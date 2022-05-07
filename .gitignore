@@ -6,8 +6,7 @@ temp/
 
 # ignore ALL ._ files
 *.exe
-*.vscode
-*.DS_Store
-*.git
+.vscode
+.DS_Store
+.git
 *.out
-*.vs
