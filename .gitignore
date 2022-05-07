@@ -4,7 +4,10 @@
 # ignore ALL files in ANY directory named temp
 temp/
 
-# ignore ALL .exe files
+# ignore ALL ._ files
 *.exe
-
 *.vscode
+*.DS_Store
+*.git
+*.out
+*.vs
