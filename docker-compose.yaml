@@ -4,4 +4,3 @@ services:
 
   app:
     image: getting-started
-   
