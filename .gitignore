@@ -3,6 +3,7 @@
 
 # ignore ALL files in ANY directory named temp
 temp/
+todo-mysql-data/
 
 # ignore ALL ._ files
 *.exe
