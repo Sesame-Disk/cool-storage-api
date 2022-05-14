@@ -3,4 +3,20 @@ version: '3.7'
 services:
 
   app:
-    image: getting-started
+    image: starting2
+    ports:
+      - 8080:8080
+    environment:
+      MYSQL_HOST: mysql
+      MYSQL_USER: root
+      MYSQL_PASSWORD: secret
+      MYSQL_DB: todos
+
+  mysq:
+    image: mysql
+    volumes:
+      - ./todo-mysql-data:/var/lib/mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: secret
+      MYSQL_DATABASE: todos
+ 
