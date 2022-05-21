@@ -16,4 +16,6 @@ ENV PATH $PATH:/usr/local/go/bin
 
 COPY . .
 
+EXPOSE 3001
+
 CMD [ "go", "run", "/app/main.go" ]

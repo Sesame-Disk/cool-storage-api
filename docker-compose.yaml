@@ -3,9 +3,12 @@ version: '3.7'
 services:
 
   app:
-    image: starting2
+    # image: starting2
+    build:
+      context: .
+      dockerfile: Dockerfile
     ports:
-      - 8080:8080
+      - 3001:3001
     environment:
       MYSQL_HOST: mysql
       MYSQL_USER: root
