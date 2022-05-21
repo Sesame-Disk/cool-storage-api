@@ -3,9 +3,7 @@ version: '3.7'
 services:
 
   app:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    image: starting2
     ports:
       - 8080:8080
     environment:
