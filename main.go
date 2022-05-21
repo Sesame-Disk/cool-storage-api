@@ -26,7 +26,7 @@ func main() {
 	r.GET("/test", func(c *gin.Context) {
 		testResourceHandler(c)
 	})
-	r.Run(":8081")
+	r.Run(":3001")
 }
 
 func registrationsHandler(c *gin.Context) {
