@@ -2,7 +2,7 @@
 
 Every name.go file must have a name_test.go where the tests for the respective functions of the name.go file must be
 
-# 6. Test the Golang Token-based Authentication Logic
+# Test the Golang Token-based Authentication Logic
 You'll now run and test Golang's token-based authentication logic in your application.
 
 1. Download all the Golang packages you're using to import them into your application.
