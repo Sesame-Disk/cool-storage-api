@@ -14,12 +14,17 @@ import (
 func main() {
 
 	r := gin.Default()
-	r.GET("/ping", func(c *gin.Context) {
+	r.GET("/api/v1/ping", func(c *gin.Context) {
 		c.String(http.StatusOK, "pong")
 	})
+	r.POST("/api/v1/auth-token/", func(c *gin.Context) {
+		seafile_authenticationsHandler(c)
+	})
+
 	r.POST("/registrations", func(c *gin.Context) {
 		registrationsHandler(c)
 	})
+
 	r.GET("/authentications", func(c *gin.Context) {
 		authenticationsHandler(c)
 	})
@@ -27,6 +32,26 @@ func main() {
 		testResourceHandler(c)
 	})
 	r.Run(":3001")
+}
+
+func seafile_authenticationsHandler(c *gin.Context) {
+
+	c.Request.ParseForm()
+	username := c.Request.FormValue("username")
+	password := c.Request.FormValue("password")
+	if username == "" || password == "" {
+		c.String(http.StatusOK, "Please enter a valid username and password.\r\n")
+	} else {
+
+		tokenDetails, err := authentications.Get_Token(username, password)
+		token := tokenDetails["auth_token"]
+
+		if err != nil {
+			c.String(http.StatusOK, err.Error())
+		} else {
+			c.JSON(http.StatusOK, gin.H{"token": token})
+		}
+	}
 }
 
 func registrationsHandler(c *gin.Context) {
@@ -63,7 +88,6 @@ func authenticationsHandler(c *gin.Context) {
 	} else {
 		c.String(http.StatusOK, "You require a username/password to get a token.\r\n")
 	}
-
 }
 
 func testResourceHandler(c *gin.Context) {
@@ -79,5 +103,4 @@ func testResourceHandler(c *gin.Context) {
 		username := fmt.Sprint(userDetails["username"])
 		c.String(http.StatusOK, "Welcome, "+username+"\r\n")
 	}
-
 }
