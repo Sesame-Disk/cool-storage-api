@@ -20,7 +20,7 @@ func main() {
 		getAuthenticationTokenHandler(c)
 	})
 	r.GET("/auth/ping/", func(c *gin.Context) {
-		testResourceHandler(c)
+		authPing(c)
 	})
 
 	r.POST("/registrations", func(c *gin.Context) {
@@ -30,9 +30,7 @@ func main() {
 	r.GET("/authentications", func(c *gin.Context) {
 		authenticationsHandler(c)
 	})
-	r.GET("/test", func(c *gin.Context) {
-		testResourceHandler(c)
-	})
+
 	r.Run(":3001")
 }
 
@@ -92,7 +90,7 @@ func authenticationsHandler(c *gin.Context) {
 	}
 }
 
-func testResourceHandler(c *gin.Context) {
+func authPing(c *gin.Context) {
 
 	authToken := strings.Split(c.Request.Header.Get("Authorization"), "Token ")[1]
 
