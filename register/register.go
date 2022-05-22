@@ -1,4 +1,4 @@
-package registrations
+package register
 
 import (
 	"database/sql"
