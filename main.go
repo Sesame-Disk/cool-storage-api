@@ -4,7 +4,6 @@ import (
 	"C/Users/acast/Documents/GitHub/cool-storage-api/authenticate"
 	"C/Users/acast/Documents/GitHub/cool-storage-api/register"
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"strings"
 
@@ -18,7 +17,10 @@ func main() {
 		c.String(http.StatusOK, "pong")
 	})
 	r.POST("/api/v1/auth-token/", func(c *gin.Context) {
-		seafile_authenticationsHandler(c)
+		getAuthenticationTokenHandler(c)
+	})
+	r.GET("/auth/ping/", func(c *gin.Context) {
+		testResourceHandler(c)
 	})
 
 	r.POST("/registrations", func(c *gin.Context) {
@@ -34,7 +36,7 @@ func main() {
 	r.Run(":3001")
 }
 
-func seafile_authenticationsHandler(c *gin.Context) {
+func getAuthenticationTokenHandler(c *gin.Context) {
 
 	c.Request.ParseForm()
 	username := c.Request.FormValue("username")
@@ -92,15 +94,17 @@ func authenticationsHandler(c *gin.Context) {
 
 func testResourceHandler(c *gin.Context) {
 
-	authToken := strings.Split(c.Request.Header.Get("Authorization"), "Bearer ")[1]
+	authToken := strings.Split(c.Request.Header.Get("Authorization"), "Token ")[1]
 
-	userDetails, err := authenticate.ValidateToken(authToken)
+	// userDetails, err := authenticate.ValidateToken(authToken)
+	_, err := authenticate.ValidateToken(authToken)
 
 	if err != nil {
 		c.String(http.StatusOK, err.Error())
 	} else {
 
-		username := fmt.Sprint(userDetails["username"])
-		c.String(http.StatusOK, "Welcome, "+username+"\r\n")
+		// username := fmt.Sprint(userDetails["username"])
+		// c.String(http.StatusOK, "Welcome, "+username+"\r\n")
+		c.String(http.StatusOK, "pong")
 	}
 }

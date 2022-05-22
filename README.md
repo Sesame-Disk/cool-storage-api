@@ -13,19 +13,19 @@ $ go get golang.org/x/crypto/bcrypt
     >> cd directory
     >> go run main.go
 
-3. The above command has a blocking function that makes your web application listen on port 8081. Therefore, don't enter any other command on your terminal window.
+3. The above command has a blocking function that makes your web application listen on port 3001. Therefore, don't enter any other command on your terminal window.
 
 4. SSH to your server on another terminal window.
 
 5. Then, execute the curl command below to add a sample john_doe's account to your application. Replace EXAMPLE_PASSWORD with a strong value.
->> curl -X POST http://localhost:8081/registrations -H "Content-Type: application/x-www-form-urlencoded" -d "username=john_doe&password=EXAMPLE_PASSWORD"
+>> curl -X POST http://localhost:3001/registrations -H "Content-Type: application/x-www-form-urlencoded" -d "username=john_doe&password=EXAMPLE_PASSWORD"
 
 6. You should now receive the following output.
     >>Success
 
 7. Next, make a request to the /authentications endpoint using john_doe's credentials to get a time-based token.
 
->> curl -u john_doe:EXAMPLE_PASSWORD http://localhost:8081/authentications
+>> curl -u john_doe:EXAMPLE_PASSWORD http://localhost:3001/authentications
 
 8. You should now get a JSON-based response showing the token details as shown below. The token is valid for sixty minutes(1 hour) since you defined this using the statement expirtyTime := time.Now().Add(time.Minute * 60) in the authentications.go file.
 
@@ -38,20 +38,20 @@ $ go get golang.org/x/crypto/bcrypt
 
 9. Copy the value of the auth_token. For example sxGfdDPQvb8ygi7wuAHt90CjMspteY8lDLtvV4AENlw=. Next, execute the curl command below and include your token in an Authorization header preceded by the term Bearer. In the following command, you're querying the /test resource/endpoint. In a production environment, you can query any resource that allows authentication using the time-based token.
 
-  >> curl -H "Authorization: Bearer sxGfdDPQvb8ygi7wuAHt90CjMspteY8lDLtvV4AENlw=" http://localhost:8081/test
+  >> curl -H "Authorization: Bearer sxGfdDPQvb8ygi7wuAHt90CjMspteY8lDLtvV4AENlw=" http://localhost:3001/test
 
 10. You should receive the following response, which shows you're now authenticated to the system using the time-based token.
     >>Welcome, john_doe
 
 11. Attempt authenticating to the application using an invalid token. For instance, fakerandomtoken.
-  >> curl -H "Authorization: Bearer fakerandomtoken" http://localhost:8081/test
+  >> curl -H "Authorization: Bearer fakerandomtoken" http://localhost:3001/test
 
     *   Your application should not allow you in, and you'll get the error below.
 
         >>Invalid access token.
 
 12. Next, attempt requesting a token without a valid user account.
-    >> curl -u john_doe:WRONG_PASSWORD http://localhost:8081/authentications
+    >> curl -u john_doe:WRONG_PASSWORD http://localhost:3001/authentications
 
     * output 
         >> Invalid username or password.

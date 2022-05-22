@@ -177,7 +177,7 @@ func Get_Token(username string, password string) (map[string]interface{}, error)
 	if err != nil {
 
 		if err == sql.ErrNoRows {
-			return nil, errors.New("invalid username or password")
+			return nil, errors.New("invalid username or password" + username + " " + password)
 		}
 
 		return nil, err
@@ -186,7 +186,7 @@ func Get_Token(username string, password string) (map[string]interface{}, error)
 	err = bcrypt.CompareHashAndPassword([]byte(accountPassword), []byte(password))
 
 	if err != nil {
-		return nil, errors.New("invalid username or password")
+		return nil, errors.New("invalid username or password" + username + " " + password)
 	}
 
 	//////////////////////////////////////////////////
