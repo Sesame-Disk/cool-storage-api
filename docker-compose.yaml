@@ -18,7 +18,7 @@ services:
   mysq:
     image: mysql
     volumes:
-      - ./todo-mysql-data:/var/lib/mysql
+      - ./DB:/docker-entrypoint-initdb.d
     environment:
       MYSQL_ROOT_PASSWORD: secret
       MYSQL_DATABASE: todos
