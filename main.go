@@ -1,12 +1,13 @@
 package main
 
 import (
-	authentications "C/Users/acast/Documents/GitHub/cool-storage-api/authenticate"
-	registrations "C/Users/acast/Documents/GitHub/cool-storage-api/register"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"strings"
+
+	authentications "github.com/Sesame-Disk/cool-storage-api/authenticate"
+	registrations "github.com/Sesame-Disk/cool-storage-api/register"
 
 	"github.com/gin-gonic/gin"
 )
