@@ -1,6 +1,6 @@
 CREATE DATABASE sample_db DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
-CREATE USER 'sample_db_user'@'localhost' IDENTIFIED WITH mysql_native_password BY 'EXAMPLE_PASSWORD';
-GRANT ALL PRIVILEGES ON sample_db.* TO 'sample_db_user'@'localhost';
+CREATE USER 'sample_db_user'@'%' IDENTIFIED WITH mysql_native_password BY 'EXAMPLE_PASSWORD';
+GRANT ALL PRIVILEGES ON sample_db.* TO 'sample_db_user'@'%';
 FLUSH PRIVILEGES;
 
 

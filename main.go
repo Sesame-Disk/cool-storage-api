@@ -1,13 +1,12 @@
 package main
 
 import (
+	"C/Users/acast/Documents/GitHub/cool-storage-api/authenticate"
+	"C/Users/acast/Documents/GitHub/cool-storage-api/register"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"strings"
-
-	authentications "github.com/Sesame-Disk/cool-storage-api/authenticate"
-	registrations "github.com/Sesame-Disk/cool-storage-api/register"
 
 	"github.com/gin-gonic/gin"
 )
@@ -44,7 +43,7 @@ func seafile_authenticationsHandler(c *gin.Context) {
 		c.String(http.StatusOK, "Please enter a valid username and password.\r\n")
 	} else {
 
-		tokenDetails, err := authentications.Get_Token(username, password)
+		tokenDetails, err := authenticate.Get_Token(username, password)
 		token := tokenDetails["auth_token"]
 
 		if err != nil {
@@ -62,7 +61,7 @@ func registrationsHandler(c *gin.Context) {
 	if username == "" || password == "" {
 		c.String(http.StatusOK, "Please enter a valid username and password.\r\n")
 	} else {
-		response, err := registrations.RegisterUser(username, password)
+		response, err := register.RegisterUser(username, password)
 		if err != nil {
 			c.String(http.StatusOK, err.Error())
 		} else {
@@ -77,7 +76,7 @@ func authenticationsHandler(c *gin.Context) {
 
 	if ok {
 
-		tokenDetails, err := authentications.GenerateToken(username, password)
+		tokenDetails, err := authenticate.GenerateToken(username, password)
 
 		if err != nil {
 			c.String(http.StatusOK, err.Error())
@@ -95,7 +94,7 @@ func testResourceHandler(c *gin.Context) {
 
 	authToken := strings.Split(c.Request.Header.Get("Authorization"), "Bearer ")[1]
 
-	userDetails, err := authentications.ValidateToken(authToken)
+	userDetails, err := authenticate.ValidateToken(authToken)
 
 	if err != nil {
 		c.String(http.StatusOK, err.Error())
