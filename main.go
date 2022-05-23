@@ -4,6 +4,7 @@ import (
 	"C/Users/acast/Documents/GitHub/cool-storage-api/authenticate"
 	"C/Users/acast/Documents/GitHub/cool-storage-api/register"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strings"
 
@@ -92,17 +93,24 @@ func authenticationsHandler(c *gin.Context) {
 
 func authPing(c *gin.Context) {
 
-	authToken := strings.Split(c.Request.Header.Get("Authorization"), "Token ")[1]
+	// authToken := strings.Split(c.Request.Header.Get("Authorization"), "Token ")[1]
+	data := strings.Split(c.Request.Header.Get("Authorization"), "Token")
 
-	// userDetails, err := authenticate.ValidateToken(authToken)
-	_, err := authenticate.ValidateToken(authToken)
-
-	if err != nil {
-		c.String(http.StatusOK, err.Error())
+	if len(data) < 2 {
+		c.String(http.StatusBadRequest, errors.New("request not valid").Error())
 	} else {
+		authToken := data[1]
 
-		// username := fmt.Sprint(userDetails["username"])
-		// c.String(http.StatusOK, "Welcome, "+username+"\r\n")
-		c.String(http.StatusOK, "pong")
+		// userDetails, err := authenticate.ValidateToken(authToken)
+		_, err := authenticate.ValidateToken(authToken)
+
+		if err != nil {
+			c.String(http.StatusOK, err.Error())
+		} else {
+
+			// username := fmt.Sprint(userDetails["username"])
+			// c.String(http.StatusOK, "Welcome, "+username+"\r\n")
+			c.String(http.StatusOK, "pong")
+		}
 	}
 }
