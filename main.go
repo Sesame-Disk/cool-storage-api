@@ -94,7 +94,7 @@ func authenticationsHandler(c *gin.Context) {
 func authPing(c *gin.Context) {
 
 	// authToken := strings.Split(c.Request.Header.Get("Authorization"), "Token ")[1]
-	data := strings.Split(c.Request.Header.Get("Authorization"), "Token")
+	data := strings.Split(c.Request.Header.Get("Authorization"), "Token ")
 
 	if len(data) < 2 {
 		c.String(http.StatusBadRequest, errors.New("request not valid").Error())
