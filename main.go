@@ -3,7 +3,6 @@ package main
 import (
 	"C/Users/acast/Documents/GitHub/cool-storage-api/authenticate"
 	"C/Users/acast/Documents/GitHub/cool-storage-api/register"
-	"encoding/json"
 	"errors"
 	"net/http"
 	"strings"
@@ -20,16 +19,11 @@ func main() {
 	r.POST("/api/v1/auth-token/", func(c *gin.Context) {
 		getAuthenticationTokenHandler(c)
 	})
-	r.GET("/auth/ping/", func(c *gin.Context) {
+	r.GET("/api/v1/auth/ping/", func(c *gin.Context) {
 		authPing(c)
 	})
-
-	r.POST("/registrations", func(c *gin.Context) {
+	r.POST("/api/v1/registrations", func(c *gin.Context) {
 		registrationsHandler(c)
-	})
-
-	r.GET("/authentications", func(c *gin.Context) {
-		authenticationsHandler(c)
 	})
 
 	r.Run(":3001")
@@ -68,26 +62,6 @@ func registrationsHandler(c *gin.Context) {
 		} else {
 			c.String(http.StatusOK, response)
 		}
-	}
-}
-
-func authenticationsHandler(c *gin.Context) {
-
-	username, password, ok := c.Request.BasicAuth()
-
-	if ok {
-
-		tokenDetails, err := authenticate.GenerateToken(username, password)
-
-		if err != nil {
-			c.String(http.StatusOK, err.Error())
-		} else {
-			enc := json.NewEncoder(c.Writer)
-			enc.SetIndent("", "  ")
-			enc.Encode(tokenDetails)
-		}
-	} else {
-		c.String(http.StatusOK, "You require a username/password to get a token.\r\n")
 	}
 }
 
