@@ -270,7 +270,7 @@ func Get_Token(username string, password string) (map[string]interface{}, error)
 }
 
 func build_random_token() (map[string]interface{}, error) {
-	randomToken := make([]byte, 32)
+	randomToken := make([]byte, 30)
 
 	_, err := rand.Read(randomToken)
 
