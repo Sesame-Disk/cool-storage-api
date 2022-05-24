@@ -1,8 +1,8 @@
 package main
 
 import (
-	"C/Users/acast/Documents/GitHub/cool-storage-api/authenticate"
-	"C/Users/acast/Documents/GitHub/cool-storage-api/register"
+	authenticate "cool-storage-api/authenticate"
+	register "cool-storage-api/register"
 	"errors"
 	"net/http"
 	"strings"
