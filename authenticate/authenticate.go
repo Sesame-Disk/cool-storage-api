@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/base64"
 	"errors"
+	"strings"
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
@@ -279,6 +280,9 @@ func build_random_token() (map[string]interface{}, error) {
 	}
 
 	authToken := base64.URLEncoding.EncodeToString(randomToken)
+
+	authToken = strings.Replace(authToken, "-", "0", 40)
+	authToken = strings.Replace(authToken, "_", "1", 40)
 
 	const timeLayout = "2006-01-02 15:04:05"
 
