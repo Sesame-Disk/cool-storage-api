@@ -1,4 +1,4 @@
-module C/Users/acast/Documents/GitHub/cool-storage-api
+module cool-storage-api
 
 go 1.18
 
