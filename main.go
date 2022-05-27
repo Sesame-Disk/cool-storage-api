@@ -38,7 +38,7 @@ func getAuthenticationTokenHandler(c *gin.Context) {
 		c.String(http.StatusOK, "Please enter a valid username and password.\r\n")
 	} else {
 
-		tokenDetails, err := authenticate.Get_Token(username, password)
+		tokenDetails, err := authenticate.GetToken(username, password)
 		token := tokenDetails["auth_token"]
 
 		if err != nil {

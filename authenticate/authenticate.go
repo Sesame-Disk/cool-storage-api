@@ -153,7 +153,7 @@ func ValidateToken(authToken string) (map[string]interface{}, error) {
 	return userDetails, nil
 }
 
-func Get_Token(username string, password string) (map[string]interface{}, error) {
+func GetToken(username string, password string) (map[string]interface{}, error) {
 
 	db, err := sql.Open("mysql", "sample_db_user:EXAMPLE_PASSWORD@tcp(127.0.0.1:3306)/sample_db")
 	if err != nil {
@@ -220,7 +220,7 @@ func Get_Token(username string, password string) (map[string]interface{}, error)
 
 			defer stmt.Close()
 
-			tokenDetails, err := build_random_token()
+			tokenDetails, err := buildRandomToken()
 			if err != nil {
 				return nil, err
 			}
@@ -242,7 +242,7 @@ func Get_Token(username string, password string) (map[string]interface{}, error)
 		// return nil, errors.New("The token is expired.\r\n")
 		//we have to update old token version by token_id
 
-		tokenDetails, err := build_random_token()
+		tokenDetails, err := buildRandomToken()
 		if err != nil {
 			return nil, err
 		}
@@ -270,7 +270,7 @@ func Get_Token(username string, password string) (map[string]interface{}, error)
 	return tokenDetails, nil
 }
 
-func build_random_token() (map[string]interface{}, error) {
+func buildRandomToken() (map[string]interface{}, error) {
 	randomToken := make([]byte, 30)
 
 	_, err := rand.Read(randomToken)

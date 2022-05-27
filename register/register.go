@@ -32,6 +32,6 @@ func RegisterUser(username string, password string) (string, error) {
 		return "", err
 	}
 
-	return "Success\r\n", nil
+	return "success", nil
 
 }
