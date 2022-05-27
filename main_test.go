@@ -1,27 +1,38 @@
 package main
 
 import (
+	"net/http"
 	"net/http/httptest"
 	"testing"
 
 	"github.com/gin-gonic/gin"
+	"github.com/stretchr/testify/assert"
 )
 
 func TestPingResponse(t *testing.T) {
 
 	w := httptest.NewRecorder()
-	router := gin.Default()
+	r := SetUpRouter()
 	gin.SetMode(gin.TestMode)
 
-	router.GET("/api/v1/ping", PingResponse)
+	r.GET("/api/v1/ping", PingResponse)
+	req, err := http.NewRequest(http.MethodGet, "/api/v1/ping", nil)
+	if err != nil {
+		t.Fatalf("Couldn't create request: %v\n", err)
+	}
 
-	t.Run("pongTest", func(t *testing.T) {
+	// Perform the request
+	r.ServeHTTP(w, req)
 
-		if w.Code != 200 {
-			t.Errorf("Expected %v but got %v", 200, w.Code)
-		}
+	// Check to see if the response was what you expected
+	if w.Code != http.StatusOK {
+		t.Fatalf("Expected to get status %d but instead got %d\n", http.StatusOK, w.Code)
+	}
+	assert.Equal(t, "pong1", w.Body.String())
+	assert.Equal(t, http.StatusOK, w.Code)
+}
 
-		t.Log(w.Body.String())
-
-	})
+func SetUpRouter() *gin.Engine {
+	router := gin.Default()
+	return router
 }
