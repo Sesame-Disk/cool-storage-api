@@ -12,90 +12,10 @@ import (
 	"golang.org/x/crypto/bcrypt"
 )
 
-func GenerateToken(username string, password string) (map[string]interface{}, error) {
-
-	db, err := sql.Open("mysql", "sample_db_user:EXAMPLE_PASSWORD@tcp(127.0.0.1:3306)/sample_db")
-	if err != nil {
-		return nil, err
-	}
-
-	queryString := "select user_id, password from system_users where username = ?"
-
-	stmt, err := db.Prepare(queryString)
-
-	if err != nil {
-		return nil, err
-	}
-
-	defer stmt.Close()
-
-	userId := 0
-	accountPassword := ""
-
-	err = stmt.QueryRow(username).Scan(&userId, &accountPassword)
-
-	if err != nil {
-
-		if err == sql.ErrNoRows {
-			return nil, errors.New("invalid username or password")
-		}
-
-		return nil, err
-	}
-
-	err = bcrypt.CompareHashAndPassword([]byte(accountPassword), []byte(password))
-
-	if err != nil {
-		return nil, errors.New("invalid username or password")
-	}
-
-	queryString = "insert into authentication_tokens(user_id, auth_token, generated_at, expires_at) values (?, ?, ?, ?)"
-	stmt, err = db.Prepare(queryString)
-
-	if err != nil {
-		return nil, err
-	}
-
-	defer stmt.Close()
-
-	randomToken := make([]byte, 32)
-
-	_, err = rand.Read(randomToken)
-
-	if err != nil {
-		return nil, err
-	}
-
-	authToken := base64.URLEncoding.EncodeToString(randomToken)
-
-	const timeLayout = "2006-01-02 15:04:05"
-
-	dt := time.Now()
-	expirtyTime := time.Now().Add(time.Minute * 1)
-
-	generatedAt := dt.Format(timeLayout)
-	expiresAt := expirtyTime.Format(timeLayout)
-
-	_, err = stmt.Exec(userId, authToken, generatedAt, expiresAt)
-
-	if err != nil {
-		return nil, err
-	}
-
-	tokenDetails := map[string]interface{}{
-		"token_type":   "Bearer",
-		"auth_token":   authToken,
-		"generated_at": generatedAt,
-		"expires_at":   expiresAt,
-	}
-
-	return tokenDetails, nil
-}
-
+//Get the username associated with the token input
 func ValidateToken(authToken string) (map[string]interface{}, error) {
 
 	db, err := sql.Open("mysql", "sample_db_user:EXAMPLE_PASSWORD@tcp(127.0.0.1:3306)/sample_db")
-
 	if err != nil {
 		return nil, err
 	}
@@ -111,7 +31,6 @@ func ValidateToken(authToken string) (map[string]interface{}, error) {
             where auth_token = ?`
 
 	stmt, err := db.Prepare(queryString)
-
 	if err != nil {
 		return nil, err
 	}
@@ -153,7 +72,8 @@ func ValidateToken(authToken string) (map[string]interface{}, error) {
 	return userDetails, nil
 }
 
-func GetToken(username string, password string) (map[string]interface{}, error) {
+//Get a valid token associated with username and password
+func GetToken(username string, password string) (map[string]string, error) {
 
 	db, err := sql.Open("mysql", "sample_db_user:EXAMPLE_PASSWORD@tcp(127.0.0.1:3306)/sample_db")
 	if err != nil {
@@ -163,7 +83,6 @@ func GetToken(username string, password string) (map[string]interface{}, error) 
 	queryString := "select user_id, password from system_users where username = ?"
 
 	stmt, err := db.Prepare(queryString)
-
 	if err != nil {
 		return nil, err
 	}
@@ -190,7 +109,6 @@ func GetToken(username string, password string) (map[string]interface{}, error) 
 		return nil, errors.New("invalid username or password" + username + " " + password)
 	}
 
-	//////////////////////////////////////////////////
 	queryString = "select token_id, auth_token, generated_at, expires_at from authentication_tokens where user_id = ?"
 
 	stmt, err = db.Prepare(queryString)
@@ -220,7 +138,7 @@ func GetToken(username string, password string) (map[string]interface{}, error) 
 
 			defer stmt.Close()
 
-			tokenDetails, err := buildRandomToken()
+			tokenDetails, err := BuildRandomToken()
 			if err != nil {
 				return nil, err
 			}
@@ -242,7 +160,7 @@ func GetToken(username string, password string) (map[string]interface{}, error) 
 		// return nil, errors.New("The token is expired.\r\n")
 		//we have to update old token version by token_id
 
-		tokenDetails, err := buildRandomToken()
+		tokenDetails, err := BuildRandomToken()
 		if err != nil {
 			return nil, err
 		}
@@ -260,7 +178,7 @@ func GetToken(username string, password string) (map[string]interface{}, error) 
 		return tokenDetails, err
 	}
 
-	tokenDetails := map[string]interface{}{
+	tokenDetails := map[string]string{
 		"token_type":   "Bearer",
 		"auth_token":   auth_token,
 		"generated_at": generatedAt,
@@ -270,7 +188,8 @@ func GetToken(username string, password string) (map[string]interface{}, error) 
 	return tokenDetails, nil
 }
 
-func buildRandomToken() (map[string]interface{}, error) {
+//Generate a random alphanumeric token of len 40
+func BuildRandomToken() (map[string]string, error) {
 	randomToken := make([]byte, 30)
 
 	_, err := rand.Read(randomToken)
@@ -291,7 +210,8 @@ func buildRandomToken() (map[string]interface{}, error) {
 
 	generatedAt := dt.Format(timeLayout)
 	expiresAt := expirtyTime.Format(timeLayout)
-	tokenDetails := map[string]interface{}{
+
+	tokenDetails := map[string]string{
 		"token_type":   "Bearer",
 		"auth_token":   authToken,
 		"generated_at": generatedAt,
