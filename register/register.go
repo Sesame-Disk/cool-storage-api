@@ -33,5 +33,4 @@ func RegisterUser(username string, password string) (string, error) {
 	}
 
 	return "success", nil
-
 }

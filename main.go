@@ -11,25 +11,28 @@ import (
 )
 
 func main() {
-
 	r := gin.Default()
 	r.GET("/api/v1/ping", func(c *gin.Context) {
-		c.String(http.StatusOK, "pong")
+		PingResponse(c)
 	})
 	r.POST("/api/v1/auth-token/", func(c *gin.Context) {
-		getAuthenticationTokenHandler(c)
+		GetAuthenticationTokenHandler(c)
 	})
 	r.GET("/api/v1/auth/ping/", func(c *gin.Context) {
-		authPing(c)
+		AuthPing(c)
 	})
 	r.POST("/api/v1/registrations", func(c *gin.Context) {
-		registrationsHandler(c)
+		RegistrationsHandler(c)
 	})
 
-	r.Run(":3001")
+	r.Run("localhost:3001")
 }
 
-func getAuthenticationTokenHandler(c *gin.Context) {
+func PingResponse(c *gin.Context) {
+	c.String(http.StatusOK, "pong")
+}
+
+func GetAuthenticationTokenHandler(c *gin.Context) {
 
 	c.Request.ParseForm()
 	username := c.Request.FormValue("username")
@@ -49,7 +52,7 @@ func getAuthenticationTokenHandler(c *gin.Context) {
 	}
 }
 
-func registrationsHandler(c *gin.Context) {
+func RegistrationsHandler(c *gin.Context) {
 	c.Request.ParseForm()
 	username := c.Request.FormValue("username")
 	password := c.Request.FormValue("password")
@@ -65,7 +68,7 @@ func registrationsHandler(c *gin.Context) {
 	}
 }
 
-func authPing(c *gin.Context) {
+func AuthPing(c *gin.Context) {
 
 	// authToken := strings.Split(c.Request.Header.Get("Authorization"), "Token ")[1]
 	data := strings.Split(c.Request.Header.Get("Authorization"), "Token ")
