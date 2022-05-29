@@ -35,59 +35,44 @@ func PingResponse(c *gin.Context) {
 
 //return a valid token
 func GetAuthenticationTokenHandler(c *gin.Context) {
-
-	c.Request.ParseForm()
-	username := c.Request.FormValue("username")
-	password := c.Request.FormValue("password")
-
-	if username == "" || password == "" {
-		c.String(http.StatusNotAcceptable, "please enter a valid username and password %v,%v,%v", username, password, c.Request.Body)
+	err1 := c.Request.ParseForm()
+	if err1 != nil {
+		c.String(http.StatusBadRequest, err1.Error())
 	} else {
-		tokenDetails, err := authenticate.GetToken(username, password)
-		if err != nil {
-			c.String(http.StatusInternalServerError, err.Error())
+		username := c.Request.FormValue("username")
+		password := c.Request.FormValue("password")
+
+		if username == "" || password == "" {
+			c.String(http.StatusNotAcceptable, "please enter a valid username and password %v,%v,%v", username, password, c.Request.Body)
 		} else {
-			token := tokenDetails["auth_token"]
-			c.JSON(http.StatusOK, gin.H{"token": token})
+			tokenDetails, err := authenticate.GetToken(username, password)
+			if err != nil {
+				c.String(http.StatusInternalServerError, err.Error())
+			} else {
+				token := tokenDetails["auth_token"]
+				c.JSON(http.StatusOK, gin.H{"token": token})
+			}
 		}
 	}
-
-	//oficial
-	// err1 := c.Request.ParseForm()
-	// if err1 != nil {
-	// 	c.String(http.StatusBadRequest, "%v,%v", err1.Error(), c.Request)
-	// } else {
-	// 	username := c.Request.FormValue("username")
-	// 	password := c.Request.FormValue("password")
-
-	// 	if username == "" || password == "" {
-	// 		c.String(http.StatusNotAcceptable, "please enter a valid username and password %v,%v,%v", username, password, c.Request.Body)
-	// 	} else {
-	// 		tokenDetails, err := authenticate.GetToken(username, password)
-	// 		if err != nil {
-	// 			c.String(http.StatusInternalServerError, err.Error())
-	// 		} else {
-	// 			token := tokenDetails["auth_token"]
-	// 			c.JSON(http.StatusOK, gin.H{"token": token})
-	// 		}
-	// 	}
-	// }
-
 }
 
 //register a user in the database
 func RegistrationsHandler(c *gin.Context) {
-	c.Request.ParseForm()
-	username := c.Request.FormValue("username")
-	password := c.Request.FormValue("password")
-	if username == "" || password == "" {
-		c.String(http.StatusOK, "Please enter a valid username and password.\r\n")
+	err1 := c.Request.ParseForm()
+	if err1 != nil {
+		c.String(http.StatusBadRequest, err1.Error())
 	} else {
-		response, err := register.RegisterUser(username, password)
-		if err != nil {
-			c.String(http.StatusOK, err.Error())
+		username := c.Request.FormValue("username")
+		password := c.Request.FormValue("password")
+		if username == "" || password == "" {
+			c.String(http.StatusOK, "Please enter a valid username and password.\r\n")
 		} else {
-			c.String(http.StatusOK, response)
+			response, err := register.RegisterUser(username, password)
+			if err != nil {
+				c.String(http.StatusOK, err.Error())
+			} else {
+				c.String(http.StatusOK, response)
+			}
 		}
 	}
 }

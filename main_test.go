@@ -7,7 +7,9 @@ import (
 	"math/rand"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -46,10 +48,18 @@ func TestGetAuthenticationTokenHandler(t *testing.T) {
 
 	r.POST("/api/v1/auth-token/", GetAuthenticationTokenHandler)
 
-	req, err := http.NewRequest(http.MethodPost, "http://localhost:3001/api/v1/auth-token/?username=julio&password=abc", nil)
+	randomUser, randomPassword := getNewFakeUserPassword()
+	register.RegisterUser(randomUser, randomPassword)
+
+	v := make(url.Values)
+	v.Set("username", randomUser)
+	v.Add("password", randomPassword)
+
+	req, err := http.NewRequest(http.MethodPost, "http://localhost:3001/api/v1/auth-token/", strings.NewReader(v.Encode()))
 	if err != nil {
 		t.Fatalf("Couldn't create request: %v\n", err)
 	}
+	req.Header.Add("Content-Type", "application/x-www-form-urlencoded")
 
 	// Perform the request
 	r.ServeHTTP(w, req)
@@ -69,7 +79,6 @@ func TestGetAuthenticationTokenHandler(t *testing.T) {
 	token := got["token"].(string)
 
 	_, err2 := authenticate.ValidateToken(token)
-
 	if err2 != nil {
 		t.Errorf("Expected %v but got %v", nil, err2)
 	}
@@ -83,10 +92,17 @@ func TestRegistrationsHandler(t *testing.T) {
 
 	r.POST("/api/v1/registrations", RegistrationsHandler)
 
-	req, err := http.NewRequest(http.MethodPost, "http://localhost:3001/api/v1/registrations?username=juli12345884412&password=rtzzttt", nil)
+	randomUser, randomPassword := getNewFakeUserPassword()
+
+	v := make(url.Values)
+	v.Set("username", randomUser)
+	v.Add("password", randomPassword)
+
+	req, err := http.NewRequest(http.MethodPost, "http://localhost:3001/api/v1/registrations", strings.NewReader(v.Encode()))
 	if err != nil {
 		t.Fatalf("Couldn't create request: %v\n", err)
 	}
+	req.Header.Add("Content-Type", "application/x-www-form-urlencoded")
 
 	// Perform the request
 	r.ServeHTTP(w, req)
@@ -111,10 +127,9 @@ func TestAuthPing(t *testing.T) {
 		t.Fatalf("Couldn't create request: %v\n", err)
 	}
 
-	rand.Seed(time.Now().UnixNano())
-	randomUser := strconv.Itoa(rand.Intn(1000000))
-	randomPassword := strconv.Itoa(rand.Intn(1000000))
+	randomUser, randomPassword := getNewFakeUserPassword()
 	register.RegisterUser(randomUser, randomPassword)
+
 	tokenDetails, _ := authenticate.GetToken(randomUser, randomPassword)
 	auth_token := tokenDetails["auth_token"]
 	value := "Token " + auth_token
@@ -133,4 +148,11 @@ func TestAuthPing(t *testing.T) {
 func SetUpRouter() *gin.Engine {
 	router := gin.Default()
 	return router
+}
+
+func getNewFakeUserPassword() (string, string) {
+	rand.Seed(time.Now().UnixNano())
+	randomUser := strconv.Itoa(rand.Intn(1000000))
+	randomPassword := strconv.Itoa(rand.Intn(1000000))
+	return randomUser, randomPassword
 }
