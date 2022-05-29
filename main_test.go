@@ -44,22 +44,7 @@ func TestGetAuthenticationTokenHandler(t *testing.T) {
 	r := SetUpRouter()
 	gin.SetMode(gin.TestMode)
 
-	// const endPoint = "/api/v1/auth-token/?username=julio&password=abc" //"/api/v1/auth-token/"
-
 	r.POST("/api/v1/auth-token/", GetAuthenticationTokenHandler)
-
-	// when
-
-	// rand.Seed(time.Now().UnixNano())
-	// randomUser := strconv.Itoa(rand.Intn(1000000))
-	// randomPassword := strconv.Itoa(rand.Intn(1000000))
-
-	// register.RegisterUser(randomUser, randomPassword)
-
-	// params := url.Values{}
-	// params.Add("username=", "u1")
-	// params.Add("password=", "p1")
-	// registrationPayload := params.Encode()
 
 	req, err := http.NewRequest(http.MethodPost, "http://localhost:3001/api/v1/auth-token/?username=julio&password=abc", nil)
 	if err != nil {
