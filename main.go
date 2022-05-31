@@ -7,11 +7,20 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
 )
 
 func main() {
 	r := gin.Default()
+	r.Use(cors.New(cors.Config{
+		AllowOrigins:     []string{"http://localhost:3000"},
+		AllowMethods:     []string{"PUT", "PATCH", "POST", "GET"},
+		AllowHeaders:     []string{"authorization"},
+		ExposeHeaders:    []string{"Content-Length"},
+		AllowCredentials: true,
+	}))
+
 	r.GET("/api/v1/ping", func(c *gin.Context) {
 		PingResponse(c)
 	})
@@ -28,6 +37,13 @@ func main() {
 	r.Run("localhost:3001")
 }
 
+func enableCors(c *gin.Context) {
+	c.Request.Header.Add("Access-Control-Allow-Origin", "*")
+	c.Request.Header.Add("Access-Control-Allow-Credentials", "true")
+	c.Request.Header.Add("Access-Control-Allow-Headers", "Content-Type, Content-Length, Accept-Encoding, X-CSRF-Token, Authorization, accept, origin, Cache-Control, X-Requested-With")
+	c.Request.Header.Add("Access-Control-Allow-Methods", "POST, OPTIONS, GET, PUT")
+}
+
 //"pong" response
 func PingResponse(c *gin.Context) {
 	c.String(http.StatusOK, "pong")
@@ -35,6 +51,7 @@ func PingResponse(c *gin.Context) {
 
 //return a valid token
 func GetAuthenticationTokenHandler(c *gin.Context) {
+	enableCors(c)
 	err1 := c.Request.ParseForm()
 	if err1 != nil {
 		c.String(http.StatusBadRequest, err1.Error())
