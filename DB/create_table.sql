@@ -21,4 +21,4 @@ CREATE TABLE authentication_tokens (
        expires_at   DATETIME
 ) ENGINE = InnoDB;
 
-QUIT;
+-- QUIT;
