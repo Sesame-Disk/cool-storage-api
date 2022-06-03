@@ -4,6 +4,7 @@ import (
 	authenticate "cool-storage-api/authenticate"
 	register "cool-storage-api/register"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 
@@ -32,6 +33,9 @@ func main() {
 	})
 	r.POST("/api/v1/registrations", func(c *gin.Context) {
 		RegistrationsHandler(c)
+	})
+	r.GET("/api/v1/account/info/", func(c *gin.Context) {
+		AccountInfoResponse(c)
 	})
 
 	r.Run("localhost:3001")
@@ -115,6 +119,52 @@ func AuthPing(c *gin.Context) {
 			// username := fmt.Sprint(userDetails["username"])
 			// c.String(http.StatusOK, "Welcome, "+username+"\r\n")
 			c.String(http.StatusOK, "pong")
+		}
+	}
+}
+
+func AccountInfoResponse(c *gin.Context) {
+
+	data := strings.Split(c.Request.Header.Get("Authorization"), "Token ")
+
+	if len(data) < 2 {
+		c.String(http.StatusBadRequest, errors.New("request not valid").Error())
+	} else {
+		authToken := data[1]
+		userDetails, err := authenticate.ValidateToken(authToken)
+
+		if err != nil {
+			c.String(403, errors.New("invalid token").Error())
+		} else {
+			username := fmt.Sprint(userDetails["username"])
+			ss := strings.Split(username, "@")
+			name := ss[0]
+			c.JSON(http.StatusOK, gin.H{
+
+				"login_id": "",
+
+				"is_staff": false,
+
+				"name": name,
+
+				"email_notification_interval": 0,
+
+				"institution": "",
+
+				"department": "",
+
+				"avatar_url": "http://127.0.0.1:8000/media/avatars/default.png",
+
+				"contact_email": nil,
+
+				"space_usage": "0.00%",
+
+				"usage": 0,
+
+				"total": 0,
+
+				"email": username,
+			})
 		}
 	}
 }
