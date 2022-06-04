@@ -153,7 +153,7 @@ func AccountInfoResponse(c *gin.Context) {
 
 				"department": "",
 
-				"avatar_url": "http://127.0.0.1:8000/media/avatars/default.png",
+				"avatar_url": "http://127.0.0.1:3000/media/avatars/default.png",
 
 				"contact_email": nil,
 
