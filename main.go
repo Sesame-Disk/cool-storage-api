@@ -38,7 +38,7 @@ func main() {
 		AccountInfoResponse(c)
 	})
 
-	r.Run("localhost:3001")
+	r.Run(":3001")
 }
 
 func enableCors(c *gin.Context) {
@@ -123,6 +123,7 @@ func AuthPing(c *gin.Context) {
 	}
 }
 
+//to get user info
 func AccountInfoResponse(c *gin.Context) {
 
 	data := strings.Split(c.Request.Header.Get("Authorization"), "Token ")

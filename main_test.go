@@ -145,6 +145,46 @@ func TestAuthPing(t *testing.T) {
 	assert.Equal(t, "pong", w.Body.String())
 }
 
+func TestAccountInfoResponse(t *testing.T) {
+
+	w := httptest.NewRecorder()
+	r := SetUpRouter()
+	gin.SetMode(gin.TestMode)
+
+	r.GET("/api/v1/account/info/", AccountInfoResponse)
+
+	req, err := http.NewRequest(http.MethodGet, "http://localhost:3001/api/v1/account/info/", nil)
+	if err != nil {
+		t.Fatalf("Couldn't create request: %v\n", err)
+	}
+
+	randomUser, randomPassword := getNewFakeUserPassword()
+	register.RegisterUser(randomUser, randomPassword)
+
+	tokenDetails, _ := authenticate.GetToken(randomUser, randomPassword)
+	auth_token := tokenDetails["auth_token"]
+	value := "Token " + auth_token
+	req.Header.Set("Authorization", value)
+
+	// Perform the request
+	r.ServeHTTP(w, req)
+
+	// Check to see if the response was what you expected
+	if w.Code != http.StatusOK {
+		t.Fatalf("Expected to get status %d but instead got %d\n", http.StatusOK, w.Code)
+	}
+	var got gin.H
+	err1 := json.Unmarshal(w.Body.Bytes(), &got)
+	if err1 != nil {
+		t.Fatal(err1)
+	}
+
+	email := got["email"].(string)
+	if email != randomUser {
+		t.Fatalf("expected to get status %s but instead got %s", randomUser, email)
+	}
+}
+
 func SetUpRouter() *gin.Engine {
 	router := gin.Default()
 	return router
