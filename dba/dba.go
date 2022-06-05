@@ -11,7 +11,7 @@ type Contacto struct {
 }
 
 func ObtenerBaseDeDatos() (db *sql.DB, e error) {
-	db, err := sql.Open("mysql", "sample_db_user:EXAMPLE_PASSWORD@tcp(127.0.0.1:3306)/sample_db")
+	db, err := sql.Open("mysql", "sample_db_user:EXAMPLE_PASSWORD@tcp(127.0.0.1:33061)/sample_db")
 	if err != nil {
 		return nil, err
 	}

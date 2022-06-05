@@ -9,7 +9,7 @@ import (
 
 func RegisterUser(username string, password string) (string, error) {
 
-	db, err := sql.Open("mysql", "sample_db_user:EXAMPLE_PASSWORD@tcp(127.0.0.1:3306)/sample_db")
+	db, err := sql.Open("mysql", "sample_db_user:EXAMPLE_PASSWORD@tcp(host.docker.internal:3306)/sample_db")
 	if err != nil {
 		return "", err
 	}

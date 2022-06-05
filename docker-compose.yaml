@@ -13,14 +13,17 @@ services:
       MYSQL_HOST: mysql
       MYSQL_USER: root
       MYSQL_PASSWORD: secret
-      MYSQL_DB: todos
+      MYSQL_DB: sample_db
 
   mysq:
     image: mysql
-    # volumes:
-    #   - ./DB:/docker-entrypoint-initdb.d
+    volumes:
+      - ./DB:/docker-entrypoint-initdb.d
     environment:
       MYSQL_ROOT_PASSWORD: secret
-      MYSQL_DATABASE: todos
+      MYSQL_DATABASE: sample_db
     ports:
       - 33061:3306
+    expose:
+      - '33061'
+

@@ -15,7 +15,7 @@ import (
 //Get the username associated with the token input
 func ValidateToken(authToken string) (map[string]interface{}, error) {
 
-	db, err := sql.Open("mysql", "sample_db_user:EXAMPLE_PASSWORD@tcp(127.0.0.1:3306)/sample_db")
+	db, err := sql.Open("mysql", "sample_db_user:EXAMPLE_PASSWORD@tcp(host.docker.internal:33061)/sample_db")
 	if err != nil {
 		return nil, err
 	}
@@ -75,7 +75,7 @@ func ValidateToken(authToken string) (map[string]interface{}, error) {
 //Get a valid token associated with username and password
 func GetToken(username string, password string) (map[string]string, error) {
 
-	db, err := sql.Open("mysql", "sample_db_user:EXAMPLE_PASSWORD@tcp(127.0.0.1:3306)/sample_db")
+	db, err := sql.Open("mysql", "sample_db_user:EXAMPLE_PASSWORD@tcp(host.docker.internal:33061)/sample_db")
 	if err != nil {
 		return nil, err
 	}
