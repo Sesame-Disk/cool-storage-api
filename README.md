@@ -19,6 +19,8 @@ docker-compose build
 docker-compose up
 ```
 
+Now the server started on port :3001
+
 ## Requirements
 Every name.go file must have a name_test.go where the tests for the respective functions of the name.go file must be
 
@@ -56,85 +58,79 @@ go test --coverprofile=coverage.out
 go tool cover --html=coverage.out
 ```
 
-## Test the Golang Token-based Authentication Logic
-You'll now run and test Golang's token-based authentication logic in your application.
+## Endpoints
 
-1. Download all the Golang packages you're using to import them into your application.
-
-```
-go mod tidy
-```
-
-2. Next, run the project.
-
-```
-cd cool-storage-api
-go run main.go
-```
-
-
-3. The above command has a blocking function that makes your web application listen on port 3001. Therefore, don't enter any other command on your terminal window.
-
-4. First make sure the server started executing de curl command below
+1. To make sure the server started:  "/api/v1/ping"
 ```
 curl http://localhost:3001/api/v1/ping
 ```
+output:
+```
+pong
+```
 
-5. Then, execute the curl command below to add a sample john_doe's account to your application. Replace EXAMPLE_PASSWORD with a strong value.
+2. To add a sample john_doe's account to your application. Replace EXAMPLE_PASSWORD with a strong value: "/api/v1/registrations"
 ```
 curl -X POST http://localhost:3001/registrations -H "Content-Type: application/x-www-form-urlencoded" -d "username=john_doe&password=EXAMPLE_PASSWORD"
 ```
 
-6. You should now receive the following output.
+output:
 ```
 Success
 ```
 
-7. Next, make a request to the /authentications endpoint using john_doe's credentials to get a time-based token.
+3. Request to the "/api/v1/auth-token/" endpoint using john_doe's credentials to get a time-based token.
 
 ```
 curl -d "username=john_doe&password=EXAMPLE_PASSWORD" http://localhost:3001/api/v1/auth-token/
 ```
 
-8. You should now get a JSON-based response showing the token details as shown below. The token is valid for sixty minutes(1 hour) since you defined this using the statement expirtyTime := time.Now().Add(time.Minute * 60) in the authentications.go file.
-
+output:
 {"token":"l7p81hy0iEPzKZY5l0SEfpiKecwGQ1aqsGO4DyYs"}
 
-9. Copy the value of the auth_token. For example l7p81hy0iEPzKZY5l0SEfpiKecwGQ1aqsGO4DyYs. Next, execute the curl command below and include your token in an Authorization header preceded by the term Token. 
+4. Authorization token request: "/api/v1/auth/ping/"
 
 ```
 curl -H "Authorization: Token l7p81hy0iEPzKZY5l0SEfpiKecwGQ1aqsGO4DyYs" http://localhost:3001/api/v1/auth/ping/
 ```
 
-10. You should receive the following response, which shows you're now authenticated to the system using the time-based token.
+output if token is valid:
 ```
 pong
 ```
 
-11. Attempt authenticating to the application using an invalid token. For instance, fakerandomtoken.
-```
-curl -H "Authorization: Token fakerandomtoken" http://localhost:3001/api/v1/auth/ping/
-```
-
-* Your application should not allow you in, and you'll get the error below.
+output if token not valid
 ```
 invalid access token
 ```
 
-12. Next, attempt requesting a expired token.
-
-```
-curl -H "Authorization: Token l7p81hy0iEPzKZY5l0SEfpiKecwGQ1aqsGO4DyYs" http://localhost:3001/api/v1/auth/ping/
-```
-
-* output 
+output if token expired
 ```
 the token is expired
 ```
 
-14. Your token-based authentication logic is now working as expected.
+5. To get account info: "/api/v1/account/info/"
+```
+curl -H "Authorization: Token 5DwfTS8iOkbV4LkyHUDucmdlLfMuyum8VBDTgz2j" http://localhost:3001/api/v1/account/info/
+```
+output example:
+{
+  "avatar_url":"http://127.0.0.1:3000/media/avatars/default.png",
+  "contact_email":null,
+  "department":"",
+  "email":"john_doe",
+  "email_notification_interval":0,
+  "institution":"",
+  "is_staff":false,
+  "login_id":"",
+  "name":"john_doe",
+  "space_usage":"0.00%",
+  "total":0,
+  "usage":0
+}
 
-15. Please note: When using Golang token-based authentication in a production environment, you should always use SSL/TLS certificates to prevent attacks during token requests, and responses flow.
+
+Please note: When using Golang token-based authentication in a production environment, you should always use SSL/TLS certificates to prevent attacks during token requests, and responses flow.
 
 ## References:
 > https://www.vultr.com/docs/implement-tokenbased-authentication-with-golang-and-mysql-8-server/
