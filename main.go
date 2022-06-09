@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"path/filepath"
 	"strings"
 
 	"github.com/gin-contrib/cors"
@@ -14,6 +15,8 @@ import (
 
 func main() {
 	r := gin.Default()
+	// Set a lower memory limit for multipart forms (default is 32 MiB)
+	r.MaxMultipartMemory = 8 << 20 // 8 MiB
 	r.Use(cors.New(cors.Config{
 		AllowAllOrigins:  true,
 		AllowMethods:     []string{"PUT", "PATCH", "POST", "GET"},
@@ -36,6 +39,27 @@ func main() {
 	})
 	r.GET("/api/v1/account/info/", func(c *gin.Context) {
 		AccountInfoResponse(c)
+	})
+
+	r.POST("/api/v1/upload", func(c *gin.Context) {
+		// Source
+		file, err := c.FormFile("file")
+		if err != nil {
+			c.String(http.StatusBadRequest, "get form err: %s", err.Error())
+			return
+		}
+
+		filename := filepath.Base(file.Filename)
+
+		dst := "./upload/" + filename //<- destino del archivo
+
+		// filename := "./tmp/" + filepath.Base(file.Filename)
+		if err := c.SaveUploadedFile(file, dst); err != nil {
+			c.String(http.StatusBadRequest, "upload file err: %s", err.Error())
+			return
+		}
+
+		c.String(http.StatusOK, "File %s uploaded successfully.", file.Filename)
 	})
 
 	r.Run(":3001")
