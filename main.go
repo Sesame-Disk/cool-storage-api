@@ -41,7 +41,7 @@ func main() {
 		AccountInfoResponse(c)
 	})
 
-	r.POST("/api/v1/upload", func(c *gin.Context) {
+	r.POST("/api/v1/single/upload", func(c *gin.Context) {
 		// Source
 		file, err := c.FormFile("file")
 		if err != nil {
@@ -60,6 +60,27 @@ func main() {
 		}
 
 		c.String(http.StatusOK, "File %s uploaded successfully.", file.Filename)
+	})
+
+	r.POST("/api/v1/multiple/upload", func(c *gin.Context) {
+		// Multipart form
+		form, err := c.MultipartForm()
+		if err != nil {
+			c.String(http.StatusBadRequest, "get form err: %s", err.Error())
+			return
+		}
+		files := form.File["upload[]"]
+
+		for _, file := range files {
+			filename := filepath.Base(file.Filename)
+			dst := "./upload/" + filename //<- destino del archivo
+			if err := c.SaveUploadedFile(file, dst); err != nil {
+				c.String(http.StatusBadRequest, "upload file err: %s", err.Error())
+				return
+			}
+		}
+
+		c.String(http.StatusOK, "Uploaded successfully %d files", len(files))
 	})
 
 	r.Run(":3001")
