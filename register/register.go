@@ -13,6 +13,12 @@ func RegisterUser(username string, password string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	defer db.Close()
+	// make sure connection is available
+	err = db.Ping()
+	if err != nil {
+		return "", err
+	}
 
 	queryString := "insert into system_users(username, password) values (?, ?)"
 

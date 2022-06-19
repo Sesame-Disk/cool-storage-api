@@ -2,6 +2,7 @@ package main
 
 import (
 	authenticate "cool-storage-api/authenticate"
+	"cool-storage-api/configread"
 	register "cool-storage-api/register"
 	"errors"
 	"fmt"
@@ -14,6 +15,8 @@ import (
 )
 
 func main() {
+	config := configread.ParseYamlConfig("conf/cool-api.yaml")
+
 	r := gin.Default()
 	// Set a lower memory limit for multipart forms (default is 32 MiB)
 	r.MaxMultipartMemory = 8 << 20 // 8 MiB
@@ -83,7 +86,11 @@ func main() {
 		c.String(http.StatusOK, "Uploaded successfully %d files", len(files))
 	})
 
-	r.Run(":3001")
+	if err := r.Run(config.ServerConfig.Port); nil != err {
+		panic(err)
+	}
+
+	// r.Run(":3001")
 }
 
 func enableCors(c *gin.Context) {

@@ -19,6 +19,12 @@ func ValidateToken(authToken string) (map[string]interface{}, error) {
 	if err != nil {
 		return nil, err
 	}
+	defer db.Close()
+	// make sure connection is available
+	err = db.Ping()
+	if err != nil {
+		return nil, err
+	}
 
 	queryString := `select 
                 system_users.user_id,
@@ -76,6 +82,12 @@ func ValidateToken(authToken string) (map[string]interface{}, error) {
 func GetToken(username string, password string) (map[string]string, error) {
 
 	db, err := sql.Open("mysql", "sample_db_user:EXAMPLE_PASSWORD@tcp(host.docker.internal:33061)/sample_db")
+	if err != nil {
+		return nil, err
+	}
+	defer db.Close()
+	// make sure connection is available
+	err = db.Ping()
 	if err != nil {
 		return nil, err
 	}
