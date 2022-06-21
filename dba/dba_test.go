@@ -9,9 +9,13 @@ import (
 )
 
 func TestObtenerBaseDeDatos(t *testing.T) {
-	_, err := dba.ObtenerBaseDeDatos()
+	db, err := dba.ObtenerBaseDeDatos()
 	if err != nil {
 		t.Errorf("Expected %v but got %v", nil, err)
+	}
+	err = db.Ping()
+	if err != nil {
+		t.Errorf(err.Error())
 	}
 }
 
