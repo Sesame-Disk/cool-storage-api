@@ -90,7 +90,6 @@ func main() {
 		panic(err)
 	}
 
-	// r.Run(":3001")
 }
 
 func enableCors(c *gin.Context) {
