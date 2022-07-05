@@ -49,7 +49,7 @@ go test -v .\some_test.go
 1. Run the tests and save the coverage profile in "coverage.out" 
 
 ```
-go test --coverprofile=coverage.out
+go test ./... --coverprofile=coverage.out
 ```
 
 2. View the coverage profile in your browser
