@@ -14,6 +14,10 @@ services:
       MYSQL_USER: root
       MYSQL_PASSWORD: secret
       MYSQL_DB: sample_db
+    networks:
+      - todo-app
+    depends_on:
+      - mysq
 
   mysq:
     image: mysql
@@ -26,4 +30,7 @@ services:
       - 33061:3306
     expose:
       - '33061'
-
+    networks:
+      - todo-app
+networks:
+  todo-app:
