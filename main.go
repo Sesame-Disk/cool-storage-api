@@ -7,9 +7,12 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
+	"github.com/Ja7ad/goMerge"
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
 )
@@ -22,10 +25,11 @@ func main() {
 	r.MaxMultipartMemory = 8 << 20 // 8 MiB
 	r.Use(cors.New(cors.Config{
 		AllowAllOrigins:  true,
-		AllowMethods:     []string{"PUT", "PATCH", "POST", "GET"},
-		AllowHeaders:     []string{"authorization"},
+		AllowMethods:     []string{"PUT", "PATCH", "POST", "GET", "OPTIONS"},
+		AllowHeaders:     []string{"authorization", "uploader-chunk-number", "uploader-chunks-total", "uploader-file-id"},
 		ExposeHeaders:    []string{"Content-Length"},
 		AllowCredentials: true,
+		MaxAge:           86400,
 	}))
 
 	r.GET("/api/v1/ping", func(c *gin.Context) {
@@ -46,23 +50,45 @@ func main() {
 
 	r.POST("/api/v1/single/upload", func(c *gin.Context) {
 		// Source
-		file, err := c.FormFile("file")
+		_, uploadFile, err := c.Request.FormFile("file")
 		if err != nil {
 			c.String(http.StatusBadRequest, "get form err: %s", err.Error())
 			return
 		}
-
-		filename := filepath.Base(file.Filename)
-
-		dst := "./upload/" + filename //<- destino del archivo
+		// filename := filepath.Base(file.Filename)
+		filename := c.GetHeader("uploader-file-name")
+		fmt.Println(filename)
+		fileid := c.GetHeader("uploader-file-id")
+		chunkNum := c.GetHeader("uploader-chunk-number")
+		chunksTotal := c.GetHeader("uploader-chunks-total")
+		extension := filepath.Ext(filename)
+		name := filename[0 : len(filename)-len(extension)]
+		extension = ".marged"
+		path := "./upload/" + fileid
+		dst := path + "/" + chunkNum + "." + extension //<- destino del archivo
+		if _, err := os.Stat(dst); os.IsNotExist(err) {
+			os.Mkdir(path, 0777)
+		}
 
 		// filename := "./tmp/" + filepath.Base(file.Filename)
-		if err := c.SaveUploadedFile(file, dst); err != nil {
+		if err := c.SaveUploadedFile(uploadFile, dst); err != nil {
 			c.String(http.StatusBadRequest, "upload file err: %s", err.Error())
 			return
 		}
 
-		c.String(http.StatusOK, "File %s uploaded successfully.", file.Filename)
+		c.String(http.StatusOK, "File %s uploaded successfully.", filename)
+
+		chunklen, _ := strconv.Atoi(chunksTotal)
+		chunknumInt, _ := strconv.Atoi(chunkNum)
+		newfile := path + "/" + name + extension
+		if chunknumInt == chunklen-1 {
+			//merge all chunks
+			err := goMerge.Merge(path, extension, newfile, true)
+			if err != nil {
+				fmt.Println(err)
+			}
+		}
+
 	})
 
 	r.POST("/api/v1/multiple/upload", func(c *gin.Context) {
