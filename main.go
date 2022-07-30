@@ -31,7 +31,7 @@ func main() {
 	r.Use(cors.New(cors.Config{
 		AllowAllOrigins:  true,
 		AllowMethods:     []string{"PUT", "PATCH", "POST", "GET", "OPTIONS"},
-		AllowHeaders:     []string{"authorization", "uploader-chunk-number", "uploader-chunks-total", "uploader-file-id", "uploader-file-name", "uploader-file-hash"},
+		AllowHeaders:     []string{"authorization", "uploader-chunk-number", "uploader-chunks-total", "uploader-file-id", "uploader-file-name"},
 		ExposeHeaders:    []string{"Content-Length"},
 		AllowCredentials: true,
 		MaxAge:           86400,
@@ -49,7 +49,6 @@ func main() {
 			c.String(http.StatusBadRequest, "get form err: %s", err.Error())
 			return
 		}
-		// filename := filepath.Base(file.Filename)
 		filename := c.GetHeader("uploader-file-name")
 		fmt.Println(filename)
 		fileid := c.GetHeader("uploader-file-id")
@@ -58,14 +57,12 @@ func main() {
 		chunksTotal := c.GetHeader("uploader-chunks-total")
 		extension := filepath.Ext(filename)
 		name := filename[0 : len(filename)-len(extension)]
-		extension = ".marged"
 		path := "./upload/" + fileid
 		dst := path + "/" + chunkNum + "." + extension //<- destino del archivo
 		if _, err := os.Stat(dst); os.IsNotExist(err) {
 			os.Mkdir(path, 0777)
 		}
 
-		// filename := "./tmp/" + filepath.Base(file.Filename)
 		if err := c.SaveUploadedFile(uploadFile, dst); err != nil {
 			c.String(http.StatusBadRequest, "upload file err: %s", err.Error())
 			return
