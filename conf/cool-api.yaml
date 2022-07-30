@@ -7,10 +7,10 @@ server:
   readTimeoutSecs: 15
   writeTimeoutSecs: 15
 db:
-  user: "sample_db_user"
-  pass: "EXAMPLE_PASSWORD"
-  host: "tcp(127.0.0.1:33061)"
-  dataBaseName: "sample_db"
+  user: "root"
+  pass: "0204"
+  host: "tcp(127.0.0.1:3306)"
+  dataBaseName: "new_db_collection"
   migrate:
     enable: true
     dir: "/config/migrations"
