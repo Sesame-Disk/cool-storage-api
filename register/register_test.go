@@ -19,7 +19,11 @@ func TestRegisterUser_WithRandomUser(t *testing.T) {
 
 	var count int
 
-	db, err := sql.Open("mysql", "sample_db_user:EXAMPLE_PASSWORD@tcp(127.0.0.1:3306)/sample_db")
+	db, err := sql.Open("mysql", "sample_db_user:EXAMPLE_PASSWORD@tcp(host.docker.internal:33061)/sample_db")
+	if err != nil {
+		t.Errorf(err.Error())
+	}
+	err = db.Ping()
 	if err != nil {
 		t.Errorf(err.Error())
 	}
@@ -43,7 +47,7 @@ func TestRegisterUser_WithRandomUser(t *testing.T) {
 
 	oldCount, err1 := dbCount(db)
 	if err1 != nil {
-		t.Errorf(err.Error())
+		t.Errorf(err1.Error())
 	}
 
 	result, err := register.RegisterUser(randomUser, randomPassword)

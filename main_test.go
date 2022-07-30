@@ -2,7 +2,7 @@ package main
 
 import (
 	"cool-storage-api/authenticate"
-	register "cool-storage-api/register"
+	"cool-storage-api/register"
 	"encoding/json"
 	"math/rand"
 	"net/http"

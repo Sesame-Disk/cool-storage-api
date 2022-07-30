@@ -1,8 +1,13 @@
 package dba
 
 import (
-	"cool-storage-api/authenticate"
+	"cool-storage-api/configread"
+	"crypto/rand"
 	"database/sql"
+	"encoding/base64"
+	"fmt"
+	"strings"
+	"time"
 )
 
 type Contacto struct {
@@ -11,11 +16,35 @@ type Contacto struct {
 }
 
 func ObtenerBaseDeDatos() (db *sql.DB, e error) {
-	db, err := sql.Open("mysql", "sample_db_user:EXAMPLE_PASSWORD@tcp(127.0.0.1:33061)/sample_db")
+
+	config := configread.Configuration
+	// db, err := sql.Open("mysql", "sample_db_user:EXAMPLE_PASSWORD@tcp(host.docker.internal:33061)/sample_db")
+	// if err != nil {
+	// 	return nil, err
+	// }
+	// err = db.Ping()
+	// if err != nil {
+	// 	return nil, err
+	// }
+	// return db, nil
+
+	usuario := config.DataBaseConfig.Usuario                     //"root"
+	pass := config.DataBaseConfig.Pass                           //"0204"
+	host := config.DataBaseConfig.Host                           //"tcp(127.0.0.1:3306)"
+	nombreBaseDeDatos := config.DataBaseConfig.NombreBaseDeDatos //"new_db_collection"
+
+	// Debe tener la forma usuario:contraseña@protocolo(host:puerto)/nombreBaseDeDatos
+	db, err := sql.Open("mysql", fmt.Sprintf("%s:%s@%s/%s", usuario, pass, host, nombreBaseDeDatos))
 	if err != nil {
 		return nil, err
 	}
-	return db, nil
+	// defer db.Close()
+	// make sure connection is available
+	err = db.Ping()
+	if err != nil {
+		return nil, err
+	}
+	return db, err
 }
 
 func Eliminar(c Contacto) error {
@@ -74,7 +103,7 @@ func InsertIntoAuthenticationTokens() (e error) {
 
 	defer stmt.Close()
 
-	tokenDetails, err := authenticate.BuildRandomToken()
+	tokenDetails, err := BuildRandomToken()
 	if err != nil {
 		return err
 	}
@@ -84,4 +113,37 @@ func InsertIntoAuthenticationTokens() (e error) {
 		return err
 	}
 	return nil
+}
+
+//Generate a random alphanumeric token of len 40
+func BuildRandomToken() (map[string]string, error) {
+	randomToken := make([]byte, 30)
+
+	_, err := rand.Read(randomToken)
+
+	if err != nil {
+		return nil, err
+	}
+
+	authToken := base64.URLEncoding.EncodeToString(randomToken)
+
+	authToken = strings.Replace(authToken, "-", "0", 40)
+	authToken = strings.Replace(authToken, "_", "1", 40)
+
+	const timeLayout = "2006-01-02 15:04:05"
+
+	dt := time.Now()
+	expirtyTime := time.Now().Add(time.Minute * 1)
+
+	generatedAt := dt.Format(timeLayout)
+	expiresAt := expirtyTime.Format(timeLayout)
+
+	tokenDetails := map[string]string{
+		"token_type":   "Bearer",
+		"auth_token":   authToken,
+		"generated_at": generatedAt,
+		"expires_at":   expiresAt,
+	}
+
+	return tokenDetails, err
 }

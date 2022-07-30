@@ -2,43 +2,124 @@ package main
 
 import (
 	authenticate "cool-storage-api/authenticate"
+	"cool-storage-api/configread"
 	register "cool-storage-api/register"
+	"crypto/sha256"
 	"errors"
 	"fmt"
+	"io/ioutil"
+	"log"
 	"net/http"
+	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 
+	"github.com/Ja7ad/goMerge"
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
 )
 
 func main() {
+	// config := configread.ParseYamlConfig("conf/cool-api.yaml")
+
+	config := configread.Configuration
+
 	r := gin.Default()
+	// Set a lower memory limit for multipart forms (default is 32 MiB)
+	r.MaxMultipartMemory = 8 << 20 // 8 MiB
 	r.Use(cors.New(cors.Config{
 		AllowAllOrigins:  true,
-		AllowMethods:     []string{"PUT", "PATCH", "POST", "GET"},
-		AllowHeaders:     []string{"authorization"},
+		AllowMethods:     []string{"PUT", "PATCH", "POST", "GET", "OPTIONS"},
+		AllowHeaders:     []string{"authorization", "uploader-chunk-number", "uploader-chunks-total", "uploader-file-id", "uploader-file-name", "uploader-file-hash"},
 		ExposeHeaders:    []string{"Content-Length"},
 		AllowCredentials: true,
+		MaxAge:           86400,
 	}))
 
-	r.GET("/api/v1/ping", func(c *gin.Context) {
-		PingResponse(c)
+	r.GET("/api/v1/ping", PingResponse)
+	r.POST("/api/v1/auth-token/", GetAuthenticationTokenHandler)
+	r.GET("/api/v1/auth/ping/", AuthPing)
+	r.POST("/api/v1/registrations", RegistrationsHandler)
+	r.GET("/api/v1/account/info/", AccountInfoResponse)
+	r.POST("/api/v1/single/upload", func(c *gin.Context) {
+		// Source
+		_, uploadFile, err := c.Request.FormFile("file")
+		if err != nil {
+			c.String(http.StatusBadRequest, "get form err: %s", err.Error())
+			return
+		}
+		filename := c.GetHeader("uploader-file-name")
+		fmt.Println(filename)
+		fileid := c.GetHeader("uploader-file-id")
+		fileHash := c.GetHeader("uploader-file-hash")
+		chunkNum := c.GetHeader("uploader-chunk-number")
+		chunksTotal := c.GetHeader("uploader-chunks-total")
+		extension := filepath.Ext(filename)
+		name := filename[0 : len(filename)-len(extension)]
+		path := "./upload/" + fileid
+		dst := path + "/" + chunkNum + "." + extension //<- destino del archivo
+		if _, err := os.Stat(dst); os.IsNotExist(err) {
+			os.Mkdir(path, 0777)
+		}
+
+		if err := c.SaveUploadedFile(uploadFile, dst); err != nil {
+			c.String(http.StatusBadRequest, "upload file err: %s", err.Error())
+			return
+		}
+
+		c.String(http.StatusOK, "File %s uploaded successfully.", filename)
+
+		chunklen, _ := strconv.Atoi(chunksTotal)
+		chunknumInt, _ := strconv.Atoi(chunkNum)
+		newfile := path + "/" + name + extension
+		if chunknumInt == chunklen-1 {
+			//merge all chunks
+			err := goMerge.Merge(path, extension, newfile, true)
+			if err != nil {
+				fmt.Println(err)
+			}
+			hash := hashingReadFile(newfile)
+			if hash != fileHash {
+				c.String(http.StatusBadRequest, "upload file err: %s", errors.New("upload failed"))
+			}
+		}
+
 	})
-	r.POST("/api/v1/auth-token/", func(c *gin.Context) {
-		GetAuthenticationTokenHandler(c)
-	})
-	r.GET("/api/v1/auth/ping/", func(c *gin.Context) {
-		AuthPing(c)
-	})
-	r.POST("/api/v1/registrations", func(c *gin.Context) {
-		RegistrationsHandler(c)
-	})
-	r.GET("/api/v1/account/info/", func(c *gin.Context) {
-		AccountInfoResponse(c)
+	r.POST("/api/v1/multiple/upload", func(c *gin.Context) {
+		// Multipart form
+		form, err := c.MultipartForm()
+		if err != nil {
+			c.String(http.StatusBadRequest, "get form err: %s", err.Error())
+			return
+		}
+		files := form.File["upload[]"]
+
+		for _, file := range files {
+			filename := filepath.Base(file.Filename)
+			dst := "./upload/" + filename //<- destino del archivo
+			if err := c.SaveUploadedFile(file, dst); err != nil {
+				c.String(http.StatusBadRequest, "upload file err: %s", err.Error())
+				return
+			}
+		}
+
+		c.String(http.StatusOK, "Uploaded successfully %d files", len(files))
 	})
 
-	r.Run(":3001")
+	if err := r.Run(config.ServerConfig.Port); nil != err {
+		panic(err)
+	}
+}
+
+func hashingReadFile(path string) string {
+	content, err := ioutil.ReadFile(path)
+	if err != nil {
+		log.Fatal(err)
+	}
+	another := sha256.Sum256(content)
+	resultstring := fmt.Sprintf("%x", another)
+	return resultstring
 }
 
 func enableCors(c *gin.Context) {
