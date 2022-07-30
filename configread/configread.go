@@ -65,3 +65,5 @@ func ParseYamlConfig(pathYaml string) Config {
 	}
 	return conf1
 }
+
+var Configuration = ParseYamlConfig("conf/cool-api.yaml")
