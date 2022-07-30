@@ -1,0 +1,21 @@
+app:
+  prefixUrl: "http://127.0.0.1:3001"
+  storageSavePath: "/upload/"
+server:
+  port: ":3001"
+  timeoutSecs: 10
+  readTimeoutSecs: 15
+  writeTimeoutSecs: 15
+db:
+  user: "root"
+  pass: "0204"
+  host: "tcp(127.0.0.1:3306)"
+  dataBaseName: "new_db_collection"
+  migrate:
+    enable: true
+    dir: "/config/migrations"
+  pool:
+    maxOpen: 50
+    maxIdle: 5
+    maxLifetime: 86400
+

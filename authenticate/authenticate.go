@@ -1,6 +1,7 @@
 package authenticate
 
 import (
+	"cool-storage-api/dba"
 	"crypto/rand"
 	"database/sql"
 	"encoding/base64"
@@ -15,14 +16,21 @@ import (
 //Get the username associated with the token input
 func ValidateToken(authToken string) (map[string]interface{}, error) {
 
-	db, err := sql.Open("mysql", "sample_db_user:EXAMPLE_PASSWORD@tcp(host.docker.internal:33061)/sample_db")
+	// db, err := sql.Open("mysql", "sample_db_user:EXAMPLE_PASSWORD@tcp(host.docker.internal:33061)/sample_db")
+	db, err := dba.ObtenerBaseDeDatos()
+	if err != nil {
+		return nil, err
+	}
+	defer db.Close()
+	// make sure connection is available
+	err = db.Ping()
 	if err != nil {
 		return nil, err
 	}
 
 	queryString := `select 
                 system_users.user_id,
-                username,
+                email,
                 generated_at,
                 expires_at                         
             from authentication_tokens
@@ -38,11 +46,11 @@ func ValidateToken(authToken string) (map[string]interface{}, error) {
 	defer stmt.Close()
 
 	userId := 0
-	username := ""
+	email := ""
 	generatedAt := ""
 	expiresAt := ""
 
-	err = stmt.QueryRow(authToken).Scan(&userId, &username, &generatedAt, &expiresAt)
+	err = stmt.QueryRow(authToken).Scan(&userId, &email, &generatedAt, &expiresAt)
 
 	if err != nil {
 
@@ -64,7 +72,7 @@ func ValidateToken(authToken string) (map[string]interface{}, error) {
 
 	userDetails := map[string]interface{}{
 		"user_id":      userId,
-		"username":     username,
+		"email":        email,
 		"generated_at": generatedAt,
 		"expires_at":   expiresAt,
 	}
@@ -73,14 +81,21 @@ func ValidateToken(authToken string) (map[string]interface{}, error) {
 }
 
 //Get a valid token associated with username and password
-func GetToken(username string, password string) (map[string]string, error) {
+func GetToken(email string, password string) (map[string]string, error) {
 
-	db, err := sql.Open("mysql", "sample_db_user:EXAMPLE_PASSWORD@tcp(host.docker.internal:33061)/sample_db")
+	// db, err := sql.Open("mysql", "sample_db_user:EXAMPLE_PASSWORD@tcp(host.docker.internal:33061)/sample_db")
+	db, err := dba.ObtenerBaseDeDatos()
+	if err != nil {
+		return nil, err
+	}
+	defer db.Close()
+	// make sure connection is available
+	err = db.Ping()
 	if err != nil {
 		return nil, err
 	}
 
-	queryString := "select user_id, password from system_users where username = ?"
+	queryString := "select user_id, password from system_users where email = ?"
 
 	stmt, err := db.Prepare(queryString)
 	if err != nil {
@@ -92,12 +107,12 @@ func GetToken(username string, password string) (map[string]string, error) {
 	userId := 0
 	accountPassword := ""
 
-	err = stmt.QueryRow(username).Scan(&userId, &accountPassword)
+	err = stmt.QueryRow(email).Scan(&userId, &accountPassword)
 
 	if err != nil {
 
 		if err == sql.ErrNoRows {
-			return nil, errors.New("invalid username or password" + username + " " + password)
+			return nil, errors.New("invalid email or password" + email + " " + password)
 		}
 
 		return nil, err
@@ -106,7 +121,7 @@ func GetToken(username string, password string) (map[string]string, error) {
 	err = bcrypt.CompareHashAndPassword([]byte(accountPassword), []byte(password))
 
 	if err != nil {
-		return nil, errors.New("invalid username or password" + username + " " + password)
+		return nil, errors.New("invalid email or password" + email + " " + password)
 	}
 
 	queryString = "select token_id, auth_token, generated_at, expires_at from authentication_tokens where user_id = ?"
