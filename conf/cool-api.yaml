@@ -18,4 +18,9 @@ db:
     maxOpen: 50
     maxIdle: 5
     maxLifetime: 86400
-
+aws:
+  accessKeyID: 'AKIAT7HILEBQYK4HFXZ2'
+  secretAccessKey: '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'
+  accessToken: ''
+  region: 'us-west-2'
+  vaultName: 'dev-uploadfiles'
