@@ -10,6 +10,7 @@ type Config struct {
 	CoolAppConf    AppConf  `yaml:"app"`
 	ServerConfig   ServConf `yaml:"server"`
 	DataBaseConfig DBConf   `yaml:"db"`
+	AWSConfig      AWSConf  `yaml:"aws"`
 }
 
 type AppConf struct {
@@ -42,6 +43,14 @@ type PoolConf struct {
 	MaxOpen     int `yaml:"maxOpen"`
 	MaxIdle     int `yaml:"maxIdle"`
 	MaxLifetime int `yaml:"maxLifetime"`
+}
+
+type AWSConf struct {
+	AccessKeyID     string `yaml:"accessKeyID"`
+	SecretAccessKey string `yaml:"secretAccessKey"`
+	AccessToken     string `yaml:"accessToken"`
+	Region          string `yaml:"region"`
+	VaultName       string `yaml:"vaultName"`
 }
 
 func unmarshalYAMLFile(path string, v interface{}) error {
