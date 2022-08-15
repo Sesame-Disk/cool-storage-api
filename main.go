@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"context"
 	authenticate "cool-storage-api/authenticate"
 	configread "cool-storage-api/configread"
 	register "cool-storage-api/register"
@@ -8,8 +10,13 @@ import (
 	"errors"
 	"fmt"
 	"io/ioutil"
+	"log"
 	"net/http"
 	"strings"
+
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/service/glacier"
 
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
@@ -97,12 +104,36 @@ func Upload(c *gin.Context) {
 	}
 
 	filename := c.GetHeader("uploader-file-name")
+	chunkid := c.GetHeader("uploader-chunk-number")
+	chunksTotal := c.GetHeader("uploader-chunks-total")
 	path := "./upload/"
 	dst := path + filename //<- destino del archivo
 
 	util.AppendData(dst, fileData)
 
-	c.String(http.StatusOK, "File %s uploaded successfully.", filename)
+	//AWS-Glacier
+	if chunkid == chunksTotal {
+		Ufile, err := ioutil.ReadFile(dst)
+		awsConfig := configread.Configuration.AWSConfig
+		cfg, err := config.LoadDefaultConfig(context.TODO(), config.WithRegion(awsConfig.Region),
+			config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(awsConfig.AccessKeyID, awsConfig.SecretAccessKey, awsConfig.AccessToken)))
+		if err != nil {
+			log.Fatalf("failed to load AWS configuration, %v", err)
+		}
+		client := glacier.NewFromConfig(cfg)
+		vaultName := awsConfig.VaultName
+		input := glacier.UploadArchiveInput{
+			VaultName: &vaultName,
+			Body:      bytes.NewReader(Ufile),
+		}
+		result, err := client.UploadArchive(context.TODO(), &input)
+		if err != nil {
+			log.Fatalf("failed to upload archive to AWS-Glacier, %v", err)
+		}
+		c.String(http.StatusOK, "File %s uploaded successfully with id %s", filename, *result.ArchiveId)
+	} else {
+		c.String(http.StatusOK, "Chunk # %s of file %s uploaded successfully.", chunkid, filename)
+	}
 }
 
 //return a valid token
