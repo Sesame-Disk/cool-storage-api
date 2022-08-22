@@ -1,0 +1,26 @@
+app:
+  prefixUrl: "http://localhost:8080"
+  storageSavePath: "/storage/"
+server:
+  port: ":8080"
+  timeoutSecs: 5
+  readTimeoutSecs: 5
+  writeTimeoutSecs: 5
+db:
+  user: "user"
+  pass: "pass"
+  host: "tcp(...)"
+  dataBaseName: "db_name"
+  migrate:
+    enable: true 
+    dir:  "/migrate"
+  pool:
+    maxOpen: 5
+    maxIdle: 5
+    maxLifetime: 5
+aws:
+  accessKeyID: "MYACCESSKEYID"
+  secretAccessKey: "MYSECRETACCESSKEY"
+  accessToken: "MYACCESSTOKEN"
+  region: "region"
+  vaultName: "vaultName"

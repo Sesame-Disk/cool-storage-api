@@ -11,4 +11,4 @@ todo-mysql-data/
 .DS_Store
 .git
 *.out
-conf/cool-api.yaml
+cool-api.yaml
