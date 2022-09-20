@@ -24,3 +24,6 @@ aws:
   accessToken: "MYACCESSTOKEN"
   region: "region"
   vaultName: "vaultName"
+  snstopicName: "snstopicName"
+  SNSTopic: "TopicArn"
+  jobDescription: "jobDescription"
