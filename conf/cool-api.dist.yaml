@@ -26,4 +26,3 @@ aws:
   vaultName: "vaultName"
   snstopicName: "snstopicName"
   SNSTopic: "TopicArn"
-  jobDescription: "jobDescription"

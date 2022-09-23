@@ -5,6 +5,7 @@ import (
 	"context"
 	authenticate "cool-storage-api/authenticate"
 	configread "cool-storage-api/configread"
+	glacierdownloader "cool-storage-api/glacierdownloader"
 	register "cool-storage-api/register"
 	util "cool-storage-api/util"
 	"errors"
@@ -13,6 +14,7 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
@@ -44,6 +46,7 @@ func main() {
 	r.POST("/api/v1/registrations", RegistrationsHandler)
 	r.GET("/api/v1/account/info/", AccountInfoResponse)
 	r.POST("/api/v1/single/upload", Upload)
+	r.POST("/api/v1/single/download", Download)
 
 	// r.POST("/api/v1/multiple/upload", func(c *gin.Context) {
 	// 	// Multipart form
@@ -133,6 +136,35 @@ func Upload(c *gin.Context) {
 		c.String(http.StatusOK, "File %s uploaded successfully with id %s", filename, *result.ArchiveId)
 	} else {
 		c.String(http.StatusOK, "Chunk # %s of file %s uploaded successfully.", chunkid, filename)
+	}
+}
+
+//downlod file
+func Download(c *gin.Context) {
+	err1 := c.Request.ParseForm()
+	if err1 != nil {
+		c.String(http.StatusBadRequest, err1.Error())
+	} else {
+
+		archiveId := c.Request.FormValue("archiveId")
+
+		fileName := c.Request.FormValue("fileName")
+
+		start := time.Now()
+		log.Print("starting download file at")
+		log.Print(start)
+
+		err := glacierdownloader.Download(archiveId, fileName)
+		if err != nil {
+			c.String(http.StatusBadGateway, err.Error())
+		} else {
+			c.String(http.StatusOK, "download success")
+		}
+
+		end := time.Now()
+		log.Print("finish download file at")
+		log.Print(end)
+
 	}
 }
 

@@ -53,7 +53,6 @@ type AWSConf struct {
 	VaultName       string `yaml:"vaultName"`
 	SNSTopicName    string `yaml:"snstopicName"`
 	SNSTopic        string `yaml:"SNSTopic"`
-	JobDescription  string `yaml:"jobDescription"`
 }
 
 func unmarshalYAMLFile(path string, v interface{}) error {
