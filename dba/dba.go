@@ -2,6 +2,7 @@ package dba
 
 import (
 	"cool-storage-api/configread"
+	"cool-storage-api/util"
 	"crypto/rand"
 	"database/sql"
 	"encoding/base64"
@@ -115,20 +116,20 @@ func InsertIntoAuthenticationTokens() (e error) {
 	return nil
 }
 
-func InsertArchive(archive_id string, archive_name string, library string) (e error) {
+func InsertArchive(a util.Archive) (e error) {
 	db, err := ObtenerBaseDeDatos()
 	if err != nil {
 		return err
 	}
 	defer db.Close()
 
-	sql, err := db.Prepare("INSERT INTO files (file_id, library_id, file_name) VALUES(?, ?, ?)")
+	sql, err := db.Prepare("INSERT INTO files (`vault_file_id`,`library_id`,`user_id`,`file_name`,`upload_date`,`file_size`,`file_state`) VALUES(?, ?, ?, ?, ?, ?, ?)")
 	if err != nil {
 		return err
 	}
 	defer sql.Close()
 
-	_, err = sql.Exec(archive_id, library, archive_name)
+	_, err = sql.Exec(a.Vault_file_id, a.Library_id, a.User_id, a.File_name, a.Upload_date, a.File_size, a.File_state)
 	if err != nil {
 		return err
 	}

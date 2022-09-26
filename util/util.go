@@ -8,6 +8,16 @@ import (
 	"os"
 )
 
+type Archive struct {
+	Vault_file_id string
+	Library_id    int
+	User_id       int
+	File_name     string
+	Upload_date   string
+	File_size     int
+	File_state    string
+}
+
 func AppendData(path string, data []byte) {
 	// If the file doesn't exist, create it, or append to the file
 	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)

@@ -129,7 +129,17 @@ func Upload(c *gin.Context) {
 		}
 
 		// save data to db
-		response := dba.InsertArchive(*result.ArchiveId, filename, "test")
+		archive_data := util.Archive{
+			Vault_file_id: *result.ArchiveId,
+			Library_id:    0,
+			User_id:       0,
+			File_name:     filename,
+			Upload_date:   "now",
+			File_size:     0,
+			File_state:    "uploading",
+		}
+
+		response := dba.InsertArchive(archive_data)
 		if response != nil {
 			c.String(http.StatusOK, response.Error())
 		} else {
