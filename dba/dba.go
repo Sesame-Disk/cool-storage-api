@@ -115,6 +115,27 @@ func InsertIntoAuthenticationTokens() (e error) {
 	return nil
 }
 
+func InsertArchive(archive_id string, archive_name string, library string) (e error) {
+	db, err := ObtenerBaseDeDatos()
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	sql, err := db.Prepare("INSERT INTO files (file_id, library_id, file_name) VALUES(?, ?, ?)")
+	if err != nil {
+		return err
+	}
+	defer sql.Close()
+
+	_, err = sql.Exec(archive_id, library, archive_name)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
 //Generate a random alphanumeric token of len 40
 func BuildRandomToken() (map[string]string, error) {
 	randomToken := make([]byte, 30)

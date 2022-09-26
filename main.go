@@ -5,6 +5,7 @@ import (
 	"context"
 	authenticate "cool-storage-api/authenticate"
 	configread "cool-storage-api/configread"
+	"cool-storage-api/dba"
 	glacierdownloader "cool-storage-api/glacierdownloader"
 	register "cool-storage-api/register"
 	util "cool-storage-api/util"
@@ -88,20 +89,12 @@ func PingResponse(c *gin.Context) {
 
 //upload file
 func Upload(c *gin.Context) {
-	// Source
+	// Get data from request
 	_, uploadFile, err := c.Request.FormFile("file")
-	if err != nil {
-		c.String(http.StatusBadRequest, "get form err: %s", err.Error())
-		return
-	}
 
-	file, err1 := uploadFile.Open()
-	if err1 != nil {
-		c.String(http.StatusBadRequest, "get form err: %s", err.Error())
-		return
-	}
-	fileData, err2 := ioutil.ReadAll(file)
-	if err2 != nil {
+	file, err := uploadFile.Open()
+	fileData, err := ioutil.ReadAll(file)
+	if err != nil {
 		c.String(http.StatusBadRequest, "get form err: %s", err.Error())
 		return
 	}
@@ -112,6 +105,7 @@ func Upload(c *gin.Context) {
 	path := "./upload/"
 	dst := path + filename //<- destino del archivo
 
+	// marge actual chunck with prev
 	util.AppendData(dst, fileData)
 
 	//AWS-Glacier
@@ -133,7 +127,14 @@ func Upload(c *gin.Context) {
 		if err != nil {
 			log.Fatalf("failed to upload archive to AWS-Glacier, %v", err)
 		}
-		c.String(http.StatusOK, "File %s uploaded successfully with id %s", filename, *result.ArchiveId)
+
+		// save data to db
+		response := dba.InsertArchive(*result.ArchiveId, filename, "test")
+		if response != nil {
+			c.String(http.StatusOK, response.Error())
+		} else {
+			c.String(http.StatusOK, "File %s uploaded successfully with id %s", filename, *result.ArchiveId)
+		}
 	} else {
 		c.String(http.StatusOK, "Chunk # %s of file %s uploaded successfully.", chunkid, filename)
 	}
