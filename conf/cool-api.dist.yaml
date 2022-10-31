@@ -2,6 +2,7 @@ app:
   prefixUrl: "http://localhost:8080"
   storageSavePath: "/storage/"
 server:
+  # same port as app in docker-compose file.
   port: ":8080"
   timeoutSecs: 5
   readTimeoutSecs: 5
@@ -9,7 +10,9 @@ server:
 db:
   user: "user"
   pass: "pass"
+  ## e.g. host: "tcp(mysql:33061)" for docker-compose
   host: "tcp(...)"
+  # If using docker-compose this DB should be the same as docker-compose file.
   dataBaseName: "db_name"
   migrate:
     enable: true 

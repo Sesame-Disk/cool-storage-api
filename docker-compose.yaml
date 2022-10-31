@@ -13,19 +13,21 @@ services:
       MYSQL_HOST: mysql
       MYSQL_USER: root
       MYSQL_PASSWORD: secret
-      MYSQL_DB: sample_db
+      MYSQL_DB: new_db_collection
     networks:
       - todo-app
     depends_on:
-      - mysq
+      - mysql
+    volumes:
+      - ./:/app
 
-  mysq:
+  mysql:
     image: mysql
     volumes:
       - ./DB:/docker-entrypoint-initdb.d
     environment:
       MYSQL_ROOT_PASSWORD: secret
-      MYSQL_DATABASE: sample_db
+      MYSQL_DATABASE: new_db_collection
     ports:
       - 33061:3306
     expose:
