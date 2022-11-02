@@ -1,10 +1,10 @@
 package main
 
 import (
-	"bytes"
-	"context"
 	authenticate "cool-storage-api/authenticate"
 	configread "cool-storage-api/configread"
+	glacierdownloader "cool-storage-api/glacierdownloader"
+	glacieruploader "cool-storage-api/glacieruploader"
 	register "cool-storage-api/register"
 	util "cool-storage-api/util"
 	"errors"
@@ -13,10 +13,7 @@ import (
 	"log"
 	"net/http"
 	"strings"
-
-	"github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/credentials"
-	"github.com/aws/aws-sdk-go-v2/service/glacier"
+	"time"
 
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
@@ -44,6 +41,7 @@ func main() {
 	r.POST("/api/v1/registrations", RegistrationsHandler)
 	r.GET("/api/v1/account/info/", AccountInfoResponse)
 	r.POST("/api/v1/single/upload", Upload)
+	r.POST("/api/v1/single/download", Download)
 
 	// r.POST("/api/v1/multiple/upload", func(c *gin.Context) {
 	// 	// Multipart form
@@ -85,20 +83,12 @@ func PingResponse(c *gin.Context) {
 
 //upload file
 func Upload(c *gin.Context) {
-	// Source
+	// Get data from request
 	_, uploadFile, err := c.Request.FormFile("file")
-	if err != nil {
-		c.String(http.StatusBadRequest, "get form err: %s", err.Error())
-		return
-	}
 
-	file, err1 := uploadFile.Open()
-	if err1 != nil {
-		c.String(http.StatusBadRequest, "get form err: %s", err.Error())
-		return
-	}
-	fileData, err2 := ioutil.ReadAll(file)
-	if err2 != nil {
+	file, err := uploadFile.Open()
+	fileData, err := ioutil.ReadAll(file)
+	if err != nil {
 		c.String(http.StatusBadRequest, "get form err: %s", err.Error())
 		return
 	}
@@ -109,30 +99,66 @@ func Upload(c *gin.Context) {
 	path := "./upload/"
 	dst := path + filename //<- destino del archivo
 
+	// marge actual chunck with prev
 	util.AppendData(dst, fileData)
 
 	//AWS-Glacier
 	if chunkid == chunksTotal {
-		Ufile, err := ioutil.ReadFile(dst)
-		awsConfig := configread.Configuration.AWSConfig
-		cfg, err := config.LoadDefaultConfig(context.TODO(), config.WithRegion(awsConfig.Region),
-			config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(awsConfig.AccessKeyID, awsConfig.SecretAccessKey, awsConfig.AccessToken)))
-		if err != nil {
-			log.Fatalf("failed to load AWS configuration, %v", err)
+		db := glacieruploader.Upload(dst, filename)
+		if db != nil {
+			c.String(http.StatusInternalServerError, db.Error())
+		} else {
+			// c.String(http.StatusOK, "File %s uploaded successfully with id %s", filename, *result.ArchiveId)
+			c.String(http.StatusOK, "File %s uploaded successfully", filename)
 		}
-		client := glacier.NewFromConfig(cfg)
-		vaultName := awsConfig.VaultName
-		input := glacier.UploadArchiveInput{
-			VaultName: &vaultName,
-			Body:      bytes.NewReader(Ufile),
-		}
-		result, err := client.UploadArchive(context.TODO(), &input)
-		if err != nil {
-			log.Fatalf("failed to upload archive to AWS-Glacier, %v", err)
-		}
-		c.String(http.StatusOK, "File %s uploaded successfully with id %s", filename, *result.ArchiveId)
 	} else {
 		c.String(http.StatusOK, "Chunk # %s of file %s uploaded successfully.", chunkid, filename)
+	}
+}
+
+//downlod file
+func Download(c *gin.Context) {
+	err1 := c.Request.ParseForm()
+	if err1 != nil {
+		c.String(http.StatusBadRequest, err1.Error())
+	} else {
+
+		archiveId := c.Request.FormValue("archiveId")
+
+		fileName := c.Request.FormValue("fileName")
+
+		// todo: get from DB and fill struct
+		archiveStruc := util.Archive{
+			Vault_file_id: archiveId,
+			Library_id:    0,
+			User_id:       0,
+			File_name:     fileName,
+			Upload_date:   "now",
+			File_size:     "0 KB",
+			File_checksum: " ",
+			File_state:    "uploaded",
+		}
+
+		if archiveStruc.File_state != "uploaded" {
+			c.String(http.StatusInternalServerError, "The file you're trying to download has already been uploaded")
+		} else {
+
+			start := time.Now()
+			log.Print("starting download file at")
+			log.Print(start)
+
+			err := glacierdownloader.Download(archiveStruc)
+			if err != nil {
+				c.String(http.StatusBadGateway, err.Error())
+			} else {
+				c.String(http.StatusOK, "download success")
+			}
+
+			end := time.Now()
+			log.Print("finish download file at")
+			log.Print(end)
+		}
+
 	}
 }
 
