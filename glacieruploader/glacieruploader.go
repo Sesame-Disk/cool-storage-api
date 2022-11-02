@@ -27,9 +27,7 @@ func Upload(dst string, filename string) error {
 	if err != nil {
 		return errors.New(fmt.Sprintf("Fail to load the size of the file: %s", err))
 	}
-	file_size := Rfile.Size()
-
-	// file_size := int64(0)
+	file_size := util.HumanFileSize(float64(Rfile.Size()))
 
 	awsConfig := configread.Configuration.AWSConfig
 	cfg, err := config.LoadDefaultConfig(context.TODO(), config.WithRegion(awsConfig.Region),

@@ -127,14 +127,14 @@ func Download(c *gin.Context) {
 
 		fileName := c.Request.FormValue("fileName")
 
-		// get from DB and fill struct
+		// todo: get from DB and fill struct
 		archiveStruc := util.Archive{
 			Vault_file_id: archiveId,
 			Library_id:    0,
 			User_id:       0,
 			File_name:     fileName,
 			Upload_date:   "now",
-			File_size:     0,
+			File_size:     "0 KB",
 			File_checksum: " ",
 			File_state:    "uploaded",
 		}

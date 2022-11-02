@@ -96,7 +96,7 @@ CREATE TABLE IF NOT EXISTS `new_db_collection`.`files` (
   `user_id` BIGINT NOT NULL,
   `file_name` VARCHAR(255) NOT NULL,
   `uplod_date` DATETIME NOT NULL,
-  `file_size` BIGINT NOT NULL,
+  `file_size` VARCHAR(255) NOT NULL,
   `file_checksum` VARCHAR(255) NOT NULL,
   `file_state` VARCHAR(45) NOT NULL,
   PRIMARY KEY (`vault_file_id`),
