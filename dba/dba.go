@@ -123,13 +123,13 @@ func InsertArchive(a util.Archive) (e error) {
 	}
 	defer db.Close()
 
-	sql, err := db.Prepare("INSERT INTO files (`vault_file_id`,`library_id`,`user_id`,`file_name`,`upload_date`,`file_size`,`file_state`) VALUES(?, ?, ?, ?, ?, ?, ?)")
+	sql, err := db.Prepare("INSERT INTO files (`vault_file_id`,`library_id`,`user_id`,`file_name`,`upload_date`,`file_size`, `file_checksum`, `file_state`) VALUES(?, ?, ?, ?, ?, ?, ?, ?)")
 	if err != nil {
 		return err
 	}
 	defer sql.Close()
 
-	_, err = sql.Exec(a.Vault_file_id, a.Library_id, a.User_id, a.File_name, a.Upload_date, a.File_size, a.File_state)
+	_, err = sql.Exec(a.Vault_file_id, a.Library_id, a.User_id, a.File_name, a.Upload_date, a.File_size, a.File_checksum, a.File_state)
 	if err != nil {
 		return err
 	}

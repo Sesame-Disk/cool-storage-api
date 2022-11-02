@@ -14,7 +14,8 @@ type Archive struct {
 	User_id       int
 	File_name     string
 	Upload_date   string
-	File_size     int
+	File_size     int64
+	File_checksum string
 	File_state    string
 }
 

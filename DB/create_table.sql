@@ -90,6 +90,7 @@ ENGINE = InnoDB;
 -- Table `new_db_collection`.`files`
 -- -----------------------------------------------------
 CREATE TABLE IF NOT EXISTS `new_db_collection`.`files` (
+  `file_id` VARCHAR(255) NOT NULL,
   `vault_file_id` VARCHAR(255) NOT NULL,
   `library_id` BIGINT NOT NULL,
   `user_id` BIGINT NOT NULL,
@@ -100,14 +101,15 @@ CREATE TABLE IF NOT EXISTS `new_db_collection`.`files` (
   `file_state` VARCHAR(45) NOT NULL,
   PRIMARY KEY (`file_id`),
   UNIQUE KEY `file_id_UNIQUE` (`vault_file_id`),
-  KEY `fk_files_library1_idx` (`library_id`),
-  KEY `fk_file_user_idx` (`user_id`),
-  CONSTRAINT `fk_files_libraries`
-    FOREIGN KEY (`library_id`)
-    REFERENCES `new_db_collection`.`library` (`library_id`),
-  CONSTRAINT `fk_files_user`
-    FOREIGN KEY (`user_id`)
-    REFERENCES `new_db_collection`.`system_users` (`user_id`))
+  -- KEY `fk_files_library1_idx` (`library_id`),
+  -- KEY `fk_file_user_idx` (`user_id`),
+  -- CONSTRAINT `fk_files_libraries`
+  --   FOREIGN KEY (`library_id`)
+  --   REFERENCES `new_db_collection`.`library` (`library_id`),
+  -- CONSTRAINT `fk_files_user`
+  --   FOREIGN KEY (`user_id`)
+  --   REFERENCES `new_db_collection`.`system_users` (`user_id`)
+  )
 ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
 
 
