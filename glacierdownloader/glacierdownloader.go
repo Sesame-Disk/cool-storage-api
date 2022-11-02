@@ -2,18 +2,19 @@ package glacierdownloader
 
 import (
 	glacierjob "cool-storage-api/glacierjob"
+	util "cool-storage-api/util"
 	"errors"
 	"time"
 )
 
-func Download(archiveId, fileName string) error {
+func Download(a util.Archive) error {
 
 	// *steps:
 	//1-initiate retrieval archive job
 	//2-wait for job is completed(ask for job description)
 	//3-get job output and write the file
 
-	jobId, err := glacierjob.Glacier_InitiateRetrievalJob(archiveId)
+	jobId, err := glacierjob.Glacier_InitiateRetrievalJob(a.Vault_file_id)
 	if err != nil {
 		return err
 	} else {
@@ -27,7 +28,7 @@ func Download(archiveId, fileName string) error {
 				return err
 			}
 			if completed {
-				_, err := glacierjob.Glacier_GetJobOutput(jobId, fileName)
+				_, err := glacierjob.Glacier_GetJobOutput(jobId, a.File_name)
 				return err
 			}
 		}

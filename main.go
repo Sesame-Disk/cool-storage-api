@@ -1,12 +1,10 @@
 package main
 
 import (
-	"bytes"
-	"context"
 	authenticate "cool-storage-api/authenticate"
 	configread "cool-storage-api/configread"
-	"cool-storage-api/dba"
 	glacierdownloader "cool-storage-api/glacierdownloader"
+	glacieruploader "cool-storage-api/glacieruploader"
 	register "cool-storage-api/register"
 	util "cool-storage-api/util"
 	"errors"
@@ -16,10 +14,6 @@ import (
 	"net/http"
 	"strings"
 	"time"
-
-	"github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/credentials"
-	"github.com/aws/aws-sdk-go-v2/service/glacier"
 
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
@@ -110,40 +104,12 @@ func Upload(c *gin.Context) {
 
 	//AWS-Glacier
 	if chunkid == chunksTotal {
-		Ufile, err := ioutil.ReadFile(dst)
-		awsConfig := configread.Configuration.AWSConfig
-		cfg, err := config.LoadDefaultConfig(context.TODO(), config.WithRegion(awsConfig.Region),
-			config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(awsConfig.AccessKeyID, awsConfig.SecretAccessKey, awsConfig.AccessToken)))
-		if err != nil {
-			log.Fatalf("failed to load AWS configuration, %v", err)
-		}
-		client := glacier.NewFromConfig(cfg)
-		vaultName := awsConfig.VaultName
-		input := glacier.UploadArchiveInput{
-			VaultName: &vaultName,
-			Body:      bytes.NewReader(Ufile),
-		}
-		result, err := client.UploadArchive(context.TODO(), &input)
-		if err != nil {
-			log.Fatalf("failed to upload archive to AWS-Glacier, %v", err)
-		}
-
-		// save data to db
-		archive_data := util.Archive{
-			Vault_file_id: *result.ArchiveId,
-			Library_id:    0,
-			User_id:       0,
-			File_name:     filename,
-			Upload_date:   "now",
-			File_size:     0,
-			File_state:    "uploading",
-		}
-
-		response := dba.InsertArchive(archive_data)
-		if response != nil {
-			c.String(http.StatusOK, response.Error())
+		db := glacieruploader.Upload(dst, filename)
+		if db != nil {
+			c.String(http.StatusInternalServerError, db.Error())
 		} else {
-			c.String(http.StatusOK, "File %s uploaded successfully with id %s", filename, *result.ArchiveId)
+			// c.String(http.StatusOK, "File %s uploaded successfully with id %s", filename, *result.ArchiveId)
+			c.String(http.StatusOK, "File %s uploaded successfully", filename)
 		}
 	} else {
 		c.String(http.StatusOK, "Chunk # %s of file %s uploaded successfully.", chunkid, filename)
@@ -161,20 +127,37 @@ func Download(c *gin.Context) {
 
 		fileName := c.Request.FormValue("fileName")
 
-		start := time.Now()
-		log.Print("starting download file at")
-		log.Print(start)
-
-		err := glacierdownloader.Download(archiveId, fileName)
-		if err != nil {
-			c.String(http.StatusBadGateway, err.Error())
-		} else {
-			c.String(http.StatusOK, "download success")
+		// get from DB and fill struct
+		archiveStruc := util.Archive{
+			Vault_file_id: archiveId,
+			Library_id:    0,
+			User_id:       0,
+			File_name:     fileName,
+			Upload_date:   "now",
+			File_size:     0,
+			File_checksum: " ",
+			File_state:    "uploaded",
 		}
 
-		end := time.Now()
-		log.Print("finish download file at")
-		log.Print(end)
+		if archiveStruc.File_state != "uploaded" {
+			c.String(http.StatusInternalServerError, "The file you're trying to download has already been uploaded")
+		} else {
+
+			start := time.Now()
+			log.Print("starting download file at")
+			log.Print(start)
+
+			err := glacierdownloader.Download(archiveStruc)
+			if err != nil {
+				c.String(http.StatusBadGateway, err.Error())
+			} else {
+				c.String(http.StatusOK, "download success")
+			}
+
+			end := time.Now()
+			log.Print("finish download file at")
+			log.Print(end)
+		}
 
 	}
 }
