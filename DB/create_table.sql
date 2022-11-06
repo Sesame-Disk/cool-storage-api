@@ -100,7 +100,7 @@ CREATE TABLE IF NOT EXISTS `new_db_collection`.`files` (
   `file_checksum` VARCHAR(255) NOT NULL,
   `file_state` VARCHAR(45) NOT NULL,
   PRIMARY KEY (`vault_file_id`),
-  UNIQUE KEY `file_id_UNIQUE` (`vault_file_id`),
+  UNIQUE KEY `file_id_UNIQUE` (`vault_file_id`)
   -- KEY `fk_files_library1_idx` (`library_id`),
   -- KEY `fk_file_user_idx` (`user_id`),
   -- CONSTRAINT `fk_files_libraries`
