@@ -34,5 +34,11 @@ services:
       - '33061'
     networks:
       - todo-app
+    # Grant the container the CAP_SYS_NICE capability,
+    # which allows the container to raise process nice values,
+    # set real-time scheduling policies, set CPU affinity,
+    # and other operations.
+    cap_add:
+      - SYS_NICE
 networks:
   todo-app:
