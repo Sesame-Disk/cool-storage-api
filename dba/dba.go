@@ -137,6 +137,20 @@ func InsertArchive(a util.Archive) (e error) {
 	return nil
 }
 
+func GetArchive(id string) (util.Archive, error) {
+	arc := util.Archive{}
+	db, err := ObtenerBaseDeDatos()
+	if err != nil {
+		return arc, err
+	}
+	defer db.Close()
+
+	sqlQuery := "SELECT * FROM files where vault_file_id=?"
+	row := db.QueryRow(sqlQuery, id)
+	err1 := row.Scan(&arc.Vault_file_id, &arc.Library_id, &arc.User_id, &arc.File_name, &arc.Upload_date, &arc.File_size, &arc.File_checksum, &arc.File_state)
+	return arc, err1
+}
+
 //Generate a random alphanumeric token of len 40
 func BuildRandomToken() (map[string]string, error) {
 	randomToken := make([]byte, 30)

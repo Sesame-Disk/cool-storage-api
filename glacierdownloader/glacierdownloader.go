@@ -14,7 +14,7 @@ func Download(a util.Archive) error {
 	//2-wait for job is completed(ask for job description)
 	//3-get job output and write the file
 
-	jobId, err := glacierjob.Glacier_InitiateRetrievalJob(a.Vault_file_id)
+	jobId, err := glacierjob.Glacier_InitiateRetrievalJob(a.Vault_file_id, a.File_name)
 	if err != nil {
 		return err
 	} else {
