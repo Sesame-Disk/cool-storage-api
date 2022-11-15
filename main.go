@@ -37,10 +37,10 @@ func main() {
 	}))
 
 	r.GET("/api/v1/ping", PingResponse)
-	r.POST("/api/v1/auth-token/", GetAuthenticationTokenHandler)
-	r.GET("/api/v1/auth/ping/", AuthPing)
+	r.POST("/api/v1/auth-token", GetAuthenticationTokenHandler)
+	r.GET("/api/v1/auth/ping", AuthPing)
 	r.POST("/api/v1/registrations", RegistrationsHandler)
-	r.GET("/api/v1/account/info/", AccountInfoResponse)
+	r.GET("/api/v1/account/info", AccountInfoResponse)
 	r.POST("/api/v1/single/upload", Upload)
 	r.POST("/api/v1/single/download", Download)
 
@@ -87,6 +87,12 @@ func PingResponse(c *gin.Context) {
 //upload file
 func Upload(c *gin.Context) {
 	// Get data from request
+	userToken := c.GetHeader("user-token")
+	tokenDetails, err := authenticate.ValidateToken(userToken)
+	if err != nil {
+		c.String(http.StatusBadRequest, "user token not valid")
+		return
+	}
 	_, uploadFile, err := c.Request.FormFile("file")
 
 	file, err := uploadFile.Open()
@@ -107,7 +113,8 @@ func Upload(c *gin.Context) {
 
 	//AWS-Glacier
 	if chunkid == chunksTotal {
-		db := glacieruploader.Upload(dst, filename)
+		user_id := tokenDetails["user_id"]
+		db := glacieruploader.Upload(dst, filename, user_id.(int))
 		if db != nil {
 			c.String(http.StatusInternalServerError, db.Error())
 		} else {
@@ -179,7 +186,7 @@ func GetAuthenticationTokenHandler(c *gin.Context) {
 		password := c.Request.FormValue("password")
 
 		if username == "" || password == "" {
-			c.String(http.StatusNotAcceptable, "please enter a valid username and password %v,%v,%v", username, password, c.Request.Body)
+			c.String(http.StatusNotAcceptable, "please enter a not void username and password")
 		} else {
 			tokenDetails, err := authenticate.GetToken(username, password)
 			if err != nil {
@@ -201,7 +208,7 @@ func RegistrationsHandler(c *gin.Context) {
 		username := c.Request.FormValue("username")
 		password := c.Request.FormValue("password")
 		if username == "" || password == "" {
-			c.String(http.StatusOK, "Please enter a valid username and password.\r\n")
+			c.String(http.StatusOK, "Please enter not void username and password.")
 		} else {
 			response, err := register.RegisterUser(username, password)
 			if err != nil {
