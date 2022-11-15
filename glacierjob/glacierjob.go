@@ -63,7 +63,7 @@ func Glacier_InitiateInventoryJob() {
 	fmt.Println(*result)
 }
 
-func Glacier_InitiateRetrievalJob(archiveId string) (string, error) {
+func Glacier_InitiateRetrievalJob(archiveId string, archiveName string) (string, error) {
 
 	awsConfig := configread.Configuration.AWSConfig
 	cfg, err := config.LoadDefaultConfig(context.TODO(), config.WithRegion(awsConfig.Region),
@@ -74,15 +74,15 @@ func Glacier_InitiateRetrievalJob(archiveId string) (string, error) {
 	}
 
 	svc := glacier.NewFromConfig(cfg)
-	//https://docs.aws.amazon.com/amazonglacier/latest/dev/downloading-an-archive-two-steps.html
+	description := fmt.Sprintf("Retrieval job to download %s file", archiveName)
 	input := &glacier.InitiateJobInput{
 		AccountId: aws.String("-"),
 		JobParameters: &glaciertypes.JobParameters{
-			Description: aws.String("My retrieval job"),
+			Description: aws.String(description),
 			SNSTopic:    aws.String(awsConfig.SNSTopic),
 			Type:        aws.String("archive-retrieval"),
 			ArchiveId:   aws.String(archiveId),
-			Tier:        aws.String("Bulk"),
+			Tier:        aws.String("Standard"),
 		},
 		VaultName: aws.String(awsConfig.VaultName),
 	}

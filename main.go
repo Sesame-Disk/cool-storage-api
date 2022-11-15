@@ -3,6 +3,7 @@ package main
 import (
 	authenticate "cool-storage-api/authenticate"
 	configread "cool-storage-api/configread"
+	dba "cool-storage-api/dba"
 	glacierdownloader "cool-storage-api/glacierdownloader"
 	glacieruploader "cool-storage-api/glacieruploader"
 	register "cool-storage-api/register"
@@ -42,6 +43,8 @@ func main() {
 	r.GET("/api/v1/account/info/", AccountInfoResponse)
 	r.POST("/api/v1/single/upload", Upload)
 	r.POST("/api/v1/single/download", Download)
+
+	r.GET("/api/v1/get-archive", GetArchive)
 
 	// r.POST("/api/v1/multiple/upload", func(c *gin.Context) {
 	// 	// Multipart form
@@ -124,19 +127,9 @@ func Download(c *gin.Context) {
 	} else {
 
 		archiveId := c.Request.FormValue("archiveId")
-
-		fileName := c.Request.FormValue("fileName")
-
-		// todo: get from DB and fill struct
-		archiveStruc := util.Archive{
-			Vault_file_id: archiveId,
-			Library_id:    0,
-			User_id:       0,
-			File_name:     fileName,
-			Upload_date:   "now",
-			File_size:     "0 KB",
-			File_checksum: " ",
-			File_state:    "uploaded",
+		archiveStruc, err := dba.GetArchive(archiveId)
+		if err != nil {
+			c.String(http.StatusBadRequest, err1.Error())
 		}
 
 		if archiveStruc.File_state != "uploaded" {
@@ -158,7 +151,20 @@ func Download(c *gin.Context) {
 			log.Print("finish download file at")
 			log.Print(end)
 		}
+	}
+}
 
+func GetArchive(c *gin.Context) {
+	err1 := c.Request.ParseForm()
+	if err1 != nil {
+		c.String(http.StatusBadRequest, err1.Error())
+	} else {
+		archiveId := c.Request.FormValue("archiveId")
+		res, err := dba.GetArchive(archiveId)
+		if err != nil {
+			c.String(http.StatusBadRequest, err1.Error())
+		}
+		c.JSON(http.StatusOK, gin.H{"status": http.StatusOK, "data": res})
 	}
 }
 
