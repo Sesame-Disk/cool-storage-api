@@ -46,6 +46,7 @@ type PoolConf struct {
 }
 
 type AWSConf struct {
+	AuthMethod      string `yaml:"authMethod"`
 	AccessKeyID     string `yaml:"accessKeyID"`
 	SecretAccessKey string `yaml:"secretAccessKey"`
 	AccessToken     string `yaml:"accessToken"`
