@@ -3,6 +3,7 @@ package glacierjob
 import (
 	"context"
 	"cool-storage-api/configread"
+	glacierManager "cool-storage-api/plugins/glacier"
 	"errors"
 	"fmt"
 	"io"
@@ -10,8 +11,6 @@ import (
 	"os"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/glacier"
 	glaciertypes "github.com/aws/aws-sdk-go-v2/service/glacier/types"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
@@ -22,14 +21,13 @@ import (
 // To initiate an inventory-retrieval job
 // The example initiates an inventory-retrieval job for the vault input.
 func Glacier_InitiateInventoryJob() {
-	awsConfig := configread.Configuration.AWSConfig
-	cfg, err := config.LoadDefaultConfig(context.TODO(), config.WithRegion(awsConfig.Region),
-		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(awsConfig.AccessKeyID, awsConfig.SecretAccessKey, awsConfig.AccessToken)))
+	cfg, err := glacierManager.AWSAuth()
 	if err != nil {
-		log.Fatalf("failed to load AWS configuration, %v", err)
+		log.Fatalf("ERROR:, %v", err)
 	}
 
 	svc := glacier.NewFromConfig(cfg)
+	awsConfig := configread.Configuration.AWSConfig
 
 	input := &glacier.InitiateJobInput{
 		AccountId: aws.String("-"),
@@ -64,16 +62,15 @@ func Glacier_InitiateInventoryJob() {
 }
 
 func Glacier_InitiateRetrievalJob(archiveId string, archiveName string) (string, error) {
-
-	awsConfig := configread.Configuration.AWSConfig
-	cfg, err := config.LoadDefaultConfig(context.TODO(), config.WithRegion(awsConfig.Region),
-		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(awsConfig.AccessKeyID, awsConfig.SecretAccessKey, awsConfig.AccessToken)))
+	cfg, err := glacierManager.AWSAuth()
 	if err != nil {
 		// log.Fatalf("failed to load AWS configuration, %v", err)
 		return "", errors.New("failed to load AWS configuration")
 	}
 
 	svc := glacier.NewFromConfig(cfg)
+	awsConfig := configread.Configuration.AWSConfig
+
 	description := fmt.Sprintf("Retrieval job to download %s file", archiveName)
 	input := &glacier.InitiateJobInput{
 		AccountId: aws.String("-"),
@@ -116,16 +113,14 @@ func Glacier_InitiateRetrievalJob(archiveId string, archiveName string) (string,
 // The example returns information about the previously initiated job specified by the
 // job ID.
 func Glacier_DescribeJob(jobId string) (glacier.DescribeJobOutput, error) {
-
-	awsConfig := configread.Configuration.AWSConfig
-	cfg, err := config.LoadDefaultConfig(context.TODO(), config.WithRegion(awsConfig.Region),
-		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(awsConfig.AccessKeyID, awsConfig.SecretAccessKey, awsConfig.AccessToken)))
+	cfg, err := glacierManager.AWSAuth()
 	if err != nil {
 		log.Fatalf("failed to load AWS configuration, %v", err)
 		return glacier.DescribeJobOutput{}, errors.New("failed to load AWS configuration")
 	}
 
 	svc := glacier.NewFromConfig(cfg)
+	awsConfig := configread.Configuration.AWSConfig
 
 	input := &glacier.DescribeJobInput{
 		AccountId: aws.String("-"),
@@ -180,15 +175,15 @@ func Glacier_GetJobOutput(jobId, fileName string) (int32, error) {
 
 	log.Println("Downloading...")
 
-	awsConfig := configread.Configuration.AWSConfig
-	cfg, err := config.LoadDefaultConfig(context.TODO(), config.WithRegion(awsConfig.Region),
-		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(awsConfig.AccessKeyID, awsConfig.SecretAccessKey, awsConfig.AccessToken)))
+	cfg, err := glacierManager.AWSAuth()
 	if err != nil {
 		// log.Fatalf("failed to load AWS configuration, %v", err)
 		return 400, errors.New("failed to load AWS configuration")
 	}
 
 	svc := glacier.NewFromConfig(cfg)
+	awsConfig := configread.Configuration.AWSConfig
+
 	input := &glacier.GetJobOutputInput{
 		AccountId: aws.String("-"),
 		JobId:     aws.String(jobId),
@@ -248,15 +243,14 @@ func Glacier_GetJobOutput(jobId, fileName string) (int32, error) {
 
 // To list jobs for a vault
 // The example lists jobs for the vault input.
-func Glacier_ListJobs() {
-	awsConfig := configread.Configuration.AWSConfig
-	cfg, err := config.LoadDefaultConfig(context.TODO(), config.WithRegion(awsConfig.Region),
-		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(awsConfig.AccessKeyID, awsConfig.SecretAccessKey, awsConfig.AccessToken)))
+func Glacier_ListJobs() (glacier.ListJobsOutput, error) {
+	cfg, err := glacierManager.AWSAuth()
 	if err != nil {
-		log.Fatalf("failed to load AWS configuration, %v", err)
+		fmt.Printf("ERROR: %v", err)
+		return glacier.ListJobsOutput{}, err
 	}
-
 	svc := glacier.NewFromConfig(cfg)
+	awsConfig := configread.Configuration.AWSConfig
 
 	input := &glacier.ListJobsInput{
 		AccountId: aws.String("-"),
@@ -268,7 +262,7 @@ func Glacier_ListJobs() {
 		var nsk *types.NoSuchKey
 		if errors.As(err, &nsk) {
 			// handle NoSuchKey error		//PENDING
-			return
+			return glacier.ListJobsOutput{}, err
 		}
 		var apiErr smithy.APIError
 		if errors.As(err, &apiErr) {
@@ -276,11 +270,11 @@ func Glacier_ListJobs() {
 			// message := apiErr.ErrorMessage()
 			// handle error code
 			//PENDING
-			return
+			return glacier.ListJobsOutput{}, err
 		}
 		// handle error //PENDING
-		return
+		return glacier.ListJobsOutput{}, err
 	}
 
-	fmt.Println(*result)
+	return *result, nil
 }

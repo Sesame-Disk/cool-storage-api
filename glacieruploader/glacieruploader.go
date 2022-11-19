@@ -5,6 +5,7 @@ import (
 	"context"
 	configread "cool-storage-api/configread"
 	"cool-storage-api/dba"
+	glacierManager "cool-storage-api/plugins/glacier"
 	util "cool-storage-api/util"
 	"errors"
 	"fmt"
@@ -12,8 +13,6 @@ import (
 	"os"
 	"time"
 
-	"github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/glacier"
 )
 
@@ -29,13 +28,14 @@ func Upload(dst string, filename string, user_id int) error {
 	}
 	file_size := util.HumanFileSize(float64(Rfile.Size()))
 
-	awsConfig := configread.Configuration.AWSConfig
-	cfg, err := config.LoadDefaultConfig(context.TODO(), config.WithRegion(awsConfig.Region),
-		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(awsConfig.AccessKeyID, awsConfig.SecretAccessKey, awsConfig.AccessToken)))
+	cfg, err := glacierManager.AWSAuth()
 	if err != nil {
 		return errors.New(fmt.Sprintf("failed to load AWS configuration: %s", err))
 	}
+
 	client := glacier.NewFromConfig(cfg)
+	awsConfig := configread.Configuration.AWSConfig
+
 	vaultName := awsConfig.VaultName
 	input := glacier.UploadArchiveInput{
 		VaultName:          &vaultName,

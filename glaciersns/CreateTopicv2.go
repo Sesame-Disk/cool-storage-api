@@ -3,12 +3,11 @@ package glaciersns
 import (
 	"context"
 	"cool-storage-api/configread"
+	glacierManager "cool-storage-api/plugins/glacier"
 	"flag"
 	"fmt"
 	"log"
 
-	"github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/sns"
 )
 
@@ -43,8 +42,7 @@ func CreateSNSTopic() {
 		return
 	}
 
-	cfg, err := config.LoadDefaultConfig(context.TODO(), config.WithRegion(awsConfig.Region),
-		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(awsConfig.AccessKeyID, awsConfig.SecretAccessKey, awsConfig.AccessToken)))
+	cfg, err := glacierManager.AWSAuth()
 	if err != nil {
 		log.Fatalf("failed to load AWS configuration, %v", err)
 	}
