@@ -112,7 +112,7 @@ func GetToken(email string, password string) (map[string]string, error) {
 	if err != nil {
 
 		if err == sql.ErrNoRows {
-			return nil, errors.New("invalid email or password" + email + " " + password)
+			return nil, errors.New("invalid email or password")
 		}
 
 		return nil, err
@@ -121,7 +121,7 @@ func GetToken(email string, password string) (map[string]string, error) {
 	err = bcrypt.CompareHashAndPassword([]byte(accountPassword), []byte(password))
 
 	if err != nil {
-		return nil, errors.New("invalid email or password" + email + " " + password)
+		return nil, errors.New("invalid email or password")
 	}
 
 	queryString = "select token_id, auth_token, generated_at, expires_at from authentication_tokens where user_id = ?"
@@ -221,7 +221,7 @@ func BuildRandomToken() (map[string]string, error) {
 	const timeLayout = "2006-01-02 15:04:05"
 
 	dt := time.Now()
-	expirtyTime := time.Now().Add(time.Minute * 1)
+	expirtyTime := time.Now().Add(time.Minute * 1440)
 
 	generatedAt := dt.Format(timeLayout)
 	expiresAt := expirtyTime.Format(timeLayout)

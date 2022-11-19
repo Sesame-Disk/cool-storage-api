@@ -17,7 +17,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/glacier"
 )
 
-func Upload(dst string, filename string) error {
+func Upload(dst string, filename string, user_id int) error {
 	Ufile, err := ioutil.ReadFile(dst)
 	if err != nil {
 		return errors.New(fmt.Sprintf("Fail to load the file: %s", err))
@@ -47,10 +47,11 @@ func Upload(dst string, filename string) error {
 		return errors.New(fmt.Sprintf("failed to upload archive to AWS-Glacier: %s", err))
 	}
 	// save data to db
+	// user_Int, _ := strconv.Atoi(user_id)
 	archive_data := util.Archive{
 		Vault_file_id: *result.ArchiveId,
 		Library_id:    1,
-		User_id:       2,
+		User_id:       user_id,
 		File_name:     filename,
 		Upload_date:   time.Now().Format("2006-01-02 15:04:05"),
 		File_size:     file_size,
