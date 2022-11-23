@@ -1,11 +1,11 @@
-package glacieruploader
+package glacierUpload
 
 import (
 	"bytes"
 	"context"
 	configread "cool-storage-api/configread"
 	"cool-storage-api/dba"
-	glacierManager "cool-storage-api/plugins/glacier"
+	"cool-storage-api/plugins/awsAuth"
 	util "cool-storage-api/util"
 	"errors"
 	"fmt"
@@ -28,7 +28,7 @@ func Upload(dst string, filename string, user_id int) error {
 	}
 	file_size := util.HumanFileSize(float64(Rfile.Size()))
 
-	cfg, err := glacierManager.AWSAuth()
+	cfg, err := awsAuth.Authenticate()
 	if err != nil {
 		return errors.New(fmt.Sprintf("failed to load AWS configuration: %s", err))
 	}

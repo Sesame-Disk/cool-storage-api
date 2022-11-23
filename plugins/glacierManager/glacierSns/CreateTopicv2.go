@@ -3,7 +3,7 @@ package glaciersns
 import (
 	"context"
 	"cool-storage-api/configread"
-	glacierManager "cool-storage-api/plugins/glacier"
+	"cool-storage-api/plugins/awsAuth"
 	"flag"
 	"fmt"
 	"log"
@@ -42,7 +42,7 @@ func CreateSNSTopic() {
 		return
 	}
 
-	cfg, err := glacierManager.AWSAuth()
+	cfg, err := awsAuth.Authenticate()
 	if err != nil {
 		log.Fatalf("failed to load AWS configuration, %v", err)
 	}

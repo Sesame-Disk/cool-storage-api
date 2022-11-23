@@ -1,4 +1,4 @@
-package glacier
+package awsAuth
 
 import (
 	"context"
@@ -9,13 +9,11 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
-	// "github.com/aws/aws-sdk-go-v2/service/glacier"
-	// "github.com/aws/aws-sdk-go-v2/service/s3/types"
-	// "github.com/aws/smithy-go"
 )
 
-func AWSAuth() (aws.Config, error) {
-	awsConfig := configread.Configuration.AWSConfig
+var awsConfig = configread.Configuration.AWSConfig
+
+func Authenticate() (aws.Config, error) {
 	isProfileAuth := strings.Contains(awsConfig.AuthMethod, "profile")
 	isKeyAuth := strings.Contains(awsConfig.AuthMethod, "key") || strings.Contains(awsConfig.AuthMethod, "secret")
 	if isProfileAuth {
@@ -35,7 +33,6 @@ func AuthWithProfile(profileName string) (aws.Config, error) {
 }
 
 func AuthWithCredentials() (aws.Config, error) {
-	awsConfig := configread.Configuration.AWSConfig
 	cfg, err := config.LoadDefaultConfig(context.TODO(), config.WithRegion(awsConfig.Region),
 		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(awsConfig.AccessKeyID, awsConfig.SecretAccessKey, awsConfig.AccessToken)))
 	return cfg, err

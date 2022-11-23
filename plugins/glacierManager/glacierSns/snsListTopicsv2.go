@@ -2,7 +2,7 @@ package glaciersns
 
 import (
 	"context"
-	glacierManager "cool-storage-api/plugins/glacier"
+	"cool-storage-api/plugins/awsAuth"
 	"fmt"
 	"log"
 
@@ -31,7 +31,7 @@ func GetTopics(c context.Context, api SNSListTopicsAPI, input *sns.ListTopicsInp
 
 func GetTopicArnList() {
 
-	cfg, err := glacierManager.AWSAuth()
+	cfg, err := awsAuth.Authenticate()
 	if err != nil {
 		log.Fatalf("failed to load AWS configuration, %v", err)
 	}
