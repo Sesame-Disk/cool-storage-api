@@ -1,9 +1,9 @@
-package glacierjob
+package glacierJob
 
 import (
 	"context"
 	"cool-storage-api/configread"
-	glacierManager "cool-storage-api/plugins/glacier"
+	"cool-storage-api/plugins/awsAuth"
 	"errors"
 	"fmt"
 	"io"
@@ -21,7 +21,7 @@ import (
 // To initiate an inventory-retrieval job
 // The example initiates an inventory-retrieval job for the vault input.
 func Glacier_InitiateInventoryJob() {
-	cfg, err := glacierManager.AWSAuth()
+	cfg, err := awsAuth.Authenticate()
 	if err != nil {
 		log.Fatalf("ERROR:, %v", err)
 	}
@@ -62,7 +62,7 @@ func Glacier_InitiateInventoryJob() {
 }
 
 func Glacier_InitiateRetrievalJob(archiveId string, archiveName string) (string, error) {
-	cfg, err := glacierManager.AWSAuth()
+	cfg, err := awsAuth.Authenticate()
 	if err != nil {
 		// log.Fatalf("failed to load AWS configuration, %v", err)
 		return "", errors.New("failed to load AWS configuration")
@@ -113,7 +113,7 @@ func Glacier_InitiateRetrievalJob(archiveId string, archiveName string) (string,
 // The example returns information about the previously initiated job specified by the
 // job ID.
 func Glacier_DescribeJob(jobId string) (glacier.DescribeJobOutput, error) {
-	cfg, err := glacierManager.AWSAuth()
+	cfg, err := awsAuth.Authenticate()
 	if err != nil {
 		log.Fatalf("failed to load AWS configuration, %v", err)
 		return glacier.DescribeJobOutput{}, errors.New("failed to load AWS configuration")
@@ -175,7 +175,7 @@ func Glacier_GetJobOutput(jobId, fileName string) (int32, error) {
 
 	log.Println("Downloading...")
 
-	cfg, err := glacierManager.AWSAuth()
+	cfg, err := awsAuth.Authenticate()
 	if err != nil {
 		// log.Fatalf("failed to load AWS configuration, %v", err)
 		return 400, errors.New("failed to load AWS configuration")
@@ -244,7 +244,7 @@ func Glacier_GetJobOutput(jobId, fileName string) (int32, error) {
 // To list jobs for a vault
 // The example lists jobs for the vault input.
 func Glacier_ListJobs() (glacier.ListJobsOutput, error) {
-	cfg, err := glacierManager.AWSAuth()
+	cfg, err := awsAuth.Authenticate()
 	if err != nil {
 		fmt.Printf("ERROR: %v", err)
 		return glacier.ListJobsOutput{}, err
