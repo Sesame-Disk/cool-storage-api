@@ -46,14 +46,14 @@ type PoolConf struct {
 }
 
 type AWSConf struct {
-	AuthMethod      string `yaml:"authMethod"`
-	AccessKeyID     string `yaml:"accessKeyID"`
-	SecretAccessKey string `yaml:"secretAccessKey"`
-	AccessToken     string `yaml:"accessToken"`
-	Region          string `yaml:"region"`
-	VaultName       string `yaml:"vaultName"`
-	SNSTopicName    string `yaml:"snstopicName"`
-	SNSTopic        string `yaml:"SNSTopic"`
+	AccessProfileName string `yaml:"accessProfileName"`
+	AccessKeyID       string `yaml:"accessKeyID"`
+	SecretAccessKey   string `yaml:"secretAccessKey"`
+	AccessToken       string `yaml:"accessToken"`
+	Region            string `yaml:"region"`
+	VaultName         string `yaml:"vaultName"`
+	SNSTopicName      string `yaml:"snstopicName"`
+	SNSTopic          string `yaml:"SNSTopic"`
 }
 
 func unmarshalYAMLFile(path string, v interface{}) error {
