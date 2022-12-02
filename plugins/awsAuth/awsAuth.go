@@ -4,6 +4,7 @@ import (
 	"context"
 	"cool-storage-api/configread"
 	"errors"
+	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
@@ -13,9 +14,11 @@ import (
 var awsConfig = configread.Configuration.AWSConfig
 
 func Authenticate() (aws.Config, error) {
-	if awsConfig.AccessProfileName != "" {
+	isProfileAuth := strings.Contains(awsConfig.AuthMethod, "profile")
+	isKeyAuth := strings.Contains(awsConfig.AuthMethod, "key") || strings.Contains(awsConfig.AuthMethod, "secret")
+	if isProfileAuth {
 		return AuthWithProfile("")
-	} else if awsConfig.AccessKeyID != "" && awsConfig.SecretAccessKey != "" {
+	} else if isKeyAuth {
 		return AuthWithCredentials()
 	}
 	return aws.Config{}, errors.New("No autentification method found")
