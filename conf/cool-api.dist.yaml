@@ -22,11 +22,14 @@ db:
     maxIdle: 5
     maxLifetime: 5
 aws:
-  authMethod: "profile || secret key"
+  # Auth Option A
+  accessProfileName: "default"
+  # Auth Option B
   accessKeyID: "MYACCESSKEYID"
   secretAccessKey: "MYSECRETACCESSKEY"
   accessToken: "MYACCESSTOKEN"
   region: "region"
+  # Glacier Config
   vaultName: "vaultName"
   snstopicName: "snstopicName"
   SNSTopic: "TopicArn"
