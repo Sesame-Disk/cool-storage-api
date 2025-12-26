@@ -1,21 +1,52 @@
-FROM ubuntu:22.04
+# Build stage
+FROM golang:1.25-trixie AS builder
+
+WORKDIR /build
+
+# Copy go mod files first for better caching
+COPY go.mod go.sum* ./
+RUN go mod download
+
+# Copy source code
+COPY . .
+
+# Build the binary
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
+    -ldflags="-w -s" \
+    -o sesamefs \
+    ./cmd/sesamefs
+
+# Runtime stage
+FROM debian:trixie-slim
+
+# Install ca-certificates for HTTPS and tzdata for timezones
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        ca-certificates \
+        tzdata && \
+    rm -rf /var/lib/apt/lists/* && \
+    apt-get clean
+
+# Create non-root user for security
+RUN useradd -r -u 1000 -s /bin/false sesamefs
 
 WORKDIR /app
 
-# Update and upgrade repo
-RUN apt-get update -y -q && apt-get upgrade -y -q 
+# Copy binary from builder
+COPY --from=builder /build/sesamefs .
 
-# Install tools we might need
-RUN DEBIAN_FRONTEND=noninteractive apt-get install --no-install-recommends -y -q curl ca-certificates
+# Copy config files if needed
+COPY --from=builder /build/config*.yaml* ./
 
-# Download Go 1.18.1 and install it to /usr/local/go
-RUN curl -s https://storage.googleapis.com/golang/go1.18.1.linux-amd64.tar.gz| tar -v -C /usr/local -xz
+# Use non-root user
+USER sesamefs
 
-# Let's people find our Go binaries
-ENV PATH $PATH:/usr/local/go/bin
+# Expose API port
+EXPOSE 8080
 
-COPY . .
+# Health check
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+    CMD ["/app/sesamefs", "health"] || exit 1
 
-# EXPOSE 3001
-
-CMD [ "go", "run", "/app/main.go" ]
+ENTRYPOINT ["/app/sesamefs"]
+CMD ["serve"]
