@@ -261,8 +261,8 @@ func (s *Server) setupRoutes() {
 			v2.RegisterFileRoutes(protected, s.db, s.config, s.storage, s.tokenStore, serverURL)
 
 			// Block endpoints (content-addressable storage)
-			if s.blockStore != nil {
-				v2.RegisterBlockRoutes(protected, s.blockStore, s.config)
+			if s.blockStore != nil || s.storageManager != nil {
+				v2.RegisterBlockRoutes(protected, s.blockStore, s.storageManager, s.config)
 			}
 
 			// Share link endpoints

@@ -8,17 +8,33 @@ Notice: Test it at your own risk and create issues here. The project is somewhat
 
 SesameFS aims to be a world-class replacement for enterprise file sync and share (EFSS) solutions with these key differentiators:
 
-1. **Smart Two-Tier Storage**: Unlike Seafile which only supports immediate-access storage, SesameFS uses intelligent policies:
+1. **Multi-Region Storage with Intelligent Routing**: Unlike Seafile's single-backend design, SesameFS supports:
+   - **Multiple Storage Backends**: Register hot/cold backends per region (USA, EU, China, etc.)
+   - **Hostname-Based Routing**: `us.sesamefs.com` → USA backends, `eu.sesamefs.com` → EU backends
+   - **Automatic Failover**: If primary backend fails, seamlessly route to configured failover
+   - **Storage Class Policies**: Libraries can specify their storage class or inherit from region defaults
+
+2. **Smart Two-Tier Storage**: Hot and cold tiers with intelligent backend selection:
    - **Hot Storage**: Immediate access for active files (auto-selects S3 Standard or IA based on access patterns)
    - **Cold Storage**: Cost-effective archival (auto-selects Glacier Instant or Deep Archive based on retention age)
 
-2. **Distributed-First Database**: Global Cassandra cluster with tunable consistency for worldwide deployments
+3. **Distributed-First Architecture**: Everything is designed for global distribution:
+   - **Database**: Cassandra with multi-DC replication for worldwide deployments
+   - **Storage**: S3-compatible backends in multiple regions with policy-based routing
+   - **Servers**: Stateless API servers that can be deployed anywhere (no sticky sessions)
+   - **Tokens**: Cassandra-backed token store (stateless, distributed, any server handles any request)
 
-3. **Modern Authentication**: OIDC-native with accounts.sesamedisk.com as primary provider
+4. **SHA-256 Internal Storage with Seafile Compatibility**: Modern security with legacy support:
+   - **Internally**: All blocks stored using SHA-256 (64 chars) for security
+   - **Externally**: Seafile clients use SHA-1 (40 chars) - we translate transparently
+   - **New Clients**: Can use SHA-256 directly via `?hash_type=sha256` parameter
+   - **Mapping Table**: `block_id_mappings` stores external→internal translations
 
-4. **True Multi-Tenancy**: Complete tenant isolation with per-tenant storage backends
+5. **Modern Authentication**: OIDC-native with accounts.sesamedisk.com as primary provider
 
-5. **Seafile Client Compatible**: Works with existing Seafile desktop and mobile apps
+6. **True Multi-Tenancy**: Complete tenant isolation with per-tenant storage backends
+
+7. **Seafile Client Compatible**: Works with existing Seafile desktop and mobile apps
 
 ---
 
@@ -82,8 +98,33 @@ SesameFS aims to be a world-class replacement for enterprise file sync and share
 | **Hash** | SHA-1 (160-bit, weak) | **SHA-256** (256-bit, secure) |
 | **Chunk Size** | Fixed 1MB/8MB | **Variable 512KB-8MB** (better dedup) |
 | **Block Storage** | Local filesystem only | **S3 (hot) + Glacier (cold)** |
+| **Storage Routing** | Single backend | **Multi-region with hostname routing** |
 | **Security** | Fixed polynomial | **Random polynomial per-tenant** |
 | **Cross-tenant Dedup** | Always on (privacy risk) | **Optional, off by default** |
+
+### Hash Translation Layer
+
+SesameFS stores all blocks using SHA-256 (64 chars) internally but maintains Seafile client compatibility:
+
+```
+Seafile Client (SHA-1)           SesameFS (SHA-256)
+─────────────────────────────────────────────────────────
+PUT block/abc123...              → Compute SHA-256 of data
+  (40-char SHA-1 ID)             → Store with internal SHA-256 ID
+                                 → Save mapping: abc123... → SHA-256
+─────────────────────────────────────────────────────────
+GET block/abc123...              → Lookup mapping: abc123... → SHA-256
+  (40-char SHA-1 ID)             → Retrieve using internal SHA-256 ID
+─────────────────────────────────────────────────────────
+New clients (SHA-256):           → Use ?hash_type=sha256
+PUT block/SHA-256-ID...          → Store directly (no mapping needed)
+```
+
+**Benefits:**
+- **Security**: Modern SHA-256 hashing for all stored blocks
+- **Compatibility**: Seafile desktop/mobile clients work unchanged
+- **Future-proof**: New clients can use SHA-256 directly
+- **Deduplication**: Same content = same SHA-256 hash (cross-protocol dedup)
 
 ### How It Works
 
@@ -733,18 +774,21 @@ Alternative: Collabora Online (LibreOffice-based)
 | Feature | Seafile | SesameFS |
 |---------|---------|----------|
 | **Storage Backend** | Local filesystem only | S3, Glacier, Disk - configurable |
+| **Multi-Region Storage** | Single backend | Multiple backends with hostname routing |
+| **Storage Failover** | None | Automatic failover to healthy backends |
 | **Cold Storage** | Not supported | Smart cold tier (auto-selects Glacier IR/Deep) |
 | **Database** | MySQL/PostgreSQL (single node) | Cassandra (global, distributed) |
 | **Chunking** | Rabin CDC, fixed sizes | FastCDC, adaptive to network speed |
 | **Chunk Sizes** | Fixed 1-8MB | Adaptive 2-256MB based on connection |
-| **Hash Security** | SHA-1 (deprecated) | SHA-256 |
+| **Hash Security** | SHA-1 everywhere | SHA-256 internally (SHA-1 translated for compatibility) |
+| **Block Storage** | SHA-1 IDs | SHA-256 IDs with transparent SHA-1 translation |
 | **Authentication** | Custom + LDAP | OIDC-native |
 | **Multi-tenancy** | One hostname per instance | Multiple hostnames per cluster |
 | **Session State** | Sticky sessions required | Stateless (any server, any request) |
 | **Upload Resume** | Same server only | Any server (distributed tokens) |
 | **Horizontal Scaling** | Per-tenant instances | Shared stateless pool |
 | **Storage Lifecycle** | Manual | Auto hot/cold with smart backend selection |
-| **Geo-distribution** | Complex replication | Native Cassandra multi-DC |
+| **Geo-distribution** | Complex replication | Native Cassandra multi-DC + multi-region S3 |
 | **Security Scanning** | ClamAV only (optional) | ClamAV + YARA + URL scanning |
 | **Phishing Detection** | Not available | YARA rules + document analysis |
 | **Deployment** | C + Python (complex) | Go (single binary) |

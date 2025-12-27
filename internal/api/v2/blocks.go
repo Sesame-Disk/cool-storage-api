@@ -45,6 +45,32 @@ func RegisterBlockRoutes(rg *gin.RouterGroup, blockStore *storage.BlockStore, st
 	}
 }
 
+// getBlockStore returns the appropriate BlockStore based on hostname routing
+// Uses StorageManager for multi-region support with fallback to legacy store
+func (h *BlockHandler) getBlockStore(c *gin.Context) (*storage.BlockStore, string) {
+	if h.storageManager == nil {
+		return h.blockStore, "legacy"
+	}
+
+	// Extract hostname for region resolution
+	hostname := c.Request.Host
+	if colonIdx := strings.Index(hostname, ":"); colonIdx > 0 {
+		hostname = hostname[:colonIdx]
+	}
+
+	// Resolve storage class based on hostname
+	storageClass := h.storageManager.ResolveStorageClass(hostname, "", "hot")
+
+	// Get healthy BlockStore with failover
+	blockStore, actualClass, err := h.storageManager.GetHealthyBlockStore(storageClass)
+	if err != nil {
+		log.Printf("v2/blocks: failed to get healthy backend for %s: %v, using legacy\n", storageClass, err)
+		return h.blockStore, "legacy"
+	}
+
+	return blockStore, actualClass
+}
+
 // CheckBlocksRequest is the request body for checking blocks
 type CheckBlocksRequest struct {
 	Hashes []string `json:"hashes" binding:"required"`
@@ -79,8 +105,15 @@ func (h *BlockHandler) CheckBlocks(c *gin.Context) {
 		return
 	}
 
+	// Get appropriate BlockStore based on hostname routing
+	blockStore, _ := h.getBlockStore(c)
+	if blockStore == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "block storage not available"})
+		return
+	}
+
 	// Check blocks in parallel for better performance
-	existsMap, err := h.blockStore.CheckBlocksParallel(c.Request.Context(), req.Hashes, 20)
+	existsMap, err := blockStore.CheckBlocksParallel(c.Request.Context(), req.Hashes, 20)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to check blocks"})
 		return
@@ -160,8 +193,17 @@ func (h *BlockHandler) UploadBlock(c *gin.Context) {
 		return
 	}
 
+	// Get appropriate BlockStore based on hostname routing
+	blockStore, storageClass := h.getBlockStore(c)
+	if blockStore == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "block storage not available"})
+		return
+	}
+
+	log.Printf("v2/blocks: uploading block %s to storage class %s\n", hash[:12], storageClass)
+
 	// Check if block already exists
-	exists, err := h.blockStore.BlockExists(c.Request.Context(), hash)
+	exists, err := blockStore.BlockExists(c.Request.Context(), hash)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to check block existence"})
 		return
@@ -184,7 +226,7 @@ func (h *BlockHandler) UploadBlock(c *gin.Context) {
 		Size: int64(len(data)),
 	}
 
-	_, err = h.blockStore.PutBlockData(c.Request.Context(), block)
+	_, err = blockStore.PutBlockData(c.Request.Context(), block)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to store block"})
 		return
@@ -207,8 +249,15 @@ func (h *BlockHandler) DownloadBlock(c *gin.Context) {
 		return
 	}
 
+	// Get appropriate BlockStore based on hostname routing
+	blockStore, _ := h.getBlockStore(c)
+	if blockStore == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "block storage not available"})
+		return
+	}
+
 	// Get the block
-	data, err := h.blockStore.GetBlock(c.Request.Context(), hash)
+	data, err := blockStore.GetBlock(c.Request.Context(), hash)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "block not found"})
 		return
@@ -231,7 +280,14 @@ func (h *BlockHandler) BlockExists(c *gin.Context) {
 		return
 	}
 
-	exists, err := h.blockStore.BlockExists(c.Request.Context(), hash)
+	// Get appropriate BlockStore based on hostname routing
+	blockStore, _ := h.getBlockStore(c)
+	if blockStore == nil {
+		c.Status(http.StatusServiceUnavailable)
+		return
+	}
+
+	exists, err := blockStore.BlockExists(c.Request.Context(), hash)
 	if err != nil {
 		c.Status(http.StatusInternalServerError)
 		return
