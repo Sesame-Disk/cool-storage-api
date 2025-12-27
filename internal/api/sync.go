@@ -1,0 +1,586 @@
+package api
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/Sesame-Disk/sesamefs/internal/db"
+	"github.com/Sesame-Disk/sesamefs/internal/storage"
+	"github.com/gin-gonic/gin"
+)
+
+// SyncHandler handles Seafile sync protocol operations
+// These endpoints are used by the Seafile Desktop client for file synchronization
+type SyncHandler struct {
+	db         *db.DB
+	storage    *storage.S3Store
+	blockStore *storage.BlockStore
+}
+
+// NewSyncHandler creates a new sync protocol handler
+func NewSyncHandler(database *db.DB, s3Store *storage.S3Store, blockStore *storage.BlockStore) *SyncHandler {
+	return &SyncHandler{
+		db:         database,
+		storage:    s3Store,
+		blockStore: blockStore,
+	}
+}
+
+// RegisterSyncRoutes registers the sync protocol routes
+func (h *SyncHandler) RegisterSyncRoutes(router *gin.Engine, authMiddleware gin.HandlerFunc) {
+	// Sync protocol routes under /seafhttp/repo/
+	repo := router.Group("/seafhttp/repo/:repo_id")
+	repo.Use(authMiddleware)
+	{
+		// Commit operations
+		repo.GET("/commit/HEAD", h.GetHeadCommit)
+		repo.GET("/commit/:commit_id", h.GetCommit)
+		repo.PUT("/commit/:commit_id", h.PutCommit)
+
+		// Block operations
+		repo.GET("/block/:block_id", h.GetBlock)
+		repo.PUT("/block/:block_id", h.PutBlock)
+		repo.POST("/check-blocks", h.CheckBlocks)
+
+		// Filesystem operations
+		repo.GET("/fs-id-list", h.GetFSIDList)
+		repo.GET("/fs/:fs_id", h.GetFSObject)
+		repo.POST("/pack-fs", h.PackFS)
+		repo.POST("/recv-fs", h.RecvFS)
+		repo.POST("/check-fs", h.CheckFS)
+
+		// Permission and quota
+		repo.GET("/permission-check", h.PermissionCheck)
+		repo.GET("/quota-check", h.QuotaCheck)
+	}
+}
+
+// Commit represents a Seafile commit object
+type Commit struct {
+	CommitID    string `json:"commit_id"`
+	RepoID      string `json:"repo_id"`
+	RootID      string `json:"root_id"`      // Root FS object ID
+	ParentID    string `json:"parent_id"`    // Parent commit ID (empty for first commit)
+	SecondParent string `json:"second_parent_id,omitempty"` // For merge commits
+	Description string `json:"description"`
+	Creator     string `json:"creator"`
+	CreatorName string `json:"creator_name"`
+	Ctime       int64  `json:"ctime"`        // Creation time (Unix timestamp)
+	Version     int    `json:"version"`      // Commit version (currently 1)
+	Encrypted   bool   `json:"encrypted,omitempty"`
+	EncVersion  int    `json:"enc_version,omitempty"`
+	Magic       string `json:"magic,omitempty"`
+	RandomKey   string `json:"random_key,omitempty"`
+}
+
+// FSObject represents a Seafile filesystem object (file or directory)
+type FSObject struct {
+	Type    int         `json:"type"`    // 1 = file, 3 = directory
+	ID      string      `json:"id"`      // SHA-1 hash of contents
+	Name    string      `json:"name,omitempty"`
+	Mode    int         `json:"mode,omitempty"`   // Unix file mode
+	Mtime   int64       `json:"mtime,omitempty"`  // Modification time
+	Size    int64       `json:"size,omitempty"`   // File size
+	BlockIDs []string   `json:"block_ids,omitempty"` // Block IDs for files
+	Entries []FSEntry   `json:"dirents,omitempty"`   // Directory entries
+}
+
+// FSEntry represents a directory entry
+type FSEntry struct {
+	Name     string `json:"name"`
+	ID       string `json:"id"`       // FS object ID
+	Mode     int    `json:"mode"`     // Unix file mode (33188 = regular file, 16384 = directory)
+	Mtime    int64  `json:"mtime"`
+	Size     int64  `json:"size,omitempty"`
+	Modifier string `json:"modifier,omitempty"`
+}
+
+// GetHeadCommit returns the HEAD commit for a repository
+// GET /seafhttp/repo/:repo_id/commit/HEAD
+func (h *SyncHandler) GetHeadCommit(c *gin.Context) {
+	repoID := c.Param("repo_id")
+	orgID := c.GetString("org_id")
+
+	// Check if database is available
+	if h.db == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "database not available"})
+		return
+	}
+
+	// Get head commit from database
+	var headCommitID string
+	err := h.db.Session().Query(`
+		SELECT head_commit_id FROM libraries
+		WHERE org_id = ? AND library_id = ?
+	`, orgID, repoID).Scan(&headCommitID)
+
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "library not found"})
+		return
+	}
+
+	// If no head commit exists, return empty (new library)
+	if headCommitID == "" {
+		c.JSON(http.StatusOK, gin.H{"is_corrupted": false, "head_commit_id": ""})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"is_corrupted":   false,
+		"head_commit_id": headCommitID,
+	})
+}
+
+// GetCommit returns a specific commit object
+// GET /seafhttp/repo/:repo_id/commit/:commit_id
+func (h *SyncHandler) GetCommit(c *gin.Context) {
+	repoID := c.Param("repo_id")
+	commitID := c.Param("commit_id")
+	orgID := c.GetString("org_id")
+
+	// Query commit from database
+	var commit Commit
+	var parentID, rootID, description, creator, creatorName string
+	var ctime time.Time
+	var version int
+
+	err := h.db.Session().Query(`
+		SELECT commit_id, parent_id, root_fs_id, description, creator_id, created_at
+		FROM commits WHERE library_id = ? AND commit_id = ?
+	`, repoID, commitID).Scan(
+		&commit.CommitID, &parentID, &rootID, &description, &creator, &ctime,
+	)
+
+	if err != nil {
+		// If commit not found, try to create initial commit
+		c.JSON(http.StatusNotFound, gin.H{"error": "commit not found"})
+		return
+	}
+
+	commit.RepoID = repoID
+	commit.RootID = rootID
+	commit.ParentID = parentID
+	commit.Description = description
+	commit.Creator = creator
+	commit.CreatorName = creatorName
+	commit.Ctime = ctime.Unix()
+	commit.Version = version
+	_ = orgID // Used for access control
+
+	// Return commit as JSON
+	c.JSON(http.StatusOK, commit)
+}
+
+// PutCommit stores a new commit object
+// PUT /seafhttp/repo/:repo_id/commit/:commit_id
+func (h *SyncHandler) PutCommit(c *gin.Context) {
+	repoID := c.Param("repo_id")
+	commitID := c.Param("commit_id")
+	orgID := c.GetString("org_id")
+	userID := c.GetString("user_id")
+
+	// Read commit data from body
+	body, err := io.ReadAll(c.Request.Body)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "failed to read body"})
+		return
+	}
+
+	var commit Commit
+	if err := json.Unmarshal(body, &commit); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid commit format"})
+		return
+	}
+
+	// Verify commit ID matches
+	if commit.CommitID != "" && commit.CommitID != commitID {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "commit ID mismatch"})
+		return
+	}
+
+	// Store commit in database
+	now := time.Now()
+	err = h.db.Session().Query(`
+		INSERT INTO commits (library_id, commit_id, parent_id, root_fs_id, creator_id, description, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+	`, repoID, commitID, commit.ParentID, commit.RootID, userID, commit.Description, now).Exec()
+
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to store commit"})
+		return
+	}
+
+	// Update library head
+	err = h.db.Session().Query(`
+		UPDATE libraries SET head_commit_id = ?, updated_at = ?
+		WHERE org_id = ? AND library_id = ?
+	`, commitID, now, orgID, repoID).Exec()
+
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update head"})
+		return
+	}
+
+	c.Status(http.StatusOK)
+}
+
+// GetBlock retrieves a block by ID
+// GET /seafhttp/repo/:repo_id/block/:block_id
+func (h *SyncHandler) GetBlock(c *gin.Context) {
+	blockID := c.Param("block_id")
+	orgID := c.GetString("org_id")
+
+	if h.blockStore == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "block storage not available"})
+		return
+	}
+
+	// Retrieve block from storage
+	data, err := h.blockStore.GetBlock(c.Request.Context(), blockID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "block not found"})
+		return
+	}
+
+	// Update last accessed time
+	_ = h.db.Session().Query(`
+		UPDATE blocks SET last_accessed = ? WHERE org_id = ? AND block_id = ?
+	`, time.Now(), orgID, blockID).Exec()
+
+	c.Data(http.StatusOK, "application/octet-stream", data)
+}
+
+// PutBlock stores a block
+// PUT /seafhttp/repo/:repo_id/block/:block_id
+func (h *SyncHandler) PutBlock(c *gin.Context) {
+	blockID := c.Param("block_id")
+	orgID := c.GetString("org_id")
+
+	if h.blockStore == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "block storage not available"})
+		return
+	}
+
+	// Read block data
+	data, err := io.ReadAll(c.Request.Body)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "failed to read block data"})
+		return
+	}
+
+	// Verify block hash
+	hash := sha256.Sum256(data)
+	computedID := hex.EncodeToString(hash[:])
+
+	// For SHA-1 compatibility with legacy Seafile, just check length
+	// Seafile uses SHA-1 (40 chars), we use SHA-256 (64 chars)
+	if len(blockID) == 40 {
+		// Legacy SHA-1 block ID - accept as-is for compatibility
+	} else if computedID != blockID {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "block hash mismatch"})
+		return
+	}
+
+	// Store block
+	blockData := &storage.BlockData{
+		Data: data,
+		Hash: blockID, // Use provided ID for compatibility
+	}
+
+	_, err = h.blockStore.PutBlockData(c.Request.Context(), blockData)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to store block"})
+		return
+	}
+
+	// Store block metadata in database
+	_ = h.db.Session().Query(`
+		INSERT INTO blocks (org_id, block_id, size_bytes, storage_class, ref_count, created_at, last_accessed)
+		VALUES (?, ?, ?, 'hot', 1, ?, ?)
+	`, orgID, blockID, len(data), time.Now(), time.Now()).Exec()
+
+	c.Status(http.StatusOK)
+}
+
+// CheckBlocksRequest represents the request to check which blocks exist
+type CheckBlocksRequest struct {
+	BlockIDs []string `json:"block_ids"`
+}
+
+// CheckBlocks checks which blocks already exist (for deduplication)
+// POST /seafhttp/repo/:repo_id/check-blocks
+func (h *SyncHandler) CheckBlocks(c *gin.Context) {
+	if h.blockStore == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "block storage not available"})
+		return
+	}
+
+	// Read block IDs from body
+	body, err := io.ReadAll(c.Request.Body)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "failed to read body"})
+		return
+	}
+
+	// Parse as newline-separated block IDs (Seafile format)
+	blockIDs := strings.Split(strings.TrimSpace(string(body)), "\n")
+
+	// Check which blocks exist
+	existMap, err := h.blockStore.CheckBlocksParallel(c.Request.Context(), blockIDs, 10)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to check blocks"})
+		return
+	}
+
+	// Return list of missing blocks (needed for upload)
+	var needed []string
+	for _, id := range blockIDs {
+		if !existMap[id] {
+			needed = append(needed, id)
+		}
+	}
+
+	// Return as newline-separated list
+	c.String(http.StatusOK, strings.Join(needed, "\n"))
+}
+
+// GetFSIDList returns the list of FS object IDs for sync
+// GET /seafhttp/repo/:repo_id/fs-id-list
+func (h *SyncHandler) GetFSIDList(c *gin.Context) {
+	repoID := c.Param("repo_id")
+	serverHead := c.Query("server-head")
+	clientHead := c.Query("client-head")
+	dirOnly := c.Query("dir-only") == "1"
+
+	_ = clientHead // Used for incremental sync
+	_ = dirOnly    // Whether to return only directories
+
+	// Get FS object IDs by traversing from server head commit
+	var fsIDs []string
+
+	if serverHead != "" {
+		// Query root FS ID from commit
+		var rootFSID string
+		err := h.db.Session().Query(`
+			SELECT root_fs_id FROM commits WHERE library_id = ? AND commit_id = ?
+		`, repoID, serverHead).Scan(&rootFSID)
+
+		if err == nil && rootFSID != "" {
+			// For now, just return the root FS ID
+			// TODO: Traverse the FS tree to get all IDs
+			fsIDs = append(fsIDs, rootFSID)
+		}
+	}
+
+	// Return as newline-separated list with count header
+	result := fmt.Sprintf("%d\n%s", len(fsIDs), strings.Join(fsIDs, "\n"))
+	c.String(http.StatusOK, result)
+}
+
+// GetFSObject retrieves a filesystem object
+// GET /seafhttp/repo/:repo_id/fs/:fs_id
+func (h *SyncHandler) GetFSObject(c *gin.Context) {
+	repoID := c.Param("repo_id")
+	fsID := c.Param("fs_id")
+
+	// Query FS object from database
+	// Schema uses: obj_type, obj_name, dir_entries (as TEXT), block_ids (as LIST<TEXT>)
+	var fsType string
+	var name string
+	var size int64
+	var mtime int64
+	var entriesJSON string
+	var blockIDs []string
+
+	err := h.db.Session().Query(`
+		SELECT obj_type, obj_name, size_bytes, mtime, dir_entries, block_ids
+		FROM fs_objects WHERE library_id = ? AND fs_id = ?
+	`, repoID, fsID).Scan(&fsType, &name, &size, &mtime, &entriesJSON, &blockIDs)
+
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "fs object not found"})
+		return
+	}
+
+	// Build FS object
+	obj := FSObject{
+		ID:    fsID,
+		Name:  name,
+		Size:  size,
+		Mtime: mtime,
+	}
+
+	if fsType == "file" {
+		obj.Type = 1
+		obj.BlockIDs = blockIDs
+	} else {
+		obj.Type = 3
+		if entriesJSON != "" {
+			json.Unmarshal([]byte(entriesJSON), &obj.Entries)
+		}
+	}
+
+	c.JSON(http.StatusOK, obj)
+}
+
+// PackFS packs multiple FS objects into a single response
+// POST /seafhttp/repo/:repo_id/pack-fs
+func (h *SyncHandler) PackFS(c *gin.Context) {
+	repoID := c.Param("repo_id")
+
+	// Read FS IDs from body
+	body, err := io.ReadAll(c.Request.Body)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "failed to read body"})
+		return
+	}
+
+	fsIDs := strings.Split(strings.TrimSpace(string(body)), "\n")
+
+	// Collect FS objects
+	var objects []FSObject
+	for _, fsID := range fsIDs {
+		if fsID == "" {
+			continue
+		}
+
+		var fsType string
+		var name string
+		var size int64
+		var mtime int64
+		var entriesJSON string
+		var blockIDs []string
+
+		err := h.db.Session().Query(`
+			SELECT obj_type, obj_name, size_bytes, mtime, dir_entries, block_ids
+			FROM fs_objects WHERE library_id = ? AND fs_id = ?
+		`, repoID, fsID).Scan(&fsType, &name, &size, &mtime, &entriesJSON, &blockIDs)
+
+		if err != nil {
+			continue // Skip missing objects
+		}
+
+		obj := FSObject{
+			ID:    fsID,
+			Name:  name,
+			Size:  size,
+			Mtime: mtime,
+		}
+
+		if fsType == "file" {
+			obj.Type = 1
+			obj.BlockIDs = blockIDs
+		} else {
+			obj.Type = 3
+			if entriesJSON != "" {
+				json.Unmarshal([]byte(entriesJSON), &obj.Entries)
+			}
+		}
+
+		objects = append(objects, obj)
+	}
+
+	c.JSON(http.StatusOK, objects)
+}
+
+// RecvFS receives and stores FS objects from client
+// POST /seafhttp/repo/:repo_id/recv-fs
+func (h *SyncHandler) RecvFS(c *gin.Context) {
+	repoID := c.Param("repo_id")
+
+	// Read FS objects from body
+	body, err := io.ReadAll(c.Request.Body)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "failed to read body"})
+		return
+	}
+
+	var objects []FSObject
+	if err := json.Unmarshal(body, &objects); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid fs objects format"})
+		return
+	}
+
+	// Store each FS object
+	for _, obj := range objects {
+		fsType := "dir"
+		if obj.Type == 1 {
+			fsType = "file"
+		}
+
+		entriesJSON, _ := json.Marshal(obj.Entries)
+
+		err := h.db.Session().Query(`
+			INSERT INTO fs_objects (library_id, fs_id, obj_type, obj_name, size_bytes, mtime, dir_entries, block_ids)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		`, repoID, obj.ID, fsType, obj.Name, obj.Size,
+			obj.Mtime, string(entriesJSON), obj.BlockIDs).Exec()
+
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to store fs object"})
+			return
+		}
+	}
+
+	c.Status(http.StatusOK)
+}
+
+// CheckFS checks which FS objects already exist
+// POST /seafhttp/repo/:repo_id/check-fs
+func (h *SyncHandler) CheckFS(c *gin.Context) {
+	repoID := c.Param("repo_id")
+
+	// Read FS IDs from body
+	body, err := io.ReadAll(c.Request.Body)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "failed to read body"})
+		return
+	}
+
+	fsIDs := strings.Split(strings.TrimSpace(string(body)), "\n")
+
+	// Check which FS objects exist
+	var needed []string
+	for _, fsID := range fsIDs {
+		if fsID == "" {
+			continue
+		}
+
+		var exists string
+		err := h.db.Session().Query(`
+			SELECT fs_id FROM fs_objects WHERE library_id = ? AND fs_id = ? LIMIT 1
+		`, repoID, fsID).Scan(&exists)
+
+		if err != nil {
+			needed = append(needed, fsID)
+		}
+	}
+
+	c.String(http.StatusOK, strings.Join(needed, "\n"))
+}
+
+// PermissionCheck checks user permissions for the repository
+// GET /seafhttp/repo/:repo_id/permission-check
+func (h *SyncHandler) PermissionCheck(c *gin.Context) {
+	// For now, return full read/write permission
+	// TODO: Implement proper permission checking
+	c.JSON(http.StatusOK, gin.H{
+		"permission": "rw",
+	})
+}
+
+// QuotaCheck checks if user has enough quota for upload
+// GET /seafhttp/repo/:repo_id/quota-check
+func (h *SyncHandler) QuotaCheck(c *gin.Context) {
+	// For now, return unlimited quota
+	// TODO: Implement proper quota checking
+	c.JSON(http.StatusOK, gin.H{
+		"has_quota": true,
+	})
+}

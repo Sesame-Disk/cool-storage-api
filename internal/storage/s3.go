@@ -326,3 +326,60 @@ func (s *S3Store) Bucket() string {
 func (s *S3Store) Client() *s3.Client {
 	return s.client
 }
+
+// ObjectInfo represents information about an S3 object
+type ObjectInfo struct {
+	Key          string
+	Size         int64
+	LastModified time.Time
+	IsDirectory  bool // True if this is a "directory" (common prefix)
+}
+
+// List lists objects with the given prefix
+// If delimiter is non-empty, it groups objects by that delimiter (for directory listing)
+func (s *S3Store) List(ctx context.Context, prefix string, delimiter string) ([]ObjectInfo, error) {
+	input := &s3.ListObjectsV2Input{
+		Bucket: aws.String(s.bucket),
+		Prefix: aws.String(prefix),
+	}
+
+	if delimiter != "" {
+		input.Delimiter = aws.String(delimiter)
+	}
+
+	var objects []ObjectInfo
+
+	paginator := s3.NewListObjectsV2Paginator(s.client, input)
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("failed to list objects: %w", err)
+		}
+
+		// Add common prefixes (directories)
+		for _, cp := range page.CommonPrefixes {
+			if cp.Prefix != nil {
+				objects = append(objects, ObjectInfo{
+					Key:         *cp.Prefix,
+					IsDirectory: true,
+				})
+			}
+		}
+
+		// Add objects (files)
+		for _, obj := range page.Contents {
+			if obj.Key != nil {
+				info := ObjectInfo{
+					Key:  *obj.Key,
+					Size: aws.ToInt64(obj.Size),
+				}
+				if obj.LastModified != nil {
+					info.LastModified = *obj.LastModified
+				}
+				objects = append(objects, info)
+			}
+		}
+	}
+
+	return objects, nil
+}

@@ -74,7 +74,6 @@ func (h *FileHandler) ListDirectory(c *gin.Context) {
 
 	// Normalize path
 	dirPath = normalizePath(dirPath)
-	_ = dirPath // Will be used when implementing directory listing
 
 	// Get library to verify access (use strings for UUID binding)
 	var libID, headCommitID string
@@ -86,11 +85,65 @@ func (h *FileHandler) ListDirectory(c *gin.Context) {
 		return
 	}
 
-	// TODO: Traverse commits and fs_objects to build directory listing
-	// For now, return empty directory
-	c.JSON(http.StatusOK, gin.H{
-		"dirent_list": []models.FileInfo{},
-	})
+	// Build S3 prefix for directory listing
+	// Storage key format: {org_id}/{repo_id}{path}
+	prefix := fmt.Sprintf("%s/%s", orgID, repoID)
+	if dirPath != "/" {
+		prefix = prefix + dirPath
+	}
+	// Ensure prefix ends with / for directory listing
+	if !strings.HasSuffix(prefix, "/") {
+		prefix = prefix + "/"
+	}
+
+	// List files from S3 if storage is available
+	var direntList []models.FileInfo
+	if h.storage != nil {
+		objects, err := h.storage.List(c.Request.Context(), prefix, "/")
+		if err != nil {
+			// Log error but return empty list (not a fatal error)
+			c.JSON(http.StatusOK, []models.FileInfo{})
+			return
+		}
+
+		for _, obj := range objects {
+			// Extract the name from the key (remove prefix)
+			name := strings.TrimPrefix(obj.Key, prefix)
+			// Remove trailing slash from directory names
+			name = strings.TrimSuffix(name, "/")
+
+			if name == "" {
+				continue // Skip the directory itself
+			}
+
+			fileType := "file"
+			if obj.IsDirectory {
+				fileType = "dir"
+			}
+
+			direntList = append(direntList, models.FileInfo{
+				Name:  name,
+				Type:  fileType,
+				Size:  obj.Size,
+				MTime: obj.LastModified,
+			})
+		}
+	}
+
+	// Return empty array instead of null
+	if direntList == nil {
+		direntList = []models.FileInfo{}
+	}
+
+	// Seafile API can return either "dirent_list" wrapper or flat array
+	// depending on the endpoint. /api2/repos/:id/dir/ returns flat array
+	if strings.HasPrefix(c.Request.URL.Path, "/api2/") {
+		c.JSON(http.StatusOK, direntList)
+	} else {
+		c.JSON(http.StatusOK, gin.H{
+			"dirent_list": direntList,
+		})
+	}
 }
 
 // CreateDirectoryRequest represents the request for creating a directory

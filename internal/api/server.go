@@ -16,12 +16,13 @@ import (
 
 // Server represents the HTTP API server
 type Server struct {
-	config       *config.Config
-	db           *db.DB
-	storage      *storage.S3Store
-	tokenManager *TokenManager
-	router       *gin.Engine
-	server       *http.Server
+	config     *config.Config
+	db         *db.DB
+	storage    *storage.S3Store
+	blockStore *storage.BlockStore
+	tokenStore TokenStore
+	router     *gin.Engine
+	server     *http.Server
 }
 
 // NewServer creates a new API server
@@ -42,15 +43,32 @@ func NewServer(cfg *config.Config, database *db.DB) *Server {
 		// Continue without S3 - file operations will fail gracefully
 	}
 
-	// Initialize token manager for seafhttp
-	tokenManager := NewTokenManager(cfg.SeafHTTP.TokenTTL)
+	// Initialize token store for seafhttp
+	// Use Cassandra-backed store if database is available (stateless, distributed)
+	// Fall back to in-memory store if database is not available
+	var tokenStore TokenStore
+	if database != nil {
+		dbTokenStore := db.NewTokenStore(database, cfg.SeafHTTP.TokenTTL)
+		tokenStore = NewCassandraTokenAdapter(dbTokenStore)
+		log.Println("Using Cassandra-backed token store (stateless, distributed)")
+	} else {
+		tokenStore = NewTokenManager(cfg.SeafHTTP.TokenTTL)
+		log.Println("Using in-memory token store (not distributed)")
+	}
+
+	// Initialize block store for content-addressable storage
+	var blockStore *storage.BlockStore
+	if s3Store != nil {
+		blockStore = storage.NewBlockStore(s3Store, "blocks/")
+	}
 
 	s := &Server{
-		config:       cfg,
-		db:           database,
-		storage:      s3Store,
-		tokenManager: tokenManager,
-		router:       router,
+		config:     cfg,
+		db:         database,
+		storage:    s3Store,
+		blockStore: blockStore,
+		tokenStore: tokenStore,
+		router:     router,
 	}
 
 	s.setupRoutes()
@@ -138,7 +156,12 @@ func (s *Server) setupRoutes() {
 			v2.RegisterLibraryRoutes(protected, s.db, s.config)
 
 			// File endpoints (with Seafile-compatible URL generation)
-			v2.RegisterFileRoutes(protected, s.db, s.config, s.storage, s.tokenManager, serverURL)
+			v2.RegisterFileRoutes(protected, s.db, s.config, s.storage, s.tokenStore, serverURL)
+
+			// Block endpoints (content-addressable storage)
+			if s.blockStore != nil {
+				v2.RegisterBlockRoutes(protected, s.blockStore, s.config)
+			}
 
 			// Share link endpoints
 			v2.RegisterShareRoutes(protected, s.db, s.config)
@@ -148,10 +171,41 @@ func (s *Server) setupRoutes() {
 		}
 	}
 
+	// Legacy /api2/ routes for Seafile CLI compatibility
+	// The Seafile CLI uses /api2/ prefix (no version in path)
+	api2 := s.router.Group("/api2")
+	{
+		// Auth token endpoint (used by seaf-cli for login)
+		api2.POST("/auth-token/", s.handleAuthToken)
+
+		// Ping/server info
+		api2.GET("/ping/", s.handlePing)
+		api2.GET("/server-info/", s.handleServerInfo)
+
+		// Account info
+		api2.GET("/account/info/", s.authMiddleware(), s.handleAccountInfo)
+
+		// Protected endpoints
+		protected := api2.Group("")
+		protected.Use(s.authMiddleware())
+		{
+			// Library endpoints (same handlers as v2)
+			v2.RegisterLibraryRoutes(protected, s.db, s.config)
+
+			// File endpoints
+			v2.RegisterFileRoutes(protected, s.db, s.config, s.storage, s.tokenStore, serverURL)
+		}
+	}
+
 	// Seafile-compatible file transfer endpoints (seafhttp)
 	// These endpoints handle the actual file uploads/downloads
-	seafHTTPHandler := NewSeafHTTPHandler(s.storage, s.tokenManager)
+	seafHTTPHandler := NewSeafHTTPHandler(s.storage, s.tokenStore)
 	seafHTTPHandler.RegisterSeafHTTPRoutes(s.router)
+
+	// Seafile sync protocol endpoints (for Desktop client)
+	// These endpoints handle repository synchronization
+	syncHandler := NewSyncHandler(s.db, s.storage, s.blockStore)
+	syncHandler.RegisterSyncRoutes(s.router, s.authMiddleware())
 }
 
 // authMiddleware validates authentication tokens
@@ -211,6 +265,70 @@ func (s *Server) handleHealth(c *gin.Context) {
 // handleNotImplemented returns a 501 Not Implemented response
 func (s *Server) handleNotImplemented(c *gin.Context) {
 	c.JSON(http.StatusNotImplemented, gin.H{"error": "not implemented yet"})
+}
+
+// handleAuthToken handles the Seafile CLI auth-token endpoint
+// POST /api2/auth-token/ with username and password
+func (s *Server) handleAuthToken(c *gin.Context) {
+	username := c.PostForm("username")
+	password := c.PostForm("password")
+
+	if username == "" || password == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "username and password required"})
+		return
+	}
+
+	// In dev mode, check dev tokens by matching username
+	if s.config.Auth.DevMode {
+		for _, devToken := range s.config.Auth.DevTokens {
+			// In dev mode, accept any password for configured users
+			// The username should match the user_id or a configured email
+			if devToken.UserID == username || devToken.Token == password {
+				c.JSON(http.StatusOK, gin.H{
+					"token": devToken.Token,
+				})
+				return
+			}
+		}
+	}
+
+	// TODO: Implement OIDC password grant or redirect to OIDC flow
+	c.JSON(http.StatusUnauthorized, gin.H{
+		"non_field_errors": "Unable to login with provided credentials.",
+	})
+}
+
+// handleServerInfo returns server information for Seafile clients
+// GET /api2/server-info/
+func (s *Server) handleServerInfo(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{
+		"version":                     "10.0.0",  // Seafile version we're compatible with
+		"encrypted_library_version":  2,
+		"enable_encrypted_library":   true,
+		"enable_repo_history_setting": true,
+		"enable_reset_encrypted_repo_password": false,
+	})
+}
+
+// handleAccountInfo returns account information for the authenticated user
+// GET /api2/account/info/
+func (s *Server) handleAccountInfo(c *gin.Context) {
+	userID := c.GetString("user_id")
+	orgID := c.GetString("org_id")
+
+	// Return basic account info
+	// In a full implementation, this would query the user from the database
+	c.JSON(http.StatusOK, gin.H{
+		"email":       userID + "@sesamefs.local", // Placeholder email
+		"name":        userID,
+		"login_id":    "",
+		"department":  "",
+		"contact_email": "",
+		"institution": orgID,
+		"is_staff":    false,
+		"space_usage": 0,
+		"total_space": -2, // -2 means unlimited
+	})
 }
 
 // Run starts the HTTP server

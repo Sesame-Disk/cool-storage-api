@@ -95,8 +95,55 @@ File Upload Flow:
                      │                    │
                      ▼                    ▼
               Variable-size         Block already
-              blocks (512KB-8MB)    exists? Skip!
+              blocks (2-256MB)      exists? Skip!
                                     (deduplication)
+```
+
+### Adaptive Chunking (Network-Aware)
+
+SesameFS automatically adjusts chunk sizes based on client network speed for optimal performance across all connection types.
+
+```
+Upload Start Sequence:
+┌─────────────────────────────────────────────────────────────────────┐
+│  1. SPEED PROBE                                                     │
+│     Upload 1MB test chunk, measure speed                            │
+│     Timeout after 30s → assume very slow connection                 │
+├─────────────────────────────────────────────────────────────────────┤
+│  2. CALCULATE OPTIMAL CHUNK SIZE                                    │
+│     Target: ~8 seconds per chunk                                    │
+│                                                                     │
+│     Speed Detected    │ Calculated Chunk Size                       │
+│     ──────────────────┼─────────────────────                        │
+│     500 Kbps (mobile) │ 2 MB (minimum)                              │
+│     5 Mbps (home)     │ 5 MB                                        │
+│     50 Mbps (office)  │ 50 MB                                       │
+│     500 Mbps (DC)     │ 256 MB (maximum)                            │
+├─────────────────────────────────────────────────────────────────────┤
+│  3. UPLOAD WITH ADAPTATION                                          │
+│     • Measure each chunk upload time                                │
+│     • Adjust size up/down based on actual speed                     │
+│     • 60s timeout per chunk → reduce size 50% and retry             │
+│     • Failed chunk → retry with exponential backoff                 │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+**Why Adaptive?**
+| Tenant Type | Fixed 16MB Chunks | Adaptive Chunks |
+|-------------|-------------------|-----------------|
+| Mobile (500 Kbps) | 4+ min/chunk, timeouts | 2MB = 32s/chunk, reliable |
+| Home (10 Mbps) | 13s/chunk, OK | 10MB = 8s/chunk, optimal |
+| Enterprise (100 Mbps) | 1.3s/chunk, too small | 100MB = 8s/chunk, efficient |
+| Datacenter (1 Gbps) | 0.1s/chunk, way too small | 256MB = 2s/chunk, minimal overhead |
+
+**Retry Strategy:**
+```
+Attempt 1: Upload chunk → Fail → Wait 1s
+Attempt 2: Retry same size → Fail → Wait 2s
+Attempt 3: Reduce size 50% → Retry → Wait 4s
+Attempt 4: Retry smaller → Fail → Wait 8s
+Attempt 5: Reduce size 50% again → Retry
+Attempt 6+: Give up, report error
 ```
 
 ### Storage Class Tiering
@@ -387,10 +434,26 @@ database:
 
 chunking:
   algorithm: fastcdc
-  min_size: 524288              # 512 KB
-  avg_size: 2097152             # 2 MB
-  max_size: 8388608             # 8 MB
   hash_algorithm: sha256
+
+  # Adaptive chunk sizing (adjusts to client network speed)
+  adaptive:
+    enabled: true
+    absolute_min: 2097152       # 2 MB floor (terrible connections)
+    absolute_max: 268435456     # 256 MB ceiling (datacenter)
+    initial_size: 16777216      # 16 MB starting point
+    target_seconds: 8           # Target time per chunk upload
+
+  # Speed probe (measures connection before upload)
+  probe:
+    size: 1048576               # 1 MB probe
+    timeout: 30                 # 30 second timeout
+
+  # Timeout and retry
+  chunk_timeout: 60             # Abort chunk after 60 seconds
+  max_retries: 5
+  reduce_on_timeout: 0.5        # Reduce to 50% size on timeout
+  reduce_on_failure: 0.5        # Reduce to 50% size on failure
 
 storage:
   default_class: hot
@@ -435,40 +498,235 @@ lifecycle:
 
 ## Development Roadmap
 
-### Phase 1: Foundation (MVP)
+### Phase 1: Foundation (MVP) ✅
 1. [x] Project structure and Go modules setup
-2. [ ] Configuration management (godotenv + YAML)
-3. [ ] Cassandra connection and schema
-4. [ ] Library CRUD operations
-5. [ ] FastCDC chunking implementation
-6. [ ] Block storage layer (S3)
-7. [ ] File upload (chunked to S3)
-8. [ ] File download (reassemble from blocks)
-9. [ ] Directory operations
-10. [ ] Share links (basic)
-11. [ ] OIDC authentication integration
-12. [ ] Glacier integration (upload + restore)
+2. [x] Configuration management (YAML + env overrides)
+3. [x] Cassandra connection and schema
+4. [x] Library CRUD operations
+5. [x] S3 storage integration (MinIO compatible)
+6. [x] Basic file upload/download via `/seafhttp/`
+7. [x] Token-based file access (configurable TTL)
+8. [x] FastCDC chunking with adaptive sizing
+9. [x] Block storage layer (content-addressable)
+10. [x] Block check/upload/download endpoints
+11. [x] Distributed token store (Cassandra-backed, stateless)
 
-### Phase 2: Seafile Sync Protocol
-- [ ] `/seafhttp/` endpoint implementation
-- [ ] Commit/FS object model
-- [ ] Block check/upload/download
-- [ ] Sync state machine
-- [ ] Desktop client compatibility testing
+### 🚀 PRIORITY: Seafile Client Compatibility
+**Goal: Test with Seafile Desktop and CLI clients**
 
-### Phase 3: Enterprise Features
-- [ ] Multi-tenancy (organizations)
-- [ ] Quota management
+```
+Immediate (for CLI testing):
+├── [ ] Add /api2/ legacy route aliases
+├── [ ] GET /api2/repos/ - List libraries
+├── [ ] GET /api2/repos/:id/dir/?p=/ - Directory listing  ← CRITICAL
+├── [ ] GET /api2/auth-token/ - Auth token endpoint
+└── [ ] Test with: seaf-cli sync
+
+For Desktop client (sync protocol):
+├── [ ] GET /seafhttp/repo/:id/commit/HEAD - Latest commit
+├── [ ] GET /seafhttp/repo/:id/commit/:cid - Get commit
+├── [ ] POST /seafhttp/repo/:id/check-blocks/ - Check blocks
+├── [ ] GET /seafhttp/repo/:id/block/:bid - Download block
+├── [ ] POST /seafhttp/repo/:id/recv-fs/ - Receive FS object
+├── [ ] GET /seafhttp/repo/:id/fs/:fsid - Get FS object
+└── [ ] Commit/FS object model in Cassandra
+```
+
+### Phase 2: Stateless Distributed Architecture ✅
+```
+Completed:
+├── [x] Content-addressable block storage (S3)
+├── [x] Block deduplication (by SHA256)
+├── [x] Distributed token store (Cassandra TTL)
+├── [x] Any server can handle any request (stateless)
+└── [x] No sticky sessions required
+
+Pending:
+├── [ ] POST /api/v2/files/commit - Finalize chunked upload
+└── [ ] Upload session tracking (for resume across servers)
+```
+
+### Phase 3: Multi-Hostname Multi-Tenancy
+**Goal: Multiple domains → Same backend cluster**
+
+```
+Architecture:
+┌─────────────────────────────────────────────────────────────┐
+│  storage.acme.com ──┐                                       │
+│  files.globex.io ───┼──► Load Balancer ──► Stateless Pool  │
+│  cloud.initech.de ──┘         │                             │
+│                               ▼                             │
+│              Hostname → Org Middleware                      │
+│              storage.acme.com → org: "acme-123"             │
+│                               │                             │
+│                               ▼                             │
+│         S3 (multi-region) ◄── Backend ──► Cassandra (global)│
+└─────────────────────────────────────────────────────────────┘
+
+Implementation:
+├── [ ] hostname_mappings table in Cassandra
+├── [ ] Tenant resolution middleware (hostname → org_id)
+├── [ ] URL generation uses request hostname
+├── [ ] Per-org storage configuration (S3 regions)
+├── [ ] Per-org settings and quotas
+└── [ ] Multi-region S3 routing (nearest to user)
+
+Benefits over Seafile:
+├── Unlimited hostnames per cluster (vs one per instance)
+├── Shared infrastructure, isolated data
+├── Global distribution with Cassandra
+├── Automatic failover (any server handles any tenant)
+└── Per-tenant compliance settings (data residency)
+```
+
+### Phase 4: Enterprise Features
+- [ ] Directory operations (list, create, delete)
+- [ ] File operations (info, delete, move, copy)
+- [ ] Quota management per org
 - [ ] Admin APIs
 - [ ] Audit logging
-- [ ] File versioning UI
+- [ ] Share links (basic)
+- [ ] OIDC authentication integration
+- [ ] Glacier integration (upload + restore)
 
-### Phase 4: Advanced
+### Phase 5: Security Scanning
+**Goal: Detect malware and phishing in uploaded files**
+
+```
+Architecture:
+┌─────────────────────────────────────────────────────────────────────┐
+│  File Upload ──► Pre-scan Queue ──► Security Pipeline              │
+│                                            │                        │
+│         ┌──────────────────────────────────┼────────────────┐       │
+│         │                                  │                │       │
+│         ▼                                  ▼                ▼       │
+│  ┌─────────────┐   ┌───────────────┐   ┌──────────────────────┐    │
+│  │  ClamAV     │   │  YARA Engine  │   │  URL/Link Scanner    │    │
+│  │  (TCP)      │   │  (Phishing    │   │  (Safe Browsing,     │    │
+│  │  Malware    │   │   Patterns)   │   │   PhishTank)         │    │
+│  └─────────────┘   └───────────────┘   └──────────────────────┘    │
+│         │                  │                      │                 │
+│         └──────────────────┴──────────────────────┘                 │
+│                            │                                        │
+│                            ▼                                        │
+│                   Scan Result → Clean / Quarantine / Reject         │
+└─────────────────────────────────────────────────────────────────────┘
+
+ClamAV Integration (Malware):
+├── [ ] Connect via TCP (clamd INSTREAM protocol)
+├── [ ] Scan on upload before committing to storage
+├── [ ] Configurable: block, quarantine, or log-only
+├── [ ] Scan queue with retry for clamd failures
+├── [ ] Per-org enable/disable setting
+└── [ ] Signature update status monitoring
+
+Phishing Detection (Files + Share Links):
+├── [ ] YARA rules engine for pattern matching
+│       ├── Phishing kit detection (fake login forms)
+│       ├── Credential harvesting scripts
+│       ├── Malicious macros in Office files
+│       └── Suspicious JavaScript in PDFs
+├── [ ] URL extraction and scanning
+│       ├── Extract links from documents (Office, PDF, HTML)
+│       ├── Google Safe Browsing API check
+│       ├── PhishTank lookup
+│       ├── OpenPhish feed integration
+│       └── VirusTotal URL scan (optional, paid)
+├── [ ] Office document analysis (oletools)
+│       ├── Macro detection and risk scoring
+│       ├── Embedded object inspection
+│       └── External link detection
+├── [ ] PDF analysis (pdfid/pdf-parser)
+│       ├── JavaScript detection
+│       ├── Auto-open action detection
+│       └── Embedded file extraction
+└── [ ] Share link abuse prevention
+        ├── Monitor download patterns (bulk scraping)
+        ├── Geographic anomaly detection
+        └── Report/flag suspicious shares
+
+Configuration:
+├── ClamAV: host, port, timeout, max file size
+├── YARA: rule directories, update frequency
+├── URL scanning: API keys, rate limits
+├── Actions: block/quarantine/log per threat type
+└── Per-org overrides (enterprise can disable)
+```
+
+**Why not rspamd for files?**
+rspamd is email-focused (headers, SMTP patterns, sender reputation). For file content analysis, YARA rules + oletools + URL scanning provides better coverage. However, we can use rspamd if files are shared via email notifications.
+
+### Phase 6: Office Integration (OnlyOffice/Collabora)
+**Goal: Real-time collaborative document editing**
+
+```
+Architecture:
+┌─────────────────────────────────────────────────────────────────────┐
+│  User Browser                                                        │
+│       │                                                              │
+│       ▼                                                              │
+│  ┌─────────────────────────────────────────────────────────────┐    │
+│  │  SesameFS Web UI                                             │    │
+│  │  Load OnlyOffice JS: /onlyoffice/api/documents/api.js        │    │
+│  │  Initialize editor in iframe                                 │    │
+│  └─────────────────────────────────────────────────────────────┘    │
+│       │                      │                                       │
+│       ▼                      ▼                                       │
+│  ┌──────────────┐    ┌─────────────────────────────────────────┐    │
+│  │  SesameFS    │    │  OnlyOffice Document Server              │    │
+│  │  API         │◄───│  (or Collabora Online)                   │    │
+│  │              │    │                                          │    │
+│  │  WOPI Host   │───►│  Fetches doc via GetFile                 │    │
+│  │  Endpoints   │◄───│  Saves doc via PutFile callback          │    │
+│  └──────────────┘    └─────────────────────────────────────────┘    │
+└─────────────────────────────────────────────────────────────────────┘
+
+WOPI Protocol Endpoints (SesameFS implements as WOPI Host):
+├── [ ] GET  /wopi/files/:file_id              - CheckFileInfo
+│       └── Returns: file name, size, permissions, user info, JWT
+├── [ ] GET  /wopi/files/:file_id/contents     - GetFile
+│       └── Returns: raw file bytes
+├── [ ] POST /wopi/files/:file_id/contents     - PutFile
+│       └── Receives: updated file from OnlyOffice
+├── [ ] POST /wopi/files/:file_id              - Lock/Unlock/RefreshLock
+│       └── Header: X-WOPI-Override = LOCK|UNLOCK|REFRESH_LOCK
+├── [ ] POST /wopi/files/:file_id              - PutRelativeFile
+│       └── Creates new file (Save As)
+└── [ ] POST /wopi/files/:file_id              - RenameFile
+
+Integration Features:
+├── [ ] JWT authentication (ONLYOFFICE_JWT_SECRET)
+├── [ ] Force save on button press (not just on close)
+├── [ ] Auto-save interval configuration
+├── [ ] Co-authoring with real-time sync
+├── [ ] File locking during edit
+├── [ ] Document conversion (doc → docx, etc.)
+└── [ ] Mobile editing support
+
+Supported File Types:
+├── View/Edit: docx, xlsx, pptx
+├── View only: doc, xls, ppt, odt, ods, odp
+└── Convert on open: doc → docx, xls → xlsx, ppt → pptx
+
+Configuration:
+├── ONLYOFFICE_URL: Document Server URL
+├── ONLYOFFICE_JWT_SECRET: Shared secret for JWT
+├── ONLYOFFICE_FORCE_SAVE: Enable save button
+└── ONLYOFFICE_MAX_SIZE: Max document size (default 100MB)
+
+Alternative: Collabora Online (LibreOffice-based)
+├── Same WOPI protocol, different document server
+├── Better compatibility with ODF formats
+└── Can run both and let users choose
+```
+
+### Phase 7: Advanced
 - [ ] WebDAV interface
 - [ ] Search (Elasticsearch)
 - [ ] Thumbnails and previews
 - [ ] Client-side encryption
 - [ ] Real-time notifications (WebSocket)
+- [ ] File versioning UI
 
 ### Future
 - [ ] Redis cluster for caching
@@ -485,11 +743,18 @@ lifecycle:
 | **Storage Backend** | Local filesystem only | S3, Glacier, Disk - configurable |
 | **Cold Storage** | Not supported | Native Glacier with restore workflow |
 | **Database** | MySQL/PostgreSQL (single node) | Cassandra (global, distributed) |
-| **Chunking Speed** | Rabin CDC (baseline) | FastCDC (10x faster) |
+| **Chunking** | Rabin CDC, fixed sizes | FastCDC, adaptive to network speed |
+| **Chunk Sizes** | Fixed 1-8MB | Adaptive 2-256MB based on connection |
 | **Hash Security** | SHA-1 (deprecated) | SHA-256 |
 | **Authentication** | Custom + LDAP | OIDC-native |
-| **Multi-tenancy** | Limited | Full isolation with per-tenant encryption |
+| **Multi-tenancy** | One hostname per instance | Multiple hostnames per cluster |
+| **Session State** | Sticky sessions required | Stateless (any server, any request) |
+| **Upload Resume** | Same server only | Any server (distributed tokens) |
+| **Horizontal Scaling** | Per-tenant instances | Shared stateless pool |
 | **Storage Lifecycle** | Manual | Automatic policies |
+| **Geo-distribution** | Complex replication | Native Cassandra multi-DC |
+| **Security Scanning** | ClamAV only (optional) | ClamAV + YARA + URL scanning |
+| **Phishing Detection** | Not available | YARA rules + document analysis |
 | **Deployment** | C + Python (complex) | Go (single binary) |
 | **License** | AGPLv3 (server) | TBD (permissive) |
 

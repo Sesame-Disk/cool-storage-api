@@ -73,6 +73,8 @@ func (db *DB) Migrate() error {
 		migrationCreateShareLinks,
 		migrationCreateShares,
 		migrationCreateRestoreJobs,
+		migrationCreateAccessTokens,
+		migrationCreateHostnameMappings,
 	}
 
 	for _, migration := range migrations {
@@ -251,4 +253,28 @@ CREATE TABLE IF NOT EXISTS restore_jobs (
 	completed_at TIMESTAMP,
 	expires_at TIMESTAMP,
 	PRIMARY KEY ((org_id), job_id)
+)`
+
+// Access tokens for stateless file operations
+// Uses Cassandra TTL for automatic expiration
+const migrationCreateAccessTokens = `
+CREATE TABLE IF NOT EXISTS access_tokens (
+	token TEXT PRIMARY KEY,
+	token_type TEXT,
+	org_id UUID,
+	repo_id UUID,
+	file_path TEXT,
+	user_id UUID,
+	created_at TIMESTAMP
+)`
+
+// Hostname mappings for multi-tenant routing
+// Maps hostnames/domains to organizations
+const migrationCreateHostnameMappings = `
+CREATE TABLE IF NOT EXISTS hostname_mappings (
+	hostname TEXT PRIMARY KEY,
+	org_id UUID,
+	settings MAP<TEXT, TEXT>,
+	created_at TIMESTAMP,
+	updated_at TIMESTAMP
 )`

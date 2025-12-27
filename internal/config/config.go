@@ -84,11 +84,36 @@ type OIDCConfig struct {
 
 // ChunkingConfig holds FastCDC chunking settings
 type ChunkingConfig struct {
-	Algorithm     string `yaml:"algorithm"`      // fastcdc
-	MinSize       int    `yaml:"min_size"`       // 512 KB default
-	AvgSize       int    `yaml:"avg_size"`       // 2 MB default
-	MaxSize       int    `yaml:"max_size"`       // 8 MB default
-	HashAlgorithm string `yaml:"hash_algorithm"` // sha256
+	Algorithm     string         `yaml:"algorithm"`      // fastcdc
+	HashAlgorithm string         `yaml:"hash_algorithm"` // sha256
+	Adaptive      AdaptiveConfig `yaml:"adaptive"`       // Adaptive chunk sizing
+	Probe         ProbeConfig    `yaml:"probe"`          // Speed probe settings
+	Retry         RetryConfig    `yaml:"retry"`          // Retry settings
+}
+
+// AdaptiveConfig holds adaptive chunk sizing settings
+type AdaptiveConfig struct {
+	Enabled       bool  `yaml:"enabled"`        // Enable adaptive chunking
+	AbsoluteMin   int64 `yaml:"absolute_min"`   // 2 MB floor (terrible connections)
+	AbsoluteMax   int64 `yaml:"absolute_max"`   // 256 MB ceiling (datacenter)
+	InitialSize   int64 `yaml:"initial_size"`   // 16 MB starting point (if probe skipped)
+	TargetSeconds int   `yaml:"target_seconds"` // Target seconds per chunk (8s default)
+}
+
+// ProbeConfig holds speed probe settings
+type ProbeConfig struct {
+	Size    int64         `yaml:"size"`    // Probe size in bytes (1 MB default)
+	Timeout time.Duration `yaml:"timeout"` // Probe timeout (30s default)
+}
+
+// RetryConfig holds retry and timeout settings
+type RetryConfig struct {
+	ChunkTimeout     time.Duration `yaml:"chunk_timeout"`      // Per-chunk timeout (60s default)
+	MaxRetries       int           `yaml:"max_retries"`        // Max retry attempts (5 default)
+	ReduceOnTimeout  float64       `yaml:"reduce_on_timeout"`  // Reduce to this fraction on timeout (0.5)
+	ReduceOnFailure  float64       `yaml:"reduce_on_failure"`  // Reduce to this fraction on failure (0.5)
+	BackoffBase      time.Duration `yaml:"backoff_base"`       // Base backoff duration (1s default)
+	BackoffMaxJitter time.Duration `yaml:"backoff_max_jitter"` // Max jitter to add (500ms default)
 }
 
 // VersioningConfig holds file versioning settings
@@ -158,10 +183,26 @@ func DefaultConfig() *Config {
 		},
 		Chunking: ChunkingConfig{
 			Algorithm:     "fastcdc",
-			MinSize:       524288,  // 512 KB
-			AvgSize:       2097152, // 2 MB
-			MaxSize:       8388608, // 8 MB
 			HashAlgorithm: "sha256",
+			Adaptive: AdaptiveConfig{
+				Enabled:       true,
+				AbsoluteMin:   2 * 1024 * 1024,   // 2 MB
+				AbsoluteMax:   256 * 1024 * 1024, // 256 MB
+				InitialSize:   16 * 1024 * 1024,  // 16 MB
+				TargetSeconds: 8,                 // 8 seconds per chunk
+			},
+			Probe: ProbeConfig{
+				Size:    1 * 1024 * 1024, // 1 MB probe
+				Timeout: 30 * time.Second,
+			},
+			Retry: RetryConfig{
+				ChunkTimeout:     60 * time.Second,
+				MaxRetries:       5,
+				ReduceOnTimeout:  0.5,
+				ReduceOnFailure:  0.5,
+				BackoffBase:      1 * time.Second,
+				BackoffMaxJitter: 500 * time.Millisecond,
+			},
 		},
 		Versioning: VersioningConfig{
 			DefaultTTLDays: 90,

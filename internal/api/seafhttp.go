@@ -34,6 +34,14 @@ type AccessToken struct {
 	CreatedAt time.Time
 }
 
+// TokenStore is the interface for token operations (can be in-memory or Cassandra-backed)
+type TokenStore interface {
+	CreateUploadToken(orgID, repoID, path, userID string) (string, error)
+	CreateDownloadToken(orgID, repoID, path, userID string) (string, error)
+	GetToken(tokenStr string, expectedType TokenType) (*AccessToken, bool)
+	DeleteToken(tokenStr string) error
+}
+
 // TokenManager manages temporary access tokens for file operations
 type TokenManager struct {
 	tokens   map[string]*AccessToken
@@ -128,10 +136,11 @@ func (tm *TokenManager) GetToken(tokenStr string, expectedType TokenType) (*Acce
 }
 
 // DeleteToken removes a token
-func (tm *TokenManager) DeleteToken(tokenStr string) {
+func (tm *TokenManager) DeleteToken(tokenStr string) error {
 	tm.mu.Lock()
 	delete(tm.tokens, tokenStr)
 	tm.mu.Unlock()
+	return nil
 }
 
 // cleanup periodically removes expired tokens
@@ -149,17 +158,20 @@ func (tm *TokenManager) cleanup() {
 	}
 }
 
+// Ensure TokenManager implements TokenStore
+var _ TokenStore = (*TokenManager)(nil)
+
 // SeafHTTPHandler handles Seafile-compatible file operations
 type SeafHTTPHandler struct {
-	storage      *storage.S3Store
-	tokenManager *TokenManager
+	storage    *storage.S3Store
+	tokenStore TokenStore
 }
 
 // NewSeafHTTPHandler creates a new SeafHTTP handler
-func NewSeafHTTPHandler(s3Store *storage.S3Store, tokenManager *TokenManager) *SeafHTTPHandler {
+func NewSeafHTTPHandler(s3Store *storage.S3Store, tokenStore TokenStore) *SeafHTTPHandler {
 	return &SeafHTTPHandler{
-		storage:      s3Store,
-		tokenManager: tokenManager,
+		storage:    s3Store,
+		tokenStore: tokenStore,
 	}
 }
 
@@ -180,7 +192,7 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 	tokenStr := c.Param("token")
 
 	// Validate token
-	token, valid := h.tokenManager.GetToken(tokenStr, TokenTypeUpload)
+	token, valid := h.tokenStore.GetToken(tokenStr, TokenTypeUpload)
 	if !valid {
 		c.JSON(http.StatusForbidden, gin.H{"error": "invalid or expired upload token"})
 		return
@@ -230,7 +242,7 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 	fileID := generateFileID(storageKey)
 
 	// Delete the upload token (one-time use)
-	h.tokenManager.DeleteToken(tokenStr)
+	h.tokenStore.DeleteToken(tokenStr)
 
 	// Return response based on ret-json parameter
 	if retJSON {
@@ -253,7 +265,7 @@ func (h *SeafHTTPHandler) HandleDownload(c *gin.Context) {
 	requestedPath := c.Param("filepath")
 
 	// Validate token
-	token, valid := h.tokenManager.GetToken(tokenStr, TokenTypeDownload)
+	token, valid := h.tokenStore.GetToken(tokenStr, TokenTypeDownload)
 	if !valid {
 		c.JSON(http.StatusForbidden, gin.H{"error": "invalid or expired download token"})
 		return
