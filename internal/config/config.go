@@ -17,6 +17,12 @@ type Config struct {
 	Auth       AuthConfig       `yaml:"auth"`
 	Chunking   ChunkingConfig   `yaml:"chunking"`
 	Versioning VersioningConfig `yaml:"versioning"`
+	SeafHTTP   SeafHTTPConfig   `yaml:"seafhttp"`
+}
+
+// SeafHTTPConfig holds Seafile-compatible file transfer settings
+type SeafHTTPConfig struct {
+	TokenTTL time.Duration `yaml:"token_ttl"` // How long upload/download tokens are valid
 }
 
 // ServerConfig holds HTTP server settings
@@ -162,6 +168,9 @@ func DefaultConfig() *Config {
 			MinTTLDays:     7,
 			GCInterval:     24 * time.Hour,
 		},
+		SeafHTTP: SeafHTTPConfig{
+			TokenTTL: 1 * time.Hour,
+		},
 	}
 }
 
@@ -215,6 +224,13 @@ func (c *Config) applyEnvOverrides() {
 	// Auth
 	if v := os.Getenv("AUTH_DEV_MODE"); v != "" {
 		c.Auth.DevMode = v == "true" || v == "1"
+	}
+
+	// SeafHTTP
+	if v := os.Getenv("SEAFHTTP_TOKEN_TTL"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			c.SeafHTTP.TokenTTL = d
+		}
 	}
 	if v := os.Getenv("OIDC_ISSUER"); v != "" {
 		c.Auth.OIDC.Issuer = v

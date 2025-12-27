@@ -1,31 +1,48 @@
 package v2
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"io"
 	"net/http"
 	"path"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/Sesame-Disk/sesamefs/internal/config"
 	"github.com/Sesame-Disk/sesamefs/internal/db"
 	"github.com/Sesame-Disk/sesamefs/internal/models"
+	"github.com/Sesame-Disk/sesamefs/internal/storage"
 	"github.com/gin-gonic/gin"
-	"github.com/google/uuid"
 )
+
+// TokenCreator is an interface for creating access tokens
+type TokenCreator interface {
+	CreateUploadToken(orgID, repoID, path, userID string) (string, error)
+	CreateDownloadToken(orgID, repoID, path, userID string) (string, error)
+}
 
 // FileHandler handles file-related API requests
 type FileHandler struct {
-	db     *db.DB
-	config *config.Config
+	db           *db.DB
+	config       *config.Config
+	storage      *storage.S3Store
+	tokenCreator TokenCreator
+	serverURL    string // Base URL of the server for generating seafhttp URLs
 }
 
 // RegisterFileRoutes registers file routes
-func RegisterFileRoutes(rg *gin.RouterGroup, database *db.DB, cfg *config.Config) {
-	h := &FileHandler{db: database, config: cfg}
+func RegisterFileRoutes(rg *gin.RouterGroup, database *db.DB, cfg *config.Config, s3Store *storage.S3Store, tokenCreator TokenCreator, serverURL string) {
+	h := &FileHandler{
+		db:           database,
+		config:       cfg,
+		storage:      s3Store,
+		tokenCreator: tokenCreator,
+		serverURL:    serverURL,
+	}
 
 	repos := rg.Group("/repos/:repo_id")
 	{
@@ -40,9 +57,9 @@ func RegisterFileRoutes(rg *gin.RouterGroup, database *db.DB, cfg *config.Config
 		repos.POST("/file/move", h.MoveFile)
 		repos.POST("/file/copy", h.CopyFile)
 
-		// Upload/Download links
+		// Upload/Download links (Seafile uses GET for both)
 		repos.GET("/file/download-link", h.GetDownloadLink)
-		repos.POST("/upload-link", h.GetUploadLink)
+		repos.GET("/upload-link", h.GetUploadLink)
 
 		// Direct upload (for smaller files)
 		repos.POST("/upload", h.UploadFile)
@@ -180,37 +197,76 @@ func (h *FileHandler) CopyFile(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"success": true})
 }
 
-// GetDownloadLink returns a presigned URL for downloading a file
+// GetDownloadLink returns a URL for downloading a file (Seafile compatible)
+// The URL points to the server's seafhttp endpoint, not directly to S3
 func (h *FileHandler) GetDownloadLink(c *gin.Context) {
+	repoID := c.Param("repo_id")
 	filePath := c.Query("p")
+	orgID := c.GetString("org_id")
+	userID := c.GetString("user_id")
+
 	if filePath == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "path is required"})
 		return
 	}
 
-	// TODO: Generate presigned S3 URL
-	// For now, return a placeholder
-	c.JSON(http.StatusOK, models.DownloadLink{
-		URL:       "https://example.com/download/placeholder",
-		ExpiresAt: time.Now().Add(1 * time.Hour),
-	})
+	// Check if token creator is available
+	if h.tokenCreator == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "service not available"})
+		return
+	}
+
+	// Normalize path
+	filePath = normalizePath(filePath)
+
+	// Create a download token
+	token, err := h.tokenCreator.CreateDownloadToken(orgID, repoID, filePath, userID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate download link"})
+		return
+	}
+
+	// Get the filename from the path
+	filename := filepath.Base(filePath)
+
+	// Build the Seafile-compatible download URL
+	// Format: {server}/seafhttp/files/{token}/{filename}
+	downloadURL := fmt.Sprintf("%s/seafhttp/files/%s/%s", h.serverURL, token, filename)
+
+	// Return just the URL string (Seafile compatible)
+	c.String(http.StatusOK, downloadURL)
 }
 
-// GetUploadLink returns a presigned URL for uploading a file
+// GetUploadLink returns a URL for uploading a file (Seafile compatible)
+// The URL points to the server's seafhttp endpoint, not directly to S3
 func (h *FileHandler) GetUploadLink(c *gin.Context) {
-	filePath := c.Query("p")
-	if filePath == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "path is required"})
+	repoID := c.Param("repo_id")
+	parentDir := c.DefaultQuery("p", "/")
+	orgID := c.GetString("org_id")
+	userID := c.GetString("user_id")
+
+	// Check if token creator is available
+	if h.tokenCreator == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "service not available"})
 		return
 	}
 
-	// TODO: Generate presigned S3 URL for upload
-	// For now, return a placeholder
-	c.JSON(http.StatusOK, models.UploadLink{
-		URL:       "https://example.com/upload/placeholder",
-		Token:     uuid.New().String(),
-		ExpiresAt: time.Now().Add(1 * time.Hour),
-	})
+	// Normalize path
+	parentDir = normalizePath(parentDir)
+
+	// Create an upload token
+	token, err := h.tokenCreator.CreateUploadToken(orgID, repoID, parentDir, userID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate upload link"})
+		return
+	}
+
+	// Build the Seafile-compatible upload URL
+	// Format: {server}/seafhttp/upload-api/{token}
+	uploadURL := fmt.Sprintf("%s/seafhttp/upload-api/%s", h.serverURL, token)
+
+	// Return just the URL string (Seafile compatible)
+	c.String(http.StatusOK, uploadURL)
 }
 
 // UploadFile handles direct file uploads (for smaller files)
@@ -237,25 +293,42 @@ func (h *FileHandler) UploadFile(c *gin.Context) {
 	hash := sha256.Sum256(content)
 	blockID := hex.EncodeToString(hash[:])
 
-	// Check if block already exists (deduplication) - use string for UUID
+	// Check if block already exists (deduplication)
 	var existingBlockID string
 	_ = h.db.Session().Query(`
 		SELECT block_id FROM blocks WHERE org_id = ? AND block_id = ?
 	`, orgID, blockID).Scan(&existingBlockID)
 
-	if existingBlockID == "" {
-		// TODO: Upload block to S3
-		// TODO: Store block metadata in database
+	// Storage key format: org_id/block_id (content-addressed)
+	storageKey := fmt.Sprintf("%s/%s", orgID, blockID)
 
-		// For now, just record the block (use string for UUID)
+	if existingBlockID == "" {
+		// Upload block to S3 if storage is available
+		if h.storage != nil {
+			_, err := h.storage.Put(c.Request.Context(), storageKey, bytes.NewReader(content), int64(len(content)))
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to upload to storage"})
+				return
+			}
+		}
+
+		// Store block metadata in database
 		if err := h.db.Session().Query(`
 			INSERT INTO blocks (org_id, block_id, size_bytes, storage_class, storage_key, ref_count, created_at, last_accessed)
 			VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 		`, orgID, blockID, len(content), h.config.Storage.DefaultClass,
-			fmt.Sprintf("%s/%s", orgID, blockID), 1, time.Now(), time.Now(),
+			storageKey, 1, time.Now(), time.Now(),
 		).Exec(); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to store block"})
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to store block metadata"})
 			return
+		}
+	} else {
+		// Block exists, increment ref count
+		if err := h.db.Session().Query(`
+			UPDATE blocks SET ref_count = ref_count + 1, last_accessed = ?
+			WHERE org_id = ? AND block_id = ?
+		`, time.Now(), orgID, blockID).Exec(); err != nil {
+			// Non-fatal error, continue
 		}
 	}
 
@@ -264,12 +337,13 @@ func (h *FileHandler) UploadFile(c *gin.Context) {
 	filePath := path.Join(parentDir, header.Filename)
 
 	c.JSON(http.StatusOK, gin.H{
-		"success": true,
-		"id":      blockID,
-		"name":    header.Filename,
-		"path":    filePath,
-		"size":    len(content),
-		"repo_id": repoID,
+		"success":     true,
+		"id":          blockID,
+		"name":        header.Filename,
+		"path":        filePath,
+		"size":        len(content),
+		"repo_id":     repoID,
+		"storage_key": storageKey,
 	})
 }
 

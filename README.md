@@ -553,6 +553,13 @@ The original prototype code has been archived in `_legacy/` for reference:
 
 ---
 
+## Documentation
+
+- [Seafile API Compatibility](docs/SEAFILE_COMPATIBILITY.md) - How the Seafile-compatible API works
+- [Licensing Guide](docs/LICENSING.md) - Legal considerations for using and distributing SesameFS
+
+---
+
 ## References
 
 - [FastCDC Paper (USENIX ATC'16)](https://www.usenix.org/conference/atc16/technical-sessions/presentation/xia)
@@ -567,6 +574,8 @@ The original prototype code has been archived in `_legacy/` for reference:
 MIT License (may change in future)
 
 See [LICENSE](LICENSE) for details.
+
+**Note on Seafile Compatibility:** SesameFS implements a Seafile-compatible API for interoperability purposes. SesameFS is an independent project, not affiliated with Seafile Ltd. See [docs/LICENSING.md](docs/LICENSING.md) for details on why this is legally permissible.
 
 ---
 

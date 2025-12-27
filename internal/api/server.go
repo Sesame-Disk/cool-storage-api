@@ -3,20 +3,25 @@ package api
 import (
 	"context"
 	"fmt"
+	"log"
 	"net/http"
+	"os"
 
 	"github.com/Sesame-Disk/sesamefs/internal/api/v2"
 	"github.com/Sesame-Disk/sesamefs/internal/config"
 	"github.com/Sesame-Disk/sesamefs/internal/db"
+	"github.com/Sesame-Disk/sesamefs/internal/storage"
 	"github.com/gin-gonic/gin"
 )
 
 // Server represents the HTTP API server
 type Server struct {
-	config   *config.Config
-	db       *db.DB
-	router   *gin.Engine
-	server   *http.Server
+	config       *config.Config
+	db           *db.DB
+	storage      *storage.S3Store
+	tokenManager *TokenManager
+	router       *gin.Engine
+	server       *http.Server
 }
 
 // NewServer creates a new API server
@@ -30,10 +35,22 @@ func NewServer(cfg *config.Config, database *db.DB) *Server {
 	router.Use(gin.Recovery())
 	router.Use(gin.Logger())
 
+	// Initialize S3 storage
+	s3Store, err := initS3Storage(cfg)
+	if err != nil {
+		log.Printf("Warning: Failed to initialize S3 storage: %v", err)
+		// Continue without S3 - file operations will fail gracefully
+	}
+
+	// Initialize token manager for seafhttp
+	tokenManager := NewTokenManager(cfg.SeafHTTP.TokenTTL)
+
 	s := &Server{
-		config: cfg,
-		db:     database,
-		router: router,
+		config:       cfg,
+		db:           database,
+		storage:      s3Store,
+		tokenManager: tokenManager,
+		router:       router,
 	}
 
 	s.setupRoutes()
@@ -41,11 +58,62 @@ func NewServer(cfg *config.Config, database *db.DB) *Server {
 	return s
 }
 
+// initS3Storage initializes the S3 storage backend
+func initS3Storage(cfg *config.Config) (*storage.S3Store, error) {
+	// Get S3 configuration from environment or config
+	endpoint := os.Getenv("S3_ENDPOINT")
+	bucket := os.Getenv("S3_BUCKET")
+	region := os.Getenv("AWS_REGION")
+	accessKey := os.Getenv("AWS_ACCESS_KEY_ID")
+	secretKey := os.Getenv("AWS_SECRET_ACCESS_KEY")
+
+	// Fall back to config if not in environment
+	if bucket == "" {
+		if hotBackend, ok := cfg.Storage.Backends["hot"]; ok {
+			if endpoint == "" {
+				endpoint = hotBackend.Endpoint
+			}
+			bucket = hotBackend.Bucket
+			if region == "" {
+				region = hotBackend.Region
+			}
+		}
+	}
+
+	if bucket == "" {
+		return nil, fmt.Errorf("S3 bucket not configured")
+	}
+
+	if region == "" {
+		region = "us-east-1"
+	}
+
+	s3Cfg := storage.S3Config{
+		Endpoint:        endpoint,
+		Bucket:          bucket,
+		Region:          region,
+		AccessKeyID:     accessKey,
+		SecretAccessKey: secretKey,
+		UsePathStyle:    endpoint != "", // Use path style for custom endpoints (MinIO)
+		AccessType:      storage.AccessImmediate,
+	}
+
+	return storage.NewS3Store(context.Background(), s3Cfg)
+}
+
 // setupRoutes configures all API routes
 func (s *Server) setupRoutes() {
 	// Health check endpoints
 	s.router.GET("/ping", s.handlePing)
 	s.router.GET("/health", s.handleHealth)
+
+	// Determine server URL for generating seafhttp URLs
+	// In production, this should come from config or be auto-detected
+	serverURL := os.Getenv("SERVER_URL")
+	if serverURL == "" {
+		// Default to the configured port
+		serverURL = fmt.Sprintf("http://localhost%s", s.config.Server.Port)
+	}
 
 	// API v2 routes
 	apiV2 := s.router.Group("/api/v2")
@@ -69,8 +137,8 @@ func (s *Server) setupRoutes() {
 			// Library endpoints
 			v2.RegisterLibraryRoutes(protected, s.db, s.config)
 
-			// File endpoints
-			v2.RegisterFileRoutes(protected, s.db, s.config)
+			// File endpoints (with Seafile-compatible URL generation)
+			v2.RegisterFileRoutes(protected, s.db, s.config, s.storage, s.tokenManager, serverURL)
 
 			// Share link endpoints
 			v2.RegisterShareRoutes(protected, s.db, s.config)
@@ -80,12 +148,10 @@ func (s *Server) setupRoutes() {
 		}
 	}
 
-	// Seafile sync protocol (Phase 2)
-	// seafhttp := s.router.Group("/seafhttp")
-	// {
-	//     seafhttp.Use(s.authMiddleware())
-	//     seafhttp.RegisterSeafileRoutes(seafhttp, s.db, s.config)
-	// }
+	// Seafile-compatible file transfer endpoints (seafhttp)
+	// These endpoints handle the actual file uploads/downloads
+	seafHTTPHandler := NewSeafHTTPHandler(s.storage, s.tokenManager)
+	seafHTTPHandler.RegisterSeafHTTPRoutes(s.router)
 }
 
 // authMiddleware validates authentication tokens
