@@ -1,14 +1,54 @@
-# ignore ALL .log files
-*.log
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+/sesamefs
 
-# ignore ALL files in ANY directory named temp
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool
+*.out
+coverage.html
+
+# Go workspace file
+go.work
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Config files with secrets
+config.yaml
+.env
+
+# Temp files
 temp/
+tmp/
+*.tmp
+
+# Build artifacts
+dist/
+build/
+
+# Docker volumes (if not using named volumes)
+data/
+
+# Legacy MySQL data (can be removed after migration)
 todo-mysql-data/
 
-# ignore ALL ._ files
-*.exe
-.vscode
-.DS_Store
-.git
-*.out
-cool-api.yaml
+# Upload/download directories
+upload/
+download/

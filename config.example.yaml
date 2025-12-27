@@ -1,0 +1,85 @@
+# SesameFS Configuration
+# Copy this file to config.yaml and customize for your environment
+
+server:
+  port: ":8080"
+  read_timeout: 30s
+  write_timeout: 300s      # Long timeout for large file uploads
+  max_upload_mb: 10240     # 10 GB max upload size
+
+database:
+  hosts:
+    - localhost:9042
+  keyspace: sesamefs
+  consistency: LOCAL_QUORUM
+  local_dc: datacenter1
+  # username: cassandra
+  # password: cassandra
+
+storage:
+  default_class: hot
+  backends:
+    hot:
+      type: s3
+      endpoint: ""                    # Leave empty for AWS, or set for MinIO
+      bucket: sesamefs-blocks-hot
+      region: us-east-1
+      # storage_class: STANDARD
+    warm:
+      type: s3
+      bucket: sesamefs-blocks-warm
+      region: us-east-1
+      storage_class: STANDARD_IA
+    cold:
+      type: s3
+      bucket: sesamefs-blocks-cold
+      region: us-east-1
+      storage_class: GLACIER_IR
+    frozen:
+      type: glacier
+      vault: sesamefs-deep-archive
+      region: us-east-1
+    # local:
+    #   type: filesystem
+    #   path: /data/sesamefs
+
+auth:
+  dev_mode: true                      # Set to false in production
+  dev_tokens:
+    - token: "dev-token-123"
+      user_id: "00000000-0000-0000-0000-000000000001"
+      org_id: "00000000-0000-0000-0000-000000000001"
+  oidc:
+    issuer: https://accounts.sesamedisk.com
+    client_id: ""                     # Set via OIDC_CLIENT_ID env var
+    client_secret: ""                 # Set via OIDC_CLIENT_SECRET env var
+    scopes:
+      - openid
+      - profile
+      - email
+
+chunking:
+  algorithm: fastcdc
+  min_size: 524288                    # 512 KB
+  avg_size: 2097152                   # 2 MB
+  max_size: 8388608                   # 8 MB
+  hash_algorithm: sha256
+
+versioning:
+  default_ttl_days: 90                # 0 = keep forever
+  min_ttl_days: 7
+  gc_interval: 24h
+
+# lifecycle:
+#   enabled: true
+#   check_interval: 1h
+#   rules:
+#     - age_days: 30
+#       from_class: hot
+#       to_class: warm
+#     - age_days: 90
+#       from_class: warm
+#       to_class: cold
+#     - age_days: 365
+#       from_class: cold
+#       to_class: frozen
