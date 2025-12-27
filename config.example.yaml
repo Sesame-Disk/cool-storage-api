@@ -17,31 +17,82 @@ database:
   # password: cassandra
 
 storage:
-  default_class: hot
-  backends:
-    hot:
+  default_class: hot-s3-usa
+
+  # Storage classes: {tier}-{type}-{region}
+  # Each class is a named storage backend with location info
+  classes:
+    # Hot storage (immediate access) - Multi-region
+    hot-s3-usa:
       type: s3
-      endpoint: ""                    # Leave empty for AWS, or set for MinIO
-      bucket: sesamefs-blocks-hot
+      tier: hot
+      endpoint: ""                    # Leave empty for AWS
+      bucket: sesamefs-usa
       region: us-east-1
-      # storage_class: STANDARD
-    warm:
+      failover_class: hot-s3-eu       # Failover if this backend is down
+
+    hot-s3-eu:
       type: s3
-      bucket: sesamefs-blocks-warm
-      region: us-east-1
-      storage_class: STANDARD_IA
-    cold:
+      tier: hot
+      endpoint: ""
+      bucket: sesamefs-eu
+      region: eu-west-1
+      failover_class: hot-s3-usa
+
+    hot-s3-china:
       type: s3
-      bucket: sesamefs-blocks-cold
-      region: us-east-1
-      storage_class: GLACIER_IR
-    frozen:
+      tier: hot
+      endpoint: ""
+      bucket: sesamefs-china
+      region: cn-north-1
+
+    # Cold storage (delayed access)
+    cold-glacier-usa:
       type: glacier
-      vault: sesamefs-deep-archive
+      tier: cold
+      bucket: sesamefs-archive-usa
       region: us-east-1
-    # local:
-    #   type: filesystem
-    #   path: /data/sesamefs
+
+    # Local development (MinIO)
+    hot-minio-local:
+      type: s3
+      tier: hot
+      endpoint: "http://localhost:9000"
+      bucket: sesamefs-blocks
+      region: us-east-1
+      access_key: minioadmin
+      secret_key: minioadmin
+      use_path_style: true            # Required for MinIO
+
+  # Map API hostnames to regions
+  endpoint_regions:
+    "us.sesamefs.com": "usa"
+    "eu.sesamefs.com": "eu"
+    "cn.sesamefs.com": "china"
+    "*.sesamefs.com": "usa"           # Wildcard default
+    "localhost": "local"
+    "*": "usa"                        # Global default
+
+  # Map regions to storage classes
+  region_classes:
+    usa:
+      hot: hot-s3-usa
+      cold: cold-glacier-usa
+    eu:
+      hot: hot-s3-eu
+      cold: cold-glacier-usa          # Uses USA cold storage
+    china:
+      hot: hot-s3-china
+      cold: ""                        # No cold storage in China yet
+    local:
+      hot: hot-minio-local
+      cold: ""
+
+  # Legacy backends (deprecated, use classes instead)
+  # backends:
+  #   hot:
+  #     type: s3
+  #     bucket: sesamefs-blocks-hot
 
 auth:
   dev_mode: true                      # Set to false in production

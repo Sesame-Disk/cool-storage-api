@@ -45,11 +45,35 @@ type DatabaseConfig struct {
 
 // StorageConfig holds storage backend settings
 type StorageConfig struct {
-	DefaultClass string                   `yaml:"default_class"`
-	Backends     map[string]BackendConfig `yaml:"backends"`
+	DefaultClass    string                        `yaml:"default_class"`
+	Classes         map[string]StorageClassConfig `yaml:"classes"`
+	EndpointRegions map[string]string             `yaml:"endpoint_regions"` // hostname → region
+	RegionClasses   map[string]RegionClassConfig  `yaml:"region_classes"`   // region → {hot, cold}
+
+	// Legacy support (deprecated, use Classes instead)
+	Backends map[string]BackendConfig `yaml:"backends"`
 }
 
-// BackendConfig holds configuration for a storage backend
+// StorageClassConfig holds configuration for a storage class (e.g., hot-s3-usa)
+type StorageClassConfig struct {
+	Type          string `yaml:"type"`           // s3, glacier, disk
+	Tier          string `yaml:"tier"`           // hot, cold
+	Endpoint      string `yaml:"endpoint"`       // Primary endpoint
+	Bucket        string `yaml:"bucket"`         // S3 bucket name
+	Region        string `yaml:"region"`         // AWS region
+	AccessKey     string `yaml:"access_key"`     // AWS access key (optional, can use env)
+	SecretKey     string `yaml:"secret_key"`     // AWS secret key (optional, can use env)
+	UsePathStyle  bool   `yaml:"use_path_style"` // For MinIO compatibility
+	FailoverClass string `yaml:"failover_class"` // Fallback class if this one is down
+}
+
+// RegionClassConfig maps a region to its hot and cold storage classes
+type RegionClassConfig struct {
+	Hot  string `yaml:"hot"`
+	Cold string `yaml:"cold"`
+}
+
+// BackendConfig holds configuration for a storage backend (legacy, deprecated)
 type BackendConfig struct {
 	Type         string `yaml:"type"`          // s3, glacier, filesystem
 	Endpoint     string `yaml:"endpoint"`      // S3 endpoint

@@ -64,7 +64,7 @@ services:
       retries: 3
     restart: unless-stopped
 
-  # Create default bucket on startup
+  # Create buckets for multi-region simulation
   minio-init:
     image: minio/mc:latest
     depends_on:
@@ -73,8 +73,18 @@ services:
     entrypoint: >
       /bin/sh -c "
       mc alias set myminio http://minio:9000 minioadmin minioadmin;
+      echo 'Creating buckets for multi-region simulation...';
       mc mb myminio/sesamefs-blocks --ignore-existing;
+      mc mb myminio/sesamefs-usa --ignore-existing;
+      mc mb myminio/sesamefs-eu --ignore-existing;
+      mc mb myminio/sesamefs-china --ignore-existing;
+      mc mb myminio/sesamefs-archive --ignore-existing;
       mc anonymous set download myminio/sesamefs-blocks;
+      mc anonymous set download myminio/sesamefs-usa;
+      mc anonymous set download myminio/sesamefs-eu;
+      mc anonymous set download myminio/sesamefs-china;
+      echo 'Buckets created:';
+      mc ls myminio;
       exit 0;
       "
 

@@ -4,7 +4,9 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"io"
+	"log"
 	"net/http"
+	"strings"
 
 	"github.com/Sesame-Disk/sesamefs/internal/config"
 	"github.com/Sesame-Disk/sesamefs/internal/storage"
@@ -13,15 +15,18 @@ import (
 
 // BlockHandler handles block-level API operations
 type BlockHandler struct {
-	blockStore *storage.BlockStore
-	config     *config.Config
+	blockStore     *storage.BlockStore // Legacy single store (fallback)
+	storageManager *storage.Manager    // Multi-backend storage manager
+	config         *config.Config
 }
 
 // RegisterBlockRoutes registers the block API routes
-func RegisterBlockRoutes(rg *gin.RouterGroup, blockStore *storage.BlockStore, cfg *config.Config) {
+// Supports both legacy single BlockStore and multi-region StorageManager
+func RegisterBlockRoutes(rg *gin.RouterGroup, blockStore *storage.BlockStore, storageManager *storage.Manager, cfg *config.Config) {
 	h := &BlockHandler{
-		blockStore: blockStore,
-		config:     cfg,
+		blockStore:     blockStore,
+		storageManager: storageManager,
+		config:         cfg,
 	}
 
 	blocks := rg.Group("/blocks")

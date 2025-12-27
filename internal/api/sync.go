@@ -19,17 +19,19 @@ import (
 // SyncHandler handles Seafile sync protocol operations
 // These endpoints are used by the Seafile Desktop client for file synchronization
 type SyncHandler struct {
-	db         *db.DB
-	storage    *storage.S3Store
-	blockStore *storage.BlockStore
+	db             *db.DB
+	storage        *storage.S3Store    // Legacy single store
+	blockStore     *storage.BlockStore // Legacy single block store
+	storageManager *storage.Manager    // Multi-backend storage manager
 }
 
 // NewSyncHandler creates a new sync protocol handler
-func NewSyncHandler(database *db.DB, s3Store *storage.S3Store, blockStore *storage.BlockStore) *SyncHandler {
+func NewSyncHandler(database *db.DB, s3Store *storage.S3Store, blockStore *storage.BlockStore, storageManager *storage.Manager) *SyncHandler {
 	return &SyncHandler{
-		db:         database,
-		storage:    s3Store,
-		blockStore: blockStore,
+		db:             database,
+		storage:        s3Store,
+		blockStore:     blockStore,
+		storageManager: storageManager,
 	}
 }
 
@@ -359,83 +361,189 @@ func (h *SyncHandler) PutCommit(c *gin.Context) {
 
 // GetBlock retrieves a block by ID
 // GET /seafhttp/repo/:repo_id/block/:block_id
+// Supports both SHA-1 (40 chars, Seafile legacy) and SHA-256 (64 chars, new clients)
 func (h *SyncHandler) GetBlock(c *gin.Context) {
-	blockID := c.Param("block_id")
+	externalID := c.Param("block_id")
 	orgID := c.GetString("org_id")
 
-	if h.blockStore == nil {
+	// Determine internal ID based on external ID length
+	var internalID string
+	isLegacySHA1 := len(externalID) == 40
+
+	if h.db != nil && isLegacySHA1 {
+		// SHA-1: look up internal SHA-256 ID from mapping
+		err := h.db.Session().Query(`
+			SELECT internal_id FROM block_id_mappings WHERE org_id = ? AND external_id = ?
+		`, orgID, externalID).Scan(&internalID)
+
+		if err != nil || internalID == "" {
+			// Fallback: maybe this is an old block stored with SHA-1 directly
+			// Try using the external ID as the internal ID
+			internalID = externalID
+			log.Printf("GetBlock: no mapping found for %s, using as-is\n", externalID)
+		} else {
+			log.Printf("GetBlock: resolved %s → %s\n", externalID, internalID)
+		}
+	} else {
+		// SHA-256 or no DB: use external ID directly
+		internalID = externalID
+	}
+
+	// Look up storage class from database
+	var storageClass string
+	if h.db != nil {
+		err := h.db.Session().Query(`
+			SELECT storage_class FROM blocks WHERE org_id = ? AND block_id = ?
+		`, orgID, internalID).Scan(&storageClass)
+
+		if err != nil || storageClass == "" {
+			storageClass = "hot"
+		}
+	} else {
+		storageClass = "hot"
+	}
+
+	// Get the appropriate BlockStore using StorageManager
+	var blockStore *storage.BlockStore
+	var err error
+
+	if h.storageManager != nil {
+		blockStore, err = h.storageManager.GetBlockStore(storageClass)
+		if err != nil {
+			log.Printf("GetBlock: storage class %s not found: %v, trying default\n", storageClass, err)
+			blockStore, _, err = h.storageManager.GetHealthyBlockStore(h.storageManager.ResolveStorageClass("", "", "hot"))
+			if err != nil {
+				blockStore = h.blockStore
+			}
+		}
+	} else {
+		blockStore = h.blockStore
+	}
+
+	if blockStore == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "block storage not available"})
 		return
 	}
 
-	// Retrieve block from storage
-	data, err := h.blockStore.GetBlock(c.Request.Context(), blockID)
+	// Retrieve block from storage using internal ID
+	data, err := blockStore.GetBlock(c.Request.Context(), internalID)
 	if err != nil {
+		log.Printf("GetBlock: block %s (internal: %s) not found in %s: %v\n",
+			externalID, internalID, storageClass, err)
 		c.JSON(http.StatusNotFound, gin.H{"error": "block not found"})
 		return
 	}
 
-	// Update last accessed time
-	_ = h.db.Session().Query(`
-		UPDATE blocks SET last_accessed = ? WHERE org_id = ? AND block_id = ?
-	`, time.Now(), orgID, blockID).Exec()
+	// Update last accessed time (if DB available)
+	if h.db != nil {
+		_ = h.db.Session().Query(`
+			UPDATE blocks SET last_accessed = ? WHERE org_id = ? AND block_id = ?
+		`, time.Now(), orgID, internalID).Exec()
+	}
 
 	c.Data(http.StatusOK, "application/octet-stream", data)
 }
 
 // PutBlock stores a block
 // PUT /seafhttp/repo/:repo_id/block/:block_id
+// Supports both SHA-1 (40 chars, Seafile legacy) and SHA-256 (64 chars, new clients)
+// Internally always stores blocks using SHA-256 for consistency
 func (h *SyncHandler) PutBlock(c *gin.Context) {
-	blockID := c.Param("block_id")
+	externalID := c.Param("block_id")
 	orgID := c.GetString("org_id")
+	hashType := c.DefaultQuery("hash_type", "") // Optional: "sha256" for new clients
 
-	fmt.Printf("PutBlock: blockID=%s, len=%d\n", blockID, len(blockID))
-
-	if h.blockStore == nil {
-		fmt.Printf("PutBlock: block storage not available\n")
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "block storage not available"})
-		return
-	}
+	log.Printf("PutBlock: externalID=%s, len=%d\n", externalID, len(externalID))
 
 	// Read block data
 	data, err := io.ReadAll(c.Request.Body)
 	if err != nil {
-		fmt.Printf("PutBlock: failed to read body: %v\n", err)
+		log.Printf("PutBlock: failed to read body: %v\n", err)
 		c.JSON(http.StatusBadRequest, gin.H{"error": "failed to read block data"})
 		return
 	}
 
-	fmt.Printf("PutBlock: received %d bytes for block %s\n", len(data), blockID)
+	log.Printf("PutBlock: received %d bytes for block %s\n", len(data), externalID)
 
-	// Verify block hash - skip for Seafile's 40-char SHA-1 IDs
-	if len(blockID) != 40 {
-		hash := sha256.Sum256(data)
-		computedID := hex.EncodeToString(hash[:])
-		if computedID != blockID {
-			fmt.Printf("PutBlock: hash mismatch, expected %s got %s\n", blockID, computedID)
-			c.JSON(http.StatusBadRequest, gin.H{"error": "block hash mismatch"})
-			return
-		}
+	// Always compute SHA-256 as the internal storage ID
+	sha256Hash := sha256.Sum256(data)
+	internalID := hex.EncodeToString(sha256Hash[:])
+
+	// Determine if this is a legacy SHA-1 ID or new SHA-256 ID
+	isLegacySHA1 := len(externalID) == 40 && hashType != "sha256"
+	isDirectSHA256 := len(externalID) == 64 || hashType == "sha256"
+
+	// Verify hash for SHA-256 clients
+	if isDirectSHA256 && externalID != internalID {
+		log.Printf("PutBlock: SHA-256 hash mismatch, expected %s got %s\n", externalID, internalID)
+		c.JSON(http.StatusBadRequest, gin.H{"error": "block hash mismatch"})
+		return
 	}
 
-	// Store block
+	// Resolve storage class based on request hostname
+	hostname := c.Request.Host
+	if colonIdx := strings.Index(hostname, ":"); colonIdx > 0 {
+		hostname = hostname[:colonIdx] // Strip port
+	}
+
+	// Get the appropriate BlockStore using StorageManager with failover
+	var blockStore *storage.BlockStore
+	var storageClass string
+
+	if h.storageManager != nil {
+		preferredClass := h.storageManager.ResolveStorageClass(hostname, "", "hot")
+		blockStore, storageClass, err = h.storageManager.GetHealthyBlockStore(preferredClass)
+		if err != nil {
+			log.Printf("PutBlock: failed to get healthy backend: %v, falling back to legacy\n", err)
+			blockStore = h.blockStore
+			storageClass = "hot"
+		}
+	} else {
+		blockStore = h.blockStore
+		storageClass = "hot"
+	}
+
+	if blockStore == nil {
+		log.Printf("PutBlock: block storage not available\n")
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "block storage not available"})
+		return
+	}
+
+	log.Printf("PutBlock: storing block external=%s internal=%s in storage class %s\n",
+		externalID, internalID, storageClass)
+
+	// Store block using internal SHA-256 ID
 	blockData := &storage.BlockData{
 		Data: data,
-		Hash: blockID, // Use provided ID for compatibility
+		Hash: internalID, // Always use SHA-256 for storage
 	}
 
-	_, err = h.blockStore.PutBlockData(c.Request.Context(), blockData)
+	_, err = blockStore.PutBlockData(c.Request.Context(), blockData)
 	if err != nil {
-		fmt.Printf("PutBlock: failed to store in S3: %v\n", err)
+		log.Printf("PutBlock: failed to store in backend: %v\n", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to store block"})
 		return
 	}
 
-	// Store block metadata in database
-	_ = h.db.Session().Query(`
-		INSERT INTO blocks (org_id, block_id, size_bytes, storage_class, ref_count, created_at, last_accessed)
-		VALUES (?, ?, ?, 'hot', 1, ?, ?)
-	`, orgID, blockID, len(data), time.Now(), time.Now()).Exec()
+	// Store block metadata and mapping (if DB available)
+	if h.db != nil {
+		now := time.Now()
+
+		// Store block metadata using internal ID
+		_ = h.db.Session().Query(`
+			INSERT INTO blocks (org_id, block_id, size_bytes, storage_class, ref_count, created_at, last_accessed)
+			VALUES (?, ?, ?, ?, 1, ?, ?)
+		`, orgID, internalID, len(data), storageClass, now, now).Exec()
+
+		// If legacy SHA-1 client, store mapping external→internal
+		if isLegacySHA1 {
+			_ = h.db.Session().Query(`
+				INSERT INTO block_id_mappings (org_id, external_id, internal_id, created_at)
+				VALUES (?, ?, ?, ?)
+			`, orgID, externalID, internalID, now).Exec()
+			log.Printf("PutBlock: stored mapping %s → %s\n", externalID, internalID)
+		}
+	}
 
 	c.Status(http.StatusOK)
 }
@@ -447,11 +555,10 @@ type CheckBlocksRequest struct {
 
 // CheckBlocks checks which blocks already exist (for deduplication)
 // POST /seafhttp/repo/:repo_id/check-blocks
+// Supports both SHA-1 (40 chars, Seafile legacy) and SHA-256 (64 chars, new clients)
+// Translates SHA-1 external IDs to internal SHA-256 IDs for storage lookup
 func (h *SyncHandler) CheckBlocks(c *gin.Context) {
-	if h.blockStore == nil {
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "block storage not available"})
-		return
-	}
+	orgID := c.GetString("org_id")
 
 	// Read block IDs from body
 	body, err := io.ReadAll(c.Request.Body)
@@ -461,20 +568,83 @@ func (h *SyncHandler) CheckBlocks(c *gin.Context) {
 	}
 
 	// Parse as newline-separated block IDs (Seafile format)
-	blockIDs := strings.Split(strings.TrimSpace(string(body)), "\n")
+	externalIDs := strings.Split(strings.TrimSpace(string(body)), "\n")
 
-	// Check which blocks exist
-	existMap, err := h.blockStore.CheckBlocksParallel(c.Request.Context(), blockIDs, 10)
+	// Build mapping from external IDs to internal IDs
+	// For SHA-1 IDs (40 chars), look up the internal SHA-256 from mapping table
+	// For SHA-256 IDs (64 chars), use directly
+	externalToInternal := make(map[string]string)
+	var internalIDs []string
+
+	for _, extID := range externalIDs {
+		if extID == "" {
+			continue
+		}
+
+		var internalID string
+		isLegacySHA1 := len(extID) == 40
+
+		if h.db != nil && isLegacySHA1 {
+			// SHA-1: look up internal SHA-256 ID from mapping
+			err := h.db.Session().Query(`
+				SELECT internal_id FROM block_id_mappings WHERE org_id = ? AND external_id = ?
+			`, orgID, extID).Scan(&internalID)
+
+			if err != nil || internalID == "" {
+				// No mapping found - this block hasn't been uploaded yet
+				// or it's an old block stored with SHA-1 directly
+				internalID = extID
+			}
+		} else {
+			// SHA-256 or no DB: use external ID directly
+			internalID = extID
+		}
+
+		externalToInternal[extID] = internalID
+		internalIDs = append(internalIDs, internalID)
+	}
+
+	// Resolve storage class based on request hostname
+	hostname := c.Request.Host
+	if colonIdx := strings.Index(hostname, ":"); colonIdx > 0 {
+		hostname = hostname[:colonIdx] // Strip port
+	}
+
+	// Get the appropriate BlockStore using StorageManager with failover
+	var blockStore *storage.BlockStore
+
+	if h.storageManager != nil {
+		preferredClass := h.storageManager.ResolveStorageClass(hostname, "", "hot")
+		blockStore, _, err = h.storageManager.GetHealthyBlockStore(preferredClass)
+		if err != nil {
+			log.Printf("CheckBlocks: failed to get healthy backend: %v, falling back to legacy\n", err)
+			blockStore = h.blockStore
+		}
+	} else {
+		blockStore = h.blockStore
+	}
+
+	if blockStore == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "block storage not available"})
+		return
+	}
+
+	// Check which blocks exist using internal IDs
+	existMap, err := blockStore.CheckBlocksParallel(c.Request.Context(), internalIDs, 10)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to check blocks"})
 		return
 	}
 
-	// Return list of missing blocks (needed for upload)
+	// Return list of missing blocks using external IDs (client expects these)
 	var needed []string
-	for _, id := range blockIDs {
-		if !existMap[id] {
-			needed = append(needed, id)
+	for _, extID := range externalIDs {
+		if extID == "" {
+			continue
+		}
+		internalID := externalToInternal[extID]
+		if !existMap[internalID] {
+			needed = append(needed, extID)
 		}
 	}
 

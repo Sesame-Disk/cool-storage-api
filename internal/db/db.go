@@ -70,6 +70,7 @@ func (db *DB) Migrate() error {
 		migrationCreateCommits,
 		migrationCreateFSObjects,
 		migrationCreateBlocks,
+		migrationCreateBlockIDMappings,
 		migrationCreateShareLinks,
 		migrationCreateShares,
 		migrationCreateRestoreJobs,
@@ -211,6 +212,17 @@ CREATE TABLE IF NOT EXISTS blocks (
 	created_at TIMESTAMP,
 	last_accessed TIMESTAMP,
 	PRIMARY KEY ((org_id), block_id)
+)`
+
+// Block ID mappings for SHA-1 to SHA-256 translation
+// Allows Seafile clients (SHA-1) to work with internal SHA-256 storage
+const migrationCreateBlockIDMappings = `
+CREATE TABLE IF NOT EXISTS block_id_mappings (
+	org_id UUID,
+	external_id TEXT,
+	internal_id TEXT,
+	created_at TIMESTAMP,
+	PRIMARY KEY ((org_id), external_id)
 )`
 
 const migrationCreateShareLinks = `

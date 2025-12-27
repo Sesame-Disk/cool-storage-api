@@ -7,11 +7,13 @@ This document describes the test coverage status and what requires integration t
 | Package | Coverage | Notes |
 |---------|----------|-------|
 | `internal/config` | 96.7% | Well covered, only yaml parse error paths not tested |
-| `internal/api` | 25.4% | Sync protocol structs, token management, hostname resolution |
+| `internal/storage` | 31.4% | StorageManager, health checks, policy resolution |
+| `internal/api` | 24.4% | Sync protocol structs, token management, hostname resolution |
 | `internal/api/v2` | 3.2% | Requires database integration |
 | `internal/chunker` | 63.2% | FastCDC algorithm well covered |
+| `internal/models` | n/a | Data structures only |
 
-*Last updated: 2024-12-27*
+*Last updated: 2025-12-27*
 
 ## Running Tests
 
@@ -63,6 +65,20 @@ The following components can be tested in isolation:
 - `HostnameResolver` - in-memory cache behavior
 - Wildcard matching logic
 - Middleware context setting
+
+### Storage Manager (`internal/storage/storage.go`)
+- `NewManager()` - creates storage manager with empty backends
+- `RegisterBackend()` - registers backends with failover configuration
+- `GetBackend()` - retrieves backend by name
+- `GetHealthyBackend()` - returns healthy backend with automatic failover
+- `GetBlockStore()` - returns BlockStore for storage class (with caching)
+- `GetHealthyBlockStore()` - returns healthy BlockStore with failover
+- `ResolveStorageClass()` - policy resolution (hostname → region → class)
+- `CheckHealth()` - health check operations
+- `UpdateHealth()` - consecutive fail tracking
+- `ListBackends()` - list all registered backends
+- `GetHotBackends()` / `GetColdBackends()` - filter by access type
+- `HealthStatus.String()` - status to string conversion
 
 ### HTTP Handlers (without dependencies)
 - `PermissionCheck` - always returns "rw"
@@ -186,6 +202,22 @@ type StorageInterface interface {
 }
 ```
 
+## Upload Architecture
+
+The codebase has **three separate upload paths** that do NOT share internal API calls:
+
+| Path | Endpoint | Used By | Chunking | Storage Backend |
+|------|----------|---------|----------|-----------------|
+| **Sync Protocol** | `/seafhttp/repo/:id/block/:id` | Seafile Desktop | Client-side (SHA-1) | **StorageManager** (multi-region) |
+| **v2 Block API** | `/api/v2/blocks/upload` | Web/API clients | Client-side (SHA-256) | Single BlockStore |
+| **SeafHTTP Upload** | `/seafhttp/upload-api/:token` | Web forms | No chunking | S3Store direct |
+| **v2 File Upload** | `/api2/repos/:id/upload` | API clients | No chunking | S3Store direct |
+
+**Key differences:**
+- **Sync Protocol** - Uses `StorageManager` for multi-region storage routing, blocks stored content-addressed
+- **v2 Block API** - Uses single `BlockStore`, needs update to use StorageManager
+- **Web uploads** - Store whole files path-addressed (not content-addressed)
+
 ## Future Improvements
 
 1. **Add database interface** - Abstract DB operations behind interface for mocking
@@ -193,3 +225,4 @@ type StorageInterface interface {
 3. **Integration test suite** - Add `_integration_test.go` files with build tags
 4. **Test containers** - Use testcontainers-go for automatic Docker management
 5. **E2E tests** - Full API tests with real Seafile client compatibility checks
+6. **Unify upload backends** - Update v2 Block API to use StorageManager for multi-region support

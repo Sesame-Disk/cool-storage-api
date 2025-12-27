@@ -16,13 +16,14 @@ import (
 
 // Server represents the HTTP API server
 type Server struct {
-	config     *config.Config
-	db         *db.DB
-	storage    *storage.S3Store
-	blockStore *storage.BlockStore
-	tokenStore TokenStore
-	router     *gin.Engine
-	server     *http.Server
+	config         *config.Config
+	db             *db.DB
+	storage        *storage.S3Store    // Legacy single S3 store
+	storageManager *storage.Manager    // Multi-backend storage manager
+	blockStore     *storage.BlockStore // Legacy single block store
+	tokenStore     TokenStore
+	router         *gin.Engine
+	server         *http.Server
 }
 
 // NewServer creates a new API server
@@ -36,10 +37,13 @@ func NewServer(cfg *config.Config, database *db.DB) *Server {
 	router.Use(gin.Recovery())
 	router.Use(gin.Logger())
 
-	// Initialize S3 storage
+	// Initialize storage manager with multi-backend support
+	storageManager := initStorageManager(cfg)
+
+	// Initialize legacy S3 storage (for backward compatibility)
 	s3Store, err := initS3Storage(cfg)
 	if err != nil {
-		log.Printf("Warning: Failed to initialize S3 storage: %v", err)
+		log.Printf("Warning: Failed to initialize legacy S3 storage: %v", err)
 		// Continue without S3 - file operations will fail gracefully
 	}
 
@@ -63,12 +67,13 @@ func NewServer(cfg *config.Config, database *db.DB) *Server {
 	}
 
 	s := &Server{
-		config:     cfg,
-		db:         database,
-		storage:    s3Store,
-		blockStore: blockStore,
-		tokenStore: tokenStore,
-		router:     router,
+		config:         cfg,
+		db:             database,
+		storage:        s3Store,
+		storageManager: storageManager,
+		blockStore:     blockStore,
+		tokenStore:     tokenStore,
+		router:         router,
 	}
 
 	s.setupRoutes()
@@ -76,7 +81,88 @@ func NewServer(cfg *config.Config, database *db.DB) *Server {
 	return s
 }
 
-// initS3Storage initializes the S3 storage backend
+// initStorageManager initializes the multi-backend storage manager
+func initStorageManager(cfg *config.Config) *storage.Manager {
+	manager := storage.NewManager()
+
+	// Set default class
+	if cfg.Storage.DefaultClass != "" {
+		manager.SetDefaultClass(cfg.Storage.DefaultClass)
+	}
+
+	// Set endpoint to region mapping
+	if cfg.Storage.EndpointRegions != nil {
+		manager.SetEndpointRegions(cfg.Storage.EndpointRegions)
+	}
+
+	// Set region to class mapping
+	if cfg.Storage.RegionClasses != nil {
+		regionClasses := make(map[string]storage.RegionClassConfig)
+		for region, classes := range cfg.Storage.RegionClasses {
+			regionClasses[region] = storage.RegionClassConfig{
+				Hot:  classes.Hot,
+				Cold: classes.Cold,
+			}
+		}
+		manager.SetRegionClasses(regionClasses)
+	}
+
+	// Initialize storage classes from config
+	for className, classCfg := range cfg.Storage.Classes {
+		s3Store, err := initStorageClass(className, classCfg)
+		if err != nil {
+			log.Printf("Warning: Failed to initialize storage class %s: %v", className, err)
+			continue
+		}
+		manager.RegisterBackend(className, s3Store, classCfg.FailoverClass)
+		log.Printf("Registered storage class: %s (type=%s, tier=%s, bucket=%s)",
+			className, classCfg.Type, classCfg.Tier, classCfg.Bucket)
+	}
+
+	// Log summary
+	backends := manager.ListBackends()
+	log.Printf("Storage manager initialized with %d backends: %v", len(backends), backends)
+
+	return manager
+}
+
+// initStorageClass creates an S3Store for a storage class config
+func initStorageClass(name string, cfg config.StorageClassConfig) (*storage.S3Store, error) {
+	// Get credentials from config or environment
+	accessKey := cfg.AccessKey
+	secretKey := cfg.SecretKey
+	if accessKey == "" {
+		accessKey = os.Getenv("AWS_ACCESS_KEY_ID")
+	}
+	if secretKey == "" {
+		secretKey = os.Getenv("AWS_SECRET_ACCESS_KEY")
+	}
+
+	region := cfg.Region
+	if region == "" {
+		region = "us-east-1"
+	}
+
+	// Determine access type from tier
+	accessType := storage.AccessImmediate
+	if cfg.Tier == "cold" {
+		accessType = storage.AccessDelayed
+	}
+
+	s3Cfg := storage.S3Config{
+		Endpoint:        cfg.Endpoint,
+		Bucket:          cfg.Bucket,
+		Region:          region,
+		AccessKeyID:     accessKey,
+		SecretAccessKey: secretKey,
+		UsePathStyle:    cfg.UsePathStyle || cfg.Endpoint != "",
+		AccessType:      accessType,
+	}
+
+	return storage.NewS3Store(context.Background(), s3Cfg)
+}
+
+// initS3Storage initializes the S3 storage backend (legacy, single backend)
 func initS3Storage(cfg *config.Config) (*storage.S3Store, error) {
 	// Get S3 configuration from environment or config
 	endpoint := os.Getenv("S3_ENDPOINT")
@@ -87,7 +173,23 @@ func initS3Storage(cfg *config.Config) (*storage.S3Store, error) {
 
 	// Fall back to config if not in environment
 	if bucket == "" {
-		if hotBackend, ok := cfg.Storage.Backends["hot"]; ok {
+		// Try new storage classes first
+		if defaultClass, ok := cfg.Storage.Classes[cfg.Storage.DefaultClass]; ok {
+			if endpoint == "" {
+				endpoint = defaultClass.Endpoint
+			}
+			bucket = defaultClass.Bucket
+			if region == "" {
+				region = defaultClass.Region
+			}
+			if accessKey == "" {
+				accessKey = defaultClass.AccessKey
+			}
+			if secretKey == "" {
+				secretKey = defaultClass.SecretKey
+			}
+		} else if hotBackend, ok := cfg.Storage.Backends["hot"]; ok {
+			// Fall back to legacy backends
 			if endpoint == "" {
 				endpoint = hotBackend.Endpoint
 			}
@@ -205,7 +307,7 @@ func (s *Server) setupRoutes() {
 	// Seafile sync protocol endpoints (for Desktop client)
 	// These endpoints handle repository synchronization
 	// Uses a different auth middleware that accepts repo tokens
-	syncHandler := NewSyncHandler(s.db, s.storage, s.blockStore)
+	syncHandler := NewSyncHandler(s.db, s.storage, s.blockStore, s.storageManager)
 	syncHandler.RegisterSyncRoutes(s.router, s.syncAuthMiddleware())
 }
 
