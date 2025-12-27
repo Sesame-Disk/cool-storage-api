@@ -48,10 +48,15 @@ The following components can be tested in isolation:
 - Token expiration logic
 
 ### Sync Protocol Structs (`internal/api/sync.go`)
-- `Commit` - JSON serialization/deserialization
+- `Commit` - JSON serialization/deserialization with pointer types for null fields
 - `FSObject` - file and directory objects
 - `FSEntry` - directory entries
-- Helper functions like `formatFSIDList()`
+- `isHexString()` - hex string validation for FS IDs
+- `sha1Hex()` - SHA-1 compatible hash generation (40 chars)
+- `GetProtocolVersion` - returns protocol version 2
+- `PermissionCheck` - returns empty body (Seafile format)
+- `QuotaCheck` - returns quota status
+- Commit struct null field serialization (`parent_id: null`)
 
 ### Hostname Resolution (`internal/api/hostname.go`)
 - `normalizeHostname()` - hostname normalization

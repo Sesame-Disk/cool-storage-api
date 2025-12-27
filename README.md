@@ -821,34 +821,24 @@ The original prototype code has been archived in `_legacy/` for reference:
 
 ### Seafile API Comparison Testing
 
-For testing API compatibility with a real Seafile server, use this reference server:
+For testing API compatibility with a real Seafile server, see `.seafile-reference.md` (gitignored) for credentials and example API calls.
 
-```
-Server: https://app.nihaoconsult.com/
-Email: abel.aguzmans@gmail.com
-Password: Qwerty123!
-```
-
-**Authentication:**
+**Quick start:**
 ```bash
-# Get auth token
-curl -X POST "https://app.nihaoconsult.com/api2/auth-token/" \
-  -d "username=abel.aguzmans@gmail.com" \
-  -d "password=Qwerty123!"
+# Get auth token from Seafile server
+curl -X POST "https://<seafile-server>/api2/auth-token/" \
+  -d "username=<email>" -d "password=<password>"
 
 # Use token for API calls
-curl -H "Authorization: Token <token>" "https://app.nihaoconsult.com/api2/repos/"
-```
+curl -H "Authorization: Token <token>" "https://<seafile-server>/api2/repos/"
 
-**Sync Protocol Testing (with token from download-info):**
-```bash
-# Get download-info (includes sync token)
+# Get sync token from download-info
 curl -H "Authorization: Token <api_token>" \
-  "https://app.nihaoconsult.com/api2/repos/<repo_id>/download-info/"
+  "https://<seafile-server>/api2/repos/<repo_id>/download-info/"
 
 # Use Seafile-Repo-Token header for sync endpoints
 curl -H "Seafile-Repo-Token: <sync_token>" \
-  "https://app.nihaoconsult.com/seafhttp/repo/<repo_id>/commit/HEAD"
+  "https://<seafile-server>/seafhttp/repo/<repo_id>/commit/HEAD"
 ```
 
 ### Key API Format Differences (Seafile vs SesameFS)
