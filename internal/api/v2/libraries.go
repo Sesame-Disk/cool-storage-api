@@ -72,12 +72,16 @@ func (h *LibraryHandler) ListLibraries(c *gin.Context) {
 			LibraryID:    libUUID,
 			OrgID:        orgUUID,
 			OwnerID:      ownerUUID,
+			Owner:        ownerID + "@sesamefs.local", // Seafile expects email
 			Name:         name,
 			Description:  description,
 			Encrypted:    encrypted,
 			StorageClass: storageClass,
 			SizeBytes:    sizeBytes,
 			FileCount:    fileCount,
+			MTime:        updatedAt.Unix(), // Unix timestamp for Seafile
+			Type:         "repo",           // Seafile library type
+			Permission:   "rw",             // TODO: Check actual permissions
 			CreatedAt:    createdAt,
 			UpdatedAt:    updatedAt,
 		})
@@ -114,6 +118,20 @@ func (h *LibraryHandler) CreateLibrary(c *gin.Context) {
 
 	orgID := c.GetString("org_id")
 	userID := c.GetString("user_id")
+
+	// Check if a library with this name already exists for this user
+	var existingName string
+	iter := h.db.Session().Query(`
+		SELECT name FROM libraries WHERE org_id = ? AND owner_id = ? ALLOW FILTERING
+	`, orgID, userID).Iter()
+	for iter.Scan(&existingName) {
+		if existingName == req.Name {
+			iter.Close()
+			c.JSON(http.StatusConflict, gin.H{"error": "a library with this name already exists"})
+			return
+		}
+	}
+	iter.Close()
 
 	orgUUID, _ := uuid.Parse(orgID)
 	userUUID, _ := uuid.Parse(userID)

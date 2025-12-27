@@ -66,8 +66,9 @@ func (ts *TokenStore) CreateToken(tokenType TokenType, orgID, repoID, path, user
 	}
 
 	// Insert with TTL for automatic expiration
+	// Note: "token" is quoted because it's a reserved keyword in CQL
 	ttlSeconds := int(ts.ttl.Seconds())
-	query := `INSERT INTO access_tokens (token, token_type, org_id, repo_id, file_path, user_id, created_at)
+	query := `INSERT INTO access_tokens ("token", token_type, org_id, repo_id, file_path, user_id, created_at)
 	          VALUES (?, ?, ?, ?, ?, ?, ?) USING TTL ?`
 
 	orgUUID, err := gocql.ParseUUID(orgID)
@@ -123,8 +124,8 @@ func (ts *TokenStore) CreateDownloadToken(orgID, repoID, path, userID string) (s
 
 // GetToken retrieves and validates a token
 func (ts *TokenStore) GetToken(tokenStr string, expectedType TokenType) (*AccessToken, bool) {
-	query := `SELECT token, token_type, org_id, repo_id, file_path, user_id, created_at
-	          FROM access_tokens WHERE token = ?`
+	query := `SELECT "token", token_type, org_id, repo_id, file_path, user_id, created_at
+	          FROM access_tokens WHERE "token" = ?`
 
 	var token AccessToken
 	var tokenType string
@@ -160,7 +161,7 @@ func (ts *TokenStore) GetToken(tokenStr string, expectedType TokenType) (*Access
 
 // DeleteToken removes a token (for single-use tokens like upload)
 func (ts *TokenStore) DeleteToken(tokenStr string) error {
-	query := `DELETE FROM access_tokens WHERE token = ?`
+	query := `DELETE FROM access_tokens WHERE "token" = ?`
 	return ts.session.Query(query, tokenStr).Exec()
 }
 

@@ -257,9 +257,10 @@ CREATE TABLE IF NOT EXISTS restore_jobs (
 
 // Access tokens for stateless file operations
 // Uses Cassandra TTL for automatic expiration
+// Note: "token" is quoted because it's a reserved keyword in CQL
 const migrationCreateAccessTokens = `
 CREATE TABLE IF NOT EXISTS access_tokens (
-	token TEXT PRIMARY KEY,
+	"token" TEXT PRIMARY KEY,
 	token_type TEXT,
 	org_id UUID,
 	repo_id UUID,

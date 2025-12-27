@@ -14,7 +14,6 @@ import (
 
 	"github.com/Sesame-Disk/sesamefs/internal/config"
 	"github.com/Sesame-Disk/sesamefs/internal/db"
-	"github.com/Sesame-Disk/sesamefs/internal/models"
 	"github.com/Sesame-Disk/sesamefs/internal/storage"
 	"github.com/gin-gonic/gin"
 )
@@ -23,6 +22,21 @@ import (
 type TokenCreator interface {
 	CreateUploadToken(orgID, repoID, path, userID string) (string, error)
 	CreateDownloadToken(orgID, repoID, path, userID string) (string, error)
+}
+
+// Dirent represents a directory entry in Seafile API format
+// This matches the exact format expected by Seafile clients
+type Dirent struct {
+	ID            string `json:"id"`
+	Name          string `json:"name"`
+	Type          string `json:"type"` // "file" or "dir"
+	Size          int64  `json:"size"`
+	MTime         int64  `json:"mtime"`      // Unix timestamp
+	Permission    string `json:"permission"` // "rw" or "r"
+	ParentDir     string `json:"parent_dir,omitempty"`
+	Starred       bool   `json:"starred,omitempty"`
+	ModifierEmail string `json:"modifier_email,omitempty"`
+	ModifierName  string `json:"modifier_name,omitempty"`
 }
 
 // FileHandler handles file-related API requests
@@ -46,27 +60,40 @@ func RegisterFileRoutes(rg *gin.RouterGroup, database *db.DB, cfg *config.Config
 
 	repos := rg.Group("/repos/:repo_id")
 	{
-		// Directory operations
+		// Directory operations (both with and without trailing slash for Seafile compatibility)
 		repos.GET("/dir", h.ListDirectory)
+		repos.GET("/dir/", h.ListDirectory)
 		repos.POST("/dir", h.CreateDirectory)
+		repos.POST("/dir/", h.CreateDirectory)
 		repos.DELETE("/dir", h.DeleteDirectory)
+		repos.DELETE("/dir/", h.DeleteDirectory)
 
 		// File operations
 		repos.GET("/file", h.GetFileInfo)
+		repos.GET("/file/", h.GetFileInfo)
 		repos.DELETE("/file", h.DeleteFile)
+		repos.DELETE("/file/", h.DeleteFile)
 		repos.POST("/file/move", h.MoveFile)
 		repos.POST("/file/copy", h.CopyFile)
 
 		// Upload/Download links (Seafile uses GET for both)
 		repos.GET("/file/download-link", h.GetDownloadLink)
+		repos.GET("/file/download-link/", h.GetDownloadLink)
 		repos.GET("/upload-link", h.GetUploadLink)
+		repos.GET("/upload-link/", h.GetUploadLink)
 
 		// Direct upload (for smaller files)
 		repos.POST("/upload", h.UploadFile)
+		repos.POST("/upload/", h.UploadFile)
+
+		// Sync info endpoint (for desktop client)
+		repos.GET("/download-info", h.GetDownloadInfo)
+		repos.GET("/download-info/", h.GetDownloadInfo)
 	}
 }
 
 // ListDirectory returns the contents of a directory
+// Implements Seafile API: GET /api2/repos/:repo_id/dir/?p=/path
 func (h *FileHandler) ListDirectory(c *gin.Context) {
 	repoID := c.Param("repo_id")
 	dirPath := c.DefaultQuery("p", "/")
@@ -75,12 +102,20 @@ func (h *FileHandler) ListDirectory(c *gin.Context) {
 	// Normalize path
 	dirPath = normalizePath(dirPath)
 
+	// Check if database is available
+	if h.db == nil {
+		// Return empty directory if no database
+		c.JSON(http.StatusOK, []Dirent{})
+		return
+	}
+
 	// Get library to verify access (use strings for UUID binding)
 	var libID, headCommitID string
-	if err := h.db.Session().Query(`
+	err := h.db.Session().Query(`
 		SELECT library_id, head_commit_id FROM libraries
 		WHERE org_id = ? AND library_id = ?
-	`, orgID, repoID).Scan(&libID, &headCommitID); err != nil {
+	`, orgID, repoID).Scan(&libID, &headCommitID)
+	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "library not found"})
 		return
 	}
@@ -97,12 +132,12 @@ func (h *FileHandler) ListDirectory(c *gin.Context) {
 	}
 
 	// List files from S3 if storage is available
-	var direntList []models.FileInfo
+	var direntList []Dirent
 	if h.storage != nil {
 		objects, err := h.storage.List(c.Request.Context(), prefix, "/")
 		if err != nil {
 			// Log error but return empty list (not a fatal error)
-			c.JSON(http.StatusOK, []models.FileInfo{})
+			c.JSON(http.StatusOK, []Dirent{})
 			return
 		}
 
@@ -121,29 +156,37 @@ func (h *FileHandler) ListDirectory(c *gin.Context) {
 				fileType = "dir"
 			}
 
-			direntList = append(direntList, models.FileInfo{
-				Name:  name,
-				Type:  fileType,
-				Size:  obj.Size,
-				MTime: obj.LastModified,
+			// Generate a deterministic ID based on path
+			// In a full implementation, this would come from fs_objects
+			objPath := path.Join(dirPath, name)
+			id := generatePathID(orgID, repoID, objPath)
+
+			direntList = append(direntList, Dirent{
+				ID:         id,
+				Name:       name,
+				Type:       fileType,
+				Size:       obj.Size,
+				MTime:      obj.LastModified.Unix(),
+				Permission: "rw", // Default to read-write
+				ParentDir:  dirPath,
 			})
 		}
 	}
 
 	// Return empty array instead of null
 	if direntList == nil {
-		direntList = []models.FileInfo{}
+		direntList = []Dirent{}
 	}
 
-	// Seafile API can return either "dirent_list" wrapper or flat array
-	// depending on the endpoint. /api2/repos/:id/dir/ returns flat array
-	if strings.HasPrefix(c.Request.URL.Path, "/api2/") {
-		c.JSON(http.StatusOK, direntList)
-	} else {
-		c.JSON(http.StatusOK, gin.H{
-			"dirent_list": direntList,
-		})
-	}
+	// Seafile API /api2/repos/:id/dir/ always returns flat array
+	c.JSON(http.StatusOK, direntList)
+}
+
+// generatePathID creates a deterministic ID for a file/dir path
+// This is a placeholder - in a full implementation, IDs come from fs_objects
+func generatePathID(orgID, repoID, filePath string) string {
+	hash := sha256.Sum256([]byte(orgID + "/" + repoID + filePath))
+	return hex.EncodeToString(hash[:20]) // 40 character hex string like Seafile
 }
 
 // CreateDirectoryRequest represents the request for creating a directory
@@ -412,4 +455,75 @@ func normalizePath(p string) string {
 		p = strings.TrimSuffix(p, "/")
 	}
 	return path.Clean(p)
+}
+
+// GetDownloadInfo returns repository sync information for desktop client
+// Implements Seafile API: GET /api2/repos/:repo_id/download-info/
+func (h *FileHandler) GetDownloadInfo(c *gin.Context) {
+	repoID := c.Param("repo_id")
+	orgID := c.GetString("org_id")
+	userID := c.GetString("user_id")
+
+	// Get library info from database
+	var libID, ownerID, name, description, headCommitID string
+	var encrypted bool
+	var encVersion int
+	var magic, randomKey string
+	var sizeBytes int64
+	var updatedAt time.Time
+
+	err := h.db.Session().Query(`
+		SELECT library_id, owner_id, name, description, encrypted, enc_version,
+		       magic, random_key, head_commit_id, size_bytes, updated_at
+		FROM libraries WHERE org_id = ? AND library_id = ?
+	`, orgID, repoID).Scan(
+		&libID, &ownerID, &name, &description, &encrypted, &encVersion,
+		&magic, &randomKey, &headCommitID, &sizeBytes, &updatedAt,
+	)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "library not found"})
+		return
+	}
+
+	// Generate a sync token for this repo
+	token, err := h.tokenCreator.CreateDownloadToken(orgID, repoID, "/", userID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate sync token"})
+		return
+	}
+
+	// Extract port from server URL or config
+	serverPort := "8080" // Default port
+	if h.config != nil && h.config.Server.Port != "" {
+		// Port in config includes colon, e.g., ":8080"
+		serverPort = strings.TrimPrefix(h.config.Server.Port, ":")
+	}
+
+	// Build response in Seafile format
+	response := gin.H{
+		"relay_id":      "localhost",                          // Relay server ID
+		"relay_addr":    "localhost",                          // Relay server address
+		"relay_port":    serverPort,                           // Relay server port (same as HTTP)
+		"email":         userID + "@sesamefs.local",           // User email
+		"token":         token,                                // Sync token
+		"repo_id":       repoID,                               // Repository ID
+		"repo_name":     name,                                 // Repository name
+		"repo_desc":     description,                          // Repository description
+		"repo_size":     sizeBytes,                            // Repository size
+		"repo_version":  1,                                    // Repository version
+		"mtime":         updatedAt.Unix(),                     // Last modification time
+		"encrypted":     encrypted,                            // Is encrypted
+		"permission":    "rw",                                 // User permission
+		"head_commit_id": headCommitID,                        // Head commit ID
+		"is_corrupted":  false,                                // Is repository corrupted
+	}
+
+	// Add encryption fields if encrypted
+	if encrypted {
+		response["enc_version"] = encVersion
+		response["magic"] = magic
+		response["random_key"] = randomKey
+	}
+
+	c.JSON(http.StatusOK, response)
 }

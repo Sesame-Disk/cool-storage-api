@@ -442,3 +442,163 @@ func TestChangeStorageClassRequest(t *testing.T) {
 		})
 	}
 }
+
+// TestDirentJSONFormat tests that Dirent serializes to Seafile-compatible format
+func TestDirentJSONFormat(t *testing.T) {
+	dirent := Dirent{
+		ID:            "abc123def456",
+		Name:          "document.pdf",
+		Type:          "file",
+		Size:          1024,
+		MTime:         1234567890,
+		Permission:    "rw",
+		ParentDir:     "/documents",
+		Starred:       false,
+		ModifierEmail: "user@example.com",
+		ModifierName:  "Test User",
+	}
+
+	data, err := json.Marshal(dirent)
+	if err != nil {
+		t.Fatalf("failed to marshal dirent: %v", err)
+	}
+
+	// Verify JSON field names match Seafile format
+	jsonStr := string(data)
+	expectedFields := []string{
+		`"id":"abc123def456"`,
+		`"name":"document.pdf"`,
+		`"type":"file"`,
+		`"size":1024`,
+		`"mtime":1234567890`,
+		`"permission":"rw"`,
+		`"parent_dir":"/documents"`,
+	}
+
+	for _, field := range expectedFields {
+		if !bytes.Contains(data, []byte(field)) {
+			t.Errorf("JSON missing or incorrect field: %s\nGot: %s", field, jsonStr)
+		}
+	}
+}
+
+// TestDirentJSONFormatDirectory tests directory dirent format
+func TestDirentJSONFormatDirectory(t *testing.T) {
+	dirent := Dirent{
+		ID:         "dir123",
+		Name:       "photos",
+		Type:       "dir",
+		Size:       0,
+		MTime:      1234567890,
+		Permission: "rw",
+		ParentDir:  "/",
+	}
+
+	data, err := json.Marshal(dirent)
+	if err != nil {
+		t.Fatalf("failed to marshal dirent: %v", err)
+	}
+
+	var decoded Dirent
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatalf("failed to unmarshal dirent: %v", err)
+	}
+
+	if decoded.Type != "dir" {
+		t.Errorf("Type = %s, want dir", decoded.Type)
+	}
+	if decoded.Name != "photos" {
+		t.Errorf("Name = %s, want photos", decoded.Name)
+	}
+}
+
+// TestGeneratePathID tests deterministic ID generation
+func TestGeneratePathID(t *testing.T) {
+	orgID := "org1"
+	repoID := "repo1"
+	path1 := "/documents/file.txt"
+	path2 := "/documents/other.txt"
+
+	// Same inputs should produce same ID
+	id1a := generatePathID(orgID, repoID, path1)
+	id1b := generatePathID(orgID, repoID, path1)
+	if id1a != id1b {
+		t.Errorf("Same inputs produced different IDs: %s vs %s", id1a, id1b)
+	}
+
+	// Different paths should produce different IDs
+	id2 := generatePathID(orgID, repoID, path2)
+	if id1a == id2 {
+		t.Errorf("Different paths produced same ID: %s", id1a)
+	}
+
+	// ID should be 40 characters (like Seafile file IDs)
+	if len(id1a) != 40 {
+		t.Errorf("ID length = %d, want 40", len(id1a))
+	}
+}
+
+// TestListDirectoryWithoutDB tests directory listing when database is not available
+func TestListDirectoryWithoutDB(t *testing.T) {
+	r := setupTestRouter()
+
+	h := &FileHandler{
+		db:      nil, // No database
+		storage: nil, // No storage
+	}
+
+	r.GET("/api2/repos/:repo_id/dir/", h.ListDirectory)
+
+	req, _ := http.NewRequest("GET", "/api2/repos/test-repo/dir/?p=/", nil)
+	req.Header.Set("Authorization", "Token test-token")
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	// Should return empty array, not error
+	if w.Code != http.StatusOK {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusOK)
+	}
+
+	var result []Dirent
+	if err := json.Unmarshal(w.Body.Bytes(), &result); err != nil {
+		t.Fatalf("failed to parse response: %v", err)
+	}
+
+	if len(result) != 0 {
+		t.Errorf("expected empty array, got %d items", len(result))
+	}
+}
+
+// TestListDirectoryTrailingSlash tests both /dir and /dir/ paths work
+func TestListDirectoryTrailingSlash(t *testing.T) {
+	r := setupTestRouter()
+
+	h := &FileHandler{
+		db:      nil,
+		storage: nil,
+	}
+
+	// Register both paths like in production
+	r.GET("/api2/repos/:repo_id/dir", h.ListDirectory)
+	r.GET("/api2/repos/:repo_id/dir/", h.ListDirectory)
+
+	paths := []string{
+		"/api2/repos/test-repo/dir?p=/",
+		"/api2/repos/test-repo/dir/?p=/",
+	}
+
+	for _, path := range paths {
+		t.Run(path, func(t *testing.T) {
+			req, _ := http.NewRequest("GET", path, nil)
+			req.Header.Set("Authorization", "Token test-token")
+
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, req)
+
+			if w.Code != http.StatusOK {
+				t.Errorf("status = %d, want %d for path %s", w.Code, http.StatusOK, path)
+			}
+		})
+	}
+}

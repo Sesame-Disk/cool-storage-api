@@ -1,15 +1,16 @@
-# SesameFS - Enterprise File Storage Platform
+# WIP: SesameFS - Enterprise File Storage Platform
 
-> A modern, flexible, enterprise-grade file storage and sync platform built in Go. Inspired by Seafile Pro but designed for multi-cloud storage with support for immediate (S3/Disk) and archival (Glacier) storage classes.
+> A modern, flexible, enterprise-grade file storage and sync platform built in Go. Inspired by Seafile Pro but designed for multi-cloud storage with support for immediate (S3/Disk) and archival (Glacier) storage classes. 
+
+Notice: Test it at your own risk and create issues here. The project is somewhat AI slop, but we will get it to be better over time with Claude's help xD.
 
 ## Project Vision
 
 SesameFS aims to be a world-class replacement for enterprise file sync and share (EFSS) solutions with these key differentiators:
 
-1. **Multi-Storage Class Architecture**: Unlike Seafile which only supports immediate-access storage, SesameFS supports:
-   - **Hot Storage (S3/Disk)**: Immediate access for active files
-   - **Cold Storage (Glacier)**: Cost-effective archival with retrieval delays
-   - **Local Disk**: On-premise storage for compliance requirements
+1. **Smart Two-Tier Storage**: Unlike Seafile which only supports immediate-access storage, SesameFS uses intelligent policies:
+   - **Hot Storage**: Immediate access for active files (auto-selects S3 Standard or IA based on access patterns)
+   - **Cold Storage**: Cost-effective archival (auto-selects Glacier Instant or Deep Archive based on retention age)
 
 2. **Distributed-First Database**: Global Cassandra cluster with tunable consistency for worldwide deployments
 
@@ -42,7 +43,7 @@ SesameFS aims to be a world-class replacement for enterprise file sync and share
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
 │                              CLIENTS                                     │
-│      Seafile Desktop │ Seafile Mobile │ Web App │ WebDAV │ REST API     │
+│      Seafile Desktop │ Seafile Mobile │ Web App │ REST API              │
 └────────────────────────────────┬────────────────────────────────────────┘
                                  │
                                  ▼
@@ -80,7 +81,7 @@ SesameFS aims to be a world-class replacement for enterprise file sync and share
 | **Algorithm** | Rabin CDC (slow) | **FastCDC** (10x faster) |
 | **Hash** | SHA-1 (160-bit, weak) | **SHA-256** (256-bit, secure) |
 | **Chunk Size** | Fixed 1MB/8MB | **Variable 512KB-8MB** (better dedup) |
-| **Block Storage** | Local filesystem only | **S3 + Glacier tiered** |
+| **Block Storage** | Local filesystem only | **S3 (hot) + Glacier (cold)** |
 | **Security** | Fixed polynomial | **Random polynomial per-tenant** |
 | **Cross-tenant Dedup** | Always on (privacy risk) | **Optional, off by default** |
 
@@ -146,14 +147,16 @@ Attempt 5: Reduce size 50% again → Retry
 Attempt 6+: Give up, report error
 ```
 
-### Storage Class Tiering
+### Smart Storage Tiering
 
-| Class | Backend | Access Time | Use Case | Block Age Threshold |
-|-------|---------|-------------|----------|---------------------|
-| `hot` | S3 Standard | Milliseconds | Active files | Default |
-| `warm` | S3-IA | Milliseconds | 30+ days inactive |
-| `cold` | Glacier Instant | Milliseconds | 90+ days, rare access |
-| `frozen` | Glacier Deep | 12-48 hours | 365+ days, compliance |
+SesameFS uses a simple two-tier model (hot/cold) with intelligent backend selection:
+
+| User Tier | Backend Selection | Access Time | Policy |
+|-----------|-------------------|-------------|--------|
+| **Hot** | S3 Standard → S3-IA | Milliseconds | Auto-downgrades to IA after 30 days inactive |
+| **Cold** | Glacier IR → Deep Archive | Minutes to hours | Auto-downgrades to Deep after 365 days |
+
+Users only choose "hot" or "cold" - the system handles the rest based on access patterns and retention.
 
 ---
 
@@ -193,21 +196,18 @@ init → check → commit → fs → data → update-branch → finished
 A **Library** is the fundamental unit of organization - a collection of files and folders that can be:
 - Encrypted (client-side or server-side)
 - Shared with users/groups
-- Assigned to specific storage classes
+- Assigned to hot or cold storage
 - Versioned with full history
 - Synced via Seafile clients
 
-### Storage Lifecycle Policies
-Libraries can define automatic transitions:
+### Storage Policies
+Libraries can define when to move files to cold storage:
 ```yaml
 lifecycle:
-  - transition_after: 30d
-    to_class: warm
-  - transition_after: 90d
-    to_class: cold
-  - transition_after: 365d
-    to_class: frozen
+  move_to_cold_after: 90d  # Move untouched files to cold storage after 90 days
 ```
+
+Within each tier, the system automatically optimizes costs (hot: Standard→IA, cold: IR→Deep Archive).
 
 ---
 
@@ -461,37 +461,23 @@ storage:
     hot:
       type: s3
       endpoint: s3.amazonaws.com
-      bucket: sesamefs-blocks-hot
+      bucket: sesamefs-blocks
       region: us-east-1
-    warm:
-      type: s3
-      bucket: sesamefs-blocks-warm
-      storage_class: STANDARD_IA
-      region: us-east-1
+      # Smart policy: Auto-transitions to STANDARD_IA after 30 days inactive
+      auto_ia_days: 30
     cold:
-      type: s3
-      bucket: sesamefs-blocks-cold
-      storage_class: GLACIER_IR
-      region: us-east-1
-    frozen:
       type: glacier
-      vault: sesamefs-deep-archive
-      retrieval_tier: Bulk
+      bucket: sesamefs-blocks-archive
       region: us-east-1
+      # Smart policy: Uses Glacier IR initially, Deep Archive after 365 days
+      auto_deep_archive_days: 365
+      retrieval_tier: Standard  # Standard (3-5 hours) or Bulk (5-12 hours)
 
 lifecycle:
   enabled: true
   check_interval: 1h
-  rules:
-    - age_days: 30
-      from_class: hot
-      to_class: warm
-    - age_days: 90
-      from_class: warm
-      to_class: cold
-    - age_days: 365
-      from_class: cold
-      to_class: frozen
+  # Move files to cold storage after 90 days of no access
+  move_to_cold_days: 90
 ```
 
 ---
@@ -516,10 +502,10 @@ lifecycle:
 
 ```
 Immediate (for CLI testing):
-├── [ ] Add /api2/ legacy route aliases
-├── [ ] GET /api2/repos/ - List libraries
-├── [ ] GET /api2/repos/:id/dir/?p=/ - Directory listing  ← CRITICAL
-├── [ ] GET /api2/auth-token/ - Auth token endpoint
+├── [x] Add /api2/ legacy route aliases
+├── [x] GET /api2/repos/ - List libraries
+├── [x] GET /api2/repos/:id/dir/?p=/ - Directory listing  ← CRITICAL
+├── [x] GET /api2/auth-token/ - Auth token endpoint
 └── [ ] Test with: seaf-cli sync
 
 For Desktop client (sync protocol):
@@ -721,7 +707,6 @@ Alternative: Collabora Online (LibreOffice-based)
 ```
 
 ### Phase 7: Advanced
-- [ ] WebDAV interface
 - [ ] Search (Elasticsearch)
 - [ ] Thumbnails and previews
 - [ ] Client-side encryption
@@ -741,7 +726,7 @@ Alternative: Collabora Online (LibreOffice-based)
 | Feature | Seafile | SesameFS |
 |---------|---------|----------|
 | **Storage Backend** | Local filesystem only | S3, Glacier, Disk - configurable |
-| **Cold Storage** | Not supported | Native Glacier with restore workflow |
+| **Cold Storage** | Not supported | Smart cold tier (auto-selects Glacier IR/Deep) |
 | **Database** | MySQL/PostgreSQL (single node) | Cassandra (global, distributed) |
 | **Chunking** | Rabin CDC, fixed sizes | FastCDC, adaptive to network speed |
 | **Chunk Sizes** | Fixed 1-8MB | Adaptive 2-256MB based on connection |
@@ -751,7 +736,7 @@ Alternative: Collabora Online (LibreOffice-based)
 | **Session State** | Sticky sessions required | Stateless (any server, any request) |
 | **Upload Resume** | Same server only | Any server (distributed tokens) |
 | **Horizontal Scaling** | Per-tenant instances | Shared stateless pool |
-| **Storage Lifecycle** | Manual | Automatic policies |
+| **Storage Lifecycle** | Manual | Auto hot/cold with smart backend selection |
 | **Geo-distribution** | Complex replication | Native Cassandra multi-DC |
 | **Security Scanning** | ClamAV only (optional) | ClamAV + YARA + URL scanning |
 | **Phishing Detection** | Not available | YARA rules + document analysis |
@@ -822,6 +807,73 @@ The original prototype code has been archived in `_legacy/` for reference:
 
 - [Seafile API Compatibility](docs/SEAFILE_COMPATIBILITY.md) - How the Seafile-compatible API works
 - [Licensing Guide](docs/LICENSING.md) - Legal considerations for using and distributing SesameFS
+
+---
+
+## Development & Testing
+
+### Seafile API Comparison Testing
+
+For testing API compatibility with a real Seafile server, use this reference server:
+
+```
+Server: https://app.nihaoconsult.com/
+Email: abel.aguzmans@gmail.com
+Password: Qwerty123!
+```
+
+**Authentication:**
+```bash
+# Get auth token
+curl -X POST "https://app.nihaoconsult.com/api2/auth-token/" \
+  -d "username=abel.aguzmans@gmail.com" \
+  -d "password=Qwerty123!"
+
+# Use token for API calls
+curl -H "Authorization: Token <token>" "https://app.nihaoconsult.com/api2/repos/"
+```
+
+**Sync Protocol Testing (with token from download-info):**
+```bash
+# Get download-info (includes sync token)
+curl -H "Authorization: Token <api_token>" \
+  "https://app.nihaoconsult.com/api2/repos/<repo_id>/download-info/"
+
+# Use Seafile-Repo-Token header for sync endpoints
+curl -H "Seafile-Repo-Token: <sync_token>" \
+  "https://app.nihaoconsult.com/seafhttp/repo/<repo_id>/commit/HEAD"
+```
+
+### Key API Format Differences (Seafile vs SesameFS)
+
+These are the response format requirements discovered through testing with real Seafile:
+
+| Endpoint | Field | Seafile Format | Notes |
+|----------|-------|----------------|-------|
+| `/commit/{id}` | `parent_id` | `null` (not `""`) | Use pointer type for null JSON |
+| `/commit/{id}` | `second_parent_id` | `null` | Always include, even if null |
+| `/commit/{id}` | `repo_name` | String | Include library name |
+| `/commit/{id}` | `repo_desc` | String | Include library description |
+| `/commit/{id}` | `repo_category` | `null` | Always null |
+| `/commit/{id}` | `no_local_history` | `1` | Integer, not boolean |
+| `/commit/{id}` | `creator` | 40 zeros | Format: `"0000...0000"` (40 chars) |
+| `/commit/{id}` | `version` | `1` | Must be 1, not 0 |
+| `/fs-id-list` | Response | `[]` (JSON array) | NOT newline-separated text |
+| `/permission-check` | Response | Empty body | Just HTTP 200, no JSON |
+| `/protocol-version` | Response | `{"version": 2}` | JSON object |
+| `/download-info` | `encrypted` | `""` (empty string) | Not `false` boolean |
+
+### Single-Port Architecture
+
+Unlike traditional Seafile which uses multiple ports:
+- Port 8000: Seahub (web UI & API)
+- Port 8082: Seafile fileserver (seafhttp)
+
+SesameFS runs everything on a **single port** (default 8080):
+- `/api2/`, `/api/v2/` - REST API
+- `/seafhttp/` - Sync protocol
+
+This is intentional for cloud-native deployments (easier load balancing, K8s, etc.).
 
 ---
 

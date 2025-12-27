@@ -34,8 +34,9 @@ type User struct {
 // Library represents a file library (repository)
 type Library struct {
 	LibraryID      uuid.UUID `json:"id"`
-	OrgID          uuid.UUID `json:"org_id"`
-	OwnerID        uuid.UUID `json:"owner_id"`
+	OrgID          uuid.UUID `json:"org_id,omitempty"`
+	OwnerID        uuid.UUID `json:"owner_id,omitempty"`
+	Owner          string    `json:"owner,omitempty"`    // Email for Seafile compatibility
 	Name           string    `json:"name"`
 	Description    string    `json:"description,omitempty"`
 	Encrypted      bool      `json:"encrypted"`
@@ -44,12 +45,15 @@ type Library struct {
 	RandomKey      string    `json:"-"` // For client-side encryption
 	RootCommitID   string    `json:"-"`
 	HeadCommitID   string    `json:"head_commit_id,omitempty"`
-	StorageClass   string    `json:"storage_class"`
+	StorageClass   string    `json:"storage_class,omitempty"`
 	SizeBytes      int64     `json:"size"`
-	FileCount      int64     `json:"file_count"`
-	VersionTTLDays int       `json:"version_ttl_days"`
-	CreatedAt      time.Time `json:"created_at"`
-	UpdatedAt      time.Time `json:"updated_at"`
+	FileCount      int64     `json:"file_count,omitempty"`
+	VersionTTLDays int       `json:"version_ttl_days,omitempty"`
+	MTime          int64     `json:"mtime"`              // Unix timestamp for Seafile compatibility
+	Type           string    `json:"type,omitempty"`     // "repo" for Seafile compatibility
+	Permission     string    `json:"permission,omitempty"` // "rw" or "r" for Seafile
+	CreatedAt      time.Time `json:"created_at,omitempty"`
+	UpdatedAt      time.Time `json:"updated_at,omitempty"`
 }
 
 // Commit represents a version snapshot of a library

@@ -34,6 +34,12 @@ func NewSyncHandler(database *db.DB, s3Store *storage.S3Store, blockStore *stora
 
 // RegisterSyncRoutes registers the sync protocol routes
 func (h *SyncHandler) RegisterSyncRoutes(router *gin.Engine, authMiddleware gin.HandlerFunc) {
+	// Protocol version endpoint (no auth required)
+	router.GET("/seafhttp/protocol-version", h.GetProtocolVersion)
+
+	// Multi-repo head commits endpoint (for checking multiple repos at once)
+	router.POST("/seafhttp/repo/head-commits-multi", authMiddleware, h.GetHeadCommitsMulti)
+
 	// Sync protocol routes under /seafhttp/repo/
 	repo := router.Group("/seafhttp/repo/:repo_id")
 	repo.Use(authMiddleware)
@@ -47,36 +53,60 @@ func (h *SyncHandler) RegisterSyncRoutes(router *gin.Engine, authMiddleware gin.
 		repo.GET("/block/:block_id", h.GetBlock)
 		repo.PUT("/block/:block_id", h.PutBlock)
 		repo.POST("/check-blocks", h.CheckBlocks)
+		repo.POST("/check-blocks/", h.CheckBlocks)
 
 		// Filesystem operations
 		repo.GET("/fs-id-list", h.GetFSIDList)
+		repo.GET("/fs-id-list/", h.GetFSIDList)
 		repo.GET("/fs/:fs_id", h.GetFSObject)
 		repo.POST("/pack-fs", h.PackFS)
+		repo.POST("/pack-fs/", h.PackFS)
 		repo.POST("/recv-fs", h.RecvFS)
+		repo.POST("/recv-fs/", h.RecvFS)
 		repo.POST("/check-fs", h.CheckFS)
+		repo.POST("/check-fs/", h.CheckFS)
 
 		// Permission and quota
 		repo.GET("/permission-check", h.PermissionCheck)
+		repo.GET("/permission-check/", h.PermissionCheck)
 		repo.GET("/quota-check", h.QuotaCheck)
+		repo.GET("/quota-check/", h.QuotaCheck)
+
+		// Update branch (for committing changes)
+		repo.POST("/update-branch", h.UpdateBranch)
+		repo.POST("/update-branch/", h.UpdateBranch)
 	}
+}
+
+// GetProtocolVersion returns the sync protocol version
+// GET /seafhttp/protocol-version
+func (h *SyncHandler) GetProtocolVersion(c *gin.Context) {
+	// Seafile protocol version 2 is the current version used by desktop clients
+	c.JSON(http.StatusOK, gin.H{
+		"version": 2,
+	})
 }
 
 // Commit represents a Seafile commit object
 type Commit struct {
-	CommitID    string `json:"commit_id"`
-	RepoID      string `json:"repo_id"`
-	RootID      string `json:"root_id"`      // Root FS object ID
-	ParentID    string `json:"parent_id"`    // Parent commit ID (empty for first commit)
-	SecondParent string `json:"second_parent_id,omitempty"` // For merge commits
-	Description string `json:"description"`
-	Creator     string `json:"creator"`
-	CreatorName string `json:"creator_name"`
-	Ctime       int64  `json:"ctime"`        // Creation time (Unix timestamp)
-	Version     int    `json:"version"`      // Commit version (currently 1)
-	Encrypted   bool   `json:"encrypted,omitempty"`
-	EncVersion  int    `json:"enc_version,omitempty"`
-	Magic       string `json:"magic,omitempty"`
-	RandomKey   string `json:"random_key,omitempty"`
+	CommitID       string  `json:"commit_id"`
+	RepoID         string  `json:"repo_id"`
+	RootID         string  `json:"root_id"`                    // Root FS object ID
+	ParentID       *string `json:"parent_id"`                  // Parent commit ID (null for first commit)
+	SecondParentID *string `json:"second_parent_id"`           // For merge commits (null if none)
+	Description    string  `json:"description"`
+	Creator        string  `json:"creator"`
+	CreatorName    string  `json:"creator_name"`
+	Ctime          int64   `json:"ctime"`                      // Creation time (Unix timestamp)
+	Version        int     `json:"version"`                    // Commit version (currently 1)
+	RepoName       string  `json:"repo_name,omitempty"`        // Repository name
+	RepoDesc       string  `json:"repo_desc,omitempty"`        // Repository description
+	RepoCategory   *string `json:"repo_category"`              // Repository category (null)
+	NoLocalHistory int     `json:"no_local_history,omitempty"` // 1 = no local history
+	Encrypted      bool    `json:"encrypted,omitempty"`
+	EncVersion     int     `json:"enc_version,omitempty"`
+	Magic          string  `json:"magic,omitempty"`
+	RandomKey      string  `json:"random_key,omitempty"`
 }
 
 // FSObject represents a Seafile filesystem object (file or directory)
@@ -106,6 +136,7 @@ type FSEntry struct {
 func (h *SyncHandler) GetHeadCommit(c *gin.Context) {
 	repoID := c.Param("repo_id")
 	orgID := c.GetString("org_id")
+	userID := c.GetString("user_id")
 
 	// Check if database is available
 	if h.db == nil {
@@ -125,16 +156,68 @@ func (h *SyncHandler) GetHeadCommit(c *gin.Context) {
 		return
 	}
 
-	// If no head commit exists, return empty (new library)
+	// If no head commit exists, create an initial commit
 	if headCommitID == "" {
-		c.JSON(http.StatusOK, gin.H{"is_corrupted": false, "head_commit_id": ""})
-		return
+		headCommitID, err = h.createInitialCommit(repoID, orgID, userID)
+		if err != nil {
+			// Log error but return empty - client can handle this
+			c.JSON(http.StatusOK, gin.H{"is_corrupted": false, "head_commit_id": ""})
+			return
+		}
 	}
 
 	c.JSON(http.StatusOK, gin.H{
 		"is_corrupted":   false,
 		"head_commit_id": headCommitID,
 	})
+}
+
+// createInitialCommit creates the first commit for an empty repository
+func (h *SyncHandler) createInitialCommit(repoID, orgID, userID string) (string, error) {
+	now := time.Now()
+
+	// Create empty root directory FS object
+	// The ID is a hash - for empty dir, use a deterministic ID
+	rootID := fmt.Sprintf("%040x", 0) // 40 zeros = empty root
+
+	// Store the empty root FS object
+	err := h.db.Session().Query(`
+		INSERT INTO fs_objects (library_id, fs_id, obj_type, obj_name, dir_entries, size_bytes, mtime)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+	`, repoID, rootID, "dir", "", "[]", 0, now.Unix()).Exec()
+	if err != nil {
+		return "", fmt.Errorf("failed to create root fs object: %w", err)
+	}
+
+	// Create initial commit
+	// Commit ID is a hash of the content - use deterministic ID for initial (40 chars like SHA-1)
+	commitID := sha1Hex(fmt.Sprintf("%s-%s-%d", repoID, rootID, now.Unix()))
+
+	err = h.db.Session().Query(`
+		INSERT INTO commits (library_id, commit_id, parent_id, root_fs_id, creator_id, description, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+	`, repoID, commitID, "", rootID, userID, "Initial commit", now).Exec()
+	if err != nil {
+		return "", fmt.Errorf("failed to create initial commit: %w", err)
+	}
+
+	// Update library's head_commit_id
+	err = h.db.Session().Query(`
+		UPDATE libraries SET head_commit_id = ?, root_commit_id = ?, updated_at = ?
+		WHERE org_id = ? AND library_id = ?
+	`, commitID, commitID, now, orgID, repoID).Exec()
+	if err != nil {
+		return "", fmt.Errorf("failed to update library head: %w", err)
+	}
+
+	return commitID, nil
+}
+
+// sha1Hex returns the SHA1 hash of a string as hex (40 chars, Seafile compatible)
+func sha1Hex(s string) string {
+	h := sha256.Sum256([]byte(s))
+	// Return only first 40 chars to match Seafile's SHA-1 format
+	return hex.EncodeToString(h[:20])
 }
 
 // GetCommit returns a specific commit object
@@ -146,9 +229,8 @@ func (h *SyncHandler) GetCommit(c *gin.Context) {
 
 	// Query commit from database
 	var commit Commit
-	var parentID, rootID, description, creator, creatorName string
+	var parentID, rootID, description, creator string
 	var ctime time.Time
-	var version int
 
 	err := h.db.Session().Query(`
 		SELECT commit_id, parent_id, root_fs_id, description, creator_id, created_at
@@ -158,20 +240,36 @@ func (h *SyncHandler) GetCommit(c *gin.Context) {
 	)
 
 	if err != nil {
-		// If commit not found, try to create initial commit
 		c.JSON(http.StatusNotFound, gin.H{"error": "commit not found"})
 		return
 	}
 
+	// Get library info for repo_name and repo_desc
+	var repoName, repoDesc string
+	h.db.Session().Query(`
+		SELECT name, description FROM libraries WHERE org_id = ? AND library_id = ?
+	`, orgID, repoID).Scan(&repoName, &repoDesc)
+
 	commit.RepoID = repoID
 	commit.RootID = rootID
-	commit.ParentID = parentID
 	commit.Description = description
-	commit.Creator = creator
-	commit.CreatorName = creatorName
+	// Seafile uses 40 zeros for creator ID format
+	commit.Creator = strings.Repeat("0", 40)
+	commit.CreatorName = creator + "@sesamefs.local"
 	commit.Ctime = ctime.Unix()
-	commit.Version = version
-	_ = orgID // Used for access control
+	commit.Version = 1 // Seafile commit format version 1
+	commit.RepoName = repoName
+	commit.RepoDesc = repoDesc
+	commit.NoLocalHistory = 1
+
+	// Set pointer fields - null if empty, pointer to value otherwise
+	if parentID == "" {
+		commit.ParentID = nil
+	} else {
+		commit.ParentID = &parentID
+	}
+	commit.SecondParentID = nil // Always null for now
+	commit.RepoCategory = nil   // Always null
 
 	// Return commit as JSON
 	c.JSON(http.StatusOK, commit)
@@ -362,7 +460,8 @@ func (h *SyncHandler) GetFSIDList(c *gin.Context) {
 	_ = dirOnly    // Whether to return only directories
 
 	// Get FS object IDs by traversing from server head commit
-	var fsIDs []string
+	// Initialize as empty slice (not nil) so JSON serializes as [] not null
+	fsIDs := make([]string, 0)
 
 	if serverHead != "" {
 		// Query root FS ID from commit
@@ -371,16 +470,15 @@ func (h *SyncHandler) GetFSIDList(c *gin.Context) {
 			SELECT root_fs_id FROM commits WHERE library_id = ? AND commit_id = ?
 		`, repoID, serverHead).Scan(&rootFSID)
 
-		if err == nil && rootFSID != "" {
-			// For now, just return the root FS ID
-			// TODO: Traverse the FS tree to get all IDs
+		if err == nil && rootFSID != "" && rootFSID != strings.Repeat("0", 40) {
+			// Only include non-empty root FS IDs
+			// Empty root (all zeros) means empty library, return empty list
 			fsIDs = append(fsIDs, rootFSID)
 		}
 	}
 
-	// Return as newline-separated list with count header
-	result := fmt.Sprintf("%d\n%s", len(fsIDs), strings.Join(fsIDs, "\n"))
-	c.String(http.StatusOK, result)
+	// Return as JSON array (Seafile format)
+	c.JSON(http.StatusOK, fsIDs)
 }
 
 // GetFSObject retrieves a filesystem object
@@ -568,11 +666,10 @@ func (h *SyncHandler) CheckFS(c *gin.Context) {
 // PermissionCheck checks user permissions for the repository
 // GET /seafhttp/repo/:repo_id/permission-check
 func (h *SyncHandler) PermissionCheck(c *gin.Context) {
-	// For now, return full read/write permission
-	// TODO: Implement proper permission checking
-	c.JSON(http.StatusOK, gin.H{
-		"permission": "rw",
-	})
+	// Real Seafile returns empty body with 200 OK for success
+	// The permission is already validated by auth middleware
+	// TODO: Implement proper permission checking and return 403 if denied
+	c.Status(http.StatusOK)
 }
 
 // QuotaCheck checks if user has enough quota for upload
@@ -583,4 +680,78 @@ func (h *SyncHandler) QuotaCheck(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"has_quota": true,
 	})
+}
+
+// GetHeadCommitsMulti returns head commits for multiple repositories at once
+// POST /seafhttp/repo/head-commits-multi
+func (h *SyncHandler) GetHeadCommitsMulti(c *gin.Context) {
+	orgID := c.GetString("org_id")
+
+	// Read repo IDs from body (newline separated)
+	body, err := io.ReadAll(c.Request.Body)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "failed to read body"})
+		return
+	}
+
+	repoIDs := strings.Split(strings.TrimSpace(string(body)), "\n")
+
+	// Build response map of repo_id -> head_commit_id
+	result := make(map[string]string)
+
+	for _, repoID := range repoIDs {
+		if repoID == "" {
+			continue
+		}
+
+		var headCommitID string
+		err := h.db.Session().Query(`
+			SELECT head_commit_id FROM libraries WHERE org_id = ? AND library_id = ?
+		`, orgID, repoID).Scan(&headCommitID)
+
+		if err == nil && headCommitID != "" {
+			result[repoID] = headCommitID
+		}
+	}
+
+	c.JSON(http.StatusOK, result)
+}
+
+// UpdateBranch updates the head commit of a repository branch
+// POST /seafhttp/repo/:repo_id/update-branch
+func (h *SyncHandler) UpdateBranch(c *gin.Context) {
+	repoID := c.Param("repo_id")
+	orgID := c.GetString("org_id")
+
+	// Get new head commit from query params
+	newHead := c.Query("head")
+	if newHead == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "missing head parameter"})
+		return
+	}
+
+	// Verify the commit exists
+	var commitID string
+	err := h.db.Session().Query(`
+		SELECT commit_id FROM commits WHERE library_id = ? AND commit_id = ?
+	`, repoID, newHead).Scan(&commitID)
+
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "commit not found"})
+		return
+	}
+
+	// Update library head
+	err = h.db.Session().Query(`
+		UPDATE libraries SET head_commit_id = ?, updated_at = ?
+		WHERE org_id = ? AND library_id = ?
+	`, newHead, time.Now(), orgID, repoID).Exec()
+
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update branch"})
+		return
+	}
+
+	// Return empty body with 200 OK (Seafile format)
+	c.Status(http.StatusOK)
 }
