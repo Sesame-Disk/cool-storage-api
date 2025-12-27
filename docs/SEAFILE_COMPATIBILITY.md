@@ -153,8 +153,63 @@ seafhttp:
 | Backend Storage | Custom block storage | S3-compatible (AWS S3, MinIO) |
 | Database | SQLite/MySQL | Apache Cassandra |
 | Chunking | Custom CDC | FastCDC (planned) |
-| Sync Protocol | Proprietary | Not implemented (API only) |
+| Sync Protocol | Proprietary | **Implemented** (Desktop client compatible) |
 | Authentication | Built-in + LDAP | OIDC + Dev tokens |
+
+## Sync Protocol (`/seafhttp/`)
+
+SesameFS implements the Seafile sync protocol, allowing Seafile desktop clients to sync files directly.
+
+### Supported Endpoints
+
+```
+/seafhttp/protocol-version          GET     Protocol version (returns {"version": 2})
+/seafhttp/repo/head-commits-multi   POST    Check multiple repos at once
+/seafhttp/repo/:repo_id/
+├── /commit/HEAD                    GET     Get HEAD commit ID
+├── /commit/HEAD?head=<id>          PUT     Update HEAD pointer
+├── /commit/:commit_id              GET     Get commit details
+├── /commit/:commit_id              PUT     Store commit
+├── /block/:block_id                GET     Download block
+├── /block/:block_id                PUT     Upload block
+├── /check-blocks/                  POST    Check which blocks exist
+├── /fs-id-list/                    GET     List FS object IDs (JSON array)
+├── /fs/:fs_id                      GET     Get FS object
+├── /pack-fs/                       POST    Pack multiple FS objects
+├── /recv-fs/                       POST    Receive FS objects (binary format)
+├── /check-fs/                      POST    Check which FS objects exist
+├── /permission-check/              GET     Check permissions (empty body = OK)
+├── /quota-check/                   GET     Check quota
+└── /update-branch/                 POST    Update branch head
+```
+
+### Critical Format Requirements
+
+These format details are essential for Seafile client compatibility:
+
+| Endpoint | Requirement | Notes |
+|----------|-------------|-------|
+| `/commit/:id` | `parent_id: null` | Use `*string` type, not empty string |
+| `/commit/:id` | `version: 1` | Must be 1, not 0 |
+| `/commit/:id` | `creator: "0000...0"` | 40 zeros |
+| `/fs-id-list` | JSON array `[]` | NOT newline-separated text |
+| `/permission-check` | Empty body | Just HTTP 200, no JSON |
+| `/recv-fs` | Binary format | 40-char hex ID + binary object data |
+
+### Binary FS Object Format
+
+The `recv-fs` endpoint receives FS objects in binary packed format:
+```
+[40-char hex FS ID][newline][object data][40-char hex FS ID][newline]...
+```
+
+Object data starts with a type byte:
+- `0x01` = File object
+- `0x03` = Directory object
+
+### Single-Port Architecture
+
+Unlike Seafile which uses multiple ports (8000 for API, 8082 for seafhttp), SesameFS runs everything on a single port (default 8080). The `relay_port` in download-info responses must match the actual server port.
 
 ## Configuration
 

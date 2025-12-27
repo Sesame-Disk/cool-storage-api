@@ -28,11 +28,12 @@ func setupSyncTestRouter() *gin.Engine {
 
 // TestCommitStruct tests the Commit struct JSON serialization
 func TestCommitStruct(t *testing.T) {
+	parentID := "parent123"
 	commit := Commit{
 		CommitID:    "abc123",
 		RepoID:      "00000000-0000-0000-0000-000000000001",
 		RootID:      "def456",
-		ParentID:    "parent123",
+		ParentID:    &parentID,
 		Description: "Test commit",
 		Creator:     "user1",
 		CreatorName: "Test User",
@@ -58,6 +59,9 @@ func TestCommitStruct(t *testing.T) {
 	}
 	if decoded.Ctime != commit.Ctime {
 		t.Errorf("Ctime mismatch: got %d, want %d", decoded.Ctime, commit.Ctime)
+	}
+	if decoded.ParentID == nil || *decoded.ParentID != parentID {
+		t.Errorf("ParentID mismatch: got %v, want %s", decoded.ParentID, parentID)
 	}
 }
 
@@ -229,6 +233,7 @@ func TestSyncHandlerWithoutDB(t *testing.T) {
 }
 
 // TestPermissionCheckResponse tests the permission check endpoint response format
+// NOTE: Seafile desktop client expects empty body with 200 OK, not JSON
 func TestPermissionCheckResponse(t *testing.T) {
 	r := setupSyncTestRouter()
 	h := &SyncHandler{}
@@ -243,17 +248,10 @@ func TestPermissionCheckResponse(t *testing.T) {
 		t.Fatalf("status = %d, want %d", w.Code, http.StatusOK)
 	}
 
-	var response map[string]interface{}
-	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
-		t.Fatalf("failed to parse response: %v", err)
-	}
-
-	permission, ok := response["permission"].(string)
-	if !ok {
-		t.Fatal("permission field not found or not string")
-	}
-	if permission != "rw" {
-		t.Errorf("permission = %s, want rw", permission)
+	// Seafile expects empty body for success (200 OK means permission granted)
+	body := w.Body.String()
+	if body != "" {
+		t.Errorf("expected empty body for permission check, got: %s", body)
 	}
 }
 
@@ -400,21 +398,23 @@ func TestRecvFSRequestParsing(t *testing.T) {
 
 // TestCommitJSONFields tests that JSON field names match Seafile protocol
 func TestCommitJSONFields(t *testing.T) {
+	parentID := "parent"
+	secondParent := "second"
 	commit := Commit{
-		CommitID:     "abc",
-		RepoID:       "repo",
-		RootID:       "root",
-		ParentID:     "parent",
-		SecondParent: "second",
-		Description:  "desc",
-		Creator:      "user",
-		CreatorName:  "name",
-		Ctime:        123,
-		Version:      1,
-		Encrypted:    true,
-		EncVersion:   2,
-		Magic:        "magic",
-		RandomKey:    "key",
+		CommitID:       "abc",
+		RepoID:         "repo",
+		RootID:         "root",
+		ParentID:       &parentID,
+		SecondParentID: &secondParent,
+		Description:    "desc",
+		Creator:        "user",
+		CreatorName:    "name",
+		Ctime:          123,
+		Version:        1,
+		Encrypted:      true,
+		EncVersion:     2,
+		Magic:          "magic",
+		RandomKey:      "key",
 	}
 
 	data, err := json.Marshal(commit)
@@ -446,4 +446,223 @@ func TestCommitJSONFields(t *testing.T) {
 			t.Errorf("JSON missing field: %s\nGot: %s", field, jsonStr)
 		}
 	}
+}
+
+// TestCommitNullFields tests that pointer fields serialize as null when nil
+func TestCommitNullFields(t *testing.T) {
+	commit := Commit{
+		CommitID:       "abc",
+		RepoID:         "repo",
+		RootID:         "root",
+		ParentID:       nil, // Should serialize as null
+		SecondParentID: nil, // Should serialize as null
+		RepoCategory:   nil, // Should serialize as null
+		Description:    "Initial commit",
+		Creator:        strings.Repeat("0", 40),
+		CreatorName:    "test@sesamefs.local",
+		Ctime:          1234567890,
+		Version:        1,
+	}
+
+	data, err := json.Marshal(commit)
+	if err != nil {
+		t.Fatalf("failed to marshal: %v", err)
+	}
+
+	jsonStr := string(data)
+
+	// Check that null fields are present as null (not empty string)
+	if !strings.Contains(jsonStr, `"parent_id":null`) {
+		t.Errorf("parent_id should be null, got: %s", jsonStr)
+	}
+	if !strings.Contains(jsonStr, `"second_parent_id":null`) {
+		t.Errorf("second_parent_id should be null, got: %s", jsonStr)
+	}
+	if !strings.Contains(jsonStr, `"repo_category":null`) {
+		t.Errorf("repo_category should be null, got: %s", jsonStr)
+	}
+}
+
+// TestGetProtocolVersion tests the protocol version endpoint
+func TestGetProtocolVersion(t *testing.T) {
+	r := gin.New()
+	h := &SyncHandler{}
+	r.GET("/seafhttp/protocol-version", h.GetProtocolVersion)
+
+	req, _ := http.NewRequest("GET", "/seafhttp/protocol-version", nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusOK)
+	}
+
+	var response map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+		t.Fatalf("failed to parse response: %v", err)
+	}
+
+	version, ok := response["version"].(float64)
+	if !ok {
+		t.Fatal("version field not found or not number")
+	}
+	if version != 2 {
+		t.Errorf("version = %v, want 2", version)
+	}
+}
+
+// TestPermissionCheckEmptyBody tests that permission-check returns empty body
+func TestPermissionCheckEmptyBody(t *testing.T) {
+	r := setupSyncTestRouter()
+	h := &SyncHandler{}
+
+	r.GET("/seafhttp/repo/:repo_id/permission-check", h.PermissionCheck)
+
+	req, _ := http.NewRequest("GET", "/seafhttp/repo/test-repo/permission-check", nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusOK)
+	}
+
+	// Seafile expects empty body, not JSON
+	body := w.Body.String()
+	if body != "" {
+		t.Errorf("body should be empty, got: %s", body)
+	}
+}
+
+// TestIsHexString tests the isHexString helper function
+func TestIsHexString(t *testing.T) {
+	tests := []struct {
+		input    string
+		expected bool
+	}{
+		{"0123456789abcdef", true},
+		{"ABCDEF0123456789", true},
+		{"aAbBcCdDeEfF0123", true},
+		{"0000000000000000000000000000000000000000", true}, // 40 zeros
+		{"ghijkl", false},
+		{"0123g567", false},
+		{"", true}, // Empty is technically valid hex
+		{"abc!", false},
+		{"abc def", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			result := isHexString([]byte(tt.input))
+			if result != tt.expected {
+				t.Errorf("isHexString(%q) = %v, want %v", tt.input, result, tt.expected)
+			}
+		})
+	}
+}
+
+// TestSha1Hex tests the sha1Hex helper function
+func TestSha1Hex(t *testing.T) {
+	// Test that sha1Hex returns 40 characters (Seafile SHA-1 compatible)
+	result := sha1Hex("test input")
+
+	if len(result) != 40 {
+		t.Errorf("sha1Hex length = %d, want 40", len(result))
+	}
+
+	// Verify it's valid hex
+	if !isHexString([]byte(result)) {
+		t.Errorf("sha1Hex result is not valid hex: %s", result)
+	}
+
+	// Test determinism
+	result2 := sha1Hex("test input")
+	if result != result2 {
+		t.Errorf("sha1Hex not deterministic: %s != %s", result, result2)
+	}
+
+	// Test different inputs produce different outputs
+	result3 := sha1Hex("different input")
+	if result == result3 {
+		t.Errorf("sha1Hex should produce different hashes for different inputs")
+	}
+}
+
+// TestFSIDListJSONFormat tests that fs-id-list returns JSON array format
+func TestFSIDListJSONFormat(t *testing.T) {
+	// Empty list should be []
+	emptyList := make([]string, 0)
+	data, err := json.Marshal(emptyList)
+	if err != nil {
+		t.Fatalf("failed to marshal empty list: %v", err)
+	}
+	if string(data) != "[]" {
+		t.Errorf("empty list should be [], got: %s", string(data))
+	}
+
+	// List with items
+	fsIDs := []string{"abc123", "def456"}
+	data, err = json.Marshal(fsIDs)
+	if err != nil {
+		t.Fatalf("failed to marshal list: %v", err)
+	}
+	if string(data) != `["abc123","def456"]` {
+		t.Errorf("unexpected JSON format: %s", string(data))
+	}
+}
+
+// TestCommitStructWithPointerFields tests Commit struct serialization with pointer types
+func TestCommitStructWithPointerFields(t *testing.T) {
+	t.Run("with nil pointers", func(t *testing.T) {
+		commit := Commit{
+			CommitID:       "abc123",
+			RepoID:         "repo-id",
+			RootID:         "root-id",
+			ParentID:       nil,
+			SecondParentID: nil,
+			RepoCategory:   nil,
+			Version:        1,
+		}
+
+		data, err := json.Marshal(commit)
+		if err != nil {
+			t.Fatalf("failed to marshal: %v", err)
+		}
+
+		var decoded map[string]interface{}
+		if err := json.Unmarshal(data, &decoded); err != nil {
+			t.Fatalf("failed to unmarshal: %v", err)
+		}
+
+		// Check parent_id is null (not missing or empty string)
+		if decoded["parent_id"] != nil {
+			t.Errorf("parent_id should be null, got: %v", decoded["parent_id"])
+		}
+	})
+
+	t.Run("with non-nil pointers", func(t *testing.T) {
+		parentID := "parent-commit"
+		commit := Commit{
+			CommitID:       "abc123",
+			RepoID:         "repo-id",
+			RootID:         "root-id",
+			ParentID:       &parentID,
+			SecondParentID: nil,
+			Version:        1,
+		}
+
+		data, err := json.Marshal(commit)
+		if err != nil {
+			t.Fatalf("failed to marshal: %v", err)
+		}
+
+		var decoded map[string]interface{}
+		if err := json.Unmarshal(data, &decoded); err != nil {
+			t.Fatalf("failed to unmarshal: %v", err)
+		}
+
+		// Check parent_id has the value
+		if decoded["parent_id"] != "parent-commit" {
+			t.Errorf("parent_id should be 'parent-commit', got: %v", decoded["parent_id"])
+		}
+	})
 }

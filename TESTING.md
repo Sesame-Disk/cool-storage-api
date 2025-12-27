@@ -7,9 +7,11 @@ This document describes the test coverage status and what requires integration t
 | Package | Coverage | Notes |
 |---------|----------|-------|
 | `internal/config` | 96.7% | Well covered, only yaml parse error paths not tested |
-| `internal/api` | 30.4% | Unit tests for token management, handlers without deps |
-| `internal/api/v2` | 1.9% | Requires database integration |
-| `internal/chunker` | 62.1% | FastCDC algorithm well covered |
+| `internal/api` | 25.4% | Sync protocol structs, token management, hostname resolution |
+| `internal/api/v2` | 3.2% | Requires database integration |
+| `internal/chunker` | 63.2% | FastCDC algorithm well covered |
+
+*Last updated: 2024-12-27*
 
 ## Running Tests
 

@@ -52,3 +52,4 @@ todo-mysql-data/
 # Upload/download directories
 upload/
 download/
+.seafile-reference.md

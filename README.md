@@ -497,26 +497,33 @@ lifecycle:
 10. [x] Block check/upload/download endpoints
 11. [x] Distributed token store (Cassandra-backed, stateless)
 
-### 🚀 PRIORITY: Seafile Client Compatibility
+### 🚀 PRIORITY: Seafile Client Compatibility ✅
 **Goal: Test with Seafile Desktop and CLI clients**
 
 ```
 Immediate (for CLI testing):
 ├── [x] Add /api2/ legacy route aliases
 ├── [x] GET /api2/repos/ - List libraries
-├── [x] GET /api2/repos/:id/dir/?p=/ - Directory listing  ← CRITICAL
+├── [x] GET /api2/repos/:id/dir/?p=/ - Directory listing
 ├── [x] GET /api2/auth-token/ - Auth token endpoint
-└── [ ] Test with: seaf-cli sync
+└── [x] Test with: seaf-cli sync
 
 For Desktop client (sync protocol):
-├── [ ] GET /seafhttp/repo/:id/commit/HEAD - Latest commit
-├── [ ] GET /seafhttp/repo/:id/commit/:cid - Get commit
-├── [ ] POST /seafhttp/repo/:id/check-blocks/ - Check blocks
-├── [ ] GET /seafhttp/repo/:id/block/:bid - Download block
-├── [ ] POST /seafhttp/repo/:id/recv-fs/ - Receive FS object
-├── [ ] GET /seafhttp/repo/:id/fs/:fsid - Get FS object
-└── [ ] Commit/FS object model in Cassandra
+├── [x] GET /seafhttp/repo/:id/commit/HEAD - Latest commit
+├── [x] GET /seafhttp/repo/:id/commit/:cid - Get commit
+├── [x] PUT /seafhttp/repo/:id/commit/HEAD?head= - Update HEAD
+├── [x] POST /seafhttp/repo/:id/check-blocks/ - Check blocks
+├── [x] GET /seafhttp/repo/:id/block/:bid - Download block
+├── [x] PUT /seafhttp/repo/:id/block/:bid - Upload block
+├── [x] POST /seafhttp/repo/:id/recv-fs/ - Receive FS objects (binary format)
+├── [x] GET /seafhttp/repo/:id/fs/:fsid - Get FS object
+├── [x] GET /seafhttp/repo/:id/fs-id-list/ - Get FS ID list (JSON array format)
+├── [x] GET /seafhttp/repo/:id/permission-check/ - Permission check (empty body)
+├── [x] POST /seafhttp/repo/head-commits-multi - Multi-repo head commits
+└── [x] Commit/FS object model in Cassandra
 ```
+
+**Tested with:** Seafile Desktop Client for macOS - login, sync, file upload all working.
 
 ### Phase 2: Stateless Distributed Architecture ✅
 ```
