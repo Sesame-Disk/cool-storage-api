@@ -8,12 +8,12 @@ This document describes the test coverage status and what requires integration t
 |---------|----------|-------|
 | `internal/config` | 96.7% | Well covered, only yaml parse error paths not tested |
 | `internal/storage` | 31.4% | StorageManager, health checks, policy resolution |
-| `internal/api` | 24.4% | Sync protocol structs, token management, hostname resolution |
-| `internal/api/v2` | 3.2% | Requires database integration |
+| `internal/api` | 25.3% | Sync protocol, token management, hostname resolution, hash translation |
+| `internal/api/v2` | 3.1% | Requires database integration |
 | `internal/chunker` | 63.2% | FastCDC algorithm well covered |
 | `internal/models` | n/a | Data structures only |
 
-*Last updated: 2025-12-27*
+*Last updated: 2025-12-28*
 
 ## Running Tests
 
@@ -59,6 +59,14 @@ The following components can be tested in isolation:
 - `PermissionCheck` - returns empty body (Seafile format)
 - `QuotaCheck` - returns quota status
 - Commit struct null field serialization (`parent_id: null`)
+
+### Hash Translation (`internal/api/sync_test.go`)
+- `TestBlockIDFormats` - SHA-1 (40 char) vs SHA-256 (64 char) detection
+- `TestSHA256Computation` - SHA-256 hash format validation
+- `TestHashTypeParameter` - `?hash_type=sha256` query parameter handling
+- `TestExternalToInternalMapping` - external→internal ID mapping logic
+- `TestCheckBlocksMapping` - CheckBlocks with SHA-1→SHA-256 translation
+- `TestBlockHashValidation` - hash verification for direct SHA-256 uploads
 
 ### Hostname Resolution (`internal/api/hostname.go`)
 - `normalizeHostname()` - hostname normalization
@@ -208,15 +216,35 @@ The codebase has **three separate upload paths** that do NOT share internal API 
 
 | Path | Endpoint | Used By | Chunking | Storage Backend |
 |------|----------|---------|----------|-----------------|
-| **Sync Protocol** | `/seafhttp/repo/:id/block/:id` | Seafile Desktop | Client-side (SHA-1) | **StorageManager** (multi-region) |
-| **v2 Block API** | `/api/v2/blocks/upload` | Web/API clients | Client-side (SHA-256) | Single BlockStore |
+| **Sync Protocol** | `/seafhttp/repo/:id/block/:id` | Seafile Desktop | Client-side (SHA-1→SHA-256) | **StorageManager** (multi-region) |
+| **v2 Block API** | `/api/v2/blocks/upload` | Web/API clients | Client-side (SHA-256) | **StorageManager** (multi-region) |
 | **SeafHTTP Upload** | `/seafhttp/upload-api/:token` | Web forms | No chunking | S3Store direct |
 | **v2 File Upload** | `/api2/repos/:id/upload` | API clients | No chunking | S3Store direct |
 
 **Key differences:**
-- **Sync Protocol** - Uses `StorageManager` for multi-region storage routing, blocks stored content-addressed
-- **v2 Block API** - Uses single `BlockStore`, needs update to use StorageManager
+- **Sync Protocol** - Uses `StorageManager` for multi-region storage routing, translates SHA-1→SHA-256 internally
+- **v2 Block API** - Uses `StorageManager` for multi-region storage routing (updated 2025-12-28)
 - **Web uploads** - Store whole files path-addressed (not content-addressed)
+
+### Hash Translation (SHA-1 to SHA-256)
+
+Seafile clients use SHA-1 (40 chars) for block IDs, but SesameFS stores everything as SHA-256 (64 chars) internally:
+
+```
+Seafile Client (SHA-1)           SesameFS (SHA-256)
+─────────────────────────────────────────────────────────
+PUT block/abc123... (40)         → Compute SHA-256 of data
+                                 → Store with internal SHA-256 ID
+                                 → Save mapping: abc123... → SHA-256
+─────────────────────────────────────────────────────────
+GET block/abc123... (40)         → Lookup mapping: abc123... → SHA-256
+                                 → Retrieve using internal SHA-256 ID
+─────────────────────────────────────────────────────────
+New clients (SHA-256):           → Use ?hash_type=sha256
+PUT block/SHA-256... (64)        → Store directly (no mapping needed)
+```
+
+The `block_id_mappings` table in Cassandra stores external→internal translations.
 
 ## Future Improvements
 
@@ -225,4 +253,3 @@ The codebase has **three separate upload paths** that do NOT share internal API 
 3. **Integration test suite** - Add `_integration_test.go` files with build tags
 4. **Test containers** - Use testcontainers-go for automatic Docker management
 5. **E2E tests** - Full API tests with real Seafile client compatibility checks
-6. **Unify upload backends** - Update v2 Block API to use StorageManager for multi-region support
