@@ -1,0 +1,129 @@
+.file-uploader-container {
+  display: flex;
+  /* flex: 1; */
+}
+
+.file-uploader {
+  position: fixed;
+  bottom: 99999px;
+}
+
+.uploader-list-view {
+  display: flex;
+  flex-direction: column;
+  position: fixed;
+  right: 1px;
+  bottom: 1px;
+  width: 35rem;
+  height: 20rem;
+  border: 1px solid #ddd;
+  border-radius: 3px;
+  box-shadow: 0 0 6px #ddd;
+  background-color: #fff;
+  z-index: 1050;
+}
+
+.uploader-list-header {
+  background-color: #f0f0f0;
+  padding: 0.625rem;
+  font-size: 1rem;
+  color: #322;
+  display: flex;
+  justify-content: space-between;
+  min-height: 2.25rem;
+  border-bottom: 1px solid #ddd;
+}
+
+.uploader-list-header .progress {
+  height: 5px;
+  margin-top: 8px;
+  width: 475px;
+}
+
+.uploader-list-header .upload-dialog-op-container {
+  line-height: 1;
+}
+
+.uploader-list-header .upload-dialog-op {
+  display: inline-block;
+  margin: 3px 0 0 4px;
+  font-size: 18px;
+  line-height: 1;
+  color: #b8b8b8;
+  cursor: pointer;
+}
+
+.uploader-list-content {
+  padding: 0 1rem 1.25rem;
+  background-color: #fff;
+  overflow: auto;
+}
+
+.file-upload-item {
+  height: 44px;
+}
+
+.upload-progress .progress-container {
+  height: 24px;
+  padding: 4px 0;
+}
+
+.upload-progress .progress {
+  height: 5px;
+  width: 80%;
+}
+
+.upload-progress .progress .progress-bar {
+  color: #e83;
+}
+
+.upload-progress .progress-text {
+  margin-top: 2px;
+  font-size: 12px;
+  line-height: 12px;
+  color: #666666;
+}
+
+#upload-link-total-progress-container {
+  margin: 20px -32px 0;
+  border: 1px solid #eee;
+  border-width: 1px 0;
+  font-size: 14px;
+  height: 52px;
+}
+
+#upload-link-total-progress-container .progress {
+  height: 5px;
+  margin-top: 8px;
+}
+
+.file-upload-item .upload-success-icon {
+  width: 16px;
+  height: 16px;
+  padding: 4px;
+  color: #fff;
+  background: #47b881;
+  border-radius: 100%;
+  font-size: 8px;
+  line-height: 1.1;
+  font-weight: bolder;
+}
+
+.file-upload-item .upload-success-msg {
+  color: #47b881;
+}
+
+.file-upload-item .upload-failure-icon {
+  width: 16px;
+  height: 16px;
+  padding: 4px;
+  color: #fff;
+  background: #ec4c47;
+  border-radius: 100%;
+  font-size: 8px;
+  text-align: center;
+}
+
+.file-upload-item .upload-failure-msg {
+  color: #ec4c47;
+}

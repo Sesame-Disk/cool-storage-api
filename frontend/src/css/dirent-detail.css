@@ -1,0 +1,184 @@
+.detail-container {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  border-left: 1px solid #e8e8e8;
+}
+
+.detail-header {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  line-height: 2.5rem;
+  background-color: #f9f9f9;
+  border-bottom: 1px solid #e8e8e8;
+  height: 40px;
+}
+
+.detail-header .detail-control {
+  padding-left: 0.5rem;
+  font-size: 16px;
+  color: #b9b9b9;
+}
+
+.detail-header .detail-control:hover {
+  color: #888;
+}
+
+.detail-header .detail-title {
+  margin-left: 0.25rem;
+  display: flex;
+  flex: 1;
+  justify-content: center;
+  align-items: center;
+  width: 0; /* prevent strut flex layout */
+}
+
+.detail-header .detail-title .name {
+  margin: 0 0.5rem 0 0.25rem;
+  line-height: 1.5rem;
+  vertical-align: middle;
+  font-size: 1rem;
+  color: #322;
+}
+
+.detail-body {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+
+.dirent-info .img {
+  height: 10rem;
+  padding: 0.5rem 0;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+}
+
+.dirent-info .img .thumbnail {
+  max-width: calc(100% - 4px);
+  max-height: 100%;
+  display: inline-block;
+}
+
+.dirent-table-container {
+  padding: 10px 20px 20px;
+  display: flex;
+}
+
+.dirent-table-container tr {
+  border: none;
+}
+
+.dirent-table-container table {
+  flex: 1;
+}
+
+.dirent-table-container th,
+.dirent-table-container td {
+  padding: 5px 3px;
+  border: none;
+}
+
+.dirent-table-container th {
+  font-size: 13px;
+  text-align: left;
+  font-weight: normal;
+  color: #9c9c9c;
+}
+
+.dirent-table-container td {
+  font-size: 14px;
+  color: #333;
+  word-break: break-all;
+}
+
+.dirent-table-container .file-tag-container th {
+  vertical-align: top;
+  list-style: none;
+  padding-top: 8px;
+}
+
+.dirent-table-container .file-tag-container .tag-list {
+  list-style: none;
+}
+
+.dirent-table-container .seafile-multicolor-icon.seafile-multicolor-icon-tag {
+  width: 20px;
+  height: 20px;
+  cursor: pointer;
+}
+
+.file-related-files th {
+  vertical-align: top;
+}
+
+.file-related-files td i {
+  padding: 0;
+}
+
+.file-related-files td ul {
+  list-style: none;
+  max-height: 100px;
+  overflow-y: scroll;
+  white-space: nowrap;
+}
+
+.file-related-files td ul li {
+  margin-bottom: 5px;
+  overflow-x: hidden;
+  text-overflow: ellipsis;
+}
+
+.file-related-files ul li a,
+.list-related-file-table tr td a {
+  color: #333;
+}
+
+.list-related-file-body {
+  min-height: 200px;
+  max-height: 500px;
+  overflow-y: scroll;
+}
+
+.no-related-file {
+  text-align: center;
+}
+
+.sf-add-related-file .alert {
+  margin: 0.5rem;
+}
+
+.sf-add-related-file .related-file-subtitle {
+  display: inline-block;
+  margin-bottom: 0.5rem;
+}
+
+.detail-container .nav-item .nav-link, .detail-container .nav-item .nav-link i {
+  margin: 0 auto;
+}
+
+.detail-container .edit-file-extra-attributes-btn {
+  min-width: 80px;
+  width: fit-content;
+  max-width: 100%;
+  height: 28px;
+  line-height: 28px;
+  padding: 0 10px;
+  background-color: #f0f0f0;
+  border-radius: 3px;
+  color: #929292;
+  font-size: 14px;
+  text-align: center;
+  cursor: pointer;
+}
+
+.detail-container .edit-file-extra-attributes-btn:hover {
+  cursor: pointer;
+  background-color: #dbdbdb;
+  color: #666;
+}

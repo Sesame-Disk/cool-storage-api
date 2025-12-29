@@ -1,0 +1,575 @@
+{
+  "status": "done",
+  "assets": {
+    "static/css/app.0a6c10b6.css": {
+      "name": "static/css/app.0a6c10b6.css",
+      "path": "C:\\Users\\yoili\\OneDrive\\Documentos\\Work\\NiHaoCloud\\seafile-nihaocloud\\seahub\\frontend\\build\\frontend\\static\\css\\app.0a6c10b6.css"
+    },
+    "static/css/commons.0896cb31.css": {
+      "name": "static/css/commons.0896cb31.css",
+      "path": "C:\\Users\\yoili\\OneDrive\\Documentos\\Work\\NiHaoCloud\\seafile-nihaocloud\\seahub\\frontend\\build\\frontend\\static\\css\\commons.0896cb31.css"
+    },
+    "static/css/draft.22c06bac.css": {
+      "name": "static/css/draft.22c06bac.css",
+      "path": "C:\\Users\\yoili\\OneDrive\\Documentos\\Work\\NiHaoCloud\\seafile-nihaocloud\\seahub\\frontend\\build\\frontend\\static\\css\\draft.22c06bac.css"
+    },
+    "static/css/fileHistory.12927620.css": {
+      "name": "static/css/fileHistory.12927620.css",
+      "path": "C:\\Users\\yoili\\OneDrive\\Documentos\\Work\\NiHaoCloud\\seafile-nihaocloud\\seahub\\frontend\\build\\frontend\\static\\css\\fileHistory.12927620.css"
+    },
+    "static/css/fileHistoryOld.6d426e0b.css": {
+      "name": "static/css/fileHistoryOld.6d426e0b.css",
+      "path": "C:\\Users\\yoili\\OneDrive\\Documentos\\Work\\NiHaoCloud\\seafile-nihaocloud\\seahub\\frontend\\build\\frontend\\static\\css\\fileHistoryOld.6d426e0b.css"
+    },
+    "static/css/historyTrashFileView.14c233ee.css": {
+      "name": "static/css/historyTrashFileView.14c233ee.css",
+      "path": "C:\\Users\\yoili\\OneDrive\\Documentos\\Work\\NiHaoCloud\\seafile-nihaocloud\\seahub\\frontend\\build\\frontend\\static\\css\\historyTrashFileView.14c233ee.css"
+    },
+    "static/css/markdownEditor.aee3ee08.css": {
+      "name": "static/css/markdownEditor.aee3ee08.css",
+      "path": "C:\\Users\\yoili\\OneDrive\\Documentos\\Work\\NiHaoCloud\\seafile-nihaocloud\\seahub\\frontend\\build\\frontend\\static\\css\\markdownEditor.aee3ee08.css"
+    },
+    "static/css/orgAdmin.eab5f23f.css": {
+      "name": "static/css/orgAdmin.eab5f23f.css",
+      "path": "C:\\Users\\yoili\\OneDrive\\Documentos\\Work\\NiHaoCloud\\seafile-nihaocloud\\seahub\\frontend\\build\\frontend\\static\\css\\orgAdmin.eab5f23f.css"
+    },
+    "static/css/plainMarkdownEditor.1f7f8136.css": {
+      "name": "static/css/plainMarkdownEditor.1f7f8136.css",
+      "path": "C:\\Users\\yoili\\OneDrive\\Documentos\\Work\\NiHaoCloud\\seafile-nihaocloud\\seahub\\frontend\\build\\frontend\\static\\css\\plainMarkdownEditor.1f7f8136.css"
+    },
+    "static/css/repoFolderTrash.69b56f7c.css": {
+      "name": "static/css/repoFolderTrash.69b56f7c.css",
+      "path": "C:\\Users\\yoili\\OneDrive\\Documentos\\Work\\NiHaoCloud\\seafile-nihaocloud\\seahub\\frontend\\build\\frontend\\static\\css\\repoFolderTrash.69b56f7c.css"
+    },
+    "static/css/repoHistory.d2c893af.css": {
+      "name": "static/css/repoHistory.d2c893af.css",
+      "path": "C:\\Users\\yoili\\OneDrive\\Documentos\\Work\\NiHaoCloud\\seafile-nihaocloud\\seahub\\frontend\\build\\frontend\\static\\css\\repoHistory.d2c893af.css"
+    },
+    "static/css/repoSnapshot.0ee3fb82.css": {
+      "name": "static/css/repoSnapshot.0ee3fb82.css",
+      "path": "C:\\Users\\yoili\\OneDrive\\Documentos\\Work\\NiHaoCloud\\seafile-nihaocloud\\seahub\\frontend\\build\\frontend\\static\\css\\repoSnapshot.0ee3fb82.css"
+    },
+    "static/css/sdocFileHistory.59c3027a.css": {
+      "name": "static/css/sdocFileHistory.59c3027a.css",
+      "path": "C:\\Users\\yoili\\OneDrive\\Documentos\\Work\\NiHaoCloud\\seafile-nihaocloud\\seahub\\frontend\\build\\frontend\\static\\css\\sdocFileHistory.59c3027a.css"
+    },
+    "static/css/settings.4e24d65d.css": {
+      "name": "static/css/settings.4e24d65d.css",
+      "path": "C:\\Users\\yoili\\OneDrive\\Documentos\\Work\\NiHaoCloud\\seafile-nihaocloud\\seahub\\frontend\\build\\frontend\\static\\css\\settings.4e24d65d.css"
+    },
+    "static/css/sharedDirView.0167fb72.css": {
+      "name": "static/css/sharedDirView.0167fb72.css",
+      "path": "C:\\Users\\yoili\\OneDrive\\Documentos\\Work\\NiHaoCloud\\seafile-nihaocloud\\seahub\\frontend\\build\\frontend\\static\\css\\sharedDirView.0167fb72.css"
+    },
+    "static/css/sharedFileViewSpreadsheet.aea7959b.css": {
+      "name": "static/css/sharedFileViewSpreadsheet.aea7959b.css",
+      "path": "C:\\Users\\yoili\\OneDrive\\Documentos\\Work\\NiHaoCloud\\seafile-nihaocloud\\seahub\\frontend\\build\\frontend\\static\\css\\sharedFileViewSpreadsheet.aea7959b.css"
+    },
+    "static/css/subscription.39b82133.css": {
+      "name": "static/css/subscription.39b82133.css",
+      "path": "C:\\Users\\yoili\\OneDrive\\Documentos\\Work\\NiHaoCloud\\seafile-nihaocloud\\seahub\\frontend\\build\\frontend\\static\\css\\subscription.39b82133.css"
+    },
+    "static/css/sysAdmin.defb2342.css": {
+      "name": "static/css/sysAdmin.defb2342.css",
+      "path": "C:\\Users\\yoili\\OneDrive\\Documentos\\Work\\NiHaoCloud\\seafile-nihaocloud\\seahub\\frontend\\build\\frontend\\static\\css\\sysAdmin.defb2342.css"
+    },
+    "static/css/TCAccept.0abfc181.css": {
+      "name": "static/css/TCAccept.0abfc181.css",
+      "path": "C:\\Users\\yoili\\OneDrive\\Documentos\\Work\\NiHaoCloud\\seafile-nihaocloud\\seahub\\frontend\\build\\frontend\\static\\css\\TCAccept.0abfc181.css"
+    },
+    "static/css/TCView.0abfc181.css": {
+      "name": "static/css/TCView.0abfc181.css",
+      "path": "C:\\Users\\yoili\\OneDrive\\Documentos\\Work\\NiHaoCloud\\seafile-nihaocloud\\seahub\\frontend\\build\\frontend\\static\\css\\TCView.0abfc181.css"
+    },
+    "static/css/uploadLink.d59e882a.css": {
+      "name": "static/css/uploadLink.d59e882a.css",
+      "path": "C:\\Users\\yoili\\OneDrive\\Documentos\\Work\\NiHaoCloud\\seafile-nihaocloud\\seahub\\frontend\\build\\frontend\\static\\css\\uploadLink.d59e882a.css"
+    },
+    "static/css/viewFileSpreadsheet.aea7959b.css": {
+      "name": "static/css/viewFileSpreadsheet.aea7959b.css",
+      "path": "C:\\Users\\yoili\\OneDrive\\Documentos\\Work\\NiHaoCloud\\seafile-nihaocloud\\seahub\\frontend\\build\\frontend\\static\\css\\viewFileSpreadsheet.aea7959b.css"
+    },
+    "static/css/wiki.253952fd.css": {
+      "name": "static/css/wiki.253952fd.css",
+      "path": "C:\\Users\\yoili\\OneDrive\\Documentos\\Work\\NiHaoCloud\\seafile-nihaocloud\\seahub\\frontend\\build\\frontend\\static\\css\\wiki.253952fd.css"
+    },
+    "static/js/334.414e1376.chunk.js": {
+      "name": "static/js/334.414e1376.chunk.js",
+      "path": "C:\\Users\\yoili\\OneDrive\\Documentos\\Work\\NiHaoCloud\\seafile-nihaocloud\\seahub\\frontend\\build\\frontend\\static\\js\\334.414e1376.chunk.js"
+    },
+    "static/js/347.5f2fe80e.chunk.js": {
+      "name": "static/js/347.5f2fe80e.chunk.js",
+      "path": "C:\\Users\\yoili\\OneDrive\\Documentos\\Work\\NiHaoCloud\\seafile-nihaocloud\\seahub\\frontend\\build\\frontend\\static\\js\\347.5f2fe80e.chunk.js"
+    },
+    "static/js/349.df816323.chunk.js": {
+      "name": "static/js/349.df816323.chunk.js",
+      "path": "C:\\Users\\yoili\\OneDrive\\Documentos\\Work\\NiHaoCloud\\seafile-nihaocloud\\seahub\\frontend\\build\\frontend\\static\\js\\349.df816323.chunk.js"
+    },
+    "static/js/685.7291a8cc.chunk.js": {
+      "name": "static/js/685.7291a8cc.chunk.js",
+      "path": "C:\\Users\\yoili\\OneDrive\\Documentos\\Work\\NiHaoCloud\\seafile-nihaocloud\\seahub\\frontend\\build\\frontend\\static\\js\\685.7291a8cc.chunk.js"
+    },
+    "static/js/695.4f440918.chunk.js": {
+      "name": "static/js/695.4f440918.chunk.js",
+      "path": "C:\\Users\\yoili\\OneDrive\\Documentos\\Work\\NiHaoCloud\\seafile-nihaocloud\\seahub\\frontend\\build\\frontend\\static\\js\\695.4f440918.chunk.js"
+    },
+    "static/js/75.a877b6a8.chunk.js": {
+      "name": "static/js/75.a877b6a8.chunk.js",
+      "path": "C:\\Users\\yoili\\OneDrive\\Documentos\\Work\\NiHaoCloud\\seafile-nihaocloud\\seahub\\frontend\\build\\frontend\\static\\js\\75.a877b6a8.chunk.js"
+    },
+    "static/js/834.cf890565.chunk.js": {
+      "name": "static/js/834.cf890565.chunk.js",
+      "path": "C:\\Users\\yoili\\OneDrive\\Documentos\\Work\\NiHaoCloud\\seafile-nihaocloud\\seahub\\frontend\\build\\frontend\\static\\js\\834.cf890565.chunk.js"
+    },
+    "static/js/862.0ff9f3ae.chunk.js": {
+      "name": "static/js/862.0ff9f3ae.chunk.js",
+      "path": "C:\\Users\\yoili\\OneDrive\\Documentos\\Work\\NiHaoCloud\\seafile-nihaocloud\\seahub\\frontend\\build\\frontend\\static\\js\\862.0ff9f3ae.chunk.js"
+    },
+    "static/js/965.306351b3.chunk.js": {
+      "name": "static/js/965.306351b3.chunk.js",
+      "path": "C:\\Users\\yoili\\OneDrive\\Documentos\\Work\\NiHaoCloud\\seafile-nihaocloud\\seahub\\frontend\\build\\frontend\\static\\js\\965.306351b3.chunk.js"
+    },
+    "static/js/app.98bf5a79.js": {
+      "name": "static/js/app.98bf5a79.js",
+      "path": "C:\\Users\\yoili\\OneDrive\\Documentos\\Work\\NiHaoCloud\\seafile-nihaocloud\\seahub\\frontend\\build\\frontend\\static\\js\\app.98bf5a79.js"
+    },
+    "static/js/app.98bf5a79.js.LICENSE.txt": {
+      "name": "static/js/app.98bf5a79.js.LICENSE.txt",
+      "path": "C:\\Users\\yoili\\OneDrive\\Documentos\\Work\\NiHaoCloud\\seafile-nihaocloud\\seahub\\frontend\\build\\frontend\\static\\js\\app.98bf5a79.js.LICENSE.txt"
+    },
+    "static/js/commons.141444fd.js": {
+      "name": "static/js/commons.141444fd.js",
+      "path": "C:\\Users\\yoili\\OneDrive\\Documentos\\Work\\NiHaoCloud\\seafile-nihaocloud\\seahub\\frontend\\build\\frontend\\static\\js\\commons.141444fd.js"
+    },
+    "static/js/commons.141444fd.js.LICENSE.txt": {
+      "name": "static/js/commons.141444fd.js.LICENSE.txt",
+      "path": "C:\\Users\\yoili\\OneDrive\\Documentos\\Work\\NiHaoCloud\\seafile-nihaocloud\\seahub\\frontend\\build\\frontend\\static\\js\\commons.141444fd.js.LICENSE.txt"
+    },
+    "static/js/draft.4beb7a44.js": {
+      "name": "static/js/draft.4beb7a44.js",
+      "path": "C:\\Users\\yoili\\OneDrive\\Documentos\\Work\\NiHaoCloud\\seafile-nihaocloud\\seahub\\frontend\\build\\frontend\\static\\js\\draft.4beb7a44.js"
+    },
+    "static/js/fileHistory.1247980e.js": {
+      "name": "static/js/fileHistory.1247980e.js",
+      "path": "C:\\Users\\yoili\\OneDrive\\Documentos\\Work\\NiHaoCloud\\seafile-nihaocloud\\seahub\\frontend\\build\\frontend\\static\\js\\fileHistory.1247980e.js"
+    },
+    "static/js/fileHistoryOld.1f42b983.js": {
+      "name": "static/js/fileHistoryOld.1f42b983.js",
+      "path": "C:\\Users\\yoili\\OneDrive\\Documentos\\Work\\NiHaoCloud\\seafile-nihaocloud\\seahub\\frontend\\build\\frontend\\static\\js\\fileHistoryOld.1f42b983.js"
+    },
+    "static/js/fileView.9f4516cc.js": {
+      "name": "static/js/fileView.9f4516cc.js",
+      "path": "C:\\Users\\yoili\\OneDrive\\Documentos\\Work\\NiHaoCloud\\seafile-nihaocloud\\seahub\\frontend\\build\\frontend\\static\\js\\fileView.9f4516cc.js"
+    },
+    "static/js/historyTrashFileView.6b88ef58.js": {
+      "name": "static/js/historyTrashFileView.6b88ef58.js",
+      "path": "C:\\Users\\yoili\\OneDrive\\Documentos\\Work\\NiHaoCloud\\seafile-nihaocloud\\seahub\\frontend\\build\\frontend\\static\\js\\historyTrashFileView.6b88ef58.js"
+    },
+    "static/js/institutionAdmin.8d268656.js": {
+      "name": "static/js/institutionAdmin.8d268656.js",
+      "path": "C:\\Users\\yoili\\OneDrive\\Documentos\\Work\\NiHaoCloud\\seafile-nihaocloud\\seahub\\frontend\\build\\frontend\\static\\js\\institutionAdmin.8d268656.js"
+    },
+    "static/js/markdownEditor.4dc5dca7.js": {
+      "name": "static/js/markdownEditor.4dc5dca7.js",
+      "path": "C:\\Users\\yoili\\OneDrive\\Documentos\\Work\\NiHaoCloud\\seafile-nihaocloud\\seahub\\frontend\\build\\frontend\\static\\js\\markdownEditor.4dc5dca7.js"
+    },
+    "static/js/markdownEditor.4dc5dca7.js.LICENSE.txt": {
+      "name": "static/js/markdownEditor.4dc5dca7.js.LICENSE.txt",
+      "path": "C:\\Users\\yoili\\OneDrive\\Documentos\\Work\\NiHaoCloud\\seafile-nihaocloud\\seahub\\frontend\\build\\frontend\\static\\js\\markdownEditor.4dc5dca7.js.LICENSE.txt"
+    },
+    "static/js/orgAdmin.d36f7606.js": {
+      "name": "static/js/orgAdmin.d36f7606.js",
+      "path": "C:\\Users\\yoili\\OneDrive\\Documentos\\Work\\NiHaoCloud\\seafile-nihaocloud\\seahub\\frontend\\build\\frontend\\static\\js\\orgAdmin.d36f7606.js"
+    },
+    "static/js/orgAdmin.d36f7606.js.LICENSE.txt": {
+      "name": "static/js/orgAdmin.d36f7606.js.LICENSE.txt",
+      "path": "C:\\Users\\yoili\\OneDrive\\Documentos\\Work\\NiHaoCloud\\seafile-nihaocloud\\seahub\\frontend\\build\\frontend\\static\\js\\orgAdmin.d36f7606.js.LICENSE.txt"
+    },
+    "static/js/plainMarkdownEditor.26eaf7f1.js": {
+      "name": "static/js/plainMarkdownEditor.26eaf7f1.js",
+      "path": "C:\\Users\\yoili\\OneDrive\\Documentos\\Work\\NiHaoCloud\\seafile-nihaocloud\\seahub\\frontend\\build\\frontend\\static\\js\\plainMarkdownEditor.26eaf7f1.js"
+    },
+    "static/js/repoFolderTrash.e63a79a3.js": {
+      "name": "static/js/repoFolderTrash.e63a79a3.js",
+      "path": "C:\\Users\\yoili\\OneDrive\\Documentos\\Work\\NiHaoCloud\\seafile-nihaocloud\\seahub\\frontend\\build\\frontend\\static\\js\\repoFolderTrash.e63a79a3.js"
+    },
+    "static/js/repoHistory.550383f7.js": {
+      "name": "static/js/repoHistory.550383f7.js",
+      "path": "C:\\Users\\yoili\\OneDrive\\Documentos\\Work\\NiHaoCloud\\seafile-nihaocloud\\seahub\\frontend\\build\\frontend\\static\\js\\repoHistory.550383f7.js"
+    },
+    "static/js/repoSnapshot.381bdb78.js": {
+      "name": "static/js/repoSnapshot.381bdb78.js",
+      "path": "C:\\Users\\yoili\\OneDrive\\Documentos\\Work\\NiHaoCloud\\seafile-nihaocloud\\seahub\\frontend\\build\\frontend\\static\\js\\repoSnapshot.381bdb78.js"
+    },
+    "static/js/runtime.86db51cf.js": {
+      "name": "static/js/runtime.86db51cf.js",
+      "path": "C:\\Users\\yoili\\OneDrive\\Documentos\\Work\\NiHaoCloud\\seafile-nihaocloud\\seahub\\frontend\\build\\frontend\\static\\js\\runtime.86db51cf.js"
+    },
+    "static/js/sdocFileHistory.b916ab1e.js": {
+      "name": "static/js/sdocFileHistory.b916ab1e.js",
+      "path": "C:\\Users\\yoili\\OneDrive\\Documentos\\Work\\NiHaoCloud\\seafile-nihaocloud\\seahub\\frontend\\build\\frontend\\static\\js\\sdocFileHistory.b916ab1e.js"
+    },
+    "static/js/sdocPublishedRevision.ddec4bc8.js": {
+      "name": "static/js/sdocPublishedRevision.ddec4bc8.js",
+      "path": "C:\\Users\\yoili\\OneDrive\\Documentos\\Work\\NiHaoCloud\\seafile-nihaocloud\\seahub\\frontend\\build\\frontend\\static\\js\\sdocPublishedRevision.ddec4bc8.js"
+    },
+    "static/js/search.6c51b9f4.js": {
+      "name": "static/js/search.6c51b9f4.js",
+      "path": "C:\\Users\\yoili\\OneDrive\\Documentos\\Work\\NiHaoCloud\\seafile-nihaocloud\\seahub\\frontend\\build\\frontend\\static\\js\\search.6c51b9f4.js"
+    },
+    "static/js/settings.df4c385d.js": {
+      "name": "static/js/settings.df4c385d.js",
+      "path": "C:\\Users\\yoili\\OneDrive\\Documentos\\Work\\NiHaoCloud\\seafile-nihaocloud\\seahub\\frontend\\build\\frontend\\static\\js\\settings.df4c385d.js"
+    },
+    "static/js/sharedDirView.ac2ff39b.js": {
+      "name": "static/js/sharedDirView.ac2ff39b.js",
+      "path": "C:\\Users\\yoili\\OneDrive\\Documentos\\Work\\NiHaoCloud\\seafile-nihaocloud\\seahub\\frontend\\build\\frontend\\static\\js\\sharedDirView.ac2ff39b.js"
+    },
+    "static/js/sharedFileViewAudio.2ec74d76.js": {
+      "name": "static/js/sharedFileViewAudio.2ec74d76.js",
+      "path": "C:\\Users\\yoili\\OneDrive\\Documentos\\Work\\NiHaoCloud\\seafile-nihaocloud\\seahub\\frontend\\build\\frontend\\static\\js\\sharedFileViewAudio.2ec74d76.js"
+    },
+    "static/js/sharedFileViewDocument.35bac6cf.js": {
+      "name": "static/js/sharedFileViewDocument.35bac6cf.js",
+      "path": "C:\\Users\\yoili\\OneDrive\\Documentos\\Work\\NiHaoCloud\\seafile-nihaocloud\\seahub\\frontend\\build\\frontend\\static\\js\\sharedFileViewDocument.35bac6cf.js"
+    },
+    "static/js/sharedFileViewImage.bd650551.js": {
+      "name": "static/js/sharedFileViewImage.bd650551.js",
+      "path": "C:\\Users\\yoili\\OneDrive\\Documentos\\Work\\NiHaoCloud\\seafile-nihaocloud\\seahub\\frontend\\build\\frontend\\static\\js\\sharedFileViewImage.bd650551.js"
+    },
+    "static/js/sharedFileViewMarkdown.d28c3ebb.js": {
+      "name": "static/js/sharedFileViewMarkdown.d28c3ebb.js",
+      "path": "C:\\Users\\yoili\\OneDrive\\Documentos\\Work\\NiHaoCloud\\seafile-nihaocloud\\seahub\\frontend\\build\\frontend\\static\\js\\sharedFileViewMarkdown.d28c3ebb.js"
+    },
+    "static/js/sharedFileViewPDF.76b58320.js": {
+      "name": "static/js/sharedFileViewPDF.76b58320.js",
+      "path": "C:\\Users\\yoili\\OneDrive\\Documentos\\Work\\NiHaoCloud\\seafile-nihaocloud\\seahub\\frontend\\build\\frontend\\static\\js\\sharedFileViewPDF.76b58320.js"
+    },
+    "static/js/sharedFileViewSdoc.a4055f7d.js": {
+      "name": "static/js/sharedFileViewSdoc.a4055f7d.js",
+      "path": "C:\\Users\\yoili\\OneDrive\\Documentos\\Work\\NiHaoCloud\\seafile-nihaocloud\\seahub\\frontend\\build\\frontend\\static\\js\\sharedFileViewSdoc.a4055f7d.js"
+    },
+    "static/js/sharedFileViewSpreadsheet.753ec6c4.js": {
+      "name": "static/js/sharedFileViewSpreadsheet.753ec6c4.js",
+      "path": "C:\\Users\\yoili\\OneDrive\\Documentos\\Work\\NiHaoCloud\\seafile-nihaocloud\\seahub\\frontend\\build\\frontend\\static\\js\\sharedFileViewSpreadsheet.753ec6c4.js"
+    },
+    "static/js/sharedFileViewSVG.d8614899.js": {
+      "name": "static/js/sharedFileViewSVG.d8614899.js",
+      "path": "C:\\Users\\yoili\\OneDrive\\Documentos\\Work\\NiHaoCloud\\seafile-nihaocloud\\seahub\\frontend\\build\\frontend\\static\\js\\sharedFileViewSVG.d8614899.js"
+    },
+    "static/js/sharedFileViewText.d2ab5b73.js": {
+      "name": "static/js/sharedFileViewText.d2ab5b73.js",
+      "path": "C:\\Users\\yoili\\OneDrive\\Documentos\\Work\\NiHaoCloud\\seafile-nihaocloud\\seahub\\frontend\\build\\frontend\\static\\js\\sharedFileViewText.d2ab5b73.js"
+    },
+    "static/js/sharedFileViewUnknown.67d00bc7.js": {
+      "name": "static/js/sharedFileViewUnknown.67d00bc7.js",
+      "path": "C:\\Users\\yoili\\OneDrive\\Documentos\\Work\\NiHaoCloud\\seafile-nihaocloud\\seahub\\frontend\\build\\frontend\\static\\js\\sharedFileViewUnknown.67d00bc7.js"
+    },
+    "static/js/sharedFileViewVideo.63110405.js": {
+      "name": "static/js/sharedFileViewVideo.63110405.js",
+      "path": "C:\\Users\\yoili\\OneDrive\\Documentos\\Work\\NiHaoCloud\\seafile-nihaocloud\\seahub\\frontend\\build\\frontend\\static\\js\\sharedFileViewVideo.63110405.js"
+    },
+    "static/js/subscription.b63581d9.js": {
+      "name": "static/js/subscription.b63581d9.js",
+      "path": "C:\\Users\\yoili\\OneDrive\\Documentos\\Work\\NiHaoCloud\\seafile-nihaocloud\\seahub\\frontend\\build\\frontend\\static\\js\\subscription.b63581d9.js"
+    },
+    "static/js/sysAdmin.5658e48f.js": {
+      "name": "static/js/sysAdmin.5658e48f.js",
+      "path": "C:\\Users\\yoili\\OneDrive\\Documentos\\Work\\NiHaoCloud\\seafile-nihaocloud\\seahub\\frontend\\build\\frontend\\static\\js\\sysAdmin.5658e48f.js"
+    },
+    "static/js/sysAdmin.5658e48f.js.LICENSE.txt": {
+      "name": "static/js/sysAdmin.5658e48f.js.LICENSE.txt",
+      "path": "C:\\Users\\yoili\\OneDrive\\Documentos\\Work\\NiHaoCloud\\seafile-nihaocloud\\seahub\\frontend\\build\\frontend\\static\\js\\sysAdmin.5658e48f.js.LICENSE.txt"
+    },
+    "static/js/TCAccept.e482fe30.js": {
+      "name": "static/js/TCAccept.e482fe30.js",
+      "path": "C:\\Users\\yoili\\OneDrive\\Documentos\\Work\\NiHaoCloud\\seafile-nihaocloud\\seahub\\frontend\\build\\frontend\\static\\js\\TCAccept.e482fe30.js"
+    },
+    "static/js/TCView.581dc96f.js": {
+      "name": "static/js/TCView.581dc96f.js",
+      "path": "C:\\Users\\yoili\\OneDrive\\Documentos\\Work\\NiHaoCloud\\seafile-nihaocloud\\seahub\\frontend\\build\\frontend\\static\\js\\TCView.581dc96f.js"
+    },
+    "static/js/uploadLink.1577e4c5.js": {
+      "name": "static/js/uploadLink.1577e4c5.js",
+      "path": "C:\\Users\\yoili\\OneDrive\\Documentos\\Work\\NiHaoCloud\\seafile-nihaocloud\\seahub\\frontend\\build\\frontend\\static\\js\\uploadLink.1577e4c5.js"
+    },
+    "static/js/viewFileDocument.f0f2abc4.js": {
+      "name": "static/js/viewFileDocument.f0f2abc4.js",
+      "path": "C:\\Users\\yoili\\OneDrive\\Documentos\\Work\\NiHaoCloud\\seafile-nihaocloud\\seahub\\frontend\\build\\frontend\\static\\js\\viewFileDocument.f0f2abc4.js"
+    },
+    "static/js/viewFileSdoc.bcd36e70.js": {
+      "name": "static/js/viewFileSdoc.bcd36e70.js",
+      "path": "C:\\Users\\yoili\\OneDrive\\Documentos\\Work\\NiHaoCloud\\seafile-nihaocloud\\seahub\\frontend\\build\\frontend\\static\\js\\viewFileSdoc.bcd36e70.js"
+    },
+    "static/js/viewFileSpreadsheet.994ecffe.js": {
+      "name": "static/js/viewFileSpreadsheet.994ecffe.js",
+      "path": "C:\\Users\\yoili\\OneDrive\\Documentos\\Work\\NiHaoCloud\\seafile-nihaocloud\\seahub\\frontend\\build\\frontend\\static\\js\\viewFileSpreadsheet.994ecffe.js"
+    },
+    "static/js/viewFileText.3f34997c.js": {
+      "name": "static/js/viewFileText.3f34997c.js",
+      "path": "C:\\Users\\yoili\\OneDrive\\Documentos\\Work\\NiHaoCloud\\seafile-nihaocloud\\seahub\\frontend\\build\\frontend\\static\\js\\viewFileText.3f34997c.js"
+    },
+    "static/js/wiki.1c8cb60b.js": {
+      "name": "static/js/wiki.1c8cb60b.js",
+      "path": "C:\\Users\\yoili\\OneDrive\\Documentos\\Work\\NiHaoCloud\\seafile-nihaocloud\\seahub\\frontend\\build\\frontend\\static\\js\\wiki.1c8cb60b.js"
+    }
+  },
+  "chunks": {
+    "app": [
+      "static/js/runtime.86db51cf.js",
+      "static/css/commons.0896cb31.css",
+      "static/js/commons.141444fd.js",
+      "static/css/app.0a6c10b6.css",
+      "static/js/app.98bf5a79.js"
+    ],
+    "draft": [
+      "static/js/runtime.86db51cf.js",
+      "static/css/commons.0896cb31.css",
+      "static/js/commons.141444fd.js",
+      "static/css/draft.22c06bac.css",
+      "static/js/draft.4beb7a44.js"
+    ],
+    "fileHistory": [
+      "static/js/runtime.86db51cf.js",
+      "static/css/commons.0896cb31.css",
+      "static/js/commons.141444fd.js",
+      "static/css/fileHistory.12927620.css",
+      "static/js/fileHistory.1247980e.js"
+    ],
+    "fileHistoryOld": [
+      "static/js/runtime.86db51cf.js",
+      "static/css/commons.0896cb31.css",
+      "static/js/commons.141444fd.js",
+      "static/css/fileHistoryOld.6d426e0b.css",
+      "static/js/fileHistoryOld.1f42b983.js"
+    ],
+    "fileView": [
+      "static/js/runtime.86db51cf.js",
+      "static/css/commons.0896cb31.css",
+      "static/js/commons.141444fd.js",
+      "static/js/fileView.9f4516cc.js"
+    ],
+    "historyTrashFileView": [
+      "static/js/runtime.86db51cf.js",
+      "static/css/commons.0896cb31.css",
+      "static/js/commons.141444fd.js",
+      "static/css/historyTrashFileView.14c233ee.css",
+      "static/js/historyTrashFileView.6b88ef58.js"
+    ],
+    "institutionAdmin": [
+      "static/js/runtime.86db51cf.js",
+      "static/css/commons.0896cb31.css",
+      "static/js/commons.141444fd.js",
+      "static/js/institutionAdmin.8d268656.js"
+    ],
+    "markdownEditor": [
+      "static/js/runtime.86db51cf.js",
+      "static/css/commons.0896cb31.css",
+      "static/js/commons.141444fd.js",
+      "static/css/markdownEditor.aee3ee08.css",
+      "static/js/markdownEditor.4dc5dca7.js"
+    ],
+    "orgAdmin": [
+      "static/js/runtime.86db51cf.js",
+      "static/css/commons.0896cb31.css",
+      "static/js/commons.141444fd.js",
+      "static/css/orgAdmin.eab5f23f.css",
+      "static/js/orgAdmin.d36f7606.js"
+    ],
+    "plainMarkdownEditor": [
+      "static/js/runtime.86db51cf.js",
+      "static/css/commons.0896cb31.css",
+      "static/js/commons.141444fd.js",
+      "static/css/plainMarkdownEditor.1f7f8136.css",
+      "static/js/plainMarkdownEditor.26eaf7f1.js"
+    ],
+    "repoFolderTrash": [
+      "static/js/runtime.86db51cf.js",
+      "static/css/commons.0896cb31.css",
+      "static/js/commons.141444fd.js",
+      "static/css/repoFolderTrash.69b56f7c.css",
+      "static/js/repoFolderTrash.e63a79a3.js"
+    ],
+    "repoHistory": [
+      "static/js/runtime.86db51cf.js",
+      "static/css/commons.0896cb31.css",
+      "static/js/commons.141444fd.js",
+      "static/css/repoHistory.d2c893af.css",
+      "static/js/repoHistory.550383f7.js"
+    ],
+    "repoSnapshot": [
+      "static/js/runtime.86db51cf.js",
+      "static/css/commons.0896cb31.css",
+      "static/js/commons.141444fd.js",
+      "static/css/repoSnapshot.0ee3fb82.css",
+      "static/js/repoSnapshot.381bdb78.js"
+    ],
+    "sdocFileHistory": [
+      "static/js/runtime.86db51cf.js",
+      "static/css/commons.0896cb31.css",
+      "static/js/commons.141444fd.js",
+      "static/css/sdocFileHistory.59c3027a.css",
+      "static/js/sdocFileHistory.b916ab1e.js"
+    ],
+    "sdocPublishedRevision": [
+      "static/js/runtime.86db51cf.js",
+      "static/css/commons.0896cb31.css",
+      "static/js/commons.141444fd.js",
+      "static/js/sdocPublishedRevision.ddec4bc8.js"
+    ],
+    "search": [
+      "static/js/runtime.86db51cf.js",
+      "static/css/commons.0896cb31.css",
+      "static/js/commons.141444fd.js",
+      "static/js/search.6c51b9f4.js"
+    ],
+    "settings": [
+      "static/js/runtime.86db51cf.js",
+      "static/css/commons.0896cb31.css",
+      "static/js/commons.141444fd.js",
+      "static/css/settings.4e24d65d.css",
+      "static/js/settings.df4c385d.js"
+    ],
+    "sharedDirView": [
+      "static/js/runtime.86db51cf.js",
+      "static/css/commons.0896cb31.css",
+      "static/js/commons.141444fd.js",
+      "static/css/sharedDirView.0167fb72.css",
+      "static/js/sharedDirView.ac2ff39b.js"
+    ],
+    "sharedFileViewAudio": [
+      "static/js/runtime.86db51cf.js",
+      "static/css/commons.0896cb31.css",
+      "static/js/commons.141444fd.js",
+      "static/js/sharedFileViewAudio.2ec74d76.js"
+    ],
+    "sharedFileViewDocument": [
+      "static/js/runtime.86db51cf.js",
+      "static/css/commons.0896cb31.css",
+      "static/js/commons.141444fd.js",
+      "static/js/sharedFileViewDocument.35bac6cf.js"
+    ],
+    "sharedFileViewImage": [
+      "static/js/runtime.86db51cf.js",
+      "static/css/commons.0896cb31.css",
+      "static/js/commons.141444fd.js",
+      "static/js/sharedFileViewImage.bd650551.js"
+    ],
+    "sharedFileViewMarkdown": [
+      "static/js/runtime.86db51cf.js",
+      "static/css/commons.0896cb31.css",
+      "static/js/commons.141444fd.js",
+      "static/js/sharedFileViewMarkdown.d28c3ebb.js"
+    ],
+    "sharedFileViewPDF": [
+      "static/js/runtime.86db51cf.js",
+      "static/css/commons.0896cb31.css",
+      "static/js/commons.141444fd.js",
+      "static/js/sharedFileViewPDF.76b58320.js"
+    ],
+    "sharedFileViewSdoc": [
+      "static/js/runtime.86db51cf.js",
+      "static/css/commons.0896cb31.css",
+      "static/js/commons.141444fd.js",
+      "static/js/sharedFileViewSdoc.a4055f7d.js"
+    ],
+    "sharedFileViewSpreadsheet": [
+      "static/js/runtime.86db51cf.js",
+      "static/css/commons.0896cb31.css",
+      "static/js/commons.141444fd.js",
+      "static/css/sharedFileViewSpreadsheet.aea7959b.css",
+      "static/js/sharedFileViewSpreadsheet.753ec6c4.js"
+    ],
+    "sharedFileViewSVG": [
+      "static/js/runtime.86db51cf.js",
+      "static/css/commons.0896cb31.css",
+      "static/js/commons.141444fd.js",
+      "static/js/sharedFileViewSVG.d8614899.js"
+    ],
+    "sharedFileViewText": [
+      "static/js/runtime.86db51cf.js",
+      "static/css/commons.0896cb31.css",
+      "static/js/commons.141444fd.js",
+      "static/js/sharedFileViewText.d2ab5b73.js"
+    ],
+    "sharedFileViewUnknown": [
+      "static/js/runtime.86db51cf.js",
+      "static/css/commons.0896cb31.css",
+      "static/js/commons.141444fd.js",
+      "static/js/sharedFileViewUnknown.67d00bc7.js"
+    ],
+    "sharedFileViewVideo": [
+      "static/js/runtime.86db51cf.js",
+      "static/css/commons.0896cb31.css",
+      "static/js/commons.141444fd.js",
+      "static/js/sharedFileViewVideo.63110405.js"
+    ],
+    "subscription": [
+      "static/js/runtime.86db51cf.js",
+      "static/css/commons.0896cb31.css",
+      "static/js/commons.141444fd.js",
+      "static/css/subscription.39b82133.css",
+      "static/js/subscription.b63581d9.js"
+    ],
+    "sysAdmin": [
+      "static/js/runtime.86db51cf.js",
+      "static/css/commons.0896cb31.css",
+      "static/js/commons.141444fd.js",
+      "static/css/sysAdmin.defb2342.css",
+      "static/js/sysAdmin.5658e48f.js"
+    ],
+    "TCAccept": [
+      "static/js/runtime.86db51cf.js",
+      "static/css/commons.0896cb31.css",
+      "static/js/commons.141444fd.js",
+      "static/css/TCAccept.0abfc181.css",
+      "static/js/TCAccept.e482fe30.js"
+    ],
+    "TCView": [
+      "static/js/runtime.86db51cf.js",
+      "static/css/commons.0896cb31.css",
+      "static/js/commons.141444fd.js",
+      "static/css/TCView.0abfc181.css",
+      "static/js/TCView.581dc96f.js"
+    ],
+    "uploadLink": [
+      "static/js/runtime.86db51cf.js",
+      "static/css/commons.0896cb31.css",
+      "static/js/commons.141444fd.js",
+      "static/css/uploadLink.d59e882a.css",
+      "static/js/uploadLink.1577e4c5.js"
+    ],
+    "viewFileDocument": [
+      "static/js/runtime.86db51cf.js",
+      "static/css/commons.0896cb31.css",
+      "static/js/commons.141444fd.js",
+      "static/js/viewFileDocument.f0f2abc4.js"
+    ],
+    "viewFileSdoc": [
+      "static/js/runtime.86db51cf.js",
+      "static/css/commons.0896cb31.css",
+      "static/js/commons.141444fd.js",
+      "static/js/viewFileSdoc.bcd36e70.js"
+    ],
+    "viewFileSpreadsheet": [
+      "static/js/runtime.86db51cf.js",
+      "static/css/commons.0896cb31.css",
+      "static/js/commons.141444fd.js",
+      "static/css/viewFileSpreadsheet.aea7959b.css",
+      "static/js/viewFileSpreadsheet.994ecffe.js"
+    ],
+    "viewFileText": [
+      "static/js/runtime.86db51cf.js",
+      "static/css/commons.0896cb31.css",
+      "static/js/commons.141444fd.js",
+      "static/js/viewFileText.3f34997c.js"
+    ],
+    "wiki": [
+      "static/js/runtime.86db51cf.js",
+      "static/css/commons.0896cb31.css",
+      "static/js/commons.141444fd.js",
+      "static/css/wiki.253952fd.css",
+      "static/js/wiki.1c8cb60b.js"
+    ]
+  }
+}

@@ -1,0 +1,591 @@
+.table-real-container {
+  height: auto !important;
+  max-height: 20rem !important;
+}
+
+.highlighted-link {
+  border-radius: 5px;
+}
+
+.highlighted-link-p-x {
+  padding: 0 5px;
+}
+
+body .side-nav-footer .highlighted-link,
+body .account-popup .highlighted-link,
+.highlighted-link {
+  color: white !important;
+  background-color: #ec8000 !important;
+  font-weight: bold !important;
+}
+
+.highlight-item {
+  border-left: 3px solid rgb(217, 130, 43) !important;
+  color: inherit !important;
+}
+
+.internal-ad {
+  background-color: #f8f9fa;
+  padding: 10px;
+  border: 1px solid #ccc;
+  border-radius: 5px;
+  margin-bottom: 20px;
+  color: #333333;
+  border-left: 3px solid rgba(217, 130, 43, 0.8);
+}
+
+.internal-ad .fa-exclamation-triangle {
+  color: #ec8000;
+}
+
+/* Versión compacta con color más suave */
+.internal-ad-compact {
+  background-color: #f8f9fb;
+  border-color: #e0e4e8;
+  border-left-color: #94a3b8;
+  padding: 12px 16px;
+  font-size: 13px;
+  position: relative;
+}
+
+.internal-ad-compact .fa-info-circle {
+  color: #64748b;
+  margin-right: 4px;
+}
+
+/* Botón de cerrar */
+.internal-ad-close {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  background: none;
+  border: none;
+  font-size: 20px;
+  color: #94a3b8;
+  cursor: pointer;
+  padding: 4px 8px;
+  line-height: 1;
+  transition: color 0.2s ease;
+}
+
+.internal-ad-close:hover {
+  color: #475569;
+}
+
+.internal-ad-header {
+  color: #475569;
+  font-size: 13px;
+  margin-bottom: 6px;
+}
+
+.internal-ad-text {
+  color: #64748b;
+  font-size: 13px;
+  line-height: 1.5;
+  margin-bottom: 10px;
+}
+
+.internal-ad-text strong {
+  color: #ec8000;
+}
+
+.toast-upgrade-info {
+  color: #333333;
+}
+
+.features-list {
+  list-style-type: none;
+  padding-left: 0;
+  margin-bottom: 16px;
+}
+
+.features-list li {
+  margin-bottom: 8px;
+  padding-left: 4px;
+}
+
+.upgrade-limits-info {
+  background: linear-gradient(135deg, #f8f9fa 0%, #e9ecef 100%);
+  border: 1px solid #dee2e6;
+  border-radius: 8px;
+  padding: 14px 16px;
+  margin-bottom: 12px;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
+}
+
+.upgrade-limits-info p {
+  margin: 0 0 10px 0;
+}
+
+.upgrade-limits-info p:last-child {
+  margin-bottom: 0;
+}
+
+.upgrade-limits-info strong {
+  color: #495057;
+  font-size: 14px;
+}
+
+.limits-comparison {
+  font-size: 13px;
+  line-height: 1.8;
+  margin-top: 8px;
+}
+
+.limit-free {
+  display: block;
+  color: #6c757d;
+  padding: 6px 0;
+  opacity: 0.85;
+}
+
+.limit-pro {
+  display: block;
+  color: #ec8000;
+  font-weight: 600;
+  padding: 6px 0;
+  font-size: 14px;
+}
+
+code {
+  word-break: break-word;
+  white-space: pre-wrap;
+}
+
+/* CHAT - Tema Claro con Branding NiHao */
+
+/* Link del Chat con badge NEW */
+.chat-link-wrapper{
+  position: relative;
+  display: inline-block !important;
+}
+
+.chat-new-badge{
+  position: absolute;
+  top: -6px;
+  right: -18px;
+  display: inline-block;
+  background: linear-gradient(135deg, #ec8000 0%, #ff9500 100%);
+  color: #ffffff;
+  font-size: 8px;
+  font-weight: 700;
+  letter-spacing: 0.2px;
+  padding: 1px 3px;
+  border-radius: 3px;
+  text-transform: uppercase;
+  line-height: 1.3;
+  box-shadow: 0 1px 3px rgba(236, 128, 0, .4);
+  animation: chatBadgePulse 2s ease-in-out infinite;
+  white-space: nowrap;
+}
+
+@keyframes chatBadgePulse {
+  0%, 100% { 
+    transform: scale(1);
+    box-shadow: 0 1px 3px rgba(236, 128, 0, .4);
+  }
+  50% { 
+    transform: scale(1.08);
+    box-shadow: 0 2px 6px rgba(236, 128, 0, .6);
+  }
+}
+
+/* Overlay suave */
+.chat-overlay{
+  position: fixed; inset: 0; background: rgba(0,0,0,.15); z-index: 1040;
+  animation: chatFade .2s ease;
+  backdrop-filter: blur(2px);
+}
+@keyframes chatFade { from{opacity:0} to{opacity:1} }
+
+/* Drawer claro y profesional */
+.chat-drawer{
+  position: fixed; top: 0; right: 0; height: 100vh; width: 440px; max-width: 100vw;
+  background: #ffffff; color: #333333; z-index: 1050;
+  box-shadow: -4px 0 20px rgba(0,0,0,.1);
+  overflow: auto; padding: 0;
+  animation: chatSlide .25s ease;
+  border-left: 3px solid #ec8000;
+  display: flex;
+  flex-direction: column;
+}
+@keyframes chatSlide { from{transform: translateX(24px); opacity:0} to{transform:none; opacity:1} }
+
+/* Botón de cerrar dentro del header */
+.chat-close{ 
+  font-size: 24px; line-height: 1;
+  color: rgba(255,255,255,.9); 
+  background: rgba(255,255,255,.15); 
+  border: 0; cursor: pointer;
+  width: 32px; height: 32px; 
+  display: flex; align-items: center; justify-content: center;
+  border-radius: 6px;
+  transition: all .2s ease;
+  font-weight: 300;
+  flex-shrink: 0;
+  margin-left: 8px;
+}
+.chat-close:hover{ 
+  color: #ffffff; 
+  background: rgba(255,255,255,.25);
+  transform: scale(1.05);
+}
+
+/* Widget con tema claro */
+.zulip-chat { 
+  background: #ffffff; 
+  border: none;
+  border-radius: 0; 
+  overflow: hidden;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+}
+
+/* Header con color naranja y acciones alineadas */
+.zulip-chat__header{ 
+  display: flex; align-items: center; justify-content: space-between; 
+  padding: 20px 24px 16px; 
+  border-bottom: 2px solid #f0f0f0; 
+  background: linear-gradient(135deg, #ec8000 0%, #d97200 100%);
+  color: #ffffff;
+  font-weight: 700;
+  font-size: 18px;
+  flex-shrink: 0;
+}
+
+/* Contenedor de acciones del header (Refresh + Close) */
+.zulip-chat__header-actions{
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* Body con scroll mejorado */
+.zulip-chat__body{ 
+  padding: 0; 
+  flex: 1;
+  overflow-y: auto; 
+  background: #fafafa;
+}
+
+/* Filas de usuarios más espaciosas */
+.zulip-chat__row{ 
+  display: flex; align-items: center; gap: 12px; 
+  padding: 14px 20px;
+  background: #ffffff;
+  transition: background .2s ease;
+}
+.zulip-chat__row:hover{
+  background: #fff8f0;
+}
+.zulip-chat__row + .zulip-chat__row{ 
+  border-top: 1px solid #e8e8e8; 
+}
+
+/* Avatar limpio y moderno */
+.zulip-chat__avatar{ 
+  width: 44px; height: 44px; 
+  border-radius: 50%; 
+  flex: 0 0 44px; 
+  border: 2px solid #f0f0f0;
+  object-fit: cover;
+  transition: border-color .2s ease;
+}
+.zulip-chat__row:hover .zulip-chat__avatar{
+  border-color: #ec8000;
+}
+
+/* Metadata del usuario */
+.zulip-chat__meta{ 
+  flex: 1 1 auto; 
+  min-width: 0; 
+}
+.zulip-chat__name{ 
+  font-weight: 600; 
+  line-height: 1.3; 
+  color: #1a1a1a;
+  font-size: 15px;
+  margin-bottom: 2px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.zulip-chat__you-badge{
+  display: inline-flex;
+  align-items: center;
+  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  color: #ffffff;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  text-transform: uppercase;
+  line-height: 1.2;
+  box-shadow: 0 1px 2px rgba(102, 126, 234, 0.3);
+}
+
+.zulip-chat__email{ 
+  font-size: 13px; 
+  color: #666666; 
+  white-space: nowrap; 
+  overflow: hidden; 
+  text-overflow: ellipsis; 
+}
+
+/* Estado con colores vivos */
+.zulip-chat__status{ 
+  display: inline-flex; 
+  align-items: center; 
+  gap: 6px; 
+  font-size: 12px; 
+  font-weight: 500;
+  color: #555;
+  padding: 4px 10px;
+  border-radius: 12px;
+  background: #f5f5f5;
+}
+
+/* Dots de estado */
+.zulip-chat__dot{ 
+  width: 9px; height: 9px; 
+  border-radius: 50%; 
+  display: inline-block;
+  box-shadow: 0 0 0 2px rgba(255,255,255,.5);
+}
+.zulip-chat__dot.online{ background: #22c55e; }
+.zulip-chat__dot.idle{ background: #f59e0b; }
+.zulip-chat__dot.offline{ background: #9ca3af; }
+.zulip-chat__dot.unknown{ background: #d1d5db; }
+
+/* Botones con estilo moderno */
+.zulip-chat__btn{ 
+  appearance: none; 
+  border: 1px solid #d0d0d0; 
+  background: #ffffff; 
+  color: #555; 
+  padding: 7px 14px; 
+  font-size: 13px; 
+  font-weight: 500;
+  border-radius: 8px; 
+  cursor: pointer;
+  transition: all .2s ease;
+  white-space: nowrap;
+}
+.zulip-chat__btn:hover{ 
+  background: #f8f8f8; 
+  border-color: #b0b0b0;
+}
+.zulip-chat__btn:disabled{
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* Botón primario con color naranja */
+.zulip-chat__btn--primary{ 
+  border-color: #ec8000; 
+  color: #ffffff; 
+  background: linear-gradient(135deg, #ec8000 0%, #d97200 100%);
+  font-weight: 600;
+  box-shadow: 0 2px 4px rgba(236, 128, 0, .2);
+}
+.zulip-chat__btn--primary:hover{ 
+  background: linear-gradient(135deg, #d97200 0%, #c66600 100%);
+  box-shadow: 0 3px 6px rgba(236, 128, 0, .3);
+  transform: translateY(-1px);
+}
+
+/* ================================================== */
+/* CHINA SHARE - Componente de compartir en China    */
+/* ================================================== */
+
+/* Alert informativo para el padre (arriba del panel) */
+.china-info-alert {
+  background: #fff8f0;
+  border: 1px solid #ffd699;
+  border-left: 4px solid #ec8000;
+  border-radius: 6px;
+  padding: 12px 14px;
+  margin-bottom: 16px;
+  position: relative; /* Para posicionar el botón de cerrar */
+}
+
+.china-info-alert-content {
+  width: 100%;
+  padding-right: 30px; /* Espacio para el botón de cerrar */
+}
+
+.china-info-alert-close-btn {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  background: transparent;
+  border: none;
+  font-size: 18px;
+  cursor: pointer;
+  color: #d97e2b;
+  opacity: 0.6;
+  padding: 4px 8px;
+  line-height: 1;
+  transition: opacity 0.2s ease;
+}
+
+.china-info-alert-close-btn:hover {
+  opacity: 1;
+}
+
+.china-info-alert-content strong {
+  color: #ec8000;
+  font-size: 13px;
+  font-weight: 600;
+  margin-bottom: 3px;
+}
+
+.china-info-alert-content p {
+  color: #666;
+  font-size: 12px;
+  line-height: 1.4;
+  margin: 0;
+}
+
+/* Wrapper del componente de China */
+.china-share-wrapper {
+  margin-top: 24px;
+  padding-top: 24px;
+  border-top: 1px solid #e8e8e8;
+}
+
+/* Header simple con título y botón */
+.china-share-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+
+.china-share-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.china-flag-icon {
+  font-size: 20px;
+  line-height: 1;
+}
+
+.china-title-text {
+  color: #ec8000;
+  font-size: 16px;
+  font-weight: 600;
+}
+
+/* Badge contador de links */
+.china-links-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 20px;
+  height: 20px;
+  padding: 0 6px;
+  background: #ec8000;
+  color: #ffffff;
+  font-size: 11px;
+  font-weight: 700;
+  border-radius: 10px;
+  line-height: 1;
+}
+
+/* Botón de toggle minimalista */
+.china-toggle-btn {
+  background: #ffffff;
+  border: 1px solid #ec8000;
+  color: #ec8000;
+  padding: 6px 14px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 500;
+  transition: all 0.2s ease;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.china-toggle-btn:hover {
+  background: #ec8000;
+  color: #ffffff;
+}
+
+/* Mensaje breve informativo */
+.china-share-hint {
+  color: #666;
+  font-size: 12px;
+  line-height: 1.4;
+  margin: 0 0 12px 0;
+  padding-left: 28px;
+}
+
+/* Panel expandible */
+.china-share-panel {
+  padding: 16px 0 0 0;
+  animation: chinaSlideDown 0.3s ease;
+}
+
+@keyframes chinaSlideDown {
+  from {
+    opacity: 0;
+    transform: translateY(-10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* Responsive */
+@media (max-width: 768px) {
+  .china-info-alert {
+    padding: 10px 12px;
+  }
+  
+  .china-info-alert-content strong {
+    font-size: 12px;
+  }
+  
+  .china-info-alert-content p {
+    font-size: 11px;
+  }
+  
+  .china-share-header {
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+  
+  .china-toggle-btn {
+    font-size: 12px;
+    padding: 5px 12px;
+  }
+  
+  .china-share-hint {
+    font-size: 11px;
+    padding-left: 0;
+  }
+}
+
+/* Botón especial para copiar link y password juntos */
+.china-copy-all-btn {
+  background: linear-gradient(135deg, #ec8000 0%, #d97200 100%) !important;
+  border-color: #ec8000 !important;
+  font-weight: 600;
+  box-shadow: 0 2px 4px rgba(236, 128, 0, .2);
+  transition: all .2s ease;
+}
+
+.china-copy-all-btn:hover {
+  background: linear-gradient(135deg, #d97200 0%, #c66600 100%) !important;
+  box-shadow: 0 3px 6px rgba(236, 128, 0, .3);
+  transform: translateY(-1px);
+}

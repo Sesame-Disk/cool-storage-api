@@ -1,0 +1,298 @@
+import React, { Component } from 'react';
+import ReactDom from 'react-dom';
+import { Router, navigate } from '@gatsbyjs/reach-router';
+import MediaQuery from 'react-responsive';
+import { Modal } from 'reactstrap';
+import { siteRoot, canAddRepo } from './utils/constants';
+import { Utils } from './utils/utils';
+import { isAuthenticated } from './utils/seafile-api';
+import LoginPage from './pages/login';
+import SystemNotification from './components/system-notification';
+import SidePanel from './components/side-panel';
+import MainPanel from './components/main-panel';
+import FilesActivities from './pages/dashboard/files-activities';
+import MyFileActivities from './pages/dashboard/my-file-activities';
+import Starred from './pages/starred/starred';
+import LinkedDevices from './pages/linked-devices/linked-devices';
+import ShareAdminLibraries from './pages/share-admin/libraries';
+import ShareAdminFolders from './pages/share-admin/folders';
+import ShareAdminShareLinks from './pages/share-admin/share-links';
+import ShareAdminUploadLinks from './pages/share-admin/upload-links';
+import SharedLibraries from './pages/shared-libs/shared-libs';
+import ShareWithOCM from './pages/share-with-ocm/shared-with-ocm';
+import OCMViaWebdav from './pages/ocm-via-webdav/ocm-via-webdav';
+import OCMRepoDir from './pages/share-with-ocm/remote-dir-view';
+import MyLibraries from './pages/my-libs/my-libs';
+import MyLibDeleted from './pages/my-libs/my-libs-deleted';
+import PublicSharedView from './pages/shared-with-all/public-shared-view';
+import LibContentView from './pages/lib-content-view/lib-content-view';
+import Group from './pages/groups/group-view';
+import Groups from './pages/groups/groups-view';
+import InvitationsView from './pages/invitations/invitations-view';
+import Wikis from './pages/wikis/wikis';
+import MainContentWrapper from './components/main-content-wrapper';
+
+import './css/layout.css';
+import './css/toolbar.css';
+import './css/search.css';
+
+import './services/css.css';
+
+const FilesActivitiesWrapper = MainContentWrapper(FilesActivities);
+const MyFileActivitiesWrapper = MainContentWrapper(MyFileActivities);
+const StarredWrapper = MainContentWrapper(Starred);
+const LinkedDevicesWrapper = MainContentWrapper(LinkedDevices);
+const SharedLibrariesWrapper = MainContentWrapper(SharedLibraries);
+const SharedWithOCMWrapper = MainContentWrapper(ShareWithOCM);
+const OCMViaWebdavWrapper = MainContentWrapper(OCMViaWebdav);
+const ShareAdminLibrariesWrapper = MainContentWrapper(ShareAdminLibraries);
+const ShareAdminFoldersWrapper = MainContentWrapper(ShareAdminFolders);
+
+class App extends Component {
+
+  constructor(props) {
+    super(props);
+    this.state = {
+      isOpen: false,
+      isSidePanelClosed: false,
+      currentTab: '/',
+      pathPrefix: [],
+      isCheckingAuth: true,
+      isLoggedIn: false,
+    };
+    this.dirViewPanels = ['my-libs', 'shared-libs', 'org']; // and group
+    window.onpopstate = this.onpopstate;
+  }
+
+  onpopstate = (event) => {
+    if (event.state && event.state.currentTab && event.state.pathPrefix) {
+      let { currentTab, pathPrefix } = event.state;
+      this.setState({ currentTab, pathPrefix });
+    }
+  };
+
+  UNSAFE_componentWillMount() {
+    if (!Utils.isDesktop()) {
+      this.setState({
+        isSidePanelClosed: true
+      });
+    }
+  }
+
+  navigateClientUrlToLib = () => {
+    if (window.location.hash && window.location.hash.indexOf('common/lib') != -1) {
+      let splitUrlArray = window.location.hash.split('/');
+      let repoID = splitUrlArray[splitUrlArray.length - 2];
+      let url = siteRoot + 'library/' + repoID + '/';
+      navigate(url, { repalce: true });
+    }
+  };
+
+  componentDidMount() {
+    // Check authentication status
+    const loggedIn = isAuthenticated();
+    const isLoginPage = window.location.pathname === '/login/' || window.location.pathname === '/login';
+
+    if (!loggedIn && !isLoginPage) {
+      // Redirect to login if not authenticated
+      window.location.href = '/login/';
+      return;
+    }
+
+    if (loggedIn && isLoginPage) {
+      // Redirect to home if already authenticated and on login page
+      window.location.href = '/';
+      return;
+    }
+
+    this.setState({
+      isCheckingAuth: false,
+      isLoggedIn: loggedIn,
+    });
+
+    if (!loggedIn) {
+      return; // Don't initialize app state for login page
+    }
+
+    // url from client  e.g. http://127.0.0.1:8000/#common/lib/34e7fb92-e91d-499d-bcde-c30ea8af9828/
+    // navigate to library page http://127.0.0.1:8000/library/34e7fb92-e91d-499d-bcde-c30ea8af9828/
+    this.navigateClientUrlToLib();
+
+    // TODO: need refactor later
+    let href = window.location.href.split('/');
+    this.setState({ currentTab: href[href.length - 2] });
+  }
+
+  onCloseSidePanel = () => {
+    this.setState({
+      isSidePanelClosed: !this.state.isSidePanelClosed
+    });
+  };
+
+  onShowSidePanel = () => {
+    this.setState({
+      isSidePanelClosed: !this.state.isSidePanelClosed
+    });
+  };
+
+  onSearchedClick = (selectedItem) => {
+    if (selectedItem.is_dir === true) {
+      this.setState({ currentTab: '', pathPrefix: [] });
+      let url = siteRoot + 'library/' + selectedItem.repo_id + '/' + selectedItem.repo_name + selectedItem.path;
+      navigate(url, { repalce: true });
+    } else {
+      let url = siteRoot + 'lib/' + selectedItem.repo_id + '/file' + Utils.encodePath(selectedItem.path);
+      let isWeChat = Utils.isWeChat();
+      if (!isWeChat) {
+        let newWindow = window.open('about:blank');
+        newWindow.location.href = url;
+      } else {
+        location.href = url;
+      }
+    }
+  };
+
+  onGroupChanged = (groupID) => {
+    setTimeout(function () {
+      let url;
+      if (groupID) {
+        url = siteRoot + 'group/' + groupID + '/';
+      }
+      else {
+        url = siteRoot + 'groups/';
+      }
+      window.location = url.toString();
+    }, 1);
+  };
+
+  tabItemClick = (tabName, groupID) => {
+    let pathPrefix = [];
+    if (groupID || this.dirViewPanels.indexOf(tabName) > -1) {
+      pathPrefix = this.generatorPrefix(tabName, groupID);
+    }
+    this.setState({
+      currentTab: tabName,
+      pathPrefix: pathPrefix
+    }, () => {
+      let { currentTab, pathPrefix } = this.state;
+      window.history.replaceState({ currentTab: currentTab, pathPrefix: pathPrefix }, null);
+    });
+    if (!Utils.isDesktop() && !this.state.isSidePanelClosed) {
+      this.setState({ isSidePanelClosed: true });
+    }
+  };
+
+  generatorPrefix = (tabName, groupID) => {
+    let pathPrefix = [];
+    if (groupID) {
+      let navTab1 = {
+        url: siteRoot + 'groups/',
+        showName: 'Groups',
+        name: 'groups',
+        id: null,
+      };
+      let navTab2 = {
+        url: siteRoot + 'group/' + groupID + '/',
+        showName: tabName,
+        name: tabName,
+        id: groupID,
+      };
+      pathPrefix.push(navTab1);
+      pathPrefix.push(navTab2);
+    } else {
+      let navTab = {
+        url: siteRoot + tabName + '/',
+        showName: this.getTabShowName(tabName),
+        name: tabName,
+        id: null,
+      };
+      pathPrefix.push(navTab);
+    }
+    return pathPrefix;
+  };
+
+  getTabShowName = (tabName) => {
+    if (tabName === 'my-libs') {
+      return 'Libraries';
+    }
+    if (tabName === 'shared-libs') {
+      return 'Shared with me';
+    }
+    if (tabName === 'org') {
+      return 'Shared with all';
+    }
+  };
+
+  toggleSidePanel = () => {
+    this.setState({
+      isSidePanelClosed: !this.state.isSidePanelClosed
+    });
+  };
+
+  render() {
+    let { currentTab, isSidePanelClosed, isCheckingAuth, isLoggedIn } = this.state;
+
+    // Show loading while checking auth
+    if (isCheckingAuth) {
+      return (
+        <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', height: '100vh' }}>
+          <div>Loading...</div>
+        </div>
+      );
+    }
+
+    // Show login page if not authenticated
+    if (!isLoggedIn) {
+      return <LoginPage />;
+    }
+
+    const home = canAddRepo ?
+      <MyLibraries path={siteRoot} onShowSidePanel={this.onShowSidePanel} onSearchedClick={this.onSearchedClick} /> :
+      <SharedLibrariesWrapper path={siteRoot} onShowSidePanel={this.onShowSidePanel} onSearchedClick={this.onSearchedClick} />;
+
+    return (
+      <React.Fragment>
+        <SystemNotification />
+        <div id="main">
+          <SidePanel isSidePanelClosed={this.state.isSidePanelClosed} onCloseSidePanel={this.onCloseSidePanel} currentTab={currentTab} tabItemClick={this.tabItemClick} />
+          <MainPanel>
+            <Router className="reach-router">
+              {home}
+              <FilesActivitiesWrapper path={siteRoot + 'dashboard'} onShowSidePanel={this.onShowSidePanel} onSearchedClick={this.onSearchedClick} />
+              <MyFileActivitiesWrapper path={siteRoot + 'my-activities'} onShowSidePanel={this.onShowSidePanel} onSearchedClick={this.onSearchedClick} />
+              <StarredWrapper path={siteRoot + 'starred'} onShowSidePanel={this.onShowSidePanel} onSearchedClick={this.onSearchedClick} />
+              <LinkedDevicesWrapper path={siteRoot + 'linked-devices'} onShowSidePanel={this.onShowSidePanel} onSearchedClick={this.onSearchedClick} />
+              <ShareAdminLibrariesWrapper path={siteRoot + 'share-admin-libs'} onShowSidePanel={this.onShowSidePanel} onSearchedClick={this.onSearchedClick} />
+              <ShareAdminFoldersWrapper path={siteRoot + 'share-admin-folders'} onShowSidePanel={this.onShowSidePanel} onSearchedClick={this.onSearchedClick} />
+              <ShareAdminShareLinks path={siteRoot + 'share-admin-share-links'} onShowSidePanel={this.onShowSidePanel} onSearchedClick={this.onSearchedClick} />
+              <ShareAdminUploadLinks path={siteRoot + 'share-admin-upload-links'} onShowSidePanel={this.onShowSidePanel} onSearchedClick={this.onSearchedClick} />
+              <SharedLibrariesWrapper path={siteRoot + 'shared-libs'} onShowSidePanel={this.onShowSidePanel} onSearchedClick={this.onSearchedClick} />
+              <SharedWithOCMWrapper path={siteRoot + 'shared-with-ocm'} onShowSidePanel={this.onShowSidePanel} onSearchedClick={this.onSearchedClick} />
+              <OCMViaWebdavWrapper path={siteRoot + 'ocm-via-webdav'} onShowSidePanel={this.onShowSidePanel} onSearchedClick={this.onSearchedClick} />
+              <MyLibraries path={siteRoot + 'my-libs'} onShowSidePanel={this.onShowSidePanel} onSearchedClick={this.onSearchedClick} />
+              <MyLibDeleted path={siteRoot + 'my-libs/deleted/'} onSearchedClick={this.onSearchedClick} />
+              <LibContentView path={siteRoot + 'library/:repoID/*'} pathPrefix={this.state.pathPrefix} onMenuClick={this.onShowSidePanel} onTabNavClick={this.tabItemClick} />
+              <OCMRepoDir path={siteRoot + 'remote-library/:providerID/:repoID/*'} pathPrefix={this.state.pathPrefix} onMenuClick={this.onShowSidePanel} onTabNavClick={this.tabItemClick} />
+              <Groups path={siteRoot + 'groups'} onShowSidePanel={this.onShowSidePanel} onSearchedClick={this.onSearchedClick} />
+              <Group
+                path={siteRoot + 'group/:groupID'}
+                onShowSidePanel={this.onShowSidePanel}
+                onSearchedClick={this.onSearchedClick}
+                onTabNavClick={this.tabItemClick}
+                onGroupChanged={this.onGroupChanged}
+              />
+              <Wikis path={siteRoot + 'published'} onShowSidePanel={this.onShowSidePanel} onSearchedClick={this.onSearchedClick} />
+              <PublicSharedView path={siteRoot + 'org/'} onShowSidePanel={this.onShowSidePanel} onSearchedClick={this.onSearchedClick} onTabNavClick={this.tabItemClick} />
+              <InvitationsView path={siteRoot + 'invitations/'} onShowSidePanel={this.onShowSidePanel} onSearchedClick={this.onSearchedClick} />
+            </Router>
+          </MainPanel>
+          <MediaQuery query="(max-width: 767.8px)">
+            <Modal zIndex="1030" isOpen={!isSidePanelClosed} toggle={this.toggleSidePanel} contentClassName="d-none"></Modal>
+          </MediaQuery>
+        </div>
+      </React.Fragment>
+    );
+  }
+}
+
+ReactDom.render(<App />, document.getElementById('wrapper'));

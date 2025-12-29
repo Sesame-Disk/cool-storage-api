@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="theme-color" content="#000000">
+  <title>SesameFS</title>
+  <link rel="icon" href="%PUBLIC_URL%/favicon.ico">
+</head>
+<body>
+  <div id="wrapper"></div>
+  <div id="root"></div>
+  <!-- Runtime API URL injection - will be replaced by docker-entrypoint.sh in production -->
+  <script>window.SESAMEFS_API_URL = window.SESAMEFS_API_URL || 'http://localhost:8080';</script>
+  <script>
+    // SesameFS configuration - replaces Django template injection
+    // These values are read by src/utils/constants.js
+    window.gettext = function(s) { return s; }; // i18n placeholder
+    window.ngettext = function(s, p, n) { return n === 1 ? s : p; };
+
+    window.app = {
+      config: {
+        // Core URLs - will be overridden by runtime config if available
+        siteRoot: '/',
+        loginUrl: '/login/',
+        serviceURL: window.SESAMEFS_API_URL,
+        fileServerRoot: window.SESAMEFS_API_URL + '/seafhttp',
+        mediaUrl: '/static/',
+
+        // Branding
+        siteTitle: 'SesameFS',
+        siteName: 'SesameFS',
+        logoPath: '/static/img/logo.png',
+        faviconPath: '/static/img/favicon.ico',
+        logoWidth: 150,
+        logoHeight: 40,
+        loginBGPath: '',
+        avatarInfo: { defaultUrl: '/static/img/default-avatar.png' },
+        avatarURL: '/static/img/default-avatar.png',
+
+        // Feature flags - match SesameFS capabilities
+        isPro: 'True',
+        isDocs: 'False',
+        isDBSqlite3: 'False',
+        useGoFileserver: 'True',
+        seafileVersion: '11.0.0',
+        lang: 'en',
+        enableRepoAutoDel: 'False',
+      },
+
+      pageOptions: {
+        // User info - populated after login
+        name: '',
+        username: '',
+        contactEmail: '',
+
+        // Permissions
+        canAddRepo: true,
+        canShareRepo: true,
+        canAddGroup: true,
+        canGenerateShareLink: true,
+        canGenerateUploadLink: true,
+        canSendShareLinkEmail: false,
+        canViewOrg: 'False',
+
+        // Features
+        fileAuditEnabled: false,
+        folderPermEnabled: false,
+        enableResetEncryptedRepoPassword: 'False',
+        isEmailConfigured: 'False',
+        trashReposExpireDays: 30,
+        seafileCollabServer: '',
+        groupImportMembersExtraMsg: '',
+
+        // Upload settings
+        enableUploadFolder: 'True',
+        enableResumableFileUpload: 'True',
+        resumableUploadFileBlockSize: 8 * 1024 * 1024, // 8MB
+        maxUploadFileSize: -1, // unlimited
+        maxNumberOfFilesForFileupload: 1000,
+
+        // Library settings
+        storages: [],
+        libraryTemplates: [],
+        enableRepoSnapshotLabel: false,
+        enableEncryptedLibrary: false,
+        enableRepoHistorySetting: false,
+        repoPasswordMinLength: 8,
+        canAddPublicRepo: false,
+        canPublishRepo: false,
+        canInvitePeople: false,
+        canLockUnlockFile: true,
+        showLogoutIcon: true,
+
+        // Share link settings
+        shareLinkForceUsePassword: false,
+        shareLinkPasswordMinLength: 8,
+        shareLinkPasswordStrengthLevel: 1,
+        shareLinkExpireDaysMin: 0,
+        shareLinkExpireDaysMax: 0,
+        shareLinkExpireDaysDefault: 0,
+        uploadLinkExpireDaysMin: 0,
+        uploadLinkExpireDaysMax: 0,
+        uploadLinkExpireDaysDefault: 0,
+
+        // UI settings
+        maxFileName: 255,
+        thumbnailSizeForOriginal: 1024,
+        customNavItems: [],
+        sideNavFooterCustomHtml: '',
+        aboutDialogCustomHtml: '',
+        enableShowContactEmailWhenSearchUser: false,
+        enableShowLoginIDWhenSearchUser: false,
+        isSystemStaff: false,
+
+        // Integrations
+        enableVideoThumbnail: false,
+        enableOnlyoffice: false,
+        onlyofficeConverterExtensions: [],
+        enableSeafileAI: false,
+        enableSSOToThirdpartWebsite: false,
+        enableTC: false,
+        enableSeaTableIntegration: false,
+        canSetExProps: false,
+
+        // Subscription (Pro features)
+        enableSubscription: false,
+        additionalShareDialogNote: {},
+        additionalAppBottomLinks: [],
+        additionalAboutDialogLinks: [],
+        enableShareToDepartment: false,
+        enableSysAdminViewRepo: false,
+        enableOCM: false,
+        ocmRemoteServers: [],
+        enableOCMViaWebdav: false,
+        enableSeadoc: false,
+
+        // Notifications
+        curNoteMsg: '',
+        curNoteID: '',
+      }
+    };
+
+    // Load runtime config if available (for Docker deployments)
+    if (typeof window.SESAMEFS_CONFIG === 'object') {
+      Object.assign(window.app.config, window.SESAMEFS_CONFIG);
+    }
+  </script>
+</body>
+</html>

@@ -1,0 +1,226 @@
+.pdf-file-view {
+  overflow: hidden;
+  position: relative;
+}
+
+/* for pdf online file view */
+.pdf-file-view.file-view-content {
+  border: 0;
+}
+
+.sf-hide {
+  height: 0;
+  overflow: hidden;
+}
+
+#outerContainer,
+#mainContainer,
+#viewerContainer {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  right: 0;
+}
+
+#viewerContainer {
+  padding: 10px 0 0;
+  overflow: auto;
+  margin-bottom: 33px;
+}
+
+#viewerContainer:focus {
+  outline: none;
+}
+
+.pdfViewer .page {
+  position: relative;
+  background: #fff;
+  border: none;
+  box-shadow: 0 0 6px #ccc;
+  margin: 0 auto 10px;
+}
+
+.page .loading-icon {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+}
+
+/* the following lines overwrite lines from web/viewer.css */
+#toolbarViewerMiddle {
+  left: auto;
+  right: 0;
+  transform: none;
+}
+
+select#scaleSelect {
+  background: #fff;
+  height: 24px;
+  font-size: 12px;
+}
+
+#scaleSelectContainer::after {
+  top: 4px;
+}
+
+/* errorWrapper starts */
+#errorWrapper {
+  background: #ff6e6e;
+  color: #0c0c0d;
+  left: 0;
+  position: absolute;
+  right: 0;
+  /*z-index: 1000;*/
+  z-index: 998; /* for seahub */
+  padding: 3px 6px;
+}
+/* errorWrapper ends */
+
+/* toolbar */
+.toolbar {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  /*z-index: 9999;*/
+  z-index: 998; /* 1048: for seahub 'file view' */
+}
+
+#toolbarContainer {
+  box-shadow: none;
+  border-top: 1px solid #c9c9c9;
+  height: auto;
+}
+
+#loadingBar {
+  position: fixed;
+  top: 50%;
+  width: auto;
+  height: auto;
+  border: 0;
+  background: transparent;
+}
+
+input#pageNumber {
+  font-size: 12px;
+  height: 20px;
+  padding: 0 5px;
+  margin: 0 0 0 9px;
+}
+
+#numPages.toolbarLabel {
+  margin: 0;
+  padding: 0 7px;
+}
+
+/* toolbar ends */
+
+/* sidebar starts */
+#sidebarContainer {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  border-top: none;
+  background: #fff;
+}
+
+#toolbarSidebar {
+  height: auto;
+  background: #fff;
+}
+
+#thumbnailView {
+  width: 100%;
+  padding: 0;
+}
+
+#thumbnails-header {
+}
+
+#thumbnails-header .title {
+  font-size: 1rem;
+}
+
+#thumbnails-header .sf2-icon-x3 {
+  font-family: 'seafile-font2';
+}
+
+#thumbnails-header .close-thumbnail-panel {
+  font-size: 1rem;
+  color: #999;
+}
+
+#thumbnails-header .close-thumbnail-panel:hover {
+  color: #555;
+}
+
+#thumbnailView .thumbnail {
+  float: none;
+  max-width: unset;
+  max-height: unset;
+  width: auto;
+  height: auto;
+  padding: 10px 0;
+  border: none;
+  border-radius: unset;
+  margin: 0 1px 0 0;
+  text-align: center;
+}
+
+#thumbnailView .thumbnail.selected {
+  background: #f0f0f0; 
+}
+
+#thumbnailView .thumbnail .thumbnail-page-number {
+  font-size: .875rem;
+  color: #999;
+  position: absolute;
+  right: 100%;
+  bottom: 0;
+}
+
+#thumbnailView .thumbnail .thumbnailImage {
+  border: 1px solid #ddd;
+  border-radius: 3px;
+}
+
+#thumbnailView .thumbnail.selected .thumbnailImage {
+  border: 2px solid #ff9800;
+}
+
+#sidebarContent {
+  inset-block: 51.5px 0;
+}
+
+.splitToolbarButton > .toolbarButton {
+  float: none;
+}
+/* sidebar ends */
+
+/* overlay, passwordOverlay */
+#overlayContainer {
+  display: table;
+  position: absolute;
+  width: 100%;
+  height: 100%;
+  background-color: rgba(0, 0, 0, 0.2);
+  /*z-index: 40000;*/
+  z-index: 999; /* 1049: for seahub 'share' dialog */
+}
+
+.dirent-info .img .thumbnail {
+  float: none;
+  width: auto;
+  height: auto;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+}
+
+@media print {
+  #wrapper {
+    display: none;
+  }
+}

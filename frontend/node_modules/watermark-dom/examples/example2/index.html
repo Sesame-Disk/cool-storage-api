@@ -1,0 +1,206 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>两边空白</title>
+    <meta name="keywords" content="&#x9879;&#x76EE;&#x5173;&#x952E;&#x8BCD;">
+    <meta name="description" content="&#x9879;&#x76EE;&#x63CF;&#x8FF0;">
+    <script>
+        var sn = sn || {
+                    pageType:['report']
+                }
+    </script>
+    <link rel="stylesheet" href="./assets/css/common.css">
+    <link rel="stylesheet" href="./assets/css/index.css">
+</head>
+<body>
+    <!--#include virtual="component/_header-main.html"-->
+    <section class="yy-wrap w clearfix">
+
+        <!-- 实时报告 [[-->
+        <div class="s-view clearfix">
+            <div class="header-view mb20">
+                <h3> 实时概况 </h3>
+                <div class="chose-data-wrapper">
+                    <div id="currentTime" class="time mt5">
+                        2015/11/20(星期三) 17:15:56
+                    </div>
+                    <div class="date">
+                        <input class="date-selector Wdate" type="text" value="2016-03-02(&#x4ECA;&#x5929;)">
+                        <span class="ml15 mr15">VS</span>
+                        <input class="date-selector Wdate" type="text" value="2016-03-02(&#x4ECA;&#x5929;)">
+                    </div>
+                </div>
+            </div>
+            <div id="mainChartInfo-wrapper" class="fl">
+                <h4>今日付款金额(元)</h4>
+                <div class="curData"></div>
+                <div class="compareData">
+                    <div class="data">
+                        对比期:
+                        <span></span>
+                    </div>
+                    <div class="trend up">
+                        <i></i> <span></span> <em>%</em>
+                    </div>
+                </div>
+            </div>
+            <div id="mainChart" class="fr"></div>
+        </div>
+        <!-- 实时报告 ]]-->
+
+        <!-- 渠道分析 [[-->
+        <div class="channel s-view clearfix">
+            <div class="header-view">
+                <h3> 渠道分析 </h3>
+            </div>
+            <div class="clearfix">
+                <div id="channelChart" class="fl"></div>
+                <div id="channelChartInfo-wrapper" class="fl">
+
+                </div>
+            </div> 
+        </div>
+        <!-- 渠道分析 ]]-->
+        <!-- 品类分析-->
+        <div class="pinlei s-view clearfix">
+            <div class="header-view">
+                <h3>品类分析</h3>
+            </div>
+            <div id="cateTable">
+
+            </div>
+        </div>
+         <!-- 大区分析-->
+        <div class="pinlei s-view clearfix">
+            <div class="header-view">
+                <h3>大区分析</h3>
+            </div>
+            <div id="areaTable">
+
+            </div>
+            <!-- 分页 [[-->
+            <div class="hwj-paginate clearfix">
+                <div class="sn-page">
+                    <a href="#" class="sn-page-prev">
+                        <i class="sn-arrow-right"> &lt; </i>
+                        <span>上一页</span>
+                    </a>
+                    <a href="#" class="sn-page-item">1</a>
+                    <a href="#" class="sn-page-item sn-page-current">
+                        2
+                    </a>
+                    <a href="#" class="sn-page-item">
+                        3
+                    </a>
+                    <a href="#" class="sn-page-item">
+                        4
+                    </a>
+                    <a href="#" class="sn-page-item">
+                        5
+                    </a>
+                    <span class="sn-page-ellipsis">...</span>
+                    <a href="#" class="sn-page-item">50</a>
+                    <a href="#" class="sn-page-next">
+                        <span>下一页</span>
+                        <i class="sn-arrow-left"> &gt; </i>
+                    </a>
+
+          <span class="sn-page-which">
+               向第
+                    <input name="some_name" value="6" type="text">
+               页
+          </span>
+                    <a class="sn-page-info sn-page-goto" href="#">跳转</a>
+                </div>
+            </div>
+            <!-- 分页 ]] -->
+        </div>
+
+
+    </section>
+    <!--#include virtual="component/_footer.html"-->
+
+    <script id="channelDetailChart" type="text/x-jsrender">
+        <table class="data">
+            <tr class="clearfix">
+                <th></th>
+                <th>与对比期比较</th>
+                <th>付款金额</th>
+            </tr>
+            {{for data}}
+            <tr>
+            <tr class="clearfix">
+                <td>{{:name}}</td>
+                <td>
+                    <span class="percent up">{{:percent}}%</span>
+                </td>
+                <td>
+                    <span class="val">{{:valueStr}}</span>
+                    <span class="progress p{{:#index + 1}}"><em data-w="{{:progressWidth}}%"></em></span>
+                    <a href="javascript:;" class="detail" data-index="{{:#index}}"><span class="open">查看详情</span><span class="close">收起详情</span></a>
+                </td>
+            </tr>
+            <tr class="clearfix">
+                <td colspan="3" class="chart-td hide">
+                    <div id="detailChart{{:#index}}" class="chart"></div>
+                    {{if #index==1}}
+                        <div id="detailChart1-2" class="chart"></div>
+                    {{/if}}
+                </td>
+            </tr>
+            {{/for}}
+        </table>
+    </script>
+
+    <script id="percentTableTemp" type="text/x-jsrender">
+        <table class="data">
+            <tr>
+                <th></th>
+                <th>与对比期比较</th>
+                <th>付款金额</th>
+                <th class="cate-name">
+                    <span><em></em>门店</span>
+                    <span class="cate2"><em></em>易购</span>
+                    <span class="cate3"><em></em>天猫</span>
+                </th>
+            </tr>
+            {{for data}}
+            <tr>
+                <td>{{:name}}</td>
+                <td>
+                    <span class="percent up">{{:percent}}</span>
+                </td>
+                <td>
+                    <span class="val">{{:count}}</span>
+                </td>
+                <td class="cate">
+                    <div class="clearfix">
+                        {{for detail ~widths=widths}}
+                           <em class="progress p{{:#index + 1}}" data-w="{{:~widths[#index]}}px"></em><em class="per">{{:#data}}</em>
+                        {{/for}}
+                    </div>
+                </td>
+            </tr>
+            {{/for}}
+        </table>
+    </script>
+
+    <script src="../libs/jquery/dist/jquery.min.js"></script>
+    <script src="../libs/jsrender.min.js"></script>
+    <script src="../libs/echarts/echarts3/echarts.min.js"></script>
+    <script src="./assets/js/countUp.js"></script>
+    <script src="./assets/js/common.js"></script>
+    <script src="./assets/js/index.js"></script>
+    <script src="../../index.js"></script>
+    <script type="text/javascript">
+        watermark.init({
+            watermark_txt: "测试水印",
+            watermark_x_space: 10,
+            watermark_y_space: 20,
+            watermark_parent_node: document.getElementsByClassName('yy-wrap w clearfix')[0]
+        });
+    </script>
+
+</body>
+</html>

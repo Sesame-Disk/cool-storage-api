@@ -1,0 +1,128 @@
+
+/* begin toobar-container */
+.cur-view-toolbar {
+  position: relative;
+  display: flex;
+  flex: 1;
+  align-items: center;
+  height: 32px;
+}
+
+.border-left-show:before {
+  position: absolute;
+  top: 10px;
+  left: -1px;
+  width: 1px;
+  height: 30px;
+  content: '';
+  background-color: #ddd;
+}
+
+/* end toolbar-container */
+
+/* file-operation toolbar eg: edit, upload, new, share*/
+.operation-item  {
+  padding: 0 0.5rem;
+  margin-right: 0.25rem;
+  height: 30px;
+  min-width: 55px;
+  background-color: #fff;
+  line-height: 29px;
+  font-weight: normal;
+  border: 1px solid #ccc;
+  border-radius: 2px;
+}
+
+.group-operations {
+  margin-right: 0.25rem;
+}
+
+.group-operations .group-op-item {
+  padding: 0 0.5rem;
+  height: 30px;
+  min-width: 46px;
+  background-color: #fff;
+  line-height: 29px;
+  font-weight: normal;
+  border: 1px solid #ccc;
+  border-radius: 2px;
+  font-size: 1.125rem;
+}
+/* end file-operation toolbar */
+
+/* begin view-mode toolbar */
+.detail-btn button,
+.sf-view-mode-btn {
+  padding: 0;
+  height: 30px;
+  min-width: 2rem;
+  color: #aaa;
+  background-color: #fff;
+  border: 1px solid #ccc;
+  line-height: 29px;
+  font-size: 18px;
+  border-radius: 2px;
+}
+
+.detail-btn button {
+  font-size: 15px;
+  padding-top: 1px;
+}
+
+.sf-view-mode-btn.current-mode {
+  background-color: #ccc !important;
+  color: #fff !important;
+}
+/* end view-mode toolbar */
+
+/* begin common-toolbar */
+.common-toolbar {
+  display: flex;
+  margin-left: auto;
+  align-items: center;
+}
+
+.common-toolbar > div{
+  margin-left: .5rem;
+}
+
+.common-toolbar .logout-icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  margin-left: 8px;
+  text-decoration: none;
+  color: #ccc;
+}
+/* end common-toolbar */
+
+/* begin path toolbar  */
+.path-toolbar {
+  list-style: none;
+}
+
+.path-toolbar .toolbar-item {
+  display: inline-block;
+  text-align: center;
+  margin-left: 0.75rem;
+}
+
+.path-toolbar .toolbar-item a {
+  color:#8a8a8a;
+  font-size:22px;
+}
+
+
+.path-toolbar .toolbar-item a:hover {
+  color:#eb8205;
+  text-decoration:none;
+}
+/* end path toolbar */
+
+@media (max-width: 767px) {
+  .border-left-show:before {
+    width: 0;
+  }
+}

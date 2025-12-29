@@ -88,6 +88,21 @@ services:
       exit 0;
       "
 
+  # SesameFS Web UI (Seafile-compatible frontend)
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        - SESAMEFS_API_URL=http://localhost:8080
+    ports:
+      - "3000:80"
+    environment:
+      - SESAMEFS_API_URL=http://localhost:8080
+    depends_on:
+      - sesamefs
+    restart: unless-stopped
+
 volumes:
   cassandra_data:
   minio_data:

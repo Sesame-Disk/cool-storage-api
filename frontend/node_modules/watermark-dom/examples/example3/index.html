@@ -1,0 +1,55 @@
+<!doctype html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <meta name="renderer" content="webkit">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
+    <meta http-equiv="X-UA-Compatible" content="IE = edge">
+    <title>iframe测试</title>
+    <link rel="stylesheet" href="../libs/bootstrap/dist/css/bootstrap.min.css">
+    <link rel="stylesheet" href="./css/main.css">
+    <!--[if lte IE 9]>
+        <script src="../libs/html5shiv/dist/html5shiv.min.js"></script>
+    <![endif]-->
+</head>
+<body>
+    <div class="header container-fluid">
+        <a class="logo pull-left" href=""></a>
+        <ul class="tab-main-h pull-left">
+            <li class="item active">导航1</li>
+            <li class="item">导航2</li>
+        </ul>
+        <div class="admin-wrap">
+            欢迎<span id="zg-username">admin</span>,
+            <a href="#" id="zg-logout">注销</a>
+        </div>
+    </div>
+
+    <div class="sidebar pull-left">
+        <ul class="nav">
+            <li class="active">
+                <a href="" class="active"><i class="icon-billing"></i><span class="text-ellipsis">一级菜单</span><i class="fu fu-right"></i></a>
+                <ul class="nav">
+                    <li class="active"><a class="active"><span class="text-ellipsis">二级菜单</span></a></li>
+                </ul>
+            </li>        
+        </ul>
+    </div>
+
+
+    <div class="main">
+        <iframe src="iframe.html" width="100%" height="2000px" frameborder="0" id="iframeH"></iframe>
+    </div>
+
+    <script src="../libs/jquery/dist/jquery.min.js"></script>
+    <script src="../../index.js"></script>
+    <script type="text/javascript">
+        watermark.init({ 
+            watermark_txt: "测试水印",
+            watermark_parent_height: 2000,
+
+            watermark_parent_node: document.getElementsByClassName('main')[0]
+        });
+    </script>
+</body>
+</html>

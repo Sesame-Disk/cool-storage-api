@@ -18,6 +18,12 @@ type Config struct {
 	Chunking   ChunkingConfig   `yaml:"chunking"`
 	Versioning VersioningConfig `yaml:"versioning"`
 	SeafHTTP   SeafHTTPConfig   `yaml:"seafhttp"`
+	CORS       CORSConfig       `yaml:"cors"`
+}
+
+// CORSConfig holds CORS settings for frontend access
+type CORSConfig struct {
+	AllowedOrigins []string `yaml:"allowed_origins"`
 }
 
 // SeafHTTPConfig holds Seafile-compatible file transfer settings

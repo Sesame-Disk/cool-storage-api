@@ -7,11 +7,13 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/Sesame-Disk/sesamefs/internal/api/v2"
 	"github.com/Sesame-Disk/sesamefs/internal/config"
 	"github.com/Sesame-Disk/sesamefs/internal/db"
 	"github.com/Sesame-Disk/sesamefs/internal/storage"
+	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
 )
 
@@ -43,6 +45,25 @@ func NewServer(cfg *config.Config, database *db.DB) *Server {
 
 	router.Use(gin.Recovery())
 	router.Use(gin.Logger())
+
+	// CORS middleware for frontend access
+	corsConfig := cors.Config{
+		AllowMethods:     []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
+		AllowHeaders:     []string{"Origin", "Content-Type", "Accept", "Authorization", "Seafile-Repo-Token"},
+		ExposeHeaders:    []string{"Content-Length", "Content-Type"},
+		AllowCredentials: true,
+		MaxAge:           12 * time.Hour,
+	}
+	// In dev mode, allow all origins; in production, use configured origins
+	if cfg.Auth.DevMode {
+		corsConfig.AllowAllOrigins = true
+	} else if len(cfg.CORS.AllowedOrigins) > 0 {
+		corsConfig.AllowOrigins = cfg.CORS.AllowedOrigins
+	} else {
+		// Default to allowing all origins if not configured
+		corsConfig.AllowAllOrigins = true
+	}
+	router.Use(cors.New(corsConfig))
 
 	// Initialize storage manager with multi-backend support
 	storageManager := initStorageManager(cfg)

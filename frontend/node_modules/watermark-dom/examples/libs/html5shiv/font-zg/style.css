@@ -1,0 +1,108 @@
+@font-face {
+  font-family: 'zg';
+  src:  url('fonts/zg.eot?tzz4gy');
+  src:  url('fonts/zg.eot?tzz4gy#iefix') format('embedded-opentype'),
+    url('fonts/zg.ttf?tzz4gy') format('truetype'),
+    url('fonts/zg.woff?tzz4gy') format('woff'),
+    url('fonts/zg.svg?tzz4gy#zg') format('svg');
+  font-weight: normal;
+  font-style: normal;
+}
+
+[class^="icon-"], [class*=" icon-"] {
+  /* use !important to prevent issues with browser extensions that change fonts */
+  font-family: 'zg' !important;
+  speak: none;
+  font-style: normal;
+  font-weight: normal;
+  font-variant: normal;
+  text-transform: none;
+  line-height: 1;
+
+  /* Better Font Rendering =========== */
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+.icon-drill:before {
+  content: "\e9d9";
+}
+.icon-up:before {
+  content: "\e900";
+}
+.icon-down:before {
+  content: "\e901";
+}
+.icon-left:before {
+  content: "\e902";
+}
+.icon-right:before {
+  content: "\e903";
+}
+.icon-question-circle-o:before {
+  content: "\e90c";
+}
+.icon-question-circle:before {
+  content: "\e90d";
+}
+.icon-info-circle-o:before {
+  content: "\e90e";
+}
+.icon-info-circle:before {
+  content: "\e90f";
+}
+.icon-cross-circle-o:before {
+  content: "\e910";
+}
+.icon-cross-circle:before {
+  content: "\e911";
+}
+.icon-check-circle-o:before {
+  content: "\e912";
+}
+.icon-check-circle:before {
+  content: "\e913";
+}
+.icon-exclamation-circle-o:before {
+  content: "\e914";
+}
+.icon-exclamation-circle:before {
+  content: "\e915";
+}
+.icon-check:before {
+  content: "\e916";
+}
+.icon-cross:before {
+  content: "\e917";
+}
+.icon-ssh:before {
+  content: "\e964";
+}
+.icon-payments:before {
+  content: "\e96d";
+}
+.icon-billing:before {
+  content: "\e96e";
+}
+.icon-account1:before {
+  content: "\e97a";
+}
+.icon-bigdata:before {
+  content: "\e9ae";
+}
+.icon-promotion-management:before {
+  content: "\e9b2";
+}
+.icon-data-growth:before {
+  content: "\e9b6";
+}
+.icon-resource-management1:before {
+  content: "\e9bd";
+}
+.icon-script-upgrade:before {
+  content: "\e9be";
+}
+.icon-system-management:before {
+  content: "\e9c4";
+}
+

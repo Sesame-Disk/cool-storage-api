@@ -1,0 +1,92 @@
+.divAds {
+    display: block;
+}
+
+.divAds img {
+    max-width: 100%;
+    height: auto !important;
+    margin: 0;
+    padding: 0;
+}
+
+.divAds p {
+    padding: 0;
+    margin: 0;
+    word-wrap: break-word;
+}
+
+.center-ads {
+    text-align: center;
+}
+
+.adsense-library {
+    width: 400px;
+    margin-top: 25px;
+    text-align: center;
+    text-align: -moz-center;
+    text-align: -webkit-center;
+}
+
+@media only screen and (max-width: 1440px) {
+    .adsense-library {
+        width: 250px !important;
+        height: auto;
+        margin-top: 25px;
+        text-align: center;
+        text-align: -moz-center;
+        text-align: -webkit-center;
+    }
+
+    .shared-dir-view-main {
+        max-width: 865px !important;
+    }
+}
+
+@media only screen and (max-width: 1280px) {
+    .adsense-library {
+        width: 250px !important;
+        height: auto;
+        margin-top: 25px;
+        text-align: center;
+        text-align: -moz-center;
+        text-align: -webkit-center;
+    }
+
+    .shared-dir-view-main {
+        max-width: 780px !important;
+    }
+}
+
+
+@media only screen and (max-width: 800px) {
+    .adsense-library {
+        width: 700px !important;
+        height: auto;
+        margin-top: 10px;
+        text-align: center;
+        text-align: -moz-center;
+        text-align: -webkit-center;
+    }
+}
+
+@media only screen and (max-width: 375px) {
+    .adsense-library {
+        width: 375px !important;
+        height: auto;
+        margin-top: 5px;
+        text-align: center;
+        text-align: -moz-center;
+        text-align: -webkit-center;
+    }
+}
+
+@media only screen and (max-width: 360px) {
+    .adsense-library {
+        width: 360px !important;
+        height: auto;
+        margin-top: 5px;
+        text-align: center;
+        text-align: -moz-center;
+        text-align: -webkit-center;
+    }
+}

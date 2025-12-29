@@ -1,0 +1,66 @@
+#wrapper {
+  height: 100%;
+}
+
+.shared-file-view-md {
+  height: 100%;
+  overflow-y: hidden;
+}
+
+.shared-file-view-md-header {
+  background: #f4f4f7;
+  height: 53px;
+  border-bottom: 1px solid #e8e8e8;
+  padding: 8px 16px 4px;
+  justify-content: space-between;
+}
+
+.shared-file-view-md-main {
+  height: calc(100% - 53px);
+}
+
+.shared-file-view-head {
+  width: 950px;
+  height: 60px;
+  background: #fff;
+  margin: 0 auto;
+  display: flex;
+  align-items:center;
+  justify-content: space-between;
+}
+
+.shared-file-view-head h2 {
+  color: #222;
+  font-size: 1.4em;
+  margin-bottom: 0px;
+  font-weight: 400;
+}
+
+.shared-file-view-head .share-by {
+  margin: 0;
+}
+
+.shared-file-view-body {
+  height: calc(100% - 60px);
+  padding: 30px 0 15px;
+  background: #f4f4f4;
+  border: 1px solid #ededed;
+  overflow: auto;
+}
+
+.shared-file-view-body.md-view {
+  padding: 0;
+  display: flex;
+  min-height: 0;
+}
+
+.shared-file-view-body .sf-slate-viewer-outline {
+  top: 145px !important;
+}
+
+@media (max-width: 991.98px) {
+  .shared-file-view-head {
+    width: 100%;
+    padding: 10px 20px;
+  }
+}
