@@ -976,6 +976,45 @@ The original prototype code has been archived in `_legacy/` for reference:
 
 ---
 
+## Web UI (Frontend)
+
+SesameFS includes a web interface extracted from Seafile Pro (Seahub), modified to work as a standalone React SPA.
+
+### Quick Start
+
+```bash
+# Start backend
+./scripts/bootstrap.sh dev
+
+# In another terminal, start frontend
+cd frontend
+npm ci --legacy-peer-deps
+npm start
+
+# Open http://localhost:3001
+# Login: admin@sesamefs.local / dev-token-123
+```
+
+### Docker Deployment
+
+```bash
+# Build and run with docker-compose
+docker-compose up --build
+
+# Frontend: http://localhost:3000
+# Backend:  http://localhost:8080
+```
+
+### Key Features
+- Token-based authentication (no Django/CSRF)
+- Standalone SPA build
+- Configurable API URL via environment
+- Works with existing Seafile desktop clients
+
+See [docs/FRONTEND-SETUP.md](docs/FRONTEND-SETUP.md) for detailed setup guide.
+
+---
+
 ## Documentation
 
 - [API Roadmap](docs/API-ROADMAP.md) - Pending endpoints organized by implementation phase
@@ -983,6 +1022,7 @@ The original prototype code has been archived in `_legacy/` for reference:
 - [Multi-Region Testing](docs/MULTIREGION-TESTING.md) - Testing guide for multi-region setup
 - [Migration from Seafile](docs/MIGRATION-FROM-SEAFILE.md) - Step-by-step migration with minimal downtime
 - [Seafile API Compatibility](docs/SEAFILE_COMPATIBILITY.md) - How the Seafile-compatible API works
+- [Frontend Setup](docs/FRONTEND-SETUP.md) - Web UI extraction and configuration
 - [Licensing Guide](docs/LICENSING.md) - Legal considerations for using and distributing SesameFS
 
 ---

@@ -53,3 +53,13 @@ todo-mysql-data/
 upload/
 download/
 .seafile-reference.md
+
+# Frontend
+frontend/node_modules/
+frontend/build/
+frontend/.env
+frontend/.env.local
+frontend/.env.*.local
+frontend/npm-debug.log*
+frontend/yarn-debug.log*
+frontend/yarn-error.log*
