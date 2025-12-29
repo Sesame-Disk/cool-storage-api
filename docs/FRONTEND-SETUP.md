@@ -335,14 +335,84 @@ corsConfig := cors.Config{
 - Run `npm ci --legacy-peer-deps` to install dependencies
 - Check Node.js version (18+ required)
 
+## CSS & Styling Architecture
+
+The frontend uses multiple CSS layers for proper styling:
+
+### CSS Load Order (Important!)
+
+1. **Bootstrap 4** (`bootstrap/dist/css/bootstrap.min.css`)
+   - Required by reactstrap components (dropdowns, modals, buttons)
+   - Imported in `src/app.js`
+
+2. **Seahub Base Styles** (`public/static/css/seahub.css`)
+   - Base Seafile styles (links, buttons, layout)
+   - Link colors (#eb8205 orange)
+   - Loaded via `public/index.html`
+
+3. **Icon Fonts**
+   - `sf_font2/seafile-font2.css` - sf2-icon-* classes
+   - `sf_font3/iconfont.css` - sf3-font-* classes
+   - `fontawesome/css/fontawesome-all.min.css` - Font Awesome icons
+
+4. **Component CSS** (in src/css/)
+   - layout.css, toolbar.css, side-panel.css, etc.
+
+5. **SesameFS Overrides** (`src/services/css.css`)
+   - Custom fixes for Bootstrap conflicts
+   - Sidebar header sizing
+   - Action icon layout
+
+### Static Assets (from Seahub)
+
+Copy these from Seahub source (`seahub/media/`) to `public/static/`:
+
+```bash
+# Icon fonts
+cp -r seahub/media/css/sf_font2/ frontend/public/static/css/
+cp -r seahub/media/css/sf_font3/ frontend/public/static/css/
+cp -r seahub/media/fontawesome/ frontend/public/static/
+
+# Library icons
+cp -r seahub/media/img/lib/ frontend/public/static/img/
+
+# File type icons
+cp -r seahub/media/img/file/ frontend/public/static/img/
+
+# Base styles
+cp seahub/media/css/seahub.css frontend/public/static/css/
+```
+
+### Common Style Issues & Fixes
+
+| Issue | Cause | Fix |
+|-------|-------|-----|
+| Links not styled | Missing seahub.css | Add `<link>` in index.html |
+| Icons missing | Missing font files | Copy sf_font2, sf_font3 folders |
+| Dropdowns broken | Missing Bootstrap | `npm install bootstrap@4.6.2` and import in app.js |
+| Sidebar headers large | Bootstrap h3 override | Add `.sf-heading` style in services/css.css |
+| Action icons stacked | Bootstrap block styles | Add inline-block override in services/css.css |
+
 ## File Structure
 
 ```
 frontend/
 ├── public/
-│   └── index.html          # Standalone HTML with window.app config
+│   ├── index.html          # Standalone HTML with window.app config
+│   └── static/
+│       ├── css/
+│       │   ├── seahub.css  # Seafile base styles
+│       │   ├── sf_font2/   # Icon font (sf2-icon-*)
+│       │   └── sf_font3/   # Icon font (sf3-font-*)
+│       ├── fontawesome/    # Font Awesome icons
+│       └── img/
+│           ├── lib/        # Library icons (24/, 48/, 256/)
+│           └── file/       # File type icons (24/, 192/)
 ├── src/
-│   ├── app.js              # Main app with auth routing
+│   ├── app.js              # Main app with auth routing, Bootstrap import
+│   ├── css/                # Component-specific styles
+│   ├── services/
+│   │   └── css.css         # SesameFS custom overrides
 │   ├── pages/
 │   │   └── login/          # Login page component
 │   └── utils/
@@ -358,12 +428,46 @@ frontend/
 └── .eslintrc.js            # ESLint config
 ```
 
+## API Implementation Status
+
+| Endpoint | Status | Notes |
+|----------|--------|-------|
+| `POST /api2/auth-token/` | ✅ Working | Dev mode accepts configured tokens |
+| `GET /api/v2.1/repos/` | ✅ Working | Web UI format (repo_id, repo_name) |
+| `GET /api2/repos/` | ✅ Working | CLI format (id, name) |
+| `GET /api2/repos/:id/dir/` | ✅ Working | Reads from fs_objects tree |
+| `POST /api2/repos/:id/upload-link/` | ✅ Working | Returns upload URL |
+| `GET /api2/repos/:id/file/download-link/` | ✅ Working | Returns download URL |
+| `DELETE /api2/repos/:id/file/` | 🔄 Stub | Returns success, no commit |
+| `POST /api2/repos/:id/file/move/` | 🔄 Stub | Not implemented |
+| `POST /api2/repos/:id/dir/` | 🔄 Stub | Returns success, no commit |
+
+## Responsiveness
+
+The Seahub frontend has limited mobile responsiveness:
+
+- Uses `react-responsive` MediaQuery for layout switching
+- Mobile view (< 768px) shows slide-out menu
+- Some components have mobile-specific renders
+
+**Improving responsiveness would require:**
+1. CSS media queries for better breakpoints
+2. Touch-friendly interactions
+3. Responsive tables/grids
+4. Mobile-optimized dialogs
+
 ## Future Improvements
 
-- [ ] Add proper logo and branding images
-- [ ] Implement proper user info display after login
+- [x] Add proper logo and branding images
+- [x] Fix icon fonts (sf2-icon, sf3-font)
+- [x] Add Bootstrap CSS for reactstrap
+- [x] Fix sidebar header styling
+- [x] Fix action icon layout
+- [x] Implement directory listing from fs_objects
 - [ ] Add logout button functionality
-- [ ] Style improvements for login page
-- [ ] Add loading states and error handling
+- [ ] Implement file delete with commits
+- [ ] Implement file move/copy
+- [ ] Add proper error handling
 - [ ] Implement share link functionality
 - [ ] Add file preview support
+- [ ] Improve mobile responsiveness

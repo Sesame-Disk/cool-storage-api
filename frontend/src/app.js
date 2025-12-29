@@ -32,6 +32,9 @@ import InvitationsView from './pages/invitations/invitations-view';
 import Wikis from './pages/wikis/wikis';
 import MainContentWrapper from './components/main-content-wrapper';
 
+// Bootstrap CSS (required for reactstrap components)
+import 'bootstrap/dist/css/bootstrap.min.css';
+
 import './css/layout.css';
 import './css/toolbar.css';
 import './css/search.css';

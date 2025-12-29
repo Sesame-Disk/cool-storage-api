@@ -1,3 +1,42 @@
+/* ================================================== */
+/* SesameFS Custom Overrides                          */
+/* ================================================== */
+
+/* Fix sidebar headers (Files, Tools) being too large due to Bootstrap h3 */
+.sf-heading {
+  font-size: 14px !important;
+  font-weight: 600 !important;
+  color: #333 !important;
+  margin: 0.5rem 1rem !important;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+/* Fix action icons appearing on multiple lines */
+td > div > .op-icon,
+td > div > .dropdown {
+  display: inline-block !important;
+  vertical-align: middle !important;
+}
+
+td > div > .op-icon {
+  margin-right: 8px;
+}
+
+/* Ensure dropdown toggle icon is inline */
+.sf-dropdown-toggle {
+  display: inline-block !important;
+  vertical-align: middle !important;
+  cursor: pointer;
+}
+
+/* Fix dropdown menu positioning */
+.dropdown-menu {
+  z-index: 1050;
+}
+
+/* ================================================== */
+
 .table-real-container {
   height: auto !important;
   max-height: 20rem !important;

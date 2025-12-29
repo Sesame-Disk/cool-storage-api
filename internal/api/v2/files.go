@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"path"
 	"path/filepath"
@@ -38,6 +40,23 @@ type Dirent struct {
 	ModifierEmail string `json:"modifier_email,omitempty"`
 	ModifierName  string `json:"modifier_name,omitempty"`
 }
+
+// FSEntry represents a directory entry stored in fs_objects.dir_entries
+// This matches the Seafile format for directory entries
+type FSEntry struct {
+	Name     string `json:"name"`
+	ID       string `json:"id"`       // FS object ID (40 char hex)
+	Mode     int    `json:"mode"`     // Unix file mode (33188 = regular file, 16384 = directory)
+	MTime    int64  `json:"mtime"`    // Unix timestamp
+	Size     int64  `json:"size,omitempty"`
+	Modifier string `json:"modifier,omitempty"`
+}
+
+// ModeFile is the Unix mode for a regular file (0100644)
+const ModeFile = 33188
+
+// ModeDir is the Unix mode for a directory (040000)
+const ModeDir = 16384
 
 // FileHandler handles file-related API requests
 type FileHandler struct {
@@ -94,6 +113,7 @@ func RegisterFileRoutes(rg *gin.RouterGroup, database *db.DB, cfg *config.Config
 
 // ListDirectory returns the contents of a directory
 // Implements Seafile API: GET /api2/repos/:repo_id/dir/?p=/path
+// Reads from fs_objects for proper Seafile compatibility
 func (h *FileHandler) ListDirectory(c *gin.Context) {
 	repoID := c.Param("repo_id")
 	dirPath := c.DefaultQuery("p", "/")
@@ -104,12 +124,11 @@ func (h *FileHandler) ListDirectory(c *gin.Context) {
 
 	// Check if database is available
 	if h.db == nil {
-		// Return empty directory if no database
 		c.JSON(http.StatusOK, []Dirent{})
 		return
 	}
 
-	// Get library to verify access (use strings for UUID binding)
+	// Get library's head_commit_id
 	var libID, headCommitID string
 	err := h.db.Session().Query(`
 		SELECT library_id, head_commit_id FROM libraries
@@ -120,62 +139,127 @@ func (h *FileHandler) ListDirectory(c *gin.Context) {
 		return
 	}
 
-	// Build S3 prefix for directory listing
-	// Storage key format: {org_id}/{repo_id}{path}
-	prefix := fmt.Sprintf("%s/%s", orgID, repoID)
-	if dirPath != "/" {
-		prefix = prefix + dirPath
-	}
-	// Ensure prefix ends with / for directory listing
-	if !strings.HasSuffix(prefix, "/") {
-		prefix = prefix + "/"
+	// If no head commit, return empty directory
+	if headCommitID == "" {
+		c.JSON(http.StatusOK, []Dirent{})
+		return
 	}
 
-	// List files from S3 if storage is available
-	var direntList []Dirent
-	if h.storage != nil {
-		objects, err := h.storage.List(c.Request.Context(), prefix, "/")
-		if err != nil {
-			// Log error but return empty list (not a fatal error)
+	// Get root_fs_id from the head commit
+	var rootFSID string
+	err = h.db.Session().Query(`
+		SELECT root_fs_id FROM commits
+		WHERE library_id = ? AND commit_id = ?
+	`, repoID, headCommitID).Scan(&rootFSID)
+	if err != nil {
+		log.Printf("ListDirectory: failed to get commit %s: %v", headCommitID, err)
+		c.JSON(http.StatusOK, []Dirent{})
+		return
+	}
+
+	// Traverse from root to requested path
+	currentFSID := rootFSID
+	if dirPath != "/" {
+		// Split path into components and traverse
+		parts := strings.Split(strings.Trim(dirPath, "/"), "/")
+		for _, part := range parts {
+			if part == "" {
+				continue
+			}
+
+			// Get current directory's entries
+			var entriesJSON string
+			err = h.db.Session().Query(`
+				SELECT dir_entries FROM fs_objects
+				WHERE library_id = ? AND fs_id = ?
+			`, repoID, currentFSID).Scan(&entriesJSON)
+			if err != nil {
+				log.Printf("ListDirectory: failed to get fs_object %s: %v", currentFSID, err)
+				c.JSON(http.StatusNotFound, gin.H{"error": "directory not found"})
+				return
+			}
+
+			// Parse entries and find the next component
+			var entries []FSEntry
+			if entriesJSON != "" && entriesJSON != "[]" {
+				if err := json.Unmarshal([]byte(entriesJSON), &entries); err != nil {
+					log.Printf("ListDirectory: failed to parse entries for %s: %v", currentFSID, err)
+					c.JSON(http.StatusInternalServerError, gin.H{"error": "invalid directory data"})
+					return
+				}
+			}
+
+			// Find the child directory
+			found := false
+			for _, entry := range entries {
+				if entry.Name == part {
+					// Check if it's a directory (mode & 0170000 == 040000 for dirs)
+					if entry.Mode&0170000 == 040000 || entry.Mode == ModeDir {
+						currentFSID = entry.ID
+						found = true
+						break
+					} else {
+						// Path component is not a directory
+						c.JSON(http.StatusBadRequest, gin.H{"error": "path is not a directory"})
+						return
+					}
+				}
+			}
+
+			if !found {
+				c.JSON(http.StatusNotFound, gin.H{"error": "directory not found"})
+				return
+			}
+		}
+	}
+
+	// Get the target directory's entries
+	var entriesJSON string
+	err = h.db.Session().Query(`
+		SELECT dir_entries FROM fs_objects
+		WHERE library_id = ? AND fs_id = ?
+	`, repoID, currentFSID).Scan(&entriesJSON)
+	if err != nil {
+		log.Printf("ListDirectory: failed to get target fs_object %s: %v", currentFSID, err)
+		c.JSON(http.StatusOK, []Dirent{})
+		return
+	}
+
+	// Parse entries
+	var entries []FSEntry
+	if entriesJSON != "" && entriesJSON != "[]" {
+		if err := json.Unmarshal([]byte(entriesJSON), &entries); err != nil {
+			log.Printf("ListDirectory: failed to parse target entries for %s: %v", currentFSID, err)
 			c.JSON(http.StatusOK, []Dirent{})
 			return
 		}
-
-		for _, obj := range objects {
-			// Extract the name from the key (remove prefix)
-			name := strings.TrimPrefix(obj.Key, prefix)
-			// Remove trailing slash from directory names
-			name = strings.TrimSuffix(name, "/")
-
-			if name == "" {
-				continue // Skip the directory itself
-			}
-
-			fileType := "file"
-			if obj.IsDirectory {
-				fileType = "dir"
-			}
-
-			// Generate a deterministic ID based on path
-			// In a full implementation, this would come from fs_objects
-			objPath := path.Join(dirPath, name)
-			id := generatePathID(orgID, repoID, objPath)
-
-			direntList = append(direntList, Dirent{
-				ID:         id,
-				Name:       name,
-				Type:       fileType,
-				Size:       obj.Size,
-				MTime:      obj.LastModified.Unix(),
-				Permission: "rw", // Default to read-write
-				ParentDir:  dirPath,
-			})
-		}
 	}
 
-	// Return empty array instead of null
-	if direntList == nil {
-		direntList = []Dirent{}
+	// Convert FSEntry to Dirent for API response
+	direntList := make([]Dirent, 0, len(entries))
+	for _, entry := range entries {
+		// Determine type from mode
+		fileType := "file"
+		if entry.Mode&0170000 == 040000 || entry.Mode == ModeDir {
+			fileType = "dir"
+		}
+
+		dirent := Dirent{
+			ID:         entry.ID,
+			Name:       entry.Name,
+			Type:       fileType,
+			Size:       entry.Size,
+			MTime:      entry.MTime,
+			Permission: "rw",
+			ParentDir:  dirPath,
+		}
+
+		// Add modifier if available
+		if entry.Modifier != "" {
+			dirent.ModifierEmail = entry.Modifier
+		}
+
+		direntList = append(direntList, dirent)
 	}
 
 	// Seafile API /api2/repos/:id/dir/ always returns flat array
