@@ -65,8 +65,8 @@ checkBrowsers(paths.appPath, isInteractive)
     // if you're in it, you don't end up in Trash
     fs.emptyDirSync(paths.appBuild);
     // Merge with the public folder
-    //! seafile: no need do this
-    // copyPublicFolder();
+    // NOTE: Re-enabled for SesameFS standalone build (was disabled for Django integration)
+    copyPublicFolder();
     // Start the webpack build
     return build(previousFileSizes);
   })

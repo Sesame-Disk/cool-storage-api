@@ -1,0 +1,81 @@
+/* Seafile Icon Font 2 - sf2-icon-* */
+@font-face {
+    font-family: 'seafile-font2';
+    src: url('seafile-font2.eot');
+    src: url('seafile-font2.eot?#iefix') format('embedded-opentype'),
+         url('seafile-font2.woff') format('woff'),
+         url('seafile-font2.ttf') format('truetype'),
+         url('seafile-font2.svg#seafile-font2') format('svg');
+    font-weight: normal;
+    font-style: normal;
+}
+
+[class^="sf2-icon-"],
+[class*=" sf2-icon-"] {
+    font-family: 'seafile-font2';
+    speak: none;
+    font-weight: normal;
+    font-variant: normal;
+    text-transform: none;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+}
+
+.sf2-icon-histogram:before { content: "\e000"; }
+.sf2-icon-wrench:before { content: "\e001"; }
+.sf2-icon-clock:before { content: "\e002"; }
+.sf2-icon-bell:before { content: "\e003"; }
+.sf2-icon-contacts:before { content: "\e004"; }
+.sf2-icon-recycle:before { content: "\e005"; }
+.sf2-icon-delete:before { content: "\e006"; }
+.sf2-icon-monitor:before { content: "\e007"; }
+.sf2-icon-download:before { content: "\e008"; }
+.sf2-icon-file:before { content: "\e009"; }
+.sf2-icon-folder:before { content: "\e00a"; }
+.sf2-icon-msgs:before { content: "\e00b"; }
+.sf2-icon-group:before { content: "\e00c"; }
+.sf2-icon-library:before { content: "\e00d"; }
+.sf2-icon-link:before { content: "\e00e"; }
+.sf2-icon-user:before { content: "\e00f"; }
+.sf2-icon-organization:before { content: "\e010"; }
+.sf2-icon-share:before { content: "\e011"; }
+.sf2-icon-star:before { content: "\e012"; }
+.sf2-icon-history:before { content: "\e014"; }
+.sf2-icon-cog1:before { content: "\e015"; }
+.sf2-icon-trash:before { content: "\e016"; }
+.sf2-icon-security:before { content: "\e017"; }
+.sf2-icon-edit:before { content: "\e018"; }
+.sf2-icon-draft:before { content: "\e018"; }
+.sf2-icon-edit2:before { content: "\e018"; }
+.sf2-icon-eye:before { content: "\e019"; }
+.sf2-icon-caret-down:before { content: "\e01a"; }
+.sf2-icon-cog2:before { content: "\e01b"; }
+.sf2-icon-minus:before { content: "\e01c"; }
+.sf2-icon-x1:before { content: "\e01d"; }
+.sf2-icon-tick:before { content: "\e01e"; }
+.sf2-icon-x2:before { content: "\e01f"; }
+.sf2-icon-user2:before { content: "\e020"; }
+.sf2-icon-msgs2:before { content: "\e021"; }
+.sf2-icon-comment:before { content: "\e023"; }
+.sf2-icon-wiki:before { content: "\e013"; }
+.sf2-icon-wiki2:before { content: "\e024"; }
+.sf2-icon-grid-view:before { content: "\e025"; }
+.sf2-icon-list-view:before { content: "\e026"; }
+.sf2-icon-wiki-view:before { content: "\e013"; }
+.sf2-icon-plus:before { content: "\e027"; }
+.sf2-icon-copy:before { content: "\e028"; }
+.sf2-icon-move:before { content: "\e029"; }
+.sf2-icon-reply:before { content: "\e02a"; }
+.sf2-icon-invite:before { content: "\e02b"; }
+.sf2-icon-lock:before { content: "\e02c"; }
+.sf2-icon-unlock:before { content: "\e02d"; }
+.sf2-icon-admin-log:before { content: "\e02e"; }
+.sf2-icon-info:before { content: "\e02f"; }
+.sf2-icon-logout:before { content: "\e030"; }
+.sf2-icon-menu:before { content: "\e031"; }
+.sf2-icon-more:before { content: "\e032"; }
+.sf2-icon-plus2:before { content: "\e033"; }
+.sf2-icon-upload:before { content: "\e034"; }
+.sf2-icon-x3:before { content: "\e035"; }
+.sf2-icon-two-columns:before { content: "\e036"; }
+.sf2-icon-tag:before { content: "\e037"; }

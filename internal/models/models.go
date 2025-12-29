@@ -32,12 +32,14 @@ type User struct {
 }
 
 // Library represents a file library (repository)
+// JSON field names match Seafile/Seahub frontend expectations
 type Library struct {
-	LibraryID      uuid.UUID `json:"id"`
+	LibraryID      uuid.UUID `json:"repo_id"`                // Seahub frontend expects repo_id
 	OrgID          uuid.UUID `json:"org_id,omitempty"`
 	OwnerID        uuid.UUID `json:"owner_id,omitempty"`
-	Owner          string    `json:"owner,omitempty"`    // Email for Seafile compatibility
-	Name           string    `json:"name"`
+	Owner          string    `json:"owner_email,omitempty"`  // Seahub frontend expects owner_email
+	OwnerName      string    `json:"owner_name,omitempty"`   // Display name for owner
+	Name           string    `json:"repo_name"`              // Seahub frontend expects repo_name
 	Description    string    `json:"description,omitempty"`
 	Encrypted      bool      `json:"encrypted"`
 	EncVersion     int       `json:"enc_version,omitempty"`
@@ -45,13 +47,16 @@ type Library struct {
 	RandomKey      string    `json:"-"` // For client-side encryption
 	RootCommitID   string    `json:"-"`
 	HeadCommitID   string    `json:"head_commit_id,omitempty"`
-	StorageClass   string    `json:"storage_class,omitempty"`
+	StorageClass   string    `json:"storage_name,omitempty"` // Seahub uses storage_name
 	SizeBytes      int64     `json:"size"`
 	FileCount      int64     `json:"file_count,omitempty"`
 	VersionTTLDays int       `json:"version_ttl_days,omitempty"`
-	MTime          int64     `json:"mtime"`              // Unix timestamp for Seafile compatibility
-	Type           string    `json:"type,omitempty"`     // "repo" for Seafile compatibility
-	Permission     string    `json:"permission,omitempty"` // "rw" or "r" for Seafile
+	MTime          int64     `json:"last_modified"`          // Seahub frontend expects last_modified
+	Type           string    `json:"type,omitempty"`         // "repo" for Seafile compatibility
+	Permission     string    `json:"permission,omitempty"`   // "rw" or "r" for Seafile
+	Starred        bool      `json:"starred,omitempty"`      // User has starred this repo
+	Monitored      bool      `json:"monitored,omitempty"`    // User monitors this repo
+	Status         string    `json:"status,omitempty"`       // Repo status
 	CreatedAt      time.Time `json:"created_at,omitempty"`
 	UpdatedAt      time.Time `json:"updated_at,omitempty"`
 }

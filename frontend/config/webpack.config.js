@@ -615,12 +615,15 @@ module.exports = function (webpackEnv) {
         excludeAliases: ['console'],
       }),
       // Generates an `index.html` file with the <script> injected.
+      // NOTE: SesameFS - only include 'app' chunk for standalone SPA
+      // (other entry points like sysAdmin, settings, etc. are for Django integration)
       new HtmlWebpackPlugin(
         Object.assign(
           {},
           {
             inject: true,
             template: paths.appHtml,
+            chunks: ['app'], // Only include the main app entry point
           },
           isEnvProduction
             ? {

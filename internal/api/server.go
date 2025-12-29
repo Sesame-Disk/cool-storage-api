@@ -331,6 +331,19 @@ func (s *Server) setupRoutes() {
 		}
 	}
 
+	// API v2.1 routes for Seahub frontend compatibility
+	// The Seahub frontend uses /api/v2.1/ prefix with different response format
+	apiV21 := s.router.Group("/api/v2.1")
+	{
+		// Protected endpoints
+		protected := apiV21.Group("")
+		protected.Use(s.authMiddleware())
+		{
+			// Library endpoints with v2.1 response format
+			v2.RegisterV21LibraryRoutes(protected, s.db, s.config, s.tokenStore)
+		}
+	}
+
 	// Seafile-compatible file transfer endpoints (seafhttp)
 	// These endpoints handle the actual file uploads/downloads
 	seafHTTPHandler := NewSeafHTTPHandler(s.storage, s.tokenStore)

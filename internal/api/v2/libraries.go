@@ -47,6 +47,16 @@ func RegisterLibraryRoutesWithToken(rg *gin.RouterGroup, database *db.DB, cfg *c
 	}
 }
 
+// RegisterV21LibraryRoutes registers v2.1 library routes with Seahub-compatible response format
+func RegisterV21LibraryRoutes(rg *gin.RouterGroup, database *db.DB, cfg *config.Config, tokenCreator LibraryTokenCreator) {
+	h := &LibraryHandler{db: database, config: cfg, tokenCreator: tokenCreator}
+
+	repos := rg.Group("/repos")
+	{
+		repos.GET("", h.ListLibrariesV21)
+	}
+}
+
 // ListLibraries returns all libraries for the authenticated user
 func (h *LibraryHandler) ListLibraries(c *gin.Context) {
 	orgID := c.GetString("org_id")
@@ -457,4 +467,109 @@ func (h *LibraryHandler) ChangeStorageClass(c *gin.Context) {
 	// TODO: Trigger background job to migrate blocks to new storage class
 
 	c.JSON(http.StatusOK, gin.H{"success": true})
+}
+
+// V21Library represents a library in v2.1 API format
+// This format uses different field names and ISO date format for Seahub frontend compatibility
+type V21Library struct {
+	Type                 string `json:"type"`
+	RepoID               string `json:"repo_id"`
+	RepoName             string `json:"repo_name"`
+	OwnerEmail           string `json:"owner_email"`
+	OwnerName            string `json:"owner_name"`
+	OwnerContactEmail    string `json:"owner_contact_email"`
+	LastModified         string `json:"last_modified"` // ISO 8601 format
+	ModifierEmail        string `json:"modifier_email"`
+	ModifierName         string `json:"modifier_name"`
+	ModifierContactEmail string `json:"modifier_contact_email"`
+	Size                 int64  `json:"size"`
+	Encrypted            bool   `json:"encrypted"`
+	Permission           string `json:"permission"`
+	Starred              bool   `json:"starred"`
+	Monitored            bool   `json:"monitored"`
+	Status               string `json:"status"`
+	Salt                 string `json:"salt"`
+	StorageName          string `json:"storage_name,omitempty"`
+}
+
+// V21LibraryResponse represents the v2.1 API response for listing libraries
+type V21LibraryResponse struct {
+	Repos []V21Library `json:"repos"`
+}
+
+// ListLibrariesV21 returns all libraries in v2.1 API format for Seahub frontend
+func (h *LibraryHandler) ListLibrariesV21(c *gin.Context) {
+	orgID := c.GetString("org_id")
+	userID := c.GetString("user_id")
+	if orgID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "missing org_id"})
+		return
+	}
+
+	if _, err := uuid.Parse(orgID); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid org_id"})
+		return
+	}
+
+	// Query libraries from database
+	iter := h.db.Session().Query(`
+		SELECT library_id, owner_id, name, description, encrypted,
+			   storage_class, size_bytes, file_count, created_at, updated_at
+		FROM libraries WHERE org_id = ?
+	`, orgID).Iter()
+
+	var libraries []V21Library
+	var libID, ownerID string
+	var name, description, storageClass string
+	var encrypted bool
+	var sizeBytes, fileCount int64
+	var createdAt, updatedAt time.Time
+
+	for iter.Scan(
+		&libID, &ownerID, &name, &description,
+		&encrypted, &storageClass, &sizeBytes,
+		&fileCount, &createdAt, &updatedAt,
+	) {
+		// Generate owner email
+		ownerEmail := ownerID + "@sesamefs.local"
+
+		// Determine library type (mine, shared, public)
+		libType := "mine"
+		if ownerID != userID {
+			libType = "shared"
+		}
+
+		libraries = append(libraries, V21Library{
+			Type:                 libType,
+			RepoID:               libID,
+			RepoName:             name,
+			OwnerEmail:           ownerEmail,
+			OwnerName:            strings.Split(ownerEmail, "@")[0], // Extract name from email
+			OwnerContactEmail:    ownerEmail,
+			LastModified:         updatedAt.Format(time.RFC3339), // ISO 8601 format
+			ModifierEmail:        ownerEmail,
+			ModifierName:         strings.Split(ownerEmail, "@")[0],
+			ModifierContactEmail: ownerEmail,
+			Size:                 sizeBytes,
+			Encrypted:            encrypted,
+			Permission:           "rw", // TODO: Check actual permissions
+			Starred:              false,
+			Monitored:            false,
+			Status:               "normal",
+			Salt:                 "",
+			StorageName:          storageClass,
+		})
+	}
+
+	if err := iter.Close(); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list libraries", "details": err.Error()})
+		return
+	}
+
+	// Return empty array instead of null
+	if libraries == nil {
+		libraries = []V21Library{}
+	}
+
+	c.JSON(http.StatusOK, V21LibraryResponse{Repos: libraries})
 }
