@@ -957,6 +957,7 @@ sesamefs/
 │   ├── API-ROADMAP.md         # Pending API endpoints by phase
 │   ├── STORAGE_ARCHITECTURE.md # Multi-region storage design
 │   ├── MULTIREGION-TESTING.md # Testing guide
+│   ├── MIGRATION-FROM-SEAFILE.md # Seafile migration guide
 │   └── SEAFILE_COMPATIBILITY.md # Protocol compatibility
 ├── configs/                   # Per-environment configs
 ├── docker-compose.yaml        # Development stack
@@ -980,6 +981,7 @@ The original prototype code has been archived in `_legacy/` for reference:
 - [API Roadmap](docs/API-ROADMAP.md) - Pending endpoints organized by implementation phase
 - [Storage Architecture](docs/STORAGE_ARCHITECTURE.md) - Multi-region storage design and policies
 - [Multi-Region Testing](docs/MULTIREGION-TESTING.md) - Testing guide for multi-region setup
+- [Migration from Seafile](docs/MIGRATION-FROM-SEAFILE.md) - Step-by-step migration with minimal downtime
 - [Seafile API Compatibility](docs/SEAFILE_COMPATIBILITY.md) - How the Seafile-compatible API works
 - [Licensing Guide](docs/LICENSING.md) - Legal considerations for using and distributing SesameFS
 
