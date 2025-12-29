@@ -798,24 +798,140 @@ Alternative: Collabora Online (LibreOffice-based)
 
 ## Getting Started
 
+### Prerequisites
+
+- **Go 1.25+** - [Install Go](https://go.dev/doc/install)
+- **Docker & Docker Compose** - [Install Docker](https://docs.docker.com/get-docker/)
+- **MinIO** (or S3-compatible storage) - Included in Docker Compose
+
+### Quick Start (Docker Compose)
+
+The fastest way to get started is with Docker Compose, which sets up everything:
+
 ```bash
 # Clone the repository
 git clone https://github.com/Sesame-Disk/sesamefs.git
 cd sesamefs
 
-# Copy and configure
-cp config.example.yaml config.yaml
-# Edit config.yaml with your settings
-
-# Run with Docker Compose (includes Cassandra)
+# Start all services (Cassandra, MinIO, SesameFS)
 docker-compose up -d
 
-# Or run locally (requires Cassandra)
-go run ./cmd/sesamefs
+# Verify services are running
+docker-compose ps
 
-# Run tests
-go test ./...
+# Test the API
+curl http://localhost:8080/ping
+# → "pong"
+
+# Test with dev token
+curl http://localhost:8080/api2/account/info/ \
+  -H "Authorization: Token dev-token-123"
 ```
+
+### Local Development (Without Docker)
+
+For active development, run SesameFS locally with Docker services:
+
+```bash
+# 1. Start infrastructure only (Cassandra + MinIO)
+docker-compose up -d cassandra minio
+
+# 2. Wait for Cassandra to be ready (about 60s first time)
+docker-compose logs -f cassandra
+# Wait for "Startup complete"
+
+# 3. Copy and configure
+cp config.example.yaml config.yaml
+# Edit config.yaml if needed
+
+# 4. Run SesameFS locally
+go run ./cmd/sesamefs serve
+
+# 5. In another terminal, run tests
+go test ./...
+
+# 6. Test the API
+curl http://localhost:8080/ping
+```
+
+### Multi-Region Testing
+
+SesameFS supports multi-region deployments with automatic failover. Test this locally:
+
+```bash
+# 1. Add hostname entries (one-time setup)
+sudo sh -c 'echo "127.0.0.1 us.sesamefs.local eu.sesamefs.local sesamefs.local" >> /etc/hosts'
+
+# 2. Bootstrap the multi-region environment
+./scripts/bootstrap-multiregion.sh
+
+# This starts:
+# - nginx (load balancer on port 8080)
+# - sesamefs-usa (defaults to USA S3 bucket)
+# - sesamefs-eu (defaults to EU S3 bucket)
+# - minio (with regional buckets: sesamefs-usa, sesamefs-eu)
+# - cassandra (shared database)
+
+# 3. Test regional routing
+curl http://localhost:8080/ping           # Load balanced
+curl http://us.sesamefs.local:8080/ping   # Routes to USA server
+curl http://eu.sesamefs.local:8080/ping   # Routes to EU server
+
+# 4. Run the full test suite
+./scripts/test-multiregion.sh all
+
+# 5. View MinIO Console (see bucket contents)
+open http://localhost:9001
+# Login: minioadmin / minioadmin
+
+# 6. Stop the environment
+./scripts/bootstrap-multiregion.sh --down
+
+# Clean start (removes all data)
+./scripts/bootstrap-multiregion.sh --clean
+```
+
+**Multi-Region Architecture:**
+```
+                              ┌─────────────────┐
+                              │     Client      │
+                              └────────┬────────┘
+                                       │
+                                       ▼
+                              ┌─────────────────┐
+                              │  nginx (8080)   │
+                              │  Load Balancer  │
+                              └────────┬────────┘
+                                       │
+               ┌───────────────────────┼───────────────────────┐
+               │                       │                       │
+               ▼                       ▼                       ▼
+      ┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
+      │  us.sesamefs    │    │  eu.sesamefs    │    │    default      │
+      │     .local      │    │     .local      │    │  (round-robin)  │
+      └────────┬────────┘    └────────┬────────┘    └────────┬────────┘
+               │                       │                       │
+               ▼                       ▼                       ▼
+      ┌─────────────────┐    ┌─────────────────┐
+      │  sesamefs-usa   │    │  sesamefs-eu    │
+      │  Default: USA   │    │  Default: EU    │
+      │  Failover: EU   │    │  Failover: USA  │
+      └────────┬────────┘    └────────┬────────┘
+               │                       │
+               └───────────┬───────────┘
+                           │
+               ┌───────────┴───────────┐
+               │                       │
+               ▼                       ▼
+      ┌─────────────────┐    ┌─────────────────┐
+      │  MinIO (9000)   │    │ Cassandra(9042) │
+      │  sesamefs-usa   │    │    (shared)     │
+      │  sesamefs-eu    │    │                 │
+      │  sesamefs-arch  │    │                 │
+      └─────────────────┘    └─────────────────┘
+```
+
+See [docs/MULTIREGION-TESTING.md](docs/MULTIREGION-TESTING.md) for detailed testing scenarios.
 
 ---
 

@@ -1,0 +1,202 @@
+# Multi-Region Test Environment
+#
+# This setup simulates a multi-region deployment with:
+# - nginx as load balancer/entry point
+# - 2 SesameFS servers (USA and EU regions)
+# - MinIO with separate buckets per region
+# - Shared Cassandra database
+#
+# Usage:
+#   docker-compose -f docker-compose-multiregion.yaml up -d
+#
+# Test endpoints:
+#   - http://localhost:8080 (nginx - load balanced)
+#   - http://us.sesamefs.local:8080 (routes to USA server)
+#   - http://eu.sesamefs.local:8080 (routes to EU server)
+#
+# Add to /etc/hosts:
+#   127.0.0.1 us.sesamefs.local eu.sesamefs.local sesamefs.local
+#
+# Test failover:
+#   docker-compose -f docker-compose-multiregion.yaml stop sesamefs-usa
+#   # Requests should failover to EU
+
+services:
+  # ==========================================================================
+  # NGINX - Entry Point / Load Balancer
+  # ==========================================================================
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "8080:80"
+    volumes:
+      - ./configs/nginx-multiregion.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - sesamefs-usa
+      - sesamefs-eu
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://localhost/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
+  # ==========================================================================
+  # SESAMEFS SERVERS
+  # ==========================================================================
+
+  # USA Region Server
+  sesamefs-usa:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      - PORT=8080
+      - SERVER_REGION=usa
+      - CASSANDRA_HOSTS=cassandra:9042
+      - CASSANDRA_KEYSPACE=sesamefs
+      - CASSANDRA_LOCAL_DC=datacenter1
+      - AUTH_DEV_MODE=true
+      - AWS_ACCESS_KEY_ID=minioadmin
+      - AWS_SECRET_ACCESS_KEY=minioadmin
+    depends_on:
+      cassandra:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    volumes:
+      - ./configs/config-usa.yaml:/app/config.yaml:ro
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://localhost:8080/ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    restart: unless-stopped
+
+  # EU Region Server
+  sesamefs-eu:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      - PORT=8080
+      - SERVER_REGION=eu
+      - CASSANDRA_HOSTS=cassandra:9042
+      - CASSANDRA_KEYSPACE=sesamefs
+      - CASSANDRA_LOCAL_DC=datacenter1
+      - AUTH_DEV_MODE=true
+      - AWS_ACCESS_KEY_ID=minioadmin
+      - AWS_SECRET_ACCESS_KEY=minioadmin
+    depends_on:
+      cassandra:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    volumes:
+      - ./configs/config-eu.yaml:/app/config.yaml:ro
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://localhost:8080/ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    restart: unless-stopped
+
+  # ==========================================================================
+  # STORAGE - MinIO (S3-compatible)
+  # ==========================================================================
+  minio:
+    image: minio/minio:latest
+    ports:
+      - "9000:9000"      # S3 API
+      - "9001:9001"      # Console
+    environment:
+      - MINIO_ROOT_USER=minioadmin
+      - MINIO_ROOT_PASSWORD=minioadmin
+    volumes:
+      - minio_multiregion_data:/data
+    command: server /data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # Initialize MinIO buckets for each region
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      echo 'Waiting for MinIO...';
+      sleep 5;
+      mc alias set myminio http://minio:9000 minioadmin minioadmin;
+      echo 'Creating regional buckets...';
+      mc mb myminio/sesamefs-usa --ignore-existing;
+      mc mb myminio/sesamefs-eu --ignore-existing;
+      mc mb myminio/sesamefs-blocks --ignore-existing;
+      mc mb myminio/sesamefs-archive --ignore-existing;
+      echo 'Setting bucket policies...';
+      mc anonymous set download myminio/sesamefs-usa;
+      mc anonymous set download myminio/sesamefs-eu;
+      mc anonymous set download myminio/sesamefs-blocks;
+      echo 'Buckets created:';
+      mc ls myminio;
+      echo 'MinIO initialization complete!';
+      exit 0;
+      "
+
+  # ==========================================================================
+  # TEST RUNNER - For running tests inside the Docker network
+  # ==========================================================================
+  test-runner:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    volumes:
+      - ./scripts:/scripts:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      - nginx
+    environment:
+      - TOKEN=dev-token-123
+      - BASE_URL=http://nginx:80
+      - USA_URL=http://sesamefs-usa:8080
+      - EU_URL=http://sesamefs-eu:8080
+    profiles:
+      - test
+
+  # ==========================================================================
+  # DATABASE - Cassandra (Shared)
+  # ==========================================================================
+  cassandra:
+    image: cassandra:5.0
+    ports:
+      - "9042:9042"
+    environment:
+      - CASSANDRA_CLUSTER_NAME=sesamefs-multiregion
+      - CASSANDRA_DC=datacenter1
+      - CASSANDRA_ENDPOINT_SNITCH=GossipingPropertyFileSnitch
+      - MAX_HEAP_SIZE=512M
+      - HEAP_NEWSIZE=100M
+    volumes:
+      - cassandra_multiregion_data:/var/lib/cassandra
+    healthcheck:
+      test: ["CMD", "cqlsh", "-e", "describe keyspaces"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+    restart: unless-stopped
+
+volumes:
+  cassandra_multiregion_data:
+  minio_multiregion_data:
+
+networks:
+  default:
+    name: sesamefs-multiregion

@@ -19,11 +19,12 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
 # Runtime stage
 FROM debian:trixie-slim
 
-# Install ca-certificates for HTTPS and tzdata for timezones
+# Install ca-certificates for HTTPS, tzdata for timezones, wget for healthchecks
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         ca-certificates \
-        tzdata && \
+        tzdata \
+        wget && \
     rm -rf /var/lib/apt/lists/* && \
     apt-get clean
 
@@ -45,8 +46,8 @@ USER sesamefs
 EXPOSE 8080
 
 # Health check
-HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD ["/app/sesamefs", "health"] || exit 1
+HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
+    CMD wget -q -O - http://localhost:8080/ping || exit 1
 
 ENTRYPOINT ["/app/sesamefs"]
 CMD ["serve"]

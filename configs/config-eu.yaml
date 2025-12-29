@@ -1,0 +1,100 @@
+# SesameFS Configuration - EU Region Server
+#
+# This server defaults to EU storage and fails over to USA
+
+server:
+  port: ":8080"
+  read_timeout: 30s
+  write_timeout: 300s
+  max_upload_mb: 10240
+
+database:
+  hosts:
+    - cassandra:9042
+  keyspace: sesamefs
+  consistency: LOCAL_QUORUM
+  local_dc: datacenter1
+
+storage:
+  # EU server defaults to EU bucket
+  default_class: hot-s3-eu
+
+  classes:
+    # EU Region - Primary for this server
+    hot-s3-eu:
+      type: s3
+      tier: hot
+      endpoint: "http://minio:9000"
+      bucket: sesamefs-eu
+      region: eu-west-1
+      access_key: minioadmin
+      secret_key: minioadmin
+      use_path_style: true
+      failover_class: hot-s3-usa  # Failover to USA if EU fails
+
+    # USA Region - Failover for EU
+    hot-s3-usa:
+      type: s3
+      tier: hot
+      endpoint: "http://minio:9000"
+      bucket: sesamefs-usa
+      region: us-east-1
+      access_key: minioadmin
+      secret_key: minioadmin
+      use_path_style: true
+      failover_class: hot-s3-eu  # Failover back to EU
+
+    # Archive storage
+    cold-glacier-usa:
+      type: s3
+      tier: cold
+      endpoint: "http://minio:9000"
+      bucket: sesamefs-archive
+      region: us-east-1
+      access_key: minioadmin
+      secret_key: minioadmin
+      use_path_style: true
+
+  # Map hostnames to regions
+  endpoint_regions:
+    "us.sesamefs.local": "usa"
+    "eu.sesamefs.local": "eu"
+    "sesamefs.local": "eu"     # Default to EU for this server
+    "localhost": "eu"
+    "*": "eu"                   # Fallback to EU
+
+  # Map regions to storage classes
+  region_classes:
+    usa:
+      hot: hot-s3-usa
+      cold: cold-glacier-usa
+    eu:
+      hot: hot-s3-eu
+      cold: cold-glacier-usa
+
+auth:
+  dev_mode: true
+  dev_tokens:
+    - token: "dev-token-123"
+      user_id: "00000000-0000-0000-0000-000000000001"
+      org_id: "00000000-0000-0000-0000-000000000001"
+  oidc:
+    issuer: https://accounts.sesamedisk.com
+    client_id: ""
+    client_secret: ""
+    scopes:
+      - openid
+      - profile
+      - email
+
+chunking:
+  algorithm: fastcdc
+  min_size: 524288
+  avg_size: 2097152
+  max_size: 8388608
+  hash_algorithm: sha256
+
+versioning:
+  default_ttl_days: 90
+  min_ttl_days: 7
+  gc_interval: 24h
