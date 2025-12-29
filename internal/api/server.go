@@ -316,6 +316,14 @@ func (s *Server) setupRoutes() {
 		// Account info
 		api2.GET("/account/info", s.authMiddleware(), s.handleAccountInfo)
 
+		// Starred files (stub - returns empty array)
+		api2.GET("/starredfiles", s.authMiddleware(), s.handleStarredFiles)
+		api2.GET("/starredfiles/", s.authMiddleware(), s.handleStarredFiles)
+
+		// User avatars (stub - returns placeholder)
+		api2.GET("/avatars/user/:email/resized/:size", s.handleUserAvatar)
+		api2.GET("/avatars/user/:email/resized/:size/", s.handleUserAvatar)
+
 		// Protected endpoints
 		protected := api2.Group("")
 		protected.Use(s.authMiddleware())
@@ -551,6 +559,25 @@ func (s *Server) handleAccountInfo(c *gin.Context) {
 		"is_staff":    false,
 		"space_usage": 0,
 		"total_space": -2, // -2 means unlimited
+	})
+}
+
+// handleStarredFiles returns the list of starred files for the user
+// GET /api2/starredfiles/
+func (s *Server) handleStarredFiles(c *gin.Context) {
+	// Return empty array - starring not implemented yet
+	c.JSON(http.StatusOK, []interface{}{})
+}
+
+// handleUserAvatar returns an avatar for a user
+// GET /api2/avatars/user/:email/resized/:size/
+func (s *Server) handleUserAvatar(c *gin.Context) {
+	// Return a default avatar URL
+	// In production, this would return actual user avatars
+	c.JSON(http.StatusOK, gin.H{
+		"url":     "",
+		"is_default": true,
+		"mtime":   0,
 	})
 }
 

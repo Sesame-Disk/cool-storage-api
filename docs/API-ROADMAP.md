@@ -461,8 +461,149 @@ CREATE TABLE file_tag_mappings (
 
 ---
 
+## Phase 5: Frontend Modernization & Responsiveness
+
+**Priority: LOW (Post-Launch)**
+**Prerequisite for: Mobile-friendly web interface**
+
+The current frontend is extracted from Seahub and uses Bootstrap 4 with limited mobile responsiveness. This phase focuses on modernizing the CSS architecture and making the UI fully responsive.
+
+### Recommended Approach: CSS Framework Migration
+
+**Target: Tailwind CSS**
+
+Tailwind CSS is recommended because:
+- Utility-first approach works well with existing React components
+- Excellent responsive design utilities built-in
+- Smaller bundle size with PurgeCSS
+- Easy to gradually migrate (can coexist with existing CSS)
+- Active community and ecosystem
+
+### Alternative Options Considered
+
+| Option | Effort | Pros | Cons |
+|--------|--------|------|------|
+| **Tailwind CSS** | 4-6 weeks | Modern, utility-first, great DX | Learning curve, migration effort |
+| **CSS-Only Fixes** | 2 weeks | Quick, minimal changes | Limited improvement, technical debt |
+| **Bootstrap 5 Upgrade** | 3-4 weeks | Familiar, drop-in upgrade | Still not mobile-first |
+| **Ant Design** | 6-8 weeks | Full component library | Heavy, opinionated |
+| **Separate Mobile UI** | 2-3 months | Best UX | Two codebases |
+
+### Migration Strategy
+
+#### Phase 5.1: Setup & Infrastructure
+| Task | Description |
+|------|-------------|
+| Install Tailwind CSS | Add to build pipeline with PostCSS |
+| Configure PurgeCSS | Optimize for production bundle size |
+| Create base config | Define color palette, breakpoints, spacing |
+| Setup dark mode | Optional: Add dark theme support |
+
+#### Phase 5.2: Core Layout Components
+| Component | Current | Target |
+|-----------|---------|--------|
+| Side Panel | Fixed width | Collapsible, responsive |
+| Main Panel | Flex layout | Responsive grid |
+| Header/Toolbar | Desktop-only | Mobile-friendly with hamburger |
+| Modals/Dialogs | Fixed size | Responsive, mobile sheets |
+
+#### Phase 5.3: Data Components
+| Component | Current | Target |
+|-----------|---------|--------|
+| File List Table | `<table>` | Responsive grid/cards on mobile |
+| Library List | Table rows | Cards on mobile |
+| Breadcrumb | Overflow hidden | Scrollable, collapsible |
+| Action Menus | Dropdown | Bottom sheet on mobile |
+
+#### Phase 5.4: Forms & Inputs
+| Component | Current | Target |
+|-----------|---------|--------|
+| Login Form | Basic | Touch-friendly, larger targets |
+| Share Dialog | Complex form | Step-by-step wizard on mobile |
+| Upload UI | Drag-drop only | Mobile file picker |
+| Search | Desktop search bar | Expandable mobile search |
+
+### Responsive Breakpoints
+
+```javascript
+// Tailwind default breakpoints (recommended)
+screens: {
+  'sm': '640px',   // Mobile landscape
+  'md': '768px',   // Tablets
+  'lg': '1024px',  // Desktop
+  'xl': '1280px',  // Large desktop
+  '2xl': '1536px', // Extra large
+}
+```
+
+### Mobile-First Patterns to Implement
+
+1. **Navigation**
+   - Hamburger menu on mobile
+   - Slide-out side panel
+   - Bottom navigation bar (optional)
+
+2. **File Browser**
+   - Card view default on mobile
+   - Swipe actions (delete, share)
+   - Long-press for context menu
+   - Pull-to-refresh
+
+3. **File Operations**
+   - Bottom action sheet instead of dropdown
+   - Full-screen dialogs on mobile
+   - Touch-friendly selection (checkboxes)
+
+4. **Upload/Download**
+   - Native file picker integration
+   - Progress in notification area
+   - Background upload support
+
+### Files to Modify
+
+| File | Changes |
+|------|---------|
+| `package.json` | Add tailwindcss, postcss, autoprefixer |
+| `tailwind.config.js` | Create configuration |
+| `postcss.config.js` | Add Tailwind plugin |
+| `src/index.css` | Add Tailwind directives |
+| `src/app.js` | Remove Bootstrap import |
+| `src/components/*` | Migrate to Tailwind classes |
+| `src/css/*` | Gradually deprecate |
+
+### Estimated Timeline
+
+| Phase | Duration | Dependencies |
+|-------|----------|--------------|
+| 5.1 Setup | 1 week | None |
+| 5.2 Core Layout | 2 weeks | 5.1 |
+| 5.3 Data Components | 2 weeks | 5.2 |
+| 5.4 Forms | 1 week | 5.2 |
+| Testing & Polish | 1 week | All |
+| **Total** | **~6-7 weeks** | |
+
+### Success Criteria
+
+- [ ] UI works on mobile devices (320px+)
+- [ ] Touch-friendly interactions
+- [ ] No horizontal scrolling on mobile
+- [ ] Lighthouse mobile score > 80
+- [ ] File upload works on mobile browsers
+- [ ] All features accessible on mobile
+
+### Notes
+
+- This phase should be started **after** core API features are complete
+- Seafile mobile apps (iOS/Android) can be used as interim mobile solution
+- Consider A/B testing new responsive design before full rollout
+- May want to keep "desktop mode" toggle for power users
+
+---
+
 ## References
 
 - [Seafile API Reference](https://seafile-api.readme.io/)
 - [Seafile Admin Manual](https://manual.seafile.com/12.0/develop/web_api_v2.1/)
 - [Current Implementation](../internal/api/v2/files.go)
+- [Tailwind CSS Documentation](https://tailwindcss.com/docs)
+- [Tailwind UI Components](https://tailwindui.com/) (paid, but good reference)

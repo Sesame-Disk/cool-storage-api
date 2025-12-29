@@ -54,10 +54,13 @@ func RegisterV21LibraryRoutes(rg *gin.RouterGroup, database *db.DB, cfg *config.
 	repos := rg.Group("/repos")
 	{
 		repos.GET("", h.ListLibrariesV21)
+		repos.GET("/:repo_id", h.GetLibraryV21)
 	}
 }
 
 // ListLibraries returns all libraries for the authenticated user
+// This endpoint uses the api2 format expected by Seafile desktop client
+// (id, name, mtime) rather than the v2.1 web UI format (repo_id, repo_name, last_modified)
 func (h *LibraryHandler) ListLibraries(c *gin.Context) {
 	orgID := c.GetString("org_id")
 	if orgID == "" {
@@ -73,13 +76,14 @@ func (h *LibraryHandler) ListLibraries(c *gin.Context) {
 	// Query libraries from database (use string for UUID binding)
 	iter := h.db.Session().Query(`
 		SELECT library_id, owner_id, name, description, encrypted,
-			   storage_class, size_bytes, file_count, created_at, updated_at
+			   storage_class, size_bytes, file_count, head_commit_id, created_at, updated_at
 		FROM libraries WHERE org_id = ?
 	`, orgID).Iter()
 
-	var libraries []models.Library
+	var libraries []gin.H
 	var libID, ownerID string
 	var name, description, storageClass string
+	var headCommitID string
 	var encrypted bool
 	var sizeBytes, fileCount int64
 	var createdAt, updatedAt time.Time
@@ -87,28 +91,37 @@ func (h *LibraryHandler) ListLibraries(c *gin.Context) {
 	for iter.Scan(
 		&libID, &ownerID, &name, &description,
 		&encrypted, &storageClass, &sizeBytes,
-		&fileCount, &createdAt, &updatedAt,
+		&fileCount, &headCommitID, &createdAt, &updatedAt,
 	) {
-		libUUID, _ := uuid.Parse(libID)
-		ownerUUID, _ := uuid.Parse(ownerID)
-		orgUUID, _ := uuid.Parse(orgID)
+		ownerEmail := ownerID + "@sesamefs.local"
 
-		libraries = append(libraries, models.Library{
-			LibraryID:    libUUID,
-			OrgID:        orgUUID,
-			OwnerID:      ownerUUID,
-			Owner:        ownerID + "@sesamefs.local", // Seafile expects email
-			Name:         name,
-			Description:  description,
-			Encrypted:    encrypted,
-			StorageClass: storageClass,
-			SizeBytes:    sizeBytes,
-			FileCount:    fileCount,
-			MTime:        updatedAt.Unix(), // Unix timestamp for Seafile
-			Type:         "repo",           // Seafile library type
-			Permission:   "rw",             // TODO: Check actual permissions
-			CreatedAt:    createdAt,
-			UpdatedAt:    updatedAt,
+		// Seafile desktop client expects these specific field names:
+		// - id (not repo_id)
+		// - name (not repo_name)
+		// - mtime (not last_modified)
+		// - owner (not owner_email)
+		// - desc (not description)
+		libraries = append(libraries, gin.H{
+			"id":             libID,
+			"name":           name,
+			"desc":           description,
+			"owner":          ownerEmail,
+			"owner_name":     strings.Split(ownerEmail, "@")[0],
+			"owner_contact_email": ownerEmail,
+			"mtime":          updatedAt.Unix(),
+			"mtime_relative": "", // Optional human-readable time
+			"encrypted":      encrypted,
+			"permission":     "rw",
+			"virtual":        false,
+			"root":           "0000000000000000000000000000000000000000",
+			"head_commit_id": headCommitID,
+			"version":        1,
+			"type":           "repo",
+			"size":           sizeBytes,
+			"size_formatted": formatSize(sizeBytes),
+			"file_count":     fileCount,
+			"storage_id":     storageClass,
+			"storage_name":   storageClass,
 		})
 	}
 
@@ -119,10 +132,24 @@ func (h *LibraryHandler) ListLibraries(c *gin.Context) {
 
 	// Return empty array instead of null
 	if libraries == nil {
-		libraries = []models.Library{}
+		libraries = []gin.H{}
 	}
 
 	c.JSON(http.StatusOK, libraries)
+}
+
+// formatSize returns a human-readable size string
+func formatSize(bytes int64) string {
+	const unit = 1024
+	if bytes < unit {
+		return fmt.Sprintf("%d B", bytes)
+	}
+	div, exp := int64(unit), 0
+	for n := bytes / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %cB", float64(bytes)/float64(div), "KMGTPE"[exp])
 }
 
 // CreateLibraryRequest represents the request body for creating a library
@@ -297,6 +324,7 @@ func (h *LibraryHandler) CreateLibrary(c *gin.Context) {
 }
 
 // GetLibrary returns a single library by ID
+// This endpoint uses the api2 format expected by Seafile desktop client
 func (h *LibraryHandler) GetLibrary(c *gin.Context) {
 	repoID := c.Param("repo_id")
 	orgID := c.GetString("org_id")
@@ -308,6 +336,7 @@ func (h *LibraryHandler) GetLibrary(c *gin.Context) {
 
 	var libID, ownerID string
 	var name, description, storageClass string
+	var headCommitID string
 	var encrypted bool
 	var sizeBytes, fileCount int64
 	var versionTTLDays int
@@ -316,37 +345,42 @@ func (h *LibraryHandler) GetLibrary(c *gin.Context) {
 	if err := h.db.Session().Query(`
 		SELECT library_id, owner_id, name, description, encrypted,
 			   storage_class, size_bytes, file_count, version_ttl_days,
-			   created_at, updated_at
+			   head_commit_id, created_at, updated_at
 		FROM libraries WHERE org_id = ? AND library_id = ?
 	`, orgID, repoID).Scan(
 		&libID, &ownerID, &name, &description,
 		&encrypted, &storageClass, &sizeBytes,
-		&fileCount, &versionTTLDays, &createdAt, &updatedAt,
+		&fileCount, &versionTTLDays, &headCommitID, &createdAt, &updatedAt,
 	); err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "library not found"})
 		return
 	}
 
-	libUUID, _ := uuid.Parse(libID)
-	ownerUUID, _ := uuid.Parse(ownerID)
-	orgUUID, _ := uuid.Parse(orgID)
+	ownerEmail := ownerID + "@sesamefs.local"
 
-	lib := models.Library{
-		LibraryID:      libUUID,
-		OrgID:          orgUUID,
-		OwnerID:        ownerUUID,
-		Name:           name,
-		Description:    description,
-		Encrypted:      encrypted,
-		StorageClass:   storageClass,
-		SizeBytes:      sizeBytes,
-		FileCount:      fileCount,
-		VersionTTLDays: versionTTLDays,
-		CreatedAt:      createdAt,
-		UpdatedAt:      updatedAt,
-	}
-
-	c.JSON(http.StatusOK, lib)
+	// Return api2 format for Seafile desktop client compatibility
+	c.JSON(http.StatusOK, gin.H{
+		"id":             libID,
+		"name":           name,
+		"desc":           description,
+		"owner":          ownerEmail,
+		"owner_name":     strings.Split(ownerEmail, "@")[0],
+		"owner_contact_email": ownerEmail,
+		"mtime":          updatedAt.Unix(),
+		"mtime_relative": "",
+		"encrypted":      encrypted,
+		"permission":     "rw",
+		"virtual":        false,
+		"root":           "0000000000000000000000000000000000000000",
+		"head_commit_id": headCommitID,
+		"version":        1,
+		"type":           "repo",
+		"size":           sizeBytes,
+		"size_formatted": formatSize(sizeBytes),
+		"file_count":     fileCount,
+		"storage_id":     storageClass,
+		"storage_name":   storageClass,
+	})
 }
 
 // UpdateLibraryRequest represents the request body for updating a library
@@ -572,4 +606,74 @@ func (h *LibraryHandler) ListLibrariesV21(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, V21LibraryResponse{Repos: libraries})
+}
+
+// GetLibraryV21 returns a single library in v2.1 API format
+func (h *LibraryHandler) GetLibraryV21(c *gin.Context) {
+	repoID := c.Param("repo_id")
+	orgID := c.GetString("org_id")
+	userID := c.GetString("user_id")
+
+	if _, err := uuid.Parse(repoID); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid repo_id"})
+		return
+	}
+
+	var libID, ownerID string
+	var name, description, storageClass string
+	var encrypted bool
+	var sizeBytes, fileCount int64
+	var headCommitID string
+	var createdAt, updatedAt time.Time
+
+	if err := h.db.Session().Query(`
+		SELECT library_id, owner_id, name, description, encrypted,
+			   storage_class, size_bytes, file_count, head_commit_id,
+			   created_at, updated_at
+		FROM libraries WHERE org_id = ? AND library_id = ?
+	`, orgID, repoID).Scan(
+		&libID, &ownerID, &name, &description,
+		&encrypted, &storageClass, &sizeBytes,
+		&fileCount, &headCommitID, &createdAt, &updatedAt,
+	); err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "library not found"})
+		return
+	}
+
+	// Generate owner email
+	ownerEmail := ownerID + "@sesamefs.local"
+
+	// Determine library type (mine, shared, public)
+	libType := "mine"
+	if ownerID != userID {
+		libType = "shared"
+	}
+
+	// Return v2.1 format response
+	response := gin.H{
+		"type":                  libType,
+		"repo_id":               libID,
+		"repo_name":             name,
+		"owner_email":           ownerEmail,
+		"owner_name":            strings.Split(ownerEmail, "@")[0],
+		"owner_contact_email":   ownerEmail,
+		"last_modified":         updatedAt.Format(time.RFC3339),
+		"modifier_email":        ownerEmail,
+		"modifier_name":         strings.Split(ownerEmail, "@")[0],
+		"modifier_contact_email": ownerEmail,
+		"size":                  sizeBytes,
+		"file_count":            fileCount,
+		"encrypted":             encrypted,
+		"permission":            "rw",
+		"starred":               false,
+		"monitored":             false,
+		"status":                "normal",
+		"salt":                  "",
+		"storage_name":          storageClass,
+		"head_commit_id":        headCommitID,
+		"version":               1,
+		"lib_need_decrypt":      false,
+	}
+
+	c.JSON(http.StatusOK, response)
 }

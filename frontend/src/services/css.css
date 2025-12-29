@@ -2,15 +2,337 @@
 /* SesameFS Custom Overrides                          */
 /* ================================================== */
 
-/* Fix sidebar headers (Files, Tools) being too large due to Bootstrap h3 */
+/* ================================================== */
+/* Sidebar Navigation Styles                          */
+/* ================================================== */
+
+/* Sidebar section headers */
 .sf-heading {
-  font-size: 14px !important;
-  font-weight: 600 !important;
-  color: #333 !important;
-  margin: 0.5rem 1rem !important;
+  font-size: 11px !important;
+  font-weight: 700 !important;
+  color: #999 !important;
+  margin: 16px 0 8px 0 !important;
+  padding: 0 !important;
   text-transform: uppercase;
-  letter-spacing: 0.5px;
+  letter-spacing: 1px;
 }
+
+/* Remove Bootstrap's default nav styling */
+.side-nav .nav {
+  border: none !important;
+  height: auto !important;
+  padding: 0 !important;
+  margin: 0 0 8px 0 !important;
+}
+
+/* Nav container for proper stacking */
+.side-nav .nav-container {
+  display: flex;
+  flex-direction: column;
+  padding: 0;
+  margin: 0;
+}
+
+/* Nav items */
+.side-nav .nav-item {
+  display: block !important;
+  width: 100%;
+  margin: 0;
+  padding: 0;
+}
+
+/* Nav links - main styling */
+.side-nav .nav-link {
+  display: flex !important;
+  align-items: center;
+  padding: 8px 12px !important;
+  color: #333 !important;
+  font-size: 14px !important;
+  font-weight: normal !important;
+  text-decoration: none !important;
+  border-radius: 4px;
+  transition: background-color 0.15s ease;
+}
+
+.side-nav .nav-link:hover {
+  background-color: #f5f5f5 !important;
+  color: #333 !important;
+  text-decoration: none !important;
+}
+
+.side-nav .nav-link.active {
+  color: #eb8205 !important;
+  background-color: #fff5eb !important;
+  font-weight: 500 !important;
+}
+
+/* Icons in nav links */
+.side-nav .nav-link span[class^="sf2-icon-"],
+.side-nav .nav-link span[class*=" sf2-icon-"],
+.side-nav .nav-link span[class^="sf3-font"] {
+  margin-right: 10px;
+  font-size: 16px;
+  color: #666;
+  width: 20px;
+  text-align: center;
+}
+
+.side-nav .nav-link.active span[class^="sf2-icon-"],
+.side-nav .nav-link.active span[class*=" sf2-icon-"],
+.side-nav .nav-link.active span[class^="sf3-font"] {
+  color: #eb8205;
+}
+
+/* Nav text */
+.side-nav .nav-text {
+  flex: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Toggle icon for expandable sections */
+.side-nav .toggle-icon {
+  margin-left: auto;
+  font-size: 12px;
+  color: #999;
+}
+
+/* Sub navigation (groups list) */
+.side-nav .sub-nav {
+  margin-left: 20px;
+  overflow: hidden;
+  transition: height 0.2s ease;
+}
+
+.side-nav .sub-nav .nav-link {
+  padding: 6px 12px !important;
+  font-size: 13px !important;
+}
+
+.side-nav .sub-nav .sharp {
+  margin-right: 8px;
+  color: #999;
+}
+
+/* ================================================== */
+/* Toolbar Buttons (Seafile style - light gray)       */
+/* ================================================== */
+
+/* All toolbar buttons - light gray like Seafile */
+.cur-view-toolbar .btn.btn-secondary,
+.cur-view-toolbar .btn.btn-secondary.operation-item,
+.cur-view-toolbar .operation button.btn,
+.cur-view-toolbar .dropdown .btn {
+  background-color: #f8f8f8 !important;
+  background: linear-gradient(to bottom, #fff 0%, #f0f0f0 100%) !important;
+  border: 1px solid #ccc !important;
+  color: #555 !important;
+  font-weight: normal !important;
+  font-size: 13px !important;
+  box-shadow: none !important;
+  border-radius: 3px !important;
+  padding: 5px 12px !important;
+  height: auto !important;
+  line-height: 1.4 !important;
+}
+
+.cur-view-toolbar .btn:hover,
+.cur-view-toolbar .btn.btn-secondary:hover,
+.cur-view-toolbar .operation button.btn:hover,
+.cur-view-toolbar .dropdown .btn:hover {
+  background: linear-gradient(to bottom, #f0f0f0 0%, #e5e5e5 100%) !important;
+  border-color: #bbb !important;
+  color: #333 !important;
+}
+
+.cur-view-toolbar .btn:focus,
+.cur-view-toolbar .btn.operation-item:focus {
+  box-shadow: none !important;
+  outline: none !important;
+}
+
+/* Icon in buttons */
+.cur-view-toolbar .btn i {
+  color: #666 !important;
+  margin-right: 4px;
+}
+
+/* Dropdown toggle caret */
+.cur-view-toolbar .dropdown-toggle::after {
+  margin-left: 0.3rem;
+  vertical-align: middle;
+}
+
+/* Button spacing */
+.cur-view-toolbar .operation {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+
+/* ================================================== */
+/* Header Row Layout                                  */
+/* ================================================== */
+
+/* Ensure proper header alignment */
+.main-panel-north {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 16px !important;
+  min-height: 50px;
+  gap: 16px;
+}
+
+/* Left side toolbar */
+.main-panel-north .cur-view-toolbar {
+  display: flex;
+  align-items: center;
+  flex: 0 0 auto;
+}
+
+/* ================================================== */
+/* Search Bar Styling (Seafile style)                 */
+/* ================================================== */
+
+/* Main toolbar container */
+.common-toolbar {
+  display: flex;
+  align-items: center;
+  margin-left: auto;
+  gap: 8px;
+}
+
+.common-toolbar .search-icon-container,
+.common-toolbar .search {
+  display: flex;
+  align-items: center;
+}
+
+/* Search container wrapper */
+.common-toolbar .search {
+  position: relative;
+}
+
+/* Search input - styled like Seafile */
+.common-toolbar .search-input {
+  height: 30px !important;
+  padding: 4px 8px 4px 32px !important;
+  font-size: 13px !important;
+  background-color: #fff !important;
+  border: 1px solid #ccc !important;
+  border-radius: 3px !important;
+  color: #555 !important;
+  min-width: 200px;
+  transition: all 0.2s ease;
+}
+
+.common-toolbar .search-input::placeholder {
+  color: #999;
+  font-size: 12px;
+}
+
+.common-toolbar .search-input:focus {
+  border-color: #aaa !important;
+  outline: none !important;
+  box-shadow: none !important;
+}
+
+/* Search icon positioning */
+.common-toolbar .input-icon {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+
+.common-toolbar .search-icon-left {
+  position: absolute;
+  left: 10px;
+  top: 50%;
+  transform: translateY(-50%);
+  color: #999;
+  font-size: 13px;
+  z-index: 1;
+  pointer-events: none;
+}
+
+/* Close icon in search */
+.common-toolbar .search-icon-right {
+  position: absolute;
+  right: 8px;
+  top: 50%;
+  transform: translateY(-50%);
+  color: #999;
+  font-size: 12px;
+  cursor: pointer;
+  padding: 4px;
+  background: transparent !important;
+}
+
+.common-toolbar .search-icon-right:hover {
+  color: #555;
+}
+
+/* Search mask - semi-transparent overlay */
+.search-mask.show {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  background-color: rgba(0, 0, 0, 0.15);
+  z-index: 1;
+}
+
+.search-mask.hide {
+  display: none;
+}
+
+/* Expanded search container */
+.common-toolbar .search-container.show {
+  position: fixed;
+  top: 10px;
+  right: 60px;
+  z-index: 2;
+  background: #fff;
+  border-radius: 4px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.12);
+  padding: 12px;
+  width: 600px;
+  max-width: calc(100vw - 80px);
+}
+
+.common-toolbar .search-container.show .search-input {
+  width: 100% !important;
+  height: 36px !important;
+  font-size: 14px !important;
+  padding-left: 36px !important;
+}
+
+.common-toolbar .search-container.show .search-icon-left {
+  left: 12px;
+  font-size: 14px;
+}
+
+/* Search results dropdown */
+.common-toolbar .search-result-container {
+  margin-top: 8px;
+  max-height: 350px;
+  overflow-y: auto;
+}
+
+/* Notification and account icons alignment */
+.common-toolbar .notification-icon,
+.common-toolbar .account {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* ================================================== */
+/* Action Icons (Library List)                        */
+/* ================================================== */
 
 /* Fix action icons appearing on multiple lines */
 td > div > .op-icon,
