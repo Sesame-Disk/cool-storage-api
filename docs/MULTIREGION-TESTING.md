@@ -45,7 +45,25 @@ This document describes how to set up and test the multi-region storage capabili
 
 ## Quick Start
 
-### 1. Start the Stack
+### 1. Bootstrap the Environment
+
+**Recommended: Use the unified bootstrap script**
+
+```bash
+# Development mode (single instance, minimal resources)
+./scripts/bootstrap.sh dev
+
+# Multi-region mode (USA + EU with nginx load balancer)
+./scripts/bootstrap.sh multiregion
+
+# Clean start (removes volumes)
+./scripts/bootstrap.sh multiregion --clean
+
+# Stop environment
+./scripts/bootstrap.sh multiregion --down
+```
+
+### Alternative: Manual Start
 
 ```bash
 # Build and start all services
@@ -122,8 +140,9 @@ Then run:
 ## Quick Test Commands
 
 ```bash
-# Bootstrap the environment (one command)
-./scripts/bootstrap-multiregion.sh
+# Bootstrap the environment
+./scripts/bootstrap.sh dev              # Development (single instance)
+./scripts/bootstrap.sh multiregion      # Multi-region (USA + EU)
 
 # Run tests in container (recommended - no /etc/hosts needed)
 ./scripts/run-tests.sh multiregion all      # Basic tests
@@ -135,18 +154,18 @@ Then run:
 ./scripts/test-failover.sh all
 
 # Stop environment
-./scripts/bootstrap-multiregion.sh --down
+./scripts/bootstrap.sh --down
 
 # Clean start (remove data)
-./scripts/bootstrap-multiregion.sh --clean
+./scripts/bootstrap.sh multiregion --clean
 ```
 
 ## Available Test Scripts
 
 | Script | Purpose |
 |--------|---------|
-| `run-tests.sh` | **Recommended** - Runs tests in container (no /etc/hosts needed) |
-| `bootstrap-multiregion.sh` | One-command setup/teardown of multi-region environment |
+| `bootstrap.sh` | **Recommended** - Unified bootstrap for dev and multi-region modes |
+| `run-tests.sh` | Runs tests in container (no /etc/hosts needed) |
 | `test-multiregion.sh` | Basic connectivity, upload, routing tests (host-based) |
 | `test-failover.sh` | Large file upload (1GB), failover during operations (host-based) |
 
@@ -300,13 +319,14 @@ docker-compose -f docker-compose-multiregion.yaml down -v
 
 | File | Purpose |
 |------|---------|
+| `docker-compose.yaml` | Development stack (single instance) |
 | `docker-compose-multiregion.yaml` | Multi-region stack definition |
 | `Dockerfile.test` | Test container image |
 | `configs/nginx-multiregion.conf` | Nginx load balancer config |
 | `configs/config-usa.yaml` | USA server configuration |
 | `configs/config-eu.yaml` | EU server configuration |
+| `scripts/bootstrap.sh` | Unified environment setup (dev/multiregion) |
 | `scripts/run-tests.sh` | Container-based test runner |
-| `scripts/bootstrap-multiregion.sh` | Environment setup/teardown |
 | `scripts/test-multiregion.sh` | Multi-region test script |
 | `scripts/test-failover.sh` | Failover test script |
 

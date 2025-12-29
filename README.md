@@ -804,20 +804,17 @@ Alternative: Collabora Online (LibreOffice-based)
 - **Docker & Docker Compose** - [Install Docker](https://docs.docker.com/get-docker/)
 - **MinIO** (or S3-compatible storage) - Included in Docker Compose
 
-### Quick Start (Docker Compose)
+### Quick Start (Bootstrap Script)
 
-The fastest way to get started is with Docker Compose, which sets up everything:
+The fastest way to get started is with the bootstrap script:
 
 ```bash
 # Clone the repository
 git clone https://github.com/Sesame-Disk/sesamefs.git
 cd sesamefs
 
-# Start all services (Cassandra, MinIO, SesameFS)
-docker-compose up -d
-
-# Verify services are running
-docker-compose ps
+# Start development environment (Cassandra, MinIO, SesameFS)
+./scripts/bootstrap.sh dev
 
 # Test the API
 curl http://localhost:8080/ping
@@ -826,28 +823,28 @@ curl http://localhost:8080/ping
 # Test with dev token
 curl http://localhost:8080/api2/account/info/ \
   -H "Authorization: Token dev-token-123"
+
+# Stop when done
+./scripts/bootstrap.sh --down
 ```
 
-### Local Development (Without Docker)
+### Local Development (Run Go Locally)
 
-For active development, run SesameFS locally with Docker services:
+For active development with hot-reload, run Go locally while infrastructure runs in Docker:
 
 ```bash
-# 1. Start infrastructure only (Cassandra + MinIO)
-docker-compose up -d cassandra minio
+# 1. Start infrastructure (Cassandra + MinIO + schema)
+./scripts/bootstrap.sh dev
 
-# 2. Wait for Cassandra to be ready (about 60s first time)
-docker-compose logs -f cassandra
-# Wait for "Startup complete"
+# 2. Stop the SesameFS container (keep infrastructure running)
+docker-compose stop sesamefs
 
-# 3. Copy and configure
-cp config.example.yaml config.yaml
-# Edit config.yaml if needed
-
-# 4. Run SesameFS locally
+# 3. Run SesameFS locally with hot-reload
 go run ./cmd/sesamefs serve
 
-# 5. In another terminal, run tests
+# 4. Make changes, restart Go process, repeat
+
+# 5. Run tests
 go test ./...
 
 # 6. Test the API
@@ -859,11 +856,8 @@ curl http://localhost:8080/ping
 SesameFS supports multi-region deployments with automatic failover. Test this locally:
 
 ```bash
-# 1. Add hostname entries (one-time setup)
-sudo sh -c 'echo "127.0.0.1 us.sesamefs.local eu.sesamefs.local sesamefs.local" >> /etc/hosts'
-
-# 2. Bootstrap the multi-region environment
-./scripts/bootstrap-multiregion.sh
+# 1. Bootstrap the multi-region environment
+./scripts/bootstrap.sh multiregion
 
 # This starts:
 # - nginx (load balancer on port 8080)
@@ -872,23 +866,26 @@ sudo sh -c 'echo "127.0.0.1 us.sesamefs.local eu.sesamefs.local sesamefs.local" 
 # - minio (with regional buckets: sesamefs-usa, sesamefs-eu)
 # - cassandra (shared database)
 
-# 3. Test regional routing
-curl http://localhost:8080/ping           # Load balanced
+# 2. Run tests in container (no /etc/hosts needed!)
+./scripts/run-tests.sh multiregion all
+
+# 3. Test failover scenarios (1GB upload, server stops mid-operation)
+./scripts/run-tests.sh failover all
+
+# 4. (Optional) For hostname-based routing from host:
+sudo sh -c 'echo "127.0.0.1 us.sesamefs.local eu.sesamefs.local" >> /etc/hosts'
 curl http://us.sesamefs.local:8080/ping   # Routes to USA server
 curl http://eu.sesamefs.local:8080/ping   # Routes to EU server
-
-# 4. Run the full test suite
-./scripts/test-multiregion.sh all
 
 # 5. View MinIO Console (see bucket contents)
 open http://localhost:9001
 # Login: minioadmin / minioadmin
 
 # 6. Stop the environment
-./scripts/bootstrap-multiregion.sh --down
+./scripts/bootstrap.sh multiregion --down
 
 # Clean start (removes all data)
-./scripts/bootstrap-multiregion.sh --clean
+./scripts/bootstrap.sh multiregion --clean
 ```
 
 **Multi-Region Architecture:**
@@ -940,22 +937,30 @@ See [docs/MULTIREGION-TESTING.md](docs/MULTIREGION-TESTING.md) for detailed test
 ```
 sesamefs/
 ├── cmd/
-│   └── sesamefs/           # Main application entry point
+│   └── sesamefs/              # Main application entry point
 ├── internal/
-│   ├── api/                # HTTP handlers
-│   │   ├── v2/             # REST API v2
-│   │   └── seafhttp/       # Seafile sync protocol
-│   ├── auth/               # OIDC authentication
-│   ├── chunker/            # FastCDC implementation
-│   ├── storage/            # Storage backends (S3, Glacier, Disk)
-│   ├── db/                 # Cassandra repository layer
-│   ├── models/             # Domain models
-│   └── services/           # Business logic
-├── pkg/                    # Public packages
-├── config/                 # Configuration
-├── migrations/             # Cassandra schema migrations
-├── _legacy/                # Archived prototype code
-└── docker-compose.yaml
+│   ├── api/                   # HTTP handlers
+│   │   ├── v2/                # REST API v2
+│   │   └── seafhttp/          # Seafile sync protocol
+│   ├── auth/                  # OIDC authentication
+│   ├── chunker/               # FastCDC implementation
+│   ├── storage/               # Storage backends (S3, Glacier, Disk)
+│   ├── db/                    # Cassandra repository layer
+│   ├── models/                # Domain models
+│   └── services/              # Business logic
+├── scripts/
+│   ├── bootstrap.sh           # Dev/multi-region environment setup
+│   ├── run-tests.sh           # Container-based test runner
+│   ├── test-multiregion.sh    # Multi-region tests
+│   └── test-failover.sh       # Failover scenario tests
+├── docs/
+│   ├── API-ROADMAP.md         # Pending API endpoints by phase
+│   ├── STORAGE_ARCHITECTURE.md # Multi-region storage design
+│   ├── MULTIREGION-TESTING.md # Testing guide
+│   └── SEAFILE_COMPATIBILITY.md # Protocol compatibility
+├── configs/                   # Per-environment configs
+├── docker-compose.yaml        # Development stack
+└── docker-compose-multiregion.yaml # Multi-region stack
 ```
 
 ---
@@ -972,6 +977,9 @@ The original prototype code has been archived in `_legacy/` for reference:
 
 ## Documentation
 
+- [API Roadmap](docs/API-ROADMAP.md) - Pending endpoints organized by implementation phase
+- [Storage Architecture](docs/STORAGE_ARCHITECTURE.md) - Multi-region storage design and policies
+- [Multi-Region Testing](docs/MULTIREGION-TESTING.md) - Testing guide for multi-region setup
 - [Seafile API Compatibility](docs/SEAFILE_COMPATIBILITY.md) - How the Seafile-compatible API works
 - [Licensing Guide](docs/LICENSING.md) - Legal considerations for using and distributing SesameFS
 
