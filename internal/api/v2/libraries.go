@@ -1,7 +1,11 @@
 package v2
 
 import (
+	"crypto/sha1"
+	"encoding/hex"
+	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/Sesame-Disk/sesamefs/internal/config"
@@ -11,15 +15,26 @@ import (
 	"github.com/google/uuid"
 )
 
+// LibraryTokenCreator is an interface for creating sync tokens
+type LibraryTokenCreator interface {
+	CreateDownloadToken(orgID, repoID, path, userID string) (string, error)
+}
+
 // LibraryHandler handles library-related API requests
 type LibraryHandler struct {
-	db     *db.DB
-	config *config.Config
+	db           *db.DB
+	config       *config.Config
+	tokenCreator LibraryTokenCreator
 }
 
 // RegisterLibraryRoutes registers library routes
 func RegisterLibraryRoutes(rg *gin.RouterGroup, database *db.DB, cfg *config.Config) {
-	h := &LibraryHandler{db: database, config: cfg}
+	RegisterLibraryRoutesWithToken(rg, database, cfg, nil)
+}
+
+// RegisterLibraryRoutesWithToken registers library routes with token creator
+func RegisterLibraryRoutesWithToken(rg *gin.RouterGroup, database *db.DB, cfg *config.Config, tokenCreator LibraryTokenCreator) {
+	h := &LibraryHandler{db: database, config: cfg, tokenCreator: tokenCreator}
 
 	repos := rg.Group("/repos")
 	{
@@ -102,17 +117,34 @@ func (h *LibraryHandler) ListLibraries(c *gin.Context) {
 
 // CreateLibraryRequest represents the request body for creating a library
 type CreateLibraryRequest struct {
-	Name        string `json:"name" binding:"required"`
-	Description string `json:"description"`
-	Encrypted   bool   `json:"encrypted"`
-	Password    string `json:"password,omitempty"` // For encrypted libraries
+	Name        string `json:"name" form:"name"`
+	Description string `json:"description" form:"desc"` // Seafile uses "desc" in form
+	Encrypted   bool   `json:"encrypted" form:"encrypted"`
+	Password    string `json:"password,omitempty" form:"passwd"` // Seafile uses "passwd" in form
 }
 
 // CreateLibrary creates a new library
 func (h *LibraryHandler) CreateLibrary(c *gin.Context) {
 	var req CreateLibraryRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+
+	// Try JSON first, then fall back to form data (Seafile desktop uses form data)
+	contentType := c.GetHeader("Content-Type")
+	if strings.Contains(contentType, "application/json") {
+		if err := c.ShouldBindJSON(&req); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+	} else {
+		// Form data (application/x-www-form-urlencoded)
+		req.Name = c.PostForm("name")
+		req.Description = c.PostForm("desc")
+		req.Password = c.PostForm("passwd")
+		req.Encrypted = c.PostForm("encrypted") == "true" || c.PostForm("encrypted") == "1"
+	}
+
+	// Validate required field
+	if req.Name == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "name is required"})
 		return
 	}
 
@@ -153,25 +185,105 @@ func (h *LibraryHandler) CreateLibrary(c *gin.Context) {
 		UpdatedAt:      now,
 	}
 
-	// TODO: Handle encrypted library setup (magic, random_key)
+	// Create empty root directory fs_object
+	// Seafile uses a specific format for empty directories - the fs_id is the SHA-1 hash
+	// of the serialized directory content. For an empty dir, we use a well-known empty dir hash.
+	emptyDirEntries := "[]" // Empty JSON array for directory entries
+	emptyDirData := fmt.Sprintf("%d\n%s", 1, emptyDirEntries) // version + entries
+	emptyDirHash := sha1.Sum([]byte(emptyDirData))
+	rootFSID := hex.EncodeToString(emptyDirHash[:])
 
-	// Insert into database (pass UUIDs as strings)
+	// Store empty root directory in fs_objects
+	if err := h.db.Session().Query(`
+		INSERT INTO fs_objects (library_id, fs_id, obj_type, obj_name, dir_entries, mtime)
+		VALUES (?, ?, ?, ?, ?, ?)
+	`, newLibID.String(), rootFSID, "dir", "", emptyDirEntries, now.Unix()).Exec(); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create root directory", "details": err.Error()})
+		return
+	}
+
+	// Generate initial commit ID (SHA-1 hash of repo creation data)
+	commitData := fmt.Sprintf("%s:%s:%d", newLibID.String(), req.Name, now.UnixNano())
+	commitHash := sha1.Sum([]byte(commitData))
+	headCommitID := hex.EncodeToString(commitHash[:])
+
+	// Insert into database with head_commit_id
 	if err := h.db.Session().Query(`
 		INSERT INTO libraries (
 			org_id, library_id, owner_id, name, description, encrypted,
 			storage_class, size_bytes, file_count, version_ttl_days,
-			created_at, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			head_commit_id, created_at, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`, orgID, newLibID.String(), userID, library.Name,
 		library.Description, library.Encrypted, library.StorageClass,
 		library.SizeBytes, library.FileCount, library.VersionTTLDays,
-		library.CreatedAt, library.UpdatedAt,
+		headCommitID, library.CreatedAt, library.UpdatedAt,
 	).Exec(); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create library", "details": err.Error()})
 		return
 	}
 
-	c.JSON(http.StatusCreated, library)
+	// Create initial commit record with root_fs_id pointing to empty root directory
+	if err := h.db.Session().Query(`
+		INSERT INTO commits (library_id, commit_id, root_fs_id, creator_id, description, created_at)
+		VALUES (?, ?, ?, ?, ?, ?)
+	`, newLibID.String(), headCommitID, rootFSID, userID, "Initial commit", now).Exec(); err != nil {
+		// Non-fatal - library was created
+	}
+
+	// Get user email for response
+	userEmail := c.GetString("user_email")
+	if userEmail == "" {
+		userEmail = userID + "@sesamefs.local"
+	}
+
+	// Generate sync token if token creator is available
+	syncToken := ""
+	if h.tokenCreator != nil {
+		token, err := h.tokenCreator.CreateDownloadToken(orgID, newLibID.String(), "/", userID)
+		if err == nil {
+			syncToken = token
+		}
+	}
+
+	// Get server port for relay info
+	serverPort := "8080"
+	if h.config != nil && h.config.Server.Port != "" {
+		serverPort = strings.TrimPrefix(h.config.Server.Port, ":")
+	}
+
+	// Return Seafile-compatible response (HTTP 200, not 201)
+	// This format matches what Seafile returns and includes sync info
+	response := gin.H{
+		"relay_id":        "localhost",
+		"relay_addr":      "localhost",
+		"relay_port":      serverPort,
+		"email":           userEmail,
+		"token":           syncToken,
+		"repo_id":         newLibID.String(),
+		"repo_name":       req.Name,
+		"repo_desc":       req.Description,
+		"repo_size":       0,
+		"repo_size_formatted": "0 bytes",
+		"mtime":           now.Unix(),
+		"mtime_relative":  "",
+		"encrypted":       "",
+		"enc_version":     0,
+		"salt":            "",
+		"magic":           "",
+		"random_key":      "",
+		"repo_version":    1,
+		"head_commit_id":  headCommitID,
+		"permission":      "rw",
+	}
+
+	// Set encrypted fields if library is encrypted
+	if req.Encrypted {
+		response["encrypted"] = true
+		// TODO: Handle encrypted library setup (magic, random_key, salt)
+	}
+
+	c.JSON(http.StatusOK, response)
 }
 
 // GetLibrary returns a single library by ID

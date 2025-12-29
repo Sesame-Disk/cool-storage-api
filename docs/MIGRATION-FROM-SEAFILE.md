@@ -36,15 +36,15 @@ Before starting migration:
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
-│                        MIGRATION TIMELINE                                │
+│                        MIGRATION PHASES                                  │
 ├─────────────────────────────────────────────────────────────────────────┤
 │                                                                          │
 │  Phase 1          Phase 2         Phase 3        Phase 4      Phase 5   │
 │  Preparation      Shadow Mode     Read-Through   Cutover      Cleanup   │
 │  ───────────      ───────────     ────────────   ───────      ───────   │
-│  2-3 weeks        1 week          1 week         5-15 min     2-4 weeks │
-│                                                                          │
 │  [No downtime]    [No downtime]   [No downtime]  [Brief]     [No down]  │
+│                                                                          │
+│  Each phase can proceed to the next when its checklist is complete.     │
 │                                                                          │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
@@ -481,9 +481,8 @@ After cutover, continue migrating cold blocks in background:
 # Monitor progress
 ./sesamefs migrate status --watch
 
-# Estimated time for 20TB:
-# - At 100 MB/s: ~55 hours
-# - With rate limiting: 1-2 weeks
+# Progress depends on rate limiting and network throughput
+# Monitor with: ./sesamefs migrate status --watch
 ```
 
 ### 5.2 Verify Complete Migration
@@ -501,7 +500,7 @@ After cutover, continue migrating cold blocks in background:
 
 ### 5.3 Decommission Seafile
 
-Once fully migrated and stable (recommend 2-4 weeks post-cutover):
+Once fully migrated and verified stable:
 
 ```bash
 # 1. Disable Seafile fallback

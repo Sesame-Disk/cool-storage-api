@@ -6,6 +6,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
 
 	"github.com/Sesame-Disk/sesamefs/internal/api/v2"
 	"github.com/Sesame-Disk/sesamefs/internal/config"
@@ -34,6 +35,12 @@ func NewServer(cfg *config.Config, database *db.DB) *Server {
 	}
 
 	router := gin.New()
+	// Disable trailing slash redirect - Seafile clients send POST to /api2/repos/
+	// and Gin's 307 redirect breaks POST requests
+	router.RedirectTrailingSlash = false
+	router.RedirectFixedPath = false
+	router.HandleMethodNotAllowed = true
+
 	router.Use(gin.Recovery())
 	router.Use(gin.Logger())
 
@@ -254,8 +261,8 @@ func (s *Server) setupRoutes() {
 		protected := apiV2.Group("")
 		protected.Use(s.authMiddleware())
 		{
-			// Library endpoints
-			v2.RegisterLibraryRoutes(protected, s.db, s.config)
+			// Library endpoints (with token creator for sync token generation)
+			v2.RegisterLibraryRoutesWithToken(protected, s.db, s.config, s.tokenStore)
 
 			// File endpoints (with Seafile-compatible URL generation)
 			v2.RegisterFileRoutes(protected, s.db, s.config, s.storage, s.tokenStore, serverURL)
@@ -275,27 +282,31 @@ func (s *Server) setupRoutes() {
 
 	// Legacy /api2/ routes for Seafile CLI compatibility
 	// The Seafile CLI uses /api2/ prefix (no version in path)
+	// Routes registered WITHOUT trailing slashes since our wrapper strips them from requests
 	api2 := s.router.Group("/api2")
 	{
 		// Auth token endpoint (used by seaf-cli for login)
-		api2.POST("/auth-token/", s.handleAuthToken)
+		api2.POST("/auth-token", s.handleAuthToken)
 
 		// Ping/server info
-		api2.GET("/ping/", s.handlePing)
-		api2.GET("/server-info/", s.handleServerInfo)
+		api2.GET("/ping", s.handlePing)
+		api2.GET("/server-info", s.handleServerInfo)
 
 		// Account info
-		api2.GET("/account/info/", s.authMiddleware(), s.handleAccountInfo)
+		api2.GET("/account/info", s.authMiddleware(), s.handleAccountInfo)
 
 		// Protected endpoints
 		protected := api2.Group("")
 		protected.Use(s.authMiddleware())
 		{
-			// Library endpoints (same handlers as v2)
-			v2.RegisterLibraryRoutes(protected, s.db, s.config)
+			// Library endpoints (same handlers as v2, with token creator)
+			v2.RegisterLibraryRoutesWithToken(protected, s.db, s.config, s.tokenStore)
 
 			// File endpoints
 			v2.RegisterFileRoutes(protected, s.db, s.config, s.storage, s.tokenStore, serverURL)
+
+			// Repo tokens endpoint (for getting sync tokens for multiple repos)
+			protected.GET("/repo-tokens", s.handleRepoTokens)
 		}
 	}
 
@@ -509,11 +520,74 @@ func (s *Server) handleAccountInfo(c *gin.Context) {
 	})
 }
 
+// handleRepoTokens returns sync tokens for the specified repositories
+// GET /api2/repo-tokens?repos=uuid1,uuid2,...
+func (s *Server) handleRepoTokens(c *gin.Context) {
+	userID := c.GetString("user_id")
+	orgID := c.GetString("org_id")
+	reposParam := c.Query("repos")
+
+	if reposParam == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "repos parameter required"})
+		return
+	}
+
+	// Parse repo IDs (comma-separated)
+	repoIDs := strings.Split(reposParam, ",")
+
+	// Generate tokens for each repo
+	tokens := make(map[string]string)
+	for _, repoID := range repoIDs {
+		repoID = strings.TrimSpace(repoID)
+		if repoID == "" {
+			continue
+		}
+
+		// Verify the repo exists and user has access
+		var libID string
+		err := s.db.Session().Query(`
+			SELECT library_id FROM libraries
+			WHERE org_id = ? AND library_id = ?
+		`, orgID, repoID).Scan(&libID)
+		if err != nil {
+			// Skip repos that don't exist or user doesn't have access to
+			continue
+		}
+
+		// Generate a sync token for this repo
+		token, err := s.tokenStore.CreateDownloadToken(orgID, repoID, "/", userID)
+		if err != nil {
+			continue
+		}
+		tokens[repoID] = token
+	}
+
+	c.JSON(http.StatusOK, tokens)
+}
+
+// trailingSlashHandler wraps a handler and strips trailing slashes from requests
+type trailingSlashHandler struct {
+	handler http.Handler
+}
+
+func (h *trailingSlashHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// Strip trailing slash (except for root path)
+	// This ensures /api2/repos/ is handled the same as /api2/repos
+	if len(r.URL.Path) > 1 && r.URL.Path[len(r.URL.Path)-1] == '/' {
+		r.URL.Path = r.URL.Path[:len(r.URL.Path)-1]
+	}
+	h.handler.ServeHTTP(w, r)
+}
+
 // Run starts the HTTP server
 func (s *Server) Run() error {
+	// Wrap router to strip trailing slashes before gin routing
+	// This prevents gin's 307 redirect which breaks POST requests from Seafile clients
+	handler := &trailingSlashHandler{handler: s.router}
+
 	s.server = &http.Server{
 		Addr:         s.config.Server.Port,
-		Handler:      s.router,
+		Handler:      handler,
 		ReadTimeout:  s.config.Server.ReadTimeout,
 		WriteTimeout: s.config.Server.WriteTimeout,
 	}

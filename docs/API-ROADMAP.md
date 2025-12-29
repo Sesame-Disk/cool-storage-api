@@ -57,8 +57,7 @@ These endpoints enable Seafile Desktop client synchronization:
 ## Phase 1: Core File Operations
 
 **Priority: HIGH**
-**When to implement: Before any web UI development**
-**Estimated effort: 1-2 weeks**
+**Prerequisite for: Web UI development**
 
 These endpoints are essential for basic file management through a web interface.
 
@@ -151,8 +150,7 @@ POST /api2/repos/:id/dir/?p=/path
 ## Phase 2: User Features
 
 **Priority: MEDIUM**
-**When to implement: When building user-facing features**
-**Estimated effort: 1 week**
+**Prerequisite for: User-facing web features**
 
 ### Starred Files
 
@@ -208,8 +206,7 @@ CREATE TABLE starred_files (
 ## Phase 3: Productivity Features
 
 **Priority: MEDIUM**
-**When to implement: For collaborative editing support**
-**Estimated effort: 1-2 weeks**
+**Prerequisite for: Collaborative editing (OnlyOffice integration)**
 
 ### File Locking
 
@@ -292,8 +289,7 @@ CREATE TABLE activities (
 ## Phase 4: Advanced Features
 
 **Priority: LOW**
-**When to implement: For feature parity with Seafile Pro**
-**Estimated effort: 2-3 weeks**
+**Prerequisite for: Feature parity with Seafile Pro**
 
 ### Search
 

@@ -55,7 +55,7 @@ chunking:
 
 ### Decision 3: Client Compatibility - Seafile Protocol
 
-**Status**: CONFIRMED
+**Status**: CONFIRMED & IMPLEMENTED
 
 **Choice**: Implement Seafile sync protocol (`/seafhttp/`) for client compatibility
 
@@ -65,7 +65,7 @@ chunking:
 - Desktop and Android are GPLv3 (usable as clients)
 - Reduces time-to-market significantly
 
-**Implementation**: Phase 2 (after MVP REST API)
+**Implementation**: ✅ Complete - Desktop clients can sync via `/seafhttp/` endpoints
 
 ---
 
@@ -112,21 +112,26 @@ auth:
 
 ### Decision 6: Phase 1 Priority Order
 
-**Status**: CONFIRMED
+**Status**: CONFIRMED (updated December 2025)
 
-**Order**:
-1. Project structure and Go modules
-2. Configuration management (Viper)
-3. Cassandra connection and schema
-4. Library CRUD operations
-5. FastCDC chunking implementation
-6. Block storage layer (S3)
-7. File upload (chunked to S3)
-8. File download (reassemble from blocks)
-9. Directory operations
-10. Share links (basic)
-11. OIDC authentication integration
-12. Glacier integration (upload + restore)
+**Completed**:
+- [x] Project structure and Go modules
+- [x] Configuration management (Viper)
+- [x] Cassandra connection and schema
+- [x] Library CRUD operations
+- [x] Block storage layer (S3)
+- [x] Seafile sync protocol (`/seafhttp/`) - Desktop client compatible
+- [x] Multi-region storage with nginx failover
+- [x] SHA-1 → SHA-256 block ID mapping
+- [x] Container-based testing infrastructure
+
+**Remaining**:
+- [ ] File operations with commit creation (for web UI)
+- [ ] Directory operations with commit creation
+- [ ] Share links (basic)
+- [ ] OIDC authentication integration
+- [ ] Glacier integration (upload + restore)
+- [ ] FastCDC chunking implementation (currently using fixed blocks)
 
 ---
 
@@ -267,7 +272,88 @@ versioning:
 
 ---
 
+### Decision 13: Multi-Region Storage Architecture
+
+**Status**: CONFIRMED
+
+**Choice**: Hostname-based routing with nginx load balancer and automatic failover
+
+**Architecture**:
+```
+Client → nginx (hostname routing) → Regional SesameFS instance → Regional S3 bucket
+                                  ↘ Failover to other region if primary fails
+```
+
+**Key Features**:
+- `us.sesamefs.local` → USA backend (primary: sesamefs-usa bucket)
+- `eu.sesamefs.local` → EU backend (primary: sesamefs-eu bucket)
+- Automatic failover at nginx level
+- Shared Cassandra for metadata (multi-DC replication)
+- Each region can fail over to other region's storage
+
+**Configuration**:
+```yaml
+storage:
+  classes:
+    hot-primary:
+      bucket: "sesamefs-usa"
+    hot-failover:
+      bucket: "sesamefs-eu"
+```
+
+**Documentation**: See [MULTIREGION-TESTING.md](docs/MULTIREGION-TESTING.md)
+
+---
+
+### Decision 14: SHA-1 to SHA-256 Block ID Mapping
+
+**Status**: CONFIRMED
+
+**Choice**: Store blocks with SHA-256 internally, translate SHA-1 from Seafile clients
+
+**Rationale**:
+- SHA-256 is more secure for content addressing
+- Seafile clients use SHA-1 (40 chars) - can't change client behavior
+- Transparent translation via `block_id_mappings` table
+
+**Schema**:
+```cql
+CREATE TABLE block_id_mappings (
+    org_id UUID,
+    external_id TEXT,    -- SHA-1 from Seafile client (40 chars)
+    internal_id TEXT,    -- SHA-256 used in storage (64 chars)
+    created_at TIMESTAMP,
+    PRIMARY KEY ((org_id), external_id)
+);
+```
+
+**Flow**:
+1. Client uploads block with SHA-1 ID
+2. Server computes SHA-256 of content
+3. Stores block under SHA-256 key
+4. Creates mapping: SHA-1 → SHA-256
+5. Client requests block by SHA-1, server translates and fetches
+
+---
+
 ## Open Decisions
+
+---
+
+### Decision 15: Migration Strategy (Seafile → SesameFS)
+
+**Status**: OPEN
+
+**Context**: For users with existing Seafile deployments (e.g., 20TB multi-tenant), need a migration path with minimal downtime.
+
+**Options**:
+1. **Lazy migration** - Read from Seafile storage, copy to SesameFS on access
+2. **Bulk migration** - Offline migration with maintenance window
+3. **Shadow mode** - Run both systems, compare responses, gradual cutover
+
+**Current Recommendation**: Lazy migration with shadow mode validation
+
+**Documentation**: See [MIGRATION-FROM-SEAFILE.md](docs/MIGRATION-FROM-SEAFILE.md)
 
 ---
 
@@ -332,7 +418,11 @@ Implementation requires studying:
 | 2025-12-26 | Auth: OIDC (lower priority) | Confirmed |
 | 2025-12-26 | Phase 1 priorities | Confirmed |
 | 2025-12-26 | Multi-tenancy: Logical → Per-customer | Confirmed |
-| 2025-12-26 | Runtime versions: Go 1.25.5, Debian Bookworm | Confirmed |
+| 2025-12-26 | Runtime versions: Go 1.25.5, Debian Trixie | Confirmed |
 | 2025-12-26 | Project name: SesameFS | Confirmed |
 | 2025-12-26 | License: MIT (initial) | Confirmed |
 | 2025-12-26 | Versioning: All versions with TTL | Confirmed |
+| 2025-12-29 | Multi-region architecture with nginx failover | Confirmed |
+| 2025-12-29 | SHA-1 → SHA-256 block ID mapping | Confirmed |
+| 2025-12-29 | Phase 1 priorities updated (sync protocol complete) | Updated |
+| 2025-12-29 | Migration strategy from Seafile | Open |

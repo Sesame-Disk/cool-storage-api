@@ -1,7 +1,10 @@
 package api
 
 import (
+	"bytes"
+	"compress/zlib"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -114,14 +117,14 @@ type Commit struct {
 
 // FSObject represents a Seafile filesystem object (file or directory)
 type FSObject struct {
-	Type    int         `json:"type"`    // 1 = file, 3 = directory
-	ID      string      `json:"id"`      // SHA-1 hash of contents
-	Name    string      `json:"name,omitempty"`
-	Mode    int         `json:"mode,omitempty"`   // Unix file mode
-	Mtime   int64       `json:"mtime,omitempty"`  // Modification time
-	Size    int64       `json:"size,omitempty"`   // File size
-	BlockIDs []string   `json:"block_ids,omitempty"` // Block IDs for files
-	Entries []FSEntry   `json:"dirents,omitempty"`   // Directory entries
+	Type     int       `json:"type"`              // 1 = file, 3 = directory
+	ID       string    `json:"id"`                // SHA-1 hash of contents
+	Name     string    `json:"name,omitempty"`
+	Mode     int       `json:"mode,omitempty"`    // Unix file mode
+	Mtime    int64     `json:"mtime,omitempty"`   // Modification time
+	Size     int64     `json:"size,omitempty"`    // File size
+	BlockIDs []string  `json:"block_ids,omitempty"` // Block IDs for files
+	Entries  *[]FSEntry `json:"dirents,omitempty"`  // Directory entries (pointer to distinguish nil from empty)
 }
 
 // FSEntry represents a directory entry
@@ -723,9 +726,12 @@ func (h *SyncHandler) GetFSObject(c *gin.Context) {
 		obj.BlockIDs = blockIDs
 	} else {
 		obj.Type = 3
-		if entriesJSON != "" {
-			json.Unmarshal([]byte(entriesJSON), &obj.Entries)
+		// For directories, always include dirents (even if empty)
+		entries := []FSEntry{}
+		if entriesJSON != "" && entriesJSON != "[]" {
+			json.Unmarshal([]byte(entriesJSON), &entries)
 		}
+		obj.Entries = &entries
 	}
 
 	c.JSON(http.StatusOK, obj)
@@ -733,6 +739,8 @@ func (h *SyncHandler) GetFSObject(c *gin.Context) {
 
 // PackFS packs multiple FS objects into a single response
 // POST /seafhttp/repo/:repo_id/pack-fs
+// Returns binary packed format that Seafile client expects:
+// For each object: 40-byte hex ID + object size (4 bytes BE) + zlib-compressed JSON
 func (h *SyncHandler) PackFS(c *gin.Context) {
 	repoID := c.Param("repo_id")
 
@@ -743,12 +751,26 @@ func (h *SyncHandler) PackFS(c *gin.Context) {
 		return
 	}
 
-	fsIDs := strings.Split(strings.TrimSpace(string(body)), "\n")
+	// Parse the body - can be JSON array or newline-separated
+	var fsIDs []string
+	bodyStr := strings.TrimSpace(string(body))
+	if strings.HasPrefix(bodyStr, "[") {
+		// JSON array format
+		if err := json.Unmarshal(body, &fsIDs); err != nil {
+			log.Printf("pack-fs: failed to parse JSON array: %v", err)
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid JSON array"})
+			return
+		}
+	} else {
+		// Newline-separated format
+		fsIDs = strings.Split(bodyStr, "\n")
+	}
 
-	// Collect FS objects
-	var objects []FSObject
+	// Build binary response
+	var buf bytes.Buffer
+
 	for _, fsID := range fsIDs {
-		if fsID == "" {
+		if fsID == "" || len(fsID) != 40 {
 			continue
 		}
 
@@ -765,37 +787,67 @@ func (h *SyncHandler) PackFS(c *gin.Context) {
 		`, repoID, fsID).Scan(&fsType, &name, &size, &mtime, &entriesJSON, &blockIDs)
 
 		if err != nil {
+			log.Printf("pack-fs: object %s not found: %v", fsID, err)
 			continue // Skip missing objects
 		}
 
-		obj := FSObject{
-			ID:    fsID,
-			Name:  name,
-			Size:  size,
-			Mtime: mtime,
-		}
+		// Build JSON object that matches Seafile's format
+		var jsonObj interface{}
 
-		if fsType == "file" {
-			obj.Type = 1
-			obj.BlockIDs = blockIDs
+		if fsType == "dir" {
+			// Directory format: {"version": 1, "type": 3, "dirents": [...]}
+			var dirents []map[string]interface{}
+			if entriesJSON != "" && entriesJSON != "[]" {
+				// Parse the stored dirents
+				json.Unmarshal([]byte(entriesJSON), &dirents)
+			} else {
+				dirents = []map[string]interface{}{}
+			}
+			jsonObj = map[string]interface{}{
+				"version": 1,
+				"type":    3, // SEAF_METADATA_TYPE_DIR
+				"dirents": dirents,
+			}
 		} else {
-			obj.Type = 3
-			if entriesJSON != "" {
-				json.Unmarshal([]byte(entriesJSON), &obj.Entries)
+			// File format: {"version": 1, "type": 1, "block_ids": [...], "size": N}
+			jsonObj = map[string]interface{}{
+				"version":   1,
+				"type":      1, // SEAF_METADATA_TYPE_FILE
+				"block_ids": blockIDs,
+				"size":      size,
 			}
 		}
 
-		objects = append(objects, obj)
+		// Serialize to JSON
+		jsonBytes, err := json.Marshal(jsonObj)
+		if err != nil {
+			log.Printf("pack-fs: failed to marshal object %s: %v", fsID, err)
+			continue
+		}
+
+		// Compress with zlib
+		var compressed bytes.Buffer
+		zlibWriter := zlib.NewWriter(&compressed)
+		zlibWriter.Write(jsonBytes)
+		zlibWriter.Close()
+
+		// Write object ID (40-byte hex string, no newline)
+		buf.WriteString(fsID)
+
+		// Write object size (4 bytes, network byte order)
+		binary.Write(&buf, binary.BigEndian, uint32(compressed.Len()))
+
+		// Write compressed object content
+		buf.Write(compressed.Bytes())
 	}
 
-	c.JSON(http.StatusOK, objects)
+	c.Data(http.StatusOK, "application/octet-stream", buf.Bytes())
 }
 
 // RecvFS receives and stores FS objects from client
 // POST /seafhttp/repo/:repo_id/recv-fs
 // Seafile sends packed FS objects in binary format:
-// - 40-char hex FS ID + newline
-// - Binary object data (type byte + serialized content)
+// For each object: 40-byte hex ID + 4-byte size (BE) + zlib-compressed JSON
 func (h *SyncHandler) RecvFS(c *gin.Context) {
 	repoID := c.Param("repo_id")
 
@@ -806,74 +858,100 @@ func (h *SyncHandler) RecvFS(c *gin.Context) {
 		return
 	}
 
-	if len(body) < 41 {
+	if len(body) < 44 { // At least 40 (ID) + 4 (size)
 		c.JSON(http.StatusBadRequest, gin.H{"error": "body too short"})
 		return
 	}
 
 	// Parse packed FS objects
-	// Format: each object is [40-char hex ID][newline][object data]
-	// Multiple objects can be concatenated
+	// Format: each object is [40-char hex ID][4-byte size][zlib-compressed JSON]
 	offset := 0
 	objectsStored := 0
 
-	for offset < len(body) {
+	for offset+44 <= len(body) {
 		// Read 40-char hex FS ID
-		if offset+40 > len(body) {
-			break
-		}
 		fsID := string(body[offset : offset+40])
 		offset += 40
 
-		// Skip newline if present
-		if offset < len(body) && body[offset] == '\n' {
-			offset++
+		// Read 4-byte size (big-endian)
+		objSize := binary.BigEndian.Uint32(body[offset : offset+4])
+		offset += 4
+
+		// Read the compressed object data
+		if offset+int(objSize) > len(body) {
+			log.Printf("recv-fs: truncated object data for %s", fsID)
+			break
 		}
+		compressedData := body[offset : offset+int(objSize)]
+		offset += int(objSize)
 
-		// Find the object data - it ends at the next 40-char hex ID or end of body
-		dataStart := offset
-		dataEnd := len(body)
-
-		// Look for the next FS ID (40 hex chars followed by newline or end)
-		for i := offset; i < len(body)-40; i++ {
-			if isHexString(body[i:i+40]) && (i+40 >= len(body) || body[i+40] == '\n') {
-				dataEnd = i
-				break
-			}
+		// Decompress with zlib
+		zlibReader, err := zlib.NewReader(bytes.NewReader(compressedData))
+		if err != nil {
+			log.Printf("recv-fs: failed to create zlib reader for %s: %v", fsID, err)
+			continue
 		}
-
-		objData := body[dataStart:dataEnd]
-		offset = dataEnd
-
-		// Parse the object data (Seafile binary format)
-		// Type 1 = file, Type 3 = directory
-		if len(objData) == 0 {
+		jsonData, err := io.ReadAll(zlibReader)
+		zlibReader.Close()
+		if err != nil {
+			log.Printf("recv-fs: failed to decompress object %s: %v", fsID, err)
 			continue
 		}
 
-		objType := int(objData[0])
-		fsType := "dir"
-		if objType == 1 {
-			fsType = "file"
+		// Parse JSON
+		var obj map[string]interface{}
+		if err := json.Unmarshal(jsonData, &obj); err != nil {
+			log.Printf("recv-fs: failed to parse JSON for %s: %v", fsID, err)
+			continue
 		}
 
-		// For now, store the raw binary data and basic info
-		// Full parsing of Seafile binary format would go here
+		// Extract type (1=file, 3=dir)
+		objType := 0
+		if t, ok := obj["type"].(float64); ok {
+			objType = int(t)
+		}
+
+		fsType := "dir"
+		var size int64
+		var blockIDs []string
+		var entriesJSON string = "[]"
+
+		if objType == 1 {
+			// File object
+			fsType = "file"
+			if s, ok := obj["size"].(float64); ok {
+				size = int64(s)
+			}
+			if bids, ok := obj["block_ids"].([]interface{}); ok {
+				for _, bid := range bids {
+					if bidStr, ok := bid.(string); ok {
+						blockIDs = append(blockIDs, bidStr)
+					}
+				}
+			}
+		} else if objType == 3 {
+			// Directory object
+			if dirents, ok := obj["dirents"].([]interface{}); ok {
+				direntBytes, _ := json.Marshal(dirents)
+				entriesJSON = string(direntBytes)
+			}
+		}
+
 		now := time.Now().Unix()
 
-		err := h.db.Session().Query(`
+		err = h.db.Session().Query(`
 			INSERT INTO fs_objects (library_id, fs_id, obj_type, obj_name, size_bytes, mtime, dir_entries, block_ids)
 			VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-		`, repoID, fsID, fsType, "", 0, now, "[]", []string{}).Exec()
+		`, repoID, fsID, fsType, "", size, now, entriesJSON, blockIDs).Exec()
 
 		if err != nil {
-			fmt.Printf("recv-fs: Failed to store object %s: %v\n", fsID, err)
+			log.Printf("recv-fs: Failed to store object %s: %v", fsID, err)
 		} else {
 			objectsStored++
 		}
 	}
 
-	fmt.Printf("recv-fs: Stored %d objects for repo %s\n", objectsStored, repoID)
+	log.Printf("recv-fs: Stored %d objects for repo %s", objectsStored, repoID)
 	c.Status(http.StatusOK)
 }
 
