@@ -1,5 +1,7 @@
 import { siteRoot, historyRepoID } from './constants';
 import { Utils } from './utils';
+import { getToken } from './seafile-api';
+
 class URLDecorator {
 
   static getUrl(options) {
@@ -11,7 +13,9 @@ class URLDecorator {
         url = siteRoot + 'repo/' + historyRepoID + '/' + options.objID + '/download?' + params;
         break;
       case 'download_file_url':
-        url = siteRoot + 'lib/' + options.repoID + '/file' + Utils.encodePath(options.filePath) + '?dl=1';
+        // Include auth token in URL for downloads (opens in new tab without headers)
+        const token = getToken();
+        url = siteRoot + 'lib/' + options.repoID + '/file' + Utils.encodePath(options.filePath) + '?dl=1' + (token ? '&token=' + token : '');
         break;
       case 'file_revisions':
         params = 'p=' + Utils.encodePath(options.filePath);

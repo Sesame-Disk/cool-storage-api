@@ -4,6 +4,7 @@ import cookie from 'react-cookies';
 import moment from 'moment';
 import { navigate } from '@gatsbyjs/reach-router';
 import { gettext, siteRoot, username, enableVideoThumbnail } from '../../utils/constants';
+import { getToken } from '../../utils/seafile-api';
 import { seafileAPI } from '../../utils/seafile-api';
 import { Utils } from '../../utils/utils';
 import collabServer from '../../utils/collab-server';
@@ -1314,6 +1315,12 @@ class LibContentView extends React.Component {
         let url = siteRoot + 'lib/' + repoID + '/file' + Utils.encodePath(direntPath);
         if (dirent.is_sdoc_revision && dirent.revision_id) {
           url = siteRoot + 'lib/' + repoID + '/revisions/' + dirent.revision_id + '/';
+        }
+
+        // Add auth token to URL for file viewer (opens in new tab)
+        const token = getToken();
+        if (token) {
+          url += (url.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(token);
         }
 
         let isWeChat = Utils.isWeChat();

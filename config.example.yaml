@@ -111,15 +111,65 @@ auth:
 
 chunking:
   algorithm: fastcdc
-  min_size: 524288                    # 512 KB
-  avg_size: 2097152                   # 2 MB
-  max_size: 8388608                   # 8 MB
   hash_algorithm: sha256
+
+  # Adaptive chunk sizing (adjusts to client network speed)
+  # This applies to server-side chunking (web/API uploads)
+  # Seafile desktop/mobile clients control their own chunking (256KB-4MB, SHA-1)
+  adaptive:
+    enabled: true
+    absolute_min: 2097152             # 2 MB floor (slow/unstable connections)
+    absolute_max: 268435456           # 256 MB ceiling (datacenter speeds)
+    initial_size: 16777216            # 16 MB starting point
+    target_seconds: 8                 # Target ~8 seconds per chunk upload
+
+  # Speed probe (measures connection before upload)
+  probe:
+    size: 1048576                     # 1 MB probe size
+    timeout: 30s                      # Probe timeout
+
+  # Timeout and retry settings
+  retry:
+    chunk_timeout: 60s                # Abort chunk after 60 seconds
+    max_retries: 5                    # Max retry attempts
+    reduce_on_timeout: 0.5            # Reduce to 50% size on timeout
+    reduce_on_failure: 0.5            # Reduce to 50% size on failure
+    backoff_base: 1s                  # Base backoff duration
+    backoff_max_jitter: 500ms         # Max jitter to add
 
 versioning:
   default_ttl_days: 90                # 0 = keep forever
   min_ttl_days: 7
   gc_interval: 24h
+
+# OnlyOffice Document Server integration
+onlyoffice:
+  enabled: true
+  api_js_url: "https://office.sesamedisk.com/web-apps/apps/api/documents/api.js"
+  jwt_secret: ""                       # Set via ONLYOFFICE_JWT_SECRET env var
+  verify_certificate: false
+  force_save: true
+  # server_url: Public URL for OnlyOffice to fetch documents (required for remote OnlyOffice servers)
+  # If not set, uses SERVER_URL env var or defaults to localhost
+  # server_url: "https://files.sesamedisk.com"
+  view_extensions:
+    - doc
+    - docx
+    - ppt
+    - pptx
+    - xls
+    - xlsx
+    - odt
+    - fodt
+    - odp
+    - fodp
+    - ods
+    - fods
+    - pdf
+  edit_extensions:
+    - docx
+    - pptx
+    - xlsx
 
 # lifecycle:
 #   enabled: true

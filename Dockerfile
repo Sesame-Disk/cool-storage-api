@@ -1,5 +1,7 @@
 # Build stage
-FROM golang:1.25-trixie AS builder
+FROM --platform=$BUILDPLATFORM golang:1.25-trixie AS builder
+
+ARG TARGETOS TARGETARCH
 
 WORKDIR /build
 
@@ -10,8 +12,8 @@ RUN go mod download
 # Copy source code
 COPY . .
 
-# Build the binary
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
+# Build the binary for the target platform
+RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-arm64} go build \
     -ldflags="-w -s" \
     -o sesamefs \
     ./cmd/sesamefs

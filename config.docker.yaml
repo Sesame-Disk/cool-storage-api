@@ -1,0 +1,175 @@
+# SesameFS Configuration
+# Copy this file to config.yaml and customize for your environment
+
+server:
+  port: ":8080"
+  read_timeout: 30s
+  write_timeout: 300s      # Long timeout for large file uploads
+  max_upload_mb: 10240     # 10 GB max upload size
+
+database:
+  hosts:
+    - localhost:9042
+  keyspace: sesamefs
+  consistency: LOCAL_QUORUM
+  local_dc: datacenter1
+  # username: cassandra
+  # password: cassandra
+
+storage:
+  default_class: hot-minio-local
+
+  # Multi-region storage classes (using MinIO buckets to simulate regions)
+  classes:
+    hot-s3-usa:
+      type: s3
+      tier: hot
+      endpoint: "http://minio:9000"
+      bucket: sesamefs-usa
+      region: us-east-1
+      access_key: minioadmin
+      secret_key: minioadmin
+      use_path_style: true
+      failover_class: hot-s3-eu
+
+    hot-s3-eu:
+      type: s3
+      tier: hot
+      endpoint: "http://minio:9000"
+      bucket: sesamefs-eu
+      region: eu-west-1
+      access_key: minioadmin
+      secret_key: minioadmin
+      use_path_style: true
+      failover_class: hot-s3-usa
+
+    hot-s3-china:
+      type: s3
+      tier: hot
+      endpoint: "http://minio:9000"
+      bucket: sesamefs-china
+      region: cn-north-1
+      access_key: minioadmin
+      secret_key: minioadmin
+      use_path_style: true
+
+    cold-glacier-usa:
+      type: s3
+      tier: cold
+      endpoint: "http://minio:9000"
+      bucket: sesamefs-archive
+      region: us-east-1
+      access_key: minioadmin
+      secret_key: minioadmin
+      use_path_style: true
+
+    # Default local development bucket
+    hot-minio-local:
+      type: s3
+      tier: hot
+      endpoint: "http://minio:9000"
+      bucket: sesamefs-blocks
+      region: us-east-1
+      access_key: minioadmin
+      secret_key: minioadmin
+      use_path_style: true
+
+  # Map hostnames to regions
+  endpoint_regions:
+    "us.sesamefs.local": "usa"
+    "eu.sesamefs.local": "eu"
+    "cn.sesamefs.local": "china"
+    "localhost": "local"
+    "*": "local"
+
+  # Map regions to storage classes
+  region_classes:
+    usa:
+      hot: hot-s3-usa
+      cold: cold-glacier-usa
+    eu:
+      hot: hot-s3-eu
+      cold: cold-glacier-usa
+    china:
+      hot: hot-s3-china
+      cold: ""
+    local:
+      hot: hot-minio-local
+      cold: ""
+
+  # Legacy backends (kept for backwards compatibility)
+  backends:
+    hot:
+      type: s3
+      endpoint: "http://minio:9000"
+      bucket: sesamefs-blocks
+      region: us-east-1
+
+auth:
+  dev_mode: true                      # Set to false in production
+  dev_tokens:
+    - token: "dev-token-123"
+      user_id: "00000000-0000-0000-0000-000000000001"
+      org_id: "00000000-0000-0000-0000-000000000001"
+  oidc:
+    issuer: https://accounts.sesamedisk.com
+    client_id: ""                     # Set via OIDC_CLIENT_ID env var
+    client_secret: ""                 # Set via OIDC_CLIENT_SECRET env var
+    scopes:
+      - openid
+      - profile
+      - email
+
+chunking:
+  algorithm: fastcdc
+  min_size: 2097152                   # 2 MB (minimum for slow connections)
+  avg_size: 16777216                  # 16 MB (default target)
+  max_size: 268435456                 # 256 MB (maximum for fast connections)
+  hash_algorithm: sha256
+
+versioning:
+  default_ttl_days: 90                # 0 = keep forever
+  min_ttl_days: 7
+  gc_interval: 24h
+
+# lifecycle:
+#   enabled: true
+#   check_interval: 1h
+#   rules:
+#     - age_days: 30
+#       from_class: hot
+#       to_class: warm
+#     - age_days: 90
+#       from_class: warm
+#       to_class: cold
+#     - age_days: 365
+#       from_class: cold
+#       to_class: frozen
+
+onlyoffice:
+  enabled: true
+  # Local OnlyOffice Document Server (loaded by browser)
+  api_js_url: "http://localhost:8088/web-apps/apps/api/documents/api.js"
+  jwt_secret: "qzBQTRe5ThkVkl9zAR1vElLjNiDGtjn8"
+  verify_certificate: false
+  # URL for OnlyOffice container to reach SesameFS (docker network)
+  server_url: "http://sesamefs:8080"
+  # Extensions that can be viewed in OnlyOffice
+  view_extensions:
+    - doc
+    - docx
+    - ppt
+    - pptx
+    - xls
+    - xlsx
+    - odt
+    - fodt
+    - odp
+    - fodp
+    - ods
+    - fods
+  # Extensions that can be edited (subset of view)
+  edit_extensions:
+    - docx
+    - pptx
+    - xlsx

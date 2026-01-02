@@ -1,7 +1,6 @@
 package storage
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -92,29 +91,198 @@ func (s *S3Store) key(blockID string) string {
 }
 
 // Put stores a block in S3
+// Optimized to avoid double-buffering when possible:
+// 1. If data is already an io.ReadSeeker and size is known, use directly
+// 2. For unknown size, use SpillBuffer (memory for small, disk for large)
 func (s *S3Store) Put(ctx context.Context, blockID string, data io.Reader, size int64) (string, error) {
 	key := s.key(blockID)
 
-	// Read all data into memory for PutObject
-	// TODO: Use multipart upload for large files
-	buf, err := io.ReadAll(data)
-	if err != nil {
-		return "", fmt.Errorf("failed to read data: %w", err)
+	var body io.ReadSeeker
+	var contentLength int64
+
+	// Check if data is already seekable (e.g., bytes.Reader, os.File)
+	if rs, ok := data.(io.ReadSeeker); ok && size > 0 {
+		// Data is already seekable and size is known - use directly (no copy!)
+		body = rs
+		contentLength = size
+	} else {
+		// Need to buffer the data to get size and make it seekable
+		// Use SpillBuffer: memory for small data, disk for large data
+		spill := NewSpillBuffer(16 * 1024 * 1024) // 16 MB threshold
+		defer spill.Close()
+
+		if _, err := io.Copy(spill, data); err != nil {
+			return "", fmt.Errorf("failed to buffer data: %w", err)
+		}
+
+		contentLength = spill.Size()
+
+		// Get a reader for the buffered data
+		reader, err := spill.ReadSeeker()
+		if err != nil {
+			return "", fmt.Errorf("failed to get reader: %w", err)
+		}
+		body = reader
 	}
 
 	input := &s3.PutObjectInput{
 		Bucket:        aws.String(s.bucket),
 		Key:           aws.String(key),
-		Body:          bytes.NewReader(buf),
-		ContentLength: aws.Int64(int64(len(buf))),
+		Body:          body,
+		ContentLength: aws.Int64(contentLength),
 	}
 
-	_, err = s.client.PutObject(ctx, input)
+	_, err := s.client.PutObject(ctx, input)
 	if err != nil {
 		return "", fmt.Errorf("failed to upload to S3: %w", err)
 	}
 
 	return key, nil
+}
+
+// MultipartThreshold is the size above which multipart upload is used
+const MultipartThreshold = 100 * 1024 * 1024 // 100 MB
+
+// MultipartPartSize is the size of each part in multipart upload
+const MultipartPartSize = 16 * 1024 * 1024 // 16 MB per part
+
+// PutAuto automatically chooses between regular and multipart upload based on size
+func (s *S3Store) PutAuto(ctx context.Context, blockID string, data io.Reader, size int64) (string, error) {
+	if size > MultipartThreshold {
+		return s.PutLarge(ctx, blockID, data, size)
+	}
+	return s.Put(ctx, blockID, data, size)
+}
+
+// PutLarge stores a large block using multipart upload
+// This is more reliable for large files and supports parallel uploads
+func (s *S3Store) PutLarge(ctx context.Context, blockID string, data io.Reader, size int64) (string, error) {
+	key := s.key(blockID)
+
+	// Initiate multipart upload
+	createResp, err := s.client.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{
+		Bucket: aws.String(s.bucket),
+		Key:    aws.String(key),
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to initiate multipart upload: %w", err)
+	}
+
+	uploadID := createResp.UploadId
+
+	// Upload parts
+	var completedParts []types.CompletedPart
+	partNumber := int32(1)
+	var uploaded int64
+
+	for uploaded < size {
+		// Calculate part size
+		remaining := size - uploaded
+		partSize := int64(MultipartPartSize)
+		if remaining < partSize {
+			partSize = remaining
+		}
+
+		// Read part data into buffer (needed for Content-Length and potential retry)
+		partBuf := make([]byte, partSize)
+		n, err := io.ReadFull(data, partBuf)
+		if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
+			// Abort the multipart upload on error
+			s.client.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{
+				Bucket:   aws.String(s.bucket),
+				Key:      aws.String(key),
+				UploadId: uploadID,
+			})
+			return "", fmt.Errorf("failed to read part %d: %w", partNumber, err)
+		}
+
+		// Handle short read at end of file
+		if n < len(partBuf) {
+			partBuf = partBuf[:n]
+		}
+
+		// Upload part
+		partResp, err := s.client.UploadPart(ctx, &s3.UploadPartInput{
+			Bucket:        aws.String(s.bucket),
+			Key:           aws.String(key),
+			UploadId:      uploadID,
+			PartNumber:    aws.Int32(partNumber),
+			Body:          &bytesReadSeeker{data: partBuf},
+			ContentLength: aws.Int64(int64(len(partBuf))),
+		})
+		if err != nil {
+			// Abort the multipart upload on error
+			s.client.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{
+				Bucket:   aws.String(s.bucket),
+				Key:      aws.String(key),
+				UploadId: uploadID,
+			})
+			return "", fmt.Errorf("failed to upload part %d: %w", partNumber, err)
+		}
+
+		completedParts = append(completedParts, types.CompletedPart{
+			ETag:       partResp.ETag,
+			PartNumber: aws.Int32(partNumber),
+		})
+
+		uploaded += int64(len(partBuf))
+		partNumber++
+	}
+
+	// Complete multipart upload
+	_, err = s.client.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
+		Bucket:   aws.String(s.bucket),
+		Key:      aws.String(key),
+		UploadId: uploadID,
+		MultipartUpload: &types.CompletedMultipartUpload{
+			Parts: completedParts,
+		},
+	})
+	if err != nil {
+		// Abort the multipart upload on error
+		s.client.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{
+			Bucket:   aws.String(s.bucket),
+			Key:      aws.String(key),
+			UploadId: uploadID,
+		})
+		return "", fmt.Errorf("failed to complete multipart upload: %w", err)
+	}
+
+	return key, nil
+}
+
+// bytesReadSeeker wraps a byte slice as io.ReadSeeker
+type bytesReadSeeker struct {
+	data   []byte
+	offset int
+}
+
+func (r *bytesReadSeeker) Read(p []byte) (int, error) {
+	if r.offset >= len(r.data) {
+		return 0, io.EOF
+	}
+	n := copy(p, r.data[r.offset:])
+	r.offset += n
+	return n, nil
+}
+
+func (r *bytesReadSeeker) Seek(offset int64, whence int) (int64, error) {
+	var newOffset int64
+	switch whence {
+	case io.SeekStart:
+		newOffset = offset
+	case io.SeekCurrent:
+		newOffset = int64(r.offset) + offset
+	case io.SeekEnd:
+		newOffset = int64(len(r.data)) + offset
+	default:
+		return 0, fmt.Errorf("invalid whence: %d", whence)
+	}
+	if newOffset < 0 {
+		return 0, fmt.Errorf("negative offset")
+	}
+	r.offset = int(newOffset)
+	return newOffset, nil
 }
 
 // Get retrieves a block from S3

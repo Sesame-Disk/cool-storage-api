@@ -1,15 +1,19 @@
 package api
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/Sesame-Disk/sesamefs/internal/db"
 	"github.com/Sesame-Disk/sesamefs/internal/storage"
 	"github.com/gin-gonic/gin"
 )
@@ -163,15 +167,19 @@ var _ TokenStore = (*TokenManager)(nil)
 
 // SeafHTTPHandler handles Seafile-compatible file operations
 type SeafHTTPHandler struct {
-	storage    *storage.S3Store
-	tokenStore TokenStore
+	storage        *storage.S3Store
+	storageManager *storage.Manager
+	db             *db.DB
+	tokenStore     TokenStore
 }
 
 // NewSeafHTTPHandler creates a new SeafHTTP handler
-func NewSeafHTTPHandler(s3Store *storage.S3Store, tokenStore TokenStore) *SeafHTTPHandler {
+func NewSeafHTTPHandler(s3Store *storage.S3Store, storageManager *storage.Manager, database *db.DB, tokenStore TokenStore) *SeafHTTPHandler {
 	return &SeafHTTPHandler{
-		storage:    s3Store,
-		tokenStore: tokenStore,
+		storage:        s3Store,
+		storageManager: storageManager,
+		db:             database,
+		tokenStore:     tokenStore,
 	}
 }
 
@@ -264,14 +272,42 @@ func (h *SeafHTTPHandler) HandleDownload(c *gin.Context) {
 	tokenStr := c.Param("token")
 	requestedPath := c.Param("filepath")
 
+	log.Printf("[HandleDownload] Token: %s, RequestedPath: %s", tokenStr, requestedPath)
+
 	// Validate token
 	token, valid := h.tokenStore.GetToken(tokenStr, TokenTypeDownload)
 	if !valid {
+		log.Printf("[HandleDownload] Invalid token: %s", tokenStr)
 		c.JSON(http.StatusForbidden, gin.H{"error": "invalid or expired download token"})
 		return
 	}
 
-	// Check if storage is available
+	log.Printf("[HandleDownload] Token valid: OrgID=%s, RepoID=%s, Path=%s", token.OrgID, token.RepoID, token.Path)
+
+	// Get filename from path
+	filename := filepath.Base(token.Path)
+	if requestedPath != "" && requestedPath != "/" {
+		filename = filepath.Base(requestedPath)
+	}
+
+	// Try to get file content from block storage (content-addressed)
+	// This is the normal flow for SesameFS files
+	if h.db != nil && h.storageManager != nil {
+		log.Printf("[HandleDownload] Attempting block-based file retrieval")
+		content, err := h.getFileFromBlocks(c, token)
+		if err == nil {
+			log.Printf("[HandleDownload] Block-based retrieval SUCCESS, size=%d", len(content))
+			c.Header("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, filename))
+			c.Data(http.StatusOK, "application/octet-stream", content)
+			return
+		}
+		log.Printf("[HandleDownload] Block-based retrieval FAILED: %v", err)
+		// If block-based retrieval fails, fall back to direct S3 path-based retrieval
+	} else {
+		log.Printf("[HandleDownload] Block storage not available (db=%v, storageManager=%v)", h.db != nil, h.storageManager != nil)
+	}
+
+	// Fallback: Try direct S3 path-based retrieval (legacy)
 	if h.storage == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "storage not available"})
 		return
@@ -288,14 +324,7 @@ func (h *SeafHTTPHandler) HandleDownload(c *gin.Context) {
 	}
 	defer reader.Close()
 
-	// Get filename from path
-	filename := filepath.Base(token.Path)
-	if requestedPath != "" && requestedPath != "/" {
-		filename = filepath.Base(requestedPath)
-	}
-
-	// Read content to get size (for small files)
-	// For large files, this should use streaming with content-length from S3
+	// Read content
 	content, err := io.ReadAll(reader)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read file"})
@@ -305,6 +334,184 @@ func (h *SeafHTTPHandler) HandleDownload(c *gin.Context) {
 	// Set headers for file download
 	c.Header("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, filename))
 	c.Data(http.StatusOK, "application/octet-stream", content)
+}
+
+// getFileFromBlocks retrieves a file by looking up its blocks and concatenating them
+func (h *SeafHTTPHandler) getFileFromBlocks(c *gin.Context, token *AccessToken) ([]byte, error) {
+	ctx := c.Request.Context()
+
+	// Get the library's head commit to find the root FS
+	var headCommit string
+	err := h.db.Session().Query(`
+		SELECT head_commit_id FROM libraries
+		WHERE org_id = ? AND library_id = ?
+	`, token.OrgID, token.RepoID).Scan(&headCommit)
+	if err != nil {
+		return nil, fmt.Errorf("library not found: %w", err)
+	}
+
+	// Get the root FS ID from the commit
+	var rootFSID string
+	err = h.db.Session().Query(`
+		SELECT root_fs_id FROM commits
+		WHERE library_id = ? AND commit_id = ?
+	`, token.RepoID, headCommit).Scan(&rootFSID)
+	if err != nil {
+		return nil, fmt.Errorf("commit not found: %w", err)
+	}
+
+	// Navigate to the target file through the directory structure
+	filePath := token.Path
+	if !strings.HasPrefix(filePath, "/") {
+		filePath = "/" + filePath
+	}
+
+	// Split path into components
+	pathParts := strings.Split(strings.Trim(filePath, "/"), "/")
+	if len(pathParts) == 0 || (len(pathParts) == 1 && pathParts[0] == "") {
+		return nil, fmt.Errorf("invalid file path")
+	}
+
+	currentFSID := rootFSID
+
+	// Navigate to the file (all parts except the last are directories)
+	for i := 0; i < len(pathParts)-1; i++ {
+		dirName := pathParts[i]
+		nextFSID, err := h.findEntryInDir(token.RepoID, currentFSID, dirName)
+		if err != nil {
+			return nil, fmt.Errorf("directory not found: %s: %w", dirName, err)
+		}
+		currentFSID = nextFSID
+	}
+
+	// Find the target file in the current directory
+	targetName := pathParts[len(pathParts)-1]
+	fileFSID, err := h.findEntryInDir(token.RepoID, currentFSID, targetName)
+	if err != nil {
+		return nil, fmt.Errorf("file not found: %s: %w", targetName, err)
+	}
+
+	// Get the file's block IDs
+	var blockIDs []string
+	err = h.db.Session().Query(`
+		SELECT block_ids FROM fs_objects
+		WHERE library_id = ? AND fs_id = ?
+	`, token.RepoID, fileFSID).Scan(&blockIDs)
+	if err != nil {
+		return nil, fmt.Errorf("file metadata not found: %w", err)
+	}
+
+	// Get block store from storage manager
+	blockStore, _, err := h.storageManager.GetHealthyBlockStore("")
+	if err != nil {
+		return nil, fmt.Errorf("block store not available: %w", err)
+	}
+
+	// Retrieve and concatenate blocks
+	var content bytes.Buffer
+	for _, blockID := range blockIDs {
+		// Translate SHA-1 (40 chars) to SHA-256 (64 chars) if needed
+		internalID := blockID
+		if len(blockID) == 40 {
+			// Look up internal SHA-256 ID from mapping
+			var mappedID string
+			err := h.db.Session().Query(`
+				SELECT internal_id FROM block_id_mappings WHERE org_id = ? AND external_id = ?
+			`, token.OrgID, blockID).Scan(&mappedID)
+			if err == nil && mappedID != "" {
+				log.Printf("[getFileFromBlocks] Resolved block %s → %s", blockID, mappedID)
+				internalID = mappedID
+			} else {
+				log.Printf("[getFileFromBlocks] No mapping for block %s, using as-is", blockID)
+			}
+		}
+
+		blockData, err := blockStore.GetBlock(ctx, internalID)
+		if err != nil {
+			return nil, fmt.Errorf("failed to retrieve block %s: %w", blockID, err)
+		}
+		content.Write(blockData)
+	}
+
+	return content.Bytes(), nil
+}
+
+// findEntryInDir finds an entry (file or directory) within a directory FS object
+func (h *SeafHTTPHandler) findEntryInDir(repoID, dirFSID, entryName string) (string, error) {
+	var dirEntries string
+	err := h.db.Session().Query(`
+		SELECT dir_entries FROM fs_objects
+		WHERE library_id = ? AND fs_id = ?
+	`, repoID, dirFSID).Scan(&dirEntries)
+	if err != nil {
+		return "", fmt.Errorf("directory not found: %w", err)
+	}
+
+	log.Printf("[findEntryInDir] Looking for entry '%s' in dir %s", entryName, dirFSID)
+	log.Printf("[findEntryInDir] Dir entries length: %d", len(dirEntries))
+
+	// Parse dir_entries - format is JSON array like [{"id":"...","mode":...,"modifier":"...","mtime":...,"name":"...","size":...},...]
+	// Find the entry by name, then extract the entire JSON object to get the ID
+	searchPattern := fmt.Sprintf(`"name":"%s"`, entryName)
+	log.Printf("[findEntryInDir] Search pattern: %s", searchPattern)
+	idx := strings.Index(dirEntries, searchPattern)
+	log.Printf("[findEntryInDir] Pattern found at index: %d", idx)
+	if idx == -1 {
+		// Log a snippet of the dir_entries for debugging
+		if len(dirEntries) > 500 {
+			log.Printf("[findEntryInDir] Dir entries (first 500 chars): %s", dirEntries[:500])
+		} else {
+			log.Printf("[findEntryInDir] Dir entries: %s", dirEntries)
+		}
+		return "", fmt.Errorf("entry not found: %s", entryName)
+	}
+
+	// Find the start of the JSON object containing this entry (search backwards for '{')
+	objectStart := -1
+	for i := idx; i >= 0; i-- {
+		if dirEntries[i] == '{' {
+			objectStart = i
+			break
+		}
+	}
+	if objectStart == -1 {
+		return "", fmt.Errorf("malformed dir entries: no object start for: %s", entryName)
+	}
+
+	// Find the end of the JSON object (search forward for '}')
+	objectEnd := -1
+	for i := idx; i < len(dirEntries); i++ {
+		if dirEntries[i] == '}' {
+			objectEnd = i + 1
+			break
+		}
+	}
+	if objectEnd == -1 {
+		return "", fmt.Errorf("malformed dir entries: no object end for: %s", entryName)
+	}
+
+	// Extract just this entry's JSON object
+	entryJSON := dirEntries[objectStart:objectEnd]
+	log.Printf("[findEntryInDir] Extracted object: %s", entryJSON)
+
+	// Find the "id" field within this object
+	idPattern := `"id":"`
+	idIdx := strings.Index(entryJSON, idPattern)
+	if idIdx == -1 {
+		return "", fmt.Errorf("entry ID not found for: %s", entryName)
+	}
+
+	// Extract the ID value
+	idStart := idIdx + len(idPattern)
+	idEnd := strings.Index(entryJSON[idStart:], `"`)
+	if idEnd == -1 {
+		return "", fmt.Errorf("malformed entry for: %s", entryName)
+	}
+
+	entryID := entryJSON[idStart : idStart+idEnd]
+	log.Printf("[findEntryInDir] Found entry ID: %s", entryID)
+
+	return entryID, nil
 }
 
 // Helper function to generate a file ID

@@ -91,7 +91,7 @@ func TestFSObjectStruct(t *testing.T) {
 				Name:  "documents",
 				Mode:  16384, // directory
 				Mtime: 1234567890,
-				Entries: []FSEntry{
+				Entries: &[]FSEntry{
 					{Name: "file1.txt", ID: "f1", Mode: 33188, Mtime: 1234567890, Size: 100},
 					{Name: "file2.txt", ID: "f2", Mode: 33188, Mtime: 1234567891, Size: 200},
 				},
@@ -359,7 +359,7 @@ func TestRecvFSRequestParsing(t *testing.T) {
 			ID:    "dir1",
 			Name:  "docs",
 			Mtime: 1234567890,
-			Entries: []FSEntry{
+			Entries: &[]FSEntry{
 				{Name: "a.txt", ID: "a1", Mode: 33188},
 			},
 		},
@@ -391,8 +391,13 @@ func TestRecvFSRequestParsing(t *testing.T) {
 	if decoded[1].Type != 3 {
 		t.Errorf("object[1].Type = %d, want 3", decoded[1].Type)
 	}
-	if len(decoded[1].Entries) != 1 {
-		t.Errorf("object[1].Entries length = %d, want 1", len(decoded[1].Entries))
+	if decoded[1].Entries == nil || len(*decoded[1].Entries) != 1 {
+		t.Errorf("object[1].Entries length = %d, want 1", func() int {
+			if decoded[1].Entries == nil {
+				return 0
+			}
+			return len(*decoded[1].Entries)
+		}())
 	}
 }
 

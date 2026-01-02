@@ -19,6 +19,20 @@ type Config struct {
 	Versioning VersioningConfig `yaml:"versioning"`
 	SeafHTTP   SeafHTTPConfig   `yaml:"seafhttp"`
 	CORS       CORSConfig       `yaml:"cors"`
+	OnlyOffice OnlyOfficeConfig `yaml:"onlyoffice"`
+}
+
+// OnlyOfficeConfig holds OnlyOffice Document Server integration settings
+// See: https://manual.seafile.com/deploy/only_office/
+type OnlyOfficeConfig struct {
+	Enabled           bool     `yaml:"enabled"`
+	APIJSURL          string   `yaml:"api_js_url"`          // URL to api.js (e.g., https://office.example.com/web-apps/apps/api/documents/api.js)
+	JWTSecret         string   `yaml:"jwt_secret"`          // JWT secret for signing tokens
+	VerifyCertificate bool     `yaml:"verify_certificate"`  // Whether to verify OnlyOffice SSL cert
+	ForceSave         bool     `yaml:"force_save"`          // Enable force save on user action
+	ViewExtensions    []string `yaml:"view_extensions"`     // Extensions that can be viewed (doc, docx, ppt, etc.)
+	EditExtensions    []string `yaml:"edit_extensions"`     // Extensions that can be edited (docx, pptx, xlsx)
+	ServerURL         string   `yaml:"server_url"`          // Public URL for OnlyOffice to fetch documents (e.g., https://files.example.com)
 }
 
 // CORSConfig holds CORS settings for frontend access
@@ -242,6 +256,13 @@ func DefaultConfig() *Config {
 		SeafHTTP: SeafHTTPConfig{
 			TokenTTL: 1 * time.Hour,
 		},
+		OnlyOffice: OnlyOfficeConfig{
+			Enabled:           false,
+			VerifyCertificate: true,
+			ForceSave:         true,
+			ViewExtensions:    []string{"doc", "docx", "ppt", "pptx", "xls", "xlsx", "odt", "fodt", "odp", "fodp", "ods", "fods"},
+			EditExtensions:    []string{"docx", "pptx", "xlsx"},
+		},
 	}
 }
 
@@ -311,6 +332,17 @@ func (c *Config) applyEnvOverrides() {
 	}
 	if v := os.Getenv("OIDC_CLIENT_SECRET"); v != "" {
 		c.Auth.OIDC.ClientSecret = v
+	}
+
+	// OnlyOffice
+	if v := os.Getenv("ONLYOFFICE_ENABLED"); v != "" {
+		c.OnlyOffice.Enabled = v == "true" || v == "1"
+	}
+	if v := os.Getenv("ONLYOFFICE_API_JS_URL"); v != "" {
+		c.OnlyOffice.APIJSURL = v
+	}
+	if v := os.Getenv("ONLYOFFICE_JWT_SECRET"); v != "" {
+		c.OnlyOffice.JWTSecret = v
 	}
 }
 

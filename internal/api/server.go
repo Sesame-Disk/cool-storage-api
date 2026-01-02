@@ -316,9 +316,8 @@ func (s *Server) setupRoutes() {
 		// Account info
 		api2.GET("/account/info", s.authMiddleware(), s.handleAccountInfo)
 
-		// Starred files (stub - returns empty array)
-		api2.GET("/starredfiles", s.authMiddleware(), s.handleStarredFiles)
-		api2.GET("/starredfiles/", s.authMiddleware(), s.handleStarredFiles)
+		// Starred files API
+		v2.RegisterStarredRoutes(api2.Group("", s.authMiddleware()), s.db)
 
 		// User avatars (stub - returns placeholder)
 		api2.GET("/avatars/user/:email/resized/:size", s.handleUserAvatar)
@@ -349,12 +348,40 @@ func (s *Server) setupRoutes() {
 		{
 			// Library endpoints with v2.1 response format
 			v2.RegisterV21LibraryRoutes(protected, s.db, s.config, s.tokenStore)
+
+			// OnlyOffice integration endpoints
+			v2.RegisterOnlyOfficeRoutes(protected, s.db, s.config, s.storage, s.tokenStore, serverURL)
+
+			// Starred items for v2.1 API (uses "starred-items" instead of "starredfiles")
+			v2.RegisterV21StarredRoutes(protected, s.db)
+
+			// Share links for v2.1 API
+			v2.RegisterShareLinkRoutes(protected, s.db)
+
+			// Stub handlers for optional Seahub features (return empty results instead of 404)
+			protected.GET("/notifications", s.handleEmptyNotifications)
+			protected.GET("/notifications/", s.handleEmptyNotifications)
+			protected.GET("/repos/:repo_id/repo-tags", s.handleEmptyRepoTags)
+			protected.GET("/repos/:repo_id/repo-tags/", s.handleEmptyRepoTags)
+			protected.POST("/repos/:repo_id/repo-tags", s.handleCreateRepoTag)
+			protected.POST("/repos/:repo_id/repo-tags/", s.handleCreateRepoTag)
+			protected.GET("/repo-folder-share-info", s.handleEmptyFolderShareInfo)
+			protected.GET("/repo-folder-share-info/", s.handleEmptyFolderShareInfo)
 		}
 	}
 
+	// OnlyOffice callback endpoints (not behind auth - OnlyOffice server calls these)
+	onlyoffice := s.router.Group("/onlyoffice")
+	{
+		v2.RegisterOnlyOfficeCallbackRoutes(onlyoffice, s.db, s.config, s.storage, serverURL)
+	}
+
+	// File viewer routes (for viewing files in browser, including OnlyOffice editor)
+	v2.RegisterFileViewRoutes(s.router, s.db, s.config, s.storage, s.tokenStore, serverURL, s.authMiddleware())
+
 	// Seafile-compatible file transfer endpoints (seafhttp)
 	// These endpoints handle the actual file uploads/downloads
-	seafHTTPHandler := NewSeafHTTPHandler(s.storage, s.tokenStore)
+	seafHTTPHandler := NewSeafHTTPHandler(s.storage, s.storageManager, s.db, s.tokenStore)
 	seafHTTPHandler.RegisterSeafHTTPRoutes(s.router)
 
 	// Seafile sync protocol endpoints (for Desktop client)
@@ -562,13 +589,6 @@ func (s *Server) handleAccountInfo(c *gin.Context) {
 	})
 }
 
-// handleStarredFiles returns the list of starred files for the user
-// GET /api2/starredfiles/
-func (s *Server) handleStarredFiles(c *gin.Context) {
-	// Return empty array - starring not implemented yet
-	c.JSON(http.StatusOK, []interface{}{})
-}
-
 // handleUserAvatar returns an avatar for a user
 // GET /api2/avatars/user/:email/resized/:size/
 func (s *Server) handleUserAvatar(c *gin.Context) {
@@ -662,4 +682,42 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		return s.server.Shutdown(ctx)
 	}
 	return nil
+}
+
+// handleEmptyNotifications returns empty notifications list
+// GET /api/v2.1/notifications/
+func (s *Server) handleEmptyNotifications(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{
+		"notification_list": []interface{}{},
+		"unseen_count":      0,
+	})
+}
+
+// handleEmptyRepoTags returns empty repo tags list
+// GET /api/v2.1/repos/:repo_id/repo-tags/
+func (s *Server) handleEmptyRepoTags(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{
+		"repo_tags": []interface{}{},
+	})
+}
+
+// handleEmptyFolderShareInfo returns empty folder share info
+// GET /api/v2.1/repo-folder-share-info/
+func (s *Server) handleEmptyFolderShareInfo(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{
+		"share_info_list": []interface{}{},
+	})
+}
+
+// handleCreateRepoTag returns a stub response for tag creation
+// POST /api/v2.1/repos/:repo_id/repo-tags/
+func (s *Server) handleCreateRepoTag(c *gin.Context) {
+	// Return stub success - full implementation would create tag in database
+	c.JSON(http.StatusOK, gin.H{
+		"repo_tag": gin.H{
+			"id":    1,
+			"name":  c.PostForm("name"),
+			"color": c.PostForm("color"),
+		},
+	})
 }

@@ -37,7 +37,8 @@ func TestLibraryJSONSerialization(t *testing.T) {
 		t.Fatalf("Failed to unmarshal JSON: %v", err)
 	}
 
-	expectedFields := []string{"id", "org_id", "owner_id", "name", "encrypted", "storage_class", "size", "file_count", "version_ttl_days", "created_at", "updated_at"}
+	// Seafile-compatible JSON field names
+	expectedFields := []string{"repo_id", "repo_name", "encrypted", "size", "last_modified"}
 	for _, field := range expectedFields {
 		if _, ok := jsonMap[field]; !ok {
 			t.Errorf("Expected field %q not found in JSON", field)

@@ -42,6 +42,7 @@ func RegisterLibraryRoutesWithToken(rg *gin.RouterGroup, database *db.DB, cfg *c
 		repos.POST("", h.CreateLibrary)
 		repos.GET("/:repo_id", h.GetLibrary)
 		repos.PUT("/:repo_id", h.UpdateLibrary)
+		repos.POST("/:repo_id", h.LibraryOperation) // handles op=rename
 		repos.DELETE("/:repo_id", h.DeleteLibrary)
 		repos.POST("/:repo_id/storage-class", h.ChangeStorageClass)
 	}
@@ -50,11 +51,48 @@ func RegisterLibraryRoutesWithToken(rg *gin.RouterGroup, database *db.DB, cfg *c
 // RegisterV21LibraryRoutes registers v2.1 library routes with Seahub-compatible response format
 func RegisterV21LibraryRoutes(rg *gin.RouterGroup, database *db.DB, cfg *config.Config, tokenCreator LibraryTokenCreator) {
 	h := &LibraryHandler{db: database, config: cfg, tokenCreator: tokenCreator}
+	fh := &FileHandler{db: database, config: cfg}
 
 	repos := rg.Group("/repos")
 	{
 		repos.GET("", h.ListLibrariesV21)
 		repos.GET("/:repo_id", h.GetLibraryV21)
+		repos.GET("/:repo_id/dir", fh.ListDirectoryV21)
+		repos.GET("/:repo_id/dir/", fh.ListDirectoryV21)
+
+		// File operations (CRUD)
+		repos.GET("/:repo_id/file", fh.GetFileInfo)
+		repos.GET("/:repo_id/file/", fh.GetFileInfo)
+		repos.DELETE("/:repo_id/file", fh.DeleteFile)
+		repos.DELETE("/:repo_id/file/", fh.DeleteFile)
+		repos.POST("/:repo_id/file", fh.FileOperation)  // rename, create
+		repos.POST("/:repo_id/file/", fh.FileOperation) // rename, create
+		repos.PUT("/:repo_id/file", fh.LockFile)        // lock, unlock
+		repos.PUT("/:repo_id/file/", fh.LockFile)       // lock, unlock
+		repos.GET("/:repo_id/file/detail", fh.GetFileDetail)
+		repos.GET("/:repo_id/file/detail/", fh.GetFileDetail)
+
+		// Directory operations
+		repos.DELETE("/:repo_id/dir", fh.DeleteDirectory)
+		repos.DELETE("/:repo_id/dir/", fh.DeleteDirectory)
+		repos.POST("/:repo_id/dir", fh.DirectoryOperation)  // mkdir, rename
+		repos.POST("/:repo_id/dir/", fh.DirectoryOperation) // mkdir, rename
+
+		// Move/Copy operations
+		repos.POST("/:repo_id/file/move", fh.MoveFile)
+		repos.POST("/:repo_id/file/move/", fh.MoveFile)
+		repos.POST("/:repo_id/file/copy", fh.CopyFile)
+		repos.POST("/:repo_id/file/copy/", fh.CopyFile)
+
+		// File tags (stub)
+		repos.GET("/:repo_id/file-tags", h.GetFileTags)
+		repos.GET("/:repo_id/file-tags/", h.GetFileTags)
+		repos.POST("/:repo_id/file-tags", h.AddFileTag)
+		repos.POST("/:repo_id/file-tags/", h.AddFileTag)
+
+		// Resumable upload support
+		repos.GET("/:repo_id/file-uploaded-bytes", fh.GetFileUploadedBytes)
+		repos.GET("/:repo_id/file-uploaded-bytes/", fh.GetFileUploadedBytes)
 	}
 }
 
@@ -360,26 +398,27 @@ func (h *LibraryHandler) GetLibrary(c *gin.Context) {
 
 	// Return api2 format for Seafile desktop client compatibility
 	c.JSON(http.StatusOK, gin.H{
-		"id":             libID,
-		"name":           name,
-		"desc":           description,
-		"owner":          ownerEmail,
-		"owner_name":     strings.Split(ownerEmail, "@")[0],
+		"id":                  libID,
+		"name":                name,
+		"desc":                description,
+		"owner":               ownerEmail,
+		"owner_email":         ownerEmail, // Used by share dialog
+		"owner_name":          strings.Split(ownerEmail, "@")[0],
 		"owner_contact_email": ownerEmail,
-		"mtime":          updatedAt.Unix(),
-		"mtime_relative": "",
-		"encrypted":      encrypted,
-		"permission":     "rw",
-		"virtual":        false,
-		"root":           "0000000000000000000000000000000000000000",
-		"head_commit_id": headCommitID,
-		"version":        1,
-		"type":           "repo",
-		"size":           sizeBytes,
-		"size_formatted": formatSize(sizeBytes),
-		"file_count":     fileCount,
-		"storage_id":     storageClass,
-		"storage_name":   storageClass,
+		"mtime":               updatedAt.Unix(),
+		"mtime_relative":      "",
+		"encrypted":           encrypted,
+		"permission":          "rw",
+		"virtual":             false,
+		"root":                "0000000000000000000000000000000000000000",
+		"head_commit_id":      headCommitID,
+		"version":             1,
+		"type":                "repo",
+		"size":                sizeBytes,
+		"size_formatted":      formatSize(sizeBytes),
+		"file_count":          fileCount,
+		"storage_id":          storageClass,
+		"storage_name":        storageClass,
 	})
 }
 
@@ -468,6 +507,52 @@ func (h *LibraryHandler) DeleteLibrary(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"success": true})
 }
 
+// LibraryOperation handles POST operations on a library based on 'op' query parameter
+// Implements Seafile API: POST /api2/repos/:repo_id/?op=rename
+func (h *LibraryHandler) LibraryOperation(c *gin.Context) {
+	op := c.Query("op")
+
+	switch op {
+	case "rename":
+		h.RenameLibrary(c)
+	default:
+		c.JSON(http.StatusBadRequest, gin.H{"error": "unsupported operation: " + op})
+	}
+}
+
+// RenameLibraryRequest represents the request body for renaming a library
+type RenameLibraryRequest struct {
+	RepoName string `json:"repo_name" form:"repo_name"`
+}
+
+// RenameLibrary renames a library
+// Implements Seafile API: POST /api2/repos/:repo_id/?op=rename
+func (h *LibraryHandler) RenameLibrary(c *gin.Context) {
+	repoID := c.Param("repo_id")
+	orgID := c.GetString("org_id")
+
+	var req RenameLibraryRequest
+	if err := c.ShouldBind(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	if req.RepoName == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "repo_name is required"})
+		return
+	}
+
+	if err := h.db.Session().Query(`
+		UPDATE libraries SET name = ?, updated_at = ?
+		WHERE org_id = ? AND library_id = ?
+	`, req.RepoName, time.Now(), orgID, repoID).Exec(); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to rename library"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"success": true})
+}
+
 // ChangeStorageClassRequest represents the request body for changing storage class
 type ChangeStorageClassRequest struct {
 	StorageClass string `json:"storage_class" binding:"required"`
@@ -501,6 +586,57 @@ func (h *LibraryHandler) ChangeStorageClass(c *gin.Context) {
 	// TODO: Trigger background job to migrate blocks to new storage class
 
 	c.JSON(http.StatusOK, gin.H{"success": true})
+}
+
+// FileTag represents a tag on a file
+type FileTag struct {
+	ID       int    `json:"id"`
+	RepoTagID int   `json:"repo_tag_id"`
+	Name     string `json:"tag_name"`
+	Color    string `json:"tag_color"`
+}
+
+// GetFileTags returns tags for a file
+// Implements: GET /api/v2.1/repos/:repo_id/file-tags/?file_path=/xxx
+func (h *LibraryHandler) GetFileTags(c *gin.Context) {
+	// For now, return empty list - full implementation would query database
+	c.JSON(http.StatusOK, gin.H{
+		"file_tags": []FileTag{},
+	})
+}
+
+// AddFileTagRequest represents the request for adding a tag to a file
+type AddFileTagRequest struct {
+	FilePath  string `json:"file_path" form:"file_path"`
+	RepoTagID string `json:"repo_tag_id" form:"repo_tag_id"` // String to handle form data
+}
+
+// AddFileTag adds a tag to a file
+// Implements: POST /api/v2.1/repos/:repo_id/file-tags/
+func (h *LibraryHandler) AddFileTag(c *gin.Context) {
+	// Read form values directly to avoid binding issues
+	filePath := c.PostForm("file_path")
+	repoTagID := c.PostForm("repo_tag_id")
+
+	if filePath == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "file_path is required"})
+		return
+	}
+
+	if repoTagID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "repo_tag_id is required"})
+		return
+	}
+
+	// For now, return stub success - full implementation would create tag in database
+	c.JSON(http.StatusOK, gin.H{
+		"file_tag": gin.H{
+			"id":          1,
+			"repo_tag_id": repoTagID,
+			"tag_name":    "Tag",
+			"tag_color":   "#FF0000",
+		},
+	})
 }
 
 // V21Library represents a library in v2.1 API format
@@ -642,37 +778,26 @@ func (h *LibraryHandler) GetLibraryV21(c *gin.Context) {
 
 	// Generate owner email
 	ownerEmail := ownerID + "@sesamefs.local"
+	_ = userID // Used for permission checks in future
 
-	// Determine library type (mine, shared, public)
-	libType := "mine"
-	if ownerID != userID {
-		libType = "shared"
-	}
-
-	// Return v2.1 format response
+	// Return v2.1 format response (matches Seafile's /api/v2.1/repos/:id/ format)
 	response := gin.H{
-		"type":                  libType,
-		"repo_id":               libID,
-		"repo_name":             name,
-		"owner_email":           ownerEmail,
-		"owner_name":            strings.Split(ownerEmail, "@")[0],
-		"owner_contact_email":   ownerEmail,
-		"last_modified":         updatedAt.Format(time.RFC3339),
-		"modifier_email":        ownerEmail,
-		"modifier_name":         strings.Split(ownerEmail, "@")[0],
-		"modifier_contact_email": ownerEmail,
-		"size":                  sizeBytes,
-		"file_count":            fileCount,
-		"encrypted":             encrypted,
-		"permission":            "rw",
-		"starred":               false,
-		"monitored":             false,
-		"status":                "normal",
-		"salt":                  "",
-		"storage_name":          storageClass,
-		"head_commit_id":        headCommitID,
-		"version":               1,
-		"lib_need_decrypt":      false,
+		"repo_id":             libID,
+		"repo_name":           name,
+		"owner_email":         ownerEmail,
+		"owner_name":          strings.Split(ownerEmail, "@")[0],
+		"owner_contact_email": ownerEmail,
+		"size":                sizeBytes,
+		"encrypted":           encrypted,
+		"file_count":          fileCount,
+		"permission":          "rw",
+		"no_quota":            true,
+		"is_admin":            true,
+		"is_virtual":          false,
+		"has_been_shared_out": false,
+		"lib_need_decrypt":    false,
+		"last_modified":       updatedAt.Format(time.RFC3339),
+		"status":              "normal",
 	}
 
 	c.JSON(http.StatusOK, response)

@@ -76,6 +76,9 @@ func (db *DB) Migrate() error {
 		migrationCreateRestoreJobs,
 		migrationCreateAccessTokens,
 		migrationCreateHostnameMappings,
+		migrationCreateOnlyOfficeDocKeys,
+		migrationCreateStarredFiles,
+		migrationCreateLockedFiles,
 	}
 
 	for _, migration := range migrations {
@@ -290,4 +293,38 @@ CREATE TABLE IF NOT EXISTS hostname_mappings (
 	settings MAP<TEXT, TEXT>,
 	created_at TIMESTAMP,
 	updated_at TIMESTAMP
+)`
+
+// OnlyOffice document key mappings for callback lookups
+// Stores temporary mappings between doc_key and file info for OnlyOffice callbacks
+// Uses TTL for automatic cleanup (24 hours)
+const migrationCreateOnlyOfficeDocKeys = `
+CREATE TABLE IF NOT EXISTS onlyoffice_doc_keys (
+	doc_key TEXT PRIMARY KEY,
+	user_id TEXT,
+	repo_id TEXT,
+	file_path TEXT,
+	created_at TIMESTAMP
+)`
+
+// Starred files for user favorites
+// Partition by user_id for efficient querying of user's starred items
+const migrationCreateStarredFiles = `
+CREATE TABLE IF NOT EXISTS starred_files (
+	user_id UUID,
+	repo_id UUID,
+	path TEXT,
+	starred_at TIMESTAMP,
+	PRIMARY KEY ((user_id), repo_id, path)
+)`
+
+// Locked files for file locking feature
+// Partition by repo_id for efficient querying when listing directory
+const migrationCreateLockedFiles = `
+CREATE TABLE IF NOT EXISTS locked_files (
+	repo_id UUID,
+	path TEXT,
+	locked_by UUID,
+	locked_at TIMESTAMP,
+	PRIMARY KEY ((repo_id), path)
 )`

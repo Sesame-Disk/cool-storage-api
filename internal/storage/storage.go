@@ -218,6 +218,11 @@ func (m *Manager) GetBackend(name string) (Store, bool) {
 
 // GetHealthyBackend returns a healthy backend for the given class, with failover
 func (m *Manager) GetHealthyBackend(preferredClass string) (Store, string, error) {
+	// Fall back to default class if empty
+	if preferredClass == "" && m.defaultClass != "" {
+		preferredClass = m.defaultClass
+	}
+
 	// Try preferred class first
 	if store, ok := m.backends[preferredClass]; ok {
 		m.healthMu.RLock()
