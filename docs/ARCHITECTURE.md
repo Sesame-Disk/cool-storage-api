@@ -451,6 +451,235 @@ Session 2 (China): Block abc123 → DB lookup finds it exists in hot-s3-usa
 
 ---
 
+## Database Schema (ER Diagram)
+
+The following diagram shows the Cassandra tables and their relationships:
+
+```mermaid
+erDiagram
+    organizations {
+        UUID org_id PK
+        TEXT name
+        MAP settings
+        BIGINT storage_quota
+        BIGINT storage_used
+        BIGINT chunking_polynomial
+        MAP storage_config
+        TIMESTAMP created_at
+    }
+
+    users {
+        UUID org_id PK
+        UUID user_id PK
+        TEXT email
+        TEXT name
+        TEXT role
+        TEXT oidc_sub
+        BIGINT quota_bytes
+        BIGINT used_bytes
+        TIMESTAMP created_at
+    }
+
+    users_by_email {
+        TEXT email PK
+        UUID user_id
+        UUID org_id
+    }
+
+    users_by_oidc {
+        TEXT oidc_issuer PK
+        TEXT oidc_sub PK
+        UUID user_id
+        UUID org_id
+    }
+
+    libraries {
+        UUID org_id PK
+        UUID library_id PK
+        UUID owner_id
+        TEXT name
+        TEXT description
+        BOOLEAN encrypted
+        INT enc_version
+        TEXT magic
+        TEXT random_key
+        TEXT root_commit_id
+        TEXT head_commit_id
+        TEXT storage_class
+        BIGINT size_bytes
+        BIGINT file_count
+        INT version_ttl_days
+        TIMESTAMP created_at
+        TIMESTAMP updated_at
+    }
+
+    commits {
+        UUID library_id PK
+        TEXT commit_id PK
+        TEXT parent_id
+        TEXT root_fs_id
+        UUID creator_id
+        TEXT description
+        TIMESTAMP created_at
+    }
+
+    fs_objects {
+        UUID library_id PK
+        TEXT fs_id PK
+        TEXT obj_type
+        TEXT obj_name
+        TEXT dir_entries
+        LIST block_ids
+        BIGINT size_bytes
+        BIGINT mtime
+    }
+
+    blocks {
+        UUID org_id PK
+        TEXT block_id PK
+        INT size_bytes
+        TEXT storage_class
+        TEXT storage_key
+        INT ref_count
+        TIMESTAMP created_at
+        TIMESTAMP last_accessed
+    }
+
+    block_id_mappings {
+        UUID org_id PK
+        TEXT external_id PK
+        TEXT internal_id
+        TIMESTAMP created_at
+    }
+
+    share_links {
+        TEXT share_token PK
+        UUID org_id
+        UUID library_id
+        TEXT file_path
+        UUID created_by
+        TEXT permission
+        TEXT password_hash
+        TIMESTAMP expires_at
+        INT download_count
+        INT max_downloads
+        TIMESTAMP created_at
+    }
+
+    shares {
+        UUID library_id PK
+        UUID share_id PK
+        UUID shared_by
+        UUID shared_to
+        TEXT shared_to_type
+        TEXT permission
+        TIMESTAMP created_at
+        TIMESTAMP expires_at
+    }
+
+    starred_files {
+        UUID user_id PK
+        UUID repo_id PK
+        TEXT path PK
+        TIMESTAMP starred_at
+    }
+
+    locked_files {
+        UUID repo_id PK
+        TEXT path PK
+        UUID locked_by
+        TIMESTAMP locked_at
+    }
+
+    access_tokens {
+        TEXT token PK
+        TEXT token_type
+        UUID org_id
+        UUID repo_id
+        TEXT file_path
+        UUID user_id
+        TIMESTAMP created_at
+    }
+
+    hostname_mappings {
+        TEXT hostname PK
+        UUID org_id
+        MAP settings
+        TIMESTAMP created_at
+        TIMESTAMP updated_at
+    }
+
+    onlyoffice_doc_keys {
+        TEXT doc_key PK
+        TEXT user_id
+        TEXT repo_id
+        TEXT file_path
+        TIMESTAMP created_at
+    }
+
+    restore_jobs {
+        UUID org_id PK
+        UUID job_id PK
+        UUID library_id
+        LIST block_ids
+        TEXT glacier_job_id
+        TEXT status
+        TIMESTAMP requested_at
+        TIMESTAMP completed_at
+        TIMESTAMP expires_at
+    }
+
+    %% Relationships
+    organizations ||--o{ users : "contains"
+    organizations ||--o{ libraries : "contains"
+    organizations ||--o{ blocks : "contains"
+    organizations ||--o{ block_id_mappings : "contains"
+    organizations ||--o{ restore_jobs : "contains"
+    organizations ||--o{ hostname_mappings : "mapped_to"
+
+    users ||--o{ libraries : "owns"
+    users ||--o{ starred_files : "stars"
+    users ||--o{ commits : "creates"
+    users ||--o{ shares : "creates"
+    users ||--o{ share_links : "creates"
+
+    libraries ||--o{ commits : "has"
+    libraries ||--o{ fs_objects : "contains"
+    libraries ||--o{ shares : "shared"
+    libraries ||--o{ locked_files : "has"
+
+    commits ||--|| fs_objects : "root_fs"
+    fs_objects ||--o{ blocks : "references"
+```
+
+### Table Relationships
+
+| Relationship | Description |
+|--------------|-------------|
+| `organizations` → `users` | Users belong to an organization (partition key) |
+| `organizations` → `libraries` | Libraries belong to an organization |
+| `libraries` → `commits` | Git-like commit history per library |
+| `commits` → `fs_objects` | Each commit points to a root fs_object (directory tree) |
+| `fs_objects` → `blocks` | Files reference content blocks by ID |
+| `blocks` ← `block_id_mappings` | SHA-1 to SHA-256 translation for Seafile clients |
+| `users` → `starred_files` | User favorites |
+| `libraries` → `locked_files` | File locking for collaborative editing |
+
+### Cassandra Partition Keys
+
+Cassandra tables use partition keys (PK) for data distribution:
+
+| Table | Partition Key | Clustering Key | Purpose |
+|-------|---------------|----------------|---------|
+| `users` | `org_id` | `user_id` | Group users by org |
+| `libraries` | `org_id` | `library_id` | Group libraries by org |
+| `commits` | `library_id` | `commit_id` | History per library |
+| `fs_objects` | `library_id` | `fs_id` | Tree per library |
+| `blocks` | `org_id` | `block_id` | Blocks per org (dedup) |
+| `starred_files` | `user_id` | `repo_id, path` | User favorites |
+
+---
+
 ## Technical Notes
 
 ### Why Not ScyllaDB?

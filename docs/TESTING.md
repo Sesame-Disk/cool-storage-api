@@ -7,13 +7,18 @@ This document describes test coverage, benchmarks, and how to run tests.
 | Package | Coverage | Notes |
 |---------|----------|-------|
 | `internal/config` | 92.5% | Well covered |
-| `internal/storage` | 46.6% | StorageManager, S3, BlockStore, SpillBuffer |
-| `internal/api` | 21.1% | Sync protocol, token management, hostname |
-| `internal/api/v2` | 15.1% | FileView, OnlyOffice, Starred, CRUD ops |
 | `internal/chunker` | 79.2% | FastCDC + Adaptive chunking |
+| `internal/storage` | 46.6% | StorageManager, S3, BlockStore, SpillBuffer |
+| `internal/api` | 21.0% | Sync protocol, token management, hostname |
+| `internal/api/v2` | 13.8% | FileView, OnlyOffice, Starred, CRUD ops |
 | `internal/models` | n/a | Data structures only |
+| `internal/db` | 0% | Requires Cassandra (integration tests) |
 
-*Last updated: 2026-01-02*
+*Last updated: 2026-01-03*
+
+### Frontend Tests
+
+The frontend (extracted from Seafile's Seahub) does not currently have unit tests. The `npm test` script exists but no test files are present in `frontend/src/`.
 
 ---
 
@@ -95,7 +100,7 @@ go test -v -run "TestLargeFileChunking|TestAdaptiveChunkingWithSpeed" \
 | `internal/api/v2/onlyoffice_test.go` | OnlyOffice pure functions (10 tests) |
 | `internal/api/v2/libraries_test.go` | formatSize function (32 tests) |
 | `internal/api/v2/fs_helpers_test.go` | FS helper functions (10 tests) |
-| `internal/api/v2/starred_test.go` | StarredFile struct, auth checks (15 tests) |
+| `internal/api/v2/starred_test.go` | StarredFile struct, auth checks, form binding (18 tests) |
 | `internal/api/v2/files_crud_test.go` | CRUD operations (25+ tests) |
 | `internal/storage/manager_test.go` | StorageManager, failover, health tracking |
 | `internal/storage/s3_test.go` | S3 helper functions, config structs |
@@ -240,7 +245,18 @@ For files >100MB, use `S3Store.PutAuto()` for automatic multipart:
 
 ## Known Test Issues
 
-### Disabled Tests
+### Fixed Issues (2026-01-03)
+
+1. **`v2/fileview_test.go` - Missing tokenCreator**
+   - Tests were missing mock tokenCreator, causing nil pointer panics
+   - Fix: Added `mockTokenCreator` struct implementing `TokenCreator` interface
+   - Updated all tests that create `FileViewHandler` to include tokenCreator
+
+2. **`v2/starred_test.go` - StarFileRequest binding tests**
+   - Tests used `"p"` JSON field but expected `Path` field to be populated
+   - Fix: Updated tests to properly test both `path` (v2.1 API) and `p` (v2 legacy API) bindings
+
+### Remaining Issues
 
 1. **`v2/handler_test.go` empty name validation**
    - Test expects 400 for empty name, returns 200
