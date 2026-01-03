@@ -7,6 +7,7 @@ const propTypes = {
 };
 
 const modalRoot = document.getElementById('modal-wrapper');
+
 class ModalPortal extends React.Component {
 
   constructor(props) {
@@ -15,7 +16,9 @@ class ModalPortal extends React.Component {
   }
 
   componentDidMount() {
-    modalRoot.appendChild(this.el);
+    if (modalRoot) {
+      modalRoot.appendChild(this.el);
+    }
   }
 
   componentWillUnmount() {

@@ -1,5 +1,6 @@
 import React, { Fragment } from 'react';
 import PropTypes from 'prop-types';
+import { navigate } from '@gatsbyjs/reach-router';
 import { Button, ButtonGroup } from 'reactstrap';
 import { gettext, siteRoot, name, fileServerRoot, useGoFileserver } from '../../utils/constants';
 import { Utils } from '../../utils/utils';
@@ -243,12 +244,8 @@ class MultipleDirOperationToolbar extends React.Component {
 
   onHistory = (dirent) => {
     let filePath = this.getDirentPath(dirent);
-    let url = URLDecorator.getUrl({
-      type: 'file_revisions',
-      repoID: this.props.repoID,
-      filePath: filePath
-    });
-    location.href = url;
+    let url = siteRoot + 'repo/file_revisions/' + this.props.repoID + '/?p=' + encodeURIComponent(filePath);
+    navigate(url);
   };
 
   onAccessLog = (dirent) => {

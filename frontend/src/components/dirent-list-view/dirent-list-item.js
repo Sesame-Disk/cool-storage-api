@@ -1,5 +1,6 @@
 import React, { Fragment } from 'react';
 import PropTypes from 'prop-types';
+import { navigate } from '@gatsbyjs/reach-router';
 import MediaQuery from 'react-responsive';
 import { v4 as uuidv4 } from 'uuid';
 import moment from 'moment';
@@ -227,7 +228,7 @@ class DirentListItem extends React.Component {
 
   onItemShare = (e) => {
     e.preventDefault();
-    e.nativeEvent.stopImmediatePropagation(); //for document event
+    e.nativeEvent.stopImmediatePropagation();
     this.setState({isShareDialogShow: !this.state.isShareDialogShow});
   };
 
@@ -415,8 +416,8 @@ class DirentListItem extends React.Component {
   onHistory = () => {
     let repoID = this.props.repoID;
     let filePath = this.getDirentPath(this.props.dirent);
-    let url = URLDecorator.getUrl({type: 'file_revisions', repoID: repoID, filePath: filePath});
-    location.href = url;
+    let url = siteRoot + 'repo/file_revisions/' + repoID + '/?p=' + encodeURIComponent(filePath);
+    navigate(url);
   };
 
   onAccessLog = () => {
@@ -898,19 +899,17 @@ class DirentListItem extends React.Component {
           </ModalPortal>
         }
         {this.state.isShareDialogShow &&
-          <ModalPortal>
-            <ShareDialog
-              itemType={dirent.type}
-              itemName={dirent.name}
-              itemPath={direntPath}
-              userPerm={dirent.permission}
-              repoID={this.props.repoID}
-              repoEncrypted={this.props.repoEncrypted}
-              enableDirPrivateShare={this.props.enableDirPrivateShare}
-              isGroupOwnedRepo={this.props.isGroupOwnedRepo}
-              toggleDialog={this.closeSharedDialog}
-            />
-          </ModalPortal>
+          <ShareDialog
+            itemType={dirent.type}
+            itemName={dirent.name}
+            itemPath={direntPath}
+            userPerm={dirent.permission}
+            repoID={this.props.repoID}
+            repoEncrypted={this.props.repoEncrypted}
+            enableDirPrivateShare={this.props.enableDirPrivateShare}
+            isGroupOwnedRepo={this.props.isGroupOwnedRepo}
+            toggleDialog={this.closeSharedDialog}
+          />
         }
         {this.state.isPermissionDialogOpen &&
           <ModalPortal>

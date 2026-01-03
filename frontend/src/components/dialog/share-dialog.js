@@ -324,17 +324,21 @@ class ShareDialog extends React.Component {
   render() {
     const { itemType, itemName } = this.props;
     return (
-      <div>
-        <Modal isOpen={true} style={{ maxWidth: '760px' }} className="share-dialog" toggle={this.props.toggleDialog}>
-          <ModalHeader toggle={this.props.toggleDialog} tag="div">
-            <h5 className="text-truncate">{gettext('Share')} <span className="op-target" title={itemName}>{itemName}</span></h5>
-            {this.renderExternalShareMessage()}
-          </ModalHeader>
-          <ModalBody className="share-dialog-content" role="tablist">
-            {(itemType === 'library' || itemType === 'dir') && this.renderDirContent()}
-            {itemType === 'file' && this.renderFileContent()}
-          </ModalBody>
-        </Modal>
+      <div className="modal show d-block" tabIndex="-1" style={{ backgroundColor: 'rgba(0,0,0,0.5)' }}>
+        <div className="modal-dialog" style={{ maxWidth: '760px' }}>
+          <div className="modal-content">
+            <div className="modal-header">
+              <h5 className="modal-title text-truncate">{gettext('Share')} <span className="op-target" title={itemName}>{itemName}</span></h5>
+              <button type="button" className="close" onClick={this.props.toggleDialog} aria-label="Close">
+                <span aria-hidden="true">&times;</span>
+              </button>
+            </div>
+            <div className="modal-body share-dialog-content" role="tablist">
+              {(itemType === 'library' || itemType === 'dir') && this.renderDirContent()}
+              {itemType === 'file' && this.renderFileContent()}
+            </div>
+          </div>
+        </div>
       </div>
     );
   }

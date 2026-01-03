@@ -14,6 +14,17 @@ func init() {
 	gin.SetMode(gin.TestMode)
 }
 
+// mockTokenCreator implements TokenCreator interface for testing
+type mockTokenCreator struct{}
+
+func (m *mockTokenCreator) CreateUploadToken(orgID, repoID, path, userID string) (string, error) {
+	return "mock-upload-token-" + repoID, nil
+}
+
+func (m *mockTokenCreator) CreateDownloadToken(orgID, repoID, path, userID string) (string, error) {
+	return "mock-download-token-" + repoID, nil
+}
+
 // TestErrorPageHTML tests the error page HTML generator
 func TestErrorPageHTML(t *testing.T) {
 	tests := []struct {
@@ -332,7 +343,8 @@ func TestViewFileRedirectsNonOfficeFiles(t *testing.T) {
 				ViewExtensions: []string{"docx", "xlsx", "pptx"},
 			},
 		},
-		serverURL: "http://localhost:8080",
+		serverURL:    "http://localhost:8080",
+		tokenCreator: &mockTokenCreator{},
 	}
 
 	r := gin.New()
@@ -387,8 +399,9 @@ func TestViewFileRedirectsNonOfficeFiles(t *testing.T) {
 
 			if tt.expectRedirect {
 				location := w.Header().Get("Location")
-				if !strings.Contains(location, "/api/v2/files/repo-123/download") {
-					t.Errorf("redirect location = %q, expected download URL", location)
+				// Redirects to seafhttp download endpoint with token
+				if !strings.Contains(location, "/seafhttp/files/") {
+					t.Errorf("redirect location = %q, expected seafhttp download URL", location)
 				}
 			}
 		})
@@ -404,7 +417,8 @@ func TestViewFileOnlyOfficeDisabled(t *testing.T) {
 				ViewExtensions: []string{"docx", "xlsx"},
 			},
 		},
-		serverURL: "http://localhost:8080",
+		serverURL:    "http://localhost:8080",
+		tokenCreator: &mockTokenCreator{},
 	}
 
 	r := gin.New()
@@ -425,8 +439,8 @@ func TestViewFileOnlyOfficeDisabled(t *testing.T) {
 	}
 
 	location := w.Header().Get("Location")
-	if !strings.Contains(location, "/download") {
-		t.Errorf("expected redirect to download, got %q", location)
+	if !strings.Contains(location, "/seafhttp/files/") {
+		t.Errorf("expected redirect to seafhttp download, got %q", location)
 	}
 }
 
@@ -439,7 +453,8 @@ func TestViewFilePathNormalization(t *testing.T) {
 				ViewExtensions: []string{},
 			},
 		},
-		serverURL: "http://localhost:8080",
+		serverURL:    "http://localhost:8080",
+		tokenCreator: &mockTokenCreator{},
 	}
 
 	r := gin.New()
@@ -451,24 +466,24 @@ func TestViewFilePathNormalization(t *testing.T) {
 	r.GET("/lib/:repo_id/file/*filepath", h.ViewFile)
 
 	tests := []struct {
-		name         string
-		requestPath  string
-		expectInPath string
+		name           string
+		requestPath    string
+		expectFilename string
 	}{
 		{
-			name:         "path with leading slash",
-			requestPath:  "/lib/repo-123/file/docs/file.txt",
-			expectInPath: "/docs/file.txt",
+			name:           "path with leading slash",
+			requestPath:    "/lib/repo-123/file/docs/file.txt",
+			expectFilename: "file.txt",
 		},
 		{
-			name:         "path in subdirectory",
-			requestPath:  "/lib/repo-123/file/nested/deep/file.pdf",
-			expectInPath: "/nested/deep/file.pdf",
+			name:           "path in subdirectory",
+			requestPath:    "/lib/repo-123/file/nested/deep/file.pdf",
+			expectFilename: "file.pdf",
 		},
 		{
-			name:         "root file",
-			requestPath:  "/lib/repo-123/file/root.txt",
-			expectInPath: "/root.txt",
+			name:           "root file",
+			requestPath:    "/lib/repo-123/file/root.txt",
+			expectFilename: "root.txt",
 		},
 	}
 
@@ -478,10 +493,10 @@ func TestViewFilePathNormalization(t *testing.T) {
 			w := httptest.NewRecorder()
 			r.ServeHTTP(w, req)
 
-			// Check redirect URL contains the normalized path
+			// Check redirect URL contains the filename
 			location := w.Header().Get("Location")
-			if !strings.Contains(location, "p="+tt.expectInPath) {
-				t.Errorf("redirect URL = %q, expected to contain p=%s", location, tt.expectInPath)
+			if !strings.Contains(location, "/"+tt.expectFilename) {
+				t.Errorf("redirect URL = %q, expected to contain /%s", location, tt.expectFilename)
 			}
 		})
 	}
@@ -503,8 +518,8 @@ func TestRegisterFileViewRoutes(t *testing.T) {
 
 	r := gin.New()
 
-	// Register routes
-	RegisterFileViewRoutes(r, nil, cfg, nil, nil, "http://localhost:8080", nil)
+	// Register routes with mock token creator
+	RegisterFileViewRoutes(r, nil, cfg, nil, &mockTokenCreator{}, "http://localhost:8080", nil)
 
 	// Test that the route exists
 	req, _ := http.NewRequest("GET", "/lib/repo-123/file/test.txt?token=test-token", nil)

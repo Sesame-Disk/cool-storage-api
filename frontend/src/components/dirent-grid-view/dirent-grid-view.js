@@ -1,5 +1,6 @@
 import React, { Fragment } from 'react';
 import PropTypes from 'prop-types';
+import { navigate } from '@gatsbyjs/reach-router';
 import { siteRoot, username, enableSeadoc, thumbnailSizeForOriginal } from '../../utils/constants';
 import { Utils } from '../../utils/utils';
 import { seafileAPI } from '../../utils/seafile-api';
@@ -329,8 +330,8 @@ class DirentGridView extends React.Component {
   onHistory = (currentObject) => {
     let repoID = this.props.repoID;
     let filePath = this.getDirentPath(currentObject);
-    let url = URLDecorator.getUrl({type: 'file_revisions', repoID: repoID, filePath: filePath});
-    location.href = url;
+    let url = siteRoot + 'repo/file_revisions/' + repoID + '/?p=' + encodeURIComponent(filePath);
+    navigate(url);
   };
 
   onAccessLog = (currentObject) => {

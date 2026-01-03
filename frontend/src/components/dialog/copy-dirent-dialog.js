@@ -1,6 +1,6 @@
 import React from 'react';
 import PropTypes from 'prop-types';
-import { Button, Modal, ModalHeader, ModalFooter, ModalBody, Alert } from 'reactstrap';
+import { Button, Alert } from 'reactstrap';
 import { gettext } from '../../utils/constants';
 import { Utils } from '../../utils/utils';
 import FileChooser from '../file-chooser/file-chooser';
@@ -147,25 +147,34 @@ class CopyDirent extends React.Component {
     let mode = 'current_repo_and_other_repos';
     const { isMutipleOperation } = this.props;
     return (
-      <Modal isOpen={true} toggle={this.toggle}>
-        <ModalHeader toggle={this.toggle}>
-          {isMutipleOperation ? title : <div dangerouslySetInnerHTML={{__html: title}} className="d-flex mw-100"></div>}
-        </ModalHeader>
-        <ModalBody>
-          <FileChooser
-            repoID={this.props.repoID}
-            currentPath={this.props.path}
-            onDirentItemClick={this.onDirentItemClick}
-            onRepoItemClick={this.onRepoItemClick}
-            mode={mode}
-          />
-          {this.state.errMessage && <Alert color="danger" className="mt-2">{this.state.errMessage}</Alert>}
-        </ModalBody>
-        <ModalFooter>
-          <Button color="secondary" onClick={this.toggle}>{gettext('Cancel')}</Button>
-          <Button color="primary" onClick={this.handleSubmit}>{gettext('Submit')}</Button>
-        </ModalFooter>
-      </Modal>
+      <div className="modal show d-block" tabIndex="-1" style={{ backgroundColor: 'rgba(0,0,0,0.5)' }}>
+        <div className="modal-dialog">
+          <div className="modal-content">
+            <div className="modal-header">
+              <h5 className="modal-title">
+                {isMutipleOperation ? title : <span dangerouslySetInnerHTML={{__html: title}} className="d-flex mw-100"></span>}
+              </h5>
+              <button type="button" className="close" onClick={this.toggle} aria-label="Close">
+                <span aria-hidden="true">&times;</span>
+              </button>
+            </div>
+            <div className="modal-body">
+              <FileChooser
+                repoID={this.props.repoID}
+                currentPath={this.props.path}
+                onDirentItemClick={this.onDirentItemClick}
+                onRepoItemClick={this.onRepoItemClick}
+                mode={mode}
+              />
+              {this.state.errMessage && <Alert color="danger" className="mt-2">{this.state.errMessage}</Alert>}
+            </div>
+            <div className="modal-footer">
+              <Button color="secondary" onClick={this.toggle}>{gettext('Cancel')}</Button>
+              <Button color="primary" onClick={this.handleSubmit}>{gettext('Submit')}</Button>
+            </div>
+          </div>
+        </div>
+      </div>
     );
   }
 }

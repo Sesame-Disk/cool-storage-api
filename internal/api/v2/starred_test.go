@@ -78,14 +78,24 @@ func TestStarFileRequest_Binding(t *testing.T) {
 		body       string
 		wantStatus int
 		wantRepoID string
-		wantPath   string
+		wantPath   string  // Using "path" JSON tag
+		wantPathV2 string  // Using "p" JSON tag (v2 API)
 	}{
 		{
-			name:       "JSON format",
-			body:       `{"repo_id":"repo-123","p":"/path/to/file.txt"}`,
+			name:       "JSON format with path (v2.1)",
+			body:       `{"repo_id":"repo-123","path":"/path/to/file.txt"}`,
 			wantStatus: http.StatusOK,
 			wantRepoID: "repo-123",
 			wantPath:   "/path/to/file.txt",
+			wantPathV2: "",
+		},
+		{
+			name:       "JSON format with p (v2)",
+			body:       `{"repo_id":"repo-456","p":"/legacy/path.txt"}`,
+			wantStatus: http.StatusOK,
+			wantRepoID: "repo-456",
+			wantPath:   "",
+			wantPathV2: "/legacy/path.txt",
 		},
 		{
 			name:       "empty body",
@@ -93,6 +103,7 @@ func TestStarFileRequest_Binding(t *testing.T) {
 			wantStatus: http.StatusOK,
 			wantRepoID: "",
 			wantPath:   "",
+			wantPathV2: "",
 		},
 	}
 
@@ -119,6 +130,9 @@ func TestStarFileRequest_Binding(t *testing.T) {
 				if result.Path != tt.wantPath {
 					t.Errorf("Path = %q, want %q", result.Path, tt.wantPath)
 				}
+				if result.PathV2 != tt.wantPathV2 {
+					t.Errorf("PathV2 = %q, want %q", result.PathV2, tt.wantPathV2)
+				}
 			}
 		})
 	}
@@ -137,9 +151,10 @@ func TestStarFileRequest_FormBinding(t *testing.T) {
 		c.JSON(http.StatusOK, req)
 	})
 
+	// Test with "path" form field (v2.1 API)
 	form := url.Values{}
 	form.Set("repo_id", "repo-456")
-	form.Set("p", "/another/path.txt")
+	form.Set("path", "/another/path.txt")
 
 	req := httptest.NewRequest("POST", "/test", strings.NewReader(form.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
@@ -160,6 +175,46 @@ func TestStarFileRequest_FormBinding(t *testing.T) {
 	}
 	if result.Path != "/another/path.txt" {
 		t.Errorf("Path = %q, want %q", result.Path, "/another/path.txt")
+	}
+}
+
+// Test StarFileRequest form binding with legacy "p" parameter
+func TestStarFileRequest_FormBinding_LegacyP(t *testing.T) {
+	r := gin.New()
+
+	r.POST("/test", func(c *gin.Context) {
+		var req StarFileRequest
+		if err := c.ShouldBind(&req); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		c.JSON(http.StatusOK, req)
+	})
+
+	// Test with "p" form field (v2 API legacy)
+	form := url.Values{}
+	form.Set("repo_id", "repo-789")
+	form.Set("p", "/legacy/file.txt")
+
+	req := httptest.NewRequest("POST", "/test", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	w := httptest.NewRecorder()
+
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusOK)
+	}
+
+	var result StarFileRequest
+	if err := json.Unmarshal(w.Body.Bytes(), &result); err != nil {
+		t.Fatalf("Failed to parse response: %v", err)
+	}
+	if result.RepoID != "repo-789" {
+		t.Errorf("RepoID = %q, want %q", result.RepoID, "repo-789")
+	}
+	if result.PathV2 != "/legacy/file.txt" {
+		t.Errorf("PathV2 = %q, want %q", result.PathV2, "/legacy/file.txt")
 	}
 }
 
