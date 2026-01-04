@@ -17,6 +17,7 @@ import (
 	"github.com/Sesame-Disk/sesamefs/internal/config"
 	"github.com/Sesame-Disk/sesamefs/internal/db"
 	"github.com/Sesame-Disk/sesamefs/internal/storage"
+	"github.com/apache/cassandra-gocql-driver/v2"
 	"github.com/gin-gonic/gin"
 )
 
@@ -40,13 +41,13 @@ type Dirent struct {
 	ModifierEmail          string `json:"modifier_email,omitempty"`
 	ModifierName           string `json:"modifier_name,omitempty"`
 	ModifierContactEmail   string `json:"modifier_contact_email,omitempty"`
-	IsLocked               bool   `json:"is_locked,omitempty"`
-	LockTime               int64  `json:"lock_time,omitempty"`
-	IsFreezed              bool   `json:"is_freezed,omitempty"`
-	LockOwner              string `json:"lock_owner,omitempty"`
-	LockOwnerName          string `json:"lock_owner_name,omitempty"`
-	LockOwnerContactEmail  string `json:"lock_owner_contact_email,omitempty"`
-	LockedByMe             bool   `json:"locked_by_me,omitempty"`
+	IsLocked               bool   `json:"is_locked"`
+	LockTime               int64  `json:"lock_time"`
+	IsFreezed              bool   `json:"is_freezed"`
+	LockOwner              string `json:"lock_owner"`
+	LockOwnerName          string `json:"lock_owner_name"`
+	LockOwnerContactEmail  string `json:"lock_owner_contact_email"`
+	LockedByMe             bool   `json:"locked_by_me"`
 }
 
 // FSEntry represents a directory entry stored in fs_objects.dir_entries
@@ -1930,12 +1931,17 @@ func (h *FileHandler) ListDirectoryV21(c *gin.Context) {
 	lockIter := h.db.Session().Query(`
 		SELECT path, locked_by, locked_at FROM locked_files WHERE repo_id = ?
 	`, repoID).Iter()
-	var lockPath, lockedBy string
+	var lockPath string
+	var lockedByUUID gocql.UUID
 	var lockedAt time.Time
-	for lockIter.Scan(&lockPath, &lockedBy, &lockedAt) {
-		lockedFiles[lockPath] = lockInfo{LockedBy: lockedBy, LockedAt: lockedAt}
+	for lockIter.Scan(&lockPath, &lockedByUUID, &lockedAt) {
+		log.Printf("ListDirectoryV21: found locked file: path=%s, locked_by=%s", lockPath, lockedByUUID.String())
+		lockedFiles[lockPath] = lockInfo{LockedBy: lockedByUUID.String(), LockedAt: lockedAt}
 	}
-	lockIter.Close()
+	if err := lockIter.Close(); err != nil {
+		log.Printf("ListDirectoryV21: failed to get locked files: %v", err)
+	}
+	log.Printf("ListDirectoryV21: repoID=%s, dirPath=%s, lockedFiles count=%d", repoID, dirPath, len(lockedFiles))
 
 	// Convert FSEntry to Dirent for API response (v2.1 format)
 	direntList := make([]Dirent, 0, len(entries))
@@ -1979,6 +1985,7 @@ func (h *FileHandler) ListDirectoryV21(c *gin.Context) {
 		if fileType == "file" {
 			// Check if file is locked
 			if lock, isLocked := lockedFiles[fullPath]; isLocked {
+				log.Printf("ListDirectoryV21: file %s is LOCKED by %s", fullPath, lock.LockedBy)
 				dirent.IsLocked = true
 				dirent.LockTime = lock.LockedAt.Unix()
 				dirent.LockOwner = lock.LockedBy

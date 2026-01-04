@@ -361,12 +361,11 @@ func (s *Server) setupRoutes() {
 			// Stub handlers for optional Seahub features (return empty results instead of 404)
 			protected.GET("/notifications", s.handleEmptyNotifications)
 			protected.GET("/notifications/", s.handleEmptyNotifications)
-			protected.GET("/repos/:repo_id/repo-tags", s.handleEmptyRepoTags)
-			protected.GET("/repos/:repo_id/repo-tags/", s.handleEmptyRepoTags)
-			protected.POST("/repos/:repo_id/repo-tags", s.handleCreateRepoTag)
-			protected.POST("/repos/:repo_id/repo-tags/", s.handleCreateRepoTag)
 			protected.GET("/repo-folder-share-info", s.handleEmptyFolderShareInfo)
 			protected.GET("/repo-folder-share-info/", s.handleEmptyFolderShareInfo)
+
+			// Tag routes (fully implemented)
+			v2.RegisterTagRoutes(protected, s.db)
 		}
 	}
 

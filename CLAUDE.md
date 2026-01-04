@@ -33,8 +33,16 @@ A Seafile-compatible cloud storage API with modern internals (Go, Cassandra, S3)
 | [README.md](README.md) | Quick start, features overview |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Design decisions, storage architecture, chunking |
 | [docs/API-REFERENCE.md](docs/API-REFERENCE.md) | API endpoints, implementation status, specs |
+| [docs/DATABASE-GUIDE.md](docs/DATABASE-GUIDE.md) | Cassandra tables, examples, consistency plan |
 | [docs/TESTING.md](docs/TESTING.md) | Test coverage, benchmarks, integration tests |
 | [docs/LICENSING.md](docs/LICENSING.md) | Legal considerations for Seafile compatibility |
+
+## External References
+
+| Resource | URL |
+|----------|-----|
+| Seafile Web API v2.1 | https://manual.seafile.com/latest/develop/web_api_v2.1/ |
+| seafile-js (frontend API client) | https://github.com/haiwen/seafile-js |
 
 ## Quick Commands
 

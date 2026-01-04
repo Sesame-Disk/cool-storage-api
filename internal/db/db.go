@@ -79,6 +79,11 @@ func (db *DB) Migrate() error {
 		migrationCreateOnlyOfficeDocKeys,
 		migrationCreateStarredFiles,
 		migrationCreateLockedFiles,
+		migrationCreateRepoTags,
+		migrationCreateFileTags,
+		migrationCreateRepoTagCounters,
+		migrationCreateFileTagCounters,
+		migrationCreateFileTagsById,
 	}
 
 	for _, migration := range migrations {
@@ -327,4 +332,53 @@ CREATE TABLE IF NOT EXISTS locked_files (
 	locked_by UUID,
 	locked_at TIMESTAMP,
 	PRIMARY KEY ((repo_id), path)
+)`
+
+// Repository-level tags
+// Partition by repo_id for efficient listing of all tags in a repo
+const migrationCreateRepoTags = `
+CREATE TABLE IF NOT EXISTS repo_tags (
+	repo_id UUID,
+	tag_id INT,
+	name TEXT,
+	color TEXT,
+	created_at TIMESTAMP,
+	PRIMARY KEY ((repo_id), tag_id)
+)`
+
+// File tags - associates files with repo tags
+// Partition by repo_id for efficient listing
+const migrationCreateFileTags = `
+CREATE TABLE IF NOT EXISTS file_tags (
+	repo_id UUID,
+	file_path TEXT,
+	tag_id INT,
+	created_at TIMESTAMP,
+	PRIMARY KEY ((repo_id), file_path, tag_id)
+)`
+
+// Counter for generating tag IDs per repo
+const migrationCreateRepoTagCounters = `
+CREATE TABLE IF NOT EXISTS repo_tag_counters (
+	repo_id UUID PRIMARY KEY,
+	next_tag_id INT
+)`
+
+// Counter for generating unique file_tag_id values per repo
+const migrationCreateFileTagCounters = `
+CREATE TABLE IF NOT EXISTS file_tag_counters (
+	repo_id UUID PRIMARY KEY,
+	next_file_tag_id INT
+)`
+
+// Lookup table to find file tags by their unique ID
+// This enables DELETE /repos/:repo_id/file-tags/:file_tag_id/
+const migrationCreateFileTagsById = `
+CREATE TABLE IF NOT EXISTS file_tags_by_id (
+	repo_id UUID,
+	file_tag_id INT,
+	file_path TEXT,
+	tag_id INT,
+	created_at TIMESTAMP,
+	PRIMARY KEY ((repo_id), file_tag_id)
 )`
