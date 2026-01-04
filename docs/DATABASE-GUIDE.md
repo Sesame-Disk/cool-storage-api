@@ -6,7 +6,7 @@ SesameFS uses Apache Cassandra for metadata storage. This document explains each
 
 ---
 
-## Current Tables (16 in schema, 16 in DB)
+## Current Tables (22 in schema, 22 in DB)
 
 ### 1. `organizations`
 **Purpose:** Multi-tenant organization/company records
@@ -512,6 +512,65 @@ POST /api/v2.1/repos/{repo_id}/file-tags/
 PRIMARY KEY (repo_id)
 ```
 
+**Fields:**
+| Field | Type | Description |
+|-------|------|-------------|
+| `repo_id` | UUID | Repository identifier |
+| `next_tag_id` | INT | Next available tag ID |
+
+---
+
+### 21. `file_tag_counters`
+**Purpose:** Auto-increment file tag IDs per repository (for unique file_tag_id values)
+
+**Schema:**
+```sql
+PRIMARY KEY (repo_id)
+```
+
+**Fields:**
+| Field | Type | Description |
+|-------|------|-------------|
+| `repo_id` | UUID | Repository identifier |
+| `next_file_tag_id` | INT | Next available file tag ID |
+
+**Implementation Notes:**
+- Uses Lightweight Transactions (LWT) for atomic counter initialization
+- Each file-tag association gets a unique `file_tag_id` for direct lookup
+
+---
+
+### 22. `file_tags_by_id`
+**Purpose:** Lookup table to find file tags by their unique ID (enables DELETE by file_tag_id)
+
+**Schema:**
+```sql
+PRIMARY KEY ((repo_id), file_tag_id)
+```
+
+**Fields:**
+| Field | Type | Description |
+|-------|------|-------------|
+| `repo_id` | UUID | Repository identifier |
+| `file_tag_id` | INT | Unique identifier for this file-tag association |
+| `file_path` | TEXT | Path to the tagged file |
+| `tag_id` | INT | Reference to repo_tags.tag_id |
+| `created_at` | TIMESTAMP | When the tag was added |
+
+**API Usage:**
+```bash
+# Delete a file tag by its unique ID
+DELETE /api/v2.1/repos/{repo_id}/file-tags/{file_tag_id}/
+
+# The handler looks up the file_tag_id → gets (file_path, tag_id) → deletes from both tables
+```
+
+**Consistency Pattern:**
+When adding a file tag:
+1. Generate unique `file_tag_id` via counter
+2. Write to `file_tags` table (for efficient file-based queries)
+3. Write to `file_tags_by_id` table (for efficient ID-based deletion)
+
 ---
 
 ## Consistency Challenges & Solutions
@@ -652,7 +711,16 @@ database:
 
 ## Action Items
 
-- [ ] Create missing tables (`repo_tags`, `file_tags`, `repo_tag_counters`, `locked_files`)
+### Completed
+- [x] Create `repo_tags` table (repo-level tag definitions)
+- [x] Create `file_tags` table (file-tag associations by path)
+- [x] Create `repo_tag_counters` table (auto-increment repo tag IDs)
+- [x] Create `locked_files` table (file locking)
+- [x] Create `file_tag_counters` table (auto-increment file tag IDs)
+- [x] Create `file_tags_by_id` table (lookup file tags by unique ID)
+- [x] Implement LWT for tag counter initialization
+
+### Pending
 - [ ] Implement LWT for user creation
 - [ ] Implement LWT for `head_commit_id` updates (optimistic locking)
 - [ ] Convert `blocks.ref_count` to counter table

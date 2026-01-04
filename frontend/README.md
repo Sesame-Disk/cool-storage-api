@@ -111,4 +111,4 @@ Mobile support uses `react-responsive` MediaQuery for different layouts.
 
 ## Documentation
 
-See [docs/FRONTEND-SETUP.md](../docs/FRONTEND-SETUP.md) for detailed setup guide.
+See [docs/FRONTEND.md](../docs/FRONTEND.md) for detailed setup guide.

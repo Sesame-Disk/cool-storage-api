@@ -711,10 +711,6 @@ class DirentListItem extends React.Component {
     const lockedImageUrl = `${mediaUrl}img/file-${dirent.is_freezed ? 'freezed-32.svg' : 'locked-32.png'}`;
     const lockedMessage = dirent.is_freezed ? gettext('freezed') : gettext('locked');
 
-    // DEBUG: Log lock status for each file
-    if (dirent.type === 'file') {
-      console.log(`[LOCK DEBUG] File: ${dirent.name}, is_locked: ${dirent.is_locked}, lock_owner: ${dirent.lock_owner}, lock_owner_name: ${dirent.lock_owner_name}, lockedImageUrl: ${lockedImageUrl}`);
-    }
     const desktopItem = (
       <tr
         className={trClass}

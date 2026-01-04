@@ -6,19 +6,22 @@ This document describes test coverage, benchmarks, and how to run tests.
 
 | Package | Coverage | Notes |
 |---------|----------|-------|
-| `internal/config` | 92.5% | Well covered |
-| `internal/chunker` | 79.2% | FastCDC + Adaptive chunking |
+| `internal/config` | 92.5% | Well covered - config loading, validation, env |
+| `internal/chunker` | 79.2% | FastCDC + Adaptive chunking algorithms |
 | `internal/storage` | 46.6% | StorageManager, S3, BlockStore, SpillBuffer |
 | `internal/api` | 21.0% | Sync protocol, token management, hostname |
-| `internal/api/v2` | 13.8% | FileView, OnlyOffice, Starred, CRUD ops |
+| `internal/api/v2` | 16.1% | FileView, OnlyOffice, Starred, Tags, CRUD, Lock |
 | `internal/models` | n/a | Data structures only |
 | `internal/db` | 0% | Requires Cassandra (integration tests) |
 
-*Last updated: 2026-01-03*
+*Last updated: 2026-01-04*
 
 ### Frontend Tests
 
-The frontend (extracted from Seafile's Seahub) does not currently have unit tests. The `npm test` script exists but no test files are present in `frontend/src/`.
+The frontend (React SPA extracted from Seahub) does not currently have unit tests. Test infrastructure exists (`npm test`) but no test files are present in `frontend/src/`. Consider adding tests for:
+- Dirent model parsing
+- API client functions
+- Component rendering
 
 ---
 
@@ -102,6 +105,8 @@ go test -v -run "TestLargeFileChunking|TestAdaptiveChunkingWithSpeed" \
 | `internal/api/v2/fs_helpers_test.go` | FS helper functions (10 tests) |
 | `internal/api/v2/starred_test.go` | StarredFile struct, auth checks, form binding (18 tests) |
 | `internal/api/v2/files_crud_test.go` | CRUD operations (25+ tests) |
+| `internal/api/v2/files_lock_test.go` | File locking, Dirent struct, parameter validation (15+ tests) |
+| `internal/api/v2/tags_test.go` | Tag CRUD, file tags, validation (20+ tests) |
 | `internal/storage/manager_test.go` | StorageManager, failover, health tracking |
 | `internal/storage/s3_test.go` | S3 helper functions, config structs |
 | `internal/storage/blocks_test.go` | BlockStore, hash sharding |
@@ -109,6 +114,7 @@ go test -v -run "TestLargeFileChunking|TestAdaptiveChunkingWithSpeed" \
 | `internal/config/config_test.go` | Config loading, validation, env overrides |
 | `internal/chunker/fastcdc_test.go` | FastCDC algorithm, deterministic chunking |
 | `internal/chunker/adaptive_test.go` | Adaptive chunking, speed probe (16 tests) |
+| `internal/chunker/integration_test.go` | Integration tests for chunking |
 | `internal/models/models_test.go` | Model JSON serialization |
 
 ---

@@ -1928,18 +1928,25 @@ func (h *FileHandler) ListDirectoryV21(c *gin.Context) {
 		LockedAt time.Time
 	}
 	lockedFiles := make(map[string]lockInfo)
-	lockIter := h.db.Session().Query(`
-		SELECT path, locked_by, locked_at FROM locked_files WHERE repo_id = ?
-	`, repoID).Iter()
-	var lockPath string
-	var lockedByUUID gocql.UUID
-	var lockedAt time.Time
-	for lockIter.Scan(&lockPath, &lockedByUUID, &lockedAt) {
-		log.Printf("ListDirectoryV21: found locked file: path=%s, locked_by=%s", lockPath, lockedByUUID.String())
-		lockedFiles[lockPath] = lockInfo{LockedBy: lockedByUUID.String(), LockedAt: lockedAt}
-	}
-	if err := lockIter.Close(); err != nil {
-		log.Printf("ListDirectoryV21: failed to get locked files: %v", err)
+
+	// Parse repo UUID for locked files query
+	repoUUID, err := gocql.ParseUUID(repoID)
+	if err != nil {
+		log.Printf("ListDirectoryV21: failed to parse repo UUID for locked files: %v", err)
+	} else {
+		lockIter := h.db.Session().Query(`
+			SELECT path, locked_by, locked_at FROM locked_files WHERE repo_id = ?
+		`, repoUUID).Iter()
+		var lockPath string
+		var lockedByUUID gocql.UUID
+		var lockedAt time.Time
+		for lockIter.Scan(&lockPath, &lockedByUUID, &lockedAt) {
+			log.Printf("ListDirectoryV21: found locked file: path=%s, locked_by=%s", lockPath, lockedByUUID.String())
+			lockedFiles[lockPath] = lockInfo{LockedBy: lockedByUUID.String(), LockedAt: lockedAt}
+		}
+		if err := lockIter.Close(); err != nil {
+			log.Printf("ListDirectoryV21: failed to get locked files: %v", err)
+		}
 	}
 	log.Printf("ListDirectoryV21: repoID=%s, dirPath=%s, lockedFiles count=%d", repoID, dirPath, len(lockedFiles))
 
@@ -2026,6 +2033,8 @@ func (h *FileHandler) LockFile(c *gin.Context) {
 	filePath := c.Query("p")
 	userID := c.GetString("user_id")
 
+	log.Printf("LockFile: repoID=%s, filePath=%s, userID=%s", repoID, filePath, userID)
+
 	if filePath == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "path is required"})
 		return
@@ -2036,22 +2045,48 @@ func (h *FileHandler) LockFile(c *gin.Context) {
 
 	var req FileLockRequest
 	if err := c.ShouldBind(&req); err != nil {
+		log.Printf("LockFile: failed to bind request: %v", err)
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
+	}
+
+	log.Printf("LockFile: operation=%s", req.Operation)
+
+	// Parse repo UUID
+	repoUUID, err := gocql.ParseUUID(repoID)
+	if err != nil {
+		log.Printf("LockFile: failed to parse repo UUID: %v", err)
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid repo_id"})
+		return
+	}
+
+	// Parse user UUID (use a default if not set)
+	var userUUID gocql.UUID
+	if userID != "" {
+		userUUID, err = gocql.ParseUUID(userID)
+		if err != nil {
+			log.Printf("LockFile: failed to parse user UUID %s: %v, using default", userID, err)
+			userUUID, _ = gocql.ParseUUID("00000000-0000-0000-0000-000000000001")
+		}
+	} else {
+		userUUID, _ = gocql.ParseUUID("00000000-0000-0000-0000-000000000001")
 	}
 
 	switch req.Operation {
 	case "lock":
 		// Store lock in database
 		lockTime := time.Now()
+		log.Printf("LockFile: inserting lock for repoUUID=%s, path=%s, userUUID=%s", repoUUID.String(), filePath, userUUID.String())
 		if err := h.db.Session().Query(`
 			INSERT INTO locked_files (repo_id, path, locked_by, locked_at)
 			VALUES (?, ?, ?, ?)
-		`, repoID, filePath, userID, lockTime).Exec(); err != nil {
+		`, repoUUID, filePath, userUUID, lockTime).Exec(); err != nil {
+			log.Printf("LockFile: failed to insert lock: %v", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to lock file"})
 			return
 		}
 
+		log.Printf("LockFile: lock successful")
 		c.JSON(http.StatusOK, gin.H{
 			"success":    true,
 			"repo_id":    repoID,
@@ -2062,13 +2097,16 @@ func (h *FileHandler) LockFile(c *gin.Context) {
 		})
 	case "unlock":
 		// Remove lock from database
+		log.Printf("LockFile: deleting lock for repoUUID=%s, path=%s", repoUUID.String(), filePath)
 		if err := h.db.Session().Query(`
 			DELETE FROM locked_files WHERE repo_id = ? AND path = ?
-		`, repoID, filePath).Exec(); err != nil {
+		`, repoUUID, filePath).Exec(); err != nil {
+			log.Printf("LockFile: failed to delete lock: %v", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to unlock file"})
 			return
 		}
 
+		log.Printf("LockFile: unlock successful")
 		c.JSON(http.StatusOK, gin.H{
 			"success":   true,
 			"repo_id":   repoID,
@@ -2076,6 +2114,7 @@ func (h *FileHandler) LockFile(c *gin.Context) {
 			"is_locked": false,
 		})
 	default:
+		log.Printf("LockFile: unknown operation: %s", req.Operation)
 		c.JSON(http.StatusBadRequest, gin.H{"error": "operation must be 'lock' or 'unlock'"})
 	}
 }

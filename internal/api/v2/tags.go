@@ -391,24 +391,23 @@ func (h *TagHandler) AddFileTag(c *gin.Context) {
 			return
 		}
 
-		// Get next file_tag_id using counter
-		var currentID int
-		applied, err := h.db.Session().Query(`
-			INSERT INTO file_tag_counters (repo_id, next_file_tag_id) VALUES (?, 1) IF NOT EXISTS
-		`, repoUUID).ScanCAS(&currentID)
+		// Get next file_tag_id using counter - simpler approach without LWT
+		err = h.db.Session().Query(`
+			SELECT next_file_tag_id FROM file_tag_counters WHERE repo_id = ?
+		`, repoUUID).Scan(&fileTagID)
 
 		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to initialize file tag counter"})
-			return
-		}
-
-		if !applied {
-			// Counter exists, get current value and increment
-			h.db.Session().Query(`
-				SELECT next_file_tag_id FROM file_tag_counters WHERE repo_id = ?
-			`, repoUUID).Scan(&fileTagID)
-
-			// Update counter
+			// Counter doesn't exist, create it with value 1
+			fileTagID = 1
+			err = h.db.Session().Query(`
+				INSERT INTO file_tag_counters (repo_id, next_file_tag_id) VALUES (?, ?)
+			`, repoUUID, 2).Exec()
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to initialize file tag counter"})
+				return
+			}
+		} else {
+			// Increment counter
 			h.db.Session().Query(`
 				UPDATE file_tag_counters SET next_file_tag_id = ? WHERE repo_id = ?
 			`, fileTagID+1, repoUUID).Exec()

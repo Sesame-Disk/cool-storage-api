@@ -207,7 +207,7 @@ npm start
 # Login: admin@sesamefs.local / dev-token-123
 ```
 
-See [docs/FRONTEND-SETUP.md](docs/FRONTEND-SETUP.md) for detailed setup guide.
+See [docs/FRONTEND.md](docs/FRONTEND.md) for detailed setup guide.
 
 ---
 
@@ -250,7 +250,7 @@ This is intentional for cloud-native deployments (easier load balancing, K8s, et
 | [docs/API-REFERENCE.md](docs/API-REFERENCE.md) | API endpoints, implementation status, compatibility |
 | [docs/TESTING.md](docs/TESTING.md) | Test coverage, benchmarks, running tests |
 | [docs/MULTIREGION-TESTING.md](docs/MULTIREGION-TESTING.md) | Multi-region testing guide |
-| [docs/FRONTEND-SETUP.md](docs/FRONTEND-SETUP.md) | Web UI setup and configuration |
+| [docs/FRONTEND.md](docs/FRONTEND.md) | Web UI setup, patterns, Docker, troubleshooting |
 | [docs/MIGRATION-FROM-SEAFILE.md](docs/MIGRATION-FROM-SEAFILE.md) | Seafile migration guide |
 | [docs/LICENSING.md](docs/LICENSING.md) | Legal considerations |
 
