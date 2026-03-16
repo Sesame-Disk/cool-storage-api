@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/Sesame-Disk/sesamefs/internal/config"
 	"github.com/Sesame-Disk/sesamefs/internal/crypto"
@@ -602,18 +603,11 @@ func (h *FileViewHandler) ServeRawFile(c *gin.Context) {
 		return
 	}
 
-	// Normal file serving: stream block-by-block, O(block_size) RAM
+	// Normal file serving
 	mimeType := mime.TypeByExtension("." + ext)
 	if mimeType == "" {
 		mimeType = "application/octet-stream"
 	}
-
-	c.Header("Content-Disposition", fmt.Sprintf(`inline; filename="%s"`, sanitizeFilename(filename)))
-	c.Header("Content-Type", mimeType)
-	if fileSize > 0 && !encrypted {
-		c.Header("Content-Length", strconv.FormatInt(fileSize, 10))
-	}
-	c.Status(http.StatusOK)
 
 	// Batch resolve all block IDs upfront to avoid per-block Cassandra queries
 	resolvedIDs := streaming.BatchResolveBlockIDs(h.db, orgID, blockIDs)
@@ -622,6 +616,31 @@ func (h *FileViewHandler) ServeRawFile(c *gin.Context) {
 	if encrypted {
 		fileKeyParam = fileKey
 	}
+
+	// For video/audio files, use BlockReadSeeker so http.ServeContent can handle
+	// Range requests (HTTP 206) without buffering the entire file. Only O(1 block) RAM.
+	if isVideoFile(ext) || isAudioFile(ext) {
+		blockSizes, err := streaming.QueryBlockSizes(h.db, orgID, resolvedIDs)
+		if err != nil {
+			log.Printf("[ServeRawFile] Failed to query block sizes: %v", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read file metadata"})
+			return
+		}
+
+		rs := streaming.NewBlockReadSeeker(ctx, blockStore, resolvedIDs, blockSizes, fileSize, fileKeyParam)
+		c.Header("Content-Disposition", fmt.Sprintf(`inline; filename="%s"`, sanitizeFilename(filename)))
+		http.ServeContent(c.Writer, c.Request, filename, time.Time{}, rs)
+		return
+	}
+
+	// Non-video/audio: stream block-by-block, O(block_size) RAM
+	c.Header("Content-Disposition", fmt.Sprintf(`inline; filename="%s"`, sanitizeFilename(filename)))
+	c.Header("Content-Type", mimeType)
+	if fileSize > 0 && !encrypted {
+		c.Header("Content-Length", strconv.FormatInt(fileSize, 10))
+	}
+	c.Status(http.StatusOK)
+
 	streaming.StreamBlocks(c, ctx, blockStore, resolvedIDs, fileKeyParam, "ServeRawFile")
 }
 
@@ -700,6 +719,15 @@ func (h *FileViewHandler) getMaxFileSizeForPreview(ext string) int64 {
 func isVideoFile(ext string) bool {
 	switch ext {
 	case "mp4", "webm", "ogg", "mov", "avi", "mkv", "flv", "wmv", "m4v", "mpg", "mpeg":
+		return true
+	}
+	return false
+}
+
+// isAudioFile returns true for audio file extensions
+func isAudioFile(ext string) bool {
+	switch ext {
+	case "mp3", "wav", "flac", "aac", "m4a", "wma", "ogg":
 		return true
 	}
 	return false

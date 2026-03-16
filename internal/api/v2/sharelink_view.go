@@ -433,14 +433,6 @@ func (h *ShareLinkViewHandler) handleShareLinkRaw(c *gin.Context, sl *shareLinkD
 		mimeType = "application/octet-stream"
 	}
 
-	// Stream blocks directly to response — O(block_size) RAM
-	c.Header("Content-Disposition", fmt.Sprintf(`inline; filename="%s"`, filename))
-	c.Header("Content-Type", mimeType)
-	if fileSize > 0 && !encrypted {
-		c.Header("Content-Length", strconv.FormatInt(fileSize, 10))
-	}
-	c.Status(http.StatusOK)
-
 	// Batch resolve all block IDs upfront to avoid per-block Cassandra queries
 	resolvedIDs := streaming.BatchResolveBlockIDs(h.db, sl.orgID, blockIDs)
 
@@ -448,7 +440,34 @@ func (h *ShareLinkViewHandler) handleShareLinkRaw(c *gin.Context, sl *shareLinkD
 	if encrypted {
 		fileKeyParam = fileKey
 	}
-	streaming.StreamBlocks(c, c.Request.Context(), blockStore, resolvedIDs, fileKeyParam, "ShareLinkRaw")
+
+	ctx := c.Request.Context()
+
+	// For video/audio files, use BlockReadSeeker so http.ServeContent can handle
+	// Range requests (HTTP 206) without buffering the entire file. Only O(1 block) RAM.
+	if isVideoFile(ext) || isAudioFile(ext) {
+		blockSizes, err := streaming.QueryBlockSizes(h.db, sl.orgID, resolvedIDs)
+		if err != nil {
+			slog.Error("Failed to query block sizes for share link", "error", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read file metadata"})
+			return
+		}
+
+		rs := streaming.NewBlockReadSeeker(ctx, blockStore, resolvedIDs, blockSizes, fileSize, fileKeyParam)
+		c.Header("Content-Disposition", fmt.Sprintf(`inline; filename="%s"`, filename))
+		http.ServeContent(c.Writer, c.Request, filename, time.Time{}, rs)
+		return
+	}
+
+	// Non-video/audio: stream block-by-block, O(block_size) RAM
+	c.Header("Content-Disposition", fmt.Sprintf(`inline; filename="%s"`, filename))
+	c.Header("Content-Type", mimeType)
+	if fileSize > 0 && !encrypted {
+		c.Header("Content-Length", strconv.FormatInt(fileSize, 10))
+	}
+	c.Status(http.StatusOK)
+
+	streaming.StreamBlocks(c, ctx, blockStore, resolvedIDs, fileKeyParam, "ShareLinkRaw")
 }
 
 // serveSharedDirPage renders the shared directory view

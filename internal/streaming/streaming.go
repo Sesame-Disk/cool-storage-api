@@ -79,12 +79,21 @@ func BatchResolveBlockIDs(database *db.DB, orgID string, blockIDs []string) []st
 		for iter.Scan(&extID, &intID) {
 			mapping[extID] = intID
 		}
-		iter.Close()
+		if err := iter.Close(); err != nil {
+			log.Printf("[BatchResolveBlockIDs] WARNING: query error org=%s blocks=%d: %v", orgID, len(batch), err)
+		}
 
+		var unresolved int
 		for _, idx := range batch {
 			if mapped, ok := mapping[blockIDs[idx]]; ok && mapped != "" {
 				resolved[idx] = mapped
+			} else {
+				unresolved++
 			}
+		}
+		if unresolved > 0 {
+			log.Printf("[BatchResolveBlockIDs] WARNING: %d/%d blocks UNRESOLVED for org=%s (first unresolved: %s)",
+				unresolved, len(batch), orgID, externalIDs[0])
 		}
 	}
 

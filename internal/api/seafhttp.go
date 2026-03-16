@@ -678,9 +678,13 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 	}
 
 	// Create SHA-1 → SHA-256 mapping
-	h.db.Session().Query(`
+	if err := h.db.Session().Query(`
 		INSERT INTO block_id_mappings (org_id, external_id, internal_id) VALUES (?, ?, ?)
-	`, token.OrgID, fileID, sha256ID).Exec()
+	`, token.OrgID, fileID, sha256ID).Exec(); err != nil {
+		log.Printf("[HandleUpload] CRITICAL: Failed to write block_id_mapping org=%s ext=%s int=%s: %v", token.OrgID, fileID[:16], sha256ID[:16], err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create block mapping"})
+		return
+	}
 
 	// Update filesystem metadata
 	commitID, actualFilename, err := h.commitUploadedFile(token.OrgID, token.RepoID, token.UserID, parentDir, filename, fileID, chunkData, finalSize, replaceFile)
@@ -774,9 +778,12 @@ func (h *SeafHTTPHandler) finalizeUploadStreaming(c *gin.Context, token *AccessT
 		}
 
 		// Create SHA-1 → SHA-256 mapping
-		h.db.Session().Query(`
+		if err := h.db.Session().Query(`
 			INSERT INTO block_id_mappings (org_id, external_id, internal_id) VALUES (?, ?, ?)
-		`, token.OrgID, blockSHA1ID, sha256ID).Exec()
+		`, token.OrgID, blockSHA1ID, sha256ID).Exec(); err != nil {
+			log.Printf("[finalizeUploadStreaming] CRITICAL: Failed to write block_id_mapping org=%s ext=%s int=%s: %v", token.OrgID, blockSHA1ID[:16], sha256ID[:16], err)
+			return "", "", fmt.Errorf("failed to create block mapping: %w", err)
+		}
 
 		if readErr == io.EOF || readErr == io.ErrUnexpectedEOF {
 			break
