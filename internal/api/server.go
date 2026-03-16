@@ -2038,7 +2038,7 @@ func (s *Server) handleAccountInfo(c *gin.Context) {
 		"usage":                       usedBytes,
 		"total":                       quotaBytes,
 		"space_usage":                 spaceUsage,
-		"avatar_url":                  "http://" + c.Request.Host + "/media/avatars/default.png",
+		"avatar_url":                  getBaseURLFromRequest(c) + "/media/avatars/default.png",
 		"enable_subscription":         false,
 		"file_updates_email_interval": 0,
 		"collaborate_email_interval":  0,
@@ -2092,7 +2092,7 @@ func (s *Server) handleSearchUser(c *gin.Context) {
 			users = append(users, gin.H{
 				"email":         email,
 				"name":          displayName,
-				"avatar_url":    "http://" + c.Request.Host + "/media/avatars/default.png",
+				"avatar_url":    getBaseURLFromRequest(c) + "/media/avatars/default.png",
 				"contact_email": email,
 				"login_id":      email,
 			})
