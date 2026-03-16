@@ -85,8 +85,12 @@ func (r *BlockReadSeeker) Read(p []byte) (int, error) {
 		offsetInBlock := r.pos - r.offsets[blockIdx]
 		available := int64(len(r.cachedData)) - offsetInBlock
 		if available <= 0 {
-			// Block data shorter than expected, move to next
-			r.pos = r.offsets[blockIdx] + int64(len(r.cachedData))
+			// Safety net: advance to next block to prevent infinite loop.
+			if blockIdx+1 < len(r.offsets) {
+				r.pos = r.offsets[blockIdx+1]
+			} else {
+				r.pos = r.totalSize
+			}
 			continue
 		}
 
@@ -182,6 +186,21 @@ func (r *BlockReadSeeker) ensureBlock(idx int) error {
 	}
 
 	r.cachedIdx = idx
+
+	// If the actual data size differs from the recorded block size (e.g. encrypted
+	// blocks store the ciphertext size but cachedData is the smaller plaintext),
+	// fix blockSizes and recompute offsets so that Seek and findBlock stay correct.
+	actualSize := int64(len(r.cachedData))
+	if r.blockSizes[idx] != actualSize {
+		r.blockSizes[idx] = actualSize
+		var cum int64
+		for i, sz := range r.blockSizes {
+			r.offsets[i] = cum
+			cum += sz
+		}
+		r.totalSize = cum
+	}
+
 	return nil
 }
 
