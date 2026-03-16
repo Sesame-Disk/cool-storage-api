@@ -29,7 +29,7 @@ class AddDepartDialog extends React.Component {
       if (this.props.parentGroupID) {
         parentGroup = this.props.parentGroupID;
       }
-      seafileAPI.orgAdminAddDepartGroup(orgID, parentGroup, this.state.departName.trim()).then((res) => {
+      seafileAPI.orgAdminAddDepartGroup(orgID, this.state.departName.trim(), parentGroup).then((res) => {
         this.props.toggle();
         this.props.onDepartChanged();
       }).catch(error => {

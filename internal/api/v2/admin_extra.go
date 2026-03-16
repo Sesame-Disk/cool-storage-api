@@ -50,7 +50,7 @@ func (h *AdminHandler) AdminGetSysInfo(c *gin.Context) {
 
 	// Count groups
 	var groupsCount int
-	iter = h.db.Session().Query(`SELECT group_id FROM user_groups`).Iter()
+	iter = h.db.Session().Query(`SELECT group_id FROM groups`).Iter()
 	for iter.Scan(&dummy) {
 		groupsCount++
 	}
@@ -370,11 +370,12 @@ func (h *AdminHandler) AdminSearchOrganizations(c *gin.Context) {
 		}
 		// Count users in this org
 		usersCount := h.countOrgUsers(orgID)
+		creatorEmail, creatorName := h.resolveOrgCreator(orgID)
 		orgs = append(orgs, gin.H{
 			"org_id":        orgID,
 			"org_name":      name,
-			"creator_email": "",
-			"creator_name":  "",
+			"creator_email": creatorEmail,
+			"creator_name":  creatorName,
 			"role":          "default",
 			"quota_usage":   storageUsed,
 			"quota":         storageQuota,
@@ -619,24 +620,27 @@ func (h *AdminHandler) AdminListOrgGroups(c *gin.Context) {
 	targetOrgID := c.Param("org_id")
 
 	iter := h.db.Session().Query(`
-		SELECT group_id, group_name, owner_id, created_at
-		FROM user_groups WHERE org_id = ?
+		SELECT group_id, name, creator_id, created_at
+		FROM groups WHERE org_id = ?
 	`, targetOrgID).Iter()
 
 	var groups []gin.H
-	var groupID, groupName, ownerID string
+	var groupID, groupName, creatorID string
 	var createdAt time.Time
 
-	for iter.Scan(&groupID, &groupName, &ownerID, &createdAt) {
-		ownerEmail := h.resolveOwnerEmail(targetOrgID, ownerID)
+	for iter.Scan(&groupID, &groupName, &creatorID, &createdAt) {
+		ownerEmail := h.resolveOwnerEmail(targetOrgID, creatorID)
 		ownerName := ownerEmail // fallback; resolveOwnerEmail returns email
 		groups = append(groups, gin.H{
 			"id":                    groupID,
+			"group_id":              groupID,
 			"group_name":            groupName,
 			"creator_email":         ownerEmail,
 			"creator_name":          ownerName,
 			"creator_contact_email": ownerEmail,
 			"ctime":                 createdAt.Format(time.RFC3339),
+			"created_at":            createdAt.Format(time.RFC3339),
+			"parent_group_id":       0,
 		})
 	}
 	iter.Close()
@@ -645,7 +649,7 @@ func (h *AdminHandler) AdminListOrgGroups(c *gin.Context) {
 		groups = []gin.H{}
 	}
 
-	c.JSON(http.StatusOK, gin.H{"groups": groups})
+	c.JSON(http.StatusOK, gin.H{"groups": groups, "group_list": groups})
 }
 
 // ============================================================================
@@ -1897,6 +1901,17 @@ func (h *AdminHandler) countOrgUsers(orgID string) int {
 	return count
 }
 
+func (h *AdminHandler) countOrgGroups(orgID string) int {
+	count := 0
+	iter := h.db.Session().Query(`SELECT group_id FROM groups WHERE org_id = ?`, orgID).Iter()
+	var dummy string
+	for iter.Scan(&dummy) {
+		count++
+	}
+	iter.Close()
+	return count
+}
+
 func (h *AdminHandler) countOrgLibraries(orgID string) int {
 	count := 0
 	iter := h.db.Session().Query(`SELECT library_id FROM libraries WHERE org_id = ?`, orgID).Iter()
@@ -1906,6 +1921,29 @@ func (h *AdminHandler) countOrgLibraries(orgID string) int {
 	}
 	iter.Close()
 	return count
+}
+
+// resolveOrgCreator returns the email and name of the first admin user in an org.
+// Falls back to the first user if no admin/superadmin exists.
+func (h *AdminHandler) resolveOrgCreator(orgID string) (string, string) {
+	var email, name, role string
+	var firstEmail, firstName string
+	first := true
+	iter := h.db.Session().Query(`
+		SELECT email, name, role FROM users WHERE org_id = ?
+	`, orgID).Iter()
+	for iter.Scan(&email, &name, &role) {
+		if first {
+			firstEmail, firstName = email, name
+			first = false
+		}
+		if role == "superadmin" || role == "admin" {
+			iter.Close()
+			return email, name
+		}
+	}
+	iter.Close()
+	return firstEmail, firstName
 }
 
 func generateUserID() string {

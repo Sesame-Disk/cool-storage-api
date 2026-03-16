@@ -2445,17 +2445,61 @@ func (h *OrgAdminHandler) GetOrgAddressBookGroup(c *gin.Context) {
 
 	quota := h.getOrgSettingInt(targetOrgID, "group_quota_"+groupID, -2)
 
-	result := gin.H{
-		"id":              groupID,
-		"name":            name,
-		"parent_group_id": parentGroupID,
-		"created_at":      createdAt.Format(time.RFC3339),
-		"quota":           quota,
+	// Resolve members
+	memIter := h.db.Session().Query(`
+		SELECT user_id, role FROM group_members WHERE group_id = ?
+	`, groupID).Iter()
+	usersMap := h.resolveUsersMap(targetOrgID)
+	var members []gin.H
+	var memUserID, memRole string
+	for memIter.Scan(&memUserID, &memRole) {
+		u := usersMap[memUserID]
+		displayRole := memRole
+		if len(memRole) > 0 {
+			displayRole = strings.ToUpper(memRole[:1]) + memRole[1:]
+		}
+		members = append(members, gin.H{
+			"email":      u.Email,
+			"name":       u.Name,
+			"role":       displayRole,
+			"avatar_url": "/static/img/default-avatar.png",
+		})
+	}
+	memIter.Close()
+	if members == nil {
+		members = []gin.H{}
 	}
 
-	// Resolve ancestors if requested
+	// Resolve sub-departments
+	subIter := h.db.Session().Query(`
+		SELECT group_id, name, parent_group_id, is_department, created_at
+		FROM groups WHERE org_id = ?
+	`, targetOrgID).Iter()
+	var subGroups []gin.H
+	var subGID, subName, subParent string
+	var subIsDept bool
+	var subCreatedAt time.Time
+	for subIter.Scan(&subGID, &subName, &subParent, &subIsDept, &subCreatedAt) {
+		if !subIsDept || subParent != groupID {
+			continue
+		}
+		subQuota := h.getOrgSettingInt(targetOrgID, "group_quota_"+subGID, -2)
+		subGroups = append(subGroups, gin.H{
+			"id":              subGID,
+			"name":            subName,
+			"parent_group_id": subParent,
+			"created_at":      subCreatedAt.Format(time.RFC3339),
+			"quota":           subQuota,
+		})
+	}
+	subIter.Close()
+	if subGroups == nil {
+		subGroups = []gin.H{}
+	}
+
+	// Resolve ancestors
+	var ancestors []gin.H
 	if c.Query("return_ancestors") == "true" {
-		var ancestors []gin.H
 		currentParent := parentGroupID
 		for currentParent != "" {
 			var pName, pParent string
@@ -2471,13 +2515,21 @@ func (h *OrgAdminHandler) GetOrgAddressBookGroup(c *gin.Context) {
 			})
 			currentParent = pParent
 		}
-		if ancestors == nil {
-			ancestors = []gin.H{}
-		}
-		result["ancestor_groups"] = ancestors
+	}
+	if ancestors == nil {
+		ancestors = []gin.H{}
 	}
 
-	c.JSON(http.StatusOK, result)
+	c.JSON(http.StatusOK, gin.H{
+		"id":              groupID,
+		"name":            name,
+		"parent_group_id": parentGroupID,
+		"created_at":      createdAt.Format(time.RFC3339),
+		"quota":           quota,
+		"members":         members,
+		"groups":          subGroups,
+		"ancestor_groups": ancestors,
+	})
 }
 
 // UpdateOrgAddressBookGroup updates a department group's name.
@@ -2680,12 +2732,15 @@ func (h *OrgAdminHandler) ListOrgLinks(c *gin.Context) {
 			}
 		}
 
+		linkURL := fmt.Sprintf("%s/d/%s", getBrowserURL(c, ""), token)
 		links = append(links, gin.H{
 			"token":        token,
 			"name":         linkName,
+			"link":         linkURL,
 			"owner_email":  info[0],
 			"owner_name":   info[1],
 			"created_time": createdAt.Format(time.RFC3339),
+			"view_count":   0,
 		})
 	}
 	iter.Close()
@@ -2816,10 +2871,12 @@ func (h *OrgAdminHandler) ListOrgUploadLinks(c *gin.Context) {
 		var repoName string
 		h.db.Session().Query(`SELECT name FROM libraries WHERE org_id = ? AND library_id = ?`, orgID, libID).Scan(&repoName)
 
+		uploadLinkURL := fmt.Sprintf("%s/u/d/%s", getBrowserURL(c, ""), token)
 		links = append(links, gin.H{
 			"obj_name":      objName,
 			"path":          filePath,
 			"token":         token,
+			"link":          uploadLinkURL,
 			"repo_id":       libID,
 			"repo_name":     repoName,
 			"creator_email": info[0],

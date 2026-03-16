@@ -32,7 +32,7 @@ class SearchOrgs extends Component {
     seafileAPI.sysAdminSearchOrgs(this.state.query.trim()).then(res => {
       this.setState({
         loading: false,
-        orgList: res.data.organization_list
+        orgList: res.data.organizations || res.data.organization_list || []
       });
     }).catch((error) => {
       this.setState({

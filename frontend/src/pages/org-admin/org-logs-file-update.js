@@ -3,7 +3,7 @@ import PropTypes from 'prop-types';
 import moment from 'moment';
 import { Dropdown, DropdownToggle, DropdownMenu, DropdownItem } from 'reactstrap';
 import { seafileAPI } from '../../utils/seafile-api';
-import { siteRoot, gettext, lang } from '../../utils/constants';
+import { siteRoot, gettext, lang, orgID } from '../../utils/constants';
 import { Utils } from '../../utils/utils';
 import toaster from '../../components/toast';
 import OrgLogsFileUpdateEvent from '../../models/org-logs-file-update';
@@ -38,7 +38,7 @@ class OrgLogsFileUpdate extends Component {
   }
 
   initData = (email, repoID, page) => {
-    seafileAPI.orgAdminListFileUpdate(email, repoID, page).then(res => {
+    seafileAPI.orgAdminListFileUpdate(orgID, email, repoID, page).then(res => {
       let eventList = res.data.log_list.map(item => {
         return new OrgLogsFileUpdateEvent(item);
       });

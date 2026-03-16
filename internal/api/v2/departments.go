@@ -30,9 +30,9 @@ type DepartmentResponse struct {
 	CreatedAt      string                `json:"created_at"`
 	ParentGroupID  string                `json:"parent_group_id,omitempty"`
 	MemberCount    int                   `json:"member_count,omitempty"`
-	Groups         []DepartmentResponse  `json:"groups,omitempty"` // Sub-departments
-	Members        []GroupMemberResponse `json:"members,omitempty"`
-	AncestorGroups []DepartmentRef       `json:"ancestor_groups,omitempty"` // Breadcrumb
+	Groups         []DepartmentResponse  `json:"groups"`           // Sub-departments
+	Members        []GroupMemberResponse `json:"members"`
+	AncestorGroups []DepartmentRef       `json:"ancestor_groups"` // Breadcrumb
 }
 
 // DepartmentRef is a lightweight reference used in ancestor chains
@@ -257,7 +257,7 @@ func (h *DepartmentHandler) GetDepartment(c *gin.Context) {
 	subDepts := h.getSubDepartments(orgID, groupID)
 
 	// Build ancestor chain if requested
-	var ancestors []DepartmentRef
+	ancestors := []DepartmentRef{}
 	if returnAncestors && parentGroupID != nil {
 		ancestors = h.getAncestors(orgID, *parentGroupID)
 	}

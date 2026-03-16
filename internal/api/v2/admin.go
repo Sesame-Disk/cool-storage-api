@@ -275,11 +275,12 @@ func (h *AdminHandler) ListOrganizations(c *gin.Context) {
 
 	for iter.Scan(&orgID, &name, &storageQuota, &storageUsed, &createdAt) {
 		usersCount := h.countOrgUsers(orgID)
+		creatorEmail, creatorName := h.resolveOrgCreator(orgID)
 		orgs = append(orgs, gin.H{
 			"org_id":        orgID,
 			"org_name":      name,
-			"creator_email": "",
-			"creator_name":  "",
+			"creator_email": creatorEmail,
+			"creator_name":  creatorName,
 			"role":          "default",
 			"quota_usage":   storageUsed,
 			"quota":         storageQuota,
@@ -463,7 +464,6 @@ func (h *AdminHandler) GetOrganization(c *gin.Context) {
 	var storageQuota, storageUsed int64
 	var settings map[string]string
 	var createdAt time.Time
-	_ = settings // settings not used in response
 
 	err := h.db.Session().Query(`
 		SELECT name, storage_quota, storage_used, settings, created_at
@@ -477,18 +477,28 @@ func (h *AdminHandler) GetOrganization(c *gin.Context) {
 
 	usersCount := h.countOrgUsers(orgID)
 	reposCount := h.countOrgLibraries(orgID)
+	groupsCount := h.countOrgGroups(orgID)
+	creatorEmail, creatorName := h.resolveOrgCreator(orgID)
+
+	// Extract max_user_number from settings map
+	var maxUserNumber int
+	if v, ok := settings["max_user_number"]; ok {
+		maxUserNumber, _ = strconv.Atoi(v)
+	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"org_id":        orgID,
-		"org_name":      name,
-		"creator_email": "",
-		"creator_name":  "",
-		"role":          "default",
-		"quota_usage":   storageUsed,
-		"quota":         storageQuota,
-		"ctime":         createdAt.Format(time.RFC3339),
-		"users_count":   usersCount,
-		"repos_count":   reposCount,
+		"org_id":          orgID,
+		"org_name":        name,
+		"creator_email":   creatorEmail,
+		"creator_name":    creatorName,
+		"role":            "default",
+		"quota_usage":     storageUsed,
+		"quota":           storageQuota,
+		"ctime":           createdAt.Format(time.RFC3339),
+		"users_count":     usersCount,
+		"repos_count":     reposCount,
+		"groups_count":    groupsCount,
+		"max_user_number": maxUserNumber,
 	})
 }
 
@@ -2245,7 +2255,9 @@ func (h *AdminHandler) BatchAddAdmins(c *gin.Context) {
 // Field names must match what the Seahub sys-admin frontend expects.
 type adminLibraryResponse struct {
 	ID          string `json:"id"`
+	RepoID      string `json:"repo_id"`
 	Name        string `json:"name"`
+	RepoName    string `json:"repo_name"`
 	OwnerEmail  string `json:"owner_email"`
 	OwnerName   string `json:"owner_name"`
 	Size        int64  `json:"size"`
@@ -2399,7 +2411,9 @@ func (h *AdminHandler) AdminListAllLibraries(c *gin.Context) {
 			ownerName := h.resolveOwnerName(orgID, ownerID)
 			allLibs = append(allLibs, adminLibraryResponse{
 				ID:          libID,
+				RepoID:      libID,
 				Name:        name,
+				RepoName:    name,
 				OwnerEmail:  ownerEmail,
 				Permission:  "rw", // Admin always has rw over all libraries
 				OwnerName:   ownerName,

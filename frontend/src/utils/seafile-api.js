@@ -644,7 +644,7 @@ seafileAPI.sysAdminGetRepoFileDownloadURL = function (repoID, path) {
 };
 
 // Admin: get upload URL for system repo (stub)
-seafileAPI.sydAdminGetSysRepoItemUploadURL = function (path) {
+seafileAPI.sysAdminGetSysRepoItemUploadURL = function (path) {
   return Promise.resolve({ data: { upload_link: '' } });
 };
 
@@ -1014,6 +1014,78 @@ seafileAPI.sysAdminUpdateOrgUser = function (orgID, email, key, value) {
   let form = new FormData();
   form.append(key, value);
   return this.req.put(url, form);
+};
+
+// Admin: list organizations
+seafileAPI.sysAdminListOrgs = function (page, perPage) {
+  let url = this.server + '/api/v2.1/admin/organizations/';
+  let params = new URLSearchParams();
+  if (page) params.set('page', page);
+  if (perPage) params.set('per_page', perPage);
+  if (params.toString()) url += '?' + params.toString();
+  return this.req.get(url);
+};
+
+// Admin: search organizations
+seafileAPI.sysAdminSearchOrgs = function (query) {
+  let url = this.server + '/api/v2.1/admin/search-organization/?query=' + encodeURIComponent(query);
+  return this.req.get(url);
+};
+
+// Admin: get single organization
+seafileAPI.sysAdminGetOrg = function (orgID) {
+  let url = this.server + '/api/v2.1/admin/organizations/' + orgID + '/';
+  return this.req.get(url);
+};
+
+// Admin: create organization
+seafileAPI.sysAdminAddOrg = function (orgName, ownerEmail, password) {
+  let url = this.server + '/api/v2.1/admin/organizations/';
+  let data = { org_name: orgName, owner_email: ownerEmail, password: password };
+  return this.req.post(url, data);
+};
+
+// Admin: update organization
+seafileAPI.sysAdminUpdateOrg = function (orgID, data) {
+  let url = this.server + '/api/v2.1/admin/organizations/' + orgID + '/';
+  return this.req.put(url, data);
+};
+
+// Admin: delete (deactivate) organization
+seafileAPI.sysAdminDeleteOrg = function (orgID) {
+  let url = this.server + '/api/v2.1/admin/organizations/' + orgID + '/';
+  return this.req.delete(url);
+};
+
+// Admin: list org users (sys-admin panel)
+seafileAPI.sysAdminListOrgUsers = function (orgID) {
+  let url = this.server + '/api/v2.1/admin/organizations/' + orgID + '/users/';
+  return this.req.get(url);
+};
+
+// Admin: add user to org (sys-admin panel)
+seafileAPI.sysAdminAddOrgUser = function (orgID, email, name, password) {
+  let url = this.server + '/api/v2.1/admin/organizations/' + orgID + '/users/';
+  let data = { email: email, name: name, password: password };
+  return this.req.post(url, data);
+};
+
+// Admin: delete user from org (sys-admin panel)
+seafileAPI.sysAdminDeleteOrgUser = function (orgID, email) {
+  let url = this.server + '/api/v2.1/admin/organizations/' + orgID + '/users/' + encodeURIComponent(email) + '/';
+  return this.req.delete(url);
+};
+
+// Admin: list org groups (sys-admin panel)
+seafileAPI.sysAdminListOrgGroups = function (orgID) {
+  let url = this.server + '/api/v2.1/admin/organizations/' + orgID + '/groups/';
+  return this.req.get(url);
+};
+
+// Admin: reset user password
+seafileAPI.sysAdminResetUserPassword = function (email) {
+  let url = this.server + '/api/v2.1/admin/users/' + encodeURIComponent(email) + '/reset-password/';
+  return this.req.put(url);
 };
 
 // ============================================================================
@@ -1416,6 +1488,18 @@ seafileAPI.orgAdminDeleteOrgLink = function (token) {
   return this.req.delete(url);
 };
 
+// Org Admin: list org upload links
+seafileAPI.orgAdminListOrgUploadLinks = function (page) {
+  let url = this.server + '/api/v2.1/org/admin/upload-links/?page=' + (page || 1);
+  return this.req.get(url);
+};
+
+// Org Admin: delete org upload link
+seafileAPI.orgAdminDeleteOrgUploadLink = function (token) {
+  let url = this.server + '/api/v2.1/org/admin/upload-links/' + token + '/';
+  return this.req.delete(url);
+};
+
 // Org Admin: list departments
 seafileAPI.orgAdminListDepartments = function (orgID) {
   let url = this.server + '/api/v2.1/org/' + orgID + '/admin/address-book/groups/';
@@ -1440,7 +1524,7 @@ seafileAPI.orgAdminAddDepartGroup = function (orgID, groupName, parentGroup) {
 
 // Org Admin: get department group info
 seafileAPI.orgAdminListGroupInfo = function (orgID, groupID) {
-  let url = this.server + '/api/v2.1/org/' + orgID + '/admin/address-book/groups/' + groupID + '/';
+  let url = this.server + '/api/v2.1/org/' + orgID + '/admin/address-book/groups/' + groupID + '/?return_ancestors=true';
   return this.req.get(url);
 };
 

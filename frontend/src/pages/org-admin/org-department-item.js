@@ -71,7 +71,7 @@ class OrgDepartmentItem extends React.Component {
   };
 
   listOrgMembers = (groupID) => {
-    seafileAPI.orgAdminListGroupInfo(orgID, groupID, true).then(res => {
+    seafileAPI.orgAdminListGroupInfo(orgID, groupID).then(res => {
       this.setState({
         members: res.data.members,
         groups: res.data.groups,
@@ -85,7 +85,7 @@ class OrgDepartmentItem extends React.Component {
   };
 
   listSubDepartGroups = (groupID) => {
-    seafileAPI.orgAdminListGroupInfo(orgID, groupID, true).then(res => {
+    seafileAPI.orgAdminListGroupInfo(orgID, groupID).then(res => {
       this.setState({ groups: res.data.groups });
     }).catch(error => {
       let errMessage = Utils.getErrorMsg(error);

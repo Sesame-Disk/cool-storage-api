@@ -2,7 +2,7 @@ import React, { Component, Fragment } from 'react';
 import PropTypes from 'prop-types';
 import { Utils } from '../../../utils/utils';
 import { seafileAPI } from '../../../utils/seafile-api';
-import { gettext } from '../../../utils/constants';
+import { siteRoot, gettext } from '../../../utils/constants';
 import toaster from '../../../components/toast';
 import EmptyTip from '../../../components/empty-tip';
 import Loading from '../../../components/loading';
@@ -103,8 +103,8 @@ class Item extends Component {
       <Fragment>
         <tr onMouseEnter={this.handleMouseEnter} onMouseLeave={this.handleMouseLeave}>
           <td><img src={iconUrl} title={iconTitle} alt={iconTitle} width="24" /></td>
-          <td>{item.repo_name}</td>
-          <td>{item.repo_id}</td>
+          <td><a href={`${siteRoot}sys/libraries/${item.repo_id || item.id}/`}>{item.repo_name || item.name}</a></td>
+          <td>{item.repo_id || item.id}</td>
           <td>
             {!item.owner_email ?
               '--' :
@@ -157,7 +157,7 @@ class OrgRepos extends Component {
     seafileAPI.sysAdminListOrgRepos(this.props.orgID).then((res) => {
       this.setState({
         loading: false,
-        repoList: res.data.repo_list
+        repoList: res.data.repos || res.data.repo_list || []
       });
     }).catch((error) => {
       this.setState({

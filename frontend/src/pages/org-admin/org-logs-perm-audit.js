@@ -3,7 +3,7 @@ import PropTypes from 'prop-types';
 import moment from 'moment';
 import { Dropdown, DropdownToggle, DropdownMenu, DropdownItem } from 'reactstrap';
 import { seafileAPI } from '../../utils/seafile-api';
-import { siteRoot, gettext, lang } from '../../utils/constants';
+import { siteRoot, gettext, lang, orgID } from '../../utils/constants';
 import { Utils } from '../../utils/utils';
 import toaster from '../../components/toast';
 import OrgLogsFilePermEvent from '../../models/org-logs-perm-audit';
@@ -33,7 +33,7 @@ class OrgLogsFileUpdate extends Component {
   }
 
   initData = (email, repoID, page) => {
-    seafileAPI.orgAdminListPermAudit(email, repoID, page).then(res => {
+    seafileAPI.orgAdminListPermAudit(orgID, email, repoID, page).then(res => {
       let eventList = res.data.log_list.map(item => {
         return new OrgLogsFilePermEvent(item);
       });
@@ -58,7 +58,9 @@ class OrgLogsFileUpdate extends Component {
     } else {
       page = page - 1;
     }
-    this.initData(page);
+    let email = this.state.userSelected;
+    let repoID = this.state.repoSelected;
+    this.initData(email, repoID, page);
   };
 
   filterUser = (userSelected) => {

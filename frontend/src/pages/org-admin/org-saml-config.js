@@ -46,14 +46,12 @@ class OrgSAMLConfig extends Component {
   }
 
   updateSamlConfig = (changeType, value) => {
-    let metadataUrl = null;
-    let domain = null;
-    let idpCertificate = null;
-    if (changeType === 'metadataUrl') metadataUrl = value;
-    if (changeType === 'domain') domain = value;
-    if (changeType === 'idpCertificate') idpCertificate = value;
+    let data = {};
+    if (changeType === 'metadataUrl') data.metadata_url = value;
+    if (changeType === 'domain') data.domain = value;
+    if (changeType === 'idpCertificate') data.idp_certificate = value;
 
-    seafileAPI.orgAdminUpdateSamlConfig(orgID, metadataUrl, domain, idpCertificate).then((res) => {
+    seafileAPI.orgAdminUpdateSamlConfig(orgID, data).then((res) => {
       this.setState({
         samlConfigID: res.data.saml_config.id,
         metadataUrl: res.data.saml_config.metadata_url,
