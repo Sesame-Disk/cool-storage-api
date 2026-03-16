@@ -294,10 +294,7 @@ func (h *FileShareHandler) CreateShare(c *gin.Context) {
 		return
 	}
 
-	// ========================================================================
-	// PERMISSION CHECK: Block sharing of encrypted libraries (security policy)
-	// ========================================================================
-	// Get library info to check if it's encrypted
+	// Get library info
 	var libOrgID string
 	var encrypted bool
 	err = h.db.Session().Query(`
@@ -305,14 +302,6 @@ func (h *FileShareHandler) CreateShare(c *gin.Context) {
 	`, repoUUID.String()).Scan(&libOrgID, &encrypted)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "library not found"})
-		return
-	}
-
-	// Prevent sharing encrypted libraries (security policy)
-	if encrypted {
-		c.JSON(http.StatusForbidden, gin.H{
-			"error": "Cannot share encrypted libraries. Encrypted libraries cannot be shared for security reasons. Please move files to a non-encrypted library to share them.",
-		})
 		return
 	}
 

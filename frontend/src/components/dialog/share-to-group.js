@@ -114,6 +114,7 @@ const propTypes = {
   itemType: PropTypes.string.isRequired,
   repoID: PropTypes.string.isRequired,
   isRepoOwner: PropTypes.bool.isRequired,
+  repoEncrypted: PropTypes.bool,
   onAddCustomPermissionToggle: PropTypes.func,
 };
 
@@ -328,6 +329,12 @@ class ShareToGroup extends React.Component {
     );
     return (
       <Fragment>
+        {this.props.repoEncrypted &&
+          <div className="alert alert-warning mb-2" role="alert">
+            <span className="sf2-icon-lock mr-1"></span>
+            {gettext('This library is encrypted. You will need to share the password with each member of the group who needs access.')}
+          </div>
+        }
         <table className="w-xs-200">
           {thead}
           <tbody>

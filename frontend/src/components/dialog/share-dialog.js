@@ -214,6 +214,7 @@ class ShareDialog extends React.Component {
                       itemPath={this.props.itemPath}
                       repoID={this.props.repoID}
                       isRepoOwner={this.state.isRepoOwner}
+                      repoEncrypted={this.props.repoEncrypted}
                       onAddCustomPermissionToggle={this.onAddCustomPermissionToggle}
                     />
                   </TabPane>
@@ -226,6 +227,7 @@ class ShareDialog extends React.Component {
                       itemPath={this.props.itemPath}
                       repoID={this.props.repoID}
                       isRepoOwner={this.state.isRepoOwner}
+                      repoEncrypted={this.props.repoEncrypted}
                       onAddCustomPermissionToggle={this.onAddCustomPermissionToggle}
                     />
                   </TabPane>
