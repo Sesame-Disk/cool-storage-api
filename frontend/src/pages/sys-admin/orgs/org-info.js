@@ -66,7 +66,7 @@ class Content extends Component {
             <dt className="info-item-heading">{gettext('Number of members')}</dt>
             <dd className="info-item-content">{users_count}</dd>
 
-            {max_user_number &&
+            {max_user_number > 0 &&
               <Fragment>
                 <dt className="info-item-heading">{gettext('Max number of members')}</dt>
                 <dd className="info-item-content">
