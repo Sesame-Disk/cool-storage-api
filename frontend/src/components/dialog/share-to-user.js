@@ -353,7 +353,7 @@ class ShareToUser extends React.Component {
     );
     return (
       <Fragment>
-        {this.props.repoEncrypted &&
+        {!!this.props.repoEncrypted &&
           <div className="alert alert-warning mb-2" role="alert">
             <span className="sf2-icon-lock mr-1"></span>
             {gettext('This library is encrypted. You will need to share the password with the user so they can access it.')}
