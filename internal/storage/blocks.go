@@ -142,6 +142,12 @@ func (bs *BlockStore) GetBlockReader(ctx context.Context, hash string) (io.ReadC
 	return bs.s3.Get(ctx, key)
 }
 
+// GetBlockSize returns the size in bytes of a block using S3 HEAD (no data transfer).
+func (bs *BlockStore) GetBlockSize(ctx context.Context, hash string) (int64, error) {
+	key := bs.hashToKey(hash)
+	return bs.s3.GetObjectSize(ctx, key)
+}
+
 // BlockExists checks if a block exists
 func (bs *BlockStore) BlockExists(ctx context.Context, hash string) (bool, error) {
 	key := bs.hashToKey(hash)

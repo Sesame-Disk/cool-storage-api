@@ -345,6 +345,24 @@ func (s *S3Store) Delete(ctx context.Context, storageKey string) error {
 	return nil
 }
 
+// GetObjectSize returns the size of an object using HEAD (no data transfer).
+func (s *S3Store) GetObjectSize(ctx context.Context, storageKey string) (int64, error) {
+	input := &s3.HeadObjectInput{
+		Bucket: aws.String(s.bucket),
+		Key:    aws.String(storageKey),
+	}
+
+	result, err := s.client.HeadObject(ctx, input)
+	if err != nil {
+		return 0, fmt.Errorf("failed to get object size: %w", err)
+	}
+
+	if result.ContentLength != nil {
+		return *result.ContentLength, nil
+	}
+	return 0, nil
+}
+
 // Exists checks if a block exists in S3
 func (s *S3Store) Exists(ctx context.Context, storageKey string) (bool, error) {
 	input := &s3.HeadObjectInput{

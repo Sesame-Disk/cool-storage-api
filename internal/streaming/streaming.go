@@ -16,6 +16,7 @@ import (
 type BlockReader interface {
 	GetBlock(ctx context.Context, hash string) ([]byte, error)
 	GetBlockReader(ctx context.Context, hash string) (io.ReadCloser, error)
+	GetBlockSize(ctx context.Context, hash string) (int64, error)
 }
 
 // copyBufPool provides reusable 4MB buffers for io.CopyBuffer to avoid

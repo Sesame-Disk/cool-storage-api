@@ -686,6 +686,13 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 		return
 	}
 
+	// Register block metadata for size lookups (used by video/audio Range requests)
+	if err := h.db.Session().Query(`
+		INSERT INTO blocks (org_id, block_id, size_bytes, created_at) VALUES (?, ?, ?, toTimestamp(now()))
+	`, token.OrgID, sha256ID, len(storedContent)).Exec(); err != nil {
+		log.Printf("[HandleUpload] WARNING: Failed to write block metadata org=%s block=%s: %v", token.OrgID, sha256ID[:16], err)
+	}
+
 	// Update filesystem metadata
 	commitID, actualFilename, err := h.commitUploadedFile(token.OrgID, token.RepoID, token.UserID, parentDir, filename, fileID, chunkData, finalSize, replaceFile)
 	if err != nil {
@@ -783,6 +790,13 @@ func (h *SeafHTTPHandler) finalizeUploadStreaming(c *gin.Context, token *AccessT
 		`, token.OrgID, blockSHA1ID, sha256ID).Exec(); err != nil {
 			log.Printf("[finalizeUploadStreaming] CRITICAL: Failed to write block_id_mapping org=%s ext=%s int=%s: %v", token.OrgID, blockSHA1ID[:16], sha256ID[:16], err)
 			return "", "", fmt.Errorf("failed to create block mapping: %w", err)
+		}
+
+		// Register block metadata for size lookups (used by video/audio Range requests)
+		if err := h.db.Session().Query(`
+			INSERT INTO blocks (org_id, block_id, size_bytes, created_at) VALUES (?, ?, ?, toTimestamp(now()))
+		`, token.OrgID, sha256ID, len(storedBlock)).Exec(); err != nil {
+			log.Printf("[finalizeUploadStreaming] WARNING: Failed to write block metadata org=%s block=%s: %v", token.OrgID, sha256ID[:16], err)
 		}
 
 		if readErr == io.EOF || readErr == io.ErrUnexpectedEOF {

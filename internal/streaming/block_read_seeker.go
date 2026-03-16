@@ -185,16 +185,18 @@ func (r *BlockReadSeeker) ensureBlock(idx int) error {
 	return nil
 }
 
-// QueryBlockSizes fetches block sizes from the database for a list of resolved block IDs.
-// Returns sizes in the same order as the input blockIDs.
-// Falls back to 0 for blocks not found in the DB (should not happen in practice).
-func QueryBlockSizes(database *db.DB, orgID string, blockIDs []string) ([]int64, error) {
+// QueryBlockSizes fetches block sizes for a list of resolved block IDs.
+// Uses Cassandra first (fast, single batch query), then falls back to S3 HEAD
+// for any blocks missing from the DB (legacy uploads that didn't populate the blocks table).
+func QueryBlockSizes(ctx context.Context, database *db.DB, orgID string, blockStore BlockReader, blockIDs []string) ([]int64, error) {
 	sizes := make([]int64, len(blockIDs))
 
 	if len(blockIDs) == 0 {
 		return sizes, nil
 	}
 
+	// Step 1: batch query from Cassandra (fast, 1 round trip per 100 blocks)
+	var missing []int // indices of blocks not found in DB
 	const batchSize = 100
 	for start := 0; start < len(blockIDs); start += batchSize {
 		end := start + batchSize
@@ -214,16 +216,55 @@ func QueryBlockSizes(database *db.DB, orgID string, blockIDs []string) ([]int64,
 			sizeMap[blockID] = int64(sizeBytes)
 		}
 		if err := iter.Close(); err != nil {
-			return nil, fmt.Errorf("failed to query block sizes: %w", err)
+			log.Printf("[QueryBlockSizes] WARNING: DB query failed, falling back to S3: %v", err)
+			// Mark all in this batch as missing
+			for i := start; i < end; i++ {
+				missing = append(missing, i)
+			}
+			continue
 		}
 
 		for i := start; i < end; i++ {
-			if sz, ok := sizeMap[blockIDs[i]]; ok {
+			if sz, ok := sizeMap[blockIDs[i]]; ok && sz > 0 {
 				sizes[i] = sz
 			} else {
-				log.Printf("[QueryBlockSizes] WARNING: block %s not found in blocks table", blockIDs[i][:16])
+				missing = append(missing, i)
 			}
 		}
+	}
+
+	if len(missing) == 0 {
+		return sizes, nil
+	}
+
+	// Step 2: fallback to S3 HEAD for missing blocks (parallel)
+	log.Printf("[QueryBlockSizes] %d/%d blocks missing from DB, falling back to S3 HEAD", len(missing), len(blockIDs))
+
+	type result struct {
+		idx  int
+		size int64
+		err  error
+	}
+
+	ch := make(chan result, len(missing))
+	const maxConcurrency = 20
+	sem := make(chan struct{}, maxConcurrency)
+
+	for _, idx := range missing {
+		sem <- struct{}{}
+		go func(i int, blockID string) {
+			defer func() { <-sem }()
+			size, err := blockStore.GetBlockSize(ctx, blockID)
+			ch <- result{idx: i, size: size, err: err}
+		}(idx, blockIDs[idx])
+	}
+
+	for range missing {
+		r := <-ch
+		if r.err != nil {
+			return nil, fmt.Errorf("failed to get size for block %d via S3: %w", r.idx, r.err)
+		}
+		sizes[r.idx] = r.size
 	}
 
 	return sizes, nil

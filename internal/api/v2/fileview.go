@@ -620,7 +620,7 @@ func (h *FileViewHandler) ServeRawFile(c *gin.Context) {
 	// For video/audio files, use BlockReadSeeker so http.ServeContent can handle
 	// Range requests (HTTP 206) without buffering the entire file. Only O(1 block) RAM.
 	if isVideoFile(ext) || isAudioFile(ext) {
-		blockSizes, err := streaming.QueryBlockSizes(h.db, orgID, resolvedIDs)
+		blockSizes, err := streaming.QueryBlockSizes(ctx, h.db, orgID, blockStore, resolvedIDs)
 		if err != nil {
 			log.Printf("[ServeRawFile] Failed to query block sizes: %v", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read file metadata"})
