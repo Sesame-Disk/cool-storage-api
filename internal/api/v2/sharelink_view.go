@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -1094,6 +1095,34 @@ func extensionToBundleName(ext string) string {
 	}
 }
 
+// buildShareLinkFullPath constructs and validates the full path for share link access.
+// It ensures the resulting path stays within the share link's base directory,
+// preventing path traversal attacks (e.g., ?path=../../secret).
+func buildShareLinkFullPath(basePath, subPath string) (string, error) {
+	// Clean the base path to ensure a consistent starting point
+	cleanBase := path.Clean("/" + basePath)
+	if cleanBase == "." || cleanBase == "" {
+		cleanBase = "/"
+	}
+
+	// Join the base and the subpath
+	// Do NOT clean subPath with a leading slash first, as that strips leading ../
+	fullPath := path.Join(cleanBase, subPath)
+	
+	// Clean the resulting joined path
+	cleanFull := path.Clean(fullPath)
+
+	// Check if the resulting path is still within the base path
+	if cleanBase != "/" {
+		// If it's exactly the base, or it starts with the base + slash
+		if cleanFull != cleanBase && !strings.HasPrefix(cleanFull, cleanBase+"/") {
+			return "", fmt.Errorf("path traversal detected")
+		}
+	}
+
+	return cleanFull, nil
+}
+
 // ListShareLinkDirents lists directory entries for a shared directory
 // GET /api/v2.1/share-links/:token/dirents/
 func (h *ShareLinkViewHandler) ListShareLinkDirents(c *gin.Context) {
@@ -1121,14 +1150,11 @@ func (h *ShareLinkViewHandler) ListShareLinkDirents(c *gin.Context) {
 		requestedPath = "/"
 	}
 
-	// Build the full path: share link's base path + requested sub-path
-	var fullPath string
-	if sl.filePath == "/" || sl.filePath == "" {
-		fullPath = requestedPath
-	} else if requestedPath == "/" {
-		fullPath = sl.filePath
-	} else {
-		fullPath = strings.TrimSuffix(sl.filePath, "/") + "/" + strings.TrimPrefix(requestedPath, "/")
+	// Build the full path with traversal protection
+	fullPath, err := buildShareLinkFullPath(sl.filePath, requestedPath)
+	if err != nil {
+		c.JSON(http.StatusForbidden, gin.H{"error": "invalid path"})
+		return
 	}
 
 	// Traverse to the directory
@@ -1267,17 +1293,15 @@ func (h *ShareLinkViewHandler) ServeShareLinkFilePage(c *gin.Context) {
 		return
 	}
 
-	// Build full path from share link base + requested file path
+	// Build full path with traversal protection
 	if filePath == "" {
 		filePath = "/"
 	}
-	var fullPath string
-	if sl.filePath == "/" || sl.filePath == "" {
-		fullPath = filePath
-	} else if filePath == "/" {
-		fullPath = sl.filePath
-	} else {
-		fullPath = strings.TrimSuffix(sl.filePath, "/") + "/" + strings.TrimPrefix(filePath, "/")
+	fullPath, err := buildShareLinkFullPath(sl.filePath, filePath)
+	if err != nil {
+		c.Header("Content-Type", "text/html; charset=utf-8")
+		c.String(http.StatusForbidden, errorPageHTML("Forbidden", "Invalid path."))
+		return
 	}
 
 	// Override the share link's file path with the specific file
@@ -1345,14 +1369,11 @@ func (h *ShareLinkViewHandler) GetShareLinkZipTask(c *gin.Context) {
 		return
 	}
 
-	// Build the full path
-	var fullPath string
-	if sl.filePath == "/" || sl.filePath == "" {
-		fullPath = path
-	} else if path == "/" {
-		fullPath = sl.filePath
-	} else {
-		fullPath = strings.TrimSuffix(sl.filePath, "/") + "/" + strings.TrimPrefix(path, "/")
+	// Build the full path with traversal protection
+	fullPath, err := buildShareLinkFullPath(sl.filePath, path)
+	if err != nil {
+		c.JSON(http.StatusForbidden, gin.H{"error": "invalid path"})
+		return
 	}
 
 	// Generate a download token for the zip
@@ -1556,14 +1577,11 @@ func (h *ShareLinkViewHandler) GetShareLinkUploadURL(c *gin.Context) {
 		return
 	}
 
-	// Build the full path for upload destination
-	var fullPath string
-	if sl.filePath == "/" || sl.filePath == "" {
-		fullPath = path
-	} else if path == "/" {
-		fullPath = sl.filePath
-	} else {
-		fullPath = strings.TrimSuffix(sl.filePath, "/") + "/" + strings.TrimPrefix(path, "/")
+	// Build the full path with traversal protection
+	fullPath, err := buildShareLinkFullPath(sl.filePath, path)
+	if err != nil {
+		c.JSON(http.StatusForbidden, gin.H{"error": "invalid path"})
+		return
 	}
 
 	// Generate an upload URL using the seafhttp upload mechanism
