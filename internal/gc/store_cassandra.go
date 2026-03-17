@@ -11,6 +11,17 @@ import (
 	"github.com/google/uuid"
 )
 
+// parseUUID converts a string scanned from Cassandra to uuid.UUID.
+// gocql v2 cannot unmarshal CQL UUID directly into google/uuid.UUID,
+// so we scan as string and convert.
+func parseUUID(s string) uuid.UUID {
+	id, err := uuid.Parse(s)
+	if err != nil {
+		return uuid.Nil
+	}
+	return id
+}
+
 // parseDirEntries extracts child fs_ids from a JSON dir_entries column.
 // Each entry has an "id" field that is the child fs_id.
 func parseDirEntries(jsonStr string) []string {
@@ -54,7 +65,7 @@ func (s *CassandraStore) EnqueueItem(orgID uuid.UUID, queuedAt time.Time, itemTy
 	return s.db.Session().Query(`
 		INSERT INTO gc_queue (org_id, queued_at, item_type, item_id, library_id, storage_class, retry_count)
 		VALUES (?, ?, ?, ?, ?, ?, ?)
-	`, orgID, queuedAt, string(itemType), itemID, libraryID, storageClass, retryCount).Exec()
+	`, orgID.String(), queuedAt, string(itemType), itemID, libraryID.String(), storageClass, retryCount).Exec()
 }
 
 func (s *CassandraStore) DequeueBatch(orgID uuid.UUID, batchSize int, cutoff time.Time) ([]QueueItem, error) {
@@ -63,17 +74,24 @@ func (s *CassandraStore) DequeueBatch(orgID uuid.UUID, batchSize int, cutoff tim
 		FROM gc_queue
 		WHERE org_id = ? AND queued_at < ?
 		LIMIT ?
-	`, orgID, cutoff, batchSize).Iter()
+	`, orgID.String(), cutoff, batchSize).Iter()
 
 	var items []QueueItem
-	var item QueueItem
-	var itemTypeStr string
+	var orgIDStr, itemTypeStr, itemID, libIDStr, storageClass string
+	var queuedAt time.Time
+	var retryCount int
 
-	for iter.Scan(&item.OrgID, &item.QueuedAt, &itemTypeStr, &item.ItemID,
-		&item.LibraryID, &item.StorageClass, &item.RetryCount) {
-		item.ItemType = ItemType(itemTypeStr)
-		items = append(items, item)
-		item = QueueItem{}
+	for iter.Scan(&orgIDStr, &queuedAt, &itemTypeStr, &itemID,
+		&libIDStr, &storageClass, &retryCount) {
+		items = append(items, QueueItem{
+			OrgID:        parseUUID(orgIDStr),
+			QueuedAt:     queuedAt,
+			ItemType:     ItemType(itemTypeStr),
+			ItemID:       itemID,
+			LibraryID:    parseUUID(libIDStr),
+			StorageClass: storageClass,
+			RetryCount:   retryCount,
+		})
 	}
 
 	if err := iter.Close(); err != nil {
@@ -86,21 +104,21 @@ func (s *CassandraStore) CompleteItem(orgID uuid.UUID, queuedAt time.Time, itemT
 	return s.db.Session().Query(`
 		DELETE FROM gc_queue
 		WHERE org_id = ? AND queued_at = ? AND item_type = ? AND item_id = ?
-	`, orgID, queuedAt, string(itemType), itemID).Exec()
+	`, orgID.String(), queuedAt, string(itemType), itemID).Exec()
 }
 
 func (s *CassandraStore) UpdateRetryCount(orgID uuid.UUID, queuedAt time.Time, itemType ItemType, itemID string, retryCount int) error {
 	return s.db.Session().Query(`
 		UPDATE gc_queue SET retry_count = ?
 		WHERE org_id = ? AND queued_at = ? AND item_type = ? AND item_id = ?
-	`, retryCount, orgID, queuedAt, string(itemType), itemID).Exec()
+	`, retryCount, orgID.String(), queuedAt, string(itemType), itemID).Exec()
 }
 
 func (s *CassandraStore) GetQueueSize(orgID uuid.UUID) (int, error) {
 	var count int
 	err := s.db.Session().Query(`
 		SELECT COUNT(*) FROM gc_queue WHERE org_id = ?
-	`, orgID).Scan(&count)
+	`, orgID.String()).Scan(&count)
 	if err != nil {
 		return 0, fmt.Errorf("failed to get queue size: %w", err)
 	}
@@ -119,9 +137,9 @@ func (s *CassandraStore) GetTotalQueueSize() (int, error) {
 func (s *CassandraStore) ListOrgsWithQueuedItems() ([]uuid.UUID, error) {
 	iter := s.db.Session().Query(`SELECT DISTINCT org_id FROM gc_queue`).Iter()
 	var orgs []uuid.UUID
-	var orgID uuid.UUID
-	for iter.Scan(&orgID) {
-		orgs = append(orgs, orgID)
+	var orgIDStr string
+	for iter.Scan(&orgIDStr) {
+		orgs = append(orgs, parseUUID(orgIDStr))
 	}
 	if err := iter.Close(); err != nil {
 		return nil, fmt.Errorf("failed to list orgs: %w", err)
@@ -135,28 +153,28 @@ func (s *CassandraStore) GetBlockRefCount(orgID uuid.UUID, blockID string) (int,
 	var refCount int
 	err := s.db.Session().Query(`
 		SELECT ref_count FROM blocks WHERE org_id = ? AND block_id = ?
-	`, orgID, blockID).Scan(&refCount)
+	`, orgID.String(), blockID).Scan(&refCount)
 	return refCount, err
 }
 
 func (s *CassandraStore) DeleteBlock(orgID uuid.UUID, blockID string) error {
 	return s.db.Session().Query(`
 		DELETE FROM blocks WHERE org_id = ? AND block_id = ?
-	`, orgID, blockID).Exec()
+	`, orgID.String(), blockID).Exec()
 }
 
 func (s *CassandraStore) DecrementBlockRefCount(orgID uuid.UUID, blockID string) error {
 	return s.db.Session().Query(`
 		UPDATE blocks SET ref_count = ref_count - 1, last_accessed = ?
 		WHERE org_id = ? AND block_id = ?
-	`, time.Now(), orgID, blockID).Exec()
+	`, time.Now(), orgID.String(), blockID).Exec()
 }
 
 func (s *CassandraStore) ListBlockMappingsByInternalID(orgID uuid.UUID, internalID string) ([]BlockMapping, error) {
 	iter := s.db.Session().Query(`
 		SELECT internal_id, external_id FROM block_id_mappings_by_internal
 		WHERE org_id = ? AND internal_id = ?
-	`, orgID, internalID).Iter()
+	`, orgID.String(), internalID).Iter()
 
 	var mappings []BlockMapping
 	var intID, extID string
@@ -175,7 +193,7 @@ func (s *CassandraStore) ListBlockMappingsByInternalID(orgID uuid.UUID, internal
 func (s *CassandraStore) listBlockMappingsByInternalIDFallback(orgID uuid.UUID, internalID string) ([]BlockMapping, error) {
 	iter := s.db.Session().Query(`
 		SELECT external_id, internal_id FROM block_id_mappings WHERE org_id = ?
-	`, orgID).Iter()
+	`, orgID.String()).Iter()
 
 	var mappings []BlockMapping
 	var extID, intID string
@@ -195,13 +213,13 @@ func (s *CassandraStore) DeleteBlockMapping(orgID uuid.UUID, externalID string) 
 	var internalID string
 	err := s.db.Session().Query(`
 		SELECT internal_id FROM block_id_mappings WHERE org_id = ? AND external_id = ?
-	`, orgID, externalID).Scan(&internalID)
+	`, orgID.String(), externalID).Scan(&internalID)
 
 	batch := s.db.Session().Batch(gocql.UnloggedBatch)
-	batch.Query(`DELETE FROM block_id_mappings WHERE org_id = ? AND external_id = ?`, orgID, externalID)
+	batch.Query(`DELETE FROM block_id_mappings WHERE org_id = ? AND external_id = ?`, orgID.String(), externalID)
 	if err == nil && internalID != "" {
 		batch.Query(`DELETE FROM block_id_mappings_by_internal WHERE org_id = ? AND internal_id = ? AND external_id = ?`,
-			orgID, internalID, externalID)
+			orgID.String(), internalID, externalID)
 	}
 	return batch.Exec()
 }
@@ -212,14 +230,14 @@ func (s *CassandraStore) GetCommit(libraryID uuid.UUID, commitID string) (Commit
 	var info CommitInfo
 	err := s.db.Session().Query(`
 		SELECT commit_id, root_fs_id FROM commits WHERE library_id = ? AND commit_id = ?
-	`, libraryID, commitID).Scan(&info.CommitID, &info.RootFSID)
+	`, libraryID.String(), commitID).Scan(&info.CommitID, &info.RootFSID)
 	return info, err
 }
 
 func (s *CassandraStore) DeleteCommit(libraryID uuid.UUID, commitID string) error {
 	return s.db.Session().Query(`
 		DELETE FROM commits WHERE library_id = ? AND commit_id = ?
-	`, libraryID, commitID).Exec()
+	`, libraryID.String(), commitID).Exec()
 }
 
 // --- FS object operations ---
@@ -230,7 +248,7 @@ func (s *CassandraStore) GetFSObject(libraryID uuid.UUID, fsID string) (FSObject
 	var dirEntriesJSON string
 	err := s.db.Session().Query(`
 		SELECT fs_id, obj_type, block_ids, dir_entries FROM fs_objects WHERE library_id = ? AND fs_id = ?
-	`, libraryID, fsID).Scan(&info.FSID, &info.ObjType, &blockIDs, &dirEntriesJSON)
+	`, libraryID.String(), fsID).Scan(&info.FSID, &info.ObjType, &blockIDs, &dirEntriesJSON)
 	if err != nil {
 		return FSObjectInfo{}, err
 	}
@@ -242,7 +260,7 @@ func (s *CassandraStore) GetFSObject(libraryID uuid.UUID, fsID string) (FSObject
 func (s *CassandraStore) DeleteFSObject(libraryID uuid.UUID, fsID string) error {
 	return s.db.Session().Query(`
 		DELETE FROM fs_objects WHERE library_id = ? AND fs_id = ?
-	`, libraryID, fsID).Exec()
+	`, libraryID.String(), fsID).Exec()
 }
 
 // --- Library operations ---
@@ -251,14 +269,14 @@ func (s *CassandraStore) GetLibraryStorageClass(orgID, libraryID uuid.UUID) (str
 	var storageClass string
 	err := s.db.Session().Query(`
 		SELECT storage_class FROM libraries WHERE org_id = ? AND library_id = ?
-	`, orgID, libraryID).Scan(&storageClass)
+	`, orgID.String(), libraryID.String()).Scan(&storageClass)
 	return storageClass, err
 }
 
 func (s *CassandraStore) ListCommitsForLibrary(libraryID uuid.UUID) ([]CommitInfo, error) {
 	iter := s.db.Session().Query(`
 		SELECT commit_id, root_fs_id FROM commits WHERE library_id = ?
-	`, libraryID).Iter()
+	`, libraryID.String()).Iter()
 
 	var commits []CommitInfo
 	var commitID, rootFSID string
@@ -274,7 +292,7 @@ func (s *CassandraStore) ListCommitsForLibrary(libraryID uuid.UUID) ([]CommitInf
 func (s *CassandraStore) ListFSObjectsForLibrary(libraryID uuid.UUID) ([]FSObjectInfo, error) {
 	iter := s.db.Session().Query(`
 		SELECT fs_id, obj_type, block_ids, dir_entries FROM fs_objects WHERE library_id = ?
-	`, libraryID).Iter()
+	`, libraryID.String()).Iter()
 
 	var objects []FSObjectInfo
 	var fsID, objType, dirEntriesJSON string
@@ -299,9 +317,9 @@ func (s *CassandraStore) ListFSObjectsForLibrary(libraryID uuid.UUID) ([]FSObjec
 func (s *CassandraStore) ListOrganizations() ([]uuid.UUID, error) {
 	iter := s.db.Session().Query(`SELECT org_id FROM organizations`).Iter()
 	var orgs []uuid.UUID
-	var orgID uuid.UUID
-	for iter.Scan(&orgID) {
-		orgs = append(orgs, orgID)
+	var orgIDStr string
+	for iter.Scan(&orgIDStr) {
+		orgs = append(orgs, parseUUID(orgIDStr))
 	}
 	if err := iter.Close(); err != nil {
 		return nil, err
@@ -312,7 +330,7 @@ func (s *CassandraStore) ListOrganizations() ([]uuid.UUID, error) {
 func (s *CassandraStore) ListBlocksForOrg(orgID uuid.UUID) ([]BlockInfo, error) {
 	iter := s.db.Session().Query(`
 		SELECT block_id, storage_class, ref_count FROM blocks WHERE org_id = ?
-	`, orgID).Iter()
+	`, orgID.String()).Iter()
 
 	var blocks []BlockInfo
 	var blockID, storageClass string
@@ -332,11 +350,10 @@ func (s *CassandraStore) ListShareLinks() ([]ShareLinkInfo, error) {
 	`).Iter()
 
 	var links []ShareLinkInfo
-	var shareToken string
-	var orgID uuid.UUID
+	var shareToken, orgIDStr string
 	var expiresAt time.Time
-	for iter.Scan(&shareToken, &orgID, &expiresAt) {
-		links = append(links, ShareLinkInfo{ShareToken: shareToken, OrgID: orgID, ExpiresAt: expiresAt})
+	for iter.Scan(&shareToken, &orgIDStr, &expiresAt) {
+		links = append(links, ShareLinkInfo{ShareToken: shareToken, OrgID: parseUUID(orgIDStr), ExpiresAt: expiresAt})
 	}
 	if err := iter.Close(); err != nil {
 		return nil, err
@@ -347,9 +364,9 @@ func (s *CassandraStore) ListShareLinks() ([]ShareLinkInfo, error) {
 func (s *CassandraStore) ListDistinctCommitLibraries() ([]uuid.UUID, error) {
 	iter := s.db.Session().Query(`SELECT DISTINCT library_id FROM commits`).Iter()
 	var ids []uuid.UUID
-	var id uuid.UUID
-	for iter.Scan(&id) {
-		ids = append(ids, id)
+	var idStr string
+	for iter.Scan(&idStr) {
+		ids = append(ids, parseUUID(idStr))
 	}
 	if err := iter.Close(); err != nil {
 		return nil, err
@@ -360,9 +377,9 @@ func (s *CassandraStore) ListDistinctCommitLibraries() ([]uuid.UUID, error) {
 func (s *CassandraStore) ListDistinctFSObjectLibraries() ([]uuid.UUID, error) {
 	iter := s.db.Session().Query(`SELECT DISTINCT library_id FROM fs_objects`).Iter()
 	var ids []uuid.UUID
-	var id uuid.UUID
-	for iter.Scan(&id) {
-		ids = append(ids, id)
+	var idStr string
+	for iter.Scan(&idStr) {
+		ids = append(ids, parseUUID(idStr))
 	}
 	if err := iter.Close(); err != nil {
 		return nil, err
@@ -371,10 +388,10 @@ func (s *CassandraStore) ListDistinctFSObjectLibraries() ([]uuid.UUID, error) {
 }
 
 func (s *CassandraStore) LibraryExists(libraryID uuid.UUID) (bool, error) {
-	var existingLibID uuid.UUID
+	var existingLibIDStr string
 	err := s.db.Session().Query(`
 		SELECT library_id FROM libraries_by_id WHERE library_id = ?
-	`, libraryID).Scan(&existingLibID)
+	`, libraryID.String()).Scan(&existingLibIDStr)
 	if err != nil {
 		return false, nil // Not found
 	}
@@ -382,20 +399,20 @@ func (s *CassandraStore) LibraryExists(libraryID uuid.UUID) (bool, error) {
 }
 
 func (s *CassandraStore) FindOrgForLibrary(libraryID uuid.UUID) (uuid.UUID, error) {
-	var orgID uuid.UUID
+	var orgIDStr string
 	err := s.db.Session().Query(`
 		SELECT org_id FROM libraries_by_id WHERE library_id = ?
-	`, libraryID).Scan(&orgID)
+	`, libraryID.String()).Scan(&orgIDStr)
 	if err != nil {
 		return uuid.Nil, err
 	}
-	return orgID, nil
+	return parseUUID(orgIDStr), nil
 }
 
 func (s *CassandraStore) ListCommitIDsForLibrary(libraryID uuid.UUID) ([]string, error) {
 	iter := s.db.Session().Query(`
 		SELECT commit_id FROM commits WHERE library_id = ?
-	`, libraryID).Iter()
+	`, libraryID.String()).Iter()
 	var ids []string
 	var id string
 	for iter.Scan(&id) {
@@ -410,7 +427,7 @@ func (s *CassandraStore) ListCommitIDsForLibrary(libraryID uuid.UUID) ([]string,
 func (s *CassandraStore) ListFSObjectIDsForLibrary(libraryID uuid.UUID) ([]string, error) {
 	iter := s.db.Session().Query(`
 		SELECT fs_id FROM fs_objects WHERE library_id = ?
-	`, libraryID).Iter()
+	`, libraryID.String()).Iter()
 	var ids []string
 	var id string
 	for iter.Scan(&id) {
@@ -430,14 +447,13 @@ func (s *CassandraStore) ListLibrariesWithVersionTTL() ([]LibraryTTLInfo, error)
 	`).Iter()
 
 	var results []LibraryTTLInfo
-	var orgID, libraryID uuid.UUID
-	var headCommitID string
+	var orgIDStr, libIDStr, headCommitID string
 	var versionTTLDays int
-	for iter.Scan(&orgID, &libraryID, &headCommitID, &versionTTLDays) {
+	for iter.Scan(&orgIDStr, &libIDStr, &headCommitID, &versionTTLDays) {
 		if versionTTLDays > 0 {
 			results = append(results, LibraryTTLInfo{
-				OrgID:          orgID,
-				LibraryID:      libraryID,
+				OrgID:          parseUUID(orgIDStr),
+				LibraryID:      parseUUID(libIDStr),
 				HeadCommitID:   headCommitID,
 				VersionTTLDays: versionTTLDays,
 			})
@@ -452,7 +468,7 @@ func (s *CassandraStore) ListLibrariesWithVersionTTL() ([]LibraryTTLInfo, error)
 func (s *CassandraStore) ListCommitsWithTimestamps(libraryID uuid.UUID) ([]CommitWithTimestamp, error) {
 	iter := s.db.Session().Query(`
 		SELECT commit_id, parent_id, root_fs_id, created_at FROM commits WHERE library_id = ?
-	`, libraryID).Iter()
+	`, libraryID.String()).Iter()
 
 	var commits []CommitWithTimestamp
 	var commitID, parentID, rootFSID string
@@ -479,14 +495,13 @@ func (s *CassandraStore) ListLibrariesWithAutoDelete() ([]LibraryAutoDeleteInfo,
 	`).Iter()
 
 	var results []LibraryAutoDeleteInfo
-	var orgID, libraryID uuid.UUID
-	var headCommitID string
+	var orgIDStr, libIDStr, headCommitID string
 	var autoDeleteDays int
-	for iter.Scan(&orgID, &libraryID, &headCommitID, &autoDeleteDays) {
+	for iter.Scan(&orgIDStr, &libIDStr, &headCommitID, &autoDeleteDays) {
 		if autoDeleteDays > 0 {
 			results = append(results, LibraryAutoDeleteInfo{
-				OrgID:          orgID,
-				LibraryID:      libraryID,
+				OrgID:          parseUUID(orgIDStr),
+				LibraryID:      parseUUID(libIDStr),
 				HeadCommitID:   headCommitID,
 				AutoDeleteDays: autoDeleteDays,
 			})
@@ -535,14 +550,14 @@ func (s *CassandraStore) ListExpiredShares() ([]ExpiredShareInfo, error) {
 	`).Iter()
 
 	var results []ExpiredShareInfo
-	var libraryID, shareID, sharedTo uuid.UUID
+	var libIDStr, shareIDStr, sharedToStr string
 	var expiresAt time.Time
-	for iter.Scan(&libraryID, &shareID, &sharedTo, &expiresAt) {
+	for iter.Scan(&libIDStr, &shareIDStr, &sharedToStr, &expiresAt) {
 		if !expiresAt.IsZero() && expiresAt.Before(now) {
 			results = append(results, ExpiredShareInfo{
-				LibraryID: libraryID,
-				ShareID:   shareID,
-				SharedTo:  sharedTo,
+				LibraryID: parseUUID(libIDStr),
+				ShareID:   parseUUID(shareIDStr),
+				SharedTo:  parseUUID(sharedToStr),
 				ExpiresAt: expiresAt,
 			})
 		}
@@ -556,13 +571,13 @@ func (s *CassandraStore) ListExpiredShares() ([]ExpiredShareInfo, error) {
 func (s *CassandraStore) DeleteShare(libraryID, shareID uuid.UUID) error {
 	return s.db.Session().Query(`
 		DELETE FROM shares WHERE library_id = ? AND share_id = ?
-	`, libraryID, shareID).Exec()
+	`, libraryID.String(), shareID.String()).Exec()
 }
 
 func (s *CassandraStore) DeleteShareByUser(sharedTo, libraryID uuid.UUID) error {
 	return s.db.Session().Query(`
 		DELETE FROM shares_by_user WHERE shared_to = ? AND library_id = ?
-	`, sharedTo, libraryID).Exec()
+	`, sharedTo.String(), libraryID.String()).Exec()
 }
 
 // --- Expired restore jobs ---
@@ -574,16 +589,15 @@ func (s *CassandraStore) ListExpiredRestoreJobs() ([]ExpiredRestoreJobInfo, erro
 	`).Iter()
 
 	var results []ExpiredRestoreJobInfo
-	var orgID, libraryID, jobID uuid.UUID
-	var status string
+	var orgIDStr, libIDStr, jobIDStr, status string
 	var expiresAt time.Time
-	for iter.Scan(&orgID, &libraryID, &jobID, &status, &expiresAt) {
+	for iter.Scan(&orgIDStr, &libIDStr, &jobIDStr, &status, &expiresAt) {
 		// Clean up completed jobs or jobs past their expiration
 		if status == "completed" || status == "failed" || (!expiresAt.IsZero() && expiresAt.Before(now)) {
 			results = append(results, ExpiredRestoreJobInfo{
-				OrgID:     orgID,
-				LibraryID: libraryID,
-				JobID:     jobID,
+				OrgID:     parseUUID(orgIDStr),
+				LibraryID: parseUUID(libIDStr),
+				JobID:     parseUUID(jobIDStr),
 				Status:    status,
 				ExpiresAt: expiresAt,
 			})
@@ -598,7 +612,7 @@ func (s *CassandraStore) ListExpiredRestoreJobs() ([]ExpiredRestoreJobInfo, erro
 func (s *CassandraStore) DeleteRestoreJob(orgID, libraryID, jobID uuid.UUID) error {
 	return s.db.Session().Query(`
 		DELETE FROM restore_jobs WHERE org_id = ? AND library_id = ? AND job_id = ?
-	`, orgID, libraryID, jobID).Exec()
+	`, orgID.String(), libraryID.String(), jobID.String()).Exec()
 }
 
 // --- Library artifact cleanup ---
@@ -606,12 +620,12 @@ func (s *CassandraStore) DeleteRestoreJob(orgID, libraryID, jobID uuid.UUID) err
 func (s *CassandraStore) ListSharesByLibrary(libraryID uuid.UUID) ([]ShareInfo, error) {
 	iter := s.db.Session().Query(`
 		SELECT library_id, share_id, shared_to FROM shares WHERE library_id = ?
-	`, libraryID).Iter()
+	`, libraryID.String()).Iter()
 
 	var results []ShareInfo
-	var libID, shareID, sharedTo uuid.UUID
-	for iter.Scan(&libID, &shareID, &sharedTo) {
-		results = append(results, ShareInfo{LibraryID: libID, ShareID: shareID, SharedTo: sharedTo})
+	var libIDStr, shareIDStr, sharedToStr string
+	for iter.Scan(&libIDStr, &shareIDStr, &sharedToStr) {
+		results = append(results, ShareInfo{LibraryID: parseUUID(libIDStr), ShareID: parseUUID(shareIDStr), SharedTo: parseUUID(sharedToStr)})
 	}
 	if err := iter.Close(); err != nil {
 		return nil, err
@@ -622,7 +636,7 @@ func (s *CassandraStore) ListSharesByLibrary(libraryID uuid.UUID) ([]ShareInfo, 
 func (s *CassandraStore) ListRepoTagsByLibrary(libraryID uuid.UUID) ([]string, error) {
 	iter := s.db.Session().Query(`
 		SELECT tag_id FROM repo_tags WHERE repo_id = ?
-	`, libraryID).Iter()
+	`, libraryID.String()).Iter()
 
 	var results []string
 	var tagID int
@@ -638,21 +652,20 @@ func (s *CassandraStore) ListRepoTagsByLibrary(libraryID uuid.UUID) ([]string, e
 func (s *CassandraStore) DeleteRepoTag(libraryID uuid.UUID, tagID int) error {
 	return s.db.Session().Query(`
 		DELETE FROM repo_tags WHERE repo_id = ? AND tag_id = ?
-	`, libraryID, tagID).Exec()
+	`, libraryID.String(), tagID).Exec()
 }
 
 func (s *CassandraStore) ListFileTagsByLibrary(libraryID uuid.UUID) ([]FileTagInfo, error) {
 	iter := s.db.Session().Query(`
 		SELECT repo_id, file_path, tag_id, file_tag_id FROM file_tags WHERE repo_id = ?
-	`, libraryID).Iter()
+	`, libraryID.String()).Iter()
 
 	var results []FileTagInfo
-	var repoID uuid.UUID
-	var filePath string
+	var repoIDStr, filePath string
 	var tagID, fileTagID int
-	for iter.Scan(&repoID, &filePath, &tagID, &fileTagID) {
+	for iter.Scan(&repoIDStr, &filePath, &tagID, &fileTagID) {
 		results = append(results, FileTagInfo{
-			RepoID:    repoID,
+			RepoID:    parseUUID(repoIDStr),
 			FilePath:  filePath,
 			TagID:     tagID,
 			FileTagID: fileTagID,
@@ -667,25 +680,24 @@ func (s *CassandraStore) ListFileTagsByLibrary(libraryID uuid.UUID) ([]FileTagIn
 func (s *CassandraStore) DeleteFileTag(libraryID uuid.UUID, filePath string, tagID int) error {
 	return s.db.Session().Query(`
 		DELETE FROM file_tags WHERE repo_id = ? AND file_path = ? AND tag_id = ?
-	`, libraryID, filePath, tagID).Exec()
+	`, libraryID.String(), filePath, tagID).Exec()
 }
 
 func (s *CassandraStore) DeleteFileTagByID(libraryID uuid.UUID, fileTagID int) error {
 	return s.db.Session().Query(`
 		DELETE FROM file_tags_by_id WHERE repo_id = ? AND file_tag_id = ?
-	`, libraryID, fileTagID).Exec()
+	`, libraryID.String(), fileTagID).Exec()
 }
 
 func (s *CassandraStore) ListRepoAPITokensByLibrary(libraryID uuid.UUID) ([]RepoAPITokenInfo, error) {
 	iter := s.db.Session().Query(`
 		SELECT repo_id, app_name, api_token FROM repo_api_tokens WHERE repo_id = ?
-	`, libraryID).Iter()
+	`, libraryID.String()).Iter()
 
 	var results []RepoAPITokenInfo
-	var repoID uuid.UUID
-	var appName, apiToken string
-	for iter.Scan(&repoID, &appName, &apiToken) {
-		results = append(results, RepoAPITokenInfo{RepoID: repoID, AppName: appName, APIToken: apiToken})
+	var repoIDStr, appName, apiToken string
+	for iter.Scan(&repoIDStr, &appName, &apiToken) {
+		results = append(results, RepoAPITokenInfo{RepoID: parseUUID(repoIDStr), AppName: appName, APIToken: apiToken})
 	}
 	if err := iter.Close(); err != nil {
 		return nil, err
@@ -696,7 +708,7 @@ func (s *CassandraStore) ListRepoAPITokensByLibrary(libraryID uuid.UUID) ([]Repo
 func (s *CassandraStore) DeleteRepoAPIToken(libraryID uuid.UUID, appName string) error {
 	return s.db.Session().Query(`
 		DELETE FROM repo_api_tokens WHERE repo_id = ? AND app_name = ?
-	`, libraryID, appName).Exec()
+	`, libraryID.String(), appName).Exec()
 }
 
 func (s *CassandraStore) DeleteRepoAPITokenByToken(apiToken string) error {
@@ -709,7 +721,7 @@ func (s *CassandraStore) DeleteLockedFilesByLibrary(libraryID uuid.UUID) error {
 	// First list all locked files for this library, then delete them
 	iter := s.db.Session().Query(`
 		SELECT path FROM locked_files WHERE repo_id = ?
-	`, libraryID).Iter()
+	`, libraryID.String()).Iter()
 
 	var paths []string
 	var path string
@@ -721,7 +733,7 @@ func (s *CassandraStore) DeleteLockedFilesByLibrary(libraryID uuid.UUID) error {
 	for _, p := range paths {
 		s.db.Session().Query(`
 			DELETE FROM locked_files WHERE repo_id = ? AND path = ?
-		`, libraryID, p).Exec()
+		`, libraryID.String(), p).Exec()
 	}
 	return nil
 }
@@ -731,7 +743,7 @@ func (s *CassandraStore) DeleteShareLinksByLibrary(orgID, libraryID uuid.UUID) (
 	iter := s.db.Session().Query(`
 		SELECT link_token, created_by, created_at FROM share_links_by_library
 		WHERE org_id = ? AND library_id = ?
-	`, orgID, libraryID).Iter()
+	`, orgID.String(), libraryID.String()).Iter()
 
 	type linkInfo struct {
 		token     string
@@ -752,11 +764,11 @@ func (s *CassandraStore) DeleteShareLinksByLibrary(orgID, libraryID uuid.UUID) (
 		batch := s.db.Session().Batch(gocql.LoggedBatch)
 		batch.Query(`DELETE FROM share_links WHERE link_token = ?`, link.token)
 		batch.Query(`DELETE FROM share_links_by_creator WHERE org_id = ? AND created_by = ? AND created_at = ? AND link_token = ?`,
-			orgID, link.createdBy, link.createdAt, link.token)
+			orgID.String(), link.createdBy, link.createdAt, link.token)
 		batch.Query(`DELETE FROM share_links_by_org WHERE org_id = ? AND created_at = ? AND link_token = ?`,
-			orgID, link.createdAt, link.token)
+			orgID.String(), link.createdAt, link.token)
 		batch.Query(`DELETE FROM share_links_by_library WHERE org_id = ? AND library_id = ? AND link_token = ?`,
-			orgID, libraryID, link.token)
+			orgID.String(), libraryID.String(), link.token)
 		if err := batch.Exec(); err == nil {
 			deletedTokens = append(deletedTokens, link.token)
 		}
