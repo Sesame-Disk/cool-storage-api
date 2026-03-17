@@ -372,28 +372,48 @@ func (w *Worker) decrementAndFindZeroRef(orgID uuid.UUID, blockIDs []string) []s
 // Only enqueues commits and fs_objects — blocks are handled in cascade
 // when fs_objects are processed (via decrementAndFindZeroRef).
 func (w *Worker) EnqueueLibraryContents(orgID, libraryID uuid.UUID, storageClass string) error {
-	// Enqueue all commits for this library
+	now := time.Now()
+
+	// Enqueue all commits for this library (batched)
 	commits, err := w.store.ListCommitsForLibrary(libraryID)
 	if err != nil {
 		return fmt.Errorf("failed to list commits for library %s: %w", libraryID, err)
 	}
-	for _, c := range commits {
-		w.queue.Enqueue(orgID, ItemCommit, c.CommitID, libraryID, "")
+	if len(commits) > 0 {
+		batch := make([]QueueItem, 0, len(commits))
+		for _, c := range commits {
+			batch = append(batch, QueueItem{
+				OrgID: orgID, QueuedAt: now, ItemType: ItemCommit,
+				ItemID: c.CommitID, LibraryID: libraryID,
+			})
+		}
+		if err := w.queue.EnqueueBatch(batch); err != nil {
+			return fmt.Errorf("failed to batch enqueue commits for library %s: %w", libraryID, err)
+		}
 	}
 
-	// Enqueue all fs_objects (blocks will cascade via processFSObject)
+	// Enqueue all fs_objects (batched; blocks will cascade via processFSObject)
 	fsObjects, err := w.store.ListFSObjectsForLibrary(libraryID)
 	if err != nil {
 		return fmt.Errorf("failed to list fs_objects for library %s: %w", libraryID, err)
 	}
-	for _, obj := range fsObjects {
-		w.queue.Enqueue(orgID, ItemFSObject, obj.FSID, libraryID, "")
+	if len(fsObjects) > 0 {
+		batch := make([]QueueItem, 0, len(fsObjects))
+		for _, obj := range fsObjects {
+			batch = append(batch, QueueItem{
+				OrgID: orgID, QueuedAt: now, ItemType: ItemFSObject,
+				ItemID: obj.FSID, LibraryID: libraryID,
+			})
+		}
+		if err := w.queue.EnqueueBatch(batch); err != nil {
+			return fmt.Errorf("failed to batch enqueue fs_objects for library %s: %w", libraryID, err)
+		}
 	}
 
 	// Clean up library-specific artifacts that don't cascade through fs_objects
 	w.enqueueLibraryArtifacts(orgID, libraryID)
 
-	log.Printf("[GC Worker] Enqueued library %s contents for deletion", libraryID)
+	log.Printf("[GC Worker] Enqueued library %s contents for deletion (%d commits, %d fs_objects)", libraryID, len(commits), len(fsObjects))
 	return nil
 }
 

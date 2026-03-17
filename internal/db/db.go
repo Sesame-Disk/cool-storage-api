@@ -764,6 +764,8 @@ CREATE TABLE IF NOT EXISTS gc_queue_stats (
 const migrationCreateBlockIDMappingsByInternal = `
 CREATE TABLE IF NOT EXISTS block_id_mappings_by_internal (
 	org_id UUID,
+	internal_id TEXT,
+	external_id TEXT,
 	PRIMARY KEY ((org_id), internal_id, external_id)
 )`
 
@@ -776,11 +778,13 @@ CREATE TABLE IF NOT EXISTS gc_processed_items (
 ) WITH default_time_to_live = 172800` // 48 hours TTL
 
 // deleted_libraries keeps track of libraries that have been permanently deleted
-// to allow background garbage collection (which only has library_id) 
+// to allow background garbage collection (which only has library_id)
 // to resolve the org_id of orphaned items.
+// 90-day TTL ensures auto-cleanup — the GC scanner runs daily, so 90 days
+// is more than enough to process all orphans before the record expires.
 const migrationCreateDeletedLibraries = `
 CREATE TABLE IF NOT EXISTS deleted_libraries (
 	library_id UUID PRIMARY KEY,
 	org_id UUID,
 	deleted_at TIMESTAMP
-)`
+) WITH default_time_to_live = 7776000`

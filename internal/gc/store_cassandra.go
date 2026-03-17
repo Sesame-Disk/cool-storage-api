@@ -60,20 +60,25 @@ func NewCassandraStore(database *db.DB) *CassandraStore {
 	return &CassandraStore{db: database}
 }
 
+// maxBatchSize is the maximum number of statements per Cassandra batch.
+// Keeps batches within Cassandra's recommended size limits.
+const maxBatchSize = 50
+
 // --- Queue operations ---
 
 func (s *CassandraStore) EnqueueItem(orgID uuid.UUID, queuedAt time.Time, itemType ItemType, itemID string, libraryID uuid.UUID, storageClass string, retryCount int) error {
-	batch := s.db.Session().NewBatch(gocql.LoggedBatch)
-	batch.Query(`
+	if err := s.db.Session().Query(`
 		INSERT INTO gc_queue (org_id, queued_at, item_type, item_id, library_id, storage_class, retry_count)
 		VALUES (?, ?, ?, ?, ?, ?, ?)
-	`, orgID.String(), queuedAt, string(itemType), itemID, libraryID.String(), storageClass, retryCount)
-	
-	// Increment atomic counters in gc_queue_stats
-	batch.Query(`UPDATE gc_queue_stats SET queue_size = queue_size + 1 WHERE stat_key = ?`, orgID.String())
-	batch.Query(`UPDATE gc_queue_stats SET queue_size = queue_size + 1 WHERE stat_key = 'total'`)
-	
-	return s.db.Session().ExecuteBatch(batch)
+	`, orgID.String(), queuedAt, string(itemType), itemID, libraryID.String(), storageClass, retryCount).Exec(); err != nil {
+		return err
+	}
+
+	// Counter updates must be in a separate COUNTER batch (cannot mix with regular mutations)
+	counterBatch := s.db.Session().Batch(gocql.CounterBatch)
+	counterBatch.Query(`UPDATE gc_queue_stats SET queue_size = queue_size + 1 WHERE stat_key = ?`, orgID.String())
+	counterBatch.Query(`UPDATE gc_queue_stats SET queue_size = queue_size + 1 WHERE stat_key = 'total'`)
+	return counterBatch.Exec()
 }
 
 func (s *CassandraStore) EnqueueBatch(items []QueueItem) error {
@@ -81,23 +86,37 @@ func (s *CassandraStore) EnqueueBatch(items []QueueItem) error {
 		return nil
 	}
 
-	batch := s.db.Session().NewBatch(gocql.LoggedBatch)
-	
+	// Insert in chunks of maxBatchSize to stay within Cassandra batch limits
+	for i := 0; i < len(items); i += maxBatchSize {
+		end := i + maxBatchSize
+		if end > len(items) {
+			end = len(items)
+		}
+		chunk := items[i:end]
+
+		batch := s.db.Session().Batch(gocql.LoggedBatch)
+		for _, item := range chunk {
+			batch.Query(`
+				INSERT INTO gc_queue (org_id, queued_at, item_type, item_id, library_id, storage_class, retry_count)
+				VALUES (?, ?, ?, ?, ?, ?, ?)
+			`, item.OrgID.String(), item.QueuedAt, string(item.ItemType), item.ItemID, item.LibraryID.String(), item.StorageClass, item.RetryCount)
+		}
+		if err := batch.Exec(); err != nil {
+			return fmt.Errorf("failed to enqueue batch chunk at offset %d: %w", i, err)
+		}
+	}
+
+	// Counter updates in a separate COUNTER batch
 	orgCounts := make(map[string]int)
 	for _, item := range items {
-		batch.Query(`
-			INSERT INTO gc_queue (org_id, queued_at, item_type, item_id, library_id, storage_class, retry_count)
-			VALUES (?, ?, ?, ?, ?, ?, ?)
-		`, item.OrgID.String(), item.QueuedAt, string(item.ItemType), item.ItemID, item.LibraryID.String(), item.StorageClass, item.RetryCount)
 		orgCounts[item.OrgID.String()]++
 	}
-
+	counterBatch := s.db.Session().Batch(gocql.CounterBatch)
 	for orgIDStr, count := range orgCounts {
-		batch.Query(`UPDATE gc_queue_stats SET queue_size = queue_size + ? WHERE stat_key = ?`, count, orgIDStr)
+		counterBatch.Query(`UPDATE gc_queue_stats SET queue_size = queue_size + ? WHERE stat_key = ?`, int64(count), orgIDStr)
 	}
-	batch.Query(`UPDATE gc_queue_stats SET queue_size = queue_size + ? WHERE stat_key = 'total'`, len(items))
-
-	return s.db.Session().ExecuteBatch(batch)
+	counterBatch.Query(`UPDATE gc_queue_stats SET queue_size = queue_size + ? WHERE stat_key = 'total'`, int64(len(items)))
+	return counterBatch.Exec()
 }
 
 func (s *CassandraStore) DequeueBatch(orgID uuid.UUID, batchSize int, cutoff time.Time) ([]QueueItem, error) {
@@ -133,20 +152,24 @@ func (s *CassandraStore) DequeueBatch(orgID uuid.UUID, batchSize int, cutoff tim
 }
 
 func (s *CassandraStore) CompleteItem(orgID uuid.UUID, queuedAt time.Time, itemType ItemType, itemID string) error {
-	batch := s.db.Session().NewBatch(gocql.LoggedBatch)
-	
-	// Soft-delete via TTL instead of immediate DELETE to reduce tombstone impact.
-	// We set a 1-second TTL which essentially marks it for expiring without a synchronous DELETE.
-	batch.Query(`
-		UPDATE gc_queue USING TTL 1 SET retry_count = -1
+	// Delete the queue item. gc_queue already has a table-level TTL (7 days) which
+	// limits tombstone lifespan. The DELETE is necessary because UPDATE USING TTL
+	// only applies to the updated columns, leaving the rest of the row alive.
+	if err := s.db.Session().Query(`
+		DELETE FROM gc_queue
 		WHERE org_id = ? AND queued_at = ? AND item_type = ? AND item_id = ?
-	`, orgID.String(), queuedAt, string(itemType), itemID)
-	
-	// Decrement atomic counters
-	batch.Query(`UPDATE gc_queue_stats SET queue_size = queue_size - 1 WHERE stat_key = ?`, orgID.String())
-	batch.Query(`UPDATE gc_queue_stats SET queue_size = queue_size - 1 WHERE stat_key = 'total'`)
-	
-	return s.db.Session().ExecuteBatch(batch)
+	`, orgID.String(), queuedAt, string(itemType), itemID).Exec(); err != nil {
+		return err
+	}
+
+	// Decrement counters in a separate COUNTER batch
+	counterBatch := s.db.Session().Batch(gocql.CounterBatch)
+	counterBatch.Query(`UPDATE gc_queue_stats SET queue_size = queue_size - 1 WHERE stat_key = ?`, orgID.String())
+	counterBatch.Query(`UPDATE gc_queue_stats SET queue_size = queue_size - 1 WHERE stat_key = 'total'`)
+	if err := counterBatch.Exec(); err != nil {
+		log.Printf("[GC Store] Warning: failed to decrement queue counters for org %s: %v", orgID, err)
+	}
+	return nil
 }
 
 func (s *CassandraStore) UpdateRetryCount(orgID uuid.UUID, queuedAt time.Time, itemType ItemType, itemID string, retryCount int) error {
@@ -203,12 +226,15 @@ func (s *CassandraStore) ListOrgsWithQueuedItems() ([]uuid.UUID, error) {
 	return orgs, nil
 }
 
-// MarkItemProcessed attempts to insert the taskID into the gc_processed_items table 
-// with a TTL of 48 hours. Returns applied=true if successful, false if already exists.
+// MarkItemProcessed attempts to insert the taskID into the gc_processed_items table.
+// The table has a default TTL of 48 hours so entries auto-expire.
+// Returns applied=true if this is the first time (safe to proceed), false if already processed.
 func (s *CassandraStore) MarkItemProcessed(taskID uuid.UUID) (bool, error) {
+	// USING TTL must come before IF NOT EXISTS in CQL syntax.
+	// We omit USING TTL here because the table already has default_time_to_live = 172800.
 	applied, err := s.db.Session().Query(`
-		INSERT INTO gc_processed_items (task_id) VALUES (?) IF NOT EXISTS USING TTL 172800
-	`, taskID).ScanCAS()
+		INSERT INTO gc_processed_items (task_id) VALUES (?) IF NOT EXISTS
+	`, taskID.String()).ScanCAS()
 	return applied, err
 }
 
@@ -222,11 +248,38 @@ func (s *CassandraStore) GetBlockRefCount(orgID uuid.UUID, blockID string) (int,
 	return refCount, err
 }
 
+// DeleteBlockIfUnreferenced atomically checks ref_count <= 0 and, if so, deletes the block.
+// Uses a two-phase approach because CQL does not support DELETE ... IF <non-key condition>.
+// Phase 1: UPDATE ... SET ref_count = -999 ... IF ref_count <= 0 (LWT marks for deletion)
+// Phase 2: DELETE the row (unconditional, since we own it after the LWT)
+// If ref_count > 0, the LWT fails and we skip deletion entirely.
 func (s *CassandraStore) DeleteBlock(orgID uuid.UUID, blockID string) (bool, error) {
+	// Phase 1: Atomically claim the block for deletion via LWT.
+	// Setting ref_count to a sentinel value (-999) ensures that even if another
+	// process reads the row between phase 1 and 2, it won't treat it as valid.
+	var prevRefCount int
 	applied, err := s.db.Session().Query(`
-		DELETE FROM blocks WHERE org_id = ? AND block_id = ? IF ref_count <= 0
-	`, orgID, blockID).ScanCAS()
-	return applied, err
+		UPDATE blocks SET ref_count = -999
+		WHERE org_id = ? AND block_id = ?
+		IF ref_count <= 0
+	`, orgID.String(), blockID).ScanCAS(&prevRefCount)
+	if err != nil {
+		return false, err
+	}
+	if !applied {
+		return false, nil
+	}
+
+	// Phase 2: The LWT succeeded — we own this row. Delete it unconditionally.
+	if err := s.db.Session().Query(`
+		DELETE FROM blocks WHERE org_id = ? AND block_id = ?
+	`, orgID.String(), blockID).Exec(); err != nil {
+		// If the DELETE fails, the row is left with ref_count = -999.
+		// The scanner will find it (ref_count <= 0) and re-enqueue for cleanup.
+		log.Printf("[GC Store] Warning: LWT succeeded but DELETE failed for block %s: %v", blockID, err)
+		return true, err
+	}
+	return true, nil
 }
 
 func (s *CassandraStore) DecrementBlockRefCount(orgID uuid.UUID, blockID string) error {
@@ -778,7 +831,6 @@ func (s *CassandraStore) DeleteRepoAPITokenByToken(apiToken string) error {
 }
 
 func (s *CassandraStore) DeleteLockedFilesByLibrary(libraryID uuid.UUID) error {
-	// First list all locked files for this library, then delete them
 	iter := s.db.Session().Query(`
 		SELECT path FROM locked_files WHERE repo_id = ?
 	`, libraryID.String()).Iter()
@@ -790,10 +842,19 @@ func (s *CassandraStore) DeleteLockedFilesByLibrary(libraryID uuid.UUID) error {
 	}
 	iter.Close()
 
-	for _, p := range paths {
-		s.db.Session().Query(`
-			DELETE FROM locked_files WHERE repo_id = ? AND path = ?
-		`, libraryID.String(), p).Exec()
+	// Batch deletes in chunks
+	for i := 0; i < len(paths); i += maxBatchSize {
+		end := i + maxBatchSize
+		if end > len(paths) {
+			end = len(paths)
+		}
+		batch := s.db.Session().Batch(gocql.UnloggedBatch)
+		for _, p := range paths[i:end] {
+			batch.Query(`DELETE FROM locked_files WHERE repo_id = ? AND path = ?`, libraryID.String(), p)
+		}
+		if err := batch.Exec(); err != nil {
+			log.Printf("[GC Store] Warning: failed to batch delete locked files for library %s: %v", libraryID, err)
+		}
 	}
 	return nil
 }
