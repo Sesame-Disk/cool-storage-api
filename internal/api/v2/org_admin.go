@@ -15,6 +15,7 @@ import (
 	"github.com/Sesame-Disk/sesamefs/internal/config"
 	"github.com/Sesame-Disk/sesamefs/internal/db"
 	"github.com/Sesame-Disk/sesamefs/internal/middleware"
+	gocql "github.com/apache/cassandra-gocql-driver/v2"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 )
@@ -2180,11 +2181,15 @@ func (h *OrgAdminHandler) CleanOrgTrashLibraries(c *gin.Context) {
 		if deletedAt.IsZero() {
 			continue
 		}
-		// Hard-delete library rows
-		h.db.Session().Query(`DELETE FROM libraries WHERE org_id = ? AND library_id = ?`,
-			targetOrgID, libID).Exec()
-		h.db.Session().Query(`DELETE FROM libraries_by_id WHERE library_id = ?`,
-			libID).Exec()
+		// Hard-delete library rows + preserve org lookup for GC
+		batch := h.db.Session().Batch(gocql.LoggedBatch)
+		batch.Query(`DELETE FROM libraries WHERE org_id = ? AND library_id = ?`, targetOrgID, libID)
+		batch.Query(`DELETE FROM libraries_by_id WHERE library_id = ?`, libID)
+		batch.Query(`INSERT INTO deleted_libraries (library_id, org_id, deleted_at) VALUES (?, ?, ?)`, libID, targetOrgID, time.Now())
+		if err := batch.Exec(); err != nil {
+			log.Printf("[CleanOrgTrashLibraries] failed to delete library %s: %v", libID, err)
+			continue
+		}
 		cleaned++
 	}
 	iter.Close()
@@ -2216,11 +2221,15 @@ func (h *OrgAdminHandler) DeleteOrgTrashLibrary(c *gin.Context) {
 		return
 	}
 
-	// Hard-delete
-	h.db.Session().Query(`DELETE FROM libraries WHERE org_id = ? AND library_id = ?`,
-		targetOrgID, repoID).Exec()
-	h.db.Session().Query(`DELETE FROM libraries_by_id WHERE library_id = ?`,
-		repoID).Exec()
+	// Hard-delete + preserve org lookup for GC
+	batch := h.db.Session().Batch(gocql.LoggedBatch)
+	batch.Query(`DELETE FROM libraries WHERE org_id = ? AND library_id = ?`, targetOrgID, repoID)
+	batch.Query(`DELETE FROM libraries_by_id WHERE library_id = ?`, repoID)
+	batch.Query(`INSERT INTO deleted_libraries (library_id, org_id, deleted_at) VALUES (?, ?, ?)`, repoID, targetOrgID, time.Now())
+	if err := batch.Exec(); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete library"})
+		return
+	}
 
 	c.JSON(http.StatusOK, gin.H{"success": true})
 }

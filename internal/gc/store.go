@@ -12,16 +12,18 @@ import (
 type GCStore interface {
 	// Queue operations
 	EnqueueItem(orgID uuid.UUID, queuedAt time.Time, itemType ItemType, itemID string, libraryID uuid.UUID, storageClass string, retryCount int) error
+	EnqueueBatch(items []QueueItem) error
 	DequeueBatch(orgID uuid.UUID, batchSize int, cutoff time.Time) ([]QueueItem, error)
 	CompleteItem(orgID uuid.UUID, queuedAt time.Time, itemType ItemType, itemID string) error
 	UpdateRetryCount(orgID uuid.UUID, queuedAt time.Time, itemType ItemType, itemID string, retryCount int) error
 	GetQueueSize(orgID uuid.UUID) (int, error)
 	GetTotalQueueSize() (int, error)
 	ListOrgsWithQueuedItems() ([]uuid.UUID, error)
+	MarkItemProcessed(taskID uuid.UUID) (bool, error)
 
 	// Block operations (worker)
 	GetBlockRefCount(orgID uuid.UUID, blockID string) (int, error)
-	DeleteBlock(orgID uuid.UUID, blockID string) error
+	DeleteBlock(orgID uuid.UUID, blockID string) (bool, error)
 	DecrementBlockRefCount(orgID uuid.UUID, blockID string) error
 	DeleteBlockMapping(orgID uuid.UUID, externalID string) error
 
@@ -59,8 +61,8 @@ type GCStore interface {
 	// Auto-delete enforcement
 	ListLibrariesWithAutoDelete() ([]LibraryAutoDeleteInfo, error)
 
-	// Share link deletion
-	DeleteShareLink(shareToken string) error
+	// Share link deletion (defensive: attempts index cleanup even if primary record is gone)
+	DeleteShareLink(shareToken string, orgID uuid.UUID, libraryID uuid.UUID) error
 
 	// Expired shares (user-to-user library shares)
 	ListExpiredShares() ([]ExpiredShareInfo, error)

@@ -44,6 +44,14 @@ func (q *Queue) Enqueue(orgID uuid.UUID, itemType ItemType, itemID string, libra
 	return q.store.EnqueueItem(orgID, time.Now(), itemType, itemID, libraryID, storageClass, 0)
 }
 
+// EnqueueBatch inserts multiple items into the gc_queue efficiently.
+func (q *Queue) EnqueueBatch(items []QueueItem) error {
+	if len(items) == 0 {
+		return nil
+	}
+	return q.store.EnqueueBatch(items)
+}
+
 // DequeueBatch retrieves the oldest items from the queue for a given org
 // that are older than minAge (grace period). Returns up to batchSize items.
 func (q *Queue) DequeueBatch(orgID uuid.UUID, batchSize int, minAge time.Duration) ([]QueueItem, error) {

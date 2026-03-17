@@ -262,6 +262,10 @@ func (h *DeletedLibraryHandler) PermanentDeleteRepo(c *gin.Context) {
 	batch := h.db.Session().Batch(gocql.LoggedBatch)
 	batch.Query(`DELETE FROM libraries WHERE org_id = ? AND library_id = ?`, orgID, repoID)
 	batch.Query(`DELETE FROM libraries_by_id WHERE library_id = ?`, repoID)
+	
+	// Preserve the org lookup for the Garbage Collector
+	batch.Query(`INSERT INTO deleted_libraries (library_id, org_id, deleted_at) VALUES (?, ?, ?)`, repoID, orgID, time.Now())
+	
 	if err := batch.Exec(); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete library"})
 		return

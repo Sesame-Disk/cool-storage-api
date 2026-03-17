@@ -122,27 +122,26 @@ func (w *Worker) processItem(ctx context.Context, item QueueItem) error {
 }
 
 func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
-	// Re-verify ref_count is still 0 before deleting
-	refCount, err := w.store.GetBlockRefCount(item.OrgID, item.ItemID)
-	if err != nil {
-		// Block may already be deleted
-		log.Printf("[GC Worker] Block %s not found (may already be deleted): %v", item.ItemID, err)
+	if w.dryRun {
+		log.Printf("[GC Worker] DRY RUN: Would conditionally delete block %s from DB and S3", item.ItemID)
 		return nil
 	}
 
-	if refCount > 0 {
-		// Block was re-referenced during grace period, skip deletion
-		log.Printf("[GC Worker] Block %s ref_count=%d, skipping deletion", item.ItemID, refCount)
+	// 1. Delete block record from DB using LWT (IF ref_count <= 0)
+	applied, err := w.store.DeleteBlock(item.OrgID, item.ItemID)
+	if err != nil {
+		return fmt.Errorf("failed to execute LWT delete for block record: %w", err)
+	}
+
+	// 2. If it didn't apply, it means ref_count > 0 or it was already deleted.
+	// We skip deleting from S3 to avoid data loss.
+	if !applied {
+		log.Printf("[GC Worker] Block %s LWT delete not applied (ref_count > 0 or already deleted), skipping S3 deletion", item.ItemID)
 		metrics.GCItemsSkippedTotal.Inc()
 		return nil
 	}
 
-	if w.dryRun {
-		log.Printf("[GC Worker] DRY RUN: Would delete block %s from S3 and DB", item.ItemID)
-		return nil
-	}
-
-	// Delete from S3
+	// 3. Since DB delete succeeded (ref_count was 0), now safely delete from S3
 	storageClass := item.StorageClass
 	if storageClass == "" {
 		storageClass = "hot"
@@ -154,16 +153,14 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 			return fmt.Errorf("failed to get block store for class %s: %w", storageClass, err)
 		}
 		if err := blockStore.DeleteBlock(ctx, item.ItemID); err != nil {
+			// S3 deletion failed, but DB record is gone.
+			// This leaves an orphan in S3, which is safer than deleting live data.
+			log.Printf("[GC Worker] WARNING: Failed to delete block %s from S3 after DB deletion: %v", item.ItemID, err)
 			return fmt.Errorf("failed to delete block from S3: %w", err)
 		}
 	}
 
-	// Delete block record from DB
-	if err := w.store.DeleteBlock(item.OrgID, item.ItemID); err != nil {
-		return fmt.Errorf("failed to delete block record: %w", err)
-	}
-
-	// Delete block_id_mappings using reverse lookup (avoids full org scan)
+	// 4. Clean up related mappings
 	mappings, err := w.store.ListBlockMappingsByInternalID(item.OrgID, item.ItemID)
 	if err == nil {
 		for _, mapping := range mappings {
@@ -213,17 +210,62 @@ func (w *Worker) processFSObject(ctx context.Context, item QueueItem) error {
 	}
 
 	// If it's a directory, enqueue child fs_objects for recursive deletion
-	for _, childID := range fsObj.DirEntries {
-		w.queue.Enqueue(item.OrgID, ItemFSObject, childID, item.LibraryID, "")
+	if len(fsObj.DirEntries) > 0 {
+		var batch []QueueItem
+		now := time.Now()
+		for _, childID := range fsObj.DirEntries {
+			batch = append(batch, QueueItem{
+				OrgID:        item.OrgID,
+				QueuedAt:     now,
+				ItemType:     ItemFSObject,
+				ItemID:       childID,
+				LibraryID:    item.LibraryID,
+				StorageClass: "",
+				RetryCount:   0,
+			})
+		}
+		if err := w.queue.EnqueueBatch(batch); err != nil {
+			log.Printf("[GC Worker] Failed to batch enqueue children for %s: %v", item.ItemID, err)
+			return err
+		}
 	}
 
-	// If it's a file with blocks, decrement ref counts and enqueue blocks that hit 0
+	// If it's a file with blocks, decrement ref counts
 	if len(fsObj.BlockIDs) > 0 {
-		zeroRefBlocks := w.decrementAndFindZeroRef(item.OrgID, fsObj.BlockIDs)
-		storageClass, _ := w.store.GetLibraryStorageClass(item.OrgID, item.LibraryID)
+		// Create a deterministic task ID for this specific decrement operation
+		// based on the fs_object and the specific queue item timestamp to ensure 
+		// retries of this exact queue item don't double-decrement.
+		taskIDStr := fmt.Sprintf("%s-%d", item.ItemID, item.QueuedAt.UnixNano())
+		taskID := uuid.NewMD5(uuid.NameSpaceOID, []byte(taskIDStr))
 
-		for _, blockID := range zeroRefBlocks {
-			w.queue.Enqueue(item.OrgID, ItemBlock, blockID, item.LibraryID, storageClass)
+		applied, err := w.store.MarkItemProcessed(taskID)
+		if err != nil {
+			return fmt.Errorf("failed to check idempotency for fs_object %s: %w", item.ItemID, err)
+		}
+
+		if applied {
+			// First time processing this exact task, safe to decrement
+			zeroRefBlocks := w.decrementAndFindZeroRef(item.OrgID, fsObj.BlockIDs)
+			storageClass, _ := w.store.GetLibraryStorageClass(item.OrgID, item.LibraryID)
+
+			var blockBatch []QueueItem
+			now := time.Now()
+			for _, blockID := range zeroRefBlocks {
+				blockBatch = append(blockBatch, QueueItem{
+					OrgID:        item.OrgID,
+					QueuedAt:     now,
+					ItemType:     ItemBlock,
+					ItemID:       blockID,
+					LibraryID:    item.LibraryID,
+					StorageClass: storageClass,
+					RetryCount:   0,
+				})
+			}
+			if len(blockBatch) > 0 {
+				w.queue.EnqueueBatch(blockBatch)
+			}
+		} else {
+			log.Printf("[GC Worker] Skipping decrement for %s (already processed task %s)", item.ItemID, taskID)
 		}
 	}
 
@@ -260,7 +302,7 @@ func (w *Worker) processShareLink(ctx context.Context, item QueueItem) error {
 		return nil
 	}
 
-	if err := w.store.DeleteShareLink(item.ItemID); err != nil {
+	if err := w.store.DeleteShareLink(item.ItemID, item.OrgID, item.LibraryID); err != nil {
 		return fmt.Errorf("failed to delete share link: %w", err)
 	}
 

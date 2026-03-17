@@ -361,6 +361,15 @@ func (m *MockStore) EnqueueItem(orgID uuid.UUID, queuedAt time.Time, itemType It
 	return nil
 }
 
+func (m *MockStore) EnqueueBatch(items []QueueItem) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, item := range items {
+		m.queue[item.OrgID] = append(m.queue[item.OrgID], item)
+	}
+	return nil
+}
+
 func (m *MockStore) DequeueBatch(orgID uuid.UUID, batchSize int, cutoff time.Time) ([]QueueItem, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -439,6 +448,20 @@ func (m *MockStore) ListOrgsWithQueuedItems() ([]uuid.UUID, error) {
 	return orgs, nil
 }
 
+func (m *MockStore) MarkItemProcessed(taskID uuid.UUID) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	key := taskID.String()
+	if _, exists := m.gcStats[key]; exists {
+		return false, nil
+	}
+	
+	// Mock TTL by just setting it in gcStats for now
+	m.gcStats[key] = "processed"
+	return true, nil
+}
+
 func (m *MockStore) GetBlockRefCount(orgID uuid.UUID, blockID string) (int, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -451,13 +474,21 @@ func (m *MockStore) GetBlockRefCount(orgID uuid.UUID, blockID string) (int, erro
 	return b.RefCount, nil
 }
 
-func (m *MockStore) DeleteBlock(orgID uuid.UUID, blockID string) error {
+func (m *MockStore) DeleteBlock(orgID uuid.UUID, blockID string) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	key := fmt.Sprintf("%s:%s", orgID, blockID)
+	b, ok := m.blocks[key]
+	if !ok {
+		return false, nil
+	}
+	if b.RefCount > 0 {
+		return false, nil
+	}
+
 	delete(m.blocks, key)
-	return nil
+	return true, nil
 }
 
 func (m *MockStore) DecrementBlockRefCount(orgID uuid.UUID, blockID string) error {
@@ -760,7 +791,7 @@ func (m *MockStore) ListCommitsWithTimestamps(libraryID uuid.UUID) ([]CommitWith
 	return commits, nil
 }
 
-func (m *MockStore) DeleteShareLink(shareToken string) error {
+func (m *MockStore) DeleteShareLink(shareToken string, orgID uuid.UUID, libraryID uuid.UUID) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	delete(m.shareLinks, shareToken)

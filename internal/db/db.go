@@ -133,7 +133,10 @@ func (db *DB) Migrate() error {
 		migrationCreateCustomSharePermissionsByUser,
 		migrationCreateGCQueue,
 		migrationCreateGCStats,
+		migrationCreateGCQueueStats,
 		migrationCreateBlockIDMappingsByInternal,
+		migrationCreateGCProcessedItems,
+		migrationCreateDeletedLibraries,
 	}
 
 	for _, migration := range migrations {
@@ -749,13 +752,35 @@ CREATE TABLE IF NOT EXISTS gc_stats (
 	updated_at TIMESTAMP
 )`
 
+// GC queue stats for atomic queue size tracking
+const migrationCreateGCQueueStats = `
+CREATE TABLE IF NOT EXISTS gc_queue_stats (
+	stat_key TEXT PRIMARY KEY,
+	queue_size COUNTER
+)`
+
 // Reverse lookup for block_id_mappings by internal_id (SHA-256)
 // Avoids full org scan when deleting a block and its mappings
 const migrationCreateBlockIDMappingsByInternal = `
 CREATE TABLE IF NOT EXISTS block_id_mappings_by_internal (
 	org_id UUID,
-	internal_id TEXT,
-	external_id TEXT,
-	created_at TIMESTAMP,
 	PRIMARY KEY ((org_id), internal_id, external_id)
+)`
+
+// GC processed items to ensure worker idempotency.
+// Records processed queue items (by combination of attributes) with a TTL to prevent 
+// double-decrement of ref_counts if the queue fails to acknowledge quickly.
+const migrationCreateGCProcessedItems = `
+CREATE TABLE IF NOT EXISTS gc_processed_items (
+	task_id UUID PRIMARY KEY
+) WITH default_time_to_live = 172800` // 48 hours TTL
+
+// deleted_libraries keeps track of libraries that have been permanently deleted
+// to allow background garbage collection (which only has library_id) 
+// to resolve the org_id of orphaned items.
+const migrationCreateDeletedLibraries = `
+CREATE TABLE IF NOT EXISTS deleted_libraries (
+	library_id UUID PRIMARY KEY,
+	org_id UUID,
+	deleted_at TIMESTAMP
 )`

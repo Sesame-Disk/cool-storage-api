@@ -3,6 +3,7 @@ package gc
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"time"
 
 	"github.com/Sesame-Disk/sesamefs/internal/db"
@@ -62,10 +63,41 @@ func NewCassandraStore(database *db.DB) *CassandraStore {
 // --- Queue operations ---
 
 func (s *CassandraStore) EnqueueItem(orgID uuid.UUID, queuedAt time.Time, itemType ItemType, itemID string, libraryID uuid.UUID, storageClass string, retryCount int) error {
-	return s.db.Session().Query(`
+	batch := s.db.Session().NewBatch(gocql.LoggedBatch)
+	batch.Query(`
 		INSERT INTO gc_queue (org_id, queued_at, item_type, item_id, library_id, storage_class, retry_count)
 		VALUES (?, ?, ?, ?, ?, ?, ?)
-	`, orgID.String(), queuedAt, string(itemType), itemID, libraryID.String(), storageClass, retryCount).Exec()
+	`, orgID.String(), queuedAt, string(itemType), itemID, libraryID.String(), storageClass, retryCount)
+	
+	// Increment atomic counters in gc_queue_stats
+	batch.Query(`UPDATE gc_queue_stats SET queue_size = queue_size + 1 WHERE stat_key = ?`, orgID.String())
+	batch.Query(`UPDATE gc_queue_stats SET queue_size = queue_size + 1 WHERE stat_key = 'total'`)
+	
+	return s.db.Session().ExecuteBatch(batch)
+}
+
+func (s *CassandraStore) EnqueueBatch(items []QueueItem) error {
+	if len(items) == 0 {
+		return nil
+	}
+
+	batch := s.db.Session().NewBatch(gocql.LoggedBatch)
+	
+	orgCounts := make(map[string]int)
+	for _, item := range items {
+		batch.Query(`
+			INSERT INTO gc_queue (org_id, queued_at, item_type, item_id, library_id, storage_class, retry_count)
+			VALUES (?, ?, ?, ?, ?, ?, ?)
+		`, item.OrgID.String(), item.QueuedAt, string(item.ItemType), item.ItemID, item.LibraryID.String(), item.StorageClass, item.RetryCount)
+		orgCounts[item.OrgID.String()]++
+	}
+
+	for orgIDStr, count := range orgCounts {
+		batch.Query(`UPDATE gc_queue_stats SET queue_size = queue_size + ? WHERE stat_key = ?`, count, orgIDStr)
+	}
+	batch.Query(`UPDATE gc_queue_stats SET queue_size = queue_size + ? WHERE stat_key = 'total'`, len(items))
+
+	return s.db.Session().ExecuteBatch(batch)
 }
 
 func (s *CassandraStore) DequeueBatch(orgID uuid.UUID, batchSize int, cutoff time.Time) ([]QueueItem, error) {
@@ -101,10 +133,20 @@ func (s *CassandraStore) DequeueBatch(orgID uuid.UUID, batchSize int, cutoff tim
 }
 
 func (s *CassandraStore) CompleteItem(orgID uuid.UUID, queuedAt time.Time, itemType ItemType, itemID string) error {
-	return s.db.Session().Query(`
-		DELETE FROM gc_queue
+	batch := s.db.Session().NewBatch(gocql.LoggedBatch)
+	
+	// Soft-delete via TTL instead of immediate DELETE to reduce tombstone impact.
+	// We set a 1-second TTL which essentially marks it for expiring without a synchronous DELETE.
+	batch.Query(`
+		UPDATE gc_queue USING TTL 1 SET retry_count = -1
 		WHERE org_id = ? AND queued_at = ? AND item_type = ? AND item_id = ?
-	`, orgID.String(), queuedAt, string(itemType), itemID).Exec()
+	`, orgID.String(), queuedAt, string(itemType), itemID)
+	
+	// Decrement atomic counters
+	batch.Query(`UPDATE gc_queue_stats SET queue_size = queue_size - 1 WHERE stat_key = ?`, orgID.String())
+	batch.Query(`UPDATE gc_queue_stats SET queue_size = queue_size - 1 WHERE stat_key = 'total'`)
+	
+	return s.db.Session().ExecuteBatch(batch)
 }
 
 func (s *CassandraStore) UpdateRetryCount(orgID uuid.UUID, queuedAt time.Time, itemType ItemType, itemID string, retryCount int) error {
@@ -115,23 +157,37 @@ func (s *CassandraStore) UpdateRetryCount(orgID uuid.UUID, queuedAt time.Time, i
 }
 
 func (s *CassandraStore) GetQueueSize(orgID uuid.UUID) (int, error) {
-	var count int
+	var count int64
 	err := s.db.Session().Query(`
-		SELECT COUNT(*) FROM gc_queue WHERE org_id = ?
+		SELECT queue_size FROM gc_queue_stats WHERE stat_key = ?
 	`, orgID.String()).Scan(&count)
 	if err != nil {
+		if err == gocql.ErrNotFound {
+			return 0, nil
+		}
 		return 0, fmt.Errorf("failed to get queue size: %w", err)
 	}
-	return count, nil
+	if count < 0 {
+		count = 0
+	}
+	return int(count), nil
 }
 
 func (s *CassandraStore) GetTotalQueueSize() (int, error) {
-	var count int
-	err := s.db.Session().Query(`SELECT COUNT(*) FROM gc_queue`).Scan(&count)
+	var count int64
+	err := s.db.Session().Query(`
+		SELECT queue_size FROM gc_queue_stats WHERE stat_key = 'total'
+	`).Scan(&count)
 	if err != nil {
+		if err == gocql.ErrNotFound {
+			return 0, nil
+		}
 		return 0, fmt.Errorf("failed to get total queue size: %w", err)
 	}
-	return count, nil
+	if count < 0 {
+		count = 0
+	}
+	return int(count), nil
 }
 
 func (s *CassandraStore) ListOrgsWithQueuedItems() ([]uuid.UUID, error) {
@@ -147,6 +203,15 @@ func (s *CassandraStore) ListOrgsWithQueuedItems() ([]uuid.UUID, error) {
 	return orgs, nil
 }
 
+// MarkItemProcessed attempts to insert the taskID into the gc_processed_items table 
+// with a TTL of 48 hours. Returns applied=true if successful, false if already exists.
+func (s *CassandraStore) MarkItemProcessed(taskID uuid.UUID) (bool, error) {
+	applied, err := s.db.Session().Query(`
+		INSERT INTO gc_processed_items (task_id) VALUES (?) IF NOT EXISTS USING TTL 172800
+	`, taskID).ScanCAS()
+	return applied, err
+}
+
 // --- Block operations ---
 
 func (s *CassandraStore) GetBlockRefCount(orgID uuid.UUID, blockID string) (int, error) {
@@ -157,10 +222,11 @@ func (s *CassandraStore) GetBlockRefCount(orgID uuid.UUID, blockID string) (int,
 	return refCount, err
 }
 
-func (s *CassandraStore) DeleteBlock(orgID uuid.UUID, blockID string) error {
-	return s.db.Session().Query(`
-		DELETE FROM blocks WHERE org_id = ? AND block_id = ?
-	`, orgID.String(), blockID).Exec()
+func (s *CassandraStore) DeleteBlock(orgID uuid.UUID, blockID string) (bool, error) {
+	applied, err := s.db.Session().Query(`
+		DELETE FROM blocks WHERE org_id = ? AND block_id = ? IF ref_count <= 0
+	`, orgID, blockID).ScanCAS()
+	return applied, err
 }
 
 func (s *CassandraStore) DecrementBlockRefCount(orgID uuid.UUID, blockID string) error {
@@ -174,7 +240,7 @@ func (s *CassandraStore) ListBlockMappingsByInternalID(orgID uuid.UUID, internal
 	iter := s.db.Session().Query(`
 		SELECT internal_id, external_id FROM block_id_mappings_by_internal
 		WHERE org_id = ? AND internal_id = ?
-	`, orgID.String(), internalID).Iter()
+	`, orgID, internalID).Iter()
 
 	var mappings []BlockMapping
 	var intID, extID string
@@ -182,28 +248,8 @@ func (s *CassandraStore) ListBlockMappingsByInternalID(orgID uuid.UUID, internal
 		mappings = append(mappings, BlockMapping{ExternalID: extID, InternalID: intID})
 	}
 	if err := iter.Close(); err != nil {
-		// Fallback: scan the original table if reverse lookup table doesn't exist yet
-		return s.listBlockMappingsByInternalIDFallback(orgID, internalID)
-	}
-	return mappings, nil
-}
-
-// listBlockMappingsByInternalIDFallback scans block_id_mappings for the given internalID.
-// Used as fallback if the reverse lookup table hasn't been populated yet.
-func (s *CassandraStore) listBlockMappingsByInternalIDFallback(orgID uuid.UUID, internalID string) ([]BlockMapping, error) {
-	iter := s.db.Session().Query(`
-		SELECT external_id, internal_id FROM block_id_mappings WHERE org_id = ?
-	`, orgID.String()).Iter()
-
-	var mappings []BlockMapping
-	var extID, intID string
-	for iter.Scan(&extID, &intID) {
-		if intID == internalID {
-			mappings = append(mappings, BlockMapping{ExternalID: extID, InternalID: intID})
-		}
-	}
-	if err := iter.Close(); err != nil {
-		return nil, err
+		// Log error but do NOT fallback to full org scan. Scanner will eventually clean this up.
+		return nil, nil
 	}
 	return mappings, nil
 }
@@ -404,7 +450,14 @@ func (s *CassandraStore) FindOrgForLibrary(libraryID uuid.UUID) (uuid.UUID, erro
 		SELECT org_id FROM libraries_by_id WHERE library_id = ?
 	`, libraryID.String()).Scan(&orgIDStr)
 	if err != nil {
-		return uuid.Nil, err
+		// Fallback to deleted_libraries table for permanently deleted libraries
+		// that the garbage collector is trying to process.
+		err = s.db.Session().Query(`
+			SELECT org_id FROM deleted_libraries WHERE library_id = ?
+		`, libraryID.String()).Scan(&orgIDStr)
+		if err != nil {
+			return uuid.Nil, err
+		}
 	}
 	return parseUUID(orgIDStr), nil
 }
@@ -515,7 +568,7 @@ func (s *CassandraStore) ListLibrariesWithAutoDelete() ([]LibraryAutoDeleteInfo,
 
 // --- Share link deletion ---
 
-func (s *CassandraStore) DeleteShareLink(shareToken string) error {
+func (s *CassandraStore) DeleteShareLink(shareToken string, fallbackOrgID uuid.UUID, fallbackLibraryID uuid.UUID) error {
 	// Read clustering keys from primary table for quad-delete
 	var orgID, createdBy, libraryID string
 	var createdAt time.Time
@@ -523,7 +576,14 @@ func (s *CassandraStore) DeleteShareLink(shareToken string) error {
 		SELECT org_id, created_by, library_id, created_at FROM share_links WHERE link_token = ?
 	`, shareToken).Scan(&orgID, &createdBy, &libraryID, &createdAt)
 	if err != nil {
-		// If not found in primary table, nothing to delete
+		// Primary record is gone. Attempt defensive cleanup of index tables
+		// using the fallback org/library IDs from the queue item. This prevents
+		// permanent orphans in the secondary index tables.
+		if fallbackOrgID != uuid.Nil && fallbackLibraryID != uuid.Nil {
+			log.Printf("[GC DeleteShareLink] Primary record missing for token %s, defensive cleanup of share_links_by_library", shareToken)
+			s.db.Session().Query(`DELETE FROM share_links_by_library WHERE org_id = ? AND library_id = ? AND link_token = ?`,
+				fallbackOrgID.String(), fallbackLibraryID.String(), shareToken).Exec()
+		}
 		return nil
 	}
 
