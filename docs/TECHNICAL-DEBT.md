@@ -383,10 +383,11 @@ Fixed. SeafHTTP endpoints (`HandleUpload`, `HandleDownload`, `HandleZipDownload`
 
 ---
 
-## 9. Library Deletion: Three Incomplete Cleanup Paths — ⚠️ PENDING
+## 9. Library Deletion: Cleanup Paths — ✅ RESOLVED (2026-03-17), Gap B pending
 
 ### Status
-Known gaps. Fully documented 2026-02-24. Implementation planned (see below).
+~~Known gaps. Fully documented 2026-02-24. Implementation planned (see below).~~
+**Resolved** (2026-03-17): GC worker now cleans all library artifacts (shares, share links, tags, API tokens, locked files) via `enqueueLibraryArtifacts`. Scanner Phase 7 cleans expired user-to-user shares. Only Gap B (`CleanRepoTrash` stub) remains.
 
 ### Overview
 
@@ -394,23 +395,26 @@ There are **three code paths** that should clean up library-related data but eac
 
 | Path | Endpoint | File/object data | `shares` | `share_links` | `upload_links` |
 |------|----------|-----------------|----------|---------------|----------------|
-| User permanent delete | `DELETE /repos/deleted/:id/` | ✅ GC async | ❌ orphan | ❌ orphan | ❌ orphan |
-| Admin bulk clean | `DELETE /admin/trash-libraries/` | ✅ GC async | ❌ orphan | ❌ orphan | ❌ orphan |
-| GC auto-delete scanner (Phase 6) | background / `auto_delete_days` | ✅ fs_objects enqueued | ❌ orphan | ❌ orphan | ❌ orphan |
+| User permanent delete | `DELETE /repos/deleted/:id/` | ✅ GC async | ✅ GC async (artifacts) | ✅ GC async (artifacts) | ✅ GC async (artifacts) |
+| Admin bulk clean | `DELETE /admin/trash-libraries/` | ✅ GC async | ✅ GC async (artifacts) | ✅ GC async (artifacts) | ✅ GC async (artifacts) |
+| GC auto-delete scanner (Phase 6) | background / `auto_delete_days` | ✅ fs_objects enqueued | ✅ Phase 7 (shares) / artifacts (links) | ✅ via artifacts | ✅ via artifacts |
 | User file-trash clean | `DELETE /repos/:id/trash/` | **stub — nothing** | — | — | — |
 
 ---
 
-### Gap A: Orphaned `shares`, `share_links` ~~, `upload_links`~~
+### Gap A: Orphaned `shares`, `share_links` ~~, `upload_links`~~ — ✅ RESOLVED (2026-03-17)
 
-~~Affects all four paths above.~~ **Partially resolved** (2026-03-13): Share/upload links are now cleaned via `share_links_by_library` lookup table when a library is permanently deleted. See `docs/SHARE-LINKS-UNIFICATION.md` § 11.7.
+**Fully resolved** (2026-03-17): GC worker `enqueueLibraryArtifacts()` now cleans all library artifacts on permanent delete:
 
 | Table | Partition Key | Status |
 |-------|---------------|--------|
-| `shares` | `library_id` | **Still orphaned** — efficient to clean, not yet hooked in |
-| `share_links` (unified) | `link_token` | **Resolved** — `cleanupLibraryLinks()` via `share_links_by_library` |
+| `shares` + `shares_by_user` | `library_id` | ✅ **Resolved** — `ListSharesByLibrary` → `DeleteShare` in GC worker |
+| `share_links` (all 4 tables) | `link_token` | ✅ **Resolved** — `DeleteShareLinksByLibrary` in GC worker |
+| `repo_tags` + `file_tags` | `library_id` | ✅ **Resolved** — `cleanupLibraryTags` in GC worker |
+| `repo_api_tokens` | `library_id` | ✅ **Resolved** — `ListRepoAPITokensByLibrary` → `DeleteRepoAPIToken` |
+| `locked_files` | `repo_id` | ✅ **Resolved** — `DeleteLockedFilesByLibrary` |
 
-**Remaining work**: Hook `shares` cleanup into `PermanentDeleteRepo`. Tracked as `ISSUE-GC-ORPHANS-01` in `docs/KNOWN_ISSUES.md`.
+Additionally, scanner **Phase 7** catches expired user-to-user shares independently.
 
 ---
 
@@ -436,11 +440,11 @@ What the endpoint should do:
 
 ---
 
-### Gap C: GC Phase 6 does not clean shares/links after `auto_delete_days`
+### Gap C: GC Phase 6 does not clean shares/links after `auto_delete_days` — ✅ RESOLVED (2026-03-17)
 
-`scanAutoDeleteExpiredObjects` (Phase 6 of the GC scanner) runs periodically and prunes old fs_objects when `auto_delete_days` is configured for a library. It correctly enqueues orphaned fs_objects for deletion — but it does not clean `shares`, `share_links`, or `upload_links` that may point to file paths within those deleted versions.
+~~`scanAutoDeleteExpiredObjects` (Phase 6) didn't clean shares/links for expired versions.~~
 
-This is lower severity than Gap A (files themselves are gone; link tokens just 404) but contributes to the same DB bloat.
+**Resolved**: Scanner Phase 7 (`scanExpiredShares`) now cleans expired user-to-user shares independently. Share links with `expires_at` are auto-cleaned by scanner Phase 2. When a library is fully deleted, `enqueueLibraryArtifacts` cleans all remaining artifacts.
 
 ---
 
@@ -456,63 +460,22 @@ GC Phase 6:
 
 ---
 
-### Implementation Plan
+### Implementation Status
 
-#### Step 1 — New lookup tables (DB migration)
-```sql
-CREATE TABLE IF NOT EXISTS share_links_by_library (
-    org_id     UUID,
-    library_id UUID,
-    token      TEXT,
-    PRIMARY KEY ((org_id, library_id), token)
-);
+| Step | Description | Status |
+|------|-------------|--------|
+| 1 | Lookup tables (`share_links_by_library`) | ✅ Done (2026-03-13) |
+| 2 | Dual-write in share link creation/deletion | ✅ Done (2026-03-13) |
+| 3 | Cleanup on permanent delete (Gap A) | ✅ Done (2026-03-17) — `enqueueLibraryArtifacts` in GC worker |
+| 4 | Implement `CleanRepoTrash` (Gap B) | ❌ Pending — `trash.go` still a stub |
+| 5 | GC scanner orphan phases | ✅ Done (2026-03-17) — Phases 7+8 (shares, restore jobs) |
+| 6 | Tests | ✅ Done (2026-03-17) — scanner + worker tests updated |
 
-CREATE TABLE IF NOT EXISTS upload_links_by_library (
-    org_id     UUID,
-    library_id UUID,
-    token      TEXT,
-    PRIMARY KEY ((org_id, library_id), token)
-);
-```
+### Remaining: Gap B (`CleanRepoTrash`)
 
-#### Step 2 — Dual-write in share/upload link creation/deletion
-Update `CreateShareLink`, `DeleteShareLink`, `CreateUploadLink`, `DeleteUploadLink` handlers to write/delete in the new tables alongside the existing ones.
-
-#### Step 3 — Inline cleanup on permanent delete (fixes Gap A)
-Add `go cleanupLibraryRelatedData(h.db, orgID, repoID)` in both `PermanentDeleteRepo` and `AdminCleanTrashLibraries`:
-1. `DELETE FROM shares WHERE library_id = ?`
-2. `SELECT token FROM share_links_by_library WHERE org_id=? AND library_id=?` → batch-delete `share_links` + `share_links_by_library`
-3. Same for upload_links
-
-#### Step 4 — Implement `CleanRepoTrash` properly (fixes Gap B)
-Replace stub with real logic:
-1. Get all commits for the library ordered by timestamp
-2. Keep: HEAD commit + any commit within `keep_days`
-3. For all other commits: enqueue their fs_objects via GC
-4. Delete commit rows
-
-#### Step 5 — GC scanner orphan phase (fixes Gap A historical backlog)
-New scanner phase in `internal/gc/scanner.go`:
-- Scan `shares` — verify `library_id` in `libraries_by_id`; delete if not found
-- Scan `share_links_by_library` + `upload_links_by_library` — same check
-
-#### Step 6 — Tests
-- Unit test for `cleanupLibraryRelatedData`
-- Unit test for new `CleanRepoTrash` logic (mock GC enqueuer)
-- Integration test: create library → add share + link → delete library → verify cleanup
-- GC scanner test for orphan detection phase
-
-### Risk
-- Gap A + C: Low — scoped to rows whose `library_id` no longer exists
-- Gap B: Medium — `CleanRepoTrash` currently returns 200 (no user-visible regression); implementation must be careful not to prune commits that blocks in use
-
-### Files to Touch
-- `internal/db/db.go` — new tables
-- `internal/api/v2/share_links.go` — dual-write
-- `internal/api/v2/upload_links.go` — dual-write
-- `internal/api/v2/deleted_libraries.go` — inline cleanup in `PermanentDeleteRepo`
-- `internal/api/v2/admin.go` — inline cleanup in `AdminCleanTrashLibraries`
+**Files to touch:**
 - `internal/api/v2/trash.go` — implement `CleanRepoTrash`
+- `internal/gc/store.go` / `store_cassandra.go` — may need `ListCommitsWithTimestamps` per library
 - `internal/gc/scanner.go` — new orphan detection phase
 
 ---
@@ -562,4 +525,4 @@ All inline HTML has been migrated from Go source files to `html/template` files 
 
 ---
 
-*Last updated: 2026-03-05*
+*Last updated: 2026-03-17*

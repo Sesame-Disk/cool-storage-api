@@ -146,15 +146,15 @@ Format:
 - **Frozen**: 2026-02-04 — 90.8% Go coverage, all error paths tested, stable since 2026-01-13 (20+ sessions without code changes)
 
 ### Garbage Collection
-- **Status**: ✅ COMPLETE
+- **Status**: ✅ COMPLETE (major overhaul 2026-03-17)
 - **Go packages**: `internal/gc/`
-- **Go unit test coverage**: ~40% (measured 2026-01-29)
-- **Go test files**: `internal/gc/scanner_test.go`, `internal/gc/worker_test.go`
+- **Go unit test coverage**: ~65% (measured 2026-03-17)
+- **Go test files**: `gc_test.go`, `queue_test.go`, `worker_test.go`, `scanner_test.go`
 - **Integration test scripts**: `scripts/test-gc.sh` (21 assertions)
 - **Integration endpoint coverage**: 4/4 admin GC endpoints (100%)
 - **Frontend files**: N/A
 - **Open bugs**: none
-- **Soak started**: 2026-02-04 (auto_delete_days enforced, all TTL phases complete)
+- **2026-03-17 overhaul**: 7 item types, 8 scanner phases, cascade deletion, artifact cleanup, stats persistence, reverse lookup table, iterative tree walk. ISSUE-GC-ORPHANS-01 resolved.
 
 ### Permission Middleware
 - **Status**: ✅ COMPLETE

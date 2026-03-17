@@ -669,13 +669,18 @@ func (h *OnlyOfficeHandler) saveEditedDocument(ctx context.Context, repoID, file
 		}
 	}
 
-	// Create SHA-1 → SHA-256 mapping for sync protocol compatibility
+	// Create SHA-1 → SHA-256 mapping for sync protocol compatibility (dual-write: forward + reverse)
 	if err := h.db.Session().Query(`
 		INSERT INTO block_id_mappings (org_id, external_id, internal_id) VALUES (?, ?, ?)
 	`, orgID, externalBlockID, internalBlockID).Exec(); err != nil {
 		log.Printf("OnlyOffice: Warning - failed to create block mapping: %v", err)
 	} else {
 		log.Printf("OnlyOffice: Created block mapping: %s → %s", externalBlockID[:16], internalBlockID[:16])
+	}
+	if err := h.db.Session().Query(`
+		INSERT INTO block_id_mappings_by_internal (org_id, internal_id, external_id, created_at) VALUES (?, ?, ?, toTimestamp(now()))
+	`, orgID, internalBlockID, externalBlockID).Exec(); err != nil {
+		log.Printf("OnlyOffice: Warning - failed to create reverse block mapping: %v", err)
 	}
 
 	// Store block metadata using internal (SHA-256) ID

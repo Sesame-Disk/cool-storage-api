@@ -48,6 +48,8 @@ func NewCassandraStore(database *db.DB) *CassandraStore {
 	return &CassandraStore{db: database}
 }
 
+// --- Queue operations ---
+
 func (s *CassandraStore) EnqueueItem(orgID uuid.UUID, queuedAt time.Time, itemType ItemType, itemID string, libraryID uuid.UUID, storageClass string, retryCount int) error {
 	return s.db.Session().Query(`
 		INSERT INTO gc_queue (org_id, queued_at, item_type, item_id, library_id, storage_class, retry_count)
@@ -127,6 +129,8 @@ func (s *CassandraStore) ListOrgsWithQueuedItems() ([]uuid.UUID, error) {
 	return orgs, nil
 }
 
+// --- Block operations ---
+
 func (s *CassandraStore) GetBlockRefCount(orgID uuid.UUID, blockID string) (int, error) {
 	var refCount int
 	err := s.db.Session().Query(`
@@ -148,7 +152,27 @@ func (s *CassandraStore) DecrementBlockRefCount(orgID uuid.UUID, blockID string)
 	`, time.Now(), orgID, blockID).Exec()
 }
 
-func (s *CassandraStore) ListBlockMappings(orgID uuid.UUID) ([]BlockMapping, error) {
+func (s *CassandraStore) ListBlockMappingsByInternalID(orgID uuid.UUID, internalID string) ([]BlockMapping, error) {
+	iter := s.db.Session().Query(`
+		SELECT internal_id, external_id FROM block_id_mappings_by_internal
+		WHERE org_id = ? AND internal_id = ?
+	`, orgID, internalID).Iter()
+
+	var mappings []BlockMapping
+	var intID, extID string
+	for iter.Scan(&intID, &extID) {
+		mappings = append(mappings, BlockMapping{ExternalID: extID, InternalID: intID})
+	}
+	if err := iter.Close(); err != nil {
+		// Fallback: scan the original table if reverse lookup table doesn't exist yet
+		return s.listBlockMappingsByInternalIDFallback(orgID, internalID)
+	}
+	return mappings, nil
+}
+
+// listBlockMappingsByInternalIDFallback scans block_id_mappings for the given internalID.
+// Used as fallback if the reverse lookup table hasn't been populated yet.
+func (s *CassandraStore) listBlockMappingsByInternalIDFallback(orgID uuid.UUID, internalID string) ([]BlockMapping, error) {
 	iter := s.db.Session().Query(`
 		SELECT external_id, internal_id FROM block_id_mappings WHERE org_id = ?
 	`, orgID).Iter()
@@ -156,7 +180,9 @@ func (s *CassandraStore) ListBlockMappings(orgID uuid.UUID) ([]BlockMapping, err
 	var mappings []BlockMapping
 	var extID, intID string
 	for iter.Scan(&extID, &intID) {
-		mappings = append(mappings, BlockMapping{ExternalID: extID, InternalID: intID})
+		if intID == internalID {
+			mappings = append(mappings, BlockMapping{ExternalID: extID, InternalID: intID})
+		}
 	}
 	if err := iter.Close(); err != nil {
 		return nil, err
@@ -165,9 +191,29 @@ func (s *CassandraStore) ListBlockMappings(orgID uuid.UUID) ([]BlockMapping, err
 }
 
 func (s *CassandraStore) DeleteBlockMapping(orgID uuid.UUID, externalID string) error {
-	return s.db.Session().Query(`
-		DELETE FROM block_id_mappings WHERE org_id = ? AND external_id = ?
-	`, orgID, externalID).Exec()
+	// Read the internal_id first for reverse table cleanup
+	var internalID string
+	err := s.db.Session().Query(`
+		SELECT internal_id FROM block_id_mappings WHERE org_id = ? AND external_id = ?
+	`, orgID, externalID).Scan(&internalID)
+
+	batch := s.db.Session().Batch(gocql.UnloggedBatch)
+	batch.Query(`DELETE FROM block_id_mappings WHERE org_id = ? AND external_id = ?`, orgID, externalID)
+	if err == nil && internalID != "" {
+		batch.Query(`DELETE FROM block_id_mappings_by_internal WHERE org_id = ? AND internal_id = ? AND external_id = ?`,
+			orgID, internalID, externalID)
+	}
+	return batch.Exec()
+}
+
+// --- Commit operations ---
+
+func (s *CassandraStore) GetCommit(libraryID uuid.UUID, commitID string) (CommitInfo, error) {
+	var info CommitInfo
+	err := s.db.Session().Query(`
+		SELECT commit_id, root_fs_id FROM commits WHERE library_id = ? AND commit_id = ?
+	`, libraryID, commitID).Scan(&info.CommitID, &info.RootFSID)
+	return info, err
 }
 
 func (s *CassandraStore) DeleteCommit(libraryID uuid.UUID, commitID string) error {
@@ -175,6 +221,8 @@ func (s *CassandraStore) DeleteCommit(libraryID uuid.UUID, commitID string) erro
 		DELETE FROM commits WHERE library_id = ? AND commit_id = ?
 	`, libraryID, commitID).Exec()
 }
+
+// --- FS object operations ---
 
 func (s *CassandraStore) GetFSObject(libraryID uuid.UUID, fsID string) (FSObjectInfo, error) {
 	var info FSObjectInfo
@@ -196,6 +244,8 @@ func (s *CassandraStore) DeleteFSObject(libraryID uuid.UUID, fsID string) error 
 		DELETE FROM fs_objects WHERE library_id = ? AND fs_id = ?
 	`, libraryID, fsID).Exec()
 }
+
+// --- Library operations ---
 
 func (s *CassandraStore) GetLibraryStorageClass(orgID, libraryID uuid.UUID) (string, error) {
 	var storageClass string
@@ -243,6 +293,8 @@ func (s *CassandraStore) ListFSObjectsForLibrary(libraryID uuid.UUID) ([]FSObjec
 	}
 	return objects, nil
 }
+
+// --- Scanner operations ---
 
 func (s *CassandraStore) ListOrganizations() ([]uuid.UUID, error) {
 	iter := s.db.Session().Query(`SELECT org_id FROM organizations`).Iter()
@@ -370,6 +422,8 @@ func (s *CassandraStore) ListFSObjectIDsForLibrary(libraryID uuid.UUID) ([]strin
 	return ids, nil
 }
 
+// --- Version TTL ---
+
 func (s *CassandraStore) ListLibrariesWithVersionTTL() ([]LibraryTTLInfo, error) {
 	iter := s.db.Session().Query(`
 		SELECT org_id, library_id, head_commit_id, version_ttl_days FROM libraries
@@ -391,31 +445,6 @@ func (s *CassandraStore) ListLibrariesWithVersionTTL() ([]LibraryTTLInfo, error)
 	}
 	if err := iter.Close(); err != nil {
 		return nil, fmt.Errorf("failed to list libraries with version TTL: %w", err)
-	}
-	return results, nil
-}
-
-func (s *CassandraStore) ListLibrariesWithAutoDelete() ([]LibraryAutoDeleteInfo, error) {
-	iter := s.db.Session().Query(`
-		SELECT org_id, library_id, head_commit_id, auto_delete_days FROM libraries
-	`).Iter()
-
-	var results []LibraryAutoDeleteInfo
-	var orgID, libraryID uuid.UUID
-	var headCommitID string
-	var autoDeleteDays int
-	for iter.Scan(&orgID, &libraryID, &headCommitID, &autoDeleteDays) {
-		if autoDeleteDays > 0 {
-			results = append(results, LibraryAutoDeleteInfo{
-				OrgID:          orgID,
-				LibraryID:      libraryID,
-				HeadCommitID:   headCommitID,
-				AutoDeleteDays: autoDeleteDays,
-			})
-		}
-	}
-	if err := iter.Close(); err != nil {
-		return nil, fmt.Errorf("failed to list libraries with auto delete: %w", err)
 	}
 	return results, nil
 }
@@ -442,6 +471,35 @@ func (s *CassandraStore) ListCommitsWithTimestamps(libraryID uuid.UUID) ([]Commi
 	return commits, nil
 }
 
+// --- Auto-delete ---
+
+func (s *CassandraStore) ListLibrariesWithAutoDelete() ([]LibraryAutoDeleteInfo, error) {
+	iter := s.db.Session().Query(`
+		SELECT org_id, library_id, head_commit_id, auto_delete_days FROM libraries
+	`).Iter()
+
+	var results []LibraryAutoDeleteInfo
+	var orgID, libraryID uuid.UUID
+	var headCommitID string
+	var autoDeleteDays int
+	for iter.Scan(&orgID, &libraryID, &headCommitID, &autoDeleteDays) {
+		if autoDeleteDays > 0 {
+			results = append(results, LibraryAutoDeleteInfo{
+				OrgID:          orgID,
+				LibraryID:      libraryID,
+				HeadCommitID:   headCommitID,
+				AutoDeleteDays: autoDeleteDays,
+			})
+		}
+	}
+	if err := iter.Close(); err != nil {
+		return nil, fmt.Errorf("failed to list libraries with auto delete: %w", err)
+	}
+	return results, nil
+}
+
+// --- Share link deletion ---
+
 func (s *CassandraStore) DeleteShareLink(shareToken string) error {
 	// Read clustering keys from primary table for quad-delete
 	var orgID, createdBy, libraryID string
@@ -465,6 +523,268 @@ func (s *CassandraStore) DeleteShareLink(shareToken string) error {
 		orgID, libraryID, shareToken)
 	return batch.Exec()
 }
+
+// --- Expired shares (user-to-user) ---
+
+func (s *CassandraStore) ListExpiredShares() ([]ExpiredShareInfo, error) {
+	now := time.Now()
+	// shares table doesn't have a global secondary index on expires_at,
+	// so we need to scan all shares. This is acceptable since it runs every 24h.
+	iter := s.db.Session().Query(`
+		SELECT library_id, share_id, shared_to, expires_at FROM shares
+	`).Iter()
+
+	var results []ExpiredShareInfo
+	var libraryID, shareID, sharedTo uuid.UUID
+	var expiresAt time.Time
+	for iter.Scan(&libraryID, &shareID, &sharedTo, &expiresAt) {
+		if !expiresAt.IsZero() && expiresAt.Before(now) {
+			results = append(results, ExpiredShareInfo{
+				LibraryID: libraryID,
+				ShareID:   shareID,
+				SharedTo:  sharedTo,
+				ExpiresAt: expiresAt,
+			})
+		}
+	}
+	if err := iter.Close(); err != nil {
+		return nil, fmt.Errorf("failed to list expired shares: %w", err)
+	}
+	return results, nil
+}
+
+func (s *CassandraStore) DeleteShare(libraryID, shareID uuid.UUID) error {
+	return s.db.Session().Query(`
+		DELETE FROM shares WHERE library_id = ? AND share_id = ?
+	`, libraryID, shareID).Exec()
+}
+
+func (s *CassandraStore) DeleteShareByUser(sharedTo, libraryID uuid.UUID) error {
+	return s.db.Session().Query(`
+		DELETE FROM shares_by_user WHERE shared_to = ? AND library_id = ?
+	`, sharedTo, libraryID).Exec()
+}
+
+// --- Expired restore jobs ---
+
+func (s *CassandraStore) ListExpiredRestoreJobs() ([]ExpiredRestoreJobInfo, error) {
+	now := time.Now()
+	iter := s.db.Session().Query(`
+		SELECT org_id, library_id, job_id, status, expires_at FROM restore_jobs
+	`).Iter()
+
+	var results []ExpiredRestoreJobInfo
+	var orgID, libraryID, jobID uuid.UUID
+	var status string
+	var expiresAt time.Time
+	for iter.Scan(&orgID, &libraryID, &jobID, &status, &expiresAt) {
+		// Clean up completed jobs or jobs past their expiration
+		if status == "completed" || status == "failed" || (!expiresAt.IsZero() && expiresAt.Before(now)) {
+			results = append(results, ExpiredRestoreJobInfo{
+				OrgID:     orgID,
+				LibraryID: libraryID,
+				JobID:     jobID,
+				Status:    status,
+				ExpiresAt: expiresAt,
+			})
+		}
+	}
+	if err := iter.Close(); err != nil {
+		return nil, fmt.Errorf("failed to list expired restore jobs: %w", err)
+	}
+	return results, nil
+}
+
+func (s *CassandraStore) DeleteRestoreJob(orgID, libraryID, jobID uuid.UUID) error {
+	return s.db.Session().Query(`
+		DELETE FROM restore_jobs WHERE org_id = ? AND library_id = ? AND job_id = ?
+	`, orgID, libraryID, jobID).Exec()
+}
+
+// --- Library artifact cleanup ---
+
+func (s *CassandraStore) ListSharesByLibrary(libraryID uuid.UUID) ([]ShareInfo, error) {
+	iter := s.db.Session().Query(`
+		SELECT library_id, share_id, shared_to FROM shares WHERE library_id = ?
+	`, libraryID).Iter()
+
+	var results []ShareInfo
+	var libID, shareID, sharedTo uuid.UUID
+	for iter.Scan(&libID, &shareID, &sharedTo) {
+		results = append(results, ShareInfo{LibraryID: libID, ShareID: shareID, SharedTo: sharedTo})
+	}
+	if err := iter.Close(); err != nil {
+		return nil, err
+	}
+	return results, nil
+}
+
+func (s *CassandraStore) ListRepoTagsByLibrary(libraryID uuid.UUID) ([]string, error) {
+	iter := s.db.Session().Query(`
+		SELECT tag_id FROM repo_tags WHERE repo_id = ?
+	`, libraryID).Iter()
+
+	var results []string
+	var tagID int
+	for iter.Scan(&tagID) {
+		results = append(results, fmt.Sprintf("%d", tagID))
+	}
+	if err := iter.Close(); err != nil {
+		return nil, err
+	}
+	return results, nil
+}
+
+func (s *CassandraStore) DeleteRepoTag(libraryID uuid.UUID, tagID int) error {
+	return s.db.Session().Query(`
+		DELETE FROM repo_tags WHERE repo_id = ? AND tag_id = ?
+	`, libraryID, tagID).Exec()
+}
+
+func (s *CassandraStore) ListFileTagsByLibrary(libraryID uuid.UUID) ([]FileTagInfo, error) {
+	iter := s.db.Session().Query(`
+		SELECT repo_id, file_path, tag_id, file_tag_id FROM file_tags WHERE repo_id = ?
+	`, libraryID).Iter()
+
+	var results []FileTagInfo
+	var repoID uuid.UUID
+	var filePath string
+	var tagID, fileTagID int
+	for iter.Scan(&repoID, &filePath, &tagID, &fileTagID) {
+		results = append(results, FileTagInfo{
+			RepoID:    repoID,
+			FilePath:  filePath,
+			TagID:     tagID,
+			FileTagID: fileTagID,
+		})
+	}
+	if err := iter.Close(); err != nil {
+		return nil, err
+	}
+	return results, nil
+}
+
+func (s *CassandraStore) DeleteFileTag(libraryID uuid.UUID, filePath string, tagID int) error {
+	return s.db.Session().Query(`
+		DELETE FROM file_tags WHERE repo_id = ? AND file_path = ? AND tag_id = ?
+	`, libraryID, filePath, tagID).Exec()
+}
+
+func (s *CassandraStore) DeleteFileTagByID(libraryID uuid.UUID, fileTagID int) error {
+	return s.db.Session().Query(`
+		DELETE FROM file_tags_by_id WHERE repo_id = ? AND file_tag_id = ?
+	`, libraryID, fileTagID).Exec()
+}
+
+func (s *CassandraStore) ListRepoAPITokensByLibrary(libraryID uuid.UUID) ([]RepoAPITokenInfo, error) {
+	iter := s.db.Session().Query(`
+		SELECT repo_id, app_name, api_token FROM repo_api_tokens WHERE repo_id = ?
+	`, libraryID).Iter()
+
+	var results []RepoAPITokenInfo
+	var repoID uuid.UUID
+	var appName, apiToken string
+	for iter.Scan(&repoID, &appName, &apiToken) {
+		results = append(results, RepoAPITokenInfo{RepoID: repoID, AppName: appName, APIToken: apiToken})
+	}
+	if err := iter.Close(); err != nil {
+		return nil, err
+	}
+	return results, nil
+}
+
+func (s *CassandraStore) DeleteRepoAPIToken(libraryID uuid.UUID, appName string) error {
+	return s.db.Session().Query(`
+		DELETE FROM repo_api_tokens WHERE repo_id = ? AND app_name = ?
+	`, libraryID, appName).Exec()
+}
+
+func (s *CassandraStore) DeleteRepoAPITokenByToken(apiToken string) error {
+	return s.db.Session().Query(`
+		DELETE FROM repo_api_tokens_by_token WHERE api_token = ?
+	`, apiToken).Exec()
+}
+
+func (s *CassandraStore) DeleteLockedFilesByLibrary(libraryID uuid.UUID) error {
+	// First list all locked files for this library, then delete them
+	iter := s.db.Session().Query(`
+		SELECT path FROM locked_files WHERE repo_id = ?
+	`, libraryID).Iter()
+
+	var paths []string
+	var path string
+	for iter.Scan(&path) {
+		paths = append(paths, path)
+	}
+	iter.Close()
+
+	for _, p := range paths {
+		s.db.Session().Query(`
+			DELETE FROM locked_files WHERE repo_id = ? AND path = ?
+		`, libraryID, p).Exec()
+	}
+	return nil
+}
+
+func (s *CassandraStore) DeleteShareLinksByLibrary(orgID, libraryID uuid.UUID) ([]string, error) {
+	// Use the by_library index for efficient lookup
+	iter := s.db.Session().Query(`
+		SELECT link_token, created_by, created_at FROM share_links_by_library
+		WHERE org_id = ? AND library_id = ?
+	`, orgID, libraryID).Iter()
+
+	type linkInfo struct {
+		token     string
+		createdBy string
+		createdAt time.Time
+	}
+
+	var links []linkInfo
+	var token, createdBy string
+	var createdAt time.Time
+	for iter.Scan(&token, &createdBy, &createdAt) {
+		links = append(links, linkInfo{token: token, createdBy: createdBy, createdAt: createdAt})
+	}
+	iter.Close()
+
+	var deletedTokens []string
+	for _, link := range links {
+		batch := s.db.Session().Batch(gocql.LoggedBatch)
+		batch.Query(`DELETE FROM share_links WHERE link_token = ?`, link.token)
+		batch.Query(`DELETE FROM share_links_by_creator WHERE org_id = ? AND created_by = ? AND created_at = ? AND link_token = ?`,
+			orgID, link.createdBy, link.createdAt, link.token)
+		batch.Query(`DELETE FROM share_links_by_org WHERE org_id = ? AND created_at = ? AND link_token = ?`,
+			orgID, link.createdAt, link.token)
+		batch.Query(`DELETE FROM share_links_by_library WHERE org_id = ? AND library_id = ? AND link_token = ?`,
+			orgID, libraryID, link.token)
+		if err := batch.Exec(); err == nil {
+			deletedTokens = append(deletedTokens, link.token)
+		}
+	}
+
+	return deletedTokens, nil
+}
+
+// --- GC stats persistence ---
+
+func (s *CassandraStore) SaveGCStats(key, value string) error {
+	return s.db.Session().Query(`
+		INSERT INTO gc_stats (stat_key, stat_value, updated_at) VALUES (?, ?, ?)
+	`, key, value, time.Now()).Exec()
+}
+
+func (s *CassandraStore) LoadGCStats(key string) (string, error) {
+	var value string
+	err := s.db.Session().Query(`
+		SELECT stat_value FROM gc_stats WHERE stat_key = ?
+	`, key).Scan(&value)
+	if err != nil {
+		return "", err
+	}
+	return value, nil
+}
+
+// --- Storage adapter ---
 
 // StorageManagerAdapter wraps a *storage.Manager to implement StorageProvider.
 type StorageManagerAdapter struct {

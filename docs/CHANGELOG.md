@@ -8,6 +8,59 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-03-17 — Garbage Collection Major Overhaul
+
+**Session Type**: Optimization + Feature
+**Worked By**: Claude
+
+### GC Worker — Rewritten with Cascade Deletion
+
+- **7 item types**: block, commit, fs_object, block_mapping, share_link, share, restore_job
+- **Commit cascade**: `processCommit` now fetches commit → enqueues root fs_object → cascading deletion through tree (was previously deleting commit without cleaning children)
+- **FS object cascade**: `processFSObject` enqueues child dir entries recursively before handling blocks
+- **Library artifact cleanup**: `enqueueLibraryArtifacts` cleans shares, share links, repo tags, file tags, API tokens, locked files on library deletion
+- **Reverse lookup**: `processBlock` uses `block_id_mappings_by_internal` instead of full org scan
+- **EnqueueLibraryContents**: Only enqueues commits + fs_objects — blocks cascade from fs_object processing (previously double-enqueued)
+
+### GC Scanner — 8 Phases + Startup Run
+
+- **Phase 7** (new): `scanExpiredShares` — finds user-to-user shares with `expires_at < now`, deletes directly
+- **Phase 8** (new): `scanExpiredRestoreJobs` — finds completed/failed/expired restore jobs, deletes directly
+- **Startup scan**: Scanner now runs immediately on startup before entering 24h ticker loop (catches anything missed during downtime)
+- **Iterative tree walk**: `walkFSTree` converted from recursive to iterative using explicit stack (prevents stack overflow on deeply nested directories)
+
+### Stats Persistence (Container Restart Recovery)
+
+- `persistStats()` saves `last_worker_run`, `last_scan_run`, `blocks_deleted_total` to `gc_stats` table on shutdown
+- `restoreStats()` loads persisted stats on startup
+- Prometheus counters survive container restarts
+
+### New DB Migration
+
+- `block_id_mappings_by_internal` table — reverse lookup (SHA-256 → SHA-1) for efficient block mapping cleanup without full table scans
+
+### GCStore Interface — Expanded
+
+New methods: `ListBlockMappingsByInternalID`, `GetCommit`, `ListExpiredShares`, `DeleteShare`, `DeleteShareByUser`, `ListExpiredRestoreJobs`, `DeleteRestoreJob`, `ListSharesByLibrary`, `ListRepoTagsByLibrary`, `DeleteRepoTag`, `ListFileTagsByLibrary`, `DeleteFileTag`, `DeleteFileTagByID`, `ListRepoAPITokensByLibrary`, `DeleteRepoAPIToken`, `DeleteRepoAPITokenByToken`, `DeleteLockedFilesByLibrary`, `DeleteShareLinksByLibrary`, `SaveGCStats`, `LoadGCStats`
+
+### Issues Resolved
+
+- **ISSUE-GC-ORPHANS-01**: ✅ Fully resolved — all library artifacts cleaned on delete
+- **Gap A + Gap C** (TECHNICAL-DEBT § 9): ✅ Resolved
+
+### Files Changed
+- `internal/gc/gc.go` — stats persistence + startup scan
+- `internal/gc/worker.go` — complete rewrite with cascade + artifact cleanup
+- `internal/gc/scanner.go` — 2 new phases + iterative tree walk
+- `internal/gc/store.go` — expanded interface + new types
+- `internal/gc/store_cassandra.go` — all new method implementations
+- `internal/gc/store_mock.go` — complete rewrite for new interface
+- `internal/gc/worker_test.go` — updated for cascade + new types
+- `internal/gc/scanner_test.go` — tests for phases 7+8
+- `internal/db/db.go` — `block_id_mappings_by_internal` migration
+
+---
+
 ## 2026-03-12 — Share Dialog Documentation + SHARE_LINK_HMAC_KEY
 
 **Session Type**: Documentation
@@ -428,17 +481,15 @@ admin.DELETE("/trash-libraries", h.AdminCleanTrashLibraries)
 - `PermanentDeleteRepo` in `deleted_libraries.go` — full doc comment listing what is and isn't cleaned
 - `share_links`, `shares`, `upload_links` tables in `db.go` — comments flagging the orphaned-data gap
 
-### Orphaned Data — Three Gaps Documented as Pending Issues
+### Orphaned Data — Three Gaps Documented (A+C resolved, B pending)
 
-Analysis of all deletion paths found **three distinct gaps**:
+**Gap A / ISSUE-GC-ORPHANS-01**: ✅ **Resolved** (2026-03-17) — GC worker `enqueueLibraryArtifacts` now cleans shares, share links, tags, API tokens, locked files on library deletion. Scanner Phase 7 catches expired shares.
 
-**Gap A / ISSUE-GC-ORPHANS-01** (expanded scope): `shares`, `share_links`, `upload_links` orphan on *all* deletion paths — user permanent delete, admin bulk clean, and GC Phase 6 auto-delete by `auto_delete_days`.
+**Gap B / ISSUE-TRASH-CLEAN-01**: ❌ **Pending** — `CleanRepoTrash` (`DELETE /repos/:id/trash/`) is still a stub.
 
-**Gap B / ISSUE-TRASH-CLEAN-01** (new): `CleanRepoTrash` (`DELETE /repos/:id/trash/`) is a complete stub — returns `{"success": true}` without doing anything. GC Phase 6 only runs on libraries with `auto_delete_days` set, not in response to user-triggered requests.
+**Gap C**: ✅ **Resolved** (2026-03-17) — Scanner Phase 7 (expired shares) + Phase 2 (expired share links) + `enqueueLibraryArtifacts` cover all cases.
 
-**Gap C**: GC Phase 6 (`scanAutoDeleteExpiredObjects`) prunes fs_objects/blocks but does not clean shares or links for expired file versions.
-
-Full tracking in `docs/TECHNICAL-DEBT.md` § 9 (Gaps A, B, C) and `docs/KNOWN_ISSUES.md` (ISSUE-GC-ORPHANS-01, ISSUE-TRASH-CLEAN-01).
+Full tracking in `docs/TECHNICAL-DEBT.md` § 9 and `docs/KNOWN_ISSUES.md`.
 
 ### Files Changed
 - `internal/api/v2/admin.go` — route registration + `AdminCleanTrashLibraries` handler

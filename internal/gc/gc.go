@@ -2,7 +2,9 @@ package gc
 
 import (
 	"context"
+	"fmt"
 	"log"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -103,6 +105,9 @@ func (s *Service) Start() {
 		return
 	}
 
+	// Restore persisted stats from database
+	s.restoreStats()
+
 	ctx, cancel := context.WithCancel(context.Background())
 	s.cancel = cancel
 	s.started = true
@@ -114,7 +119,7 @@ func (s *Service) Start() {
 		s.runWorkerLoop(ctx)
 	}()
 
-	// Start scanner goroutine
+	// Start scanner goroutine — runs immediately on startup then on interval
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
@@ -138,6 +143,10 @@ func (s *Service) Stop() {
 	log.Println("[GC] Stopping...")
 	s.cancel()
 	s.wg.Wait()
+
+	// Persist stats to database before shutdown
+	s.persistStats()
+
 	s.started = false
 	log.Println("[GC] Stopped")
 }
@@ -233,6 +242,9 @@ func (s *Service) runWorkerOnce(ctx context.Context) {
 }
 
 func (s *Service) runScannerLoop(ctx context.Context) {
+	// Run scanner immediately on startup to catch anything missed during downtime
+	s.runScannerOnce(ctx)
+
 	ticker := time.NewTicker(s.config.ScanInterval)
 	defer ticker.Stop()
 
@@ -261,4 +273,34 @@ func (s *Service) SetDryRun(dryRun bool) {
 	defer s.mu.Unlock()
 	s.config.DryRun = dryRun
 	s.worker.dryRun = dryRun
+}
+
+// persistStats saves GC stats to the database for recovery after restart.
+func (s *Service) persistStats() {
+	if lastWorker := s.stats.LastWorkerRun(); !lastWorker.IsZero() {
+		s.store.SaveGCStats("last_worker_run", lastWorker.Format(time.RFC3339))
+	}
+	if lastScan := s.stats.LastScanRun(); !lastScan.IsZero() {
+		s.store.SaveGCStats("last_scan_run", lastScan.Format(time.RFC3339))
+	}
+	s.store.SaveGCStats("blocks_deleted_total", fmt.Sprintf("%d", s.stats.BlocksDeleted()))
+}
+
+// restoreStats loads persisted GC stats from the database on startup.
+func (s *Service) restoreStats() {
+	if val, err := s.store.LoadGCStats("last_worker_run"); err == nil && val != "" {
+		if t, err := time.Parse(time.RFC3339, val); err == nil {
+			s.stats.SetLastWorkerRun(t)
+		}
+	}
+	if val, err := s.store.LoadGCStats("last_scan_run"); err == nil && val != "" {
+		if t, err := time.Parse(time.RFC3339, val); err == nil {
+			s.stats.SetLastScanRun(t)
+		}
+	}
+	if val, err := s.store.LoadGCStats("blocks_deleted_total"); err == nil && val != "" {
+		if n, err := strconv.ParseInt(val, 10, 64); err == nil {
+			s.stats.blocksDeleted.Store(n)
+		}
+	}
 }

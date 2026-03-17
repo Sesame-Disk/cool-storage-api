@@ -1727,10 +1727,20 @@ Move/Copy operations fully implemented (batch sync + async variants) with confli
 ## 🚧 BACKEND NOT IMPLEMENTED
 
 ### Garbage Collection — COMPLETE ✅
-**Status**: ✅ Fully implemented (2026-01-30)
+**Status**: ✅ Fully implemented (2026-01-30), major overhaul (2026-03-17)
 **Files**: `internal/gc/` — gc.go, queue.go, worker.go, scanner.go, store.go, store_cassandra.go, gc_hooks.go, gc_adapter.go
 **Tests**: 55 Go unit tests + 21 bash integration tests
 **Admin API**: `GET /api/v2.1/admin/gc/status`, `POST /api/v2.1/admin/gc/run`
+
+**2026-03-17 overhaul:**
+- Worker: 7 item types (block, commit, fs_object, block_mapping, share_link, share, restore_job)
+- Scanner: 8 phases (orphaned blocks/commits/fs_objects, expired share links/versions/auto-delete/shares/restore jobs)
+- Commit deletion now cascades → root fs_object → child entries → blocks (was missing cascade)
+- Library deletion enqueues all artifacts (shares, tags, tokens, locked files)
+- Reverse lookup table `block_id_mappings_by_internal` eliminates full-table scans on block deletion
+- `walkFSTree` converted from recursive to iterative (prevents stack overflow)
+- Stats persisted to `gc_stats` table on shutdown, restored on startup (survives container restarts)
+- Scanner runs immediately on startup before entering 24h ticker loop
 
 ### Authentication — COMPLETE ✅
 **Status**: ✅ OIDC Phase 1 complete (2026-01-28) + dev tokens
@@ -1908,27 +1918,21 @@ CREATE TABLE org_usage_counters (
 
 ### ISSUE-GC-ORPHANS-01: Orphaned shares/links After Library Permanent Delete or Auto-Delete
 
-**Status**: ⚠️ Known gap — not yet fixed
+**Status**: ✅ Resolved (2026-03-17)
 **Discovered**: 2026-02-24
-**Priority**: 🟡 Medium — data accumulates but causes no runtime errors; orphaned links return 404 when accessed
+**Priority**: ~~🟡 Medium~~ → Resolved
 
-**Affected paths:**
-- `DELETE /repos/deleted/:repo_id/` — user permanently deletes their own library
-- `DELETE /admin/trash-libraries/` — admin bulk-cleans trash
-- GC scanner Phase 6 — auto-expiry by `auto_delete_days`
+**Resolution (2026-03-17):**
+All library artifacts are now cleaned on permanent delete via `enqueueLibraryArtifacts()` in the GC worker:
+- ✅ `shares` + `shares_by_user` — cleaned via `ListSharesByLibrary` → `DeleteShare`
+- ✅ `share_links` (all 4 tables) — cleaned via `DeleteShareLinksByLibrary`
+- ✅ `repo_tags` + `file_tags` — cleaned via `cleanupLibraryTags`
+- ✅ `repo_api_tokens` — cleaned via `ListRepoAPITokensByLibrary` → `DeleteRepoAPIToken`
+- ✅ `locked_files` — cleaned via `DeleteLockedFilesByLibrary`
 
-**Current Behavior:**
-In all three paths above, the following rows are **never removed** after the library ceases to exist:
-- `shares` — user-to-user and group shares for the deleted library
-- ~~`share_links` / `share_links_by_creator` — public download links~~ **RESOLVED** (2026-03-13)
-- ~~`upload_links` / `upload_links_by_creator` — public upload links~~ **RESOLVED** (2026-03-13)
+Additionally, GC scanner **Phase 7** now catches expired user-to-user shares (`expires_at < now`) independently of library deletion.
 
-**Partially Resolved (2026-03-13):**
-Share/upload links are now cleaned via `cleanupLibraryLinks()` using the `share_links_by_library` lookup table. Called async from `PermanentDeleteRepo`. See `docs/SHARE-LINKS-UNIFICATION.md` § 11.7 + 11.8.
-
-**Remaining:**
-- `shares` table still orphaned — could be deleted directly (`WHERE library_id = ?`) but not yet hooked in
-- Historical orphans from before the unification still need a GC scanner phase
+Historical orphans from before this change will be caught by scanner Phase 3/4 (orphaned commits/fs_objects) on the next 24h scan cycle.
 
 ---
 

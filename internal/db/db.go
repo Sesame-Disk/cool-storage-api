@@ -133,6 +133,7 @@ func (db *DB) Migrate() error {
 		migrationCreateCustomSharePermissionsByUser,
 		migrationCreateGCQueue,
 		migrationCreateGCStats,
+		migrationCreateBlockIDMappingsByInternal,
 	}
 
 	for _, migration := range migrations {
@@ -746,4 +747,15 @@ CREATE TABLE IF NOT EXISTS gc_stats (
 	stat_key TEXT PRIMARY KEY,
 	stat_value TEXT,
 	updated_at TIMESTAMP
+)`
+
+// Reverse lookup for block_id_mappings by internal_id (SHA-256)
+// Avoids full org scan when deleting a block and its mappings
+const migrationCreateBlockIDMappingsByInternal = `
+CREATE TABLE IF NOT EXISTS block_id_mappings_by_internal (
+	org_id UUID,
+	internal_id TEXT,
+	external_id TEXT,
+	created_at TIMESTAMP,
+	PRIMARY KEY ((org_id), internal_id, external_id)
 )`

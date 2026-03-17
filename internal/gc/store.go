@@ -23,10 +23,13 @@ type GCStore interface {
 	GetBlockRefCount(orgID uuid.UUID, blockID string) (int, error)
 	DeleteBlock(orgID uuid.UUID, blockID string) error
 	DecrementBlockRefCount(orgID uuid.UUID, blockID string) error
-	ListBlockMappings(orgID uuid.UUID) ([]BlockMapping, error)
 	DeleteBlockMapping(orgID uuid.UUID, externalID string) error
 
+	// Reverse lookup: find block mappings by internal_id (avoids full scan)
+	ListBlockMappingsByInternalID(orgID uuid.UUID, internalID string) ([]BlockMapping, error)
+
 	// Commit operations (worker)
+	GetCommit(libraryID uuid.UUID, commitID string) (CommitInfo, error)
 	DeleteCommit(libraryID uuid.UUID, commitID string) error
 
 	// FS object operations (worker)
@@ -58,7 +61,39 @@ type GCStore interface {
 
 	// Share link deletion
 	DeleteShareLink(shareToken string) error
+
+	// Expired shares (user-to-user library shares)
+	ListExpiredShares() ([]ExpiredShareInfo, error)
+	DeleteShare(libraryID, shareID uuid.UUID) error
+	DeleteShareByUser(sharedTo, libraryID uuid.UUID) error
+
+	// Expired restore jobs
+	ListExpiredRestoreJobs() ([]ExpiredRestoreJobInfo, error)
+	DeleteRestoreJob(orgID, libraryID, jobID uuid.UUID) error
+
+	// Orphaned library artifacts cleanup
+	ListSharesByLibrary(libraryID uuid.UUID) ([]ShareInfo, error)
+	ListRepoTagsByLibrary(libraryID uuid.UUID) ([]string, error)
+	DeleteRepoTag(libraryID uuid.UUID, tagID int) error
+	ListFileTagsByLibrary(libraryID uuid.UUID) ([]FileTagInfo, error)
+	DeleteFileTag(libraryID uuid.UUID, filePath string, tagID int) error
+	DeleteFileTagByID(libraryID uuid.UUID, fileTagID int) error
+	ListRepoAPITokensByLibrary(libraryID uuid.UUID) ([]RepoAPITokenInfo, error)
+	DeleteRepoAPIToken(libraryID uuid.UUID, appName string) error
+	DeleteRepoAPITokenByToken(apiToken string) error
+	DeleteLockedFilesByLibrary(libraryID uuid.UUID) error
+	DeleteShareLinksByLibrary(orgID, libraryID uuid.UUID) ([]string, error)
+
+	// GC stats persistence
+	SaveGCStats(key, value string) error
+	LoadGCStats(key string) (string, error)
 }
+
+// ItemType constants for new GC item types
+const (
+	ItemShare      ItemType = "share"
+	ItemRestoreJob ItemType = "restore_job"
+)
 
 // BlockMapping represents a SHA-1 to SHA-256 block ID mapping.
 type BlockMapping struct {
@@ -116,6 +151,45 @@ type LibraryAutoDeleteInfo struct {
 	LibraryID      uuid.UUID
 	HeadCommitID   string
 	AutoDeleteDays int
+}
+
+// ExpiredShareInfo holds data about an expired user-to-user share.
+type ExpiredShareInfo struct {
+	LibraryID uuid.UUID
+	ShareID   uuid.UUID
+	SharedTo  uuid.UUID
+	ExpiresAt time.Time
+}
+
+// ExpiredRestoreJobInfo holds data about an expired/completed restore job.
+type ExpiredRestoreJobInfo struct {
+	OrgID     uuid.UUID
+	LibraryID uuid.UUID
+	JobID     uuid.UUID
+	Status    string
+	ExpiresAt time.Time
+}
+
+// ShareInfo holds data about a library share for orphan cleanup.
+type ShareInfo struct {
+	LibraryID uuid.UUID
+	ShareID   uuid.UUID
+	SharedTo  uuid.UUID
+}
+
+// FileTagInfo holds data about a file tag for orphan cleanup.
+type FileTagInfo struct {
+	RepoID    uuid.UUID
+	FilePath  string
+	TagID     int
+	FileTagID int
+}
+
+// RepoAPITokenInfo holds data about a repo API token for orphan cleanup.
+type RepoAPITokenInfo struct {
+	RepoID   uuid.UUID
+	AppName  string
+	APIToken string
 }
 
 // BlockStoreDeleter is a minimal interface for S3 block deletion.

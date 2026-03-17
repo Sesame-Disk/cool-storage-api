@@ -37,6 +37,27 @@ type MockStore struct {
 
 	// share_links keyed by shareToken
 	shareLinks map[string]*mockShareLink
+
+	// shares keyed by "libraryID:shareID"
+	shares map[string]*mockShare
+
+	// restore_jobs keyed by "orgID:libraryID:jobID"
+	restoreJobs map[string]*mockRestoreJob
+
+	// repo_tags keyed by "libraryID:tagID"
+	repoTags map[string]bool
+
+	// file_tags keyed by "libraryID:filePath:tagID"
+	fileTags map[string]*mockFileTag
+
+	// repo_api_tokens keyed by "libraryID:appName"
+	apiTokens map[string]*mockAPIToken
+
+	// locked_files keyed by "libraryID:path"
+	lockedFiles map[string]bool
+
+	// gc_stats keyed by stat_key
+	gcStats map[string]string
 }
 
 type mockBlock struct {
@@ -77,6 +98,34 @@ type mockShareLink struct {
 	ExpiresAt  time.Time
 }
 
+type mockShare struct {
+	LibraryID uuid.UUID
+	ShareID   uuid.UUID
+	SharedTo  uuid.UUID
+	ExpiresAt time.Time
+}
+
+type mockRestoreJob struct {
+	OrgID     uuid.UUID
+	LibraryID uuid.UUID
+	JobID     uuid.UUID
+	Status    string
+	ExpiresAt time.Time
+}
+
+type mockFileTag struct {
+	RepoID    uuid.UUID
+	FilePath  string
+	TagID     int
+	FileTagID int
+}
+
+type mockAPIToken struct {
+	RepoID   uuid.UUID
+	AppName  string
+	APIToken string
+}
+
 // NewMockStore creates a new in-memory mock store.
 func NewMockStore() *MockStore {
 	return &MockStore{
@@ -87,6 +136,13 @@ func NewMockStore() *MockStore {
 		fsObjects:     make(map[string]*mockFSObject),
 		libraries:     make(map[uuid.UUID]*mockLibrary),
 		shareLinks:    make(map[string]*mockShareLink),
+		shares:        make(map[string]*mockShare),
+		restoreJobs:   make(map[string]*mockRestoreJob),
+		repoTags:      make(map[string]bool),
+		fileTags:      make(map[string]*mockFileTag),
+		apiTokens:     make(map[string]*mockAPIToken),
+		lockedFiles:   make(map[string]bool),
+		gcStats:       make(map[string]string),
 		organizations: nil,
 	}
 }
@@ -216,6 +272,31 @@ func (m *MockStore) AddShareLink(shareToken string, orgID uuid.UUID, expiresAt t
 	}
 }
 
+func (m *MockStore) AddShare(libraryID, shareID, sharedTo uuid.UUID, expiresAt time.Time) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	key := fmt.Sprintf("%s:%s", libraryID, shareID)
+	m.shares[key] = &mockShare{
+		LibraryID: libraryID,
+		ShareID:   shareID,
+		SharedTo:  sharedTo,
+		ExpiresAt: expiresAt,
+	}
+}
+
+func (m *MockStore) AddRestoreJob(orgID, libraryID, jobID uuid.UUID, status string, expiresAt time.Time) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	key := fmt.Sprintf("%s:%s:%s", orgID, libraryID, jobID)
+	m.restoreJobs[key] = &mockRestoreJob{
+		OrgID:     orgID,
+		LibraryID: libraryID,
+		JobID:     jobID,
+		Status:    status,
+		ExpiresAt: expiresAt,
+	}
+}
+
 // GetBlock returns a block for test assertions.
 func (m *MockStore) GetBlock(orgID uuid.UUID, blockID string) *mockBlock {
 	m.mu.RLock()
@@ -223,8 +304,8 @@ func (m *MockStore) GetBlock(orgID uuid.UUID, blockID string) *mockBlock {
 	return m.blocks[fmt.Sprintf("%s:%s", orgID, blockID)]
 }
 
-// GetCommit returns a commit for test assertions.
-func (m *MockStore) GetCommit(libraryID uuid.UUID, commitID string) *mockCommit {
+// GetCommitRecord returns a commit for test assertions.
+func (m *MockStore) GetCommitRecord(libraryID uuid.UUID, commitID string) *mockCommit {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.commits[fmt.Sprintf("%s:%s", libraryID, commitID)]
@@ -253,6 +334,13 @@ func (m *MockStore) QueueItems(orgID uuid.UUID) []QueueItem {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return append([]QueueItem{}, m.queue[orgID]...)
+}
+
+// GetShareLink returns a share link for test assertions.
+func (m *MockStore) GetShareLink(shareToken string) *mockShareLink {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.shareLinks[shareToken]
 }
 
 // --- GCStore interface implementation ---
@@ -285,7 +373,7 @@ func (m *MockStore) DequeueBatch(orgID uuid.UUID, batchSize int, cutoff time.Tim
 
 	var result []QueueItem
 	for _, item := range items {
-		if item.QueuedAt.Before(cutoff) {
+		if !item.QueuedAt.After(cutoff) {
 			result = append(result, item)
 			if len(result) >= batchSize {
 				break
@@ -385,16 +473,16 @@ func (m *MockStore) DecrementBlockRefCount(orgID uuid.UUID, blockID string) erro
 	return nil
 }
 
-func (m *MockStore) ListBlockMappings(orgID uuid.UUID) ([]BlockMapping, error) {
+func (m *MockStore) ListBlockMappingsByInternalID(orgID uuid.UUID, internalID string) ([]BlockMapping, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
 	prefix := fmt.Sprintf("%s:", orgID)
 	var mappings []BlockMapping
-	for key, internalID := range m.mappings {
-		if len(key) > len(prefix) && key[:len(prefix)] == prefix {
+	for key, intID := range m.mappings {
+		if len(key) > len(prefix) && key[:len(prefix)] == prefix && intID == internalID {
 			extID := key[len(prefix):]
-			mappings = append(mappings, BlockMapping{ExternalID: extID, InternalID: internalID})
+			mappings = append(mappings, BlockMapping{ExternalID: extID, InternalID: intID})
 		}
 	}
 	return mappings, nil
@@ -407,6 +495,18 @@ func (m *MockStore) DeleteBlockMapping(orgID uuid.UUID, externalID string) error
 	key := fmt.Sprintf("%s:%s", orgID, externalID)
 	delete(m.mappings, key)
 	return nil
+}
+
+func (m *MockStore) GetCommit(libraryID uuid.UUID, commitID string) (CommitInfo, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	key := fmt.Sprintf("%s:%s", libraryID, commitID)
+	c, ok := m.commits[key]
+	if !ok {
+		return CommitInfo{}, fmt.Errorf("commit not found: %s", commitID)
+	}
+	return CommitInfo{CommitID: c.CommitID, RootFSID: c.RootFSID}, nil
 }
 
 func (m *MockStore) DeleteCommit(libraryID uuid.UUID, commitID string) error {
@@ -667,11 +767,202 @@ func (m *MockStore) DeleteShareLink(shareToken string) error {
 	return nil
 }
 
-// GetShareLink returns a share link for test assertions.
-func (m *MockStore) GetShareLink(shareToken string) *mockShareLink {
+// --- Expired shares ---
+
+func (m *MockStore) ListExpiredShares() ([]ExpiredShareInfo, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	return m.shareLinks[shareToken]
+
+	now := time.Now()
+	var results []ExpiredShareInfo
+	for _, s := range m.shares {
+		if !s.ExpiresAt.IsZero() && s.ExpiresAt.Before(now) {
+			results = append(results, ExpiredShareInfo{
+				LibraryID: s.LibraryID,
+				ShareID:   s.ShareID,
+				SharedTo:  s.SharedTo,
+				ExpiresAt: s.ExpiresAt,
+			})
+		}
+	}
+	return results, nil
+}
+
+func (m *MockStore) DeleteShare(libraryID, shareID uuid.UUID) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	key := fmt.Sprintf("%s:%s", libraryID, shareID)
+	delete(m.shares, key)
+	return nil
+}
+
+func (m *MockStore) DeleteShareByUser(sharedTo, libraryID uuid.UUID) error {
+	// In mock, shares_by_user is implicit in the shares map
+	return nil
+}
+
+// --- Expired restore jobs ---
+
+func (m *MockStore) ListExpiredRestoreJobs() ([]ExpiredRestoreJobInfo, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	now := time.Now()
+	var results []ExpiredRestoreJobInfo
+	for _, j := range m.restoreJobs {
+		if j.Status == "completed" || j.Status == "failed" || (!j.ExpiresAt.IsZero() && j.ExpiresAt.Before(now)) {
+			results = append(results, ExpiredRestoreJobInfo{
+				OrgID:     j.OrgID,
+				LibraryID: j.LibraryID,
+				JobID:     j.JobID,
+				Status:    j.Status,
+				ExpiresAt: j.ExpiresAt,
+			})
+		}
+	}
+	return results, nil
+}
+
+func (m *MockStore) DeleteRestoreJob(orgID, libraryID, jobID uuid.UUID) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	key := fmt.Sprintf("%s:%s:%s", orgID, libraryID, jobID)
+	delete(m.restoreJobs, key)
+	return nil
+}
+
+// --- Library artifact cleanup ---
+
+func (m *MockStore) ListSharesByLibrary(libraryID uuid.UUID) ([]ShareInfo, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	prefix := fmt.Sprintf("%s:", libraryID)
+	var results []ShareInfo
+	for key, s := range m.shares {
+		if len(key) > len(prefix) && key[:len(prefix)] == prefix {
+			results = append(results, ShareInfo{LibraryID: s.LibraryID, ShareID: s.ShareID, SharedTo: s.SharedTo})
+		}
+	}
+	return results, nil
+}
+
+func (m *MockStore) ListRepoTagsByLibrary(libraryID uuid.UUID) ([]string, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	prefix := fmt.Sprintf("%s:", libraryID)
+	var results []string
+	for key := range m.repoTags {
+		if len(key) > len(prefix) && key[:len(prefix)] == prefix {
+			results = append(results, key[len(prefix):])
+		}
+	}
+	return results, nil
+}
+
+func (m *MockStore) DeleteRepoTag(libraryID uuid.UUID, tagID int) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	key := fmt.Sprintf("%s:%d", libraryID, tagID)
+	delete(m.repoTags, key)
+	return nil
+}
+
+func (m *MockStore) ListFileTagsByLibrary(libraryID uuid.UUID) ([]FileTagInfo, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	prefix := fmt.Sprintf("%s:", libraryID)
+	var results []FileTagInfo
+	for key, ft := range m.fileTags {
+		if len(key) > len(prefix) && key[:len(prefix)] == prefix {
+			results = append(results, FileTagInfo{
+				RepoID:    ft.RepoID,
+				FilePath:  ft.FilePath,
+				TagID:     ft.TagID,
+				FileTagID: ft.FileTagID,
+			})
+		}
+	}
+	return results, nil
+}
+
+func (m *MockStore) DeleteFileTag(libraryID uuid.UUID, filePath string, tagID int) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	key := fmt.Sprintf("%s:%s:%d", libraryID, filePath, tagID)
+	delete(m.fileTags, key)
+	return nil
+}
+
+func (m *MockStore) DeleteFileTagByID(libraryID uuid.UUID, fileTagID int) error {
+	return nil // Mock doesn't have secondary index
+}
+
+func (m *MockStore) ListRepoAPITokensByLibrary(libraryID uuid.UUID) ([]RepoAPITokenInfo, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	prefix := fmt.Sprintf("%s:", libraryID)
+	var results []RepoAPITokenInfo
+	for key, t := range m.apiTokens {
+		if len(key) > len(prefix) && key[:len(prefix)] == prefix {
+			results = append(results, RepoAPITokenInfo{RepoID: t.RepoID, AppName: t.AppName, APIToken: t.APIToken})
+		}
+	}
+	return results, nil
+}
+
+func (m *MockStore) DeleteRepoAPIToken(libraryID uuid.UUID, appName string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	key := fmt.Sprintf("%s:%s", libraryID, appName)
+	delete(m.apiTokens, key)
+	return nil
+}
+
+func (m *MockStore) DeleteRepoAPITokenByToken(apiToken string) error {
+	return nil // Mock doesn't have reverse lookup
+}
+
+func (m *MockStore) DeleteLockedFilesByLibrary(libraryID uuid.UUID) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	prefix := fmt.Sprintf("%s:", libraryID)
+	for key := range m.lockedFiles {
+		if len(key) > len(prefix) && key[:len(prefix)] == prefix {
+			delete(m.lockedFiles, key)
+		}
+	}
+	return nil
+}
+
+func (m *MockStore) DeleteShareLinksByLibrary(orgID, libraryID uuid.UUID) ([]string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	// In mock, iterate share links and delete those matching libraryID
+	// (simplified — real impl uses share_links_by_library table)
+	return nil, nil
+}
+
+// --- GC stats persistence ---
+
+func (m *MockStore) SaveGCStats(key, value string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.gcStats[key] = value
+	return nil
+}
+
+func (m *MockStore) LoadGCStats(key string) (string, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	val, ok := m.gcStats[key]
+	if !ok {
+		return "", fmt.Errorf("stat not found: %s", key)
+	}
+	return val, nil
 }
 
 // MockStorageProvider implements StorageProvider for testing.

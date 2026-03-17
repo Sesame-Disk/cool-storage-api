@@ -300,3 +300,49 @@ func TestQueue_MultipleItemTypes(t *testing.T) {
 		}
 	}
 }
+
+func TestQueue_NewItemTypes(t *testing.T) {
+	store := NewMockStore()
+	q := NewQueue(store)
+
+	orgID := uuid.New()
+	libID := uuid.New()
+
+	// Enqueue the new item types: share and restore_job
+	err := q.Enqueue(orgID, ItemShare, "share-1", libID, "")
+	if err != nil {
+		t.Fatalf("Enqueue ItemShare failed: %v", err)
+	}
+	err = q.Enqueue(orgID, ItemRestoreJob, "restore-job-1", libID, "")
+	if err != nil {
+		t.Fatalf("Enqueue ItemRestoreJob failed: %v", err)
+	}
+
+	items, err := q.DequeueBatch(orgID, 10, 0)
+	if err != nil {
+		t.Fatalf("DequeueBatch failed: %v", err)
+	}
+	if len(items) != 2 {
+		t.Fatalf("expected 2 items, got %d", len(items))
+	}
+
+	typeSet := make(map[ItemType]bool)
+	for _, item := range items {
+		typeSet[item.ItemType] = true
+	}
+	if !typeSet[ItemShare] {
+		t.Error("missing ItemShare")
+	}
+	if !typeSet[ItemRestoreJob] {
+		t.Error("missing ItemRestoreJob")
+	}
+}
+
+func TestItemType_NewConstants(t *testing.T) {
+	if string(ItemShare) != "share" {
+		t.Errorf("ItemShare = %q, want %q", string(ItemShare), "share")
+	}
+	if string(ItemRestoreJob) != "restore_job" {
+		t.Errorf("ItemRestoreJob = %q, want %q", string(ItemRestoreJob), "restore_job")
+	}
+}

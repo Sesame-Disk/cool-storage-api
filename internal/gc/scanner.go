@@ -33,41 +33,34 @@ func (s *Scanner) ScanOnce(ctx context.Context) error {
 
 	enqueued := 0
 
-	n, err := s.scanOrphanedBlocks(ctx)
-	if err != nil {
-		log.Printf("[GC Scanner] Error scanning orphaned blocks: %v", err)
+	phases := []struct {
+		name string
+		fn   func(context.Context) (int, error)
+	}{
+		{"orphaned_blocks", s.scanOrphanedBlocks},
+		{"expired_links", s.scanExpiredShareLinks},
+		{"orphaned_commits", s.scanOrphanedCommits},
+		{"orphaned_fs_objects", s.scanOrphanedFSObjects},
+		{"expired_versions", s.scanExpiredVersions},
+		{"auto_delete", s.scanAutoDeleteExpiredObjects},
+		{"expired_shares", s.scanExpiredShares},
+		{"expired_restore_jobs", s.scanExpiredRestoreJobs},
 	}
-	enqueued += n
 
-	n, err = s.scanExpiredShareLinks(ctx)
-	if err != nil {
-		log.Printf("[GC Scanner] Error scanning expired share links: %v", err)
-	}
-	enqueued += n
+	for _, phase := range phases {
+		select {
+		case <-ctx.Done():
+			log.Printf("[GC Scanner] Scan interrupted after %d items in %v", enqueued, time.Since(start))
+			return ctx.Err()
+		default:
+		}
 
-	n, err = s.scanOrphanedCommits(ctx)
-	if err != nil {
-		log.Printf("[GC Scanner] Error scanning orphaned commits: %v", err)
+		n, err := phase.fn(ctx)
+		if err != nil {
+			log.Printf("[GC Scanner] Error in phase %s: %v", phase.name, err)
+		}
+		enqueued += n
 	}
-	enqueued += n
-
-	n, err = s.scanOrphanedFSObjects(ctx)
-	if err != nil {
-		log.Printf("[GC Scanner] Error scanning orphaned fs_objects: %v", err)
-	}
-	enqueued += n
-
-	n, err = s.scanExpiredVersions(ctx)
-	if err != nil {
-		log.Printf("[GC Scanner] Error scanning expired versions: %v", err)
-	}
-	enqueued += n
-
-	n, err = s.scanAutoDeleteExpiredObjects(ctx)
-	if err != nil {
-		log.Printf("[GC Scanner] Error scanning auto-delete expired objects: %v", err)
-	}
-	enqueued += n
 
 	elapsed := time.Since(start)
 	log.Printf("[GC Scanner] Safety scan complete: enqueued %d items in %v", enqueued, elapsed)
@@ -165,9 +158,12 @@ func (s *Scanner) scanOrphanedCommits(ctx context.Context) (int, error) {
 			continue
 		}
 
-		// Library doesn't exist - enqueue all its commits
+		// Library doesn't exist - try to find the org
 		orgID, err := s.store.FindOrgForLibrary(libID)
 		if err != nil || orgID == uuid.Nil {
+			// Can't determine org — scan all orgs to find matching commits
+			// This handles the case where library_by_id record was also deleted
+			log.Printf("[GC Scanner] Phase 3: Library %s deleted, org lookup failed, skipping", libID)
 			continue
 		}
 
@@ -212,6 +208,7 @@ func (s *Scanner) scanOrphanedFSObjects(ctx context.Context) (int, error) {
 
 		orgID, err := s.store.FindOrgForLibrary(libID)
 		if err != nil || orgID == uuid.Nil {
+			log.Printf("[GC Scanner] Phase 4: Library %s deleted, org lookup failed, skipping", libID)
 			continue
 		}
 
@@ -351,7 +348,7 @@ func (s *Scanner) scanAutoDeleteExpiredObjects(ctx context.Context) (int, error)
 			}
 		}
 
-		// Walk filesystem trees of all keepCommits to build keepFSSet
+		// Walk filesystem trees of all keepCommits to build keepFSSet (iterative)
 		keepFSSet := make(map[string]bool)
 		for commitID := range keepCommits {
 			if c, ok := commitMap[commitID]; ok && c.RootFSID != "" {
@@ -381,20 +378,94 @@ func (s *Scanner) scanAutoDeleteExpiredObjects(ctx context.Context) (int, error)
 	return enqueued, nil
 }
 
-// walkFSTree recursively walks a filesystem tree starting from fsID,
-// adding all visited fs_ids to the visited set.
+// scanExpiredShares finds user-to-user library shares past their expiration date.
+func (s *Scanner) scanExpiredShares(ctx context.Context) (int, error) {
+	log.Println("[GC Scanner] Phase 7: Scanning for expired user-to-user shares...")
+
+	shares, err := s.store.ListExpiredShares()
+	if err != nil {
+		return 0, err
+	}
+
+	enqueued := 0
+	for _, share := range shares {
+		select {
+		case <-ctx.Done():
+			return enqueued, ctx.Err()
+		default:
+		}
+
+		// Delete directly — shares are small metadata, no need for queue
+		if err := s.store.DeleteShare(share.LibraryID, share.ShareID); err == nil {
+			s.store.DeleteShareByUser(share.SharedTo, share.LibraryID)
+			enqueued++
+		}
+	}
+
+	log.Printf("[GC Scanner] Phase 7 complete: cleaned %d expired shares", enqueued)
+	metrics.GCItemsEnqueuedTotal.WithLabelValues("expired_shares").Add(float64(enqueued))
+	metrics.GCScannerLastPhaseRun.WithLabelValues("expired_shares").SetToCurrentTime()
+	return enqueued, nil
+}
+
+// scanExpiredRestoreJobs finds completed/expired Glacier restore jobs.
+func (s *Scanner) scanExpiredRestoreJobs(ctx context.Context) (int, error) {
+	log.Println("[GC Scanner] Phase 8: Scanning for expired restore jobs...")
+
+	jobs, err := s.store.ListExpiredRestoreJobs()
+	if err != nil {
+		return 0, err
+	}
+
+	enqueued := 0
+	for _, job := range jobs {
+		select {
+		case <-ctx.Done():
+			return enqueued, ctx.Err()
+		default:
+		}
+
+		// Delete directly — restore jobs are small metadata
+		if err := s.store.DeleteRestoreJob(job.OrgID, job.LibraryID, job.JobID); err == nil {
+			enqueued++
+		}
+	}
+
+	log.Printf("[GC Scanner] Phase 8 complete: cleaned %d expired restore jobs", enqueued)
+	metrics.GCItemsEnqueuedTotal.WithLabelValues("expired_restore_jobs").Add(float64(enqueued))
+	metrics.GCScannerLastPhaseRun.WithLabelValues("expired_restore_jobs").SetToCurrentTime()
+	return enqueued, nil
+}
+
+// walkFSTree iteratively walks a filesystem tree starting from fsID,
+// adding all visited fs_ids to the visited set. Uses an explicit stack
+// instead of recursion to avoid stack overflow on deep directory trees.
 func (s *Scanner) walkFSTree(libraryID uuid.UUID, fsID string, visited map[string]bool) {
 	if fsID == "" || visited[fsID] {
 		return
 	}
-	visited[fsID] = true
 
-	obj, err := s.store.GetFSObject(libraryID, fsID)
-	if err != nil {
-		return
-	}
+	stack := []string{fsID}
+	for len(stack) > 0 {
+		// Pop
+		current := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
 
-	for _, childID := range obj.DirEntries {
-		s.walkFSTree(libraryID, childID, visited)
+		if current == "" || visited[current] {
+			continue
+		}
+		visited[current] = true
+
+		obj, err := s.store.GetFSObject(libraryID, current)
+		if err != nil {
+			continue
+		}
+
+		// Push children
+		for _, childID := range obj.DirEntries {
+			if !visited[childID] {
+				stack = append(stack, childID)
+			}
+		}
 	}
 }

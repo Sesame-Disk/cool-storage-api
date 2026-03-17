@@ -499,6 +499,29 @@ PUT /seafhttp/repo/{repo_id}/block/{sha1_hash}
 
 ---
 
+### 9b. `block_id_mappings_by_internal`
+**Purpose:** Reverse lookup (SHA-256 → SHA-1) for GC cleanup — avoids full table scans when deleting blocks
+
+**Schema:**
+```sql
+PRIMARY KEY ((org_id), internal_id, external_id)  -- Lookup by SHA-256
+```
+
+**Why needed?**
+- When GC deletes a block (by SHA-256 internal_id), it needs to find and clean the corresponding forward mapping
+- Without this table, the worker would have to scan the entire `block_id_mappings` table per org
+- Dual-written alongside `block_id_mappings` on every upload
+
+**GC Usage:**
+```
+Worker deletes block (SHA-256) →
+  ListBlockMappingsByInternalID(org_id, internal_id) →
+  Returns external_id (SHA-1) →
+  Delete from both block_id_mappings + block_id_mappings_by_internal
+```
+
+---
+
 ### 10. `share_links` (unified)
 **Purpose:** Unified public/password-protected links (share, upload, internal/smart links)
 

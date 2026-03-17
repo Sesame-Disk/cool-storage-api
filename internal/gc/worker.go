@@ -12,13 +12,13 @@ import (
 
 // Worker drains the gc_queue and deletes items from S3 and the database.
 type Worker struct {
-	store          GCStore
-	storage        StorageProvider
-	queue          *Queue
-	batchSize      int
-	gracePeriod    time.Duration
-	dryRun         bool
-	stats          *Stats
+	store       GCStore
+	storage     StorageProvider
+	queue       *Queue
+	batchSize   int
+	gracePeriod time.Duration
+	dryRun      bool
+	stats       *Stats
 }
 
 // NewWorker creates a new GC worker.
@@ -112,6 +112,10 @@ func (w *Worker) processItem(ctx context.Context, item QueueItem) error {
 		return w.processBlockMapping(ctx, item)
 	case ItemShareLink:
 		return w.processShareLink(ctx, item)
+	case ItemShare:
+		return w.processShare(ctx, item)
+	case ItemRestoreJob:
+		return w.processRestoreJob(ctx, item)
 	default:
 		return fmt.Errorf("unknown item type: %s", item.ItemType)
 	}
@@ -159,13 +163,11 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 		return fmt.Errorf("failed to delete block record: %w", err)
 	}
 
-	// Delete block_id_mappings where internal_id matches this block
-	mappings, err := w.store.ListBlockMappings(item.OrgID)
+	// Delete block_id_mappings using reverse lookup (avoids full org scan)
+	mappings, err := w.store.ListBlockMappingsByInternalID(item.OrgID, item.ItemID)
 	if err == nil {
 		for _, mapping := range mappings {
-			if mapping.InternalID == item.ItemID {
-				w.store.DeleteBlockMapping(item.OrgID, mapping.ExternalID)
-			}
+			w.store.DeleteBlockMapping(item.OrgID, mapping.ExternalID)
 		}
 	}
 
@@ -175,9 +177,22 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 }
 
 func (w *Worker) processCommit(ctx context.Context, item QueueItem) error {
+	// Get the commit to find its root_fs_id for cascading deletion
+	commit, err := w.store.GetCommit(item.LibraryID, item.ItemID)
+	if err != nil {
+		// Commit may already be deleted
+		log.Printf("[GC Worker] Commit %s not found (may already be deleted)", item.ItemID)
+		return nil
+	}
+
 	if w.dryRun {
 		log.Printf("[GC Worker] DRY RUN: Would delete commit %s from library %s", item.ItemID, item.LibraryID)
 		return nil
+	}
+
+	// Enqueue the root fs_object for cascading deletion (fs_object → blocks)
+	if commit.RootFSID != "" {
+		w.queue.Enqueue(item.OrgID, ItemFSObject, commit.RootFSID, item.LibraryID, "")
 	}
 
 	if err := w.store.DeleteCommit(item.LibraryID, item.ItemID); err != nil {
@@ -195,6 +210,11 @@ func (w *Worker) processFSObject(ctx context.Context, item QueueItem) error {
 		// Already deleted
 		log.Printf("[GC Worker] FS object %s not found (may already be deleted)", item.ItemID)
 		return nil
+	}
+
+	// If it's a directory, enqueue child fs_objects for recursive deletion
+	for _, childID := range fsObj.DirEntries {
+		w.queue.Enqueue(item.OrgID, ItemFSObject, childID, item.LibraryID, "")
 	}
 
 	// If it's a file with blocks, decrement ref counts and enqueue blocks that hit 0
@@ -248,6 +268,44 @@ func (w *Worker) processShareLink(ctx context.Context, item QueueItem) error {
 	return nil
 }
 
+func (w *Worker) processShare(ctx context.Context, item QueueItem) error {
+	if w.dryRun {
+		log.Printf("[GC Worker] DRY RUN: Would delete share %s", item.ItemID)
+		return nil
+	}
+
+	shareID, err := uuid.Parse(item.ItemID)
+	if err != nil {
+		return fmt.Errorf("invalid share ID: %w", err)
+	}
+
+	if err := w.store.DeleteShare(item.LibraryID, shareID); err != nil {
+		return fmt.Errorf("failed to delete share: %w", err)
+	}
+
+	log.Printf("[GC Worker] Deleted share %s", item.ItemID)
+	return nil
+}
+
+func (w *Worker) processRestoreJob(ctx context.Context, item QueueItem) error {
+	if w.dryRun {
+		log.Printf("[GC Worker] DRY RUN: Would delete restore job %s", item.ItemID)
+		return nil
+	}
+
+	jobID, err := uuid.Parse(item.ItemID)
+	if err != nil {
+		return fmt.Errorf("invalid restore job ID: %w", err)
+	}
+
+	if err := w.store.DeleteRestoreJob(item.OrgID, item.LibraryID, jobID); err != nil {
+		return fmt.Errorf("failed to delete restore job: %w", err)
+	}
+
+	log.Printf("[GC Worker] Deleted restore job %s", item.ItemID)
+	return nil
+}
+
 // decrementAndFindZeroRef decrements ref_count for blocks and returns those that hit 0.
 func (w *Worker) decrementAndFindZeroRef(orgID uuid.UUID, blockIDs []string) []string {
 	var zeroRef []string
@@ -268,7 +326,9 @@ func (w *Worker) decrementAndFindZeroRef(orgID uuid.UUID, blockIDs []string) []s
 	return zeroRef
 }
 
-// EnqueueLibraryContents enqueues all commits, fs_objects, and blocks for a deleted library.
+// EnqueueLibraryContents enqueues all contents of a deleted library for GC.
+// Only enqueues commits and fs_objects — blocks are handled in cascade
+// when fs_objects are processed (via decrementAndFindZeroRef).
 func (w *Worker) EnqueueLibraryContents(orgID, libraryID uuid.UUID, storageClass string) error {
 	// Enqueue all commits for this library
 	commits, err := w.store.ListCommitsForLibrary(libraryID)
@@ -279,18 +339,82 @@ func (w *Worker) EnqueueLibraryContents(orgID, libraryID uuid.UUID, storageClass
 		w.queue.Enqueue(orgID, ItemCommit, c.CommitID, libraryID, "")
 	}
 
-	// Enqueue all fs_objects and their blocks
+	// Enqueue all fs_objects (blocks will cascade via processFSObject)
 	fsObjects, err := w.store.ListFSObjectsForLibrary(libraryID)
 	if err != nil {
 		return fmt.Errorf("failed to list fs_objects for library %s: %w", libraryID, err)
 	}
 	for _, obj := range fsObjects {
 		w.queue.Enqueue(orgID, ItemFSObject, obj.FSID, libraryID, "")
-		for _, blockID := range obj.BlockIDs {
-			w.queue.Enqueue(orgID, ItemBlock, blockID, libraryID, storageClass)
+	}
+
+	// Clean up library-specific artifacts that don't cascade through fs_objects
+	w.enqueueLibraryArtifacts(orgID, libraryID)
+
+	log.Printf("[GC Worker] Enqueued library %s contents for deletion", libraryID)
+	return nil
+}
+
+// enqueueLibraryArtifacts cleans up auxiliary data tied to a deleted library:
+// share links, shares, tags, api tokens, locked files.
+func (w *Worker) enqueueLibraryArtifacts(orgID, libraryID uuid.UUID) {
+	// Delete share links via the by_library index (efficient)
+	tokens, err := w.store.DeleteShareLinksByLibrary(orgID, libraryID)
+	if err == nil {
+		for _, token := range tokens {
+			log.Printf("[GC Worker] Cleaned up share link %s for deleted library %s", token, libraryID)
 		}
 	}
 
-	log.Printf("[GC Worker] Enqueued library %s contents for deletion", libraryID)
+	// Delete shares
+	shares, err := w.store.ListSharesByLibrary(libraryID)
+	if err == nil {
+		for _, share := range shares {
+			w.store.DeleteShare(libraryID, share.ShareID)
+			w.store.DeleteShareByUser(share.SharedTo, libraryID)
+		}
+	}
+
+	// Delete repo tags and file tags
+	if err := w.cleanupLibraryTags(libraryID); err != nil {
+		log.Printf("[GC Worker] Error cleaning tags for library %s: %v", libraryID, err)
+	}
+
+	// Delete API tokens
+	tokens2, err := w.store.ListRepoAPITokensByLibrary(libraryID)
+	if err == nil {
+		for _, t := range tokens2 {
+			w.store.DeleteRepoAPIToken(libraryID, t.AppName)
+			w.store.DeleteRepoAPITokenByToken(t.APIToken)
+		}
+	}
+
+	// Delete locked files
+	w.store.DeleteLockedFilesByLibrary(libraryID)
+}
+
+func (w *Worker) cleanupLibraryTags(libraryID uuid.UUID) error {
+	// Delete file tags first (they reference repo tags)
+	fileTags, err := w.store.ListFileTagsByLibrary(libraryID)
+	if err != nil {
+		return err
+	}
+	for _, ft := range fileTags {
+		w.store.DeleteFileTag(libraryID, ft.FilePath, ft.TagID)
+		w.store.DeleteFileTagByID(libraryID, ft.FileTagID)
+	}
+
+	// Delete repo tag definitions
+	tagIDs, err := w.store.ListRepoTagsByLibrary(libraryID)
+	if err != nil {
+		return err
+	}
+	for _, tagIDStr := range tagIDs {
+		var tagID int
+		if _, err := fmt.Sscanf(tagIDStr, "%d", &tagID); err == nil {
+			w.store.DeleteRepoTag(libraryID, tagID)
+		}
+	}
+
 	return nil
 }

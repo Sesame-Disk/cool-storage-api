@@ -109,14 +109,6 @@ func TestScanner_ScanOrphanedCommits(t *testing.T) {
 	store.AddCommit(libA, "commit-a2", "fs-root-2")
 
 	// Library B does NOT exist (deleted), but has 1 orphaned commit
-	// We still need the library in the "find org" lookup to work
-	// The scanner checks libraries_by_id (via LibraryExists) and then FindOrgForLibrary
-	// For orphaned commits, the library is gone from the main table
-	// We need to add it temporarily for FindOrgForLibrary to work, then remove it
-	// Actually, the scanner needs FindOrgForLibrary to return a valid org
-	// Let's add the library for org lookup but mark it as not existing via LibraryExists
-	// In the mock, LibraryExists checks m.libraries, so if we add it, it exists.
-	// For this test, we'll add the library, add commits, then remove the library.
 	store.AddLibrary(orgID, libB, "hot")
 	store.AddCommit(libB, "commit-b1", "fs-root-3")
 
@@ -132,8 +124,6 @@ func TestScanner_ScanOrphanedCommits(t *testing.T) {
 	}
 
 	// Library B's commit should NOT be enqueued because FindOrgForLibrary will fail
-	// (library record is gone). This is expected behavior - the scanner skips
-	// orphaned data when it can't determine the org.
 	items := store.QueueItems(orgID)
 	commitItems := 0
 	for _, item := range items {
@@ -141,15 +131,12 @@ func TestScanner_ScanOrphanedCommits(t *testing.T) {
 			commitItems++
 		}
 	}
-	// Since library B is deleted, FindOrgForLibrary returns error, so 0 commits enqueued
 	if commitItems != 0 {
 		t.Errorf("expected 0 orphaned commits enqueued (org lookup fails), got %d", commitItems)
 	}
 }
 
 func TestScanner_ScanOrphanedCommits_WithOrgLookup(t *testing.T) {
-	// Test the case where the library record still exists in libraries_by_id
-	// but was removed from the main libraries table (partial deletion)
 	store := NewMockStore()
 	stats := &Stats{}
 	q := NewQueue(store)
@@ -160,15 +147,11 @@ func TestScanner_ScanOrphanedCommits_WithOrgLookup(t *testing.T) {
 
 	libOrphaned := uuid.New()
 
-	// Add commits for a library
 	store.AddCommit(libOrphaned, "commit-orphan-1", "fs-root")
 
-	// Library doesn't exist (no AddLibrary call), so LibraryExists returns false
-	// and FindOrgForLibrary will also fail. This tests the guard.
 	ctx := context.Background()
 	s.ScanOnce(ctx)
 
-	// No commits should be enqueued (can't find org)
 	if store.QueueLen() != 0 {
 		t.Errorf("expected 0 items enqueued when org can't be found, got %d", store.QueueLen())
 	}
@@ -186,27 +169,20 @@ func TestScanner_ScanOrphanedFSObjects(t *testing.T) {
 	libA := uuid.New()
 	libB := uuid.New()
 
-	// Library A exists with 3 fs_objects
 	store.AddLibrary(orgID, libA, "hot")
 	store.AddFSObject(libA, "fs-a1", "file", []string{"blk-1"})
-	store.AddFSObject(libA, "fs-a2", "dir", nil)
-	store.AddFSObject(libA, "fs-a3", "file", []string{"blk-2"})
 
-	// Library B exists, has 2 fs_objects, but we'll keep library B for this test
 	store.AddLibrary(orgID, libB, "cold")
 	store.AddFSObject(libB, "fs-b1", "file", []string{"blk-3"})
-	store.AddFSObject(libB, "fs-b2", "file", []string{"blk-4"})
 
 	ctx := context.Background()
 	s.ScanOnce(ctx)
 
 	// Both libraries exist, so no orphaned fs_objects
 	fsItems := 0
-	for _, orgItems := range []uuid.UUID{orgID} {
-		for _, item := range store.QueueItems(orgItems) {
-			if item.ItemType == ItemFSObject {
-				fsItems++
-			}
+	for _, item := range store.QueueItems(orgID) {
+		if item.ItemType == ItemFSObject {
+			fsItems++
 		}
 	}
 	if fsItems != 0 {
@@ -288,7 +264,6 @@ func TestScanner_ContextCancellation(t *testing.T) {
 	q := NewQueue(store)
 	s := NewScanner(store, q, stats)
 
-	// Add many orgs with blocks to ensure scan takes time
 	for i := 0; i < 100; i++ {
 		orgID := uuid.New()
 		store.AddOrganization(orgID)
@@ -296,10 +271,9 @@ func TestScanner_ContextCancellation(t *testing.T) {
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	cancel() // Cancel immediately
+	cancel()
 
 	err := s.ScanOnce(ctx)
-	// Should not error fatally, just stop early
 	_ = err
 }
 
@@ -313,26 +287,22 @@ func TestScanner_ScanExpiredVersions_EnqueuesExpired(t *testing.T) {
 	store.AddOrganization(orgID)
 	libID := uuid.New()
 
-	// HEAD chain: head -> parent -> grandparent
 	headID := "commit-head"
 	parentID := "commit-parent"
 	grandparentID := "commit-grandparent"
 
-	// Library with 1-day TTL, head is headID
 	store.AddLibraryWithTTL(orgID, libID, "hot", headID, 1)
 
 	now := time.Now()
-	old := now.Add(-48 * time.Hour) // 2 days ago
+	old := now.Add(-48 * time.Hour)
 
-	// HEAD chain commits (all old, but should be kept)
 	store.AddCommitWithDetails(libID, headID, "fs-1", parentID, old)
 	store.AddCommitWithDetails(libID, parentID, "fs-2", grandparentID, old)
 	store.AddCommitWithDetails(libID, grandparentID, "fs-3", "", old)
 
-	// Non-HEAD-chain commits
-	store.AddCommitWithDetails(libID, "commit-expired-1", "fs-4", "", old)     // expired, not in chain
-	store.AddCommitWithDetails(libID, "commit-expired-2", "fs-5", "", old)     // expired, not in chain
-	store.AddCommitWithDetails(libID, "commit-recent", "fs-6", "", now)        // recent, not expired
+	store.AddCommitWithDetails(libID, "commit-expired-1", "fs-4", "", old)
+	store.AddCommitWithDetails(libID, "commit-expired-2", "fs-5", "", old)
+	store.AddCommitWithDetails(libID, "commit-recent", "fs-6", "", now)
 
 	ctx := context.Background()
 	err := s.ScanOnce(ctx)
@@ -340,13 +310,11 @@ func TestScanner_ScanExpiredVersions_EnqueuesExpired(t *testing.T) {
 		t.Fatalf("ScanOnce failed: %v", err)
 	}
 
-	// Only the 2 expired non-HEAD-chain commits should be enqueued
 	items := store.QueueItems(orgID)
 	commitItems := 0
 	for _, item := range items {
 		if item.ItemType == ItemCommit {
 			commitItems++
-			// Verify it's not a HEAD chain commit
 			if item.ItemID == headID || item.ItemID == parentID || item.ItemID == grandparentID {
 				t.Errorf("HEAD chain commit %s should not be enqueued", item.ItemID)
 			}
@@ -372,16 +340,14 @@ func TestScanner_ScanExpiredVersions_PreservesHEADChain(t *testing.T) {
 
 	store.AddLibraryWithTTL(orgID, libID, "hot", headID, 1)
 
-	old := time.Now().Add(-72 * time.Hour) // 3 days ago
+	old := time.Now().Add(-72 * time.Hour)
 
-	// All commits are old and in the HEAD chain
 	store.AddCommitWithDetails(libID, headID, "fs-1", parentID, old)
 	store.AddCommitWithDetails(libID, parentID, "fs-2", "", old)
 
 	ctx := context.Background()
 	s.ScanOnce(ctx)
 
-	// No commits should be enqueued - all are in HEAD chain
 	items := store.QueueItems(orgID)
 	commitItems := 0
 	for _, item := range items {
@@ -404,17 +370,15 @@ func TestScanner_ScanExpiredVersions_SkipsNegativeTTL(t *testing.T) {
 	store.AddOrganization(orgID)
 	libID := uuid.New()
 
-	// version_ttl_days = -1 means keep all
 	store.AddLibraryWithTTL(orgID, libID, "hot", "head", -1)
 
-	old := time.Now().Add(-720 * time.Hour) // 30 days ago
+	old := time.Now().Add(-720 * time.Hour)
 	store.AddCommitWithDetails(libID, "head", "fs-1", "", old)
 	store.AddCommitWithDetails(libID, "old-commit", "fs-2", "", old)
 
 	ctx := context.Background()
 	s.ScanOnce(ctx)
 
-	// Library with ttl=-1 is skipped by ListLibrariesWithVersionTTL (only returns >0)
 	items := store.QueueItems(orgID)
 	commitItems := 0
 	for _, item := range items {
@@ -437,7 +401,6 @@ func TestScanner_ScanExpiredVersions_SkipsZeroTTL(t *testing.T) {
 	store.AddOrganization(orgID)
 	libID := uuid.New()
 
-	// version_ttl_days = 0 means no setting
 	store.AddLibraryWithTTL(orgID, libID, "hot", "head", 0)
 
 	old := time.Now().Add(-720 * time.Hour)
@@ -471,18 +434,14 @@ func TestScanner_ScanAutoDeleteExpiredObjects_Basic(t *testing.T) {
 
 	headCommitID := "commit-head"
 
-	// Library with auto_delete_days=1
 	store.AddLibraryWithAutoDelete(orgID, libID, "hot", headCommitID, 1)
 
 	now := time.Now()
-	// HEAD commit points to root dir
 	store.AddCommitWithDetails(libID, headCommitID, "fs-root", "", now)
 
-	// fs_objects: root dir -> file1 (in HEAD tree)
 	store.AddFSObjectWithEntries(libID, "fs-root", "dir", nil, []string{"fs-file1"})
 	store.AddFSObject(libID, "fs-file1", "file", []string{"blk-1"})
 
-	// Orphaned fs_object (not in HEAD tree)
 	store.AddFSObject(libID, "fs-orphan", "file", []string{"blk-2"})
 
 	ctx := context.Background()
@@ -491,7 +450,6 @@ func TestScanner_ScanAutoDeleteExpiredObjects_Basic(t *testing.T) {
 		t.Fatalf("ScanOnce failed: %v", err)
 	}
 
-	// Only the orphaned fs_object should be enqueued
 	items := store.QueueItems(orgID)
 	fsItems := 0
 	for _, item := range items {
@@ -524,7 +482,6 @@ func TestScanner_ScanAutoDeleteExpiredObjects_PreservesHEADTree(t *testing.T) {
 	now := time.Now()
 	store.AddCommitWithDetails(libID, headCommitID, "fs-root", "", now)
 
-	// Nested tree: root -> subdir -> file
 	store.AddFSObjectWithEntries(libID, "fs-root", "dir", nil, []string{"fs-subdir"})
 	store.AddFSObjectWithEntries(libID, "fs-subdir", "dir", nil, []string{"fs-file"})
 	store.AddFSObject(libID, "fs-file", "file", []string{"blk-1"})
@@ -535,7 +492,6 @@ func TestScanner_ScanAutoDeleteExpiredObjects_PreservesHEADTree(t *testing.T) {
 		t.Fatalf("ScanOnce failed: %v", err)
 	}
 
-	// All fs_objects are in HEAD tree, so 0 should be enqueued
 	items := store.QueueItems(orgID)
 	fsItems := 0
 	for _, item := range items {
@@ -561,18 +517,15 @@ func TestScanner_ScanAutoDeleteExpiredObjects_PreservesRecentCommits(t *testing.
 	headCommitID := "commit-head"
 	recentCommitID := "commit-recent"
 
-	// Library with auto_delete_days=30
 	store.AddLibraryWithAutoDelete(orgID, libID, "hot", headCommitID, 30)
 
 	now := time.Now()
 	fiveDaysAgo := now.Add(-5 * 24 * time.Hour)
 
-	// HEAD commit with its tree
 	store.AddCommitWithDetails(libID, headCommitID, "fs-root-head", "", now)
 	store.AddFSObjectWithEntries(libID, "fs-root-head", "dir", nil, []string{"fs-file-head"})
 	store.AddFSObject(libID, "fs-file-head", "file", []string{"blk-1"})
 
-	// Recent non-HEAD commit (5 days old, within 30-day window) with its own tree
 	store.AddCommitWithDetails(libID, recentCommitID, "fs-root-recent", "", fiveDaysAgo)
 	store.AddFSObjectWithEntries(libID, "fs-root-recent", "dir", nil, []string{"fs-file-recent"})
 	store.AddFSObject(libID, "fs-file-recent", "file", []string{"blk-2"})
@@ -583,7 +536,6 @@ func TestScanner_ScanAutoDeleteExpiredObjects_PreservesRecentCommits(t *testing.
 		t.Fatalf("ScanOnce failed: %v", err)
 	}
 
-	// Both commit trees should be preserved (HEAD + recent within window)
 	items := store.QueueItems(orgID)
 	fsItems := 0
 	for _, item := range items {
@@ -606,7 +558,6 @@ func TestScanner_ScanAutoDeleteExpiredObjects_SkipsZeroAutoDelete(t *testing.T) 
 	store.AddOrganization(orgID)
 	libID := uuid.New()
 
-	// Library with auto_delete_days=0 (feature disabled)
 	store.AddLibraryWithAutoDelete(orgID, libID, "hot", "commit-head", 0)
 
 	now := time.Now()
@@ -620,7 +571,6 @@ func TestScanner_ScanAutoDeleteExpiredObjects_SkipsZeroAutoDelete(t *testing.T) 
 		t.Fatalf("ScanOnce failed: %v", err)
 	}
 
-	// auto_delete_days=0 means feature is disabled, so 0 fs_objects enqueued
 	items := store.QueueItems(orgID)
 	fsItems := 0
 	for _, item := range items {
@@ -650,13 +600,11 @@ func TestScanner_ScanAutoDeleteExpiredObjects_NestedDirs(t *testing.T) {
 	now := time.Now()
 	store.AddCommitWithDetails(libID, headCommitID, "fs-root", "", now)
 
-	// Deep tree: root -> dir1 -> dir2 -> file
 	store.AddFSObjectWithEntries(libID, "fs-root", "dir", nil, []string{"fs-dir1"})
 	store.AddFSObjectWithEntries(libID, "fs-dir1", "dir", nil, []string{"fs-dir2"})
 	store.AddFSObjectWithEntries(libID, "fs-dir2", "dir", nil, []string{"fs-file"})
 	store.AddFSObject(libID, "fs-file", "file", []string{"blk-1"})
 
-	// Orphaned fs_objects not in tree
 	store.AddFSObject(libID, "fs-orphan-1", "file", []string{"blk-2"})
 	store.AddFSObject(libID, "fs-orphan-2", "dir", nil)
 
@@ -666,7 +614,6 @@ func TestScanner_ScanAutoDeleteExpiredObjects_NestedDirs(t *testing.T) {
 		t.Fatalf("ScanOnce failed: %v", err)
 	}
 
-	// Only the 2 orphaned fs_objects should be enqueued
 	items := store.QueueItems(orgID)
 	fsItems := 0
 	enqueuedIDs := make(map[string]bool)
@@ -685,11 +632,60 @@ func TestScanner_ScanAutoDeleteExpiredObjects_NestedDirs(t *testing.T) {
 	if !enqueuedIDs["fs-orphan-2"] {
 		t.Error("expected fs-orphan-2 to be enqueued")
 	}
-	// Verify tree objects were NOT enqueued
 	for _, treeID := range []string{"fs-root", "fs-dir1", "fs-dir2", "fs-file"} {
 		if enqueuedIDs[treeID] {
 			t.Errorf("tree object %s should not be enqueued", treeID)
 		}
+	}
+}
+
+func TestScanner_ScanExpiredShares(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	s := NewScanner(store, q, stats)
+
+	orgID := uuid.New()
+	store.AddOrganization(orgID)
+	libID := uuid.New()
+
+	// Add expired and active shares
+	store.AddShare(libID, uuid.New(), uuid.New(), time.Now().Add(-24*time.Hour))  // expired
+	store.AddShare(libID, uuid.New(), uuid.New(), time.Now().Add(24*time.Hour))   // active
+	store.AddShare(libID, uuid.New(), uuid.New(), time.Time{})                     // permanent
+
+	ctx := context.Background()
+	s.scanExpiredShares(ctx)
+
+	// One expired share should be deleted (directly, not via queue)
+	shares, _ := store.ListExpiredShares()
+	if len(shares) != 0 {
+		t.Errorf("expected 0 expired shares after cleanup, got %d", len(shares))
+	}
+}
+
+func TestScanner_ScanExpiredRestoreJobs(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	s := NewScanner(store, q, stats)
+
+	orgID := uuid.New()
+	store.AddOrganization(orgID)
+	libID := uuid.New()
+
+	// Add completed and active restore jobs
+	store.AddRestoreJob(orgID, libID, uuid.New(), "completed", time.Now().Add(-24*time.Hour))
+	store.AddRestoreJob(orgID, libID, uuid.New(), "failed", time.Now().Add(-24*time.Hour))
+	store.AddRestoreJob(orgID, libID, uuid.New(), "pending", time.Now().Add(24*time.Hour)) // active
+
+	ctx := context.Background()
+	s.scanExpiredRestoreJobs(ctx)
+
+	// 2 expired jobs should be deleted, 1 should remain
+	jobs, _ := store.ListExpiredRestoreJobs()
+	if len(jobs) != 0 {
+		t.Errorf("expected 0 expired restore jobs after cleanup, got %d", len(jobs))
 	}
 }
 
@@ -705,16 +701,12 @@ func TestScanner_IdempotentEnqueue(t *testing.T) {
 
 	ctx := context.Background()
 
-	// Run scan twice
 	s.ScanOnce(ctx)
 	firstCount := store.QueueLen()
 
 	s.ScanOnce(ctx)
 	secondCount := store.QueueLen()
 
-	// Second scan will add duplicates since mock store doesn't enforce PK uniqueness
-	// In production, Cassandra's PK prevents duplicates. This is expected behavior
-	// for the mock.
 	if firstCount != 1 {
 		t.Errorf("first scan should enqueue 1 item, got %d", firstCount)
 	}

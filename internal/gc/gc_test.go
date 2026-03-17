@@ -414,3 +414,73 @@ func TestService_Queue(t *testing.T) {
 		t.Error("Queue() should return the internal queue")
 	}
 }
+
+func TestService_PersistAndRestoreStats(t *testing.T) {
+	store := NewMockStore()
+	cfg := config.GCConfig{Enabled: true}
+
+	// Create service and set some stats
+	svc := NewService(store, nil, cfg)
+	workerTime := time.Date(2026, 3, 15, 10, 30, 0, 0, time.UTC)
+	scanTime := time.Date(2026, 3, 15, 11, 0, 0, 0, time.UTC)
+	svc.stats.SetLastWorkerRun(workerTime)
+	svc.stats.SetLastScanRun(scanTime)
+	svc.stats.blocksDeleted.Store(42)
+
+	// Persist
+	svc.persistStats()
+
+	// Create a new service and restore — should recover the stats
+	svc2 := NewService(store, nil, cfg)
+	svc2.restoreStats()
+
+	if got := svc2.stats.LastWorkerRun(); !got.Equal(workerTime) {
+		t.Errorf("restored LastWorkerRun = %v, want %v", got, workerTime)
+	}
+	if got := svc2.stats.LastScanRun(); !got.Equal(scanTime) {
+		t.Errorf("restored LastScanRun = %v, want %v", got, scanTime)
+	}
+	if got := svc2.stats.BlocksDeleted(); got != 42 {
+		t.Errorf("restored BlocksDeleted = %d, want 42", got)
+	}
+}
+
+func TestService_RestoreStats_Empty(t *testing.T) {
+	store := NewMockStore()
+	cfg := config.GCConfig{Enabled: true}
+
+	svc := NewService(store, nil, cfg)
+	svc.restoreStats()
+
+	// Should be zero values when nothing was persisted
+	if got := svc.stats.LastWorkerRun(); !got.IsZero() {
+		t.Errorf("expected zero LastWorkerRun, got %v", got)
+	}
+	if got := svc.stats.LastScanRun(); !got.IsZero() {
+		t.Errorf("expected zero LastScanRun, got %v", got)
+	}
+	if got := svc.stats.BlocksDeleted(); got != 0 {
+		t.Errorf("expected 0 BlocksDeleted, got %d", got)
+	}
+}
+
+func TestService_PersistStats_SkipsZeroTimes(t *testing.T) {
+	store := NewMockStore()
+	cfg := config.GCConfig{Enabled: true}
+
+	svc := NewService(store, nil, cfg)
+	// Only set blocksDeleted, leave times at zero
+	svc.stats.blocksDeleted.Store(10)
+	svc.persistStats()
+
+	// Verify only blocks_deleted_total was saved, not the zero times
+	if val, _ := store.LoadGCStats("last_worker_run"); val != "" {
+		t.Errorf("should not persist zero last_worker_run, got %q", val)
+	}
+	if val, _ := store.LoadGCStats("last_scan_run"); val != "" {
+		t.Errorf("should not persist zero last_scan_run, got %q", val)
+	}
+	if val, _ := store.LoadGCStats("blocks_deleted_total"); val != "10" {
+		t.Errorf("blocks_deleted_total = %q, want %q", val, "10")
+	}
+}

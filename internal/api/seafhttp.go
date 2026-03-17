@@ -677,13 +677,18 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 		log.Printf("[HandleUpload] Stored block %s (SHA-256: %s)", fileID[:16], sha256ID[:16])
 	}
 
-	// Create SHA-1 → SHA-256 mapping
+	// Create SHA-1 → SHA-256 mapping (dual-write: forward + reverse lookup)
 	if err := h.db.Session().Query(`
 		INSERT INTO block_id_mappings (org_id, external_id, internal_id) VALUES (?, ?, ?)
 	`, token.OrgID, fileID, sha256ID).Exec(); err != nil {
 		log.Printf("[HandleUpload] CRITICAL: Failed to write block_id_mapping org=%s ext=%s int=%s: %v", token.OrgID, fileID[:16], sha256ID[:16], err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create block mapping"})
 		return
+	}
+	if err := h.db.Session().Query(`
+		INSERT INTO block_id_mappings_by_internal (org_id, internal_id, external_id, created_at) VALUES (?, ?, ?, toTimestamp(now()))
+	`, token.OrgID, sha256ID, fileID).Exec(); err != nil {
+		log.Printf("[HandleUpload] WARNING: Failed to write reverse block_id_mapping org=%s int=%s ext=%s: %v", token.OrgID, sha256ID[:16], fileID[:16], err)
 	}
 
 	// Register block metadata for size lookups (used by video/audio Range requests)
@@ -784,12 +789,17 @@ func (h *SeafHTTPHandler) finalizeUploadStreaming(c *gin.Context, token *AccessT
 			return "", "", fmt.Errorf("failed to store block: %w", err)
 		}
 
-		// Create SHA-1 → SHA-256 mapping
+		// Create SHA-1 → SHA-256 mapping (dual-write: forward + reverse lookup)
 		if err := h.db.Session().Query(`
 			INSERT INTO block_id_mappings (org_id, external_id, internal_id) VALUES (?, ?, ?)
 		`, token.OrgID, blockSHA1ID, sha256ID).Exec(); err != nil {
 			log.Printf("[finalizeUploadStreaming] CRITICAL: Failed to write block_id_mapping org=%s ext=%s int=%s: %v", token.OrgID, blockSHA1ID[:16], sha256ID[:16], err)
 			return "", "", fmt.Errorf("failed to create block mapping: %w", err)
+		}
+		if err := h.db.Session().Query(`
+			INSERT INTO block_id_mappings_by_internal (org_id, internal_id, external_id, created_at) VALUES (?, ?, ?, toTimestamp(now()))
+		`, token.OrgID, sha256ID, blockSHA1ID).Exec(); err != nil {
+			log.Printf("[finalizeUploadStreaming] WARNING: Failed to write reverse block_id_mapping org=%s int=%s ext=%s: %v", token.OrgID, sha256ID[:16], blockSHA1ID[:16], err)
 		}
 
 		// Register block metadata for size lookups (used by video/audio Range requests)

@@ -485,9 +485,9 @@ A `MockStorageProvider` and `mockBlockDeleter` simulate S3 and track deleted blo
 | File | Tests | Type | What's Tested |
 |------|-------|------|---------------|
 | `internal/gc/gc_test.go` | 10 | Unit (mock) | Stats (atomic counters, concurrency), GCStatus formatting, Service creation, config propagation, SetDryRun, disabled service, trigger channels, status with mock store |
-| `internal/gc/queue_test.go` | 10 | Integration (mock) | Enqueue+Dequeue round-trip, grace period filtering, retry increment, ListOrgsWithQueuedItems, GetQueueSize, GetTotalQueueSize, multiple item types, Complete removes items |
-| `internal/gc/worker_test.go` | 12 | Integration (mock) | Block deletion (ref_count=0 with S3+DB cleanup), block sparing (ref_count>0), dry run mode, commit deletion, FS object cascade (decrement blocks, enqueue zero-ref), retry on failure, empty queue, library contents enqueue, block mapping deletion, context cancellation |
-| `internal/gc/scanner_test.go` | 9 | Integration (mock) | Orphaned blocks (ref_count<=0), expired share links, orphaned commits (with org lookup), orphaned fs_objects, empty DB scan, full pipeline (all 4 phases), context cancellation, idempotent enqueue |
+| `internal/gc/queue_test.go` | 10 | Integration (mock) | Enqueue+Dequeue round-trip, grace period filtering, retry increment, ListOrgsWithQueuedItems, GetQueueSize, GetTotalQueueSize, multiple item types (incl. share, restore_job), Complete removes items |
+| `internal/gc/worker_test.go` | 12 | Integration (mock) | Block deletion (ref_count=0 with S3+DB+reverse mapping cleanup), block sparing (ref_count>0), dry run mode, commit cascade (enqueues root fs_object), FS object cascade (enqueues child dirs + blocks), retry on failure, empty queue, library contents enqueue (no duplicate blocks), block mapping deletion, context cancellation |
+| `internal/gc/scanner_test.go` | 11 | Integration (mock) | Orphaned blocks (ref_count<=0), expired share links, orphaned commits (with org lookup), orphaned fs_objects, empty DB scan, full pipeline (all 8 phases), context cancellation, idempotent enqueue, expired shares (Phase 7), expired restore jobs (Phase 8) |
 | `internal/api/gc_adapter_test.go` | 7 | Unit | Invalid UUIDs, empty inputs, interface compliance, nil service, config defaults |
 | `internal/api/v2/gc_hooks_test.go` | 8 | Unit | Set/get hooks, nil defaults, concurrent access, interface compile-time check, mock call recording |
 
@@ -501,11 +501,15 @@ All of these run without any external dependencies:
 | `Worker_ProcessBlock_RefCountPositive` | Block with ref_count>0 is NOT deleted (safety check) |
 | `Worker_ProcessBlock_DryRun` | Dry run mode logs but doesn't delete anything |
 | `Worker_ProcessFSObject_CascadeBlocks` | FS object deletion decrements block ref_counts, enqueues blocks that hit 0 |
-| `Worker_EnqueueLibraryContents` | Library deletion enqueues all commits + fs_objects + blocks |
+| `Worker_ProcessCommit_CascadesFSObjects` | Commit deletion fetches commit → enqueues root fs_object for cascade |
+| `Worker_ProcessFSObject_CascadesDirEntries` | Directory deletion enqueues child entries recursively |
+| `Worker_EnqueueLibraryContents_NoDuplicateBlocks` | Library enqueue only adds commits+fs_objects (blocks cascade from fs_object processing) |
 | `Worker_RetryOnFailure` | Unknown item type triggers retry count increment |
 | `Scanner_ScanOrphanedBlocks` | Finds blocks with ref_count<=0 across orgs |
 | `Scanner_ScanExpiredShareLinks` | Finds share links past expiry, skips permanent ones |
-| `Scanner_ScanOnce_FullPipeline` | All 4 scanner phases run in sequence |
+| `Scanner_ScanExpiredShares` | Expired user-to-user shares cleaned (Phase 7) |
+| `Scanner_ScanExpiredRestoreJobs` | Completed/failed/expired restore jobs cleaned (Phase 8) |
+| `Scanner_ScanOnce_FullPipeline` | All 8 scanner phases run in sequence |
 | `Queue_DequeueBatch_GracePeriod` | Items newer than grace period are not dequeued |
 
 ### Manual GC Verification
@@ -571,6 +575,12 @@ The `scripts/test-gc.sh` script tests the GC admin endpoints against a live back
 Tests: 21 assertions covering status endpoint, permission enforcement (403 for non-admin), worker/scanner triggers, dry_run override, status updates after triggers, edge cases (empty body, invalid JSON).
 
 Also wired into `./scripts/test.sh api` as the "Garbage Collection Admin API" suite.
+
+### Tests Updated in 2026-03-17 (GC Major Overhaul)
+
+- **Updated: `internal/gc/worker_test.go`** — commit cascade (enqueues root fs_object), fs_object cascade (enqueues child dirs), library enqueue (no duplicate blocks), block deletion with reverse mapping cleanup
+- **Updated: `internal/gc/scanner_test.go`** — 11 tests: added Phase 7 (expired shares) + Phase 8 (expired restore jobs), full pipeline now covers all 8 phases
+- **Updated: `internal/gc/store_mock.go`** — complete rewrite: new mock types (shares, restore jobs, file tags, API tokens), all new GCStore interface methods implemented
 
 ### Tests Updated in 2026-01-30 (GC Mock Refactoring)
 

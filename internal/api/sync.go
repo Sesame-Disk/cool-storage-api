@@ -851,12 +851,16 @@ func (h *SyncHandler) PutBlock(c *gin.Context) {
 			VALUES (?, ?, ?, ?, 1, ?, ?)
 		`, orgID, internalID, len(data), storageClass, now, now).Exec()
 
-		// If legacy SHA-1 client, store mapping external→internal
+		// If legacy SHA-1 client, store mapping external→internal (dual-write: forward + reverse)
 		if isLegacySHA1 {
 			_ = h.db.Session().Query(`
 				INSERT INTO block_id_mappings (org_id, external_id, internal_id, created_at)
 				VALUES (?, ?, ?, ?)
 			`, orgID, externalID, internalID, now).Exec()
+			_ = h.db.Session().Query(`
+				INSERT INTO block_id_mappings_by_internal (org_id, internal_id, external_id, created_at)
+				VALUES (?, ?, ?, ?)
+			`, orgID, internalID, externalID, now).Exec()
 			log.Printf("PutBlock: stored mapping %s → %s\n", externalID, internalID)
 		}
 	}

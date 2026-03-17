@@ -78,8 +78,8 @@ func TestWorker_ProcessBlock_RefCountZero(t *testing.T) {
 		t.Errorf("expected S3 deletion of block-1, got %v", deleted)
 	}
 
-	// Block mapping should be cleaned up
-	mappings, _ := store.ListBlockMappings(orgID)
+	// Block mapping should be cleaned up (via reverse lookup)
+	mappings, _ := store.ListBlockMappingsByInternalID(orgID, "block-1")
 	if len(mappings) != 0 {
 		t.Errorf("expected 0 mappings, got %d", len(mappings))
 	}
@@ -149,7 +149,7 @@ func TestWorker_ProcessBlock_DryRun(t *testing.T) {
 	}
 }
 
-func TestWorker_ProcessCommit(t *testing.T) {
+func TestWorker_ProcessCommit_CascadesFSObjects(t *testing.T) {
 	store := NewMockStore()
 	stats := &Stats{}
 	q := NewQueue(store)
@@ -157,6 +157,8 @@ func TestWorker_ProcessCommit(t *testing.T) {
 
 	orgID := uuid.New()
 	libID := uuid.New()
+
+	// Commit points to a root fs_object
 	store.AddCommit(libID, "commit-abc", "fs-root")
 
 	store.EnqueueItem(orgID, time.Now().Add(-2*time.Hour), ItemCommit, "commit-abc", libID, "", 0)
@@ -171,8 +173,42 @@ func TestWorker_ProcessCommit(t *testing.T) {
 	}
 
 	// Commit should be deleted
-	if store.GetCommit(libID, "commit-abc") != nil {
+	if store.GetCommitRecord(libID, "commit-abc") != nil {
 		t.Error("commit should be deleted")
+	}
+
+	// Root fs_object should be enqueued for cascade deletion
+	items := store.QueueItems(orgID)
+	fsItems := 0
+	for _, item := range items {
+		if item.ItemType == ItemFSObject && item.ItemID == "fs-root" {
+			fsItems++
+		}
+	}
+	if fsItems != 1 {
+		t.Errorf("expected 1 fs_object enqueued for cascade, got %d", fsItems)
+	}
+}
+
+func TestWorker_ProcessCommit_AlreadyDeleted(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	w := NewWorker(store, nil, q, 100, 0, false, stats)
+
+	orgID := uuid.New()
+	libID := uuid.New()
+
+	// Don't add the commit — simulate already deleted
+	store.EnqueueItem(orgID, time.Now().Add(-2*time.Hour), ItemCommit, "commit-gone", libID, "", 0)
+
+	ctx := context.Background()
+	n, err := w.ProcessOnce(ctx)
+	if err != nil {
+		t.Fatalf("ProcessOnce failed: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("expected 1 processed (already deleted), got %d", n)
 	}
 }
 
@@ -240,6 +276,48 @@ func TestWorker_ProcessFSObject_CascadeBlocks(t *testing.T) {
 	}
 }
 
+func TestWorker_ProcessFSObject_CascadesDirEntries(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	w := NewWorker(store, nil, q, 100, 0, false, stats)
+
+	orgID := uuid.New()
+	libID := uuid.New()
+
+	// Create a directory with children
+	store.AddFSObjectWithEntries(libID, "fs-dir", "dir", nil, []string{"fs-child1", "fs-child2"})
+	store.AddLibrary(orgID, libID, "hot")
+
+	store.EnqueueItem(orgID, time.Now().Add(-2*time.Hour), ItemFSObject, "fs-dir", libID, "", 0)
+
+	ctx := context.Background()
+	n, err := w.ProcessOnce(ctx)
+	if err != nil {
+		t.Fatalf("ProcessOnce failed: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("expected 1 processed, got %d", n)
+	}
+
+	// Directory should be deleted
+	if store.GetFSObj(libID, "fs-dir") != nil {
+		t.Error("directory fs_object should be deleted")
+	}
+
+	// Children should be enqueued
+	items := store.QueueItems(orgID)
+	childCount := 0
+	for _, item := range items {
+		if item.ItemType == ItemFSObject {
+			childCount++
+		}
+	}
+	if childCount != 2 {
+		t.Errorf("expected 2 child fs_objects enqueued, got %d", childCount)
+	}
+}
+
 func TestWorker_RetryOnFailure(t *testing.T) {
 	store := NewMockStore()
 	stats := &Stats{}
@@ -283,7 +361,7 @@ func TestWorker_ProcessOnce_EmptyQueue(t *testing.T) {
 	}
 }
 
-func TestWorker_EnqueueLibraryContents(t *testing.T) {
+func TestWorker_EnqueueLibraryContents_NoDuplicateBlocks(t *testing.T) {
 	store := NewMockStore()
 	stats := &Stats{}
 	q := NewQueue(store)
@@ -303,7 +381,8 @@ func TestWorker_EnqueueLibraryContents(t *testing.T) {
 		t.Fatalf("EnqueueLibraryContents failed: %v", err)
 	}
 
-	// Check queue contents
+	// Check queue contents — should only have commits and fs_objects,
+	// NOT blocks (blocks cascade from fs_object processing)
 	items := store.QueueItems(orgID)
 
 	commitCount := 0
@@ -326,8 +405,8 @@ func TestWorker_EnqueueLibraryContents(t *testing.T) {
 	if fsCount != 2 {
 		t.Errorf("expected 2 fs_objects enqueued, got %d", fsCount)
 	}
-	if blockCount != 3 {
-		t.Errorf("expected 3 blocks enqueued, got %d", blockCount)
+	if blockCount != 0 {
+		t.Errorf("expected 0 blocks enqueued (cascade from fs_objects), got %d", blockCount)
 	}
 }
 
@@ -352,7 +431,7 @@ func TestWorker_ProcessBlockMapping(t *testing.T) {
 	}
 
 	// Mapping should be deleted
-	mappings, _ := store.ListBlockMappings(orgID)
+	mappings, _ := store.ListBlockMappingsByInternalID(orgID, "int-sha256")
 	if len(mappings) != 0 {
 		t.Errorf("expected 0 mappings, got %d", len(mappings))
 	}
@@ -369,6 +448,8 @@ func TestQueueItem_TypeConversion(t *testing.T) {
 		{"fs_object", ItemFSObject},
 		{"block_mapping", ItemBlockMapping},
 		{"share_link", ItemShareLink},
+		{"share", ItemShare},
+		{"restore_job", ItemRestoreJob},
 	}
 
 	for _, tt := range tests {

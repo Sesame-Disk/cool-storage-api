@@ -429,29 +429,50 @@ Session 2 (China): Block abc123 → DB lookup finds it exists in hot-s3-usa
 
 ### Components
 
-#### GC Worker (runs every gc_interval)
+The GC system has two independent goroutines: a **Worker** (every 30s) and a **Scanner** (every 24h).
 
-```
-1. SCAN: Find commits older than version_ttl_days
-   SELECT * FROM commits WHERE created_at < NOW() - TTL
+#### GC Worker (runs every 30s)
 
-2. MARK: Identify orphaned blocks
-   - Walk FS tree of each commit to be deleted
-   - Decrement ref_count for each block
-   - Mark blocks with ref_count = 0 as orphaned
+Drains the `gc_queue` table. Each item has a type; the worker dispatches accordingly:
 
-3. SWEEP: Delete orphaned data
-   - Delete commits from commits table
-   - Delete orphaned fs_objects
-   - Delete orphaned blocks from S3 (ref_count = 0)
-   - Clean up block_id_mappings for deleted blocks
-```
+| Item Type | Action |
+|-----------|--------|
+| `block` | Check `ref_count`; if 0 → delete from S3 + DB + reverse mappings |
+| `commit` | Fetch commit → enqueue root `fs_object` for cascading deletion → delete commit |
+| `fs_object` | Enqueue child dir entries (recursive) + enqueue blocks → delete fs_object |
+| `block_mapping` | Delete forward + reverse `block_id_mappings` entries |
+| `share_link` | Delete from all 4 share_links tables (quad-delete) |
+| `share` | Delete user-to-user share from `shares` + `shares_by_user` |
+| `restore_job` | Delete completed/expired restore job |
+
+**Two-phase deletion**: items sit in `gc_queue` for a grace period (default 1h) before the worker processes them. The `gc_queue` table has a 7-day TTL for auto-cleanup of stuck items.
+
+**Cascading**: Commit → fs_object → blocks. The worker only enqueues commits and fs_objects when a library is deleted; blocks are discovered and enqueued during fs_object processing.
+
+**Library deletion** also enqueues artifact cleanup: shares, share links, repo tags, file tags, API tokens, locked files.
+
+#### GC Scanner (8 phases, runs every 24h + on startup)
+
+| Phase | What it scans | Action |
+|-------|--------------|--------|
+| 1 | Orphaned blocks (`ref_count=0`) | Enqueue for deletion |
+| 2 | Expired share links (`expires_at < now`) | Enqueue for deletion |
+| 3 | Orphaned commits (library no longer exists) | Enqueue for deletion |
+| 4 | Orphaned fs_objects (library no longer exists) | Enqueue for deletion |
+| 5 | Expired versions (`version_ttl_days`) | Enqueue old commits |
+| 6 | Auto-delete expired objects (`auto_delete_days`) | Enqueue old fs_objects |
+| 7 | Expired user-to-user shares | Delete directly |
+| 8 | Expired/completed restore jobs | Delete directly |
+
+**Stats persistence**: Worker/scanner timestamps and `blocks_deleted_total` are saved to `gc_stats` table on shutdown and restored on startup, surviving container restarts.
 
 **Safety measures**:
 - Never delete HEAD commit or its ancestors within TTL
-- Grace period: blocks marked orphaned wait 24h before S3 deletion
-- Dry-run mode for testing
-- Metrics: commits_deleted, blocks_deleted, bytes_reclaimed
+- Grace period: items wait 1h in queue before processing
+- `gc_queue` has 7-day Cassandra TTL for stuck items
+- Dry-run mode for testing (toggle at runtime via admin API)
+- Prometheus metrics: `gc_worker_duration`, `gc_scanner_duration`, `gc_queue_size`, `gc_blocks_deleted_total`
+- Scanner runs immediately on startup to catch anything missed during downtime
 
 #### Reference Counting
 
@@ -460,6 +481,10 @@ Session 2 (China): Block abc123 → DB lookup finds it exists in hot-s3-usa
 - **File copy**: increment `ref_count`
 - **Commit deletion**: decrement `ref_count` for all blocks in commit
 - **Block deletion**: only when `ref_count = 0`
+
+#### Reverse Lookup Table
+
+`block_id_mappings_by_internal` provides reverse lookup (internal SHA-256 → external SHA-1) so the worker can find and clean mappings when deleting a block without scanning the entire `block_id_mappings` table. Dual-written alongside the forward table on every upload.
 
 ---
 
@@ -599,6 +624,13 @@ erDiagram
         TIMESTAMP created_at
     }
 
+    block_id_mappings_by_internal {
+        UUID org_id PK
+        TEXT internal_id PK
+        TEXT external_id PK
+        TIMESTAMP created_at
+    }
+
     share_links {
         TEXT link_token PK
         TEXT link_type
@@ -687,6 +719,7 @@ erDiagram
     organizations ||--o{ libraries : "contains"
     organizations ||--o{ blocks : "contains"
     organizations ||--o{ block_id_mappings : "contains"
+    organizations ||--o{ block_id_mappings_by_internal : "contains"
     organizations ||--o{ restore_jobs : "contains"
     organizations ||--o{ hostname_mappings : "mapped_to"
 
@@ -715,6 +748,7 @@ erDiagram
 | `commits` → `fs_objects` | Each commit points to a root fs_object (directory tree) |
 | `fs_objects` → `blocks` | Files reference content blocks by ID |
 | `blocks` ← `block_id_mappings` | SHA-1 to SHA-256 translation for Seafile clients |
+| `block_id_mappings` ↔ `block_id_mappings_by_internal` | Reverse lookup (SHA-256 → SHA-1) for GC cleanup |
 | `users` → `starred_files` | User favorites |
 | `libraries` → `locked_files` | File locking for collaborative editing |
 
@@ -729,6 +763,7 @@ Cassandra tables use partition keys (PK) for data distribution:
 | `commits` | `library_id` | `commit_id` | History per library |
 | `fs_objects` | `library_id` | `fs_id` | Tree per library |
 | `blocks` | `org_id` | `block_id` | Blocks per org (dedup) |
+| `block_id_mappings_by_internal` | `org_id` | `internal_id, external_id` | Reverse lookup for GC |
 | `starred_files` | `user_id` | `repo_id, path` | User favorites |
 
 ---
