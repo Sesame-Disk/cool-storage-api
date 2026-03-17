@@ -78,6 +78,7 @@ func (s *Scanner) scanOrphanedBlocks(ctx context.Context) (int, error) {
 	}
 
 	enqueued := 0
+	now := time.Now()
 	for _, orgID := range orgs {
 		select {
 		case <-ctx.Done():
@@ -90,11 +91,24 @@ func (s *Scanner) scanOrphanedBlocks(ctx context.Context) (int, error) {
 			continue
 		}
 
+		var batch []QueueItem
 		for _, b := range blocks {
 			if b.RefCount <= 0 {
-				if err := s.queue.Enqueue(orgID, ItemBlock, b.BlockID, uuid.Nil, b.StorageClass); err == nil {
-					enqueued++
-				}
+				batch = append(batch, QueueItem{
+					OrgID:        orgID,
+					QueuedAt:     now,
+					ItemType:     ItemBlock,
+					ItemID:       b.BlockID,
+					LibraryID:    uuid.Nil,
+					StorageClass: b.StorageClass,
+				})
+			}
+		}
+		if len(batch) > 0 {
+			if err := s.queue.EnqueueBatch(batch); err != nil {
+				log.Printf("[GC Scanner] Phase 1: failed to batch enqueue blocks for org %s: %v", orgID, err)
+			} else {
+				enqueued += len(batch)
 			}
 		}
 	}
@@ -116,17 +130,23 @@ func (s *Scanner) scanExpiredShareLinks(ctx context.Context) (int, error) {
 	}
 
 	enqueued := 0
+	var batch []QueueItem
+	batchTime := time.Now()
 	for _, link := range links {
-		select {
-		case <-ctx.Done():
-			return enqueued, ctx.Err()
-		default:
-		}
-
 		if !link.ExpiresAt.IsZero() && link.ExpiresAt.Before(now) {
-			if err := s.queue.Enqueue(link.OrgID, ItemShareLink, link.ShareToken, uuid.Nil, ""); err == nil {
-				enqueued++
-			}
+			batch = append(batch, QueueItem{
+				OrgID:    link.OrgID,
+				QueuedAt: batchTime,
+				ItemType: ItemShareLink,
+				ItemID:   link.ShareToken,
+			})
+		}
+	}
+	if len(batch) > 0 {
+		if err := s.queue.EnqueueBatch(batch); err != nil {
+			log.Printf("[GC Scanner] Phase 2: failed to batch enqueue expired links: %v", err)
+		} else {
+			enqueued = len(batch)
 		}
 	}
 
@@ -171,9 +191,22 @@ func (s *Scanner) scanOrphanedCommits(ctx context.Context) (int, error) {
 		if err != nil {
 			continue
 		}
-		for _, commitID := range commitIDs {
-			if err := s.queue.Enqueue(orgID, ItemCommit, commitID, libID, ""); err == nil {
-				enqueued++
+		if len(commitIDs) > 0 {
+			now := time.Now()
+			batch := make([]QueueItem, 0, len(commitIDs))
+			for _, commitID := range commitIDs {
+				batch = append(batch, QueueItem{
+					OrgID:     orgID,
+					QueuedAt:  now,
+					ItemType:  ItemCommit,
+					ItemID:    commitID,
+					LibraryID: libID,
+				})
+			}
+			if err := s.queue.EnqueueBatch(batch); err != nil {
+				log.Printf("[GC Scanner] Phase 3: failed to batch enqueue commits for library %s: %v", libID, err)
+			} else {
+				enqueued += len(batch)
 			}
 		}
 	}
@@ -216,9 +249,22 @@ func (s *Scanner) scanOrphanedFSObjects(ctx context.Context) (int, error) {
 		if err != nil {
 			continue
 		}
-		for _, fsID := range fsIDs {
-			if err := s.queue.Enqueue(orgID, ItemFSObject, fsID, libID, ""); err == nil {
-				enqueued++
+		if len(fsIDs) > 0 {
+			now := time.Now()
+			batch := make([]QueueItem, 0, len(fsIDs))
+			for _, fsID := range fsIDs {
+				batch = append(batch, QueueItem{
+					OrgID:     orgID,
+					QueuedAt:  now,
+					ItemType:  ItemFSObject,
+					ItemID:    fsID,
+					LibraryID: libID,
+				})
+			}
+			if err := s.queue.EnqueueBatch(batch); err != nil {
+				log.Printf("[GC Scanner] Phase 4: failed to batch enqueue fs_objects for library %s: %v", libID, err)
+			} else {
+				enqueued += len(batch)
 			}
 		}
 	}
@@ -276,14 +322,27 @@ func (s *Scanner) scanExpiredVersions(ctx context.Context) (int, error) {
 
 		// Find expired commits not in keep set
 		cutoff := time.Now().AddDate(0, 0, -lib.VersionTTLDays)
+		now := time.Now()
+		var batch []QueueItem
 		for _, c := range commits {
 			if keepSet[c.CommitID] {
 				continue
 			}
 			if c.CreatedAt.Before(cutoff) {
-				if err := s.queue.Enqueue(lib.OrgID, ItemCommit, c.CommitID, lib.LibraryID, ""); err == nil {
-					enqueued++
-				}
+				batch = append(batch, QueueItem{
+					OrgID:     lib.OrgID,
+					QueuedAt:  now,
+					ItemType:  ItemCommit,
+					ItemID:    c.CommitID,
+					LibraryID: lib.LibraryID,
+				})
+			}
+		}
+		if len(batch) > 0 {
+			if err := s.queue.EnqueueBatch(batch); err != nil {
+				log.Printf("[GC Scanner] Phase 5: failed to batch enqueue expired commits for library %s: %v", lib.LibraryID, err)
+			} else {
+				enqueued += len(batch)
 			}
 		}
 	}
@@ -363,11 +422,24 @@ func (s *Scanner) scanAutoDeleteExpiredObjects(ctx context.Context) (int, error)
 			continue
 		}
 
+		now := time.Now()
+		var batch []QueueItem
 		for _, fsID := range allFSIDs {
 			if !keepFSSet[fsID] {
-				if err := s.queue.Enqueue(lib.OrgID, ItemFSObject, fsID, lib.LibraryID, ""); err == nil {
-					enqueued++
-				}
+				batch = append(batch, QueueItem{
+					OrgID:     lib.OrgID,
+					QueuedAt:  now,
+					ItemType:  ItemFSObject,
+					ItemID:    fsID,
+					LibraryID: lib.LibraryID,
+				})
+			}
+		}
+		if len(batch) > 0 {
+			if err := s.queue.EnqueueBatch(batch); err != nil {
+				log.Printf("[GC Scanner] Phase 6: failed to batch enqueue fs_objects for library %s: %v", lib.LibraryID, err)
+			} else {
+				enqueued += len(batch)
 			}
 		}
 	}

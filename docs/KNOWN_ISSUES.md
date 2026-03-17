@@ -696,6 +696,54 @@ Added `getEffectiveHostname(c *gin.Context) string` helper in `server.go` for th
 
 ## 🔴 OPEN ISSUES
 
+### ISSUE-GC-MULTIINSTANCE-01: GC is not safe with multiple instances
+
+**Status**: 🟡 Pending
+**Discovered**: 2026-03-17
+**Priority**: 🟡 High — required before scaling to multiple replicas
+**Affected**: `internal/gc/worker.go`, `internal/gc/scanner.go`, `internal/gc/gc.go`
+
+**Problem:**
+The GC (worker + scanner) has no coordination mechanism between instances. If multiple server replicas are running, all of them execute the worker and scanner in parallel, causing:
+
+1. **DequeueBatch without locking**: `SELECT ... LIMIT ?` returns the same items to all instances. Both process the same items simultaneously.
+2. **Scanner without leader election**: Multiple scanners enqueue the same orphans as duplicates (the PK includes `queued_at = time.Now()`, so each INSERT creates a distinct row).
+3. **gc_queue_stats counters out of sync**: Duplicate work causes extra counter decrements, skewing admin metrics.
+
+**Is there data loss?** No. Destructive operations are protected:
+- `DeleteBlock` uses LWT two-phase (only one instance wins the `IF ref_count <= 0`)
+- `MarkItemProcessed` uses `INSERT ... IF NOT EXISTS` to prevent double-decrement of ref_count
+- Cassandra DELETEs are idempotent
+
+**Actual impact**: Wasted work (CPU/network overhead) and slightly incorrect admin counters. No risk of data loss.
+
+**Proposed solution — Leader Election via LWT:**
+```sql
+CREATE TABLE IF NOT EXISTS gc_leader (
+    role TEXT PRIMARY KEY,
+    instance_id TEXT,
+    heartbeat TIMESTAMP
+) WITH default_time_to_live = 30;
+```
+```go
+// Only the leader runs worker/scanner. If it dies, the TTL expires and another takes over.
+applied, _ := session.Query(`
+    INSERT INTO gc_leader (role, instance_id, heartbeat)
+    VALUES (?, ?, ?) IF NOT EXISTS
+`, role, instanceID, time.Now()).ScanCAS()
+```
+- Heartbeat renewal every 10s with `UPDATE ... IF instance_id = ?`
+- If heartbeat expires (TTL 30s), another instance can take leadership
+- Separate roles: `worker` and `scanner` (can run on different instances)
+
+**Alternative — Org partitioning:**
+Each instance processes `hash(orgID) % numInstances == myIndex`. No coordination needed but requires knowing the total number of instances.
+
+**Alternative — Accept duplication:**
+If only 2-3 instances will run, overhead is minimal and all logic is already idempotent. Counters can be recalculated with a periodic scan.
+
+---
+
 ### ISSUE-FILE-EDIT-01: No In-Browser Editing for Text/Markdown/Code Files
 
 **Status**: ❌ Not Implemented
