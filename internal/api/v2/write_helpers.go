@@ -157,6 +157,18 @@ func renameGroup(db interface{ Session() *gocql.Session }, orgID, groupID, newNa
 	return nil
 }
 
+func softDeleteUser(db interface{ Session() *gocql.Session }, orgID, userID string, deletedAt time.Time) error {
+	return db.Session().Query(`
+		UPDATE users SET role = ?, deleted_at = ? WHERE org_id = ? AND user_id = ?
+	`, "deleted", deletedAt, orgID, userID).Exec()
+}
+
+func restoreDeletedUser(db interface{ Session() *gocql.Session }, orgID, userID string) error {
+	return db.Session().Query(`
+		UPDATE users SET role = ?, deleted_at = ? WHERE org_id = ? AND user_id = ?
+	`, "user", nil, orgID, userID).Exec()
+}
+
 func rollbackNewLibrary(db interface{ Session() *gocql.Session }, orgID, libraryID string) error {
 	batch := db.Session().Batch(gocql.LoggedBatch)
 	batch.Query(`

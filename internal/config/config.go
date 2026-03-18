@@ -255,6 +255,12 @@ type GCConfig struct {
 	BatchSize      int           `yaml:"batch_size"`      // default: 100 (items per tick)
 	GracePeriod    time.Duration `yaml:"grace_period"`    // default: 1h (delay before S3 delete)
 	DryRun         bool          `yaml:"dry_run"`         // default: false
+
+	// Soft-delete grace periods (0 = cascade immediately)
+	UserGraceDays      int `yaml:"user_grace_days"`      // default: 7 — days before deleted user is permanently purged
+	OrgGraceDays       int `yaml:"org_grace_days"`       // default: 30 — days before deleted org is permanently purged
+	TrashRetentionDays int `yaml:"trash_retention_days"` // default: 30 — days deleted libraries stay in trash
+	AuditRetentionDays int `yaml:"audit_retention_days"` // default: 365 — days audit log entries are kept
 }
 
 // Load reads configuration from config.yaml and environment variables
@@ -360,12 +366,16 @@ func DefaultConfig() *Config {
 			GCInterval:     24 * time.Hour,
 		},
 		GC: GCConfig{
-			Enabled:        true,
-			WorkerInterval: 30 * time.Second,
-			ScanInterval:   24 * time.Hour,
-			BatchSize:      100,
-			GracePeriod:    1 * time.Hour,
-			DryRun:         false,
+			Enabled:            true,
+			WorkerInterval:     30 * time.Second,
+			ScanInterval:       24 * time.Hour,
+			BatchSize:          100,
+			GracePeriod:        1 * time.Hour,
+			DryRun:             false,
+			UserGraceDays:      7,
+			OrgGraceDays:       30,
+			TrashRetentionDays: 30,
+			AuditRetentionDays: 365,
 		},
 		SeafHTTP: SeafHTTPConfig{
 			TokenTTL: 1 * time.Hour,
@@ -592,6 +602,28 @@ func (c *Config) applyEnvOverrides() {
 	if v := os.Getenv("FILEVIEW_MAX_IWORK_PREVIEW_BYTES"); v != "" {
 		if i, err := strconv.ParseInt(v, 10, 64); err == nil {
 			c.FileView.MaxIWorkPreviewBytes = i
+		}
+	}
+
+	// GC grace periods
+	if v := os.Getenv("GC_USER_GRACE_DAYS"); v != "" {
+		if i, err := strconv.Atoi(v); err == nil {
+			c.GC.UserGraceDays = i
+		}
+	}
+	if v := os.Getenv("GC_ORG_GRACE_DAYS"); v != "" {
+		if i, err := strconv.Atoi(v); err == nil {
+			c.GC.OrgGraceDays = i
+		}
+	}
+	if v := os.Getenv("GC_TRASH_RETENTION_DAYS"); v != "" {
+		if i, err := strconv.Atoi(v); err == nil {
+			c.GC.TrashRetentionDays = i
+		}
+	}
+	if v := os.Getenv("GC_AUDIT_RETENTION_DAYS"); v != "" {
+		if i, err := strconv.Atoi(v); err == nil {
+			c.GC.AuditRetentionDays = i
 		}
 	}
 }

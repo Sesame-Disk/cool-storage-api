@@ -687,7 +687,11 @@ func (h *AdminHandler) adminUsersHandler(c *gin.Context) {
 				h.GetUser(c)
 			}
 		case "PUT":
-			h.UpdateUser(c)
+			if strings.HasPrefix(subResource, "restore") {
+				h.RestoreUser(c)
+			} else {
+				h.UpdateUser(c)
+			}
 		case "DELETE":
 			h.DeactivateUser(c)
 		default:
@@ -885,11 +889,9 @@ func (h *AdminHandler) DeactivateUser(c *gin.Context) {
 
 	orgID := callerOrgID
 
-	// Set role to "deactivated" to disable the user
-	if err := h.db.Session().Query(`
-		UPDATE users SET role = ? WHERE org_id = ? AND user_id = ?
-	`, "deactivated", orgID, targetUserID).Exec(); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to deactivate user"})
+	// Soft-delete: mark as "deleted" with timestamp for grace period cascade
+	if err := softDeleteUser(h.db, orgID, targetUserID, time.Now()); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete user"})
 		return
 	}
 
@@ -2140,10 +2142,52 @@ func (h *AdminHandler) DeleteUserByEmail(c *gin.Context, email string) {
 		return
 	}
 
+	// Soft-delete: mark as "deleted" with timestamp for grace period cascade
+	if err := softDeleteUser(h.db, userOrgID, userID, time.Now()); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete user"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"success": true})
+}
+
+// RestoreUser restores a soft-deleted user (within grace period).
+// PUT /admin/users/:email/restore/
+func (h *AdminHandler) RestoreUser(c *gin.Context) {
+	callerOrgID := c.GetString("org_id")
+	callerUserID := c.GetString("user_id")
+
+	if err := h.requireAdminAccess(c, callerOrgID, callerUserID); err != nil {
+		return
+	}
+
+	email := h.getResolvedUserParam(c)
+	if !strings.Contains(email, "@") {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "email address required"})
+		return
+	}
+
+	userID, userOrgID, err := h.lookupUserByEmail(email)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "user not found"})
+		return
+	}
+
+	// Verify user is actually in "deleted" state
+	var currentRole string
 	if err := h.db.Session().Query(`
-		UPDATE users SET role = ? WHERE org_id = ? AND user_id = ?
-	`, "deactivated", userOrgID, userID).Exec(); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to deactivate user"})
+		SELECT role FROM users WHERE org_id = ? AND user_id = ?
+	`, userOrgID, userID).Scan(&currentRole); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to fetch user"})
+		return
+	}
+	if currentRole != "deleted" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "user is not in deleted state"})
+		return
+	}
+
+	if err := restoreDeletedUser(h.db, userOrgID, userID); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to restore user"})
 		return
 	}
 

@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Sesame-Disk/sesamefs/internal/config"
 	"github.com/google/uuid"
 )
 
@@ -13,7 +14,7 @@ func TestNewScanner(t *testing.T) {
 	stats := &Stats{}
 	q := NewQueue(store)
 
-	s := NewScanner(store, q, stats)
+	s := NewScanner(store, q, stats, config.GCConfig{})
 
 	if s == nil {
 		t.Fatal("NewScanner returned nil")
@@ -24,7 +25,7 @@ func TestScanner_ScanOrphanedBlocks(t *testing.T) {
 	store := NewMockStore()
 	stats := &Stats{}
 	q := NewQueue(store)
-	s := NewScanner(store, q, stats)
+	s := NewScanner(store, q, stats, config.GCConfig{})
 
 	orgID := uuid.New()
 	store.AddOrganization(orgID)
@@ -62,7 +63,7 @@ func TestScanner_ScanExpiredShareLinks(t *testing.T) {
 	store := NewMockStore()
 	stats := &Stats{}
 	q := NewQueue(store)
-	s := NewScanner(store, q, stats)
+	s := NewScanner(store, q, stats, config.GCConfig{})
 
 	orgID := uuid.New()
 	store.AddOrganization(orgID)
@@ -95,7 +96,7 @@ func TestScanner_ScanOrphanedCommits(t *testing.T) {
 	store := NewMockStore()
 	stats := &Stats{}
 	q := NewQueue(store)
-	s := NewScanner(store, q, stats)
+	s := NewScanner(store, q, stats, config.GCConfig{})
 
 	orgID := uuid.New()
 	store.AddOrganization(orgID)
@@ -140,7 +141,7 @@ func TestScanner_ScanOrphanedCommits_WithOrgLookup(t *testing.T) {
 	store := NewMockStore()
 	stats := &Stats{}
 	q := NewQueue(store)
-	s := NewScanner(store, q, stats)
+	s := NewScanner(store, q, stats, config.GCConfig{})
 
 	orgID := uuid.New()
 	store.AddOrganization(orgID)
@@ -161,7 +162,7 @@ func TestScanner_ScanOrphanedFSObjects(t *testing.T) {
 	store := NewMockStore()
 	stats := &Stats{}
 	q := NewQueue(store)
-	s := NewScanner(store, q, stats)
+	s := NewScanner(store, q, stats, config.GCConfig{})
 
 	orgID := uuid.New()
 	store.AddOrganization(orgID)
@@ -194,7 +195,7 @@ func TestScanner_ScanOnce_EmptyDB(t *testing.T) {
 	store := NewMockStore()
 	stats := &Stats{}
 	q := NewQueue(store)
-	s := NewScanner(store, q, stats)
+	s := NewScanner(store, q, stats, config.GCConfig{})
 
 	ctx := context.Background()
 	err := s.ScanOnce(ctx)
@@ -215,7 +216,7 @@ func TestScanner_ScanOnce_FullPipeline(t *testing.T) {
 	store := NewMockStore()
 	stats := &Stats{}
 	q := NewQueue(store)
-	s := NewScanner(store, q, stats)
+	s := NewScanner(store, q, stats, config.GCConfig{})
 
 	orgID := uuid.New()
 	store.AddOrganization(orgID)
@@ -262,7 +263,7 @@ func TestScanner_ContextCancellation(t *testing.T) {
 	store := NewMockStore()
 	stats := &Stats{}
 	q := NewQueue(store)
-	s := NewScanner(store, q, stats)
+	s := NewScanner(store, q, stats, config.GCConfig{})
 
 	for i := 0; i < 100; i++ {
 		orgID := uuid.New()
@@ -281,7 +282,7 @@ func TestScanner_ScanExpiredVersions_EnqueuesExpired(t *testing.T) {
 	store := NewMockStore()
 	stats := &Stats{}
 	q := NewQueue(store)
-	s := NewScanner(store, q, stats)
+	s := NewScanner(store, q, stats, config.GCConfig{})
 
 	orgID := uuid.New()
 	store.AddOrganization(orgID)
@@ -329,7 +330,7 @@ func TestScanner_ScanExpiredVersions_PreservesHEADChain(t *testing.T) {
 	store := NewMockStore()
 	stats := &Stats{}
 	q := NewQueue(store)
-	s := NewScanner(store, q, stats)
+	s := NewScanner(store, q, stats, config.GCConfig{})
 
 	orgID := uuid.New()
 	store.AddOrganization(orgID)
@@ -364,7 +365,7 @@ func TestScanner_ScanExpiredVersions_SkipsNegativeTTL(t *testing.T) {
 	store := NewMockStore()
 	stats := &Stats{}
 	q := NewQueue(store)
-	s := NewScanner(store, q, stats)
+	s := NewScanner(store, q, stats, config.GCConfig{})
 
 	orgID := uuid.New()
 	store.AddOrganization(orgID)
@@ -395,7 +396,7 @@ func TestScanner_ScanExpiredVersions_SkipsZeroTTL(t *testing.T) {
 	store := NewMockStore()
 	stats := &Stats{}
 	q := NewQueue(store)
-	s := NewScanner(store, q, stats)
+	s := NewScanner(store, q, stats, config.GCConfig{})
 
 	orgID := uuid.New()
 	store.AddOrganization(orgID)
@@ -426,7 +427,7 @@ func TestScanner_ScanAutoDeleteExpiredObjects_Basic(t *testing.T) {
 	store := NewMockStore()
 	stats := &Stats{}
 	q := NewQueue(store)
-	s := NewScanner(store, q, stats)
+	s := NewScanner(store, q, stats, config.GCConfig{})
 
 	orgID := uuid.New()
 	store.AddOrganization(orgID)
@@ -469,7 +470,7 @@ func TestScanner_ScanAutoDeleteExpiredObjects_PreservesHEADTree(t *testing.T) {
 	store := NewMockStore()
 	stats := &Stats{}
 	q := NewQueue(store)
-	s := NewScanner(store, q, stats)
+	s := NewScanner(store, q, stats, config.GCConfig{})
 
 	orgID := uuid.New()
 	store.AddOrganization(orgID)
@@ -508,7 +509,7 @@ func TestScanner_ScanAutoDeleteExpiredObjects_PreservesRecentCommits(t *testing.
 	store := NewMockStore()
 	stats := &Stats{}
 	q := NewQueue(store)
-	s := NewScanner(store, q, stats)
+	s := NewScanner(store, q, stats, config.GCConfig{})
 
 	orgID := uuid.New()
 	store.AddOrganization(orgID)
@@ -552,7 +553,7 @@ func TestScanner_ScanAutoDeleteExpiredObjects_SkipsZeroAutoDelete(t *testing.T) 
 	store := NewMockStore()
 	stats := &Stats{}
 	q := NewQueue(store)
-	s := NewScanner(store, q, stats)
+	s := NewScanner(store, q, stats, config.GCConfig{})
 
 	orgID := uuid.New()
 	store.AddOrganization(orgID)
@@ -587,7 +588,7 @@ func TestScanner_ScanAutoDeleteExpiredObjects_NestedDirs(t *testing.T) {
 	store := NewMockStore()
 	stats := &Stats{}
 	q := NewQueue(store)
-	s := NewScanner(store, q, stats)
+	s := NewScanner(store, q, stats, config.GCConfig{})
 
 	orgID := uuid.New()
 	store.AddOrganization(orgID)
@@ -643,7 +644,7 @@ func TestScanner_ScanExpiredShares(t *testing.T) {
 	store := NewMockStore()
 	stats := &Stats{}
 	q := NewQueue(store)
-	s := NewScanner(store, q, stats)
+	s := NewScanner(store, q, stats, config.GCConfig{})
 
 	orgID := uuid.New()
 	store.AddOrganization(orgID)
@@ -668,7 +669,7 @@ func TestScanner_ScanExpiredRestoreJobs(t *testing.T) {
 	store := NewMockStore()
 	stats := &Stats{}
 	q := NewQueue(store)
-	s := NewScanner(store, q, stats)
+	s := NewScanner(store, q, stats, config.GCConfig{})
 
 	orgID := uuid.New()
 	store.AddOrganization(orgID)
@@ -693,7 +694,7 @@ func TestScanner_IdempotentEnqueue(t *testing.T) {
 	store := NewMockStore()
 	stats := &Stats{}
 	q := NewQueue(store)
-	s := NewScanner(store, q, stats)
+	s := NewScanner(store, q, stats, config.GCConfig{})
 
 	orgID := uuid.New()
 	store.AddOrganization(orgID)

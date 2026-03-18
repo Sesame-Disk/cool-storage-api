@@ -158,6 +158,8 @@ func (db *DB) Migrate() error {
 		migrationAddLibraryDeletedAt,
 		migrationAddLibraryDeletedBy,
 		migrationAddFSObjectFullPath,
+		migrationAddUserDeletedAt,
+		migrationAddOrgDeletedAt,
 	}
 	for _, migration := range alterMigrations {
 		if err := db.session.Query(migration).Exec(); err != nil {
@@ -805,3 +807,11 @@ CREATE TABLE IF NOT EXISTS audit_log (
 	PRIMARY KEY ((org_id), timestamp, action, target_id)
 ) WITH CLUSTERING ORDER BY (timestamp DESC, action ASC, target_id ASC)
   AND default_time_to_live = 31536000`
+
+// Add deleted_at column to users table for soft-delete grace period
+const migrationAddUserDeletedAt = `
+ALTER TABLE users ADD deleted_at TIMESTAMP`
+
+// Add deleted_at column to organizations table for soft-delete grace period
+const migrationAddOrgDeletedAt = `
+ALTER TABLE organizations ADD deleted_at TIMESTAMP`

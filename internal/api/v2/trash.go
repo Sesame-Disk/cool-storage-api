@@ -14,6 +14,11 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+// CommitGCEnqueuer enqueues specific commits for GC deletion.
+type CommitGCEnqueuer interface {
+	EnqueueCommits(orgID, libraryID string, commitIDs []string)
+}
+
 // TrashHandler handles file/folder trash (recycle bin) endpoints
 type TrashHandler struct {
 	db             *db.DB
@@ -436,21 +441,12 @@ func (h *TrashHandler) RestoreTrashItem(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"success": true})
 }
 
-// CleanRepoTrash permanently cleans deleted items from trash.
+// CleanRepoTrash permanently cleans deleted items from trash by enqueuing
+// expired commits for GC deletion.
 //
-// STUB — currently a no-op. See ISSUE-TRASH-CLEAN-01 and docs/TECHNICAL-DEBT.md § 9 Gap B.
-//
-// The handler accepts the request and returns 200 OK but does not enqueue any
-// commits for GC or remove any data. Note: GC Phase 6 runs on libraries with
-// auto_delete_days > 0 automatically, but it does NOT respond to user-triggered
-// requests here — so even with auto_delete_days configured, clicking "Clean Trash"
-// in the UI has no immediate effect.
-//
-// What this should do when implemented:
-//  1. List all commits for the library sorted by timestamp
-//  2. Keep: HEAD commit + any commit created within keep_days of today
-//  3. Enqueue fs_objects of expired commits via getLibraryEnqueuer()
-//  4. Delete the expired commit rows from the commits table
+// The handler lists all commits for the library, walks the HEAD parent chain
+// to identify commits that must be kept, and enqueues the rest to the GC queue.
+// The GC worker handles cascading deletion (commit → root_fs_id → blocks).
 //
 // DELETE /api/v2.1/repos/:repo_id/trash/?keep_days=3
 func (h *TrashHandler) CleanRepoTrash(c *gin.Context) {
@@ -467,19 +463,95 @@ func (h *TrashHandler) CleanRepoTrash(c *gin.Context) {
 		}
 	}
 
-	// Parse keep_days parameter (0 = delete all, 3 = keep last 3 days, etc.)
+	if h.db == nil {
+		c.JSON(http.StatusOK, gin.H{"success": true})
+		return
+	}
+
+	// Parse keep_days parameter (0 = delete all non-HEAD, 3 = keep last 3 days, etc.)
 	keepDays := 0
 	if d := c.Query("keep_days"); d != "" {
-		if parsed, err := strconv.Atoi(d); err == nil {
+		if parsed, err := strconv.Atoi(d); err == nil && parsed >= 0 {
 			keepDays = parsed
 		}
 	}
 
-	// In our commit-based system, trash is virtual (derived from commit history).
-	// "Cleaning" trash means deleting old commits beyond the keep period.
-	// For now, we acknowledge the request — actual commit pruning is handled by GC.
-	_ = keepDays
-	_ = repoID
+	// Get HEAD commit for this library
+	var headCommitID string
+	if err := h.db.Session().Query(`
+		SELECT head_commit_id FROM libraries_by_id WHERE library_id = ?
+	`, repoID).Scan(&headCommitID); err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error_msg": "library not found"})
+		return
+	}
+
+	// List all commits with timestamps and parent IDs
+	type commitRow struct {
+		CommitID  string
+		ParentID  string
+		CreatedAt time.Time
+	}
+
+	iter := h.db.Session().Query(`
+		SELECT commit_id, parent_id, created_at FROM commits WHERE library_id = ?
+	`, repoID).Iter()
+
+	commitMap := make(map[string]commitRow)
+	var cID, pID string
+	var createdAt time.Time
+	for iter.Scan(&cID, &pID, &createdAt) {
+		commitMap[cID] = commitRow{CommitID: cID, ParentID: pID, CreatedAt: createdAt}
+	}
+	iter.Close()
+
+	if len(commitMap) == 0 {
+		c.JSON(http.StatusOK, gin.H{"success": true})
+		return
+	}
+
+	// Walk HEAD chain → keepSet (these commits form the linear history)
+	keepSet := make(map[string]bool)
+	current := headCommitID
+	for current != "" {
+		if keepSet[current] {
+			break // cycle protection
+		}
+		keepSet[current] = true
+		if row, ok := commitMap[current]; ok {
+			current = row.ParentID
+		} else {
+			break
+		}
+	}
+
+	// Also keep any commit created within keep_days window
+	if keepDays > 0 {
+		cutoff := time.Now().AddDate(0, 0, -keepDays)
+		for _, row := range commitMap {
+			if !row.CreatedAt.Before(cutoff) {
+				keepSet[row.CommitID] = true
+			}
+		}
+	}
+
+	// Collect expired commit IDs (not in keepSet)
+	var expiredIDs []string
+	for id := range commitMap {
+		if !keepSet[id] {
+			expiredIDs = append(expiredIDs, id)
+		}
+	}
+
+	if len(expiredIDs) == 0 {
+		c.JSON(http.StatusOK, gin.H{"success": true})
+		return
+	}
+
+	// Enqueue expired commits for GC deletion
+	enqueuer := getCommitEnqueuer()
+	if enqueuer != nil {
+		enqueuer.EnqueueCommits(orgID, repoID, expiredIDs)
+	}
 
 	c.JSON(http.StatusOK, gin.H{"success": true})
 }

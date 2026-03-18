@@ -116,6 +116,10 @@ func (w *Worker) processItem(ctx context.Context, item QueueItem) error {
 		return w.processShare(ctx, item)
 	case ItemRestoreJob:
 		return w.processRestoreJob(ctx, item)
+	case ItemUserCascade:
+		return w.processUserCascade(ctx, item)
+	case ItemLibraryCascade:
+		return w.processLibraryCascade(ctx, item)
 	default:
 		return fmt.Errorf("unknown item type: %s", item.ItemType)
 	}
@@ -346,6 +350,134 @@ func (w *Worker) processRestoreJob(ctx context.Context, item QueueItem) error {
 	}
 
 	log.Printf("[GC Worker] Deleted restore job %s", item.ItemID)
+	return nil
+}
+
+// processUserCascade performs the full cascade deletion of a soft-deleted user:
+// 1. Soft-delete all owned libraries (move to trash)
+// 2. Remove from all groups
+// 3. Clean up shares received by this user
+// 4. Delete starred files and monitored repos
+// 5. Hard-delete user record + email lookup
+// 6. Audit log
+func (w *Worker) processUserCascade(ctx context.Context, item QueueItem) error {
+	if w.dryRun {
+		log.Printf("[GC Worker] DRY RUN: Would cascade-delete user %s in org %s", item.ItemID, item.OrgID)
+		return nil
+	}
+
+	userID, err := uuid.Parse(item.ItemID)
+	if err != nil {
+		return fmt.Errorf("invalid user ID: %w", err)
+	}
+
+	// Get user email before deletion (needed for users_by_email cleanup)
+	email, err := w.store.GetUserEmail(item.OrgID, userID)
+	if err != nil {
+		log.Printf("[GC Worker] User %s email lookup failed (may already be deleted): %v", item.ItemID, err)
+		return nil
+	}
+
+	// 1. Soft-delete all owned libraries → they go to library trash
+	libIDs, err := w.store.ListLibrariesByOwner(item.OrgID, userID)
+	if err != nil {
+		log.Printf("[GC Worker] Failed to list libraries for user %s: %v", item.ItemID, err)
+	} else {
+		for _, libID := range libIDs {
+			if err := w.store.SoftDeleteLibrary(item.OrgID, libID, userID); err != nil {
+				log.Printf("[GC Worker] Failed to soft-delete library %s for user %s: %v", libID, item.ItemID, err)
+			}
+		}
+	}
+
+	// 2. Remove from all groups (both tables)
+	groupIDs, err := w.store.ListGroupMembershipsByUser(item.OrgID, userID)
+	if err != nil {
+		log.Printf("[GC Worker] Failed to list groups for user %s: %v", item.ItemID, err)
+	} else {
+		for _, groupID := range groupIDs {
+			w.store.DeleteGroupMember(groupID, userID)
+			w.store.DeleteGroupByMember(item.OrgID, userID, groupID)
+		}
+	}
+
+	// 3. Clean up shares received by this user
+	shares, err := w.store.ListSharesByUser(userID)
+	if err != nil {
+		log.Printf("[GC Worker] Failed to list shares for user %s: %v", item.ItemID, err)
+	} else {
+		for _, share := range shares {
+			w.store.DeleteShareByUser(share.SharedTo, share.LibraryID)
+		}
+	}
+
+	// 4. Delete starred files and monitored repos
+	w.store.DeleteStarredFilesByUser(userID)
+	w.store.DeleteMonitoredReposByUser(userID)
+
+	// 5. Hard-delete user record + email lookup
+	if err := w.store.HardDeleteUser(item.OrgID, userID, email); err != nil {
+		return fmt.Errorf("failed to hard-delete user %s: %w", item.ItemID, err)
+	}
+
+	// 6. Audit log
+	w.store.WriteAuditLog(AuditLogEntry{
+		OrgID:      item.OrgID,
+		Action:     "gc_user_cascade_deleted",
+		TargetType: "user",
+		TargetID:   item.ItemID,
+		ActorID:    "gc_worker",
+		Details:    fmt.Sprintf("email=%s libraries=%d groups=%d shares=%d", email, len(libIDs), len(groupIDs), len(shares)),
+		Timestamp:  time.Now(),
+	})
+
+	log.Printf("[GC Worker] Cascade-deleted user %s (%s): %d libraries, %d groups, %d shares",
+		item.ItemID, email, len(libIDs), len(groupIDs), len(shares))
+	return nil
+}
+
+// processLibraryCascade performs the full cascade deletion of a soft-deleted library:
+// 1. Enqueue all commits, fs_objects, and clean up artifacts
+// 2. Hard-delete the library record
+// 3. Audit log
+func (w *Worker) processLibraryCascade(ctx context.Context, item QueueItem) error {
+	if w.dryRun {
+		log.Printf("[GC Worker] DRY RUN: Would cascade-delete library %s in org %s", item.ItemID, item.OrgID)
+		return nil
+	}
+
+	libraryID, err := uuid.Parse(item.ItemID)
+	if err != nil {
+		return fmt.Errorf("invalid library ID: %w", err)
+	}
+
+	storageClass := item.StorageClass
+	if storageClass == "" {
+		storageClass, _ = w.store.GetLibraryStorageClass(item.OrgID, libraryID)
+	}
+
+	// 1. Enqueue all library contents for deletion (commits, fs_objects, artifacts)
+	if err := w.EnqueueLibraryContents(item.OrgID, libraryID, storageClass); err != nil {
+		return fmt.Errorf("failed to enqueue library contents: %w", err)
+	}
+
+	// 2. Hard-delete the library record itself
+	if err := w.store.HardDeleteLibrary(item.OrgID, libraryID); err != nil {
+		return fmt.Errorf("failed to hard-delete library %s: %w", item.ItemID, err)
+	}
+
+	// 3. Audit log
+	w.store.WriteAuditLog(AuditLogEntry{
+		OrgID:      item.OrgID,
+		Action:     "gc_library_cascade_deleted",
+		TargetType: "library",
+		TargetID:   item.ItemID,
+		ActorID:    "gc_worker",
+		Details:    fmt.Sprintf("storage_class=%s", storageClass),
+		Timestamp:  time.Now(),
+	})
+
+	log.Printf("[GC Worker] Cascade-deleted library %s (storage_class=%s)", item.ItemID, storageClass)
 	return nil
 }
 

@@ -1136,6 +1136,200 @@ func (s *CassandraStore) LoadGCStats(key string) (string, error) {
 	return value, nil
 }
 
+// --- User cascade methods ---
+
+func (s *CassandraStore) ListDeletedUsersExpired(graceDays int) ([]DeletedUserInfo, error) {
+	cutoff := time.Now().AddDate(0, 0, -graceDays)
+
+	// Scan all orgs for users with role='deleted' and deleted_at before cutoff
+	orgIter := s.db.Session().Query(`SELECT org_id FROM organizations`).Iter()
+	var orgIDStr string
+	var result []DeletedUserInfo
+
+	for orgIter.Scan(&orgIDStr) {
+		orgID := parseUUID(orgIDStr)
+		if orgID == uuid.Nil {
+			continue
+		}
+
+		iter := s.db.Session().Query(`
+			SELECT user_id, email, deleted_at FROM users WHERE org_id = ?
+		`, orgIDStr).Iter()
+
+		var userIDStr, email string
+		var deletedAt *time.Time
+		for iter.Scan(&userIDStr, &email, &deletedAt) {
+			if deletedAt == nil || deletedAt.IsZero() {
+				continue
+			}
+			if deletedAt.Before(cutoff) {
+				result = append(result, DeletedUserInfo{
+					OrgID:     orgID,
+					UserID:    parseUUID(userIDStr),
+					Email:     email,
+					DeletedAt: *deletedAt,
+				})
+			}
+		}
+		iter.Close()
+	}
+	orgIter.Close()
+
+	return result, nil
+}
+
+func (s *CassandraStore) ListLibrariesByOwner(orgID, ownerID uuid.UUID) ([]uuid.UUID, error) {
+	iter := s.db.Session().Query(`
+		SELECT library_id, owner_id FROM libraries WHERE org_id = ?
+	`, orgID.String()).Iter()
+
+	var libIDStr, ownerIDStr string
+	var result []uuid.UUID
+	for iter.Scan(&libIDStr, &ownerIDStr) {
+		if ownerIDStr == ownerID.String() {
+			result = append(result, parseUUID(libIDStr))
+		}
+	}
+	if err := iter.Close(); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+func (s *CassandraStore) SoftDeleteLibrary(orgID, libraryID, deletedBy uuid.UUID) error {
+	now := time.Now()
+	batch := s.db.Session().Batch(gocql.LoggedBatch)
+	batch.Query(`
+		UPDATE libraries SET deleted_at = ?, deleted_by = ? WHERE org_id = ? AND library_id = ?
+	`, now, deletedBy.String(), orgID.String(), libraryID.String())
+	batch.Query(`
+		INSERT INTO deleted_libraries (library_id, org_id, deleted_at) VALUES (?, ?, ?)
+	`, libraryID.String(), orgID.String(), now)
+	return batch.Exec()
+}
+
+func (s *CassandraStore) ListGroupMembershipsByUser(orgID, userID uuid.UUID) ([]uuid.UUID, error) {
+	iter := s.db.Session().Query(`
+		SELECT group_id FROM groups_by_member WHERE org_id = ? AND user_id = ?
+	`, orgID.String(), userID.String()).Iter()
+
+	var groupIDStr string
+	var result []uuid.UUID
+	for iter.Scan(&groupIDStr) {
+		result = append(result, parseUUID(groupIDStr))
+	}
+	if err := iter.Close(); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+func (s *CassandraStore) DeleteGroupMember(groupID, userID uuid.UUID) error {
+	return s.db.Session().Query(`
+		DELETE FROM group_members WHERE group_id = ? AND user_id = ?
+	`, groupID.String(), userID.String()).Exec()
+}
+
+func (s *CassandraStore) DeleteGroupByMember(orgID, userID, groupID uuid.UUID) error {
+	return s.db.Session().Query(`
+		DELETE FROM groups_by_member WHERE org_id = ? AND user_id = ? AND group_id = ?
+	`, orgID.String(), userID.String(), groupID.String()).Exec()
+}
+
+func (s *CassandraStore) ListSharesByUser(userID uuid.UUID) ([]ShareByUserInfo, error) {
+	iter := s.db.Session().Query(`
+		SELECT shared_to, library_id FROM shares_by_user WHERE shared_to = ?
+	`, userID.String()).Iter()
+
+	var sharedToStr, libIDStr string
+	var result []ShareByUserInfo
+	for iter.Scan(&sharedToStr, &libIDStr) {
+		result = append(result, ShareByUserInfo{
+			SharedTo:  parseUUID(sharedToStr),
+			LibraryID: parseUUID(libIDStr),
+		})
+	}
+	if err := iter.Close(); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+func (s *CassandraStore) DeleteStarredFilesByUser(userID uuid.UUID) error {
+	return s.db.Session().Query(`
+		DELETE FROM starred_files WHERE user_id = ?
+	`, userID.String()).Exec()
+}
+
+func (s *CassandraStore) DeleteMonitoredReposByUser(userID uuid.UUID) error {
+	return s.db.Session().Query(`
+		DELETE FROM monitored_repos WHERE user_id = ?
+	`, userID.String()).Exec()
+}
+
+func (s *CassandraStore) HardDeleteUser(orgID, userID uuid.UUID, email string) error {
+	batch := s.db.Session().Batch(gocql.LoggedBatch)
+	batch.Query(`
+		DELETE FROM users WHERE org_id = ? AND user_id = ?
+	`, orgID.String(), userID.String())
+	if email != "" {
+		batch.Query(`
+			DELETE FROM users_by_email WHERE email = ?
+		`, email)
+	}
+	return batch.Exec()
+}
+
+func (s *CassandraStore) GetUserEmail(orgID, userID uuid.UUID) (string, error) {
+	var email string
+	err := s.db.Session().Query(`
+		SELECT email FROM users WHERE org_id = ? AND user_id = ?
+	`, orgID.String(), userID.String()).Scan(&email)
+	if err != nil {
+		return "", err
+	}
+	return email, nil
+}
+
+// --- Library trash auto-purge (Fase 3) ---
+
+func (s *CassandraStore) ListExpiredDeletedLibraries(retentionDays int) ([]DeletedLibraryInfo, error) {
+	iter := s.db.Session().Query(`
+		SELECT library_id, org_id, deleted_at FROM deleted_libraries
+	`).Iter()
+
+	cutoff := time.Now().AddDate(0, 0, -retentionDays)
+	var libIDStr, orgIDStr string
+	var deletedAt time.Time
+	var result []DeletedLibraryInfo
+	for iter.Scan(&libIDStr, &orgIDStr, &deletedAt) {
+		if deletedAt.Before(cutoff) {
+			orgID := parseUUID(orgIDStr)
+			libID := parseUUID(libIDStr)
+			storageClass, _ := s.GetLibraryStorageClass(orgID, libID)
+			result = append(result, DeletedLibraryInfo{
+				OrgID:        orgID,
+				LibraryID:    libID,
+				StorageClass: storageClass,
+				DeletedAt:    deletedAt,
+			})
+		}
+	}
+	if err := iter.Close(); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+func (s *CassandraStore) HardDeleteLibrary(orgID, libraryID uuid.UUID) error {
+	batch := s.db.Session().Batch(gocql.LoggedBatch)
+	batch.Query(`DELETE FROM libraries WHERE org_id = ? AND library_id = ?`,
+		orgID.String(), libraryID.String())
+	batch.Query(`DELETE FROM deleted_libraries WHERE library_id = ?`,
+		libraryID.String())
+	return batch.Exec()
+}
+
 // --- Storage adapter ---
 
 // StorageManagerAdapter wraps a *storage.Manager to implement StorageProvider.

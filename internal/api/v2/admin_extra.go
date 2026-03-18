@@ -608,9 +608,8 @@ func (h *AdminHandler) AdminDeleteOrgUser(c *gin.Context) {
 		return
 	}
 
-	// Mark as deactivated rather than hard delete
-	if err := h.db.Session().Query(`UPDATE users SET role = ? WHERE org_id = ? AND user_id = ?`,
-		"deactivated", targetOrgID, foundUID).Exec(); err != nil {
+	// Soft-delete: mark as "deleted" with timestamp for grace period cascade
+	if err := softDeleteUser(h.db, targetOrgID, foundUID, time.Now()); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete user"})
 		return
 	}

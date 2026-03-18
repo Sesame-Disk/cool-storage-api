@@ -5,6 +5,7 @@ import (
 	"log"
 	"time"
 
+	"github.com/Sesame-Disk/sesamefs/internal/config"
 	"github.com/Sesame-Disk/sesamefs/internal/metrics"
 	"github.com/google/uuid"
 )
@@ -12,17 +13,19 @@ import (
 // Scanner periodically finds orphaned items that were missed by inline enqueue
 // and adds them to the gc_queue for processing.
 type Scanner struct {
-	store GCStore
-	queue *Queue
-	stats *Stats
+	store  GCStore
+	queue  *Queue
+	stats  *Stats
+	config config.GCConfig
 }
 
 // NewScanner creates a new safety scanner.
-func NewScanner(store GCStore, queue *Queue, stats *Stats) *Scanner {
+func NewScanner(store GCStore, queue *Queue, stats *Stats, cfg config.GCConfig) *Scanner {
 	return &Scanner{
-		store: store,
-		queue: queue,
-		stats: stats,
+		store:  store,
+		queue:  queue,
+		stats:  stats,
+		config: cfg,
 	}
 }
 
@@ -46,6 +49,8 @@ func (s *Scanner) ScanOnce(ctx context.Context) error {
 		{"expired_shares", s.scanExpiredShares},
 		{"expired_restore_jobs", s.scanExpiredRestoreJobs},
 		{"orphaned_group_shares", s.scanOrphanedGroupShares},
+		{"expired_deleted_users", s.scanExpiredDeletedUsers},
+		{"expired_deleted_libraries", s.scanExpiredDeletedLibraries},
 	}
 
 	for _, phase := range phases {
@@ -556,6 +561,78 @@ func (s *Scanner) scanOrphanedGroupShares(ctx context.Context) (int, error) {
 	metrics.GCItemsEnqueuedTotal.WithLabelValues("orphaned_group_shares").Add(float64(cleaned))
 	metrics.GCScannerLastPhaseRun.WithLabelValues("orphaned_group_shares").SetToCurrentTime()
 	return cleaned, nil
+}
+
+// scanExpiredDeletedUsers finds soft-deleted users whose grace period has expired
+// and enqueues them for cascade deletion.
+func (s *Scanner) scanExpiredDeletedUsers(ctx context.Context) (int, error) {
+	log.Println("[GC Scanner] Phase 10: Scanning for expired deleted users...")
+
+	users, err := s.store.ListDeletedUsersExpired(s.config.UserGraceDays)
+	if err != nil {
+		return 0, err
+	}
+
+	enqueued := 0
+	now := time.Now()
+	var batch []QueueItem
+	for _, u := range users {
+		batch = append(batch, QueueItem{
+			OrgID:    u.OrgID,
+			QueuedAt: now,
+			ItemType: ItemUserCascade,
+			ItemID:   u.UserID.String(),
+		})
+	}
+	if len(batch) > 0 {
+		if err := s.queue.EnqueueBatch(batch); err != nil {
+			log.Printf("[GC Scanner] Phase 10: failed to enqueue expired deleted users: %v", err)
+		} else {
+			enqueued = len(batch)
+		}
+	}
+
+	log.Printf("[GC Scanner] Phase 10 complete: enqueued %d expired deleted users", enqueued)
+	metrics.GCItemsEnqueuedTotal.WithLabelValues("expired_deleted_users").Add(float64(enqueued))
+	metrics.GCScannerLastPhaseRun.WithLabelValues("expired_deleted_users").SetToCurrentTime()
+	return enqueued, nil
+}
+
+// scanExpiredDeletedLibraries finds soft-deleted libraries whose trash retention
+// period has expired and enqueues them for cascade deletion (commits, fs_objects,
+// blocks, and all library artifacts).
+func (s *Scanner) scanExpiredDeletedLibraries(ctx context.Context) (int, error) {
+	log.Println("[GC Scanner] Phase 11: Scanning for expired deleted libraries...")
+
+	libs, err := s.store.ListExpiredDeletedLibraries(s.config.TrashRetentionDays)
+	if err != nil {
+		return 0, err
+	}
+
+	enqueued := 0
+	now := time.Now()
+	var batch []QueueItem
+	for _, lib := range libs {
+		batch = append(batch, QueueItem{
+			OrgID:        lib.OrgID,
+			QueuedAt:     now,
+			ItemType:     ItemLibraryCascade,
+			ItemID:       lib.LibraryID.String(),
+			StorageClass: lib.StorageClass,
+		})
+	}
+	if len(batch) > 0 {
+		if err := s.queue.EnqueueBatch(batch); err != nil {
+			log.Printf("[GC Scanner] Phase 11: failed to enqueue expired deleted libraries: %v", err)
+		} else {
+			enqueued = len(batch)
+		}
+	}
+
+	log.Printf("[GC Scanner] Phase 11 complete: enqueued %d expired deleted libraries", enqueued)
+	metrics.GCItemsEnqueuedTotal.WithLabelValues("expired_deleted_libraries").Add(float64(enqueued))
+	metrics.GCScannerLastPhaseRun.WithLabelValues("expired_deleted_libraries").SetToCurrentTime()
+	return enqueued, nil
 }
 
 // walkFSTree iteratively walks a filesystem tree starting from fsID,

@@ -1002,6 +1002,39 @@ func (m *MockStore) ListAllGroupShares() ([]GroupShareInfo, error) { return nil,
 func (m *MockStore) GroupExists(orgID, groupID uuid.UUID) (bool, error) { return false, nil }
 func (m *MockStore) WriteAuditLog(entry AuditLogEntry) error            { return nil }
 
+// --- Library trash auto-purge (Fase 3) ---
+
+func (m *MockStore) ListExpiredDeletedLibraries(retentionDays int) ([]DeletedLibraryInfo, error) {
+	return nil, nil
+}
+func (m *MockStore) HardDeleteLibrary(orgID, libraryID uuid.UUID) error { return nil }
+
+// --- User cascade (Fase 1) ---
+
+func (m *MockStore) ListDeletedUsersExpired(graceDays int) ([]DeletedUserInfo, error) {
+	return nil, nil
+}
+func (m *MockStore) ListLibrariesByOwner(orgID, ownerID uuid.UUID) ([]uuid.UUID, error) {
+	return nil, nil
+}
+func (m *MockStore) SoftDeleteLibrary(orgID, libraryID, deletedBy uuid.UUID) error { return nil }
+func (m *MockStore) ListGroupMembershipsByUser(orgID, userID uuid.UUID) ([]uuid.UUID, error) {
+	return nil, nil
+}
+func (m *MockStore) DeleteGroupMember(groupID, userID uuid.UUID) error { return nil }
+func (m *MockStore) DeleteGroupByMember(orgID, userID, groupID uuid.UUID) error {
+	return nil
+}
+func (m *MockStore) ListSharesByUser(userID uuid.UUID) ([]ShareByUserInfo, error) {
+	return nil, nil
+}
+func (m *MockStore) DeleteStarredFilesByUser(userID uuid.UUID) error    { return nil }
+func (m *MockStore) DeleteMonitoredReposByUser(userID uuid.UUID) error  { return nil }
+func (m *MockStore) HardDeleteUser(orgID, userID uuid.UUID, email string) error { return nil }
+func (m *MockStore) GetUserEmail(orgID, userID uuid.UUID) (string, error) {
+	return "", nil
+}
+
 // --- GC stats persistence ---
 
 func (m *MockStore) SaveGCStats(key, value string) error {

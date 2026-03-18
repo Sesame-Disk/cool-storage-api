@@ -108,6 +108,23 @@ type GCStore interface {
 	// Audit log
 	WriteAuditLog(entry AuditLogEntry) error
 
+	// User cascade (soft-delete → hard-delete after grace period)
+	ListDeletedUsersExpired(graceDays int) ([]DeletedUserInfo, error)
+	ListLibrariesByOwner(orgID, ownerID uuid.UUID) ([]uuid.UUID, error)
+	SoftDeleteLibrary(orgID, libraryID, deletedBy uuid.UUID) error
+	ListGroupMembershipsByUser(orgID, userID uuid.UUID) ([]uuid.UUID, error)
+	DeleteGroupMember(groupID, userID uuid.UUID) error
+	DeleteGroupByMember(orgID, userID, groupID uuid.UUID) error
+	ListSharesByUser(userID uuid.UUID) ([]ShareByUserInfo, error)
+	DeleteStarredFilesByUser(userID uuid.UUID) error
+	DeleteMonitoredReposByUser(userID uuid.UUID) error
+	HardDeleteUser(orgID, userID uuid.UUID, email string) error
+	GetUserEmail(orgID, userID uuid.UUID) (string, error)
+
+	// Library trash auto-purge (soft-deleted libraries past retention period)
+	ListExpiredDeletedLibraries(retentionDays int) ([]DeletedLibraryInfo, error)
+	HardDeleteLibrary(orgID, libraryID uuid.UUID) error
+
 	// GC stats persistence
 	SaveGCStats(key, value string) error
 	LoadGCStats(key string) (string, error)
@@ -223,6 +240,28 @@ type GroupShareInfo struct {
 	SharedTo     uuid.UUID // group_id
 	SharedToType string    // "group"
 	OrgID        uuid.UUID // needed for scanner lookups
+}
+
+// DeletedUserInfo holds data about a soft-deleted user for cascade processing.
+type DeletedUserInfo struct {
+	OrgID     uuid.UUID
+	UserID    uuid.UUID
+	Email     string
+	DeletedAt time.Time
+}
+
+// DeletedLibraryInfo holds data about a soft-deleted library for trash auto-purge.
+type DeletedLibraryInfo struct {
+	OrgID        uuid.UUID
+	LibraryID    uuid.UUID
+	StorageClass string
+	DeletedAt    time.Time
+}
+
+// ShareByUserInfo holds data about a share received by a user.
+type ShareByUserInfo struct {
+	SharedTo  uuid.UUID // user_id
+	LibraryID uuid.UUID
 }
 
 // AuditLogEntry records a deletion event for compliance/traceability.

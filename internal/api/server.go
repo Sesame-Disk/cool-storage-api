@@ -463,6 +463,7 @@ func (s *Server) setupRoutes() {
 		v2.SetGCHooks(
 			&gcBlockEnqueuer{service: s.gcService},
 			&gcLibraryEnqueuer{service: s.gcService},
+			&gcCommitEnqueuer{service: s.gcService},
 		)
 	}
 

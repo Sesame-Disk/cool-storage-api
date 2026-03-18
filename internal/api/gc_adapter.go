@@ -47,3 +47,25 @@ func (e *gcLibraryEnqueuer) EnqueueLibraryDeletion(orgID, libraryID string, stor
 		log.Printf("[GC Adapter] Failed to enqueue library %s deletion: %v", libraryID, err)
 	}
 }
+
+// gcCommitEnqueuer adapts gc.Service to the v2.CommitGCEnqueuer interface.
+type gcCommitEnqueuer struct {
+	service *gc.Service
+}
+
+// EnqueueCommits enqueues specific commits for GC deletion.
+func (e *gcCommitEnqueuer) EnqueueCommits(orgID, libraryID string, commitIDs []string) {
+	orgUUID, err := uuid.Parse(orgID)
+	if err != nil {
+		log.Printf("[GC Adapter] Invalid org_id %q: %v", orgID, err)
+		return
+	}
+	libUUID, err := uuid.Parse(libraryID)
+	if err != nil {
+		log.Printf("[GC Adapter] Invalid library_id %q: %v", libraryID, err)
+		return
+	}
+	if err := e.service.EnqueueCommits(orgUUID, libUUID, commitIDs); err != nil {
+		log.Printf("[GC Adapter] Failed to enqueue %d commits for library %s: %v", len(commitIDs), libraryID, err)
+	}
+}

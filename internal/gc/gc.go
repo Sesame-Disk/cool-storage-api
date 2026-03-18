@@ -88,7 +88,7 @@ func NewService(store GCStore, storage StorageProvider, cfg config.GCConfig) *Se
 		config:         cfg,
 		queue:          queue,
 		worker:         NewWorker(store, storage, queue, cfg.BatchSize, cfg.GracePeriod, cfg.DryRun, stats),
-		scanner:        NewScanner(store, queue, stats),
+		scanner:        NewScanner(store, queue, stats, cfg),
 		stats:          stats,
 		triggerWorker:  make(chan struct{}, 1),
 		triggerScanner: make(chan struct{}, 1),
@@ -209,6 +209,25 @@ func (s *Service) EnqueueBlock(orgID uuid.UUID, blockID string, libraryID uuid.U
 // EnqueueLibraryDeletion enqueues all contents of a library for GC.
 func (s *Service) EnqueueLibraryDeletion(orgID, libraryID uuid.UUID, storageClass string) error {
 	return s.worker.EnqueueLibraryContents(orgID, libraryID, storageClass)
+}
+
+// EnqueueCommits enqueues specific commits for GC deletion (used by CleanRepoTrash).
+func (s *Service) EnqueueCommits(orgID, libraryID uuid.UUID, commitIDs []string) error {
+	if len(commitIDs) == 0 {
+		return nil
+	}
+	now := time.Now()
+	items := make([]QueueItem, 0, len(commitIDs))
+	for _, id := range commitIDs {
+		items = append(items, QueueItem{
+			OrgID:     orgID,
+			QueuedAt:  now,
+			ItemType:  ItemCommit,
+			ItemID:    id,
+			LibraryID: libraryID,
+		})
+	}
+	return s.queue.EnqueueBatch(items)
 }
 
 func (s *Service) runWorkerLoop(ctx context.Context) {

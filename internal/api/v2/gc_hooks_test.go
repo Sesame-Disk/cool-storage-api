@@ -34,14 +34,30 @@ func (m *mockLibraryGCEnqueuer) EnqueueLibraryDeletion(orgID, libraryID string, 
 	m.calls = append(m.calls, libGCEnqueueCall{orgID, libraryID, storageClass})
 }
 
+// mockCommitGCEnqueuer implements CommitGCEnqueuer for testing
+type mockCommitGCEnqueuer struct {
+	calls []commitGCEnqueueCall
+}
+
+type commitGCEnqueueCall struct {
+	orgID     string
+	libraryID string
+	commitIDs []string
+}
+
+func (m *mockCommitGCEnqueuer) EnqueueCommits(orgID, libraryID string, commitIDs []string) {
+	m.calls = append(m.calls, commitGCEnqueueCall{orgID, libraryID, commitIDs})
+}
+
 func TestSetGCHooks(t *testing.T) {
 	// Reset hooks at end of test
-	defer SetGCHooks(nil, nil)
+	defer SetGCHooks(nil, nil, nil)
 
 	blockEnq := &mockGCEnqueuer{}
 	libEnq := &mockLibraryGCEnqueuer{}
+	commitEnq := &mockCommitGCEnqueuer{}
 
-	SetGCHooks(blockEnq, libEnq)
+	SetGCHooks(blockEnq, libEnq, commitEnq)
 
 	got := getBlockEnqueuer()
 	if got != blockEnq {
@@ -52,13 +68,18 @@ func TestSetGCHooks(t *testing.T) {
 	if gotLib != libEnq {
 		t.Error("getLibraryEnqueuer() should return the set enqueuer")
 	}
+
+	gotCommit := getCommitEnqueuer()
+	if gotCommit != commitEnq {
+		t.Error("getCommitEnqueuer() should return the set enqueuer")
+	}
 }
 
 func TestGetBlockEnqueuerFunc(t *testing.T) {
-	defer SetGCHooks(nil, nil)
+	defer SetGCHooks(nil, nil, nil)
 
 	blockEnq := &mockGCEnqueuer{}
-	SetGCHooks(blockEnq, nil)
+	SetGCHooks(blockEnq, nil, nil)
 
 	got := GetBlockEnqueuerFunc()
 	if got != blockEnq {
@@ -67,10 +88,10 @@ func TestGetBlockEnqueuerFunc(t *testing.T) {
 }
 
 func TestGCHooks_NilByDefault(t *testing.T) {
-	defer SetGCHooks(nil, nil)
+	defer SetGCHooks(nil, nil, nil)
 
 	// Reset to nil
-	SetGCHooks(nil, nil)
+	SetGCHooks(nil, nil, nil)
 
 	if got := getBlockEnqueuer(); got != nil {
 		t.Error("getBlockEnqueuer() should be nil when not set")
@@ -79,22 +100,27 @@ func TestGCHooks_NilByDefault(t *testing.T) {
 	if got := getLibraryEnqueuer(); got != nil {
 		t.Error("getLibraryEnqueuer() should be nil when not set")
 	}
+
+	if got := getCommitEnqueuer(); got != nil {
+		t.Error("getCommitEnqueuer() should be nil when not set")
+	}
 }
 
 func TestGCHooks_ConcurrentAccess(t *testing.T) {
-	defer SetGCHooks(nil, nil)
+	defer SetGCHooks(nil, nil, nil)
 
 	done := make(chan struct{})
 
 	// Concurrent reads and writes
 	for i := 0; i < 50; i++ {
 		go func() {
-			SetGCHooks(&mockGCEnqueuer{}, &mockLibraryGCEnqueuer{})
+			SetGCHooks(&mockGCEnqueuer{}, &mockLibraryGCEnqueuer{}, &mockCommitGCEnqueuer{})
 			done <- struct{}{}
 		}()
 		go func() {
 			_ = getBlockEnqueuer()
 			_ = getLibraryEnqueuer()
+			_ = getCommitEnqueuer()
 			done <- struct{}{}
 		}()
 	}
@@ -108,6 +134,7 @@ func TestGCEnqueuer_Interface(t *testing.T) {
 	// Verify the mock satisfies the interface at compile time
 	var _ GCEnqueuer = (*mockGCEnqueuer)(nil)
 	var _ LibraryGCEnqueuer = (*mockLibraryGCEnqueuer)(nil)
+	var _ CommitGCEnqueuer = (*mockCommitGCEnqueuer)(nil)
 }
 
 func TestMockGCEnqueuer_RecordsCalls(t *testing.T) {
