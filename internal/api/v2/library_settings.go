@@ -347,9 +347,11 @@ func (h *LibrarySettingsHandler) CreateAPIToken(c *gin.Context) {
 		INSERT INTO repo_api_tokens_by_token (api_token, repo_id, app_name, permission, generated_by)
 		VALUES (?, ?, ?, ?, ?)
 	`, apiToken, repoID, req.AppName, req.Permission, userID).Exec(); err != nil {
-		_ = h.db.Session().Query(`
+		if rollbackErr := h.db.Session().Query(`
 			DELETE FROM repo_api_tokens WHERE repo_id = ? AND app_name = ?
-		`, repoID, req.AppName).Exec()
+		`, repoID, req.AppName).Exec(); rollbackErr != nil {
+			log.Printf("[CreateAPIToken] rollback failed after reverse lookup failure for repo=%s app=%s: %v", repoID, req.AppName, rollbackErr)
+		}
 		log.Printf("[CreateAPIToken] Failed to create reverse lookup token: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create API token"})
 		return

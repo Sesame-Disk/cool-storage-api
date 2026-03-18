@@ -71,7 +71,6 @@ func cleanupGroupShares(database *db.DB, groupID uuid.UUID) error {
 		shareIter := database.Session().Query(`
 			SELECT share_id, shared_to FROM shares WHERE library_id = ?
 		`, libID).Iter()
-		defer shareIter.Close()
 
 		batch := database.Session().Batch(gocql.LoggedBatch)
 		var shareID, sharedTo string
