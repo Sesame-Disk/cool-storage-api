@@ -1,6 +1,7 @@
 package v2
 
 import (
+	"encoding/json"
 	"io"
 	"log/slog"
 	"net/http"
@@ -602,6 +603,11 @@ func (h *GroupHandler) DeleteGroup(c *gin.Context) {
 		return
 	}
 
+	// Get group name before deletion (for audit log)
+	var groupName string
+	h.db.Session().Query(`SELECT name FROM groups WHERE org_id = ? AND group_id = ?`,
+		orgUUID.String(), groupUUID.String()).Scan(&groupName)
+
 	// Collect member IDs before deletion (for groups_by_member cleanup)
 	memberIter := h.db.Session().Query(`SELECT user_id FROM group_members WHERE group_id = ?`, groupUUID.String()).Iter()
 	var memberID string
@@ -636,47 +642,20 @@ func (h *GroupHandler) DeleteGroup(c *gin.Context) {
 	}
 
 	// Clean up shares where shared_to = this group (async, best-effort)
-	go h.cleanupGroupShares(groupUUID)
+	go cleanupGroupSharesAsync(h.db, groupUUID)
+
+	// Audit log
+	auditDetails, _ := json.Marshal(map[string]interface{}{
+		"group_name":    groupName,
+		"members_count": len(memberIDs),
+	})
+	h.db.Session().Query(`
+		INSERT INTO audit_log (org_id, timestamp, action, target_type, target_id, actor_id, details)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+	`, orgUUID.String(), time.Now(), "delete_group", "group", groupID, userID,
+		string(auditDetails)).Exec()
 
 	c.JSON(http.StatusOK, gin.H{"success": true})
-}
-
-// cleanupGroupShares removes all library shares targeting a deleted group.
-func (h *GroupHandler) cleanupGroupShares(groupID uuid.UUID) {
-	// shares_by_user is partitioned by shared_to, efficient lookup
-	iter := h.db.Session().Query(`
-		SELECT library_id FROM shares_by_user WHERE shared_to = ?
-	`, groupID.String()).Iter()
-
-	var libIDStr string
-	var libraryIDs []string
-	for iter.Scan(&libIDStr) {
-		libraryIDs = append(libraryIDs, libIDStr)
-	}
-	iter.Close()
-
-	for _, libID := range libraryIDs {
-		// Find the share_id in the shares table
-		shareIter := h.db.Session().Query(`
-			SELECT share_id, shared_to FROM shares WHERE library_id = ?
-		`, libID).Iter()
-		var shareIDStr, sharedToStr string
-		for shareIter.Scan(&shareIDStr, &sharedToStr) {
-			if sharedToStr == groupID.String() {
-				h.db.Session().Query(`DELETE FROM shares WHERE library_id = ? AND share_id = ?`,
-					libID, shareIDStr).Exec()
-			}
-		}
-		shareIter.Close()
-
-		// Delete from shares_by_user
-		h.db.Session().Query(`DELETE FROM shares_by_user WHERE shared_to = ? AND library_id = ?`,
-			groupID.String(), libID).Exec()
-	}
-
-	if len(libraryIDs) > 0 {
-		slog.Info("cleaned up group shares", "group_id", groupID, "shares_cleaned", len(libraryIDs))
-	}
 }
 
 // ListGroupMembers returns list of group members

@@ -1160,34 +1160,22 @@ func (h *AdminHandler) AdminCreateGroup(c *gin.Context) {
 	groupUUID := uuid.New()
 	now := time.Now()
 
-	// Insert group
-	if err := h.db.Session().Query(`
-		INSERT INTO groups (org_id, group_id, name, creator_id, is_department, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?)
-	`, orgID, groupUUID.String(), groupName, ownerID, false, now, now).Exec(); err != nil {
+	// Atomic batch: create group + lookup + owner membership
+	batch := h.db.Session().Batch(gocql.LoggedBatch)
+	batch.Query(`INSERT INTO groups (org_id, group_id, name, creator_id, is_department, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		orgID, groupUUID.String(), groupName, ownerID, false, now, now)
+	batch.Query(`INSERT INTO groups_by_id (group_id, org_id, name) VALUES (?, ?, ?)`,
+		groupUUID.String(), orgID, groupName)
+	batch.Query(`INSERT INTO group_members (group_id, user_id, role, added_at) VALUES (?, ?, ?, ?)`,
+		groupUUID.String(), ownerID, "owner", now)
+	batch.Query(`INSERT INTO groups_by_member (org_id, user_id, group_id, group_name, role, added_at)
+		VALUES (?, ?, ?, ?, ?, ?)`,
+		orgID, ownerID, groupUUID.String(), groupName, "owner", now)
+	if err := batch.Exec(); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create group"})
 		return
 	}
-
-	// Add to groups_by_id lookup
-	h.db.Session().Query(`
-		INSERT INTO groups_by_id (group_id, org_id, name) VALUES (?, ?, ?)
-	`, groupUUID.String(), orgID, groupName).Exec()
-
-	// Add owner as member
-	if err := h.db.Session().Query(`
-		INSERT INTO group_members (group_id, user_id, role, added_at)
-		VALUES (?, ?, ?, ?)
-	`, groupUUID.String(), ownerID, "owner", now).Exec(); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to add owner as member"})
-		return
-	}
-
-	// Add to lookup table
-	h.db.Session().Query(`
-		INSERT INTO groups_by_member (org_id, user_id, group_id, group_name, role, added_at)
-		VALUES (?, ?, ?, ?, ?, ?)
-	`, orgID, ownerID, groupUUID.String(), groupName, "owner", now).Exec()
 
 	c.JSON(http.StatusCreated, adminGroupResponse{
 		ID:            groupUUID.String(),
@@ -1260,11 +1248,15 @@ func (h *AdminHandler) AdminDeleteGroup(c *gin.Context) {
 
 	// Audit log
 	orgUUID, _ := uuid.Parse(orgID)
+	auditDetails, _ := json.Marshal(map[string]interface{}{
+		"group_name":    name,
+		"members_count": len(memberIDs),
+	})
 	h.db.Session().Query(`
 		INSERT INTO audit_log (org_id, timestamp, action, target_type, target_id, actor_id, details)
 		VALUES (?, ?, ?, ?, ?, ?, ?)
 	`, orgUUID.String(), time.Now(), "delete_group", "group", groupID, callerUserID,
-		fmt.Sprintf(`{"group_name":"%s","members_count":%d}`, name, len(memberIDs))).Exec()
+		string(auditDetails)).Exec()
 
 	c.JSON(http.StatusOK, gin.H{"success": true})
 }
@@ -3560,10 +3552,10 @@ func (h *AdminHandler) AdminCleanTrashLibraries(c *gin.Context) {
 			batch := h.db.Session().Batch(gocql.LoggedBatch)
 			batch.Query(`DELETE FROM libraries WHERE org_id = ? AND library_id = ?`, orgID, lib.libID)
 			batch.Query(`DELETE FROM libraries_by_id WHERE library_id = ?`, lib.libID)
-			
+
 			// Preserve the org lookup for the Garbage Collector
 			batch.Query(`INSERT INTO deleted_libraries (library_id, org_id, deleted_at) VALUES (?, ?, ?)`, lib.libID, orgID, time.Now())
-			
+
 			if err := batch.Exec(); err != nil {
 				log.Printf("[AdminCleanTrashLibraries] failed to delete library %s (org %s): %v", lib.libID, orgID, err)
 				continue

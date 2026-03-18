@@ -8,6 +8,7 @@ package v2
 // the response format expected by the Seahub-compatible frontend.
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"sort"
@@ -1813,11 +1814,15 @@ func (h *AdminHandler) AdminDeleteAddressBookGroup(c *gin.Context) {
 
 	// Audit log
 	orgUUID, _ := uuid.Parse(callerOrgID)
+	auditDetails, _ := json.Marshal(map[string]interface{}{
+		"group_name":    groupName,
+		"members_count": len(memberIDs),
+	})
 	h.db.Session().Query(`
 		INSERT INTO audit_log (org_id, timestamp, action, target_type, target_id, actor_id, details)
 		VALUES (?, ?, ?, ?, ?, ?, ?)
 	`, orgUUID.String(), time.Now(), "delete_address_book_group", "group", groupID, callerUserID,
-		fmt.Sprintf(`{"group_name":"%s","members_count":%d}`, groupName, len(memberIDs))).Exec()
+		string(auditDetails)).Exec()
 
 	c.JSON(http.StatusOK, gin.H{"success": true})
 }

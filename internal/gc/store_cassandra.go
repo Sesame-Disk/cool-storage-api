@@ -1053,14 +1053,6 @@ func (s *CassandraStore) ListSharesByGroup(groupID uuid.UUID) ([]GroupShareInfo,
 
 	// For each library, get the share_id from the shares table
 	for i, gs := range results {
-		iter2 := s.db.Session().Query(`
-			SELECT share_id FROM shares WHERE library_id = ? AND shared_to = ? ALLOW FILTERING
-		`, gs.LibraryID.String()).Iter()
-		// Actually, shares PK is (library_id, share_id), we need to scan
-		// Let's query shares by library and filter
-		iter2.Close()
-
-		// Better approach: query shares table for this library
 		shareIter := s.db.Session().Query(`
 			SELECT share_id, shared_to FROM shares WHERE library_id = ?
 		`, gs.LibraryID.String()).Iter()
@@ -1078,6 +1070,9 @@ func (s *CassandraStore) ListSharesByGroup(groupID uuid.UUID) ([]GroupShareInfo,
 }
 
 // ListAllGroupShares returns all shares with shared_to_type='group' for the scanner.
+// NOTE: This performs a full table scan on 'shares' and filters in application code.
+// If the shares table grows large, consider adding a 'shares_by_type' materialized view
+// or secondary index to push filtering to Cassandra.
 func (s *CassandraStore) ListAllGroupShares() ([]GroupShareInfo, error) {
 	iter := s.db.Session().Query(`
 		SELECT library_id, share_id, shared_to, shared_to_type FROM shares

@@ -21,7 +21,7 @@ type Stats struct {
 	lastScanRun   atomic.Value // time.Time
 }
 
-func (s *Stats) IncrBlocksDeleted()          { s.blocksDeleted.Add(1) }
+func (s *Stats) IncrBlocksDeleted()           { s.blocksDeleted.Add(1) }
 func (s *Stats) BlocksDeleted() int64         { return s.blocksDeleted.Load() }
 func (s *Stats) SetLastWorkerRun(t time.Time) { s.lastWorkerRun.Store(t) }
 func (s *Stats) SetLastScanRun(t time.Time)   { s.lastScanRun.Store(t) }
@@ -68,6 +68,8 @@ type Service struct {
 	started bool
 	mu      sync.Mutex
 
+	// consecutiveErrors is only accessed from the workerLoop goroutine
+	// (via runWorkerOnce). If this changes, protect with s.mu.
 	consecutiveErrors int
 
 	// Channels for manual triggers

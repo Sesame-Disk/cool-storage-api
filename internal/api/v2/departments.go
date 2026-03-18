@@ -1,11 +1,11 @@
 package v2
 
 import (
+	"encoding/json"
 	"log/slog"
 	"net/http"
 	"time"
 
-	"fmt"
 	"log"
 
 	"github.com/Sesame-Disk/sesamefs/internal/db"
@@ -34,7 +34,7 @@ type DepartmentResponse struct {
 	CreatedAt      string                `json:"created_at"`
 	ParentGroupID  string                `json:"parent_group_id,omitempty"`
 	MemberCount    int                   `json:"member_count,omitempty"`
-	Groups         []DepartmentResponse  `json:"groups"`           // Sub-departments
+	Groups         []DepartmentResponse  `json:"groups"` // Sub-departments
 	Members        []GroupMemberResponse `json:"members"`
 	AncestorGroups []DepartmentRef       `json:"ancestor_groups"` // Breadcrumb
 }
@@ -375,11 +375,15 @@ func (h *DepartmentHandler) DeleteDepartment(c *gin.Context) {
 
 	// Audit log
 	orgUUID, _ := uuid.Parse(orgID)
+	auditDetails, _ := json.Marshal(map[string]interface{}{
+		"name":          deptName,
+		"members_count": len(memberIDs),
+	})
 	h.db.Session().Query(`
 		INSERT INTO audit_log (org_id, timestamp, action, target_type, target_id, actor_id, details)
 		VALUES (?, ?, ?, ?, ?, ?, ?)
 	`, orgUUID.String(), time.Now(), "delete_department", "department", groupID, callerUserID,
-		fmt.Sprintf(`{"name":"%s","members_count":%d}`, deptName, len(memberIDs))).Exec()
+		string(auditDetails)).Exec()
 
 	log.Printf("[Department] Deleted department %s (%s) with %d members", groupID, deptName, len(memberIDs))
 	c.JSON(http.StatusOK, gin.H{"success": true})
