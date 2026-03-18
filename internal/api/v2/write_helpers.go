@@ -1,6 +1,7 @@
 package v2
 
 import (
+	"fmt"
 	"time"
 
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
@@ -131,20 +132,26 @@ func renameGroup(db interface{ Session() *gocql.Session }, orgID, groupID, newNa
 		return err
 	}
 
+	var failedCount int
 	for i := 0; i < len(memberIDs); i += 50 {
 		end := i + 50
 		if end > len(memberIDs) {
 			end = len(memberIDs)
 		}
 		memberBatch := db.Session().Batch(gocql.UnloggedBatch)
+		batchSize := end - i
 		for _, userID := range memberIDs[i:end] {
 			memberBatch.Query(`
 				UPDATE groups_by_member SET group_name = ? WHERE org_id = ? AND user_id = ? AND group_id = ?
 			`, newName, orgID, userID, groupID)
 		}
 		if err := memberBatch.Exec(); err != nil {
-			return err
+			failedCount += batchSize
 		}
+	}
+
+	if failedCount > 0 {
+		return fmt.Errorf("group renamed but failed to update %d member index rows", failedCount)
 	}
 
 	return nil

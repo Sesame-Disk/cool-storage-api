@@ -876,7 +876,7 @@ func (h *FileShareHandler) LeaveShareRepo(c *gin.Context) {
 		return
 	}
 
-	if err := deleteLibraryShare(h.db, repoUUID.String(), userID, "user"); err != nil {
+	if err := deleteLibraryShare(h.db, repoUUID.String(), foundShareID, userID); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete share"})
 		return
 	}

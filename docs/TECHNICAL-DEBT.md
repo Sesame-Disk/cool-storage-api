@@ -354,6 +354,10 @@ The `modifier` field is part of the Seafile FS object hash (`fs_id`). Changing i
 - [ ] Fix dialogs as users report issues
 - [ ] Add tests when fixing bugs
 - [ ] Fix remaining fake-email display fields (Section 7) — `files.go`, `seafhttp.go`, `starred.go`
+- [x] **Extract `cleanupLibraryTags` to batch** (Section 11) — 6 separate DELETEs → 1 LoggedBatch ✅ (2026-03-18)
+- [ ] **Extract share link helpers** (Section 11) — `createShareLink`/`deleteShareLink` touch 4 tables
+- [ ] **Add test for `LeaveShareRepo`** (Section 11) — bug was undetected due to missing test
+- [ ] **Standardize logging to `slog`** (Section 11) — new helpers use `log.Printf`, inconsistent
 
 ### Long-Term (Backlog)
 - [ ] Migrate all ~100 dialogs (can be automated with script)
@@ -361,6 +365,8 @@ The `modifier` field is part of the Seafile FS object hash (`fs_id`). Changing i
 - [ ] Consider forking seafile-js for any customization needs
 - [ ] OIDC JWT signature verification (Section 6)
 - [ ] Decide on FS object modifier fix (Section 7) — accept mixed-state history or leave as-is
+- [ ] **Extract remaining ~41 inline batches to DRY helpers** (Section 11) — incremental migration
+- [ ] **Add concurrency tests for `renameGroup` and `reserveNextFileTagID`** (Section 11)
 
 ---
 
@@ -538,4 +544,60 @@ All inline HTML has been migrated from Go source files to `html/template` files 
 
 ---
 
-*Last updated: 2026-03-17*
+## 11. Atomic Batch Operations & DRY Helpers Refactoring — 🟡 PARTIAL (2026-03-18)
+
+### Status
+Commit `305d8b21` introduced atomic `LoggedBatch` operations and DRY helper functions for dual-table writes. Local fixes applied for 4 bugs introduced in the commit. **Core pattern established; remaining inline batches should migrate to helpers incrementally.**
+
+### What Was Done (Commit 305d8b21 + Local Fixes)
+
+**New files:**
+- `internal/api/v2/write_helpers.go` — 10 helper functions for atomic dual-table writes
+- `internal/api/v2/group_cleanup.go` — 4 helper functions for group lifecycle cleanup
+
+**Patterns established:**
+- All dual-table writes use `gocql.LoggedBatch` for atomicity (all-or-nothing)
+- Helpers accept `interface{ Session() *gocql.Session }` for testability
+- Large member updates use `UnloggedBatch` in chunks of 50
+- Counter allocation uses LWT (`IF NOT EXISTS` + CAS retry) to prevent race conditions
+- API token creation uses LWT to prevent duplicate `app_name` entries
+- In-memory state maps use TTL-based pruning to prevent memory leaks
+
+**Bugs fixed in local changes (all introduced in same commit):**
+1. `write_helpers.go` — `failedCount` variable not declared (compilation error)
+2. `file_shares.go:879` — incorrect arguments to `deleteLibraryShare` in `LeaveShareRepo`
+3. `group_cleanup.go` — individual DELETEs in loop → refactored to `LoggedBatch` per library
+4. `libraries_test.go:729` — type switch without variable capture
+
+### Remaining: Inline Batches Not Yet Extracted to Helpers
+
+~41 inline `LoggedBatch` usages remain across handlers. High-priority candidates:
+
+| Candidate | File(s) | Tables | Why |
+|-----------|---------|--------|-----|
+| ~~`cleanupLibraryTags`~~ | ~~`tags.go:823-846`~~ | ~~6 tables~~ | ✅ **Fixed** — 6 DELETEs → 1 LoggedBatch |
+| `createShareLink` / `deleteShareLink` | `share_links.go` | 4 tables | Most complex dual-write, easy to get wrong |
+| `createGroup` / `deleteGroup` | `groups.go` | 3 tables | Frequent operation, 5 inline batches |
+| `createDepartment` / `deleteDepartment` | `departments.go` | 2 tables | Same pattern as groups |
+| Library transfer (admin) | `admin.go`, `admin_extra.go`, `org_admin.go` | 2 tables | `updateLibraryOwner` helper exists but may not be used everywhere |
+
+### Remaining: Test Coverage Gaps
+
+| Gap | Risk |
+|-----|------|
+| `LeaveShareRepo` — no test (bug was undetected) | High — the args-swap bug had no test |
+| `renameGroup` — no concurrency test | Medium — Phase 2 (UnloggedBatch) can lose updates |
+| `reserveNextFileTagID` — no unit test for CAS retry | Medium — complex retry logic untested |
+| `cleanupGroupShares` — no test for batch cleanup | Low — tested indirectly via integration |
+
+### Remaining: Consistency Issues
+
+| Issue | Severity | Notes |
+|-------|----------|-------|
+| Mixed `log.Printf` / `slog` logging | Low | New helpers use `log.Printf`, rest of codebase moving to `slog` |
+| `renameGroup` Phase 1/Phase 2 non-atomic | Low | Phase 1 (groups+groups_by_id) succeeds but Phase 2 (groups_by_member) can partially fail. Inherent to Cassandra denormalization — document as known limitation |
+| `file_count` counter increment (tags.go) | Low | Simple Cassandra counter, can lose increments under network partitions. UI-only impact |
+
+---
+
+*Last updated: 2026-03-18*

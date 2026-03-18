@@ -66,28 +66,30 @@ func cleanupGroupShares(database *db.DB, groupID uuid.UUID) error {
 		return err
 	}
 
+	groupIDStr := groupID.String()
 	for _, libID := range libraryIDs {
 		shareIter := database.Session().Query(`
 			SELECT share_id, shared_to FROM shares WHERE library_id = ?
 		`, libID).Iter()
+		defer shareIter.Close()
+
+		batch := database.Session().Batch(gocql.LoggedBatch)
 		var shareID, sharedTo string
 		for shareIter.Scan(&shareID, &sharedTo) {
-			if sharedTo != groupID.String() {
+			if sharedTo != groupIDStr {
 				continue
 			}
-			if err := database.Session().Query(`DELETE FROM shares WHERE library_id = ? AND share_id = ?`,
-				libID, shareID).Exec(); err != nil {
-				_ = shareIter.Close()
-				return fmt.Errorf("failed to delete share %s for group %s: %w", shareID, groupID, err)
-			}
+			batch.Query(`DELETE FROM shares WHERE library_id = ? AND share_id = ?`,
+				libID, shareID)
 		}
 		if err := shareIter.Close(); err != nil {
 			return err
 		}
 
-		if err := database.Session().Query(`DELETE FROM shares_by_user WHERE shared_to = ? AND library_id = ?`,
-			groupID.String(), libID).Exec(); err != nil {
-			return fmt.Errorf("failed to delete shares_by_user lookup for library %s and group %s: %w", libID, groupID, err)
+		batch.Query(`DELETE FROM shares_by_user WHERE shared_to = ? AND library_id = ?`,
+			groupIDStr, libID)
+		if err := batch.Exec(); err != nil {
+			return fmt.Errorf("failed to delete shares for library %s and group %s: %w", libID, groupID, err)
 		}
 	}
 

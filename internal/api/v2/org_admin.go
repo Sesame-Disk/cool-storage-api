@@ -619,6 +619,10 @@ func (h *OrgAdminHandler) UpdateOrgUser(c *gin.Context) {
 		return
 	}
 
+	originalRole := role
+	originalName := name
+	originalQuota := quota
+
 	// seafile-js sends FormData for all org-admin user updates.
 	// Fields: is_active, is_staff, name, contact_email, quota_total
 	if v := c.Request.FormValue("is_active"); v != "" {
@@ -627,11 +631,6 @@ func (h *OrgAdminHandler) UpdateOrgUser(c *gin.Context) {
 			role = "deactivated"
 		} else if role == "deactivated" {
 			role = "user"
-		}
-		if err := h.db.Session().Query(`UPDATE users SET role = ? WHERE org_id = ? AND user_id = ?`,
-			role, targetOrgID, userID).Exec(); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update user"})
-			return
 		}
 	}
 
@@ -642,30 +641,35 @@ func (h *OrgAdminHandler) UpdateOrgUser(c *gin.Context) {
 		} else if role == "admin" {
 			role = "user"
 		}
-		if err := h.db.Session().Query(`UPDATE users SET role = ? WHERE org_id = ? AND user_id = ?`,
-			role, targetOrgID, userID).Exec(); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update user"})
-			return
-		}
 	}
 
 	if v := c.Request.FormValue("name"); v != "" {
 		name = v
-		if err := h.db.Session().Query(`UPDATE users SET name = ? WHERE org_id = ? AND user_id = ?`,
-			name, targetOrgID, userID).Exec(); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update user"})
-			return
-		}
 	}
 
 	if v := c.Request.FormValue("quota_total"); v != "" {
 		if q, err := strconv.ParseInt(v, 10, 64); err == nil {
 			quota = q
-			if err := h.db.Session().Query(`UPDATE users SET quota_bytes = ? WHERE org_id = ? AND user_id = ?`,
-				quota, targetOrgID, userID).Exec(); err != nil {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update user"})
-				return
-			}
+		}
+	}
+
+	if role != originalRole || name != originalName || quota != originalQuota {
+		batch := h.db.Session().Batch(gocql.LoggedBatch)
+		if role != originalRole {
+			batch.Query(`UPDATE users SET role = ? WHERE org_id = ? AND user_id = ?`,
+				role, targetOrgID, userID)
+		}
+		if name != originalName {
+			batch.Query(`UPDATE users SET name = ? WHERE org_id = ? AND user_id = ?`,
+				name, targetOrgID, userID)
+		}
+		if quota != originalQuota {
+			batch.Query(`UPDATE users SET quota_bytes = ? WHERE org_id = ? AND user_id = ?`,
+				quota, targetOrgID, userID)
+		}
+		if err := batch.Exec(); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update user"})
+			return
 		}
 	}
 

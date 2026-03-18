@@ -368,6 +368,46 @@ type FileTagAddRequest struct {
 	RepoTagID int    `json:"repo_tag_id" form:"repo_tag_id"`
 }
 
+func reserveNextFileTagID(sess *gocql.Session, repoUUID gocql.UUID) (int, error) {
+	const maxRetries = 8
+
+	for i := 0; i < maxRetries; i++ {
+		var nextID int
+		err := sess.Query(`
+			SELECT next_file_tag_id FROM file_tag_counters WHERE repo_id = ?
+		`, repoUUID).Scan(&nextID)
+
+		if err == gocql.ErrNotFound {
+			applied, casErr := sess.Query(`
+				INSERT INTO file_tag_counters (repo_id, next_file_tag_id) VALUES (?, ?) IF NOT EXISTS
+			`, repoUUID, 2).MapScanCAS(map[string]interface{}{})
+			if casErr != nil {
+				return 0, casErr
+			}
+			if applied {
+				return 1, nil
+			}
+			continue
+		}
+		if err != nil {
+			return 0, err
+		}
+
+		applied, casErr := sess.Query(`
+			UPDATE file_tag_counters SET next_file_tag_id = ?
+			WHERE repo_id = ? IF next_file_tag_id = ?
+		`, nextID+1, repoUUID, nextID).MapScanCAS(map[string]interface{}{})
+		if casErr != nil {
+			return 0, casErr
+		}
+		if applied {
+			return nextID, nil
+		}
+	}
+
+	return 0, gocql.ErrNotFound
+}
+
 // AddFileTag adds a tag to a file
 // POST /api/v2.1/repos/:repo_id/file-tags/
 func (h *TagHandler) AddFileTag(c *gin.Context) {
@@ -423,29 +463,10 @@ func (h *TagHandler) AddFileTag(c *gin.Context) {
 			return
 		}
 
-		// Get next file_tag_id using counter - simpler approach without LWT
-		err = h.db.Session().Query(`
-			SELECT next_file_tag_id FROM file_tag_counters WHERE repo_id = ?
-		`, repoUUID).Scan(&fileTagID)
-
+		fileTagID, err = reserveNextFileTagID(h.db.Session(), repoUUID)
 		if err != nil {
-			// Counter doesn't exist, create it with value 1
-			fileTagID = 1
-			err = h.db.Session().Query(`
-				INSERT INTO file_tag_counters (repo_id, next_file_tag_id) VALUES (?, ?)
-			`, repoUUID, 2).Exec()
-			if err != nil {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to initialize file tag counter"})
-				return
-			}
-		} else {
-			// Increment counter
-			if err := h.db.Session().Query(`
-				UPDATE file_tag_counters SET next_file_tag_id = ? WHERE repo_id = ?
-			`, fileTagID+1, repoUUID).Exec(); err != nil {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update file tag counter"})
-				return
-			}
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to allocate file tag id"})
+			return
 		}
 
 		now := time.Now()
@@ -798,32 +819,16 @@ func CleanupAllLibraryTags(database *db.DB, repoID string) {
 		return
 	}
 
-	// Delete all file_tags for this repo
-	if err := database.Session().Query(`DELETE FROM file_tags WHERE repo_id = ?`, repoUUID).Exec(); err != nil {
-		log.Printf("[CleanupAllLibraryTags] failed to delete file_tags for library %s: %v", repoID, err)
-	}
-
-	// Delete all file_tags_by_id for this repo
-	if err := database.Session().Query(`DELETE FROM file_tags_by_id WHERE repo_id = ?`, repoUUID).Exec(); err != nil {
-		log.Printf("[CleanupAllLibraryTags] failed to delete file_tags_by_id for library %s: %v", repoID, err)
-	}
-
-	// Delete all repo_tags for this repo
-	if err := database.Session().Query(`DELETE FROM repo_tags WHERE repo_id = ?`, repoUUID).Exec(); err != nil {
-		log.Printf("[CleanupAllLibraryTags] failed to delete repo_tags for library %s: %v", repoID, err)
-	}
-
-	// Delete all repo_tag_file_counts for this repo
-	if err := database.Session().Query(`DELETE FROM repo_tag_file_counts WHERE repo_id = ?`, repoUUID).Exec(); err != nil {
-		log.Printf("[CleanupAllLibraryTags] failed to delete repo_tag_file_counts for library %s: %v", repoID, err)
-	}
-
-	// Delete tag counters
-	if err := database.Session().Query(`DELETE FROM repo_tag_counters WHERE repo_id = ?`, repoUUID).Exec(); err != nil {
-		log.Printf("[CleanupAllLibraryTags] failed to delete repo_tag_counters for library %s: %v", repoID, err)
-	}
-	if err := database.Session().Query(`DELETE FROM file_tag_counters WHERE repo_id = ?`, repoUUID).Exec(); err != nil {
-		log.Printf("[CleanupAllLibraryTags] failed to delete file_tag_counters for library %s: %v", repoID, err)
+	batch := database.Session().Batch(gocql.LoggedBatch)
+	batch.Query(`DELETE FROM file_tags WHERE repo_id = ?`, repoUUID)
+	batch.Query(`DELETE FROM file_tags_by_id WHERE repo_id = ?`, repoUUID)
+	batch.Query(`DELETE FROM repo_tags WHERE repo_id = ?`, repoUUID)
+	batch.Query(`DELETE FROM repo_tag_file_counts WHERE repo_id = ?`, repoUUID)
+	batch.Query(`DELETE FROM repo_tag_counters WHERE repo_id = ?`, repoUUID)
+	batch.Query(`DELETE FROM file_tag_counters WHERE repo_id = ?`, repoUUID)
+	if err := batch.Exec(); err != nil {
+		log.Printf("[CleanupAllLibraryTags] failed to delete tag data for library %s: %v", repoID, err)
+		return
 	}
 
 	log.Printf("[CleanupAllLibraryTags] Cleaned all tag data for library %s", repoID)

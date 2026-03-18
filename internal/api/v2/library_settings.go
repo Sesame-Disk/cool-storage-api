@@ -328,18 +328,29 @@ func (h *LibrarySettingsHandler) CreateAPIToken(c *gin.Context) {
 
 	now := time.Now()
 
-	// Check if app_name already exists
-	var existing string
-	err := h.db.Session().Query(`
-		SELECT app_name FROM repo_api_tokens WHERE repo_id = ? AND app_name = ?
-	`, repoID, req.AppName).Scan(&existing)
-	if err == nil {
+	// Use LWT to prevent concurrent duplicate app_name creation.
+	applied, err := h.db.Session().Query(`
+		INSERT INTO repo_api_tokens (repo_id, app_name, api_token, permission, generated_by, created_at)
+		VALUES (?, ?, ?, ?, ?, ?) IF NOT EXISTS
+	`, repoID, req.AppName, apiToken, req.Permission, userID, now).MapScanCAS(map[string]interface{}{})
+	if err != nil {
+		log.Printf("[CreateAPIToken] Failed to create token (LWT): %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create API token"})
+		return
+	}
+	if !applied {
 		c.JSON(http.StatusConflict, gin.H{"error": "API token with this app name already exists"})
 		return
 	}
 
-	if err := createRepoAPIToken(h.db, repoID, req.AppName, apiToken, req.Permission, userID, now); err != nil {
-		log.Printf("[CreateAPIToken] Failed to create token: %v", err)
+	if err := h.db.Session().Query(`
+		INSERT INTO repo_api_tokens_by_token (api_token, repo_id, app_name, permission, generated_by)
+		VALUES (?, ?, ?, ?, ?)
+	`, apiToken, repoID, req.AppName, req.Permission, userID).Exec(); err != nil {
+		_ = h.db.Session().Query(`
+			DELETE FROM repo_api_tokens WHERE repo_id = ? AND app_name = ?
+		`, repoID, req.AppName).Exec()
+		log.Printf("[CreateAPIToken] Failed to create reverse lookup token: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create API token"})
 		return
 	}

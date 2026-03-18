@@ -1026,13 +1026,7 @@ func (c *OIDCClient) storeState(state string, authState *AuthState) {
 	c.stateMu.Lock()
 	defer c.stateMu.Unlock()
 
-	// Clean up old states (older than 10 minutes)
-	cutoff := time.Now().Add(-10 * time.Minute)
-	for s, as := range c.states {
-		if as.CreatedAt.Before(cutoff) {
-			delete(c.states, s)
-		}
-	}
+	c.pruneExpiredStatesLocked()
 
 	c.states[state] = authState
 }
@@ -1042,19 +1036,24 @@ func (c *OIDCClient) consumeState(state string) (*AuthState, error) {
 	c.stateMu.Lock()
 	defer c.stateMu.Unlock()
 
+	c.pruneExpiredStatesLocked()
+
 	authState, ok := c.states[state]
 	if !ok {
 		return nil, fmt.Errorf("state not found")
 	}
 
-	// Check if state has expired (10 minutes)
-	if time.Since(authState.CreatedAt) > 10*time.Minute {
-		delete(c.states, state)
-		return nil, fmt.Errorf("state has expired")
-	}
-
 	delete(c.states, state)
 	return authState, nil
+}
+
+func (c *OIDCClient) pruneExpiredStatesLocked() {
+	cutoff := time.Now().Add(-10 * time.Minute)
+	for s, as := range c.states {
+		if as.CreatedAt.Before(cutoff) {
+			delete(c.states, s)
+		}
+	}
 }
 
 // GetLogoutURL returns the URL to redirect users to for logout

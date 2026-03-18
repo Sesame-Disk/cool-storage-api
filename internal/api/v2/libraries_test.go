@@ -726,11 +726,10 @@ func TestV21Library_EncryptedField(t *testing.T) {
 
 	// encrypted must be a number, not boolean
 	enc := raw["encrypted"]
-	switch enc.(type) {
+	switch v := enc.(type) {
 	case float64:
-		// Good - JSON number
-		if enc.(float64) != 1 {
-			t.Errorf("encrypted = %v, want 1", enc)
+		if v != 1 {
+			t.Errorf("encrypted = %v, want 1", v)
 		}
 	default:
 		t.Errorf("encrypted should be number type, got %T", enc)
