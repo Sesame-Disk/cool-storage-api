@@ -246,9 +246,9 @@ func (h *LibrarySettingsHandler) SetAutoDelete(c *gin.Context) {
 
 // APITokenResponse represents an API token in responses
 type APITokenResponse struct {
-	AppName    string `json:"app_name"`
-	APIToken   string `json:"api_token"`
-	Permission string `json:"permission"`
+	AppName     string `json:"app_name"`
+	APIToken    string `json:"api_token"`
+	Permission  string `json:"permission"`
 	GeneratedAt string `json:"generated_at"`
 }
 
@@ -271,9 +271,9 @@ func (h *LibrarySettingsHandler) ListAPITokens(c *gin.Context) {
 
 	for iter.Scan(&appName, &apiToken, &permission, &createdAt) {
 		tokens = append(tokens, APITokenResponse{
-			AppName:    appName,
-			APIToken:   apiToken,
-			Permission: permission,
+			AppName:     appName,
+			APIToken:    apiToken,
+			Permission:  permission,
 			GeneratedAt: createdAt.Format(time.RFC3339),
 		})
 	}
@@ -338,28 +338,16 @@ func (h *LibrarySettingsHandler) CreateAPIToken(c *gin.Context) {
 		return
 	}
 
-	if err := h.db.Session().Query(`
-		INSERT INTO repo_api_tokens (repo_id, app_name, api_token, permission, generated_by, created_at)
-		VALUES (?, ?, ?, ?, ?, ?)
-	`, repoID, req.AppName, apiToken, req.Permission, userID, now).Exec(); err != nil {
+	if err := createRepoAPIToken(h.db, repoID, req.AppName, apiToken, req.Permission, userID, now); err != nil {
 		log.Printf("[CreateAPIToken] Failed to create token: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create API token"})
 		return
 	}
 
-	// Dual-write to reverse-lookup table for auth middleware
-	if err := h.db.Session().Query(`
-		INSERT INTO repo_api_tokens_by_token (api_token, repo_id, app_name, permission, generated_by)
-		VALUES (?, ?, ?, ?, ?)
-	`, apiToken, repoID, req.AppName, req.Permission, userID).Exec(); err != nil {
-		log.Printf("[CreateAPIToken] Failed to write reverse-lookup: %v", err)
-		// Non-fatal: token works but won't authenticate until manually fixed
-	}
-
 	c.JSON(http.StatusOK, APITokenResponse{
-		AppName:    req.AppName,
-		APIToken:   apiToken,
-		Permission: req.Permission,
+		AppName:     req.AppName,
+		APIToken:    apiToken,
+		Permission:  req.Permission,
 		GeneratedAt: now.Format(time.RFC3339),
 	})
 }
@@ -384,17 +372,10 @@ func (h *LibrarySettingsHandler) DeleteAPIToken(c *gin.Context) {
 		SELECT api_token FROM repo_api_tokens WHERE repo_id = ? AND app_name = ?
 	`, repoID, appName).Scan(&apiToken)
 
-	if err := h.db.Session().Query(`
-		DELETE FROM repo_api_tokens WHERE repo_id = ? AND app_name = ?
-	`, repoID, appName).Exec(); err != nil {
+	if err := deleteRepoAPIToken(h.db, repoID, appName, apiToken); err != nil {
 		log.Printf("[DeleteAPIToken] Failed to delete token: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete API token"})
 		return
-	}
-
-	// Clean up reverse-lookup table
-	if apiToken != "" {
-		h.db.Session().Query(`DELETE FROM repo_api_tokens_by_token WHERE api_token = ?`, apiToken).Exec()
 	}
 
 	c.JSON(http.StatusOK, gin.H{"success": true})
@@ -433,18 +414,10 @@ func (h *LibrarySettingsHandler) UpdateAPIToken(c *gin.Context) {
 		SELECT api_token FROM repo_api_tokens WHERE repo_id = ? AND app_name = ?
 	`, repoID, appName).Scan(&apiToken)
 
-	if err := h.db.Session().Query(`
-		UPDATE repo_api_tokens SET permission = ? WHERE repo_id = ? AND app_name = ?
-	`, req.Permission, repoID, appName).Exec(); err != nil {
+	if err := updateRepoAPITokenPermission(h.db, repoID, appName, apiToken, req.Permission); err != nil {
 		log.Printf("[UpdateAPIToken] Failed to update token: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update API token"})
 		return
-	}
-
-	// Update reverse-lookup table
-	if apiToken != "" {
-		h.db.Session().Query(`UPDATE repo_api_tokens_by_token SET permission = ? WHERE api_token = ?`,
-			req.Permission, apiToken).Exec()
 	}
 
 	c.JSON(http.StatusOK, gin.H{"success": true})
@@ -493,23 +466,10 @@ func (h *LibrarySettingsHandler) TransferLibrary(c *gin.Context) {
 
 	now := time.Now()
 
-	// Update the owner in the libraries table
-	if err := h.db.Session().Query(`
-		UPDATE libraries SET owner_id = ?, updated_at = ?
-		WHERE org_id = ? AND library_id = ?
-	`, newOwnerID, now, orgID, repoID).Exec(); err != nil {
-		log.Printf("[TransferLibrary] Failed to update libraries: %v", err)
+	if err := updateLibraryOwner(h.db, orgID, repoID, newOwnerID, now); err != nil {
+		log.Printf("[TransferLibrary] Failed to transfer owner: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error_msg": "failed to transfer library"})
 		return
-	}
-
-	// Update the libraries_by_id lookup table (dual-write pattern)
-	if err := h.db.Session().Query(`
-		UPDATE libraries_by_id SET owner_id = ?
-		WHERE library_id = ?
-	`, newOwnerID, repoID).Exec(); err != nil {
-		log.Printf("[TransferLibrary] Failed to update libraries_by_id: %v", err)
-		// Non-fatal - the main table was updated
 	}
 
 	c.JSON(http.StatusOK, gin.H{"success": true})

@@ -396,25 +396,13 @@ func (h *FileShareHandler) CreateShare(c *gin.Context) {
 
 			shareIDUUID := uuid.New()
 
-			// Insert share into database
-			if err := h.db.Session().Query(`
-				INSERT INTO shares (
-					library_id, share_id, shared_by, shared_to, shared_to_type,
-					permission, created_at, expires_at
-				) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-			`, repoUUID.String(), shareIDUUID.String(), userID, sharedToUserID, "user", permission, now, nil).Exec(); err != nil {
+			if err := createLibraryShare(h.db, repoUUID.String(), shareIDUUID.String(), userID, sharedToUserID, "user", permission, now, nil); err != nil {
 				failedItems = append(failedItems, gin.H{
 					"email":     username,
 					"error_msg": "failed to create share",
 				})
 				continue
 			}
-
-			// Dual-write to shares_by_user lookup
-			h.db.Session().Query(`
-				INSERT INTO shares_by_user (shared_to, library_id, shared_to_type, permission, shared_by, created_at)
-				VALUES (?, ?, ?, ?, ?, ?)
-			`, sharedToUserID, repoUUID.String(), "user", permission, userID, now).Exec()
 
 			successItems = append(successItems, gin.H{
 				"user_info":  gin.H{"name": username, "nickname": userName, "contact_email": username, "avatar_url": ""},
@@ -456,13 +444,7 @@ func (h *FileShareHandler) CreateShare(c *gin.Context) {
 
 			shareIDUUID := uuid.New()
 
-			// Insert share into database
-			if err := h.db.Session().Query(`
-				INSERT INTO shares (
-					library_id, share_id, shared_by, shared_to, shared_to_type,
-					permission, created_at, expires_at
-				) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-			`, repoUUID.String(), shareIDUUID.String(), userID, groupUUID.String(), "group", permission, now, nil).Exec(); err != nil {
+			if err := createLibraryShare(h.db, repoUUID.String(), shareIDUUID.String(), userID, groupUUID.String(), "group", permission, now, nil); err != nil {
 				failedItems = append(failedItems, gin.H{
 					"group_id":  groupID,
 					"error_msg": "failed to create share",
@@ -604,17 +586,9 @@ func (h *FileShareHandler) UpdateSharePermission(c *gin.Context) {
 		return
 	}
 
-	// Update permission
-	if err := h.db.Session().Query(`
-		UPDATE shares SET permission = ? WHERE library_id = ? AND share_id = ?
-	`, permission, repoUUID.String(), shareIDUUID.String()).Exec(); err != nil {
+	if err := updateLibrarySharePermission(h.db, repoUUID.String(), shareIDUUID.String(), sharedToID, permission); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update share"})
 		return
-	}
-	if shareType == "user" {
-		h.db.Session().Query(`
-			UPDATE shares_by_user SET permission = ? WHERE shared_to = ? AND library_id = ?
-		`, permission, sharedToID, repoUUID.String()).Exec()
 	}
 
 	c.JSON(http.StatusOK, gin.H{"success": true})
@@ -723,17 +697,9 @@ func (h *FileShareHandler) DeleteShare(c *gin.Context) {
 		return
 	}
 
-	// Delete share
-	if err := h.db.Session().Query(`
-		DELETE FROM shares WHERE library_id = ? AND share_id = ?
-	`, repoUUID.String(), shareIDUUID.String()).Exec(); err != nil {
+	if err := deleteLibraryShare(h.db, repoUUID.String(), shareIDUUID.String(), sharedToID); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete share"})
 		return
-	}
-	if shareType == "user" {
-		h.db.Session().Query(`
-			DELETE FROM shares_by_user WHERE shared_to = ? AND library_id = ?
-		`, sharedToID, repoUUID.String()).Exec()
 	}
 
 	c.JSON(http.StatusOK, gin.H{"success": true})
@@ -910,21 +876,10 @@ func (h *FileShareHandler) LeaveShareRepo(c *gin.Context) {
 		return
 	}
 
-	shareIDUUID, err := uuid.Parse(foundShareID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "invalid share_id in database"})
-		return
-	}
-
-	if err := h.db.Session().Query(`
-		DELETE FROM shares WHERE library_id = ? AND share_id = ?
-	`, repoUUID.String(), shareIDUUID.String()).Exec(); err != nil {
+	if err := deleteLibraryShare(h.db, repoUUID.String(), userID, "user"); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete share"})
 		return
 	}
-	h.db.Session().Query(`
-		DELETE FROM shares_by_user WHERE shared_to = ? AND library_id = ?
-	`, userID, repoUUID.String()).Exec()
 
 	c.JSON(http.StatusOK, gin.H{"success": true})
 }

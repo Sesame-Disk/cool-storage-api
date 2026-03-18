@@ -185,7 +185,9 @@ func (h *ShareLinkViewHandler) resolveShareLink(token string) (*shareLinkData, e
 	// Increment view_count (fire-and-forget, approximate counter)
 	now := time.Now()
 	go func() {
-		h.db.Session().Query(`UPDATE share_links SET view_count = view_count + 1, last_accessed_at = ? WHERE link_token = ?`, now, token).Exec()
+		if err := h.db.Session().Query(`UPDATE share_links SET view_count = view_count + 1, last_accessed_at = ? WHERE link_token = ?`, now, token).Exec(); err != nil {
+			log.Printf("[resolveShareLink] failed to update view_count for token %s: %v", token, err)
+		}
 	}()
 
 	// Get library name and head commit ID
@@ -369,10 +371,14 @@ func (h *ShareLinkViewHandler) handleShareLinkDownload(c *gin.Context, sl *share
 	// Increment download_count and handle single_use deactivation (fire-and-forget)
 	go func() {
 		now := time.Now()
-		h.db.Session().Query(`UPDATE share_links SET download_count = download_count + 1, last_accessed_at = ? WHERE link_token = ?`,
-			now, sl.token).Exec()
+		if err := h.db.Session().Query(`UPDATE share_links SET download_count = download_count + 1, last_accessed_at = ? WHERE link_token = ?`,
+			now, sl.token).Exec(); err != nil {
+			log.Printf("[handleShareLinkDownload] failed to update download_count for token %s: %v", sl.token, err)
+		}
 		if sl.singleUse {
-			h.db.Session().Query(`UPDATE share_links SET active = false WHERE link_token = ?`, sl.token).Exec()
+			if err := h.db.Session().Query(`UPDATE share_links SET active = false WHERE link_token = ?`, sl.token).Exec(); err != nil {
+				log.Printf("[handleShareLinkDownload] failed to deactivate single-use token %s: %v", sl.token, err)
+			}
 		}
 	}()
 
@@ -1537,12 +1543,16 @@ func (h *ShareLinkViewHandler) PostUploadLinkDone(c *gin.Context) {
 	// Increment upload_count and handle single_use deactivation (fire-and-forget)
 	go func() {
 		now := time.Now()
-		h.db.Session().Query(`UPDATE share_links SET upload_count = upload_count + 1, last_accessed_at = ? WHERE link_token = ?`,
-			now, token).Exec()
+		if err := h.db.Session().Query(`UPDATE share_links SET upload_count = upload_count + 1, last_accessed_at = ? WHERE link_token = ?`,
+			now, token).Exec(); err != nil {
+			log.Printf("[PostUploadLinkDone] failed to update upload_count for token %s: %v", token, err)
+		}
 		// Check single_use flag
 		var singleUse bool
 		if err := h.db.Session().Query(`SELECT single_use FROM share_links WHERE link_token = ?`, token).Scan(&singleUse); err == nil && singleUse {
-			h.db.Session().Query(`UPDATE share_links SET active = false WHERE link_token = ?`, token).Exec()
+			if err := h.db.Session().Query(`UPDATE share_links SET active = false WHERE link_token = ?`, token).Exec(); err != nil {
+				log.Printf("[PostUploadLinkDone] failed to deactivate single-use token %s: %v", token, err)
+			}
 		}
 	}()
 
@@ -1628,10 +1638,14 @@ func (h *ShareLinkViewHandler) PostShareLinkUploadDone(c *gin.Context) {
 	// Increment upload_count and handle single_use deactivation (fire-and-forget)
 	go func() {
 		now := time.Now()
-		h.db.Session().Query(`UPDATE share_links SET upload_count = upload_count + 1, last_accessed_at = ? WHERE link_token = ?`,
-			now, sl.token).Exec()
+		if err := h.db.Session().Query(`UPDATE share_links SET upload_count = upload_count + 1, last_accessed_at = ? WHERE link_token = ?`,
+			now, sl.token).Exec(); err != nil {
+			log.Printf("[PostShareLinkUploadDone] failed to update upload_count for token %s: %v", sl.token, err)
+		}
 		if sl.singleUse {
-			h.db.Session().Query(`UPDATE share_links SET active = false WHERE link_token = ?`, sl.token).Exec()
+			if err := h.db.Session().Query(`UPDATE share_links SET active = false WHERE link_token = ?`, sl.token).Exec(); err != nil {
+				log.Printf("[PostShareLinkUploadDone] failed to deactivate single-use token %s: %v", sl.token, err)
+			}
 		}
 	}()
 

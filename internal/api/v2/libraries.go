@@ -496,15 +496,6 @@ func (h *LibraryHandler) CreateLibrary(c *gin.Context) {
 	emptyDirHash := sha1.Sum([]byte(emptyDirData))
 	rootFSID := hex.EncodeToString(emptyDirHash[:])
 
-	// Store empty root directory in fs_objects
-	if err := h.db.Session().Query(`
-		INSERT INTO fs_objects (library_id, fs_id, obj_type, obj_name, dir_entries, mtime)
-		VALUES (?, ?, ?, ?, ?, ?)
-	`, newLibID.String(), rootFSID, "dir", "", emptyDirEntries, now.Unix()).Exec(); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create root directory", "details": err.Error()})
-		return
-	}
-
 	// Generate initial commit ID (SHA-1 hash of repo creation data)
 	commitData := fmt.Sprintf("%s:%s:%d", newLibID.String(), req.Name, now.UnixNano())
 	commitHash := sha1.Sum([]byte(commitData))
@@ -528,6 +519,10 @@ func (h *LibraryHandler) CreateLibrary(c *gin.Context) {
 	// Insert into database with head_commit_id and encryption params
 	// Use batched writes to maintain consistency between libraries and libraries_by_id
 	batch := h.db.Session().Batch(gocql.LoggedBatch)
+	batch.Query(`
+		INSERT INTO fs_objects (library_id, fs_id, obj_type, obj_name, dir_entries, mtime)
+		VALUES (?, ?, ?, ?, ?, ?)
+	`, newLibID.String(), rootFSID, "dir", "", emptyDirEntries, now.Unix())
 
 	if req.Encrypted && encParams != nil {
 		batch.Query(`
@@ -577,19 +572,14 @@ func (h *LibraryHandler) CreateLibrary(c *gin.Context) {
 		)
 	}
 
+	batch.Query(`
+		INSERT INTO commits (library_id, commit_id, root_fs_id, creator_id, description, created_at)
+		VALUES (?, ?, ?, ?, ?, ?)
+	`, newLibID.String(), headCommitID, rootFSID, userID, "Initial commit", now)
+
 	if err := batch.Exec(); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create library", "details": err.Error()})
 		return
-	}
-
-	// Create initial commit record with root_fs_id pointing to empty root directory
-	if err := h.db.Session().Query(`
-		INSERT INTO commits (library_id, commit_id, root_fs_id, creator_id, description, created_at)
-		VALUES (?, ?, ?, ?, ?, ?)
-	`, newLibID.String(), headCommitID, rootFSID, userID, "Initial commit", now).Exec(); err != nil {
-		// Non-fatal for the library creation response, but log prominently:
-		// a missing commit record will cause file operations to fail later.
-		log.Printf("[CreateLibrary] ERROR: failed to create initial commit record for library %s: %v", newLibID.String(), err)
 	}
 
 	// Get user email for response (normally set by auth middleware;

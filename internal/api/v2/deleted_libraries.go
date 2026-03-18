@@ -247,36 +247,41 @@ func (h *DeletedLibraryHandler) PermanentDeleteRepo(c *gin.Context) {
 		}
 	}
 
-	// Enqueue all library contents for GC
-	if h.libHandler != nil && h.libHandler.gcEnqueuer != nil {
-		go h.libHandler.gcEnqueuer.EnqueueLibraryDeletion(orgID, repoID, storageClass)
+	// Clean up share/upload links before hard delete so derived tables do not
+	// outlive the library row on partial failures.
+	if err := cleanupLibraryLinks(h.db, orgID, repoID); err != nil {
+		log.Printf("[PermanentDeleteRepo] Failed to clean share links for %s: %v", repoID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to clean share links"})
+		return
 	}
-
-	// Clean up all tag data for this library (async, non-blocking)
-	go CleanupAllLibraryTags(h.db, repoID)
-
-	// Clean up share/upload links for this library via the lookup table
-	go cleanupLibraryLinks(h.db, orgID, repoID)
 
 	// Hard delete the library records
 	batch := h.db.Session().Batch(gocql.LoggedBatch)
 	batch.Query(`DELETE FROM libraries WHERE org_id = ? AND library_id = ?`, orgID, repoID)
 	batch.Query(`DELETE FROM libraries_by_id WHERE library_id = ?`, repoID)
-	
+
 	// Preserve the org lookup for the Garbage Collector
 	batch.Query(`INSERT INTO deleted_libraries (library_id, org_id, deleted_at) VALUES (?, ?, ?)`, repoID, orgID, time.Now())
-	
+
 	if err := batch.Exec(); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete library"})
 		return
 	}
+
+	// Enqueue all library contents for GC after the delete marker is persisted.
+	if h.libHandler != nil && h.libHandler.gcEnqueuer != nil {
+		go h.libHandler.gcEnqueuer.EnqueueLibraryDeletion(orgID, repoID, storageClass)
+	}
+
+	// Tag cleanup is secondary metadata and can remain asynchronous.
+	go CleanupAllLibraryTags(h.db, repoID)
 
 	c.JSON(http.StatusOK, gin.H{"success": true})
 }
 
 // cleanupLibraryLinks removes all share/upload links for a deleted library
 // by scanning share_links_by_library and quad-deleting each link.
-func cleanupLibraryLinks(db interface{ Session() *gocql.Session }, orgID, libraryID string) {
+func cleanupLibraryLinks(db interface{ Session() *gocql.Session }, orgID, libraryID string) error {
 	iter := db.Session().Query(`
 		SELECT link_token, created_by, created_at FROM share_links_by_library
 		WHERE org_id = ? AND library_id = ?
@@ -290,7 +295,13 @@ func cleanupLibraryLinks(db interface{ Session() *gocql.Session }, orgID, librar
 		batch.Query(`DELETE FROM share_links_by_creator WHERE org_id = ? AND created_by = ? AND created_at = ? AND link_token = ?`, orgID, createdBy, createdAt, linkToken)
 		batch.Query(`DELETE FROM share_links_by_org WHERE org_id = ? AND created_at = ? AND link_token = ?`, orgID, createdAt, linkToken)
 		batch.Query(`DELETE FROM share_links_by_library WHERE org_id = ? AND library_id = ? AND link_token = ?`, orgID, libraryID, linkToken)
-		batch.Exec()
+		if err := batch.Exec(); err != nil {
+			_ = iter.Close()
+			return err
+		}
 	}
-	iter.Close()
+	if err := iter.Close(); err != nil {
+		return err
+	}
+	return nil
 }

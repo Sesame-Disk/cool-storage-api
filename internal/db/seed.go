@@ -40,11 +40,10 @@ func (db *DB) SeedDatabase(devMode bool, firstSuperAdminEmail string) error {
 	defaultExists := defaultErr == nil
 
 	if platformExists && defaultExists {
-		log.Println("✓ Database already seeded, skipping")
-		return nil
+		log.Println("✓ Core organizations already seeded")
+	} else {
+		log.Println("→ Seeding database with default data...")
 	}
-
-	log.Println("→ Seeding database with default data...")
 
 	// Create platform organization first (for superadmin users)
 	if !platformExists {
@@ -75,6 +74,11 @@ func (db *DB) SeedDatabase(devMode bool, firstSuperAdminEmail string) error {
 		if err := db.createSuperAdmin(platformOrgID, uuid.MustParse("00000000-0000-0000-0000-000000000099"), "superadmin@sesamefs.local", "Platform Super Admin"); err != nil {
 			return err
 		}
+	}
+
+	if platformExists && defaultExists && !devMode {
+		log.Println("✓ Database already seeded, skipping")
+		return nil
 	}
 
 	log.Println("✓ Database seeding completed successfully")

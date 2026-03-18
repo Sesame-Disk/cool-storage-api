@@ -58,22 +58,23 @@ func TestCreateGroup(t *testing.T) {
 			name:       "missing group_name",
 			body:       map[string]string{},
 			wantStatus: http.StatusBadRequest,
-			wantError:  "group_name",
+			wantError:  "GroupName",
 		},
 		{
 			name: "empty group_name",
 			body: map[string]string{
-				"group_name": "",
+				"name": "",
 			},
 			wantStatus: http.StatusBadRequest,
-			wantError:  "group_name is required",
+			wantError:  "GroupName",
 		},
 		{
 			name: "valid request without DB",
 			body: map[string]string{
-				"group_name": "Test Group",
+				"name": "Test Group",
 			},
 			wantStatus: http.StatusInternalServerError,
+			wantError:  "database not available",
 		},
 	}
 
@@ -88,6 +89,10 @@ func TestCreateGroup(t *testing.T) {
 
 			if w.Code != tt.wantStatus {
 				t.Errorf("status = %d, want %d. Response: %s", w.Code, tt.wantStatus, w.Body.String())
+			}
+
+			if tt.wantError != "" && !strings.Contains(w.Body.String(), tt.wantError) {
+				t.Errorf("response = %s, want to contain %q", w.Body.String(), tt.wantError)
 			}
 		})
 	}
@@ -163,9 +168,9 @@ func TestUpdateGroup(t *testing.T) {
 		wantError  string
 	}{
 		{
-			name:    "missing group_name",
-			groupID: "123e4567-e89b-12d3-a456-426614174000",
-			body:    map[string]string{},
+			name:       "missing group_name",
+			groupID:    "123e4567-e89b-12d3-a456-426614174000",
+			body:       map[string]string{},
 			wantStatus: http.StatusBadRequest,
 			wantError:  "group_name",
 		},
@@ -306,9 +311,9 @@ func TestAddGroupMember(t *testing.T) {
 		wantError  string
 	}{
 		{
-			name:    "missing email",
-			groupID: "123e4567-e89b-12d3-a456-426614174000",
-			body:    map[string]string{},
+			name:       "missing email",
+			groupID:    "123e4567-e89b-12d3-a456-426614174000",
+			body:       map[string]string{},
 			wantStatus: http.StatusBadRequest,
 			wantError:  "email",
 		},
@@ -396,6 +401,111 @@ func TestRemoveGroupMember(t *testing.T) {
 
 			if w.Code != tt.wantStatus {
 				t.Errorf("status = %d, want %d. Response: %s", w.Code, tt.wantStatus, w.Body.String())
+			}
+		})
+	}
+}
+
+// TestCreateGroupOwnedLibrary_FailurePaths covers early validation and missing-db behavior.
+func TestCreateGroupOwnedLibrary_FailurePaths(t *testing.T) {
+	r := gin.New()
+	handler := &GroupHandler{}
+
+	r.POST("/api/v2.1/groups/:group_id/group-owned-libraries/", func(c *gin.Context) {
+		c.Set("org_id", "test-org-id")
+		c.Set("user_id", "test-user-id")
+		handler.CreateGroupOwnedLibrary(c)
+	})
+
+	tests := []struct {
+		name         string
+		groupID      string
+		form         url.Values
+		wantStatus   int
+		wantContains string
+	}{
+		{
+			name:         "invalid group id",
+			groupID:      "not-a-uuid",
+			form:         url.Values{"name": {"Repo"}},
+			wantStatus:   http.StatusBadRequest,
+			wantContains: "invalid group_id",
+		},
+		{
+			name:         "valid group id without db",
+			groupID:      "123e4567-e89b-12d3-a456-426614174000",
+			form:         url.Values{"name": {"Repo"}},
+			wantStatus:   http.StatusInternalServerError,
+			wantContains: "database not available",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			reqURL := "/api/v2.1/groups/" + tt.groupID + "/group-owned-libraries/"
+			req := httptest.NewRequest("POST", reqURL, strings.NewReader(tt.form.Encode()))
+			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			w := httptest.NewRecorder()
+
+			r.ServeHTTP(w, req)
+
+			if w.Code != tt.wantStatus {
+				t.Errorf("status = %d, want %d. Response: %s", w.Code, tt.wantStatus, w.Body.String())
+			}
+			if tt.wantContains != "" && !strings.Contains(w.Body.String(), tt.wantContains) {
+				t.Errorf("response = %s, want to contain %q", w.Body.String(), tt.wantContains)
+			}
+		})
+	}
+}
+
+// TestDeleteGroupOwnedLibrary_FailurePaths covers early validation and missing-db behavior.
+func TestDeleteGroupOwnedLibrary_FailurePaths(t *testing.T) {
+	r := gin.New()
+	handler := &GroupHandler{}
+
+	r.DELETE("/api/v2.1/groups/:group_id/group-owned-libraries/:library_id/", func(c *gin.Context) {
+		c.Set("org_id", "test-org-id")
+		c.Set("user_id", "test-user-id")
+		handler.DeleteGroupOwnedLibrary(c)
+	})
+
+	tests := []struct {
+		name         string
+		groupID      string
+		libraryID    string
+		wantStatus   int
+		wantContains string
+	}{
+		{
+			name:         "invalid group id",
+			groupID:      "not-a-uuid",
+			libraryID:    "11111111-1111-1111-1111-111111111111",
+			wantStatus:   http.StatusBadRequest,
+			wantContains: "invalid group_id",
+		},
+		{
+			name:         "valid group id without db",
+			groupID:      "123e4567-e89b-12d3-a456-426614174000",
+			libraryID:    "11111111-1111-1111-1111-111111111111",
+			wantStatus:   http.StatusInternalServerError,
+			wantContains: "database not available",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			reqURL := "/api/v2.1/groups/" + tt.groupID + "/group-owned-libraries/" + tt.libraryID + "/"
+			req := httptest.NewRequest("DELETE", reqURL, nil)
+			w := httptest.NewRecorder()
+
+			r.ServeHTTP(w, req)
+
+			if w.Code != tt.wantStatus {
+				t.Errorf("status = %d, want %d. Response: %s", w.Code, tt.wantStatus, w.Body.String())
+			}
+			if tt.wantContains != "" && !strings.Contains(w.Body.String(), tt.wantContains) {
+				t.Errorf("response = %s, want to contain %q", w.Body.String(), tt.wantContains)
 			}
 		})
 	}

@@ -36,6 +36,9 @@ services:
       - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-minioadmin}
       - SHARE_LINK_HMAC_KEY=${SHARE_LINK_HMAC_KEY:-dev-share-link-hmac-key}
       - FIRST_SUPERADMIN_EMAIL=${FIRST_SUPERADMIN_EMAIL}
+      - ONLYOFFICE_ENABLED=${ONLYOFFICE_ENABLED:-true}
+      - ONLYOFFICE_API_JS_URL=${ONLYOFFICE_API_JS_URL:-http://localhost:8088/web-apps/apps/api/documents/api.js}
+      - ONLYOFFICE_JWT_SECRET=${ONLYOFFICE_JWT_SECRET:-change-me-to-a-random-string}
     depends_on:
       cassandra:
         condition: service_healthy

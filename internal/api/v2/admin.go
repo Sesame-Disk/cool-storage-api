@@ -392,21 +392,6 @@ func (h *AdminHandler) CreateOrganization(c *gin.Context) {
 		"default_backend": "s3",
 	}
 
-	if err := h.db.Session().Query(`
-		INSERT INTO organizations (
-			org_id, name, settings, storage_quota, storage_used,
-			chunking_polynomial, storage_config, created_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-	`,
-		orgID.String(), orgName, settings,
-		storageQuota, int64(0), int64(17592186044415),
-		storageConfig, now,
-	).Exec(); err != nil {
-		log.Printf("CreateOrganization: failed to insert org %s: %v", orgName, err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create organization"})
-		return
-	}
-
 	// ── Optionally create the owner/admin user ─────────────────────────────
 	ownerName := ""
 	if ownerEmail != "" {
@@ -414,6 +399,16 @@ func (h *AdminHandler) CreateOrganization(c *gin.Context) {
 		ownerUserID := uuid.New()
 
 		batch := h.db.Session().Batch(gocql.LoggedBatch)
+		batch.Query(`
+			INSERT INTO organizations (
+				org_id, name, settings, storage_quota, storage_used,
+				chunking_polynomial, storage_config, created_at
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		`,
+			orgID.String(), orgName, settings,
+			storageQuota, int64(0), int64(17592186044415),
+			storageConfig, now,
+		)
 		batch.Query(`
 			INSERT INTO users (org_id, user_id, email, name, role, quota_bytes, used_bytes, created_at)
 			VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -426,8 +421,25 @@ func (h *AdminHandler) CreateOrganization(c *gin.Context) {
 		`, ownerEmail, ownerUserID.String(), orgID.String())
 
 		if err := batch.Exec(); err != nil {
-			log.Printf("CreateOrganization: failed to create owner user %s in org %s: %v",
-				ownerEmail, orgID, err)
+			log.Printf("CreateOrganization: failed to create org %s with owner %s: %v",
+				orgID, ownerEmail, err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create organization"})
+			return
+		}
+	} else {
+		if err := h.db.Session().Query(`
+			INSERT INTO organizations (
+				org_id, name, settings, storage_quota, storage_used,
+				chunking_polynomial, storage_config, created_at
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		`,
+			orgID.String(), orgName, settings,
+			storageQuota, int64(0), int64(17592186044415),
+			storageConfig, now,
+		).Exec(); err != nil {
+			log.Printf("CreateOrganization: failed to insert org %s: %v", orgName, err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create organization"})
+			return
 		}
 	}
 
@@ -931,9 +943,11 @@ func (h *AdminHandler) lookupUserByEmail(email string) (userID, orgID string, er
 	}
 
 	// Backfill the index so future lookups are fast
-	_ = h.db.Session().Query(`
+	if err := h.db.Session().Query(`
 		INSERT INTO users_by_email (email, user_id, org_id) VALUES (?, ?, ?)
-	`, email, userID, orgID).Exec()
+	`, email, userID, orgID).Exec(); err != nil {
+		log.Printf("[lookupUserByEmail] failed to backfill users_by_email for %s: %v", email, err)
+	}
 
 	err = nil
 	return
@@ -1228,23 +1242,16 @@ func (h *AdminHandler) AdminDeleteGroup(c *gin.Context) {
 		return
 	}
 
-	// Clean up groups_by_member lookup (different partitions, unlogged batch)
-	for i := 0; i < len(memberIDs); i += 50 {
-		end := i + 50
-		if end > len(memberIDs) {
-			end = len(memberIDs)
-		}
-		memberBatch := h.db.Session().Batch(gocql.UnloggedBatch)
-		for _, uid := range memberIDs[i:end] {
-			memberBatch.Query(`DELETE FROM groups_by_member WHERE org_id = ? AND user_id = ? AND group_id = ?`,
-				orgID, uid, groupID)
-		}
-		memberBatch.Exec()
+	if err := cleanupGroupsByMember(h.db, orgID, groupID, memberIDs); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to clean group membership index"})
+		return
 	}
 
-	// Clean up shares where shared_to = this group (async, best-effort)
 	groupUUID, _ := uuid.Parse(groupID)
-	go cleanupGroupSharesAsync(h.db, groupUUID)
+	if err := cleanupGroupShares(h.db, groupUUID); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to clean group shares"})
+		return
+	}
 
 	// Audit log
 	orgUUID, _ := uuid.Parse(orgID)
@@ -1252,51 +1259,15 @@ func (h *AdminHandler) AdminDeleteGroup(c *gin.Context) {
 		"group_name":    name,
 		"members_count": len(memberIDs),
 	})
-	h.db.Session().Query(`
+	if err := h.db.Session().Query(`
 		INSERT INTO audit_log (org_id, timestamp, action, target_type, target_id, actor_id, details)
 		VALUES (?, ?, ?, ?, ?, ?, ?)
 	`, orgUUID.String(), time.Now(), "delete_group", "group", groupID, callerUserID,
-		string(auditDetails)).Exec()
+		string(auditDetails)).Exec(); err != nil {
+		log.Printf("[AdminDeleteGroup] failed to write audit log for group %s in org %s: %v", groupID, orgID, err)
+	}
 
 	c.JSON(http.StatusOK, gin.H{"success": true})
-}
-
-// cleanupGroupSharesAsync removes all library shares targeting a deleted group.
-// Runs async — safe for best-effort cleanup; scanner phase 9 catches any misses.
-func cleanupGroupSharesAsync(database *db.DB, groupID uuid.UUID) {
-	iter := database.Session().Query(`
-		SELECT library_id FROM shares_by_user WHERE shared_to = ?
-	`, groupID.String()).Iter()
-
-	var libIDStr string
-	var libraryIDs []string
-	for iter.Scan(&libIDStr) {
-		libraryIDs = append(libraryIDs, libIDStr)
-	}
-	iter.Close()
-
-	for _, libID := range libraryIDs {
-		// Find share_id(s) for this group in the shares table
-		shareIter := database.Session().Query(`
-			SELECT share_id, shared_to FROM shares WHERE library_id = ?
-		`, libID).Iter()
-		var shareIDStr, sharedToStr string
-		for shareIter.Scan(&shareIDStr, &sharedToStr) {
-			if sharedToStr == groupID.String() {
-				database.Session().Query(`DELETE FROM shares WHERE library_id = ? AND share_id = ?`,
-					libID, shareIDStr).Exec()
-			}
-		}
-		shareIter.Close()
-
-		// Delete from shares_by_user
-		database.Session().Query(`DELETE FROM shares_by_user WHERE shared_to = ? AND library_id = ?`,
-			groupID.String(), libID).Exec()
-	}
-
-	if len(libraryIDs) > 0 {
-		log.Printf("[Admin] Cleaned up %d group shares for deleted group %s", len(libraryIDs), groupID)
-	}
 }
 
 // AdminTransferGroup transfers group ownership or renames a group.
@@ -1328,13 +1299,10 @@ func (h *AdminHandler) AdminTransferGroup(c *gin.Context) {
 	// Rename path: seafile-js sysAdminRenameDepartment sends PUT /admin/groups/:id/ with 'name'
 	if newOwnerEmail == "" && newName != "" {
 		now := time.Now()
-		if err := h.db.Session().Query(`
-			UPDATE groups SET name = ?, updated_at = ? WHERE org_id = ? AND group_id = ?
-		`, newName, now, orgID, groupID).Exec(); err != nil {
+		if err := renameGroup(h.db, orgID, groupID, newName, now); err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to rename group"})
 			return
 		}
-		h.db.Session().Query(`UPDATE groups_by_id SET name = ? WHERE group_id = ?`, newName, groupID).Exec()
 		// Re-fetch current owner info to return a complete group object
 		var creatorID string
 		h.db.Session().Query(`SELECT creator_id FROM groups WHERE org_id = ? AND group_id = ?`, orgID, groupID).Scan(&creatorID)
@@ -1377,36 +1345,31 @@ func (h *AdminHandler) AdminTransferGroup(c *gin.Context) {
 	}
 
 	now := time.Now()
-
-	// Update group creator
-	h.db.Session().Query(`
-		UPDATE groups SET creator_id = ?, updated_at = ? WHERE org_id = ? AND group_id = ?
-	`, newOwnerID, now, orgID, groupID).Exec()
-
-	// Demote old owner to member in group_members
-	h.db.Session().Query(`
-		UPDATE group_members SET role = ? WHERE group_id = ? AND user_id = ?
-	`, "member", groupID, creatorID).Exec()
-
-	// Demote old owner in lookup table (groups_by_member)
-	h.db.Session().Query(`
-		UPDATE groups_by_member SET role = ? WHERE org_id = ? AND user_id = ? AND group_id = ?
-	`, "member", orgID, creatorID, groupID).Exec()
-
-	// Add new owner as owner (upsert)
-	h.db.Session().Query(`
-		INSERT INTO group_members (group_id, user_id, role, added_at)
-		VALUES (?, ?, ?, ?)
-	`, groupID, newOwnerID, "owner", now).Exec()
-
-	// Update lookup tables
 	var groupName string
 	h.db.Session().Query(`SELECT name FROM groups WHERE org_id = ? AND group_id = ?`, orgID, groupID).Scan(&groupName)
 
-	h.db.Session().Query(`
+	batch := h.db.Session().Batch(gocql.LoggedBatch)
+	batch.Query(`
+		UPDATE groups SET creator_id = ?, updated_at = ? WHERE org_id = ? AND group_id = ?
+	`, newOwnerID, now, orgID, groupID)
+	batch.Query(`
+		UPDATE group_members SET role = ? WHERE group_id = ? AND user_id = ?
+	`, "member", groupID, creatorID)
+	batch.Query(`
+		UPDATE groups_by_member SET role = ? WHERE org_id = ? AND user_id = ? AND group_id = ?
+	`, "member", orgID, creatorID, groupID)
+	batch.Query(`
+		INSERT INTO group_members (group_id, user_id, role, added_at)
+		VALUES (?, ?, ?, ?)
+	`, groupID, newOwnerID, "owner", now)
+	batch.Query(`
 		INSERT INTO groups_by_member (org_id, user_id, group_id, group_name, role, added_at)
 		VALUES (?, ?, ?, ?, ?, ?)
-	`, orgID, newOwnerID, groupID, groupName, "owner", now).Exec()
+	`, orgID, newOwnerID, groupID, groupName, "owner", now)
+	if err := batch.Exec(); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to transfer group ownership"})
+		return
+	}
 
 	// Return updated group object (frontend replaces item = res.data)
 	var newOwnerName string
@@ -1579,20 +1542,10 @@ func (h *AdminHandler) AdminAddGroupMember(c *gin.Context) {
 
 		now := time.Now()
 
-		// Add to group_members
-		if err := h.db.Session().Query(`
-			INSERT INTO group_members (group_id, user_id, role, added_at)
-			VALUES (?, ?, ?, ?)
-		`, groupID, memberID, "member", now).Exec(); err != nil {
+		if err := upsertGroupMember(h.db, orgID, groupID, memberID, groupName, "member", now); err != nil {
 			failed = append(failed, failedItem{Email: email, ErrorMsg: "failed to add member"})
 			continue
 		}
-
-		// Add to lookup table
-		h.db.Session().Query(`
-			INSERT INTO groups_by_member (org_id, user_id, group_id, group_name, role, added_at)
-			VALUES (?, ?, ?, ?, ?, ?)
-		`, orgID, memberID, groupID, groupName, "member", now).Exec()
 
 		// Get member name for response
 		var memberName string
@@ -1658,15 +1611,10 @@ func (h *AdminHandler) AdminRemoveGroupMember(c *gin.Context) {
 		return
 	}
 
-	// Delete from group_members
-	h.db.Session().Query(`
-		DELETE FROM group_members WHERE group_id = ? AND user_id = ?
-	`, groupID, memberID).Exec()
-
-	// Delete from lookup table
-	h.db.Session().Query(`
-		DELETE FROM groups_by_member WHERE org_id = ? AND user_id = ? AND group_id = ?
-	`, orgID, memberID, groupID).Exec()
+	if err := deleteGroupMember(h.db, orgID, groupID, memberID); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to remove group member"})
+		return
+	}
 
 	c.JSON(http.StatusOK, gin.H{"success": true})
 }
@@ -2018,20 +1966,10 @@ func (h *AdminHandler) AdminCreateUser(c *gin.Context) {
 	userID := uuid.New().String()
 	now := time.Now()
 
-	// Create user record
-	if err := h.db.Session().Query(`
-		INSERT INTO users (org_id, user_id, email, name, role, quota_bytes, used_bytes, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-	`, orgID, userID, email, name, role, int64(-2), int64(0), now).Exec(); err != nil {
+	if err := createUserWithEmailLookup(h.db, orgID, userID, email, name, role, int64(-2), int64(0), now); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create user"})
 		return
 	}
-
-	// Create email lookup
-	h.db.Session().Query(`
-		INSERT INTO users_by_email (email, user_id, org_id)
-		VALUES (?, ?, ?)
-	`, email, userID, orgID).Exec()
 
 	c.JSON(http.StatusCreated, makeAdminUserResponse(email, name, role, -2, 0, now))
 }
@@ -2116,46 +2054,64 @@ func (h *AdminHandler) UpdateUserByEmail(c *gin.Context, email string) {
 			return
 		}
 		currentRole = newRole
-		h.db.Session().Query(`
+		if err := h.db.Session().Query(`
 			UPDATE users SET role = ? WHERE org_id = ? AND user_id = ?
-		`, newRole, userOrgID, userID).Exec()
+		`, newRole, userOrgID, userID).Exec(); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update user"})
+			return
+		}
 	}
 
 	if isStaffStr != "" {
 		if isStaffStr == "false" && (currentRole == "admin" || currentRole == "superadmin") {
 			currentRole = "user"
-			h.db.Session().Query(`
+			if err := h.db.Session().Query(`
 				UPDATE users SET role = ? WHERE org_id = ? AND user_id = ?
-			`, currentRole, userOrgID, userID).Exec()
+			`, currentRole, userOrgID, userID).Exec(); err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update user"})
+				return
+			}
 		} else if isStaffStr == "true" && currentRole != "admin" && currentRole != "superadmin" {
 			currentRole = "admin"
-			h.db.Session().Query(`
+			if err := h.db.Session().Query(`
 				UPDATE users SET role = ? WHERE org_id = ? AND user_id = ?
-			`, currentRole, userOrgID, userID).Exec()
+			`, currentRole, userOrgID, userID).Exec(); err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update user"})
+				return
+			}
 		}
 	}
 
 	if newName != "" {
 		currentName = newName
-		h.db.Session().Query(`
+		if err := h.db.Session().Query(`
 			UPDATE users SET name = ? WHERE org_id = ? AND user_id = ?
-		`, newName, userOrgID, userID).Exec()
+		`, newName, userOrgID, userID).Exec(); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update user"})
+			return
+		}
 	}
 
 	if quotaStr != "" {
 		if quota, err := strconv.ParseInt(quotaStr, 10, 64); err == nil {
 			currentQuota = quota
-			h.db.Session().Query(`
+			if err := h.db.Session().Query(`
 				UPDATE users SET quota_bytes = ? WHERE org_id = ? AND user_id = ?
-			`, quota, userOrgID, userID).Exec()
+			`, quota, userOrgID, userID).Exec(); err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update user"})
+				return
+			}
 		}
 	}
 
 	if isActiveStr == "false" {
 		currentRole = "deactivated"
-		h.db.Session().Query(`
+		if err := h.db.Session().Query(`
 			UPDATE users SET role = ? WHERE org_id = ? AND user_id = ?
-		`, "deactivated", userOrgID, userID).Exec()
+		`, "deactivated", userOrgID, userID).Exec(); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update user"})
+			return
+		}
 	}
 
 	resp := makeAdminUserResponse(email, currentName, currentRole, currentQuota, currentUsed, currentCreated)
@@ -2184,9 +2140,12 @@ func (h *AdminHandler) DeleteUserByEmail(c *gin.Context, email string) {
 		return
 	}
 
-	h.db.Session().Query(`
+	if err := h.db.Session().Query(`
 		UPDATE users SET role = ? WHERE org_id = ? AND user_id = ?
-	`, "deactivated", userOrgID, userID).Exec()
+	`, "deactivated", userOrgID, userID).Exec(); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to deactivate user"})
+		return
+	}
 
 	c.JSON(http.StatusOK, gin.H{"success": true})
 }
@@ -2273,8 +2232,11 @@ func (h *AdminHandler) BatchAddAdmins(c *gin.Context) {
 		}
 
 		// Set role to superadmin
-		h.db.Session().Query(`UPDATE users SET role = ? WHERE org_id = ? AND user_id = ?`,
-			"superadmin", userOrgID, userID).Exec()
+		if err := h.db.Session().Query(`UPDATE users SET role = ? WHERE org_id = ? AND user_id = ?`,
+			"superadmin", userOrgID, userID).Exec(); err != nil {
+			failed = append(failed, gin.H{"email": email, "error_msg": "failed to update user"})
+			continue
+		}
 
 		// Read back updated user data
 		var name, role string
@@ -2827,14 +2789,6 @@ func (h *AdminHandler) AdminCreateLibrary(c *gin.Context) {
 	emptyDirHash := sha1.Sum([]byte(emptyDirData))
 	rootFSID := hex.EncodeToString(emptyDirHash[:])
 
-	if err := h.db.Session().Query(`
-		INSERT INTO fs_objects (library_id, fs_id, obj_type, obj_name, dir_entries, mtime)
-		VALUES (?, ?, ?, ?, ?, ?)
-	`, newLibID.String(), rootFSID, "dir", "", emptyDirEntries, now.Unix()).Exec(); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create root directory"})
-		return
-	}
-
 	commitData := fmt.Sprintf("%s:%s:%d", newLibID.String(), repoName, now.UnixNano())
 	commitHash := sha1.Sum([]byte(commitData))
 	headCommitID := hex.EncodeToString(commitHash[:])
@@ -2849,6 +2803,10 @@ func (h *AdminHandler) AdminCreateLibrary(c *gin.Context) {
 	}
 
 	batch := h.db.Session().Batch(gocql.LoggedBatch)
+	batch.Query(`
+		INSERT INTO fs_objects (library_id, fs_id, obj_type, obj_name, dir_entries, mtime)
+		VALUES (?, ?, ?, ?, ?, ?)
+	`, newLibID.String(), rootFSID, "dir", "", emptyDirEntries, now.Unix())
 	batch.Query(`
 		INSERT INTO libraries (
 			org_id, library_id, owner_id, name, description, encrypted,
@@ -2865,18 +2823,16 @@ func (h *AdminHandler) AdminCreateLibrary(c *gin.Context) {
 		) VALUES (?, ?, ?, ?, ?)
 	`, newLibID.String(), ownerOrgID, ownerUserID, headCommitID, false,
 	)
+	batch.Query(`
+		INSERT INTO commits (library_id, commit_id, root_fs_id, creator_id, description, created_at)
+		VALUES (?, ?, ?, ?, ?, ?)
+	`, newLibID.String(), headCommitID, rootFSID, callerUserID, "Initial commit", now)
 
 	if err := batch.Exec(); err != nil {
 		log.Printf("[AdminCreateLibrary] Failed to create library: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create library"})
 		return
 	}
-
-	// Create initial commit
-	h.db.Session().Query(`
-		INSERT INTO commits (library_id, commit_id, root_fs_id, creator_id, description, created_at)
-		VALUES (?, ?, ?, ?, ?, ?)
-	`, newLibID.String(), headCommitID, rootFSID, callerUserID, "Initial commit", now).Exec()
 
 	log.Printf("[AdminCreateLibrary] Admin %s created library %s for user %s", callerUserID, newLibID.String(), ownerEmail)
 
@@ -2957,21 +2913,12 @@ func (h *AdminHandler) AdminTransferLibrary(c *gin.Context) {
 		return
 	}
 
-	// Dual-write: update both tables
 	now := time.Now()
-	if err := h.db.Session().Query(`
-		UPDATE libraries SET owner_id = ?, updated_at = ?
-		WHERE org_id = ? AND library_id = ?
-	`, newOwnerID, now, orgID, libraryID).Exec(); err != nil {
-		log.Printf("[AdminTransferLibrary] Failed to update libraries: %v", err)
+	if err := updateLibraryOwner(h.db, orgID, libraryID, newOwnerID, now); err != nil {
+		log.Printf("[AdminTransferLibrary] Failed to transfer owner: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to transfer library"})
 		return
 	}
-
-	h.db.Session().Query(`
-		UPDATE libraries_by_id SET owner_id = ?
-		WHERE library_id = ?
-	`, newOwnerID, libraryID).Exec()
 
 	log.Printf("[AdminTransferLibrary] Admin %s transferred library %s to %s", callerUserID, libraryID, newOwnerEmail)
 	c.JSON(http.StatusOK, gin.H{"success": true})

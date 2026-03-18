@@ -504,39 +504,32 @@ func (h *GroupHandler) UpdateGroup(c *gin.Context) {
 		}
 
 		now := time.Now()
-
-		// Update groups table creator_id
-		if err := h.db.Session().Query(`
-			UPDATE groups SET creator_id = ?, updated_at = ? WHERE org_id = ? AND group_id = ?
-		`, newOwnerID, now, orgUUID.String(), groupUUID.String()).Exec(); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to transfer group"})
-			return
-		}
-
-		// Demote old owner to member
-		h.db.Session().Query(`
-			UPDATE group_members SET role = ? WHERE group_id = ? AND user_id = ?
-		`, "member", groupUUID.String(), userID).Exec() //nolint:errcheck
-
-		// Demote old owner in lookup table
-		h.db.Session().Query(`
-			UPDATE groups_by_member SET role = ? WHERE org_id = ? AND user_id = ? AND group_id = ?
-		`, "member", orgUUID.String(), userID, groupUUID.String()).Exec() //nolint:errcheck
-
-		// Promote new owner (insert or update)
-		h.db.Session().Query(`
-			INSERT INTO group_members (group_id, user_id, role, added_at)
-			VALUES (?, ?, ?, ?)
-		`, groupUUID.String(), newOwnerID, "owner", now).Exec() //nolint:errcheck
-
-		// Update lookup table for new owner (insert or update)
 		var groupName string
 		h.db.Session().Query(`SELECT name FROM groups WHERE org_id = ? AND group_id = ?`,
 			orgUUID.String(), groupUUID.String()).Scan(&groupName)
-		h.db.Session().Query(`
+
+		batch := h.db.Session().Batch(gocql.LoggedBatch)
+		batch.Query(`
+			UPDATE groups SET creator_id = ?, updated_at = ? WHERE org_id = ? AND group_id = ?
+		`, newOwnerID, now, orgUUID.String(), groupUUID.String())
+		batch.Query(`
+			UPDATE group_members SET role = ? WHERE group_id = ? AND user_id = ?
+		`, "member", groupUUID.String(), userID)
+		batch.Query(`
+			UPDATE groups_by_member SET role = ? WHERE org_id = ? AND user_id = ? AND group_id = ?
+		`, "member", orgUUID.String(), userID, groupUUID.String())
+		batch.Query(`
+			INSERT INTO group_members (group_id, user_id, role, added_at)
+			VALUES (?, ?, ?, ?)
+		`, groupUUID.String(), newOwnerID, "owner", now)
+		batch.Query(`
 			INSERT INTO groups_by_member (org_id, user_id, group_id, group_name, role, added_at)
 			VALUES (?, ?, ?, ?, ?, ?)
-		`, orgUUID.String(), newOwnerID, groupUUID.String(), groupName, "owner", now).Exec() //nolint:errcheck
+		`, orgUUID.String(), newOwnerID, groupUUID.String(), groupName, "owner", now)
+		if err := batch.Exec(); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to transfer group"})
+			return
+		}
 
 		c.JSON(http.StatusOK, gin.H{"success": true})
 		return
@@ -552,22 +545,9 @@ func (h *GroupHandler) UpdateGroup(c *gin.Context) {
 		return
 	}
 
-	// Update group name
-	if err := h.db.Session().Query(`
-		UPDATE groups SET name = ?, updated_at = ? WHERE org_id = ? AND group_id = ?
-	`, req.GroupName, time.Now(), orgUUID.String(), groupUUID.String()).Exec(); err != nil {
+	if err := renameGroup(h.db, orgUUID.String(), groupUUID.String(), req.GroupName, time.Now()); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update group"})
 		return
-	}
-
-	// Update groups_by_id lookup
-	h.db.Session().Query(`UPDATE groups_by_id SET name = ? WHERE group_id = ?`, req.GroupName, groupUUID.String()).Exec()
-
-	// Update lookup table for all members
-	if err := h.db.Session().Query(`
-		UPDATE groups_by_member SET group_name = ? WHERE org_id = ? AND group_id = ?
-	`, req.GroupName, orgUUID.String(), groupUUID.String()).Exec(); err != nil {
-		// Log error but don't fail the request
 	}
 
 	c.JSON(http.StatusOK, gin.H{"success": true})
@@ -627,33 +607,28 @@ func (h *GroupHandler) DeleteGroup(c *gin.Context) {
 		return
 	}
 
-	// Clean up groups_by_member lookup (separate batch, different partitions)
-	for i := 0; i < len(memberIDs); i += 50 {
-		end := i + 50
-		if end > len(memberIDs) {
-			end = len(memberIDs)
-		}
-		memberBatch := h.db.Session().Batch(gocql.UnloggedBatch)
-		for _, uid := range memberIDs[i:end] {
-			memberBatch.Query(`DELETE FROM groups_by_member WHERE org_id = ? AND user_id = ? AND group_id = ?`,
-				orgUUID.String(), uid, groupUUID.String())
-		}
-		memberBatch.Exec()
+	if err := cleanupGroupsByMember(h.db, orgUUID.String(), groupUUID.String(), memberIDs); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to clean group membership index"})
+		return
 	}
 
-	// Clean up shares where shared_to = this group (async, best-effort)
-	go cleanupGroupSharesAsync(h.db, groupUUID)
+	if err := cleanupGroupShares(h.db, groupUUID); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to clean group shares"})
+		return
+	}
 
 	// Audit log
 	auditDetails, _ := json.Marshal(map[string]interface{}{
 		"group_name":    groupName,
 		"members_count": len(memberIDs),
 	})
-	h.db.Session().Query(`
+	if err := h.db.Session().Query(`
 		INSERT INTO audit_log (org_id, timestamp, action, target_type, target_id, actor_id, details)
 		VALUES (?, ?, ?, ?, ?, ?, ?)
 	`, orgUUID.String(), time.Now(), "delete_group", "group", groupID, userID,
-		string(auditDetails)).Exec()
+		string(auditDetails)).Exec(); err != nil {
+		slog.Warn("DeleteGroup: failed to write audit log", "group_id", groupID, "org_id", orgUUID.String(), "error", err)
+	}
 
 	c.JSON(http.StatusOK, gin.H{"success": true})
 }
@@ -778,25 +753,13 @@ func (h *GroupHandler) AddGroupMember(c *gin.Context) {
 
 	now := time.Now()
 
-	// Add to group_members
-	if err := h.db.Session().Query(`
-		INSERT INTO group_members (group_id, user_id, role, added_at)
-		VALUES (?, ?, ?, ?)
-	`, groupUUID.String(), newMemberID, req.Role, now).Exec(); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to add member"})
-		return
-	}
-
 	// Get group name
 	var groupName string
 	h.db.Session().Query(`SELECT name FROM groups WHERE org_id = ? AND group_id = ?`, orgUUID.String(), groupUUID.String()).Scan(&groupName)
 
-	// Add to lookup table
-	if err := h.db.Session().Query(`
-		INSERT INTO groups_by_member (org_id, user_id, group_id, group_name, role, added_at)
-		VALUES (?, ?, ?, ?, ?, ?)
-	`, orgUUID.String(), newMemberID, groupUUID.String(), groupName, req.Role, now).Exec(); err != nil {
-		// Log error but don't fail
+	if err := upsertGroupMember(h.db, orgUUID.String(), groupUUID.String(), newMemberID, groupName, req.Role, now); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to add member"})
+		return
 	}
 
 	c.JSON(http.StatusOK, gin.H{"success": true})
@@ -866,19 +829,9 @@ func (h *GroupHandler) RemoveGroupMember(c *gin.Context) {
 		return
 	}
 
-	// Remove from group_members
-	if err := h.db.Session().Query(`
-		DELETE FROM group_members WHERE group_id = ? AND user_id = ?
-	`, groupUUID.String(), memberID).Exec(); err != nil {
+	if err := deleteGroupMember(h.db, orgUUID.String(), groupUUID.String(), memberID); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to remove member"})
 		return
-	}
-
-	// Remove from lookup table
-	if err := h.db.Session().Query(`
-		DELETE FROM groups_by_member WHERE org_id = ? AND user_id = ? AND group_id = ?
-	`, orgUUID.String(), memberID, groupUUID.String()).Exec(); err != nil {
-		// Log error but don't fail
 	}
 
 	c.JSON(http.StatusOK, gin.H{"success": true})
@@ -959,29 +912,35 @@ func (h *GroupHandler) CreateGroupOwnedLibrary(c *gin.Context) {
 	now := time.Now()
 
 	// Create library (owned by the requesting user on behalf of the group)
-	h.db.Session().Query(`
+	batch := h.db.Session().Batch(gocql.LoggedBatch)
+	batch.Query(`
 		INSERT INTO libraries (org_id, library_id, owner_id, name, encrypted, size_bytes, file_count, created_at, updated_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, orgID, newLibID, userID, repoName, false, int64(0), int64(0), now, now).Exec()
-
-	h.db.Session().Query(`
+	`, orgID, newLibID, userID, repoName, false, int64(0), int64(0), now, now)
+	batch.Query(`
 		INSERT INTO libraries_by_id (library_id, org_id, owner_id, encrypted)
 		VALUES (?, ?, ?, ?)
-	`, newLibID, orgID, userID, false).Exec()
+	`, newLibID, orgID, userID, false)
+	if err := batch.Exec(); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create library"})
+		return
+	}
 
 	// Initialize filesystem (root dir + initial commit)
 	fsHelper := NewFSHelper(h.db)
 	if err := fsHelper.InitializeLibraryFS(orgID, newLibID, userID, repoName); err != nil {
+		_ = rollbackNewLibrary(h.db, orgID, newLibID)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to initialize library filesystem"})
 		return
 	}
 
 	// Share the library with the group
 	shareID := uuid.New().String()
-	h.db.Session().Query(`
-		INSERT INTO shares (library_id, share_id, shared_by, shared_to, shared_to_type, permission, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?)
-	`, newLibID, shareID, userID, groupUUID.String(), "group", "rw", now).Exec()
+	if err := createLibraryShare(h.db, newLibID, shareID, userID, groupUUID.String(), "group", "rw", now, nil); err != nil {
+		_ = rollbackNewLibrary(h.db, orgID, newLibID)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to share library with group"})
+		return
+	}
 
 	// Resolve caller email and name for the response
 	var ownerEmail, ownerName string
@@ -1060,10 +1019,13 @@ func (h *GroupHandler) DeleteGroupOwnedLibrary(c *gin.Context) {
 	}
 
 	now := time.Now()
-	h.db.Session().Query(`
+	if err := h.db.Session().Query(`
 		UPDATE libraries SET deleted_at = ?, deleted_by = ?
 		WHERE org_id = ? AND library_id = ?
-	`, now, userID, orgID, repoID).Exec()
+	`, now, userID, orgID, repoID).Exec(); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete library"})
+		return
+	}
 
 	c.JSON(http.StatusOK, gin.H{"success": true})
 }
@@ -1147,15 +1109,10 @@ func (h *GroupHandler) BulkAddGroupMembers(c *gin.Context) {
 			continue
 		}
 
-		h.db.Session().Query(`
-			INSERT INTO group_members (group_id, user_id, role, added_at)
-			VALUES (?, ?, ?, ?)
-		`, groupUUID.String(), memberID, "member", now).Exec()
-
-		h.db.Session().Query(`
-			INSERT INTO groups_by_member (org_id, user_id, group_id, group_name, role, added_at)
-			VALUES (?, ?, ?, ?, ?, ?)
-		`, orgID, memberID, groupUUID.String(), groupName, "member", now).Exec()
+		if err := upsertGroupMember(h.db, orgID, groupUUID.String(), memberID, groupName, "member", now); err != nil {
+			failed = append(failed, failedItem{Email: email, ErrorMsg: "failed to add member"})
+			continue
+		}
 
 		// Mark as existing to prevent duplicates within the same batch
 		existingMembers[memberID] = true
@@ -1272,15 +1229,10 @@ func (h *GroupHandler) ImportGroupMembersViaFile(c *gin.Context) {
 			continue
 		}
 
-		h.db.Session().Query(`
-			INSERT INTO group_members (group_id, user_id, role, added_at)
-			VALUES (?, ?, ?, ?)
-		`, groupUUID.String(), memberID, "member", now).Exec()
-
-		h.db.Session().Query(`
-			INSERT INTO groups_by_member (org_id, user_id, group_id, group_name, role, added_at)
-			VALUES (?, ?, ?, ?, ?, ?)
-		`, orgID, memberID, groupUUID.String(), groupName, "member", now).Exec()
+		if err := upsertGroupMember(h.db, orgID, groupUUID.String(), memberID, groupName, "member", now); err != nil {
+			failed = append(failed, failedItem{Email: email, ErrorMsg: "failed to add member"})
+			continue
+		}
 
 		// Mark as existing to prevent duplicates within the same batch
 		existingMembers[memberID] = true
@@ -1346,18 +1298,17 @@ func (h *GroupHandler) SetGroupAdmin(c *gin.Context) {
 		newRole = "admin"
 	}
 
-	// Update group_members table
-	if err := h.db.Session().Query(`
+	batch := h.db.Session().Batch(gocql.LoggedBatch)
+	batch.Query(`
 		UPDATE group_members SET role = ? WHERE group_id = ? AND user_id = ?
-	`, newRole, groupUUID.String(), memberID).Exec(); err != nil {
+	`, newRole, groupUUID.String(), memberID)
+	batch.Query(`
+		UPDATE groups_by_member SET role = ? WHERE org_id = ? AND user_id = ? AND group_id = ?
+	`, newRole, orgID, memberID, groupUUID.String())
+	if err := batch.Exec(); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update member role"})
 		return
 	}
-
-	// Update lookup table
-	h.db.Session().Query(`
-		UPDATE groups_by_member SET role = ? WHERE org_id = ? AND user_id = ? AND group_id = ?
-	`, newRole, orgID, memberID, groupUUID.String()).Exec() //nolint:errcheck
 
 	// Fetch member details for response
 	var memberName string

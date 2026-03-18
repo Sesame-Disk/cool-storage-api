@@ -130,6 +130,26 @@ func (c *testClient) PutJSON(t *testing.T, path string, body interface{}) *http.
 	return resp
 }
 
+// PutForm sends a PUT request with form-encoded body.
+func (c *testClient) PutForm(t *testing.T, path string, values url.Values) *http.Response {
+	t.Helper()
+
+	buf := bytes.NewBufferString(values.Encode())
+	req, err := http.NewRequest(http.MethodPut, c.baseURL+path, buf)
+	if err != nil {
+		t.Fatalf("failed to create request: %v", err)
+	}
+
+	req.Header.Set("Authorization", "Token "+c.token)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		t.Fatalf("PUT %s failed: %v", path, err)
+	}
+	return resp
+}
+
 // Delete sends a DELETE request.
 func (c *testClient) Delete(t *testing.T, path string) *http.Response {
 	t.Helper()

@@ -1754,7 +1754,9 @@ func (h *FileHandler) ResolveSmartLink(c *gin.Context) {
 	// Increment view_count in background
 	go func() {
 		now := time.Now()
-		h.db.Session().Query(`UPDATE share_links SET view_count = view_count + 1, last_accessed_at = ? WHERE link_token = ?`, now, token).Exec()
+		if err := h.db.Session().Query(`UPDATE share_links SET view_count = view_count + 1, last_accessed_at = ? WHERE link_token = ?`, now, token).Exec(); err != nil {
+			log.Printf("[ViewInternalLink] failed to update view_count for token %s: %v", token, err)
+		}
 	}()
 
 	// Determine redirect URL based on path
@@ -4276,12 +4278,17 @@ func (h *FileHandler) cleanupFileTagsForPrefix(repoID, dirPath string) {
 				repoUUID, fp, tagID2)
 			batch.Query(`DELETE FROM file_tags_by_id WHERE repo_id = ? AND file_tag_id = ?`,
 				repoUUID, fileTagID2)
-			batch.Exec()
+			if err := batch.Exec(); err != nil {
+				log.Printf("[cleanupFileTagsForPrefix] failed to delete tag rows for repo %s path %q tag %d: %v", repoID, fp, tagID2, err)
+				continue
+			}
 
-			h.db.Session().Query(`
+			if err := h.db.Session().Query(`
 				UPDATE repo_tag_file_counts SET file_count = file_count - 1
 				WHERE repo_id = ? AND tag_id = ?
-			`, repoUUID, tagID2).Exec()
+			`, repoUUID, tagID2).Exec(); err != nil {
+				log.Printf("[cleanupFileTagsForPrefix] failed to decrement repo_tag_file_counts for repo %s tag %d: %v", repoID, tagID2, err)
+			}
 		}
 	}
 	iter.Close()

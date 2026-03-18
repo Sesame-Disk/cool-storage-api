@@ -296,9 +296,11 @@ func (h *OrgAdminHandler) lookupOrgUserByEmail(orgID, email string) (userID stri
 		return "", fmt.Errorf("user not found")
 	}
 	// Backfill the index
-	_ = h.db.Session().Query(`
+	if err := h.db.Session().Query(`
 		INSERT INTO users_by_email (email, user_id, org_id) VALUES (?, ?, ?)
-	`, email, scanUID, orgID).Exec()
+	`, email, scanUID, orgID).Exec(); err != nil {
+		log.Printf("[lookupOrgUserByEmail] failed to backfill users_by_email for %s in org %s: %v", email, orgID, err)
+	}
 	return scanUID, nil
 }
 
@@ -550,16 +552,10 @@ func (h *OrgAdminHandler) AddOrgUser(c *gin.Context) {
 	userID := uuid.New().String()
 	now := time.Now()
 
-	if err := h.db.Session().Query(`
-		INSERT INTO users (org_id, user_id, email, name, role, quota_bytes, used_bytes, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-	`, targetOrgID, userID, email, name, "user", int64(-2), int64(0), now).Exec(); err != nil {
+	if err := createUserWithEmailLookup(h.db, targetOrgID, userID, email, name, "user", int64(-2), int64(0), now); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create user"})
 		return
 	}
-	h.db.Session().Query(`
-		INSERT INTO users_by_email (email, user_id, org_id) VALUES (?, ?, ?)
-	`, email, userID, targetOrgID).Exec()
 
 	c.JSON(http.StatusCreated, buildOrgUserRow(email, name, "user", targetOrgID, -2, 0, now))
 }
@@ -632,8 +628,11 @@ func (h *OrgAdminHandler) UpdateOrgUser(c *gin.Context) {
 		} else if role == "deactivated" {
 			role = "user"
 		}
-		h.db.Session().Query(`UPDATE users SET role = ? WHERE org_id = ? AND user_id = ?`,
-			role, targetOrgID, userID).Exec()
+		if err := h.db.Session().Query(`UPDATE users SET role = ? WHERE org_id = ? AND user_id = ?`,
+			role, targetOrgID, userID).Exec(); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update user"})
+			return
+		}
 	}
 
 	if v := c.Request.FormValue("is_staff"); v != "" {
@@ -643,21 +642,30 @@ func (h *OrgAdminHandler) UpdateOrgUser(c *gin.Context) {
 		} else if role == "admin" {
 			role = "user"
 		}
-		h.db.Session().Query(`UPDATE users SET role = ? WHERE org_id = ? AND user_id = ?`,
-			role, targetOrgID, userID).Exec()
+		if err := h.db.Session().Query(`UPDATE users SET role = ? WHERE org_id = ? AND user_id = ?`,
+			role, targetOrgID, userID).Exec(); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update user"})
+			return
+		}
 	}
 
 	if v := c.Request.FormValue("name"); v != "" {
 		name = v
-		h.db.Session().Query(`UPDATE users SET name = ? WHERE org_id = ? AND user_id = ?`,
-			name, targetOrgID, userID).Exec()
+		if err := h.db.Session().Query(`UPDATE users SET name = ? WHERE org_id = ? AND user_id = ?`,
+			name, targetOrgID, userID).Exec(); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update user"})
+			return
+		}
 	}
 
 	if v := c.Request.FormValue("quota_total"); v != "" {
 		if q, err := strconv.ParseInt(v, 10, 64); err == nil {
 			quota = q
-			h.db.Session().Query(`UPDATE users SET quota_bytes = ? WHERE org_id = ? AND user_id = ?`,
-				quota, targetOrgID, userID).Exec()
+			if err := h.db.Session().Query(`UPDATE users SET quota_bytes = ? WHERE org_id = ? AND user_id = ?`,
+				quota, targetOrgID, userID).Exec(); err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update user"})
+				return
+			}
 		}
 	}
 
@@ -691,8 +699,11 @@ func (h *OrgAdminHandler) DeleteOrgUser(c *gin.Context) {
 		return
 	}
 
-	h.db.Session().Query(`UPDATE users SET role = ? WHERE org_id = ? AND user_id = ?`,
-		"deactivated", targetOrgID, userID).Exec()
+	if err := h.db.Session().Query(`UPDATE users SET role = ? WHERE org_id = ? AND user_id = ?`,
+		"deactivated", targetOrgID, userID).Exec(); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete user"})
+		return
+	}
 
 	c.JSON(http.StatusOK, gin.H{"success": true})
 }
@@ -949,16 +960,10 @@ func (h *OrgAdminHandler) ImportOrgUsers(c *gin.Context) {
 		}
 
 		userID := uuid.New().String()
-		if err := h.db.Session().Query(`
-			INSERT INTO users (org_id, user_id, email, name, role, quota_bytes, used_bytes, created_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-		`, targetOrgID, userID, email, name, "user", int64(-2), int64(0), now).Exec(); err != nil {
+		if err := createUserWithEmailLookup(h.db, targetOrgID, userID, email, name, "user", int64(-2), int64(0), now); err != nil {
 			failed = append(failed, gin.H{"email": email, "error": "database error"})
 			continue
 		}
-		h.db.Session().Query(`
-			INSERT INTO users_by_email (email, user_id, org_id) VALUES (?, ?, ?)
-		`, email, userID, targetOrgID).Exec()
 		success = append(success, buildOrgUserRow(email, name, "user", targetOrgID, -2, 0, now))
 	}
 
@@ -1225,9 +1230,12 @@ func (h *OrgAdminHandler) UpdateOrgGroup(c *gin.Context) {
 	// Store group quota in org settings (no dedicated column on groups table).
 	if quotaStr := c.Request.FormValue("quota"); quotaStr != "" {
 		settingKey := "group_quota_" + groupID
-		h.db.Session().Query(`
+		if err := h.db.Session().Query(`
 			UPDATE organizations SET settings[?] = ? WHERE org_id = ?
-		`, settingKey, quotaStr, targetOrgID).Exec()
+		`, settingKey, quotaStr, targetOrgID).Exec(); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update group"})
+			return
+		}
 	}
 
 	c.JSON(http.StatusOK, gin.H{"success": true})
@@ -1266,37 +1274,33 @@ func (h *OrgAdminHandler) TransferOrgGroup(c *gin.Context) {
 
 	now := time.Now()
 
-	// Update group creator
-	h.db.Session().Query(`
-		UPDATE groups SET creator_id = ?, updated_at = ? WHERE org_id = ? AND group_id = ?
-	`, newOwnerID, now, targetOrgID, groupID).Exec()
-
-	// Demote old owner to member in group_members
-	h.db.Session().Query(`
-		UPDATE group_members SET role = ? WHERE group_id = ? AND user_id = ?
-	`, "member", groupID, creatorID).Exec()
-
-	// Demote old owner in lookup table
-	h.db.Session().Query(`
-		UPDATE groups_by_member SET role = ? WHERE org_id = ? AND user_id = ? AND group_id = ?
-	`, "member", targetOrgID, creatorID, groupID).Exec()
-
-	// Promote new owner in group_members (upsert)
-	h.db.Session().Query(`
-		INSERT INTO group_members (group_id, user_id, role, added_at)
-		VALUES (?, ?, ?, ?)
-	`, groupID, newOwnerID, "owner", now).Exec()
-
 	// Read group name and created_at for lookup table and response
 	var groupName string
 	var createdAt time.Time
 	h.db.Session().Query(`SELECT name, created_at FROM groups WHERE org_id = ? AND group_id = ?`, targetOrgID, groupID).Scan(&groupName, &createdAt)
 
-	// Add new owner to lookup table (upsert)
-	h.db.Session().Query(`
+	batch := h.db.Session().Batch(gocql.LoggedBatch)
+	batch.Query(`
+		UPDATE groups SET creator_id = ?, updated_at = ? WHERE org_id = ? AND group_id = ?
+	`, newOwnerID, now, targetOrgID, groupID)
+	batch.Query(`
+		UPDATE group_members SET role = ? WHERE group_id = ? AND user_id = ?
+	`, "member", groupID, creatorID)
+	batch.Query(`
+		UPDATE groups_by_member SET role = ? WHERE org_id = ? AND user_id = ? AND group_id = ?
+	`, "member", targetOrgID, creatorID, groupID)
+	batch.Query(`
+		INSERT INTO group_members (group_id, user_id, role, added_at)
+		VALUES (?, ?, ?, ?)
+	`, groupID, newOwnerID, "owner", now)
+	batch.Query(`
 		INSERT INTO groups_by_member (org_id, user_id, group_id, group_name, role, added_at)
 		VALUES (?, ?, ?, ?, ?, ?)
-	`, targetOrgID, newOwnerID, groupID, groupName, "owner", now).Exec()
+	`, targetOrgID, newOwnerID, groupID, groupName, "owner", now)
+	if err := batch.Exec(); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to transfer group ownership"})
+		return
+	}
 
 	// Resolve new owner display name
 	newOwnerName := h.resolveUserName(targetOrgID, newOwnerID)
@@ -1342,18 +1346,24 @@ func (h *OrgAdminHandler) DeleteOrgGroup(c *gin.Context) {
 	}
 	memberIter.Close()
 
-	// Delete group row
-	h.db.Session().Query(`DELETE FROM groups WHERE org_id = ? AND group_id = ?`,
-		targetOrgID, groupID).Exec()
-	h.db.Session().Query(`DELETE FROM groups_by_id WHERE group_id = ?`, groupID).Exec()
-
-	// Delete all members
-	h.db.Session().Query(`DELETE FROM group_members WHERE group_id = ?`, groupID).Exec()
-
-	// Clean up groups_by_member lookup table
-	for _, uid := range memberIDs {
-		h.db.Session().Query(`DELETE FROM groups_by_member WHERE org_id = ? AND user_id = ? AND group_id = ?`,
-			targetOrgID, uid, groupID).Exec()
+	batch := h.db.Session().Batch(gocql.LoggedBatch)
+	batch.Query(`DELETE FROM groups WHERE org_id = ? AND group_id = ?`, targetOrgID, groupID)
+	batch.Query(`DELETE FROM groups_by_id WHERE group_id = ?`, groupID)
+	batch.Query(`DELETE FROM group_members WHERE group_id = ?`, groupID)
+	if err := batch.Exec(); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete group"})
+		return
+	}
+	if err := cleanupGroupsByMember(h.db, targetOrgID, groupID, memberIDs); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to clean group membership index"})
+		return
+	}
+	groupUUID, err := uuid.Parse(groupID)
+	if err == nil {
+		if err := cleanupGroupShares(h.db, groupUUID); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to clean group shares"})
+			return
+		}
 	}
 
 	c.JSON(http.StatusOK, gin.H{"success": true})
@@ -1499,17 +1509,10 @@ func (h *OrgAdminHandler) AddOrgGroupMember(c *gin.Context) {
 
 	now := time.Now()
 
-	// Add to group_members
-	h.db.Session().Query(`
-		INSERT INTO group_members (group_id, user_id, role, added_at)
-		VALUES (?, ?, ?, ?)
-	`, groupID, memberID, "member", now).Exec()
-
-	// Add to lookup table
-	h.db.Session().Query(`
-		INSERT INTO groups_by_member (org_id, user_id, group_id, group_name, role, added_at)
-		VALUES (?, ?, ?, ?, ?, ?)
-	`, targetOrgID, memberID, groupID, groupName, "member", now).Exec()
+	if err := upsertGroupMember(h.db, targetOrgID, groupID, memberID, groupName, "member", now); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to add group member"})
+		return
+	}
 
 	c.JSON(http.StatusOK, gin.H{"success": true})
 }
@@ -1540,15 +1543,10 @@ func (h *OrgAdminHandler) DeleteOrgGroupMember(c *gin.Context) {
 		return
 	}
 
-	// Delete from group_members
-	h.db.Session().Query(`
-		DELETE FROM group_members WHERE group_id = ? AND user_id = ?
-	`, groupID, memberID).Exec()
-
-	// Delete from lookup table
-	h.db.Session().Query(`
-		DELETE FROM groups_by_member WHERE org_id = ? AND user_id = ? AND group_id = ?
-	`, targetOrgID, memberID, groupID).Exec()
+	if err := deleteGroupMember(h.db, targetOrgID, groupID, memberID); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete group member"})
+		return
+	}
 
 	c.JSON(http.StatusOK, gin.H{"success": true})
 }
@@ -1578,20 +1576,14 @@ func (h *OrgAdminHandler) UpdateOrgGroupMember(c *gin.Context) {
 		newRole = "admin"
 	}
 
-	// Update group_members
-	h.db.Session().Query(`
-		UPDATE group_members SET role = ? WHERE group_id = ? AND user_id = ?
-	`, newRole, groupID, memberID).Exec()
-
 	// Update lookup table
 	var groupName string
 	h.db.Session().Query(`SELECT name FROM groups WHERE org_id = ? AND group_id = ?`,
 		targetOrgID, groupID).Scan(&groupName)
-
-	h.db.Session().Query(`
-		INSERT INTO groups_by_member (org_id, user_id, group_id, group_name, role, added_at)
-		VALUES (?, ?, ?, ?, ?, ?)
-	`, targetOrgID, memberID, groupID, groupName, newRole, time.Now()).Exec()
+	if err := upsertGroupMember(h.db, targetOrgID, groupID, memberID, groupName, newRole, time.Now()); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update group member"})
+		return
+	}
 
 	c.JSON(http.StatusOK, gin.H{"success": true})
 }
@@ -1693,31 +1685,35 @@ func (h *OrgAdminHandler) AddOrgGroupOwnedLibrary(c *gin.Context) {
 	newLibID := uuid.New().String()
 	now := time.Now()
 
-	// Create the library
-	h.db.Session().Query(`
+	batch := h.db.Session().Batch(gocql.LoggedBatch)
+	batch.Query(`
 		INSERT INTO libraries (org_id, library_id, owner_id, name, encrypted, size_bytes, file_count, created_at, updated_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, targetOrgID, newLibID, callerUserID, repoName, false, int64(0), int64(0), now, now).Exec()
-
-	// Create lookup entry
-	h.db.Session().Query(`
+	`, targetOrgID, newLibID, callerUserID, repoName, false, int64(0), int64(0), now, now)
+	batch.Query(`
 		INSERT INTO libraries_by_id (library_id, org_id, owner_id, encrypted)
 		VALUES (?, ?, ?, ?)
-	`, newLibID, targetOrgID, callerUserID, false).Exec()
+	`, newLibID, targetOrgID, callerUserID, false)
+	if err := batch.Exec(); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create library"})
+		return
+	}
 
 	// Initialize filesystem (root dir + initial commit)
 	fsHelper := NewFSHelper(h.db)
 	if err := fsHelper.InitializeLibraryFS(targetOrgID, newLibID, callerUserID, repoName); err != nil {
+		_ = rollbackNewLibrary(h.db, targetOrgID, newLibID)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to initialize library filesystem"})
 		return
 	}
 
 	// Share to group with rw permission
 	shareID := uuid.New().String()
-	h.db.Session().Query(`
-		INSERT INTO shares (library_id, share_id, shared_by, shared_to, shared_to_type, permission, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?)
-	`, newLibID, shareID, callerUserID, groupID, "group", "rw", now).Exec()
+	if err := createLibraryShare(h.db, newLibID, shareID, callerUserID, groupID, "group", "rw", now, nil); err != nil {
+		_ = rollbackNewLibrary(h.db, targetOrgID, newLibID)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to share library with group"})
+		return
+	}
 
 	c.JSON(http.StatusOK, gin.H{
 		"repo_id":   newLibID,
@@ -1752,10 +1748,13 @@ func (h *OrgAdminHandler) DeleteOrgGroupOwnedLibrary(c *gin.Context) {
 	// Soft-delete
 	callerUserID := c.GetString("user_id")
 	now := time.Now()
-	h.db.Session().Query(`
+	if err := h.db.Session().Query(`
 		UPDATE libraries SET deleted_at = ?, deleted_by = ?
 		WHERE org_id = ? AND library_id = ?
-	`, now, callerUserID, targetOrgID, repoID).Exec()
+	`, now, callerUserID, targetOrgID, repoID).Exec(); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete library"})
+		return
+	}
 
 	c.JSON(http.StatusOK, gin.H{"success": true})
 }
@@ -1938,18 +1937,11 @@ func (h *OrgAdminHandler) TransferOrgRepo(c *gin.Context) {
 		return
 	}
 
-	// Update owner
 	now := time.Now()
-	h.db.Session().Query(`
-		UPDATE libraries SET owner_id = ?, updated_at = ?
-		WHERE org_id = ? AND library_id = ?
-	`, newOwnerID, now, targetOrgID, repoID).Exec()
-
-	// Update lookup table
-	h.db.Session().Query(`
-		UPDATE libraries_by_id SET owner_id = ?
-		WHERE library_id = ?
-	`, newOwnerID, repoID).Exec()
+	if err := updateLibraryOwner(h.db, targetOrgID, repoID, newOwnerID, now); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to transfer library"})
+		return
+	}
 
 	c.JSON(http.StatusOK, gin.H{"success": true})
 }
@@ -2181,18 +2173,27 @@ func (h *OrgAdminHandler) CleanOrgTrashLibraries(c *gin.Context) {
 		if deletedAt.IsZero() {
 			continue
 		}
+		if err := cleanupLibraryLinks(h.db, targetOrgID, libID); err != nil {
+			iter.Close()
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to clean library links"})
+			return
+		}
 		// Hard-delete library rows + preserve org lookup for GC
 		batch := h.db.Session().Batch(gocql.LoggedBatch)
 		batch.Query(`DELETE FROM libraries WHERE org_id = ? AND library_id = ?`, targetOrgID, libID)
 		batch.Query(`DELETE FROM libraries_by_id WHERE library_id = ?`, libID)
 		batch.Query(`INSERT INTO deleted_libraries (library_id, org_id, deleted_at) VALUES (?, ?, ?)`, libID, targetOrgID, time.Now())
 		if err := batch.Exec(); err != nil {
-			log.Printf("[CleanOrgTrashLibraries] failed to delete library %s: %v", libID, err)
-			continue
+			iter.Close()
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete library"})
+			return
 		}
 		cleaned++
 	}
-	iter.Close()
+	if err := iter.Close(); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to scan trash libraries"})
+		return
+	}
 
 	log.Printf("[CleanOrgTrashLibraries] Cleaned %d trashed libraries in org %s", cleaned, targetOrgID)
 	c.JSON(http.StatusOK, gin.H{"success": true})
@@ -2218,6 +2219,11 @@ func (h *OrgAdminHandler) DeleteOrgTrashLibrary(c *gin.Context) {
 	}
 	if deletedAt.IsZero() {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "library is not in trash"})
+		return
+	}
+
+	if err := cleanupLibraryLinks(h.db, targetOrgID, repoID); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to clean library links"})
 		return
 	}
 
@@ -2367,38 +2373,33 @@ func (h *OrgAdminHandler) AddOrgAddressBookGroup(c *gin.Context) {
 		}
 	}
 
-	// Use conditional INSERT to avoid passing invalid UUID for parent_group_id
-	var insertErr error
+	batch := h.db.Session().Batch(gocql.LoggedBatch)
 	if parentGroup != "" {
-		insertErr = h.db.Session().Query(`
+		batch.Query(`
 			INSERT INTO groups (org_id, group_id, name, creator_id, parent_group_id, is_department, created_at, updated_at)
 			VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-		`, targetOrgID, newGroupID, groupName, creatorID, parentGroup, true, now, now).Exec()
+		`, targetOrgID, newGroupID, groupName, creatorID, parentGroup, true, now, now)
 	} else {
-		insertErr = h.db.Session().Query(`
+		batch.Query(`
 			INSERT INTO groups (org_id, group_id, name, creator_id, is_department, created_at, updated_at)
 			VALUES (?, ?, ?, ?, ?, ?, ?)
-		`, targetOrgID, newGroupID, groupName, creatorID, true, now, now).Exec()
+		`, targetOrgID, newGroupID, groupName, creatorID, true, now, now)
 	}
-	if insertErr != nil {
+	batch.Query(`
+		INSERT INTO groups_by_id (group_id, org_id, name) VALUES (?, ?, ?)
+	`, newGroupID, targetOrgID, groupName)
+	batch.Query(`
+		INSERT INTO group_members (group_id, user_id, role, added_at)
+		VALUES (?, ?, ?, ?)
+	`, newGroupID, creatorID, "owner", now)
+	batch.Query(`
+		INSERT INTO groups_by_member (org_id, user_id, group_id, group_name, role, added_at)
+		VALUES (?, ?, ?, ?, ?, ?)
+	`, targetOrgID, creatorID, newGroupID, groupName, "owner", now)
+	if err := batch.Exec(); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create department"})
 		return
 	}
-
-	// Add to groups_by_id lookup
-	h.db.Session().Query(`
-		INSERT INTO groups_by_id (group_id, org_id, name) VALUES (?, ?, ?)
-	`, newGroupID, targetOrgID, groupName).Exec()
-
-	// Add creator as owner member
-	h.db.Session().Query(`
-		INSERT INTO group_members (group_id, user_id, role, added_at)
-		VALUES (?, ?, ?, ?)
-	`, newGroupID, creatorID, "owner", now).Exec()
-	h.db.Session().Query(`
-		INSERT INTO groups_by_member (org_id, user_id, group_id, group_name, role, added_at)
-		VALUES (?, ?, ?, ?, ?, ?)
-	`, targetOrgID, creatorID, newGroupID, groupName, "owner", now).Exec()
 
 	// Add staff members if specified
 	if groupStaff != "" {
@@ -2411,14 +2412,10 @@ func (h *OrgAdminHandler) AddOrgAddressBookGroup(c *gin.Context) {
 			if err != nil {
 				continue
 			}
-			h.db.Session().Query(`
-				INSERT INTO group_members (group_id, user_id, role, added_at)
-				VALUES (?, ?, ?, ?)
-			`, newGroupID, staffID, "member", now).Exec()
-			h.db.Session().Query(`
-				INSERT INTO groups_by_member (org_id, user_id, group_id, group_name, role, added_at)
-				VALUES (?, ?, ?, ?, ?, ?)
-			`, targetOrgID, staffID, newGroupID, groupName, "member", now).Exec()
+			if err := upsertGroupMember(h.db, targetOrgID, newGroupID, staffID, groupName, "member", now); err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to add department staff"})
+				return
+			}
 		}
 	}
 
@@ -2564,10 +2561,10 @@ func (h *OrgAdminHandler) UpdateOrgAddressBookGroup(c *gin.Context) {
 		return
 	}
 
-	h.db.Session().Query(`
-		UPDATE groups SET name = ?, updated_at = ? WHERE org_id = ? AND group_id = ?
-	`, newName, time.Now(), targetOrgID, groupID).Exec()
-	h.db.Session().Query(`UPDATE groups_by_id SET name = ? WHERE group_id = ?`, newName, groupID).Exec()
+	if err := renameGroup(h.db, targetOrgID, groupID, newName, time.Now()); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to rename group"})
+		return
+	}
 
 	c.JSON(http.StatusOK, gin.H{"id": groupID, "name": newName})
 }
@@ -2595,18 +2592,34 @@ func (h *OrgAdminHandler) DeleteOrgAddressBookGroup(c *gin.Context) {
 		SELECT user_id FROM group_members WHERE group_id = ?
 	`, groupID).Iter()
 	var memberID string
+	var memberIDs []string
 	for memIter.Scan(&memberID) {
-		h.db.Session().Query(`
-			DELETE FROM groups_by_member WHERE org_id = ? AND user_id = ? AND group_id = ?
-		`, targetOrgID, memberID, groupID).Exec()
+		memberIDs = append(memberIDs, memberID)
 	}
-	memIter.Close()
+	if err := memIter.Close(); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to load group members"})
+		return
+	}
 
-	// Delete group members and group
-	h.db.Session().Query(`DELETE FROM group_members WHERE group_id = ?`, groupID).Exec()
-	h.db.Session().Query(`DELETE FROM groups WHERE org_id = ? AND group_id = ?`,
-		targetOrgID, groupID).Exec()
-	h.db.Session().Query(`DELETE FROM groups_by_id WHERE group_id = ?`, groupID).Exec()
+	batch := h.db.Session().Batch(gocql.LoggedBatch)
+	batch.Query(`DELETE FROM group_members WHERE group_id = ?`, groupID)
+	batch.Query(`DELETE FROM groups WHERE org_id = ? AND group_id = ?`, targetOrgID, groupID)
+	batch.Query(`DELETE FROM groups_by_id WHERE group_id = ?`, groupID)
+	if err := batch.Exec(); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete department"})
+		return
+	}
+	if err := cleanupGroupsByMember(h.db, targetOrgID, groupID, memberIDs); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to clean department membership index"})
+		return
+	}
+	groupUUID, err := uuid.Parse(groupID)
+	if err == nil {
+		if err := cleanupGroupShares(h.db, groupUUID); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to clean department shares"})
+			return
+		}
+	}
 
 	c.JSON(http.StatusOK, gin.H{"success": true})
 }

@@ -427,28 +427,21 @@ func (h *FSHelper) InitializeLibraryFS(orgID, repoID, userID, repoName string) e
 	emptyDirHash := sha1.Sum([]byte(emptyDirData))
 	rootFSID := hex.EncodeToString(emptyDirHash[:])
 
-	if err := h.db.Session().Query(`
-		INSERT INTO fs_objects (library_id, fs_id, obj_type, obj_name, dir_entries, mtime)
-		VALUES (?, ?, ?, ?, ?, ?)
-	`, repoID, rootFSID, "dir", "", emptyDirEntries, now.Unix()).Exec(); err != nil {
-		return fmt.Errorf("failed to create root directory: %w", err)
-	}
-
 	// 2. Generate initial commit ID
 	commitData := fmt.Sprintf("%s:%s:%d", repoID, repoName, now.UnixNano())
 	commitHash := sha1.Sum([]byte(commitData))
 	headCommitID := hex.EncodeToString(commitHash[:])
 
-	// 3. Create initial commit record
-	if err := h.db.Session().Query(`
+	// 3. Persist root object, initial commit, and head_commit atomically.
+	batch := h.db.Session().Batch(gocql.LoggedBatch)
+	batch.Query(`
+		INSERT INTO fs_objects (library_id, fs_id, obj_type, obj_name, dir_entries, mtime)
+		VALUES (?, ?, ?, ?, ?, ?)
+	`, repoID, rootFSID, "dir", "", emptyDirEntries, now.Unix())
+	batch.Query(`
 		INSERT INTO commits (library_id, commit_id, root_fs_id, creator_id, description, created_at)
 		VALUES (?, ?, ?, ?, ?, ?)
-	`, repoID, headCommitID, rootFSID, userID, "Initial commit", now).Exec(); err != nil {
-		return fmt.Errorf("failed to create initial commit: %w", err)
-	}
-
-	// 4. Set head_commit_id on library tables
-	batch := h.db.Session().Batch(gocql.LoggedBatch)
+	`, repoID, headCommitID, rootFSID, userID, "Initial commit", now)
 	batch.Query(`
 		UPDATE libraries SET head_commit_id = ? WHERE org_id = ? AND library_id = ?
 	`, headCommitID, orgID, repoID)
@@ -456,7 +449,7 @@ func (h *FSHelper) InitializeLibraryFS(orgID, repoID, userID, repoName string) e
 		UPDATE libraries_by_id SET head_commit_id = ? WHERE library_id = ?
 	`, headCommitID, repoID)
 	if err := batch.Exec(); err != nil {
-		return fmt.Errorf("failed to set head_commit_id: %w", err)
+		return fmt.Errorf("failed to initialize library fs state: %w", err)
 	}
 
 	return nil

@@ -445,8 +445,8 @@ func TestSeafHTTPHandlerUploadInvalidToken(t *testing.T) {
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
-	if w.Code != http.StatusForbidden {
-		t.Errorf("status = %d, want %d", w.Code, http.StatusForbidden)
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusUnauthorized)
 	}
 }
 
@@ -483,8 +483,8 @@ func TestSeafHTTPHandlerDownloadInvalidToken(t *testing.T) {
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
-	if w.Code != http.StatusForbidden {
-		t.Errorf("status = %d, want %d", w.Code, http.StatusForbidden)
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusUnauthorized)
 	}
 }
 
@@ -609,12 +609,12 @@ func TestSanitizeFilename(t *testing.T) {
 
 func TestParseContentRange(t *testing.T) {
 	tests := []struct {
-		name       string
-		header     string
-		wantStart  int64
-		wantEnd    int64
-		wantTotal  int64
-		wantOK     bool
+		name      string
+		header    string
+		wantStart int64
+		wantEnd   int64
+		wantTotal int64
+		wantOK    bool
 	}{
 		{"valid range", "bytes 0-1023/5000", 0, 1023, 5000, true},
 		{"middle chunk", "bytes 1024-2047/5000", 1024, 2047, 5000, true},

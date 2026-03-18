@@ -261,7 +261,7 @@ func TestCreateOrganization_MissingName(t *testing.T) {
 
 	var resp map[string]interface{}
 	json.Unmarshal(w.Body.Bytes(), &resp)
-	assert.Equal(t, "name is required", resp["error"])
+	assert.Equal(t, "org_name (or name) is required", resp["error"])
 }
 
 func TestCreateOrganization_ValidRequestParsing(t *testing.T) {
@@ -548,12 +548,13 @@ func TestAdminUserResponse_JSONFormat(t *testing.T) {
 	assert.Equal(t, true, parsed["is_active"])
 	assert.Equal(t, false, parsed["is_staff"])
 	assert.Equal(t, "user", parsed["role"])
+	assert.Equal(t, "", parsed["admin_role"])
 	assert.Equal(t, float64(1099511627776), parsed["quota_total"])
 	assert.Equal(t, float64(524288), parsed["quota_usage"])
 	assert.Equal(t, "2025-06-15T12:00:00Z", parsed["create_time"])
 	assert.Equal(t, "", parsed["last_login"])
 
-	expectedKeys := []string{"email", "name", "is_active", "is_staff", "role", "quota_total", "quota_usage", "create_time", "last_login"}
+	expectedKeys := []string{"email", "name", "is_active", "is_staff", "role", "admin_role", "quota_total", "quota_usage", "create_time", "last_login"}
 	for _, key := range expectedKeys {
 		_, exists := parsed[key]
 		assert.True(t, exists, "expected key %q in JSON output", key)

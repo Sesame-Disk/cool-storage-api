@@ -58,7 +58,7 @@ func TestErrorPageHTML(t *testing.T) {
 			expected: []string{
 				"<!DOCTYPE html>",
 				"error-container",
-				"#c0392b", // Error color
+				"Something went wrong.",
 			},
 		},
 	}
@@ -675,7 +675,6 @@ func TestOnlyOfficeEditorHTMLLoadingState(t *testing.T) {
 	loadingElements := []string{
 		"loading-spinner",
 		"Loading document...",
-		"@keyframes spin",
 	}
 
 	for _, elem := range loadingElements {

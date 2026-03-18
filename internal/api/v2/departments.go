@@ -294,14 +294,10 @@ func (h *DepartmentHandler) UpdateDepartment(c *gin.Context) {
 		return
 	}
 
-	// Update group name
-	if err := h.db.Session().Query(`
-		UPDATE groups SET name = ?, updated_at = ? WHERE org_id = ? AND group_id = ?
-	`, req.Name, time.Now(), orgID, groupID).Exec(); err != nil {
+	if err := renameGroup(h.db, orgID, groupID, req.Name, time.Now()); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update department"})
 		return
 	}
-	h.db.Session().Query(`UPDATE groups_by_id SET name = ? WHERE group_id = ?`, req.Name, groupID).Exec()
 
 	c.JSON(http.StatusOK, gin.H{"id": groupID, "name": req.Name})
 }
@@ -355,23 +351,16 @@ func (h *DepartmentHandler) DeleteDepartment(c *gin.Context) {
 		return
 	}
 
-	// Clean up groups_by_member lookup (different partitions, unlogged batch)
-	for i := 0; i < len(memberIDs); i += 50 {
-		end := i + 50
-		if end > len(memberIDs) {
-			end = len(memberIDs)
-		}
-		memberBatch := h.db.Session().Batch(gocql.UnloggedBatch)
-		for _, uid := range memberIDs[i:end] {
-			memberBatch.Query(`DELETE FROM groups_by_member WHERE org_id = ? AND user_id = ? AND group_id = ?`,
-				orgID, uid, groupID)
-		}
-		memberBatch.Exec()
+	if err := cleanupGroupsByMember(h.db, orgID, groupID, memberIDs); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to clean department membership index"})
+		return
 	}
 
-	// Clean up shares where shared_to = this department (async, best-effort)
 	groupUUID, _ := uuid.Parse(groupID)
-	go cleanupGroupSharesAsync(h.db, groupUUID)
+	if err := cleanupGroupShares(h.db, groupUUID); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to clean department shares"})
+		return
+	}
 
 	// Audit log
 	orgUUID, _ := uuid.Parse(orgID)

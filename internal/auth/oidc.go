@@ -22,6 +22,7 @@ import (
 
 	"github.com/Sesame-Disk/sesamefs/internal/config"
 	"github.com/Sesame-Disk/sesamefs/internal/db"
+	gocql "github.com/apache/cassandra-gocql-driver/v2"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
 )
@@ -768,16 +769,9 @@ func (c *OIDCClient) provisionUser(ctx context.Context, claims *IDTokenClaims, u
 					role = dbRole
 				}
 
-				// Create OIDC mapping for future logins
-				_ = c.db.Session().Query(`
-					INSERT INTO users_by_oidc (oidc_issuer, oidc_sub, user_id, org_id)
-					VALUES (?, ?, ?, ?)
-				`, c.config.Issuer, claims.Subject, userID, orgID).Exec()
-
-				// Update oidc_sub on the user record
-				_ = c.db.Session().Query(`
-					UPDATE users SET oidc_sub = ? WHERE org_id = ? AND user_id = ?
-				`, claims.Subject, orgID, userID).Exec()
+				if err := c.attachOIDCIdentity(userID, orgID, email, claims.Subject); err != nil {
+					return nil, fmt.Errorf("failed to attach OIDC identity: %w", err)
+				}
 
 				goto userReady
 			}
@@ -886,35 +880,48 @@ userReady:
 	}, nil
 }
 
+func (c *OIDCClient) attachOIDCIdentity(userID, orgID, email, oidcSub string) error {
+	batch := c.db.Session().Batch(gocql.LoggedBatch)
+	batch.Query(`
+		INSERT INTO users_by_oidc (oidc_issuer, oidc_sub, user_id, org_id)
+		VALUES (?, ?, ?, ?)
+	`, c.config.Issuer, oidcSub, userID, orgID)
+	batch.Query(`
+		UPDATE users SET oidc_sub = ? WHERE org_id = ? AND user_id = ?
+	`, oidcSub, orgID, userID)
+	if email != "" {
+		batch.Query(`
+			INSERT INTO users_by_email (email, user_id, org_id)
+			VALUES (?, ?, ?)
+		`, email, userID, orgID)
+	}
+	if err := batch.Exec(); err != nil {
+		return fmt.Errorf("failed to persist OIDC identity mapping: %w", err)
+	}
+	return nil
+}
+
 // createUser creates a new user record in the database
 func (c *OIDCClient) createUser(ctx context.Context, userID, orgID, email, name, role, oidcSub string) error {
 	now := time.Now()
 
-	// Create OIDC mapping
-	if err := c.db.Session().Query(`
-		INSERT INTO users_by_oidc (oidc_issuer, oidc_sub, user_id, org_id)
-		VALUES (?, ?, ?, ?)
-	`, c.config.Issuer, oidcSub, userID, orgID).Exec(); err != nil {
-		return fmt.Errorf("failed to create OIDC mapping: %w", err)
-	}
-
-	// Create user record
-	if err := c.db.Session().Query(`
+	batch := c.db.Session().Batch(gocql.LoggedBatch)
+	batch.Query(`
 		INSERT INTO users (org_id, user_id, email, name, role, quota_bytes, used_bytes, created_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-	`, orgID, userID, email, name, role, int64(-2), int64(0), now).Exec(); err != nil {
-		return fmt.Errorf("failed to create user record: %w", err)
-	}
-
-	// Create email lookup so admin APIs can find user by email
+	`, orgID, userID, email, name, role, int64(-2), int64(0), now)
+	batch.Query(`
+		INSERT INTO users_by_oidc (oidc_issuer, oidc_sub, user_id, org_id)
+		VALUES (?, ?, ?, ?)
+	`, c.config.Issuer, oidcSub, userID, orgID)
 	if email != "" {
-		if err := c.db.Session().Query(`
+		batch.Query(`
 			INSERT INTO users_by_email (email, user_id, org_id)
 			VALUES (?, ?, ?)
-		`, email, userID, orgID).Exec(); err != nil {
-			// Log but don't fail — the user record was already created
-			fmt.Printf("WARN: failed to create users_by_email entry for %s: %v\n", email, err)
-		}
+		`, email, userID, orgID)
+	}
+	if err := batch.Exec(); err != nil {
+		return fmt.Errorf("failed to create user records: %w", err)
 	}
 
 	return nil
