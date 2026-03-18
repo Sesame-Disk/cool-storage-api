@@ -383,11 +383,15 @@ Fixed. SeafHTTP endpoints (`HandleUpload`, `HandleDownload`, `HandleZipDownload`
 
 ---
 
-## 9. Library Deletion: Cleanup Paths — ✅ RESOLVED (2026-03-17), Gap B pending
+## 9. Library Deletion: Cleanup Paths — ✅ RESOLVED (2026-03-18), Gap B pending
 
 ### Status
 ~~Known gaps. Fully documented 2026-02-24. Implementation planned (see below).~~
-**Resolved** (2026-03-17): GC worker now cleans all library artifacts (shares, share links, tags, API tokens, locked files) via `enqueueLibraryArtifacts`. Scanner Phase 7 cleans expired user-to-user shares. Only Gap B (`CleanRepoTrash` stub) remains.
+**Resolved** (2026-03-18): GC worker now cleans **all** library artifacts via `enqueueLibraryArtifacts`:
+- shares, share links, tags, API tokens, locked files (2026-03-17)
+- starred_files, monitored_repos, restore_jobs, tag counters (repo_tag_counters, file_tag_counters, repo_tag_file_counts) (2026-03-18)
+
+Scanner Phase 7 cleans expired user-to-user shares. **Phase 9** (2026-03-18) cleans orphaned group shares (shares where `shared_to` is a deleted group). Only Gap B (`CleanRepoTrash` stub) remains.
 
 ### Overview
 
@@ -413,8 +417,14 @@ There are **three code paths** that should clean up library-related data but eac
 | `repo_tags` + `file_tags` | `library_id` | ✅ **Resolved** — `cleanupLibraryTags` in GC worker |
 | `repo_api_tokens` | `library_id` | ✅ **Resolved** — `ListRepoAPITokensByLibrary` → `DeleteRepoAPIToken` |
 | `locked_files` | `repo_id` | ✅ **Resolved** — `DeleteLockedFilesByLibrary` |
+| `starred_files` | `user_id, repo_id` | ✅ **Resolved** (2026-03-18) — `DeleteStarredFilesByLibrary` |
+| `monitored_repos` | `user_id, repo_id` | ✅ **Resolved** (2026-03-18) — `DeleteMonitoredReposByLibrary` |
+| `restore_jobs` | `org_id, library_id` | ✅ **Resolved** (2026-03-18) — `DeleteRestoreJobsByLibrary` |
+| `repo_tag_counters` | `repo_id` | ✅ **Resolved** (2026-03-18) — `DeleteRepoTagCounters` |
+| `file_tag_counters` | `repo_id` | ✅ **Resolved** (2026-03-18) — `DeleteFileTagCounters` |
+| `repo_tag_file_counts` | `repo_id, tag_id` | ✅ **Resolved** (2026-03-18) — `DeleteRepoTagFileCounts` |
 
-Additionally, scanner **Phase 7** catches expired user-to-user shares independently.
+Additionally, scanner **Phase 7** catches expired user-to-user shares independently, and **Phase 9** catches orphaned group shares (group deleted but shares remain).
 
 ---
 
@@ -468,8 +478,11 @@ GC Phase 6:
 | 2 | Dual-write in share link creation/deletion | ✅ Done (2026-03-13) |
 | 3 | Cleanup on permanent delete (Gap A) | ✅ Done (2026-03-17) — `enqueueLibraryArtifacts` in GC worker |
 | 4 | Implement `CleanRepoTrash` (Gap B) | ❌ Pending — `trash.go` still a stub |
-| 5 | GC scanner orphan phases | ✅ Done (2026-03-17) — Phases 7+8 (shares, restore jobs) |
+| 5 | GC scanner orphan phases | ✅ Done (2026-03-17) — Phases 7+8 (shares, restore jobs); Phase 9 (2026-03-18, group shares) |
 | 6 | Tests | ✅ Done (2026-03-17) — scanner + worker tests updated |
+| 7 | Starred/monitored/counters cleanup | ✅ Done (2026-03-18) — 6 new tables cleaned in `enqueueLibraryArtifacts` |
+| 8 | Group deletion cascade | ✅ Done (2026-03-18) — atomic batches + async shares cleanup |
+| 9 | Audit log for deletions | ✅ Done (2026-03-18) — `audit_log` table (365-day TTL) |
 
 ### Remaining: Gap B (`CleanRepoTrash`)
 

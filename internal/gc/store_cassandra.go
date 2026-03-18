@@ -898,6 +898,230 @@ func (s *CassandraStore) DeleteShareLinksByLibrary(orgID, libraryID uuid.UUID) (
 	return deletedTokens, nil
 }
 
+// --- Starred files and monitored repos cleanup ---
+
+func (s *CassandraStore) DeleteStarredFilesByLibrary(libraryID uuid.UUID) error {
+	// starred_files has a secondary index on repo_id, so we can query by it
+	iter := s.db.Session().Query(`
+		SELECT user_id, path FROM starred_files WHERE repo_id = ?
+	`, libraryID.String()).Iter()
+
+	type starEntry struct {
+		userID string
+		path   string
+	}
+	var entries []starEntry
+	var userID, path string
+	for iter.Scan(&userID, &path) {
+		entries = append(entries, starEntry{userID: userID, path: path})
+	}
+	iter.Close()
+
+	for i := 0; i < len(entries); i += maxBatchSize {
+		end := i + maxBatchSize
+		if end > len(entries) {
+			end = len(entries)
+		}
+		batch := s.db.Session().Batch(gocql.UnloggedBatch)
+		for _, e := range entries[i:end] {
+			batch.Query(`DELETE FROM starred_files WHERE user_id = ? AND repo_id = ? AND path = ?`,
+				e.userID, libraryID.String(), e.path)
+		}
+		if err := batch.Exec(); err != nil {
+			log.Printf("[GC Store] Warning: failed to batch delete starred files for library %s: %v", libraryID, err)
+		}
+	}
+	return nil
+}
+
+func (s *CassandraStore) DeleteMonitoredReposByLibrary(libraryID uuid.UUID) error {
+	// monitored_repos is partitioned by user_id — need to scan or use secondary index
+	// We'll do a full scan filtered by repo_id (acceptable in GC context)
+	iter := s.db.Session().Query(`
+		SELECT user_id FROM monitored_repos WHERE repo_id = ? ALLOW FILTERING
+	`, libraryID.String()).Iter()
+
+	var userIDs []string
+	var userID string
+	for iter.Scan(&userID) {
+		userIDs = append(userIDs, userID)
+	}
+	iter.Close()
+
+	for i := 0; i < len(userIDs); i += maxBatchSize {
+		end := i + maxBatchSize
+		if end > len(userIDs) {
+			end = len(userIDs)
+		}
+		batch := s.db.Session().Batch(gocql.UnloggedBatch)
+		for _, uid := range userIDs[i:end] {
+			batch.Query(`DELETE FROM monitored_repos WHERE user_id = ? AND repo_id = ?`,
+				uid, libraryID.String())
+		}
+		if err := batch.Exec(); err != nil {
+			log.Printf("[GC Store] Warning: failed to batch delete monitored repos for library %s: %v", libraryID, err)
+		}
+	}
+	return nil
+}
+
+// --- Restore jobs cleanup by library ---
+
+func (s *CassandraStore) DeleteRestoreJobsByLibrary(orgID, libraryID uuid.UUID) error {
+	iter := s.db.Session().Query(`
+		SELECT job_id FROM restore_jobs WHERE org_id = ? AND library_id = ?
+	`, orgID.String(), libraryID.String()).Iter()
+
+	var jobIDs []string
+	var jobID string
+	for iter.Scan(&jobID) {
+		jobIDs = append(jobIDs, jobID)
+	}
+	iter.Close()
+
+	for i := 0; i < len(jobIDs); i += maxBatchSize {
+		end := i + maxBatchSize
+		if end > len(jobIDs) {
+			end = len(jobIDs)
+		}
+		batch := s.db.Session().Batch(gocql.UnloggedBatch)
+		for _, jid := range jobIDs[i:end] {
+			batch.Query(`DELETE FROM restore_jobs WHERE org_id = ? AND library_id = ? AND job_id = ?`,
+				orgID.String(), libraryID.String(), jid)
+		}
+		if err := batch.Exec(); err != nil {
+			log.Printf("[GC Store] Warning: failed to batch delete restore jobs for library %s: %v", libraryID, err)
+		}
+	}
+	return nil
+}
+
+// --- Tag counter cleanup ---
+
+func (s *CassandraStore) DeleteRepoTagCounters(libraryID uuid.UUID) error {
+	return s.db.Session().Query(`
+		DELETE FROM repo_tag_counters WHERE repo_id = ?
+	`, libraryID.String()).Exec()
+}
+
+func (s *CassandraStore) DeleteFileTagCounters(libraryID uuid.UUID) error {
+	return s.db.Session().Query(`
+		DELETE FROM file_tag_counters WHERE repo_id = ?
+	`, libraryID.String()).Exec()
+}
+
+func (s *CassandraStore) DeleteRepoTagFileCounts(libraryID uuid.UUID) error {
+	// repo_tag_file_counts is a counter table partitioned by (repo_id), tag_id
+	// We need to list tag_ids first, then delete each row
+	iter := s.db.Session().Query(`
+		SELECT tag_id FROM repo_tag_file_counts WHERE repo_id = ?
+	`, libraryID.String()).Iter()
+
+	var tagIDs []int
+	var tagID int
+	for iter.Scan(&tagID) {
+		tagIDs = append(tagIDs, tagID)
+	}
+	iter.Close()
+
+	for _, tid := range tagIDs {
+		s.db.Session().Query(`DELETE FROM repo_tag_file_counts WHERE repo_id = ? AND tag_id = ?`,
+			libraryID.String(), tid).Exec()
+	}
+	return nil
+}
+
+// --- Group shares cleanup ---
+
+func (s *CassandraStore) ListSharesByGroup(groupID uuid.UUID) ([]GroupShareInfo, error) {
+	// shares_by_user is partitioned by shared_to, so this is efficient
+	iter := s.db.Session().Query(`
+		SELECT shared_to, library_id FROM shares_by_user WHERE shared_to = ?
+	`, groupID.String()).Iter()
+
+	var results []GroupShareInfo
+	var sharedToStr, libIDStr string
+	for iter.Scan(&sharedToStr, &libIDStr) {
+		results = append(results, GroupShareInfo{
+			LibraryID: parseUUID(libIDStr),
+			SharedTo:  parseUUID(sharedToStr),
+		})
+	}
+	if err := iter.Close(); err != nil {
+		return nil, err
+	}
+
+	// For each library, get the share_id from the shares table
+	for i, gs := range results {
+		iter2 := s.db.Session().Query(`
+			SELECT share_id FROM shares WHERE library_id = ? AND shared_to = ? ALLOW FILTERING
+		`, gs.LibraryID.String()).Iter()
+		// Actually, shares PK is (library_id, share_id), we need to scan
+		// Let's query shares by library and filter
+		iter2.Close()
+
+		// Better approach: query shares table for this library
+		shareIter := s.db.Session().Query(`
+			SELECT share_id, shared_to FROM shares WHERE library_id = ?
+		`, gs.LibraryID.String()).Iter()
+		var shareIDStr, stStr string
+		for shareIter.Scan(&shareIDStr, &stStr) {
+			if stStr == groupID.String() {
+				results[i].ShareID = parseUUID(shareIDStr)
+				break
+			}
+		}
+		shareIter.Close()
+	}
+
+	return results, nil
+}
+
+// ListAllGroupShares returns all shares with shared_to_type='group' for the scanner.
+func (s *CassandraStore) ListAllGroupShares() ([]GroupShareInfo, error) {
+	iter := s.db.Session().Query(`
+		SELECT library_id, share_id, shared_to, shared_to_type FROM shares
+	`).Iter()
+
+	var results []GroupShareInfo
+	var libIDStr, shareIDStr, sharedToStr, sharedToType string
+	for iter.Scan(&libIDStr, &shareIDStr, &sharedToStr, &sharedToType) {
+		if sharedToType == "group" {
+			results = append(results, GroupShareInfo{
+				LibraryID:    parseUUID(libIDStr),
+				ShareID:      parseUUID(shareIDStr),
+				SharedTo:     parseUUID(sharedToStr),
+				SharedToType: sharedToType,
+			})
+		}
+	}
+	if err := iter.Close(); err != nil {
+		return nil, fmt.Errorf("failed to list group shares: %w", err)
+	}
+	return results, nil
+}
+
+func (s *CassandraStore) GroupExists(orgID, groupID uuid.UUID) (bool, error) {
+	var name string
+	err := s.db.Session().Query(`
+		SELECT name FROM groups WHERE org_id = ? AND group_id = ?
+	`, orgID.String(), groupID.String()).Scan(&name)
+	if err != nil {
+		return false, nil
+	}
+	return true, nil
+}
+
+// --- Audit log ---
+
+func (s *CassandraStore) WriteAuditLog(entry AuditLogEntry) error {
+	return s.db.Session().Query(`
+		INSERT INTO audit_log (org_id, timestamp, action, target_type, target_id, actor_id, details)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+	`, entry.OrgID.String(), entry.Timestamp, entry.Action, entry.TargetType,
+		entry.TargetID, entry.ActorID, entry.Details).Exec()
+}
+
 // --- GC stats persistence ---
 
 func (s *CassandraStore) SaveGCStats(key, value string) error {

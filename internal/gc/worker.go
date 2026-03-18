@@ -169,6 +169,7 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 	}
 
 	w.stats.IncrBlocksDeleted()
+	metrics.GCAuditEventsTotal.WithLabelValues("gc_block_deleted").Inc()
 	log.Printf("[GC Worker] Deleted block %s", item.ItemID)
 	return nil
 }
@@ -417,23 +418,25 @@ func (w *Worker) EnqueueLibraryContents(orgID, libraryID uuid.UUID, storageClass
 	return nil
 }
 
-// enqueueLibraryArtifacts cleans up auxiliary data tied to a deleted library:
-// share links, shares, tags, api tokens, locked files.
+// enqueueLibraryArtifacts cleans up ALL auxiliary data tied to a deleted library:
+// share links, shares, tags, tag counters, api tokens, locked files,
+// starred files, monitored repos, and restore jobs.
 func (w *Worker) enqueueLibraryArtifacts(orgID, libraryID uuid.UUID) {
 	// Delete share links via the by_library index (efficient)
 	tokens, err := w.store.DeleteShareLinksByLibrary(orgID, libraryID)
-	if err == nil {
-		for _, token := range tokens {
-			log.Printf("[GC Worker] Cleaned up share link %s for deleted library %s", token, libraryID)
-		}
+	if err == nil && len(tokens) > 0 {
+		log.Printf("[GC Worker] Cleaned up %d share links for deleted library %s", len(tokens), libraryID)
 	}
 
-	// Delete shares
+	// Delete shares (user-to-user and group shares)
 	shares, err := w.store.ListSharesByLibrary(libraryID)
 	if err == nil {
 		for _, share := range shares {
 			w.store.DeleteShare(libraryID, share.ShareID)
 			w.store.DeleteShareByUser(share.SharedTo, libraryID)
+		}
+		if len(shares) > 0 {
+			log.Printf("[GC Worker] Cleaned up %d shares for deleted library %s", len(shares), libraryID)
 		}
 	}
 
@@ -441,6 +444,11 @@ func (w *Worker) enqueueLibraryArtifacts(orgID, libraryID uuid.UUID) {
 	if err := w.cleanupLibraryTags(libraryID); err != nil {
 		log.Printf("[GC Worker] Error cleaning tags for library %s: %v", libraryID, err)
 	}
+
+	// Delete tag counter tables (repo_tag_counters, file_tag_counters, repo_tag_file_counts)
+	w.store.DeleteRepoTagCounters(libraryID)
+	w.store.DeleteFileTagCounters(libraryID)
+	w.store.DeleteRepoTagFileCounts(libraryID)
 
 	// Delete API tokens
 	tokens2, err := w.store.ListRepoAPITokensByLibrary(libraryID)
@@ -453,6 +461,32 @@ func (w *Worker) enqueueLibraryArtifacts(orgID, libraryID uuid.UUID) {
 
 	// Delete locked files
 	w.store.DeleteLockedFilesByLibrary(libraryID)
+
+	// Delete starred files referencing this library
+	if err := w.store.DeleteStarredFilesByLibrary(libraryID); err != nil {
+		log.Printf("[GC Worker] Error cleaning starred files for library %s: %v", libraryID, err)
+	}
+
+	// Delete monitored repos referencing this library
+	if err := w.store.DeleteMonitoredReposByLibrary(libraryID); err != nil {
+		log.Printf("[GC Worker] Error cleaning monitored repos for library %s: %v", libraryID, err)
+	}
+
+	// Delete restore jobs for this library
+	if err := w.store.DeleteRestoreJobsByLibrary(orgID, libraryID); err != nil {
+		log.Printf("[GC Worker] Error cleaning restore jobs for library %s: %v", libraryID, err)
+	}
+
+	// Audit log
+	w.store.WriteAuditLog(AuditLogEntry{
+		OrgID:      orgID,
+		Action:     "gc_library_artifacts_cleaned",
+		TargetType: "library",
+		TargetID:   libraryID.String(),
+		ActorID:    "gc_worker",
+		Details:    fmt.Sprintf("shares=%d links=%d", len(shares), len(tokens)),
+		Timestamp:  time.Now(),
+	})
 }
 
 func (w *Worker) cleanupLibraryTags(libraryID uuid.UUID) error {

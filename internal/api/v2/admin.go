@@ -1199,7 +1199,7 @@ func (h *AdminHandler) AdminCreateGroup(c *gin.Context) {
 	})
 }
 
-// AdminDeleteGroup deletes a group.
+// AdminDeleteGroup deletes a group and cleans up all related data.
 // DELETE /admin/groups/:group_id/
 func (h *AdminHandler) AdminDeleteGroup(c *gin.Context) {
 	callerOrgID := c.GetString("org_id")
@@ -1221,7 +1221,7 @@ func (h *AdminHandler) AdminDeleteGroup(c *gin.Context) {
 		return
 	}
 
-	// Get all members before deleting, so we can clean up groups_by_member
+	// Get all members before deleting (for groups_by_member cleanup)
 	memberIter := h.db.Session().Query(`SELECT user_id FROM group_members WHERE group_id = ?`, groupID).Iter()
 	var memberID string
 	var memberIDs []string
@@ -1230,20 +1230,81 @@ func (h *AdminHandler) AdminDeleteGroup(c *gin.Context) {
 	}
 	memberIter.Close()
 
-	// Delete group
-	h.db.Session().Query(`DELETE FROM groups WHERE org_id = ? AND group_id = ?`, orgID, groupID).Exec()
-	h.db.Session().Query(`DELETE FROM groups_by_id WHERE group_id = ?`, groupID).Exec()
-
-	// Delete all members
-	h.db.Session().Query(`DELETE FROM group_members WHERE group_id = ?`, groupID).Exec()
-
-	// Clean up groups_by_member lookup table
-	for _, uid := range memberIDs {
-		h.db.Session().Query(`DELETE FROM groups_by_member WHERE org_id = ? AND user_id = ? AND group_id = ?`,
-			orgID, uid, groupID).Exec()
+	// Atomic batch: delete group + groups_by_id + group_members
+	batch := h.db.Session().Batch(gocql.LoggedBatch)
+	batch.Query(`DELETE FROM groups WHERE org_id = ? AND group_id = ?`, orgID, groupID)
+	batch.Query(`DELETE FROM groups_by_id WHERE group_id = ?`, groupID)
+	batch.Query(`DELETE FROM group_members WHERE group_id = ?`, groupID)
+	if err := batch.Exec(); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete group"})
+		return
 	}
 
+	// Clean up groups_by_member lookup (different partitions, unlogged batch)
+	for i := 0; i < len(memberIDs); i += 50 {
+		end := i + 50
+		if end > len(memberIDs) {
+			end = len(memberIDs)
+		}
+		memberBatch := h.db.Session().Batch(gocql.UnloggedBatch)
+		for _, uid := range memberIDs[i:end] {
+			memberBatch.Query(`DELETE FROM groups_by_member WHERE org_id = ? AND user_id = ? AND group_id = ?`,
+				orgID, uid, groupID)
+		}
+		memberBatch.Exec()
+	}
+
+	// Clean up shares where shared_to = this group (async, best-effort)
+	groupUUID, _ := uuid.Parse(groupID)
+	go cleanupGroupSharesAsync(h.db, groupUUID)
+
+	// Audit log
+	orgUUID, _ := uuid.Parse(orgID)
+	h.db.Session().Query(`
+		INSERT INTO audit_log (org_id, timestamp, action, target_type, target_id, actor_id, details)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+	`, orgUUID.String(), time.Now(), "delete_group", "group", groupID, callerUserID,
+		fmt.Sprintf(`{"group_name":"%s","members_count":%d}`, name, len(memberIDs))).Exec()
+
 	c.JSON(http.StatusOK, gin.H{"success": true})
+}
+
+// cleanupGroupSharesAsync removes all library shares targeting a deleted group.
+// Runs async — safe for best-effort cleanup; scanner phase 9 catches any misses.
+func cleanupGroupSharesAsync(database *db.DB, groupID uuid.UUID) {
+	iter := database.Session().Query(`
+		SELECT library_id FROM shares_by_user WHERE shared_to = ?
+	`, groupID.String()).Iter()
+
+	var libIDStr string
+	var libraryIDs []string
+	for iter.Scan(&libIDStr) {
+		libraryIDs = append(libraryIDs, libIDStr)
+	}
+	iter.Close()
+
+	for _, libID := range libraryIDs {
+		// Find share_id(s) for this group in the shares table
+		shareIter := database.Session().Query(`
+			SELECT share_id, shared_to FROM shares WHERE library_id = ?
+		`, libID).Iter()
+		var shareIDStr, sharedToStr string
+		for shareIter.Scan(&shareIDStr, &sharedToStr) {
+			if sharedToStr == groupID.String() {
+				database.Session().Query(`DELETE FROM shares WHERE library_id = ? AND share_id = ?`,
+					libID, shareIDStr).Exec()
+			}
+		}
+		shareIter.Close()
+
+		// Delete from shares_by_user
+		database.Session().Query(`DELETE FROM shares_by_user WHERE shared_to = ? AND library_id = ?`,
+			groupID.String(), libID).Exec()
+	}
+
+	if len(libraryIDs) > 0 {
+		log.Printf("[Admin] Cleaned up %d group shares for deleted group %s", len(libraryIDs), groupID)
+	}
 }
 
 // AdminTransferGroup transfers group ownership or renames a group.

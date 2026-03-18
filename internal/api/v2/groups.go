@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/Sesame-Disk/sesamefs/internal/db"
+	gocql "github.com/apache/cassandra-gocql-driver/v2"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 )
@@ -359,36 +360,20 @@ func (h *GroupHandler) CreateGroup(c *gin.Context) {
 	groupUUID := uuid.New()
 	now := time.Now()
 
-	// Insert into groups table (is_department=false for user-created groups)
-	// Use .String() for UUID params - gocql can't marshal google/uuid.UUID directly
-	if err := h.db.Session().Query(`
-		INSERT INTO groups (org_id, group_id, name, creator_id, is_department, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?)
-	`, orgUUID.String(), groupUUID.String(), req.GroupName, userUUID.String(), false, now, now).Exec(); err != nil {
+	// Atomic batch: create group + lookup + creator membership
+	batch := h.db.Session().Batch(gocql.LoggedBatch)
+	batch.Query(`INSERT INTO groups (org_id, group_id, name, creator_id, is_department, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		orgUUID.String(), groupUUID.String(), req.GroupName, userUUID.String(), false, now, now)
+	batch.Query(`INSERT INTO groups_by_id (group_id, org_id, name) VALUES (?, ?, ?)`,
+		groupUUID.String(), orgUUID.String(), req.GroupName)
+	batch.Query(`INSERT INTO group_members (group_id, user_id, role, added_at) VALUES (?, ?, ?, ?)`,
+		groupUUID.String(), userUUID.String(), "owner", now)
+	batch.Query(`INSERT INTO groups_by_member (org_id, user_id, group_id, group_name, role, added_at)
+		VALUES (?, ?, ?, ?, ?, ?)`,
+		orgUUID.String(), userUUID.String(), groupUUID.String(), req.GroupName, "owner", now)
+	if err := batch.Exec(); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create group"})
-		return
-	}
-
-	// Add to groups_by_id lookup
-	h.db.Session().Query(`
-		INSERT INTO groups_by_id (group_id, org_id, name) VALUES (?, ?, ?)
-	`, groupUUID.String(), orgUUID.String(), req.GroupName).Exec()
-
-	// Add creator as owner in group_members
-	if err := h.db.Session().Query(`
-		INSERT INTO group_members (group_id, user_id, role, added_at)
-		VALUES (?, ?, ?, ?)
-	`, groupUUID.String(), userUUID.String(), "owner", now).Exec(); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to add creator as member"})
-		return
-	}
-
-	// Add to lookup table
-	if err := h.db.Session().Query(`
-		INSERT INTO groups_by_member (org_id, user_id, group_id, group_name, role, added_at)
-		VALUES (?, ?, ?, ?, ?, ?)
-	`, orgUUID.String(), userUUID.String(), groupUUID.String(), req.GroupName, "owner", now).Exec(); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update lookup table"})
 		return
 	}
 
@@ -587,7 +572,7 @@ func (h *GroupHandler) UpdateGroup(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"success": true})
 }
 
-// DeleteGroup deletes a group
+// DeleteGroup deletes a group and cleans up all related data (shares, members).
 // DELETE /api/v2.1/groups/:group_id/
 func (h *GroupHandler) DeleteGroup(c *gin.Context) {
 	groupID := c.Param("group_id")
@@ -600,7 +585,6 @@ func (h *GroupHandler) DeleteGroup(c *gin.Context) {
 		return
 	}
 
-	// Check if database is available
 	if h.db == nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "database not available"})
 		return
@@ -618,30 +602,81 @@ func (h *GroupHandler) DeleteGroup(c *gin.Context) {
 		return
 	}
 
-	// Delete from groups table
-	if err := h.db.Session().Query(`
-		DELETE FROM groups WHERE org_id = ? AND group_id = ?
-	`, orgUUID.String(), groupUUID.String()).Exec(); err != nil {
+	// Collect member IDs before deletion (for groups_by_member cleanup)
+	memberIter := h.db.Session().Query(`SELECT user_id FROM group_members WHERE group_id = ?`, groupUUID.String()).Iter()
+	var memberID string
+	var memberIDs []string
+	for memberIter.Scan(&memberID) {
+		memberIDs = append(memberIDs, memberID)
+	}
+	memberIter.Close()
+
+	// Atomic batch: delete group + groups_by_id + group_members
+	batch := h.db.Session().Batch(gocql.LoggedBatch)
+	batch.Query(`DELETE FROM groups WHERE org_id = ? AND group_id = ?`, orgUUID.String(), groupUUID.String())
+	batch.Query(`DELETE FROM groups_by_id WHERE group_id = ?`, groupUUID.String())
+	batch.Query(`DELETE FROM group_members WHERE group_id = ?`, groupUUID.String())
+	if err := batch.Exec(); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete group"})
 		return
 	}
-	h.db.Session().Query(`DELETE FROM groups_by_id WHERE group_id = ?`, groupUUID.String()).Exec()
 
-	// Delete all members
-	if err := h.db.Session().Query(`
-		DELETE FROM group_members WHERE group_id = ?
-	`, groupUUID.String()).Exec(); err != nil {
-		// Log error but continue
+	// Clean up groups_by_member lookup (separate batch, different partitions)
+	for i := 0; i < len(memberIDs); i += 50 {
+		end := i + 50
+		if end > len(memberIDs) {
+			end = len(memberIDs)
+		}
+		memberBatch := h.db.Session().Batch(gocql.UnloggedBatch)
+		for _, uid := range memberIDs[i:end] {
+			memberBatch.Query(`DELETE FROM groups_by_member WHERE org_id = ? AND user_id = ? AND group_id = ?`,
+				orgUUID.String(), uid, groupUUID.String())
+		}
+		memberBatch.Exec()
 	}
 
-	// Delete from lookup table
-	if err := h.db.Session().Query(`
-		DELETE FROM groups_by_member WHERE org_id = ? AND group_id = ?
-	`, orgUUID.String(), groupUUID.String()).Exec(); err != nil {
-		// Log error but continue
-	}
+	// Clean up shares where shared_to = this group (async, best-effort)
+	go h.cleanupGroupShares(groupUUID)
 
 	c.JSON(http.StatusOK, gin.H{"success": true})
+}
+
+// cleanupGroupShares removes all library shares targeting a deleted group.
+func (h *GroupHandler) cleanupGroupShares(groupID uuid.UUID) {
+	// shares_by_user is partitioned by shared_to, efficient lookup
+	iter := h.db.Session().Query(`
+		SELECT library_id FROM shares_by_user WHERE shared_to = ?
+	`, groupID.String()).Iter()
+
+	var libIDStr string
+	var libraryIDs []string
+	for iter.Scan(&libIDStr) {
+		libraryIDs = append(libraryIDs, libIDStr)
+	}
+	iter.Close()
+
+	for _, libID := range libraryIDs {
+		// Find the share_id in the shares table
+		shareIter := h.db.Session().Query(`
+			SELECT share_id, shared_to FROM shares WHERE library_id = ?
+		`, libID).Iter()
+		var shareIDStr, sharedToStr string
+		for shareIter.Scan(&shareIDStr, &sharedToStr) {
+			if sharedToStr == groupID.String() {
+				h.db.Session().Query(`DELETE FROM shares WHERE library_id = ? AND share_id = ?`,
+					libID, shareIDStr).Exec()
+			}
+		}
+		shareIter.Close()
+
+		// Delete from shares_by_user
+		h.db.Session().Query(`DELETE FROM shares_by_user WHERE shared_to = ? AND library_id = ?`,
+			groupID.String(), libID).Exec()
+	}
+
+	if len(libraryIDs) > 0 {
+		slog.Info("cleaned up group shares", "group_id", groupID, "shares_cleaned", len(libraryIDs))
+	}
 }
 
 // ListGroupMembers returns list of group members

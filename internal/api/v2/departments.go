@@ -5,8 +5,12 @@ import (
 	"net/http"
 	"time"
 
+	"fmt"
+	"log"
+
 	"github.com/Sesame-Disk/sesamefs/internal/db"
 	"github.com/Sesame-Disk/sesamefs/internal/middleware"
+	gocql "github.com/apache/cassandra-gocql-driver/v2"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 )
@@ -185,39 +189,29 @@ func (h *DepartmentHandler) CreateDepartment(c *gin.Context) {
 		parentGroupID = req.ParentGroupID
 	}
 
-	// Insert into groups table (is_department = true)
-	var insertErr error
+	// Atomic batch: create department + lookup + creator membership
+	batch := h.db.Session().Batch(gocql.LoggedBatch)
 	if parentGroupID != "" {
-		insertErr = h.db.Session().Query(`INSERT INTO groups (org_id, group_id, name, creator_id, is_department, parent_group_id, created_at, updated_at)
+		batch.Query(`INSERT INTO groups (org_id, group_id, name, creator_id, is_department, parent_group_id, created_at, updated_at)
 			VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-			orgID, groupID, req.Name, userID, true, parentGroupID, now, now,
-		).Exec()
+			orgID, groupID, req.Name, userID, true, parentGroupID, now, now)
 	} else {
-		insertErr = h.db.Session().Query(`INSERT INTO groups (org_id, group_id, name, creator_id, is_department, created_at, updated_at)
+		batch.Query(`INSERT INTO groups (org_id, group_id, name, creator_id, is_department, created_at, updated_at)
 			VALUES (?, ?, ?, ?, ?, ?, ?)`,
-			orgID, groupID, req.Name, userID, true, now, now,
-		).Exec()
+			orgID, groupID, req.Name, userID, true, now, now)
 	}
-	if insertErr != nil {
-		slog.Error("failed to create department", "error", insertErr)
+	batch.Query(`INSERT INTO groups_by_id (group_id, org_id, name) VALUES (?, ?, ?)`,
+		groupID, orgID, req.Name)
+	batch.Query(`INSERT INTO group_members (group_id, user_id, role, added_at) VALUES (?, ?, ?, ?)`,
+		groupID, userID, "owner", now)
+	batch.Query(`INSERT INTO groups_by_member (org_id, user_id, group_id, group_name, role, added_at)
+		VALUES (?, ?, ?, ?, ?, ?)`,
+		orgID, userID, groupID, req.Name, "owner", now)
+	if err := batch.Exec(); err != nil {
+		slog.Error("failed to create department", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create department"})
 		return
 	}
-
-	// Add to groups_by_id lookup
-	h.db.Session().Query(`
-		INSERT INTO groups_by_id (group_id, org_id, name) VALUES (?, ?, ?)
-	`, groupID, orgID, req.Name).Exec()
-
-	// Add creator as owner in group_members + groups_by_member (dual write)
-	h.db.Session().Query(`
-		INSERT INTO group_members (group_id, user_id, role, added_at) VALUES (?, ?, ?, ?)
-	`, groupID, userID, "owner", now).Exec()
-
-	h.db.Session().Query(`
-		INSERT INTO groups_by_member (org_id, user_id, group_id, group_name, role, added_at)
-		VALUES (?, ?, ?, ?, ?, ?)
-	`, orgID, userID, groupID, req.Name, "owner", now).Exec()
 
 	c.JSON(http.StatusCreated, DepartmentResponse{
 		ID:            groupID,
@@ -312,10 +306,11 @@ func (h *DepartmentHandler) UpdateDepartment(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"id": groupID, "name": req.Name})
 }
 
-// DeleteDepartment deletes a department and removes all members (admin only).
+// DeleteDepartment deletes a department, removes all members, and cleans up shares (admin only).
 // DELETE /api/v2.1/admin/address-book/groups/:group_id/
 func (h *DepartmentHandler) DeleteDepartment(c *gin.Context) {
 	orgID := c.GetString("org_id")
+	callerUserID := c.GetString("user_id")
 	groupID := c.Param("group_id")
 
 	if _, err := uuid.Parse(groupID); err != nil {
@@ -336,22 +331,57 @@ func (h *DepartmentHandler) DeleteDepartment(c *gin.Context) {
 		return
 	}
 
-	// Remove all group_members entries and groups_by_member entries
+	// Get department name for audit log
+	var deptName string
+	h.db.Session().Query(`SELECT name FROM groups WHERE org_id = ? AND group_id = ?`,
+		orgID, groupID).Scan(&deptName)
+
+	// Collect members before deletion (for groups_by_member cleanup)
 	memIter := h.db.Session().Query(`SELECT user_id FROM group_members WHERE group_id = ?`, groupID).Iter()
 	var memberID string
+	var memberIDs []string
 	for memIter.Scan(&memberID) {
-		h.db.Session().Query(`DELETE FROM groups_by_member WHERE org_id = ? AND user_id = ? AND group_id = ?`,
-			orgID, memberID, groupID).Exec()
+		memberIDs = append(memberIDs, memberID)
 	}
 	memIter.Close()
 
-	// Delete all members
-	h.db.Session().Query(`DELETE FROM group_members WHERE group_id = ?`, groupID).Exec()
+	// Atomic batch: delete group + groups_by_id + group_members
+	batch := h.db.Session().Batch(gocql.LoggedBatch)
+	batch.Query(`DELETE FROM groups WHERE org_id = ? AND group_id = ?`, orgID, groupID)
+	batch.Query(`DELETE FROM groups_by_id WHERE group_id = ?`, groupID)
+	batch.Query(`DELETE FROM group_members WHERE group_id = ?`, groupID)
+	if err := batch.Exec(); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete department"})
+		return
+	}
 
-	// Delete the group itself
-	h.db.Session().Query(`DELETE FROM groups WHERE org_id = ? AND group_id = ?`, orgID, groupID).Exec()
-	h.db.Session().Query(`DELETE FROM groups_by_id WHERE group_id = ?`, groupID).Exec()
+	// Clean up groups_by_member lookup (different partitions, unlogged batch)
+	for i := 0; i < len(memberIDs); i += 50 {
+		end := i + 50
+		if end > len(memberIDs) {
+			end = len(memberIDs)
+		}
+		memberBatch := h.db.Session().Batch(gocql.UnloggedBatch)
+		for _, uid := range memberIDs[i:end] {
+			memberBatch.Query(`DELETE FROM groups_by_member WHERE org_id = ? AND user_id = ? AND group_id = ?`,
+				orgID, uid, groupID)
+		}
+		memberBatch.Exec()
+	}
 
+	// Clean up shares where shared_to = this department (async, best-effort)
+	groupUUID, _ := uuid.Parse(groupID)
+	go cleanupGroupSharesAsync(h.db, groupUUID)
+
+	// Audit log
+	orgUUID, _ := uuid.Parse(orgID)
+	h.db.Session().Query(`
+		INSERT INTO audit_log (org_id, timestamp, action, target_type, target_id, actor_id, details)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+	`, orgUUID.String(), time.Now(), "delete_department", "department", groupID, callerUserID,
+		fmt.Sprintf(`{"name":"%s","members_count":%d}`, deptName, len(memberIDs))).Exec()
+
+	log.Printf("[Department] Deleted department %s (%s) with %d members", groupID, deptName, len(memberIDs))
 	c.JSON(http.StatusOK, gin.H{"success": true})
 }
 

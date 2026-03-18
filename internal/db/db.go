@@ -137,6 +137,7 @@ func (db *DB) Migrate() error {
 		migrationCreateBlockIDMappingsByInternal,
 		migrationCreateGCProcessedItems,
 		migrationCreateDeletedLibraries,
+		migrationCreateAuditLog,
 	}
 
 	for _, migration := range migrations {
@@ -788,3 +789,19 @@ CREATE TABLE IF NOT EXISTS deleted_libraries (
 	org_id UUID,
 	deleted_at TIMESTAMP
 ) WITH default_time_to_live = 7776000`
+
+// Audit log — tracks deletion events for compliance and traceability.
+// Partitioned by org_id, clustered by timestamp DESC for efficient recent-first queries.
+// 365-day TTL keeps the table from growing unboundedly.
+const migrationCreateAuditLog = `
+CREATE TABLE IF NOT EXISTS audit_log (
+	org_id UUID,
+	timestamp TIMESTAMP,
+	action TEXT,
+	target_type TEXT,
+	target_id TEXT,
+	actor_id TEXT,
+	details TEXT,
+	PRIMARY KEY ((org_id), timestamp, action, target_id)
+) WITH CLUSTERING ORDER BY (timestamp DESC, action ASC, target_id ASC)
+  AND default_time_to_live = 31536000`

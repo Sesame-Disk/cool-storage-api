@@ -45,6 +45,7 @@ func (s *Scanner) ScanOnce(ctx context.Context) error {
 		{"auto_delete", s.scanAutoDeleteExpiredObjects},
 		{"expired_shares", s.scanExpiredShares},
 		{"expired_restore_jobs", s.scanExpiredRestoreJobs},
+		{"orphaned_group_shares", s.scanOrphanedGroupShares},
 	}
 
 	for _, phase := range phases {
@@ -507,6 +508,54 @@ func (s *Scanner) scanExpiredRestoreJobs(ctx context.Context) (int, error) {
 	metrics.GCItemsEnqueuedTotal.WithLabelValues("expired_restore_jobs").Add(float64(enqueued))
 	metrics.GCScannerLastPhaseRun.WithLabelValues("expired_restore_jobs").SetToCurrentTime()
 	return enqueued, nil
+}
+
+// scanOrphanedGroupShares finds shares where shared_to is a group that no longer exists.
+func (s *Scanner) scanOrphanedGroupShares(ctx context.Context) (int, error) {
+	log.Println("[GC Scanner] Phase 9: Scanning for orphaned group shares...")
+
+	groupShares, err := s.store.ListAllGroupShares()
+	if err != nil {
+		return 0, err
+	}
+
+	// Cache group existence checks to avoid repeated lookups
+	groupExistsCache := make(map[uuid.UUID]bool)
+
+	cleaned := 0
+	for _, gs := range groupShares {
+		select {
+		case <-ctx.Done():
+			return cleaned, ctx.Err()
+		default:
+		}
+
+		// Check if group still exists (with cache)
+		exists, cached := groupExistsCache[gs.SharedTo]
+		if !cached {
+			// We need the org_id to check group existence.
+			// Try to find it via the library's org.
+			orgID, err := s.store.FindOrgForLibrary(gs.LibraryID)
+			if err != nil || orgID == uuid.Nil {
+				continue
+			}
+			exists, _ = s.store.GroupExists(orgID, gs.SharedTo)
+			groupExistsCache[gs.SharedTo] = exists
+		}
+
+		if !exists {
+			// Group deleted — clean up the orphaned share
+			if err := s.store.DeleteShare(gs.LibraryID, gs.ShareID); err == nil {
+				s.store.DeleteShareByUser(gs.SharedTo, gs.LibraryID)
+				cleaned++
+			}
+		}
+	}
+
+	log.Printf("[GC Scanner] Phase 9 complete: cleaned %d orphaned group shares", cleaned)
+	metrics.GCItemsEnqueuedTotal.WithLabelValues("orphaned_group_shares").Add(float64(cleaned))
+	metrics.GCScannerLastPhaseRun.WithLabelValues("orphaned_group_shares").SetToCurrentTime()
+	return cleaned, nil
 }
 
 // walkFSTree iteratively walks a filesystem tree starting from fsID,

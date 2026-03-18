@@ -68,6 +68,8 @@ type Service struct {
 	started bool
 	mu      sync.Mutex
 
+	consecutiveErrors int
+
 	// Channels for manual triggers
 	triggerWorker  chan struct{}
 	triggerScanner chan struct{}
@@ -224,18 +226,33 @@ func (s *Service) runWorkerLoop(ctx context.Context) {
 }
 
 func (s *Service) runWorkerOnce(ctx context.Context) {
+	queueBefore, _ := s.queue.GetTotalQueueSize()
+
 	start := time.Now()
 	n, err := s.worker.ProcessOnce(ctx)
 	metrics.GCWorkerDuration.Observe(time.Since(start).Seconds())
-	if err != nil {
-		log.Printf("[GC Worker] Error: %v", err)
-	}
+
 	now := time.Now()
 	s.stats.SetLastWorkerRun(now)
 	metrics.GCLastWorkerRun.Set(float64(now.Unix()))
-	if queueSize, qErr := s.queue.GetTotalQueueSize(); qErr == nil {
-		metrics.GCQueueSize.Set(float64(queueSize))
+
+	if err != nil {
+		log.Printf("[GC Worker] Error: %v", err)
+		s.consecutiveErrors++
+		metrics.GCWorkerConsecutiveErrors.Set(float64(s.consecutiveErrors))
+	} else {
+		s.consecutiveErrors = 0
+		metrics.GCWorkerConsecutiveErrors.Set(0)
+		if n > 0 {
+			metrics.GCWorkerLastSuccessTimestamp.Set(float64(now.Unix()))
+		}
 	}
+
+	if queueAfter, qErr := s.queue.GetTotalQueueSize(); qErr == nil {
+		metrics.GCQueueSize.Set(float64(queueAfter))
+		metrics.GCQueueGrowthRate.Set(float64(queueAfter - queueBefore))
+	}
+
 	if n > 0 {
 		log.Printf("[GC Worker] Processed %d items", n)
 	}

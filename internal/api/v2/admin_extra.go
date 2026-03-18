@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/Sesame-Disk/sesamefs/internal/middleware"
+	gocql "github.com/apache/cassandra-gocql-driver/v2"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 )
@@ -1752,7 +1753,7 @@ func (h *AdminHandler) AdminUpdateAddressBookGroup(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"success": true})
 }
 
-// AdminDeleteAddressBookGroup deletes a department group and its members.
+// AdminDeleteAddressBookGroup deletes a department group, its members, and related shares.
 // DELETE /admin/address-book/groups/:group_id/
 func (h *AdminHandler) AdminDeleteAddressBookGroup(c *gin.Context) {
 	callerOrgID := c.GetString("org_id")
@@ -1763,29 +1764,60 @@ func (h *AdminHandler) AdminDeleteAddressBookGroup(c *gin.Context) {
 
 	groupID := c.Param("group_id")
 
+	var groupName string
 	if err := h.db.Session().Query(`
 		SELECT name FROM groups WHERE org_id = ? AND group_id = ?
-	`, callerOrgID, groupID).Scan(new(string)); err != nil {
+	`, callerOrgID, groupID).Scan(&groupName); err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "group not found"})
 		return
 	}
 
-	// Delete group members from lookup table
+	// Collect members before deletion (for groups_by_member cleanup)
 	memIter := h.db.Session().Query(`
 		SELECT user_id FROM group_members WHERE group_id = ?
 	`, groupID).Iter()
 	var memberID string
+	var memberIDs []string
 	for memIter.Scan(&memberID) {
-		h.db.Session().Query(`
-			DELETE FROM groups_by_member WHERE org_id = ? AND user_id = ? AND group_id = ?
-		`, callerOrgID, memberID, groupID).Exec()
+		memberIDs = append(memberIDs, memberID)
 	}
 	memIter.Close()
 
-	h.db.Session().Query(`DELETE FROM group_members WHERE group_id = ?`, groupID).Exec()
-	h.db.Session().Query(`DELETE FROM groups WHERE org_id = ? AND group_id = ?`,
-		callerOrgID, groupID).Exec()
-	h.db.Session().Query(`DELETE FROM groups_by_id WHERE group_id = ?`, groupID).Exec()
+	// Atomic batch: delete group + groups_by_id + group_members
+	batch := h.db.Session().Batch(gocql.LoggedBatch)
+	batch.Query(`DELETE FROM groups WHERE org_id = ? AND group_id = ?`, callerOrgID, groupID)
+	batch.Query(`DELETE FROM groups_by_id WHERE group_id = ?`, groupID)
+	batch.Query(`DELETE FROM group_members WHERE group_id = ?`, groupID)
+	if err := batch.Exec(); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete group"})
+		return
+	}
+
+	// Clean up groups_by_member lookup (different partitions, unlogged batch)
+	for i := 0; i < len(memberIDs); i += 50 {
+		end := i + 50
+		if end > len(memberIDs) {
+			end = len(memberIDs)
+		}
+		memberBatch := h.db.Session().Batch(gocql.UnloggedBatch)
+		for _, uid := range memberIDs[i:end] {
+			memberBatch.Query(`DELETE FROM groups_by_member WHERE org_id = ? AND user_id = ? AND group_id = ?`,
+				callerOrgID, uid, groupID)
+		}
+		memberBatch.Exec()
+	}
+
+	// Clean up shares where shared_to = this group (async, best-effort)
+	groupUUID, _ := uuid.Parse(groupID)
+	go cleanupGroupSharesAsync(h.db, groupUUID)
+
+	// Audit log
+	orgUUID, _ := uuid.Parse(callerOrgID)
+	h.db.Session().Query(`
+		INSERT INTO audit_log (org_id, timestamp, action, target_type, target_id, actor_id, details)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+	`, orgUUID.String(), time.Now(), "delete_address_book_group", "group", groupID, callerUserID,
+		fmt.Sprintf(`{"group_name":"%s","members_count":%d}`, groupName, len(memberIDs))).Exec()
 
 	c.JSON(http.StatusOK, gin.H{"success": true})
 }

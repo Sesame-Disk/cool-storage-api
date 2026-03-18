@@ -977,6 +977,31 @@ func (m *MockStore) DeleteShareLinksByLibrary(orgID, libraryID uuid.UUID) ([]str
 	return nil, nil
 }
 
+// --- New cleanup methods ---
+
+func (m *MockStore) DeleteStarredFilesByLibrary(libraryID uuid.UUID) error { return nil }
+func (m *MockStore) DeleteMonitoredReposByLibrary(libraryID uuid.UUID) error { return nil }
+func (m *MockStore) DeleteRestoreJobsByLibrary(orgID, libraryID uuid.UUID) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	prefix := fmt.Sprintf("%s:%s:", orgID, libraryID)
+	for key := range m.restoreJobs {
+		if len(key) >= len(prefix) && key[:len(prefix)] == prefix {
+			delete(m.restoreJobs, key)
+		}
+	}
+	return nil
+}
+func (m *MockStore) DeleteRepoTagCounters(libraryID uuid.UUID) error    { return nil }
+func (m *MockStore) DeleteFileTagCounters(libraryID uuid.UUID) error    { return nil }
+func (m *MockStore) DeleteRepoTagFileCounts(libraryID uuid.UUID) error  { return nil }
+func (m *MockStore) ListSharesByGroup(groupID uuid.UUID) ([]GroupShareInfo, error) {
+	return nil, nil
+}
+func (m *MockStore) ListAllGroupShares() ([]GroupShareInfo, error) { return nil, nil }
+func (m *MockStore) GroupExists(orgID, groupID uuid.UUID) (bool, error) { return false, nil }
+func (m *MockStore) WriteAuditLog(entry AuditLogEntry) error            { return nil }
+
 // --- GC stats persistence ---
 
 func (m *MockStore) SaveGCStats(key, value string) error {

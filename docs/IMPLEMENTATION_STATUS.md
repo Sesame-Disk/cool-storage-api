@@ -70,19 +70,19 @@
 | **Search** | ✅ COMPLETE | Mostly stable | ❌ No | 2026-01-22 | Cassandra SASI implementation |
 | **OIDC Authentication** | ✅ COMPLETE | Mostly stable | ❌ No | 2026-01-28 | Phase 1 complete - SSO login working |
 | **OIDC Group/Dept Sync** | ✅ COMPLETE | Mostly stable | ❌ No | 2026-02-02 | Claims extraction, sync on login, full sync mode |
-| **Garbage Collection** | ✅ COMPLETE | Mostly stable | ❌ No | 2026-03-17 | Major overhaul: 7 item types, 8 scanner phases, cascade deletion, artifact cleanup, stats persistence, reverse lookup table, iterative tree walk |
+| **Garbage Collection** | ✅ COMPLETE | Mostly stable | ❌ No | 2026-03-18 | 7 item types, 9 scanner phases (incl. orphaned group shares), full artifact cleanup (starred, monitored, counters, restore jobs), atomic group deletion, audit log, health metrics |
 | **Admin Panel (Groups/Users)** | ✅ COMPLETE | Mostly stable | ❌ No | 2026-02-02 | 16 admin endpoints + OIDC group/dept sync, 29 tests |
 | **Admin Library Management** | ✅ COMPLETE | Mostly stable | ❌ No | 2026-02-12 | 12 endpoints in admin.go + seafile-api.js methods + trash libraries |
 | **Admin Link Management** | ✅ COMPLETE | Mostly stable | ❌ No | 2026-02-12 | 13 endpoints: share link admin (list/delete), upload links (user CRUD + admin), per-user links. See [ADMIN-FEATURES.md](ADMIN-FEATURES.md) § 2 |
 | **Superadmin Departments/Address Book** | ✅ COMPLETE | Mostly stable | ❌ No | 2026-03-05 | 9 endpoints: dept CRUD, address book groups, group-owned libraries. See [ADMIN-FEATURES.md](ADMIN-FEATURES.md) § 4 |
 | **Org Admin Panel** | ✅ COMPLETE | Mostly stable | ❌ No | 2026-03-05 | 50+ endpoints in org_admin.go. Users, groups, repos, trash, departments, links. See [ADMIN-FEATURES.md](ADMIN-FEATURES.md) § 5 |
-| **Audit Logs** | 🟡 PARTIAL | **UNSTABLE** | ❌ No | 2026-02-02 | Console stub only. See [ADMIN-FEATURES.md](ADMIN-FEATURES.md) § 3 |
+| **Audit Logs** | 🟡 PARTIAL | Mostly stable | ❌ No | 2026-03-18 | `audit_log` table with 365-day TTL for deletion events (GC, groups, departments). Console stubs remain for login/file-access logs. See [ADMIN-FEATURES.md](ADMIN-FEATURES.md) § 3 |
 | **File/Folder Trash** | ✅ COMPLETE | Mostly stable | ❌ No | 2026-03-11 | List, restore, clean trash + browse deleted folders. Enhanced: filters out children of deleted directories (2026-03-11) |
 | **Library Recycle Bin** | ✅ COMPLETE | Mostly stable | ❌ No | 2026-02-05 | Soft-delete, restore, permanent delete. User + admin endpoints |
 | **File Expiry Countdown** | ✅ COMPLETE | Mostly stable | ❌ No | 2026-02-05 | `expires_at` in directory listing for auto-delete libraries |
 | **Admin Library Management** | ✅ COMPLETE | Mostly stable | ❌ No | 2026-02-12 | 12 endpoints in admin.go + seafile-api.js methods + trash libraries |
 | **Admin Link Management** | ✅ COMPLETE | Mostly stable | ❌ No | 2026-02-12 | 13 endpoints: share link admin (list/delete), upload links (user CRUD + admin), per-user links. See [ADMIN-FEATURES.md](ADMIN-FEATURES.md) § 2 |
-| **Audit Logs** | 🟡 PARTIAL | **UNSTABLE** | ❌ No | 2026-02-02 | Console stub only. See [ADMIN-FEATURES.md](ADMIN-FEATURES.md) § 3 |
+| **Audit Logs** | 🟡 PARTIAL | Mostly stable | ❌ No | 2026-03-18 | `audit_log` table with 365-day TTL for deletion events (GC, groups, departments). Console stubs remain for login/file-access logs. See [ADMIN-FEATURES.md](ADMIN-FEATURES.md) § 3 |
 | **Version History UI** | ✅ COMPLETE | Mostly stable | ❌ No | 2026-02-26 | Detail sidebar History tab + full-page view + revert conflict dialog (Replace/Keep Both/Cancel) + View action + proper user name resolution. 17 integration tests. |
 | **File Preview & Raw Serving** | ✅ COMPLETE | Mostly stable | ❌ No | 2026-02-12 | Inline preview for PDF/images/video/audio/text, OnlyOffice for docs. Auth token handling fixed for search results. 14 unit + 28 integration tests. |
 | **Monitoring/Health Checks** | 🔒 FROZEN | **STABLE** | ❌ No | 2026-02-04 | Structured logging, `/health`, `/ready`, `/metrics`. 5 unit + 21 integration tests. |

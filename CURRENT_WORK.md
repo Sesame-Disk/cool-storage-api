@@ -17,7 +17,7 @@
 
 **🔴 PRODUCTION BLOCKERS** (Must complete before deploy):
 1. ~~**OIDC Authentication**~~ - ✅ **COMPLETE** (Phase 1 - Basic Login)
-2. ~~**Garbage Collection**~~ - ✅ **COMPLETE** (Queue worker + safety scanner + admin API)
+2. ~~**Garbage Collection**~~ - ✅ **COMPLETE** (Queue worker + 9-phase scanner + admin API + audit log + health metrics)
 3. ~~**Monitoring/Health Checks**~~ - ✅ **COMPLETE** (Structured logging, `/health`, `/ready`, `/metrics`)
 
 **Then review**:

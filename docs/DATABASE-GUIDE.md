@@ -1019,6 +1019,30 @@ database:
 
 ---
 
+## Audit Log Table
+
+```sql
+CREATE TABLE IF NOT EXISTS audit_log (
+    org_id UUID,
+    timestamp TIMESTAMP,
+    action TEXT,         -- e.g. "delete_group", "gc_library_artifacts_cleaned", "delete_department"
+    target_type TEXT,    -- e.g. "group", "library", "department"
+    target_id TEXT,
+    actor_id TEXT,       -- user_id or "gc_worker"/"gc_scanner"
+    details TEXT,        -- JSON with extra context
+    PRIMARY KEY ((org_id), timestamp, action, target_id)
+) WITH CLUSTERING ORDER BY (timestamp DESC, action ASC, target_id ASC)
+  AND default_time_to_live = 31536000  -- 365 days
+```
+
+**Purpose**: Tracks deletion events for compliance and traceability. Written by GC worker (library cleanup), group/department deletion handlers, and scanner phases.
+
+**Query patterns**:
+- Recent events for an org: `SELECT * FROM audit_log WHERE org_id = ? LIMIT 100`
+- Events by action: `SELECT * FROM audit_log WHERE org_id = ? AND timestamp > ? AND action = ? ALLOW FILTERING`
+
+---
+
 ## References
 
 - [Cassandra Lightweight Transactions](https://docs.datastax.com/en/cql-oss/3.x/cql/cql_using/useInsertLWT.html)

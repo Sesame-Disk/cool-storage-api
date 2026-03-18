@@ -449,9 +449,9 @@ Drains the `gc_queue` table. Each item has a type; the worker dispatches accordi
 
 **Cascading**: Commit → fs_object → blocks. The worker only enqueues commits and fs_objects when a library is deleted; blocks are discovered and enqueued during fs_object processing.
 
-**Library deletion** also enqueues artifact cleanup: shares, share links, repo tags, file tags, API tokens, locked files.
+**Library deletion** also enqueues artifact cleanup: shares, share links, repo tags, file tags, API tokens, locked files, starred files, monitored repos, restore jobs, and tag counters.
 
-#### GC Scanner (8 phases, runs every 24h + on startup)
+#### GC Scanner (9 phases, runs every 24h + on startup)
 
 | Phase | What it scans | Action |
 |-------|--------------|--------|
@@ -463,16 +463,20 @@ Drains the `gc_queue` table. Each item has a type; the worker dispatches accordi
 | 6 | Auto-delete expired objects (`auto_delete_days`) | Enqueue old fs_objects |
 | 7 | Expired user-to-user shares | Delete directly |
 | 8 | Expired/completed restore jobs | Delete directly |
+| 9 | Orphaned group shares (group deleted but shares remain) | Delete directly |
 
 **Stats persistence**: Worker/scanner timestamps and `blocks_deleted_total` are saved to `gc_stats` table on shutdown and restored on startup, surviving container restarts.
+
+**Audit logging**: Deletion events (library artifacts cleaned, blocks deleted, groups deleted) are written to the `audit_log` table (365-day TTL, partitioned by `org_id`).
 
 **Safety measures**:
 - Never delete HEAD commit or its ancestors within TTL
 - Grace period: items wait 1h in queue before processing
 - `gc_queue` has 7-day Cassandra TTL for stuck items
 - Dry-run mode for testing (toggle at runtime via admin API)
-- Prometheus metrics: `gc_worker_duration`, `gc_scanner_duration`, `gc_queue_size`, `gc_blocks_deleted_total`
+- Prometheus metrics: `gc_worker_duration`, `gc_scanner_duration`, `gc_queue_size`, `gc_blocks_deleted_total`, `gc_worker_consecutive_errors`, `gc_queue_growth_rate`, `gc_worker_last_success_timestamp_seconds`
 - Scanner runs immediately on startup to catch anything missed during downtime
+- Health alerting: `gc_worker_consecutive_errors` tracks sequential failures (alert if > 5), `gc_queue_growth_rate` tracks net queue growth (positive = queue growing faster than worker can drain)
 
 #### Reference Counting
 

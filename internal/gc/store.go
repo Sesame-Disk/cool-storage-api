@@ -86,6 +86,28 @@ type GCStore interface {
 	DeleteLockedFilesByLibrary(libraryID uuid.UUID) error
 	DeleteShareLinksByLibrary(orgID, libraryID uuid.UUID) ([]string, error)
 
+	// Starred files and monitored repos cleanup
+	DeleteStarredFilesByLibrary(libraryID uuid.UUID) error
+	DeleteMonitoredReposByLibrary(libraryID uuid.UUID) error
+
+	// Restore jobs cleanup by library
+	DeleteRestoreJobsByLibrary(orgID, libraryID uuid.UUID) error
+
+	// Tag counter cleanup
+	DeleteRepoTagCounters(libraryID uuid.UUID) error
+	DeleteFileTagCounters(libraryID uuid.UUID) error
+	DeleteRepoTagFileCounts(libraryID uuid.UUID) error
+
+	// Group shares cleanup (shares where shared_to is a group)
+	ListSharesByGroup(groupID uuid.UUID) ([]GroupShareInfo, error)
+
+	// Scanner: orphaned group shares
+	ListAllGroupShares() ([]GroupShareInfo, error)
+	GroupExists(orgID, groupID uuid.UUID) (bool, error)
+
+	// Audit log
+	WriteAuditLog(entry AuditLogEntry) error
+
 	// GC stats persistence
 	SaveGCStats(key, value string) error
 	LoadGCStats(key string) (string, error)
@@ -192,6 +214,26 @@ type RepoAPITokenInfo struct {
 	RepoID   uuid.UUID
 	AppName  string
 	APIToken string
+}
+
+// GroupShareInfo holds data about a share where shared_to is a group.
+type GroupShareInfo struct {
+	LibraryID    uuid.UUID
+	ShareID      uuid.UUID
+	SharedTo     uuid.UUID // group_id
+	SharedToType string    // "group"
+	OrgID        uuid.UUID // needed for scanner lookups
+}
+
+// AuditLogEntry records a deletion event for compliance/traceability.
+type AuditLogEntry struct {
+	OrgID      uuid.UUID
+	Action     string // e.g. "delete_library", "delete_group", "gc_block_deleted"
+	TargetType string // e.g. "library", "group", "block", "user"
+	TargetID   string
+	ActorID    string // user who triggered it, or "gc_worker"/"gc_scanner"
+	Details    string // JSON or free-text with extra context
+	Timestamp  time.Time
 }
 
 // BlockStoreDeleter is a minimal interface for S3 block deletion.

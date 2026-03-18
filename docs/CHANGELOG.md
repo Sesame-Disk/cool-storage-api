@@ -8,6 +8,60 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-03-18 — GC Completeness, Group Deletion Cascade, Audit Log, Health Metrics
+
+**Session Type**: Feature + Hardening (pre-production)
+**Worked By**: Claude
+
+### GC Worker — Complete Library Artifact Cleanup
+
+- `enqueueLibraryArtifacts` now cleans **all** auxiliary tables: added `starred_files`, `monitored_repos`, `restore_jobs`, `repo_tag_counters`, `file_tag_counters`, `repo_tag_file_counts`
+- 6 new GCStore methods: `DeleteStarredFilesByLibrary`, `DeleteMonitoredReposByLibrary`, `DeleteRestoreJobsByLibrary`, `DeleteRepoTagCounters`, `DeleteFileTagCounters`, `DeleteRepoTagFileCounts`
+
+### GC Scanner — Phase 9: Orphaned Group Shares
+
+- **Phase 9** (new): `scanOrphanedGroupShares` — finds shares where `shared_to` is a group that no longer exists
+- 3 new GCStore methods: `ListAllGroupShares`, `GroupExists`, `ListSharesByGroup`
+
+### Group/Department Deletion — Atomic + Cascade
+
+- All 4 delete handlers (`DeleteGroup`, `AdminDeleteGroup`, `AdminDeleteAddressBookGroup`, `DeleteDepartment`) now:
+  - Use `LoggedBatch` for atomic deletion of `groups` + `groups_by_id` + `group_members`
+  - Use `UnloggedBatch` (chunks of 50) for `groups_by_member` cleanup
+  - Clean up library shares targeting the deleted group (async, best-effort via `cleanupGroupSharesAsync`)
+- All 2 create handlers (`CreateGroup`, `CreateDepartment`) now use `LoggedBatch` for atomic creation
+
+### Audit Log
+
+- New `audit_log` Cassandra table: partitioned by `org_id`, clustered by `timestamp DESC`, 365-day TTL
+- Written on: group deletion, department deletion, GC library artifact cleanup
+- `AuditLogEntry` type + `WriteAuditLog` store method
+
+### GC Health Metrics
+
+- `gc_worker_consecutive_errors` — tracks sequential failures (alert threshold: > 5)
+- `gc_queue_growth_rate` — net queue delta per worker pass (positive = growing)
+- `gc_worker_last_success_timestamp_seconds` — staleness detection (alert if > 1h old)
+- `gc_audit_events_total` — counter by action type
+
+### Files Changed
+
+- `internal/gc/worker.go` — expanded `enqueueLibraryArtifacts`, audit logging
+- `internal/gc/scanner.go` — Phase 9
+- `internal/gc/store.go` — 12 new interface methods + new types
+- `internal/gc/store_cassandra.go` — 12 new implementations
+- `internal/gc/store_mock.go` — 12 new mock methods
+- `internal/gc/gc.go` — health metrics integration, `consecutiveErrors` field
+- `internal/api/v2/groups.go` — atomic create/delete, shares cleanup
+- `internal/api/v2/admin.go` — atomic AdminDeleteGroup, audit log
+- `internal/api/v2/admin_extra.go` — atomic AdminDeleteAddressBookGroup, audit log
+- `internal/api/v2/departments.go` — atomic create/delete, shares cleanup, audit log
+- `internal/metrics/metrics.go` — 4 new Prometheus metrics
+- `internal/db/db.go` — `audit_log` table migration
+- `docs/ARCHITECTURE.md`, `docs/TECHNICAL-DEBT.md`, `docs/IMPLEMENTATION_STATUS.md`, `docs/CHANGELOG.md`
+
+---
+
 ## 2026-03-17 — Garbage Collection Major Overhaul
 
 **Session Type**: Optimization + Feature

@@ -124,6 +124,40 @@ var (
 			Help: "Current number of active user sessions.",
 		},
 	)
+
+	// GCWorkerConsecutiveErrors tracks consecutive worker errors for alerting.
+	// Reset to 0 on successful pass, incremented on failure.
+	GCWorkerConsecutiveErrors = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "gc_worker_consecutive_errors",
+			Help: "Number of consecutive GC worker errors (reset on success). Alert if > 5.",
+		},
+	)
+
+	// GCQueueGrowthRate tracks how fast the queue is growing (items enqueued minus processed per interval).
+	GCQueueGrowthRate = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "gc_queue_growth_rate",
+			Help: "Net queue growth per worker interval (positive = growing, negative = draining).",
+		},
+	)
+
+	// GCWorkerLastSuccessTimestamp records when the worker last successfully processed items.
+	GCWorkerLastSuccessTimestamp = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "gc_worker_last_success_timestamp_seconds",
+			Help: "Unix timestamp of last successful GC worker pass with items processed. Alert if stale > 1h.",
+		},
+	)
+
+	// GCAuditEventsTotal counts audit log entries written.
+	GCAuditEventsTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "gc_audit_events_total",
+			Help: "Total number of audit log entries written by GC system.",
+		},
+		[]string{"action"},
+	)
 )
 
 // Register registers all custom metrics with the default Prometheus registry.
@@ -143,5 +177,9 @@ func Register() {
 		GCWorkerDuration,
 		GCScannerDuration,
 		ActiveSessions,
+		GCWorkerConsecutiveErrors,
+		GCQueueGrowthRate,
+		GCWorkerLastSuccessTimestamp,
+		GCAuditEventsTotal,
 	)
 }
