@@ -1,7 +1,7 @@
 # Current Work - SesameFS
 
-**Last Updated**: 2026-03-12
-**Session**: Session 56 — Share Dialog Documentation + SHARE_LINK_HMAC_KEY
+**Last Updated**: 2026-03-18
+**Session**: Session 57 — Production Readiness Phases 3-5 (Library Trash, Org Deletion, Bulk Optimization)
 
 **📏 File Size Rule**: Keep this file under **500 lines** unless unavoidable. Move detailed content to:
 - `docs/KNOWN_ISSUES.md` - Detailed bug tracking
@@ -17,7 +17,7 @@
 
 **🔴 PRODUCTION BLOCKERS** (Must complete before deploy):
 1. ~~**OIDC Authentication**~~ - ✅ **COMPLETE** (Phase 1 - Basic Login)
-2. ~~**Garbage Collection**~~ - ✅ **COMPLETE** (Queue worker + 9-phase scanner + admin API + audit log + health metrics)
+2. ~~**Garbage Collection**~~ - ✅ **COMPLETE** (Queue worker + 12-phase scanner + 3 cascade types + admin API + audit log + health metrics)
 3. ~~**Monitoring/Health Checks**~~ - ✅ **COMPLETE** (Structured logging, `/health`, `/ready`, `/metrics`)
 
 **Then review**:
@@ -45,19 +45,29 @@
 
 ## Last Session Summary ✅
 
-**Date**: 2026-03-12
-**Focus**: Share Dialog Documentation + SHARE_LINK_HMAC_KEY deployment docs
+**Date**: 2026-03-18
+**Focus**: Production Readiness — Soft-Delete Cascades, Org Deletion, Bulk Optimization
 
-### Completed This Session (Session 56)
+### Completed This Session (Session 57)
 
-#### Documentation — Share Dialog & SHARE_LINK_HMAC_KEY ✅
+#### Fase 3: Library Trash Auto-Purge ✅
+- Scanner Phase 11 finds expired deleted libraries past `TrashRetentionDays` (30 days)
+- Worker `processLibraryCascade` enqueues contents + hard-deletes library record
 
-Audited all pending changes and updated documentation across 6 files:
+#### Fase 4: Organization Deletion with Grace Period ✅
+- Three org states: active → deactivated (reversible) → deleted (30-day grace → cascade)
+- Scanner Phase 12: `scanExpiredDeletedOrgs`
+- Worker `processOrgCascade`: libraries → users → groups → hard-delete org
+- New endpoints: `POST .../delete/` (soft-delete), `POST .../restore/`
+- **Frontend TODO**: Superadmin dashboard needs UI for org delete/restore/status (see ISSUE-FRONTEND-ORG-DELETE-01)
 
-**SHARE_LINK_HMAC_KEY** — was implemented in `sharelink_view.go` and `config.go` but completely absent from deployment docs. Now documented in:
-- `.env.prod.example` — new `Share Link Security` section with `openssl rand -hex 32` instructions
-- `.env.example` — dev default with security notes
-- `config.example.yaml` — `auth.share_link_hmac_key` field
+#### Fase 5: BulkAddGroupMembers Optimization ✅
+- New `bulkUpsertGroupMembers()` — UnloggedBatch chunks of 25 members
+- Both `BulkAddGroupMembers` and `ImportGroupMembersViaFile` refactored
+- 100 members: 200 → 4 round-trips
+
+#### Fase 6: Documentation ✅
+- Updated CHANGELOG, KNOWN_ISSUES, IMPLEMENTATION_STATUS, CURRENT_WORK, ARCHITECTURE, ENDPOINT-REGISTRY, ADMIN-FEATURES
 - `config.prod.yaml` — comment pointing to env var
 - `docs/DEPLOY.md` — Step 0.3 (third secret to generate), Step 4 required vars, env-var table
 - `docs/IMPLEMENTATION_STATUS.md` — Sharing System row updated, new Share Dialog UI row

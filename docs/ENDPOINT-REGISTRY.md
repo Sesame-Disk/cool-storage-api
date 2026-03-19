@@ -952,6 +952,28 @@ Before implementing a new endpoint:
 
 ---
 
+## Superadmin — Organization Soft-Delete & Restore (2026-03-18)
+
+### POST /api/v2.1/admin/organizations/:org_id/delete/
+**Handler**: `AdminHandler.SoftDeleteOrganization`
+**File**: `internal/api/v2/admin.go`
+**Registration**: `RegisterAdminRoutes` in admin.go (superadminOnly group)
+**Purpose**: Soft-delete an organization — sets `settings['status'] = 'deleted'` + `deleted_at = NOW()`. After `OrgGraceDays` (default 30), GC cascade permanently deletes all org data (libraries, users, groups).
+**Auth**: Superadmin only. Platform org cannot be deleted.
+**Response**: `{ "success": true }`
+**Added**: 2026-03-18
+
+### POST /api/v2.1/admin/organizations/:org_id/restore/
+**Handler**: `AdminHandler.RestoreOrganization`
+**File**: `internal/api/v2/admin.go`
+**Registration**: `RegisterAdminRoutes` in admin.go (superadminOnly group)
+**Purpose**: Restore a soft-deleted organization within its grace period — sets `settings['status'] = 'active'`, clears `deleted_at`. Returns 400 if org is not in deleted state.
+**Auth**: Superadmin only.
+**Response**: `{ "success": true }`
+**Added**: 2026-03-18
+
+---
+
 ## Superadmin — Departments, Address Book, Group-Owned Libraries (2026-03-05)
 
 ### GET /api/v2.1/admin/organizations/:org_id/departments/

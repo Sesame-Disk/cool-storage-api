@@ -1,6 +1,6 @@
 # Known Issues - SesameFS
 
-**Last Updated**: 2026-03-11
+**Last Updated**: 2026-03-18
 
 This document tracks all known bugs, limitations, and issues in SesameFS.
 
@@ -56,6 +56,13 @@ This document tracks all known bugs, limitations, and issues in SesameFS.
 |-------|--------|---------|
 | **Display fields still hardcoded** | 🟡 Partial fix (2026-02-26) | Library list/detail fixed. File history modifier fixed (2026-02-26) — now resolves user name/email from `users` table. Remaining: file detail, starred files, sync token responses still return `UUID@sesamefs.local`. Safe to fix — display only. See ISSUE-EMAIL-01 below. |
 | **FS object modifier hardcoded** | 🔴 Risky — needs migration analysis | `seafhttp.go` and `onlyoffice.go` write `UUID@sesamefs.local` into stored FS object modifier field, which is part of the `fs_id` hash. Changing breaks hash of existing stored objects. See ISSUE-EMAIL-01 below. |
+
+### 🟡 Frontend Pending — New Backend Features (2026-03-18)
+| Issue | Status | Details |
+|-------|--------|---------|
+| **Superadmin: Org Soft-Delete/Restore UI** | 🟡 Backend ready, frontend TODO | Backend has `POST /admin/organizations/:org_id/delete/` and `POST .../restore/`. Frontend superadmin dashboard needs: "Delete" button (distinct from "Deactivate"), "Restore" button for deleted orgs, status column showing active/deactivated/deleted with grace period countdown. See ISSUE-FRONTEND-ORG-DELETE-01 below. |
+| **Superadmin: Deleted Orgs List/Filter** | 🟡 Backend ready, frontend TODO | `ListOrganizations` should filter/tab by status (active, deactivated, deleted). Currently shows all orgs with no status differentiation. |
+| **Org Admin: Org Deletion Awareness** | 🟡 Backend ready, frontend TODO | Org admin dashboard should show a banner/warning if their org is in "deleted" state with days remaining before permanent cascade. |
 
 ### 🟢 Lower Priority (Polish/UX)
 | Issue | Status | Notes |
@@ -2080,6 +2087,44 @@ The client also sends `replace=1` in both cases, so the form parameter doesn't h
 - `internal/db/tokens.go` — Add CreateUpdateToken, update TokenCreator interface
 - `frontend/src/components/file-uploader/file-uploader.js` — Send `replace=0` in uploadFile()
 - Test files: `seafhttp_test.go`, `fileview_test.go` — Update mocks
+
+---
+
+## ISSUE-FRONTEND-ORG-DELETE-01: Superadmin Org Soft-Delete/Restore UI
+
+**Status**: 🟡 Backend complete, frontend TODO
+**Date identified**: 2026-03-18
+**Priority**: Medium — needed before production if multi-org is used
+
+### Problem
+
+Backend now supports three distinct org states (active, deactivated, deleted) with full cascade deletion after grace period, but the frontend superadmin dashboard has no UI for:
+1. Soft-deleting an org (triggering the 30-day grace period cascade)
+2. Restoring a deleted org within the grace period
+3. Displaying org status with visual differentiation
+4. Filtering orgs by status
+
+### Backend Endpoints (ready)
+
+| Method | Endpoint | Action |
+|--------|----------|--------|
+| DELETE | `/admin/organizations/:org_id/` | Deactivate (sets status='deactivated', reversible, no cascade) |
+| POST | `/admin/organizations/:org_id/delete/` | Soft-delete (sets status='deleted' + deleted_at, starts grace period) |
+| POST | `/admin/organizations/:org_id/restore/` | Restore (sets status='active', clears deleted_at) |
+
+### Frontend Changes Required
+
+**Files to modify:**
+- `frontend/src/pages/sys-admin/orgs/` — Org list and detail pages
+- `frontend/src/utils/seafile-api.js` — Add `sysAdminSoftDeleteOrg(orgID)` and `sysAdminRestoreOrg(orgID)` API functions
+
+**UI requirements:**
+1. Org list: add "Status" column (active/deactivated/deleted) with color coding
+2. Org actions dropdown: separate "Deactivate" (existing) from "Delete" (new) actions
+3. Deleted orgs: show "Restore" button + days remaining before permanent deletion
+4. Confirmation dialog for delete action warning about the 30-day grace period
+5. Optional: filter tabs or dropdown to show All/Active/Deactivated/Deleted orgs
+6. Org admin dashboard: warning banner if org is in "deleted" state
 
 ---
 

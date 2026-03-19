@@ -8,6 +8,62 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-03-18 — Production Readiness: Soft-Delete Cascades, Org Deletion, Bulk Optimization
+
+**Session Type**: Feature (production hardening phases 3-5)
+**Worked By**: Claude
+
+### Fase 3: Library Trash Auto-Purge
+
+Soft-deleted libraries (in `deleted_libraries` table) now auto-purge after `TrashRetentionDays` (default 30 days).
+
+- **Scanner Phase 11**: `scanExpiredDeletedLibraries` — finds libraries past retention period
+- **Worker**: `processLibraryCascade` — enqueues library contents (commits, fs_objects, artifacts) then hard-deletes from `libraries` + `deleted_libraries`
+- New `ItemLibraryCascade` queue item type
+- New GCStore methods: `ListExpiredDeletedLibraries`, `HardDeleteLibrary`
+
+### Fase 4: Organization Deletion with Grace Period
+
+Full org lifecycle: active → deactivated (reversible) → deleted (grace period → cascade).
+
+- **Scanner Phase 12**: `scanExpiredDeletedOrgs` — finds orgs past `OrgGraceDays` (default 30 days)
+- **Worker**: `processOrgCascade` — enqueues all libraries as `ItemLibraryCascade`, cleans up all users (shares, starred, monitored, hard-delete), deletes all groups (`DeleteGroupFull`), hard-deletes org record, audit log
+- New `ItemOrgCascade` queue item type
+- New GCStore methods (7): `ListExpiredDeletedOrgs`, `ListUsersByOrg`, `ListGroupsByOrg`, `ListLibrariesForOrg`, `DeleteGroupFull`, `HardDeleteOrg`, `GetOrgName`
+- New API endpoints (superadmin only):
+  - `POST /admin/organizations/:org_id/delete/` — `SoftDeleteOrganization` (sets `settings['status'] = 'deleted'` + `deleted_at`)
+  - `POST /admin/organizations/:org_id/restore/` — `RestoreOrganization` (sets `settings['status'] = 'active'`, clears `deleted_at`)
+- `DeactivateOrganization` unchanged (only sets `settings['status'] = 'deactivated'`, no cascade)
+- New write helpers: `softDeleteOrg()`, `restoreDeletedOrg()` — DRY pattern matching `softDeleteUser()`/`restoreDeletedUser()`
+
+### Fase 5: BulkAddGroupMembers Optimization
+
+- New `bulkUpsertGroupMembers()` helper — UnloggedBatch in chunks of 25 members (50 statements per batch)
+- Refactored `BulkAddGroupMembers` and `ImportGroupMembersViaFile` from per-member individual inserts to collect-then-batch pattern
+- Performance: 100 members goes from 200 round-trips → 4 round-trips
+
+### Files Changed
+
+- `internal/gc/queue.go` — `ItemLibraryCascade`, `ItemOrgCascade` constants
+- `internal/gc/store.go` — 9 new interface methods, 4 new types
+- `internal/gc/store_cassandra.go` — 9 new Cassandra implementations
+- `internal/gc/store_mock.go` — 9 new stubs
+- `internal/gc/scanner.go` — Phase 11 + Phase 12
+- `internal/gc/worker.go` — `processLibraryCascade`, `processOrgCascade`
+- `internal/api/v2/admin.go` — `SoftDeleteOrganization`, `RestoreOrganization` + routes
+- `internal/api/v2/write_helpers.go` — `softDeleteOrg()`, `restoreDeletedOrg()`
+- `internal/api/v2/group_cleanup.go` — `bulkUpsertGroupMembers()` helper
+- `internal/api/v2/groups.go` — refactored `BulkAddGroupMembers`, `ImportGroupMembersViaFile`
+
+### Frontend Pending
+
+The following new backend features require frontend updates in the superadmin and org admin dashboards:
+- **Org soft-delete/restore**: Add "Delete" and "Restore" buttons to org management UI (separate from existing "Deactivate")
+- **Org status display**: Show org status (active/deactivated/deleted) with grace period countdown for deleted orgs
+- **Deleted orgs list**: Filter/tab for deleted orgs pending permanent removal
+
+---
+
 ## 2026-03-18 — GC Completeness, Group Deletion Cascade, Audit Log, Health Metrics
 
 **Session Type**: Feature + Hardening (pre-production)

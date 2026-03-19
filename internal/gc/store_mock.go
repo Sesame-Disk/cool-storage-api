@@ -1035,6 +1035,24 @@ func (m *MockStore) GetUserEmail(orgID, userID uuid.UUID) (string, error) {
 	return "", nil
 }
 
+// --- Org cascade (Fase 4) ---
+
+func (m *MockStore) ListExpiredDeletedOrgs(graceDays int) ([]DeletedOrgInfo, error) {
+	return nil, nil
+}
+func (m *MockStore) ListUsersByOrg(orgID uuid.UUID) ([]OrgUserInfo, error) {
+	return nil, nil
+}
+func (m *MockStore) ListGroupsByOrg(orgID uuid.UUID) ([]uuid.UUID, error) {
+	return nil, nil
+}
+func (m *MockStore) ListLibrariesForOrg(orgID uuid.UUID) ([]OrgLibraryInfo, error) {
+	return nil, nil
+}
+func (m *MockStore) DeleteGroupFull(orgID, groupID uuid.UUID) error { return nil }
+func (m *MockStore) HardDeleteOrg(orgID uuid.UUID) error            { return nil }
+func (m *MockStore) GetOrgName(orgID uuid.UUID) (string, error)     { return "", nil }
+
 // --- GC stats persistence ---
 
 func (m *MockStore) SaveGCStats(key, value string) error {

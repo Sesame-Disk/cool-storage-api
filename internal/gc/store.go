@@ -125,6 +125,15 @@ type GCStore interface {
 	ListExpiredDeletedLibraries(retentionDays int) ([]DeletedLibraryInfo, error)
 	HardDeleteLibrary(orgID, libraryID uuid.UUID) error
 
+	// Org cascade (soft-deleted orgs past grace period)
+	ListExpiredDeletedOrgs(graceDays int) ([]DeletedOrgInfo, error)
+	ListUsersByOrg(orgID uuid.UUID) ([]OrgUserInfo, error)
+	ListGroupsByOrg(orgID uuid.UUID) ([]uuid.UUID, error)
+	ListLibrariesForOrg(orgID uuid.UUID) ([]OrgLibraryInfo, error)
+	DeleteGroupFull(orgID, groupID uuid.UUID) error
+	HardDeleteOrg(orgID uuid.UUID) error
+	GetOrgName(orgID uuid.UUID) (string, error)
+
 	// GC stats persistence
 	SaveGCStats(key, value string) error
 	LoadGCStats(key string) (string, error)
@@ -256,6 +265,25 @@ type DeletedLibraryInfo struct {
 	LibraryID    uuid.UUID
 	StorageClass string
 	DeletedAt    time.Time
+}
+
+// DeletedOrgInfo holds data about a soft-deleted org for cascade processing.
+type DeletedOrgInfo struct {
+	OrgID     uuid.UUID
+	Name      string
+	DeletedAt time.Time
+}
+
+// OrgUserInfo holds basic user data for org cascade cleanup.
+type OrgUserInfo struct {
+	UserID uuid.UUID
+	Email  string
+}
+
+// OrgLibraryInfo holds basic library data for org cascade cleanup.
+type OrgLibraryInfo struct {
+	LibraryID    uuid.UUID
+	StorageClass string
 }
 
 // ShareByUserInfo holds data about a share received by a user.

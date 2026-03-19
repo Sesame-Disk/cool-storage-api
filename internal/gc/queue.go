@@ -18,6 +18,7 @@ const (
 	ItemShareLink      ItemType = "share_link"
 	ItemUserCascade    ItemType = "user_cascade"
 	ItemLibraryCascade ItemType = "library_cascade"
+	ItemOrgCascade     ItemType = "org_cascade"
 )
 
 // QueueItem represents a single item pending garbage collection

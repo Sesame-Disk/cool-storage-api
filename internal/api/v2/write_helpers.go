@@ -169,6 +169,18 @@ func restoreDeletedUser(db interface{ Session() *gocql.Session }, orgID, userID 
 	`, "user", nil, orgID, userID).Exec()
 }
 
+func softDeleteOrg(db interface{ Session() *gocql.Session }, orgID string, deletedAt time.Time) error {
+	return db.Session().Query(`
+		UPDATE organizations SET settings['status'] = ?, deleted_at = ? WHERE org_id = ?
+	`, "deleted", deletedAt, orgID).Exec()
+}
+
+func restoreDeletedOrg(db interface{ Session() *gocql.Session }, orgID string) error {
+	return db.Session().Query(`
+		UPDATE organizations SET settings['status'] = ?, deleted_at = ? WHERE org_id = ?
+	`, "active", nil, orgID).Exec()
+}
+
 func rollbackNewLibrary(db interface{ Session() *gocql.Session }, orgID, libraryID string) error {
 	batch := db.Session().Batch(gocql.LoggedBatch)
 	batch.Query(`

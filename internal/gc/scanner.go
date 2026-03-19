@@ -51,6 +51,7 @@ func (s *Scanner) ScanOnce(ctx context.Context) error {
 		{"orphaned_group_shares", s.scanOrphanedGroupShares},
 		{"expired_deleted_users", s.scanExpiredDeletedUsers},
 		{"expired_deleted_libraries", s.scanExpiredDeletedLibraries},
+		{"expired_deleted_orgs", s.scanExpiredDeletedOrgs},
 	}
 
 	for _, phase := range phases {
@@ -632,6 +633,41 @@ func (s *Scanner) scanExpiredDeletedLibraries(ctx context.Context) (int, error) 
 	log.Printf("[GC Scanner] Phase 11 complete: enqueued %d expired deleted libraries", enqueued)
 	metrics.GCItemsEnqueuedTotal.WithLabelValues("expired_deleted_libraries").Add(float64(enqueued))
 	metrics.GCScannerLastPhaseRun.WithLabelValues("expired_deleted_libraries").SetToCurrentTime()
+	return enqueued, nil
+}
+
+// scanExpiredDeletedOrgs finds soft-deleted organizations whose grace period
+// has expired and enqueues them for cascade deletion (users, libraries, groups).
+func (s *Scanner) scanExpiredDeletedOrgs(ctx context.Context) (int, error) {
+	log.Println("[GC Scanner] Phase 12: Scanning for expired deleted organizations...")
+
+	orgs, err := s.store.ListExpiredDeletedOrgs(s.config.OrgGraceDays)
+	if err != nil {
+		return 0, err
+	}
+
+	enqueued := 0
+	now := time.Now()
+	var batch []QueueItem
+	for _, org := range orgs {
+		batch = append(batch, QueueItem{
+			OrgID:    org.OrgID,
+			QueuedAt: now,
+			ItemType: ItemOrgCascade,
+			ItemID:   org.OrgID.String(),
+		})
+	}
+	if len(batch) > 0 {
+		if err := s.queue.EnqueueBatch(batch); err != nil {
+			log.Printf("[GC Scanner] Phase 12: failed to enqueue expired deleted orgs: %v", err)
+		} else {
+			enqueued = len(batch)
+		}
+	}
+
+	log.Printf("[GC Scanner] Phase 12 complete: enqueued %d expired deleted organizations", enqueued)
+	metrics.GCItemsEnqueuedTotal.WithLabelValues("expired_deleted_orgs").Add(float64(enqueued))
+	metrics.GCScannerLastPhaseRun.WithLabelValues("expired_deleted_orgs").SetToCurrentTime()
 	return enqueued, nil
 }
 

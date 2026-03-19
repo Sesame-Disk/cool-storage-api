@@ -1086,8 +1086,15 @@ func (h *GroupHandler) BulkAddGroupMembers(c *gin.Context) {
 	memberIter.Close()
 
 	var failed []failedItem
-	var success []GroupMemberResponse
 	now := time.Now()
+
+	// Phase 1: Resolve emails and collect valid members
+	type resolvedMember struct {
+		email  string
+		userID string
+		name   string
+	}
+	var valid []resolvedMember
 
 	for _, email := range strings.Split(emailsRaw, ",") {
 		email = strings.TrimSpace(email)
@@ -1103,32 +1110,42 @@ func (h *GroupHandler) BulkAddGroupMembers(c *gin.Context) {
 			continue
 		}
 
-		// Check if user is already a member
 		if existingMembers[memberID] {
 			failed = append(failed, failedItem{Email: email, ErrorMsg: "User is already a member of this group."})
 			continue
 		}
 
-		if err := upsertGroupMember(h.db, orgID, groupUUID.String(), memberID, groupName, "member", now); err != nil {
-			failed = append(failed, failedItem{Email: email, ErrorMsg: "failed to add member"})
-			continue
-		}
-
-		// Mark as existing to prevent duplicates within the same batch
 		existingMembers[memberID] = true
 
-		// Resolve user details for the response object
 		var memberName string
 		h.db.Session().Query(`SELECT name FROM users WHERE org_id = ? AND user_id = ?`, orgID, memberID).Scan(&memberName)
 
-		success = append(success, GroupMemberResponse{
-			Email:     email,
-			Name:      memberName,
-			UserID:    memberID,
-			Role:      "Member",
-			AddedAt:   now.Format(time.RFC3339),
-			AvatarURL: "",
-		})
+		valid = append(valid, resolvedMember{email: email, userID: memberID, name: memberName})
+	}
+
+	// Phase 2: Batch-insert all valid members (chunks of 25)
+	var success []GroupMemberResponse
+	if len(valid) > 0 {
+		inserts := make([]bulkMemberInsert, len(valid))
+		for i, v := range valid {
+			inserts[i] = bulkMemberInsert{UserID: v.userID, Role: "member"}
+		}
+		if err := bulkUpsertGroupMembers(h.db, orgID, groupUUID.String(), groupName, inserts, now); err != nil {
+			for _, v := range valid {
+				failed = append(failed, failedItem{Email: v.email, ErrorMsg: "failed to add member"})
+			}
+		} else {
+			for _, v := range valid {
+				success = append(success, GroupMemberResponse{
+					Email:     v.email,
+					Name:      v.name,
+					UserID:    v.userID,
+					Role:      "Member",
+					AddedAt:   now.Format(time.RFC3339),
+					AvatarURL: "",
+				})
+			}
+		}
 	}
 
 	if failed == nil {
@@ -1200,15 +1217,20 @@ func (h *GroupHandler) ImportGroupMembersViaFile(c *gin.Context) {
 	memberIter.Close()
 
 	var failed []failedItem
-	var success []string
 	now := time.Now()
+
+	// Phase 1: Resolve emails and collect valid members
+	type resolvedImport struct {
+		email  string
+		userID string
+	}
+	var valid []resolvedImport
 
 	for _, line := range strings.Split(buf.String(), "\n") {
 		email := strings.TrimSpace(line)
 		if email == "" {
 			continue
 		}
-		// Strip CSV quotes if any
 		email = strings.Trim(email, `"`)
 		email = strings.Trim(email, "'")
 		if email == "" {
@@ -1223,21 +1245,31 @@ func (h *GroupHandler) ImportGroupMembersViaFile(c *gin.Context) {
 			continue
 		}
 
-		// Check if user is already a member
 		if existingMembers[memberID] {
 			failed = append(failed, failedItem{Email: email, ErrorMsg: "User is already a member of this group."})
 			continue
 		}
 
-		if err := upsertGroupMember(h.db, orgID, groupUUID.String(), memberID, groupName, "member", now); err != nil {
-			failed = append(failed, failedItem{Email: email, ErrorMsg: "failed to add member"})
-			continue
-		}
-
-		// Mark as existing to prevent duplicates within the same batch
 		existingMembers[memberID] = true
+		valid = append(valid, resolvedImport{email: email, userID: memberID})
+	}
 
-		success = append(success, email)
+	// Phase 2: Batch-insert all valid members (chunks of 25)
+	var success []string
+	if len(valid) > 0 {
+		inserts := make([]bulkMemberInsert, len(valid))
+		for i, v := range valid {
+			inserts[i] = bulkMemberInsert{UserID: v.userID, Role: "member"}
+		}
+		if err := bulkUpsertGroupMembers(h.db, orgID, groupUUID.String(), groupName, inserts, now); err != nil {
+			for _, v := range valid {
+				failed = append(failed, failedItem{Email: v.email, ErrorMsg: "failed to add member"})
+			}
+		} else {
+			for _, v := range valid {
+				success = append(success, v.email)
+			}
+		}
 	}
 
 	if failed == nil {

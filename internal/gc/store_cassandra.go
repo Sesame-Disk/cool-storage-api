@@ -1330,6 +1330,125 @@ func (s *CassandraStore) HardDeleteLibrary(orgID, libraryID uuid.UUID) error {
 	return batch.Exec()
 }
 
+// --- Org cascade (Fase 4) ---
+
+func (s *CassandraStore) ListExpiredDeletedOrgs(graceDays int) ([]DeletedOrgInfo, error) {
+	iter := s.db.Session().Query(`
+		SELECT org_id, name, deleted_at FROM organizations
+	`).Iter()
+
+	cutoff := time.Now().AddDate(0, 0, -graceDays)
+	var orgIDStr, name string
+	var deletedAt *time.Time
+	var result []DeletedOrgInfo
+	for iter.Scan(&orgIDStr, &name, &deletedAt) {
+		if deletedAt == nil || deletedAt.IsZero() {
+			continue
+		}
+		if deletedAt.Before(cutoff) {
+			result = append(result, DeletedOrgInfo{
+				OrgID:     parseUUID(orgIDStr),
+				Name:      name,
+				DeletedAt: *deletedAt,
+			})
+		}
+	}
+	if err := iter.Close(); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+func (s *CassandraStore) ListUsersByOrg(orgID uuid.UUID) ([]OrgUserInfo, error) {
+	iter := s.db.Session().Query(`
+		SELECT user_id, email FROM users WHERE org_id = ?
+	`, orgID.String()).Iter()
+
+	var userIDStr, email string
+	var result []OrgUserInfo
+	for iter.Scan(&userIDStr, &email) {
+		result = append(result, OrgUserInfo{
+			UserID: parseUUID(userIDStr),
+			Email:  email,
+		})
+	}
+	if err := iter.Close(); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+func (s *CassandraStore) ListGroupsByOrg(orgID uuid.UUID) ([]uuid.UUID, error) {
+	iter := s.db.Session().Query(`
+		SELECT group_id FROM groups WHERE org_id = ?
+	`, orgID.String()).Iter()
+
+	var groupIDStr string
+	var result []uuid.UUID
+	for iter.Scan(&groupIDStr) {
+		result = append(result, parseUUID(groupIDStr))
+	}
+	if err := iter.Close(); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+func (s *CassandraStore) ListLibrariesForOrg(orgID uuid.UUID) ([]OrgLibraryInfo, error) {
+	iter := s.db.Session().Query(`
+		SELECT library_id, storage_class FROM libraries WHERE org_id = ?
+	`, orgID.String()).Iter()
+
+	var libIDStr, storageClass string
+	var result []OrgLibraryInfo
+	for iter.Scan(&libIDStr, &storageClass) {
+		result = append(result, OrgLibraryInfo{
+			LibraryID:    parseUUID(libIDStr),
+			StorageClass: storageClass,
+		})
+	}
+	if err := iter.Close(); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+func (s *CassandraStore) DeleteGroupFull(orgID, groupID uuid.UUID) error {
+	// Clean up groups_by_member for each member
+	iter := s.db.Session().Query(`
+		SELECT user_id FROM group_members WHERE group_id = ?
+	`, groupID.String()).Iter()
+
+	var userIDStr string
+	for iter.Scan(&userIDStr) {
+		s.db.Session().Query(`
+			DELETE FROM groups_by_member WHERE org_id = ? AND user_id = ? AND group_id = ?
+		`, orgID.String(), userIDStr, groupID.String()).Exec()
+	}
+	iter.Close()
+
+	// Delete members, group record, and by_id lookup
+	batch := s.db.Session().Batch(gocql.LoggedBatch)
+	batch.Query(`DELETE FROM group_members WHERE group_id = ?`, groupID.String())
+	batch.Query(`DELETE FROM groups WHERE org_id = ? AND group_id = ?`, orgID.String(), groupID.String())
+	batch.Query(`DELETE FROM groups_by_id WHERE group_id = ?`, groupID.String())
+	return batch.Exec()
+}
+
+func (s *CassandraStore) HardDeleteOrg(orgID uuid.UUID) error {
+	return s.db.Session().Query(`
+		DELETE FROM organizations WHERE org_id = ?
+	`, orgID.String()).Exec()
+}
+
+func (s *CassandraStore) GetOrgName(orgID uuid.UUID) (string, error) {
+	var name string
+	err := s.db.Session().Query(`
+		SELECT name FROM organizations WHERE org_id = ?
+	`, orgID.String()).Scan(&name)
+	return name, err
+}
+
 // --- Storage adapter ---
 
 // StorageManagerAdapter wraps a *storage.Manager to implement StorageProvider.

@@ -61,6 +61,10 @@ func RegisterAdminRoutes(rg *gin.RouterGroup, database *db.DB, cfg *config.Confi
 			superadminOnly.PUT("/organizations/:org_id", h.UpdateOrganization)
 			superadminOnly.DELETE("/organizations/:org_id/", h.DeactivateOrganization)
 			superadminOnly.DELETE("/organizations/:org_id", h.DeactivateOrganization)
+			superadminOnly.POST("/organizations/:org_id/delete/", h.SoftDeleteOrganization)
+			superadminOnly.POST("/organizations/:org_id/delete", h.SoftDeleteOrganization)
+			superadminOnly.POST("/organizations/:org_id/restore/", h.RestoreOrganization)
+			superadminOnly.POST("/organizations/:org_id/restore", h.RestoreOrganization)
 		}
 
 		// User listing per org (superadmin or tenant admin for own org)
@@ -586,6 +590,62 @@ func (h *AdminHandler) DeactivateOrganization(c *gin.Context) {
 		UPDATE organizations SET settings['status'] = ? WHERE org_id = ?
 	`, "deactivated", orgID).Exec(); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to deactivate organization"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"success": true})
+}
+
+// SoftDeleteOrganization marks an organization as deleted with a grace period.
+// After OrgGraceDays the GC scanner will cascade-delete all resources.
+// POST /admin/organizations/:org_id/delete/
+func (h *AdminHandler) SoftDeleteOrganization(c *gin.Context) {
+	orgID := c.Param("org_id")
+
+	if orgID == middleware.PlatformOrgID {
+		c.JSON(http.StatusForbidden, gin.H{"error": "cannot delete platform organization"})
+		return
+	}
+
+	// Verify org exists
+	var name string
+	err := h.db.Session().Query(`
+		SELECT name FROM organizations WHERE org_id = ?
+	`, orgID).Scan(&name)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "organization not found"})
+		return
+	}
+
+	if err := softDeleteOrg(h.db, orgID, time.Now()); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete organization"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"success": true})
+}
+
+// RestoreOrganization restores a soft-deleted org (within grace period).
+// POST /admin/organizations/:org_id/restore/
+func (h *AdminHandler) RestoreOrganization(c *gin.Context) {
+	orgID := c.Param("org_id")
+
+	// Verify org exists and is actually deleted
+	var deletedAt *time.Time
+	err := h.db.Session().Query(`
+		SELECT deleted_at FROM organizations WHERE org_id = ?
+	`, orgID).Scan(&deletedAt)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "organization not found"})
+		return
+	}
+	if deletedAt == nil || deletedAt.IsZero() {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "organization is not deleted"})
+		return
+	}
+
+	if err := restoreDeletedOrg(h.db, orgID); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to restore organization"})
 		return
 	}
 

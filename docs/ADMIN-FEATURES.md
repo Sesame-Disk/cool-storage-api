@@ -13,7 +13,7 @@ Three admin feature areas needed for production. The OIDC provider manages users
 |---------|---------|----------|----------|----------|
 | Admin Library Management | ✅ Complete (2026-02-12) | ✅ Exists | ✅ Exists | DONE |
 | Admin Share Link & Upload Link Management | ✅ Complete (2026-02-12) | ✅ Exists | ✅ Exists | DONE |
-| Admin Organization Management | ✅ Complete (2026-02-23) | ✅ Exists | ✅ Exists | DONE |
+| Admin Organization Management | ✅ Complete (2026-03-18) | 🟡 Needs update (soft-delete/restore UI) | ✅ Exists | DONE (backend), frontend TODO |
 | Admin User Management | ✅ Complete (2026-02-23) | ✅ Exists | ✅ Exists | DONE |
 | Custom Share Permissions | ✅ Complete (2026-03-11) | ✅ Exists | ✅ Exists | DONE |
 | Audit Logs | 🟡 Stub only | ✅ Exists (unused) | ❌ Missing | MEDIUM |
@@ -73,24 +73,36 @@ Run from the project root. The script uses `docker compose exec cassandra cqlsh`
 | GET | `/admin/organizations/:org_id/` | `GetOrganization` | admin or superadmin |
 | PUT | `/admin/organizations/:org_id/` | `UpdateOrganization` | **superadmin only** |
 | DELETE | `/admin/organizations/:org_id/` | `DeactivateOrganization` | **superadmin only** |
+| POST | `/admin/organizations/:org_id/delete/` | `SoftDeleteOrganization` | **superadmin only** |
+| POST | `/admin/organizations/:org_id/restore/` | `RestoreOrganization` | **superadmin only** |
 | GET | `/admin/organizations/:org_id/users/` | `ListOrgUsers` | admin or superadmin |
 | POST | `/admin/organizations/:org_id/users/` | `AdminAddOrgUser` | admin or superadmin |
 | PUT | `/admin/organizations/:org_id/users/:email/` | `AdminUpdateOrgUser` | admin or superadmin |
 | DELETE | `/admin/organizations/:org_id/users/:email/` | `AdminDeleteOrgUser` | admin or superadmin |
 
-### DeactivateOrganization — ⚠️ INCOMPLETE (2026-02-23)
+### Organization Lifecycle — ✅ COMPLETE (2026-03-18)
 
-**Current behavior:** The `DELETE /admin/organizations/:org_id/` endpoint does NOT delete the organization from the database. It only sets `settings['status'] = 'deactivated'` (soft-deactivation via map column update).
+Three distinct org states with full GC cascade:
 
-**Known issues:**
-1. `ListOrganizations` does NOT filter out deactivated orgs — they still appear in the list
-2. Deactivated orgs are still fully functional (users can still log in, access libraries, etc.)
-3. No `deleted_at` / `deleted_by` columns like the library soft-delete pattern
-4. No cascade handling (users, libraries, shares of the deactivated org remain active)
+| State | Trigger | Reversible | GC Cascade |
+|-------|---------|------------|------------|
+| **active** | Default / `RestoreOrganization` | — | No |
+| **deactivated** | `DeactivateOrganization` (DELETE) | Yes (manual) | No |
+| **deleted** | `SoftDeleteOrganization` (POST .../delete/) | Yes within grace period via `RestoreOrganization` | Yes — after `OrgGraceDays` (default 30 days) |
 
-**TODO — Choose one approach:**
-- **Option A (Hard delete):** Change to `DELETE FROM organizations WHERE org_id = ?` + cascade cleanup of related data (users, libraries, shares, etc.)
-- **Option B (Proper soft-delete):** Add `deleted_at` / `deleted_by` columns (matching library pattern), filter deactivated orgs from all queries, and block login for users of deactivated orgs
+**Cascade flow** (after grace period expires):
+1. GC Scanner Phase 12 finds org with `deleted_at` past `OrgGraceDays`
+2. Enqueues `ItemOrgCascade` → Worker `processOrgCascade`:
+   - All libraries → enqueued as `ItemLibraryCascade` (content cleanup)
+   - All users → shares, starred, monitored cleaned + hard-deleted
+   - All groups → `DeleteGroupFull` (members, by_member, by_id, record)
+   - Org record → hard-deleted from `organizations` table
+   - Audit log entry written
+
+**Remaining frontend TODO** (see ISSUE-FRONTEND-ORG-DELETE-01 in KNOWN_ISSUES.md):
+- Superadmin dashboard: "Delete" button (distinct from "Deactivate"), "Restore" button, status column
+- `ListOrganizations` should filter by status (active/deactivated/deleted)
+- Org admin dashboard: warning banner for orgs in "deleted" state
 
 ---
 

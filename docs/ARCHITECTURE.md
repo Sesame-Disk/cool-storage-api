@@ -444,6 +444,9 @@ Drains the `gc_queue` table. Each item has a type; the worker dispatches accordi
 | `share_link` | Delete from all 4 share_links tables (quad-delete) |
 | `share` | Delete user-to-user share from `shares` + `shares_by_user` |
 | `restore_job` | Delete completed/expired restore job |
+| `user_cascade` | Soft-delete owned libraries, remove from groups, clean shares/starred/monitored, hard-delete user |
+| `library_cascade` | Enqueue all library contents (commits, fs_objects, artifacts), hard-delete library + deleted_libraries |
+| `org_cascade` | Enqueue all libraries as `library_cascade`, clean up all users, delete all groups, hard-delete org |
 
 **Two-phase deletion**: items sit in `gc_queue` for a grace period (default 1h) before the worker processes them. The `gc_queue` table has a 7-day TTL for auto-cleanup of stuck items.
 
@@ -451,7 +454,7 @@ Drains the `gc_queue` table. Each item has a type; the worker dispatches accordi
 
 **Library deletion** also enqueues artifact cleanup: shares, share links, repo tags, file tags, API tokens, locked files, starred files, monitored repos, restore jobs, and tag counters.
 
-#### GC Scanner (9 phases, runs every 24h + on startup)
+#### GC Scanner (12 phases, runs every 24h + on startup)
 
 | Phase | What it scans | Action |
 |-------|--------------|--------|
@@ -464,6 +467,14 @@ Drains the `gc_queue` table. Each item has a type; the worker dispatches accordi
 | 7 | Expired user-to-user shares | Delete directly |
 | 8 | Expired/completed restore jobs | Delete directly |
 | 9 | Orphaned group shares (group deleted but shares remain) | Delete directly |
+| 10 | Expired deleted users (`deleted_at` < now - `UserGraceDays`) | Enqueue `user_cascade` |
+| 11 | Expired deleted libraries (`deleted_at` < now - `TrashRetentionDays`) | Enqueue `library_cascade` |
+| 12 | Expired deleted orgs (`deleted_at` < now - `OrgGraceDays`) | Enqueue `org_cascade` |
+
+**Soft-delete grace periods** (configurable in `gc:` config):
+- `user_grace_days`: 7 days (user → user_cascade)
+- `trash_retention_days`: 30 days (library → library_cascade)
+- `org_grace_days`: 30 days (org → org_cascade)
 
 **Stats persistence**: Worker/scanner timestamps and `blocks_deleted_total` are saved to `gc_stats` table on shutdown and restored on startup, surviving container restarts.
 

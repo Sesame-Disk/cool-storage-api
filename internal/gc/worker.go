@@ -120,6 +120,8 @@ func (w *Worker) processItem(ctx context.Context, item QueueItem) error {
 		return w.processUserCascade(ctx, item)
 	case ItemLibraryCascade:
 		return w.processLibraryCascade(ctx, item)
+	case ItemOrgCascade:
+		return w.processOrgCascade(ctx, item)
 	default:
 		return fmt.Errorf("unknown item type: %s", item.ItemType)
 	}
@@ -478,6 +480,102 @@ func (w *Worker) processLibraryCascade(ctx context.Context, item QueueItem) erro
 	})
 
 	log.Printf("[GC Worker] Cascade-deleted library %s (storage_class=%s)", item.ItemID, storageClass)
+	return nil
+}
+
+// processOrgCascade performs the full cascade deletion of a soft-deleted organization:
+// 1. Enqueue all libraries as LibraryCascade (content cleanup)
+// 2. Clean up all users (shares, starred, monitored, hard-delete)
+// 3. Delete all groups (members, by_member, by_id, group record)
+// 4. Hard-delete org record
+// 5. Audit log
+func (w *Worker) processOrgCascade(ctx context.Context, item QueueItem) error {
+	if w.dryRun {
+		log.Printf("[GC Worker] DRY RUN: Would cascade-delete org %s", item.ItemID)
+		return nil
+	}
+
+	orgID := item.OrgID
+	orgName, err := w.store.GetOrgName(orgID)
+	if err != nil {
+		log.Printf("[GC Worker] Org %s name lookup failed (may already be deleted): %v", item.ItemID, err)
+		return nil
+	}
+
+	// 1. Enqueue all libraries for cascade deletion
+	libs, err := w.store.ListLibrariesForOrg(orgID)
+	if err != nil {
+		log.Printf("[GC Worker] Failed to list libraries for org %s: %v", item.ItemID, err)
+	} else if len(libs) > 0 {
+		now := time.Now()
+		var batch []QueueItem
+		for _, lib := range libs {
+			batch = append(batch, QueueItem{
+				OrgID:        orgID,
+				QueuedAt:     now,
+				ItemType:     ItemLibraryCascade,
+				ItemID:       lib.LibraryID.String(),
+				StorageClass: lib.StorageClass,
+			})
+		}
+		if err := w.queue.EnqueueBatch(batch); err != nil {
+			log.Printf("[GC Worker] Failed to enqueue libraries for org %s: %v", item.ItemID, err)
+		}
+	}
+
+	// 2. Clean up all users (no user grace period — org is being deleted)
+	users, err := w.store.ListUsersByOrg(orgID)
+	if err != nil {
+		log.Printf("[GC Worker] Failed to list users for org %s: %v", item.ItemID, err)
+	} else {
+		for _, u := range users {
+			// Remove from groups
+			groupIDs, _ := w.store.ListGroupMembershipsByUser(orgID, u.UserID)
+			for _, gid := range groupIDs {
+				w.store.DeleteGroupMember(gid, u.UserID)
+				w.store.DeleteGroupByMember(orgID, u.UserID, gid)
+			}
+			// Clean shares
+			shares, _ := w.store.ListSharesByUser(u.UserID)
+			for _, s := range shares {
+				w.store.DeleteShareByUser(s.SharedTo, s.LibraryID)
+			}
+			// Clean personal data
+			w.store.DeleteStarredFilesByUser(u.UserID)
+			w.store.DeleteMonitoredReposByUser(u.UserID)
+			// Hard-delete user
+			w.store.HardDeleteUser(orgID, u.UserID, u.Email)
+		}
+	}
+
+	// 3. Delete all groups
+	groupIDs, err := w.store.ListGroupsByOrg(orgID)
+	if err != nil {
+		log.Printf("[GC Worker] Failed to list groups for org %s: %v", item.ItemID, err)
+	} else {
+		for _, gid := range groupIDs {
+			w.store.DeleteGroupFull(orgID, gid)
+		}
+	}
+
+	// 4. Hard-delete org record
+	if err := w.store.HardDeleteOrg(orgID); err != nil {
+		return fmt.Errorf("failed to hard-delete org %s: %w", item.ItemID, err)
+	}
+
+	// 5. Audit log
+	w.store.WriteAuditLog(AuditLogEntry{
+		OrgID:      orgID,
+		Action:     "gc_org_cascade_deleted",
+		TargetType: "organization",
+		TargetID:   item.ItemID,
+		ActorID:    "gc_worker",
+		Details:    fmt.Sprintf("name=%s libraries=%d users=%d groups=%d", orgName, len(libs), len(users), len(groupIDs)),
+		Timestamp:  time.Now(),
+	})
+
+	log.Printf("[GC Worker] Cascade-deleted org %s (%s): %d libraries, %d users, %d groups",
+		item.ItemID, orgName, len(libs), len(users), len(groupIDs))
 	return nil
 }
 
