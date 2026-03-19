@@ -27,14 +27,16 @@ type OrgAdminHandler struct {
 	db             *db.DB
 	config         *config.Config
 	permMiddleware *middleware.PermissionMiddleware
+	sessions       SessionInvalidator
 }
 
 // NewOrgAdminHandler creates a new OrgAdminHandler.
-func NewOrgAdminHandler(database *db.DB, cfg *config.Config, perm *middleware.PermissionMiddleware) *OrgAdminHandler {
+func NewOrgAdminHandler(database *db.DB, cfg *config.Config, perm *middleware.PermissionMiddleware, sessions SessionInvalidator) *OrgAdminHandler {
 	return &OrgAdminHandler{
 		db:             database,
 		config:         cfg,
 		permMiddleware: perm,
+		sessions:       sessions,
 	}
 }
 
@@ -45,8 +47,8 @@ func NewOrgAdminHandler(database *db.DB, cfg *config.Config, perm *middleware.Pe
 //   - /org/:org_id/admin/...  — endpoints that require an explicit org_id parameter
 //
 // All endpoints require the user to be an org admin of the specified org or a superadmin.
-func RegisterOrgAdminRoutes(rg *gin.RouterGroup, database *db.DB, cfg *config.Config, perm *middleware.PermissionMiddleware) {
-	h := NewOrgAdminHandler(database, cfg, perm)
+func RegisterOrgAdminRoutes(rg *gin.RouterGroup, database *db.DB, cfg *config.Config, perm *middleware.PermissionMiddleware, sessions SessionInvalidator) {
+	h := NewOrgAdminHandler(database, cfg, perm, sessions)
 
 	orgBase := rg.Group("/org")
 	orgBase.Use(perm.RequireAdminOrAbove())
@@ -325,13 +327,13 @@ type orgUserRow struct {
 	AvatarURL    string `json:"avatar_url"`
 }
 
-func buildOrgUserRow(email, name, role, orgID string, quota, used int64, created time.Time) orgUserRow {
+func buildOrgUserRow(email, name, role, status, orgID string, quota, used int64, created time.Time) orgUserRow {
 	return orgUserRow{
 		ID:           email, // Seafile uses email as user ID in org-admin context
 		Email:        email,
 		Name:         name,
 		ContactEmail: "",
-		IsActive:     role != "deactivated",
+		IsActive:     IsUserUsable(status),
 		IsOrgStaff:   role == "admin" || role == "superadmin",
 		Role:         role,
 		QuotaTotal:   quota,
@@ -461,20 +463,20 @@ func (h *OrgAdminHandler) ListOrgUsers(c *gin.Context) {
 	isStaffOnly := c.Query("is_staff") == "true"
 
 	iter := h.db.Session().Query(`
-		SELECT user_id, email, name, role, quota_bytes, used_bytes, created_at
+		SELECT user_id, email, name, role, status, quota_bytes, used_bytes, created_at
 		FROM users WHERE org_id = ?
 	`, targetOrgID).Iter()
 
 	var all []orgUserRow
-	var userID, email, name, role string
+	var userID, email, name, role, status string
 	var quota, used int64
 	var created time.Time
 
-	for iter.Scan(&userID, &email, &name, &role, &quota, &used, &created) {
+	for iter.Scan(&userID, &email, &name, &role, &status, &quota, &used, &created) {
 		if isStaffOnly && role != "admin" && role != "superadmin" {
 			continue
 		}
-		all = append(all, buildOrgUserRow(email, name, role, targetOrgID, quota, used, created))
+		all = append(all, buildOrgUserRow(email, name, role, status, targetOrgID, quota, used, created))
 	}
 	if err := iter.Close(); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list users"})
@@ -557,7 +559,7 @@ func (h *OrgAdminHandler) AddOrgUser(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusCreated, buildOrgUserRow(email, name, "user", targetOrgID, -2, 0, now))
+	c.JSON(http.StatusCreated, buildOrgUserRow(email, name, "user", StatusActive, targetOrgID, -2, 0, now))
 }
 
 // GetOrgUser returns details for a single user identified by email within the target org.
@@ -575,19 +577,19 @@ func (h *OrgAdminHandler) GetOrgUser(c *gin.Context) {
 		return
 	}
 
-	var name, role string
+	var name, role, status string
 	var quota, used int64
 	var created time.Time
 
 	if err := h.db.Session().Query(`
-		SELECT name, role, quota_bytes, used_bytes, created_at
+		SELECT name, role, status, quota_bytes, used_bytes, created_at
 		FROM users WHERE org_id = ? AND user_id = ?
-	`, targetOrgID, userID).Scan(&name, &role, &quota, &used, &created); err != nil {
+	`, targetOrgID, userID).Scan(&name, &role, &status, &quota, &used, &created); err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "user not found"})
 		return
 	}
 
-	c.JSON(http.StatusOK, buildOrgUserRow(email, name, role, targetOrgID, quota, used, created))
+	c.JSON(http.StatusOK, buildOrgUserRow(email, name, role, status, targetOrgID, quota, used, created))
 }
 
 // UpdateOrgUser updates an org user's active status, staff role, name, or quota.
@@ -607,14 +609,14 @@ func (h *OrgAdminHandler) UpdateOrgUser(c *gin.Context) {
 		return
 	}
 
-	var name, role string
+	var name, role, status string
 	var quota, used int64
 	var created time.Time
 
 	if err := h.db.Session().Query(`
-		SELECT name, role, quota_bytes, used_bytes, created_at
+		SELECT name, role, status, quota_bytes, used_bytes, created_at
 		FROM users WHERE org_id = ? AND user_id = ?
-	`, targetOrgID, userID).Scan(&name, &role, &quota, &used, &created); err != nil {
+	`, targetOrgID, userID).Scan(&name, &role, &status, &quota, &used, &created); err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "user not found"})
 		return
 	}
@@ -626,11 +628,18 @@ func (h *OrgAdminHandler) UpdateOrgUser(c *gin.Context) {
 	// seafile-js sends FormData for all org-admin user updates.
 	// Fields: is_active, is_staff, name, contact_email, quota_total
 	if v := c.Request.FormValue("is_active"); v != "" {
-		active := v == "true"
-		if !active {
-			role = "deactivated"
-		} else if role == "deactivated" {
-			role = "user"
+		if v == "false" {
+			if err := deactivateUser(h.db, h.sessions, targetOrgID, userID); err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update user"})
+				return
+			}
+			status = StatusDeactivated
+		} else if v == "true" {
+			if err := activateUser(h.db, targetOrgID, userID); err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update user"})
+				return
+			}
+			status = StatusActive
 		}
 	}
 
@@ -678,10 +687,10 @@ func (h *OrgAdminHandler) UpdateOrgUser(c *gin.Context) {
 		_ = v
 	}
 
-	c.JSON(http.StatusOK, buildOrgUserRow(email, name, role, targetOrgID, quota, used, created))
+	c.JSON(http.StatusOK, buildOrgUserRow(email, name, role, status, targetOrgID, quota, used, created))
 }
 
-// DeleteOrgUser deactivates (soft-deletes) a user from the target org.
+// DeleteOrgUser soft-deletes a user from the target org.
 // The caller cannot delete themselves.
 // DELETE /org/:org_id/admin/users/:email/
 func (h *OrgAdminHandler) DeleteOrgUser(c *gin.Context) {
@@ -704,11 +713,10 @@ func (h *OrgAdminHandler) DeleteOrgUser(c *gin.Context) {
 	}
 
 	// Soft-delete: mark as "deleted" with timestamp for grace period cascade
-	if err := softDeleteUser(h.db, targetOrgID, userID, time.Now()); err != nil {
+	if err := softDeleteUser(h.db, h.sessions, targetOrgID, userID, time.Now()); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete user"})
 		return
 	}
-
 	c.JSON(http.StatusOK, gin.H{"success": true})
 }
 
@@ -863,18 +871,18 @@ func (h *OrgAdminHandler) SearchOrgUser(c *gin.Context) {
 	}
 
 	iter := h.db.Session().Query(`
-		SELECT user_id, email, name, role, quota_bytes, used_bytes, created_at
+		SELECT user_id, email, name, role, status, quota_bytes, used_bytes, created_at
 		FROM users WHERE org_id = ?
 	`, targetOrgID).Iter()
 
 	var results []orgUserRow
-	var userID, email, name, role string
+	var userID, email, name, role, status string
 	var quota, used int64
 	var created time.Time
 
-	for iter.Scan(&userID, &email, &name, &role, &quota, &used, &created) {
+	for iter.Scan(&userID, &email, &name, &role, &status, &quota, &used, &created) {
 		if strings.Contains(strings.ToLower(email), query) || strings.Contains(strings.ToLower(name), query) {
-			results = append(results, buildOrgUserRow(email, name, role, targetOrgID, quota, used, created))
+			results = append(results, buildOrgUserRow(email, name, role, status, targetOrgID, quota, used, created))
 		}
 	}
 	iter.Close()
@@ -968,7 +976,7 @@ func (h *OrgAdminHandler) ImportOrgUsers(c *gin.Context) {
 			failed = append(failed, gin.H{"email": email, "error": "database error"})
 			continue
 		}
-		success = append(success, buildOrgUserRow(email, name, "user", targetOrgID, -2, 0, now))
+		success = append(success, buildOrgUserRow(email, name, "user", StatusActive, targetOrgID, -2, 0, now))
 	}
 
 	if success == nil {

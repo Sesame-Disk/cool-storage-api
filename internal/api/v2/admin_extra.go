@@ -484,14 +484,14 @@ func (h *AdminHandler) AdminUpdateOrgUser(c *gin.Context) {
 		return
 	}
 
-	var name, role string
+	var name, role, status string
 	var quotaBytes, usedBytes int64
 	var createdAt time.Time
 
 	if err := h.db.Session().Query(`
-		SELECT name, role, quota_bytes, used_bytes, created_at
+		SELECT name, role, status, quota_bytes, used_bytes, created_at
 		FROM users WHERE org_id = ? AND user_id = ?
-	`, targetOrgID, userID).Scan(&name, &role, &quotaBytes, &usedBytes, &createdAt); err != nil {
+	`, targetOrgID, userID).Scan(&name, &role, &status, &quotaBytes, &usedBytes, &createdAt); err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "user not found"})
 		return
 	}
@@ -499,14 +499,17 @@ func (h *AdminHandler) AdminUpdateOrgUser(c *gin.Context) {
 	// Apply updates from FormData
 	if v := c.Request.FormValue("active"); v != "" {
 		if v == "false" {
-			role = "deactivated"
-		} else if role == "deactivated" {
-			role = "user"
-		}
-		if err := h.db.Session().Query(`UPDATE users SET role = ? WHERE org_id = ? AND user_id = ?`,
-			role, targetOrgID, userID).Exec(); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update user"})
-			return
+			if err := deactivateUser(h.db, h.sessions, targetOrgID, userID); err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update user"})
+				return
+			}
+			status = StatusDeactivated
+		} else if v == "true" {
+			if err := activateUser(h.db, targetOrgID, userID); err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update user"})
+				return
+			}
+			status = StatusActive
 		}
 	}
 
@@ -560,7 +563,7 @@ func (h *AdminHandler) AdminUpdateOrgUser(c *gin.Context) {
 		}
 	}
 
-	isActive := role != "deactivated"
+	isActive := IsUserUsable(status)
 	isOrgStaff := role == "admin" || role == "superadmin"
 
 	c.JSON(http.StatusOK, gin.H{
@@ -609,11 +612,10 @@ func (h *AdminHandler) AdminDeleteOrgUser(c *gin.Context) {
 	}
 
 	// Soft-delete: mark as "deleted" with timestamp for grace period cascade
-	if err := softDeleteUser(h.db, targetOrgID, foundUID, time.Now()); err != nil {
+	if err := softDeleteUser(h.db, h.sessions, targetOrgID, foundUID, time.Now()); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete user"})
 		return
 	}
-
 	c.JSON(http.StatusOK, gin.H{"success": true})
 }
 

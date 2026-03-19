@@ -126,6 +126,7 @@ func (db *DB) Migrate() error {
 		migrationCreateGroupsByMember,
 		migrationCreateGroupsByID,
 		migrationCreateSessions,
+		migrationCreateSessionsByUser,
 		migrationCreateRepoAPITokens,
 		migrationCreateRepoAPITokensByToken,
 		migrationCreateMonitoredRepos,
@@ -160,6 +161,8 @@ func (db *DB) Migrate() error {
 		migrationAddFSObjectFullPath,
 		migrationAddUserDeletedAt,
 		migrationAddOrgDeletedAt,
+		migrationAddUserStatus,
+		migrationAddOrgStatus,
 	}
 	for _, migration := range alterMigrations {
 		if err := db.session.Query(migration).Exec(); err != nil {
@@ -173,7 +176,64 @@ func (db *DB) Migrate() error {
 		}
 	}
 
+	// Backfill status columns for existing data
+	db.backfillUserStatus()
+	db.backfillOrgStatus()
+
 	return nil
+}
+
+// backfillUserStatus populates the `status` column for users that predate the migration.
+// Legacy data may have role="deactivated" or role="deleted" — these are split into
+// the dedicated status column and the original role is defaulted to "user".
+func (db *DB) backfillUserStatus() {
+	orgIter := db.session.Query(`SELECT org_id FROM organizations`).Iter()
+	var orgIDStr string
+	for orgIter.Scan(&orgIDStr) {
+		iter := db.session.Query(`SELECT user_id, role, status FROM users WHERE org_id = ?`, orgIDStr).Iter()
+		var userID, role, status string
+		for iter.Scan(&userID, &role, &status) {
+			if status != "" {
+				continue // already backfilled
+			}
+			switch role {
+			case "deactivated":
+				db.session.Query(`UPDATE users SET status = ?, role = ? WHERE org_id = ? AND user_id = ?`,
+					"deactivated", "user", orgIDStr, userID).Exec()
+			case "deleted":
+				db.session.Query(`UPDATE users SET status = ? WHERE org_id = ? AND user_id = ?`,
+					"deleted", orgIDStr, userID).Exec()
+			default:
+				db.session.Query(`UPDATE users SET status = ? WHERE org_id = ? AND user_id = ?`,
+					"active", orgIDStr, userID).Exec()
+			}
+		}
+		iter.Close()
+	}
+	orgIter.Close()
+}
+
+// backfillOrgStatus populates the `status` column for orgs that predate the migration.
+// Legacy data stored lifecycle state in settings['status'] — we migrate that to the
+// dedicated status column.
+func (db *DB) backfillOrgStatus() {
+	iter := db.session.Query(`SELECT org_id, status, settings FROM organizations`).Iter()
+	var orgIDStr, status string
+	var settings map[string]string
+	for iter.Scan(&orgIDStr, &status, &settings) {
+		if status != "" {
+			continue // already backfilled
+		}
+		// Check legacy settings['status']
+		if legacyStatus, ok := settings["status"]; ok && legacyStatus != "" {
+			db.session.Query(`UPDATE organizations SET status = ? WHERE org_id = ?`,
+				legacyStatus, orgIDStr).Exec()
+		} else {
+			db.session.Query(`UPDATE organizations SET status = ? WHERE org_id = ?`,
+				"active", orgIDStr).Exec()
+		}
+	}
+	iter.Close()
 }
 
 // parseConsistency converts string to gocql.Consistency
@@ -648,6 +708,16 @@ CREATE TABLE IF NOT EXISTS sessions (
 	expires_at TIMESTAMP
 )`
 
+// Sessions by user — reverse index for bulk invalidation when a user is deactivated/deleted.
+// Partition by (org_id, user_id) so we can efficiently list and delete all sessions for a user.
+const migrationCreateSessionsByUser = `
+CREATE TABLE IF NOT EXISTS sessions_by_user (
+	org_id UUID,
+	user_id UUID,
+	token_hash TEXT,
+	PRIMARY KEY ((org_id, user_id), token_hash)
+)`
+
 // Repo API tokens for programmatic access to individual libraries
 // Partition by repo_id for efficient listing of tokens per repo
 const migrationCreateRepoAPITokens = `
@@ -773,7 +843,7 @@ CREATE TABLE IF NOT EXISTS block_id_mappings_by_internal (
 )`
 
 // GC processed items to ensure worker idempotency.
-// Records processed queue items (by combination of attributes) with a TTL to prevent 
+// Records processed queue items (by combination of attributes) with a TTL to prevent
 // double-decrement of ref_counts if the queue fails to acknowledge quickly.
 const migrationCreateGCProcessedItems = `
 CREATE TABLE IF NOT EXISTS gc_processed_items (
@@ -815,3 +885,13 @@ ALTER TABLE users ADD deleted_at TIMESTAMP`
 // Add deleted_at column to organizations table for soft-delete grace period
 const migrationAddOrgDeletedAt = `
 ALTER TABLE organizations ADD deleted_at TIMESTAMP`
+
+// Add status column to users table — lifecycle state independent of role.
+// Values: "active", "deactivated", "deleted"
+const migrationAddUserStatus = `
+ALTER TABLE users ADD status TEXT`
+
+// Add status column to organizations table — lifecycle state independent of settings map.
+// Values: "active", "deactivated", "deleted"
+const migrationAddOrgStatus = `
+ALTER TABLE organizations ADD status TEXT`

@@ -661,11 +661,17 @@ func (s *Server) setupRoutes() {
 		protected := apiV21.Group("")
 		protected.Use(s.authMiddleware())
 		{
+			// Extract session manager so admin handlers can invalidate sessions
+			var sessionInvalidator v2.SessionInvalidator
+			if s.authHandler != nil {
+				sessionInvalidator = s.authHandler.GetSessionManager()
+			}
+
 			// Admin API endpoints (superadmin and tenant admin)
-			v2.RegisterAdminRoutes(protected, s.db, s.config, s.permMiddleware, s.tokenStore, serverURL)
+			v2.RegisterAdminRoutes(protected, s.db, s.config, s.permMiddleware, s.tokenStore, sessionInvalidator, serverURL)
 
 			// Org-admin API endpoints (/api/v2.1/org/... — tenant admin for own org)
-			v2.RegisterOrgAdminRoutes(protected, s.db, s.config, s.permMiddleware)
+			v2.RegisterOrgAdminRoutes(protected, s.db, s.config, s.permMiddleware, sessionInvalidator)
 
 			// GC admin endpoints (staff only)
 			if s.gcService != nil {
@@ -1320,6 +1326,37 @@ func getViewMode(r *http.Request) string {
 	return ""
 }
 
+// enforceAccountStatus checks that the user and their org are active.
+// Used ONLY for repo API token auth (sessions are killed at source on deactivate/delete).
+// Returns an error (and aborts the gin context) if access is denied.
+func (s *Server) enforceAccountStatus(c *gin.Context, userID, orgID string) error {
+	// Check user status
+	var userStatus string
+	if err := s.db.Session().Query(
+		`SELECT status FROM users WHERE org_id = ? AND user_id = ?`, orgID, userID,
+	).Scan(&userStatus); err == nil {
+		if !v2.IsUserUsable(userStatus) {
+			c.JSON(http.StatusForbidden, gin.H{"error": "account " + userStatus})
+			c.Abort()
+			return fmt.Errorf("user %s", userStatus)
+		}
+	}
+
+	// Check org status
+	var orgStatus string
+	if err := s.db.Session().Query(
+		`SELECT status FROM organizations WHERE org_id = ?`, orgID,
+	).Scan(&orgStatus); err == nil {
+		if !v2.IsOrgUsable(orgStatus) {
+			c.JSON(http.StatusForbidden, gin.H{"error": "organization " + orgStatus})
+			c.Abort()
+			return fmt.Errorf("org %s", orgStatus)
+		}
+	}
+
+	return nil
+}
+
 // authMiddleware validates authentication tokens
 func (s *Server) authMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
@@ -1396,6 +1433,8 @@ func (s *Server) authMiddleware() gin.HandlerFunc {
 			if sessionMgr != nil {
 				session, err := sessionMgr.ValidateSession(token)
 				if err == nil {
+					// Sessions are killed at source when a user/org is deactivated or deleted,
+					// so no per-request status check is needed here.
 					c.Set("user_id", session.UserID)
 					c.Set("org_id", session.OrgID)
 					c.Set("email", session.Email)
@@ -1425,6 +1464,10 @@ func (s *Server) authMiddleware() gin.HandlerFunc {
 				if err := s.db.Session().Query(`
 					SELECT org_id FROM libraries_by_id WHERE library_id = ?
 				`, repoID).Scan(&orgID); err == nil {
+					// Enforce user and org lifecycle status for API tokens too
+					if err := s.enforceAccountStatus(c, generatedBy, orgID); err != nil {
+						return
+					}
 					c.Set("user_id", generatedBy)
 					c.Set("org_id", orgID)
 					c.Set("repo_api_token", true)
@@ -1546,6 +1589,10 @@ func (s *Server) smartLinkAuthMiddleware() gin.HandlerFunc {
 				if err := s.db.Session().Query(`
 					SELECT org_id FROM libraries_by_id WHERE library_id = ?
 				`, repoID).Scan(&orgID); err == nil {
+					// Enforce user and org lifecycle status for API tokens too
+					if err := s.enforceAccountStatus(c, generatedBy, orgID); err != nil {
+						return
+					}
 					c.Set("user_id", generatedBy)
 					c.Set("org_id", orgID)
 					c.Set("repo_api_token", true)
@@ -2067,16 +2114,16 @@ func (s *Server) handleSearchUser(c *gin.Context) {
 
 	// Query all users in the organization
 	iter := s.db.Session().Query(`
-		SELECT user_id, email, name, role FROM users WHERE org_id = ?
+		SELECT user_id, email, name, role, status FROM users WHERE org_id = ?
 	`, orgID).Iter()
 
 	var users []gin.H
-	var userID, email, name, role string
+	var userID, email, name, role, status string
 	queryLower := strings.ToLower(query)
 
-	for iter.Scan(&userID, &email, &name, &role) {
-		// Skip deactivated users
-		if role == "deactivated" {
+	for iter.Scan(&userID, &email, &name, &role, &status) {
+		// Skip non-active users
+		if !v2.IsUserUsable(status) {
 			continue
 		}
 		// Match against email or name (case-insensitive)

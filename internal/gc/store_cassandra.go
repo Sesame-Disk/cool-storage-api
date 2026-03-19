@@ -1141,7 +1141,7 @@ func (s *CassandraStore) LoadGCStats(key string) (string, error) {
 func (s *CassandraStore) ListDeletedUsersExpired(graceDays int) ([]DeletedUserInfo, error) {
 	cutoff := time.Now().AddDate(0, 0, -graceDays)
 
-	// Scan all orgs for users with role='deleted' and deleted_at before cutoff
+	// Scan all orgs for users with status='deleted' and deleted_at before cutoff
 	orgIter := s.db.Session().Query(`SELECT org_id FROM organizations`).Iter()
 	var orgIDStr string
 	var result []DeletedUserInfo
@@ -1153,13 +1153,13 @@ func (s *CassandraStore) ListDeletedUsersExpired(graceDays int) ([]DeletedUserIn
 		}
 
 		iter := s.db.Session().Query(`
-			SELECT user_id, email, deleted_at FROM users WHERE org_id = ?
+			SELECT user_id, email, status, deleted_at FROM users WHERE org_id = ?
 		`, orgIDStr).Iter()
 
-		var userIDStr, email string
+		var userIDStr, email, status string
 		var deletedAt *time.Time
-		for iter.Scan(&userIDStr, &email, &deletedAt) {
-			if deletedAt == nil || deletedAt.IsZero() {
+		for iter.Scan(&userIDStr, &email, &status, &deletedAt) {
+			if status != "deleted" || deletedAt == nil || deletedAt.IsZero() {
 				continue
 			}
 			if deletedAt.Before(cutoff) {
@@ -1334,15 +1334,15 @@ func (s *CassandraStore) HardDeleteLibrary(orgID, libraryID uuid.UUID) error {
 
 func (s *CassandraStore) ListExpiredDeletedOrgs(graceDays int) ([]DeletedOrgInfo, error) {
 	iter := s.db.Session().Query(`
-		SELECT org_id, name, deleted_at FROM organizations
+		SELECT org_id, name, status, deleted_at FROM organizations
 	`).Iter()
 
 	cutoff := time.Now().AddDate(0, 0, -graceDays)
-	var orgIDStr, name string
+	var orgIDStr, name, status string
 	var deletedAt *time.Time
 	var result []DeletedOrgInfo
-	for iter.Scan(&orgIDStr, &name, &deletedAt) {
-		if deletedAt == nil || deletedAt.IsZero() {
+	for iter.Scan(&orgIDStr, &name, &status, &deletedAt) {
+		if status != "deleted" || deletedAt == nil || deletedAt.IsZero() {
 			continue
 		}
 		if deletedAt.Before(cutoff) {

@@ -110,16 +110,52 @@ func TestRequireSuperAdminMiddleware_RejectsUserIDOnlyNoOrgID(t *testing.T) {
 	assert.Equal(t, http.StatusUnauthorized, w.Code)
 }
 
-// --- DeactivateOrganization handler tests ---
+// --- SoftDeleteOrganization (DELETE) handler tests ---
+
+func TestSoftDeleteOrganization_DELETE_PlatformOrgProtection(t *testing.T) {
+	h := &AdminHandler{}
+
+	r := gin.New()
+	r.DELETE("/admin/organizations/:org_id", h.SoftDeleteOrganization)
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("DELETE", "/admin/organizations/"+middleware.PlatformOrgID, nil)
+	r.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusForbidden, w.Code)
+
+	var body map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &body)
+	assert.Equal(t, "cannot delete platform organization", body["error"])
+}
+
+func TestSoftDeleteOrganization_DELETE_NonPlatformOrgHitsDB(t *testing.T) {
+	// With nil DB, a non-platform org_id will panic or return 500 —
+	// confirms it doesn't get the 403 protection response.
+	h := &AdminHandler{}
+
+	r := gin.New()
+	r.Use(gin.Recovery())
+	r.DELETE("/admin/organizations/:org_id", h.SoftDeleteOrganization)
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("DELETE", "/admin/organizations/00000000-0000-0000-0000-000000000099", nil)
+	r.ServeHTTP(w, req)
+
+	// Should NOT be 403 (that's the platform protection). It should be 500 (nil DB panic recovered).
+	assert.NotEqual(t, http.StatusForbidden, w.Code)
+}
+
+// --- DeactivateOrganization (POST /deactivate/) handler tests ---
 
 func TestDeactivateOrganization_PlatformOrgProtection(t *testing.T) {
 	h := &AdminHandler{}
 
 	r := gin.New()
-	r.DELETE("/admin/organizations/:org_id", h.DeactivateOrganization)
+	r.POST("/admin/organizations/:org_id/deactivate/", h.DeactivateOrganization)
 
 	w := httptest.NewRecorder()
-	req, _ := http.NewRequest("DELETE", "/admin/organizations/"+middleware.PlatformOrgID, nil)
+	req, _ := http.NewRequest("POST", "/admin/organizations/"+middleware.PlatformOrgID+"/deactivate/", nil)
 	r.ServeHTTP(w, req)
 
 	assert.Equal(t, http.StatusForbidden, w.Code)
@@ -130,25 +166,22 @@ func TestDeactivateOrganization_PlatformOrgProtection(t *testing.T) {
 }
 
 func TestDeactivateOrganization_NonPlatformOrgHitsDB(t *testing.T) {
-	// With nil DB, a non-platform org_id will panic or return 500 —
-	// confirms it doesn't get the 403 protection response.
 	h := &AdminHandler{}
 
 	r := gin.New()
 	r.Use(gin.Recovery())
-	r.DELETE("/admin/organizations/:org_id", h.DeactivateOrganization)
+	r.POST("/admin/organizations/:org_id/deactivate/", h.DeactivateOrganization)
 
 	w := httptest.NewRecorder()
-	req, _ := http.NewRequest("DELETE", "/admin/organizations/00000000-0000-0000-0000-000000000099", nil)
+	req, _ := http.NewRequest("POST", "/admin/organizations/00000000-0000-0000-0000-000000000099/deactivate/", nil)
 	r.ServeHTTP(w, req)
 
-	// Should NOT be 403 (that's the platform protection). It should be 500 (nil DB panic recovered).
 	assert.NotEqual(t, http.StatusForbidden, w.Code)
 }
 
-// --- DeactivateUser handler tests ---
+// --- SoftDeleteUser handler tests ---
 
-func TestDeactivateUser_SelfDeactivation(t *testing.T) {
+func TestSoftDeleteUser_SelfDeletion(t *testing.T) {
 	h := &AdminHandler{
 		permMiddleware: middleware.NewPermissionMiddleware(nil),
 	}
@@ -161,7 +194,7 @@ func TestDeactivateUser_SelfDeactivation(t *testing.T) {
 		c.Set("org_id", middleware.PlatformOrgID)
 		c.Next()
 	})
-	r.DELETE("/admin/users/:user_id", h.DeactivateUser)
+	r.DELETE("/admin/users/:user_id", h.SoftDeleteUser)
 
 	w := httptest.NewRecorder()
 	req, _ := http.NewRequest("DELETE", "/admin/users/user-123", nil)
@@ -174,8 +207,8 @@ func TestDeactivateUser_SelfDeactivation(t *testing.T) {
 	assert.True(t, w.Code == http.StatusInternalServerError || w.Code == http.StatusBadRequest || w.Code == http.StatusForbidden)
 }
 
-func TestDeactivateUser_SelfCheckLogic(t *testing.T) {
-	// Directly test the self-deactivation check logic that exists in DeactivateUser
+func TestSoftDeleteUser_SelfCheckLogic(t *testing.T) {
+	// Directly test the self-deletion check logic that exists in SoftDeleteUser
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
 
@@ -187,7 +220,7 @@ func TestDeactivateUser_SelfCheckLogic(t *testing.T) {
 	targetUserID := "user-123"
 
 	if targetUserID == callerUserID {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "cannot deactivate your own account"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "cannot delete your own account"})
 	}
 
 	assert.Equal(t, http.StatusBadRequest, w.Code)
@@ -395,6 +428,7 @@ func TestMakeAdminUserResponse(t *testing.T) {
 		email      string
 		userName   string
 		role       string
+		status     string
 		quotaBytes int64
 		usedBytes  int64
 		wantActive bool
@@ -406,6 +440,7 @@ func TestMakeAdminUserResponse(t *testing.T) {
 			email:      "user@example.com",
 			userName:   "Regular User",
 			role:       "user",
+			status:     "active",
 			quotaBytes: 1099511627776,
 			usedBytes:  512000,
 			wantActive: true,
@@ -417,6 +452,7 @@ func TestMakeAdminUserResponse(t *testing.T) {
 			email:      "admin@example.com",
 			userName:   "Admin User",
 			role:       "admin",
+			status:     "active",
 			quotaBytes: 2199023255552,
 			usedBytes:  1048576,
 			wantActive: true,
@@ -428,6 +464,7 @@ func TestMakeAdminUserResponse(t *testing.T) {
 			email:      "super@example.com",
 			userName:   "Super Admin",
 			role:       "superadmin",
+			status:     "active",
 			quotaBytes: -1,
 			usedBytes:  0,
 			wantActive: true,
@@ -438,18 +475,20 @@ func TestMakeAdminUserResponse(t *testing.T) {
 			name:       "deactivated user has is_active false and is_staff false",
 			email:      "deactivated@example.com",
 			userName:   "Gone User",
-			role:       "deactivated",
+			role:       "user",
+			status:     "deactivated",
 			quotaBytes: 0,
 			usedBytes:  0,
 			wantActive: false,
 			wantStaff:  false,
-			wantRole:   "deactivated",
+			wantRole:   "user",
 		},
 		{
 			name:       "readonly user is not staff",
 			email:      "readonly@example.com",
 			userName:   "Read Only",
 			role:       "readonly",
+			status:     "active",
 			quotaBytes: 500000,
 			usedBytes:  100000,
 			wantActive: true,
@@ -461,6 +500,7 @@ func TestMakeAdminUserResponse(t *testing.T) {
 			email:      "guest@example.com",
 			userName:   "Guest User",
 			role:       "guest",
+			status:     "active",
 			quotaBytes: 0,
 			usedBytes:  0,
 			wantActive: true,
@@ -471,7 +511,7 @@ func TestMakeAdminUserResponse(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			resp := makeAdminUserResponse(tt.email, tt.userName, tt.role, tt.quotaBytes, tt.usedBytes, fixedTime)
+			resp := makeAdminUserResponse(tt.email, tt.userName, tt.role, tt.status, tt.quotaBytes, tt.usedBytes, fixedTime)
 
 			assert.Equal(t, tt.email, resp.Email)
 			assert.Equal(t, tt.userName, resp.Name)
@@ -741,7 +781,7 @@ func TestRegisterAdminRoutes_RoutesExist(t *testing.T) {
 	pm := middleware.NewPermissionMiddleware(nil)
 	cfg := &config.Config{}
 	rg := r.Group("/api/v2.1")
-	RegisterAdminRoutes(rg, nil, cfg, pm, nil, "")
+	RegisterAdminRoutes(rg, nil, cfg, pm, nil, nil, "")
 
 	tests := []struct {
 		name   string
@@ -755,6 +795,7 @@ func TestRegisterAdminRoutes_RoutesExist(t *testing.T) {
 		{"GET search-user", "GET", "/api/v2.1/admin/search-user/"},
 		{"GET admins", "GET", "/api/v2.1/admin/admins/"},
 		{"POST org soft-delete", "POST", "/api/v2.1/admin/organizations/00000000-0000-0000-0000-000000000001/delete/"},
+		{"POST org deactivate", "POST", "/api/v2.1/admin/organizations/00000000-0000-0000-0000-000000000001/deactivate/"},
 		{"POST org restore", "POST", "/api/v2.1/admin/organizations/00000000-0000-0000-0000-000000000001/restore/"},
 	}
 
@@ -858,7 +899,7 @@ func TestNewAdminHandler(t *testing.T) {
 	pm := middleware.NewPermissionMiddleware(nil)
 	cfg := &config.Config{}
 
-	handler := NewAdminHandler(nil, cfg, pm, nil, "")
+	handler := NewAdminHandler(nil, cfg, pm, nil, nil, "")
 
 	assert.NotNil(t, handler)
 	assert.Nil(t, handler.db)

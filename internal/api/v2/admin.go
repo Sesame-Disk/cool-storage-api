@@ -25,24 +25,26 @@ type AdminHandler struct {
 	config         *config.Config
 	permMiddleware *middleware.PermissionMiddleware
 	tokenCreator   TokenCreator
+	sessions       SessionInvalidator
 	serverURL      string
 }
 
 // NewAdminHandler creates a new AdminHandler
-func NewAdminHandler(database *db.DB, cfg *config.Config, perm *middleware.PermissionMiddleware, tokenCreator TokenCreator, serverURL string) *AdminHandler {
+func NewAdminHandler(database *db.DB, cfg *config.Config, perm *middleware.PermissionMiddleware, tokenCreator TokenCreator, sessions SessionInvalidator, serverURL string) *AdminHandler {
 	return &AdminHandler{
 		db:             database,
 		config:         cfg,
 		permMiddleware: perm,
 		tokenCreator:   tokenCreator,
+		sessions:       sessions,
 		serverURL:      serverURL,
 	}
 }
 
 // RegisterAdminRoutes registers admin API routes under the given router group.
 // All org CRUD endpoints require superadmin. User management allows tenant admin for own org.
-func RegisterAdminRoutes(rg *gin.RouterGroup, database *db.DB, cfg *config.Config, perm *middleware.PermissionMiddleware, tokenCreator TokenCreator, serverURL string) {
-	h := NewAdminHandler(database, cfg, perm, tokenCreator, serverURL)
+func RegisterAdminRoutes(rg *gin.RouterGroup, database *db.DB, cfg *config.Config, perm *middleware.PermissionMiddleware, tokenCreator TokenCreator, sessions SessionInvalidator, serverURL string) {
+	h := NewAdminHandler(database, cfg, perm, tokenCreator, sessions, serverURL)
 
 	admin := rg.Group("/admin")
 	{
@@ -59,10 +61,14 @@ func RegisterAdminRoutes(rg *gin.RouterGroup, database *db.DB, cfg *config.Confi
 			superadminOnly.POST("/organizations", h.CreateOrganization)
 			superadminOnly.PUT("/organizations/:org_id/", h.UpdateOrganization)
 			superadminOnly.PUT("/organizations/:org_id", h.UpdateOrganization)
-			superadminOnly.DELETE("/organizations/:org_id/", h.DeactivateOrganization)
-			superadminOnly.DELETE("/organizations/:org_id", h.DeactivateOrganization)
-			superadminOnly.POST("/organizations/:org_id/delete/", h.SoftDeleteOrganization)
-			superadminOnly.POST("/organizations/:org_id/delete", h.SoftDeleteOrganization)
+			superadminOnly.DELETE("/organizations/:org_id/", h.SoftDeleteOrganization)
+			superadminOnly.DELETE("/organizations/:org_id", h.SoftDeleteOrganization)
+			superadminOnly.POST("/organizations/:org_id/delete/", h.SoftDeleteOrganization) // alias for DELETE
+			superadminOnly.POST("/organizations/:org_id/delete", h.SoftDeleteOrganization)  // alias for DELETE
+			superadminOnly.POST("/organizations/:org_id/deactivate/", h.DeactivateOrganization)
+			superadminOnly.POST("/organizations/:org_id/deactivate", h.DeactivateOrganization)
+			superadminOnly.POST("/organizations/:org_id/reactivate/", h.ReactivateOrganization)
+			superadminOnly.POST("/organizations/:org_id/reactivate", h.ReactivateOrganization)
 			superadminOnly.POST("/organizations/:org_id/restore/", h.RestoreOrganization)
 			superadminOnly.POST("/organizations/:org_id/restore", h.RestoreOrganization)
 		}
@@ -405,18 +411,18 @@ func (h *AdminHandler) CreateOrganization(c *gin.Context) {
 		batch := h.db.Session().Batch(gocql.LoggedBatch)
 		batch.Query(`
 			INSERT INTO organizations (
-				org_id, name, settings, storage_quota, storage_used,
+				org_id, name, status, settings, storage_quota, storage_used,
 				chunking_polynomial, storage_config, created_at
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 		`,
-			orgID.String(), orgName, settings,
+			orgID.String(), orgName, StatusActive, settings,
 			storageQuota, int64(0), int64(17592186044415),
 			storageConfig, now,
 		)
 		batch.Query(`
-			INSERT INTO users (org_id, user_id, email, name, role, quota_bytes, used_bytes, created_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-		`, orgID.String(), ownerUserID.String(), ownerEmail, ownerName, "admin",
+			INSERT INTO users (org_id, user_id, email, name, role, status, quota_bytes, used_bytes, created_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`, orgID.String(), ownerUserID.String(), ownerEmail, ownerName, "admin", StatusActive,
 			int64(107374182400), int64(0), now)
 
 		batch.Query(`
@@ -433,11 +439,11 @@ func (h *AdminHandler) CreateOrganization(c *gin.Context) {
 	} else {
 		if err := h.db.Session().Query(`
 			INSERT INTO organizations (
-				org_id, name, settings, storage_quota, storage_used,
+				org_id, name, status, settings, storage_quota, storage_used,
 				chunking_polynomial, storage_config, created_at
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 		`,
-			orgID.String(), orgName, settings,
+			orgID.String(), orgName, StatusActive, settings,
 			storageQuota, int64(0), int64(17592186044415),
 			storageConfig, now,
 		).Exec(); err != nil {
@@ -564,41 +570,11 @@ func (h *AdminHandler) UpdateOrganization(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"success": true})
 }
 
-// DeactivateOrganization deactivates an organization (superadmin only)
+// SoftDeleteOrganization soft-deletes an organization (superadmin only).
+// Sets status="deleted" + deleted_at; after OrgGraceDays the GC scanner
+// will cascade-delete all resources.
 // DELETE /admin/organizations/:org_id/
-func (h *AdminHandler) DeactivateOrganization(c *gin.Context) {
-	orgID := c.Param("org_id")
-
-	// Don't allow deactivating the platform org
-	if orgID == middleware.PlatformOrgID {
-		c.JSON(http.StatusForbidden, gin.H{"error": "cannot deactivate platform organization"})
-		return
-	}
-
-	// Verify org exists
-	var name string
-	err := h.db.Session().Query(`
-		SELECT name FROM organizations WHERE org_id = ?
-	`, orgID).Scan(&name)
-	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "organization not found"})
-		return
-	}
-
-	// Mark org as deactivated by setting a setting
-	if err := h.db.Session().Query(`
-		UPDATE organizations SET settings['status'] = ? WHERE org_id = ?
-	`, "deactivated", orgID).Exec(); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to deactivate organization"})
-		return
-	}
-
-	c.JSON(http.StatusOK, gin.H{"success": true})
-}
-
-// SoftDeleteOrganization marks an organization as deleted with a grace period.
-// After OrgGraceDays the GC scanner will cascade-delete all resources.
-// POST /admin/organizations/:org_id/delete/
+// POST   /admin/organizations/:org_id/delete/  (alias, kept for backward compat)
 func (h *AdminHandler) SoftDeleteOrganization(c *gin.Context) {
 	orgID := c.Param("org_id")
 
@@ -617,11 +593,39 @@ func (h *AdminHandler) SoftDeleteOrganization(c *gin.Context) {
 		return
 	}
 
-	if err := softDeleteOrg(h.db, orgID, time.Now()); err != nil {
+	if err := softDeleteOrg(h.db, h.sessions, orgID, time.Now()); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete organization"})
 		return
 	}
+	c.JSON(http.StatusOK, gin.H{"success": true})
+}
 
+// DeactivateOrganization sets an organization to status="deactivated" (superadmin only).
+// This is a reversible, non-destructive operation — no grace period, no GC cascade.
+// Use POST .../reactivate/ to reverse.
+// POST /admin/organizations/:org_id/deactivate/
+func (h *AdminHandler) DeactivateOrganization(c *gin.Context) {
+	orgID := c.Param("org_id")
+
+	if orgID == middleware.PlatformOrgID {
+		c.JSON(http.StatusForbidden, gin.H{"error": "cannot deactivate platform organization"})
+		return
+	}
+
+	// Verify org exists
+	var name string
+	err := h.db.Session().Query(`
+		SELECT name FROM organizations WHERE org_id = ?
+	`, orgID).Scan(&name)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "organization not found"})
+		return
+	}
+
+	if err := deactivateOrg(h.db, h.sessions, orgID); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to deactivate organization"})
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{"success": true})
 }
 
@@ -630,25 +634,50 @@ func (h *AdminHandler) SoftDeleteOrganization(c *gin.Context) {
 func (h *AdminHandler) RestoreOrganization(c *gin.Context) {
 	orgID := c.Param("org_id")
 
-	// Verify org exists and is actually deleted
-	var deletedAt *time.Time
+	// Verify org exists and is actually in "deleted" state
+	var orgStatus string
 	err := h.db.Session().Query(`
-		SELECT deleted_at FROM organizations WHERE org_id = ?
-	`, orgID).Scan(&deletedAt)
+		SELECT status FROM organizations WHERE org_id = ?
+	`, orgID).Scan(&orgStatus)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "organization not found"})
 		return
 	}
-	if deletedAt == nil || deletedAt.IsZero() {
+	if orgStatus != StatusDeleted {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "organization is not deleted"})
 		return
 	}
 
-	if err := restoreDeletedOrg(h.db, orgID); err != nil {
+	if err := activateOrg(h.db, orgID); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to restore organization"})
 		return
 	}
+	c.JSON(http.StatusOK, gin.H{"success": true})
+}
 
+// ReactivateOrganization reactivates a deactivated org (status="deactivated" → "active").
+// Does NOT restore soft-deleted orgs — use /restore/ for that.
+// POST /admin/organizations/:org_id/reactivate/
+func (h *AdminHandler) ReactivateOrganization(c *gin.Context) {
+	orgID := c.Param("org_id")
+
+	var orgStatus string
+	err := h.db.Session().Query(`
+		SELECT status FROM organizations WHERE org_id = ?
+	`, orgID).Scan(&orgStatus)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "organization not found"})
+		return
+	}
+	if orgStatus != StatusDeactivated {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "organization is not deactivated"})
+		return
+	}
+
+	if err := activateOrg(h.db, orgID); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to reactivate organization"})
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{"success": true})
 }
 
@@ -685,17 +714,17 @@ func (h *AdminHandler) ListOrgUsers(c *gin.Context) {
 	}
 
 	iter := h.db.Session().Query(`
-		SELECT user_id, email, name, role, quota_bytes, used_bytes, created_at
+		SELECT user_id, email, name, role, status, quota_bytes, used_bytes, created_at
 		FROM users WHERE org_id = ?
 	`, targetOrgID).Iter()
 
 	var users []gin.H
-	var userID, email, name, role string
+	var userID, email, name, role, status string
 	var quotaBytes, usedBytes int64
 	var createdAt time.Time
 
-	for iter.Scan(&userID, &email, &name, &role, &quotaBytes, &usedBytes, &createdAt) {
-		isActive := role != "deactivated"
+	for iter.Scan(&userID, &email, &name, &role, &status, &quotaBytes, &usedBytes, &createdAt) {
+		isActive := IsUserUsable(status)
 		isOrgStaff := role == "admin" || role == "superadmin"
 		users = append(users, gin.H{
 			"email":        email,
@@ -753,7 +782,7 @@ func (h *AdminHandler) adminUsersHandler(c *gin.Context) {
 				h.UpdateUser(c)
 			}
 		case "DELETE":
-			h.DeactivateUser(c)
+			h.SoftDeleteUser(c)
 		default:
 			c.JSON(http.StatusMethodNotAllowed, gin.H{"error": "method not allowed"})
 		}
@@ -786,7 +815,7 @@ func (h *AdminHandler) adminUsersHandler(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "user identifier required"})
 		} else {
 			c.Set("resolved_user_param", path)
-			h.DeactivateUser(c)
+			h.SoftDeleteUser(c)
 		}
 	default:
 		c.JSON(http.StatusMethodNotAllowed, gin.H{"error": "method not allowed"})
@@ -922,10 +951,11 @@ func (h *AdminHandler) UpdateUser(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"success": true})
 }
 
-// DeactivateUser deactivates a user.
+// SoftDeleteUser soft-deletes a user (status="deleted", sets deleted_at).
+// After UserGraceDays the GC scanner will cascade-delete all resources.
 // DELETE /admin/users/:user_id/
 // If :user_id contains an @ sign, it's treated as an email lookup (seafile-js compatible).
-func (h *AdminHandler) DeactivateUser(c *gin.Context) {
+func (h *AdminHandler) SoftDeleteUser(c *gin.Context) {
 	targetUserID := h.getResolvedUserParam(c)
 
 	// Dispatch to email-based handler if the param looks like an email
@@ -941,20 +971,19 @@ func (h *AdminHandler) DeactivateUser(c *gin.Context) {
 		return
 	}
 
-	// Don't allow deactivating yourself
+	// Don't allow deleting yourself
 	if targetUserID == callerUserID {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "cannot deactivate your own account"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "cannot delete your own account"})
 		return
 	}
 
 	orgID := callerOrgID
 
 	// Soft-delete: mark as "deleted" with timestamp for grace period cascade
-	if err := softDeleteUser(h.db, orgID, targetUserID, time.Now()); err != nil {
+	if err := softDeleteUser(h.db, h.sessions, orgID, targetUserID, time.Now()); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete user"})
 		return
 	}
-
 	c.JSON(http.StatusOK, gin.H{"success": true})
 }
 
@@ -1815,7 +1844,7 @@ type adminUserResponse struct {
 	LastLogin  string `json:"last_login"`
 }
 
-func makeAdminUserResponse(email, name, role string, quotaBytes, usedBytes int64, createdAt time.Time) adminUserResponse {
+func makeAdminUserResponse(email, name, role, status string, quotaBytes, usedBytes int64, createdAt time.Time) adminUserResponse {
 	// admin_role is the role shown in the admin panel dropdown (only for admin/superadmin users)
 	adminRole := role
 	if role != "admin" && role != "superadmin" {
@@ -1824,7 +1853,7 @@ func makeAdminUserResponse(email, name, role string, quotaBytes, usedBytes int64
 	return adminUserResponse{
 		Email:      email,
 		Name:       name,
-		IsActive:   role != "deactivated",
+		IsActive:   IsUserUsable(status),
 		IsStaff:    role == "admin" || role == "superadmin",
 		Role:       role,
 		AdminRole:  adminRole,
@@ -1873,18 +1902,18 @@ func (h *AdminHandler) ListAllUsers(c *gin.Context) {
 	seen := make(map[string]bool) // deduplicate by email
 	for _, orgID := range orgIDs {
 		iter := h.db.Session().Query(`
-			SELECT user_id, email, name, role, quota_bytes, used_bytes, created_at
+			SELECT user_id, email, name, role, status, quota_bytes, used_bytes, created_at
 			FROM users WHERE org_id = ?
 		`, orgID).Iter()
 
-		var userID, email, name, role string
+		var userID, email, name, role, status string
 		var quotaBytes, usedBytes int64
 		var createdAt time.Time
 
-		for iter.Scan(&userID, &email, &name, &role, &quotaBytes, &usedBytes, &createdAt) {
+		for iter.Scan(&userID, &email, &name, &role, &status, &quotaBytes, &usedBytes, &createdAt) {
 			if !seen[email] {
 				seen[email] = true
-				allUsers = append(allUsers, makeAdminUserResponse(email, name, role, quotaBytes, usedBytes, createdAt))
+				allUsers = append(allUsers, makeAdminUserResponse(email, name, role, status, quotaBytes, usedBytes, createdAt))
 			}
 		}
 		if err := iter.Close(); err != nil {
@@ -1954,18 +1983,18 @@ func (h *AdminHandler) SearchUsers(c *gin.Context) {
 	seen := make(map[string]bool)
 	for _, orgID := range orgIDs {
 		iter := h.db.Session().Query(`
-			SELECT user_id, email, name, role, quota_bytes, used_bytes, created_at
+			SELECT user_id, email, name, role, status, quota_bytes, used_bytes, created_at
 			FROM users WHERE org_id = ?
 		`, orgID).Iter()
 
-		var userID, email, name, role string
+		var userID, email, name, role, status string
 		var quotaBytes, usedBytes int64
 		var createdAt time.Time
 
-		for iter.Scan(&userID, &email, &name, &role, &quotaBytes, &usedBytes, &createdAt) {
+		for iter.Scan(&userID, &email, &name, &role, &status, &quotaBytes, &usedBytes, &createdAt) {
 			if !seen[email] && (strings.Contains(strings.ToLower(email), query) || strings.Contains(strings.ToLower(name), query)) {
 				seen[email] = true
-				results = append(results, makeAdminUserResponse(email, name, role, quotaBytes, usedBytes, createdAt))
+				results = append(results, makeAdminUserResponse(email, name, role, status, quotaBytes, usedBytes, createdAt))
 			}
 		}
 		iter.Close()
@@ -2033,7 +2062,7 @@ func (h *AdminHandler) AdminCreateUser(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusCreated, makeAdminUserResponse(email, name, role, -2, 0, now))
+	c.JSON(http.StatusCreated, makeAdminUserResponse(email, name, role, "active", -2, 0, now))
 }
 
 // GetUserByEmail returns user details by email.
@@ -2054,19 +2083,19 @@ func (h *AdminHandler) GetUserByEmail(c *gin.Context, email string) {
 		return
 	}
 
-	var name, role string
+	var name, role, status string
 	var quotaBytes, usedBytes int64
 	var createdAt time.Time
 
 	if err := h.db.Session().Query(`
-		SELECT name, role, quota_bytes, used_bytes, created_at
+		SELECT name, role, status, quota_bytes, used_bytes, created_at
 		FROM users WHERE org_id = ? AND user_id = ?
-	`, userOrgID, userID).Scan(&name, &role, &quotaBytes, &usedBytes, &createdAt); err != nil {
+	`, userOrgID, userID).Scan(&name, &role, &status, &quotaBytes, &usedBytes, &createdAt); err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "user not found"})
 		return
 	}
 
-	c.JSON(http.StatusOK, makeAdminUserResponse(email, name, role, quotaBytes, usedBytes, createdAt))
+	c.JSON(http.StatusOK, makeAdminUserResponse(email, name, role, status, quotaBytes, usedBytes, createdAt))
 }
 
 // UpdateUserByEmail updates a user by email.
@@ -2086,13 +2115,13 @@ func (h *AdminHandler) UpdateUserByEmail(c *gin.Context, email string) {
 	}
 
 	// Read current user data to return updated response
-	var currentName, currentRole string
+	var currentName, currentRole, currentStatus string
 	var currentQuota, currentUsed int64
 	var currentCreated time.Time
 	h.db.Session().Query(`
-		SELECT name, role, quota_bytes, used_bytes, created_at
+		SELECT name, role, status, quota_bytes, used_bytes, created_at
 		FROM users WHERE org_id = ? AND user_id = ?
-	`, userOrgID, userID).Scan(&currentName, &currentRole, &currentQuota, &currentUsed, &currentCreated)
+	`, userOrgID, userID).Scan(&currentName, &currentRole, &currentStatus, &currentQuota, &currentUsed, &currentCreated)
 
 	// Read form values
 	newRole := c.Request.FormValue("role")
@@ -2167,20 +2196,24 @@ func (h *AdminHandler) UpdateUserByEmail(c *gin.Context, email string) {
 	}
 
 	if isActiveStr == "false" {
-		currentRole = "deactivated"
-		if err := h.db.Session().Query(`
-			UPDATE users SET role = ? WHERE org_id = ? AND user_id = ?
-		`, "deactivated", userOrgID, userID).Exec(); err != nil {
+		if err := deactivateUser(h.db, h.sessions, userOrgID, userID); err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update user"})
 			return
 		}
+		currentStatus = "deactivated"
+	} else if isActiveStr == "true" {
+		if err := activateUser(h.db, userOrgID, userID); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update user"})
+			return
+		}
+		currentStatus = "active"
 	}
 
-	resp := makeAdminUserResponse(email, currentName, currentRole, currentQuota, currentUsed, currentCreated)
+	resp := makeAdminUserResponse(email, currentName, currentRole, currentStatus, currentQuota, currentUsed, currentCreated)
 	c.JSON(http.StatusOK, resp)
 }
 
-// DeleteUserByEmail deactivates a user by email.
+// DeleteUserByEmail soft-deletes a user by email (grace period → GC cascade).
 // DELETE /admin/users/:email/
 func (h *AdminHandler) DeleteUserByEmail(c *gin.Context, email string) {
 	callerOrgID := c.GetString("org_id")
@@ -2196,18 +2229,17 @@ func (h *AdminHandler) DeleteUserByEmail(c *gin.Context, email string) {
 		return
 	}
 
-	// Don't allow deactivating yourself
+	// Don't allow deleting yourself
 	if userID == callerUserID {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "cannot deactivate your own account"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "cannot delete your own account"})
 		return
 	}
 
 	// Soft-delete: mark as "deleted" with timestamp for grace period cascade
-	if err := softDeleteUser(h.db, userOrgID, userID, time.Now()); err != nil {
+	if err := softDeleteUser(h.db, h.sessions, userOrgID, userID, time.Now()); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete user"})
 		return
 	}
-
 	c.JSON(http.StatusOK, gin.H{"success": true})
 }
 
@@ -2234,23 +2266,22 @@ func (h *AdminHandler) RestoreUser(c *gin.Context) {
 	}
 
 	// Verify user is actually in "deleted" state
-	var currentRole string
+	var currentStatus string
 	if err := h.db.Session().Query(`
-		SELECT role FROM users WHERE org_id = ? AND user_id = ?
-	`, userOrgID, userID).Scan(&currentRole); err != nil {
+		SELECT status FROM users WHERE org_id = ? AND user_id = ?
+	`, userOrgID, userID).Scan(&currentStatus); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to fetch user"})
 		return
 	}
-	if currentRole != "deleted" {
+	if currentStatus != StatusDeleted {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "user is not in deleted state"})
 		return
 	}
 
-	if err := restoreDeletedUser(h.db, userOrgID, userID); err != nil {
+	if err := activateUser(h.db, userOrgID, userID); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to restore user"})
 		return
 	}
-
 	c.JSON(http.StatusOK, gin.H{"success": true})
 }
 
@@ -2283,18 +2314,18 @@ func (h *AdminHandler) ListAdminUsers(c *gin.Context) {
 	seen := make(map[string]bool)
 	for _, orgID := range orgIDs {
 		iter := h.db.Session().Query(`
-			SELECT user_id, email, name, role, quota_bytes, used_bytes, created_at
+			SELECT user_id, email, name, role, status, quota_bytes, used_bytes, created_at
 			FROM users WHERE org_id = ?
 		`, orgID).Iter()
 
-		var userID, email, name, role string
+		var userID, email, name, role, status string
 		var quotaBytes, usedBytes int64
 		var createdAt time.Time
 
-		for iter.Scan(&userID, &email, &name, &role, &quotaBytes, &usedBytes, &createdAt) {
+		for iter.Scan(&userID, &email, &name, &role, &status, &quotaBytes, &usedBytes, &createdAt) {
 			if !seen[email] && role == "superadmin" {
 				seen[email] = true
-				admins = append(admins, makeAdminUserResponse(email, name, role, quotaBytes, usedBytes, createdAt))
+				admins = append(admins, makeAdminUserResponse(email, name, role, status, quotaBytes, usedBytes, createdAt))
 			}
 		}
 		iter.Close()
@@ -2343,17 +2374,17 @@ func (h *AdminHandler) BatchAddAdmins(c *gin.Context) {
 		}
 
 		// Read back updated user data
-		var name, role string
+		var name, role, status string
 		var quotaBytes, usedBytes int64
 		var createdAt time.Time
 		if err := h.db.Session().Query(`
-			SELECT name, role, quota_bytes, used_bytes, created_at
+			SELECT name, role, status, quota_bytes, used_bytes, created_at
 			FROM users WHERE org_id = ? AND user_id = ?
-		`, userOrgID, userID).Scan(&name, &role, &quotaBytes, &usedBytes, &createdAt); err != nil {
+		`, userOrgID, userID).Scan(&name, &role, &status, &quotaBytes, &usedBytes, &createdAt); err != nil {
 			failed = append(failed, gin.H{"email": email, "error_msg": "failed to read user"})
 			continue
 		}
-		success = append(success, makeAdminUserResponse(email, name, role, quotaBytes, usedBytes, createdAt))
+		success = append(success, makeAdminUserResponse(email, name, role, status, quotaBytes, usedBytes, createdAt))
 	}
 
 	if success == nil {

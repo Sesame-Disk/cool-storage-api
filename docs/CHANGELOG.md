@@ -8,6 +8,28 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## [Unreleased] - 2026-03-19
+
+### Changed
+- **User/Org lifecycle: separated `status` from `role`** — New `status` column (`active`, `deactivated`, `deleted`) on both `users` and `organizations` tables. Role field now only tracks permissions (`superadmin`, `admin`, `user`, `readonly`, `guest`), preserving the original role when a user is deactivated or deleted.
+- **Session invalidation on deactivate/delete** — New `sessions_by_user` reverse-index table enables bulk session invalidation. When a user or org is deactivated/deleted, all their sessions are killed immediately (DB + in-memory cache). This eliminates the need for per-request status checks on session-authenticated requests.
+- **Share link `active` flag enforcement** — When a user/org is deactivated or deleted, all their share links are set `active=false`. On reactivation, links are re-enabled (`active=true`). This preserves the links instead of losing them permanently. `resolveShareLink` distinguishes "disabled" (admin action) from "expired" (time/download limit) with different error messages.
+- **Single-use share links: hard delete** — Consumed single-use links are now permanently deleted from all 4 tables (not just marked `active=false`).
+- **Auth enforcement** — Repo API tokens validated via `enforceAccountStatus()` in both `authMiddleware` and `smartLinkAuthMiddleware`. Session-authenticated requests rely on session invalidation at source.
+- **OIDC login enforcement** — `provisionUser` rejects login attempts from deactivated/deleted users and orgs.
+- **Org deactivation** — Uses dedicated `status` column instead of `settings['status']` map entry.
+- **New endpoint** — `POST /admin/organizations/:org_id/reactivate/` (`ReactivateOrganization`) restores a deactivated org to active. Separate from `RestoreOrganization` which handles deleted orgs.
+- **Backfill migration** — Runs on startup: `role="deactivated"` → `status="deactivated", role="user"`; `role="deleted"` → `status="deleted"`; `settings['status']` → `status` column.
+
+### Added
+- `sessions_by_user` table — reverse index `(org_id, user_id) → token_hash` for bulk session invalidation
+- `InvalidateUserSessions()` in `SessionManager` — deletes all sessions from DB and evicts from cache
+- `SessionInvalidator` interface in `write_helpers.go` — decouples admin handlers from concrete session manager
+- `setUserShareLinksActive()`, `setOrgShareLinksActive()` helpers — batch-toggle `active` flag across all 3 share link tables
+- `deleteConsumedShareLink()` helper — hard-deletes consumed single-use links from all 4 tables
+
+---
+
 ## 2026-03-18 — Production Readiness: Soft-Delete Cascades, Org Deletion, Bulk Optimization
 
 **Session Type**: Feature (production hardening phases 3-5)

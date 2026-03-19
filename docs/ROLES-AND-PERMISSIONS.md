@@ -1,7 +1,7 @@
 # Roles & Permissions - SesameFS
 
-**Last Updated**: 2026-03-11
-**Status**: IMPLEMENTED — All phases complete (superadmin role, admin API, OIDC org provisioning, role sync)
+**Last Updated**: 2026-03-19
+**Status**: IMPLEMENTED — All phases complete (superadmin role, admin API, OIDC org provisioning, role sync, status/role separation)
 
 ---
 
@@ -14,6 +14,82 @@ SesameFS uses a **three-layer permission model**:
 3. **Resource level** — Library permissions, group roles, share links
 
 Users are provisioned exclusively through the **OIDC provider**. SesameFS does not create users directly — it auto-provisions on first login and syncs roles from OIDC claims.
+
+---
+
+## Role vs Status (Separated Fields)
+
+**Added**: 2026-03-19
+
+The `role` and `status` fields serve different purposes and are stored independently on both `users` and `organizations` tables.
+
+### `role` = Permission Level
+
+Determines what actions the user is allowed to perform. Values: `superadmin`, `admin`, `user`, `readonly`, `guest`.
+
+The role is **never overwritten** by lifecycle operations. A deactivated admin retains `role="admin"` and gets it back on reactivation.
+
+### `status` = Lifecycle State
+
+Determines whether the account is active, suspended, or pending deletion. Values: `active`, `deactivated`, `deleted`.
+
+- **`active`** — Normal operation. Full access according to `role`.
+- **`deactivated`** — Suspended. All access blocked (auth middleware rejects requests). Reversible by admin.
+- **`deleted`** — Pending permanent deletion. All access blocked. Reversible within grace period. After grace period, GC cascade removes all data.
+
+### Why They Are Separate
+
+Previously, `role` was overloaded to encode both permission level and lifecycle state (e.g., `role="deactivated"`). This caused the original role to be lost — when reactivating a user, the system could not restore them to their previous role (admin, user, etc.) and had to default to `"user"`.
+
+With separate fields:
+- Deactivating an admin: `role="admin"` stays, `status="deactivated"` is set
+- Reactivating: `status="active"` is set, user is still `role="admin"`
+
+### Status Transitions
+
+```
+Users:
+  active ──────► deactivated ──────► deleted ──────► [GC cascade after grace period]
+    ▲                │                   │
+    └────────────────┘                   │
+    (reactivate)     ◄───────────────────┘
+                     (restore within grace period)
+
+Organizations:
+  active ──────► deactivated ──────► deleted ──────► [GC cascade after grace period]
+    ▲                │                   │
+    └────────────────┘                   │
+    (reactivate)     ◄───────────────────┘
+                     (restore within grace period)
+```
+
+### Enforcement Points
+
+| Layer | What It Checks | Effect |
+|-------|---------------|--------|
+| `deactivateUser` / `softDeleteUser` / `deactivateOrg` / `softDeleteOrg` | N/A | Kills all sessions at source (DB + cache), sets share links `active=false` |
+| `reactivateUser` / `restoreDeletedUser` / `reactivateOrg` / `restoreDeletedOrg` | N/A | Sets share links `active=true` (re-enables them) |
+| `authMiddleware` (OIDC sessions) | Session existence | Sessions are killed at source — no per-request status query needed |
+| `authMiddleware` (Repo API tokens) | `enforceAccountStatus()` | Queries user `status` + org `status` — blocks deactivated/deleted |
+| `smartLinkAuthMiddleware` (Repo API tokens) | `enforceAccountStatus()` | Same as above |
+| `provisionUser` (OIDC) | User `status` + Org `status` at login | Rejects login attempts from deactivated/deleted users/orgs |
+| `resolveShareLink` | `active` flag on share link | Shows "disabled" (vs "expired") — link can be re-enabled on reactivation |
+
+### Side Effects on Deactivate/Delete
+
+When a user or org is deactivated/deleted, the helper functions trigger these side effects in a background goroutine:
+
+1. **Session invalidation** — `InvalidateUserSessions()` reads all `token_hash` from `sessions_by_user`, batch-deletes from both `sessions` and `sessions_by_user`, and evicts from in-memory cache.
+2. **Share link disable** — `setUserShareLinksActive(false)` / `setOrgShareLinksActive(false)` sets `active=false` on all share links across 3 tables (`share_links`, `share_links_by_creator`, `share_links_by_org`).
+
+On reactivation/restore, step 2 is reversed (`active=true`). Sessions are not restored — the user must log in again.
+
+### Backfill Migration
+
+Existing data is automatically migrated on startup:
+- `role="deactivated"` → `status="deactivated"`, `role="user"` (original role was lost, defaults to `"user"`)
+- `role="deleted"` → `status="deleted"`, `role` preserved
+- `organizations.settings['status']` → `organizations.status` column
 
 ---
 
@@ -78,7 +154,7 @@ GET /api/v2/admin/organizations/{org_id}/               # View org details
 GET /api/v2/admin/organizations/{org_id}/users/         # List org users
 GET /api/v2/admin/organizations/{org_id}/libraries/     # List org libraries
 PUT /api/v2/admin/organizations/{org_id}/               # Update org settings
-DELETE /api/v2/admin/organizations/{org_id}/             # Deactivate org
+DELETE /api/v2/admin/organizations/{org_id}/             # Soft-delete org (grace period → GC cascade)
 ```
 
 Super admins **cannot** use regular `/api/v2/repos/` endpoints (they have no tenant context). They must use the `/api/v2/admin/` prefix which explicitly requires a target org.
@@ -339,18 +415,19 @@ All phases are complete. Modified/created files:
 
 ---
 
-## Database Schema (No Changes Required)
+## Database Schema
 
-The existing schema already supports the role model:
+The schema uses separate `role` and `status` columns for users, and a `status` column for organizations:
 
 ```sql
--- Users table: role field stores any role string
+-- Users table: role = permission level, status = lifecycle state
 CREATE TABLE users (
     org_id UUID,
     user_id UUID,
     email TEXT,
     name TEXT,
-    role TEXT,          -- "superadmin", "admin", "user", "readonly", "guest"
+    role TEXT,           -- "superadmin", "admin", "user", "readonly", "guest"
+    status TEXT,         -- "active", "deactivated", "deleted"
     ...
     PRIMARY KEY ((org_id), user_id)
 );
@@ -361,19 +438,28 @@ CREATE TABLE sessions (
     user_id UUID,
     org_id UUID,
     email TEXT,
-    role TEXT,          -- Cached from users table
+    role TEXT,           -- Cached from users table
     ...
 );
 
--- Organizations: no schema change needed
+-- Sessions by user: reverse index for bulk invalidation on deactivate/delete
+CREATE TABLE sessions_by_user (
+    org_id UUID,
+    user_id UUID,
+    token_hash TEXT,
+    PRIMARY KEY ((org_id, user_id), token_hash)
+);
+
+-- Organizations: status tracks lifecycle state
 CREATE TABLE organizations (
     org_id UUID PRIMARY KEY,
     name TEXT,
+    status TEXT,         -- "active", "deactivated", "deleted"
     ...
 );
 ```
 
-The `role` column is `TEXT` — no migration needed to add `superadmin`. The platform org is just another row in `organizations`.
+Both `role` and `status` columns are `TEXT`. The `status` column defaults to `"active"` for new records. A backfill migration handles existing data where `role` was overloaded for lifecycle state.
 
 ---
 

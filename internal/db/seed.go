@@ -91,9 +91,9 @@ func (db *DB) createPlatformOrganization(orgID uuid.UUID) error {
 
 	query := `
 		INSERT INTO organizations (
-			org_id, name, settings, storage_quota, storage_used,
+			org_id, name, status, settings, storage_quota, storage_used,
 			chunking_polynomial, storage_config, created_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`
 
 	settings := map[string]string{
@@ -108,6 +108,7 @@ func (db *DB) createPlatformOrganization(orgID uuid.UUID) error {
 	err := db.Session().Query(query,
 		orgID.String(),
 		"SesameFS Platform",
+		"active",
 		settings,
 		int64(0), // Platform org doesn't need storage quota
 		int64(0),
@@ -134,15 +135,16 @@ func (db *DB) createSuperAdmin(platformOrgID uuid.UUID, userID uuid.UUID, email,
 
 	batch.Query(`
 		INSERT INTO users (
-			org_id, user_id, email, name, role,
+			org_id, user_id, email, name, role, status,
 			quota_bytes, used_bytes, created_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
 		platformOrgID.String(),
 		userID.String(),
 		email,
 		name,
 		"superadmin",
+		"active",
 		int64(-2), // unlimited
 		int64(0),
 		now,
@@ -172,9 +174,9 @@ func (db *DB) createDefaultOrganization(orgID uuid.UUID) error {
 
 	query := `
 		INSERT INTO organizations (
-			org_id, name, settings, storage_quota, storage_used,
+			org_id, name, status, settings, storage_quota, storage_used,
 			chunking_polynomial, storage_config, created_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`
 
 	// Default settings
@@ -190,6 +192,7 @@ func (db *DB) createDefaultOrganization(orgID uuid.UUID) error {
 	err := db.Session().Query(query,
 		orgID.String(), // Convert UUID to string
 		"Default Organization",
+		"active",
 		settings,
 		int64(1099511627776),  // 1TB default quota
 		int64(0),              // 0 bytes used
@@ -249,15 +252,16 @@ func (db *DB) createTestUsers(orgID uuid.UUID) error {
 		// Insert into users table
 		batch.Query(`
 			INSERT INTO users (
-				org_id, user_id, email, name, role,
+				org_id, user_id, email, name, role, status,
 				quota_bytes, used_bytes, created_at
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 		`,
 			orgID.String(),       // Convert UUID to string
 			user.userID.String(), // Convert UUID to string
 			user.email,
 			user.name,
 			user.role,
+			"active",
 			int64(53687091200), // 50GB for test users
 			int64(0),
 			now,

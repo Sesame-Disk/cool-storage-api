@@ -9,6 +9,7 @@ import (
 
 	"github.com/Sesame-Disk/sesamefs/internal/config"
 	"github.com/Sesame-Disk/sesamefs/internal/db"
+	gocql "github.com/apache/cassandra-gocql-driver/v2"
 	"github.com/golang-jwt/jwt/v5"
 )
 
@@ -246,13 +247,20 @@ func (sm *SessionManager) storeSession(session *Session) error {
 		ttlSeconds = int(sm.config.SessionTTL.Seconds())
 	}
 
-	return sm.db.Session().Query(`
+	batch := sm.db.Session().Batch(gocql.LoggedBatch) // atomic: both inserts must succeed together
+	batch.Query(`
 		INSERT INTO sessions (token_hash, user_id, org_id, email, role, created_at, expires_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?)
 		USING TTL ?
 	`, tokenHash, session.UserID, session.OrgID, session.Email, session.Role,
 		session.CreatedAt, session.ExpiresAt,
-		ttlSeconds).Exec()
+		ttlSeconds)
+	batch.Query(`
+		INSERT INTO sessions_by_user (org_id, user_id, token_hash)
+		VALUES (?, ?, ?)
+		USING TTL ?
+	`, session.OrgID, session.UserID, tokenHash, ttlSeconds)
+	return batch.Exec()
 }
 
 // loadSession loads a session from the database
@@ -275,13 +283,79 @@ func (sm *SessionManager) loadSession(token string) (*Session, error) {
 	return &session, nil
 }
 
-// deleteSession deletes a session from the database
+// deleteSession deletes a session from the database (both tables)
 func (sm *SessionManager) deleteSession(token string) error {
 	tokenHash := hashToken(token)
+
+	// Also need org_id/user_id to delete from sessions_by_user.
+	// Read them from the primary table first.
+	var orgID, userID string
+	if err := sm.db.Session().Query(
+		`SELECT org_id, user_id FROM sessions WHERE token_hash = ?`, tokenHash,
+	).Scan(&orgID, &userID); err == nil && orgID != "" {
+		sm.db.Session().Query(
+			`DELETE FROM sessions_by_user WHERE org_id = ? AND user_id = ? AND token_hash = ?`,
+			orgID, userID, tokenHash,
+		).Exec() //nolint:errcheck
+	}
 
 	return sm.db.Session().Query(`
 		DELETE FROM sessions WHERE token_hash = ?
 	`, tokenHash).Exec()
+}
+
+// InvalidateUserSessions invalidates ALL sessions for a given user.
+// Used when a user is deactivated or deleted so the middleware doesn't need
+// per-request status checks.
+func (sm *SessionManager) InvalidateUserSessions(orgID, userID string) error {
+	if sm.db == nil {
+		return nil
+	}
+
+	// 1. Read all token_hashes from the reverse-index table
+	iter := sm.db.Session().Query(
+		`SELECT token_hash FROM sessions_by_user WHERE org_id = ? AND user_id = ?`,
+		orgID, userID,
+	).Iter()
+
+	var hashes []string
+	var h string
+	for iter.Scan(&h) {
+		hashes = append(hashes, h)
+	}
+	if err := iter.Close(); err != nil {
+		return fmt.Errorf("read sessions_by_user: %w", err)
+	}
+
+	if len(hashes) == 0 {
+		return nil
+	}
+
+	// 2. Batch-delete from both tables (chunks of 25)
+	for i := 0; i < len(hashes); i += 25 {
+		end := i + 25
+		if end > len(hashes) {
+			end = len(hashes)
+		}
+		batch := sm.db.Session().Batch(gocql.UnloggedBatch) // deletes are idempotent, no log needed
+		for _, th := range hashes[i:end] {
+			batch.Query(`DELETE FROM sessions WHERE token_hash = ?`, th)
+			batch.Query(`DELETE FROM sessions_by_user WHERE org_id = ? AND user_id = ? AND token_hash = ?`,
+				orgID, userID, th)
+		}
+		batch.Exec() //nolint:errcheck
+	}
+
+	// 3. Evict from in-memory cache (scan for matching user)
+	sm.cacheMu.Lock()
+	for tok, sess := range sm.cache {
+		if sess.UserID == userID && sess.OrgID == orgID {
+			delete(sm.cache, tok)
+		}
+	}
+	sm.cacheMu.Unlock()
+
+	return nil
 }
 
 // cleanupLoop periodically cleans up expired sessions from the cache

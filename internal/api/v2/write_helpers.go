@@ -2,17 +2,35 @@ package v2
 
 import (
 	"fmt"
+	"log"
 	"time"
 
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
 )
 
+// User/Org status constants — lifecycle state independent of role.
+const (
+	StatusActive      = "active"
+	StatusDeactivated = "deactivated"
+	StatusDeleted     = "deleted"
+)
+
+// IsUserUsable returns true if the user status allows normal access.
+func IsUserUsable(status string) bool {
+	return status == "" || status == StatusActive
+}
+
+// IsOrgUsable returns true if the org status allows normal access.
+func IsOrgUsable(status string) bool {
+	return status == "" || status == StatusActive
+}
+
 func createUserWithEmailLookup(db interface{ Session() *gocql.Session }, orgID, userID, email, name, role string, quotaBytes, usedBytes int64, createdAt time.Time) error {
 	batch := db.Session().Batch(gocql.LoggedBatch)
 	batch.Query(`
-		INSERT INTO users (org_id, user_id, email, name, role, quota_bytes, used_bytes, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-	`, orgID, userID, email, name, role, quotaBytes, usedBytes, createdAt)
+		INSERT INTO users (org_id, user_id, email, name, role, status, quota_bytes, used_bytes, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, orgID, userID, email, name, role, StatusActive, quotaBytes, usedBytes, createdAt)
 	batch.Query(`
 		INSERT INTO users_by_email (email, user_id, org_id)
 		VALUES (?, ?, ?)
@@ -157,28 +175,215 @@ func renameGroup(db interface{ Session() *gocql.Session }, orgID, groupID, newNa
 	return nil
 }
 
-func softDeleteUser(db interface{ Session() *gocql.Session }, orgID, userID string, deletedAt time.Time) error {
-	return db.Session().Query(`
-		UPDATE users SET role = ?, deleted_at = ? WHERE org_id = ? AND user_id = ?
-	`, "deleted", deletedAt, orgID, userID).Exec()
+// SessionInvalidator can revoke all sessions for a given user.
+// Implemented by auth.SessionManager; used by admin handlers to kill sessions
+// when a user is deactivated or deleted.
+type SessionInvalidator interface {
+	InvalidateUserSessions(orgID, userID string) error
 }
 
-func restoreDeletedUser(db interface{ Session() *gocql.Session }, orgID, userID string) error {
-	return db.Session().Query(`
-		UPDATE users SET role = ?, deleted_at = ? WHERE org_id = ? AND user_id = ?
-	`, "user", nil, orgID, userID).Exec()
+// deactivateUser marks a user as deactivated and, in a background goroutine,
+// kills all their active sessions and disables their share links.
+func deactivateUser(db interface{ Session() *gocql.Session }, si SessionInvalidator, orgID, userID string) error {
+	if err := db.Session().Query(`
+		UPDATE users SET status = ? WHERE org_id = ? AND user_id = ?
+	`, StatusDeactivated, orgID, userID).Exec(); err != nil {
+		return err
+	}
+	go func() {
+		if si != nil {
+			si.InvalidateUserSessions(orgID, userID) //nolint:errcheck
+		}
+		setUserShareLinksActive(db, orgID, userID, false)
+	}()
+	return nil
 }
 
-func softDeleteOrg(db interface{ Session() *gocql.Session }, orgID string, deletedAt time.Time) error {
-	return db.Session().Query(`
-		UPDATE organizations SET settings['status'] = ?, deleted_at = ? WHERE org_id = ?
-	`, "deleted", deletedAt, orgID).Exec()
+// activateUser marks a user as active, clears deleted_at, and in a background
+// goroutine re-enables their share links. Works for both reactivation
+// (deactivated → active) and restore (deleted → active).
+func activateUser(db interface{ Session() *gocql.Session }, orgID, userID string) error {
+	if err := db.Session().Query(`
+		UPDATE users SET status = ?, deleted_at = ? WHERE org_id = ? AND user_id = ?
+	`, StatusActive, nil, orgID, userID).Exec(); err != nil {
+		return err
+	}
+	go setUserShareLinksActive(db, orgID, userID, true)
+	return nil
 }
 
-func restoreDeletedOrg(db interface{ Session() *gocql.Session }, orgID string) error {
-	return db.Session().Query(`
-		UPDATE organizations SET settings['status'] = ?, deleted_at = ? WHERE org_id = ?
-	`, "active", nil, orgID).Exec()
+// softDeleteUser marks a user as deleted and, in a background goroutine,
+// kills all their active sessions and disables their share links.
+func softDeleteUser(db interface{ Session() *gocql.Session }, si SessionInvalidator, orgID, userID string, deletedAt time.Time) error {
+	if err := db.Session().Query(`
+		UPDATE users SET status = ?, deleted_at = ? WHERE org_id = ? AND user_id = ?
+	`, StatusDeleted, deletedAt, orgID, userID).Exec(); err != nil {
+		return err
+	}
+	go func() {
+		if si != nil {
+			si.InvalidateUserSessions(orgID, userID) //nolint:errcheck
+		}
+		setUserShareLinksActive(db, orgID, userID, false)
+	}()
+	return nil
+}
+
+// deactivateOrg marks an org as deactivated and, in a background goroutine,
+// kills all sessions for every user in the org and disables all org share links.
+func deactivateOrg(db interface{ Session() *gocql.Session }, si SessionInvalidator, orgID string) error {
+	if err := db.Session().Query(`
+		UPDATE organizations SET status = ? WHERE org_id = ?
+	`, StatusDeactivated, orgID).Exec(); err != nil {
+		return err
+	}
+	go func() {
+		invalidateOrgSessions(db, si, orgID)
+		setOrgShareLinksActive(db, orgID, false)
+	}()
+	return nil
+}
+
+// activateOrg marks an org as active, clears deleted_at, and in a background
+// goroutine re-enables all org share links. Works for both reactivation
+// (deactivated → active) and restore (deleted → active).
+func activateOrg(db interface{ Session() *gocql.Session }, orgID string) error {
+	if err := db.Session().Query(`
+		UPDATE organizations SET status = ?, deleted_at = ? WHERE org_id = ?
+	`, StatusActive, nil, orgID).Exec(); err != nil {
+		return err
+	}
+	go setOrgShareLinksActive(db, orgID, true)
+	return nil
+}
+
+// softDeleteOrg marks an org as deleted and, in a background goroutine,
+// kills all sessions for every user in the org and disables all org share links.
+func softDeleteOrg(db interface{ Session() *gocql.Session }, si SessionInvalidator, orgID string, deletedAt time.Time) error {
+	if err := db.Session().Query(`
+		UPDATE organizations SET status = ?, deleted_at = ? WHERE org_id = ?
+	`, StatusDeleted, deletedAt, orgID).Exec(); err != nil {
+		return err
+	}
+	go func() {
+		invalidateOrgSessions(db, si, orgID)
+		setOrgShareLinksActive(db, orgID, false)
+	}()
+	return nil
+}
+
+// invalidateOrgSessions invalidates sessions for every user in an org.
+// Used when an org is deactivated or soft-deleted.
+func invalidateOrgSessions(dbSess interface{ Session() *gocql.Session }, si SessionInvalidator, orgID string) {
+	if si == nil {
+		return
+	}
+	iter := dbSess.Session().Query(`SELECT user_id FROM users WHERE org_id = ?`, orgID).Iter()
+	var uid string
+	for iter.Scan(&uid) {
+		si.InvalidateUserSessions(orgID, uid) //nolint:errcheck
+	}
+	iter.Close() //nolint:errcheck
+}
+
+// setUserShareLinksActive toggles the `active` flag on all share links created by a user.
+// Updates 3 tables: share_links (primary), share_links_by_creator, share_links_by_org.
+// Used when a user is deactivated/deleted (active=false) or reactivated (active=true).
+func setUserShareLinksActive(db interface{ Session() *gocql.Session }, orgID, userID string, active bool) {
+	type link struct {
+		token     string
+		createdAt time.Time
+	}
+	iter := db.Session().Query(
+		`SELECT link_token, created_at FROM share_links_by_creator WHERE org_id = ? AND created_by = ?`,
+		orgID, userID,
+	).Iter()
+
+	var links []link
+	var l link
+	for iter.Scan(&l.token, &l.createdAt) {
+		links = append(links, l)
+	}
+	if err := iter.Close(); err != nil {
+		log.Printf("[setUserShareLinksActive] iter close: %v", err)
+	}
+
+	for i := 0; i < len(links); i += 25 {
+		end := i + 25
+		if end > len(links) {
+			end = len(links)
+		}
+		batch := db.Session().Batch(gocql.UnloggedBatch)
+		for _, lk := range links[i:end] {
+			batch.Query(`UPDATE share_links SET active = ? WHERE link_token = ?`, active, lk.token)
+			batch.Query(`UPDATE share_links_by_creator SET active = ? WHERE org_id = ? AND created_by = ? AND created_at = ? AND link_token = ?`,
+				active, orgID, userID, lk.createdAt, lk.token)
+			batch.Query(`UPDATE share_links_by_org SET active = ? WHERE org_id = ? AND created_at = ? AND link_token = ?`,
+				active, orgID, lk.createdAt, lk.token)
+		}
+		if err := batch.Exec(); err != nil {
+			log.Printf("[setUserShareLinksActive] batch exec: %v", err)
+		}
+	}
+}
+
+// setOrgShareLinksActive toggles the `active` flag on all share links in an org.
+// Updates 3 tables: share_links (primary), share_links_by_creator, share_links_by_org.
+// Used when an org is deactivated/deleted (active=false) or reactivated (active=true).
+func setOrgShareLinksActive(db interface{ Session() *gocql.Session }, orgID string, active bool) {
+	type link struct {
+		token     string
+		createdBy string
+		createdAt time.Time
+	}
+	iter := db.Session().Query(
+		`SELECT link_token, created_by, created_at FROM share_links_by_org WHERE org_id = ?`,
+		orgID,
+	).Iter()
+
+	var links []link
+	var l link
+	for iter.Scan(&l.token, &l.createdBy, &l.createdAt) {
+		links = append(links, l)
+	}
+	if err := iter.Close(); err != nil {
+		log.Printf("[setOrgShareLinksActive] iter close: %v", err)
+	}
+
+	for i := 0; i < len(links); i += 25 {
+		end := i + 25
+		if end > len(links) {
+			end = len(links)
+		}
+		batch := db.Session().Batch(gocql.UnloggedBatch)
+		for _, lk := range links[i:end] {
+			batch.Query(`UPDATE share_links SET active = ? WHERE link_token = ?`, active, lk.token)
+			batch.Query(`UPDATE share_links_by_creator SET active = ? WHERE org_id = ? AND created_by = ? AND created_at = ? AND link_token = ?`,
+				active, orgID, lk.createdBy, lk.createdAt, lk.token)
+			batch.Query(`UPDATE share_links_by_org SET active = ? WHERE org_id = ? AND created_at = ? AND link_token = ?`,
+				active, orgID, lk.createdAt, lk.token)
+		}
+		if err := batch.Exec(); err != nil {
+			log.Printf("[setOrgShareLinksActive] batch exec: %v", err)
+		}
+	}
+}
+
+// deleteConsumedShareLink removes a single-use share link from all 3 tables after it is consumed.
+// Called fire-and-forget after a successful download/upload on a single-use link.
+// Keeps the DB clean — consumed single-use links are permanently gone.
+func deleteConsumedShareLink(db interface{ Session() *gocql.Session }, token, orgID, libraryID, createdBy string, createdAt time.Time) {
+	batch := db.Session().Batch(gocql.UnloggedBatch) // deletes are idempotent
+	batch.Query(`DELETE FROM share_links WHERE link_token = ?`, token)
+	batch.Query(`DELETE FROM share_links_by_creator WHERE org_id = ? AND created_by = ? AND created_at = ? AND link_token = ?`,
+		orgID, createdBy, createdAt, token)
+	batch.Query(`DELETE FROM share_links_by_org WHERE org_id = ? AND created_at = ? AND link_token = ?`,
+		orgID, createdAt, token)
+	batch.Query(`DELETE FROM share_links_by_library WHERE org_id = ? AND library_id = ? AND link_token = ?`,
+		orgID, libraryID, token)
+	if err := batch.Exec(); err != nil {
+		log.Printf("[deleteConsumedShareLink] failed for token %s: %v", token, err)
+	}
 }
 
 func rollbackNewLibrary(db interface{ Session() *gocql.Session }, orgID, libraryID string) error {

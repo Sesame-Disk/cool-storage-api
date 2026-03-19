@@ -130,10 +130,15 @@ type shareLinkData struct {
 	permission   string
 	createdBy    string
 	creatorName  string
-	isExpired    bool
-	repoName     string
-	commitID     string
-	isDir        bool
+	createdAt    time.Time
+	// isExpired: link has exceeded its validity (time, max downloads).
+	isExpired bool
+	// isDisabled: link was explicitly disabled by an admin action (user/org deactivated or deleted).
+	// Semantically distinct from expiration — the link can be re-enabled on reactivation.
+	isDisabled bool
+	repoName   string
+	commitID   string
+	isDir      bool
 	targetEntry  *FSEntry
 	passwordHash string
 	singleUse    bool
@@ -152,32 +157,30 @@ type shareLinkData struct {
 func (h *ShareLinkViewHandler) resolveShareLink(token string) (*shareLinkData, error) {
 	var orgID, libraryID, filePath, permission, createdBy, passwordHash string
 	var expiresAt *time.Time
-	var downloadCount int
+	var createdAt time.Time
+	var downloadCount, uploadCount int
 	var maxDownloads *int
 	var active, singleUse bool
 
 	err := h.db.Session().Query(`
 		SELECT org_id, library_id, file_path, permission, created_by, expires_at,
-		       download_count, max_downloads, password_hash, active, single_use
+		       download_count, upload_count, max_downloads, password_hash, active, single_use, created_at
 		FROM share_links WHERE link_token = ?
 	`, token).Scan(&orgID, &libraryID, &filePath, &permission, &createdBy, &expiresAt,
-		&downloadCount, &maxDownloads, &passwordHash, &active, &singleUse)
+		&downloadCount, &uploadCount, &maxDownloads, &passwordHash, &active, &singleUse, &createdAt)
 	if err != nil {
 		return nil, fmt.Errorf("share link not found")
 	}
 
-	// Check soft-disable
-	isExpired := false
-	if !active {
-		isExpired = true
-	}
+	// active=false means the link was disabled by an admin (user/org deactivated or deleted).
+	// This is semantically distinct from expiration — a disabled link can be re-enabled on reactivation.
+	isDisabled := !active
 
-	// Check expiration
+	// Check time expiration and download limit (true "expired" states, unrelated to admin disable)
+	isExpired := false
 	if expiresAt != nil && time.Now().After(*expiresAt) {
 		isExpired = true
 	}
-
-	// Check max downloads
 	if maxDownloads != nil && downloadCount >= *maxDownloads {
 		isExpired = true
 	}
@@ -210,6 +213,10 @@ func (h *ShareLinkViewHandler) resolveShareLink(token string) (*shareLinkData, e
 		creatorName = createdBy
 	}
 
+	// Creator/org lifecycle is enforced via the `active` flag on share links:
+	// when a user/org is deactivated or deleted, their share links are set active=false.
+	// No runtime status queries needed here.
+
 	return &shareLinkData{
 		token:        token,
 		orgID:        orgID,
@@ -218,7 +225,9 @@ func (h *ShareLinkViewHandler) resolveShareLink(token string) (*shareLinkData, e
 		permission:   permission,
 		createdBy:    createdBy,
 		creatorName:  creatorName,
+		createdAt:    createdAt,
 		isExpired:    isExpired,
+		isDisabled:   isDisabled,
 		repoName:     repoName,
 		commitID:     commitID,
 		canEdit:      canEdit,
@@ -227,6 +236,14 @@ func (h *ShareLinkViewHandler) resolveShareLink(token string) (*shareLinkData, e
 		passwordHash: passwordHash,
 		singleUse:    singleUse,
 	}, nil
+}
+
+// unavailableJSON returns the appropriate error payload based on why the link is unavailable.
+func (sl *shareLinkData) unavailableJSON() gin.H {
+	if sl.isDisabled {
+		return gin.H{"error": "share link has been disabled"}
+	}
+	return gin.H{"error": "share link has expired"}
 }
 
 // parseShareLinkPermission parses permission which can be either:
@@ -272,9 +289,13 @@ func (h *ShareLinkViewHandler) ServeShareLinkPage(c *gin.Context) {
 		return
 	}
 
-	if sl.isExpired {
+	if sl.isExpired || sl.isDisabled {
 		c.Header("Content-Type", "text/html; charset=utf-8")
-		c.String(http.StatusGone, errorPageHTML("Link Expired", "This share link has expired or reached its download limit."))
+		if sl.isDisabled {
+			c.String(http.StatusGone, errorPageHTML("Link Disabled", "This share link has been disabled by an administrator."))
+		} else {
+			c.String(http.StatusGone, errorPageHTML("Link Expired", "This share link has expired or reached its download limit."))
+		}
 		return
 	}
 
@@ -368,16 +389,17 @@ func (h *ShareLinkViewHandler) handleShareLinkDownload(c *gin.Context, sl *share
 		return
 	}
 
-	// Increment download_count and handle single_use deactivation (fire-and-forget)
+	// Increment download_count or, for single-use links, delete from all tables (fire-and-forget)
 	go func() {
-		now := time.Now()
-		if err := h.db.Session().Query(`UPDATE share_links SET download_count = download_count + 1, last_accessed_at = ? WHERE link_token = ?`,
-			now, sl.token).Exec(); err != nil {
-			log.Printf("[handleShareLinkDownload] failed to update download_count for token %s: %v", sl.token, err)
-		}
 		if sl.singleUse {
-			if err := h.db.Session().Query(`UPDATE share_links SET active = false WHERE link_token = ?`, sl.token).Exec(); err != nil {
-				log.Printf("[handleShareLinkDownload] failed to deactivate single-use token %s: %v", sl.token, err)
+			// Single-use link consumed: delete from all tables so the row doesn't linger.
+			// Future accesses return 404 (link not found).
+			deleteConsumedShareLink(h.db, sl.token, sl.orgID, sl.libraryID, sl.createdBy, sl.createdAt)
+		} else {
+			now := time.Now()
+			if err := h.db.Session().Query(`UPDATE share_links SET download_count = download_count + 1, last_accessed_at = ? WHERE link_token = ?`,
+				now, sl.token).Exec(); err != nil {
+				log.Printf("[handleShareLinkDownload] failed to update download_count for token %s: %v", sl.token, err)
 			}
 		}
 	}()
@@ -1140,8 +1162,8 @@ func (h *ShareLinkViewHandler) ListShareLinkDirents(c *gin.Context) {
 		return
 	}
 
-	if sl.isExpired {
-		c.JSON(http.StatusGone, gin.H{"error": "share link has expired"})
+	if sl.isExpired || sl.isDisabled {
+		c.JSON(http.StatusGone, sl.unavailableJSON())
 		return
 	}
 
@@ -1261,8 +1283,8 @@ func (h *ShareLinkViewHandler) GetShareLinkRepoTags(c *gin.Context) {
 		return
 	}
 
-	if sl.isExpired {
-		c.JSON(http.StatusGone, gin.H{"error": "share link has expired"})
+	if sl.isExpired || sl.isDisabled {
+		c.JSON(http.StatusGone, sl.unavailableJSON())
 		return
 	}
 
@@ -1287,9 +1309,13 @@ func (h *ShareLinkViewHandler) ServeShareLinkFilePage(c *gin.Context) {
 		return
 	}
 
-	if sl.isExpired {
+	if sl.isExpired || sl.isDisabled {
 		c.Header("Content-Type", "text/html; charset=utf-8")
-		c.String(http.StatusGone, errorPageHTML("Link Expired", "This share link has expired or reached its download limit."))
+		if sl.isDisabled {
+			c.String(http.StatusGone, errorPageHTML("Link Disabled", "This share link has been disabled by an administrator."))
+		} else {
+			c.String(http.StatusGone, errorPageHTML("Link Expired", "This share link has expired or reached its download limit."))
+		}
 		return
 	}
 
@@ -1360,8 +1386,8 @@ func (h *ShareLinkViewHandler) GetShareLinkZipTask(c *gin.Context) {
 		return
 	}
 
-	if sl.isExpired {
-		c.JSON(http.StatusGone, gin.H{"error": "share link has expired"})
+	if sl.isExpired || sl.isDisabled {
+		c.JSON(http.StatusGone, sl.unavailableJSON())
 		return
 	}
 
@@ -1410,14 +1436,22 @@ func (h *ShareLinkViewHandler) ServeUploadLinkPage(c *gin.Context) {
 	// Resolve the upload link from DB
 	var orgID, libraryID, filePath, createdBy, passwordHash string
 	var expiresAt *time.Time
+	var active bool
 
 	err := h.db.Session().Query(`
-		SELECT org_id, library_id, file_path, created_by, password_hash, expires_at
+		SELECT org_id, library_id, file_path, created_by, password_hash, expires_at, active
 		FROM share_links WHERE link_token = ?
-	`, token).Scan(&orgID, &libraryID, &filePath, &createdBy, &passwordHash, &expiresAt)
+	`, token).Scan(&orgID, &libraryID, &filePath, &createdBy, &passwordHash, &expiresAt, &active)
 	if err != nil {
 		c.Header("Content-Type", "text/html; charset=utf-8")
 		c.String(http.StatusNotFound, errorPageHTML("Not Found", "This upload link does not exist."))
+		return
+	}
+
+	// Check disabled (admin deactivated owner or org) — distinct from time expiration
+	if !active {
+		c.Header("Content-Type", "text/html; charset=utf-8")
+		c.String(http.StatusGone, errorPageHTML("Link Disabled", "This upload link has been disabled by an administrator."))
 		return
 	}
 
@@ -1506,16 +1540,21 @@ func (h *ShareLinkViewHandler) GetUploadLinkUploadURL(c *gin.Context) {
 	// Resolve upload link
 	var orgID, libraryID, filePath, createdBy string
 	var expiresAt *time.Time
+	var active bool
 	err := h.db.Session().Query(`
-		SELECT org_id, library_id, file_path, created_by, expires_at
+		SELECT org_id, library_id, file_path, created_by, expires_at, active
 		FROM share_links WHERE link_token = ?
-	`, token).Scan(&orgID, &libraryID, &filePath, &createdBy, &expiresAt)
+	`, token).Scan(&orgID, &libraryID, &filePath, &createdBy, &expiresAt, &active)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "upload link not found"})
 		return
 	}
 
-	// Check expiration
+	// Check disabled (admin) and expiration separately
+	if !active {
+		c.JSON(http.StatusGone, gin.H{"error": "upload link has been disabled"})
+		return
+	}
 	if expiresAt != nil && time.Now().After(*expiresAt) {
 		c.JSON(http.StatusGone, gin.H{"error": "upload link has expired"})
 		return
@@ -1540,18 +1579,24 @@ func (h *ShareLinkViewHandler) GetUploadLinkUploadURL(c *gin.Context) {
 func (h *ShareLinkViewHandler) PostUploadLinkDone(c *gin.Context) {
 	token := c.Param("token")
 
-	// Increment upload_count and handle single_use deactivation (fire-and-forget)
+	// Increment upload_count or, for single-use links, delete from all tables (fire-and-forget)
 	go func() {
-		now := time.Now()
-		if err := h.db.Session().Query(`UPDATE share_links SET upload_count = upload_count + 1, last_accessed_at = ? WHERE link_token = ?`,
-			now, token).Exec(); err != nil {
-			log.Printf("[PostUploadLinkDone] failed to update upload_count for token %s: %v", token, err)
-		}
-		// Check single_use flag
 		var singleUse bool
-		if err := h.db.Session().Query(`SELECT single_use FROM share_links WHERE link_token = ?`, token).Scan(&singleUse); err == nil && singleUse {
-			if err := h.db.Session().Query(`UPDATE share_links SET active = false WHERE link_token = ?`, token).Exec(); err != nil {
-				log.Printf("[PostUploadLinkDone] failed to deactivate single-use token %s: %v", token, err)
+		var orgID2, libraryID2, createdBy2 string
+		var createdAt2 time.Time
+		if err := h.db.Session().Query(
+			`SELECT single_use, org_id, library_id, created_by, created_at FROM share_links WHERE link_token = ?`,
+			token,
+		).Scan(&singleUse, &orgID2, &libraryID2, &createdBy2, &createdAt2); err != nil {
+			return // row already gone (e.g. concurrent consumption)
+		}
+		if singleUse {
+			deleteConsumedShareLink(h.db, token, orgID2, libraryID2, createdBy2, createdAt2)
+		} else {
+			now := time.Now()
+			if err := h.db.Session().Query(`UPDATE share_links SET upload_count = upload_count + 1, last_accessed_at = ? WHERE link_token = ?`,
+				now, token).Exec(); err != nil {
+				log.Printf("[PostUploadLinkDone] failed to update upload_count for token %s: %v", token, err)
 			}
 		}
 	}()
@@ -1571,8 +1616,8 @@ func (h *ShareLinkViewHandler) GetShareLinkUploadURL(c *gin.Context) {
 		return
 	}
 
-	if sl.isExpired {
-		c.JSON(http.StatusGone, gin.H{"error": "share link has expired"})
+	if sl.isExpired || sl.isDisabled {
+		c.JSON(http.StatusGone, sl.unavailableJSON())
 		return
 	}
 
@@ -1620,8 +1665,8 @@ func (h *ShareLinkViewHandler) PostShareLinkUploadDone(c *gin.Context) {
 		return
 	}
 
-	if sl.isExpired {
-		c.JSON(http.StatusGone, gin.H{"error": "share link has expired"})
+	if sl.isExpired || sl.isDisabled {
+		c.JSON(http.StatusGone, sl.unavailableJSON())
 		return
 	}
 
@@ -1635,16 +1680,15 @@ func (h *ShareLinkViewHandler) PostShareLinkUploadDone(c *gin.Context) {
 		return
 	}
 
-	// Increment upload_count and handle single_use deactivation (fire-and-forget)
+	// Increment upload_count or, for single-use links, delete from all tables (fire-and-forget)
 	go func() {
-		now := time.Now()
-		if err := h.db.Session().Query(`UPDATE share_links SET upload_count = upload_count + 1, last_accessed_at = ? WHERE link_token = ?`,
-			now, sl.token).Exec(); err != nil {
-			log.Printf("[PostShareLinkUploadDone] failed to update upload_count for token %s: %v", sl.token, err)
-		}
 		if sl.singleUse {
-			if err := h.db.Session().Query(`UPDATE share_links SET active = false WHERE link_token = ?`, sl.token).Exec(); err != nil {
-				log.Printf("[PostShareLinkUploadDone] failed to deactivate single-use token %s: %v", sl.token, err)
+			deleteConsumedShareLink(h.db, sl.token, sl.orgID, sl.libraryID, sl.createdBy, sl.createdAt)
+		} else {
+			now := time.Now()
+			if err := h.db.Session().Query(`UPDATE share_links SET upload_count = upload_count + 1, last_accessed_at = ? WHERE link_token = ?`,
+				now, sl.token).Exec(); err != nil {
+				log.Printf("[PostShareLinkUploadDone] failed to update upload_count for token %s: %v", sl.token, err)
 			}
 		}
 	}()

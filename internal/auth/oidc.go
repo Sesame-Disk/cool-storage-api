@@ -701,9 +701,9 @@ func (c *OIDCClient) provisionUser(ctx context.Context, claims *IDTokenClaims, u
 			}
 			now := time.Now()
 			createErr := c.db.Session().Query(`
-				INSERT INTO organizations (org_id, name, settings, storage_quota, storage_used, chunking_polynomial, storage_config, created_at)
-				VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-			`, orgID, orgName,
+				INSERT INTO organizations (org_id, name, status, settings, storage_quota, storage_used, chunking_polynomial, storage_config, created_at)
+				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+			`, orgID, orgName, "active",
 				map[string]string{"theme": "default", "features": "all"},
 				int64(1099511627776), int64(0), int64(17592186044415),
 				map[string]string{"default_backend": "s3"},
@@ -838,6 +838,22 @@ func (c *OIDCClient) provisionUser(ctx context.Context, claims *IDTokenClaims, u
 	}
 userReady:
 
+	// Enforce lifecycle status — reject login for deactivated/deleted users and orgs.
+	if !isNewUser {
+		var userStatus string
+		if err := c.db.Session().Query(
+			`SELECT status FROM users WHERE org_id = ? AND user_id = ?`, orgID, userID,
+		).Scan(&userStatus); err == nil && userStatus != "" && userStatus != "active" {
+			return nil, fmt.Errorf("account %s", userStatus)
+		}
+		var orgStatus string
+		if err := c.db.Session().Query(
+			`SELECT status FROM organizations WHERE org_id = ?`, orgID,
+		).Scan(&orgStatus); err == nil && orgStatus != "" && orgStatus != "active" {
+			return nil, fmt.Errorf("organization %s", orgStatus)
+		}
+	}
+
 	// Sync group memberships from OIDC claims
 	if c.config.SyncGroupsOnLogin {
 		groups := c.extractGroups(claims, userInfo)
@@ -907,9 +923,9 @@ func (c *OIDCClient) createUser(ctx context.Context, userID, orgID, email, name,
 
 	batch := c.db.Session().Batch(gocql.LoggedBatch)
 	batch.Query(`
-		INSERT INTO users (org_id, user_id, email, name, role, quota_bytes, used_bytes, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-	`, orgID, userID, email, name, role, int64(-2), int64(0), now)
+		INSERT INTO users (org_id, user_id, email, name, role, status, quota_bytes, used_bytes, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, orgID, userID, email, name, role, "active", int64(-2), int64(0), now)
 	batch.Query(`
 		INSERT INTO users_by_oidc (oidc_issuer, oidc_sub, user_id, org_id)
 		VALUES (?, ?, ?, ?)

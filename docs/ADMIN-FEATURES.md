@@ -72,23 +72,27 @@ Run from the project root. The script uses `docker compose exec cassandra cqlsh`
 | POST | `/admin/organizations/` | `CreateOrganization` | **superadmin only** |
 | GET | `/admin/organizations/:org_id/` | `GetOrganization` | admin or superadmin |
 | PUT | `/admin/organizations/:org_id/` | `UpdateOrganization` | **superadmin only** |
-| DELETE | `/admin/organizations/:org_id/` | `DeactivateOrganization` | **superadmin only** |
-| POST | `/admin/organizations/:org_id/delete/` | `SoftDeleteOrganization` | **superadmin only** |
-| POST | `/admin/organizations/:org_id/restore/` | `RestoreOrganization` | **superadmin only** |
+| DELETE | `/admin/organizations/:org_id/` | `SoftDeleteOrganization` | **superadmin only** — sets `status="deleted"`, starts grace period |
+| POST | `/admin/organizations/:org_id/delete/` | `SoftDeleteOrganization` | **superadmin only** — alias for DELETE (backward compat) |
+| POST | `/admin/organizations/:org_id/deactivate/` | `DeactivateOrganization` | **superadmin only** — sets `status="deactivated"` (reversible, no GC) |
+| POST | `/admin/organizations/:org_id/reactivate/` | `ReactivateOrganization` | **superadmin only** — restores deactivated org to `status="active"` |
+| POST | `/admin/organizations/:org_id/restore/` | `RestoreOrganization` | **superadmin only** — restores deleted org within grace period |
 | GET | `/admin/organizations/:org_id/users/` | `ListOrgUsers` | admin or superadmin |
 | POST | `/admin/organizations/:org_id/users/` | `AdminAddOrgUser` | admin or superadmin |
 | PUT | `/admin/organizations/:org_id/users/:email/` | `AdminUpdateOrgUser` | admin or superadmin |
 | DELETE | `/admin/organizations/:org_id/users/:email/` | `AdminDeleteOrgUser` | admin or superadmin |
 
-### Organization Lifecycle — ✅ COMPLETE (2026-03-18)
+### Organization Lifecycle — ✅ COMPLETE (2026-03-18, updated 2026-03-19)
 
-Three distinct org states with full GC cascade:
+Three distinct org states tracked via the dedicated `status` column (separate from `settings`):
 
 | State | Trigger | Reversible | GC Cascade |
 |-------|---------|------------|------------|
-| **active** | Default / `RestoreOrganization` | — | No |
-| **deactivated** | `DeactivateOrganization` (DELETE) | Yes (manual) | No |
-| **deleted** | `SoftDeleteOrganization` (POST .../delete/) | Yes within grace period via `RestoreOrganization` | Yes — after `OrgGraceDays` (default 30 days) |
+| **active** | Default / `ReactivateOrganization` / `RestoreOrganization` | — | No |
+| **deactivated** | `DeactivateOrganization` (POST .../deactivate/) | Yes via `ReactivateOrganization` (POST .../reactivate/) | No |
+| **deleted** | `SoftDeleteOrganization` (DELETE) | Yes within grace period via `RestoreOrganization` (POST .../restore/) | Yes — after `OrgGraceDays` (default 30 days) |
+
+**Note (2026-03-19)**: Org status is now stored in a dedicated `status` column on the `organizations` table instead of `settings['status']`. This mirrors the user model where `status` (lifecycle state) is separated from `role` (permission level). A backfill migration automatically converts existing `settings['status']` values to the new column.
 
 **Cascade flow** (after grace period expires):
 1. GC Scanner Phase 12 finds org with `deleted_at` past `OrgGraceDays`
@@ -138,7 +142,7 @@ If `owner_email` is provided, an admin user is created in the new org (dual-writ
 | POST | `/admin/users/` | `AdminCreateUser` | Creates user in caller's org. Dual-writes to `users` + `users_by_email` |
 | GET | `/admin/users/:email/` | `GetUserByEmail` | Resolves via `users_by_email` table |
 | PUT | `/admin/users/:email/` | `UpdateUser` | Update role, quota, name |
-| DELETE | `/admin/users/:email/` | `DeleteUserByEmail` | Soft-deactivate (sets `role="deactivated"`) |
+| DELETE | `/admin/users/:email/` | `DeleteUserByEmail` | Soft-delete (sets `status="deleted"`, `deleted_at=now()`, starts 7-day grace period) |
 | GET | `/admin/admins/` | `ListAdminUsers` | Lists admin+superadmin users. Response key: `admin_user_list` |
 | GET | `/admin/search-user/` | `SearchUsers` | Search by email or name substring |
 

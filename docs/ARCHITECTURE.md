@@ -218,6 +218,8 @@ versioning:
 
 **Choice**: OIDC with accounts.sesamedisk.com
 
+**Status enforcement**: When a user or org is deactivated/deleted, all their sessions are immediately invalidated (killed at source via `sessions_by_user` reverse-index table) and their share links are set `active=false`. This means session-authenticated requests don't need per-request status queries. Repo API tokens are checked via `enforceAccountStatus()` in both `authMiddleware` and `smartLinkAuthMiddleware`. The OIDC `provisionUser` flow rejects login attempts from deactivated/deleted users and orgs. Share link resolution distinguishes "disabled" (admin action, reversible on reactivation) from "expired" (time/download limit, permanent).
+
 **Dev Mode Config**:
 ```yaml
 auth:
@@ -547,6 +549,7 @@ erDiagram
     organizations {
         UUID org_id PK
         TEXT name
+        TEXT status
         MAP settings
         BIGINT storage_quota
         BIGINT storage_used
@@ -561,6 +564,7 @@ erDiagram
         TEXT email
         TEXT name
         TEXT role
+        TEXT status
         TEXT oidc_sub
         BIGINT quota_bytes
         BIGINT used_bytes

@@ -35,6 +35,7 @@ type MockStore struct {
 	// organizations keyed by orgID
 	organizations []uuid.UUID
 	orgNames      map[uuid.UUID]string
+	orgStatus     map[uuid.UUID]string
 	orgDeletedAt  map[uuid.UUID]time.Time
 
 	// users keyed by "orgID:userID"
@@ -159,6 +160,7 @@ type mockUser struct {
 	OrgID     uuid.UUID
 	UserID    uuid.UUID
 	Email     string
+	Status    string
 	DeletedAt *time.Time
 }
 
@@ -183,6 +185,7 @@ func NewMockStore() *MockStore {
 		fsObjects:        make(map[string]*mockFSObject),
 		libraries:        make(map[uuid.UUID]*mockLibrary),
 		orgNames:         make(map[uuid.UUID]string),
+		orgStatus:        make(map[uuid.UUID]string),
 		orgDeletedAt:     make(map[uuid.UUID]time.Time),
 		users:            make(map[string]*mockUser),
 		groups:           make(map[string]bool),
@@ -363,12 +366,13 @@ func (m *MockStore) AddOrganizationWithName(orgID uuid.UUID, name string) {
 	m.orgNames[orgID] = name
 }
 
-// AddDeletedOrg adds an org with deleted_at set (for scanner Phase 12).
+// AddDeletedOrg adds an org with status='deleted' and deleted_at set (for scanner Phase 12).
 func (m *MockStore) AddDeletedOrg(orgID uuid.UUID, name string, deletedAt time.Time) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.organizations = append(m.organizations, orgID)
 	m.orgNames[orgID] = name
+	m.orgStatus[orgID] = "deleted"
 	m.orgDeletedAt[orgID] = deletedAt
 }
 
@@ -380,12 +384,12 @@ func (m *MockStore) AddUser(orgID, userID uuid.UUID, email string) {
 	m.users[key] = &mockUser{OrgID: orgID, UserID: userID, Email: email}
 }
 
-// AddDeletedUser adds a user with deleted_at set (for scanner Phase 10).
+// AddDeletedUser adds a user with status='deleted' and deleted_at set (for scanner Phase 10).
 func (m *MockStore) AddDeletedUser(orgID, userID uuid.UUID, email string, deletedAt time.Time) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	key := fmt.Sprintf("%s:%s", orgID, userID)
-	m.users[key] = &mockUser{OrgID: orgID, UserID: userID, Email: email, DeletedAt: &deletedAt}
+	m.users[key] = &mockUser{OrgID: orgID, UserID: userID, Email: email, Status: "deleted", DeletedAt: &deletedAt}
 }
 
 // AddGroupForOrg adds a group to the mock store.
@@ -1231,7 +1235,7 @@ func (m *MockStore) ListDeletedUsersExpired(graceDays int) ([]DeletedUserInfo, e
 	cutoff := time.Now().AddDate(0, 0, -graceDays)
 	var result []DeletedUserInfo
 	for _, u := range m.users {
-		if u.DeletedAt != nil && u.DeletedAt.Before(cutoff) {
+		if u.Status == "deleted" && u.DeletedAt != nil && u.DeletedAt.Before(cutoff) {
 			result = append(result, DeletedUserInfo{
 				OrgID:     u.OrgID,
 				UserID:    u.UserID,
@@ -1321,7 +1325,7 @@ func (m *MockStore) ListExpiredDeletedOrgs(graceDays int) ([]DeletedOrgInfo, err
 	cutoff := time.Now().AddDate(0, 0, -graceDays)
 	var result []DeletedOrgInfo
 	for orgID, deletedAt := range m.orgDeletedAt {
-		if deletedAt.Before(cutoff) {
+		if m.orgStatus[orgID] == "deleted" && deletedAt.Before(cutoff) {
 			result = append(result, DeletedOrgInfo{
 				OrgID:     orgID,
 				Name:      m.orgNames[orgID],
@@ -1392,6 +1396,7 @@ func (m *MockStore) HardDeleteOrg(orgID uuid.UUID) error {
 		}
 	}
 	delete(m.orgNames, orgID)
+	delete(m.orgStatus, orgID)
 	delete(m.orgDeletedAt, orgID)
 	return nil
 }

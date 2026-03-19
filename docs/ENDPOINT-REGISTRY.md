@@ -928,10 +928,10 @@ Before implementing a new endpoint:
 **Added**: 2026-02-02
 
 ### DELETE /api/v2.1/admin/users/:email/
-**Handler**: `AdminHandler.DeactivateUser` → `DeleteUserByEmail` (dispatched via `adminUsersHandler`)
+**Handler**: `AdminHandler.SoftDeleteUser` → `DeleteUserByEmail` (dispatched via `adminUsersHandler`)
 **File**: `internal/api/v2/admin.go`
 **Registration**: via `adminUsersHandler`
-**Purpose**: Deactivate user (sets role to "deactivated"). Resolves email via `users_by_email`
+**Purpose**: Soft-delete user (sets `status="deleted"` + `deleted_at`). After `UserGraceDays` (default 7), GC cascade. Resolves email via `users_by_email`
 **Added**: 2026-02-02
 
 ### GET /api/v2.1/admin/admins/
@@ -952,16 +952,32 @@ Before implementing a new endpoint:
 
 ---
 
-## Superadmin — Organization Soft-Delete & Restore (2026-03-18)
+## Superadmin — Organization Lifecycle (2026-03-18, updated 2026-03-19)
 
-### POST /api/v2.1/admin/organizations/:org_id/delete/
+### DELETE /api/v2.1/admin/organizations/:org_id/
 **Handler**: `AdminHandler.SoftDeleteOrganization`
 **File**: `internal/api/v2/admin.go`
 **Registration**: `RegisterAdminRoutes` in admin.go (superadminOnly group)
-**Purpose**: Soft-delete an organization — sets `settings['status'] = 'deleted'` + `deleted_at = NOW()`. After `OrgGraceDays` (default 30), GC cascade permanently deletes all org data (libraries, users, groups).
+**Purpose**: Soft-delete an organization — sets `status = 'deleted'` + `deleted_at = NOW()`. After `OrgGraceDays` (default 30), GC cascade permanently deletes all org data (libraries, users, groups). Consistent with `DELETE /admin/users/:email/` which also performs soft-delete.
 **Auth**: Superadmin only. Platform org cannot be deleted.
 **Response**: `{ "success": true }`
+**Added**: 2026-03-19
+
+### POST /api/v2.1/admin/organizations/:org_id/delete/
+**Handler**: `AdminHandler.SoftDeleteOrganization` (alias for DELETE, kept for backward compat)
+**File**: `internal/api/v2/admin.go`
+**Registration**: `RegisterAdminRoutes` in admin.go (superadminOnly group)
+**Purpose**: Same as DELETE above.
 **Added**: 2026-03-18
+
+### POST /api/v2.1/admin/organizations/:org_id/deactivate/
+**Handler**: `AdminHandler.DeactivateOrganization`
+**File**: `internal/api/v2/admin.go`
+**Registration**: `RegisterAdminRoutes` in admin.go (superadminOnly group)
+**Purpose**: Deactivate an organization — sets `status = 'deactivated'`. Reversible, no grace period, no GC cascade. Use POST .../reactivate/ to reverse.
+**Auth**: Superadmin only. Platform org cannot be deactivated.
+**Response**: `{ "success": true }`
+**Added**: 2026-03-19
 
 ### POST /api/v2.1/admin/organizations/:org_id/restore/
 **Handler**: `AdminHandler.RestoreOrganization`
