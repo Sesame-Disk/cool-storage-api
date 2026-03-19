@@ -273,24 +273,48 @@ func (h *AdminHandler) ListOrganizations(c *gin.Context) {
 		return
 	}
 
+	statusFilter := strings.TrimSpace(strings.ToLower(c.DefaultQuery("status", "")))
+	if statusFilter == "all" {
+		statusFilter = ""
+	}
+	if statusFilter != "" && statusFilter != StatusActive && statusFilter != StatusDeactivated && statusFilter != StatusDeleted {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid status filter"})
+		return
+	}
+
 	iter := h.db.Session().Query(`
-		SELECT org_id, name, storage_quota, storage_used, created_at
+		SELECT org_id, name, status, storage_quota, storage_used, created_at, deleted_at
 		FROM organizations
 	`).Iter()
 
 	var orgs []gin.H
-	var orgID, name string
+	var orgID, name, status string
 	var storageQuota, storageUsed int64
 	var createdAt time.Time
+	var deletedAt *time.Time
 
-	for iter.Scan(&orgID, &name, &storageQuota, &storageUsed, &createdAt) {
+	for iter.Scan(&orgID, &name, &status, &storageQuota, &storageUsed, &createdAt, &deletedAt) {
+		effectiveStatus := status
+		if effectiveStatus == "" {
+			effectiveStatus = StatusActive
+		}
+		if statusFilter != "" && effectiveStatus != statusFilter {
+			continue
+		}
+
 		usersCount := h.countOrgUsers(orgID)
 		creatorEmail, creatorName := h.resolveOrgCreator(orgID)
+		var deletedAtStr interface{}
+		if deletedAt != nil {
+			deletedAtStr = deletedAt.Format(time.RFC3339)
+		}
 		orgs = append(orgs, gin.H{
 			"org_id":        orgID,
 			"org_name":      name,
 			"creator_email": creatorEmail,
 			"creator_name":  creatorName,
+			"status":        effectiveStatus,
+			"deleted_at":    deletedAtStr,
 			"role":          "default",
 			"quota_usage":   storageUsed,
 			"quota":         storageQuota,
@@ -458,6 +482,8 @@ func (h *AdminHandler) CreateOrganization(c *gin.Context) {
 		"org_name":      orgName,
 		"creator_email": ownerEmail,
 		"creator_name":  ownerName,
+		"status":        StatusActive,
+		"deleted_at":    nil,
 		"role":          "default",
 		"quota_usage":   int64(0),
 		"quota":         storageQuota,
@@ -483,14 +509,16 @@ func (h *AdminHandler) GetOrganization(c *gin.Context) {
 	orgID := c.Param("org_id")
 
 	var name string
+	var status string
 	var storageQuota, storageUsed int64
 	var settings map[string]string
 	var createdAt time.Time
+	var deletedAt *time.Time
 
 	err := h.db.Session().Query(`
-		SELECT name, storage_quota, storage_used, settings, created_at
+		SELECT name, status, storage_quota, storage_used, settings, created_at, deleted_at
 		FROM organizations WHERE org_id = ?
-	`, orgID).Scan(&name, &storageQuota, &storageUsed, &settings, &createdAt)
+	`, orgID).Scan(&name, &status, &storageQuota, &storageUsed, &settings, &createdAt, &deletedAt)
 
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "organization not found"})
@@ -508,11 +536,23 @@ func (h *AdminHandler) GetOrganization(c *gin.Context) {
 		maxUserNumber, _ = strconv.Atoi(v)
 	}
 
+	effectiveStatus := status
+	if effectiveStatus == "" {
+		effectiveStatus = StatusActive
+	}
+
+	var deletedAtStr interface{}
+	if deletedAt != nil {
+		deletedAtStr = deletedAt.Format(time.RFC3339)
+	}
+
 	c.JSON(http.StatusOK, gin.H{
 		"org_id":          orgID,
 		"org_name":        name,
 		"creator_email":   creatorEmail,
 		"creator_name":    creatorName,
+		"status":          effectiveStatus,
+		"deleted_at":      deletedAtStr,
 		"role":            "default",
 		"quota_usage":     storageUsed,
 		"quota":           storageQuota,

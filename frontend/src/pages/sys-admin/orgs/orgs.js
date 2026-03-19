@@ -21,6 +21,7 @@ class Orgs extends Component {
       orgList: [],
       currentPage: 1,
       perPage: 25,
+      statusFilter: 'all',
       hasNextPage: false,
       isAddOrgDialogOpen: false
     };
@@ -28,18 +29,19 @@ class Orgs extends Component {
 
   componentDidMount() {
     let urlParams = (new URL(window.location)).searchParams;
-    const { currentPage, perPage } = this.state;
+    const { currentPage, perPage, statusFilter } = this.state;
     this.setState({
       perPage: parseInt(urlParams.get('per_page') || perPage),
-      currentPage: parseInt(urlParams.get('page') || currentPage)
+      currentPage: parseInt(urlParams.get('page') || currentPage),
+      statusFilter: urlParams.get('status') || statusFilter
     }, () => {
       this.getItemsByPage(this.state.currentPage);
     });
   }
 
   getItemsByPage = (page) => {
-    const { perPage } = this.state;
-    seafileAPI.sysAdminListOrgs(page, perPage).then((res) => {
+    const { perPage, statusFilter } = this.state;
+    seafileAPI.sysAdminListOrgs(page, perPage, statusFilter).then((res) => {
       this.setState({
         loading: false,
         orgList: res.data.organizations,
@@ -58,6 +60,20 @@ class Orgs extends Component {
     this.setState({
       perPage: perPage
     }, () => {
+      this.getItemsByPage(1);
+    });
+  };
+
+  setStatusFilter = (statusFilter) => {
+    this.setState({
+      statusFilter
+    }, () => {
+      const url = new URL(location.href);
+      const searchParams = new URLSearchParams(url.search);
+      searchParams.set('page', '1');
+      searchParams.set('status', statusFilter);
+      url.search = searchParams.toString();
+      navigate(url.toString());
       this.getItemsByPage(1);
     });
   };
@@ -98,11 +114,38 @@ class Orgs extends Component {
 
   deleteOrg = (orgID) => {
     seafileAPI.sysAdminDeleteOrg(orgID).then(res => {
-      let orgList = this.state.orgList.filter(org => {
-        return org.org_id !== orgID;
-      });
-      this.setState({ orgList: orgList });
+      this.getItemsByPage(this.state.currentPage);
       toaster.success(gettext('Successfully deleted 1 item.'));
+    }).catch((error) => {
+      let errMessage = Utils.getErrorMsg(error);
+      toaster.danger(errMessage);
+    });
+  };
+
+  deactivateOrg = (orgID) => {
+    seafileAPI.sysAdminDeactivateOrg(orgID).then(() => {
+      this.getItemsByPage(this.state.currentPage);
+      toaster.success(gettext('Edit succeeded'));
+    }).catch((error) => {
+      let errMessage = Utils.getErrorMsg(error);
+      toaster.danger(errMessage);
+    });
+  };
+
+  reactivateOrg = (orgID) => {
+    seafileAPI.sysAdminReactivateOrg(orgID).then(() => {
+      this.getItemsByPage(this.state.currentPage);
+      toaster.success(gettext('Edit succeeded'));
+    }).catch((error) => {
+      let errMessage = Utils.getErrorMsg(error);
+      toaster.danger(errMessage);
+    });
+  };
+
+  restoreOrg = (orgID) => {
+    seafileAPI.sysAdminRestoreOrg(orgID).then(() => {
+      this.getItemsByPage(this.state.currentPage);
+      toaster.success(gettext('Edit succeeded'));
     }).catch((error) => {
       let errMessage = Utils.getErrorMsg(error);
       toaster.danger(errMessage);
@@ -131,6 +174,27 @@ class Orgs extends Component {
           <div className="cur-view-container">
             <div className="cur-view-path">
               <h3 className="sf-heading">{gettext('Organizations')}</h3>
+              <div className="d-flex align-items-center mt-2">
+                <span className="mr-2">{gettext('Status')}</span>
+                {['all', 'active', 'deactivated', 'deleted'].map(status => {
+                  const isActive = this.state.statusFilter === status;
+                  const labelMap = {
+                    all: gettext('All'),
+                    active: gettext('Active'),
+                    deactivated: gettext('Inactive'),
+                    deleted: gettext('Deleted')
+                  };
+                  return (
+                    <button
+                      key={status}
+                      className={`btn btn-sm mr-2 ${isActive ? 'btn-primary' : 'btn-outline-secondary'}`}
+                      onClick={() => this.setStatusFilter(status)}
+                    >
+                      {labelMap[status]}
+                    </button>
+                  );
+                })}
+              </div>
             </div>
             <div className="cur-view-content">
               <Content
@@ -144,6 +208,9 @@ class Orgs extends Component {
                 getListByPage={this.getItemsByPage}
                 updateRole={this.updateRole}
                 deleteOrg={this.deleteOrg}
+                deactivateOrg={this.deactivateOrg}
+                reactivateOrg={this.reactivateOrg}
+                restoreOrg={this.restoreOrg}
               />
             </div>
           </div>

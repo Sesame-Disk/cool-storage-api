@@ -1017,11 +1017,12 @@ seafileAPI.sysAdminUpdateOrgUser = function (orgID, email, key, value) {
 };
 
 // Admin: list organizations
-seafileAPI.sysAdminListOrgs = function (page, perPage) {
+seafileAPI.sysAdminListOrgs = function (page, perPage, status) {
   let url = this.server + '/api/v2.1/admin/organizations/';
   let params = new URLSearchParams();
   if (page) params.set('page', page);
   if (perPage) params.set('per_page', perPage);
+  if (status && status !== 'all') params.set('status', status);
   if (params.toString()) url += '?' + params.toString();
   return this.req.get(url);
 };
@@ -1055,6 +1056,24 @@ seafileAPI.sysAdminUpdateOrg = function (orgID, data) {
 seafileAPI.sysAdminDeleteOrg = function (orgID) {
   let url = this.server + '/api/v2.1/admin/organizations/' + orgID + '/';
   return this.req.delete(url);
+};
+
+// Admin: deactivate organization
+seafileAPI.sysAdminDeactivateOrg = function (orgID) {
+  let url = this.server + '/api/v2.1/admin/organizations/' + orgID + '/deactivate/';
+  return this.req.post(url);
+};
+
+// Admin: reactivate organization
+seafileAPI.sysAdminReactivateOrg = function (orgID) {
+  let url = this.server + '/api/v2.1/admin/organizations/' + orgID + '/reactivate/';
+  return this.req.post(url);
+};
+
+// Admin: restore deleted organization
+seafileAPI.sysAdminRestoreOrg = function (orgID) {
+  let url = this.server + '/api/v2.1/admin/organizations/' + orgID + '/restore/';
+  return this.req.post(url);
 };
 
 // Admin: list org users (sys-admin panel)
