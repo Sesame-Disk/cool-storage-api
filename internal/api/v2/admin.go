@@ -211,12 +211,16 @@ func RegisterAdminRoutes(rg *gin.RouterGroup, database *db.DB, cfg *config.Confi
 		admin.GET("/share-links", h.AdminListShareLinks)
 		admin.DELETE("/share-links/:token/", h.AdminDeleteShareLink)
 		admin.DELETE("/share-links/:token", h.AdminDeleteShareLink)
+		admin.PUT("/share-links/:token/active/", h.AdminSetShareLinkActive)
+		admin.PUT("/share-links/:token/active", h.AdminSetShareLinkActive)
 
 		// Upload links
 		admin.GET("/upload-links/", h.AdminListUploadLinks)
 		admin.GET("/upload-links", h.AdminListUploadLinks)
 		admin.DELETE("/upload-links/:token/", h.AdminDeleteUploadLink)
 		admin.DELETE("/upload-links/:token", h.AdminDeleteUploadLink)
+		admin.PUT("/upload-links/:token/active/", h.AdminSetUploadLinkActive)
+		admin.PUT("/upload-links/:token/active", h.AdminSetUploadLinkActive)
 
 		// System notifications
 		admin.GET("/sys-notifications/", h.AdminListSysNotifications)

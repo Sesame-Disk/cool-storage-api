@@ -750,21 +750,59 @@ func (h *AdminHandler) AdminListShareLinks(c *gin.Context) {
 		return
 	}
 
-	// Query from share_links_by_org — efficient single-partition query, ordered by date DESC
+	// Backward-compatible filter: status=active|inactive maps to active=true|false
+	statusFilter := strings.TrimSpace(strings.ToLower(c.DefaultQuery("status", "")))
+	activeParam := strings.TrimSpace(strings.ToLower(c.DefaultQuery("active", "")))
+	expiredParam := strings.TrimSpace(strings.ToLower(c.DefaultQuery("expired", "")))
+
+	if statusFilter == "active" {
+		activeParam = "true"
+	} else if statusFilter == "inactive" {
+		activeParam = "false"
+	} else if statusFilter != "" && statusFilter != "all" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid status filter"})
+		return
+	}
+
+	hasActiveFilter := false
+	activeFilter := false
+	if activeParam != "" && activeParam != "all" {
+		parsed, err := strconv.ParseBool(activeParam)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid active filter"})
+			return
+		}
+		hasActiveFilter = true
+		activeFilter = parsed
+	}
+
+	hasExpiredFilter := false
+	expiredFilter := false
+	if expiredParam != "" && expiredParam != "all" {
+		parsed, err := strconv.ParseBool(expiredParam)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid expired filter"})
+			return
+		}
+		hasExpiredFilter = true
+		expiredFilter = parsed
+	}
+
 	var links []gin.H
 	iter := h.db.Session().Query(`
-		SELECT link_token, link_type, library_id, file_path, created_by, permission, expires_at, has_password, active, created_at
+		SELECT link_token, link_type, library_id, file_path, created_by, permission, expires_at, has_password, active, view_count, created_at
 		FROM share_links_by_org WHERE org_id = ?
 	`, callerOrgID).Iter()
 	var token, linkType, libID, filePath, createdBy, permission string
 	var expiresAt *time.Time
 	var hasPassword, active bool
+	var viewCount *int
 	var createdAt time.Time
 
 	libNameCache := map[string]string{}
 	userCache := map[string][2]string{} // createdBy -> [email, name]
 
-	for iter.Scan(&token, &linkType, &libID, &filePath, &createdBy, &permission, &expiresAt, &hasPassword, &active, &createdAt) {
+	for iter.Scan(&token, &linkType, &libID, &filePath, &createdBy, &permission, &expiresAt, &hasPassword, &active, &viewCount, &createdAt) {
 		// Only share links
 		if linkType != "share" {
 			continue
@@ -775,13 +813,24 @@ func (h *AdminHandler) AdminListShareLinks(c *gin.Context) {
 			objName = filePath[idx+1:]
 		}
 
-		isExpired := !active
+		isExpired := false
 		expireDateStr := ""
 		if expiresAt != nil && !expiresAt.IsZero() {
 			if expiresAt.Before(time.Now()) {
 				isExpired = true
 			}
 			expireDateStr = expiresAt.Format("2006-01-02T15:04:05+00:00")
+		}
+		if hasActiveFilter && active != activeFilter {
+			continue
+		}
+		if hasExpiredFilter && isExpired != expiredFilter {
+			continue
+		}
+
+		status := "active"
+		if !active {
+			status = "inactive"
 		}
 
 		repoName, ok := libNameCache[libID]
@@ -809,6 +858,11 @@ func (h *AdminHandler) AdminListShareLinks(c *gin.Context) {
 
 		perms := parsePermsJSON(permission)
 
+		count := 0
+		if viewCount != nil {
+			count = *viewCount
+		}
+
 		links = append(links, gin.H{
 			"obj_name":      objName,
 			"token":         token,
@@ -818,9 +872,12 @@ func (h *AdminHandler) AdminListShareLinks(c *gin.Context) {
 			"creator_email": userData[0],
 			"creator_name":  userData[1],
 			"ctime":         createdAt.Format(time.RFC3339),
-			"view_cnt":      0,
+			"view_cnt":      count,
 			"expire_date":   expireDateStr,
 			"is_expired":    isExpired,
+			"active":        active,
+			"has_password":  hasPassword,
+			"status":        status,
 			"permissions":   gin.H{"can_download": perms.CanDownload, "can_edit": perms.CanEdit},
 		})
 	}
@@ -836,29 +893,7 @@ func (h *AdminHandler) AdminListShareLinks(c *gin.Context) {
 	// Sorting support (data already comes sorted by ctime DESC from Cassandra)
 	sortBy := c.DefaultQuery("order_by", "")
 	direction := c.DefaultQuery("direction", "asc")
-	if sortBy != "" {
-		sort.Slice(links, func(i, j int) bool {
-			var vi, vj string
-			switch sortBy {
-			case "ctime":
-				vi, _ = links[i]["ctime"].(string)
-				vj, _ = links[j]["ctime"].(string)
-			case "creator":
-				vi, _ = links[i]["creator_email"].(string)
-				vj, _ = links[j]["creator_email"].(string)
-			case "name":
-				vi, _ = links[i]["obj_name"].(string)
-				vj, _ = links[j]["obj_name"].(string)
-			default:
-				vi, _ = links[i]["ctime"].(string)
-				vj, _ = links[j]["ctime"].(string)
-			}
-			if direction == "desc" {
-				return vi > vj
-			}
-			return vi < vj
-		})
-	}
+	sortAdminLinks(links, sortBy, direction)
 
 	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
 	perPage, _ := strconv.Atoi(c.DefaultQuery("per_page", "25"))
@@ -904,6 +939,48 @@ func (h *AdminHandler) AdminDeleteShareLink(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"success": true})
 }
 
+// AdminSetShareLinkActive toggles active flag for a share link (superadmin/admin scope).
+// PUT /admin/share-links/:token/active/
+// Body/Form: active=true|false
+func (h *AdminHandler) AdminSetShareLinkActive(c *gin.Context) {
+	callerOrgID := c.GetString("org_id")
+	callerUserID := c.GetString("user_id")
+	if err := h.requireAdminAccess(c, callerOrgID, callerUserID); err != nil {
+		return
+	}
+
+	token := c.Param("token")
+	activeRaw := strings.TrimSpace(strings.ToLower(c.PostForm("active")))
+	if activeRaw == "" {
+		var req struct {
+			Active *bool `json:"active"`
+		}
+		if err := c.ShouldBindJSON(&req); err == nil && req.Active != nil {
+			activeRaw = strconv.FormatBool(*req.Active)
+		}
+	}
+	active, err := strconv.ParseBool(activeRaw)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "active is required and must be true or false"})
+		return
+	}
+
+	if err := h.setAdminLinkActive(token, "share", active); err != nil {
+		if err.Error() == "not found" {
+			c.JSON(http.StatusNotFound, gin.H{"error": "share link not found"})
+			return
+		}
+		if err.Error() == "wrong type" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "link is not a share link"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update share link"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"success": true, "active": active})
+}
+
 // ============================================================================
 // Upload Links — GET /admin/upload-links/ , DELETE /admin/upload-links/:token/
 // ============================================================================
@@ -915,21 +992,59 @@ func (h *AdminHandler) AdminListUploadLinks(c *gin.Context) {
 		return
 	}
 
-	// Query from share_links_by_org — efficient single-partition query
+	// Backward-compatible filter: status=active|inactive maps to active=true|false
+	statusFilter := strings.TrimSpace(strings.ToLower(c.DefaultQuery("status", "")))
+	activeParam := strings.TrimSpace(strings.ToLower(c.DefaultQuery("active", "")))
+	expiredParam := strings.TrimSpace(strings.ToLower(c.DefaultQuery("expired", "")))
+
+	if statusFilter == "active" {
+		activeParam = "true"
+	} else if statusFilter == "inactive" {
+		activeParam = "false"
+	} else if statusFilter != "" && statusFilter != "all" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid status filter"})
+		return
+	}
+
+	hasActiveFilter := false
+	activeFilter := false
+	if activeParam != "" && activeParam != "all" {
+		parsed, err := strconv.ParseBool(activeParam)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid active filter"})
+			return
+		}
+		hasActiveFilter = true
+		activeFilter = parsed
+	}
+
+	hasExpiredFilter := false
+	expiredFilter := false
+	if expiredParam != "" && expiredParam != "all" {
+		parsed, err := strconv.ParseBool(expiredParam)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid expired filter"})
+			return
+		}
+		hasExpiredFilter = true
+		expiredFilter = parsed
+	}
+
 	var links []gin.H
 	iter := h.db.Session().Query(`
-		SELECT link_token, link_type, library_id, file_path, created_by, expires_at, active, created_at
+		SELECT link_token, link_type, library_id, file_path, created_by, expires_at, active, has_password, upload_count, created_at
 		FROM share_links_by_org WHERE org_id = ?
 	`, callerOrgID).Iter()
 	var token, linkType, libID, filePath, createdBy string
 	var expiresAt *time.Time
-	var active bool
+	var active, hasPassword bool
+	var uploadCount *int
 	var createdAt time.Time
 
 	libNameCache := map[string]string{}
 	userCache := map[string][2]string{}
 
-	for iter.Scan(&token, &linkType, &libID, &filePath, &createdBy, &expiresAt, &active, &createdAt) {
+	for iter.Scan(&token, &linkType, &libID, &filePath, &createdBy, &expiresAt, &active, &hasPassword, &uploadCount, &createdAt) {
 		// Only upload links
 		if linkType != "upload" {
 			continue
@@ -940,13 +1055,24 @@ func (h *AdminHandler) AdminListUploadLinks(c *gin.Context) {
 			objName = filePath[idx+1:]
 		}
 
-		isExpired := !active
+		isExpired := false
 		expireDateStr := ""
 		if expiresAt != nil && !expiresAt.IsZero() {
 			if expiresAt.Before(time.Now()) {
 				isExpired = true
 			}
 			expireDateStr = expiresAt.Format("2006-01-02T15:04:05+00:00")
+		}
+		if hasActiveFilter && active != activeFilter {
+			continue
+		}
+		if hasExpiredFilter && isExpired != expiredFilter {
+			continue
+		}
+
+		status := "active"
+		if !active {
+			status = "inactive"
 		}
 
 		repoName, ok := libNameCache[libID]
@@ -972,6 +1098,11 @@ func (h *AdminHandler) AdminListUploadLinks(c *gin.Context) {
 			userCache[createdBy] = userData
 		}
 
+		count := 0
+		if uploadCount != nil {
+			count = *uploadCount
+		}
+
 		links = append(links, gin.H{
 			"obj_name":      objName,
 			"path":          filePath,
@@ -981,9 +1112,12 @@ func (h *AdminHandler) AdminListUploadLinks(c *gin.Context) {
 			"creator_email": userData[0],
 			"creator_name":  userData[1],
 			"ctime":         createdAt.Format(time.RFC3339),
-			"view_cnt":      0,
+			"view_cnt":      count,
 			"expire_date":   expireDateStr,
 			"is_expired":    isExpired,
+			"active":        active,
+			"has_password":  hasPassword,
+			"status":        status,
 		})
 	}
 	if err := iter.Close(); err != nil {
@@ -994,6 +1128,10 @@ func (h *AdminHandler) AdminListUploadLinks(c *gin.Context) {
 	if links == nil {
 		links = []gin.H{}
 	}
+
+	sortBy := c.DefaultQuery("order_by", "")
+	direction := c.DefaultQuery("direction", "asc")
+	sortAdminLinks(links, sortBy, direction)
 
 	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
 	perPage, _ := strconv.Atoi(c.DefaultQuery("per_page", "25"))
@@ -1036,6 +1174,111 @@ func (h *AdminHandler) AdminDeleteUploadLink(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"success": true})
+}
+
+func sortAdminLinks(links []gin.H, sortBy, direction string) {
+	if sortBy == "" {
+		return
+	}
+
+	sort.Slice(links, func(i, j int) bool {
+		if sortBy == "view_cnt" {
+			vi, _ := links[i]["view_cnt"].(int)
+			vj, _ := links[j]["view_cnt"].(int)
+			if direction == "desc" {
+				return vi > vj
+			}
+			return vi < vj
+		}
+
+		var vi, vj string
+		switch sortBy {
+		case "ctime":
+			vi, _ = links[i]["ctime"].(string)
+			vj, _ = links[j]["ctime"].(string)
+		case "creator":
+			vi, _ = links[i]["creator_email"].(string)
+			vj, _ = links[j]["creator_email"].(string)
+		case "name":
+			vi, _ = links[i]["obj_name"].(string)
+			vj, _ = links[j]["obj_name"].(string)
+		default:
+			vi, _ = links[i]["ctime"].(string)
+			vj, _ = links[j]["ctime"].(string)
+		}
+		if direction == "desc" {
+			return vi > vj
+		}
+		return vi < vj
+	})
+}
+
+// AdminSetUploadLinkActive toggles active flag for an upload link (superadmin/admin scope).
+// PUT /admin/upload-links/:token/active/
+// Body/Form: active=true|false
+func (h *AdminHandler) AdminSetUploadLinkActive(c *gin.Context) {
+	callerOrgID := c.GetString("org_id")
+	callerUserID := c.GetString("user_id")
+	if err := h.requireAdminAccess(c, callerOrgID, callerUserID); err != nil {
+		return
+	}
+
+	token := c.Param("token")
+	activeRaw := strings.TrimSpace(strings.ToLower(c.PostForm("active")))
+	if activeRaw == "" {
+		var req struct {
+			Active *bool `json:"active"`
+		}
+		if err := c.ShouldBindJSON(&req); err == nil && req.Active != nil {
+			activeRaw = strconv.FormatBool(*req.Active)
+		}
+	}
+	active, err := strconv.ParseBool(activeRaw)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "active is required and must be true or false"})
+		return
+	}
+
+	if err := h.setAdminLinkActive(token, "upload", active); err != nil {
+		if err.Error() == "not found" {
+			c.JSON(http.StatusNotFound, gin.H{"error": "upload link not found"})
+			return
+		}
+		if err.Error() == "wrong type" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "link is not an upload link"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update upload link"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"success": true, "active": active})
+}
+
+func (h *AdminHandler) setAdminLinkActive(token, expectedType string, active bool) error {
+	var createdBy, orgID, libID, linkType string
+	var createdAt time.Time
+	if err := h.db.Session().Query(`
+		SELECT created_by, org_id, library_id, created_at, link_type
+		FROM share_links WHERE link_token = ?
+	`, token).Scan(&createdBy, &orgID, &libID, &createdAt, &linkType); err != nil {
+		return fmt.Errorf("not found")
+	}
+	if linkType != expectedType {
+		return fmt.Errorf("wrong type")
+	}
+
+	batch := h.db.Session().Batch(gocql.UnloggedBatch)
+	batch.Query(`UPDATE share_links SET active = ? WHERE link_token = ?`, active, token)
+	batch.Query(`UPDATE share_links_by_creator SET active = ? WHERE org_id = ? AND created_by = ? AND created_at = ? AND link_token = ?`,
+		active, orgID, createdBy, createdAt, token)
+	batch.Query(`UPDATE share_links_by_org SET active = ? WHERE org_id = ? AND created_at = ? AND link_token = ?`,
+		active, orgID, createdAt, token)
+
+	if err := batch.Exec(); err != nil {
+		return err
+	}
+	return nil
 }
 
 // ============================================================================

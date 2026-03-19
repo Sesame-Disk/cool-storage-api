@@ -845,13 +845,16 @@ seafileAPI.sysAdminSearchTrashRepos = function (owner) {
 // ============================================================================
 
 // Admin: list all share links (paginated, sortable)
-seafileAPI.sysAdminListShareLinks = function (page, perPage, sortBy, sortOrder) {
+seafileAPI.sysAdminListShareLinks = function (page, perPage, sortBy, sortOrder, status, active, expired) {
   let url = this.server + '/api/v2.1/admin/share-links/';
   const params = new URLSearchParams();
   if (page) params.set('page', page);
   if (perPage) params.set('per_page', perPage);
   if (sortBy) params.set('order_by', sortBy);
   if (sortOrder) params.set('direction', sortOrder);
+  if (status && status !== 'all') params.set('status', status);
+  if (active !== undefined && active !== null && active !== 'all') params.set('active', active);
+  if (expired !== undefined && expired !== null && expired !== 'all') params.set('expired', expired);
   if (params.toString()) url += '?' + params.toString();
   return this.req.get(url);
 };
@@ -862,12 +865,25 @@ seafileAPI.sysAdminDeleteShareLink = function (token) {
   return this.req.delete(url);
 };
 
-// Admin: list all upload links (paginated)
-seafileAPI.sysAdminListAllUploadLinks = function (page, perPage) {
+// Admin: activate/deactivate share link by token
+seafileAPI.sysAdminSetShareLinkActive = function (token, active) {
+  let url = this.server + '/api/v2.1/admin/share-links/' + token + '/active/';
+  let form = new FormData();
+  form.append('active', active);
+  return this.req.put(url, form);
+};
+
+// Admin: list all upload links (paginated, sortable)
+seafileAPI.sysAdminListAllUploadLinks = function (page, perPage, sortBy, sortOrder, status, active, expired) {
   let url = this.server + '/api/v2.1/admin/upload-links/';
   const params = new URLSearchParams();
   if (page) params.set('page', page);
   if (perPage) params.set('per_page', perPage);
+  if (sortBy) params.set('order_by', sortBy);
+  if (sortOrder) params.set('direction', sortOrder);
+  if (status && status !== 'all') params.set('status', status);
+  if (active !== undefined && active !== null && active !== 'all') params.set('active', active);
+  if (expired !== undefined && expired !== null && expired !== 'all') params.set('expired', expired);
   if (params.toString()) url += '?' + params.toString();
   return this.req.get(url);
 };
@@ -876,6 +892,14 @@ seafileAPI.sysAdminListAllUploadLinks = function (page, perPage) {
 seafileAPI.sysAdminDeleteUploadLink = function (token) {
   let url = this.server + '/api/v2.1/admin/upload-links/' + token + '/';
   return this.req.delete(url);
+};
+
+// Admin: activate/deactivate upload link by token
+seafileAPI.sysAdminSetUploadLinkActive = function (token, active) {
+  let url = this.server + '/api/v2.1/admin/upload-links/' + token + '/active/';
+  let form = new FormData();
+  form.append('active', active);
+  return this.req.put(url, form);
 };
 
 // Admin: list share links created by a specific user

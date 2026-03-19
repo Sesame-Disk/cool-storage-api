@@ -123,22 +123,22 @@ func getCSSBundleFallbacks() map[string]string {
 
 // shareLinkData holds the resolved share link info for rendering
 type shareLinkData struct {
-	token        string
-	orgID        string
-	libraryID    string
-	filePath     string
-	permission   string
-	createdBy    string
-	creatorName  string
-	createdAt    time.Time
+	token       string
+	orgID       string
+	libraryID   string
+	filePath    string
+	permission  string
+	createdBy   string
+	creatorName string
+	createdAt   time.Time
 	// isExpired: link has exceeded its validity (time, max downloads).
 	isExpired bool
 	// isDisabled: link was explicitly disabled by an admin action (user/org deactivated or deleted).
 	// Semantically distinct from expiration — the link can be re-enabled on reactivation.
-	isDisabled bool
-	repoName   string
-	commitID   string
-	isDir      bool
+	isDisabled   bool
+	repoName     string
+	commitID     string
+	isDir        bool
 	targetEntry  *FSEntry
 	passwordHash string
 	singleUse    bool
@@ -153,8 +153,9 @@ type shareLinkData struct {
 	fileSubPath string
 }
 
-// resolveShareLink looks up and validates a share link token from the unified share_links table
-func (h *ShareLinkViewHandler) resolveShareLink(token string) (*shareLinkData, error) {
+// resolveShareLink looks up and validates a share link token from the unified share_links table.
+// When countView is true, it increments the view counter.
+func (h *ShareLinkViewHandler) resolveShareLink(token string, countView bool) (*shareLinkData, error) {
 	var orgID, libraryID, filePath, permission, createdBy, passwordHash string
 	var expiresAt *time.Time
 	var createdAt time.Time
@@ -185,13 +186,15 @@ func (h *ShareLinkViewHandler) resolveShareLink(token string) (*shareLinkData, e
 		isExpired = true
 	}
 
-	// Increment view_count (fire-and-forget, approximate counter)
-	now := time.Now()
-	go func() {
-		if err := h.db.Session().Query(`UPDATE share_links SET view_count = view_count + 1, last_accessed_at = ? WHERE link_token = ?`, now, token).Exec(); err != nil {
-			log.Printf("[resolveShareLink] failed to update view_count for token %s: %v", token, err)
-		}
-	}()
+	if countView {
+		// Increment view_count (fire-and-forget, approximate counter)
+		now := time.Now()
+		go func() {
+			if err := incrementShareLinkCounterDualWrite(h.db, token, "view_count", now); err != nil {
+				log.Printf("[resolveShareLink] failed to update view_count for token %s: %v", token, err)
+			}
+		}()
+	}
 
 	// Get library name and head commit ID
 	var repoName, commitID string
@@ -282,7 +285,7 @@ func parseShareLinkPermission(permission string) (canEdit, canDownload, canUploa
 func (h *ShareLinkViewHandler) ServeShareLinkPage(c *gin.Context) {
 	token := c.Param("token")
 
-	sl, err := h.resolveShareLink(token)
+	sl, err := h.resolveShareLink(token, true)
 	if err != nil {
 		c.Header("Content-Type", "text/html; charset=utf-8")
 		c.String(http.StatusNotFound, errorPageHTML("Not Found", "This share link does not exist."))
@@ -397,8 +400,7 @@ func (h *ShareLinkViewHandler) handleShareLinkDownload(c *gin.Context, sl *share
 			deleteConsumedShareLink(h.db, sl.token, sl.orgID, sl.libraryID, sl.createdBy, sl.createdAt)
 		} else {
 			now := time.Now()
-			if err := h.db.Session().Query(`UPDATE share_links SET download_count = download_count + 1, last_accessed_at = ? WHERE link_token = ?`,
-				now, sl.token).Exec(); err != nil {
+			if err := incrementShareLinkCounterDualWrite(h.db, sl.token, "download_count", now); err != nil {
 				log.Printf("[handleShareLinkDownload] failed to update download_count for token %s: %v", sl.token, err)
 			}
 		}
@@ -1136,7 +1138,7 @@ func buildShareLinkFullPath(basePath, subPath string) (string, error) {
 	// Join the base and the subpath
 	// Do NOT clean subPath with a leading slash first, as that strips leading ../
 	fullPath := path.Join(cleanBase, subPath)
-	
+
 	// Clean the resulting joined path
 	cleanFull := path.Clean(fullPath)
 
@@ -1156,7 +1158,7 @@ func buildShareLinkFullPath(basePath, subPath string) (string, error) {
 func (h *ShareLinkViewHandler) ListShareLinkDirents(c *gin.Context) {
 	token := c.Param("token")
 
-	sl, err := h.resolveShareLink(token)
+	sl, err := h.resolveShareLink(token, false)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "share link not found"})
 		return
@@ -1277,7 +1279,7 @@ func (h *ShareLinkViewHandler) ListShareLinkDirents(c *gin.Context) {
 func (h *ShareLinkViewHandler) GetShareLinkRepoTags(c *gin.Context) {
 	token := c.Param("token")
 
-	sl, err := h.resolveShareLink(token)
+	sl, err := h.resolveShareLink(token, false)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "share link not found"})
 		return
@@ -1302,7 +1304,7 @@ func (h *ShareLinkViewHandler) ServeShareLinkFilePage(c *gin.Context) {
 	token := c.Param("token")
 	filePath := c.Query("p")
 
-	sl, err := h.resolveShareLink(token)
+	sl, err := h.resolveShareLink(token, true)
 	if err != nil {
 		c.Header("Content-Type", "text/html; charset=utf-8")
 		c.String(http.StatusNotFound, errorPageHTML("Not Found", "This share link does not exist."))
@@ -1380,7 +1382,7 @@ func (h *ShareLinkViewHandler) GetShareLinkZipTask(c *gin.Context) {
 	token := c.Query("share_link_token")
 	path := c.DefaultQuery("path", "/")
 
-	sl, err := h.resolveShareLink(token)
+	sl, err := h.resolveShareLink(token, false)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "share link not found"})
 		return
@@ -1594,8 +1596,7 @@ func (h *ShareLinkViewHandler) PostUploadLinkDone(c *gin.Context) {
 			deleteConsumedShareLink(h.db, token, orgID2, libraryID2, createdBy2, createdAt2)
 		} else {
 			now := time.Now()
-			if err := h.db.Session().Query(`UPDATE share_links SET upload_count = upload_count + 1, last_accessed_at = ? WHERE link_token = ?`,
-				now, token).Exec(); err != nil {
+			if err := incrementShareLinkCounterDualWrite(h.db, token, "upload_count", now); err != nil {
 				log.Printf("[PostUploadLinkDone] failed to update upload_count for token %s: %v", token, err)
 			}
 		}
@@ -1610,7 +1611,7 @@ func (h *ShareLinkViewHandler) GetShareLinkUploadURL(c *gin.Context) {
 	token := c.Param("token")
 	path := c.DefaultQuery("path", "/")
 
-	sl, err := h.resolveShareLink(token)
+	sl, err := h.resolveShareLink(token, false)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "share link not found"})
 		return
@@ -1659,7 +1660,7 @@ func (h *ShareLinkViewHandler) PostShareLinkUploadDone(c *gin.Context) {
 	token := c.Param("token")
 
 	// Validate the share link exists and has upload permissions
-	sl, err := h.resolveShareLink(token)
+	sl, err := h.resolveShareLink(token, false)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "share link not found"})
 		return
@@ -1686,8 +1687,7 @@ func (h *ShareLinkViewHandler) PostShareLinkUploadDone(c *gin.Context) {
 			deleteConsumedShareLink(h.db, sl.token, sl.orgID, sl.libraryID, sl.createdBy, sl.createdAt)
 		} else {
 			now := time.Now()
-			if err := h.db.Session().Query(`UPDATE share_links SET upload_count = upload_count + 1, last_accessed_at = ? WHERE link_token = ?`,
-				now, sl.token).Exec(); err != nil {
+			if err := incrementShareLinkCounterDualWrite(h.db, sl.token, "upload_count", now); err != nil {
 				log.Printf("[PostShareLinkUploadDone] failed to update upload_count for token %s: %v", sl.token, err)
 			}
 		}

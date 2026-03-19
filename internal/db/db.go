@@ -163,6 +163,8 @@ func (db *DB) Migrate() error {
 		migrationAddOrgDeletedAt,
 		migrationAddUserStatus,
 		migrationAddOrgStatus,
+		migrationAddShareLinksByOrgViewCount,
+		migrationAddShareLinksByOrgUploadCount,
 	}
 	for _, migration := range alterMigrations {
 		if err := db.session.Query(migration).Exec(); err != nil {
@@ -453,6 +455,8 @@ CREATE TABLE IF NOT EXISTS share_links_by_org (
 	expires_at TIMESTAMP,
 	has_password BOOLEAN,
 	active BOOLEAN,
+	view_count INT,
+	upload_count INT,
 	PRIMARY KEY ((org_id), created_at, link_token)
 ) WITH CLUSTERING ORDER BY (created_at DESC, link_token ASC)`
 
@@ -895,3 +899,10 @@ ALTER TABLE users ADD status TEXT`
 // Values: "active", "deactivated", "deleted"
 const migrationAddOrgStatus = `
 ALTER TABLE organizations ADD status TEXT`
+
+// Add denormalized counters to admin lookup table so link lists can avoid per-row counter lookups.
+const migrationAddShareLinksByOrgViewCount = `
+ALTER TABLE share_links_by_org ADD view_count INT`
+
+const migrationAddShareLinksByOrgUploadCount = `
+ALTER TABLE share_links_by_org ADD upload_count INT`

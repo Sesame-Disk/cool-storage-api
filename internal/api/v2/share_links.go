@@ -245,18 +245,18 @@ func (h *ShareLinkHandler) insertShareLink(
 		batch.Query(`
 			INSERT INTO share_links_by_org (
 				org_id, created_at, link_token, link_type, library_id, file_path,
-				created_by, permission, expires_at, has_password, active
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, true) USING TTL ?
+				created_by, permission, expires_at, has_password, active, view_count, upload_count
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, true, ?, ?) USING TTL ?
 		`, orgID, createdAt, token, linkType, libraryID, filePath,
-			createdBy, permission, expiresAt, hasPassword, ttlSeconds)
+			createdBy, permission, expiresAt, hasPassword, viewCount, uploadCount, ttlSeconds)
 	} else {
 		batch.Query(`
 			INSERT INTO share_links_by_org (
 				org_id, created_at, link_token, link_type, library_id, file_path,
-				created_by, permission, expires_at, has_password, active
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, true)
+				created_by, permission, expires_at, has_password, active, view_count, upload_count
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, true, ?, ?)
 		`, orgID, createdAt, token, linkType, libraryID, filePath,
-			createdBy, permission, expiresAt, hasPassword)
+			createdBy, permission, expiresAt, hasPassword, viewCount, uploadCount)
 	}
 
 	// 4. By library (for orphan cleanup)

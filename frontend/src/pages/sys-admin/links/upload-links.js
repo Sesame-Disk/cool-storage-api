@@ -1,162 +1,12 @@
 import React, { Component, Fragment } from 'react';
-import PropTypes from 'prop-types';
+import { navigate } from '@gatsbyjs/reach-router';
 import { seafileAPI } from '../../../utils/seafile-api';
 import { gettext } from '../../../utils/constants';
 import toaster from '../../../components/toast';
 import { Utils } from '../../../utils/utils';
-import EmptyTip from '../../../components/empty-tip';
-import moment from 'moment';
-import Loading from '../../../components/loading';
-import Paginator from '../../../components/paginator';
 import LinksNav from './links-nav';
 import MainPanelTopbar from '../main-panel-topbar';
-import UserLink from '../user-link';
-
-
-class Content extends Component {
-
-  constructor(props) {
-    super(props);
-  }
-
-  getPreviousPage = () => {
-    this.props.getUploadLinksByPage(this.props.currentPage - 1);
-  };
-
-  getNextPage = () => {
-    this.props.getUploadLinksByPage(this.props.currentPage + 1);
-  };
-
-  render() {
-    const { loading, errorMsg, items, perPage, currentPage, hasNextPage } = this.props;
-    if (loading) {
-      return <Loading />;
-    } else if (errorMsg) {
-      return <p className="error text-center">{errorMsg}</p>;
-    } else {
-      const emptyTip = (
-        <EmptyTip>
-          <h2>{gettext('No upload links')}</h2>
-        </EmptyTip>
-      );
-      const table = (
-        <Fragment>
-          <table className="table-hover">
-            <thead>
-              <tr>
-                <th width="18%">{gettext('Name')}</th>
-                <th width="18%">{gettext('Token')}</th>
-                <th width="18%">{gettext('Owner')}</th>
-                <th width="15%">{gettext('Created At')}</th>
-                <th width="10%">{gettext('Count')}</th>
-                <th width="11%">{gettext('Expiration')}</th>
-                <th width="10%">{/*Operations*/}</th>
-              </tr>
-            </thead>
-            {items &&
-              <tbody>
-                {items.map((item, index) => {
-                  return (<Item
-                    key={index}
-                    item={item}
-                    deleteUploadLink={this.props.deleteUploadLink}
-                  />);
-                })}
-              </tbody>
-            }
-          </table>
-          <Paginator
-            gotoPreviousPage={this.getPreviousPage}
-            gotoNextPage={this.getNextPage}
-            currentPage={currentPage}
-            hasNextPage={hasNextPage}
-            curPerPage={perPage}
-            resetPerPage={this.props.resetPerPage}
-          />
-        </Fragment>
-      );
-      return items.length ? table : emptyTip;
-    }
-  }
-}
-
-Content.propTypes = {
-  loading: PropTypes.bool.isRequired,
-  errorMsg: PropTypes.string.isRequired,
-  items: PropTypes.array.isRequired,
-  getLogsByPage: PropTypes.func,
-  resetPerPage: PropTypes.func,
-  currentPage: PropTypes.number,
-  perPage: PropTypes.number,
-  pageInfo: PropTypes.object,
-  hasNextPage: PropTypes.bool,
-  getUploadLinksByPage: PropTypes.func.isRequired,
-  deleteUploadLink: PropTypes.func.isRequired,
-};
-
-
-class Item extends Component {
-
-  constructor(props) {
-    super(props);
-    this.state = {
-      isOpIconShown: false,
-    };
-  }
-
-  handleMouseOver = () => {
-    this.setState({
-      isOpIconShown: true
-    });
-  };
-
-  handleMouseOut = () => {
-    this.setState({
-      isOpIconShown: false
-    });
-  };
-
-  deleteUploadLink = () => {
-    this.props.deleteUploadLink(this.props.item.token);
-  };
-
-  renderExpiration = () => {
-    let item = this.props.item;
-    if (!item.expire_date) {
-      return '--';
-    }
-    const expire_date = moment(item.expire_date).format('YYYY-MM-DD');
-    const expire_time = moment(item.expire_date).format('YYYY-MM-DD HH:mm:ss');
-    return (<span className={item.is_expired ? 'error' : ''} title={expire_time}>{expire_date}</span>);
-  };
-
-  render() {
-    let { isOpIconShown } = this.state;
-    let { item } = this.props;
-    let deleteIcon = `action-icon sf2-icon-delete ${isOpIconShown ? '' : 'invisible'}`;
-    return (
-      <Fragment>
-        <tr onMouseOver={this.handleMouseOver} onMouseOut={this.handleMouseOut}>
-          <td>{item.path}</td>
-          <td>{item.token}</td>
-          <td><UserLink email={item.creator_email} name={item.creator_name} /></td>
-          <td>{moment(item.ctime).fromNow()}</td>
-          <td>{item.view_cnt}</td>
-          <td>{this.renderExpiration()}</td>
-          <td>
-            <a href="#" className={deleteIcon} title={gettext('Remove')} onClick={this.deleteUploadLink}></a>
-          </td>
-        </tr>
-      </Fragment>
-    );
-  }
-}
-
-
-Item.propTypes = {
-  item: PropTypes.object.isRequired,
-  deleteUploadLink: PropTypes.func.isRequired,
-};
+import LinksContent from './links-table';
 
 
 class UploadLinks extends Component {
@@ -170,24 +20,34 @@ class UploadLinks extends Component {
       perPage: 25,
       currentPage: 1,
       hasNextPage: false,
+      sortBy: '',
+      sortOrder: 'asc',
+      activeFilter: 'all',
+      expiredFilter: 'all',
     };
     this.initPage = 1;
   }
 
   componentDidMount() {
     let urlParams = (new URL(window.location)).searchParams;
-    const { currentPage, perPage } = this.state;
+    const { currentPage, perPage, sortBy, sortOrder, activeFilter, expiredFilter } = this.state;
     this.setState({
       perPage: parseInt(urlParams.get('per_page') || perPage),
-      currentPage: parseInt(urlParams.get('page') || currentPage)
+      currentPage: parseInt(urlParams.get('page') || currentPage),
+      sortBy: urlParams.get('order_by') || sortBy,
+      sortOrder: urlParams.get('direction') || sortOrder,
+      activeFilter: urlParams.get('active') || urlParams.get('status') || activeFilter,
+      expiredFilter: urlParams.get('expired') || expiredFilter
     }, () => {
       this.getUploadLinksByPage(this.state.currentPage);
     });
   }
 
   getUploadLinksByPage = (page) => {
-    let { perPage } = this.state;
-    seafileAPI.sysAdminListAllUploadLinks(page, perPage).then((res) => {
+    let { perPage, sortBy, sortOrder, activeFilter, expiredFilter } = this.state;
+    const activeParam = activeFilter === 'all' ? 'all' : (activeFilter === 'active');
+    const expiredParam = expiredFilter === 'all' ? 'all' : (expiredFilter === 'expired');
+    seafileAPI.sysAdminListAllUploadLinks(page, perPage, sortBy, sortOrder, null, activeParam, expiredParam).then((res) => {
       this.setState({
         uploadLinkList: res.data.upload_link_list,
         loading: false,
@@ -214,10 +74,82 @@ class UploadLinks extends Component {
     });
   };
 
+  setUploadLinkActive = (linkToken, active) => {
+    seafileAPI.sysAdminSetUploadLinkActive(linkToken, active).then(() => {
+      const uploadLinkList = this.state.uploadLinkList.map(item => {
+        if (item.token === linkToken) {
+          item.active = active;
+        }
+        return item;
+      });
+      this.setState({ uploadLinkList });
+      toaster.success(gettext('Edit succeeded'));
+    }).catch(error => {
+      let errMessage = Utils.getErrorMsg(error);
+      toaster.danger(errMessage);
+    });
+  };
+
   resetPerPage = (newPerPage) => {
     this.setState({
       perPage: newPerPage,
     }, () => this.getUploadLinksByPage(this.initPage));
+  };
+
+  sortItems = (sortBy) => {
+    this.setState({
+      currentPage: 1,
+      sortBy: sortBy,
+      sortOrder: this.state.sortOrder === 'asc' ? 'desc' : 'asc'
+    }, () => {
+      let url = new URL(location.href);
+      let searchParams = new URLSearchParams(url.search);
+      const { currentPage, sortBy, sortOrder } = this.state;
+      searchParams.set('page', currentPage);
+      searchParams.set('order_by', sortBy);
+      searchParams.set('direction', sortOrder);
+      searchParams.set('active', this.state.activeFilter);
+      searchParams.set('expired', this.state.expiredFilter);
+      url.search = searchParams.toString();
+      navigate(url.toString());
+      this.getUploadLinksByPage(currentPage);
+    });
+  };
+
+  setActiveFilter = (activeFilter) => {
+    this.setState({
+      currentPage: 1,
+      activeFilter,
+    }, () => {
+      let url = new URL(location.href);
+      let searchParams = new URLSearchParams(url.search);
+      searchParams.set('page', '1');
+      searchParams.set('active', activeFilter);
+      searchParams.set('expired', this.state.expiredFilter);
+      searchParams.set('order_by', this.state.sortBy);
+      searchParams.set('direction', this.state.sortOrder);
+      url.search = searchParams.toString();
+      navigate(url.toString());
+      this.getUploadLinksByPage(1);
+    });
+  };
+
+  setExpiredFilter = (expiredFilter) => {
+    this.setState({
+      currentPage: 1,
+      expiredFilter,
+    }, () => {
+      let url = new URL(location.href);
+      let searchParams = new URLSearchParams(url.search);
+      searchParams.set('page', '1');
+      searchParams.set('active', this.state.activeFilter);
+      searchParams.set('expired', expiredFilter);
+      searchParams.set('order_by', this.state.sortBy);
+      searchParams.set('direction', this.state.sortOrder);
+      url.search = searchParams.toString();
+      navigate(url.toString());
+      this.getUploadLinksByPage(1);
+    });
   };
 
   render() {
@@ -229,16 +161,26 @@ class UploadLinks extends Component {
           <div className="cur-view-container">
             <LinksNav currentItem="uploadLinks" />
             <div className="cur-view-content">
-              <Content
+              <LinksContent
                 loading={this.state.loading}
                 errorMsg={this.state.errorMsg}
                 items={uploadLinkList}
                 currentPage={currentPage}
                 perPage={perPage}
                 hasNextPage={hasNextPage}
-                getUploadLinksByPage={this.getUploadLinksByPage}
+                getByPage={this.getUploadLinksByPage}
                 resetPerPage={this.resetPerPage}
-                deleteUploadLink={this.deleteUploadLink}
+                emptyTitle={gettext('No upload links')}
+                enableSort={true}
+                sortBy={this.state.sortBy}
+                sortOrder={this.state.sortOrder}
+                activeFilter={this.state.activeFilter}
+                expiredFilter={this.state.expiredFilter}
+                setActiveFilter={this.setActiveFilter}
+                setExpiredFilter={this.setExpiredFilter}
+                sortItems={this.sortItems}
+                onDelete={this.deleteUploadLink}
+                onToggleActive={this.setUploadLinkActive}
               />
             </div>
           </div>

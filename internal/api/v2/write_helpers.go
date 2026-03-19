@@ -386,6 +386,67 @@ func deleteConsumedShareLink(db interface{ Session() *gocql.Session }, token, or
 	}
 }
 
+// incrementShareLinkCounterDualWrite increments a link counter on primary + lookup tables.
+// counter must be one of: view_count, download_count, upload_count.
+func incrementShareLinkCounterDualWrite(db interface{ Session() *gocql.Session }, token, counter string, touchedAt time.Time) error {
+	if counter != "view_count" && counter != "download_count" && counter != "upload_count" {
+		return fmt.Errorf("invalid counter: %s", counter)
+	}
+
+	var orgID, createdBy string
+	var createdAt time.Time
+	var viewCountPtr, downloadCountPtr, uploadCountPtr *int
+	if err := db.Session().Query(`
+		SELECT org_id, created_by, created_at, view_count, download_count, upload_count
+		FROM share_links WHERE link_token = ?
+	`, token).Scan(&orgID, &createdBy, &createdAt, &viewCountPtr, &downloadCountPtr, &uploadCountPtr); err != nil {
+		return err
+	}
+
+	viewCount := 0
+	if viewCountPtr != nil {
+		viewCount = *viewCountPtr
+	}
+	downloadCount := 0
+	if downloadCountPtr != nil {
+		downloadCount = *downloadCountPtr
+	}
+	uploadCount := 0
+	if uploadCountPtr != nil {
+		uploadCount = *uploadCountPtr
+	}
+
+	switch counter {
+	case "view_count":
+		viewCount++
+	case "download_count":
+		downloadCount++
+	case "upload_count":
+		uploadCount++
+	}
+
+	batch := db.Session().Batch(gocql.UnloggedBatch)
+	batch.Query(`
+		UPDATE share_links
+		SET view_count = ?, download_count = ?, upload_count = ?, last_accessed_at = ?
+		WHERE link_token = ?
+	`, viewCount, downloadCount, uploadCount, touchedAt, token)
+	batch.Query(`
+		UPDATE share_links_by_creator
+		SET view_count = ?, download_count = ?, upload_count = ?, last_accessed_at = ?
+		WHERE org_id = ? AND created_by = ? AND created_at = ? AND link_token = ?
+	`, viewCount, downloadCount, uploadCount, touchedAt, orgID, createdBy, createdAt, token)
+
+	// share_links_by_org stores only view_count and upload_count (no download_count column).
+	batch.Query(`
+		UPDATE share_links_by_org
+		SET view_count = ?, upload_count = ?
+		WHERE org_id = ? AND created_at = ? AND link_token = ?
+	`, viewCount, uploadCount, orgID, createdAt, token)
+
+	return batch.Exec()
+}
+
 func rollbackNewLibrary(db interface{ Session() *gocql.Session }, orgID, libraryID string) error {
 	batch := db.Session().Batch(gocql.LoggedBatch)
 	batch.Query(`

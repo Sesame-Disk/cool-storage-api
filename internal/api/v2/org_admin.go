@@ -2729,14 +2729,15 @@ func (h *OrgAdminHandler) ListOrgLinks(c *gin.Context) {
 	userCache := make(map[string][2]string) // createdBy -> [email, name]
 	var links []gin.H
 	iter := h.db.Session().Query(`
-		SELECT link_token, link_type, library_id, file_path, created_by, created_at
+		SELECT link_token, link_type, library_id, file_path, created_by, view_count, created_at
 		FROM share_links_by_org WHERE org_id = ?
 	`, orgID).Iter()
 
 	var token, linkType, libID, filePath, createdBy string
+	var viewCount *int
 	var createdAt time.Time
 
-	for iter.Scan(&token, &linkType, &libID, &filePath, &createdBy, &createdAt) {
+	for iter.Scan(&token, &linkType, &libID, &filePath, &createdBy, &viewCount, &createdAt) {
 		if linkType != "share" {
 			continue
 		}
@@ -2767,6 +2768,11 @@ func (h *OrgAdminHandler) ListOrgLinks(c *gin.Context) {
 		}
 
 		linkURL := fmt.Sprintf("%s/d/%s", getBrowserURL(c, ""), token)
+		count := 0
+		if viewCount != nil {
+			count = *viewCount
+		}
+
 		links = append(links, gin.H{
 			"token":        token,
 			"name":         linkName,
@@ -2774,7 +2780,7 @@ func (h *OrgAdminHandler) ListOrgLinks(c *gin.Context) {
 			"owner_email":  info[0],
 			"owner_name":   info[1],
 			"created_time": createdAt.Format(time.RFC3339),
-			"view_count":   0,
+			"view_count":   count,
 		})
 	}
 	iter.Close()
@@ -2865,15 +2871,16 @@ func (h *OrgAdminHandler) ListOrgUploadLinks(c *gin.Context) {
 	userCache := make(map[string][2]string)
 	var links []gin.H
 	iter := h.db.Session().Query(`
-		SELECT link_token, link_type, library_id, file_path, created_by, expires_at, created_at
+		SELECT link_token, link_type, library_id, file_path, created_by, expires_at, upload_count, created_at
 		FROM share_links_by_org WHERE org_id = ?
 	`, orgID).Iter()
 
 	var token, linkType, libID, filePath, createdBy string
 	var expiresAt *time.Time
+	var uploadCount *int
 	var createdAt time.Time
 
-	for iter.Scan(&token, &linkType, &libID, &filePath, &createdBy, &expiresAt, &createdAt) {
+	for iter.Scan(&token, &linkType, &libID, &filePath, &createdBy, &expiresAt, &uploadCount, &createdAt) {
 		if linkType != "upload" {
 			continue
 		}
@@ -2906,6 +2913,11 @@ func (h *OrgAdminHandler) ListOrgUploadLinks(c *gin.Context) {
 		h.db.Session().Query(`SELECT name FROM libraries WHERE org_id = ? AND library_id = ?`, orgID, libID).Scan(&repoName)
 
 		uploadLinkURL := fmt.Sprintf("%s/u/d/%s", getBrowserURL(c, ""), token)
+		count := 0
+		if uploadCount != nil {
+			count = *uploadCount
+		}
+
 		links = append(links, gin.H{
 			"obj_name":      objName,
 			"path":          filePath,
@@ -2916,7 +2928,7 @@ func (h *OrgAdminHandler) ListOrgUploadLinks(c *gin.Context) {
 			"creator_email": info[0],
 			"creator_name":  info[1],
 			"ctime":         createdAt.Format(time.RFC3339),
-			"view_cnt":      0,
+			"view_cnt":      count,
 			"expire_date":   expireDateStr,
 			"is_expired":    isExpired,
 		})

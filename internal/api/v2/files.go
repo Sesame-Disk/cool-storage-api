@@ -1754,7 +1754,7 @@ func (h *FileHandler) ResolveSmartLink(c *gin.Context) {
 	// Increment view_count in background
 	go func() {
 		now := time.Now()
-		if err := h.db.Session().Query(`UPDATE share_links SET view_count = view_count + 1, last_accessed_at = ? WHERE link_token = ?`, now, token).Exec(); err != nil {
+		if err := incrementShareLinkCounterDualWrite(h.db, token, "view_count", now); err != nil {
 			log.Printf("[ViewInternalLink] failed to update view_count for token %s: %v", token, err)
 		}
 	}()
