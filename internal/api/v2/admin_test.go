@@ -681,6 +681,57 @@ func TestPaginationParsingLogic(t *testing.T) {
 	}
 }
 
+// --- SoftDeleteOrganization handler tests ---
+
+func TestSoftDeleteOrganization_PlatformOrgProtection(t *testing.T) {
+	h := &AdminHandler{}
+
+	r := gin.New()
+	r.POST("/admin/organizations/:org_id/delete/", h.SoftDeleteOrganization)
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/admin/organizations/"+middleware.PlatformOrgID+"/delete/", nil)
+	r.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusForbidden, w.Code)
+
+	var body map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &body)
+	assert.Equal(t, "cannot delete platform organization", body["error"])
+}
+
+func TestSoftDeleteOrganization_NonPlatformOrgHitsDB(t *testing.T) {
+	h := &AdminHandler{}
+
+	r := gin.New()
+	r.Use(gin.Recovery())
+	r.POST("/admin/organizations/:org_id/delete/", h.SoftDeleteOrganization)
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/admin/organizations/00000000-0000-0000-0000-000000000099/delete/", nil)
+	r.ServeHTTP(w, req)
+
+	// Should NOT be 403 (that's the platform protection). It should be 500 (nil DB panic recovered).
+	assert.NotEqual(t, http.StatusForbidden, w.Code)
+}
+
+// --- RestoreOrganization handler tests ---
+
+func TestRestoreOrganization_NonExistentOrgHitsDB(t *testing.T) {
+	h := &AdminHandler{}
+
+	r := gin.New()
+	r.Use(gin.Recovery())
+	r.POST("/admin/organizations/:org_id/restore/", h.RestoreOrganization)
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/admin/organizations/00000000-0000-0000-0000-000000000099/restore/", nil)
+	r.ServeHTTP(w, req)
+
+	// With nil DB it will panic/500, confirming route wiring works
+	assert.True(t, w.Code == http.StatusInternalServerError || w.Code == http.StatusNotFound)
+}
+
 // --- RegisterAdminRoutes route registration test ---
 
 func TestRegisterAdminRoutes_RoutesExist(t *testing.T) {
@@ -703,6 +754,8 @@ func TestRegisterAdminRoutes_RoutesExist(t *testing.T) {
 		{"GET search-group", "GET", "/api/v2.1/admin/search-group/"},
 		{"GET search-user", "GET", "/api/v2.1/admin/search-user/"},
 		{"GET admins", "GET", "/api/v2.1/admin/admins/"},
+		{"POST org soft-delete", "POST", "/api/v2.1/admin/organizations/00000000-0000-0000-0000-000000000001/delete/"},
+		{"POST org restore", "POST", "/api/v2.1/admin/organizations/00000000-0000-0000-0000-000000000001/restore/"},
 	}
 
 	for _, tt := range tests {

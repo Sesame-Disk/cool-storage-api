@@ -716,3 +716,309 @@ func TestScanner_IdempotentEnqueue(t *testing.T) {
 		t.Errorf("expected 2 items after second scan (mock doesn't deduplicate), got %d", secondCount)
 	}
 }
+
+// === Phase 10: Expired Deleted Users ===
+
+func TestScanner_ScanExpiredDeletedUsers_EnqueuesExpired(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	s := NewScanner(store, q, stats, config.GCConfig{UserGraceDays: 7})
+
+	orgID := uuid.New()
+	store.AddOrganization(orgID)
+
+	// Expired user (deleted 10 days ago, grace = 7)
+	expiredUser := uuid.New()
+	store.AddDeletedUser(orgID, expiredUser, "expired@test.com", time.Now().AddDate(0, 0, -10))
+
+	// Recent user (deleted 3 days ago, grace = 7 → NOT expired)
+	recentUser := uuid.New()
+	store.AddDeletedUser(orgID, recentUser, "recent@test.com", time.Now().AddDate(0, 0, -3))
+
+	// Active user (not deleted)
+	activeUser := uuid.New()
+	store.AddUser(orgID, activeUser, "active@test.com")
+
+	ctx := context.Background()
+	n, err := s.scanExpiredDeletedUsers(ctx)
+	if err != nil {
+		t.Fatalf("scanExpiredDeletedUsers failed: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("expected 1 expired user enqueued, got %d", n)
+	}
+
+	// Verify queue contains user_cascade for expired user only
+	items := store.QueueItems(orgID)
+	cascadeCount := 0
+	for _, item := range items {
+		if item.ItemType == ItemUserCascade {
+			cascadeCount++
+			if item.ItemID != expiredUser.String() {
+				t.Errorf("expected expired user %s enqueued, got %s", expiredUser, item.ItemID)
+			}
+		}
+	}
+	if cascadeCount != 1 {
+		t.Errorf("expected 1 user_cascade item, got %d", cascadeCount)
+	}
+}
+
+func TestScanner_ScanExpiredDeletedUsers_NoneExpired(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	s := NewScanner(store, q, stats, config.GCConfig{UserGraceDays: 7})
+
+	orgID := uuid.New()
+	store.AddOrganization(orgID)
+
+	// Only recent deleted user (within grace)
+	store.AddDeletedUser(orgID, uuid.New(), "recent@test.com", time.Now().AddDate(0, 0, -2))
+
+	ctx := context.Background()
+	n, err := s.scanExpiredDeletedUsers(ctx)
+	if err != nil {
+		t.Fatalf("scanExpiredDeletedUsers failed: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("expected 0 expired users enqueued, got %d", n)
+	}
+	if store.QueueLen() != 0 {
+		t.Errorf("expected empty queue, got %d items", store.QueueLen())
+	}
+}
+
+// === Phase 11: Expired Deleted Libraries ===
+
+func TestScanner_ScanExpiredDeletedLibraries_EnqueuesExpired(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	s := NewScanner(store, q, stats, config.GCConfig{TrashRetentionDays: 30})
+
+	orgID := uuid.New()
+	store.AddOrganization(orgID)
+
+	// Expired library (deleted 45 days ago, retention = 30)
+	expiredLib := uuid.New()
+	store.AddDeletedLibrary(orgID, expiredLib, "hot", time.Now().AddDate(0, 0, -45))
+
+	// Recent library (deleted 10 days ago, retention = 30 → NOT expired)
+	recentLib := uuid.New()
+	store.AddDeletedLibrary(orgID, recentLib, "cold", time.Now().AddDate(0, 0, -10))
+
+	ctx := context.Background()
+	n, err := s.scanExpiredDeletedLibraries(ctx)
+	if err != nil {
+		t.Fatalf("scanExpiredDeletedLibraries failed: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("expected 1 expired library enqueued, got %d", n)
+	}
+
+	// Verify queue contains library_cascade with correct storage class
+	items := store.QueueItems(orgID)
+	cascadeCount := 0
+	for _, item := range items {
+		if item.ItemType == ItemLibraryCascade {
+			cascadeCount++
+			if item.ItemID != expiredLib.String() {
+				t.Errorf("expected expired lib %s enqueued, got %s", expiredLib, item.ItemID)
+			}
+			if item.StorageClass != "hot" {
+				t.Errorf("expected storage class 'hot', got %s", item.StorageClass)
+			}
+		}
+	}
+	if cascadeCount != 1 {
+		t.Errorf("expected 1 library_cascade item, got %d", cascadeCount)
+	}
+}
+
+func TestScanner_ScanExpiredDeletedLibraries_NoneExpired(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	s := NewScanner(store, q, stats, config.GCConfig{TrashRetentionDays: 30})
+
+	orgID := uuid.New()
+	store.AddOrganization(orgID)
+
+	// Only recently deleted library
+	store.AddDeletedLibrary(orgID, uuid.New(), "hot", time.Now().AddDate(0, 0, -5))
+
+	ctx := context.Background()
+	n, err := s.scanExpiredDeletedLibraries(ctx)
+	if err != nil {
+		t.Fatalf("scanExpiredDeletedLibraries failed: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("expected 0 expired libraries enqueued, got %d", n)
+	}
+}
+
+func TestScanner_ScanExpiredDeletedLibraries_Multiple(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	s := NewScanner(store, q, stats, config.GCConfig{TrashRetentionDays: 30})
+
+	orgID := uuid.New()
+	store.AddOrganization(orgID)
+
+	// 3 expired libraries
+	for i := 0; i < 3; i++ {
+		store.AddDeletedLibrary(orgID, uuid.New(), "hot", time.Now().AddDate(0, 0, -60))
+	}
+
+	ctx := context.Background()
+	n, err := s.scanExpiredDeletedLibraries(ctx)
+	if err != nil {
+		t.Fatalf("scanExpiredDeletedLibraries failed: %v", err)
+	}
+	if n != 3 {
+		t.Errorf("expected 3 expired libraries enqueued, got %d", n)
+	}
+}
+
+// === Phase 12: Expired Deleted Orgs ===
+
+func TestScanner_ScanExpiredDeletedOrgs_EnqueuesExpired(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	s := NewScanner(store, q, stats, config.GCConfig{OrgGraceDays: 30})
+
+	// Expired org (deleted 45 days ago, grace = 30)
+	expiredOrg := uuid.New()
+	store.AddDeletedOrg(expiredOrg, "Expired Corp", time.Now().AddDate(0, 0, -45))
+
+	// Recent org (deleted 10 days ago, grace = 30 → NOT expired)
+	recentOrg := uuid.New()
+	store.AddDeletedOrg(recentOrg, "Recent Corp", time.Now().AddDate(0, 0, -10))
+
+	ctx := context.Background()
+	n, err := s.scanExpiredDeletedOrgs(ctx)
+	if err != nil {
+		t.Fatalf("scanExpiredDeletedOrgs failed: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("expected 1 expired org enqueued, got %d", n)
+	}
+
+	// Verify queue: org_cascade for expired org only
+	items := store.QueueItems(expiredOrg)
+	cascadeCount := 0
+	for _, item := range items {
+		if item.ItemType == ItemOrgCascade {
+			cascadeCount++
+			if item.ItemID != expiredOrg.String() {
+				t.Errorf("expected expired org %s enqueued, got %s", expiredOrg, item.ItemID)
+			}
+		}
+	}
+	if cascadeCount != 1 {
+		t.Errorf("expected 1 org_cascade item, got %d", cascadeCount)
+	}
+
+	// Recent org should have nothing enqueued
+	recentItems := store.QueueItems(recentOrg)
+	if len(recentItems) != 0 {
+		t.Errorf("expected 0 items for recent org, got %d", len(recentItems))
+	}
+}
+
+func TestScanner_ScanExpiredDeletedOrgs_NoneExpired(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	s := NewScanner(store, q, stats, config.GCConfig{OrgGraceDays: 30})
+
+	// Only recently deleted org
+	store.AddDeletedOrg(uuid.New(), "Fresh Corp", time.Now().AddDate(0, 0, -5))
+
+	ctx := context.Background()
+	n, err := s.scanExpiredDeletedOrgs(ctx)
+	if err != nil {
+		t.Fatalf("scanExpiredDeletedOrgs failed: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("expected 0 expired orgs enqueued, got %d", n)
+	}
+}
+
+func TestScanner_ScanExpiredDeletedOrgs_Multiple(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	s := NewScanner(store, q, stats, config.GCConfig{OrgGraceDays: 30})
+
+	// 3 expired orgs
+	orgIDs := make([]uuid.UUID, 3)
+	for i := 0; i < 3; i++ {
+		orgIDs[i] = uuid.New()
+		store.AddDeletedOrg(orgIDs[i], "Doomed Corp", time.Now().AddDate(0, 0, -60))
+	}
+
+	ctx := context.Background()
+	n, err := s.scanExpiredDeletedOrgs(ctx)
+	if err != nil {
+		t.Fatalf("scanExpiredDeletedOrgs failed: %v", err)
+	}
+	if n != 3 {
+		t.Errorf("expected 3 expired orgs enqueued, got %d", n)
+	}
+}
+
+// === Full pipeline integration: Phases 10-12 via ScanOnce ===
+
+func TestScanner_ScanOnce_IncludesPhases10to12(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	s := NewScanner(store, q, stats, config.GCConfig{
+		UserGraceDays:      7,
+		TrashRetentionDays: 30,
+		OrgGraceDays:       30,
+	})
+
+	orgID := uuid.New()
+	store.AddOrganization(orgID)
+
+	// Phase 10: expired deleted user
+	expiredUser := uuid.New()
+	store.AddDeletedUser(orgID, expiredUser, "expired@test.com", time.Now().AddDate(0, 0, -10))
+
+	// Phase 11: expired deleted library
+	expiredLib := uuid.New()
+	store.AddDeletedLibrary(orgID, expiredLib, "hot", time.Now().AddDate(0, 0, -45))
+
+	// Phase 12: expired deleted org (different org)
+	expiredOrgID := uuid.New()
+	store.AddDeletedOrg(expiredOrgID, "Dead Corp", time.Now().AddDate(0, 0, -60))
+
+	ctx := context.Background()
+	err := s.ScanOnce(ctx)
+	if err != nil {
+		t.Fatalf("ScanOnce failed: %v", err)
+	}
+
+	// Check all three phases produced items
+	typeCount := make(map[ItemType]int)
+	for _, orgQ := range []uuid.UUID{orgID, expiredOrgID} {
+		for _, item := range store.QueueItems(orgQ) {
+			typeCount[item.ItemType]++
+		}
+	}
+	if typeCount[ItemUserCascade] != 1 {
+		t.Errorf("expected 1 user_cascade from Phase 10, got %d", typeCount[ItemUserCascade])
+	}
+	if typeCount[ItemLibraryCascade] != 1 {
+		t.Errorf("expected 1 library_cascade from Phase 11, got %d", typeCount[ItemLibraryCascade])
+	}
+	if typeCount[ItemOrgCascade] != 1 {
+		t.Errorf("expected 1 org_cascade from Phase 12, got %d", typeCount[ItemOrgCascade])
+	}
+}

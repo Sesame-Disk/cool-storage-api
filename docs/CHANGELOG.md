@@ -55,6 +55,15 @@ Full org lifecycle: active → deactivated (reversible) → deleted (grace perio
 - `internal/api/v2/group_cleanup.go` — `bulkUpsertGroupMembers()` helper
 - `internal/api/v2/groups.go` — refactored `BulkAddGroupMembers`, `ImportGroupMembersViaFile`
 
+### Fase 6: Comprehensive Cascade Test Coverage
+
+MockStore enhanced with full in-memory implementations for 19 GCStore methods (replacing nil stubs). Added mock types (`mockUser`, `mockDeletedLibrary`, `mockShareByUser`), 12 seeders, and 6 assertion helpers.
+
+- **Worker tests**: 26 tests (was 12) — 10 new cascade tests: 3 dry-run, 2 invalid UUID, 3 full cascade (user/library/org), 2 already-deleted graceful skip
+- **Scanner tests**: 30 tests (was 11) — 9 new Phase 10-12 tests: expired users/libraries/orgs enqueue, non-expired skip, multiple items, full ScanOnce integration covering all 12 phases
+- **Admin tests**: 26 tests (was 23) — 3 new: SoftDeleteOrganization platform protection (403), RestoreOrganization route wiring, new routes in RegisterAdminRoutes
+- **Total GC tests**: 88 Go unit tests (was 55) + 21 bash integration tests
+
 ### Frontend Pending
 
 The following new backend features require frontend updates in the superadmin and org admin dashboards:

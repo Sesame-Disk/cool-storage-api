@@ -503,3 +503,368 @@ func TestWorker_ContextCancellation(t *testing.T) {
 		_ = err
 	}
 }
+
+// === Cascade tests: Dry Run ===
+
+func TestWorker_ProcessUserCascade_DryRun(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	w := NewWorker(store, nil, q, 100, 0, true, stats) // dryRun=true
+
+	orgID := uuid.New()
+	userID := uuid.New()
+	store.AddOrganization(orgID)
+	store.AddUser(orgID, userID, "alice@test.com")
+
+	store.EnqueueItem(orgID, time.Now().Add(-2*time.Hour), ItemUserCascade, userID.String(), uuid.Nil, "", 0)
+
+	ctx := context.Background()
+	n, err := w.ProcessOnce(ctx)
+	if err != nil {
+		t.Fatalf("ProcessOnce failed: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("expected 1 processed, got %d", n)
+	}
+
+	// User should still exist (dry run)
+	if !store.HasUser(orgID, userID) {
+		t.Error("user should still exist in dry run mode")
+	}
+}
+
+func TestWorker_ProcessLibraryCascade_DryRun(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	w := NewWorker(store, nil, q, 100, 0, true, stats)
+
+	orgID := uuid.New()
+	libID := uuid.New()
+	store.AddOrganization(orgID)
+	store.AddLibrary(orgID, libID, "hot")
+
+	store.EnqueueItem(orgID, time.Now().Add(-2*time.Hour), ItemLibraryCascade, libID.String(), uuid.Nil, "hot", 0)
+
+	ctx := context.Background()
+	n, err := w.ProcessOnce(ctx)
+	if err != nil {
+		t.Fatalf("ProcessOnce failed: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("expected 1 processed, got %d", n)
+	}
+
+	// Library should still exist (dry run)
+	if _, err := store.GetLibraryStorageClass(orgID, libID); err != nil {
+		t.Error("library should still exist in dry run mode")
+	}
+}
+
+func TestWorker_ProcessOrgCascade_DryRun(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	w := NewWorker(store, nil, q, 100, 0, true, stats)
+
+	orgID := uuid.New()
+	store.AddOrganizationWithName(orgID, "Test Org")
+
+	store.EnqueueItem(orgID, time.Now().Add(-2*time.Hour), ItemOrgCascade, orgID.String(), uuid.Nil, "", 0)
+
+	ctx := context.Background()
+	n, err := w.ProcessOnce(ctx)
+	if err != nil {
+		t.Fatalf("ProcessOnce failed: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("expected 1 processed, got %d", n)
+	}
+
+	// Org should still exist (dry run)
+	if !store.HasOrg(orgID) {
+		t.Error("org should still exist in dry run mode")
+	}
+}
+
+// === Cascade tests: Invalid UUID ===
+
+func TestWorker_ProcessUserCascade_InvalidUUID(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	w := NewWorker(store, nil, q, 100, 0, false, stats)
+
+	orgID := uuid.New()
+	store.AddOrganization(orgID)
+
+	store.EnqueueItem(orgID, time.Now().Add(-2*time.Hour), ItemUserCascade, "not-a-uuid", uuid.Nil, "", 0)
+
+	ctx := context.Background()
+	n, _ := w.ProcessOnce(ctx)
+	// Should fail and not count as processed
+	if n != 0 {
+		t.Errorf("expected 0 processed (invalid UUID), got %d", n)
+	}
+}
+
+func TestWorker_ProcessLibraryCascade_InvalidUUID(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	w := NewWorker(store, nil, q, 100, 0, false, stats)
+
+	orgID := uuid.New()
+	store.AddOrganization(orgID)
+
+	store.EnqueueItem(orgID, time.Now().Add(-2*time.Hour), ItemLibraryCascade, "not-a-uuid", uuid.Nil, "", 0)
+
+	ctx := context.Background()
+	n, _ := w.ProcessOnce(ctx)
+	if n != 0 {
+		t.Errorf("expected 0 processed (invalid UUID), got %d", n)
+	}
+}
+
+// === Cascade tests: Full cascade with real data ===
+
+func TestWorker_ProcessUserCascade_FullCascade(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	w := NewWorker(store, nil, q, 100, 0, false, stats)
+
+	orgID := uuid.New()
+	userID := uuid.New()
+	groupID := uuid.New()
+	libID := uuid.New()
+
+	store.AddOrganization(orgID)
+	store.AddUser(orgID, userID, "alice@test.com")
+	store.AddGroupMembership(orgID, userID, groupID)
+	store.AddShareByUser(userID, libID)
+	store.AddStarredFile(userID)
+	store.AddMonitoredRepo(userID)
+
+	store.EnqueueItem(orgID, time.Now().Add(-2*time.Hour), ItemUserCascade, userID.String(), uuid.Nil, "", 0)
+
+	ctx := context.Background()
+	n, err := w.ProcessOnce(ctx)
+	if err != nil {
+		t.Fatalf("ProcessOnce failed: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("expected 1 processed, got %d", n)
+	}
+
+	// User should be hard-deleted
+	if store.HasUser(orgID, userID) {
+		t.Error("user should be hard-deleted after cascade")
+	}
+
+	// Starred files and monitored repos should be cleaned
+	if store.HasStarredFiles(userID) {
+		t.Error("starred files should be deleted after user cascade")
+	}
+	if store.HasMonitoredRepos(userID) {
+		t.Error("monitored repos should be deleted after user cascade")
+	}
+
+	// Audit log should have an entry
+	entries := store.AuditLogEntries()
+	if len(entries) != 1 {
+		t.Errorf("expected 1 audit log entry, got %d", len(entries))
+	} else if entries[0].Action != "gc_user_cascade_deleted" {
+		t.Errorf("expected action gc_user_cascade_deleted, got %s", entries[0].Action)
+	}
+}
+
+func TestWorker_ProcessLibraryCascade_FullCascade(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	w := NewWorker(store, nil, q, 100, 0, false, stats)
+
+	orgID := uuid.New()
+	libID := uuid.New()
+
+	store.AddOrganization(orgID)
+	store.AddLibrary(orgID, libID, "hot")
+	store.AddCommit(libID, "commit-1", "fs-root")
+	store.AddFSObject(libID, "fs-root", "dir", nil)
+
+	store.EnqueueItem(orgID, time.Now().Add(-2*time.Hour), ItemLibraryCascade, libID.String(), uuid.Nil, "hot", 0)
+
+	ctx := context.Background()
+	n, err := w.ProcessOnce(ctx)
+	if err != nil {
+		t.Fatalf("ProcessOnce failed: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("expected 1 processed, got %d", n)
+	}
+
+	// Library should be hard-deleted
+	if _, err := store.GetLibraryStorageClass(orgID, libID); err == nil {
+		t.Error("library should be hard-deleted after cascade")
+	}
+
+	// Contents should be enqueued for deletion (commits + fs_objects)
+	items := store.QueueItems(orgID)
+	commitCount, fsCount := 0, 0
+	for _, item := range items {
+		switch item.ItemType {
+		case ItemCommit:
+			commitCount++
+		case ItemFSObject:
+			fsCount++
+		}
+	}
+	if commitCount != 1 {
+		t.Errorf("expected 1 commit enqueued, got %d", commitCount)
+	}
+	if fsCount != 1 {
+		t.Errorf("expected 1 fs_object enqueued, got %d", fsCount)
+	}
+
+	// Audit log: 2 entries — gc_library_artifacts_cleaned + gc_library_cascade_deleted
+	entries := store.AuditLogEntries()
+	if len(entries) != 2 {
+		t.Errorf("expected 2 audit log entries, got %d", len(entries))
+	}
+	actions := map[string]bool{}
+	for _, e := range entries {
+		actions[e.Action] = true
+	}
+	if !actions["gc_library_artifacts_cleaned"] {
+		t.Error("expected gc_library_artifacts_cleaned audit entry")
+	}
+	if !actions["gc_library_cascade_deleted"] {
+		t.Error("expected gc_library_cascade_deleted audit entry")
+	}
+}
+
+func TestWorker_ProcessOrgCascade_FullCascade(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	w := NewWorker(store, nil, q, 100, 0, false, stats)
+
+	orgID := uuid.New()
+	userID1 := uuid.New()
+	userID2 := uuid.New()
+	groupID := uuid.New()
+	libID := uuid.New()
+
+	store.AddOrganizationWithName(orgID, "Doomed Corp")
+	store.AddUser(orgID, userID1, "alice@doomed.com")
+	store.AddUser(orgID, userID2, "bob@doomed.com")
+	store.AddStarredFile(userID1)
+	store.AddMonitoredRepo(userID2)
+	store.AddGroupForOrg(orgID, groupID)
+	store.AddGroupMembership(orgID, userID1, groupID)
+	store.AddLibrary(orgID, libID, "hot")
+
+	store.EnqueueItem(orgID, time.Now().Add(-2*time.Hour), ItemOrgCascade, orgID.String(), uuid.Nil, "", 0)
+
+	ctx := context.Background()
+	n, err := w.ProcessOnce(ctx)
+	if err != nil {
+		t.Fatalf("ProcessOnce failed: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("expected 1 processed, got %d", n)
+	}
+
+	// Org should be hard-deleted
+	if store.HasOrg(orgID) {
+		t.Error("org should be hard-deleted after cascade")
+	}
+
+	// Users should be hard-deleted
+	if store.HasUser(orgID, userID1) {
+		t.Error("user1 should be hard-deleted after org cascade")
+	}
+	if store.HasUser(orgID, userID2) {
+		t.Error("user2 should be hard-deleted after org cascade")
+	}
+
+	// Groups should be deleted
+	if store.HasGroup(orgID, groupID) {
+		t.Error("group should be deleted after org cascade")
+	}
+
+	// Starred/monitored should be cleaned
+	if store.HasStarredFiles(userID1) {
+		t.Error("starred files should be deleted after org cascade")
+	}
+	if store.HasMonitoredRepos(userID2) {
+		t.Error("monitored repos should be deleted after org cascade")
+	}
+
+	// Library should be enqueued as LibraryCascade
+	items := store.QueueItems(orgID)
+	libCascadeCount := 0
+	for _, item := range items {
+		if item.ItemType == ItemLibraryCascade {
+			libCascadeCount++
+		}
+	}
+	if libCascadeCount != 1 {
+		t.Errorf("expected 1 library_cascade enqueued, got %d", libCascadeCount)
+	}
+
+	// Audit log
+	entries := store.AuditLogEntries()
+	if len(entries) != 1 {
+		t.Errorf("expected 1 audit log entry, got %d", len(entries))
+	} else if entries[0].Action != "gc_org_cascade_deleted" {
+		t.Errorf("expected action gc_org_cascade_deleted, got %s", entries[0].Action)
+	}
+}
+
+func TestWorker_ProcessUserCascade_AlreadyDeleted(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	w := NewWorker(store, nil, q, 100, 0, false, stats)
+
+	orgID := uuid.New()
+	store.AddOrganization(orgID)
+
+	// User doesn't exist — simulate already deleted
+	store.EnqueueItem(orgID, time.Now().Add(-2*time.Hour), ItemUserCascade, uuid.New().String(), uuid.Nil, "", 0)
+
+	ctx := context.Background()
+	n, err := w.ProcessOnce(ctx)
+	if err != nil {
+		t.Fatalf("ProcessOnce failed: %v", err)
+	}
+	// Should gracefully skip (returns nil when email lookup fails)
+	if n != 1 {
+		t.Errorf("expected 1 processed (skipped gracefully), got %d", n)
+	}
+}
+
+func TestWorker_ProcessOrgCascade_AlreadyDeleted(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	w := NewWorker(store, nil, q, 100, 0, false, stats)
+
+	orgID := uuid.New()
+	// Don't add org — simulate already deleted
+
+	store.EnqueueItem(orgID, time.Now().Add(-2*time.Hour), ItemOrgCascade, orgID.String(), uuid.Nil, "", 0)
+
+	ctx := context.Background()
+	n, err := w.ProcessOnce(ctx)
+	if err != nil {
+		t.Fatalf("ProcessOnce failed: %v", err)
+	}
+	// Should gracefully skip (returns nil when org name lookup fails)
+	if n != 1 {
+		t.Errorf("expected 1 processed (skipped gracefully), got %d", n)
+	}
+}

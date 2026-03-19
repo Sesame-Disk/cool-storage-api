@@ -474,9 +474,9 @@ The GC system is decoupled from Cassandra via:
 | `internal/gc/store_mock.go` | `MockStore` — in-memory implementation for tests, with helpers for seeding data |
 
 The `MockStore` provides test helper methods:
-- `AddBlock`, `AddCommit`, `AddFSObject`, `AddLibrary`, `AddShareLink`, `AddOrganization` — seed data
-- `GetBlock`, `GetCommit`, `GetFSObj` — verify state after operations
-- `QueueLen`, `QueueItems` — inspect queue contents
+- **Seeders**: `AddBlock`, `AddCommit`, `AddFSObject`, `AddLibrary`, `AddShareLink`, `AddOrganization`, `AddOrganizationWithName`, `AddDeletedOrg`, `AddUser`, `AddDeletedUser`, `AddGroupForOrg`, `AddGroupMembership`, `AddDeletedLibrary`, `AddShareByUser`, `AddStarredFile`, `AddMonitoredRepo`
+- **Assertions**: `GetBlock`, `GetCommit`, `GetFSObj`, `HasUser`, `HasGroup`, `HasOrg`, `HasStarredFiles`, `HasMonitoredRepos`, `AuditLogEntries`
+- **Queue inspection**: `QueueLen`, `QueueItems`
 
 A `MockStorageProvider` and `mockBlockDeleter` simulate S3 and track deleted block IDs.
 
@@ -484,10 +484,10 @@ A `MockStorageProvider` and `mockBlockDeleter` simulate S3 and track deleted blo
 
 | File | Tests | Type | What's Tested |
 |------|-------|------|---------------|
-| `internal/gc/gc_test.go` | 10 | Unit (mock) | Stats (atomic counters, concurrency), GCStatus formatting, Service creation, config propagation, SetDryRun, disabled service, trigger channels, status with mock store |
-| `internal/gc/queue_test.go` | 10 | Integration (mock) | Enqueue+Dequeue round-trip, grace period filtering, retry increment, ListOrgsWithQueuedItems, GetQueueSize, GetTotalQueueSize, multiple item types (incl. share, restore_job), Complete removes items |
-| `internal/gc/worker_test.go` | 12 | Integration (mock) | Block deletion (ref_count=0 with S3+DB+reverse mapping cleanup), block sparing (ref_count>0), dry run mode, commit cascade (enqueues root fs_object), FS object cascade (enqueues child dirs + blocks), retry on failure, empty queue, library contents enqueue (no duplicate blocks), block mapping deletion, context cancellation |
-| `internal/gc/scanner_test.go` | 11 | Integration (mock) | Orphaned blocks (ref_count<=0), expired share links, orphaned commits (with org lookup), orphaned fs_objects, empty DB scan, full pipeline (all 8 phases), context cancellation, idempotent enqueue, expired shares (Phase 7), expired restore jobs (Phase 8) |
+| `internal/gc/gc_test.go` | 20 | Unit (mock) | Stats (atomic counters, concurrency), GCStatus formatting, Service creation, config propagation, SetDryRun, disabled service, trigger channels, status with mock store |
+| `internal/gc/queue_test.go` | 12 | Integration (mock) | Enqueue+Dequeue round-trip, grace period filtering, retry increment, ListOrgsWithQueuedItems, GetQueueSize, GetTotalQueueSize, multiple item types (incl. share, restore_job, user/library/org cascade), Complete removes items |
+| `internal/gc/worker_test.go` | 26 | Integration (mock) | Block deletion (ref_count=0 with S3+DB+reverse mapping cleanup), block sparing (ref_count>0), dry run mode, commit cascade (enqueues root fs_object), FS object cascade (enqueues child dirs + blocks), retry on failure, empty queue, library contents enqueue (no duplicate blocks), block mapping deletion, context cancellation, **cascade dry-run** (user/library/org), **cascade invalid UUID**, **cascade full** (user/library/org with real mock data), **cascade already-deleted** graceful skip |
+| `internal/gc/scanner_test.go` | 30 | Integration (mock) | Orphaned blocks (ref_count<=0), expired share links, orphaned commits (with org lookup), orphaned fs_objects, empty DB scan, full pipeline (all 12 phases), context cancellation, idempotent enqueue, expired shares (Phase 7), expired restore jobs (Phase 8), **Phase 10**: expired deleted users (enqueue/skip), **Phase 11**: expired deleted libraries (enqueue/skip/multiple), **Phase 12**: expired deleted orgs (enqueue/skip/multiple), **Phases 10-12 via ScanOnce integration** |
 | `internal/api/gc_adapter_test.go` | 7 | Unit | Invalid UUIDs, empty inputs, interface compliance, nil service, config defaults |
 | `internal/api/v2/gc_hooks_test.go` | 8 | Unit | Set/get hooks, nil defaults, concurrent access, interface compile-time check, mock call recording |
 
@@ -509,7 +509,20 @@ All of these run without any external dependencies:
 | `Scanner_ScanExpiredShareLinks` | Finds share links past expiry, skips permanent ones |
 | `Scanner_ScanExpiredShares` | Expired user-to-user shares cleaned (Phase 7) |
 | `Scanner_ScanExpiredRestoreJobs` | Completed/failed/expired restore jobs cleaned (Phase 8) |
-| `Scanner_ScanOnce_FullPipeline` | All 8 scanner phases run in sequence |
+| `Scanner_ScanOnce_FullPipeline` | All 12 scanner phases run in sequence |
+| `Scanner_ScanExpiredDeletedUsers_EnqueuesExpired` | Phase 10: expired soft-deleted users get enqueued as `user_cascade` |
+| `Scanner_ScanExpiredDeletedLibraries_EnqueuesExpired` | Phase 11: expired soft-deleted libraries get enqueued as `library_cascade` |
+| `Scanner_ScanExpiredDeletedOrgs_EnqueuesExpired` | Phase 12: expired soft-deleted orgs get enqueued as `org_cascade` |
+| `Scanner_ScanOnce_IncludesPhases10to12` | Full pipeline integration: all 3 new phases produce items via ScanOnce |
+| `Worker_ProcessUserCascade_FullCascade` | User cascade: removes groups, shares, starred, monitored, hard-deletes user, audit log |
+| `Worker_ProcessLibraryCascade_FullCascade` | Library cascade: enqueues commits+fs_objects, hard-deletes library, 2 audit entries |
+| `Worker_ProcessOrgCascade_FullCascade` | Org cascade: deletes users/groups, enqueues libraries as LibraryCascade, hard-deletes org |
+| `Worker_ProcessUserCascade_DryRun` | Dry run skips user deletion |
+| `Worker_ProcessOrgCascade_DryRun` | Dry run skips org deletion |
+| `Worker_ProcessUserCascade_AlreadyDeleted` | Gracefully skips when user doesn't exist |
+| `Worker_ProcessOrgCascade_AlreadyDeleted` | Gracefully skips when org doesn't exist |
+| `SoftDeleteOrganization_PlatformOrgProtection` | Platform org cannot be soft-deleted (403) |
+| `RestoreOrganization_NonExistentOrgHitsDB` | Route wiring works, reaches DB layer |
 | `Queue_DequeueBatch_GracePeriod` | Items newer than grace period are not dequeued |
 
 ### Manual GC Verification
@@ -575,6 +588,13 @@ The `scripts/test-gc.sh` script tests the GC admin endpoints against a live back
 Tests: 21 assertions covering status endpoint, permission enforcement (403 for non-admin), worker/scanner triggers, dry_run override, status updates after triggers, edge cases (empty body, invalid JSON).
 
 Also wired into `./scripts/test.sh api` as the "Garbage Collection Admin API" suite.
+
+### Tests Updated in 2026-03-18 (Soft-Delete Cascade Tests)
+
+- **Updated: `internal/gc/store_mock.go`** — Major enhancement: added `mockUser`, `mockDeletedLibrary`, `mockShareByUser` types; new fields for users, groups, groupMembers, groupsByMember, deletedLibraries, sharesByUser, starredFiles, monitoredRepos, auditLog; 12 new seeders (`AddDeletedOrg`, `AddUser`, `AddDeletedUser`, `AddGroupForOrg`, `AddGroupMembership`, `AddDeletedLibrary`, `AddShareByUser`, `AddStarredFile`, `AddMonitoredRepo`, etc.); 6 new assertion helpers (`HasUser`, `HasGroup`, `HasOrg`, `HasStarredFiles`, `HasMonitoredRepos`, `AuditLogEntries`); replaced all nil-returning stubs with real in-memory implementations for 19 GCStore methods
+- **Updated: `internal/gc/worker_test.go`** — 26 tests (was 12): added 10 cascade tests — 3 dry-run (user/library/org), 2 invalid UUID, 3 full cascade with real mock data (user cascade cleans groups/shares/starred/monitored, library cascade enqueues contents, org cascade deletes users+groups and enqueues libraries), 2 already-deleted graceful skip
+- **Updated: `internal/gc/scanner_test.go`** — 30 tests (was 11): added 9 tests — Phase 10 expired deleted users (enqueue expired, skip non-expired), Phase 11 expired deleted libraries (enqueue/skip/multiple), Phase 12 expired deleted orgs (enqueue/skip/multiple), full ScanOnce integration covering all 12 phases
+- **Updated: `internal/api/v2/admin_test.go`** — 26 tests (was 23): added `SoftDeleteOrganization_PlatformOrgProtection` (403), `SoftDeleteOrganization_NonPlatformOrgHitsDB`, `RestoreOrganization_NonExistentOrgHitsDB`; added 2 new routes to `RegisterAdminRoutes_RoutesExist` (delete/, restore/)
 
 ### Tests Updated in 2026-03-17 (GC Major Overhaul)
 

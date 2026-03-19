@@ -29,7 +29,7 @@
 1. **Sync Protocol**: 100% complete, 🔒 FROZEN
 2. **Backend API**: ~98% complete - OIDC ✅, GC ✅, Library Settings ✅, Monitoring ✅, Departments ✅, Admin Panel (groups/users) ✅, OIDC Group/Dept Sync ✅, Tag cascade ✅, Admin Link Management ✅, Upload Links ✅, Org Admin Panel ✅, Superadmin Departments ✅, Custom Share Permissions ✅
 3. **Frontend UI**: ~85% complete (all modals migrated, About modal rebranded, File History UI ✅, History Download ✅, Snapshot View ✅, Restore from History ✅, Share Dialog all 8 tabs ✅, permission UI ~75% with granular flags, ~51 ModalPortal wrappers to clean up, folder icons ✅)
-4. **All tests passing**: 18 test suites (all green), 345+ bash integration + 26 Go integration + 138 frontend + 55 GC unit + 267 api/v2+middleware tests + 29 admin panel + 17 file history + 28 file preview + 10 search tests
+4. **All tests passing**: 18 test suites (all green), 345+ bash integration + 26 Go integration + 138 frontend + 88 GC unit + 267 api/v2+middleware tests + 29 admin panel + 17 file history + 28 file preview + 10 search tests
 5. **Active Bugs**: 0 open (all 5 resolved in Session 32)
 
 ### Step 2: Before Making ANY Code Changes
@@ -66,16 +66,17 @@
 - Both `BulkAddGroupMembers` and `ImportGroupMembersViaFile` refactored
 - 100 members: 200 → 4 round-trips
 
-#### Fase 6: Documentation ✅
-- Updated CHANGELOG, KNOWN_ISSUES, IMPLEMENTATION_STATUS, CURRENT_WORK, ARCHITECTURE, ENDPOINT-REGISTRY, ADMIN-FEATURES
-- `config.prod.yaml` — comment pointing to env var
-- `docs/DEPLOY.md` — Step 0.3 (third secret to generate), Step 4 required vars, env-var table
-- `docs/IMPLEMENTATION_STATUS.md` — Sharing System row updated, new Share Dialog UI row
+#### Fase 6: Comprehensive Cascade Test Coverage ✅
+- **MockStore**: Major enhancement — added `mockUser`, `mockDeletedLibrary`, `mockShareByUser` types; 12 new seeders, 6 assertion helpers, 19 GCStore methods with real in-memory implementations (replaced nil stubs)
+- **Worker tests**: 26 tests (was 12) — 10 new cascade tests covering dry-run, invalid UUID, full cascade (user/library/org), already-deleted graceful skip
+- **Scanner tests**: 30 tests (was 11) — 9 new Phase 10-12 tests: expired users/libraries/orgs enqueue + skip + multiple, full ScanOnce integration
+- **Admin tests**: 26 tests (was 23) — SoftDeleteOrganization platform protection, RestoreOrganization route wiring, new routes registered
+- **Total GC tests**: 88 Go unit tests (was 55)
 
-**Share Dialog** — 6 tabs completamente implementados, 2 stubs desactivados:
-`Share Link` | `Upload Link` | `Internal Link` | `Share to User` | `Share to Group` | `Custom Sharing Permissions` | ~~`Invite Guest`~~ (canInvitePeople=false) | ~~`Share to Other Server`~~ (enableOCM=false)
+#### Fase 7: Documentation ✅
+- Updated TESTING.md, CHANGELOG, KNOWN_ISSUES, IMPLEMENTATION_STATUS, CURRENT_WORK, ARCHITECTURE, ENDPOINT-REGISTRY, ADMIN-FEATURES
 
-**Files changed**: `.env.prod.example`, `.env.example`, `config.example.yaml`, `config.prod.yaml`, `docs/DEPLOY.md`, `docs/IMPLEMENTATION_STATUS.md`, `docs/CHANGELOG.md`, `CURRENT_WORK.md`
+**Files changed**: `store_mock.go`, `worker_test.go`, `scanner_test.go`, `admin_test.go`, `TESTING.md`, `CHANGELOG.md`, `IMPLEMENTATION_STATUS.md`, `CURRENT_WORK.md`
 
 ### Previous Session (Session 55) — Org Admin Panel + Superadmin Parity
 
@@ -237,7 +238,7 @@ Detail sidebar now has Info | History tabs for files. Full-page history also wor
 | **Admin Link Management** | ✅ DONE | Share + upload links. 13 endpoints. See [ADMIN-FEATURES.md](docs/ADMIN-FEATURES.md) § 2 |
 | **Superadmin Departments/Address Book** | ✅ DONE | 9 endpoints. See [ADMIN-FEATURES.md](docs/ADMIN-FEATURES.md) § 4 |
 | **Org Admin Panel** | ✅ DONE | 50+ endpoints. Full parity with superadmin. See [ADMIN-FEATURES.md](docs/ADMIN-FEATURES.md) § 5 |
-| **Org Delete (DeactivateOrg)** | ⚠️ INCOMPLETE | Soft-deactivate only (`settings['status']`), no filtering in list, no cascade. See [ADMIN-FEATURES.md](docs/ADMIN-FEATURES.md) § DeactivateOrganization |
+| **Org Delete (3-state lifecycle)** | ✅ DONE (backend) | active → deactivated → deleted (30-day grace → cascade). Frontend TODO: ISSUE-FRONTEND-ORG-DELETE-01 |
 | **Audit Logs** | ❌ TODO | 5 tables, ~5 endpoints, ~15 handler integrations. See [ADMIN-FEATURES.md](docs/ADMIN-FEATURES.md) § 3 |
 | **File History UI** | ✅ DONE | Detail sidebar History tab + full-page view. 17 integration tests. |
 | **GC TTL Enforcement** | ✅ DONE | Scanner Phase 5 (version_ttl_days) + Phase 6 (auto_delete_days) + share link deletion |

@@ -480,7 +480,7 @@ These MUST be completed before production deployment:
 - **Impact**: ~~Storage costs grow forever~~ Now automatically cleaned up
 - **Status**: Fully implemented — queue worker + safety scanner + admin API
 - **Files**: `internal/gc/` — gc.go, queue.go, worker.go, scanner.go, store.go, store_mock.go, store_cassandra.go, gc_hooks.go, gc_adapter.go
-- **Tests**: 55 Go unit tests + 21 bash integration tests
+- **Tests**: 88 Go unit tests + 21 bash integration tests
 - **Admin API**: `GET /api/v2.1/admin/gc/status`, `POST /api/v2.1/admin/gc/run`
 
 ### 3. ~~Monitoring/Health Checks~~ ✅ COMPLETE (2026-01-30)

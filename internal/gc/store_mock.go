@@ -32,14 +32,34 @@ type MockStore struct {
 	// libraries keyed by libraryID
 	libraries map[uuid.UUID]*mockLibrary
 
-	// organizations
+	// organizations keyed by orgID
 	organizations []uuid.UUID
+	orgNames      map[uuid.UUID]string
+	orgDeletedAt  map[uuid.UUID]time.Time
+
+	// users keyed by "orgID:userID"
+	users map[string]*mockUser
+
+	// groups keyed by "orgID:groupID"
+	groups map[string]bool
+
+	// group_members keyed by "groupID:userID"
+	groupMembers map[string]bool
+
+	// groups_by_member keyed by "orgID:userID:groupID"
+	groupsByMember map[string]bool
+
+	// deleted_libraries keyed by "libraryID"
+	deletedLibraries map[uuid.UUID]*mockDeletedLibrary
 
 	// share_links keyed by shareToken
 	shareLinks map[string]*mockShareLink
 
 	// shares keyed by "libraryID:shareID"
 	shares map[string]*mockShare
+
+	// shares_by_user keyed by "userID:libraryID"
+	sharesByUser map[string]*mockShareByUser
 
 	// restore_jobs keyed by "orgID:libraryID:jobID"
 	restoreJobs map[string]*mockRestoreJob
@@ -56,8 +76,17 @@ type MockStore struct {
 	// locked_files keyed by "libraryID:path"
 	lockedFiles map[string]bool
 
+	// starred_files keyed by "userID"
+	starredFiles map[uuid.UUID]bool
+
+	// monitored_repos keyed by "userID"
+	monitoredRepos map[uuid.UUID]bool
+
 	// gc_stats keyed by stat_key
 	gcStats map[string]string
+
+	// audit_log entries
+	auditLog []AuditLogEntry
 }
 
 type mockBlock struct {
@@ -126,24 +155,52 @@ type mockAPIToken struct {
 	APIToken string
 }
 
+type mockUser struct {
+	OrgID     uuid.UUID
+	UserID    uuid.UUID
+	Email     string
+	DeletedAt *time.Time
+}
+
+type mockDeletedLibrary struct {
+	OrgID     uuid.UUID
+	LibraryID uuid.UUID
+	DeletedAt time.Time
+}
+
+type mockShareByUser struct {
+	SharedTo  uuid.UUID
+	LibraryID uuid.UUID
+}
+
 // NewMockStore creates a new in-memory mock store.
 func NewMockStore() *MockStore {
 	return &MockStore{
-		queue:         make(map[uuid.UUID][]QueueItem),
-		blocks:        make(map[string]*mockBlock),
-		mappings:      make(map[string]string),
-		commits:       make(map[string]*mockCommit),
-		fsObjects:     make(map[string]*mockFSObject),
-		libraries:     make(map[uuid.UUID]*mockLibrary),
-		shareLinks:    make(map[string]*mockShareLink),
-		shares:        make(map[string]*mockShare),
-		restoreJobs:   make(map[string]*mockRestoreJob),
-		repoTags:      make(map[string]bool),
-		fileTags:      make(map[string]*mockFileTag),
-		apiTokens:     make(map[string]*mockAPIToken),
-		lockedFiles:   make(map[string]bool),
-		gcStats:       make(map[string]string),
-		organizations: nil,
+		queue:            make(map[uuid.UUID][]QueueItem),
+		blocks:           make(map[string]*mockBlock),
+		mappings:         make(map[string]string),
+		commits:          make(map[string]*mockCommit),
+		fsObjects:        make(map[string]*mockFSObject),
+		libraries:        make(map[uuid.UUID]*mockLibrary),
+		orgNames:         make(map[uuid.UUID]string),
+		orgDeletedAt:     make(map[uuid.UUID]time.Time),
+		users:            make(map[string]*mockUser),
+		groups:           make(map[string]bool),
+		groupMembers:     make(map[string]bool),
+		groupsByMember:   make(map[string]bool),
+		deletedLibraries: make(map[uuid.UUID]*mockDeletedLibrary),
+		shareLinks:       make(map[string]*mockShareLink),
+		shares:           make(map[string]*mockShare),
+		sharesByUser:     make(map[string]*mockShareByUser),
+		restoreJobs:      make(map[string]*mockRestoreJob),
+		repoTags:         make(map[string]bool),
+		fileTags:         make(map[string]*mockFileTag),
+		apiTokens:        make(map[string]*mockAPIToken),
+		lockedFiles:      make(map[string]bool),
+		starredFiles:     make(map[uuid.UUID]bool),
+		monitoredRepos:   make(map[uuid.UUID]bool),
+		gcStats:          make(map[string]string),
+		organizations:    nil,
 	}
 }
 
@@ -153,6 +210,7 @@ func (m *MockStore) AddOrganization(orgID uuid.UUID) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.organizations = append(m.organizations, orgID)
+	m.orgNames[orgID] = ""
 }
 
 func (m *MockStore) AddBlock(orgID uuid.UUID, blockID, storageClass string, refCount int) {
@@ -295,6 +353,133 @@ func (m *MockStore) AddRestoreJob(orgID, libraryID, jobID uuid.UUID, status stri
 		Status:    status,
 		ExpiresAt: expiresAt,
 	}
+}
+
+// AddOrganizationWithName adds an org with a name (for cascade tests).
+func (m *MockStore) AddOrganizationWithName(orgID uuid.UUID, name string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.organizations = append(m.organizations, orgID)
+	m.orgNames[orgID] = name
+}
+
+// AddDeletedOrg adds an org with deleted_at set (for scanner Phase 12).
+func (m *MockStore) AddDeletedOrg(orgID uuid.UUID, name string, deletedAt time.Time) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.organizations = append(m.organizations, orgID)
+	m.orgNames[orgID] = name
+	m.orgDeletedAt[orgID] = deletedAt
+}
+
+// AddUser adds a user to the mock store.
+func (m *MockStore) AddUser(orgID, userID uuid.UUID, email string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	key := fmt.Sprintf("%s:%s", orgID, userID)
+	m.users[key] = &mockUser{OrgID: orgID, UserID: userID, Email: email}
+}
+
+// AddDeletedUser adds a user with deleted_at set (for scanner Phase 10).
+func (m *MockStore) AddDeletedUser(orgID, userID uuid.UUID, email string, deletedAt time.Time) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	key := fmt.Sprintf("%s:%s", orgID, userID)
+	m.users[key] = &mockUser{OrgID: orgID, UserID: userID, Email: email, DeletedAt: &deletedAt}
+}
+
+// AddGroupForOrg adds a group to the mock store.
+func (m *MockStore) AddGroupForOrg(orgID, groupID uuid.UUID) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	key := fmt.Sprintf("%s:%s", orgID, groupID)
+	m.groups[key] = true
+}
+
+// AddGroupMembership adds a user to a group (both tables).
+func (m *MockStore) AddGroupMembership(orgID, userID, groupID uuid.UUID) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.groupMembers[fmt.Sprintf("%s:%s", groupID, userID)] = true
+	m.groupsByMember[fmt.Sprintf("%s:%s:%s", orgID, userID, groupID)] = true
+}
+
+// AddDeletedLibrary adds a soft-deleted library (for scanner Phase 11).
+func (m *MockStore) AddDeletedLibrary(orgID, libraryID uuid.UUID, storageClass string, deletedAt time.Time) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.libraries[libraryID] = &mockLibrary{OrgID: orgID, LibraryID: libraryID, StorageClass: storageClass}
+	m.deletedLibraries[libraryID] = &mockDeletedLibrary{OrgID: orgID, LibraryID: libraryID, DeletedAt: deletedAt}
+}
+
+// AddShareByUser adds a share_by_user entry (for cascade tests).
+func (m *MockStore) AddShareByUser(userID, libraryID uuid.UUID) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	key := fmt.Sprintf("%s:%s", userID, libraryID)
+	m.sharesByUser[key] = &mockShareByUser{SharedTo: userID, LibraryID: libraryID}
+}
+
+// AddStarredFile adds a starred file entry for a user.
+func (m *MockStore) AddStarredFile(userID uuid.UUID) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.starredFiles[userID] = true
+}
+
+// AddMonitoredRepo adds a monitored repo entry for a user.
+func (m *MockStore) AddMonitoredRepo(userID uuid.UUID) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.monitoredRepos[userID] = true
+}
+
+// HasUser returns true if the user exists in the store (for test assertions).
+func (m *MockStore) HasUser(orgID, userID uuid.UUID) bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	_, ok := m.users[fmt.Sprintf("%s:%s", orgID, userID)]
+	return ok
+}
+
+// HasGroup returns true if the group exists in the store (for test assertions).
+func (m *MockStore) HasGroup(orgID, groupID uuid.UUID) bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.groups[fmt.Sprintf("%s:%s", orgID, groupID)]
+}
+
+// HasOrg returns true if the org exists (not hard-deleted).
+func (m *MockStore) HasOrg(orgID uuid.UUID) bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for _, id := range m.organizations {
+		if id == orgID {
+			return true
+		}
+	}
+	return false
+}
+
+// HasStarredFiles returns true if starred files exist for user.
+func (m *MockStore) HasStarredFiles(userID uuid.UUID) bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.starredFiles[userID]
+}
+
+// HasMonitoredRepos returns true if monitored repos exist for user.
+func (m *MockStore) HasMonitoredRepos(userID uuid.UUID) bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.monitoredRepos[userID]
+}
+
+// AuditLogEntries returns all audit log entries (for test assertions).
+func (m *MockStore) AuditLogEntries() []AuditLogEntry {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return append([]AuditLogEntry{}, m.auditLog...)
 }
 
 // GetBlock returns a block for test assertions.
@@ -1000,58 +1185,225 @@ func (m *MockStore) ListSharesByGroup(groupID uuid.UUID) ([]GroupShareInfo, erro
 }
 func (m *MockStore) ListAllGroupShares() ([]GroupShareInfo, error) { return nil, nil }
 func (m *MockStore) GroupExists(orgID, groupID uuid.UUID) (bool, error) { return false, nil }
-func (m *MockStore) WriteAuditLog(entry AuditLogEntry) error            { return nil }
+func (m *MockStore) WriteAuditLog(entry AuditLogEntry) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.auditLog = append(m.auditLog, entry)
+	return nil
+}
 
 // --- Library trash auto-purge (Fase 3) ---
 
 func (m *MockStore) ListExpiredDeletedLibraries(retentionDays int) ([]DeletedLibraryInfo, error) {
-	return nil, nil
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	cutoff := time.Now().AddDate(0, 0, -retentionDays)
+	var result []DeletedLibraryInfo
+	for _, dl := range m.deletedLibraries {
+		if dl.DeletedAt.Before(cutoff) {
+			sc := ""
+			if lib, ok := m.libraries[dl.LibraryID]; ok {
+				sc = lib.StorageClass
+			}
+			result = append(result, DeletedLibraryInfo{
+				OrgID:        dl.OrgID,
+				LibraryID:    dl.LibraryID,
+				StorageClass: sc,
+				DeletedAt:    dl.DeletedAt,
+			})
+		}
+	}
+	return result, nil
 }
-func (m *MockStore) HardDeleteLibrary(orgID, libraryID uuid.UUID) error { return nil }
+func (m *MockStore) HardDeleteLibrary(orgID, libraryID uuid.UUID) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.libraries, libraryID)
+	delete(m.deletedLibraries, libraryID)
+	return nil
+}
 
 // --- User cascade (Fase 1) ---
 
 func (m *MockStore) ListDeletedUsersExpired(graceDays int) ([]DeletedUserInfo, error) {
-	return nil, nil
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	cutoff := time.Now().AddDate(0, 0, -graceDays)
+	var result []DeletedUserInfo
+	for _, u := range m.users {
+		if u.DeletedAt != nil && u.DeletedAt.Before(cutoff) {
+			result = append(result, DeletedUserInfo{
+				OrgID:     u.OrgID,
+				UserID:    u.UserID,
+				Email:     u.Email,
+				DeletedAt: *u.DeletedAt,
+			})
+		}
+	}
+	return result, nil
 }
 func (m *MockStore) ListLibrariesByOwner(orgID, ownerID uuid.UUID) ([]uuid.UUID, error) {
 	return nil, nil
 }
 func (m *MockStore) SoftDeleteLibrary(orgID, libraryID, deletedBy uuid.UUID) error { return nil }
 func (m *MockStore) ListGroupMembershipsByUser(orgID, userID uuid.UUID) ([]uuid.UUID, error) {
-	return nil, nil
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	prefix := fmt.Sprintf("%s:%s:", orgID, userID)
+	var result []uuid.UUID
+	for key := range m.groupsByMember {
+		if len(key) > len(prefix) && key[:len(prefix)] == prefix {
+			gid, err := uuid.Parse(key[len(prefix):])
+			if err == nil {
+				result = append(result, gid)
+			}
+		}
+	}
+	return result, nil
 }
-func (m *MockStore) DeleteGroupMember(groupID, userID uuid.UUID) error { return nil }
+func (m *MockStore) DeleteGroupMember(groupID, userID uuid.UUID) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.groupMembers, fmt.Sprintf("%s:%s", groupID, userID))
+	return nil
+}
 func (m *MockStore) DeleteGroupByMember(orgID, userID, groupID uuid.UUID) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.groupsByMember, fmt.Sprintf("%s:%s:%s", orgID, userID, groupID))
 	return nil
 }
 func (m *MockStore) ListSharesByUser(userID uuid.UUID) ([]ShareByUserInfo, error) {
-	return nil, nil
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	prefix := fmt.Sprintf("%s:", userID)
+	var result []ShareByUserInfo
+	for key, s := range m.sharesByUser {
+		if len(key) > len(prefix) && key[:len(prefix)] == prefix {
+			result = append(result, ShareByUserInfo{SharedTo: s.SharedTo, LibraryID: s.LibraryID})
+		}
+	}
+	return result, nil
 }
-func (m *MockStore) DeleteStarredFilesByUser(userID uuid.UUID) error    { return nil }
-func (m *MockStore) DeleteMonitoredReposByUser(userID uuid.UUID) error  { return nil }
-func (m *MockStore) HardDeleteUser(orgID, userID uuid.UUID, email string) error { return nil }
+func (m *MockStore) DeleteStarredFilesByUser(userID uuid.UUID) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.starredFiles, userID)
+	return nil
+}
+func (m *MockStore) DeleteMonitoredReposByUser(userID uuid.UUID) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.monitoredRepos, userID)
+	return nil
+}
+func (m *MockStore) HardDeleteUser(orgID, userID uuid.UUID, email string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.users, fmt.Sprintf("%s:%s", orgID, userID))
+	return nil
+}
 func (m *MockStore) GetUserEmail(orgID, userID uuid.UUID) (string, error) {
-	return "", nil
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	u, ok := m.users[fmt.Sprintf("%s:%s", orgID, userID)]
+	if !ok {
+		return "", fmt.Errorf("user not found")
+	}
+	return u.Email, nil
 }
 
 // --- Org cascade (Fase 4) ---
 
 func (m *MockStore) ListExpiredDeletedOrgs(graceDays int) ([]DeletedOrgInfo, error) {
-	return nil, nil
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	cutoff := time.Now().AddDate(0, 0, -graceDays)
+	var result []DeletedOrgInfo
+	for orgID, deletedAt := range m.orgDeletedAt {
+		if deletedAt.Before(cutoff) {
+			result = append(result, DeletedOrgInfo{
+				OrgID:     orgID,
+				Name:      m.orgNames[orgID],
+				DeletedAt: deletedAt,
+			})
+		}
+	}
+	return result, nil
 }
 func (m *MockStore) ListUsersByOrg(orgID uuid.UUID) ([]OrgUserInfo, error) {
-	return nil, nil
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	prefix := fmt.Sprintf("%s:", orgID)
+	var result []OrgUserInfo
+	for key, u := range m.users {
+		if len(key) > len(prefix) && key[:len(prefix)] == prefix {
+			result = append(result, OrgUserInfo{UserID: u.UserID, Email: u.Email})
+		}
+	}
+	return result, nil
 }
 func (m *MockStore) ListGroupsByOrg(orgID uuid.UUID) ([]uuid.UUID, error) {
-	return nil, nil
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	prefix := fmt.Sprintf("%s:", orgID)
+	var result []uuid.UUID
+	for key := range m.groups {
+		if len(key) > len(prefix) && key[:len(prefix)] == prefix {
+			gid, err := uuid.Parse(key[len(prefix):])
+			if err == nil {
+				result = append(result, gid)
+			}
+		}
+	}
+	return result, nil
 }
 func (m *MockStore) ListLibrariesForOrg(orgID uuid.UUID) ([]OrgLibraryInfo, error) {
-	return nil, nil
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	var result []OrgLibraryInfo
+	for _, lib := range m.libraries {
+		if lib.OrgID == orgID {
+			result = append(result, OrgLibraryInfo{LibraryID: lib.LibraryID, StorageClass: lib.StorageClass})
+		}
+	}
+	return result, nil
 }
-func (m *MockStore) DeleteGroupFull(orgID, groupID uuid.UUID) error { return nil }
-func (m *MockStore) HardDeleteOrg(orgID uuid.UUID) error            { return nil }
-func (m *MockStore) GetOrgName(orgID uuid.UUID) (string, error)     { return "", nil }
+func (m *MockStore) DeleteGroupFull(orgID, groupID uuid.UUID) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.groups, fmt.Sprintf("%s:%s", orgID, groupID))
+	// Clean group_members
+	prefix := fmt.Sprintf("%s:", groupID)
+	for key := range m.groupMembers {
+		if len(key) > len(prefix) && key[:len(prefix)] == prefix {
+			delete(m.groupMembers, key)
+		}
+	}
+	return nil
+}
+func (m *MockStore) HardDeleteOrg(orgID uuid.UUID) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for i, id := range m.organizations {
+		if id == orgID {
+			m.organizations = append(m.organizations[:i], m.organizations[i+1:]...)
+			break
+		}
+	}
+	delete(m.orgNames, orgID)
+	delete(m.orgDeletedAt, orgID)
+	return nil
+}
+func (m *MockStore) GetOrgName(orgID uuid.UUID) (string, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	name, ok := m.orgNames[orgID]
+	if !ok {
+		return "", fmt.Errorf("org not found")
+	}
+	return name, nil
+}
 
 // --- GC stats persistence ---
 
