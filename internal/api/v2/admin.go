@@ -733,6 +733,11 @@ func (h *AdminHandler) ListOrgUsers(c *gin.Context) {
 	callerOrgID := c.GetString("org_id")
 	callerUserID := c.GetString("user_id")
 
+	statusFilter, ok := parseUserStatusFilter(c)
+	if !ok {
+		return
+	}
+
 	// Check permissions: superadmin can access any org, admin can access own org
 	if callerOrgID != middleware.PlatformOrgID {
 		// Not a platform user — must be admin of the target org
@@ -768,11 +773,15 @@ func (h *AdminHandler) ListOrgUsers(c *gin.Context) {
 	var createdAt time.Time
 
 	for iter.Scan(&userID, &email, &name, &role, &status, &quotaBytes, &usedBytes, &createdAt) {
+		if !userMatchesStatusFilter(status, statusFilter) {
+			continue
+		}
 		isActive := IsUserUsable(status)
 		isOrgStaff := role == "admin" || role == "superadmin"
 		users = append(users, gin.H{
 			"email":        email,
 			"name":         name,
+			"status":       normalizeUserStatus(status),
 			"active":       isActive,
 			"is_org_staff": isOrgStaff,
 			"quota_usage":  usedBytes,
@@ -1878,6 +1887,7 @@ func (h *AdminHandler) AdminListGroupLibraries(c *gin.Context) {
 type adminUserResponse struct {
 	Email      string `json:"email"`
 	Name       string `json:"name"`
+	Status     string `json:"status"`
 	IsActive   bool   `json:"is_active"`
 	IsStaff    bool   `json:"is_staff"`
 	Role       string `json:"role"`
@@ -1894,10 +1904,12 @@ func makeAdminUserResponse(email, name, role, status string, quotaBytes, usedByt
 	if role != "admin" && role != "superadmin" {
 		adminRole = ""
 	}
+	canonicalStatus := normalizeUserStatus(status)
 	return adminUserResponse{
 		Email:      email,
 		Name:       name,
-		IsActive:   IsUserUsable(status),
+		Status:     canonicalStatus,
+		IsActive:   canonicalStatus == StatusActive,
 		IsStaff:    role == "admin" || role == "superadmin",
 		Role:       role,
 		AdminRole:  adminRole,
@@ -1908,6 +1920,38 @@ func makeAdminUserResponse(email, name, role, status string, quotaBytes, usedByt
 	}
 }
 
+func normalizeUserStatus(status string) string {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case StatusDeleted:
+		return StatusDeleted
+	case StatusDeactivated:
+		return StatusDeactivated
+	default:
+		return StatusActive
+	}
+}
+
+func parseUserStatusFilter(c *gin.Context) (string, bool) {
+	status := strings.ToLower(strings.TrimSpace(c.DefaultQuery("status", "all")))
+	switch status {
+	case "", "all", StatusActive, StatusDeactivated, StatusDeleted:
+		if status == "" {
+			status = "all"
+		}
+		return status, true
+	default:
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid status filter"})
+		return "", false
+	}
+}
+
+func userMatchesStatusFilter(rawStatus, statusFilter string) bool {
+	if statusFilter == "all" {
+		return true
+	}
+	return normalizeUserStatus(rawStatus) == statusFilter
+}
+
 // ListAllUsers lists all users with pagination.
 // Superadmin sees users across ALL orgs; tenant admin sees only own org.
 // GET /admin/users/?page=N&per_page=N
@@ -1916,6 +1960,11 @@ func (h *AdminHandler) ListAllUsers(c *gin.Context) {
 	callerUserID := c.GetString("user_id")
 
 	if err := h.requireAdminAccess(c, callerOrgID, callerUserID); err != nil {
+		return
+	}
+
+	statusFilter, ok := parseUserStatusFilter(c)
+	if !ok {
 		return
 	}
 
@@ -1955,7 +2004,7 @@ func (h *AdminHandler) ListAllUsers(c *gin.Context) {
 		var createdAt time.Time
 
 		for iter.Scan(&userID, &email, &name, &role, &status, &quotaBytes, &usedBytes, &createdAt) {
-			if !seen[email] {
+			if !seen[email] && userMatchesStatusFilter(status, statusFilter) {
 				seen[email] = true
 				allUsers = append(allUsers, makeAdminUserResponse(email, name, role, status, quotaBytes, usedBytes, createdAt))
 			}
@@ -1999,8 +2048,22 @@ func (h *AdminHandler) SearchUsers(c *gin.Context) {
 	}
 
 	query := strings.ToLower(c.Query("query"))
+	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
+	perPage, _ := strconv.Atoi(c.DefaultQuery("per_page", "25"))
+	if page < 1 {
+		page = 1
+	}
+	if perPage < 1 {
+		perPage = 25
+	}
 	if query == "" {
-		c.JSON(http.StatusOK, gin.H{"user_list": []adminUserResponse{}})
+		c.JSON(http.StatusOK, gin.H{
+			"user_list": []adminUserResponse{},
+			"page_info": gin.H{
+				"current_page":  page,
+				"has_next_page": false,
+			},
+		})
 		return
 	}
 
@@ -2048,7 +2111,23 @@ func (h *AdminHandler) SearchUsers(c *gin.Context) {
 		results = []adminUserResponse{}
 	}
 
-	c.JSON(http.StatusOK, gin.H{"user_list": results})
+	total := len(results)
+	start := (page - 1) * perPage
+	if start > total {
+		start = total
+	}
+	end := start + perPage
+	if end > total {
+		end = total
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"user_list": results[start:end],
+		"page_info": gin.H{
+			"current_page":  page,
+			"has_next_page": end < total,
+		},
+	})
 }
 
 // AdminCreateUser creates a new user via admin API.

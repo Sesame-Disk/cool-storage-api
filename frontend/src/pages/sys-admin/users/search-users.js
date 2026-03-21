@@ -116,7 +116,11 @@ class SearchUsers extends Component {
       this.setState({
         userList: res.data.user_list,
         loading: false,
-        pageInfo: res.data.page_info
+        currentPage: page,
+        pageInfo: res.data.page_info || {
+          current_page: page,
+          has_next_page: false,
+        }
       });
     }).catch((error) => {
       this.setState({
@@ -142,6 +146,18 @@ class SearchUsers extends Component {
       this.setState({ userList: newUserList });
       let msg = gettext('Deleted user %s');
       msg = msg.replace('%s', username);
+      toaster.success(msg);
+    }).catch((error) => {
+      let errMessage = Utils.getErrorMsg(error);
+      toaster.danger(errMessage);
+    });
+  };
+
+  restoreUser = (email, userName) => {
+    seafileAPI.sysAdminRestoreUser(email).then(() => {
+      this.getItems(this.state.currentPage);
+      let msg = gettext('Restored user %s');
+      msg = msg.replace('%s', userName);
       toaster.success(msg);
     }).catch((error) => {
       let errMessage = Utils.getErrorMsg(error);
@@ -331,10 +347,11 @@ class SearchUsers extends Component {
                   items={this.state.userList}
                   updateUser={this.updateUser}
                   deleteUser={this.deleteUser}
+                  restoreUser={this.restoreUser}
                   updateAdminRole={this.updateAdminRole}
                   revokeAdmin={this.revokeAdmin}
                   onUserSelected={this.onUserSelected}
-                  isAllUsersSelected={this.isAllUsersSelected}
+                  isAllUsersSelected={this.state.isAllUsersSelected}
                   toggleSelectAllUsers={this.toggleSelectAllUsers}
                 />
               </div>

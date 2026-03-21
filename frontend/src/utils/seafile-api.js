@@ -919,7 +919,7 @@ seafileAPI.sysAdminListUploadLinksByUser = function (email) {
 // ============================================================================
 
 // Admin: list all users (paginated, sortable)
-seafileAPI.sysAdminListUsers = function (page, perPage, isLDAPImported, sortBy, sortOrder) {
+seafileAPI.sysAdminListUsers = function (page, perPage, isLDAPImported, sortBy, sortOrder, status) {
   let url = this.server + '/api/v2.1/admin/users/';
   const params = new URLSearchParams();
   if (page) params.set('page', page);
@@ -927,6 +927,7 @@ seafileAPI.sysAdminListUsers = function (page, perPage, isLDAPImported, sortBy, 
   if (isLDAPImported) params.set('source', 'LDAPImport');
   if (sortBy) params.set('order_by', sortBy);
   if (sortOrder) params.set('direction', sortOrder);
+  if (status && status !== 'all') params.set('status', status);
   if (params.toString()) url += '?' + params.toString();
   return this.req.get(url);
 };
@@ -963,6 +964,12 @@ seafileAPI.sysAdminDeleteUser = function (email) {
   return this.req.delete(url);
 };
 
+// Admin: restore soft-deleted user
+seafileAPI.sysAdminRestoreUser = function (email) {
+  let url = this.server + '/api/v2.1/admin/users/' + encodeURIComponent(email) + '/restore/';
+  return this.req.put(url);
+};
+
 // Admin: add new user
 seafileAPI.sysAdminAddUser = function (email, name, password, role) {
   let url = this.server + '/api/v2.1/admin/users/';
@@ -973,10 +980,13 @@ seafileAPI.sysAdminAddUser = function (email, name, password, role) {
 
 // Admin: search users
 seafileAPI.sysAdminSearchUsers = function (query, page, perPage, orgId) {
-  let url = this.server + '/api/v2.1/admin/search-user/?query=' + encodeURIComponent(query);
-  if (orgId) {
-    url += '&org_id=' + encodeURIComponent(orgId);
-  }
+  let url = this.server + '/api/v2.1/admin/search-user/';
+  const params = new URLSearchParams();
+  params.set('query', query);
+  if (page) params.set('page', page);
+  if (perPage) params.set('per_page', perPage);
+  if (orgId) params.set('org_id', orgId);
+  url += '?' + params.toString();
   return this.req.get(url);
 };
 
@@ -1101,8 +1111,13 @@ seafileAPI.sysAdminRestoreOrg = function (orgID) {
 };
 
 // Admin: list org users (sys-admin panel)
-seafileAPI.sysAdminListOrgUsers = function (orgID) {
+seafileAPI.sysAdminListOrgUsers = function (orgID, status) {
   let url = this.server + '/api/v2.1/admin/organizations/' + orgID + '/users/';
+  if (status && status !== 'all') {
+    const params = new URLSearchParams();
+    params.set('status', status);
+    url += '?' + params.toString();
+  }
   return this.req.get(url);
 };
 

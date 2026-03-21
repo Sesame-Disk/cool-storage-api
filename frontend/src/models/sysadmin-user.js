@@ -7,6 +7,7 @@ class SysAdminUser {
     this.last_login = object.last_login;
     this.last_access_time = object.last_access_time;
     this.create_time = object.create_time;
+    this.status = object.status;
     this.is_active = object.is_active;
     this.is_staff = object.is_staff;
     this.reference_id = object.reference_id;

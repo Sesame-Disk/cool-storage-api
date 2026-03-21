@@ -138,6 +138,7 @@ class Content extends Component {
                   toggleItemFreezed={this.toggleItemFreezed}
                   updateUser={this.props.updateUser}
                   deleteUser={this.props.deleteUser}
+                  restoreUser={this.props.restoreUser}
                   updateAdminRole={this.props.updateAdminRole}
                   revokeAdmin={this.props.revokeAdmin}
                   onUserSelected={this.props.onUserSelected}
@@ -182,6 +183,7 @@ Content.propTypes = {
   resetPerPage: PropTypes.func,
   updateUser: PropTypes.func,
   deleteUser: PropTypes.func,
+  restoreUser: PropTypes.func,
   updateAdminRole: PropTypes.func,
   revokeAdmin: PropTypes.func,
   onUserSelected: PropTypes.func,
@@ -201,7 +203,8 @@ class Item extends Component {
       isDeleteUserDialogOpen: false,
       isResetUserPasswordDialogOpen: false,
       isRevokeAdminDialogOpen: false,
-      isConfirmInactiveDialogOpen: false
+      isConfirmInactiveDialogOpen: false,
+      isRestoreUserDialogOpen: false
     };
   }
 
@@ -249,6 +252,10 @@ class Item extends Component {
 
   toggleConfirmInactiveDialog = () => {
     this.setState({ isConfirmInactiveDialogOpen: !this.state.isConfirmInactiveDialogOpen });
+  };
+
+  toggleRestoreUserDialog = () => {
+    this.setState({ isRestoreUserDialogOpen: !this.state.isRestoreUserDialogOpen });
   };
 
   onUserSelected = () => {
@@ -307,6 +314,8 @@ class Item extends Component {
         return gettext('Active');
       case 'inactive':
         return gettext('Inactive');
+      case 'deleted':
+        return gettext('Deleted');
     }
   };
 
@@ -321,6 +330,11 @@ class Item extends Component {
   deleteUser = () => {
     toaster.notify(gettext('It may take some time, please wait.'));
     this.props.deleteUser(this.props.item.email, this.props.item.name);
+  };
+
+  restoreUser = () => {
+    toaster.notify(gettext('It may take some time, please wait.'));
+    this.props.restoreUser(this.props.item.email, this.props.item.name);
   };
 
   resetPassword = () => {
@@ -343,6 +357,9 @@ class Item extends Component {
       isAdmin, isLDAPImported,
       isSearchResult, item
     } = this.props;
+    if (item.status === 'deleted') {
+      return ['Restore'];
+    }
     let list = ['Delete'];
     if (!isLDAPImported ||
       (isSearchResult && item.source === 'db')) {
@@ -366,6 +383,9 @@ class Item extends Component {
       case 'Revoke Admin':
         translateResult = gettext('Revoke Admin');
         break;
+      case 'Restore':
+        translateResult = gettext('Restore');
+        break;
     }
 
     return translateResult;
@@ -382,6 +402,9 @@ class Item extends Component {
       case 'Revoke Admin':
         this.toggleRevokeAdminDialog();
         break;
+      case 'Restore':
+        this.toggleRestoreUserDialog();
+        break;
       default:
         break;
     }
@@ -396,7 +419,8 @@ class Item extends Component {
       isDeleteUserDialogOpen,
       isResetUserPasswordDialogOpen,
       isRevokeAdminDialogOpen,
-      isConfirmInactiveDialogOpen
+      isConfirmInactiveDialogOpen,
+      isRestoreUserDialogOpen
     } = this.state;
 
     const itemName = '<span class="op-target">' + Utils.HTMLescape(item.name) + '</span>';
@@ -404,9 +428,13 @@ class Item extends Component {
     const resetPasswordDialogMsg = gettext('Are you sure you want to reset the password of {placeholder} ?').replace('{placeholder}', itemName);
     const revokeAdminDialogMsg = gettext('Are you sure you want to revoke the admin permission of {placeholder} ?').replace('{placeholder}', itemName);
     const confirmSetUserInactiveMsg = gettext('Are you sure you want to set {user_placeholder} inactive?').replace('{user_placeholder}', itemName);
+    const restoreUserDialogMsg = gettext('Are you sure you want to restore {placeholder} ?').replace('{placeholder}', itemName);
+
+    const effectiveStatus = item.status || (item.is_active ? 'active' : 'inactive');
+    const isDeleted = effectiveStatus === 'deleted';
 
     // for 'user status'
-    const curStatus = item.is_active ? 'active' : 'inactive';
+    const curStatus = effectiveStatus === 'active' ? 'active' : 'inactive';
     this.statusOptions = ['active', 'inactive'].map(item => {
       return {
         value: item,
@@ -478,14 +506,18 @@ class Item extends Component {
             }
           </td>
           <td>
-            <Selector
-              isDropdownToggleShown={highlight}
-              currentSelectedOption={currentSelectedStatusOption}
-              options={this.statusOptions}
-              selectOption={this.updateStatus}
-              toggleItemFreezed={this.props.toggleItemFreezed}
-              operationBeforeSelect={item.is_active ? this.toggleConfirmInactiveDialog : undefined}
-            />
+            {isDeleted ?
+              <span className="badge badge-danger">{gettext('Deleted')}</span>
+              :
+              <Selector
+                isDropdownToggleShown={highlight}
+                currentSelectedOption={currentSelectedStatusOption}
+                options={this.statusOptions}
+                selectOption={this.updateStatus}
+                toggleItemFreezed={this.props.toggleItemFreezed}
+                operationBeforeSelect={effectiveStatus === 'active' ? this.toggleConfirmInactiveDialog : undefined}
+              />
+            }
           </td>
           {isPro &&
             <td>
@@ -588,6 +620,15 @@ class Item extends Component {
             toggleDialog={this.toggleConfirmInactiveDialog}
           />
         }
+        {isRestoreUserDialogOpen &&
+          <CommonOperationConfirmationDialog
+            title={gettext('Restore User')}
+            message={restoreUserDialogMsg}
+            executeOperation={this.restoreUser}
+            confirmBtnText={gettext('Restore')}
+            toggleDialog={this.toggleRestoreUserDialog}
+          />
+        }
       </Fragment>
     );
   }
@@ -603,6 +644,7 @@ Item.propTypes = {
   toggleItemFreezed: PropTypes.func.isRequired,
   updateUser: PropTypes.func,
   deleteUser: PropTypes.func,
+  restoreUser: PropTypes.func,
   updateAdminRole: PropTypes.func,
   revokeAdmin: PropTypes.func,
   onUserSelected: PropTypes.func,

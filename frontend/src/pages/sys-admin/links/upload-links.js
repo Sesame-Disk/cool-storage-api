@@ -64,10 +64,11 @@ class UploadLinks extends Component {
 
   deleteUploadLink = (linkToken) => {
     seafileAPI.sysAdminDeleteUploadLink(linkToken).then(res => {
-      let newUploadLinkList = this.state.uploadLinkList.filter(item =>
-        item.token !== linkToken
-      );
-      this.setState({ uploadLinkList: newUploadLinkList });
+      const targetPage = this.state.uploadLinkList.length === 1 && this.state.currentPage > 1
+        ? this.state.currentPage - 1
+        : this.state.currentPage;
+      this.getUploadLinksByPage(targetPage);
+      toaster.success(gettext('Successfully deleted 1 item.'));
     }).catch(error => {
       let errMessage = Utils.getErrorMsg(error);
       toaster.danger(errMessage);

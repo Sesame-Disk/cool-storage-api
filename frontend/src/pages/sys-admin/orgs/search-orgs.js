@@ -73,6 +73,54 @@ class SearchOrgs extends Component {
     });
   };
 
+  deactivateOrg = (orgID) => {
+    seafileAPI.sysAdminDeactivateOrg(orgID).then(() => {
+      const orgList = this.state.orgList.map(org => {
+        if (org.org_id === orgID) {
+          org.status = 'deactivated';
+        }
+        return org;
+      });
+      this.setState({ orgList });
+      toaster.success(gettext('Edit succeeded'));
+    }).catch((error) => {
+      let errMessage = Utils.getErrorMsg(error);
+      toaster.danger(errMessage);
+    });
+  };
+
+  reactivateOrg = (orgID) => {
+    seafileAPI.sysAdminReactivateOrg(orgID).then(() => {
+      const orgList = this.state.orgList.map(org => {
+        if (org.org_id === orgID) {
+          org.status = 'active';
+        }
+        return org;
+      });
+      this.setState({ orgList });
+      toaster.success(gettext('Edit succeeded'));
+    }).catch((error) => {
+      let errMessage = Utils.getErrorMsg(error);
+      toaster.danger(errMessage);
+    });
+  };
+
+  restoreOrg = (orgID) => {
+    seafileAPI.sysAdminRestoreOrg(orgID).then(() => {
+      const orgList = this.state.orgList.map(org => {
+        if (org.org_id === orgID) {
+          org.status = 'active';
+        }
+        return org;
+      });
+      this.setState({ orgList });
+      toaster.success(gettext('Edit succeeded'));
+    }).catch((error) => {
+      let errMessage = Utils.getErrorMsg(error);
+      toaster.danger(errMessage);
+    });
+  };
+
   handleInputChange = (e) => {
     this.setState({
       query: e.target.value
@@ -131,6 +179,9 @@ class SearchOrgs extends Component {
                   items={this.state.orgList}
                   updateRole={this.updateRole}
                   deleteOrg={this.deleteOrg}
+                  deactivateOrg={this.deactivateOrg}
+                  reactivateOrg={this.reactivateOrg}
+                  restoreOrg={this.restoreOrg}
                 />
               </div>
             </div>

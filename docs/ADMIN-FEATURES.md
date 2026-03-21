@@ -1,6 +1,6 @@
 # Admin Features — Library Management, Link Management, Org Admin, Audit Logs
 
-**Last Updated**: 2026-03-11
+**Last Updated**: 2026-03-21
 **Status**: Library Management ✅ DONE, Link Management ✅ DONE, Sharing Stubs ✅ DONE, Org Management ✅ DONE, Org Admin Panel ✅ DONE, Superadmin Departments ✅ DONE, Custom Share Permissions ✅ DONE, Audit Logs pending
 
 ---
@@ -13,7 +13,7 @@ Three admin feature areas needed for production. The OIDC provider manages users
 |---------|---------|----------|----------|----------|
 | Admin Library Management | ✅ Complete (2026-02-12) | ✅ Exists | ✅ Exists | DONE |
 | Admin Share Link & Upload Link Management | ✅ Complete (2026-02-12) | ✅ Exists | ✅ Exists | DONE |
-| Admin Organization Management | ✅ Complete (2026-03-18) | 🟡 Needs update (soft-delete/restore UI) | ✅ Exists | DONE (backend), frontend TODO |
+| Admin Organization Management | ✅ Complete (2026-03-21) | ✅ Complete (superadmin lifecycle UI) | ✅ Exists | DONE |
 | Admin User Management | ✅ Complete (2026-02-23) | ✅ Exists | ✅ Exists | DONE |
 | Custom Share Permissions | ✅ Complete (2026-03-11) | ✅ Exists | ✅ Exists | DONE |
 | Audit Logs | 🟡 Stub only | ✅ Exists (unused) | ❌ Missing | MEDIUM |
@@ -103,9 +103,12 @@ Three distinct org states tracked via the dedicated `status` column (separate fr
    - Org record → hard-deleted from `organizations` table
    - Audit log entry written
 
-**Remaining frontend TODO** (see ISSUE-FRONTEND-ORG-DELETE-01 in KNOWN_ISSUES.md):
-- Superadmin dashboard: "Delete" button (distinct from "Deactivate"), "Restore" button, status column
-- `ListOrganizations` should filter by status (active/deactivated/deleted)
+**Frontend status (2026-03-21):**
+- Superadmin dashboard now includes distinct lifecycle actions for "Deactivate", "Delete", "Reactivate", and "Restore"
+- `ListOrganizations` supports status filtering (`all`, `active`, `deactivated`, `deleted`)
+- Search Organizations now reuses the same lifecycle actions as the main organizations list
+
+**Remaining frontend TODO**:
 - Org admin dashboard: warning banner for orgs in "deleted" state
 
 ---

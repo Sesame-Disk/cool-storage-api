@@ -35,4 +35,22 @@ describe('Share/Upload Links API methods in seafile-api.js', () => {
         expect(uploadSection).toContain("params.set('active', active)");
         expect(uploadSection).toContain("params.set('expired', expired)");
     });
+
+    test('sysAdminListUsers supports status filter', () => {
+        expect(apiContent).toContain('seafileAPI.sysAdminListUsers');
+        expect(apiContent).toMatch(/sysAdminListUsers\s*=\s*function\s*\(\s*page\s*,\s*perPage\s*,\s*isLDAPImported\s*,\s*sortBy\s*,\s*sortOrder\s*,\s*status\s*\)/);
+        expect(apiContent).toContain("params.set('status', status)");
+    });
+
+    test('sysAdminRestoreUser endpoint exists', () => {
+        expect(apiContent).toContain('seafileAPI.sysAdminRestoreUser');
+        expect(apiContent).toContain("/api/v2.1/admin/users/");
+        expect(apiContent).toContain("/restore/");
+    });
+
+    test('sysAdminSearchUsers forwards pagination params', () => {
+        expect(apiContent).toContain('seafileAPI.sysAdminSearchUsers');
+        expect(apiContent).toContain("params.set('page', page)");
+        expect(apiContent).toContain("params.set('per_page', perPage)");
+    });
 });

@@ -119,10 +119,11 @@ class ShareLinks extends Component {
 
   deleteShareLink = (linkToken) => {
     seafileAPI.sysAdminDeleteShareLink(linkToken).then(res => {
-      let newShareLinkList = this.state.shareLinkList.filter(item =>
-        item.token !== linkToken
-      );
-      this.setState({ shareLinkList: newShareLinkList });
+      const targetPage = this.state.shareLinkList.length === 1 && this.state.currentPage > 1
+        ? this.state.currentPage - 1
+        : this.state.currentPage;
+      this.getShareLinksByPage(targetPage);
+      toaster.success(gettext('Successfully deleted 1 item.'));
     }).catch(error => {
       let errMessage = Utils.getErrorMsg(error);
       toaster.danger(errMessage);

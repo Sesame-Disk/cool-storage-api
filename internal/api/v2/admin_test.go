@@ -567,6 +567,7 @@ func TestAdminUserResponse_JSONFormat(t *testing.T) {
 	resp := adminUserResponse{
 		Email:      "test@example.com",
 		Name:       "Test User",
+		Status:     "active",
 		IsActive:   true,
 		IsStaff:    false,
 		Role:       "user",
@@ -585,6 +586,7 @@ func TestAdminUserResponse_JSONFormat(t *testing.T) {
 
 	assert.Equal(t, "test@example.com", parsed["email"])
 	assert.Equal(t, "Test User", parsed["name"])
+	assert.Equal(t, "active", parsed["status"])
 	assert.Equal(t, true, parsed["is_active"])
 	assert.Equal(t, false, parsed["is_staff"])
 	assert.Equal(t, "user", parsed["role"])
@@ -594,7 +596,7 @@ func TestAdminUserResponse_JSONFormat(t *testing.T) {
 	assert.Equal(t, "2025-06-15T12:00:00Z", parsed["create_time"])
 	assert.Equal(t, "", parsed["last_login"])
 
-	expectedKeys := []string{"email", "name", "is_active", "is_staff", "role", "admin_role", "quota_total", "quota_usage", "create_time", "last_login"}
+	expectedKeys := []string{"email", "name", "status", "is_active", "is_staff", "role", "admin_role", "quota_total", "quota_usage", "create_time", "last_login"}
 	for _, key := range expectedKeys {
 		_, exists := parsed[key]
 		assert.True(t, exists, "expected key %q in JSON output", key)
@@ -717,6 +719,100 @@ func TestPaginationParsingLogic(t *testing.T) {
 
 			assert.Equal(t, tt.wantPage, page)
 			assert.Equal(t, tt.wantPerPage, perPage)
+		})
+	}
+}
+
+// --- User status filter helper tests (ListAllUsers/ListOrgUsers) ---
+
+func TestNormalizeUserStatus(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		expected string
+	}{
+		{"active stays active", "active", StatusActive},
+		{"deactivated stays deactivated", "deactivated", StatusDeactivated},
+		{"deleted stays deleted", "deleted", StatusDeleted},
+		{"empty defaults active", "", StatusActive},
+		{"unknown defaults active", "weird", StatusActive},
+		{"trim and lowercase", "  DEACTIVATED  ", StatusDeactivated},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := normalizeUserStatus(tt.input)
+			assert.Equal(t, tt.expected, got)
+		})
+	}
+}
+
+func TestUserMatchesStatusFilter(t *testing.T) {
+	tests := []struct {
+		name         string
+		rowStatus    string
+		statusFilter string
+		expected     bool
+	}{
+		{"all matches active", "active", "all", true},
+		{"all matches deleted", "deleted", "all", true},
+		{"active matches active", "active", "active", true},
+		{"active does not match deleted", "active", "deleted", false},
+		{"deactivated matches deactivated", "DEACTIVATED", "deactivated", true},
+		{"unknown row normalized to active", "unknown", "active", true},
+		{"unknown row does not match deleted", "unknown", "deleted", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := userMatchesStatusFilter(tt.rowStatus, tt.statusFilter)
+			assert.Equal(t, tt.expected, got)
+		})
+	}
+}
+
+func TestParseUserStatusFilter(t *testing.T) {
+	tests := []struct {
+		name         string
+		queryValue   string
+		wantOK       bool
+		wantFilter   string
+		wantHTTPCode int
+	}{
+		{"missing status defaults all", "", true, "all", 0},
+		{"explicit all", "all", true, "all", 0},
+		{"active accepted", "active", true, "active", 0},
+		{"deactivated accepted", "deactivated", true, "deactivated", 0},
+		{"deleted accepted", "deleted", true, "deleted", 0},
+		{"whitespace and uppercase normalized", "  DELETED ", true, "deleted", 0},
+		{"invalid rejected", "paused", false, "", http.StatusBadRequest},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			path := "/admin/users/"
+			if tt.queryValue != "" {
+				path += "?status=" + tt.queryValue
+			}
+			req, err := http.NewRequest("GET", path, nil)
+			assert.NoError(t, err)
+			c.Request = req
+
+			gotFilter, gotOK := parseUserStatusFilter(c)
+			assert.Equal(t, tt.wantOK, gotOK)
+			assert.Equal(t, tt.wantFilter, gotFilter)
+
+			if tt.wantHTTPCode != 0 {
+				assert.Equal(t, tt.wantHTTPCode, w.Code)
+				var body map[string]interface{}
+				err = json.Unmarshal(w.Body.Bytes(), &body)
+				assert.NoError(t, err)
+				assert.Equal(t, "invalid status filter", body["error"])
+			} else {
+				assert.True(t, w.Code == 0 || w.Code == http.StatusOK)
+			}
 		})
 	}
 }

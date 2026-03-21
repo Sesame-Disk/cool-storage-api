@@ -36,6 +36,7 @@ class Users extends Component {
       hasNextPage: false,
       currentPage: 1,
       perPage: 25,
+      statusFilter: 'all',
       hasUserSelected: false,
       selectedUserList: [],
       isAllUsersSelected: false,
@@ -55,13 +56,15 @@ class Users extends Component {
       const {
         currentPage, perPage,
         sortBy = '',
-        sortOrder = 'asc'
+        sortOrder = 'asc',
+        statusFilter = 'all'
       } = this.state;
       this.setState({
         perPage: parseInt(urlParams.get('per_page') || perPage),
         currentPage: parseInt(urlParams.get('page') || currentPage),
         sortBy: urlParams.get('order_by') || sortBy,
-        sortOrder: urlParams.get('direction') || sortOrder
+        sortOrder: urlParams.get('direction') || sortOrder,
+        statusFilter: urlParams.get('status') || statusFilter
       }, () => {
         this.getUsersListByPage(this.state.currentPage);
       });
@@ -161,9 +164,9 @@ class Users extends Component {
   };
 
   getUsersListByPage = (page) => {
-    const { perPage, sortBy, sortOrder } = this.state;
+    const { perPage, sortBy, sortOrder, statusFilter } = this.state;
     const { isLDAPImported } = this.props;
-    seafileAPI.sysAdminListUsers(page, perPage, isLDAPImported, sortBy, sortOrder).then(res => {
+    seafileAPI.sysAdminListUsers(page, perPage, isLDAPImported, sortBy, sortOrder, statusFilter).then(res => {
       let users = res.data.data.map(user => { return new SysAdminUser(user); });
       this.setState({
         userList: users,
@@ -197,6 +200,21 @@ class Users extends Component {
     });
   };
 
+  setStatusFilter = (statusFilter) => {
+    this.setState({
+      statusFilter,
+      currentPage: 1
+    }, () => {
+      let url = new URL(location.href);
+      let searchParams = new URLSearchParams(url.search);
+      searchParams.set('page', '1');
+      searchParams.set('status', statusFilter);
+      url.search = searchParams.toString();
+      navigate(url.toString());
+      this.getUsersListByPage(1);
+    });
+  };
+
   deleteUser = (email, username) => {
     seafileAPI.sysAdminDeleteUser(email).then(res => {
       let newUserList = this.state.userList.filter(item => {
@@ -204,6 +222,18 @@ class Users extends Component {
       });
       this.setState({ userList: newUserList });
       let msg = gettext('Deleted user %s');
+      msg = msg.replace('%s', username);
+      toaster.success(msg);
+    }).catch((error) => {
+      let errMessage = Utils.getErrorMsg(error);
+      toaster.danger(errMessage);
+    });
+  };
+
+  restoreUser = (email, username) => {
+    seafileAPI.sysAdminRestoreUser(email).then(() => {
+      this.getUsersListByPage(this.state.currentPage);
+      let msg = gettext('Restored user %s');
       msg = msg.replace('%s', username);
       toaster.success(msg);
     }).catch((error) => {
@@ -451,6 +481,29 @@ class Users extends Component {
         <div className="main-panel-center flex-row">
           <div className="cur-view-container">
             <UsersNav currentItem={this.getCurrentNavItem()} />
+            {!isAdmin &&
+              <div className="d-flex align-items-center mb-3">
+                <span className="mr-2">{gettext('Status')}</span>
+                {['all', 'active', 'deactivated', 'deleted'].map(status => {
+                  const isStatusSelected = this.state.statusFilter === status;
+                  const labelMap = {
+                    all: gettext('All'),
+                    active: gettext('Active'),
+                    deactivated: gettext('Inactive'),
+                    deleted: gettext('Deleted')
+                  };
+                  return (
+                    <button
+                      key={status}
+                      className={`btn btn-sm mr-2 ${isStatusSelected ? 'btn-primary' : 'btn-outline-secondary'}`}
+                      onClick={() => this.setStatusFilter(status)}
+                    >
+                      {labelMap[status]}
+                    </button>
+                  );
+                })}
+              </div>
+            }
             <div className="cur-view-content">
               <Content
                 isAdmin={isAdmin}
@@ -468,10 +521,11 @@ class Users extends Component {
                 getListByPage={this.getUsersListByPage}
                 updateUser={this.updateUser}
                 deleteUser={this.deleteUser}
+                restoreUser={this.restoreUser}
                 updateAdminRole={this.updateAdminRole}
                 revokeAdmin={this.revokeAdmin}
                 onUserSelected={this.onUserSelected}
-                isAllUsersSelected={this.isAllUsersSelected}
+                isAllUsersSelected={this.state.isAllUsersSelected}
                 toggleSelectAllUsers={this.toggleSelectAllUsers}
               />
             </div>

@@ -454,6 +454,7 @@ func (h *AdminHandler) AdminAddOrgUser(c *gin.Context) {
 	c.JSON(http.StatusCreated, gin.H{
 		"email":        req.Email,
 		"name":         req.Name,
+		"status":       StatusActive,
 		"active":       true,
 		"is_org_staff": false,
 		"quota_usage":  0,
@@ -569,6 +570,7 @@ func (h *AdminHandler) AdminUpdateOrgUser(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"email":        email,
 		"name":         name,
+		"status":       normalizeUserStatus(status),
 		"active":       isActive,
 		"is_org_staff": isOrgStaff,
 		"quota_usage":  usedBytes,
