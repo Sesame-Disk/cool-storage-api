@@ -9,9 +9,13 @@ import (
 	"testing"
 )
 
-// TestShareLinkViewCountingCallSites is a regression test for the
-// double-count bug on page reloads. It ensures only page-render handlers
-// call resolveShareLink(..., true), while auxiliary API handlers use false.
+// TestShareLinkViewCountingCallSites is a regression test that ensures NO handler
+// calls resolveShareLink(..., true). View counting was moved to incrementViewCount()
+// which is called AFTER password/expiry/disabled checks, so password-prompt pages
+// and expired/disabled links don't inflate the view counter.
+//
+// All resolveShareLink calls must pass countView=false.
+// Actual view counting happens in serveSharedDirPage and serveSharedFilePage.
 func TestShareLinkViewCountingCallSites(t *testing.T) {
 	_, thisFile, _, ok := runtime.Caller(0)
 	if !ok {
@@ -27,14 +31,21 @@ func TestShareLinkViewCountingCallSites(t *testing.T) {
 		t.Fatalf("failed to parse sharelink_view.go: %v", err)
 	}
 
-	expected := map[string]bool{
-		"ServeShareLinkPage":      true,
-		"ServeShareLinkFilePage":  true,
-		"ListShareLinkDirents":    false,
-		"GetShareLinkRepoTags":    false,
-		"GetShareLinkZipTask":     false,
-		"GetShareLinkUploadURL":   false,
-		"PostShareLinkUploadDone": false,
+	// Every handler that calls resolveShareLink must pass countView=false.
+	// View counting is handled explicitly via incrementViewCount() after all checks.
+	expectedFalse := []string{
+		"ServeShareLinkPage",
+		"ServeShareLinkFilePage",
+		"ListShareLinkDirents",
+		"GetShareLinkRepoTags",
+		"GetShareLinkZipTask",
+		"GetShareLinkUploadURL",
+		"PostShareLinkUploadDone",
+	}
+
+	expectedSet := make(map[string]bool, len(expectedFalse))
+	for _, name := range expectedFalse {
+		expectedSet[name] = true
 	}
 
 	seen := make(map[string]bool)
@@ -45,8 +56,7 @@ func TestShareLinkViewCountingCallSites(t *testing.T) {
 			continue
 		}
 
-		expectedFlag, tracked := expected[fn.Name.Name]
-		if !tracked {
+		if !expectedSet[fn.Name.Name] {
 			continue
 		}
 
@@ -71,9 +81,8 @@ func TestShareLinkViewCountingCallSites(t *testing.T) {
 				t.Fatalf("%s must pass boolean literal as second resolveShareLink arg", fn.Name.Name)
 			}
 
-			got := flagIdent.Name == "true"
-			if got != expectedFlag {
-				t.Fatalf("%s resolveShareLink countView = %v, want %v", fn.Name.Name, got, expectedFlag)
+			if flagIdent.Name == "true" {
+				t.Fatalf("%s calls resolveShareLink with countView=true; view counting must happen via incrementViewCount() after password/expiry checks", fn.Name.Name)
 			}
 
 			found = true
@@ -86,9 +95,39 @@ func TestShareLinkViewCountingCallSites(t *testing.T) {
 		seen[fn.Name.Name] = true
 	}
 
-	for name := range expected {
+	for _, name := range expectedFalse {
 		if !seen[name] {
 			t.Fatalf("expected tracked function not found in AST: %s", name)
+		}
+	}
+
+	// Verify that serveSharedDirPage and serveSharedFilePage call incrementViewCount
+	for _, fnName := range []string{"serveSharedDirPage", "serveSharedFilePage"} {
+		found := false
+		for _, decl := range fileNode.Decls {
+			fn, ok := decl.(*ast.FuncDecl)
+			if !ok || fn.Body == nil || fn.Name.Name != fnName {
+				continue
+			}
+
+			ast.Inspect(fn.Body, func(n ast.Node) bool {
+				call, ok := n.(*ast.CallExpr)
+				if !ok {
+					return true
+				}
+				sel, ok := call.Fun.(*ast.SelectorExpr)
+				if !ok || sel.Sel == nil {
+					return true
+				}
+				if sel.Sel.Name == "incrementViewCount" {
+					found = true
+					return false
+				}
+				return true
+			})
+		}
+		if !found {
+			t.Fatalf("%s must call incrementViewCount", fnName)
 		}
 	}
 }

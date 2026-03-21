@@ -153,6 +153,16 @@ type shareLinkData struct {
 	fileSubPath string
 }
 
+// incrementViewCount increments the view_count for a share link asynchronously.
+// Call this AFTER verifying the link is active, not expired, and password-verified.
+func (h *ShareLinkViewHandler) incrementViewCount(token string) {
+	go func() {
+		if err := incrementShareLinkCounterDualWrite(h.db, token, "view_count", time.Now()); err != nil {
+			log.Printf("[incrementViewCount] failed to update view_count for token %s: %v", token, err)
+		}
+	}()
+}
+
 // resolveShareLink looks up and validates a share link token from the unified share_links table.
 // When countView is true, it increments the view counter.
 func (h *ShareLinkViewHandler) resolveShareLink(token string, countView bool) (*shareLinkData, error) {
@@ -285,7 +295,7 @@ func parseShareLinkPermission(permission string) (canEdit, canDownload, canUploa
 func (h *ShareLinkViewHandler) ServeShareLinkPage(c *gin.Context) {
 	token := c.Param("token")
 
-	sl, err := h.resolveShareLink(token, true)
+	sl, err := h.resolveShareLink(token, false)
 	if err != nil {
 		c.Header("Content-Type", "text/html; charset=utf-8")
 		c.String(http.StatusNotFound, errorPageHTML("Not Found", "This share link does not exist."))
@@ -350,6 +360,7 @@ func (h *ShareLinkViewHandler) ServeShareLinkPage(c *gin.Context) {
 			c.String(http.StatusForbidden, errorPageHTML("Password Required", "This share link is password-protected."))
 			return
 		}
+		// download_count is tracked separately in handleShareLinkDownload; no view_count here
 		h.handleShareLinkDownload(c, sl, fsHelper, rootFSID)
 		return
 	}
@@ -361,11 +372,14 @@ func (h *ShareLinkViewHandler) ServeShareLinkPage(c *gin.Context) {
 			c.String(http.StatusForbidden, errorPageHTML("Password Required", "This share link is password-protected."))
 			return
 		}
+		// raw is an embedded resource request, not a page view
 		h.handleShareLinkRaw(c, sl)
 		return
 	}
 
 	// Serve the appropriate HTML page
+	// view_count is incremented inside serveSharedDirPage / serveSharedFilePage
+	// AFTER password verification, so password-prompt pages don't inflate the counter.
 	if isDir {
 		h.serveSharedDirPage(c, sl)
 	} else {
@@ -532,6 +546,13 @@ func (h *ShareLinkViewHandler) serveSharedDirPage(c *gin.Context, sl *shareLinkD
 	noPassword := sl.passwordHash == "" || passwordVerified
 	needPassword := sl.passwordHash != "" && !passwordVerified
 
+	// Count view only when the user can actually see content (no password, or already verified).
+	// If they still need to enter the password, the view will be counted on the page reload
+	// after successful password verification (cookie will be set).
+	if noPassword {
+		h.incrementViewCount(sl.token)
+	}
+
 	pageOptions := fmt.Sprintf(`{
 		"token": %q,
 		"repoID": %q,
@@ -688,6 +709,9 @@ func (h *ShareLinkViewHandler) serveSharedFilePage(c *gin.Context, sl *shareLink
 		h.servePasswordPage(c, sl.token, "d", filename)
 		return
 	}
+
+	// Password verified (or not required) — count the view now that the user can see content.
+	h.incrementViewCount(sl.token)
 
 	// Build raw file path for preview (serves actual file content with correct MIME type)
 	// For files inside a shared directory, we need /d/{token}/files/?p={path}&raw=1
@@ -1304,7 +1328,7 @@ func (h *ShareLinkViewHandler) ServeShareLinkFilePage(c *gin.Context) {
 	token := c.Param("token")
 	filePath := c.Query("p")
 
-	sl, err := h.resolveShareLink(token, true)
+	sl, err := h.resolveShareLink(token, false)
 	if err != nil {
 		c.Header("Content-Type", "text/html; charset=utf-8")
 		c.String(http.StatusNotFound, errorPageHTML("Not Found", "This share link does not exist."))
@@ -1362,17 +1386,19 @@ func (h *ShareLinkViewHandler) ServeShareLinkFilePage(c *gin.Context) {
 
 	// Handle direct download (?dl=1)
 	if c.Query("dl") == "1" {
+		// download_count is tracked separately; no view_count here
 		h.handleShareLinkDownload(c, sl, fsHelper, rootFSID)
 		return
 	}
 
 	// Handle raw file content (?raw=1)
 	if c.Query("raw") == "1" {
+		// raw is an embedded resource request, not a page view
 		h.handleShareLinkRaw(c, sl)
 		return
 	}
 
-	// Serve the file view page
+	// Serve the file view page (view_count incremented inside serveSharedFilePage)
 	h.serveSharedFilePage(c, sl)
 }
 
@@ -1581,19 +1607,33 @@ func (h *ShareLinkViewHandler) GetUploadLinkUploadURL(c *gin.Context) {
 func (h *ShareLinkViewHandler) PostUploadLinkDone(c *gin.Context) {
 	token := c.Param("token")
 
+	// Validate the upload link before incrementing counters.
+	var orgID, libraryID, createdBy, passwordHash string
+	var expiresAt *time.Time
+	var active, singleUse bool
+	var createdAt time.Time
+	err := h.db.Session().Query(`
+		SELECT org_id, library_id, created_by, password_hash, expires_at, active, single_use, created_at
+		FROM share_links WHERE link_token = ?
+	`, token).Scan(&orgID, &libraryID, &createdBy, &passwordHash, &expiresAt, &active, &singleUse, &createdAt)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "upload link not found"})
+		return
+	}
+
+	if !active {
+		c.JSON(http.StatusGone, gin.H{"error": "upload link has been disabled"})
+		return
+	}
+	if expiresAt != nil && time.Now().After(*expiresAt) {
+		c.JSON(http.StatusGone, gin.H{"error": "upload link has expired"})
+		return
+	}
+
 	// Increment upload_count or, for single-use links, delete from all tables (fire-and-forget)
 	go func() {
-		var singleUse bool
-		var orgID2, libraryID2, createdBy2 string
-		var createdAt2 time.Time
-		if err := h.db.Session().Query(
-			`SELECT single_use, org_id, library_id, created_by, created_at FROM share_links WHERE link_token = ?`,
-			token,
-		).Scan(&singleUse, &orgID2, &libraryID2, &createdBy2, &createdAt2); err != nil {
-			return // row already gone (e.g. concurrent consumption)
-		}
 		if singleUse {
-			deleteConsumedShareLink(h.db, token, orgID2, libraryID2, createdBy2, createdAt2)
+			deleteConsumedShareLink(h.db, token, orgID, libraryID, createdBy, createdAt)
 		} else {
 			now := time.Now()
 			if err := incrementShareLinkCounterDualWrite(h.db, token, "upload_count", now); err != nil {

@@ -6,6 +6,7 @@ import UserItem from './org-user-item';
 const propTypes = {
   initOrgUsersData: PropTypes.func.isRequired,
   toggleDelete: PropTypes.func.isRequired,
+  restoreUser: PropTypes.func,
   changeStatus: PropTypes.func.isRequired,
   orgUsers: PropTypes.array.isRequired,
   page: PropTypes.number.isRequired,
@@ -87,6 +88,7 @@ class OrgUsersList extends React.Component {
                   currentTab="users"
                   isItemFreezed={this.state.isItemFreezed}
                   toggleDelete={this.props.toggleDelete}
+                  restoreUser={this.props.restoreUser}
                   changeStatus={this.props.changeStatus}
                   onFreezedItem={this.onFreezedItem}
                   onUnfreezedItem={this.onUnfreezedItem}

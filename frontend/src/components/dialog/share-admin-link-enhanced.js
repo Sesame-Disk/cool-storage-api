@@ -10,6 +10,7 @@ import { changeLinkToChina } from '../../services/links';
 const propTypes = {
     link: PropTypes.string.isRequired,
     password: PropTypes.string,
+    hasPassword: PropTypes.bool,
     viewCount: PropTypes.number,
     isShareLink: PropTypes.bool, // default: false (upload link)
     toggleDialog: PropTypes.func.isRequired
@@ -55,10 +56,11 @@ class ShareAdminLinkEnhanced extends React.Component {
     };
 
     render() {
-        const { password, viewCount, toggleDialog } = this.props;
+        const { password, hasPassword: hasPasswordProp, viewCount, toggleDialog } = this.props;
         const isShareLink = this.props.isShareLink || false; // default: false (upload link)
         const { showPassword, showChinaInfo } = this.state;
-        const hasPassword = password && password.length > 0;
+        const passwordValueAvailable = !!(password && password.length > 0);
+        const hasPassword = hasPasswordProp === true || passwordValueAvailable;
 
         // Transform link to China domain if it has password (share links) or if it's an upload link
         let link = this.props.link;
@@ -120,33 +122,40 @@ class ShareAdminLinkEnhanced extends React.Component {
                                     <h6 className="text-secondary mb-2">
                                         <i className="fas fa-key"></i> {gettext('Password')}
                                     </h6>
-                                    <div className="d-flex align-items-center">
-                                        <Input
-                                            type={showPassword ? 'text' : 'password'}
-                                            value={password}
-                                            readOnly
-                                            className="flex-grow-1"
-                                            style={{ fontFamily: 'monospace', fontSize: '14px' }}
-                                        />
-                                        <Button
-                                            color="secondary"
-                                            size="sm"
-                                            className="ml-2 px-3"
-                                            onClick={this.togglePasswordVisibility}
-                                            style={{ whiteSpace: 'nowrap' }}
-                                        >
-                                            <i className={`fas fa-eye${showPassword ? '-slash' : ''}`}></i> {showPassword ? gettext('Hide') : gettext('Show')}
-                                        </Button>
-                                        <Button
-                                            color="primary"
-                                            size="sm"
-                                            className="ml-2 px-3"
-                                            onClick={this.copyPassword}
-                                            style={{ whiteSpace: 'nowrap' }}
-                                        >
-                                            <i className="fas fa-copy"></i> {gettext('Copy')}
-                                        </Button>
-                                    </div>
+                                    {passwordValueAvailable ? (
+                                        <div className="d-flex align-items-center">
+                                            <Input
+                                                type={showPassword ? 'text' : 'password'}
+                                                value={password}
+                                                readOnly
+                                                className="flex-grow-1"
+                                                style={{ fontFamily: 'monospace', fontSize: '14px' }}
+                                            />
+                                            <Button
+                                                color="secondary"
+                                                size="sm"
+                                                className="ml-2 px-3"
+                                                onClick={this.togglePasswordVisibility}
+                                                style={{ whiteSpace: 'nowrap' }}
+                                            >
+                                                <i className={`fas fa-eye${showPassword ? '-slash' : ''}`}></i> {showPassword ? gettext('Hide') : gettext('Show')}
+                                            </Button>
+                                            <Button
+                                                color="primary"
+                                                size="sm"
+                                                className="ml-2 px-3"
+                                                onClick={this.copyPassword}
+                                                style={{ whiteSpace: 'nowrap' }}
+                                            >
+                                                <i className="fas fa-copy"></i> {gettext('Copy')}
+                                            </Button>
+                                        </div>
+                                    ) : (
+                                        <div className="text-muted small p-3 bg-light rounded">
+                                            <i className="fas fa-lock mr-1"></i>
+                                            {gettext('This link is password protected, but the password value is not available in this admin view.')}
+                                        </div>
+                                    )}
                                 </div>
                             )}
 
@@ -213,7 +222,7 @@ class ShareAdminLinkEnhanced extends React.Component {
                             </div>
                         </div>
                         <div className="modal-footer">
-                            {hasPassword && (
+                            {passwordValueAvailable && (
                                 <Button color="success" onClick={this.copyLinkAndPassword} className="px-4">
                                     <i className="fas fa-clipboard-check"></i> {gettext('Copy Link & Password')}
                                 </Button>

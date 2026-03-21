@@ -193,6 +193,7 @@ class Item extends Component {
           <ShareAdminLinkEnhanced
             link={item.link}
             password={item.password}
+            hasPassword={item.has_password === true}
             viewCount={item.view_cnt}
             toggleDialog={this.toggleLinkDialog}
           />

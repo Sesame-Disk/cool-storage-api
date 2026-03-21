@@ -101,6 +101,8 @@ func RegisterOrgAdminRoutes(rg *gin.RouterGroup, database *db.DB, cfg *config.Co
 		idGroup.PUT("/users/:email", h.UpdateOrgUser)
 		idGroup.DELETE("/users/:email/", h.DeleteOrgUser)
 		idGroup.DELETE("/users/:email", h.DeleteOrgUser)
+		idGroup.PUT("/users/:email/restore/", h.RestoreOrgUser)
+		idGroup.PUT("/users/:email/restore", h.RestoreOrgUser)
 		idGroup.PUT("/users/:email/set-password/", h.ResetOrgUserPassword)
 		idGroup.PUT("/users/:email/set-password", h.ResetOrgUserPassword)
 		idGroup.GET("/users/:email/repos/", h.GetOrgUserOwnedRepos)
@@ -316,6 +318,7 @@ type orgUserRow struct {
 	Email        string `json:"email"`
 	Name         string `json:"name"`
 	ContactEmail string `json:"owner_contact_email"`
+	Status       string `json:"status"`
 	IsActive     bool   `json:"is_active"`
 	IsOrgStaff   bool   `json:"is_org_staff"`
 	Role         string `json:"role"`
@@ -328,12 +331,14 @@ type orgUserRow struct {
 }
 
 func buildOrgUserRow(email, name, role, status, orgID string, quota, used int64, created time.Time) orgUserRow {
+	canonicalStatus := normalizeUserStatus(status)
 	return orgUserRow{
 		ID:           email, // Seafile uses email as user ID in org-admin context
 		Email:        email,
 		Name:         name,
 		ContactEmail: "",
-		IsActive:     IsUserUsable(status),
+		Status:       canonicalStatus,
+		IsActive:     canonicalStatus == StatusActive,
 		IsOrgStaff:   role == "admin" || role == "superadmin",
 		Role:         role,
 		QuotaTotal:   quota,
@@ -452,6 +457,11 @@ func (h *OrgAdminHandler) ListOrgUsers(c *gin.Context) {
 		return
 	}
 
+	statusFilter, ok := parseUserStatusFilter(c)
+	if !ok {
+		return
+	}
+
 	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
 	perPage, _ := strconv.Atoi(c.DefaultQuery("per_page", "25"))
 	if page < 1 {
@@ -474,6 +484,9 @@ func (h *OrgAdminHandler) ListOrgUsers(c *gin.Context) {
 
 	for iter.Scan(&userID, &email, &name, &role, &status, &quota, &used, &created) {
 		if isStaffOnly && role != "admin" && role != "superadmin" {
+			continue
+		}
+		if !userMatchesStatusFilter(status, statusFilter) {
 			continue
 		}
 		all = append(all, buildOrgUserRow(email, name, role, status, targetOrgID, quota, used, created))
@@ -627,6 +640,16 @@ func (h *OrgAdminHandler) UpdateOrgUser(c *gin.Context) {
 
 	// seafile-js sends FormData for all org-admin user updates.
 	// Fields: is_active, is_staff, name, contact_email, quota_total
+	hasMutatingFields := c.Request.FormValue("is_active") != "" ||
+		c.Request.FormValue("is_staff") != "" ||
+		c.Request.FormValue("name") != "" ||
+		c.Request.FormValue("contact_email") != "" ||
+		c.Request.FormValue("quota_total") != ""
+	if normalizeUserStatus(status) == StatusDeleted && hasMutatingFields {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "deleted users must be restored before modification"})
+		return
+	}
+
 	if v := c.Request.FormValue("is_active"); v != "" {
 		if v == "false" {
 			if err := deactivateUser(h.db, h.sessions, targetOrgID, userID); err != nil {
@@ -715,6 +738,40 @@ func (h *OrgAdminHandler) DeleteOrgUser(c *gin.Context) {
 	// Soft-delete: mark as "deleted" with timestamp for grace period cascade
 	if err := softDeleteUser(h.db, h.sessions, targetOrgID, userID, time.Now()); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete user"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true})
+}
+
+// RestoreOrgUser restores a soft-deleted user within the caller's org.
+// PUT /org/:org_id/admin/users/:email/restore/
+func (h *OrgAdminHandler) RestoreOrgUser(c *gin.Context) {
+	targetOrgID := c.Param("org_id")
+	email := c.Param("email")
+	if err := h.requireOrgAccess(c, targetOrgID); err != nil {
+		return
+	}
+
+	userID, err := h.lookupOrgUserByEmail(targetOrgID, email)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "user not found"})
+		return
+	}
+
+	var currentStatus string
+	if err := h.db.Session().Query(`
+		SELECT status FROM users WHERE org_id = ? AND user_id = ?
+	`, targetOrgID, userID).Scan(&currentStatus); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to fetch user"})
+		return
+	}
+	if normalizeUserStatus(currentStatus) != StatusDeleted {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "user is not in deleted state"})
+		return
+	}
+
+	if err := activateUser(h.db, targetOrgID, userID); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to restore user"})
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"success": true})
@@ -864,9 +921,33 @@ func (h *OrgAdminHandler) SearchOrgUser(c *gin.Context) {
 		return
 	}
 
+	statusFilter, ok := parseUserStatusFilter(c)
+	if !ok {
+		return
+	}
+
+	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
+	perPage, _ := strconv.Atoi(c.DefaultQuery("per_page", "25"))
+	if page < 1 {
+		page = 1
+	}
+	if perPage < 1 || perPage > 100 {
+		perPage = 25
+	}
+
 	query := strings.ToLower(strings.TrimSpace(c.Query("query")))
 	if query == "" {
-		c.JSON(http.StatusOK, gin.H{"users": []orgUserRow{}})
+		empty := []orgUserRow{}
+		c.JSON(http.StatusOK, gin.H{
+			"user_list":   empty,
+			"page":        page,
+			"page_next":   false,
+			"total_count": 0,
+			"page_info": gin.H{
+				"current_page":  page,
+				"has_next_page": false,
+			},
+		})
 		return
 	}
 
@@ -881,6 +962,9 @@ func (h *OrgAdminHandler) SearchOrgUser(c *gin.Context) {
 	var created time.Time
 
 	for iter.Scan(&userID, &email, &name, &role, &status, &quota, &used, &created) {
+		if !userMatchesStatusFilter(status, statusFilter) {
+			continue
+		}
 		if strings.Contains(strings.ToLower(email), query) || strings.Contains(strings.ToLower(name), query) {
 			results = append(results, buildOrgUserRow(email, name, role, status, targetOrgID, quota, used, created))
 		}
@@ -890,7 +974,31 @@ func (h *OrgAdminHandler) SearchOrgUser(c *gin.Context) {
 	if results == nil {
 		results = []orgUserRow{}
 	}
-	c.JSON(http.StatusOK, gin.H{"users": results})
+
+	total := len(results)
+	start := (page - 1) * perPage
+	if start > total {
+		start = total
+	}
+	end := start + perPage
+	if end > total {
+		end = total
+	}
+	pageData := results[start:end]
+	if pageData == nil {
+		pageData = []orgUserRow{}
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"user_list":   pageData,
+		"page":        page,
+		"page_next":   end < total,
+		"total_count": total,
+		"page_info": gin.H{
+			"current_page":  page,
+			"has_next_page": end < total,
+		},
+	})
 }
 
 // ImportOrgUsers bulk-creates users from an uploaded CSV file.
@@ -2723,21 +2831,40 @@ func (h *OrgAdminHandler) ListOrgLinks(c *gin.Context) {
 	if page < 1 {
 		page = 1
 	}
-	perPage := 25
+	perPage, _ := strconv.Atoi(c.DefaultQuery("per_page", "25"))
+	if perPage < 1 || perPage > 100 {
+		perPage = 25
+	}
+
+	expiredParam := strings.TrimSpace(strings.ToLower(c.DefaultQuery("expired", "")))
+	hasExpiredFilter := false
+	expiredFilter := false
+	if expiredParam != "" && expiredParam != "all" {
+		parsed, err := strconv.ParseBool(expiredParam)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid expired filter"})
+			return
+		}
+		hasExpiredFilter = true
+		expiredFilter = parsed
+	}
 
 	// Single-partition query on share_links_by_org — no more iterating users
 	userCache := make(map[string][2]string) // createdBy -> [email, name]
+	libNameCache := make(map[string]string)
 	var links []gin.H
 	iter := h.db.Session().Query(`
-		SELECT link_token, link_type, library_id, file_path, created_by, view_count, created_at
+		SELECT link_token, link_type, library_id, file_path, created_by, permission, expires_at, has_password, active, view_count, created_at
 		FROM share_links_by_org WHERE org_id = ?
 	`, orgID).Iter()
 
-	var token, linkType, libID, filePath, createdBy string
+	var token, linkType, libID, filePath, createdBy, permission string
+	var expiresAt *time.Time
+	var hasPassword, active bool
 	var viewCount *int
 	var createdAt time.Time
 
-	for iter.Scan(&token, &linkType, &libID, &filePath, &createdBy, &viewCount, &createdAt) {
+	for iter.Scan(&token, &linkType, &libID, &filePath, &createdBy, &permission, &expiresAt, &hasPassword, &active, &viewCount, &createdAt) {
 		if linkType != "share" {
 			continue
 		}
@@ -2760,11 +2887,36 @@ func (h *OrgAdminHandler) ListOrgLinks(c *gin.Context) {
 			linkName = filePath[idx+1:]
 		}
 		if linkName == "" || linkName == "/" {
-			var libName string
-			h.db.Session().Query(`SELECT name FROM libraries WHERE org_id = ? AND library_id = ?`, orgID, libID).Scan(&libName)
+			libName, ok := libNameCache[libID]
+			if !ok {
+				h.db.Session().Query(`SELECT name FROM libraries WHERE org_id = ? AND library_id = ?`, orgID, libID).Scan(&libName)
+				if libName == "" {
+					libName = "Unknown Library"
+				}
+				libNameCache[libID] = libName
+			}
 			if libName != "" {
 				linkName = libName
 			}
+		}
+
+		repoName, ok := libNameCache[libID]
+		if !ok {
+			h.db.Session().Query(`SELECT name FROM libraries WHERE org_id = ? AND library_id = ?`, orgID, libID).Scan(&repoName)
+			if repoName == "" {
+				repoName = "Unknown Library"
+			}
+			libNameCache[libID] = repoName
+		}
+
+		isExpired := false
+		expireDateStr := ""
+		if expiresAt != nil && !expiresAt.IsZero() {
+			isExpired = expiresAt.Before(time.Now())
+			expireDateStr = expiresAt.Format(time.RFC3339)
+		}
+		if hasExpiredFilter && isExpired != expiredFilter {
+			continue
 		}
 
 		linkURL := fmt.Sprintf("%s/d/%s", getBrowserURL(c, ""), token)
@@ -2773,21 +2925,48 @@ func (h *OrgAdminHandler) ListOrgLinks(c *gin.Context) {
 			count = *viewCount
 		}
 
+		perms := parsePermsJSON(permission)
+		status := "active"
+		if !active {
+			status = "inactive"
+		}
+
 		links = append(links, gin.H{
-			"token":        token,
-			"name":         linkName,
-			"link":         linkURL,
-			"owner_email":  info[0],
-			"owner_name":   info[1],
-			"created_time": createdAt.Format(time.RFC3339),
-			"view_count":   count,
+			"obj_name":      linkName,
+			"name":          linkName,
+			"path":          filePath,
+			"token":         token,
+			"link":          linkURL,
+			"repo_id":       libID,
+			"repo_name":     repoName,
+			"owner_email":   info[0],
+			"owner_name":    info[1],
+			"creator_email": info[0],
+			"creator_name":  info[1],
+			"created_time":  createdAt.Format(time.RFC3339),
+			"ctime":         createdAt.Format(time.RFC3339),
+			"view_count":    count,
+			"view_cnt":      count,
+			"expire_date":   expireDateStr,
+			"is_expired":    isExpired,
+			"active":        active,
+			"status":        status,
+			"has_password":  hasPassword,
+			"permissions":   gin.H{"can_download": perms.CanDownload, "can_edit": perms.CanEdit},
 		})
 	}
-	iter.Close()
+	if err := iter.Close(); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list links"})
+		return
+	}
 
 	if links == nil {
 		links = []gin.H{}
 	}
+
+	sortBy := c.DefaultQuery("order_by", "")
+	direction := c.DefaultQuery("direction", "asc")
+	sortAdminLinks(links, sortBy, direction)
 
 	// Paginate
 	total := len(links)
@@ -2804,6 +2983,7 @@ func (h *OrgAdminHandler) ListOrgLinks(c *gin.Context) {
 		"link_list": links[start:end],
 		"page":      page,
 		"page_next": end < total,
+		"count":     total,
 	})
 }
 
@@ -2865,22 +3045,40 @@ func (h *OrgAdminHandler) ListOrgUploadLinks(c *gin.Context) {
 	if page < 1 {
 		page = 1
 	}
-	perPage := 25
+	perPage, _ := strconv.Atoi(c.DefaultQuery("per_page", "25"))
+	if perPage < 1 || perPage > 100 {
+		perPage = 25
+	}
+
+	expiredParam := strings.TrimSpace(strings.ToLower(c.DefaultQuery("expired", "")))
+	hasExpiredFilter := false
+	expiredFilter := false
+	if expiredParam != "" && expiredParam != "all" {
+		parsed, err := strconv.ParseBool(expiredParam)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid expired filter"})
+			return
+		}
+		hasExpiredFilter = true
+		expiredFilter = parsed
+	}
 
 	// Single-partition query on share_links_by_org
 	userCache := make(map[string][2]string)
+	libNameCache := make(map[string]string)
 	var links []gin.H
 	iter := h.db.Session().Query(`
-		SELECT link_token, link_type, library_id, file_path, created_by, expires_at, upload_count, created_at
+		SELECT link_token, link_type, library_id, file_path, created_by, expires_at, active, has_password, upload_count, created_at
 		FROM share_links_by_org WHERE org_id = ?
 	`, orgID).Iter()
 
 	var token, linkType, libID, filePath, createdBy string
 	var expiresAt *time.Time
+	var active, hasPassword bool
 	var uploadCount *int
 	var createdAt time.Time
 
-	for iter.Scan(&token, &linkType, &libID, &filePath, &createdBy, &expiresAt, &uploadCount, &createdAt) {
+	for iter.Scan(&token, &linkType, &libID, &filePath, &createdBy, &expiresAt, &active, &hasPassword, &uploadCount, &createdAt) {
 		if linkType != "upload" {
 			continue
 		}
@@ -2908,14 +3106,28 @@ func (h *OrgAdminHandler) ListOrgUploadLinks(c *gin.Context) {
 			isExpired = expiresAt.Before(time.Now())
 			expireDateStr = expiresAt.Format(time.RFC3339)
 		}
+		if hasExpiredFilter && isExpired != expiredFilter {
+			continue
+		}
 
-		var repoName string
-		h.db.Session().Query(`SELECT name FROM libraries WHERE org_id = ? AND library_id = ?`, orgID, libID).Scan(&repoName)
+		repoName, ok := libNameCache[libID]
+		if !ok {
+			h.db.Session().Query(`SELECT name FROM libraries WHERE org_id = ? AND library_id = ?`, orgID, libID).Scan(&repoName)
+			if repoName == "" {
+				repoName = "Unknown Library"
+			}
+			libNameCache[libID] = repoName
+		}
 
 		uploadLinkURL := fmt.Sprintf("%s/u/d/%s", getBrowserURL(c, ""), token)
 		count := 0
 		if uploadCount != nil {
 			count = *uploadCount
+		}
+
+		status := "active"
+		if !active {
+			status = "inactive"
 		}
 
 		links = append(links, gin.H{
@@ -2931,13 +3143,23 @@ func (h *OrgAdminHandler) ListOrgUploadLinks(c *gin.Context) {
 			"view_cnt":      count,
 			"expire_date":   expireDateStr,
 			"is_expired":    isExpired,
+			"active":        active,
+			"status":        status,
+			"has_password":  hasPassword,
 		})
 	}
-	iter.Close()
+	if err := iter.Close(); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list upload links"})
+		return
+	}
 
 	if links == nil {
 		links = []gin.H{}
 	}
+
+	sortBy := c.DefaultQuery("order_by", "")
+	direction := c.DefaultQuery("direction", "asc")
+	sortAdminLinks(links, sortBy, direction)
 
 	total := len(links)
 	start := (page - 1) * perPage

@@ -25,8 +25,12 @@ class OrgUsersSearchUsersResult extends React.Component {
     this.setState({ isItemFreezed: false });
   };
 
+  toggleItemFreezed = (isFreezed) => {
+    this.setState({ isItemFreezed: isFreezed });
+  };
+
   render() {
-    let { orgUsers, changeStatus } = this.props;
+    let { orgUsers, changeStatus, restoreUser } = this.props;
     return (
       <div className="cur-view-content">
         <table>
@@ -50,8 +54,10 @@ class OrgUsersSearchUsersResult extends React.Component {
                   currentTab="users"
                   isItemFreezed={this.state.isItemFreezed}
                   toggleDelete={this.props.toggleDelete}
+                  restoreUser={restoreUser}
                   onFreezedItem={this.onFreezedItem}
                   onUnfreezedItem={this.onUnfreezedItem}
+                  toggleItemFreezed={this.toggleItemFreezed}
                   changeStatus={changeStatus}
                 />
               );
@@ -65,6 +71,7 @@ class OrgUsersSearchUsersResult extends React.Component {
 
 OrgUsersSearchUsersResult.propTypes = {
   toggleDelete: PropTypes.func.isRequired,
+  restoreUser: PropTypes.func,
   orgUsers: PropTypes.array.isRequired,
   changeStatus: PropTypes.func.isRequired,
 };
@@ -77,9 +84,16 @@ class OrgUsersSearchUsers extends Component {
       query: '',
       orgUsers: [],
       org_id: '',
+      statusFilter: 'all',
       isSubmitBtnActive: false,
       loading: true,
       errorMsg: '',
+      currentPage: 1,
+      perPage: 25,
+      pageInfo: {
+        current_page: 1,
+        has_next_page: false,
+      },
     };
   }
 
@@ -87,32 +101,38 @@ class OrgUsersSearchUsers extends Component {
     let params = (new URL(document.location)).searchParams;
     this.setState({
       query: params.get('query') || '',
-    }, () => { this.getItems(); });
+      statusFilter: params.get('status') || 'all',
+      currentPage: parseInt(params.get('page') || 1),
+      perPage: parseInt(params.get('per_page') || 25)
+    }, () => { this.getItems(this.state.currentPage); });
   }
 
-  getItems = () => {
-    seafileAPI.orgAdminSearchUser(orgID, this.state.query.trim()).then(res => {
-      let userList = res.data.user_list.map(item => {
+  getItems = (page = 1) => {
+    seafileAPI.orgAdminSearchUser(orgID, this.state.query.trim(), page, this.state.perPage, this.state.statusFilter).then(res => {
+      let userList = (res.data.user_list || []).map(item => {
         return new OrgUserInfo(item);
       });
       this.setState({
         orgUsers: userList,
         loading: false,
+        currentPage: page,
+        pageInfo: res.data.page_info || {
+          current_page: res.data.page || page,
+          has_next_page: res.data.page_next || false,
+        }
       });
     }).catch((error) => {
       this.setState({
         loading: false,
-        errorMsg: Utils.getErrorMsg(error, true) // true: show login tip if 403
+        errorMsg: Utils.getErrorMsg(error, true)
       });
     });
   };
 
   deleteUser = (email, username) => {
-    seafileAPI.orgAdminDeleteOrgUser(orgID, email).then(res => {
-      let newUserList = this.state.orgUsers.filter(item => {
-        return item.email !== email;
-      });
-      this.setState({ orgUsers: newUserList });
+    seafileAPI.orgAdminDeleteOrgUser(orgID, email).then(() => {
+      const targetPage = this.state.orgUsers.length === 1 && this.state.currentPage > 1 ? this.state.currentPage - 1 : this.state.currentPage;
+      this.getItems(targetPage);
       let msg = gettext('Deleted user %s');
       msg = msg.replace('%s', username);
       toaster.success(msg);
@@ -122,17 +142,11 @@ class OrgUsersSearchUsers extends Component {
     });
   };
 
-  updateUser = (email, key, value) => {
-    seafileAPI.sysAdminUpdateUser(email, key, value).then(res => {
-      let newUserList = this.state.orgUsers.map(item => {
-        if (item.email === email) {
-          item[key] = res.data[key];
-        }
-        return item;
-      });
-      this.setState({ orgUsers: newUserList });
-      const msg = (key === 'is_active' && value) ?
-        res.data.update_status_tip : gettext('Edit succeeded');
+  restoreUser = (email, username) => {
+    seafileAPI.orgAdminRestoreOrgUser(orgID, email).then(() => {
+      this.getItems(this.state.currentPage);
+      let msg = gettext('Restored user %s');
+      msg = msg.replace('%s', username);
       toaster.success(msg);
     }).catch((error) => {
       let errMessage = Utils.getErrorMsg(error);
@@ -157,9 +171,26 @@ class OrgUsersSearchUsers extends Component {
     if (e.keyCode === 13) {
       const { isSubmitBtnActive } = this.state;
       if (isSubmitBtnActive) {
-        this.getItems();
+        this.getItems(1);
       }
     }
+  };
+
+  getPreviousPageList = () => {
+    this.getItems(this.state.pageInfo.current_page - 1);
+  };
+
+  getNextPageList = () => {
+    this.getItems(this.state.pageInfo.current_page + 1);
+  };
+
+  setStatusFilter = (statusFilter) => {
+    this.setState({
+      statusFilter,
+      currentPage: 1
+    }, () => {
+      this.getItems(1);
+    });
   };
 
   changeStatus = (email, isActive) => {
@@ -167,6 +198,7 @@ class OrgUsersSearchUsers extends Component {
       let users = this.state.orgUsers.map(item => {
         if (item.email === email) {
           item['is_active'] = res.data['is_active'];
+          item['status'] = res.data['status'];
         }
         return item;
       });
@@ -199,18 +231,45 @@ class OrgUsersSearchUsers extends Component {
                   </FormGroup>
                   <FormGroup row>
                     <Col sm={{ size: 5 }}>
-                      <button className="btn btn-outline-primary" disabled={!isSubmitBtnActive} onClick={this.getItems}>{gettext('Submit')}</button>
+                      <button className="btn btn-outline-primary" disabled={!isSubmitBtnActive} onClick={() => this.getItems(1)}>{gettext('Submit')}</button>
                     </Col>
                   </FormGroup>
                 </Form>
               </div>
               <div className="mt-4 mb-6">
                 <h4 className="border-bottom font-weight-normal mb-2 pb-1">{gettext('Result')}</h4>
+                <div className="d-flex align-items-center mb-3">
+                  <span className="mr-2">{gettext('Status')}</span>
+                  {['all', 'active', 'deactivated', 'deleted'].map(status => {
+                    const isStatusSelected = this.state.statusFilter === status;
+                    const labelMap = {
+                      all: gettext('All'),
+                      active: gettext('Active'),
+                      deactivated: gettext('Inactive'),
+                      deleted: gettext('Deleted')
+                    };
+                    return (
+                      <button
+                        key={status}
+                        className={`btn btn-sm mr-2 ${isStatusSelected ? 'btn-primary' : 'btn-outline-secondary'}`}
+                        onClick={() => this.setStatusFilter(status)}
+                      >
+                        {labelMap[status]}
+                      </button>
+                    );
+                  })}
+                </div>
                 <OrgUsersSearchUsersResult
                   toggleDelete={this.deleteUser}
+                  restoreUser={this.restoreUser}
                   changeStatus={this.changeStatus}
                   orgUsers={this.state.orgUsers}
                 />
+                <div className="paginator">
+                  {this.state.pageInfo.current_page > 1 && <a href="#" onClick={(e) => { e.preventDefault(); this.getPreviousPageList(); }}>{gettext('Previous')}</a>}
+                  {(this.state.pageInfo.current_page > 1 && this.state.pageInfo.has_next_page) && <span> | </span>}
+                  {this.state.pageInfo.has_next_page && <a href="#" onClick={(e) => { e.preventDefault(); this.getNextPageList(); }}>{gettext('Next')}</a>}
+                </div>
               </div>
             </div>
           </div>

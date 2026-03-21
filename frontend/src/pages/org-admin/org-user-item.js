@@ -14,9 +14,10 @@ const propTypes = {
   toggleRevokeAdmin: PropTypes.func,
   isItemFreezed: PropTypes.bool.isRequired,
   toggleDelete: PropTypes.func.isRequired,
+  restoreUser: PropTypes.func,
   onFreezedItem: PropTypes.func.isRequired,
   onUnfreezedItem: PropTypes.func.isRequired,
-  toggleItemFreezed: PropTypes.func.isRequired,
+  toggleItemFreezed: PropTypes.func,
   changeStatus: PropTypes.func.isRequired,
 };
 
@@ -27,7 +28,9 @@ class UserItem extends React.Component {
     this.state = {
       highlight: false,
       showMenu: false,
-      isItemMenuShow: false
+      isItemMenuShow: false,
+      isConfirmInactiveDialogOpen: false,
+      isRestoreUserDialogOpen: false
     };
   }
 
@@ -75,6 +78,11 @@ class UserItem extends React.Component {
   toggleRevokeAdmin = () => {
     const email = this.props.user.email;
     this.props.toggleRevokeAdmin(email);
+  };
+
+  restoreUser = () => {
+    const { email, name } = this.props.user;
+    this.props.restoreUser(email, name);
   };
 
   changeStatus = (statusOption) => {
@@ -127,8 +135,11 @@ class UserItem extends React.Component {
     switch (status) {
       case 'active':
         return gettext('Active');
+      case 'deactivated':
       case 'inactive':
         return gettext('Inactive');
+      case 'deleted':
+        return gettext('Deleted');
     }
   };
 
@@ -136,15 +147,68 @@ class UserItem extends React.Component {
     this.setState({ isConfirmInactiveDialogOpen: !this.state.isConfirmInactiveDialogOpen });
   };
 
+  toggleRestoreUserDialog = () => {
+    this.setState({ isRestoreUserDialogOpen: !this.state.isRestoreUserDialogOpen });
+  };
+
+  getMenuOperations = () => {
+    const { currentTab, user } = this.props;
+    if (user.status === 'deleted') {
+      return ['Restore'];
+    }
+
+    const operations = ['Delete', 'ResetPwd'];
+    if (currentTab === 'admins') {
+      operations.push('Revoke Admin');
+    }
+    return operations;
+  };
+
+  translateOperation = (operation) => {
+    switch (operation) {
+      case 'Delete':
+        return gettext('Delete');
+      case 'ResetPwd':
+        return gettext('ResetPwd');
+      case 'Revoke Admin':
+        return gettext('Revoke Admin');
+      case 'Restore':
+        return gettext('Restore');
+      default:
+        return operation;
+    }
+  };
+
+  onMenuItemClick = (operation) => {
+    switch (operation) {
+      case 'Delete':
+        this.toggleDelete();
+        break;
+      case 'ResetPwd':
+        this.toggleResetPW();
+        break;
+      case 'Revoke Admin':
+        this.toggleRevokeAdmin();
+        break;
+      case 'Restore':
+        this.toggleRestoreUserDialog();
+        break;
+      default:
+        break;
+    }
+  };
+
   render() {
-    const { highlight, isConfirmInactiveDialogOpen } = this.state;
+    const { highlight, isConfirmInactiveDialogOpen, isRestoreUserDialogOpen } = this.state;
     let { user, currentTab } = this.props;
     let href = siteRoot + 'org/useradmin/info/' + encodeURIComponent(user.email) + '/';
     let isOperationMenuShow = (user.email !== username) && this.state.showMenu;
+    const effectiveStatus = user.status || (user.is_active ? 'active' : 'deactivated');
+    const isDeleted = effectiveStatus === 'deleted';
 
     // for 'user status'
-    const curStatus = user.is_active ? 'active' : 'inactive';
-    this.statusOptions = ['active', 'inactive'].map(item => {
+    const curStatus = effectiveStatus === 'active' ? 'active' : 'deactivated';
+    this.statusOptions = ['active', 'deactivated'].map(item => {
       return {
         value: item,
         text: this.translateStatus(item),
@@ -155,6 +219,8 @@ class UserItem extends React.Component {
 
     const itemName = '<span class="op-target">' + Utils.HTMLescape(user.name) + '</span>';
     const confirmSetUserInactiveMsg = gettext('Are you sure you want to set {user_placeholder} inactive?').replace('{user_placeholder}', itemName);
+    const restoreUserDialogMsg = gettext('Are you sure you want to restore {placeholder} ?').replace('{placeholder}', itemName);
+    const menuOperations = this.getMenuOperations();
 
     return (
       <>
@@ -163,14 +229,18 @@ class UserItem extends React.Component {
             <a href={href}>{user.name}</a>
           </td>
           <td>
-            <Selector
-              isDropdownToggleShown={highlight}
-              currentSelectedOption={currentSelectedStatusOption}
-              options={this.statusOptions}
-              selectOption={this.changeStatus}
-              toggleItemFreezed={this.props.toggleItemFreezed}
-              operationBeforeSelect={user.is_active ? this.toggleConfirmInactiveDialog : undefined}
-            />
+            {isDeleted ?
+              <span className="badge badge-danger">{gettext('Deleted')}</span>
+              :
+              <Selector
+                isDropdownToggleShown={highlight}
+                currentSelectedOption={currentSelectedStatusOption}
+                options={this.statusOptions}
+                selectOption={this.changeStatus}
+                toggleItemFreezed={this.props.toggleItemFreezed}
+                operationBeforeSelect={effectiveStatus === 'active' ? this.toggleConfirmInactiveDialog : undefined}
+              />
+            }
           </td>
           <td>{`${Utils.formatSize({ bytes: user.quota_usage })} / ${this.getQuotaTotal(user.quota_total)}`}</td>
           <td>
@@ -191,9 +261,9 @@ class UserItem extends React.Component {
                   onClick={this.onDropdownToggleClick}
                 />
                 <DropdownMenu>
-                  <DropdownItem onClick={this.toggleDelete}>{gettext('Delete')}</DropdownItem>
-                  <DropdownItem onClick={this.toggleResetPW}>{gettext('ResetPwd')}</DropdownItem>
-                  {currentTab === 'admins' && <DropdownItem onClick={this.toggleRevokeAdmin}>{gettext('Revoke Admin')}</DropdownItem>}
+                  {menuOperations.map((operation, index) => (
+                    <DropdownItem key={index} onClick={() => this.onMenuItemClick(operation)}>{this.translateOperation(operation)}</DropdownItem>
+                  ))}
                 </DropdownMenu>
               </Dropdown>
             )}
@@ -206,6 +276,15 @@ class UserItem extends React.Component {
             executeOperation={this.setUserInactive}
             confirmBtnText={gettext('Set')}
             toggleDialog={this.toggleConfirmInactiveDialog}
+          />
+        }
+        {isRestoreUserDialogOpen &&
+          <CommonOperationConfirmationDialog
+            title={gettext('Restore User')}
+            message={restoreUserDialogMsg}
+            executeOperation={this.restoreUser}
+            confirmBtnText={gettext('Restore')}
+            toggleDialog={this.toggleRestoreUserDialog}
           />
         }
       </>

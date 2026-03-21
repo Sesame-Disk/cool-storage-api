@@ -4,247 +4,37 @@ import { Utils } from '../../../utils/utils';
 import { seafileAPI } from '../../../utils/seafile-api';
 import { gettext } from '../../../utils/constants';
 import toaster from '../../../components/toast';
-import EmptyTip from '../../../components/empty-tip';
-import Loading from '../../../components/loading';
-import OpMenu from '../../../components/dialog/op-menu';
-import LinkDialog from '../../../components/dialog/share-admin-link';
 import MainPanelTopbar from '../main-panel-topbar';
+import LinksContent from '../links/links-table';
 import Nav from './user-nav';
-
-class Content extends Component {
-
-  constructor(props) {
-    super(props);
-    this.state = {
-      isItemFreezed: false
-    };
-  }
-
-  onFreezedItem = () => {
-    this.setState({ isItemFreezed: true });
-  };
-
-  onUnfreezedItem = () => {
-    this.setState({ isItemFreezed: false });
-  };
-
-  render() {
-    const { loading, errorMsg, items } = this.props;
-    if (loading) {
-      return <Loading />;
-    } else if (errorMsg) {
-      return <p className="error text-center mt-4">{errorMsg}</p>;
-    } else {
-      const emptyTip = (
-        <EmptyTip>
-          <h2>{gettext('No shared links')}</h2>
-        </EmptyTip>
-      );
-      const table = (
-        <Fragment>
-          <table>
-            <thead>
-              <tr>
-                <th width="5%">{/* icon */}</th>
-                <th width="30%">{gettext('Name')}</th>
-                <th width="20%">{gettext('Size')}</th>
-                <th width="20%">{gettext('Type')}</th>
-                <th width="20%">{gettext('Visits')}</th>
-                <th width="5%">{/* Operations */}</th>
-              </tr>
-            </thead>
-            <tbody>
-              {items.map((item, index) => {
-                return (<Item
-                  key={index}
-                  item={item}
-                  isItemFreezed={this.state.isItemFreezed}
-                  onFreezedItem={this.onFreezedItem}
-                  onUnfreezedItem={this.onUnfreezedItem}
-                  deleteItem={this.props.deleteItem}
-                />);
-              })}
-            </tbody>
-          </table>
-        </Fragment>
-      );
-      return items.length ? table : emptyTip;
-    }
-  }
-}
-
-Content.propTypes = {
-  loading: PropTypes.bool.isRequired,
-  errorMsg: PropTypes.string.isRequired,
-  items: PropTypes.array.isRequired,
-  deleteItem: PropTypes.func,
-  email: PropTypes.string,
-};
-
-class Item extends Component {
-
-  constructor(props) {
-    super(props);
-    this.state = {
-      isOpIconShown: false,
-      highlight: false,
-      isLinkDialogOpen: false
-    };
-  }
-
-  handleMouseEnter = () => {
-    if (!this.props.isItemFreezed) {
-      this.setState({
-        isOpIconShown: true,
-        highlight: true
-      });
-    }
-  };
-
-  handleMouseLeave = () => {
-    if (!this.props.isItemFreezed) {
-      this.setState({
-        isOpIconShown: false,
-        highlight: false
-      });
-    }
-  };
-
-  onUnfreezedItem = () => {
-    this.setState({
-      highlight: false,
-      isOpIconShow: false
-    });
-    this.props.onUnfreezedItem();
-  };
-
-  toggleLinkDialog = () => {
-    this.setState({ isLinkDialogOpen: !this.state.isLinkDialogOpen });
-  };
-
-  deleteItem = () => {
-    this.props.deleteItem(this.props.item);
-  };
-
-  translateOperations = (item) => {
-    let translateResult = '';
-    switch (item) {
-      case 'View':
-        translateResult = gettext('View');
-        break;
-      case 'Delete':
-        translateResult = gettext('Delete');
-        break;
-    }
-
-    return translateResult;
-  };
-
-  onMenuItemClick = (operation) => {
-    switch (operation) {
-      case 'View':
-        this.toggleLinkDialog();
-        break;
-      case 'Delete':
-        this.deleteItem();
-        break;
-    }
-  };
-
-  getRoleText = () => {
-    let roleText;
-    const { item } = this.props;
-    switch (item.role) {
-      case 'Owner':
-        roleText = gettext('Owner');
-        break;
-      case 'Admin':
-        roleText = gettext('Admin');
-        break;
-      case 'Member':
-        roleText = gettext('Member');
-        break;
-    }
-    return roleText;
-  };
-
-  getIconUrl = () => {
-    const { item } = this.props;
-    let url;
-    if (item.type === 'upload') {
-      url = Utils.getFolderIconUrl();
-    } else { // share link
-      if (item.is_dir) {
-        url = Utils.getFolderIconUrl();
-      } else {
-        url = Utils.getFileIconUrl(item.obj_name);
-      }
-    }
-    return url;
-  };
-
-  render() {
-    const { item } = this.props;
-    const { isOpIconShown, isLinkDialogOpen } = this.state;
-
-    return (
-      <Fragment>
-        <tr className={this.state.highlight ? 'tr-highlight' : ''} onMouseEnter={this.handleMouseEnter} onMouseLeave={this.handleMouseLeave}>
-          <td><img src={this.getIconUrl()} alt="" width="24" /></td>
-          <td>{item.obj_name === '/' ? item.repo_name : item.obj_name}</td>
-          {item.type === 'upload' ?
-            <Fragment>
-              <td></td>
-              <td>{gettext('Upload')}</td>
-            </Fragment> :
-            <Fragment>
-              <td>{item.is_dir ? null : Utils.bytesToSize(item.size)}</td>
-              <td>{gettext('Download')}</td>
-            </Fragment>
-          }
-          <td>{item.view_cnt}</td>
-          <td>
-            {isOpIconShown &&
-              <OpMenu
-                operations={['View', 'Delete']}
-                translateOperations={this.translateOperations}
-                onMenuItemClick={this.onMenuItemClick}
-                onFreezedItem={this.props.onFreezedItem}
-                onUnfreezedItem={this.onUnfreezedItem}
-              />
-            }
-          </td>
-        </tr>
-        {isLinkDialogOpen &&
-          <LinkDialog
-            link={item.link}
-            toggleDialog={this.toggleLinkDialog}
-          />
-        }
-      </Fragment>
-    );
-  }
-}
-
-Item.propTypes = {
-  item: PropTypes.object.isRequired,
-  isItemFreezed: PropTypes.bool.isRequired,
-  onFreezedItem: PropTypes.func.isRequired,
-  onUnfreezedItem: PropTypes.func.isRequired,
-  deleteItem: PropTypes.func,
-  email: PropTypes.string,
-};
 
 class Links extends Component {
 
   constructor(props) {
     super(props);
     this.state = {
-      loading: true,
-      errorMsg: '',
+      currentTab: 'shareLinks',
       userInfo: {},
+      shareLoading: true,
+      shareErrorMsg: '',
+      shareLinkItems: [],
+      sharePage: 1,
+      sharePageNext: false,
+      sharePerPage: 25,
+      shareSortBy: '',
+      shareSortOrder: 'asc',
+      shareActiveFilter: 'all',
+      shareExpiredFilter: 'all',
+      uploadLoading: true,
+      uploadErrorMsg: '',
       uploadLinkItems: [],
-      shareLinkItems: []
+      uploadPage: 1,
+      uploadPageNext: false,
+      uploadPerPage: 25,
+      uploadSortBy: '',
+      uploadSortOrder: 'asc',
+      uploadActiveFilter: 'all',
+      uploadExpiredFilter: 'all'
     };
   }
 
@@ -256,70 +46,173 @@ class Links extends Component {
       });
     });
 
-    seafileAPI.sysAdminListShareLinksByUser(email).then(res => {
-      const items = res.data.share_link_list.map(item => {
-        item.type = 'download';
-        return item;
-      });
-      items.sort((a, b) => {
-        return a.is_dir ? -1 : 1;
-      });
+    this.listShareLinks(1);
+    this.listUploadLinks(1);
+  }
+
+  switchTab = (tab) => {
+    this.setState({ currentTab: tab });
+  };
+
+  listShareLinks = (page) => {
+    const email = decodeURIComponent(this.props.email);
+    const { sharePerPage, shareSortBy, shareSortOrder, shareActiveFilter, shareExpiredFilter } = this.state;
+    const activeParam = shareActiveFilter === 'all' ? 'all' : (shareActiveFilter === 'active');
+    const expiredParam = shareExpiredFilter === 'all' ? 'all' : (shareExpiredFilter === 'expired');
+
+    seafileAPI.sysAdminListShareLinksByUser(email, page, sharePerPage, shareSortBy, shareSortOrder, activeParam, expiredParam).then(res => {
       this.setState({
-        loading: false,
-        shareLinkItems: items
-      });
-    });
-    seafileAPI.sysAdminListUploadLinksByUser(email).then(res => {
-      const items = res.data.upload_link_list.map(item => {
-        item.type = 'upload';
-        return item;
-      });
-      this.setState({
-        loading: false,
-        uploadLinkItems: items
+        shareLoading: false,
+        shareErrorMsg: '',
+        shareLinkItems: res.data.share_link_list || [],
+        sharePage: page,
+        sharePageNext: Utils.hasNextPage(page, sharePerPage, res.data.count || 0)
       });
     }).catch((error) => {
       this.setState({
-        loading: false,
-        errorMsg: Utils.getErrorMsg(error, true) // true: show login tip if 403
+        shareLoading: false,
+        shareErrorMsg: Utils.getErrorMsg(error, true)
       });
     });
-  }
+  };
 
-  deleteItem = (item) => {
-    const type = item.type;
-    const token = item.token;
-    if (type === 'download') {
-      seafileAPI.sysAdminDeleteShareLink(token).then(res => {
-        let items = this.state.shareLinkItems.filter(item => {
-          return item.token !== token;
-        });
-        this.setState({
-          shareLinkItems: items
-        });
-        toaster.success(gettext('Successfully deleted 1 item.'));
-      }).catch((error) => {
-        let errMessage = Utils.getErrorMsg(error);
-        toaster.danger(errMessage);
+  listUploadLinks = (page) => {
+    const email = decodeURIComponent(this.props.email);
+    const { uploadPerPage, uploadSortBy, uploadSortOrder, uploadActiveFilter, uploadExpiredFilter } = this.state;
+    const activeParam = uploadActiveFilter === 'all' ? 'all' : (uploadActiveFilter === 'active');
+    const expiredParam = uploadExpiredFilter === 'all' ? 'all' : (uploadExpiredFilter === 'expired');
+
+    seafileAPI.sysAdminListUploadLinksByUser(email, page, uploadPerPage, uploadSortBy, uploadSortOrder, activeParam, expiredParam).then(res => {
+      this.setState({
+        uploadLoading: false,
+        uploadErrorMsg: '',
+        uploadLinkItems: res.data.upload_link_list || [],
+        uploadPage: page,
+        uploadPageNext: Utils.hasNextPage(page, uploadPerPage, res.data.count || 0)
       });
+    }).catch((error) => {
+      this.setState({
+        uploadLoading: false,
+        uploadErrorMsg: Utils.getErrorMsg(error, true)
+      });
+    });
+  };
+
+  sortItems = (tab, sortBy) => {
+    const sortByKey = tab === 'shareLinks' ? 'shareSortBy' : 'uploadSortBy';
+    const sortOrderKey = tab === 'shareLinks' ? 'shareSortOrder' : 'uploadSortOrder';
+    this.setState({
+      [sortByKey]: sortBy,
+      [sortOrderKey]: this.state[sortOrderKey] === 'asc' ? 'desc' : 'asc'
+    }, () => {
+      if (tab === 'shareLinks') {
+        this.listShareLinks(1);
+      } else {
+        this.listUploadLinks(1);
+      }
+    });
+  };
+
+  setActiveFilter = (tab, activeFilter) => {
+    const filterKey = tab === 'shareLinks' ? 'shareActiveFilter' : 'uploadActiveFilter';
+    this.setState({ [filterKey]: activeFilter }, () => {
+      if (tab === 'shareLinks') {
+        this.listShareLinks(1);
+      } else {
+        this.listUploadLinks(1);
+      }
+    });
+  };
+
+  setExpiredFilter = (tab, expiredFilter) => {
+    const filterKey = tab === 'shareLinks' ? 'shareExpiredFilter' : 'uploadExpiredFilter';
+    this.setState({ [filterKey]: expiredFilter }, () => {
+      if (tab === 'shareLinks') {
+        this.listShareLinks(1);
+      } else {
+        this.listUploadLinks(1);
+      }
+    });
+  };
+
+  resetPerPage = (tab, perPage) => {
+    const key = tab === 'shareLinks' ? 'sharePerPage' : 'uploadPerPage';
+    this.setState({ [key]: perPage }, () => {
+      if (tab === 'shareLinks') {
+        this.listShareLinks(1);
+      } else {
+        this.listUploadLinks(1);
+      }
+    });
+  };
+
+  getByPage = (tab, page) => {
+    if (tab === 'shareLinks') {
+      this.listShareLinks(page);
     } else {
-      seafileAPI.sysAdminDeleteUploadLink(token).then(res => {
-        let items = this.state.uploadLinkItems.filter(item => {
-          return item.token !== token;
-        });
-        this.setState({
-          uploadLinkItems: items
-        });
-        toaster.success(gettext('Successfully deleted 1 item.'));
-      }).catch((error) => {
-        let errMessage = Utils.getErrorMsg(error);
-        toaster.danger(errMessage);
-      });
+      this.listUploadLinks(page);
     }
   };
 
+  deleteShareLink = (token) => {
+    seafileAPI.sysAdminDeleteShareLink(token).then(() => {
+      const targetPage = this.state.shareLinkItems.length === 1 && this.state.sharePage > 1 ? this.state.sharePage - 1 : this.state.sharePage;
+      this.listShareLinks(targetPage);
+      toaster.success(gettext('Successfully deleted 1 item.'));
+    }).catch((error) => {
+      toaster.danger(Utils.getErrorMsg(error));
+    });
+  };
+
+  deleteUploadLink = (token) => {
+    seafileAPI.sysAdminDeleteUploadLink(token).then(() => {
+      const targetPage = this.state.uploadLinkItems.length === 1 && this.state.uploadPage > 1 ? this.state.uploadPage - 1 : this.state.uploadPage;
+      this.listUploadLinks(targetPage);
+      toaster.success(gettext('Successfully deleted 1 item.'));
+    }).catch((error) => {
+      toaster.danger(Utils.getErrorMsg(error));
+    });
+  };
+
+  setShareLinkActive = (token, active) => {
+    seafileAPI.sysAdminSetShareLinkActive(token, active).then(() => {
+      const shareLinkItems = this.state.shareLinkItems.map(item => item.token === token ? { ...item, active, status: active ? 'active' : 'inactive' } : item);
+      this.setState({ shareLinkItems });
+      toaster.success(gettext('Edit succeeded'));
+    }).catch((error) => {
+      toaster.danger(Utils.getErrorMsg(error));
+    });
+  };
+
+  setUploadLinkActive = (token, active) => {
+    seafileAPI.sysAdminSetUploadLinkActive(token, active).then(() => {
+      const uploadLinkItems = this.state.uploadLinkItems.map(item => item.token === token ? { ...item, active, status: active ? 'active' : 'inactive' } : item);
+      this.setState({ uploadLinkItems });
+      toaster.success(gettext('Edit succeeded'));
+    }).catch((error) => {
+      toaster.danger(Utils.getErrorMsg(error));
+    });
+  };
+
   render() {
-    const { shareLinkItems, uploadLinkItems } = this.state;
+    const { currentTab } = this.state;
+    const isShare = currentTab === 'shareLinks';
+    const items = isShare ? this.state.shareLinkItems : this.state.uploadLinkItems;
+    const loading = isShare ? this.state.shareLoading : this.state.uploadLoading;
+    const errorMsg = isShare ? this.state.shareErrorMsg : this.state.uploadErrorMsg;
+    const currentPage = isShare ? this.state.sharePage : this.state.uploadPage;
+    const hasNextPage = isShare ? this.state.sharePageNext : this.state.uploadPageNext;
+    const perPage = isShare ? this.state.sharePerPage : this.state.uploadPerPage;
+    const sortBy = isShare ? this.state.shareSortBy : this.state.uploadSortBy;
+    const sortOrder = isShare ? this.state.shareSortOrder : this.state.uploadSortOrder;
+    const activeFilter = isShare ? this.state.shareActiveFilter : this.state.uploadActiveFilter;
+    const expiredFilter = isShare ? this.state.shareExpiredFilter : this.state.uploadExpiredFilter;
+    const onDelete = isShare ? this.deleteShareLink : this.deleteUploadLink;
+    const onToggleActive = isShare ? this.setShareLinkActive : this.setUploadLinkActive;
+    const emptyTitle = expiredFilter === 'all' && activeFilter === 'all'
+      ? (isShare ? gettext('No share links') : gettext('No upload links'))
+      : (isShare ? gettext('No share links match the current filter') : gettext('No upload links match the current filter'));
+
     return (
       <Fragment>
         <MainPanelTopbar {...this.props} />
@@ -327,11 +220,36 @@ class Links extends Component {
           <div className="cur-view-container">
             <Nav currentItem="links" email={this.props.email} userName={this.state.userInfo.name} />
             <div className="cur-view-content">
-              <Content
-                loading={this.state.loading}
-                errorMsg={this.state.errorMsg}
-                items={[].concat(uploadLinkItems, shareLinkItems)}
-                deleteItem={this.deleteItem}
+              <div className="tab-nav-container mb-4">
+                <ul className="nav">
+                  <li className="nav-item">
+                    <button type="button" className={`nav-link btn btn-link${isShare ? ' active' : ''}`} onClick={() => this.switchTab('shareLinks')}>{gettext('Share Links')}</button>
+                  </li>
+                  <li className="nav-item">
+                    <button type="button" className={`nav-link btn btn-link${!isShare ? ' active' : ''}`} onClick={() => this.switchTab('uploadLinks')}>{gettext('Upload Links')}</button>
+                  </li>
+                </ul>
+              </div>
+              <LinksContent
+                loading={loading}
+                errorMsg={errorMsg}
+                items={items}
+                currentPage={currentPage}
+                perPage={perPage}
+                hasNextPage={hasNextPage}
+                getByPage={(page) => this.getByPage(currentTab, page)}
+                resetPerPage={(value) => this.resetPerPage(currentTab, value)}
+                emptyTitle={emptyTitle}
+                enableSort={true}
+                sortBy={sortBy}
+                sortOrder={sortOrder}
+                activeFilter={activeFilter}
+                expiredFilter={expiredFilter}
+                setActiveFilter={(value) => this.setActiveFilter(currentTab, value)}
+                setExpiredFilter={(value) => this.setExpiredFilter(currentTab, value)}
+                sortItems={(field) => this.sortItems(currentTab, field)}
+                onDelete={onDelete}
+                onToggleActive={onToggleActive}
               />
             </div>
           </div>

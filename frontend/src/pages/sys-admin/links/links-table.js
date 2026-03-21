@@ -5,6 +5,7 @@ import { gettext } from '../../../utils/constants';
 import EmptyTip from '../../../components/empty-tip';
 import Loading from '../../../components/loading';
 import Paginator from '../../../components/paginator';
+import ShareAdminLinkEnhanced from '../../../components/dialog/share-admin-link-enhanced';
 import UserLink from '../user-link';
 
 class LinksContent extends Component {
@@ -80,7 +81,7 @@ class LinksContent extends Component {
                             <th width="8%">{gettext('Active')}</th>
                             <th width="8%">{gettext('Protected')}</th>
                             <th width="13%">{this.renderSortHeader('ctime', gettext('Created At'))}</th>
-                            <th width="8%">{this.renderSortHeader('view_cnt', gettext('Count'))}</th>
+                            <th width="8%">{this.renderSortHeader('view_cnt', gettext('Visits'))}</th>
                             <th width="7%">{gettext('Expired')}</th>
                             <th width="5%">{/* Operations */}</th>
                         </tr>
@@ -180,6 +181,7 @@ class LinksRow extends Component {
         super(props);
         this.state = {
             isOpIconShown: false,
+            isLinkDialogOpen: false,
         };
     }
 
@@ -200,56 +202,83 @@ class LinksRow extends Component {
         this.props.onDelete(this.props.item.token);
     };
 
+    toggleLinkDialog = () => {
+        this.setState({ isLinkDialogOpen: !this.state.isLinkDialogOpen });
+    };
+
     render() {
-        const { isOpIconShown } = this.state;
+        const { isOpIconShown, isLinkDialogOpen } = this.state;
         const { item } = this.props;
         const deleteIcon = `action-icon sf2-icon-delete ${isOpIconShown ? '' : 'invisible'}`;
         const toggleIcon = `action-icon ${item.active === false ? 'sf2-icon-reply' : 'sf2-icon-x3'} mr-2 ${isOpIconShown ? '' : 'invisible'}`;
+        const viewIcon = `action-icon sf2-icon-link mr-2 ${isOpIconShown && item.link ? '' : 'invisible'}`;
 
         return (
-            <tr onMouseOver={this.handleMouseOver} onMouseOut={this.handleMouseOut}>
-                <td>{item.obj_name || item.path || '--'}</td>
-                <td>{item.repo_name || '--'}</td>
-                <td>{item.token}</td>
-                <td><UserLink email={item.creator_email} name={item.creator_name} /></td>
-                <td>
-                    <span className={item.active === false ? 'badge badge-warning' : 'badge badge-success'}>
-                        {item.active === false ? gettext('Inactive') : gettext('Active')}
-                    </span>
-                </td>
-                <td>
-                    <span className={item.has_password ? 'badge badge-warning' : 'badge badge-secondary'}>
-                        {item.has_password ? gettext('Yes') : gettext('No')}
-                    </span>
-                </td>
-                <td>{moment(item.ctime).fromNow()}</td>
-                <td>{item.view_cnt}</td>
-                <td>
-                    <span className={item.is_expired ? 'badge badge-danger' : 'badge badge-secondary'}>
-                        {item.is_expired ? gettext('Expired') : gettext('No')}
-                    </span>
-                </td>
-                <td>
-                    <button
-                        type="button"
-                        className={`${toggleIcon} border-0 bg-transparent p-0`}
-                        title={item.active === false ? gettext('Activate') : gettext('Deactivate')}
-                        aria-label={item.active === false ? gettext('Activate') : gettext('Deactivate')}
-                        onClick={this.toggleActive}
-                    >
-                        <span className="sr-only">{item.active === false ? gettext('Activate') : gettext('Deactivate')}</span>
-                    </button>
-                    <button
-                        type="button"
-                        className={`${deleteIcon} border-0 bg-transparent p-0`}
-                        title={gettext('Delete')}
-                        aria-label={gettext('Delete')}
-                        onClick={this.deleteLink}
-                    >
-                        <span className="sr-only">{gettext('Delete')}</span>
-                    </button>
-                </td>
-            </tr>
+            <Fragment>
+                <tr onMouseOver={this.handleMouseOver} onMouseOut={this.handleMouseOut}>
+                    <td>{item.obj_name || item.path || '--'}</td>
+                    <td>{item.repo_name || '--'}</td>
+                    <td>{item.token}</td>
+                    <td><UserLink email={item.creator_email} name={item.creator_name} /></td>
+                    <td>
+                        <span className={item.active === false ? 'badge badge-warning' : 'badge badge-success'}>
+                            {item.active === false ? gettext('Inactive') : gettext('Active')}
+                        </span>
+                    </td>
+                    <td>
+                        <span className={item.has_password ? 'badge badge-warning' : 'badge badge-secondary'}>
+                            {item.has_password ? gettext('Yes') : gettext('No')}
+                        </span>
+                    </td>
+                    <td>{moment(item.ctime).fromNow()}</td>
+                    <td>{item.view_cnt}</td>
+                    <td>
+                        <span className={item.is_expired ? 'badge badge-danger' : 'badge badge-secondary'}>
+                            {item.is_expired ? gettext('Expired') : gettext('No')}
+                        </span>
+                    </td>
+                    <td>
+                        <button
+                            type="button"
+                            className={`${viewIcon} border-0 bg-transparent p-0`}
+                            title={gettext('View')}
+                            aria-label={gettext('View')}
+                            onClick={this.toggleLinkDialog}
+                            disabled={!item.link}
+                        >
+                            <span className="sr-only">{gettext('View')}</span>
+                        </button>
+                        <button
+                            type="button"
+                            className={`${toggleIcon} border-0 bg-transparent p-0`}
+                            title={item.active === false ? gettext('Activate') : gettext('Deactivate')}
+                            aria-label={item.active === false ? gettext('Activate') : gettext('Deactivate')}
+                            onClick={this.toggleActive}
+                        >
+                            <span className="sr-only">{item.active === false ? gettext('Activate') : gettext('Deactivate')}</span>
+                        </button>
+                        <button
+                            type="button"
+                            className={`${deleteIcon} border-0 bg-transparent p-0`}
+                            title={gettext('Delete')}
+                            aria-label={gettext('Delete')}
+                            onClick={this.deleteLink}
+                        >
+                            <span className="sr-only">{gettext('Delete')}</span>
+                        </button>
+                    </td>
+                </tr>
+                {isLinkDialogOpen && item.link && (
+                    <ShareAdminLinkEnhanced
+                        link={item.link}
+                        password={item.password || ''}
+                        hasPassword={item.has_password === true}
+                        viewCount={item.view_cnt}
+                        isShareLink={item.link_type !== 'upload'}
+                        toggleDialog={this.toggleLinkDialog}
+                    />
+                )}
+            </Fragment>
         );
     }
 }

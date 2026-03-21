@@ -9,6 +9,7 @@ class OrgUserInfo {
     this.name = object.name;
     this.email = object.email;
     this.contact_email = object.owner_contact_email;
+    this.status = object.status || (object.is_active ? 'active' : 'deactivated');
     this.is_active = object.is_active;
     this.quota_usage = object.quota_usage;
     this.quota_total = object.quota_total;

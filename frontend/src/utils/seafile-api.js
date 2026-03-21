@@ -903,14 +903,30 @@ seafileAPI.sysAdminSetUploadLinkActive = function (token, active) {
 };
 
 // Admin: list share links created by a specific user
-seafileAPI.sysAdminListShareLinksByUser = function (email) {
+seafileAPI.sysAdminListShareLinksByUser = function (email, page, perPage, sortBy, sortOrder, activeFilter, expiredFilter) {
   let url = this.server + '/api/v2.1/admin/users/' + encodeURIComponent(email) + '/share-links/';
+  const params = new URLSearchParams();
+  if (page) params.set('page', page);
+  if (perPage) params.set('per_page', perPage);
+  if (sortBy) params.set('order_by', sortBy);
+  if (sortOrder) params.set('direction', sortOrder);
+  if (activeFilter && activeFilter !== 'all') params.set('active', activeFilter);
+  if (expiredFilter && expiredFilter !== 'all') params.set('expired', expiredFilter);
+  if (params.toString()) url += '?' + params.toString();
   return this.req.get(url);
 };
 
 // Admin: list upload links created by a specific user
-seafileAPI.sysAdminListUploadLinksByUser = function (email) {
+seafileAPI.sysAdminListUploadLinksByUser = function (email, page, perPage, sortBy, sortOrder, activeFilter, expiredFilter) {
   let url = this.server + '/api/v2.1/admin/users/' + encodeURIComponent(email) + '/upload-links/';
+  const params = new URLSearchParams();
+  if (page) params.set('page', page);
+  if (perPage) params.set('per_page', perPage);
+  if (sortBy) params.set('order_by', sortBy);
+  if (sortOrder) params.set('direction', sortOrder);
+  if (activeFilter && activeFilter !== 'all') params.set('active', activeFilter);
+  if (expiredFilter && expiredFilter !== 'all') params.set('expired', expiredFilter);
+  if (params.toString()) url += '?' + params.toString();
   return this.req.get(url);
 };
 
@@ -1320,11 +1336,15 @@ seafileAPI.orgAdminSetSysSettingInfo = function (orgID, key, value) {
 };
 
 // Org Admin: list org users
-seafileAPI.orgAdminListOrgUsers = function (orgID, isStaff, page, sortBy, sortOrder) {
-  let url = this.server + '/api/v2.1/org/' + orgID + '/admin/users/?page=' + (page || 1);
-  if (isStaff === true) url += '&is_staff=true';
-  if (sortBy) url += '&order_by=' + sortBy;
-  if (sortOrder) url += '&direction=' + sortOrder;
+seafileAPI.orgAdminListOrgUsers = function (orgID, isStaff, page, sortBy, sortOrder, statusFilter) {
+  let url = this.server + '/api/v2.1/org/' + orgID + '/admin/users/';
+  const params = new URLSearchParams();
+  params.set('page', page || 1);
+  if (isStaff === true) params.set('is_staff', 'true');
+  if (sortBy) params.set('order_by', sortBy);
+  if (sortOrder) params.set('direction', sortOrder);
+  if (statusFilter) params.set('status', statusFilter);
+  url += '?' + params.toString();
   return this.req.get(url);
 };
 
@@ -1348,6 +1368,12 @@ seafileAPI.orgAdminGetOrgUserInfo = function (orgID, email) {
 seafileAPI.orgAdminDeleteOrgUser = function (orgID, email) {
   let url = this.server + '/api/v2.1/org/' + orgID + '/admin/users/' + encodeURIComponent(email) + '/';
   return this.req.delete(url);
+};
+
+// Org Admin: restore deleted org user
+seafileAPI.orgAdminRestoreOrgUser = function (orgID, email) {
+  let url = this.server + '/api/v2.1/org/' + orgID + '/admin/users/' + encodeURIComponent(email) + '/restore/';
+  return this.req.put(url);
 };
 
 // Org Admin: change org user status (activate/deactivate)
@@ -1417,8 +1443,14 @@ seafileAPI.orgAdminGetOrgUserBesharedRepos = function (orgID, email) {
 };
 
 // Org Admin: search org user
-seafileAPI.orgAdminSearchUser = function (orgID, query) {
-  let url = this.server + '/api/v2.1/org/' + orgID + '/admin/search-user/?query=' + encodeURIComponent(query);
+seafileAPI.orgAdminSearchUser = function (orgID, query, page, perPage, statusFilter) {
+  let url = this.server + '/api/v2.1/org/' + orgID + '/admin/search-user/';
+  const params = new URLSearchParams();
+  params.set('query', query || '');
+  if (page) params.set('page', page);
+  if (perPage) params.set('per_page', perPage);
+  if (statusFilter) params.set('status', statusFilter);
+  url += '?' + params.toString();
   return this.req.get(url);
 };
 
@@ -1535,8 +1567,15 @@ seafileAPI.orgAdminTransferOrgRepo = function (orgID, repoID, email) {
 };
 
 // Org Admin: list org links
-seafileAPI.orgAdminListOrgLinks = function (page) {
-  let url = this.server + '/api/v2.1/org/admin/links/?page=' + (page || 1);
+seafileAPI.orgAdminListOrgLinks = function (page, perPage, sortBy, sortOrder, expiredFilter) {
+  let url = this.server + '/api/v2.1/org/admin/links/';
+  const params = new URLSearchParams();
+  params.set('page', page || 1);
+  if (perPage) params.set('per_page', perPage);
+  if (sortBy) params.set('order_by', sortBy);
+  if (sortOrder) params.set('direction', sortOrder);
+  if (expiredFilter && expiredFilter !== 'all') params.set('expired', expiredFilter === 'expired');
+  url += '?' + params.toString();
   return this.req.get(url);
 };
 
@@ -1547,8 +1586,15 @@ seafileAPI.orgAdminDeleteOrgLink = function (token) {
 };
 
 // Org Admin: list org upload links
-seafileAPI.orgAdminListOrgUploadLinks = function (page) {
-  let url = this.server + '/api/v2.1/org/admin/upload-links/?page=' + (page || 1);
+seafileAPI.orgAdminListOrgUploadLinks = function (page, perPage, sortBy, sortOrder, expiredFilter) {
+  let url = this.server + '/api/v2.1/org/admin/upload-links/';
+  const params = new URLSearchParams();
+  params.set('page', page || 1);
+  if (perPage) params.set('per_page', perPage);
+  if (sortBy) params.set('order_by', sortBy);
+  if (sortOrder) params.set('direction', sortOrder);
+  if (expiredFilter && expiredFilter !== 'all') params.set('expired', expiredFilter === 'expired');
+  url += '?' + params.toString();
   return this.req.get(url);
 };
 

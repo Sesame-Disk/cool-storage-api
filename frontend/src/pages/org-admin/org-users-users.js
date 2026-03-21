@@ -77,6 +77,7 @@ class OrgUsers extends Component {
       orgUsers: [],
       page: 1,
       pageNext: false,
+      statusFilter: 'all',
       sortBy: '',
       sortOrder: 'asc',
       isShowAddOrgUserDialog: false,
@@ -88,7 +89,7 @@ class OrgUsers extends Component {
 
   componentDidMount() {
     let urlParams = (new URL(window.location)).searchParams;
-    const { page, sortBy, sortOrder } = this.state;
+    const { page, sortBy, sortOrder, statusFilter } = this.state;
     this.setState({
       /*
         perPage: parseInt(urlParams.get('per_page') || perPage),
@@ -96,7 +97,8 @@ class OrgUsers extends Component {
         */
       page: parseInt(urlParams.get('page') || page),
       sortBy: urlParams.get('order_by') || sortBy,
-      sortOrder: urlParams.get('direction') || sortOrder
+      sortOrder: urlParams.get('direction') || sortOrder,
+      statusFilter: urlParams.get('status') || statusFilter
     }, () => {
       this.initOrgUsersData(this.state.page);
     });
@@ -137,8 +139,8 @@ class OrgUsers extends Component {
   };
 
   initOrgUsersData = (page) => {
-    const { sortBy, sortOrder } = this.state;
-    seafileAPI.orgAdminListOrgUsers(orgID, '', page, sortBy, sortOrder).then(res => {
+    const { sortBy, sortOrder, statusFilter } = this.state;
+    seafileAPI.orgAdminListOrgUsers(orgID, '', page, sortBy, sortOrder, statusFilter).then(res => {
       let userList = res.data.user_list.map(item => {
         return new OrgUserInfo(item);
       });
@@ -150,6 +152,21 @@ class OrgUsers extends Component {
     }).catch(error => {
       let errMessage = Utils.getErrorMsg(error);
       toaster.danger(errMessage);
+    });
+  };
+
+  setStatusFilter = (statusFilter) => {
+    this.setState({
+      statusFilter,
+      page: 1
+    }, () => {
+      let url = new URL(location.href);
+      let searchParams = new URLSearchParams(url.search);
+      searchParams.set('page', '1');
+      searchParams.set('status', statusFilter);
+      url.search = searchParams.toString();
+      navigate(url.toString());
+      this.initOrgUsersData(1);
     });
   };
 
@@ -197,8 +214,8 @@ class OrgUsers extends Component {
 
   toggleOrgUsersDelete = (email, username) => {
     seafileAPI.orgAdminDeleteOrgUser(orgID, email).then(res => {
-      let users = this.state.orgUsers.filter(item => item.email !== email);
-      this.setState({ orgUsers: users });
+      const targetPage = this.state.orgUsers.length === 1 && this.state.page > 1 ? this.state.page - 1 : this.state.page;
+      this.initOrgUsersData(targetPage);
       let msg = gettext('Deleted user %s');
       msg = msg.replace('%s', username);
       toaster.success(msg);
@@ -240,11 +257,24 @@ class OrgUsers extends Component {
       let users = this.state.orgUsers.map(item => {
         if (item.email === email) {
           item['is_active'] = res.data['is_active'];
+          item['status'] = res.data['status'];
         }
         return item;
       });
       this.setState({ orgUsers: users });
       toaster.success(gettext('Edit succeeded.'));
+    }).catch(error => {
+      let errMessage = Utils.getErrorMsg(error);
+      toaster.danger(errMessage);
+    });
+  };
+
+  restoreUser = (email, username) => {
+    seafileAPI.orgAdminRestoreOrgUser(orgID, email).then(() => {
+      this.initOrgUsersData(this.state.page);
+      let msg = gettext('Restored user %s');
+      msg = msg.replace('%s', username);
+      toaster.success(msg);
     }).catch(error => {
       let errMessage = Utils.getErrorMsg(error);
       toaster.danger(errMessage);
@@ -328,9 +358,31 @@ class OrgUsers extends Component {
         <div className="main-panel-center flex-row">
           <div className="cur-view-container">
             <Nav currentItem="all" />
+            <div className="d-flex align-items-center mb-3">
+              <span className="mr-2">{gettext('Status')}</span>
+              {['all', 'active', 'deactivated', 'deleted'].map(status => {
+                const isStatusSelected = this.state.statusFilter === status;
+                const labelMap = {
+                  all: gettext('All'),
+                  active: gettext('Active'),
+                  deactivated: gettext('Inactive'),
+                  deleted: gettext('Deleted')
+                };
+                return (
+                  <button
+                    key={status}
+                    className={`btn btn-sm mr-2 ${isStatusSelected ? 'btn-primary' : 'btn-outline-secondary'}`}
+                    onClick={() => this.setStatusFilter(status)}
+                  >
+                    {labelMap[status]}
+                  </button>
+                );
+              })}
+            </div>
             <OrgUsersList
               initOrgUsersData={this.initOrgUsersData}
               toggleDelete={this.toggleOrgUsersDelete}
+              restoreUser={this.restoreUser}
               changeStatus={this.changeStatus}
               orgUsers={this.state.orgUsers}
               page={this.state.page}
