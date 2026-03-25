@@ -463,12 +463,16 @@ func (w *Worker) processLibraryCascade(ctx context.Context, item QueueItem) erro
 		return fmt.Errorf("failed to enqueue library contents: %w", err)
 	}
 
-	// 2. Hard-delete the library record itself
+	// 2. Clean up the lib-scope storage counter row (aggregates were already
+	//    adjusted when the library was soft-deleted).
+	_ = w.store.DeleteLibraryStorageCounter(item.OrgID, libraryID)
+
+	// 3. Hard-delete the library record itself
 	if err := w.store.HardDeleteLibrary(item.OrgID, libraryID); err != nil {
 		return fmt.Errorf("failed to hard-delete library %s: %w", item.ItemID, err)
 	}
 
-	// 3. Audit log
+	// 4. Audit log
 	w.store.WriteAuditLog(AuditLogEntry{
 		OrgID:      item.OrgID,
 		Action:     "gc_library_cascade_deleted",
@@ -502,11 +506,23 @@ func (w *Worker) processOrgCascade(ctx context.Context, item QueueItem) error {
 		return nil
 	}
 
-	// 1. Enqueue all libraries for cascade deletion
+	// 1. Enqueue all libraries for cascade deletion.
+	// Libraries that weren't individually soft-deleted still have their storage
+	// counted in aggregates. Soft-delete them first so counters are adjusted
+	// before the org/user rows disappear.
 	libs, err := w.store.ListLibrariesForOrg(orgID)
 	if err != nil {
 		log.Printf("[GC Worker] Failed to list libraries for org %s: %v", item.ItemID, err)
 	} else if len(libs) > 0 {
+		for _, lib := range libs {
+			if lib.DeletedAt.IsZero() {
+				// Still active — soft-delete to adjust storage counters.
+				if err := w.store.SoftDeleteLibrary(orgID, lib.LibraryID, uuid.Nil); err != nil {
+					log.Printf("[GC Worker] Failed to soft-delete library %s during org cascade: %v", lib.LibraryID, err)
+				}
+			}
+		}
+
 		now := time.Now()
 		var batch []QueueItem
 		for _, lib := range libs {

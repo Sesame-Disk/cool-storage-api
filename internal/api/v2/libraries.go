@@ -885,14 +885,10 @@ func (h *LibraryHandler) DeleteLibrary(c *gin.Context) {
 		return
 	}
 
-	// Soft-delete: set deleted_at timestamp instead of hard-deleting
-	// This allows the library to be restored from the recycle bin
-	now := time.Now()
-	err = h.db.Session().Query(`
-		UPDATE libraries SET deleted_at = ?, deleted_by = ?
-		WHERE org_id = ? AND library_id = ?
-	`, now, userID, orgID, repoID).Exec()
-	if err != nil {
+	// Soft-delete: set deleted_at + adjust storage counters.
+	// ownerID = userID here because the permission check above ensures only the
+	// owner can delete.
+	if err := softDeleteLibrary(h.db, orgID, userID, userID, repoID); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete library"})
 		return
 	}

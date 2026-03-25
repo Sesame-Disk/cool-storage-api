@@ -159,12 +159,8 @@ func (h *DeletedLibraryHandler) RestoreDeletedRepo(c *gin.Context) {
 		return
 	}
 
-	// Clear deleted_at to restore the library
-	// Use a zero-value timestamp — in Cassandra, we need to explicitly set to null
-	err = h.db.Session().Query(`
-		DELETE deleted_at, deleted_by FROM libraries WHERE org_id = ? AND library_id = ?
-	`, orgID, repoID).Exec()
-	if err != nil {
+	// Restore: clear deleted_at + re-add library storage to aggregate counters.
+	if err := restoreDeletedLibrary(h.db, orgID, ownerID, repoID); err != nil {
 		log.Printf("[RestoreDeletedRepo] Failed to restore library %s: %v", repoID, err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to restore library"})
 		return
@@ -272,6 +268,10 @@ func (h *DeletedLibraryHandler) PermanentDeleteRepo(c *gin.Context) {
 	if h.libHandler != nil && h.libHandler.gcEnqueuer != nil {
 		go h.libHandler.gcEnqueuer.EnqueueLibraryDeletion(orgID, repoID, storageClass)
 	}
+
+	// Clean up the lib-scope storage counter row. Aggregate scopes (org, user,
+	// platform) were already adjusted when the library was soft-deleted.
+	deleteLibraryStorageCounter(h.db, orgID, repoID)
 
 	// Tag cleanup is secondary metadata and can remain asynchronous.
 	go CleanupAllLibraryTags(h.db, repoID)

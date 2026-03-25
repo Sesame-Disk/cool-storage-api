@@ -125,6 +125,11 @@ type GCStore interface {
 	ListExpiredDeletedLibraries(retentionDays int) ([]DeletedLibraryInfo, error)
 	HardDeleteLibrary(orgID, libraryID uuid.UUID) error
 
+	// Storage counter cleanup after permanent library deletion.
+	// Deletes the lib-scope counter row. Aggregate scopes (org, user, platform)
+	// must have been adjusted earlier via SoftDeleteLibrary.
+	DeleteLibraryStorageCounter(orgID, libraryID uuid.UUID) error
+
 	// Org cascade (soft-deleted orgs past grace period)
 	ListExpiredDeletedOrgs(graceDays int) ([]DeletedOrgInfo, error)
 	ListUsersByOrg(orgID uuid.UUID) ([]OrgUserInfo, error)
@@ -284,6 +289,8 @@ type OrgUserInfo struct {
 type OrgLibraryInfo struct {
 	LibraryID    uuid.UUID
 	StorageClass string
+	OwnerID      uuid.UUID
+	DeletedAt    time.Time // zero means library is still active
 }
 
 // ShareByUserInfo holds data about a share received by a user.

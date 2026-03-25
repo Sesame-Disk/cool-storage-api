@@ -116,10 +116,12 @@ type mockFSObject struct {
 type mockLibrary struct {
 	OrgID          uuid.UUID
 	LibraryID      uuid.UUID
+	OwnerID        uuid.UUID
 	StorageClass   string
 	HeadCommitID   string
 	VersionTTLDays int
 	AutoDeleteDays int
+	DeletedAt      time.Time
 }
 
 type mockShareLink struct {
@@ -1368,10 +1370,19 @@ func (m *MockStore) ListLibrariesForOrg(orgID uuid.UUID) ([]OrgLibraryInfo, erro
 	var result []OrgLibraryInfo
 	for _, lib := range m.libraries {
 		if lib.OrgID == orgID {
-			result = append(result, OrgLibraryInfo{LibraryID: lib.LibraryID, StorageClass: lib.StorageClass})
+			result = append(result, OrgLibraryInfo{
+				LibraryID:    lib.LibraryID,
+				StorageClass: lib.StorageClass,
+				OwnerID:      lib.OwnerID,
+				DeletedAt:    lib.DeletedAt,
+			})
 		}
 	}
 	return result, nil
+}
+
+func (m *MockStore) DeleteLibraryStorageCounter(orgID, libraryID uuid.UUID) error {
+	return nil // no-op in mock — storage_counters not simulated
 }
 func (m *MockStore) DeleteGroupFull(orgID, groupID uuid.UUID) error {
 	m.mu.Lock()

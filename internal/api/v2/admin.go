@@ -3000,11 +3000,12 @@ func (h *AdminHandler) AdminDeleteLibrary(c *gin.Context) {
 		return
 	}
 
-	// Verify library exists and is not already deleted
+	// Verify library exists and is not already deleted; fetch owner for storage accounting.
+	var ownerID string
 	var deletedAt time.Time
 	if err := h.db.Session().Query(`
-		SELECT deleted_at FROM libraries WHERE org_id = ? AND library_id = ?
-	`, orgID, libraryID).Scan(&deletedAt); err != nil {
+		SELECT owner_id, deleted_at FROM libraries WHERE org_id = ? AND library_id = ?
+	`, orgID, libraryID).Scan(&ownerID, &deletedAt); err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "library not found"})
 		return
 	}
@@ -3013,12 +3014,8 @@ func (h *AdminHandler) AdminDeleteLibrary(c *gin.Context) {
 		return
 	}
 
-	// Soft-delete
-	now := time.Now()
-	if err := h.db.Session().Query(`
-		UPDATE libraries SET deleted_at = ?, deleted_by = ?
-		WHERE org_id = ? AND library_id = ?
-	`, now, callerUserID, orgID, libraryID).Exec(); err != nil {
+	// Soft-delete + adjust storage counters.
+	if err := softDeleteLibrary(h.db, orgID, ownerID, callerUserID, libraryID); err != nil {
 		log.Printf("[AdminDeleteLibrary] Failed to delete library %s: %v", libraryID, err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete library"})
 		return
