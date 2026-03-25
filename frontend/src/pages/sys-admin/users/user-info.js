@@ -6,7 +6,7 @@ import { seafileAPI } from '../../../utils/seafile-api';
 import { gettext, isPro } from '../../../utils/constants';
 import toaster from '../../../components/toast';
 import Loading from '../../../components/loading';
-import SysAdminSetQuotaDialog from '../../../components/dialog/sysadmin-dialog/set-quota';
+import SysAdminSetQuotaDialog from '../../../components/dialog/sysadmin-dialog/set-user-traffic-quotas';
 import SysAdminSetUploadDownloadRateLimitDialog from '../../../components/dialog/sysadmin-dialog/set-upload-download-rate-limit';
 import SysAdminUpdateUserDialog from '../../../components/dialog/sysadmin-dialog/update-user';
 import MainPanelTopbar from '../main-panel-topbar';
@@ -40,8 +40,8 @@ class Content extends Component {
     this.setState({ isSetUserDownloadRateLimitDialogOpen: !this.state.isSetUserDownloadRateLimitDialogOpen });
   };
 
-  updateQuota = (value) => {
-    this.props.updateUser('quota_total', value);
+  updateQuota = (values) => {
+    return this.props.updateUser(values);
   };
 
   updateUploadDownloadRateLimit = (uploadOrDownload, value) => {
@@ -155,6 +155,16 @@ class Content extends Component {
               {`${Utils.bytesToSize(user.quota_usage)} / ${user.quota_total > 0 ? Utils.bytesToSize(user.quota_total) : '--'}`}
               {this.showEditIcon(this.toggleSetQuotaDialog)}
             </dd>
+            <dt className="info-item-heading">{gettext('Monthly Upload Quota')}</dt>
+            <dd className="info-item-content">
+              {user.traffic_upload_quota > 0 ? Utils.bytesToSize(user.traffic_upload_quota) : '--'}
+              {this.showEditIcon(this.toggleSetQuotaDialog)}
+            </dd>
+            <dt className="info-item-heading">{gettext('Monthly Download Quota')}</dt>
+            <dd className="info-item-content">
+              {user.traffic_download_quota > 0 ? Utils.bytesToSize(user.traffic_download_quota) : '--'}
+              {this.showEditIcon(this.toggleSetQuotaDialog)}
+            </dd>
             {isPro &&
               <Fragment>
                 <dt className="info-item-heading">{gettext('Upload Rate Limit')}</dt>
@@ -194,8 +204,11 @@ class Content extends Component {
           </dl>
           {isSetQuotaDialogOpen &&
             <SysAdminSetQuotaDialog
+              quotaTotal={user.quota_total}
+              trafficUploadQuota={user.traffic_upload_quota}
+              trafficDownloadQuota={user.traffic_download_quota}
               updateQuota={this.updateQuota}
-              toggle={this.toggleSetQuotaDialog}
+              toggleDialog={this.toggleSetQuotaDialog}
             />
           }
           {(isPro && isSetUserUploadRateLimitDialogOpen) &&
@@ -265,18 +278,26 @@ class User extends Component {
     });
   }
 
-  updateUser = (key, value) => {
+  updateUser = (keyOrData, value) => {
     const email = this.state.userInfo.email;
-    seafileAPI.sysAdminUpdateUser(email, key, value).then(res => {
-      let userInfo = this.state.userInfo;
-      userInfo[key] = res.data[key];
-      this.setState({
-        userInfo: userInfo
+    let payload = keyOrData;
+    if (typeof keyOrData !== 'string') {
+      const formData = new FormData();
+      Object.keys(keyOrData).forEach((key) => {
+        formData.append(key, keyOrData[key]);
       });
+      payload = formData;
+    }
+    seafileAPI.sysAdminUpdateUser(email, payload, value).then(res => {
+      const requestedUpdates = typeof keyOrData === 'string' ? { [keyOrData]: value } : keyOrData;
+      this.setState((prevState) => ({
+        userInfo: Object.assign({}, prevState.userInfo, requestedUpdates, res.data)
+      }));
       toaster.success(gettext('Edit succeeded'));
     }).catch((error) => {
-      let errMessage = Utils.getErrorMsg(error);
+      const errMessage = Utils.getErrorMsg(error);
       toaster.danger(errMessage);
+      return Promise.reject(errMessage);
     });
   };
 

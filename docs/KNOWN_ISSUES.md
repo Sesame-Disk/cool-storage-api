@@ -35,6 +35,7 @@ This document tracks all known bugs, limitations, and issues in SesameFS.
 | Library Settings Backend | ✅ Complete | History, API tokens, auto-delete, transfer |
 | **Desktop SSO Browser UX** | ✅ Fixed (2026-03-04) | After browser SSO login for desktop client, now shows confirmation page with auto-close. See ISSUE-SSO-01 below. |
 | **Upload "Don't Replace" (Desktop Client)** | 🟡 Pending | Desktop client file browser "No" button (auto-rename) doesn't work. Client uses `update-link` vs `upload-link` to distinguish replace vs no-replace, but both map to same token/handler. Backend autorename infrastructure ready (`autoRenameIfExists`), needs token-level `Replace` flag to distinguish endpoints. Web "Don't replace" also broken (same root cause). See ISSUE-UPLOAD-REPLACE-01 below. |
+| **Org Logo Upload** | 🟡 Stub | `UpdateOrgLogo` in org_admin.go accepts the file but does not persist it to storage. Returns a static path from settings. Functional as a route placeholder until an asset storage backend is available. |
 
 ### 🟡 SeaDrive 3.x Missing Endpoints (Non-fatal, but degrade UX)
 | Issue | Status | Notes |
@@ -2090,41 +2091,16 @@ The client also sends `replace=1` in both cases, so the form parameter doesn't h
 
 ---
 
-## ISSUE-FRONTEND-ORG-DELETE-01: Superadmin Org Soft-Delete/Restore UI
+## ~~ISSUE-FRONTEND-ORG-DELETE-01~~: Superadmin Org Soft-Delete/Restore UI — ✅ RESOLVED
 
-**Status**: 🟡 Backend complete, frontend TODO
-**Date identified**: 2026-03-18
-**Priority**: Medium — needed before production if multi-org is used
+**Status**: ✅ Complete (2026-03-25)
+**Date identified**: 2026-03-18 | **Date resolved**: 2026-03-25
 
-### Problem
-
-Backend now supports three distinct org states (active, deactivated, deleted) with full cascade deletion after grace period, but the frontend superadmin dashboard has no UI for:
-1. Soft-deleting an org (triggering the 30-day grace period cascade)
-2. Restoring a deleted org within the grace period
-3. Displaying org status with visual differentiation
-4. Filtering orgs by status
-
-### Backend Endpoints (ready)
-
-| Method | Endpoint | Action |
-|--------|----------|--------|
-| DELETE | `/admin/organizations/:org_id/` | Deactivate (sets status='deactivated', reversible, no cascade) |
-| POST | `/admin/organizations/:org_id/delete/` | Soft-delete (sets status='deleted' + deleted_at, starts grace period) |
-| POST | `/admin/organizations/:org_id/restore/` | Restore (sets status='active', clears deleted_at) |
-
-### Frontend Changes Required
-
-**Files to modify:**
-- `frontend/src/pages/sys-admin/orgs/` — Org list and detail pages
-- `frontend/src/utils/seafile-api.js` — Add `sysAdminSoftDeleteOrg(orgID)` and `sysAdminRestoreOrg(orgID)` API functions
-
-**UI requirements:**
-1. Org list: add "Status" column (active/deactivated/deleted) with color coding
-2. Org actions dropdown: separate "Deactivate" (existing) from "Delete" (new) actions
-3. Deleted orgs: show "Restore" button + days remaining before permanent deletion
-4. Confirmation dialog for delete action warning about the 30-day grace period
-5. Optional: filter tabs or dropdown to show All/Active/Deactivated/Deleted orgs
-6. Org admin dashboard: warning banner if org is in "deleted" state
+Fully implemented in `frontend/src/pages/sys-admin/orgs/orgs-content.js`, `orgs.js`, and `search-orgs.js`:
+- Status column with color-coded badges (active/deactivated/deleted)
+- Separate Deactivate, Delete, Reactivate, and Restore actions with confirmation dialogs
+- Status filter support in org listing
+- Search results also support all lifecycle actions
 
 ---
 

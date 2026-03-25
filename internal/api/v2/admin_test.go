@@ -565,16 +565,18 @@ func TestAdminGroupResponse_JSONFormat(t *testing.T) {
 
 func TestAdminUserResponse_JSONFormat(t *testing.T) {
 	resp := adminUserResponse{
-		Email:      "test@example.com",
-		Name:       "Test User",
-		Status:     "active",
-		IsActive:   true,
-		IsStaff:    false,
-		Role:       "user",
-		QuotaTotal: 1099511627776,
-		QuotaUsage: 524288,
-		CreateTime: "2025-06-15T12:00:00Z",
-		LastLogin:  "",
+		Email:                "test@example.com",
+		Name:                 "Test User",
+		Status:               "active",
+		IsActive:             true,
+		IsStaff:              false,
+		Role:                 "user",
+		QuotaTotal:           1099511627776,
+		QuotaUsage:           524288,
+		TrafficUploadQuota:   2097152,
+		TrafficDownloadQuota: 4194304,
+		CreateTime:           "2025-06-15T12:00:00Z",
+		LastLogin:            "",
 	}
 
 	data, err := json.Marshal(resp)
@@ -593,10 +595,12 @@ func TestAdminUserResponse_JSONFormat(t *testing.T) {
 	assert.Equal(t, "", parsed["admin_role"])
 	assert.Equal(t, float64(1099511627776), parsed["quota_total"])
 	assert.Equal(t, float64(524288), parsed["quota_usage"])
+	assert.Equal(t, float64(2097152), parsed["traffic_upload_quota"])
+	assert.Equal(t, float64(4194304), parsed["traffic_download_quota"])
 	assert.Equal(t, "2025-06-15T12:00:00Z", parsed["create_time"])
 	assert.Equal(t, "", parsed["last_login"])
 
-	expectedKeys := []string{"email", "name", "status", "is_active", "is_staff", "role", "admin_role", "quota_total", "quota_usage", "create_time", "last_login"}
+	expectedKeys := []string{"email", "name", "status", "is_active", "is_staff", "role", "admin_role", "quota_total", "quota_usage", "traffic_upload_quota", "traffic_download_quota", "create_time", "last_login"}
 	for _, key := range expectedKeys {
 		_, exists := parsed[key]
 		assert.True(t, exists, "expected key %q in JSON output", key)

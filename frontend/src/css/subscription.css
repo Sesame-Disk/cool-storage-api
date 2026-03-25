@@ -2,6 +2,31 @@
     padding: 0rem 1rem 8rem;
     overflow: auto;
   }
+
+  .subscription-page {
+    height: 100vh;
+    min-height: 0;
+  }
+
+  .subscription-shell {
+    min-height: 0;
+  }
+
+  .subscription-page .side-panel,
+  .subscription-main-panel {
+    min-height: 0;
+  }
+
+  .subscription-main-panel {
+    min-width: 0;
+  }
+
+  .subscription-content {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
+  }
   
   .content .dropdown .btn-outline-primary {
     color: #f19645;

@@ -2,7 +2,7 @@ import React, { Component, Fragment } from 'react';
 import PropTypes from 'prop-types';
 import toaster from './toast';
 import { InputGroup, InputGroupAddon, InputGroupText, Input, Button } from 'reactstrap';
-import { gettext, serviceURL } from '../utils/constants';
+import { gettext, serviceURL, subscriptionDetailsUrl } from '../utils/constants';
 import { Utils } from '../utils/utils';
 import { subscriptionAPI } from '../utils/subscription-api';
 import Loading from './loading';
@@ -10,9 +10,55 @@ import Loading from './loading';
 import '../css/layout.css';
 import '../css/subscription.css';
 
-const {
-  isOrgContext,
-} = window.app.pageOptions;
+const isOrgContext = window.app?.pageOptions?.isOrgContext ?? true;
+
+const BYTES_IN_GB = 1000 * 1000 * 1000;
+
+const formatPlanName = (plan, orgContext) => {
+  if (!plan) {
+    return orgContext ? gettext('Organization') : gettext('Personal');
+  }
+  return plan
+    .split(/[-_]/)
+    .filter(Boolean)
+    .map(part => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(' ');
+};
+
+const formatBillingCycle = (billingCycle) => {
+  if (billingCycle === 'annual') {
+    return gettext('Annual');
+  }
+  if (billingCycle === 'monthly') {
+    return gettext('Monthly');
+  }
+  return billingCycle || '--';
+};
+
+const formatBytesOrUnlimited = (bytes) => {
+  if (bytes > 0) {
+    return Utils.bytesToSize(bytes);
+  }
+  return gettext('Unlimited');
+};
+
+const formatUsageAndLimit = (used, limit) => {
+  return `${Utils.bytesToSize(used || 0)} / ${formatBytesOrUnlimited(limit)}`;
+};
+
+const formatUserLimit = (currentUsers, maxUsers) => {
+  if (maxUsers > 0) {
+    return `${currentUsers || 0} / ${maxUsers}`;
+  }
+  return `${currentUsers || 0} / ${gettext('Unlimited')}`;
+};
+
+const quotaUsagePercent = (used, limit) => {
+  if (limit <= 0) {
+    return gettext('Unlimited');
+  }
+  return `${((used || 0) / limit * 100).toFixed(1)}%`;
+};
 
 const PlansPropTypes = {
   plans: PropTypes.array.isRequired,
@@ -32,7 +78,7 @@ class Plans extends Component {
   }
 
   togglePlan = (plan) => {
-    this.setState({currentPlan: plan}, () => {
+    this.setState({ currentPlan: plan }, () => {
     });
   };
 
@@ -74,7 +120,7 @@ class Plans extends Component {
     } else if (count > 9999) {
       count = 9999;
     }
-    this.setState({count: count});
+    this.setState({ count: count });
   };
 
   onAssetQuotaUnitCountInputChange = (e) => {
@@ -88,7 +134,7 @@ class Plans extends Component {
     } else if (count > 9999) {
       count = 9999;
     }
-    this.setState({assetQuotaUnitCount: count});
+    this.setState({ assetQuotaUnitCount: count });
   };
 
   renderPaidOrExtendTime = () => {
@@ -102,7 +148,7 @@ class Plans extends Component {
     let originalTotalAmount = totalAmount;
     return (
       <div className='d-flex flex-column subscription-container'>
-        <span className="subscription-subtitle">{'选择方案'}</span>
+        <span className="subscription-subtitle">{gettext('Choose Plan')}</span>
         <dl className='items-dl'>
           {plans.map((item, index) => {
             let selectedCss = item.plan_id === currentPlan.plan_id ? 'plan-selected' : '';
@@ -121,7 +167,7 @@ class Plans extends Component {
 
         {paymentType === 'extend_time' && boughtQuota > 0 &&
           <Fragment>
-            <span className="subscription-subtitle">{'增加空间'}</span>
+            <span className="subscription-subtitle">{gettext('Additional Storage')}</span>
             <dl className='items-dl'>
               <dd className='order-item order-item-top order-item-bottom subscription-list'>
                 <span className='order-into'>{currentPlan.asset_quota_unit + 'GB x ' + (boughtQuota / currentPlan.asset_quota_unit)}</span>
@@ -132,46 +178,46 @@ class Plans extends Component {
           </Fragment>
         }
 
-        <span className="subscription-subtitle">{'方案汇总'}</span>
+        <span className="subscription-subtitle">{gettext('Summary')}</span>
         <dl className='items-dl'>
           <div>
             <dd className='order-item order-item-top'>
-              <span className='order-into'>{'所选方案'}</span>
+              <span className='order-into'>{gettext('Selected Plan')}</span>
               <span className='order-value'>{currentPlan.name}</span>
             </dd>
             {isOrgContext &&
               <dd className='order-item'>
-                <span className='order-into'>{'成员人数'}</span>
-                <span className='order-value'>{currentPlan.count + '人'}</span>
+                <span className='order-into'>{gettext('Users')}</span>
+                <span className='order-value'>{`${currentPlan.count} ${gettext('users')}`}</span>
               </dd>
             }
             <dd className='order-item'>
-              <span className='order-into'>{'可用空间'}</span>
-              <span className='order-value'>{'100GB(附赠)' + (boughtQuota > 0 ? '+' + boughtQuota + 'GB(扩充)' : '')}</span>
+              <span className='order-into'>{gettext('Available Storage')}</span>
+              <span className='order-value'>{`100GB (${gettext('included')})` + (boughtQuota > 0 ? ` + ${boughtQuota}GB (${gettext('extra')})` : '')}</span>
             </dd>
             <dd className='order-item order-item-bottom rounded-0'>
-              <span className='order-into'>{'到期时间'}</span>
+              <span className='order-into'>{gettext('Expiration')}</span>
               <span className='order-value'>{currentPlan.new_term_end}</span>
             </dd>
             <dd className='order-item order-item-bottom subscription-list'>
-              <span className='order-into'>{'实际支付金额'}</span>
+              <span className='order-into'>{gettext('Total Amount')}</span>
               <span className='order-price'>
                 {originalTotalAmount !== totalAmount &&
-                  <span style={{fontSize: 'small', textDecoration: 'line-through', color: '#9a9a9a'}}>{'￥' + originalTotalAmount}</span>
+                  <span style={{ fontSize: 'small', textDecoration: 'line-through', color: '#9a9a9a' }}>{'￥' + originalTotalAmount}</span>
                 }
                 <span>{'￥' + totalAmount + ' '}</span>
               </span>
             </dd>
           </div>
         </dl>
-        <Button className='subscription-submit' color="primary" onClick={this.onPay}>{'提交订单'}</Button>
+        <Button className='subscription-submit' color="primary" onClick={this.onPay}>{gettext('Submit Order')}</Button>
       </div>
     );
   };
 
   renderAddUser = () => {
     let { currentPlan, count } = this.state;
-    let operationIntro = '新增用户';
+    let operationIntro = gettext('Add Users');
     let originalTotalAmount = count * currentPlan.price_per_user;
     let totalAmount = originalTotalAmount;
     return (
@@ -181,7 +227,7 @@ class Plans extends Component {
         <span className='py-2 mb-0 text-orange font-500 text-center'>
           {'¥ '}<span className="price-version-plan-price">{currentPlan.price}</span>{' ' + currentPlan.description}
         </span>
-        <InputGroup style={{marginBottom: '5px'}} className='user-numbers'>
+        <InputGroup style={{ marginBottom: '5px' }} className='user-numbers'>
           <InputGroupAddon addonType="prepend">
             <InputGroupText>{operationIntro}</InputGroupText>
           </InputGroupAddon>
@@ -198,21 +244,21 @@ class Plans extends Component {
           />
         </InputGroup>
         <span className='py-2 text-orange mb-0 font-500 price-version-plan-whole-price text-center'>
-          {'总价 ¥ ' + totalAmount}
+          {gettext('Total') + ' ¥ ' + totalAmount}
           {originalTotalAmount !== totalAmount &&
-            <span style={{fontSize: 'small', textDecoration: 'line-through', color: '#9a9a9a'}}>{' ￥' + originalTotalAmount}</span>
+            <span style={{ fontSize: 'small', textDecoration: 'line-through', color: '#9a9a9a' }}>{' ￥' + originalTotalAmount}</span>
           }
         </span>
-        <span className='py-2 mb-0 text-lg-size font-500 price-version-plan-valid-day text-center'>{'有效期至 ' + currentPlan.new_term_end}</span>
-        <span className='subscription-notice text-center py-5'>{'注：当有效期剩余天数少于计划中的时候，增加用户的价格按天来计算'}</span>
-        <Button className='subscription-submit' onClick={this.onPay} color="primary">{'立即购买'}</Button>
+        <span className='py-2 mb-0 text-lg-size font-500 price-version-plan-valid-day text-center'>{gettext('Valid Until') + ' ' + currentPlan.new_term_end}</span>
+        <span className='subscription-notice text-center py-5'>{gettext('When the remaining subscription time is shorter than the selected plan, added users are charged proportionally by day.')}</span>
+        <Button className='subscription-submit' onClick={this.onPay} color="primary">{gettext('Buy Now')}</Button>
       </div>
     );
   };
 
   renderBuyQuota = () => {
     let { currentPlan, assetQuotaUnitCount } = this.state;
-    let operationIntro = '新增空间';
+    let operationIntro = gettext('Add Storage');
     let originalTotalAmount = assetQuotaUnitCount * currentPlan.price_per_asset_quota_unit;
     let totalAmount = originalTotalAmount;
     return (
@@ -222,7 +268,7 @@ class Plans extends Component {
         <span className='py-2 mb-0 text-orange font-500 text-center'>
           {'¥ '}<span className="price-version-plan-price">{currentPlan.asset_quota_price}</span>{' ' + currentPlan.asset_quota_description}
         </span>
-        <InputGroup style={{marginBottom: '5px'}} className='space-quota'>
+        <InputGroup style={{ marginBottom: '5px' }} className='space-quota'>
           <InputGroupAddon addonType="prepend">
             <InputGroupText><span className="font-500">{operationIntro}</span></InputGroupText>
           </InputGroupAddon>
@@ -242,14 +288,14 @@ class Plans extends Component {
           </InputGroupAddon>
         </InputGroup>
         <span className='py-4 text-orange mb-0 font-500 price-version-plan-whole-price text-center'>
-          {'总价 ¥ ' + totalAmount}
+          {gettext('Total') + ' ¥ ' + totalAmount}
           {originalTotalAmount !== totalAmount &&
-            <span style={{fontSize: 'small', textDecoration: 'line-through', color: '#9a9a9a'}}>{' ￥' + originalTotalAmount}</span>
+            <span style={{ fontSize: 'small', textDecoration: 'line-through', color: '#9a9a9a' }}>{' ￥' + originalTotalAmount}</span>
           }
         </span>
-        <span className='py-2 mb-0 text-lg-size font-500 price-version-plan-valid-day text-center'>{'有效期至 ' + currentPlan.new_term_end}</span>
-        <span className='subscription-notice text-center py-5'>{'注：当有效期剩余天数少于计划中的时候，增加空间的价格按天来计算'}</span>
-        <Button className='subscription-submit' onClick={this.onPay} color="primary">{'立即购买'}</Button>
+        <span className='py-2 mb-0 text-lg-size font-500 price-version-plan-valid-day text-center'>{gettext('Valid Until') + ' ' + currentPlan.new_term_end}</span>
+        <span className='subscription-notice text-center py-5'>{gettext('When the remaining subscription time is shorter than the selected plan, added storage is charged proportionally by day.')}</span>
+        <Button className='subscription-submit' onClick={this.onPay} color="primary">{gettext('Buy Now')}</Button>
       </div>
     );
   };
@@ -330,25 +376,23 @@ class PlansDialog extends Component {
 
   render() {
     const { isLoading, isWaiting, planList } = this.state;
-    const { toggleDialog, paymentTypeTrans, paymentType } = this.props;
-    const modalStyle = (paymentType === 'paid' || paymentType === 'extend_time') ?
-      {width: '560px', maxWidth: '560px'} : {width: '560px'};
+    const { toggleDialog, paymentTypeTrans } = this.props;
 
     if (isLoading) {
       return (
         <div className="modal show d-block" tabIndex="-1" style={{ backgroundColor: 'rgba(0,0,0,0.5)' }}>
           <div className="modal-dialog modal-dialog-centered">
             <div className="modal-content">
-          <div className="modal-header">
-              <h5 className="modal-title">{paymentTypeTrans}</h5>
-              <button type="button" className="close" onClick={toggleDialog} aria-label="Close">
-                <span aria-hidden="true">&times;</span>
-              </button>
+              <div className="modal-header">
+                <h5 className="modal-title">{paymentTypeTrans}</h5>
+                <button type="button" className="close" onClick={toggleDialog} aria-label="Close">
+                  <span aria-hidden="true">&times;</span>
+                </button>
+              </div>
+              <div className="modal-body">
+                <Loading />
+              </div>
             </div>
-          <div className="modal-body">
-            <Loading />
-          </div>
-        </div>
           </div>
         </div>
       );
@@ -358,45 +402,45 @@ class PlansDialog extends Component {
         <div className="modal show d-block" tabIndex="-1" style={{ backgroundColor: 'rgba(0,0,0,0.5)' }}>
           <div className="modal-dialog modal-dialog-centered">
             <div className="modal-content">
-          <div className="modal-header">
-              <h5 className="modal-title">{paymentTypeTrans}</h5>
-              <button type="button" className="close" onClick={this.onReload} aria-label="Close">
-                <span aria-hidden="true">&times;</span>
-              </button>
+              <div className="modal-header">
+                <h5 className="modal-title">{paymentTypeTrans}</h5>
+                <button type="button" className="close" onClick={this.onReload} aria-label="Close">
+                  <span aria-hidden="true">&times;</span>
+                </button>
+              </div>
+              <div className="modal-body">
+                <div>{gettext('Has the payment been completed?')}</div>
+              </div>
+              <div className="modal-footer">
+                <button className="btn btn-outline-primary" onClick={this.onReload}>{gettext('Yes')}</button>
+              </div>
             </div>
-          <div className="modal-body">
-            <div>{'是否完成付款?'}</div>
-          </div>
-          <div className="modal-footer">
-            <button className="btn btn-outline-primary" onClick={this.onReload}>{'是'}</button>
-          </div>
-        </div>
           </div>
         </div>
       );
     }
     return (
       <div className="modal show d-block" tabIndex="-1" style={{ backgroundColor: 'rgba(0,0,0,0.5)' }}>
-          <div className="modal-dialog modal-dialog-centered">
-            <div className="modal-content">
-        <div className="modal-header">
+        <div className="modal-dialog modal-dialog-centered">
+          <div className="modal-content">
+            <div className="modal-header">
               <h5 className="modal-title">{paymentTypeTrans}</h5>
               <button type="button" className="close" onClick={toggleDialog} aria-label="Close">
                 <span aria-hidden="true">&times;</span>
               </button>
             </div>
-        <div className="modal-body">
-          <div className="d-flex justify-content-between">
-            <Plans
-              plans={planList}
-              onPay={this.onPay}
-              paymentType={this.props.paymentType}
-            />
+            <div className="modal-body">
+              <div className="d-flex justify-content-between">
+                <Plans
+                  plans={planList}
+                  onPay={this.onPay}
+                  paymentType={this.props.paymentType}
+                />
+              </div>
+            </div>
           </div>
         </div>
       </div>
-          </div>
-        </div>
     );
   }
 }
@@ -413,15 +457,16 @@ class Subscription extends Component {
   constructor(props) {
     super(props);
     this.paymentTypeTransMap = {
-      paid: '立即购买',
-      extend_time: '立即续费',
-      add_user: '增加用户',
-      buy_quota: '增加空间',
+      paid: gettext('Buy Now'),
+      extend_time: gettext('Renew Now'),
+      add_user: gettext('Add Users'),
+      buy_quota: gettext('Add Storage'),
     };
     this.state = {
       isLoading: true,
       errorMsg: '',
       isDialogOpen: false,
+      subscriptionData: null,
       planName: this.props.isOrgContext ? '团队版' : '个人版',
       userLimit: 20,
       assetQuota: 1,
@@ -435,11 +480,29 @@ class Subscription extends Component {
 
   getSubscription = () => {
     subscriptionAPI.getSubscription().then((res) => {
-      const subscription = res.data.subscription;
-      const paymentTypeList = res.data.payment_type_list;
+      const data = res.data || {};
+      const paymentTypeList = Array.isArray(data.payment_type_list) ? data.payment_type_list : [];
+
+      if (Object.prototype.hasOwnProperty.call(data, 'storage_quota') || Object.prototype.hasOwnProperty.call(data, 'traffic_quota')) {
+        this.setState({
+          isLoading: false,
+          errorMsg: '',
+          subscriptionData: data,
+          paymentTypeList: paymentTypeList,
+          subscription: null,
+          planName: formatPlanName(data.plan, this.props.isOrgContext),
+          userLimit: data.max_users,
+          assetQuota: data.storage_quota > 0 ? Math.round(data.storage_quota / BYTES_IN_GB) : 0,
+          termEnd: data.traffic_reset_date || '--',
+        });
+        return;
+      }
+
+      const subscription = data.subscription;
       if (!subscription) {
         this.setState({
           isLoading: false,
+          subscriptionData: null,
           paymentTypeList: paymentTypeList,
         });
       } else {
@@ -447,6 +510,7 @@ class Subscription extends Component {
         let plan = subscription.plan;
         this.setState({
           isLoading: false,
+          subscriptionData: null,
           subscription,
           planName: plan.name,
           userLimit: subscription.user_limit,
@@ -477,9 +541,73 @@ class Subscription extends Component {
     this.getSubscription();
   }
 
+  renderQuotaSummary = (label, used, limit, isLast = false) => {
+    return (
+      <dd className={`order-item${isLast ? ' order-item-bottom rounded-0' : ''}`}>
+        <span className="order-into">{label}</span>
+        <span className="order-value">{formatUsageAndLimit(used, limit)}</span>
+      </dd>
+    );
+  };
+
+  renderCurrentSubscription = () => {
+    const { subscriptionData } = this.state;
+    const storageQuota = subscriptionData.storage_quota || 0;
+    const storageUsed = subscriptionData.storage_used || 0;
+    const trafficQuota = subscriptionData.traffic_quota || 0;
+    const combinedUsed = subscriptionData.traffic_combined_used || 0;
+    const uploadQuota = subscriptionData.traffic_upload_quota || 0;
+    const uploadUsed = subscriptionData.traffic_upload_used || 0;
+    const downloadQuota = subscriptionData.traffic_download_quota || 0;
+    const downloadUsed = subscriptionData.traffic_download_used || 0;
+    const currentUsers = subscriptionData.current_users || 0;
+    const maxUsers = subscriptionData.max_users || 0;
+
+    return (
+      <Fragment>
+        <div id="current-plan" className="subscription-info">
+          <h3 className="subscription-info-heading">{gettext('Current Plan')}</h3>
+          <p className="mb-2">{formatPlanName(subscriptionData.plan, this.props.isOrgContext)}</p>
+        </div>
+        {this.props.isOrgContext &&
+          <div id="user-limit" className="subscription-info">
+            <h3 className="subscription-info-heading">{gettext('User Limit')}</h3>
+            <p className="mb-2">{formatUserLimit(currentUsers, maxUsers)}</p>
+          </div>
+        }
+        <div id="asset-quota" className="subscription-info">
+          <h3 className="subscription-info-heading">{gettext('Storage')}</h3>
+          <dl className="items-dl mb-0">
+            {this.renderQuotaSummary(gettext('Used'), storageUsed, storageQuota)}
+            <dd className="order-item order-item-bottom rounded-0">
+              <span className="order-into">{gettext('Usage')}</span>
+              <span className="order-value">{quotaUsagePercent(storageUsed, storageQuota)}</span>
+            </dd>
+          </dl>
+        </div>
+        <div id="traffic-quota" className="subscription-info">
+          <h3 className="subscription-info-heading">{gettext('Traffic')}</h3>
+          <dl className="items-dl mb-0">
+            {trafficQuota > 0 && this.renderQuotaSummary(gettext('Combined Monthly Traffic'), combinedUsed, trafficQuota)}
+            {this.renderQuotaSummary(gettext('Monthly Upload Traffic'), uploadUsed, uploadQuota)}
+            {this.renderQuotaSummary(gettext('Monthly Download Traffic'), downloadUsed, downloadQuota)}
+            <dd className="order-item order-item-bottom rounded-0">
+              <span className="order-into">{gettext('Traffic Reset')}</span>
+              <span className="order-value">{subscriptionData.traffic_reset_date || '--'}</span>
+            </dd>
+          </dl>
+        </div>
+        <div id="current-subscription-period" className="subscription-info">
+          <h3 className="subscription-info-heading">{gettext('Billing Cycle')}</h3>
+          <p className="mb-2">{formatBillingCycle(subscriptionData.billing_cycle)}</p>
+        </div>
+      </Fragment>
+    );
+  };
+
   render() {
     const { isLoading, errorMsg, planName, userLimit, assetQuota, termEnd,
-      isDialogOpen, paymentTypeList, currentPaymentType } = this.state;
+      isDialogOpen, paymentTypeList, currentPaymentType, subscriptionData } = this.state;
     if (isLoading) {
       return <Loading />;
     }
@@ -488,30 +616,39 @@ class Subscription extends Component {
     }
     return (
       <Fragment>
-        <div className="content position-relative" onScroll={this.props.handleContentScroll}>
-          <div id="current-plan" className="subscription-info">
-            <h3 className="subscription-info-heading">{'当前版本'}</h3>
-            <p className="mb-2">{planName}</p>
-          </div>
-          {this.props.isOrgContext &&
-            <div id="user-limit" className="subscription-info">
-              <h3 className="subscription-info-heading">{'用户数限制'}</h3>
-              <p className="mb-2">{userLimit}</p>
-            </div>
-          }
-          <div id="asset-quota" className="subscription-info">
-            <h3 className="subscription-info-heading">{'空间'}</h3>
-            <p className="mb-2">{assetQuota ? assetQuota + 'GB' : '1GB'}</p>
-          </div>
-          <div id="current-subscription-period" className="subscription-info">
-            <h3 className="subscription-info-heading">{'订阅有效期'}</h3>
-            <p className="mb-2">{termEnd}</p>
-          </div>
+        <div className="content subscription-content position-relative" onScroll={this.props.handleContentScroll}>
+          {subscriptionData ? this.renderCurrentSubscription() : (
+            <Fragment>
+              <div id="current-plan" className="subscription-info">
+                <h3 className="subscription-info-heading">{gettext('Current Plan')}</h3>
+                <p className="mb-2">{planName}</p>
+              </div>
+              {this.props.isOrgContext &&
+                <div id="user-limit" className="subscription-info">
+                  <h3 className="subscription-info-heading">{gettext('User Limit')}</h3>
+                  <p className="mb-2">{userLimit}</p>
+                </div>
+              }
+              <div id="asset-quota" className="subscription-info">
+                <h3 className="subscription-info-heading">{gettext('Storage')}</h3>
+                <p className="mb-2">{assetQuota ? assetQuota + 'GB' : '1GB'}</p>
+              </div>
+              <div id="current-subscription-period" className="subscription-info">
+                <h3 className="subscription-info-heading">{gettext('Billing Cycle')}</h3>
+                <p className="mb-2">{termEnd}</p>
+              </div>
+            </Fragment>
+          )}
           <div id="product-price" className="subscription-info">
-            <h3 className="subscription-info-heading">{'云服务付费方案'}</h3>
-            <p className="mb-2">
-              <a rel="noopener noreferrer" target="_blank" href="https://www.seafile.com/seafile-docs/home/">{'查看详情'}</a>
-            </p>
+            <h3 className="subscription-info-heading">{gettext('Billing Details')}</h3>
+            {subscriptionDetailsUrl && (
+              <p className="mb-2">
+                <a rel="noopener noreferrer" target="_blank" href={subscriptionDetailsUrl}>{gettext('View Details')}</a>
+              </p>
+            )}
+            {subscriptionData && paymentTypeList.length === 0 &&
+              <p className="mb-2 text-secondary">{gettext('Plan changes are managed by the billing service.')}</p>
+            }
           </div>
           {paymentTypeList.map((item, index) => {
             let name = this.paymentTypeTransMap[item];
@@ -525,9 +662,9 @@ class Subscription extends Component {
           })}
           {!this.state.subscription &&
             <div id="sales-consultant" className="subscription-info mt-6">
-              <h3 className="subscription-info-heading">{'销售咨询'}</h3>
+              <h3 className="subscription-info-heading">{gettext('Sales Contact')}</h3>
               <img className="mb-2" src="/media/img/qr-sale.png" alt="" width="112"></img>
-              <p className="mb-2">{'微信扫码联系销售'}</p>
+              <p className="mb-2">{gettext('Scan to contact sales')}</p>
             </div>
           }
         </div>

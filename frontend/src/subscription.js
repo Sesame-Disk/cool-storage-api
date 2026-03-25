@@ -1,6 +1,6 @@
 import React from 'react';
 import ReactDOM from 'react-dom';
-import { siteRoot, mediaUrl, logoPath, logoWidth, logoHeight, siteTitle } from './utils/constants';
+import { siteRoot, mediaUrl, logoPath, logoHeight, siteTitle, gettext } from './utils/constants';
 import SideNav from './components/user-settings/side-nav';
 import Account from './components/common/account';
 import Notification from './components/common/notification';
@@ -16,13 +16,14 @@ class UserSubscription extends React.Component {
   constructor(props) {
     super(props);
     this.sideNavItems = [
-      { show: true, href: '#current-plan', text: '当前版本' },
-      { show: true, href: '#asset-quota', text: '空间' },
-      { show: true, href: '#current-subscription-period', text: '订阅有效期' },
-      { show: true, href: '#product-price', text: '云服务付费方案' },
+      { show: true, href: '#current-plan', text: gettext('Current Plan') },
+      { show: true, href: '#asset-quota', text: gettext('Storage') },
+      { show: true, href: '#traffic-quota', text: gettext('Traffic') },
+      { show: true, href: '#current-subscription-period', text: gettext('Billing Cycle') },
+      { show: true, href: '#product-price', text: gettext('Billing Details') },
     ];
     this.state = {
-      curItemID: this.sideNavItems[0].href.substr(1),
+      curItemID: this.sideNavItems[0].href.slice(1),
     };
   }
 
@@ -30,11 +31,12 @@ class UserSubscription extends React.Component {
     // Mobile does not display the sideNav, so when scrolling don't update curItemID
     const scrollTop = e.target.scrollTop;
     const scrolled = this.sideNavItems.filter((item, index) => {
-      return item.show && document.getElementById(item.href.substr(1)).offsetTop - 45 < scrollTop;
+      const section = document.getElementById(item.href.slice(1));
+      return item.show && section && section.offsetTop - 45 < scrollTop;
     });
     if (scrolled.length) {
       this.setState({
-        curItemID: scrolled[scrolled.length - 1].href.substr(1)
+        curItemID: scrolled[scrolled.length - 1].href.slice(1)
       });
     }
   };
@@ -42,22 +44,22 @@ class UserSubscription extends React.Component {
   render() {
     let logoUrl = logoPath.startsWith('http') ? logoPath : mediaUrl + logoPath;
     return (
-      <div className="h-100 d-flex flex-column">
+      <div className="subscription-page h-100 d-flex flex-column">
         <div className="top-header d-flex justify-content-between">
           <a href={siteRoot}>
-            <img src={logoUrl} height={logoHeight} style={{width: 'auto'}} title={siteTitle} alt="logo" />
+            <img src={logoUrl} height={logoHeight} style={{ width: 'auto' }} title={siteTitle} alt="logo" />
           </a>
           <div className="common-toolbar">
             <Notification />
             <Account />
           </div>
         </div>
-        <div className="flex-auto d-flex o-hidden">
+        <div className="subscription-shell flex-auto d-flex o-hidden">
           <div className="side-panel o-auto">
             <SideNav data={this.sideNavItems} curItemID={this.state.curItemID} />
           </div>
-          <div className="main-panel d-flex flex-column">
-            <h2 className="heading">{'付费管理'}</h2>
+          <div className="main-panel subscription-main-panel d-flex flex-column">
+            <h2 className="heading">{gettext('Subscription')}</h2>
             <Subscription isOrgContext={false} handleContentScroll={this.handleContentScroll} />
           </div>
         </div>

@@ -8,37 +8,59 @@ import { Utils } from '../../utils/utils';
 const propTypes = {
   orgID: PropTypes.string,
   email: PropTypes.string.isRequired,
-  quotaTotal: PropTypes.string.isRequired,
+  quotaTotal: PropTypes.oneOfType([PropTypes.string, PropTypes.number]).isRequired,
+  trafficUploadQuota: PropTypes.oneOfType([PropTypes.string, PropTypes.number]),
+  trafficDownloadQuota: PropTypes.oneOfType([PropTypes.string, PropTypes.number]),
   updateQuota: PropTypes.func.isRequired,
   toggleDialog: PropTypes.func.isRequired
+};
+
+const MB = 1000 * 1000;
+
+const quotaBytesToInputValue = (quota) => {
+  return quota > 0 ? String(Math.round(quota / MB)) : '';
 };
 
 class SetOrgUserQuota extends React.Component {
 
   constructor(props) {
     super(props);
-    const initialQuota = this.props.quotaTotal < 0 ? '' :
-      this.props.quotaTotal / (1000 * 1000);
     this.state = {
-      inputValue: initialQuota,
+      storageInputValue: quotaBytesToInputValue(this.props.quotaTotal),
+      uploadInputValue: quotaBytesToInputValue(this.props.trafficUploadQuota),
+      downloadInputValue: quotaBytesToInputValue(this.props.trafficDownloadQuota),
       submitBtnDisabled: false
     };
   }
 
-  handleInputChange = (e) => {
+  handleInputChange = (field) => (e) => {
     this.setState({
-      inputValue: e.target.value
+      [field]: e.target.value
     });
+  };
+
+  parseMegabytes = (value, emptyValue) => {
+    const trimmed = `${value || ''}`.trim();
+    if (trimmed === '') {
+      return emptyValue;
+    }
+
+    const parsed = Number(trimmed);
+    if (!Number.isFinite(parsed) || parsed < 0) {
+      return null;
+    }
+
+    return Math.round(parsed * MB);
   };
 
   formSubmit = () => {
     const { orgID, email } = this.props;
-    const quota = this.state.inputValue.trim();
+    const storageQuota = this.parseMegabytes(this.state.storageInputValue, 0);
+    const uploadQuota = this.parseMegabytes(this.state.uploadInputValue, -1);
+    const downloadQuota = this.parseMegabytes(this.state.downloadInputValue, -1);
 
-    if (!quota) {
-      this.setState({
-        formErrorMsg: gettext('It is required.')
-      });
+    if (storageQuota === null || uploadQuota === null || downloadQuota === null) {
+      this.setState({ formErrorMsg: gettext('Please enter a valid non-negative number.') });
       return false;
     }
 
@@ -46,8 +68,16 @@ class SetOrgUserQuota extends React.Component {
       submitBtnDisabled: true
     });
 
-    seafileAPI.orgAdminSetOrgUserQuota(orgID, email, quota).then((res) => {
-      this.props.updateQuota(res.data.quota_total);
+    seafileAPI.orgAdminUpdateOrgUserQuotas(orgID, email, {
+      quotaTotal: storageQuota,
+      trafficUploadQuota: uploadQuota,
+      trafficDownloadQuota: downloadQuota,
+    }).then((res) => {
+      this.props.updateQuota({
+        quota_total: res.data.quota_total,
+        traffic_upload_quota: res.data.traffic_upload_quota,
+        traffic_download_quota: res.data.traffic_download_quota,
+      });
       this.props.toggleDialog();
     }).catch((error) => {
       let errorMsg = Utils.getErrorMsg(error);
@@ -59,36 +89,55 @@ class SetOrgUserQuota extends React.Component {
   };
 
   render() {
-    const { inputValue, formErrorMsg, submitBtnDisabled } = this.state;
+    const { storageInputValue, uploadInputValue, downloadInputValue, formErrorMsg, submitBtnDisabled } = this.state;
     return (
       <div className="modal show d-block" tabIndex="-1" style={{ backgroundColor: 'rgba(0,0,0,0.5)' }}>
-          <div className="modal-dialog modal-dialog-centered">
-            <div className="modal-content">
-        <div className="modal-header">
+        <div className="modal-dialog modal-dialog-centered">
+          <div className="modal-content">
+            <div className="modal-header">
               <h5 className="modal-title">{gettext('Set user quota')}</h5>
               <button type="button" className="close" onClick={this.props.toggleDialog} aria-label="Close">
                 <span aria-hidden="true">&times;</span>
               </button>
             </div>
-        <div className="modal-body">
-          <React.Fragment>
-            <InputGroup>
-              <input type="text" className="form-control" value={inputValue} onChange={this.handleInputChange} />
-              <InputGroupAddon addonType="append">
-                <InputGroupText>MB</InputGroupText>
-              </InputGroupAddon>
-            </InputGroup>
-            <p className="small text-secondary mt-2 mb-2">{gettext('Tip: 0 means default limit')}</p>
-            {formErrorMsg && <p className="error m-0 mt-2">{formErrorMsg}</p>}
-          </React.Fragment>
-        </div>
-        <div className="modal-footer">
-          <button className="btn btn-secondary" onClick={this.props.toggleDialog}>{gettext('Cancel')}</button>
-          <button className="btn btn-primary" disabled={submitBtnDisabled} onClick={this.formSubmit}>{gettext('Submit')}</button>
-        </div>
-      </div>
+            <div className="modal-body">
+              <React.Fragment>
+                <label className="mb-1">{gettext('Storage quota')}</label>
+                <InputGroup>
+                  <input type="text" className="form-control" value={storageInputValue} onChange={this.handleInputChange('storageInputValue')} />
+                  <InputGroupAddon addonType="append">
+                    <InputGroupText>MB</InputGroupText>
+                  </InputGroupAddon>
+                </InputGroup>
+                <p className="small text-secondary mt-2 mb-3">{gettext('Tip: 0 means default limit')}</p>
+
+                <label className="mb-1">{gettext('Monthly upload quota')}</label>
+                <InputGroup>
+                  <input type="text" className="form-control" value={uploadInputValue} onChange={this.handleInputChange('uploadInputValue')} />
+                  <InputGroupAddon addonType="append">
+                    <InputGroupText>MB</InputGroupText>
+                  </InputGroupAddon>
+                </InputGroup>
+                <p className="small text-secondary mt-2 mb-3">{gettext('Leave empty to inherit the organization limit.')}</p>
+
+                <label className="mb-1">{gettext('Monthly download quota')}</label>
+                <InputGroup>
+                  <input type="text" className="form-control" value={downloadInputValue} onChange={this.handleInputChange('downloadInputValue')} />
+                  <InputGroupAddon addonType="append">
+                    <InputGroupText>MB</InputGroupText>
+                  </InputGroupAddon>
+                </InputGroup>
+                <p className="small text-secondary mt-2 mb-2">{gettext('Leave empty to inherit the organization limit.')}</p>
+                {formErrorMsg && <p className="error m-0 mt-2">{formErrorMsg}</p>}
+              </React.Fragment>
+            </div>
+            <div className="modal-footer">
+              <button className="btn btn-secondary" onClick={this.props.toggleDialog}>{gettext('Cancel')}</button>
+              <button className="btn btn-primary" disabled={submitBtnDisabled} onClick={this.formSubmit}>{gettext('Submit')}</button>
+            </div>
           </div>
         </div>
+      </div>
     );
   }
 }

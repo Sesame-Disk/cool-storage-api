@@ -51,15 +51,13 @@ class OrgUserProfile extends Component {
   };
 
   updateQuota = (quota) => {
-    this.setState({
-      quota_total: quota
-    });
+    this.setState(quota);
   };
 
   render() {
     return (
       <Fragment>
-        <MainPanelTopbar/>
+        <MainPanelTopbar />
         <div className="main-panel-center flex-row">
           <div className="cur-view-container">
             <OrgAdminUserNav email={this.props.email} currentItem='profile' />
@@ -111,9 +109,17 @@ class Content extends Component {
     const {
       loading, errorMsg,
       avatar_url, email, contact_email,
-      name, quota_total, quota_usage
+      name, quota_total, quota_usage,
+      traffic_upload_quota, traffic_download_quota,
     } = this.props.data;
     const { isSetNameDialogOpen, isSetContactEmailDialogOpen, isSetQuotaDialogOpen } = this.state;
+
+    const formatQuota = (quota, emptyLabel) => {
+      if (quota > 0) {
+        return Utils.bytesToSize(quota);
+      }
+      return emptyLabel;
+    };
 
     if (loading) {
       return <Loading />;
@@ -153,33 +159,47 @@ class Content extends Component {
             {`${Utils.bytesToSize(quota_usage)}${quota_total > 0 ? ' / ' + Utils.bytesToSize(quota_total) : ''}`}
             <span title={gettext('Edit')} className="attr-action-icon fa fa-pencil-alt" onClick={this.toggleSetQuotaDialog}></span>
           </dd>
+
+          <dt>{gettext('Monthly Upload Quota')}</dt>
+          <dd>
+            {formatQuota(traffic_upload_quota, gettext('Inherited from organization'))}
+            <span title={gettext('Edit')} className="attr-action-icon fa fa-pencil-alt" onClick={this.toggleSetQuotaDialog}></span>
+          </dd>
+
+          <dt>{gettext('Monthly Download Quota')}</dt>
+          <dd>
+            {formatQuota(traffic_download_quota, gettext('Inherited from organization'))}
+            <span title={gettext('Edit')} className="attr-action-icon fa fa-pencil-alt" onClick={this.toggleSetQuotaDialog}></span>
+          </dd>
         </dl>
         {isSetNameDialogOpen &&
-        <SetOrgUserName
-          orgID={orgID}
-          email={email}
-          name={name}
-          updateName={this.props.updateName}
-          toggleDialog={this.toggleSetNameDialog}
-        />
+          <SetOrgUserName
+            orgID={orgID}
+            email={email}
+            name={name}
+            updateName={this.props.updateName}
+            toggleDialog={this.toggleSetNameDialog}
+          />
         }
         {isSetContactEmailDialogOpen &&
-        <SetOrgUserContactEmail
-          orgID={orgID}
-          email={email}
-          contactEmail={contact_email}
-          updateContactEmail={this.props.updateContactEmail}
-          toggleDialog={this.toggleSetContactEmailDialog}
-        />
+          <SetOrgUserContactEmail
+            orgID={orgID}
+            email={email}
+            contactEmail={contact_email}
+            updateContactEmail={this.props.updateContactEmail}
+            toggleDialog={this.toggleSetContactEmailDialog}
+          />
         }
         {isSetQuotaDialogOpen &&
-        <SetOrgUserQuota
-          orgID={orgID}
-          email={email}
-          quotaTotal={quota_total}
-          updateQuota={this.props.updateQuota}
-          toggleDialog={this.toggleSetQuotaDialog}
-        />
+          <SetOrgUserQuota
+            orgID={orgID}
+            email={email}
+            quotaTotal={quota_total}
+            trafficUploadQuota={traffic_upload_quota}
+            trafficDownloadQuota={traffic_download_quota}
+            updateQuota={this.props.updateQuota}
+            toggleDialog={this.toggleSetQuotaDialog}
+          />
         }
       </Fragment>
     );

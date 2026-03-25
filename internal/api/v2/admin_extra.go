@@ -99,10 +99,159 @@ var trafficTypeOrder = []string{
 	"link-file-upload", "link-file-download",
 }
 
+type userTrafficMeta struct {
+	ID    string
+	Email string
+	Name  string
+}
+
+func newUserTrafficRow(meta userTrafficMeta) gin.H {
+	return gin.H{
+		"email":              meta.Email,
+		"name":               meta.Name,
+		"sync_file_upload":   int64(0),
+		"sync_file_download": int64(0),
+		"web_file_upload":    int64(0),
+		"web_file_download":  int64(0),
+		"link_file_upload":   int64(0),
+		"link_file_download": int64(0),
+	}
+}
+
+func addTrafficBytes(row gin.H, trafficType string, bytes int64) {
+	switch trafficType {
+	case "sync-file-upload":
+		row["sync_file_upload"] = row["sync_file_upload"].(int64) + bytes
+	case "sync-file-download":
+		row["sync_file_download"] = row["sync_file_download"].(int64) + bytes
+	case "web-file-upload":
+		row["web_file_upload"] = row["web_file_upload"].(int64) + bytes
+	case "web-file-download":
+		row["web_file_download"] = row["web_file_download"].(int64) + bytes
+	case "link-file-upload":
+		row["link_file_upload"] = row["link_file_upload"].(int64) + bytes
+	case "link-file-download":
+		row["link_file_download"] = row["link_file_download"].(int64) + bytes
+	}
+}
+
+func int64FromTrafficRow(row gin.H, key string) int64 {
+	if value, ok := row[key]; ok {
+		switch typed := value.(type) {
+		case int64:
+			return typed
+		case int:
+			return int64(typed)
+		case int32:
+			return int64(typed)
+		case float64:
+			return int64(typed)
+		}
+	}
+	return 0
+}
+
+func stringFromTrafficRow(row gin.H, key string) string {
+	if value, ok := row[key]; ok {
+		if typed, ok := value.(string); ok {
+			return typed
+		}
+	}
+	return ""
+}
+
+func sortTrafficRows(rows []gin.H, orderBy, defaultField string) {
+	field := orderBy
+	ascending := true
+	if field == "" {
+		field = defaultField + "_desc"
+	}
+	if strings.HasSuffix(field, "_desc") {
+		ascending = false
+		field = strings.TrimSuffix(field, "_desc")
+	} else if strings.HasSuffix(field, "_asc") {
+		field = strings.TrimSuffix(field, "_asc")
+	}
+
+	sort.SliceStable(rows, func(i, j int) bool {
+		if field == "name" || field == "email" || field == "org_name" {
+			left := stringFromTrafficRow(rows[i], field)
+			right := stringFromTrafficRow(rows[j], field)
+			if !ascending {
+				return left > right
+			}
+			return left < right
+		}
+
+		left := int64FromTrafficRow(rows[i], field)
+		right := int64FromTrafficRow(rows[j], field)
+		if left == right {
+			return stringFromTrafficRow(rows[i], "name") < stringFromTrafficRow(rows[j], "name")
+		}
+		if ascending {
+			return left < right
+		}
+		return left > right
+	})
+}
+
+func loadUserTrafficMetaForOrg(session *gocql.Session, orgID gocql.UUID, userMap map[string]userTrafficMeta) {
+	iter := session.Query(`SELECT user_id, email, name FROM users WHERE org_id = ?`, orgID).Iter()
+	var uid gocql.UUID
+	var email, name string
+	for iter.Scan(&uid, &email, &name) {
+		userMap[uid.String()] = userTrafficMeta{ID: uid.String(), Email: email, Name: name}
+	}
+	_ = iter.Close()
+}
+
+func accumulateTrafficPartition(session *gocql.Session, orgID gocql.UUID, month string, userMap map[string]userTrafficMeta, entries map[string]gin.H, perUserTotals map[string]int64, aggregateTotals map[string]int64) {
+	iter := session.Query(
+		`SELECT user_id, traffic_type, bytes_transferred FROM traffic_counters WHERE org_id = ? AND month = ?`,
+		orgID, month,
+	).Iter()
+	var userUUID gocql.UUID
+	var trafficType string
+	var bytes int64
+	for iter.Scan(&userUUID, &trafficType, &bytes) {
+		if userUUID == (gocql.UUID{}) {
+			if aggregateTotals != nil {
+				aggregateTotals[trafficType] += bytes
+			}
+			continue
+		}
+		if perUserTotals != nil {
+			perUserTotals[trafficType] += bytes
+		}
+		meta, ok := userMap[userUUID.String()]
+		if !ok || meta.Email == "" {
+			continue
+		}
+		entry, exists := entries[meta.Email]
+		if !exists {
+			entry = newUserTrafficRow(meta)
+		}
+		addTrafficBytes(entry, trafficType, bytes)
+		entries[meta.Email] = entry
+	}
+	_ = iter.Close()
+}
+
+func platformUserTrafficComplete(platformTotals map[string]int64, perUserTotals map[string]int64) bool {
+	for _, trafficType := range trafficTypeOrder {
+		if platformTotals[trafficType] != perUserTotals[trafficType] {
+			return false
+		}
+	}
+	return true
+}
+
 // queryTrafficStats reads traffic_counters for the given orgID and the date range
 // specified in the gin.Context query params (start, end, group_by).
 // Pass orgID=gocql.UUID{} (all-zeros) to query the platform-wide aggregate
-// written by the Recorder for sysadmin cross-org statistics.
+// written by the Recorder for sysadmin cross-org statistics. That partition now
+// also contains per-user detail rows, so only the zero-user aggregate rows are
+// counted for the system-wide chart.
 func queryTrafficStats(session *gocql.Session, orgID gocql.UUID, c *gin.Context) []gin.H {
 	startStr := c.Query("start")
 	endStr := c.Query("end")
@@ -144,14 +293,18 @@ func queryTrafficStats(session *gocql.Session, orgID gocql.UUID, c *gin.Context)
 	agg := map[string]map[string]int64{}
 	for month := range monthsNeeded {
 		iter := session.Query(
-			`SELECT day, traffic_type, bytes_transferred FROM traffic_counters
+			`SELECT day, user_id, traffic_type, bytes_transferred FROM traffic_counters
 			 WHERE org_id = ? AND month = ?`,
 			orgID, month,
 		).Iter()
 		var day time.Time
+		var userID gocql.UUID
 		var trafficType string
 		var bytes int64
-		for iter.Scan(&day, &trafficType, &bytes) {
+		for iter.Scan(&day, &userID, &trafficType, &bytes) {
+			if orgID == (gocql.UUID{}) && userID != (gocql.UUID{}) {
+				continue
+			}
 			dk := day.UTC().Format("2006-01-02")
 			if agg[dk] == nil {
 				agg[dk] = map[string]int64{}
@@ -327,6 +480,7 @@ func (h *AdminHandler) AdminListOrgTraffic(c *gin.Context) {
 	}
 
 	month := c.DefaultQuery("month", time.Now().UTC().Format("200601"))
+	orderBy := c.Query("order_by")
 	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
 	perPage, _ := strconv.Atoi(c.DefaultQuery("per_page", "25"))
 	if page < 1 {
@@ -350,48 +504,40 @@ func (h *AdminHandler) AdminListOrgTraffic(c *gin.Context) {
 	}
 	_ = iter.Close()
 
-	// Paginate.
+	list := make([]gin.H, 0, len(allOrgs))
+	for _, org := range allOrgs {
+		usage := traffic.ReadOrgMonthlyUsage(h.db, org.ID.String(), month)
+		list = append(list, gin.H{
+			"org_id":         org.ID.String(),
+			"name":           org.Name,
+			"upload_bytes":   usage.Upload,
+			"download_bytes": usage.Download,
+			"total_bytes":    usage.Combined,
+		})
+	}
+	sortTrafficRows(list, orderBy, "total_bytes")
+
+	// Paginate after sorting so the UI receives the correct page slice.
 	offset := (page - 1) * perPage
 	hasNext := false
-	if offset >= len(allOrgs) {
+	if offset >= len(list) {
 		c.JSON(http.StatusOK, gin.H{"org_traffic_list": []gin.H{}, "has_next_page": false})
 		return
 	}
 	end := offset + perPage
-	if end >= len(allOrgs) {
-		end = len(allOrgs)
+	if end >= len(list) {
+		end = len(list)
 	} else {
 		hasNext = true
 	}
-	pageOrgs := allOrgs[offset:end]
+	list = list[offset:end]
 
-	list := make([]gin.H, 0, len(pageOrgs))
-	for _, org := range pageOrgs {
-		totals := map[string]int64{}
-		iter2 := h.db.Session().Query(
-			`SELECT scope, bytes_transferred FROM traffic_monthly WHERE org_id = ? AND month = ?`,
-			org.ID, month,
-		).Iter()
-		var scope string
-		var bytes int64
-		for iter2.Scan(&scope, &bytes) {
-			totals[scope] = bytes
-		}
-		_ = iter2.Close()
-
-		list = append(list, gin.H{
-			"org_id":         org.ID.String(),
-			"name":           org.Name,
-			"upload_bytes":   totals["org:upload"],
-			"download_bytes": totals["org:download"],
-			"total_bytes":    totals["org:combined"],
-		})
-	}
 	c.JSON(http.StatusOK, gin.H{"org_traffic_list": list, "has_next_page": hasNext})
 }
 
-// AdminListUserTraffic returns per-user traffic totals for a given org and month.
-// GET /admin/statistics/user-traffic/?org_id=<uuid>&month=202603&page=1&per_page=25
+// AdminListUserTraffic returns per-user traffic totals for a given month.
+// When org_id is omitted, it aggregates traffic across all organizations.
+// GET /admin/statistics/user-traffic/?month=202603&page=1&per_page=25
 func (h *AdminHandler) AdminListUserTraffic(c *gin.Context) {
 	callerOrgID := c.GetString("org_id")
 	callerUserID := c.GetString("user_id")
@@ -401,6 +547,7 @@ func (h *AdminHandler) AdminListUserTraffic(c *gin.Context) {
 
 	targetOrgStr := c.Query("org_id")
 	month := c.DefaultQuery("month", time.Now().UTC().Format("200601"))
+	orderBy := c.Query("order_by")
 	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
 	perPage, _ := strconv.Atoi(c.DefaultQuery("per_page", "25"))
 	if page < 1 {
@@ -410,89 +557,65 @@ func (h *AdminHandler) AdminListUserTraffic(c *gin.Context) {
 		perPage = 25
 	}
 
-	if targetOrgStr == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "org_id query param required"})
-		return
-	}
-	targetOrgUUID, err := gocql.ParseUUID(targetOrgStr)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid org_id"})
-		return
-	}
-
-	// Build user info map for the org.
-	type userMeta struct {
-		ID    string
-		Email string
-		Name  string
-	}
-	userMap := map[string]userMeta{}
-	iter := h.db.Session().Query(
-		`SELECT user_id, email, name FROM users WHERE org_id = ?`, targetOrgUUID,
-	).Iter()
-	var uid gocql.UUID
-	var email, name string
-	for iter.Scan(&uid, &email, &name) {
-		userMap[uid.String()] = userMeta{ID: uid.String(), Email: email, Name: name}
-	}
-	_ = iter.Close()
-
-	// Aggregate traffic per user from traffic_counters.
-	userTraffic := map[string]map[string]int64{} // userID -> trafficType -> bytes
-	iter2 := h.db.Session().Query(
-		`SELECT user_id, traffic_type, bytes_transferred FROM traffic_counters
-		 WHERE org_id = ? AND month = ?`,
-		targetOrgUUID, month,
-	).Iter()
-	var userUUID gocql.UUID
-	var ttype string
-	var tbytes int64
-	for iter2.Scan(&userUUID, &ttype, &tbytes) {
-		uid := userUUID.String()
-		if userTraffic[uid] == nil {
-			userTraffic[uid] = map[string]int64{}
+	entries := map[string]gin.H{}
+	userMap := map[string]userTrafficMeta{}
+	var orgIDs []gocql.UUID
+	if targetOrgStr != "" {
+		targetOrgUUID, err := gocql.ParseUUID(targetOrgStr)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid org_id"})
+			return
 		}
-		userTraffic[uid][ttype] += tbytes
+		orgIDs = []gocql.UUID{targetOrgUUID}
+	} else {
+		iter := h.db.Session().Query(`SELECT org_id FROM organizations`).Iter()
+		var orgID gocql.UUID
+		for iter.Scan(&orgID) {
+			orgIDs = append(orgIDs, orgID)
+		}
+		_ = iter.Close()
 	}
-	_ = iter2.Close()
 
-	// Collect user IDs that have traffic data.
-	var userIDs []string
-	for uid := range userTraffic {
-		userIDs = append(userIDs, uid)
+	for _, orgID := range orgIDs {
+		loadUserTrafficMetaForOrg(h.db.Session(), orgID, userMap)
 	}
-	sort.Strings(userIDs)
+
+	if targetOrgStr != "" {
+		accumulateTrafficPartition(h.db.Session(), orgIDs[0], month, userMap, entries, nil, nil)
+	} else {
+		fastEntries := map[string]gin.H{}
+		platformTotals := map[string]int64{}
+		perUserTotals := map[string]int64{}
+		accumulateTrafficPartition(h.db.Session(), gocql.UUID{}, month, userMap, fastEntries, perUserTotals, platformTotals)
+		if platformUserTrafficComplete(platformTotals, perUserTotals) {
+			entries = fastEntries
+		} else {
+			for _, orgID := range orgIDs {
+				accumulateTrafficPartition(h.db.Session(), orgID, month, userMap, entries, nil, nil)
+			}
+		}
+	}
+
+	list := make([]gin.H, 0, len(entries))
+	for _, entry := range entries {
+		list = append(list, entry)
+	}
+	sortTrafficRows(list, orderBy, "link_file_download")
 
 	// Paginate.
 	offset := (page - 1) * perPage
 	hasNext := false
-	if offset >= len(userIDs) {
+	if offset >= len(list) {
 		c.JSON(http.StatusOK, gin.H{"user_monthly_traffic_list": []gin.H{}, "has_next_page": false})
 		return
 	}
 	endIdx := offset + perPage
-	if endIdx >= len(userIDs) {
-		endIdx = len(userIDs)
+	if endIdx >= len(list) {
+		endIdx = len(list)
 	} else {
 		hasNext = true
 	}
-
-	list := make([]gin.H, 0, endIdx-offset)
-	for _, uid := range userIDs[offset:endIdx] {
-		m := userTraffic[uid]
-		u := userMap[uid]
-		list = append(list, gin.H{
-			"email":              u.Email,
-			"name":               u.Name,
-			"sync_file_upload":   m["sync-file-upload"],
-			"sync_file_download": m["sync-file-download"],
-			"web_file_upload":    m["web-file-upload"],
-			"web_file_download":  m["web-file-download"],
-			"link_file_upload":   m["link-file-upload"],
-			"link_file_download": m["link-file-download"],
-		})
-	}
-	c.JSON(http.StatusOK, gin.H{"user_monthly_traffic_list": list, "has_next_page": hasNext})
+	c.JSON(http.StatusOK, gin.H{"user_monthly_traffic_list": list[offset:endIdx], "has_next_page": hasNext})
 }
 
 // ============================================================================

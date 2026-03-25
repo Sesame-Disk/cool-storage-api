@@ -20,6 +20,24 @@ class TrafficTable extends React.Component {
     const { type, sortBy, sortOrder } = this.props;
     const sortIcon = sortOrder === 'asc' ? <span className="fas fa-caret-up"></span> : <span className="fas fa-caret-down"></span>;
 
+    if (type === 'org') {
+      return (
+        <table className="table-hover">
+          <thead>
+            <tr>
+              <th width="28%">{gettext('Organization')}</th>
+              <th width="24%"><div className="d-block table-sort-op cursor-pointer" onClick={this.props.sortItems.bind(this, 'upload_bytes')}>{gettext('Upload')} {sortBy === 'upload_bytes' && sortIcon}</div></th>
+              <th width="24%"><div className="d-block table-sort-op cursor-pointer" onClick={this.props.sortItems.bind(this, 'download_bytes')}>{gettext('Download')} {sortBy === 'download_bytes' && sortIcon}</div></th>
+              <th width="24%"><div className="d-block table-sort-op cursor-pointer" onClick={this.props.sortItems.bind(this, 'total_bytes')}>{gettext('Total Traffic')} {sortBy === 'total_bytes' && sortIcon}</div></th>
+            </tr>
+          </thead>
+          <tbody>
+            {this.props.children}
+          </tbody>
+        </table>
+      );
+    }
+
     return (
       <table className="table-hover">
         <thead>

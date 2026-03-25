@@ -22,7 +22,7 @@ class OrgsTraffic extends React.Component {
       month: moment().format('YYYYMM'),
       isLoading: false,
       errorMessage: '',
-      sortBy: 'link_file_download',
+      sortBy: 'total_bytes',
       sortOrder: 'desc'
     };
     this.initPage = 1;
@@ -77,7 +77,7 @@ class OrgsTraffic extends React.Component {
     const orderBy = sortOrder === 'asc' ? sortBy : `${sortBy}_${sortOrder}`;
     this.setState({ isLoading: true, errorMessage: '' });
     seafileAPI.sysAdminListOrgTraffic(month, page, perPage, orderBy).then(res => {
-      let orgTrafficList = res.data.org_monthly_traffic_list.slice(0);
+      let orgTrafficList = (res.data.org_traffic_list || res.data.org_monthly_traffic_list || []).slice(0);
       this.setState({
         month: month,
         currentPage: page,

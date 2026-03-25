@@ -6,7 +6,7 @@ import { seafileAPI } from '../../../utils/seafile-api';
 import { gettext, serviceURL } from '../../../utils/constants';
 import toaster from '../../../components/toast';
 import Loading from '../../../components/loading';
-import SysAdminSetOrgQuotaDialog from '../../../components/dialog/sysadmin-dialog/set-quota';
+import SysAdminSetOrgQuotaDialog from '../../../components/dialog/sysadmin-dialog/set-org-traffic-quotas';
 import SysAdminSetOrgNameDialog from '../../../components/dialog/sysadmin-dialog/sysadmin-set-org-name-dialog';
 import SysAdminSetOrgMaxUserNumberDialog from '../../../components/dialog/sysadmin-dialog/sysadmin-set-org-max-user-number-dialog';
 import MainPanelTopbar from '../main-panel-topbar';
@@ -24,15 +24,15 @@ class Content extends Component {
   }
 
   toggleSetQuotaDialog = () => {
-    this.setState({isSetQuotaDialogOpen: !this.state.isSetQuotaDialogOpen});
+    this.setState({ isSetQuotaDialogOpen: !this.state.isSetQuotaDialogOpen });
   };
 
   toggleSetNameDialog = () => {
-    this.setState({isSetNameDialogOpen: !this.state.isSetNameDialogOpen});
+    this.setState({ isSetNameDialogOpen: !this.state.isSetNameDialogOpen });
   };
 
   toggleSetMaxUserNumberDialog = () => {
-    this.setState({isSetMaxUserNumberDialogOpen: !this.state.isSetMaxUserNumberDialogOpen});
+    this.setState({ isSetMaxUserNumberDialogOpen: !this.state.isSetMaxUserNumberDialogOpen });
   };
 
   showEditIcon = (action) => {
@@ -52,8 +52,16 @@ class Content extends Component {
     } else if (errorMsg) {
       return <p className="error text-center">{errorMsg}</p>;
     } else {
-      const { org_name, users_count, max_user_number, groups_count, quota, quota_usage, enable_saml_login, metadata_url, domain } = this.props.orgInfo;
+      const {
+        org_name, users_count, max_user_number, groups_count,
+        quota, quota_usage, traffic_quota, traffic_upload_quota, traffic_download_quota,
+        traffic_combined_used, traffic_upload_used, traffic_download_used,
+        plan, billing_cycle, enable_saml_login, metadata_url, domain,
+      } = this.props.orgInfo;
       const { isSetQuotaDialogOpen, isSetNameDialogOpen, isSetMaxUserNumberDialogOpen } = this.state;
+      const formatTrafficQuota = (used, limit) => {
+        return `${Utils.bytesToSize(used || 0)} / ${limit > 0 ? Utils.bytesToSize(limit) : gettext('Unlimited')}`;
+      };
       return (
         <Fragment>
           <dl className="m-0">
@@ -79,11 +87,26 @@ class Content extends Component {
             <dt className="info-item-heading">{gettext('Number of groups')}</dt>
             <dd className="info-item-content">{groups_count}</dd>
 
+            <dt className="info-item-heading">{gettext('Plan')}</dt>
+            <dd className="info-item-content">{plan || '--'}</dd>
+
+            <dt className="info-item-heading">{gettext('Billing Cycle')}</dt>
+            <dd className="info-item-content">{billing_cycle || '--'}</dd>
+
             <dt className="info-item-heading">{gettext('Space Used')}</dt>
             <dd className="info-item-content">
               {`${Utils.bytesToSize(quota_usage)} / ${quota > 0 ? Utils.bytesToSize(quota) : '--'}`}
               {this.showEditIcon(this.toggleSetQuotaDialog)}
             </dd>
+
+            <dt className="info-item-heading">{gettext('Combined Monthly Traffic')}</dt>
+            <dd className="info-item-content">{formatTrafficQuota(traffic_combined_used, traffic_quota)}</dd>
+
+            <dt className="info-item-heading">{gettext('Monthly Upload Traffic')}</dt>
+            <dd className="info-item-content">{formatTrafficQuota(traffic_upload_used, traffic_upload_quota)}</dd>
+
+            <dt className="info-item-heading">{gettext('Monthly Download Traffic')}</dt>
+            <dd className="info-item-content">{formatTrafficQuota(traffic_download_used, traffic_download_quota)}</dd>
             {enable_saml_login &&
               <Fragment>
                 <dt className="info-item-heading">{gettext('SAML Config')}</dt>
@@ -115,24 +138,28 @@ class Content extends Component {
             }
           </dl>
           {isSetQuotaDialogOpen &&
-          <SysAdminSetOrgQuotaDialog
-            updateQuota={this.props.updateQuota}
-            toggle={this.toggleSetQuotaDialog}
-          />
+            <SysAdminSetOrgQuotaDialog
+              storageQuota={quota}
+              trafficQuota={traffic_quota}
+              trafficUploadQuota={traffic_upload_quota}
+              trafficDownloadQuota={traffic_download_quota}
+              updateQuota={this.props.updateQuota}
+              toggleDialog={this.toggleSetQuotaDialog}
+            />
           }
           {isSetNameDialogOpen &&
-          <SysAdminSetOrgNameDialog
-            name={org_name}
-            updateName={this.props.updateName}
-            toggle={this.toggleSetNameDialog}
-          />
+            <SysAdminSetOrgNameDialog
+              name={org_name}
+              updateName={this.props.updateName}
+              toggle={this.toggleSetNameDialog}
+            />
           }
           {isSetMaxUserNumberDialogOpen &&
-          <SysAdminSetOrgMaxUserNumberDialog
-            value={max_user_number}
-            updateValue={this.props.updateMaxUserNumber}
-            toggle={this.toggleSetMaxUserNumberDialog}
-          />
+            <SysAdminSetOrgMaxUserNumberDialog
+              value={max_user_number}
+              updateValue={this.props.updateMaxUserNumber}
+              toggle={this.toggleSetMaxUserNumberDialog}
+            />
           }
         </Fragment>
       );
@@ -165,7 +192,7 @@ class OrgInfo extends Component {
     };
   }
 
-  componentDidMount () {
+  componentDidMount() {
     seafileAPI.sysAdminGetOrg(this.props.orgID).then((res) => {
       this.setState({
         loading: false,
@@ -179,44 +206,50 @@ class OrgInfo extends Component {
     });
   }
 
-  updateQuota = (quota) => {
-    const data = {quota: quota};
-    seafileAPI.sysAdminUpdateOrg(this.props.orgID, data).then(res => {
-      const newOrgInfo = Object.assign(this.state.orgInfo, {
-        quota: res.data.quota
-      });
-      this.setState({orgInfo: newOrgInfo});
-      toaster.success(gettext('Successfully set quota.'));
+  updateQuota = (updates) => {
+    return seafileAPI.sysAdminUpdateOrg(this.props.orgID, updates).then(() => {
+      this.setState((prevState) => ({
+        orgInfo: Object.assign({}, prevState.orgInfo, {
+          quota: updates.storage_quota,
+          storage_quota: updates.storage_quota,
+          traffic_quota: updates.traffic_quota,
+          traffic_upload_quota: updates.traffic_upload_quota,
+          traffic_download_quota: updates.traffic_download_quota,
+        })
+      }));
+      toaster.success(gettext('Successfully updated organization quotas.'));
     }).catch((error) => {
-      let errMessage = Utils.getErrorMsg(error);
+      const errMessage = Utils.getErrorMsg(error);
       toaster.danger(errMessage);
+      return Promise.reject(errMessage);
     });
   };
 
   updateName = (orgName) => {
-    const data = {orgName: orgName};
-    seafileAPI.sysAdminUpdateOrg(this.props.orgID, data).then(res => {
-      const newOrgInfo = Object.assign(this.state.orgInfo, {
-        org_name: res.data.org_name
-      });
-      this.setState({orgInfo: newOrgInfo});
+    const data = { name: orgName };
+    seafileAPI.sysAdminUpdateOrg(this.props.orgID, data).then(() => {
+      this.setState((prevState) => ({
+        orgInfo: Object.assign({}, prevState.orgInfo, { org_name: orgName })
+      }));
       toaster.success(gettext('Successfully set name.'));
     }).catch((error) => {
-      let errMessage = Utils.getErrorMsg(error);
+      const errMessage = Utils.getErrorMsg(error);
       toaster.danger(errMessage);
     });
   };
 
   updateMaxUserNumber = (newValue) => {
-    const data = {maxUserNumber: newValue};
-    seafileAPI.sysAdminUpdateOrg(this.props.orgID, data).then(res => {
-      const newOrgInfo = Object.assign(this.state.orgInfo, {
-        max_user_number: res.data.max_user_number
-      });
-      this.setState({orgInfo: newOrgInfo});
+    const data = { max_users: newValue };
+    seafileAPI.sysAdminUpdateOrg(this.props.orgID, data).then(() => {
+      this.setState((prevState) => ({
+        orgInfo: Object.assign({}, prevState.orgInfo, {
+          max_user_number: newValue,
+          max_users: newValue,
+        })
+      }));
       toaster.success(gettext('Successfully set max number of members.'));
     }).catch((error) => {
-      let errMessage = Utils.getErrorMsg(error);
+      const errMessage = Utils.getErrorMsg(error);
       toaster.danger(errMessage);
     });
   };

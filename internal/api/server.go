@@ -967,6 +967,15 @@ func (s *Server) setupRoutes() {
 			s.serveHTMLWithUser(c, "./frontend/build/sysadmin.html", email)
 			return
 		}
+
+		if c.Request.URL.Path == "/subscription" || c.Request.URL.Path == "/subscription/" {
+			if _, err := os.Stat("./frontend/build/subscription.html"); err == nil {
+				s.serveHTMLWithUser(c, "./frontend/build/subscription.html", email)
+			} else {
+				s.serveHTMLWithUser(c, "./frontend/build/index.html", email)
+			}
+			return
+		}
 		// Mobile UA detection: serve mobile frontend if available
 		viewMode := getViewMode(c.Request)
 
@@ -1077,93 +1086,118 @@ func (s *Server) serveAccessDenied(c *gin.Context, title, message string) {
 	c.String(http.StatusForbidden, html)
 }
 
+func extractRequestAuthToken(c *gin.Context) string {
+	var token string
+	authHeader := c.GetHeader("Authorization")
+	if authHeader != "" {
+		if _, err := fmt.Sscanf(authHeader, "Token %s", &token); err != nil {
+			fmt.Sscanf(authHeader, "Bearer %s", &token) //nolint:errcheck
+		}
+	}
+
+	if token == "" {
+		if cookie, err := c.Cookie("sesamefs_auth"); err == nil && cookie != "" {
+			if idx := strings.LastIndex(cookie, "@"); idx >= 0 && idx < len(cookie)-1 {
+				token = cookie[idx+1:]
+			} else {
+				token = cookie
+			}
+		}
+	}
+
+	if token == "undefined" || token == "null" {
+		return ""
+	}
+
+	return token
+}
+
+func requestOrgScopeHint(c *gin.Context) string {
+	path := c.Request.URL.Path
+	const orgAPIPrefix = "/api/v2.1/org/"
+	if !strings.HasPrefix(path, orgAPIPrefix) {
+		return ""
+	}
+
+	rest := strings.TrimPrefix(path, orgAPIPrefix)
+	if rest == "" {
+		return ""
+	}
+	segment := rest
+	if slash := strings.IndexByte(rest, '/'); slash >= 0 {
+		segment = rest[:slash]
+	}
+	if segment == "" || segment == "admin" {
+		return ""
+	}
+	return segment
+}
+
+func (s *Server) matchDevToken(token string) (config.DevTokenEntry, bool) {
+	if !s.config.Auth.DevMode || token == "" {
+		return config.DevTokenEntry{}, false
+	}
+	for _, devToken := range s.config.Auth.DevTokens {
+		if devToken.Token == token {
+			return devToken, true
+		}
+	}
+	return config.DevTokenEntry{}, false
+}
+
+func (s *Server) applyDevToken(c *gin.Context, devToken config.DevTokenEntry) {
+	c.Set("user_id", devToken.UserID)
+	c.Set("org_id", devToken.OrgID)
+	if devToken.Email != "" {
+		c.Set("email", devToken.Email)
+	}
+	if devToken.Role != "" {
+		c.Set("role", devToken.Role)
+	}
+}
+
+func (s *Server) applyAnonymousDevAuth(c *gin.Context) bool {
+	if !s.config.Auth.AllowAnonymous || !s.config.Auth.DevMode || len(s.config.Auth.DevTokens) == 0 {
+		return false
+	}
+
+	if orgID := requestOrgScopeHint(c); orgID != "" {
+		for _, devToken := range s.config.Auth.DevTokens {
+			if devToken.OrgID == orgID {
+				s.applyDevToken(c, devToken)
+				c.Next()
+				return true
+			}
+		}
+		return false
+	}
+
+	path := c.Request.URL.Path
+	if strings.HasPrefix(path, "/api/v2.1/org/") || path == "/org" || strings.HasPrefix(path, "/org/") {
+		for _, devToken := range s.config.Auth.DevTokens {
+			if devToken.OrgID != middleware.PlatformOrgID {
+				s.applyDevToken(c, devToken)
+				c.Next()
+				return true
+			}
+		}
+		return false
+	}
+
+	s.applyDevToken(c, s.config.Auth.DevTokens[0])
+	c.Next()
+	return true
+}
+
 // resolveOrgForPanel extracts orgID/orgName for HTML page injection (best-effort, never blocks).
 // Order: dev tokens → sesamefs_auth cookie → Authorization header → OIDC session → empty.
 func (s *Server) resolveOrgForPanel(c *gin.Context) (orgID, orgName string) {
-	// 1. Dev mode: match the request token against the configured dev tokens.
-	if s.config.Auth.DevMode && len(s.config.Auth.DevTokens) > 0 {
-		// Try to extract the token from the Authorization header or cookie.
-		reqToken := ""
-		if auth := c.GetHeader("Authorization"); auth != "" {
-			fmt.Sscanf(auth, "Token %s", &reqToken) //nolint:errcheck
-			if reqToken == "" {
-				fmt.Sscanf(auth, "Bearer %s", &reqToken) //nolint:errcheck
-			}
-		}
-		if reqToken == "" {
-			if cookie, err := c.Cookie("sesamefs_auth"); err == nil && cookie != "" {
-				if idx := strings.LastIndex(cookie, "@"); idx >= 0 && idx < len(cookie)-1 {
-					reqToken = cookie[idx+1:]
-				} else {
-					reqToken = cookie
-				}
-			}
-		}
-		// Find the matching dev token; fall back to the first token if not found.
-		matchedToken := s.config.Auth.DevTokens[0]
-		for _, dt := range s.config.Auth.DevTokens {
-			if dt.Token == reqToken {
-				matchedToken = dt
-				break
-			}
-		}
-		orgID = matchedToken.OrgID
-		if s.db != nil && orgID != "" {
-			s.db.Session().Query( //nolint:errcheck
-				`SELECT name FROM organizations WHERE org_id = ?`, orgID,
-			).Scan(&orgName)
-		}
-		return
-	}
+	// Resolve org context using the same authenticated identity source that powers
+	// the API middleware. This avoids injecting a stale org_id into the org-admin
+	// shell when the cookie and active API token diverge.
+	_, orgID, _ = s.resolveUserAuth(c)
 
-	// 2. Extract raw token and email from cookie or Authorization header.
-	token := ""
-	cookieEmail := ""
-	if cookie, err := c.Cookie("sesamefs_auth"); err == nil && cookie != "" {
-		// Format: email@token — token is everything after the last '@'.
-		if idx := strings.LastIndex(cookie, "@"); idx >= 0 && idx < len(cookie)-1 {
-			cookieEmail = cookie[:idx]
-			token = cookie[idx+1:]
-		} else {
-			// Fallback: cookie may be a raw token without email@ prefix.
-			token = cookie
-		}
-	}
-	if token == "" {
-		if auth := c.GetHeader("Authorization"); auth != "" {
-			fmt.Sscanf(auth, "Token %s", &token) //nolint:errcheck
-			if token == "" {
-				fmt.Sscanf(auth, "Bearer %s", &token) //nolint:errcheck
-			}
-		}
-	}
-
-	if token == "" || token == "undefined" || token == "null" {
-		return
-	}
-
-	// 3. Try OIDC session (Cassandra-backed or JWT).
-	if s.authHandler != nil {
-		if mgr := s.authHandler.GetSessionManager(); mgr != nil {
-			if session, err := mgr.ValidateSession(token); err == nil {
-				orgID = session.OrgID
-			}
-		}
-	}
-
-	// 4. Fallback: if session validation failed, look up org by email from cookie.
-	// This covers cases where the token in the cookie is stale (e.g., page was loaded
-	// before a re-login that updated localStorage but not the cookie).
-	if orgID == "" && cookieEmail != "" && s.db != nil {
-		var emailOrgID string
-		if qerr := s.db.Session().Query(
-			`SELECT org_id FROM users_by_email WHERE email = ?`, cookieEmail,
-		).Scan(&emailOrgID); qerr == nil && emailOrgID != "" {
-			orgID = emailOrgID
-		}
-	}
-
-	// 5. Best-effort org name lookup.
+	// Best-effort org name lookup.
 	if s.db != nil && orgID != "" {
 		s.db.Session().Query( //nolint:errcheck
 			`SELECT name FROM organizations WHERE org_id = ?`, orgID,
@@ -1183,34 +1217,10 @@ func jsonQuote(s string) string {
 // Returns empty string if user cannot be identified.
 func (s *Server) resolveUserEmail(c *gin.Context) string {
 	// 1. Dev mode: match request token against configured dev tokens.
-	if s.config.Auth.DevMode && len(s.config.Auth.DevTokens) > 0 {
-		reqToken := ""
-		if auth := c.GetHeader("Authorization"); auth != "" {
-			fmt.Sscanf(auth, "Token %s", &reqToken) //nolint:errcheck
-			if reqToken == "" {
-				fmt.Sscanf(auth, "Bearer %s", &reqToken) //nolint:errcheck
-			}
-		}
-		if reqToken == "" {
-			if cookie, err := c.Cookie("sesamefs_auth"); err == nil && cookie != "" {
-				if idx := strings.LastIndex(cookie, "@"); idx >= 0 && idx < len(cookie)-1 {
-					reqToken = cookie[idx+1:]
-				} else {
-					reqToken = cookie
-				}
-			}
-		}
-		matchedToken := s.config.Auth.DevTokens[0]
-		for _, dt := range s.config.Auth.DevTokens {
-			if dt.Token == reqToken {
-				matchedToken = dt
-				break
-			}
-		}
+	if matchedToken, ok := s.matchDevToken(extractRequestAuthToken(c)); ok {
 		if matchedToken.Email != "" {
 			return matchedToken.Email
 		}
-		// Fallback: look up email from DB by user_id + org_id
 		if s.db != nil && matchedToken.UserID != "" && matchedToken.OrgID != "" {
 			var email string
 			if err := s.db.Session().Query(
@@ -1220,7 +1230,9 @@ func (s *Server) resolveUserEmail(c *gin.Context) string {
 				return email
 			}
 		}
-		return matchedToken.UserID + "@sesamefs.local"
+		if matchedToken.UserID != "" {
+			return matchedToken.UserID + "@sesamefs.local"
+		}
 	}
 
 	// 2. Extract email from cookie (format: email@token).
@@ -1238,51 +1250,21 @@ func (s *Server) resolveUserEmail(c *gin.Context) string {
 // Returns empty strings if the user cannot be identified.
 func (s *Server) resolveUserAuth(c *gin.Context) (userID, orgID, role string) {
 	// 1. Dev mode: match request token against configured dev tokens.
-	if s.config.Auth.DevMode && len(s.config.Auth.DevTokens) > 0 {
-		reqToken := ""
-		if auth := c.GetHeader("Authorization"); auth != "" {
-			fmt.Sscanf(auth, "Token %s", &reqToken) //nolint:errcheck
-			if reqToken == "" {
-				fmt.Sscanf(auth, "Bearer %s", &reqToken) //nolint:errcheck
-			}
+	if matchedToken, ok := s.matchDevToken(extractRequestAuthToken(c)); ok {
+		userID = matchedToken.UserID
+		orgID = matchedToken.OrgID
+		role = matchedToken.Role
+		if role == "" && s.db != nil && orgID != "" && userID != "" {
+			s.db.Session().Query( //nolint:errcheck
+				`SELECT role FROM users WHERE org_id = ? AND user_id = ?`, orgID, userID,
+			).Scan(&role)
 		}
-		if reqToken == "" {
-			if cookie, err := c.Cookie("sesamefs_auth"); err == nil && cookie != "" {
-				if idx := strings.LastIndex(cookie, "@"); idx >= 0 && idx < len(cookie)-1 {
-					reqToken = cookie[idx+1:]
-				} else {
-					reqToken = cookie
-				}
-			}
-		}
-		if reqToken != "" {
-			for _, dt := range s.config.Auth.DevTokens {
-				if dt.Token == reqToken {
-					userID = dt.UserID
-					orgID = dt.OrgID
-					role = dt.Role
-					// Look up role from DB if not set in dev token config
-					if role == "" && s.db != nil && orgID != "" && userID != "" {
-						s.db.Session().Query( //nolint:errcheck
-							`SELECT role FROM users WHERE org_id = ? AND user_id = ?`, orgID, userID,
-						).Scan(&role)
-					}
-					return
-				}
-			}
-		}
+		return
 	}
 
 	// 2. Extract token from cookie.
-	token := ""
-	if cookie, err := c.Cookie("sesamefs_auth"); err == nil && cookie != "" {
-		if idx := strings.LastIndex(cookie, "@"); idx >= 0 && idx < len(cookie)-1 {
-			token = cookie[idx+1:]
-		} else {
-			token = cookie
-		}
-	}
-	if token == "" || token == "undefined" || token == "null" {
+	token := extractRequestAuthToken(c)
+	if token == "" {
 		return
 	}
 
@@ -1373,41 +1355,10 @@ func (s *Server) enforceAccountStatus(c *gin.Context, userID, orgID string) erro
 // authMiddleware validates authentication tokens
 func (s *Server) authMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		// Helper to use anonymous access (first dev token)
-		useAnonymous := func() bool {
-			if s.config.Auth.AllowAnonymous && s.config.Auth.DevMode && len(s.config.Auth.DevTokens) > 0 {
-				c.Set("user_id", s.config.Auth.DevTokens[0].UserID)
-				c.Set("org_id", s.config.Auth.DevTokens[0].OrgID)
-				c.Next()
-				return true
-			}
-			return false
-		}
-
-		// Get token from header or cookie
-		var token string
-		authHeader := c.GetHeader("Authorization")
-		if authHeader != "" {
-			// Parse "Token <token>" format (Seafile compatible)
-			if _, err := fmt.Sscanf(authHeader, "Token %s", &token); err != nil {
-				// Try "Bearer <token>" format
-				fmt.Sscanf(authHeader, "Bearer %s", &token) //nolint:errcheck
-			}
-		}
-
-		// Fallback to sesamefs_auth cookie (used by browser navigations like export-excel)
-		if token == "" {
-			if cookie, err := c.Cookie("sesamefs_auth"); err == nil && cookie != "" {
-				if idx := strings.LastIndex(cookie, "@"); idx >= 0 && idx < len(cookie)-1 {
-					token = cookie[idx+1:]
-				} else {
-					token = cookie
-				}
-			}
-		}
+		token := extractRequestAuthToken(c)
 
 		if token == "" {
-			if useAnonymous() {
+			if s.applyAnonymousDevAuth(c) {
 				return
 			}
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "missing authorization header"})
@@ -1415,29 +1366,11 @@ func (s *Server) authMiddleware() gin.HandlerFunc {
 			return
 		}
 
-		// Check for empty/invalid token values
-		if token == "" || token == "undefined" || token == "null" {
-			if useAnonymous() {
-				return
-			}
-			c.JSON(http.StatusUnauthorized, gin.H{"error": "empty or invalid token"})
-			c.Abort()
-			return
-		}
-
 		// In dev mode, check dev tokens first
-		if s.config.Auth.DevMode {
-			for _, devToken := range s.config.Auth.DevTokens {
-				if devToken.Token == token {
-					c.Set("user_id", devToken.UserID)
-					c.Set("org_id", devToken.OrgID)
-					if devToken.Role != "" {
-						c.Set("role", devToken.Role)
-					}
-					c.Next()
-					return
-				}
-			}
+		if devToken, ok := s.matchDevToken(token); ok {
+			s.applyDevToken(c, devToken)
+			c.Next()
+			return
 		}
 
 		// Try to validate as OIDC session token
@@ -1493,7 +1426,7 @@ func (s *Server) authMiddleware() gin.HandlerFunc {
 		}
 
 		// Token not found - try anonymous fallback before rejecting
-		if useAnonymous() {
+		if s.applyAnonymousDevAuth(c) {
 			return
 		}
 
@@ -1519,37 +1452,10 @@ func (s *Server) smartLinkAuthMiddleware() gin.HandlerFunc {
 			c.Abort()
 		}
 
-		// Anonymous dev-mode shortcut (mirrors authMiddleware)
-		useAnonymous := func() bool {
-			if s.config.Auth.AllowAnonymous && s.config.Auth.DevMode && len(s.config.Auth.DevTokens) > 0 {
-				c.Set("user_id", s.config.Auth.DevTokens[0].UserID)
-				c.Set("org_id", s.config.Auth.DevTokens[0].OrgID)
-				c.Next()
-				return true
-			}
-			return false
-		}
+		token := extractRequestAuthToken(c)
 
-		// Extract token from Authorization header or sesamefs_auth cookie.
-		var token string
-		authHeader := c.GetHeader("Authorization")
-		if authHeader != "" {
-			if _, err := fmt.Sscanf(authHeader, "Token %s", &token); err != nil {
-				fmt.Sscanf(authHeader, "Bearer %s", &token) //nolint:errcheck
-			}
-		}
 		if token == "" {
-			if cookie, err := c.Cookie("sesamefs_auth"); err == nil && cookie != "" {
-				if idx := strings.LastIndex(cookie, "@"); idx >= 0 && idx < len(cookie)-1 {
-					token = cookie[idx+1:]
-				} else {
-					token = cookie
-				}
-			}
-		}
-
-		if token == "" || token == "undefined" || token == "null" {
-			if useAnonymous() {
+			if s.applyAnonymousDevAuth(c) {
 				return
 			}
 			redirectToLogin(false)
@@ -1557,18 +1463,10 @@ func (s *Server) smartLinkAuthMiddleware() gin.HandlerFunc {
 		}
 
 		// Dev-mode tokens.
-		if s.config.Auth.DevMode {
-			for _, devToken := range s.config.Auth.DevTokens {
-				if devToken.Token == token {
-					c.Set("user_id", devToken.UserID)
-					c.Set("org_id", devToken.OrgID)
-					if devToken.Role != "" {
-						c.Set("role", devToken.Role)
-					}
-					c.Next()
-					return
-				}
-			}
+		if devToken, ok := s.matchDevToken(token); ok {
+			s.applyDevToken(c, devToken)
+			c.Next()
+			return
 		}
 
 		// OIDC session token.
@@ -1617,7 +1515,7 @@ func (s *Server) smartLinkAuthMiddleware() gin.HandlerFunc {
 			}
 		}
 
-		if useAnonymous() {
+		if s.applyAnonymousDevAuth(c) {
 			return
 		}
 		redirectToLogin(false)
@@ -1631,17 +1529,6 @@ func (s *Server) smartLinkAuthMiddleware() gin.HandlerFunc {
 // 3. token query parameter
 func (s *Server) syncAuthMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		// Helper to use anonymous access (first dev token) — mirrors authMiddleware behavior
-		useAnonymous := func() bool {
-			if s.config.Auth.AllowAnonymous && s.config.Auth.DevMode && len(s.config.Auth.DevTokens) > 0 {
-				c.Set("user_id", s.config.Auth.DevTokens[0].UserID)
-				c.Set("org_id", s.config.Auth.DevTokens[0].OrgID)
-				c.Next()
-				return true
-			}
-			return false
-		}
-
 		var token string
 
 		// Try Seafile-Repo-Token header first (used by desktop client)
@@ -1670,7 +1557,7 @@ func (s *Server) syncAuthMiddleware() gin.HandlerFunc {
 
 		// No token provided — try anonymous fallback, otherwise reject
 		if token == "" {
-			if useAnonymous() {
+			if s.applyAnonymousDevAuth(c) {
 				return
 			}
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "authentication required"})
@@ -1679,15 +1566,10 @@ func (s *Server) syncAuthMiddleware() gin.HandlerFunc {
 		}
 
 		// Check if it's a dev token (only in dev mode)
-		if s.config.Auth.DevMode {
-			for _, devToken := range s.config.Auth.DevTokens {
-				if devToken.Token == token {
-					c.Set("user_id", devToken.UserID)
-					c.Set("org_id", devToken.OrgID)
-					c.Next()
-					return
-				}
-			}
+		if devToken, ok := s.matchDevToken(token); ok {
+			s.applyDevToken(c, devToken)
+			c.Next()
+			return
 		}
 
 		// Check if it's a valid repo token (from download-info)
@@ -2064,16 +1946,8 @@ func (s *Server) handleAccountInfo(c *gin.Context) {
 	usedBytes := traffic.ReadStorageUsed(s.db, fmt.Sprintf("user:%s:%s", orgID, userID))
 
 	// Query current month's per-user traffic usage.
-	month := time.Now().UTC().Format("200601")
-	var trafficUploadUsed, trafficDownloadUsed int64
-	_ = s.db.Session().Query(
-		`SELECT bytes_transferred FROM traffic_monthly WHERE org_id = ? AND month = ? AND scope = ?`,
-		orgUUID, month, userID+":upload",
-	).Scan(&trafficUploadUsed)
-	_ = s.db.Session().Query(
-		`SELECT bytes_transferred FROM traffic_monthly WHERE org_id = ? AND month = ? AND scope = ?`,
-		orgUUID, month, userID+":download",
-	).Scan(&trafficDownloadUsed)
+	month := traffic.CurrentMonth()
+	userTrafficUsage := traffic.ReadUserMonthlyUsage(s.db, orgID, userID, month)
 
 	// Use email username as display name if name is empty
 	if name == "" {
@@ -2132,10 +2006,10 @@ func (s *Server) handleAccountInfo(c *gin.Context) {
 		"can_generate_share_link":  canGenerateShareLink,
 		"can_generate_upload_link": canGenerateUploadLink,
 		// Traffic quota and usage for current month
-		"traffic_upload_quota":    trafficUploadQuota,
-		"traffic_upload_used":     trafficUploadUsed,
-		"traffic_download_quota":  trafficDownloadQuota,
-		"traffic_download_used":   trafficDownloadUsed,
+		"traffic_upload_quota":   trafficUploadQuota,
+		"traffic_upload_used":    userTrafficUsage.Upload,
+		"traffic_download_quota": trafficDownloadQuota,
+		"traffic_download_used":  userTrafficUsage.Download,
 	})
 }
 
@@ -2161,20 +2035,8 @@ func (s *Server) handleGetSubscription(c *gin.Context) {
 	storageUsed = traffic.ReadStorageUsed(s.db, fmt.Sprintf("org:%s", orgID))
 
 	// Current month's org traffic totals from traffic_monthly.
-	month := time.Now().UTC().Format("200601")
-	var combinedUsed, uploadUsed, downloadUsed int64
-	_ = s.db.Session().Query(
-		`SELECT bytes_transferred FROM traffic_monthly WHERE org_id = ? AND month = ? AND scope = ?`,
-		orgUUID, month, "org:combined",
-	).Scan(&combinedUsed)
-	_ = s.db.Session().Query(
-		`SELECT bytes_transferred FROM traffic_monthly WHERE org_id = ? AND month = ? AND scope = ?`,
-		orgUUID, month, "org:upload",
-	).Scan(&uploadUsed)
-	_ = s.db.Session().Query(
-		`SELECT bytes_transferred FROM traffic_monthly WHERE org_id = ? AND month = ? AND scope = ?`,
-		orgUUID, month, "org:download",
-	).Scan(&downloadUsed)
+	month := traffic.CurrentMonth()
+	orgTrafficUsage := traffic.ReadOrgMonthlyUsage(s.db, orgID, month)
 
 	// Count current users.
 	var currentUsers int
@@ -2192,15 +2054,7 @@ func (s *Server) handleGetSubscription(c *gin.Context) {
 	}
 
 	// Look up per-user traffic for the caller.
-	var trafficUploadUsed, trafficDownloadUsed int64
-	_ = s.db.Session().Query(
-		`SELECT bytes_transferred FROM traffic_monthly WHERE org_id = ? AND month = ? AND scope = ?`,
-		orgUUID, month, userID+":upload",
-	).Scan(&trafficUploadUsed)
-	_ = s.db.Session().Query(
-		`SELECT bytes_transferred FROM traffic_monthly WHERE org_id = ? AND month = ? AND scope = ?`,
-		orgUUID, month, userID+":download",
-	).Scan(&trafficDownloadUsed)
+	userTrafficUsage := traffic.ReadUserMonthlyUsage(s.db, orgID, userID, month)
 
 	c.JSON(http.StatusOK, gin.H{
 		"plan":                   plan,
@@ -2209,17 +2063,17 @@ func (s *Server) handleGetSubscription(c *gin.Context) {
 		"storage_used":           storageUsed,
 		"storage_percent":        storagePercent,
 		"traffic_quota":          trafficQuota,
-		"traffic_combined_used":  combinedUsed,
+		"traffic_combined_used":  orgTrafficUsage.Combined,
 		"traffic_upload_quota":   trafficUploadQuota,
-		"traffic_upload_used":    uploadUsed,
+		"traffic_upload_used":    orgTrafficUsage.Upload,
 		"traffic_download_quota": trafficDownloadQuota,
-		"traffic_download_used":  downloadUsed,
+		"traffic_download_used":  orgTrafficUsage.Download,
 		"traffic_reset_date":     nextReset.Format("2006-01-02"),
 		"max_users":              maxUsers,
 		"current_users":          currentUsers,
 		// Per-user quota (if set)
-		"user_upload_used":   trafficUploadUsed,
-		"user_download_used": trafficDownloadUsed,
+		"user_upload_used":   userTrafficUsage.Upload,
+		"user_download_used": userTrafficUsage.Download,
 	})
 }
 

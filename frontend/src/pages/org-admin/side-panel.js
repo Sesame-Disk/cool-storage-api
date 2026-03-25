@@ -85,7 +85,7 @@ class SidePanel extends React.Component {
                   <li className="nav-item">
                     <Link className={`nav-link ellipsis ${this.getActiveClass('subscription')}`} to={siteRoot + 'org/subscription/'} onClick={() => this.tabItemClick('subscription')} >
                       <Icon symbol='currency' />
-                      <span className="nav-text">{'付费管理'}</span>
+                      <span className="nav-text">{gettext('Subscription')}</span>
                     </Link>
                   </li>
                 }

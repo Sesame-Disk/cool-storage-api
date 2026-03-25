@@ -1,5 +1,5 @@
 import { SeafileAPI } from 'seafile-js';
-import { siteRoot, serviceURL } from './constants';
+import { serviceURL } from './constants';
 
 const TOKEN_KEY = 'sesamefs_auth_token';
 
@@ -9,6 +9,25 @@ const BYPASS_LOGIN = process.env.REACT_APP_BYPASS_LOGIN === 'true';
 const BYPASS_TOKEN = 'dev-token-admin'; // Default admin token for testing
 
 let seafileAPI = new SeafileAPI();
+
+function createAPIError(message, responseData, status) {
+  const error = new Error(message);
+  error.response = {
+    data: responseData,
+  };
+  if (status) {
+    error.response.status = status;
+  }
+  return error;
+}
+
+function syncAuthCookie(token) {
+  if (!token) {
+    document.cookie = 'sesamefs_auth=; expires=Thu, 01 Jan 1970 00:00:00 GMT; path=/';
+    return;
+  }
+  document.cookie = 'sesamefs_auth=' + encodeURIComponent(token) + '; path=/; SameSite=Lax';
+}
 
 // Global 401 interceptor: redirect to login when session expires.
 // This prevents the frontend from getting stuck in loading states
@@ -21,7 +40,7 @@ function setupResponseInterceptor() {
       if (error.response && error.response.status === 401) {
         // Clear stale token and session cookie, then redirect to login
         localStorage.removeItem(TOKEN_KEY);
-        document.cookie = 'sesamefs_auth=; expires=Thu, 01 Jan 1970 00:00:00 GMT; path=/';
+        syncAuthCookie('');
         // Avoid redirect loops: only redirect if not already on login page
         if (window.location.pathname !== '/login/' && window.location.pathname !== '/login') {
           const next = encodeURIComponent(window.location.pathname + window.location.search + window.location.hash);
@@ -44,6 +63,7 @@ function initAPI() {
   if (BYPASS_LOGIN && !token) {
     token = BYPASS_TOKEN;
     localStorage.setItem(TOKEN_KEY, token);
+    syncAuthCookie(token);
   }
 
   if (token) {
@@ -102,6 +122,7 @@ async function login(username, password) {
 
   if (data.token) {
     localStorage.setItem(TOKEN_KEY, data.token);
+    syncAuthCookie(data.token);
     // Reinitialize API with the new token
     seafileAPI.init({ server, token: data.token });
     setupResponseInterceptor();
@@ -122,7 +143,7 @@ async function logout() {
       const data = await response.json();
       // Clear local token and session cookie
       localStorage.removeItem(TOKEN_KEY);
-      document.cookie = 'sesamefs_auth=; expires=Thu, 01 Jan 1970 00:00:00 GMT; path=/';
+      syncAuthCookie('');
 
       if (data.logout_url) {
         // Redirect to OIDC provider's logout endpoint for single logout
@@ -137,7 +158,7 @@ async function logout() {
 
   // Fallback: just clear local token and session cookie, then redirect to login
   localStorage.removeItem(TOKEN_KEY);
-  document.cookie = 'sesamefs_auth=; expires=Thu, 01 Jan 1970 00:00:00 GMT; path=/';
+  syncAuthCookie('');
   window.location.href = '/login/';
 }
 
@@ -177,6 +198,7 @@ function getToken() {
 function setAuthToken(token) {
   const server = serviceURL || window.location.origin;
   localStorage.setItem(TOKEN_KEY, token);
+  syncAuthCookie(token);
   seafileAPI.init({ server, token });
   setupResponseInterceptor();
 }
@@ -237,7 +259,7 @@ seafileAPI.exchangeOIDCCode = async function (code, state, redirectURI) {
     });
     if (!response.ok) {
       const error = await response.json().catch(() => ({}));
-      throw { response: { data: error } };
+      throw createAPIError('OIDC callback failed', error, response.status);
     }
     return { data: await response.json() };
   } catch (err) {
@@ -1311,25 +1333,36 @@ seafileAPI.orgAdminGetOrgInfo = function () {
   return this.req.get(url);
 };
 
+// Org Admin: get org web settings
+seafileAPI.orgAdminGetWebSettings = function (orgID) {
+  let url = this.server + '/api/v2.1/org/' + orgID + '/admin/web-settings/';
+  return this.req.get(url);
+};
+
+// Org Admin: update org info
+seafileAPI.orgAdminUpdateOrgInfo = function (data) {
+  let url = this.server + '/api/v2.1/org/admin/info/';
+  return this.req.put(url, data);
+};
+
 // Org Admin: update org name
 seafileAPI.orgAdminUpdateName = function (orgID, newOrgName) {
-  let url = this.server + '/api/v2.1/org/' + orgID + '/admin/info/';
-  let form = new FormData();
-  form.append('new_name', newOrgName);
-  return this.req.put(url, form);
+  return this.orgAdminUpdateOrgInfo({ org_name: newOrgName }).then(() => {
+    return this.orgAdminGetOrgInfo();
+  });
 };
 
 // Org Admin: update org logo
 seafileAPI.orgAdminUpdateLogo = function (orgID, file) {
-  let url = this.server + '/api/v2.1/org/' + orgID + '/admin/info/';
+  let url = this.server + '/api/v2.1/org/' + orgID + '/admin/logo/';
   let form = new FormData();
   form.append('logo', file);
-  return this.req.put(url, form);
+  return this.req.post(url, form);
 };
 
 // Org Admin: set org system setting
 seafileAPI.orgAdminSetSysSettingInfo = function (orgID, key, value) {
-  let url = this.server + '/api/v2.1/org/' + orgID + '/admin/info/';
+  let url = this.server + '/api/v2.1/org/' + orgID + '/admin/web-settings/';
   let form = new FormData();
   form.append(key, value);
   return this.req.put(url, form);
@@ -1410,9 +1443,22 @@ seafileAPI.orgAdminSetOrgUserContactEmail = function (orgID, email, contactEmail
 
 // Org Admin: set org user quota
 seafileAPI.orgAdminSetOrgUserQuota = function (orgID, email, quota) {
+  return this.orgAdminUpdateOrgUserQuotas(orgID, email, { quotaTotal: quota });
+};
+
+// Org Admin: update org user storage and traffic quotas
+seafileAPI.orgAdminUpdateOrgUserQuotas = function (orgID, email, { quotaTotal, trafficUploadQuota, trafficDownloadQuota }) {
   let url = this.server + '/api/v2.1/org/' + orgID + '/admin/users/' + encodeURIComponent(email) + '/';
   let form = new FormData();
-  form.append('quota_total', quota);
+  if (quotaTotal !== undefined && quotaTotal !== null) {
+    form.append('quota_total', quotaTotal);
+  }
+  if (trafficUploadQuota !== undefined && trafficUploadQuota !== null) {
+    form.append('traffic_upload_quota', trafficUploadQuota);
+  }
+  if (trafficDownloadQuota !== undefined && trafficDownloadQuota !== null) {
+    form.append('traffic_download_quota', trafficDownloadQuota);
+  }
   return this.req.put(url, form);
 };
 
@@ -1686,18 +1732,21 @@ seafileAPI.orgAdminCleanTrashRepo = function (orgID) {
 };
 
 // Sys Admin: list per-org traffic summary for a month
-seafileAPI.sysAdminListOrgTraffic = function (month, page, perPage) {
+seafileAPI.sysAdminListOrgTraffic = function (month, page, perPage, orderBy) {
   let url = this.server + '/api/v2.1/admin/statistics/org-traffic/?month=' + month;
   if (page) url += '&page=' + page;
   if (perPage) url += '&per_page=' + perPage;
+  if (orderBy) url += '&order_by=' + orderBy;
   return this.req.get(url);
 };
 
-// Sys Admin: list per-user traffic for a specific org and month
-seafileAPI.sysAdminListUserTraffic = function (orgID, month, page, perPage) {
-  let url = this.server + '/api/v2.1/admin/statistics/user-traffic/?org_id=' + orgID + '&month=' + month;
+// Sys Admin: list per-user traffic for a month, optionally scoped to one org
+seafileAPI.sysAdminListUserTraffic = function (month, page, perPage, orderBy, orgID) {
+  let url = this.server + '/api/v2.1/admin/statistics/user-traffic/?month=' + month;
+  if (orgID) url += '&org_id=' + orgID;
   if (page) url += '&page=' + page;
   if (perPage) url += '&per_page=' + perPage;
+  if (orderBy) url += '&order_by=' + orderBy;
   return this.req.get(url);
 };
 
@@ -1788,7 +1837,7 @@ seafileAPI.orgAdminUnlinkDevice = function (orgID, platform, deviceID, email) {
 
 // Org Admin: list device errors
 seafileAPI.orgAdminListDevicesErrors = function (orgID, page, perPage) {
-  let url = this.server + '/api/v2.1/org/' + orgID + '/admin/devices/errors/?page=' + (page || 1);
+  let url = this.server + '/api/v2.1/org/' + orgID + '/admin/devices-errors/?page=' + (page || 1);
   if (perPage) url += '&per_page=' + perPage;
   return this.req.get(url);
 };
@@ -1810,7 +1859,7 @@ seafileAPI.orgAdminVerifyDomain = function (orgID, domain) {
   let url = this.server + '/api/v2.1/org/' + orgID + '/admin/verify-domain/';
   let form = new FormData();
   form.append('domain', domain);
-  return this.req.post(url, form);
+  return this.req.put(url, form);
 };
 
 // ============================================================================

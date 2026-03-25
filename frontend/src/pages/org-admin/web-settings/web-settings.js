@@ -25,11 +25,12 @@ class OrgWebSettings extends Component {
   }
 
   componentDidMount() {
-    seafileAPI.orgAdminGetOrgInfo().then((res) => {
+    seafileAPI.orgAdminGetWebSettings(orgID).then((res) => {
       this.setState({
         loading: false,
         config_dict: res.data,
-        file_ext_white_list: res.data.file_ext_white_list
+        file_ext_white_list: res.data.file_ext_white_list,
+        logoPath: res.data.logo_path || this.state.logoPath,
       });
     }).catch((error) => {
       this.setState({
@@ -41,9 +42,11 @@ class OrgWebSettings extends Component {
 
   updateName = (key, newOrgName) => {
     seafileAPI.orgAdminUpdateName(orgID, newOrgName).then((res) => {
-      this.setState({
-        config_dict: res.data
-      });
+      this.setState((prevState) => ({
+        config_dict: Object.assign({}, prevState.config_dict, {
+          org_name: res.data.org_name
+        })
+      }));
       toaster.success(gettext('Success'));
     }).catch((error) => {
       let errMessage = Utils.getErrorMsg(error);
@@ -54,7 +57,7 @@ class OrgWebSettings extends Component {
   updateLogo = (file) => {
     seafileAPI.orgAdminUpdateLogo(orgID, file).then((res) => {
       this.setState({
-        logoPath: res.data.logo_path
+        logoPath: res.data.logo_path || this.state.logoPath
       });
       toaster.success(gettext('Success'));
     }).catch((error) => {
@@ -65,9 +68,13 @@ class OrgWebSettings extends Component {
 
   updateFileExtWhiteList = (key, value) => {
     seafileAPI.orgAdminSetSysSettingInfo(orgID, key, value).then((res) => {
-      this.setState({
-        file_ext_white_list: res.data.file_ext_white_list
-      });
+      this.setState((prevState) => ({
+        file_ext_white_list: res.data.file_ext_white_list,
+        config_dict: Object.assign({}, prevState.config_dict, {
+          file_ext_white_list: res.data.file_ext_white_list,
+          logo_path: res.data.logo_path || prevState.config_dict?.logo_path,
+        })
+      }));
       toaster.success(gettext('Success'));
     }).catch((error) => {
       let errMessage = Utils.getErrorMsg(error);

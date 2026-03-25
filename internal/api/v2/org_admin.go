@@ -315,20 +315,22 @@ func (h *OrgAdminHandler) lookupOrgUserByEmail(orgID, email string) (userID stri
 //	id, name, email, owner_contact_email, is_active, quota_usage, quota_total,
 //	last_login, ctime, is_org_staff, role, org_id
 type orgUserRow struct {
-	ID           string `json:"id"`
-	Email        string `json:"email"`
-	Name         string `json:"name"`
-	ContactEmail string `json:"owner_contact_email"`
-	Status       string `json:"status"`
-	IsActive     bool   `json:"is_active"`
-	IsOrgStaff   bool   `json:"is_org_staff"`
-	Role         string `json:"role"`
-	QuotaTotal   int64  `json:"quota_total"`
-	QuotaUsage   int64  `json:"quota_usage"`
-	Ctime        string `json:"ctime"`
-	LastLogin    string `json:"last_login"`
-	OrgID        string `json:"org_id"`
-	AvatarURL    string `json:"avatar_url"`
+	ID                   string `json:"id"`
+	Email                string `json:"email"`
+	Name                 string `json:"name"`
+	ContactEmail         string `json:"owner_contact_email"`
+	Status               string `json:"status"`
+	IsActive             bool   `json:"is_active"`
+	IsOrgStaff           bool   `json:"is_org_staff"`
+	Role                 string `json:"role"`
+	QuotaTotal           int64  `json:"quota_total"`
+	QuotaUsage           int64  `json:"quota_usage"`
+	TrafficUploadQuota   int64  `json:"traffic_upload_quota"`
+	TrafficDownloadQuota int64  `json:"traffic_download_quota"`
+	Ctime                string `json:"ctime"`
+	LastLogin            string `json:"last_login"`
+	OrgID                string `json:"org_id"`
+	AvatarURL            string `json:"avatar_url"`
 }
 
 func buildOrgUserRow(email, name, role, status, orgID string, quota, used int64, created time.Time) orgUserRow {
@@ -349,6 +351,13 @@ func buildOrgUserRow(email, name, role, status, orgID string, quota, used int64,
 		OrgID:        orgID,
 		AvatarURL:    "/static/img/default-avatar.png",
 	}
+}
+
+func buildOrgUserRowWithTraffic(email, name, role, status, orgID string, quota, used, trafficUploadQuota, trafficDownloadQuota int64, created time.Time) orgUserRow {
+	row := buildOrgUserRow(email, name, role, status, orgID, quota, used, created)
+	row.TrafficUploadQuota = trafficUploadQuota
+	row.TrafficDownloadQuota = trafficDownloadQuota
+	return row
 }
 
 // ============================================================================
@@ -387,24 +396,7 @@ func (h *OrgAdminHandler) GetOrgInfo(c *gin.Context) {
 		return
 	}
 
-	// Read current month's traffic totals.
-	month := time.Now().UTC().Format("200601")
-	orgUUID, _ := gocql.ParseUUID(orgID)
-	type monthlyScope struct {
-		scope string
-		dst   *int64
-	}
-	var combinedUsed, uploadUsed, downloadUsed int64
-	for _, ms := range []monthlyScope{
-		{"org:combined", &combinedUsed},
-		{"org:upload", &uploadUsed},
-		{"org:download", &downloadUsed},
-	} {
-		_ = h.db.Session().Query(
-			`SELECT bytes_transferred FROM traffic_monthly WHERE org_id = ? AND month = ? AND scope = ?`,
-			orgUUID, month, ms.scope,
-		).Scan(ms.dst)
-	}
+	monthlyUsage := traffic.ReadOrgMonthlyUsage(h.db, orgID, traffic.CurrentMonth())
 
 	usersCount := h.countOrgMembers(orgID)
 
@@ -418,15 +410,15 @@ func (h *OrgAdminHandler) GetOrgInfo(c *gin.Context) {
 		"active_members": usersCount,
 		"ctime":          createdAt.Format(time.RFC3339),
 		// Traffic quota info
-		"plan":                    plan,
-		"billing_cycle":           billingCycle,
-		"traffic_quota":           trafficQuota,
-		"traffic_combined_used":   combinedUsed,
-		"traffic_upload_quota":    trafficUploadQuota,
-		"traffic_upload_used":     uploadUsed,
-		"traffic_download_quota":  trafficDownloadQuota,
-		"traffic_download_used":   downloadUsed,
-		"max_users":               maxUsers,
+		"plan":                   plan,
+		"billing_cycle":          billingCycle,
+		"traffic_quota":          trafficQuota,
+		"traffic_combined_used":  monthlyUsage.Combined,
+		"traffic_upload_quota":   trafficUploadQuota,
+		"traffic_upload_used":    monthlyUsage.Upload,
+		"traffic_download_quota": trafficDownloadQuota,
+		"traffic_download_used":  monthlyUsage.Download,
+		"max_users":              maxUsers,
 	})
 }
 
@@ -445,16 +437,31 @@ func (h *OrgAdminHandler) UpdateOrgInfo(c *gin.Context) {
 	// Accept both JSON and form data (seafile-js compatibility)
 	orgName := c.Request.FormValue("org_name")
 	maxUsersStr := c.Request.FormValue("max_user_number")
+	trafficQuotaStr := c.Request.FormValue("traffic_quota")
+	trafficUploadQuotaStr := c.Request.FormValue("traffic_upload_quota")
+	trafficDownloadQuotaStr := c.Request.FormValue("traffic_download_quota")
 
-	if orgName == "" && maxUsersStr == "" {
+	if orgName == "" && maxUsersStr == "" && trafficQuotaStr == "" && trafficUploadQuotaStr == "" && trafficDownloadQuotaStr == "" {
 		// Try JSON body
 		var body struct {
-			OrgName       string `json:"org_name"`
-			MaxUserNumber string `json:"max_user_number"`
+			OrgName              string `json:"org_name"`
+			MaxUserNumber        string `json:"max_user_number"`
+			TrafficQuota         *int64 `json:"traffic_quota"`
+			TrafficUploadQuota   *int64 `json:"traffic_upload_quota"`
+			TrafficDownloadQuota *int64 `json:"traffic_download_quota"`
 		}
 		if err := c.ShouldBindJSON(&body); err == nil {
 			orgName = body.OrgName
 			maxUsersStr = body.MaxUserNumber
+			if body.TrafficQuota != nil {
+				trafficQuotaStr = strconv.FormatInt(*body.TrafficQuota, 10)
+			}
+			if body.TrafficUploadQuota != nil {
+				trafficUploadQuotaStr = strconv.FormatInt(*body.TrafficUploadQuota, 10)
+			}
+			if body.TrafficDownloadQuota != nil {
+				trafficDownloadQuotaStr = strconv.FormatInt(*body.TrafficDownloadQuota, 10)
+			}
 		}
 	}
 
@@ -472,6 +479,39 @@ func (h *OrgAdminHandler) UpdateOrgInfo(c *gin.Context) {
 			UPDATE organizations SET settings['max_user_number'] = ? WHERE org_id = ?
 		`, maxUsersStr, orgID).Exec(); err != nil {
 			log.Printf("UpdateOrgInfo: failed to update max_user_number for org %s: %v", orgID, err)
+		}
+	}
+
+	if trafficQuotaStr != "" {
+		if quota, err := strconv.ParseInt(trafficQuotaStr, 10, 64); err == nil {
+			if err := h.db.Session().Query(`
+				UPDATE organizations SET traffic_quota = ? WHERE org_id = ?
+			`, quota, orgID).Exec(); err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update organization"})
+				return
+			}
+		}
+	}
+
+	if trafficUploadQuotaStr != "" {
+		if quota, err := strconv.ParseInt(trafficUploadQuotaStr, 10, 64); err == nil {
+			if err := h.db.Session().Query(`
+				UPDATE organizations SET traffic_upload_quota = ? WHERE org_id = ?
+			`, quota, orgID).Exec(); err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update organization"})
+				return
+			}
+		}
+	}
+
+	if trafficDownloadQuotaStr != "" {
+		if quota, err := strconv.ParseInt(trafficDownloadQuotaStr, 10, 64); err == nil {
+			if err := h.db.Session().Query(`
+				UPDATE organizations SET traffic_download_quota = ? WHERE org_id = ?
+			`, quota, orgID).Exec(); err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update organization"})
+				return
+			}
 		}
 	}
 
@@ -633,18 +673,18 @@ func (h *OrgAdminHandler) GetOrgUser(c *gin.Context) {
 	}
 
 	var name, role, status string
-	var quota int64
+	var quota, trafficUploadQuota, trafficDownloadQuota int64
 	var created time.Time
 
 	if err := h.db.Session().Query(`
-		SELECT name, role, status, quota_bytes, created_at
+		SELECT name, role, status, quota_bytes, traffic_upload_quota, traffic_download_quota, created_at
 		FROM users WHERE org_id = ? AND user_id = ?
-	`, targetOrgID, userID).Scan(&name, &role, &status, &quota, &created); err != nil {
+	`, targetOrgID, userID).Scan(&name, &role, &status, &quota, &trafficUploadQuota, &trafficDownloadQuota, &created); err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "user not found"})
 		return
 	}
 
-	c.JSON(http.StatusOK, buildOrgUserRow(email, name, role, status, targetOrgID, quota, traffic.ReadStorageUsed(h.db, fmt.Sprintf("user:%s:%s", targetOrgID, userID)), created))
+	c.JSON(http.StatusOK, buildOrgUserRowWithTraffic(email, name, role, status, targetOrgID, quota, traffic.ReadStorageUsed(h.db, fmt.Sprintf("user:%s:%s", targetOrgID, userID)), trafficUploadQuota, trafficDownloadQuota, created))
 }
 
 // UpdateOrgUser updates an org user's active status, staff role, name, or quota.
@@ -665,13 +705,13 @@ func (h *OrgAdminHandler) UpdateOrgUser(c *gin.Context) {
 	}
 
 	var name, role, status string
-	var quota int64
+	var quota, trafficUploadQuota, trafficDownloadQuota int64
 	var created time.Time
 
 	if err := h.db.Session().Query(`
-		SELECT name, role, status, quota_bytes, created_at
+		SELECT name, role, status, quota_bytes, traffic_upload_quota, traffic_download_quota, created_at
 		FROM users WHERE org_id = ? AND user_id = ?
-	`, targetOrgID, userID).Scan(&name, &role, &status, &quota, &created); err != nil {
+	`, targetOrgID, userID).Scan(&name, &role, &status, &quota, &trafficUploadQuota, &trafficDownloadQuota, &created); err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "user not found"})
 		return
 	}
@@ -754,6 +794,7 @@ func (h *OrgAdminHandler) UpdateOrgUser(c *gin.Context) {
 
 	if v := c.Request.FormValue("traffic_upload_quota"); v != "" {
 		if q, err := strconv.ParseInt(v, 10, 64); err == nil {
+			trafficUploadQuota = q
 			if err := h.db.Session().Query(
 				`UPDATE users SET traffic_upload_quota = ? WHERE org_id = ? AND user_id = ?`,
 				q, targetOrgID, userID,
@@ -766,6 +807,7 @@ func (h *OrgAdminHandler) UpdateOrgUser(c *gin.Context) {
 
 	if v := c.Request.FormValue("traffic_download_quota"); v != "" {
 		if q, err := strconv.ParseInt(v, 10, 64); err == nil {
+			trafficDownloadQuota = q
 			if err := h.db.Session().Query(
 				`UPDATE users SET traffic_download_quota = ? WHERE org_id = ? AND user_id = ?`,
 				q, targetOrgID, userID,
@@ -776,7 +818,7 @@ func (h *OrgAdminHandler) UpdateOrgUser(c *gin.Context) {
 		}
 	}
 
-	c.JSON(http.StatusOK, buildOrgUserRow(email, name, role, status, targetOrgID, quota, traffic.ReadStorageUsed(h.db, fmt.Sprintf("user:%s:%s", targetOrgID, userID)), created))
+	c.JSON(http.StatusOK, buildOrgUserRowWithTraffic(email, name, role, status, targetOrgID, quota, traffic.ReadStorageUsed(h.db, fmt.Sprintf("user:%s:%s", targetOrgID, userID)), trafficUploadQuota, trafficDownloadQuota, created))
 }
 
 // DeleteOrgUser soft-deletes a user from the target org.
@@ -1243,6 +1285,19 @@ func (h *OrgAdminHandler) getOrgSettingInt(orgID, key string, defaultVal int) in
 		return defaultVal
 	}
 	return v
+}
+
+var allowedOrgSettingKeys = map[string]bool{
+	"file_ext_white_list": true,
+	"logo_path":           true,
+}
+
+func (h *OrgAdminHandler) updateOrgSetting(orgID, key, value string) error {
+	if !allowedOrgSettingKeys[key] {
+		return fmt.Errorf("unsupported org setting key: %q", key)
+	}
+	query := fmt.Sprintf("UPDATE organizations SET settings['%s'] = ? WHERE org_id = ?", key)
+	return h.db.Session().Query(query, value, orgID).Exec()
 }
 
 // ============================================================================
@@ -3426,13 +3481,82 @@ func (h *OrgAdminHandler) ListOrgRepoPermLogs(c *gin.Context) {
 // ============================================================================
 
 func (h *OrgAdminHandler) GetOrgWebSettings(c *gin.Context) {
-	h.notImplemented(c, "get org web settings")
+	targetOrgID := c.Param("org_id")
+	if err := h.requireOrgAccess(c, targetOrgID); err != nil {
+		return
+	}
+
+	var orgName string
+	if err := h.db.Session().Query(`SELECT name FROM organizations WHERE org_id = ?`, targetOrgID).Scan(&orgName); err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "organization not found"})
+		return
+	}
+
+	logoPath := h.getOrgSetting(targetOrgID, "logo_path", "")
+	c.JSON(http.StatusOK, gin.H{
+		"org_name":            orgName,
+		"file_ext_white_list": h.getOrgSetting(targetOrgID, "file_ext_white_list", ""),
+		"logo_path":           logoPath,
+	})
 }
+
 func (h *OrgAdminHandler) SetOrgWebSettings(c *gin.Context) {
-	h.notImplemented(c, "set org web settings")
+	targetOrgID := c.Param("org_id")
+	if err := h.requireOrgAccess(c, targetOrgID); err != nil {
+		return
+	}
+
+	fileExtWhiteList := c.Request.FormValue("file_ext_white_list")
+	if fileExtWhiteList == "" {
+		var body struct {
+			FileExtWhiteList string `json:"file_ext_white_list"`
+		}
+		if err := c.ShouldBindJSON(&body); err == nil {
+			fileExtWhiteList = body.FileExtWhiteList
+		}
+	}
+
+	if fileExtWhiteList == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "file_ext_white_list is required"})
+		return
+	}
+
+	if err := h.updateOrgSetting(targetOrgID, "file_ext_white_list", fileExtWhiteList); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update organization web settings"})
+		return
+	}
+
+	var orgName string
+	_ = h.db.Session().Query(`SELECT name FROM organizations WHERE org_id = ?`, targetOrgID).Scan(&orgName)
+	c.JSON(http.StatusOK, gin.H{
+		"org_name":            orgName,
+		"file_ext_white_list": fileExtWhiteList,
+		"logo_path":           h.getOrgSetting(targetOrgID, "logo_path", ""),
+	})
 }
+
 func (h *OrgAdminHandler) UpdateOrgLogo(c *gin.Context) {
-	h.notImplemented(c, "update org logo")
+	targetOrgID := c.Param("org_id")
+	if err := h.requireOrgAccess(c, targetOrgID); err != nil {
+		return
+	}
+
+	fileHeader, err := c.FormFile("logo")
+	if err != nil || fileHeader == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "logo file is required"})
+		return
+	}
+
+	// Backend logo asset persistence is not implemented yet. Keep the route
+	// functional and return a stable path so org-admin UI no longer depends on
+	// the legacy /info endpoint.
+	logoPath := h.getOrgSetting(targetOrgID, "logo_path", "/media/custom/logo.png")
+	if err := h.updateOrgSetting(targetOrgID, "logo_path", logoPath); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update organization logo"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"logo_path": logoPath})
 }
 func (h *OrgAdminHandler) GetOrgSAMLConfig(c *gin.Context) {
 	h.notImplemented(c, "get org SAML config")

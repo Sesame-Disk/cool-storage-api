@@ -520,14 +520,35 @@ func (h *AdminHandler) GetOrganization(c *gin.Context) {
 	var name string
 	var status string
 	var storageQuota int64
+	var trafficQuota int64
+	var trafficUploadQuota int64
+	var trafficDownloadQuota int64
+	var maxUsers int
+	var plan string
+	var billingCycle string
 	var settings map[string]string
 	var createdAt time.Time
 	var deletedAt *time.Time
 
 	err := h.db.Session().Query(`
-		SELECT name, status, storage_quota, settings, created_at, deleted_at
+		SELECT name, status, storage_quota, traffic_quota, traffic_upload_quota,
+		       traffic_download_quota, max_users, plan, billing_cycle, settings,
+		       created_at, deleted_at
 		FROM organizations WHERE org_id = ?
-	`, orgID).Scan(&name, &status, &storageQuota, &settings, &createdAt, &deletedAt)
+	`, orgID).Scan(
+		&name,
+		&status,
+		&storageQuota,
+		&trafficQuota,
+		&trafficUploadQuota,
+		&trafficDownloadQuota,
+		&maxUsers,
+		&plan,
+		&billingCycle,
+		&settings,
+		&createdAt,
+		&deletedAt,
+	)
 
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "organization not found"})
@@ -539,11 +560,15 @@ func (h *AdminHandler) GetOrganization(c *gin.Context) {
 	groupsCount := h.countOrgGroups(orgID)
 	creatorEmail, creatorName := h.resolveOrgCreator(orgID)
 
-	// Extract max_user_number from settings map
-	var maxUserNumber int
+	// Extract max_user_number from settings map as backward-compatible fallback.
+	maxUserNumber := maxUsers
 	if v, ok := settings["max_user_number"]; ok {
-		maxUserNumber, _ = strconv.Atoi(v)
+		if parsed, err := strconv.Atoi(v); err == nil && parsed > 0 {
+			maxUserNumber = parsed
+		}
 	}
+
+	monthlyUsage := traffic.ReadOrgMonthlyUsage(h.db, orgID, traffic.CurrentMonth())
 
 	effectiveStatus := status
 	if effectiveStatus == "" {
@@ -556,20 +581,30 @@ func (h *AdminHandler) GetOrganization(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"org_id":          orgID,
-		"org_name":        name,
-		"creator_email":   creatorEmail,
-		"creator_name":    creatorName,
-		"status":          effectiveStatus,
-		"deleted_at":      deletedAtStr,
-		"role":            "default",
-		"quota_usage":     traffic.ReadStorageUsed(h.db, fmt.Sprintf("org:%s", orgID)),
-		"quota":           storageQuota,
-		"ctime":           createdAt.Format(time.RFC3339),
-		"users_count":     usersCount,
-		"repos_count":     reposCount,
-		"groups_count":    groupsCount,
-		"max_user_number": maxUserNumber,
+		"org_id":                 orgID,
+		"org_name":               name,
+		"creator_email":          creatorEmail,
+		"creator_name":           creatorName,
+		"status":                 effectiveStatus,
+		"deleted_at":             deletedAtStr,
+		"role":                   "default",
+		"quota_usage":            traffic.ReadStorageUsed(h.db, fmt.Sprintf("org:%s", orgID)),
+		"quota":                  storageQuota,
+		"storage_quota":          storageQuota,
+		"traffic_quota":          trafficQuota,
+		"traffic_upload_quota":   trafficUploadQuota,
+		"traffic_download_quota": trafficDownloadQuota,
+		"traffic_combined_used":  monthlyUsage.Combined,
+		"traffic_upload_used":    monthlyUsage.Upload,
+		"traffic_download_used":  monthlyUsage.Download,
+		"plan":                   plan,
+		"billing_cycle":          billingCycle,
+		"ctime":                  createdAt.Format(time.RFC3339),
+		"users_count":            usersCount,
+		"repos_count":            reposCount,
+		"groups_count":           groupsCount,
+		"max_users":              maxUserNumber,
+		"max_user_number":        maxUserNumber,
 	})
 }
 
@@ -1919,17 +1954,19 @@ func (h *AdminHandler) AdminListGroupLibraries(c *gin.Context) {
 
 // adminUserResponse matches the seafile-js expected user object format.
 type adminUserResponse struct {
-	Email      string `json:"email"`
-	Name       string `json:"name"`
-	Status     string `json:"status"`
-	IsActive   bool   `json:"is_active"`
-	IsStaff    bool   `json:"is_staff"`
-	Role       string `json:"role"`
-	AdminRole  string `json:"admin_role"`
-	QuotaTotal int64  `json:"quota_total"`
-	QuotaUsage int64  `json:"quota_usage"`
-	CreateTime string `json:"create_time"`
-	LastLogin  string `json:"last_login"`
+	Email                string `json:"email"`
+	Name                 string `json:"name"`
+	Status               string `json:"status"`
+	IsActive             bool   `json:"is_active"`
+	IsStaff              bool   `json:"is_staff"`
+	Role                 string `json:"role"`
+	AdminRole            string `json:"admin_role"`
+	QuotaTotal           int64  `json:"quota_total"`
+	QuotaUsage           int64  `json:"quota_usage"`
+	TrafficUploadQuota   int64  `json:"traffic_upload_quota"`
+	TrafficDownloadQuota int64  `json:"traffic_download_quota"`
+	CreateTime           string `json:"create_time"`
+	LastLogin            string `json:"last_login"`
 }
 
 func makeAdminUserResponse(email, name, role, status string, quotaBytes, usedBytes int64, createdAt time.Time) adminUserResponse {
@@ -1940,17 +1977,19 @@ func makeAdminUserResponse(email, name, role, status string, quotaBytes, usedByt
 	}
 	canonicalStatus := normalizeUserStatus(status)
 	return adminUserResponse{
-		Email:      email,
-		Name:       name,
-		Status:     canonicalStatus,
-		IsActive:   canonicalStatus == StatusActive,
-		IsStaff:    role == "admin" || role == "superadmin",
-		Role:       role,
-		AdminRole:  adminRole,
-		QuotaTotal: quotaBytes,
-		QuotaUsage: usedBytes,
-		CreateTime: createdAt.Format(time.RFC3339),
-		LastLogin:  "", // Not tracked currently
+		Email:                email,
+		Name:                 name,
+		Status:               canonicalStatus,
+		IsActive:             canonicalStatus == StatusActive,
+		IsStaff:              role == "admin" || role == "superadmin",
+		Role:                 role,
+		AdminRole:            adminRole,
+		QuotaTotal:           quotaBytes,
+		QuotaUsage:           usedBytes,
+		TrafficUploadQuota:   0,
+		TrafficDownloadQuota: 0,
+		CreateTime:           createdAt.Format(time.RFC3339),
+		LastLogin:            "", // Not tracked currently
 	}
 }
 
@@ -2250,17 +2289,22 @@ func (h *AdminHandler) GetUserByEmail(c *gin.Context, email string) {
 
 	var name, role, status string
 	var quotaBytes int64
+	var trafficUploadQuota int64
+	var trafficDownloadQuota int64
 	var createdAt time.Time
 
 	if err := h.db.Session().Query(`
-		SELECT name, role, status, quota_bytes, created_at
+		SELECT name, role, status, quota_bytes, traffic_upload_quota, traffic_download_quota, created_at
 		FROM users WHERE org_id = ? AND user_id = ?
-	`, userOrgID, userID).Scan(&name, &role, &status, &quotaBytes, &createdAt); err != nil {
+	`, userOrgID, userID).Scan(&name, &role, &status, &quotaBytes, &trafficUploadQuota, &trafficDownloadQuota, &createdAt); err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "user not found"})
 		return
 	}
 
-	c.JSON(http.StatusOK, makeAdminUserResponse(email, name, role, status, quotaBytes, traffic.ReadStorageUsed(h.db, fmt.Sprintf("user:%s:%s", userOrgID, userID)), createdAt))
+	resp := makeAdminUserResponse(email, name, role, status, quotaBytes, traffic.ReadStorageUsed(h.db, fmt.Sprintf("user:%s:%s", userOrgID, userID)), createdAt)
+	resp.TrafficUploadQuota = trafficUploadQuota
+	resp.TrafficDownloadQuota = trafficDownloadQuota
+	c.JSON(http.StatusOK, resp)
 }
 
 // UpdateUserByEmail updates a user by email.
@@ -2282,16 +2326,20 @@ func (h *AdminHandler) UpdateUserByEmail(c *gin.Context, email string) {
 	// Read current user data to return updated response
 	var currentName, currentRole, currentStatus string
 	var currentQuota int64
+	var currentTrafficUploadQuota int64
+	var currentTrafficDownloadQuota int64
 	var currentCreated time.Time
 	h.db.Session().Query(`
-		SELECT name, role, status, quota_bytes, created_at
+		SELECT name, role, status, quota_bytes, traffic_upload_quota, traffic_download_quota, created_at
 		FROM users WHERE org_id = ? AND user_id = ?
-	`, userOrgID, userID).Scan(&currentName, &currentRole, &currentStatus, &currentQuota, &currentCreated)
+	`, userOrgID, userID).Scan(&currentName, &currentRole, &currentStatus, &currentQuota, &currentTrafficUploadQuota, &currentTrafficDownloadQuota, &currentCreated)
 
 	// Read form values
 	newRole := c.Request.FormValue("role")
 	newName := c.Request.FormValue("name")
 	quotaStr := c.Request.FormValue("quota_total")
+	trafficUploadQuotaStr := c.Request.FormValue("traffic_upload_quota")
+	trafficDownloadQuotaStr := c.Request.FormValue("traffic_download_quota")
 	isActiveStr := c.Request.FormValue("is_active")
 	isStaffStr := c.Request.FormValue("is_staff")
 
@@ -2360,6 +2408,30 @@ func (h *AdminHandler) UpdateUserByEmail(c *gin.Context, email string) {
 		}
 	}
 
+	if trafficUploadQuotaStr != "" {
+		if quota, err := strconv.ParseInt(trafficUploadQuotaStr, 10, 64); err == nil {
+			currentTrafficUploadQuota = quota
+			if err := h.db.Session().Query(`
+				UPDATE users SET traffic_upload_quota = ? WHERE org_id = ? AND user_id = ?
+			`, quota, userOrgID, userID).Exec(); err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update user"})
+				return
+			}
+		}
+	}
+
+	if trafficDownloadQuotaStr != "" {
+		if quota, err := strconv.ParseInt(trafficDownloadQuotaStr, 10, 64); err == nil {
+			currentTrafficDownloadQuota = quota
+			if err := h.db.Session().Query(`
+				UPDATE users SET traffic_download_quota = ? WHERE org_id = ? AND user_id = ?
+			`, quota, userOrgID, userID).Exec(); err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update user"})
+				return
+			}
+		}
+	}
+
 	if isActiveStr == "false" {
 		if err := deactivateUser(h.db, h.sessions, userOrgID, userID); err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update user"})
@@ -2375,6 +2447,8 @@ func (h *AdminHandler) UpdateUserByEmail(c *gin.Context, email string) {
 	}
 
 	resp := makeAdminUserResponse(email, currentName, currentRole, currentStatus, currentQuota, traffic.ReadStorageUsed(h.db, fmt.Sprintf("user:%s:%s", userOrgID, userID)), currentCreated)
+	resp.TrafficUploadQuota = currentTrafficUploadQuota
+	resp.TrafficDownloadQuota = currentTrafficDownloadQuota
 	c.JSON(http.StatusOK, resp)
 }
 

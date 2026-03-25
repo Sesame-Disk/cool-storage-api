@@ -71,11 +71,6 @@ func (r *Recorder) Record(orgID, userID, trafficType string, bytes int64) {
 	}
 }
 
-// platformOrgID is the zero UUID used as the partition key for the cross-org
-// aggregated traffic counter. Sysadmin statistics query only this partition
-// instead of iterating every org partition.
-const platformOrgID = "00000000-0000-0000-0000-000000000000"
-
 // recordCounters performs all counter updates inside the goroutine.
 func (r *Recorder) recordCounters(orgID, userID, month string, day time.Time, trafficType, direction string, bytes int64) error {
 	orgUUID, err := gocql.ParseUUID(orgID)
@@ -106,7 +101,17 @@ func (r *Recorder) recordCounters(orgID, userID, month string, day time.Time, tr
 		log.Printf("[traffic] platform aggregate error type=%s: %v", trafficType, err)
 	}
 
-	// 3–5. Monthly aggregates — used for quota enforcement (1 partition read).
+	// 3. Platform-wide per-user detail — kept in the same zero-UUID partition so
+	//    global user-traffic reports can avoid reading every org partition.
+	if err := r.session.Query(
+		`UPDATE traffic_counters SET bytes_transferred = bytes_transferred + ?
+		 WHERE org_id = ? AND month = ? AND day = ? AND user_id = ? AND traffic_type = ?`,
+		bytes, gocql.UUID{}, month, day, userUUID, trafficType,
+	).Exec(); err != nil {
+		log.Printf("[traffic] platform per-user aggregate error user=%s type=%s: %v", userID, trafficType, err)
+	}
+
+	// 4–6. Monthly aggregates — used for quota enforcement (1 partition read).
 	scopes := []string{
 		fmt.Sprintf("org:%s", direction),        // per-direction org total
 		"org:combined",                          // combined upload+download org total

@@ -7,9 +7,7 @@ import { siteRoot, isPro, gettext, appAvatarURL, enableSSOToThirdpartWebsite } f
 import toaster from '../toast';
 import RenderRole from '../../services/footer-upgrade';
 
-const {
-  isOrgContext,
-} = window.app.pageOptions;
+const isOrgContext = window.app?.pageOptions?.isOrgContext ?? true;
 
 const propTypes = {
   isAdminPanel: PropTypes.bool,
@@ -24,6 +22,9 @@ class Account extends Component {
       contactEmail: '',
       quotaUsage: '',
       quotaTotal: '',
+      trafficUpload: '',
+      trafficDownload: '',
+      hasTrafficQuota: false,
       isStaff: false,
       isOrgStaff: false,
       usageRate: '',
@@ -77,13 +78,19 @@ class Account extends Component {
     e.preventDefault();
     if (this.isFirstMounted) {
       seafileAPI.getAccountInfo().then(resp => {
+        const uploadQuota = resp.data.traffic_upload_quota;
+        const uploadUsed = resp.data.traffic_upload_used || 0;
+        const downloadQuota = resp.data.traffic_download_quota;
+        const downloadUsed = resp.data.traffic_download_used || 0;
         this.setState({
           userName: resp.data.name,
           contactEmail: resp.data.email,
           usageRate: resp.data.space_usage,
           quotaUsage: Utils.bytesToSize(resp.data.usage),
-          // quotaTotal: Utils.bytesToSize(resp.data.total),
           quotaTotal: resp.data.total === -2 ? 'Unlimited' : Utils.bytesToSize(resp.data.total),
+          trafficUpload: `${Utils.bytesToSize(uploadUsed)} / ${uploadQuota > 0 ? Utils.bytesToSize(uploadQuota) : 'Unlimited'}`,
+          trafficDownload: `${Utils.bytesToSize(downloadUsed)} / ${downloadQuota > 0 ? Utils.bytesToSize(downloadQuota) : 'Unlimited'}`,
+          hasTrafficQuota: uploadQuota > 0 || downloadQuota > 0 || uploadUsed > 0 || downloadUsed > 0,
           isStaff: resp.data.is_staff,
           isInstAdmin: resp.data.is_inst_admin,
           isOrgStaff: resp.data.is_org_staff === 1 ? true : false,
@@ -169,10 +176,16 @@ class Account extends Component {
                 <p>{gettext('Used:')}{' '}{this.state.quotaUsage} / {this.state.quotaTotal}</p>
                 <div id="quota-bar"><span id="quota-usage" className="usage" style={{ width: this.state.usageRate }}></span></div>
               </div>
+              {this.state.hasTrafficQuota &&
+                <div className="item pt-2">
+                  <p className="mb-1">{gettext('Monthly Upload Traffic')}{' '}{this.state.trafficUpload}</p>
+                  <p className="mb-0">{gettext('Monthly Download Traffic')}{' '}{this.state.trafficDownload}</p>
+                </div>
+              }
             </div>
             <RenderRole isOrgStaff={this.state.isOrgStaff} />
             <a href={siteRoot + 'profile/'} className="item">{gettext('Settings')}</a>
-            {(this.state.enableSubscription && !isOrgContext) && <a href={siteRoot + 'subscription/'} className="item">{'付费管理'}</a>}
+            {(this.state.enableSubscription && !isOrgContext) && <a href={siteRoot + 'subscription/'} className="item">{gettext('Subscription')}</a>}
             {this.renderMenu()}
             {enableSSOToThirdpartWebsite && <a href={siteRoot + 'sso-to-thirdpart/'} className="item">{gettext('Customer Portal')}</a>}
             <a href={siteRoot + 'accounts/logout/'} className="item">{gettext('Log out')}</a>
