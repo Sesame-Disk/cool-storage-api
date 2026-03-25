@@ -600,4 +600,41 @@ Commit `305d8b21` introduced atomic `LoggedBatch` operations and DRY helper func
 
 ---
 
-*Last updated: 2026-03-18*
+## 12. Storage & Traffic Quotas — Scalability Debt (2026-03-25)
+
+### 12a. `COUNT(*)` for Max Users Check
+
+**File:** `internal/traffic/checker.go` — `CheckMaxUsers`
+
+```go
+SELECT COUNT(*) FROM users WHERE org_id = ?
+```
+
+Full partition scan on every user-add. Acceptable for v1 because:
+- Enterprise orgs have `max_users = -1` → check skipped entirely
+- Free orgs are small (1 user) → scan is trivial
+- Paid orgs with explicit limit are rare and small
+
+**Future fix (v2):** Add a `user_count` counter to `storage_counters` (scope `org:<id>:users`), increment on user create, decrement on delete. Single counter read instead of partition scan.
+
+### 12b. Hot Partition for Platform Traffic Aggregate
+
+**File:** `internal/traffic/recorder.go` — `recordCounters`
+
+All traffic across all orgs updates a single partition: `org_id = 00000000-0000-0000-0000-000000000000`. Under high global traffic, this creates a hotspot on a single ScyllaDB node.
+
+**Impact:** Only affects sysadmin traffic charts. No user-facing impact until very high volume.
+
+**Future fix (v2):** Shard the platform aggregate key by `shard_id` (1–10, random). Query all shards and sum for the dashboard. Or compute platform totals asynchronously from per-org data.
+
+### 12c. Storage Counter Functions Location
+
+**Status:** Resolved.
+
+`IncrementStorageCounters`, `DecrementStorageCounters`, and `ReadStorageUsed` now live in `internal/traffic/storage.go` alongside the shared traffic helpers.
+
+The GC path now reuses the shared implementation via `traffic.AdjustAggregateStorageCounters(...)`, so the old duplication in `internal/gc/store_cassandra.go` has been removed.
+
+---
+
+*Last updated: 2026-03-25*

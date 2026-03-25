@@ -412,7 +412,7 @@ func (h *OrgAdminHandler) GetOrgInfo(c *gin.Context) {
 		"org_id":         orgID,
 		"org_name":       name,
 		"storage_quota":  storageQuota,
-		"storage_usage":  ReadStorageUsed(h.db, fmt.Sprintf("org:%s", orgID)),
+		"storage_usage":  traffic.ReadStorageUsed(h.db, fmt.Sprintf("org:%s", orgID)),
 		"member_usage":   usersCount,
 		"member_quota":   h.getOrgSettingInt(orgID, "max_user_number", 0),
 		"active_members": usersCount,
@@ -523,7 +523,7 @@ func (h *OrgAdminHandler) ListOrgUsers(c *gin.Context) {
 		if !userMatchesStatusFilter(status, statusFilter) {
 			continue
 		}
-		all = append(all, buildOrgUserRow(email, name, role, status, targetOrgID, quota, ReadStorageUsed(h.db, fmt.Sprintf("user:%s:%s", targetOrgID, userID)), created))
+		all = append(all, buildOrgUserRow(email, name, role, status, targetOrgID, quota, traffic.ReadStorageUsed(h.db, fmt.Sprintf("user:%s:%s", targetOrgID, userID)), created))
 	}
 	if err := iter.Close(); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list users"})
@@ -644,7 +644,7 @@ func (h *OrgAdminHandler) GetOrgUser(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusOK, buildOrgUserRow(email, name, role, status, targetOrgID, quota, ReadStorageUsed(h.db, fmt.Sprintf("user:%s:%s", targetOrgID, userID)), created))
+	c.JSON(http.StatusOK, buildOrgUserRow(email, name, role, status, targetOrgID, quota, traffic.ReadStorageUsed(h.db, fmt.Sprintf("user:%s:%s", targetOrgID, userID)), created))
 }
 
 // UpdateOrgUser updates an org user's active status, staff role, name, or quota.
@@ -776,7 +776,7 @@ func (h *OrgAdminHandler) UpdateOrgUser(c *gin.Context) {
 		}
 	}
 
-	c.JSON(http.StatusOK, buildOrgUserRow(email, name, role, status, targetOrgID, quota, ReadStorageUsed(h.db, fmt.Sprintf("user:%s:%s", targetOrgID, userID)), created))
+	c.JSON(http.StatusOK, buildOrgUserRow(email, name, role, status, targetOrgID, quota, traffic.ReadStorageUsed(h.db, fmt.Sprintf("user:%s:%s", targetOrgID, userID)), created))
 }
 
 // DeleteOrgUser soft-deletes a user from the target org.
@@ -1032,7 +1032,7 @@ func (h *OrgAdminHandler) SearchOrgUser(c *gin.Context) {
 			continue
 		}
 		if strings.Contains(strings.ToLower(email), query) || strings.Contains(strings.ToLower(name), query) {
-			results = append(results, buildOrgUserRow(email, name, role, status, targetOrgID, quota, ReadStorageUsed(h.db, fmt.Sprintf("user:%s:%s", targetOrgID, userID)), created))
+			results = append(results, buildOrgUserRow(email, name, role, status, targetOrgID, quota, traffic.ReadStorageUsed(h.db, fmt.Sprintf("user:%s:%s", targetOrgID, userID)), created))
 		}
 	}
 	iter.Close()
@@ -2823,7 +2823,7 @@ func (h *OrgAdminHandler) OrgStatisticStorage(c *gin.Context) {
 		return
 	}
 
-	bytesUsed := ReadStorageUsed(h.db, fmt.Sprintf("org:%s", targetOrgID))
+	bytesUsed := traffic.ReadStorageUsed(h.db, fmt.Sprintf("org:%s", targetOrgID))
 
 	stats := dateRangeStrings(c)
 	result := make([]gin.H, len(stats))

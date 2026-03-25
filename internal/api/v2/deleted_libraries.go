@@ -7,6 +7,7 @@ import (
 
 	"github.com/Sesame-Disk/sesamefs/internal/db"
 	"github.com/Sesame-Disk/sesamefs/internal/middleware"
+	"github.com/Sesame-Disk/sesamefs/internal/traffic"
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
 	"github.com/gin-gonic/gin"
 )
@@ -271,7 +272,7 @@ func (h *DeletedLibraryHandler) PermanentDeleteRepo(c *gin.Context) {
 
 	// Clean up the lib-scope storage counter row. Aggregate scopes (org, user,
 	// platform) were already adjusted when the library was soft-deleted.
-	deleteLibraryStorageCounter(h.db, orgID, repoID)
+	traffic.DeleteLibraryStorageCounter(h.db, orgID, repoID)
 
 	// Tag cleanup is secondary metadata and can remain asynchronous.
 	go CleanupAllLibraryTags(h.db, repoID)

@@ -57,18 +57,18 @@ func (r *Recorder) Record(orgID, userID, trafficType string, bytes int64) {
 	day := now.Truncate(24 * time.Hour)
 	direction := directionOf(trafficType)
 
-	go func() {
-		select {
-		case r.sem <- struct{}{}: // acquire slot (non-blocking)
+	select {
+	case r.sem <- struct{}{}: // acquire slot (non-blocking)
+		go func() {
 			defer func() { <-r.sem }() // release slot
 			if err := r.recordCounters(orgID, userID, month, day, trafficType, direction, bytes); err != nil {
 				log.Printf("[traffic] record error org=%s user=%s type=%s: %v", orgID, userID, trafficType, err)
 			}
-		default:
-			// Inflight limit reached — silently drop to prevent goroutine pile-up.
-			return
-		}
-	}()
+		}()
+	default:
+		// Inflight limit reached — drop without spawning a goroutine.
+		return
+	}
 }
 
 // platformOrgID is the zero UUID used as the partition key for the cross-org

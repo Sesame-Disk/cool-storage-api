@@ -1313,7 +1313,7 @@ func (h *FileHandler) DeleteDirectory(c *gin.Context) {
 			}
 		}
 		if totalSize > 0 {
-			DecrementStorageCounters(h.db, orgID, userID, repoID, totalSize, fileCount)
+			traffic.DecrementStorageCounters(h.db, orgID, userID, repoID, totalSize, fileCount)
 		}
 	}()
 
@@ -1915,7 +1915,7 @@ func (h *FileHandler) DeleteFile(c *gin.Context) {
 
 	// Decrement storage counters for the deleted file — fire-and-forget.
 	if fileSize := result.TargetEntry.Size; fileSize > 0 {
-		DecrementStorageCounters(h.db, orgID, userID, repoID, fileSize, 1)
+		traffic.DecrementStorageCounters(h.db, orgID, userID, repoID, fileSize, 1)
 	}
 
 	c.JSON(http.StatusOK, gin.H{
@@ -2745,7 +2745,7 @@ func (h *FileHandler) UploadFile(c *gin.Context) {
 	if rec := traffic.Get(); rec != nil {
 		rec.Record(orgID, userID, traffic.WebUpload, int64(len(content)))
 	}
-	IncrementStorageCounters(h.db, orgID, userID, repoID, int64(len(content)), 1)
+	traffic.IncrementStorageCounters(h.db, orgID, userID, repoID, int64(len(content)), 1)
 
 	c.JSON(http.StatusOK, gin.H{
 		"success":     true,
@@ -4272,10 +4272,10 @@ func (h *FileHandler) BatchDeleteItems(c *gin.Context) {
 			if entry.Mode == ModeDir || entry.Mode&0170000 == 040000 {
 				_, totalSize, fileCount, err := fsHelper.collectDirStats(req.RepoID, entry.ID)
 				if err == nil && totalSize > 0 {
-					DecrementStorageCounters(h.db, orgID, userID, req.RepoID, totalSize, fileCount)
+					traffic.DecrementStorageCounters(h.db, orgID, userID, req.RepoID, totalSize, fileCount)
 				}
 			} else if entry.Size > 0 {
-				DecrementStorageCounters(h.db, orgID, userID, req.RepoID, entry.Size, 1)
+				traffic.DecrementStorageCounters(h.db, orgID, userID, req.RepoID, entry.Size, 1)
 			}
 		}
 	}()

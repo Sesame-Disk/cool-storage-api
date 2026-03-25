@@ -8,6 +8,7 @@ import (
 
 	"github.com/Sesame-Disk/sesamefs/internal/db"
 	"github.com/Sesame-Disk/sesamefs/internal/storage"
+	"github.com/Sesame-Disk/sesamefs/internal/traffic"
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
 	"github.com/google/uuid"
 )
@@ -1217,51 +1218,10 @@ func (s *CassandraStore) SoftDeleteLibrary(orgID, libraryID, deletedBy uuid.UUID
 	}
 
 	// Adjust storage counters: subtract library's usage from aggregate scopes.
-	// Mirrors the logic in write_helpers.softDeleteLibrary (can't import api/v2).
 	if ownerID != "" {
-		s.decrementLibraryFromAggregates(orgID.String(), ownerID, libraryID.String())
+		traffic.AdjustAggregateStorageCounters(s.db, orgID.String(), ownerID, libraryID.String(), false)
 	}
 	return nil
-}
-
-// decrementLibraryFromAggregates reads the lib-scope storage counter and
-// subtracts its value from the org, user, and platform scopes.
-// Mirrors write_helpers.adjustAggregateStorageCounters (can't import api/v2).
-func (s *CassandraStore) decrementLibraryFromAggregates(orgID, ownerID, libraryID string) {
-	libScope := fmt.Sprintf("lib:%s:%s", orgID, libraryID)
-	var bytesUsed, fileCount int64
-	_ = s.db.Session().Query(
-		`SELECT bytes_used, file_count FROM storage_counters WHERE scope = ?`, libScope,
-	).Scan(&bytesUsed, &fileCount)
-
-	if bytesUsed <= 0 && fileCount <= 0 {
-		return
-	}
-
-	scopes := []string{
-		"platform",
-		fmt.Sprintf("org:%s", orgID),
-		fmt.Sprintf("user:%s:%s", orgID, ownerID),
-	}
-	for _, scope := range scopes {
-		var curBytes, curFiles int64
-		_ = s.db.Session().Query(
-			`SELECT bytes_used, file_count FROM storage_counters WHERE scope = ?`, scope,
-		).Scan(&curBytes, &curFiles)
-
-		actBytes := min(bytesUsed, max(curBytes, 0))
-		actFiles := min(fileCount, max(curFiles, 0))
-		if actBytes <= 0 && actFiles <= 0 {
-			continue
-		}
-		if err := s.db.Session().Query(
-			`UPDATE storage_counters SET bytes_used = bytes_used - ?, file_count = file_count - ?
-			 WHERE scope = ?`,
-			actBytes, actFiles, scope,
-		).Exec(); err != nil {
-			log.Printf("[gc] storage decrement error scope=%s: %v", scope, err)
-		}
-	}
 }
 
 func (s *CassandraStore) ListGroupMembershipsByUser(orgID, userID uuid.UUID) ([]uuid.UUID, error) {
@@ -1473,8 +1433,8 @@ func (s *CassandraStore) ListLibrariesForOrg(orgID uuid.UUID) ([]OrgLibraryInfo,
 }
 
 func (s *CassandraStore) DeleteLibraryStorageCounter(orgID, libraryID uuid.UUID) error {
-	scope := fmt.Sprintf("lib:%s:%s", orgID, libraryID)
-	return s.db.Session().Query(`DELETE FROM storage_counters WHERE scope = ?`, scope).Exec()
+	traffic.DeleteLibraryStorageCounter(s.db, orgID.String(), libraryID.String())
+	return nil
 }
 
 func (s *CassandraStore) DeleteGroupFull(orgID, groupID uuid.UUID) error {

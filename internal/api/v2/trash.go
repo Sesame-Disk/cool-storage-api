@@ -11,6 +11,7 @@ import (
 
 	"github.com/Sesame-Disk/sesamefs/internal/db"
 	"github.com/Sesame-Disk/sesamefs/internal/middleware"
+	"github.com/Sesame-Disk/sesamefs/internal/traffic"
 	"github.com/gin-gonic/gin"
 )
 
@@ -443,10 +444,10 @@ func (h *TrashHandler) RestoreTrashItem(c *gin.Context) {
 		if oldEntry.Mode == ModeDir || oldEntry.Mode&0170000 == 040000 {
 			_, totalSize, fileCount, err := fsHelper.collectDirStats(repoID, oldEntry.ID)
 			if err == nil && totalSize > 0 {
-				IncrementStorageCounters(h.db, orgID, userID, repoID, totalSize, fileCount)
+				traffic.IncrementStorageCounters(h.db, orgID, userID, repoID, totalSize, fileCount)
 			}
 		} else if oldEntry.Size > 0 {
-			IncrementStorageCounters(h.db, orgID, userID, repoID, oldEntry.Size, 1)
+			traffic.IncrementStorageCounters(h.db, orgID, userID, repoID, oldEntry.Size, 1)
 		}
 	}()
 
@@ -778,10 +779,10 @@ func (h *TrashHandler) RevertDirents(c *gin.Context) {
 			if isDir {
 				_, totalSize, fileCount, err := fsHelper.collectDirStats(repoID, entry.ID)
 				if err == nil && totalSize > 0 {
-					IncrementStorageCounters(h.db, orgID, userID, repoID, totalSize, fileCount)
+					traffic.IncrementStorageCounters(h.db, orgID, userID, repoID, totalSize, fileCount)
 				}
 			} else if entry.Size > 0 {
-				IncrementStorageCounters(h.db, orgID, userID, repoID, entry.Size, 1)
+				traffic.IncrementStorageCounters(h.db, orgID, userID, repoID, entry.Size, 1)
 			}
 		}(oldEntry, isDir)
 	}

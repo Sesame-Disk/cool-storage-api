@@ -325,7 +325,7 @@ func (h *AdminHandler) ListOrganizations(c *gin.Context) {
 			"status":        effectiveStatus,
 			"deleted_at":    deletedAtStr,
 			"role":          "default",
-			"quota_usage":   ReadStorageUsed(h.db, fmt.Sprintf("org:%s", orgID)),
+			"quota_usage":   traffic.ReadStorageUsed(h.db, fmt.Sprintf("org:%s", orgID)),
 			"quota":         storageQuota,
 			"ctime":         createdAt.Format(time.RFC3339),
 			"users_count":   usersCount,
@@ -563,7 +563,7 @@ func (h *AdminHandler) GetOrganization(c *gin.Context) {
 		"status":          effectiveStatus,
 		"deleted_at":      deletedAtStr,
 		"role":            "default",
-		"quota_usage":     ReadStorageUsed(h.db, fmt.Sprintf("org:%s", orgID)),
+		"quota_usage":     traffic.ReadStorageUsed(h.db, fmt.Sprintf("org:%s", orgID)),
 		"quota":           storageQuota,
 		"ctime":           createdAt.Format(time.RFC3339),
 		"users_count":     usersCount,
@@ -818,7 +818,7 @@ func (h *AdminHandler) ListOrgUsers(c *gin.Context) {
 			"status":       normalizeUserStatus(status),
 			"active":       isActive,
 			"is_org_staff": isOrgStaff,
-			"quota_usage":  ReadStorageUsed(h.db, fmt.Sprintf("user:%s:%s", targetOrgID, userID)),
+			"quota_usage":  traffic.ReadStorageUsed(h.db, fmt.Sprintf("user:%s:%s", targetOrgID, userID)),
 			"quota_total":  quotaBytes,
 			"create_time":  createdAt.Format(time.RFC3339),
 			"last_login":   "",
@@ -965,7 +965,7 @@ func (h *AdminHandler) GetUser(c *gin.Context) {
 		"name":        name,
 		"role":        role,
 		"quota_bytes": quotaBytes,
-		"used_bytes":  ReadStorageUsed(h.db, fmt.Sprintf("user:%s:%s", userOrgID, targetUserID)),
+		"used_bytes":  traffic.ReadStorageUsed(h.db, fmt.Sprintf("user:%s:%s", userOrgID, targetUserID)),
 		"created_at":  createdAt,
 	})
 }
@@ -2040,7 +2040,7 @@ func (h *AdminHandler) ListAllUsers(c *gin.Context) {
 		for iter.Scan(&userID, &email, &name, &role, &status, &quotaBytes, &createdAt) {
 			if !seen[email] && userMatchesStatusFilter(status, statusFilter) {
 				seen[email] = true
-				allUsers = append(allUsers, makeAdminUserResponse(email, name, role, status, quotaBytes, ReadStorageUsed(h.db, fmt.Sprintf("user:%s:%s", orgID, userID)), createdAt))
+				allUsers = append(allUsers, makeAdminUserResponse(email, name, role, status, quotaBytes, traffic.ReadStorageUsed(h.db, fmt.Sprintf("user:%s:%s", orgID, userID)), createdAt))
 			}
 		}
 		if err := iter.Close(); err != nil {
@@ -2135,7 +2135,7 @@ func (h *AdminHandler) SearchUsers(c *gin.Context) {
 		for iter.Scan(&userID, &email, &name, &role, &status, &quotaBytes, &createdAt) {
 			if !seen[email] && (strings.Contains(strings.ToLower(email), query) || strings.Contains(strings.ToLower(name), query)) {
 				seen[email] = true
-				results = append(results, makeAdminUserResponse(email, name, role, status, quotaBytes, ReadStorageUsed(h.db, fmt.Sprintf("user:%s:%s", orgID, userID)), createdAt))
+				results = append(results, makeAdminUserResponse(email, name, role, status, quotaBytes, traffic.ReadStorageUsed(h.db, fmt.Sprintf("user:%s:%s", orgID, userID)), createdAt))
 			}
 		}
 		iter.Close()
@@ -2260,7 +2260,7 @@ func (h *AdminHandler) GetUserByEmail(c *gin.Context, email string) {
 		return
 	}
 
-	c.JSON(http.StatusOK, makeAdminUserResponse(email, name, role, status, quotaBytes, ReadStorageUsed(h.db, fmt.Sprintf("user:%s:%s", userOrgID, userID)), createdAt))
+	c.JSON(http.StatusOK, makeAdminUserResponse(email, name, role, status, quotaBytes, traffic.ReadStorageUsed(h.db, fmt.Sprintf("user:%s:%s", userOrgID, userID)), createdAt))
 }
 
 // UpdateUserByEmail updates a user by email.
@@ -2374,7 +2374,7 @@ func (h *AdminHandler) UpdateUserByEmail(c *gin.Context, email string) {
 		currentStatus = "active"
 	}
 
-	resp := makeAdminUserResponse(email, currentName, currentRole, currentStatus, currentQuota, ReadStorageUsed(h.db, fmt.Sprintf("user:%s:%s", userOrgID, userID)), currentCreated)
+	resp := makeAdminUserResponse(email, currentName, currentRole, currentStatus, currentQuota, traffic.ReadStorageUsed(h.db, fmt.Sprintf("user:%s:%s", userOrgID, userID)), currentCreated)
 	c.JSON(http.StatusOK, resp)
 }
 
@@ -2490,7 +2490,7 @@ func (h *AdminHandler) ListAdminUsers(c *gin.Context) {
 		for iter.Scan(&userID, &email, &name, &role, &status, &quotaBytes, &createdAt) {
 			if !seen[email] && role == "superadmin" {
 				seen[email] = true
-				admins = append(admins, makeAdminUserResponse(email, name, role, status, quotaBytes, ReadStorageUsed(h.db, fmt.Sprintf("user:%s:%s", orgID, userID)), createdAt))
+				admins = append(admins, makeAdminUserResponse(email, name, role, status, quotaBytes, traffic.ReadStorageUsed(h.db, fmt.Sprintf("user:%s:%s", orgID, userID)), createdAt))
 			}
 		}
 		iter.Close()
@@ -2549,7 +2549,7 @@ func (h *AdminHandler) BatchAddAdmins(c *gin.Context) {
 			failed = append(failed, gin.H{"email": email, "error_msg": "failed to read user"})
 			continue
 		}
-		success = append(success, makeAdminUserResponse(email, name, role, status, quotaBytes, ReadStorageUsed(h.db, fmt.Sprintf("user:%s:%s", userOrgID, userID)), createdAt))
+		success = append(success, makeAdminUserResponse(email, name, role, status, quotaBytes, traffic.ReadStorageUsed(h.db, fmt.Sprintf("user:%s:%s", userOrgID, userID)), createdAt))
 	}
 
 	if success == nil {

@@ -2061,7 +2061,7 @@ func (s *Server) handleAccountInfo(c *gin.Context) {
 	}
 
 	// Read live storage usage from the counter table.
-	usedBytes := v2.ReadStorageUsed(s.db, fmt.Sprintf("user:%s:%s", orgID, userID))
+	usedBytes := traffic.ReadStorageUsed(s.db, fmt.Sprintf("user:%s:%s", orgID, userID))
 
 	// Query current month's per-user traffic usage.
 	month := time.Now().UTC().Format("200601")
@@ -2158,7 +2158,7 @@ func (s *Server) handleGetSubscription(c *gin.Context) {
 		&trafficQuota, &trafficUploadQuota, &trafficDownloadQuota, &maxUsers)
 
 	// Read live storage usage from the counter table (not the stale organizations column).
-	storageUsed = v2.ReadStorageUsed(s.db, fmt.Sprintf("org:%s", orgID))
+	storageUsed = traffic.ReadStorageUsed(s.db, fmt.Sprintf("org:%s", orgID))
 
 	// Current month's org traffic totals from traffic_monthly.
 	month := time.Now().UTC().Format("200601")

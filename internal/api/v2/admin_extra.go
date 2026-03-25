@@ -226,7 +226,7 @@ func (h *AdminHandler) AdminStatisticStorage(c *gin.Context) {
 	// Read the platform-wide storage counter (current snapshot — no time series).
 	// NOTE: Storage has no historical time-series tracking yet. The frontend graph
 	// shows a flat line at the current value. For v2, consider daily snapshots.
-	bytesUsed := ReadStorageUsed(h.db, "platform")
+	bytesUsed := traffic.ReadStorageUsed(h.db, "platform")
 
 	stats := h.generateDateRange(c)
 	result := make([]gin.H, len(stats))
@@ -669,7 +669,7 @@ func (h *AdminHandler) AdminSearchOrganizations(c *gin.Context) {
 			"creator_name":  creatorName,
 			"status":        effectiveStatus,
 			"role":          "default",
-			"quota_usage":   ReadStorageUsed(h.db, fmt.Sprintf("org:%s", orgID)),
+			"quota_usage":   traffic.ReadStorageUsed(h.db, fmt.Sprintf("org:%s", orgID)),
 			"quota":         storageQuota,
 			"ctime":         createdAt.Format(time.RFC3339),
 			"users_count":   usersCount,
@@ -890,7 +890,7 @@ func (h *AdminHandler) AdminUpdateOrgUser(c *gin.Context) {
 		"status":       normalizeUserStatus(status),
 		"active":       isActive,
 		"is_org_staff": isOrgStaff,
-		"quota_usage":  ReadStorageUsed(h.db, fmt.Sprintf("user:%s:%s", targetOrgID, userID)),
+		"quota_usage":  traffic.ReadStorageUsed(h.db, fmt.Sprintf("user:%s:%s", targetOrgID, userID)),
 		"quota_total":  quotaBytes,
 		"create_time":  createdAt.Format(time.RFC3339),
 		"last_login":   "",

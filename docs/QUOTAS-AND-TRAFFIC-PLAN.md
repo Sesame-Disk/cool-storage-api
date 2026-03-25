@@ -1,127 +1,127 @@
-# Storage & Traffic Quotas — Plan de Implementacion
+# Storage & Traffic Quotas — Implementation Plan
 
-## Contexto
+## Context
 
-SesameFS tiene columnas de quota en DB (`storage_quota`, `storage_used`, `quota_bytes`, `used_bytes`) pero **nunca se actualizan**. No existe tracking de trafico. Los endpoints de estadisticas devuelven stubs vacios o 501. El frontend ya tiene paginas de charts/tablas listas esperando data real.
+SesameFS has quota columns in the DB (`storage_quota`, `storage_used`, `quota_bytes`, `used_bytes`) but **they were never updated**. No traffic tracking existed. Statistics endpoints returned empty stubs or 501. The frontend already has chart/table pages ready and waiting for real data.
 
-**Objetivo**: Implementar tracking real de storage y trafico, enforcement de quotas por plan, y activar los endpoints de estadisticas.
+**Goal**: Implement real storage and traffic tracking, per-plan quota enforcement, and activate the statistics endpoints.
 
 ---
 
-## Reglas de Negocio
+## Business Rules
 
-### Planes actuales
+### Current Plans
 
-Un servicio externo de billing gestiona los planes y llama a la API admin de SesameFS para setear los limites en cada org. SesameFS **no gestiona billing** — solo almacena los limites actuales y los enforcea.
+An external billing service manages plans and calls the SesameFS admin API to set limits on each org. SesameFS **does not manage billing** — it only stores the current limits and enforces them.
 
-#### Planes mensuales
+#### Monthly Plans
 
-| Plan | Precio | Users | Storage | Upload/mes | Download/mes | Trafico |
-|------|--------|-------|---------|------------|--------------|---------|
-| **Personal Free** | Gratis | 1 | 2 GB | 10 GB | 10 GB | Combinado* |
-| **Starter** | $4/mo | 1 incl. | 250 GB | 50 TB | 250 GB | Separado |
-| **StarterPlus** | $10/mo | 1 incl. | 2 TB | 50 TB | 2 TB | Separado |
-| **Business** | $40/mo | 1 incl. | 8 TB | 50 TB | 8 TB | Separado |
+| Plan | Price | Users | Storage | Upload/mo | Download/mo | Traffic |
+|------|-------|-------|---------|-----------|-------------|---------|
+| **Personal Free** | Free | 1 | 2 GB | 10 GB | 10 GB | Combined* |
+| **Starter** | $4/mo | 1 incl. | 250 GB | 50 TB | 250 GB | Separate |
+| **StarterPlus** | $10/mo | 1 incl. | 2 TB | 50 TB | 2 TB | Separate |
+| **Business** | $40/mo | 1 incl. | 8 TB | 50 TB | 8 TB | Separate |
 | **Enterprise** | Custom | Custom | Custom | Custom | Custom | Custom |
 
-*Free tiene 10GB **combinado** (upload+download juntos). Paid plans tienen limites separados.
+*Free has 10GB **combined** (upload+download together). Paid plans have separate limits.
 
-#### Planes anuales
+#### Annual Plans
 
-Mismos tiers con descuento anual. La diferencia:
-- **Billing cycle** (monthly/annual) = frecuencia de pago y renovacion
-- **Traffic reset** = siempre mensual, sin importar el billing cycle
-- Un plan anual con 250GB/mes de download no acumula: cada mes se resetea a 0
-- El billing service puede llamar a la API para cambiar quotas en cualquier momento (upgrade, downgrade, renovacion)
+Same tiers with annual discount. The difference:
+- **Billing cycle** (monthly/annual) = payment and renewal frequency
+- **Traffic reset** = always monthly, regardless of billing cycle
+- An annual plan with 250GB/mo download does not accumulate: each month resets to 0
+- The billing service can call the API to change quotas at any time (upgrade, downgrade, renewal)
 
-#### On-demand (planes pagos)
+#### On-demand (Paid Plans)
 
-Los planes pagos incluyen 1 usuario. Mas alla de lo incluido:
-- **Storage extra**: billing cobra por tiers de uso
-- **Traffic extra**: billing cobra por tiers de uso
-- **Users extra**: billing cobra por usuario adicional
-- SesameFS **no bloquea** en planes pagos — solo avisa (soft warning). Billing se encarga del cobro.
+Paid plans include 1 user. Beyond what is included:
+- **Extra storage**: billing charges by usage tier
+- **Extra traffic**: billing charges by usage tier
+- **Extra users**: billing charges per additional user
+- SesameFS **does not block** on paid plans — only warns (soft warning). Billing handles the charges.
 
-### Modelo de datos por org
+### Per-Org Data Model
 
-Billing setea estos campos en cada org via `PUT /admin/organizations/:org_id/`:
+Billing sets these fields on each org via `PUT /admin/organizations/:org_id/`:
 
-| Campo | Tipo | Free | Starter | Enterprise | Significado |
-|-------|------|------|---------|------------|-------------|
-| `plan` | string | `"free"` | `"starter"` | `"enterprise-acme"` | Nombre del plan |
-| `billing_cycle` | string | `"monthly"` | `"monthly"` | `"annual"` | Ciclo de facturacion |
-| `storage_quota` | int64 | 2 GB | 250 GB | custom | Limite de almacenamiento. -1 = ilimitado |
-| `traffic_quota` | int64 | 10 GB | -1 | custom | Limite mensual total (upload+download). Campo universal — si viene, es EL limite. -1 = sin limite combinado |
-| `traffic_upload_quota` | int64 | -1 | 50 TB | custom | Limite mensual upload adicional. -1 = sin limite individual de upload |
-| `traffic_download_quota` | int64 | -1 | 250 GB | custom | Limite mensual download adicional. -1 = sin limite individual de download |
-| `max_users` | int | 1 | -1 | 50 | Hard cap de usuarios. -1 = ilimitado (billing cobra extra) |
+| Field | Type | Free | Starter | Enterprise | Meaning |
+|-------|------|------|---------|------------|---------|
+| `plan` | string | `"free"` | `"starter"` | `"enterprise-acme"` | Plan name |
+| `billing_cycle` | string | `"monthly"` | `"monthly"` | `"annual"` | Billing cycle |
+| `storage_quota` | int64 | 2 GB | 250 GB | custom | Storage limit. -1 = unlimited |
+| `traffic_quota` | int64 | 10 GB | -1 | custom | Combined monthly limit (upload+download). Universal field — if set, it IS the limit. -1 = no combined limit |
+| `traffic_upload_quota` | int64 | -1 | 50 TB | custom | Monthly upload limit. -1 = no individual upload limit |
+| `traffic_download_quota` | int64 | -1 | 250 GB | custom | Monthly download limit. -1 = no individual download limit |
+| `max_users` | int | 1 | -1 | 50 | Hard user cap. -1 = unlimited (billing charges extra) |
 
-**Logica de evaluacion de trafico (el mas restrictivo gana):**
-1. Si `traffic_quota != -1` → check `upload_used + download_used <= traffic_quota`
-2. Si `traffic_upload_quota != -1` → check `upload_used <= traffic_upload_quota`
-3. Si `traffic_download_quota != -1` → check `download_used <= traffic_download_quota`
-4. Cualquier check que falle → bloqueado (free) o warning (pago)
+**Traffic evaluation logic (most restrictive wins):**
+1. If `traffic_quota != -1` → check `upload_used + download_used <= traffic_quota`
+2. If `traffic_upload_quota != -1` → check `upload_used <= traffic_upload_quota`
+3. If `traffic_download_quota != -1` → check `download_used <= traffic_download_quota`
+4. Any check that fails → blocked (free) or warning (paid)
 
-`traffic_quota` es el campo universal. Billing puede usarlo solo (simple) o combinarlo con los individuales (granular). Ejemplos:
+`traffic_quota` is the universal field. Billing can use it alone (simple) or combine it with individual limits (granular). Examples:
 
-| Plan | traffic_quota | traffic_upload_quota | traffic_download_quota | Efecto |
+| Plan | traffic_quota | traffic_upload_quota | traffic_download_quota | Effect |
 |------|--------------|---------------------|----------------------|--------|
-| Free | 10 GB | -1 | -1 | 10GB total, distribuye como quiera |
-| Custom simple | 500 GB | -1 | -1 | 500GB total, sin limites por direccion |
-| Starter | -1 | 50 TB | 250 GB | Sin limite total, pero download tope 250GB |
-| Enterprise custom | 100 TB | -1 | 10 TB | 100TB total Y download max 10TB |
+| Free | 10 GB | -1 | -1 | 10GB total, distribute as desired |
+| Custom simple | 500 GB | -1 | -1 | 500GB total, no per-direction limits |
+| Starter | -1 | 50 TB | 250 GB | No total limit, but download capped at 250GB |
+| Enterprise custom | 100 TB | -1 | 10 TB | 100TB total AND download max 10TB |
 
-### Enforcement segun tipo de plan
+### Enforcement by Plan Type
 
-| Escenario | Plan Free | Plan Pago |
-|-----------|-----------|-----------|
-| Storage excedido | **Hard block** — rechazar upload con 403 | **Soft warning** — permitir, billing cobra overage |
-| Traffic excedido (cualquier check) | **Hard block** — rechazar con 403 | **Soft warning** — permitir, billing cobra overage |
-| Max users excedido | **Hard block** — rechazar crear usuario con 403 | Si max_users=-1: permitir, billing cobra. Si max_users>0: hard block |
-| Warning threshold | N/A (se bloquea directo) | Avisar al llegar a 80% del limite incluido |
+| Scenario | Free Plan | Paid Plan |
+|----------|-----------|-----------|
+| Storage exceeded | **Hard block** — reject upload with 403 | **Soft warning** — allow, billing charges overage |
+| Traffic exceeded (any check) | **Hard block** — reject with 403 | **Soft warning** — allow, billing charges overage |
+| Max users exceeded | **Hard block** — reject user creation with 403 | If max_users=-1: allow, billing charges. If max_users>0: hard block |
+| Warning threshold | N/A (blocked directly) | Warn at 80% of included limit |
 
-### Quotas a nivel usuario
+### Per-User Quotas
 
-Dentro de una org, el admin puede asignar limites individuales por usuario:
+Within an org, the admin can assign individual limits per user:
 
-- `quota_bytes` (storage) — ya existe en schema
-- `traffic_upload_quota` — nuevo
-- `traffic_download_quota` — nuevo
-- Valor -1 = heredar del pool de la org (sin limite individual)
-- El check mas restrictivo gana: si la org esta bloqueada, el user no puede subir aunque le quede quota individual
-- No hay `traffic_quota` (combinado) a nivel usuario — solo a nivel org
+- `quota_bytes` (storage) — already exists in schema
+- `traffic_upload_quota` — new
+- `traffic_download_quota` — new
+- Value -1 = inherit from org pool (no individual limit)
+- Most restrictive check wins: if the org is blocked, the user cannot upload even if they have individual quota remaining
+- No `traffic_quota` (combined) at user level — only at org level
 
 ---
 
-## Tracking de Trafico — 6 Categorias
+## Traffic Tracking — 6 Categories
 
-Compatible con Seafile. Se trackea upload y download por separado, subdividido por canal:
+Compatible with Seafile. Upload and download are tracked separately, subdivided by channel:
 
-| Traffic Type | Descripcion | Handler(s) |
+| Traffic Type | Description | Handler(s) |
 |-------------|-------------|------------|
-| `sync-file-upload` | Desktop sync client sube bloques | `PutBlock` (sync.go:762) |
-| `sync-file-download` | Desktop sync client baja bloques | `GetBlock` (sync.go:665) |
-| `web-file-upload` | Web UI sube archivos (resumable.js) | `HandleUpload` (seafhttp.go:481), `UploadFile` (files.go:2638), `UploadBlock` (blocks.go:149) |
-| `web-file-download` | Web UI descarga archivos | `HandleDownload` (seafhttp.go:1251), `HandleZipDownload` (seafhttp.go:1584), `DownloadBlock` (blocks.go:244), `DownloadHistoricFile` (fileview.go:759) |
-| `link-file-upload` | Subida via share/upload link publico | `HandleUpload` con token source=link |
-| `link-file-download` | Descarga via share link publico | `handleShareLinkDownload` (sharelink_view.go:391) |
+| `sync-file-upload` | Desktop sync client uploads blocks | `PutBlock` (sync.go:762) |
+| `sync-file-download` | Desktop sync client downloads blocks | `GetBlock` (sync.go:665) |
+| `web-file-upload` | Web UI uploads files (resumable.js) | `HandleUpload` (seafhttp.go:481), `UploadFile` (files.go:2638), `UploadBlock` (blocks.go:149) |
+| `web-file-download` | Web UI downloads files | `HandleDownload` (seafhttp.go:1251), `HandleZipDownload` (seafhttp.go:1584), `DownloadBlock` (blocks.go:244), `DownloadHistoricFile` (fileview.go:759) |
+| `link-file-upload` | Upload via public share/upload link | `HandleUpload` with token source=link |
+| `link-file-download` | Download via public share link | `handleShareLinkDownload` (sharelink_view.go:391) |
 
-Para quota enforcement se evaluan 3 checks (el mas restrictivo gana):
-1. **Combinado** (`traffic_quota`): upload_total + download_total vs limite combinado
-2. **Upload** (`traffic_upload_quota`): sync+web+link upload vs limite upload
-3. **Download** (`traffic_download_quota`): sync+web+link download vs limite download
+For quota enforcement, 3 checks are evaluated (most restrictive wins):
+1. **Combined** (`traffic_quota`): upload_total + download_total vs combined limit
+2. **Upload** (`traffic_upload_quota`): sync+web+link upload vs upload limit
+3. **Download** (`traffic_download_quota`): sync+web+link download vs download limit
 
 ---
 
-## Phase 1: Schema — Nuevas tablas y columnas
+## Phase 1: Schema — New Tables and Columns
 
-### Archivos a modificar
-- `internal/db/db.go` — agregar migrations
-- `internal/models/models.go` — agregar campos a structs
+### Files to modify
+- `internal/db/db.go` — add migrations
+- `internal/models/models.go` — add fields to structs
 
-### 1.1 Tabla `traffic_counters` (counter table)
+### 1.1 Table `traffic_counters` (counter table)
 
-Tracking diario por org/user/tipo. Partition por `(org_id, month)` para scoping mensual natural.
+Daily tracking per org/user/type. Partitioned by `(org_id, month)` for natural monthly scoping.
 
 ```sql
 CREATE TABLE IF NOT EXISTS traffic_counters (
@@ -135,16 +135,16 @@ CREATE TABLE IF NOT EXISTS traffic_counters (
 )
 ```
 
-Patron existente: `gc_queue_stats` ya usa `COUNTER` (db.go:834).
+Existing pattern: `gc_queue_stats` already uses `COUNTER` (db.go:834).
 
-Permite:
-- Queries por dia (estadisticas con group_by=day)
-- Sumas por mes (quota check)
-- Desglose por user (estadisticas per-user)
+Enables:
+- Per-day queries (statistics with group_by=day)
+- Monthly sums (quota check)
+- Per-user breakdown (per-user statistics)
 
-### 1.2 Tabla `traffic_monthly` (counter table — fast quota check)
+### 1.2 Table `traffic_monthly` (counter table — fast quota check)
 
-Contadores mensuales agregados para enforcement rapido (1 partition read per check).
+Aggregated monthly counters for fast enforcement (1 partition read per check).
 
 ```sql
 CREATE TABLE IF NOT EXISTS traffic_monthly (
@@ -156,17 +156,17 @@ CREATE TABLE IF NOT EXISTS traffic_monthly (
 )
 ```
 
-- `scope='org:upload'` = total upload de la org (para check de `traffic_upload_quota`)
-- `scope='org:download'` = total download de la org (para check de `traffic_download_quota`)
-- `scope='org:combined'` = total upload+download de la org (para check de `traffic_quota` combinado)
-- `scope='<user_id>:upload'` = upload del usuario
-- `scope='<user_id>:download'` = download del usuario
-- Se incrementa en paralelo con `traffic_counters` (fire-and-forget)
-- Cada operacion incrementa 3 scopes org (upload o download + combined) y 1 scope user
+- `scope='org:upload'` = org's total upload (for `traffic_upload_quota` check)
+- `scope='org:download'` = org's total download (for `traffic_download_quota` check)
+- `scope='org:combined'` = org's total upload+download (for combined `traffic_quota` check)
+- `scope='<user_id>:upload'` = user's upload
+- `scope='<user_id>:download'` = user's download
+- Incremented in parallel with `traffic_counters` (fire-and-forget)
+- Each operation increments 3 org scopes (upload or download + combined) and 1 user scope
 
-### 1.3 Tabla `storage_counters` (counter table)
+### 1.3 Table `storage_counters` (counter table)
 
-Contadores atomicos de storage para increment/decrement concurrente.
+Atomic storage counters for concurrent increment/decrement.
 
 ```sql
 CREATE TABLE IF NOT EXISTS storage_counters (
@@ -180,7 +180,7 @@ CREATE TABLE IF NOT EXISTS storage_counters (
 ### 1.4 ALTER TABLE organizations
 
 ```sql
-ALTER TABLE organizations ADD traffic_quota BIGINT          -- combined monthly limit (-1=no aplica)
+ALTER TABLE organizations ADD traffic_quota BIGINT          -- combined monthly limit (-1=N/A)
 ALTER TABLE organizations ADD traffic_upload_quota BIGINT   -- upload monthly limit (-1=unlimited)
 ALTER TABLE organizations ADD traffic_download_quota BIGINT -- download monthly limit (-1=unlimited)
 ALTER TABLE organizations ADD max_users INT                 -- hard cap (-1=unlimited)
@@ -188,7 +188,7 @@ ALTER TABLE organizations ADD plan TEXT                     -- plan name from bi
 ALTER TABLE organizations ADD billing_cycle TEXT            -- "monthly" | "annual"
 ```
 
-`storage_quota` ya existe. Los nuevos campos permiten al billing service setear todo via API.
+`storage_quota` already exists. The new fields allow the billing service to set everything via API.
 
 ### 1.5 ALTER TABLE users
 
@@ -197,12 +197,12 @@ ALTER TABLE users ADD traffic_upload_quota BIGINT
 ALTER TABLE users ADD traffic_download_quota BIGINT
 ```
 
-`quota_bytes` (storage) ya existe.
+`quota_bytes` (storage) already exists.
 
-### 1.6 Actualizar structs en models.go
+### 1.6 Update structs in models.go
 
 ```go
-// Organization — agregar:
+// Organization — add:
 TrafficQuota         int64  `json:"traffic_quota"`          // combined monthly limit, -1=N/A
 TrafficUploadQuota   int64  `json:"traffic_upload_quota"`   // upload monthly limit, -1=unlimited
 TrafficDownloadQuota int64  `json:"traffic_download_quota"` // download monthly limit, -1=unlimited
@@ -210,20 +210,20 @@ MaxUsers             int    `json:"max_users"`              // hard cap, -1=unli
 Plan                 string `json:"plan,omitempty"`
 BillingCycle         string `json:"billing_cycle,omitempty"` // "monthly" | "annual"
 
-// User — agregar:
+// User — add:
 TrafficUploadQuota   int64 `json:"traffic_upload_quota"`   // -1=inherit from org
 TrafficDownloadQuota int64 `json:"traffic_download_quota"` // -1=inherit from org
 ```
 
 ---
 
-## Phase 2: TrafficRecorder — Core de tracking
+## Phase 2: TrafficRecorder — Core Tracking
 
-### Archivos nuevos
+### New files
 - `internal/traffic/recorder.go`
 
-### Archivos a modificar
-- `internal/api/server.go` — inicializacion
+### Files to modify
+- `internal/api/server.go` — initialization
 
 ### 2.1 TrafficRecorder struct
 
@@ -234,23 +234,22 @@ type Recorder struct {
     session *gocql.Session
 }
 
-// Record registra bytes transferidos. Corre en goroutine, nunca bloquea el request.
+// Record logs transferred bytes. Runs in a goroutine, never blocks the request.
 func (r *Recorder) Record(orgID, userID, trafficType string, bytes int64)
 ```
 
-Logica interna:
-1. Calcula `month := time.Now().Format("200601")` y `day := time.Now().Truncate(24h)`
-2. Increment `traffic_counters` con (org_id, month, day, user_id, traffic_type)
-3. Determina direction: si trafficType contiene "upload" → direction="upload"; si "download" → direction="download"
-4. Increment `traffic_monthly` con 4 scopes:
-   - `"org:<direction>"` (ej: `"org:upload"`) — para check de quota individual
-   - `"org:combined"` — para check de quota combinada
-   - `"<userID>:<direction>"` — para check de quota per-user
-   - (3 writes a traffic_monthly por operacion)
-5. Todo dentro de `go func() { ... }()` — fire-and-forget
-6. Errores se logean, nunca se propagan
+Internal logic:
+1. Compute `month := time.Now().Format("200601")` and `day := time.Now().Truncate(24h)`
+2. Increment `traffic_counters` with (org_id, month, day, user_id, traffic_type)
+3. Determine direction: if trafficType contains "upload" → direction="upload"; if "download" → direction="download"
+4. Increment `traffic_monthly` with 3 scopes:
+   - `"org:<direction>"` (e.g., `"org:upload"`) — for individual quota check
+   - `"org:combined"` — for combined quota check
+   - `"<userID>:<direction>"` — for per-user quota check
+5. All inside `go func() { ... }()` — fire-and-forget
+6. Errors are logged, never propagated
 
-### 2.2 Constantes
+### 2.2 Constants
 
 ```go
 const (
@@ -263,9 +262,9 @@ const (
 )
 ```
 
-### 2.3 Inyeccion global
+### 2.3 Global injection
 
-Patron existente: `SetGCHooks` en gc_hooks.go.
+Existing pattern: `SetGCHooks` in gc_hooks.go.
 
 ```go
 var globalRecorder struct {
@@ -277,41 +276,41 @@ func SetRecorder(r *Recorder) { ... }
 func Get() *Recorder { ... }
 ```
 
-Se inicializa en `server.go` junto al resto de servicios.
+Initialized in `server.go` alongside other services.
 
 ---
 
-## Phase 3: Instrumentacion — Uploads
+## Phase 3: Instrumentation — Uploads
 
-### Archivos a modificar
+### Files to modify
 - `internal/api/seafhttp.go` — HandleUpload, AccessToken struct
 - `internal/api/sync.go` — PutBlock
 - `internal/api/v2/blocks.go` — UploadBlock
 - `internal/api/v2/files.go` — UploadFile
-- `internal/db/tokens.go` — AccessToken struct (agregar Source)
-- `internal/api/v2/sharelink_view.go` — marcar tokens como "link"
+- `internal/db/tokens.go` — AccessToken struct (add Source)
+- `internal/api/v2/sharelink_view.go` — mark tokens as "link"
 
-### 3.1 Agregar `Source` a AccessToken
+### 3.1 Add `Source` to AccessToken
 
 ```go
-// En ambos AccessToken (seafhttp.go:43 y db/tokens.go:21)
-Source string // "web" (default) o "link" (share/upload link)
+// In both AccessToken (seafhttp.go:43 and db/tokens.go:21)
+Source string // "web" (default) or "link" (share/upload link)
 ```
 
-En `GetUploadLinkUploadURL` (sharelink_view.go:1593) y `GetShareLinkUploadURL` (sharelink_view.go:1685): al crear el token, setear `Source: "link"`. Requiere extender `CreateUploadToken` para aceptar source, o crear `CreateUploadTokenWithSource`.
+In `GetUploadLinkUploadURL` (sharelink_view.go:1593) and `GetShareLinkUploadURL` (sharelink_view.go:1685): when creating the token, set `Source: "link"`. Requires extending `CreateUploadToken` to accept source, or creating `CreateUploadTokenWithSource`.
 
-### 3.2 Puntos de instrumentacion
+### 3.2 Instrumentation points
 
-| Handler | Archivo:Linea | Traffic Type | Size Source | Cuando |
-|---------|--------------|-------------|-------------|--------|
-| `HandleUpload` | seafhttp.go:~710 | `WebUpload` o `LinkUpload` (segun token.Source) | `finalSize` del commit | Despues de commit exitoso |
-| `PutBlock` | sync.go:~868 | `SyncUpload` | `len(data)` | Despues de store exitoso |
-| `UploadBlock` | blocks.go:~240 | `WebUpload` | `len(data)` | Despues de store exitoso |
-| `UploadFile` | files.go:~2700 | `WebUpload` | `len(content)` | Despues de commit exitoso |
+| Handler | File:Line | Traffic Type | Size Source | When |
+|---------|-----------|-------------|-------------|------|
+| `HandleUpload` | seafhttp.go:~710 | `WebUpload` or `LinkUpload` (based on token.Source) | `finalSize` from commit | After successful commit |
+| `PutBlock` | sync.go:~868 | `SyncUpload` | `len(data)` | After successful store |
+| `UploadBlock` | blocks.go:~240 | `WebUpload` | `len(data)` | After successful store |
+| `UploadFile` | files.go:~2700 | `WebUpload` | `len(content)` | After successful commit |
 
-Ejemplo de instrumentacion:
+Instrumentation example:
 ```go
-// Al final de HandleUpload, despues del commit exitoso:
+// At the end of HandleUpload, after successful commit:
 if rec := traffic.Get(); rec != nil {
     tt := traffic.WebUpload
     if token.Source == "link" {
@@ -323,91 +322,91 @@ if rec := traffic.Get(); rec != nil {
 
 ---
 
-## Phase 4: Instrumentacion — Downloads
+## Phase 4: Instrumentation — Downloads
 
-### Archivos a modificar
+### Files to modify
 - `internal/api/seafhttp.go` — HandleDownload, HandleZipDownload
 - `internal/api/sync.go` — GetBlock
 - `internal/api/v2/blocks.go` — DownloadBlock
 - `internal/api/v2/sharelink_view.go` — handleShareLinkDownload
 - `internal/api/v2/fileview.go` — DownloadHistoricFile
 
-### 4.1 Puntos de instrumentacion
+### 4.1 Instrumentation points
 
-| Handler | Archivo | Traffic Type | Size Source | Cuando |
-|---------|---------|-------------|-------------|--------|
-| `HandleDownload` | seafhttp.go | `WebDownload` | `fileSize` de fs_objects | Despues de streaming exitoso |
-| `HandleZipDownload` | seafhttp.go | `WebDownload` | byte count acumulado | Despues de zip stream |
-| `GetBlock` | sync.go | `SyncDownload` | `len(data)` | Despues de enviar |
-| `DownloadBlock` | blocks.go | `WebDownload` | `len(data)` | Despues de enviar |
-| `handleShareLinkDownload` | sharelink_view.go | `LinkDownload` | `fileSize` de metadata | Despues de streaming |
-| `DownloadHistoricFile` | fileview.go | `WebDownload` | file size | Despues de enviar |
+| Handler | File | Traffic Type | Size Source | When |
+|---------|------|-------------|-------------|------|
+| `HandleDownload` | seafhttp.go | `WebDownload` | `fileSize` from fs_objects | After successful streaming |
+| `HandleZipDownload` | seafhttp.go | `WebDownload` | accumulated byte count | After zip stream |
+| `GetBlock` | sync.go | `SyncDownload` | `len(data)` | After sending |
+| `DownloadBlock` | blocks.go | `WebDownload` | `len(data)` | After sending |
+| `handleShareLinkDownload` | sharelink_view.go | `LinkDownload` | `fileSize` from metadata | After streaming |
+| `DownloadHistoricFile` | fileview.go | `WebDownload` | file size | After sending |
 
-Nota: registrar DESPUES de enviar exitosamente. Si streaming falla a mitad, idealmente contar bytes enviados. Si no es practico, no contar (el error es raro y el drift es aceptable).
+Note: Record AFTER successful send. If streaming fails midway, ideally count bytes sent. If not practical, don't count (the error is rare and drift is acceptable).
 
 ---
 
 ## Phase 5: Storage Tracking
 
-### Archivos a modificar
-- `internal/api/v2/write_helpers.go` — helpers de increment/decrement
-- `internal/api/seafhttp.go` — increment en upload
-- `internal/api/sync.go` — increment en PutBlock
-- `internal/api/v2/files.go` — increment en UploadFile, decrement en DeleteFile
-- `internal/api/v2/libraries.go` — decrement en delete library
-- `internal/gc/worker.go` — recalculacion periodica
+### Files to modify
+- `internal/traffic/storage.go` — increment/decrement helpers
+- `internal/api/seafhttp.go` — increment on upload
+- `internal/api/sync.go` — increment on PutBlock
+- `internal/api/v2/files.go` — increment on UploadFile, decrement on DeleteFile
+- `internal/api/v2/libraries.go` — decrement on delete library
+- `internal/gc/worker.go` — periodic recalculation
 
-### 5.1 Helpers en write_helpers.go
+### 5.1 Helpers in traffic/storage.go
 
 ```go
-func incrementStorageCounters(db, orgID, userID, libraryID string, deltaBytes int64, deltaFiles int64)
-func decrementStorageCounters(db, orgID, userID, libraryID string, deltaBytes int64, deltaFiles int64)
+func IncrementStorageCounters(db, orgID, userID, libraryID string, deltaBytes int64, deltaFiles int64)
+func DecrementStorageCounters(db, orgID, userID, libraryID string, deltaBytes int64, deltaFiles int64)
 ```
 
-Cada uno hace 3 counter updates atomicos: `org:<orgID>`, `user:<orgID>:<userID>`, `lib:<orgID>:<libID>`. Fire-and-forget en goroutine.
+Each performs 4 counter updates: `platform`, `org:<orgID>`, `user:<orgID>:<userID>`, `lib:<orgID>:<libID>`. Fire-and-forget in goroutine.
 
-### 5.2 Instrumentacion
+### 5.2 Instrumentation
 
-- **Upload**: despues de commit exitoso, `incrementStorageCounters(db, orgID, userID, libID, fileSize, 1)`
-- **Delete file**: en `DeleteFile`, `decrementStorageCounters(db, orgID, userID, libID, fileSize, 1)`
-- **Delete library**: en soft-delete (trash), no decrementar aun. En hard-delete (GC cascade), decrementar por el size total.
+- **Upload**: after successful commit, `IncrementStorageCounters(db, orgID, userID, libID, fileSize, 1)`
+- **Delete file**: in `DeleteFile`, `DecrementStorageCounters(db, orgID, userID, libID, fileSize, 1)`
+- **Delete library**: on soft-delete (trash), decrement aggregates but preserve lib counter. On hard-delete (GC cascade), clean up lib counter row.
 
-### 5.3 Deduplicacion
+### 5.3 Deduplication
 
-Solo incrementar storage cuando el bloque es **nuevo** (`ref_count` pasa de 0 a 1). Si ya existe (dedup), no incrementar. Los handlers ya detectan esto.
+Only increment storage when the block is **new** (`ref_count` goes from 0 to 1). If it already exists (dedup), don't increment. The handlers already detect this.
 
-### 5.4 Recalculacion periodica (GC Phase 13)
+### 5.4 Periodic Recalculation (GC Phase 13)
 
-Nueva fase en `gc/worker.go`: `RecalculateStorageCounters`
-1. Para cada org: sumar `size_bytes` de todas las libraries activas → UPDATE `organizations.storage_used`
-2. Para cada user: sumar `size_bytes` de sus libraries → UPDATE `users.used_bytes`
-3. Para cada library: sumar `size_bytes` de sus fs_objects del head commit → UPDATE `libraries.size_bytes`
-4. Corre 1x/dia. Corrige drift acumulado.
+New phase in `gc/worker.go`: `RecalculateStorageCounters`
+1. For each org: sum `size_bytes` of all active libraries → UPDATE `organizations.storage_used`
+2. For each user: sum `size_bytes` of their libraries → UPDATE `users.used_bytes`
+3. For each library: sum `size_bytes` of head commit's fs_objects → UPDATE `libraries.size_bytes`
+4. Runs 1x/day. Corrects accumulated drift.
 
 ---
 
 ## Phase 6: Quota Enforcement
 
-### Archivos nuevos
+### New files
 - `internal/traffic/checker.go`
 
-### Archivos a modificar
-- `internal/api/sync.go` — QuotaCheck (linea 1636)
-- `internal/api/seafhttp.go` — pre-check en HandleUpload
-- `internal/api/v2/files.go` — pre-check en UploadFile
-- `internal/api/v2/blocks.go` — pre-check en UploadBlock
-- `internal/api/v2/admin.go` — pre-check en crear usuario (max_users)
+### Files to modify
+- `internal/api/sync.go` — QuotaCheck (line 1636)
+- `internal/api/seafhttp.go` — pre-check in HandleUpload
+- `internal/api/v2/files.go` — pre-check in UploadFile
+- `internal/api/v2/blocks.go` — pre-check in UploadBlock
+- `internal/api/v2/admin.go` — pre-check on user creation (max_users)
 
 ### 6.1 QuotaChecker
 
 ```go
 type QuotaStatus struct {
-    Allowed    bool   // puede proceder
-    Warning    bool   // >80% del limite (solo planes pagos)
-    UsedBytes  int64  // uso actual
-    LimitBytes int64  // limite del check que fallo (-1=ilimitado)
+    Allowed    bool   // can proceed
+    Warning    bool   // >80% of limit (paid plans only)
+    UsedBytes  int64  // current usage
+    LimitBytes int64  // limit of the check that failed (-1=unlimited)
     Reason     string // "storage", "traffic-combined", "traffic-upload", "traffic-download", "max-users"
-    Plan       string // nombre del plan
+    Plan       string // plan name
 }
 
 type Checker struct {
@@ -419,9 +418,9 @@ func (c *Checker) CheckTrafficQuota(orgID, userID, direction string, additionalB
 func (c *Checker) CheckMaxUsers(orgID string) (QuotaStatus, error)
 ```
 
-### 6.2 Logica de CheckTrafficQuota
+### 6.2 CheckTrafficQuota Logic
 
-`direction` es `"upload"` o `"download"`. Un solo metodo evalua los 3 checks de trafico y retorna el mas restrictivo.
+`direction` is `"upload"` or `"download"`. A single method evaluates all 3 traffic checks and returns the most restrictive.
 
 ```
 CheckTrafficQuota(orgID, userID, direction, additionalBytes):
@@ -431,34 +430,34 @@ CheckTrafficQuota(orgID, userID, direction, additionalBytes):
 
   2. month = time.Now().Format("200601")
 
-  3. CHECK 1: Quota combinada (traffic_quota)
-     Si traffic_quota != -1:
+  3. CHECK 1: Combined quota (traffic_quota)
+     If traffic_quota != -1:
        SELECT bytes FROM traffic_monthly WHERE org_id=? AND month=? AND scope='org:combined'
-       Evaluar: combined_used + additional > traffic_quota
+       Evaluate: combined_used + additional > traffic_quota
 
-  4. CHECK 2: Quota de direction (traffic_upload_quota o traffic_download_quota)
-     quota = traffic_upload_quota si direction=="upload", else traffic_download_quota
-     Si quota != -1:
+  4. CHECK 2: Direction quota (traffic_upload_quota or traffic_download_quota)
+     quota = traffic_upload_quota if direction=="upload", else traffic_download_quota
+     If quota != -1:
        SELECT bytes FROM traffic_monthly WHERE scope='org:<direction>'
-       Evaluar: direction_used + additional > quota
+       Evaluate: direction_used + additional > quota
 
-  5. CHECK 3: Quota per-user
-     Si userID != "":
+  5. CHECK 3: Per-user quota
+     If userID != "":
        SELECT traffic_upload_quota, traffic_download_quota FROM users WHERE org_id=? AND user_id=?
-       user_quota = el que corresponda segun direction
-       Si user_quota != -1:
+       user_quota = the one corresponding to direction
+       If user_quota != -1:
          SELECT bytes FROM traffic_monthly WHERE scope='<userID>:<direction>'
-         Evaluar: user_used + additional > user_quota
+         Evaluate: user_used + additional > user_quota
 
-  6. Para cada check que falle:
-     Si plan == "" o plan == "free" → Allowed=false (hard block)
-     Si plan pago → Allowed=true, Warning=true
+  6. For each check that fails:
+     If plan == "" or plan == "free" → Allowed=false (hard block)
+     If paid plan → Allowed=true, Warning=true
 
-  7. Retornar el status MAS restrictivo de los 3 checks
-     Reason = el check que fallo ("traffic-combined", "traffic-upload", "traffic-download")
+  7. Return the MOST restrictive status of the 3 checks
+     Reason = the check that failed ("traffic-combined", "traffic-upload", "traffic-download")
 ```
 
-### 6.3 Integracion en handlers
+### 6.3 Handler Integration
 
 **QuotaCheck endpoint** (sync.go:1636 — desktop client):
 ```go
@@ -473,7 +472,7 @@ func (h *SyncHandler) QuotaCheck(c *gin.Context) {
 }
 ```
 
-**Upload pre-check** (antes de leer datos del request):
+**Upload pre-check** (before reading request data):
 ```go
 storageStatus, _ := checker.CheckStorageQuota(orgID, contentLength)
 if !storageStatus.Allowed {
@@ -488,10 +487,10 @@ if !trafficStatus.Allowed {
 if trafficStatus.Warning {
     c.Header("X-Quota-Warning", trafficStatus.Reason)
 }
-// proceder con upload...
+// proceed with upload...
 ```
 
-**Download pre-check** (antes de streaming):
+**Download pre-check** (before streaming):
 ```go
 trafficStatus, _ := checker.CheckTrafficQuota(orgID, userID, "download", fileSize)
 if !trafficStatus.Allowed {
@@ -503,7 +502,7 @@ if trafficStatus.Warning {
 }
 ```
 
-**Crear usuario** (admin.go, org_admin.go):
+**Create user** (admin.go, org_admin.go):
 ```go
 usersStatus, _ := checker.CheckMaxUsers(orgID)
 if !usersStatus.Allowed {
@@ -512,45 +511,45 @@ if !usersStatus.Allowed {
 }
 ```
 
-### 6.4 Header de warning
+### 6.4 Warning Header
 
-Para planes pagos con soft warning, setear header `X-Quota-Warning: storage|traffic-upload|traffic-download` para que el frontend muestre un aviso sin bloquear.
+For paid plans with soft warning, set header `X-Quota-Warning: storage|traffic-upload|traffic-download` so the frontend can show a notice without blocking.
 
-### 6.5 Share link enforcement
+### 6.5 Share Link Enforcement
 
-Share link downloads/uploads: el trafico cuenta contra la org del creador del link. Si la org del creador esta en free y excedio quota, el share link devuelve 403. El campo `trafficOverLimit` en respuestas de share link (actualmente hardcodeado a `false` en sharelink_view.go) se evalua contra la quota real.
+Share link downloads/uploads: traffic counts against the link creator's org. If the creator's org is on free and has exceeded quota, the share link returns 403. The `trafficOverLimit` field in share link responses (currently hardcoded to `false` in sharelink_view.go) evaluates against real quota.
 
 ---
 
 ## Phase 7: Statistics API
 
-### Archivos a modificar
-- `internal/api/v2/admin_extra.go` — reemplazar stubs
-- `internal/api/v2/admin.go` — agregar rutas nuevas
-- `internal/api/v2/org_admin.go` — reemplazar stubs 501
-- `frontend/src/utils/seafile-api.js` — fix URLs rotas
+### Files to modify
+- `internal/api/v2/admin_extra.go` — replace stubs
+- `internal/api/v2/admin.go` — add new routes
+- `internal/api/v2/org_admin.go` — replace 501 stubs
+- `frontend/src/utils/seafile-api.js` — fix broken URLs
 
-### 7.1 Reemplazar stubs existentes
+### 7.1 Replace Existing Stubs
 
 **`AdminStatisticTraffic`** (admin_extra.go:152):
-1. Reusar `generateDateRange(c)` existente para parsear start/end/group_by
-2. Para cada fecha: query `traffic_counters` partition `(platform_org_id, month)` filtrando `day`
-3. Para superadmin: iterar todas las orgs, o usar una partition especial "platform" que acumule cross-org
-4. Sumar por traffic_type, retornar formato existente:
+1. Reuse existing `generateDateRange(c)` to parse start/end/group_by
+2. For each date: query `traffic_counters` partition `(platform_org_id, month)` filtering by `day`
+3. For superadmin: iterate all organizations, or use a special "platform" partition that accumulates cross-organization traffic
+4. Sum by traffic_type, return existing format:
 ```json
 [{"datetime": "2026-03-24T00:00:00+00:00", "sync-file-upload": 12345, "sync-file-download": 67890, "web-file-upload": 11111, "web-file-download": 22222, "link-file-upload": 3333, "link-file-download": 4444}]
 ```
 
 **`AdminStatisticStorage`** (admin_extra.go:116):
-- Query `storage_counters` para cada org, sumar totales por dia
-- Retornar `[{datetime, total_storage}]`
+- Query `storage_counters` for each org, sum totals per day
+- Return `[{datetime, total_storage}]`
 
-**`OrgStatisticTraffic`** (org_admin.go — actualmente 501):
-- Igual que AdminStatisticTraffic pero scoped a la org del caller
+**`OrgStatisticTraffic`** (org_admin.go — currently 501):
+- Same as AdminStatisticTraffic but scoped to the caller's org
 
-**`OrgStatisticUserTraffic`** (org_admin.go — actualmente 501):
-- Query `traffic_counters` para un mes, agrupar por user_id
-- Retornar lista paginada:
+**`OrgStatisticUserTraffic`** (org_admin.go — currently 501):
+- Query `traffic_counters` for a month, group by user_id
+- Return paginated list:
 ```json
 {
   "user_monthly_traffic_list": [
@@ -560,47 +559,47 @@ Share link downloads/uploads: el trafico cuenta contra la org del creador del li
 }
 ```
 
-### 7.2 Endpoints nuevos
+### 7.2 New Endpoints
 
-| Ruta | Handler | Descripcion |
-|------|---------|-------------|
+| Route | Handler | Description |
+|-------|---------|-------------|
 | `GET /admin/statistics/user-traffic/` | `AdminListUserTraffic` | Per-user traffic cross-org (superadmin) |
 | `GET /admin/statistics/org-traffic/` | `AdminListOrgTraffic` | Per-org traffic summary (superadmin) |
 
-### 7.3 Fix frontend (seafile-api.js)
+### 7.3 Frontend Fix (seafile-api.js)
 
-Bugs actuales:
-- `orgAdminStatisticSystemTraffic()` apunta a `/total-storage/` → corregir a `/system-traffic/`
-- `orgAdminListUserTraffic()` apunta a `/total-storage/` → corregir a `/user-traffic/`
+Current bugs:
+- `orgAdminStatisticSystemTraffic()` points to `/total-storage/` → fix to `/system-traffic/`
+- `orgAdminListUserTraffic()` points to `/total-storage/` → fix to `/user-traffic/`
 
-Funciones faltantes a agregar:
+Missing functions to add:
 - `sysAdminListUserTraffic(month, page, perPage, orderBy)` → `/admin/statistics/user-traffic/`
 - `sysAdminListOrgTraffic(month, page, perPage, orderBy)` → `/admin/statistics/org-traffic/`
 
 ---
 
-## Phase 8: Plan/Quota API (para billing service externo)
+## Phase 8: Plan/Quota API (for External Billing Service)
 
-### Archivos a modificar
-- `internal/api/v2/admin.go` — extender PUT org, PUT user endpoints
+### Files to modify
+- `internal/api/v2/admin.go` — extend PUT org, PUT user endpoints
 - `internal/api/v2/admin_extra.go` — subscription info endpoint
-- `internal/api/v2/org_admin.go` — exponer quota status a org admin
+- `internal/api/v2/org_admin.go` — expose quota status to org admin
 
-### 8.1 Extender PUT /admin/organizations/:org_id/
+### 8.1 Extend PUT /admin/organizations/:org_id/
 
-Ya acepta `storage_quota`. Agregar soporte para todos los campos que billing envia:
+Already accepts `storage_quota`. Add support for all fields that billing sends:
 
 ```
-storage_quota            (int64, bytes) — ya existe
-traffic_quota            (int64, bytes/mes combinado, -1=no aplica) — NUEVO
-traffic_upload_quota     (int64, bytes/mes, -1=ilimitado) — NUEVO
-traffic_download_quota   (int64, bytes/mes, -1=ilimitado) — NUEVO
-max_users                (int, -1=ilimitado) — NUEVO
-plan                     (string, nombre del plan) — NUEVO
-billing_cycle            (string, "monthly"|"annual") — NUEVO
+storage_quota            (int64, bytes) — already exists
+traffic_quota            (int64, bytes/mo combined, -1=N/A) — NEW
+traffic_upload_quota     (int64, bytes/mo, -1=unlimited) — NEW
+traffic_download_quota   (int64, bytes/mo, -1=unlimited) — NEW
+max_users                (int, -1=unlimited) — NEW
+plan                     (string, plan name) — NEW
+billing_cycle            (string, "monthly"|"annual") — NEW
 ```
 
-**Ejemplo: billing setea plan free**
+**Example: billing sets free plan**
 ```json
 {
     "plan": "free",
@@ -613,7 +612,7 @@ billing_cycle            (string, "monthly"|"annual") — NUEVO
 }
 ```
 
-**Ejemplo: billing setea plan Starter**
+**Example: billing sets Starter plan**
 ```json
 {
     "plan": "starter",
@@ -626,19 +625,19 @@ billing_cycle            (string, "monthly"|"annual") — NUEVO
 }
 ```
 
-### 8.2 Extender PUT /admin/organizations/:org_id/users/:email/
+### 8.2 Extend PUT /admin/organizations/:org_id/users/:email/
 
-Ya acepta `quota_total` (storage). Agregar:
+Already accepts `quota_total` (storage). Add:
 ```
-traffic_upload_quota   (int64, bytes/mes)
-traffic_download_quota (int64, bytes/mes)
+traffic_upload_quota   (int64, bytes/mo)
+traffic_download_quota (int64, bytes/mo)
 ```
 
-El org admin puede asignar limites individuales de trafico.
+The org admin can assign individual traffic limits.
 
-### 8.3 GET /api/v2.1/subscription/ (nuevo)
+### 8.3 GET /api/v2.1/subscription/ (new)
 
-Retorna info del plan actual de la org del usuario autenticado. Consumido por el componente de subscription del frontend.
+Returns current plan info for the authenticated user's org. Consumed by the frontend subscription component.
 
 ```json
 {
@@ -659,9 +658,9 @@ Retorna info del plan actual de la org del usuario autenticado. Consumido por el
 }
 ```
 
-### 8.4 Extender GET /org/admin/info/
+### 8.4 Extend GET /org/admin/info/
 
-Ya retorna `storage_quota` y `storage_usage`. Agregar:
+Already returns `storage_quota` and `storage_usage`. Add:
 ```json
 {
     "traffic_quota": 10737418240,
@@ -676,9 +675,9 @@ Ya retorna `storage_quota` y `storage_usage`. Agregar:
 }
 ```
 
-### 8.5 Extender GET /api/v2.1/account/info/
+### 8.5 Extend GET /api/v2.1/account/info/
 
-Ya retorna `total` (storage quota) y `usage` (storage used). Agregar traffic info del usuario:
+Already returns `total` (storage quota) and `usage` (storage used). Add per-user traffic info:
 ```json
 {
     "traffic_upload_quota": -1,
@@ -690,7 +689,7 @@ Ya retorna `total` (storage quota) y `usage` (storage used). Agregar traffic inf
 
 ---
 
-## Orden de Implementacion
+## Implementation Order
 
 ```
 Phase 1 (Schema)
@@ -710,91 +709,101 @@ Phase 2 (TrafficRecorder core)
               Phase 8 (Plan/Quota API)
 ```
 
-- Phases 3+5 son paralelas (no dependen entre si)
-- Phase 4 depende de Phase 3 (misma mecanica, complementa)
-- Phase 6 depende de Phase 5 (necesita storage counters)
-- Phase 7 necesita Phases 3+4 (necesita datos de trafico)
-- Phase 8 es mayormente independiente pero va al final (necesita los campos de Phase 1)
+- Phases 3+5 are parallel (no dependencies between them)
+- Phase 4 depends on Phase 3 (same mechanics, complements it)
+- Phase 6 depends on Phase 5 (needs storage counters)
+- Phase 7 needs Phases 3+4 (needs traffic data)
+- Phase 8 is mostly independent but goes last (needs Phase 1 fields)
 
 ---
 
-## Archivos Criticos (resumen)
+## Critical Files (Summary)
 
-| Archivo | Cambios |
-|---------|---------|
-| `internal/db/db.go` | 3 tablas nuevas (traffic_counters, traffic_monthly, storage_counters) + 6 ALTER TABLE |
-| `internal/models/models.go` | Campos nuevos en Organization, User |
-| `internal/traffic/recorder.go` | **Nuevo** — TrafficRecorder |
-| `internal/traffic/checker.go` | **Nuevo** — QuotaChecker |
-| `internal/api/seafhttp.go` | AccessToken.Source, instrumentar HandleUpload/HandleDownload, pre-checks |
-| `internal/api/sync.go` | Instrumentar PutBlock/GetBlock, implementar QuotaCheck real |
-| `internal/api/v2/blocks.go` | Instrumentar UploadBlock/DownloadBlock, pre-checks |
-| `internal/api/v2/files.go` | Instrumentar UploadFile, decrement en DeleteFile |
-| `internal/api/v2/write_helpers.go` | incrementStorageCounters/decrementStorageCounters |
-| `internal/api/v2/admin_extra.go` | Reemplazar stubs de statistics, subscription endpoint |
-| `internal/api/v2/admin.go` | Nuevas rutas statistics, extender PUT org |
-| `internal/api/v2/org_admin.go` | Reemplazar stubs 501, extender endpoints |
-| `internal/api/v2/sharelink_view.go` | Token source=link, trafficOverLimit real |
-| `internal/api/v2/fileview.go` | Instrumentar DownloadHistoricFile |
-| `internal/api/v2/libraries.go` | Decrement storage en delete |
-| `internal/api/server.go` | Inicializar TrafficRecorder y QuotaChecker |
-| `internal/gc/worker.go` | Phase 13: RecalculateStorageCounters |
+| File | Changes |
+|------|---------|
+| `internal/db/db.go` | 3 new tables (traffic_counters, traffic_monthly, storage_counters) + 6 ALTER TABLE |
+| `internal/models/models.go` | New fields in Organization, User |
+| `internal/traffic/recorder.go` | **New** — TrafficRecorder |
+| `internal/traffic/checker.go` | **New** — QuotaChecker |
+| `internal/traffic/storage.go` | **New** — Storage counter helpers (Increment/Decrement/Read/Adjust/Delete) |
+| `internal/api/seafhttp.go` | AccessToken.Source, instrument HandleUpload/HandleDownload, pre-checks |
+| `internal/api/sync.go` | Instrument PutBlock/GetBlock, implement real QuotaCheck |
+| `internal/api/v2/blocks.go` | Instrument UploadBlock/DownloadBlock, pre-checks |
+| `internal/api/v2/files.go` | Instrument UploadFile, decrement on DeleteFile |
+| `internal/api/v2/write_helpers.go` | softDeleteLibrary/restoreDeletedLibrary (delegates to traffic package) |
+| `internal/api/v2/admin_extra.go` | Replace statistics stubs, subscription endpoint |
+| `internal/api/v2/admin.go` | New statistics routes, extend PUT org |
+| `internal/api/v2/org_admin.go` | Replace 501 stubs, extend endpoints |
+| `internal/api/v2/sharelink_view.go` | Token source=link, real trafficOverLimit |
+| `internal/api/v2/fileview.go` | Instrument DownloadHistoricFile |
+| `internal/api/v2/libraries.go` | Decrement storage on delete |
+| `internal/api/server.go` | Initialize TrafficRecorder and QuotaChecker |
+| `internal/gc/store_cassandra.go` | SoftDeleteLibrary delegates to traffic.AdjustAggregateStorageCounters |
 | `internal/db/tokens.go` | AccessToken.Source field |
-| `frontend/src/utils/seafile-api.js` | Fix URLs rotas, agregar funciones faltantes |
+| `frontend/src/utils/seafile-api.js` | Fix broken URLs, add missing functions |
 
 ---
 
-## Consideraciones de ScyllaDB
+## ScyllaDB Considerations
 
-### Counter tables
-- Usamos counter tables para `traffic_counters`, `traffic_monthly`, y `storage_counters`
-- Counter tables NO soportan TTL — cleanup manual de meses viejos si es necesario
-- Counter tables NO soportan conditional updates (LWT) — no es problema para nuestro caso
-- Counters son eventually consistent — aceptable para quotas (drift temporal es ok)
+### Counter Tables
+- We use counter tables for `traffic_counters`, `traffic_monthly`, and `storage_counters`
+- Counter tables do NOT support TTL — manual cleanup of old months if necessary
+- Counter tables do NOT support conditional updates (LWT) — not a problem for our use case
+- Counters are eventually consistent — acceptable for quotas (temporary drift is ok)
 
 ### Partitioning
-- `traffic_counters`: partition `(org_id, month)` — una partition por org por mes (~6 tipos * ~30 dias * N users filas)
-- `traffic_monthly`: partition `(org_id, month)` — pocas filas por partition (2 org scopes + 2 per user)
-- `storage_counters`: partition `(scope)` — una fila por entity (org, user, library)
+- `traffic_counters`: partition `(org_id, month)` — one partition per org per month (~6 types * ~30 days * N users rows)
+- `traffic_monthly`: partition `(org_id, month)` — few rows per partition (2 org scopes + 2 per user)
+- `storage_counters`: partition `(scope)` — one row per entity (org, user, library)
 
-### Hot partitions
-- Orgs con trafico masivo podrian crear hot partitions en `traffic_counters`
-- Mitigacion: partition por `(org_id, month)` limita el tamaño. Si necesario, shardear por semana
-- Premature optimization — evaluar despues de datos reales
+### Hot Partitions
+- Organizations with massive traffic could create hot partitions in `traffic_counters`
+- Mitigation: partitioning by `(org_id, month)` limits the size. If needed, shard by week
+- Premature optimization — evaluate after real data
 
 ---
 
-## Verificacion
+## Implementation Status (2026-03-25)
 
-### Tests unitarios
-- TrafficRecorder: mock de session, verificar queries generados
-- QuotaChecker: test con free (hard block), paid (soft warning), unlimited (-1)
-- Storage counters: increment/decrement correcto
+| Phase | Description | Status | Notes |
+|-------|-------------|--------|-------|
+| **Phase 1** | Schema — tables + ALTER TABLE | ✅ COMPLETE | 3 counter tables + 8 ALTER TABLE migrations in db.go |
+| **Phase 2** | TrafficRecorder core | ✅ COMPLETE | `internal/traffic/recorder.go` — semaphore-bounded goroutines, UUID validation, platform aggregate |
+| **Phase 3** | Upload instrumentation | ✅ COMPLETE | HandleUpload, PutBlock, UploadBlock, UploadFile. Token.Source distinguishes link vs web |
+| **Phase 4** | Download instrumentation | ✅ COMPLETE | HandleDownload, HandleZipDownload, GetBlock, DownloadBlock, DownloadHistoricFile, handleShareLinkDownload |
+| **Phase 5** | Storage tracking | ✅ COMPLETE | Increment/DecrementStorageCounters in `traffic/storage.go` (4 scopes), negative delta guard, library soft-delete/restore adjusts aggregates |
+| **Phase 6** | Quota enforcement | ✅ COMPLETE | CheckStorageQuota, CheckTrafficQuota, CheckMaxUsers. Free=hard block, paid=soft warning. Pre-checks in all upload/download paths |
+| **Phase 7** | Statistics API | ✅ COMPLETE | AdminStatisticTraffic, AdminStatisticStorage, OrgStatisticTraffic, OrgStatisticUserTraffic, AdminListOrgTraffic, AdminListUserTraffic — all real data |
+| **Phase 8** | Plan/Quota API | ✅ COMPLETE | PUT org accepts all plan fields, PUT user accepts traffic quotas, GET subscription, account info extended |
 
-### Tests de integracion
-- Upload archivo → verificar traffic_counters incrementado con tipo correcto
-- Upload archivo → verificar traffic_monthly incrementado (org:upload, org:combined, user:upload)
-- Upload archivo → verificar storage_counters incrementado
-- Download archivo → verificar traffic_counters incrementado
-- Share link download → verificar tipo `link-file-download`
-- Sync upload → verificar tipo `sync-file-upload`
-- Org free con traffic_quota=10GB → upload 6GB + download 5GB → segunda op bloqueada (combinado)
-- Org starter con traffic_download_quota=250GB → download >250GB → warning header (soft)
-- Org free con storage_quota=2GB → upload >2GB → rechazo 403
-- Org free con max_users=1 → crear segundo usuario → rechazo 403
-- Org paid con max_users=-1 → crear usuarios sin limite
-- GET /admin/statistics/system-traffic/ → verificar datos reales en formato correcto
-- GET /org/:id/admin/statistics/user-traffic/ → verificar desglose por usuario
-- PUT /admin/organizations/:id/ con todos los campos de plan → verificar persistencia
-- GET /api/v2.1/subscription/ → verificar datos reales con plan info
+### Post-implementation fixes (2026-03-25)
+- **Recorder semaphore**: Moved `select` outside goroutine — drops records without spawning goroutines under load
+- **DecrementStorageCounters**: Added early return guard for negative deltaBytes
+- **Library soft-delete storage accounting**: `softDeleteLibrary()` decrements aggregates, `restoreDeletedLibrary()` re-adds them, `DeleteLibraryStorageCounter()` cleans up lib-scope row on permanent delete. GC delegates to shared `traffic` package.
+- **Storage counter consolidation**: Moved `IncrementStorageCounters`, `DecrementStorageCounters`, `ReadStorageUsed`, `AdjustAggregateStorageCounters`, `DeleteLibraryStorageCounter` from `write_helpers.go` to `internal/traffic/storage.go`. Eliminated duplicated `decrementLibraryFromAggregates` in GC.
 
-### Tests manuales
-- Web upload → dashboard sys-admin muestra trafico web
-- Desktop sync → estadisticas muestran sync-file-upload
-- Share link download → estadisticas muestran link-file-download
-- Org free: 2GB storage limit → subir >2GB → bloqueo
-- Org free: 10GB traffic combinado → superar → bloqueo
-- Org paid: exceder download quota → warning header pero no bloqueo
-- Enterprise con max_users=50 → usuario 51 bloqueado
-- Frontend subscription component → muestra datos reales
-- Billing API: PUT org con plan change → quotas actualizadas inmediatamente
+### Known scalability debt (v2)
+- `COUNT(*)` for `CheckMaxUsers` — full partition scan. Replace with counter in v2. See `TECHNICAL-DEBT.md` § 12a.
+- Platform traffic aggregate uses single hot partition. Shard in v2. See `TECHNICAL-DEBT.md` § 12b.
+
+---
+
+## Verification
+
+### Unit Tests
+- TrafficRecorder: mock session, verify generated queries
+- QuotaChecker: test with free (hard block), paid (soft warning), unlimited (-1)
+- Storage counters: correct increment/decrement
+
+### Integration Tests
+- Upload file → verify traffic_counters incremented with correct type
+- Upload file → verify traffic_monthly incremented (org:upload, org:combined, user:upload)
+- Upload file → verify storage_counters incremented
+- Download file → verify traffic_counters incremented
+- Share link download → verify type `link-file-download`
+- Sync upload → verify type `sync-file-upload`
+- Free org with traffic_quota=10GB → upload 6GB + download 5GB → second op blocked (combined)
+- Starter org with traffic_download_quota=250GB → download >250GB → warning header (soft)
+- Free org with storage_quota=2GB → upload >2GB → 403 rejection
+- Free org with max_users=1 → create second user → 403 rejection

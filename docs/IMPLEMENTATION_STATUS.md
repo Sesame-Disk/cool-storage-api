@@ -1,6 +1,6 @@
 # Implementation Status - SesameFS
 
-**Last Updated**: 2026-03-18
+**Last Updated**: 2026-03-25
 
 ---
 
@@ -76,9 +76,10 @@
 | **Admin Link Management** | ✅ COMPLETE | Mostly stable | ❌ No | 2026-02-12 | 13 endpoints: share link admin (list/delete), upload links (user CRUD + admin), per-user links. See [ADMIN-FEATURES.md](ADMIN-FEATURES.md) § 2 |
 | **Superadmin Departments/Address Book** | ✅ COMPLETE | Mostly stable | ❌ No | 2026-03-05 | 9 endpoints: dept CRUD, address book groups, group-owned libraries. See [ADMIN-FEATURES.md](ADMIN-FEATURES.md) § 4 |
 | **Org Admin Panel** | ✅ COMPLETE | Mostly stable | ❌ No | 2026-03-05 | 50+ endpoints in org_admin.go. Users, groups, repos, trash, departments, links. See [ADMIN-FEATURES.md](ADMIN-FEATURES.md) § 5 |
+| **Storage & Traffic Quotas** | ✅ COMPLETE | Mostly stable | ❌ No | 2026-03-25 | Traffic recording (fire-and-forget), quota enforcement (free=hard block, paid=soft warning), storage counters (4 scopes), statistics API, plan management API. All upload/download paths instrumented. Library soft-delete adjusts storage counters. See [QUOTAS-AND-TRAFFIC-PLAN.md](QUOTAS-AND-TRAFFIC-PLAN.md) |
 | **Audit Logs** | 🟡 PARTIAL | Mostly stable | ❌ No | 2026-03-18 | `audit_log` table with 365-day TTL for deletion events (GC, groups, departments). Console stubs remain for login/file-access logs. See [ADMIN-FEATURES.md](ADMIN-FEATURES.md) § 3 |
 | **File/Folder Trash** | ✅ COMPLETE | Mostly stable | ❌ No | 2026-03-11 | List, restore, clean trash + browse deleted folders. Enhanced: filters out children of deleted directories (2026-03-11) |
-| **Library Recycle Bin** | ✅ COMPLETE | Mostly stable | ❌ No | 2026-02-05 | Soft-delete, restore, permanent delete. User + admin endpoints |
+| **Library Recycle Bin** | ✅ COMPLETE | Mostly stable | ❌ No | 2026-03-25 | Soft-delete, restore, permanent delete. User + admin endpoints. Storage counters adjusted on delete/restore (2026-03-25) |
 | **File Expiry Countdown** | ✅ COMPLETE | Mostly stable | ❌ No | 2026-02-05 | `expires_at` in directory listing for auto-delete libraries |
 | **Admin Library Management** | ✅ COMPLETE | Mostly stable | ❌ No | 2026-02-12 | 12 endpoints in admin.go + seafile-api.js methods + trash libraries |
 | **Admin Link Management** | ✅ COMPLETE | Mostly stable | ❌ No | 2026-02-12 | 13 endpoints: share link admin (list/delete), upload links (user CRUD + admin), per-user links. See [ADMIN-FEATURES.md](ADMIN-FEATURES.md) § 2 |

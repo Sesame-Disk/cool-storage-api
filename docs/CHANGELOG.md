@@ -8,7 +8,43 @@ Session-by-session development history for SesameFS.
 
 ---
 
-## [Unreleased] - 2026-03-19
+## [Unreleased] - 2026-03-25
+
+### Added — Storage & Traffic Quotas
+- **Traffic recording** (`internal/traffic/recorder.go`) — Fire-and-forget async `Recorder.Record()` writes to `traffic_counters` (daily detail) + `traffic_monthly` (3 scopes per call) + platform aggregate (zero UUID partition). Bounded by semaphore (256 inflight); excess dropped without spawning goroutines.
+- **Quota enforcement** (`internal/traffic/checker.go`) — `CheckStorageQuota`, `CheckTrafficQuota`, `CheckMaxUsers`. Free plan = hard block (403), paid = soft warning (X-Quota-Warning header).
+- **Storage counters** (`internal/traffic/storage.go`) — `IncrementStorageCounters` / `DecrementStorageCounters` track 4 scopes: platform, org, user, library. Counter tables use Cassandra/ScyllaDB native counters.
+- **Schema migrations** — 3 new counter tables (`traffic_counters`, `traffic_monthly`, `storage_counters`) + ALTER TABLE on organizations (plan, billing_cycle, traffic quotas, max_users) and users (traffic quotas). `AccessToken.Source` field for link vs web distinction.
+- **Quota pre-checks** — `HandleUpload`, `HandleDownload`, `UploadFile`, `PutBlock`, `GetBlock`, `UploadBlock`, `DownloadBlock`, `HandleZipDownload` all check quotas before processing. `AdminCreateUser`, `AdminAddOrgUser`, `AddOrgUser` check max_users.
+- **Statistics API** — `AdminStatisticTraffic`, `AdminStatisticStorage`, `OrgStatisticTraffic`, `OrgStatisticUserTraffic`, `AdminListOrgTraffic`, `AdminListUserTraffic` — all return real data from counter tables.
+- **Plan/Quota API** — `PUT /admin/organizations/:id/` accepts all plan fields; `PUT .../users/:email/` accepts traffic quotas; `GET /api/v2.1/subscription/` new endpoint; `GET /org/admin/info/` + `GET /api2/account/info/` extended with traffic data.
+- **Frontend fixes** — `seafile-api.js`: fixed 2 URL bugs (`orgAdminStatisticSystemTraffic`, `orgAdminListUserTraffic`); added `sysAdminListOrgTraffic` + `sysAdminListUserTraffic`.
+
+### Added — Library Soft-Delete Storage Accounting
+- **`softDeleteLibrary()`** — Canonical helper that marks library deleted AND decrements aggregate storage counters (org, user, platform) from the lib-scope counter. Lib-scope counter preserved for restore.
+- **`restoreDeletedLibrary()`** — Clears deleted_at AND re-adds lib-scope storage to aggregates. Mirror of softDeleteLibrary.
+- **`deleteLibraryStorageCounter()`** — Removes lib-scope counter row after permanent deletion.
+- **`adjustAggregateStorageCounters()`** — Read-cap-decrement pattern to prevent negative counters.
+- All callers updated: `DeleteLibrary`, `AdminDeleteLibrary`, `RestoreDeletedRepo`, `PermanentDeleteRepo`.
+- GC mirrored: `CassandraStore.SoftDeleteLibrary` decrements aggregates; `processOrgCascade` soft-deletes active libraries before cascade; `processLibraryCascade` cleans up lib counter row.
+
+### Changed
+- **Recorder semaphore** — Semaphore check moved outside goroutine to avoid spawning goroutines that immediately exit under load.
+- **DecrementStorageCounters** — Added early return guard for negative deltaBytes/deltaFiles to prevent accidental increment.
+
+### Files Changed
+- `internal/traffic/recorder.go`, `internal/traffic/checker.go`, `internal/traffic/storage.go` — Traffic/quota package and storage counter helpers
+- `internal/api/v2/write_helpers.go` — soft-delete/restore helpers delegating to `traffic`
+- `internal/api/v2/files.go`, `admin.go`, `admin_extra.go`, `libraries.go`, `deleted_libraries.go` — Quota instrumentation + soft-delete callers
+- `internal/api/v2/fileview.go`, `sharelink_view.go` — Traffic recording + quota pre-checks
+- `internal/api/seafhttp.go`, `sync.go` — Traffic recording + quota pre-checks
+- `internal/gc/store.go`, `store_cassandra.go`, `store_mock.go`, `worker.go` — Storage counter integration
+- `internal/db/db.go`, `internal/models/models.go` — Schema migrations
+- `frontend/src/utils/seafile-api.js` — URL fixes + new API functions
+
+---
+
+## 2026-03-19 — User/Org Lifecycle: Status Separation, Session Invalidation, Share Link Toggle
 
 ### Changed
 - **User/Org lifecycle: separated `status` from `role`** — New `status` column (`active`, `deactivated`, `deleted`) on both `users` and `organizations` tables. Role field now only tracks permissions (`superadmin`, `admin`, `user`, `readonly`, `guest`), preserving the original role when a user is deactivated or deleted.

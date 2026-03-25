@@ -662,7 +662,7 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 			rec.Record(token.OrgID, token.UserID, tt, total)
 		}
 		if h.db != nil {
-			v2.IncrementStorageCounters(h.db, token.OrgID, token.UserID, token.RepoID, total, 1)
+			traffic.IncrementStorageCounters(h.db, token.OrgID, token.UserID, token.RepoID, total, 1)
 		}
 
 		if retJSON {
@@ -773,7 +773,7 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 		rec.Record(token.OrgID, token.UserID, tt, finalSize)
 	}
 	if h.db != nil {
-		v2.IncrementStorageCounters(h.db, token.OrgID, token.UserID, token.RepoID, finalSize, 1)
+		traffic.IncrementStorageCounters(h.db, token.OrgID, token.UserID, token.RepoID, finalSize, 1)
 	}
 
 	if retJSON {
