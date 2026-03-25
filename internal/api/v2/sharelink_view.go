@@ -27,6 +27,7 @@ import (
 	"github.com/Sesame-Disk/sesamefs/internal/storage"
 	"github.com/Sesame-Disk/sesamefs/internal/streaming"
 	"github.com/Sesame-Disk/sesamefs/internal/templates"
+	"github.com/Sesame-Disk/sesamefs/internal/traffic"
 	"github.com/gin-gonic/gin"
 	"golang.org/x/crypto/bcrypt"
 )
@@ -399,7 +400,7 @@ func (h *ShareLinkViewHandler) handleShareLinkDownload(c *gin.Context, sl *share
 	filename := filepath.Base(sl.filePath)
 
 	// Generate download token using the share link creator's user ID
-	downloadToken, err := h.tokenCreator.CreateDownloadToken(sl.orgID, sl.libraryID, sl.filePath, sl.createdBy)
+	downloadToken, err := h.tokenCreator.CreateLinkDownloadToken(sl.orgID, sl.libraryID, sl.filePath, sl.createdBy)
 	if err != nil {
 		c.Header("Content-Type", "text/html; charset=utf-8")
 		c.String(http.StatusInternalServerError, errorPageHTML("Download Error", "Failed to generate download link."))
@@ -426,6 +427,25 @@ func (h *ShareLinkViewHandler) handleShareLinkDownload(c *gin.Context, sl *share
 
 // handleShareLinkRaw serves the raw file content for inline preview (images, PDFs, videos, etc.)
 func (h *ShareLinkViewHandler) handleShareLinkRaw(c *gin.Context, sl *shareLinkData) {
+	// Record traffic after the response is fully written (covers all return paths).
+	bytesBefore := int64(c.Writer.Size())
+	defer func() {
+		if rec := traffic.Get(); rec != nil {
+			sent := int64(c.Writer.Size()) - bytesBefore
+			if sent > 0 {
+				rec.Record(sl.orgID, sl.createdBy, traffic.LinkDownload, sent)
+			}
+		}
+	}()
+
+	// Quota pre-check: reject if the org's download traffic quota is exhausted.
+	if checker := traffic.GetChecker(); checker != nil {
+		if st, _ := checker.CheckTrafficQuota(sl.orgID, sl.createdBy, "download", 0); !st.Allowed {
+			c.JSON(http.StatusForbidden, gin.H{"error": "traffic quota exceeded"})
+			return
+		}
+	}
+
 	if sl.targetEntry == nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "file not found"})
 		return
@@ -897,7 +917,7 @@ func isOnlyOfficeViewable(ext string) bool {
 // inside the standard share link layout (header + preview container), not a full-page editor.
 func (h *ShareLinkViewHandler) buildOnlyOfficePreviewPage(filename, ext string, fileSize int64, sl *shareLinkData) (string, error) {
 	// Generate download token so OnlyOffice server can fetch the document
-	downloadToken, err := h.tokenCreator.CreateDownloadToken(sl.orgID, sl.libraryID, sl.filePath, sl.createdBy)
+	downloadToken, err := h.tokenCreator.CreateLinkDownloadToken(sl.orgID, sl.libraryID, sl.filePath, sl.createdBy)
 	if err != nil {
 		return "", fmt.Errorf("failed to create download token: %w", err)
 	}
@@ -989,7 +1009,7 @@ func (h *ShareLinkViewHandler) buildOnlyOfficePreviewPage(filename, ext string, 
 // serveSharedFileOnlyOffice renders the OnlyOffice viewer for a shared file
 func (h *ShareLinkViewHandler) serveSharedFileOnlyOffice(c *gin.Context, sl *shareLinkData, filename, ext string) {
 	// Generate download token so OnlyOffice server can fetch the document
-	downloadToken, err := h.tokenCreator.CreateDownloadToken(sl.orgID, sl.libraryID, sl.filePath, sl.createdBy)
+	downloadToken, err := h.tokenCreator.CreateLinkDownloadToken(sl.orgID, sl.libraryID, sl.filePath, sl.createdBy)
 	if err != nil {
 		c.Header("Content-Type", "text/html; charset=utf-8")
 		c.String(http.StatusInternalServerError, errorPageHTML("Error", "Failed to generate document access token."))
@@ -1438,7 +1458,7 @@ func (h *ShareLinkViewHandler) GetShareLinkZipTask(c *gin.Context) {
 
 	// Generate a download token for the zip
 	// We reuse the download token mechanism — the zip will be created on-the-fly
-	zipToken, err := h.tokenCreator.CreateDownloadToken(sl.orgID, sl.libraryID, fullPath, sl.createdBy)
+	zipToken, err := h.tokenCreator.CreateLinkDownloadToken(sl.orgID, sl.libraryID, fullPath, sl.createdBy)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create zip download token"})
 		return
@@ -1590,7 +1610,7 @@ func (h *ShareLinkViewHandler) GetUploadLinkUploadURL(c *gin.Context) {
 
 	// Generate an upload URL using the seafhttp upload mechanism
 	// Create a token that the file-upload handler will accept
-	uploadToken, err := h.tokenCreator.CreateUploadToken(orgID, libraryID, filePath, createdBy)
+	uploadToken, err := h.tokenCreator.CreateLinkUploadToken(orgID, libraryID, filePath, createdBy)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate upload URL"})
 		return
@@ -1682,7 +1702,7 @@ func (h *ShareLinkViewHandler) GetShareLinkUploadURL(c *gin.Context) {
 
 	// Generate an upload URL using the seafhttp upload mechanism
 	// Create a token that the file-upload handler will accept
-	uploadToken, err := h.tokenCreator.CreateUploadToken(sl.orgID, sl.libraryID, fullPath, sl.createdBy)
+	uploadToken, err := h.tokenCreator.CreateLinkUploadToken(sl.orgID, sl.libraryID, fullPath, sl.createdBy)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate upload URL"})
 		return

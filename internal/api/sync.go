@@ -22,6 +22,7 @@ import (
 	"github.com/Sesame-Disk/sesamefs/internal/httputil"
 	"github.com/Sesame-Disk/sesamefs/internal/middleware"
 	"github.com/Sesame-Disk/sesamefs/internal/storage"
+	"github.com/Sesame-Disk/sesamefs/internal/traffic"
 	"github.com/gin-gonic/gin"
 )
 
@@ -666,6 +667,7 @@ func (h *SyncHandler) GetBlock(c *gin.Context) {
 	repoID := c.Param("repo_id")
 	externalID := c.Param("block_id")
 	orgID := c.GetString("org_id")
+	userID := c.GetString("user_id")
 
 	if !h.checkSyncPermission(c, repoID, middleware.PermissionR) {
 		return
@@ -745,6 +747,14 @@ func (h *SyncHandler) GetBlock(c *gin.Context) {
 	// In both cases, blocks are returned as-is - NO re-encryption needed.
 	// The client will decrypt using its locally-derived file key.
 
+	// Quota pre-check: reject if download traffic quota exceeded.
+	if checker := traffic.GetChecker(); checker != nil {
+		if qs, _ := checker.CheckTrafficQuota(orgID, userID, "download", int64(len(data))); !qs.Allowed {
+			c.JSON(http.StatusForbidden, gin.H{"error": "download traffic quota exceeded"})
+			return
+		}
+	}
+
 	// Update last accessed time (if DB available)
 	if h.db != nil {
 		_ = h.db.Session().Query(`
@@ -753,6 +763,11 @@ func (h *SyncHandler) GetBlock(c *gin.Context) {
 	}
 
 	c.Data(http.StatusOK, "application/octet-stream", data)
+
+	// Record sync download traffic — fire-and-forget.
+	if rec := traffic.Get(); rec != nil {
+		rec.Record(orgID, userID, traffic.SyncDownload, int64(len(data)))
+	}
 }
 
 // PutBlock stores a block
@@ -763,6 +778,7 @@ func (h *SyncHandler) PutBlock(c *gin.Context) {
 	repoID := c.Param("repo_id")
 	externalID := c.Param("block_id")
 	orgID := c.GetString("org_id")
+	userID := c.GetString("user_id")
 	hashType := c.DefaultQuery("hash_type", "") // Optional: "sha256" for new clients
 
 	if !h.checkSyncPermission(c, repoID, middleware.PermissionRW) {
@@ -770,6 +786,21 @@ func (h *SyncHandler) PutBlock(c *gin.Context) {
 	}
 
 	log.Printf("PutBlock: externalID=%s, len=%d\n", externalID, len(externalID))
+
+	// Quota pre-check: reject early if storage or upload traffic quota exceeded.
+	if checker := traffic.GetChecker(); checker != nil {
+		contentLen := c.Request.ContentLength
+		if contentLen > 0 {
+			if qs, _ := checker.CheckStorageQuota(orgID, contentLen); !qs.Allowed {
+				c.JSON(http.StatusForbidden, gin.H{"error": "storage quota exceeded"})
+				return
+			}
+			if qs, _ := checker.CheckTrafficQuota(orgID, userID, "upload", contentLen); !qs.Allowed {
+				c.JSON(http.StatusForbidden, gin.H{"error": "upload traffic quota exceeded"})
+				return
+			}
+		}
+	}
 
 	// Read block data
 	data, err := io.ReadAll(c.Request.Body)
@@ -866,6 +897,11 @@ func (h *SyncHandler) PutBlock(c *gin.Context) {
 	}
 
 	c.Status(http.StatusOK)
+
+	// Record sync upload traffic — fire-and-forget.
+	if rec := traffic.Get(); rec != nil {
+		rec.Record(orgID, userID, traffic.SyncUpload, int64(len(data)))
+	}
 }
 
 // CheckBlocksRequest represents the request to check which blocks exist
@@ -1640,10 +1676,18 @@ func (h *SyncHandler) QuotaCheck(c *gin.Context) {
 		return
 	}
 
-	// Quota enforcement not yet implemented — return unlimited
-	c.JSON(http.StatusOK, gin.H{
-		"has_quota": true,
-	})
+	orgID := c.GetString("org_id")
+
+	checker := traffic.GetChecker()
+	if checker == nil {
+		// Quota system not initialized — allow (graceful degradation).
+		c.JSON(http.StatusOK, gin.H{"has_quota": true})
+		return
+	}
+
+	// Check storage quota with 0 additional bytes to see if the org is already over limit.
+	st, _ := checker.CheckStorageQuota(orgID, 0)
+	c.JSON(http.StatusOK, gin.H{"has_quota": st.Allowed})
 }
 
 // GetHeadCommitsMulti returns head commits for multiple repositories at once

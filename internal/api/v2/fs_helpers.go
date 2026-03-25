@@ -531,43 +531,47 @@ func (h *FSHelper) GetHeadCommitID(repoID string) (string, error) {
 
 // CollectBlockIDsRecursive collects all block IDs from a directory tree recursively
 func (h *FSHelper) CollectBlockIDsRecursive(repoID, fsID string) ([]string, error) {
-	var blockIDs []string
+	blockIDs, _, _, err := h.collectDirStats(repoID, fsID)
+	return blockIDs, err
+}
 
-	// Get fs_object
+// collectDirStats recursively collects block IDs, total size in bytes, and file count
+// for a directory tree rooted at the given fs_object.
+func (h *FSHelper) collectDirStats(repoID, fsID string) (blockIDs []string, totalSize int64, fileCount int64, err error) {
 	var objType string
 	var dirEntries string
 	var blockIDsList []string
+	var sizeBytes int64
 
-	err := h.db.Session().Query(`
-		SELECT obj_type, dir_entries, block_ids FROM fs_objects WHERE library_id = ? AND fs_id = ?
-	`, repoID, fsID).Scan(&objType, &dirEntries, &blockIDsList)
+	err = h.db.Session().Query(`
+		SELECT obj_type, dir_entries, block_ids, size_bytes FROM fs_objects WHERE library_id = ? AND fs_id = ?
+	`, repoID, fsID).Scan(&objType, &dirEntries, &blockIDsList, &sizeBytes)
 	if err != nil {
-		return nil, fmt.Errorf("fs_object not found: %w", err)
+		return nil, 0, 0, fmt.Errorf("fs_object not found: %w", err)
 	}
 
 	if objType == "file" || objType == "" {
-		// It's a file, collect its block IDs
-		blockIDs = append(blockIDs, blockIDsList...)
-	} else {
-		// It's a directory, recurse into children
-		var entries []FSEntry
-		if dirEntries != "" && dirEntries != "[]" {
-			if err := json.Unmarshal([]byte(dirEntries), &entries); err != nil {
-				return nil, fmt.Errorf("invalid directory data: %w", err)
-			}
-		}
+		return blockIDsList, sizeBytes, 1, nil
+	}
 
-		for _, entry := range entries {
-			childBlockIDs, err := h.CollectBlockIDsRecursive(repoID, entry.ID)
-			if err != nil {
-				// Log but continue - some entries might be missing
-				continue
-			}
-			blockIDs = append(blockIDs, childBlockIDs...)
+	// Directory: recurse into children
+	var entries []FSEntry
+	if dirEntries != "" && dirEntries != "[]" {
+		if err := json.Unmarshal([]byte(dirEntries), &entries); err != nil {
+			return nil, 0, 0, fmt.Errorf("invalid directory data: %w", err)
 		}
 	}
 
-	return blockIDs, nil
+	for _, entry := range entries {
+		childBlocks, childSize, childCount, err := h.collectDirStats(repoID, entry.ID)
+		if err != nil {
+			continue
+		}
+		blockIDs = append(blockIDs, childBlocks...)
+		totalSize += childSize
+		fileCount += childCount
+	}
+	return blockIDs, totalSize, fileCount, nil
 }
 
 // DecrementBlockRefCounts decrements ref_count for blocks (for deletion).

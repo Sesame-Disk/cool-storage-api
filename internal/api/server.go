@@ -26,6 +26,8 @@ import (
 	"github.com/Sesame-Disk/sesamefs/internal/middleware"
 	"github.com/Sesame-Disk/sesamefs/internal/storage"
 	"github.com/Sesame-Disk/sesamefs/internal/templates"
+	"github.com/Sesame-Disk/sesamefs/internal/traffic"
+	gocql "github.com/apache/cassandra-gocql-driver/v2"
 	"github.com/gin-contrib/cors"
 	"github.com/gin-contrib/gzip"
 	"github.com/gin-gonic/gin"
@@ -467,6 +469,13 @@ func (s *Server) setupRoutes() {
 		)
 	}
 
+	// Initialise the global traffic recorder — fire-and-forget counter writes
+	// from upload/download handlers. Uses the same DB session as everything else.
+	traffic.SetRecorder(traffic.NewRecorder(s.db.Session()))
+
+	// Initialise the global quota checker.
+	traffic.SetChecker(traffic.NewChecker(s.db.Session()))
+
 	// Health check endpoints
 	s.router.GET("/ping", s.handlePing)
 
@@ -763,6 +772,10 @@ func (s *Server) setupRoutes() {
 
 			// Tag routes (fully implemented)
 			v2.RegisterTagRoutes(protected, s.db)
+
+			// Subscription info (plan, storage/traffic quotas and usage for current org)
+			protected.GET("/subscription/", s.handleGetSubscription)
+			protected.GET("/subscription", s.handleGetSubscription)
 		}
 	}
 
@@ -2023,14 +2036,19 @@ func (s *Server) handleAutoLogin(c *gin.Context) {
 func (s *Server) handleAccountInfo(c *gin.Context) {
 	userID := c.GetString("user_id")
 	orgID := c.GetString("org_id")
+	orgUUID, _ := gocql.ParseUUID(orgID)
+	userUUID, _ := gocql.ParseUUID(userID)
 
 	// Fetch actual user data from database
 	var email, name, role string
-	var quotaBytes, usedBytes int64
+	var quotaBytes int64
+	var trafficUploadQuota, trafficDownloadQuota int64
 	err := s.db.Session().Query(`
-		SELECT email, name, role, quota_bytes, used_bytes
+		SELECT email, name, role, quota_bytes,
+		       traffic_upload_quota, traffic_download_quota
 		FROM users WHERE org_id = ? AND user_id = ?
-	`, orgID, userID).Scan(&email, &name, &role, &quotaBytes, &usedBytes)
+	`, orgUUID, userUUID).Scan(&email, &name, &role, &quotaBytes,
+		&trafficUploadQuota, &trafficDownloadQuota)
 
 	if err != nil {
 		// Fallback to defaults if user not found (shouldn't happen for authenticated user)
@@ -2038,8 +2056,24 @@ func (s *Server) handleAccountInfo(c *gin.Context) {
 		name = userID
 		role = "user"
 		quotaBytes = -2 // unlimited
-		usedBytes = 0
+		trafficUploadQuota = -1
+		trafficDownloadQuota = -1
 	}
+
+	// Read live storage usage from the counter table.
+	usedBytes := v2.ReadStorageUsed(s.db, fmt.Sprintf("user:%s:%s", orgID, userID))
+
+	// Query current month's per-user traffic usage.
+	month := time.Now().UTC().Format("200601")
+	var trafficUploadUsed, trafficDownloadUsed int64
+	_ = s.db.Session().Query(
+		`SELECT bytes_transferred FROM traffic_monthly WHERE org_id = ? AND month = ? AND scope = ?`,
+		orgUUID, month, userID+":upload",
+	).Scan(&trafficUploadUsed)
+	_ = s.db.Session().Query(
+		`SELECT bytes_transferred FROM traffic_monthly WHERE org_id = ? AND month = ? AND scope = ?`,
+		orgUUID, month, userID+":download",
+	).Scan(&trafficDownloadUsed)
 
 	// Use email username as display name if name is empty
 	if name == "" {
@@ -2087,7 +2121,7 @@ func (s *Server) handleAccountInfo(c *gin.Context) {
 		"total":                       quotaBytes,
 		"space_usage":                 spaceUsage,
 		"avatar_url":                  getBaseURLFromRequest(c) + "/media/avatars/default.png",
-		"enable_subscription":         false,
+		"enable_subscription":         true,
 		"file_updates_email_interval": 0,
 		"collaborate_email_interval":  0,
 		// SesameFS extensions for permission control
@@ -2097,6 +2131,95 @@ func (s *Server) handleAccountInfo(c *gin.Context) {
 		"can_add_group":            canAddGroup,
 		"can_generate_share_link":  canGenerateShareLink,
 		"can_generate_upload_link": canGenerateUploadLink,
+		// Traffic quota and usage for current month
+		"traffic_upload_quota":    trafficUploadQuota,
+		"traffic_upload_used":     trafficUploadUsed,
+		"traffic_download_quota":  trafficDownloadQuota,
+		"traffic_download_used":   trafficDownloadUsed,
+	})
+}
+
+// handleGetSubscription returns the current org's plan and usage info.
+// GET /api/v2.1/subscription/
+func (s *Server) handleGetSubscription(c *gin.Context) {
+	userID := c.GetString("user_id")
+	orgID := c.GetString("org_id")
+	orgUUID, _ := gocql.ParseUUID(orgID)
+
+	var plan, billingCycle string
+	var storageQuota, storageUsed int64
+	var trafficQuota, trafficUploadQuota, trafficDownloadQuota int64
+	var maxUsers int
+	_ = s.db.Session().Query(`
+		SELECT plan, billing_cycle, storage_quota,
+		       traffic_quota, traffic_upload_quota, traffic_download_quota, max_users
+		FROM organizations WHERE org_id = ?
+	`, orgUUID).Scan(&plan, &billingCycle, &storageQuota,
+		&trafficQuota, &trafficUploadQuota, &trafficDownloadQuota, &maxUsers)
+
+	// Read live storage usage from the counter table (not the stale organizations column).
+	storageUsed = v2.ReadStorageUsed(s.db, fmt.Sprintf("org:%s", orgID))
+
+	// Current month's org traffic totals from traffic_monthly.
+	month := time.Now().UTC().Format("200601")
+	var combinedUsed, uploadUsed, downloadUsed int64
+	_ = s.db.Session().Query(
+		`SELECT bytes_transferred FROM traffic_monthly WHERE org_id = ? AND month = ? AND scope = ?`,
+		orgUUID, month, "org:combined",
+	).Scan(&combinedUsed)
+	_ = s.db.Session().Query(
+		`SELECT bytes_transferred FROM traffic_monthly WHERE org_id = ? AND month = ? AND scope = ?`,
+		orgUUID, month, "org:upload",
+	).Scan(&uploadUsed)
+	_ = s.db.Session().Query(
+		`SELECT bytes_transferred FROM traffic_monthly WHERE org_id = ? AND month = ? AND scope = ?`,
+		orgUUID, month, "org:download",
+	).Scan(&downloadUsed)
+
+	// Count current users.
+	var currentUsers int
+	_ = s.db.Session().Query(
+		`SELECT COUNT(*) FROM users WHERE org_id = ?`, orgUUID,
+	).Scan(&currentUsers)
+
+	// Next reset date is the first of next month.
+	now := time.Now().UTC()
+	nextReset := time.Date(now.Year(), now.Month()+1, 1, 0, 0, 0, 0, time.UTC)
+
+	var storagePercent float64
+	if storageQuota > 0 {
+		storagePercent = float64(storageUsed) / float64(storageQuota) * 100
+	}
+
+	// Look up per-user traffic for the caller.
+	var trafficUploadUsed, trafficDownloadUsed int64
+	_ = s.db.Session().Query(
+		`SELECT bytes_transferred FROM traffic_monthly WHERE org_id = ? AND month = ? AND scope = ?`,
+		orgUUID, month, userID+":upload",
+	).Scan(&trafficUploadUsed)
+	_ = s.db.Session().Query(
+		`SELECT bytes_transferred FROM traffic_monthly WHERE org_id = ? AND month = ? AND scope = ?`,
+		orgUUID, month, userID+":download",
+	).Scan(&trafficDownloadUsed)
+
+	c.JSON(http.StatusOK, gin.H{
+		"plan":                   plan,
+		"billing_cycle":          billingCycle,
+		"storage_quota":          storageQuota,
+		"storage_used":           storageUsed,
+		"storage_percent":        storagePercent,
+		"traffic_quota":          trafficQuota,
+		"traffic_combined_used":  combinedUsed,
+		"traffic_upload_quota":   trafficUploadQuota,
+		"traffic_upload_used":    uploadUsed,
+		"traffic_download_quota": trafficDownloadQuota,
+		"traffic_download_used":  downloadUsed,
+		"traffic_reset_date":     nextReset.Format("2006-01-02"),
+		"max_users":              maxUsers,
+		"current_users":          currentUsers,
+		// Per-user quota (if set)
+		"user_upload_used":   trafficUploadUsed,
+		"user_download_used": trafficDownloadUsed,
 	})
 }
 

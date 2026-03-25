@@ -438,6 +438,18 @@ func (h *TrashHandler) RestoreTrashItem(c *gin.Context) {
 		return
 	}
 
+	// Increment storage counters for the restored item — fire-and-forget.
+	go func() {
+		if oldEntry.Mode == ModeDir || oldEntry.Mode&0170000 == 040000 {
+			_, totalSize, fileCount, err := fsHelper.collectDirStats(repoID, oldEntry.ID)
+			if err == nil && totalSize > 0 {
+				IncrementStorageCounters(h.db, orgID, userID, repoID, totalSize, fileCount)
+			}
+		} else if oldEntry.Size > 0 {
+			IncrementStorageCounters(h.db, orgID, userID, repoID, oldEntry.Size, 1)
+		}
+	}()
+
 	c.JSON(http.StatusOK, gin.H{"success": true})
 }
 
@@ -760,6 +772,18 @@ func (h *TrashHandler) RevertDirents(c *gin.Context) {
 
 		currentHeadCommitID = newCommitID
 		successItems = append(successItems, revertResult{Path: filePath, IsDir: isDir})
+
+		// Increment storage counters for the restored item — fire-and-forget.
+		go func(entry FSEntry, isDir bool) {
+			if isDir {
+				_, totalSize, fileCount, err := fsHelper.collectDirStats(repoID, entry.ID)
+				if err == nil && totalSize > 0 {
+					IncrementStorageCounters(h.db, orgID, userID, repoID, totalSize, fileCount)
+				}
+			} else if entry.Size > 0 {
+				IncrementStorageCounters(h.db, orgID, userID, repoID, entry.Size, 1)
+			}
+		}(oldEntry, isDir)
 	}
 
 	if successItems == nil {

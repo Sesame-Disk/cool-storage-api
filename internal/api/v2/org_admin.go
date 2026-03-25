@@ -15,6 +15,7 @@ import (
 	"github.com/Sesame-Disk/sesamefs/internal/config"
 	"github.com/Sesame-Disk/sesamefs/internal/db"
 	"github.com/Sesame-Disk/sesamefs/internal/middleware"
+	"github.com/Sesame-Disk/sesamefs/internal/traffic"
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -367,32 +368,65 @@ func (h *OrgAdminHandler) GetOrgInfo(c *gin.Context) {
 		return
 	}
 
-	var name string
-	var storageQuota, storageUsed int64
+	var name, plan, billingCycle string
+	var storageQuota int64
+	var trafficQuota, trafficUploadQuota, trafficDownloadQuota int64
+	var maxUsers int
 	var createdAt time.Time
 
 	err = h.db.Session().Query(`
-		SELECT name, storage_quota, storage_used, created_at
+		SELECT name, storage_quota, created_at,
+		       traffic_quota, traffic_upload_quota, traffic_download_quota,
+		       max_users, plan, billing_cycle
 		FROM organizations WHERE org_id = ?
-	`, orgID).Scan(&name, &storageQuota, &storageUsed, &createdAt)
+	`, orgID).Scan(&name, &storageQuota, &createdAt,
+		&trafficQuota, &trafficUploadQuota, &trafficDownloadQuota,
+		&maxUsers, &plan, &billingCycle)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "organization not found"})
 		return
 	}
 
+	// Read current month's traffic totals.
+	month := time.Now().UTC().Format("200601")
+	orgUUID, _ := gocql.ParseUUID(orgID)
+	type monthlyScope struct {
+		scope string
+		dst   *int64
+	}
+	var combinedUsed, uploadUsed, downloadUsed int64
+	for _, ms := range []monthlyScope{
+		{"org:combined", &combinedUsed},
+		{"org:upload", &uploadUsed},
+		{"org:download", &downloadUsed},
+	} {
+		_ = h.db.Session().Query(
+			`SELECT bytes_transferred FROM traffic_monthly WHERE org_id = ? AND month = ? AND scope = ?`,
+			orgUUID, month, ms.scope,
+		).Scan(ms.dst)
+	}
+
 	usersCount := h.countOrgMembers(orgID)
 
-	// Response fields match what org-info.js reads:
-	// res.data.org_name, storage_quota, storage_usage, member_quota, member_usage, active_members
 	c.JSON(http.StatusOK, gin.H{
 		"org_id":         orgID,
 		"org_name":       name,
 		"storage_quota":  storageQuota,
-		"storage_usage":  storageUsed,
+		"storage_usage":  ReadStorageUsed(h.db, fmt.Sprintf("org:%s", orgID)),
 		"member_usage":   usersCount,
 		"member_quota":   h.getOrgSettingInt(orgID, "max_user_number", 0),
 		"active_members": usersCount,
 		"ctime":          createdAt.Format(time.RFC3339),
+		// Traffic quota info
+		"plan":                    plan,
+		"billing_cycle":           billingCycle,
+		"traffic_quota":           trafficQuota,
+		"traffic_combined_used":   combinedUsed,
+		"traffic_upload_quota":    trafficUploadQuota,
+		"traffic_upload_used":     uploadUsed,
+		"traffic_download_quota":  trafficDownloadQuota,
+		"traffic_download_used":   downloadUsed,
+		"max_users":               maxUsers,
 	})
 }
 
@@ -473,23 +507,23 @@ func (h *OrgAdminHandler) ListOrgUsers(c *gin.Context) {
 	isStaffOnly := c.Query("is_staff") == "true"
 
 	iter := h.db.Session().Query(`
-		SELECT user_id, email, name, role, status, quota_bytes, used_bytes, created_at
+		SELECT user_id, email, name, role, status, quota_bytes, created_at
 		FROM users WHERE org_id = ?
 	`, targetOrgID).Iter()
 
 	var all []orgUserRow
 	var userID, email, name, role, status string
-	var quota, used int64
+	var quota int64
 	var created time.Time
 
-	for iter.Scan(&userID, &email, &name, &role, &status, &quota, &used, &created) {
+	for iter.Scan(&userID, &email, &name, &role, &status, &quota, &created) {
 		if isStaffOnly && role != "admin" && role != "superadmin" {
 			continue
 		}
 		if !userMatchesStatusFilter(status, statusFilter) {
 			continue
 		}
-		all = append(all, buildOrgUserRow(email, name, role, status, targetOrgID, quota, used, created))
+		all = append(all, buildOrgUserRow(email, name, role, status, targetOrgID, quota, ReadStorageUsed(h.db, fmt.Sprintf("user:%s:%s", targetOrgID, userID)), created))
 	}
 	if err := iter.Close(); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list users"})
@@ -564,6 +598,14 @@ func (h *OrgAdminHandler) AddOrgUser(c *gin.Context) {
 		return
 	}
 
+	// Enforce max_users quota for the org
+	if checker := traffic.GetChecker(); checker != nil {
+		if st, _ := checker.CheckMaxUsers(targetOrgID); !st.Allowed {
+			c.JSON(http.StatusForbidden, gin.H{"error": "user limit reached for this organization"})
+			return
+		}
+	}
+
 	userID := uuid.New().String()
 	now := time.Now()
 
@@ -591,18 +633,18 @@ func (h *OrgAdminHandler) GetOrgUser(c *gin.Context) {
 	}
 
 	var name, role, status string
-	var quota, used int64
+	var quota int64
 	var created time.Time
 
 	if err := h.db.Session().Query(`
-		SELECT name, role, status, quota_bytes, used_bytes, created_at
+		SELECT name, role, status, quota_bytes, created_at
 		FROM users WHERE org_id = ? AND user_id = ?
-	`, targetOrgID, userID).Scan(&name, &role, &status, &quota, &used, &created); err != nil {
+	`, targetOrgID, userID).Scan(&name, &role, &status, &quota, &created); err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "user not found"})
 		return
 	}
 
-	c.JSON(http.StatusOK, buildOrgUserRow(email, name, role, status, targetOrgID, quota, used, created))
+	c.JSON(http.StatusOK, buildOrgUserRow(email, name, role, status, targetOrgID, quota, ReadStorageUsed(h.db, fmt.Sprintf("user:%s:%s", targetOrgID, userID)), created))
 }
 
 // UpdateOrgUser updates an org user's active status, staff role, name, or quota.
@@ -623,13 +665,13 @@ func (h *OrgAdminHandler) UpdateOrgUser(c *gin.Context) {
 	}
 
 	var name, role, status string
-	var quota, used int64
+	var quota int64
 	var created time.Time
 
 	if err := h.db.Session().Query(`
-		SELECT name, role, status, quota_bytes, used_bytes, created_at
+		SELECT name, role, status, quota_bytes, created_at
 		FROM users WHERE org_id = ? AND user_id = ?
-	`, targetOrgID, userID).Scan(&name, &role, &status, &quota, &used, &created); err != nil {
+	`, targetOrgID, userID).Scan(&name, &role, &status, &quota, &created); err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "user not found"})
 		return
 	}
@@ -710,7 +752,31 @@ func (h *OrgAdminHandler) UpdateOrgUser(c *gin.Context) {
 		_ = v
 	}
 
-	c.JSON(http.StatusOK, buildOrgUserRow(email, name, role, status, targetOrgID, quota, used, created))
+	if v := c.Request.FormValue("traffic_upload_quota"); v != "" {
+		if q, err := strconv.ParseInt(v, 10, 64); err == nil {
+			if err := h.db.Session().Query(
+				`UPDATE users SET traffic_upload_quota = ? WHERE org_id = ? AND user_id = ?`,
+				q, targetOrgID, userID,
+			).Exec(); err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update user"})
+				return
+			}
+		}
+	}
+
+	if v := c.Request.FormValue("traffic_download_quota"); v != "" {
+		if q, err := strconv.ParseInt(v, 10, 64); err == nil {
+			if err := h.db.Session().Query(
+				`UPDATE users SET traffic_download_quota = ? WHERE org_id = ? AND user_id = ?`,
+				q, targetOrgID, userID,
+			).Exec(); err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update user"})
+				return
+			}
+		}
+	}
+
+	c.JSON(http.StatusOK, buildOrgUserRow(email, name, role, status, targetOrgID, quota, ReadStorageUsed(h.db, fmt.Sprintf("user:%s:%s", targetOrgID, userID)), created))
 }
 
 // DeleteOrgUser soft-deletes a user from the target org.
@@ -952,21 +1018,21 @@ func (h *OrgAdminHandler) SearchOrgUser(c *gin.Context) {
 	}
 
 	iter := h.db.Session().Query(`
-		SELECT user_id, email, name, role, status, quota_bytes, used_bytes, created_at
+		SELECT user_id, email, name, role, status, quota_bytes, created_at
 		FROM users WHERE org_id = ?
 	`, targetOrgID).Iter()
 
 	var results []orgUserRow
 	var userID, email, name, role, status string
-	var quota, used int64
+	var quota int64
 	var created time.Time
 
-	for iter.Scan(&userID, &email, &name, &role, &status, &quota, &used, &created) {
+	for iter.Scan(&userID, &email, &name, &role, &status, &quota, &created) {
 		if !userMatchesStatusFilter(status, statusFilter) {
 			continue
 		}
 		if strings.Contains(strings.ToLower(email), query) || strings.Contains(strings.ToLower(name), query) {
-			results = append(results, buildOrgUserRow(email, name, role, status, targetOrgID, quota, used, created))
+			results = append(results, buildOrgUserRow(email, name, role, status, targetOrgID, quota, ReadStorageUsed(h.db, fmt.Sprintf("user:%s:%s", targetOrgID, userID)), created))
 		}
 	}
 	iter.Close()
@@ -2752,16 +2818,143 @@ func (h *OrgAdminHandler) OrgStatisticFiles(c *gin.Context) {
 	h.notImplemented(c, "org statistics file-operations")
 }
 func (h *OrgAdminHandler) OrgStatisticStorage(c *gin.Context) {
-	h.notImplemented(c, "org statistics total-storage")
+	targetOrgID := c.Param("org_id")
+	if err := h.requireOrgAccess(c, targetOrgID); err != nil {
+		return
+	}
+
+	bytesUsed := ReadStorageUsed(h.db, fmt.Sprintf("org:%s", targetOrgID))
+
+	stats := dateRangeStrings(c)
+	result := make([]gin.H, len(stats))
+	for i, dt := range stats {
+		result[i] = gin.H{"datetime": dt, "total_storage": bytesUsed}
+	}
+	c.JSON(http.StatusOK, result)
 }
 func (h *OrgAdminHandler) OrgStatisticActiveUsers(c *gin.Context) {
 	h.notImplemented(c, "org statistics active-users")
 }
 func (h *OrgAdminHandler) OrgStatisticTraffic(c *gin.Context) {
-	h.notImplemented(c, "org statistics system-traffic")
+	targetOrgID := c.Param("org_id")
+	if err := h.requireOrgAccess(c, targetOrgID); err != nil {
+		return
+	}
+
+	orgUUID, err := gocql.ParseUUID(targetOrgID)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid org_id"})
+		return
+	}
+	c.JSON(http.StatusOK, queryTrafficStats(h.db.Session(), orgUUID, c))
 }
 func (h *OrgAdminHandler) OrgStatisticUserTraffic(c *gin.Context) {
-	h.notImplemented(c, "org statistics user-traffic")
+	targetOrgID := c.Param("org_id")
+	if err := h.requireOrgAccess(c, targetOrgID); err != nil {
+		return
+	}
+
+	month := c.DefaultQuery("month", time.Now().UTC().Format("200601"))
+	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
+	perPage, _ := strconv.Atoi(c.DefaultQuery("per_page", "25"))
+	if page < 1 {
+		page = 1
+	}
+	if perPage < 1 || perPage > 100 {
+		perPage = 25
+	}
+
+	orgUUID, err := gocql.ParseUUID(targetOrgID)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid org_id"})
+		return
+	}
+
+	// Build user info map.
+	type userMeta struct {
+		Email string
+		Name  string
+	}
+	userInfoMap := map[string]userMeta{}
+	iter := h.db.Session().Query(
+		`SELECT user_id, email, name FROM users WHERE org_id = ?`, orgUUID,
+	).Iter()
+	var uid gocql.UUID
+	var email, uname string
+	for iter.Scan(&uid, &email, &uname) {
+		userInfoMap[uid.String()] = userMeta{Email: email, Name: uname}
+	}
+	_ = iter.Close()
+
+	// Read per-direction totals from traffic_monthly.
+	type userTrafficRow struct {
+		UserID   string
+		Upload   int64
+		Download int64
+	}
+	trafficMap := map[string]*userTrafficRow{}
+	iter2 := h.db.Session().Query(
+		`SELECT scope, bytes_transferred FROM traffic_monthly WHERE org_id = ? AND month = ?`,
+		orgUUID, month,
+	).Iter()
+	var scope string
+	var bytes int64
+	for iter2.Scan(&scope, &bytes) {
+		// scopes: "<userID>:upload", "<userID>:download"
+		colon := strings.LastIndex(scope, ":")
+		if colon <= 0 {
+			continue
+		}
+		userID := scope[:colon]
+		direction := scope[colon+1:]
+		if _, ok := gocql.ParseUUID(userID); ok != nil {
+			continue // skip org:*  and other non-user scopes
+		}
+		if trafficMap[userID] == nil {
+			trafficMap[userID] = &userTrafficRow{UserID: userID}
+		}
+		switch direction {
+		case "upload":
+			trafficMap[userID].Upload += bytes
+		case "download":
+			trafficMap[userID].Download += bytes
+		}
+	}
+	_ = iter2.Close()
+
+	// Collect and sort user IDs for stable pagination.
+	var userIDs []string
+	for uid := range trafficMap {
+		userIDs = append(userIDs, uid)
+	}
+	sort.Strings(userIDs)
+
+	offset := (page - 1) * perPage
+	hasNext := false
+	if offset >= len(userIDs) {
+		c.JSON(http.StatusOK, gin.H{"user_monthly_traffic_list": []gin.H{}, "has_next_page": false})
+		return
+	}
+	end := offset + perPage
+	if end >= len(userIDs) {
+		end = len(userIDs)
+	} else {
+		hasNext = true
+	}
+
+	list := make([]gin.H, 0, end-offset)
+	for _, uid := range userIDs[offset:end] {
+		row := trafficMap[uid]
+		info := userInfoMap[uid]
+		list = append(list, gin.H{
+			"email":          info.Email,
+			"name":           info.Name,
+			"upload_bytes":   row.Upload,
+			"download_bytes": row.Download,
+			"total_bytes":    row.Upload + row.Download,
+		})
+	}
+	c.JSON(http.StatusOK, gin.H{"user_monthly_traffic_list": list, "has_next_page": hasNext})
 }
 
 // ============================================================================

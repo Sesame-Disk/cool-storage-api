@@ -1685,6 +1685,22 @@ seafileAPI.orgAdminCleanTrashRepo = function (orgID) {
   return this.req.delete(url);
 };
 
+// Sys Admin: list per-org traffic summary for a month
+seafileAPI.sysAdminListOrgTraffic = function (month, page, perPage) {
+  let url = this.server + '/api/v2.1/admin/statistics/org-traffic/?month=' + month;
+  if (page) url += '&page=' + page;
+  if (perPage) url += '&per_page=' + perPage;
+  return this.req.get(url);
+};
+
+// Sys Admin: list per-user traffic for a specific org and month
+seafileAPI.sysAdminListUserTraffic = function (orgID, month, page, perPage) {
+  let url = this.server + '/api/v2.1/admin/statistics/user-traffic/?org_id=' + orgID + '&month=' + month;
+  if (page) url += '&page=' + page;
+  if (perPage) url += '&per_page=' + perPage;
+  return this.req.get(url);
+};
+
 // Org Admin: statistic files
 seafileAPI.orgAdminStatisticFiles = function (orgID, startTime, endTime, groupBy) {
   let url = this.server + '/api/v2.1/org/' + orgID + '/admin/statistics/file-operations/?start=' + startTime + '&end=' + endTime;
@@ -1708,14 +1724,14 @@ seafileAPI.orgAdminStatisticActiveUsers = function (orgID, startTime, endTime, g
 
 // Org Admin: statistic system traffic
 seafileAPI.orgAdminStatisticSystemTraffic = function (orgID, startTime, endTime, groupBy) {
-  let url = this.server + '/api/v2.1/org/' + orgID + '/admin/statistics/total-storage/?start=' + startTime + '&end=' + endTime;
+  let url = this.server + '/api/v2.1/org/' + orgID + '/admin/statistics/system-traffic/?start=' + startTime + '&end=' + endTime;
   if (groupBy) url += '&group_by=' + groupBy;
   return this.req.get(url);
 };
 
 // Org Admin: list user traffic
 seafileAPI.orgAdminListUserTraffic = function (orgID, month, page, perPage, orderBy) {
-  let url = this.server + '/api/v2.1/org/' + orgID + '/admin/statistics/total-storage/?month=' + month;
+  let url = this.server + '/api/v2.1/org/' + orgID + '/admin/statistics/user-traffic/?month=' + month;
   if (page) url += '&page=' + page;
   if (perPage) url += '&per_page=' + perPage;
   if (orderBy) url += '&order_by=' + orderBy;

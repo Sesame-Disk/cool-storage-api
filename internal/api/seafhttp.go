@@ -27,6 +27,7 @@ import (
 	"github.com/Sesame-Disk/sesamefs/internal/middleware"
 	"github.com/Sesame-Disk/sesamefs/internal/storage"
 	"github.com/Sesame-Disk/sesamefs/internal/streaming"
+	"github.com/Sesame-Disk/sesamefs/internal/traffic"
 	"github.com/gin-gonic/gin"
 )
 
@@ -47,6 +48,7 @@ type AccessToken struct {
 	RepoID    string
 	Path      string // File path for downloads, parent dir for uploads
 	UserID    string
+	Source    string // "" or "web" = regular user; "link" = share/upload link
 	AuthToken string // User's auth token (for one-time login tokens)
 	ExpiresAt time.Time
 	CreatedAt time.Time
@@ -56,6 +58,8 @@ type AccessToken struct {
 type TokenStore interface {
 	CreateUploadToken(orgID, repoID, path, userID string) (string, error)
 	CreateDownloadToken(orgID, repoID, path, userID string) (string, error)
+	CreateLinkUploadToken(orgID, repoID, path, userID string) (string, error)
+	CreateLinkDownloadToken(orgID, repoID, path, userID string) (string, error)
 	GetToken(tokenStr string, expectedType TokenType) (*AccessToken, bool)
 	DeleteToken(tokenStr string) error
 	CreateOneTimeLoginToken(userID, orgID, authToken string) (string, error)
@@ -87,7 +91,7 @@ func NewTokenManager(tokenTTL time.Duration) *TokenManager {
 const DefaultTokenTTL = 1 * time.Hour
 
 // CreateToken creates a new access token
-func (tm *TokenManager) CreateToken(tokenType TokenType, orgID, repoID, path, userID string, ttl time.Duration) (*AccessToken, error) {
+func (tm *TokenManager) CreateToken(tokenType TokenType, orgID, repoID, path, userID, source string, ttl time.Duration) (*AccessToken, error) {
 	// Generate random token
 	bytes := make([]byte, 16)
 	if _, err := rand.Read(bytes); err != nil {
@@ -102,6 +106,7 @@ func (tm *TokenManager) CreateToken(tokenType TokenType, orgID, repoID, path, us
 		RepoID:    repoID,
 		Path:      path,
 		UserID:    userID,
+		Source:    source,
 		ExpiresAt: time.Now().Add(ttl),
 		CreatedAt: time.Now(),
 	}
@@ -115,7 +120,7 @@ func (tm *TokenManager) CreateToken(tokenType TokenType, orgID, repoID, path, us
 
 // CreateUploadToken creates an upload token (implements TokenCreator interface)
 func (tm *TokenManager) CreateUploadToken(orgID, repoID, path, userID string) (string, error) {
-	token, err := tm.CreateToken(TokenTypeUpload, orgID, repoID, path, userID, tm.tokenTTL)
+	token, err := tm.CreateToken(TokenTypeUpload, orgID, repoID, path, userID, "", tm.tokenTTL)
 	if err != nil {
 		return "", err
 	}
@@ -124,7 +129,25 @@ func (tm *TokenManager) CreateUploadToken(orgID, repoID, path, userID string) (s
 
 // CreateDownloadToken creates a download token (implements TokenCreator interface)
 func (tm *TokenManager) CreateDownloadToken(orgID, repoID, path, userID string) (string, error) {
-	token, err := tm.CreateToken(TokenTypeDownload, orgID, repoID, path, userID, tm.tokenTTL)
+	token, err := tm.CreateToken(TokenTypeDownload, orgID, repoID, path, userID, "", tm.tokenTTL)
+	if err != nil {
+		return "", err
+	}
+	return token.Token, nil
+}
+
+// CreateLinkUploadToken creates an upload token tagged as a share/upload link.
+func (tm *TokenManager) CreateLinkUploadToken(orgID, repoID, path, userID string) (string, error) {
+	token, err := tm.CreateToken(TokenTypeUpload, orgID, repoID, path, userID, "link", tm.tokenTTL)
+	if err != nil {
+		return "", err
+	}
+	return token.Token, nil
+}
+
+// CreateLinkDownloadToken creates a download token tagged as a share link.
+func (tm *TokenManager) CreateLinkDownloadToken(orgID, repoID, path, userID string) (string, error) {
+	token, err := tm.CreateToken(TokenTypeDownload, orgID, repoID, path, userID, "link", tm.tokenTTL)
 	if err != nil {
 		return "", err
 	}
@@ -516,6 +539,25 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 		return
 	}
 
+	// Quota pre-check — evaluated before reading the body so we can fail fast.
+	// contentLength is an upper bound (includes multipart overhead); acceptable for quota checks.
+	if checker := traffic.GetChecker(); checker != nil {
+		contentLength := c.Request.ContentLength
+		if contentLength < 0 {
+			contentLength = 0
+		}
+		if st, _ := checker.CheckStorageQuota(token.OrgID, contentLength); !st.Allowed {
+			c.JSON(http.StatusForbidden, gin.H{"error": "storage quota exceeded"})
+			return
+		}
+		if st, _ := checker.CheckTrafficQuota(token.OrgID, token.UserID, "upload", contentLength); !st.Allowed {
+			c.JSON(http.StatusForbidden, gin.H{"error": "traffic quota exceeded", "reason": st.Reason})
+			return
+		} else if st.Warning {
+			c.Header("X-Quota-Warning", st.Reason)
+		}
+	}
+
 	// Get the file from the request
 	file, header, err := c.Request.FormFile("file")
 	if err != nil {
@@ -610,6 +652,19 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 		}
 
 		log.Printf("[HandleUpload] Upload complete: file=%s, size=%d, id=%s", actualFilename, total, fileID[:16])
+
+		// Record traffic and storage — fire-and-forget, never blocks the response.
+		if rec := traffic.Get(); rec != nil {
+			tt := traffic.WebUpload
+			if token.Source == "link" {
+				tt = traffic.LinkUpload
+			}
+			rec.Record(token.OrgID, token.UserID, tt, total)
+		}
+		if h.db != nil {
+			v2.IncrementStorageCounters(h.db, token.OrgID, token.UserID, token.RepoID, total, 1)
+		}
+
 		if retJSON {
 			c.JSON(http.StatusOK, []gin.H{{"name": actualFilename, "id": fileID, "size": strconv.FormatInt(total, 10)}})
 		} else {
@@ -708,6 +763,19 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 	log.Printf("[HandleUpload] Filesystem updated, commit=%s", commitID)
 
 	log.Printf("[HandleUpload] Upload complete: file=%s, size=%d, id=%s", actualFilename, finalSize, fileID[:16])
+
+	// Record traffic and storage — fire-and-forget, never blocks the response.
+	if rec := traffic.Get(); rec != nil {
+		tt := traffic.WebUpload
+		if token.Source == "link" {
+			tt = traffic.LinkUpload
+		}
+		rec.Record(token.OrgID, token.UserID, tt, finalSize)
+	}
+	if h.db != nil {
+		v2.IncrementStorageCounters(h.db, token.OrgID, token.UserID, token.RepoID, finalSize, 1)
+	}
+
 	if retJSON {
 		c.JSON(http.StatusOK, []gin.H{{"name": actualFilename, "id": fileID, "size": strconv.FormatInt(finalSize, 10)}})
 	} else {
@@ -1292,6 +1360,17 @@ func (h *SeafHTTPHandler) HandleDownload(c *gin.Context) {
 		filename = filepath.Base(requestedPath)
 	}
 
+	// Quota pre-check: block if org is already over traffic quota.
+	// We don't know the file size yet, so we check the current usage only.
+	if checker := traffic.GetChecker(); checker != nil {
+		if st, _ := checker.CheckTrafficQuota(token.OrgID, token.UserID, "download", 0); !st.Allowed {
+			c.JSON(http.StatusForbidden, gin.H{"error": "traffic quota exceeded", "reason": st.Reason})
+			return
+		} else if st.Warning {
+			c.Header("X-Quota-Warning", st.Reason)
+		}
+	}
+
 	// Try to stream file from block storage (content-addressed)
 	// This is the normal flow for SesameFS files
 	if h.db != nil && h.storageManager != nil {
@@ -1325,10 +1404,23 @@ func (h *SeafHTTPHandler) HandleDownload(c *gin.Context) {
 	c.Header("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, filename))
 	c.Header("Content-Type", "application/octet-stream")
 	c.Status(http.StatusOK)
+	bytesBefore := int64(c.Writer.Size())
 	buf := streaming.GetCopyBuf()
 	defer streaming.PutCopyBuf(buf)
 	if _, err := io.CopyBuffer(c.Writer, reader, buf); err != nil {
 		log.Printf("[HandleDownload] Streaming error: %v", err)
+	}
+
+	// Record traffic for the S3 fallback path.
+	if rec := traffic.Get(); rec != nil {
+		sent := int64(c.Writer.Size()) - bytesBefore
+		if sent > 0 {
+			tt := traffic.WebDownload
+			if token.Source == "link" {
+				tt = traffic.LinkDownload
+			}
+			rec.Record(token.OrgID, token.UserID, tt, sent)
+		}
 	}
 }
 
@@ -1452,6 +1544,16 @@ func (h *SeafHTTPHandler) streamFileFromBlocks(c *gin.Context, token *AccessToke
 	streaming.StreamBlocks(c, c.Request.Context(), blockStore, resolvedIDs, fileKey, "streamFileFromBlocks")
 
 	log.Printf("[streamFileFromBlocks] Streaming complete: %d blocks", len(blockIDs))
+
+	// Record traffic — fire-and-forget, never blocks the response.
+	if rec := traffic.Get(); rec != nil {
+		tt := traffic.WebDownload
+		if token.Source == "link" {
+			tt = traffic.LinkDownload
+		}
+		rec.Record(token.OrgID, token.UserID, tt, fileSize)
+	}
+
 	return nil
 }
 
@@ -1608,6 +1710,16 @@ func (h *SeafHTTPHandler) HandleZipDownload(c *gin.Context) {
 		return
 	}
 
+	// Quota pre-check — reject early if traffic quota is already exhausted.
+	if checker := traffic.GetChecker(); checker != nil {
+		if st, _ := checker.CheckTrafficQuota(token.OrgID, token.UserID, "download", 0); !st.Allowed {
+			c.JSON(http.StatusForbidden, gin.H{"error": "traffic quota exceeded", "reason": st.Reason})
+			return
+		} else if st.Warning {
+			c.Header("X-Quota-Warning", st.Reason)
+		}
+	}
+
 	// Get the library's root FS
 	var headCommit string
 	err := h.db.Session().Query(`
@@ -1701,8 +1813,30 @@ func (h *SeafHTTPHandler) HandleZipDownload(c *gin.Context) {
 	zipWriter := zip.NewWriter(c.Writer)
 	defer zipWriter.Close()
 
+	// Snapshot writer size before streaming so we can calculate the delta afterward.
+	bytesBefore := int64(c.Writer.Size())
+
 	// Recursively add directory contents to the ZIP
 	h.addDirToZip(c.Request.Context(), zipWriter, token.RepoID, token.OrgID, targetFSID, "", fileKey)
+
+	// Record traffic for the bytes actually sent (zip overhead included is fine for billing granularity).
+	if rec := traffic.Get(); rec != nil {
+		bytesAfter := int64(c.Writer.Size())
+		if bytesAfter < 0 {
+			bytesAfter = 0
+		}
+		sent := bytesAfter - bytesBefore
+		if sent < 0 {
+			sent = 0
+		}
+		if sent > 0 {
+			tt := traffic.WebDownload
+			if token.Source == "link" {
+				tt = traffic.LinkDownload
+			}
+			rec.Record(token.OrgID, token.UserID, tt, sent)
+		}
+	}
 }
 
 // addDirToZip recursively adds directory contents to a ZIP archive

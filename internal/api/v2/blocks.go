@@ -10,6 +10,7 @@ import (
 
 	"github.com/Sesame-Disk/sesamefs/internal/config"
 	"github.com/Sesame-Disk/sesamefs/internal/storage"
+	"github.com/Sesame-Disk/sesamefs/internal/traffic"
 	"github.com/gin-gonic/gin"
 )
 
@@ -210,7 +211,10 @@ func (h *BlockHandler) UploadBlock(c *gin.Context) {
 	}
 
 	if exists {
-		// Block already exists (deduplication)
+		// Block already exists (deduplication) — data was still transferred over the network.
+		if rec := traffic.Get(); rec != nil {
+			rec.Record(c.GetString("org_id"), c.GetString("user_id"), traffic.WebUpload, int64(len(data)))
+		}
 		c.JSON(http.StatusOK, UploadBlockResponse{
 			Hash: hash,
 			Size: int64(len(data)),
@@ -230,6 +234,11 @@ func (h *BlockHandler) UploadBlock(c *gin.Context) {
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to store block"})
 		return
+	}
+
+	// Record traffic for newly stored block.
+	if rec := traffic.Get(); rec != nil {
+		rec.Record(c.GetString("org_id"), c.GetString("user_id"), traffic.WebUpload, int64(len(data)))
 	}
 
 	c.JSON(http.StatusCreated, UploadBlockResponse{
@@ -268,6 +277,11 @@ func (h *BlockHandler) DownloadBlock(c *gin.Context) {
 	c.Header("X-Block-Hash", hash)
 
 	c.Data(http.StatusOK, "application/octet-stream", data)
+
+	// Record download traffic — fire-and-forget.
+	if rec := traffic.Get(); rec != nil {
+		rec.Record(c.GetString("org_id"), c.GetString("user_id"), traffic.WebDownload, int64(len(data)))
+	}
 }
 
 // BlockExists checks if a block exists (HEAD request)

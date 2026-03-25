@@ -27,6 +27,14 @@ func (m *mockTokenCreator) CreateDownloadToken(orgID, repoID, path, userID strin
 	return "mock-download-token-" + repoID, nil
 }
 
+func (m *mockTokenCreator) CreateLinkUploadToken(orgID, repoID, path, userID string) (string, error) {
+	return "mock-link-upload-token-" + repoID, nil
+}
+
+func (m *mockTokenCreator) CreateLinkDownloadToken(orgID, repoID, path, userID string) (string, error) {
+	return "mock-link-download-token-" + repoID, nil
+}
+
 // TestErrorPageHTML tests the error page HTML generator
 func TestErrorPageHTML(t *testing.T) {
 	tests := []struct {

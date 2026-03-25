@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/apache/cassandra-gocql-driver/v2"
+	gocql "github.com/apache/cassandra-gocql-driver/v2"
 )
 
 // TokenType represents the type of access token
@@ -25,6 +25,7 @@ type AccessToken struct {
 	RepoID    string
 	Path      string // File path for downloads, parent dir for uploads
 	UserID    string
+	Source    string // "" or "web" = regular user; "link" = share/upload link
 	CreatedAt time.Time
 }
 
@@ -47,7 +48,7 @@ func NewTokenStore(db *DB, ttl time.Duration) *TokenStore {
 }
 
 // CreateToken creates a new access token and stores it in Cassandra
-func (ts *TokenStore) CreateToken(tokenType TokenType, orgID, repoID, path, userID string) (*AccessToken, error) {
+func (ts *TokenStore) CreateToken(tokenType TokenType, orgID, repoID, path, userID, source string) (*AccessToken, error) {
 	// Generate random token
 	bytes := make([]byte, 16)
 	if _, err := rand.Read(bytes); err != nil {
@@ -62,14 +63,15 @@ func (ts *TokenStore) CreateToken(tokenType TokenType, orgID, repoID, path, user
 		RepoID:    repoID,
 		Path:      path,
 		UserID:    userID,
+		Source:    source,
 		CreatedAt: time.Now(),
 	}
 
 	// Insert with TTL for automatic expiration
 	// Note: "token" is quoted because it's a reserved keyword in CQL
 	ttlSeconds := int(ts.ttl.Seconds())
-	query := `INSERT INTO access_tokens ("token", token_type, org_id, repo_id, file_path, user_id, created_at)
-	          VALUES (?, ?, ?, ?, ?, ?, ?) USING TTL ?`
+	query := `INSERT INTO access_tokens ("token", token_type, org_id, repo_id, file_path, user_id, source, created_at)
+	          VALUES (?, ?, ?, ?, ?, ?, ?, ?) USING TTL ?`
 
 	orgUUID, err := gocql.ParseUUID(orgID)
 	if err != nil {
@@ -93,6 +95,7 @@ func (ts *TokenStore) CreateToken(tokenType TokenType, orgID, repoID, path, user
 		repoUUID,
 		path,
 		userUUID,
+		source,
 		token.CreatedAt,
 		ttlSeconds,
 	).Exec()
@@ -104,18 +107,36 @@ func (ts *TokenStore) CreateToken(tokenType TokenType, orgID, repoID, path, user
 	return token, nil
 }
 
-// CreateUploadToken creates an upload token
+// CreateUploadToken creates an upload token for a regular (web) user.
 func (ts *TokenStore) CreateUploadToken(orgID, repoID, path, userID string) (string, error) {
-	token, err := ts.CreateToken(TokenTypeUpload, orgID, repoID, path, userID)
+	token, err := ts.CreateToken(TokenTypeUpload, orgID, repoID, path, userID, "")
 	if err != nil {
 		return "", err
 	}
 	return token.Token, nil
 }
 
-// CreateDownloadToken creates a download token
+// CreateLinkUploadToken creates an upload token for a share/upload link — tagged as source="link".
+func (ts *TokenStore) CreateLinkUploadToken(orgID, repoID, path, userID string) (string, error) {
+	token, err := ts.CreateToken(TokenTypeUpload, orgID, repoID, path, userID, "link")
+	if err != nil {
+		return "", err
+	}
+	return token.Token, nil
+}
+
+// CreateDownloadToken creates a download token for a regular (web) user.
 func (ts *TokenStore) CreateDownloadToken(orgID, repoID, path, userID string) (string, error) {
-	token, err := ts.CreateToken(TokenTypeDownload, orgID, repoID, path, userID)
+	token, err := ts.CreateToken(TokenTypeDownload, orgID, repoID, path, userID, "")
+	if err != nil {
+		return "", err
+	}
+	return token.Token, nil
+}
+
+// CreateLinkDownloadToken creates a download token for a share link — tagged as source="link".
+func (ts *TokenStore) CreateLinkDownloadToken(orgID, repoID, path, userID string) (string, error) {
+	token, err := ts.CreateToken(TokenTypeDownload, orgID, repoID, path, userID, "link")
 	if err != nil {
 		return "", err
 	}
@@ -124,7 +145,7 @@ func (ts *TokenStore) CreateDownloadToken(orgID, repoID, path, userID string) (s
 
 // GetToken retrieves and validates a token
 func (ts *TokenStore) GetToken(tokenStr string, expectedType TokenType) (*AccessToken, bool) {
-	query := `SELECT "token", token_type, org_id, repo_id, file_path, user_id, created_at
+	query := `SELECT "token", token_type, org_id, repo_id, file_path, user_id, source, created_at
 	          FROM access_tokens WHERE "token" = ?`
 
 	var token AccessToken
@@ -138,6 +159,7 @@ func (ts *TokenStore) GetToken(tokenStr string, expectedType TokenType) (*Access
 		&repoUUID,
 		&token.Path,
 		&userUUID,
+		&token.Source,
 		&token.CreatedAt,
 	)
 
@@ -169,6 +191,8 @@ func (ts *TokenStore) DeleteToken(tokenStr string) error {
 type TokenCreator interface {
 	CreateUploadToken(orgID, repoID, path, userID string) (string, error)
 	CreateDownloadToken(orgID, repoID, path, userID string) (string, error)
+	CreateLinkUploadToken(orgID, repoID, path, userID string) (string, error)
+	CreateLinkDownloadToken(orgID, repoID, path, userID string) (string, error)
 }
 
 // Ensure TokenStore implements TokenCreator

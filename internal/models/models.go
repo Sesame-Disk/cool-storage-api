@@ -16,21 +16,30 @@ type Organization struct {
 	StorageUsed        int64             `json:"storage_used"`
 	ChunkingPolynomial int64             `json:"-"` // Per-tenant security
 	StorageConfig      map[string]string `json:"storage_config,omitempty"`
-	CreatedAt          time.Time         `json:"created_at"`
+	// Plan and quota fields — set by external billing service
+	Plan                 string    `json:"plan,omitempty"`
+	BillingCycle         string    `json:"billing_cycle,omitempty"` // "monthly" | "annual"
+	TrafficQuota         int64     `json:"traffic_quota"`           // combined monthly limit, -1=N/A
+	TrafficUploadQuota   int64     `json:"traffic_upload_quota"`    // upload monthly limit, -1=unlimited
+	TrafficDownloadQuota int64     `json:"traffic_download_quota"`  // download monthly limit, -1=unlimited
+	MaxUsers             int       `json:"max_users"`               // hard cap, -1=unlimited
+	CreatedAt            time.Time `json:"created_at"`
 }
 
 // User represents a user in the system
 type User struct {
-	UserID     uuid.UUID `json:"user_id"`
-	OrgID      uuid.UUID `json:"org_id"`
-	Email      string    `json:"email"`
-	Name       string    `json:"name"`
-	Role       string    `json:"role"`   // superadmin, admin, user, readonly, guest
-	Status     string    `json:"status"` // active, deactivated, deleted
-	OIDCSub    string    `json:"-"`      // OIDC subject identifier
-	QuotaBytes int64     `json:"quota_bytes"`
-	UsedBytes  int64     `json:"used_bytes"`
-	CreatedAt  time.Time `json:"created_at"`
+	UserID               uuid.UUID `json:"user_id"`
+	OrgID                uuid.UUID `json:"org_id"`
+	Email                string    `json:"email"`
+	Name                 string    `json:"name"`
+	Role                 string    `json:"role"`   // superadmin, admin, user, readonly, guest
+	Status               string    `json:"status"` // active, deactivated, deleted
+	OIDCSub              string    `json:"-"`      // OIDC subject identifier
+	QuotaBytes           int64     `json:"quota_bytes"`
+	UsedBytes            int64     `json:"used_bytes"`
+	TrafficUploadQuota   int64     `json:"traffic_upload_quota"`   // -1=inherit from org
+	TrafficDownloadQuota int64     `json:"traffic_download_quota"` // -1=inherit from org
+	CreatedAt            time.Time `json:"created_at"`
 }
 
 // Library represents a file library (repository)

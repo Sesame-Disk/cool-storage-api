@@ -22,6 +22,7 @@ import (
 	"github.com/Sesame-Disk/sesamefs/internal/middleware"
 	"github.com/Sesame-Disk/sesamefs/internal/storage"
 	"github.com/Sesame-Disk/sesamefs/internal/templates"
+	"github.com/Sesame-Disk/sesamefs/internal/traffic"
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
 	"github.com/gin-gonic/gin"
 )
@@ -30,6 +31,8 @@ import (
 type TokenCreator interface {
 	CreateUploadToken(orgID, repoID, path, userID string) (string, error)
 	CreateDownloadToken(orgID, repoID, path, userID string) (string, error)
+	CreateLinkUploadToken(orgID, repoID, path, userID string) (string, error)
+	CreateLinkDownloadToken(orgID, repoID, path, userID string) (string, error)
 }
 
 // formatSizeSeafile delegates to httputil.FormatSizeSeafile.
@@ -1262,8 +1265,8 @@ func (h *FileHandler) DeleteDirectory(c *gin.Context) {
 
 	dirName := path.Base(dirPath)
 
-	// Collect all block IDs in the directory tree (for ref count decrement)
-	blockIDs, _ := fsHelper.CollectBlockIDsRecursive(repoID, result.TargetFSID)
+	// Collect all block IDs and total size in the directory tree (for ref count decrement + storage counters)
+	blockIDs, totalSize, fileCount, _ := fsHelper.collectDirStats(repoID, result.TargetFSID)
 
 	// Remove entry from parent directory
 	newEntries := RemoveEntryFromList(result.Entries, dirName)
@@ -1308,6 +1311,9 @@ func (h *FileHandler) DeleteDirectory(c *gin.Context) {
 				`, orgID, repoID).Scan(&storageClass)
 				h.gcEnqueuer.EnqueueBlocks(orgID, zeroRefBlocks, storageClass)
 			}
+		}
+		if totalSize > 0 {
+			DecrementStorageCounters(h.db, orgID, userID, repoID, totalSize, fileCount)
 		}
 	}()
 
@@ -1906,6 +1912,11 @@ func (h *FileHandler) DeleteFile(c *gin.Context) {
 
 	// Clean up file tags for the deleted file (async, non-blocking)
 	go h.cleanupFileTagsForPath(repoID, filePath)
+
+	// Decrement storage counters for the deleted file — fire-and-forget.
+	if fileSize := result.TargetEntry.Size; fileSize > 0 {
+		DecrementStorageCounters(h.db, orgID, userID, repoID, fileSize, 1)
+	}
 
 	c.JSON(http.StatusOK, gin.H{
 		"success":   true,
@@ -2652,6 +2663,24 @@ func (h *FileHandler) UploadFile(c *gin.Context) {
 		return
 	}
 
+	// Quota pre-check — evaluated before reading the body so we can fail fast.
+	if checker := traffic.GetChecker(); checker != nil {
+		contentLength := c.Request.ContentLength
+		if contentLength < 0 {
+			contentLength = 0
+		}
+		if st, _ := checker.CheckStorageQuota(orgID, contentLength); !st.Allowed {
+			c.JSON(http.StatusForbidden, gin.H{"error": "storage quota exceeded"})
+			return
+		}
+		if st, _ := checker.CheckTrafficQuota(orgID, userID, "upload", contentLength); !st.Allowed {
+			c.JSON(http.StatusForbidden, gin.H{"error": "traffic quota exceeded", "reason": st.Reason})
+			return
+		} else if st.Warning {
+			c.Header("X-Quota-Warning", st.Reason)
+		}
+	}
+
 	file, header, err := c.Request.FormFile("file")
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "file is required"})
@@ -2711,6 +2740,12 @@ func (h *FileHandler) UploadFile(c *gin.Context) {
 	// TODO: Create/update fs_object and commit
 
 	filePath := path.Join(parentDir, header.Filename)
+
+	// Record upload traffic and storage — fire-and-forget.
+	if rec := traffic.Get(); rec != nil {
+		rec.Record(orgID, userID, traffic.WebUpload, int64(len(content)))
+	}
+	IncrementStorageCounters(h.db, orgID, userID, repoID, int64(len(content)), 1)
 
 	c.JSON(http.StatusOK, gin.H{
 		"success":     true,
@@ -4163,21 +4198,21 @@ func (h *FileHandler) BatchDeleteItems(c *gin.Context) {
 		currentEntries = result.Entries
 	}
 
-	// Remove each item from entries
+	// Remove each item from entries, collecting deleted entries for storage accounting
 	deletedNames := []string{}
+	var deletedEntries []FSEntry
 	for _, name := range req.Dirents {
 		// Check if entry exists
-		found := false
 		for _, entry := range currentEntries {
 			if entry.Name == name {
-				found = true
+				deletedNames = append(deletedNames, name)
+				deletedEntries = append(deletedEntries, entry)
 				break
 			}
 		}
-		if found {
-			currentEntries = RemoveEntryFromList(currentEntries, name)
-			deletedNames = append(deletedNames, name)
-		}
+	}
+	for _, name := range deletedNames {
+		currentEntries = RemoveEntryFromList(currentEntries, name)
 	}
 
 	if len(deletedNames) == 0 {
@@ -4227,11 +4262,21 @@ func (h *FileHandler) BatchDeleteItems(c *gin.Context) {
 		return
 	}
 
-	// Clean up file tags for all deleted items (async, non-blocking)
+	// Clean up file tags and decrement storage counters for all deleted items (async, non-blocking)
 	go func() {
-		for _, name := range deletedNames {
-			deletedPath := path.Join(parentDir, name)
+		for _, entry := range deletedEntries {
+			deletedPath := path.Join(parentDir, entry.Name)
 			h.cleanupFileTagsForPath(req.RepoID, deletedPath)
+
+			// Decrement storage counters per deleted entry.
+			if entry.Mode == ModeDir || entry.Mode&0170000 == 040000 {
+				_, totalSize, fileCount, err := fsHelper.collectDirStats(req.RepoID, entry.ID)
+				if err == nil && totalSize > 0 {
+					DecrementStorageCounters(h.db, orgID, userID, req.RepoID, totalSize, fileCount)
+				}
+			} else if entry.Size > 0 {
+				DecrementStorageCounters(h.db, orgID, userID, req.RepoID, entry.Size, 1)
+			}
 		}
 	}()
 

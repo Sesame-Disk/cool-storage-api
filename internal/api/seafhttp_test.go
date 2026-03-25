@@ -62,7 +62,7 @@ func TestNewTokenManager(t *testing.T) {
 func TestTokenManagerCreateToken(t *testing.T) {
 	tm := NewTokenManager(1 * time.Hour)
 
-	token, err := tm.CreateToken(TokenTypeUpload, "org1", "repo1", "/path", "user1", 1*time.Hour)
+	token, err := tm.CreateToken(TokenTypeUpload, "org1", "repo1", "/path", "user1", "", 1*time.Hour)
 	if err != nil {
 		t.Fatalf("CreateToken failed: %v", err)
 	}
@@ -208,7 +208,7 @@ func TestTokenManagerGetTokenExpired(t *testing.T) {
 	tm := NewTokenManager(1 * time.Hour)
 
 	// Create a token with very short TTL
-	token, _ := tm.CreateToken(TokenTypeUpload, "org1", "repo1", "/", "user1", 1*time.Millisecond)
+	token, _ := tm.CreateToken(TokenTypeUpload, "org1", "repo1", "/", "user1", "", 1*time.Millisecond)
 
 	// Wait for it to expire
 	time.Sleep(10 * time.Millisecond)
@@ -382,6 +382,38 @@ func (m *MockTokenStore) CreateOneTimeLoginToken(userID, orgID, authToken string
 
 func (m *MockTokenStore) ConsumeOneTimeLoginToken(oneTimeToken string) (string, error) {
 	return "mock-auth-token", nil
+}
+
+func (m *MockTokenStore) CreateLinkUploadToken(orgID, repoID, path, userID string) (string, error) {
+	token := &AccessToken{
+		Token:     "mock-link-upload-token",
+		Type:      TokenTypeUpload,
+		Source:    "link",
+		OrgID:     orgID,
+		RepoID:    repoID,
+		Path:      path,
+		UserID:    userID,
+		ExpiresAt: time.Now().Add(1 * time.Hour),
+		CreatedAt: time.Now(),
+	}
+	m.tokens[token.Token] = token
+	return token.Token, nil
+}
+
+func (m *MockTokenStore) CreateLinkDownloadToken(orgID, repoID, path, userID string) (string, error) {
+	token := &AccessToken{
+		Token:     "mock-link-download-token",
+		Type:      TokenTypeDownload,
+		Source:    "link",
+		OrgID:     orgID,
+		RepoID:    repoID,
+		Path:      path,
+		UserID:    userID,
+		ExpiresAt: time.Now().Add(1 * time.Hour),
+		CreatedAt: time.Now(),
+	}
+	m.tokens[token.Token] = token
+	return token.Token, nil
 }
 
 func TestNewSeafHTTPHandler(t *testing.T) {

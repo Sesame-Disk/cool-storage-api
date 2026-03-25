@@ -24,6 +24,7 @@ import (
 	"github.com/Sesame-Disk/sesamefs/internal/storage"
 	"github.com/Sesame-Disk/sesamefs/internal/streaming"
 	"github.com/Sesame-Disk/sesamefs/internal/templates"
+	"github.com/Sesame-Disk/sesamefs/internal/traffic"
 	"github.com/gin-gonic/gin"
 )
 
@@ -457,6 +458,27 @@ func (h *FileViewHandler) ServeRawFile(c *gin.Context) {
 	orgID := c.GetString("org_id")
 	userID := c.GetString("user_id")
 
+	// Record traffic after the response is fully written (covers all return paths).
+	bytesBefore := int64(c.Writer.Size())
+	defer func() {
+		if rec := traffic.Get(); rec != nil {
+			sent := int64(c.Writer.Size()) - bytesBefore
+			if sent > 0 {
+				rec.Record(orgID, userID, traffic.WebDownload, sent)
+			}
+		}
+	}()
+
+	// Quota pre-check: reject if download traffic quota is already exhausted.
+	if checker := traffic.GetChecker(); checker != nil {
+		if st, _ := checker.CheckTrafficQuota(orgID, userID, "download", 0); !st.Allowed {
+			c.JSON(http.StatusForbidden, gin.H{"error": "traffic quota exceeded"})
+			return
+		} else if st.Warning {
+			c.Header("X-Quota-Warning", st.Reason)
+		}
+	}
+
 	// Clean the file path
 	if !strings.HasPrefix(filePath, "/") {
 		filePath = "/" + filePath
@@ -780,6 +802,16 @@ func (h *FileViewHandler) DownloadHistoricFile(c *gin.Context) {
 	orgID := c.GetString("org_id")
 	userID := c.GetString("user_id")
 
+	// Quota pre-check: reject if download traffic quota is already exhausted.
+	if checker := traffic.GetChecker(); checker != nil {
+		if st, _ := checker.CheckTrafficQuota(orgID, userID, "download", 0); !st.Allowed {
+			c.JSON(http.StatusForbidden, gin.H{"error": "traffic quota exceeded"})
+			return
+		} else if st.Warning {
+			c.Header("X-Quota-Warning", st.Reason)
+		}
+	}
+
 	// Check if library is encrypted and get file key
 	var encrypted bool
 	var fileKey []byte
@@ -835,7 +867,19 @@ func (h *FileViewHandler) DownloadHistoricFile(c *gin.Context) {
 	c.Status(http.StatusOK)
 
 	resolvedIDs := streaming.BatchResolveBlockIDs(h.db, orgID, blockIDs)
+	bytesBefore := int64(c.Writer.Size())
 	streaming.StreamBlocks(c, c.Request.Context(), blockStore, resolvedIDs, fileKey, "DownloadHistoricFile")
+
+	// Record download traffic using actual bytes written.
+	if rec := traffic.Get(); rec != nil {
+		bytesAfter := int64(c.Writer.Size())
+		if bytesAfter < 0 {
+			bytesAfter = 0
+		}
+		if sent := bytesAfter - bytesBefore; sent > 0 {
+			rec.Record(orgID, userID, traffic.WebDownload, sent)
+		}
+	}
 }
 
 // ViewHistoricFile serves an HTML preview page for a historic file revision.
@@ -935,6 +979,27 @@ func (h *FileViewHandler) ServeHistoricFileRaw(c *gin.Context) {
 	ext := strings.ToLower(strings.TrimPrefix(filepath.Ext(filename), "."))
 	orgID := c.GetString("org_id")
 	userID := c.GetString("user_id")
+
+	// Record traffic after the response is fully written (covers all return paths).
+	bytesBefore := int64(c.Writer.Size())
+	defer func() {
+		if rec := traffic.Get(); rec != nil {
+			sent := int64(c.Writer.Size()) - bytesBefore
+			if sent > 0 {
+				rec.Record(orgID, userID, traffic.WebDownload, sent)
+			}
+		}
+	}()
+
+	// Quota pre-check: reject if download traffic quota is already exhausted.
+	if checker := traffic.GetChecker(); checker != nil {
+		if st, _ := checker.CheckTrafficQuota(orgID, userID, "download", 0); !st.Allowed {
+			c.JSON(http.StatusForbidden, gin.H{"error": "traffic quota exceeded"})
+			return
+		} else if st.Warning {
+			c.Header("X-Quota-Warning", st.Reason)
+		}
+	}
 
 	// Check if library is encrypted and get file key
 	var encrypted bool

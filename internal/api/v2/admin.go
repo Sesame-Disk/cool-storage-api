@@ -14,6 +14,7 @@ import (
 	"github.com/Sesame-Disk/sesamefs/internal/config"
 	"github.com/Sesame-Disk/sesamefs/internal/db"
 	"github.com/Sesame-Disk/sesamefs/internal/middleware"
+	"github.com/Sesame-Disk/sesamefs/internal/traffic"
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -169,6 +170,10 @@ func RegisterAdminRoutes(rg *gin.RouterGroup, database *db.DB, cfg *config.Confi
 		admin.GET("/statistics/active-users", h.AdminStatisticActiveUsers)
 		admin.GET("/statistics/system-traffic/", h.AdminStatisticTraffic)
 		admin.GET("/statistics/system-traffic", h.AdminStatisticTraffic)
+		admin.GET("/statistics/org-traffic/", h.AdminListOrgTraffic)
+		admin.GET("/statistics/org-traffic", h.AdminListOrgTraffic)
+		admin.GET("/statistics/user-traffic/", h.AdminListUserTraffic)
+		admin.GET("/statistics/user-traffic", h.AdminListUserTraffic)
 
 		// Devices
 		admin.GET("/devices/", h.AdminListDevices)
@@ -287,17 +292,17 @@ func (h *AdminHandler) ListOrganizations(c *gin.Context) {
 	}
 
 	iter := h.db.Session().Query(`
-		SELECT org_id, name, status, storage_quota, storage_used, created_at, deleted_at
+		SELECT org_id, name, status, storage_quota, created_at, deleted_at
 		FROM organizations
 	`).Iter()
 
 	var orgs []gin.H
 	var orgID, name, status string
-	var storageQuota, storageUsed int64
+	var storageQuota int64
 	var createdAt time.Time
 	var deletedAt *time.Time
 
-	for iter.Scan(&orgID, &name, &status, &storageQuota, &storageUsed, &createdAt, &deletedAt) {
+	for iter.Scan(&orgID, &name, &status, &storageQuota, &createdAt, &deletedAt) {
 		effectiveStatus := status
 		if effectiveStatus == "" {
 			effectiveStatus = StatusActive
@@ -320,7 +325,7 @@ func (h *AdminHandler) ListOrganizations(c *gin.Context) {
 			"status":        effectiveStatus,
 			"deleted_at":    deletedAtStr,
 			"role":          "default",
-			"quota_usage":   storageUsed,
+			"quota_usage":   ReadStorageUsed(h.db, fmt.Sprintf("org:%s", orgID)),
 			"quota":         storageQuota,
 			"ctime":         createdAt.Format(time.RFC3339),
 			"users_count":   usersCount,
@@ -514,15 +519,15 @@ func (h *AdminHandler) GetOrganization(c *gin.Context) {
 
 	var name string
 	var status string
-	var storageQuota, storageUsed int64
+	var storageQuota int64
 	var settings map[string]string
 	var createdAt time.Time
 	var deletedAt *time.Time
 
 	err := h.db.Session().Query(`
-		SELECT name, status, storage_quota, storage_used, settings, created_at, deleted_at
+		SELECT name, status, storage_quota, settings, created_at, deleted_at
 		FROM organizations WHERE org_id = ?
-	`, orgID).Scan(&name, &status, &storageQuota, &storageUsed, &settings, &createdAt, &deletedAt)
+	`, orgID).Scan(&name, &status, &storageQuota, &settings, &createdAt, &deletedAt)
 
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "organization not found"})
@@ -558,7 +563,7 @@ func (h *AdminHandler) GetOrganization(c *gin.Context) {
 		"status":          effectiveStatus,
 		"deleted_at":      deletedAtStr,
 		"role":            "default",
-		"quota_usage":     storageUsed,
+		"quota_usage":     ReadStorageUsed(h.db, fmt.Sprintf("org:%s", orgID)),
 		"quota":           storageQuota,
 		"ctime":           createdAt.Format(time.RFC3339),
 		"users_count":     usersCount,
@@ -574,8 +579,14 @@ func (h *AdminHandler) UpdateOrganization(c *gin.Context) {
 	orgID := c.Param("org_id")
 
 	var req struct {
-		Name         *string `json:"name"`
-		StorageQuota *int64  `json:"storage_quota"`
+		Name                 *string `json:"name"`
+		StorageQuota         *int64  `json:"storage_quota"`
+		TrafficQuota         *int64  `json:"traffic_quota"`
+		TrafficUploadQuota   *int64  `json:"traffic_upload_quota"`
+		TrafficDownloadQuota *int64  `json:"traffic_download_quota"`
+		MaxUsers             *int    `json:"max_users"`
+		Plan                 *string `json:"plan"`
+		BillingCycle         *string `json:"billing_cycle"`
 	}
 
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -593,19 +604,42 @@ func (h *AdminHandler) UpdateOrganization(c *gin.Context) {
 		return
 	}
 
+	orgUUID, _ := gocql.ParseUUID(orgID)
+
+	type colUpdate struct {
+		col string
+		val interface{}
+	}
+	var updates []colUpdate
+
 	if req.Name != nil {
-		if err := h.db.Session().Query(`
-			UPDATE organizations SET name = ? WHERE org_id = ?
-		`, *req.Name, orgID).Exec(); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update organization"})
-			return
-		}
+		updates = append(updates, colUpdate{"name", *req.Name})
+	}
+	if req.StorageQuota != nil {
+		updates = append(updates, colUpdate{"storage_quota", *req.StorageQuota})
+	}
+	if req.TrafficQuota != nil {
+		updates = append(updates, colUpdate{"traffic_quota", *req.TrafficQuota})
+	}
+	if req.TrafficUploadQuota != nil {
+		updates = append(updates, colUpdate{"traffic_upload_quota", *req.TrafficUploadQuota})
+	}
+	if req.TrafficDownloadQuota != nil {
+		updates = append(updates, colUpdate{"traffic_download_quota", *req.TrafficDownloadQuota})
+	}
+	if req.MaxUsers != nil {
+		updates = append(updates, colUpdate{"max_users", *req.MaxUsers})
+	}
+	if req.Plan != nil {
+		updates = append(updates, colUpdate{"plan", *req.Plan})
+	}
+	if req.BillingCycle != nil {
+		updates = append(updates, colUpdate{"billing_cycle", *req.BillingCycle})
 	}
 
-	if req.StorageQuota != nil {
-		if err := h.db.Session().Query(`
-			UPDATE organizations SET storage_quota = ? WHERE org_id = ?
-		`, *req.StorageQuota, orgID).Exec(); err != nil {
+	for _, u := range updates {
+		query := fmt.Sprintf("UPDATE organizations SET %s = ? WHERE org_id = ?", u.col)
+		if err := h.db.Session().Query(query, u.val, orgUUID).Exec(); err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update organization"})
 			return
 		}
@@ -763,16 +797,16 @@ func (h *AdminHandler) ListOrgUsers(c *gin.Context) {
 	}
 
 	iter := h.db.Session().Query(`
-		SELECT user_id, email, name, role, status, quota_bytes, used_bytes, created_at
+		SELECT user_id, email, name, role, status, quota_bytes, created_at
 		FROM users WHERE org_id = ?
 	`, targetOrgID).Iter()
 
 	var users []gin.H
 	var userID, email, name, role, status string
-	var quotaBytes, usedBytes int64
+	var quotaBytes int64
 	var createdAt time.Time
 
-	for iter.Scan(&userID, &email, &name, &role, &status, &quotaBytes, &usedBytes, &createdAt) {
+	for iter.Scan(&userID, &email, &name, &role, &status, &quotaBytes, &createdAt) {
 		if !userMatchesStatusFilter(status, statusFilter) {
 			continue
 		}
@@ -784,7 +818,7 @@ func (h *AdminHandler) ListOrgUsers(c *gin.Context) {
 			"status":       normalizeUserStatus(status),
 			"active":       isActive,
 			"is_org_staff": isOrgStaff,
-			"quota_usage":  usedBytes,
+			"quota_usage":  ReadStorageUsed(h.db, fmt.Sprintf("user:%s:%s", targetOrgID, userID)),
 			"quota_total":  quotaBytes,
 			"create_time":  createdAt.Format(time.RFC3339),
 			"last_login":   "",
@@ -905,7 +939,7 @@ func (h *AdminHandler) GetUser(c *gin.Context) {
 
 	// Try to find the user - we need their org_id
 	var email, name, role, userOrgID string
-	var quotaBytes, usedBytes int64
+	var quotaBytes int64
 	var createdAt time.Time
 
 	if callerOrgID == middleware.PlatformOrgID {
@@ -915,9 +949,9 @@ func (h *AdminHandler) GetUser(c *gin.Context) {
 
 	// Tenant admin: look up in own org
 	err := h.db.Session().Query(`
-		SELECT email, name, role, quota_bytes, used_bytes, created_at
+		SELECT email, name, role, quota_bytes, created_at
 		FROM users WHERE org_id = ? AND user_id = ?
-	`, callerOrgID, targetUserID).Scan(&email, &name, &role, &quotaBytes, &usedBytes, &createdAt)
+	`, callerOrgID, targetUserID).Scan(&email, &name, &role, &quotaBytes, &createdAt)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "user not found"})
 		return
@@ -931,7 +965,7 @@ func (h *AdminHandler) GetUser(c *gin.Context) {
 		"name":        name,
 		"role":        role,
 		"quota_bytes": quotaBytes,
-		"used_bytes":  usedBytes,
+		"used_bytes":  ReadStorageUsed(h.db, fmt.Sprintf("user:%s:%s", userOrgID, targetUserID)),
 		"created_at":  createdAt,
 	})
 }
@@ -1995,18 +2029,18 @@ func (h *AdminHandler) ListAllUsers(c *gin.Context) {
 	seen := make(map[string]bool) // deduplicate by email
 	for _, orgID := range orgIDs {
 		iter := h.db.Session().Query(`
-			SELECT user_id, email, name, role, status, quota_bytes, used_bytes, created_at
+			SELECT user_id, email, name, role, status, quota_bytes, created_at
 			FROM users WHERE org_id = ?
 		`, orgID).Iter()
 
 		var userID, email, name, role, status string
-		var quotaBytes, usedBytes int64
+		var quotaBytes int64
 		var createdAt time.Time
 
-		for iter.Scan(&userID, &email, &name, &role, &status, &quotaBytes, &usedBytes, &createdAt) {
+		for iter.Scan(&userID, &email, &name, &role, &status, &quotaBytes, &createdAt) {
 			if !seen[email] && userMatchesStatusFilter(status, statusFilter) {
 				seen[email] = true
-				allUsers = append(allUsers, makeAdminUserResponse(email, name, role, status, quotaBytes, usedBytes, createdAt))
+				allUsers = append(allUsers, makeAdminUserResponse(email, name, role, status, quotaBytes, ReadStorageUsed(h.db, fmt.Sprintf("user:%s:%s", orgID, userID)), createdAt))
 			}
 		}
 		if err := iter.Close(); err != nil {
@@ -2090,18 +2124,18 @@ func (h *AdminHandler) SearchUsers(c *gin.Context) {
 	seen := make(map[string]bool)
 	for _, orgID := range orgIDs {
 		iter := h.db.Session().Query(`
-			SELECT user_id, email, name, role, status, quota_bytes, used_bytes, created_at
+			SELECT user_id, email, name, role, status, quota_bytes, created_at
 			FROM users WHERE org_id = ?
 		`, orgID).Iter()
 
 		var userID, email, name, role, status string
-		var quotaBytes, usedBytes int64
+		var quotaBytes int64
 		var createdAt time.Time
 
-		for iter.Scan(&userID, &email, &name, &role, &status, &quotaBytes, &usedBytes, &createdAt) {
+		for iter.Scan(&userID, &email, &name, &role, &status, &quotaBytes, &createdAt) {
 			if !seen[email] && (strings.Contains(strings.ToLower(email), query) || strings.Contains(strings.ToLower(name), query)) {
 				seen[email] = true
-				results = append(results, makeAdminUserResponse(email, name, role, status, quotaBytes, usedBytes, createdAt))
+				results = append(results, makeAdminUserResponse(email, name, role, status, quotaBytes, ReadStorageUsed(h.db, fmt.Sprintf("user:%s:%s", orgID, userID)), createdAt))
 			}
 		}
 		iter.Close()
@@ -2177,6 +2211,14 @@ func (h *AdminHandler) AdminCreateUser(c *gin.Context) {
 		return
 	}
 
+	// Check max_users quota before creating.
+	if checker := traffic.GetChecker(); checker != nil {
+		if st, _ := checker.CheckMaxUsers(orgID); !st.Allowed {
+			c.JSON(http.StatusForbidden, gin.H{"error": "user limit reached for this organization"})
+			return
+		}
+	}
+
 	userID := uuid.New().String()
 	now := time.Now()
 
@@ -2207,18 +2249,18 @@ func (h *AdminHandler) GetUserByEmail(c *gin.Context, email string) {
 	}
 
 	var name, role, status string
-	var quotaBytes, usedBytes int64
+	var quotaBytes int64
 	var createdAt time.Time
 
 	if err := h.db.Session().Query(`
-		SELECT name, role, status, quota_bytes, used_bytes, created_at
+		SELECT name, role, status, quota_bytes, created_at
 		FROM users WHERE org_id = ? AND user_id = ?
-	`, userOrgID, userID).Scan(&name, &role, &status, &quotaBytes, &usedBytes, &createdAt); err != nil {
+	`, userOrgID, userID).Scan(&name, &role, &status, &quotaBytes, &createdAt); err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "user not found"})
 		return
 	}
 
-	c.JSON(http.StatusOK, makeAdminUserResponse(email, name, role, status, quotaBytes, usedBytes, createdAt))
+	c.JSON(http.StatusOK, makeAdminUserResponse(email, name, role, status, quotaBytes, ReadStorageUsed(h.db, fmt.Sprintf("user:%s:%s", userOrgID, userID)), createdAt))
 }
 
 // UpdateUserByEmail updates a user by email.
@@ -2239,12 +2281,12 @@ func (h *AdminHandler) UpdateUserByEmail(c *gin.Context, email string) {
 
 	// Read current user data to return updated response
 	var currentName, currentRole, currentStatus string
-	var currentQuota, currentUsed int64
+	var currentQuota int64
 	var currentCreated time.Time
 	h.db.Session().Query(`
-		SELECT name, role, status, quota_bytes, used_bytes, created_at
+		SELECT name, role, status, quota_bytes, created_at
 		FROM users WHERE org_id = ? AND user_id = ?
-	`, userOrgID, userID).Scan(&currentName, &currentRole, &currentStatus, &currentQuota, &currentUsed, &currentCreated)
+	`, userOrgID, userID).Scan(&currentName, &currentRole, &currentStatus, &currentQuota, &currentCreated)
 
 	// Read form values
 	newRole := c.Request.FormValue("role")
@@ -2332,7 +2374,7 @@ func (h *AdminHandler) UpdateUserByEmail(c *gin.Context, email string) {
 		currentStatus = "active"
 	}
 
-	resp := makeAdminUserResponse(email, currentName, currentRole, currentStatus, currentQuota, currentUsed, currentCreated)
+	resp := makeAdminUserResponse(email, currentName, currentRole, currentStatus, currentQuota, ReadStorageUsed(h.db, fmt.Sprintf("user:%s:%s", userOrgID, userID)), currentCreated)
 	c.JSON(http.StatusOK, resp)
 }
 
@@ -2437,18 +2479,18 @@ func (h *AdminHandler) ListAdminUsers(c *gin.Context) {
 	seen := make(map[string]bool)
 	for _, orgID := range orgIDs {
 		iter := h.db.Session().Query(`
-			SELECT user_id, email, name, role, status, quota_bytes, used_bytes, created_at
+			SELECT user_id, email, name, role, status, quota_bytes, created_at
 			FROM users WHERE org_id = ?
 		`, orgID).Iter()
 
 		var userID, email, name, role, status string
-		var quotaBytes, usedBytes int64
+		var quotaBytes int64
 		var createdAt time.Time
 
-		for iter.Scan(&userID, &email, &name, &role, &status, &quotaBytes, &usedBytes, &createdAt) {
+		for iter.Scan(&userID, &email, &name, &role, &status, &quotaBytes, &createdAt) {
 			if !seen[email] && role == "superadmin" {
 				seen[email] = true
-				admins = append(admins, makeAdminUserResponse(email, name, role, status, quotaBytes, usedBytes, createdAt))
+				admins = append(admins, makeAdminUserResponse(email, name, role, status, quotaBytes, ReadStorageUsed(h.db, fmt.Sprintf("user:%s:%s", orgID, userID)), createdAt))
 			}
 		}
 		iter.Close()
@@ -2498,16 +2540,16 @@ func (h *AdminHandler) BatchAddAdmins(c *gin.Context) {
 
 		// Read back updated user data
 		var name, role, status string
-		var quotaBytes, usedBytes int64
+		var quotaBytes int64
 		var createdAt time.Time
 		if err := h.db.Session().Query(`
-			SELECT name, role, status, quota_bytes, used_bytes, created_at
+			SELECT name, role, status, quota_bytes, created_at
 			FROM users WHERE org_id = ? AND user_id = ?
-		`, userOrgID, userID).Scan(&name, &role, &status, &quotaBytes, &usedBytes, &createdAt); err != nil {
+		`, userOrgID, userID).Scan(&name, &role, &status, &quotaBytes, &createdAt); err != nil {
 			failed = append(failed, gin.H{"email": email, "error_msg": "failed to read user"})
 			continue
 		}
-		success = append(success, makeAdminUserResponse(email, name, role, status, quotaBytes, usedBytes, createdAt))
+		success = append(success, makeAdminUserResponse(email, name, role, status, quotaBytes, ReadStorageUsed(h.db, fmt.Sprintf("user:%s:%s", userOrgID, userID)), createdAt))
 	}
 
 	if success == nil {

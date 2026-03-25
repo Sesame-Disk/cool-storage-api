@@ -21,9 +21,19 @@ func (a *CassandraTokenAdapter) CreateUploadToken(orgID, repoID, path, userID st
 	return a.store.CreateUploadToken(orgID, repoID, path, userID)
 }
 
+// CreateLinkUploadToken creates an upload token tagged as a share/upload link.
+func (a *CassandraTokenAdapter) CreateLinkUploadToken(orgID, repoID, path, userID string) (string, error) {
+	return a.store.CreateLinkUploadToken(orgID, repoID, path, userID)
+}
+
 // CreateDownloadToken creates a download token
 func (a *CassandraTokenAdapter) CreateDownloadToken(orgID, repoID, path, userID string) (string, error) {
 	return a.store.CreateDownloadToken(orgID, repoID, path, userID)
+}
+
+// CreateLinkDownloadToken creates a download token tagged as a share link.
+func (a *CassandraTokenAdapter) CreateLinkDownloadToken(orgID, repoID, path, userID string) (string, error) {
+	return a.store.CreateLinkDownloadToken(orgID, repoID, path, userID)
 }
 
 // GetToken retrieves and validates a token
@@ -44,6 +54,7 @@ func (a *CassandraTokenAdapter) GetToken(tokenStr string, expectedType TokenType
 		RepoID:    dbToken.RepoID,
 		Path:      dbToken.Path,
 		UserID:    dbToken.UserID,
+		Source:    dbToken.Source,
 		CreatedAt: dbToken.CreatedAt,
 	}, true
 }

@@ -139,6 +139,9 @@ func (db *DB) Migrate() error {
 		migrationCreateGCProcessedItems,
 		migrationCreateDeletedLibraries,
 		migrationCreateAuditLog,
+		migrationCreateTrafficCounters,
+		migrationCreateTrafficMonthly,
+		migrationCreateStorageCounters,
 	}
 
 	for _, migration := range migrations {
@@ -165,6 +168,16 @@ func (db *DB) Migrate() error {
 		migrationAddOrgStatus,
 		migrationAddShareLinksByOrgViewCount,
 		migrationAddShareLinksByOrgUploadCount,
+		migrationAddOrgTrafficQuota,
+		migrationAddOrgTrafficUploadQuota,
+		migrationAddOrgTrafficDownloadQuota,
+		migrationAddOrgMaxUsers,
+		migrationAddOrgPlan,
+		migrationAddOrgBillingCycle,
+		migrationAddUserTrafficUploadQuota,
+		migrationAddUserTrafficDownloadQuota,
+		migrationAddAccessTokenSource,
+		migrationAddBlockIdMappingCreatedAt,
 	}
 	for _, migration := range alterMigrations {
 		if err := db.session.Query(migration).Exec(); err != nil {
@@ -906,3 +919,71 @@ ALTER TABLE share_links_by_org ADD view_count INT`
 
 const migrationAddShareLinksByOrgUploadCount = `
 ALTER TABLE share_links_by_org ADD upload_count INT`
+
+// Traffic counters — daily granularity per org/user/type for statistics queries.
+// Partition by (org_id, month) keeps each monthly partition bounded.
+const migrationCreateTrafficCounters = `
+CREATE TABLE IF NOT EXISTS traffic_counters (
+	org_id UUID,
+	month TEXT,
+	day DATE,
+	user_id UUID,
+	traffic_type TEXT,
+	bytes_transferred COUNTER,
+	PRIMARY KEY ((org_id, month), day, user_id, traffic_type)
+)`
+
+// Traffic monthly — aggregated monthly counters for fast quota enforcement.
+// A single partition read gives all scopes for an org+month.
+const migrationCreateTrafficMonthly = `
+CREATE TABLE IF NOT EXISTS traffic_monthly (
+	org_id UUID,
+	month TEXT,
+	scope TEXT,
+	bytes_transferred COUNTER,
+	PRIMARY KEY ((org_id, month), scope)
+)`
+
+// Storage counters — per-entity (org, user, library) byte and file counts.
+// Single partition per entity; counter semantics allow concurrent increment/decrement.
+const migrationCreateStorageCounters = `
+CREATE TABLE IF NOT EXISTS storage_counters (
+	scope TEXT,
+	bytes_used COUNTER,
+	file_count COUNTER,
+	PRIMARY KEY ((scope))
+)`
+
+// Plan and traffic quota columns on organizations (set by external billing service).
+const migrationAddOrgTrafficQuota = `
+ALTER TABLE organizations ADD traffic_quota BIGINT`
+
+const migrationAddOrgTrafficUploadQuota = `
+ALTER TABLE organizations ADD traffic_upload_quota BIGINT`
+
+const migrationAddOrgTrafficDownloadQuota = `
+ALTER TABLE organizations ADD traffic_download_quota BIGINT`
+
+const migrationAddOrgMaxUsers = `
+ALTER TABLE organizations ADD max_users INT`
+
+const migrationAddOrgPlan = `
+ALTER TABLE organizations ADD plan TEXT`
+
+const migrationAddOrgBillingCycle = `
+ALTER TABLE organizations ADD billing_cycle TEXT`
+
+// Per-user traffic quota overrides (inherit from org when -1).
+const migrationAddUserTrafficUploadQuota = `
+ALTER TABLE users ADD traffic_upload_quota BIGINT`
+
+const migrationAddUserTrafficDownloadQuota = `
+ALTER TABLE users ADD traffic_download_quota BIGINT`
+
+// Source tag on access tokens — distinguishes "link" (share/upload link) from regular user uploads.
+const migrationAddAccessTokenSource = `
+ALTER TABLE access_tokens ADD source TEXT`
+
+// Timestamp on reverse block-id mappings — records when the mapping was written.
+const migrationAddBlockIdMappingCreatedAt = `
+ALTER TABLE block_id_mappings_by_internal ADD created_at TIMESTAMP`
