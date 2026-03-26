@@ -44,7 +44,7 @@ class OrgStatisticTraffic extends React.Component {
       let data = res.data;
       if (Array.isArray(data)) {
         data.forEach(item => {
-          labels.push(moment(item.datetime).format('YYYY-MM-DD'));
+          labels.push(moment.utc(item.datetime).format('YYYY-MM-DD'));
           link_upload.push(item['link-file-upload']);
           link_download.push(item['link-file-download']);
           sync_upload.push(item['sync-file-upload']);

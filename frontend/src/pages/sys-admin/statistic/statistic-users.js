@@ -29,7 +29,7 @@ class StatisticUsers extends React.Component {
       let data = res.data;
       if (Array.isArray(data)) {
         data.forEach(item => {
-          labels.push(moment(item.datetime).format('YYYY-MM-DD'));
+          labels.push(moment.utc(item.datetime).format('YYYY-MM-DD'));
           count.push(item.count);
         });
         let userCount = {

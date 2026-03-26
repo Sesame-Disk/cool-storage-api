@@ -29,7 +29,7 @@ class OrgStatisticStorage extends React.Component {
       let data = res.data;
       if (Array.isArray(data)) {
         data.forEach(item => {
-          labels.push(moment(item.datetime).format('YYYY-MM-DD'));
+          labels.push(moment.utc(item.datetime).format('YYYY-MM-DD'));
           totalStorage.push(item.total_storage);
         });
         let total_storage = {

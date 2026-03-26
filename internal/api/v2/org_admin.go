@@ -2878,12 +2878,15 @@ func (h *OrgAdminHandler) OrgStatisticStorage(c *gin.Context) {
 		return
 	}
 
-	bytesUsed := traffic.ReadStorageUsed(h.db, fmt.Sprintf("org:%s", targetOrgID))
+	scope := fmt.Sprintf("org:%s", targetOrgID)
+	start, end := parseDateRangeParams(c)
+	history := traffic.ReconstructStorageHistory(h.db, scope, start, end)
 
 	stats := dateRangeStrings(c)
 	result := make([]gin.H, len(stats))
 	for i, dt := range stats {
-		result[i] = gin.H{"datetime": dt, "total_storage": bytesUsed}
+		dayKey := dt[:10]
+		result[i] = gin.H{"datetime": dt, "total_storage": history[dayKey]}
 	}
 	c.JSON(http.StatusOK, result)
 }
@@ -2910,6 +2913,7 @@ func (h *OrgAdminHandler) OrgStatisticUserTraffic(c *gin.Context) {
 	}
 
 	month := c.DefaultQuery("month", time.Now().UTC().Format("200601"))
+	orderBy := c.Query("order_by")
 	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
 	perPage, _ := strconv.Atoi(c.DefaultQuery("per_page", "25"))
 	if page < 1 {
@@ -2925,91 +2929,35 @@ func (h *OrgAdminHandler) OrgStatisticUserTraffic(c *gin.Context) {
 		return
 	}
 
-	// Build user info map.
-	type userMeta struct {
-		Email string
-		Name  string
-	}
-	userInfoMap := map[string]userMeta{}
-	iter := h.db.Session().Query(
-		`SELECT user_id, email, name FROM users WHERE org_id = ?`, orgUUID,
-	).Iter()
-	var uid gocql.UUID
-	var email, uname string
-	for iter.Scan(&uid, &email, &uname) {
-		userInfoMap[uid.String()] = userMeta{Email: email, Name: uname}
-	}
-	_ = iter.Close()
+	// Build user info map and accumulate per-type traffic from traffic_counters,
+	// matching the sysadmin AdminListUserTraffic response format so the frontend
+	// can display per-type columns (sync/web/link × upload/download).
+	userMap := map[string]userTrafficMeta{}
+	loadUserTrafficMetaForOrg(h.db.Session(), orgUUID, userMap)
 
-	// Read per-direction totals from traffic_monthly.
-	type userTrafficRow struct {
-		UserID   string
-		Upload   int64
-		Download int64
-	}
-	trafficMap := map[string]*userTrafficRow{}
-	iter2 := h.db.Session().Query(
-		`SELECT scope, bytes_transferred FROM traffic_monthly WHERE org_id = ? AND month = ?`,
-		orgUUID, month,
-	).Iter()
-	var scope string
-	var bytes int64
-	for iter2.Scan(&scope, &bytes) {
-		// scopes: "<userID>:upload", "<userID>:download"
-		colon := strings.LastIndex(scope, ":")
-		if colon <= 0 {
-			continue
-		}
-		userID := scope[:colon]
-		direction := scope[colon+1:]
-		if _, ok := gocql.ParseUUID(userID); ok != nil {
-			continue // skip org:*  and other non-user scopes
-		}
-		if trafficMap[userID] == nil {
-			trafficMap[userID] = &userTrafficRow{UserID: userID}
-		}
-		switch direction {
-		case "upload":
-			trafficMap[userID].Upload += bytes
-		case "download":
-			trafficMap[userID].Download += bytes
-		}
-	}
-	_ = iter2.Close()
+	entries := map[string]gin.H{}
+	accumulateTrafficPartition(h.db.Session(), orgUUID, month, userMap, entries, nil, nil)
 
-	// Collect and sort user IDs for stable pagination.
-	var userIDs []string
-	for uid := range trafficMap {
-		userIDs = append(userIDs, uid)
+	list := make([]gin.H, 0, len(entries))
+	for _, entry := range entries {
+		list = append(list, entry)
 	}
-	sort.Strings(userIDs)
+	sortTrafficRows(list, orderBy, "link_file_download")
 
+	// Paginate after sorting.
 	offset := (page - 1) * perPage
 	hasNext := false
-	if offset >= len(userIDs) {
+	if offset >= len(list) {
 		c.JSON(http.StatusOK, gin.H{"user_monthly_traffic_list": []gin.H{}, "has_next_page": false})
 		return
 	}
-	end := offset + perPage
-	if end >= len(userIDs) {
-		end = len(userIDs)
+	endIdx := offset + perPage
+	if endIdx >= len(list) {
+		endIdx = len(list)
 	} else {
 		hasNext = true
 	}
-
-	list := make([]gin.H, 0, end-offset)
-	for _, uid := range userIDs[offset:end] {
-		row := trafficMap[uid]
-		info := userInfoMap[uid]
-		list = append(list, gin.H{
-			"email":          info.Email,
-			"name":           info.Name,
-			"upload_bytes":   row.Upload,
-			"download_bytes": row.Download,
-			"total_bytes":    row.Upload + row.Download,
-		})
-	}
-	c.JSON(http.StatusOK, gin.H{"user_monthly_traffic_list": list, "has_next_page": hasNext})
+	c.JSON(http.StatusOK, gin.H{"user_monthly_traffic_list": list[offset:endIdx], "has_next_page": hasNext})
 }
 
 // ============================================================================

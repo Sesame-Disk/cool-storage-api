@@ -257,14 +257,14 @@ func queryTrafficStats(session *gocql.Session, orgID gocql.UUID, c *gin.Context)
 	endStr := c.Query("end")
 	groupBy := c.DefaultQuery("group_by", "day")
 
-	now := time.Now().UTC()
-	end := now
-	start := now.AddDate(0, 0, -7)
-	if t, err := time.Parse("2006-01-02", startStr); err == nil {
-		start = t.UTC()
+	today := time.Now().UTC().Truncate(24 * time.Hour)
+	start := today.AddDate(0, 0, -7)
+	end := today
+	if startStr != "" {
+		start = parseDateParam(startStr, start)
 	}
-	if t, err := time.Parse("2006-01-02", endStr); err == nil {
-		end = t.UTC()
+	if endStr != "" {
+		end = parseDateParam(endStr, end)
 	}
 
 	var dates []time.Time
@@ -280,7 +280,7 @@ func queryTrafficStats(session *gocql.Session, orgID gocql.UUID, c *gin.Context)
 		}
 	}
 	if len(dates) == 0 {
-		dates = []time.Time{now.Truncate(24 * time.Hour)}
+		dates = []time.Time{today}
 	}
 
 	// Group dates by month to minimise repeated partition reads.
@@ -376,17 +376,17 @@ func (h *AdminHandler) AdminStatisticStorage(c *gin.Context) {
 		return
 	}
 
-	// Read the platform-wide storage counter (current snapshot — no time series).
-	// NOTE: Storage has no historical time-series tracking yet. The frontend graph
-	// shows a flat line at the current value. For v2, consider daily snapshots.
-	bytesUsed := traffic.ReadStorageUsed(h.db, "platform")
+	start, end := parseDateRangeParams(c)
+	history := traffic.ReconstructStorageHistory(h.db, "platform", start, end)
 
 	stats := h.generateDateRange(c)
 	result := make([]gin.H, len(stats))
 	for i, dt := range stats {
+		// dt is "2006-01-02T00:00:00+00:00", extract the date portion for lookup.
+		dayKey := dt[:10]
 		result[i] = gin.H{
 			"datetime":      dt,
-			"total_storage": bytesUsed,
+			"total_storage": history[dayKey],
 		}
 	}
 	c.JSON(http.StatusOK, result)
@@ -426,6 +426,32 @@ func (h *AdminHandler) generateDateRange(c *gin.Context) []string {
 	return dateRangeStrings(c)
 }
 
+// parseDateParam parses a date string in "2006-01-02" or "2006-01-02 15:04:05"
+// format and returns it truncated to midnight UTC. Returns fallback on failure.
+func parseDateParam(s string, fallback time.Time) time.Time {
+	for _, layout := range []string{"2006-01-02", "2006-01-02 15:04:05"} {
+		if t, err := time.Parse(layout, s); err == nil {
+			return t.UTC().Truncate(24 * time.Hour)
+		}
+	}
+	return fallback
+}
+
+// parseDateRangeParams extracts start/end query params as time.Time values
+// for use by storage history reconstruction.
+func parseDateRangeParams(c *gin.Context) (time.Time, time.Time) {
+	today := time.Now().UTC().Truncate(24 * time.Hour)
+	start := today.AddDate(0, 0, -7)
+	end := today
+	if s := c.Query("start"); s != "" {
+		start = parseDateParam(s, start)
+	}
+	if s := c.Query("end"); s != "" {
+		end = parseDateParam(s, end)
+	}
+	return start, end
+}
+
 // dateRangeStrings is the package-level equivalent of generateDateRange.
 // Both AdminHandler and OrgAdminHandler use this helper.
 func dateRangeStrings(c *gin.Context) []string {
@@ -433,19 +459,15 @@ func dateRangeStrings(c *gin.Context) []string {
 	endStr := c.Query("end")
 	groupBy := c.DefaultQuery("group_by", "day")
 
-	now := time.Now().UTC()
-	end := now
-	start := now.AddDate(0, 0, -7)
+	today := time.Now().UTC().Truncate(24 * time.Hour)
+	start := today.AddDate(0, 0, -7)
+	end := today
 
 	if startStr != "" {
-		if t, err := time.Parse("2006-01-02", startStr); err == nil {
-			start = t
-		}
+		start = parseDateParam(startStr, start)
 	}
 	if endStr != "" {
-		if t, err := time.Parse("2006-01-02", endStr); err == nil {
-			end = t
-		}
+		end = parseDateParam(endStr, end)
 	}
 
 	var dates []string
@@ -461,7 +483,7 @@ func dateRangeStrings(c *gin.Context) []string {
 		}
 	}
 	if len(dates) == 0 {
-		dates = []string{now.Format("2006-01-02T00:00:00+00:00")}
+		dates = []string{today.Format("2006-01-02T00:00:00+00:00")}
 	}
 	return dates
 }

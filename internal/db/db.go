@@ -86,7 +86,7 @@ func (db *DB) Session() *gocql.Session {
 
 // Ping verifies database connectivity by executing a lightweight query.
 func (db *DB) Ping(ctx context.Context) error {
-	return db.session.Query(`SELECT now() FROM system.local`).WithContext(ctx).Exec()
+	return db.session.Query(`SELECT now() FROM system.local`).ExecContext(ctx)
 }
 
 // Migrate runs database migrations
@@ -945,14 +945,19 @@ CREATE TABLE IF NOT EXISTS traffic_monthly (
 )`
 
 // Storage counters — per-entity (org, user, library) byte and file counts.
-// Single partition per entity; counter semantics allow concurrent increment/decrement.
+// The partition key is "scope"; the clustering key is "day".
+//   - day = 1970-01-01 → running total (used for fast quota checks)
+//   - day = <real date> → daily delta (used for time-series graphs)
+//
+// This mirrors how traffic uses traffic_counters (per-day) + traffic_monthly (aggregate).
 const migrationCreateStorageCounters = `
 CREATE TABLE IF NOT EXISTS storage_counters (
 	scope TEXT,
+	day DATE,
 	bytes_used COUNTER,
 	file_count COUNTER,
-	PRIMARY KEY ((scope))
-)`
+	PRIMARY KEY ((scope), day)
+) WITH CLUSTERING ORDER BY (day DESC)`
 
 // Plan and traffic quota columns on organizations (set by external billing service).
 const migrationAddOrgTrafficQuota = `

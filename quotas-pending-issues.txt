@@ -1,0 +1,170 @@
+================================================================================
+  QUOTAS — PENDIENTES Y GAPS CONOCIDOS
+  Última actualización: 2026-03-26
+================================================================================
+
+## BUGS CORREGIDOS (2026-03-26)
+
+[x] sysAdminStatisticTraffic() y sysAdminStatisticStorages() no existían
+    - seafile-api.js no tenía estas 2 funciones
+    - Las páginas sysadmin de Traffic (gráficas) y Storage crasheaban
+    - FIX: Añadidas ambas funciones apuntando a /api/v2.1/admin/statistics/
+
+[x] OrgStatisticUserTraffic devolvía campos incompatibles con frontend
+    - Backend devolvía upload_bytes/download_bytes/total_bytes
+    - Frontend esperaba sync_file_upload/sync_file_download/web_file_upload/etc.
+    - Todas las columnas mostraban "0 bytes"
+    - Además: backend no soportaba parámetro order_by (ignoraba sorting)
+    - FIX: Reescrito endpoint para usar traffic_counters (desglose por tipo)
+      con sortTrafficRows() y paginación post-sort, igual que AdminListUserTraffic
+
+[x] Args invertidos en resetPerPage de statistic-traffic-orgs.js
+    - Llamaba getTrafficList(page, month) en vez de (month, page)
+    - Cambiar per_page en tab de orgs mandaba request con month=1
+    - FIX: Corregido orden de argumentos
+
+[x] Fallback muerto a org_monthly_traffic_list
+    - statistic-traffic-orgs.js tenía fallback innecesario
+    - Backend siempre devuelve org_traffic_list
+    - FIX: Eliminado fallback
+
+[x] Traffic off-by-one (tráfico de hoy aparecía como ayer)
+    - Backend devuelve datetime "2026-03-26T00:00:00+00:00" (medianoche UTC)
+    - moment(item.datetime) en el browser convierte a hora local: en UTC-X queda como día anterior
+    - FIX (backend): parseDateParam() acepta ambos formatos y trunca a midnight UTC
+    - FIX (frontend): 8 archivos de estadísticas cambiados a moment.utc(item.datetime)
+      sys-admin: statistic-traffic.js, statistic-storage.js, statistic-file.js, statistic-users.js
+      org-admin: statistic-traffic.js, statistic-storage.js, statistic-file.js, statistic-users.js
+
+[x] Storage charts mostraban línea plana (valor actual repetido)
+    - No existía tracking histórico de storage, solo snapshot live
+    - AdminStatisticStorage y OrgStatisticStorage repetían el valor actual
+    - FIX: Rediseño de storage_counters con (scope, day) como PRIMARY KEY
+      - day=1970-01-01 → total acumulado (quotas rápidas, 1 query)
+      - day=<fecha real> → delta diario (gráficas time-series)
+      - Una sola tabla, mismo patrón que traffic_counters + traffic_monthly
+      - ReconstructStorageHistory() reconstruye historial desde total + deltas
+      - NOTA: historial empieza a acumularse desde el deploy
+
+
+## VERIFICADO OK (2026-03-26)
+
+[ok] Sysadmin: gráficas de tráfico (system-traffic)
+     - Backend devuelve array con datetime + 6 tipos de tráfico
+     - Frontend parsea correctamente los 6 campos con guiones
+     - queryTrafficStats() agrupa por day/week/month correctamente
+
+[ok] Sysadmin: tabla de tráfico por org (org-traffic)
+     - Backend devuelve org_traffic_list con upload_bytes/download_bytes/total_bytes
+     - Frontend TrafficTableBody renderiza 4 columnas para type='org'
+     - Sorting server-side funciona con sortTrafficRows()
+
+[ok] Sysadmin: tabla de tráfico por usuario (user-traffic)
+     - Backend devuelve user_monthly_traffic_list con 6 campos per-type
+     - Frontend TrafficTableBody renderiza 7 columnas para type='user'
+     - Sorting server-side funciona
+
+[ok] Org-admin: gráficas de tráfico (system-traffic)
+     - Usa orgAdminStatisticSystemTraffic() → queryTrafficStats(orgUUID)
+     - Mismo formato que sysadmin, funciona correctamente
+
+[ok] Org-admin: gráfica de storage (total-storage)
+     - Usa orgAdminStatisticStorages() → OrgStatisticStorage
+     - Devuelve snapshot actual (línea plana — limitación conocida, no bug)
+
+[ok] Org-admin: tabla de tráfico por usuario (user-traffic)
+     - CORREGIDO: ahora usa traffic_counters con desglose por tipo
+     - Matching perfecto con frontend
+
+[ok] MainPanelTopbar en org-admin no necesita props
+     - Solo usa children y search (opcionales), statistics no los pasa
+     - No es bug
+
+
+## LIMITACIONES CONOCIDAS (no son bugs)
+
+[ ] Storage charts sin historial previo al deploy
+    - storage_counters registra deltas diarios desde el primer deploy
+    - Días sin datos de delta muestran el valor actual (aproximación correcta)
+    - Con el tiempo, la gráfica reflejará cambios reales día a día
+
+[ ] Active Users endpoint no implementado (org-admin)
+    - Devuelve notImplemented
+    - GET /org/:org_id/admin/statistics/active-users/
+
+[ ] File Operations endpoint no implementado (org-admin)
+    - Devuelve notImplemented
+    - GET /org/:org_id/admin/statistics/file-operations/
+
+[ ] Paginación in-memory para org-traffic y user-traffic
+    - Lee TODAS las orgs/usuarios, ordena en Go, luego pagina
+    - Funciona pero será lento con miles de orgs
+    - Optimizar si hay problemas de rendimiento
+
+
+## FRONTEND PARCIAL O AUSENTE (Backend listo)
+
+[ ] Warning de quota al usuario
+    - Backend envía header X-Quota-Warning cuando uso >80%
+    - Frontend no consume este header para mostrar avisos/toast/banner
+    - Afecta: uploads y downloads
+
+[ ] Mensajes de error de quota específicos
+    - Backend devuelve 403 genérico "quota exceeded"
+    - Frontend no distingue qué quota se excedió (storage vs traffic vs max_users)
+    - No hay guía al usuario sobre qué hacer (contactar admin, liberar espacio, etc.)
+
+[ ] Vista personal de quota para usuario regular
+    - Endpoint GET /api/v2.1/subscription/ existe y devuelve datos
+    - No hay página en account settings para que el usuario vea su consumo
+    - El usuario no sabe cuánto ha usado ni cuánto le queda
+
+[ ] UI de configuración de traffic quota por organización
+    - Backend soporta traffic_quota, traffic_upload_quota, traffic_download_quota
+    - No hay formulario en sysadmin para editarlos (solo vía API directa)
+    - Los campos se leen pero no se pueden modificar desde el panel
+
+[ ] Visualización de herencia de quota usuario→org
+    - Backend: si usuario no tiene límite propio, usa el de la org
+    - No hay UI que muestre esta herencia ni que permita override claro
+
+
+## NO IMPLEMENTADO
+
+[ ] Notificaciones por email/in-app
+    - No hay alerta al llegar a 80%, 90%, 100% de quota
+    - Ni para el usuario ni para el admin de la org
+    - Solo se detecta en el momento de la operación
+
+[ ] Dashboard de riesgo de quotas
+    - No hay vista para ver qué orgs/usuarios están cerca del límite
+    - Admin tiene que revisar org por org manualmente
+    - Sería útil una tabla ordenable por % de uso
+
+[ ] Audit log de cambios de quota
+    - No se registra quién cambió qué quota ni cuándo
+    - Sin trazabilidad para compliance
+
+[ ] Métricas de drops del recorder
+    - Si se saturan las 256 goroutines del recorder, se descartan registros silenciosamente
+    - No hay logging ni métricas de esto
+    - Potencial pérdida de datos de tráfico sin que nadie lo sepa
+
+
+## DECISIONES PENDIENTES
+
+[ ] Paid plan = soft warning solamente
+    - Uploads/downloads PASAN aunque se exceda la quota en plan de pago
+    - Solo se envía warning. ¿Es el comportamiento deseado?
+    - Revisar si debería haber un hard limit también para paid
+
+
+## PRIORIDAD SUGERIDA
+
+1. [DONE] Verificar y corregir estadísticas sysadmin + org-admin
+2. [DONE] Storage time-series (storage_counters rediseñado con day)
+3. Consumir X-Quota-Warning en frontend (banners/toasts)
+4. Mensajes de error específicos por tipo de quota
+5. Vista personal de uso para usuario regular
+6. UI de configuración de traffic quota por org
+7. Notificaciones por email al 80%/100%

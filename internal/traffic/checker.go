@@ -260,7 +260,8 @@ func (c *Checker) readTrafficMonthly(orgID, month, scope string) (int64, error) 
 func (c *Checker) readStorageCounter(scope string) (int64, error) {
 	var bytes int64
 	err := c.session.Query(`
-		SELECT bytes_used FROM storage_counters WHERE scope = ?`, scope,
+		SELECT bytes_used FROM storage_counters WHERE scope = ? AND day = ?`,
+		scope, storageTotalDay,
 	).Scan(&bytes)
 	if err != nil {
 		return 0, err
