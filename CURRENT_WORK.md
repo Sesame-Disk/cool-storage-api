@@ -159,7 +159,7 @@ Admin share link list/delete fixed; upload links full feature (DB tables, user C
 
 ### 🔴 PRIORITY 3: Audit Logs & Activity Logs — PRIORITIZE NEXT
 
-**Status**: 🟡 Console-only stub exists, no persistence or API
+**Status**: 🟡 Partial foundations exist: `audit_log` for deletion events and `users.last_login_at` for latest successful login, but no historical login/file activity dataset or APIs
 **Details**: [docs/ADMIN-FEATURES.md](docs/ADMIN-FEATURES.md) § 3
 
 **Two related systems need implementation:**
@@ -170,10 +170,22 @@ Admin share link list/delete fixed; upload links full feature (DB tables, user C
 
 **What exists today:**
 - `internal/middleware/audit.go` — 13 action types defined, `AuditEvent` struct, console-only logging, 8 unit tests
+- `audit_log` table — persists deletion/compliance events for GC, groups, departments
+- `users.last_login_at` — real latest-login timestamp updated on successful auth and exposed in admin/org-admin user responses
 - Frontend UI components for both admin logs and user activity feed
 
-**What's needed:**
-- 5 new Cassandra tables (login_logs, file_access_logs, file_update_logs, permission_audit_logs, activities) with 90-day TTL
+**Next logical slice:**
+- Implement `login_logs` first as the bridge between point-in-time `last_login_at` and real historical audit/reporting
+- Reuse the successful-auth hooks already touching `users.last_login_at`
+- Expose login history to the existing admin login-log pages before expanding to file/activity logs
+
+**Explicit pending gap:**
+- `/sys/statistics/file/` and `/org/statistics-admin/file/` still cannot be made real without `file_update_logs` and `file_access_logs`
+- That dependency is separate from `login_logs`; login audit work does not unblock file-operation charts by itself
+- There is also a confirmed scope bug in org-admin statistics: traffic-based org-admin metrics can resolve to platform-wide aggregates when the org-admin shell is mounted with platform-org context
+
+**Remaining full backlog:**
+- 5 dedicated Cassandra tables (login_logs, file_access_logs, file_update_logs, permission_audit_logs, activities) with 90-day TTL
 - New `internal/api/v2/audit.go` handler file (~5 endpoints)
 - Async DB write integration (buffered channel pattern) across ~15 existing handlers
 - Wire up frontend pages to real API endpoints

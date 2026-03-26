@@ -1041,6 +1041,38 @@ CREATE TABLE IF NOT EXISTS audit_log (
 - Recent events for an org: `SELECT * FROM audit_log WHERE org_id = ? LIMIT 100`
 - Events by action: `SELECT * FROM audit_log WHERE org_id = ? AND timestamp > ? AND action = ? ALLOW FILTERING`
 
+**Scope note**: `audit_log` is not a general-purpose login/activity history store. It currently covers deletion/compliance events only.
+
+### Next Logical Audit Table: `login_logs`
+
+Now that `users.last_login_at` is persisted as the latest successful login timestamp, the next logical audit/reporting step is a dedicated immutable `login_logs` table.
+
+Suggested first version:
+
+```sql
+CREATE TABLE IF NOT EXISTS login_logs (
+        org_id UUID,
+        log_id TIMEUUID,
+        user_id UUID,
+        email TEXT,
+        name TEXT,
+        auth_source TEXT,
+        login_ip TEXT,
+        user_agent TEXT,
+        created_at TIMESTAMP,
+        PRIMARY KEY ((org_id), log_id)
+) WITH CLUSTERING ORDER BY (log_id DESC)
+    AND default_time_to_live = 7776000;
+```
+
+**Purpose**: Historical login audit trail and period reporting. Complements `users.last_login_at` instead of replacing it.
+
+**Query patterns**:
+- Recent login events for an org: `SELECT * FROM login_logs WHERE org_id = ? LIMIT 100`
+- Login history for a time window: `SELECT * FROM login_logs WHERE org_id = ? AND log_id > minTimeuuid(?) AND log_id < maxTimeuuid(?)`
+
+**Design note**: Start with successful login events only. Failed-login tracking can be added later if compliance requirements justify the extra write volume and schema fields.
+
 ---
 
 ## References

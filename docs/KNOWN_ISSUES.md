@@ -37,6 +37,8 @@ This document tracks all known bugs, limitations, and issues in SesameFS.
 | **Upload "Don't Replace" (Desktop Client)** | 🟡 Pending | Desktop client file browser "No" button (auto-rename) doesn't work. Client uses `update-link` vs `upload-link` to distinguish replace vs no-replace, but both map to same token/handler. Backend autorename infrastructure ready (`autoRenameIfExists`), needs token-level `Replace` flag to distinguish endpoints. Web "Don't replace" also broken (same root cause). See ISSUE-UPLOAD-REPLACE-01 below. |
 | **Org Logo Upload** | 🟡 Stub | `UpdateOrgLogo` in org_admin.go accepts the file but does not persist it to storage. Returns a static path from settings. Functional as a route placeholder until an asset storage backend is available. |
 | **Login Analytics History** | 🟡 Partial | `last_login` is now real and persisted in `users.last_login_at`, but there is still no historical login event dataset for trend analysis, login audit timelines, or period-based "users who logged in" charts. See ISSUE-LOGIN-ANALYTICS-01 below. |
+| **File Statistics Pages Are Still Stubbed** | 🟡 Pending | `/sys/statistics/file/` currently returns all-zero series and `/org/statistics-admin/file/` is still unimplemented. Real data depends on new `file_update_logs` and `file_access_logs` tables, not on `login_logs`. See ISSUE-FILE-STATS-01 below. |
+| **Org Admin Statistics Can Leak Platform Scope** | 🔴 Confirmed bug | When org-admin pages are mounted with platform-org context, traffic-based org-admin metrics can resolve to the global aggregate instead of a tenant scope. Affects at least org-admin traffic, org-admin per-user traffic, and org-admin active-users. See ISSUE-ORG-STATS-SCOPE-01 below. |
 
 ### 🟡 SeaDrive 3.x Missing Endpoints (Non-fatal, but degrade UX)
 | Issue | Status | Notes |
@@ -152,6 +154,93 @@ There is still no historical login events table, which means the system cannot a
 
 - Add a dedicated login-events dataset if login audit/history becomes a product requirement
 - Keep using traffic-based activity metrics for period charts until real login analytics exist
+
+---
+
+### ISSUE-FILE-STATS-01: File Statistics Screens Have No Real Event Dataset Yet
+
+**Status**: 🟡 Pending (2026-03-26)
+**Severity**: Medium — screens exist but do not provide trustworthy operational data
+**Affected**: `/sys/statistics/file/`, `/org/statistics-admin/file/`, backend `AdminStatisticFiles`, backend `OrgStatisticFiles`
+
+#### Problem
+
+The file statistics pages are present in the frontend, but the backend does not yet have a real historical event source for file operations.
+
+Current behavior:
+
+- sysadmin `GET /api/v2.1/admin/statistics/file-operations/` returns a date range filled with zeros
+- org-admin `GET /api/v2.1/org/:org_id/admin/statistics/file-operations/` is still not implemented
+
+These screens cannot be fixed with `users.last_login_at` or a future `login_logs` table because they are about file operations, not authentication.
+
+#### Required Data Sources
+
+To make these screens real, SesameFS needs file-event datasets such as:
+
+- `file_update_logs` for `added`, `modified`, `deleted`
+- `file_access_logs` for `visited`
+
+An optional `activities` table can support dashboard feeds and broader event browsing, but the file-statistics charts specifically depend on file event history.
+
+#### Remaining Work
+
+- Add immutable file event tables (`file_update_logs`, `file_access_logs`)
+- Write file operation events from upload/create/edit/delete/move/rename/download/preview handlers
+- Implement real aggregation in `AdminStatisticFiles`
+- Implement `OrgStatisticFiles` using the same event source scoped by org
+- Keep the UI treated as pending/stubbed until those tables exist
+
+#### Related Docs
+
+- `docs/ADMIN-FEATURES.md`
+- `docs/CURRENT_WORK.md`
+
+---
+
+### ISSUE-ORG-STATS-SCOPE-01: Org-Admin Statistics Can Resolve to Platform-Wide Aggregates
+
+**Status**: 🔴 Confirmed bug (2026-03-26)
+**Severity**: High — tenant-scoped admin views can show platform-wide data under the wrong context
+**Affected**: `/org/statistics-admin/traffic/`, org-admin user traffic table, `/org/statistics-admin/active-users/`
+
+#### Problem
+
+The org-admin frontend reads its `orgID` from the org-admin SPA shell injection (`window.org.pageOptions.orgID`). When that shell is served in platform-org context, the injected `orgID` becomes the platform UUID (`00000000-0000-0000-0000-000000000000`).
+
+For traffic-based metrics, that UUID is not just another org value: it is also the sentinel used by backend helpers for platform-wide aggregate partitions.
+
+As a result, some org-admin statistics can collapse to platform-wide values instead of tenant-scoped values.
+
+#### Confirmed Affected Metrics
+
+- org-admin traffic time series
+- org-admin per-user traffic table
+- org-admin active-users time series
+
+#### Not Confirmed With The Same Failure Mode
+
+- org-admin storage time series appears to remain tenant-scoped because it uses `org:<orgID>` storage scopes rather than the traffic aggregate sentinel
+- org-admin file statistics are still pending/unimplemented, so they are not currently part of this leak
+
+#### Root Cause
+
+- `serveOrgAdminPanel` injects org-admin context from the authenticated user session
+- platform org uses the nil UUID / all-zero UUID
+- traffic/active-user statistics helpers treat that same UUID as the platform-wide aggregate partition
+
+This is a scope-boundary bug, not a traffic math bug.
+
+#### Remaining Work
+
+- Decide the product rule for platform users opening `/org/...`
+- Ensure org-admin routes never execute against the platform aggregate scope by accident
+- Add regression tests for org-admin statistics with platform-org vs tenant-org contexts
+
+#### Related Docs
+
+- `docs/CURRENT_WORK.md`
+- `docs/IMPLEMENTATION_STATUS.md`
 
 ---
 

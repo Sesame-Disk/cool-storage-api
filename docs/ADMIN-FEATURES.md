@@ -1,6 +1,6 @@
 # Admin Features — Library Management, Link Management, Org Admin, Audit Logs
 
-**Last Updated**: 2026-03-21
+**Last Updated**: 2026-03-26
 **Status**: Library Management ✅ DONE, Link Management ✅ DONE, Sharing Stubs ✅ DONE, Org Management ✅ DONE, Org Admin Panel ✅ DONE, Superadmin Departments ✅ DONE, Custom Share Permissions ✅ DONE, Audit Logs pending
 
 ---
@@ -335,17 +335,48 @@ Custom share permissions allow library owners to define fine-grained access cont
 ### What Exists
 
 - **Middleware**: `internal/middleware/audit.go` — defines action types and basic structure, but **only logs to console** (no database persistence)
+- **Deletion audit persistence**: `audit_log` Cassandra table is already live for GC / group / department deletion events
+- **Point-in-time login state**: `users.last_login_at` is now updated on successful login/session creation and exposed in admin/org-admin responses
 - **Stub endpoint**: `GET /activities` returns empty `{"events": []}` (in `internal/api/server.go:1173`)
 - **Frontend pages**: Full UI in `frontend/src/pages/sys-admin/logs-page/` — `login-logs.js`, `file-access-logs.js`, `file-update-logs.js`, `share-permission-logs.js`
 - **Dashboard**: `frontend/src/pages/dashboard/files-activities.js` — calls `seafileAPI.listActivities()`
 - **seafile-js methods**: `sysAdminListLoginLogs`, `sysAdminListFileAccessLogs`, `sysAdminListFileUpdateLogs`, `sysAdminListSharePermissionLogs`, `sysAdminListAdminLogs`, `listActivities`
 - **API-REFERENCE.md**: Documents planned `activities` table schema (line 627) but never implemented
 
-### What's Missing — Everything
+### Recommended Next Slice
+
+The audit/logging backlog is no longer a pure greenfield problem. There are now two useful foundations already in place:
+
+- `users.last_login_at` answers "when did this user last authenticate successfully?"
+- `audit_log` covers destructive lifecycle events for compliance/troubleshooting
+
+The next logical step is to add a dedicated `login_logs` table first, before tackling the broader file-access / file-update / activities backlog. That closes the highest-value remaining gap between point-in-time user state and real historical audit/reporting.
+
+**Why `login_logs` first:**
+
+- It turns the new `last_login_at` field into a real historical trail instead of a single mutable timestamp.
+- It unlocks admin-facing login audit pages that already exist in the frontend.
+- It enables period queries such as "who logged in this week/month" without inferring activity from traffic counters.
+- It is much smaller in scope than the full 5-table audit/activity rollout.
+
+**Suggested phase split:**
+
+1. `login_logs` table + write path on successful authentication
+2. Admin/org-admin login-log list endpoints
+3. Optional aggregation/reporting queries for historical login analytics
+4. Remaining audit tables (`file_access_logs`, `file_update_logs`, `permission_audit_logs`, `activities`)
+
+**Important separation of concerns:**
+
+- `login_logs` is for authentication audit/history
+- `file_update_logs` and `file_access_logs` are what unblock `/sys/statistics/file/` and `/org/statistics-admin/file/`
+- file statistics should not be derived from `last_login_at` or `login_logs`
+
+### What's Missing — Historical Event Persistence + APIs
 
 #### Database Tables
 
-5 new Cassandra tables needed (all use TIMEUUID clustering for time-ordered queries):
+The full backlog still needs 5 dedicated Cassandra tables (all use TIMEUUID clustering for time-ordered queries), but `login_logs` should be treated as the first incremental delivery:
 
 ```cql
 -- 1. Login logs
@@ -471,6 +502,39 @@ Where to insert audit log writes in existing handlers:
 | Delete share link | `internal/api/v2/share_links.go` | `DeleteShareLink()` | `permission_audit_logs` |
 | Library create | `internal/api/v2/libraries.go` | `CreateLibrary()` | `activities` |
 | Library delete | `internal/api/v2/libraries.go` | `DeleteLibrary()` | `activities` |
+
+### Login Audit Design Notes
+
+For the first slice, prefer a narrow implementation centered on successful login events:
+
+- Keep `users.last_login_at` as the authoritative "latest successful login" field for user detail pages.
+- Write one immutable row per successful authentication into `login_logs`.
+- Reuse the same auth hooks already used to update `last_login_at`, so the write paths stay centralized.
+- Treat failed-login logging as a later enhancement unless product/compliance requirements demand it immediately.
+
+Minimum useful columns for the first version:
+
+- `org_id`, `log_id`, `user_id`
+- `email`, `name`
+- `auth_source` (`oidc_web`, `oidc_desktop`, `dev_token`, etc.)
+- `login_ip`, `user_agent`
+- `created_at`
+
+This gives a practical audit trail without forcing the full activity-feed project into the same delivery.
+
+### File Statistics Dependency Note
+
+The existing frontend pages for file statistics already exist, but they do not have a real backend dataset yet:
+
+- sysadmin file statistics currently return zero-filled buckets
+- org-admin file statistics are still unimplemented
+
+To make those charts authoritative, the backend needs immutable file event history:
+
+- `file_update_logs` for `added`, `modified`, `deleted`
+- `file_access_logs` for `visited`
+
+That work is adjacent to the broader audit backlog, but distinct from the login-audit slice.
 
 #### Response Formats
 
