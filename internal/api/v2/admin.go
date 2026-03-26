@@ -1968,6 +1968,11 @@ type adminUserResponse struct {
 	TrafficDownloadQuota int64  `json:"traffic_download_quota"`
 	CreateTime           string `json:"create_time"`
 	LastLogin            string `json:"last_login"`
+	// Org-level quota limits (populated only in single-user responses).
+	OrgStorageQuota         int64 `json:"org_storage_quota,omitempty"`
+	OrgTrafficQuota         int64 `json:"org_traffic_quota,omitempty"` // combined upload+download
+	OrgTrafficUploadQuota   int64 `json:"org_traffic_upload_quota,omitempty"`
+	OrgTrafficDownloadQuota int64 `json:"org_traffic_download_quota,omitempty"`
 }
 
 func makeAdminUserResponse(email, name, role, status string, quotaBytes, usedBytes int64, createdAt, lastLoginAt time.Time) adminUserResponse {
@@ -2305,6 +2310,11 @@ func (h *AdminHandler) GetUserByEmail(c *gin.Context, email string) {
 	resp := makeAdminUserResponse(email, name, role, status, quotaBytes, traffic.ReadStorageUsed(h.db, fmt.Sprintf("user:%s:%s", userOrgID, userID)), createdAt, lastLoginAt)
 	resp.TrafficUploadQuota = trafficUploadQuota
 	resp.TrafficDownloadQuota = trafficDownloadQuota
+	oq, _ := readOrgQuotas(h.db, userOrgID) // best-effort for display
+	resp.OrgStorageQuota = oq.StorageQuota
+	resp.OrgTrafficQuota = oq.TrafficQuota
+	resp.OrgTrafficUploadQuota = oq.TrafficUploadQuota
+	resp.OrgTrafficDownloadQuota = oq.TrafficDownloadQuota
 	c.JSON(http.StatusOK, resp)
 }
 
@@ -2397,39 +2407,60 @@ func (h *AdminHandler) UpdateUserByEmail(c *gin.Context, email string) {
 		}
 	}
 
+	// Parse new quota values for validation before writing.
+	newQuota := currentQuota
 	if quotaStr != "" {
-		if quota, err := strconv.ParseInt(quotaStr, 10, 64); err == nil {
-			currentQuota = quota
-			if err := h.db.Session().Query(`
-				UPDATE users SET quota_bytes = ? WHERE org_id = ? AND user_id = ?
-			`, quota, userOrgID, userID).Exec(); err != nil {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update user"})
-				return
-			}
+		if q, err := strconv.ParseInt(quotaStr, 10, 64); err == nil {
+			newQuota = q
 		}
 	}
-
+	newUploadQuota := currentTrafficUploadQuota
 	if trafficUploadQuotaStr != "" {
-		if quota, err := strconv.ParseInt(trafficUploadQuotaStr, 10, 64); err == nil {
-			currentTrafficUploadQuota = quota
-			if err := h.db.Session().Query(`
-				UPDATE users SET traffic_upload_quota = ? WHERE org_id = ? AND user_id = ?
-			`, quota, userOrgID, userID).Exec(); err != nil {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update user"})
-				return
-			}
+		if q, err := strconv.ParseInt(trafficUploadQuotaStr, 10, 64); err == nil {
+			newUploadQuota = q
+		}
+	}
+	newDownloadQuota := currentTrafficDownloadQuota
+	if trafficDownloadQuotaStr != "" {
+		if q, err := strconv.ParseInt(trafficDownloadQuotaStr, 10, 64); err == nil {
+			newDownloadQuota = q
 		}
 	}
 
-	if trafficDownloadQuotaStr != "" {
-		if quota, err := strconv.ParseInt(trafficDownloadQuotaStr, 10, 64); err == nil {
-			currentTrafficDownloadQuota = quota
-			if err := h.db.Session().Query(`
-				UPDATE users SET traffic_download_quota = ? WHERE org_id = ? AND user_id = ?
-			`, quota, userOrgID, userID).Exec(); err != nil {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update user"})
-				return
-			}
+	// Validate user quotas against org limits.
+	oq, quotaErr := readAndValidateUserQuotaLimits(h.db, userOrgID, newQuota, newUploadQuota, newDownloadQuota)
+	if quotaErr != nil {
+		c.JSON(quotaErr.StatusCode, gin.H{"error": quotaErr.Message})
+		return
+	}
+
+	if newQuota != currentQuota {
+		currentQuota = newQuota
+		if err := h.db.Session().Query(`
+			UPDATE users SET quota_bytes = ? WHERE org_id = ? AND user_id = ?
+		`, currentQuota, userOrgID, userID).Exec(); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update user"})
+			return
+		}
+	}
+
+	if newUploadQuota != currentTrafficUploadQuota {
+		currentTrafficUploadQuota = newUploadQuota
+		if err := h.db.Session().Query(`
+			UPDATE users SET traffic_upload_quota = ? WHERE org_id = ? AND user_id = ?
+		`, currentTrafficUploadQuota, userOrgID, userID).Exec(); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update user"})
+			return
+		}
+	}
+
+	if newDownloadQuota != currentTrafficDownloadQuota {
+		currentTrafficDownloadQuota = newDownloadQuota
+		if err := h.db.Session().Query(`
+			UPDATE users SET traffic_download_quota = ? WHERE org_id = ? AND user_id = ?
+		`, currentTrafficDownloadQuota, userOrgID, userID).Exec(); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update user"})
+			return
 		}
 	}
 
@@ -2450,6 +2481,10 @@ func (h *AdminHandler) UpdateUserByEmail(c *gin.Context, email string) {
 	resp := makeAdminUserResponse(email, currentName, currentRole, currentStatus, currentQuota, traffic.ReadStorageUsed(h.db, fmt.Sprintf("user:%s:%s", userOrgID, userID)), currentCreated, currentLastLogin)
 	resp.TrafficUploadQuota = currentTrafficUploadQuota
 	resp.TrafficDownloadQuota = currentTrafficDownloadQuota
+	resp.OrgStorageQuota = oq.StorageQuota
+	resp.OrgTrafficQuota = oq.TrafficQuota
+	resp.OrgTrafficUploadQuota = oq.TrafficUploadQuota
+	resp.OrgTrafficDownloadQuota = oq.TrafficDownloadQuota
 	c.JSON(http.StatusOK, resp)
 }
 

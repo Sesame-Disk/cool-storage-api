@@ -127,7 +127,7 @@ class UserItem extends React.Component {
       case -2:
         return '--';
       default: // data > 0
-        return Utils.formatSize({ bytes: data });
+        return Utils.bytesToSize(data);
     }
   };
 
@@ -242,7 +242,7 @@ class UserItem extends React.Component {
               />
             }
           </td>
-          <td>{`${Utils.formatSize({ bytes: user.quota_usage })} / ${this.getQuotaTotal(user.quota_total)}`}</td>
+          <td>{`${Utils.bytesToSize(user.quota_usage)} / ${this.getQuotaTotal(user.quota_total)}`}</td>
           <td>
             {user.ctime} /
             <br />

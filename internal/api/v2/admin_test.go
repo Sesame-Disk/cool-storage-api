@@ -608,6 +608,50 @@ func TestAdminUserResponse_JSONFormat(t *testing.T) {
 	assert.Equal(t, len(expectedKeys), len(parsed), "unexpected extra keys in JSON output")
 }
 
+func TestAdminUserResponse_JSONFormatWithOrgQuotaFields(t *testing.T) {
+	resp := adminUserResponse{
+		Email:                   "test@example.com",
+		Name:                    "Test User",
+		Status:                  "active",
+		IsActive:                true,
+		Role:                    "user",
+		QuotaTotal:              1099511627776,
+		QuotaUsage:              524288,
+		TrafficUploadQuota:      2097152,
+		TrafficDownloadQuota:    4194304,
+		OrgStorageQuota:         2199023255552,
+		OrgTrafficQuota:         10737418240,
+		OrgTrafficUploadQuota:   5368709120,
+		OrgTrafficDownloadQuota: 8589934592,
+		CreateTime:              "2025-06-15T12:00:00Z",
+		LastLogin:               "",
+	}
+
+	data, err := json.Marshal(resp)
+	assert.NoError(t, err)
+
+	var parsed map[string]interface{}
+	err = json.Unmarshal(data, &parsed)
+	assert.NoError(t, err)
+
+	assert.Equal(t, float64(2199023255552), parsed["org_storage_quota"])
+	assert.Equal(t, float64(10737418240), parsed["org_traffic_quota"])
+	assert.Equal(t, float64(5368709120), parsed["org_traffic_upload_quota"])
+	assert.Equal(t, float64(8589934592), parsed["org_traffic_download_quota"])
+
+	expectedKeys := []string{
+		"email", "name", "status", "is_active", "is_staff", "role", "admin_role",
+		"quota_total", "quota_usage", "traffic_upload_quota", "traffic_download_quota",
+		"org_storage_quota", "org_traffic_quota", "org_traffic_upload_quota", "org_traffic_download_quota",
+		"create_time", "last_login",
+	}
+	for _, key := range expectedKeys {
+		_, exists := parsed[key]
+		assert.True(t, exists, "expected key %q in JSON output", key)
+	}
+	assert.Equal(t, len(expectedKeys), len(parsed), "unexpected extra keys in JSON output")
+}
+
 // --- Pagination logic validation tests ---
 
 func TestPaginationParsingLogic(t *testing.T) {

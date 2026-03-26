@@ -3,6 +3,7 @@ package v2
 import (
 	"fmt"
 	"log"
+	"net/http"
 	"time"
 
 	"github.com/Sesame-Disk/sesamefs/internal/traffic"
@@ -510,4 +511,106 @@ func restoreDeletedLibrary(db interface{ Session() *gocql.Session }, orgID, owne
 	// Re-add the library's storage to aggregates.
 	traffic.AdjustAggregateStorageCounters(db, orgID, ownerID, libraryID, true)
 	return nil
+}
+
+// orgQuotas holds an organization's quota limits.
+type orgQuotas struct {
+	StorageQuota         int64
+	TrafficQuota         int64 // combined upload+download
+	TrafficUploadQuota   int64
+	TrafficDownloadQuota int64
+}
+
+var readOrgQuotasFn = readOrgQuotas
+
+type quotaValidationError struct {
+	StatusCode int
+	Message    string
+}
+
+func (e *quotaValidationError) Error() string {
+	if e == nil {
+		return ""
+	}
+	return e.Message
+}
+
+// readOrgQuotas fetches the quota limits for an organization.
+// Returns the quotas and an error if the DB read failed (as opposed to
+// "org has no limits").  Callers that guard writes MUST check the error
+// and reject the request instead of silently allowing unlimited quotas.
+func readOrgQuotas(db interface{ Session() *gocql.Session }, orgID string) (orgQuotas, error) {
+	var q orgQuotas
+	err := db.Session().Query(
+		`SELECT storage_quota, traffic_quota, traffic_upload_quota, traffic_download_quota FROM organizations WHERE org_id = ?`,
+		orgID,
+	).Scan(&q.StorageQuota, &q.TrafficQuota, &q.TrafficUploadQuota, &q.TrafficDownloadQuota)
+	return q, err
+}
+
+func readAndValidateUserQuotaLimits(db interface{ Session() *gocql.Session }, orgID string, storageQuota, uploadQuota, downloadQuota int64) (orgQuotas, *quotaValidationError) {
+	oq, err := readOrgQuotasFn(db, orgID)
+	if err != nil {
+		return orgQuotas{}, &quotaValidationError{
+			StatusCode: http.StatusInternalServerError,
+			Message:    "failed to read organization quotas",
+		}
+	}
+	if msg := validateUserQuotaAgainstOrg(storageQuota, oq.StorageQuota, "storage quota"); msg != "" {
+		return oq, &quotaValidationError{
+			StatusCode: http.StatusBadRequest,
+			Message:    msg,
+		}
+	}
+	if msg := validateUserTrafficQuotasAgainstOrg(uploadQuota, downloadQuota, oq); msg != "" {
+		return oq, &quotaValidationError{
+			StatusCode: http.StatusBadRequest,
+			Message:    msg,
+		}
+	}
+	return oq, nil
+}
+
+// validateUserQuotaAgainstOrg checks that the given user quota does not exceed
+// the corresponding org quota. orgLimit <= 0 means unlimited (no cap).
+// Returns an error message or "" if valid.
+func validateUserQuotaAgainstOrg(userValue, orgLimit int64, field string) string {
+	if orgLimit <= 0 {
+		return "" // org has no limit
+	}
+	if userValue <= 0 {
+		return "" // user value is default/inherit/unlimited
+	}
+	if userValue > orgLimit {
+		return fmt.Sprintf("%s (%d) exceeds organization limit (%d)", field, userValue, orgLimit)
+	}
+	return ""
+}
+
+// validateUserTrafficQuotasAgainstOrg validates that user traffic quotas don't
+// exceed the org's per-direction limits, AND that their sum doesn't exceed the
+// org's combined traffic limit (if set).
+func validateUserTrafficQuotasAgainstOrg(uploadQuota, downloadQuota int64, oq orgQuotas) string {
+	// Per-direction checks.
+	if msg := validateUserQuotaAgainstOrg(uploadQuota, oq.TrafficUploadQuota, "upload quota"); msg != "" {
+		return msg
+	}
+	if msg := validateUserQuotaAgainstOrg(downloadQuota, oq.TrafficDownloadQuota, "download quota"); msg != "" {
+		return msg
+	}
+	// Combined check: each individual value must fit, AND their sum must fit.
+	if oq.TrafficQuota > 0 {
+		if uploadQuota > 0 && uploadQuota > oq.TrafficQuota {
+			return fmt.Sprintf("upload quota (%d) exceeds organization combined traffic limit (%d)", uploadQuota, oq.TrafficQuota)
+		}
+		if downloadQuota > 0 && downloadQuota > oq.TrafficQuota {
+			return fmt.Sprintf("download quota (%d) exceeds organization combined traffic limit (%d)", downloadQuota, oq.TrafficQuota)
+		}
+		// Sum check: if both are set, their sum must not exceed the combined limit.
+		if uploadQuota > 0 && downloadQuota > 0 && uploadQuota+downloadQuota > oq.TrafficQuota {
+			return fmt.Sprintf("upload + download quota sum (%d) exceeds organization combined traffic limit (%d)",
+				uploadQuota+downloadQuota, oq.TrafficQuota)
+		}
+	}
+	return ""
 }

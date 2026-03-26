@@ -331,6 +331,11 @@ type orgUserRow struct {
 	LastLogin            string `json:"last_login"`
 	OrgID                string `json:"org_id"`
 	AvatarURL            string `json:"avatar_url"`
+	// Org-level quota limits (populated only in single-user responses).
+	OrgStorageQuota         int64 `json:"org_storage_quota,omitempty"`
+	OrgTrafficQuota         int64 `json:"org_traffic_quota,omitempty"` // combined upload+download
+	OrgTrafficUploadQuota   int64 `json:"org_traffic_upload_quota,omitempty"`
+	OrgTrafficDownloadQuota int64 `json:"org_traffic_download_quota,omitempty"`
 }
 
 func buildOrgUserRow(email, name, role, status, orgID string, quota, used int64, created, lastLogin time.Time) orgUserRow {
@@ -683,7 +688,13 @@ func (h *OrgAdminHandler) GetOrgUser(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusOK, buildOrgUserRowWithTraffic(email, name, role, status, targetOrgID, quota, traffic.ReadStorageUsed(h.db, fmt.Sprintf("user:%s:%s", targetOrgID, userID)), trafficUploadQuota, trafficDownloadQuota, created, lastLogin))
+	row := buildOrgUserRowWithTraffic(email, name, role, status, targetOrgID, quota, traffic.ReadStorageUsed(h.db, fmt.Sprintf("user:%s:%s", targetOrgID, userID)), trafficUploadQuota, trafficDownloadQuota, created, lastLogin)
+	oq, _ := readOrgQuotas(h.db, targetOrgID) // best-effort for display
+	row.OrgStorageQuota = oq.StorageQuota
+	row.OrgTrafficQuota = oq.TrafficQuota
+	row.OrgTrafficUploadQuota = oq.TrafficUploadQuota
+	row.OrgTrafficDownloadQuota = oq.TrafficDownloadQuota
+	c.JSON(http.StatusOK, row)
 }
 
 // UpdateOrgUser updates an org user's active status, staff role, name, or quota.
@@ -766,6 +777,27 @@ func (h *OrgAdminHandler) UpdateOrgUser(c *gin.Context) {
 		}
 	}
 
+	// Parse traffic quota values early so we can validate all quotas together.
+	newUploadQuota := trafficUploadQuota
+	newDownloadQuota := trafficDownloadQuota
+	if v := c.Request.FormValue("traffic_upload_quota"); v != "" {
+		if q, err := strconv.ParseInt(v, 10, 64); err == nil {
+			newUploadQuota = q
+		}
+	}
+	if v := c.Request.FormValue("traffic_download_quota"); v != "" {
+		if q, err := strconv.ParseInt(v, 10, 64); err == nil {
+			newDownloadQuota = q
+		}
+	}
+
+	// Validate user quotas against org limits.
+	oq, quotaErr := readAndValidateUserQuotaLimits(h.db, targetOrgID, quota, newUploadQuota, newDownloadQuota)
+	if quotaErr != nil {
+		c.JSON(quotaErr.StatusCode, gin.H{"error": quotaErr.Message})
+		return
+	}
+
 	if role != originalRole || name != originalName || quota != originalQuota {
 		batch := h.db.Session().Batch(gocql.LoggedBatch)
 		if role != originalRole {
@@ -791,33 +823,34 @@ func (h *OrgAdminHandler) UpdateOrgUser(c *gin.Context) {
 		_ = v
 	}
 
-	if v := c.Request.FormValue("traffic_upload_quota"); v != "" {
-		if q, err := strconv.ParseInt(v, 10, 64); err == nil {
-			trafficUploadQuota = q
-			if err := h.db.Session().Query(
-				`UPDATE users SET traffic_upload_quota = ? WHERE org_id = ? AND user_id = ?`,
-				q, targetOrgID, userID,
-			).Exec(); err != nil {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update user"})
-				return
-			}
+	if newUploadQuota != trafficUploadQuota {
+		trafficUploadQuota = newUploadQuota
+		if err := h.db.Session().Query(
+			`UPDATE users SET traffic_upload_quota = ? WHERE org_id = ? AND user_id = ?`,
+			trafficUploadQuota, targetOrgID, userID,
+		).Exec(); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update user"})
+			return
 		}
 	}
 
-	if v := c.Request.FormValue("traffic_download_quota"); v != "" {
-		if q, err := strconv.ParseInt(v, 10, 64); err == nil {
-			trafficDownloadQuota = q
-			if err := h.db.Session().Query(
-				`UPDATE users SET traffic_download_quota = ? WHERE org_id = ? AND user_id = ?`,
-				q, targetOrgID, userID,
-			).Exec(); err != nil {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update user"})
-				return
-			}
+	if newDownloadQuota != trafficDownloadQuota {
+		trafficDownloadQuota = newDownloadQuota
+		if err := h.db.Session().Query(
+			`UPDATE users SET traffic_download_quota = ? WHERE org_id = ? AND user_id = ?`,
+			trafficDownloadQuota, targetOrgID, userID,
+		).Exec(); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update user"})
+			return
 		}
 	}
 
-	c.JSON(http.StatusOK, buildOrgUserRowWithTraffic(email, name, role, status, targetOrgID, quota, traffic.ReadStorageUsed(h.db, fmt.Sprintf("user:%s:%s", targetOrgID, userID)), trafficUploadQuota, trafficDownloadQuota, created, lastLogin))
+	row := buildOrgUserRowWithTraffic(email, name, role, status, targetOrgID, quota, traffic.ReadStorageUsed(h.db, fmt.Sprintf("user:%s:%s", targetOrgID, userID)), trafficUploadQuota, trafficDownloadQuota, created, lastLogin)
+	row.OrgStorageQuota = oq.StorageQuota
+	row.OrgTrafficQuota = oq.TrafficQuota
+	row.OrgTrafficUploadQuota = oq.TrafficUploadQuota
+	row.OrgTrafficDownloadQuota = oq.TrafficDownloadQuota
+	c.JSON(http.StatusOK, row)
 }
 
 // DeleteOrgUser soft-deletes a user from the target org.

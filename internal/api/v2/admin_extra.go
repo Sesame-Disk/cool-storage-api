@@ -1131,51 +1131,86 @@ func (h *AdminHandler) AdminUpdateOrgUser(c *gin.Context) {
 		}
 	}
 
+	originalQuota := quotaBytes
 	if v := c.Request.FormValue("quota_total"); v != "" {
 		if q, err := strconv.ParseInt(v, 10, 64); err == nil {
 			quotaBytes = q
-			if err := h.db.Session().Query(`UPDATE users SET quota_bytes = ? WHERE org_id = ? AND user_id = ?`,
-				quotaBytes, targetOrgID, userID).Exec(); err != nil {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update user"})
-				return
-			}
 		}
 	}
 
+	var trafficUploadQuota, trafficDownloadQuota int64
+	// Read current traffic quotas.
+	_ = h.db.Session().Query(
+		`SELECT traffic_upload_quota, traffic_download_quota FROM users WHERE org_id = ? AND user_id = ?`,
+		targetOrgID, userID,
+	).Scan(&trafficUploadQuota, &trafficDownloadQuota)
+
+	newUploadQuota := trafficUploadQuota
+	newDownloadQuota := trafficDownloadQuota
 	if v := c.Request.FormValue("traffic_upload_quota"); v != "" {
 		if q, err := strconv.ParseInt(v, 10, 64); err == nil {
-			if err := h.db.Session().Query(`UPDATE users SET traffic_upload_quota = ? WHERE org_id = ? AND user_id = ?`,
-				q, targetOrgID, userID).Exec(); err != nil {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update user"})
-				return
-			}
+			newUploadQuota = q
+		}
+	}
+	if v := c.Request.FormValue("traffic_download_quota"); v != "" {
+		if q, err := strconv.ParseInt(v, 10, 64); err == nil {
+			newDownloadQuota = q
 		}
 	}
 
-	if v := c.Request.FormValue("traffic_download_quota"); v != "" {
-		if q, err := strconv.ParseInt(v, 10, 64); err == nil {
-			if err := h.db.Session().Query(`UPDATE users SET traffic_download_quota = ? WHERE org_id = ? AND user_id = ?`,
-				q, targetOrgID, userID).Exec(); err != nil {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update user"})
-				return
-			}
+	// Validate user quotas against org limits.
+	oq, quotaErr := readAndValidateUserQuotaLimits(h.db, targetOrgID, quotaBytes, newUploadQuota, newDownloadQuota)
+	if quotaErr != nil {
+		c.JSON(quotaErr.StatusCode, gin.H{"error": quotaErr.Message})
+		return
+	}
+
+	if quotaBytes != originalQuota {
+		if err := h.db.Session().Query(`UPDATE users SET quota_bytes = ? WHERE org_id = ? AND user_id = ?`,
+			quotaBytes, targetOrgID, userID).Exec(); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update user"})
+			return
 		}
+	}
+
+	if newUploadQuota != trafficUploadQuota {
+		if err := h.db.Session().Query(`UPDATE users SET traffic_upload_quota = ? WHERE org_id = ? AND user_id = ?`,
+			newUploadQuota, targetOrgID, userID).Exec(); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update user"})
+			return
+		}
+		trafficUploadQuota = newUploadQuota
+	}
+
+	if newDownloadQuota != trafficDownloadQuota {
+		if err := h.db.Session().Query(`UPDATE users SET traffic_download_quota = ? WHERE org_id = ? AND user_id = ?`,
+			newDownloadQuota, targetOrgID, userID).Exec(); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update user"})
+			return
+		}
+		trafficDownloadQuota = newDownloadQuota
 	}
 
 	isActive := IsUserUsable(status)
 	isOrgStaff := role == "admin" || role == "superadmin"
 
 	c.JSON(http.StatusOK, gin.H{
-		"email":        email,
-		"name":         name,
-		"status":       normalizeUserStatus(status),
-		"active":       isActive,
-		"is_org_staff": isOrgStaff,
-		"quota_usage":  traffic.ReadStorageUsed(h.db, fmt.Sprintf("user:%s:%s", targetOrgID, userID)),
-		"quota_total":  quotaBytes,
-		"create_time":  createdAt.Format(time.RFC3339),
-		"last_login":   formatOptionalTimestamp(lastLoginAt),
-		"org_id":       targetOrgID,
+		"email":                      email,
+		"name":                       name,
+		"status":                     normalizeUserStatus(status),
+		"active":                     isActive,
+		"is_org_staff":               isOrgStaff,
+		"quota_usage":                traffic.ReadStorageUsed(h.db, fmt.Sprintf("user:%s:%s", targetOrgID, userID)),
+		"quota_total":                quotaBytes,
+		"traffic_upload_quota":       trafficUploadQuota,
+		"traffic_download_quota":     trafficDownloadQuota,
+		"org_storage_quota":          oq.StorageQuota,
+		"org_traffic_quota":          oq.TrafficQuota,
+		"org_traffic_upload_quota":   oq.TrafficUploadQuota,
+		"org_traffic_download_quota": oq.TrafficDownloadQuota,
+		"create_time":                createdAt.Format(time.RFC3339),
+		"last_login":                 formatOptionalTimestamp(lastLoginAt),
+		"org_id":                     targetOrgID,
 	})
 }
 

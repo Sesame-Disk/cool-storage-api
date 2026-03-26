@@ -11,6 +11,10 @@ const propTypes = {
   quotaTotal: PropTypes.oneOfType([PropTypes.string, PropTypes.number]).isRequired,
   trafficUploadQuota: PropTypes.oneOfType([PropTypes.string, PropTypes.number]),
   trafficDownloadQuota: PropTypes.oneOfType([PropTypes.string, PropTypes.number]),
+  orgStorageQuota: PropTypes.number,
+  orgTrafficQuota: PropTypes.number, // combined upload+download
+  orgTrafficUploadQuota: PropTypes.number,
+  orgTrafficDownloadQuota: PropTypes.number,
   updateQuota: PropTypes.func.isRequired,
   toggleDialog: PropTypes.func.isRequired
 };
@@ -53,14 +57,44 @@ class SetOrgUserQuota extends React.Component {
     return Math.round(parsed * MB);
   };
 
+  exceedsOrgLimit = (valueBytes, orgLimitBytes) => {
+    return orgLimitBytes > 0 && valueBytes > 0 && valueBytes > orgLimitBytes;
+  };
+
   formSubmit = () => {
-    const { orgID, email } = this.props;
+    const { orgID, email, orgStorageQuota, orgTrafficQuota, orgTrafficUploadQuota, orgTrafficDownloadQuota } = this.props;
     const storageQuota = this.parseMegabytes(this.state.storageInputValue, 0);
     const uploadQuota = this.parseMegabytes(this.state.uploadInputValue, -1);
     const downloadQuota = this.parseMegabytes(this.state.downloadInputValue, -1);
 
     if (storageQuota === null || uploadQuota === null || downloadQuota === null) {
       this.setState({ formErrorMsg: gettext('Please enter a valid non-negative number.') });
+      return false;
+    }
+
+    if (this.exceedsOrgLimit(storageQuota, orgStorageQuota)) {
+      this.setState({ formErrorMsg: gettext('Storage quota exceeds organization limit.') });
+      return false;
+    }
+    if (this.exceedsOrgLimit(uploadQuota, orgTrafficUploadQuota)) {
+      this.setState({ formErrorMsg: gettext('Upload quota exceeds organization limit.') });
+      return false;
+    }
+    if (this.exceedsOrgLimit(downloadQuota, orgTrafficDownloadQuota)) {
+      this.setState({ formErrorMsg: gettext('Download quota exceeds organization limit.') });
+      return false;
+    }
+    // Combined traffic limit: each value and their sum.
+    if (this.exceedsOrgLimit(uploadQuota, orgTrafficQuota)) {
+      this.setState({ formErrorMsg: gettext('Upload quota exceeds organization combined traffic limit.') });
+      return false;
+    }
+    if (this.exceedsOrgLimit(downloadQuota, orgTrafficQuota)) {
+      this.setState({ formErrorMsg: gettext('Download quota exceeds organization combined traffic limit.') });
+      return false;
+    }
+    if (orgTrafficQuota > 0 && uploadQuota > 0 && downloadQuota > 0 && uploadQuota + downloadQuota > orgTrafficQuota) {
+      this.setState({ formErrorMsg: gettext('Upload + download quota sum exceeds organization combined traffic limit.') });
       return false;
     }
 
@@ -88,8 +122,18 @@ class SetOrgUserQuota extends React.Component {
     });
   };
 
+  formatOrgLimit = (quota) => {
+    if (!quota || quota <= 0) return null;
+    return Utils.bytesToSize(quota);
+  };
+
   render() {
     const { storageInputValue, uploadInputValue, downloadInputValue, formErrorMsg, submitBtnDisabled } = this.state;
+    const { orgStorageQuota, orgTrafficQuota, orgTrafficUploadQuota, orgTrafficDownloadQuota } = this.props;
+    const storageLimitStr = this.formatOrgLimit(orgStorageQuota);
+    const combinedLimitStr = this.formatOrgLimit(orgTrafficQuota);
+    const uploadLimitStr = this.formatOrgLimit(orgTrafficUploadQuota);
+    const downloadLimitStr = this.formatOrgLimit(orgTrafficDownloadQuota);
     return (
       <div className="modal show d-block" tabIndex="-1" style={{ backgroundColor: 'rgba(0,0,0,0.5)' }}>
         <div className="modal-dialog modal-dialog-centered">
@@ -109,7 +153,10 @@ class SetOrgUserQuota extends React.Component {
                     <InputGroupText>MB</InputGroupText>
                   </InputGroupAddon>
                 </InputGroup>
-                <p className="small text-secondary mt-2 mb-3">{gettext('Tip: 0 means default limit')}</p>
+                <p className="small text-secondary mt-2 mb-3">
+                  {gettext('Tip: 0 means default limit')}
+                  {storageLimitStr && ` — ${gettext('Organization limit')}: ${storageLimitStr}`}
+                </p>
 
                 <label className="mb-1">{gettext('Monthly upload quota')}</label>
                 <InputGroup>
@@ -118,7 +165,11 @@ class SetOrgUserQuota extends React.Component {
                     <InputGroupText>MB</InputGroupText>
                   </InputGroupAddon>
                 </InputGroup>
-                <p className="small text-secondary mt-2 mb-3">{gettext('Leave empty to inherit the organization limit.')}</p>
+                <p className="small text-secondary mt-2 mb-3">
+                  {gettext('Leave empty to inherit the organization limit.')}
+                  {uploadLimitStr && ` ${gettext('Organization limit')}: ${uploadLimitStr}`}
+                  {!uploadLimitStr && combinedLimitStr && ` ${gettext('Organization combined limit')}: ${combinedLimitStr}`}
+                </p>
 
                 <label className="mb-1">{gettext('Monthly download quota')}</label>
                 <InputGroup>
@@ -127,7 +178,11 @@ class SetOrgUserQuota extends React.Component {
                     <InputGroupText>MB</InputGroupText>
                   </InputGroupAddon>
                 </InputGroup>
-                <p className="small text-secondary mt-2 mb-2">{gettext('Leave empty to inherit the organization limit.')}</p>
+                <p className="small text-secondary mt-2 mb-2">
+                  {gettext('Leave empty to inherit the organization limit.')}
+                  {downloadLimitStr && ` ${gettext('Organization limit')}: ${downloadLimitStr}`}
+                  {!downloadLimitStr && combinedLimitStr && ` ${gettext('Organization combined limit')}: ${combinedLimitStr}`}
+                </p>
                 {formErrorMsg && <p className="error m-0 mt-2">{formErrorMsg}</p>}
               </React.Fragment>
             </div>

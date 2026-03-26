@@ -46,11 +46,13 @@ class Content extends Component {
 
   updateUploadDownloadRateLimit = (uploadOrDownload, value) => {
     if (uploadOrDownload === 'upload') {
-      this.props.updateUser('upload_rate_limit', value);
+      return this.props.updateUser('upload_rate_limit', value);
     }
     if (uploadOrDownload === 'download') {
-      this.props.updateUser('download_rate_limit', value);
+      return this.props.updateUser('download_rate_limit', value);
     }
+
+    return Promise.resolve();
   };
 
   toggleDialog = (key, dialogTitle) => {
@@ -78,7 +80,7 @@ class Content extends Component {
   };
 
   updateValue = (value) => {
-    this.props.updateUser(this.state.currentKey, value);
+    return this.props.updateUser(this.state.currentKey, value);
   };
 
   toggleUpdateUserDialog = () => {
@@ -152,17 +154,31 @@ class Content extends Component {
 
             <dt className="info-item-heading">{gettext('Space Used / Quota')}</dt>
             <dd className="info-item-content">
-              {`${Utils.bytesToSize(user.quota_usage)} / ${user.quota_total > 0 ? Utils.bytesToSize(user.quota_total) : '--'}`}
+              {(() => {
+                const effective = user.quota_total > 0 ? user.quota_total : user.org_storage_quota;
+                const inherited = !(user.quota_total > 0) && effective > 0;
+                return `${Utils.bytesToSize(user.quota_usage)} / ${effective > 0 ? Utils.bytesToSize(effective) + (inherited ? ` (${gettext('inherited')})` : '') : '--'}`;
+              })()}
               {this.showEditIcon(this.toggleSetQuotaDialog)}
             </dd>
             <dt className="info-item-heading">{gettext('Monthly Upload Quota')}</dt>
             <dd className="info-item-content">
-              {user.traffic_upload_quota > 0 ? Utils.bytesToSize(user.traffic_upload_quota) : '--'}
+              {(() => {
+                const effective = user.traffic_upload_quota > 0 ? user.traffic_upload_quota : (user.org_traffic_upload_quota > 0 ? user.org_traffic_upload_quota : user.org_traffic_quota);
+                const inherited = !(user.traffic_upload_quota > 0) && effective > 0;
+                const label = inherited && !(user.org_traffic_upload_quota > 0) && user.org_traffic_quota > 0 ? gettext('combined') : gettext('inherited');
+                return effective > 0 ? Utils.bytesToSize(effective) + (inherited ? ` (${label})` : '') : '--';
+              })()}
               {this.showEditIcon(this.toggleSetQuotaDialog)}
             </dd>
             <dt className="info-item-heading">{gettext('Monthly Download Quota')}</dt>
             <dd className="info-item-content">
-              {user.traffic_download_quota > 0 ? Utils.bytesToSize(user.traffic_download_quota) : '--'}
+              {(() => {
+                const effective = user.traffic_download_quota > 0 ? user.traffic_download_quota : (user.org_traffic_download_quota > 0 ? user.org_traffic_download_quota : user.org_traffic_quota);
+                const inherited = !(user.traffic_download_quota > 0) && effective > 0;
+                const label = inherited && !(user.org_traffic_download_quota > 0) && user.org_traffic_quota > 0 ? gettext('combined') : gettext('inherited');
+                return effective > 0 ? Utils.bytesToSize(effective) + (inherited ? ` (${label})` : '') : '--';
+              })()}
               {this.showEditIcon(this.toggleSetQuotaDialog)}
             </dd>
             {isPro &&
@@ -207,6 +223,10 @@ class Content extends Component {
               quotaTotal={user.quota_total}
               trafficUploadQuota={user.traffic_upload_quota}
               trafficDownloadQuota={user.traffic_download_quota}
+              orgStorageQuota={user.org_storage_quota}
+              orgTrafficQuota={user.org_traffic_quota}
+              orgTrafficUploadQuota={user.org_traffic_upload_quota}
+              orgTrafficDownloadQuota={user.org_traffic_download_quota}
               updateQuota={this.updateQuota}
               toggleDialog={this.toggleSetQuotaDialog}
             />
@@ -288,7 +308,7 @@ class User extends Component {
       });
       payload = formData;
     }
-    seafileAPI.sysAdminUpdateUser(email, payload, value).then(res => {
+    return seafileAPI.sysAdminUpdateUser(email, payload, value).then(res => {
       const requestedUpdates = typeof keyOrData === 'string' ? { [keyOrData]: value } : keyOrData;
       this.setState((prevState) => ({
         userInfo: Object.assign({}, prevState.userInfo, requestedUpdates, res.data)

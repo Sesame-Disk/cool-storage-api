@@ -111,12 +111,19 @@ class Content extends Component {
       avatar_url, email, contact_email,
       name, quota_total, quota_usage,
       traffic_upload_quota, traffic_download_quota,
+      org_storage_quota, org_traffic_quota, org_traffic_upload_quota, org_traffic_download_quota,
     } = this.props.data;
     const { isSetNameDialogOpen, isSetContactEmailDialogOpen, isSetQuotaDialogOpen } = this.state;
 
-    const formatQuota = (quota, emptyLabel) => {
-      if (quota > 0) {
-        return Utils.bytesToSize(quota);
+    // Effective quota: use user's individual quota, fall back to org per-direction, then org combined.
+    const effectiveStorageQuota = quota_total > 0 ? quota_total : org_storage_quota;
+    const effectiveUploadQuota = traffic_upload_quota > 0 ? traffic_upload_quota : (org_traffic_upload_quota > 0 ? org_traffic_upload_quota : org_traffic_quota);
+    const effectiveDownloadQuota = traffic_download_quota > 0 ? traffic_download_quota : (org_traffic_download_quota > 0 ? org_traffic_download_quota : org_traffic_quota);
+
+    const formatQuota = (effective, individual, emptyLabel) => {
+      if (effective > 0) {
+        const text = Utils.bytesToSize(effective);
+        return individual > 0 ? text : `${text} (${gettext('inherited')})`;
       }
       return emptyLabel;
     };
@@ -156,19 +163,19 @@ class Content extends Component {
 
           <dt>{gettext('Space Used / Quota')}</dt>
           <dd>
-            {`${Utils.bytesToSize(quota_usage)}${quota_total > 0 ? ' / ' + Utils.bytesToSize(quota_total) : ''}`}
+            {`${Utils.bytesToSize(quota_usage)}${effectiveStorageQuota > 0 ? ' / ' + Utils.bytesToSize(effectiveStorageQuota) + (quota_total <= 0 ? ` (${gettext('inherited')})` : '') : ''}`}
             <span title={gettext('Edit')} className="attr-action-icon fa fa-pencil-alt" onClick={this.toggleSetQuotaDialog}></span>
           </dd>
 
           <dt>{gettext('Monthly Upload Quota')}</dt>
           <dd>
-            {formatQuota(traffic_upload_quota, gettext('Inherited from organization'))}
+            {formatQuota(effectiveUploadQuota, traffic_upload_quota, gettext('No limit'))}
             <span title={gettext('Edit')} className="attr-action-icon fa fa-pencil-alt" onClick={this.toggleSetQuotaDialog}></span>
           </dd>
 
           <dt>{gettext('Monthly Download Quota')}</dt>
           <dd>
-            {formatQuota(traffic_download_quota, gettext('Inherited from organization'))}
+            {formatQuota(effectiveDownloadQuota, traffic_download_quota, gettext('No limit'))}
             <span title={gettext('Edit')} className="attr-action-icon fa fa-pencil-alt" onClick={this.toggleSetQuotaDialog}></span>
           </dd>
         </dl>
@@ -197,6 +204,10 @@ class Content extends Component {
             quotaTotal={quota_total}
             trafficUploadQuota={traffic_upload_quota}
             trafficDownloadQuota={traffic_download_quota}
+            orgStorageQuota={org_storage_quota}
+            orgTrafficQuota={org_traffic_quota}
+            orgTrafficUploadQuota={org_traffic_upload_quota}
+            orgTrafficDownloadQuota={org_traffic_download_quota}
             updateQuota={this.props.updateQuota}
             toggleDialog={this.toggleSetQuotaDialog}
           />
