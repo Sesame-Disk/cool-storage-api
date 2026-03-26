@@ -5,6 +5,10 @@ const MAX_API_CACHE_ENTRIES = 100;
 const APP_SHELL = [
   '/',
   '/libraries/',
+  '/shared/',
+  '/groups/',
+  '/starred/',
+  '/more/',
   '/login/',
   '/manifest.json',
   '/offline.html'
@@ -74,10 +78,16 @@ self.addEventListener('fetch', (event) => {
     return;
   }
 
-  // Navigation requests: network-first, fallback to cached app shell
+  // Navigation requests: network-first, fallback to cached SPA shell
   if (request.mode === 'navigate') {
     event.respondWith(
-      fetch(request).catch(() => {
+      fetch(request).catch(async () => {
+        // Serve the SPA shell for any app route
+        const cached = await caches.match(url.pathname);
+        if (cached) return cached;
+        // Fall back to root index (SPA shell) for dynamic routes
+        const shell = await caches.match('/');
+        if (shell) return shell;
         return caches.match('/offline.html');
       })
     );

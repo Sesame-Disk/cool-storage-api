@@ -81,6 +81,11 @@ export function initDb(): Promise<DbInitResult> {
 }
 
 async function doInit(): Promise<DbInitResult> {
+  // Skip WASM initialization in SSR / Node.js environments
+  if (typeof window === 'undefined') {
+    return { db: null, tier: 'none' };
+  }
+
   // Try IDB-backed SQLite (good persistence, works on main thread)
   if (isIdbSupported()) {
     try {

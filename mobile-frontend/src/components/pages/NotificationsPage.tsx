@@ -128,10 +128,15 @@ export default function NotificationsPage() {
   const [page, setPage] = useState(1);
 
   const fetchNotifications = useCallback(async (pageNum: number, replace = false) => {
-    const data = await listNotifications(pageNum, PER_PAGE);
-    const items = data.notification_list || [];
-    setNotifications(prev => replace ? items : [...prev, ...items]);
-    setHasMore(items.length >= PER_PAGE);
+    try {
+      const data = await listNotifications(pageNum, PER_PAGE);
+      const items = data.notification_list || [];
+      setNotifications(prev => replace ? items : [...prev, ...items]);
+      setHasMore(items.length >= PER_PAGE);
+    } catch {
+      if (replace) setNotifications([]);
+      setHasMore(false);
+    }
   }, []);
 
   useEffect(() => {

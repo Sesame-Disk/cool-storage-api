@@ -15,9 +15,14 @@ export default function ActivityFeed() {
   const [page, setPage] = useState(1);
 
   const fetchActivities = useCallback(async (pageNum: number, replace = false) => {
-    const { events, more } = await listActivities(pageNum);
-    setActivities(prev => replace ? events : [...prev, ...events]);
-    setHasMore(more);
+    try {
+      const { events, more } = await listActivities(pageNum);
+      setActivities(prev => replace ? events : [...prev, ...events]);
+      setHasMore(more);
+    } catch {
+      if (replace) setActivities([]);
+      setHasMore(false);
+    }
   }, []);
 
   useEffect(() => {

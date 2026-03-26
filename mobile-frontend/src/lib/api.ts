@@ -547,12 +547,16 @@ export async function listNotifications(page: number = 1, perPage: number = 25):
 }
 
 export async function getUnseenNotificationCount(): Promise<number> {
-  const res = await fetch(`${serviceURL()}/api/v2.1/notifications/count/`, {
-    headers: authHeaders(),
-  });
-  if (!res.ok) throw new Error('Failed to get notification count');
-  const data = await res.json();
-  return data.unseen_count ?? 0;
+  try {
+    const res = await fetch(`${serviceURL()}/api/v2.1/notifications/count/`, {
+      headers: authHeaders(),
+    });
+    if (!res.ok) return 0;
+    const data = await res.json();
+    return data.unseen_count ?? 0;
+  } catch {
+    return 0;
+  }
 }
 
 export async function markNotificationAsRead(notificationId: number): Promise<void> {

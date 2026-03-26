@@ -43,8 +43,12 @@ export default function LinkedDevicesPage() {
   const [unlinking, setUnlinking] = useState(false);
 
   const fetchDevices = useCallback(async () => {
-    const data = await listLinkedDevices();
-    setDevices(data);
+    try {
+      const data = await listLinkedDevices();
+      setDevices(data);
+    } catch {
+      setDevices([]);
+    }
   }, []);
 
   useEffect(() => {

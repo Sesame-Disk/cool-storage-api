@@ -1,0 +1,26 @@
+---
+import AppLayout from '../layouts/AppLayout.astro';
+import App from '../components/App';
+
+export function getStaticPaths() {
+  // Generate pages for all known routes so they exist as static files.
+  // nginx catch-all will handle dynamic routes (library IDs, group IDs).
+  return [
+    { params: { app: undefined } },          // /
+    { params: { app: 'libraries' } },        // /libraries/
+    { params: { app: 'shared' } },           // /shared/
+    { params: { app: 'groups' } },           // /groups/
+    { params: { app: 'starred' } },          // /starred/
+    { params: { app: 'more' } },             // /more/
+    { params: { app: 'activity' } },         // /activity/
+    { params: { app: 'search' } },           // /search/
+    { params: { app: 'notifications' } },    // /notifications/
+    { params: { app: 'share-admin' } },      // /share-admin/
+    { params: { app: 'devices' } },          // /devices/
+  ];
+}
+---
+
+<AppLayout title="SesameFS">
+  <App client:only="react" />
+</AppLayout>

@@ -177,9 +177,9 @@ export default function SearchPage() {
   const handleResultClick = (result: SearchResult) => {
     addToRecent(query);
     if (result.is_dir) {
-      window.location.href = `/library/${result.repo_id}${result.path}`;
+      window.location.href = `/libraries/${result.repo_id}${result.path}`;
     } else {
-      window.location.href = `/library/${result.repo_id}/file${result.path}`;
+      window.location.href = `/libraries/${result.repo_id}${result.path}`;
     }
   };
 
