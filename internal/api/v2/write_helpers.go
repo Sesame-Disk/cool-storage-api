@@ -26,6 +26,13 @@ func IsOrgUsable(status string) bool {
 	return status == "" || status == StatusActive
 }
 
+func formatOptionalTimestamp(ts time.Time) string {
+	if ts.IsZero() {
+		return ""
+	}
+	return ts.UTC().Format(time.RFC3339)
+}
+
 func createUserWithEmailLookup(db interface{ Session() *gocql.Session }, orgID, userID, email, name, role string, quotaBytes, usedBytes int64, createdAt time.Time) error {
 	batch := db.Session().Batch(gocql.LoggedBatch)
 	batch.Query(`

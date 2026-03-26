@@ -1,6 +1,6 @@
 # Known Issues - SesameFS
 
-**Last Updated**: 2026-03-18
+**Last Updated**: 2026-03-26
 
 This document tracks all known bugs, limitations, and issues in SesameFS.
 
@@ -36,6 +36,7 @@ This document tracks all known bugs, limitations, and issues in SesameFS.
 | **Desktop SSO Browser UX** | ✅ Fixed (2026-03-04) | After browser SSO login for desktop client, now shows confirmation page with auto-close. See ISSUE-SSO-01 below. |
 | **Upload "Don't Replace" (Desktop Client)** | 🟡 Pending | Desktop client file browser "No" button (auto-rename) doesn't work. Client uses `update-link` vs `upload-link` to distinguish replace vs no-replace, but both map to same token/handler. Backend autorename infrastructure ready (`autoRenameIfExists`), needs token-level `Replace` flag to distinguish endpoints. Web "Don't replace" also broken (same root cause). See ISSUE-UPLOAD-REPLACE-01 below. |
 | **Org Logo Upload** | 🟡 Stub | `UpdateOrgLogo` in org_admin.go accepts the file but does not persist it to storage. Returns a static path from settings. Functional as a route placeholder until an asset storage backend is available. |
+| **Login Analytics History** | 🟡 Partial | `last_login` is now real and persisted in `users.last_login_at`, but there is still no historical login event dataset for trend analysis, login audit timelines, or period-based "users who logged in" charts. See ISSUE-LOGIN-ANALYTICS-01 below. |
 
 ### 🟡 SeaDrive 3.x Missing Endpoints (Non-fatal, but degrade UX)
 | Issue | Status | Notes |
@@ -121,6 +122,36 @@ The page is now trustworthy for the main operational KPIs, but it still exposes 
 
 - `docs/DASHBOARD-REDESIGN-PLAN.md`
 - `docs/ADMIN-DASHBOARD-WIREFRAMES.md`
+
+---
+
+### ISSUE-LOGIN-ANALYTICS-01: Only Point-in-Time `last_login` Exists
+
+**Status**: 🟡 Partial fix (2026-03-26)
+**Severity**: Medium — user detail pages now show a real last login, but audit/reporting remains incomplete
+**Affected**: Admin user lists/details, org-admin user lists/details, any future login analytics/reporting feature
+
+#### Problem
+
+SesameFS now persists `users.last_login_at` on successful authentication, so the `last_login` field shown in admin and org-admin responses is no longer stubbed. However, this is only a point-in-time field on the user row.
+
+There is still no historical login events table, which means the system cannot answer questions like:
+
+- how many users logged in during a selected period
+- login trends over time
+- per-user login history / audit trail
+- anomaly detection based on login frequency
+
+#### Fixed
+
+- Successful session creation now updates `users.last_login_at`
+- Dev-token login also updates `users.last_login_at`
+- Admin and org-admin user responses now serialize the real `last_login`
+
+#### Remaining Work
+
+- Add a dedicated login-events dataset if login audit/history becomes a product requirement
+- Keep using traffic-based activity metrics for period charts until real login analytics exist
 
 ---
 

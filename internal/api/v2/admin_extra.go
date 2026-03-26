@@ -450,15 +450,7 @@ func (h *AdminHandler) AdminStatisticActiveUsers(c *gin.Context) {
 		return
 	}
 
-	stats := h.generateDateRange(c)
-	result := make([]gin.H, len(stats))
-	for i, dt := range stats {
-		result[i] = gin.H{
-			"datetime": dt,
-			"count":    0,
-		}
-	}
-	c.JSON(http.StatusOK, result)
+	c.JSON(http.StatusOK, queryActiveUserStats(h.db.Session(), gocql.UUID{}, c))
 }
 
 func (h *AdminHandler) AdminStatisticTraffic(c *gin.Context) {
@@ -537,6 +529,99 @@ func dateRangeStrings(c *gin.Context) []string {
 		dates = []string{today.Format("2006-01-02T00:00:00+00:00")}
 	}
 	return dates
+}
+
+// queryActiveUserStats returns a time series where each bucket counts distinct
+// users that generated traffic during the requested period, regardless of their
+// current status at query time.
+func queryActiveUserStats(session *gocql.Session, orgID gocql.UUID, c *gin.Context) []gin.H {
+	startStr := c.Query("start")
+	endStr := c.Query("end")
+	groupBy := c.DefaultQuery("group_by", "day")
+
+	today := time.Now().UTC().Truncate(24 * time.Hour)
+	start := today.AddDate(0, 0, -7)
+	end := today
+	if startStr != "" {
+		start = parseDateParam(startStr, start)
+	}
+	if endStr != "" {
+		end = parseDateParam(endStr, end)
+	}
+
+	var dates []time.Time
+	for d := start; !d.After(end); {
+		dates = append(dates, d)
+		switch groupBy {
+		case "month":
+			d = d.AddDate(0, 1, 0)
+		case "week":
+			d = d.AddDate(0, 0, 7)
+		default:
+			d = d.AddDate(0, 0, 1)
+		}
+	}
+	if len(dates) == 0 {
+		dates = []time.Time{today}
+	}
+
+	monthsNeeded := map[string]bool{}
+	for _, d := range dates {
+		monthsNeeded[d.Format("200601")] = true
+	}
+
+	dailyUsers := map[string]map[gocql.UUID]struct{}{}
+	for month := range monthsNeeded {
+		iter := session.Query(
+			`SELECT day, user_id FROM traffic_counters WHERE org_id = ? AND month = ?`,
+			orgID, month,
+		).Iter()
+		var day time.Time
+		var userID gocql.UUID
+		for iter.Scan(&day, &userID) {
+			if userID == (gocql.UUID{}) {
+				continue
+			}
+			dayKey := day.UTC().Format("2006-01-02")
+			if dailyUsers[dayKey] == nil {
+				dailyUsers[dayKey] = map[gocql.UUID]struct{}{}
+			}
+			dailyUsers[dayKey][userID] = struct{}{}
+		}
+		if err := iter.Close(); err != nil {
+			log.Printf("[active-users] queryActiveUserStats iter error: %v", err)
+		}
+	}
+
+	result := make([]gin.H, 0, len(dates))
+	for i, d := range dates {
+		var periodEnd time.Time
+		if i+1 < len(dates) {
+			periodEnd = dates[i+1]
+		} else {
+			periodEnd = end.AddDate(0, 0, 1)
+		}
+
+		bucketUsers := map[gocql.UUID]struct{}{}
+		for dayKey, users := range dailyUsers {
+			dt, err := time.Parse("2006-01-02", dayKey)
+			if err != nil {
+				continue
+			}
+			if !dt.Before(d) && dt.Before(periodEnd) {
+				for userID := range users {
+					bucketUsers[userID] = struct{}{}
+				}
+			}
+		}
+
+		result = append(result, gin.H{
+			"datetime": d.Format("2006-01-02T00:00:00+00:00"),
+			"count":    len(bucketUsers),
+		})
+	}
+
+	return result
 }
 
 // ============================================================================
@@ -953,7 +1038,7 @@ func (h *AdminHandler) AdminAddOrgUser(c *gin.Context) {
 		"quota_usage":  0,
 		"quota_total":  -2,
 		"create_time":  now.Format(time.RFC3339),
-		"last_login":   "",
+		"last_login":   formatOptionalTimestamp(time.Time{}),
 		"org_id":       targetOrgID,
 	})
 }
@@ -980,12 +1065,12 @@ func (h *AdminHandler) AdminUpdateOrgUser(c *gin.Context) {
 
 	var name, role, status string
 	var quotaBytes int64
-	var createdAt time.Time
+	var createdAt, lastLoginAt time.Time
 
 	if err := h.db.Session().Query(`
-		SELECT name, role, status, quota_bytes, created_at
+		SELECT name, role, status, quota_bytes, created_at, last_login_at
 		FROM users WHERE org_id = ? AND user_id = ?
-	`, targetOrgID, userID).Scan(&name, &role, &status, &quotaBytes, &createdAt); err != nil {
+	`, targetOrgID, userID).Scan(&name, &role, &status, &quotaBytes, &createdAt, &lastLoginAt); err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "user not found"})
 		return
 	}
@@ -1089,7 +1174,7 @@ func (h *AdminHandler) AdminUpdateOrgUser(c *gin.Context) {
 		"quota_usage":  traffic.ReadStorageUsed(h.db, fmt.Sprintf("user:%s:%s", targetOrgID, userID)),
 		"quota_total":  quotaBytes,
 		"create_time":  createdAt.Format(time.RFC3339),
-		"last_login":   "",
+		"last_login":   formatOptionalTimestamp(lastLoginAt),
 		"org_id":       targetOrgID,
 	})
 }

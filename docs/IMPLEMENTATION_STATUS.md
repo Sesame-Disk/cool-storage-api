@@ -1,6 +1,6 @@
 # Implementation Status - SesameFS
 
-**Last Updated**: 2026-03-25
+**Last Updated**: 2026-03-26
 
 ---
 
@@ -57,7 +57,7 @@
 | **OnlyOffice Integration** | 🔒 FROZEN | **STABLE** | ❌ No | 2026-02-12 | Document editing stable — doc key rotation fix (was causing toolbar greying out) + JWT 8h expiry |
 | **Frontend (React)** | 🟡 PARTIAL | **UNSTABLE** | N/A | 2026-03-26 | Library list works, all modals migrated, ~51 ModalPortal wrappers to remove. Admin dashboard modernization is documented but not implemented yet. |
 | **Frontend Logout** | 🔒 FROZEN | **STABLE** | N/A | 2026-01-27 | Working - nginx proxies /accounts/ to backend |
-| **User Management** | ✅ COMPLETE | Mostly stable | ❌ No | 2026-01-28 | OIDC login + dev tokens supported |
+| **User Management** | ✅ COMPLETE | Mostly stable | ❌ No | 2026-03-26 | OIDC login + dev tokens supported. `users.last_login_at` is now persisted on successful login/session creation and exposed in admin/org-admin user responses. Historical login analytics remain unimplemented. |
 | **Database Seeding** | ✅ COMPLETE | Mostly stable | ❌ No | 2026-01-23 | Auto-creates default org + admin user on first run |
 | **Sharing System** | ✅ COMPLETE | Mostly stable | ❌ No | 2026-03-12 | Share to users/groups + share links + upload links + group permissions. Custom share permissions with granular flags. Creator info in share/upload link responses. Password-protected share links with HMAC cookie auth (SHARE_LINK_HMAC_KEY). |
 | **Share Dialog UI** | ✅ COMPLETE | Mostly stable | ❌ No | 2026-03-12 | 6 tabs fully implemented: Share Link (create/list/update/delete + password/expiry/permissions/batch/email), Upload Link, Internal Link, Share to User, Share to Group, Custom Sharing Permissions. «Invite Guest» and «Share to Other Server (OCM)» tabs are disabled stubs (canInvitePeople=false, enableOCM=false) — no backend endpoints exist. |

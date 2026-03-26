@@ -333,7 +333,7 @@ type orgUserRow struct {
 	AvatarURL            string `json:"avatar_url"`
 }
 
-func buildOrgUserRow(email, name, role, status, orgID string, quota, used int64, created time.Time) orgUserRow {
+func buildOrgUserRow(email, name, role, status, orgID string, quota, used int64, created, lastLogin time.Time) orgUserRow {
 	canonicalStatus := normalizeUserStatus(status)
 	return orgUserRow{
 		ID:           email, // Seafile uses email as user ID in org-admin context
@@ -347,14 +347,14 @@ func buildOrgUserRow(email, name, role, status, orgID string, quota, used int64,
 		QuotaTotal:   quota,
 		QuotaUsage:   used,
 		Ctime:        created.Format(time.RFC3339),
-		LastLogin:    "",
+		LastLogin:    formatOptionalTimestamp(lastLogin),
 		OrgID:        orgID,
 		AvatarURL:    "/static/img/default-avatar.png",
 	}
 }
 
-func buildOrgUserRowWithTraffic(email, name, role, status, orgID string, quota, used, trafficUploadQuota, trafficDownloadQuota int64, created time.Time) orgUserRow {
-	row := buildOrgUserRow(email, name, role, status, orgID, quota, used, created)
+func buildOrgUserRowWithTraffic(email, name, role, status, orgID string, quota, used, trafficUploadQuota, trafficDownloadQuota int64, created, lastLogin time.Time) orgUserRow {
+	row := buildOrgUserRow(email, name, role, status, orgID, quota, used, created, lastLogin)
 	row.TrafficUploadQuota = trafficUploadQuota
 	row.TrafficDownloadQuota = trafficDownloadQuota
 	return row
@@ -546,23 +546,23 @@ func (h *OrgAdminHandler) ListOrgUsers(c *gin.Context) {
 	isStaffOnly := c.Query("is_staff") == "true"
 
 	iter := h.db.Session().Query(`
-		SELECT user_id, email, name, role, status, quota_bytes, created_at
+		SELECT user_id, email, name, role, status, quota_bytes, created_at, last_login_at
 		FROM users WHERE org_id = ?
 	`, targetOrgID).Iter()
 
 	var all []orgUserRow
 	var userID, email, name, role, status string
 	var quota int64
-	var created time.Time
+	var created, lastLogin time.Time
 
-	for iter.Scan(&userID, &email, &name, &role, &status, &quota, &created) {
+	for iter.Scan(&userID, &email, &name, &role, &status, &quota, &created, &lastLogin) {
 		if isStaffOnly && role != "admin" && role != "superadmin" {
 			continue
 		}
 		if !userMatchesStatusFilter(status, statusFilter) {
 			continue
 		}
-		all = append(all, buildOrgUserRow(email, name, role, status, targetOrgID, quota, traffic.ReadStorageUsed(h.db, fmt.Sprintf("user:%s:%s", targetOrgID, userID)), created))
+		all = append(all, buildOrgUserRow(email, name, role, status, targetOrgID, quota, traffic.ReadStorageUsed(h.db, fmt.Sprintf("user:%s:%s", targetOrgID, userID)), created, lastLogin))
 	}
 	if err := iter.Close(); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list users"})
@@ -653,7 +653,7 @@ func (h *OrgAdminHandler) AddOrgUser(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusCreated, buildOrgUserRow(email, name, "user", StatusActive, targetOrgID, -2, 0, now))
+	c.JSON(http.StatusCreated, buildOrgUserRow(email, name, "user", StatusActive, targetOrgID, -2, 0, now, time.Time{}))
 }
 
 // GetOrgUser returns details for a single user identified by email within the target org.
@@ -673,17 +673,17 @@ func (h *OrgAdminHandler) GetOrgUser(c *gin.Context) {
 
 	var name, role, status string
 	var quota, trafficUploadQuota, trafficDownloadQuota int64
-	var created time.Time
+	var created, lastLogin time.Time
 
 	if err := h.db.Session().Query(`
-		SELECT name, role, status, quota_bytes, traffic_upload_quota, traffic_download_quota, created_at
+		SELECT name, role, status, quota_bytes, traffic_upload_quota, traffic_download_quota, created_at, last_login_at
 		FROM users WHERE org_id = ? AND user_id = ?
-	`, targetOrgID, userID).Scan(&name, &role, &status, &quota, &trafficUploadQuota, &trafficDownloadQuota, &created); err != nil {
+	`, targetOrgID, userID).Scan(&name, &role, &status, &quota, &trafficUploadQuota, &trafficDownloadQuota, &created, &lastLogin); err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "user not found"})
 		return
 	}
 
-	c.JSON(http.StatusOK, buildOrgUserRowWithTraffic(email, name, role, status, targetOrgID, quota, traffic.ReadStorageUsed(h.db, fmt.Sprintf("user:%s:%s", targetOrgID, userID)), trafficUploadQuota, trafficDownloadQuota, created))
+	c.JSON(http.StatusOK, buildOrgUserRowWithTraffic(email, name, role, status, targetOrgID, quota, traffic.ReadStorageUsed(h.db, fmt.Sprintf("user:%s:%s", targetOrgID, userID)), trafficUploadQuota, trafficDownloadQuota, created, lastLogin))
 }
 
 // UpdateOrgUser updates an org user's active status, staff role, name, or quota.
@@ -705,12 +705,12 @@ func (h *OrgAdminHandler) UpdateOrgUser(c *gin.Context) {
 
 	var name, role, status string
 	var quota, trafficUploadQuota, trafficDownloadQuota int64
-	var created time.Time
+	var created, lastLogin time.Time
 
 	if err := h.db.Session().Query(`
-		SELECT name, role, status, quota_bytes, traffic_upload_quota, traffic_download_quota, created_at
+		SELECT name, role, status, quota_bytes, traffic_upload_quota, traffic_download_quota, created_at, last_login_at
 		FROM users WHERE org_id = ? AND user_id = ?
-	`, targetOrgID, userID).Scan(&name, &role, &status, &quota, &trafficUploadQuota, &trafficDownloadQuota, &created); err != nil {
+	`, targetOrgID, userID).Scan(&name, &role, &status, &quota, &trafficUploadQuota, &trafficDownloadQuota, &created, &lastLogin); err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "user not found"})
 		return
 	}
@@ -817,7 +817,7 @@ func (h *OrgAdminHandler) UpdateOrgUser(c *gin.Context) {
 		}
 	}
 
-	c.JSON(http.StatusOK, buildOrgUserRowWithTraffic(email, name, role, status, targetOrgID, quota, traffic.ReadStorageUsed(h.db, fmt.Sprintf("user:%s:%s", targetOrgID, userID)), trafficUploadQuota, trafficDownloadQuota, created))
+	c.JSON(http.StatusOK, buildOrgUserRowWithTraffic(email, name, role, status, targetOrgID, quota, traffic.ReadStorageUsed(h.db, fmt.Sprintf("user:%s:%s", targetOrgID, userID)), trafficUploadQuota, trafficDownloadQuota, created, lastLogin))
 }
 
 // DeleteOrgUser soft-deletes a user from the target org.
@@ -1059,21 +1059,21 @@ func (h *OrgAdminHandler) SearchOrgUser(c *gin.Context) {
 	}
 
 	iter := h.db.Session().Query(`
-		SELECT user_id, email, name, role, status, quota_bytes, created_at
+		SELECT user_id, email, name, role, status, quota_bytes, created_at, last_login_at
 		FROM users WHERE org_id = ?
 	`, targetOrgID).Iter()
 
 	var results []orgUserRow
 	var userID, email, name, role, status string
 	var quota int64
-	var created time.Time
+	var created, lastLogin time.Time
 
-	for iter.Scan(&userID, &email, &name, &role, &status, &quota, &created) {
+	for iter.Scan(&userID, &email, &name, &role, &status, &quota, &created, &lastLogin) {
 		if !userMatchesStatusFilter(status, statusFilter) {
 			continue
 		}
 		if strings.Contains(strings.ToLower(email), query) || strings.Contains(strings.ToLower(name), query) {
-			results = append(results, buildOrgUserRow(email, name, role, status, targetOrgID, quota, traffic.ReadStorageUsed(h.db, fmt.Sprintf("user:%s:%s", targetOrgID, userID)), created))
+			results = append(results, buildOrgUserRow(email, name, role, status, targetOrgID, quota, traffic.ReadStorageUsed(h.db, fmt.Sprintf("user:%s:%s", targetOrgID, userID)), created, lastLogin))
 		}
 	}
 	iter.Close()
@@ -1191,7 +1191,7 @@ func (h *OrgAdminHandler) ImportOrgUsers(c *gin.Context) {
 			failed = append(failed, gin.H{"email": email, "error": "database error"})
 			continue
 		}
-		success = append(success, buildOrgUserRow(email, name, "user", StatusActive, targetOrgID, -2, 0, now))
+		success = append(success, buildOrgUserRow(email, name, "user", StatusActive, targetOrgID, -2, 0, now, time.Time{}))
 	}
 
 	if success == nil {
@@ -2903,7 +2903,18 @@ func (h *OrgAdminHandler) OrgStatisticStorage(c *gin.Context) {
 	c.JSON(http.StatusOK, result)
 }
 func (h *OrgAdminHandler) OrgStatisticActiveUsers(c *gin.Context) {
-	h.notImplemented(c, "org statistics active-users")
+	targetOrgID := c.Param("org_id")
+	if err := h.requireOrgAccess(c, targetOrgID); err != nil {
+		return
+	}
+
+	orgUUID, err := gocql.ParseUUID(targetOrgID)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid org_id"})
+		return
+	}
+
+	c.JSON(http.StatusOK, queryActiveUserStats(h.db.Session(), orgUUID, c))
 }
 func (h *OrgAdminHandler) OrgStatisticTraffic(c *gin.Context) {
 	targetOrgID := c.Param("org_id")

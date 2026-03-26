@@ -176,6 +176,7 @@ func (db *DB) Migrate() error {
 		migrationAddOrgBillingCycle,
 		migrationAddUserTrafficUploadQuota,
 		migrationAddUserTrafficDownloadQuota,
+		migrationAddUserLastLoginAt,
 		migrationAddAccessTokenSource,
 		migrationAddBlockIdMappingCreatedAt,
 	}
@@ -734,6 +735,9 @@ CREATE TABLE IF NOT EXISTS sessions_by_user (
 	token_hash TEXT,
 	PRIMARY KEY ((org_id, user_id), token_hash)
 )`
+
+const migrationAddUserLastLoginAt = `
+ALTER TABLE users ADD last_login_at TIMESTAMP`
 
 // Repo API tokens for programmatic access to individual libraries
 // Partition by repo_id for efficient listing of tokens per repo

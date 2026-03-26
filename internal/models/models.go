@@ -28,18 +28,19 @@ type Organization struct {
 
 // User represents a user in the system
 type User struct {
-	UserID               uuid.UUID `json:"user_id"`
-	OrgID                uuid.UUID `json:"org_id"`
-	Email                string    `json:"email"`
-	Name                 string    `json:"name"`
-	Role                 string    `json:"role"`   // superadmin, admin, user, readonly, guest
-	Status               string    `json:"status"` // active, deactivated, deleted
-	OIDCSub              string    `json:"-"`      // OIDC subject identifier
-	QuotaBytes           int64     `json:"quota_bytes"`
-	UsedBytes            int64     `json:"used_bytes"`
-	TrafficUploadQuota   int64     `json:"traffic_upload_quota"`   // -1=inherit from org
-	TrafficDownloadQuota int64     `json:"traffic_download_quota"` // -1=inherit from org
-	CreatedAt            time.Time `json:"created_at"`
+	UserID               uuid.UUID  `json:"user_id"`
+	OrgID                uuid.UUID  `json:"org_id"`
+	Email                string     `json:"email"`
+	Name                 string     `json:"name"`
+	Role                 string     `json:"role"`   // superadmin, admin, user, readonly, guest
+	Status               string     `json:"status"` // active, deactivated, deleted
+	OIDCSub              string     `json:"-"`      // OIDC subject identifier
+	QuotaBytes           int64      `json:"quota_bytes"`
+	UsedBytes            int64      `json:"used_bytes"`
+	TrafficUploadQuota   int64      `json:"traffic_upload_quota"`   // -1=inherit from org
+	TrafficDownloadQuota int64      `json:"traffic_download_quota"` // -1=inherit from org
+	CreatedAt            time.Time  `json:"created_at"`
+	LastLoginAt          *time.Time `json:"last_login_at,omitempty"`
 }
 
 // Library represents a file library (repository)

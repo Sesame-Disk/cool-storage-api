@@ -29,14 +29,15 @@ class OrgStatisticUsers extends React.Component {
       let data = res.data;
       if (Array.isArray(data)) {
         data.forEach(item => {
-          labels.push(moment.utc(item.datetime).format('YYYY-MM-DD'));
+          labels.push(moment.utc(item.datetime).format(groupBy === 'month' ? 'YYYY-MM' : 'YYYY-MM-DD'));
           count.push(item.count);
         });
         let userCount = {
           label: gettext('Active Users'),
           data: count,
           borderColor: '#fd913a',
-          backgroundColor: '#fd913a'};
+          backgroundColor: '#fd913a'
+        };
         filesData = [userCount];
       }
       this.setState({

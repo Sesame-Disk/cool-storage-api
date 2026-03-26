@@ -1746,6 +1746,13 @@ seafileAPI.sysAdminStatisticStorages = function (startTime, endTime, groupBy) {
   return this.req.get(url);
 };
 
+// Sys Admin: statistic active users
+seafileAPI.sysAdminStatisticActiveUsers = function (startTime, endTime, groupBy) {
+  let url = this.server + '/api/v2.1/admin/statistics/active-users/?start=' + startTime + '&end=' + endTime;
+  if (groupBy) url += '&group_by=' + groupBy;
+  return this.req.get(url);
+};
+
 seafileAPI.sysAdminListOrgTraffic = function (month, page, perPage, orderBy) {
   let url = this.server + '/api/v2.1/admin/statistics/org-traffic/?month=' + month;
   if (page) url += '&page=' + page;

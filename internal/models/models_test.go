@@ -53,15 +53,17 @@ func TestLibraryJSONSerialization(t *testing.T) {
 
 func TestUserJSONSerialization(t *testing.T) {
 	now := time.Now().Truncate(time.Second)
+	lastLogin := now.Add(2 * time.Hour)
 	user := User{
-		UserID:     uuid.New(),
-		OrgID:      uuid.New(),
-		Email:      "test@example.com",
-		Name:       "Test User",
-		Role:       "admin",
-		QuotaBytes: 1024 * 1024 * 1024,
-		UsedBytes:  512 * 1024 * 1024,
-		CreatedAt:  now,
+		UserID:      uuid.New(),
+		OrgID:       uuid.New(),
+		Email:       "test@example.com",
+		Name:        "Test User",
+		Role:        "admin",
+		QuotaBytes:  1024 * 1024 * 1024,
+		UsedBytes:   512 * 1024 * 1024,
+		CreatedAt:   now,
+		LastLoginAt: &lastLogin,
 	}
 
 	data, err := json.Marshal(user)
@@ -80,10 +82,39 @@ func TestUserJSONSerialization(t *testing.T) {
 	if jsonMap["role"] != "admin" {
 		t.Errorf("role = %v, want admin", jsonMap["role"])
 	}
+	if jsonMap["last_login_at"] != lastLogin.Format(time.RFC3339) {
+		t.Errorf("last_login_at = %v, want %s", jsonMap["last_login_at"], lastLogin.Format(time.RFC3339))
+	}
 
 	// OIDCSub should not be in JSON (json:"-")
 	if _, ok := jsonMap["oidc_sub"]; ok {
 		t.Error("oidc_sub should not be in JSON")
+	}
+}
+
+func TestUserJSONSerialization_OmitsNilLastLoginAt(t *testing.T) {
+	now := time.Now().Truncate(time.Second)
+	user := User{
+		UserID:    uuid.New(),
+		OrgID:     uuid.New(),
+		Email:     "test@example.com",
+		Name:      "Test User",
+		Role:      "admin",
+		CreatedAt: now,
+	}
+
+	data, err := json.Marshal(user)
+	if err != nil {
+		t.Fatalf("Failed to marshal User: %v", err)
+	}
+
+	var jsonMap map[string]interface{}
+	if err := json.Unmarshal(data, &jsonMap); err != nil {
+		t.Fatalf("Failed to unmarshal JSON: %v", err)
+	}
+
+	if _, ok := jsonMap["last_login_at"]; ok {
+		t.Error("last_login_at should be omitted when nil")
 	}
 }
 

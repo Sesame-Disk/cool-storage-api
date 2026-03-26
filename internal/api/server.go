@@ -1156,6 +1156,17 @@ func (s *Server) applyDevToken(c *gin.Context, devToken config.DevTokenEntry) {
 	}
 }
 
+func (s *Server) touchUserLastLogin(orgID, userID string, at time.Time) {
+	if s.db == nil || orgID == "" || userID == "" {
+		return
+	}
+	if err := s.db.Session().Query(`
+		UPDATE users SET last_login_at = ? WHERE org_id = ? AND user_id = ?
+	`, at, orgID, userID).Exec(); err != nil {
+		slog.Warn("Failed to update last_login_at", "org_id", orgID, "user_id", userID, "error", err)
+	}
+}
+
 func (s *Server) applyAnonymousDevAuth(c *gin.Context) bool {
 	if !s.config.Auth.AllowAnonymous || !s.config.Auth.DevMode || len(s.config.Auth.DevTokens) == 0 {
 		return false
@@ -1683,6 +1694,7 @@ func (s *Server) handleAuthToken(c *gin.Context) {
 				(devToken.Email != "" && devToken.Email == username))
 
 			if usernameMatches || devToken.Token == password {
+				s.touchUserLastLogin(devToken.OrgID, devToken.UserID, time.Now().UTC())
 				c.JSON(http.StatusOK, gin.H{
 					"token": devToken.Token,
 				})

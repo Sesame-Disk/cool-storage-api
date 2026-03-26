@@ -11,7 +11,7 @@ func TestIsUserUsable(t *testing.T) {
 		want   bool
 	}{
 		{"active", true},
-		{"", true},       // legacy: before migration, status is empty
+		{"", true}, // legacy: before migration, status is empty
 		{"deactivated", false},
 		{"deleted", false},
 		{"unknown", false},
@@ -101,7 +101,7 @@ func TestMakeAdminUserResponse_StatusField(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			resp := makeAdminUserResponse("test@example.com", "Test", tt.role, tt.status, 0, 0, now)
+			resp := makeAdminUserResponse("test@example.com", "Test", tt.role, tt.status, 0, 0, now, time.Time{})
 
 			if resp.IsActive != tt.wantActive {
 				t.Errorf("IsActive = %v, want %v (role=%q, status=%q)", resp.IsActive, tt.wantActive, tt.role, tt.status)

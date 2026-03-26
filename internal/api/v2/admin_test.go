@@ -511,7 +511,7 @@ func TestMakeAdminUserResponse(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			resp := makeAdminUserResponse(tt.email, tt.userName, tt.role, tt.status, tt.quotaBytes, tt.usedBytes, fixedTime)
+			resp := makeAdminUserResponse(tt.email, tt.userName, tt.role, tt.status, tt.quotaBytes, tt.usedBytes, fixedTime, time.Time{})
 
 			assert.Equal(t, tt.email, resp.Email)
 			assert.Equal(t, tt.userName, resp.Name)

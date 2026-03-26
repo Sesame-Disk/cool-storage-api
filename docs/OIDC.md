@@ -1,6 +1,6 @@
 # OIDC Integration - SesameFS
 
-**Last Updated**: 2026-02-19
+**Last Updated**: 2026-03-26
 **Status**: IMPLEMENTED - All Phases Complete (OIDC Login + Role Sync + Org Provisioning + Admin API + Group/Dept Sync + Desktop Client SSO)
 
 ---
@@ -212,8 +212,10 @@ SesameFS receives ID token + userinfo
         │   ├─ No + auto_provision=true → CREATE user (new UUID, email from claims, role from OIDC)
         │   └─ Yes → ROLE SYNC: if DB role ≠ OIDC role, UPDATE role in DB (OIDC is source of truth)
         │
-        └─ Create session (JWT) → return to frontend
+        └─ Create session (JWT), update users.last_login_at → return to frontend
 ```
+
+      Successful OIDC authentication updates the user's `last_login_at` timestamp when the session or API-token session is created. Admin and org-admin user management endpoints expose that value as `last_login`. This is a point-in-time field only; SesameFS still does not persist a full login event history.
 
 ### Role Sync on Re-Login
 

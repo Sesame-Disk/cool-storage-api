@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"log"
 	"sync"
 	"time"
 
@@ -111,6 +112,7 @@ func (sm *SessionManager) CreateSessionWithTTL(userID, orgID, email, role string
 		if err := sm.storeSession(session); err != nil {
 			return nil, fmt.Errorf("failed to store session: %w", err)
 		}
+		sm.touchUserLastLogin(userID, orgID, now)
 	}
 
 	// Cache session
@@ -261,6 +263,17 @@ func (sm *SessionManager) storeSession(session *Session) error {
 		USING TTL ?
 	`, session.OrgID, session.UserID, tokenHash, ttlSeconds)
 	return batch.Exec()
+}
+
+func (sm *SessionManager) touchUserLastLogin(userID, orgID string, at time.Time) {
+	if sm.db == nil || userID == "" || orgID == "" {
+		return
+	}
+	if err := sm.db.Session().Query(`
+		UPDATE users SET last_login_at = ? WHERE org_id = ? AND user_id = ?
+	`, at, orgID, userID).Exec(); err != nil {
+		log.Printf("[auth] failed to update last_login_at org=%s user=%s: %v", orgID, userID, err)
+	}
 }
 
 // loadSession loads a session from the database
