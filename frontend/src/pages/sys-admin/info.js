@@ -1,8 +1,6 @@
 import React, { Component, Fragment } from 'react';
-import { Button } from 'reactstrap';
 import { seafileAPI } from '../../utils/seafile-api';
-import { gettext, isPro, isDefaultAdmin, seafileVersion } from '../../utils/constants';
-import toaster from '../../components/toast';
+import { gettext, isPro } from '../../utils/constants';
 import { Utils } from '../../utils/utils';
 import Loading from '../../components/loading';
 import MainPanelTopbar from './main-panel-topbar';
@@ -18,7 +16,6 @@ class Info extends Component {
       errorMsg: '',
       sysInfo: {}
     };
-    this.fileInput = React.createRef();
   }
 
   componentDidMount() {
@@ -35,49 +32,20 @@ class Info extends Component {
     });
   }
 
-  uploadLicenseFile = (e) => {
-
-    // no file selected
-    if (!this.fileInput.current.files.length) {
-      return;
-    }
-    const file = this.fileInput.current.files[0];
-    seafileAPI.sysAdminUploadLicense(file).then((res) => {
-      let info = this.state.sysInfo;
-      Object.assign(info, res.data, { with_license: true });
-      this.setState({
-        sysInfo: info
-      });
-    }).catch((error) => {
-      let errMsg = Utils.getErrorMsg(error);
-      toaster.danger(errMsg);
-    });
-  };
-
-  openFileInput = () => {
-    this.fileInput.current.click();
-  };
-
-  renderLicenseDescString = (license_mode, license_to, license_expiration) => {
-    if (license_mode === 'life-time') {
-      if (window.app.config.lang === 'zh-cn') {
-        return '永久授权给 ' + license_to + '，技术支持服务至 ' + license_expiration + ' 到期';
-      } else {
-        return gettext('licensed to {placeholder_license_to}, upgrade service expired in {placeholder_license_expiration}')
-          .replace('{placeholder_license_to}', license_to).replace('{placeholder_license_expiration}', license_expiration);
-      }
-    } else {
-      return gettext('licensed to {placeholder_license_to}, expires on {placeholder_license_expiration}')
-        .replace('{placeholder_license_to}', license_to).replace('{placeholder_license_expiration}', license_expiration);
-    }
-  };
-
   render() {
-    let { license_mode, license_to, license_expiration, org_count,
+    let { org_count,
       repos_count, total_files_count, total_storage, total_devices_count,
-      current_connected_devices_count, license_maxusers, multi_tenancy_enabled,
-      active_users_count, users_count, groups_count, with_license } = this.state.sysInfo;
+      current_connected_devices_count, multi_tenancy_enabled,
+      active_users_count, users_count, groups_count,
+      traffic_month_total, traffic_month_upload, traffic_month_download,
+      traffic_year_total, traffic_year_upload, traffic_year_download } = this.state.sysInfo;
     let { loading, errorMsg } = this.state;
+    const formatTrafficBreakdown = (total, upload, download) => {
+      return `${Utils.bytesToSize(total || 0)} / ${Utils.bytesToSize(upload || 0)} / ${Utils.bytesToSize(download || 0)}`;
+    };
+    const deviceInfo = total_devices_count == null || current_connected_devices_count == null
+      ? gettext('Not available')
+      : `${total_devices_count} / ${current_connected_devices_count}`;
 
     return (
       <Fragment>
@@ -90,42 +58,25 @@ class Info extends Component {
               {errorMsg && <p className="error text-center mt-4">{errorMsg}</p>}
               {(!loading && !errorMsg) &&
                 <dl className="flex-1 m-0">
-                  <dt className="info-item-heading">{gettext('System Info')}</dt>
-                  {isPro ?
-                    <dd className="info-item-content">
-                      {gettext('Professional Edition')}
-                      {with_license &&
-                        ' ' + this.renderLicenseDescString(license_mode, license_to, license_expiration)
-                      }<br />
-                      {isDefaultAdmin &&
-                        <Fragment>
-                          <Button type="button" className="mt-2" onClick={this.openFileInput}>{gettext('Upload license')}</Button>
-                          <input className="d-none" type="file" onChange={this.uploadLicenseFile} ref={this.fileInput} />
-                        </Fragment>
-                      }
-                    </dd> :
-                    <dd className="info-item-content">
-                      {gettext('Community Edition')}
-                      <a className="ml-1" href="https://download.seafile.com/published/seafile-manual/deploy_pro/migrate_from_seafile_community_server.md" target="_blank" rel="noreferrer">{gettext('Upgrade to Pro Edition')}</a>
-                    </dd>
-                  }
-
-                  <dt className="info-item-heading">{gettext('Version')}</dt>
-                  <dd className="info-item-content">{seafileVersion}</dd>
-
                   <dt className="info-item-heading">{gettext('Libraries')} / {gettext('Files')}</dt>
                   <dd className="info-item-content">{repos_count} / {total_files_count}</dd>
 
                   <dt className="info-item-heading">{gettext('Storage Used')}</dt>
                   <dd className="info-item-content">{Utils.bytesToSize(total_storage)}</dd>
 
+                  <dt className="info-item-heading">{gettext('This Month Traffic')} ({gettext('Total')} / {gettext('Upload')} / {gettext('Download')})</dt>
+                  <dd className="info-item-content">{formatTrafficBreakdown(traffic_month_total, traffic_month_upload, traffic_month_download)}</dd>
+
+                  <dt className="info-item-heading">{gettext('This Year Traffic')} ({gettext('Total')} / {gettext('Upload')} / {gettext('Download')})</dt>
+                  <dd className="info-item-content">{formatTrafficBreakdown(traffic_year_total, traffic_year_upload, traffic_year_download)}</dd>
+
                   <dt className="info-item-heading">{gettext('Total Devices')} / {gettext('Current Connected Devices')}</dt>
-                  <dd className="info-item-content">{total_devices_count} / {current_connected_devices_count}</dd>
+                  <dd className="info-item-content">{deviceInfo}</dd>
 
                   {isPro ?
                     <Fragment>
-                      <dt className="info-item-heading">{gettext('Activated Users')} / {gettext('Total Users')} / {gettext('Limits')}</dt>
-                      <dd className="info-item-content">{active_users_count}{' / '}{users_count}{' / '}{with_license ? license_maxusers : '--'}</dd>
+                      <dt className="info-item-heading">{gettext('Activated Users')} / {gettext('Total Users')}</dt>
+                      <dd className="info-item-content">{active_users_count} / {users_count}</dd>
                     </Fragment> :
                     <Fragment>
                       <dt className="info-item-heading">{gettext('Activated Users')} / {gettext('Total Users')}</dt>

@@ -25,6 +25,12 @@ type DBSession interface {
 	Session() *gocql.Session
 }
 
+// StorageSnapshot is the running-total storage state for a given scope.
+type StorageSnapshot struct {
+	BytesUsed int64
+	FileCount int64
+}
+
 // storageTotalDay is the sentinel date used for the running-total row.
 // All real daily deltas use actual dates (2026-03-26, etc.) which are always
 // after this sentinel, so range queries for graphs never include it.
@@ -105,6 +111,20 @@ func ReadStorageUsed(db DBSession, scope string) int64 {
 		scope, storageTotalDay,
 	).Scan(&v)
 	return max(v, 0)
+}
+
+// ReadStorageSnapshot returns the running-total bytes_used and file_count for
+// the given scope. Missing rows are treated as zero.
+func ReadStorageSnapshot(db DBSession, scope string) StorageSnapshot {
+	var bytesUsed, fileCount int64
+	_ = db.Session().Query(
+		`SELECT bytes_used, file_count FROM storage_counters WHERE scope = ? AND day = ?`,
+		scope, storageTotalDay,
+	).Scan(&bytesUsed, &fileCount)
+	return StorageSnapshot{
+		BytesUsed: max(bytesUsed, 0),
+		FileCount: max(fileCount, 0),
+	}
 }
 
 // ReadStorageDailyDeltas returns storage deltas for each day in [start, end].

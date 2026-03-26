@@ -24,10 +24,14 @@ class StatisticCommonTool extends React.Component {
   componentDidMount() {
     let today = moment().format('YYYY-MM-DD 00:00:00');
     let endTime = today;
-    let startTime = moment().subtract(6,'d').format('YYYY-MM-DD 00:00:00');
+    let startTime = moment().subtract(6, 'd').format('YYYY-MM-DD 00:00:00');
     let group_by = 'day';
     this.props.getActiviesFiles(startTime, endTime, group_by);
   }
+
+  getGroupBy = (statisticTypeName) => {
+    return statisticTypeName === 'oneYear' ? 'month' : 'day';
+  };
 
   changeActive = (statisticTypeName) => {
     let { statisticType } = this.state;
@@ -37,21 +41,21 @@ class StatisticCommonTool extends React.Component {
     let today = moment().format('YYYY-MM-DD 00:00:00');
     let endTime = today;
     let startTime;
-    switch(statisticTypeName) {
-      case 'oneWeek' :
-        startTime = moment().subtract(6,'d').format('YYYY-MM-DD 00:00:00');
+    switch (statisticTypeName) {
+      case 'oneWeek':
+        startTime = moment().subtract(6, 'd').format('YYYY-MM-DD 00:00:00');
         break;
-      case 'oneMonth' :
-        startTime = moment().subtract(29,'d').format('YYYY-MM-DD 00:00:00');
+      case 'oneMonth':
+        startTime = moment().subtract(29, 'd').format('YYYY-MM-DD 00:00:00');
         break;
-      case 'oneYear' :
-        startTime = moment().subtract(364,'d').format('YYYY-MM-DD 00:00:00');
+      case 'oneYear':
+        startTime = moment().subtract(364, 'd').format('YYYY-MM-DD 00:00:00');
         break;
     }
     this.setState({
       statisticType: statisticTypeName,
     });
-    let group_by = 'day';
+    let group_by = this.getGroupBy(statisticTypeName);
     this.props.getActiviesFiles(startTime, endTime, group_by);
   };
 
@@ -90,7 +94,7 @@ class StatisticCommonTool extends React.Component {
 
   onSubmit = () => {
     let { startValue, endValue } = this.state;
-    if(!startValue || !endValue) {
+    if (!startValue || !endValue) {
       return;
     }
     this.setState({
@@ -104,14 +108,14 @@ class StatisticCommonTool extends React.Component {
 
   render() {
     let { statisticType, endValue, startValue } = this.state;
-    return(
+    return (
       <Fragment>
         {this.props.children}
         <div className="system-statistic-time-range">
           <div className="sys-stat-tool">
             <div className={`system-statistic-item border-right-0 rounded-left ${statisticType === 'oneWeek' ? 'item-active' : ''}`} onClick={this.changeActive.bind(this, 'oneWeek')}>{gettext('7 Days')}</div>
-            <div className={`system-statistic-item border-right-0 ${statisticType === 'oneMonth' ? 'item-active' : ''}`}  onClick={this.changeActive.bind(this, 'oneMonth')}>{gettext('30 Days')}</div>
-            <div className={`system-statistic-item rounded-right ${statisticType === 'oneYear' ? 'item-active' : ''}`}  onClick={this.changeActive.bind(this, 'oneYear')}>{gettext('1 Year')}</div>
+            <div className={`system-statistic-item border-right-0 ${statisticType === 'oneMonth' ? 'item-active' : ''}`} onClick={this.changeActive.bind(this, 'oneMonth')}>{gettext('30 Days')}</div>
+            <div className={`system-statistic-item rounded-right ${statisticType === 'oneYear' ? 'item-active' : ''}`} onClick={this.changeActive.bind(this, 'oneYear')}>{gettext('1 Year')}</div>
           </div>
           <div className="system-statistic-input-container">
             <Picker

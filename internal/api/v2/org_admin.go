@@ -397,27 +397,62 @@ func (h *OrgAdminHandler) GetOrgInfo(c *gin.Context) {
 	}
 
 	monthlyUsage := traffic.ReadOrgMonthlyUsage(h.db, orgID, traffic.CurrentMonth())
+	yearlyUsage := traffic.MonthlyTransferUsage{}
+	now := time.Now().UTC()
+	for month := time.January; month <= now.Month(); month++ {
+		usage := traffic.ReadOrgMonthlyUsage(h.db, orgID, time.Date(now.Year(), month, 1, 0, 0, 0, 0, time.UTC).Format("200601"))
+		yearlyUsage.Combined += usage.Combined
+		yearlyUsage.Upload += usage.Upload
+		yearlyUsage.Download += usage.Download
+	}
 
+	storageSnapshot := traffic.ReadStorageSnapshot(h.db, fmt.Sprintf("org:%s", orgID))
 	usersCount := h.countOrgMembers(orgID)
+	activeUsersCount := h.countOrgActiveMembers(orgID)
+
+	var reposCount int
+	iter := h.db.Session().Query(`SELECT library_id FROM libraries WHERE org_id = ?`, orgID).Iter()
+	var libraryID gocql.UUID
+	for iter.Scan(&libraryID) {
+		reposCount++
+	}
+	_ = iter.Close()
+
+	var groupsCount int
+	iter = h.db.Session().Query(`SELECT group_id FROM groups WHERE org_id = ?`, orgID).Iter()
+	var groupID gocql.UUID
+	for iter.Scan(&groupID) {
+		groupsCount++
+	}
+	_ = iter.Close()
 
 	c.JSON(http.StatusOK, gin.H{
-		"org_id":         orgID,
-		"org_name":       name,
-		"storage_quota":  storageQuota,
-		"storage_usage":  traffic.ReadStorageUsed(h.db, fmt.Sprintf("org:%s", orgID)),
-		"member_usage":   usersCount,
-		"member_quota":   h.getOrgSettingInt(orgID, "max_user_number", 0),
-		"active_members": usersCount,
-		"ctime":          createdAt.Format(time.RFC3339),
+		"org_id":            orgID,
+		"org_name":          name,
+		"storage_quota":     storageQuota,
+		"storage_usage":     storageSnapshot.BytesUsed,
+		"total_files_count": storageSnapshot.FileCount,
+		"repos_count":       reposCount,
+		"groups_count":      groupsCount,
+		"member_usage":      usersCount,
+		"member_quota":      h.getOrgSettingInt(orgID, "max_user_number", 0),
+		"active_members":    activeUsersCount,
+		"ctime":             createdAt.Format(time.RFC3339),
 		// Traffic quota info
 		"plan":                   plan,
 		"billing_cycle":          billingCycle,
 		"traffic_quota":          trafficQuota,
+		"traffic_month_total":    monthlyUsage.Combined,
+		"traffic_month_upload":   monthlyUsage.Upload,
+		"traffic_month_download": monthlyUsage.Download,
 		"traffic_combined_used":  monthlyUsage.Combined,
 		"traffic_upload_quota":   trafficUploadQuota,
 		"traffic_upload_used":    monthlyUsage.Upload,
 		"traffic_download_quota": trafficDownloadQuota,
 		"traffic_download_used":  monthlyUsage.Download,
+		"traffic_year_total":     yearlyUsage.Combined,
+		"traffic_year_upload":    yearlyUsage.Upload,
+		"traffic_year_download":  yearlyUsage.Download,
 		"max_users":              maxUsers,
 	})
 }
@@ -465,53 +500,17 @@ func (h *OrgAdminHandler) UpdateOrgInfo(c *gin.Context) {
 		}
 	}
 
+	if maxUsersStr != "" || trafficQuotaStr != "" || trafficUploadQuotaStr != "" || trafficDownloadQuotaStr != "" {
+		c.JSON(http.StatusForbidden, gin.H{"error": "organization limits are managed by billing"})
+		return
+	}
+
 	if orgName != "" {
 		if err := h.db.Session().Query(`
 			UPDATE organizations SET name = ? WHERE org_id = ?
 		`, orgName, orgID).Exec(); err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update organization"})
 			return
-		}
-	}
-
-	if maxUsersStr != "" {
-		if err := h.db.Session().Query(`
-			UPDATE organizations SET settings['max_user_number'] = ? WHERE org_id = ?
-		`, maxUsersStr, orgID).Exec(); err != nil {
-			log.Printf("UpdateOrgInfo: failed to update max_user_number for org %s: %v", orgID, err)
-		}
-	}
-
-	if trafficQuotaStr != "" {
-		if quota, err := strconv.ParseInt(trafficQuotaStr, 10, 64); err == nil {
-			if err := h.db.Session().Query(`
-				UPDATE organizations SET traffic_quota = ? WHERE org_id = ?
-			`, quota, orgID).Exec(); err != nil {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update organization"})
-				return
-			}
-		}
-	}
-
-	if trafficUploadQuotaStr != "" {
-		if quota, err := strconv.ParseInt(trafficUploadQuotaStr, 10, 64); err == nil {
-			if err := h.db.Session().Query(`
-				UPDATE organizations SET traffic_upload_quota = ? WHERE org_id = ?
-			`, quota, orgID).Exec(); err != nil {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update organization"})
-				return
-			}
-		}
-	}
-
-	if trafficDownloadQuotaStr != "" {
-		if quota, err := strconv.ParseInt(trafficDownloadQuotaStr, 10, 64); err == nil {
-			if err := h.db.Session().Query(`
-				UPDATE organizations SET traffic_download_quota = ? WHERE org_id = ?
-			`, quota, orgID).Exec(); err != nil {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update organization"})
-				return
-			}
 		}
 	}
 
@@ -1246,6 +1245,19 @@ func (h *OrgAdminHandler) countOrgMembers(orgID string) int {
 		count++
 	}
 	iter.Close()
+	return count
+}
+
+func (h *OrgAdminHandler) countOrgActiveMembers(orgID string) int {
+	count := 0
+	iter := h.db.Session().Query(`SELECT user_id, status FROM users WHERE org_id = ?`, orgID).Iter()
+	var userID, status string
+	for iter.Scan(&userID, &status) {
+		if IsUserUsable(status) {
+			count++
+		}
+	}
+	_ = iter.Close()
 	return count
 }
 

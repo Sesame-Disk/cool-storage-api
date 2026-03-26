@@ -28,6 +28,40 @@ import (
 // System Info — GET /admin/sysinfo/
 // ============================================================================
 
+func readPlatformTrafficUsage(session *gocql.Session, months []string) traffic.MonthlyTransferUsage {
+	usage := traffic.MonthlyTransferUsage{}
+	for _, month := range months {
+		iter := session.Query(
+			`SELECT user_id, traffic_type, bytes_transferred FROM traffic_counters WHERE org_id = ? AND month = ?`,
+			gocql.UUID{}, month,
+		).Iter()
+		var userUUID gocql.UUID
+		var trafficType string
+		var bytes int64
+		for iter.Scan(&userUUID, &trafficType, &bytes) {
+			if userUUID != (gocql.UUID{}) {
+				continue
+			}
+			usage.Combined += bytes
+			if strings.HasSuffix(trafficType, "-upload") {
+				usage.Upload += bytes
+			} else if strings.HasSuffix(trafficType, "-download") {
+				usage.Download += bytes
+			}
+		}
+		_ = iter.Close()
+	}
+	return usage
+}
+
+func yearToDateMonthKeys(now time.Time) []string {
+	months := make([]string, 0, int(now.Month()))
+	for month := time.January; month <= now.Month(); month++ {
+		months = append(months, time.Date(now.Year(), month, 1, 0, 0, 0, 0, time.UTC).Format("200601"))
+	}
+	return months
+}
+
 func (h *AdminHandler) AdminGetSysInfo(c *gin.Context) {
 	callerOrgID := c.GetString("org_id")
 	callerUserID := c.GetString("user_id")
@@ -35,22 +69,28 @@ func (h *AdminHandler) AdminGetSysInfo(c *gin.Context) {
 		return
 	}
 
-	// Count users
+	// Count users and usable users.
 	var usersCount int
-	iter := h.db.Session().Query(`SELECT user_id FROM users`).Iter()
-	var dummy string
-	for iter.Scan(&dummy) {
+	var activeUsersCount int
+	iter := h.db.Session().Query(`SELECT user_id, status FROM users`).Iter()
+	var userID gocql.UUID
+	var status string
+	for iter.Scan(&userID, &status) {
 		usersCount++
+		if IsUserUsable(status) {
+			activeUsersCount++
+		}
 	}
-	iter.Close()
+	_ = iter.Close()
 
 	// Count libraries
 	var reposCount int
+	var dummy gocql.UUID
 	iter = h.db.Session().Query(`SELECT library_id FROM libraries`).Iter()
 	for iter.Scan(&dummy) {
 		reposCount++
 	}
-	iter.Close()
+	_ = iter.Close()
 
 	// Count groups
 	var groupsCount int
@@ -58,7 +98,7 @@ func (h *AdminHandler) AdminGetSysInfo(c *gin.Context) {
 	for iter.Scan(&dummy) {
 		groupsCount++
 	}
-	iter.Close()
+	_ = iter.Close()
 
 	// Count organizations
 	var orgCount int
@@ -66,13 +106,18 @@ func (h *AdminHandler) AdminGetSysInfo(c *gin.Context) {
 	for iter.Scan(&dummy) {
 		orgCount++
 	}
-	iter.Close()
+	_ = iter.Close()
+
+	platformStorage := traffic.ReadStorageSnapshot(h.db, "platform")
+	now := time.Now().UTC()
+	monthUsage := readPlatformTrafficUsage(h.db.Session(), []string{traffic.CurrentMonth()})
+	yearUsage := readPlatformTrafficUsage(h.db.Session(), yearToDateMonthKeys(now))
 
 	c.JSON(http.StatusOK, gin.H{
 		"users_count":                     usersCount,
-		"active_users_count":              usersCount, // Approximate
+		"active_users_count":              activeUsersCount,
 		"repos_count":                     reposCount,
-		"total_files_count":               0, // Would require scanning all libraries
+		"total_files_count":               platformStorage.FileCount,
 		"groups_count":                    groupsCount,
 		"org_count":                       orgCount,
 		"multi_tenancy_enabled":           true,
@@ -82,9 +127,15 @@ func (h *AdminHandler) AdminGetSysInfo(c *gin.Context) {
 		"license_mode":                    "subscription",
 		"license_maxusers":                1000,
 		"license_to":                      "SesameFS",
-		"total_storage":                   int64(0),
-		"total_devices_count":             0,
-		"current_connected_devices_count": 0,
+		"total_storage":                   platformStorage.BytesUsed,
+		"traffic_month_total":             monthUsage.Combined,
+		"traffic_month_upload":            monthUsage.Upload,
+		"traffic_month_download":          monthUsage.Download,
+		"traffic_year_total":              yearUsage.Combined,
+		"traffic_year_upload":             yearUsage.Upload,
+		"traffic_year_download":           yearUsage.Download,
+		"total_devices_count":             nil,
+		"current_connected_devices_count": nil,
 	})
 }
 

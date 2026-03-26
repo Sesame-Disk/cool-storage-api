@@ -71,6 +71,7 @@ This document tracks all known bugs, limitations, and issues in SesameFS.
 | Activities Feed + Audit Logs | 🔴 Stub only — prioritize soon | Returns empty `{events:[]}`. Needs 5 DB tables, ~15 handler integrations. See ADMIN-FEATURES.md § 3 |
 | Published Libraries (Wikis) | ❌ Hidden + Stub | Nav hidden, `/api/v2.1/wikis/` returns `[]`. Needs wiki/publish backend |
 | Linked Devices | ❌ Hidden + Stub | Nav hidden, `/api2/devices/` returns `[]`. Needs device tracking on sync |
+| **Sysadmin Info Dashboard Has Residual Stubbed Metadata** | 🟡 Partial | `/admin/sysinfo` now returns real storage, file, active-user, and this-month/this-year traffic KPIs. Remaining gaps: device counts are still unavailable and license fields are still stubbed. See ISSUE-SYSINFO-KPI-01 below. |
 | Share Admin (Libraries/Folders/Links) | 🟡 Partial | Share link list/create/delete work; admin management + upload links still missing |
 | Watch/Unwatch Libraries | ❌ Deferred | Complex notification system needed |
 | Thumbnails | ❌ Not Started | Visual polish |
@@ -78,6 +79,48 @@ This document tracks all known bugs, limitations, and issues in SesameFS.
 | Frontend Test Coverage | 🟡 ~0.6% | 6 test files for 620+ source files |
 
 **For detailed implementation status, see**: `docs/IMPLEMENTATION_STATUS.md`
+
+---
+
+### ISSUE-SYSINFO-KPI-01: Sysadmin Info Dashboard Still Has Residual Stubbed Fields
+
+**Status**: 🟡 Partial fix (2026-03-26)
+**Severity**: Low-Medium — core KPIs are now usable; remaining gaps are secondary metadata
+**Affected**: `GET /api/v2.1/admin/sysinfo/`, superadmin info dashboard
+
+#### Problem
+
+The core sysadmin KPI issue is mostly resolved. The endpoint now returns real values for:
+
+- `active_users_count`
+- `total_files_count`
+- `total_storage`
+- `traffic_month_total`, `traffic_month_upload`, `traffic_month_download`
+- `traffic_year_total`, `traffic_year_upload`, `traffic_year_download`
+
+The remaining gaps are limited to residual stubbed or unavailable fields:
+
+- `total_devices_count` and `current_connected_devices_count` are still unavailable because device tracking is not implemented
+- license-related fields are still stubbed
+
+The page is now trustworthy for the main operational KPIs, but it still exposes non-authoritative metadata for licensing and devices.
+
+#### Fixed
+
+- Platform storage now comes from the `storage_counters` `platform` scope
+- Platform file count now comes from the same storage snapshot
+- Active users now use user lifecycle status instead of duplicating total users
+- Sysadmin overview now exposes this-month and this-year traffic KPIs
+
+#### Remaining Work
+
+- Keep device KPIs hidden or explicitly unavailable until device tracking exists
+- Either wire real licensing metadata or hide the license block in the frontend until it is authoritative
+
+#### Related Docs
+
+- `docs/DASHBOARD-REDESIGN-PLAN.md`
+- `docs/ADMIN-DASHBOARD-WIREFRAMES.md`
 
 ---
 

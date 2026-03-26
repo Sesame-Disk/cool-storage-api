@@ -461,6 +461,18 @@ if (dirent.is_locked) {
 - [ ] Share link functionality
 - [ ] File preview support
 - [ ] Mobile responsiveness improvements
+- [ ] Modernize superadmin and org admin dashboards using shared templates and updated styling. See `docs/DASHBOARD-REDESIGN-PLAN.md`
+
+### Admin Dashboard Modernization
+
+The current admin views are functionally useful but visually dated. A separate planning document now tracks the proposed redesign for superadmin and org admin surfaces, including:
+
+- A shared dashboard template layer
+- Modern KPI-first layouts
+- Stronger visual hierarchy and operational dashboards
+- Incremental adoption of Tailwind CSS for new admin surfaces
+
+See `docs/DASHBOARD-REDESIGN-PLAN.md`.
 
 ---
 

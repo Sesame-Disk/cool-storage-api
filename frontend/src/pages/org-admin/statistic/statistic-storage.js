@@ -29,14 +29,15 @@ class OrgStatisticStorage extends React.Component {
       let data = res.data;
       if (Array.isArray(data)) {
         data.forEach(item => {
-          labels.push(moment.utc(item.datetime).format('YYYY-MM-DD'));
+          labels.push(moment.utc(item.datetime).format(groupBy === 'month' ? 'YYYY-MM' : 'YYYY-MM-DD'));
           totalStorage.push(item.total_storage);
         });
         let total_storage = {
           label: gettext('Total Storage'),
           data: totalStorage,
           borderColor: '#fd913a',
-          backgroundColor: '#fd913a'};
+          backgroundColor: '#fd913a'
+        };
         filesData = [total_storage];
       }
       this.setState({
@@ -52,7 +53,7 @@ class OrgStatisticStorage extends React.Component {
 
   render() {
     let { labels, filesData, isLoading } = this.state;
-    return(
+    return (
       <Fragment>
         <MainPanelTopbar />
         <div className="cur-view-container">
@@ -64,7 +65,7 @@ class OrgStatisticStorage extends React.Component {
               <StatisticChart
                 labels={labels}
                 filesData={filesData}
-                suggestedMaxNumbers={10*1000*1000}
+                suggestedMaxNumbers={10 * 1000 * 1000}
                 isTitleCallback={true}
                 isTicksCallback={true}
                 isLegendStatus={false}

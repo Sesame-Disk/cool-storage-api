@@ -55,7 +55,7 @@
 | **Library CRUD** | ✅ COMPLETE | Mostly stable | ⚠️ Partial | 2026-01-08 | Create/delete/list working |
 | **Starred Files** | ✅ COMPLETE | Mostly stable | ❌ No | 2026-01-08 | Fixed Cassandra query issue |
 | **OnlyOffice Integration** | 🔒 FROZEN | **STABLE** | ❌ No | 2026-02-12 | Document editing stable — doc key rotation fix (was causing toolbar greying out) + JWT 8h expiry |
-| **Frontend (React)** | 🟡 PARTIAL | **UNSTABLE** | N/A | 2026-01-30 | Library list works, all modals migrated, ~51 ModalPortal wrappers to remove |
+| **Frontend (React)** | 🟡 PARTIAL | **UNSTABLE** | N/A | 2026-03-26 | Library list works, all modals migrated, ~51 ModalPortal wrappers to remove. Admin dashboard modernization is documented but not implemented yet. |
 | **Frontend Logout** | 🔒 FROZEN | **STABLE** | N/A | 2026-01-27 | Working - nginx proxies /accounts/ to backend |
 | **User Management** | ✅ COMPLETE | Mostly stable | ❌ No | 2026-01-28 | OIDC login + dev tokens supported |
 | **Database Seeding** | ✅ COMPLETE | Mostly stable | ❌ No | 2026-01-23 | Auto-creates default org + admin user on first run |
@@ -72,6 +72,7 @@
 | **OIDC Group/Dept Sync** | ✅ COMPLETE | Mostly stable | ❌ No | 2026-02-02 | Claims extraction, sync on login, full sync mode |
 | **Garbage Collection** | ✅ COMPLETE | Mostly stable | ❌ No | 2026-03-18 | 9 item types (incl. `user_cascade`, `library_cascade`, `org_cascade`), 12 scanner phases, soft-delete cascades for users (7-day grace), libraries (30-day trash), orgs (30-day grace). Full artifact cleanup, atomic group deletion, audit log, health metrics |
 | **Admin Panel (Groups/Users)** | ✅ COMPLETE | Mostly stable | ❌ No | 2026-02-02 | 16 admin endpoints + OIDC group/dept sync, 29 tests |
+| **Admin Dashboard KPIs** | 🟡 PARTIAL | Mostly stable | ❌ No | 2026-03-26 | Sysadmin and org-admin overview KPIs now use real storage, file, active-user, and this-month/this-year traffic data. Remaining gaps: device counts are unavailable and sysadmin license metadata is still stubbed. Redesign backlog remains documented in `docs/DASHBOARD-REDESIGN-PLAN.md` and `docs/ADMIN-DASHBOARD-WIREFRAMES.md`. |
 | **Admin Library Management** | ✅ COMPLETE | Mostly stable | ❌ No | 2026-02-12 | 12 endpoints in admin.go + seafile-api.js methods + trash libraries |
 | **Admin Link Management** | ✅ COMPLETE | Mostly stable | ❌ No | 2026-02-12 | 13 endpoints: share link admin (list/delete), upload links (user CRUD + admin), per-user links. See [ADMIN-FEATURES.md](ADMIN-FEATURES.md) § 2 |
 | **Superadmin Departments/Address Book** | ✅ COMPLETE | Mostly stable | ❌ No | 2026-03-05 | 9 endpoints: dept CRUD, address book groups, group-owned libraries. See [ADMIN-FEATURES.md](ADMIN-FEATURES.md) § 4 |
