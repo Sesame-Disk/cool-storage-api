@@ -186,7 +186,7 @@ The role claim tells SesameFS what role to assign the user.
 | `guest`, `external` | `guest` | Shared content only |
 | *(anything else)* | Config `default_role` (default: `user`) | Fallback |
 
-**Important**: A `superadmin` role is only effective when the user's org claim resolves to the platform org. A user with `superadmin` role in a regular tenant org is treated as a regular superadmin but cannot access platform admin endpoints (the `RequireSuperAdmin` middleware checks both role AND org).
+**Important**: A `superadmin` role is only effective when the user's org claim resolves to the platform org. If OIDC or legacy DB state yields `superadmin` for a regular tenant org, SesameFS normalizes that role to `owner` and persists the correction on login.
 
 ### Provisioning Logic (What Happens on Login)
 
@@ -209,8 +209,8 @@ SesameFS receives ID token + userinfo
         │   └─ Yes → continue
         │
         ├─ Does user exist? (lookup via users_by_oidc table: oidc_issuer + oidc_sub)
-        │   ├─ No + auto_provision=true → CREATE user (new UUID, email from claims, role from OIDC)
-        │   └─ Yes → ROLE SYNC: if DB role ≠ OIDC role, UPDATE role in DB (OIDC is source of truth)
+        │   ├─ No + auto_provision=true → CREATE user (new UUID, email from claims, normalized role)
+        │   └─ Yes → ROLE SYNC: if DB role ≠ normalized OIDC role, UPDATE role in DB
         │
         └─ Create session (JWT), update users.last_login_at → return to frontend
 ```
@@ -219,12 +219,12 @@ SesameFS receives ID token + userinfo
 
 ### Role Sync on Re-Login
 
-Every time an existing user logs in, SesameFS compares the role from the OIDC token with the role stored in the database. If they differ, the DB is updated to match the OIDC claim. This means:
+Every time an existing user logs in, SesameFS compares the normalized role from the OIDC token with the role stored in the database. If they differ, the DB is updated to the normalized role. This means:
 
 - **Promotions** (e.g., user → admin): Take effect on next login
 - **Demotions** (e.g., admin → readonly): Take effect on next login
-- **OIDC provider is the single source of truth** for roles
-- The admin API can also deactivate users (sets role to `deactivated`), but OIDC re-login will overwrite this — so deactivation should also be done at the OIDC provider level
+- **Platform safety override**: `superadmin` is reserved for the platform org; tenant `superadmin` claims are downgraded to `owner`
+- Lifecycle state is enforced via `status`, not by pseudo-roles like `deactivated`
 
 ### What the OIDC Provider Must Support
 
@@ -339,15 +339,15 @@ Sets `settings['status'] = 'deactivated'` on the org. The platform org (`0000000
 **Response** `200`: `{"success": true}`
 **Response** `403`: `{"error": "cannot deactivate platform organization"}`
 
-### User Management (Superadmin or Tenant Admin)
+### User Management Through Admin Surfaces
 
-User endpoints allow **superadmin** (any org) or **tenant admin** (own org only).
+Platform-wide user endpoints under `/api/v2.1/admin/...` now require a real platform superadmin. Org-scoped user administration lives under `/api/v2.1/org/...`.
 
 #### List Org Users
 ```
 GET /api/v2.1/admin/organizations/:org_id/users/
 ```
-**Permission**: Superadmin for any org, tenant admin for own org only.
+**Permission**: Platform superadmin only.
 
 **Response** `200`:
 ```json
@@ -371,7 +371,7 @@ Note: `quota_bytes = -2` means "use org default quota".
 ```
 GET /api/v2.1/admin/users/:user_id/
 ```
-**Limitation**: Superadmin gets `501 Not Implemented` (Cassandra schema requires org_id for user lookup — use the org users list endpoint instead). Tenant admin can look up users in their own org.
+**Limitation**: The platform-superadmin lookup by bare user id still gets `501 Not Implemented` because Cassandra lookup needs `org_id`; use the org users list endpoint instead.
 
 #### Update User
 ```
@@ -395,12 +395,12 @@ Content-Type: application/json
 ```
 DELETE /api/v2.1/admin/users/:user_id/
 ```
-Sets user's role to `deactivated`. Cannot deactivate yourself.
+Sets user's `status` to `deactivated` and invalidates active sessions. Cannot deactivate yourself.
 
 **Response** `200`: `{"success": true}`
 **Response** `400`: `{"error": "cannot deactivate your own account"}`
 
-**Note**: Deactivated users will be re-activated on next OIDC login (role syncs from OIDC). To permanently deactivate, also disable the user in the OIDC provider.
+**Note**: Deactivated users remain blocked because lifecycle is enforced via `status`. To prevent future reactivation, also disable the user in the OIDC provider.
 
 ---
 

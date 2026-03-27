@@ -22,6 +22,7 @@ import (
 
 	"github.com/Sesame-Disk/sesamefs/internal/config"
 	"github.com/Sesame-Disk/sesamefs/internal/db"
+	"github.com/Sesame-Disk/sesamefs/internal/middleware"
 	"github.com/Sesame-Disk/sesamefs/internal/traffic"
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
 	"github.com/golang-jwt/jwt/v5"
@@ -687,6 +688,7 @@ func (c *OIDCClient) provisionUser(ctx context.Context, claims *IDTokenClaims, u
 	if oidcProvidedRole {
 		role = c.mapOIDCRole(roles[0])
 	}
+	role = c.normalizeRoleForOrg(orgID, role)
 
 	// Auto-provision organization if it doesn't exist
 	isNewOrg := false
@@ -717,9 +719,9 @@ func (c *OIDCClient) provisionUser(ctx context.Context, claims *IDTokenClaims, u
 				int64(2147483648), int64(0), int64(17592186044415), // 2GB storage
 				map[string]string{"default_backend": "s3"},
 				now,
-				"free",    // plan
-				"hard",    // quota_policy
-				"monthly", // billing_cycle
+				"free",             // plan
+				"hard",             // quota_policy
+				"monthly",          // billing_cycle
 				int64(10737418240), // traffic_quota: 10GB
 				int64(-1),          // traffic_upload_quota
 				int64(-1),          // traffic_download_quota
@@ -784,7 +786,15 @@ func (c *OIDCClient) provisionUser(ctx context.Context, claims *IDTokenClaims, u
 				if roleErr := c.db.Session().Query(`
 					SELECT role FROM users WHERE org_id = ? AND user_id = ?
 				`, orgID, userID).Scan(&dbRole); roleErr == nil {
-					role = dbRole
+					normalizedDBRole := c.normalizeRoleForOrg(orgID, dbRole)
+					if normalizedDBRole != dbRole {
+						if updateErr := c.db.Session().Query(`
+							UPDATE users SET role = ? WHERE org_id = ? AND user_id = ?
+						`, normalizedDBRole, orgID, userID).Exec(); updateErr != nil {
+							fmt.Printf("Warning: failed to normalize role for existing user: %v\n", updateErr)
+						}
+					}
+					role = normalizedDBRole
 				}
 
 				if err := c.attachOIDCIdentity(userID, orgID, email, claims.Subject); err != nil {
@@ -853,6 +863,17 @@ func (c *OIDCClient) provisionUser(ctx context.Context, claims *IDTokenClaims, u
 			SELECT role FROM users WHERE org_id = ? AND user_id = ?
 		`, orgID, userID).Scan(&dbRole)
 		if roleErr == nil {
+			normalizedDBRole := c.normalizeRoleForOrg(orgID, dbRole)
+			if normalizedDBRole != dbRole {
+				if updateErr := c.db.Session().Query(`
+					UPDATE users SET role = ? WHERE org_id = ? AND user_id = ?
+				`, normalizedDBRole, orgID, userID).Exec(); updateErr != nil {
+					fmt.Printf("Warning: failed to normalize role from DB: %v\n", updateErr)
+				}
+				dbRole = normalizedDBRole
+			}
+
+			role = c.normalizeRoleForOrg(orgID, role)
 			if dbRole == "superadmin" && orgID == c.config.PlatformOrgID {
 				// Superadmin promoted via script — preserve their role
 				role = dbRole
@@ -1056,6 +1077,13 @@ func (c *OIDCClient) mapOIDCRole(oidcRole string) string {
 	default:
 		return c.config.DefaultRole
 	}
+}
+
+func (c *OIDCClient) normalizeRoleForOrg(orgID, role string) string {
+	if role == string(middleware.RoleSuperAdmin) && orgID != c.config.PlatformOrgID {
+		return string(middleware.RoleOwner)
+	}
+	return role
 }
 
 // isValidRedirectURI checks if a redirect URI is in the allowed list

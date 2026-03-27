@@ -676,19 +676,19 @@ func (s *Server) setupRoutes() {
 				sessionInvalidator = s.authHandler.GetSessionManager()
 			}
 
-			// Admin API endpoints (superadmin and tenant admin)
+			// Admin API endpoints (platform superadmin only)
 			v2.RegisterAdminRoutes(protected, s.db, s.config, s.permMiddleware, s.tokenStore, sessionInvalidator, serverURL)
 
 			// Org-admin API endpoints (/api/v2.1/org/... — tenant admin for own org)
 			v2.RegisterOrgAdminRoutes(protected, s.db, s.config, s.permMiddleware, sessionInvalidator)
 
-			// GC admin endpoints (staff only)
+			// GC admin endpoints (platform superadmin only)
 			if s.gcService != nil {
-				admin := protected.Group("/admin")
-				admin.GET("/gc/status", s.handleGCStatus)
-				admin.GET("/gc/status/", s.handleGCStatus)
-				admin.POST("/gc/run", s.handleGCRun)
-				admin.POST("/gc/run/", s.handleGCRun)
+				gcAdmin := protected.Group("/admin", s.permMiddleware.RequireSuperAdmin())
+				gcAdmin.GET("/gc/status", s.handleGCStatus)
+				gcAdmin.GET("/gc/status/", s.handleGCStatus)
+				gcAdmin.POST("/gc/run", s.handleGCRun)
+				gcAdmin.POST("/gc/run/", s.handleGCRun)
 			}
 
 			// Library endpoints with v2.1 response format
@@ -944,7 +944,7 @@ func (s *Server) setupRoutes() {
 		// Resolve user email once for injection into whichever HTML we serve.
 		email := s.resolveUserEmail(c)
 
-		// Serve admin panel for /sys/* routes — gate by superadmin role
+		// Serve admin panel for /sys/* routes — gate by platform superadmin role.
 		if strings.HasPrefix(c.Request.URL.Path, "/sys/") || c.Request.URL.Path == "/sys" {
 			authUserID, authOrgID, authRole := s.resolveUserAuth(c)
 			if authOrgID == "" {
@@ -960,7 +960,7 @@ func (s *Server) setupRoutes() {
 					authRole = dbRole
 				}
 			}
-			if authRole != "superadmin" || authOrgID != middleware.PlatformOrgID {
+			if !middleware.IsPlatformSuperAdmin(authOrgID, middleware.OrganizationRole(authRole)) {
 				s.serveAccessDenied(c, "Access Denied", "You do not have permission to access the System Administration panel.")
 				return
 			}
@@ -1972,7 +1972,7 @@ func (s *Server) handleAccountInfo(c *gin.Context) {
 
 	// Determine permissions based on role.
 	// Phase 1 keeps legacy account/info flags role-based; owner behaves like admin-level org staff.
-	isStaff := role == "superadmin"
+	isStaff := middleware.IsPlatformSuperAdmin(orgID, middleware.OrganizationRole(role))
 	canManageContent := middleware.HasRequiredOrgRole(middleware.OrganizationRole(role), middleware.RoleUser)
 	canAddRepo := canManageContent
 	canShareRepo := canManageContent
@@ -2475,16 +2475,10 @@ func (s *Server) handleCreateRepoTag(c *gin.Context) {
 	})
 }
 
-// handleGCStatus returns the current GC status
+// handleGCStatus returns the current GC status.
+// Protected by RequireSuperAdmin() middleware at the route group level.
 // GET /api/v2.1/admin/gc/status
 func (s *Server) handleGCStatus(c *gin.Context) {
-	// Check staff permission
-	role := c.GetString("role")
-	if role != "admin" && role != "superadmin" {
-		c.JSON(http.StatusForbidden, gin.H{"error": "admin access required"})
-		return
-	}
-
 	if s.gcService == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "GC service not available"})
 		return
@@ -2493,16 +2487,10 @@ func (s *Server) handleGCStatus(c *gin.Context) {
 	c.JSON(http.StatusOK, s.gcService.Status())
 }
 
-// handleGCRun triggers a manual GC run
+// handleGCRun triggers a manual GC run.
+// Protected by RequireSuperAdmin() middleware at the route group level.
 // POST /api/v2.1/admin/gc/run
 func (s *Server) handleGCRun(c *gin.Context) {
-	// Check staff permission
-	role := c.GetString("role")
-	if role != "admin" && role != "superadmin" {
-		c.JSON(http.StatusForbidden, gin.H{"error": "admin access required"})
-		return
-	}
-
 	if s.gcService == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "GC service not available"})
 		return

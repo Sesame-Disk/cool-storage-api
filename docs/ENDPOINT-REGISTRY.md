@@ -902,7 +902,7 @@ Before implementing a new endpoint:
 **Handler**: `AdminHandler.ListAllUsers` (dispatched via `adminUsersHandler`)
 **File**: `internal/api/v2/admin.go`
 **Registration**: `admin.Any("/users", h.adminUsersHandler)` + `admin.Any("/users/*path", h.adminUsersHandler)`
-**Purpose**: List all users with pagination. Superadmin queries ALL orgs; tenant admin sees own org only
+**Purpose**: List all users with pagination from the platform-superadmin surface. The caller can query across all orgs.
 **Response**: `{ "data": [...], "total_count": N }`
 **Added**: 2026-02-02 | **Updated**: 2026-02-23 (multi-org superadmin fix)
 
@@ -910,7 +910,7 @@ Before implementing a new endpoint:
 **Handler**: `AdminHandler.AdminCreateUser` (dispatched via `adminUsersHandler`)
 **File**: `internal/api/v2/admin.go`
 **Registration**: via `adminUsersHandler`
-**Purpose**: Create a new user in the caller's org. Dual-writes to `users` + `users_by_email`
+**Purpose**: Create a new user in the target org selected through the platform-superadmin surface. Dual-writes to `users` + `users_by_email`
 **Added**: 2026-02-02
 
 ### GET /api/v2.1/admin/users/:email/
@@ -938,7 +938,7 @@ Before implementing a new endpoint:
 **Handler**: `AdminHandler.ListAdminUsers`
 **File**: `internal/api/v2/admin.go`
 **Registration**: `admin.GET("/admins/", h.ListAdminUsers)`
-**Purpose**: List users with admin or superadmin role. Superadmin queries ALL orgs
+**Purpose**: List users with elevated roles from the platform-superadmin surface across all orgs
 **Response**: `{ "admin_user_list": [...] }`
 **Added**: 2026-02-02 | **Updated**: 2026-02-23 (multi-org fix + response key change: `"data"` → `"admin_user_list"`)
 
@@ -946,7 +946,7 @@ Before implementing a new endpoint:
 **Handler**: `AdminHandler.SearchUsers`
 **File**: `internal/api/v2/admin.go`
 **Registration**: `admin.GET("/search-user/", h.SearchUsers)`
-**Purpose**: Search users by email or name. Superadmin searches ALL orgs
+**Purpose**: Search users by email or name from the platform-superadmin surface across all orgs
 **Response**: `{ "users": [...] }`
 **Added**: 2026-02-02 | **Updated**: 2026-02-23 (multi-org superadmin fix)
 

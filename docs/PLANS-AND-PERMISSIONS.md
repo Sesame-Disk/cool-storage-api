@@ -753,6 +753,12 @@ Implementation notes:
 | 2.1 | Create enforcement profile resolver | New: `internal/plans/resolver.go` | Medium |
 | 2.2 | Create role permission map (hardcoded) | New: `internal/plans/roles.go` | Low |
 | 2.3 | Create `ResolveCapabilities(role, quotaPolicy)` with `upgrade_features` | `internal/plans/resolver.go` | Medium |
+
+### Pending Compatibility Cleanup
+
+- Wire/frontend naming still uses legacy fields such as `is_staff` and `is_org_staff`.
+- Canonical semantics are now: platform superadmin vs org staff.
+- Pending follow-up: introduce clearer API/frontend names such as `isSuperAdmin` or `isPlatformSuperAdmin`, keep legacy aliases during migration, then remove ambiguity once clients are updated.
 | 2.4 | Add `traffic_period_usage` aggregate table for enforcement performance | `internal/db/db.go`, `internal/traffic/recorder.go` | Medium |
 | 2.5 | Update `account/info` to return resolved capabilities + quota state + current period fields | `internal/api/server.go` | Medium |
 | 2.6 | Update `subscription` endpoint with quota state objects and current period fields | `internal/api/server.go` | Low |

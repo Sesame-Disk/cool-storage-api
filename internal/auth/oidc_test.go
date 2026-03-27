@@ -259,9 +259,9 @@ func TestOIDCClient_GetDiscovery_InvalidIssuer(t *testing.T) {
 // TestOIDCClient_ValidateRedirectURI tests redirect URI validation
 func TestOIDCClient_ValidateRedirectURI(t *testing.T) {
 	tests := []struct {
-		name         string
-		allowedURIs  []string
-		testURI      string
+		name          string
+		allowedURIs   []string
+		testURI       string
 		shouldBeValid bool
 	}{
 		{
@@ -512,6 +512,34 @@ func TestOIDCClient_MapOIDCRole(t *testing.T) {
 			got := client.mapOIDCRole(tt.oidcRole)
 			if got != tt.expectedRole {
 				t.Errorf("mapOIDCRole(%q) = %q, want %q", tt.oidcRole, got, tt.expectedRole)
+			}
+		})
+	}
+}
+
+func TestOIDCClient_NormalizeRoleForOrg(t *testing.T) {
+	client := &OIDCClient{
+		config: &config.OIDCConfig{
+			PlatformOrgID: "00000000-0000-0000-0000-000000000000",
+		},
+	}
+
+	tests := []struct {
+		name     string
+		orgID    string
+		role     string
+		expected string
+	}{
+		{name: "platform keeps superadmin", orgID: "00000000-0000-0000-0000-000000000000", role: "superadmin", expected: "superadmin"},
+		{name: "tenant clamps superadmin to owner", orgID: "tenant-org", role: "superadmin", expected: "owner"},
+		{name: "tenant keeps owner", orgID: "tenant-org", role: "owner", expected: "owner"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := client.normalizeRoleForOrg(tt.orgID, tt.role)
+			if got != tt.expected {
+				t.Fatalf("normalizeRoleForOrg(%q, %q) = %q, want %q", tt.orgID, tt.role, got, tt.expected)
 			}
 		})
 	}
@@ -1000,9 +1028,9 @@ func TestParseRSAJWK(t *testing.T) {
 // TestParseGroupClaims tests parsing of group claims in various formats
 func TestParseGroupClaims(t *testing.T) {
 	tests := []struct {
-		name   string
-		raw    interface{}
-		want   []GroupClaim
+		name string
+		raw  interface{}
+		want []GroupClaim
 	}{
 		{
 			name: "string array",
@@ -1326,7 +1354,7 @@ func TestOIDCClient_GetUserInfo(t *testing.T) {
 				Issuer:   server.URL,
 				ClientID: "test-client",
 			},
-			states:    make(map[string]*AuthState),
+			states: make(map[string]*AuthState),
 			discovery: &OIDCDiscovery{
 				Issuer:           server.URL,
 				UserInfoEndpoint: server.URL + "/userinfo",

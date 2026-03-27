@@ -42,12 +42,12 @@ func NewAdminHandler(database *db.DB, cfg *config.Config, perm *middleware.Permi
 	}
 }
 
-// RegisterAdminRoutes registers admin API routes under the given router group.
-// All org CRUD endpoints require superadmin. User management allows tenant admin for own org.
+// RegisterAdminRoutes registers platform-admin API routes under the given router group.
+// All /admin endpoints are reserved for platform superadmins.
 func RegisterAdminRoutes(rg *gin.RouterGroup, database *db.DB, cfg *config.Config, perm *middleware.PermissionMiddleware, tokenCreator TokenCreator, sessions SessionInvalidator, serverURL string) {
 	h := NewAdminHandler(database, cfg, perm, tokenCreator, sessions, serverURL)
 
-	admin := rg.Group("/admin")
+	admin := rg.Group("/admin", perm.RequireSuperAdmin())
 	{
 		// Organization management - read operations (admin or above, checked in handler)
 		admin.GET("/organizations/", h.ListOrganizations)
@@ -74,7 +74,7 @@ func RegisterAdminRoutes(rg *gin.RouterGroup, database *db.DB, cfg *config.Confi
 			superadminOnly.POST("/organizations/:org_id/restore", h.RestoreOrganization)
 		}
 
-		// User listing per org (superadmin or tenant admin for own org)
+		// User listing per org (platform superadmin only)
 		admin.GET("/organizations/:org_id/users/", h.ListOrgUsers)
 		admin.GET("/organizations/:org_id/users", h.ListOrgUsers)
 		admin.POST("/organizations/:org_id/users/", h.AdminAddOrgUser)
@@ -922,7 +922,7 @@ func (h *AdminHandler) ReactivateOrganization(c *gin.Context) {
 }
 
 // ListOrgUsers lists users in an organization.
-// Superadmin can list any org. Tenant admin can list their own org.
+// Platform superadmin can list users for any organization.
 // GET /admin/organizations/:org_id/users/
 func (h *AdminHandler) ListOrgUsers(c *gin.Context) {
 	targetOrgID := c.Param("org_id")
@@ -934,7 +934,7 @@ func (h *AdminHandler) ListOrgUsers(c *gin.Context) {
 		return
 	}
 
-	// Check permissions: superadmin can access any org, admin can access own org
+	// Check permissions: only platform superadmin can access /admin routes.
 	if callerOrgID != middleware.PlatformOrgID {
 		// Not a platform user — must be admin of the target org
 		if callerOrgID != targetOrgID {
@@ -951,7 +951,7 @@ func (h *AdminHandler) ListOrgUsers(c *gin.Context) {
 	} else {
 		// Platform user — must be superadmin
 		role, err := h.permMiddleware.GetUserOrgRole(callerOrgID, callerUserID)
-		if err != nil || role != middleware.RoleSuperAdmin {
+		if err != nil || !middleware.IsPlatformSuperAdmin(callerOrgID, role) {
 			c.JSON(http.StatusForbidden, gin.H{"error": "insufficient permissions"})
 			c.Abort()
 			return
@@ -1109,7 +1109,7 @@ func (h *AdminHandler) GetUser(c *gin.Context) {
 		return
 	}
 
-	// Tenant admin: look up in own org
+	// /admin is platform-scoped, so direct user ID lookups stay within the platform org.
 	err := h.db.Session().Query(`
 		SELECT email, name, role, quota_bytes, created_at, last_login_at
 		FROM users WHERE org_id = ? AND user_id = ?
@@ -1133,7 +1133,6 @@ func (h *AdminHandler) GetUser(c *gin.Context) {
 	})
 }
 
-// UpdateUser updates a user's role, status, or quota.
 // PUT /admin/users/:user_id/
 // If :user_id contains an @ sign, it's treated as an email lookup (seafile-js compatible).
 func (h *AdminHandler) UpdateUser(c *gin.Context) {
@@ -1162,7 +1161,7 @@ func (h *AdminHandler) UpdateUser(c *gin.Context) {
 		return
 	}
 
-	// Tenant admin can only update users in their own org
+	// /admin is platform-scoped, so direct user ID updates operate within the platform org.
 	orgID := callerOrgID
 
 	// Validate role if provided
@@ -1171,8 +1170,12 @@ func (h *AdminHandler) UpdateUser(c *gin.Context) {
 		// Only superadmin can assign superadmin role
 		if *req.Role == "superadmin" {
 			role, _ := h.permMiddleware.GetUserOrgRole(callerOrgID, callerUserID)
-			if role != middleware.RoleSuperAdmin {
+			if !middleware.IsPlatformSuperAdmin(callerOrgID, role) {
 				c.JSON(http.StatusForbidden, gin.H{"error": "only superadmin can assign superadmin role"})
+				return
+			}
+			if orgID != middleware.PlatformOrgID {
+				c.JSON(http.StatusForbidden, gin.H{"error": "superadmin role is reserved for the platform organization"})
 				return
 			}
 			validRoles["superadmin"] = true
@@ -1237,7 +1240,7 @@ func (h *AdminHandler) SoftDeleteUser(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"success": true})
 }
 
-// requireAdminAccess checks that the caller is superadmin or tenant admin.
+// requireAdminAccess checks that the caller is a platform superadmin.
 // Returns a non-nil error (and writes the response) if not authorized.
 func (h *AdminHandler) requireAdminAccess(c *gin.Context, callerOrgID, callerUserID string) error {
 	role, err := h.permMiddleware.GetUserOrgRole(callerOrgID, callerUserID)
@@ -1246,11 +1249,12 @@ func (h *AdminHandler) requireAdminAccess(c *gin.Context, callerOrgID, callerUse
 		c.Abort()
 		return err
 	}
-	if !isAdminOrAbove(role) {
+	if !middleware.IsPlatformSuperAdmin(callerOrgID, role) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "insufficient permissions"})
 		c.Abort()
-		return fmt.Errorf("insufficient permissions: role %s", role)
+		return fmt.Errorf("insufficient permissions: role %s org %s", role, callerOrgID)
 	}
+	c.Set("user_org_role", role)
 	return nil
 }
 
@@ -1328,10 +1332,10 @@ func (h *AdminHandler) ListAllGroups(c *gin.Context) {
 		perPage = 25
 	}
 
-	// Determine which orgs to query: superadmin sees all, tenant admin sees own org
+	// Determine which orgs to query: platform superadmin may query all orgs.
 	callerRole, _ := h.permMiddleware.GetUserOrgRole(callerOrgID, callerUserID)
 	var orgIDs []string
-	if callerRole == middleware.RoleSuperAdmin {
+	if middleware.IsPlatformSuperAdmin(callerOrgID, callerRole) {
 		orgIter := h.db.Session().Query(`SELECT org_id FROM organizations`).Iter()
 		var oid string
 		for orgIter.Scan(&oid) {
@@ -1413,10 +1417,10 @@ func (h *AdminHandler) SearchGroups(c *gin.Context) {
 		return
 	}
 
-	// Determine which orgs to query: superadmin sees all, tenant admin sees own org
+	// Determine which orgs to query: platform superadmin may query all orgs.
 	callerRole, _ := h.permMiddleware.GetUserOrgRole(callerOrgID, callerUserID)
 	var orgIDs []string
-	if callerRole == middleware.RoleSuperAdmin {
+	if middleware.IsPlatformSuperAdmin(callerOrgID, callerRole) {
 		orgIter := h.db.Session().Query(`SELECT org_id FROM organizations`).Iter()
 		var oid string
 		for orgIter.Scan(&oid) {
@@ -1630,7 +1634,7 @@ func (h *AdminHandler) AdminTransferGroup(c *gin.Context) {
 	// Resolve the group's actual org_id from groups_by_id (superadmin may operate on groups outside their own org)
 	callerRole, _ := h.permMiddleware.GetUserOrgRole(callerOrgID, callerUserID)
 	orgID := callerOrgID
-	if callerRole == middleware.RoleSuperAdmin {
+	if middleware.IsPlatformSuperAdmin(callerOrgID, callerRole) {
 		var groupOrgID string
 		if err := h.db.Session().Query(`SELECT org_id FROM groups_by_id WHERE group_id = ?`, groupID).Scan(&groupOrgID); err == nil && groupOrgID != "" {
 			orgID = groupOrgID
@@ -1753,13 +1757,6 @@ func (h *AdminHandler) AdminListGroupMembers(c *gin.Context) {
 		return
 	}
 
-	// Tenant admins may only see groups in their own org.
-	callerRole, _ := h.permMiddleware.GetUserOrgRole(callerOrgID, callerUserID)
-	if callerRole != middleware.RoleSuperAdmin && orgID != callerOrgID {
-		c.JSON(http.StatusForbidden, gin.H{"error": "access denied"})
-		return
-	}
-
 	iter := h.db.Session().Query(`
 		SELECT user_id, role, added_at FROM group_members WHERE group_id = ?
 	`, groupID).Iter()
@@ -1840,13 +1837,6 @@ func (h *AdminHandler) AdminAddGroupMember(c *gin.Context) {
 	groupIter.Close()
 	if !found {
 		c.JSON(http.StatusNotFound, gin.H{"error": "group not found"})
-		return
-	}
-
-	// Tenant admins may only manage groups in their own org.
-	callerRole, _ := h.permMiddleware.GetUserOrgRole(callerOrgID, callerUserID)
-	if callerRole != middleware.RoleSuperAdmin && orgID != callerOrgID {
-		c.JSON(http.StatusForbidden, gin.H{"error": "access denied"})
 		return
 	}
 
@@ -1938,13 +1928,6 @@ func (h *AdminHandler) AdminRemoveGroupMember(c *gin.Context) {
 		return
 	}
 
-	// Tenant admins may only manage groups in their own org.
-	callerRole, _ := h.permMiddleware.GetUserOrgRole(callerOrgID, callerUserID)
-	if callerRole != middleware.RoleSuperAdmin && orgID != callerOrgID {
-		c.JSON(http.StatusForbidden, gin.H{"error": "access denied"})
-		return
-	}
-
 	// Resolve user by email
 	memberID, _, err := h.lookupUserByEmail(email)
 	if err != nil {
@@ -1982,13 +1965,6 @@ func (h *AdminHandler) AdminListGroupLibraries(c *gin.Context) {
 	groupIter.Close()
 	if !found {
 		c.JSON(http.StatusNotFound, gin.H{"error": "group not found"})
-		return
-	}
-
-	// Tenant admins may only see groups in their own org.
-	callerRole, _ := h.permMiddleware.GetUserOrgRole(callerOrgID, callerUserID)
-	if callerRole != middleware.RoleSuperAdmin && orgID != callerOrgID {
-		c.JSON(http.StatusForbidden, gin.H{"error": "access denied"})
 		return
 	}
 
@@ -2159,7 +2135,7 @@ func userMatchesStatusFilter(rawStatus, statusFilter string) bool {
 }
 
 // ListAllUsers lists all users with pagination.
-// Superadmin sees users across ALL orgs; tenant admin sees only own org.
+// Platform superadmin sees users across all orgs.
 // GET /admin/users/?page=N&per_page=N
 func (h *AdminHandler) ListAllUsers(c *gin.Context) {
 	callerOrgID := c.GetString("org_id")
@@ -2183,10 +2159,10 @@ func (h *AdminHandler) ListAllUsers(c *gin.Context) {
 		perPage = 25
 	}
 
-	// Determine which orgs to query: superadmin sees all, tenant admin sees own org
+	// Determine which orgs to query: platform superadmin may query all orgs.
 	callerRole, _ := h.permMiddleware.GetUserOrgRole(callerOrgID, callerUserID)
 	var orgIDs []string
-	if callerRole == middleware.RoleSuperAdmin {
+	if middleware.IsPlatformSuperAdmin(callerOrgID, callerRole) {
 		orgIter := h.db.Session().Query(`SELECT org_id FROM organizations`).Iter()
 		var oid string
 		for orgIter.Scan(&oid) {
@@ -2243,7 +2219,7 @@ func (h *AdminHandler) ListAllUsers(c *gin.Context) {
 }
 
 // SearchUsers searches users by email or name.
-// Superadmin searches across ALL orgs; tenant admin searches own org.
+// Platform superadmin searches across all orgs.
 // GET /admin/search-user/?query=...
 func (h *AdminHandler) SearchUsers(c *gin.Context) {
 	callerOrgID := c.GetString("org_id")
@@ -2279,9 +2255,9 @@ func (h *AdminHandler) SearchUsers(c *gin.Context) {
 
 	// If superadmin passes org_id param, restrict search to that org
 	filterOrgID := c.Query("org_id")
-	if filterOrgID != "" && callerRole == middleware.RoleSuperAdmin {
+	if filterOrgID != "" && middleware.IsPlatformSuperAdmin(callerOrgID, callerRole) {
 		orgIDs = []string{filterOrgID}
-	} else if callerRole == middleware.RoleSuperAdmin {
+	} else if middleware.IsPlatformSuperAdmin(callerOrgID, callerRole) {
 		orgIter := h.db.Session().Query(`SELECT org_id FROM organizations`).Iter()
 		var oid string
 		for orgIter.Scan(&oid) {
@@ -2485,8 +2461,12 @@ func (h *AdminHandler) UpdateUserByEmail(c *gin.Context, email string) {
 		validRoles := map[string]bool{"admin": true, "user": true, "readonly": true, "guest": true}
 		if newRole == "superadmin" {
 			role, _ := h.permMiddleware.GetUserOrgRole(callerOrgID, callerUserID)
-			if role != middleware.RoleSuperAdmin {
+			if !middleware.IsPlatformSuperAdmin(callerOrgID, role) {
 				c.JSON(http.StatusForbidden, gin.H{"error": "only superadmin can assign superadmin role"})
+				return
+			}
+			if userOrgID != middleware.PlatformOrgID {
+				c.JSON(http.StatusForbidden, gin.H{"error": "superadmin role is reserved for the platform organization"})
 				return
 			}
 			validRoles["superadmin"] = true
@@ -2694,7 +2674,7 @@ func (h *AdminHandler) ListAdminUsers(c *gin.Context) {
 	// Determine which orgs to query
 	callerRole, _ := h.permMiddleware.GetUserOrgRole(callerOrgID, callerUserID)
 	var orgIDs []string
-	if callerRole == middleware.RoleSuperAdmin {
+	if middleware.IsPlatformSuperAdmin(callerOrgID, callerRole) {
 		orgIter := h.db.Session().Query(`SELECT org_id FROM organizations`).Iter()
 		var oid string
 		for orgIter.Scan(&oid) {
@@ -2758,6 +2738,11 @@ func (h *AdminHandler) BatchAddAdmins(c *gin.Context) {
 		userID, userOrgID, err := h.lookupUserByEmail(email)
 		if err != nil {
 			failed = append(failed, gin.H{"email": email, "error_msg": "user not found"})
+			continue
+		}
+
+		if userOrgID != middleware.PlatformOrgID {
+			failed = append(failed, gin.H{"email": email, "error_msg": "superadmin role is reserved for the platform organization"})
 			continue
 		}
 
@@ -2918,10 +2903,10 @@ func (h *AdminHandler) AdminListAllLibraries(c *gin.Context) {
 		perPage = 25
 	}
 
-	// Determine which orgs to query: superadmin sees all, tenant admin sees own org
+	// Determine which orgs to query: platform superadmin may query all orgs.
 	callerRole, _ := h.permMiddleware.GetUserOrgRole(callerOrgID, callerUserID)
 	var orgIDs []string
-	if callerRole == middleware.RoleSuperAdmin {
+	if middleware.IsPlatformSuperAdmin(callerOrgID, callerRole) {
 		// Superadmin: query all orgs
 		orgIter := h.db.Session().Query(`SELECT org_id FROM organizations`).Iter()
 		var oid string
@@ -3041,7 +3026,7 @@ func (h *AdminHandler) AdminSearchLibraries(c *gin.Context) {
 
 	callerRole, _ := h.permMiddleware.GetUserOrgRole(callerOrgID, callerUserID)
 	var orgIDs []string
-	if callerRole == middleware.RoleSuperAdmin {
+	if middleware.IsPlatformSuperAdmin(callerOrgID, callerRole) {
 		orgIter := h.db.Session().Query(`SELECT org_id FROM organizations`).Iter()
 		var oid string
 		for orgIter.Scan(&oid) {
@@ -3147,13 +3132,6 @@ func (h *AdminHandler) AdminGetLibrary(c *gin.Context) {
 		return
 	}
 
-	// Tenant admin can only see libraries in their own org
-	callerRole, _ := h.permMiddleware.GetUserOrgRole(callerOrgID, callerUserID)
-	if callerRole != middleware.RoleSuperAdmin && orgID != callerOrgID {
-		c.JSON(http.StatusForbidden, gin.H{"error": "insufficient permissions"})
-		return
-	}
-
 	var libID, ownerID, name, description, storageClass, headCommitID string
 	var encrypted bool
 	var sizeBytes, fileCount int64
@@ -3224,12 +3202,6 @@ func (h *AdminHandler) AdminDeleteLibrary(c *gin.Context) {
 		return
 	}
 
-	callerRole, _ := h.permMiddleware.GetUserOrgRole(callerOrgID, callerUserID)
-	if callerRole != middleware.RoleSuperAdmin && orgID != callerOrgID {
-		c.JSON(http.StatusForbidden, gin.H{"error": "insufficient permissions"})
-		return
-	}
-
 	// Verify library exists and is not already deleted; fetch owner for storage accounting.
 	var ownerID string
 	var deletedAt time.Time
@@ -3297,13 +3269,6 @@ func (h *AdminHandler) AdminCreateLibrary(c *gin.Context) {
 	ownerUserID, ownerOrgID, err := h.lookupUserByEmail(ownerEmail)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "owner user not found"})
-		return
-	}
-
-	// Tenant admin can only create in own org
-	callerRole, _ := h.permMiddleware.GetUserOrgRole(callerOrgID, callerUserID)
-	if callerRole != middleware.RoleSuperAdmin && ownerOrgID != callerOrgID {
-		c.JSON(http.StatusForbidden, gin.H{"error": "cannot create library for user in different organization"})
 		return
 	}
 
@@ -3421,12 +3386,6 @@ func (h *AdminHandler) AdminTransferLibrary(c *gin.Context) {
 		return
 	}
 
-	callerRole, _ := h.permMiddleware.GetUserOrgRole(callerOrgID, callerUserID)
-	if callerRole != middleware.RoleSuperAdmin && orgID != callerOrgID {
-		c.JSON(http.StatusForbidden, gin.H{"error": "insufficient permissions"})
-		return
-	}
-
 	// Lookup new owner
 	newOwnerID, newOwnerOrgID, err := h.lookupUserByEmail(newOwnerEmail)
 	if err != nil {
@@ -3473,12 +3432,6 @@ func (h *AdminHandler) AdminGetHistorySetting(c *gin.Context) {
 		SELECT org_id FROM libraries_by_id WHERE library_id = ?
 	`, libraryID).Scan(&orgID); err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "library not found"})
-		return
-	}
-
-	callerRole, _ := h.permMiddleware.GetUserOrgRole(callerOrgID, callerUserID)
-	if callerRole != middleware.RoleSuperAdmin && orgID != callerOrgID {
-		c.JSON(http.StatusForbidden, gin.H{"error": "insufficient permissions"})
 		return
 	}
 
@@ -3533,12 +3486,6 @@ func (h *AdminHandler) AdminUpdateHistorySetting(c *gin.Context) {
 		return
 	}
 
-	callerRole, _ := h.permMiddleware.GetUserOrgRole(callerOrgID, callerUserID)
-	if callerRole != middleware.RoleSuperAdmin && orgID != callerOrgID {
-		c.JSON(http.StatusForbidden, gin.H{"error": "insufficient permissions"})
-		return
-	}
-
 	if err := h.db.Session().Query(`
 		UPDATE libraries SET version_ttl_days = ?, updated_at = ?
 		WHERE org_id = ? AND library_id = ?
@@ -3579,12 +3526,6 @@ func (h *AdminHandler) AdminGetDownloadLink(c *gin.Context) {
 		SELECT org_id FROM libraries_by_id WHERE library_id = ?
 	`, libraryID).Scan(&orgID); err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "library not found"})
-		return
-	}
-
-	callerRole, _ := h.permMiddleware.GetUserOrgRole(callerOrgID, callerUserID)
-	if callerRole != middleware.RoleSuperAdmin && orgID != callerOrgID {
-		c.JSON(http.StatusForbidden, gin.H{"error": "insufficient permissions"})
 		return
 	}
 
@@ -3643,12 +3584,6 @@ func (h *AdminHandler) AdminListDirents(c *gin.Context) {
 		SELECT org_id FROM libraries_by_id WHERE library_id = ?
 	`, libraryID).Scan(&orgID); err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "library not found"})
-		return
-	}
-
-	callerRole, _ := h.permMiddleware.GetUserOrgRole(callerOrgID, callerUserID)
-	if callerRole != middleware.RoleSuperAdmin && orgID != callerOrgID {
-		c.JSON(http.StatusForbidden, gin.H{"error": "insufficient permissions"})
 		return
 	}
 
@@ -3817,12 +3752,6 @@ func (h *AdminHandler) AdminListSharedItems(c *gin.Context) {
 		return
 	}
 
-	callerRole, _ := h.permMiddleware.GetUserOrgRole(callerOrgID, callerUserID)
-	if callerRole != middleware.RoleSuperAdmin && orgID != callerOrgID {
-		c.JSON(http.StatusForbidden, gin.H{"error": "insufficient permissions"})
-		return
-	}
-
 	var items []gin.H
 
 	// Query shares for this library
@@ -3889,7 +3818,7 @@ func (h *AdminHandler) AdminListTrashLibraries(c *gin.Context) {
 
 	callerRole, _ := h.permMiddleware.GetUserOrgRole(callerOrgID, callerUserID)
 	var orgIDs []string
-	if callerRole == middleware.RoleSuperAdmin {
+	if middleware.IsPlatformSuperAdmin(callerOrgID, callerRole) {
 		orgIter := h.db.Session().Query(`SELECT org_id FROM organizations`).Iter()
 		var oid string
 		for orgIter.Scan(&oid) {
@@ -3960,8 +3889,7 @@ func (h *AdminHandler) AdminListTrashLibraries(c *gin.Context) {
 }
 
 // AdminCleanTrashLibraries permanently deletes all soft-deleted libraries visible to the caller.
-// Superadmin: cleans trash across all organizations.
-// Org admin:  cleans trash only within their own organization.
+// Platform superadmin cleans trash across all organizations.
 //
 // For each trashed library this performs the same cleanup as PermanentDeleteRepo:
 //   - Enqueues all commits, fs_objects and blocks for GC (async)
@@ -3979,7 +3907,7 @@ func (h *AdminHandler) AdminCleanTrashLibraries(c *gin.Context) {
 
 	callerRole, _ := h.permMiddleware.GetUserOrgRole(callerOrgID, callerUserID)
 	var orgIDs []string
-	if callerRole == middleware.RoleSuperAdmin {
+	if middleware.IsPlatformSuperAdmin(callerOrgID, callerRole) {
 		orgIter := h.db.Session().Query(`SELECT org_id FROM organizations`).Iter()
 		var oid string
 		for orgIter.Scan(&oid) {

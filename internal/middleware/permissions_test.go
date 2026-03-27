@@ -151,6 +151,18 @@ func TestRequireSuperAdmin_RejectsEmptyAuth(t *testing.T) {
 	}
 }
 
+func TestIsPlatformSuperAdmin(t *testing.T) {
+	if !IsPlatformSuperAdmin(PlatformOrgID, RoleSuperAdmin) {
+		t.Fatal("expected platform superadmin to be recognized")
+	}
+	if IsPlatformSuperAdmin("00000000-0000-0000-0000-000000000001", RoleSuperAdmin) {
+		t.Fatal("tenant superadmin role should not be treated as platform superadmin")
+	}
+	if IsPlatformSuperAdmin(PlatformOrgID, RoleAdmin) {
+		t.Fatal("platform admin role should not be treated as platform superadmin")
+	}
+}
+
 // --- RequireOrgRole middleware tests ---
 
 func TestRequireOrgRole_RejectsEmptyAuth(t *testing.T) {

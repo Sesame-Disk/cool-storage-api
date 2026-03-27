@@ -1570,7 +1570,7 @@ func (h *AdminHandler) AdminDeleteShareLink(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"success": true})
 }
 
-// AdminSetShareLinkActive toggles active flag for a share link (superadmin/admin scope).
+// AdminSetShareLinkActive toggles active flag for a share link (platform superadmin scope).
 // PUT /admin/share-links/:token/active/
 // Body/Form: active=true|false
 func (h *AdminHandler) AdminSetShareLinkActive(c *gin.Context) {
@@ -1844,7 +1844,7 @@ func sortAdminLinks(links []gin.H, sortBy, direction string) {
 	})
 }
 
-// AdminSetUploadLinkActive toggles active flag for an upload link (superadmin/admin scope).
+// AdminSetUploadLinkActive toggles active flag for an upload link (platform superadmin scope).
 // PUT /admin/upload-links/:token/active/
 // Body/Form: active=true|false
 func (h *AdminHandler) AdminSetUploadLinkActive(c *gin.Context) {
@@ -2499,13 +2499,6 @@ func (h *AdminHandler) AdminUpdateGroupMemberRole(c *gin.Context) {
 	groupIter.Close()
 	if !found {
 		c.JSON(http.StatusNotFound, gin.H{"error": "group not found"})
-		return
-	}
-
-	// Tenant admins may only manage groups in their own org.
-	callerRole, _ := h.permMiddleware.GetUserOrgRole(callerOrgID, callerUserID)
-	if callerRole != middleware.RoleSuperAdmin && orgID != callerOrgID {
-		c.JSON(http.StatusForbidden, gin.H{"error": "access denied"})
 		return
 	}
 

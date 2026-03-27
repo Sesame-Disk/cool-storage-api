@@ -603,7 +603,7 @@ func (m *PermissionMiddleware) RequireSuperAdmin() gin.HandlerFunc {
 			return
 		}
 
-		if role != RoleSuperAdmin {
+		if !IsPlatformSuperAdmin(orgID, role) {
 			c.JSON(http.StatusForbidden, gin.H{"error": "insufficient permissions"})
 			c.Abort()
 			return

@@ -253,14 +253,16 @@ func (h *OrgAdminHandler) requireOrgAccess(c *gin.Context, targetOrgID string) e
 		return err
 	}
 
-	if callerOrgID == middleware.PlatformOrgID {
-		// Platform user: must be superadmin to access any org
-		if role != middleware.RoleSuperAdmin {
-			c.JSON(http.StatusForbidden, gin.H{"error": "insufficient permissions"})
-			c.Abort()
-			return fmt.Errorf("insufficient permissions")
-		}
+	if middleware.IsPlatformSuperAdmin(callerOrgID, role) {
+		// Platform superadmin can access any org
 		return nil
+	}
+
+	if callerOrgID == middleware.PlatformOrgID {
+		// Platform user but not superadmin
+		c.JSON(http.StatusForbidden, gin.H{"error": "insufficient permissions"})
+		c.Abort()
+		return fmt.Errorf("insufficient permissions")
 	}
 
 	// Tenant user: must be admin of their own org and target must match
@@ -3596,7 +3598,7 @@ func (h *OrgAdminHandler) TransferOrgOwnership(c *gin.Context) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "insufficient permissions"})
 		return
 	}
-	isSuperAdmin := callerOrgID == middleware.PlatformOrgID && callerPlatformRole == middleware.RoleSuperAdmin
+	isSuperAdmin := middleware.IsPlatformSuperAdmin(callerOrgID, callerPlatformRole)
 
 	var existingOwnerUserID string
 	iter := h.db.Session().Query(`

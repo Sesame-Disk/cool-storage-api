@@ -1,6 +1,6 @@
 # Admin Features — Library Management, Link Management, Org Admin, Audit Logs
 
-**Last Updated**: 2026-03-26
+**Last Updated**: 2026-03-27
 **Status**: Library Management ✅ DONE, Link Management ✅ DONE, Sharing Stubs ✅ DONE, Org Management ✅ DONE, Org Admin Panel ✅ DONE, Superadmin Departments ✅ DONE, Custom Share Permissions ✅ DONE, Audit Logs pending
 
 ---
@@ -28,7 +28,7 @@ Three admin feature areas needed for production. The OIDC provider manages users
 1. `role == "superadmin"`
 2. `org_id == "00000000-0000-0000-0000-000000000000"` (platform org)
 
-OIDC users are provisioned into their tenant org, not the platform org. Even with `OIDC_DEFAULT_ROLE=superadmin`, they get 403 on org management endpoints.
+OIDC users are provisioned into their tenant org, not the platform org. If OIDC or legacy data tries to assign `superadmin` outside the platform org, SesameFS now normalizes that role to `owner`.
 
 ### Solution A: FIRST_SUPERADMIN_EMAIL (recommended for fresh deploys)
 
@@ -66,21 +66,23 @@ Run from the project root. The script uses `docker compose exec cassandra cqlsh`
 
 ### Organization Management Endpoints
 
+All `/api/v2.1/admin/...` endpoints are **platform-superadmin-only**. Org-scoped admin operations live under `/api/v2.1/org/...`.
+
 | Method | Endpoint | Handler | Auth Required |
 |--------|----------|---------|---------------|
-| GET | `/admin/organizations/` | `ListOrganizations` | admin or superadmin (read-only for admin) |
-| POST | `/admin/organizations/` | `CreateOrganization` | **superadmin only** |
-| GET | `/admin/organizations/:org_id/` | `GetOrganization` | admin or superadmin |
-| PUT | `/admin/organizations/:org_id/` | `UpdateOrganization` | **superadmin only** |
-| DELETE | `/admin/organizations/:org_id/` | `SoftDeleteOrganization` | **superadmin only** — sets `status="deleted"`, starts grace period |
-| POST | `/admin/organizations/:org_id/delete/` | `SoftDeleteOrganization` | **superadmin only** — alias for DELETE (backward compat) |
-| POST | `/admin/organizations/:org_id/deactivate/` | `DeactivateOrganization` | **superadmin only** — sets `status="deactivated"` (reversible, no GC) |
-| POST | `/admin/organizations/:org_id/reactivate/` | `ReactivateOrganization` | **superadmin only** — restores deactivated org to `status="active"` |
-| POST | `/admin/organizations/:org_id/restore/` | `RestoreOrganization` | **superadmin only** — restores deleted org within grace period |
-| GET | `/admin/organizations/:org_id/users/` | `ListOrgUsers` | admin or superadmin |
-| POST | `/admin/organizations/:org_id/users/` | `AdminAddOrgUser` | admin or superadmin |
-| PUT | `/admin/organizations/:org_id/users/:email/` | `AdminUpdateOrgUser` | admin or superadmin |
-| DELETE | `/admin/organizations/:org_id/users/:email/` | `AdminDeleteOrgUser` | admin or superadmin |
+| GET | `/admin/organizations/` | `ListOrganizations` | **platform superadmin only** |
+| POST | `/admin/organizations/` | `CreateOrganization` | **platform superadmin only** |
+| GET | `/admin/organizations/:org_id/` | `GetOrganization` | **platform superadmin only** |
+| PUT | `/admin/organizations/:org_id/` | `UpdateOrganization` | **platform superadmin only** |
+| DELETE | `/admin/organizations/:org_id/` | `SoftDeleteOrganization` | **platform superadmin only** — sets `status="deleted"`, starts grace period |
+| POST | `/admin/organizations/:org_id/delete/` | `SoftDeleteOrganization` | **platform superadmin only** — alias for DELETE (backward compat) |
+| POST | `/admin/organizations/:org_id/deactivate/` | `DeactivateOrganization` | **platform superadmin only** — sets `status="deactivated"` (reversible, no GC) |
+| POST | `/admin/organizations/:org_id/reactivate/` | `ReactivateOrganization` | **platform superadmin only** — restores deactivated org to `status="active"` |
+| POST | `/admin/organizations/:org_id/restore/` | `RestoreOrganization` | **platform superadmin only** — restores deleted org within grace period |
+| GET | `/admin/organizations/:org_id/users/` | `ListOrgUsers` | **platform superadmin only** |
+| POST | `/admin/organizations/:org_id/users/` | `AdminAddOrgUser` | **platform superadmin only** |
+| PUT | `/admin/organizations/:org_id/users/:email/` | `AdminUpdateOrgUser` | **platform superadmin only** |
+| DELETE | `/admin/organizations/:org_id/users/:email/` | `AdminDeleteOrgUser` | **platform superadmin only** |
 
 ### Organization Lifecycle — ✅ COMPLETE (2026-03-18, updated 2026-03-19)
 
@@ -141,19 +143,19 @@ If `owner_email` is provided, an admin user is created in the new org (dual-writ
 
 | Method | Endpoint | Handler | Notes |
 |--------|----------|---------|-------|
-| GET | `/admin/users/` | `ListAllUsers` | Paginated. Superadmin sees ALL orgs; tenant admin sees own org |
-| POST | `/admin/users/` | `AdminCreateUser` | Creates user in caller's org. Dual-writes to `users` + `users_by_email` |
+| GET | `/admin/users/` | `ListAllUsers` | Paginated. Platform superadmin sees all orgs |
+| POST | `/admin/users/` | `AdminCreateUser` | Creates user in the target org selected by the platform superadmin |
 | GET | `/admin/users/:email/` | `GetUserByEmail` | Resolves via `users_by_email` table |
 | PUT | `/admin/users/:email/` | `UpdateUser` | Update role, quota, name |
 | DELETE | `/admin/users/:email/` | `DeleteUserByEmail` | Soft-delete (sets `status="deleted"`, `deleted_at=now()`, starts 7-day grace period) |
 | GET | `/admin/admins/` | `ListAdminUsers` | Lists admin+superadmin users. Response key: `admin_user_list` |
 | GET | `/admin/search-user/` | `SearchUsers` | Search by email or name substring |
 
-### Multi-Org Behavior (2026-02-23 fix)
+### Multi-Org Behavior (updated 2026-03-27)
 
-- **Superadmin**: `ListAllUsers`, `ListAdminUsers`, `SearchUsers` query ALL orgs by iterating `SELECT org_id FROM organizations` + platform org. Results deduplicated by email.
-- **Tenant admin**: Only sees users in their own org.
-- Same pattern used by `AdminListAllLibraries`.
+- **Platform superadmin**: `ListAllUsers`, `ListAdminUsers`, `SearchUsers` query all orgs by iterating `SELECT org_id FROM organizations` + platform org. Results are deduplicated by email.
+- **Org admin / owner**: These flows live under `/api/v2.1/org/...`, never `/api/v2.1/admin/...`.
+- Same platform-wide pattern is used by `AdminListAllLibraries`.
 
 ### `users_by_email` Dual-Write (2026-02-23 fix)
 
@@ -194,11 +196,11 @@ All user creation paths now write to BOTH `users` AND `users_by_email`:
 | PUT | `/admin/libraries/:library_id/history-setting/` | `AdminUpdateHistorySetting` | ✅ JSON `{keep_days}` |
 | GET | `/admin/libraries/:library_id/shared-items/` | `AdminListSharedItems` | ✅ `?share_type=user\|group` |
 | GET | `/admin/trash-libraries/` | `AdminListTrashLibraries` | ✅ `?page=&per_page=&owner=` |
-| DELETE | `/admin/trash-libraries/` | `AdminCleanTrashLibraries` | ✅ Permanently deletes all soft-deleted libs; superadmin cleans all orgs |
+| DELETE | `/admin/trash-libraries/` | `AdminCleanTrashLibraries` | ✅ Permanently deletes all soft-deleted libs across all orgs |
 
 ### Key Design Decisions
 
-- **No permission filter**: Admin sees ALL libraries in their org; superadmin sees ALL libraries across all orgs
+- **No resource-level permission filter**: the platform superadmin surface sees all libraries across all orgs; org-scoped visibility is handled by the separate `/org` admin surface
 - **Library lookup**: `libraries` table (partitioned by `org_id`) for listing, `libraries_by_id` for single lookups
 - **Transfer**: Dual-write to `libraries` + `libraries_by_id` tables
 - **Search**: Application-level case-insensitive substring match + ID prefix match

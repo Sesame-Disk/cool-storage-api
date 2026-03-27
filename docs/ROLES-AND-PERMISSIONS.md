@@ -1,6 +1,6 @@
 # Roles & Permissions - SesameFS
 
-**Last Updated**: 2026-03-19
+**Last Updated**: 2026-03-27
 **Status**: IMPLEMENTED — All phases complete (superadmin role, admin API, OIDC org provisioning, role sync, status/role separation)
 
 ---
@@ -10,7 +10,7 @@
 SesameFS uses a **three-layer permission model**:
 
 1. **Platform level** — Super admins manage all tenants (cross-org)
-2. **Organization level** — Tenant admins and users operate within their org
+2. **Organization level** — Org owners, org admins, and users operate within their org
 3. **Resource level** — Library permissions, group roles, share links
 
 Users are provisioned exclusively through the **OIDC provider**. SesameFS does not create users directly — it auto-provisions on first login and syncs roles from OIDC claims.
@@ -25,7 +25,7 @@ The `role` and `status` fields serve different purposes and are stored independe
 
 ### `role` = Permission Level
 
-Determines what actions the user is allowed to perform. Values: `superadmin`, `admin`, `user`, `readonly`, `guest`.
+Determines what actions the user is allowed to perform. Values: `superadmin`, `owner`, `admin`, `user`, `readonly`, `guest`.
 
 The role is **never overwritten** by lifecycle operations. A deactivated admin retains `role="admin"` and gets it back on reactivation.
 
@@ -97,18 +97,20 @@ Existing data is automatically migrated on startup:
 
 ```
 superadmin          ← Platform-level (dedicated platform org)
-  └── admin         ← Tenant-level (org-scoped)
-      └── user      ← Regular tenant member
-          └── readonly  ← View-only tenant member
-              └── guest     ← Limited to shared content only
+  └── owner         ← Tenant-level highest role (billing + lifecycle)
+      └── admin     ← Tenant-level admin (org-scoped)
+          └── user      ← Regular tenant member
+              └── readonly  ← View-only tenant member
+                  └── guest     ← Limited to shared content only
 ```
 
 ### Role Definitions
 
 | Role | Scope | Description |
 |------|-------|-------------|
-| `superadmin` | **Platform** | Manages all tenants. Belongs to the platform org (`00000000-0000-0000-0000-000000000000`). Can list/create/deactivate organizations, view any tenant's data, impersonate tenant admins for support. Cannot directly access tenant files — must switch into tenant context. |
-| `admin` | **Tenant** | Full control within their organization. Can manage users (view, deactivate), create/delete libraries, manage groups, configure org settings, view audit logs. Cannot access other tenants. |
+| `superadmin` | **Platform** | Manages all tenants. Belongs to the platform org (`00000000-0000-0000-0000-000000000000`). `/api/v2.1/admin/...` requires both platform org membership and `role=superadmin`. |
+| `owner` | **Tenant** | Highest tenant role. Can do everything an org admin can, plus ownership transfer, org lifecycle actions, and billing-facing flows inside their org. |
+| `admin` | **Tenant** | Full operational control within their organization. Can manage users, create/delete libraries, manage groups, configure org settings, and view audit logs. Cannot access other tenants. |
 | `user` | **Tenant** | Regular member. Can create libraries, upload/download files, create groups, share content with other members. Standard quota applies. |
 | `readonly` | **Tenant** | View-only access. Can browse libraries shared with them, download files, but cannot upload, create libraries, share, or modify content. |
 | `guest` | **Tenant** | Most restricted. Can only access content explicitly shared with them. Cannot browse org libraries, create anything, or share with others. Intended for external collaborators. |
@@ -117,7 +119,8 @@ superadmin          ← Platform-level (dedicated platform org)
 
 ```go
 roleHierarchy := map[OrganizationRole]int{
-    RoleSuperAdmin: 4,  // NEW
+    RoleSuperAdmin: 5,
+    RoleOwner:      4,
     RoleAdmin:      3,
     RoleUser:       2,
     RoleReadOnly:   1,
@@ -159,23 +162,25 @@ DELETE /api/v2/admin/organizations/{org_id}/             # Soft-delete org (grac
 
 Super admins **cannot** use regular `/api/v2/repos/` endpoints (they have no tenant context). They must use the `/api/v2/admin/` prefix which explicitly requires a target org.
 
+Org owners/admins use the separate `/api/v2.1/org/...` surface. Tenant roles never inherit `/api/v2.1/admin/...` access.
+
 ---
 
 ## Permission Matrix
 
 ### Organization-Level Operations
 
-| Operation | superadmin | admin | user | readonly | guest |
-|-----------|:----------:|:-----:|:----:|:--------:|:-----:|
-| List all organizations | ✅ | ❌ | ❌ | ❌ | ❌ |
-| Create organization | ✅ | ❌ | ❌ | ❌ | ❌ |
-| Deactivate organization | ✅ | ❌ | ❌ | ❌ | ❌ |
-| View org settings | ✅ | ✅ | ❌ | ❌ | ❌ |
-| Modify org settings | ✅ | ✅ | ❌ | ❌ | ❌ |
-| List org users | ✅ | ✅ | ❌ | ❌ | ❌ |
-| Deactivate org user | ✅ | ✅ | ❌ | ❌ | ❌ |
-| Change user role (within org) | ✅ | ✅ | ❌ | ❌ | ❌ |
-| View org audit log | ✅ | ✅ | ❌ | ❌ | ❌ |
+| Operation | superadmin | owner | admin | user | readonly | guest |
+|-----------|:----------:|:-----:|:-----:|:----:|:--------:|:-----:|
+| List all organizations | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| Create organization | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| Deactivate organization | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ |
+| View org settings | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ |
+| Modify org settings | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ |
+| List org users | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ |
+| Deactivate org user | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ |
+| Change user role (within org) | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ |
+| View org audit log | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ |
 
 ### Library Operations
 
@@ -238,7 +243,8 @@ The OIDC provider sends role strings in a custom claim. SesameFS maps them:
 
 | OIDC Claim Value | SesameFS Role | Notes |
 |------------------|---------------|-------|
-| `superadmin`, `super_admin`, `platform_admin` | `superadmin` | **Must also have platform org claim** |
+| `superadmin`, `super_admin`, `platform_admin` | `superadmin` | **Must also have platform org claim; otherwise normalized to `owner`** |
+| `owner`, `org_owner` | `owner` | Highest tenant role |
 | `admin`, `administrator`, `tenant_admin` | `admin` | Org-scoped admin |
 | `user`, `member` | `user` | Regular member |
 | `readonly`, `read-only`, `viewer` | `readonly` | View-only |
@@ -277,6 +283,17 @@ The script:
 3. Invalidates existing sessions
 
 After running, the user must log out and log back in via OIDC.
+
+## Session Flags Exposed to Frontends
+
+The account-info response intentionally exposes two different booleans:
+
+| Field | Meaning |
+|-------|---------|
+| `is_staff` | `true` only for a real platform superadmin (`role=superadmin` in the platform org) |
+| `is_org_staff` | `true` for org-level staff roles (`owner`, `admin`) and also for platform superadmin |
+
+This split keeps `/sys/` and `/admin/` reserved for platform operations while still enabling org-admin tools for tenant owners/admins.
 
 **Caveat**: If OIDC provisioning is active (`OIDC_AUTO_PROVISION=true`) and the user's
 org claim doesn't match `platform_org_claim_value`, re-login will re-assign them to their
@@ -473,11 +490,17 @@ The Seafile frontend uses `window.app.pageOptions` flags from the backend:
 | `canShareRepo` | role >= `user` |
 | `canAddGroup` | role >= `user` |
 | `canGenerateShareLink` | role >= `user` |
-| `canInvitePeople` | role = `admin` |
-| `isStaff` | role = `admin` or `superadmin` |
-| `isPlatformAdmin` | role = `superadmin` (NEW) |
+| `canInvitePeople` | role >= `admin` |
+| `isStaff` | legacy frontend alias; currently maps to real platform superadmin only |
+| `isOrgStaff` | org staff roles (`owner`, `admin`) and platform superadmin |
+| `isPlatformAdmin` | legacy/conceptual alias for platform superadmin; not the canonical wire name |
 
 The super admin frontend experience will need a **separate admin panel** (or admin section) that shows the multi-tenant management UI. This is outside the regular Seafile frontend.
+
+Pending naming cleanup:
+- Backend semantics are already split between platform superadmin and org staff.
+- Frontend/mobile payload names still use legacy fields like `is_staff` and `is_org_staff` for compatibility.
+- A future compatibility-preserving migration should introduce explicit names such as `isSuperAdmin` while keeping old fields as aliases during transition.
 
 ---
 
