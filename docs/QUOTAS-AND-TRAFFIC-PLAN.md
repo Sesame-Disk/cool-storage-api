@@ -11,6 +11,7 @@ The current agreed design is:
 - A dedicated aggregate such as `traffic_period_usage` is acceptable for performance and is the recommended source for quota enforcement.
 - `billing_cycle` remains commercial metadata only; even annual plans still enforce monthly traffic quotas.
 - Storage does not use periods. Storage is simply current usage vs current limit.
+- Accounts may send `current_period_ends_at` explicitly. If it does not, SesameFS derives it from `current_period_started_at` using the same monthly anchor semantics used by Stripe.
 
 Where this document refers to "monthly traffic reset" for enforcement, read it as "quota-period rollover" under the current design.
 
@@ -65,7 +66,7 @@ Billing sets these fields on each org via `PUT /admin/organizations/:org_id/`:
 | `plan` | string | `"free"` | `"starter"` | `"enterprise-acme"` | Plan name |
 | `billing_cycle` | string | `"monthly"` | `"monthly"` | `"annual"` | Billing cycle |
 | `current_period_started_at` | timestamp | org create time | billing anchor | billing anchor | Current quota period start |
-| `current_period_ends_at` | timestamp | +1 monthly quota period | +1 monthly quota period | +1 monthly quota period | Current quota period end |
+| `current_period_ends_at` | timestamp | derived or provided | derived or provided | derived or provided | Current quota period end |
 | `storage_quota` | int64 | 2 GB | 250 GB | custom | Storage limit. -1 = unlimited |
 | `traffic_quota` | int64 | 10 GB | -1 | custom | Combined monthly limit (upload+download). Universal field — if set, it IS the limit. -1 = no combined limit |
 | `traffic_upload_quota` | int64 | -1 | 50 TB | custom | Monthly upload limit. -1 = no individual upload limit |
@@ -195,6 +196,7 @@ CREATE TABLE IF NOT EXISTS traffic_period_usage (
 ```
 
 This table is the preferred source for quota enforcement once the current-period model is implemented.
+The rollover job should operate by `current_period_ends_at <= now`, not by natural month boundaries.
 
 ### 1.3 Table `storage_counters` (counter table)
 

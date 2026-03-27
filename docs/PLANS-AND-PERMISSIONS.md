@@ -421,7 +421,7 @@ func ResolveCapabilities(role string, quotaPolicy string, profile *EnforcementPr
 
 - **`plan`**: Opaque display string from Accounts. Shown to user in UI labels. **Never used for logic.** Could be "Starter", "Business", "Enterprise Custom ACME", anything.
 - **`billing_cycle`**: Commercial cycle only. It tells how the plan is billed, not how monthly traffic enforcement is computed.
-- **`current_period_started_at` / `current_period_ends_at`**: Current quota period boundaries for the org. These are the canonical source for traffic reset timing.
+- **`current_period_started_at` / `current_period_ends_at`**: Current quota period boundaries for the org. `current_period_ends_at` is the canonical source for reset timing and rollover checks.
 - **`is_org_owner`**: Derived from `role == "owner"`. Determines if the user has billing authority.
 - **`can_upgrade`**: `true` when the user is the org owner AND there's a reason to upgrade. See below.
 - **`storage`**: Simple quota state. Storage has no monthly period. Either usage is within limit or writes are blocked.
@@ -532,7 +532,7 @@ Every org MUST be born with an explicit plan and quota_policy. No more ambiguous
 | `quota_policy` | `"hard"` |
 | `billing_cycle` | `"monthly"` |
 | `current_period_started_at` | org creation time |
-| `current_period_ends_at` | start + 1 monthly quota period |
+| `current_period_ends_at` | from Accounts if provided, else SesameFS derives it from start using the standard monthly formula |
 | `storage_quota` | 2 GB |
 | `traffic_quota` | 10 GB |
 | `traffic_upload_quota` | -1 |
@@ -590,6 +590,10 @@ new capabilities, new limits, upgrade_features is now empty
 - Next sync from Accounts **overwrites** any manual changes
 - This is by design — Accounts is the source of truth for billing
 - No persistent local overrides. If a custom deal is needed, it's configured in Accounts
+- Accounts may send `current_period_started_at` and optionally `current_period_ends_at`
+- If Accounts sends `current_period_ends_at`, SesameFS uses it as authoritative
+- If Accounts sends only `current_period_started_at`, SesameFS derives `current_period_ends_at` with the standard monthly formula
+- If Accounts sends both start and end, SesameFS should validate that they are coherent before persisting them
 
 ### Internal Handler Separation
 
@@ -672,7 +676,9 @@ Option B: Accounts provisions via API
 
 After the org pays again and Accounts upgrades it back to a paid profile, user reactivation can be manual by the owner or admins. A future improvement may restore the same users who were active before downgrade if SesameFS stores a pre-downgrade activation snapshot.
 
-Traffic enforcement uses the org's current quota period, not the natural UTC month. Every org has `current_period_started_at` and `current_period_ends_at`, and traffic usage is evaluated within that window even for annual billing plans. A periodic rollover job should advance expired periods for any org whose current period ended, without deleting historical counters.
+Traffic enforcement uses the org's current quota period, not the natural UTC month. Every org has `current_period_started_at` and `current_period_ends_at`, and traffic usage is evaluated within that window even for annual billing plans. The rollover job should select orgs by `current_period_ends_at <= now`, advance them in a loop until the end is in the future, and never delete historical counters.
+
+The monthly period formula should follow the same standard anchor semantics used by Stripe. Accounts may provide the end explicitly; otherwise SesameFS derives it from the start.
 
 Storage does not use rolling periods. Storage is simple: either current usage is within the limit or additional writes are blocked.
 
@@ -688,7 +694,7 @@ Purpose:
 - explain the operational impact before applying the change
 
 Suggested contract:
-- input: `org_id`, proposed `quota_policy`, proposed quota values, optional proposed period values
+- input: `org_id`, proposed `quota_policy`, proposed quota values, optional proposed `current_period_started_at`, optional proposed `current_period_ends_at`
 - output:
   - `would_exceed_storage`
   - `would_exceed_traffic`
@@ -752,7 +758,7 @@ This endpoint is not required for core enforcement, but it is useful for downgra
 | Step | What | Effort |
 |------|------|--------|
 | 4.1 | Add preview/evaluate endpoint for proposed plan/quota changes | Medium |
-| 4.2 | Add periodic quota-period rollover job for expired org periods | Medium |
+| 4.2 | Add periodic quota-period rollover job for orgs with `current_period_ends_at <= now` | Medium |
 | 4.3 | Implement `service_tokens` table + middleware | Medium |
 | 4.4 | Add M2M code path in admin org update handler (idempotency, audit) | Medium |
 | 4.5 | Design invite flow for user creation | Medium |

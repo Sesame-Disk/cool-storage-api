@@ -598,10 +598,15 @@
             para warnings y enforcement granular cuando existan sub-límites
         - El enforcement de tráfico no debe basarse en mes natural sino en `current_period_started_at`
             + `current_period_ends_at` de la org
+        - `current_period_ends_at` es la referencia canónica para saber si el período venció
+        - Accounts puede mandar `current_period_ends_at`; si no lo manda, SesameFS lo deriva
+            desde `current_period_started_at` con la fórmula mensual estándar tipo Stripe
         - Hace falta una agregación optimizada por período efectivo de la org
             para no depender del mes natural ni recalcular desde cero en cada request
         - Hace falta un job periódico de rollover del período actual para cualquier org vencida,
             no solo free; puede vivir junto al scheduler del GC si conviene operativamente
+        - Ese job debe seleccionar por `current_period_ends_at <= now` y avanzar múltiples períodos
+            si la org quedó atrasada por downtime o retrasos
         - No hay que limpiar histórico: solo avanzar el período efectivo
 
 [DECIDIDO] Contrato backend → frontend
