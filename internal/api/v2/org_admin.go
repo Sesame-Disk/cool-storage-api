@@ -742,6 +742,17 @@ func (h *OrgAdminHandler) UpdateOrgUser(c *gin.Context) {
 	originalName := name
 	originalQuota := quota
 
+	// Protect the org owner: only a platform superadmin can modify the owner.
+	callerOrgID := c.GetString("org_id")
+	callerUserID := c.GetString("user_id")
+	if originalRole == string(middleware.RoleOwner) {
+		callerPlatformRole, _ := h.permMiddleware.GetUserOrgRole(callerOrgID, callerUserID)
+		if !middleware.IsPlatformSuperAdmin(callerOrgID, callerPlatformRole) {
+			c.JSON(http.StatusForbidden, gin.H{"error": "only a platform superadmin can modify the organization owner"})
+			return
+		}
+	}
+
 	// seafile-js sends FormData for all org-admin user updates.
 	// Fields: is_active, is_staff, name, contact_email, quota_total
 	hasMutatingFields := c.Request.FormValue("is_active") != "" ||
@@ -880,6 +891,18 @@ func (h *OrgAdminHandler) DeleteOrgUser(c *gin.Context) {
 	if userID == callerUserID {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "cannot delete your own account"})
 		return
+	}
+
+	// Protect the org owner from deletion by non-superadmins.
+	var targetRole string
+	if err := h.db.Session().Query(`SELECT role FROM users WHERE org_id = ? AND user_id = ?`,
+		targetOrgID, userID).Scan(&targetRole); err == nil && targetRole == string(middleware.RoleOwner) {
+		callerOrgID := c.GetString("org_id")
+		callerPlatformRole, _ := h.permMiddleware.GetUserOrgRole(callerOrgID, callerUserID)
+		if !middleware.IsPlatformSuperAdmin(callerOrgID, callerPlatformRole) {
+			c.JSON(http.StatusForbidden, gin.H{"error": "cannot delete the organization owner"})
+			return
+		}
 	}
 
 	// Soft-delete: mark as "deleted" with timestamp for grace period cascade
