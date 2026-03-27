@@ -1098,11 +1098,7 @@ func (h *AdminHandler) AdminUpdateOrgUser(c *gin.Context) {
 		isStaffVal = c.Request.FormValue("is_staff")
 	}
 	if isStaffVal != "" {
-		if isStaffVal == "true" {
-			role = "admin"
-		} else if role == "admin" {
-			role = "user"
-		}
+		role = applyLegacyStaffToggle(role, isStaffVal == "true")
 		if err := h.db.Session().Query(`UPDATE users SET role = ? WHERE org_id = ? AND user_id = ?`,
 			role, targetOrgID, userID).Exec(); err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update user"})
@@ -1192,7 +1188,7 @@ func (h *AdminHandler) AdminUpdateOrgUser(c *gin.Context) {
 	}
 
 	isActive := IsUserUsable(status)
-	isOrgStaff := role == "admin" || role == "superadmin"
+	isOrgStaff := middleware.IsOrgStaff(role)
 
 	c.JSON(http.StatusOK, gin.H{
 		"email":                      email,
@@ -3015,8 +3011,8 @@ func (h *AdminHandler) countOrgLibraries(orgID string) int {
 	return count
 }
 
-// resolveOrgCreator returns the email and name of the first admin user in an org.
-// Falls back to the first user if no admin/superadmin exists.
+// resolveOrgCreator returns the email and name of the first owner/admin user in an org.
+// Falls back to the first user if no owner/admin/superadmin exists.
 func (h *AdminHandler) resolveOrgCreator(orgID string) (string, string) {
 	var email, name, role string
 	var firstEmail, firstName string
@@ -3029,7 +3025,7 @@ func (h *AdminHandler) resolveOrgCreator(orgID string) (string, string) {
 			firstEmail, firstName = email, name
 			first = false
 		}
-		if role == "superadmin" || role == "admin" {
+		if role == "superadmin" || role == "owner" || role == "admin" {
 			iter.Close()
 			return email, name
 		}

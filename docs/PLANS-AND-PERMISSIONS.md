@@ -1,7 +1,7 @@
 # Plans & Permissions — SesameFS
 
 **Last Updated**: 2026-03-27
-**Status**: DESIGN APPROVED — Pending implementation
+**Status**: Phase 1 IMPLEMENTED — Phase 2 pending
 
 ---
 
@@ -102,7 +102,19 @@ If in the future we need co-owners, billing-viewer, or owner-without-admin, we c
   - Old owner -> `role=admin`
   - New owner -> `role=owner`
   - Only 1 owner per org (enforced in code).
+- **Superadmin override**: A platform superadmin may also assign or reassign the org owner, including bootstrapping ownership for orgs that currently have no owner. The target user must already belong to the org and be at least `admin`.
 - **OIDC mapping**: Add `"owner"` to the OIDC role mapping table in `mapOIDCRole()`.
+
+### Known Issue: OIDC Role Sync vs Manual Overrides
+
+Current policy decision:
+- Manual role changes done inside SesameFS (for example, owner transfer or superadmin repairs) must remain effective.
+- Automatic OIDC role synchronization must not overwrite those manual changes for now.
+
+Status:
+- This remains **technical debt / open issue**.
+- The current role-mapping support for OIDC claim values exists, but the long-term reconciliation rule between IdP role claims and manual SesameFS overrides still needs a dedicated design.
+- Until that design is implemented, treat manual role changes as the effective source of truth for operational support scenarios.
 
 ### Existing checks that work automatically
 
@@ -712,19 +724,27 @@ This endpoint is not required for core enforcement, but it is useful for downgra
 
 ## Implementation Plan
 
-### Phase 1: Backend Model (no frontend changes)
+### Phase 1: Backend Model (no frontend changes) — DONE (2026-03-27)
 
-| Step | What | Files | Effort |
+| Step | What | Files | Status |
 |------|------|-------|--------|
-| 1.1 | Add `"owner"` to role hierarchy | `internal/middleware/permissions.go` | Low |
-| 1.2 | Add `quota_policy` column + migration | `internal/db/db.go`, `internal/models/models.go` | Low |
-| 1.3 | Add `current_period_started_at` + `current_period_ends_at` to organizations | `internal/db/db.go`, `internal/models/models.go` | Medium |
-| 1.4 | Add enforcement profiles config struct + loader | `internal/config/config.go` | Medium |
-| 1.5 | Replace `isFree()` with `isHardEnforcement()` | `internal/traffic/checker.go` | Low |
-| 1.6 | Set defaults on org creation (seed, admin, OIDC), including current period fields | `internal/db/seed.go`, `internal/api/v2/admin.go`, `internal/auth/oidc.go` | Medium |
-| 1.7 | Set `role=owner` for org creator | `internal/api/v2/admin.go`, `internal/auth/oidc.go` | Low |
-| 1.8 | Add ownership transfer endpoint | `internal/api/v2/org_admin.go` | Medium |
-| 1.9 | Add `max_users` check to OIDC auto-provision | `internal/auth/oidc.go` | Low |
+| 1.1 | Add `"owner"` to role hierarchy + `IsOrgStaff()` helper | `permissions.go`, `server.go`, `admin.go`, `admin_extra.go`, `org_admin.go`, `oidc.go` | ✅ |
+| 1.2 | Add `quota_policy` column + migration | `db.go`, `models.go` | ✅ |
+| 1.3 | Add `current_period_started_at` + `current_period_ends_at` to organizations | `db.go`, `models.go` | ✅ |
+| 1.4 | Add enforcement profiles config struct + loader (`EnforcementProfile`, `GetEnforcementProfile()`, defaults) | `config.go` | ✅ |
+| 1.5 | Replace `isFree(plan)` with `isHardEnforcement(quotaPolicy)` — queries read `quota_policy` | `checker.go` | ✅ |
+| 1.6 | Set defaults on org creation (seed, admin, OIDC), including plan, quota_policy, period fields | `seed.go`, `admin.go`, `oidc.go` | ✅ |
+| 1.7 | Set `role=owner` for org creator (admin create + OIDC first user in new org) | `admin.go`, `oidc.go` | ✅ |
+| 1.8 | Add ownership transfer endpoint `PUT /org/:org_id/admin/transfer-ownership/` | `org_admin.go` | ✅ |
+| 1.9 | Add `max_users` check to OIDC auto-provision (skip for new org) | `oidc.go` | ✅ |
+
+Implementation notes:
+- `IsOrgStaff(role)` centralizes the `role == "admin" || role == "superadmin"` pattern — now includes owner automatically via hierarchy check.
+- All 5 inline `isOrgStaff` checks across `server.go`, `admin.go`, `admin_extra.go`, `org_admin.go` replaced with `middleware.IsOrgStaff()`.
+- `GetOrganization` and `GetOrgInfo` queries updated to SELECT and return `quota_policy`, `current_period_started_at`, `current_period_ends_at`.
+- `UpdateOrganization` accepts `quota_policy` (validated: must be "hard" or "soft"), `current_period_started_at`, `current_period_ends_at`.
+- Seed orgs (platform + default) get `quota_policy="soft"` + unlimited quotas. Admin-created and OIDC-provisioned orgs get `quota_policy="hard"` + free defaults (2GB storage, 10GB traffic, 1 user).
+- OIDC `mapOIDCRole()` extended with `"owner"`, `"org_owner"`, `"tenant_admin"` mappings.
 
 ### Phase 2: Capability Resolution
 

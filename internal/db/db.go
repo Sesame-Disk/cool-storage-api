@@ -179,6 +179,9 @@ func (db *DB) Migrate() error {
 		migrationAddUserLastLoginAt,
 		migrationAddAccessTokenSource,
 		migrationAddBlockIdMappingCreatedAt,
+		migrationAddOrgQuotaPolicy,
+		migrationAddOrgCurrentPeriodStartedAt,
+		migrationAddOrgCurrentPeriodEndsAt,
 	}
 	for _, migration := range alterMigrations {
 		if err := db.session.Query(migration).Exec(); err != nil {
@@ -996,3 +999,14 @@ ALTER TABLE access_tokens ADD source TEXT`
 // Timestamp on reverse block-id mappings — records when the mapping was written.
 const migrationAddBlockIdMappingCreatedAt = `
 ALTER TABLE block_id_mappings_by_internal ADD created_at TIMESTAMP`
+
+// Enforcement profile key — "hard" (free) or "soft" (paid). Replaces isFree(plan).
+const migrationAddOrgQuotaPolicy = `
+ALTER TABLE organizations ADD quota_policy TEXT`
+
+// Current quota period boundaries — canonical source for traffic reset timing.
+const migrationAddOrgCurrentPeriodStartedAt = `
+ALTER TABLE organizations ADD current_period_started_at TIMESTAMP`
+
+const migrationAddOrgCurrentPeriodEndsAt = `
+ALTER TABLE organizations ADD current_period_ends_at TIMESTAMP`

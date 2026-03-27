@@ -5,8 +5,113 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Sesame-Disk/sesamefs/internal/middleware"
 	"github.com/stretchr/testify/assert"
 )
+
+func TestApplyLegacyStaffToggle(t *testing.T) {
+	tests := []struct {
+		name     string
+		role     string
+		isStaff  bool
+		expected string
+	}{
+		{"owner stays owner when set staff true", "owner", true, "owner"},
+		{"owner stays owner when set staff false", "owner", false, "owner"},
+		{"admin demotes to user when staff false", "admin", false, "user"},
+		{"user promotes to admin when staff true", "user", true, "admin"},
+		{"readonly promotes to admin when staff true", "readonly", true, "admin"},
+		{"superadmin remains superadmin", "superadmin", true, "superadmin"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.expected, applyLegacyStaffToggle(tt.role, tt.isStaff))
+		})
+	}
+}
+
+func TestBuildOwnershipTransferPlan(t *testing.T) {
+	tests := []struct {
+		name              string
+		isSuperAdmin      bool
+		callerUserID      string
+		existingOwnerID   string
+		newOwnerUserID    string
+		callerRole        middleware.OrganizationRole
+		newOwnerRole      middleware.OrganizationRole
+		wantErr           string
+		wantDemoteOwnerID string
+		wantPromoteUserID string
+		wantNoOp          bool
+		wantBootstrap     bool
+	}{
+		{
+			name:              "owner can transfer to admin",
+			callerUserID:      "owner-1",
+			existingOwnerID:   "owner-1",
+			newOwnerUserID:    "admin-1",
+			callerRole:        middleware.RoleOwner,
+			newOwnerRole:      middleware.RoleAdmin,
+			wantDemoteOwnerID: "owner-1",
+			wantPromoteUserID: "admin-1",
+		},
+		{
+			name:              "superadmin can bootstrap owner",
+			isSuperAdmin:      true,
+			callerUserID:      "super-1",
+			newOwnerUserID:    "admin-1",
+			callerRole:        middleware.RoleSuperAdmin,
+			newOwnerRole:      middleware.RoleAdmin,
+			wantPromoteUserID: "admin-1",
+			wantBootstrap:     true,
+		},
+		{
+			name:            "owner cannot transfer to self",
+			callerUserID:    "owner-1",
+			existingOwnerID: "owner-1",
+			newOwnerUserID:  "owner-1",
+			callerRole:      middleware.RoleOwner,
+			newOwnerRole:    middleware.RoleOwner,
+			wantErr:         "cannot transfer ownership to yourself",
+		},
+		{
+			name:            "new owner must be admin or above",
+			callerUserID:    "owner-1",
+			existingOwnerID: "owner-1",
+			newOwnerUserID:  "user-1",
+			callerRole:      middleware.RoleOwner,
+			newOwnerRole:    middleware.RoleUser,
+			wantErr:         "new owner must be an admin",
+		},
+		{
+			name:              "same owner is noop",
+			isSuperAdmin:      true,
+			callerUserID:      "super-1",
+			existingOwnerID:   "owner-1",
+			newOwnerUserID:    "owner-1",
+			callerRole:        middleware.RoleSuperAdmin,
+			newOwnerRole:      middleware.RoleOwner,
+			wantNoOp:          true,
+			wantPromoteUserID: "owner-1",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			plan, err := buildOwnershipTransferPlan(tt.isSuperAdmin, tt.callerUserID, tt.existingOwnerID, tt.newOwnerUserID, tt.callerRole, tt.newOwnerRole)
+			if tt.wantErr != "" {
+				assert.EqualError(t, err, tt.wantErr)
+				return
+			}
+			assert.NoError(t, err)
+			assert.Equal(t, tt.wantDemoteOwnerID, plan.DemoteOwnerID)
+			assert.Equal(t, tt.wantPromoteUserID, plan.PromoteUserID)
+			assert.Equal(t, tt.wantNoOp, plan.NoOp)
+			assert.Equal(t, tt.wantBootstrap, plan.BootstrapOwner)
+		})
+	}
+}
 
 func TestOrgUserRow_JSONFormatWithOrgQuotaFields(t *testing.T) {
 	createdAt := time.Date(2025, 6, 15, 12, 0, 0, 0, time.UTC)

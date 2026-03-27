@@ -919,7 +919,7 @@ func (s *Server) setupRoutes() {
 				role = dbRole
 			}
 		}
-		if role != "admin" && role != "superadmin" {
+		if !middleware.IsOrgStaff(role) {
 			s.serveAccessDenied(c, "Access Denied", "You do not have permission to access the Organization Administration panel.")
 			c.Abort()
 			return
@@ -1970,14 +1970,15 @@ func (s *Server) handleAccountInfo(c *gin.Context) {
 		}
 	}
 
-	// Determine permissions based on role
-	// Roles: superadmin, admin, user, readonly, guest
+	// Determine permissions based on role.
+	// Phase 1 keeps legacy account/info flags role-based; owner behaves like admin-level org staff.
 	isStaff := role == "superadmin"
-	canAddRepo := role == "superadmin" || role == "admin" || role == "user"
-	canShareRepo := role == "superadmin" || role == "admin" || role == "user"
-	canAddGroup := role == "superadmin" || role == "admin" || role == "user"
-	canGenerateShareLink := role == "superadmin" || role == "admin" || role == "user"
-	canGenerateUploadLink := role == "superadmin" || role == "admin" || role == "user"
+	canManageContent := middleware.HasRequiredOrgRole(middleware.OrganizationRole(role), middleware.RoleUser)
+	canAddRepo := canManageContent
+	canShareRepo := canManageContent
+	canAddGroup := canManageContent
+	canGenerateShareLink := canManageContent
+	canGenerateUploadLink := canManageContent
 
 	// Calculate space usage
 	spaceUsage := "0%"
@@ -1998,7 +1999,7 @@ func (s *Server) handleAccountInfo(c *gin.Context) {
 		"institution":   orgID,
 		"is_staff":      isStaff,
 		"is_org_staff": func() int {
-			if role == "admin" || role == "superadmin" {
+			if middleware.IsOrgStaff(role) {
 				return 1
 			}
 			return 0

@@ -1,9 +1,9 @@
 # Storage & Traffic Quotas — Implementation Plan
 
-## Update 2026-03-27
+## Update 2026-03-27 (Phase 1 implemented)
 
 This document originally described traffic enforcement using natural monthly partitions only.
-The current agreed design is:
+The current agreed design is (Phase 1 backend model is now implemented):
 
 - `traffic_counters` and `traffic_monthly` remain useful for analytics and natural-month reporting.
 - Traffic quota enforcement must use the org's current quota period, not the natural UTC month.
@@ -90,7 +90,9 @@ Billing sets these fields on each org via `PUT /admin/organizations/:org_id/`:
 
 ### Enforcement by Plan Type
 
-| Scenario | Free Plan | Paid Plan |
+**Implementation note (2026-03-27)**: Enforcement is now keyed by `quota_policy` ("hard"/"soft"), not by plan name. `isFree(plan)` has been replaced by `isHardEnforcement(quotaPolicy)` in `checker.go`. All checker queries (`CheckStorageQuota`, `CheckTrafficQuota`, `CheckMaxUsers`) read `quota_policy` from the organizations table.
+
+| Scenario | `quota_policy="hard"` (Free) | `quota_policy="soft"` (Paid) |
 |----------|-----------|-----------|
 | Storage exceeded | **Hard block** — reject upload with 403 | **Soft warning** — allow, billing charges overage |
 | Traffic exceeded (any check) | **Hard block** — reject with 403 | **Soft warning** — allow, billing charges overage |

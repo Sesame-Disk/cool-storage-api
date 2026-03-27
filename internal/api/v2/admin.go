@@ -426,6 +426,7 @@ func (h *AdminHandler) CreateOrganization(c *gin.Context) {
 	// ── Create the organization ────────────────────────────────────────────
 	orgID := uuid.New()
 	now := time.Now()
+	periodEnd := now.AddDate(0, 1, 0) // +1 month default period
 
 	settings := map[string]string{
 		"theme":    "default",
@@ -435,27 +436,42 @@ func (h *AdminHandler) CreateOrganization(c *gin.Context) {
 		"default_backend": "s3",
 	}
 
-	// ── Optionally create the owner/admin user ─────────────────────────────
+	orgInsertQuery := `
+		INSERT INTO organizations (
+			org_id, name, status, settings, storage_quota, storage_used,
+			chunking_polynomial, storage_config, created_at,
+			plan, quota_policy, billing_cycle,
+			traffic_quota, traffic_upload_quota, traffic_download_quota, max_users,
+			current_period_started_at, current_period_ends_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`
+	orgInsertArgs := []interface{}{
+		orgID.String(), orgName, StatusActive, settings,
+		storageQuota, int64(0), int64(17592186044415),
+		storageConfig, now,
+		"Free Plan",        // plan (display)
+		"hard",             // quota_policy (free tier defaults)
+		"monthly",          // billing_cycle
+		int64(10737418240), // traffic_quota: 10 GB combined
+		int64(-1),          // traffic_upload_quota: no individual limit
+		int64(-1),          // traffic_download_quota: no individual limit
+		int(1),             // max_users: 1
+		now,                // current_period_started_at
+		periodEnd,          // current_period_ends_at
+	}
+
+	// ── Optionally create the owner user ──────────────────────────────────
 	ownerName := ""
 	if ownerEmail != "" {
 		ownerName = strings.Split(ownerEmail, "@")[0]
 		ownerUserID := uuid.New()
 
 		batch := h.db.Session().Batch(gocql.LoggedBatch)
-		batch.Query(`
-			INSERT INTO organizations (
-				org_id, name, status, settings, storage_quota, storage_used,
-				chunking_polynomial, storage_config, created_at
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-		`,
-			orgID.String(), orgName, StatusActive, settings,
-			storageQuota, int64(0), int64(17592186044415),
-			storageConfig, now,
-		)
+		batch.Query(orgInsertQuery, orgInsertArgs...)
 		batch.Query(`
 			INSERT INTO users (org_id, user_id, email, name, role, status, quota_bytes, used_bytes, created_at)
 			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-		`, orgID.String(), ownerUserID.String(), ownerEmail, ownerName, "admin", StatusActive,
+		`, orgID.String(), ownerUserID.String(), ownerEmail, ownerName, "owner", StatusActive,
 			int64(107374182400), int64(0), now)
 
 		batch.Query(`
@@ -470,16 +486,7 @@ func (h *AdminHandler) CreateOrganization(c *gin.Context) {
 			return
 		}
 	} else {
-		if err := h.db.Session().Query(`
-			INSERT INTO organizations (
-				org_id, name, status, settings, storage_quota, storage_used,
-				chunking_polynomial, storage_config, created_at
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-		`,
-			orgID.String(), orgName, StatusActive, settings,
-			storageQuota, int64(0), int64(17592186044415),
-			storageConfig, now,
-		).Exec(); err != nil {
+		if err := h.db.Session().Query(orgInsertQuery, orgInsertArgs...).Exec(); err != nil {
 			log.Printf("CreateOrganization: failed to insert org %s: %v", orgName, err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create organization"})
 			return
@@ -493,7 +500,7 @@ func (h *AdminHandler) CreateOrganization(c *gin.Context) {
 		"creator_name":  ownerName,
 		"status":        StatusActive,
 		"deleted_at":    nil,
-		"role":          "default",
+		"role":          "owner",
 		"quota_usage":   int64(0),
 		"quota":         storageQuota,
 		"ctime":         now.Format(time.RFC3339),
@@ -525,15 +532,19 @@ func (h *AdminHandler) GetOrganization(c *gin.Context) {
 	var trafficDownloadQuota int64
 	var maxUsers int
 	var plan string
+	var quotaPolicy string
 	var billingCycle string
+	var currentPeriodStartedAt *time.Time
+	var currentPeriodEndsAt *time.Time
 	var settings map[string]string
 	var createdAt time.Time
 	var deletedAt *time.Time
 
 	err := h.db.Session().Query(`
 		SELECT name, status, storage_quota, traffic_quota, traffic_upload_quota,
-		       traffic_download_quota, max_users, plan, billing_cycle, settings,
-		       created_at, deleted_at
+		       traffic_download_quota, max_users, plan, quota_policy, billing_cycle,
+		       current_period_started_at, current_period_ends_at,
+		       settings, created_at, deleted_at
 		FROM organizations WHERE org_id = ?
 	`, orgID).Scan(
 		&name,
@@ -544,7 +555,10 @@ func (h *AdminHandler) GetOrganization(c *gin.Context) {
 		&trafficDownloadQuota,
 		&maxUsers,
 		&plan,
+		&quotaPolicy,
 		&billingCycle,
+		&currentPeriodStartedAt,
+		&currentPeriodEndsAt,
 		&settings,
 		&createdAt,
 		&deletedAt,
@@ -581,30 +595,33 @@ func (h *AdminHandler) GetOrganization(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"org_id":                 orgID,
-		"org_name":               name,
-		"creator_email":          creatorEmail,
-		"creator_name":           creatorName,
-		"status":                 effectiveStatus,
-		"deleted_at":             deletedAtStr,
-		"role":                   "default",
-		"quota_usage":            traffic.ReadStorageUsed(h.db, fmt.Sprintf("org:%s", orgID)),
-		"quota":                  storageQuota,
-		"storage_quota":          storageQuota,
-		"traffic_quota":          trafficQuota,
-		"traffic_upload_quota":   trafficUploadQuota,
-		"traffic_download_quota": trafficDownloadQuota,
-		"traffic_combined_used":  monthlyUsage.Combined,
-		"traffic_upload_used":    monthlyUsage.Upload,
-		"traffic_download_used":  monthlyUsage.Download,
-		"plan":                   plan,
-		"billing_cycle":          billingCycle,
-		"ctime":                  createdAt.Format(time.RFC3339),
-		"users_count":            usersCount,
-		"repos_count":            reposCount,
-		"groups_count":           groupsCount,
-		"max_users":              maxUserNumber,
-		"max_user_number":        maxUserNumber,
+		"org_id":                    orgID,
+		"org_name":                  name,
+		"creator_email":             creatorEmail,
+		"creator_name":              creatorName,
+		"status":                    effectiveStatus,
+		"deleted_at":                deletedAtStr,
+		"role":                      "default",
+		"quota_usage":               traffic.ReadStorageUsed(h.db, fmt.Sprintf("org:%s", orgID)),
+		"quota":                     storageQuota,
+		"storage_quota":             storageQuota,
+		"traffic_quota":             trafficQuota,
+		"traffic_upload_quota":      trafficUploadQuota,
+		"traffic_download_quota":    trafficDownloadQuota,
+		"traffic_combined_used":     monthlyUsage.Combined,
+		"traffic_upload_used":       monthlyUsage.Upload,
+		"traffic_download_used":     monthlyUsage.Download,
+		"plan":                      plan,
+		"quota_policy":              quotaPolicy,
+		"billing_cycle":             billingCycle,
+		"current_period_started_at": currentPeriodStartedAt,
+		"current_period_ends_at":    currentPeriodEndsAt,
+		"ctime":                     createdAt.Format(time.RFC3339),
+		"users_count":               usersCount,
+		"repos_count":               reposCount,
+		"groups_count":              groupsCount,
+		"max_users":                 maxUserNumber,
+		"max_user_number":           maxUserNumber,
 	})
 }
 
@@ -614,14 +631,17 @@ func (h *AdminHandler) UpdateOrganization(c *gin.Context) {
 	orgID := c.Param("org_id")
 
 	var req struct {
-		Name                 *string `json:"name"`
-		StorageQuota         *int64  `json:"storage_quota"`
-		TrafficQuota         *int64  `json:"traffic_quota"`
-		TrafficUploadQuota   *int64  `json:"traffic_upload_quota"`
-		TrafficDownloadQuota *int64  `json:"traffic_download_quota"`
-		MaxUsers             *int    `json:"max_users"`
-		Plan                 *string `json:"plan"`
-		BillingCycle         *string `json:"billing_cycle"`
+		Name                   *string    `json:"name"`
+		StorageQuota           *int64     `json:"storage_quota"`
+		TrafficQuota           *int64     `json:"traffic_quota"`
+		TrafficUploadQuota     *int64     `json:"traffic_upload_quota"`
+		TrafficDownloadQuota   *int64     `json:"traffic_download_quota"`
+		MaxUsers               *int       `json:"max_users"`
+		Plan                   *string    `json:"plan"`
+		QuotaPolicy            *string    `json:"quota_policy"`
+		BillingCycle           *string    `json:"billing_cycle"`
+		CurrentPeriodStartedAt *time.Time `json:"current_period_started_at"`
+		CurrentPeriodEndsAt    *time.Time `json:"current_period_ends_at"`
 	}
 
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -629,11 +649,36 @@ func (h *AdminHandler) UpdateOrganization(c *gin.Context) {
 		return
 	}
 
-	// Verify org exists
+	// Verify org exists and load current state for audit logging.
 	var existingName string
+	var existingStorageQuota int64
+	var existingTrafficQuota int64
+	var existingTrafficUploadQuota int64
+	var existingTrafficDownloadQuota int64
+	var existingMaxUsers int
+	var existingPlan string
+	var existingQuotaPolicy string
+	var existingBillingCycle string
+	var existingCurrentPeriodStartedAt *time.Time
+	var existingCurrentPeriodEndsAt *time.Time
 	err := h.db.Session().Query(`
-		SELECT name FROM organizations WHERE org_id = ?
-	`, orgID).Scan(&existingName)
+		SELECT name, storage_quota, traffic_quota, traffic_upload_quota, traffic_download_quota,
+		       max_users, plan, quota_policy, billing_cycle,
+		       current_period_started_at, current_period_ends_at
+		FROM organizations WHERE org_id = ?
+	`, orgID).Scan(
+		&existingName,
+		&existingStorageQuota,
+		&existingTrafficQuota,
+		&existingTrafficUploadQuota,
+		&existingTrafficDownloadQuota,
+		&existingMaxUsers,
+		&existingPlan,
+		&existingQuotaPolicy,
+		&existingBillingCycle,
+		&existingCurrentPeriodStartedAt,
+		&existingCurrentPeriodEndsAt,
+	)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "organization not found"})
 		return
@@ -646,38 +691,120 @@ func (h *AdminHandler) UpdateOrganization(c *gin.Context) {
 		val interface{}
 	}
 	var updates []colUpdate
+	auditChanges := map[string]map[string]interface{}{}
+	setAuditChange := func(field string, oldVal, newVal interface{}) {
+		auditChanges[field] = map[string]interface{}{
+			"old": oldVal,
+			"new": newVal,
+		}
+	}
+	formatTimePtr := func(value *time.Time) interface{} {
+		if value == nil {
+			return nil
+		}
+		return value.UTC().Format(time.RFC3339)
+	}
 
 	if req.Name != nil {
 		updates = append(updates, colUpdate{"name", *req.Name})
+		if *req.Name != existingName {
+			setAuditChange("name", existingName, *req.Name)
+		}
 	}
 	if req.StorageQuota != nil {
 		updates = append(updates, colUpdate{"storage_quota", *req.StorageQuota})
+		if *req.StorageQuota != existingStorageQuota {
+			setAuditChange("storage_quota", existingStorageQuota, *req.StorageQuota)
+		}
 	}
 	if req.TrafficQuota != nil {
 		updates = append(updates, colUpdate{"traffic_quota", *req.TrafficQuota})
+		if *req.TrafficQuota != existingTrafficQuota {
+			setAuditChange("traffic_quota", existingTrafficQuota, *req.TrafficQuota)
+		}
 	}
 	if req.TrafficUploadQuota != nil {
 		updates = append(updates, colUpdate{"traffic_upload_quota", *req.TrafficUploadQuota})
+		if *req.TrafficUploadQuota != existingTrafficUploadQuota {
+			setAuditChange("traffic_upload_quota", existingTrafficUploadQuota, *req.TrafficUploadQuota)
+		}
 	}
 	if req.TrafficDownloadQuota != nil {
 		updates = append(updates, colUpdate{"traffic_download_quota", *req.TrafficDownloadQuota})
+		if *req.TrafficDownloadQuota != existingTrafficDownloadQuota {
+			setAuditChange("traffic_download_quota", existingTrafficDownloadQuota, *req.TrafficDownloadQuota)
+		}
 	}
 	if req.MaxUsers != nil {
 		updates = append(updates, colUpdate{"max_users", *req.MaxUsers})
+		if *req.MaxUsers != existingMaxUsers {
+			setAuditChange("max_users", existingMaxUsers, *req.MaxUsers)
+		}
 	}
 	if req.Plan != nil {
 		updates = append(updates, colUpdate{"plan", *req.Plan})
+		if *req.Plan != existingPlan {
+			setAuditChange("plan", existingPlan, *req.Plan)
+		}
+	}
+	if req.QuotaPolicy != nil {
+		qp := *req.QuotaPolicy
+		if qp != "hard" && qp != "soft" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "quota_policy must be 'hard' or 'soft'"})
+			return
+		}
+		updates = append(updates, colUpdate{"quota_policy", qp})
+		if qp != existingQuotaPolicy {
+			setAuditChange("quota_policy", existingQuotaPolicy, qp)
+		}
 	}
 	if req.BillingCycle != nil {
 		updates = append(updates, colUpdate{"billing_cycle", *req.BillingCycle})
+		if *req.BillingCycle != existingBillingCycle {
+			setAuditChange("billing_cycle", existingBillingCycle, *req.BillingCycle)
+		}
+	}
+	if req.CurrentPeriodStartedAt != nil {
+		updates = append(updates, colUpdate{"current_period_started_at", *req.CurrentPeriodStartedAt})
+		if formatTimePtr(req.CurrentPeriodStartedAt) != formatTimePtr(existingCurrentPeriodStartedAt) {
+			setAuditChange("current_period_started_at", formatTimePtr(existingCurrentPeriodStartedAt), formatTimePtr(req.CurrentPeriodStartedAt))
+		}
+	}
+	if req.CurrentPeriodEndsAt != nil {
+		updates = append(updates, colUpdate{"current_period_ends_at", *req.CurrentPeriodEndsAt})
+		if formatTimePtr(req.CurrentPeriodEndsAt) != formatTimePtr(existingCurrentPeriodEndsAt) {
+			setAuditChange("current_period_ends_at", formatTimePtr(existingCurrentPeriodEndsAt), formatTimePtr(req.CurrentPeriodEndsAt))
+		}
 	}
 
+	if len(updates) == 0 {
+		c.JSON(http.StatusOK, gin.H{"success": true})
+		return
+	}
+
+	batch := h.db.Session().Batch(gocql.LoggedBatch)
 	for _, u := range updates {
 		query := fmt.Sprintf("UPDATE organizations SET %s = ? WHERE org_id = ?", u.col)
-		if err := h.db.Session().Query(query, u.val, orgUUID).Exec(); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update organization"})
-			return
-		}
+		batch.Query(query, u.val, orgUUID)
+	}
+
+	actorID := c.GetString("user_id")
+	if actorID == "" {
+		actorID = "service-token"
+	}
+	auditDetails, _ := json.Marshal(map[string]interface{}{
+		"org_id":          orgID,
+		"changes":         auditChanges,
+		"override_source": "manual-superadmin",
+	})
+	batch.Query(`
+		INSERT INTO audit_log (org_id, timestamp, action, target_type, target_id, actor_id, details)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+	`, orgUUID, time.Now().UTC(), "organization.update", "organization", orgID, actorID, string(auditDetails))
+
+	if err := batch.Exec(); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update organization"})
+		return
 	}
 
 	c.JSON(http.StatusOK, gin.H{"success": true})
@@ -846,7 +973,7 @@ func (h *AdminHandler) ListOrgUsers(c *gin.Context) {
 			continue
 		}
 		isActive := IsUserUsable(status)
-		isOrgStaff := role == "admin" || role == "superadmin"
+		isOrgStaff := middleware.IsOrgStaff(role)
 		users = append(users, gin.H{
 			"email":        email,
 			"name":         name,
@@ -1987,7 +2114,7 @@ func makeAdminUserResponse(email, name, role, status string, quotaBytes, usedByt
 		Name:                 name,
 		Status:               canonicalStatus,
 		IsActive:             canonicalStatus == StatusActive,
-		IsStaff:              role == "admin" || role == "superadmin",
+		IsStaff:              middleware.IsOrgStaff(role),
 		Role:                 role,
 		AdminRole:            adminRole,
 		QuotaTotal:           quotaBytes,
@@ -2378,16 +2505,9 @@ func (h *AdminHandler) UpdateUserByEmail(c *gin.Context, email string) {
 	}
 
 	if isStaffStr != "" {
-		if isStaffStr == "false" && (currentRole == "admin" || currentRole == "superadmin") {
-			currentRole = "user"
-			if err := h.db.Session().Query(`
-				UPDATE users SET role = ? WHERE org_id = ? AND user_id = ?
-			`, currentRole, userOrgID, userID).Exec(); err != nil {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update user"})
-				return
-			}
-		} else if isStaffStr == "true" && currentRole != "admin" && currentRole != "superadmin" {
-			currentRole = "admin"
+		nextRole := applyLegacyStaffToggle(currentRole, isStaffStr == "true")
+		if nextRole != currentRole {
+			currentRole = nextRole
 			if err := h.db.Session().Query(`
 				UPDATE users SET role = ? WHERE org_id = ? AND user_id = ?
 			`, currentRole, userOrgID, userID).Exec(); err != nil {

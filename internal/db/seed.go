@@ -92,8 +92,11 @@ func (db *DB) createPlatformOrganization(orgID uuid.UUID) error {
 	query := `
 		INSERT INTO organizations (
 			org_id, name, status, settings, storage_quota, storage_used,
-			chunking_polynomial, storage_config, created_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+			chunking_polynomial, storage_config, created_at,
+			plan, quota_policy, billing_cycle,
+			traffic_quota, traffic_upload_quota, traffic_download_quota, max_users,
+			current_period_started_at, current_period_ends_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`
 
 	settings := map[string]string{
@@ -105,16 +108,27 @@ func (db *DB) createPlatformOrganization(orgID uuid.UUID) error {
 		"default_backend": "s3",
 	}
 
+	periodEnd := now.AddDate(0, 1, 0) // +1 month
+
 	err := db.Session().Query(query,
 		orgID.String(),
 		"SesameFS Platform",
 		"active",
 		settings,
-		int64(0), // Platform org doesn't need storage quota
+		int64(-1), // unlimited storage
 		int64(0),
 		int64(17592186044415),
 		storageConfig,
 		now,
+		"platform",  // plan (display)
+		"soft",      // quota_policy
+		"monthly",   // billing_cycle
+		int64(-1),   // traffic_quota unlimited
+		int64(-1),   // traffic_upload_quota unlimited
+		int64(-1),   // traffic_download_quota unlimited
+		int(-1),     // max_users unlimited
+		now,         // current_period_started_at
+		periodEnd,   // current_period_ends_at
 	).Exec()
 
 	if err != nil {
@@ -175,8 +189,11 @@ func (db *DB) createDefaultOrganization(orgID uuid.UUID) error {
 	query := `
 		INSERT INTO organizations (
 			org_id, name, status, settings, storage_quota, storage_used,
-			chunking_polynomial, storage_config, created_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+			chunking_polynomial, storage_config, created_at,
+			plan, quota_policy, billing_cycle,
+			traffic_quota, traffic_upload_quota, traffic_download_quota, max_users,
+			current_period_started_at, current_period_ends_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`
 
 	// Default settings
@@ -189,8 +206,10 @@ func (db *DB) createDefaultOrganization(orgID uuid.UUID) error {
 		"default_backend": "s3",
 	}
 
+	periodEnd := now.AddDate(0, 1, 0) // +1 month
+
 	err := db.Session().Query(query,
-		orgID.String(), // Convert UUID to string
+		orgID.String(),
 		"Default Organization",
 		"active",
 		settings,
@@ -199,6 +218,15 @@ func (db *DB) createDefaultOrganization(orgID uuid.UUID) error {
 		int64(17592186044415), // Default Rabin polynomial
 		storageConfig,
 		now,
+		"business", // plan (display)
+		"soft",     // quota_policy
+		"monthly",  // billing_cycle
+		int64(-1),  // traffic_quota unlimited
+		int64(-1),  // traffic_upload_quota unlimited
+		int64(-1),  // traffic_download_quota unlimited
+		int(-1),    // max_users unlimited
+		now,        // current_period_started_at
+		periodEnd,  // current_period_ends_at
 	).Exec()
 
 	if err != nil {

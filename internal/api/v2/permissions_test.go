@@ -268,6 +268,7 @@ func TestAccountInfoPermissionFlags(t *testing.T) {
 		canGenerateLink bool
 	}{
 		{"superadmin", true, true, true, true},
+		{"owner", true, true, true, true},
 		{"admin", true, true, true, true},
 		{"user", true, true, true, true},
 		{"readonly", false, false, false, false},
@@ -277,7 +278,7 @@ func TestAccountInfoPermissionFlags(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.role, func(t *testing.T) {
 			// These are the expected values based on role
-			isWriteRole := tt.role == "superadmin" || tt.role == "admin" || tt.role == "user"
+			isWriteRole := canManageLegacyContent(tt.role)
 
 			assert := assert.New(t)
 			assert.Equal(tt.canAddRepo, isWriteRole, "can_add_repo mismatch for %s", tt.role)

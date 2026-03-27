@@ -473,6 +473,146 @@ func TestGetEnvIntInvalid(t *testing.T) {
 	}
 }
 
+// --- Enforcement Profile tests ---
+
+func TestDefaultHardProfile(t *testing.T) {
+	p := DefaultHardProfile()
+
+	// Hard profile restricts groups, guests, publish, global address book
+	if p.Features.CanAddGroup {
+		t.Error("hard profile: CanAddGroup should be false")
+	}
+	if p.Features.CanInviteGuest {
+		t.Error("hard profile: CanInviteGuest should be false")
+	}
+	if p.Features.CanPublishRepo {
+		t.Error("hard profile: CanPublishRepo should be false")
+	}
+	if p.Features.CanUseGlobalAddressBook {
+		t.Error("hard profile: CanUseGlobalAddressBook should be false")
+	}
+	if p.Features.CanSendShareLinkMail {
+		t.Error("hard profile: CanSendShareLinkMail should be false")
+	}
+
+	// Hard profile allows basic features
+	if !p.Features.CanAddRepo {
+		t.Error("hard profile: CanAddRepo should be true")
+	}
+	if !p.Features.CanShareRepo {
+		t.Error("hard profile: CanShareRepo should be true")
+	}
+	if !p.Features.CanGenerateShareLink {
+		t.Error("hard profile: CanGenerateShareLink should be true")
+	}
+	if !p.Features.CanConnectWithDesktopClients {
+		t.Error("hard profile: CanConnectWithDesktopClients should be true")
+	}
+
+	// Hard profile has strict numeric limits
+	if p.Limits.MaxLibraries != 3 {
+		t.Errorf("hard profile: MaxLibraries = %d, want 3", p.Limits.MaxLibraries)
+	}
+	if p.Limits.MaxShareLinks != 3 {
+		t.Errorf("hard profile: MaxShareLinks = %d, want 3", p.Limits.MaxShareLinks)
+	}
+	if p.Limits.MaxUploadLinks != 1 {
+		t.Errorf("hard profile: MaxUploadLinks = %d, want 1", p.Limits.MaxUploadLinks)
+	}
+	if p.Limits.ShareLinkExpireDaysMax != 3 {
+		t.Errorf("hard profile: ShareLinkExpireDaysMax = %d, want 3", p.Limits.ShareLinkExpireDaysMax)
+	}
+	if p.Limits.UploadLinkExpireDaysMax != 3 {
+		t.Errorf("hard profile: UploadLinkExpireDaysMax = %d, want 3", p.Limits.UploadLinkExpireDaysMax)
+	}
+}
+
+func TestDefaultSoftProfile(t *testing.T) {
+	p := DefaultSoftProfile()
+
+	// Soft profile enables all features
+	if !p.Features.CanAddGroup {
+		t.Error("soft profile: CanAddGroup should be true")
+	}
+	if !p.Features.CanInviteGuest {
+		t.Error("soft profile: CanInviteGuest should be true")
+	}
+	if !p.Features.CanPublishRepo {
+		t.Error("soft profile: CanPublishRepo should be true")
+	}
+	if !p.Features.CanUseGlobalAddressBook {
+		t.Error("soft profile: CanUseGlobalAddressBook should be true")
+	}
+	if !p.Features.CanSendShareLinkMail {
+		t.Error("soft profile: CanSendShareLinkMail should be true")
+	}
+
+	// Soft profile has unlimited numeric limits (-1 or 0)
+	if p.Limits.MaxLibraries != -1 {
+		t.Errorf("soft profile: MaxLibraries = %d, want -1", p.Limits.MaxLibraries)
+	}
+	if p.Limits.MaxShareLinks != -1 {
+		t.Errorf("soft profile: MaxShareLinks = %d, want -1", p.Limits.MaxShareLinks)
+	}
+	if p.Limits.MaxUploadLinks != -1 {
+		t.Errorf("soft profile: MaxUploadLinks = %d, want -1", p.Limits.MaxUploadLinks)
+	}
+	if p.Limits.ShareLinkExpireDaysMax != 0 {
+		t.Errorf("soft profile: ShareLinkExpireDaysMax = %d, want 0", p.Limits.ShareLinkExpireDaysMax)
+	}
+	if p.Limits.UploadLinkExpireDaysMax != 0 {
+		t.Errorf("soft profile: UploadLinkExpireDaysMax = %d, want 0", p.Limits.UploadLinkExpireDaysMax)
+	}
+}
+
+func TestGetEnforcementProfile(t *testing.T) {
+	cfg := DefaultConfig()
+
+	// "hard" returns hard profile
+	hard := cfg.GetEnforcementProfile("hard")
+	if hard.Features.CanAddGroup {
+		t.Error("GetEnforcementProfile(hard): CanAddGroup should be false")
+	}
+	if hard.Limits.MaxLibraries != 3 {
+		t.Errorf("GetEnforcementProfile(hard): MaxLibraries = %d, want 3", hard.Limits.MaxLibraries)
+	}
+
+	// "soft" returns soft profile
+	soft := cfg.GetEnforcementProfile("soft")
+	if !soft.Features.CanAddGroup {
+		t.Error("GetEnforcementProfile(soft): CanAddGroup should be true")
+	}
+	if soft.Limits.MaxLibraries != -1 {
+		t.Errorf("GetEnforcementProfile(soft): MaxLibraries = %d, want -1", soft.Limits.MaxLibraries)
+	}
+
+	// "" defaults to hard
+	empty := cfg.GetEnforcementProfile("")
+	if empty.Features.CanAddGroup {
+		t.Error("GetEnforcementProfile(''): should default to hard, CanAddGroup should be false")
+	}
+
+	// unknown key falls back to hard defaults
+	unknown := cfg.GetEnforcementProfile("unknown_policy")
+	if unknown.Features.CanAddGroup {
+		t.Error("GetEnforcementProfile(unknown): should fall back to hard defaults")
+	}
+}
+
+func TestDefaultConfigHasEnforcementProfiles(t *testing.T) {
+	cfg := DefaultConfig()
+
+	if len(cfg.EnforcementProfiles) != 2 {
+		t.Fatalf("EnforcementProfiles count = %d, want 2", len(cfg.EnforcementProfiles))
+	}
+	if _, ok := cfg.EnforcementProfiles["hard"]; !ok {
+		t.Error("EnforcementProfiles missing 'hard' key")
+	}
+	if _, ok := cfg.EnforcementProfiles["soft"]; !ok {
+		t.Error("EnforcementProfiles missing 'soft' key")
+	}
+}
+
 // TestS3OverrideNoHotBackend tests S3 env vars when "hot" backend doesn't exist
 func TestS3OverrideNoHotBackend(t *testing.T) {
 	cfg := DefaultConfig()

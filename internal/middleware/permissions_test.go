@@ -281,11 +281,19 @@ func TestOrgRoleHierarchy(t *testing.T) {
 		expectedResult bool
 	}{
 		{"superadmin satisfies superadmin", RoleSuperAdmin, RoleSuperAdmin, true},
+		{"superadmin satisfies owner", RoleSuperAdmin, RoleOwner, true},
 		{"superadmin satisfies admin", RoleSuperAdmin, RoleAdmin, true},
 		{"superadmin satisfies user", RoleSuperAdmin, RoleUser, true},
 		{"superadmin satisfies readonly", RoleSuperAdmin, RoleReadOnly, true},
 		{"superadmin satisfies guest", RoleSuperAdmin, RoleGuest, true},
+		{"owner satisfies owner", RoleOwner, RoleOwner, true},
+		{"owner satisfies admin", RoleOwner, RoleAdmin, true},
+		{"owner satisfies user", RoleOwner, RoleUser, true},
+		{"owner satisfies readonly", RoleOwner, RoleReadOnly, true},
+		{"owner satisfies guest", RoleOwner, RoleGuest, true},
+		{"owner does not satisfy superadmin", RoleOwner, RoleSuperAdmin, false},
 		{"admin does not satisfy superadmin", RoleAdmin, RoleSuperAdmin, false},
+		{"admin does not satisfy owner", RoleAdmin, RoleOwner, false},
 		{"admin satisfies admin", RoleAdmin, RoleAdmin, true},
 		{"admin satisfies user", RoleAdmin, RoleUser, true},
 		{"admin satisfies readonly", RoleAdmin, RoleReadOnly, true},
@@ -294,6 +302,7 @@ func TestOrgRoleHierarchy(t *testing.T) {
 		{"user satisfies readonly", RoleUser, RoleReadOnly, true},
 		{"user satisfies guest", RoleUser, RoleGuest, true},
 		{"user does not satisfy admin", RoleUser, RoleAdmin, false},
+		{"user does not satisfy owner", RoleUser, RoleOwner, false},
 		{"user does not satisfy superadmin", RoleUser, RoleSuperAdmin, false},
 		{"readonly satisfies readonly", RoleReadOnly, RoleReadOnly, true},
 		{"readonly satisfies guest", RoleReadOnly, RoleGuest, true},
@@ -302,6 +311,7 @@ func TestOrgRoleHierarchy(t *testing.T) {
 		{"guest does not satisfy readonly", RoleGuest, RoleReadOnly, false},
 		{"guest does not satisfy user", RoleGuest, RoleUser, false},
 		{"guest does not satisfy admin", RoleGuest, RoleAdmin, false},
+		{"guest does not satisfy owner", RoleGuest, RoleOwner, false},
 		{"guest does not satisfy superadmin", RoleGuest, RoleSuperAdmin, false},
 	}
 
@@ -353,15 +363,22 @@ func TestHasRequiredOrgRolePublic(t *testing.T) {
 		expected     bool
 	}{
 		{"superadmin satisfies superadmin", RoleSuperAdmin, RoleSuperAdmin, true},
+		{"superadmin satisfies owner", RoleSuperAdmin, RoleOwner, true},
 		{"superadmin satisfies admin", RoleSuperAdmin, RoleAdmin, true},
 		{"superadmin satisfies user", RoleSuperAdmin, RoleUser, true},
 		{"superadmin satisfies readonly", RoleSuperAdmin, RoleReadOnly, true},
 		{"superadmin satisfies guest", RoleSuperAdmin, RoleGuest, true},
+		{"owner satisfies owner", RoleOwner, RoleOwner, true},
+		{"owner satisfies admin", RoleOwner, RoleAdmin, true},
+		{"owner satisfies user", RoleOwner, RoleUser, true},
+		{"owner does not satisfy superadmin", RoleOwner, RoleSuperAdmin, false},
 		{"admin does not satisfy superadmin", RoleAdmin, RoleSuperAdmin, false},
+		{"admin does not satisfy owner", RoleAdmin, RoleOwner, false},
 		{"admin satisfies admin", RoleAdmin, RoleAdmin, true},
 		{"admin satisfies user", RoleAdmin, RoleUser, true},
 		{"user satisfies user", RoleUser, RoleUser, true},
 		{"user does not satisfy admin", RoleUser, RoleAdmin, false},
+		{"user does not satisfy owner", RoleUser, RoleOwner, false},
 		{"readonly does not satisfy user", RoleReadOnly, RoleUser, false},
 		{"readonly satisfies readonly", RoleReadOnly, RoleReadOnly, true},
 		{"guest satisfies guest", RoleGuest, RoleGuest, true},
@@ -463,6 +480,9 @@ func TestOrgRoleConstants(t *testing.T) {
 	if RoleAdmin != "admin" {
 		t.Errorf("RoleAdmin = %q, want %q", RoleAdmin, "admin")
 	}
+	if RoleOwner != "owner" {
+		t.Errorf("RoleOwner = %q, want %q", RoleOwner, "owner")
+	}
 	if RoleUser != "user" {
 		t.Errorf("RoleUser = %q, want %q", RoleUser, "user")
 	}
@@ -471,6 +491,32 @@ func TestOrgRoleConstants(t *testing.T) {
 	}
 	if RoleGuest != "guest" {
 		t.Errorf("RoleGuest = %q, want %q", RoleGuest, "guest")
+	}
+}
+
+// TestIsOrgStaff tests the exported IsOrgStaff helper
+func TestIsOrgStaff(t *testing.T) {
+	tests := []struct {
+		role     string
+		expected bool
+	}{
+		{"superadmin", true},
+		{"owner", true},
+		{"admin", true},
+		{"user", false},
+		{"readonly", false},
+		{"guest", false},
+		{"", false},
+		{"unknown", false},
+	}
+
+	for _, tt := range tests {
+		t.Run("role="+tt.role, func(t *testing.T) {
+			result := IsOrgStaff(tt.role)
+			if result != tt.expected {
+				t.Errorf("IsOrgStaff(%q) = %v, want %v", tt.role, result, tt.expected)
+			}
+		})
 	}
 }
 

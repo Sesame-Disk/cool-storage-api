@@ -154,7 +154,7 @@ func (h *DeletedLibraryHandler) RestoreDeletedRepo(c *gin.Context) {
 
 	// Superadmin and org admin can restore any library in their scope; regular users only their own
 	userRole := middleware.OrganizationRole(c.GetString("user_org_role"))
-	isAdmin := userRole == middleware.RoleAdmin || userRole == middleware.RoleSuperAdmin
+	isAdmin := middleware.HasRequiredOrgRole(userRole, middleware.RoleAdmin)
 	if ownerID != userID && !isAdmin {
 		c.JSON(http.StatusForbidden, gin.H{"error": "only library owner can restore"})
 		return
@@ -238,7 +238,7 @@ func (h *DeletedLibraryHandler) PermanentDeleteRepo(c *gin.Context) {
 	if ownerID != userID {
 		// Check if user is admin via context role set by auth middleware
 		userRole := middleware.OrganizationRole(c.GetString("user_org_role"))
-		if userRole != middleware.RoleAdmin && userRole != middleware.RoleSuperAdmin {
+		if !middleware.HasRequiredOrgRole(userRole, middleware.RoleAdmin) {
 			c.JSON(http.StatusForbidden, gin.H{"error": "only library owner or admin can permanently delete"})
 			return
 		}

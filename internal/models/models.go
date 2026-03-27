@@ -18,7 +18,10 @@ type Organization struct {
 	StorageConfig      map[string]string `json:"storage_config,omitempty"`
 	// Plan and quota fields — set by external billing service
 	Plan                 string    `json:"plan,omitempty"`
+	QuotaPolicy          string    `json:"quota_policy,omitempty"`  // "hard" (free) | "soft" (paid)
 	BillingCycle         string    `json:"billing_cycle,omitempty"` // "monthly" | "annual"
+	CurrentPeriodStartedAt *time.Time `json:"current_period_started_at,omitempty"` // quota period start
+	CurrentPeriodEndsAt    *time.Time `json:"current_period_ends_at,omitempty"`    // quota period end
 	TrafficQuota         int64     `json:"traffic_quota"`           // combined monthly limit, -1=N/A
 	TrafficUploadQuota   int64     `json:"traffic_upload_quota"`    // upload monthly limit, -1=unlimited
 	TrafficDownloadQuota int64     `json:"traffic_download_quota"`  // download monthly limit, -1=unlimited
@@ -32,7 +35,7 @@ type User struct {
 	OrgID                uuid.UUID  `json:"org_id"`
 	Email                string     `json:"email"`
 	Name                 string     `json:"name"`
-	Role                 string     `json:"role"`   // superadmin, admin, user, readonly, guest
+	Role                 string     `json:"role"`   // superadmin, owner, admin, user, readonly, guest
 	Status               string     `json:"status"` // active, deactivated, deleted
 	OIDCSub              string     `json:"-"`      // OIDC subject identifier
 	QuotaBytes           int64      `json:"quota_bytes"`

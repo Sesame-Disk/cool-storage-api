@@ -22,6 +22,7 @@ import (
 
 	"github.com/Sesame-Disk/sesamefs/internal/config"
 	"github.com/Sesame-Disk/sesamefs/internal/db"
+	"github.com/Sesame-Disk/sesamefs/internal/traffic"
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
@@ -688,26 +689,43 @@ func (c *OIDCClient) provisionUser(ctx context.Context, claims *IDTokenClaims, u
 	}
 
 	// Auto-provision organization if it doesn't exist
+	isNewOrg := false
 	if c.config.AutoProvision && orgID != "" {
 		var existingOrgID string
 		orgErr := c.db.Session().Query(`
 			SELECT org_id FROM organizations WHERE org_id = ?
 		`, orgID).Scan(&existingOrgID)
 		if orgErr != nil {
-			// Org doesn't exist - create it
+			// Org doesn't exist - create it with free tier defaults
+			isNewOrg = true
 			orgName := c.config.DefaultOrgName
 			if orgName == "" {
 				orgName = "Auto-provisioned Organization"
 			}
 			now := time.Now()
+			periodEnd := now.AddDate(0, 1, 0) // +1 month
 			createErr := c.db.Session().Query(`
-				INSERT INTO organizations (org_id, name, status, settings, storage_quota, storage_used, chunking_polynomial, storage_config, created_at)
-				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+				INSERT INTO organizations (
+					org_id, name, status, settings, storage_quota, storage_used,
+					chunking_polynomial, storage_config, created_at,
+					plan, quota_policy, billing_cycle,
+					traffic_quota, traffic_upload_quota, traffic_download_quota, max_users,
+					current_period_started_at, current_period_ends_at
+				) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			`, orgID, orgName, "active",
 				map[string]string{"theme": "default", "features": "all"},
-				int64(1099511627776), int64(0), int64(17592186044415),
+				int64(2147483648), int64(0), int64(17592186044415), // 2GB storage
 				map[string]string{"default_backend": "s3"},
 				now,
+				"free",    // plan
+				"hard",    // quota_policy
+				"monthly", // billing_cycle
+				int64(10737418240), // traffic_quota: 10GB
+				int64(-1),          // traffic_upload_quota
+				int64(-1),          // traffic_download_quota
+				int(1),             // max_users
+				now,                // current_period_started_at
+				periodEnd,          // current_period_ends_at
 			).Exec()
 			if createErr != nil {
 				fmt.Printf("Warning: failed to auto-provision org %s: %v\n", orgID, createErr)
@@ -799,6 +817,20 @@ func (c *OIDCClient) provisionUser(ctx context.Context, claims *IDTokenClaims, u
 		}
 		if name == "" {
 			name = email
+		}
+
+		// First user in a new org gets role=owner
+		if isNewOrg {
+			role = "owner"
+		}
+
+		// Check max_users quota before creating (skip for new orgs — first user is always allowed)
+		if !isNewOrg {
+			if checker := traffic.GetChecker(); checker != nil {
+				if st, _ := checker.CheckMaxUsers(orgID); !st.Allowed {
+					return nil, fmt.Errorf("organization user limit reached")
+				}
+			}
 		}
 
 		// Create user record
@@ -1011,7 +1043,9 @@ func (c *OIDCClient) mapOIDCRole(oidcRole string) string {
 	switch strings.ToLower(oidcRole) {
 	case "superadmin", "super_admin", "platform_admin":
 		return "superadmin"
-	case "admin", "administrator":
+	case "owner", "org_owner":
+		return "owner"
+	case "admin", "administrator", "tenant_admin":
 		return "admin"
 	case "user", "member":
 		return "user"

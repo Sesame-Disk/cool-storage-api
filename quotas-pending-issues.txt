@@ -533,7 +533,13 @@
 [DECIDIDO] Override manual del superadmin vs Accounts
     - DECISIÓN: Override efímero. Accounts pisa duro en el siguiente sync.
     - Superadmin puede editar manualmente para emergencias/debug
+    - Incluye cambio manual de plan / quota_policy (`hard` <-> `soft`) y quotas
     - No hay overrides persistentes locales
+
+[ISSUE ABIERTO] Sync de roles OIDC vs cambios manuales en SesameFS
+    - Decisión operativa actual: transfer de ownership o fixes manuales hechos por superadmin NO deben ser sobreescritos por sync automático de role desde OIDC
+    - El mapping de roles OIDC se mantiene, pero la reconciliación fina IdP vs overrides manuales queda como deuda pendiente
+    - Requiere diseño específico antes de reactivar cualquier sync agresivo de roles
 
 [DECIDIDO] Endpoints del provisioning token
     - DECISIÓN: Alcance completo superadmin-equivalent en primera versión
@@ -684,12 +690,14 @@
 1. [DONE] Verificar y corregir estadísticas sysadmin + org-admin
 2. [DONE] Storage time-series (storage_counters rediseñado con day)
 3. [DONE] Diseño completo de plans & permissions (docs/PLANS-AND-PERMISSIONS.md)
-4. Agregar role "owner" a jerarquía + OIDC mapping
-5. Agregar `quota_policy` a organizations + migration
-6. Agregar `current_period_started_at` + `current_period_ends_at` a organizations
-7. Crear enforcement profiles config (keyed by quota_policy) + loader
-8. Reemplazar `isFree()` por `isHardEnforcement(quota_policy)`
-9. Aplicar defaults en seed (business), admin create (free), OIDC (free), role=owner para creador
+4. [DONE] Agregar role "owner" a jerarquía + OIDC mapping + IsOrgStaff() centralizado
+5. [DONE] Agregar `quota_policy` a organizations + migration
+6. [DONE] Agregar `current_period_started_at` + `current_period_ends_at` a organizations
+7. [DONE] Crear enforcement profiles config (keyed by quota_policy) + loader
+8. [DONE] Reemplazar `isFree()` por `isHardEnforcement(quota_policy)` — queries leen quota_policy
+9. [DONE] Defaults en seed (soft), admin create (hard/free), OIDC (hard/free), role=owner para creador
+9a.[DONE] Endpoint de ownership transfer: PUT /org/:org_id/admin/transfer-ownership/
+9b.[DONE] max_users check en OIDC auto-provision (skip para org nueva)
 10. Crear `ResolveCapabilities(role, quotaPolicy)` con `upgrade_features` list
 11. Agregar agregación de tráfico por período efectivo para enforcement
 12. Actualizar `/api2/account/info/` con: storage{}, traffic{}, current_period_*, upgrade_features, can_upgrade, is_org_owner
@@ -718,3 +726,20 @@
     - O bien: Accounts llama provisioning API de SesameFS para crear user
     - Requiere coordinación con equipo de Accounts
     - Documentado en docs/PLANS-AND-PERMISSIONS.md sección "User Creation"
+
+## PROGRESO DE IMPLEMENTACIÓN
+
+[2026-03-27] Phase 1 — Backend Model: COMPLETA
+    - Role "owner" en jerarquía (5>4>3>2>1>0) + IsOrgStaff() helper centralizado
+    - OIDC mapping ampliado: "owner", "org_owner", "tenant_admin"
+    - Columnas: quota_policy, current_period_started_at, current_period_ends_at (ALTER TABLE + models)
+    - EnforcementProfile struct en config.go (Features + Limits), GetEnforcementProfile(), defaults hard/soft
+    - isFree(plan) → isHardEnforcement(quotaPolicy), queries leen quota_policy
+    - Org creation (seed, admin, OIDC) con todos los campos de plan+período
+    - Creador de org = role owner (admin.go + OIDC isNewOrg)
+    - PUT /org/:org_id/admin/transfer-ownership/ (owner o superadmin; permite bootstrap si la org no tiene owner)
+    - max_users check en OIDC provisionUser (skip para org nueva)
+    - UpdateOrganization acepta quota_policy, current_period_started_at, current_period_ends_at
+    - GetOrganization y GetOrgInfo devuelven los nuevos campos
+    - Legacy handlers ajustados para no degradar `owner` vía toggles de `is_staff` y para tratar `owner` como admin-level en account/info y trash libs
+    - Build limpio, todos los tests pasan

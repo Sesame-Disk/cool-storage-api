@@ -30,6 +30,7 @@ type OrganizationRole string
 
 const (
 	RoleSuperAdmin OrganizationRole = "superadmin"
+	RoleOwner      OrganizationRole = "owner"
 	RoleAdmin      OrganizationRole = "admin"
 	RoleUser       OrganizationRole = "user"
 	RoleReadOnly   OrganizationRole = "readonly"
@@ -342,7 +343,7 @@ func (m *PermissionMiddleware) GetLibraryPermission(orgID, userID, repoID string
 func (m *PermissionMiddleware) GetLibraryPermissionWithFlags(orgID, userID, repoID string) (LibraryPermission, *PermissionFlags, error) {
 	// Check if user is admin/superadmin - they have full access to all libraries
 	role, err := m.GetUserOrgRole(orgID, userID)
-	if err == nil && (role == RoleSuperAdmin || role == RoleAdmin) {
+	if err == nil && (role == RoleSuperAdmin || role == RoleOwner || role == RoleAdmin) {
 		return PermissionOwner, allPermFlags(), nil
 	}
 
@@ -439,7 +440,7 @@ func (m *PermissionMiddleware) GetLibraryPermissionWithFlags(orgID, userID, repo
 func (m *PermissionMiddleware) GetLibraryPermissionRaw(orgID, userID, repoID string) (string, error) {
 	// Check if user is admin/superadmin - they have full access
 	role, err := m.GetUserOrgRole(orgID, userID)
-	if err == nil && (role == RoleSuperAdmin || role == RoleAdmin) {
+	if err == nil && (role == RoleSuperAdmin || role == RoleOwner || role == RoleAdmin) {
 		return "rw", nil
 	}
 
@@ -619,9 +620,10 @@ func (m *PermissionMiddleware) RequireAdminOrAbove() gin.HandlerFunc {
 }
 
 // orgRoleHierarchy defines the canonical role hierarchy.
-// superadmin(4) > admin(3) > user(2) > readonly(1) > guest(0)
+// superadmin(5) > owner(4) > admin(3) > user(2) > readonly(1) > guest(0)
 var orgRoleHierarchy = map[OrganizationRole]int{
-	RoleSuperAdmin: 4,
+	RoleSuperAdmin: 5,
+	RoleOwner:      4,
 	RoleAdmin:      3,
 	RoleUser:       2,
 	RoleReadOnly:   1,
@@ -629,9 +631,15 @@ var orgRoleHierarchy = map[OrganizationRole]int{
 }
 
 // HasRequiredOrgRole checks if userRole meets or exceeds requiredRole in the hierarchy.
-// Hierarchy: superadmin(4) > admin(3) > user(2) > readonly(1) > guest(0)
+// Hierarchy: superadmin(5) > owner(4) > admin(3) > user(2) > readonly(1) > guest(0)
 func HasRequiredOrgRole(userRole, requiredRole OrganizationRole) bool {
 	return orgRoleHierarchy[userRole] >= orgRoleHierarchy[requiredRole]
+}
+
+// IsOrgStaff returns true if the role string represents an admin-level or higher role
+// (admin, owner, superadmin). Use this instead of inline comparisons.
+func IsOrgStaff(role string) bool {
+	return HasRequiredOrgRole(OrganizationRole(role), RoleAdmin)
 }
 
 // hasRequiredOrgRole checks if user's role meets requirement

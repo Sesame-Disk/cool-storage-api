@@ -70,8 +70,8 @@ func TestSeedDatabase_DevModeUsers(t *testing.T) {
 
 	t.Run("creates users with different roles", func(t *testing.T) {
 		// Test that we have the correct roles defined (including superadmin)
-		roles := []string{"superadmin", "admin", "user", "readonly", "guest"}
-		assert.Equal(t, 5, len(roles), "Should have 5 distinct roles")
+		roles := []string{"superadmin", "owner", "admin", "user", "readonly", "guest"}
+		assert.Equal(t, 6, len(roles), "Should have 6 distinct roles")
 	})
 
 	t.Run("dev mode creates 5 users total", func(t *testing.T) {

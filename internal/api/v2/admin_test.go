@@ -472,6 +472,18 @@ func TestMakeAdminUserResponse(t *testing.T) {
 			wantRole:   "superadmin",
 		},
 		{
+			name:       "owner user has is_staff true",
+			email:      "owner@example.com",
+			userName:   "Owner User",
+			role:       "owner",
+			status:     "active",
+			quotaBytes: 1099511627776,
+			usedBytes:  0,
+			wantActive: true,
+			wantStaff:  true,
+			wantRole:   "owner",
+		},
+		{
 			name:       "deactivated user has is_active false and is_staff false",
 			email:      "deactivated@example.com",
 			userName:   "Gone User",

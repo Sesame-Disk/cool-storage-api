@@ -12,19 +12,122 @@ import (
 
 // Config holds all configuration for SesameFS
 type Config struct {
-	Server        ServerConfig        `yaml:"server"`
-	Database      DatabaseConfig      `yaml:"database"`
-	Storage       StorageConfig       `yaml:"storage"`
-	Auth          AuthConfig          `yaml:"auth"`
-	Chunking      ChunkingConfig      `yaml:"chunking"`
-	Versioning    VersioningConfig    `yaml:"versioning"`
-	GC            GCConfig            `yaml:"gc"`
-	SeafHTTP      SeafHTTPConfig      `yaml:"seafhttp"`
-	CORS          CORSConfig          `yaml:"cors"`
-	OnlyOffice    OnlyOfficeConfig    `yaml:"onlyoffice"`
-	Elasticsearch ElasticsearchConfig `yaml:"elasticsearch"`
-	Monitoring    MonitoringConfig    `yaml:"monitoring"`
-	FileView      FileViewConfig      `yaml:"fileview"`
+	Server              ServerConfig                   `yaml:"server"`
+	Database            DatabaseConfig                 `yaml:"database"`
+	Storage             StorageConfig                  `yaml:"storage"`
+	Auth                AuthConfig                     `yaml:"auth"`
+	Chunking            ChunkingConfig                 `yaml:"chunking"`
+	Versioning          VersioningConfig               `yaml:"versioning"`
+	GC                  GCConfig                       `yaml:"gc"`
+	SeafHTTP            SeafHTTPConfig                 `yaml:"seafhttp"`
+	CORS                CORSConfig                     `yaml:"cors"`
+	OnlyOffice          OnlyOfficeConfig               `yaml:"onlyoffice"`
+	Elasticsearch       ElasticsearchConfig            `yaml:"elasticsearch"`
+	Monitoring          MonitoringConfig               `yaml:"monitoring"`
+	FileView            FileViewConfig                 `yaml:"fileview"`
+	EnforcementProfiles map[string]EnforcementProfile  `yaml:"enforcement_profiles"`
+}
+
+// EnforcementProfile defines feature flags and numeric limits for a quota_policy.
+// Keyed by quota_policy value ("hard", "soft") in the config map.
+type EnforcementProfile struct {
+	Features EnforcementFeatures `yaml:"features"`
+	Limits   EnforcementLimits   `yaml:"limits"`
+}
+
+// EnforcementFeatures are boolean feature flags per enforcement profile.
+type EnforcementFeatures struct {
+	CanAddRepo                      bool `yaml:"can_add_repo" json:"can_add_repo"`
+	CanShareRepo                    bool `yaml:"can_share_repo" json:"can_share_repo"`
+	CanAddGroup                     bool `yaml:"can_add_group" json:"can_add_group"`
+	CanGenerateShareLink            bool `yaml:"can_generate_share_link" json:"can_generate_share_link"`
+	CanGenerateUploadLink           bool `yaml:"can_generate_upload_link" json:"can_generate_upload_link"`
+	CanSendShareLinkMail            bool `yaml:"can_send_share_link_mail" json:"can_send_share_link_mail"`
+	CanInviteGuest                  bool `yaml:"can_invite_guest" json:"can_invite_guest"`
+	CanPublishRepo                  bool `yaml:"can_publish_repo" json:"can_publish_repo"`
+	CanUseGlobalAddressBook         bool `yaml:"can_use_global_address_book" json:"can_use_global_address_book"`
+	CanConnectWithDesktopClients    bool `yaml:"can_connect_with_desktop_clients" json:"can_connect_with_desktop_clients"`
+	CanConnectWithAndroidClients    bool `yaml:"can_connect_with_android_clients" json:"can_connect_with_android_clients"`
+	CanConnectWithIOSClients        bool `yaml:"can_connect_with_ios_clients" json:"can_connect_with_ios_clients"`
+	CanExportFilesViaMobileClient   bool `yaml:"can_export_files_via_mobile_client" json:"can_export_files_via_mobile_client"`
+}
+
+// EnforcementLimits are numeric limits per enforcement profile. -1 or 0 = unlimited.
+type EnforcementLimits struct {
+	MaxLibraries            int `yaml:"max_libraries" json:"max_libraries"`
+	MaxShareLinks           int `yaml:"max_share_links" json:"max_share_links"`
+	MaxUploadLinks          int `yaml:"max_upload_links" json:"max_upload_links"`
+	ShareLinkExpireDaysMax  int `yaml:"share_link_expire_days_max" json:"share_link_expire_days_max"`
+	UploadLinkExpireDaysMax int `yaml:"upload_link_expire_days_max" json:"upload_link_expire_days_max"`
+}
+
+// GetEnforcementProfile returns the profile for a quota_policy value.
+// Falls back to "hard" defaults if the policy is not configured.
+func (c *Config) GetEnforcementProfile(quotaPolicy string) EnforcementProfile {
+	if quotaPolicy == "" {
+		quotaPolicy = "hard"
+	}
+	if profile, ok := c.EnforcementProfiles[quotaPolicy]; ok {
+		return profile
+	}
+	// Return hard defaults if not configured
+	return DefaultHardProfile()
+}
+
+// DefaultHardProfile returns the built-in free tier enforcement profile.
+func DefaultHardProfile() EnforcementProfile {
+	return EnforcementProfile{
+		Features: EnforcementFeatures{
+			CanAddRepo:                    true,
+			CanShareRepo:                  true,
+			CanAddGroup:                   false,
+			CanGenerateShareLink:          true,
+			CanGenerateUploadLink:         true,
+			CanSendShareLinkMail:          false,
+			CanInviteGuest:                false,
+			CanPublishRepo:                false,
+			CanUseGlobalAddressBook:       false,
+			CanConnectWithDesktopClients:  true,
+			CanConnectWithAndroidClients:  true,
+			CanConnectWithIOSClients:      true,
+			CanExportFilesViaMobileClient: true,
+		},
+		Limits: EnforcementLimits{
+			MaxLibraries:            3,
+			MaxShareLinks:           3,
+			MaxUploadLinks:          1,
+			ShareLinkExpireDaysMax:  3,
+			UploadLinkExpireDaysMax: 3,
+		},
+	}
+}
+
+// DefaultSoftProfile returns the built-in paid tier enforcement profile.
+func DefaultSoftProfile() EnforcementProfile {
+	return EnforcementProfile{
+		Features: EnforcementFeatures{
+			CanAddRepo:                    true,
+			CanShareRepo:                  true,
+			CanAddGroup:                   true,
+			CanGenerateShareLink:          true,
+			CanGenerateUploadLink:         true,
+			CanSendShareLinkMail:          true,
+			CanInviteGuest:                true,
+			CanPublishRepo:                true,
+			CanUseGlobalAddressBook:       true,
+			CanConnectWithDesktopClients:  true,
+			CanConnectWithAndroidClients:  true,
+			CanConnectWithIOSClients:      true,
+			CanExportFilesViaMobileClient: true,
+		},
+		Limits: EnforcementLimits{
+			MaxLibraries:            -1, // unlimited
+			MaxShareLinks:           -1,
+			MaxUploadLinks:          -1,
+			ShareLinkExpireDaysMax:  0, // 0 = no forced limit
+			UploadLinkExpireDaysMax: 0,
+		},
+	}
 }
 
 // MonitoringConfig holds observability settings (metrics, health checks)
@@ -402,6 +505,10 @@ func DefaultConfig() *Config {
 			MaxVideoBytes:        10 * 1024 * 1024 * 1024, // 10 GB for videos (4K, long recordings)
 			MaxTextBytes:         50 * 1024 * 1024,        // 50 MB for text files (prevent browser freeze)
 			MaxIWorkPreviewBytes: 50 * 1024 * 1024,        // 50 MB for iWork previews
+		},
+		EnforcementProfiles: map[string]EnforcementProfile{
+			"hard": DefaultHardProfile(),
+			"soft": DefaultSoftProfile(),
 		},
 	}
 }

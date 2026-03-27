@@ -29,23 +29,24 @@ func NewChecker(session *gocql.Session) *Checker {
 	return &Checker{session: session}
 }
 
-// isFree returns true if the plan name indicates a free tier.
-func isFree(plan string) bool {
-	return plan == "" || plan == "free"
+// isHardEnforcement returns true if the quota_policy indicates hard enforcement
+// (free tier). Empty defaults to "hard" — safe default, no org gets a free pass.
+func isHardEnforcement(quotaPolicy string) bool {
+	return quotaPolicy == "" || quotaPolicy == "hard"
 }
 
 // CheckStorageQuota evaluates whether uploading additionalBytes would exceed the
 // org's storage quota.
 func (c *Checker) CheckStorageQuota(orgID string, additionalBytes int64) (QuotaStatus, error) {
 	var storageQuota int64
-	var plan string
+	var quotaPolicy string
 
 	// Minimal query: only the columns we need (storage_used is stale, use live counter).
 	err := c.session.Query(`
-		SELECT storage_quota, plan
+		SELECT storage_quota, quota_policy
 		FROM organizations WHERE org_id = ?`,
 		mustParseUUID(orgID),
-	).Scan(&storageQuota, &plan)
+	).Scan(&storageQuota, &quotaPolicy)
 	if err != nil {
 		return QuotaStatus{Allowed: true}, fmt.Errorf("CheckStorageQuota: %w", err)
 	}
@@ -55,31 +56,31 @@ func (c *Checker) CheckStorageQuota(orgID string, additionalBytes int64) (QuotaS
 
 	if storageQuota <= 0 {
 		// -1 or 0 means unlimited
-		return QuotaStatus{Allowed: true, LimitBytes: -1, UsedBytes: storageUsed, Plan: plan}, nil
+		return QuotaStatus{Allowed: true, LimitBytes: -1, UsedBytes: storageUsed, Plan: quotaPolicy}, nil
 	}
 
 	projected := storageUsed + additionalBytes
 	if projected > storageQuota {
-		allowed := !isFree(plan) // paid plans: soft warning, free: hard block
-		warning := !isFree(plan)
+		allowed := !isHardEnforcement(quotaPolicy) // paid plans: soft warning, free: hard block
+		warning := !isHardEnforcement(quotaPolicy)
 		return QuotaStatus{
 			Allowed:    allowed,
 			Warning:    warning,
 			UsedBytes:  storageUsed,
 			LimitBytes: storageQuota,
 			Reason:     "storage",
-			Plan:       plan,
+			Plan:       quotaPolicy,
 		}, nil
 	}
 
 	// Warn at 80% for paid plans
-	warning := !isFree(plan) && float64(projected)/float64(storageQuota) >= 0.80
+	warning := !isHardEnforcement(quotaPolicy) && float64(projected)/float64(storageQuota) >= 0.80
 	return QuotaStatus{
 		Allowed:    true,
 		Warning:    warning,
 		UsedBytes:  storageUsed,
 		LimitBytes: storageQuota,
-		Plan:       plan,
+		Plan:       quotaPolicy,
 	}, nil
 }
 
@@ -90,19 +91,19 @@ func (c *Checker) CheckStorageQuota(orgID string, additionalBytes int64) (QuotaS
 func (c *Checker) CheckTrafficQuota(orgID, userID, direction string, additionalBytes int64) (QuotaStatus, error) {
 	// 1. Load org quota config.
 	var trafficQuota, uploadQuota, downloadQuota int64
-	var plan string
+	var quotaPolicy string
 	err := c.session.Query(`
-		SELECT traffic_quota, traffic_upload_quota, traffic_download_quota, plan
+		SELECT traffic_quota, traffic_upload_quota, traffic_download_quota, quota_policy
 		FROM organizations WHERE org_id = ?`,
 		mustParseUUID(orgID),
-	).Scan(&trafficQuota, &uploadQuota, &downloadQuota, &plan)
+	).Scan(&trafficQuota, &uploadQuota, &downloadQuota, &quotaPolicy)
 	if err != nil {
 		// If row doesn't exist, allow by default (migration may not have run).
 		return QuotaStatus{Allowed: true}, nil
 	}
 
 	month := time.Now().UTC().Format("200601")
-	worst := QuotaStatus{Allowed: true, LimitBytes: -1, Plan: plan}
+	worst := QuotaStatus{Allowed: true, LimitBytes: -1, Plan: quotaPolicy}
 
 	// 2. Check combined quota.
 	if trafficQuota > 0 {
@@ -110,15 +111,15 @@ func (c *Checker) CheckTrafficQuota(orgID, userID, direction string, additionalB
 		projected := used + additionalBytes
 		if projected > trafficQuota {
 			s := QuotaStatus{
-				Allowed:    !isFree(plan),
-				Warning:    !isFree(plan),
+				Allowed:    !isHardEnforcement(quotaPolicy),
+				Warning:    !isHardEnforcement(quotaPolicy),
 				UsedBytes:  used,
 				LimitBytes: trafficQuota,
 				Reason:     "traffic-combined",
-				Plan:       plan,
+				Plan:       quotaPolicy,
 			}
 			worst = moreRestrictive(worst, s)
-		} else if !isFree(plan) && float64(projected)/float64(trafficQuota) >= 0.80 {
+		} else if !isHardEnforcement(quotaPolicy) && float64(projected)/float64(trafficQuota) >= 0.80 {
 			worst.Warning = true
 			if worst.Reason == "" {
 				worst.Reason = "traffic-combined"
@@ -140,15 +141,15 @@ func (c *Checker) CheckTrafficQuota(orgID, userID, direction string, additionalB
 		reason := "traffic-" + direction
 		if projected > dirQuota {
 			s := QuotaStatus{
-				Allowed:    !isFree(plan),
-				Warning:    !isFree(plan),
+				Allowed:    !isHardEnforcement(quotaPolicy),
+				Warning:    !isHardEnforcement(quotaPolicy),
 				UsedBytes:  used,
 				LimitBytes: dirQuota,
 				Reason:     reason,
-				Plan:       plan,
+				Plan:       quotaPolicy,
 			}
 			worst = moreRestrictive(worst, s)
-		} else if !isFree(plan) && float64(projected)/float64(dirQuota) >= 0.80 {
+		} else if !isHardEnforcement(quotaPolicy) && float64(projected)/float64(dirQuota) >= 0.80 {
 			worst.Warning = true
 			if worst.Reason == "" {
 				worst.Reason = reason
@@ -178,12 +179,12 @@ func (c *Checker) CheckTrafficQuota(orgID, userID, direction string, additionalB
 				reason := "traffic-" + direction
 				if projected > userDirQuota {
 					s := QuotaStatus{
-						Allowed:    !isFree(plan),
-						Warning:    !isFree(plan),
+						Allowed:    !isHardEnforcement(quotaPolicy),
+						Warning:    !isHardEnforcement(quotaPolicy),
 						UsedBytes:  used,
 						LimitBytes: userDirQuota,
 						Reason:     reason,
-						Plan:       plan,
+						Plan:       quotaPolicy,
 					}
 					worst = moreRestrictive(worst, s)
 				}
@@ -197,18 +198,18 @@ func (c *Checker) CheckTrafficQuota(orgID, userID, direction string, additionalB
 // CheckMaxUsers evaluates whether adding a new user to the org is allowed.
 func (c *Checker) CheckMaxUsers(orgID string) (QuotaStatus, error) {
 	var maxUsers int
-	var plan string
+	var quotaPolicy string
 	err := c.session.Query(`
-		SELECT max_users, plan FROM organizations WHERE org_id = ?`,
+		SELECT max_users, quota_policy FROM organizations WHERE org_id = ?`,
 		mustParseUUID(orgID),
-	).Scan(&maxUsers, &plan)
+	).Scan(&maxUsers, &quotaPolicy)
 	if err != nil {
 		return QuotaStatus{Allowed: true}, nil
 	}
 
 	// -1 or 0 = unlimited
 	if maxUsers <= 0 {
-		return QuotaStatus{Allowed: true, LimitBytes: -1, Plan: plan}, nil
+		return QuotaStatus{Allowed: true, LimitBytes: -1, Plan: quotaPolicy}, nil
 	}
 
 	// Count current users.
@@ -230,7 +231,7 @@ func (c *Checker) CheckMaxUsers(orgID string) (QuotaStatus, error) {
 			UsedBytes:  int64(currentUsers),
 			LimitBytes: int64(maxUsers),
 			Reason:     "max-users",
-			Plan:       plan,
+			Plan:       quotaPolicy,
 		}, nil
 	}
 
@@ -238,7 +239,7 @@ func (c *Checker) CheckMaxUsers(orgID string) (QuotaStatus, error) {
 		Allowed:    true,
 		UsedBytes:  int64(currentUsers),
 		LimitBytes: int64(maxUsers),
-		Plan:       plan,
+		Plan:       quotaPolicy,
 	}, nil
 }
 

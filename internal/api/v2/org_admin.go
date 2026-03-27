@@ -117,6 +117,10 @@ func RegisterOrgAdminRoutes(rg *gin.RouterGroup, database *db.DB, cfg *config.Co
 		idGroup.POST("/invite-users/", h.InviteOrgUsers)
 		idGroup.POST("/invite-users", h.InviteOrgUsers)
 
+		// ---- Ownership transfer ----
+		idGroup.PUT("/transfer-ownership/", h.TransferOrgOwnership)
+		idGroup.PUT("/transfer-ownership", h.TransferOrgOwnership)
+
 		// ---- Groups ----
 		idGroup.GET("/groups/", h.ListOrgGroups)
 		idGroup.GET("/groups", h.ListOrgGroups)
@@ -347,7 +351,7 @@ func buildOrgUserRow(email, name, role, status, orgID string, quota, used int64,
 		ContactEmail: "",
 		Status:       canonicalStatus,
 		IsActive:     canonicalStatus == StatusActive,
-		IsOrgStaff:   role == "admin" || role == "superadmin",
+		IsOrgStaff:   middleware.IsOrgStaff(role),
 		Role:         role,
 		QuotaTotal:   quota,
 		QuotaUsage:   used,
@@ -382,20 +386,23 @@ func (h *OrgAdminHandler) GetOrgInfo(c *gin.Context) {
 		return
 	}
 
-	var name, plan, billingCycle string
+	var name, plan, quotaPolicy, billingCycle string
 	var storageQuota int64
 	var trafficQuota, trafficUploadQuota, trafficDownloadQuota int64
 	var maxUsers int
 	var createdAt time.Time
+	var currentPeriodStartedAt, currentPeriodEndsAt *time.Time
 
 	err = h.db.Session().Query(`
 		SELECT name, storage_quota, created_at,
 		       traffic_quota, traffic_upload_quota, traffic_download_quota,
-		       max_users, plan, billing_cycle
+		       max_users, plan, quota_policy, billing_cycle,
+		       current_period_started_at, current_period_ends_at
 		FROM organizations WHERE org_id = ?
 	`, orgID).Scan(&name, &storageQuota, &createdAt,
 		&trafficQuota, &trafficUploadQuota, &trafficDownloadQuota,
-		&maxUsers, &plan, &billingCycle)
+		&maxUsers, &plan, &quotaPolicy, &billingCycle,
+		&currentPeriodStartedAt, &currentPeriodEndsAt)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "organization not found"})
 		return
@@ -444,21 +451,24 @@ func (h *OrgAdminHandler) GetOrgInfo(c *gin.Context) {
 		"active_members":    activeUsersCount,
 		"ctime":             createdAt.Format(time.RFC3339),
 		// Traffic quota info
-		"plan":                   plan,
-		"billing_cycle":          billingCycle,
-		"traffic_quota":          trafficQuota,
-		"traffic_month_total":    monthlyUsage.Combined,
-		"traffic_month_upload":   monthlyUsage.Upload,
-		"traffic_month_download": monthlyUsage.Download,
-		"traffic_combined_used":  monthlyUsage.Combined,
-		"traffic_upload_quota":   trafficUploadQuota,
-		"traffic_upload_used":    monthlyUsage.Upload,
-		"traffic_download_quota": trafficDownloadQuota,
-		"traffic_download_used":  monthlyUsage.Download,
-		"traffic_year_total":     yearlyUsage.Combined,
-		"traffic_year_upload":    yearlyUsage.Upload,
-		"traffic_year_download":  yearlyUsage.Download,
-		"max_users":              maxUsers,
+		"plan":                      plan,
+		"quota_policy":              quotaPolicy,
+		"billing_cycle":             billingCycle,
+		"current_period_started_at": currentPeriodStartedAt,
+		"current_period_ends_at":    currentPeriodEndsAt,
+		"traffic_quota":             trafficQuota,
+		"traffic_month_total":       monthlyUsage.Combined,
+		"traffic_month_upload":      monthlyUsage.Upload,
+		"traffic_month_download":    monthlyUsage.Download,
+		"traffic_combined_used":     monthlyUsage.Combined,
+		"traffic_upload_quota":      trafficUploadQuota,
+		"traffic_upload_used":       monthlyUsage.Upload,
+		"traffic_download_quota":    trafficDownloadQuota,
+		"traffic_download_used":     monthlyUsage.Download,
+		"traffic_year_total":        yearlyUsage.Combined,
+		"traffic_year_upload":       yearlyUsage.Upload,
+		"traffic_year_download":     yearlyUsage.Download,
+		"max_users":                 maxUsers,
 	})
 }
 
@@ -561,7 +571,7 @@ func (h *OrgAdminHandler) ListOrgUsers(c *gin.Context) {
 	var created, lastLogin time.Time
 
 	for iter.Scan(&userID, &email, &name, &role, &status, &quota, &created, &lastLogin) {
-		if isStaffOnly && role != "admin" && role != "superadmin" {
+		if isStaffOnly && !middleware.IsOrgStaff(role) {
 			continue
 		}
 		if !userMatchesStatusFilter(status, statusFilter) {
@@ -759,12 +769,7 @@ func (h *OrgAdminHandler) UpdateOrgUser(c *gin.Context) {
 	}
 
 	if v := c.Request.FormValue("is_staff"); v != "" {
-		isStaff := v == "true"
-		if isStaff {
-			role = "admin"
-		} else if role == "admin" {
-			role = "user"
-		}
+		role = applyLegacyStaffToggle(role, v == "true")
 	}
 
 	if v := c.Request.FormValue("name"); v != "" {
@@ -3570,4 +3575,109 @@ func (h *OrgAdminHandler) UpdateOrgSAMLConfig(c *gin.Context) {
 }
 func (h *OrgAdminHandler) VerifyOrgDomain(c *gin.Context) {
 	h.notImplemented(c, "verify org domain")
+}
+
+// TransferOrgOwnership transfers org ownership from the current owner to another admin.
+// PUT /org/:org_id/admin/transfer-ownership/
+// Body: {"new_owner": "user@example.com"}
+// Allowed callers:
+//   - current org owner
+//   - platform superadmin (can also bootstrap ownership when an org has no owner)
+func (h *OrgAdminHandler) TransferOrgOwnership(c *gin.Context) {
+	orgID := c.Param("org_id")
+	if err := h.requireOrgAccess(c, orgID); err != nil {
+		return
+	}
+
+	callerOrgID := c.GetString("org_id")
+	callerUserID := c.GetString("user_id")
+	callerPlatformRole, err := h.permMiddleware.GetUserOrgRole(callerOrgID, callerUserID)
+	if err != nil {
+		c.JSON(http.StatusForbidden, gin.H{"error": "insufficient permissions"})
+		return
+	}
+	isSuperAdmin := callerOrgID == middleware.PlatformOrgID && callerPlatformRole == middleware.RoleSuperAdmin
+
+	var existingOwnerUserID string
+	iter := h.db.Session().Query(`
+		SELECT user_id, role FROM users WHERE org_id = ?
+	`, orgID).Iter()
+	var iterUserID string
+	var iterRole string
+	for iter.Scan(&iterUserID, &iterRole) {
+		if iterRole == string(middleware.RoleOwner) {
+			existingOwnerUserID = iterUserID
+			break
+		}
+	}
+	if err := iter.Close(); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to inspect organization owner"})
+		return
+	}
+
+	callerRole := middleware.RoleOwner
+	if !isSuperAdmin {
+		var roleErr error
+		callerRole, roleErr = h.permMiddleware.GetUserOrgRole(orgID, callerUserID)
+		if roleErr != nil {
+			c.JSON(http.StatusForbidden, gin.H{"error": "insufficient permissions"})
+			return
+		}
+	}
+
+	var req struct {
+		NewOwner string `json:"new_owner"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil || req.NewOwner == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "new_owner (email) is required"})
+		return
+	}
+
+	newOwnerUserID, err := h.lookupOrgUserByEmail(orgID, req.NewOwner)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "user not found"})
+		return
+	}
+
+	newRole, err := h.permMiddleware.GetUserOrgRole(orgID, newOwnerUserID)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "new owner must be an admin"})
+		return
+	}
+
+	plan, planErr := buildOwnershipTransferPlan(isSuperAdmin, callerUserID, existingOwnerUserID, newOwnerUserID, callerRole, newRole)
+	if planErr != nil {
+		status := http.StatusBadRequest
+		if planErr.Error() == "only the organization owner or a superadmin can transfer ownership" {
+			status = http.StatusForbidden
+		}
+		c.JSON(status, gin.H{"error": planErr.Error()})
+		return
+	}
+
+	if plan.NoOp {
+		c.JSON(http.StatusOK, gin.H{
+			"success":   true,
+			"new_owner": req.NewOwner,
+		})
+		return
+	}
+
+	// Swap roles atomically: existing owner → admin (if any), new owner → owner.
+	batch := h.db.Session().Batch(gocql.LoggedBatch)
+	if plan.DemoteOwnerID != "" {
+		batch.Query(`UPDATE users SET role = ? WHERE org_id = ? AND user_id = ?`,
+			"admin", orgID, plan.DemoteOwnerID)
+	}
+	batch.Query(`UPDATE users SET role = ? WHERE org_id = ? AND user_id = ?`,
+		"owner", orgID, plan.PromoteUserID)
+	if err := batch.Exec(); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to transfer ownership"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"success":   true,
+		"new_owner": req.NewOwner,
+	})
 }
