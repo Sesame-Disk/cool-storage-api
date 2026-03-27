@@ -1,5 +1,19 @@
 # Storage & Traffic Quotas — Implementation Plan
 
+## Update 2026-03-27
+
+This document originally described traffic enforcement using natural monthly partitions only.
+The current agreed design is:
+
+- `traffic_counters` and `traffic_monthly` remain useful for analytics and natural-month reporting.
+- Traffic quota enforcement must use the org's current quota period, not the natural UTC month.
+- Every org should carry `current_period_started_at` and `current_period_ends_at`.
+- A dedicated aggregate such as `traffic_period_usage` is acceptable for performance and is the recommended source for quota enforcement.
+- `billing_cycle` remains commercial metadata only; even annual plans still enforce monthly traffic quotas.
+- Storage does not use periods. Storage is simply current usage vs current limit.
+
+Where this document refers to "monthly traffic reset" for enforcement, read it as "quota-period rollover" under the current design.
+
 ## Context
 
 SesameFS has quota columns in the DB (`storage_quota`, `storage_used`, `quota_bytes`, `used_bytes`) but **they were never updated**. No traffic tracking existed. Statistics endpoints returned empty stubs or 501. The frontend already has chart/table pages ready and waiting for real data.
@@ -30,7 +44,7 @@ An external billing service manages plans and calls the SesameFS admin API to se
 
 Same tiers with annual discount. The difference:
 - **Billing cycle** (monthly/annual) = payment and renewal frequency
-- **Traffic reset** = always monthly, regardless of billing cycle
+- **Traffic quota period** = always monthly, regardless of billing cycle
 - An annual plan with 250GB/mo download does not accumulate: each month resets to 0
 - The billing service can call the API to change quotas at any time (upgrade, downgrade, renewal)
 
@@ -50,6 +64,8 @@ Billing sets these fields on each org via `PUT /admin/organizations/:org_id/`:
 |-------|------|------|---------|------------|---------|
 | `plan` | string | `"free"` | `"starter"` | `"enterprise-acme"` | Plan name |
 | `billing_cycle` | string | `"monthly"` | `"monthly"` | `"annual"` | Billing cycle |
+| `current_period_started_at` | timestamp | org create time | billing anchor | billing anchor | Current quota period start |
+| `current_period_ends_at` | timestamp | +1 monthly quota period | +1 monthly quota period | +1 monthly quota period | Current quota period end |
 | `storage_quota` | int64 | 2 GB | 250 GB | custom | Storage limit. -1 = unlimited |
 | `traffic_quota` | int64 | 10 GB | -1 | custom | Combined monthly limit (upload+download). Universal field — if set, it IS the limit. -1 = no combined limit |
 | `traffic_upload_quota` | int64 | -1 | 50 TB | custom | Monthly upload limit. -1 = no individual upload limit |
@@ -142,9 +158,9 @@ Enables:
 - Monthly sums (quota check)
 - Per-user breakdown (per-user statistics)
 
-### 1.2 Table `traffic_monthly` (counter table — fast quota check)
+### 1.2 Table `traffic_monthly` (counter table — reporting / natural-month aggregate)
 
-Aggregated monthly counters for fast enforcement (1 partition read per check).
+Aggregated monthly counters for reporting and dashboard reads.
 
 ```sql
 CREATE TABLE IF NOT EXISTS traffic_monthly (
@@ -163,6 +179,22 @@ CREATE TABLE IF NOT EXISTS traffic_monthly (
 - `scope='<user_id>:download'` = user's download
 - Incremented in parallel with `traffic_counters` (fire-and-forget)
 - Each operation increments 3 org scopes (upload or download + combined) and 1 user scope
+
+### 1.2.1 Table `traffic_period_usage` (counter table — fast quota enforcement)
+
+Recommended aggregate keyed by the org's current quota period.
+
+```sql
+CREATE TABLE IF NOT EXISTS traffic_period_usage (
+    org_id UUID,
+    period_started_at TIMESTAMP,
+    scope TEXT,           -- 'org:upload', 'org:download', 'org:combined', '<user_id>:upload', '<user_id>:download'
+    bytes_transferred COUNTER,
+    PRIMARY KEY ((org_id, period_started_at), scope)
+)
+```
+
+This table is the preferred source for quota enforcement once the current-period model is implemented.
 
 ### 1.3 Table `storage_counters` (counter table)
 
@@ -186,6 +218,8 @@ ALTER TABLE organizations ADD traffic_download_quota BIGINT -- download monthly 
 ALTER TABLE organizations ADD max_users INT                 -- hard cap (-1=unlimited)
 ALTER TABLE organizations ADD plan TEXT                     -- plan name from billing
 ALTER TABLE organizations ADD billing_cycle TEXT            -- "monthly" | "annual"
+ALTER TABLE organizations ADD current_period_started_at TIMESTAMP
+ALTER TABLE organizations ADD current_period_ends_at TIMESTAMP
 ```
 
 `storage_quota` already exists. The new fields allow the billing service to set everything via API.
@@ -209,6 +243,8 @@ TrafficDownloadQuota int64  `json:"traffic_download_quota"` // download monthly 
 MaxUsers             int    `json:"max_users"`              // hard cap, -1=unlimited
 Plan                 string `json:"plan,omitempty"`
 BillingCycle         string `json:"billing_cycle,omitempty"` // "monthly" | "annual"
+CurrentPeriodStartedAt time.Time `json:"current_period_started_at,omitempty"`
+CurrentPeriodEndsAt    time.Time `json:"current_period_ends_at,omitempty"`
 
 // User — add:
 TrafficUploadQuota   int64 `json:"traffic_upload_quota"`   // -1=inherit from org
