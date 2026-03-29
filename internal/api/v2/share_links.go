@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Sesame-Disk/sesamefs/internal/config"
 	"github.com/Sesame-Disk/sesamefs/internal/db"
 	"github.com/Sesame-Disk/sesamefs/internal/middleware"
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
@@ -23,11 +24,12 @@ type ShareLinkHandler struct {
 	db             *db.DB
 	serverURL      string
 	permMiddleware *middleware.PermissionMiddleware
+	config         *config.Config
 }
 
 // NewShareLinkHandler creates a new ShareLinkHandler
-func NewShareLinkHandler(database *db.DB, serverURL string, permMiddleware *middleware.PermissionMiddleware) *ShareLinkHandler {
-	return &ShareLinkHandler{db: database, serverURL: serverURL, permMiddleware: permMiddleware}
+func NewShareLinkHandler(database *db.DB, serverURL string, permMiddleware *middleware.PermissionMiddleware, cfg *config.Config) *ShareLinkHandler {
+	return &ShareLinkHandler{db: database, serverURL: serverURL, permMiddleware: permMiddleware, config: cfg}
 }
 
 // ShareLinkResponse represents a share link in API response (Seafile-compatible)
@@ -62,8 +64,8 @@ type Perms struct {
 }
 
 // RegisterShareLinkRoutes registers share link routes
-func RegisterShareLinkRoutes(rg *gin.RouterGroup, database *db.DB, serverURL string, permMiddleware *middleware.PermissionMiddleware) *ShareLinkHandler {
-	h := NewShareLinkHandler(database, serverURL, permMiddleware)
+func RegisterShareLinkRoutes(rg *gin.RouterGroup, database *db.DB, serverURL string, permMiddleware *middleware.PermissionMiddleware, cfg *config.Config) *ShareLinkHandler {
+	h := NewShareLinkHandler(database, serverURL, permMiddleware, cfg)
 
 	shareLinks := rg.Group("/share-links")
 	{
@@ -485,6 +487,37 @@ func (h *ShareLinkHandler) CreateShareLink(c *gin.Context) {
 		return
 	}
 
+	// ENFORCEMENT CHECK: feature flag + numeric limit + expiry cap
+	if h.config != nil {
+		enforcement := GetOrgEnforcement(h.db, orgID, h.config)
+		if !enforcement.Profile.Features.CanGenerateShareLink {
+			c.JSON(http.StatusForbidden, gin.H{
+				"error":            "Share link creation is not available on your plan",
+				"upgrade_required": true,
+			})
+			return
+		}
+		if enforcement.Profile.Limits.MaxShareLinks > 0 {
+			count := CountActiveShareLinks(h.db, orgID)
+			if count >= enforcement.Profile.Limits.MaxShareLinks {
+				c.JSON(http.StatusForbidden, gin.H{
+					"error":   "Share link limit reached",
+					"limit":   enforcement.Profile.Limits.MaxShareLinks,
+					"current": count,
+				})
+				return
+			}
+		}
+		if max := enforcement.Profile.Limits.ShareLinkExpireDaysMax; max > 0 {
+			if req.ExpireDays > max {
+				req.ExpireDays = max
+			}
+			if req.ExpireDays == 0 && req.ExpirationTime == "" {
+				req.ExpireDays = max
+			}
+		}
+	}
+
 	// Normalize permission to canonical JSON format
 	permissionJSON := normalizePermissionInput(req.Permissions)
 
@@ -854,6 +887,29 @@ func (h *ShareLinkHandler) BatchCreateShareLinks(c *gin.Context) {
 		if err != nil || !hasAccess {
 			c.JSON(http.StatusForbidden, gin.H{"error": "you do not have access to this library"})
 			return
+		}
+	}
+
+	// ENFORCEMENT CHECK: feature flag + numeric limit
+	if h.config != nil {
+		enforcement := GetOrgEnforcement(h.db, orgID, h.config)
+		if !enforcement.Profile.Features.CanGenerateShareLink {
+			c.JSON(http.StatusForbidden, gin.H{
+				"error":            "Share link creation is not available on your plan",
+				"upgrade_required": true,
+			})
+			return
+		}
+		if enforcement.Profile.Limits.MaxShareLinks > 0 {
+			count := CountActiveShareLinks(h.db, orgID)
+			if count+req.Number > enforcement.Profile.Limits.MaxShareLinks {
+				c.JSON(http.StatusForbidden, gin.H{
+					"error":   "Share link limit would be exceeded",
+					"limit":   enforcement.Profile.Limits.MaxShareLinks,
+					"current": count,
+				})
+				return
+			}
 		}
 	}
 

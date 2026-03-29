@@ -1,7 +1,7 @@
 # Plans & Permissions — SesameFS
 
-**Last Updated**: 2026-03-27
-**Status**: Phase 1 IMPLEMENTED — Phase 2 pending
+**Last Updated**: 2026-03-28
+**Status**: Phase 1 IMPLEMENTED — Phase 2 BACKEND COMPLETE — Phase 3 pending
 
 ---
 
@@ -746,25 +746,31 @@ Implementation notes:
 - Seed orgs (platform + default) get `quota_policy="soft"` + unlimited quotas. Admin-created and OIDC-provisioned orgs get `quota_policy="hard"` + free defaults (2GB storage, 10GB traffic, 1 user).
 - OIDC `mapOIDCRole()` extended with `"owner"`, `"org_owner"`, `"tenant_admin"` mappings.
 
-### Phase 2: Capability Resolution
+### Phase 2: Capability Resolution — DONE (2026-03-28)
 
-| Step | What | Files | Effort |
+| Step | What | Files | Status |
 |------|------|-------|--------|
-| 2.1 | Create enforcement profile resolver | New: `internal/plans/resolver.go` | Medium |
-| 2.2 | Create role permission map (hardcoded) | New: `internal/plans/roles.go` | Low |
-| 2.3 | Create `ResolveCapabilities(role, quotaPolicy)` with `upgrade_features` | `internal/plans/resolver.go` | Medium |
+| 2.1 | Create enforcement profile resolver | New: `internal/plans/resolver.go` | ✅ |
+| 2.2 | Create role permission map (hardcoded) | New: `internal/plans/roles.go` | ✅ |
+| 2.3 | Create `ResolveCapabilities(role, quotaPolicy)` with `upgrade_features` | `internal/plans/resolver.go` | ✅ |
 
 ### Pending Compatibility Cleanup
 
 - Wire/frontend naming still uses legacy fields such as `is_staff` and `is_org_staff`.
 - Canonical semantics are now: platform superadmin vs org staff.
 - Pending follow-up: introduce clearer API/frontend names such as `isSuperAdmin` or `isPlatformSuperAdmin`, keep legacy aliases during migration, then remove ambiguity once clients are updated.
-| 2.4 | Add `traffic_period_usage` aggregate table for enforcement performance | `internal/db/db.go`, `internal/traffic/recorder.go` | Medium |
-| 2.5 | Update `account/info` to return resolved capabilities + quota state + current period fields | `internal/api/server.go` | Medium |
-| 2.6 | Update `subscription` endpoint with quota state objects and current period fields | `internal/api/server.go` | Low |
-| 2.7 | Add enforcement-profile-based checks to share link creation | `internal/api/v2/file_shares.go` | Medium |
-| 2.8 | Add enforcement-profile-based checks to library creation | `internal/api/v2/repos.go` | Low |
-| 2.9 | Add enforcement-profile-based checks to group creation | `internal/api/v2/groups.go` | Low |
+| 2.4 | Add `traffic_period_usage` aggregate table for enforcement performance | `internal/db/db.go`, `internal/traffic/recorder.go` | ✅ |
+| 2.5 | Update `account/info` to return resolved capabilities + quota state + current period fields | `internal/api/server.go` | ✅ |
+| 2.6 | Update `subscription` endpoint with quota state objects and current period fields | `internal/api/server.go` | ✅ |
+| 2.7 | Add enforcement-profile-based checks to share link creation | `internal/api/v2/share_links.go`, `internal/api/v2/upload_links.go` | ✅ |
+| 2.8 | Add enforcement-profile-based checks to library creation | `internal/api/v2/libraries.go`, `internal/api/v2/groups.go` | ✅ |
+| 2.9 | Add enforcement-profile-based checks to group creation | `internal/api/v2/groups.go` | ✅ |
+
+Phase 2 implementation notes:
+- `traffic_period_usage` is now the canonical source for quota enforcement and for the Phase 2 `traffic{}` objects returned by `account/info` and `subscription`.
+- `traffic_monthly` remains in place for natural-month reporting and dashboards.
+- `upgrade_features` now follows the documented frontend contract and returns short names such as `add_group` instead of raw `can_*` keys.
+- `traffic.reset_date` now reflects `current_period_ends_at` when present and falls back to the next UTC calendar month only for backward compatibility.
 
 ### Phase 3: Frontend Migration
 

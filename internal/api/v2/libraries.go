@@ -441,6 +441,29 @@ func (h *LibraryHandler) CreateLibrary(c *gin.Context) {
 	}
 	log.Printf("[CreateLibrary] Permission granted: user has role %q", userRole)
 
+	// ENFORCEMENT CHECK: feature flag + numeric limit
+	if h.config != nil {
+		enforcement := GetOrgEnforcement(h.db, orgID, h.config)
+		if !enforcement.Profile.Features.CanAddRepo {
+			c.JSON(http.StatusForbidden, gin.H{
+				"error":            "Library creation is not available on your plan",
+				"upgrade_required": true,
+			})
+			return
+		}
+		if enforcement.Profile.Limits.MaxLibraries > 0 {
+			count := CountActiveLibraries(h.db, orgID)
+			if count >= enforcement.Profile.Limits.MaxLibraries {
+				c.JSON(http.StatusForbidden, gin.H{
+					"error":   "Library limit reached",
+					"limit":   enforcement.Profile.Limits.MaxLibraries,
+					"current": count,
+				})
+				return
+			}
+		}
+	}
+
 	// Check if a library with this name already exists for this user
 	// Query all libraries for org, then filter by owner in application code
 	// (acceptable for this rare operation, avoids ALLOW FILTERING performance hit)

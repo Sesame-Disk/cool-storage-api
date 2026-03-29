@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Sesame-Disk/sesamefs/internal/config"
 	"github.com/Sesame-Disk/sesamefs/internal/db"
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
 	"github.com/gin-gonic/gin"
@@ -16,17 +17,18 @@ import (
 
 // GroupHandler handles group-related API requests
 type GroupHandler struct {
-	db *db.DB
+	db     *db.DB
+	config *config.Config
 }
 
 // NewGroupHandler creates a new GroupHandler
-func NewGroupHandler(database *db.DB) *GroupHandler {
-	return &GroupHandler{db: database}
+func NewGroupHandler(database *db.DB, cfg *config.Config) *GroupHandler {
+	return &GroupHandler{db: database, config: cfg}
 }
 
 // RegisterGroupRoutes registers group routes
-func RegisterGroupRoutes(rg *gin.RouterGroup, database *db.DB) *GroupHandler {
-	h := NewGroupHandler(database)
+func RegisterGroupRoutes(rg *gin.RouterGroup, database *db.DB, cfg *config.Config) *GroupHandler {
+	h := NewGroupHandler(database, cfg)
 
 	groups := rg.Group("/groups")
 	{
@@ -72,8 +74,8 @@ func RegisterGroupRoutes(rg *gin.RouterGroup, database *db.DB) *GroupHandler {
 // RegisterShareableGroupRoutes registers the shareable-groups endpoint.
 // Returns all groups the user can share with (same as their groups).
 // GET /api/v2.1/shareable-groups/
-func RegisterShareableGroupRoutes(rg *gin.RouterGroup, database *db.DB) {
-	h := NewGroupHandler(database)
+func RegisterShareableGroupRoutes(rg *gin.RouterGroup, database *db.DB, cfg *config.Config) {
+	h := NewGroupHandler(database, cfg)
 	rg.GET("/shareable-groups", h.ListShareableGroups)
 	rg.GET("/shareable-groups/", h.ListShareableGroups)
 }
@@ -348,6 +350,18 @@ func (h *GroupHandler) CreateGroup(c *gin.Context) {
 	if req.GroupName == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "group_name is required"})
 		return
+	}
+
+	// ENFORCEMENT CHECK: feature flag
+	if h.config != nil {
+		enforcement := GetOrgEnforcement(h.db, orgID, h.config)
+		if !enforcement.Profile.Features.CanAddGroup {
+			c.JSON(http.StatusForbidden, gin.H{
+				"error":            "Group creation is not available on your plan",
+				"upgrade_required": true,
+			})
+			return
+		}
 	}
 
 	// Check if database is available
@@ -901,6 +915,29 @@ func (h *GroupHandler) CreateGroupOwnedLibrary(c *gin.Context) {
 	var groupName string
 	h.db.Session().Query(`SELECT name FROM groups WHERE org_id = ? AND group_id = ?`,
 		orgID, groupUUID.String()).Scan(&groupName)
+
+	// ENFORCEMENT CHECK: feature flag + numeric limit
+	if h.config != nil {
+		enforcement := GetOrgEnforcement(h.db, orgID, h.config)
+		if !enforcement.Profile.Features.CanAddRepo {
+			c.JSON(http.StatusForbidden, gin.H{
+				"error":            "Library creation is not available on your plan",
+				"upgrade_required": true,
+			})
+			return
+		}
+		if enforcement.Profile.Limits.MaxLibraries > 0 {
+			count := CountActiveLibraries(h.db, orgID)
+			if count >= enforcement.Profile.Limits.MaxLibraries {
+				c.JSON(http.StatusForbidden, gin.H{
+					"error":   "Library limit reached",
+					"limit":   enforcement.Profile.Limits.MaxLibraries,
+					"current": count,
+				})
+				return
+			}
+		}
+	}
 
 	repoName := c.PostForm("name")
 	if repoName == "" {

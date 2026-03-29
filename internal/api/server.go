@@ -24,6 +24,7 @@ import (
 	"github.com/Sesame-Disk/sesamefs/internal/logging"
 	"github.com/Sesame-Disk/sesamefs/internal/metrics"
 	"github.com/Sesame-Disk/sesamefs/internal/middleware"
+	"github.com/Sesame-Disk/sesamefs/internal/plans"
 	"github.com/Sesame-Disk/sesamefs/internal/storage"
 	"github.com/Sesame-Disk/sesamefs/internal/templates"
 	"github.com/Sesame-Disk/sesamefs/internal/traffic"
@@ -720,16 +721,16 @@ func (s *Server) setupRoutes() {
 			v2.RegisterV21StarredRoutes(protected, s.db)
 
 			// Share links for v2.1 API
-			v2.RegisterShareLinkRoutes(protected, s.db, serverURL, s.permMiddleware)
+			v2.RegisterShareLinkRoutes(protected, s.db, serverURL, s.permMiddleware, s.config)
 
 			// Upload links for v2.1 API
-			v2.RegisterUploadLinkRoutes(protected, s.db, serverURL, s.permMiddleware)
+			v2.RegisterUploadLinkRoutes(protected, s.db, serverURL, s.permMiddleware, s.config)
 
 			// Groups for v2.1 API
-			v2.RegisterGroupRoutes(protected, s.db)
+			v2.RegisterGroupRoutes(protected, s.db, s.config)
 
 			// Shareable groups (returns groups user can share with — same as user's groups)
-			v2.RegisterShareableGroupRoutes(protected, s.db)
+			v2.RegisterShareableGroupRoutes(protected, s.db, s.config)
 
 			// Monitored repos (watch/unwatch libraries)
 			v2.RegisterMonitoredRepoRoutes(protected, s.db)
@@ -786,7 +787,7 @@ func (s *Server) setupRoutes() {
 	}
 
 	// Export share links to Excel (requires auth)
-	exportHandler := v2.NewShareLinkHandler(s.db, serverURL, s.permMiddleware)
+	exportHandler := v2.NewShareLinkHandler(s.db, serverURL, s.permMiddleware, s.config)
 	s.router.GET("/share/link/export-excel/", s.authMiddleware(), exportHandler.ExportShareLinksExcel)
 	s.router.GET("/share/link/export-excel", s.authMiddleware(), exportHandler.ExportShareLinksExcel)
 
@@ -1933,35 +1934,51 @@ func (s *Server) handleAccountInfo(c *gin.Context) {
 	orgUUID, _ := gocql.ParseUUID(orgID)
 	userUUID, _ := gocql.ParseUUID(userID)
 
-	// Fetch actual user data from database
+	// Fetch user data from database.
 	var email, name, role string
 	var quotaBytes int64
-	var trafficUploadQuota, trafficDownloadQuota int64
+	var userTrafficUploadQuota, userTrafficDownloadQuota int64
 	err := s.db.Session().Query(`
 		SELECT email, name, role, quota_bytes,
 		       traffic_upload_quota, traffic_download_quota
 		FROM users WHERE org_id = ? AND user_id = ?
 	`, orgUUID, userUUID).Scan(&email, &name, &role, &quotaBytes,
-		&trafficUploadQuota, &trafficDownloadQuota)
+		&userTrafficUploadQuota, &userTrafficDownloadQuota)
 
 	if err != nil {
-		// Fallback to defaults if user not found (shouldn't happen for authenticated user)
 		email = userID + "@sesamefs.local"
 		name = userID
 		role = "user"
-		quotaBytes = -2 // unlimited
-		trafficUploadQuota = -1
-		trafficDownloadQuota = -1
+		quotaBytes = -2
+		userTrafficUploadQuota = -1
+		userTrafficDownloadQuota = -1
 	}
 
-	// Read live storage usage from the counter table.
-	usedBytes := traffic.ReadStorageUsed(s.db, fmt.Sprintf("user:%s:%s", orgID, userID))
+	// Fetch org data: plan, quotas, enforcement profile, period.
+	var orgPlan, billingCycle, quotaPolicy string
+	var storageQuota, trafficQuota, trafficUploadQuota, trafficDownloadQuota int64
+	var currentPeriodStartedAt, currentPeriodEndsAt *time.Time
+	_ = s.db.Session().Query(`
+		SELECT plan, billing_cycle, quota_policy, storage_quota,
+		       traffic_quota, traffic_upload_quota, traffic_download_quota,
+		       current_period_started_at, current_period_ends_at
+		FROM organizations WHERE org_id = ?
+	`, orgUUID).Scan(&orgPlan, &billingCycle, &quotaPolicy, &storageQuota,
+		&trafficQuota, &trafficUploadQuota, &trafficDownloadQuota,
+		&currentPeriodStartedAt, &currentPeriodEndsAt)
 
-	// Query current month's per-user traffic usage.
-	month := traffic.CurrentMonth()
-	userTrafficUsage := traffic.ReadUserMonthlyUsage(s.db, orgID, userID, month)
+	// Read live storage usage (user-level for legacy, org-level for new storage object).
+	userUsedBytes := traffic.ReadStorageUsed(s.db, fmt.Sprintf("user:%s:%s", orgID, userID))
+	orgStorageUsed := traffic.ReadStorageUsed(s.db, fmt.Sprintf("org:%s", orgID))
 
-	// Use email username as display name if name is empty
+	now := time.Now().UTC()
+	periodStartedAt := traffic.EffectivePeriodStart(currentPeriodStartedAt, now)
+
+	// Query current period traffic usage.
+	userTrafficUsage := traffic.ReadUserPeriodUsage(s.db, orgID, userID, periodStartedAt)
+	orgTrafficUsage := traffic.ReadOrgPeriodUsage(s.db, orgID, periodStartedAt)
+
+	// Use email username as display name if name is empty.
 	if name == "" {
 		if atIdx := strings.Index(email, "@"); atIdx > 0 {
 			name = email[:atIdx]
@@ -1970,27 +1987,46 @@ func (s *Server) handleAccountInfo(c *gin.Context) {
 		}
 	}
 
-	// Determine permissions based on role.
-	// Phase 1 keeps legacy account/info flags role-based; owner behaves like admin-level org staff.
+	// Legacy desktop-client fields.
 	isStaff := middleware.IsPlatformSuperAdmin(orgID, middleware.OrganizationRole(role))
-	canManageContent := middleware.HasRequiredOrgRole(middleware.OrganizationRole(role), middleware.RoleUser)
-	canAddRepo := canManageContent
-	canShareRepo := canManageContent
-	canAddGroup := canManageContent
-	canGenerateShareLink := canManageContent
-	canGenerateUploadLink := canManageContent
-
-	// Calculate space usage
 	spaceUsage := "0%"
-	if quotaBytes > 0 && usedBytes > 0 {
-		percentage := float64(usedBytes) / float64(quotaBytes) * 100
+	if quotaBytes > 0 && userUsedBytes > 0 {
+		percentage := float64(userUsedBytes) / float64(quotaBytes) * 100
 		spaceUsage = fmt.Sprintf("%.1f%%", percentage)
 	}
 
-	// Return basic account info matching stock Seafile format
-	// CRITICAL: Field names and types must match exactly for desktop client compatibility
-	// Verified against stock Seafile (app.nihaoconsult.com)
+	// Resolve capabilities from role + enforcement profile.
+	profile := s.config.GetEnforcementProfile(quotaPolicy)
+	resolved := plans.ResolveCapabilities(role, profile)
+
+	// Compute storage state.
+	var storagePct float64
+	storageOverQuota := false
+	if storageQuota > 0 {
+		storagePct = float64(orgStorageUsed) / float64(storageQuota) * 100
+		storageOverQuota = orgStorageUsed > storageQuota
+	}
+
+	// Compute traffic state.
+	var trafficPct float64
+	trafficOverQuota := false
+	if trafficQuota > 0 {
+		trafficPct = float64(orgTrafficUsage.Combined) / float64(trafficQuota) * 100
+		trafficOverQuota = orgTrafficUsage.Combined > trafficQuota
+	}
+	uploadOverQuota := trafficUploadQuota > 0 && orgTrafficUsage.Upload > trafficUploadQuota
+	downloadOverQuota := trafficDownloadQuota > 0 && orgTrafficUsage.Download > trafficDownloadQuota
+
+	// Derived flags.
+	isOrgOwner := role == "owner"
+	canUpgrade := plans.ComputeCanUpgrade(role, quotaPolicy, storagePct, trafficPct, storageOverQuota, trafficOverQuota)
+
+	trafficResetDate := traffic.EffectiveTrafficResetDate(currentPeriodEndsAt, now)
+
+	// Return account info.
+	// CRITICAL: Preserve all Seafile-compatible fields for desktop client.
 	c.JSON(http.StatusOK, gin.H{
+		// === Seafile-compatible fields ===
 		"email":         email,
 		"name":          name,
 		"login_id":      email,
@@ -2004,24 +2040,72 @@ func (s *Server) handleAccountInfo(c *gin.Context) {
 			}
 			return 0
 		}(),
-		"usage":                       usedBytes,
+		"usage":                       userUsedBytes,
 		"total":                       quotaBytes,
 		"space_usage":                 spaceUsage,
 		"avatar_url":                  getBaseURLFromRequest(c) + "/media/avatars/default.png",
 		"enable_subscription":         true,
 		"file_updates_email_interval": 0,
 		"collaborate_email_interval":  0,
-		// SesameFS extensions for permission control
-		"role":                     role,
-		"can_add_repo":             canAddRepo,
-		"can_share_repo":           canShareRepo,
-		"can_add_group":            canAddGroup,
-		"can_generate_share_link":  canGenerateShareLink,
-		"can_generate_upload_link": canGenerateUploadLink,
-		// Traffic quota and usage for current month
-		"traffic_upload_quota":   trafficUploadQuota,
+
+		// === Role & plan ===
+		"role":                      role,
+		"plan":                      orgPlan,
+		"is_org_owner":              isOrgOwner,
+		"can_upgrade":               canUpgrade,
+		"billing_cycle":             billingCycle,
+		"current_period_started_at": currentPeriodStartedAt,
+		"current_period_ends_at":    currentPeriodEndsAt,
+
+		// === Structured storage object ===
+		"storage": gin.H{
+			"used":       orgStorageUsed,
+			"quota":      storageQuota,
+			"percent":    storagePct,
+			"over_quota": storageOverQuota,
+		},
+
+		// === Structured traffic object ===
+		"traffic": gin.H{
+			"used":                orgTrafficUsage.Combined,
+			"quota":               trafficQuota,
+			"percent":             trafficPct,
+			"over_quota":          trafficOverQuota,
+			"upload_used":         orgTrafficUsage.Upload,
+			"upload_quota":        trafficUploadQuota,
+			"upload_over_quota":   uploadOverQuota,
+			"download_used":       orgTrafficUsage.Download,
+			"download_quota":      trafficDownloadQuota,
+			"download_over_quota": downloadOverQuota,
+			"reset_date":          trafficResetDate,
+		},
+
+		// === Resolved capability flags (role AND enforcement profile) ===
+		"can_add_repo":                       resolved.Capabilities["can_add_repo"],
+		"can_share_repo":                     resolved.Capabilities["can_share_repo"],
+		"can_add_group":                      resolved.Capabilities["can_add_group"],
+		"can_generate_share_link":            resolved.Capabilities["can_generate_share_link"],
+		"can_generate_upload_link":           resolved.Capabilities["can_generate_upload_link"],
+		"can_send_share_link_mail":           resolved.Capabilities["can_send_share_link_mail"],
+		"can_invite_guest":                   resolved.Capabilities["can_invite_guest"],
+		"can_publish_repo":                   resolved.Capabilities["can_publish_repo"],
+		"can_use_global_address_book":        resolved.Capabilities["can_use_global_address_book"],
+		"can_connect_with_desktop_clients":   resolved.Capabilities["can_connect_with_desktop_clients"],
+		"can_connect_with_android_clients":   resolved.Capabilities["can_connect_with_android_clients"],
+		"can_connect_with_ios_clients":       resolved.Capabilities["can_connect_with_ios_clients"],
+		"can_export_files_via_mobile_client": resolved.Capabilities["can_export_files_via_mobile_client"],
+
+		// === Numeric limits from enforcement profile ===
+		"share_link_expire_days_max":  resolved.Limits.ShareLinkExpireDaysMax,
+		"upload_link_expire_days_max": resolved.Limits.UploadLinkExpireDaysMax,
+
+		// === Upgrade CTA support ===
+		"upgrade_features": resolved.UpgradeFeatures,
+
+		// === Per-user traffic (backward compat) ===
+		"traffic_upload_quota":   userTrafficUploadQuota,
 		"traffic_upload_used":    userTrafficUsage.Upload,
-		"traffic_download_quota": trafficDownloadQuota,
+		"traffic_download_quota": userTrafficDownloadQuota,
 		"traffic_download_used":  userTrafficUsage.Download,
 	})
 }
@@ -2033,23 +2117,28 @@ func (s *Server) handleGetSubscription(c *gin.Context) {
 	orgID := c.GetString("org_id")
 	orgUUID, _ := gocql.ParseUUID(orgID)
 
-	var plan, billingCycle string
-	var storageQuota, storageUsed int64
+	var plan, billingCycle, quotaPolicy string
+	var storageQuota int64
 	var trafficQuota, trafficUploadQuota, trafficDownloadQuota int64
 	var maxUsers int
+	var currentPeriodStartedAt, currentPeriodEndsAt *time.Time
 	_ = s.db.Session().Query(`
 		SELECT plan, billing_cycle, storage_quota,
-		       traffic_quota, traffic_upload_quota, traffic_download_quota, max_users
+		       traffic_quota, traffic_upload_quota, traffic_download_quota, max_users,
+		       quota_policy, current_period_started_at, current_period_ends_at
 		FROM organizations WHERE org_id = ?
 	`, orgUUID).Scan(&plan, &billingCycle, &storageQuota,
-		&trafficQuota, &trafficUploadQuota, &trafficDownloadQuota, &maxUsers)
+		&trafficQuota, &trafficUploadQuota, &trafficDownloadQuota, &maxUsers,
+		&quotaPolicy, &currentPeriodStartedAt, &currentPeriodEndsAt)
 
-	// Read live storage usage from the counter table (not the stale organizations column).
-	storageUsed = traffic.ReadStorageUsed(s.db, fmt.Sprintf("org:%s", orgID))
+	// Read live storage usage from the counter table.
+	storageUsed := traffic.ReadStorageUsed(s.db, fmt.Sprintf("org:%s", orgID))
 
-	// Current month's org traffic totals from traffic_monthly.
-	month := traffic.CurrentMonth()
-	orgTrafficUsage := traffic.ReadOrgMonthlyUsage(s.db, orgID, month)
+	now := time.Now().UTC()
+	periodStartedAt := traffic.EffectivePeriodStart(currentPeriodStartedAt, now)
+
+	// Current quota-period org traffic totals.
+	orgTrafficUsage := traffic.ReadOrgPeriodUsage(s.db, orgID, periodStartedAt)
 
 	// Count current users.
 	var currentUsers int
@@ -2057,34 +2146,69 @@ func (s *Server) handleGetSubscription(c *gin.Context) {
 		`SELECT COUNT(*) FROM users WHERE org_id = ?`, orgUUID,
 	).Scan(&currentUsers)
 
-	// Next reset date is the first of next month.
-	now := time.Now().UTC()
-	nextReset := time.Date(now.Year(), now.Month()+1, 1, 0, 0, 0, 0, time.UTC)
-
-	var storagePercent float64
+	// Compute storage state.
+	var storagePct float64
+	storageOverQuota := false
 	if storageQuota > 0 {
-		storagePercent = float64(storageUsed) / float64(storageQuota) * 100
+		storagePct = float64(storageUsed) / float64(storageQuota) * 100
+		storageOverQuota = storageUsed > storageQuota
 	}
 
-	// Look up per-user traffic for the caller.
-	userTrafficUsage := traffic.ReadUserMonthlyUsage(s.db, orgID, userID, month)
+	// Compute traffic state.
+	var trafficPct float64
+	trafficOverQuota := false
+	if trafficQuota > 0 {
+		trafficPct = float64(orgTrafficUsage.Combined) / float64(trafficQuota) * 100
+		trafficOverQuota = orgTrafficUsage.Combined > trafficQuota
+	}
+	uploadOverQuota := trafficUploadQuota > 0 && orgTrafficUsage.Upload > trafficUploadQuota
+	downloadOverQuota := trafficDownloadQuota > 0 && orgTrafficUsage.Download > trafficDownloadQuota
+
+	trafficResetDate := traffic.EffectiveTrafficResetDate(currentPeriodEndsAt, now)
+
+	// Per-user traffic for the caller.
+	userTrafficUsage := traffic.ReadUserPeriodUsage(s.db, orgID, userID, periodStartedAt)
 
 	c.JSON(http.StatusOK, gin.H{
-		"plan":                   plan,
-		"billing_cycle":          billingCycle,
-		"storage_quota":          storageQuota,
-		"storage_used":           storageUsed,
-		"storage_percent":        storagePercent,
-		"traffic_quota":          trafficQuota,
-		"traffic_combined_used":  orgTrafficUsage.Combined,
-		"traffic_upload_quota":   trafficUploadQuota,
-		"traffic_upload_used":    orgTrafficUsage.Upload,
-		"traffic_download_quota": trafficDownloadQuota,
-		"traffic_download_used":  orgTrafficUsage.Download,
-		"traffic_reset_date":     nextReset.Format("2006-01-02"),
-		"max_users":              maxUsers,
-		"current_users":          currentUsers,
-		// Per-user quota (if set)
+		// Flat fields (backward compat)
+		"plan":                      plan,
+		"billing_cycle":             billingCycle,
+		"quota_policy":              quotaPolicy,
+		"storage_quota":             storageQuota,
+		"storage_used":              storageUsed,
+		"storage_percent":           storagePct,
+		"traffic_quota":             trafficQuota,
+		"traffic_combined_used":     orgTrafficUsage.Combined,
+		"traffic_upload_quota":      trafficUploadQuota,
+		"traffic_upload_used":       orgTrafficUsage.Upload,
+		"traffic_download_quota":    trafficDownloadQuota,
+		"traffic_download_used":     orgTrafficUsage.Download,
+		"traffic_reset_date":        trafficResetDate,
+		"max_users":                 maxUsers,
+		"current_users":             currentUsers,
+		"current_period_started_at": currentPeriodStartedAt,
+		"current_period_ends_at":    currentPeriodEndsAt,
+		// Structured objects
+		"storage": gin.H{
+			"used":       storageUsed,
+			"quota":      storageQuota,
+			"percent":    storagePct,
+			"over_quota": storageOverQuota,
+		},
+		"traffic": gin.H{
+			"used":                orgTrafficUsage.Combined,
+			"quota":               trafficQuota,
+			"percent":             trafficPct,
+			"over_quota":          trafficOverQuota,
+			"upload_used":         orgTrafficUsage.Upload,
+			"upload_quota":        trafficUploadQuota,
+			"upload_over_quota":   uploadOverQuota,
+			"download_used":       orgTrafficUsage.Download,
+			"download_quota":      trafficDownloadQuota,
+			"download_over_quota": downloadOverQuota,
+			"reset_date":          trafficResetDate,
+		},
+		// Per-user traffic
 		"user_upload_used":   userTrafficUsage.Upload,
 		"user_download_used": userTrafficUsage.Download,
 	})

@@ -1,14 +1,14 @@
 # Storage & Traffic Quotas — Implementation Plan
 
-## Update 2026-03-27 (Phase 1 implemented)
+## Update 2026-03-28 (Phase 2 backend implemented)
 
 This document originally described traffic enforcement using natural monthly partitions only.
-The current agreed design is (Phase 1 backend model is now implemented):
+The current agreed design is now implemented in the backend through Phase 2:
 
 - `traffic_counters` and `traffic_monthly` remain useful for analytics and natural-month reporting.
-- Traffic quota enforcement must use the org's current quota period, not the natural UTC month.
+- Traffic quota enforcement now uses the org's current quota period, not the natural UTC month.
 - Every org should carry `current_period_started_at` and `current_period_ends_at`.
-- A dedicated aggregate such as `traffic_period_usage` is acceptable for performance and is the recommended source for quota enforcement.
+- `traffic_period_usage` is the canonical aggregate for quota enforcement and Phase 2 account/subscription traffic payloads.
 - `billing_cycle` remains commercial metadata only; even annual plans still enforce monthly traffic quotas.
 - Storage does not use periods. Storage is simply current usage vs current limit.
 - Accounts may send `current_period_ends_at` explicitly. If it does not, SesameFS derives it from `current_period_started_at` using the same monthly anchor semantics used by Stripe.
@@ -804,7 +804,7 @@ Phase 2 (TrafficRecorder core)
 
 ---
 
-## Implementation Status (2026-03-25)
+## Implementation Status (2026-03-28)
 
 | Phase | Description | Status | Notes |
 |-------|-------------|--------|-------|
@@ -815,7 +815,14 @@ Phase 2 (TrafficRecorder core)
 | **Phase 5** | Storage tracking | ✅ COMPLETE | Increment/DecrementStorageCounters in `traffic/storage.go` (4 scopes), negative delta guard, library soft-delete/restore adjusts aggregates |
 | **Phase 6** | Quota enforcement | ✅ COMPLETE | CheckStorageQuota, CheckTrafficQuota, CheckMaxUsers. Free=hard block, paid=soft warning. Pre-checks in all upload/download paths |
 | **Phase 7** | Statistics API | ✅ COMPLETE | AdminStatisticTraffic, AdminStatisticStorage, OrgStatisticTraffic, OrgStatisticUserTraffic, AdminListOrgTraffic, AdminListUserTraffic — all real data |
-| **Phase 8** | Plan/Quota API | ✅ COMPLETE | PUT org accepts all plan fields, PUT user accepts traffic quotas, GET subscription, account info extended |
+| **Phase 8** | Plan/Quota API | ✅ COMPLETE | PUT org accepts all plan fields, PUT user accepts traffic quotas, GET subscription/account info expose current-period traffic state and resolved plan capabilities |
+
+### Phase 2 backend completion notes (2026-03-28)
+- Added `traffic_period_usage` counter table to persist org-period aggregates.
+- `TrafficRecorder` now writes both `traffic_monthly` and `traffic_period_usage` on every transfer.
+- `QuotaChecker` now enforces traffic quotas against `traffic_period_usage` keyed by `current_period_started_at`.
+- `account/info` and `subscription` now expose current-period traffic usage and use `current_period_ends_at` for reset timing.
+- Natural-month analytics remain on `traffic_monthly`; the period rollover job is still a later phase item.
 
 ### Post-implementation fixes (2026-03-25)
 - **Recorder semaphore**: Moved `select` outside goroutine — drops records without spawning goroutines under load

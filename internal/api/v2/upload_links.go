@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/Sesame-Disk/sesamefs/internal/config"
 	"github.com/Sesame-Disk/sesamefs/internal/db"
 	"github.com/Sesame-Disk/sesamefs/internal/middleware"
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
@@ -20,16 +21,18 @@ type UploadLinkHandler struct {
 	db             *db.DB
 	serverURL      string
 	permMiddleware *middleware.PermissionMiddleware
+	config         *config.Config
 	shareHandler   *ShareLinkHandler // reuse insertShareLink/deleteShareLink
 }
 
 // NewUploadLinkHandler creates a new UploadLinkHandler
-func NewUploadLinkHandler(database *db.DB, serverURL string, permMiddleware *middleware.PermissionMiddleware) *UploadLinkHandler {
+func NewUploadLinkHandler(database *db.DB, serverURL string, permMiddleware *middleware.PermissionMiddleware, cfg *config.Config) *UploadLinkHandler {
 	return &UploadLinkHandler{
 		db:             database,
 		serverURL:      serverURL,
 		permMiddleware: permMiddleware,
-		shareHandler:   &ShareLinkHandler{db: database, serverURL: serverURL, permMiddleware: permMiddleware},
+		config:         cfg,
+		shareHandler:   &ShareLinkHandler{db: database, serverURL: serverURL, permMiddleware: permMiddleware, config: cfg},
 	}
 }
 
@@ -54,8 +57,8 @@ type UploadLinkResponse struct {
 }
 
 // RegisterUploadLinkRoutes registers upload link routes
-func RegisterUploadLinkRoutes(rg *gin.RouterGroup, database *db.DB, serverURL string, permMiddleware *middleware.PermissionMiddleware) *UploadLinkHandler {
-	h := NewUploadLinkHandler(database, serverURL, permMiddleware)
+func RegisterUploadLinkRoutes(rg *gin.RouterGroup, database *db.DB, serverURL string, permMiddleware *middleware.PermissionMiddleware, cfg *config.Config) *UploadLinkHandler {
+	h := NewUploadLinkHandler(database, serverURL, permMiddleware, cfg)
 
 	uploadLinks := rg.Group("/upload-links")
 	{
@@ -263,6 +266,37 @@ func (h *UploadLinkHandler) CreateUploadLink(c *gin.Context) {
 	if _, err := uuid.Parse(req.RepoID); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid repo_id"})
 		return
+	}
+
+	// ENFORCEMENT CHECK: feature flag + numeric limit + expiry cap
+	if h.config != nil {
+		enforcement := GetOrgEnforcement(h.db, orgID, h.config)
+		if !enforcement.Profile.Features.CanGenerateUploadLink {
+			c.JSON(http.StatusForbidden, gin.H{
+				"error":            "Upload link creation is not available on your plan",
+				"upgrade_required": true,
+			})
+			return
+		}
+		if enforcement.Profile.Limits.MaxUploadLinks > 0 {
+			count := CountActiveUploadLinks(h.db, orgID)
+			if count >= enforcement.Profile.Limits.MaxUploadLinks {
+				c.JSON(http.StatusForbidden, gin.H{
+					"error":   "Upload link limit reached",
+					"limit":   enforcement.Profile.Limits.MaxUploadLinks,
+					"current": count,
+				})
+				return
+			}
+		}
+		if max := enforcement.Profile.Limits.UploadLinkExpireDaysMax; max > 0 {
+			if req.ExpireDays > max {
+				req.ExpireDays = max
+			}
+			if req.ExpireDays == 0 && req.ExpirationTime == "" {
+				req.ExpireDays = max
+			}
+		}
 	}
 
 	// Generate secure token

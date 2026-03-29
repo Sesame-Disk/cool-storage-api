@@ -61,7 +61,7 @@ func (r *Recorder) Record(orgID, userID, trafficType string, bytes int64) {
 	case r.sem <- struct{}{}: // acquire slot (non-blocking)
 		go func() {
 			defer func() { <-r.sem }() // release slot
-			if err := r.recordCounters(orgID, userID, month, day, trafficType, direction, bytes); err != nil {
+			if err := r.recordCounters(orgID, userID, month, day, now, trafficType, direction, bytes); err != nil {
 				log.Printf("[traffic] record error org=%s user=%s type=%s: %v", orgID, userID, trafficType, err)
 			}
 		}()
@@ -72,7 +72,7 @@ func (r *Recorder) Record(orgID, userID, trafficType string, bytes int64) {
 }
 
 // recordCounters performs all counter updates inside the goroutine.
-func (r *Recorder) recordCounters(orgID, userID, month string, day time.Time, trafficType, direction string, bytes int64) error {
+func (r *Recorder) recordCounters(orgID, userID, month string, day, now time.Time, trafficType, direction string, bytes int64) error {
 	orgUUID, err := gocql.ParseUUID(orgID)
 	if err != nil {
 		return fmt.Errorf("invalid org UUID %q: %w", orgID, err)
@@ -81,6 +81,7 @@ func (r *Recorder) recordCounters(orgID, userID, month string, day time.Time, tr
 	if err != nil {
 		return fmt.Errorf("invalid user UUID %q: %w", userID, err)
 	}
+	periodStartedAt := r.loadCurrentPeriodStart(orgUUID, now)
 
 	// 1. Daily per-user/type detail — used for org-level statistics breakdowns.
 	if err := r.session.Query(
@@ -125,8 +126,27 @@ func (r *Recorder) recordCounters(orgID, userID, month string, day time.Time, tr
 		).Exec(); err != nil {
 			return fmt.Errorf("traffic_monthly scope=%s: %w", scope, err)
 		}
+		if err := r.session.Query(
+			`UPDATE traffic_period_usage SET bytes_transferred = bytes_transferred + ?
+			 WHERE org_id = ? AND period_started_at = ? AND scope = ?`,
+			bytes, orgUUID, periodStartedAt, scope,
+		).Exec(); err != nil {
+			return fmt.Errorf("traffic_period_usage scope=%s: %w", scope, err)
+		}
 	}
 	return nil
+}
+
+func (r *Recorder) loadCurrentPeriodStart(orgUUID gocql.UUID, now time.Time) time.Time {
+	var currentPeriodStartedAt *time.Time
+	err := r.session.Query(
+		`SELECT current_period_started_at FROM organizations WHERE org_id = ?`,
+		orgUUID,
+	).Scan(&currentPeriodStartedAt)
+	if err != nil {
+		return EffectivePeriodStart(nil, now)
+	}
+	return EffectivePeriodStart(currentPeriodStartedAt, now)
 }
 
 // directionOf returns "upload" or "download" based on the traffic type string.

@@ -582,7 +582,8 @@ func (h *AdminHandler) GetOrganization(c *gin.Context) {
 		}
 	}
 
-	monthlyUsage := traffic.ReadOrgMonthlyUsage(h.db, orgID, traffic.CurrentMonth())
+	periodStartedAt := traffic.EffectivePeriodStart(currentPeriodStartedAt, time.Now().UTC())
+	periodUsage := traffic.ReadOrgPeriodUsage(h.db, orgID, periodStartedAt)
 
 	effectiveStatus := status
 	if effectiveStatus == "" {
@@ -608,9 +609,9 @@ func (h *AdminHandler) GetOrganization(c *gin.Context) {
 		"traffic_quota":             trafficQuota,
 		"traffic_upload_quota":      trafficUploadQuota,
 		"traffic_download_quota":    trafficDownloadQuota,
-		"traffic_combined_used":     monthlyUsage.Combined,
-		"traffic_upload_used":       monthlyUsage.Upload,
-		"traffic_download_used":     monthlyUsage.Download,
+		"traffic_combined_used":     periodUsage.Combined,
+		"traffic_upload_used":       periodUsage.Upload,
+		"traffic_download_used":     periodUsage.Download,
 		"plan":                      plan,
 		"quota_policy":              quotaPolicy,
 		"billing_cycle":             billingCycle,

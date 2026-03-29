@@ -141,6 +141,7 @@ func (db *DB) Migrate() error {
 		migrationCreateAuditLog,
 		migrationCreateTrafficCounters,
 		migrationCreateTrafficMonthly,
+		migrationCreateTrafficPeriodUsage,
 		migrationCreateStorageCounters,
 	}
 
@@ -949,6 +950,18 @@ CREATE TABLE IF NOT EXISTS traffic_monthly (
 	scope TEXT,
 	bytes_transferred COUNTER,
 	PRIMARY KEY ((org_id, month), scope)
+)`
+
+// Traffic period usage — aggregated counters keyed by the org's effective quota
+// period. This is the canonical source for quota enforcement and the Phase 2
+// account/subscription traffic payloads.
+const migrationCreateTrafficPeriodUsage = `
+CREATE TABLE IF NOT EXISTS traffic_period_usage (
+	org_id UUID,
+	period_started_at TIMESTAMP,
+	scope TEXT,
+	bytes_transferred COUNTER,
+	PRIMARY KEY ((org_id, period_started_at), scope)
 )`
 
 // Storage counters — per-entity (org, user, library) byte and file counts.

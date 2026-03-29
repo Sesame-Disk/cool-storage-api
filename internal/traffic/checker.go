@@ -92,22 +92,24 @@ func (c *Checker) CheckTrafficQuota(orgID, userID, direction string, additionalB
 	// 1. Load org quota config.
 	var trafficQuota, uploadQuota, downloadQuota int64
 	var quotaPolicy string
+	var currentPeriodStartedAt *time.Time
 	err := c.session.Query(`
-		SELECT traffic_quota, traffic_upload_quota, traffic_download_quota, quota_policy
+		SELECT traffic_quota, traffic_upload_quota, traffic_download_quota, quota_policy,
+		       current_period_started_at
 		FROM organizations WHERE org_id = ?`,
 		mustParseUUID(orgID),
-	).Scan(&trafficQuota, &uploadQuota, &downloadQuota, &quotaPolicy)
+	).Scan(&trafficQuota, &uploadQuota, &downloadQuota, &quotaPolicy, &currentPeriodStartedAt)
 	if err != nil {
 		// If row doesn't exist, allow by default (migration may not have run).
 		return QuotaStatus{Allowed: true}, nil
 	}
 
-	month := time.Now().UTC().Format("200601")
+	periodStartedAt := EffectivePeriodStart(currentPeriodStartedAt, time.Now().UTC())
 	worst := QuotaStatus{Allowed: true, LimitBytes: -1, Plan: quotaPolicy}
 
 	// 2. Check combined quota.
 	if trafficQuota > 0 {
-		used, _ := c.readTrafficMonthly(orgID, month, "org:combined")
+		used, _ := c.readTrafficPeriod(orgID, periodStartedAt, "org:combined")
 		projected := used + additionalBytes
 		if projected > trafficQuota {
 			s := QuotaStatus{
@@ -136,7 +138,7 @@ func (c *Checker) CheckTrafficQuota(orgID, userID, direction string, additionalB
 	}
 	if dirQuota > 0 {
 		scope := fmt.Sprintf("org:%s", direction)
-		used, _ := c.readTrafficMonthly(orgID, month, scope)
+		used, _ := c.readTrafficPeriod(orgID, periodStartedAt, scope)
 		projected := used + additionalBytes
 		reason := "traffic-" + direction
 		if projected > dirQuota {
@@ -174,7 +176,7 @@ func (c *Checker) CheckTrafficQuota(orgID, userID, direction string, additionalB
 			}
 			if userDirQuota > 0 {
 				scope := fmt.Sprintf("%s:%s", userID, direction)
-				used, _ := c.readTrafficMonthly(orgID, month, scope)
+				used, _ := c.readTrafficPeriod(orgID, periodStartedAt, scope)
 				projected := used + additionalBytes
 				reason := "traffic-" + direction
 				if projected > userDirQuota {
@@ -245,12 +247,12 @@ func (c *Checker) CheckMaxUsers(orgID string) (QuotaStatus, error) {
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
-func (c *Checker) readTrafficMonthly(orgID, month, scope string) (int64, error) {
+func (c *Checker) readTrafficPeriod(orgID string, periodStartedAt time.Time, scope string) (int64, error) {
 	var bytes int64
 	err := c.session.Query(`
-		SELECT bytes_transferred FROM traffic_monthly
-		WHERE org_id = ? AND month = ? AND scope = ?`,
-		mustParseUUID(orgID), month, scope,
+		SELECT bytes_transferred FROM traffic_period_usage
+		WHERE org_id = ? AND period_started_at = ? AND scope = ?`,
+		mustParseUUID(orgID), periodStartedAt.UTC(), scope,
 	).Scan(&bytes)
 	if err != nil {
 		return 0, err

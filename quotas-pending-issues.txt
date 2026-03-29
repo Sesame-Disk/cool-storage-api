@@ -1,7 +1,32 @@
 ================================================================================
   QUOTAS — PENDIENTES Y GAPS CONOCIDOS
-  Última actualización: 2026-03-27
+    Última actualización: 2026-03-28
 ================================================================================
+
+## UPDATE 2026-03-28 — PHASE 2 BACKEND COMPLETADA
+
+[ok] `traffic_period_usage` ya existe como agregado canónico por período de quota
+                - Se agregó la tabla counter en migraciones
+                - `TrafficRecorder` ahora escribe tanto `traffic_monthly` (analytics natural-month)
+                    como `traffic_period_usage` (enforcement y payloads Phase 2)
+                - `QuotaChecker` dejó de evaluar tráfico contra `traffic_monthly` y ahora usa
+                    `current_period_started_at` + `traffic_period_usage`
+
+[ok] `/api2/account/info/` y `/api/v2.1/subscription/` ya usan tráfico por período efectivo
+                - Los objetos `traffic{}` ahora leen uso del período actual
+                - `traffic_reset_date` vuelve a tomar `current_period_ends_at` como fuente canónica
+                - `upgrade_features` se alinea con el contrato del frontend (`add_group`, etc.)
+
+[ok] Los checks de enforcement profile de Phase 2 quedaron cableados en operaciones clave
+                - creación de share links
+                - creación de upload links
+                - creación de libraries
+                - creación de groups / group-owned libraries
+
+[>] Lo pendiente principal ya no es Phase 2 backend, sino fases posteriores
+                - migración/consumo frontend completo del nuevo contrato (Phase 3)
+                - rollover job por `current_period_ends_at <= now` (Phase 4)
+                - auth M2M / service tokens para provisioning externo (Phase 4)
 
 ## CONTEXTO NUEVO / DIRECCION ACORDADA (2026-03-26)
 

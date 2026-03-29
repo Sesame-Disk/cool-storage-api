@@ -410,6 +410,8 @@ func (h *OrgAdminHandler) GetOrgInfo(c *gin.Context) {
 		return
 	}
 
+	periodStartedAt := traffic.EffectivePeriodStart(currentPeriodStartedAt, time.Now().UTC())
+	periodUsage := traffic.ReadOrgPeriodUsage(h.db, orgID, periodStartedAt)
 	monthlyUsage := traffic.ReadOrgMonthlyUsage(h.db, orgID, traffic.CurrentMonth())
 	yearlyUsage := traffic.MonthlyTransferUsage{}
 	now := time.Now().UTC()
@@ -462,11 +464,11 @@ func (h *OrgAdminHandler) GetOrgInfo(c *gin.Context) {
 		"traffic_month_total":       monthlyUsage.Combined,
 		"traffic_month_upload":      monthlyUsage.Upload,
 		"traffic_month_download":    monthlyUsage.Download,
-		"traffic_combined_used":     monthlyUsage.Combined,
+		"traffic_combined_used":     periodUsage.Combined,
 		"traffic_upload_quota":      trafficUploadQuota,
-		"traffic_upload_used":       monthlyUsage.Upload,
+		"traffic_upload_used":       periodUsage.Upload,
 		"traffic_download_quota":    trafficDownloadQuota,
-		"traffic_download_used":     monthlyUsage.Download,
+		"traffic_download_used":     periodUsage.Download,
 		"traffic_year_total":        yearlyUsage.Combined,
 		"traffic_year_upload":       yearlyUsage.Upload,
 		"traffic_year_download":     yearlyUsage.Download,
