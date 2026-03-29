@@ -459,23 +459,28 @@ func (h *FileViewHandler) ServeRawFile(c *gin.Context) {
 	userID := c.GetString("user_id")
 
 	// Record traffic after the response is fully written (covers all return paths).
+	// downloadPeriod is set by the quota pre-check below and captured by the defer closure.
+	downloadTrafficStatus := traffic.QuotaStatus{Allowed: true}
 	bytesBefore := int64(c.Writer.Size())
 	defer func() {
 		if rec := traffic.Get(); rec != nil {
 			sent := int64(c.Writer.Size()) - bytesBefore
 			if sent > 0 {
-				rec.Record(orgID, userID, traffic.WebDownload, sent)
+				traffic.RecordCheckedTransfer(rec, downloadTrafficStatus, orgID, userID, traffic.WebDownload, sent)
 			}
 		}
 	}()
 
 	// Quota pre-check: reject if download traffic quota is already exhausted.
 	if checker := traffic.GetChecker(); checker != nil {
-		if st, _ := checker.CheckTrafficQuota(orgID, userID, "download", 0); !st.Allowed {
-			c.JSON(http.StatusForbidden, gin.H{"error": "traffic quota exceeded"})
+		downloadTrafficStatus, _ = traffic.CheckTrafficQuotaWithChecker(checker, orgID, userID, "download", 0)
+		if !downloadTrafficStatus.Allowed {
+			c.JSON(http.StatusForbidden, traffic.TrafficQuotaExceededResponse(downloadTrafficStatus, "traffic quota exceeded", false))
 			return
-		} else if st.Warning {
-			c.Header("X-Quota-Warning", st.Reason)
+		} else {
+			if warning, ok := traffic.TrafficQuotaWarningHeader(downloadTrafficStatus); ok {
+				c.Header("X-Quota-Warning", warning)
+			}
 		}
 	}
 
@@ -803,12 +808,16 @@ func (h *FileViewHandler) DownloadHistoricFile(c *gin.Context) {
 	userID := c.GetString("user_id")
 
 	// Quota pre-check: reject if download traffic quota is already exhausted.
+	historicDownloadStatus := traffic.QuotaStatus{Allowed: true}
 	if checker := traffic.GetChecker(); checker != nil {
-		if st, _ := checker.CheckTrafficQuota(orgID, userID, "download", 0); !st.Allowed {
-			c.JSON(http.StatusForbidden, gin.H{"error": "traffic quota exceeded"})
+		historicDownloadStatus, _ = traffic.CheckTrafficQuotaWithChecker(checker, orgID, userID, "download", 0)
+		if !historicDownloadStatus.Allowed {
+			c.JSON(http.StatusForbidden, traffic.TrafficQuotaExceededResponse(historicDownloadStatus, "traffic quota exceeded", false))
 			return
-		} else if st.Warning {
-			c.Header("X-Quota-Warning", st.Reason)
+		} else {
+			if warning, ok := traffic.TrafficQuotaWarningHeader(historicDownloadStatus); ok {
+				c.Header("X-Quota-Warning", warning)
+			}
 		}
 	}
 
@@ -877,7 +886,7 @@ func (h *FileViewHandler) DownloadHistoricFile(c *gin.Context) {
 			bytesAfter = 0
 		}
 		if sent := bytesAfter - bytesBefore; sent > 0 {
-			rec.Record(orgID, userID, traffic.WebDownload, sent)
+			traffic.RecordCheckedTransfer(rec, historicDownloadStatus, orgID, userID, traffic.WebDownload, sent)
 		}
 	}
 }
@@ -981,23 +990,28 @@ func (h *FileViewHandler) ServeHistoricFileRaw(c *gin.Context) {
 	userID := c.GetString("user_id")
 
 	// Record traffic after the response is fully written (covers all return paths).
+	// rawDownloadPeriod is set by the quota pre-check below and captured by the defer closure.
+	rawDownloadStatus := traffic.QuotaStatus{Allowed: true}
 	bytesBefore := int64(c.Writer.Size())
 	defer func() {
 		if rec := traffic.Get(); rec != nil {
 			sent := int64(c.Writer.Size()) - bytesBefore
 			if sent > 0 {
-				rec.Record(orgID, userID, traffic.WebDownload, sent)
+				traffic.RecordCheckedTransfer(rec, rawDownloadStatus, orgID, userID, traffic.WebDownload, sent)
 			}
 		}
 	}()
 
 	// Quota pre-check: reject if download traffic quota is already exhausted.
 	if checker := traffic.GetChecker(); checker != nil {
-		if st, _ := checker.CheckTrafficQuota(orgID, userID, "download", 0); !st.Allowed {
-			c.JSON(http.StatusForbidden, gin.H{"error": "traffic quota exceeded"})
+		rawDownloadStatus, _ = traffic.CheckTrafficQuotaWithChecker(checker, orgID, userID, "download", 0)
+		if !rawDownloadStatus.Allowed {
+			c.JSON(http.StatusForbidden, traffic.TrafficQuotaExceededResponse(rawDownloadStatus, "traffic quota exceeded", false))
 			return
-		} else if st.Warning {
-			c.Header("X-Quota-Warning", st.Reason)
+		} else {
+			if warning, ok := traffic.TrafficQuotaWarningHeader(rawDownloadStatus); ok {
+				c.Header("X-Quota-Warning", warning)
+			}
 		}
 	}
 

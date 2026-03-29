@@ -748,8 +748,10 @@ func (h *SyncHandler) GetBlock(c *gin.Context) {
 	// The client will decrypt using its locally-derived file key.
 
 	// Quota pre-check: reject if download traffic quota exceeded.
+	downloadTrafficStatus := traffic.QuotaStatus{Allowed: true}
 	if checker := traffic.GetChecker(); checker != nil {
-		if qs, _ := checker.CheckTrafficQuota(orgID, userID, "download", int64(len(data))); !qs.Allowed {
+		downloadTrafficStatus, _ = traffic.CheckTrafficQuotaWithChecker(checker, orgID, userID, "download", int64(len(data)))
+		if !downloadTrafficStatus.Allowed {
 			c.JSON(http.StatusForbidden, gin.H{"error": "download traffic quota exceeded"})
 			return
 		}
@@ -766,7 +768,7 @@ func (h *SyncHandler) GetBlock(c *gin.Context) {
 
 	// Record sync download traffic — fire-and-forget.
 	if rec := traffic.Get(); rec != nil {
-		rec.Record(orgID, userID, traffic.SyncDownload, int64(len(data)))
+		traffic.RecordCheckedTransfer(rec, downloadTrafficStatus, orgID, userID, traffic.SyncDownload, int64(len(data)))
 	}
 }
 
@@ -788,6 +790,7 @@ func (h *SyncHandler) PutBlock(c *gin.Context) {
 	log.Printf("PutBlock: externalID=%s, len=%d\n", externalID, len(externalID))
 
 	// Quota pre-check: reject early if storage or upload traffic quota exceeded.
+	uploadTrafficStatus := traffic.QuotaStatus{Allowed: true}
 	if checker := traffic.GetChecker(); checker != nil {
 		contentLen := c.Request.ContentLength
 		if contentLen > 0 {
@@ -795,7 +798,8 @@ func (h *SyncHandler) PutBlock(c *gin.Context) {
 				c.JSON(http.StatusForbidden, gin.H{"error": "storage quota exceeded"})
 				return
 			}
-			if qs, _ := checker.CheckTrafficQuota(orgID, userID, "upload", contentLen); !qs.Allowed {
+			uploadTrafficStatus, _ = traffic.CheckTrafficQuotaWithChecker(checker, orgID, userID, "upload", contentLen)
+			if !uploadTrafficStatus.Allowed {
 				c.JSON(http.StatusForbidden, gin.H{"error": "upload traffic quota exceeded"})
 				return
 			}
@@ -900,7 +904,7 @@ func (h *SyncHandler) PutBlock(c *gin.Context) {
 
 	// Record sync upload traffic — fire-and-forget.
 	if rec := traffic.Get(); rec != nil {
-		rec.Record(orgID, userID, traffic.SyncUpload, int64(len(data)))
+		traffic.RecordCheckedTransfer(rec, uploadTrafficStatus, orgID, userID, traffic.SyncUpload, int64(len(data)))
 	}
 }
 

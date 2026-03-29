@@ -46,7 +46,27 @@ func NewRecorder(session *gocql.Session) *Recorder {
 //
 // orgID and userID must be valid UUID strings. trafficType must be one of the
 // package-level constants (SyncUpload, WebDownload, …).
+//
+// Callers that have already run a CheckTrafficQuota pre-check should use
+// RecordWithPeriod instead — it reuses the already-resolved period and saves
+// an extra SELECT per event.
 func (r *Recorder) Record(orgID, userID, trafficType string, bytes int64) {
+	r.recordAsync(orgID, userID, trafficType, bytes, time.Time{})
+}
+
+// RecordWithPeriod is like Record but accepts the quota period start that was
+// already resolved by a preceding CheckTrafficQuota call. This eliminates the
+// SELECT on organizations that Record would otherwise perform per event,
+// and guarantees that enforcement and recording use the exact same period.
+//
+// periodStartedAt must be the PeriodStartedAt value from the QuotaStatus
+// returned by CheckTrafficQuota. If zero, falls back to the DB lookup (same
+// behaviour as Record).
+func (r *Recorder) RecordWithPeriod(orgID, userID, trafficType string, bytes int64, periodStartedAt time.Time) {
+	r.recordAsync(orgID, userID, trafficType, bytes, periodStartedAt)
+}
+
+func (r *Recorder) recordAsync(orgID, userID, trafficType string, bytes int64, periodHint time.Time) {
 	if bytes <= 0 {
 		return
 	}
@@ -61,7 +81,7 @@ func (r *Recorder) Record(orgID, userID, trafficType string, bytes int64) {
 	case r.sem <- struct{}{}: // acquire slot (non-blocking)
 		go func() {
 			defer func() { <-r.sem }() // release slot
-			if err := r.recordCounters(orgID, userID, month, day, now, trafficType, direction, bytes); err != nil {
+			if err := r.recordCounters(orgID, userID, month, day, now, periodHint, trafficType, direction, bytes); err != nil {
 				log.Printf("[traffic] record error org=%s user=%s type=%s: %v", orgID, userID, trafficType, err)
 			}
 		}()
@@ -72,7 +92,7 @@ func (r *Recorder) Record(orgID, userID, trafficType string, bytes int64) {
 }
 
 // recordCounters performs all counter updates inside the goroutine.
-func (r *Recorder) recordCounters(orgID, userID, month string, day, now time.Time, trafficType, direction string, bytes int64) error {
+func (r *Recorder) recordCounters(orgID, userID, month string, day, now, periodHint time.Time, trafficType, direction string, bytes int64) error {
 	orgUUID, err := gocql.ParseUUID(orgID)
 	if err != nil {
 		return fmt.Errorf("invalid org UUID %q: %w", orgID, err)
@@ -81,7 +101,14 @@ func (r *Recorder) recordCounters(orgID, userID, month string, day, now time.Tim
 	if err != nil {
 		return fmt.Errorf("invalid user UUID %q: %w", userID, err)
 	}
-	periodStartedAt := r.loadCurrentPeriodStart(orgUUID, now)
+	// Use the hint when provided (from a preceding quota check) to avoid an
+	// extra SELECT. Fall back to DB lookup only when the hint is absent.
+	var periodStartedAt time.Time
+	if !periodHint.IsZero() {
+		periodStartedAt = periodHint
+	} else {
+		periodStartedAt = r.loadCurrentPeriodStart(orgUUID, now)
+	}
 
 	// 1. Daily per-user/type detail — used for org-level statistics breakdowns.
 	if err := r.session.Query(

@@ -765,13 +765,26 @@ func (h *AdminHandler) UpdateOrganization(c *gin.Context) {
 			setAuditChange("billing_cycle", existingBillingCycle, *req.BillingCycle)
 		}
 	}
-	if req.CurrentPeriodStartedAt != nil {
+	// Period start and end must be updated together to keep enforcement and
+	// reset_date consistent. Accepting only one of the two could leave them
+	// pointing at different periods.
+	if req.CurrentPeriodStartedAt != nil || req.CurrentPeriodEndsAt != nil {
+		if req.CurrentPeriodStartedAt == nil || req.CurrentPeriodEndsAt == nil {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error": "current_period_started_at and current_period_ends_at must be provided together",
+			})
+			return
+		}
+		if !req.CurrentPeriodEndsAt.After(*req.CurrentPeriodStartedAt) {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error": "current_period_ends_at must be after current_period_started_at",
+			})
+			return
+		}
 		updates = append(updates, colUpdate{"current_period_started_at", *req.CurrentPeriodStartedAt})
 		if formatTimePtr(req.CurrentPeriodStartedAt) != formatTimePtr(existingCurrentPeriodStartedAt) {
 			setAuditChange("current_period_started_at", formatTimePtr(existingCurrentPeriodStartedAt), formatTimePtr(req.CurrentPeriodStartedAt))
 		}
-	}
-	if req.CurrentPeriodEndsAt != nil {
 		updates = append(updates, colUpdate{"current_period_ends_at", *req.CurrentPeriodEndsAt})
 		if formatTimePtr(req.CurrentPeriodEndsAt) != formatTimePtr(existingCurrentPeriodEndsAt) {
 			setAuditChange("current_period_ends_at", formatTimePtr(existingCurrentPeriodEndsAt), formatTimePtr(req.CurrentPeriodEndsAt))

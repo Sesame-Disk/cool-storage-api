@@ -2,6 +2,7 @@ package traffic
 
 import (
 	"fmt"
+	"log"
 	"sync"
 	"time"
 
@@ -10,12 +11,13 @@ import (
 
 // QuotaStatus describes the result of a quota check.
 type QuotaStatus struct {
-	Allowed    bool   // may the operation proceed?
-	Warning    bool   // >80% of the included limit (paid plans only)
-	UsedBytes  int64  // current usage relevant to the check
-	LimitBytes int64  // limit that was evaluated (-1 = unlimited)
-	Reason     string // "storage", "traffic-combined", "traffic-upload", "traffic-download", "max-users"
-	Plan       string // plan name from organizations table
+	Allowed         bool      // may the operation proceed?
+	Warning         bool      // >80% of the included limit (paid plans only)
+	UsedBytes       int64     // current usage relevant to the check
+	LimitBytes      int64     // limit that was evaluated (-1 = unlimited)
+	Reason          string    // "storage", "traffic-combined", "traffic-upload", "traffic-download", "max-users"
+	Plan            string    // plan name from organizations table
+	PeriodStartedAt time.Time // the quota period resolved during CheckTrafficQuota; zero for non-traffic checks
 }
 
 // Checker reads quota configuration and current usage from ScyllaDB to evaluate
@@ -105,7 +107,7 @@ func (c *Checker) CheckTrafficQuota(orgID, userID, direction string, additionalB
 	}
 
 	periodStartedAt := EffectivePeriodStart(currentPeriodStartedAt, time.Now().UTC())
-	worst := QuotaStatus{Allowed: true, LimitBytes: -1, Plan: quotaPolicy}
+	worst := QuotaStatus{Allowed: true, LimitBytes: -1, Plan: quotaPolicy, PeriodStartedAt: periodStartedAt}
 
 	// 2. Check combined quota.
 	if trafficQuota > 0 {
@@ -255,6 +257,10 @@ func (c *Checker) readTrafficPeriod(orgID string, periodStartedAt time.Time, sco
 		mustParseUUID(orgID), periodStartedAt.UTC(), scope,
 	).Scan(&bytes)
 	if err != nil {
+		// Log explicitly: a read error causes fail-open (used=0), which could allow
+		// traffic past the quota limit without the operator noticing.
+		log.Printf("[traffic] readTrafficPeriod: org=%s scope=%s period=%s err=%v (fail-open)",
+			orgID, scope, periodStartedAt.Format("2006-01-02"), err)
 		return 0, err
 	}
 	return bytes, nil

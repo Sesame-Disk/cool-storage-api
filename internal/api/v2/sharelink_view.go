@@ -428,21 +428,28 @@ func (h *ShareLinkViewHandler) handleShareLinkDownload(c *gin.Context, sl *share
 // handleShareLinkRaw serves the raw file content for inline preview (images, PDFs, videos, etc.)
 func (h *ShareLinkViewHandler) handleShareLinkRaw(c *gin.Context, sl *shareLinkData) {
 	// Record traffic after the response is fully written (covers all return paths).
+	// shareLinkDownloadPeriod is set by the quota pre-check below and captured by the defer closure.
+	shareLinkDownloadStatus := traffic.QuotaStatus{Allowed: true}
 	bytesBefore := int64(c.Writer.Size())
 	defer func() {
 		if rec := traffic.Get(); rec != nil {
 			sent := int64(c.Writer.Size()) - bytesBefore
 			if sent > 0 {
-				rec.Record(sl.orgID, sl.createdBy, traffic.LinkDownload, sent)
+				traffic.RecordCheckedTransfer(rec, shareLinkDownloadStatus, sl.orgID, sl.createdBy, traffic.LinkDownload, sent)
 			}
 		}
 	}()
 
 	// Quota pre-check: reject if the org's download traffic quota is exhausted.
 	if checker := traffic.GetChecker(); checker != nil {
-		if st, _ := checker.CheckTrafficQuota(sl.orgID, sl.createdBy, "download", 0); !st.Allowed {
-			c.JSON(http.StatusForbidden, gin.H{"error": "traffic quota exceeded"})
+		shareLinkDownloadStatus, _ = traffic.CheckTrafficQuotaWithChecker(checker, sl.orgID, sl.createdBy, "download", 0)
+		if !shareLinkDownloadStatus.Allowed {
+			c.JSON(http.StatusForbidden, traffic.TrafficQuotaExceededResponse(shareLinkDownloadStatus, "traffic quota exceeded", false))
 			return
+		} else {
+			if warning, ok := traffic.TrafficQuotaWarningHeader(shareLinkDownloadStatus); ok {
+				c.Header("X-Quota-Warning", warning)
+			}
 		}
 	}
 

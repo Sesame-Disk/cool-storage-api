@@ -164,6 +164,24 @@ func (h *BlockHandler) UploadBlock(c *gin.Context) {
 		return
 	}
 
+	uploadTrafficStatus := traffic.QuotaStatus{Allowed: true}
+	if checker := traffic.GetChecker(); checker != nil {
+		uploadTrafficStatus, _ = traffic.CheckTrafficQuotaWithChecker(
+			checker,
+			c.GetString("org_id"),
+			c.GetString("user_id"),
+			"upload",
+			c.Request.ContentLength,
+		)
+		if !uploadTrafficStatus.Allowed {
+			c.JSON(http.StatusForbidden, traffic.TrafficQuotaExceededResponse(uploadTrafficStatus, "traffic quota exceeded", true))
+			return
+		}
+		if warning, ok := traffic.TrafficQuotaWarningHeader(uploadTrafficStatus); ok {
+			c.Header("X-Quota-Warning", warning)
+		}
+	}
+
 	// Read the block data
 	data, err := io.ReadAll(io.LimitReader(c.Request.Body, maxSize+1))
 	if err != nil {
@@ -213,7 +231,7 @@ func (h *BlockHandler) UploadBlock(c *gin.Context) {
 	if exists {
 		// Block already exists (deduplication) — data was still transferred over the network.
 		if rec := traffic.Get(); rec != nil {
-			rec.Record(c.GetString("org_id"), c.GetString("user_id"), traffic.WebUpload, int64(len(data)))
+			traffic.RecordCheckedTransfer(rec, uploadTrafficStatus, c.GetString("org_id"), c.GetString("user_id"), traffic.WebUpload, int64(len(data)))
 		}
 		c.JSON(http.StatusOK, UploadBlockResponse{
 			Hash: hash,
@@ -238,7 +256,7 @@ func (h *BlockHandler) UploadBlock(c *gin.Context) {
 
 	// Record traffic for newly stored block.
 	if rec := traffic.Get(); rec != nil {
-		rec.Record(c.GetString("org_id"), c.GetString("user_id"), traffic.WebUpload, int64(len(data)))
+		traffic.RecordCheckedTransfer(rec, uploadTrafficStatus, c.GetString("org_id"), c.GetString("user_id"), traffic.WebUpload, int64(len(data)))
 	}
 
 	c.JSON(http.StatusCreated, UploadBlockResponse{
@@ -272,6 +290,24 @@ func (h *BlockHandler) DownloadBlock(c *gin.Context) {
 		return
 	}
 
+	downloadTrafficStatus := traffic.QuotaStatus{Allowed: true}
+	if checker := traffic.GetChecker(); checker != nil {
+		downloadTrafficStatus, _ = traffic.CheckTrafficQuotaWithChecker(
+			checker,
+			c.GetString("org_id"),
+			c.GetString("user_id"),
+			"download",
+			int64(len(data)),
+		)
+		if !downloadTrafficStatus.Allowed {
+			c.JSON(http.StatusForbidden, traffic.TrafficQuotaExceededResponse(downloadTrafficStatus, "traffic quota exceeded", true))
+			return
+		}
+		if warning, ok := traffic.TrafficQuotaWarningHeader(downloadTrafficStatus); ok {
+			c.Header("X-Quota-Warning", warning)
+		}
+	}
+
 	// Set headers
 	c.Header("Content-Type", "application/octet-stream")
 	c.Header("X-Block-Hash", hash)
@@ -280,7 +316,7 @@ func (h *BlockHandler) DownloadBlock(c *gin.Context) {
 
 	// Record download traffic — fire-and-forget.
 	if rec := traffic.Get(); rec != nil {
-		rec.Record(c.GetString("org_id"), c.GetString("user_id"), traffic.WebDownload, int64(len(data)))
+		traffic.RecordCheckedTransfer(rec, downloadTrafficStatus, c.GetString("org_id"), c.GetString("user_id"), traffic.WebDownload, int64(len(data)))
 	}
 }
 

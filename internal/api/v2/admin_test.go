@@ -1049,6 +1049,49 @@ func TestGetResolvedUserParam(t *testing.T) {
 	})
 }
 
+// --- UpdateOrganization period pair validation ---
+
+// validatePeriodPair mirrors the validation logic in UpdateOrganization so we
+// can unit-test the rules without needing a live database.
+func validatePeriodPair(start, end *time.Time) (int, string) {
+	if start != nil || end != nil {
+		if start == nil || end == nil {
+			return http.StatusBadRequest, "current_period_started_at and current_period_ends_at must be provided together"
+		}
+		if !end.After(*start) {
+			return http.StatusBadRequest, "current_period_ends_at must be after current_period_started_at"
+		}
+	}
+	return http.StatusOK, ""
+}
+
+func TestUpdateOrganization_PeriodPairValidation(t *testing.T) {
+	t1 := time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC)
+	t2 := time.Date(2026, 4, 1, 0, 0, 0, 0, time.UTC)
+
+	tests := []struct {
+		name       string
+		start, end *time.Time
+		wantStatus int
+	}{
+		{"neither provided", nil, nil, http.StatusOK},
+		{"both provided valid", &t1, &t2, http.StatusOK},
+		{"only start", &t1, nil, http.StatusBadRequest},
+		{"only end", nil, &t2, http.StatusBadRequest},
+		{"end == start", &t1, &t1, http.StatusBadRequest},
+		{"end before start", &t2, &t1, http.StatusBadRequest},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			status, _ := validatePeriodPair(tt.start, tt.end)
+			if status != tt.wantStatus {
+				t.Errorf("validatePeriodPair() status = %d, want %d", status, tt.wantStatus)
+			}
+		})
+	}
+}
+
 // --- NewAdminHandler constructor test ---
 
 func TestNewAdminHandler(t *testing.T) {

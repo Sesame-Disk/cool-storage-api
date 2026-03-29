@@ -541,6 +541,7 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 
 	// Quota pre-check — evaluated before reading the body so we can fail fast.
 	// contentLength is an upper bound (includes multipart overhead); acceptable for quota checks.
+	uploadTrafficStatus := traffic.QuotaStatus{Allowed: true}
 	if checker := traffic.GetChecker(); checker != nil {
 		contentLength := c.Request.ContentLength
 		if contentLength < 0 {
@@ -550,11 +551,14 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 			c.JSON(http.StatusForbidden, gin.H{"error": "storage quota exceeded"})
 			return
 		}
-		if st, _ := checker.CheckTrafficQuota(token.OrgID, token.UserID, "upload", contentLength); !st.Allowed {
-			c.JSON(http.StatusForbidden, gin.H{"error": "traffic quota exceeded", "reason": st.Reason})
+		uploadTrafficStatus, _ = traffic.CheckTrafficQuotaWithChecker(checker, token.OrgID, token.UserID, "upload", contentLength)
+		if !uploadTrafficStatus.Allowed {
+			c.JSON(http.StatusForbidden, traffic.TrafficQuotaExceededResponse(uploadTrafficStatus, "traffic quota exceeded", true))
 			return
-		} else if st.Warning {
-			c.Header("X-Quota-Warning", st.Reason)
+		} else {
+			if warning, ok := traffic.TrafficQuotaWarningHeader(uploadTrafficStatus); ok {
+				c.Header("X-Quota-Warning", warning)
+			}
 		}
 	}
 
@@ -659,7 +663,7 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 			if token.Source == "link" {
 				tt = traffic.LinkUpload
 			}
-			rec.Record(token.OrgID, token.UserID, tt, total)
+			traffic.RecordCheckedTransfer(rec, uploadTrafficStatus, token.OrgID, token.UserID, tt, total)
 		}
 		if h.db != nil {
 			traffic.IncrementStorageCounters(h.db, token.OrgID, token.UserID, token.RepoID, total, 1)
@@ -770,7 +774,7 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 		if token.Source == "link" {
 			tt = traffic.LinkUpload
 		}
-		rec.Record(token.OrgID, token.UserID, tt, finalSize)
+		traffic.RecordCheckedTransfer(rec, uploadTrafficStatus, token.OrgID, token.UserID, tt, finalSize)
 	}
 	if h.db != nil {
 		traffic.IncrementStorageCounters(h.db, token.OrgID, token.UserID, token.RepoID, finalSize, 1)
@@ -1362,12 +1366,16 @@ func (h *SeafHTTPHandler) HandleDownload(c *gin.Context) {
 
 	// Quota pre-check: block if org is already over traffic quota.
 	// We don't know the file size yet, so we check the current usage only.
+	downloadTrafficStatus := traffic.QuotaStatus{Allowed: true}
 	if checker := traffic.GetChecker(); checker != nil {
-		if st, _ := checker.CheckTrafficQuota(token.OrgID, token.UserID, "download", 0); !st.Allowed {
-			c.JSON(http.StatusForbidden, gin.H{"error": "traffic quota exceeded", "reason": st.Reason})
+		downloadTrafficStatus, _ = traffic.CheckTrafficQuotaWithChecker(checker, token.OrgID, token.UserID, "download", 0)
+		if !downloadTrafficStatus.Allowed {
+			c.JSON(http.StatusForbidden, traffic.TrafficQuotaExceededResponse(downloadTrafficStatus, "traffic quota exceeded", true))
 			return
-		} else if st.Warning {
-			c.Header("X-Quota-Warning", st.Reason)
+		} else {
+			if warning, ok := traffic.TrafficQuotaWarningHeader(downloadTrafficStatus); ok {
+				c.Header("X-Quota-Warning", warning)
+			}
 		}
 	}
 
@@ -1375,7 +1383,7 @@ func (h *SeafHTTPHandler) HandleDownload(c *gin.Context) {
 	// This is the normal flow for SesameFS files
 	if h.db != nil && h.storageManager != nil {
 		log.Printf("[HandleDownload] Attempting block-based streaming download")
-		err := h.streamFileFromBlocks(c, token, filename)
+		err := h.streamFileFromBlocks(c, token, filename, downloadTrafficStatus.PeriodStartedAt)
 		if err == nil {
 			return
 		}
@@ -1419,7 +1427,7 @@ func (h *SeafHTTPHandler) HandleDownload(c *gin.Context) {
 			if token.Source == "link" {
 				tt = traffic.LinkDownload
 			}
-			rec.Record(token.OrgID, token.UserID, tt, sent)
+			traffic.RecordCheckedTransfer(rec, downloadTrafficStatus, token.OrgID, token.UserID, tt, sent)
 		}
 	}
 }
@@ -1519,7 +1527,7 @@ func (h *SeafHTTPHandler) lookupFileBlocks(token *AccessToken) (blockIDs []strin
 // streamFileFromBlocks streams a file's blocks directly to the HTTP response.
 // Uses prefetching (overlap S3 fetch with HTTP write) and 4MB io.CopyBuffer
 // for maximum throughput. Only O(2 × block_size) RAM.
-func (h *SeafHTTPHandler) streamFileFromBlocks(c *gin.Context, token *AccessToken, filename string) error {
+func (h *SeafHTTPHandler) streamFileFromBlocks(c *gin.Context, token *AccessToken, filename string, periodStartedAt time.Time) error {
 	blockIDs, fileSize, fileKey, blockStore, err := h.lookupFileBlocks(token)
 	if err != nil {
 		return err
@@ -1551,7 +1559,7 @@ func (h *SeafHTTPHandler) streamFileFromBlocks(c *gin.Context, token *AccessToke
 		if token.Source == "link" {
 			tt = traffic.LinkDownload
 		}
-		rec.Record(token.OrgID, token.UserID, tt, fileSize)
+		rec.RecordWithPeriod(token.OrgID, token.UserID, tt, fileSize, periodStartedAt)
 	}
 
 	return nil
@@ -1711,12 +1719,16 @@ func (h *SeafHTTPHandler) HandleZipDownload(c *gin.Context) {
 	}
 
 	// Quota pre-check — reject early if traffic quota is already exhausted.
+	zipTrafficStatus := traffic.QuotaStatus{Allowed: true}
 	if checker := traffic.GetChecker(); checker != nil {
-		if st, _ := checker.CheckTrafficQuota(token.OrgID, token.UserID, "download", 0); !st.Allowed {
-			c.JSON(http.StatusForbidden, gin.H{"error": "traffic quota exceeded", "reason": st.Reason})
+		zipTrafficStatus, _ = traffic.CheckTrafficQuotaWithChecker(checker, token.OrgID, token.UserID, "download", 0)
+		if !zipTrafficStatus.Allowed {
+			c.JSON(http.StatusForbidden, traffic.TrafficQuotaExceededResponse(zipTrafficStatus, "traffic quota exceeded", true))
 			return
-		} else if st.Warning {
-			c.Header("X-Quota-Warning", st.Reason)
+		} else {
+			if warning, ok := traffic.TrafficQuotaWarningHeader(zipTrafficStatus); ok {
+				c.Header("X-Quota-Warning", warning)
+			}
 		}
 	}
 
@@ -1834,7 +1846,7 @@ func (h *SeafHTTPHandler) HandleZipDownload(c *gin.Context) {
 			if token.Source == "link" {
 				tt = traffic.LinkDownload
 			}
-			rec.Record(token.OrgID, token.UserID, tt, sent)
+			traffic.RecordCheckedTransfer(rec, zipTrafficStatus, token.OrgID, token.UserID, tt, sent)
 		}
 	}
 }

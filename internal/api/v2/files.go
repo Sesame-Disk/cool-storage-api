@@ -2664,6 +2664,7 @@ func (h *FileHandler) UploadFile(c *gin.Context) {
 	}
 
 	// Quota pre-check — evaluated before reading the body so we can fail fast.
+	uploadTrafficStatus := traffic.QuotaStatus{Allowed: true}
 	if checker := traffic.GetChecker(); checker != nil {
 		contentLength := c.Request.ContentLength
 		if contentLength < 0 {
@@ -2673,11 +2674,14 @@ func (h *FileHandler) UploadFile(c *gin.Context) {
 			c.JSON(http.StatusForbidden, gin.H{"error": "storage quota exceeded"})
 			return
 		}
-		if st, _ := checker.CheckTrafficQuota(orgID, userID, "upload", contentLength); !st.Allowed {
-			c.JSON(http.StatusForbidden, gin.H{"error": "traffic quota exceeded", "reason": st.Reason})
+		uploadTrafficStatus, _ = traffic.CheckTrafficQuotaWithChecker(checker, orgID, userID, "upload", contentLength)
+		if !uploadTrafficStatus.Allowed {
+			c.JSON(http.StatusForbidden, traffic.TrafficQuotaExceededResponse(uploadTrafficStatus, "traffic quota exceeded", true))
 			return
-		} else if st.Warning {
-			c.Header("X-Quota-Warning", st.Reason)
+		} else {
+			if warning, ok := traffic.TrafficQuotaWarningHeader(uploadTrafficStatus); ok {
+				c.Header("X-Quota-Warning", warning)
+			}
 		}
 	}
 
@@ -2743,7 +2747,7 @@ func (h *FileHandler) UploadFile(c *gin.Context) {
 
 	// Record upload traffic and storage — fire-and-forget.
 	if rec := traffic.Get(); rec != nil {
-		rec.Record(orgID, userID, traffic.WebUpload, int64(len(content)))
+		traffic.RecordCheckedTransfer(rec, uploadTrafficStatus, orgID, userID, traffic.WebUpload, int64(len(content)))
 	}
 	traffic.IncrementStorageCounters(h.db, orgID, userID, repoID, int64(len(content)), 1)
 
