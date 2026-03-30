@@ -38,16 +38,16 @@ npm run build
 docker build -t sesamefs-frontend .
 
 # Run container
-docker run -p 3000:80 -e SESAMEFS_API_URL=http://localhost:8080 sesamefs-frontend
+docker run -p 3000:80 sesamefs-frontend
 ```
 
 ## Configuration
 
-API URL is configured via `window.SESAMEFS_API_URL`:
+The desktop frontend now assumes same-origin routing:
 
-- **Default:** `http://localhost:8080` (set in `public/index.html`)
-- **Docker:** Set via `SESAMEFS_API_URL` environment variable
-- **Runtime:** Injected by `docker-entrypoint.sh`
+- **Production:** nginx routes `/`, `/sys/`, and `/org/` to the frontend container and proxies API/file routes to the Go backend on the same host.
+- **Development with `npm start`:** `src/setupProxy.js` proxies API/file routes to the backend, so same-origin requests still work.
+- **No desktop runtime API injection:** the old `SESAMEFS_API_URL` + `docker-entrypoint.sh` path is no longer used by the desktop frontend container.
 
 ## CSS & Styling
 

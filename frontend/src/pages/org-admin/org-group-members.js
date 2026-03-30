@@ -12,8 +12,6 @@ import MainPanelTopbar from './main-panel-topbar';
 
 import '../../css/org-admin-user.css';
 
-const { orgID } = window.org.pageOptions;
-
 class OrgGroupMembers extends Component {
 
   constructor(props) {
@@ -27,6 +25,7 @@ class OrgGroupMembers extends Component {
   }
 
   componentDidMount() {
+    const { orgID } = window.org.pageOptions;
     seafileAPI.orgAdminListGroupMembers(orgID, this.props.groupID).then((res) => {
       this.setState({
         loading: false,
@@ -41,6 +40,7 @@ class OrgGroupMembers extends Component {
   }
 
   updateMemberRole = (email, role) => {
+    const { orgID } = window.org.pageOptions;
     const isAdmin = role === 'Admin';
     seafileAPI.orgAdminSetGroupMemberRole(orgID, this.props.groupID, email, isAdmin).then(() => {
       const members = this.state.members.map(m => {

@@ -4,7 +4,7 @@ services:
       context: .
       dockerfile: Dockerfile
     ports:
-      - "${SESAMEFS_HOST_PORT:-3000}:${PORT:-8080}"
+      - "${SESAMEFS_HOST_PORT:-8080}:${PORT:-8080}"
     environment:
       - PORT=${PORT:-8080}
       - SERVER_URL=${SERVER_URL}
@@ -228,21 +228,18 @@ services:
     profiles:
       - test
 
-  # NOTE: nginx frontend service REMOVED (2026-02-12)
-  # The Go backend serves the SPA, static files, and API from a single port.
-  # See sesamefs-pending-issues.txt "ARCHITECTURE DISCUSSION" for rationale.
-  # To restore: uncomment and change sesamefs port back to 8082
-  # frontend:
-  #   build:
-  #     context: ./frontend
-  #     dockerfile: Dockerfile
-  #     args:
-  #       - SESAMEFS_API_URL=${SESAMEFS_API_URL:-}
-  #   ports:
-  #     - "${FRONTEND_HOST_PORT:-3000}:80"
-  #   depends_on:
-  #     - sesamefs
-  #   restart: unless-stopped
+  # Desktop Frontend (React SPA — nginx:alpine)
+  # Access at http://localhost:3000
+  # For hot-reload dev: run `npm start` in frontend/ instead (uses setupProxy.js).
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "${FRONTEND_HOST_PORT:-3000}:80"
+    depends_on:
+      - sesamefs
+    restart: unless-stopped
 
   # Seafile CLI for sync testing
   seafile-cli:

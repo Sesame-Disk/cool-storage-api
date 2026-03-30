@@ -12,8 +12,6 @@ import MainPanelTopbar from './main-panel-topbar';
 
 import '../../css/org-admin-user.css';
 
-const { orgID, orgName } = window.org.pageOptions;
-
 class OrgUserProfile extends Component {
 
   constructor(props) {
@@ -25,6 +23,7 @@ class OrgUserProfile extends Component {
   }
 
   componentDidMount() {
+    const { orgID } = window.org.pageOptions;
     const email = decodeURIComponent(this.props.email);
     seafileAPI.orgAdminGetOrgUserInfo(orgID, email).then((res) => {
       this.setState(Object.assign({
@@ -106,6 +105,7 @@ class Content extends Component {
   };
 
   render() {
+    const { orgID, orgName } = window.org.pageOptions;
     const {
       loading, errorMsg,
       avatar_url, email, contact_email,

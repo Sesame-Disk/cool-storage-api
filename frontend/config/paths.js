@@ -1,8 +1,5 @@
-'use strict';
-
 const path = require('path');
 const fs = require('fs');
-const getPublicUrlOrPath = require('react-dev-utils/getPublicUrlOrPath');
 
 // Make sure any symlinks in the project folder are resolved:
 // https://github.com/facebook/create-react-app/issues/637
@@ -21,13 +18,10 @@ const resolveApp = relativePath => path.resolve(appDirectory, relativePath);
 //   process.env.PUBLIC_URL
 // );
 
-// SesameFS standalone configuration
-const HOST = process.env.HOST || '0.0.0.0';
-const PORT = process.env.PORT || '3000';
-
-// For development, use localhost URL; for production, use relative paths
-const isProduction = process.env.NODE_ENV === 'production';
-const publicPath = process.env.PUBLIC_PATH || (isProduction ? '/' : `http://${HOST}:${PORT}/`);
+// Use relative paths in both development and production so nested SPA routes
+// resolve through webpack-dev-server history fallback instead of redirecting
+// to malformed absolute 0.0.0.0 URLs.
+const publicPath = process.env.PUBLIC_PATH || '/';
 const publicUrlOrPath = publicPath;
 
 // Build output directory
@@ -81,7 +75,5 @@ module.exports = {
   swSrc: resolveModule(resolveApp, 'src/service-worker'),
   publicUrlOrPath,
 };
-
-
 
 module.exports.moduleFileExtensions = moduleFileExtensions;

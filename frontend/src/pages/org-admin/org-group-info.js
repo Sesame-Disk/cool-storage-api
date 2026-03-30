@@ -10,8 +10,6 @@ import MainPanelTopbar from './main-panel-topbar';
 
 import '../../css/org-admin-user.css';
 
-const { orgID } = window.org.pageOptions;
-
 class OrgGroupInfo extends Component {
 
   constructor(props) {
@@ -23,6 +21,7 @@ class OrgGroupInfo extends Component {
   }
 
   componentDidMount() {
+    const { orgID } = window.org.pageOptions;
     seafileAPI.orgAdminGetGroup(orgID, this.props.groupID).then((res) => {
       this.setState(Object.assign({
         loading: false

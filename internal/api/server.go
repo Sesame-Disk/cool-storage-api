@@ -667,6 +667,10 @@ func (s *Server) setupRoutes() {
 		// OIDC auth endpoints (public - no auth required for login flow)
 		v2.RegisterAuthRoutes(apiV21, s.db, s.config, s.authRateLimiter.Limit())
 
+		// Bootstrap endpoint (public - returns user/org context for the SPA)
+		apiV21.GET("/bootstrap/", s.handleBootstrap)
+		apiV21.GET("/bootstrap", s.handleBootstrap)
+
 		// Protected endpoints
 		protected := apiV21.Group("")
 		protected.Use(s.authMiddleware())
@@ -885,159 +889,6 @@ func (s *Server) setupRoutes() {
 	syncHandler.SetTokenCreator(s.tokenStore) // Enable download-info endpoint
 	syncHandler.RegisterSyncRoutes(s.router, s.syncAuthMiddleware())
 
-	// Serve static files from frontend build with long-lived cache headers
-	staticGroup := s.router.Group("/static", func(c *gin.Context) {
-		c.Header("Cache-Control", "public, max-age=31536000, immutable")
-		c.Next()
-	})
-	staticGroup.Static("/", "./frontend/build/static")
-
-	s.router.Static("/media", "./frontend/public/media")
-
-	// Serve mobile frontend static assets (dev mode mobile UA detection)
-	mobileStaticGroup := s.router.Group("/mobile/static", func(c *gin.Context) {
-		c.Header("Cache-Control", "public, max-age=31536000, immutable")
-		c.Next()
-	})
-	mobileStaticGroup.Static("/", s.config.Server.MobileFrontendPath+"/static")
-
-	// Serve favicon (browsers request /favicon.ico and /favicon.png)
-	s.router.StaticFile("/favicon.png", "./frontend/build/favicon.png")
-	s.router.StaticFile("/favicon.ico", "./frontend/build/favicon.png")
-
-	// Org admin panel — server-side auth gate: only org admins or superadmins.
-	orgGroup := s.router.Group("/org")
-	orgGroup.Use(func(c *gin.Context) {
-		userID, orgID, role := s.resolveUserAuth(c)
-		if orgID == "" {
-			c.Redirect(http.StatusFound, "/accounts/login/?next="+url.QueryEscape(c.Request.URL.Path))
-			c.Abort()
-			return
-		}
-		// Always check the DB role — the session role may be stale
-		// (e.g. user promoted or demoted after login).
-		if s.db != nil {
-			var dbRole string
-			if err := s.db.Session().Query(
-				`SELECT role FROM users WHERE org_id = ? AND user_id = ?`, orgID, userID,
-			).Scan(&dbRole); err == nil {
-				role = dbRole
-			}
-		}
-		if !middleware.IsOrgStaff(role) {
-			s.serveAccessDenied(c, "Access Denied", "You do not have permission to access the Organization Administration panel.")
-			c.Abort()
-			return
-		}
-		c.Next()
-	})
-	orgGroup.GET("", s.serveOrgAdminPanel)
-	orgGroup.GET("/*path", s.serveOrgAdminPanel)
-
-	// SPA catch-all: serve appropriate HTML for non-API routes
-	// - /sys/* routes → sysadmin.html (admin panel, separate webpack entry)
-	// - everything else → index.html (main app)
-	s.router.NoRoute(func(c *gin.Context) {
-		// Don't serve HTML for API routes
-		if strings.HasPrefix(c.Request.URL.Path, "/api") ||
-			strings.HasPrefix(c.Request.URL.Path, "/seafhttp") ||
-			strings.HasPrefix(c.Request.URL.Path, "/onlyoffice") {
-			c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
-			return
-		}
-
-		// Resolve user email once for injection into whichever HTML we serve.
-		email := s.resolveUserEmail(c)
-
-		// Serve admin panel for /sys/* routes — gate by platform superadmin role.
-		if strings.HasPrefix(c.Request.URL.Path, "/sys/") || c.Request.URL.Path == "/sys" {
-			authUserID, authOrgID, authRole := s.resolveUserAuth(c)
-			if authOrgID == "" {
-				c.Redirect(http.StatusFound, "/accounts/login/?next="+url.QueryEscape(c.Request.URL.Path))
-				return
-			}
-			// Always check the DB role — the session role may be stale.
-			if s.db != nil {
-				var dbRole string
-				if err := s.db.Session().Query(
-					`SELECT role FROM users WHERE org_id = ? AND user_id = ?`, authOrgID, authUserID,
-				).Scan(&dbRole); err == nil {
-					authRole = dbRole
-				}
-			}
-			if !middleware.IsPlatformSuperAdmin(authOrgID, middleware.OrganizationRole(authRole)) {
-				s.serveAccessDenied(c, "Access Denied", "You do not have permission to access the System Administration panel.")
-				return
-			}
-			s.serveHTMLWithUser(c, "./frontend/build/sysadmin.html", email)
-			return
-		}
-
-		if c.Request.URL.Path == "/subscription" || c.Request.URL.Path == "/subscription/" {
-			if _, err := os.Stat("./frontend/build/subscription.html"); err == nil {
-				s.serveHTMLWithUser(c, "./frontend/build/subscription.html", email)
-			} else {
-				s.serveHTMLWithUser(c, "./frontend/build/index.html", email)
-			}
-			return
-		}
-		// Mobile UA detection: serve mobile frontend if available
-		viewMode := getViewMode(c.Request)
-
-		// Set cookie when overriding via query param
-		if c.Query("desktop") == "1" {
-			http.SetCookie(c.Writer, &http.Cookie{
-				Name:     "view_mode",
-				Value:    "desktop",
-				Path:     "/",
-				MaxAge:   86400 * 30, // 30 days
-				HttpOnly: true,
-				SameSite: http.SameSiteLaxMode,
-			})
-		} else if c.Query("mobile") == "1" {
-			http.SetCookie(c.Writer, &http.Cookie{
-				Name:     "view_mode",
-				Value:    "mobile",
-				Path:     "/",
-				MaxAge:   86400 * 30,
-				HttpOnly: true,
-				SameSite: http.SameSiteLaxMode,
-			})
-		}
-
-		serveMobile := false
-		if viewMode == "mobile" {
-			serveMobile = true
-		} else if viewMode == "desktop" {
-			serveMobile = false
-		} else if isMobileUA(c.Request.UserAgent()) {
-			serveMobile = true
-		}
-
-		if serveMobile {
-			mobilePath := s.config.Server.MobileFrontendPath + "/index.html"
-			if _, err := os.Stat(mobilePath); err == nil {
-				s.serveHTMLWithUser(c, mobilePath, email)
-				return
-			}
-			// Mobile frontend not built — fall back to desktop
-		}
-
-		s.serveHTMLWithUser(c, "./frontend/build/index.html", email)
-	})
-}
-
-// serveHTMLWithUser reads an HTML file, injects the user email placeholder, and serves it.
-func (s *Server) serveHTMLWithUser(c *gin.Context, filepath string, email string) {
-	content, err := os.ReadFile(filepath)
-	if err != nil {
-		c.File(filepath) // fallback to static serving
-		return
-	}
-	injected := injectUserEmail(string(content), email)
-	c.Header("Content-Type", "text/html; charset=utf-8")
-	c.Header("Cache-Control", "no-cache, no-store, must-revalidate")
-	c.String(http.StatusOK, injected)
 }
 
 func (s *Server) billingRedirectTarget(rawQuery string) (string, error) {
@@ -1083,57 +934,6 @@ func (s *Server) handleBillingRedirect(c *gin.Context) {
 	}
 
 	c.Redirect(http.StatusTemporaryRedirect, target)
-}
-
-// serveOrgAdminPanel serves the org admin SPA shell (orgadmin.html) with
-// the authenticated user's orgID and orgName injected into window.org.
-// The page is served to everyone; React handles auth for API calls.
-func (s *Server) serveOrgAdminPanel(c *gin.Context) {
-	orgID, orgName := s.resolveOrgForPanel(c)
-
-	content, err := os.ReadFile("./frontend/build/orgadmin.html")
-	if err != nil {
-		// orgadmin.html not built yet — redirect to index so the user isn't stuck
-		c.File("./frontend/build/index.html")
-		return
-	}
-
-	// Build the window.org config script and replace the placeholder.
-	// Values are JSON-encoded to prevent XSS via malicious org names.
-	orgScript := fmt.Sprintf(
-		"window.org = { pageOptions: { orgID: %s, orgName: %s, "+
-			"invitationLink: '', orgMemberQuotaEnabled: '', orgMembers: 0, "+
-			"orgMembersQuota: 0, hasUserAvailability: true, "+
-			"orgEnableAdminCustomLogo: 'False', orgEnableAdminCustomName: 'False', "+
-			"orgEnableAdminInviteUser: 'False', enableMultiADFS: 'False', "+
-			"enableSubscription: false } };",
-		jsonQuote(orgID), jsonQuote(orgName),
-	)
-	// The minifier removes the trailing semicolon, so search without it.
-	injected := strings.Replace(string(content), "window.org=window.__SESAME_ORG_PLACEHOLDER__", orgScript, 1)
-
-	// Also inject user email (same placeholder as index.html and sysadmin.html).
-	email := s.resolveUserEmail(c)
-	injected = injectUserEmail(injected, email)
-
-	c.Header("Content-Type", "text/html; charset=utf-8")
-	c.Header("Cache-Control", "no-cache, no-store, must-revalidate")
-	c.String(http.StatusOK, injected)
-}
-
-// serveAccessDenied renders the access_denied.html template with the given title and message.
-func (s *Server) serveAccessDenied(c *gin.Context, title, message string) {
-	html, err := templates.RenderString("access_denied.html", templates.AccessDeniedData{
-		Title:   title,
-		Message: message,
-	})
-	if err != nil {
-		c.String(http.StatusForbidden, "Access denied")
-		return
-	}
-	c.Header("Content-Type", "text/html; charset=utf-8")
-	c.Header("Cache-Control", "no-cache, no-store, must-revalidate")
-	c.String(http.StatusForbidden, html)
 }
 
 func extractRequestAuthToken(c *gin.Context) string {
@@ -1342,44 +1142,6 @@ func (s *Server) resolveUserAuth(c *gin.Context) (userID, orgID, role string) {
 	}
 
 	return
-}
-
-// userPlaceholder is the minified form of the placeholder in the HTML files.
-// The source has: window.app.pageOptions.username=window.__SESAME_USER_PLACEHOLDER__||"";
-// After build/minification the trailing semicolon may be stripped.
-const userPlaceholder = `window.app.pageOptions.username=window.__SESAME_USER_PLACEHOLDER__||""`
-
-// injectUserEmail replaces the user placeholder in HTML content with the actual email.
-func injectUserEmail(html string, email string) string {
-	replacement := fmt.Sprintf(`window.app.pageOptions.username=%s`, jsonQuote(email))
-	return strings.Replace(html, userPlaceholder, replacement, 1)
-}
-
-// isMobileUA returns true if the User-Agent string indicates a mobile device.
-func isMobileUA(userAgent string) bool {
-	ua := strings.ToLower(userAgent)
-	mobilePatterns := []string{"android", "iphone", "ipad", "ipod", "mobile", "tablet"}
-	for _, pattern := range mobilePatterns {
-		if strings.Contains(ua, pattern) {
-			return true
-		}
-	}
-	return false
-}
-
-// getViewMode checks query params and cookies for a forced view mode override.
-// Returns "desktop", "mobile", or "" (no override).
-func getViewMode(r *http.Request) string {
-	if r.URL.Query().Get("desktop") == "1" {
-		return "desktop"
-	}
-	if r.URL.Query().Get("mobile") == "1" {
-		return "mobile"
-	}
-	if cookie, err := r.Cookie("view_mode"); err == nil {
-		return cookie.Value
-	}
-	return ""
 }
 
 // enforceAccountStatus checks that the user and their org are active.

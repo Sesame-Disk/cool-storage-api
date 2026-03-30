@@ -1,5 +1,3 @@
-'use strict';
-
 const fs = require('fs');
 const evalSourceMapMiddleware = require('react-dev-utils/evalSourceMapMiddleware');
 const noopServiceWorkerMiddleware = require('react-dev-utils/noopServiceWorkerMiddleware');
@@ -97,6 +95,11 @@ module.exports = function (proxy, allowedHost) {
       // Paths with dots should still use the history fallback.
       // See https://github.com/facebook/create-react-app/issues/387.
       disableDotRule: true,
+      rewrites: [
+        { from: /^\/org(?:\/.*)?$/, to: '/orgadmin.html' },
+        { from: /^\/sys(?:\/.*)?$/, to: '/sysadmin.html' },
+        { from: /^\/subscription(?:\/.*)?$/, to: '/subscription.html' },
+      ],
       index: paths.publicUrlOrPath,
     },
     // `proxy` is run between `before` and `after` `webpack-dev-server` hooks

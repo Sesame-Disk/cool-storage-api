@@ -8,6 +8,7 @@ const appPageOptions = window.app?.pageOptions || {};
 const orgPageOptions = window.org?.pageOptions || {};
 const sysAdminPageOptions = window.sysadmin?.pageOptions || {};
 const adminPermissions = sysAdminPageOptions.admin_permissions || {};
+const parseTrue = (value) => value === true || value === 'True';
 
 export const dirPath = '/';
 export const gettext = window.gettext || ((message) => message);
@@ -51,7 +52,7 @@ export const groupImportMembersExtraMsg = appPageOptions.groupImportMembersExtra
 export const canGenerateShareLink = appPageOptions.canGenerateShareLink || false;
 export const canGenerateUploadLink = appPageOptions.canGenerateUploadLink || false;
 export const canSendShareLinkEmail = appPageOptions.canSendShareLinkEmail || false;
-export const canViewOrg = appPageOptions.canViewOrg === 'True';
+export const canViewOrg = parseTrue(appPageOptions.canViewOrg);
 export const fileAuditEnabled = appPageOptions.fileAuditEnabled || false;
 export const folderPermEnabled = appPageOptions.folderPermEnabled || false;
 export const enableResetEncryptedRepoPassword = appPageOptions.enableResetEncryptedRepoPassword === 'True';
@@ -142,19 +143,39 @@ export const useNewAPI = window.fileHistory ? window.fileHistory.pageOptions.use
 export const canDownload = window.fileHistory ? window.fileHistory.pageOptions.can_download_file : '';
 export const canCompare = window.fileHistory ? window.fileHistory.pageOptions.can_compare : '';
 
-// org admin
-export const orgID = orgPageOptions.orgID || '';
-export const orgName = orgPageOptions.orgName || '';
-export const invitationLink = orgPageOptions.invitationLink || '';
-export const orgMemberQuotaEnabled = orgPageOptions.orgMemberQuotaEnabled || '';
-export const orgMembers = orgPageOptions.orgMembers || 0;
-export const orgMembersQuota = orgPageOptions.orgMembersQuota || 0;
-export const hasUserAvailability = Object.prototype.hasOwnProperty.call(orgPageOptions, 'hasUserAvailability') ? orgPageOptions.hasUserAvailability : true;
-export const orgEnableAdminCustomLogo = orgPageOptions.orgEnableAdminCustomLogo === 'True';
-export const orgEnableAdminCustomName = orgPageOptions.orgEnableAdminCustomName === 'True';
-export const orgEnableAdminInviteUser = orgPageOptions.orgEnableAdminInviteUser === 'True';
-export const enableMultiADFS = orgPageOptions.enableMultiADFS === 'True';
-export const enableSubscription = orgPageOptions.enableSubscription || false;
+// org admin — exported as `let` so that _updateOrgContext() can update them
+// via ES module live bindings after the async bootstrap fetch resolves.
+// Do NOT change these back to `const`.
+export let orgID = orgPageOptions.orgID || '';
+export let orgName = orgPageOptions.orgName || '';
+export let invitationLink = orgPageOptions.invitationLink || '';
+export let orgMemberQuotaEnabled = orgPageOptions.orgMemberQuotaEnabled || '';
+export let orgMembers = orgPageOptions.orgMembers || 0;
+export let orgMembersQuota = orgPageOptions.orgMembersQuota || 0;
+export let hasUserAvailability = Object.prototype.hasOwnProperty.call(orgPageOptions, 'hasUserAvailability') ? orgPageOptions.hasUserAvailability : true;
+export let orgEnableAdminCustomLogo = orgPageOptions.orgEnableAdminCustomLogo === 'True';
+export let orgEnableAdminCustomName = orgPageOptions.orgEnableAdminCustomName === 'True';
+export let orgEnableAdminInviteUser = orgPageOptions.orgEnableAdminInviteUser === 'True';
+export let enableMultiADFS = orgPageOptions.enableMultiADFS === 'True';
+export let enableSubscription = orgPageOptions.enableSubscription || false;
+
+// Called by the org-admin entry point (index.js) after the bootstrap fetch resolves.
+// Updates the live bindings so all importers see the correct org context.
+export function _updateOrgContext(pageOptions) {
+  if (!pageOptions) return;
+  if (pageOptions.orgID !== undefined) orgID = pageOptions.orgID;
+  if (pageOptions.orgName !== undefined) orgName = pageOptions.orgName;
+  if (pageOptions.invitationLink !== undefined) invitationLink = pageOptions.invitationLink;
+  if (pageOptions.orgMemberQuotaEnabled !== undefined) orgMemberQuotaEnabled = pageOptions.orgMemberQuotaEnabled;
+  if (pageOptions.orgMembers !== undefined) orgMembers = pageOptions.orgMembers;
+  if (pageOptions.orgMembersQuota !== undefined) orgMembersQuota = pageOptions.orgMembersQuota;
+  if (Object.prototype.hasOwnProperty.call(pageOptions, 'hasUserAvailability')) hasUserAvailability = pageOptions.hasUserAvailability;
+  if (pageOptions.orgEnableAdminCustomLogo !== undefined) orgEnableAdminCustomLogo = pageOptions.orgEnableAdminCustomLogo === 'True';
+  if (pageOptions.orgEnableAdminCustomName !== undefined) orgEnableAdminCustomName = pageOptions.orgEnableAdminCustomName === 'True';
+  if (pageOptions.orgEnableAdminInviteUser !== undefined) orgEnableAdminInviteUser = pageOptions.orgEnableAdminInviteUser === 'True';
+  if (pageOptions.enableMultiADFS !== undefined) enableMultiADFS = pageOptions.enableMultiADFS === 'True';
+  if (pageOptions.enableSubscription !== undefined) enableSubscription = pageOptions.enableSubscription || false;
+}
 
 // sys admin
 export const constanceEnabled = sysAdminPageOptions.constance_enabled || '';

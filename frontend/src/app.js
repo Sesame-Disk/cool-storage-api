@@ -137,8 +137,11 @@ class App extends Component {
       return; // Don't initialize app state for login page
     }
 
-    // Fetch user account info and update permissions
-    this.loadUserPermissions();
+    // Bootstrap is the primary source of truth for page options.
+    // Keep account/info only as a fallback if bootstrap did not hydrate the page.
+    if (window.app?.pageOptions?.bootstrapReady !== true) {
+      this.loadUserPermissions();
+    }
 
     // url from client  e.g. http://127.0.0.1:8000/#common/lib/34e7fb92-e91d-499d-bcde-c30ea8af9828/
     // navigate to library page http://127.0.0.1:8000/library/34e7fb92-e91d-499d-bcde-c30ea8af9828/

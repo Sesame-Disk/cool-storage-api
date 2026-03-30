@@ -137,7 +137,6 @@ frontend/
 │   └── paths.js            # Build paths
 ├── Dockerfile              # Multi-stage build
 ├── nginx.conf              # SPA routing config
-└── docker-entrypoint.sh    # Runtime config injection
 ```
 
 ---
@@ -179,22 +178,18 @@ docker-compose up -d frontend
 
 ### Environment Configuration
 
-The API URL can be configured:
+The desktop frontend now uses same-origin routing:
 
-1. **Build-time** (Dockerfile ARG):
-   ```dockerfile
-   ARG SESAMEFS_API_URL=http://api.example.com
-   ```
+1. **Production**
+  - nginx proxies SPA routes to the frontend container and `/api`, `/api2`, `/seafhttp`, etc. to the Go backend
+  - the frontend sends requests to the current origin
 
-2. **Runtime** (docker-entrypoint.sh):
-   ```javascript
-   window.SESAMEFS_API_URL = 'https://api.production.com';
-   ```
+2. **Local development (`npm start`)**
+  - `src/setupProxy.js` proxies backend routes to the Go server
+  - the frontend still uses same-origin requests from the browser point of view
 
-3. **Default** (public/index.html):
-   ```javascript
-   window.SESAMEFS_API_URL = window.SESAMEFS_API_URL || 'http://localhost:8080';
-   ```
+3. **Build env**
+  - `frontend/.env` is only for build tuning (`NODE_MAX_MEMORY`, sourcemaps, parallel build)
 
 ---
 

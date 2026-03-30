@@ -18,13 +18,6 @@
   <div id="wrapper"></div>
   <div id="root"></div>
   <div id="modal-wrapper"></div>
-  <!-- Runtime API URL injection - set SESAMEFS_API_URL env var only for dev mode (different ports) -->
-  <!-- In production, leave unset to use window.location.origin automatically -->
-  <script>
-    // Only set if explicitly provided (e.g., via docker-entrypoint.sh or env var)
-    // When undefined/empty, seafile-api.js uses window.location.origin
-    window.SESAMEFS_API_URL = window.SESAMEFS_API_URL || '';
-  </script>
   <script>
     // SesameFS configuration - replaces Django template injection
     // These values are read by src/utils/constants.js
@@ -33,13 +26,11 @@
 
     window.app = {
       config: {
-        // Core URLs - Multi-host support: empty serviceURL uses window.location.origin
-        // This allows us.sesamefs.com, eu.sesamefs.com, etc. to all work automatically
-        // Override with SESAMEFS_API_URL env var for dev mode (frontend on different port)
+        // Core URLs - same-origin by default in both production and npm-start dev mode.
         siteRoot: '/',
         loginUrl: '/login/',
-        serviceURL: window.SESAMEFS_API_URL || '',  // Empty = use window.location.origin (see seafile-api.js)
-        fileServerRoot: (window.SESAMEFS_API_URL || window.location.origin) + '/seafhttp/',
+        serviceURL: '',
+        fileServerRoot: window.location.origin + '/seafhttp/',
         mediaUrl: '/static/',
 
         // Branding
@@ -64,97 +55,7 @@
         subscriptionDetailsUrl: '',
       },
 
-      pageOptions: {
-        // User info - populated after login
-        name: '',
-        username: '',
-        contactEmail: '',
-
-        // Permissions
-        canAddRepo: true,
-        canShareRepo: true,
-        canAddGroup: true,
-        canGenerateShareLink: true,
-        canGenerateUploadLink: true,
-        canSendShareLinkEmail: false,
-        canViewOrg: 'False',
-
-        // Features
-        fileAuditEnabled: false,
-        folderPermEnabled: false,
-        enableResetEncryptedRepoPassword: 'False',
-        isEmailConfigured: 'False',
-        trashReposExpireDays: 30,
-        seafileCollabServer: '',
-        groupImportMembersExtraMsg: '',
-
-        // Upload settings
-        enableUploadFolder: 'True',
-        enableResumableFileUpload: 'True',
-        resumableUploadFileBlockSize: 8 * 1024 * 1024, // 8MB
-        maxUploadFileSize: null, // null = unlimited (in MB, used by resumable.js as maxFileSize * 1000 * 1000)
-        maxNumberOfFilesForFileupload: 1000,
-
-        // Library settings
-        storages: [],
-        libraryTemplates: [],
-        enableRepoSnapshotLabel: false,
-        enableEncryptedLibrary: true,
-        enableRepoHistorySetting: true,
-        repoPasswordMinLength: 8,
-        canAddPublicRepo: false,
-        canPublishRepo: false,
-        canInvitePeople: false,
-        canLockUnlockFile: true,
-        showLogoutIcon: true,
-
-        // Share link settings
-        shareLinkForceUsePassword: false,
-        shareLinkPasswordMinLength: 8,
-        shareLinkPasswordStrengthLevel: 1,
-        shareLinkExpireDaysMin: 0,
-        shareLinkExpireDaysMax: 0,
-        shareLinkExpireDaysDefault: 0,
-        uploadLinkExpireDaysMin: 0,
-        uploadLinkExpireDaysMax: 0,
-        uploadLinkExpireDaysDefault: 0,
-
-        // UI settings
-        maxFileName: 255,
-        thumbnailSizeForOriginal: 1024,
-        customNavItems: [],
-        sideNavFooterCustomHtml: '',
-        aboutDialogCustomHtml: '',
-        enableShowContactEmailWhenSearchUser: false,
-        enableShowLoginIDWhenSearchUser: false,
-        isSystemStaff: false,
-
-        // Integrations
-        enableVideoThumbnail: false,
-        enableOnlyoffice: true,
-        onlyofficeConverterExtensions: ['doc', 'xls', 'ppt', 'odt', 'ods', 'odp'],
-        enableSeafileAI: false,
-        enableSSOToThirdpartWebsite: false,
-        enableTC: false,
-        enableSeaTableIntegration: false,
-        canSetExProps: false,
-
-        // Subscription (Pro features)
-        enableSubscription: false,
-        additionalShareDialogNote: {},
-        additionalAppBottomLinks: [],
-        additionalAboutDialogLinks: [],
-        enableShareToDepartment: false,
-        enableSysAdminViewRepo: false,
-        enableOCM: false,
-        ocmRemoteServers: [],
-        enableOCMViaWebdav: false,
-        enableSeadoc: false,
-
-        // Notifications
-        curNoteMsg: '',
-        curNoteID: '',
-      }
+      pageOptions: {}
     };
 
     // Load runtime config if available (for Docker deployments)
@@ -162,9 +63,8 @@
       Object.assign(window.app.config, window.SESAMEFS_CONFIG);
     }
 
-    // User identity - Go backend replaces at request time.
-    // Fallback (||"") keeps username='' when served raw (e.g. webpack dev server).
-    window.app.pageOptions.username=window.__SESAME_USER_PLACEHOLDER__||"";
+    // Username is hydrated by the bootstrap endpoint before the app bundle loads.
+    window.app.pageOptions.username="";
   </script>
 </body>
 </html>

@@ -10,10 +10,23 @@
 # Rate limiting zone (http context — applies to all server blocks below)
 limit_req_zone $${binary_remote_addr} zone=api:10m rate=100r/s;
 
-# Mobile User-Agent detection
+# Mobile User-Agent detection — single authoritative location (Go no longer duplicates this)
 map $${http_user_agent} $${is_mobile} {
     default 0;
     ~*(?:Android|iPhone|iPad|iPod|Mobile|Opera\ Mini|IEMobile|WPDesktop) 1;
+}
+
+# Upstream definitions
+upstream sesamefs_api {
+    server sesamefs:8080;
+}
+
+upstream sesamefs_frontend {
+    server frontend:80;
+}
+
+upstream sesamefs_mobile {
+    server mobile-frontend:80;
 }
 
 # =============================================================================
@@ -65,17 +78,17 @@ server {
         return 403;
     }
 
-    # Mobile UA routing
-    set $${backend} http://sesamefs:8080;
-    if ($${is_mobile}) {
-        set $${backend} http://mobile-frontend:80;
-    }
-
-    # Main proxy — routes mobile UAs to mobile-frontend, desktop to sesamefs
-    location / {
+    # API routes → Go backend
+    # - api/api2/seafhttp: core API and file transfer
+    # - accounts/oauth/client-login/client-sso: auth flows (logout, OIDC, desktop client)
+    # - d/u: share links and upload links
+    # - lib/repo: file viewer and raw file serving
+    # - onlyoffice/office-convert: document editing
+    # - smart-link/billing/share: misc backend-rendered routes
+    location ~ ^/(api|api2|seafhttp|seafile|ping|health|ready|accounts|oauth|client-login|client-sso|d|u|lib|repo|onlyoffice|office-convert|smart-link|billing|share|saml2|org/custom)(/|$) {
         limit_req zone=api burst=200 nodelay;
 
-        proxy_pass $${backend};
+        proxy_pass http://sesamefs_api;
         proxy_http_version 1.1;
 
         proxy_set_header Host              $${host};
@@ -83,14 +96,36 @@ server {
         proxy_set_header X-Forwarded-For   $${proxy_add_x_forwarded_for};
         proxy_set_header X-Forwarded-Proto $${scheme};
 
-        # Critical: disable buffering for large uploads and streaming downloads
         proxy_request_buffering off;
         proxy_buffering         off;
 
-        # Long timeouts for large file transfers
         proxy_read_timeout    3600s;
         proxy_send_timeout    3600s;
         proxy_connect_timeout 30s;
+    }
+
+    # Everything else → frontend container (React SPA) or mobile-frontend
+    # Mobile UA routing lives here and only here.
+    location / {
+        limit_req zone=api burst=200 nodelay;
+
+        set $${frontend_upstream} http://sesamefs_frontend;
+        if ($${is_mobile}) {
+            set $${frontend_upstream} http://sesamefs_mobile;
+        }
+
+        proxy_pass $${frontend_upstream};
+        proxy_http_version 1.1;
+
+        proxy_set_header Host              $${host};
+        proxy_set_header X-Real-IP         $${remote_addr};
+        proxy_set_header X-Forwarded-For   $${proxy_add_x_forwarded_for};
+        proxy_set_header X-Forwarded-Proto $${scheme};
+
+        # No request/response buffering needed for static SPA assets
+        proxy_buffering         off;
+        proxy_connect_timeout   10s;
+        proxy_read_timeout      60s;
     }
 }
 

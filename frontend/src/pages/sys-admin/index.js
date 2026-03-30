@@ -295,7 +295,7 @@ class SysAdmin extends React.Component {
 }
 
 ReactDom.render(
-  <I18nextProvider value={i18n}>
+  <I18nextProvider i18n={i18n}>
     <SysAdmin />
   </I18nextProvider>,
   document.getElementById('wrapper')

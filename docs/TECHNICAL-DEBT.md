@@ -4,22 +4,21 @@ This document tracks known technical debt and provides actionable plans for addr
 
 ---
 
-## 1. Multi-Host ServiceURL — ✅ FIXED (2026-02-09)
+## 1. Multi-Host ServiceURL — ✅ FIXED (2026-02-09, simplified 2026-03-30)
 
 ### Status
 The frontend now uses `window.location.origin` by default for API calls, enabling multi-tenant deployments where different hostnames (us.sesamefs.com, eu.sesamefs.com) route to the same system.
 
 ### What Was Done
-- `frontend/public/index.html`: `serviceURL` set to `window.SESAMEFS_API_URL || ''` (empty by default)
+- `frontend/public/index.html`: `serviceURL` stays same-origin (`''`)
 - `frontend/src/utils/seafile-api.js`: Fallback `const server = serviceURL || window.location.origin` handles the empty case
-- `docker-compose.yaml`: `SESAMEFS_API_URL=` is empty for production builds
-- `docker-entrypoint.sh`: Only injects `SESAMEFS_API_URL` when explicitly set at container runtime
+- `frontend/src/setupProxy.js`: npm-start development proxies API/file routes to backend while preserving same-origin requests from the browser
 - No hardcoded `localhost` references remain in `frontend/src/`
 
 ### Result
 - `https://us.sesamefs.com` → API calls go to `https://us.sesamefs.com/api/...`
 - `https://eu.sesamefs.com` → API calls go to `https://eu.sesamefs.com/api/...`
-- Dev mode: Set `SESAMEFS_API_URL` env var or use nginx proxy (frontend port 3001 → backend port 8082)
+- Dev mode: `npm start` uses `setupProxy.js` so `/api...` stays same-origin from the browser point of view
 
 ---
 

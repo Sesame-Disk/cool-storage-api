@@ -1,30 +1,3 @@
-# Frontend build stage
-FROM node:22-bookworm AS frontend-builder
-
-WORKDIR /app
-
-COPY frontend/package*.json ./
-RUN npm ci --legacy-peer-deps
-
-COPY frontend/ .
-COPY frontend/.env* ./
-RUN if [ ! -f .env ]; then \
-    echo "NODE_MAX_MEMORY=4096" > .env && \
-    echo "GENERATE_SOURCEMAP=false" >> .env && \
-    echo "WEBPACK_PARALLEL_BUILD=true" >> .env && \
-    echo "SESAMEFS_API_URL=" >> .env; \
-    fi
-
-# Strip Windows CRLF from .env (file may come from Windows host)
-RUN sed -i 's/\r$//' .env
-RUN export $(cat .env | grep -v '^#' | xargs) && \
-    NODE_MAX_MEMORY=${NODE_MAX_MEMORY:-4096} && \
-    GENERATE_SOURCEMAP=${GENERATE_SOURCEMAP:-false} && \
-    WEBPACK_PARALLEL_BUILD=${WEBPACK_PARALLEL_BUILD:-false} && \
-    export GENERATE_SOURCEMAP && \
-    export WEBPACK_PARALLEL_BUILD && \
-    NODE_OPTIONS=--max_old_space_size=$NODE_MAX_MEMORY npm run build
-
 # Go build stage
 FROM --platform=$BUILDPLATFORM golang:1.25-trixie AS builder
 
@@ -67,9 +40,6 @@ COPY --from=builder /build/sesamefs .
 
 # Copy config files for development
 COPY --from=builder /build/config.docker.yaml ./config.yaml
-
-# Copy frontend build for serving static files (share link views, etc.)
-COPY --from=frontend-builder /app/build ./frontend/build
 
 # Use non-root user
 USER sesamefs

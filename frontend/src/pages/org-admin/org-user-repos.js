@@ -12,8 +12,6 @@ import MainPanelTopbar from './main-panel-topbar';
 
 import '../../css/org-admin-user.css';
 
-const { orgID } = window.org.pageOptions;
-
 class OrgUserOwnedRepos extends Component {
 
   constructor(props) {
@@ -25,6 +23,7 @@ class OrgUserOwnedRepos extends Component {
   }
 
   componentDidMount() {
+    const { orgID } = window.org.pageOptions;
     const email = decodeURIComponent(this.props.email);
     seafileAPI.orgAdminGetOrgUserOwnedRepos(orgID, email).then((res) => {
       this.setState(Object.assign({
@@ -133,6 +132,7 @@ class Item extends Component {
   };
 
   deleteRepo = () => {
+    const { orgID } = window.org.pageOptions;
     const repo = this.props.data;
     seafileAPI.orgAdminDeleteOrgRepo(orgID, repo.repo_id).then((res) => {
       this.setState({

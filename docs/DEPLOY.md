@@ -10,8 +10,9 @@ The same `docker-compose.prod.yml` supports both single-region and multi-region 
 ```
 Internet
    │
-   ├── 443 (HTTPS) ──► Nginx (Docker) ──► sesamefs:8080  (API + Frontend)
-   │                                  └──► onlyoffice:80  (Document editor)
+  ├── 443 (HTTPS) ──► Nginx (Docker) ──► frontend:80    (Desktop React SPA)
+  │                                  ├──► sesamefs:8080 (API backend)
+  │                                  └──► onlyoffice:80 (Document editor)
    │
    └── 80  (HTTP)  ──► Nginx (Docker) ──► 301 redirect to HTTPS
 
@@ -222,7 +223,7 @@ Cassandra (9042), OnlyOffice (8088), and sesamefs (8080) are bound to
 ```bash
 cd /opt/sesamefs
 
-# First deploy: builds the Docker image (frontend + Go binary).
+# First deploy: builds the backend image, desktop frontend image, and supporting services.
 # Takes ~5–10 minutes the first time.
 docker compose -f docker-compose.prod.yml up -d --build
 

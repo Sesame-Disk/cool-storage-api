@@ -13,7 +13,7 @@
 services:
 
   # ---------------------------------------------------------------------------
-  # SesameFS API + Frontend
+  # SesameFS API backend
   # ---------------------------------------------------------------------------
   sesamefs:
     build:
@@ -166,8 +166,27 @@ services:
   #     - /etc/letsencrypt:/etc/letsencrypt:ro
   #   depends_on:
   #     - sesamefs
+  #     - frontend
   #     - onlyoffice
   #   restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Desktop Frontend (React SPA — served by nginx:alpine)
+  # ---------------------------------------------------------------------------
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    expose:
+      - "80"                        # Reachable as frontend:80 on sfs-net
+    networks:
+      - sfs-net
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
 
   # ---------------------------------------------------------------------------
   # Mobile Frontend (Astro PWA)

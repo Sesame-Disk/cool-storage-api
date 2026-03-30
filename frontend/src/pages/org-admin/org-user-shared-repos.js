@@ -10,8 +10,6 @@ import MainPanelTopbar from './main-panel-topbar';
 
 import '../../css/org-admin-user.css';
 
-const { orgID } = window.org.pageOptions;
-
 class OrgUserSharedRepos extends Component {
 
   constructor(props) {
@@ -23,6 +21,7 @@ class OrgUserSharedRepos extends Component {
   }
 
   componentDidMount() {
+    const { orgID } = window.org.pageOptions;
     const email = decodeURIComponent(this.props.email);
     seafileAPI.orgAdminGetOrgUserBesharedRepos(orgID, email).then((res) => {
       this.setState(Object.assign({

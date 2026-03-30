@@ -18,11 +18,6 @@
   <div id="wrapper"></div>
   <div id="root"></div>
   <div id="modal-wrapper"></div>
-  <!-- Runtime API URL injection - set SESAMEFS_API_URL env var only for dev mode (different ports) -->
-  <!-- In production, leave unset to use window.location.origin automatically -->
-  <script>
-    window.SESAMEFS_API_URL = window.SESAMEFS_API_URL || '';
-  </script>
   <script>
     // SesameFS base configuration - read by src/utils/constants.js
     window.gettext = function(s) { return s; };
@@ -32,8 +27,8 @@
       config: {
         siteRoot: '/',
         loginUrl: '/login/',
-        serviceURL: window.SESAMEFS_API_URL || '',
-        fileServerRoot: (window.SESAMEFS_API_URL || window.location.origin) + '/seafhttp/',
+        serviceURL: '',
+        fileServerRoot: window.location.origin + '/seafhttp/',
         mediaUrl: '/static/',
 
         // Branding
@@ -59,28 +54,7 @@
         subscriptionDetailsUrl: '',
       },
 
-      pageOptions: {
-        name: '',
-        username: '',
-        contactEmail: '',
-        canAddRepo: true,
-        canShareRepo: true,
-        canAddGroup: true,
-        canGenerateShareLink: true,
-        canGenerateUploadLink: true,
-        canSendShareLinkEmail: false,
-        canViewOrg: 'True',
-        enableUploadFolder: 'True',
-        enableResumableFileUpload: 'True',
-        resumableUploadFileBlockSize: 8 * 1024 * 1024,
-        maxUploadFileSize: null,
-        maxNumberOfFilesForFileupload: 1000,
-        canLockUnlockFile: true,
-        showLogoutIcon: true,
-        maxFileName: 255,
-        enableOnlyoffice: true,
-        onlyofficeConverterExtensions: ['doc', 'xls', 'ppt', 'odt', 'ods', 'odp'],
-      }
+      pageOptions: {}
     };
 
     // Load runtime config if available (for Docker deployments)
@@ -88,12 +62,11 @@
       Object.assign(window.app.config, window.SESAMEFS_CONFIG);
     }
 
-    // User identity - Go backend replaces at request time.
-    window.app.pageOptions.username=window.__SESAME_USER_PLACEHOLDER__||"";
+    // Username is hydrated by the bootstrap endpoint before the org-admin bundle loads.
+    window.app.pageOptions.username="";
 
-    // Org-admin specific config (read by org-admin components via window.org)
-    // IMPORTANT: Go replaces the assignment below at request time.
-    window.org=window.__SESAME_ORG_PLACEHOLDER__;
+    // Org-admin page options are hydrated by the bootstrap entrypoint.
+    window.org = { pageOptions: {} };
   </script>
 </body>
 </html>

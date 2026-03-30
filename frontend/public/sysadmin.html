@@ -18,13 +18,6 @@
   <div id="wrapper"></div>
   <div id="root"></div>
   <div id="modal-wrapper"></div>
-  <!-- Runtime API URL injection - set SESAMEFS_API_URL env var only for dev mode (different ports) -->
-  <!-- In production, leave unset to use window.location.origin automatically -->
-  <script>
-    // Only set if explicitly provided (e.g., via docker-entrypoint.sh or env var)
-    // When undefined/empty, seafile-api.js uses window.location.origin
-    window.SESAMEFS_API_URL = window.SESAMEFS_API_URL || '';
-  </script>
   <script>
     // SesameFS configuration - replaces Django template injection
     // These values are read by src/utils/constants.js
@@ -35,8 +28,8 @@
       config: {
         siteRoot: '/',
         loginUrl: '/login/',
-        serviceURL: window.SESAMEFS_API_URL || '',
-        fileServerRoot: (window.SESAMEFS_API_URL || window.location.origin) + '/seafhttp/',
+        serviceURL: '',
+        fileServerRoot: window.location.origin + '/seafhttp/',
         mediaUrl: '/static/',
 
         // Branding
@@ -61,87 +54,7 @@
         subscriptionDetailsUrl: '',
       },
 
-      pageOptions: {
-        name: '',
-        username: '',
-        contactEmail: '',
-
-        // Admin-specific: this is what makes sys-admin pages work
-        isSystemStaff: true,
-        canAddRepo: true,
-        canShareRepo: true,
-        canAddGroup: true,
-        canGenerateShareLink: true,
-        canGenerateUploadLink: true,
-        canSendShareLinkEmail: false,
-        canViewOrg: 'True',
-
-        fileAuditEnabled: false,
-        folderPermEnabled: false,
-        enableResetEncryptedRepoPassword: 'False',
-        isEmailConfigured: 'False',
-        trashReposExpireDays: 30,
-        seafileCollabServer: '',
-
-        enableUploadFolder: 'True',
-        enableResumableFileUpload: 'True',
-        resumableUploadFileBlockSize: 8 * 1024 * 1024,
-        maxUploadFileSize: null,
-        maxNumberOfFilesForFileupload: 1000,
-
-        storages: [],
-        libraryTemplates: [],
-        enableRepoSnapshotLabel: false,
-        enableEncryptedLibrary: true,
-        enableRepoHistorySetting: true,
-        repoPasswordMinLength: 8,
-        canAddPublicRepo: false,
-        canPublishRepo: false,
-        canInvitePeople: false,
-        canLockUnlockFile: true,
-        showLogoutIcon: true,
-
-        shareLinkForceUsePassword: false,
-        shareLinkPasswordMinLength: 8,
-        shareLinkPasswordStrengthLevel: 1,
-        shareLinkExpireDaysMin: 0,
-        shareLinkExpireDaysMax: 0,
-        shareLinkExpireDaysDefault: 0,
-        uploadLinkExpireDaysMin: 0,
-        uploadLinkExpireDaysMax: 0,
-        uploadLinkExpireDaysDefault: 0,
-
-        maxFileName: 255,
-        thumbnailSizeForOriginal: 1024,
-        customNavItems: [],
-        sideNavFooterCustomHtml: '',
-        aboutDialogCustomHtml: '',
-        enableShowContactEmailWhenSearchUser: false,
-        enableShowLoginIDWhenSearchUser: false,
-
-        enableVideoThumbnail: false,
-        enableOnlyoffice: true,
-        onlyofficeConverterExtensions: ['doc', 'xls', 'ppt', 'odt', 'ods', 'odp'],
-        enableSeafileAI: false,
-        enableSSOToThirdpartWebsite: false,
-        enableTC: false,
-        enableSeaTableIntegration: false,
-        canSetExProps: false,
-
-        enableSubscription: false,
-        additionalShareDialogNote: {},
-        additionalAppBottomLinks: [],
-        additionalAboutDialogLinks: [],
-        enableShareToDepartment: false,
-        enableSysAdminViewRepo: true,
-        enableOCM: false,
-        ocmRemoteServers: [],
-        enableOCMViaWebdav: false,
-        enableSeadoc: false,
-
-        curNoteMsg: '',
-        curNoteID: '',
-      }
+      pageOptions: {}
     };
 
     // Load runtime config if available (for Docker deployments)
@@ -149,46 +62,14 @@
       Object.assign(window.app.config, window.SESAMEFS_CONFIG);
     }
 
-    // User identity - Go backend replaces at request time.
-    window.app.pageOptions.username=window.__SESAME_USER_PLACEHOLDER__||"";
+    // Username is hydrated by the bootstrap endpoint before the sys-admin bundle loads.
+    window.app.pageOptions.username="";
 
-    // Sys-admin specific config (read by sys-admin components via window.sysadmin)
-    window.sysadmin = {
-      pageOptions: {
-        // Feature flags
-        constance_enabled: false,
-        multi_tenancy: true,
-        multi_institution: false,
-        sysadmin_extra_enabled: false,
-        enable_guest_invitation: false,
-        enable_terms_and_conditions: false,
-        is_default_admin: true,
-        enable_file_scan: false,
-        enable_work_weixin: false,
-        enable_dingtalk: false,
-        enableSysAdminViewRepo: true,
-        haveLDAP: false,
-        enable_share_link_report_abuse: false,
-        twoFactorAuthEnabled: false,
-        trashReposExpireDays: 30,
-        availableRoles: ['default', 'user', 'admin', 'guest', 'readonly'],
-        availableAdminRoles: ['superadmin'],
-        institutions: [],
+    // Defensive initialization in case a shared module touches org globals early.
+    window.org = { pageOptions: {} };
 
-        // Admin permissions (superadmin has all)
-        admin_permissions: {
-          can_view_system_info: true,
-          can_view_statistic: true,
-          can_config_system: true,
-          can_manage_library: true,
-          can_manage_user: true,
-          can_manage_group: true,
-          can_view_user_log: true,
-          can_view_admin_log: true,
-          other_permission: true,
-        }
-      }
-    };
+    // Sys-admin page options are hydrated by the bootstrap entrypoint.
+    window.sysadmin = { pageOptions: {} };
   </script>
 </body>
 </html>

@@ -12,8 +12,6 @@ import MainPanelTopbar from './main-panel-topbar';
 
 import '../../css/org-admin-user.css';
 
-const { orgID } = window.org.pageOptions;
-
 class OrgGroupRepos extends Component {
 
   constructor(props) {
@@ -25,6 +23,7 @@ class OrgGroupRepos extends Component {
   }
 
   componentDidMount() {
+    const { orgID } = window.org.pageOptions;
     seafileAPI.orgAdminListGroupRepos(orgID, this.props.groupID).then((res) => {
       this.setState(Object.assign({
         loading: false
@@ -137,6 +136,7 @@ class Item extends Component {
   };
 
   deleteRepo = () => {
+    const { orgID } = window.org.pageOptions;
     const repo = this.props.data;
     seafileAPI.orgAdminDeleteOrgRepo(orgID, repo.repo_id).then((res) => {
       this.setState({
