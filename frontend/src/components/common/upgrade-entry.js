@@ -1,6 +1,6 @@
 /* eslint-disable */
 import React from 'react';
-import { gettext, siteRoot } from '../../utils/constants';
+import { billingUrl, gettext, siteRoot } from '../../utils/constants';
 import { getUpgradeState } from '../../utils/upgrade-state';
 import ChatLauncher from '../../services/chat';
 
@@ -13,7 +13,6 @@ export default function UpgradeEntry({ inSidebar, isOrgStaff }) {
         overQuota,
     } = getUpgradeState();
 
-    const billingUrl = `${siteRoot}billing/`;
     const orgInfoUrl = `${siteRoot}org/info/`;
     const highlightClassName = `item ${inSidebar ? 'highlighted-link highlighted-link-p-x' : 'highlight-item'}`;
 
@@ -23,6 +22,8 @@ export default function UpgradeEntry({ inSidebar, isOrgStaff }) {
                 href={billingUrl}
                 title={gettext('Upgrade your plan to unlock more collaboration features.')}
                 className={highlightClassName}
+                target="_blank"
+                rel="noopener noreferrer"
             >
                 <span className="sf2-icon-star" style={{ verticalAlign: 'middle' }} /> {gettext('Upgrade')}
             </a>
@@ -46,6 +47,8 @@ export default function UpgradeEntry({ inSidebar, isOrgStaff }) {
                 title={gettext('You have reached a quota limit. Open Billing to increase or adjust your plan.')}
                 className={`item highlighted-link${inSidebar ? ' highlighted-link-p-x' : ''}`}
                 style={{ color: '#b42318' }}
+                target="_blank"
+                rel="noopener noreferrer"
             >
                 {gettext('Billing')}
             </a>
@@ -55,7 +58,7 @@ export default function UpgradeEntry({ inSidebar, isOrgStaff }) {
 
     if (canUpgrade && isOrgOwner) {
         return <>
-            <a href={billingUrl} className="item">{gettext('Billing')}</a>
+            <a href={billingUrl} className="item" target="_blank" rel="noopener noreferrer">{gettext('Billing')}</a>
             <ChatLauncher linkClassName="item" showNewBadge={true} inSidebar={inSidebar} />
         </>;
     }

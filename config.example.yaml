@@ -119,6 +119,12 @@ auth:
     # session_ttl: 24h           # Web browser sessions (default: 24h)
     # api_token_ttl: 4320h       # Desktop/mobile sync client tokens (default: 180 days)
 
+billing:
+  # External billing portal URL. The frontend always links to /billing/ inside SesameFS;
+  # the backend validates auth and redirects to this external destination.
+  # In local Docker compose, BILLING_URL defaults to the Sesame test portal.
+  url: ""                           # Override with BILLING_URL env var
+
 chunking:
   algorithm: fastcdc
   hash_algorithm: sha256

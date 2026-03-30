@@ -2,8 +2,7 @@ import React from 'react';
 import PropTypes from 'prop-types';
 import { InputGroup, InputGroupAddon, InputGroupText } from 'reactstrap';
 import { gettext } from '../../../utils/constants';
-
-const MB = 1000 * 1000;
+import { parseGigabytesInput, quotaBytesToGigabyteInput } from '../../../utils/quota-units';
 
 const propTypes = {
     storageQuota: PropTypes.number,
@@ -14,21 +13,14 @@ const propTypes = {
     updateQuota: PropTypes.func.isRequired,
 };
 
-const quotaBytesToInputValue = (quota) => {
-    if (quota === undefined || quota === null) {
-        return '';
-    }
-    return String(Math.round(Math.max(quota, 0) / MB));
-};
-
 class SetOrgTrafficQuotasDialog extends React.Component {
     constructor(props) {
         super(props);
         this.state = {
-            storageInputValue: quotaBytesToInputValue(props.storageQuota),
-            trafficInputValue: quotaBytesToInputValue(props.trafficQuota),
-            uploadInputValue: quotaBytesToInputValue(props.trafficUploadQuota),
-            downloadInputValue: quotaBytesToInputValue(props.trafficDownloadQuota),
+            storageInputValue: quotaBytesToGigabyteInput(props.storageQuota),
+            trafficInputValue: quotaBytesToGigabyteInput(props.trafficQuota),
+            uploadInputValue: quotaBytesToGigabyteInput(props.trafficUploadQuota),
+            downloadInputValue: quotaBytesToGigabyteInput(props.trafficDownloadQuota),
             formErrorMsg: '',
             submitBtnDisabled: false,
         };
@@ -41,20 +33,6 @@ class SetOrgTrafficQuotasDialog extends React.Component {
         });
     };
 
-    parseMegabytes = (value) => {
-        const trimmed = `${value || ''}`.trim();
-        if (trimmed === '') {
-            return null;
-        }
-
-        const parsed = Number(trimmed);
-        if (!Number.isFinite(parsed) || parsed < 0) {
-            return null;
-        }
-
-        return Math.round(parsed * MB);
-    };
-
     renderField(label, value, fieldName, tip) {
         return (
             <React.Fragment>
@@ -62,7 +40,7 @@ class SetOrgTrafficQuotasDialog extends React.Component {
                 <InputGroup>
                     <input type="text" className="form-control" value={value} onChange={this.handleInputChange(fieldName)} />
                     <InputGroupAddon addonType="append">
-                        <InputGroupText>MB</InputGroupText>
+                        <InputGroupText>GB</InputGroupText>
                     </InputGroupAddon>
                 </InputGroup>
                 <p className="small text-secondary mt-2 mb-3">{tip}</p>
@@ -71,10 +49,10 @@ class SetOrgTrafficQuotasDialog extends React.Component {
     }
 
     formSubmit = () => {
-        const storageQuota = this.parseMegabytes(this.state.storageInputValue);
-        const trafficQuota = this.parseMegabytes(this.state.trafficInputValue);
-        const trafficUploadQuota = this.parseMegabytes(this.state.uploadInputValue);
-        const trafficDownloadQuota = this.parseMegabytes(this.state.downloadInputValue);
+        const storageQuota = parseGigabytesInput(this.state.storageInputValue, null);
+        const trafficQuota = parseGigabytesInput(this.state.trafficInputValue, null);
+        const trafficUploadQuota = parseGigabytesInput(this.state.uploadInputValue, null);
+        const trafficDownloadQuota = parseGigabytesInput(this.state.downloadInputValue, null);
 
         if (storageQuota === null || trafficQuota === null || trafficUploadQuota === null || trafficDownloadQuota === null) {
             this.setState({ formErrorMsg: gettext('Please enter a valid non-negative number.') });

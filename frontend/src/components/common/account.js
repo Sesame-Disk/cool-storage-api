@@ -78,6 +78,12 @@ class Account extends Component {
     e.preventDefault();
     if (this.isFirstMounted) {
       seafileAPI.getAccountInfo().then(resp => {
+        const storage = resp.data.storage || {};
+        const storageQuota = typeof storage.quota === 'number' ? storage.quota : resp.data.total;
+        const storageUsed = typeof storage.used === 'number' ? storage.used : resp.data.usage;
+        const storagePercent = typeof storage.percent === 'number'
+          ? `${Math.min(storage.percent, 100)}%`
+          : resp.data.space_usage;
         const uploadQuota = resp.data.traffic_upload_quota;
         const uploadUsed = resp.data.traffic_upload_used || 0;
         const downloadQuota = resp.data.traffic_download_quota;
@@ -85,9 +91,9 @@ class Account extends Component {
         this.setState({
           userName: resp.data.name,
           contactEmail: resp.data.email,
-          usageRate: resp.data.space_usage,
-          quotaUsage: Utils.bytesToSize(resp.data.usage),
-          quotaTotal: resp.data.total === -2 ? 'Unlimited' : Utils.bytesToSize(resp.data.total),
+          usageRate: storagePercent,
+          quotaUsage: Utils.bytesToSize(storageUsed || 0),
+          quotaTotal: storageQuota > 0 ? Utils.bytesToSize(storageQuota) : gettext('Unlimited'),
           trafficUpload: `${Utils.bytesToSize(uploadUsed)} / ${uploadQuota > 0 ? Utils.bytesToSize(uploadQuota) : 'Unlimited'}`,
           trafficDownload: `${Utils.bytesToSize(downloadUsed)} / ${downloadQuota > 0 ? Utils.bytesToSize(downloadQuota) : 'Unlimited'}`,
           hasTrafficQuota: uploadQuota > 0 || downloadQuota > 0 || uploadUsed > 0 || downloadUsed > 0,

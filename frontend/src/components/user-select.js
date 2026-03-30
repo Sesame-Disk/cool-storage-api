@@ -15,6 +15,7 @@ const propTypes = {
   isMulti: PropTypes.bool.isRequired,
   className: PropTypes.string,
   value: PropTypes.oneOfType([PropTypes.string, PropTypes.array]),
+  isDisabled: PropTypes.bool,
   searchFunc: PropTypes.func, // optional: override default seafileAPI.searchUsers(query)
 };
 
@@ -47,9 +48,10 @@ class UserSelect extends React.Component {
           ? this.props.searchFunc(value)
           : seafileAPI.searchUsers(value);
         searchFn.then((res) => {
+          const users = res.data.users || res.data.user_list || [];
           this.options = [];
-          for (let i = 0 ; i < res.data.users.length; i++) {
-            const item = res.data.users[i];
+          for (let i = 0; i < users.length; i++) {
+            const item = users[i];
             let obj = {};
             obj.value = item.name;
             obj.email = item.email;
@@ -64,7 +66,7 @@ class UserSelect extends React.Component {
               </div>
             ) : (
               <React.Fragment>
-                <img src={item.avatar_url} className="select-module select-module-icon avatar" alt=""/>
+                <img src={item.avatar_url} className="select-module select-module-icon avatar" alt="" />
                 <span className='select-module select-module-name'>{item.name}</span>
               </React.Fragment>
             );
@@ -103,6 +105,7 @@ class UserSelect extends React.Component {
         onInputChange={this.onInputChange}
         placeholder={this.props.placeholder}
         className={`user-select ${this.props.className}`}
+        isDisabled={this.props.isDisabled}
         value={this.props.value}
         ref="userSelect"
         styles={UserSelectStyle}

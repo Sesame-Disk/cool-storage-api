@@ -384,7 +384,7 @@ func (h *AdminHandler) CreateOrganization(c *gin.Context) {
 		return
 	}
 	if storageQuota <= 0 {
-		storageQuota = 1099511627776 // 1 TB default
+		storageQuota = 2147483648 // 2 GB free-tier default
 	}
 	if h.db == nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "database not available"})
@@ -451,7 +451,7 @@ func (h *AdminHandler) CreateOrganization(c *gin.Context) {
 			INSERT INTO users (org_id, user_id, email, name, role, status, quota_bytes, used_bytes, created_at)
 			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 		`, orgID.String(), ownerUserID.String(), ownerEmail, ownerName, "owner", StatusActive,
-			int64(107374182400), int64(0), now)
+			storageQuota, int64(0), now)
 
 		batch.Query(`
 			INSERT INTO users_by_email (email, user_id, org_id)

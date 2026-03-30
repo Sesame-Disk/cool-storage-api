@@ -8,6 +8,7 @@ services:
     environment:
       - PORT=${PORT:-8080}
       - SERVER_URL=${SERVER_URL}
+      - BILLING_URL=${BILLING_URL:-https://t-accounts.sesamedisk.com/billing/}
       - CASSANDRA_HOSTS=${CASSANDRA_HOSTS:-cassandra:9042}
       - CASSANDRA_KEYSPACE=${CASSANDRA_KEYSPACE:-sesamefs}
       - CASSANDRA_LOCAL_DC=${CASSANDRA_LOCAL_DC:-datacenter1}

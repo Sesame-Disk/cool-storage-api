@@ -796,6 +796,10 @@ func (s *Server) setupRoutes() {
 	s.router.GET("/smart-link/:token", s.smartLinkAuthMiddleware(), smartLinkHandler.ResolveSmartLink)
 	s.router.GET("/smart-link/:token/", s.smartLinkAuthMiddleware(), smartLinkHandler.ResolveSmartLink)
 
+	// Billing portal redirect.
+	s.router.GET("/billing", s.handleBillingRedirect)
+	s.router.GET("/billing/", s.handleBillingRedirect)
+
 	// Public share link view (no auth middleware - validated by share link token)
 	slv := v2.NewShareLinkViewHandler(s.db, s.config, s.storage, s.storageManager, s.tokenStore, serverURL)
 	s.router.GET("/d/:token", slv.ServeShareLinkPage)
@@ -1034,6 +1038,51 @@ func (s *Server) serveHTMLWithUser(c *gin.Context, filepath string, email string
 	c.Header("Content-Type", "text/html; charset=utf-8")
 	c.Header("Cache-Control", "no-cache, no-store, must-revalidate")
 	c.String(http.StatusOK, injected)
+}
+
+func (s *Server) billingRedirectTarget(rawQuery string) (string, error) {
+	portalURL := strings.TrimSpace(s.config.Billing.URL)
+	if portalURL == "" {
+		return "", fmt.Errorf("billing portal is not configured")
+	}
+
+	target, err := url.Parse(portalURL)
+	if err != nil {
+		return "", err
+	}
+
+	if rawQuery == "" {
+		return target.String(), nil
+	}
+
+	queryValues, err := url.ParseQuery(rawQuery)
+	if err != nil {
+		return "", err
+	}
+
+	merged := target.Query()
+	for key, values := range queryValues {
+		for _, value := range values {
+			merged.Add(key, value)
+		}
+	}
+	target.RawQuery = merged.Encode()
+	return target.String(), nil
+}
+
+func (s *Server) handleBillingRedirect(c *gin.Context) {
+	if _, orgID, _ := s.resolveUserAuth(c); orgID == "" {
+		c.Redirect(http.StatusFound, "/accounts/login/?next="+url.QueryEscape(c.Request.URL.RequestURI()))
+		return
+	}
+
+	target, err := s.billingRedirectTarget(c.Request.URL.RawQuery)
+	if err != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.Redirect(http.StatusTemporaryRedirect, target)
 }
 
 // serveOrgAdminPanel serves the org admin SPA shell (orgadmin.html) with
@@ -1957,14 +2006,15 @@ func (s *Server) handleAccountInfo(c *gin.Context) {
 	// Fetch org data: plan, quotas, enforcement profile, period.
 	var orgPlan, billingCycle, quotaPolicy string
 	var storageQuota, trafficQuota, trafficUploadQuota, trafficDownloadQuota int64
+	var maxUsers int
 	var currentPeriodStartedAt, currentPeriodEndsAt *time.Time
 	_ = s.db.Session().Query(`
 		SELECT plan, billing_cycle, quota_policy, storage_quota,
-		       traffic_quota, traffic_upload_quota, traffic_download_quota,
+		       traffic_quota, traffic_upload_quota, traffic_download_quota, max_users,
 		       current_period_started_at, current_period_ends_at
 		FROM organizations WHERE org_id = ?
 	`, orgUUID).Scan(&orgPlan, &billingCycle, &quotaPolicy, &storageQuota,
-		&trafficQuota, &trafficUploadQuota, &trafficDownloadQuota,
+		&trafficQuota, &trafficUploadQuota, &trafficDownloadQuota, &maxUsers,
 		&currentPeriodStartedAt, &currentPeriodEndsAt)
 
 	// Read live storage usage (user-level for legacy, org-level for new storage object).
@@ -1977,6 +2027,9 @@ func (s *Server) handleAccountInfo(c *gin.Context) {
 	// Query current period traffic usage.
 	userTrafficUsage := traffic.ReadUserPeriodUsage(s.db, orgID, userID, periodStartedAt)
 	orgTrafficUsage := traffic.ReadOrgPeriodUsage(s.db, orgID, periodStartedAt)
+
+	var currentUsers int
+	_ = s.db.Session().Query(`SELECT COUNT(*) FROM users WHERE org_id = ?`, orgUUID).Scan(&currentUsers)
 
 	// Use email username as display name if name is empty.
 	if name == "" {
@@ -2054,6 +2107,8 @@ func (s *Server) handleAccountInfo(c *gin.Context) {
 		"is_org_owner":              isOrgOwner,
 		"can_upgrade":               canUpgrade,
 		"billing_cycle":             billingCycle,
+		"max_users":                 maxUsers,
+		"current_users":             currentUsers,
 		"current_period_started_at": currentPeriodStartedAt,
 		"current_period_ends_at":    currentPeriodEndsAt,
 

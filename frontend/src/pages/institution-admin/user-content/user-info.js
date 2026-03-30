@@ -27,8 +27,7 @@ export default function UserInfo() {
 
   const updateQuota = useCallback((quote) => {
     instAdminAPI.setInstitutionUserQuote(user.email, quote).then(res => {
-      // convert value to mb
-      const newUser = {...user, quota_total: quote * 1000 * 1000};
+      const newUser = { ...user, quota_total: quote };
       setUser(newUser);
     });
   }, [user]);
@@ -43,7 +42,7 @@ export default function UserInfo() {
       <dl className="m-0">
         <dt className="info-item-heading">{gettext('Avatar')}</dt>
         <dd className="info-item-content">
-          <img src={user.avatar_url} alt={user.name} width="80" className="rounded"  />
+          <img src={user.avatar_url} alt={user.name} width="80" className="rounded" />
         </dd>
 
         <dt className="info-item-heading">{gettext('Email')}</dt>
@@ -65,7 +64,7 @@ export default function UserInfo() {
         </dd>
       </dl>
       {isShowEditDialog && (
-        <SetQuotaDialog updateQuota={updateQuota} toggle={toggleSetQuotaDialog}/>
+        <SetQuotaDialog updateQuota={updateQuota} toggle={toggleSetQuotaDialog} />
       )}
     </>
   );

@@ -11,7 +11,7 @@
 # Env var overrides (applied after this file is loaded):
 #   AUTH_DEV_MODE, AUTH_ALLOW_ANONYMOUS, OIDC_*, ONLYOFFICE_*,
 #   CASSANDRA_*, S3_BUCKET, S3_REGION, S3_ENDPOINT,
-#   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
+#   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, BILLING_URL
 # =============================================================================
 
 server:
@@ -92,6 +92,14 @@ auth:
     require_pkce: true
     validate_audience: true
     allowed_clock_skew: 2m
+
+# =============================================================================
+# Billing Portal
+# Frontend links to /billing/ inside SesameFS; the backend redirects authenticated
+# users to this external billing portal. Set the real destination with BILLING_URL.
+# =============================================================================
+billing:
+  url: ""                      # Required in production via BILLING_URL
 
 # =============================================================================
 # Seafile HTTP (sync protocol token TTL)

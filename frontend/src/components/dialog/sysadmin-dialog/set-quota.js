@@ -2,6 +2,7 @@ import React from 'react';
 import PropTypes from 'prop-types';
 import { Button, Form, FormGroup, Input, InputGroup, InputGroupAddon, InputGroupText } from 'reactstrap';
 import { gettext } from '../../../utils/constants';
+import { parseGigabytesInput } from '../../../utils/quota-units';
 
 const propTypes = {
   toggle: PropTypes.func.isRequired,
@@ -38,7 +39,12 @@ class SetQuotaDialog extends React.Component {
   };
 
   handleSubmit = () => {
-    this.props.updateQuota(this.state.quota.trim());
+    const quotaBytes = parseGigabytesInput(this.state.quota.trim(), 0);
+    if (quotaBytes === null) {
+      return;
+    }
+
+    this.props.updateQuota(quotaBytes);
     this.toggle();
   };
 
@@ -66,7 +72,7 @@ class SetQuotaDialog extends React.Component {
                       onChange={this.handleQuotaChange}
                     />
                     <InputGroupAddon addonType="append">
-                      <InputGroupText>MB</InputGroupText>
+                      <InputGroupText>GB</InputGroupText>
                     </InputGroupAddon>
                   </InputGroup>
                   <p className="small text-secondary mt-2 mb-2">

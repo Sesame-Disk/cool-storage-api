@@ -12,20 +12,21 @@ import (
 
 // Config holds all configuration for SesameFS
 type Config struct {
-	Server              ServerConfig                   `yaml:"server"`
-	Database            DatabaseConfig                 `yaml:"database"`
-	Storage             StorageConfig                  `yaml:"storage"`
-	Auth                AuthConfig                     `yaml:"auth"`
-	Chunking            ChunkingConfig                 `yaml:"chunking"`
-	Versioning          VersioningConfig               `yaml:"versioning"`
-	GC                  GCConfig                       `yaml:"gc"`
-	SeafHTTP            SeafHTTPConfig                 `yaml:"seafhttp"`
-	CORS                CORSConfig                     `yaml:"cors"`
-	OnlyOffice          OnlyOfficeConfig               `yaml:"onlyoffice"`
-	Elasticsearch       ElasticsearchConfig            `yaml:"elasticsearch"`
-	Monitoring          MonitoringConfig               `yaml:"monitoring"`
-	FileView            FileViewConfig                 `yaml:"fileview"`
-	EnforcementProfiles map[string]EnforcementProfile  `yaml:"enforcement_profiles"`
+	Server              ServerConfig                  `yaml:"server"`
+	Database            DatabaseConfig                `yaml:"database"`
+	Storage             StorageConfig                 `yaml:"storage"`
+	Billing             BillingConfig                 `yaml:"billing"`
+	Auth                AuthConfig                    `yaml:"auth"`
+	Chunking            ChunkingConfig                `yaml:"chunking"`
+	Versioning          VersioningConfig              `yaml:"versioning"`
+	GC                  GCConfig                      `yaml:"gc"`
+	SeafHTTP            SeafHTTPConfig                `yaml:"seafhttp"`
+	CORS                CORSConfig                    `yaml:"cors"`
+	OnlyOffice          OnlyOfficeConfig              `yaml:"onlyoffice"`
+	Elasticsearch       ElasticsearchConfig           `yaml:"elasticsearch"`
+	Monitoring          MonitoringConfig              `yaml:"monitoring"`
+	FileView            FileViewConfig                `yaml:"fileview"`
+	EnforcementProfiles map[string]EnforcementProfile `yaml:"enforcement_profiles"`
 }
 
 // EnforcementProfile defines feature flags and numeric limits for a quota_policy.
@@ -37,19 +38,19 @@ type EnforcementProfile struct {
 
 // EnforcementFeatures are boolean feature flags per enforcement profile.
 type EnforcementFeatures struct {
-	CanAddRepo                      bool `yaml:"can_add_repo" json:"can_add_repo"`
-	CanShareRepo                    bool `yaml:"can_share_repo" json:"can_share_repo"`
-	CanAddGroup                     bool `yaml:"can_add_group" json:"can_add_group"`
-	CanGenerateShareLink            bool `yaml:"can_generate_share_link" json:"can_generate_share_link"`
-	CanGenerateUploadLink           bool `yaml:"can_generate_upload_link" json:"can_generate_upload_link"`
-	CanSendShareLinkMail            bool `yaml:"can_send_share_link_mail" json:"can_send_share_link_mail"`
-	CanInviteGuest                  bool `yaml:"can_invite_guest" json:"can_invite_guest"`
-	CanPublishRepo                  bool `yaml:"can_publish_repo" json:"can_publish_repo"`
-	CanUseGlobalAddressBook         bool `yaml:"can_use_global_address_book" json:"can_use_global_address_book"`
-	CanConnectWithDesktopClients    bool `yaml:"can_connect_with_desktop_clients" json:"can_connect_with_desktop_clients"`
-	CanConnectWithAndroidClients    bool `yaml:"can_connect_with_android_clients" json:"can_connect_with_android_clients"`
-	CanConnectWithIOSClients        bool `yaml:"can_connect_with_ios_clients" json:"can_connect_with_ios_clients"`
-	CanExportFilesViaMobileClient   bool `yaml:"can_export_files_via_mobile_client" json:"can_export_files_via_mobile_client"`
+	CanAddRepo                    bool `yaml:"can_add_repo" json:"can_add_repo"`
+	CanShareRepo                  bool `yaml:"can_share_repo" json:"can_share_repo"`
+	CanAddGroup                   bool `yaml:"can_add_group" json:"can_add_group"`
+	CanGenerateShareLink          bool `yaml:"can_generate_share_link" json:"can_generate_share_link"`
+	CanGenerateUploadLink         bool `yaml:"can_generate_upload_link" json:"can_generate_upload_link"`
+	CanSendShareLinkMail          bool `yaml:"can_send_share_link_mail" json:"can_send_share_link_mail"`
+	CanInviteGuest                bool `yaml:"can_invite_guest" json:"can_invite_guest"`
+	CanPublishRepo                bool `yaml:"can_publish_repo" json:"can_publish_repo"`
+	CanUseGlobalAddressBook       bool `yaml:"can_use_global_address_book" json:"can_use_global_address_book"`
+	CanConnectWithDesktopClients  bool `yaml:"can_connect_with_desktop_clients" json:"can_connect_with_desktop_clients"`
+	CanConnectWithAndroidClients  bool `yaml:"can_connect_with_android_clients" json:"can_connect_with_android_clients"`
+	CanConnectWithIOSClients      bool `yaml:"can_connect_with_ios_clients" json:"can_connect_with_ios_clients"`
+	CanExportFilesViaMobileClient bool `yaml:"can_export_files_via_mobile_client" json:"can_export_files_via_mobile_client"`
 }
 
 // EnforcementLimits are numeric limits per enforcement profile. -1 or 0 = unlimited.
@@ -137,6 +138,11 @@ type MonitoringConfig struct {
 	HealthTimeout  time.Duration `yaml:"health_timeout"`  // default: 3s
 }
 
+// BillingConfig holds external billing portal integration settings.
+type BillingConfig struct {
+	URL string `yaml:"url"`
+}
+
 // FileViewConfig holds file preview and streaming settings
 type FileViewConfig struct {
 	MaxPreviewBytes      int64 `yaml:"max_preview_bytes"`       // Maximum file size for general inline preview (default: 1GB)
@@ -178,12 +184,12 @@ type SeafHTTPConfig struct {
 
 // ServerConfig holds HTTP server settings
 type ServerConfig struct {
-	Port                string        `yaml:"port"`
-	ReadTimeout         time.Duration `yaml:"read_timeout"`
-	ReadHeaderTimeout   time.Duration `yaml:"read_header_timeout"`
-	WriteTimeout        time.Duration `yaml:"write_timeout"`
-	MaxUploadMB         int64         `yaml:"max_upload_mb"`
-	MobileFrontendPath  string        `yaml:"mobile_frontend_path"` // Path to mobile frontend dist (default: ./mobile-frontend/dist)
+	Port               string        `yaml:"port"`
+	ReadTimeout        time.Duration `yaml:"read_timeout"`
+	ReadHeaderTimeout  time.Duration `yaml:"read_header_timeout"`
+	WriteTimeout       time.Duration `yaml:"write_timeout"`
+	MaxUploadMB        int64         `yaml:"max_upload_mb"`
+	MobileFrontendPath string        `yaml:"mobile_frontend_path"` // Path to mobile frontend dist (default: ./mobile-frontend/dist)
 }
 
 // DatabaseConfig holds Cassandra connection settings
@@ -393,10 +399,10 @@ func Load() (*Config, error) {
 func DefaultConfig() *Config {
 	return &Config{
 		Server: ServerConfig{
-			Port:              ":8080",
-			ReadTimeout:       0,                // No full-body read timeout — large uploads can take minutes
-			ReadHeaderTimeout: 10 * time.Second, // Timeout for reading request headers only (Slowloris protection)
-			WriteTimeout:      0,                // No write timeout — large downloads/zips can take minutes
+			Port:               ":8080",
+			ReadTimeout:        0,                        // No full-body read timeout — large uploads can take minutes
+			ReadHeaderTimeout:  10 * time.Second,         // Timeout for reading request headers only (Slowloris protection)
+			WriteTimeout:       0,                        // No write timeout — large downloads/zips can take minutes
 			MaxUploadMB:        20480,                    // 20 GB
 			MobileFrontendPath: "./mobile-frontend/dist", // Mobile frontend build directory
 		},
@@ -416,6 +422,7 @@ func DefaultConfig() *Config {
 				},
 			},
 		},
+		Billing: BillingConfig{},
 		Auth: AuthConfig{
 			DevMode:          true,
 			ShareLinkHMACKey: "sesamefs-default-share-hmac-key-change-me",
@@ -558,6 +565,11 @@ func (c *Config) applyEnvOverrides() {
 			hot.Endpoint = v
 			c.Storage.Backends["hot"] = hot
 		}
+	}
+
+	// Billing
+	if v := os.Getenv("BILLING_URL"); v != "" {
+		c.Billing.URL = v
 	}
 
 	// Auth

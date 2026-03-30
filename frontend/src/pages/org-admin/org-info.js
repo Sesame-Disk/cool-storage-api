@@ -1,8 +1,11 @@
 import React, { Component, Fragment } from 'react';
+import { Button } from 'reactstrap';
 import { seafileAPI } from '../../utils/seafile-api';
-import { gettext, orgMemberQuotaEnabled, subscriptionDetailsUrl } from '../../utils/constants';
+import { gettext, isOrgOwner, orgID, orgMemberQuotaEnabled, subscriptionDetailsUrl, username } from '../../utils/constants';
 import { Utils } from '../../utils/utils';
 import MainPanelTopbar from './main-panel-topbar';
+import TransferOrgOwnershipDialog from '../../components/dialog/transfer-org-ownership-dialog';
+import toaster from '../../components/toast';
 
 class OrgInfo extends Component {
 
@@ -31,9 +34,34 @@ class OrgInfo extends Component {
       max_users: 0,
       member_quota: 0,
       member_usage: 0,
-      active_members: 0
+      active_members: 0,
+      isTransferOwnershipDialogOpen: false,
+      canTransferOwnership: isOrgOwner,
     };
   }
+
+  toggleTransferOwnershipDialog = () => {
+    this.setState({ isTransferOwnershipDialogOpen: !this.state.isTransferOwnershipDialogOpen });
+  };
+
+  searchOrgAdmins = (query) => {
+    return seafileAPI.orgAdminSearchUser(orgID, query, 1, 25, 'active').then((res) => {
+      const users = (res.data.user_list || []).filter((user) => user.is_org_staff);
+      return { data: { users } };
+    });
+  };
+
+  transferOwnership = (newOwnerEmail) => {
+    seafileAPI.orgAdminTransferOwnership(orgID, newOwnerEmail).then(() => {
+      this.setState({
+        isTransferOwnershipDialogOpen: false,
+        canTransferOwnership: false,
+      });
+      toaster.success(gettext('Organization ownership transferred successfully.'));
+    }).catch((error) => {
+      toaster.danger(Utils.getErrorMsg(error));
+    });
+  };
 
   componentDidMount() {
     seafileAPI.orgAdminGetOrgInfo().then(res => {
@@ -73,7 +101,7 @@ class OrgInfo extends Component {
   }
 
   render() {
-    const { loading, errorMsg } = this.state;
+    const { loading, errorMsg, canTransferOwnership, isTransferOwnershipDialogOpen } = this.state;
     if (loading) {
       return (
         <Fragment>
@@ -121,6 +149,13 @@ class OrgInfo extends Component {
               <h3 className="sf-heading">{gettext('Info')}</h3>
             </div>
             <div className="cur-view-content">
+              {canTransferOwnership && (
+                <div className="mb-3">
+                  <Button color="outline-primary" onClick={this.toggleTransferOwnershipDialog}>
+                    {gettext('Transfer ownership')}
+                  </Button>
+                </div>
+              )}
               <dl>
                 <strong>{this.state.org_name}</strong>
                 <dt>{gettext('Plan')}</dt>
@@ -168,6 +203,14 @@ class OrgInfo extends Component {
             </div>
           </div>
         </div>
+        {isTransferOwnershipDialogOpen && (
+          <TransferOrgOwnershipDialog
+            currentOwner={username}
+            searchFunc={this.searchOrgAdmins}
+            onSubmit={this.transferOwnership}
+            toggleDialog={this.toggleTransferOwnershipDialog}
+          />
+        )}
       </Fragment>
     );
   }

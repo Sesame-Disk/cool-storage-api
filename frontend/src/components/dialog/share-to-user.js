@@ -7,6 +7,8 @@ import { Utils } from '../../utils/utils';
 import toaster from '../toast';
 import UserSelect from '../user-select';
 import SharePermissionEditor from '../select-editor/share-permission-editor';
+import UpgradeCallout from '../common/upgrade-callout';
+import { getUpgradeState } from '../../utils/upgrade-state';
 import '../../css/invitations.css';
 
 import '../../css/share-to-user.css';
@@ -342,6 +344,9 @@ class ShareToUser extends React.Component {
 
   render() {
     let { sharedItems } = this.state;
+    const { isSingleMemberPlan } = getUpgradeState();
+    const canShareRepo = window.app.pageOptions.canShareRepo;
+    const sharingLocked = !canShareRepo && isSingleMemberPlan;
     const thead = (
       <thead>
         <tr>
@@ -353,6 +358,13 @@ class ShareToUser extends React.Component {
     );
     return (
       <Fragment>
+        {sharingLocked && (
+          <UpgradeCallout
+            title={gettext('Upgrade required to share with users')}
+            description={gettext('Your current plan only supports one member. Upgrade to invite teammates and share libraries or folders directly with them.')}
+            note={gettext('Internal links remain available, but direct collaboration requires more than one seat.')}
+          />
+        )}
         {!!this.props.repoEncrypted &&
           <div className="alert alert-warning mb-2" role="alert">
             <span className="sf2-icon-lock mr-1"></span>
@@ -370,6 +382,7 @@ class ShareToUser extends React.Component {
                   className="reviewer-select"
                   placeholder={gettext('Search users')}
                   onSelectChange={this.handleSelectChange}
+                  isDisabled={sharingLocked}
                 />
               </td>
               <td>
@@ -385,7 +398,7 @@ class ShareToUser extends React.Component {
                 />
               </td>
               <td>
-                <Button onClick={this.shareToUser}>{gettext('Submit')}</Button>
+                <Button onClick={this.shareToUser} disabled={sharingLocked}>{gettext('Submit')}</Button>
               </td>
             </tr>
             {this.state.errorMsg.length > 0 &&

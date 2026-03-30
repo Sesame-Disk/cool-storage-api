@@ -3,6 +3,7 @@ import PropTypes from 'prop-types';
 import { InputGroup, InputGroupAddon, InputGroupText } from 'reactstrap';
 import { gettext } from '../../utils/constants';
 import { seafileAPI } from '../../utils/seafile-api';
+import { parseGigabytesInput, quotaBytesToGigabyteInput } from '../../utils/quota-units';
 import { Utils } from '../../utils/utils';
 
 const propTypes = {
@@ -19,20 +20,14 @@ const propTypes = {
   toggleDialog: PropTypes.func.isRequired
 };
 
-const MB = 1000 * 1000;
-
-const quotaBytesToInputValue = (quota) => {
-  return quota > 0 ? String(Math.round(quota / MB)) : '';
-};
-
 class SetOrgUserQuota extends React.Component {
 
   constructor(props) {
     super(props);
     this.state = {
-      storageInputValue: quotaBytesToInputValue(this.props.quotaTotal),
-      uploadInputValue: quotaBytesToInputValue(this.props.trafficUploadQuota),
-      downloadInputValue: quotaBytesToInputValue(this.props.trafficDownloadQuota),
+      storageInputValue: quotaBytesToGigabyteInput(this.props.quotaTotal),
+      uploadInputValue: quotaBytesToGigabyteInput(this.props.trafficUploadQuota),
+      downloadInputValue: quotaBytesToGigabyteInput(this.props.trafficDownloadQuota),
       submitBtnDisabled: false
     };
   }
@@ -43,29 +38,15 @@ class SetOrgUserQuota extends React.Component {
     });
   };
 
-  parseMegabytes = (value, emptyValue) => {
-    const trimmed = `${value || ''}`.trim();
-    if (trimmed === '') {
-      return emptyValue;
-    }
-
-    const parsed = Number(trimmed);
-    if (!Number.isFinite(parsed) || parsed < 0) {
-      return null;
-    }
-
-    return Math.round(parsed * MB);
-  };
-
   exceedsOrgLimit = (valueBytes, orgLimitBytes) => {
     return orgLimitBytes > 0 && valueBytes > 0 && valueBytes > orgLimitBytes;
   };
 
   formSubmit = () => {
     const { orgID, email, orgStorageQuota, orgTrafficQuota, orgTrafficUploadQuota, orgTrafficDownloadQuota } = this.props;
-    const storageQuota = this.parseMegabytes(this.state.storageInputValue, 0);
-    const uploadQuota = this.parseMegabytes(this.state.uploadInputValue, -1);
-    const downloadQuota = this.parseMegabytes(this.state.downloadInputValue, -1);
+    const storageQuota = parseGigabytesInput(this.state.storageInputValue, 0);
+    const uploadQuota = parseGigabytesInput(this.state.uploadInputValue, -1);
+    const downloadQuota = parseGigabytesInput(this.state.downloadInputValue, -1);
 
     if (storageQuota === null || uploadQuota === null || downloadQuota === null) {
       this.setState({ formErrorMsg: gettext('Please enter a valid non-negative number.') });
@@ -150,7 +131,7 @@ class SetOrgUserQuota extends React.Component {
                 <InputGroup>
                   <input type="text" className="form-control" value={storageInputValue} onChange={this.handleInputChange('storageInputValue')} />
                   <InputGroupAddon addonType="append">
-                    <InputGroupText>MB</InputGroupText>
+                    <InputGroupText>GB</InputGroupText>
                   </InputGroupAddon>
                 </InputGroup>
                 <p className="small text-secondary mt-2 mb-3">
@@ -162,7 +143,7 @@ class SetOrgUserQuota extends React.Component {
                 <InputGroup>
                   <input type="text" className="form-control" value={uploadInputValue} onChange={this.handleInputChange('uploadInputValue')} />
                   <InputGroupAddon addonType="append">
-                    <InputGroupText>MB</InputGroupText>
+                    <InputGroupText>GB</InputGroupText>
                   </InputGroupAddon>
                 </InputGroup>
                 <p className="small text-secondary mt-2 mb-3">
@@ -175,7 +156,7 @@ class SetOrgUserQuota extends React.Component {
                 <InputGroup>
                   <input type="text" className="form-control" value={downloadInputValue} onChange={this.handleInputChange('downloadInputValue')} />
                   <InputGroupAddon addonType="append">
-                    <InputGroupText>MB</InputGroupText>
+                    <InputGroupText>GB</InputGroupText>
                   </InputGroupAddon>
                 </InputGroup>
                 <p className="small text-secondary mt-2 mb-2">

@@ -1,6 +1,6 @@
 /* eslint-disable */
 import React, { useState } from 'react';
-import { gettext, siteRoot } from '../utils/constants';
+import { billingUrl, gettext } from '../utils/constants';
 import { getUpgradeState } from '../utils/upgrade-state';
 
 /**
@@ -29,8 +29,6 @@ export default function QuotaBanner() {
 
   if (!storageOver && !trafficOver) return null;
 
-  const billingUrl = `${siteRoot}billing/`;
-
   return (
     <>
       {storageOver && (
@@ -39,7 +37,7 @@ export default function QuotaBanner() {
             {gettext('Storage quota exceeded. New uploads are blocked until space is freed or the plan is updated.')}
             {' '}
             {isOrgOwner
-              ? <a href={billingUrl}>{gettext('Manage Billing')}</a>
+              ? <a href={billingUrl} target="_blank" rel="noopener noreferrer">{gettext('Manage Billing')}</a>
               : gettext('Contact your organization owner to resolve it.')}
           </p>
           <button
@@ -57,7 +55,7 @@ export default function QuotaBanner() {
             {trafficResetDate ? ` ${gettext('Reset date:')} ${trafficResetDate}.` : ''}
             {' '}
             {isOrgOwner
-              ? <a href={billingUrl}>{gettext('Manage Billing')}</a>
+              ? <a href={billingUrl} target="_blank" rel="noopener noreferrer">{gettext('Manage Billing')}</a>
               : gettext('Contact your organization owner to resolve it.')}
           </p>
           <button

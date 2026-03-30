@@ -4,6 +4,8 @@ import MediaQuery from 'react-responsive';
 import CommonToolbar from './common-toolbar';
 import { Button } from 'reactstrap';
 import { gettext } from '../../utils/constants';
+import { getUpgradeState } from '../../utils/upgrade-state';
+import UpgradeCallout from '../common/upgrade-callout';
 
 const propTypes = {
   searchPlaceholder: PropTypes.string,
@@ -13,15 +15,11 @@ const propTypes = {
 };
 
 class GroupsToolbar extends React.Component {
-
-  constructor(props) {
-    super(props);
-  }
-
   render() {
     let { onShowSidePanel, onSearchedClick } = this.props;
     // Check permission dynamically (not from import, as it updates after API call)
     const userCanAddGroup = window.app.pageOptions.canAddGroup;
+    const { isSingleMemberPlan } = getUpgradeState();
     return (
       <div className="main-panel-north border-left-show">
         <div className="cur-view-toolbar">
@@ -39,7 +37,15 @@ class GroupsToolbar extends React.Component {
             </div>
           )}
         </div>
-        <CommonToolbar searchPlaceholder={this.props.searchPlaceholder} onSearchedClick={onSearchedClick}/>
+        {!userCanAddGroup && isSingleMemberPlan && (
+          <UpgradeCallout
+            title={gettext('Groups require a collaborative plan')}
+            description={gettext('Your current plan only supports one member. Upgrade to create groups and collaborate with other users.')}
+            ctaText={gettext('Upgrade Plan')}
+            className="mx-3 mt-3 mb-0"
+          />
+        )}
+        <CommonToolbar searchPlaceholder={this.props.searchPlaceholder} onSearchedClick={onSearchedClick} />
       </div>
     );
   }

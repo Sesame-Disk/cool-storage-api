@@ -178,9 +178,14 @@ curl http://localhost:3000/ping
 curl http://localhost:3000/api2/account/info/ \
   -H "Authorization: Token dev-token-admin"
 
+# Billing portal redirect (Docker dev defaults to the Sesame test billing URL)
+curl -I http://localhost:3000/billing/
+
 # Stop when done
 docker compose down
 ```
+
+`/billing/` is always an internal SesameFS route. The backend checks authentication and redirects to the external portal configured by `BILLING_URL`. In local Docker Compose, that env var defaults to `https://t-accounts.sesamedisk.com/billing/` for testing only.
 
 ### Local Development (Run Go outside Docker)
 

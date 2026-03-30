@@ -184,6 +184,9 @@ OIDC_JWT_SIGNING_KEY=<from step 0.3 — first openssl output>
 # Share link password cookies (REQUIRED in production)
 SHARE_LINK_HMAC_KEY=<from step 0.3 — third openssl output>
 
+# External billing portal used by /billing/
+BILLING_URL=https://accounts.yourdomain.com/billing/
+
 # OnlyOffice
 ONLYOFFICE_JWT_SECRET=<from step 0.3 — second openssl output>
 ```
@@ -191,6 +194,8 @@ ONLYOFFICE_JWT_SECRET=<from step 0.3 — second openssl output>
 > **Note:** `docker-compose.prod.yml` automatically computes `SERVER_URL`,
 > `OIDC_REDIRECT_URIS`, and `ONLYOFFICE_API_JS_URL` from `${DOMAIN}` and
 > `${OFFICE_DOMAIN}`. You don't need to set those manually.
+
+> `BILLING_URL` is different: it is the external billing portal destination. Users click SesameFS `/billing/`, and the backend redirects authenticated sessions to this external URL in a new tab.
 
 ---
 

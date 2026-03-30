@@ -1,7 +1,7 @@
 /* eslint-disable */
 import React, { useState, useEffect } from 'react';
 import { seafileAPI } from '../utils/seafile-api';
-import { gettext } from '../utils/constants';
+import { billingUrl, gettext } from '../utils/constants';
 import { Utils } from '../utils/utils';
 import toaster from '../components/toast';
 import PropTypes from 'prop-types';
@@ -91,7 +91,6 @@ export function InternalAd() {
 
     const [totalLinks, setTotalLinks] = useState(null);
     const [dismissed, setDismissed] = useState(false);
-    const upgradeLink = "/billing/"
     const upgradeState = getUpgradeState();
     const shareLinkExpireDaysMax = upgradeState.shareLinkExpireDaysMax || HARD_PLAN_LIMITS.shareLinkExpireDaysMax;
 
@@ -130,7 +129,7 @@ export function InternalAd() {
                     .replace('%(expireDays)s', shareLinkExpireDaysMax)}
             </p>
             <p>
-                <a href={upgradeLink} className='btn btn-sm btn-outline-primary'>{gettext('View Plans & Pricing')}</a>
+                <a href={billingUrl} className='btn btn-sm btn-outline-primary' target='_blank' rel='noopener noreferrer'>{gettext('View Plans & Pricing')}</a>
             </p>
         </div>
     )
@@ -144,7 +143,6 @@ export function InternalAd() {
 export const EvalProFunc = (fn, { manOrg = false, shareLinks = false, featureKey = null } = {}) => {
     if (featureKey ? !featureRequiresUpgrade(featureKey) : !hasUpgradeFeatures()) return fn
 
-    const upgradeLink = "/billing/"
     return () => {
         toaster.warning(gettext('Upgrade your plan to use this feature.'), {
             duration: 10,
@@ -189,7 +187,7 @@ export const EvalProFunc = (fn, { manOrg = false, shareLinks = false, featureKey
                             </p>
                         </div>
                     )}
-                    <a href={upgradeLink} className='btn btn-sm btn-outline-primary'>{gettext('View Plans & Pricing')}</a>
+                    <a href={billingUrl} className='btn btn-sm btn-outline-primary' target='_blank' rel='noopener noreferrer'>{gettext('View Plans & Pricing')}</a>
                 </div>
             ),
         })

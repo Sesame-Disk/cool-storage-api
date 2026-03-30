@@ -2,9 +2,8 @@ import React from 'react';
 import PropTypes from 'prop-types';
 import { InputGroup, InputGroupAddon, InputGroupText } from 'reactstrap';
 import { gettext } from '../../../utils/constants';
+import { parseGigabytesInput, quotaBytesToGigabyteInput } from '../../../utils/quota-units';
 import { Utils } from '../../../utils/utils';
-
-const MB = 1000 * 1000;
 
 const propTypes = {
     quotaTotal: PropTypes.number,
@@ -18,20 +17,13 @@ const propTypes = {
     updateQuota: PropTypes.func.isRequired,
 };
 
-const quotaBytesToInputValue = (quota) => {
-    if (quota === undefined || quota === null || quota <= 0) {
-        return '';
-    }
-    return String(Math.round(quota / MB));
-};
-
 class SetUserTrafficQuotasDialog extends React.Component {
     constructor(props) {
         super(props);
         this.state = {
-            storageInputValue: quotaBytesToInputValue(props.quotaTotal),
-            uploadInputValue: quotaBytesToInputValue(props.trafficUploadQuota),
-            downloadInputValue: quotaBytesToInputValue(props.trafficDownloadQuota),
+            storageInputValue: quotaBytesToGigabyteInput(props.quotaTotal),
+            uploadInputValue: quotaBytesToGigabyteInput(props.trafficUploadQuota),
+            downloadInputValue: quotaBytesToGigabyteInput(props.trafficDownloadQuota),
             formErrorMsg: '',
             submitBtnDisabled: false,
         };
@@ -42,20 +34,6 @@ class SetUserTrafficQuotasDialog extends React.Component {
             [field]: event.target.value,
             formErrorMsg: '',
         });
-    };
-
-    parseMegabytes = (value) => {
-        const trimmed = `${value || ''}`.trim();
-        if (trimmed === '') {
-            return 0;
-        }
-
-        const parsed = Number(trimmed);
-        if (!Number.isFinite(parsed) || parsed < 0) {
-            return null;
-        }
-
-        return Math.round(parsed * MB);
     };
 
     formatOrgLimit = (quota) => {
@@ -76,7 +54,7 @@ class SetUserTrafficQuotasDialog extends React.Component {
                 <InputGroup>
                     <input type="text" className="form-control" value={value} onChange={this.handleInputChange(fieldName)} />
                     <InputGroupAddon addonType="append">
-                        <InputGroupText>MB</InputGroupText>
+                        <InputGroupText>GB</InputGroupText>
                     </InputGroupAddon>
                 </InputGroup>
                 <p className="small text-secondary mt-2 mb-3">
@@ -90,9 +68,9 @@ class SetUserTrafficQuotasDialog extends React.Component {
 
     formSubmit = () => {
         const { orgStorageQuota, orgTrafficQuota, orgTrafficUploadQuota, orgTrafficDownloadQuota } = this.props;
-        const quotaTotal = this.parseMegabytes(this.state.storageInputValue);
-        const trafficUploadQuota = this.parseMegabytes(this.state.uploadInputValue);
-        const trafficDownloadQuota = this.parseMegabytes(this.state.downloadInputValue);
+        const quotaTotal = parseGigabytesInput(this.state.storageInputValue, 0);
+        const trafficUploadQuota = parseGigabytesInput(this.state.uploadInputValue, 0);
+        const trafficDownloadQuota = parseGigabytesInput(this.state.downloadInputValue, 0);
 
         if (quotaTotal === null || trafficUploadQuota === null || trafficDownloadQuota === null) {
             this.setState({ formErrorMsg: gettext('Please enter a valid non-negative number.') });

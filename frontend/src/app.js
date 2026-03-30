@@ -179,6 +179,8 @@ class App extends Component {
       window.app.pageOptions.isOrgOwner = data.is_org_owner === true;
       window.app.pageOptions.canUpgrade = data.can_upgrade === true;
       window.app.pageOptions.billingCycle = data.billing_cycle || '';
+      window.app.pageOptions.maxUsers = Number(data.max_users) || 0;
+      window.app.pageOptions.currentUsers = Number(data.current_users) || 0;
       window.app.pageOptions.currentPeriodStartedAt = data.current_period_started_at || null;
       window.app.pageOptions.currentPeriodEndsAt = data.current_period_ends_at || null;
       // upgradeFeatures: list of short feature names the user can unlock by upgrading

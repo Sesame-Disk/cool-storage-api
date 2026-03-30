@@ -147,6 +147,10 @@ auth:
       - profile
       - email
 
+billing:
+  # Docker/local testing billing portal. Frontend opens /billing/ and the backend redirects here.
+  url: "https://t-accounts.sesamedisk.com/billing/"
+
 chunking:
   algorithm: fastcdc
   min_size: 2097152                   # 2 MB (minimum for slow connections)

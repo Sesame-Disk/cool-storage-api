@@ -2,6 +2,7 @@ import React from 'react';
 import PropTypes from 'prop-types';
 import { Button, Input, InputGroupAddon, InputGroup } from 'reactstrap';
 import { gettext, orgID } from '../../utils/constants';
+import { BYTES_IN_GB } from '../../utils/quota-units';
 import { seafileAPI } from '../../utils/seafile-api';
 import { Utils } from '../../utils/utils';
 import toaster from '../toast';
@@ -27,7 +28,7 @@ class SetGroupQuotaDialog extends React.Component {
     let quota = this.state.quota;
     if ((quota.length && myReg.test(quota)) || quota === -2) {
       this.setState({ errMessage: '' });
-      let newQuota = this.state.quota === -2 ? this.state.quota : this.state.quota * 1000000;
+      let newQuota = this.state.quota === -2 ? this.state.quota : this.state.quota * BYTES_IN_GB;
       seafileAPI.orgAdminSetGroupQuota(orgID, this.props.groupID, newQuota).then((res) => {
         this.props.toggle();
         this.props.onDepartChanged();
@@ -72,7 +73,7 @@ class SetGroupQuotaDialog extends React.Component {
                   onChange={this.handleChange}
                   autoFocus={true}
                 />
-                <InputGroupAddon addonType="append">{'MB'}</InputGroupAddon>
+                <InputGroupAddon addonType="append">{'GB'}</InputGroupAddon>
               </InputGroup>
               <p className="tip">
                 <br /><span>{gettext('An integer that is greater than 0 or equal to -2.')}</span><br />

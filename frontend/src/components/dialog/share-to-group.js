@@ -7,6 +7,8 @@ import { Utils } from '../../utils/utils';
 import toaster from '../toast';
 import SharePermissionEditor from '../select-editor/share-permission-editor';
 import { SeahubSelect, NoGroupMessage } from '../common/select';
+import UpgradeCallout from '../common/upgrade-callout';
+import { getUpgradeState } from '../../utils/upgrade-state';
 
 class GroupItem extends React.Component {
 
@@ -318,6 +320,9 @@ class ShareToGroup extends React.Component {
   };
 
   render() {
+    const { isSingleMemberPlan } = getUpgradeState();
+    const canShareRepo = window.app.pageOptions.canShareRepo;
+    const sharingLocked = !canShareRepo && isSingleMemberPlan;
     const thead = (
       <thead>
         <tr>
@@ -329,6 +334,12 @@ class ShareToGroup extends React.Component {
     );
     return (
       <Fragment>
+        {sharingLocked && (
+          <UpgradeCallout
+            title={gettext('Upgrade required to share with groups')}
+            description={gettext('Group sharing is not available on a single-member plan. Upgrade to add members and share libraries with teams.')}
+          />
+        )}
         {!!this.props.repoEncrypted &&
           <div className="alert alert-warning mb-2" role="alert">
             <span className="sf2-icon-lock mr-1"></span>
@@ -347,6 +358,7 @@ class ShareToGroup extends React.Component {
                   maxMenuHeight={200}
                   value={this.state.selectedOption}
                   components={{ NoOptionsMessage: NoGroupMessage }}
+                  isDisabled={sharingLocked}
                 />
               </td>
               <td>
@@ -362,7 +374,7 @@ class ShareToGroup extends React.Component {
                 />
               </td>
               <td>
-                <Button onClick={this.shareToGroup}>{gettext('Submit')}</Button>
+                <Button onClick={this.shareToGroup} disabled={sharingLocked}>{gettext('Submit')}</Button>
               </td>
             </tr>
             {this.state.errorMsg.length > 0 &&

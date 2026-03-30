@@ -12,7 +12,7 @@ import InviteUserViaWeiXinDialog from '../../components/dialog/org-admin-invite-
 import toaster from '../../components/toast';
 import { seafileAPI } from '../../utils/seafile-api';
 import OrgUserInfo from '../../models/org-user';
-import { gettext, invitationLink, orgID, siteRoot, orgEnableAdminInviteUser, hasUserAvailability, orgMembers, orgMembersQuota } from '../../utils/constants';
+import { billingUrl, gettext, invitationLink, orgID, siteRoot, orgEnableAdminInviteUser, hasUserAvailability, orgMembers, orgMembersQuota } from '../../utils/constants';
 import { getUpgradeState } from '../../utils/upgrade-state';
 import { Utils } from '../../utils/utils';
 
@@ -306,7 +306,7 @@ class OrgUsers extends Component {
         {isFeatureLockedOwner ? (
           <div className="d-flex align-items-center">
             <span className="mr-3" style={{ color: '#666' }}>{gettext('Upgrade your plan to unlock additional seats and member management.')}</span>
-            <a href="/billing/" className="btn btn-primary">{gettext('Upgrade Plan')}</a>
+            <a href={billingUrl} className="btn btn-primary" target="_blank" rel="noopener noreferrer">{gettext('Upgrade Plan')}</a>
           </div>
         ) : !hasUserAvailability ? (
           <div className="d-flex align-items-center">
@@ -315,7 +315,7 @@ class OrgUsers extends Component {
                 .replace('%(used)s', orgMembers)
                 .replace('%(total)s', orgMembersQuota)}
             </span>
-            <a href="/billing/" className="btn btn-outline-primary">{gettext('Manage Billing')}</a>
+            <a href={billingUrl} className="btn btn-outline-primary" target="_blank" rel="noopener noreferrer">{gettext('Manage Billing')}</a>
           </div>
         ) : (
           <Fragment>

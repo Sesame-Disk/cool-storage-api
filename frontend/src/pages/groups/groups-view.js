@@ -12,6 +12,8 @@ import SharedRepoListView from '../../components/shared-repo-list-view/shared-re
 import CreateGroupDialog from '../../components/dialog/create-group-dialog';
 import LibDetail from '../../components/dirent-detail/lib-details';
 import EmptyTip from '../../components/empty-tip';
+import UpgradeCallout from '../../components/common/upgrade-callout';
+import { getUpgradeState } from '../../utils/upgrade-state';
 
 import '../../css/groups.css';
 
@@ -180,10 +182,12 @@ class GroupsView extends React.Component {
   };
 
   render() {
+    const { isSingleMemberPlan } = getUpgradeState();
+    const canAddGroup = window.app.pageOptions.canAddGroup;
     const emptyTip = (
       <EmptyTip>
         <h2>{gettext('No groups')}</h2>
-        {window.app.pageOptions.canAddGroup ?
+        {canAddGroup ?
           <p>{gettext('You are not in any groups. Groups allow multiple people to collaborate on libraries. You can create a group by clicking the "New Group" button in the menu bar.')}</p> :
           <p>{gettext('You are not in any groups. Groups allow multiple people to collaborate on libraries. Groups you join will be listed here.')}</p>
         }
@@ -203,6 +207,13 @@ class GroupsView extends React.Component {
               <h3 className="sf-heading">{gettext('My Groups')}</h3>
             </div>
             <div className="cur-view-content cur-view-content-groups">
+              {!canAddGroup && isSingleMemberPlan && (
+                <UpgradeCallout
+                  title={gettext('Upgrade to create and manage groups')}
+                  description={gettext('Free single-member organizations cannot create groups. Upgrade your plan to invite members and share libraries with teams.')}
+                  note={gettext('Once you add seats, the New Group action becomes available here.')}
+                />
+              )}
               {this.state.isLoading && <Loading />}
               {(!this.state.isLoading && this.state.errorMsg) && <div className="error text-center mt-2">{this.state.errorMsg}</div>}
               {(!this.state.isLoading && !this.state.errorMsg && this.state.groupList.length === 0) && emptyTip}

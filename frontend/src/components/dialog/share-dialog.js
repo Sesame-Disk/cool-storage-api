@@ -14,9 +14,11 @@ import { Utils } from '../../utils/utils';
 import Loading from '../loading';
 import toaster from '../toast';
 import CustomPermissionManager from './custom-permission/custom-permission-manager';
+import UpgradeCallout from '../common/upgrade-callout';
 
 import '../../css/share-link-dialog.css';
 import { InternalAd } from '../../services/ad';
+import { getUpgradeState } from '../../utils/upgrade-state';
 
 const propTypes = {
   isGroupOwnedRepo: PropTypes.bool,
@@ -96,6 +98,8 @@ class ShareDialog extends React.Component {
     let { repoEncrypted, userPerm, enableDirPrivateShare, itemType } = this.props;
     const enableShareLink = !repoEncrypted && window.app.pageOptions.canGenerateShareLink;
     const enableUploadLink = !repoEncrypted && window.app.pageOptions.canGenerateUploadLink && (userPerm === 'rw' || userPerm === 'admin');
+    const canShareRepo = window.app.pageOptions.canShareRepo;
+    const { isSingleMemberPlan } = getUpgradeState();
 
     // for encrypted repo, 'dir private share' is only enabled for the repo itself,
     // not for the folders in it.
@@ -174,6 +178,13 @@ class ShareDialog extends React.Component {
         <div className="share-dialog-main">
           <TabContent activeTab={this.state.activeTab}>
             <InternalAd />
+            {!canShareRepo && enableDirPrivateShare && isSingleMemberPlan && (
+              <UpgradeCallout
+                title={gettext('Direct sharing requires an upgraded plan')}
+                description={gettext('Your organization currently supports only one member, so direct sharing to users and groups is disabled until you add more seats.')}
+                note={gettext('You can still use internal links where available.')}
+              />
+            )}
             {(enableShareLink && activeTab === 'shareLink') &&
               <TabPane tabId="shareLink" role="tabpanel" id="share-link-panel">
                 <ShareLinkPanel

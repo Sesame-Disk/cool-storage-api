@@ -17,6 +17,8 @@ export function getUpgradeState() {
 
     const canUpgrade = pageOptions.canUpgrade === true;
     const isOrgOwner = pageOptions.isOrgOwner === true;
+    const maxUsers = Number(pageOptions.maxUsers) || 0;
+    const currentUsers = Number(pageOptions.currentUsers) || 0;
     const storageOverQuota = storageInfo.over_quota === true;
     const trafficOverQuota = trafficInfo.over_quota === true;
     const hasLockedFeatures = upgradeFeatures.length > 0;
@@ -24,8 +26,11 @@ export function getUpgradeState() {
     return {
         canUpgrade,
         isOrgOwner,
+        maxUsers,
+        currentUsers,
         upgradeFeatures,
         hasLockedFeatures,
+        isSingleMemberPlan: maxUsers === 1,
         isFeatureLockedOwner: canUpgrade && isOrgOwner && hasLockedFeatures,
         isPaidOwnerUpgradeCandidate: canUpgrade && isOrgOwner && !hasLockedFeatures,
         storageInfo,

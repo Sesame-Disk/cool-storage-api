@@ -9,6 +9,7 @@ import Loading from '../../../components/loading';
 import SysAdminSetOrgQuotaDialog from '../../../components/dialog/sysadmin-dialog/set-org-traffic-quotas';
 import SysAdminSetOrgNameDialog from '../../../components/dialog/sysadmin-dialog/sysadmin-set-org-name-dialog';
 import SysAdminSetOrgMaxUserNumberDialog from '../../../components/dialog/sysadmin-dialog/sysadmin-set-org-max-user-number-dialog';
+import TransferOrgOwnershipDialog from '../../../components/dialog/transfer-org-ownership-dialog';
 import MainPanelTopbar from '../main-panel-topbar';
 import OrgNav from './org-nav';
 
@@ -19,7 +20,8 @@ class Content extends Component {
     this.state = {
       isSetQuotaDialogOpen: false,
       isSetNameDialogOpen: false,
-      isSetMaxUserNumberDialogOpen: false
+      isSetMaxUserNumberDialogOpen: false,
+      isTransferOwnershipDialogOpen: false
     };
   }
 
@@ -33,6 +35,10 @@ class Content extends Component {
 
   toggleSetMaxUserNumberDialog = () => {
     this.setState({ isSetMaxUserNumberDialogOpen: !this.state.isSetMaxUserNumberDialogOpen });
+  };
+
+  toggleTransferOwnershipDialog = () => {
+    this.setState({ isTransferOwnershipDialogOpen: !this.state.isTransferOwnershipDialogOpen });
   };
 
   showEditIcon = (action) => {
@@ -56,9 +62,9 @@ class Content extends Component {
         org_name, users_count, max_user_number, groups_count,
         quota, quota_usage, traffic_quota, traffic_upload_quota, traffic_download_quota,
         traffic_combined_used, traffic_upload_used, traffic_download_used,
-        plan, billing_cycle, enable_saml_login, metadata_url, domain,
+        plan, billing_cycle, creator_email, creator_name, enable_saml_login, metadata_url, domain,
       } = this.props.orgInfo;
-      const { isSetQuotaDialogOpen, isSetNameDialogOpen, isSetMaxUserNumberDialogOpen } = this.state;
+      const { isSetQuotaDialogOpen, isSetNameDialogOpen, isSetMaxUserNumberDialogOpen, isTransferOwnershipDialogOpen } = this.state;
       const formatTrafficQuota = (used, limit) => {
         return `${Utils.bytesToSize(used || 0)} / ${limit > 0 ? Utils.bytesToSize(limit) : gettext('Unlimited')}`;
       };
@@ -69,6 +75,14 @@ class Content extends Component {
             <dd className="info-item-content">
               {org_name}
               {this.showEditIcon(this.toggleSetNameDialog)}
+            </dd>
+
+            <dt className="info-item-heading">{gettext('Owner')}</dt>
+            <dd className="info-item-content">
+              {creator_name || creator_email || '--'}
+              <button type="button" className="btn btn-link btn-sm ml-2 p-0 align-baseline" onClick={this.toggleTransferOwnershipDialog}>
+                {gettext('Transfer ownership')}
+              </button>
             </dd>
 
             <dt className="info-item-heading">{gettext('Number of members')}</dt>
@@ -161,6 +175,14 @@ class Content extends Component {
               toggle={this.toggleSetMaxUserNumberDialog}
             />
           }
+          {isTransferOwnershipDialogOpen &&
+            <TransferOrgOwnershipDialog
+              currentOwner={creator_email}
+              searchFunc={this.props.searchOrgAdmins}
+              onSubmit={this.props.transferOwnership}
+              toggleDialog={this.toggleTransferOwnershipDialog}
+            />
+          }
         </Fragment>
       );
     }
@@ -179,6 +201,8 @@ Content.propTypes = {
   updateQuota: PropTypes.func.isRequired,
   updateName: PropTypes.func.isRequired,
   updateMaxUserNumber: PropTypes.func.isRequired,
+  searchOrgAdmins: PropTypes.func.isRequired,
+  transferOwnership: PropTypes.func.isRequired,
 };
 
 class OrgInfo extends Component {
@@ -254,6 +278,26 @@ class OrgInfo extends Component {
     });
   };
 
+  searchOrgAdmins = (query) => {
+    return seafileAPI.sysAdminSearchUsers(query, 1, 25, this.props.orgID).then((res) => {
+      const users = (res.data.users || res.data.user_list || []).filter((user) => user.is_staff || user.is_org_staff || user.role === 'owner');
+      return { data: { users } };
+    });
+  };
+
+  transferOwnership = (newOwnerEmail) => {
+    return seafileAPI.sysAdminTransferOrgOwnership(this.props.orgID, newOwnerEmail).then(() => {
+      return seafileAPI.sysAdminGetOrg(this.props.orgID).then((res) => {
+        this.setState({ orgInfo: res.data });
+        toaster.success(gettext('Organization ownership transferred successfully.'));
+      });
+    }).catch((error) => {
+      const errMessage = Utils.getErrorMsg(error);
+      toaster.danger(errMessage);
+      return Promise.reject(errMessage);
+    });
+  };
+
   render() {
     const { orgInfo } = this.state;
     return (
@@ -271,6 +315,8 @@ class OrgInfo extends Component {
                 updateQuota={this.updateQuota}
                 updateName={this.updateName}
                 updateMaxUserNumber={this.updateMaxUserNumber}
+                searchOrgAdmins={this.searchOrgAdmins}
+                transferOwnership={this.transferOwnership}
               />
             </div>
           </div>

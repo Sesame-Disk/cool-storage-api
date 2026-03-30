@@ -1077,6 +1077,12 @@ seafileAPI.sysAdminDeleteOrg = function (orgID) {
   return this.req.delete(url);
 };
 
+// Admin: transfer organization ownership
+seafileAPI.sysAdminTransferOrgOwnership = function (orgID, newOwnerEmail) {
+  let url = this.server + '/api/v2.1/org/' + orgID + '/admin/transfer-ownership/';
+  return this.req.put(url, { new_owner: newOwnerEmail });
+};
+
 // Admin: deactivate organization
 seafileAPI.sysAdminDeactivateOrg = function (orgID) {
   let url = this.server + '/api/v2.1/admin/organizations/' + orgID + '/deactivate/';
@@ -1422,6 +1428,12 @@ seafileAPI.orgAdminSearchUser = function (orgID, query, page, perPage, statusFil
   if (statusFilter) params.set('status', statusFilter);
   url += '?' + params.toString();
   return this.req.get(url);
+};
+
+// Org Admin: transfer organization ownership
+seafileAPI.orgAdminTransferOwnership = function (orgID, newOwnerEmail) {
+  let url = this.server + '/api/v2.1/org/' + orgID + '/admin/transfer-ownership/';
+  return this.req.put(url, { new_owner: newOwnerEmail });
 };
 
 // Org Admin: import users via file
