@@ -5,6 +5,7 @@ import (
 	"log"
 	"time"
 
+	"github.com/Sesame-Disk/sesamefs/internal/config"
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
 	"github.com/google/uuid"
 )
@@ -13,7 +14,7 @@ import (
 // This runs automatically on application startup.
 // firstSuperAdminEmail: if non-empty, seeds a superadmin in the platform org with this email
 // so the user can log in via OIDC and be matched to the superadmin account on first login.
-func (db *DB) SeedDatabase(devMode bool, firstSuperAdminEmail string) error {
+func (db *DB) SeedDatabase(cfg *config.Config, devMode bool, firstSuperAdminEmail string) error {
 	platformOrgID := uuid.MustParse("00000000-0000-0000-0000-000000000000")
 	defaultOrgID := uuid.MustParse("00000000-0000-0000-0000-000000000001")
 
@@ -60,7 +61,7 @@ func (db *DB) SeedDatabase(devMode bool, firstSuperAdminEmail string) error {
 
 	// Create default organization
 	if !defaultExists {
-		if err := db.createDefaultOrganization(defaultOrgID); err != nil {
+		if err := db.createDefaultOrganization(defaultOrgID, cfg.GetOrganizationTemplate("")); err != nil {
 			return err
 		}
 	}
@@ -120,15 +121,15 @@ func (db *DB) createPlatformOrganization(orgID uuid.UUID) error {
 		int64(17592186044415),
 		storageConfig,
 		now,
-		"platform",  // plan (display)
-		"soft",      // quota_policy
-		"monthly",   // billing_cycle
-		int64(-1),   // traffic_quota unlimited
-		int64(-1),   // traffic_upload_quota unlimited
-		int64(-1),   // traffic_download_quota unlimited
-		int(-1),     // max_users unlimited
-		now,         // current_period_started_at
-		periodEnd,   // current_period_ends_at
+		"platform", // plan (display)
+		"soft",     // quota_policy
+		"monthly",  // billing_cycle
+		int64(-1),  // traffic_quota unlimited
+		int64(-1),  // traffic_upload_quota unlimited
+		int64(-1),  // traffic_download_quota unlimited
+		int(-1),    // max_users unlimited
+		now,        // current_period_started_at
+		periodEnd,  // current_period_ends_at
 	).Exec()
 
 	if err != nil {
@@ -183,7 +184,7 @@ func (db *DB) createSuperAdmin(platformOrgID uuid.UUID, userID uuid.UUID, email,
 }
 
 // createDefaultOrganization creates the default organization
-func (db *DB) createDefaultOrganization(orgID uuid.UUID) error {
+func (db *DB) createDefaultOrganization(orgID uuid.UUID, template config.OrganizationTemplate) error {
 	now := time.Now()
 
 	query := `
@@ -196,37 +197,27 @@ func (db *DB) createDefaultOrganization(orgID uuid.UUID) error {
 		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`
 
-	// Default settings
-	settings := map[string]string{
-		"theme":    "default",
-		"features": "all",
-	}
-
-	storageConfig := map[string]string{
-		"default_backend": "s3",
-	}
-
-	periodEnd := now.AddDate(0, 1, 0) // +1 month
+	periodEnd := template.PeriodEnd(now)
 
 	err := db.Session().Query(query,
 		orgID.String(),
 		"Default Organization",
 		"active",
-		settings,
-		int64(1099511627776),  // 1TB default quota
-		int64(0),              // 0 bytes used
-		int64(17592186044415), // Default Rabin polynomial
-		storageConfig,
+		template.Settings,
+		template.StorageQuota,
+		int64(0), // 0 bytes used
+		template.ChunkingPolynomial,
+		template.StorageConfig,
 		now,
-		"business", // plan (display)
-		"soft",     // quota_policy
-		"monthly",  // billing_cycle
-		int64(-1),  // traffic_quota unlimited
-		int64(-1),  // traffic_upload_quota unlimited
-		int64(-1),  // traffic_download_quota unlimited
-		int(-1),    // max_users unlimited
-		now,        // current_period_started_at
-		periodEnd,  // current_period_ends_at
+		template.Plan,
+		template.QuotaPolicy,
+		template.BillingCycle,
+		template.TrafficQuota,
+		template.TrafficUploadQuota,
+		template.TrafficDownloadQuota,
+		template.MaxUsers,
+		now,       // current_period_started_at
+		periodEnd, // current_period_ends_at
 	).Exec()
 
 	if err != nil {

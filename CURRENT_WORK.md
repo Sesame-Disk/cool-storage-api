@@ -1,7 +1,7 @@
 # Current Work - SesameFS
 
-**Last Updated**: 2026-03-18
-**Session**: Session 57 — Production Readiness Phases 3-5 (Library Trash, Org Deletion, Bulk Optimization)
+**Last Updated**: 2026-03-30
+**Session**: Session 58 — Plans/Permissions Phase 3 Frontend Progress + Org Ownership/Quota UI Fixes
 
 **📏 File Size Rule**: Keep this file under **500 lines** unless unavoidable. Move detailed content to:
 - `docs/KNOWN_ISSUES.md` - Detailed bug tracking
@@ -28,9 +28,24 @@
 ### Quick Context
 1. **Sync Protocol**: 100% complete, 🔒 FROZEN
 2. **Backend API**: ~98% complete - OIDC ✅, GC ✅, Library Settings ✅, Monitoring ✅, Departments ✅, Admin Panel (groups/users) ✅, OIDC Group/Dept Sync ✅, Tag cascade ✅, Admin Link Management ✅, Upload Links ✅, Org Admin Panel ✅, Superadmin Departments ✅, Custom Share Permissions ✅
-3. **Frontend UI**: ~85% complete (all modals migrated, About modal rebranded, File History UI ✅, History Download ✅, Snapshot View ✅, Restore from History ✅, Share Dialog all 8 tabs ✅, permission UI ~75% with granular flags, ~51 ModalPortal wrappers to clean up, folder icons ✅)
+3. **Frontend UI**: ~85% complete (all modals migrated, About modal rebranded, File History UI ✅, History Download ✅, Snapshot View ✅, Restore from History ✅, Share Dialog all 8 tabs ✅, permission UI ~75% with granular flags, ~51 ModalPortal wrappers to clean up, folder icons ✅). Plans/permissions Phase 3 is in progress, not closed.
 4. **All tests passing**: 18 test suites (all green), 345+ bash integration + 26 Go integration + 138 frontend + 88 GC unit + 267 api/v2+middleware tests + 29 admin panel + 17 file history + 28 file preview + 10 search tests
 5. **Active Bugs**: 0 open (all 5 resolved in Session 32)
+
+### Inter-session Update (2026-03-30)
+
+- Organization creation defaults are now config/template-driven across superadmin create, OIDC auto-provision, and seed paths.
+- Sysadmin organization UI now uses `owner` / `plan` semantics instead of legacy `creator` / `role`.
+- Ownership transfer is now reachable from:
+	- superadmin org-member role change (`owner`)
+	- sysadmin org info/users flows
+	- org-admin users page
+- Sysadmin and org-admin member-management screens now gate user creation with live `max_users` data from real APIs instead of trusting static shell defaults.
+- Remaining Plans/Permissions Phase 3 gaps:
+	- org-admin shell still injects placeholder `window.org.pageOptions` values for some non-user screens/flags
+	- frontend still needs final cleanup of legacy plan-role code paths
+	- quota UI still needs unit standardization; some screens appear to treat `GB` as decimal (`1000^3`) while backend/utilities are binary-byte based (`1024^3`)
+- Before production, the documented frontend/backend separation in `docs/V1-PRODUCTION-ROADMAP.md` remains the next infrastructure milestone and is a good opportunity to redesign org-admin bootstrap/config delivery cleanly.
 
 ### Step 2: Before Making ANY Code Changes
 - ✅ Check `docs/IMPLEMENTATION_STATUS.md` - Is component 🔒 FROZEN?

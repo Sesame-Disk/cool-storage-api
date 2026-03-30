@@ -1,6 +1,6 @@
 # Implementation Status - SesameFS
 
-**Last Updated**: 2026-03-26
+**Last Updated**: 2026-03-30
 
 ---
 
@@ -55,7 +55,7 @@
 | **Library CRUD** | ✅ COMPLETE | Mostly stable | ⚠️ Partial | 2026-01-08 | Create/delete/list working |
 | **Starred Files** | ✅ COMPLETE | Mostly stable | ❌ No | 2026-01-08 | Fixed Cassandra query issue |
 | **OnlyOffice Integration** | 🔒 FROZEN | **STABLE** | ❌ No | 2026-02-12 | Document editing stable — doc key rotation fix (was causing toolbar greying out) + JWT 8h expiry |
-| **Frontend (React)** | 🟡 PARTIAL | **UNSTABLE** | N/A | 2026-03-26 | Library list works, all modals migrated, ~51 ModalPortal wrappers to remove. Admin dashboard modernization is documented but not implemented yet. |
+| **Frontend (React)** | 🟡 PARTIAL | **UNSTABLE** | N/A | 2026-03-30 | Library list works, all modals migrated, ~51 ModalPortal wrappers to remove. Plans/permissions Phase 3 is in progress: owner/plan terminology and member-limit gating now use live data in key admin screens, but legacy plan-role code paths, org-admin shell placeholders, and quota unit standardization still remain. |
 | **Frontend Logout** | 🔒 FROZEN | **STABLE** | N/A | 2026-01-27 | Working - nginx proxies /accounts/ to backend |
 | **User Management** | ✅ COMPLETE | Mostly stable | ❌ No | 2026-03-26 | OIDC login + dev tokens supported. `users.last_login_at` is now persisted on successful login/session creation and exposed in admin/org-admin user responses. Historical login analytics remain unimplemented. |
 | **Database Seeding** | ✅ COMPLETE | Mostly stable | ❌ No | 2026-01-23 | Auto-creates default org + admin user on first run |
@@ -76,8 +76,8 @@
 | **Admin Library Management** | ✅ COMPLETE | Mostly stable | ❌ No | 2026-02-12 | 12 endpoints in admin.go + seafile-api.js methods + trash libraries |
 | **Admin Link Management** | ✅ COMPLETE | Mostly stable | ❌ No | 2026-02-12 | 13 endpoints: share link admin (list/delete), upload links (user CRUD + admin), per-user links. See [ADMIN-FEATURES.md](ADMIN-FEATURES.md) § 2 |
 | **Superadmin Departments/Address Book** | ✅ COMPLETE | Mostly stable | ❌ No | 2026-03-05 | 9 endpoints: dept CRUD, address book groups, group-owned libraries. See [ADMIN-FEATURES.md](ADMIN-FEATURES.md) § 4 |
-| **Org Admin Panel** | 🟡 PARTIAL | Mostly stable | ❌ No | 2026-03-26 | 50+ endpoints in org_admin.go. Users, groups, repos, trash, departments, links are present, but there is a confirmed statistics scope bug: traffic-based org-admin metrics can resolve to platform-wide aggregates when org-admin is mounted in platform-org context. |
-| **Storage & Traffic Quotas** | ✅ COMPLETE | Mostly stable | ❌ No | 2026-03-25 | Traffic recording (fire-and-forget), quota enforcement (free=hard block, paid=soft warning), storage counters (4 scopes), statistics API, plan management API. All upload/download paths instrumented. Library soft-delete adjusts storage counters. See [QUOTAS-AND-TRAFFIC-PLAN.md](QUOTAS-AND-TRAFFIC-PLAN.md) |
+| **Org Admin Panel** | 🟡 PARTIAL | Mostly stable | ❌ No | 2026-03-30 | 50+ endpoints in org_admin.go. Users, groups, repos, trash, departments, links are present. Ownership transfer is now visible from the users page and member creation is gated by live `max_users` data, but there is still a confirmed statistics scope bug and some org-admin screens still depend on placeholder shell flags injected via `window.org.pageOptions`. |
+| **Storage & Traffic Quotas** | ✅ COMPLETE | Mostly stable | ❌ No | 2026-03-30 | Traffic recording (fire-and-forget), quota enforcement (free=hard block, paid=soft warning), storage counters (4 scopes), statistics API, plan management API. All upload/download paths instrumented. Library soft-delete adjusts storage counters. Frontend quota-entry migration to GB is mostly done, but UI unit consistency is still pending because some screens appear decimal (`1000^3`) while backend/utilities are binary-byte based (`1024^3`). See [QUOTAS-AND-TRAFFIC-PLAN.md](QUOTAS-AND-TRAFFIC-PLAN.md) |
 | **Audit Logs** | 🟡 PARTIAL | Mostly stable | ❌ No | 2026-03-26 | `audit_log` table with 365-day TTL exists for deletion events (GC, groups, departments), and `users.last_login_at` now covers latest successful login. Historical login logs and file-operation/file-access event tables are still missing, so login audit pages and file statistics pages remain pending. See [ADMIN-FEATURES.md](ADMIN-FEATURES.md) § 3 |
 | **File/Folder Trash** | ✅ COMPLETE | Mostly stable | ❌ No | 2026-03-11 | List, restore, clean trash + browse deleted folders. Enhanced: filters out children of deleted directories (2026-03-11) |
 | **Library Recycle Bin** | ✅ COMPLETE | Mostly stable | ❌ No | 2026-03-25 | Soft-delete, restore, permanent delete. User + admin endpoints. Storage counters adjusted on delete/restore (2026-03-25) |

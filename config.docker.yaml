@@ -151,6 +151,25 @@ billing:
   # Docker/local testing billing portal. Frontend opens /billing/ and the backend redirects here.
   url: "https://t-accounts.sesamedisk.com/billing/"
 
+organizations:
+  default_template: free
+  templates:
+    free:
+      plan: free
+      quota_policy: hard
+      billing_cycle: monthly
+      storage_quota: 2147483648
+      traffic_quota: 10737418240
+      traffic_upload_quota: -1
+      traffic_download_quota: -1
+      max_users: 1
+      chunking_polynomial: 17592186044415
+      settings:
+        theme: default
+        features: all
+      storage_config:
+        default_backend: hot-minio-local
+
 chunking:
   algorithm: fastcdc
   min_size: 2097152                   # 2 MB (minimum for slow connections)

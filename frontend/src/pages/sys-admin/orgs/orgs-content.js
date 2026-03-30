@@ -8,12 +8,9 @@ import EmptyTip from '../../../components/empty-tip';
 import Loading from '../../../components/loading';
 import Paginator from '../../../components/paginator';
 import { seafileAPI } from '../../../utils/seafile-api';
-import RoleSelector from '../../../components/single-selector';
 import CommonOperationConfirmationDialog from '../../../components/dialog/common-operation-confirmation-dialog';
 import UserLink from '../user-link';
 import toaster from '../../../components/toast';
-
-const { availableRoles } = window.sysadmin.pageOptions;
 
 class Content extends Component {
 
@@ -54,9 +51,9 @@ class Content extends Component {
             <thead>
               <tr>
                 <th width="18%">{gettext('Name')}</th>
-                <th width="16%">{gettext('Creator')}</th>
+                <th width="16%">{gettext('Owner')}</th>
                 <th width="12%">{gettext('Status')}</th>
-                <th width="16%">{gettext('Role')}</th>
+                <th width="16%">{gettext('Plan')}</th>
                 <th width="14%">{gettext('Space Used')}</th>
                 <th width="16%">{gettext('Created At')}</th>
                 <th width="8%">{/* Operations */}</th>
@@ -67,7 +64,6 @@ class Content extends Component {
                 return (<Item
                   key={index}
                   item={item}
-                  updateRole={this.props.updateRole}
                   deleteOrg={this.props.deleteOrg}
                   deactivateOrg={this.props.deactivateOrg}
                   reactivateOrg={this.props.reactivateOrg}
@@ -101,7 +97,6 @@ Content.propTypes = {
   getListByPage: PropTypes.func.isRequired,
   currentPage: PropTypes.number,
   items: PropTypes.array.isRequired,
-  updateRole: PropTypes.func.isRequired,
   deleteOrg: PropTypes.func.isRequired,
   deactivateOrg: PropTypes.func.isRequired,
   reactivateOrg: PropTypes.func.isRequired,
@@ -227,21 +222,6 @@ class Item extends Component {
     });
   };
 
-  translateRole = (role) => {
-    switch (role) {
-      case 'default':
-        return gettext('Default');
-      case 'guest':
-        return gettext('Guest');
-      default:
-        return role;
-    }
-  };
-
-  updateRole = (roleOption) => {
-    this.props.updateRole(this.props.item.org_id, roleOption.value);
-  };
-
   deleteOrg = () => {
     toaster.notify(gettext('It may take some time, please wait.'));
     this.props.deleteOrg(this.props.item.org_id);
@@ -274,35 +254,17 @@ class Item extends Component {
     } = this.state;
     const status = this.getEffectiveStatus();
 
-    const { role: curRole } = item;
-    this.roleOptions = availableRoles.map(item => {
-      return {
-        value: item,
-        text: this.translateRole(item),
-        isSelected: item === curRole
-      };
-    });
-    const currentSelectedOption = this.roleOptions.filter(item => item.isSelected)[0];
-
     return (
       <Fragment>
         <tr className={highlighted ? 'tr-highlight' : ''} onMouseEnter={this.handleMouseEnter} onMouseLeave={this.handleMouseLeave}>
           <td><Link to={`${siteRoot}sys/organizations/${item.org_id}/info/`}>{item.org_name}</Link></td>
           <td>
-            <UserLink email={item.creator_email} name={item.creator_name} />
+            <UserLink email={item.owner_email} name={item.owner_name} />
           </td>
           <td>
             <span className={this.getStatusClass(status)}>{this.getStatusDisplay(status)}</span>
           </td>
-          <td>
-            <RoleSelector
-              isDropdownToggleShown={highlighted}
-              currentSelectedOption={currentSelectedOption}
-              options={this.roleOptions}
-              selectOption={this.updateRole}
-              toggleItemFreezed={this.props.toggleItemFreezed}
-            />
-          </td>
+          <td>{item.plan || '--'}</td>
           <td>{`${Utils.bytesToSize(item.quota_usage)} / ${item.quota > 0 ? Utils.bytesToSize(item.quota) : '--'}`}</td>
           <td>{moment(item.ctime).format('YYYY-MM-DD HH:mm:ss')}</td>
           <td>
@@ -339,7 +301,6 @@ class Item extends Component {
 
 Item.propTypes = {
   item: PropTypes.object.isRequired,
-  updateRole: PropTypes.func.isRequired,
   deleteOrg: PropTypes.func.isRequired,
   deactivateOrg: PropTypes.func.isRequired,
   reactivateOrg: PropTypes.func.isRequired,

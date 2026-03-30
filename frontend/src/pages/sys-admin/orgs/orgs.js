@@ -82,24 +82,6 @@ class Orgs extends Component {
     this.setState({ isAddOrgDialogOpen: !this.state.isAddOrgDialogOpen });
   };
 
-  updateRole = (orgID, role) => {
-    let orgInfo = {};
-    orgInfo.role = role;
-    seafileAPI.sysAdminUpdateOrg(orgID, orgInfo).then(res => {
-      let newOrgList = this.state.orgList.map(org => {
-        if (org.org_id === orgID) {
-          org.role = role;
-        }
-        return org;
-      });
-      this.setState({ orgList: newOrgList });
-      toaster.success(gettext('Edit succeeded'));
-    }).catch((error) => {
-      let errMessage = Utils.getErrorMsg(error);
-      toaster.danger(errMessage);
-    });
-  };
-
   addOrg = (data) => {
     const { orgName, ownerEmail, password } = data;
     seafileAPI.sysAdminAddOrg(orgName, ownerEmail, password).then(res => {
@@ -206,7 +188,6 @@ class Orgs extends Component {
                 curPerPage={this.state.perPage}
                 resetPerPage={this.resetPerPage}
                 getListByPage={this.getItemsByPage}
-                updateRole={this.updateRole}
                 deleteOrg={this.deleteOrg}
                 deactivateOrg={this.deactivateOrg}
                 reactivateOrg={this.reactivateOrg}

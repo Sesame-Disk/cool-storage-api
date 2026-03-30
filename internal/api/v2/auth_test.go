@@ -40,7 +40,7 @@ func setupAuthTestRouter() (*gin.Engine, *AuthHandler) {
 	sessions := auth.NewSessionManager(&cfg.Auth.OIDC, nil)
 
 	// Create OIDC client
-	oidc := auth.NewOIDCClient(&cfg.Auth.OIDC, nil, sessions)
+	oidc := auth.NewOIDCClient(cfg, nil, sessions)
 
 	handler := &AuthHandler{
 		config:   cfg,
@@ -87,7 +87,7 @@ func setupDisabledOIDCRouter() *gin.Engine {
 	}
 
 	sessions := &auth.SessionManager{}
-	oidc := auth.NewOIDCClient(&cfg.Auth.OIDC, nil, sessions)
+	oidc := auth.NewOIDCClient(cfg, nil, sessions)
 
 	handler := &AuthHandler{
 		config:   cfg,

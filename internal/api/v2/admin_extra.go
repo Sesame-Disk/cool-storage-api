@@ -923,16 +923,16 @@ func (h *AdminHandler) AdminSearchOrganizations(c *gin.Context) {
 	query := strings.ToLower(c.Query("query"))
 
 	iter := h.db.Session().Query(`
-		SELECT org_id, name, status, storage_quota, created_at
+		SELECT org_id, name, status, storage_quota, plan, created_at
 		FROM organizations
 	`).Iter()
 
 	var orgs []gin.H
-	var orgID, name, status string
+	var orgID, name, status, plan string
 	var storageQuota int64
 	var createdAt time.Time
 
-	for iter.Scan(&orgID, &name, &status, &storageQuota, &createdAt) {
+	for iter.Scan(&orgID, &name, &status, &storageQuota, &plan, &createdAt) {
 		if query != "" && !strings.Contains(strings.ToLower(name), query) {
 			continue
 		}
@@ -942,18 +942,18 @@ func (h *AdminHandler) AdminSearchOrganizations(c *gin.Context) {
 		}
 		// Count users in this org
 		usersCount := h.countOrgUsers(orgID)
-		creatorEmail, creatorName := h.resolveOrgCreator(orgID)
+		ownerEmail, ownerName := h.resolveOrgCreator(orgID)
 		orgs = append(orgs, gin.H{
-			"org_id":        orgID,
-			"org_name":      name,
-			"creator_email": creatorEmail,
-			"creator_name":  creatorName,
-			"status":        effectiveStatus,
-			"role":          "default",
-			"quota_usage":   traffic.ReadStorageUsed(h.db, fmt.Sprintf("org:%s", orgID)),
-			"quota":         storageQuota,
-			"ctime":         createdAt.Format(time.RFC3339),
-			"users_count":   usersCount,
+			"org_id":      orgID,
+			"org_name":    name,
+			"owner_email": ownerEmail,
+			"owner_name":  ownerName,
+			"status":      effectiveStatus,
+			"plan":        plan,
+			"quota_usage": traffic.ReadStorageUsed(h.db, fmt.Sprintf("org:%s", orgID)),
+			"quota":       storageQuota,
+			"ctime":       createdAt.Format(time.RFC3339),
+			"users_count": usersCount,
 		})
 	}
 	iter.Close()
@@ -1130,7 +1130,43 @@ func (h *AdminHandler) AdminUpdateOrgUser(c *gin.Context) {
 		}
 	}
 
-	if updateReq.Role != nil {
+	if updateReq.Role != nil && *updateReq.Role == string(middleware.RoleOwner) {
+		var existingOwnerUserID string
+		iter := h.db.Session().Query(`SELECT user_id, role FROM users WHERE org_id = ?`, targetOrgID).Iter()
+		var iterUserID, iterRole string
+		for iter.Scan(&iterUserID, &iterRole) {
+			if iterRole == string(middleware.RoleOwner) {
+				existingOwnerUserID = iterUserID
+				break
+			}
+		}
+		if err := iter.Close(); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to inspect organization owner"})
+			return
+		}
+
+		newOwnerRole := middleware.OrganizationRole(role)
+		if !middleware.HasRequiredOrgRole(newOwnerRole, middleware.RoleAdmin) {
+			newOwnerRole = middleware.RoleAdmin
+		}
+		plan, planErr := buildOwnershipTransferPlan(true, callerUserID, existingOwnerUserID, userID, middleware.RoleSuperAdmin, newOwnerRole)
+		if planErr != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": planErr.Error()})
+			return
+		}
+		if !plan.NoOp {
+			batch := h.db.Session().Batch(gocql.LoggedBatch)
+			if plan.DemoteOwnerID != "" {
+				batch.Query(`UPDATE users SET role = ? WHERE org_id = ? AND user_id = ?`, "admin", targetOrgID, plan.DemoteOwnerID)
+			}
+			batch.Query(`UPDATE users SET role = ? WHERE org_id = ? AND user_id = ?`, "owner", targetOrgID, plan.PromoteUserID)
+			if err := batch.Exec(); err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to transfer ownership"})
+				return
+			}
+		}
+		role = string(middleware.RoleOwner)
+	} else if updateReq.Role != nil {
 		validRoles := map[string]bool{"admin": true, "user": true, "readonly": true, "guest": true}
 		if validRoles[*updateReq.Role] {
 			role = *updateReq.Role
@@ -1202,6 +1238,7 @@ func (h *AdminHandler) AdminUpdateOrgUser(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"email":                      email,
 		"name":                       name,
+		"role":                       role,
 		"status":                     normalizeUserStatus(status),
 		"active":                     isActive,
 		"is_org_staff":               isOrgStaff,

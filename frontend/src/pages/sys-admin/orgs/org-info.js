@@ -62,7 +62,7 @@ class Content extends Component {
         org_name, users_count, max_user_number, groups_count,
         quota, quota_usage, traffic_quota, traffic_upload_quota, traffic_download_quota,
         traffic_combined_used, traffic_upload_used, traffic_download_used,
-        plan, billing_cycle, creator_email, creator_name, enable_saml_login, metadata_url, domain,
+        plan, billing_cycle, owner_email, owner_name, enable_saml_login, metadata_url, domain,
       } = this.props.orgInfo;
       const { isSetQuotaDialogOpen, isSetNameDialogOpen, isSetMaxUserNumberDialogOpen, isTransferOwnershipDialogOpen } = this.state;
       const formatTrafficQuota = (used, limit) => {
@@ -79,7 +79,7 @@ class Content extends Component {
 
             <dt className="info-item-heading">{gettext('Owner')}</dt>
             <dd className="info-item-content">
-              {creator_name || creator_email || '--'}
+              {owner_name || owner_email || '--'}
               <button type="button" className="btn btn-link btn-sm ml-2 p-0 align-baseline" onClick={this.toggleTransferOwnershipDialog}>
                 {gettext('Transfer ownership')}
               </button>
@@ -177,7 +177,7 @@ class Content extends Component {
           }
           {isTransferOwnershipDialogOpen &&
             <TransferOrgOwnershipDialog
-              currentOwner={creator_email}
+              currentOwner={owner_email}
               searchFunc={this.props.searchOrgAdmins}
               onSubmit={this.props.transferOwnership}
               toggleDialog={this.toggleTransferOwnershipDialog}

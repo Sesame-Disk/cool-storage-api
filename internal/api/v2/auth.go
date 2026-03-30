@@ -25,7 +25,7 @@ func NewAuthHandler(database *db.DB, cfg *config.Config) *AuthHandler {
 	sessions := auth.NewSessionManager(&cfg.Auth.OIDC, database)
 
 	// Create OIDC client
-	oidc := auth.NewOIDCClient(&cfg.Auth.OIDC, database, sessions)
+	oidc := auth.NewOIDCClient(cfg, database, sessions)
 
 	return &AuthHandler{
 		db:       database,
@@ -172,13 +172,13 @@ func (h *AuthHandler) HandleOIDCCallback(c *gin.Context) {
 
 	// Return the session token
 	c.JSON(http.StatusOK, gin.H{
-		"token":      result.SessionToken,
-		"user_id":    result.UserID,
-		"org_id":     result.OrgID,
-		"email":      result.Email,
-		"name":       result.Name,
-		"role":       result.Role,
-		"expires_at": result.ExpiresAt.Unix(),
+		"token":       result.SessionToken,
+		"user_id":     result.UserID,
+		"org_id":      result.OrgID,
+		"email":       result.Email,
+		"name":        result.Name,
+		"role":        result.Role,
+		"expires_at":  result.ExpiresAt.Unix(),
 		"is_new_user": result.IsNewUser,
 	})
 }

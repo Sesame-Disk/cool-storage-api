@@ -1,7 +1,36 @@
 ================================================================================
   QUOTAS — PENDIENTES Y GAPS CONOCIDOS
-    Última actualización: 2026-03-28
+    Última actualización: 2026-03-30
 ================================================================================
+
+## UPDATE 2026-03-30 — PHASE 3 FRONTEND EN PROGRESO (NO CERRADA)
+
+[ok] Defaults de organizaciones ya salen del template/config y no de hardcodes dispersos
+                - create organization (superadmin) usa template configurable
+                - auto-provision OIDC usa template configurable
+                - seed/default org usa template configurable
+                - sysadmin orgs ya muestra `owner` / `plan` en vez de `creator` / `role`
+
+[ok] Ownership transfer y límites de miembros ya tienen cobertura funcional en las vistas críticas
+                - superadmin puede transferir ownership vía cambio de role a `owner`
+                - org-admin ahora ve `Transfer ownership` también desde la pantalla de users
+                - sysadmin users bloquea `Add Member` cuando `max_users` ya fue alcanzado
+                - org-admin users ahora calcula el límite con `orgAdminGetOrgInfo()` real, no con placeholders
+
+[ ] Phase 3 frontend sigue abierta por dependencias legacy y bootstrap incompleto
+                - `window.org.pageOptions` en org-admin todavía inyecta placeholders (`hasUserAvailability=true`,
+                    `orgMembersQuota=0`, flags de invite/custom-branding/subscription/SAML en falso)
+                - Ya no afecta el gating principal de users ni el bloque de límites en info,
+                    pero todavía puede desalinear otras pantallas de org-admin
+                - Candidatos conocidos: invite flags, web settings, navegación subscription/SAML
+
+[ ] Desalineación de unidades GB entre frontend y backend/utilidades
+                - Hay indicios de que parte del frontend interpreta "GB" en base decimal (`1000^3`)
+                    mientras otras utilidades/backend trabajan con bytes binarios (`1024^3`)
+                - Esto puede explicar diferencias visibles entre inputs/labels del frontend y límites
+                    efectivos/formatos calculados por backend
+                - Pendiente: estandarizar una sola convención y etiquetarla bien
+                    (`GB` decimal o `GiB` binario) en toda la UI de quotas
 
 ## UPDATE 2026-03-28 — PHASE 2 BACKEND COMPLETADA
 
@@ -505,6 +534,20 @@
     - DECISIÓN: backend devolverá `plan`, `quota_policy`, `is_org_owner`, `can_upgrade` como campos separados
     - Frontend debe usar esos campos. `personalfree/business/restricted/pay_restricted*` son código muerto.
     - Ver docs/PLANS-AND-PERMISSIONS.md sección "Frontend Contract"
+
+[ ] Bootstrap org-admin aún usa pageOptions placeholders en el shell servido por Go
+        - `internal/api/server.go` inyecta valores default/estáticos en `window.org.pageOptions`
+        - Esto ya causó bugs reales en gating de usuarios hasta que la página de users se desligó
+            de esos flags y empezó a consultar `orgAdminGetOrgInfo()` directamente
+        - Si el split frontend/backend ocurre antes del cleanup final, este bootstrap debe rediseñarse
+            para no reintroducir drift entre shell y APIs reales
+
+[ ] Inconsistencia pendiente de tamaño "GB" vs bytes binarios
+        - Parte de la migración a inputs en GB quedó hecha, pero todavía hay sospecha de mezcla
+            entre cálculo decimal (1000) y binario (1024)
+        - Riesgo: un mismo valor visible en UI no representa exactamente el mismo límite efectivo
+            que persiste o devuelve backend
+        - Resolver junto con el cierre de Phase 3 frontend y la limpieza final de quotas UI
 
 
 ## NO IMPLEMENTADO

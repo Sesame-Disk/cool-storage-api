@@ -140,6 +140,7 @@ Nginx (`$mobile_detect` in `nginx.conf.template`), causing duplication.
 - The `./frontend/build/` path is relative and fragile in production deployments.
 - Two places own mobile routing logic — they can diverge.
 - Go's responsibility should end at the API boundary.
+- The org-admin shell currently injects placeholder `window.org.pageOptions` values (member availability, invite/custom-branding flags, subscription/SAML visibility), which has already caused frontend drift bugs. The split is the right moment to replace HTML placeholder substitution with a cleaner bootstrap/config contract.
 
 **Target architecture:**
 
@@ -168,6 +169,7 @@ TLS termination, rate limiting, security headers → all owned by Nginx (already
 4. **Update `docker-compose.prod.yml`** — add `frontend` service, update Nginx upstream config.
 5. **Split `Dockerfile`** — current multi-stage build produces one container. Split into
    `Dockerfile` (Go backend) and `Dockerfile.frontend` (React + nginx:alpine).
+6. **Replace server-side page-option placeholders with a real bootstrap source** — once Go stops serving the SPA shell, org-admin/sysadmin/frontend config should come from a dedicated bootstrap endpoint or static runtime config, not hardcoded HTML string substitution.
 
 **Benefits:**
 - Frontend and backend can be deployed independently.

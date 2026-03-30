@@ -16,6 +16,7 @@ type Config struct {
 	Database            DatabaseConfig                `yaml:"database"`
 	Storage             StorageConfig                 `yaml:"storage"`
 	Billing             BillingConfig                 `yaml:"billing"`
+	Organizations       OrganizationsConfig           `yaml:"organizations"`
 	Auth                AuthConfig                    `yaml:"auth"`
 	Chunking            ChunkingConfig                `yaml:"chunking"`
 	Versioning          VersioningConfig              `yaml:"versioning"`
@@ -141,6 +142,126 @@ type MonitoringConfig struct {
 // BillingConfig holds external billing portal integration settings.
 type BillingConfig struct {
 	URL string `yaml:"url"`
+}
+
+// OrganizationsConfig holds reusable organization plan/template defaults.
+type OrganizationsConfig struct {
+	DefaultTemplate string                          `yaml:"default_template"`
+	Templates       map[string]OrganizationTemplate `yaml:"templates"`
+}
+
+// OrganizationTemplate defines the persisted defaults for newly created orgs.
+type OrganizationTemplate struct {
+	Plan                 string            `yaml:"plan"`
+	QuotaPolicy          string            `yaml:"quota_policy"`
+	BillingCycle         string            `yaml:"billing_cycle"`
+	StorageQuota         int64             `yaml:"storage_quota"`
+	TrafficQuota         int64             `yaml:"traffic_quota"`
+	TrafficUploadQuota   int64             `yaml:"traffic_upload_quota"`
+	TrafficDownloadQuota int64             `yaml:"traffic_download_quota"`
+	MaxUsers             int               `yaml:"max_users"`
+	Settings             map[string]string `yaml:"settings"`
+	StorageConfig        map[string]string `yaml:"storage_config"`
+	ChunkingPolynomial   int64             `yaml:"chunking_polynomial"`
+}
+
+// DefaultFreeOrganizationTemplate returns the built-in free plan defaults.
+func DefaultFreeOrganizationTemplate() OrganizationTemplate {
+	return OrganizationTemplate{
+		Plan:                 "free",
+		QuotaPolicy:          "hard",
+		BillingCycle:         "monthly",
+		StorageQuota:         2 * 1024 * 1024 * 1024,
+		TrafficQuota:         10 * 1024 * 1024 * 1024,
+		TrafficUploadQuota:   -1,
+		TrafficDownloadQuota: -1,
+		MaxUsers:             1,
+		Settings: map[string]string{
+			"theme":    "default",
+			"features": "all",
+		},
+		ChunkingPolynomial: 17592186044415,
+	}
+}
+
+func mergeOrganizationTemplate(base, override OrganizationTemplate) OrganizationTemplate {
+	merged := base
+	if strings.TrimSpace(override.Plan) != "" {
+		merged.Plan = strings.TrimSpace(override.Plan)
+	}
+	if strings.TrimSpace(override.QuotaPolicy) != "" {
+		merged.QuotaPolicy = strings.TrimSpace(override.QuotaPolicy)
+	}
+	if strings.TrimSpace(override.BillingCycle) != "" {
+		merged.BillingCycle = strings.TrimSpace(override.BillingCycle)
+	}
+	if override.StorageQuota != 0 {
+		merged.StorageQuota = override.StorageQuota
+	}
+	if override.TrafficQuota != 0 {
+		merged.TrafficQuota = override.TrafficQuota
+	}
+	if override.TrafficUploadQuota != 0 {
+		merged.TrafficUploadQuota = override.TrafficUploadQuota
+	}
+	if override.TrafficDownloadQuota != 0 {
+		merged.TrafficDownloadQuota = override.TrafficDownloadQuota
+	}
+	if override.MaxUsers != 0 {
+		merged.MaxUsers = override.MaxUsers
+	}
+	if len(override.Settings) > 0 {
+		merged.Settings = override.Settings
+	}
+	if len(override.StorageConfig) > 0 {
+		merged.StorageConfig = override.StorageConfig
+	}
+	if override.ChunkingPolynomial != 0 {
+		merged.ChunkingPolynomial = override.ChunkingPolynomial
+	}
+	return merged
+}
+
+// GetOrganizationTemplate returns the configured template for new organizations.
+// Custom templates inherit sane free-tier defaults unless explicitly overridden.
+func (c *Config) GetOrganizationTemplate(name string) OrganizationTemplate {
+	templateName := strings.TrimSpace(name)
+	if templateName == "" {
+		templateName = strings.TrimSpace(c.Organizations.DefaultTemplate)
+	}
+	if templateName == "" {
+		templateName = "free"
+	}
+
+	tpl := DefaultFreeOrganizationTemplate()
+	if configured, ok := c.Organizations.Templates[templateName]; ok {
+		tpl = mergeOrganizationTemplate(tpl, configured)
+	}
+	if strings.TrimSpace(tpl.Plan) == "" {
+		tpl.Plan = templateName
+	}
+	if tpl.Settings == nil {
+		tpl.Settings = map[string]string{}
+	}
+	if tpl.StorageConfig == nil {
+		tpl.StorageConfig = map[string]string{}
+	}
+	if strings.TrimSpace(tpl.StorageConfig["default_backend"]) == "" {
+		tpl.StorageConfig["default_backend"] = c.Storage.DefaultClass
+	}
+	return tpl
+}
+
+// PeriodEnd returns the billing period end for a template starting at start.
+func (t OrganizationTemplate) PeriodEnd(start time.Time) time.Time {
+	switch strings.ToLower(strings.TrimSpace(t.BillingCycle)) {
+	case "annual", "yearly":
+		return start.AddDate(1, 0, 0)
+	case "weekly":
+		return start.AddDate(0, 0, 7)
+	default:
+		return start.AddDate(0, 1, 0)
+	}
 }
 
 // FileViewConfig holds file preview and streaming settings
@@ -423,6 +544,12 @@ func DefaultConfig() *Config {
 			},
 		},
 		Billing: BillingConfig{},
+		Organizations: OrganizationsConfig{
+			DefaultTemplate: "free",
+			Templates: map[string]OrganizationTemplate{
+				"free": DefaultFreeOrganizationTemplate(),
+			},
+		},
 		Auth: AuthConfig{
 			DevMode:          true,
 			ShareLinkHMACKey: "sesamefs-default-share-hmac-key-change-me",
@@ -757,6 +884,13 @@ func (c *Config) Validate() error {
 	}
 	if c.Database.Keyspace == "" {
 		return fmt.Errorf("database keyspace is required")
+	}
+	defaultTemplate := strings.TrimSpace(c.Organizations.DefaultTemplate)
+	if defaultTemplate == "" {
+		defaultTemplate = "free"
+	}
+	if _, ok := c.Organizations.Templates[defaultTemplate]; !ok {
+		return fmt.Errorf("organizations.default_template %q is not defined in organizations.templates", defaultTemplate)
 	}
 	const insecureDefaultHMACKey = "sesamefs-default-share-hmac-key-change-me"
 	if !c.Auth.DevMode && (c.Auth.ShareLinkHMACKey == "" || c.Auth.ShareLinkHMACKey == insecureDefaultHMACKey) {

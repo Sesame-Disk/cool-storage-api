@@ -11,6 +11,8 @@ class OrgUserInfo {
     this.contact_email = object.owner_contact_email;
     this.status = object.status || (object.is_active ? 'active' : 'deactivated');
     this.is_active = object.is_active;
+    this.is_org_staff = object.is_org_staff;
+    this.role = object.role;
     this.quota_usage = object.quota_usage;
     this.quota_total = object.quota_total;
     this.last_login = object.last_login ? moment(object.last_login).fromNow() : '--';

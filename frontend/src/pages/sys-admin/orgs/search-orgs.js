@@ -42,24 +42,6 @@ class SearchOrgs extends Component {
     });
   };
 
-  updateRole = (orgID, role) => {
-    let orgInfo = {};
-    orgInfo.role = role;
-    seafileAPI.sysAdminUpdateOrg(orgID, orgInfo).then(res => {
-      let newOrgList = this.state.orgList.map(org => {
-        if (org.org_id === orgID) {
-          org.role = role;
-        }
-        return org;
-      });
-      this.setState({ orgList: newOrgList });
-      toaster.success(gettext('Edit succeeded'));
-    }).catch((error) => {
-      let errMessage = Utils.getErrorMsg(error);
-      toaster.danger(errMessage);
-    });
-  };
-
   deleteOrg = (orgID) => {
     seafileAPI.sysAdminDeleteOrg(orgID).then(res => {
       let orgList = this.state.orgList.filter(org => {
@@ -177,7 +159,6 @@ class SearchOrgs extends Component {
                   loading={this.state.loading}
                   errorMsg={this.state.errorMsg}
                   items={this.state.orgList}
-                  updateRole={this.updateRole}
                   deleteOrg={this.deleteOrg}
                   deactivateOrg={this.deactivateOrg}
                   reactivateOrg={this.reactivateOrg}

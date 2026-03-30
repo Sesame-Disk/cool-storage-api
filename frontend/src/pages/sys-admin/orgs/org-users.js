@@ -5,7 +5,7 @@ import { Button } from 'reactstrap';
 import moment from 'moment';
 import { Utils } from '../../../utils/utils';
 import { seafileAPI } from '../../../utils/seafile-api';
-import { gettext, username } from '../../../utils/constants';
+import { billingUrl, gettext, username } from '../../../utils/constants';
 import toaster from '../../../components/toast';
 import EmptyTip from '../../../components/empty-tip';
 import Loading from '../../../components/loading';
@@ -106,7 +106,8 @@ class Item extends Component {
       isDeleteDialogOpen: false,
       isResetPasswordDialogOpen: false,
       isRestoreDialogOpen: false,
-      isConfirmInactiveDialogOpen: false
+      isConfirmInactiveDialogOpen: false,
+      isConfirmTransferOwnershipDialogOpen: false
     };
   }
 
@@ -177,6 +178,10 @@ class Item extends Component {
     this.setState({ isConfirmInactiveDialogOpen: !this.state.isConfirmInactiveDialogOpen });
   };
 
+  toggleConfirmTransferOwnershipDialog = () => {
+    this.setState({ isConfirmTransferOwnershipDialogOpen: !this.state.isConfirmTransferOwnershipDialogOpen });
+  };
+
   updateStatus = (statusOption) => {
     this.props.updateStatus(this.props.item.email, statusOption.value);
   };
@@ -186,7 +191,16 @@ class Item extends Component {
   };
 
   updateMembership = (membershipOption) => {
+    if (membershipOption.value === 'Owner') {
+      this.toggleConfirmTransferOwnershipDialog();
+      return;
+    }
     this.props.updateMembership(this.props.item.email, membershipOption.value);
+  };
+
+  confirmTransferOwnership = () => {
+    this.props.updateMembership(this.props.item.email, 'Owner');
+    this.toggleConfirmTransferOwnershipDialog();
   };
 
   deleteUser = () => {
@@ -237,6 +251,8 @@ class Item extends Component {
 
   translateMembership = (membership) => {
     switch (membership) {
+      case 'Owner':
+        return gettext('Owner');
       case 'Admin':
         return gettext('Admin');
       case 'Member':
@@ -246,13 +262,14 @@ class Item extends Component {
 
   render() {
     const { item } = this.props;
-    const { highlight, isOpIconShown, isDeleteDialogOpen, isResetPasswordDialogOpen, isRestoreDialogOpen, isConfirmInactiveDialogOpen } = this.state;
+    const { highlight, isOpIconShown, isDeleteDialogOpen, isResetPasswordDialogOpen, isRestoreDialogOpen, isConfirmInactiveDialogOpen, isConfirmTransferOwnershipDialogOpen } = this.state;
 
     const itemName = '<span class="op-target">' + Utils.HTMLescape(item.name) + '</span>';
     let deleteDialogMsg = gettext('Are you sure you want to delete {placeholder} ?').replace('{placeholder}', itemName);
     let resetPasswordDialogMsg = gettext('Are you sure you want to reset the password of {placeholder} ?').replace('{placeholder}', itemName);
     const confirmSetUserInactiveMsg = gettext('Are you sure you want to set {user_placeholder} inactive?').replace('{user_placeholder}', itemName);
     const restoreDialogMsg = gettext('Are you sure you want to restore {placeholder} ?').replace('{placeholder}', itemName);
+    const confirmTransferOwnershipMsg = gettext('Transfer organization ownership to {user_placeholder}? The current owner will be downgraded to admin.').replace('{user_placeholder}', itemName);
 
     const effectiveStatus = item.status || (item.active ? 'active' : 'inactive');
     const isDeleted = effectiveStatus === 'deleted';
@@ -269,8 +286,13 @@ class Item extends Component {
     const currentSelectedStatusOption = this.statusOptions.filter(item => item.isSelected)[0];
 
     // for 'user membership'
-    const curMembership = item.is_org_staff ? 'Admin' : 'Member';
-    this.membershipOptions = ['Admin', 'Member'].map(item => {
+    let curMembership = 'Member';
+    if (item.role === 'owner') {
+      curMembership = 'Owner';
+    } else if (item.role === 'admin' || item.is_org_staff) {
+      curMembership = 'Admin';
+    }
+    this.membershipOptions = ['Member', 'Admin', 'Owner'].map(item => {
       return {
         value: item,
         text: this.translateMembership(item),
@@ -300,14 +322,16 @@ class Item extends Component {
           <td>
             {isDeleted ?
               <span className="text-secondary">--</span>
-              :
-              <Selector
-                isDropdownToggleShown={highlight}
-                currentSelectedOption={currentSelectedMembershipOption}
-                options={this.membershipOptions}
-                selectOption={this.updateMembership}
-                toggleItemFreezed={this.props.toggleItemFreezed}
-              />
+              : item.role === 'owner' ?
+                <span>{gettext('Owner')}</span>
+                :
+                <Selector
+                  isDropdownToggleShown={highlight}
+                  currentSelectedOption={currentSelectedMembershipOption}
+                  options={this.membershipOptions}
+                  selectOption={this.updateMembership}
+                  toggleItemFreezed={this.props.toggleItemFreezed}
+                />
             }
           </td>
           <td>{`${Utils.bytesToSize(item.quota_usage)} / ${item.quota_total > 0 ? Utils.bytesToSize(item.quota_total) : '--'}`}</td>
@@ -362,6 +386,15 @@ class Item extends Component {
             toggleDialog={this.toggleRestoreDialog}
           />
         }
+        {isConfirmTransferOwnershipDialogOpen &&
+          <CommonOperationConfirmationDialog
+            title={gettext('Transfer ownership')}
+            message={confirmTransferOwnershipMsg}
+            executeOperation={this.confirmTransferOwnership}
+            confirmBtnText={gettext('Transfer')}
+            toggleDialog={this.toggleConfirmTransferOwnershipDialog}
+          />
+        }
       </Fragment>
     );
   }
@@ -386,6 +419,9 @@ class OrgUsers extends Component {
       loading: true,
       errorMsg: '',
       orgName: '',
+      orgPlan: '',
+      maxUsers: 0,
+      currentUsers: 0,
       userList: [],
       statusFilter: 'all',
       isAddUserDialogOpen: false
@@ -397,14 +433,21 @@ class OrgUsers extends Component {
     const statusFilter = urlParams.get('status') || this.state.statusFilter;
     this.setState({ statusFilter });
 
-    seafileAPI.sysAdminGetOrg(this.props.orgID).then((res) => {
-      this.setState({
-        orgName: res.data.org_name
-      });
-    });
+    this.refreshOrgInfo();
 
     this.getUsers(statusFilter);
   }
+
+  refreshOrgInfo = () => {
+    seafileAPI.sysAdminGetOrg(this.props.orgID).then((res) => {
+      this.setState({
+        orgName: res.data.org_name,
+        orgPlan: res.data.plan || '',
+        maxUsers: Number(res.data.max_users || res.data.max_user_number) || 0,
+        currentUsers: Number(res.data.users_count) || 0,
+      });
+    });
+  };
 
   getUsers = (statusFilter = this.state.statusFilter) => {
     seafileAPI.sysAdminListOrgUsers(this.props.orgID, statusFilter).then((res) => {
@@ -443,12 +486,14 @@ class OrgUsers extends Component {
       let userList = this.state.userList;
       userList.unshift(res.data);
       this.setState({ userList: userList });
+      this.refreshOrgInfo();
     });
   };
 
   deleteUser = (orgID, email) => {
     seafileAPI.sysAdminDeleteOrgUser(orgID, email).then(res => {
       this.getUsers(this.state.statusFilter);
+      this.refreshOrgInfo();
       toaster.success(gettext('Successfully deleted 1 item.'));
     }).catch((error) => {
       let errMessage = Utils.getErrorMsg(error);
@@ -459,6 +504,7 @@ class OrgUsers extends Component {
   restoreUser = (email) => {
     seafileAPI.sysAdminRestoreUser(email).then(() => {
       this.getUsers(this.state.statusFilter);
+      this.refreshOrgInfo();
       toaster.success(gettext('Edit succeeded'));
     }).catch((error) => {
       let errMessage = Utils.getErrorMsg(error);
@@ -484,12 +530,22 @@ class OrgUsers extends Component {
   };
 
   updateMembership = (email, membershipValue) => {
-    const isOrgStaff = membershipValue === 'Admin';
-    seafileAPI.sysAdminUpdateOrgUser(this.props.orgID, email, 'is_org_staff', isOrgStaff).then(res => {
+    const role = membershipValue === 'Owner'
+      ? 'owner'
+      : membershipValue === 'Admin'
+        ? 'admin'
+        : 'user';
+    seafileAPI.sysAdminUpdateOrgUser(this.props.orgID, email, 'role', role).then(res => {
+      if (membershipValue === 'Owner') {
+        this.getUsers(this.state.statusFilter);
+        toaster.success(gettext('Organization ownership transferred successfully.'));
+        return;
+      }
       let newUserList = this.state.userList.map(item => {
         if (item.email === email) {
           item.status = res.data.status;
           item.is_org_staff = res.data.is_org_staff;
+          item.role = res.data.role;
         }
         return item;
       });
@@ -501,11 +557,24 @@ class OrgUsers extends Component {
   };
 
   render() {
-    const { isAddUserDialogOpen, orgName } = this.state;
+    const { isAddUserDialogOpen, orgName, orgPlan, maxUsers, currentUsers } = this.state;
+    const canAddUsers = maxUsers <= 0 || currentUsers < maxUsers;
     return (
       <Fragment>
         <MainPanelTopbar {...this.props}>
-          <Button className="btn btn-secondary operation-item" onClick={this.toggleAddUserDialog}>{gettext('Add Member')}</Button>
+          {canAddUsers ? (
+            <Button className="btn btn-secondary operation-item" onClick={this.toggleAddUserDialog}>{gettext('Add Member')}</Button>
+          ) : (
+            <div className="d-flex align-items-center">
+              <span className="mr-3 text-secondary">
+                {gettext('This organization has reached its member limit (%(used)s/%(total)s) for the %(plan)s plan.')
+                  .replace('%(used)s', currentUsers)
+                  .replace('%(total)s', maxUsers)
+                  .replace('%(plan)s', orgPlan || gettext('current'))}
+              </span>
+              <a href={billingUrl} className="btn btn-outline-primary" target="_blank" rel="noopener noreferrer">{gettext('Manage Billing')}</a>
+            </div>
+          )}
         </MainPanelTopbar>
         <div className="main-panel-center flex-row">
           <div className="cur-view-container">
@@ -548,7 +617,7 @@ class OrgUsers extends Component {
             </div>
           </div>
         </div>
-        {isAddUserDialogOpen &&
+        {canAddUsers && isAddUserDialogOpen &&
           <SysAdminAddUserDialog
             addUser={this.addUser}
             toggleDialog={this.toggleAddUserDialog}

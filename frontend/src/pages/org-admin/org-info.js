@@ -1,7 +1,7 @@
 import React, { Component, Fragment } from 'react';
 import { Button } from 'reactstrap';
 import { seafileAPI } from '../../utils/seafile-api';
-import { gettext, isOrgOwner, orgID, orgMemberQuotaEnabled, subscriptionDetailsUrl, username } from '../../utils/constants';
+import { gettext, isOrgOwner, orgID, subscriptionDetailsUrl, username } from '../../utils/constants';
 import { Utils } from '../../utils/utils';
 import MainPanelTopbar from './main-panel-topbar';
 import TransferOrgOwnershipDialog from '../../components/dialog/transfer-org-ownership-dialog';
@@ -133,6 +133,7 @@ class OrgInfo extends Component {
     }
 
     const memberQuota = this.state.max_users > 0 ? this.state.max_users : this.state.member_quota;
+    const showsMemberLimit = memberQuota > 0;
     const formatQuota = (used, quota) => {
       return quota > 0 ? `${Utils.bytesToSize(used)} / ${Utils.bytesToSize(quota)}` : `${Utils.bytesToSize(used)} / ${gettext('Unlimited')}`;
     };
@@ -186,9 +187,9 @@ class OrgInfo extends Component {
                 <dt>{gettext('This Year Traffic')} ({gettext('Total')} / {gettext('Upload')} / {gettext('Download')})</dt>
                 <dd>{formatTrafficBreakdown(this.state.traffic_year_total, this.state.traffic_year_upload, this.state.traffic_year_download)}</dd>
 
-                {orgMemberQuotaEnabled ? <dt>{gettext('Active Users')} / {gettext('Total Users')} / {gettext('Limits')}</dt> : <dt>{gettext('Active Users')} / {gettext('Total Users')}</dt>}
+                {showsMemberLimit ? <dt>{gettext('Active Users')} / {gettext('Total Users')} / {gettext('Limits')}</dt> : <dt>{gettext('Active Users')} / {gettext('Total Users')}</dt>}
 
-                {orgMemberQuotaEnabled ? <dd>{(this.state.active_members > 0) ? this.state.active_members : '--'} / {(this.state.member_usage > 0) ? this.state.member_usage : '--'} / {(memberQuota > 0) ? memberQuota : '--'}</dd> : <dd>{this.state.active_members > 0 ? this.state.active_members : '--'} / {this.state.member_usage > 0 ? this.state.member_usage : '--'}</dd>}
+                {showsMemberLimit ? <dd>{(this.state.active_members > 0) ? this.state.active_members : '--'} / {(this.state.member_usage > 0) ? this.state.member_usage : '--'} / {memberQuota}</dd> : <dd>{this.state.active_members > 0 ? this.state.active_members : '--'} / {this.state.member_usage > 0 ? this.state.member_usage : '--'}</dd>}
 
                 {subscriptionDetailsUrl && (
                   <Fragment>

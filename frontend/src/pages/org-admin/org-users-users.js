@@ -9,10 +9,11 @@ import ModalPortal from '../../components/modal-portal';
 import AddOrgUserDialog from '../../components/dialog/org-add-user-dialog';
 import InviteUserDialog from '../../components/dialog/org-admin-invite-user-dialog';
 import InviteUserViaWeiXinDialog from '../../components/dialog/org-admin-invite-user-via-weixin-dialog';
+import TransferOrgOwnershipDialog from '../../components/dialog/transfer-org-ownership-dialog';
 import toaster from '../../components/toast';
 import { seafileAPI } from '../../utils/seafile-api';
 import OrgUserInfo from '../../models/org-user';
-import { billingUrl, gettext, invitationLink, orgID, siteRoot, orgEnableAdminInviteUser, hasUserAvailability, orgMembers, orgMembersQuota } from '../../utils/constants';
+import { billingUrl, gettext, invitationLink, isOrgOwner, orgID, siteRoot, orgEnableAdminInviteUser, username } from '../../utils/constants';
 import { getUpgradeState } from '../../utils/upgrade-state';
 import { Utils } from '../../utils/utils';
 
@@ -84,7 +85,13 @@ class OrgUsers extends Component {
       isShowAddOrgUserDialog: false,
       isImportOrgUsersDialogOpen: false,
       isInviteUserDialogOpen: false,
-      isInviteUserViaWeiXinDialogOpen: false
+      isInviteUserViaWeiXinDialogOpen: false,
+      isTransferOwnershipDialogOpen: false,
+      canTransferOwnership: isOrgOwner,
+      orgPlan: '',
+      maxUsers: 0,
+      currentUsers: 0,
+      limitsLoaded: false,
     };
   }
 
@@ -101,9 +108,23 @@ class OrgUsers extends Component {
       sortOrder: urlParams.get('direction') || sortOrder,
       statusFilter: urlParams.get('status') || statusFilter
     }, () => {
+      this.refreshOrgLimits();
       this.initOrgUsersData(this.state.page);
     });
   }
+
+  refreshOrgLimits = () => {
+    seafileAPI.orgAdminGetOrgInfo().then((res) => {
+      this.setState({
+        orgPlan: res.data.plan || '',
+        maxUsers: Number(res.data.max_users) || 0,
+        currentUsers: Number(res.data.member_usage) || 0,
+        limitsLoaded: true,
+      });
+    }).catch(() => {
+      this.setState({ limitsLoaded: true });
+    });
+  };
 
   sortByQuotaUsage = () => {
     this.setState({
@@ -137,6 +158,10 @@ class OrgUsers extends Component {
 
   toggleInviteUserViaWeiXinDialog = () => {
     this.setState({ isInviteUserViaWeiXinDialogOpen: !this.state.isInviteUserViaWeiXinDialogOpen });
+  };
+
+  toggleTransferOwnershipDialog = () => {
+    this.setState({ isTransferOwnershipDialogOpen: !this.state.isTransferOwnershipDialogOpen });
   };
 
   initOrgUsersData = (page) => {
@@ -184,6 +209,7 @@ class OrgUsers extends Component {
         this.setState({
           orgUsers: users.concat(this.state.orgUsers)
         });
+        this.refreshOrgLimits();
       }
       res.data.failed.forEach(item => {
         const msg = `${item.email}: ${item.error_msg}`;
@@ -202,6 +228,7 @@ class OrgUsers extends Component {
       this.setState({
         orgUsers: this.state.orgUsers
       });
+      this.refreshOrgLimits();
       this.toggleAddOrgUser();
       let msg = gettext('successfully added user %s.');
       msg = msg.replace('%s', email);
@@ -217,6 +244,7 @@ class OrgUsers extends Component {
     seafileAPI.orgAdminDeleteOrgUser(orgID, email).then(res => {
       const targetPage = this.state.orgUsers.length === 1 && this.state.page > 1 ? this.state.page - 1 : this.state.page;
       this.initOrgUsersData(targetPage);
+      this.refreshOrgLimits();
       let msg = gettext('Deleted user %s');
       msg = msg.replace('%s', username);
       toaster.success(msg);
@@ -235,6 +263,7 @@ class OrgUsers extends Component {
       this.setState({
         orgUsers: users.concat(this.state.orgUsers)
       });
+      this.refreshOrgLimits();
 
       res.data.success.forEach(item => {
         let msg = gettext('successfully sent email to %s.');
@@ -273,6 +302,7 @@ class OrgUsers extends Component {
   restoreUser = (email, username) => {
     seafileAPI.orgAdminRestoreOrgUser(orgID, email).then(() => {
       this.initOrgUsersData(this.state.page);
+      this.refreshOrgLimits();
       let msg = gettext('Restored user %s');
       msg = msg.replace('%s', username);
       toaster.success(msg);
@@ -286,6 +316,26 @@ class OrgUsers extends Component {
     navigate(`${siteRoot}org/useradmin/search-users/?query=${encodeURIComponent(keyword)}`);
   };
 
+  searchOrgAdmins = (query) => {
+    return seafileAPI.orgAdminSearchUser(orgID, query, 1, 25, 'active').then((res) => {
+      const users = (res.data.user_list || []).filter((user) => user.is_org_staff);
+      return { data: { users } };
+    });
+  };
+
+  transferOwnership = (newOwnerEmail) => {
+    seafileAPI.orgAdminTransferOwnership(orgID, newOwnerEmail).then(() => {
+      this.setState({
+        isTransferOwnershipDialogOpen: false,
+        canTransferOwnership: false,
+      });
+      this.initOrgUsersData(this.state.page);
+      toaster.success(gettext('Organization ownership transferred successfully.'));
+    }).catch((error) => {
+      toaster.danger(Utils.getErrorMsg(error));
+    });
+  };
+
   getSearch = () => {
     return <Search
       placeholder={gettext('Search users')}
@@ -296,28 +346,37 @@ class OrgUsers extends Component {
   render() {
     const topBtn = 'btn btn-secondary operation-item';
     const { isFeatureLockedOwner } = getUpgradeState();
-    const canAddUsers = !isFeatureLockedOwner && hasUserAvailability;
+    const { canTransferOwnership, isTransferOwnershipDialogOpen, currentUsers, limitsLoaded, maxUsers, orgPlan } = this.state;
+    const hasUserAvailability = maxUsers <= 0 || currentUsers < maxUsers;
+    const canAddUsers = limitsLoaded && !isFeatureLockedOwner && hasUserAvailability;
 
     let topbarChildren;
     topbarChildren = (
       <Fragment>
         {/* <button className="btn btn-secondary operation-item" onClick={this.toggleImportOrgUsersDialog}>{gettext('Import users')}</button> */}
 
+        {canTransferOwnership && (
+          <button className={topBtn} onClick={this.toggleTransferOwnershipDialog}>
+            {gettext('Transfer ownership')}
+          </button>
+        )}
+
         {isFeatureLockedOwner ? (
           <div className="d-flex align-items-center">
             <span className="mr-3" style={{ color: '#666' }}>{gettext('Upgrade your plan to unlock additional seats and member management.')}</span>
             <a href={billingUrl} className="btn btn-primary" target="_blank" rel="noopener noreferrer">{gettext('Upgrade Plan')}</a>
           </div>
-        ) : !hasUserAvailability ? (
+        ) : limitsLoaded && !hasUserAvailability ? (
           <div className="d-flex align-items-center">
             <span className="mr-3" style={{ color: '#666' }}>
-              {gettext('You have reached your member limit (%(used)s/%(total)s). Update billing to add more users.')
-                .replace('%(used)s', orgMembers)
-                .replace('%(total)s', orgMembersQuota)}
+              {gettext('You have reached the member limit (%(used)s/%(total)s) for the %(plan)s plan. Update billing to add more users.')
+                .replace('%(used)s', currentUsers)
+                .replace('%(total)s', maxUsers)
+                .replace('%(plan)s', orgPlan || gettext('current'))}
             </span>
             <a href={billingUrl} className="btn btn-outline-primary" target="_blank" rel="noopener noreferrer">{gettext('Manage Billing')}</a>
           </div>
-        ) : (
+        ) : !limitsLoaded ? null : (
           <Fragment>
             <button className={topBtn} title={gettext('Add user')} onClick={this.toggleAddOrgUser}>
               <i className="fas fa-plus-square text-secondary mr-1"></i>{gettext('Add user')}</button>
@@ -352,6 +411,14 @@ class OrgUsers extends Component {
           <ModalPortal>
             <InviteUserViaWeiXinDialog invitationLink={invitationLink} toggle={this.toggleInviteUserViaWeiXinDialog} />
           </ModalPortal>
+        }
+        {isTransferOwnershipDialogOpen &&
+          <TransferOrgOwnershipDialog
+            currentOwner={username}
+            searchFunc={this.searchOrgAdmins}
+            onSubmit={this.transferOwnership}
+            toggleDialog={this.toggleTransferOwnershipDialog}
+          />
         }
       </Fragment>
     );

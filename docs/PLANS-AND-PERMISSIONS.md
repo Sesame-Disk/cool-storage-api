@@ -1,7 +1,7 @@
 # Plans & Permissions — SesameFS
 
-**Last Updated**: 2026-03-28
-**Status**: Phase 1 IMPLEMENTED — Phase 2 BACKEND COMPLETE — Phase 3 pending
+**Last Updated**: 2026-03-30
+**Status**: Phase 1 IMPLEMENTED — Phase 2 BACKEND COMPLETE — Phase 3 IN PROGRESS
 
 ---
 
@@ -784,6 +784,27 @@ Phase 2 implementation notes:
 | 3.6 | Add share link expiry enforcement from `share_link_expire_days_max` | Share link creation UI | Low |
 | 3.7 | Add quota warning banners from `storage.over_quota` / `traffic.over_quota` | Layout/header components | Medium |
 | 3.8 | Remove all `personalfree`/`business`/`pay_restricted*` references | Multiple files | Medium |
+
+### Phase 3 Progress Update (2026-03-30)
+
+Already landed:
+- `frontend/src/app.js` now consumes the new account/subscription contract fields used by the upgrade-state helpers (`plan`, `can_upgrade`, `maxUsers`, `currentUsers`, quota objects, current period data).
+- Sysadmin org surfaces now present org semantics as `owner` and `plan`, not `creator` and fake `role`.
+- Ownership transfer is exposed from both the sysadmin member-management flow and the org-admin users page.
+- The critical member-limit UI now reads live org data on the affected pages:
+  - sysadmin org users gates `Add Member` from `sysAdminGetOrg()`
+  - org-admin users gates `Add user` / invites from `orgAdminGetOrgInfo()`
+  - org-admin info derives member-limit visibility from real quota values instead of shell placeholders
+
+Still pending before Phase 3 can be considered closed:
+- Remove remaining frontend legacy plan-role code paths (`personalfree`, `business`, `pay_restricted*`) and converge all CTAs on `can_upgrade` + `upgrade_features`.
+- Eliminate remaining org-admin dependencies on placeholder `window.org.pageOptions` values for invite/config/navigation flags.
+- Standardize quota-size units in the UI: some screens appear to use decimal `GB` (`1000^3`) while backend/utilities use binary byte conversions (`1024^3`). The product must choose one convention and label it consistently.
+- Finish warning/banner UX for quota states (`storage.over_quota`, `traffic.over_quota`, upload/download overages).
+
+Conclusion:
+- **Phase 3 is not done yet.**
+- It is materially advanced, but still open due to frontend cleanup and bootstrap consistency work.
 
 ### Phase 4: Provisioning Integration (when Accounts is ready)
 

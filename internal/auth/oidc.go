@@ -31,9 +31,10 @@ import (
 
 // OIDCClient handles OIDC authentication flows
 type OIDCClient struct {
-	config   *config.OIDCConfig
-	db       *db.DB
-	sessions *SessionManager
+	appConfig *config.Config
+	config    *config.OIDCConfig
+	db        *db.DB
+	sessions  *SessionManager
 
 	// Cached OIDC discovery document
 	discoveryMu sync.RWMutex
@@ -151,13 +152,14 @@ type AuthResult struct {
 }
 
 // NewOIDCClient creates a new OIDC client
-func NewOIDCClient(cfg *config.OIDCConfig, database *db.DB, sessions *SessionManager) *OIDCClient {
+func NewOIDCClient(appCfg *config.Config, database *db.DB, sessions *SessionManager) *OIDCClient {
 	return &OIDCClient{
-		config:   cfg,
-		db:       database,
-		sessions: sessions,
-		states:   make(map[string]*AuthState),
-		jwksKeys: make(map[string]crypto.PublicKey),
+		appConfig: appCfg,
+		config:    &appCfg.Auth.OIDC,
+		db:        database,
+		sessions:  sessions,
+		states:    make(map[string]*AuthState),
+		jwksKeys:  make(map[string]crypto.PublicKey),
 	}
 }
 
@@ -698,14 +700,15 @@ func (c *OIDCClient) provisionUser(ctx context.Context, claims *IDTokenClaims, u
 			SELECT org_id FROM organizations WHERE org_id = ?
 		`, orgID).Scan(&existingOrgID)
 		if orgErr != nil {
-			// Org doesn't exist - create it with free tier defaults
+			// Org doesn't exist - create it with the configured default org template.
 			isNewOrg = true
 			orgName := c.config.DefaultOrgName
 			if orgName == "" {
 				orgName = "Auto-provisioned Organization"
 			}
 			now := time.Now()
-			periodEnd := now.AddDate(0, 1, 0) // +1 month
+			template := c.appConfig.GetOrganizationTemplate("")
+			periodEnd := template.PeriodEnd(now)
 			createErr := c.db.Session().Query(`
 				INSERT INTO organizations (
 					org_id, name, status, settings, storage_quota, storage_used,
@@ -715,19 +718,19 @@ func (c *OIDCClient) provisionUser(ctx context.Context, claims *IDTokenClaims, u
 					current_period_started_at, current_period_ends_at
 				) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			`, orgID, orgName, "active",
-				map[string]string{"theme": "default", "features": "all"},
-				int64(2147483648), int64(0), int64(17592186044415), // 2GB storage
-				map[string]string{"default_backend": "s3"},
+				template.Settings,
+				template.StorageQuota, int64(0), template.ChunkingPolynomial,
+				template.StorageConfig,
 				now,
-				"free",             // plan
-				"hard",             // quota_policy
-				"monthly",          // billing_cycle
-				int64(10737418240), // traffic_quota: 10GB
-				int64(-1),          // traffic_upload_quota
-				int64(-1),          // traffic_download_quota
-				int(1),             // max_users
-				now,                // current_period_started_at
-				periodEnd,          // current_period_ends_at
+				template.Plan,
+				template.QuotaPolicy,
+				template.BillingCycle,
+				template.TrafficQuota,
+				template.TrafficUploadQuota,
+				template.TrafficDownloadQuota,
+				template.MaxUsers,
+				now,
+				periodEnd,
 			).Exec()
 			if createErr != nil {
 				fmt.Printf("Warning: failed to auto-provision org %s: %v\n", orgID, createErr)

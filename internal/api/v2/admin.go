@@ -292,17 +292,17 @@ func (h *AdminHandler) ListOrganizations(c *gin.Context) {
 	}
 
 	iter := h.db.Session().Query(`
-		SELECT org_id, name, status, storage_quota, created_at, deleted_at
+		SELECT org_id, name, status, storage_quota, plan, created_at, deleted_at
 		FROM organizations
 	`).Iter()
 
 	var orgs []gin.H
-	var orgID, name, status string
+	var orgID, name, status, plan string
 	var storageQuota int64
 	var createdAt time.Time
 	var deletedAt *time.Time
 
-	for iter.Scan(&orgID, &name, &status, &storageQuota, &createdAt, &deletedAt) {
+	for iter.Scan(&orgID, &name, &status, &storageQuota, &plan, &createdAt, &deletedAt) {
 		effectiveStatus := status
 		if effectiveStatus == "" {
 			effectiveStatus = StatusActive
@@ -312,23 +312,23 @@ func (h *AdminHandler) ListOrganizations(c *gin.Context) {
 		}
 
 		usersCount := h.countOrgUsers(orgID)
-		creatorEmail, creatorName := h.resolveOrgCreator(orgID)
+		ownerEmail, ownerName := h.resolveOrgCreator(orgID)
 		var deletedAtStr interface{}
 		if deletedAt != nil {
 			deletedAtStr = deletedAt.Format(time.RFC3339)
 		}
 		orgs = append(orgs, gin.H{
-			"org_id":        orgID,
-			"org_name":      name,
-			"creator_email": creatorEmail,
-			"creator_name":  creatorName,
-			"status":        effectiveStatus,
-			"deleted_at":    deletedAtStr,
-			"role":          "default",
-			"quota_usage":   traffic.ReadStorageUsed(h.db, fmt.Sprintf("org:%s", orgID)),
-			"quota":         storageQuota,
-			"ctime":         createdAt.Format(time.RFC3339),
-			"users_count":   usersCount,
+			"org_id":      orgID,
+			"org_name":    name,
+			"owner_email": ownerEmail,
+			"owner_name":  ownerName,
+			"status":      effectiveStatus,
+			"deleted_at":  deletedAtStr,
+			"plan":        plan,
+			"quota_usage": traffic.ReadStorageUsed(h.db, fmt.Sprintf("org:%s", orgID)),
+			"quota":       storageQuota,
+			"ctime":       createdAt.Format(time.RFC3339),
+			"users_count": usersCount,
 		})
 	}
 	if err := iter.Close(); err != nil {
@@ -377,18 +377,19 @@ func (h *AdminHandler) CreateOrganization(c *gin.Context) {
 		orgName = strings.TrimSpace(body.Name)
 	}
 	ownerEmail := strings.TrimSpace(body.OwnerEmail)
-	storageQuota := body.StorageQuota
 
 	if orgName == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "org_name (or name) is required"})
 		return
 	}
-	if storageQuota <= 0 {
-		storageQuota = 2147483648 // 2 GB free-tier default
-	}
 	if h.db == nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "database not available"})
 		return
+	}
+	template := h.config.GetOrganizationTemplate("")
+	storageQuota := template.StorageQuota
+	if body.StorageQuota > 0 {
+		storageQuota = body.StorageQuota
 	}
 
 	// ── Validate owner email before creating anything ─────────────────────
@@ -405,15 +406,9 @@ func (h *AdminHandler) CreateOrganization(c *gin.Context) {
 	// ── Create the organization ────────────────────────────────────────────
 	orgID := uuid.New()
 	now := time.Now()
-	periodEnd := now.AddDate(0, 1, 0) // +1 month default period
-
-	settings := map[string]string{
-		"theme":    "default",
-		"features": "all",
-	}
-	storageConfig := map[string]string{
-		"default_backend": "s3",
-	}
+	periodEnd := template.PeriodEnd(now)
+	settings := template.Settings
+	storageConfig := template.StorageConfig
 
 	orgInsertQuery := `
 		INSERT INTO organizations (
@@ -426,17 +421,17 @@ func (h *AdminHandler) CreateOrganization(c *gin.Context) {
 	`
 	orgInsertArgs := []interface{}{
 		orgID.String(), orgName, StatusActive, settings,
-		storageQuota, int64(0), int64(17592186044415),
+		storageQuota, int64(0), template.ChunkingPolynomial,
 		storageConfig, now,
-		"Free Plan",        // plan (display)
-		"hard",             // quota_policy (free tier defaults)
-		"monthly",          // billing_cycle
-		int64(10737418240), // traffic_quota: 10 GB combined
-		int64(-1),          // traffic_upload_quota: no individual limit
-		int64(-1),          // traffic_download_quota: no individual limit
-		int(1),             // max_users: 1
-		now,                // current_period_started_at
-		periodEnd,          // current_period_ends_at
+		template.Plan,
+		template.QuotaPolicy,
+		template.BillingCycle,
+		template.TrafficQuota,
+		template.TrafficUploadQuota,
+		template.TrafficDownloadQuota,
+		template.MaxUsers,
+		now,       // current_period_started_at
+		periodEnd, // current_period_ends_at
 	}
 
 	// ── Optionally create the owner user ──────────────────────────────────
@@ -473,16 +468,16 @@ func (h *AdminHandler) CreateOrganization(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusCreated, gin.H{
-		"org_id":        orgID.String(),
-		"org_name":      orgName,
-		"creator_email": ownerEmail,
-		"creator_name":  ownerName,
-		"status":        StatusActive,
-		"deleted_at":    nil,
-		"role":          "owner",
-		"quota_usage":   int64(0),
-		"quota":         storageQuota,
-		"ctime":         now.Format(time.RFC3339),
+		"org_id":      orgID.String(),
+		"org_name":    orgName,
+		"owner_email": ownerEmail,
+		"owner_name":  ownerName,
+		"status":      StatusActive,
+		"deleted_at":  nil,
+		"plan":        template.Plan,
+		"quota_usage": int64(0),
+		"quota":       storageQuota,
+		"ctime":       now.Format(time.RFC3339),
 		"users_count": func() int {
 			if ownerEmail != "" {
 				return 1
@@ -551,7 +546,7 @@ func (h *AdminHandler) GetOrganization(c *gin.Context) {
 	usersCount := h.countOrgUsers(orgID)
 	reposCount := h.countOrgLibraries(orgID)
 	groupsCount := h.countOrgGroups(orgID)
-	creatorEmail, creatorName := h.resolveOrgCreator(orgID)
+	ownerEmail, ownerName := h.resolveOrgCreator(orgID)
 
 	// Extract max_user_number from settings map as backward-compatible fallback.
 	maxUserNumber := maxUsers
@@ -577,11 +572,10 @@ func (h *AdminHandler) GetOrganization(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"org_id":                    orgID,
 		"org_name":                  name,
-		"creator_email":             creatorEmail,
-		"creator_name":              creatorName,
+		"owner_email":               ownerEmail,
+		"owner_name":                ownerName,
 		"status":                    effectiveStatus,
 		"deleted_at":                deletedAtStr,
-		"role":                      "default",
 		"quota_usage":               traffic.ReadStorageUsed(h.db, fmt.Sprintf("org:%s", orgID)),
 		"quota":                     storageQuota,
 		"storage_quota":             storageQuota,
@@ -986,6 +980,7 @@ func (h *AdminHandler) ListOrgUsers(c *gin.Context) {
 		users = append(users, gin.H{
 			"email":        email,
 			"name":         name,
+			"role":         role,
 			"status":       normalizeUserStatus(status),
 			"active":       isActive,
 			"is_org_staff": isOrgStaff,
