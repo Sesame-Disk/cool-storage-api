@@ -3,7 +3,6 @@
 package integration
 
 import (
-	"fmt"
 	"net/http"
 	"net/url"
 	"testing"
@@ -65,12 +64,13 @@ func TestInvalidUserQuotaUpdatesAreRejected(t *testing.T) {
 		"traffic_download_quota": 0,
 	})
 
-	values := url.Values{}
-	values.Set("traffic_upload_quota", fmt.Sprintf("%d", invalidTrafficUpload))
-	values.Set("traffic_download_quota", fmt.Sprintf("%d", invalidTrafficDownload))
+	body := map[string]interface{}{
+		"traffic_upload_quota":   invalidTrafficUpload,
+		"traffic_download_quota": invalidTrafficDownload,
+	}
 
 	t.Run("admin users email update rejects combined overflow", func(t *testing.T) {
-		resp := superadminClient.PutForm(t, "/api/v2.1/admin/users/"+url.PathEscape(defaultUserEmail)+"/", values)
+		resp := superadminClient.PutJSON(t, "/api/v2.1/admin/users/"+url.PathEscape(defaultUserEmail)+"/", body)
 		expectStatus(t, resp, http.StatusBadRequest)
 		body := responseJSON(t, resp)
 		if body["error"] != "upload + download quota sum (110000000) exceeds organization combined traffic limit (100000000)" {
@@ -79,7 +79,7 @@ func TestInvalidUserQuotaUpdatesAreRejected(t *testing.T) {
 	})
 
 	t.Run("platform admin org user update rejects combined overflow", func(t *testing.T) {
-		resp := superadminClient.PutForm(t, "/api/v2.1/admin/organizations/"+defaultOrgID+"/users/"+url.PathEscape(defaultUserEmail)+"/", values)
+		resp := superadminClient.PutJSON(t, "/api/v2.1/admin/organizations/"+defaultOrgID+"/users/"+url.PathEscape(defaultUserEmail)+"/", body)
 		expectStatus(t, resp, http.StatusBadRequest)
 		body := responseJSON(t, resp)
 		if body["error"] != "upload + download quota sum (110000000) exceeds organization combined traffic limit (100000000)" {
@@ -88,7 +88,7 @@ func TestInvalidUserQuotaUpdatesAreRejected(t *testing.T) {
 	})
 
 	t.Run("org admin user update rejects combined overflow", func(t *testing.T) {
-		resp := adminClient.PutForm(t, "/api/v2.1/org/"+defaultOrgID+"/admin/users/"+url.PathEscape(defaultUserEmail)+"/", values)
+		resp := adminClient.PutJSON(t, "/api/v2.1/org/"+defaultOrgID+"/admin/users/"+url.PathEscape(defaultUserEmail)+"/", body)
 		expectStatus(t, resp, http.StatusBadRequest)
 		body := responseJSON(t, resp)
 		if body["error"] != "upload + download quota sum (110000000) exceeds organization combined traffic limit (100000000)" {

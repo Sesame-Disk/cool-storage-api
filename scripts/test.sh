@@ -15,8 +15,10 @@
 #   multiregion   Run multi-region tests (requires multi-region setup)
 #   failover      Run failover tests (requires multi-region setup)
 #   go            Run Go unit tests
+#   go-all        Run all Go tests (unit + integration)
 #   go-integration Run Go integration tests (requires backend)
 #   frontend      Run frontend tests
+#   mobile        Run mobile frontend checks
 #   all           Run all applicable tests
 #
 # Options:
@@ -38,8 +40,10 @@
 #   sync        - Backend + seafile-cli container
 #   multiregion - Multi-region stack (./scripts/bootstrap.sh multiregion)
 #   failover    - Multi-region stack + host docker access
-#   go          - Go 1.25+ or Docker
-#   frontend    - Node.js + npm
+#   go          - Docker compose test profile
+#   go-all      - Docker compose test profile + running backend
+#   frontend    - Docker compose test profile
+#   mobile      - Docker compose test profile
 #
 
 set -e
@@ -106,7 +110,7 @@ log_section() { echo -e "\n${CYAN}=== $1 ===${NC}\n"; }
 
 # Check if a service is available
 check_backend() {
-    local url="${SESAMEFS_URL:-http://localhost:8082}"
+    local url="${SESAMEFS_URL:-http://localhost:3000}"
     if curl -s -f "$url/health" > /dev/null 2>&1; then
         return 0
     fi
@@ -165,6 +169,37 @@ check_node() {
     return 1
 }
 
+check_docker_compose() {
+    if docker compose version > /dev/null 2>&1; then
+        return 0
+    fi
+    return 1
+}
+
+run_compose_service() {
+    local service="$1"
+    local name="$2"
+
+    TOTAL_SUITES=$((TOTAL_SUITES + 1))
+
+    if [ "$LIST_ONLY" = true ]; then
+        echo "  - $name ($service)"
+        return 0
+    fi
+
+    log_section "Running: $name"
+
+    if docker compose --profile test run --rm --build "$service"; then
+        PASSED_SUITES=$((PASSED_SUITES + 1))
+        log_success "$name completed"
+        return 0
+    fi
+
+    FAILED_SUITES=$((FAILED_SUITES + 1))
+    log_error "$name failed"
+    return 1
+}
+
 # Run a test suite
 run_suite() {
     local name="$1"
@@ -182,7 +217,7 @@ run_suite() {
     log_section "Running: $name"
 
     if [ -f "$SCRIPT_DIR/$script" ]; then
-        if BASE_URL="${SESAMEFS_URL:-http://localhost:8082}" API_URL="${SESAMEFS_URL:-http://localhost:8082}" bash "$SCRIPT_DIR/$script" $args; then
+        if BASE_URL="${SESAMEFS_URL:-http://localhost:3000}" API_URL="${SESAMEFS_URL:-http://localhost:3000}" bash "$SCRIPT_DIR/$script" $args; then
             PASSED_SUITES=$((PASSED_SUITES + 1))
             log_success "$name completed"
             return 0
@@ -204,8 +239,13 @@ run_suite() {
 run_api_tests() {
     log_section "API Integration Tests"
 
+    if [ "${SESAMEFS_TEST_IN_CONTAINER:-0}" != "1" ] && check_docker_compose; then
+        run_compose_service "api-test" "API Integration Tests"
+        return $?
+    fi
+
     if ! check_backend; then
-        log_error "Backend not available at ${SESAMEFS_URL:-http://localhost:8082}"
+        log_error "Backend not available at ${SESAMEFS_URL:-http://localhost:3000}"
         echo ""
         echo "Start the backend with:"
         echo "  docker compose up -d"
@@ -360,8 +400,13 @@ run_failover_tests() {
 run_oidc_tests() {
     log_section "OIDC Authentication Tests"
 
+    if [ "${SESAMEFS_TEST_IN_CONTAINER:-0}" != "1" ] && check_docker_compose; then
+        run_compose_service "oidc-test" "OIDC Authentication Tests"
+        return $?
+    fi
+
     if ! check_backend; then
-        log_error "Backend not available at ${SESAMEFS_URL:-http://localhost:8082}"
+        log_error "Backend not available at ${SESAMEFS_URL:-http://localhost:3000}"
         return 1
     fi
 
@@ -379,6 +424,11 @@ run_oidc_tests() {
 # ==========================================================================
 run_go_tests() {
     log_section "Go Unit Tests"
+
+    if check_docker_compose; then
+        run_compose_service "gotest" "Go Unit Tests"
+        return $?
+    fi
 
     if check_go; then
         log_info "Running Go tests locally..."
@@ -422,9 +472,14 @@ EOF
 run_go_integration_tests() {
     log_section "Go Integration Tests"
 
+    if check_docker_compose; then
+        run_compose_service "go-integration-test" "Go Integration Tests"
+        return $?
+    fi
+
     # Check backend (same as other test scripts)
     if ! check_backend; then
-        log_error "Backend not available at ${SESAMEFS_URL:-http://localhost:8082}"
+        log_error "Backend not available at ${SESAMEFS_URL:-http://localhost:3000}"
         echo ""
         echo "Start the backend with:"
         echo "  docker compose up -d"
@@ -462,7 +517,7 @@ EOF
 
         TOTAL_SUITES=$((TOTAL_SUITES + 1))
         if docker run --rm --network host \
-            -e SESAMEFS_URL="${SESAMEFS_URL:-http://localhost:8082}" \
+            -e SESAMEFS_URL="${SESAMEFS_URL:-http://localhost:3000}" \
             sesamefs-gointegration; then
             PASSED_SUITES=$((PASSED_SUITES + 1))
             log_success "Go integration tests passed (Docker)"
@@ -473,17 +528,34 @@ EOF
     fi
 }
 
+run_go_all_tests() {
+    log_section "All Go Tests"
+
+    if check_docker_compose; then
+        run_compose_service "go-all-test" "All Go Tests"
+        return $?
+    fi
+
+    log_error "docker compose is required to run the full Go test suite"
+    return 1
+}
+
 # ==========================================================================
 # Frontend Tests
 # ==========================================================================
 run_frontend_tests() {
     log_section "Frontend Tests"
 
+    if check_docker_compose; then
+        run_compose_service "frontend-test" "Frontend Tests"
+        return $?
+    fi
+
     if ! check_node; then
         log_warning "Node.js/npm not available"
         echo ""
         echo "Install Node.js to run frontend tests, or run in Docker:"
-        echo "  docker run --rm -v $PROJECT_DIR/frontend:/app -w /app node:20 npm test -- --watchAll=false"
+        echo "  docker compose --profile test run --rm --build frontend-test"
         return 1
     fi
 
@@ -502,6 +574,18 @@ run_frontend_tests() {
         FAILED_SUITES=$((FAILED_SUITES + 1))
         log_error "Frontend tests failed"
     fi
+}
+
+run_mobile_tests() {
+    log_section "Mobile Frontend Checks"
+
+    if check_docker_compose; then
+        run_compose_service "mobile-test" "Mobile Frontend Checks"
+        return $?
+    fi
+
+    log_error "docker compose is required to run mobile frontend checks"
+    return 1
 }
 
 # ==========================================================================
@@ -558,19 +642,28 @@ list_tests() {
     echo "  - Setup, Upload, Download Failover, Recovery"
     echo ""
 
-    echo "go - Go Unit Tests (requires: Go 1.25+ or Docker)"
+    echo "go - Go Unit Tests (requires: docker compose test profile)"
     echo "  - All packages in internal/"
     echo ""
 
-    echo "go-integration - Go Integration Tests (requires: backend + Go 1.25+ or Docker)"
+    echo "go-all - All Go Tests (requires: sesamefs service + docker compose test profile)"
+    echo "  - Go unit tests"
+    echo "  - Go integration tests"
+    echo ""
+
+    echo "go-integration - Go Integration Tests (requires: sesamefs service + docker compose test profile)"
     echo "  - Libraries CRUD (create, rename, delete, list)"
     echo "  - File operations (upload, download, move, copy, delete)"
     echo "  - Permission enforcement (readonly, guest, cross-user isolation)"
     echo "  - Encrypted library support"
     echo ""
 
-    echo "frontend - Frontend Tests (requires: Node.js)"
+    echo "frontend - Frontend Tests (requires: docker compose test profile)"
     echo "  - React component tests"
+    echo ""
+
+    echo "mobile - Mobile Frontend Checks (requires: docker compose test profile)"
+    echo "  - Typecheck, lint, and Vitest suite"
     echo ""
 
     echo "all - Run all applicable tests"
@@ -616,16 +709,29 @@ main() {
         go|unit)
             run_go_tests
             ;;
+        go-all|go-full)
+            run_go_all_tests
+            ;;
         go-integration|goi)
             run_go_integration_tests
             ;;
         frontend|fe)
             run_frontend_tests
             ;;
+        mobile)
+            run_mobile_tests
+            ;;
         all)
             run_api_tests
             run_oidc_tests
             run_go_tests
+            if check_backend; then
+                run_go_all_tests
+            else
+                log_info "Skipping aggregated Go run (backend not available)"
+            fi
+            run_frontend_tests
+            run_mobile_tests
             # Run Go integration tests if backend is available
             if check_backend; then
                 run_go_integration_tests
@@ -642,11 +748,6 @@ main() {
                 run_multiregion_tests
             else
                 log_info "Skipping multiregion tests (stack not running)"
-            fi
-            if check_node; then
-                run_frontend_tests
-            else
-                log_info "Skipping frontend tests (Node.js not available)"
             fi
             ;;
         *)

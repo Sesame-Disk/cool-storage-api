@@ -149,6 +149,84 @@ services:
       - sesamefs
     restart: unless-stopped
 
+  gotest:
+    build:
+      context: .
+      dockerfile: Dockerfile.gotest
+    command: ["go", "test", "./...", "-short", "-cover"]
+    profiles:
+      - test
+
+  go-integration-test:
+    build:
+      context: .
+      dockerfile: Dockerfile.gotest
+    command:
+      - /bin/sh
+      - -c
+      - until curl -fsS http://sesamefs:8080/health > /dev/null; do sleep 2; done; go test -tags integration -v -count=1 -timeout 5m ./internal/integration/...
+    environment:
+      - SESAMEFS_URL=http://sesamefs:8080
+    depends_on:
+      - sesamefs
+    profiles:
+      - test
+
+  go-all-test:
+    build:
+      context: .
+      dockerfile: Dockerfile.gotest
+    command:
+      - /bin/sh
+      - -c
+      - go test ./... -short -cover && until curl -fsS http://sesamefs:8080/health > /dev/null; do sleep 2; done; go test -tags integration -v -count=1 -timeout 5m ./internal/integration/...
+    environment:
+      - SESAMEFS_URL=http://sesamefs:8080
+    depends_on:
+      - sesamefs
+    profiles:
+      - test
+
+  api-test:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    command: until curl -fsS http://sesamefs:8080/health > /dev/null; do sleep 2; done; ./scripts/test.sh api
+    environment:
+      - SESAMEFS_URL=http://sesamefs:8080
+      - SESAMEFS_TEST_IN_CONTAINER=1
+    depends_on:
+      - sesamefs
+    profiles:
+      - test
+
+  oidc-test:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    command: until curl -fsS http://sesamefs:8080/health > /dev/null; do sleep 2; done; ./scripts/test.sh oidc
+    environment:
+      - SESAMEFS_URL=http://sesamefs:8080
+      - SESAMEFS_TEST_IN_CONTAINER=1
+    depends_on:
+      - sesamefs
+    profiles:
+      - test
+
+  frontend-test:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontendtest
+    profiles:
+      - test
+
+  mobile-test:
+    build:
+      context: .
+      dockerfile: Dockerfile.mobiletest
+    profiles:
+      - test
+
   # NOTE: nginx frontend service REMOVED (2026-02-12)
   # The Go backend serves the SPA, static files, and API from a single port.
   # See sesamefs-pending-issues.txt "ARCHITECTURE DISCUSSION" for rationale.

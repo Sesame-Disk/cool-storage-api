@@ -38,10 +38,10 @@ func TestGroupShareDeletedWithGroupCleanup(t *testing.T) {
 
 	repoID := createTestLibrary(t, adminClient, fmt.Sprintf("inttest-group-share-%d", time.Now().UnixNano()))
 
-	shareResp := adminClient.PutForm(t, fmt.Sprintf("/api2/repos/%s/dir/shared_items/?p=/", repoID), url.Values{
-		"share_type": {"group"},
-		"group_id":   {groupID},
-		"permission": {"r"},
+	shareResp := adminClient.PutJSON(t, fmt.Sprintf("/api2/repos/%s/dir/shared_items/?p=/", repoID), map[string]interface{}{
+		"share_type": "group",
+		"group_id":   []string{groupID},
+		"permission": "r",
 	})
 	expectStatus(t, shareResp, http.StatusOK)
 	shareResp.Body.Close()

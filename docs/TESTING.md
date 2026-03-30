@@ -2,37 +2,66 @@
 
 This document describes how to run tests, test coverage, and testing infrastructure.
 
-**Last updated: 2026-01-29**
+**Last updated: 2026-03-30**
 
 ---
 
 ## Quick Start
 
 ```bash
-# Run API integration tests (default)
-./scripts/test.sh
+# Start the development stack
+docker compose up -d --build
 
-# Run specific test category
-./scripts/test.sh api          # API integration tests
-./scripts/test.sh go           # Go unit tests
-./scripts/test.sh sync         # Sync protocol tests (requires seafile-cli)
-./scripts/test.sh multiregion  # Multi-region tests (requires multi-region stack)
+# Note: `docker compose up -d --build` does NOT run tests automatically.
+# Run tests explicitly through the compose test profile.
 
-# Run all applicable tests
+# Go unit tests
+docker compose --profile test run --rm --build gotest
+
+# All Go tests (unit + integration)
+docker compose --profile test run --rm --build go-all-test
+
+# API integration tests against the running stack
+docker compose --profile test run --rm --build api-test
+
+# Frontend and mobile checks
+docker compose --profile test run --rm --build frontend-test
+docker compose --profile test run --rm --build mobile-test
+
+# Or use the unified runner, which now prefers docker compose services
+./scripts/test.sh go
+./scripts/test.sh go-all
+./scripts/test.sh api
+./scripts/test.sh frontend
+./scripts/test.sh mobile
+
+# Full local validation pass
 ./scripts/test.sh all
-
-# List available tests
-./scripts/test.sh --list
-
-# Quick mode (skip long-running tests)
-./scripts/test.sh api --quick
 ```
 
 ---
 
 ## Unified Test Runner
 
-The `./scripts/test.sh` script is the main entry point for all tests.
+The `./scripts/test.sh` script is the main entry point for all tests and now prefers `docker compose` test services when available.
+
+## Docker-First Workflow
+
+Use `docker compose up -d --build` to build and start the development environment only.
+
+Do not attach tests to `docker compose up -d --build` itself. That command should remain focused on environment startup. Tests should run as explicit one-shot services under the `test` profile so failures are visible, repeatable, and do not slow down normal container startup.
+
+### Test Services
+
+| Service | Purpose |
+|---------|---------|
+| `gotest` | Go unit tests (`go test ./... -short -cover`) |
+| `go-all-test` | All Go tests (`gotest` + integration sequence) |
+| `go-integration-test` | Go integration tests against running `sesamefs` |
+| `api-test` | Bash API integration suites via `scripts/test.sh api` |
+| `oidc-test` | OIDC shell tests via `scripts/test.sh oidc` |
+| `frontend-test` | Frontend lint + Jest |
+| `mobile-test` | Mobile typecheck + lint + Vitest |
 
 ### Test Categories
 
@@ -43,9 +72,11 @@ The `./scripts/test.sh` script is the main entry point for all tests.
 | `sync` | Seafile CLI sync protocol tests | Backend + seafile-cli container |
 | `multiregion` | Multi-region connectivity, routing tests | Multi-region stack |
 | `failover` | Failover scenarios with large files | Multi-region + host docker |
-| `go` | Go unit tests | Go 1.25+ or Docker |
-| `go-integration` | Go integration tests (against running backend) | Backend + Go 1.25+ or Docker |
-| `frontend` | Frontend React tests | Node.js + npm |
+| `go` | Go unit tests | Docker compose test profile |
+| `go-all` | All Go tests (unit + integration) | `sesamefs` + Docker compose test profile |
+| `go-integration` | Go integration tests (against running backend) | `sesamefs` + Docker compose test profile |
+| `frontend` | Frontend React tests | Docker compose test profile |
+| `mobile` | Mobile frontend checks | Docker compose test profile |
 | `all` | Run all applicable tests | Auto-detects available services |
 
 ### Options
@@ -68,6 +99,9 @@ Requires: Backend running (`docker compose up -d`)
 ```bash
 ./scripts/test.sh api
 ./scripts/test.sh api --quick  # Skip encrypted library tests
+
+# Direct compose invocation
+docker compose --profile test run --rm --build api-test
 ```
 
 **Test Suites:**
@@ -137,10 +171,13 @@ go test ./internal/auth/... -v
 
 ### 3. Go Unit Tests (`go`)
 
-Requires: Go 1.25+ or Docker
+Requires: Docker compose test profile
 
 ```bash
 ./scripts/test.sh go
+
+# Direct compose invocation
+docker compose --profile test run --rm --build gotest
 ```
 
 **Coverage by Package (Updated 2026-02-02, Session 24):**
@@ -161,33 +198,35 @@ Requires: Go 1.25+ or Docker
 | `internal/metrics` | 0 | 0% | Prometheus instrumentation |
 | `internal/templates` | 0 | 0% | Email/document rendering |
 
-**Running Manually:**
+**Direct compose invocation:**
 ```bash
-# If Go is installed locally
-go test ./... -short -cover
-
-# Using Docker (if Go not installed)
-docker build -t sesamefs-gotest -f - . << 'EOF'
-FROM golang:1.25-alpine
-RUN apk add --no-cache git
-WORKDIR /app
-COPY go.mod go.sum ./
-RUN go mod download
-COPY . .
-CMD ["go", "test", "./...", "-short", "-cover"]
-EOF
-docker run --rm sesamefs-gotest
+docker compose --profile test run --rm --build gotest
 ```
+
+### 3b. All Go Tests (`go-all`)
+
+Requires: Backend running (`docker compose up -d`) + Docker compose test profile
+
+```bash
+./scripts/test.sh go-all
+
+# Direct compose invocation
+docker compose --profile test run --rm --build go-all-test
+```
+
+This aggregate run executes both:
+- `go test ./... -short -cover`
+- `go test -tags integration -v -count=1 -timeout 5m ./internal/integration/...`
 
 ### 4. Go Integration Tests (`go-integration`)
 
-Requires: Backend running (`docker compose up -d`) + Go 1.25+ or Docker
+Requires: Backend running (`docker compose up -d`) + Docker compose test profile
 
 ```bash
 ./scripts/test.sh go-integration
 
-# Or run directly
-go test -tags integration -v -count=1 -timeout 5m ./internal/integration/...
+# Or run directly through compose
+docker compose --profile test run --rm --build go-integration-test
 ```
 
 **Build tag**: `//go:build integration` — these tests are excluded from normal `go test ./...` runs.
@@ -205,7 +244,29 @@ go test -tags integration -v -count=1 -timeout 5m ./internal/integration/...
 
 These tests make HTTP requests to the running backend (same model as bash scripts) and exercise the full stack: API handlers → middleware → database → storage. They don't contribute to `go test -cover` numbers since they're in a separate package making external HTTP calls.
 
-**Docker fallback**: If Go is not available or version is too old, `test.sh` builds a Docker image and runs tests with `--network host` to reach the backend.
+**Docker-first default**: `test.sh` prefers the `go-integration-test` compose service, which waits for `sesamefs` and runs against the compose network.
+
+### Frontend Tests (`frontend`)
+
+Requires: Docker compose test profile
+
+```bash
+./scripts/test.sh frontend
+
+# Direct compose invocation
+docker compose --profile test run --rm --build frontend-test
+```
+
+### Mobile Frontend Checks (`mobile`)
+
+Requires: Docker compose test profile
+
+```bash
+./scripts/test.sh mobile
+
+# Direct compose invocation
+docker compose --profile test run --rm --build mobile-test
+```
 
 ### 5. Sync Protocol Tests (`sync`)
 

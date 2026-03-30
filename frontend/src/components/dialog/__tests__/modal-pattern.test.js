@@ -54,18 +54,16 @@ const usesReactstrapModal = (content) => {
 
 // Helper to check if a file uses plain Bootstrap modal
 const usesBootstrapModal = (content) => {
-  return content.includes('className="modal show d-block"') ||
-         content.includes("className='modal show d-block'") ||
-         content.includes('className={`modal show d-block');
+  return /className\s*=\s*(?:"[^"]*\bmodal\b[^"]*\bshow\b[^"]*\bd-block\b[^"]*"|'[^']*\bmodal\b[^']*\bshow\b[^']*\bd-block\b[^']*'|\{`[^`]*\bmodal\b[^`]*\bshow\b[^`]*\bd-block\b[^`]*`\})/.test(content);
 };
 
 // Helper to check for close button pattern
 // Supports both Bootstrap 4 (close) and Bootstrap 5 (btn-close) patterns
 const hasCloseButton = (content) => {
   return content.includes('className="close"') ||
-         content.includes("className='close'") ||
-         content.includes('className="btn-close"') ||
-         content.includes("className='btn-close'");
+    content.includes("className='close'") ||
+    content.includes('className="btn-close"') ||
+    content.includes("className='btn-close'");
 };
 
 describe('Modal Pattern Tests - Dialog Components', () => {

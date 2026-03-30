@@ -1,0 +1,12 @@
+.git
+.github
+.vscode
+.idea
+bin/
+coverage/
+tmp/
+*.log
+**/node_modules/
+frontend/build/
+mobile-frontend/dist/
+mobile-frontend/.astro/
