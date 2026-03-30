@@ -688,9 +688,18 @@ func (h *ShareLinkHandler) UpdateShareLink(c *gin.Context) {
 	}
 
 	// Parse update fields
-	permissionsInput := c.PostForm("permissions")
-	expirationTime := c.PostForm("expiration_time")
-	newPasswordPlain := c.PostForm("password")
+	var updateBody struct {
+		Permissions    string `json:"permissions"`
+		ExpirationTime string `json:"expiration_time"`
+		Password       string `json:"password"`
+	}
+	if err := c.ShouldBindJSON(&updateBody); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		return
+	}
+	permissionsInput := updateBody.Permissions
+	expirationTime := updateBody.ExpirationTime
+	newPasswordPlain := updateBody.Password
 
 	newPermission := currentPermission
 	newExpiresAt := currentExpiresAt

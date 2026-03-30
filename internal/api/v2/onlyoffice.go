@@ -335,6 +335,10 @@ func (h *OnlyOfficeHandler) GetEditorConfig(c *gin.Context) {
 
 // getFileID retrieves the file ID from fs_objects by traversing the path
 func (h *OnlyOfficeHandler) getFileID(repoID, orgID, filePath string) (string, error) {
+	if h == nil || h.db == nil {
+		return "", fmt.Errorf("database not available")
+	}
+
 	// Get library's head_commit_id using libraries_by_id (no org_id dependency)
 	// This avoids failures when org_id doesn't match the library's partition key
 	var headCommitID string
@@ -404,6 +408,10 @@ func (h *OnlyOfficeHandler) getFileID(repoID, orgID, filePath string) (string, e
 
 // saveDocKeyMapping stores the doc_key to file mapping for callback lookup
 func (h *OnlyOfficeHandler) saveDocKeyMapping(docKey, userID, repoID, filePath string) error {
+	if h == nil || h.db == nil {
+		return fmt.Errorf("database not available")
+	}
+
 	return h.db.Session().Query(`
 		INSERT INTO onlyoffice_doc_keys (doc_key, user_id, repo_id, file_path, created_at)
 		VALUES (?, ?, ?, ?, ?)
@@ -413,6 +421,10 @@ func (h *OnlyOfficeHandler) saveDocKeyMapping(docKey, userID, repoID, filePath s
 
 // getDocKeyMapping retrieves file info by doc_key
 func (h *OnlyOfficeHandler) getDocKeyMapping(docKey string) (userID, repoID, filePath string, err error) {
+	if h == nil || h.db == nil {
+		return "", "", "", fmt.Errorf("database not available")
+	}
+
 	err = h.db.Session().Query(`
 		SELECT user_id, repo_id, file_path FROM onlyoffice_doc_keys
 		WHERE doc_key = ?
@@ -422,6 +434,10 @@ func (h *OnlyOfficeHandler) getDocKeyMapping(docKey string) (userID, repoID, fil
 
 // deleteDocKeyMapping removes the doc_key mapping
 func (h *OnlyOfficeHandler) deleteDocKeyMapping(docKey string) error {
+	if h == nil || h.db == nil {
+		return fmt.Errorf("database not available")
+	}
+
 	return h.db.Session().Query(`
 		DELETE FROM onlyoffice_doc_keys WHERE doc_key = ?
 	`, docKey).Exec()

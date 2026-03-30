@@ -2,6 +2,7 @@ package middleware
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strings"
 
@@ -243,6 +244,10 @@ func (m *PermissionMiddleware) RequireGroupRole(paramName string, requiredRole G
 
 // GetUserOrgRole retrieves user's role in an organization
 func (m *PermissionMiddleware) GetUserOrgRole(orgID, userID string) (OrganizationRole, error) {
+	if m == nil || m.db == nil {
+		return RoleGuest, fmt.Errorf("database not available")
+	}
+
 	var role string
 	err := m.db.Session().Query(`
 		SELECT role FROM users WHERE org_id = ? AND user_id = ?
@@ -545,6 +550,10 @@ func permLevel(perm LibraryPermission) int {
 
 // IsLibraryOwner checks if user is the owner of a library
 func (m *PermissionMiddleware) IsLibraryOwner(orgID, userID, repoID string) (bool, error) {
+	if m == nil || m.db == nil {
+		return false, fmt.Errorf("database not available")
+	}
+
 	var ownerIDStr string
 	err := m.db.Session().Query(`
 		SELECT owner_id FROM libraries WHERE org_id = ? AND library_id = ?

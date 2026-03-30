@@ -389,21 +389,13 @@ type CreateLibraryRequest struct {
 func (h *LibraryHandler) CreateLibrary(c *gin.Context) {
 	var req CreateLibraryRequest
 
-	// Try JSON first, then fall back to form data (Seafile desktop uses form data)
-	contentType := c.GetHeader("Content-Type")
-	if strings.Contains(contentType, "application/json") {
-		if err := c.ShouldBindJSON(&req); err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-			return
-		}
-	} else {
-		// Form data (application/x-www-form-urlencoded)
-		req.Name = c.PostForm("name")
-		req.Description = c.PostForm("desc")
-		req.Password = c.PostForm("passwd")
-		// CRITICAL: Seafile clients don't send 'encrypted' param, only 'passwd'
-		// If passwd is provided, library should be encrypted
-		req.Encrypted = c.PostForm("encrypted") == "true" || c.PostForm("encrypted") == "1" || req.Password != ""
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	// password implies encrypted (mirrors original behavior)
+	if req.Password != "" {
+		req.Encrypted = true
 	}
 
 	// Support both "name" (v2) and "repo_name" (v2.1) fields

@@ -661,11 +661,10 @@ func TestSyncBatchMove_ValidRequestNilDB(t *testing.T) {
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
-	// With nil DB and nil permMiddleware, the handler passes validation but panics
-	// when accessing the DB via FSHelper. The Recovery middleware catches the panic
-	// and returns 500. This confirms the request passes all validation checks.
+	// With nil DB and nil permMiddleware, the handler passes validation and returns
+	// 500 via the explicit nil DB guard.
 	if w.Code != http.StatusInternalServerError {
-		t.Errorf("status = %d, want %d (nil DB should cause panic caught by Recovery)", w.Code, http.StatusInternalServerError)
+		t.Errorf("status = %d, want %d (nil DB should return explicit 500)", w.Code, http.StatusInternalServerError)
 	}
 }
 
@@ -701,7 +700,7 @@ func TestBatchRequest_AllConflictPolicyValues(t *testing.T) {
 			r.ServeHTTP(w, req)
 
 			// The request should pass JSON binding and validation (not 400).
-			// With nil DB it will either panic (500 via Recovery) or proceed.
+			// With nil DB it should return 500 via the explicit nil DB guard.
 			// The key assertion is that it does NOT fail on conflict_policy parsing.
 			if w.Code == http.StatusBadRequest {
 				t.Errorf("status = %d, conflict_policy %q should not cause a bad request", w.Code, tt.policy)

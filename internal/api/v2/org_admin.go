@@ -488,46 +488,27 @@ func (h *OrgAdminHandler) UpdateOrgInfo(c *gin.Context) {
 		return
 	}
 
-	// Accept both JSON and form data (seafile-js compatibility)
-	orgName := c.Request.FormValue("org_name")
-	maxUsersStr := c.Request.FormValue("max_user_number")
-	trafficQuotaStr := c.Request.FormValue("traffic_quota")
-	trafficUploadQuotaStr := c.Request.FormValue("traffic_upload_quota")
-	trafficDownloadQuotaStr := c.Request.FormValue("traffic_download_quota")
-
-	if orgName == "" && maxUsersStr == "" && trafficQuotaStr == "" && trafficUploadQuotaStr == "" && trafficDownloadQuotaStr == "" {
-		// Try JSON body
-		var body struct {
-			OrgName              string `json:"org_name"`
-			MaxUserNumber        string `json:"max_user_number"`
-			TrafficQuota         *int64 `json:"traffic_quota"`
-			TrafficUploadQuota   *int64 `json:"traffic_upload_quota"`
-			TrafficDownloadQuota *int64 `json:"traffic_download_quota"`
-		}
-		if err := c.ShouldBindJSON(&body); err == nil {
-			orgName = body.OrgName
-			maxUsersStr = body.MaxUserNumber
-			if body.TrafficQuota != nil {
-				trafficQuotaStr = strconv.FormatInt(*body.TrafficQuota, 10)
-			}
-			if body.TrafficUploadQuota != nil {
-				trafficUploadQuotaStr = strconv.FormatInt(*body.TrafficUploadQuota, 10)
-			}
-			if body.TrafficDownloadQuota != nil {
-				trafficDownloadQuotaStr = strconv.FormatInt(*body.TrafficDownloadQuota, 10)
-			}
-		}
+	var body struct {
+		OrgName              string `json:"org_name"`
+		MaxUserNumber        *int   `json:"max_user_number"`
+		TrafficQuota         *int64 `json:"traffic_quota"`
+		TrafficUploadQuota   *int64 `json:"traffic_upload_quota"`
+		TrafficDownloadQuota *int64 `json:"traffic_download_quota"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		return
 	}
 
-	if maxUsersStr != "" || trafficQuotaStr != "" || trafficUploadQuotaStr != "" || trafficDownloadQuotaStr != "" {
+	if body.MaxUserNumber != nil || body.TrafficQuota != nil || body.TrafficUploadQuota != nil || body.TrafficDownloadQuota != nil {
 		c.JSON(http.StatusForbidden, gin.H{"error": "organization limits are managed by billing"})
 		return
 	}
 
-	if orgName != "" {
+	if body.OrgName != "" {
 		if err := h.db.Session().Query(`
 			UPDATE organizations SET name = ? WHERE org_id = ?
-		`, orgName, orgID).Exec(); err != nil {
+		`, body.OrgName, orgID).Exec(); err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update organization"})
 			return
 		}
@@ -625,19 +606,16 @@ func (h *OrgAdminHandler) AddOrgUser(c *gin.Context) {
 		return
 	}
 
-	// Parse email/name from either form or JSON
-	email := strings.TrimSpace(c.Request.FormValue("email"))
-	name := strings.TrimSpace(c.Request.FormValue("name"))
-	if email == "" {
-		var body struct {
-			Email string `json:"email"`
-			Name  string `json:"name"`
-		}
-		if err := c.ShouldBindJSON(&body); err == nil {
-			email = strings.TrimSpace(body.Email)
-			name = strings.TrimSpace(body.Name)
-		}
+	var body struct {
+		Email string `json:"email"`
+		Name  string `json:"name"`
 	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		return
+	}
+	email := strings.TrimSpace(body.Email)
+	name := strings.TrimSpace(body.Name)
 
 	if email == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "email is required"})
@@ -755,26 +733,34 @@ func (h *OrgAdminHandler) UpdateOrgUser(c *gin.Context) {
 		}
 	}
 
-	// seafile-js sends FormData for all org-admin user updates.
-	// Fields: is_active, is_staff, name, contact_email, quota_total
-	hasMutatingFields := c.Request.FormValue("is_active") != "" ||
-		c.Request.FormValue("is_staff") != "" ||
-		c.Request.FormValue("name") != "" ||
-		c.Request.FormValue("contact_email") != "" ||
-		c.Request.FormValue("quota_total") != ""
+	var updateReq struct {
+		IsActive             *bool   `json:"is_active"`
+		IsStaff              *bool   `json:"is_staff"`
+		Name                 *string `json:"name"`
+		QuotaTotal           *int64  `json:"quota_total"`
+		TrafficUploadQuota   *int64  `json:"traffic_upload_quota"`
+		TrafficDownloadQuota *int64  `json:"traffic_download_quota"`
+	}
+	if err := c.ShouldBindJSON(&updateReq); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		return
+	}
+
+	hasMutatingFields := updateReq.IsActive != nil || updateReq.IsStaff != nil ||
+		updateReq.Name != nil || updateReq.QuotaTotal != nil
 	if normalizeUserStatus(status) == StatusDeleted && hasMutatingFields {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "deleted users must be restored before modification"})
 		return
 	}
 
-	if v := c.Request.FormValue("is_active"); v != "" {
-		if v == "false" {
+	if updateReq.IsActive != nil {
+		if !*updateReq.IsActive {
 			if err := deactivateUser(h.db, h.sessions, targetOrgID, userID); err != nil {
 				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update user"})
 				return
 			}
 			status = StatusDeactivated
-		} else if v == "true" {
+		} else {
 			if err := activateUser(h.db, targetOrgID, userID); err != nil {
 				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update user"})
 				return
@@ -783,32 +769,26 @@ func (h *OrgAdminHandler) UpdateOrgUser(c *gin.Context) {
 		}
 	}
 
-	if v := c.Request.FormValue("is_staff"); v != "" {
-		role = applyLegacyStaffToggle(role, v == "true")
+	if updateReq.IsStaff != nil {
+		role = applyLegacyStaffToggle(role, *updateReq.IsStaff)
 	}
 
-	if v := c.Request.FormValue("name"); v != "" {
-		name = v
+	if updateReq.Name != nil {
+		name = *updateReq.Name
 	}
 
-	if v := c.Request.FormValue("quota_total"); v != "" {
-		if q, err := strconv.ParseInt(v, 10, 64); err == nil {
-			quota = q
-		}
+	if updateReq.QuotaTotal != nil {
+		quota = *updateReq.QuotaTotal
 	}
 
-	// Parse traffic quota values early so we can validate all quotas together.
+	// Compute traffic quota values for validation.
 	newUploadQuota := trafficUploadQuota
 	newDownloadQuota := trafficDownloadQuota
-	if v := c.Request.FormValue("traffic_upload_quota"); v != "" {
-		if q, err := strconv.ParseInt(v, 10, 64); err == nil {
-			newUploadQuota = q
-		}
+	if updateReq.TrafficUploadQuota != nil {
+		newUploadQuota = *updateReq.TrafficUploadQuota
 	}
-	if v := c.Request.FormValue("traffic_download_quota"); v != "" {
-		if q, err := strconv.ParseInt(v, 10, 64); err == nil {
-			newDownloadQuota = q
-		}
+	if updateReq.TrafficDownloadQuota != nil {
+		newDownloadQuota = *updateReq.TrafficDownloadQuota
 	}
 
 	// Validate user quotas against org limits.
@@ -836,11 +816,6 @@ func (h *OrgAdminHandler) UpdateOrgUser(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update user"})
 			return
 		}
-	}
-
-	if v := c.Request.FormValue("contact_email"); v != "" {
-		// contact_email is not stored in users table currently but acknowledge it
-		_ = v
 	}
 
 	if newUploadQuota != trafficUploadQuota {
@@ -1526,8 +1501,8 @@ func (h *OrgAdminHandler) GetOrgGroup(c *gin.Context) {
 	})
 }
 
-// UpdateOrgGroup updates a group (quota or name).
-// PUT /org/:org_id/admin/groups/:gid/  FormData: quota
+// UpdateOrgGroup updates a group (quota).
+// PUT /org/:org_id/admin/groups/:gid/
 func (h *OrgAdminHandler) UpdateOrgGroup(c *gin.Context) {
 	targetOrgID := c.Param("org_id")
 	if err := h.requireOrgAccess(c, targetOrgID); err != nil {
@@ -1545,9 +1520,15 @@ func (h *OrgAdminHandler) UpdateOrgGroup(c *gin.Context) {
 		return
 	}
 
+	var req struct {
+		Quota *int64 `json:"quota"`
+	}
+	_ = c.ShouldBindJSON(&req)
+
 	// Store group quota in org settings (no dedicated column on groups table).
-	if quotaStr := c.Request.FormValue("quota"); quotaStr != "" {
+	if req.Quota != nil {
 		settingKey := "group_quota_" + groupID
+		quotaStr := strconv.FormatInt(*req.Quota, 10)
 		if err := h.db.Session().Query(`
 			UPDATE organizations SET settings[?] = ? WHERE org_id = ?
 		`, settingKey, quotaStr, targetOrgID).Exec(); err != nil {
@@ -1560,7 +1541,7 @@ func (h *OrgAdminHandler) UpdateOrgGroup(c *gin.Context) {
 }
 
 // TransferOrgGroup transfers group ownership to another user in the organization.
-// PUT /org/:org_id/admin/groups/:gid/transfer/  FormData: new_owner=<email>
+// PUT /org/:org_id/admin/groups/:gid/transfer/
 func (h *OrgAdminHandler) TransferOrgGroup(c *gin.Context) {
 	targetOrgID := c.Param("org_id")
 	if err := h.requireOrgAccess(c, targetOrgID); err != nil {
@@ -1568,7 +1549,14 @@ func (h *OrgAdminHandler) TransferOrgGroup(c *gin.Context) {
 	}
 
 	groupID := c.Param("gid")
-	newOwnerEmail := c.Request.FormValue("new_owner")
+	var req struct {
+		NewOwner string `json:"new_owner"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		return
+	}
+	newOwnerEmail := req.NewOwner
 	if newOwnerEmail == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "new_owner is required"})
 		return
@@ -1795,7 +1783,7 @@ func (h *OrgAdminHandler) ListOrgGroupMembers(c *gin.Context) {
 }
 
 // AddOrgGroupMember adds a member to a group.
-// POST /org/:org_id/admin/groups/:gid/members/  FormData: email
+// POST /org/:org_id/admin/groups/:gid/members/
 func (h *OrgAdminHandler) AddOrgGroupMember(c *gin.Context) {
 	targetOrgID := c.Param("org_id")
 	if err := h.requireOrgAccess(c, targetOrgID); err != nil {
@@ -1803,7 +1791,14 @@ func (h *OrgAdminHandler) AddOrgGroupMember(c *gin.Context) {
 	}
 
 	groupID := c.Param("gid")
-	email := c.Request.FormValue("email")
+	var req struct {
+		Email string `json:"email"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		return
+	}
+	email := req.Email
 	if email == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "email is required"})
 		return
@@ -1870,7 +1865,7 @@ func (h *OrgAdminHandler) DeleteOrgGroupMember(c *gin.Context) {
 }
 
 // UpdateOrgGroupMember updates a member's role (is_admin).
-// PUT /org/:org_id/admin/groups/:gid/members/:email/  FormData: is_admin
+// PUT /org/:org_id/admin/groups/:gid/members/:email/
 func (h *OrgAdminHandler) UpdateOrgGroupMember(c *gin.Context) {
 	targetOrgID := c.Param("org_id")
 	if err := h.requireOrgAccess(c, targetOrgID); err != nil {
@@ -1880,7 +1875,14 @@ func (h *OrgAdminHandler) UpdateOrgGroupMember(c *gin.Context) {
 	groupID := c.Param("gid")
 	email := c.Param("email")
 
-	isAdmin := c.Request.FormValue("is_admin") == "true"
+	var req struct {
+		IsAdmin bool `json:"is_admin"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		return
+	}
+	isAdmin := req.IsAdmin
 
 	// Resolve user
 	memberID, err := h.lookupOrgUserByEmail(targetOrgID, email)
@@ -1976,7 +1978,7 @@ func (h *OrgAdminHandler) ListOrgGroupLibraries(c *gin.Context) {
 }
 
 // AddOrgGroupOwnedLibrary creates a group-owned library (department repo).
-// POST /org/:org_id/admin/groups/:gid/group-owned-libraries/  FormData: repo_name
+// POST /org/:org_id/admin/groups/:gid/group-owned-libraries/
 func (h *OrgAdminHandler) AddOrgGroupOwnedLibrary(c *gin.Context) {
 	targetOrgID := c.Param("org_id")
 	if err := h.requireOrgAccess(c, targetOrgID); err != nil {
@@ -1984,7 +1986,14 @@ func (h *OrgAdminHandler) AddOrgGroupOwnedLibrary(c *gin.Context) {
 	}
 
 	groupID := c.Param("gid")
-	repoName := c.Request.FormValue("repo_name")
+	var req struct {
+		RepoName string `json:"repo_name"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		return
+	}
+	repoName := req.RepoName
 	if repoName == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "repo_name is required"})
 		return
@@ -2221,7 +2230,7 @@ func (h *OrgAdminHandler) DeleteOrgRepo(c *gin.Context) {
 }
 
 // TransferOrgRepo transfers a repository to another user.
-// PUT /org/:org_id/admin/repos/:rid/  FormData: email
+// PUT /org/:org_id/admin/repos/:rid/
 func (h *OrgAdminHandler) TransferOrgRepo(c *gin.Context) {
 	targetOrgID := c.Param("org_id")
 	if err := h.requireOrgAccess(c, targetOrgID); err != nil {
@@ -2229,7 +2238,14 @@ func (h *OrgAdminHandler) TransferOrgRepo(c *gin.Context) {
 	}
 
 	repoID := c.Param("rid")
-	newOwnerEmail := c.Request.FormValue("email")
+	var req struct {
+		Email string `json:"email"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		return
+	}
+	newOwnerEmail := req.Email
 	if newOwnerEmail == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "email is required"})
 		return
@@ -2660,25 +2676,35 @@ func (h *OrgAdminHandler) ListOrgAddressBookGroups(c *gin.Context) {
 }
 
 // AddOrgAddressBookGroup creates a new department group.
-// POST /org/:org_id/admin/address-book/groups/  FormData: group_name, parent_group (optional), group_owner (optional), group_staff (optional, comma-separated)
+// POST /org/:org_id/admin/address-book/groups/
 func (h *OrgAdminHandler) AddOrgAddressBookGroup(c *gin.Context) {
 	targetOrgID := c.Param("org_id")
 	if err := h.requireOrgAccess(c, targetOrgID); err != nil {
 		return
 	}
 
-	groupName := c.Request.FormValue("group_name")
+	var req struct {
+		GroupName   string `json:"group_name"`
+		ParentGroup string `json:"parent_group"`
+		GroupOwner  string `json:"group_owner"`
+		GroupStaff  string `json:"group_staff"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		return
+	}
+	groupName := req.GroupName
 	if groupName == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "group_name is required"})
 		return
 	}
-	parentGroup := c.Request.FormValue("parent_group")
+	parentGroup := req.ParentGroup
 	// "-1" is the seafile-js sentinel value meaning "no parent" (root department)
 	if parentGroup == "-1" {
 		parentGroup = ""
 	}
-	groupOwner := c.Request.FormValue("group_owner")
-	groupStaff := c.Request.FormValue("group_staff")
+	groupOwner := req.GroupOwner
+	groupStaff := req.GroupStaff
 
 	callerUserID := c.GetString("user_id")
 	newGroupID := uuid.New().String()
@@ -2857,7 +2883,7 @@ func (h *OrgAdminHandler) GetOrgAddressBookGroup(c *gin.Context) {
 }
 
 // UpdateOrgAddressBookGroup updates a department group's name.
-// PUT /org/:org_id/admin/address-book/groups/:gid/  FormData: group_name
+// PUT /org/:org_id/admin/address-book/groups/:gid/
 func (h *OrgAdminHandler) UpdateOrgAddressBookGroup(c *gin.Context) {
 	targetOrgID := c.Param("org_id")
 	if err := h.requireOrgAccess(c, targetOrgID); err != nil {
@@ -2865,7 +2891,14 @@ func (h *OrgAdminHandler) UpdateOrgAddressBookGroup(c *gin.Context) {
 	}
 
 	groupID := c.Param("gid")
-	newName := c.Request.FormValue("group_name")
+	var req struct {
+		GroupName string `json:"group_name"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		return
+	}
+	newName := req.GroupName
 	if newName == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "group_name is required"})
 		return
@@ -3542,16 +3575,14 @@ func (h *OrgAdminHandler) SetOrgWebSettings(c *gin.Context) {
 		return
 	}
 
-	fileExtWhiteList := c.Request.FormValue("file_ext_white_list")
-	if fileExtWhiteList == "" {
-		var body struct {
-			FileExtWhiteList string `json:"file_ext_white_list"`
-		}
-		if err := c.ShouldBindJSON(&body); err == nil {
-			fileExtWhiteList = body.FileExtWhiteList
-		}
+	var body struct {
+		FileExtWhiteList string `json:"file_ext_white_list"`
 	}
-
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		return
+	}
+	fileExtWhiteList := body.FileExtWhiteList
 	if fileExtWhiteList == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "file_ext_white_list is required"})
 		return

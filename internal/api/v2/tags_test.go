@@ -1,9 +1,9 @@
 package v2
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"strings"
 	"testing"
 
@@ -114,19 +114,19 @@ func TestCreateRepoTag_Validation(t *testing.T) {
 
 	tests := []struct {
 		name       string
-		formData   url.Values
+		body       map[string]string
 		wantStatus int
 	}{
 		{
 			name:       "missing all fields - validation fails",
-			formData:   url.Values{},
+			body:       map[string]string{},
 			wantStatus: http.StatusBadRequest,
 		},
 		{
 			name: "with both fields - success (nil db)",
-			formData: url.Values{
-				"name":  {"Test Tag"},
-				"color": {"#FF0000"},
+			body: map[string]string{
+				"name":  "Test Tag",
+				"color": "#FF0000",
 			},
 			wantStatus: http.StatusOK,
 		},
@@ -134,9 +134,10 @@ func TestCreateRepoTag_Validation(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			body := strings.NewReader(tt.formData.Encode())
+			payload, _ := json.Marshal(tt.body)
+			body := strings.NewReader(string(payload))
 			req := httptest.NewRequest("POST", "/repos/00000000-0000-0000-0000-000000000001/repo-tags", body)
-			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			req.Header.Set("Content-Type", "application/json")
 			w := httptest.NewRecorder()
 
 			r.ServeHTTP(w, req)
@@ -179,13 +180,13 @@ func TestUpdateRepoTag_InvalidTagID(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			formData := url.Values{
-				"name":  {"Updated Name"},
-				"color": {"#00FF00"},
-			}
-			body := strings.NewReader(formData.Encode())
+			payload, _ := json.Marshal(map[string]string{
+				"name":  "Updated Name",
+				"color": "#00FF00",
+			})
+			body := strings.NewReader(string(payload))
 			req := httptest.NewRequest("PUT", "/repos/00000000-0000-0000-0000-000000000001/repo-tags/"+tt.tagID, body)
-			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			req.Header.Set("Content-Type", "application/json")
 			w := httptest.NewRecorder()
 
 			r.ServeHTTP(w, req)
@@ -261,25 +262,25 @@ func TestAddFileTag_MissingFields(t *testing.T) {
 
 	tests := []struct {
 		name       string
-		formData   url.Values
+		body       map[string]interface{}
 		wantStatus int
 	}{
 		{
 			name:       "missing all fields",
-			formData:   url.Values{},
+			body:       map[string]interface{}{},
 			wantStatus: http.StatusBadRequest,
 		},
 		{
 			name: "missing repo_tag_id",
-			formData: url.Values{
-				"file_path": {"/test/file.txt"},
+			body: map[string]interface{}{
+				"file_path": "/test/file.txt",
 			},
 			wantStatus: http.StatusBadRequest,
 		},
 		{
 			name: "missing file_path",
-			formData: url.Values{
-				"repo_tag_id": {"1"},
+			body: map[string]interface{}{
+				"repo_tag_id": 1,
 			},
 			wantStatus: http.StatusBadRequest,
 		},
@@ -287,9 +288,10 @@ func TestAddFileTag_MissingFields(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			body := strings.NewReader(tt.formData.Encode())
+			payload, _ := json.Marshal(tt.body)
+			body := strings.NewReader(string(payload))
 			req := httptest.NewRequest("POST", "/repos/00000000-0000-0000-0000-000000000001/file-tags", body)
-			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			req.Header.Set("Content-Type", "application/json")
 			w := httptest.NewRecorder()
 
 			r.ServeHTTP(w, req)
@@ -321,13 +323,13 @@ func TestRemoveFileTag_InvalidFileTagID(t *testing.T) {
 // TestTagColors_ValidFormats tests common tag color formats
 func TestTagColors_ValidFormats(t *testing.T) {
 	colors := []string{
-		"#FF0000",  // Red
-		"#00FF00",  // Green
-		"#0000FF",  // Blue
-		"#FFFFFF",  // White
-		"#000000",  // Black
-		"#FFA500",  // Orange
-		"#800080",  // Purple
+		"#FF0000", // Red
+		"#00FF00", // Green
+		"#0000FF", // Blue
+		"#FFFFFF", // White
+		"#000000", // Black
+		"#FFA500", // Orange
+		"#800080", // Purple
 	}
 
 	for _, color := range colors {

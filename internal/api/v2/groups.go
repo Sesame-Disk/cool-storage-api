@@ -939,11 +939,14 @@ func (h *GroupHandler) CreateGroupOwnedLibrary(c *gin.Context) {
 		}
 	}
 
-	repoName := c.PostForm("name")
-	if repoName == "" {
+	var createLibReq struct {
+		Name string `json:"name"`
+	}
+	if err := c.ShouldBindJSON(&createLibReq); err != nil || createLibReq.Name == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "name is required"})
 		return
 	}
+	repoName := createLibReq.Name
 
 	newLibID := uuid.New().String()
 	now := time.Now()
@@ -1095,11 +1098,14 @@ func (h *GroupHandler) BulkAddGroupMembers(c *gin.Context) {
 		return
 	}
 
-	emailsRaw := c.PostForm("emails")
-	if emailsRaw == "" {
+	var bulkMembersReq struct {
+		Emails []string `json:"emails"`
+	}
+	if err := c.ShouldBindJSON(&bulkMembersReq); err != nil || len(bulkMembersReq.Emails) == 0 {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "emails is required"})
 		return
 	}
+	emailsRaw := strings.Join(bulkMembersReq.Emails, ",")
 
 	// Get group name once for lookup inserts
 	var groupName string
@@ -1359,11 +1365,11 @@ func (h *GroupHandler) SetGroupAdmin(c *gin.Context) {
 
 	// Determine new role from is_admin param
 	var req struct {
-		IsAdmin string `json:"is_admin" form:"is_admin"`
+		IsAdmin bool `json:"is_admin"`
 	}
-	c.ShouldBind(&req) //nolint:errcheck
+	c.ShouldBindJSON(&req) //nolint:errcheck
 	newRole := "member"
-	if strings.EqualFold(req.IsAdmin, "true") {
+	if req.IsAdmin {
 		newRole = "admin"
 	}
 

@@ -174,20 +174,20 @@ export async function listDir(repoId: string, path: string): Promise<Dirent[]> {
 // Rename
 
 export async function renameFile(repoId: string, path: string, newName: string): Promise<void> {
-  const res = await fetch(`${serviceURL()}/api2/repos/${repoId}/file/?p=${encodeURIComponent(path)}`, {
+  const res = await fetch(`${serviceURL()}/api2/repos/${repoId}/file/?p=${encodeURIComponent(path)}&operation=rename`, {
     method: 'POST',
-    headers: { ...authHeaders(), 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({ operation: 'rename', newname: newName }),
+    headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+    body: JSON.stringify({ newname: newName }),
   });
   if (!res.ok) throw new Error('Failed to rename file');
   await invalidateApiCache(`/api2/repos/${repoId}/dir`);
 }
 
 export async function renameDir(repoId: string, path: string, newName: string): Promise<void> {
-  const res = await fetch(`${serviceURL()}/api2/repos/${repoId}/dir/?p=${encodeURIComponent(path)}`, {
+  const res = await fetch(`${serviceURL()}/api2/repos/${repoId}/dir/?p=${encodeURIComponent(path)}&operation=rename`, {
     method: 'POST',
-    headers: { ...authHeaders(), 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({ operation: 'rename', newname: newName }),
+    headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+    body: JSON.stringify({ newname: newName }),
   });
   if (!res.ok) throw new Error('Failed to rename folder');
   await invalidateApiCache(`/api2/repos/${repoId}/dir`);

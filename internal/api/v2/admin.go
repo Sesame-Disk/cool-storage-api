@@ -361,48 +361,23 @@ func (h *AdminHandler) ListOrganizations(c *gin.Context) {
 
 // CreateOrganization creates a new organization (superadmin only).
 // POST /admin/organizations/
-//
-// Accepts both JSON and FormData (seafile-js compatibility):
-//
-//	JSON:     { "name": "Acme", "storage_quota": 1099511627776 }
-//	FormData: org_name=Acme&owner_email=alice@acme.com&password=ignored
-//
-// If owner_email is provided, an admin user is created inside the new org.
-// The password field is accepted for API compatibility but is not used —
-// this system authenticates exclusively via OIDC.
 func (h *AdminHandler) CreateOrganization(c *gin.Context) {
-	// ── Parse request (FormData takes priority; JSON as fallback) ──────────
-	var orgName, ownerEmail string
-	var storageQuota int64
-
-	ct := c.ContentType()
-	if strings.Contains(ct, "multipart/form-data") || strings.Contains(ct, "application/x-www-form-urlencoded") {
-		// seafile-js sends FormData with org_name / owner_email / password
-		orgName = strings.TrimSpace(c.PostForm("org_name"))
-		ownerEmail = strings.TrimSpace(c.PostForm("owner_email"))
-		// password accepted but ignored (OIDC-only system)
-		if q, err := strconv.ParseInt(c.PostForm("storage_quota"), 10, 64); err == nil {
-			storageQuota = q
-		}
-	} else {
-		// JSON body
-		var body struct {
-			Name         string `json:"name"`
-			OrgName      string `json:"org_name"`
-			StorageQuota int64  `json:"storage_quota"`
-			OwnerEmail   string `json:"owner_email"`
-		}
-		if err := c.ShouldBindJSON(&body); err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "name is required"})
-			return
-		}
-		orgName = strings.TrimSpace(body.OrgName)
-		if orgName == "" {
-			orgName = strings.TrimSpace(body.Name)
-		}
-		ownerEmail = strings.TrimSpace(body.OwnerEmail)
-		storageQuota = body.StorageQuota
+	var body struct {
+		Name         string `json:"name"`
+		OrgName      string `json:"org_name"`
+		StorageQuota int64  `json:"storage_quota"`
+		OwnerEmail   string `json:"owner_email"`
 	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		return
+	}
+	orgName := strings.TrimSpace(body.OrgName)
+	if orgName == "" {
+		orgName = strings.TrimSpace(body.Name)
+	}
+	ownerEmail := strings.TrimSpace(body.OwnerEmail)
+	storageQuota := body.StorageQuota
 
 	if orgName == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "org_name (or name) is required"})
@@ -410,6 +385,10 @@ func (h *AdminHandler) CreateOrganization(c *gin.Context) {
 	}
 	if storageQuota <= 0 {
 		storageQuota = 1099511627776 // 1 TB default
+	}
+	if h.db == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "database not available"})
+		return
 	}
 
 	// ── Validate owner email before creating anything ─────────────────────
@@ -836,6 +815,10 @@ func (h *AdminHandler) SoftDeleteOrganization(c *gin.Context) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "cannot delete platform organization"})
 		return
 	}
+	if h.db == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "database not available"})
+		return
+	}
 
 	// Verify org exists
 	var name string
@@ -865,6 +848,10 @@ func (h *AdminHandler) DeactivateOrganization(c *gin.Context) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "cannot deactivate platform organization"})
 		return
 	}
+	if h.db == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "database not available"})
+		return
+	}
 
 	// Verify org exists
 	var name string
@@ -887,6 +874,10 @@ func (h *AdminHandler) DeactivateOrganization(c *gin.Context) {
 // POST /admin/organizations/:org_id/restore/
 func (h *AdminHandler) RestoreOrganization(c *gin.Context) {
 	orgID := c.Param("org_id")
+	if h.db == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "database not available"})
+		return
+	}
 
 	// Verify org exists and is actually in "deleted" state
 	var orgStatus string
@@ -914,6 +905,10 @@ func (h *AdminHandler) RestoreOrganization(c *gin.Context) {
 // POST /admin/organizations/:org_id/reactivate/
 func (h *AdminHandler) ReactivateOrganization(c *gin.Context) {
 	orgID := c.Param("org_id")
+	if h.db == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "database not available"})
+		return
+	}
 
 	var orgStatus string
 	err := h.db.Session().Query(`
@@ -1498,13 +1493,16 @@ func (h *AdminHandler) AdminCreateGroup(c *gin.Context) {
 		return
 	}
 
-	groupName := c.Request.FormValue("group_name")
-	groupOwnerEmail := c.Request.FormValue("group_owner")
-
-	if groupName == "" {
+	var createGroupReq struct {
+		GroupName  string `json:"group_name"`
+		GroupOwner string `json:"group_owner"`
+	}
+	if err := c.ShouldBindJSON(&createGroupReq); err != nil || createGroupReq.GroupName == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "group_name is required"})
 		return
 	}
+	groupName := createGroupReq.GroupName
+	groupOwnerEmail := createGroupReq.GroupOwner
 
 	orgID := callerOrgID
 
@@ -1642,8 +1640,13 @@ func (h *AdminHandler) AdminTransferGroup(c *gin.Context) {
 	}
 
 	groupID := c.Param("group_id")
-	newOwnerEmail := c.Request.FormValue("new_owner")
-	newName := c.Request.FormValue("name")
+	var transferGroupReq struct {
+		NewOwner string `json:"new_owner"`
+		Name     string `json:"name"`
+	}
+	c.ShouldBindJSON(&transferGroupReq) //nolint:errcheck
+	newOwnerEmail := transferGroupReq.NewOwner
+	newName := transferGroupReq.Name
 
 	// Resolve the group's actual org_id from groups_by_id (superadmin may operate on groups outside their own org)
 	callerRole, _ := h.permMiddleware.GetUserOrgRole(callerOrgID, callerUserID)
@@ -1833,14 +1836,14 @@ func (h *AdminHandler) AdminAddGroupMember(c *gin.Context) {
 
 	groupID := c.Param("group_id")
 
-	// Support multiple emails (form array) — handles both multipart/form-data
-	// and application/x-www-form-urlencoded.
-	c.Request.ParseMultipartForm(32 << 20)
-	emails := c.Request.Form["email"]
-	if len(emails) == 0 {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "email is required"})
+	var addMemberReq struct {
+		Emails []string `json:"emails"`
+	}
+	if err := c.ShouldBindJSON(&addMemberReq); err != nil || len(addMemberReq.Emails) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "emails is required"})
 		return
 	}
+	emails := addMemberReq.Emails
 
 	// Resolve the group's own org_id — callerOrgID may differ (e.g. superadmin).
 	var orgID, groupName string
@@ -2462,16 +2465,22 @@ func (h *AdminHandler) UpdateUserByEmail(c *gin.Context, email string) {
 		FROM users WHERE org_id = ? AND user_id = ?
 	`, userOrgID, userID).Scan(&currentName, &currentRole, &currentStatus, &currentQuota, &currentTrafficUploadQuota, &currentTrafficDownloadQuota, &currentCreated, &currentLastLogin)
 
-	// Read form values
-	newRole := c.Request.FormValue("role")
-	newName := c.Request.FormValue("name")
-	quotaStr := c.Request.FormValue("quota_total")
-	trafficUploadQuotaStr := c.Request.FormValue("traffic_upload_quota")
-	trafficDownloadQuotaStr := c.Request.FormValue("traffic_download_quota")
-	isActiveStr := c.Request.FormValue("is_active")
-	isStaffStr := c.Request.FormValue("is_staff")
+	var updateReq struct {
+		Role                 *string `json:"role"`
+		Name                 *string `json:"name"`
+		QuotaTotal           *int64  `json:"quota_total"`
+		TrafficUploadQuota   *int64  `json:"traffic_upload_quota"`
+		TrafficDownloadQuota *int64  `json:"traffic_download_quota"`
+		IsActive             *bool   `json:"is_active"`
+		IsStaff              *bool   `json:"is_staff"`
+	}
+	if err := c.ShouldBindJSON(&updateReq); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		return
+	}
 
-	if newRole != "" {
+	if updateReq.Role != nil {
+		newRole := *updateReq.Role
 		validRoles := map[string]bool{"admin": true, "user": true, "readonly": true, "guest": true}
 		if newRole == "superadmin" {
 			role, _ := h.permMiddleware.GetUserOrgRole(callerOrgID, callerUserID)
@@ -2498,8 +2507,8 @@ func (h *AdminHandler) UpdateUserByEmail(c *gin.Context, email string) {
 		}
 	}
 
-	if isStaffStr != "" {
-		nextRole := applyLegacyStaffToggle(currentRole, isStaffStr == "true")
+	if updateReq.IsStaff != nil {
+		nextRole := applyLegacyStaffToggle(currentRole, *updateReq.IsStaff)
 		if nextRole != currentRole {
 			currentRole = nextRole
 			if err := h.db.Session().Query(`
@@ -2511,34 +2520,28 @@ func (h *AdminHandler) UpdateUserByEmail(c *gin.Context, email string) {
 		}
 	}
 
-	if newName != "" {
-		currentName = newName
+	if updateReq.Name != nil {
+		currentName = *updateReq.Name
 		if err := h.db.Session().Query(`
 			UPDATE users SET name = ? WHERE org_id = ? AND user_id = ?
-		`, newName, userOrgID, userID).Exec(); err != nil {
+		`, currentName, userOrgID, userID).Exec(); err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update user"})
 			return
 		}
 	}
 
-	// Parse new quota values for validation before writing.
+	// Compute new quota values for validation before writing.
 	newQuota := currentQuota
-	if quotaStr != "" {
-		if q, err := strconv.ParseInt(quotaStr, 10, 64); err == nil {
-			newQuota = q
-		}
+	if updateReq.QuotaTotal != nil {
+		newQuota = *updateReq.QuotaTotal
 	}
 	newUploadQuota := currentTrafficUploadQuota
-	if trafficUploadQuotaStr != "" {
-		if q, err := strconv.ParseInt(trafficUploadQuotaStr, 10, 64); err == nil {
-			newUploadQuota = q
-		}
+	if updateReq.TrafficUploadQuota != nil {
+		newUploadQuota = *updateReq.TrafficUploadQuota
 	}
 	newDownloadQuota := currentTrafficDownloadQuota
-	if trafficDownloadQuotaStr != "" {
-		if q, err := strconv.ParseInt(trafficDownloadQuotaStr, 10, 64); err == nil {
-			newDownloadQuota = q
-		}
+	if updateReq.TrafficDownloadQuota != nil {
+		newDownloadQuota = *updateReq.TrafficDownloadQuota
 	}
 
 	// Validate user quotas against org limits.
@@ -2578,13 +2581,13 @@ func (h *AdminHandler) UpdateUserByEmail(c *gin.Context, email string) {
 		}
 	}
 
-	if isActiveStr == "false" {
+	if updateReq.IsActive != nil && !*updateReq.IsActive {
 		if err := deactivateUser(h.db, h.sessions, userOrgID, userID); err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update user"})
 			return
 		}
 		currentStatus = "deactivated"
-	} else if isActiveStr == "true" {
+	} else if updateReq.IsActive != nil && *updateReq.IsActive {
 		if err := activateUser(h.db, userOrgID, userID); err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update user"})
 			return
@@ -3251,24 +3254,16 @@ func (h *AdminHandler) AdminCreateLibrary(c *gin.Context) {
 		return
 	}
 
-	// Support both JSON and form data
-	var repoName, ownerEmail string
-	contentType := c.GetHeader("Content-Type")
-	if strings.Contains(contentType, "application/json") {
-		var req struct {
-			Name  string `json:"name"`
-			Owner string `json:"owner"`
-		}
-		if err := c.ShouldBindJSON(&req); err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-			return
-		}
-		repoName = req.Name
-		ownerEmail = req.Owner
-	} else {
-		repoName = c.PostForm("name")
-		ownerEmail = c.PostForm("owner")
+	var createLibReq struct {
+		Name  string `json:"name"`
+		Owner string `json:"owner"`
 	}
+	if err := c.ShouldBindJSON(&createLibReq); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		return
+	}
+	repoName := createLibReq.Name
+	ownerEmail := createLibReq.Owner
 
 	if repoName == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "name is required"})
@@ -3373,23 +3368,14 @@ func (h *AdminHandler) AdminTransferLibrary(c *gin.Context) {
 		return
 	}
 
-	// Support both JSON and form data
-	var newOwnerEmail string
-	contentType := c.GetHeader("Content-Type")
-	if strings.Contains(contentType, "application/json") {
-		var req struct {
-			Owner string `json:"owner"`
-		}
-		if err := c.ShouldBindJSON(&req); err == nil {
-			newOwnerEmail = req.Owner
-		}
-	} else {
-		newOwnerEmail = c.PostForm("owner")
+	var transferLibReq struct {
+		Owner string `json:"owner"`
 	}
-	if newOwnerEmail == "" {
+	if err := c.ShouldBindJSON(&transferLibReq); err != nil || transferLibReq.Owner == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "owner email is required"})
 		return
 	}
+	newOwnerEmail := transferLibReq.Owner
 
 	// Lookup library's org
 	var orgID string

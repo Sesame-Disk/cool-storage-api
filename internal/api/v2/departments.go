@@ -166,10 +166,6 @@ func (h *DepartmentHandler) CreateDepartment(c *gin.Context) {
 		return
 	}
 
-	groupUUID := uuid.New()
-	groupID := groupUUID.String()
-	now := time.Now()
-
 	// Validate parent if specified
 	// "-1" is the seafile-js sentinel value meaning "no parent" (root department)
 	var parentGroupID string
@@ -188,6 +184,14 @@ func (h *DepartmentHandler) CreateDepartment(c *gin.Context) {
 		}
 		parentGroupID = req.ParentGroupID
 	}
+	if h.db == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "database not available"})
+		return
+	}
+
+	groupUUID := uuid.New()
+	groupID := groupUUID.String()
+	now := time.Now()
 
 	// Atomic batch: create department + lookup + creator membership
 	batch := h.db.Session().Batch(gocql.LoggedBatch)
@@ -230,6 +234,10 @@ func (h *DepartmentHandler) GetDepartment(c *gin.Context) {
 
 	if _, err := uuid.Parse(groupID); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid group_id"})
+		return
+	}
+	if h.db == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "database not available"})
 		return
 	}
 
@@ -293,6 +301,10 @@ func (h *DepartmentHandler) UpdateDepartment(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "name is required"})
 		return
 	}
+	if h.db == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "database not available"})
+		return
+	}
 
 	if err := renameGroup(h.db, orgID, groupID, req.Name, time.Now()); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update department"})
@@ -311,6 +323,10 @@ func (h *DepartmentHandler) DeleteDepartment(c *gin.Context) {
 
 	if _, err := uuid.Parse(groupID); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid group_id"})
+		return
+	}
+	if h.db == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "database not available"})
 		return
 	}
 

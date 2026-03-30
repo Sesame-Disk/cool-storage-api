@@ -690,7 +690,12 @@ func (h *FileHandler) RenameDirectory(c *gin.Context) {
 	orgID := c.GetString("org_id")
 	userID := c.GetString("user_id")
 	dirPath := c.Query("p")
-	newName := c.PostForm("newname")
+
+	var renameReq struct {
+		Newname string `json:"newname"`
+	}
+	c.ShouldBindJSON(&renameReq) //nolint:errcheck
+	newName := renameReq.Newname
 
 	if dirPath == "" || dirPath == "/" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid path"})
@@ -877,7 +882,12 @@ func (h *FileHandler) RenameFile(c *gin.Context) {
 	orgID := c.GetString("org_id")
 	userID := c.GetString("user_id")
 	filePath := c.Query("p")
-	newName := c.PostForm("newname")
+
+	var renameFileReq struct {
+		Newname string `json:"newname"`
+	}
+	c.ShouldBindJSON(&renameFileReq) //nolint:errcheck
+	newName := renameFileReq.Newname
 
 	if filePath == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "path is required"})
@@ -3279,8 +3289,14 @@ func (h *FileHandler) RevertFile(c *gin.Context) {
 	orgID := c.GetString("org_id")
 	userID := c.GetString("user_id")
 	filePath := c.Query("p")
-	commitID := c.PostForm("commit_id")
-	conflictPolicy := c.PostForm("conflict_policy")
+
+	var restoreFileReq struct {
+		CommitID       string `json:"commit_id"`
+		ConflictPolicy string `json:"conflict_policy"`
+	}
+	c.ShouldBindJSON(&restoreFileReq) //nolint:errcheck
+	commitID := restoreFileReq.CommitID
+	conflictPolicy := restoreFileReq.ConflictPolicy
 
 	if filePath == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "path is required"})
@@ -3418,8 +3434,14 @@ func (h *FileHandler) RevertDirectory(c *gin.Context) {
 	orgID := c.GetString("org_id")
 	userID := c.GetString("user_id")
 	dirPath := c.Query("p")
-	commitID := c.PostForm("commit_id")
-	conflictPolicy := c.PostForm("conflict_policy")
+
+	var revertDirReq struct {
+		CommitID       string `json:"commit_id"`
+		ConflictPolicy string `json:"conflict_policy"`
+	}
+	c.ShouldBindJSON(&revertDirReq) //nolint:errcheck
+	commitID := revertDirReq.CommitID
+	conflictPolicy := revertDirReq.ConflictPolicy
 
 	if dirPath == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "path is required"})

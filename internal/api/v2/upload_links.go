@@ -443,8 +443,16 @@ func (h *UploadLinkHandler) UpdateUploadLink(c *gin.Context) {
 	}
 
 	// Parse updates
-	expirationTime := c.PostForm("expiration_time")
-	newPasswordPlain := c.PostForm("password")
+	var updateBody struct {
+		ExpirationTime string `json:"expiration_time"`
+		Password       string `json:"password"`
+	}
+	if err := c.ShouldBindJSON(&updateBody); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		return
+	}
+	expirationTime := updateBody.ExpirationTime
+	newPasswordPlain := updateBody.Password
 
 	newExpiresAt := currentExpiresAt
 	if expirationTime != "" {

@@ -1075,15 +1075,30 @@ func (h *AdminHandler) AdminUpdateOrgUser(c *gin.Context) {
 		return
 	}
 
-	// Apply updates from FormData
-	if v := c.Request.FormValue("active"); v != "" {
-		if v == "false" {
+	// Parse JSON body — all fields are optional pointers so only provided ones are updated.
+	var updateReq struct {
+		Active               *bool   `json:"active"`
+		IsOrgStaff           *bool   `json:"is_org_staff"`
+		IsStaff              *bool   `json:"is_staff"` // org-admin alias
+		Name                 *string `json:"name"`
+		Role                 *string `json:"role"`
+		QuotaTotal           *int64  `json:"quota_total"`
+		TrafficUploadQuota   *int64  `json:"traffic_upload_quota"`
+		TrafficDownloadQuota *int64  `json:"traffic_download_quota"`
+	}
+	if err := c.ShouldBindJSON(&updateReq); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		return
+	}
+
+	if updateReq.Active != nil {
+		if !*updateReq.Active {
 			if err := deactivateUser(h.db, h.sessions, targetOrgID, userID); err != nil {
 				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update user"})
 				return
 			}
 			status = StatusDeactivated
-		} else if v == "true" {
+		} else {
 			if err := activateUser(h.db, targetOrgID, userID); err != nil {
 				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update user"})
 				return
@@ -1093,12 +1108,12 @@ func (h *AdminHandler) AdminUpdateOrgUser(c *gin.Context) {
 	}
 
 	// Support both is_org_staff and is_staff (frontend uses is_org_staff from sys-admin, is_staff from org-admin)
-	isStaffVal := c.Request.FormValue("is_org_staff")
-	if isStaffVal == "" {
-		isStaffVal = c.Request.FormValue("is_staff")
+	staffPtr := updateReq.IsOrgStaff
+	if staffPtr == nil {
+		staffPtr = updateReq.IsStaff
 	}
-	if isStaffVal != "" {
-		role = applyLegacyStaffToggle(role, isStaffVal == "true")
+	if staffPtr != nil {
+		role = applyLegacyStaffToggle(role, *staffPtr)
 		if err := h.db.Session().Query(`UPDATE users SET role = ? WHERE org_id = ? AND user_id = ?`,
 			role, targetOrgID, userID).Exec(); err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update user"})
@@ -1106,8 +1121,8 @@ func (h *AdminHandler) AdminUpdateOrgUser(c *gin.Context) {
 		}
 	}
 
-	if v := c.Request.FormValue("name"); v != "" {
-		name = v
+	if updateReq.Name != nil && *updateReq.Name != "" {
+		name = *updateReq.Name
 		if err := h.db.Session().Query(`UPDATE users SET name = ? WHERE org_id = ? AND user_id = ?`,
 			name, targetOrgID, userID).Exec(); err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update user"})
@@ -1115,10 +1130,10 @@ func (h *AdminHandler) AdminUpdateOrgUser(c *gin.Context) {
 		}
 	}
 
-	if v := c.Request.FormValue("role"); v != "" {
+	if updateReq.Role != nil {
 		validRoles := map[string]bool{"admin": true, "user": true, "readonly": true, "guest": true}
-		if validRoles[v] {
-			role = v
+		if validRoles[*updateReq.Role] {
+			role = *updateReq.Role
 			if err := h.db.Session().Query(`UPDATE users SET role = ? WHERE org_id = ? AND user_id = ?`,
 				role, targetOrgID, userID).Exec(); err != nil {
 				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update user"})
@@ -1128,10 +1143,8 @@ func (h *AdminHandler) AdminUpdateOrgUser(c *gin.Context) {
 	}
 
 	originalQuota := quotaBytes
-	if v := c.Request.FormValue("quota_total"); v != "" {
-		if q, err := strconv.ParseInt(v, 10, 64); err == nil {
-			quotaBytes = q
-		}
+	if updateReq.QuotaTotal != nil {
+		quotaBytes = *updateReq.QuotaTotal
 	}
 
 	var trafficUploadQuota, trafficDownloadQuota int64
@@ -1143,15 +1156,11 @@ func (h *AdminHandler) AdminUpdateOrgUser(c *gin.Context) {
 
 	newUploadQuota := trafficUploadQuota
 	newDownloadQuota := trafficDownloadQuota
-	if v := c.Request.FormValue("traffic_upload_quota"); v != "" {
-		if q, err := strconv.ParseInt(v, 10, 64); err == nil {
-			newUploadQuota = q
-		}
+	if updateReq.TrafficUploadQuota != nil {
+		newUploadQuota = *updateReq.TrafficUploadQuota
 	}
-	if v := c.Request.FormValue("traffic_download_quota"); v != "" {
-		if q, err := strconv.ParseInt(v, 10, 64); err == nil {
-			newDownloadQuota = q
-		}
+	if updateReq.TrafficDownloadQuota != nil {
+		newDownloadQuota = *updateReq.TrafficDownloadQuota
 	}
 
 	// Validate user quotas against org limits.
@@ -1581,20 +1590,14 @@ func (h *AdminHandler) AdminSetShareLinkActive(c *gin.Context) {
 	}
 
 	token := c.Param("token")
-	activeRaw := strings.TrimSpace(strings.ToLower(c.PostForm("active")))
-	if activeRaw == "" {
-		var req struct {
-			Active *bool `json:"active"`
-		}
-		if err := c.ShouldBindJSON(&req); err == nil && req.Active != nil {
-			activeRaw = strconv.FormatBool(*req.Active)
-		}
+	var shareLinkReq struct {
+		Active *bool `json:"active"`
 	}
-	active, err := strconv.ParseBool(activeRaw)
-	if err != nil {
+	if err := c.ShouldBindJSON(&shareLinkReq); err != nil || shareLinkReq.Active == nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "active is required and must be true or false"})
 		return
 	}
+	active := *shareLinkReq.Active
 
 	if err := h.setAdminLinkActive(token, "share", active); err != nil {
 		if err.Error() == "not found" {
@@ -1855,20 +1858,14 @@ func (h *AdminHandler) AdminSetUploadLinkActive(c *gin.Context) {
 	}
 
 	token := c.Param("token")
-	activeRaw := strings.TrimSpace(strings.ToLower(c.PostForm("active")))
-	if activeRaw == "" {
-		var req struct {
-			Active *bool `json:"active"`
-		}
-		if err := c.ShouldBindJSON(&req); err == nil && req.Active != nil {
-			activeRaw = strconv.FormatBool(*req.Active)
-		}
+	var uploadLinkReq struct {
+		Active *bool `json:"active"`
 	}
-	active, err := strconv.ParseBool(activeRaw)
-	if err != nil {
+	if err := c.ShouldBindJSON(&uploadLinkReq); err != nil || uploadLinkReq.Active == nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "active is required and must be true or false"})
 		return
 	}
+	active := *uploadLinkReq.Active
 
 	if err := h.setAdminLinkActive(token, "upload", active); err != nil {
 		if err.Error() == "not found" {
@@ -2502,19 +2499,11 @@ func (h *AdminHandler) AdminUpdateGroupMemberRole(c *gin.Context) {
 		return
 	}
 
-	isAdminStr := c.Request.FormValue("is_admin")
-	if isAdminStr == "" {
-		// Try JSON body
-		var req struct {
-			IsAdmin interface{} `json:"is_admin"`
-		}
-		c.ShouldBindJSON(&req)
-		if req.IsAdmin != nil {
-			isAdminStr = fmt.Sprintf("%v", req.IsAdmin)
-		}
+	var groupMemberReq struct {
+		IsAdmin bool `json:"is_admin"`
 	}
-
-	isAdmin := isAdminStr == "true" || isAdminStr == "True" || isAdminStr == "1"
+	c.ShouldBindJSON(&groupMemberReq) //nolint:errcheck
+	isAdmin := groupMemberReq.IsAdmin
 	newRole := "member"
 	if isAdmin {
 		newRole = "admin"
@@ -2635,7 +2624,7 @@ func (h *AdminHandler) AdminListAddressBookGroups(c *gin.Context) {
 }
 
 // AdminAddAddressBookGroup creates a new department group.
-// POST /admin/address-book/groups/  FormData: group_name, parent_group (optional), group_owner (optional), group_staff (optional, comma-separated)
+// POST /admin/address-book/groups/
 func (h *AdminHandler) AdminAddAddressBookGroup(c *gin.Context) {
 	callerOrgID := c.GetString("org_id")
 	callerUserID := c.GetString("user_id")
@@ -2643,14 +2632,24 @@ func (h *AdminHandler) AdminAddAddressBookGroup(c *gin.Context) {
 		return
 	}
 
-	groupName := c.Request.FormValue("group_name")
+	var req struct {
+		GroupName   string `json:"group_name"`
+		ParentGroup string `json:"parent_group"`
+		GroupOwner  string `json:"group_owner"`
+		GroupStaff  string `json:"group_staff"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		return
+	}
+	groupName := req.GroupName
 	if groupName == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "group_name is required"})
 		return
 	}
-	parentGroup := c.Request.FormValue("parent_group")
-	groupOwner := c.Request.FormValue("group_owner")
-	groupStaff := c.Request.FormValue("group_staff")
+	parentGroup := req.ParentGroup
+	groupOwner := req.GroupOwner
+	groupStaff := req.GroupStaff
 
 	newGroupID := uuid.New().String()
 	now := time.Now()
@@ -2765,7 +2764,7 @@ func (h *AdminHandler) AdminGetAddressBookGroup(c *gin.Context) {
 }
 
 // AdminUpdateAddressBookGroup updates a department group's name.
-// PUT /admin/address-book/groups/:group_id/  FormData: group_name
+// PUT /admin/address-book/groups/:group_id/
 func (h *AdminHandler) AdminUpdateAddressBookGroup(c *gin.Context) {
 	callerOrgID := c.GetString("org_id")
 	callerUserID := c.GetString("user_id")
@@ -2774,7 +2773,14 @@ func (h *AdminHandler) AdminUpdateAddressBookGroup(c *gin.Context) {
 	}
 
 	groupID := c.Param("group_id")
-	newName := c.Request.FormValue("group_name")
+	var req struct {
+		GroupName string `json:"group_name"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		return
+	}
+	newName := req.GroupName
 	if newName == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "group_name is required"})
 		return
@@ -2868,7 +2874,7 @@ func (h *AdminHandler) AdminDeleteAddressBookGroup(c *gin.Context) {
 // ============================================================================
 
 // AdminAddGroupOwnedLibrary creates a group-owned library (department repo).
-// POST /admin/groups/:group_id/group-owned-libraries/  FormData: repo_name
+// POST /admin/groups/:group_id/group-owned-libraries/
 func (h *AdminHandler) AdminAddGroupOwnedLibrary(c *gin.Context) {
 	callerOrgID := c.GetString("org_id")
 	callerUserID := c.GetString("user_id")
@@ -2877,7 +2883,14 @@ func (h *AdminHandler) AdminAddGroupOwnedLibrary(c *gin.Context) {
 	}
 
 	groupID := c.Param("group_id")
-	repoName := c.Request.FormValue("repo_name")
+	var req struct {
+		RepoName string `json:"repo_name"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		return
+	}
+	repoName := req.RepoName
 	if repoName == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "repo_name is required"})
 		return

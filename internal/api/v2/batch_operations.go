@@ -32,7 +32,7 @@ type TaskStore struct {
 // AsyncTask represents an async copy/move task
 type AsyncTask struct {
 	ID           string    `json:"task_id"`
-	Type         string    `json:"type"` // "move" or "copy"
+	Type         string    `json:"type"`   // "move" or "copy"
 	Status       string    `json:"status"` // "processing", "done", "failed"
 	Total        int       `json:"total"`
 	Done         int       `json:"done"`
@@ -143,6 +143,11 @@ func (h *BatchOperationHandler) handleBatchOperation(c *gin.Context, opType stri
 	}
 	if len(req.SrcDirents) == 0 {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "src_dirents is required"})
+		return
+	}
+
+	if h.db == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "database not available"})
 		return
 	}
 

@@ -125,15 +125,9 @@ func (h *TagHandler) CreateRepoTag(c *gin.Context) {
 	repoID := c.Param("repo_id")
 
 	var req CreateRepoTagRequest
-	// Try JSON first, then form
-	if c.ContentType() == "application/json" {
-		if err := c.ShouldBindJSON(&req); err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-			return
-		}
-	} else {
-		req.Name = c.PostForm("name")
-		req.Color = c.PostForm("color")
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
 	}
 
 	if req.Name == "" {
@@ -214,14 +208,9 @@ func (h *TagHandler) UpdateRepoTag(c *gin.Context) {
 	}
 
 	var req CreateRepoTagRequest
-	if c.ContentType() == "application/json" {
-		if err := c.ShouldBindJSON(&req); err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-			return
-		}
-	} else {
-		req.Name = c.PostForm("name")
-		req.Color = c.PostForm("color")
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
 	}
 
 	if h.db != nil {
@@ -440,6 +429,10 @@ func (h *TagHandler) AddFileTag(c *gin.Context) {
 
 	if filePath == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "file_path is required"})
+		return
+	}
+	if repoTagID <= 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid repo_tag_id"})
 		return
 	}
 

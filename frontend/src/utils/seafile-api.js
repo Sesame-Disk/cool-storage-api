@@ -398,19 +398,13 @@ seafileAPI.deleteRepoTrash = function (repoID, keepDays) {
 };
 
 seafileAPI.restoreFile = function (repoID, commitID, path) {
-  let url = this.server + '/api/v2.1/repos/' + repoID + '/file/restore/';
-  let data = new FormData();
-  data.append('commit_id', commitID);
-  data.append('p', path);
-  return this.req.post(url, data);
+  let url = this.server + '/api/v2.1/repos/' + repoID + '/file/restore/?p=' + encodeURIComponent(path);
+  return this.req.post(url, { commit_id: commitID });
 };
 
 seafileAPI.restoreFolder = function (repoID, commitID, path) {
-  let url = this.server + '/api/v2.1/repos/' + repoID + '/dir/restore/';
-  let data = new FormData();
-  data.append('commit_id', commitID);
-  data.append('p', path);
-  return this.req.post(url, data);
+  let url = this.server + '/api/v2.1/repos/' + repoID + '/dir/restore/?p=' + encodeURIComponent(path);
+  return this.req.post(url, { commit_id: commitID });
 };
 
 seafileAPI.listCommitDir = function (repoID, commitID, path) {
@@ -456,35 +450,24 @@ seafileAPI.listGroupRepos = function (groupID, page, perPage) {
 // Create a library shared to a group (non-department)
 seafileAPI.createGroupRepo = function (groupID, repo) {
   let url = this.server + '/api/v2.1/groups/' + groupID + '/group-owned-libraries/';
-  let form = new FormData();
-  form.append('name', repo.repo_name);
-  if (repo.password) {
-    form.append('passwd', repo.password);
-  }
-  if (repo.permission) {
-    form.append('permission', repo.permission);
-  }
-  return this.req.post(url, form);
+  let data = { name: repo.repo_name };
+  if (repo.password) data.passwd = repo.password;
+  if (repo.permission) data.permission = repo.permission;
+  return this.req.post(url, data);
 };
 
 // Create a group-owned library (department)
 seafileAPI.createGroupOwnedLibrary = function (groupID, repo) {
   let url = this.server + '/api/v2.1/groups/' + groupID + '/group-owned-libraries/';
-  let form = new FormData();
-  form.append('name', repo.repo_name);
-  if (repo.passwd) {
-    form.append('passwd', repo.passwd);
-  }
-  form.append('permission', 'rw');
-  return this.req.post(url, form);
+  let data = { name: repo.repo_name, permission: 'rw' };
+  if (repo.passwd) data.passwd = repo.passwd;
+  return this.req.post(url, data);
 };
 
 // Rename a group-owned library
 seafileAPI.renameGroupOwnedLibrary = function (groupID, repoID, newName) {
   let url = this.server + '/api/v2.1/groups/' + groupID + '/group-owned-libraries/' + repoID + '/';
-  let form = new FormData();
-  form.append('name', newName);
-  return this.req.put(url, form);
+  return this.req.put(url, { name: newName });
 };
 
 // Delete a group-owned library
@@ -516,9 +499,7 @@ seafileAPI.importGroupMembersViaFile = function (groupID, file) {
 // Add group members (bulk)
 seafileAPI.addGroupMembers = function (groupID, emails) {
   let url = this.server + '/api/v2.1/groups/' + groupID + '/members/bulk/';
-  let form = new FormData();
-  form.append('emails', emails.join(','));
-  return this.req.post(url, form);
+  return this.req.post(url, { emails: emails });
 };
 
 // Delete a group member
@@ -530,9 +511,7 @@ seafileAPI.deleteGroupMember = function (groupID, email) {
 // Set group admin role
 seafileAPI.setGroupAdmin = function (groupID, email, isAdmin) {
   let url = this.server + '/api/v2.1/groups/' + groupID + '/members/' + encodeURIComponent(email) + '/';
-  let form = new FormData();
-  form.append('is_admin', isAdmin);
-  return this.req.put(url, form);
+  return this.req.put(url, { is_admin: !!isAdmin });
 };
 
 // Search users
@@ -558,9 +537,7 @@ seafileAPI.unstarItem = function (repoID, path) {
 // Monitor/unmonitor repos
 seafileAPI.monitorRepo = function (repoID) {
   let url = this.server + '/api/v2.1/monitored-repos/';
-  let form = new FormData();
-  form.append('repo_id', repoID);
-  return this.req.post(url, form);
+  return this.req.post(url, { repo_id: repoID });
 };
 
 seafileAPI.unMonitorRepo = function (repoID) {
@@ -693,15 +670,13 @@ seafileAPI.sysAdminListRepoSharedItems = function (repoID, shareType) {
 // Admin: add shared item to a library (uses standard share API)
 seafileAPI.sysAdminAddRepoSharedItem = function (repoID, shareType, shareToList, permission) {
   let url = this.server + '/api2/repos/' + repoID + '/dir/shared_items/?p=/';
-  let form = new FormData();
-  form.append('share_type', shareType);
-  form.append('permission', permission);
+  const data = { share_type: shareType, permission };
   if (shareType === 'user') {
-    shareToList.forEach(item => form.append('username', item));
+    data.username = shareToList;
   } else {
-    shareToList.forEach(item => form.append('group_id', item));
+    data.group_id = shareToList;
   }
-  return this.req.put(url, form);
+  return this.req.put(url, data);
 };
 
 // Admin: delete shared item from a library
@@ -723,9 +698,7 @@ seafileAPI.sysAdminUpdateRepoSharedItemPermission = function (repoID, shareType,
   } else {
     url += '&group_id=' + shareToID;
   }
-  let form = new FormData();
-  form.append('permission', permission);
-  return this.req.post(url, form);
+  return this.req.post(url, { permission });
 };
 
 // Admin: list group libraries
@@ -749,10 +722,7 @@ seafileAPI.sysAdminListShareInRepos = function (email) {
 // Admin: add library in department group
 seafileAPI.sysAdminAddRepoInDepartment = function (groupID, repoName) {
   let url = this.server + '/api/v2.1/admin/groups/' + groupID + '/group-owned-libraries/';
-  let form = new FormData();
-  form.append('name', repoName);
-  form.append('permission', 'rw');
-  return this.req.post(url, form);
+  return this.req.post(url, { repo_name: repoName });
 };
 
 // Admin: delete library in department group
@@ -776,10 +746,7 @@ seafileAPI.sysAdminSearchGroups = function (name) {
 // Admin: create a new group
 seafileAPI.sysAdminCreateNewGroup = function (groupName, ownerEmail) {
   let url = this.server + '/api/v2.1/admin/groups/';
-  let form = new FormData();
-  form.append('group_name', groupName);
-  form.append('group_owner', ownerEmail);
-  return this.req.post(url, form);
+  return this.req.post(url, { group_name: groupName, group_owner: ownerEmail });
 };
 
 // Admin: delete a group
@@ -791,9 +758,7 @@ seafileAPI.sysAdminDismissGroupByID = function (groupID) {
 // Admin: transfer a group to a new owner
 seafileAPI.sysAdminTransferGroup = function (receiverEmail, groupID) {
   let url = this.server + '/api/v2.1/admin/groups/' + groupID + '/';
-  let form = new FormData();
-  form.append('new_owner', receiverEmail);
-  return this.req.put(url, form);
+  return this.req.put(url, { new_owner: receiverEmail });
 };
 
 // Admin: list group members (paginated)
@@ -805,9 +770,7 @@ seafileAPI.sysAdminListGroupMembers = function (groupID, page, perPage) {
 // Admin: add members to a group
 seafileAPI.sysAdminAddGroupMember = function (groupID, emails) {
   let url = this.server + '/api/v2.1/admin/groups/' + groupID + '/members/';
-  let form = new FormData();
-  emails.forEach(email => form.append('email', email));
-  return this.req.post(url, form);
+  return this.req.post(url, { emails: emails });
 };
 
 // Admin: remove a member from a group
@@ -819,9 +782,7 @@ seafileAPI.sysAdminDeleteGroupMember = function (groupID, email) {
 // Admin: update group member role
 seafileAPI.sysAdminUpdateGroupMemberRole = function (groupID, email, isAdmin) {
   let url = this.server + '/api/v2.1/admin/groups/' + groupID + '/members/' + encodeURIComponent(email) + '/';
-  let form = new FormData();
-  form.append('is_admin', isAdmin);
-  return this.req.put(url, form);
+  return this.req.put(url, { is_admin: !!isAdmin });
 };
 
 // ============================================================================
@@ -890,9 +851,7 @@ seafileAPI.sysAdminDeleteShareLink = function (token) {
 // Admin: activate/deactivate share link by token
 seafileAPI.sysAdminSetShareLinkActive = function (token, active) {
   let url = this.server + '/api/v2.1/admin/share-links/' + token + '/active/';
-  let form = new FormData();
-  form.append('active', active);
-  return this.req.put(url, form);
+  return this.req.put(url, { active: !!active });
 };
 
 // Admin: list all upload links (paginated, sortable)
@@ -919,9 +878,7 @@ seafileAPI.sysAdminDeleteUploadLink = function (token) {
 // Admin: activate/deactivate upload link by token
 seafileAPI.sysAdminSetUploadLinkActive = function (token, active) {
   let url = this.server + '/api/v2.1/admin/upload-links/' + token + '/active/';
-  let form = new FormData();
-  form.append('active', active);
-  return this.req.put(url, form);
+  return this.req.put(url, { active: !!active });
 };
 
 // Admin: list share links created by a specific user
@@ -983,16 +940,10 @@ seafileAPI.sysAdminGetUser = function (email) {
 };
 
 // Admin: update user
-// Supports: sysAdminUpdateUser(email, formData) or sysAdminUpdateUser(email, key, value)
+// Supports: sysAdminUpdateUser(email, key, value) or sysAdminUpdateUser(email, object)
 seafileAPI.sysAdminUpdateUser = function (email, keyOrData, value) {
   let url = this.server + '/api/v2.1/admin/users/' + encodeURIComponent(email) + '/';
-  let data;
-  if (typeof keyOrData === 'string' && value !== undefined) {
-    data = new FormData();
-    data.append(keyOrData, value);
-  } else {
-    data = keyOrData;
-  }
+  const data = typeof keyOrData === 'string' ? { [keyOrData]: value } : keyOrData;
   return this.req.put(url, data);
 };
 
@@ -1069,9 +1020,7 @@ seafileAPI.sysAdminSetAdminUsers = function (emails) {
 // Admin: update admin role (e.g., admin <-> superadmin)
 seafileAPI.sysAdminUpdateAdminRole = function (email, role) {
   let url = this.server + '/api/v2.1/admin/users/' + encodeURIComponent(email) + '/';
-  let form = new FormData();
-  form.append('role', role);
-  return this.req.put(url, form);
+  return this.req.put(url, { role });
 };
 
 // Admin: add admins in batch
@@ -1083,9 +1032,7 @@ seafileAPI.sysAdminAddAdminInBatch = function (emails) {
 // Admin: update org user (sys-admin panel)
 seafileAPI.sysAdminUpdateOrgUser = function (orgID, email, key, value) {
   let url = this.server + '/api/v2.1/admin/organizations/' + orgID + '/users/' + encodeURIComponent(email) + '/';
-  let form = new FormData();
-  form.append(key, value);
-  return this.req.put(url, form);
+  return this.req.put(url, { [key]: value });
 };
 
 // Admin: list organizations
@@ -1237,6 +1184,20 @@ seafileAPI.deleteCustomSharePermission = function (repoID, permissionID) {
 };
 
 // ============================================================================
+// Rename API methods
+// ============================================================================
+
+seafileAPI.renameDir = function (repoID, dirPath, newDirName) {
+  let url = this.server + '/api2/repos/' + repoID + '/dir/?p=' + encodeURIComponent(dirPath) + '&operation=rename';
+  return this.req.post(url, { newname: newDirName });
+};
+
+seafileAPI.renameFile = function (repoID, filePath, newFileName) {
+  let url = this.server + '/api/v2.1/repos/' + repoID + '/file/?p=' + encodeURIComponent(filePath) + '&operation=rename';
+  return this.req.post(url, { newname: newFileName });
+};
+
+// ============================================================================
 // Revert API methods (for restoring files/folders to a specific commit version)
 // ============================================================================
 
@@ -1244,11 +1205,8 @@ seafileAPI.deleteCustomSharePermission = function (repoID, permissionID) {
 // conflictPolicy: 'replace' | 'skip' | undefined (undefined = return conflict error)
 seafileAPI.revertFile = function (repoID, path, commitID, conflictPolicy) {
   let url = this.server + '/api/v2.1/repos/' + repoID + '/file/?p=' + encodeURIComponent(path) + '&operation=revert';
-  let data = new FormData();
-  data.append('commit_id', commitID);
-  if (conflictPolicy) {
-    data.append('conflict_policy', conflictPolicy);
-  }
+  const data = { commit_id: commitID };
+  if (conflictPolicy) data.conflict_policy = conflictPolicy;
   return this.req.post(url, data);
 };
 
@@ -1256,28 +1214,21 @@ seafileAPI.revertFile = function (repoID, path, commitID, conflictPolicy) {
 // conflictPolicy: 'replace' | 'skip' | undefined (undefined = return conflict error)
 seafileAPI.revertFolder = function (repoID, path, commitID, conflictPolicy) {
   let url = this.server + '/api/v2.1/repos/' + repoID + '/dir/?p=' + encodeURIComponent(path) + '&operation=revert';
-  let data = new FormData();
-  data.append('commit_id', commitID);
-  if (conflictPolicy) {
-    data.append('conflict_policy', conflictPolicy);
-  }
+  const data = { commit_id: commitID };
+  if (conflictPolicy) data.conflict_policy = conflictPolicy;
   return this.req.post(url, data);
 };
 
 // Revert entire library to a specific commit
 seafileAPI.revertRepo = function (repoID, commitID) {
   let url = this.server + '/api/v2.1/repos/' + repoID + '/?operation=revert';
-  let data = new FormData();
-  data.append('commit_id', commitID);
-  return this.req.put(url, data);
+  return this.req.put(url, { commit_id: commitID });
 };
 
 // Update the password of a share link. Pass null or '' to remove the password.
 seafileAPI.updateShareLinkPassword = function (token, newPassword) {
   let url = this.server + '/api/v2.1/share-links/' + token + '/';
-  let form = new FormData();
-  form.append('password', newPassword === null || newPassword === '' ? '__remove__' : newPassword);
-  return this.req.put(url, form);
+  return this.req.put(url, { password: newPassword === null || newPassword === '' ? '__remove__' : newPassword });
 };
 
 export { seafileAPI, isAuthenticated, login, logout, getToken, setAuthToken, initAPI };
@@ -1293,14 +1244,9 @@ seafileAPI.sharedUploadLinkGetFileUploadUrl = function (token) {
 };
 
 // Notify server that a file was uploaded via upload link
-seafileAPI.shareLinksUploadDone = function (token, filePath, isDir) {
+seafileAPI.shareLinksUploadDone = function (token) {
   let url = this.server + '/api/v2.1/upload-links/' + token + '/upload-done/';
-  let form = new FormData();
-  form.append('path', filePath);
-  if (isDir) {
-    form.append('is_dir', 'true');
-  }
-  return this.req.post(url, form);
+  return this.req.post(url);
 };
 
 // ============================================================================
@@ -1363,9 +1309,7 @@ seafileAPI.orgAdminUpdateLogo = function (orgID, file) {
 // Org Admin: set org system setting
 seafileAPI.orgAdminSetSysSettingInfo = function (orgID, key, value) {
   let url = this.server + '/api/v2.1/org/' + orgID + '/admin/web-settings/';
-  let form = new FormData();
-  form.append(key, value);
-  return this.req.put(url, form);
+  return this.req.put(url, { [key]: value });
 };
 
 // Org Admin: list org users
@@ -1384,11 +1328,7 @@ seafileAPI.orgAdminListOrgUsers = function (orgID, isStaff, page, sortBy, sortOr
 // Org Admin: add org user
 seafileAPI.orgAdminAddOrgUser = function (orgID, email, name, password) {
   let url = this.server + '/api/v2.1/org/' + orgID + '/admin/users/';
-  let form = new FormData();
-  form.append('email', email);
-  form.append('name', name);
-  form.append('password', password);
-  return this.req.post(url, form);
+  return this.req.post(url, { email, name });
 };
 
 // Org Admin: get org user info
@@ -1412,33 +1352,25 @@ seafileAPI.orgAdminRestoreOrgUser = function (orgID, email) {
 // Org Admin: change org user status (activate/deactivate)
 seafileAPI.orgAdminChangeOrgUserStatus = function (orgID, email, isActive) {
   let url = this.server + '/api/v2.1/org/' + orgID + '/admin/users/' + encodeURIComponent(email) + '/';
-  let form = new FormData();
-  form.append('is_active', isActive);
-  return this.req.put(url, form);
+  return this.req.put(url, { is_active: !!isActive });
 };
 
 // Org Admin: reset org user password
 seafileAPI.orgAdminResetOrgUserPassword = function (orgID, email) {
   let url = this.server + '/api/v2.1/org/' + orgID + '/admin/users/' + encodeURIComponent(email) + '/set-password/';
-  let form = new FormData();
-  form.append('password', '');
-  return this.req.put(url, form);
+  return this.req.put(url);
 };
 
 // Org Admin: set org user name
 seafileAPI.orgAdminSetOrgUserName = function (orgID, email, name) {
   let url = this.server + '/api/v2.1/org/' + orgID + '/admin/users/' + encodeURIComponent(email) + '/';
-  let form = new FormData();
-  form.append('name', name);
-  return this.req.put(url, form);
+  return this.req.put(url, { name });
 };
 
 // Org Admin: set org user contact email
 seafileAPI.orgAdminSetOrgUserContactEmail = function (orgID, email, contactEmail) {
   let url = this.server + '/api/v2.1/org/' + orgID + '/admin/users/' + encodeURIComponent(email) + '/';
-  let form = new FormData();
-  form.append('contact_email', contactEmail);
-  return this.req.put(url, form);
+  return this.req.put(url, { contact_email: contactEmail });
 };
 
 // Org Admin: set org user quota
@@ -1449,25 +1381,17 @@ seafileAPI.orgAdminSetOrgUserQuota = function (orgID, email, quota) {
 // Org Admin: update org user storage and traffic quotas
 seafileAPI.orgAdminUpdateOrgUserQuotas = function (orgID, email, { quotaTotal, trafficUploadQuota, trafficDownloadQuota }) {
   let url = this.server + '/api/v2.1/org/' + orgID + '/admin/users/' + encodeURIComponent(email) + '/';
-  let form = new FormData();
-  if (quotaTotal !== undefined && quotaTotal !== null) {
-    form.append('quota_total', quotaTotal);
-  }
-  if (trafficUploadQuota !== undefined && trafficUploadQuota !== null) {
-    form.append('traffic_upload_quota', trafficUploadQuota);
-  }
-  if (trafficDownloadQuota !== undefined && trafficDownloadQuota !== null) {
-    form.append('traffic_download_quota', trafficDownloadQuota);
-  }
-  return this.req.put(url, form);
+  const data = {};
+  if (quotaTotal != null) data.quota_total = quotaTotal;
+  if (trafficUploadQuota != null) data.traffic_upload_quota = trafficUploadQuota;
+  if (trafficDownloadQuota != null) data.traffic_download_quota = trafficDownloadQuota;
+  return this.req.put(url, data);
 };
 
 // Org Admin: set org admin role
 seafileAPI.orgAdminSetOrgAdmin = function (orgID, email, isStaff) {
   let url = this.server + '/api/v2.1/org/' + orgID + '/admin/users/' + encodeURIComponent(email) + '/';
-  let form = new FormData();
-  form.append('is_staff', isStaff);
-  return this.req.put(url, form);
+  return this.req.put(url, { is_staff: !!isStaff });
 };
 
 // Org Admin: get org user owned repos
@@ -1511,9 +1435,7 @@ seafileAPI.orgAdminImportUsersViaFile = function (orgID, file) {
 // Org Admin: invite org users
 seafileAPI.orgAdminInviteOrgUsers = function (orgID, emails) {
   let url = this.server + '/api/v2.1/org/' + orgID + '/admin/invite-users/';
-  let form = new FormData();
-  emails.forEach(e => form.append('email', e));
-  return this.req.post(url, form);
+  return this.req.post(url, { email_list: emails });
 };
 
 // Org Admin: list org groups
@@ -1537,17 +1459,13 @@ seafileAPI.orgAdminDeleteOrgGroup = function (orgID, groupID) {
 // Org Admin: set group quota
 seafileAPI.orgAdminSetGroupQuota = function (orgID, groupID, quota) {
   let url = this.server + '/api/v2.1/org/' + orgID + '/admin/groups/' + groupID + '/';
-  let form = new FormData();
-  form.append('quota', quota);
-  return this.req.put(url, form);
+  return this.req.put(url, { quota });
 };
 
 // Org Admin: transfer group to a new owner
 seafileAPI.orgAdminTransferGroup = function (orgID, groupID, newOwnerEmail) {
   let url = this.server + '/api/v2.1/org/' + orgID + '/admin/groups/' + groupID + '/transfer/';
-  let form = new FormData();
-  form.append('new_owner', newOwnerEmail);
-  return this.req.put(url, form);
+  return this.req.put(url, { new_owner: newOwnerEmail });
 };
 
 // Org Admin: search org group
@@ -1565,9 +1483,7 @@ seafileAPI.orgAdminListGroupMembers = function (orgID, groupID) {
 // Org Admin: add group member
 seafileAPI.orgAdminAddGroupMember = function (orgID, groupID, email) {
   let url = this.server + '/api/v2.1/org/' + orgID + '/admin/groups/' + groupID + '/members/';
-  let form = new FormData();
-  form.append('email', email);
-  return this.req.post(url, form);
+  return this.req.post(url, { email });
 };
 
 // Org Admin: delete group member
@@ -1579,9 +1495,7 @@ seafileAPI.orgAdminDeleteGroupMember = function (orgID, groupID, email) {
 // Org Admin: set group member role
 seafileAPI.orgAdminSetGroupMemberRole = function (orgID, groupID, email, isAdmin) {
   let url = this.server + '/api/v2.1/org/' + orgID + '/admin/groups/' + groupID + '/members/' + encodeURIComponent(email) + '/';
-  let form = new FormData();
-  form.append('is_admin', isAdmin);
-  return this.req.put(url, form);
+  return this.req.put(url, { is_admin: !!isAdmin });
 };
 
 // Org Admin: list group libraries (repos)
@@ -1607,9 +1521,7 @@ seafileAPI.orgAdminDeleteOrgRepo = function (orgID, repoID) {
 // Org Admin: transfer org repo
 seafileAPI.orgAdminTransferOrgRepo = function (orgID, repoID, email) {
   let url = this.server + '/api/v2.1/org/' + orgID + '/admin/repos/' + repoID + '/';
-  let form = new FormData();
-  form.append('email', email);
-  return this.req.put(url, form);
+  return this.req.put(url, { email });
 };
 
 // Org Admin: list org links
@@ -1666,10 +1578,9 @@ seafileAPI.orgAdminListDepartGroups = function (orgID, parentID) {
 // Org Admin: add department group
 seafileAPI.orgAdminAddDepartGroup = function (orgID, groupName, parentGroup) {
   let url = this.server + '/api/v2.1/org/' + orgID + '/admin/address-book/groups/';
-  let form = new FormData();
-  form.append('group_name', groupName);
-  if (parentGroup) form.append('parent_group', parentGroup);
-  return this.req.post(url, form);
+  const data = { group_name: groupName };
+  if (parentGroup) data.parent_group = parentGroup;
+  return this.req.post(url, data);
 };
 
 // Org Admin: get department group info
@@ -1681,9 +1592,7 @@ seafileAPI.orgAdminListGroupInfo = function (orgID, groupID) {
 // Org Admin: update department group
 seafileAPI.orgAdminUpdateDepartGroup = function (orgID, groupID, groupName) {
   let url = this.server + '/api/v2.1/org/' + orgID + '/admin/address-book/groups/' + groupID + '/';
-  let form = new FormData();
-  form.append('group_name', groupName);
-  return this.req.put(url, form);
+  return this.req.put(url, { group_name: groupName });
 };
 
 // Org Admin: delete department group
@@ -1695,9 +1604,7 @@ seafileAPI.orgAdminDeleteDepartGroup = function (orgID, groupID) {
 // Org Admin: add department repo
 seafileAPI.orgAdminAddDepartmentRepo = function (orgID, groupID, repoName) {
   let url = this.server + '/api/v2.1/org/' + orgID + '/admin/groups/' + groupID + '/group-owned-libraries/';
-  let form = new FormData();
-  form.append('repo_name', repoName);
-  return this.req.post(url, form);
+  return this.req.post(url, { repo_name: repoName });
 };
 
 // Org Admin: delete department repo
@@ -1849,11 +1756,7 @@ seafileAPI.orgAdminListDevices = function (orgID, platform, page, perPage) {
 // Org Admin: unlink device
 seafileAPI.orgAdminUnlinkDevice = function (orgID, platform, deviceID, email) {
   let url = this.server + '/api/v2.1/org/' + orgID + '/admin/devices/';
-  let form = new FormData();
-  form.append('platform', platform);
-  form.append('device_id', deviceID);
-  form.append('email', email);
-  return this.req.delete(url, { data: form });
+  return this.req.delete(url, { data: { platform, device_id: deviceID, email } });
 };
 
 // Org Admin: list device errors
@@ -1878,9 +1781,7 @@ seafileAPI.orgAdminUpdateSamlConfig = function (orgID, data) {
 // Org Admin: verify domain
 seafileAPI.orgAdminVerifyDomain = function (orgID, domain) {
   let url = this.server + '/api/v2.1/org/' + orgID + '/admin/verify-domain/';
-  let form = new FormData();
-  form.append('domain', domain);
-  return this.req.put(url, form);
+  return this.req.put(url, { domain });
 };
 
 // ============================================================================
@@ -1922,9 +1823,7 @@ seafileAPI.getAllRepoFolderShareInfo = function (repoID, shareType) {
 // Update permission for a user share item
 seafileAPI.updateShareToUserItemPermission = function (repoID, path, shareType, shareToEmail, permission) {
   let url = this.server + '/api2/repos/' + repoID + '/dir/shared_items/?p=' + encodeURIComponent(path) + '&share_type=user&username=' + encodeURIComponent(shareToEmail);
-  let form = new FormData();
-  form.append('permission', permission);
-  return this.req.post(url, form);
+  return this.req.post(url, { permission });
 };
 
 // Delete a user share item
@@ -1936,9 +1835,7 @@ seafileAPI.deleteShareToUserItem = function (repoID, path, shareType, shareToEma
 // Update permission for a group share item
 seafileAPI.updateShareToGroupItemPermission = function (repoID, path, shareType, groupID, permission) {
   let url = this.server + '/api2/repos/' + repoID + '/dir/shared_items/?p=' + encodeURIComponent(path) + '&share_type=group&group_id=' + groupID;
-  let form = new FormData();
-  form.append('permission', permission);
-  return this.req.post(url, form);
+  return this.req.post(url, { permission });
 };
 
 // Delete a group share item

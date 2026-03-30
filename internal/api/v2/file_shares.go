@@ -275,8 +275,18 @@ func (h *FileShareHandler) CreateShare(c *gin.Context) {
 		path = "/"
 	}
 
-	shareType := c.PostForm("share_type")  // "user" or "group"
-	permission := c.PostForm("permission") // "r", "rw"
+	var body struct {
+		ShareType  string   `json:"share_type"`
+		Permission string   `json:"permission"`
+		Username   []string `json:"username"`
+		GroupID    []string `json:"group_id"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		return
+	}
+	shareType := body.ShareType
+	permission := body.Permission
 
 	if shareType == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "share_type is required"})
@@ -320,14 +330,12 @@ func (h *FileShareHandler) CreateShare(c *gin.Context) {
 
 	// Validate share_type-specific parameters before DB access
 	if shareType == "user" {
-		usernames := c.PostFormArray("username")
-		if len(usernames) == 0 {
+		if len(body.Username) == 0 {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "username is required"})
 			return
 		}
 	} else if shareType == "group" {
-		groupIDs := c.PostFormArray("group_id")
-		if len(groupIDs) == 0 {
+		if len(body.GroupID) == 0 {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "group_id is required"})
 			return
 		}
@@ -359,7 +367,7 @@ func (h *FileShareHandler) CreateShare(c *gin.Context) {
 
 	if shareType == "user" {
 		// Share to user(s)
-		usernames := c.PostFormArray("username")
+		usernames := body.Username
 
 		for _, username := range usernames {
 			// Get user by email (with fallback for pre-index users)
@@ -413,7 +421,7 @@ func (h *FileShareHandler) CreateShare(c *gin.Context) {
 		}
 	} else if shareType == "group" {
 		// Share to group(s)
-		groupIDs := c.PostFormArray("group_id")
+		groupIDs := body.GroupID
 		if len(groupIDs) == 0 {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "group_id is required"})
 			return
@@ -476,14 +484,22 @@ func (h *FileShareHandler) CreateShare(c *gin.Context) {
 
 // UpdateSharePermission updates permission for a share
 // POST /api2/repos/:repo_id/dir/shared_items/?p={path}&share_type={type}&username={user} or &group_id={id}
-// Form data: permission
+// JSON body: { "permission": "r" | "rw" }
 func (h *FileShareHandler) UpdateSharePermission(c *gin.Context) {
 	repoID := c.Param("repo_id")
 	path := c.Query("p")
 	shareType := c.Query("share_type")
 	username := c.Query("username")
 	groupID := c.Query("group_id")
-	permission := c.PostForm("permission")
+
+	var body struct {
+		Permission string `json:"permission"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		return
+	}
+	permission := body.Permission
 
 	if repoID == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "repo_id is required"})

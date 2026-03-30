@@ -9,6 +9,7 @@ import {
   listGroups,
   createGroup,
   renameFile,
+  renameDir,
   deleteFile,
   starFile,
   createShareLink,
@@ -177,10 +178,25 @@ describe('API methods with auth headers', () => {
     await renameFile('repo-id', '/old.txt', 'new.txt');
 
     expect(fetchMock).toHaveBeenCalledWith(
-      expect.stringContaining('/api2/repos/repo-id/file/'),
+      'http://localhost:8080/api2/repos/repo-id/file/?p=%2Fold.txt&operation=rename',
       expect.objectContaining({
         method: 'POST',
-        body: expect.any(URLSearchParams),
+        body: JSON.stringify({ newname: 'new.txt' }),
+      }),
+    );
+  });
+
+  it('renameDir sends rename operation', async () => {
+    const fetchMock = mockFetchOk();
+    vi.stubGlobal('fetch', fetchMock);
+
+    await renameDir('repo-id', '/old-dir', 'new-dir');
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      'http://localhost:8080/api2/repos/repo-id/dir/?p=%2Fold-dir&operation=rename',
+      expect.objectContaining({
+        method: 'POST',
+        body: JSON.stringify({ newname: 'new-dir' }),
       }),
     );
   });

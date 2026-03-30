@@ -300,15 +300,7 @@ class User extends Component {
 
   updateUser = (keyOrData, value) => {
     const email = this.state.userInfo.email;
-    let payload = keyOrData;
-    if (typeof keyOrData !== 'string') {
-      const formData = new FormData();
-      Object.keys(keyOrData).forEach((key) => {
-        formData.append(key, keyOrData[key]);
-      });
-      payload = formData;
-    }
-    return seafileAPI.sysAdminUpdateUser(email, payload, value).then(res => {
+    return seafileAPI.sysAdminUpdateUser(email, keyOrData, value).then(res => {
       const requestedUpdates = typeof keyOrData === 'string' ? { [keyOrData]: value } : keyOrData;
       this.setState((prevState) => ({
         userInfo: Object.assign({}, prevState.userInfo, requestedUpdates, res.data)

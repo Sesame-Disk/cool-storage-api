@@ -310,8 +310,7 @@ func TestCreateDepartmentRequest_JSON(t *testing.T) {
 }
 
 // TestGetDepartment_ValidUUID_NilDB tests that UUID validation passes for a valid
-// UUID, but the handler panics when accessing nil DB. The gin Recovery middleware
-// catches the panic and returns 500, proving that validation passed (not 400).
+// UUID and the handler returns a controlled 500 when the DB is unavailable.
 func TestGetDepartment_ValidUUID_NilDB(t *testing.T) {
 	r, h := setupDepartmentRouter()
 	r.GET("/api/v2.1/admin/address-book/groups/:group_id/", h.GetDepartment)
@@ -320,9 +319,9 @@ func TestGetDepartment_ValidUUID_NilDB(t *testing.T) {
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
-	// Valid UUID passes validation; nil DB causes panic caught by Recovery → 500
+	// Valid UUID passes validation; nil DB returns explicit 500
 	if w.Code != http.StatusInternalServerError {
-		t.Errorf("status = %d, want %d (valid UUID should pass validation, nil DB causes panic)", w.Code, http.StatusInternalServerError)
+		t.Errorf("status = %d, want %d (valid UUID should pass validation, nil DB returns explicit 500)", w.Code, http.StatusInternalServerError)
 	}
 }
 
@@ -351,8 +350,7 @@ func TestUpdateDepartment_ValidUUID_EmptyName(t *testing.T) {
 }
 
 // TestDeleteDepartment_ValidUUID_NilDB tests that UUID validation passes for a valid
-// UUID in delete. The handler calls getSubDepartments which uses nil DB, causing a panic.
-// Recovery middleware catches it and returns 500, proving UUID validation passed (not 400).
+// UUID in delete and the handler returns a controlled 500 when the DB is unavailable.
 func TestDeleteDepartment_ValidUUID_NilDB(t *testing.T) {
 	r, h := setupDepartmentRouter()
 	r.DELETE("/api/v2.1/admin/address-book/groups/:group_id/", h.DeleteDepartment)
@@ -361,9 +359,9 @@ func TestDeleteDepartment_ValidUUID_NilDB(t *testing.T) {
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
-	// Valid UUID passes validation; nil DB causes panic in getSubDepartments → 500
+	// Valid UUID passes validation; nil DB returns explicit 500
 	if w.Code != http.StatusInternalServerError {
-		t.Errorf("status = %d, want %d (valid UUID should pass validation, nil DB causes panic)", w.Code, http.StatusInternalServerError)
+		t.Errorf("status = %d, want %d (valid UUID should pass validation, nil DB returns explicit 500)", w.Code, http.StatusInternalServerError)
 	}
 }
 
