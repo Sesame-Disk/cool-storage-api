@@ -5,7 +5,7 @@ import { Utils } from '../../utils/utils';
 import { seafileAPI } from '../../utils/seafile-api';
 import { siteRoot, isPro, gettext, appAvatarURL, enableSSOToThirdpartWebsite } from '../../utils/constants';
 import toaster from '../toast';
-import RenderRole from '../../services/footer-upgrade';
+import UpgradeEntry from './upgrade-entry';
 
 const isOrgContext = window.app?.pageOptions?.isOrgContext ?? true;
 
@@ -158,9 +158,9 @@ class Account extends Component {
   render() {
     return (
       <div id="account">
-        <a id="my-info" href="#" onClick={this.onClickAccount} className="account-toggle no-deco d-none d-md-block" aria-label={gettext('View profile and more')}>
+        <button type="button" id="my-info" onClick={this.onClickAccount} className="account-toggle no-deco d-none d-md-block border-0 bg-transparent p-0" aria-label={gettext('View profile and more')}>
           {this.renderAvatar()}
-        </a>
+        </button>
         <span className="account-toggle sf2-icon-more mobile-icon d-md-none" aria-label={gettext('View profile and more')} onClick={this.onClickAccount}></span>
         <div id="user-info-popup" className={`account-popup sf-popover ${this.state.showInfo ? '' : 'hide'}`}>
           <div className="outer-caret up-outer-caret">
@@ -183,7 +183,7 @@ class Account extends Component {
                 </div>
               }
             </div>
-            <RenderRole isOrgStaff={this.state.isOrgStaff} />
+            <UpgradeEntry isOrgStaff={this.state.isOrgStaff} />
             <a href={siteRoot + 'profile/'} className="item">{gettext('Settings')}</a>
             {(this.state.enableSubscription && !isOrgContext) && <a href={siteRoot + 'subscription/'} className="item">{gettext('Subscription')}</a>}
             {this.renderMenu()}

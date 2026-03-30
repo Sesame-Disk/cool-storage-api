@@ -182,8 +182,35 @@ export const enableShareLinkReportAbuse = sysAdminPageOptions.enable_share_link_
 // institution admin
 export const institutionName = appPageOptions.institutionName || '';
 
-export const isFreeUser = appPageOptions.userRole === 'personalfree' || appPageOptions.userRole === 'restricted';
-export const shareLinkExpireDaysMax = isFreeUser ? 3 : appPageOptions.shareLinkExpireDaysMax;
-export const shareLinkExpireDaysDefault = isFreeUser ? 3 : appPageOptions.shareLinkExpireDaysDefault;
-export const uploadLinkExpireDaysMax = isFreeUser ? 3 : appPageOptions.uploadLinkExpireDaysMax;
-export const uploadLinkExpireDaysDefault = isFreeUser ? 3 : appPageOptions.uploadLinkExpireDaysDefault;
+// canUpgrade: true when the org is on the free tier (any owner) or when a paid
+// owner is approaching/exceeding quota. Set dynamically by app.js after the
+// account/info response arrives. Defaults to false so components stay hidden
+// until we know the real state.
+// NOTE: This is a mutable reference — components that render at startup should
+// read window.app.pageOptions.canUpgrade directly if they need the live value
+// after the async load completes.
+export const canUpgrade = appPageOptions.canUpgrade === true;
+
+// isOrgOwner: true when the current user holds the owner role in the org.
+export const isOrgOwner = appPageOptions.isOrgOwner === true;
+
+// upgradeFeatures: list of short feature names blocked by the enforcement
+// profile (e.g. ["add_group", "invite_guest"]). Empty for paid orgs.
+// NOTE: populated asynchronously; use window.app.pageOptions.upgradeFeatures
+// for live reads inside event handlers.
+export const upgradeFeatures = Array.isArray(appPageOptions.upgradeFeatures) ? appPageOptions.upgradeFeatures : [];
+
+// isFreeUser: backward-compat alias. True when canUpgrade and the user is the
+// org owner, matching the old "free user sees upgrade CTA" semantic.
+// New code should prefer canUpgrade + isOrgOwner directly.
+// @deprecated — use canUpgrade / upgradeFeatures instead.
+export const isFreeUser = canUpgrade && isOrgOwner;
+
+// Share/upload link expiry caps from enforcement profile.
+// Backend caps the value server-side; the frontend uses these to constrain
+// the date picker so the user sees the right range before submitting.
+// 0 means no cap (unlimited / paid plan with no restriction).
+export const shareLinkExpireDaysMax = appPageOptions.shareLinkExpireDaysMax || 0;
+export const shareLinkExpireDaysDefault = appPageOptions.shareLinkExpireDaysDefault || 0;
+export const uploadLinkExpireDaysMax = appPageOptions.uploadLinkExpireDaysMax || 0;
+export const uploadLinkExpireDaysDefault = appPageOptions.uploadLinkExpireDaysDefault || 0;

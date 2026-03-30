@@ -12,7 +12,8 @@ import InviteUserViaWeiXinDialog from '../../components/dialog/org-admin-invite-
 import toaster from '../../components/toast';
 import { seafileAPI } from '../../utils/seafile-api';
 import OrgUserInfo from '../../models/org-user';
-import { gettext, invitationLink, orgID, siteRoot, orgEnableAdminInviteUser, isFreeUser, hasUserAvailability, orgMembers, orgMembersQuota } from '../../utils/constants';
+import { gettext, invitationLink, orgID, siteRoot, orgEnableAdminInviteUser, hasUserAvailability, orgMembers, orgMembersQuota } from '../../utils/constants';
+import { getUpgradeState } from '../../utils/upgrade-state';
 import { Utils } from '../../utils/utils';
 
 class Search extends React.Component {
@@ -294,24 +295,27 @@ class OrgUsers extends Component {
 
   render() {
     const topBtn = 'btn btn-secondary operation-item';
-    const canAddUsers = !isFreeUser && hasUserAvailability;
+    const { isFeatureLockedOwner } = getUpgradeState();
+    const canAddUsers = !isFeatureLockedOwner && hasUserAvailability;
 
     let topbarChildren;
     topbarChildren = (
       <Fragment>
         {/* <button className="btn btn-secondary operation-item" onClick={this.toggleImportOrgUsersDialog}>{gettext('Import users')}</button> */}
 
-        {isFreeUser ? (
+        {isFeatureLockedOwner ? (
           <div className="d-flex align-items-center">
-            <span className="mr-3" style={{ color: '#666' }}>Upgrade your plan to add more users</span>
-            <a href="/billing/" className="btn btn-primary">Upgrade Plan</a>
+            <span className="mr-3" style={{ color: '#666' }}>{gettext('Upgrade your plan to unlock additional seats and member management.')}</span>
+            <a href="/billing/" className="btn btn-primary">{gettext('Upgrade Plan')}</a>
           </div>
         ) : !hasUserAvailability ? (
           <div className="d-flex align-items-center">
             <span className="mr-3" style={{ color: '#666' }}>
-              You have reached your user limit ({orgMembers}/{orgMembersQuota}). Add more users to your plan
+              {gettext('You have reached your member limit (%(used)s/%(total)s). Update billing to add more users.')
+                .replace('%(used)s', orgMembers)
+                .replace('%(total)s', orgMembersQuota)}
             </span>
-            <a href="/billing/" className="btn btn-outline-primary">Manage Billing</a>
+            <a href="/billing/" className="btn btn-outline-primary">{gettext('Manage Billing')}</a>
           </div>
         ) : (
           <Fragment>

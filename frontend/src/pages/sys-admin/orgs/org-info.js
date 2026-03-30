@@ -239,7 +239,7 @@ class OrgInfo extends Component {
   };
 
   updateMaxUserNumber = (newValue) => {
-    const data = { max_users: newValue };
+    const data = { max_users: parseInt(newValue, 10) };
     seafileAPI.sysAdminUpdateOrg(this.props.orgID, data).then(() => {
       this.setState((prevState) => ({
         orgInfo: Object.assign({}, prevState.orgInfo, {

@@ -1,14 +1,14 @@
 /* eslint-disable */
 import React, { useState, useEffect } from 'react';
 import { seafileAPI } from '../utils/seafile-api';
+import { gettext } from '../utils/constants';
 import { Utils } from '../utils/utils';
 import toaster from '../components/toast';
 import PropTypes from 'prop-types';
+import { featureRequiresUpgrade, getHardPlanLimits, getUpgradeState, hasUpgradeFeatures } from '../utils/upgrade-state';
 import './ad.css';
-import { isFreeUser } from '../utils/constants';
 
-const MAX_FREE_SHARELINKS = 3
-const MAX_FREE_UPLOADLINKS = 1
+const HARD_PLAN_LIMITS = getHardPlanLimits();
 
 function Ad(props) {
     const [error, setError] = useState(null);
@@ -61,9 +61,9 @@ function Ad(props) {
 }
 
 export default function InsertAd(props) {
-    const { userRole } = window.app.pageOptions;
-
-    const showAds = userRole === 'personalfree' || userRole === 'restricted' || props.category === 'Flat_message';
+    // Show ads for orgs that have locked features (free/restricted plan) or
+    // for special flat-message category regardless of plan.
+    const showAds = hasUpgradeFeatures() || props.category === 'Flat_message';
 
     if (showAds) {
         return <Ad zone={props.zone} size={props.size} category={props.category} center={props.center} />;
@@ -85,13 +85,15 @@ InsertAd.defaultProps = {
 }
 
 export function InternalAd() {
-    if (!isFreeUser) {
+    if (!hasUpgradeFeatures()) {
         return null
     }
 
     const [totalLinks, setTotalLinks] = useState(null);
     const [dismissed, setDismissed] = useState(false);
     const upgradeLink = "/billing/"
+    const upgradeState = getUpgradeState();
+    const shareLinkExpireDaysMax = upgradeState.shareLinkExpireDaysMax || HARD_PLAN_LIMITS.shareLinkExpireDaysMax;
 
     useEffect(() => {
         seafileAPI.listShareLinks({ page: 1 }).then((res) => {
@@ -105,7 +107,7 @@ export function InternalAd() {
         return null;
     }
 
-    const linksUsed = totalLinks !== null ? `${totalLinks}/${MAX_FREE_SHARELINKS}` : `${MAX_FREE_SHARELINKS}`;
+    const linksUsed = totalLinks !== null ? `${totalLinks}/${HARD_PLAN_LIMITS.maxShareLinks}` : `${HARD_PLAN_LIMITS.maxShareLinks}`;
 
     return (
         <div className='internal-ad internal-ad-compact'>
@@ -118,25 +120,33 @@ export function InternalAd() {
             </button>
             <p className='internal-ad-header'>
                 <i className="fa fa-info-circle" />
-                <strong>Free Plan</strong>
+                <strong>{gettext('Plan limits')}</strong>
                 {totalLinks !== null && ` • ${linksUsed} links used`}
             </p>
             <p className='internal-ad-text'>
-                Shared links for free accounts are valid for 3 days. Please upgrade to get unlimited sharing/upload links and no expiration date!
+                {gettext('This plan currently limits sharing to %(shareCount)s share links, %(uploadCount)s upload link, and %(expireDays)s-day expiration. Upgrade to remove these limits.')
+                    .replace('%(shareCount)s', HARD_PLAN_LIMITS.maxShareLinks)
+                    .replace('%(uploadCount)s', HARD_PLAN_LIMITS.maxUploadLinks)
+                    .replace('%(expireDays)s', shareLinkExpireDaysMax)}
             </p>
             <p>
-                <a href={upgradeLink} className='btn btn-sm btn-outline-primary'>View Plans & Pricing</a>
+                <a href={upgradeLink} className='btn btn-sm btn-outline-primary'>{gettext('View Plans & Pricing')}</a>
             </p>
         </div>
     )
 }
 
-export const EvalProFunc = (fn, { manOrg = false, shareLinks = false } = {}) => {
-    if (!isFreeUser) return fn
+/**
+ * EvalProFunc — wraps `fn` so it shows an upgrade toast when the org has
+ * locked features. Pass `featureKey` (e.g. "add_group") to show a targeted
+ * message; omit it for a generic upgrade prompt.
+ */
+export const EvalProFunc = (fn, { manOrg = false, shareLinks = false, featureKey = null } = {}) => {
+    if (featureKey ? !featureRequiresUpgrade(featureKey) : !hasUpgradeFeatures()) return fn
 
     const upgradeLink = "/billing/"
     return () => {
-        toaster.warning("Please upgrade your account to use this feature!", {
+        toaster.warning(gettext('Upgrade your plan to use this feature.'), {
             duration: 10,
             description: (
                 <div className='mt-3 toast-upgrade-info'>
@@ -144,38 +154,42 @@ export const EvalProFunc = (fn, { manOrg = false, shareLinks = false } = {}) => 
                         <>
                             <ul className='features-list'>
                                 <li>
-                                    ✓ Add and manage users in your organization
+                                    {gettext('Add and manage users in your organization')}
                                 </li>
                                 <li>
-                                    ✓ Secure file/library sharing with granular permissions
+                                    {gettext('Secure file and library sharing with granular permissions')}
                                 </li>
                                 <li>
-                                    ✓ Create teams and groups for collaboration
+                                    {gettext('Create teams and groups for collaboration')}
                                 </li>
                                 <li>
-                                    ✓ Audit logs, activity tracking & priority support
+                                    {gettext('Access audit logs, activity tracking, and priority support')}
                                 </li>
                             </ul>
                             <div className='upgrade-limits-info'>
-                                <p><strong>Your Free Plan Includes:</strong></p>
+                                <p><strong>{gettext('Current plan limits:')}</strong></p>
                                 <p className='limits-comparison'>
-                                    <span className='limit-free'>📦 Storage: 2 GB</span>
-                                    <span className='limit-free'>🌐 Monthly Traffic: 10 GB</span>
-                                    <span className='limit-pro'>💎 Pro Plans: Up to 1000s of GB + on-demand scaling</span>
+                                    <span className='limit-free'>{gettext('Storage and traffic quotas are enforced by your current plan.')}</span>
+                                    <span className='limit-pro'>{gettext('Upgrade for larger quotas and broader collaboration features.')}</span>
                                 </p>
                             </div>
                         </>
                     )}
                     {shareLinks && (
                         <div className='upgrade-limits-info'>
-                            <p><strong>Free Plan Limit Reached</strong></p>
+                            <p><strong>{gettext('Sharing limits reached')}</strong></p>
                             <p className='limits-comparison'>
-                                <span className='limit-free'>Free: 3 share links, 3 upload link, 3-day expiration</span>
-                                <span className='limit-pro'>Pro: Unlimited links, no expiration</span>
+                                <span className='limit-free'>
+                                    {gettext('Current plan: %(shareCount)s share links, %(uploadCount)s upload link, %(expireDays)s-day expiration')
+                                        .replace('%(shareCount)s', HARD_PLAN_LIMITS.maxShareLinks)
+                                        .replace('%(uploadCount)s', HARD_PLAN_LIMITS.maxUploadLinks)
+                                        .replace('%(expireDays)s', HARD_PLAN_LIMITS.shareLinkExpireDaysMax)}
+                                </span>
+                                <span className='limit-pro'>{gettext('Upgrade for more sharing capacity and longer-lived links.')}</span>
                             </p>
                         </div>
                     )}
-                    <a href={upgradeLink} className='btn btn-sm btn-outline-primary'>View Plans & Pricing</a>
+                    <a href={upgradeLink} className='btn btn-sm btn-outline-primary'>{gettext('View Plans & Pricing')}</a>
                 </div>
             ),
         })
@@ -185,7 +199,7 @@ export const EvalProFunc = (fn, { manOrg = false, shareLinks = false } = {}) => 
 let isCheckingQuota = false;
 
 export const EvalQuotaShareLinks = (fn) => {
-    if (!isFreeUser) return fn
+    if (!hasUpgradeFeatures()) return fn
 
     return () => {
         if (isCheckingQuota) return;
@@ -193,7 +207,7 @@ export const EvalQuotaShareLinks = (fn) => {
         isCheckingQuota = true;
 
         seafileAPI.listShareLinks({ page: 1 }).then((res) => {
-            if (res.data.length >= MAX_FREE_SHARELINKS) {
+            if (res.data.length >= HARD_PLAN_LIMITS.maxShareLinks) {
                 const newFn = EvalProFunc(fn, { shareLinks: true })
                 if (newFn) {
                     newFn()
@@ -211,7 +225,7 @@ export const EvalQuotaShareLinks = (fn) => {
 }
 
 export const EvalQuotaUploadLinks = (fn) => {
-    if (!isFreeUser) return fn
+    if (!hasUpgradeFeatures()) return fn
 
     return () => {
         if (isCheckingQuota) return;
@@ -219,7 +233,7 @@ export const EvalQuotaUploadLinks = (fn) => {
         isCheckingQuota = true;
 
         seafileAPI.listUserUploadLinks().then((res) => {
-            if (res.data.length >= MAX_FREE_UPLOADLINKS) {
+            if (res.data.length >= HARD_PLAN_LIMITS.maxUploadLinks) {
                 const newFn = EvalProFunc(fn, { shareLinks: true })
                 if (newFn) {
                     newFn()

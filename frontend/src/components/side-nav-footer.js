@@ -2,7 +2,7 @@ import React, { Fragment } from 'react';
 import { gettext, siteRoot, enableTC, sideNavFooterCustomHtml, additionalAppBottomLinks } from '../utils/constants';
 import ModalPortal from './modal-portal';
 import AboutDialog from './dialog/about-dialog';
-import RenderRole from '../services/footer-upgrade';
+import UpgradeEntry from './common/upgrade-entry';
 
 class SideNavFooter extends React.Component {
 
@@ -37,8 +37,8 @@ class SideNavFooter extends React.Component {
       <Fragment>
         <div className="side-nav-footer flex-wrap">
           <a href={siteRoot + 'help/'} target="_blank" rel="noopener noreferrer" className="item">{gettext('Help')}</a>
-          <a href="#" className="item" onClick={this.onAboutDialogToggle}>{gettext('About')}</a>
-          <RenderRole inSidebar={true} />
+          <button type="button" className="item btn btn-link p-0 border-0 align-baseline" onClick={this.onAboutDialogToggle}>{gettext('About')}</button>
+          <UpgradeEntry inSidebar={true} />
           {enableTC && <a href={`${siteRoot}terms/`} className="item">{gettext('Terms')}</a>}
           {this.renderExternalAppLinks()}
           <a href={siteRoot + 'download_client_program/'} target="_blank" className={`item ${additionalAppBottomLinks ? '' : 'last-item'}`} rel="noreferrer">

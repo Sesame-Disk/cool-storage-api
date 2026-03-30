@@ -9,6 +9,7 @@ import { isAuthenticated, seafileAPI, getToken } from './utils/seafile-api';
 import LoginPage from './pages/login';
 import SSOPage from './pages/sso';
 import SystemNotification from './components/system-notification';
+import QuotaBanner from './components/quota-banner';
 import SidePanel from './components/side-panel';
 import MainPanel from './components/main-panel';
 import FilesActivities from './pages/dashboard/files-activities';
@@ -153,15 +154,14 @@ class App extends Component {
     seafileAPI.getAccountInfo().then(resp => {
       const data = resp.data;
 
-      // Update global page options with user info and permissions
+      // Identity
       window.app.pageOptions.name = data.name || '';
       window.app.pageOptions.username = data.email || '';
       window.app.pageOptions.contactEmail = data.contact_email || data.email || '';
       window.app.pageOptions.userRole = data.role || 'user';
 
-      // Update permissions based on API response
-      // If backend returns explicit permission flags, use them
-      // Otherwise, derive from role
+      // Capability flags — backend resolves role AND enforcement profile.
+      // Fall back to role-derived defaults only for old backends without these fields.
       const role = data.role || 'user';
       const canWrite = role === 'admin' || role === 'user';
 
@@ -170,6 +170,32 @@ class App extends Component {
       window.app.pageOptions.canAddGroup = data.can_add_group !== undefined ? data.can_add_group : canWrite;
       window.app.pageOptions.canGenerateShareLink = data.can_generate_share_link !== undefined ? data.can_generate_share_link : canWrite;
       window.app.pageOptions.canGenerateUploadLink = data.can_generate_upload_link !== undefined ? data.can_generate_upload_link : canWrite;
+      window.app.pageOptions.canSendShareLinkMail = data.can_send_share_link_mail !== undefined ? data.can_send_share_link_mail : canWrite;
+      window.app.pageOptions.canInviteGuest = data.can_invite_guest !== undefined ? data.can_invite_guest : false;
+      window.app.pageOptions.canPublishRepo = data.can_publish_repo !== undefined ? data.can_publish_repo : false;
+
+      // Plan & upgrade CTA
+      window.app.pageOptions.plan = data.plan || '';
+      window.app.pageOptions.isOrgOwner = data.is_org_owner === true;
+      window.app.pageOptions.canUpgrade = data.can_upgrade === true;
+      window.app.pageOptions.billingCycle = data.billing_cycle || '';
+      window.app.pageOptions.currentPeriodStartedAt = data.current_period_started_at || null;
+      window.app.pageOptions.currentPeriodEndsAt = data.current_period_ends_at || null;
+      // upgradeFeatures: list of short feature names the user can unlock by upgrading
+      // (e.g. ["add_group", "invite_guest"]) — empty for paid orgs.
+      window.app.pageOptions.upgradeFeatures = Array.isArray(data.upgrade_features) ? data.upgrade_features : [];
+
+      // Enforcement limits for share/upload link creation UI
+      window.app.pageOptions.shareLinkExpireDaysMax = data.share_link_expire_days_max || 0;
+      window.app.pageOptions.uploadLinkExpireDaysMax = data.upload_link_expire_days_max || 0;
+
+      // Org-level storage quota object  { used, quota, percent, over_quota }
+      window.app.pageOptions.storageInfo = data.storage || null;
+
+      // Org-level traffic quota object  { used, quota, percent, over_quota, upload_used,
+      //   upload_quota, upload_over_quota, download_used, download_quota,
+      //   download_over_quota, reset_date }
+      window.app.pageOptions.trafficInfo = data.traffic || null;
 
       // Force a re-render to pick up new permissions
       this.forceUpdate();
@@ -318,6 +344,7 @@ class App extends Component {
     return (
       <React.Fragment>
         <SystemNotification />
+        <QuotaBanner />
         <div id="main">
           <SidePanel isSidePanelClosed={this.state.isSidePanelClosed} onCloseSidePanel={this.onCloseSidePanel} currentTab={currentTab} tabItemClick={this.tabItemClick} />
           <MainPanel>

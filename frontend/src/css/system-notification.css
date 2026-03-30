@@ -13,3 +13,22 @@
   color: #a68558;
   text-decoration: underline;
 }
+
+.quota-banner {
+  padding: 4px 10px;
+  color: #1f0600;
+}
+.quota-banner-error {
+  background: #fddaa4;
+  border-bottom: 1px solid #f5c26b;
+}
+.quota-banner a {
+  color: #a65800;
+  text-decoration: underline;
+}
+.quota-banner .close {
+  font-size: 16px;
+  line-height: 1;
+  color: #888;
+  cursor: pointer;
+}
