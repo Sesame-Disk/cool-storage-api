@@ -15,43 +15,10 @@ import (
 
 // listDepartmentGroups returns groups where is_department=true for the given org.
 func (h *OrgAdminHandler) listDepartmentGroups(orgID string) []gin.H {
-	iter := h.db.Session().Query(`
-		SELECT group_id, name, parent_group_id, created_at
-		FROM groups WHERE org_id = ?
-	`, orgID).Iter()
-
-	var results []gin.H
-	var groupID, name string
-	var parentGroupID string
-	var createdAt time.Time
-	var isDept bool
-
-	// We need is_department — re-query with it
-	iter.Close()
-	iter = h.db.Session().Query(`
-		SELECT group_id, name, parent_group_id, is_department, created_at
-		FROM groups WHERE org_id = ?
-	`, orgID).Iter()
-
-	for iter.Scan(&groupID, &name, &parentGroupID, &isDept, &createdAt) {
-		if !isDept {
-			continue
-		}
-		quota := h.getOrgSettingInt(orgID, "group_quota_"+groupID, -2)
-		results = append(results, gin.H{
-			"id":              groupID,
-			"name":            name,
-			"parent_group_id": parentGroupID,
-			"created_at":      createdAt.Format(time.RFC3339),
-			"quota":           quota,
-		})
-	}
-	iter.Close()
-
-	if results == nil {
-		results = []gin.H{}
-	}
-	return results
+	records := listDepartmentGroupRecords(h.db.Session(), orgID)
+	return departmentGroupListData(records, func(groupID string) int64 {
+		return int64(h.getOrgSettingInt(orgID, "group_quota_"+groupID, -2))
+	})
 }
 
 // ListOrgDepartments lists department groups in the org.

@@ -400,41 +400,21 @@ func (h *DepartmentHandler) DeleteDepartment(c *gin.Context) {
 
 // listDepartmentsForOrg returns all departments in an org
 func (h *DepartmentHandler) listDepartmentsForOrg(orgID string) []DepartmentResponse {
-	iter := h.db.Session().Query(`
-		SELECT group_id, name, parent_group_id, created_at FROM groups WHERE org_id = ?
-	`, orgID).Iter()
+	records := listDepartmentGroupRecords(h.db.Session(), orgID)
+	departments := make([]DepartmentResponse, 0, len(records))
 
-	var departments []DepartmentResponse
-	var groupID, name string
-	var parentGroupID *string
-	var createdAt time.Time
-
-	for iter.Scan(&groupID, &name, &parentGroupID, &createdAt) {
-		// Only include departments (is_department=true check)
-		var isDept bool
-		h.db.Session().Query(`SELECT is_department FROM groups WHERE org_id = ? AND group_id = ?`,
-			orgID, groupID).Scan(&isDept)
-		if !isDept {
-			continue
-		}
-
+	for _, record := range records {
 		var memberCount int
-		h.db.Session().Query(`SELECT COUNT(*) FROM group_members WHERE group_id = ?`, groupID).Scan(&memberCount)
-
-		parentStr := ""
-		if parentGroupID != nil {
-			parentStr = *parentGroupID
-		}
+		h.db.Session().Query(`SELECT COUNT(*) FROM group_members WHERE group_id = ?`, record.ID).Scan(&memberCount)
 
 		departments = append(departments, DepartmentResponse{
-			ID:            groupID,
-			Name:          name,
-			CreatedAt:     createdAt.Format(time.RFC3339),
-			ParentGroupID: parentStr,
+			ID:            record.ID,
+			Name:          record.Name,
+			CreatedAt:     record.CreatedAt.Format(time.RFC3339),
+			ParentGroupID: record.ParentGroupID,
 			MemberCount:   memberCount,
 		})
 	}
-	iter.Close()
 
 	if departments == nil {
 		departments = []DepartmentResponse{}
@@ -444,41 +424,28 @@ func (h *DepartmentHandler) listDepartmentsForOrg(orgID string) []DepartmentResp
 
 // getSubDepartments returns direct child departments of a given group
 func (h *DepartmentHandler) getSubDepartments(orgID, parentID string) []DepartmentResponse {
-	iter := h.db.Session().Query(`
-		SELECT group_id, name, parent_group_id, created_at FROM groups WHERE org_id = ?
-	`, orgID).Iter()
+	records := listDepartmentGroupRecords(h.db.Session(), orgID)
+	children := make([]DepartmentResponse, 0)
 
-	var children []DepartmentResponse
-	var groupID, name string
-	var pgID *string
-	var createdAt time.Time
-
-	for iter.Scan(&groupID, &name, &pgID, &createdAt) {
-		if pgID != nil && *pgID == parentID && name != "" {
-			// Verify it's still a department (not deleted/tombstone)
-			var isDept bool
-			var checkName string
-			if err := h.db.Session().Query(`SELECT name, is_department FROM groups WHERE org_id = ? AND group_id = ?`,
-				orgID, groupID).Scan(&checkName, &isDept); err != nil || !isDept {
-				slog.Debug("getSubDepartments: skipping group (not found or not department)",
-					"group_id", groupID, "name", name, "err", err, "is_dept", isDept)
-				continue
-			}
-			slog.Debug("getSubDepartments: found child",
-				"group_id", groupID, "name", checkName, "is_dept", isDept)
-			var memberCount int
-			h.db.Session().Query(`SELECT COUNT(*) FROM group_members WHERE group_id = ?`, groupID).Scan(&memberCount)
-
-			children = append(children, DepartmentResponse{
-				ID:            groupID,
-				Name:          name,
-				CreatedAt:     createdAt.Format(time.RFC3339),
-				ParentGroupID: parentID,
-				MemberCount:   memberCount,
-			})
+	for _, record := range records {
+		if record.ParentGroupID != parentID || record.Name == "" {
+			continue
 		}
+
+		slog.Debug("getSubDepartments: found child",
+			"group_id", record.ID, "name", record.Name, "is_dept", true)
+
+		var memberCount int
+		h.db.Session().Query(`SELECT COUNT(*) FROM group_members WHERE group_id = ?`, record.ID).Scan(&memberCount)
+
+		children = append(children, DepartmentResponse{
+			ID:            record.ID,
+			Name:          record.Name,
+			CreatedAt:     record.CreatedAt.Format(time.RFC3339),
+			ParentGroupID: parentID,
+			MemberCount:   memberCount,
+		})
 	}
-	iter.Close()
 
 	if children == nil {
 		children = []DepartmentResponse{}
