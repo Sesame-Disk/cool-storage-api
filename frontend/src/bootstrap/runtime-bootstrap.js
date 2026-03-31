@@ -239,7 +239,7 @@ export function AdminAccessDenied({ message, title }) {
 
 export function getAdminDeniedProps(data, scope) {
     if (data?.bootstrapError) {
-        return null;
+        return getBootstrapErrorProps(data);
     }
 
     const permissions = data?.permissions;

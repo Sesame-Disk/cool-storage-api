@@ -14,6 +14,36 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+type bootstrapIdentity struct {
+	UserID string
+	OrgID  string
+	Role   string
+	Email  string
+}
+
+type bootstrapUserData struct {
+	Email string
+	Name  string
+	Role  string
+}
+
+type bootstrapOrgData struct {
+	Loaded                 bool
+	Name                   string
+	Settings               map[string]string
+	MaxUsers               int
+	CurrentUsers           int
+	Plan                   string
+	BillingCycle           string
+	QuotaPolicy            string
+	StorageQuota           int64
+	TrafficQuota           int64
+	TrafficUploadQuota     int64
+	TrafficDownloadQuota   int64
+	CurrentPeriodStartedAt *time.Time
+	CurrentPeriodEndsAt    *time.Time
+}
+
 // handleBootstrap returns app bootstrap data for the SPA.
 //
 // This endpoint is public (no auth required). It returns the authenticated
@@ -23,39 +53,182 @@ import (
 //
 // GET /api/v2.1/bootstrap/
 func (s *Server) handleBootstrap(c *gin.Context) {
-	userID, orgID, role := s.resolveUserAuth(c)
-	email := s.resolveUserEmail(c)
-	resolvedOrgID, resolvedOrgName := s.resolveOrgForPanel(c)
-	if orgID == "" {
-		orgID = resolvedOrgID
+	identity := s.resolveBootstrapIdentity(c)
+	userData := s.loadBootstrapUserData(identity)
+	if identity.Email == "" {
+		identity.Email = userData.Email
 	}
-	orgName := resolvedOrgName
-	appPageOptions := s.buildAppBootstrapPageOptions(userID, orgID, role, email)
-	orgPageOptions := s.buildOrgBootstrapPageOptions(orgID, orgName)
-	canAccessOrgAdmin := middleware.IsOrgStaff(role)
-	canAccessSysAdmin := middleware.IsPlatformSuperAdmin(orgID, middleware.OrganizationRole(role))
+	if identity.Role == "" {
+		identity.Role = userData.Role
+	}
+	orgData := s.loadBootstrapOrgData(identity.OrgID)
+	appPageOptions := s.buildAppBootstrapPageOptions(identity, userData, orgData)
+	orgPageOptions := s.buildOrgBootstrapPageOptions(identity.OrgID, orgData)
+	canAccessOrgAdmin := middleware.IsOrgStaff(identity.Role)
+	canAccessSysAdmin := middleware.IsPlatformSuperAdmin(identity.OrgID, middleware.OrganizationRole(identity.Role))
 
 	c.JSON(http.StatusOK, gin.H{
-		"username":              email,
-		"org_id":                orgID,
-		"org_name":              orgName,
+		"username":              identity.Email,
+		"org_id":                identity.OrgID,
+		"org_name":              orgData.Name,
 		"app_page_options":      appPageOptions,
-		"page_options":          orgPageOptions,
 		"org_page_options":      orgPageOptions,
 		"sysadmin_page_options": s.buildSysAdminBootstrapPageOptions(canAccessSysAdmin),
 		"permissions": gin.H{
-			"isAuthenticated":   userID != "" && orgID != "",
+			"isAuthenticated":   identity.UserID != "" && identity.OrgID != "",
 			"canAccessOrgAdmin": canAccessOrgAdmin,
 			"canAccessSysAdmin": canAccessSysAdmin,
 		},
 	})
 }
 
-func (s *Server) buildAppBootstrapPageOptions(userID, orgID, role, fallbackEmail string) gin.H {
+func (s *Server) resolveBootstrapIdentity(c *gin.Context) bootstrapIdentity {
+	token := extractRequestAuthToken(c)
+
+	if matchedToken, ok := s.matchDevToken(token); ok {
+		return bootstrapIdentity{
+			UserID: matchedToken.UserID,
+			OrgID:  matchedToken.OrgID,
+			Role:   matchedToken.Role,
+			Email:  matchedToken.Email,
+		}
+	}
+
+	if token != "" && s.authHandler != nil {
+		if mgr := s.authHandler.GetSessionManager(); mgr != nil {
+			if session, err := mgr.ValidateSession(token); err == nil {
+				return bootstrapIdentity{
+					UserID: session.UserID,
+					OrgID:  session.OrgID,
+					Role:   session.Role,
+					Email:  session.Email,
+				}
+			}
+		}
+	}
+
+	return bootstrapIdentity{Email: extractEmailFromAuthCookie(c)}
+}
+
+func (s *Server) loadBootstrapUserData(identity bootstrapIdentity) bootstrapUserData {
+	data := bootstrapUserData{
+		Email: identity.Email,
+		Role:  identity.Role,
+	}
+
+	if identity.UserID == "" || identity.OrgID == "" || s.db == nil {
+		if data.Email == "" && identity.UserID != "" {
+			data.Email = identity.UserID + "@sesamefs.local"
+		}
+		if data.Name == "" && data.Email != "" {
+			if atIdx := strings.Index(data.Email, "@"); atIdx > 0 {
+				data.Name = data.Email[:atIdx]
+			} else {
+				data.Name = data.Email
+			}
+		}
+		return data
+	}
+
+	orgUUID, err := gocql.ParseUUID(identity.OrgID)
+	if err != nil {
+		return data
+	}
+	userUUID, err := gocql.ParseUUID(identity.UserID)
+	if err != nil {
+		return data
+	}
+
+	if err := s.db.Session().Query(`
+		SELECT email, name, role
+		FROM users WHERE org_id = ? AND user_id = ?
+	`, orgUUID, userUUID).Scan(&data.Email, &data.Name, &data.Role); err != nil {
+		if data.Email == "" {
+			data.Email = identity.UserID + "@sesamefs.local"
+		}
+		if data.Role == "" {
+			data.Role = "user"
+		}
+	}
+
+	if data.Name == "" {
+		if atIdx := strings.Index(data.Email, "@"); atIdx > 0 {
+			data.Name = data.Email[:atIdx]
+		} else {
+			data.Name = data.Email
+		}
+	}
+
+	return data
+}
+
+func (s *Server) loadBootstrapOrgData(orgID string) bootstrapOrgData {
+	if orgID == "" || s.db == nil {
+		return bootstrapOrgData{}
+	}
+
+	orgUUID, err := gocql.ParseUUID(orgID)
+	if err != nil {
+		return bootstrapOrgData{}
+	}
+
+	data := bootstrapOrgData{}
+	if err := s.db.Session().Query(`
+		SELECT name, settings, max_users, plan, billing_cycle, quota_policy,
+		       storage_quota, traffic_quota, traffic_upload_quota, traffic_download_quota,
+		       current_period_started_at, current_period_ends_at
+		FROM organizations WHERE org_id = ?
+	`, orgUUID).Scan(
+		&data.Name,
+		&data.Settings,
+		&data.MaxUsers,
+		&data.Plan,
+		&data.BillingCycle,
+		&data.QuotaPolicy,
+		&data.StorageQuota,
+		&data.TrafficQuota,
+		&data.TrafficUploadQuota,
+		&data.TrafficDownloadQuota,
+		&data.CurrentPeriodStartedAt,
+		&data.CurrentPeriodEndsAt,
+	); err != nil {
+		return bootstrapOrgData{}
+	}
+	data.Loaded = true
+
+	_ = s.db.Session().Query(`SELECT COUNT(*) FROM users WHERE org_id = ?`, orgUUID).Scan(&data.CurrentUsers)
+
+	return data
+}
+
+func extractEmailFromAuthCookie(c *gin.Context) string {
+	if cookie, err := c.Cookie("sesamefs_auth"); err == nil && cookie != "" {
+		if idx := strings.LastIndex(cookie, "@"); idx >= 0 && idx < len(cookie)-1 {
+			return cookie[:idx]
+		}
+	}
+
+	return ""
+}
+
+func (s *Server) buildAppBootstrapPageOptions(identity bootstrapIdentity, userData bootstrapUserData, orgData bootstrapOrgData) gin.H {
+	role := identity.Role
+	if userData.Role != "" {
+		role = userData.Role
+	}
+	email := identity.Email
+	if userData.Email != "" {
+		email = userData.Email
+	}
+	name := userData.Name
+	if name == "" {
+		name = identity.UserID
+	}
+
 	pageOptions := gin.H{
 		"name":                    "",
-		"username":                fallbackEmail,
-		"contactEmail":            fallbackEmail,
+		"username":                email,
+		"contactEmail":            email,
 		"userRole":                role,
 		"canAddRepo":              false,
 		"canShareRepo":            false,
@@ -85,86 +258,37 @@ func (s *Server) buildAppBootstrapPageOptions(userID, orgID, role, fallbackEmail
 		"enableSubscription":      true,
 	}
 
-	if s.db == nil || userID == "" || orgID == "" {
+	if s.db == nil || identity.UserID == "" || identity.OrgID == "" {
 		return pageOptions
 	}
 
-	orgUUID, err := gocql.ParseUUID(orgID)
-	if err != nil {
-		return pageOptions
-	}
-	userUUID, err := gocql.ParseUUID(userID)
-	if err != nil {
-		return pageOptions
-	}
-
-	var email, name string
-	err = s.db.Session().Query(`
-		SELECT email, name, role, quota_bytes,
-		       traffic_upload_quota, traffic_download_quota
-		FROM users WHERE org_id = ? AND user_id = ?
-	`, orgUUID, userUUID).Scan(&email, &name, &role, new(int64),
-		new(int64), new(int64))
-	if err != nil {
-		email = fallbackEmail
-		if email == "" {
-			email = userID + "@sesamefs.local"
-		}
-		name = userID
-		role = "user"
-	}
-
-	if name == "" {
-		if atIdx := strings.Index(email, "@"); atIdx > 0 {
-			name = email[:atIdx]
-		} else {
-			name = email
-		}
-	}
-
-	var orgPlan, billingCycle, quotaPolicy string
-	var storageQuota, trafficQuota, trafficUploadQuota, trafficDownloadQuota int64
-	var maxUsers int
-	var currentPeriodStartedAt, currentPeriodEndsAt *time.Time
-	_ = s.db.Session().Query(`
-		SELECT plan, billing_cycle, quota_policy, storage_quota,
-		       traffic_quota, traffic_upload_quota, traffic_download_quota, max_users,
-		       current_period_started_at, current_period_ends_at
-		FROM organizations WHERE org_id = ?
-	`, orgUUID).Scan(&orgPlan, &billingCycle, &quotaPolicy, &storageQuota,
-		&trafficQuota, &trafficUploadQuota, &trafficDownloadQuota, &maxUsers,
-		&currentPeriodStartedAt, &currentPeriodEndsAt)
-
-	orgStorageUsed := traffic.ReadStorageUsed(s.db, fmt.Sprintf("org:%s", orgID))
+	orgStorageUsed := traffic.ReadStorageUsed(s.db, fmt.Sprintf("org:%s", identity.OrgID))
 	now := time.Now().UTC()
-	periodStartedAt := traffic.EffectivePeriodStart(currentPeriodStartedAt, now)
-	orgTrafficUsage := traffic.ReadOrgPeriodUsage(s.db, orgID, periodStartedAt)
+	periodStartedAt := traffic.EffectivePeriodStart(orgData.CurrentPeriodStartedAt, now)
+	orgTrafficUsage := traffic.ReadOrgPeriodUsage(s.db, identity.OrgID, periodStartedAt)
 
-	var currentUsers int
-	_ = s.db.Session().Query(`SELECT COUNT(*) FROM users WHERE org_id = ?`, orgUUID).Scan(&currentUsers)
-
-	profile := s.config.GetEnforcementProfile(quotaPolicy)
+	profile := s.config.GetEnforcementProfile(orgData.QuotaPolicy)
 	resolved := plans.ResolveCapabilities(role, profile)
 
 	var storagePct float64
 	storageOverQuota := false
-	if storageQuota > 0 {
-		storagePct = float64(orgStorageUsed) / float64(storageQuota) * 100
-		storageOverQuota = orgStorageUsed > storageQuota
+	if orgData.StorageQuota > 0 {
+		storagePct = float64(orgStorageUsed) / float64(orgData.StorageQuota) * 100
+		storageOverQuota = orgStorageUsed > orgData.StorageQuota
 	}
 
 	var trafficPct float64
 	trafficOverQuota := false
-	if trafficQuota > 0 {
-		trafficPct = float64(orgTrafficUsage.Combined) / float64(trafficQuota) * 100
-		trafficOverQuota = orgTrafficUsage.Combined > trafficQuota
+	if orgData.TrafficQuota > 0 {
+		trafficPct = float64(orgTrafficUsage.Combined) / float64(orgData.TrafficQuota) * 100
+		trafficOverQuota = orgTrafficUsage.Combined > orgData.TrafficQuota
 	}
-	uploadOverQuota := trafficUploadQuota > 0 && orgTrafficUsage.Upload > trafficUploadQuota
-	downloadOverQuota := trafficDownloadQuota > 0 && orgTrafficUsage.Download > trafficDownloadQuota
+	uploadOverQuota := orgData.TrafficUploadQuota > 0 && orgTrafficUsage.Upload > orgData.TrafficUploadQuota
+	downloadOverQuota := orgData.TrafficDownloadQuota > 0 && orgTrafficUsage.Download > orgData.TrafficDownloadQuota
 
 	isOrgOwner := role == "owner"
-	canUpgrade := plans.ComputeCanUpgrade(role, quotaPolicy, storagePct, trafficPct, storageOverQuota, trafficOverQuota)
-	isStaff := middleware.IsPlatformSuperAdmin(orgID, middleware.OrganizationRole(role))
+	canUpgrade := plans.ComputeCanUpgrade(role, orgData.QuotaPolicy, storagePct, trafficPct, storageOverQuota, trafficOverQuota)
+	isStaff := middleware.IsPlatformSuperAdmin(identity.OrgID, middleware.OrganizationRole(role))
 	canViewOrg := middleware.IsOrgStaff(role)
 	canInviteGuest := resolved.Capabilities["can_invite_guest"]
 	canSendShareLinkEmail := resolved.Capabilities["can_send_share_link_mail"]
@@ -185,44 +309,44 @@ func (s *Server) buildAppBootstrapPageOptions(userID, orgID, role, fallbackEmail
 	pageOptions["canPublishRepo"] = resolved.Capabilities["can_publish_repo"]
 	pageOptions["canViewOrg"] = canViewOrg
 	pageOptions["isSystemStaff"] = isStaff
-	pageOptions["plan"] = orgPlan
+	pageOptions["plan"] = orgData.Plan
 	pageOptions["isOrgOwner"] = isOrgOwner
 	pageOptions["canUpgrade"] = canUpgrade
-	pageOptions["billingCycle"] = billingCycle
-	pageOptions["maxUsers"] = maxUsers
-	pageOptions["currentUsers"] = currentUsers
-	pageOptions["currentPeriodStartedAt"] = currentPeriodStartedAt
-	pageOptions["currentPeriodEndsAt"] = currentPeriodEndsAt
+	pageOptions["billingCycle"] = orgData.BillingCycle
+	pageOptions["maxUsers"] = orgData.MaxUsers
+	pageOptions["currentUsers"] = orgData.CurrentUsers
+	pageOptions["currentPeriodStartedAt"] = orgData.CurrentPeriodStartedAt
+	pageOptions["currentPeriodEndsAt"] = orgData.CurrentPeriodEndsAt
 	pageOptions["upgradeFeatures"] = resolved.UpgradeFeatures
 	pageOptions["shareLinkExpireDaysMax"] = resolved.Limits.ShareLinkExpireDaysMax
 	pageOptions["uploadLinkExpireDaysMax"] = resolved.Limits.UploadLinkExpireDaysMax
 	pageOptions["storageInfo"] = gin.H{
 		"used":       orgStorageUsed,
-		"quota":      storageQuota,
+		"quota":      orgData.StorageQuota,
 		"percent":    storagePct,
 		"over_quota": storageOverQuota,
 	}
 	pageOptions["trafficInfo"] = gin.H{
 		"used":                orgTrafficUsage.Combined,
-		"quota":               trafficQuota,
+		"quota":               orgData.TrafficQuota,
 		"percent":             trafficPct,
 		"over_quota":          trafficOverQuota,
 		"upload_used":         orgTrafficUsage.Upload,
-		"upload_quota":        trafficUploadQuota,
+		"upload_quota":        orgData.TrafficUploadQuota,
 		"upload_over_quota":   uploadOverQuota,
 		"download_used":       orgTrafficUsage.Download,
-		"download_quota":      trafficDownloadQuota,
+		"download_quota":      orgData.TrafficDownloadQuota,
 		"download_over_quota": downloadOverQuota,
-		"reset_date":          traffic.EffectiveTrafficResetDate(currentPeriodEndsAt, now),
+		"reset_date":          traffic.EffectiveTrafficResetDate(orgData.CurrentPeriodEndsAt, now),
 	}
 
 	return pageOptions
 }
 
-func (s *Server) buildOrgBootstrapPageOptions(orgID, orgName string) gin.H {
+func (s *Server) buildOrgBootstrapPageOptions(orgID string, orgData bootstrapOrgData) gin.H {
 	pageOptions := gin.H{
 		"orgID":                    orgID,
-		"orgName":                  orgName,
+		"orgName":                  orgData.Name,
 		"invitationLink":           "",
 		"orgMemberQuotaEnabled":    "False",
 		"orgMembers":               0,
@@ -235,36 +359,24 @@ func (s *Server) buildOrgBootstrapPageOptions(orgID, orgName string) gin.H {
 		"enableSubscription":       false,
 	}
 
-	if s.db == nil || orgID == "" {
+	if orgID == "" || !orgData.Loaded {
 		return pageOptions
 	}
 
-	var settings map[string]string
-	var maxUsers int
-	if err := s.db.Session().Query(`
-		SELECT name, settings, max_users
-		FROM organizations WHERE org_id = ?
-	`, orgID).Scan(&orgName, &settings, &maxUsers); err != nil {
-		return pageOptions
-	}
-
-	currentUsers := 0
-	_ = s.db.Session().Query(`SELECT COUNT(*) FROM users WHERE org_id = ?`, orgID).Scan(&currentUsers)
-
-	effectiveMaxUsers := maxUsers
-	if settings != nil {
-		if rawMaxUsers, ok := settings["max_user_number"]; ok {
+	effectiveMaxUsers := orgData.MaxUsers
+	if orgData.Settings != nil {
+		if rawMaxUsers, ok := orgData.Settings["max_user_number"]; ok {
 			if parsedMaxUsers, err := strconv.Atoi(rawMaxUsers); err == nil && parsedMaxUsers > 0 {
 				effectiveMaxUsers = parsedMaxUsers
 			}
 		}
 	}
 
-	hasUserAvailability := effectiveMaxUsers <= 0 || currentUsers < effectiveMaxUsers
+	hasUserAvailability := effectiveMaxUsers <= 0 || orgData.CurrentUsers < effectiveMaxUsers
 
-	pageOptions["orgName"] = orgName
+	pageOptions["orgName"] = orgData.Name
 	pageOptions["orgMemberQuotaEnabled"] = boolString(effectiveMaxUsers > 0)
-	pageOptions["orgMembers"] = currentUsers
+	pageOptions["orgMembers"] = orgData.CurrentUsers
 	pageOptions["orgMembersQuota"] = effectiveMaxUsers
 	pageOptions["hasUserAvailability"] = hasUserAvailability
 	pageOptions["orgEnableAdminCustomLogo"] = "True"

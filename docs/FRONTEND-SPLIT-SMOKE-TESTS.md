@@ -36,6 +36,11 @@ Automation entrypoint:
 	- `DESKTOP_SMOKE_SYS_ADMIN_EMAIL`
 	- `DESKTOP_SMOKE_SYS_ADMIN_PASSWORD`
 
+Credential note:
+
+- Local Docker dev uses built-in `@sesamefs.local` users and dev-token passwords.
+- Any non-local target must provide explicit `DESKTOP_SMOKE_*` credentials.
+
 Test users:
 
 - regular org user

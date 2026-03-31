@@ -13,7 +13,13 @@ import (
 func TestGroupShareDeletedWithGroupCleanup(t *testing.T) {
 	groupName := fmt.Sprintf("inttest-group-%d", time.Now().UnixNano())
 	createGroupResp := adminClient.PostJSON(t, "/api/v2.1/groups/", map[string]string{"name": groupName})
-	expectStatus(t, createGroupResp, http.StatusCreated)
+	if createGroupResp.StatusCode != http.StatusCreated {
+		body := responseJSON(t, createGroupResp)
+		if upgradeRequired, _ := body["upgrade_required"].(bool); upgradeRequired {
+			t.Skip("group creation is disabled by the current org plan in this integration environment")
+		}
+		t.Fatalf("expected status %d, got %d: %v", http.StatusCreated, createGroupResp.StatusCode, body)
+	}
 
 	group := responseJSON(t, createGroupResp)
 	groupID, ok := group["id"].(string)

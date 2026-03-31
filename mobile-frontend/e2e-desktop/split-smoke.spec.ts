@@ -5,6 +5,38 @@ type Credentials = {
   password: string;
 };
 
+const baseURL = process.env.DESKTOP_BASE_URL || 'http://localhost:3000';
+const isLocalDesktopBaseURL = /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?(\/|$)/i.test(baseURL);
+
+function requireEnv(name: string) {
+  const value = process.env[name];
+  return typeof value === 'string' && value.length > 0;
+}
+
+function assertDesktopSmokeCredentialConfig() {
+  if (isLocalDesktopBaseURL) {
+    return;
+  }
+
+  const requiredVars = [
+    'DESKTOP_SMOKE_USER_EMAIL',
+    'DESKTOP_SMOKE_USER_PASSWORD',
+    'DESKTOP_SMOKE_ORG_ADMIN_EMAIL',
+    'DESKTOP_SMOKE_ORG_ADMIN_PASSWORD',
+    'DESKTOP_SMOKE_SYS_ADMIN_EMAIL',
+    'DESKTOP_SMOKE_SYS_ADMIN_PASSWORD',
+  ];
+  const missingVars = requiredVars.filter((name) => !requireEnv(name));
+
+  if (missingVars.length > 0) {
+    throw new Error(
+      `Set explicit DESKTOP_SMOKE_* credentials for non-local runs. Missing: ${missingVars.join(', ')}`
+    );
+  }
+}
+
+assertDesktopSmokeCredentialConfig();
+
 const credentials = {
   user: {
     email: process.env.DESKTOP_SMOKE_USER_EMAIL || 'user@sesamefs.local',

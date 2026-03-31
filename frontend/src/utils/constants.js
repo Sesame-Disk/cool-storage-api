@@ -4,6 +4,9 @@ export const defaultContentForSDoc = {
 };
 
 const appConfig = window.app?.config || {};
+// constants.js snapshots globals at import time. Entry points must run bootstrap
+// before importing app bundles, and any values that can change post-bootstrap
+// should be exported as `let` with an explicit updater.
 const appPageOptions = window.app?.pageOptions || {};
 const orgPageOptions = window.org?.pageOptions || {};
 const sysAdminPageOptions = window.sysadmin?.pageOptions || {};
@@ -149,7 +152,7 @@ export const canCompare = window.fileHistory ? window.fileHistory.pageOptions.ca
 export let orgID = orgPageOptions.orgID || '';
 export let orgName = orgPageOptions.orgName || '';
 export let invitationLink = orgPageOptions.invitationLink || '';
-export let orgMemberQuotaEnabled = orgPageOptions.orgMemberQuotaEnabled || '';
+export let orgMemberQuotaEnabled = parseTrue(orgPageOptions.orgMemberQuotaEnabled);
 export let orgMembers = orgPageOptions.orgMembers || 0;
 export let orgMembersQuota = orgPageOptions.orgMembersQuota || 0;
 export let hasUserAvailability = Object.prototype.hasOwnProperty.call(orgPageOptions, 'hasUserAvailability') ? orgPageOptions.hasUserAvailability : true;
@@ -166,7 +169,7 @@ export function _updateOrgContext(pageOptions) {
   if (pageOptions.orgID !== undefined) orgID = pageOptions.orgID;
   if (pageOptions.orgName !== undefined) orgName = pageOptions.orgName;
   if (pageOptions.invitationLink !== undefined) invitationLink = pageOptions.invitationLink;
-  if (pageOptions.orgMemberQuotaEnabled !== undefined) orgMemberQuotaEnabled = pageOptions.orgMemberQuotaEnabled;
+  if (pageOptions.orgMemberQuotaEnabled !== undefined) orgMemberQuotaEnabled = parseTrue(pageOptions.orgMemberQuotaEnabled);
   if (pageOptions.orgMembers !== undefined) orgMembers = pageOptions.orgMembers;
   if (pageOptions.orgMembersQuota !== undefined) orgMembersQuota = pageOptions.orgMembersQuota;
   if (Object.prototype.hasOwnProperty.call(pageOptions, 'hasUserAvailability')) hasUserAvailability = pageOptions.hasUserAvailability;
