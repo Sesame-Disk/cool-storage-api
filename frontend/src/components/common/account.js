@@ -194,7 +194,7 @@ class Account extends Component {
             {(this.state.enableSubscription && !isOrgContext) && <a href={siteRoot + 'subscription/'} className="item">{gettext('Subscription')}</a>}
             {this.renderMenu()}
             {enableSSOToThirdpartWebsite && <a href={siteRoot + 'sso-to-thirdpart/'} className="item">{gettext('Customer Portal')}</a>}
-            <a href={siteRoot + 'accounts/logout/'} className="item">{gettext('Log out')}</a>
+            <a href={siteRoot + 'accounts/logout/'} className="item" onClick={() => { localStorage.removeItem('sesamefs_auth_token'); for (const k of Object.keys(localStorage)) { if (k.startsWith('custom_permissions_')) localStorage.removeItem(k); } }}>{gettext('Log out')}</a>
           </div>
         </div>
       </div>

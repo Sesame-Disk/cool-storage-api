@@ -1,7 +1,7 @@
 # Current Work - SesameFS
 
-**Last Updated**: 2026-03-30
-**Session**: Session 58 — Plans/Permissions Phase 3 Frontend Progress + Org Ownership/Quota UI Fixes
+**Last Updated**: 2026-03-31
+**Session**: Session 59 — Frontend/Backend Split Hardening + Nginx Production Fixes + Logout Fix
 
 **📏 File Size Rule**: Keep this file under **500 lines** unless unavoidable. Move detailed content to:
 - `docs/KNOWN_ISSUES.md` - Detailed bug tracking
@@ -45,7 +45,7 @@
 	- org-admin shell still injects placeholder `window.org.pageOptions` values for some non-user screens/flags
 	- frontend still needs final cleanup of legacy plan-role code paths
 	- quota UI still needs unit standardization; some screens appear to treat `GB` as decimal (`1000^3`) while backend/utilities are binary-byte based (`1024^3`)
-- Before production, the documented frontend/backend separation in `docs/V1-PRODUCTION-ROADMAP.md` remains the next infrastructure milestone and is a good opportunity to redesign org-admin bootstrap/config delivery cleanly.
+- Frontend/backend separation **COMPLETE** (2026-03-30/31) — see `docs/V1-PRODUCTION-ROADMAP.md` P0 #3 and session 59 notes. Nginx production bugs fixed, bundle coupling fixed, logout fixed.
 
 ### Step 2: Before Making ANY Code Changes
 - ✅ Check `docs/IMPLEMENTATION_STATUS.md` - Is component 🔒 FROZEN?
@@ -60,38 +60,40 @@
 
 ## Last Session Summary ✅
 
-**Date**: 2026-03-18
-**Focus**: Production Readiness — Soft-Delete Cascades, Org Deletion, Bulk Optimization
+**Date**: 2026-03-31
+**Focus**: Frontend/Backend Split Audit + Nginx Production Hardening + Bug Fixes
 
-### Completed This Session (Session 57)
+### Completed This Session (Session 59)
 
-#### Fase 3: Library Trash Auto-Purge ✅
-- Scanner Phase 11 finds expired deleted libraries past `TrashRetentionDays` (30 days)
-- Worker `processLibraryCascade` enqueues contents + hard-deletes library record
+#### Nginx frontend container — 6 production bugs fixed ✅
+All were silent failures that would only surface under production load:
+- `client_max_body_size 100G` at server block (was missing → nginx default 1MB blocked large uploads)
+- Proxy timeouts: `proxy_read_timeout 3600s`, `proxy_send_timeout 3600s`, `proxy_connect_timeout 30s` at server block
+- `proxy_buffering off; proxy_request_buffering off` on transfer routes (`/d/`, `/u/d/`, `/lib/`, `/repo/`, `/seafhttp/`)
+- `proxy_http_version 1.1` + `proxy_set_header Connection ""` on all proxy locations (HTTP/1.1 keepalive)
+- `sendfile on; tcp_nopush on; tcp_nodelay on` at server block
+- `gzip_vary on; gzip_comp_level 6`
 
-#### Fase 4: Organization Deletion with Grace Period ✅
-- Three org states: active → deactivated (reversible) → deleted (30-day grace → cascade)
-- Scanner Phase 12: `scanExpiredDeletedOrgs`
-- Worker `processOrgCascade`: libraries → users → groups → hard-delete org
-- New endpoints: `POST .../delete/` (soft-delete), `POST .../restore/`
-- **Frontend TODO**: Superadmin dashboard needs UI for org delete/restore/status (see ISSUE-FRONTEND-ORG-DELETE-01)
+#### Nginx production reverse proxy — improvements ✅
+- Upstream keepalive: `keepalive 32/16/8` on all 3 upstream blocks
+- Separate rate limit zone for file transfers (`transfer` zone 20r/s vs `api` zone 100r/s)
+- Content-Security-Policy header added
+- All `add_header` directives now use `always`
+- `client_max_body_size 100G` (was 20G)
+- Frontend location: `proxy_send_timeout 3600s`, `proxy_connect_timeout 30s`
 
-#### Fase 5: BulkAddGroupMembers Optimization ✅
-- New `bulkUpsertGroupMembers()` — UnloggedBatch chunks of 25 members
-- Both `BulkAddGroupMembers` and `ImportGroupMembersViaFile` refactored
-- 100 members: 200 → 4 round-trips
+#### Bundle hash coupling fix ✅
+- `internal/api/v2/sharelink_view.go` — `fetchBundleManifest()` fetches `asset-manifest.json` from
+  frontend container at startup. 3-level fallback: HTTP → filesystem scan → hardcoded.
+  `FRONTEND_URL` env var added to both docker-compose files.
 
-#### Fase 6: Comprehensive Cascade Test Coverage ✅
-- **MockStore**: Major enhancement — added `mockUser`, `mockDeletedLibrary`, `mockShareByUser` types; 12 new seeders, 6 assertion helpers, 19 GCStore methods with real in-memory implementations (replaced nil stubs)
-- **Worker tests**: 26 tests (was 12) — 10 new cascade tests covering dry-run, invalid UUID, full cascade (user/library/org), already-deleted graceful skip
-- **Scanner tests**: 30 tests (was 11) — 9 new Phase 10-12 tests: expired users/libraries/orgs enqueue + skip + multiple, full ScanOnce integration
-- **Admin tests**: 26 tests (was 23) — SoftDeleteOrganization platform protection, RestoreOrganization route wiring, new routes registered
-- **Total GC tests**: 88 Go unit tests (was 55)
+#### Logout fixes ✅
+- `internal/api/server.go` — `handleLogout` now calls `SessionManager.InvalidateSession(token)`
+  before clearing cookie and redirecting (server-side session was never invalidated before)
+- `frontend/src/components/common/logout.js` + `account.js` — clear `sesamefs_auth_token` and
+  `custom_permissions_*` from localStorage on click (was left behind after backend redirect)
 
-#### Fase 7: Documentation ✅
-- Updated TESTING.md, CHANGELOG, KNOWN_ISSUES, IMPLEMENTATION_STATUS, CURRENT_WORK, ARCHITECTURE, ENDPOINT-REGISTRY, ADMIN-FEATURES
-
-**Files changed**: `store_mock.go`, `worker_test.go`, `scanner_test.go`, `admin_test.go`, `TESTING.md`, `CHANGELOG.md`, `IMPLEMENTATION_STATUS.md`, `CURRENT_WORK.md`
+**Files changed**: `frontend/nginx.conf`, `nginx/nginx.conf.template`, `internal/api/v2/sharelink_view.go`, `internal/api/server.go`, `frontend/src/components/common/logout.js`, `frontend/src/components/common/account.js`, `docker-compose.yaml`, `docker-compose.prod.yml`, `docs/V1-PRODUCTION-ROADMAP.md`, `docs/CHANGELOG.md`, `CURRENT_WORK.md`
 
 ### Previous Session (Session 55) — Org Admin Panel + Superadmin Parity
 

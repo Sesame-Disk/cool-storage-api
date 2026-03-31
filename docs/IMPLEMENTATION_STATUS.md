@@ -14,13 +14,14 @@
 | Core Backend API | ~98% | GC ✅, OIDC ✅, Library Settings ✅, Monitoring ✅ |
 | Admin Panels | ~95% | Superadmin ✅, Org Admin ✅, both at parity. Audit logs pending |
 | Frontend UI | ~85% | All 122 modals migrated ✅, File History UI ✅, permission UI (~75% with granular flags), ~51 ModalPortal wrappers to clean up |
-| Authentication | ~70% | OIDC Phase 1 complete, dev tokens supported |
-| Production Infrastructure | ✅ ~95% | GC ✅, Monitoring ✅, Health checks ✅, Structured logging ✅ |
+| Authentication | ~80% | OIDC Phase 1 complete, JWT revocation hardened (2026-03-31), dev tokens supported |
+| Production Infrastructure | ✅ ~97% | GC ✅, Monitoring ✅, Health checks ✅, Structured logging ✅, Frontend/Backend separation ✅, Nginx production hardening ✅ |
 
 **✅ Production Blockers — ALL COMPLETE**:
 1. ~~OIDC Authentication~~ - ✅ COMPLETE (Phase 1 - Basic Login)
 2. ~~Garbage Collection~~ - ✅ COMPLETE (Queue worker + scanner + admin API)
 3. ~~Monitoring/Health Checks~~ - ✅ COMPLETE (slog logging, `/health`, `/ready`, `/metrics`)
+4. ~~Frontend/Backend Separation~~ - ✅ COMPLETE (2026-03-30/31) — separate React/nginx container, bootstrap API, nginx production hardening
 
 ---
 
@@ -68,7 +69,7 @@
 | **File Tags** | ✅ COMPLETE | Mostly stable | ❌ No | 2026-02-12 | Repo tags + file tagging + cascade cleanup on delete/move + tag migration on rename |
 | **Batch Operations** | ✅ COMPLETE | Mostly stable | ❌ No | 2026-01-27 | Sync/async move/copy, task tracking |
 | **Search** | ✅ COMPLETE | Mostly stable | ❌ No | 2026-01-22 | Cassandra SASI implementation |
-| **OIDC Authentication** | ✅ COMPLETE | Mostly stable | ❌ No | 2026-01-28 | Phase 1 complete - SSO login working |
+| **OIDC Authentication** | ✅ COMPLETE | Mostly stable | ❌ No | 2026-03-31 | Phase 1 complete - SSO login working. JWT revocation hardened: revoked JWT tokens now checked against DB on cache miss (prevents re-authentication after logout/deactivation when `OIDC_JWT_SIGNING_KEY` is set) |
 | **OIDC Group/Dept Sync** | ✅ COMPLETE | Mostly stable | ❌ No | 2026-02-02 | Claims extraction, sync on login, full sync mode |
 | **Garbage Collection** | ✅ COMPLETE | Mostly stable | ❌ No | 2026-03-18 | 9 item types (incl. `user_cascade`, `library_cascade`, `org_cascade`), 12 scanner phases, soft-delete cascades for users (7-day grace), libraries (30-day trash), orgs (30-day grace). Full artifact cleanup, atomic group deletion, audit log, health metrics |
 | **Admin Panel (Groups/Users)** | ✅ COMPLETE | Mostly stable | ❌ No | 2026-02-02 | 16 admin endpoints + OIDC group/dept sync, 29 tests |
@@ -77,6 +78,7 @@
 | **Admin Link Management** | ✅ COMPLETE | Mostly stable | ❌ No | 2026-02-12 | 13 endpoints: share link admin (list/delete), upload links (user CRUD + admin), per-user links. See [ADMIN-FEATURES.md](ADMIN-FEATURES.md) § 2 |
 | **Superadmin Departments/Address Book** | ✅ COMPLETE | Mostly stable | ❌ No | 2026-03-05 | 9 endpoints: dept CRUD, address book groups, group-owned libraries. See [ADMIN-FEATURES.md](ADMIN-FEATURES.md) § 4 |
 | **Org Admin Panel** | 🟡 PARTIAL | Mostly stable | ❌ No | 2026-03-30 | 50+ endpoints in org_admin.go. Users, groups, repos, trash, departments, links are present. Ownership transfer is now visible from the users page and member creation is gated by live `max_users` data, but there is still a confirmed statistics scope bug and some org-admin screens still depend on placeholder shell flags injected via `window.org.pageOptions`. |
+| **Frontend/Backend Separation** | ✅ COMPLETE | Mostly stable | ❌ No | 2026-03-31 | Go is a pure API server. React SPA served by separate `nginx:alpine` container (`frontend/Dockerfile`). Bootstrap API (`GET /api/v2.1/bootstrap/`) replaces server-side placeholder injection. `constants.js` live bindings fix org-admin orgID timing. 6 nginx production bugs fixed (client_max_body_size 100G, proxy timeouts, buffering, HTTP/1.1 keepalive). Bundle hash coupling fixed via `asset-manifest.json` HTTP fetch. |
 | **Storage & Traffic Quotas** | ✅ COMPLETE | Mostly stable | ❌ No | 2026-03-30 | Traffic recording (fire-and-forget), quota enforcement (free=hard block, paid=soft warning), storage counters (4 scopes), statistics API, plan management API. All upload/download paths instrumented. Library soft-delete adjusts storage counters. Frontend quota-entry migration to GB is mostly done, but UI unit consistency is still pending because some screens appear decimal (`1000^3`) while backend/utilities are binary-byte based (`1024^3`). See [QUOTAS-AND-TRAFFIC-PLAN.md](QUOTAS-AND-TRAFFIC-PLAN.md) |
 | **Audit Logs** | 🟡 PARTIAL | Mostly stable | ❌ No | 2026-03-26 | `audit_log` table with 365-day TTL exists for deletion events (GC, groups, departments), and `users.last_login_at` now covers latest successful login. Historical login logs and file-operation/file-access event tables are still missing, so login audit pages and file statistics pages remain pending. See [ADMIN-FEATURES.md](ADMIN-FEATURES.md) § 3 |
 | **File/Folder Trash** | ✅ COMPLETE | Mostly stable | ❌ No | 2026-03-11 | List, restore, clean trash + browse deleted folders. Enhanced: filters out children of deleted directories (2026-03-11) |

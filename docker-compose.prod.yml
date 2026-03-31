@@ -32,6 +32,7 @@ services:
       - OIDC_REDIRECT_URIS=https://${DOMAIN}/sso/,https://${DOMAIN}/oauth/callback/
       - ONLYOFFICE_API_JS_URL=https://${OFFICE_DOMAIN}/web-apps/apps/api/documents/api.js
       - ONLYOFFICE_JWT_SECRET=${ONLYOFFICE_JWT_SECRET}
+      - FRONTEND_URL=${FRONTEND_URL:-http://frontend:80}
 
       # Cassandra — defaults work for single-region; override in .env for multi-region
       - CASSANDRA_HOSTS=${CASSANDRA_HOSTS:-cassandra:9042}

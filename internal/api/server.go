@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"log/slog"
@@ -16,6 +17,7 @@ import (
 	"time"
 
 	v2 "github.com/Sesame-Disk/sesamefs/internal/api/v2"
+	authpkg "github.com/Sesame-Disk/sesamefs/internal/auth"
 	"github.com/Sesame-Disk/sesamefs/internal/config"
 	"github.com/Sesame-Disk/sesamefs/internal/db"
 	"github.com/Sesame-Disk/sesamefs/internal/gc"
@@ -962,6 +964,17 @@ func extractRequestAuthToken(c *gin.Context) string {
 	return token
 }
 
+func isSessionValidationInfraError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	return !errors.Is(err, authpkg.ErrSessionExpired) &&
+		!errors.Is(err, authpkg.ErrSessionInvalid) &&
+		!errors.Is(err, authpkg.ErrSessionRevoked) &&
+		!errors.Is(err, authpkg.ErrSessionNotFound)
+}
+
 func requestOrgScopeHint(c *gin.Context) string {
 	path := c.Request.URL.Path
 	const orgAPIPrefix = "/api/v2.1/org/"
@@ -1213,8 +1226,13 @@ func (s *Server) authMiddleware() gin.HandlerFunc {
 				}
 				// If the session was found but expired, return immediately
 				// with a specific error so the frontend can redirect to login.
-				if strings.Contains(err.Error(), "expired") {
+				if authpkg.IsSessionExpired(err) {
 					c.JSON(http.StatusUnauthorized, gin.H{"error": "session expired"})
+					c.Abort()
+					return
+				}
+				if isSessionValidationInfraError(err) {
+					c.JSON(http.StatusServiceUnavailable, gin.H{"error": "session validation unavailable"})
 					c.Abort()
 					return
 				}
@@ -1305,8 +1323,13 @@ func (s *Server) smartLinkAuthMiddleware() gin.HandlerFunc {
 					c.Next()
 					return
 				}
-				if strings.Contains(err.Error(), "expired") {
+				if authpkg.IsSessionExpired(err) {
 					redirectToLogin(true)
+					return
+				}
+				if isSessionValidationInfraError(err) {
+					c.JSON(http.StatusServiceUnavailable, gin.H{"error": "session validation unavailable"})
+					c.Abort()
 					return
 				}
 			}
@@ -1415,6 +1438,11 @@ func (s *Server) syncAuthMiddleware() gin.HandlerFunc {
 					c.Set("email", session.Email)
 					c.Set("role", session.Role)
 					c.Next()
+					return
+				}
+				if isSessionValidationInfraError(err) {
+					c.JSON(http.StatusServiceUnavailable, gin.H{"error": "session validation unavailable"})
+					c.Abort()
 					return
 				}
 			}
@@ -2391,16 +2419,23 @@ func (s *Server) handleOAuthCallback(c *gin.Context) {
 	c.Redirect(http.StatusFound, "/")
 }
 
-// handleLogout clears the user's session and redirects to home
+// handleLogout invalidates the user's session and redirects to home.
 // GET /accounts/logout/
 func (s *Server) handleLogout(c *gin.Context) {
-	// In a real implementation, we would invalidate the token in the database
-	// For now, we just return an HTML page that clears localStorage and redirects
-	c.Header("Content-Type", "text/html; charset=utf-8")
-	if err := templates.Render(c.Writer, "logout.html", nil); err != nil {
-		log.Printf("[handleLogout] template error: %v", err)
-		c.String(http.StatusInternalServerError, "Internal Server Error")
+	if token := extractRequestAuthToken(c); token != "" && s.authHandler != nil {
+		if sessionMgr := s.authHandler.GetSessionManager(); sessionMgr != nil {
+			if err := sessionMgr.InvalidateSession(token); err != nil {
+				log.Printf("[handleLogout] failed to invalidate session: %v", err)
+			}
+		}
 	}
+
+	// Clear the auth cookie server-side (maxAge=-1 expires immediately)
+	isSecure := c.Request.TLS != nil
+	c.SetCookie("sesamefs_auth", "", -1, "/", "", isSecure, false)
+
+	// Redirect to home — the SPA will detect the missing session and show the login page
+	c.Redirect(http.StatusFound, "/")
 }
 
 // handleCreateRepoTag returns a stub response for tag creation

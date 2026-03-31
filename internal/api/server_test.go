@@ -189,6 +189,41 @@ func TestHandleAuthToken(t *testing.T) {
 	}
 }
 
+func TestExtractRequestAuthToken(t *testing.T) {
+	tests := []struct {
+		name       string
+		authHeader string
+		cookie     string
+		want       string
+	}{
+		{name: "token header", authHeader: "Token abc123", want: "abc123"},
+		{name: "bearer header", authHeader: "Bearer abc123", want: "abc123"},
+		{name: "plain cookie token", cookie: "abc123", want: "abc123"},
+		{name: "email token cookie", cookie: "user@example.com@abc123", want: "abc123"},
+		{name: "undefined token ignored", cookie: "undefined", want: ""},
+		{name: "null token ignored", cookie: "null", want: ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			req := httptest.NewRequest(http.MethodGet, "/", nil)
+			if tt.authHeader != "" {
+				req.Header.Set("Authorization", tt.authHeader)
+			}
+			if tt.cookie != "" {
+				req.AddCookie(&http.Cookie{Name: "sesamefs_auth", Value: tt.cookie})
+			}
+			c.Request = req
+
+			if got := extractRequestAuthToken(c); got != tt.want {
+				t.Errorf("extractRequestAuthToken() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 // TestHandleAccountInfo tests the account info endpoint
 func TestHandleAccountInfo(t *testing.T) {
 	t.Skip("Requires database connection - run as integration test")

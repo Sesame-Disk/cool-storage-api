@@ -19,6 +19,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Sesame-Disk/sesamefs/internal/config"
@@ -43,9 +44,20 @@ type ShareLinkViewHandler struct {
 	// bundleMap maps entry point names (e.g. "sharedDirView") to hashed filenames
 	jsBundleMap  map[string]string
 	cssBundleMap map[string]string
+	bundleMu     sync.RWMutex
+	frontendURL  string
+	bundleSource string
+	lastRefresh  time.Time
 }
 
-// NewShareLinkViewHandler creates a new ShareLinkViewHandler and scans frontend bundles
+// NewShareLinkViewHandler creates a new ShareLinkViewHandler and resolves frontend bundles.
+//
+// Bundle resolution order (first success wins):
+//  1. HTTP fetch of asset-manifest.json from the frontend container (FRONTEND_URL env var,
+//     default http://frontend:80). This is the correct path in multi-container deployments.
+//  2. Filesystem scan of ./frontend/build/static/{js,css} — works in local dev when the
+//     frontend and backend share a filesystem (e.g. `go run ./cmd/sesamefs` from repo root).
+//  3. Hardcoded fallback filenames — last resort; these go stale on each frontend rebuild.
 func NewShareLinkViewHandler(database *db.DB, cfg *config.Config, s3Store *storage.S3Store, storageManager *storage.Manager, tokenCreator TokenCreator, serverURL string) *ShareLinkViewHandler {
 	h := &ShareLinkViewHandler{
 		db:             database,
@@ -55,9 +67,112 @@ func NewShareLinkViewHandler(database *db.DB, cfg *config.Config, s3Store *stora
 		tokenCreator:   tokenCreator,
 		serverURL:      serverURL,
 	}
-	h.jsBundleMap = scanBundles("./frontend/build/static/js", ".js")
-	h.cssBundleMap = scanBundles("./frontend/build/static/css", ".css")
+
+	h.frontendURL = os.Getenv("FRONTEND_URL")
+	if h.frontendURL == "" {
+		h.frontendURL = "http://frontend:80"
+	}
+
+	h.refreshBundleMaps(true)
+
 	return h
+}
+
+func (h *ShareLinkViewHandler) refreshBundleMaps(force bool) {
+	h.bundleMu.RLock()
+	bundleSource := h.bundleSource
+	lastRefresh := h.lastRefresh
+	h.bundleMu.RUnlock()
+
+	if !force {
+		retryWindow := 5 * time.Second
+		if bundleSource == "http" {
+			retryWindow = 1 * time.Minute
+		}
+		if !lastRefresh.IsZero() && time.Since(lastRefresh) < retryWindow {
+			return
+		}
+	}
+
+	h.bundleMu.Lock()
+	defer h.bundleMu.Unlock()
+
+	if !force {
+		retryWindow := 5 * time.Second
+		if h.bundleSource == "http" {
+			retryWindow = 1 * time.Minute
+		}
+		if !h.lastRefresh.IsZero() && time.Since(h.lastRefresh) < retryWindow {
+			return
+		}
+	}
+
+	if jsMap, cssMap, err := fetchBundleManifest(h.frontendURL); err == nil {
+		slog.Info("Loaded frontend bundle manifest via HTTP", "url", h.frontendURL)
+		h.jsBundleMap = jsMap
+		h.cssBundleMap = cssMap
+		h.bundleSource = "http"
+		h.lastRefresh = time.Now()
+		return
+	} else {
+		slog.Warn("Could not fetch bundle manifest from frontend container, falling back to filesystem scan", "url", h.frontendURL, "error", err)
+	}
+
+	jsMap := scanBundles("./frontend/build/static/js", ".js")
+	cssMap := scanBundles("./frontend/build/static/css", ".css")
+	h.jsBundleMap = jsMap
+	h.cssBundleMap = cssMap
+	h.lastRefresh = time.Now()
+	if len(jsMap) > 0 || len(cssMap) > 0 {
+		h.bundleSource = "filesystem"
+		return
+	}
+	h.bundleSource = "fallback"
+}
+
+// fetchBundleManifest fetches asset-manifest.json from the frontend container and returns
+// JS and CSS bundle maps (entry name → hashed filename, e.g. "sharedDirView" → "sharedDirView.ef3d8149.js").
+// CRA generates asset-manifest.json automatically at build time.
+func fetchBundleManifest(frontendURL string) (jsMap, cssMap map[string]string, err error) {
+	manifestURL := strings.TrimSuffix(frontendURL, "/") + "/asset-manifest.json"
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Get(manifestURL)
+	if err != nil {
+		return nil, nil, fmt.Errorf("GET %s: %w", manifestURL, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, nil, fmt.Errorf("GET %s: status %d", manifestURL, resp.StatusCode)
+	}
+
+	// CRA asset-manifest.json structure: {"files": {"sharedDirView.js": "/static/js/sharedDirView.abc.js", ...}}
+	var manifest struct {
+		Files map[string]string `json:"files"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&manifest); err != nil {
+		return nil, nil, fmt.Errorf("decode asset-manifest.json: %w", err)
+	}
+
+	jsMap = make(map[string]string)
+	cssMap = make(map[string]string)
+	for key, assetPath := range manifest.Files {
+		// key examples: "sharedDirView.js", "commons.css", "runtime.js"
+		// assetPath examples: "/static/js/sharedDirView.ef3d8149.js"
+		filename := path.Base(assetPath) // "sharedDirView.ef3d8149.js"
+		switch {
+		case strings.HasSuffix(key, ".js") && !strings.HasSuffix(key, ".map"):
+			entryName := strings.TrimSuffix(key, ".js")
+			jsMap[entryName] = filename
+		case strings.HasSuffix(key, ".css"):
+			entryName := strings.TrimSuffix(key, ".css")
+			cssMap[entryName] = filename
+		}
+	}
+
+	if len(jsMap) == 0 {
+		return nil, nil, fmt.Errorf("asset-manifest.json contained no JS entries")
+	}
+	return jsMap, cssMap, nil
 }
 
 // scanBundles scans a directory for hashed bundle files and returns a map
@@ -67,8 +182,6 @@ func scanBundles(dir, ext string) map[string]string {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		slog.Warn("Failed to scan bundle directory, using fallback bundle names", "dir", dir, "error", err)
-		// Return fallback bundle names when directory scan fails
-		// These are the bundle names from the frontend build
 		if ext == ".js" {
 			return getJSBundleFallbacks()
 		}
@@ -1098,6 +1211,8 @@ func (h *ShareLinkViewHandler) buildSharePageHTML(bundleName, title, pageOptions
 
 // buildSharePageData builds the template data for share/upload page templates.
 func (h *ShareLinkViewHandler) buildSharePageData(bundleName, title, pageOptionsJSON string) templates.SharePageData {
+	h.refreshBundleMaps(false)
+
 	runtimeJS := h.resolveJSBundle("runtime")
 	commonsJS := h.resolveJSBundle("commons")
 	entryJS := h.resolveJSBundle(bundleName)
@@ -1133,6 +1248,8 @@ func (h *ShareLinkViewHandler) buildSharePageData(bundleName, title, pageOptions
 }
 
 func (h *ShareLinkViewHandler) resolveJSBundle(name string) string {
+	h.bundleMu.RLock()
+	defer h.bundleMu.RUnlock()
 	if f, ok := h.jsBundleMap[name]; ok {
 		return f
 	}
@@ -1140,6 +1257,8 @@ func (h *ShareLinkViewHandler) resolveJSBundle(name string) string {
 }
 
 func (h *ShareLinkViewHandler) resolveCSSBundle(name string) string {
+	h.bundleMu.RLock()
+	defer h.bundleMu.RUnlock()
 	if f, ok := h.cssBundleMap[name]; ok {
 		return f
 	}

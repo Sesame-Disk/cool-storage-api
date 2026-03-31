@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"errors"
 	"testing"
 	"time"
 
@@ -10,14 +11,14 @@ import (
 // TestSessionManager_CreateSession tests session creation
 func TestSessionManager_CreateSession(t *testing.T) {
 	tests := []struct {
-		name       string
-		config     *config.OIDCConfig
-		userID     string
-		orgID      string
-		email      string
-		role       string
-		wantErr    bool
-		checkJWT   bool
+		name     string
+		config   *config.OIDCConfig
+		userID   string
+		orgID    string
+		email    string
+		role     string
+		wantErr  bool
+		checkJWT bool
 	}{
 		{
 			name: "create session with random token",
@@ -158,6 +159,9 @@ func TestSessionManager_ValidateSession(t *testing.T) {
 		if err == nil {
 			t.Error("ValidateSession() should fail for invalid token")
 		}
+		if !errors.Is(err, ErrSessionNotFound) {
+			t.Errorf("ValidateSession() error = %v, want ErrSessionNotFound", err)
+		}
 	})
 
 	t.Run("validate expired session", func(t *testing.T) {
@@ -178,7 +182,25 @@ func TestSessionManager_ValidateSession(t *testing.T) {
 		if err == nil {
 			t.Error("ValidateSession() should fail for expired session")
 		}
+		if !errors.Is(err, ErrSessionExpired) {
+			t.Errorf("ValidateSession() error = %v, want ErrSessionExpired", err)
+		}
 	})
+}
+
+func TestSessionErrorHelpers(t *testing.T) {
+	if !IsSessionInvalid(ErrSessionInvalid) {
+		t.Error("IsSessionInvalid should detect ErrSessionInvalid")
+	}
+	if !IsSessionNotFound(ErrSessionNotFound) {
+		t.Error("IsSessionNotFound should detect ErrSessionNotFound")
+	}
+	if !IsSessionExpired(ErrSessionExpired) {
+		t.Error("IsSessionExpired should detect ErrSessionExpired")
+	}
+	if !IsSessionRevoked(ErrSessionRevoked) {
+		t.Error("IsSessionRevoked should detect ErrSessionRevoked")
+	}
 }
 
 // TestSessionManager_ValidateSession_JWT tests JWT validation

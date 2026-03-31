@@ -312,6 +312,7 @@ docker compose -f docker-compose.prod.yml logs -f
 
 # Single service
 docker compose -f docker-compose.prod.yml logs -f sesamefs
+docker compose -f docker-compose.prod.yml logs -f frontend
 docker compose -f docker-compose.prod.yml logs -f cassandra
 docker compose -f docker-compose.prod.yml logs -f onlyoffice
 ```
@@ -322,8 +323,14 @@ docker compose -f docker-compose.prod.yml logs -f onlyoffice
 cd /opt/sesamefs
 git pull
 
-# Rebuild only the sesamefs image (Cassandra/OnlyOffice don't need rebuilding)
+# Backend-only change (API, sync protocol, business logic)
 docker compose -f docker-compose.prod.yml up -d --build sesamefs
+
+# Frontend-only change (React UI, styles, components)
+docker compose -f docker-compose.prod.yml up -d --build frontend
+
+# Both changed (or when unsure)
+docker compose -f docker-compose.prod.yml up -d --build sesamefs frontend
 ```
 
 ### Restart a service
@@ -371,7 +378,7 @@ Settings that **cannot** be set via env vars and must be in this file:
 | `OIDC_CLIENT_ID` | `auth.oidc.client_id` | Secret |
 | `OIDC_CLIENT_SECRET` | `auth.oidc.client_secret` | Secret |
 | `OIDC_REDIRECT_URIS` | `auth.oidc.redirect_uris` | Computed by compose |
-| `OIDC_JWT_SIGNING_KEY` | `auth.oidc.jwt_signing_key` | Secret |
+| `OIDC_JWT_SIGNING_KEY` | `auth.oidc.jwt_signing_key` | Secret. When set, sessions are signed JWTs instead of opaque tokens. **NEVER change after deploy** — all active sessions are immediately invalidated. Revoked JWTs (logout/user deactivation) are verified against the DB so revocation is effective even in JWT mode. |
 | `OIDC_DEFAULT_ROLE` | `auth.oidc.default_role` | |
 | `OIDC_AUTO_PROVISION` | `auth.oidc.auto_provision` | |
 | `OIDC_SESSION_TTL` | `auth.oidc.session_ttl` | Web browser sessions (default: 24h) |
@@ -394,6 +401,7 @@ Settings that **cannot** be set via env vars and must be in this file:
 | `METRICS_ENABLED` | `monitoring.metrics_enabled` | |
 | `DESKTOP_CUSTOM_BRAND` | — (server-info response) | Brand name shown in desktop client (default: `Sesame Disk`) |
 | `DESKTOP_CUSTOM_LOGO` | — (server-info response) | Full URL to logo image shown in desktop client (optional) |
+| `FRONTEND_URL` | — | Internal URL of the frontend container used by share link pages to resolve hashed JS/CSS bundle names via `asset-manifest.json`. Default: `http://frontend:80`. Only change if the frontend container runs on a different host/port. |
 
 ---
 
@@ -707,8 +715,9 @@ username+password) **always returns 401** when `AUTH_DEV_MODE=false`.
   nonce, and expiry but not the cryptographic signature of the ID token.
   Risk is low in authorization code flow (tokens come server-to-server),
   but this should be patched before high-security deployments.
-- **No rate limiting** beyond the basic nginx `limit_req` — add a WAF or
-  API gateway for stricter protection.
+- **Rate limiting** is implemented via two nginx zones: API calls (100r/s, burst 200) and file transfers
+  (`/seafhttp/`, `/d/`, `/u/d/`) at a separate 20r/s zone (burst 40) to prevent large uploads/downloads
+  from starving API traffic. For stricter application-layer protection add a WAF or API gateway.
 - **Single Cassandra node** (single-region default) — suitable for testing
   and early production. For HA, deploy multi-region (see above).
 - **No Cassandra backup** configured — set up snapshots before storing

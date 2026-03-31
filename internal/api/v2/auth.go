@@ -1,6 +1,7 @@
 package v2
 
 import (
+	"errors"
 	"log"
 	"net/http"
 	"strings"
@@ -223,6 +224,15 @@ func (h *AuthHandler) GetSessionInfo(c *gin.Context) {
 
 	session, err := h.sessions.ValidateSession(token)
 	if err != nil {
+		if !errors.Is(err, auth.ErrSessionExpired) &&
+			!errors.Is(err, auth.ErrSessionInvalid) &&
+			!errors.Is(err, auth.ErrSessionRevoked) &&
+			!errors.Is(err, auth.ErrSessionNotFound) {
+			c.JSON(http.StatusServiceUnavailable, gin.H{
+				"error": "Session validation unavailable",
+			})
+			return
+		}
 		c.JSON(http.StatusUnauthorized, gin.H{
 			"error": "Invalid or expired session",
 		})

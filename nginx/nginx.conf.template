@@ -7,8 +7,12 @@
 # - $${nginx_var}    → becomes $nginx_var after substitution (nginx syntax)
 # =============================================================================
 
-# Rate limiting zone (http context — applies to all server blocks below)
+# Rate limiting zones (http context — applies to all server blocks below)
+# API zone: general API calls — 100 req/s with burst
 limit_req_zone $${binary_remote_addr} zone=api:10m rate=100r/s;
+# Transfer zone: file upload/download routes — 20 concurrent transfers per IP is plenty;
+# these are long-lived connections, not high-frequency short requests
+limit_req_zone $${binary_remote_addr} zone=transfer:10m rate=20r/s;
 
 # Mobile User-Agent detection — single authoritative location (Go no longer duplicates this)
 map $${http_user_agent} $${is_mobile} {
@@ -16,17 +20,20 @@ map $${http_user_agent} $${is_mobile} {
     ~*(?:Android|iPhone|iPad|iPod|Mobile|Opera\ Mini|IEMobile|WPDesktop) 1;
 }
 
-# Upstream definitions
+# Upstream definitions with keepalive connection pooling
 upstream sesamefs_api {
     server sesamefs:8080;
+    keepalive 32;
 }
 
 upstream sesamefs_frontend {
     server frontend:80;
+    keepalive 16;
 }
 
 upstream sesamefs_mobile {
     server mobile-frontend:80;
+    keepalive 8;
 }
 
 # =============================================================================
@@ -65,12 +72,16 @@ server {
 
     # Security headers
     add_header Strict-Transport-Security "max-age=63072000; includeSubDomains" always;
-    add_header X-Frame-Options SAMEORIGIN;
-    add_header X-Content-Type-Options nosniff;
-    add_header Referrer-Policy no-referrer-when-downgrade;
+    add_header X-Frame-Options SAMEORIGIN always;
+    add_header X-Content-Type-Options nosniff always;
+    add_header Referrer-Policy no-referrer-when-downgrade always;
+    # CSP: unsafe-inline required for server-injected window.shared.pageOptions scripts in share link pages
+    # Long-term: migrate to nonces to tighten this policy
+    add_header Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https:; connect-src 'self'; frame-src 'self' https:; font-src 'self' data:;" always;
+    add_header Permissions-Policy "camera=(), microphone=(), geolocation=()" always;
 
-    # Large file uploads (sesamefs supports up to 20 GB)
-    client_max_body_size 20G;
+    # Large file uploads
+    client_max_body_size 100G;
 
     # Block Prometheus metrics from external access
     location /metrics {
@@ -78,18 +89,41 @@ server {
         return 403;
     }
 
-    # API routes → Go backend
-    # - api/api2/seafhttp: core API and file transfer
-    # - accounts/oauth/client-login/client-sso: auth flows (logout, OIDC, desktop client)
-    # - d/u: share links and upload links
-    # - lib/repo: file viewer and raw file serving
+    # File transfer routes → Go backend
+    # These are long-lived connections (large file up/download), not high-frequency short requests.
+    # Use a separate rate limit zone to avoid starving API calls with transfer bursts.
+    location ~ ^/(seafhttp|d|u)(/|$) {
+        limit_req zone=transfer burst=40 nodelay;
+
+        proxy_pass http://sesamefs_api;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+
+        proxy_set_header Host              $${host};
+        proxy_set_header X-Real-IP         $${remote_addr};
+        proxy_set_header X-Forwarded-For   $${proxy_add_x_forwarded_for};
+        proxy_set_header X-Forwarded-Proto $${scheme};
+
+        proxy_request_buffering off;
+        proxy_buffering         off;
+
+        proxy_read_timeout    3600s;
+        proxy_send_timeout    3600s;
+        proxy_connect_timeout 30s;
+    }
+
+    # API + auth + misc backend routes → Go backend
+    # - api/api2: core JSON API (Seafile protocol + SesameFS extensions)
+    # - lib/repo: file viewer and raw file serving (authenticated)
+    # - accounts/oauth/client-login/client-sso/saml2: auth flows
     # - onlyoffice/office-convert: document editing
     # - smart-link/billing/share: misc backend-rendered routes
-    location ~ ^/(api|api2|seafhttp|seafile|ping|health|ready|accounts|oauth|client-login|client-sso|d|u|lib|repo|onlyoffice|office-convert|smart-link|billing|share|saml2|org/custom)(/|$) {
+    location ~ ^/(api|api2|seafile|ping|health|ready|accounts|oauth|client-login|client-sso|lib|repo|onlyoffice|office-convert|smart-link|billing|share|saml2|org/custom)(/|$) {
         limit_req zone=api burst=200 nodelay;
 
         proxy_pass http://sesamefs_api;
         proxy_http_version 1.1;
+        proxy_set_header Connection "";
 
         proxy_set_header Host              $${host};
         proxy_set_header X-Real-IP         $${remote_addr};
@@ -116,16 +150,17 @@ server {
 
         proxy_pass $${frontend_upstream};
         proxy_http_version 1.1;
+        proxy_set_header Connection "";
 
         proxy_set_header Host              $${host};
         proxy_set_header X-Real-IP         $${remote_addr};
         proxy_set_header X-Forwarded-For   $${proxy_add_x_forwarded_for};
         proxy_set_header X-Forwarded-Proto $${scheme};
 
-        # No request/response buffering needed for static SPA assets
         proxy_buffering         off;
-        proxy_connect_timeout   10s;
+        proxy_connect_timeout   30s;
         proxy_read_timeout      60s;
+        proxy_send_timeout      60s;
     }
 }
 

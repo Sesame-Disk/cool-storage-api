@@ -8,6 +8,52 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-03-31 — Session 59: Frontend/Backend Split Hardening + Nginx Production Fixes
+
+### Fixed — Nginx production bugs (frontend container)
+
+All 6 bugs would have caused silent failures in production:
+
+- **`client_max_body_size`** missing at server block level in `frontend/nginx.conf` — nginx default (1MB) blocked any API call or upload over 1MB. Added `client_max_body_size 100G` at server block level.
+- **No proxy timeouts** — all 14 proxy locations in `frontend/nginx.conf` had no `proxy_read_timeout`, `proxy_send_timeout`, or `proxy_connect_timeout`. Nginx default 60s caused 504 on large file operations. Added `proxy_read_timeout 3600s; proxy_send_timeout 3600s; proxy_connect_timeout 30s` at server block level.
+- **No `proxy_buffering off` on transfer routes** — `/d/`, `/u/d/`, `/lib/`, `/repo/`, `/seafhttp/` were buffering file downloads in nginx memory. Added `proxy_buffering off; proxy_request_buffering off` to those locations.
+- **HTTP/1.0 to backend** — missing `proxy_http_version 1.1` on all proxy locations meant keepalive was impossible. Added to all proxy locations with `proxy_set_header Connection ""`.
+- **No `sendfile`/`tcp_nopush`/`tcp_nodelay`** — Added at server block level.
+- **No `gzip_vary`** — CDN/proxy caches could serve compressed content to non-gzip clients. Added `gzip_vary on; gzip_comp_level 6`.
+
+### Fixed — Nginx production bugs (production reverse proxy)
+
+- **No upstream keepalive** in `nginx/nginx.conf.template` — added `keepalive 32/16/8` to all 3 upstream blocks (`sesamefs_api`, `sesamefs_frontend`, `sesamefs_mobile`) + `proxy_set_header Connection ""` in location blocks.
+- **Missing `proxy_send_timeout`** on frontend location — added `proxy_send_timeout 3600s`.
+- **`proxy_connect_timeout 10s`** too low on frontend location — changed to 30s.
+- **File transfer rate limiting** — file routes (`/seafhttp/`, `/d/`, `/u/d/`) now use a dedicated `transfer` zone (20r/s, burst=40) instead of competing with API calls in the `api` zone (100r/s, burst=200).
+- **No Content-Security-Policy** — added CSP header (`default-src 'self'`, `script-src 'unsafe-inline'` for share link page injection).
+- **Security headers missing `always` flag** — all `add_header` directives now use `always` so headers are sent on error responses too.
+- **`client_max_body_size 20G`** — increased to `100G`.
+
+### Fixed — Bundle hash coupling
+
+- `internal/api/v2/sharelink_view.go` — share link pages were using hardcoded webpack bundle hashes that became stale on every frontend rebuild, causing 404s on JS/CSS. `NewShareLinkViewHandler` now fetches `asset-manifest.json` from the frontend container at startup (3-level fallback: HTTP fetch → filesystem scan → hardcoded). `FRONTEND_URL` env var added to `docker-compose.yaml` and `docker-compose.prod.yml`.
+
+### Fixed — Logout: server-side session not invalidated + localStorage not cleared
+
+- `internal/api/server.go` — `handleLogout` now extracts the session token from the `sesamefs_auth` cookie and calls `SessionManager.InvalidateSession(token)` before clearing the cookie and redirecting. Previously, the server-side session was never invalidated on logout.
+- `frontend/src/components/common/logout.js` — logout link now clears `sesamefs_auth_token` and all `custom_permissions_*` keys from localStorage on click before following the link.
+- `frontend/src/components/common/account.js` — same fix on the account dropdown logout link.
+
+### Files Changed
+
+- `frontend/nginx.conf` — server block level settings: client_max_body_size, timeouts, sendfile, gzip_vary; per-location: proxy_http_version, proxy_buffering on transfer routes
+- `nginx/nginx.conf.template` — upstream keepalive, rate limit zones, CSP header, frontend location timeouts, client_max_body_size 100G
+- `internal/api/v2/sharelink_view.go` — `fetchBundleManifest()`, 3-level fallback in `NewShareLinkViewHandler`
+- `internal/api/server.go` — `handleLogout` with `InvalidateSession`
+- `frontend/src/components/common/logout.js` — localStorage cleanup on click
+- `frontend/src/components/common/account.js` — localStorage cleanup on click
+- `docker-compose.yaml` — `FRONTEND_URL` env var
+- `docker-compose.prod.yml` — `FRONTEND_URL` env var
+
+---
+
 ## [Unreleased] - 2026-03-25
 
 ### Added — Storage & Traffic Quotas

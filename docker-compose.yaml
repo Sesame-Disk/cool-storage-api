@@ -40,6 +40,7 @@ services:
       - ONLYOFFICE_ENABLED=${ONLYOFFICE_ENABLED:-true}
       - ONLYOFFICE_API_JS_URL=${ONLYOFFICE_API_JS_URL:-http://localhost:8088/web-apps/apps/api/documents/api.js}
       - ONLYOFFICE_JWT_SECRET=${ONLYOFFICE_JWT_SECRET:-change-me-to-a-random-string}
+      - FRONTEND_URL=${FRONTEND_URL:-http://frontend:80}
     depends_on:
       cassandra:
         condition: service_healthy

@@ -262,6 +262,8 @@ sesamefs/
 │   ├── db/                    # Cassandra repository layer
 │   └── models/                # Domain models
 ├── frontend/                  # React web UI
+│   ├── Dockerfile             # Multi-stage: node builder + nginx:alpine runtime
+│   └── nginx.conf             # SPA routing + proxy_pass to Go backend
 ├── nginx/
 │   └── nginx.conf.template    # Nginx config (SSL, proxy, OnlyOffice)
 ├── scripts/                   # Dev/test scripts
@@ -276,13 +278,21 @@ sesamefs/
 
 ---
 
-## Single-Port Architecture
+## Container Architecture
 
-Unlike traditional Seafile which uses multiple ports (8000 for web, 8082 for sync), SesameFS runs everything on a **single port** (default 8080):
-- `/api2/`, `/api/v2/` - REST API
-- `/seafhttp/` - Sync protocol
+Unlike traditional Seafile (multiple ports), SesameFS uses a clean two-container split behind a single nginx entry point:
 
-This is intentional for cloud-native deployments (easier load balancing, K8s, etc.).
+```
+Internet → nginx (TLS, rate limiting)
+               ├── /api2/, /api/v2/, /api/v2.1/, /seafhttp/, /d/, /u/d/, /lib/  → sesamefs (Go :8080)
+               └── /                                                             → frontend (nginx:alpine :80)
+```
+
+- **Go backend** (`sesamefs:8080`): pure API + Seafile sync protocol. No SPA serving.
+- **React frontend** (`frontend:80`): nginx:alpine serving the React build with SPA routing.
+- **Outer nginx**: TLS termination, rate limiting, CSP headers, mobile UA routing.
+
+This is intentional for cloud-native deployments — frontend and backend can be built, scaled, and deployed independently.
 
 ---
 

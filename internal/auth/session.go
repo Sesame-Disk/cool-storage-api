@@ -3,6 +3,7 @@ package auth
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log"
 	"sync"
@@ -13,6 +14,29 @@ import (
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
 	"github.com/golang-jwt/jwt/v5"
 )
+
+var (
+	ErrSessionInvalid  = errors.New("invalid session")
+	ErrSessionNotFound = errors.New("session not found")
+	ErrSessionExpired  = errors.New("session has expired")
+	ErrSessionRevoked  = errors.New("session revoked")
+)
+
+func IsSessionInvalid(err error) bool {
+	return errors.Is(err, ErrSessionInvalid)
+}
+
+func IsSessionNotFound(err error) bool {
+	return errors.Is(err, ErrSessionNotFound)
+}
+
+func IsSessionExpired(err error) bool {
+	return errors.Is(err, ErrSessionExpired)
+}
+
+func IsSessionRevoked(err error) bool {
+	return errors.Is(err, ErrSessionRevoked)
+}
 
 // Session represents an authenticated user session
 type Session struct {
@@ -136,15 +160,29 @@ func (sm *SessionManager) ValidateSession(token string) (*Session, error) {
 			sm.cacheMu.Lock()
 			delete(sm.cache, token)
 			sm.cacheMu.Unlock()
-			return nil, fmt.Errorf("session has expired")
+			return nil, ErrSessionExpired
+		}
+
+		if sm.config.JWTSigningKey != "" {
+			if err := sm.validateRevocableJWTState(token); err != nil {
+				if IsSessionRevoked(err) || IsSessionNotFound(err) {
+					sm.cacheMu.Lock()
+					delete(sm.cache, token)
+					sm.cacheMu.Unlock()
+				}
+				return nil, err
+			}
 		}
 		return session, nil
 	}
 
-	// If using JWT, validate the token directly
+	// If using JWT, validate the token directly then check DB for revocation
 	if sm.config.JWTSigningKey != "" {
 		session, err := sm.validateJWT(token)
 		if err != nil {
+			return nil, err
+		}
+		if err := sm.validateRevocableJWTState(token); err != nil {
 			return nil, err
 		}
 		// Cache the validated session
@@ -161,7 +199,7 @@ func (sm *SessionManager) ValidateSession(token string) (*Session, error) {
 			return nil, err
 		}
 		if time.Now().After(session.ExpiresAt) {
-			return nil, fmt.Errorf("session has expired")
+			return nil, ErrSessionExpired
 		}
 		// Cache the loaded session
 		sm.cacheMu.Lock()
@@ -170,7 +208,22 @@ func (sm *SessionManager) ValidateSession(token string) (*Session, error) {
 		return session, nil
 	}
 
-	return nil, fmt.Errorf("session not found")
+	return nil, ErrSessionNotFound
+}
+
+func (sm *SessionManager) validateRevocableJWTState(token string) error {
+	if sm.db == nil {
+		return nil
+	}
+
+	if _, err := sm.loadSession(token); err != nil {
+		if IsSessionNotFound(err) {
+			return ErrSessionRevoked
+		}
+		return fmt.Errorf("validate revocable session state: %w", err)
+	}
+
+	return nil
 }
 
 // InvalidateSession invalidates a session token
@@ -219,12 +272,12 @@ func (sm *SessionManager) validateJWT(tokenString string) (*Session, error) {
 	})
 
 	if err != nil {
-		return nil, fmt.Errorf("invalid token: %w", err)
+		return nil, fmt.Errorf("%w: %v", ErrSessionInvalid, err)
 	}
 
 	claims, ok := token.Claims.(*SessionClaims)
 	if !ok || !token.Valid {
-		return nil, fmt.Errorf("invalid token claims")
+		return nil, fmt.Errorf("%w: invalid token claims", ErrSessionInvalid)
 	}
 
 	return &Session{
@@ -290,7 +343,10 @@ func (sm *SessionManager) loadSession(token string) (*Session, error) {
 		&session.CreatedAt, &session.ExpiresAt)
 
 	if err != nil {
-		return nil, fmt.Errorf("session not found")
+		if errors.Is(err, gocql.ErrNotFound) {
+			return nil, ErrSessionNotFound
+		}
+		return nil, fmt.Errorf("load session: %w", err)
 	}
 
 	return &session, nil

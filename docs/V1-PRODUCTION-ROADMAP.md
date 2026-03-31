@@ -1,7 +1,7 @@
 # SesameFS v1.0 — Production Readiness Roadmap
 
-**Last updated:** 2026-03-28
-**Current status:** ~80% production-ready (per `IMPLEMENTATION_STATUS.md`)
+**Last updated:** 2026-03-31
+**Current status:** ~82% production-ready (per `IMPLEMENTATION_STATUS.md`)
 
 This document identifies every blocker, high-priority item, and fast-follow task required before
 the v1.0 production launch. Items are classified by priority and include current state analysis,
@@ -127,61 +127,51 @@ directly. The existing logic moves, it does not change.
 
 ---
 
-### 3. Frontend / Backend Separation + Nginx Architecture
+### ~~3. Frontend / Backend Separation + Nginx Architecture~~ — ✅ DONE (2026-03-30/31)
 
-**Current state:** The React SPA is served by the Go binary from `./frontend/build/` on disk
-(not embedded). Go serves `index.html`, `sysadmin.html`, `subscription.html` directly.
-Mobile User-Agent detection logic exists in **both** Go (`isMobileUA()` in `server.go`) and
-Nginx (`$mobile_detect` in `nginx.conf.template`), causing duplication.
+**Implemented:**
+- Go is now a pure API server. All SPA HTML/static serving removed from `internal/api/server.go`.
+  - **Exception (intentional):** Go continues to serve standalone functional HTML for `/d/` (share links),
+    `/u/d/` (upload links), `/lib/` (file viewer), `/onlyoffice/`, and SSO callback/logout.
+    These pages require server-side data injection and are security boundaries — not SPA pages.
+- `frontend/Dockerfile` — multi-stage build: `node:22-bookworm` builder + `nginx:stable-alpine` runtime.
+- `frontend/nginx.conf` — SPA routing (`/sys/`→sysadmin, `/org/`→orgadmin, `/`→index) + proxy_pass for all backend routes.
+- `nginx/nginx.conf.template` — separate upstreams: `sesamefs_api:8080`, `sesamefs_frontend:80`, `sesamefs_mobile:80`.
+- `internal/api/bootstrap.go` — `GET /api/v2.1/bootstrap/` (public) replaces server-side placeholder injection for SPA config.
+- `frontend/src/utils/constants.js` — live bindings (`export let`) for org-admin context; `_updateOrgContext()` called after bootstrap fetch so all importers see the correct `orgID` etc.
+- Mobile UA routing: single authoritative location in `nginx.conf.template` (`$is_mobile` map); Go's `isMobileUA()` removed.
+- `docker-compose.yaml` + `docker-compose.prod.yml` — `frontend` service added with `context: ./frontend`.
 
-**Problems:**
-- A frontend-only change (CSS fix, React update) requires rebuilding and redeploying the Go binary.
-- Static file caching cannot be fully controlled at the Go layer.
-- The `./frontend/build/` path is relative and fragile in production deployments.
-- Two places own mobile routing logic — they can diverge.
-- Go's responsibility should end at the API boundary.
-- The org-admin shell currently injects placeholder `window.org.pageOptions` values (member availability, invite/custom-branding flags, subscription/SAML visibility), which has already caused frontend drift bugs. The split is the right moment to replace HTML placeholder substitution with a cleaner bootstrap/config contract.
+**Production nginx bugs fixed (2026-03-31):**
 
-**Target architecture:**
+| Bug | File | Fix |
+|-----|------|-----|
+| No `client_max_body_size` → nginx default 1MB blocked large API calls | `frontend/nginx.conf` | Added `client_max_body_size 100G` at server block level |
+| No proxy timeouts → 60s default causes 504 on large uploads/downloads | `frontend/nginx.conf` | Added `proxy_read_timeout 3600s`, `proxy_send_timeout 3600s`, `proxy_connect_timeout 30s` at server block level |
+| No `proxy_buffering off` on transfer routes → memory spikes on large files | `frontend/nginx.conf` | Added `proxy_buffering off; proxy_request_buffering off` to `/d/`, `/u/d/`, `/lib/`, `/repo/`, `/seafhttp/` |
+| HTTP/1.0 to backend (no keepalive) | `frontend/nginx.conf` | Added `proxy_http_version 1.1` + `proxy_set_header Connection ""` to all proxy locations |
+| No `sendfile`/`tcp_nopush`/`tcp_nodelay` | `frontend/nginx.conf` | Added at server block level |
+| No `gzip_vary` → CDN/proxy cache corruption | `frontend/nginx.conf` | Added `gzip_vary on; gzip_comp_level 6` |
+| No keepalive on upstreams → new TCP connection per request | `nginx/nginx.conf.template` | Added `keepalive 32/16/8` to all 3 upstream blocks |
+| Missing `proxy_send_timeout` on frontend location | `nginx/nginx.conf.template` | Added `proxy_send_timeout 3600s` |
+| `proxy_connect_timeout 10s` too low | `nginx/nginx.conf.template` | Changed to 30s |
+| Rate limiting file transfers same zone as API calls | `nginx/nginx.conf.template` | New `transfer` zone (20r/s, burst=40) for `/seafhttp/`, `/d/`, `/u/d/`; API zone (100r/s, burst=200) for all other routes |
+| No Content-Security-Policy header | `nginx/nginx.conf.template` | Added CSP header with `unsafe-inline` for share link page injection |
+| Security headers missing `always` flag | `nginx/nginx.conf.template` | Added `always` to all `add_header` directives |
+| `client_max_body_size 20G` | `nginx/nginx.conf.template` | Increased to `100G` |
 
-```
-Internet
-    │
-    ▼
-[Nginx — sole entry point]
-    ├── /                 → upstream: frontend container (nginx:alpine, serves React build)
-    ├── /api/             → upstream: sesamefs container (Go, API only)
-    ├── /api2/            → upstream: sesamefs container
-    ├── /seafhttp/        → upstream: sesamefs container
-    ├── /accounts/        → upstream: sesamefs container (Accounts webhook receiver)
-    └── /metrics          → blocked externally (already done in nginx.conf.template)
+**Bundle coupling fix (2026-03-31):**
+- `internal/api/v2/sharelink_view.go` — `NewShareLinkViewHandler` now fetches `asset-manifest.json`
+  from the frontend container via HTTP at startup (`GET ${FRONTEND_URL}/asset-manifest.json`).
+  3-level fallback: HTTP fetch → filesystem scan → hardcoded hashes.
+  `FRONTEND_URL` env var added to both docker-compose files (default `http://frontend:80`).
 
-TLS termination, rate limiting, security headers → all owned by Nginx (already configured)
-```
-
-**Changes required:**
-
-1. **Remove static file serving from Go** — delete the `./frontend/build/` serving logic in
-   `internal/api/server.go:889-908`. Go becomes a pure API server.
-2. **Create a dedicated frontend container** — `nginx:alpine` image serving the React build.
-   Add `Dockerfile.frontend` alongside `Dockerfile`.
-3. **Remove `isMobileUA()` from Go** — Nginx handles mobile routing. Eliminate the duplicate.
-4. **Update `docker-compose.prod.yml`** — add `frontend` service, update Nginx upstream config.
-5. **Split `Dockerfile`** — current multi-stage build produces one container. Split into
-   `Dockerfile` (Go backend) and `Dockerfile.frontend` (React + nginx:alpine).
-6. **Replace server-side page-option placeholders with a real bootstrap source** — once Go stops serving the SPA shell, org-admin/sysadmin/frontend config should come from a dedicated bootstrap endpoint or static runtime config, not hardcoded HTML string substitution.
-
-**Benefits:**
-- Frontend and backend can be deployed independently.
-- Frontend container can be scaled independently.
-- `Cache-Control` headers for static assets are fully controlled by Nginx without Go involvement.
-- Mobile routing logic lives in exactly one place.
-
-**Key files:**
-- `nginx/nginx.conf.template` — already has the base structure, needs upstream additions
-- `internal/api/server.go:889-908` — static file serving to remove
-- `docker-compose.prod.yml` — add `frontend` service
-- `Dockerfile` — split into backend + frontend
+**Logout localStorage fix (2026-03-31):**
+- `internal/api/server.go` — `handleLogout` now invalidates the server-side session via
+  `SessionManager.InvalidateSession(token)` before clearing the cookie and redirecting.
+- `frontend/src/components/common/logout.js` + `account.js` — logout links now clear
+  `sesamefs_auth_token` and all `custom_permissions_*` keys from localStorage on click,
+  so the SPA does not attempt to reuse a stale token after redirect.
 
 ---
 
@@ -545,7 +535,7 @@ the launch on Glacier since it requires AWS Glacier infrastructure setup and tes
 |---|------|----------|---------------|-----------------|
 | 1 | Accounts ↔ SesameFS Phase 2 | **P0** | Phase 1 done, Phase 2 pending | 2–3 weeks |
 | 2 | Go code reorganization | **P0** | Not started | 3–4 weeks |
-| 3 | Frontend/Backend separation + Nginx | **P0** | Not started | 1 week |
+| 3 | Frontend/Backend separation + Nginx | **P0** | ✅ DONE (2026-03-30/31) | — |
 | 4 | Robust DB migration system | **P0** | Not started | 1 week |
 | 5 | Storage classes & multi-region | **P1** | Infra ready, ~30% | 2 weeks |
 | 6 | Antivirus / malware scanning | **P1** | 0% | 1–2 weeks |
