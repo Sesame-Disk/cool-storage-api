@@ -154,7 +154,7 @@ func (h *OrgAdminHandler) ListOrgDeviceErrors(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{
-		"devices": []gin.H{},
+		"device_errors": []gin.H{},
 		"page_info": gin.H{
 			"current_page":  1,
 			"has_next_page": false,

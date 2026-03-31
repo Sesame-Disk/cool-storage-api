@@ -391,6 +391,43 @@ test_cross_tenant_isolation() {
 }
 
 # =============================================================================
+# Test 6b: Org-Admin Scoped Isolation
+# =============================================================================
+
+test_org_admin_scoped_isolation() {
+    log_section "6b. Org-Admin Scoped Isolation"
+
+    local status=$(api_status "GET" "/api/v2.1/org/${DEFAULT_ORG_ID}/admin/users/" "$ADMIN_TOKEN")
+    run_test "Org admin: list own org users returns 200" "200" "$status"
+
+    status=$(api_status "GET" "/api/v2.1/org/${DEFAULT_ORG_ID}/admin/repos/" "$ADMIN_TOKEN")
+    run_test "Org admin: list own org repos returns 200" "200" "$status"
+
+    status=$(api_status "GET" "/api/v2.1/org/${DEFAULT_ORG_ID}/admin/devices-errors/" "$ADMIN_TOKEN")
+    run_test "Org admin: list own org device errors returns 200" "200" "$status"
+
+    if [ -n "$TENANT_ORG_ID" ]; then
+        status=$(api_status "GET" "/api/v2.1/org/${TENANT_ORG_ID}/admin/users/" "$ADMIN_TOKEN")
+        run_test "Org admin: list another org users returns 403" "403" "$status"
+
+        status=$(api_status "GET" "/api/v2.1/org/${TENANT_ORG_ID}/admin/repos/" "$ADMIN_TOKEN")
+        run_test "Org admin: list another org repos returns 403" "403" "$status"
+
+        status=$(api_status "GET" "/api/v2.1/org/${TENANT_ORG_ID}/admin/devices-errors/" "$ADMIN_TOKEN")
+        run_test "Org admin: list another org device errors returns 403" "403" "$status"
+    fi
+
+    status=$(api_status "GET" "/api/v2.1/org/${PLATFORM_ORG_ID}/admin/users/" "$ADMIN_TOKEN")
+    run_test "Org admin: list platform org users returns 403" "403" "$status"
+
+    status=$(api_status "GET" "/api/v2.1/org/${PLATFORM_ORG_ID}/admin/repos/" "$ADMIN_TOKEN")
+    run_test "Org admin: list platform org repos returns 403" "403" "$status"
+
+    status=$(api_status "GET" "/api/v2.1/org/${PLATFORM_ORG_ID}/admin/devices-errors/" "$ADMIN_TOKEN")
+    run_test "Org admin: list platform org device errors returns 403" "403" "$status"
+}
+
+# =============================================================================
 # Test 7: Role Hierarchy in Account Info
 # =============================================================================
 
@@ -614,6 +651,7 @@ main() {
     test_user_management_superadmin
     test_tenant_admin_management
     test_cross_tenant_isolation
+    test_org_admin_scoped_isolation
     test_role_hierarchy_account_info
     test_platform_org_protection
     test_user_update

@@ -8,14 +8,9 @@ import EmptyTip from '../../../components/empty-tip';
 import moment from 'moment';
 import Loading from '../../../components/loading';
 import Paginator from '../../../components/paginator';
-import SysAdminUnlinkDevice from '../../../components/dialog/sysadmin-dialog/sysadmin-unlink-device-dialog';
+import ConfirmUnlinkDeviceDialog from '../../../components/dialog/confirm-unlink-device';
 
 class Content extends Component {
-
-  constructor(props) {
-    super(props);
-  }
-
   getPreviousPageDevicesList = () => {
     this.props.getDevicesListByPage(this.props.pageInfo.current_page - 1);
   };
@@ -94,11 +89,11 @@ class Item extends Component {
   }
 
   handleMouseOver = () => {
-    this.setState({isOpIconShown: true});
+    this.setState({ isOpIconShown: true });
   };
 
   handleMouseOut = () => {
-    this.setState({isOpIconShown: false});
+    this.setState({ isOpIconShown: false });
   };
 
   handleUnlink = (e) => {
@@ -111,13 +106,13 @@ class Item extends Component {
   };
 
   toggleUnlinkDeviceDialog = () => {
-    this.setState({isUnlinkDeviceDialogOpen: !this.state.isUnlinkDeviceDialogOpen});
+    this.setState({ isUnlinkDeviceDialogOpen: !this.state.isUnlinkDeviceDialogOpen });
   };
 
   unlinkDevice = (deleteFiles) => {
     const { platform, device_id, user } = this.props.item;
     seafileAPI.orgAdminUnlinkDevice(orgID, platform, device_id, user, deleteFiles).then((res) => {
-      this.setState({unlinked: true});
+      this.setState({ unlinked: true });
       let message = gettext('Successfully unlinked the device.');
       toaster.success(message);
     }).catch((error) => {
@@ -145,12 +140,18 @@ class Item extends Component {
             <span title={moment(item.last_accessed).format('llll')}>{moment(item.last_accessed).fromNow()}</span>
           </td>
           <td>
-            <a href="#" className={`sf2-icon-delete action-icon ${isOpIconShown ? '' : 'invisible'}`} title={gettext('Unlink')} onClick={this.handleUnlink}></a>
+            <button
+              type="button"
+              className={`sf2-icon-delete action-icon btn btn-link p-0 border-0 ${isOpIconShown ? '' : 'invisible'}`}
+              title={gettext('Unlink')}
+              aria-label={gettext('Unlink')}
+              onClick={this.handleUnlink}
+            ></button>
           </td>
         </tr>
         {isUnlinkDeviceDialogOpen &&
-          <SysAdminUnlinkDevice
-            unlinkDevice={this.unlinkDevice}
+          <ConfirmUnlinkDeviceDialog
+            executeOperation={this.unlinkDevice}
             toggleDialog={this.toggleUnlinkDeviceDialog}
           />
         }
@@ -176,7 +177,7 @@ class DevicesByPlatform extends Component {
     };
   }
 
-  componentDidMount () {
+  componentDidMount() {
     let urlParams = (new URL(window.location)).searchParams;
     const { currentPage = 1, perPage } = this.state;
     this.setState({

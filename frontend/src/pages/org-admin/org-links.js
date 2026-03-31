@@ -12,7 +12,7 @@ import Loading from '../../components/loading';
 import Paginator from '../../components/paginator';
 import MainPanelTopbar from './main-panel-topbar';
 import ShareAdminLinkEnhanced from '../../components/dialog/share-admin-link-enhanced';
-import Search from '../sys-admin/search';
+import Search from '../../components/search-input';
 
 class OrgLinks extends React.Component {
 

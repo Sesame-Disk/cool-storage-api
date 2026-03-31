@@ -2,24 +2,18 @@ import React, { Component, Fragment } from 'react';
 import PropTypes from 'prop-types';
 import { Button } from 'reactstrap';
 import { seafileAPI } from '../../../utils/seafile-api';
-import { siteRoot, gettext, orgID } from '../../../utils/constants';
+import { gettext, orgID } from '../../../utils/constants';
 import toaster from '../../../components/toast';
 import { Utils } from '../../../utils/utils';
 import EmptyTip from '../../../components/empty-tip';
 import moment from 'moment';
 import Loading from '../../../components/loading';
-import { Link } from '@gatsbyjs/reach-router';
 import DevicesNav from './devices-nav';
 import MainPanelTopbar from '../main-panel-topbar';
 import UserLink from '../user-link';
 import Paginator from '../../../components/paginator';
 
 class Content extends Component {
-
-  constructor(props) {
-    super(props);
-  }
-
   getPreviousPageDeviceErrorsList = () => {
     this.props.getDeviceErrorsListByPage(this.props.pageInfo.current_page - 1);
   };
@@ -94,11 +88,11 @@ class Item extends Component {
   }
 
   handleMouseOver = () => {
-    this.setState({isOpIconShown: true});
+    this.setState({ isOpIconShown: true });
   };
 
   handleMouseOut = () => {
-    this.setState({isOpIconShown: false});
+    this.setState({ isOpIconShown: false });
   };
 
   render() {
@@ -108,7 +102,7 @@ class Item extends Component {
         <td><UserLink email={item.email} name={item.name} /></td>
         <td>{item.device_name}{' / '}{item.client_version}</td>
         <td>{item.device_ip}</td>
-        <td><Link to={`${siteRoot}sysadmin/#libs/${item.repo_id}`}>{item.repo_name}</Link></td>
+        <td><span title={item.repo_id || item.repo_name}>{item.repo_name}</span></td>
         <td>{item.error_msg}</td>
         <td>
           <span className="item-meta-info" title={moment(item.last_accessed).format('llll')}>{moment(item.error_time).fromNow()}</span>
@@ -136,7 +130,7 @@ class OrgDevicesErrors extends Component {
     };
   }
 
-  componentDidMount () {
+  componentDidMount() {
     let urlParams = (new URL(window.location)).searchParams;
     const { currentPage = 1, perPage } = this.state;
     this.setState({
@@ -154,7 +148,7 @@ class OrgDevicesErrors extends Component {
         loading: false,
         devicesErrors: res.data.device_errors,
         pageInfo: res.data.page_info,
-        isCleanBtnShown: res.data.length > 0
+        isCleanBtnShown: res.data.device_errors.length > 0
       });
     }).catch((error) => {
       this.setState({

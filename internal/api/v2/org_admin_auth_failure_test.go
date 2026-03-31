@@ -134,6 +134,22 @@ func TestOrgAdminRequireOrgAccess_CrossOrgForbidden(t *testing.T) {
 			},
 		},
 		{
+			name:   "delete repo org B rejected for admin of org A",
+			method: http.MethodDelete,
+			path:   "/org/" + orgB + "/admin/repos/repo-b/",
+			setup: func(r *gin.Engine) {
+				r.DELETE("/org/:org_id/admin/repos/:rid/", h.DeleteOrgRepo)
+			},
+		},
+		{
+			name:   "get saml config org B rejected for admin of org A",
+			method: http.MethodGet,
+			path:   "/org/" + orgB + "/admin/saml-config/",
+			setup: func(r *gin.Engine) {
+				r.GET("/org/:org_id/admin/saml-config/", h.GetOrgSAMLConfig)
+			},
+		},
+		{
 			// ListOrgLinks uses c.GetString("org_id") from the auth context (always
 			// the caller's own org), so cross-org cannot be attempted via the URL.
 			// ClearOrgDeviceErrors uses requireOrgAccess with c.Param("org_id") and
@@ -174,5 +190,50 @@ func TestOrgAdminRequireOrgAccess_CrossOrgForbidden(t *testing.T) {
 				t.Fatalf("error = %v, want %q", payload["error"], "insufficient permissions")
 			}
 		})
+	}
+}
+
+func TestOrgAdminListDeviceErrors_ResponseShape(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	const orgID = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+	const adminUser = "user-admin-a"
+
+	h := &OrgAdminHandler{
+		permMiddleware: &fixedRoleGetter{orgID: orgID, role: middleware.RoleAdmin},
+	}
+
+	r := gin.New()
+	r.Use(injectIdentity(orgID, adminUser))
+	r.GET("/org/:org_id/admin/devices-errors/", h.ListOrgDeviceErrors)
+
+	req, err := http.NewRequest(http.MethodGet, "/org/"+orgID+"/admin/devices-errors/", nil)
+	if err != nil {
+		t.Fatalf("failed to build request: %v", err)
+	}
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d, body=%s", w.Code, http.StatusOK, w.Body.String())
+	}
+
+	var payload map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("response is not valid JSON: %v", err)
+	}
+
+	if _, ok := payload["device_errors"]; !ok {
+		t.Fatalf("response missing device_errors key: %v", payload)
+	}
+	if _, ok := payload["devices"]; ok {
+		t.Fatalf("response must not expose legacy devices key: %v", payload)
+	}
+	if _, ok := payload["page_info"]; !ok {
+		t.Fatalf("response missing page_info key: %v", payload)
+	}
+	if _, ok := payload["device_errors"].([]interface{}); !ok {
+		t.Fatalf("device_errors = %T, want array", payload["device_errors"])
 	}
 }

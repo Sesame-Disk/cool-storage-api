@@ -8,7 +8,7 @@ import UserInfo from './user-content/user-info';
 import UserRepos from './user-content/user-repos';
 import UserGroups from './user-content/user-groups';
 import { gettext, siteRoot } from '../../utils/constants';
-import Search from '../sys-admin/search';
+import Search from '../../components/search-input';
 import UserListSearch from './user-list-search';
 
 export default function MainPanel(props) {
