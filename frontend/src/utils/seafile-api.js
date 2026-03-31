@@ -1761,6 +1761,27 @@ seafileAPI.orgAdminListPermAudit = function (orgID, email, repoID, page) {
   return this.req.get(url);
 };
 
+// Sys Admin: list devices (platform-wide)
+seafileAPI.sysAdminListDevices = function (platform, page, perPage) {
+  let url = this.server + '/api/v2.1/admin/devices/?page=' + (page || 1);
+  if (platform) url += '&platform=' + platform;
+  if (perPage) url += '&per_page=' + perPage;
+  return this.req.get(url);
+};
+
+// Sys Admin: list device errors (platform-wide)
+seafileAPI.sysAdminListDeviceErrors = function (page, perPage) {
+  let url = this.server + '/api/v2.1/admin/device-errors/?page=' + (page || 1);
+  if (perPage) url += '&per_page=' + perPage;
+  return this.req.get(url);
+};
+
+// Sys Admin: clear all device errors (platform-wide)
+seafileAPI.sysAdminClearDeviceErrors = function () {
+  let url = this.server + '/api/v2.1/admin/device-errors/';
+  return this.req.delete(url);
+};
+
 // Org Admin: list devices
 seafileAPI.orgAdminListDevices = function (orgID, platform, page, perPage) {
   let url = this.server + '/api/v2.1/org/' + orgID + '/admin/devices/?page=' + (page || 1);
@@ -1780,6 +1801,12 @@ seafileAPI.orgAdminListDevicesErrors = function (orgID, page, perPage) {
   let url = this.server + '/api/v2.1/org/' + orgID + '/admin/devices-errors/?page=' + (page || 1);
   if (perPage) url += '&per_page=' + perPage;
   return this.req.get(url);
+};
+
+// Org Admin: clear all device errors
+seafileAPI.orgAdminClearDeviceErrors = function (orgID) {
+  let url = this.server + '/api/v2.1/org/' + orgID + '/admin/devices-errors/';
+  return this.req.delete(url);
 };
 
 // Org Admin: get SAML config

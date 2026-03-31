@@ -162,4 +162,14 @@ func (h *OrgAdminHandler) ListOrgDeviceErrors(c *gin.Context) {
 	})
 }
 
+// ClearOrgDeviceErrors is a no-op (no device tracking table yet).
+// DELETE /org/:org_id/admin/devices-errors/
+func (h *OrgAdminHandler) ClearOrgDeviceErrors(c *gin.Context) {
+	targetOrgID := c.Param("org_id")
+	if err := h.requireOrgAccess(c, targetOrgID); err != nil {
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true})
+}
+
 // ============================================================================

@@ -165,7 +165,7 @@ class OrgDevicesErrors extends Component {
   };
 
   clean = () => {
-    seafileAPI.sysAdminClearDeviceErrors().then((res) => {
+    seafileAPI.orgAdminClearDeviceErrors(orgID).then((_res) => {
       this.setState({
         devicesErrors: [],
         isCleanBtnShown: false

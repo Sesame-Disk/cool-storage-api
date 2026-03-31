@@ -15,13 +15,20 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+// orgRoleGetter is the minimal interface for role lookups used by
+// OrgAdminHandler. *middleware.PermissionMiddleware satisfies it in
+// production; test doubles can implement it without a real database.
+type orgRoleGetter interface {
+	GetUserOrgRole(orgID, userID string) (middleware.OrganizationRole, error)
+}
+
 // OrgAdminHandler handles org-scoped admin API requests.
 // These endpoints are accessed by org admins managing their own organisation
 // and are distinct from the platform-admin endpoints under /api/v2.1/admin/.
 type OrgAdminHandler struct {
 	db             *db.DB
 	config         *config.Config
-	permMiddleware *middleware.PermissionMiddleware
+	permMiddleware orgRoleGetter
 	sessions       SessionInvalidator
 }
 

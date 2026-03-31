@@ -109,6 +109,7 @@ func registerOrgAdminDeviceRoutes(idGroup *gin.RouterGroup, h *OrgAdminHandler) 
 	registerGetWithSlashVariants(idGroup, "/devices", h.ListOrgDevices)
 	registerDeleteWithSlashVariants(idGroup, "/devices", h.UnlinkOrgDevice)
 	registerGetWithSlashVariants(idGroup, "/devices-errors", h.ListOrgDeviceErrors)
+	registerDeleteWithSlashVariants(idGroup, "/devices-errors", h.ClearOrgDeviceErrors)
 }
 
 func registerOrgAdminSettingsRoutes(idGroup *gin.RouterGroup, h *OrgAdminHandler) {
