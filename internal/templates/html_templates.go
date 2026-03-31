@@ -74,23 +74,6 @@ type FilePreviewData struct {
 	PreviewContent template.HTML // pre-built HTML snippet, trusted
 }
 
-// SharePreviewData holds data for share_file_preview.html (shared link file preview with "Shared by")
-type SharePreviewData struct {
-	Filename       string
-	SharedBy       string
-	DownloadBtn    template.HTML // pre-built download button HTML or empty
-	PreviewContent template.HTML
-}
-
-// ShareOOPreviewData holds data for share_onlyoffice_preview.html
-type ShareOOPreviewData struct {
-	Filename    string
-	SharedBy    string
-	DownloadBtn template.HTML
-	APIJSURL    string
-	ConfigJSON  template.JS
-}
-
 // OnlyOfficeData holds data for onlyoffice_editor.html
 type OnlyOfficeData struct {
 	Filename   string
@@ -108,14 +91,6 @@ type ErrorPageData struct {
 type AccessDeniedData struct {
 	Title   string
 	Message string
-}
-
-// SharePageData holds data for share_page.html and upload_link_page.html
-type SharePageData struct {
-	Title           string
-	CSSLinks        []string
-	ScriptTags      []string
-	PageOptionsJSON template.JS // raw JSON injected into window.shared or window.uploadLink
 }
 
 // LoginSuccessData holds data for login_success.html

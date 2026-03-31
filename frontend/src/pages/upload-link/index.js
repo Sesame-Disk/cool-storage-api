@@ -41,9 +41,11 @@ class SharedUploadLink extends React.Component {
         </div>
         <div className="o-auto">
           <div className="py-4 px-6 mx-auto rounded" id="upload-link-panel">
-            <h3 className="h5 d-flex text-nowrap" dangerouslySetInnerHTML={{__html: gettext('Upload files to {folder_name_placeholder}')
-              .replace('{folder_name_placeholder}', `<span class="op-target text-truncate mx-1">${Utils.HTMLescape(dirName)}</span>`)}}></h3>
-            <p className="small shared-by" dangerouslySetInnerHTML={{__html: `${gettext('shared by:')} ${sharedBy.avatar} ${sharedBy.name}`}}></p>
+            <h3 className="h5 d-flex text-nowrap" dangerouslySetInnerHTML={{
+              __html: gettext('Upload files to {folder_name_placeholder}')
+                .replace('{folder_name_placeholder}', `<span class="op-target text-truncate mx-1">${Utils.HTMLescape(dirName)}</span>`)
+            }}></h3>
+            <p className="small shared-by" dangerouslySetInnerHTML={{ __html: `${gettext('shared by:')} ${sharedBy.avatar} ${sharedBy.name}` }}></p>
             {noQuota ? (
               <div className="py-6 text-center">
                 <span className="sf3-font sf3-font-tips warning-icon"></span>
@@ -74,7 +76,7 @@ class SharedUploadLink extends React.Component {
 }
 
 if (needPassword) {
-  ReactDom.render(<SharedLinkPasswordDialog token={token} tokenType="u/d" />, document.getElementById('wrapper'));
+  ReactDom.render(<SharedLinkPasswordDialog token={token} />, document.getElementById('wrapper'));
 } else {
   ReactDom.render(<SharedUploadLink />, document.getElementById('wrapper'));
 }

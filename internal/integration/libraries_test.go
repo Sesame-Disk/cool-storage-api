@@ -65,15 +65,7 @@ func TestRenameLibrary(t *testing.T) {
 
 func TestDeleteLibrary(t *testing.T) {
 	name := fmt.Sprintf("inttest-delete-%d", time.Now().UnixNano())
-
-	// Create library (don't use helper since we'll delete it ourselves)
-	body := map[string]string{"repo_name": name}
-	createResp := adminClient.PostJSON(t, "/api/v2.1/repos/", body)
-	expectStatus(t, createResp, http.StatusOK)
-
-	var createResult map[string]interface{}
-	decodeJSON(t, createResp, &createResult)
-	repoID := createResult["repo_id"].(string)
+	repoID := createDisposableTestLibrary(t, adminClient, name)
 
 	// Delete it
 	delResp := adminClient.Delete(t, fmt.Sprintf("/api/v2.1/repos/%s/", repoID))
@@ -123,15 +115,7 @@ func TestEncryptedLibrary(t *testing.T) {
 		"encrypted": true,
 		"passwd":    "test-password-123",
 	}
-	createResp := adminClient.PostJSON(t, "/api/v2.1/repos/", body)
-	expectStatus(t, createResp, http.StatusOK)
-
-	var createResult map[string]interface{}
-	decodeJSON(t, createResp, &createResult)
-	repoID, ok := createResult["repo_id"].(string)
-	if !ok || repoID == "" {
-		t.Fatal("failed to create encrypted library")
-	}
+	repoID := createLibraryWithBody(t, adminClient, name, body, false)
 
 	t.Cleanup(func() {
 		delResp := adminClient.Delete(t, fmt.Sprintf("/api/v2.1/repos/%s/", repoID))

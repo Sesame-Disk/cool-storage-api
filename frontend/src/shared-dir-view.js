@@ -74,7 +74,7 @@ class SharedDirView extends React.Component {
     };
   }
 
-  componentDidMount() {
+  componentDidMount = () => {
     if (trafficOverLimit) {
       toaster.danger(gettext('File download is disabled: the share link traffic of owner is used up.'), {
         duration: 3
@@ -103,473 +103,473 @@ class SharedDirView extends React.Component {
     this.getShareLinkRepoTags();
   }
 
-  sortItems = (sortBy, sortOrder) => {
+sortItems = (sortBy, sortOrder) => {
+  this.setState({
+    sortBy: sortBy,
+    sortOrder: sortOrder,
+    items: Utils.sortDirentsInSharedDir(this.state.items, sortBy, sortOrder)
+  });
+};
+
+getThumbnails = () => {
+  let items = this.state.items.filter((item) => {
+    return !item.is_dir &&
+      (Utils.imageCheck(item.file_name) ||
+        (enableVideoThumbnail && Utils.videoCheck(item.file_name))) &&
+      !item.encoded_thumbnail_src;
+  });
+  if (items.length === 0) {
+    return;
+  }
+
+  const len = items.length;
+  const _this = this;
+  let getThumbnail = function (i) {
+    const curItem = items[i];
+    seafileAPI.getShareLinkThumbnail(token, curItem.file_path, thumbnailSize).then((res) => {
+      curItem.encoded_thumbnail_src = res.data.encoded_thumbnail_src;
+    }).catch((error) => {
+      // do nothing
+    }).then(() => {
+      if (i < len - 1) {
+        getThumbnail(++i);
+      } else {
+        // when done, `setState()`
+        _this.setState({
+          items: _this.state.items
+        });
+      }
+    });
+  };
+  getThumbnail(0);
+};
+
+renderPath = () => {
+  return (
+    <React.Fragment>
+      {zipped.map((item, index) => {
+        if (index !== zipped.length - 1) {
+          return (
+            <React.Fragment key={index}>
+              <a href={`?p=${encodeURIComponent(item.path)}&mode=${mode}`} className="mx-1 ellipsis" title={item.name}>{item.name}</a>
+              <span> / </span>
+            </React.Fragment>
+          );
+        }
+        return null;
+      })
+      }
+      <span className="ml-1 ellipsis" title={zipped[zipped.length - 1].name}>{zipped[zipped.length - 1].name}</span>
+    </React.Fragment>
+  );
+};
+
+zipDownloadFolder = (folderPath) => {
+  if (!useGoFileserver) {
     this.setState({
-      sortBy: sortBy,
-      sortOrder: sortOrder,
-      items: Utils.sortDirentsInSharedDir(this.state.items, sortBy, sortOrder)
+      isZipDialogOpen: true,
+      zipFolderPath: folderPath
     });
-  };
-
-  getThumbnails = () => {
-    let items = this.state.items.filter((item) => {
-      return !item.is_dir &&
-        (Utils.imageCheck(item.file_name) ||
-          (enableVideoThumbnail && Utils.videoCheck(item.file_name))) &&
-        !item.encoded_thumbnail_src;
+  }
+  else {
+    seafileAPI.getShareLinkZipTask(token, folderPath).then((res) => {
+      const zipToken = res.data['zip_token'];
+      location.href = `${fileServerRoot}zip/${zipToken}`;
+    }).catch((error) => {
+      let errorMsg = Utils.getErrorMsg(error);
+      this.setState({
+        isLoading: false,
+        errorMsg: errorMsg
+      });
     });
-    if (items.length === 0) {
-      return;
-    }
+  }
+};
 
-    const len = items.length;
-    const _this = this;
-    let getThumbnail = function (i) {
-      const curItem = items[i];
-      seafileAPI.getShareLinkThumbnail(token, curItem.file_path, thumbnailSize).then((res) => {
-        curItem.encoded_thumbnail_src = res.data.encoded_thumbnail_src;
-      }).catch((error) => {
-        // do nothing
-      }).then(() => {
-        if (i < len - 1) {
-          getThumbnail(++i);
-        } else {
-          // when done, `setState()`
-          _this.setState({
-            items: _this.state.items
-          });
-        }
-      });
-    };
-    getThumbnail(0);
-  };
-
-  renderPath = () => {
-    return (
-      <React.Fragment>
-        {zipped.map((item, index) => {
-          if (index !== zipped.length - 1) {
-            return (
-              <React.Fragment key={index}>
-                <a href={`?p=${encodeURIComponent(item.path)}&mode=${mode}`} className="mx-1 ellipsis" title={item.name}>{item.name}</a>
-                <span> / </span>
-              </React.Fragment>
-            );
-          }
-          return null;
-        })
-        }
-        <span className="ml-1 ellipsis" title={zipped[zipped.length - 1].name}>{zipped[zipped.length - 1].name}</span>
-      </React.Fragment>
-    );
-  };
-
-  zipDownloadFolder = (folderPath) => {
-    if (!useGoFileserver) {
+zipDownloadSelectedItems = () => {
+  if (!useGoFileserver) {
+    this.setState({
+      isZipDialogOpen: true,
+      zipFolderPath: relativePath,
+      selectedItems: this.state.items.filter(item => item.isSelected)
+        .map(item => item.file_name || item.folder_name)
+    });
+  }
+  else {
+    let target = this.state.items.filter(item => item.isSelected).map(item => item.file_name || item.folder_name);
+    seafileAPI.getShareLinkDirentsZipTask(token, relativePath, target).then((res) => {
+      const zipToken = res.data['zip_token'];
+      location.href = `${fileServerRoot}zip/${zipToken}`;
+    }).catch((error) => {
+      let errorMsg = Utils.getErrorMsg(error);
       this.setState({
-        isZipDialogOpen: true,
-        zipFolderPath: folderPath
+        isLoading: false,
+        errorMsg: errorMsg
       });
-    }
-    else {
-      seafileAPI.getShareLinkZipTask(token, folderPath).then((res) => {
-        const zipToken = res.data['zip_token'];
-        location.href = `${fileServerRoot}zip/${zipToken}`;
-      }).catch((error) => {
-        let errorMsg = Utils.getErrorMsg(error);
-        this.setState({
-          isLoading: false,
-          errorMsg: errorMsg
-        });
-      });
-    }
-  };
-
-  zipDownloadSelectedItems = () => {
-    if (!useGoFileserver) {
-      this.setState({
-        isZipDialogOpen: true,
-        zipFolderPath: relativePath,
-        selectedItems: this.state.items.filter(item => item.isSelected)
-          .map(item => item.file_name || item.folder_name)
-      });
-    }
-    else {
-      let target = this.state.items.filter(item => item.isSelected).map(item => item.file_name || item.folder_name);
-      seafileAPI.getShareLinkDirentsZipTask(token, relativePath, target).then((res) => {
-        const zipToken = res.data['zip_token'];
-        location.href = `${fileServerRoot}zip/${zipToken}`;
-      }).catch((error) => {
-        let errorMsg = Utils.getErrorMsg(error);
-        this.setState({
-          isLoading: false,
-          errorMsg: errorMsg
-        });
-      });
-    }
-  };
+    });
+  }
+};
 
   async getAsyncCopyMoveProgress() {
-    let { asyncCopyMoveTaskId } = this.state;
-    try {
-      let res = await seafileAPI.queryAsyncOperationProgress(asyncCopyMoveTaskId);
-      let data = res.data;
-      if (data.failed) {
-        let message = gettext('Failed to copy files to another library.');
-        toaster.danger(message);
-        this.setState({
-          asyncOperationProgress: 0,
-          isCopyMoveProgressDialogShow: false,
-        });
-        return;
-      }
-
-      if (data.successful) {
-        this.setState({
-          asyncOperationProgress: 0,
-          isCopyMoveProgressDialogShow: false,
-        });
-        let message = gettext('Successfully copied files to another library.');
-        toaster.success(message);
-        return;
-      }
-      // init state: total is 0
-      let asyncOperationProgress = !data.total ? 0 : parseInt((data.done / data.total * 100).toFixed(2));
-
-      this.getAsyncCopyMoveProgress();
-      this.setState({ asyncOperationProgress: asyncOperationProgress });
-    } catch (error) {
+  let { asyncCopyMoveTaskId } = this.state;
+  try {
+    let res = await seafileAPI.queryAsyncOperationProgress(asyncCopyMoveTaskId);
+    let data = res.data;
+    if (data.failed) {
+      let message = gettext('Failed to copy files to another library.');
+      toaster.danger(message);
       this.setState({
         asyncOperationProgress: 0,
         isCopyMoveProgressDialogShow: false,
       });
+      return;
     }
-  }
 
-  saveSelectedItems = () => {
-    this.setState({
-      isSaveSharedDirDialogShow: true,
-      itemsForSave: this.state.items.filter(item => item.isSelected)
-        .map(item => item.file_name || item.folder_name)
-    });
-  };
-
-  saveAllItems = () => {
-    this.setState({
-      isSaveSharedDirDialogShow: true,
-      itemsForSave: this.state.items
-        .map(item => item.file_name || item.folder_name)
-    });
-  };
-
-  toggleSaveSharedDirCancel = () => {
-    this.setState({
-      isSaveSharedDirDialogShow: false,
-      itemsForSave: []
-    });
-  };
-
-  handleSaveSharedDir = (destRepoID, dstPath) => {
-
-    const itemsForSave = this.state.itemsForSave;
-
-    seafileAPI.saveSharedDir(destRepoID, dstPath, token, relativePath, itemsForSave).then((res) => {
+    if (data.successful) {
       this.setState({
-        isSaveSharedDirDialogShow: false,
-        itemsForSave: [],
-        isCopyMoveProgressDialogShow: true,
-        asyncCopyMoveTaskId: res.data.task_id,
-        asyncOperatedFilesLength: itemsForSave.length,
-      }, () => {
-        this.getAsyncCopyMoveProgress();
+        asyncOperationProgress: 0,
+        isCopyMoveProgressDialogShow: false,
       });
-    }).catch((error) => {
-      let errMessage = Utils.getErrorMsg(error);
-      this.setState({ errMessage: errMessage });
-    });
-  };
-
-  onProgressDialogToggle = () => {
-    let { asyncOperationProgress } = this.state;
-    if (asyncOperationProgress !== 100) {
-      let taskId = this.state.asyncCopyMoveTaskId;
-      seafileAPI.cancelCopyMoveOperation(taskId);
+      let message = gettext('Successfully copied files to another library.');
+      toaster.success(message);
+      return;
     }
+    // init state: total is 0
+    let asyncOperationProgress = !data.total ? 0 : parseInt((data.done / data.total * 100).toFixed(2));
 
+    this.getAsyncCopyMoveProgress();
+    this.setState({ asyncOperationProgress: asyncOperationProgress });
+  } catch (error) {
     this.setState({
       asyncOperationProgress: 0,
       isCopyMoveProgressDialogShow: false,
     });
-  };
+  }
+}
 
-  closeZipDialog = () => {
+saveSelectedItems = () => {
+  this.setState({
+    isSaveSharedDirDialogShow: true,
+    itemsForSave: this.state.items.filter(item => item.isSelected)
+      .map(item => item.file_name || item.folder_name)
+  });
+};
+
+saveAllItems = () => {
+  this.setState({
+    isSaveSharedDirDialogShow: true,
+    itemsForSave: this.state.items
+      .map(item => item.file_name || item.folder_name)
+  });
+};
+
+toggleSaveSharedDirCancel = () => {
+  this.setState({
+    isSaveSharedDirDialogShow: false,
+    itemsForSave: []
+  });
+};
+
+handleSaveSharedDir = (destRepoID, dstPath) => {
+
+  const itemsForSave = this.state.itemsForSave;
+
+  seafileAPI.saveSharedDir(destRepoID, dstPath, token, relativePath, itemsForSave).then((res) => {
     this.setState({
-      isZipDialogOpen: false,
-      zipFolderPath: '',
-      selectedItems: []
-    });
-  };
-
-  // for image popup
-  prepareImageItem = (item) => {
-    const name = item.file_name;
-    const fileURL = `${siteRoot}d/${token}/files/?p=${encodeURIComponent(item.file_path)}`;
-    // Use raw file content URL for all image types (no thumbnail backend available)
-    const src = `${fileURL}&raw=1`;
-
-    return {
-      'name': name,
-      'url': fileURL,
-      'src': src
-    };
-  };
-
-  showImagePopup = (curItem) => {
-    const items = this.state.items.filter((item) => {
-      return !item.is_dir && Utils.imageCheck(item.file_name);
-    });
-    const imageItems = items.map((item) => {
-      return this.prepareImageItem(item);
-    });
-
-    this.setState({
-      isImagePopupOpen: true,
-      imageItems: imageItems,
-      imageIndex: items.indexOf(curItem)
-    });
-  };
-
-  closeImagePopup = () => {
-    this.setState({
-      isImagePopupOpen: false
-    });
-  };
-
-  moveToPrevImage = () => {
-    const imageItemsLength = this.state.imageItems.length;
-    this.setState((prevState) => ({
-      imageIndex: (prevState.imageIndex + imageItemsLength - 1) % imageItemsLength
-    }));
-  };
-
-  moveToNextImage = () => {
-    const imageItemsLength = this.state.imageItems.length;
-    this.setState((prevState) => ({
-      imageIndex: (prevState.imageIndex + 1) % imageItemsLength
-    }));
-  };
-
-  toggleAllSelected = () => {
-    this.setState((prevState) => ({
-      isAllItemsSelected: !prevState.isAllItemsSelected,
-      items: this.state.items.map((item) => {
-        item.isSelected = !prevState.isAllItemsSelected;
-        return item;
-      })
-    }));
-  };
-
-  toggleItemSelected = (targetItem, isSelected) => {
-    this.setState({
-      items: this.state.items.map((item) => {
-        if (item === targetItem) {
-          item.isSelected = isSelected;
-        }
-        return item;
-      })
+      isSaveSharedDirDialogShow: false,
+      itemsForSave: [],
+      isCopyMoveProgressDialogShow: true,
+      asyncCopyMoveTaskId: res.data.task_id,
+      asyncOperatedFilesLength: itemsForSave.length,
     }, () => {
-      this.setState({
-        isAllItemsSelected: !this.state.items.some(item => !item.isSelected)
-      });
+      this.getAsyncCopyMoveProgress();
     });
-  };
+  }).catch((error) => {
+    let errMessage = Utils.getErrorMsg(error);
+    this.setState({ errMessage: errMessage });
+  });
+};
 
-  onUploadFile = (e) => {
-    e.nativeEvent.stopImmediatePropagation();
-    this.uploader.onFileUpload();
-  };
+onProgressDialogToggle = () => {
+  let { asyncOperationProgress } = this.state;
+  if (asyncOperationProgress !== 100) {
+    let taskId = this.state.asyncCopyMoveTaskId;
+    seafileAPI.cancelCopyMoveOperation(taskId);
+  }
 
-  onFileUploadSuccess = (direntObject) => {
-    const { name, size } = direntObject;
-    const newItem = {
-      isSelected: false,
-      file_name: name,
-      file_path: Utils.joinPath(relativePath, name),
-      is_dir: false,
-      last_modified: moment().format(),
-      size: size
-    };
-    const folderItems = this.state.items.filter(item => { return item.is_dir; });
-    // put the new file as the first file
-    let items = Array.from(this.state.items);
-    items.splice(folderItems.length, 0, newItem);
-    this.setState({ items: items });
-    seafileAPI.shareLinksUploadDone(token, Utils.joinPath(dirPath, name));
-  };
+  this.setState({
+    asyncOperationProgress: 0,
+    isCopyMoveProgressDialogShow: false,
+  });
+};
 
-  getShareLinkRepoTags = () => {
-    seafileAPI.getShareLinkRepoTags(token).then(res => {
-      let usedRepoTags = [];
-      res.data.repo_tags.forEach(item => {
-        let usedRepoTag = new RepoTag(item);
-        if (usedRepoTag.fileCount > 0) {
-          usedRepoTags.push(usedRepoTag);
-        }
-      });
-      this.setState({ usedRepoTags: usedRepoTags });
-      if (usedRepoTags.length !== 0 && relativePath === '/') {
-        this.setState({ isRepoInfoBarShow: true });
+closeZipDialog = () => {
+  this.setState({
+    isZipDialogOpen: false,
+    zipFolderPath: '',
+    selectedItems: []
+  });
+};
+
+// for image popup
+prepareImageItem = (item) => {
+  const name = item.file_name;
+  const fileURL = `${siteRoot}d/${token}/files/?p=${encodeURIComponent(item.file_path)}`;
+  // Use raw file content URL for all image types (no thumbnail backend available)
+  const src = `${fileURL}&raw=1`;
+
+  return {
+    'name': name,
+    'url': fileURL,
+    'src': src
+  };
+};
+
+showImagePopup = (curItem) => {
+  const items = this.state.items.filter((item) => {
+    return !item.is_dir && Utils.imageCheck(item.file_name);
+  });
+  const imageItems = items.map((item) => {
+    return this.prepareImageItem(item);
+  });
+
+  this.setState({
+    isImagePopupOpen: true,
+    imageItems: imageItems,
+    imageIndex: items.indexOf(curItem)
+  });
+};
+
+closeImagePopup = () => {
+  this.setState({
+    isImagePopupOpen: false
+  });
+};
+
+moveToPrevImage = () => {
+  const imageItemsLength = this.state.imageItems.length;
+  this.setState((prevState) => ({
+    imageIndex: (prevState.imageIndex + imageItemsLength - 1) % imageItemsLength
+  }));
+};
+
+moveToNextImage = () => {
+  const imageItemsLength = this.state.imageItems.length;
+  this.setState((prevState) => ({
+    imageIndex: (prevState.imageIndex + 1) % imageItemsLength
+  }));
+};
+
+toggleAllSelected = () => {
+  this.setState((prevState) => ({
+    isAllItemsSelected: !prevState.isAllItemsSelected,
+    items: this.state.items.map((item) => {
+      item.isSelected = !prevState.isAllItemsSelected;
+      return item;
+    })
+  }));
+};
+
+toggleItemSelected = (targetItem, isSelected) => {
+  this.setState({
+    items: this.state.items.map((item) => {
+      if (item === targetItem) {
+        item.isSelected = isSelected;
       }
-    }).catch(error => {
-      let errMessage = Utils.getErrorMsg(error);
-      toaster.danger(errMessage);
+      return item;
+    })
+  }, () => {
+    this.setState({
+      isAllItemsSelected: !this.state.items.some(item => !item.isSelected)
     });
+  });
+};
+
+onUploadFile = (e) => {
+  e.nativeEvent.stopImmediatePropagation();
+  this.uploader.onFileUpload();
+};
+
+onFileUploadSuccess = (direntObject) => {
+  const { name, size } = direntObject;
+  const newItem = {
+    isSelected: false,
+    file_name: name,
+    file_path: Utils.joinPath(relativePath, name),
+    is_dir: false,
+    last_modified: moment().format(),
+    size: size
   };
+  const folderItems = this.state.items.filter(item => { return item.is_dir; });
+  // put the new file as the first file
+  let items = Array.from(this.state.items);
+  items.splice(folderItems.length, 0, newItem);
+  this.setState({ items: items });
+  seafileAPI.shareLinksUploadDone(token, Utils.joinPath(dirPath, name));
+};
 
-  render() {
-    const isDesktop = Utils.isDesktop();
-    const modeBaseClass = 'btn btn-secondary btn-icon sf-view-mode-btn';
-    return (
-      <React.Fragment>
-        <div className="h-100 d-flex flex-column">
-          <div className="top-header d-flex justify-content-between">
-            <a href={siteRoot}>
-              <img src={mediaUrl + logoPath} height={logoHeight} style={{ width: 'auto' }} title={siteTitle} alt="logo" />
-            </a>
-            {loginUser && <Account />}
-          </div>
-          <div className="o-auto">
-            <div className="shared-dir-view-main">
-              <InsertAd zone='shared-dir-view' category='Flat_message' center={true} />
-              <h2 className="h3 text-truncate" title={dirName}>{dirName}</h2>
-              <p>{gettext('Shared by: ')}{sharedBy}</p>
-              <div className="d-flex justify-content-between align-items-center op-bar">
-                <p className="m-0 mr-4 ellipsis d-flex align-items-center">{gettext('Current path: ')}{this.renderPath()}</p>
-                <div className="flex-none">
-                  {isDesktop &&
-                    <div className="view-mode btn-group">
-                      <a
-                        href={`?p=${encodeURIComponent(relativePath)}&mode=list`}
-                        className={`${modeBaseClass} sf2-icon-list-view ${mode === 'list' ? 'current-mode' : ''}`}
-                        title={gettext('List')}
-                        aria-label={gettext('List')}
-                      ></a>
-                      <a
-                        href={`?p=${encodeURIComponent(relativePath)}&mode=grid`}
-                        className={`${modeBaseClass} sf2-icon-grid-view ${mode === 'grid' ? 'current-mode' : ''}`}
-                        title={gettext('Grid')}
-                        aria-label={gettext('Grid')}
-                      ></a>
-                    </div>
-                  }
-                  {canUpload && (
-                    <Button disabled={noQuota}
-                      title={noQuota ? gettext('The owner of this library has run out of space.') : ''}
-                      onClick={this.onUploadFile} className="ml-2 shared-dir-op-btn shared-dir-upload-btn"
-                    >{gettext('Upload')}</Button>
-                  )}
-                  {showDownloadIcon &&
-                    <Fragment>
-                      {this.state.items.some(item => item.isSelected) ?
-                        <Fragment>
-                          <Button color="success" onClick={this.zipDownloadSelectedItems} className="ml-2 shared-dir-op-btn">{gettext('ZIP Selected Items')}</Button>
-                          {(canDownload && loginUser && (loginUser !== sharedBy)) &&
-                            <Button color="success" onClick={this.saveSelectedItems} className="ml-2 shared-dir-op-btn">{gettext('Save Selected Items')}</Button>
-                          }
-                        </Fragment>
-                        :
-                        <Fragment>
-                          <Button color="success" onClick={this.zipDownloadFolder.bind(this, relativePath)} className="ml-2 shared-dir-op-btn">{gettext('ZIP')}</Button>
-                          {(canDownload && loginUser && (loginUser !== sharedBy)) &&
-                            <Button color="success" onClick={this.saveAllItems} className="ml-2 shared-dir-op-btn">{gettext('Save')}</Button>
-                          }
-                        </Fragment>
-                      }
-                    </Fragment>
-                  }
-                </div>
+getShareLinkRepoTags = () => {
+  seafileAPI.getShareLinkRepoTags(token).then(res => {
+    let usedRepoTags = [];
+    res.data.repo_tags.forEach(item => {
+      let usedRepoTag = new RepoTag(item);
+      if (usedRepoTag.fileCount > 0) {
+        usedRepoTags.push(usedRepoTag);
+      }
+    });
+    this.setState({ usedRepoTags: usedRepoTags });
+    if (usedRepoTags.length !== 0 && relativePath === '/') {
+      this.setState({ isRepoInfoBarShow: true });
+    }
+  }).catch(error => {
+    let errMessage = Utils.getErrorMsg(error);
+    toaster.danger(errMessage);
+  });
+};
+
+render() {
+  const isDesktop = Utils.isDesktop();
+  const modeBaseClass = 'btn btn-secondary btn-icon sf-view-mode-btn';
+  return (
+    <React.Fragment>
+      <div className="h-100 d-flex flex-column">
+        <div className="top-header d-flex justify-content-between">
+          <a href={siteRoot}>
+            <img src={mediaUrl + logoPath} height={logoHeight} style={{ width: 'auto' }} title={siteTitle} alt="logo" />
+          </a>
+          {loginUser && <Account />}
+        </div>
+        <div className="o-auto">
+          <div className="shared-dir-view-main">
+            <InsertAd zone='shared-dir-view' category='Flat_message' center={true} />
+            <h2 className="h3 text-truncate" title={dirName}>{dirName}</h2>
+            <p>{gettext('Shared by: ')}{sharedBy}</p>
+            <div className="d-flex justify-content-between align-items-center op-bar">
+              <p className="m-0 mr-4 ellipsis d-flex align-items-center">{gettext('Current path: ')}{this.renderPath()}</p>
+              <div className="flex-none">
+                {isDesktop &&
+                  <div className="view-mode btn-group">
+                    <a
+                      href={`?p=${encodeURIComponent(relativePath)}&mode=list`}
+                      className={`${modeBaseClass} sf2-icon-list-view ${mode === 'list' ? 'current-mode' : ''}`}
+                      title={gettext('List')}
+                      aria-label={gettext('List')}
+                    ></a>
+                    <a
+                      href={`?p=${encodeURIComponent(relativePath)}&mode=grid`}
+                      className={`${modeBaseClass} sf2-icon-grid-view ${mode === 'grid' ? 'current-mode' : ''}`}
+                      title={gettext('Grid')}
+                      aria-label={gettext('Grid')}
+                    ></a>
+                  </div>
+                }
+                {canUpload && (
+                  <Button disabled={noQuota}
+                    title={noQuota ? gettext('The owner of this library has run out of space.') : ''}
+                    onClick={this.onUploadFile} className="ml-2 shared-dir-op-btn shared-dir-upload-btn"
+                  >{gettext('Upload')}</Button>
+                )}
+                {showDownloadIcon &&
+                  <Fragment>
+                    {this.state.items.some(item => item.isSelected) ?
+                      <Fragment>
+                        <Button color="success" onClick={this.zipDownloadSelectedItems} className="ml-2 shared-dir-op-btn">{gettext('ZIP Selected Items')}</Button>
+                        {(canDownload && loginUser && (loginUser !== sharedBy)) &&
+                          <Button color="success" onClick={this.saveSelectedItems} className="ml-2 shared-dir-op-btn">{gettext('Save Selected Items')}</Button>
+                        }
+                      </Fragment>
+                      :
+                      <Fragment>
+                        <Button color="success" onClick={this.zipDownloadFolder.bind(this, relativePath)} className="ml-2 shared-dir-op-btn">{gettext('ZIP')}</Button>
+                        {(canDownload && loginUser && (loginUser !== sharedBy)) &&
+                          <Button color="success" onClick={this.saveAllItems} className="ml-2 shared-dir-op-btn">{gettext('Save')}</Button>
+                        }
+                      </Fragment>
+                    }
+                  </Fragment>
+                }
               </div>
-              {!noQuota && canUpload && (
-                <FileUploader
-                  ref={uploader => this.uploader = uploader}
-                  dragAndDrop={false}
-                  token={token}
-                  path={dirPath === '/' ? dirPath : dirPath.replace(/\/+$/, '')}
-                  relativePath={relativePath === '/' ? relativePath : relativePath.replace(/\/+$/, '')}
-                  repoID={repoID}
-                  onFileUploadSuccess={this.onFileUploadSuccess}
-                />
-              )}
-
-              {this.state.isRepoInfoBarShow && (
-                <RepoInfoBar
-                  repoID={repoID}
-                  currentPath={'/'}
-                  usedRepoTags={this.state.usedRepoTags}
-                  shareLinkToken={token}
-                  enableFileDownload={showDownloadIcon}
-                  className="mx-0"
-                />
-              )}
-
-              <Content
-                isDesktop={isDesktop}
-                isLoading={this.state.isLoading}
-                errorMsg={this.state.errorMsg}
-                items={this.state.items}
-                sortBy={this.state.sortBy}
-                sortOrder={this.state.sortOrder}
-                sortItems={this.sortItems}
-                isAllItemsSelected={this.state.isAllItemsSelected}
-                toggleAllSelected={this.toggleAllSelected}
-                toggleItemSelected={this.toggleItemSelected}
-                zipDownloadFolder={this.zipDownloadFolder}
-                showImagePopup={this.showImagePopup}
-              />
             </div>
+            {!noQuota && canUpload && (
+              <FileUploader
+                ref={uploader => this.uploader = uploader}
+                dragAndDrop={false}
+                token={token}
+                path={dirPath === '/' ? dirPath : dirPath.replace(/\/+$/, '')}
+                relativePath={relativePath === '/' ? relativePath : relativePath.replace(/\/+$/, '')}
+                repoID={repoID}
+                onFileUploadSuccess={this.onFileUploadSuccess}
+              />
+            )}
+
+            {this.state.isRepoInfoBarShow && (
+              <RepoInfoBar
+                repoID={repoID}
+                currentPath={'/'}
+                usedRepoTags={this.state.usedRepoTags}
+                shareLinkToken={token}
+                enableFileDownload={showDownloadIcon}
+                className="mx-0"
+              />
+            )}
+
+            <Content
+              isDesktop={isDesktop}
+              isLoading={this.state.isLoading}
+              errorMsg={this.state.errorMsg}
+              items={this.state.items}
+              sortBy={this.state.sortBy}
+              sortOrder={this.state.sortOrder}
+              sortItems={this.sortItems}
+              isAllItemsSelected={this.state.isAllItemsSelected}
+              toggleAllSelected={this.toggleAllSelected}
+              toggleItemSelected={this.toggleItemSelected}
+              zipDownloadFolder={this.zipDownloadFolder}
+              showImagePopup={this.showImagePopup}
+            />
           </div>
         </div>
-        {this.state.isZipDialogOpen &&
-          <ModalPortal>
-            <ZipDownloadDialog
-              token={token}
-              path={this.state.zipFolderPath}
-              target={this.state.selectedItems}
-              toggleDialog={this.closeZipDialog}
-            />
-          </ModalPortal>
-        }
-        {this.state.isSaveSharedDirDialogShow &&
-          <SaveSharedDirDialog
-            sharedToken={token}
-            parentDir={relativePath}
-            items={this.state.itemsForSave}
-            toggleCancel={this.toggleSaveSharedDirCancel}
-            handleSaveSharedDir={this.handleSaveSharedDir}
+      </div>
+      {this.state.isZipDialogOpen &&
+        <ModalPortal>
+          <ZipDownloadDialog
+            token={token}
+            path={this.state.zipFolderPath}
+            target={this.state.selectedItems}
+            toggleDialog={this.closeZipDialog}
           />
-        }
-        {this.state.isCopyMoveProgressDialogShow && (
-          <CopyMoveDirentProgressDialog
-            type='copy'
-            asyncOperatedFilesLength={this.state.asyncOperatedFilesLength}
-            asyncOperationProgress={this.state.asyncOperationProgress}
-            toggleDialog={this.onProgressDialogToggle}
+        </ModalPortal>
+      }
+      {this.state.isSaveSharedDirDialogShow &&
+        <SaveSharedDirDialog
+          sharedToken={token}
+          parentDir={relativePath}
+          items={this.state.itemsForSave}
+          toggleCancel={this.toggleSaveSharedDirCancel}
+          handleSaveSharedDir={this.handleSaveSharedDir}
+        />
+      }
+      {this.state.isCopyMoveProgressDialogShow && (
+        <CopyMoveDirentProgressDialog
+          type='copy'
+          asyncOperatedFilesLength={this.state.asyncOperatedFilesLength}
+          asyncOperationProgress={this.state.asyncOperationProgress}
+          toggleDialog={this.onProgressDialogToggle}
+        />
+      )}
+      {this.state.isImagePopupOpen &&
+        <ModalPortal>
+          <ImageDialog
+            imageItems={this.state.imageItems}
+            imageIndex={this.state.imageIndex}
+            closeImagePopup={this.closeImagePopup}
+            moveToPrevImage={this.moveToPrevImage}
+            moveToNextImage={this.moveToNextImage}
           />
-        )}
-        {this.state.isImagePopupOpen &&
-          <ModalPortal>
-            <ImageDialog
-              imageItems={this.state.imageItems}
-              imageIndex={this.state.imageIndex}
-              closeImagePopup={this.closeImagePopup}
-              moveToPrevImage={this.moveToPrevImage}
-              moveToNextImage={this.moveToNextImage}
-            />
-          </ModalPortal>
-        }
-      </React.Fragment>
-    );
-  }
+        </ModalPortal>
+      }
+    </React.Fragment>
+  );
+}
 }
 
 class Content extends React.Component {
@@ -974,7 +974,7 @@ GridItem.propTypes = {
 };
 
 if (needPassword) {
-  ReactDom.render(<SharedLinkPasswordDialog token={token} tokenType="d" />, document.getElementById('wrapper'));
+  ReactDom.render(<SharedLinkPasswordDialog token={token} />, document.getElementById('wrapper'));
 } else {
   ReactDom.render(<SharedDirView />, document.getElementById('wrapper'));
 }

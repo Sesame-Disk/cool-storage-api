@@ -17,11 +17,11 @@ export default defineConfig({
     environment: 'jsdom',
     globals: true,
     setupFiles: ['./src/test/setup.ts'],
-    exclude: ['node_modules', 'dist', 'e2e'],
+    exclude: ['node_modules', 'dist', 'e2e', 'e2e-desktop'],
     coverage: {
       provider: 'v8',
       reporter: ['text', 'html', 'lcov'],
-      exclude: ['node_modules', 'dist', '*.config.*', 'src/test/'],
+      exclude: ['node_modules', 'dist', '*.config.*', 'src/test/', 'e2e/', 'e2e-desktop/'],
     },
   },
 });

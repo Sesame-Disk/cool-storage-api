@@ -24,7 +24,7 @@ docker compose --profile test run --rm --build go-all-test
 # API integration tests against the running stack
 docker compose --profile test run --rm --build api-test
 
-# Frontend and mobile checks
+# Frontend checks and mobile checks plus smoke
 docker compose --profile test run --rm --build frontend-test
 docker compose --profile test run --rm --build mobile-test
 
@@ -61,7 +61,7 @@ Do not attach tests to `docker compose up -d --build` itself. That command shoul
 | `api-test` | Bash API integration suites via `scripts/test.sh api` |
 | `oidc-test` | OIDC shell tests via `scripts/test.sh oidc` |
 | `frontend-test` | Frontend lint + Jest |
-| `mobile-test` | Mobile typecheck + lint + Vitest |
+| `mobile-test` | Mobile typecheck + lint + Vitest + desktop split smoke |
 
 ### Test Categories
 
@@ -76,7 +76,7 @@ Do not attach tests to `docker compose up -d --build` itself. That command shoul
 | `go-all` | All Go tests (unit + integration) | `sesamefs` + Docker compose test profile |
 | `go-integration` | Go integration tests (against running backend) | `sesamefs` + Docker compose test profile |
 | `frontend` | Frontend React tests | Docker compose test profile |
-| `mobile` | Mobile frontend checks | Docker compose test profile |
+| `mobile` | Mobile frontend checks plus desktop smoke | Docker compose test profile |
 | `all` | Run all applicable tests | Auto-detects available services |
 
 ### Options

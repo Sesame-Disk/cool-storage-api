@@ -806,26 +806,25 @@ func (s *Server) setupRoutes() {
 	s.router.GET("/billing", s.handleBillingRedirect)
 	s.router.GET("/billing/", s.handleBillingRedirect)
 
-	// Public share link view (no auth middleware - validated by share link token)
+	// Public share/upload link APIs (the frontend shell now serves /d/* and /u/d/* pages)
 	slv := v2.NewShareLinkViewHandler(s.db, s.config, s.storage, s.storageManager, s.tokenStore, serverURL)
-	s.router.GET("/d/:token", slv.ServeShareLinkPage)
 
-	// Share link file view: /d/:token/files/?p=/path - for viewing files inside shared dirs
+	// Public share link transport routes. The frontend shell owns the HTML page load,
+	// but direct file transport still uses /d/* for raw and download requests.
+	s.router.GET("/d/:token", slv.ServeShareLinkPage)
 	s.router.GET("/d/:token/files/", slv.ServeShareLinkFilePage)
 	s.router.GET("/d/:token/files", slv.ServeShareLinkFilePage)
 
-	// Share link password check (public, no auth)
-	s.router.POST("/d/:token/check-password", slv.CheckShareLinkPassword)
-	s.router.POST("/d/:token/check-password/", slv.CheckShareLinkPassword)
-
-	// Upload link view: /u/d/:token - anonymous file upload page
-	s.router.GET("/u/d/:token", slv.ServeUploadLinkPage)
-
-	// Upload link password check (public, no auth)
-	s.router.POST("/u/d/:token/check-password", slv.CheckUploadLinkPassword)
-	s.router.POST("/u/d/:token/check-password/", slv.CheckUploadLinkPassword)
+	// Public link password check (public, no auth). A single API endpoint covers both
+	// share links and upload links, so the frontend no longer needs shell-level routes.
+	s.router.POST("/api/v2.1/public-links/:token/check-password/", slv.CheckPublicLinkPassword)
+	s.router.POST("/api/v2.1/public-links/:token/check-password", slv.CheckPublicLinkPassword)
 
 	// Share link directory listing API (public, token-validated internally)
+	s.router.GET("/api/v2.1/share-links/:token/bootstrap/", slv.GetShareLinkBootstrap)
+	s.router.GET("/api/v2.1/share-links/:token/bootstrap", slv.GetShareLinkBootstrap)
+	s.router.GET("/api/v2.1/share-links/:token/files/bootstrap/", slv.GetShareLinkFileBootstrap)
+	s.router.GET("/api/v2.1/share-links/:token/files/bootstrap", slv.GetShareLinkFileBootstrap)
 	s.router.GET("/api/v2.1/share-links/:token/dirents/", slv.ListShareLinkDirents)
 	s.router.GET("/api/v2.1/share-links/:token/dirents", slv.ListShareLinkDirents)
 
@@ -853,6 +852,8 @@ func (s *Server) setupRoutes() {
 	s.router.DELETE("/api/v2.1/cancel-zip-task", cancelZipStub)
 
 	// Upload link API endpoints (public, token-validated internally)
+	s.router.GET("/api/v2.1/upload-links/:token/bootstrap/", slv.GetUploadLinkBootstrap)
+	s.router.GET("/api/v2.1/upload-links/:token/bootstrap", slv.GetUploadLinkBootstrap)
 	s.router.GET("/api/v2.1/upload-links/:token/upload/", slv.GetUploadLinkUploadURL)
 	s.router.GET("/api/v2.1/upload-links/:token/upload", slv.GetUploadLinkUploadURL)
 	s.router.POST("/api/v2.1/upload-links/:token/upload-done/", slv.PostUploadLinkDone)

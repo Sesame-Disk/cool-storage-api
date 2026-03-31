@@ -26,7 +26,8 @@ Expected local environment:
 
 Automation entrypoint:
 
-- `cd mobile-frontend && npm run test:e2e:desktop-split`
+- `cd mobile-frontend && npm run test:smoke`
+- Legacy alias kept for compatibility: `cd mobile-frontend && npm run test:e2e:desktop-split`
 - Override credentials or target with env vars when needed:
 	- `DESKTOP_BASE_URL`
 	- `DESKTOP_SMOKE_USER_EMAIL`
@@ -107,7 +108,8 @@ Expected:
 Expected:
 
 - Share controls render according to bootstrap permissions.
-- Share link page loads through backend routing.
+- Share link page loads through the frontend public shell plus bootstrap API.
+- Password-protected links block `dirents` before verification and load normally after password submission.
 
 ### 6. Upload link flow
 
@@ -118,7 +120,8 @@ Expected:
 Expected:
 
 - Upload link controls render according to bootstrap permissions.
-- Upload link page loads through backend routing.
+- Upload link page loads through the frontend public shell plus bootstrap API.
+- Password-protected upload links block upload URL issuance before verification and return a valid `/seafhttp/upload-api/` target after password submission.
 
 ### 7. Org admin shell
 

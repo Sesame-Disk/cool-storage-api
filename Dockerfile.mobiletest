@@ -1,4 +1,4 @@
-FROM node:22-bookworm
+FROM mcr.microsoft.com/playwright:v1.58.2-noble
 
 WORKDIR /app
 ENV CI=true
@@ -8,4 +8,4 @@ RUN npm ci --legacy-peer-deps
 
 COPY mobile-frontend/ ./
 
-CMD ["bash", "-lc", "npm run check"]
+CMD ["bash", "-lc", "npm run check && npm run test:smoke"]

@@ -106,7 +106,7 @@ class SharedFileView extends React.Component {
 
   render() {
     if (needPassword) {
-      return <SharedLinkPasswordDialog token={sharedToken} tokenType="d" />;
+      return <SharedLinkPasswordDialog token={sharedToken} />;
     }
 
     const { fileType } = this.props;

@@ -226,6 +226,16 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.mobiletest
+    command:
+      - /bin/sh
+      - -c
+      - >
+        until node -e 'const http = require("http"); const target = process.env.DESKTOP_BASE_URL || "http://frontend"; http.get(target, (res) => process.exit(res.statusCode < 500 ? 0 : 1)).on("error", () => process.exit(1));'; do sleep 2; done;
+        npm run check && npm run test:smoke
+    environment:
+      - DESKTOP_BASE_URL=http://frontend
+    depends_on:
+      - frontend
     profiles:
       - test
 

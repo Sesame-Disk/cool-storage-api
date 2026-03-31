@@ -1,6 +1,11 @@
 import React from 'react';
 import { gettext, siteRoot } from '../utils/constants';
 
+function buildPublicLinkPasswordCheckUrl(token) {
+  const normalizedSiteRoot = siteRoot.endsWith('/') ? siteRoot : `${siteRoot}/`;
+  return `${normalizedSiteRoot}api/v2.1/public-links/${encodeURIComponent(token)}/check-password`;
+}
+
 class SharedLinkPasswordDialog extends React.Component {
 
   constructor(props) {
@@ -19,7 +24,7 @@ class SharedLinkPasswordDialog extends React.Component {
   handleSubmit = (e) => {
     e.preventDefault();
     const { password } = this.state;
-    const { token, tokenType } = this.props;
+    const { token } = this.props;
 
     if (!password) {
       this.setState({ error: gettext('Please enter the password.') });
@@ -28,7 +33,7 @@ class SharedLinkPasswordDialog extends React.Component {
 
     this.setState({ isSubmitting: true, error: '' });
 
-    fetch(`${siteRoot}${tokenType}/${token}/check-password/`, {
+    fetch(buildPublicLinkPasswordCheckUrl(token), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ password }),

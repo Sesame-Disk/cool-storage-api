@@ -21,6 +21,12 @@ var (
 	superadminClient *testClient
 )
 
+var ephemeralLibraryPrefixes = []string{
+	"inttest-",
+	"smoke-",
+	"sesamefs-public-smoke",
+}
+
 func TestMain(m *testing.M) {
 	baseURL = os.Getenv("SESAMEFS_URL")
 	if baseURL == "" {
@@ -123,26 +129,154 @@ func verifyIntegrationAuth(baseURL, token string) error {
 // createTestLibrary creates a library and registers cleanup via t.Cleanup.
 // Returns the repo_id.
 func createTestLibrary(t *testing.T, c *testClient, name string) string {
+	return createLibraryForTest(t, c, name, map[string]string{"repo_name": name}, true)
+}
+
+func createDisposableTestLibrary(t *testing.T, c *testClient, name string) string {
+	return createLibraryForTest(t, c, name, map[string]string{"repo_name": name}, false)
+}
+
+func createLibraryWithBody(t *testing.T, c *testClient, name string, body interface{}, cleanup bool) string {
+	return createLibraryForTest(t, c, name, body, cleanup)
+}
+
+func createLibraryForTest(t *testing.T, c *testClient, name string, body interface{}, cleanup bool) string {
 	t.Helper()
 
-	body := map[string]string{"repo_name": name}
+	for attempt := 0; attempt < 2; attempt++ {
+		repoID, limitReached := tryCreateLibrary(t, c, name, body)
+		if repoID != "" {
+			if cleanup {
+				t.Cleanup(func() {
+					delResp := c.Delete(t, fmt.Sprintf("/api/v2.1/repos/%s/", repoID))
+					delResp.Body.Close()
+				})
+			}
+			return repoID
+		}
+
+		if !limitReached {
+			break
+		}
+
+		deleted := cleanupTestLibrariesAcrossKnownUsers(t)
+		if deleted == 0 {
+			t.Fatalf("failed to create library %q: library limit reached and no stale test libraries were available for cleanup", name)
+		}
+		t.Logf("cleaned up %d stale test libraries after hitting the library limit while creating %q", deleted, name)
+	}
+
+	t.Fatalf("failed to create library %q after retrying", name)
+	return ""
+}
+
+func tryCreateLibrary(t *testing.T, c *testClient, name string, body interface{}) (string, bool) {
+	t.Helper()
+
 	resp := c.PostJSON(t, "/api/v2.1/repos/", body)
-	expectStatus(t, resp, http.StatusOK)
+	var result map[string]interface{}
+	decodeJSON(t, resp, &result)
+
+	if resp.StatusCode != http.StatusOK {
+		if isLibraryLimitResponse(resp.StatusCode, result) {
+			return "", true
+		}
+		t.Fatalf("create library %q failed: status=%d body=%v", name, resp.StatusCode, result)
+	}
+
+	repoID, ok := result["repo_id"].(string)
+	if !ok || repoID == "" {
+		t.Fatalf("failed to get repo_id from create library response for %q: %v", name, result)
+	}
+
+	return repoID, false
+}
+
+func isLibraryLimitResponse(statusCode int, body map[string]interface{}) bool {
+	if statusCode != http.StatusForbidden {
+		return false
+	}
+	errMsg, _ := body["error"].(string)
+	return errMsg == "Library limit reached"
+}
+
+func cleanupTestLibrariesAcrossKnownUsers(t *testing.T) int {
+	t.Helper()
+
+	clients := []*testClient{adminClient, userClient, superadminClient}
+	seen := map[*testClient]struct{}{}
+	total := 0
+	for _, client := range clients {
+		if client == nil {
+			continue
+		}
+		if _, ok := seen[client]; ok {
+			continue
+		}
+		seen[client] = struct{}{}
+		total += cleanupOwnedEphemeralLibraries(t, client)
+	}
+	return total
+}
+
+func cleanupOwnedEphemeralLibraries(t *testing.T, c *testClient) int {
+	t.Helper()
+
+	resp := c.Get(t, "/api/v2.1/repos/?type=mine")
+	if resp.StatusCode != http.StatusOK {
+		body := responseBody(t, resp)
+		t.Logf("skipping stale library cleanup for %s: list status=%d body=%s", c.token, resp.StatusCode, body)
+		return 0
+	}
 
 	var result map[string]interface{}
 	decodeJSON(t, resp, &result)
 
-	repoID, ok := result["repo_id"].(string)
-	if !ok || repoID == "" {
-		t.Fatalf("failed to get repo_id from create library response: %v", result)
+	repos, ok := result["repos"].([]interface{})
+	if !ok {
+		return 0
 	}
 
-	t.Cleanup(func() {
-		delResp := c.Delete(t, fmt.Sprintf("/api/v2.1/repos/%s/", repoID))
-		delResp.Body.Close()
-	})
+	deleted := 0
+	for _, entry := range repos {
+		repo, ok := entry.(map[string]interface{})
+		if !ok {
+			continue
+		}
 
-	return repoID
+		repoID, _ := repo["repo_id"].(string)
+		if repoID == "" {
+			repoID, _ = repo["id"].(string)
+		}
+		repoName, _ := repo["repo_name"].(string)
+		if repoName == "" {
+			repoName, _ = repo["name"].(string)
+		}
+		if repoID == "" || !isEphemeralLibraryName(repoName) {
+			continue
+		}
+
+		delResp := c.Delete(t, fmt.Sprintf("/api/v2.1/repos/%s/", repoID))
+		if delResp.StatusCode == http.StatusOK || delResp.StatusCode == http.StatusNotFound {
+			deleted++
+		} else {
+			body := responseBody(t, delResp)
+			t.Logf("failed to delete stale test library %q (%s): status=%d body=%s", repoName, repoID, delResp.StatusCode, body)
+			continue
+		}
+		delResp.Body.Close()
+	}
+
+	return deleted
+}
+
+func isEphemeralLibraryName(name string) bool {
+	for _, prefix := range ephemeralLibraryPrefixes {
+		if strings.HasPrefix(name, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 // decodeJSON decodes a response body into v and closes the body.

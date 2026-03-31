@@ -58,16 +58,7 @@ func TestAdminCanManageOtherLibraries(t *testing.T) {
 	t.Run("admin can delete user library", func(t *testing.T) {
 		// Create a separate library for deletion test
 		delName := fmt.Sprintf("inttest-admindel-%d", time.Now().UnixNano())
-		body := map[string]string{"repo_name": delName}
-		createResp := userClient.PostJSON(t, "/api/v2.1/repos/", body)
-		expectStatus(t, createResp, http.StatusOK)
-
-		var createResult map[string]interface{}
-		decodeJSON(t, createResp, &createResult)
-		delRepoID, ok := createResult["repo_id"].(string)
-		if !ok || delRepoID == "" {
-			t.Fatal("failed to create library for admin delete test")
-		}
+		delRepoID := createDisposableTestLibrary(t, userClient, delName)
 
 		resp := adminClient.Delete(t, fmt.Sprintf("/api/v2.1/repos/%s/", delRepoID))
 		if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusForbidden {

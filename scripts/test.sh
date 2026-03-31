@@ -577,14 +577,14 @@ run_frontend_tests() {
 }
 
 run_mobile_tests() {
-    log_section "Mobile Frontend Checks"
+    log_section "Mobile Frontend Checks + Smoke"
 
     if check_docker_compose; then
-        run_compose_service "mobile-test" "Mobile Frontend Checks"
+        run_compose_service "mobile-test" "Mobile Frontend Checks + Smoke"
         return $?
     fi
 
-    log_error "docker compose is required to run mobile frontend checks"
+    log_error "docker compose is required to run mobile frontend checks plus smoke"
     return 1
 }
 

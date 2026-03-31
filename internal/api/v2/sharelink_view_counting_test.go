@@ -15,7 +15,7 @@ import (
 // and expired/disabled links don't inflate the view counter.
 //
 // All resolveShareLink calls must pass countView=false.
-// Actual view counting happens in serveSharedDirPage and serveSharedFilePage.
+// Actual view counting now happens in the bootstrap handlers that feed the frontend shell.
 func TestShareLinkViewCountingCallSites(t *testing.T) {
 	_, thisFile, _, ok := runtime.Caller(0)
 	if !ok {
@@ -34,8 +34,8 @@ func TestShareLinkViewCountingCallSites(t *testing.T) {
 	// Every handler that calls resolveShareLink must pass countView=false.
 	// View counting is handled explicitly via incrementViewCount() after all checks.
 	expectedFalse := []string{
-		"ServeShareLinkPage",
-		"ServeShareLinkFilePage",
+		"GetShareLinkBootstrap",
+		"GetShareLinkFileBootstrap",
 		"ListShareLinkDirents",
 		"GetShareLinkRepoTags",
 		"GetShareLinkZipTask",
@@ -101,8 +101,8 @@ func TestShareLinkViewCountingCallSites(t *testing.T) {
 		}
 	}
 
-	// Verify that serveSharedDirPage and serveSharedFilePage call incrementViewCount
-	for _, fnName := range []string{"serveSharedDirPage", "serveSharedFilePage"} {
+	// Verify that the bootstrap handlers call incrementViewCount after password/availability checks.
+	for _, fnName := range []string{"GetShareLinkBootstrap", "GetShareLinkFileBootstrap"} {
 		found := false
 		for _, decl := range fileNode.Decls {
 			fn, ok := decl.(*ast.FuncDecl)

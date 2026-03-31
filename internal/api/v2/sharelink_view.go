@@ -7,19 +7,15 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"html"
-	htmltemplate "html/template"
 	"log"
 	"log/slog"
 	"mime"
 	"net/http"
 	"net/url"
-	"os"
 	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/Sesame-Disk/sesamefs/internal/config"
@@ -27,7 +23,6 @@ import (
 	"github.com/Sesame-Disk/sesamefs/internal/db"
 	"github.com/Sesame-Disk/sesamefs/internal/storage"
 	"github.com/Sesame-Disk/sesamefs/internal/streaming"
-	"github.com/Sesame-Disk/sesamefs/internal/templates"
 	"github.com/Sesame-Disk/sesamefs/internal/traffic"
 	"github.com/gin-gonic/gin"
 	"golang.org/x/crypto/bcrypt"
@@ -41,197 +36,24 @@ type ShareLinkViewHandler struct {
 	storageManager *storage.Manager
 	tokenCreator   TokenCreator
 	serverURL      string
-	// bundleMap maps entry point names (e.g. "sharedDirView") to hashed filenames
-	jsBundleMap  map[string]string
-	cssBundleMap map[string]string
-	bundleMu     sync.RWMutex
-	frontendURL  string
-	bundleSource string
-	lastRefresh  time.Time
 }
 
-// NewShareLinkViewHandler creates a new ShareLinkViewHandler and resolves frontend bundles.
-//
-// Bundle resolution order (first success wins):
-//  1. HTTP fetch of asset-manifest.json from the frontend container (FRONTEND_URL env var,
-//     default http://frontend:80). This is the correct path in multi-container deployments.
-//  2. Filesystem scan of ./frontend/build/static/{js,css} — works in local dev when the
-//     frontend and backend share a filesystem (e.g. `go run ./cmd/sesamefs` from repo root).
-//  3. Hardcoded fallback filenames — last resort; these go stale on each frontend rebuild.
+type pageBootstrapResponse struct {
+	RenderMode string `json:"render_mode"`
+	Bundle     string `json:"bundle,omitempty"`
+	Title      string `json:"title"`
+	PageOptions any   `json:"page_options,omitempty"`
+}
+
+// NewShareLinkViewHandler creates a new ShareLinkViewHandler for public share/upload link APIs.
 func NewShareLinkViewHandler(database *db.DB, cfg *config.Config, s3Store *storage.S3Store, storageManager *storage.Manager, tokenCreator TokenCreator, serverURL string) *ShareLinkViewHandler {
-	h := &ShareLinkViewHandler{
+	return &ShareLinkViewHandler{
 		db:             database,
 		config:         cfg,
 		storage:        s3Store,
 		storageManager: storageManager,
 		tokenCreator:   tokenCreator,
 		serverURL:      serverURL,
-	}
-
-	h.frontendURL = os.Getenv("FRONTEND_URL")
-	if h.frontendURL == "" {
-		h.frontendURL = "http://frontend:80"
-	}
-
-	h.refreshBundleMaps(true)
-
-	return h
-}
-
-func (h *ShareLinkViewHandler) refreshBundleMaps(force bool) {
-	h.bundleMu.RLock()
-	bundleSource := h.bundleSource
-	lastRefresh := h.lastRefresh
-	h.bundleMu.RUnlock()
-
-	if !force {
-		retryWindow := 5 * time.Second
-		if bundleSource == "http" {
-			retryWindow = 1 * time.Minute
-		}
-		if !lastRefresh.IsZero() && time.Since(lastRefresh) < retryWindow {
-			return
-		}
-	}
-
-	h.bundleMu.Lock()
-	defer h.bundleMu.Unlock()
-
-	if !force {
-		retryWindow := 5 * time.Second
-		if h.bundleSource == "http" {
-			retryWindow = 1 * time.Minute
-		}
-		if !h.lastRefresh.IsZero() && time.Since(h.lastRefresh) < retryWindow {
-			return
-		}
-	}
-
-	if jsMap, cssMap, err := fetchBundleManifest(h.frontendURL); err == nil {
-		slog.Info("Loaded frontend bundle manifest via HTTP", "url", h.frontendURL)
-		h.jsBundleMap = jsMap
-		h.cssBundleMap = cssMap
-		h.bundleSource = "http"
-		h.lastRefresh = time.Now()
-		return
-	} else {
-		slog.Warn("Could not fetch bundle manifest from frontend container, falling back to filesystem scan", "url", h.frontendURL, "error", err)
-	}
-
-	jsMap := scanBundles("./frontend/build/static/js", ".js")
-	cssMap := scanBundles("./frontend/build/static/css", ".css")
-	h.jsBundleMap = jsMap
-	h.cssBundleMap = cssMap
-	h.lastRefresh = time.Now()
-	if len(jsMap) > 0 || len(cssMap) > 0 {
-		h.bundleSource = "filesystem"
-		return
-	}
-	h.bundleSource = "fallback"
-}
-
-// fetchBundleManifest fetches asset-manifest.json from the frontend container and returns
-// JS and CSS bundle maps (entry name → hashed filename, e.g. "sharedDirView" → "sharedDirView.ef3d8149.js").
-// CRA generates asset-manifest.json automatically at build time.
-func fetchBundleManifest(frontendURL string) (jsMap, cssMap map[string]string, err error) {
-	manifestURL := strings.TrimSuffix(frontendURL, "/") + "/asset-manifest.json"
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Get(manifestURL)
-	if err != nil {
-		return nil, nil, fmt.Errorf("GET %s: %w", manifestURL, err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, nil, fmt.Errorf("GET %s: status %d", manifestURL, resp.StatusCode)
-	}
-
-	// CRA asset-manifest.json structure: {"files": {"sharedDirView.js": "/static/js/sharedDirView.abc.js", ...}}
-	var manifest struct {
-		Files map[string]string `json:"files"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&manifest); err != nil {
-		return nil, nil, fmt.Errorf("decode asset-manifest.json: %w", err)
-	}
-
-	jsMap = make(map[string]string)
-	cssMap = make(map[string]string)
-	for key, assetPath := range manifest.Files {
-		// key examples: "sharedDirView.js", "commons.css", "runtime.js"
-		// assetPath examples: "/static/js/sharedDirView.ef3d8149.js"
-		filename := path.Base(assetPath) // "sharedDirView.ef3d8149.js"
-		switch {
-		case strings.HasSuffix(key, ".js") && !strings.HasSuffix(key, ".map"):
-			entryName := strings.TrimSuffix(key, ".js")
-			jsMap[entryName] = filename
-		case strings.HasSuffix(key, ".css"):
-			entryName := strings.TrimSuffix(key, ".css")
-			cssMap[entryName] = filename
-		}
-	}
-
-	if len(jsMap) == 0 {
-		return nil, nil, fmt.Errorf("asset-manifest.json contained no JS entries")
-	}
-	return jsMap, cssMap, nil
-}
-
-// scanBundles scans a directory for hashed bundle files and returns a map
-// of entry name -> hashed filename (e.g. "sharedDirView" -> "sharedDirView.ef3d8149.js")
-func scanBundles(dir, ext string) map[string]string {
-	result := make(map[string]string)
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		slog.Warn("Failed to scan bundle directory, using fallback bundle names", "dir", dir, "error", err)
-		if ext == ".js" {
-			return getJSBundleFallbacks()
-		}
-		if ext == ".css" {
-			return getCSSBundleFallbacks()
-		}
-		return result
-	}
-	for _, entry := range entries {
-		name := entry.Name()
-		if strings.HasSuffix(name, ext) && !strings.HasSuffix(name, ".map") && !strings.HasSuffix(name, ".LICENSE.txt") {
-			// Extract entry name: "sharedDirView.ef3d8149.js" -> "sharedDirView"
-			parts := strings.SplitN(name, ".", 2)
-			if len(parts) >= 2 {
-				result[parts[0]] = name
-			}
-		}
-	}
-	return result
-}
-
-// getJSBundleFallbacks returns hardcoded JS bundle filenames
-// These should be updated when the frontend is rebuilt
-func getJSBundleFallbacks() map[string]string {
-	return map[string]string{
-		"runtime":                   "runtime.b5726b5c.js",
-		"commons":                   "commons.e950012e.js",
-		"sharedDirView":             "sharedDirView.ef3d8149.js",
-		"sharedFileViewAudio":       "sharedFileViewAudio.cedd033e.js",
-		"sharedFileViewDocument":    "sharedFileViewDocument.c3f72eff.js",
-		"sharedFileViewImage":       "sharedFileViewImage.9d0dda04.js",
-		"sharedFileViewMarkdown":    "sharedFileViewMarkdown.f8135e49.js",
-		"sharedFileViewPDF":         "sharedFileViewPDF.a00415f0.js",
-		"sharedFileViewSdoc":        "sharedFileViewSdoc.00bab9a5.js",
-		"sharedFileViewSpreadsheet": "sharedFileViewSpreadsheet.ea813efa.js",
-		"sharedFileViewSVG":         "sharedFileViewSVG.5fd43385.js",
-		"sharedFileViewText":        "sharedFileViewText.757e8d1a.js",
-		"sharedFileViewUnknown":     "sharedFileViewUnknown.a0e468e0.js",
-		"sharedFileViewVideo":       "sharedFileViewVideo.6af2fa31.js",
-		"uploadLink":                "uploadLink.5d49e522.js",
-	}
-}
-
-// getCSSBundleFallbacks returns hardcoded CSS bundle filenames
-func getCSSBundleFallbacks() map[string]string {
-	return map[string]string{
-		"commons":                   "commons.82d1af8c.css",
-		"sharedDirView":             "sharedDirView.b715f1e6.css",
-		"sharedFileViewSpreadsheet": "sharedFileViewSpreadsheet.ff1ddac7.css",
-		"uploadLink":                "uploadLink.d59e882a.css",
 	}
 }
 
@@ -267,6 +89,19 @@ type shareLinkData struct {
 	fileSubPath string
 }
 
+type pathSegment struct {
+	Name string `json:"name"`
+	Path string `json:"path"`
+}
+
+func marshalPageOptionsJSON(pageOptions any) string {
+	data, err := json.Marshal(pageOptions)
+	if err != nil {
+		return `{}`
+	}
+	return string(data)
+}
+
 // incrementViewCount increments the view_count for a share link asynchronously.
 // Call this AFTER verifying the link is active, not expired, and password-verified.
 func (h *ShareLinkViewHandler) incrementViewCount(token string) {
@@ -275,6 +110,224 @@ func (h *ShareLinkViewHandler) incrementViewCount(token string) {
 			log.Printf("[incrementViewCount] failed to update view_count for token %s: %v", token, err)
 		}
 	}()
+}
+
+func buildZippedPathSegments(rootName, relativePath string) []pathSegment {
+	segments := []pathSegment{{Name: rootName, Path: "/"}}
+
+	if relativePath != "/" && relativePath != "" {
+		parts := strings.Split(strings.Trim(relativePath, "/"), "/")
+		cumPath := "/"
+		for _, part := range parts {
+			if part == "" {
+				continue
+			}
+			cumPath += part + "/"
+			segments = append(segments, pathSegment{Name: part, Path: cumPath})
+		}
+	}
+
+	return segments
+}
+
+func buildRawPath(sl *shareLinkData) string {
+	if sl.isDirShareLink {
+		return fmt.Sprintf("/d/%s/files/?p=%s&raw=1", sl.token, url.QueryEscape(sl.fileSubPath))
+	}
+	return fmt.Sprintf("/d/%s?raw=1", sl.token)
+}
+
+func (h *ShareLinkViewHandler) buildSharedDirPageBootstrap(c *gin.Context, sl *shareLinkData) pageBootstrapResponse {
+	dirName := filepath.Base(sl.filePath)
+	if sl.filePath == "/" || sl.filePath == "" {
+		dirName = sl.repoName
+	}
+
+	relativePath := c.DefaultQuery("p", "/")
+	if relativePath == "" {
+		relativePath = "/"
+	}
+	mode := c.DefaultQuery("mode", "list")
+	thumbnailSize := 48
+	zipped := buildZippedPathSegments(dirName, relativePath)
+
+	dirPath := sl.filePath
+	if dirPath == "" || dirPath == "/" {
+		dirPath = relativePath
+	} else if relativePath != "/" {
+		dirPath = strings.TrimSuffix(sl.filePath, "/") + "/" + strings.TrimPrefix(relativePath, "/")
+	}
+
+	passwordVerified := h.verifyShareLinkPasswordCookie(c, sl.token, sl.passwordHash)
+	noPassword := sl.passwordHash == "" || passwordVerified
+	needPassword := sl.passwordHash != "" && !passwordVerified
+
+	pageOptions := map[string]any{
+		"token":                sl.token,
+		"repoID":               sl.libraryID,
+		"repoName":             sl.repoName,
+		"path":                 sl.filePath,
+		"dirName":              dirName,
+		"dirPath":              dirPath,
+		"relativePath":         relativePath,
+		"mode":                 mode,
+		"thumbnailSize":        thumbnailSize,
+		"zipped":               zipped,
+		"canDownload":          sl.canDownload,
+		"canUpload":            sl.canUpload,
+		"sharedBy":             sl.creatorName,
+		"noPassword":           noPassword,
+		"needPassword":         needPassword,
+		"noQuota":              false,
+		"trafficOverLimit":     false,
+		"enableVideoThumbnail": false,
+		"permissions": map[string]bool{
+			"can_edit":     sl.canEdit,
+			"can_download": sl.canDownload,
+			"can_upload":   sl.canUpload,
+		},
+	}
+
+	return pageBootstrapResponse{
+		RenderMode: "bundle",
+		Bundle:     "sharedDirView",
+		Title:      dirName + " - SesameFS",
+		PageOptions: pageOptions,
+	}
+}
+
+func (h *ShareLinkViewHandler) buildSharedFileBundleBootstrap(c *gin.Context, sl *shareLinkData, bundleName, rawPath, filename, ext string, fileSize int64, fileContent string) pageBootstrapResponse {
+	passwordVerified := h.verifyShareLinkPasswordCookie(c, sl.token, sl.passwordHash)
+	noPassword := sl.passwordHash == "" || passwordVerified
+	needPassword := sl.passwordHash != "" && !passwordVerified
+
+	pageOptions := map[string]any{
+		"sharedToken":                sl.token,
+		"repoID":                     sl.libraryID,
+		"commitID":                   sl.commitID,
+		"filePath":                   sl.filePath,
+		"fileName":                   filename,
+		"fileSize":                   fileSize,
+		"rawPath":                    rawPath,
+		"canDownload":                sl.canDownload,
+		"canEdit":                    sl.canEdit,
+		"sharedBy":                   sl.creatorName,
+		"noPassword":                 noPassword,
+		"needPassword":               needPassword,
+		"trafficOverLimit":           false,
+		"fileExt":                    ext,
+		"siteName":                   "SesameFS",
+		"enableWatermark":            false,
+		"zipped":                     nil,
+		"enableShareLinkReportAbuse": false,
+		"fileContent":                fileContent,
+		"err":                        "",
+	}
+
+	return pageBootstrapResponse{
+		RenderMode: "bundle",
+		Bundle:     bundleName,
+		Title:      filename + " - SesameFS",
+		PageOptions: pageOptions,
+	}
+}
+
+func buildShareDownloadPath(sl *shareLinkData) string {
+	if sl.isDirShareLink {
+		return fmt.Sprintf("/d/%s/files/?p=%s&dl=1", sl.token, url.QueryEscape(sl.fileSubPath))
+	}
+	return fmt.Sprintf("/d/%s?dl=1", sl.token)
+}
+
+func (h *ShareLinkViewHandler) buildOnlyOfficeShareBootstrap(sl *shareLinkData, filename, ext string, fileSize int64) (pageBootstrapResponse, error) {
+	downloadToken, err := h.tokenCreator.CreateLinkDownloadToken(sl.orgID, sl.libraryID, sl.filePath, sl.createdBy)
+	if err != nil {
+		return pageBootstrapResponse{}, fmt.Errorf("failed to create download token: %w", err)
+	}
+
+	ooServerURL := h.config.OnlyOffice.ServerURL
+	if ooServerURL == "" {
+		ooServerURL = h.serverURL
+	}
+	downloadURL := ooServerURL + "/seafhttp/files/" + downloadToken + "/" + filename
+
+	fileID := ""
+	if sl.targetEntry != nil {
+		fileID = sl.targetEntry.ID
+	}
+	docKey := generateDocKey(sl.libraryID, sl.filePath, fileID)
+
+	docConfig := OnlyOfficeConfig{
+		Document: OnlyOfficeDocument{
+			FileType: ext,
+			Key:      docKey,
+			Title:    filename,
+			URL:      downloadURL,
+			Permissions: &OnlyOfficePermissions{
+				Edit:      false,
+				Download:  sl.canDownload,
+				Print:     sl.canDownload,
+				Copy:      true,
+				Review:    false,
+				Comment:   false,
+				FillForms: false,
+			},
+		},
+		DocumentType: getDocumentType(filename),
+		EditorConfig: OnlyOfficeEditorConfig{
+			Mode: "view",
+			User: OnlyOfficeUser{
+				ID:   "anonymous",
+				Name: "Anonymous",
+			},
+			Customization: &OnlyOfficeCustomization{
+				Forcesave:  false,
+				SubmitForm: false,
+			},
+		},
+	}
+
+	if h.config.OnlyOffice.JWTSecret != "" {
+		ooHandler := &OnlyOfficeHandler{db: h.db, config: h.config}
+		token, signErr := ooHandler.signJWT(docConfig)
+		if signErr == nil {
+			docConfig.Token = token
+		}
+	}
+
+	return pageBootstrapResponse{
+		RenderMode: "onlyoffice",
+		Title:      filename + " - SesameFS",
+		PageOptions: map[string]any{
+			"fileName":      filename,
+			"fileSize":      fileSize,
+			"sharedBy":      sl.creatorName,
+			"canDownload":   sl.canDownload,
+			"downloadPath":  buildShareDownloadPath(sl),
+			"apiJSURL":      h.config.OnlyOffice.APIJSURL,
+			"onlyOfficeConfig": docConfig,
+		},
+	}, nil
+}
+
+func (h *ShareLinkViewHandler) buildUploadLinkPageBootstrap(token, libraryID, filePath, dirName, creatorName string, needPassword bool) pageBootstrapResponse {
+	pageOptions := map[string]any{
+		"token":             token,
+		"repoID":            libraryID,
+		"path":              filePath,
+		"dirName":           dirName,
+		"sharedBy":          map[string]string{"name": creatorName, "avatar": ""},
+		"noQuota":           false,
+		"maxUploadFileSize": nil,
+		"needPassword":      needPassword,
+	}
+
+	return pageBootstrapResponse{
+		RenderMode: "bundle",
+		Bundle:     "uploadLink",
+		Title:      dirName + " - Upload - SesameFS",
+		PageOptions: pageOptions,
+	}
 }
 
 // resolveShareLink looks up and validates a share link token from the unified share_links table.
@@ -407,31 +460,81 @@ func parseShareLinkPermission(permission string) (canEdit, canDownload, canUploa
 
 // ServeShareLinkPage handles GET /d/:token
 func (h *ShareLinkViewHandler) ServeShareLinkPage(c *gin.Context) {
+	if c.Query("dl") != "1" && c.Query("raw") != "1" {
+		c.JSON(http.StatusNotFound, gin.H{"error": "public share pages are served by the frontend shell"})
+		return
+	}
+
+	token := c.Param("token")
+	sl, err := h.resolveShareLink(token, false)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "share link not found"})
+		return
+	}
+	if sl.isExpired || sl.isDisabled {
+		c.JSON(http.StatusGone, sl.unavailableJSON())
+		return
+	}
+
+	fsHelper := NewFSHelper(h.db)
+	rootFSID, _, err := fsHelper.GetRootFSID(sl.libraryID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to access shared library"})
+		return
+	}
+
+	sharePath := sl.filePath
+	if sharePath == "" {
+		sharePath = "/"
+	}
+	if sharePath == "/" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "raw/download is only available for shared files"})
+		return
+	}
+
+	result, err := fsHelper.TraverseToPathFromRoot(sl.libraryID, rootFSID, sharePath)
+	if err != nil || result.TargetEntry == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "shared file not found"})
+		return
+	}
+
+	sl.targetEntry = result.TargetEntry
+	sl.isDir = result.TargetEntry.Mode == ModeDir || result.TargetEntry.Mode&0170000 == 040000
+	if sl.isDir {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "raw/download is only available for shared files"})
+		return
+	}
+	if sl.passwordHash != "" && !h.verifyShareLinkPasswordCookie(c, token, sl.passwordHash) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Password required"})
+		return
+	}
+
+	if c.Query("dl") == "1" {
+		h.handleShareLinkDownload(c, sl, fsHelper, rootFSID)
+		return
+	}
+	h.handleShareLinkRaw(c, sl)
+}
+
+// GetShareLinkBootstrap returns the frontend bootstrap payload for GET /d/:token.
+func (h *ShareLinkViewHandler) GetShareLinkBootstrap(c *gin.Context) {
 	token := c.Param("token")
 
 	sl, err := h.resolveShareLink(token, false)
 	if err != nil {
-		c.Header("Content-Type", "text/html; charset=utf-8")
-		c.String(http.StatusNotFound, errorPageHTML("Not Found", "This share link does not exist."))
+		c.JSON(http.StatusNotFound, gin.H{"error": "share link not found"})
 		return
 	}
 
 	if sl.isExpired || sl.isDisabled {
-		c.Header("Content-Type", "text/html; charset=utf-8")
-		if sl.isDisabled {
-			c.String(http.StatusGone, errorPageHTML("Link Disabled", "This share link has been disabled by an administrator."))
-		} else {
-			c.String(http.StatusGone, errorPageHTML("Link Expired", "This share link has expired or reached its download limit."))
-		}
+		c.JSON(http.StatusGone, sl.unavailableJSON())
 		return
 	}
 
-	// Determine if this is a file or directory share
 	fsHelper := NewFSHelper(h.db)
 	rootFSID, _, err := fsHelper.GetRootFSID(sl.libraryID)
 	if err != nil {
-		c.Header("Content-Type", "text/html; charset=utf-8")
-		c.String(http.StatusInternalServerError, errorPageHTML("Error", "Failed to access the shared library."))
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to access shared library"})
 		return
 	}
 
@@ -440,65 +543,108 @@ func (h *ShareLinkViewHandler) ServeShareLinkPage(c *gin.Context) {
 		sharePath = "/"
 	}
 
-	isDir := false
-
 	if sharePath == "/" {
-		isDir = true
-	} else {
-		result, err := fsHelper.TraverseToPathFromRoot(sl.libraryID, rootFSID, sharePath)
-		if err != nil {
-			c.Header("Content-Type", "text/html; charset=utf-8")
-			c.String(http.StatusNotFound, errorPageHTML("Not Found", "The shared file or folder could not be found."))
-			return
+		sl.isDir = true
+		bootstrap := h.buildSharedDirPageBootstrap(c, sl)
+		if pageOptions, ok := bootstrap.PageOptions.(map[string]any); ok {
+			if noPassword, _ := pageOptions["noPassword"].(bool); noPassword {
+				h.incrementViewCount(sl.token)
+			}
 		}
-		if result.TargetEntry != nil {
-			sl.targetEntry = result.TargetEntry
-			isDir = result.TargetEntry.Mode == ModeDir || result.TargetEntry.Mode&0170000 == 040000
-		} else {
-			// Path not found in the FS tree
-			c.Header("Content-Type", "text/html; charset=utf-8")
-			c.String(http.StatusNotFound, errorPageHTML("Not Found", "The shared file or folder could not be found."))
-			return
-		}
-	}
-
-	sl.isDir = isDir
-
-	// Check password for download/raw/page access
-	passwordOK := h.verifyShareLinkPasswordCookie(c, sl.token, sl.passwordHash)
-
-	// Handle direct download (?dl=1)
-	if c.Query("dl") == "1" && !isDir {
-		if sl.passwordHash != "" && !passwordOK {
-			c.Header("Content-Type", "text/html; charset=utf-8")
-			c.String(http.StatusForbidden, errorPageHTML("Password Required", "This share link is password-protected."))
-			return
-		}
-		// download_count is tracked separately in handleShareLinkDownload; no view_count here
-		h.handleShareLinkDownload(c, sl, fsHelper, rootFSID)
+		c.JSON(http.StatusOK, bootstrap)
 		return
 	}
 
-	// Handle raw file content (?raw=1) for inline preview (images, PDFs, etc.)
-	if c.Query("raw") == "1" && !isDir {
-		if sl.passwordHash != "" && !passwordOK {
-			c.Header("Content-Type", "text/html; charset=utf-8")
-			c.String(http.StatusForbidden, errorPageHTML("Password Required", "This share link is password-protected."))
-			return
-		}
-		// raw is an embedded resource request, not a page view
-		h.handleShareLinkRaw(c, sl)
+	result, err := fsHelper.TraverseToPathFromRoot(sl.libraryID, rootFSID, sharePath)
+	if err != nil || result.TargetEntry == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "shared file or folder not found"})
 		return
 	}
 
-	// Serve the appropriate HTML page
-	// view_count is incremented inside serveSharedDirPage / serveSharedFilePage
-	// AFTER password verification, so password-prompt pages don't inflate the counter.
-	if isDir {
-		h.serveSharedDirPage(c, sl)
-	} else {
-		h.serveSharedFilePage(c, sl)
+	sl.targetEntry = result.TargetEntry
+	sl.isDir = result.TargetEntry.Mode == ModeDir || result.TargetEntry.Mode&0170000 == 040000
+	if sl.isDir {
+		bootstrap := h.buildSharedDirPageBootstrap(c, sl)
+		if pageOptions, ok := bootstrap.PageOptions.(map[string]any); ok {
+			if noPassword, _ := pageOptions["noPassword"].(bool); noPassword {
+				h.incrementViewCount(sl.token)
+			}
+		}
+		c.JSON(http.StatusOK, bootstrap)
+		return
 	}
+
+	bootstrap, status, err := h.buildShareFileBootstrapResponse(c, sl)
+	if err != nil {
+		c.JSON(status, gin.H{"error": err.Error()})
+		return
+	}
+	if pageOptions, ok := bootstrap.PageOptions.(map[string]any); ok {
+		if noPassword, _ := pageOptions["noPassword"].(bool); noPassword {
+			h.incrementViewCount(sl.token)
+		}
+	}
+
+	c.JSON(http.StatusOK, bootstrap)
+}
+
+// GetShareLinkFileBootstrap returns the frontend bootstrap payload for GET /d/:token/files/?p=...
+func (h *ShareLinkViewHandler) GetShareLinkFileBootstrap(c *gin.Context) {
+	token := c.Param("token")
+	filePath := c.Query("p")
+	if filePath == "" {
+		filePath = "/"
+	}
+
+	sl, err := h.resolveShareLink(token, false)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "share link not found"})
+		return
+	}
+
+	if sl.isExpired || sl.isDisabled {
+		c.JSON(http.StatusGone, sl.unavailableJSON())
+		return
+	}
+
+	fullPath, err := buildShareLinkFullPath(sl.filePath, filePath)
+	if err != nil {
+		c.JSON(http.StatusForbidden, gin.H{"error": "invalid path"})
+		return
+	}
+
+	sl.filePath = fullPath
+	sl.isDirShareLink = true
+	sl.fileSubPath = filePath
+
+	fsHelper := NewFSHelper(h.db)
+	rootFSID, _, err := fsHelper.GetRootFSID(sl.libraryID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to access shared library"})
+		return
+	}
+
+	result, err := fsHelper.TraverseToPathFromRoot(sl.libraryID, rootFSID, fullPath)
+	if err != nil || result.TargetEntry == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "shared file not found"})
+		return
+	}
+
+	sl.targetEntry = result.TargetEntry
+	sl.isDir = false
+
+	bootstrap, status, err := h.buildShareFileBootstrapResponse(c, sl)
+	if err != nil {
+		c.JSON(status, gin.H{"error": err.Error()})
+		return
+	}
+	if pageOptions, ok := bootstrap.PageOptions.(map[string]any); ok {
+		if noPassword, _ := pageOptions["noPassword"].(bool); noPassword {
+			h.incrementViewCount(sl.token)
+		}
+	}
+
+	c.JSON(http.StatusOK, bootstrap)
 }
 
 // handleShareLinkDownload handles ?dl=1 for file share links
@@ -657,112 +803,13 @@ func (h *ShareLinkViewHandler) handleShareLinkRaw(c *gin.Context, sl *shareLinkD
 
 // serveSharedDirPage renders the shared directory view
 func (h *ShareLinkViewHandler) serveSharedDirPage(c *gin.Context, sl *shareLinkData) {
-	dirName := filepath.Base(sl.filePath)
-	if sl.filePath == "/" || sl.filePath == "" {
-		dirName = sl.repoName
-	}
-
-	// Get browsing path from query parameter (for navigating into subdirectories)
-	relativePath := c.DefaultQuery("p", "/")
-	if relativePath == "" {
-		relativePath = "/"
-	}
-	mode := c.DefaultQuery("mode", "list")
-	thumbnailSize := 48
-
-	// Build the zipped breadcrumb path array
-	// zipped is [{name, path}, ...] for breadcrumb navigation
-	zippedJSON := buildZippedPath(dirName, relativePath)
-
-	// dirPath is the full filesystem path: sharePath + relativePath
-	dirPath := sl.filePath
-	if dirPath == "" || dirPath == "/" {
-		dirPath = relativePath
-	} else if relativePath != "/" {
-		dirPath = strings.TrimSuffix(sl.filePath, "/") + "/" + strings.TrimPrefix(relativePath, "/")
-	}
-
-	passwordVerified := h.verifyShareLinkPasswordCookie(c, sl.token, sl.passwordHash)
-	noPassword := sl.passwordHash == "" || passwordVerified
-	needPassword := sl.passwordHash != "" && !passwordVerified
-
-	// Count view only when the user can actually see content (no password, or already verified).
-	// If they still need to enter the password, the view will be counted on the page reload
-	// after successful password verification (cookie will be set).
-	if noPassword {
-		h.incrementViewCount(sl.token)
-	}
-
-	pageOptions := fmt.Sprintf(`{
-		"token": %q,
-		"repoID": %q,
-		"repoName": %q,
-		"path": %q,
-		"dirName": %q,
-		"dirPath": %q,
-		"relativePath": %q,
-		"mode": %q,
-		"thumbnailSize": %d,
-		"zipped": %s,
-		"canDownload": %t,
-		"canUpload": %t,
-		"sharedBy": %q,
-		"noPassword": %t,
-		"needPassword": %t,
-		"noQuota": false,
-		"trafficOverLimit": false,
-		"enableVideoThumbnail": false,
-		"permissions": {"can_edit": %t, "can_download": %t, "can_upload": %t}
-	}`,
-		sl.token,
-		sl.libraryID,
-		html.EscapeString(sl.repoName),
-		sl.filePath,
-		html.EscapeString(dirName),
-		dirPath,
-		relativePath,
-		mode,
-		thumbnailSize,
-		zippedJSON,
-		sl.canDownload,
-		sl.canUpload,
-		html.EscapeString(sl.creatorName),
-		noPassword,
-		needPassword,
-		sl.canEdit,
-		sl.canDownload,
-		sl.canUpload,
-	)
-
-	htmlPage := h.buildSharePageHTML("sharedDirView", dirName+" - SesameFS", pageOptions)
-	c.Header("Content-Type", "text/html; charset=utf-8")
-	c.String(http.StatusOK, htmlPage)
+	c.JSON(http.StatusNotFound, gin.H{"error": "public share pages are served by the frontend shell"})
 }
 
 // buildZippedPath builds the breadcrumb JSON array for shared dir navigation
 // Returns JSON like [{"name":"Root","path":"/"},{"name":"subfolder","path":"/subfolder/"}]
 func buildZippedPath(rootName, relativePath string) string {
-	type pathSegment struct {
-		Name string `json:"name"`
-		Path string `json:"path"`
-	}
-
-	segments := []pathSegment{{Name: rootName, Path: "/"}}
-
-	if relativePath != "/" && relativePath != "" {
-		// Split path and build cumulative breadcrumbs
-		parts := strings.Split(strings.Trim(relativePath, "/"), "/")
-		cumPath := "/"
-		for _, part := range parts {
-			if part == "" {
-				continue
-			}
-			cumPath += part + "/"
-			segments = append(segments, pathSegment{Name: part, Path: cumPath})
-		}
-	}
-
-	data, err := json.Marshal(segments)
+	data, err := json.Marshal(buildZippedPathSegments(rootName, relativePath))
 	if err != nil {
 		return `[{"name":"Root","path":"/"}]`
 	}
@@ -841,186 +888,36 @@ func (h *ShareLinkViewHandler) readFileContentAsText(sl *shareLinkData) string {
 
 // serveSharedFilePage renders the shared file view
 func (h *ShareLinkViewHandler) serveSharedFilePage(c *gin.Context, sl *shareLinkData) {
+	c.JSON(http.StatusNotFound, gin.H{"error": "public share pages are served by the frontend shell"})
+}
+
+func (h *ShareLinkViewHandler) buildShareFileBootstrapResponse(c *gin.Context, sl *shareLinkData) (pageBootstrapResponse, int, error) {
 	filename := filepath.Base(sl.filePath)
 	ext := strings.ToLower(strings.TrimPrefix(filepath.Ext(filename), "."))
 
-	// Check password protection BEFORE any rendering
-	if sl.passwordHash != "" && !h.verifyShareLinkPasswordCookie(c, sl.token, sl.passwordHash) {
-		h.servePasswordPage(c, sl.token, "d", filename)
-		return
-	}
-
-	// Password verified (or not required) — count the view now that the user can see content.
-	h.incrementViewCount(sl.token)
-
-	// Build raw file path for preview (serves actual file content with correct MIME type)
-	// For files inside a shared directory, we need /d/{token}/files/?p={path}&raw=1
-	// For direct file share links, we use /d/{token}?raw=1
-	var rawPath string
-	if sl.isDirShareLink {
-		rawPath = fmt.Sprintf("/d/%s/files/?p=%s&raw=1", sl.token, url.QueryEscape(sl.fileSubPath))
-	} else {
-		rawPath = fmt.Sprintf("/d/%s?raw=1", sl.token)
-	}
-
+	rawPath := buildRawPath(sl)
 	var fileSize int64
 	if sl.targetEntry != nil {
 		fileSize = sl.targetEntry.Size
 	}
 
-	// For PDFs and certain file types, use server-rendered preview page with embedded viewer
-	if useEmbeddedPreview(ext) {
-		htmlPage := h.buildEmbeddedPreviewPage(filename, ext, rawPath, fileSize, sl)
-		c.Header("Content-Type", "text/html; charset=utf-8")
-		c.String(http.StatusOK, htmlPage)
-		return
-	}
-
-	// For document types (docx, xlsx, pptx, etc.), embed OnlyOffice viewer in the preview page
-	if h.config.OnlyOffice.Enabled && isOnlyOfficeViewable(ext) {
-		htmlPage, err := h.buildOnlyOfficePreviewPage(filename, ext, fileSize, sl)
+	if ext != "pdf" && h.config.OnlyOffice.Enabled && isOnlyOfficeViewable(ext) {
+		bootstrap, err := h.buildOnlyOfficeShareBootstrap(sl, filename, ext, fileSize)
 		if err == nil {
-			c.Header("Content-Type", "text/html; charset=utf-8")
-			c.String(http.StatusOK, htmlPage)
-			return
+			return bootstrap, http.StatusOK, nil
 		}
-		// Fall through to React bundle if OnlyOffice preview fails
-		slog.Warn("OnlyOffice preview failed, falling back to React bundle", "file", filename, "error", err)
+		slog.Warn("OnlyOffice preview bootstrap failed, falling back to bundle", "file", filename, "error", err)
 	}
 
 	bundleName := extensionToBundleName(ext)
 
-	// For unknown file types (no preview), show a clean download page instead of a broken React bundle
-	if bundleName == "sharedFileViewUnknown" {
-		htmlPage := h.buildEmbeddedPreviewPage(filename, ext, "", fileSize, sl)
-		c.Header("Content-Type", "text/html; charset=utf-8")
-		c.String(http.StatusOK, htmlPage)
-		return
-	}
-
-	// For text files, read file content and embed it directly (the React component expects fileContent)
-	var fileContentJSON string
+	fileContent := ""
 	if bundleName == "sharedFileViewText" || bundleName == "sharedFileViewMarkdown" {
-		content := h.readFileContentAsText(sl)
-		contentBytes, err := json.Marshal(content)
-		if err != nil {
-			fileContentJSON = `""`
-		} else {
-			fileContentJSON = string(contentBytes)
-		}
-	} else {
-		fileContentJSON = `""`
+		fileContent = h.readFileContentAsText(sl)
 	}
 
-	passwordVerified := h.verifyShareLinkPasswordCookie(c, sl.token, sl.passwordHash)
-	noPassword := sl.passwordHash == "" || passwordVerified
-	needPassword := sl.passwordHash != "" && !passwordVerified
-
-	pageOptions := fmt.Sprintf(`{
-		"sharedToken": %q,
-		"repoID": %q,
-		"commitID": %q,
-		"filePath": %q,
-		"fileName": %q,
-		"fileSize": %d,
-		"rawPath": %q,
-		"canDownload": %t,
-		"canEdit": %t,
-		"sharedBy": %q,
-		"noPassword": %t,
-		"needPassword": %t,
-		"trafficOverLimit": false,
-		"fileExt": %q,
-		"siteName": "SesameFS",
-		"enableWatermark": false,
-		"zipped": null,
-		"enableShareLinkReportAbuse": false,
-		"fileContent": %s,
-		"err": ""
-	}`,
-		sl.token,
-		sl.libraryID,
-		sl.commitID,
-		sl.filePath,
-		html.EscapeString(filename),
-		fileSize,
-		rawPath,
-		sl.canDownload,
-		sl.canEdit,
-		html.EscapeString(sl.creatorName),
-		noPassword,
-		needPassword,
-		ext,
-		fileContentJSON,
-	)
-
-	htmlPage := h.buildSharePageHTML(bundleName, filename+" - SesameFS", pageOptions)
-	c.Header("Content-Type", "text/html; charset=utf-8")
-	c.String(http.StatusOK, htmlPage)
+	return h.buildSharedFileBundleBootstrap(c, sl, bundleName, rawPath, filename, ext, fileSize, fileContent), http.StatusOK, nil
 }
-
-// useEmbeddedPreview returns true for file types that should use the server-rendered
-// embedded preview page instead of React bundles
-func useEmbeddedPreview(ext string) bool {
-	switch ext {
-	case "pdf":
-		return true
-	case "png", "jpg", "jpeg", "gif", "bmp", "webp", "svg", "ico", "tiff", "tif":
-		return true
-	case "mp4", "webm", "ogg", "mov":
-		return true
-	case "mp3", "wav", "flac", "aac":
-		return true
-	}
-	return false
-}
-
-// buildEmbeddedPreviewPage generates a clean HTML page with embedded file preview
-func (h *ShareLinkViewHandler) buildEmbeddedPreviewPage(filename, ext, rawPath string, fileSize int64, sl *shareLinkData) string {
-	var downloadLink string
-	if sl.isDirShareLink {
-		downloadLink = fmt.Sprintf("/d/%s/files/?p=%s&dl=1", sl.token, url.QueryEscape(sl.fileSubPath))
-	} else {
-		downloadLink = fmt.Sprintf("/d/%s?dl=1", sl.token)
-	}
-
-	previewContent := buildPreviewContent(ext, rawPath, filename)
-
-	var downloadBtn string
-	if sl.canDownload {
-		fileSizeStr := formatFileSize(fileSize)
-		downloadBtn = fmt.Sprintf(`<a href="%s" class="btn-download">Download (%s)</a>`, html.EscapeString(downloadLink), fileSizeStr)
-	}
-
-	data := templates.SharePreviewData{
-		Filename:       filename,
-		SharedBy:       sl.creatorName,
-		DownloadBtn:    htmltemplate.HTML(downloadBtn),
-		PreviewContent: htmltemplate.HTML(previewContent),
-	}
-
-	s, err := templates.RenderString("share_file_preview.html", data)
-	if err != nil {
-		log.Printf("[buildEmbeddedPreviewPage] template error: %v", err)
-		return "<html><body><h1>Internal Error</h1></body></html>"
-	}
-	return s
-}
-
-// formatFileSize formats bytes into a human-readable string
-func formatFileSize(size int64) string {
-	if size < 1024 {
-		return fmt.Sprintf("%d B", size)
-	}
-	if size < 1024*1024 {
-		return fmt.Sprintf("%.1f KB", float64(size)/1024)
-	}
-	if size < 1024*1024*1024 {
-		return fmt.Sprintf("%.1f MB", float64(size)/(1024*1024))
-	}
-	return fmt.Sprintf("%.1f GB", float64(size)/(1024*1024*1024))
-}
-
 // isOnlyOfficeViewable checks if a file extension can be viewed with OnlyOffice
 func isOnlyOfficeViewable(ext string) bool {
 	switch ext {
@@ -1032,239 +929,6 @@ func isOnlyOfficeViewable(ext string) bool {
 	}
 	return false
 }
-
-// buildOnlyOfficePreviewPage generates an embedded preview page with the OnlyOffice viewer
-// inside the standard share link layout (header + preview container), not a full-page editor.
-func (h *ShareLinkViewHandler) buildOnlyOfficePreviewPage(filename, ext string, fileSize int64, sl *shareLinkData) (string, error) {
-	// Generate download token so OnlyOffice server can fetch the document
-	downloadToken, err := h.tokenCreator.CreateLinkDownloadToken(sl.orgID, sl.libraryID, sl.filePath, sl.createdBy)
-	if err != nil {
-		return "", fmt.Errorf("failed to create download token: %w", err)
-	}
-
-	// Use OnlyOffice-specific server URL for download (URL that OnlyOffice can reach)
-	ooServerURL := h.config.OnlyOffice.ServerURL
-	if ooServerURL == "" {
-		ooServerURL = h.serverURL
-	}
-	downloadURL := ooServerURL + "/seafhttp/files/" + downloadToken + "/" + filename
-
-	// Generate document key
-	fileID := ""
-	if sl.targetEntry != nil {
-		fileID = sl.targetEntry.ID
-	}
-	docKey := generateDocKey(sl.libraryID, sl.filePath, fileID)
-
-	// Build OnlyOffice config in view-only mode
-	docConfig := OnlyOfficeConfig{
-		Document: OnlyOfficeDocument{
-			FileType: ext,
-			Key:      docKey,
-			Title:    filename,
-			URL:      downloadURL,
-			Permissions: &OnlyOfficePermissions{
-				Edit:      false,
-				Download:  sl.canDownload,
-				Print:     sl.canDownload,
-				Copy:      true,
-				Review:    false,
-				Comment:   false,
-				FillForms: false,
-			},
-		},
-		DocumentType: getDocumentType(filename),
-		EditorConfig: OnlyOfficeEditorConfig{
-			Mode: "view",
-			User: OnlyOfficeUser{
-				ID:   "anonymous",
-				Name: "Anonymous",
-			},
-			Customization: &OnlyOfficeCustomization{
-				Forcesave:  false,
-				SubmitForm: false,
-			},
-		},
-	}
-
-	// Sign JWT if secret is configured
-	if h.config.OnlyOffice.JWTSecret != "" {
-		ooHandler := &OnlyOfficeHandler{
-			db:     h.db,
-			config: h.config,
-		}
-		token, signErr := ooHandler.signJWT(docConfig)
-		if signErr == nil {
-			docConfig.Token = token
-		}
-	}
-
-	configJSON, err := json.Marshal(docConfig)
-	if err != nil {
-		return "", fmt.Errorf("failed to marshal OnlyOffice config: %w", err)
-	}
-
-	downloadLink := fmt.Sprintf("/d/%s?dl=1", sl.token)
-	var downloadBtn string
-	if sl.canDownload {
-		fileSizeStr := formatFileSize(fileSize)
-		downloadBtn = fmt.Sprintf(`<a href="%s" class="btn-download">Download (%s)</a>`, html.EscapeString(downloadLink), fileSizeStr)
-	}
-
-	data := templates.ShareOOPreviewData{
-		Filename:    filename,
-		SharedBy:    sl.creatorName,
-		DownloadBtn: htmltemplate.HTML(downloadBtn),
-		APIJSURL:    h.config.OnlyOffice.APIJSURL,
-		ConfigJSON:  htmltemplate.JS(configJSON),
-	}
-
-	htmlPage, renderErr := templates.RenderString("share_onlyoffice_preview.html", data)
-	if renderErr != nil {
-		return "", fmt.Errorf("failed to render template: %w", renderErr)
-	}
-	return htmlPage, nil
-}
-
-// serveSharedFileOnlyOffice renders the OnlyOffice viewer for a shared file
-func (h *ShareLinkViewHandler) serveSharedFileOnlyOffice(c *gin.Context, sl *shareLinkData, filename, ext string) {
-	// Generate download token so OnlyOffice server can fetch the document
-	downloadToken, err := h.tokenCreator.CreateLinkDownloadToken(sl.orgID, sl.libraryID, sl.filePath, sl.createdBy)
-	if err != nil {
-		c.Header("Content-Type", "text/html; charset=utf-8")
-		c.String(http.StatusInternalServerError, errorPageHTML("Error", "Failed to generate document access token."))
-		return
-	}
-
-	// Use OnlyOffice-specific server URL for download (URL that OnlyOffice can reach)
-	ooServerURL := h.config.OnlyOffice.ServerURL
-	if ooServerURL == "" {
-		ooServerURL = h.serverURL
-	}
-	downloadURL := ooServerURL + "/seafhttp/files/" + downloadToken + "/" + filename
-
-	// Generate document key
-	fileID := ""
-	if sl.targetEntry != nil {
-		fileID = sl.targetEntry.ID
-	}
-	docKey := generateDocKey(sl.libraryID, sl.filePath, fileID)
-
-	// Build OnlyOffice config in view-only mode
-	docConfig := OnlyOfficeConfig{
-		Document: OnlyOfficeDocument{
-			FileType: ext,
-			Key:      docKey,
-			Title:    filename,
-			URL:      downloadURL,
-			Permissions: &OnlyOfficePermissions{
-				Edit:      false,
-				Download:  sl.canDownload,
-				Print:     sl.canDownload,
-				Copy:      true,
-				Review:    false,
-				Comment:   false,
-				FillForms: false,
-			},
-		},
-		DocumentType: getDocumentType(filename),
-		EditorConfig: OnlyOfficeEditorConfig{
-			Mode: "view",
-			User: OnlyOfficeUser{
-				ID:   "anonymous",
-				Name: "Anonymous",
-			},
-			Customization: &OnlyOfficeCustomization{
-				Forcesave:  false,
-				SubmitForm: false,
-			},
-		},
-	}
-
-	// Sign JWT if secret is configured
-	if h.config.OnlyOffice.JWTSecret != "" {
-		ooHandler := &OnlyOfficeHandler{
-			db:     h.db,
-			config: h.config,
-		}
-		token, err := ooHandler.signJWT(docConfig)
-		if err == nil {
-			docConfig.Token = token
-		}
-	}
-
-	htmlPage := onlyOfficeEditorHTML(h.config.OnlyOffice.APIJSURL, docConfig, filename)
-	c.Header("Content-Type", "text/html; charset=utf-8")
-	c.String(http.StatusOK, htmlPage)
-}
-
-// buildSharePageHTML generates the HTML page that loads the appropriate bundle
-func (h *ShareLinkViewHandler) buildSharePageHTML(bundleName, title, pageOptionsJSON string) string {
-	data := h.buildSharePageData(bundleName, title, pageOptionsJSON)
-	s, err := templates.RenderString("share_page.html", data)
-	if err != nil {
-		log.Printf("[buildSharePageHTML] template error: %v", err)
-		return "<html><body><h1>Internal Error</h1></body></html>"
-	}
-	return s
-}
-
-// buildSharePageData builds the template data for share/upload page templates.
-func (h *ShareLinkViewHandler) buildSharePageData(bundleName, title, pageOptionsJSON string) templates.SharePageData {
-	h.refreshBundleMaps(false)
-
-	runtimeJS := h.resolveJSBundle("runtime")
-	commonsJS := h.resolveJSBundle("commons")
-	entryJS := h.resolveJSBundle(bundleName)
-	commonsCSS := h.resolveCSSBundle("commons")
-	entryCSS := h.resolveCSSBundle(bundleName)
-
-	var cssLinks []string
-	cssLinks = append(cssLinks, "/static/css/seahub.css")
-	if commonsCSS != "" {
-		cssLinks = append(cssLinks, "/static/css/"+commonsCSS)
-	}
-	if entryCSS != "" {
-		cssLinks = append(cssLinks, "/static/css/"+entryCSS)
-	}
-
-	var scriptTags []string
-	if runtimeJS != "" {
-		scriptTags = append(scriptTags, "/static/js/"+runtimeJS)
-	}
-	if commonsJS != "" {
-		scriptTags = append(scriptTags, "/static/js/"+commonsJS)
-	}
-	if entryJS != "" {
-		scriptTags = append(scriptTags, "/static/js/"+entryJS)
-	}
-
-	return templates.SharePageData{
-		Title:           title,
-		CSSLinks:        cssLinks,
-		ScriptTags:      scriptTags,
-		PageOptionsJSON: htmltemplate.JS(pageOptionsJSON),
-	}
-}
-
-func (h *ShareLinkViewHandler) resolveJSBundle(name string) string {
-	h.bundleMu.RLock()
-	defer h.bundleMu.RUnlock()
-	if f, ok := h.jsBundleMap[name]; ok {
-		return f
-	}
-	return ""
-}
-
-func (h *ShareLinkViewHandler) resolveCSSBundle(name string) string {
-	h.bundleMu.RLock()
-	defer h.bundleMu.RUnlock()
-	if f, ok := h.cssBundleMap[name]; ok {
-		return f
-	}
-	return ""
-}
-
 // extensionToBundleName maps a file extension to the appropriate shared view bundle
 func extensionToBundleName(ext string) string {
 	switch ext {
@@ -1471,44 +1135,33 @@ func (h *ShareLinkViewHandler) GetShareLinkRepoTags(c *gin.Context) {
 // This is the route used when clicking a file inside a shared directory.
 // The frontend constructs URLs like: /d/{token}/files/?p=/path/to/file.txt
 func (h *ShareLinkViewHandler) ServeShareLinkFilePage(c *gin.Context) {
+	if c.Query("dl") != "1" && c.Query("raw") != "1" {
+		c.JSON(http.StatusNotFound, gin.H{"error": "public share pages are served by the frontend shell"})
+		return
+	}
+
 	token := c.Param("token")
 	filePath := c.Query("p")
-
-	sl, err := h.resolveShareLink(token, false)
-	if err != nil {
-		c.Header("Content-Type", "text/html; charset=utf-8")
-		c.String(http.StatusNotFound, errorPageHTML("Not Found", "This share link does not exist."))
-		return
-	}
-
-	if sl.isExpired || sl.isDisabled {
-		c.Header("Content-Type", "text/html; charset=utf-8")
-		if sl.isDisabled {
-			c.String(http.StatusGone, errorPageHTML("Link Disabled", "This share link has been disabled by an administrator."))
-		} else {
-			c.String(http.StatusGone, errorPageHTML("Link Expired", "This share link has expired or reached its download limit."))
-		}
-		return
-	}
-
-	if sl.passwordHash != "" && !h.verifyShareLinkPasswordCookie(c, token, sl.passwordHash) {
-		c.Header("Content-Type", "text/html; charset=utf-8")
-		c.String(http.StatusForbidden, errorPageHTML("Password Required", "This share link is password-protected."))
-		return
-	}
-
-	// Build full path with traversal protection
 	if filePath == "" {
 		filePath = "/"
 	}
-	fullPath, err := buildShareLinkFullPath(sl.filePath, filePath)
+
+	sl, err := h.resolveShareLink(token, false)
 	if err != nil {
-		c.Header("Content-Type", "text/html; charset=utf-8")
-		c.String(http.StatusForbidden, errorPageHTML("Forbidden", "Invalid path."))
+		c.JSON(http.StatusNotFound, gin.H{"error": "share link not found"})
+		return
+	}
+	if sl.isExpired || sl.isDisabled {
+		c.JSON(http.StatusGone, sl.unavailableJSON())
 		return
 	}
 
-	// Override the share link's file path with the specific file
+	fullPath, err := buildShareLinkFullPath(sl.filePath, filePath)
+	if err != nil {
+		c.JSON(http.StatusForbidden, gin.H{"error": "invalid path"})
+		return
+	}
+
 	sl.filePath = fullPath
 	sl.isDirShareLink = true
 	sl.fileSubPath = filePath
@@ -1516,36 +1169,28 @@ func (h *ShareLinkViewHandler) ServeShareLinkFilePage(c *gin.Context) {
 	fsHelper := NewFSHelper(h.db)
 	rootFSID, _, err := fsHelper.GetRootFSID(sl.libraryID)
 	if err != nil {
-		c.Header("Content-Type", "text/html; charset=utf-8")
-		c.String(http.StatusInternalServerError, errorPageHTML("Error", "Failed to access the shared library."))
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to access shared library"})
 		return
 	}
 
 	result, err := fsHelper.TraverseToPathFromRoot(sl.libraryID, rootFSID, fullPath)
 	if err != nil || result.TargetEntry == nil {
-		c.Header("Content-Type", "text/html; charset=utf-8")
-		c.String(http.StatusNotFound, errorPageHTML("Not Found", "The shared file could not be found."))
+		c.JSON(http.StatusNotFound, gin.H{"error": "shared file not found"})
 		return
 	}
+
 	sl.targetEntry = result.TargetEntry
 	sl.isDir = false
+	if sl.passwordHash != "" && !h.verifyShareLinkPasswordCookie(c, token, sl.passwordHash) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Password required"})
+		return
+	}
 
-	// Handle direct download (?dl=1)
 	if c.Query("dl") == "1" {
-		// download_count is tracked separately; no view_count here
 		h.handleShareLinkDownload(c, sl, fsHelper, rootFSID)
 		return
 	}
-
-	// Handle raw file content (?raw=1)
-	if c.Query("raw") == "1" {
-		// raw is an embedded resource request, not a page view
-		h.handleShareLinkRaw(c, sl)
-		return
-	}
-
-	// Serve the file view page (view_count incremented inside serveSharedFilePage)
-	h.serveSharedFilePage(c, sl)
+	h.handleShareLinkRaw(c, sl)
 }
 
 // GetShareLinkZipTask handles GET /api/v2.1/share-link-zip-task/
@@ -1605,9 +1250,13 @@ func (h *ShareLinkViewHandler) PostShareLinkZipTask(c *gin.Context) {
 // ServeUploadLinkPage handles GET /u/d/:token
 // Renders the upload link page that allows anonymous file uploads.
 func (h *ShareLinkViewHandler) ServeUploadLinkPage(c *gin.Context) {
+	c.JSON(http.StatusNotFound, gin.H{"error": "public upload pages are served by the frontend shell"})
+}
+
+// GetUploadLinkBootstrap returns the frontend bootstrap payload for GET /u/d/:token.
+func (h *ShareLinkViewHandler) GetUploadLinkBootstrap(c *gin.Context) {
 	token := c.Param("token")
 
-	// Resolve the upload link from DB
 	var orgID, libraryID, filePath, createdBy, passwordHash string
 	var expiresAt *time.Time
 	var active bool
@@ -1617,47 +1266,32 @@ func (h *ShareLinkViewHandler) ServeUploadLinkPage(c *gin.Context) {
 		FROM share_links WHERE link_token = ?
 	`, token).Scan(&orgID, &libraryID, &filePath, &createdBy, &passwordHash, &expiresAt, &active)
 	if err != nil {
-		c.Header("Content-Type", "text/html; charset=utf-8")
-		c.String(http.StatusNotFound, errorPageHTML("Not Found", "This upload link does not exist."))
+		c.JSON(http.StatusNotFound, gin.H{"error": "upload link not found"})
 		return
 	}
 
-	// Check disabled (admin deactivated owner or org) — distinct from time expiration
 	if !active {
-		c.Header("Content-Type", "text/html; charset=utf-8")
-		c.String(http.StatusGone, errorPageHTML("Link Disabled", "This upload link has been disabled by an administrator."))
+		c.JSON(http.StatusGone, gin.H{"error": "upload link has been disabled"})
 		return
 	}
-
-	// Check expiration
 	if expiresAt != nil && time.Now().After(*expiresAt) {
-		c.Header("Content-Type", "text/html; charset=utf-8")
-		c.String(http.StatusGone, errorPageHTML("Link Expired", "This upload link has expired."))
+		c.JSON(http.StatusGone, gin.H{"error": "upload link has expired"})
 		return
 	}
 
-	// Check password-protected upload links
-	needPassword := false
-	if passwordHash != "" {
-		if !h.verifyUploadLinkPasswordCookie(c, token, passwordHash) {
-			needPassword = true
-		}
-	}
+	needPassword := passwordHash != "" && !h.verifyUploadLinkPasswordCookie(c, token, passwordHash)
 
-	// Get library name
 	var repoName string
 	h.db.Session().Query(`SELECT name FROM libraries_by_id WHERE library_id = ?`, libraryID).Scan(&repoName)
 	if repoName == "" {
 		repoName = "Shared folder"
 	}
 
-	// Get uploader display name
 	dirName := filepath.Base(filePath)
 	if filePath == "/" || filePath == "" {
 		dirName = repoName
 	}
 
-	// Get creator info
 	var creatorName, creatorEmail string
 	h.db.Session().Query(`SELECT name, email FROM users WHERE org_id = ? AND user_id = ?`, orgID, createdBy).Scan(&creatorName, &creatorEmail)
 	if creatorName == "" {
@@ -1667,58 +1301,21 @@ func (h *ShareLinkViewHandler) ServeUploadLinkPage(c *gin.Context) {
 		creatorName = "Unknown"
 	}
 
-	// Build shared_by object matching frontend expectations
-	sharedByJSON := fmt.Sprintf(`{"name": %q, "avatar": ""}`, creatorName)
-
-	// Build pageOptions for the uploadLink bundle
-	pageOptions := fmt.Sprintf(`{
-		"token": %q,
-		"repoID": %q,
-		"path": %q,
-		"dirName": %q,
-		"sharedBy": %s,
-		"noQuota": false,
-		"maxUploadFileSize": null,
-		"needPassword": %t
-	}`,
-		token,
-		libraryID,
-		filePath,
-		html.EscapeString(dirName),
-		sharedByJSON,
-		needPassword,
-	)
-
-	// Use buildSharePageHTML but with "uploadLink" bundle and window.uploadLink instead of window.shared.pageOptions
-	htmlPage := h.buildUploadLinkPageHTML("uploadLink", dirName+" - Upload - SesameFS", pageOptions)
-	c.Header("Content-Type", "text/html; charset=utf-8")
-	c.String(http.StatusOK, htmlPage)
+	c.JSON(http.StatusOK, h.buildUploadLinkPageBootstrap(token, libraryID, filePath, dirName, creatorName, needPassword))
 }
-
-// buildUploadLinkPageHTML is similar to buildSharePageHTML but injects window.uploadLink
-func (h *ShareLinkViewHandler) buildUploadLinkPageHTML(bundleName, title, pageOptionsJSON string) string {
-	data := h.buildSharePageData(bundleName, title, pageOptionsJSON)
-	s, err := templates.RenderString("upload_link_page.html", data)
-	if err != nil {
-		log.Printf("[buildUploadLinkPageHTML] template error: %v", err)
-		return "<html><body><h1>Internal Error</h1></body></html>"
-	}
-	return s
-}
-
 // GetUploadLinkUploadURL handles GET /api/v2.1/upload-links/:token/upload/
 // Returns the upload URL for an upload link.
 func (h *ShareLinkViewHandler) GetUploadLinkUploadURL(c *gin.Context) {
 	token := c.Param("token")
 
 	// Resolve upload link
-	var orgID, libraryID, filePath, createdBy string
+	var orgID, libraryID, filePath, createdBy, passwordHash string
 	var expiresAt *time.Time
 	var active bool
 	err := h.db.Session().Query(`
-		SELECT org_id, library_id, file_path, created_by, expires_at, active
+		SELECT org_id, library_id, file_path, created_by, password_hash, expires_at, active
 		FROM share_links WHERE link_token = ?
-	`, token).Scan(&orgID, &libraryID, &filePath, &createdBy, &expiresAt, &active)
+	`, token).Scan(&orgID, &libraryID, &filePath, &createdBy, &passwordHash, &expiresAt, &active)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "upload link not found"})
 		return
@@ -1731,6 +1328,10 @@ func (h *ShareLinkViewHandler) GetUploadLinkUploadURL(c *gin.Context) {
 	}
 	if expiresAt != nil && time.Now().After(*expiresAt) {
 		c.JSON(http.StatusGone, gin.H{"error": "upload link has expired"})
+		return
+	}
+	if passwordHash != "" && !h.verifyUploadLinkPasswordCookie(c, token, passwordHash) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Password required"})
 		return
 	}
 
@@ -1773,6 +1374,10 @@ func (h *ShareLinkViewHandler) PostUploadLinkDone(c *gin.Context) {
 	}
 	if expiresAt != nil && time.Now().After(*expiresAt) {
 		c.JSON(http.StatusGone, gin.H{"error": "upload link has expired"})
+		return
+	}
+	if passwordHash != "" && !h.verifyUploadLinkPasswordCookie(c, token, passwordHash) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Password required"})
 		return
 	}
 
@@ -1882,111 +1487,34 @@ func (h *ShareLinkViewHandler) PostShareLinkUploadDone(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"success": true})
 }
 
-// verifyShareLinkPasswordCookie checks if the client has a valid HMAC cookie for a password-protected share link.
-// servePasswordPage renders a server-side password prompt page for password-protected share/upload links.
-// This is used for embedded preview types (images, videos, PDFs) that don't go through the React bundle.
-func (h *ShareLinkViewHandler) servePasswordPage(c *gin.Context, token, tokenType, filename string) {
-	c.Header("Content-Type", "text/html; charset=utf-8")
-	c.String(http.StatusOK, fmt.Sprintf(`<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>%s - SesameFS</title>
-    <link rel="icon" type="image/x-icon" href="/favicon.png">
-    <style>
-        body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f5f5f5; display: flex; align-items: center; justify-content: center; min-height: 100vh; }
-        .card { background: #fff; border-radius: 8px; padding: 40px; width: 400px; max-width: 90%%; box-shadow: 0 4px 20px rgba(0,0,0,0.15); text-align: center; }
-        h4 { margin: 0 0 8px; }
-        .desc { color: #666; margin-bottom: 24px; }
-        input[type=password] { width: 100%%; padding: 8px 12px; border: 1px solid #ccc; border-radius: 4px; margin-bottom: 12px; box-sizing: border-box; font-size: 14px; }
-        .err { color: #dc3545; font-size: 14px; margin-bottom: 12px; display: none; }
-        button { width: 100%%; padding: 10px; background: #3572b0; color: #fff; border: none; border-radius: 4px; font-size: 14px; cursor: pointer; }
-        button:hover { background: #2a5d8f; }
-        button:disabled { opacity: 0.6; cursor: not-allowed; }
-    </style>
-</head>
-<body>
-    <div class="card">
-        <h4>Password Protected</h4>
-        <p class="desc">This link is protected. Please enter the password to continue.</p>
-        <form id="pwform">
-            <input type="password" id="pw" placeholder="Password" autofocus />
-            <p class="err" id="err"></p>
-            <button type="submit" id="btn">Submit</button>
-        </form>
-    </div>
-    <script>
-    document.getElementById('pwform').addEventListener('submit', function(e) {
-        e.preventDefault();
-        var pw = document.getElementById('pw').value;
-        var errEl = document.getElementById('err');
-        var btn = document.getElementById('btn');
-        if (!pw) { errEl.textContent = 'Please enter the password.'; errEl.style.display = 'block'; return; }
-        btn.disabled = true; btn.textContent = 'Verifying...'; errEl.style.display = 'none';
-        fetch('/%s/%s/check-password/', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({password: pw}) })
-            .then(function(res) { if (res.ok) { window.location.reload(); } else { errEl.textContent = 'Incorrect password'; errEl.style.display = 'block'; btn.disabled = false; btn.textContent = 'Submit'; } })
-            .catch(function() { errEl.textContent = 'Network error. Please try again.'; errEl.style.display = 'block'; btn.disabled = false; btn.textContent = 'Submit'; });
-    });
-    </script>
-</body>
-</html>`, html.EscapeString(filename), tokenType, html.EscapeString(token)))
-}
-
 func (h *ShareLinkViewHandler) verifyShareLinkPasswordCookie(c *gin.Context, token, passwordHash string) bool {
 	if passwordHash == "" {
 		return true // No password required
 	}
-	cookieName := "sesamefs_slpwd_" + token[:8]
+	cookieName, expected := buildPublicLinkPasswordCookie("share", token, passwordHash, h.config.Auth.ShareLinkHMACKey)
 	cookieValue, err := c.Cookie(cookieName)
 	if err != nil {
 		return false
 	}
-	mac := hmac.New(sha256.New, []byte(h.config.Auth.ShareLinkHMACKey))
-	mac.Write([]byte(token))
-	mac.Write([]byte(passwordHash))
-	expected := hex.EncodeToString(mac.Sum(nil))
 	return cookieValue == expected
 }
 
-// CheckShareLinkPassword verifies the password for a share link and sets an HMAC cookie on success.
-func (h *ShareLinkViewHandler) CheckShareLinkPassword(c *gin.Context) {
-	token := c.Param("token")
-
-	var req struct {
-		Password string `json:"password" form:"password"`
+func buildPublicLinkPasswordCookie(linkType, token, passwordHash, hmacKey string) (string, string) {
+	mac := hmac.New(sha256.New, []byte(hmacKey))
+	switch linkType {
+	case "upload":
+		mac.Write([]byte("upload_" + token))
+		mac.Write([]byte(passwordHash))
+		return "sesamefs_ulpwd_" + token[:8], hex.EncodeToString(mac.Sum(nil))
+	default:
+		mac.Write([]byte(token))
+		mac.Write([]byte(passwordHash))
+		return "sesamefs_slpwd_" + token[:8], hex.EncodeToString(mac.Sum(nil))
 	}
-	if err := c.ShouldBind(&req); err != nil || req.Password == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "password required"})
-		return
-	}
-
-	var passwordHash string
-	err := h.db.Session().Query(
-		`SELECT password_hash FROM share_links WHERE link_token = ?`, token,
-	).Scan(&passwordHash)
-	if err != nil || passwordHash == "" {
-		c.JSON(http.StatusNotFound, gin.H{"error": "share link not found"})
-		return
-	}
-
-	if err := bcrypt.CompareHashAndPassword([]byte(passwordHash), []byte(req.Password)); err != nil {
-		c.JSON(http.StatusForbidden, gin.H{"error": "Incorrect password"})
-		return
-	}
-
-	mac := hmac.New(sha256.New, []byte(h.config.Auth.ShareLinkHMACKey))
-	mac.Write([]byte(token))
-	mac.Write([]byte(passwordHash))
-	cookieValue := hex.EncodeToString(mac.Sum(nil))
-	isSecure := c.Request.TLS != nil
-	cookieName := "sesamefs_slpwd_" + token[:8]
-	c.SetCookie(cookieName, cookieValue, 3600*24, "/", "", isSecure, true)
-	c.JSON(http.StatusOK, gin.H{"success": true})
 }
 
-// CheckUploadLinkPassword verifies the password for an upload link and sets an HMAC cookie on success.
-func (h *ShareLinkViewHandler) CheckUploadLinkPassword(c *gin.Context) {
+// CheckPublicLinkPassword verifies the password for a public link and sets the correct HMAC cookie.
+func (h *ShareLinkViewHandler) CheckPublicLinkPassword(c *gin.Context) {
 	token := c.Param("token")
 
 	var req struct {
@@ -1997,12 +1525,16 @@ func (h *ShareLinkViewHandler) CheckUploadLinkPassword(c *gin.Context) {
 		return
 	}
 
-	var passwordHash string
+	var linkType, passwordHash string
 	err := h.db.Session().Query(
-		`SELECT password_hash FROM share_links WHERE link_token = ?`, token,
-	).Scan(&passwordHash)
-	if err != nil || passwordHash == "" {
-		c.JSON(http.StatusNotFound, gin.H{"error": "upload link not found"})
+		`SELECT link_type, password_hash FROM share_links WHERE link_token = ?`, token,
+	).Scan(&linkType, &passwordHash)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "public link not found"})
+		return
+	}
+	if passwordHash == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "link does not require password"})
 		return
 	}
 
@@ -2011,12 +1543,8 @@ func (h *ShareLinkViewHandler) CheckUploadLinkPassword(c *gin.Context) {
 		return
 	}
 
-	mac := hmac.New(sha256.New, []byte(h.config.Auth.ShareLinkHMACKey))
-	mac.Write([]byte("upload_" + token))
-	mac.Write([]byte(passwordHash))
-	cookieValue := hex.EncodeToString(mac.Sum(nil))
+	cookieName, cookieValue := buildPublicLinkPasswordCookie(linkType, token, passwordHash, h.config.Auth.ShareLinkHMACKey)
 	isSecure := c.Request.TLS != nil
-	cookieName := "sesamefs_ulpwd_" + token[:8]
 	c.SetCookie(cookieName, cookieValue, 3600*24, "/", "", isSecure, true)
 	c.JSON(http.StatusOK, gin.H{"success": true})
 }
@@ -2026,14 +1554,10 @@ func (h *ShareLinkViewHandler) verifyUploadLinkPasswordCookie(c *gin.Context, to
 	if passwordHash == "" {
 		return true
 	}
-	cookieName := "sesamefs_ulpwd_" + token[:8]
+	cookieName, expected := buildPublicLinkPasswordCookie("upload", token, passwordHash, h.config.Auth.ShareLinkHMACKey)
 	cookieValue, err := c.Cookie(cookieName)
 	if err != nil {
 		return false
 	}
-	mac := hmac.New(sha256.New, []byte(h.config.Auth.ShareLinkHMACKey))
-	mac.Write([]byte("upload_" + token))
-	mac.Write([]byte(passwordHash))
-	expected := hex.EncodeToString(mac.Sum(nil))
 	return cookieValue == expected
 }
