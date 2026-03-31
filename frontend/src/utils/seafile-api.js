@@ -828,7 +828,7 @@ seafileAPI.sysAdminSearchTrashRepos = function (owner) {
 // ============================================================================
 
 // Admin: list all share links (paginated, sortable)
-seafileAPI.sysAdminListShareLinks = function (page, perPage, sortBy, sortOrder, status, active, expired) {
+seafileAPI.sysAdminListShareLinks = function (page, perPage, sortBy, sortOrder, status, active, expired, search) {
   let url = this.server + '/api/v2.1/admin/share-links/';
   const params = new URLSearchParams();
   if (page) params.set('page', page);
@@ -838,6 +838,7 @@ seafileAPI.sysAdminListShareLinks = function (page, perPage, sortBy, sortOrder, 
   if (status && status !== 'all') params.set('status', status);
   if (active !== undefined && active !== null && active !== 'all') params.set('active', active);
   if (expired !== undefined && expired !== null && expired !== 'all') params.set('expired', expired);
+  if (search) params.set('search', search);
   if (params.toString()) url += '?' + params.toString();
   return this.req.get(url);
 };
@@ -855,7 +856,7 @@ seafileAPI.sysAdminSetShareLinkActive = function (token, active) {
 };
 
 // Admin: list all upload links (paginated, sortable)
-seafileAPI.sysAdminListAllUploadLinks = function (page, perPage, sortBy, sortOrder, status, active, expired) {
+seafileAPI.sysAdminListAllUploadLinks = function (page, perPage, sortBy, sortOrder, status, active, expired, search) {
   let url = this.server + '/api/v2.1/admin/upload-links/';
   const params = new URLSearchParams();
   if (page) params.set('page', page);
@@ -865,6 +866,7 @@ seafileAPI.sysAdminListAllUploadLinks = function (page, perPage, sortBy, sortOrd
   if (status && status !== 'all') params.set('status', status);
   if (active !== undefined && active !== null && active !== 'all') params.set('active', active);
   if (expired !== undefined && expired !== null && expired !== 'all') params.set('expired', expired);
+  if (search) params.set('search', search);
   if (params.toString()) url += '?' + params.toString();
   return this.req.get(url);
 };
@@ -1537,7 +1539,7 @@ seafileAPI.orgAdminTransferOrgRepo = function (orgID, repoID, email) {
 };
 
 // Org Admin: list org links
-seafileAPI.orgAdminListOrgLinks = function (page, perPage, sortBy, sortOrder, expiredFilter) {
+seafileAPI.orgAdminListOrgLinks = function (page, perPage, sortBy, sortOrder, expiredFilter, search) {
   let url = this.server + '/api/v2.1/org/admin/links/';
   const params = new URLSearchParams();
   params.set('page', page || 1);
@@ -1545,6 +1547,7 @@ seafileAPI.orgAdminListOrgLinks = function (page, perPage, sortBy, sortOrder, ex
   if (sortBy) params.set('order_by', sortBy);
   if (sortOrder) params.set('direction', sortOrder);
   if (expiredFilter && expiredFilter !== 'all') params.set('expired', expiredFilter === 'expired');
+  if (search) params.set('search', search);
   url += '?' + params.toString();
   return this.req.get(url);
 };
@@ -1556,7 +1559,7 @@ seafileAPI.orgAdminDeleteOrgLink = function (token) {
 };
 
 // Org Admin: list org upload links
-seafileAPI.orgAdminListOrgUploadLinks = function (page, perPage, sortBy, sortOrder, expiredFilter) {
+seafileAPI.orgAdminListOrgUploadLinks = function (page, perPage, sortBy, sortOrder, expiredFilter, search) {
   let url = this.server + '/api/v2.1/org/admin/upload-links/';
   const params = new URLSearchParams();
   params.set('page', page || 1);
@@ -1564,6 +1567,7 @@ seafileAPI.orgAdminListOrgUploadLinks = function (page, perPage, sortBy, sortOrd
   if (sortBy) params.set('order_by', sortBy);
   if (sortOrder) params.set('direction', sortOrder);
   if (expiredFilter && expiredFilter !== 'all') params.set('expired', expiredFilter === 'expired');
+  if (search) params.set('search', search);
   url += '?' + params.toString();
   return this.req.get(url);
 };

@@ -3,7 +3,6 @@ package v2
 import (
 	"fmt"
 	"net/http"
-	"strconv"
 	"strings"
 	"time"
 
@@ -27,27 +26,12 @@ func (h *OrgAdminHandler) ListOrgLinks(c *gin.Context) {
 		return
 	}
 
-	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
-	if page < 1 {
-		page = 1
+	filters, err := parseAdminLinkListFiltersFromContext(c, false)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
 	}
-	perPage, _ := strconv.Atoi(c.DefaultQuery("per_page", "25"))
-	if perPage < 1 || perPage > 100 {
-		perPage = 25
-	}
-
-	expiredParam := strings.TrimSpace(strings.ToLower(c.DefaultQuery("expired", "")))
-	hasExpiredFilter := false
-	expiredFilter := false
-	if expiredParam != "" && expiredParam != "all" {
-		parsed, err := strconv.ParseBool(expiredParam)
-		if err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid expired filter"})
-			return
-		}
-		hasExpiredFilter = true
-		expiredFilter = parsed
-	}
+	page, perPage := parseAdminLinkPageParams(c.DefaultQuery("page", "1"), c.DefaultQuery("per_page", "25"), 25, 100)
 
 	// Single-partition query on share_links_by_org — no more iterating users
 	userCache := make(map[string][2]string) // createdBy -> [email, name]
@@ -115,7 +99,7 @@ func (h *OrgAdminHandler) ListOrgLinks(c *gin.Context) {
 			isExpired = expiresAt.Before(time.Now())
 			expireDateStr = expiresAt.Format(time.RFC3339)
 		}
-		if hasExpiredFilter && isExpired != expiredFilter {
+		if !filters.MatchesState(active, isExpired) {
 			continue
 		}
 
@@ -129,6 +113,9 @@ func (h *OrgAdminHandler) ListOrgLinks(c *gin.Context) {
 		status := "active"
 		if !active {
 			status = "inactive"
+		}
+		if !filters.MatchesSearch(linkName, token, filePath, repoName, info[0], info[1], linkURL) {
+			continue
 		}
 
 		links = append(links, gin.H{
@@ -168,21 +155,12 @@ func (h *OrgAdminHandler) ListOrgLinks(c *gin.Context) {
 	direction := c.DefaultQuery("direction", "asc")
 	sortAdminLinks(links, sortBy, direction)
 
-	// Paginate
-	total := len(links)
-	start := (page - 1) * perPage
-	if start > total {
-		start = total
-	}
-	end := start + perPage
-	if end > total {
-		end = total
-	}
+	pagedLinks, total, pageNext := paginateAdminLinks(links, page, perPage)
 
 	c.JSON(http.StatusOK, gin.H{
-		"link_list": links[start:end],
+		"link_list": pagedLinks,
 		"page":      page,
-		"page_next": end < total,
+		"page_next": pageNext,
 		"count":     total,
 	})
 }
@@ -241,27 +219,12 @@ func (h *OrgAdminHandler) ListOrgUploadLinks(c *gin.Context) {
 		return
 	}
 
-	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
-	if page < 1 {
-		page = 1
+	filters, err := parseAdminLinkListFiltersFromContext(c, false)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
 	}
-	perPage, _ := strconv.Atoi(c.DefaultQuery("per_page", "25"))
-	if perPage < 1 || perPage > 100 {
-		perPage = 25
-	}
-
-	expiredParam := strings.TrimSpace(strings.ToLower(c.DefaultQuery("expired", "")))
-	hasExpiredFilter := false
-	expiredFilter := false
-	if expiredParam != "" && expiredParam != "all" {
-		parsed, err := strconv.ParseBool(expiredParam)
-		if err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid expired filter"})
-			return
-		}
-		hasExpiredFilter = true
-		expiredFilter = parsed
-	}
+	page, perPage := parseAdminLinkPageParams(c.DefaultQuery("page", "1"), c.DefaultQuery("per_page", "25"), 25, 100)
 
 	// Single-partition query on share_links_by_org
 	userCache := make(map[string][2]string)
@@ -306,7 +269,7 @@ func (h *OrgAdminHandler) ListOrgUploadLinks(c *gin.Context) {
 			isExpired = expiresAt.Before(time.Now())
 			expireDateStr = expiresAt.Format(time.RFC3339)
 		}
-		if hasExpiredFilter && isExpired != expiredFilter {
+		if !filters.MatchesState(active, isExpired) {
 			continue
 		}
 
@@ -328,6 +291,9 @@ func (h *OrgAdminHandler) ListOrgUploadLinks(c *gin.Context) {
 		status := "active"
 		if !active {
 			status = "inactive"
+		}
+		if !filters.MatchesSearch(objName, token, filePath, repoName, info[0], info[1], uploadLinkURL) {
+			continue
 		}
 
 		links = append(links, gin.H{
@@ -361,18 +327,10 @@ func (h *OrgAdminHandler) ListOrgUploadLinks(c *gin.Context) {
 	direction := c.DefaultQuery("direction", "asc")
 	sortAdminLinks(links, sortBy, direction)
 
-	total := len(links)
-	start := (page - 1) * perPage
-	if start > total {
-		start = total
-	}
-	end := start + perPage
-	if end > total {
-		end = total
-	}
+	pagedLinks, total, _ := paginateAdminLinks(links, page, perPage)
 
 	c.JSON(http.StatusOK, gin.H{
-		"upload_link_list": links[start:end],
+		"upload_link_list": pagedLinks,
 		"count":            total,
 	})
 }
