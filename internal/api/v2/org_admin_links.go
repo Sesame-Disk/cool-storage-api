@@ -474,11 +474,23 @@ func (h *OrgAdminHandler) UpdateOrgLogo(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"logo_path": logoPath})
 }
 func (h *OrgAdminHandler) GetOrgSAMLConfig(c *gin.Context) {
+	targetOrgID := c.Param("org_id")
+	if err := h.requireOrgAccess(c, targetOrgID); err != nil {
+		return
+	}
 	h.notImplemented(c, "get org SAML config")
 }
 func (h *OrgAdminHandler) UpdateOrgSAMLConfig(c *gin.Context) {
+	targetOrgID := c.Param("org_id")
+	if err := h.requireOrgAccess(c, targetOrgID); err != nil {
+		return
+	}
 	h.notImplemented(c, "update org SAML config")
 }
 func (h *OrgAdminHandler) VerifyOrgDomain(c *gin.Context) {
+	targetOrgID := c.Param("org_id")
+	if err := h.requireOrgAccess(c, targetOrgID); err != nil {
+		return
+	}
 	h.notImplemented(c, "verify org domain")
 }

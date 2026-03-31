@@ -21,6 +21,9 @@ func TestOrgAdminRequireOrgAccess_Unauthenticated(t *testing.T) {
 	r.DELETE("/org/:org_id/admin/trash-libraries/", h.CleanOrgTrashLibraries)
 	r.DELETE("/org/:org_id/admin/trash-libraries/:rid/", h.DeleteOrgTrashLibrary)
 	r.DELETE("/org/:org_id/admin/groups/:gid/group-owned-libraries/:rid/", h.DeleteOrgGroupOwnedLibrary)
+	r.GET("/org/:org_id/admin/saml-config/", h.GetOrgSAMLConfig)
+	r.PUT("/org/:org_id/admin/saml-config/", h.UpdateOrgSAMLConfig)
+	r.PUT("/org/:org_id/admin/verify-domain/", h.VerifyOrgDomain)
 
 	tests := []struct {
 		name   string
@@ -33,6 +36,9 @@ func TestOrgAdminRequireOrgAccess_Unauthenticated(t *testing.T) {
 		{name: "clean trash unauthenticated", method: http.MethodDelete, path: "/org/00000000-0000-0000-0000-000000000001/admin/trash-libraries/"},
 		{name: "delete trash library unauthenticated", method: http.MethodDelete, path: "/org/00000000-0000-0000-0000-000000000001/admin/trash-libraries/11111111-1111-1111-1111-111111111111/"},
 		{name: "delete group-owned library unauthenticated", method: http.MethodDelete, path: "/org/00000000-0000-0000-0000-000000000001/admin/groups/22222222-2222-2222-2222-222222222222/group-owned-libraries/11111111-1111-1111-1111-111111111111/"},
+		{name: "get saml config unauthenticated", method: http.MethodGet, path: "/org/00000000-0000-0000-0000-000000000001/admin/saml-config/"},
+		{name: "update saml config unauthenticated", method: http.MethodPut, path: "/org/00000000-0000-0000-0000-000000000001/admin/saml-config/"},
+		{name: "verify domain unauthenticated", method: http.MethodPut, path: "/org/00000000-0000-0000-0000-000000000001/admin/verify-domain/"},
 	}
 
 	for _, tt := range tests {
