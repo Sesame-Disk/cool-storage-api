@@ -1,5 +1,6 @@
 import React, { Fragment } from 'react';
 import PropTypes from 'prop-types';
+import { navigate } from '@gatsbyjs/reach-router';
 import moment from 'moment';
 import { Dropdown, DropdownToggle, DropdownMenu, DropdownItem } from 'reactstrap';
 import { seafileAPI } from '../../utils/seafile-api';
@@ -11,6 +12,7 @@ import Loading from '../../components/loading';
 import Paginator from '../../components/paginator';
 import MainPanelTopbar from './main-panel-topbar';
 import ShareAdminLinkEnhanced from '../../components/dialog/share-admin-link-enhanced';
+import Search from '../sys-admin/search';
 
 class OrgLinks extends React.Component {
 
@@ -26,6 +28,7 @@ class OrgLinks extends React.Component {
       shareSortBy: '',
       shareSortOrder: 'asc',
       shareExpiredFilter: 'all',
+      shareSearch: '',
       shareLoading: true,
       shareErrorMsg: '',
       // Upload links state
@@ -36,6 +39,7 @@ class OrgLinks extends React.Component {
       uploadSortBy: '',
       uploadSortOrder: 'asc',
       uploadExpiredFilter: 'all',
+      uploadSearch: '',
       uploadLoading: true,
       uploadErrorMsg: '',
       // Common
@@ -46,18 +50,53 @@ class OrgLinks extends React.Component {
   }
 
   componentDidMount() {
-    this.listShareLinks(1);
-    this.listUploadLinks(1);
+    const urlParams = new URL(window.location).searchParams;
+    const currentTab = urlParams.get('tab') === 'uploadLinks' ? 'uploadLinks' : 'shareLinks';
+    this.setState({
+      currentTab,
+      shareSearch: urlParams.get('share_search') || '',
+      uploadSearch: urlParams.get('upload_search') || '',
+    }, () => {
+      this.listShareLinks(1);
+      this.listUploadLinks(1);
+    });
   }
 
+  updateURL = (overrides = {}) => {
+    const url = new URL(window.location);
+    const params = new URLSearchParams(url.search);
+    const state = {
+      tab: this.state.currentTab,
+      share_search: this.state.shareSearch,
+      upload_search: this.state.uploadSearch,
+      ...overrides,
+    };
+
+    const syncParam = (key, value, defaultValue) => {
+      if (value === undefined || value === null || value === '' || value === defaultValue) {
+        params.delete(key);
+        return;
+      }
+      params.set(key, String(value));
+    };
+
+    syncParam('tab', state.tab, 'shareLinks');
+    syncParam('share_search', state.share_search, '');
+    syncParam('upload_search', state.upload_search, '');
+    url.search = params.toString();
+    navigate(url.toString(), { replace: true });
+  };
+
   switchTab = (tab) => {
-    this.setState({ currentTab: tab });
+    this.setState({ currentTab: tab }, () => {
+      this.updateURL({ tab });
+    });
   };
 
   // Share links
   listShareLinks = (page) => {
-    const { sharePerPage, shareSortBy, shareSortOrder, shareExpiredFilter } = this.state;
-    seafileAPI.orgAdminListOrgLinks(page, sharePerPage, shareSortBy, shareSortOrder, shareExpiredFilter).then(res => {
+    const { sharePerPage, shareSortBy, shareSortOrder, shareExpiredFilter, shareSearch } = this.state;
+    seafileAPI.orgAdminListOrgLinks(page, sharePerPage, shareSortBy, shareSortOrder, shareExpiredFilter, shareSearch).then(res => {
       const data = res.data;
       this.setState({
         shareLinkList: data.link_list,
@@ -96,8 +135,8 @@ class OrgLinks extends React.Component {
 
   // Upload links
   listUploadLinks = (page) => {
-    const { uploadPerPage, uploadSortBy, uploadSortOrder, uploadExpiredFilter } = this.state;
-    seafileAPI.orgAdminListOrgUploadLinks(page, uploadPerPage, uploadSortBy, uploadSortOrder, uploadExpiredFilter).then(res => {
+    const { uploadPerPage, uploadSortBy, uploadSortOrder, uploadExpiredFilter, uploadSearch } = this.state;
+    seafileAPI.orgAdminListOrgUploadLinks(page, uploadPerPage, uploadSortBy, uploadSortOrder, uploadExpiredFilter, uploadSearch).then(res => {
       const data = res.data;
       this.setState({
         uploadLinkList: data.upload_link_list,
@@ -197,6 +236,60 @@ class OrgLinks extends React.Component {
     });
   };
 
+  submitSearch = (value) => {
+    const isShare = this.state.currentTab === 'shareLinks';
+    const stateKey = isShare ? 'shareSearch' : 'uploadSearch';
+    this.setState({
+      [stateKey]: value,
+      ...(isShare ? { sharePage: 1 } : { uploadPage: 1 }),
+    }, () => {
+      this.updateURL();
+      if (isShare) {
+        this.listShareLinks(1);
+      } else {
+        this.listUploadLinks(1);
+      }
+    });
+  };
+
+  clearSearch = () => {
+    const isShare = this.state.currentTab === 'shareLinks';
+    const stateKey = isShare ? 'shareSearch' : 'uploadSearch';
+    if (!this.state[stateKey]) {
+      return;
+    }
+    this.setState({
+      [stateKey]: '',
+      ...(isShare ? { sharePage: 1 } : { uploadPage: 1 }),
+    }, () => {
+      this.updateURL();
+      if (isShare) {
+        this.listShareLinks(1);
+      } else {
+        this.listUploadLinks(1);
+      }
+    });
+  };
+
+  renderSearch = () => {
+    const isShare = this.state.currentTab === 'shareLinks';
+    const currentSearch = isShare ? this.state.shareSearch : this.state.uploadSearch;
+    return (
+      <div className="d-flex align-items-center">
+        <Search
+          placeholder={isShare ? gettext('Search share links') : gettext('Search upload links')}
+          submit={this.submitSearch}
+          initialValue={currentSearch}
+        />
+        {currentSearch && (
+          <button type="button" className="btn btn-outline-secondary btn-sm ml-2" onClick={this.clearSearch}>
+            {gettext('Clear')}
+          </button>
+        )}
+      </div>
+    );
+  };
+
   renderExpiredFilters = (tab) => {
     const expiredFilter = tab === 'shareLinks' ? this.state.shareExpiredFilter : this.state.uploadExpiredFilter;
 
@@ -248,7 +341,7 @@ class OrgLinks extends React.Component {
 
     return (
       <Fragment>
-        <MainPanelTopbar />
+        <MainPanelTopbar search={this.renderSearch()} />
         <div className="main-panel-center flex-row">
           <div className="cur-view-container">
             <div className="cur-view-path tab-nav-container">

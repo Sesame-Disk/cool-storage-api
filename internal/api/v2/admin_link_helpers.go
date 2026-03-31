@@ -13,6 +13,9 @@ var (
 	errInvalidStatusFilter  = errors.New("invalid status filter")
 	errInvalidActiveFilter  = errors.New("invalid active filter")
 	errInvalidExpiredFilter = errors.New("invalid expired filter")
+	errAdminLinkNotFound    = errors.New("admin link not found")
+	errAdminLinkWrongType   = errors.New("wrong type")
+	errAdminLinkWrongOrg    = errors.New("wrong org")
 )
 
 type adminLinkListFilters struct {
@@ -104,6 +107,16 @@ func matchesAdminLinkSearch(search string, values ...string) bool {
 	}
 
 	return false
+}
+
+func validateAdminLinkScope(actualOrgID, expectedOrgID, actualType, expectedType string) error {
+	if expectedOrgID != "" && actualOrgID != expectedOrgID {
+		return errAdminLinkWrongOrg
+	}
+	if expectedType != "" && actualType != expectedType {
+		return errAdminLinkWrongType
+	}
+	return nil
 }
 
 func parseAdminLinkPageParams(pageParam, perPageParam string, defaultPerPage, maxPerPage int) (int, int) {

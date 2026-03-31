@@ -129,3 +129,28 @@ func TestPaginateAdminLinks_ReturnsWindowAndNextFlag(t *testing.T) {
 		t.Fatalf("unexpected first page result: %#v", paged)
 	}
 }
+
+func TestValidateAdminLinkScope(t *testing.T) {
+	tests := []struct {
+		name          string
+		actualOrgID   string
+		expectedOrgID string
+		actualType    string
+		expectedType  string
+		wantErr       error
+	}{
+		{name: "matching org and type", actualOrgID: "org-a", expectedOrgID: "org-a", actualType: "share", expectedType: "share"},
+		{name: "wrong org", actualOrgID: "org-b", expectedOrgID: "org-a", actualType: "share", expectedType: "share", wantErr: errAdminLinkWrongOrg},
+		{name: "wrong type", actualOrgID: "org-a", expectedOrgID: "org-a", actualType: "upload", expectedType: "share", wantErr: errAdminLinkWrongType},
+		{name: "type only check", actualType: "upload", expectedType: "upload"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := validateAdminLinkScope(test.actualOrgID, test.expectedOrgID, test.actualType, test.expectedType)
+			if err != test.wantErr {
+				t.Fatalf("error = %v, want %v", err, test.wantErr)
+			}
+		})
+	}
+}

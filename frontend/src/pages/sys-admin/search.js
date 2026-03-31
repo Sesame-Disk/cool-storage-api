@@ -3,7 +3,8 @@ import PropTypes from 'prop-types';
 
 const propTypes = {
   placeholder: PropTypes.string.isRequired,
-  submit: PropTypes.func.isRequired
+  submit: PropTypes.func.isRequired,
+  initialValue: PropTypes.string,
 };
 
 class Search extends React.Component {
@@ -11,8 +12,14 @@ class Search extends React.Component {
   constructor(props) {
     super(props);
     this.state = {
-      value: ''
+      value: props.initialValue || ''
     };
+  }
+
+  componentDidUpdate(prevProps) {
+    if (prevProps.initialValue !== this.props.initialValue && this.props.initialValue !== this.state.value) {
+      this.setState({ value: this.props.initialValue || '' });
+    }
   }
 
   handleInputChange = (e) => {

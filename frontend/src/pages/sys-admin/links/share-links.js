@@ -7,6 +7,7 @@ import { Utils } from '../../../utils/utils';
 import LinksNav from './links-nav';
 import MainPanelTopbar from '../main-panel-topbar';
 import LinksContent from './links-table';
+import Search from '../search';
 
 class ShareLinks extends Component {
 
@@ -22,31 +23,68 @@ class ShareLinks extends Component {
       sortBy: '',
       sortOrder: 'asc',
       activeFilter: 'all',
-      expiredFilter: 'all'
+      expiredFilter: 'all',
+      search: ''
     };
     this.initPage = 1;
   }
 
   componentDidMount() {
     let urlParams = (new URL(window.location)).searchParams;
-    const { currentPage, perPage, sortBy, sortOrder, activeFilter, expiredFilter } = this.state;
+    const { currentPage, perPage, sortBy, sortOrder, activeFilter, expiredFilter, search } = this.state;
     this.setState({
       perPage: parseInt(urlParams.get('per_page') || perPage),
       currentPage: parseInt(urlParams.get('page') || currentPage),
       sortBy: urlParams.get('order_by') || sortBy,
       sortOrder: urlParams.get('direction') || sortOrder,
       activeFilter: urlParams.get('active') || urlParams.get('status') || activeFilter,
-      expiredFilter: urlParams.get('expired') || expiredFilter
+	      expiredFilter: urlParams.get('expired') || expiredFilter,
+	      search: urlParams.get('search') || search
     }, () => {
       this.getShareLinksByPage(this.state.currentPage);
     });
   }
 
+  updateURL = (overrides = {}) => {
+    const url = new URL(window.location);
+    const params = new URLSearchParams(url.search);
+    const state = {
+      page: this.state.currentPage,
+      per_page: this.state.perPage,
+      order_by: this.state.sortBy,
+      direction: this.state.sortOrder,
+      active: this.state.activeFilter,
+      expired: this.state.expiredFilter,
+      search: this.state.search,
+      ...overrides,
+    };
+
+    const syncParam = (key, value, defaultValue) => {
+      if (value === undefined || value === null || value === '' || value === defaultValue) {
+        params.delete(key);
+        return;
+      }
+      params.set(key, String(value));
+    };
+
+    syncParam('page', state.page, 1);
+    syncParam('per_page', state.per_page, 25);
+    syncParam('order_by', state.order_by, '');
+    syncParam('direction', state.direction, 'asc');
+    syncParam('active', state.active, 'all');
+    syncParam('expired', state.expired, 'all');
+    syncParam('search', state.search, '');
+
+    url.search = params.toString();
+    navigate(url.toString(), { replace: true });
+  };
+
   getShareLinksByPage = (page) => {
-    const { perPage, sortBy, sortOrder, activeFilter, expiredFilter } = this.state;
+    const { perPage, sortBy, sortOrder, activeFilter, expiredFilter, search } = this.state;
     const activeParam = activeFilter === 'all' ? 'all' : (activeFilter === 'active');
     const expiredParam = expiredFilter === 'all' ? 'all' : (expiredFilter === 'expired');
-    seafileAPI.sysAdminListShareLinks(page, perPage, sortBy, sortOrder, null, activeParam, expiredParam).then((res) => {
+    this.updateURL({ page });
+    seafileAPI.sysAdminListShareLinks(page, perPage, sortBy, sortOrder, null, activeParam, expiredParam, search).then((res) => {
       this.setState({
         shareLinkList: res.data.share_link_list,
         loading: false,
@@ -67,17 +105,7 @@ class ShareLinks extends Component {
       sortBy: sortBy,
       sortOrder: this.state.sortOrder === 'asc' ? 'desc' : 'asc'
     }, () => {
-      let url = new URL(location.href);
-      let searchParams = new URLSearchParams(url.search);
-      const { currentPage, sortBy, sortOrder } = this.state;
-      searchParams.set('page', currentPage);
-      searchParams.set('order_by', sortBy);
-      searchParams.set('direction', sortOrder);
-      searchParams.set('active', this.state.activeFilter);
-      searchParams.set('expired', this.state.expiredFilter);
-      url.search = searchParams.toString();
-      navigate(url.toString());
-      this.getShareLinksByPage(currentPage);
+      this.getShareLinksByPage(this.state.currentPage);
     });
   };
 
@@ -86,15 +114,6 @@ class ShareLinks extends Component {
       currentPage: 1,
       activeFilter,
     }, () => {
-      let url = new URL(location.href);
-      let searchParams = new URLSearchParams(url.search);
-      searchParams.set('page', '1');
-      searchParams.set('active', activeFilter);
-      searchParams.set('expired', this.state.expiredFilter);
-      searchParams.set('order_by', this.state.sortBy);
-      searchParams.set('direction', this.state.sortOrder);
-      url.search = searchParams.toString();
-      navigate(url.toString());
       this.getShareLinksByPage(1);
     });
   };
@@ -104,17 +123,46 @@ class ShareLinks extends Component {
       currentPage: 1,
       expiredFilter,
     }, () => {
-      let url = new URL(location.href);
-      let searchParams = new URLSearchParams(url.search);
-      searchParams.set('page', '1');
-      searchParams.set('active', this.state.activeFilter);
-      searchParams.set('expired', expiredFilter);
-      searchParams.set('order_by', this.state.sortBy);
-      searchParams.set('direction', this.state.sortOrder);
-      url.search = searchParams.toString();
-      navigate(url.toString());
       this.getShareLinksByPage(1);
     });
+  };
+
+  submitSearch = (search) => {
+    this.setState({
+      currentPage: 1,
+      search,
+    }, () => {
+      this.getShareLinksByPage(1);
+    });
+  };
+
+  clearSearch = () => {
+    if (!this.state.search) {
+      return;
+    }
+    this.setState({
+      currentPage: 1,
+      search: '',
+    }, () => {
+      this.getShareLinksByPage(1);
+    });
+  };
+
+  renderSearch = () => {
+    return (
+      <div className="d-flex align-items-center">
+        <Search
+          placeholder={gettext('Search share links')}
+          submit={this.submitSearch}
+          initialValue={this.state.search}
+        />
+        {this.state.search && (
+          <button type="button" className="btn btn-outline-secondary btn-sm ml-2" onClick={this.clearSearch}>
+            {gettext('Clear')}
+          </button>
+        )}
+      </div>
+    );
   };
 
   deleteShareLink = (linkToken) => {
@@ -156,7 +204,7 @@ class ShareLinks extends Component {
     let { shareLinkList, currentPage, perPage, hasNextPage } = this.state;
     return (
       <Fragment>
-        <MainPanelTopbar {...this.props} />
+        <MainPanelTopbar {...this.props} search={this.renderSearch()} />
         <div className="main-panel-center flex-row">
           <div className="cur-view-container">
             <LinksNav currentItem="shareLinks" />

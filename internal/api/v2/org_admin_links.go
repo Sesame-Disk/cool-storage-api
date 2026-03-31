@@ -1,6 +1,7 @@
 package v2
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -179,17 +180,20 @@ func (h *OrgAdminHandler) DeleteOrgLink(c *gin.Context) {
 
 	token := c.Param("token")
 
-	// Look up the link to verify it belongs to this org
-	var linkOrgID, createdBy, libID string
+	// Look up the link to verify it belongs to this org and matches the requested type.
+	var linkOrgID, createdBy, libID, linkType string
 	var createdAt time.Time
 	if err := h.db.Session().Query(`
-		SELECT org_id, created_by, library_id, created_at FROM share_links WHERE link_token = ?
-	`, token).Scan(&linkOrgID, &createdBy, &libID, &createdAt); err != nil {
+		SELECT org_id, created_by, library_id, created_at, link_type FROM share_links WHERE link_token = ?
+	`, token).Scan(&linkOrgID, &createdBy, &libID, &createdAt, &linkType); err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "link not found"})
 		return
 	}
-	if linkOrgID != orgID {
+	if err := validateAdminLinkScope(linkOrgID, orgID, linkType, "share"); errors.Is(err, errAdminLinkWrongOrg) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "link does not belong to this organization"})
+		return
+	} else if errors.Is(err, errAdminLinkWrongType) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "link is not a share link"})
 		return
 	}
 
@@ -349,17 +353,20 @@ func (h *OrgAdminHandler) DeleteOrgUploadLink(c *gin.Context) {
 
 	token := c.Param("token")
 
-	// Look up the link to verify it belongs to this org
-	var linkOrgID, createdBy, libID string
+	// Look up the link to verify it belongs to this org and matches the requested type.
+	var linkOrgID, createdBy, libID, linkType string
 	var createdAt time.Time
 	if err := h.db.Session().Query(`
-		SELECT org_id, created_by, library_id, created_at FROM share_links WHERE link_token = ?
-	`, token).Scan(&linkOrgID, &createdBy, &libID, &createdAt); err != nil {
+		SELECT org_id, created_by, library_id, created_at, link_type FROM share_links WHERE link_token = ?
+	`, token).Scan(&linkOrgID, &createdBy, &libID, &createdAt, &linkType); err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "upload link not found"})
 		return
 	}
-	if linkOrgID != orgID {
+	if err := validateAdminLinkScope(linkOrgID, orgID, linkType, "upload"); errors.Is(err, errAdminLinkWrongOrg) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "upload link does not belong to this organization"})
+		return
+	} else if errors.Is(err, errAdminLinkWrongType) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "link is not an upload link"})
 		return
 	}
 
