@@ -155,8 +155,8 @@ func (h *AdminHandler) AdminListShareLinks(c *gin.Context) {
 		links = []gin.H{}
 	}
 
-	sortBy := c.DefaultQuery("order_by", "")
-	direction := c.DefaultQuery("direction", "asc")
+	sortBy := c.Query("order_by")
+	direction := c.Query("direction")
 	sortAdminLinks(links, sortBy, direction)
 	pagedLinks, total, _ := paginateAdminLinks(links, page, perPage)
 
@@ -357,8 +357,8 @@ func (h *AdminHandler) AdminListUploadLinks(c *gin.Context) {
 		links = []gin.H{}
 	}
 
-	sortBy := c.DefaultQuery("order_by", "")
-	direction := c.DefaultQuery("direction", "asc")
+	sortBy := c.Query("order_by")
+	direction := c.Query("direction")
 	sortAdminLinks(links, sortBy, direction)
 	pagedLinks, total, _ := paginateAdminLinks(links, page, perPage)
 
@@ -575,8 +575,8 @@ func (h *AdminHandler) AdminListUserShareLinks(c *gin.Context) {
 		links = []gin.H{}
 	}
 
-	sortBy := c.DefaultQuery("order_by", "")
-	direction := c.DefaultQuery("direction", "asc")
+	sortBy := c.Query("order_by")
+	direction := c.Query("direction")
 	sortAdminLinks(links, sortBy, direction)
 	pagedLinks, total, _ := paginateAdminLinks(links, page, perPage)
 
@@ -703,8 +703,8 @@ func (h *AdminHandler) AdminListUserUploadLinks(c *gin.Context) {
 		links = []gin.H{}
 	}
 
-	sortBy := c.DefaultQuery("order_by", "")
-	direction := c.DefaultQuery("direction", "asc")
+	sortBy := c.Query("order_by")
+	direction := c.Query("direction")
 	sortAdminLinks(links, sortBy, direction)
 	pagedLinks, total, _ := paginateAdminLinks(links, page, perPage)
 

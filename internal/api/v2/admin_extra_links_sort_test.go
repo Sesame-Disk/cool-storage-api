@@ -48,15 +48,30 @@ func TestSortAdminLinks_ByCreatedTimeDesc(t *testing.T) {
 	}
 }
 
-func TestSortAdminLinks_EmptySortByNoop(t *testing.T) {
+func TestSortAdminLinks_DefaultsToCreatedTimeDesc(t *testing.T) {
 	links := []gin.H{
-		{"token": "a", "view_cnt": 1},
-		{"token": "b", "view_cnt": 2},
+		{"token": "a", "ctime": "2026-01-01T00:00:00Z"},
+		{"token": "b", "ctime": "2026-03-01T00:00:00Z"},
+		{"token": "c", "ctime": "2026-02-01T00:00:00Z"},
 	}
 
-	sortAdminLinks(links, "", "asc")
+	sortAdminLinks(links, "", "")
 
-	if links[0]["token"] != "a" || links[1]["token"] != "b" {
-		t.Fatalf("unexpected order when sortBy empty: %#v", links)
+	if links[0]["token"] != "b" || links[1]["token"] != "c" || links[2]["token"] != "a" {
+		t.Fatalf("unexpected default order when sortBy empty: %#v", links)
+	}
+}
+
+func TestSortAdminLinks_ExplicitSortDefaultsDirectionAsc(t *testing.T) {
+	links := []gin.H{
+		{"token": "a", "obj_name": "zeta"},
+		{"token": "b", "obj_name": "alpha"},
+		{"token": "c", "obj_name": "beta"},
+	}
+
+	sortAdminLinks(links, "name", "")
+
+	if links[0]["token"] != "b" || links[1]["token"] != "c" || links[2]["token"] != "a" {
+		t.Fatalf("unexpected order when direction omitted for explicit sort: %#v", links)
 	}
 }

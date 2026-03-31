@@ -162,7 +162,12 @@ func paginateAdminLinks(links []gin.H, page, perPage int) ([]gin.H, int, bool) {
 
 func sortAdminLinks(links []gin.H, sortBy, direction string) {
 	if sortBy == "" {
-		return
+		sortBy = "ctime"
+		if direction == "" {
+			direction = "desc"
+		}
+	} else if direction == "" {
+		direction = "asc"
 	}
 
 	sort.Slice(links, func(i, j int) bool {
