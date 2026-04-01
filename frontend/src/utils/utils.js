@@ -410,6 +410,27 @@ export const Utils = {
     return mediaUrl + 'img/lib/' + size + '/' + icon_name;
   },
 
+  setFavicon: function (iconUrl) {
+    if (!iconUrl || typeof document === 'undefined') {
+      return;
+    }
+
+    let favicon = document.getElementById('favicon');
+    if (!favicon) {
+      favicon = document.createElement('link');
+      favicon.id = 'favicon';
+      favicon.rel = 'icon';
+      favicon.type = 'image/png';
+      const head = document.head || document.getElementsByTagName('head')[0];
+      if (!head) {
+        return;
+      }
+      head.appendChild(favicon);
+    }
+
+    favicon.href = iconUrl;
+  },
+
   getLibIconUrl: function (repo, isBig) {
     let permission = repo.permission || repo.share_permission; //Compatible with regular repo and repo shared
     let size = Utils.isHiDPI() ? 48 : 24;

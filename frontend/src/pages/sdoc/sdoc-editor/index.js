@@ -32,7 +32,7 @@ export default class SdocEditor extends React.Component {
       docName = docName + suffix;
     }
     const fileIcon = Utils.getFileIconUrl(docName, 192);
-    document.getElementById('favicon').href = fileIcon;
+    Utils.setFavicon(fileIcon);
   };
 
   onNewNotification = () => {

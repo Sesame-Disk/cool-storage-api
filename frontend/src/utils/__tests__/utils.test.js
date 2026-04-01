@@ -245,6 +245,29 @@ describe('Utils', () => {
     });
   });
 
+  describe('setFavicon', () => {
+    afterEach(() => {
+      document.head.innerHTML = '';
+    });
+
+    test('updates existing favicon element', () => {
+      document.head.innerHTML = '<link id="favicon" rel="icon" href="/old.png">';
+
+      Utils.setFavicon('/new.png');
+
+      expect(document.getElementById('favicon').getAttribute('href')).toBe('/new.png');
+    });
+
+    test('creates favicon element when missing', () => {
+      Utils.setFavicon('/created.png');
+
+      const favicon = document.getElementById('favicon');
+      expect(favicon).not.toBeNull();
+      expect(favicon.getAttribute('href')).toBe('/created.png');
+      expect(favicon.getAttribute('rel')).toBe('icon');
+    });
+  });
+
   describe('keyCodes', () => {
     test('has standard key codes', () => {
       expect(Utils.keyCodes.enter).toBe(13);

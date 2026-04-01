@@ -43,7 +43,7 @@ window.seafile = {
 
 (function () {
   const fileIcon = Utils.getFileIconUrl(docName, 192);
-  document.getElementById('favicon').href = fileIcon;
+  Utils.setFavicon(fileIcon);
 })();
 
 ReactDom.render(

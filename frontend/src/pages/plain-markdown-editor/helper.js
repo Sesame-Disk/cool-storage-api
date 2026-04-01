@@ -3,7 +3,7 @@ import { Utils } from '../../utils/utils';
 
 const initFavicon = (fileName) => {
   const fileIcon = Utils.getFileIconUrl(fileName, 192);
-  document.getElementById('favicon').href = fileIcon;
+  Utils.setFavicon(fileIcon);
 };
 
 const getFileInfo = async (repoID, filePath) => {

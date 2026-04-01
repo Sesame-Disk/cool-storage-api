@@ -60,7 +60,7 @@ class SharedFileView extends React.Component {
   componentDidMount() {
 
     const fileIcon = Utils.getFileIconUrl(fileName, 192);
-    document.getElementById('favicon').href = fileIcon;
+    Utils.setFavicon(fileIcon);
 
     if (trafficOverLimit) {
       toaster.danger(gettext('File download is disabled: the share link traffic of owner is used up.'), {
