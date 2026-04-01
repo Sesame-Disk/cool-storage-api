@@ -33,7 +33,12 @@ func TestGroupShareDeletedWithGroupCleanup(t *testing.T) {
 			return
 		}
 		resp := adminClient.Delete(t, fmt.Sprintf("/api/v2.1/groups/%s/", groupID))
-		resp.Body.Close()
+		if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusNotFound {
+			resp.Body.Close()
+			return
+		}
+		body := responseBody(t, resp)
+		t.Errorf("cleanup delete group %s failed: status=%d body=%s", groupID, resp.StatusCode, body)
 	})
 
 	addMemberResp := adminClient.PostForm(t, fmt.Sprintf("/api/v2.1/groups/%s/members/", groupID), url.Values{

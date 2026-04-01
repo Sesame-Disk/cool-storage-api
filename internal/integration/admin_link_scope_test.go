@@ -66,6 +66,15 @@ func createShareLinkForTest(t *testing.T, client *testClient, repoID, path strin
 	if token == "" {
 		t.Fatalf("expected share link token, got %v", payload)
 	}
+	t.Cleanup(func() {
+		resp := client.Delete(t, "/api/v2.1/org/admin/links/"+token+"/")
+		if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusNotFound {
+			resp.Body.Close()
+			return
+		}
+		body := responseBody(t, resp)
+		t.Errorf("cleanup delete share link %s failed: status=%d body=%s", token, resp.StatusCode, body)
+	})
 	return token
 }
 
@@ -94,6 +103,15 @@ func createUploadLinkForTest(t *testing.T, client *testClient, repoID, path stri
 	if token == "" {
 		t.Fatalf("expected upload link token, got %v", payload)
 	}
+	t.Cleanup(func() {
+		resp := client.Delete(t, "/api/v2.1/org/admin/upload-links/"+token+"/")
+		if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusNotFound {
+			resp.Body.Close()
+			return
+		}
+		body := responseBody(t, resp)
+		t.Errorf("cleanup delete upload link %s failed: status=%d body=%s", token, resp.StatusCode, body)
+	})
 	return token
 }
 

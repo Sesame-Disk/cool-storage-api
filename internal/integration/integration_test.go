@@ -148,8 +148,13 @@ func createLibraryForTest(t *testing.T, c *testClient, name string, body interfa
 		if repoID != "" {
 			if cleanup {
 				t.Cleanup(func() {
-					delResp := c.Delete(t, fmt.Sprintf("/api/v2.1/repos/%s/", repoID))
-					delResp.Body.Close()
+					resp := c.Delete(t, fmt.Sprintf("/api/v2.1/repos/%s/", repoID))
+					if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusNotFound {
+						resp.Body.Close()
+						return
+					}
+					body := responseBody(t, resp)
+					t.Errorf("cleanup delete library %s failed: status=%d body=%s", repoID, resp.StatusCode, body)
 				})
 			}
 			return repoID

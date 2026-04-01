@@ -118,8 +118,13 @@ func TestEncryptedLibrary(t *testing.T) {
 	repoID := createLibraryWithBody(t, adminClient, name, body, false)
 
 	t.Cleanup(func() {
-		delResp := adminClient.Delete(t, fmt.Sprintf("/api/v2.1/repos/%s/", repoID))
-		delResp.Body.Close()
+		resp := adminClient.Delete(t, fmt.Sprintf("/api/v2.1/repos/%s/", repoID))
+		if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusNotFound {
+			resp.Body.Close()
+			return
+		}
+		body := responseBody(t, resp)
+		t.Errorf("cleanup delete library %s failed: status=%d body=%s", repoID, resp.StatusCode, body)
 	})
 
 	// Verify encrypted flag
