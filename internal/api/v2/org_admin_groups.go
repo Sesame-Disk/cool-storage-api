@@ -676,9 +676,9 @@ func (h *OrgAdminHandler) AddOrgGroupOwnedLibrary(c *gin.Context) {
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`, targetOrgID, newLibID, callerUserID, repoName, false, int64(0), int64(0), now, now)
 	batch.Query(`
-		INSERT INTO libraries_by_id (library_id, org_id, owner_id, encrypted)
-		VALUES (?, ?, ?, ?)
-	`, newLibID, targetOrgID, callerUserID, false)
+		INSERT INTO libraries_by_id (library_id, org_id, owner_id, name, encrypted)
+		VALUES (?, ?, ?, ?, ?)
+	`, newLibID, targetOrgID, callerUserID, repoName, false)
 	if err := batch.Exec(); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create library"})
 		return

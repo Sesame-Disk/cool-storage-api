@@ -3,8 +3,8 @@
 -- Includes every column that exists in production (including columns that were
 -- historically added via ALTER TABLE — they are baked in here for clean installs).
 --
--- Existing deployments: all migrations are stamped automatically at first run
--- of the new migration system without re-executing any CQL.
+-- Existing deployments that intentionally reuse this baseline will re-run the
+-- CREATE TABLE / CREATE INDEX statements safely where the schema already exists.
 -- Fresh installs: this file creates the complete schema in one pass.
 
 -- ─── Core / Identity ─────────────────────────────────────────────────────────

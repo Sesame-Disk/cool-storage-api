@@ -558,10 +558,10 @@ func (h *LibraryHandler) CreateLibrary(c *gin.Context) {
 		// Dual-write to lookup table
 		batch.Query(`
 			INSERT INTO libraries_by_id (
-				library_id, org_id, owner_id, head_commit_id, encrypted,
+				library_id, org_id, owner_id, name, head_commit_id, encrypted,
 				enc_version, magic, random_key, salt, magic_strong, random_key_strong
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		`, newLibID.String(), orgID, userID, headCommitID, library.Encrypted,
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`, newLibID.String(), orgID, userID, library.Name, headCommitID, library.Encrypted,
 			encParams.EncVersion, encParams.Magic, encParams.RandomKey, encParams.Salt,
 			encParams.MagicStrong, encParams.RandomKeyStrong,
 		)
@@ -581,9 +581,9 @@ func (h *LibraryHandler) CreateLibrary(c *gin.Context) {
 		// Dual-write to lookup table (unencrypted)
 		batch.Query(`
 			INSERT INTO libraries_by_id (
-				library_id, org_id, owner_id, head_commit_id, encrypted
-			) VALUES (?, ?, ?, ?, ?)
-		`, newLibID.String(), orgID, userID, headCommitID, false,
+				library_id, org_id, owner_id, name, head_commit_id, encrypted
+			) VALUES (?, ?, ?, ?, ?, ?)
+		`, newLibID.String(), orgID, userID, library.Name, headCommitID, false,
 		)
 	}
 
@@ -946,10 +946,18 @@ func (h *LibraryHandler) RenameLibrary(c *gin.Context) {
 		return
 	}
 
-	if err := h.db.Session().Query(`
+	now := time.Now()
+	batch := h.db.Session().Batch(gocql.LoggedBatch)
+	batch.Query(`
 		UPDATE libraries SET name = ?, updated_at = ?
 		WHERE org_id = ? AND library_id = ?
-	`, req.RepoName, time.Now(), orgID, repoID).Exec(); err != nil {
+	`, req.RepoName, now, orgID, repoID)
+	batch.Query(`
+		UPDATE libraries_by_id SET name = ?
+		WHERE library_id = ?
+	`, req.RepoName, repoID)
+
+	if err := batch.Exec(); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to rename library"})
 		return
 	}

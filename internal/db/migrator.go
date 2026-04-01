@@ -76,10 +76,6 @@ func NewMigrator(session *gocql.Session) *Migrator {
 //
 // Checksum validation runs first: if any previously-applied migration file has
 // been modified, Run returns an error before touching the database.
-//
-// On the first invocation against a legacy database (schema_migrations is empty
-// but core tables already exist), all known migrations are stamped without
-// execution to preserve the existing schema.
 func (m *Migrator) Run() error {
 	if err := m.ensureTable(); err != nil {
 		return err
@@ -93,17 +89,12 @@ func (m *Migrator) Run() error {
 		return err
 	}
 
+	if err := validateAppliedMigrationChecksums(files, applied); err != nil {
+		return err
+	}
+
 	for _, mf := range files {
-		rec, alreadyApplied := applied[mf.Version]
-		if alreadyApplied {
-			if rec.Checksum != mf.Checksum {
-				return fmt.Errorf(
-					"migration %03d (%s): checksum mismatch — the file was modified after it was applied "+
-						"(recorded=%s file=%s). "+
-						"Do not edit migration files after application; create a new numbered migration instead.",
-					mf.Version, mf.Name, rec.Checksum, mf.Checksum,
-				)
-			}
+		if _, alreadyApplied := applied[mf.Version]; alreadyApplied {
 			continue
 		}
 
@@ -181,18 +172,7 @@ func (m *Migrator) Check() error {
 		return err
 	}
 
-	var issues []string
-	for _, mf := range files {
-		rec, ok := applied[mf.Version]
-		if !ok {
-			issues = append(issues, fmt.Sprintf("pending:  %s", mf.label()))
-			continue
-		}
-		if rec.Checksum != mf.Checksum {
-			issues = append(issues, fmt.Sprintf("modified: %s (recorded=%s… file=%s…)",
-				mf.label(), rec.Checksum[:8], mf.Checksum[:8]))
-		}
-	}
+	issues := migrationCheckIssues(files, applied)
 	if len(issues) == 0 {
 		return nil
 	}
@@ -302,6 +282,47 @@ func (m *Migrator) apply(mf MigrationFile) error {
 // label returns the human-readable label used in log messages.
 func (mf MigrationFile) label() string {
 	return fmt.Sprintf("%03d_%s", mf.Version, mf.Name)
+}
+
+func migrationCheckIssues(files []MigrationFile, applied map[int]AppliedMigration) []string {
+	issues := make([]string, 0, len(files))
+	for _, mf := range files {
+		rec, ok := applied[mf.Version]
+		if !ok {
+			issues = append(issues, fmt.Sprintf("pending:  %s", mf.label()))
+			continue
+		}
+		if rec.Checksum != mf.Checksum {
+			issues = append(issues, fmt.Sprintf("modified: %s (recorded=%s… file=%s…)",
+				mf.label(), checksumPrefix(rec.Checksum), checksumPrefix(mf.Checksum)))
+		}
+	}
+	return issues
+}
+
+func validateAppliedMigrationChecksums(files []MigrationFile, applied map[int]AppliedMigration) error {
+	for _, mf := range files {
+		rec, alreadyApplied := applied[mf.Version]
+		if !alreadyApplied {
+			continue
+		}
+		if rec.Checksum != mf.Checksum {
+			return fmt.Errorf(
+				"migration %03d (%s): checksum mismatch — the file was modified after it was applied "+
+					"(recorded=%s file=%s). "+
+					"Do not edit migration files after application; create a new numbered migration instead.",
+				mf.Version, mf.Name, rec.Checksum, mf.Checksum,
+			)
+		}
+	}
+	return nil
+}
+
+func checksumPrefix(checksum string) string {
+	if len(checksum) <= 8 {
+		return checksum
+	}
+	return checksum[:8]
 }
 
 // parseMigrationFilename parses "042_add_foo_column.cql" into (42, "add_foo_column").

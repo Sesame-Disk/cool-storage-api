@@ -543,9 +543,9 @@ func (h *AdminHandler) AdminCreateLibrary(c *gin.Context) {
 	)
 	batch.Query(`
 		INSERT INTO libraries_by_id (
-			library_id, org_id, owner_id, head_commit_id, encrypted
-		) VALUES (?, ?, ?, ?, ?)
-	`, newLibID.String(), ownerOrgID, ownerUserID, headCommitID, false,
+			library_id, org_id, owner_id, name, head_commit_id, encrypted
+		) VALUES (?, ?, ?, ?, ?, ?)
+	`, newLibID.String(), ownerOrgID, ownerUserID, repoName, headCommitID, false,
 	)
 	batch.Query(`
 		INSERT INTO commits (library_id, commit_id, root_fs_id, creator_id, description, created_at)
