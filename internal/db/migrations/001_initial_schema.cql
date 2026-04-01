@@ -98,6 +98,7 @@ CREATE TABLE IF NOT EXISTS libraries_by_id (
     library_id        UUID PRIMARY KEY,
     org_id            UUID,
     owner_id          UUID,
+    name              TEXT,
     head_commit_id    TEXT,
     encrypted         BOOLEAN,
     enc_version       INT,
@@ -393,6 +394,11 @@ CREATE TABLE IF NOT EXISTS starred_files (
     starred_at TIMESTAMP,
     PRIMARY KEY ((user_id), repo_id, path)
 );
+
+-- Secondary index required by GC cleanup: DELETE FROM starred_files WHERE repo_id = ?
+-- (store_cassandra.go DeleteStarredFilesByLibrary). Without this index that query
+-- requires ALLOW FILTERING and will fail on any non-trivial dataset.
+CREATE INDEX IF NOT EXISTS starred_files_by_repo ON starred_files (repo_id);
 
 CREATE TABLE IF NOT EXISTS locked_files (
     repo_id   UUID,

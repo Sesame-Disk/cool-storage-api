@@ -32,13 +32,12 @@ var migrationsFS embed.FS
 // zero-padded integer (e.g. 001, 042). The version number determines
 // application order; gaps are allowed.
 //
-// # First-run bootstrap (legacy databases)
+// # Idempotency
 //
-// When schema_migrations is empty but the organizations table already exists,
-// the migrator concludes it is running against a pre-migration-system database.
-// All known migrations are stamped as applied without executing their CQL,
-// preserving the existing schema. New migrations added after this point are
-// applied normally on the next startup.
+// All statements in 001_initial_schema.cql use CREATE TABLE IF NOT EXISTS and
+// CREATE INDEX IF NOT EXISTS, making them safe to re-run on any database state.
+// Incremental migrations (002+) use ALTER TABLE or other non-idempotent
+// statements and are only executed once — tracked via schema_migrations.
 type Migrator struct {
 	session *gocql.Session
 }
@@ -94,12 +93,6 @@ func (m *Migrator) Run() error {
 		return err
 	}
 
-	// Legacy-database bootstrap: stamp all migrations without executing them.
-	isLegacy := len(applied) == 0 && m.hasLegacyTables()
-	if isLegacy {
-		slog.Info("migrator: legacy database detected — stamping existing migrations")
-	}
-
 	for _, mf := range files {
 		rec, alreadyApplied := applied[mf.Version]
 		if alreadyApplied {
@@ -114,17 +107,10 @@ func (m *Migrator) Run() error {
 			continue
 		}
 
-		if isLegacy {
-			if err := m.stamp(mf); err != nil {
-				return fmt.Errorf("migrator: stamping %03d_%s: %w", mf.Version, mf.Name, err)
-			}
-			slog.Info("migrator: stamped", "migration", mf.label())
-		} else {
-			if err := m.apply(mf); err != nil {
-				return fmt.Errorf("migrator: applying %03d_%s: %w", mf.Version, mf.Name, err)
-			}
-			slog.Info("migrator: applied", "migration", mf.label())
+		if err := m.apply(mf); err != nil {
+			return fmt.Errorf("migrator: applying %03d_%s: %w", mf.Version, mf.Name, err)
 		}
+		slog.Info("migrator: applied", "migration", mf.label())
 	}
 
 	return nil
@@ -178,22 +164,40 @@ func (m *Migrator) DryRun() ([]MigrationFile, error) {
 	return pending, nil
 }
 
-// Check returns a non-nil error if any migrations are pending.
-// Intended for CI pipelines: exit non-zero when the deployed schema lags the
-// binary.
+// Check returns a non-nil error if any migrations are pending OR if any
+// previously-applied migration file has been modified since application.
+// Intended for CI pipelines: exit non-zero whenever the binary and database
+// are out of sync in either direction.
 func (m *Migrator) Check() error {
-	pending, err := m.DryRun()
+	if err := m.ensureTable(); err != nil {
+		return err
+	}
+	files, err := m.loadFiles()
 	if err != nil {
 		return err
 	}
-	if len(pending) == 0 {
+	applied, err := m.appliedMigrations()
+	if err != nil {
+		return err
+	}
+
+	var issues []string
+	for _, mf := range files {
+		rec, ok := applied[mf.Version]
+		if !ok {
+			issues = append(issues, fmt.Sprintf("pending:  %s", mf.label()))
+			continue
+		}
+		if rec.Checksum != mf.Checksum {
+			issues = append(issues, fmt.Sprintf("modified: %s (recorded=%s… file=%s…)",
+				mf.label(), rec.Checksum[:8], mf.Checksum[:8]))
+		}
+	}
+	if len(issues) == 0 {
 		return nil
 	}
-	names := make([]string, len(pending))
-	for i, mf := range pending {
-		names[i] = mf.label()
-	}
-	return fmt.Errorf("%d pending migration(s): %s", len(pending), strings.Join(names, ", "))
+	return fmt.Errorf("schema check failed (%d issue(s)):\n  %s",
+		len(issues), strings.Join(issues, "\n  "))
 }
 
 // ── internal helpers ─────────────────────────────────────────────────────────
@@ -272,12 +276,6 @@ func (m *Migrator) appliedMigrations() (map[int]AppliedMigration, error) {
 		return nil, fmt.Errorf("reading schema_migrations: %w", err)
 	}
 	return applied, nil
-}
-
-// hasLegacyTables returns true if the organizations table already exists,
-// indicating a database that predates the migration tracking system.
-func (m *Migrator) hasLegacyTables() bool {
-	return m.session.Query(`SELECT org_id FROM organizations LIMIT 1`).Exec() == nil
 }
 
 // stamp records a migration in schema_migrations without executing its CQL.
