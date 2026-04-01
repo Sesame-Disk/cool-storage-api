@@ -20,6 +20,13 @@ type AdminGroupProjectionRow struct {
 	CreatedAt     time.Time
 }
 
+func optionalGroupParentIDString(parentGroupID gocql.UUID) string {
+	if parentGroupID == (gocql.UUID{}) {
+		return ""
+	}
+	return parentGroupID.String()
+}
+
 func AdminGroupBucketDay(createdAt time.Time) string {
 	return createdAt.UTC().Format("2006-01-02")
 }
@@ -38,13 +45,15 @@ func ResolveAdminGroupOwnerFields(session *gocql.Session, orgID, creatorID strin
 
 func ReadAdminGroupProjectionRow(session *gocql.Session, orgID, groupID string) (AdminGroupProjectionRow, error) {
 	row := AdminGroupProjectionRow{OrgID: orgID, GroupID: groupID}
+	var parentGroupID gocql.UUID
 	err := session.Query(`
 		SELECT name, creator_id, parent_group_id, is_department, created_at
 		FROM groups WHERE org_id = ? AND group_id = ?
-	`, orgID, groupID).Scan(&row.Name, &row.CreatorID, &row.ParentGroupID, &row.IsDepartment, &row.CreatedAt)
+	`, orgID, groupID).Scan(&row.Name, &row.CreatorID, &parentGroupID, &row.IsDepartment, &row.CreatedAt)
 	if err != nil {
 		return AdminGroupProjectionRow{}, err
 	}
+	row.ParentGroupID = optionalGroupParentIDString(parentGroupID)
 	row.OwnerEmail, row.OwnerName = ResolveAdminGroupOwnerFields(session, orgID, row.CreatorID)
 	return row, nil
 }
@@ -52,6 +61,17 @@ func ReadAdminGroupProjectionRow(session *gocql.Session, orgID, groupID string) 
 func AddUpsertAdminGroupReadModelQuery(batch *gocql.Batch, row AdminGroupProjectionRow) {
 	bucketDay := AdminGroupBucketDay(row.CreatedAt)
 	batch.Query(`INSERT INTO group_admin_global_buckets (bucket_day) VALUES (?)`, bucketDay)
+	if row.ParentGroupID == "" {
+		batch.Query(`
+			INSERT INTO groups_admin_global_by_created (
+				bucket_day, created_at, org_id, group_id, name, creator_id, owner_email,
+				owner_name, is_department
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`, bucketDay, row.CreatedAt, row.OrgID, row.GroupID, row.Name, row.CreatorID, row.OwnerEmail,
+			row.OwnerName, row.IsDepartment)
+		return
+	}
+
 	batch.Query(`
 		INSERT INTO groups_admin_global_by_created (
 			bucket_day, created_at, org_id, group_id, name, creator_id, owner_email,
@@ -117,10 +137,13 @@ func ListAdminGlobalGroupRows(session *gocql.Session) ([]AdminGroupProjectionRow
 		`, bucketDay).Iter()
 
 		var row AdminGroupProjectionRow
+		var parentGroupID gocql.UUID
 		for iter.Scan(&row.CreatedAt, &row.OrgID, &row.GroupID, &row.Name, &row.CreatorID, &row.OwnerEmail,
-			&row.OwnerName, &row.ParentGroupID, &row.IsDepartment) {
+			&row.OwnerName, &parentGroupID, &row.IsDepartment) {
+			row.ParentGroupID = optionalGroupParentIDString(parentGroupID)
 			rows = append(rows, row)
 			row = AdminGroupProjectionRow{}
+			parentGroupID = gocql.UUID{}
 		}
 		if err := iter.Close(); err != nil {
 			return nil, err
