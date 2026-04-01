@@ -649,7 +649,11 @@ func (s *CassandraStore) DeleteShareLink(shareToken string, fallbackOrgID uuid.U
 	batch.Query(`DELETE FROM share_links_by_library WHERE org_id = ? AND library_id = ? AND link_token = ?`,
 		orgID, libraryID, shareToken)
 	db.AddDeleteAdminLinkReadModelQuery(batch, linkType, createdAt, orgID, shareToken)
-	return batch.Exec()
+	if err := batch.Exec(); err != nil {
+		return err
+	}
+	db.BestEffortAdjustAdminOrgLinkCount(s.db.Session(), orgID, linkType, db.AdminOrgLinkCountDelta(-1))
+	return nil
 }
 
 // --- Expired shares (user-to-user) ---
@@ -891,6 +895,7 @@ func (s *CassandraStore) DeleteShareLinksByLibrary(orgID, libraryID uuid.UUID) (
 			orgID.String(), libraryID.String(), link.token)
 		db.AddDeleteAdminLinkReadModelQuery(batch, link.linkType, link.createdAt, orgID.String(), link.token)
 		if err := batch.Exec(); err == nil {
+			db.BestEffortAdjustAdminOrgLinkCount(s.db.Session(), orgID.String(), link.linkType, db.AdminOrgLinkCountDelta(-1))
 			deletedTokens = append(deletedTokens, link.token)
 		}
 	}

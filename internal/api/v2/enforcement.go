@@ -29,24 +29,24 @@ func GetOrgEnforcement(database *db.DB, orgID string, cfg *config.Config) OrgEnf
 	}
 }
 
-// CountActiveShareLinks counts active share links (link_type="share") for an org.
-func CountActiveShareLinks(database *db.DB, orgID string) int {
+// CountShareLinks counts all share links (link_type="share") for an org for enforcement.
+func CountShareLinks(database *db.DB, orgID string) int {
 	if _, err := gocql.ParseUUID(orgID); err != nil {
 		return 0
 	}
-	count, err := db.CountActiveAdminOrgLinks(database.Session(), orgID, "share")
+	count, err := db.CountAdminOrgLinks(database.Session(), orgID, "share")
 	if err != nil {
 		return 0
 	}
 	return count
 }
 
-// CountActiveUploadLinks counts active upload links (link_type="upload") for an org.
-func CountActiveUploadLinks(database *db.DB, orgID string) int {
+// CountUploadLinks counts all upload links (link_type="upload") for an org for enforcement.
+func CountUploadLinks(database *db.DB, orgID string) int {
 	if _, err := gocql.ParseUUID(orgID); err != nil {
 		return 0
 	}
-	count, err := db.CountActiveAdminOrgLinks(database.Session(), orgID, "upload")
+	count, err := db.CountAdminOrgLinks(database.Session(), orgID, "upload")
 	if err != nil {
 		return 0
 	}

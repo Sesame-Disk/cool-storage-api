@@ -304,15 +304,16 @@ func setUserShareLinksActive(db interface{ Session() *gocql.Session }, orgID, us
 		linkType  string
 		token     string
 		createdAt time.Time
+		active    bool
 	}
 	iter := db.Session().Query(
-		`SELECT link_type, link_token, created_at FROM share_links_by_creator WHERE org_id = ? AND created_by = ?`,
+		`SELECT link_type, link_token, created_at, active FROM share_links_by_creator WHERE org_id = ? AND created_by = ?`,
 		orgID, userID,
 	).Iter()
 
 	var links []link
 	var l link
-	for iter.Scan(&l.linkType, &l.token, &l.createdAt) {
+	for iter.Scan(&l.linkType, &l.token, &l.createdAt, &l.active) {
 		links = append(links, l)
 	}
 	if err := iter.Close(); err != nil {
@@ -325,11 +326,19 @@ func setUserShareLinksActive(db interface{ Session() *gocql.Session }, orgID, us
 			end = len(links)
 		}
 		batch := db.Session().Batch(gocql.UnloggedBatch)
+		changed := false
 		for _, lk := range links[i:end] {
+			if lk.active == active {
+				continue
+			}
+			changed = true
 			batch.Query(`UPDATE share_links SET active = ? WHERE link_token = ?`, active, lk.token)
 			batch.Query(`UPDATE share_links_by_creator SET active = ? WHERE org_id = ? AND created_by = ? AND created_at = ? AND link_token = ?`,
 				active, orgID, userID, lk.createdAt, lk.token)
 			dbpkg.AddUpdateAdminLinkActiveQuery(batch, lk.linkType, lk.createdAt, orgID, lk.token, active)
+		}
+		if !changed {
+			continue
 		}
 		if err := batch.Exec(); err != nil {
 			log.Printf("[setUserShareLinksActive] batch exec: %v", err)
@@ -353,11 +362,19 @@ func setOrgShareLinksActive(db interface{ Session() *gocql.Session }, orgID stri
 			end = len(links)
 		}
 		batch := db.Session().Batch(gocql.UnloggedBatch)
+		changed := false
 		for _, lk := range links[i:end] {
+			if lk.Active == active {
+				continue
+			}
+			changed = true
 			batch.Query(`UPDATE share_links SET active = ? WHERE link_token = ?`, active, lk.Token)
 			batch.Query(`UPDATE share_links_by_creator SET active = ? WHERE org_id = ? AND created_by = ? AND created_at = ? AND link_token = ?`,
 				active, orgID, lk.CreatedBy, lk.CreatedAt, lk.Token)
 			dbpkg.AddUpdateAdminLinkActiveQuery(batch, lk.LinkType, lk.CreatedAt, orgID, lk.Token, active)
+		}
+		if !changed {
+			continue
 		}
 		if err := batch.Exec(); err != nil {
 			log.Printf("[setOrgShareLinksActive] batch exec: %v", err)
@@ -384,7 +401,9 @@ func deleteConsumedShareLink(db interface{ Session() *gocql.Session }, token, or
 	dbpkg.AddDeleteAdminLinkReadModelQuery(batch, linkType, createdAt, orgID, token)
 	if err := batch.Exec(); err != nil {
 		log.Printf("[deleteConsumedShareLink] failed for token %s: %v", token, err)
+		return
 	}
+	dbpkg.BestEffortAdjustAdminOrgLinkCount(db.Session(), orgID, linkType, dbpkg.AdminOrgLinkCountDelta(-1))
 }
 
 // incrementShareLinkCounterDualWrite increments a link counter on primary + lookup tables.

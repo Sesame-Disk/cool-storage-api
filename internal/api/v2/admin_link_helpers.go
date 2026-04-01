@@ -163,7 +163,7 @@ func paginateAdminLinks(links []gin.H, page, perPage int) ([]gin.H, int, bool) {
 	return links[start:end], total, end < total
 }
 
-func sortAdminLinks(links []gin.H, sortBy, direction string) {
+func normalizeAdminLinkSort(sortBy, direction string) (string, string) {
 	if sortBy == "" {
 		sortBy = "ctime"
 		if direction == "" {
@@ -172,6 +172,16 @@ func sortAdminLinks(links []gin.H, sortBy, direction string) {
 	} else if direction == "" {
 		direction = "asc"
 	}
+	return sortBy, direction
+}
+
+func isDefaultAdminLinkSort(sortBy, direction string) bool {
+	sortBy, direction = normalizeAdminLinkSort(sortBy, direction)
+	return sortBy == "ctime" && direction == "desc"
+}
+
+func sortAdminLinks(links []gin.H, sortBy, direction string) {
+	sortBy, direction = normalizeAdminLinkSort(sortBy, direction)
 
 	sort.Slice(links, func(i, j int) bool {
 		if sortBy == "view_cnt" {
@@ -338,19 +348,167 @@ func listAdminLinkProjectionRowsByOrg(session *gocql.Session, orgID, linkType st
 	return rows, nil
 }
 
+func normalizedAdminLinkRepoName(projected string) string {
+	repoName := strings.TrimSpace(projected)
+	if repoName == "" {
+		return "Unknown Library"
+	}
+	return repoName
+}
+
+func normalizedAdminLinkCreatorInfo(createdBy, projectedEmail, projectedName string) (string, string) {
+	creatorEmail := strings.TrimSpace(projectedEmail)
+	creatorName := strings.TrimSpace(projectedName)
+	if creatorEmail == "" {
+		creatorEmail = createdBy
+	}
+	if creatorName == "" {
+		creatorName = creatorEmail
+	}
+	return creatorEmail, creatorName
+}
+
+func adminLinkProjectionDisplay(row adminLinkProjectionRow) (string, string, string, string) {
+	repoName := normalizedAdminLinkRepoName(row.RepoName)
+	creatorEmail, creatorName := normalizedAdminLinkCreatorInfo(row.CreatedBy, row.CreatorEmail, row.CreatorName)
+	objName := resolveAdminLinkObjName(row.ObjName, row.FilePath, repoName)
+	return repoName, objName, creatorEmail, creatorName
+}
+
+func adminLinkProjectionState(row adminLinkProjectionRow) (bool, string) {
+	if row.ExpiresAt == nil || row.ExpiresAt.IsZero() {
+		return false, ""
+	}
+	return row.ExpiresAt.Before(time.Now()), row.ExpiresAt.Format(time.RFC3339)
+}
+
+func adminLinkProjectionMatches(row adminLinkProjectionRow, filters adminLinkListFilters, extraSearch ...string) bool {
+	repoName, objName, creatorEmail, creatorName := adminLinkProjectionDisplay(row)
+	isExpired, _ := adminLinkProjectionState(row)
+	if !filters.MatchesState(row.Active, isExpired) {
+		return false
+	}
+	searchValues := []string{objName, row.Token, row.FilePath, repoName, creatorEmail, creatorName}
+	searchValues = append(searchValues, extraSearch...)
+	return filters.MatchesSearch(searchValues...)
+}
+
+func listAdminLinkProjectionPage(session *gocql.Session, linkType string, filters adminLinkListFilters, page, perPage int) ([]adminLinkProjectionRow, int, bool, error) {
+	buckets, err := listAdminLinkBuckets(session, linkType)
+	if err != nil {
+		return nil, 0, false, err
+	}
+	sort.Sort(sort.Reverse(sort.StringSlice(buckets)))
+	offset := (page - 1) * perPage
+	if offset < 0 {
+		offset = 0
+	}
+	rows := make([]adminLinkProjectionRow, 0, perPage)
+	total := 0
+	for _, bucketDay := range buckets {
+		iter := session.Query(`
+			SELECT org_id, link_token, library_id, repo_name, file_path, obj_name,
+			       created_by, creator_email, creator_name, permission, expires_at,
+			       has_password, active, view_count, upload_count, created_at
+			FROM admin_links_by_created
+			WHERE link_type = ? AND bucket_day = ?
+		`, linkType, bucketDay).Iter()
+
+		var row adminLinkProjectionRow
+		for iter.Scan(
+			&row.OrgID,
+			&row.Token,
+			&row.LibraryID,
+			&row.RepoName,
+			&row.FilePath,
+			&row.ObjName,
+			&row.CreatedBy,
+			&row.CreatorEmail,
+			&row.CreatorName,
+			&row.Permission,
+			&row.ExpiresAt,
+			&row.HasPassword,
+			&row.Active,
+			&row.ViewCount,
+			&row.UploadCount,
+			&row.CreatedAt,
+		) {
+			if adminLinkProjectionMatches(row, filters) {
+				if total >= offset && len(rows) < perPage {
+					rows = append(rows, row)
+				}
+				total++
+			}
+			row = adminLinkProjectionRow{}
+		}
+		if err := iter.Close(); err != nil {
+			return nil, 0, false, err
+		}
+	}
+	return rows, total, offset+len(rows) < total, nil
+}
+
+func listAdminLinkProjectionPageByOrg(session *gocql.Session, orgID, linkType string, filters adminLinkListFilters, page, perPage int) ([]adminLinkProjectionRow, int, bool, error) {
+	buckets, err := listAdminLinkBucketsByOrg(session, orgID, linkType)
+	if err != nil {
+		return nil, 0, false, err
+	}
+	sort.Sort(sort.Reverse(sort.StringSlice(buckets)))
+	offset := (page - 1) * perPage
+	if offset < 0 {
+		offset = 0
+	}
+	rows := make([]adminLinkProjectionRow, 0, perPage)
+	total := 0
+	for _, bucketDay := range buckets {
+		iter := session.Query(`
+			SELECT link_token, library_id, repo_name, file_path, obj_name,
+			       created_by, creator_email, creator_name, permission, expires_at,
+			       has_password, active, view_count, upload_count, created_at
+			FROM admin_links_by_org_created
+			WHERE org_id = ? AND link_type = ? AND bucket_day = ?
+		`, orgID, linkType, bucketDay).Iter()
+
+		var row adminLinkProjectionRow
+		for iter.Scan(
+			&row.Token,
+			&row.LibraryID,
+			&row.RepoName,
+			&row.FilePath,
+			&row.ObjName,
+			&row.CreatedBy,
+			&row.CreatorEmail,
+			&row.CreatorName,
+			&row.Permission,
+			&row.ExpiresAt,
+			&row.HasPassword,
+			&row.Active,
+			&row.ViewCount,
+			&row.UploadCount,
+			&row.CreatedAt,
+		) {
+			row.OrgID = orgID
+			if adminLinkProjectionMatches(row, filters) {
+				if total >= offset && len(rows) < perPage {
+					rows = append(rows, row)
+				}
+				total++
+			}
+			row = adminLinkProjectionRow{}
+		}
+		if err := iter.Close(); err != nil {
+			return nil, 0, false, err
+		}
+	}
+	return rows, total, offset+len(rows) < total, nil
+}
+
 func resolveAdminLinkRepoName(session *gocql.Session, cache map[string]string, orgID, libraryID, projected string) string {
 	cacheKey := orgID + ":" + libraryID
 	if repoName, ok := cache[cacheKey]; ok {
 		return repoName
 	}
-	var repoName string
-	_ = session.Query(`SELECT name FROM libraries WHERE org_id = ? AND library_id = ?`, orgID, libraryID).Scan(&repoName)
-	if strings.TrimSpace(repoName) == "" {
-		repoName = strings.TrimSpace(projected)
-	}
-	if repoName == "" {
-		repoName = "Unknown Library"
-	}
+	repoName := normalizedAdminLinkRepoName(projected)
 	cache[cacheKey] = repoName
 	return repoName
 }
@@ -360,20 +518,7 @@ func resolveAdminLinkCreatorInfo(session *gocql.Session, cache map[string][2]str
 	if info, ok := cache[cacheKey]; ok {
 		return info[0], info[1]
 	}
-	var creatorEmail, creatorName string
-	_ = session.Query(`SELECT email, name FROM users WHERE org_id = ? AND user_id = ?`, orgID, createdBy).Scan(&creatorEmail, &creatorName)
-	if strings.TrimSpace(creatorEmail) == "" {
-		creatorEmail = strings.TrimSpace(projectedEmail)
-	}
-	if strings.TrimSpace(creatorName) == "" {
-		creatorName = strings.TrimSpace(projectedName)
-	}
-	if creatorEmail == "" {
-		creatorEmail = createdBy
-	}
-	if creatorName == "" {
-		creatorName = creatorEmail
-	}
+	creatorEmail, creatorName := normalizedAdminLinkCreatorInfo(createdBy, projectedEmail, projectedName)
 	info := [2]string{creatorEmail, creatorName}
 	cache[cacheKey] = info
 	return info[0], info[1]

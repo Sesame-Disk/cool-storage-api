@@ -179,3 +179,35 @@ func TestAdminLinkProjectionRowsSortByCreatedTimeDesc(t *testing.T) {
 		t.Fatalf("expected newest link first, got %#v", links)
 	}
 }
+
+func TestNormalizeAdminLinkSort_DefaultsToCreatedDesc(t *testing.T) {
+	sortBy, direction := normalizeAdminLinkSort("", "")
+	if sortBy != "ctime" || direction != "desc" {
+		t.Fatalf("sort = %s/%s, want ctime/desc", sortBy, direction)
+	}
+	if !isDefaultAdminLinkSort("", "") {
+		t.Fatal("expected empty sort params to use default optimized order")
+	}
+	if isDefaultAdminLinkSort("name", "asc") {
+		t.Fatal("did not expect name/asc to use default optimized order")
+	}
+}
+
+func TestAdminLinkProjectionDisplay_UsesProjectedFields(t *testing.T) {
+	row := adminLinkProjectionRow{
+		CreatedBy:    "user-id",
+		RepoName:     "Projected Repo",
+		FilePath:     "/folder/report.pdf",
+		ObjName:      "Projected File",
+		CreatorEmail: "user@example.com",
+		CreatorName:  "User Name",
+	}
+
+	repoName, objName, creatorEmail, creatorName := adminLinkProjectionDisplay(row)
+	if repoName != "Projected Repo" || objName != "Projected File" {
+		t.Fatalf("unexpected projected names: repo=%q obj=%q", repoName, objName)
+	}
+	if creatorEmail != "user@example.com" || creatorName != "User Name" {
+		t.Fatalf("unexpected projected creator info: %q / %q", creatorEmail, creatorName)
+	}
+}

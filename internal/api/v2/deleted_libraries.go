@@ -300,6 +300,7 @@ func cleanupLibraryLinks(db interface{ Session() *gocql.Session }, orgID, librar
 			_ = iter.Close()
 			return err
 		}
+		dbpkg.BestEffortAdjustAdminOrgLinkCount(db.Session(), orgID, linkType, dbpkg.AdminOrgLinkCountDelta(-1))
 	}
 	if err := iter.Close(); err != nil {
 		return err

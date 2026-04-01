@@ -279,7 +279,11 @@ func (h *ShareLinkHandler) insertShareLink(
 		createdAt,
 	)
 
-	return batch.Exec()
+	if err := batch.Exec(); err != nil {
+		return err
+	}
+	db.BestEffortAdjustAdminOrgLinkCount(h.db.Session(), orgID, linkType, db.AdminOrgLinkCountDelta(1))
+	return nil
 }
 
 // deleteShareLink deletes a link from the canonical tables and admin projections.
@@ -297,7 +301,11 @@ func (h *ShareLinkHandler) deleteShareLink(token, orgID, createdBy, libraryID st
 	batch.Query(`DELETE FROM share_links_by_library WHERE org_id = ? AND library_id = ? AND link_token = ?`,
 		orgID, libraryID, token)
 	db.AddDeleteAdminLinkReadModelQuery(batch, linkType, createdAt, orgID, token)
-	return batch.Exec()
+	if err := batch.Exec(); err != nil {
+		return err
+	}
+	db.BestEffortAdjustAdminOrgLinkCount(h.db.Session(), orgID, linkType, db.AdminOrgLinkCountDelta(-1))
+	return nil
 }
 
 // ListShareLinks returns share links for a file or all share links
@@ -505,7 +513,7 @@ func (h *ShareLinkHandler) CreateShareLink(c *gin.Context) {
 			return
 		}
 		if enforcement.Profile.Limits.MaxShareLinks > 0 {
-			count := CountActiveShareLinks(h.db, orgID)
+			count := CountShareLinks(h.db, orgID)
 			if count >= enforcement.Profile.Limits.MaxShareLinks {
 				c.JSON(http.StatusForbidden, gin.H{
 					"error":   "Share link limit reached",
@@ -917,7 +925,7 @@ func (h *ShareLinkHandler) BatchCreateShareLinks(c *gin.Context) {
 			return
 		}
 		if enforcement.Profile.Limits.MaxShareLinks > 0 {
-			count := CountActiveShareLinks(h.db, orgID)
+			count := CountShareLinks(h.db, orgID)
 			if count+req.Number > enforcement.Profile.Limits.MaxShareLinks {
 				c.JSON(http.StatusForbidden, gin.H{
 					"error":   "Share link limit would be exceeded",

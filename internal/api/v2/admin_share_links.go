@@ -29,6 +29,54 @@ func (h *AdminHandler) AdminListShareLinks(c *gin.Context) {
 		return
 	}
 	page, perPage := parseAdminLinkPageParams(c.DefaultQuery("page", "1"), c.DefaultQuery("per_page", "25"), 25, 0)
+	sortBy := c.Query("order_by")
+	direction := c.Query("direction")
+	if isDefaultAdminLinkSort(sortBy, direction) {
+		rows, total, _, err := listAdminLinkProjectionPage(h.db.Session(), "share", filters, page, perPage)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list share links"})
+			return
+		}
+
+		links := make([]gin.H, 0, len(rows))
+		for _, row := range rows {
+			repoName, objName, creatorEmail, creatorName := adminLinkProjectionDisplay(row)
+			isExpired := false
+			expireDateStr := ""
+			if row.ExpiresAt != nil && !row.ExpiresAt.IsZero() {
+				isExpired = row.ExpiresAt.Before(time.Now())
+				expireDateStr = row.ExpiresAt.Format("2006-01-02T15:04:05+00:00")
+			}
+			perms := parsePermsJSON(row.Permission)
+			status := "active"
+			if !row.Active {
+				status = "inactive"
+			}
+			links = append(links, gin.H{
+				"obj_name":      objName,
+				"token":         row.Token,
+				"repo_id":       row.LibraryID,
+				"repo_name":     repoName,
+				"path":          row.FilePath,
+				"creator_email": creatorEmail,
+				"creator_name":  creatorName,
+				"ctime":         row.CreatedAt.Format(time.RFC3339),
+				"view_cnt":      row.ViewCount,
+				"expire_date":   expireDateStr,
+				"is_expired":    isExpired,
+				"active":        row.Active,
+				"has_password":  row.HasPassword,
+				"status":        status,
+				"permissions":   gin.H{"can_download": perms.CanDownload, "can_edit": perms.CanEdit},
+			})
+		}
+
+		c.JSON(http.StatusOK, gin.H{
+			"share_link_list": links,
+			"count":           total,
+		})
+		return
+	}
 
 	rows, err := listAdminLinkProjectionRows(h.db.Session(), "share")
 	if err != nil {
@@ -38,12 +86,8 @@ func (h *AdminHandler) AdminListShareLinks(c *gin.Context) {
 
 	var links []gin.H
 
-	libNameCache := map[string]string{}
-	userCache := map[string][2]string{}
 	for _, row := range rows {
-		repoName := resolveAdminLinkRepoName(h.db.Session(), libNameCache, row.OrgID, row.LibraryID, row.RepoName)
-		creatorEmail, creatorName := resolveAdminLinkCreatorInfo(h.db.Session(), userCache, row.OrgID, row.CreatedBy, row.CreatorEmail, row.CreatorName)
-		objName := resolveAdminLinkObjName(row.ObjName, row.FilePath, repoName)
+		repoName, objName, creatorEmail, creatorName := adminLinkProjectionDisplay(row)
 
 		isExpired := false
 		expireDateStr := ""
@@ -87,8 +131,6 @@ func (h *AdminHandler) AdminListShareLinks(c *gin.Context) {
 		links = []gin.H{}
 	}
 
-	sortBy := c.Query("order_by")
-	direction := c.Query("direction")
 	sortAdminLinks(links, sortBy, direction)
 	pagedLinks, total, _ := paginateAdminLinks(links, page, perPage)
 
@@ -180,6 +222,52 @@ func (h *AdminHandler) AdminListUploadLinks(c *gin.Context) {
 		return
 	}
 	page, perPage := parseAdminLinkPageParams(c.DefaultQuery("page", "1"), c.DefaultQuery("per_page", "25"), 25, 0)
+	sortBy := c.Query("order_by")
+	direction := c.Query("direction")
+	if isDefaultAdminLinkSort(sortBy, direction) {
+		rows, total, _, err := listAdminLinkProjectionPage(h.db.Session(), "upload", filters, page, perPage)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list upload links"})
+			return
+		}
+
+		links := make([]gin.H, 0, len(rows))
+		for _, row := range rows {
+			repoName, objName, creatorEmail, creatorName := adminLinkProjectionDisplay(row)
+			isExpired := false
+			expireDateStr := ""
+			if row.ExpiresAt != nil && !row.ExpiresAt.IsZero() {
+				isExpired = row.ExpiresAt.Before(time.Now())
+				expireDateStr = row.ExpiresAt.Format("2006-01-02T15:04:05+00:00")
+			}
+			status := "active"
+			if !row.Active {
+				status = "inactive"
+			}
+			links = append(links, gin.H{
+				"obj_name":      objName,
+				"path":          row.FilePath,
+				"token":         row.Token,
+				"repo_id":       row.LibraryID,
+				"repo_name":     repoName,
+				"creator_email": creatorEmail,
+				"creator_name":  creatorName,
+				"ctime":         row.CreatedAt.Format(time.RFC3339),
+				"view_cnt":      row.UploadCount,
+				"expire_date":   expireDateStr,
+				"is_expired":    isExpired,
+				"active":        row.Active,
+				"has_password":  row.HasPassword,
+				"status":        status,
+			})
+		}
+
+		c.JSON(http.StatusOK, gin.H{
+			"upload_link_list": links,
+			"count":            total,
+		})
+		return
+	}
 
 	rows, err := listAdminLinkProjectionRows(h.db.Session(), "upload")
 	if err != nil {
@@ -189,12 +277,8 @@ func (h *AdminHandler) AdminListUploadLinks(c *gin.Context) {
 
 	var links []gin.H
 
-	libNameCache := map[string]string{}
-	userCache := map[string][2]string{}
 	for _, row := range rows {
-		repoName := resolveAdminLinkRepoName(h.db.Session(), libNameCache, row.OrgID, row.LibraryID, row.RepoName)
-		creatorEmail, creatorName := resolveAdminLinkCreatorInfo(h.db.Session(), userCache, row.OrgID, row.CreatedBy, row.CreatorEmail, row.CreatorName)
-		objName := resolveAdminLinkObjName(row.ObjName, row.FilePath, repoName)
+		repoName, objName, creatorEmail, creatorName := adminLinkProjectionDisplay(row)
 
 		isExpired := false
 		expireDateStr := ""
@@ -236,8 +320,6 @@ func (h *AdminHandler) AdminListUploadLinks(c *gin.Context) {
 		links = []gin.H{}
 	}
 
-	sortBy := c.Query("order_by")
-	direction := c.Query("direction")
 	sortAdminLinks(links, sortBy, direction)
 	pagedLinks, total, _ := paginateAdminLinks(links, page, perPage)
 

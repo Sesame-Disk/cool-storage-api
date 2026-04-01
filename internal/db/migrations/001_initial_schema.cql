@@ -288,6 +288,14 @@ CREATE TABLE IF NOT EXISTS admin_link_buckets_by_org (
     PRIMARY KEY ((org_id, link_type), bucket_day)
 ) WITH CLUSTERING ORDER BY (bucket_day DESC);
 
+-- Org/type counters for share/upload-link enforcement.
+CREATE TABLE IF NOT EXISTS admin_link_counts_by_org (
+    org_id     UUID,
+    link_type  TEXT,
+    link_count COUNTER,
+    PRIMARY KEY (org_id, link_type)
+);
+
 -- ─── Shares (user-to-user) ───────────────────────────────────────────────────
 
 CREATE TABLE IF NOT EXISTS shares (

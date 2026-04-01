@@ -279,7 +279,7 @@ func (h *UploadLinkHandler) CreateUploadLink(c *gin.Context) {
 			return
 		}
 		if enforcement.Profile.Limits.MaxUploadLinks > 0 {
-			count := CountActiveUploadLinks(h.db, orgID)
+			count := CountUploadLinks(h.db, orgID)
 			if count >= enforcement.Profile.Limits.MaxUploadLinks {
 				c.JSON(http.StatusForbidden, gin.H{
 					"error":   "Upload link limit reached",

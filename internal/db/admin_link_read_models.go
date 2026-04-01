@@ -54,6 +54,34 @@ func ResolveAdminLinkDisplayFields(session *gocql.Session, orgID, libraryID, fil
 	return repoName, AdminLinkObjName(filePath, repoName), creatorEmail, creatorName
 }
 
+func AdminOrgLinkCountDelta(delta int) int {
+	return delta
+}
+
+func AdjustAdminOrgLinkCount(session *gocql.Session, orgID, linkType string, delta int) error {
+	if !IsAdminLinkType(linkType) || delta == 0 {
+		return nil
+	}
+	return session.Query(`
+		UPDATE admin_link_counts_by_org
+		SET link_count = link_count + ?
+		WHERE org_id = ? AND link_type = ?
+	`, int64(delta), orgID, linkType).Exec()
+}
+
+func InvalidateAdminOrgLinkCount(session *gocql.Session, orgID, linkType string) error {
+	if !IsAdminLinkType(linkType) {
+		return nil
+	}
+	return session.Query(`DELETE FROM admin_link_counts_by_org WHERE org_id = ? AND link_type = ?`, orgID, linkType).Exec()
+}
+
+func BestEffortAdjustAdminOrgLinkCount(session *gocql.Session, orgID, linkType string, delta int) {
+	if err := AdjustAdminOrgLinkCount(session, orgID, linkType, delta); err != nil {
+		_ = InvalidateAdminOrgLinkCount(session, orgID, linkType)
+	}
+}
+
 func AddUpsertAdminLinkReadModelQuery(
 	batch *gocql.Batch,
 	token, linkType, orgID, libraryID, filePath, createdBy, permission string,
@@ -289,7 +317,7 @@ func ListAdminOrgLinkIndexRows(session *gocql.Session, orgID string) ([]AdminOrg
 	return rows, nil
 }
 
-func CountActiveAdminOrgLinks(session *gocql.Session, orgID, linkType string) (int, error) {
+func recountAdminOrgLinks(session *gocql.Session, orgID, linkType string) (int, error) {
 	buckets, err := listAdminLinkBucketsByOrg(session, orgID, linkType)
 	if err != nil {
 		return 0, err
@@ -297,18 +325,43 @@ func CountActiveAdminOrgLinks(session *gocql.Session, orgID, linkType string) (i
 	count := 0
 	for _, bucketDay := range buckets {
 		iter := session.Query(`
-			SELECT active FROM admin_links_by_org_created
+			SELECT link_token FROM admin_links_by_org_created
 			WHERE org_id = ? AND link_type = ? AND bucket_day = ?
 		`, orgID, linkType, bucketDay).Iter()
-		var active bool
-		for iter.Scan(&active) {
-			if active {
-				count++
-			}
+		var token string
+		for iter.Scan(&token) {
+			count++
 		}
 		if err := iter.Close(); err != nil {
 			return 0, err
 		}
 	}
 	return count, nil
+}
+
+func CountAdminOrgLinks(session *gocql.Session, orgID, linkType string) (int, error) {
+	if !IsAdminLinkType(linkType) {
+		return 0, nil
+	}
+
+	var count int64
+	err := session.Query(`SELECT link_count FROM admin_link_counts_by_org WHERE org_id = ? AND link_type = ?`, orgID, linkType).Scan(&count)
+	if err == nil {
+		if count >= 0 {
+			return int(count), nil
+		}
+		_ = InvalidateAdminOrgLinkCount(session, orgID, linkType)
+	}
+	if err != nil && err != gocql.ErrNotFound {
+		return 0, err
+	}
+
+	recount, recountErr := recountAdminOrgLinks(session, orgID, linkType)
+	if recountErr != nil {
+		return 0, recountErr
+	}
+	if recount > 0 {
+		BestEffortAdjustAdminOrgLinkCount(session, orgID, linkType, recount)
+	}
+	return recount, nil
 }
