@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	dbpkg "github.com/Sesame-Disk/sesamefs/internal/db"
 	"github.com/Sesame-Disk/sesamefs/internal/middleware"
 	"github.com/Sesame-Disk/sesamefs/internal/traffic"
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
@@ -510,9 +511,10 @@ func (h *OrgAdminHandler) GetOrgUserBesharedRepos(c *gin.Context) {
 
 	// Collect library IDs shared to this user
 	shareIter := h.db.Session().Query(`
-		SELECT library_id, permission FROM shares_by_user
-		WHERE shared_to = ?
-	`, userID).Iter()
+		SELECT created_at, library_id, share_id, permission, shared_by, shared_by_email, shared_by_name, repo_name, encrypted, size_bytes
+		FROM shares_by_user_org
+		WHERE org_id = ? AND user_id = ?
+	`, targetOrgID, userID).Iter()
 
 	type repoItem struct {
 		RepoID       string `json:"repo_id"`
@@ -524,27 +526,23 @@ func (h *OrgAdminHandler) GetOrgUserBesharedRepos(c *gin.Context) {
 	}
 
 	var repos []repoItem
-	var libID, perm string
+	var createdAt time.Time
+	var libID, shareID, perm, sharedBy, sharedByEmail, sharedByName, repoName string
+	var encrypted bool
+	var sizeBytes int64
 
-	for shareIter.Scan(&libID, &perm) {
-		// Verify the library is in the target org
-		var libName, ownerID string
-		var libSize int64
-		var libUpdatedAt time.Time
-		err := h.db.Session().Query(`
-			SELECT name, owner_id, size_bytes, updated_at FROM libraries WHERE org_id = ? AND library_id = ?
-		`, targetOrgID, libID).Scan(&libName, &ownerID, &libSize, &libUpdatedAt)
-		if err != nil {
-			continue // Library not in this org or deleted
+	for shareIter.Scan(&createdAt, &libID, &shareID, &perm, &sharedBy, &sharedByEmail, &sharedByName, &repoName, &encrypted, &sizeBytes) {
+		row, err := dbpkg.ReadAdminLibraryProjectionRow(h.db.Session(), targetOrgID, libID)
+		if err != nil || (row.DeletedAt != nil && !row.DeletedAt.IsZero()) {
+			continue
 		}
-		ownerName := h.resolveUserName(targetOrgID, ownerID)
 		repos = append(repos, repoItem{
 			RepoID:       libID,
-			RepoName:     libName,
+			RepoName:     repoName,
 			Permission:   perm,
-			OwnerName:    ownerName,
-			Size:         libSize,
-			LastModified: libUpdatedAt.Format(time.RFC3339),
+			OwnerName:    row.OwnerName,
+			Size:         sizeBytes,
+			LastModified: row.UpdatedAt.Format(time.RFC3339),
 		})
 	}
 	if err := shareIter.Close(); err != nil {

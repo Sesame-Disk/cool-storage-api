@@ -140,36 +140,29 @@ func (h *AdminHandler) adminListLibrariesSharedToUser(c *gin.Context, email stri
 	}
 
 	shareIter := h.db.Session().Query(`
-		SELECT library_id, permission FROM shares_by_user
-		WHERE shared_to = ?
-	`, targetUserID).Iter()
+		SELECT created_at, library_id, share_id, permission, shared_by, shared_by_email, shared_by_name, repo_name, encrypted, size_bytes
+		FROM shares_by_user_org
+		WHERE org_id = ? AND user_id = ?
+	`, targetOrgID, targetUserID).Iter()
 
 	var repoList []gin.H
-	var libID, perm string
+	var createdAt time.Time
+	var libID, shareID, perm, sharedBy, sharedByEmail, sharedByName, repoName string
+	var encrypted bool
+	var sizeBytes int64
 
-	for shareIter.Scan(&libID, &perm) {
-		var name, ownerID string
-		var encrypted bool
-		var sizeBytes int64
-		var updatedAt, deletedAt time.Time
-		if err := h.db.Session().Query(`
-			SELECT name, owner_id, encrypted, size_bytes, updated_at, deleted_at
-			FROM libraries WHERE org_id = ? AND library_id = ?
-		`, targetOrgID, libID).Scan(&name, &ownerID, &encrypted, &sizeBytes, &updatedAt, &deletedAt); err != nil {
+	for shareIter.Scan(&createdAt, &libID, &shareID, &perm, &sharedBy, &sharedByEmail, &sharedByName, &repoName, &encrypted, &sizeBytes) {
+		row, err := dbpkg.ReadAdminLibraryProjectionRow(h.db.Session(), targetOrgID, libID)
+		if err != nil || (row.DeletedAt != nil && !row.DeletedAt.IsZero()) {
 			continue
 		}
-		if !deletedAt.IsZero() {
-			continue
-		}
-		ownerEmail := h.resolveOwnerEmail(targetOrgID, ownerID)
-		ownerName := h.resolveOwnerName(targetOrgID, ownerID)
 		repoList = append(repoList, gin.H{
 			"id":          libID,
-			"name":        name,
-			"owner_email": ownerEmail,
-			"owner_name":  ownerName,
+			"name":        repoName,
+			"owner_email": row.OwnerEmail,
+			"owner_name":  row.OwnerName,
 			"size":        sizeBytes,
-			"last_modify": updatedAt.Format(time.RFC3339),
+			"last_modify": row.UpdatedAt.Format(time.RFC3339),
 			"encrypted":   encrypted,
 			"permission":  perm,
 		})

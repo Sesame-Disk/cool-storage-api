@@ -216,6 +216,10 @@ func (h *DepartmentHandler) CreateDepartment(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create department"})
 		return
 	}
+	if err := syncAdminGroupReadModel(h.db, orgID, groupID); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to sync group read model"})
+		return
+	}
 
 	c.JSON(http.StatusCreated, DepartmentResponse{
 		ID:            groupID,
@@ -358,6 +362,7 @@ func (h *DepartmentHandler) DeleteDepartment(c *gin.Context) {
 	memIter.Close()
 
 	// Atomic batch: delete group + groups_by_id + group_members
+	groupRow, _ := readAdminGroupReadModelRow(h.db, orgID, groupID)
 	batch := h.db.Session().Batch(gocql.LoggedBatch)
 	batch.Query(`DELETE FROM groups WHERE org_id = ? AND group_id = ?`, orgID, groupID)
 	batch.Query(`DELETE FROM groups_by_id WHERE group_id = ?`, groupID)
@@ -370,6 +375,12 @@ func (h *DepartmentHandler) DeleteDepartment(c *gin.Context) {
 	if err := cleanupGroupsByMember(h.db, orgID, groupID, memberIDs); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to clean department membership index"})
 		return
+	}
+	if groupRow.GroupID != "" {
+		if err := deleteAdminGroupReadModel(h.db, groupRow); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to clean group read model"})
+			return
+		}
 	}
 
 	groupUUID, _ := uuid.Parse(groupID)

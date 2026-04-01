@@ -1,7 +1,6 @@
 package v2
 
 import (
-	"fmt"
 	"log"
 	"time"
 
@@ -101,23 +100,18 @@ func cleanupGroupShares(database *db.DB, groupID uuid.UUID) error {
 			SELECT share_id, shared_to FROM shares WHERE library_id = ?
 		`, libID).Iter()
 
-		batch := database.Session().Batch(gocql.LoggedBatch)
 		var shareID, sharedTo string
 		for shareIter.Scan(&shareID, &sharedTo) {
 			if sharedTo != groupIDStr {
 				continue
 			}
-			batch.Query(`DELETE FROM shares WHERE library_id = ? AND share_id = ?`,
-				libID, shareID)
+			if err := deleteLibraryShare(database, libID, shareID, groupIDStr); err != nil {
+				_ = shareIter.Close()
+				return err
+			}
 		}
 		if err := shareIter.Close(); err != nil {
 			return err
-		}
-
-		batch.Query(`DELETE FROM shares_by_user WHERE shared_to = ? AND library_id = ?`,
-			groupIDStr, libID)
-		if err := batch.Exec(); err != nil {
-			return fmt.Errorf("failed to delete shares for library %s and group %s: %w", libID, groupID, err)
 		}
 	}
 

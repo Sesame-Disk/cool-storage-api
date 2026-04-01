@@ -10,6 +10,7 @@ import (
 
 	"github.com/Sesame-Disk/sesamefs/internal/config"
 	"github.com/Sesame-Disk/sesamefs/internal/db"
+	dbpkg "github.com/Sesame-Disk/sesamefs/internal/db"
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -176,36 +177,19 @@ type AddMemberRequest struct {
 
 // getGroupRepos returns repos shared with a specific group.
 func (h *GroupHandler) getGroupRepos(orgID, groupID string) []GroupRepoResponse {
-	libIter := h.db.Session().Query(`
-		SELECT library_id, owner_id, name, encrypted, size_bytes, created_at, updated_at, storage_class, deleted_at
-		FROM libraries WHERE org_id = ?
-	`, orgID).Iter()
-
 	var repos []GroupRepoResponse
-	var libID, ownerID, libName, storageClass string
+	iter := h.db.Session().Query(`
+		SELECT created_at, library_id, share_id, permission, shared_by, shared_by_email, shared_by_name, repo_name, encrypted, size_bytes
+		FROM shares_by_group WHERE org_id = ? AND group_id = ?
+	`, orgID, groupID).Iter()
+	var libID, shareID, perm, sharedBy, sharedByEmail, sharedByName, libName, storageClass string
+	var createdAt time.Time
 	var encrypted bool
 	var sizeBytes int64
-	var createdAt, updatedAt, deletedAt time.Time
 
-	for libIter.Scan(&libID, &ownerID, &libName, &encrypted, &sizeBytes, &createdAt, &updatedAt, &storageClass, &deletedAt) {
-		if !deletedAt.IsZero() {
-			continue
-		}
-		var perm string
-		if err := h.db.Session().Query(`
-			SELECT permission FROM shares
-			WHERE library_id = ? AND shared_to = ? ALLOW FILTERING
-		`, libID, groupID).Scan(&perm); err != nil {
-			continue
-		}
-
-		var ownerEmail, ownerName string
-		h.db.Session().Query(`SELECT email, name FROM users WHERE org_id = ? AND user_id = ?`, orgID, ownerID).Scan(&ownerEmail, &ownerName)
-		if ownerEmail == "" {
-			ownerEmail = ownerID
-		}
-		if ownerName == "" {
-			ownerName = strings.Split(ownerEmail, "@")[0]
+	for iter.Scan(&createdAt, &libID, &shareID, &perm, &sharedBy, &sharedByEmail, &sharedByName, &libName, &encrypted, &sizeBytes) {
+		if libRow, err := dbpkg.ReadAdminLibraryProjectionRow(h.db.Session(), orgID, libID); err == nil {
+			storageClass = libRow.StorageClass
 		}
 
 		apiPerm := "rw"
@@ -213,29 +197,24 @@ func (h *GroupHandler) getGroupRepos(orgID, groupID string) []GroupRepoResponse 
 			apiPerm = "r"
 		}
 
-		mtime := updatedAt
-		if mtime.IsZero() {
-			mtime = createdAt
-		}
-
 		repos = append(repos, GroupRepoResponse{
 			RepoID:               libID,
 			RepoName:             libName,
 			Permission:           apiPerm,
 			Size:                 sizeBytes,
-			OwnerEmail:           ownerEmail,
-			OwnerContactEmail:    ownerEmail,
-			OwnerName:            ownerName,
+			OwnerEmail:           sharedByEmail,
+			OwnerContactEmail:    sharedByEmail,
+			OwnerName:            sharedByName,
 			Encrypted:            encrypted,
-			LastModified:         mtime.UnixMilli(),
-			ModifierEmail:        ownerEmail,
-			ModifierContactEmail: ownerEmail,
-			ModifierName:         ownerName,
+			LastModified:         createdAt.UnixMilli(),
+			ModifierEmail:        sharedByEmail,
+			ModifierContactEmail: sharedByEmail,
+			ModifierName:         sharedByName,
 			Type:                 "repo",
 			StorageName:          storageClass,
 		})
 	}
-	libIter.Close()
+	iter.Close()
 
 	if repos == nil {
 		repos = []GroupRepoResponse{}
@@ -391,6 +370,10 @@ func (h *GroupHandler) CreateGroup(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create group"})
 		return
 	}
+	if err := syncAdminGroupReadModel(h.db, orgUUID.String(), groupUUID.String()); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to sync group read model"})
+		return
+	}
 
 	// Get creator email
 	var creatorEmail string
@@ -544,6 +527,10 @@ func (h *GroupHandler) UpdateGroup(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to transfer group"})
 			return
 		}
+		if err := syncAdminGroupReadModel(h.db, orgUUID.String(), groupUUID.String()); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to sync group read model"})
+			return
+		}
 
 		c.JSON(http.StatusOK, gin.H{"success": true})
 		return
@@ -612,6 +599,7 @@ func (h *GroupHandler) DeleteGroup(c *gin.Context) {
 	memberIter.Close()
 
 	// Atomic batch: delete group + groups_by_id + group_members
+	groupRow, _ := readAdminGroupReadModelRow(h.db, orgUUID.String(), groupUUID.String())
 	batch := h.db.Session().Batch(gocql.LoggedBatch)
 	batch.Query(`DELETE FROM groups WHERE org_id = ? AND group_id = ?`, orgUUID.String(), groupUUID.String())
 	batch.Query(`DELETE FROM groups_by_id WHERE group_id = ?`, groupUUID.String())
@@ -624,6 +612,12 @@ func (h *GroupHandler) DeleteGroup(c *gin.Context) {
 	if err := cleanupGroupsByMember(h.db, orgUUID.String(), groupUUID.String(), memberIDs); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to clean group membership index"})
 		return
+	}
+	if groupRow.GroupID != "" {
+		if err := deleteAdminGroupReadModel(h.db, groupRow); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to clean group read model"})
+			return
+		}
 	}
 
 	if err := cleanupGroupShares(h.db, groupUUID); err != nil {

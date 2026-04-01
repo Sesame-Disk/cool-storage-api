@@ -113,7 +113,10 @@ func createLibraryShare(db interface{ Session() *gocql.Session }, libraryID, sha
 		INSERT INTO shares_by_user (shared_to, library_id, shared_to_type, permission, shared_by, created_at)
 		VALUES (?, ?, ?, ?, ?, ?)
 	`, sharedTo, libraryID, sharedToType, permission, sharedBy, createdAt)
-	return batch.Exec()
+	if err := batch.Exec(); err != nil {
+		return err
+	}
+	return dbpkg.SyncShareReadModel(db.Session(), libraryID, shareID)
 }
 
 func updateLibrarySharePermission(db interface{ Session() *gocql.Session }, libraryID, shareID, sharedTo, permission string) error {
@@ -124,10 +127,17 @@ func updateLibrarySharePermission(db interface{ Session() *gocql.Session }, libr
 	batch.Query(`
 		UPDATE shares_by_user SET permission = ? WHERE shared_to = ? AND library_id = ?
 	`, permission, sharedTo, libraryID)
-	return batch.Exec()
+	if err := batch.Exec(); err != nil {
+		return err
+	}
+	return dbpkg.SyncShareReadModel(db.Session(), libraryID, shareID)
 }
 
 func deleteLibraryShare(db interface{ Session() *gocql.Session }, libraryID, shareID, sharedTo string) error {
+	row, err := dbpkg.ReadShareReadModelRow(db.Session(), libraryID, shareID)
+	if err != nil {
+		return err
+	}
 	batch := db.Session().Batch(gocql.LoggedBatch)
 	batch.Query(`
 		DELETE FROM shares WHERE library_id = ? AND share_id = ?
@@ -135,7 +145,20 @@ func deleteLibraryShare(db interface{ Session() *gocql.Session }, libraryID, sha
 	batch.Query(`
 		DELETE FROM shares_by_user WHERE shared_to = ? AND library_id = ?
 	`, sharedTo, libraryID)
+	dbpkg.AddDeleteShareReadModelQuery(batch, row)
 	return batch.Exec()
+}
+
+func syncAdminGroupReadModel(db interface{ Session() *gocql.Session }, orgID, groupID string) error {
+	return dbpkg.SyncAdminGroupReadModel(db.Session(), orgID, groupID)
+}
+
+func readAdminGroupReadModelRow(db interface{ Session() *gocql.Session }, orgID, groupID string) (dbpkg.AdminGroupProjectionRow, error) {
+	return dbpkg.ReadAdminGroupProjectionRow(db.Session(), orgID, groupID)
+}
+
+func deleteAdminGroupReadModel(db interface{ Session() *gocql.Session }, row dbpkg.AdminGroupProjectionRow) error {
+	return dbpkg.DeleteAdminGroupReadModel(db.Session(), row)
 }
 
 func renameGroup(db interface{ Session() *gocql.Session }, orgID, groupID, newName string, updatedAt time.Time) error {
@@ -185,7 +208,7 @@ func renameGroup(db interface{ Session() *gocql.Session }, orgID, groupID, newNa
 		return fmt.Errorf("group renamed but failed to update %d member index rows", failedCount)
 	}
 
-	return nil
+	return syncAdminGroupReadModel(db, orgID, groupID)
 }
 
 // SessionInvalidator can revoke all sessions for a given user.

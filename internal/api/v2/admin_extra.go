@@ -453,6 +453,10 @@ func (h *AdminHandler) AdminAddAddressBookGroup(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create address-book group"})
 		return
 	}
+	if err := syncAdminGroupReadModel(h.db, callerOrgID, newGroupID); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to sync group read model"})
+		return
+	}
 
 	// Add staff members if specified
 	if groupStaff != "" {
@@ -583,6 +587,7 @@ func (h *AdminHandler) AdminDeleteAddressBookGroup(c *gin.Context) {
 	}
 
 	groupID := c.Param("group_id")
+	groupRow, _ := readAdminGroupReadModelRow(h.db, callerOrgID, groupID)
 
 	var groupName string
 	if err := h.db.Session().Query(`
@@ -611,6 +616,12 @@ func (h *AdminHandler) AdminDeleteAddressBookGroup(c *gin.Context) {
 	if err := batch.Exec(); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete group"})
 		return
+	}
+	if groupRow.GroupID != "" {
+		if err := deleteAdminGroupReadModel(h.db, groupRow); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to clean group read model"})
+			return
+		}
 	}
 
 	if err := cleanupGroupsByMember(h.db, callerOrgID, groupID, memberIDs); err != nil {

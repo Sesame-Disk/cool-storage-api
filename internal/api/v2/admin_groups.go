@@ -4,10 +4,12 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 
+	dbpkg "github.com/Sesame-Disk/sesamefs/internal/db"
 	"github.com/Sesame-Disk/sesamefs/internal/middleware"
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
 	"github.com/gin-gonic/gin"
@@ -29,6 +31,18 @@ type adminGroupResponse struct {
 	OrgID         string `json:"org_id,omitempty"`
 }
 
+func adminGroupResponseFromProjection(row dbpkg.AdminGroupProjectionRow) adminGroupResponse {
+	return adminGroupResponse{
+		ID:            row.GroupID,
+		Name:          row.Name,
+		Owner:         row.OwnerEmail,
+		OwnerName:     row.OwnerName,
+		CreatedAt:     row.CreatedAt.Format(time.RFC3339),
+		ParentGroupID: 0,
+		OrgID:         row.OrgID,
+	}
+}
+
 // ListAllGroups returns all groups in the caller's org with pagination.
 // GET /admin/groups/?page=N&per_page=N
 func (h *AdminHandler) ListAllGroups(c *gin.Context) {
@@ -48,35 +62,26 @@ func (h *AdminHandler) ListAllGroups(c *gin.Context) {
 		perPage = 25
 	}
 
-	// Determine which orgs to query: platform superadmin may query all orgs.
 	callerRole, _ := h.permMiddleware.GetUserOrgRole(callerOrgID, callerUserID)
-	var orgIDs []string
-	if middleware.IsPlatformSuperAdmin(callerOrgID, callerRole) {
-		orgIter := h.db.Session().Query(`SELECT org_id FROM organizations`).Iter()
-		var oid string
-		for orgIter.Scan(&oid) {
-			orgIDs = append(orgIDs, oid)
-		}
-		orgIter.Close()
-	} else {
-		orgIDs = []string{callerOrgID}
-	}
-
 	var allGroups []adminGroupResponse
-	for _, orgID := range orgIDs {
+	if middleware.IsPlatformSuperAdmin(callerOrgID, callerRole) {
+		rows, err := dbpkg.ListAdminGlobalGroupRows(h.db.Session())
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list groups"})
+			return
+		}
+		allGroups = make([]adminGroupResponse, 0, len(rows))
+		for _, row := range rows {
+			allGroups = append(allGroups, adminGroupResponseFromProjection(row))
+		}
+	} else {
 		iter := h.db.Session().Query(`
 			SELECT group_id, name, creator_id, created_at FROM groups WHERE org_id = ?
-		`, orgID).Iter()
-
+		`, callerOrgID).Iter()
 		var groupID, name, creatorID string
 		var createdAt time.Time
-
 		for iter.Scan(&groupID, &name, &creatorID, &createdAt) {
-			var ownerEmail, ownerName string
-			h.db.Session().Query(`
-				SELECT email, name FROM users WHERE org_id = ? AND user_id = ?
-			`, orgID, creatorID).Scan(&ownerEmail, &ownerName)
-
+			ownerEmail, ownerName := dbpkg.ResolveAdminGroupOwnerFields(h.db.Session(), callerOrgID, creatorID)
 			allGroups = append(allGroups, adminGroupResponse{
 				ID:            groupID,
 				Name:          name,
@@ -84,7 +89,7 @@ func (h *AdminHandler) ListAllGroups(c *gin.Context) {
 				OwnerName:     ownerName,
 				CreatedAt:     createdAt.Format(time.RFC3339),
 				ParentGroupID: 0,
-				OrgID:         orgID,
+				OrgID:         callerOrgID,
 			})
 		}
 		if err := iter.Close(); err != nil {
@@ -133,39 +138,30 @@ func (h *AdminHandler) SearchGroups(c *gin.Context) {
 		return
 	}
 
-	// Determine which orgs to query: platform superadmin may query all orgs.
 	callerRole, _ := h.permMiddleware.GetUserOrgRole(callerOrgID, callerUserID)
-	var orgIDs []string
-	if middleware.IsPlatformSuperAdmin(callerOrgID, callerRole) {
-		orgIter := h.db.Session().Query(`SELECT org_id FROM organizations`).Iter()
-		var oid string
-		for orgIter.Scan(&oid) {
-			orgIDs = append(orgIDs, oid)
-		}
-		orgIter.Close()
-	} else {
-		orgIDs = []string{callerOrgID}
-	}
-
 	var results []adminGroupResponse
-	for _, orgID := range orgIDs {
+	if middleware.IsPlatformSuperAdmin(callerOrgID, callerRole) {
+		rows, err := dbpkg.ListAdminGlobalGroupRows(h.db.Session())
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to search groups"})
+			return
+		}
+		for _, row := range rows {
+			if strings.Contains(strings.ToLower(row.Name), query) {
+				results = append(results, adminGroupResponseFromProjection(row))
+			}
+		}
+	} else {
 		iter := h.db.Session().Query(`
 			SELECT group_id, name, creator_id, created_at FROM groups WHERE org_id = ?
-		`, orgID).Iter()
-
+		`, callerOrgID).Iter()
 		var groupID, name, creatorID string
 		var createdAt time.Time
-
 		for iter.Scan(&groupID, &name, &creatorID, &createdAt) {
 			if !strings.Contains(strings.ToLower(name), query) {
 				continue
 			}
-
-			var ownerEmail, ownerName string
-			h.db.Session().Query(`
-				SELECT email, name FROM users WHERE org_id = ? AND user_id = ?
-			`, orgID, creatorID).Scan(&ownerEmail, &ownerName)
-
+			ownerEmail, ownerName := dbpkg.ResolveAdminGroupOwnerFields(h.db.Session(), callerOrgID, creatorID)
 			results = append(results, adminGroupResponse{
 				ID:            groupID,
 				Name:          name,
@@ -173,7 +169,7 @@ func (h *AdminHandler) SearchGroups(c *gin.Context) {
 				OwnerName:     ownerName,
 				CreatedAt:     createdAt.Format(time.RFC3339),
 				ParentGroupID: 0,
-				OrgID:         orgID,
+				OrgID:         callerOrgID,
 			})
 		}
 		if err := iter.Close(); err != nil {
@@ -254,6 +250,10 @@ func (h *AdminHandler) AdminCreateGroup(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create group"})
 		return
 	}
+	if err := syncAdminGroupReadModel(h.db, orgID, groupUUID.String()); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to sync group read model"})
+		return
+	}
 
 	c.JSON(http.StatusCreated, adminGroupResponse{
 		ID:            groupUUID.String(),
@@ -277,6 +277,7 @@ func (h *AdminHandler) AdminDeleteGroup(c *gin.Context) {
 
 	groupID := c.Param("group_id")
 	orgID := callerOrgID
+	groupRow, _ := readAdminGroupReadModelRow(h.db, orgID, groupID)
 
 	// Verify group exists
 	var name string
@@ -304,6 +305,12 @@ func (h *AdminHandler) AdminDeleteGroup(c *gin.Context) {
 	if err := batch.Exec(); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete group"})
 		return
+	}
+	if groupRow.GroupID != "" {
+		if err := deleteAdminGroupReadModel(h.db, groupRow); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to clean group read model"})
+			return
+		}
 	}
 
 	if err := cleanupGroupsByMember(h.db, orgID, groupID, memberIDs); err != nil {
@@ -437,6 +444,10 @@ func (h *AdminHandler) AdminTransferGroup(c *gin.Context) {
 	`, orgID, newOwnerID, groupID, groupName, "owner", now)
 	if err := batch.Exec(); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to transfer group ownership"})
+		return
+	}
+	if err := syncAdminGroupReadModel(h.db, orgID, groupID); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to sync group read model"})
 		return
 	}
 
@@ -692,25 +703,6 @@ func (h *AdminHandler) AdminListGroupLibraries(c *gin.Context) {
 		return
 	}
 
-	// Pre-load users map for this org (avoids N+1 user lookups)
-	usersMap := make(map[string]struct{ Email, Name string })
-	uIter := h.db.Session().Query(`SELECT user_id, email, name FROM users WHERE org_id = ?`, orgID).Iter()
-	var uid, uemail, uname string
-	for uIter.Scan(&uid, &uemail, &uname) {
-		displayName := uname
-		if displayName == "" && uemail != "" {
-			displayName = strings.Split(uemail, "@")[0]
-		}
-		usersMap[uid] = struct{ Email, Name string }{Email: uemail, Name: displayName}
-	}
-	uIter.Close()
-
-	// Query all libraries in the org and filter for those shared with this group
-	libIter := h.db.Session().Query(`
-		SELECT library_id, owner_id, name, encrypted, size_bytes, created_at, updated_at, deleted_at
-		FROM libraries WHERE org_id = ?
-	`, orgID).Iter()
-
 	type adminGroupLib struct {
 		RepoID       string `json:"repo_id"`
 		Name         string `json:"name"`
@@ -722,32 +714,16 @@ func (h *AdminHandler) AdminListGroupLibraries(c *gin.Context) {
 	}
 
 	var libraries []adminGroupLib
-	var libID, ownerID, libName string
+	iter := h.db.Session().Query(`
+		SELECT created_at, library_id, share_id, permission, shared_by, shared_by_email, shared_by_name, repo_name, encrypted, size_bytes
+		FROM shares_by_group WHERE org_id = ? AND group_id = ?
+	`, orgID, groupID).Iter()
+	var createdAt time.Time
+	var libID, shareID, perm, sharedBy, sharedByEmail, sharedByName, libName string
 	var encrypted bool
 	var sizeBytes int64
-	var createdAt, updatedAt, deletedAt time.Time
 
-	for libIter.Scan(&libID, &ownerID, &libName, &encrypted, &sizeBytes, &createdAt, &updatedAt, &deletedAt) {
-		if !deletedAt.IsZero() {
-			continue
-		}
-		var perm string
-		if err := h.db.Session().Query(`
-			SELECT permission FROM shares
-			WHERE library_id = ? AND shared_to = ? ALLOW FILTERING
-		`, libID, groupID).Scan(&perm); err != nil {
-			continue
-		}
-
-		u := usersMap[ownerID]
-		ownerEmail := u.Email
-		ownerName := u.Name
-		if ownerEmail == "" {
-			ownerEmail = ownerID
-		}
-		if ownerName == "" {
-			ownerName = ownerID
-		}
+	for iter.Scan(&createdAt, &libID, &shareID, &perm, &sharedBy, &sharedByEmail, &sharedByName, &libName, &encrypted, &sizeBytes) {
 
 		apiPerm := "rw"
 		if perm == "r" {
@@ -758,13 +734,19 @@ func (h *AdminHandler) AdminListGroupLibraries(c *gin.Context) {
 			RepoID:       libID,
 			Name:         libName,
 			Size:         sizeBytes,
-			SharedBy:     ownerEmail,
-			SharedByName: ownerName,
+			SharedBy:     sharedByEmail,
+			SharedByName: sharedByName,
 			Encrypted:    encrypted,
 			Permission:   apiPerm,
 		})
 	}
-	libIter.Close()
+	if err := iter.Close(); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list group libraries"})
+		return
+	}
+	sort.SliceStable(libraries, func(i, j int) bool {
+		return libraries[i].Name < libraries[j].Name
+	})
 
 	if libraries == nil {
 		libraries = []adminGroupLib{}

@@ -110,6 +110,10 @@ func (h *OrgAdminHandler) AddOrgAddressBookGroup(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create department"})
 		return
 	}
+	if err := syncAdminGroupReadModel(h.db, targetOrgID, newGroupID); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to sync group read model"})
+		return
+	}
 
 	// Add staff members if specified
 	if groupStaff != "" {
@@ -295,6 +299,7 @@ func (h *OrgAdminHandler) DeleteOrgAddressBookGroup(c *gin.Context) {
 	}
 
 	groupID := c.Param("gid")
+	groupRow, _ := readAdminGroupReadModelRow(h.db, targetOrgID, groupID)
 
 	// Verify group exists
 	if err := h.db.Session().Query(`
@@ -325,6 +330,12 @@ func (h *OrgAdminHandler) DeleteOrgAddressBookGroup(c *gin.Context) {
 	if err := batch.Exec(); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete department"})
 		return
+	}
+	if groupRow.GroupID != "" {
+		if err := deleteAdminGroupReadModel(h.db, groupRow); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to clean group read model"})
+			return
+		}
 	}
 	if err := cleanupGroupsByMember(h.db, targetOrgID, groupID, memberIDs); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to clean department membership index"})

@@ -265,6 +265,10 @@ func (h *OrgAdminHandler) TransferOrgGroup(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to transfer group ownership"})
 		return
 	}
+	if err := syncAdminGroupReadModel(h.db, targetOrgID, groupID); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to sync group read model"})
+		return
+	}
 
 	// Resolve new owner display name
 	newOwnerName := h.resolveUserName(targetOrgID, newOwnerID)
@@ -292,6 +296,7 @@ func (h *OrgAdminHandler) DeleteOrgGroup(c *gin.Context) {
 	}
 
 	groupID := c.Param("gid")
+	groupRow, _ := readAdminGroupReadModelRow(h.db, targetOrgID, groupID)
 
 	// Verify group exists
 	if err := h.db.Session().Query(`
@@ -317,6 +322,12 @@ func (h *OrgAdminHandler) DeleteOrgGroup(c *gin.Context) {
 	if err := batch.Exec(); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete group"})
 		return
+	}
+	if groupRow.GroupID != "" {
+		if err := deleteAdminGroupReadModel(h.db, groupRow); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to clean group read model"})
+			return
+		}
 	}
 	if err := cleanupGroupsByMember(h.db, targetOrgID, groupID, memberIDs); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to clean group membership index"})
@@ -589,44 +600,30 @@ func (h *OrgAdminHandler) ListOrgGroupLibraries(c *gin.Context) {
 		return
 	}
 
-	// Look up libraries shared to this group by iterating the org's libraries
-	// and checking shares per library (avoids ALLOW FILTERING on shares table).
-	libIter := h.db.Session().Query(`
-		SELECT library_id, owner_id, name, encrypted, size_bytes, deleted_at
-		FROM libraries WHERE org_id = ?
-	`, targetOrgID).Iter()
-
-	usersMap := h.resolveUsersMap(targetOrgID)
-
 	var libraries []gin.H
-	var libID, ownerID, libName string
+	iter := h.db.Session().Query(`
+		SELECT created_at, library_id, share_id, permission, shared_by, shared_by_email, shared_by_name, repo_name, encrypted, size_bytes
+		FROM shares_by_group WHERE org_id = ? AND group_id = ?
+	`, targetOrgID, groupID).Iter()
+	var createdAt time.Time
+	var libID, shareID, perm, sharedBy, sharedByEmail, sharedByName, libName string
 	var encrypted bool
 	var sizeBytes int64
-	var deletedAt time.Time
 
-	for libIter.Scan(&libID, &ownerID, &libName, &encrypted, &sizeBytes, &deletedAt) {
-		if !deletedAt.IsZero() {
-			continue
-		}
-		// Check if this library has a share to the target group
-		var perm string
-		if err := h.db.Session().Query(`
-			SELECT permission FROM shares
-			WHERE library_id = ? AND shared_to = ? ALLOW FILTERING
-		`, libID, groupID).Scan(&perm); err != nil {
-			continue
-		}
-		u := usersMap[ownerID]
+	for iter.Scan(&createdAt, &libID, &shareID, &perm, &sharedBy, &sharedByEmail, &sharedByName, &libName, &encrypted, &sizeBytes) {
 		libraries = append(libraries, gin.H{
 			"repo_id":        libID,
 			"name":           libName,
 			"size":           sizeBytes,
-			"shared_by":      u.Email,
-			"shared_by_name": u.Name,
+			"shared_by":      sharedByEmail,
+			"shared_by_name": sharedByName,
 			"encrypted":      encrypted,
 		})
 	}
-	libIter.Close()
+	if err := iter.Close(); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list group libraries"})
+		return
+	}
 
 	if libraries == nil {
 		libraries = []gin.H{}
@@ -681,6 +678,10 @@ func (h *OrgAdminHandler) AddOrgGroupOwnedLibrary(c *gin.Context) {
 	`, newLibID, targetOrgID, callerUserID, repoName, false)
 	if err := batch.Exec(); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create library"})
+		return
+	}
+	if err := syncAdminGroupReadModel(h.db, targetOrgID, groupID); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to sync group read model"})
 		return
 	}
 

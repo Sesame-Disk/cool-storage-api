@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -744,82 +745,54 @@ func (h *FileShareHandler) ListSharedRepos(c *gin.Context) {
 	userID := c.GetString("user_id")
 	orgID := c.GetString("org_id")
 
-	userUUID, err := uuid.Parse(userID)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid user_id"})
-		return
-	}
-
-	// Query all shares created by this user
-	// Note: This scans all libraries and checks shares - we need a shares_by_creator lookup table
-	// TODO: Create shares_by_creator lookup table for efficiency
-	// For now, scan libraries owned by the user and get their shares
-	libIter := h.db.Session().Query(`
-		SELECT library_id FROM libraries WHERE org_id = ?
-	`, orgID).Iter()
-
 	sharedRepos := make(map[string]*LibraryShareInfo)
-	var scanLibID string
-	for libIter.Scan(&scanLibID) {
-		scanLibUUID, parseErr := uuid.Parse(scanLibID)
-		if parseErr != nil {
+	iter := h.db.Session().Query(`
+		SELECT created_at, library_id, share_id, shared_to, shared_to_type, permission, expires_at
+		FROM shares_by_creator WHERE org_id = ? AND shared_by = ?
+	`, orgID, userID).Iter()
+	var createdAt time.Time
+	var libID, shareID, sharedTo, sharedToType, permission string
+	var expiresAt *time.Time
+	for iter.Scan(&createdAt, &libID, &shareID, &sharedTo, &sharedToType, &permission, &expiresAt) {
+		if _, exists := sharedRepos[libID]; exists {
 			continue
 		}
-
-		iter := h.db.Session().Query(`
-			SELECT library_id, share_id, shared_to, shared_to_type, permission, shared_by
-			FROM shares WHERE library_id = ?
-		`, scanLibUUID).Iter()
-
-		var libID, shareID, sharedTo, sharedToType, permission, sharedBy string
-		for iter.Scan(&libID, &shareID, &sharedTo, &sharedToType, &permission, &sharedBy) {
-			// Only include shares created by this user
-			sharedByUUID, _ := uuid.Parse(sharedBy)
-			if sharedByUUID != userUUID {
-				continue
-			}
-
-			if _, exists := sharedRepos[libID]; !exists {
-				var name, description string
-				var encrypted bool
-				var updatedAt time.Time
-				var encVersion int
-				var magic, randomKey, salt string
-
-				if queryErr := h.db.Session().Query(`
-					SELECT name, description, encrypted, updated_at, enc_version, magic, random_key, salt
-					FROM libraries WHERE org_id = ? AND library_id = ?
-				`, orgID, libID).Scan(&name, &description, &encrypted, &updatedAt, &encVersion, &magic, &randomKey, &salt); queryErr != nil {
-					continue
-				}
-
-				encryptedInt := 0
-				if encrypted {
-					encryptedInt = 1
-				}
-
-				sharedRepos[libID] = &LibraryShareInfo{
-					RepoID:       libID,
-					RepoName:     name,
-					RepoDesc:     description,
-					Permission:   permission,
-					ShareType:    "personal",
-					LastModified: updatedAt.UnixMilli(),
-					IsVirtual:    false,
-					Encrypted:    encryptedInt,
-					EncVersion:   encVersion,
-					Magic:        magic,
-					RandomKey:    randomKey,
-					Salt:         salt,
-				}
-			}
-		}
-		if closeErr := iter.Close(); closeErr != nil {
+		var name, description string
+		var encrypted bool
+		var updatedAt time.Time
+		var encVersion int
+		var magic, randomKey, salt string
+		if queryErr := h.db.Session().Query(`
+			SELECT name, description, encrypted, updated_at, enc_version, magic, random_key, salt
+			FROM libraries WHERE org_id = ? AND library_id = ?
+		`, orgID, libID).Scan(&name, &description, &encrypted, &updatedAt, &encVersion, &magic, &randomKey, &salt); queryErr != nil {
 			continue
+		}
+		encryptedInt := 0
+		if encrypted {
+			encryptedInt = 1
+		}
+		shareType := "personal"
+		if sharedToType == "group" {
+			shareType = "group"
+		}
+		sharedRepos[libID] = &LibraryShareInfo{
+			RepoID:       libID,
+			RepoName:     name,
+			RepoDesc:     description,
+			Permission:   permission,
+			ShareType:    shareType,
+			LastModified: updatedAt.UnixMilli(),
+			IsVirtual:    false,
+			Encrypted:    encryptedInt,
+			EncVersion:   encVersion,
+			Magic:        magic,
+			RandomKey:    randomKey,
+			Salt:         salt,
 		}
 	}
-	if err := libIter.Close(); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list libraries"})
+	if err := iter.Close(); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list shared repos"})
 		return
 	}
 
@@ -828,6 +801,9 @@ func (h *FileShareHandler) ListSharedRepos(c *gin.Context) {
 	for _, repo := range sharedRepos {
 		result = append(result, *repo)
 	}
+	sort.SliceStable(result, func(i, j int) bool {
+		return result[i].RepoName < result[j].RepoName
+	})
 
 	if result == nil {
 		result = []LibraryShareInfo{}
@@ -906,32 +882,20 @@ func (h *FileShareHandler) ListBeSharedRepos(c *gin.Context) {
 	userID := c.GetString("user_id")
 	orgID := c.GetString("org_id")
 
-	userUUID, err := uuid.Parse(userID)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid user_id"})
-		return
-	}
-
 	orgUUID, err := uuid.Parse(orgID)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid org_id"})
 		return
 	}
 
-	// Query all shares where this user is the recipient (direct or via group)
-	// Note: This requires scanning all shares - we need a lookup table
-	// TODO: Create shares_by_recipient lookup table
-
 	// Get user's group IDs for group share resolution
-	var userGroupIDs []uuid.UUID
+	userTargets := map[string]string{userID: "personal"}
 	groupIter := h.db.Session().Query(`
 		SELECT group_id FROM groups_by_member WHERE org_id = ? AND user_id = ?
 	`, orgID, userID).Iter()
 	var gidStr string
 	for groupIter.Scan(&gidStr) {
-		if gid, parseErr := uuid.Parse(gidStr); parseErr == nil {
-			userGroupIDs = append(userGroupIDs, gid)
-		}
+		userTargets[gidStr] = "group"
 	}
 	groupIter.Close()
 
@@ -978,55 +942,28 @@ func (h *FileShareHandler) ListBeSharedRepos(c *gin.Context) {
 		}
 	}
 
-	// For now, we'll have to scan all libraries and check if user has shares
-	// This is very inefficient and should be optimized with a lookup table
-	libIter := h.db.Session().Query(`
-		SELECT library_id FROM libraries WHERE org_id = ?
-	`, orgID).Iter()
-
-	var libIDStr string
-	for libIter.Scan(&libIDStr) {
-		libUUID, parseErr := uuid.Parse(libIDStr)
-		if parseErr != nil {
-			continue
+	for sharedTo, resultType := range userTargets {
+		sharedToType := "user"
+		if resultType == "group" {
+			sharedToType = "group"
 		}
-
-		// Check direct shares to user
-		shareIter := h.db.Session().Query(`
-			SELECT share_id, shared_by, permission, shared_to_type
-			FROM shares WHERE library_id = ? AND shared_to = ?
-		`, libUUID, userUUID).Iter()
-
-		var shareID, sharedBy, permission, sharedToType string
-		for shareIter.Scan(&shareID, &sharedBy, &permission, &sharedToType) {
-			addLibShare(libIDStr, sharedBy, permission, sharedToType)
-		}
-		if closeErr := shareIter.Close(); closeErr != nil {
-			continue
-		}
-
-		// Check group shares (skip if already found via direct share)
-		if _, exists := beSharedRepos[libIDStr]; !exists {
-			for _, groupID := range userGroupIDs {
-				groupShareIter := h.db.Session().Query(`
-					SELECT share_id, shared_by, permission, shared_to_type
-					FROM shares WHERE library_id = ? AND shared_to = ?
-				`, libUUID, groupID).Iter()
-
-				for groupShareIter.Scan(&shareID, &sharedBy, &permission, &sharedToType) {
-					addLibShare(libIDStr, sharedBy, permission, "group")
-				}
-				groupShareIter.Close()
-
-				if _, exists := beSharedRepos[libIDStr]; exists {
-					break
-				}
+		iter := h.db.Session().Query(`
+			SELECT created_at, library_id, share_id, shared_by, permission, expires_at
+			FROM shares_by_recipient WHERE org_id = ? AND shared_to_type = ? AND shared_to = ?
+		`, orgID, sharedToType, sharedTo).Iter()
+		var libIDStr, shareID, sharedBy, permission string
+		var createdAtRecipient time.Time
+		var expiresAtRecipient *time.Time
+		for iter.Scan(&createdAtRecipient, &libIDStr, &shareID, &sharedBy, &permission, &expiresAtRecipient) {
+			if _, exists := beSharedRepos[libIDStr]; exists && resultType == "group" {
+				continue
 			}
+			addLibShare(libIDStr, sharedBy, permission, resultType)
 		}
-	}
-	if err := libIter.Close(); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list libraries"})
-		return
+		if err := iter.Close(); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list shared repos"})
+			return
+		}
 	}
 
 	// Convert map to array
@@ -1034,6 +971,9 @@ func (h *FileShareHandler) ListBeSharedRepos(c *gin.Context) {
 	for _, repo := range beSharedRepos {
 		result = append(result, *repo)
 	}
+	sort.SliceStable(result, func(i, j int) bool {
+		return result[i].RepoName < result[j].RepoName
+	})
 
 	if result == nil {
 		result = []LibraryShareInfo{}
