@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"time"
 
+	dbpkg "github.com/Sesame-Disk/sesamefs/internal/db"
 	"github.com/Sesame-Disk/sesamefs/internal/traffic"
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
 )
@@ -300,17 +301,18 @@ func invalidateOrgSessions(dbSess interface{ Session() *gocql.Session }, si Sess
 // Used when a user is deactivated/deleted (active=false) or reactivated (active=true).
 func setUserShareLinksActive(db interface{ Session() *gocql.Session }, orgID, userID string, active bool) {
 	type link struct {
+		linkType  string
 		token     string
 		createdAt time.Time
 	}
 	iter := db.Session().Query(
-		`SELECT link_token, created_at FROM share_links_by_creator WHERE org_id = ? AND created_by = ?`,
+		`SELECT link_type, link_token, created_at FROM share_links_by_creator WHERE org_id = ? AND created_by = ?`,
 		orgID, userID,
 	).Iter()
 
 	var links []link
 	var l link
-	for iter.Scan(&l.token, &l.createdAt) {
+	for iter.Scan(&l.linkType, &l.token, &l.createdAt) {
 		links = append(links, l)
 	}
 	if err := iter.Close(); err != nil {
@@ -329,6 +331,7 @@ func setUserShareLinksActive(db interface{ Session() *gocql.Session }, orgID, us
 				active, orgID, userID, lk.createdAt, lk.token)
 			batch.Query(`UPDATE share_links_by_org SET active = ? WHERE org_id = ? AND created_at = ? AND link_token = ?`,
 				active, orgID, lk.createdAt, lk.token)
+			dbpkg.AddUpdateAdminLinkActiveQuery(batch, lk.linkType, lk.createdAt, orgID, lk.token, active)
 		}
 		if err := batch.Exec(); err != nil {
 			log.Printf("[setUserShareLinksActive] batch exec: %v", err)
@@ -341,18 +344,19 @@ func setUserShareLinksActive(db interface{ Session() *gocql.Session }, orgID, us
 // Used when an org is deactivated/deleted (active=false) or reactivated (active=true).
 func setOrgShareLinksActive(db interface{ Session() *gocql.Session }, orgID string, active bool) {
 	type link struct {
+		linkType  string
 		token     string
 		createdBy string
 		createdAt time.Time
 	}
 	iter := db.Session().Query(
-		`SELECT link_token, created_by, created_at FROM share_links_by_org WHERE org_id = ?`,
+		`SELECT link_type, link_token, created_by, created_at FROM share_links_by_org WHERE org_id = ?`,
 		orgID,
 	).Iter()
 
 	var links []link
 	var l link
-	for iter.Scan(&l.token, &l.createdBy, &l.createdAt) {
+	for iter.Scan(&l.linkType, &l.token, &l.createdBy, &l.createdAt) {
 		links = append(links, l)
 	}
 	if err := iter.Close(); err != nil {
@@ -371,6 +375,7 @@ func setOrgShareLinksActive(db interface{ Session() *gocql.Session }, orgID stri
 				active, orgID, lk.createdBy, lk.createdAt, lk.token)
 			batch.Query(`UPDATE share_links_by_org SET active = ? WHERE org_id = ? AND created_at = ? AND link_token = ?`,
 				active, orgID, lk.createdAt, lk.token)
+			dbpkg.AddUpdateAdminLinkActiveQuery(batch, lk.linkType, lk.createdAt, orgID, lk.token, active)
 		}
 		if err := batch.Exec(); err != nil {
 			log.Printf("[setOrgShareLinksActive] batch exec: %v", err)
@@ -382,6 +387,12 @@ func setOrgShareLinksActive(db interface{ Session() *gocql.Session }, orgID stri
 // Called fire-and-forget after a successful download/upload on a single-use link.
 // Keeps the DB clean — consumed single-use links are permanently gone.
 func deleteConsumedShareLink(db interface{ Session() *gocql.Session }, token, orgID, libraryID, createdBy string, createdAt time.Time) {
+	var linkType string
+	if err := db.Session().Query(`SELECT link_type FROM share_links WHERE link_token = ?`, token).Scan(&linkType); err != nil {
+		log.Printf("[deleteConsumedShareLink] lookup failed for token %s: %v", token, err)
+		return
+	}
+
 	batch := db.Session().Batch(gocql.UnloggedBatch) // deletes are idempotent
 	batch.Query(`DELETE FROM share_links WHERE link_token = ?`, token)
 	batch.Query(`DELETE FROM share_links_by_creator WHERE org_id = ? AND created_by = ? AND created_at = ? AND link_token = ?`,
@@ -390,6 +401,7 @@ func deleteConsumedShareLink(db interface{ Session() *gocql.Session }, token, or
 		orgID, createdAt, token)
 	batch.Query(`DELETE FROM share_links_by_library WHERE org_id = ? AND library_id = ? AND link_token = ?`,
 		orgID, libraryID, token)
+	dbpkg.AddDeleteAdminLinkReadModelQuery(batch, linkType, createdAt, orgID, token)
 	if err := batch.Exec(); err != nil {
 		log.Printf("[deleteConsumedShareLink] failed for token %s: %v", token, err)
 	}
@@ -402,13 +414,13 @@ func incrementShareLinkCounterDualWrite(db interface{ Session() *gocql.Session }
 		return fmt.Errorf("invalid counter: %s", counter)
 	}
 
-	var orgID, createdBy string
+	var orgID, createdBy, linkType string
 	var createdAt time.Time
 	var viewCountPtr, downloadCountPtr, uploadCountPtr *int
 	if err := db.Session().Query(`
-		SELECT org_id, created_by, created_at, view_count, download_count, upload_count
+		SELECT org_id, created_by, created_at, link_type, view_count, download_count, upload_count
 		FROM share_links WHERE link_token = ?
-	`, token).Scan(&orgID, &createdBy, &createdAt, &viewCountPtr, &downloadCountPtr, &uploadCountPtr); err != nil {
+	`, token).Scan(&orgID, &createdBy, &createdAt, &linkType, &viewCountPtr, &downloadCountPtr, &uploadCountPtr); err != nil {
 		return err
 	}
 
@@ -452,6 +464,7 @@ func incrementShareLinkCounterDualWrite(db interface{ Session() *gocql.Session }
 		SET view_count = ?, upload_count = ?
 		WHERE org_id = ? AND created_at = ? AND link_token = ?
 	`, viewCount, uploadCount, orgID, createdAt, token)
+	dbpkg.AddUpdateAdminLinkCountersQuery(batch, linkType, createdAt, orgID, token, viewCount, uploadCount)
 
 	return batch.Exec()
 }

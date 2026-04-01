@@ -5,7 +5,7 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/Sesame-Disk/sesamefs/internal/db"
+	dbpkg "github.com/Sesame-Disk/sesamefs/internal/db"
 	"github.com/Sesame-Disk/sesamefs/internal/middleware"
 	"github.com/Sesame-Disk/sesamefs/internal/traffic"
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
@@ -13,7 +13,7 @@ import (
 )
 
 // RegisterDeletedLibraryRoutes registers routes for the library recycle bin
-func RegisterDeletedLibraryRoutes(rg *gin.RouterGroup, database *db.DB, libHandler *LibraryHandler) {
+func RegisterDeletedLibraryRoutes(rg *gin.RouterGroup, database *dbpkg.DB, libHandler *LibraryHandler) {
 	h := &DeletedLibraryHandler{
 		db:             database,
 		permMiddleware: middleware.NewPermissionMiddleware(database),
@@ -38,7 +38,7 @@ func RegisterDeletedLibraryRoutes(rg *gin.RouterGroup, database *db.DB, libHandl
 
 // DeletedLibraryHandler handles deleted library (recycle bin) endpoints
 type DeletedLibraryHandler struct {
-	db             *db.DB
+	db             *dbpkg.DB
 	permMiddleware *middleware.PermissionMiddleware
 	libHandler     *LibraryHandler
 }
@@ -284,18 +284,19 @@ func (h *DeletedLibraryHandler) PermanentDeleteRepo(c *gin.Context) {
 // by scanning share_links_by_library and quad-deleting each link.
 func cleanupLibraryLinks(db interface{ Session() *gocql.Session }, orgID, libraryID string) error {
 	iter := db.Session().Query(`
-		SELECT link_token, created_by, created_at FROM share_links_by_library
+		SELECT link_token, link_type, created_by, created_at FROM share_links_by_library
 		WHERE org_id = ? AND library_id = ?
 	`, orgID, libraryID).Iter()
 
-	var linkToken, createdBy string
+	var linkToken, linkType, createdBy string
 	var createdAt time.Time
-	for iter.Scan(&linkToken, &createdBy, &createdAt) {
+	for iter.Scan(&linkToken, &linkType, &createdBy, &createdAt) {
 		batch := db.Session().Batch(gocql.LoggedBatch)
 		batch.Query(`DELETE FROM share_links WHERE link_token = ?`, linkToken)
 		batch.Query(`DELETE FROM share_links_by_creator WHERE org_id = ? AND created_by = ? AND created_at = ? AND link_token = ?`, orgID, createdBy, createdAt, linkToken)
 		batch.Query(`DELETE FROM share_links_by_org WHERE org_id = ? AND created_at = ? AND link_token = ?`, orgID, createdAt, linkToken)
 		batch.Query(`DELETE FROM share_links_by_library WHERE org_id = ? AND library_id = ? AND link_token = ?`, orgID, libraryID, linkToken)
+		dbpkg.AddDeleteAdminLinkReadModelQuery(batch, linkType, createdAt, orgID, linkToken)
 		if err := batch.Exec(); err != nil {
 			_ = iter.Close()
 			return err

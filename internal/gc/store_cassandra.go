@@ -863,21 +863,22 @@ func (s *CassandraStore) DeleteLockedFilesByLibrary(libraryID uuid.UUID) error {
 func (s *CassandraStore) DeleteShareLinksByLibrary(orgID, libraryID uuid.UUID) ([]string, error) {
 	// Use the by_library index for efficient lookup
 	iter := s.db.Session().Query(`
-		SELECT link_token, created_by, created_at FROM share_links_by_library
+		SELECT link_token, link_type, created_by, created_at FROM share_links_by_library
 		WHERE org_id = ? AND library_id = ?
 	`, orgID.String(), libraryID.String()).Iter()
 
 	type linkInfo struct {
 		token     string
+		linkType  string
 		createdBy string
 		createdAt time.Time
 	}
 
 	var links []linkInfo
-	var token, createdBy string
+	var token, linkType, createdBy string
 	var createdAt time.Time
-	for iter.Scan(&token, &createdBy, &createdAt) {
-		links = append(links, linkInfo{token: token, createdBy: createdBy, createdAt: createdAt})
+	for iter.Scan(&token, &linkType, &createdBy, &createdAt) {
+		links = append(links, linkInfo{token: token, linkType: linkType, createdBy: createdBy, createdAt: createdAt})
 	}
 	iter.Close()
 
@@ -891,6 +892,7 @@ func (s *CassandraStore) DeleteShareLinksByLibrary(orgID, libraryID uuid.UUID) (
 			orgID.String(), link.createdAt, link.token)
 		batch.Query(`DELETE FROM share_links_by_library WHERE org_id = ? AND library_id = ? AND link_token = ?`,
 			orgID.String(), libraryID.String(), link.token)
+		db.AddDeleteAdminLinkReadModelQuery(batch, link.linkType, link.createdAt, orgID.String(), link.token)
 		if err := batch.Exec(); err == nil {
 			deletedTokens = append(deletedTokens, link.token)
 		}

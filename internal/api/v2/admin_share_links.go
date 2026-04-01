@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	db "github.com/Sesame-Disk/sesamefs/internal/db"
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
 	"github.com/gin-gonic/gin"
 )
@@ -452,6 +453,7 @@ func (h *AdminHandler) setAdminLinkActive(token, expectedType string, active boo
 		active, orgID, createdBy, createdAt, token)
 	batch.Query(`UPDATE share_links_by_org SET active = ? WHERE org_id = ? AND created_at = ? AND link_token = ?`,
 		active, orgID, createdAt, token)
+	db.AddUpdateAdminLinkActiveQuery(batch, linkType, createdAt, orgID, token, active)
 
 	if err := batch.Exec(); err != nil {
 		return err

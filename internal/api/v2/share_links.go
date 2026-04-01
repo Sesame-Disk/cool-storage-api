@@ -275,6 +275,23 @@ func (h *ShareLinkHandler) insertShareLink(
 			) VALUES (?, ?, ?, ?, ?, ?)
 		`, orgID, libraryID, token, linkType, createdBy, createdAt)
 	}
+	db.AddUpsertAdminLinkReadModelQuery(
+		batch,
+		token,
+		linkType,
+		orgID,
+		libraryID,
+		filePath,
+		createdBy,
+		permission,
+		expiresAt,
+		hasPassword,
+		true,
+		viewCount,
+		uploadCount,
+		ttlSeconds,
+		createdAt,
+	)
 
 	return batch.Exec()
 }
@@ -282,6 +299,11 @@ func (h *ShareLinkHandler) insertShareLink(
 // deleteShareLink deletes a link from all 4 tables.
 // Requires createdAt for the clustering key in _by_creator.
 func (h *ShareLinkHandler) deleteShareLink(token, orgID, createdBy, libraryID string, createdAt time.Time) error {
+	var linkType string
+	if err := h.db.Session().Query(`SELECT link_type FROM share_links WHERE link_token = ?`, token).Scan(&linkType); err != nil {
+		return err
+	}
+
 	batch := h.db.Session().Batch(gocql.LoggedBatch)
 	batch.Query(`DELETE FROM share_links WHERE link_token = ?`, token)
 	batch.Query(`DELETE FROM share_links_by_creator WHERE org_id = ? AND created_by = ? AND created_at = ? AND link_token = ?`,
@@ -290,6 +312,7 @@ func (h *ShareLinkHandler) deleteShareLink(token, orgID, createdBy, libraryID st
 		orgID, createdAt, token)
 	batch.Query(`DELETE FROM share_links_by_library WHERE org_id = ? AND library_id = ? AND link_token = ?`,
 		orgID, libraryID, token)
+	db.AddDeleteAdminLinkReadModelQuery(batch, linkType, createdAt, orgID, token)
 	return batch.Exec()
 }
 
