@@ -608,12 +608,32 @@ GET /d/abc123/
 ---
 
 ### 11. `shares`
-**Purpose:** User-to-user library sharing
+**Purpose:** User-to-user library sharing — canonical source of truth
 
 **Schema:**
 ```sql
 PRIMARY KEY ((library_id), share_id)  -- Partition by library
 ```
+
+**Fields:**
+| Field | Type | Description |
+|-------|------|-------------|
+| `library_id` | UUID | Shared library (partition key) |
+| `share_id` | UUID | Unique share ID (clustering key) |
+| `org_id` | UUID | Organization (denormalized at creation) |
+| `shared_by` | UUID | Creator user ID |
+| `shared_by_email` | TEXT | Creator email (denormalized at creation) |
+| `shared_by_name` | TEXT | Creator display name (denormalized at creation) |
+| `shared_to` | UUID | Recipient user ID or group ID |
+| `shared_to_type` | TEXT | `"user"` or `"group"` |
+| `repo_name` | TEXT | Library name (denormalized at creation) |
+| `encrypted` | BOOLEAN | Whether library is encrypted (denormalized) |
+| `size_bytes` | BIGINT | Library size at share creation time |
+| `permission` | TEXT | `"r"` or `"rw"` |
+| `created_at` | TIMESTAMP | Share creation time |
+| `expires_at` | TIMESTAMP | Optional expiry |
+
+**Denormalization note:** `org_id`, `repo_name`, `encrypted`, `shared_by_email`, `shared_by_name` are resolved once at creation time and stored here. `ReadShareReadModelRow()` reads all fields from this table in a single query. Rows created before this schema change fall back to multi-table resolution.
 
 **API Usage:**
 ```bash
@@ -625,6 +645,8 @@ POST /api2/repos/{repo_id}/
 GET /api2/repos/
 # Query: shares WHERE shared_to = bob_user_id
 ```
+
+**Dual-write targets:** Every write to `shares` must also write to the matching projection tables via `AddUpsertShareReadModelQuery` / `AddDeleteShareReadModelQuery`. See §Admin Read Models below.
 
 ---
 
@@ -891,11 +913,11 @@ Dual-write with `groups` table — every INSERT/UPDATE/DELETE on `groups` must a
 ---
 
 ### 24. `shares_by_user`
-**Purpose:** Lookup table for libraries shared to a specific user (avoids ALLOW FILTERING on `shares` table)
+**Purpose:** GC reverse-index — "what libraries are shared to this user?" Used exclusively for user-deletion cascade cleanup.
 
 **Schema:**
 ```sql
-PRIMARY KEY ((shared_to), library_id)  -- Partition by recipient user
+PRIMARY KEY ((shared_to), library_id)  -- Partition by recipient
 ```
 
 **Fields:**
@@ -903,21 +925,212 @@ PRIMARY KEY ((shared_to), library_id)  -- Partition by recipient user
 |-------|------|-------------|
 | `shared_to` | UUID | Recipient user ID (partition key) |
 | `library_id` | UUID | Shared library ID (clustering key) |
-| `shared_to_type` | TEXT | Always "user" for this table |
-| `permission` | TEXT | "r" or "rw" |
+| `shared_to_type` | TEXT | `"user"` |
+| `permission` | TEXT | `"r"` or `"rw"` |
 | `shared_by` | UUID | User who created the share |
 | `created_at` | TIMESTAMP | When the share was created |
 
-**API Usage:**
-```bash
-# List libraries shared to a user (admin panel):
-GET /admin/libraries/?shared_to=user@example.com
-# Org admin: user's shared repos:
-GET /org/:org_id/admin/users/:email/beshared-repos/
-```
+**Scope:** Written only for `shared_to_type == "user"`. Group shares are **not** stored here; group cleanup uses `shares_by_group` instead.
+
+**Readers:**
+- `gc.CassandraStore.ListSharesByUser(userID)` — user-deletion cascade, finds all libraries shared to this user for cleanup
+- `gc.CassandraStore.DeleteShareByUser(sharedTo, libraryID)` — per-share cleanup during cascade
+
+**Not used for API queries.** Admin panel queries use `shares_by_user_org`. Application "shared with me" views use `shares_by_recipient`.
 
 **Consistency Pattern:**
-Dual-write with `shares` table — every INSERT/UPDATE/DELETE on `shares` for `shared_to_type = 'user'` must also write to `shares_by_user`.
+Written/updated/deleted atomically alongside `shares` and projection tables in `LoggedBatch`. Only for `shared_to_type == "user"` — see `createLibraryShare`, `updateLibrarySharePermission`, `deleteLibraryShare` in `write_helpers.go`.
+
+---
+
+### 25–32. Admin Read Model Tables
+
+These tables are **denormalized projections** maintained by dual-write. They are never the source of truth — always derive from `libraries`, `groups`, `shares`, `share_links`. All are written atomically in `LoggedBatch` together with their canonical table.
+
+**Implementation files:**
+- `internal/db/admin_library_read_models.go`
+- `internal/db/admin_group_read_models.go`
+- `internal/db/admin_link_read_models.go`
+- `internal/db/share_read_models.go`
+
+---
+
+#### `libraries_by_owner`
+**Purpose:** Per-owner library listing for admin "filter by owner" view
+
+```sql
+PRIMARY KEY ((org_id, owner_id), updated_at, library_id)
+CLUSTERING ORDER BY (updated_at DESC, library_id ASC)
+```
+
+---
+
+#### `libraries_by_org_updated`
+**Purpose:** Org-wide library listing ordered by last update — default admin view
+
+```sql
+PRIMARY KEY ((org_id), updated_at, library_id)
+CLUSTERING ORDER BY (updated_at DESC, library_id ASC)
+-- Denormalized: owner_email, owner_name
+```
+
+---
+
+#### `libraries_admin_global_by_updated`
+**Purpose:** Superadmin global library listing across all orgs, bucketed by day
+
+```sql
+PRIMARY KEY ((bucket_day), updated_at, org_id, library_id)
+CLUSTERING ORDER BY (updated_at DESC, org_id ASC, library_id ASC)
+-- bucket_day = updated_at truncated to YYYY-MM-DD (UTC)
+```
+
+Use `library_admin_global_buckets` to enumerate active `bucket_day` values before querying.
+
+---
+
+#### `libraries_deleted_by_org`
+**Purpose:** Soft-deleted libraries per org (trash view)
+
+```sql
+PRIMARY KEY ((org_id), deleted_at, library_id)
+CLUSTERING ORDER BY (deleted_at DESC, library_id ASC)
+```
+
+---
+
+#### `library_admin_global_buckets`
+**Purpose:** Index of active day-buckets for global library queries
+
+```sql
+PRIMARY KEY (bucket_day)
+```
+
+One row per day that has at least one library. Scanned by `ListAdminGlobalLibraryRows` before iterating bucket partitions.
+
+---
+
+#### `library_admin_projection_state`
+**Purpose:** Current state tracker for each library's projection, enabling safe idempotent re-sync
+
+```sql
+PRIMARY KEY (library_id)
+-- Columns: org_id, owner_id, updated_at, deleted_at
+```
+
+Before upserting a projection, the old state is read, the old rows are deleted, then new rows are inserted — all in one `LoggedBatch`. This prevents stale entries when `updated_at` or `owner_id` changes (clustering key values would differ).
+
+---
+
+#### `groups_admin_global_by_created`
+**Purpose:** Superadmin global group listing, bucketed by creation day
+
+```sql
+PRIMARY KEY ((bucket_day), created_at, org_id, group_id)
+CLUSTERING ORDER BY (created_at DESC, org_id ASC, group_id ASC)
+-- Denormalized: owner_email, owner_name, parent_group_id, is_department
+```
+
+`parent_group_id` is always included in the INSERT (passed as `nil` when group is at root level) to ensure upserts correctly clear the column when a group moves from child to root.
+
+---
+
+#### `group_admin_global_buckets`
+**Purpose:** Index of active day-buckets for global group queries
+
+```sql
+PRIMARY KEY (bucket_day)
+```
+
+---
+
+#### `admin_links_by_created`
+**Purpose:** Superadmin global share/upload link listing
+
+```sql
+PRIMARY KEY ((link_type, bucket_day), created_at, org_id, link_token)
+-- link_type: 'share' | 'upload'
+-- TTL set from expires_at when the link has an expiry
+```
+
+---
+
+#### `admin_links_by_org_created`
+**Purpose:** Org-scoped share/upload link listing
+
+```sql
+PRIMARY KEY ((org_id, link_type, bucket_day), created_at, link_token)
+```
+
+---
+
+#### `admin_link_buckets` / `admin_link_buckets_by_org`
+**Purpose:** Bucket indexes for link queries
+
+```sql
+admin_link_buckets:        PRIMARY KEY (link_type, bucket_day)
+admin_link_buckets_by_org: PRIMARY KEY ((org_id, link_type), bucket_day)
+```
+
+---
+
+#### `admin_link_counts_by_org`
+**Purpose:** COUNTER — cached active link count per org and link type, used for enforcement limits
+
+```sql
+PRIMARY KEY (org_id, link_type)
+-- link_count COUNTER
+```
+
+Incremented/decremented atomically via `AdjustAdminOrgLinkCount`. On counter miss or negative value, `CountAdminOrgLinks` performs a full recount by iterating bucket partitions.
+
+---
+
+#### `shares_by_group`
+**Purpose:** Group shares — admin group detail view; group-deletion cleanup
+
+```sql
+PRIMARY KEY ((org_id, group_id), created_at, library_id, share_id)
+CLUSTERING ORDER BY (created_at DESC, library_id ASC, share_id ASC)
+-- Denormalized: shared_by, shared_by_email, shared_by_name, repo_name, encrypted, size_bytes
+```
+
+Used by `collectGroupShareReadModelRows` and `gc.ListSharesByGroup` (both look up `org_id` from `groups_by_id` first).
+
+---
+
+#### `shares_by_user_org`
+**Purpose:** User shares — org admin "user's received shares" view
+
+```sql
+PRIMARY KEY ((org_id, user_id), created_at, library_id, share_id)
+CLUSTERING ORDER BY (created_at DESC, library_id ASC, share_id ASC)
+-- Denormalized: shared_by, shared_by_email, shared_by_name, repo_name, encrypted, size_bytes
+```
+
+Queried by `GET /org/admin/users/:email/beshared-repos/`.
+
+---
+
+#### `shares_by_creator`
+**Purpose:** Shares created by a specific user
+
+```sql
+PRIMARY KEY ((org_id, shared_by), created_at, library_id, share_id)
+CLUSTERING ORDER BY (created_at DESC, library_id ASC, share_id ASC)
+```
+
+---
+
+#### `shares_by_recipient`
+**Purpose:** All shares received by an entity (user or group), unified view
+
+```sql
+PRIMARY KEY ((org_id, shared_to_type, shared_to), created_at, library_id, share_id)
+CLUSTERING ORDER BY (created_at DESC, library_id ASC, share_id ASC)
+```
+
+Covers both user and group recipients. Complement to `shares_by_user_org` (which is user-only but has no `shared_to_type` in the key, making it slightly more efficient for user-only queries).
 
 ---
 

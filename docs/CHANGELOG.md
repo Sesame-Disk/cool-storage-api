@@ -8,6 +8,85 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-04-01 — Session 60: Admin Read Model Projections + Share Denormalization + Integrity Fixes
+
+### Added — Admin Read Model System
+
+Introduced denormalized projection tables for all admin list endpoints, eliminating full-table-scans and N+1 query patterns across libraries, groups, shares, and links.
+
+**Library projections** (`internal/db/admin_library_read_models.go`):
+- `libraries_by_owner` — per-owner view, partition `(org_id, owner_id)`, clustering `updated_at DESC`
+- `libraries_by_org_updated` — org-wide view with denormalized `owner_email/name`, partition `org_id`
+- `libraries_admin_global_by_updated` — superadmin global view, bucketed by `bucket_day`
+- `libraries_deleted_by_org` — soft-deleted libraries per org, clustering `deleted_at DESC`
+- `library_admin_global_buckets` — day-bucket index for efficient iteration
+- `library_admin_projection_state` — state tracker enabling safe idempotent sync (keyed by `library_id`)
+
+**Group projections** (`internal/db/admin_group_read_models.go`):
+- `groups_admin_global_by_created` — superadmin global view, bucketed by `bucket_day`, clustering `created_at DESC`
+- `group_admin_global_buckets` — day-bucket index
+
+**Share link projections** (`internal/db/admin_link_read_models.go`):
+- `admin_links_by_created` — global view, partition `(link_type, bucket_day)`
+- `admin_links_by_org_created` — org-scoped view, partition `(org_id, link_type, bucket_day)`
+- `admin_link_buckets` / `admin_link_buckets_by_org` — bucket indexes
+- `admin_link_counts_by_org` — COUNTER table for active link enforcement per org/type
+
+**User-to-user share projections** (`internal/db/share_read_models.go`):
+- `shares_by_group` — group shares, partition `(org_id, group_id)`, full denormalized fields
+- `shares_by_user_org` — user shares for admin panel, partition `(org_id, user_id)`
+- `shares_by_creator` — creator view, partition `(org_id, shared_by)`
+- `shares_by_recipient` — recipient view, partition `(org_id, shared_to_type, shared_to)`
+
+All projections maintained via `LoggedBatch` dual-writes. Libraries use a state-tracker table for idempotent re-sync. Groups use upsert semantics (immutable `created_at` clustering key).
+
+### Changed — `shares` table: denormalized fields
+
+Added `org_id`, `shared_by_email`, `shared_by_name`, `shared_to_type`, `repo_name`, `encrypted`, `size_bytes` directly to the `shares` canonical table. Resolved once at share creation; read back in a single query on update/delete. Fallback to multi-query kept for legacy rows missing these fields.
+
+**Before**: `ReadShareReadModelRow` = 4 queries (shares + libraries_by_id + libraries + users).
+**After**: 1 query (shares), fallback only for pre-migration rows.
+
+### Fixed — Group share cleanup: N+1 queries eliminated
+
+`collectGroupShareReadModelRows` and GC `ListSharesByGroup` now query `shares_by_group` directly (single partition read) instead of the two-step `shares_by_user` → `shares` scan-and-filter pattern that performed N+1 queries. `cleanupGroupShares` looks up `org_id` from `groups_by_id` before querying `shares_by_group`.
+
+### Fixed — GC `ListAllGroupShares` full table scan
+
+GC scanner no longer scans the entire `shares` table to find group shares. Now iterates the `groups` table and queries `shares_by_group` per group partition.
+
+### Fixed — `parent_group_id` stale value in group projection
+
+`AddUpsertAdminGroupReadModelQuery` previously used two INSERT variants (one with `parent_group_id`, one without). In Cassandra, an INSERT that omits a column preserves the existing value — it does NOT null it. This caused stale `parent_group_id` if a group moved from child to root. Fixed: single INSERT always includes `parent_group_id`, passing `nil` when group is at root level.
+
+### Fixed — `shares_by_user` tombstones on group deletion
+
+`addDeleteGroupShareQueries` no longer writes tombstones to `shares_by_user` for group shares. Group shares are not written to `shares_by_user` (only user shares are), so the delete was creating tombstones on non-existent rows.
+
+### Fixed — `ErrNotFound` guard in `cleanupGroupShares` and `ListSharesByGroup`
+
+Both functions now handle `gocql.ErrNotFound` when looking up `org_id` from `groups_by_id`, returning gracefully instead of propagating an error. Covers retry scenarios where the group record was already cleaned up but share cleanup had not yet run.
+
+### Changed — `shares_by_user`: user shares only
+
+`createLibraryShare`, `updateLibrarySharePermission`, and `deleteLibraryShare` now only write to `shares_by_user` for `shared_to_type == "user"`. Group shares no longer touch this table; GC group cleanup uses `shares_by_group` instead.
+
+### Files Changed
+
+- `internal/db/migrations/001_initial_schema.cql` — denormalized columns on `shares`; all projection tables in schema
+- `internal/db/admin_library_read_models.go` — library projection helpers (upsert, delete, sync, list)
+- `internal/db/admin_group_read_models.go` — group projection helpers; `optionalGroupParentIDString`; single-variant upsert
+- `internal/db/admin_link_read_models.go` — link projection helpers with TTL and COUNTER support
+- `internal/db/share_read_models.go` — share projection helpers; `ReadShareReadModelRow` with fallback
+- `internal/api/v2/write_helpers.go` — `createLibraryShare` denormalized INSERT; conditional `shares_by_user` writes
+- `internal/api/v2/group_cleanup.go` — `collectGroupShareReadModelRows` uses `shares_by_group`; `cleanupGroupShares` with `ErrNotFound` guard
+- `internal/gc/store_cassandra.go` — `ListSharesByGroup` via `shares_by_group`; `ListAllGroupShares` via groups iteration
+- `internal/gc/store_mock.go` — updated mock implementations
+- `internal/db/admin_group_read_models_test.go` — projection tests including `optionalGroupParentIDString`
+- `internal/integration/group_projection_regression_test.go` — regression tests
+
+---
+
 ## 2026-03-31 — Session 59: Frontend/Backend Split Hardening + Nginx Production Fixes
 
 ### Fixed — Nginx production bugs (frontend container)
