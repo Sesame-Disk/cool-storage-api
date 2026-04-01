@@ -112,3 +112,39 @@ func TestInitialSchemaContainsLookupNameAndStarredIndex(t *testing.T) {
 	assert.Contains(t, content, "name              TEXT,")
 	assert.Contains(t, content, "CREATE INDEX IF NOT EXISTS starred_files_by_repo ON starred_files (repo_id);")
 }
+
+func TestAdminReadModelMigrationsExist(t *testing.T) {
+	testCases := []struct {
+		filePath string
+		contains []string
+	}{
+		{
+			filePath: "migrations/002_admin_links_read_models.cql",
+			contains: []string{"CREATE TABLE IF NOT EXISTS admin_links_by_created", "bucket_day     TEXT"},
+		},
+		{
+			filePath: "migrations/003_library_admin_read_models.cql",
+			contains: []string{
+				"CREATE TABLE IF NOT EXISTS libraries_by_owner",
+				"CREATE TABLE IF NOT EXISTS libraries_by_org_updated",
+				"CREATE TABLE IF NOT EXISTS libraries_admin_global_by_updated",
+				"CREATE TABLE IF NOT EXISTS libraries_deleted_by_org",
+			},
+		},
+		{
+			filePath: "migrations/004_group_share_read_models.cql",
+			contains: []string{"CREATE TABLE IF NOT EXISTS shares_by_group", "CREATE TABLE IF NOT EXISTS shares_by_user_org"},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.filePath, func(t *testing.T) {
+			raw, err := migrationsFS.ReadFile(tc.filePath)
+			require.NoError(t, err)
+			content := string(raw)
+			for _, needle := range tc.contains {
+				assert.Contains(t, content, needle)
+			}
+		})
+	}
+}
