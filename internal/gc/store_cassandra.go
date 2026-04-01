@@ -2,6 +2,7 @@ package gc
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"time"
@@ -1039,63 +1040,66 @@ func (s *CassandraStore) DeleteRepoTagFileCounts(libraryID uuid.UUID) error {
 // --- Group shares cleanup ---
 
 func (s *CassandraStore) ListSharesByGroup(groupID uuid.UUID) ([]GroupShareInfo, error) {
-	// shares_by_user is partitioned by shared_to, so this is efficient
+	var orgIDStr string
+	if err := s.db.Session().Query(`
+		SELECT org_id FROM groups_by_id WHERE group_id = ?
+	`, groupID.String()).Scan(&orgIDStr); err != nil {
+		if errors.Is(err, gocql.ErrNotFound) {
+			return []GroupShareInfo{}, nil
+		}
+		return nil, err
+	}
+
 	iter := s.db.Session().Query(`
-		SELECT shared_to, library_id FROM shares_by_user WHERE shared_to = ?
-	`, groupID.String()).Iter()
+		SELECT library_id, share_id FROM shares_by_group WHERE org_id = ? AND group_id = ?
+	`, orgIDStr, groupID.String()).Iter()
 
 	var results []GroupShareInfo
-	var sharedToStr, libIDStr string
-	for iter.Scan(&sharedToStr, &libIDStr) {
+	var libIDStr, shareIDStr string
+	for iter.Scan(&libIDStr, &shareIDStr) {
 		results = append(results, GroupShareInfo{
-			LibraryID: parseUUID(libIDStr),
-			SharedTo:  parseUUID(sharedToStr),
+			LibraryID:    parseUUID(libIDStr),
+			ShareID:      parseUUID(shareIDStr),
+			SharedTo:     groupID,
+			OrgID:        parseUUID(orgIDStr),
+			SharedToType: "group",
 		})
 	}
 	if err := iter.Close(); err != nil {
 		return nil, err
 	}
 
-	// For each library, get the share_id from the shares table
-	for i, gs := range results {
-		shareIter := s.db.Session().Query(`
-			SELECT share_id, shared_to FROM shares WHERE library_id = ?
-		`, gs.LibraryID.String()).Iter()
-		var shareIDStr, stStr string
-		for shareIter.Scan(&shareIDStr, &stStr) {
-			if stStr == groupID.String() {
-				results[i].ShareID = parseUUID(shareIDStr)
-				break
-			}
-		}
-		shareIter.Close()
-	}
-
 	return results, nil
 }
 
-// ListAllGroupShares returns all shares with shared_to_type='group' for the scanner.
-// NOTE: This performs a full table scan on 'shares' and filters in application code.
-// If the shares table grows large, consider adding a 'shares_by_type' materialized view
-// or secondary index to push filtering to Cassandra.
+// ListAllGroupShares returns all group shares for the scanner.
+// This scans groups, then reads each group's partition from shares_by_group.
 func (s *CassandraStore) ListAllGroupShares() ([]GroupShareInfo, error) {
-	iter := s.db.Session().Query(`
-		SELECT library_id, share_id, shared_to, shared_to_type FROM shares
+	groupIter := s.db.Session().Query(`
+		SELECT org_id, group_id FROM groups
 	`).Iter()
 
 	var results []GroupShareInfo
-	var libIDStr, shareIDStr, sharedToStr, sharedToType string
-	for iter.Scan(&libIDStr, &shareIDStr, &sharedToStr, &sharedToType) {
-		if sharedToType == "group" {
+	var orgIDStr, groupIDStr string
+	for groupIter.Scan(&orgIDStr, &groupIDStr) {
+		shareIter := s.db.Session().Query(`
+			SELECT library_id, share_id FROM shares_by_group WHERE org_id = ? AND group_id = ?
+		`, orgIDStr, groupIDStr).Iter()
+		var libIDStr, shareIDStr string
+		for shareIter.Scan(&libIDStr, &shareIDStr) {
 			results = append(results, GroupShareInfo{
 				LibraryID:    parseUUID(libIDStr),
 				ShareID:      parseUUID(shareIDStr),
-				SharedTo:     parseUUID(sharedToStr),
-				SharedToType: sharedToType,
+				SharedTo:     parseUUID(groupIDStr),
+				SharedToType: "group",
+				OrgID:        parseUUID(orgIDStr),
 			})
 		}
+		if err := shareIter.Close(); err != nil {
+			return nil, fmt.Errorf("failed to list shares for group %s: %w", groupIDStr, err)
+		}
 	}
-	if err := iter.Close(); err != nil {
+	if err := groupIter.Close(); err != nil {
 		return nil, fmt.Errorf("failed to list group shares: %w", err)
 	}
 	return results, nil

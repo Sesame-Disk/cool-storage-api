@@ -60,25 +60,18 @@ func ReadAdminGroupProjectionRow(session *gocql.Session, orgID, groupID string) 
 
 func AddUpsertAdminGroupReadModelQuery(batch *gocql.Batch, row AdminGroupProjectionRow) {
 	bucketDay := AdminGroupBucketDay(row.CreatedAt)
-	batch.Query(`INSERT INTO group_admin_global_buckets (bucket_day) VALUES (?)`, bucketDay)
-	if row.ParentGroupID == "" {
-		batch.Query(`
-			INSERT INTO groups_admin_global_by_created (
-				bucket_day, created_at, org_id, group_id, name, creator_id, owner_email,
-				owner_name, is_department
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-		`, bucketDay, row.CreatedAt, row.OrgID, row.GroupID, row.Name, row.CreatorID, row.OwnerEmail,
-			row.OwnerName, row.IsDepartment)
-		return
+	var parentGroupID interface{}
+	if row.ParentGroupID != "" {
+		parentGroupID = row.ParentGroupID
 	}
-
+	batch.Query(`INSERT INTO group_admin_global_buckets (bucket_day) VALUES (?)`, bucketDay)
 	batch.Query(`
 		INSERT INTO groups_admin_global_by_created (
 			bucket_day, created_at, org_id, group_id, name, creator_id, owner_email,
 			owner_name, parent_group_id, is_department
 		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`, bucketDay, row.CreatedAt, row.OrgID, row.GroupID, row.Name, row.CreatorID, row.OwnerEmail,
-		row.OwnerName, row.ParentGroupID, row.IsDepartment)
+		row.OwnerName, parentGroupID, row.IsDepartment)
 }
 
 func AddDeleteAdminGroupReadModelQuery(batch *gocql.Batch, row AdminGroupProjectionRow) {

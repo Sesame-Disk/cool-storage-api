@@ -131,10 +131,12 @@ type mockShareLink struct {
 }
 
 type mockShare struct {
-	LibraryID uuid.UUID
-	ShareID   uuid.UUID
-	SharedTo  uuid.UUID
-	ExpiresAt time.Time
+	OrgID        uuid.UUID
+	LibraryID    uuid.UUID
+	ShareID      uuid.UUID
+	SharedTo     uuid.UUID
+	SharedToType string
+	ExpiresAt    time.Time
 }
 
 type mockRestoreJob struct {
@@ -339,11 +341,34 @@ func (m *MockStore) AddShare(libraryID, shareID, sharedTo uuid.UUID, expiresAt t
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	key := fmt.Sprintf("%s:%s", libraryID, shareID)
+	orgID := uuid.Nil
+	if lib, ok := m.libraries[libraryID]; ok {
+		orgID = lib.OrgID
+	}
 	m.shares[key] = &mockShare{
-		LibraryID: libraryID,
-		ShareID:   shareID,
-		SharedTo:  sharedTo,
-		ExpiresAt: expiresAt,
+		OrgID:        orgID,
+		LibraryID:    libraryID,
+		ShareID:      shareID,
+		SharedTo:     sharedTo,
+		SharedToType: "user",
+		ExpiresAt:    expiresAt,
+	}
+}
+
+func (m *MockStore) AddGroupShare(libraryID, shareID, groupID uuid.UUID) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	key := fmt.Sprintf("%s:%s", libraryID, shareID)
+	orgID := uuid.Nil
+	if lib, ok := m.libraries[libraryID]; ok {
+		orgID = lib.OrgID
+	}
+	m.shares[key] = &mockShare{
+		OrgID:        orgID,
+		LibraryID:    libraryID,
+		ShareID:      shareID,
+		SharedTo:     groupID,
+		SharedToType: "group",
 	}
 }
 
@@ -647,7 +672,7 @@ func (m *MockStore) MarkItemProcessed(taskID uuid.UUID) (bool, error) {
 	if _, exists := m.gcStats[key]; exists {
 		return false, nil
 	}
-	
+
 	// Mock TTL by just setting it in gcStats for now
 	m.gcStats[key] = "processed"
 	return true, nil
@@ -1170,7 +1195,7 @@ func (m *MockStore) DeleteShareLinksByLibrary(orgID, libraryID uuid.UUID) ([]str
 
 // --- New cleanup methods ---
 
-func (m *MockStore) DeleteStarredFilesByLibrary(libraryID uuid.UUID) error { return nil }
+func (m *MockStore) DeleteStarredFilesByLibrary(libraryID uuid.UUID) error   { return nil }
 func (m *MockStore) DeleteMonitoredReposByLibrary(libraryID uuid.UUID) error { return nil }
 func (m *MockStore) DeleteRestoreJobsByLibrary(orgID, libraryID uuid.UUID) error {
 	m.mu.Lock()
@@ -1183,14 +1208,50 @@ func (m *MockStore) DeleteRestoreJobsByLibrary(orgID, libraryID uuid.UUID) error
 	}
 	return nil
 }
-func (m *MockStore) DeleteRepoTagCounters(libraryID uuid.UUID) error    { return nil }
-func (m *MockStore) DeleteFileTagCounters(libraryID uuid.UUID) error    { return nil }
-func (m *MockStore) DeleteRepoTagFileCounts(libraryID uuid.UUID) error  { return nil }
+func (m *MockStore) DeleteRepoTagCounters(libraryID uuid.UUID) error   { return nil }
+func (m *MockStore) DeleteFileTagCounters(libraryID uuid.UUID) error   { return nil }
+func (m *MockStore) DeleteRepoTagFileCounts(libraryID uuid.UUID) error { return nil }
 func (m *MockStore) ListSharesByGroup(groupID uuid.UUID) ([]GroupShareInfo, error) {
-	return nil, nil
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	var result []GroupShareInfo
+	for _, share := range m.shares {
+		if share.SharedToType != "group" || share.SharedTo != groupID {
+			continue
+		}
+		result = append(result, GroupShareInfo{
+			LibraryID:    share.LibraryID,
+			ShareID:      share.ShareID,
+			SharedTo:     share.SharedTo,
+			SharedToType: share.SharedToType,
+			OrgID:        share.OrgID,
+		})
+	}
+	return result, nil
 }
-func (m *MockStore) ListAllGroupShares() ([]GroupShareInfo, error) { return nil, nil }
-func (m *MockStore) GroupExists(orgID, groupID uuid.UUID) (bool, error) { return false, nil }
+func (m *MockStore) ListAllGroupShares() ([]GroupShareInfo, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	var result []GroupShareInfo
+	for _, share := range m.shares {
+		if share.SharedToType != "group" {
+			continue
+		}
+		result = append(result, GroupShareInfo{
+			LibraryID:    share.LibraryID,
+			ShareID:      share.ShareID,
+			SharedTo:     share.SharedTo,
+			SharedToType: share.SharedToType,
+			OrgID:        share.OrgID,
+		})
+	}
+	return result, nil
+}
+func (m *MockStore) GroupExists(orgID, groupID uuid.UUID) (bool, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.groups[fmt.Sprintf("%s:%s", orgID, groupID)], nil
+}
 func (m *MockStore) WriteAuditLog(entry AuditLogEntry) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()

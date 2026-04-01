@@ -190,14 +190,19 @@ func createLibraryShare(db interface{ Session() *gocql.Session }, libraryID, sha
 	batch := db.Session().Batch(gocql.LoggedBatch)
 	batch.Query(`
 		INSERT INTO shares (
-			library_id, share_id, shared_by, shared_to, shared_to_type,
+			library_id, share_id, org_id, shared_by, shared_by_email, shared_by_name,
+			shared_to, shared_to_type, repo_name, encrypted, size_bytes,
 			permission, created_at, expires_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-	`, libraryID, shareID, sharedBy, sharedTo, sharedToType, permission, createdAt, expiresAt)
-	batch.Query(`
-		INSERT INTO shares_by_user (shared_to, library_id, shared_to_type, permission, shared_by, created_at)
-		VALUES (?, ?, ?, ?, ?, ?)
-	`, sharedTo, libraryID, sharedToType, permission, sharedBy, createdAt)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, libraryID, shareID, row.OrgID, sharedBy, row.SharedByEmail, row.SharedByName,
+		sharedTo, sharedToType, row.RepoName, row.Encrypted, row.SizeBytes,
+		permission, createdAt, expiresAt)
+	if sharedToType == "user" {
+		batch.Query(`
+			INSERT INTO shares_by_user (shared_to, library_id, shared_to_type, permission, shared_by, created_at)
+			VALUES (?, ?, ?, ?, ?, ?)
+		`, sharedTo, libraryID, sharedToType, permission, sharedBy, createdAt)
+	}
 	dbpkg.AddUpsertShareReadModelQuery(batch, row)
 	return batch.Exec()
 }
@@ -213,9 +218,11 @@ func updateLibrarySharePermission(db interface{ Session() *gocql.Session }, libr
 	batch.Query(`
 		UPDATE shares SET permission = ? WHERE library_id = ? AND share_id = ?
 	`, permission, libraryID, shareID)
-	batch.Query(`
-		UPDATE shares_by_user SET permission = ? WHERE shared_to = ? AND library_id = ?
-	`, permission, sharedTo, libraryID)
+	if row.SharedToType == "user" {
+		batch.Query(`
+			UPDATE shares_by_user SET permission = ? WHERE shared_to = ? AND library_id = ?
+		`, permission, sharedTo, libraryID)
+	}
 	dbpkg.AddUpsertShareReadModelQuery(batch, row)
 	return batch.Exec()
 }
@@ -229,9 +236,11 @@ func deleteLibraryShare(db interface{ Session() *gocql.Session }, libraryID, sha
 	batch.Query(`
 		DELETE FROM shares WHERE library_id = ? AND share_id = ?
 	`, libraryID, shareID)
-	batch.Query(`
-		DELETE FROM shares_by_user WHERE shared_to = ? AND library_id = ?
-	`, sharedTo, libraryID)
+	if row.SharedToType == "user" {
+		batch.Query(`
+			DELETE FROM shares_by_user WHERE shared_to = ? AND library_id = ?
+		`, sharedTo, libraryID)
+	}
 	dbpkg.AddDeleteShareReadModelQuery(batch, row)
 	return batch.Exec()
 }

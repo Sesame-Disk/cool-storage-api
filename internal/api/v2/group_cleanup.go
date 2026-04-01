@@ -1,6 +1,7 @@
 package v2
 
 import (
+	"errors"
 	"log"
 	"time"
 
@@ -37,44 +38,35 @@ func addCleanupGroupsByMemberQueries(batch *gocql.Batch, orgID, groupID string, 
 	}
 }
 
-func collectGroupShareReadModelRows(database *dbpkg.DB, groupID string) ([]dbpkg.ShareReadModelRow, error) {
+func collectGroupShareReadModelRows(database *dbpkg.DB, orgID, groupID string) ([]dbpkg.ShareReadModelRow, error) {
 	iter := database.Session().Query(`
-		SELECT library_id FROM shares_by_user WHERE shared_to = ?
-	`, groupID).Iter()
+		SELECT created_at, library_id, share_id, permission,
+		       shared_by, shared_by_email, shared_by_name, repo_name, encrypted, size_bytes
+		FROM shares_by_group WHERE org_id = ? AND group_id = ?
+	`, orgID, groupID).Iter()
 
-	var libraryID string
-	var libraryIDs []string
-	for iter.Scan(&libraryID) {
-		libraryIDs = append(libraryIDs, libraryID)
+	var shareRows []dbpkg.ShareReadModelRow
+	var row dbpkg.ShareReadModelRow
+	for iter.Scan(
+		&row.CreatedAt,
+		&row.LibraryID,
+		&row.ShareID,
+		&row.Permission,
+		&row.SharedBy,
+		&row.SharedByEmail,
+		&row.SharedByName,
+		&row.RepoName,
+		&row.Encrypted,
+		&row.SizeBytes,
+	) {
+		row.OrgID = orgID
+		row.SharedTo = groupID
+		row.SharedToType = "group"
+		shareRows = append(shareRows, row)
+		row = dbpkg.ShareReadModelRow{}
 	}
 	if err := iter.Close(); err != nil {
 		return nil, err
-	}
-
-	var shareRows []dbpkg.ShareReadModelRow
-	for _, libID := range libraryIDs {
-		shareIter := database.Session().Query(`
-			SELECT share_id, shared_to FROM shares WHERE library_id = ?
-		`, libID).Iter()
-
-		var shareID, sharedTo string
-		for shareIter.Scan(&shareID, &sharedTo) {
-			if sharedTo != groupID {
-				continue
-			}
-			row, err := dbpkg.ReadShareReadModelRow(database.Session(), libID, shareID)
-			if err != nil {
-				_ = shareIter.Close()
-				return nil, err
-			}
-			if row.SharedToType != "group" || row.SharedTo != groupID {
-				continue
-			}
-			shareRows = append(shareRows, row)
-		}
-		if err := shareIter.Close(); err != nil {
-			return nil, err
-		}
 	}
 
 	if shareRows == nil {
@@ -86,7 +78,6 @@ func collectGroupShareReadModelRows(database *dbpkg.DB, groupID string) ([]dbpkg
 func addDeleteGroupShareQueries(batch *gocql.Batch, shareRows []dbpkg.ShareReadModelRow) {
 	for _, row := range shareRows {
 		batch.Query(`DELETE FROM shares WHERE library_id = ? AND share_id = ?`, row.LibraryID, row.ShareID)
-		batch.Query(`DELETE FROM shares_by_user WHERE shared_to = ? AND library_id = ?`, row.SharedTo, row.LibraryID)
 		dbpkg.AddDeleteShareReadModelQuery(batch, row)
 	}
 }
@@ -102,7 +93,7 @@ func loadGroupDeleteState(database *dbpkg.DB, orgID, groupID string) (groupDelet
 		return groupDeleteState{}, err
 	}
 
-	shareRows, err := collectGroupShareReadModelRows(database, groupID)
+	shareRows, err := collectGroupShareReadModelRows(database, orgID, groupID)
 	if err != nil {
 		return groupDeleteState{}, err
 	}
@@ -186,7 +177,14 @@ func cleanupGroupsByMember(db interface{ Session() *gocql.Session }, orgID, grou
 }
 
 func cleanupGroupShares(database *dbpkg.DB, groupID uuid.UUID) error {
-	shareRows, err := collectGroupShareReadModelRows(database, groupID.String())
+	var orgID string
+	if err := database.Session().Query(`SELECT org_id FROM groups_by_id WHERE group_id = ?`, groupID.String()).Scan(&orgID); err != nil {
+		if errors.Is(err, gocql.ErrNotFound) {
+			return nil
+		}
+		return err
+	}
+	shareRows, err := collectGroupShareReadModelRows(database, orgID, groupID.String())
 	if err != nil {
 		return err
 	}

@@ -27,20 +27,36 @@ func ReadShareReadModelRow(session *gocql.Session, libraryID, shareID string) (S
 	row := ShareReadModelRow{LibraryID: libraryID, ShareID: shareID}
 	var expiresAt *time.Time
 	err := session.Query(`
-		SELECT shared_by, shared_to, shared_to_type, permission, created_at, expires_at
+		SELECT org_id, shared_by, shared_by_email, shared_by_name, shared_to, shared_to_type,
+		       repo_name, encrypted, size_bytes, permission, created_at, expires_at
 		FROM shares WHERE library_id = ? AND share_id = ?
-	`, libraryID, shareID).Scan(&row.SharedBy, &row.SharedTo, &row.SharedToType, &row.Permission, &row.CreatedAt, &expiresAt)
+	`, libraryID, shareID).Scan(
+		&row.OrgID,
+		&row.SharedBy,
+		&row.SharedByEmail,
+		&row.SharedByName,
+		&row.SharedTo,
+		&row.SharedToType,
+		&row.RepoName,
+		&row.Encrypted,
+		&row.SizeBytes,
+		&row.Permission,
+		&row.CreatedAt,
+		&expiresAt,
+	)
 	if err != nil {
 		return ShareReadModelRow{}, err
 	}
 	row.ExpiresAt = expiresAt
-	if err := session.Query(`
-		SELECT org_id, name, encrypted FROM libraries_by_id WHERE library_id = ?
-	`, libraryID).Scan(&row.OrgID, &row.RepoName, &row.Encrypted); err != nil {
-		return ShareReadModelRow{}, err
+	if row.OrgID == "" || row.RepoName == "" || row.SharedByEmail == "" {
+		if err := session.Query(`
+			SELECT org_id, name, encrypted FROM libraries_by_id WHERE library_id = ?
+		`, libraryID).Scan(&row.OrgID, &row.RepoName, &row.Encrypted); err != nil {
+			return ShareReadModelRow{}, err
+		}
+		_ = session.Query(`SELECT size_bytes FROM libraries WHERE org_id = ? AND library_id = ?`, row.OrgID, libraryID).Scan(&row.SizeBytes)
+		row.SharedByEmail, row.SharedByName = ResolveAdminLibraryOwnerFields(session, row.OrgID, row.SharedBy)
 	}
-	_ = session.Query(`SELECT size_bytes FROM libraries WHERE org_id = ? AND library_id = ?`, row.OrgID, libraryID).Scan(&row.SizeBytes)
-	row.SharedByEmail, row.SharedByName = ResolveAdminLibraryOwnerFields(session, row.OrgID, row.SharedBy)
 	return row, nil
 }
 

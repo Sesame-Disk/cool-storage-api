@@ -21,7 +21,7 @@ func TestOptionalGroupParentIDString(t *testing.T) {
 	}
 }
 
-func TestAddUpsertAdminGroupReadModelQueryOmitsEmptyParentGroupID(t *testing.T) {
+func TestAddUpsertAdminGroupReadModelQueryAlwaysIncludesParentGroupID(t *testing.T) {
 	batch := &gocql.Batch{}
 	row := AdminGroupProjectionRow{
 		OrgID:        "00000000-0000-0000-0000-000000000001",
@@ -41,11 +41,14 @@ func TestAddUpsertAdminGroupReadModelQueryOmitsEmptyParentGroupID(t *testing.T) 
 	}
 
 	args := batch.Entries[1].Args
-	if len(args) != 9 {
-		t.Fatalf("expected 9 args for root-group projection insert, got %d", len(args))
+	if len(args) != 10 {
+		t.Fatalf("expected 10 args for root-group projection insert, got %d", len(args))
 	}
 	if got := batch.Entries[1].Stmt; got == "" {
 		t.Fatal("expected projection insert statement for root group")
+	}
+	if got := batch.Entries[1].Args[8]; got != nil {
+		t.Fatalf("expected nil parent_group_id arg for root group, got %#v", got)
 	}
 
 	batchWithParent := &gocql.Batch{}

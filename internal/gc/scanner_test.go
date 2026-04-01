@@ -2,6 +2,7 @@ package gc
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -90,6 +91,47 @@ func TestScanner_ScanExpiredShareLinks(t *testing.T) {
 	if shareLinkItems != 1 {
 		t.Errorf("expected 1 expired share link enqueued, got %d", shareLinkItems)
 	}
+}
+
+func TestScanner_ScanOrphanedGroupShares(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	s := NewScanner(store, q, stats, config.GCConfig{})
+
+	orgID := uuid.New()
+	groupID := uuid.New()
+	missingGroupID := uuid.New()
+	liveLibraryID := uuid.New()
+	orphanLibraryID := uuid.New()
+	store.AddOrganization(orgID)
+	store.AddLibrary(orgID, liveLibraryID, "hot")
+	store.AddLibrary(orgID, orphanLibraryID, "hot")
+	store.AddGroupForOrg(orgID, groupID)
+	store.AddGroupShare(liveLibraryID, uuid.New(), groupID)
+	orphanShareID := uuid.New()
+	store.AddGroupShare(orphanLibraryID, orphanShareID, missingGroupID)
+
+	ctx := context.Background()
+	n, err := s.scanOrphanedGroupShares(ctx)
+	if err != nil {
+		t.Fatalf("scanOrphanedGroupShares failed: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("expected 1 orphaned group share cleaned, got %d", n)
+	}
+
+	store.mu.RLock()
+	defer store.mu.RUnlock()
+	if _, ok := store.shares[fmt.Sprintf("%s:%s", orphanLibraryID, orphanShareID)]; ok {
+		t.Fatalf("orphaned group share still present after scanner cleanup")
+	}
+	for _, share := range store.shares {
+		if share.LibraryID == liveLibraryID && share.SharedTo == groupID {
+			return
+		}
+	}
+	t.Fatalf("live group share was incorrectly removed")
 }
 
 func TestScanner_ScanOrphanedCommits(t *testing.T) {
@@ -651,9 +693,9 @@ func TestScanner_ScanExpiredShares(t *testing.T) {
 	libID := uuid.New()
 
 	// Add expired and active shares
-	store.AddShare(libID, uuid.New(), uuid.New(), time.Now().Add(-24*time.Hour))  // expired
-	store.AddShare(libID, uuid.New(), uuid.New(), time.Now().Add(24*time.Hour))   // active
-	store.AddShare(libID, uuid.New(), uuid.New(), time.Time{})                     // permanent
+	store.AddShare(libID, uuid.New(), uuid.New(), time.Now().Add(-24*time.Hour)) // expired
+	store.AddShare(libID, uuid.New(), uuid.New(), time.Now().Add(24*time.Hour))  // active
+	store.AddShare(libID, uuid.New(), uuid.New(), time.Time{})                   // permanent
 
 	ctx := context.Background()
 	s.scanExpiredShares(ctx)
