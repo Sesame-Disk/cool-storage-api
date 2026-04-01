@@ -587,7 +587,8 @@ Worker deletes block (SHA-256) →
 ```sql
 PRIMARY KEY (link_token)  -- Lookup by token
 -- link_type: 'share' | 'upload' | 'internal'
--- See also: share_links_by_creator, share_links_by_org, share_links_by_library
+-- See also: share_links_by_creator, share_links_by_library,
+--           admin_links_by_created, admin_links_by_org_created
 -- Full schema: docs/SHARE-LINKS-UNIFICATION.md
 ```
 

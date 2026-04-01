@@ -242,26 +242,7 @@ func (h *ShareLinkHandler) insertShareLink(
 			permission, expiresAt, singleUse, viewCount, downloadCount, uploadCount, hasPassword)
 	}
 
-	// 3. By org (for admin panel)
-	if ttlSeconds > 0 {
-		batch.Query(`
-			INSERT INTO share_links_by_org (
-				org_id, created_at, link_token, link_type, library_id, file_path,
-				created_by, permission, expires_at, has_password, active, view_count, upload_count
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, true, ?, ?) USING TTL ?
-		`, orgID, createdAt, token, linkType, libraryID, filePath,
-			createdBy, permission, expiresAt, hasPassword, viewCount, uploadCount, ttlSeconds)
-	} else {
-		batch.Query(`
-			INSERT INTO share_links_by_org (
-				org_id, created_at, link_token, link_type, library_id, file_path,
-				created_by, permission, expires_at, has_password, active, view_count, upload_count
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, true, ?, ?)
-		`, orgID, createdAt, token, linkType, libraryID, filePath,
-			createdBy, permission, expiresAt, hasPassword, viewCount, uploadCount)
-	}
-
-	// 4. By library (for orphan cleanup)
+	// 3. By library (for orphan cleanup)
 	if ttlSeconds > 0 {
 		batch.Query(`
 			INSERT INTO share_links_by_library (
@@ -275,6 +256,7 @@ func (h *ShareLinkHandler) insertShareLink(
 			) VALUES (?, ?, ?, ?, ?, ?)
 		`, orgID, libraryID, token, linkType, createdBy, createdAt)
 	}
+	repoName, objName, creatorEmail, creatorName := db.ResolveAdminLinkDisplayFields(h.db.Session(), orgID, libraryID, filePath, createdBy)
 	db.AddUpsertAdminLinkReadModelQuery(
 		batch,
 		token,
@@ -284,6 +266,10 @@ func (h *ShareLinkHandler) insertShareLink(
 		filePath,
 		createdBy,
 		permission,
+		repoName,
+		objName,
+		creatorEmail,
+		creatorName,
 		expiresAt,
 		hasPassword,
 		true,
@@ -296,7 +282,7 @@ func (h *ShareLinkHandler) insertShareLink(
 	return batch.Exec()
 }
 
-// deleteShareLink deletes a link from all 4 tables.
+// deleteShareLink deletes a link from the canonical tables and admin projections.
 // Requires createdAt for the clustering key in _by_creator.
 func (h *ShareLinkHandler) deleteShareLink(token, orgID, createdBy, libraryID string, createdAt time.Time) error {
 	var linkType string
@@ -308,8 +294,6 @@ func (h *ShareLinkHandler) deleteShareLink(token, orgID, createdBy, libraryID st
 	batch.Query(`DELETE FROM share_links WHERE link_token = ?`, token)
 	batch.Query(`DELETE FROM share_links_by_creator WHERE org_id = ? AND created_by = ? AND created_at = ? AND link_token = ?`,
 		orgID, createdBy, createdAt, token)
-	batch.Query(`DELETE FROM share_links_by_org WHERE org_id = ? AND created_at = ? AND link_token = ?`,
-		orgID, createdAt, token)
 	batch.Query(`DELETE FROM share_links_by_library WHERE org_id = ? AND library_id = ? AND link_token = ?`,
 		orgID, libraryID, token)
 	db.AddDeleteAdminLinkReadModelQuery(batch, linkType, createdAt, orgID, token)

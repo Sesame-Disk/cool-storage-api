@@ -294,7 +294,6 @@ func cleanupLibraryLinks(db interface{ Session() *gocql.Session }, orgID, librar
 		batch := db.Session().Batch(gocql.LoggedBatch)
 		batch.Query(`DELETE FROM share_links WHERE link_token = ?`, linkToken)
 		batch.Query(`DELETE FROM share_links_by_creator WHERE org_id = ? AND created_by = ? AND created_at = ? AND link_token = ?`, orgID, createdBy, createdAt, linkToken)
-		batch.Query(`DELETE FROM share_links_by_org WHERE org_id = ? AND created_at = ? AND link_token = ?`, orgID, createdAt, linkToken)
 		batch.Query(`DELETE FROM share_links_by_library WHERE org_id = ? AND library_id = ? AND link_token = ?`, orgID, libraryID, linkToken)
 		dbpkg.AddDeleteAdminLinkReadModelQuery(batch, linkType, createdAt, orgID, linkToken)
 		if err := batch.Exec(); err != nil {

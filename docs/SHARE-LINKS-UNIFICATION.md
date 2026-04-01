@@ -91,22 +91,29 @@ CREATE TABLE IF NOT EXISTS share_links_by_creator (
 - Filtra `link_type` en Go para servir endpoints separados
 - Orden cronológico DESC nativo — sin sort en memoria
 
-### 2.3 `share_links_by_org` — Admin panel (links por organización)
+### 2.3 `admin_links_by_org_created` — Org-admin read model
 
 ```sql
-CREATE TABLE IF NOT EXISTS share_links_by_org (
+CREATE TABLE IF NOT EXISTS admin_links_by_org_created (
     org_id           UUID,
+    link_type        TEXT,
+    bucket_day       TEXT,
     created_at       TIMESTAMP,
     link_token       TEXT,
-    link_type        TEXT,
     library_id       UUID,
+    repo_name        TEXT,
     file_path        TEXT,
+    obj_name         TEXT,
     created_by       UUID,
+    creator_email    TEXT,
+    creator_name     TEXT,
     permission       TEXT,
     expires_at       TIMESTAMP,
     has_password     BOOLEAN,
     active           BOOLEAN,
-    PRIMARY KEY ((org_id), created_at, link_token)
+    view_count       INT,
+    upload_count     INT,
+    PRIMARY KEY ((org_id, link_type, bucket_day), created_at, link_token)
 ) WITH CLUSTERING ORDER BY (created_at DESC, link_token ASC);
 ```
 
@@ -170,20 +177,21 @@ El helper `normalizePermissionInput()` convierte cualquier formato legacy a JSON
 
 ## 5. Quad-Write Pattern (4 tablas)
 
-Cada operación CRUD escribe a las 4 tablas en un logged batch:
+Cada operación CRUD escribe a las tablas canónicas y a los read models admin en un logged batch:
 
 ```go
 batch := session.NewBatch(gocql.LoggedBatch)
 batch.Query("INSERT INTO share_links (...) VALUES (?)", ...)
 batch.Query("INSERT INTO share_links_by_creator (...) VALUES (?)", ...)
-batch.Query("INSERT INTO share_links_by_org (...) VALUES (?)", ...)
 batch.Query("INSERT INTO share_links_by_library (...) VALUES (?)", ...)
+batch.Query("INSERT INTO admin_links_by_created (...) VALUES (?)", ...)
+batch.Query("INSERT INTO admin_links_by_org_created (...) VALUES (?)", ...)
 session.ExecuteBatch(batch)
 ```
 
-**TTL**: Cuando hay `expires_at`, se aplica `USING TTL` a las 4 tablas. Las filas expiradas se auto-eliminan.
+**TTL**: Cuando hay `expires_at`, se aplica `USING TTL` a las tablas canónicas y a las proyecciones admin. Las filas expiradas se auto-eliminan.
 
-**Delete**: Logged batch DELETE de las 4 tablas. Requiere clustering keys (`created_at`, `link_token`) para las tablas con clustering order.
+**Delete**: Logged batch DELETE de las tablas canónicas y las proyecciones admin. Requiere clustering keys (`created_at`, `link_token`) para las tablas con clustering order.
 
 **Update**: Patrón delete + re-insert para manejar cambios de TTL correctamente.
 
@@ -238,8 +246,8 @@ Las migraciones en `db.go` incluyen:
 | `internal/api/v2/sharelink_view.go` | `resolveShareLink` usa `share_links`, incrementa `view_count`. Incrementa `download_count`/`upload_count`. Enforce `single_use` → `active=false` |
 | `internal/api/v2/share_links_export.go` | Query actualizada a `share_links WHERE link_token` |
 | `internal/api/v2/files.go` | `GetSmartLink` crea links `internal` con token en DB |
-| `internal/api/v2/admin_extra.go` | 6 funciones usan `share_links_by_org` (1 query/org, no full scan) |
-| `internal/api/v2/org_admin.go` | 4 funciones usan `share_links_by_org` (1 query, no iteran usuarios) |
+| `internal/api/v2/admin_share_links.go` | Los listados leen `admin_links_by_created` por buckets diarios |
+| `internal/api/v2/org_admin_share_links.go` | Los listados leen `admin_links_by_org_created` por org + tipo + bucket |
 | `internal/gc/store_cassandra.go` | `ListShareLinks` y `DeleteShareLink` usan `link_token`. Delete hace quad-delete con logged batch |
 | `internal/api/v2/deleted_libraries.go` | `PermanentDeleteRepo` limpia links vía `share_links_by_library` + `cleanupLibraryLinks()` |
 

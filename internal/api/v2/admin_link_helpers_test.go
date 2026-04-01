@@ -2,6 +2,7 @@ package v2
 
 import (
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 )
@@ -152,5 +153,29 @@ func TestValidateAdminLinkScope(t *testing.T) {
 				t.Fatalf("error = %v, want %v", err, test.wantErr)
 			}
 		})
+	}
+}
+
+func TestResolveAdminLinkObjName_FallsBackToPathRules(t *testing.T) {
+	if got := resolveAdminLinkObjName("", "/folder/report.pdf", "Repo"); got != "report.pdf" {
+		t.Fatalf("obj_name = %q, want %q", got, "report.pdf")
+	}
+	if got := resolveAdminLinkObjName("Projected Name", "/folder/report.pdf", "Repo"); got != "Projected Name" {
+		t.Fatalf("obj_name = %q, want projected value", got)
+	}
+	if got := resolveAdminLinkObjName("", "/", "Repo"); got != "Repo" {
+		t.Fatalf("root obj_name = %q, want %q", got, "Repo")
+	}
+}
+
+func TestAdminLinkProjectionRowsSortByCreatedTimeDesc(t *testing.T) {
+	now := time.Now().UTC()
+	links := []gin.H{
+		{"ctime": now.Add(-time.Hour).Format(time.RFC3339), "token": "older"},
+		{"ctime": now.Format(time.RFC3339), "token": "newer"},
+	}
+	sortAdminLinks(links, "", "")
+	if links[0]["token"] != "newer" {
+		t.Fatalf("expected newest link first, got %#v", links)
 	}
 }

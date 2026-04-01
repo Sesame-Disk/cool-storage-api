@@ -4,7 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"strings"
 	"time"
 
 	"github.com/Sesame-Disk/sesamefs/internal/middleware"
@@ -37,112 +36,60 @@ func (h *OrgAdminHandler) ListOrgLinks(c *gin.Context) {
 	userCache := make(map[string][2]string)
 	libNameCache := make(map[string]string)
 	var links []gin.H
-	iter := h.db.Session().Query(`
-		SELECT link_token, link_type, library_id, file_path, created_by, permission, expires_at, has_password, active, view_count, created_at
-		FROM share_links_by_org WHERE org_id = ?
-	`, orgID).Iter()
+	rows, err := listAdminLinkProjectionRowsByOrg(h.db.Session(), orgID, "share")
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list links"})
+		return
+	}
 
-	var token, linkType, libID, filePath, createdBy, permission string
-	var expiresAt *time.Time
-	var hasPassword, active bool
-	var viewCount *int
-	var createdAt time.Time
-
-	for iter.Scan(&token, &linkType, &libID, &filePath, &createdBy, &permission, &expiresAt, &hasPassword, &active, &viewCount, &createdAt) {
-		if linkType != "share" {
-			continue
-		}
-
-		info, ok := userCache[createdBy]
-		if !ok {
-			var email, name string
-			h.db.Session().Query(`SELECT email, name FROM users WHERE org_id = ? AND user_id = ?`, orgID, createdBy).Scan(&email, &name)
-			if name == "" && email != "" {
-				name = strings.Split(email, "@")[0]
-			}
-			info = [2]string{email, name}
-			userCache[createdBy] = info
-		}
-
-		linkName := filePath
-		if idx := strings.LastIndex(filePath, "/"); idx >= 0 && idx < len(filePath)-1 {
-			linkName = filePath[idx+1:]
-		}
-		if linkName == "" || linkName == "/" {
-			libName, ok := libNameCache[libID]
-			if !ok {
-				h.db.Session().Query(`SELECT name FROM libraries WHERE org_id = ? AND library_id = ?`, orgID, libID).Scan(&libName)
-				if libName == "" {
-					libName = "Unknown Library"
-				}
-				libNameCache[libID] = libName
-			}
-			if libName != "" {
-				linkName = libName
-			}
-		}
-
-		repoName, ok := libNameCache[libID]
-		if !ok {
-			h.db.Session().Query(`SELECT name FROM libraries WHERE org_id = ? AND library_id = ?`, orgID, libID).Scan(&repoName)
-			if repoName == "" {
-				repoName = "Unknown Library"
-			}
-			libNameCache[libID] = repoName
-		}
+	for _, row := range rows {
+		repoName := resolveAdminLinkRepoName(h.db.Session(), libNameCache, orgID, row.LibraryID, row.RepoName)
+		creatorEmail, creatorName := resolveAdminLinkCreatorInfo(h.db.Session(), userCache, orgID, row.CreatedBy, row.CreatorEmail, row.CreatorName)
+		linkName := resolveAdminLinkObjName(row.ObjName, row.FilePath, repoName)
 
 		isExpired := false
 		expireDateStr := ""
-		if expiresAt != nil && !expiresAt.IsZero() {
-			isExpired = expiresAt.Before(time.Now())
-			expireDateStr = expiresAt.Format(time.RFC3339)
+		if row.ExpiresAt != nil && !row.ExpiresAt.IsZero() {
+			isExpired = row.ExpiresAt.Before(time.Now())
+			expireDateStr = row.ExpiresAt.Format(time.RFC3339)
 		}
-		if !filters.MatchesState(active, isExpired) {
+		if !filters.MatchesState(row.Active, isExpired) {
 			continue
 		}
 
-		linkURL := fmt.Sprintf("%s/d/%s", getBrowserURL(c, ""), token)
-		count := 0
-		if viewCount != nil {
-			count = *viewCount
-		}
-
-		perms := parsePermsJSON(permission)
+		linkURL := fmt.Sprintf("%s/d/%s", getBrowserURL(c, ""), row.Token)
+		perms := parsePermsJSON(row.Permission)
 		status := "active"
-		if !active {
+		if !row.Active {
 			status = "inactive"
 		}
-		if !filters.MatchesSearch(linkName, token, filePath, repoName, info[0], info[1], linkURL) {
+		if !filters.MatchesSearch(linkName, row.Token, row.FilePath, repoName, creatorEmail, creatorName, linkURL) {
 			continue
 		}
 
 		links = append(links, gin.H{
 			"obj_name":      linkName,
 			"name":          linkName,
-			"path":          filePath,
-			"token":         token,
+			"path":          row.FilePath,
+			"token":         row.Token,
 			"link":          linkURL,
-			"repo_id":       libID,
+			"repo_id":       row.LibraryID,
 			"repo_name":     repoName,
-			"owner_email":   info[0],
-			"owner_name":    info[1],
-			"creator_email": info[0],
-			"creator_name":  info[1],
-			"created_time":  createdAt.Format(time.RFC3339),
-			"ctime":         createdAt.Format(time.RFC3339),
-			"view_count":    count,
-			"view_cnt":      count,
+			"owner_email":   creatorEmail,
+			"owner_name":    creatorName,
+			"creator_email": creatorEmail,
+			"creator_name":  creatorName,
+			"created_time":  row.CreatedAt.Format(time.RFC3339),
+			"ctime":         row.CreatedAt.Format(time.RFC3339),
+			"view_count":    row.ViewCount,
+			"view_cnt":      row.ViewCount,
 			"expire_date":   expireDateStr,
 			"is_expired":    isExpired,
-			"active":        active,
+			"active":        row.Active,
 			"status":        status,
-			"has_password":  hasPassword,
+			"has_password":  row.HasPassword,
 			"permissions":   gin.H{"can_download": perms.CanDownload, "can_edit": perms.CanEdit},
 		})
-	}
-	if err := iter.Close(); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list links"})
-		return
 	}
 
 	if links == nil {
@@ -229,92 +176,53 @@ func (h *OrgAdminHandler) ListOrgUploadLinks(c *gin.Context) {
 	userCache := make(map[string][2]string)
 	libNameCache := make(map[string]string)
 	var links []gin.H
-	iter := h.db.Session().Query(`
-		SELECT link_token, link_type, library_id, file_path, created_by, expires_at, active, has_password, upload_count, created_at
-		FROM share_links_by_org WHERE org_id = ?
-	`, orgID).Iter()
+	rows, err := listAdminLinkProjectionRowsByOrg(h.db.Session(), orgID, "upload")
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list upload links"})
+		return
+	}
 
-	var token, linkType, libID, filePath, createdBy string
-	var expiresAt *time.Time
-	var active, hasPassword bool
-	var uploadCount *int
-	var createdAt time.Time
-
-	for iter.Scan(&token, &linkType, &libID, &filePath, &createdBy, &expiresAt, &active, &hasPassword, &uploadCount, &createdAt) {
-		if linkType != "upload" {
-			continue
-		}
-
-		info, ok := userCache[createdBy]
-		if !ok {
-			var email, name string
-			h.db.Session().Query(`SELECT email, name FROM users WHERE org_id = ? AND user_id = ?`, orgID, createdBy).Scan(&email, &name)
-			if name == "" && email != "" {
-				name = strings.Split(email, "@")[0]
-			}
-			info = [2]string{email, name}
-			userCache[createdBy] = info
-		}
-
-		objName := filePath
-		if idx := strings.LastIndex(filePath, "/"); idx >= 0 && idx < len(filePath)-1 {
-			objName = filePath[idx+1:]
-		}
+	for _, row := range rows {
+		repoName := resolveAdminLinkRepoName(h.db.Session(), libNameCache, orgID, row.LibraryID, row.RepoName)
+		creatorEmail, creatorName := resolveAdminLinkCreatorInfo(h.db.Session(), userCache, orgID, row.CreatedBy, row.CreatorEmail, row.CreatorName)
+		objName := resolveAdminLinkObjName(row.ObjName, row.FilePath, repoName)
 
 		isExpired := false
 		expireDateStr := ""
-		if expiresAt != nil && !expiresAt.IsZero() {
-			isExpired = expiresAt.Before(time.Now())
-			expireDateStr = expiresAt.Format(time.RFC3339)
+		if row.ExpiresAt != nil && !row.ExpiresAt.IsZero() {
+			isExpired = row.ExpiresAt.Before(time.Now())
+			expireDateStr = row.ExpiresAt.Format(time.RFC3339)
 		}
-		if !filters.MatchesState(active, isExpired) {
+		if !filters.MatchesState(row.Active, isExpired) {
 			continue
 		}
 
-		repoName, ok := libNameCache[libID]
-		if !ok {
-			h.db.Session().Query(`SELECT name FROM libraries WHERE org_id = ? AND library_id = ?`, orgID, libID).Scan(&repoName)
-			if repoName == "" {
-				repoName = "Unknown Library"
-			}
-			libNameCache[libID] = repoName
-		}
-
-		uploadLinkURL := fmt.Sprintf("%s/u/d/%s", getBrowserURL(c, ""), token)
-		count := 0
-		if uploadCount != nil {
-			count = *uploadCount
-		}
-
+		uploadLinkURL := fmt.Sprintf("%s/u/d/%s", getBrowserURL(c, ""), row.Token)
 		status := "active"
-		if !active {
+		if !row.Active {
 			status = "inactive"
 		}
-		if !filters.MatchesSearch(objName, token, filePath, repoName, info[0], info[1], uploadLinkURL) {
+		if !filters.MatchesSearch(objName, row.Token, row.FilePath, repoName, creatorEmail, creatorName, uploadLinkURL) {
 			continue
 		}
 
 		links = append(links, gin.H{
 			"obj_name":      objName,
-			"path":          filePath,
-			"token":         token,
+			"path":          row.FilePath,
+			"token":         row.Token,
 			"link":          uploadLinkURL,
-			"repo_id":       libID,
+			"repo_id":       row.LibraryID,
 			"repo_name":     repoName,
-			"creator_email": info[0],
-			"creator_name":  info[1],
-			"ctime":         createdAt.Format(time.RFC3339),
-			"view_cnt":      count,
+			"creator_email": creatorEmail,
+			"creator_name":  creatorName,
+			"ctime":         row.CreatedAt.Format(time.RFC3339),
+			"view_cnt":      row.UploadCount,
 			"expire_date":   expireDateStr,
 			"is_expired":    isExpired,
-			"active":        active,
+			"active":        row.Active,
 			"status":        status,
-			"has_password":  hasPassword,
+			"has_password":  row.HasPassword,
 		})
-	}
-	if err := iter.Close(); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list upload links"})
-		return
 	}
 
 	if links == nil {

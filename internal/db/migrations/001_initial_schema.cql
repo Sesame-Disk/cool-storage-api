@@ -219,24 +219,6 @@ CREATE TABLE IF NOT EXISTS share_links_by_creator (
     PRIMARY KEY ((org_id, created_by), created_at, link_token)
 ) WITH CLUSTERING ORDER BY (created_at DESC, link_token ASC);
 
--- Admin panel view — all links in an org, ordered newest-first.
-CREATE TABLE IF NOT EXISTS share_links_by_org (
-    org_id       UUID,
-    created_at   TIMESTAMP,
-    link_token   TEXT,
-    link_type    TEXT,
-    library_id   UUID,
-    file_path    TEXT,
-    created_by   UUID,
-    permission   TEXT,
-    expires_at   TIMESTAMP,
-    has_password BOOLEAN,
-    active       BOOLEAN,
-    view_count   INT,
-    upload_count INT,
-    PRIMARY KEY ((org_id), created_at, link_token)
-) WITH CLUSTERING ORDER BY (created_at DESC, link_token ASC);
-
 -- Orphan cleanup: enumerate all links for a library on permanent delete.
 CREATE TABLE IF NOT EXISTS share_links_by_library (
     org_id     UUID,
@@ -247,6 +229,64 @@ CREATE TABLE IF NOT EXISTS share_links_by_library (
     created_at TIMESTAMP,
     PRIMARY KEY ((org_id, library_id), link_token)
 );
+
+-- Admin/global read models for share and upload links.
+CREATE TABLE IF NOT EXISTS admin_links_by_created (
+    link_type      TEXT,
+    bucket_day     TEXT,
+    created_at     TIMESTAMP,
+    org_id         UUID,
+    link_token     TEXT,
+    library_id     UUID,
+    repo_name      TEXT,
+    file_path      TEXT,
+    obj_name       TEXT,
+    created_by     UUID,
+    creator_email  TEXT,
+    creator_name   TEXT,
+    permission     TEXT,
+    expires_at     TIMESTAMP,
+    has_password   BOOLEAN,
+    active         BOOLEAN,
+    view_count     INT,
+    upload_count   INT,
+    PRIMARY KEY ((link_type, bucket_day), created_at, org_id, link_token)
+) WITH CLUSTERING ORDER BY (created_at DESC, org_id ASC, link_token ASC);
+
+CREATE TABLE IF NOT EXISTS admin_link_buckets (
+    link_type   TEXT,
+    bucket_day  TEXT,
+    PRIMARY KEY (link_type, bucket_day)
+) WITH CLUSTERING ORDER BY (bucket_day DESC);
+
+CREATE TABLE IF NOT EXISTS admin_links_by_org_created (
+    org_id         UUID,
+    link_type      TEXT,
+    bucket_day     TEXT,
+    created_at     TIMESTAMP,
+    link_token     TEXT,
+    library_id     UUID,
+    repo_name      TEXT,
+    file_path      TEXT,
+    obj_name       TEXT,
+    created_by     UUID,
+    creator_email  TEXT,
+    creator_name   TEXT,
+    permission     TEXT,
+    expires_at     TIMESTAMP,
+    has_password   BOOLEAN,
+    active         BOOLEAN,
+    view_count     INT,
+    upload_count   INT,
+    PRIMARY KEY ((org_id, link_type, bucket_day), created_at, link_token)
+) WITH CLUSTERING ORDER BY (created_at DESC, link_token ASC);
+
+CREATE TABLE IF NOT EXISTS admin_link_buckets_by_org (
+    org_id       UUID,
+    link_type    TEXT,
+    bucket_day   TEXT,
+    PRIMARY KEY ((org_id, link_type), bucket_day)
+) WITH CLUSTERING ORDER BY (bucket_day DESC);
 
 -- ─── Shares (user-to-user) ───────────────────────────────────────────────────
 

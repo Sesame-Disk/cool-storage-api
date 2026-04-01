@@ -297,7 +297,7 @@ func invalidateOrgSessions(dbSess interface{ Session() *gocql.Session }, si Sess
 }
 
 // setUserShareLinksActive toggles the `active` flag on all share links created by a user.
-// Updates 3 tables: share_links (primary), share_links_by_creator, share_links_by_org.
+// Updates the primary row, share_links_by_creator and the admin read models.
 // Used when a user is deactivated/deleted (active=false) or reactivated (active=true).
 func setUserShareLinksActive(db interface{ Session() *gocql.Session }, orgID, userID string, active bool) {
 	type link struct {
@@ -329,8 +329,6 @@ func setUserShareLinksActive(db interface{ Session() *gocql.Session }, orgID, us
 			batch.Query(`UPDATE share_links SET active = ? WHERE link_token = ?`, active, lk.token)
 			batch.Query(`UPDATE share_links_by_creator SET active = ? WHERE org_id = ? AND created_by = ? AND created_at = ? AND link_token = ?`,
 				active, orgID, userID, lk.createdAt, lk.token)
-			batch.Query(`UPDATE share_links_by_org SET active = ? WHERE org_id = ? AND created_at = ? AND link_token = ?`,
-				active, orgID, lk.createdAt, lk.token)
 			dbpkg.AddUpdateAdminLinkActiveQuery(batch, lk.linkType, lk.createdAt, orgID, lk.token, active)
 		}
 		if err := batch.Exec(); err != nil {
@@ -340,27 +338,13 @@ func setUserShareLinksActive(db interface{ Session() *gocql.Session }, orgID, us
 }
 
 // setOrgShareLinksActive toggles the `active` flag on all share links in an org.
-// Updates 3 tables: share_links (primary), share_links_by_creator, share_links_by_org.
+// Uses the org admin read model to enumerate links, then updates canonical rows.
 // Used when an org is deactivated/deleted (active=false) or reactivated (active=true).
 func setOrgShareLinksActive(db interface{ Session() *gocql.Session }, orgID string, active bool) {
-	type link struct {
-		linkType  string
-		token     string
-		createdBy string
-		createdAt time.Time
-	}
-	iter := db.Session().Query(
-		`SELECT link_type, link_token, created_by, created_at FROM share_links_by_org WHERE org_id = ?`,
-		orgID,
-	).Iter()
-
-	var links []link
-	var l link
-	for iter.Scan(&l.linkType, &l.token, &l.createdBy, &l.createdAt) {
-		links = append(links, l)
-	}
-	if err := iter.Close(); err != nil {
-		log.Printf("[setOrgShareLinksActive] iter close: %v", err)
+	links, err := dbpkg.ListAdminOrgLinkIndexRows(db.Session(), orgID)
+	if err != nil {
+		log.Printf("[setOrgShareLinksActive] list links: %v", err)
+		return
 	}
 
 	for i := 0; i < len(links); i += 25 {
@@ -370,12 +354,10 @@ func setOrgShareLinksActive(db interface{ Session() *gocql.Session }, orgID stri
 		}
 		batch := db.Session().Batch(gocql.UnloggedBatch)
 		for _, lk := range links[i:end] {
-			batch.Query(`UPDATE share_links SET active = ? WHERE link_token = ?`, active, lk.token)
+			batch.Query(`UPDATE share_links SET active = ? WHERE link_token = ?`, active, lk.Token)
 			batch.Query(`UPDATE share_links_by_creator SET active = ? WHERE org_id = ? AND created_by = ? AND created_at = ? AND link_token = ?`,
-				active, orgID, lk.createdBy, lk.createdAt, lk.token)
-			batch.Query(`UPDATE share_links_by_org SET active = ? WHERE org_id = ? AND created_at = ? AND link_token = ?`,
-				active, orgID, lk.createdAt, lk.token)
-			dbpkg.AddUpdateAdminLinkActiveQuery(batch, lk.linkType, lk.createdAt, orgID, lk.token, active)
+				active, orgID, lk.CreatedBy, lk.CreatedAt, lk.Token)
+			dbpkg.AddUpdateAdminLinkActiveQuery(batch, lk.LinkType, lk.CreatedAt, orgID, lk.Token, active)
 		}
 		if err := batch.Exec(); err != nil {
 			log.Printf("[setOrgShareLinksActive] batch exec: %v", err)
@@ -397,8 +379,6 @@ func deleteConsumedShareLink(db interface{ Session() *gocql.Session }, token, or
 	batch.Query(`DELETE FROM share_links WHERE link_token = ?`, token)
 	batch.Query(`DELETE FROM share_links_by_creator WHERE org_id = ? AND created_by = ? AND created_at = ? AND link_token = ?`,
 		orgID, createdBy, createdAt, token)
-	batch.Query(`DELETE FROM share_links_by_org WHERE org_id = ? AND created_at = ? AND link_token = ?`,
-		orgID, createdAt, token)
 	batch.Query(`DELETE FROM share_links_by_library WHERE org_id = ? AND library_id = ? AND link_token = ?`,
 		orgID, libraryID, token)
 	dbpkg.AddDeleteAdminLinkReadModelQuery(batch, linkType, createdAt, orgID, token)
@@ -458,12 +438,6 @@ func incrementShareLinkCounterDualWrite(db interface{ Session() *gocql.Session }
 		WHERE org_id = ? AND created_by = ? AND created_at = ? AND link_token = ?
 	`, viewCount, downloadCount, uploadCount, touchedAt, orgID, createdBy, createdAt, token)
 
-	// share_links_by_org stores only view_count and upload_count (no download_count column).
-	batch.Query(`
-		UPDATE share_links_by_org
-		SET view_count = ?, upload_count = ?
-		WHERE org_id = ? AND created_at = ? AND link_token = ?
-	`, viewCount, uploadCount, orgID, createdAt, token)
 	dbpkg.AddUpdateAdminLinkCountersQuery(batch, linkType, createdAt, orgID, token, viewCount, uploadCount)
 
 	return batch.Exec()

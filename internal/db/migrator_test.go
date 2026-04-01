@@ -111,6 +111,11 @@ func TestInitialSchemaContainsLookupNameAndStarredIndex(t *testing.T) {
 
 	assert.Contains(t, content, "name              TEXT,")
 	assert.Contains(t, content, "CREATE INDEX IF NOT EXISTS starred_files_by_repo ON starred_files (repo_id);")
+	assert.Contains(t, content, "CREATE TABLE IF NOT EXISTS admin_links_by_created")
+	assert.Contains(t, content, "CREATE TABLE IF NOT EXISTS admin_links_by_org_created")
+	assert.Contains(t, content, "CREATE TABLE IF NOT EXISTS admin_link_buckets")
+	assert.Contains(t, content, "CREATE TABLE IF NOT EXISTS admin_link_buckets_by_org")
+	assert.NotContains(t, content, "CREATE TABLE IF NOT EXISTS share_links_by_org")
 }
 
 func TestAdminReadModelMigrationsExist(t *testing.T) {
@@ -119,11 +124,7 @@ func TestAdminReadModelMigrationsExist(t *testing.T) {
 		contains []string
 	}{
 		{
-			filePath: "migrations/002_admin_links_read_models.cql",
-			contains: []string{"CREATE TABLE IF NOT EXISTS admin_links_by_created", "bucket_day     TEXT"},
-		},
-		{
-			filePath: "migrations/003_library_admin_read_models.cql",
+			filePath: "migrations/002_library_admin_read_models.cql",
 			contains: []string{
 				"CREATE TABLE IF NOT EXISTS libraries_by_owner",
 				"CREATE TABLE IF NOT EXISTS libraries_by_org_updated",
@@ -132,7 +133,7 @@ func TestAdminReadModelMigrationsExist(t *testing.T) {
 			},
 		},
 		{
-			filePath: "migrations/004_group_share_read_models.cql",
+			filePath: "migrations/003_group_share_read_models.cql",
 			contains: []string{"CREATE TABLE IF NOT EXISTS shares_by_group", "CREATE TABLE IF NOT EXISTS shares_by_user_org"},
 		},
 	}

@@ -80,7 +80,7 @@ Organizations:
 When a user or org is deactivated/deleted, the helper functions trigger these side effects in a background goroutine:
 
 1. **Session invalidation** — `InvalidateUserSessions()` reads all `token_hash` from `sessions_by_user`, batch-deletes from both `sessions` and `sessions_by_user`, and evicts from in-memory cache.
-2. **Share link disable** — `setUserShareLinksActive(false)` / `setOrgShareLinksActive(false)` sets `active=false` on all share links across 3 tables (`share_links`, `share_links_by_creator`, `share_links_by_org`).
+2. **Share link disable** — `setUserShareLinksActive(false)` / `setOrgShareLinksActive(false)` sets `active=false` on canonical link rows and the admin read models.
 
 On reactivation/restore, step 2 is reversed (`active=true`). Sessions are not restored — the user must log in again.
 

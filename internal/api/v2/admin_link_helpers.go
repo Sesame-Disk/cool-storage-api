@@ -5,7 +5,10 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
+	db "github.com/Sesame-Disk/sesamefs/internal/db"
+	gocql "github.com/apache/cassandra-gocql-driver/v2"
 	"github.com/gin-gonic/gin"
 )
 
@@ -200,4 +203,185 @@ func sortAdminLinks(links []gin.H, sortBy, direction string) {
 		}
 		return vi < vj
 	})
+}
+
+type adminLinkProjectionRow struct {
+	Token        string
+	OrgID        string
+	LibraryID    string
+	RepoName     string
+	FilePath     string
+	ObjName      string
+	CreatedBy    string
+	CreatorEmail string
+	CreatorName  string
+	Permission   string
+	ExpiresAt    *time.Time
+	HasPassword  bool
+	Active       bool
+	ViewCount    int
+	UploadCount  int
+	CreatedAt    time.Time
+}
+
+func listAdminLinkBuckets(session *gocql.Session, linkType string) ([]string, error) {
+	iter := session.Query(`SELECT bucket_day FROM admin_link_buckets WHERE link_type = ?`, linkType).Iter()
+	var buckets []string
+	var bucketDay string
+	for iter.Scan(&bucketDay) {
+		buckets = append(buckets, bucketDay)
+	}
+	if err := iter.Close(); err != nil {
+		return nil, err
+	}
+	return buckets, nil
+}
+
+func listAdminLinkBucketsByOrg(session *gocql.Session, orgID, linkType string) ([]string, error) {
+	iter := session.Query(`SELECT bucket_day FROM admin_link_buckets_by_org WHERE org_id = ? AND link_type = ?`, orgID, linkType).Iter()
+	var buckets []string
+	var bucketDay string
+	for iter.Scan(&bucketDay) {
+		buckets = append(buckets, bucketDay)
+	}
+	if err := iter.Close(); err != nil {
+		return nil, err
+	}
+	return buckets, nil
+}
+
+func listAdminLinkProjectionRows(session *gocql.Session, linkType string) ([]adminLinkProjectionRow, error) {
+	buckets, err := listAdminLinkBuckets(session, linkType)
+	if err != nil {
+		return nil, err
+	}
+	var rows []adminLinkProjectionRow
+	for _, bucketDay := range buckets {
+		iter := session.Query(`
+			SELECT org_id, link_token, library_id, repo_name, file_path, obj_name,
+			       created_by, creator_email, creator_name, permission, expires_at,
+			       has_password, active, view_count, upload_count, created_at
+			FROM admin_links_by_created
+			WHERE link_type = ? AND bucket_day = ?
+		`, linkType, bucketDay).Iter()
+
+		var row adminLinkProjectionRow
+		for iter.Scan(
+			&row.OrgID,
+			&row.Token,
+			&row.LibraryID,
+			&row.RepoName,
+			&row.FilePath,
+			&row.ObjName,
+			&row.CreatedBy,
+			&row.CreatorEmail,
+			&row.CreatorName,
+			&row.Permission,
+			&row.ExpiresAt,
+			&row.HasPassword,
+			&row.Active,
+			&row.ViewCount,
+			&row.UploadCount,
+			&row.CreatedAt,
+		) {
+			rows = append(rows, row)
+			row = adminLinkProjectionRow{}
+		}
+		if err := iter.Close(); err != nil {
+			return nil, err
+		}
+	}
+	return rows, nil
+}
+
+func listAdminLinkProjectionRowsByOrg(session *gocql.Session, orgID, linkType string) ([]adminLinkProjectionRow, error) {
+	buckets, err := listAdminLinkBucketsByOrg(session, orgID, linkType)
+	if err != nil {
+		return nil, err
+	}
+	var rows []adminLinkProjectionRow
+	for _, bucketDay := range buckets {
+		iter := session.Query(`
+			SELECT link_token, library_id, repo_name, file_path, obj_name,
+			       created_by, creator_email, creator_name, permission, expires_at,
+			       has_password, active, view_count, upload_count, created_at
+			FROM admin_links_by_org_created
+			WHERE org_id = ? AND link_type = ? AND bucket_day = ?
+		`, orgID, linkType, bucketDay).Iter()
+
+		var row adminLinkProjectionRow
+		for iter.Scan(
+			&row.Token,
+			&row.LibraryID,
+			&row.RepoName,
+			&row.FilePath,
+			&row.ObjName,
+			&row.CreatedBy,
+			&row.CreatorEmail,
+			&row.CreatorName,
+			&row.Permission,
+			&row.ExpiresAt,
+			&row.HasPassword,
+			&row.Active,
+			&row.ViewCount,
+			&row.UploadCount,
+			&row.CreatedAt,
+		) {
+			row.OrgID = orgID
+			rows = append(rows, row)
+			row = adminLinkProjectionRow{}
+		}
+		if err := iter.Close(); err != nil {
+			return nil, err
+		}
+	}
+	return rows, nil
+}
+
+func resolveAdminLinkRepoName(session *gocql.Session, cache map[string]string, orgID, libraryID, projected string) string {
+	cacheKey := orgID + ":" + libraryID
+	if repoName, ok := cache[cacheKey]; ok {
+		return repoName
+	}
+	var repoName string
+	_ = session.Query(`SELECT name FROM libraries WHERE org_id = ? AND library_id = ?`, orgID, libraryID).Scan(&repoName)
+	if strings.TrimSpace(repoName) == "" {
+		repoName = strings.TrimSpace(projected)
+	}
+	if repoName == "" {
+		repoName = "Unknown Library"
+	}
+	cache[cacheKey] = repoName
+	return repoName
+}
+
+func resolveAdminLinkCreatorInfo(session *gocql.Session, cache map[string][2]string, orgID, createdBy, projectedEmail, projectedName string) (string, string) {
+	cacheKey := orgID + ":" + createdBy
+	if info, ok := cache[cacheKey]; ok {
+		return info[0], info[1]
+	}
+	var creatorEmail, creatorName string
+	_ = session.Query(`SELECT email, name FROM users WHERE org_id = ? AND user_id = ?`, orgID, createdBy).Scan(&creatorEmail, &creatorName)
+	if strings.TrimSpace(creatorEmail) == "" {
+		creatorEmail = strings.TrimSpace(projectedEmail)
+	}
+	if strings.TrimSpace(creatorName) == "" {
+		creatorName = strings.TrimSpace(projectedName)
+	}
+	if creatorEmail == "" {
+		creatorEmail = createdBy
+	}
+	if creatorName == "" {
+		creatorName = creatorEmail
+	}
+	info := [2]string{creatorEmail, creatorName}
+	cache[cacheKey] = info
+	return info[0], info[1]
+}
+
+func resolveAdminLinkObjName(projectedObjName, filePath, repoName string) string {
+	if strings.TrimSpace(projectedObjName) != "" {
+		return projectedObjName
+	}
+	return db.AdminLinkObjName(filePath, repoName)
 }

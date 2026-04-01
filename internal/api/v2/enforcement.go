@@ -30,47 +30,26 @@ func GetOrgEnforcement(database *db.DB, orgID string, cfg *config.Config) OrgEnf
 }
 
 // CountActiveShareLinks counts active share links (link_type="share") for an org.
-// Uses the share_links_by_org table (partition by org_id).
 func CountActiveShareLinks(database *db.DB, orgID string) int {
-	orgUUID, err := gocql.ParseUUID(orgID)
+	if _, err := gocql.ParseUUID(orgID); err != nil {
+		return 0
+	}
+	count, err := db.CountActiveAdminOrgLinks(database.Session(), orgID, "share")
 	if err != nil {
 		return 0
 	}
-	iter := database.Session().Query(
-		`SELECT link_type, active FROM share_links_by_org WHERE org_id = ?`, orgUUID,
-	).Iter()
-
-	var linkType string
-	var active bool
-	count := 0
-	for iter.Scan(&linkType, &active) {
-		if linkType == "share" && active {
-			count++
-		}
-	}
-	iter.Close()
 	return count
 }
 
 // CountActiveUploadLinks counts active upload links (link_type="upload") for an org.
 func CountActiveUploadLinks(database *db.DB, orgID string) int {
-	orgUUID, err := gocql.ParseUUID(orgID)
+	if _, err := gocql.ParseUUID(orgID); err != nil {
+		return 0
+	}
+	count, err := db.CountActiveAdminOrgLinks(database.Session(), orgID, "upload")
 	if err != nil {
 		return 0
 	}
-	iter := database.Session().Query(
-		`SELECT link_type, active FROM share_links_by_org WHERE org_id = ?`, orgUUID,
-	).Iter()
-
-	var linkType string
-	var active bool
-	count := 0
-	for iter.Scan(&linkType, &active) {
-		if linkType == "upload" && active {
-			count++
-		}
-	}
-	iter.Close()
 	return count
 }
 

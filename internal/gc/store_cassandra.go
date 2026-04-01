@@ -623,12 +623,12 @@ func (s *CassandraStore) ListLibrariesWithAutoDelete() ([]LibraryAutoDeleteInfo,
 // --- Share link deletion ---
 
 func (s *CassandraStore) DeleteShareLink(shareToken string, fallbackOrgID uuid.UUID, fallbackLibraryID uuid.UUID) error {
-	// Read clustering keys from primary table for quad-delete
-	var orgID, createdBy, libraryID string
+	// Read clustering keys from primary table for canonical delete + projection cleanup
+	var orgID, createdBy, libraryID, linkType string
 	var createdAt time.Time
 	err := s.db.Session().Query(`
-		SELECT org_id, created_by, library_id, created_at FROM share_links WHERE link_token = ?
-	`, shareToken).Scan(&orgID, &createdBy, &libraryID, &createdAt)
+		SELECT org_id, created_by, library_id, created_at, link_type FROM share_links WHERE link_token = ?
+	`, shareToken).Scan(&orgID, &createdBy, &libraryID, &createdAt, &linkType)
 	if err != nil {
 		// Primary record is gone. Attempt defensive cleanup of index tables
 		// using the fallback org/library IDs from the queue item. This prevents
@@ -641,15 +641,14 @@ func (s *CassandraStore) DeleteShareLink(shareToken string, fallbackOrgID uuid.U
 		return nil
 	}
 
-	// Quad-delete from all 4 tables
+	// Delete canonical rows and admin projections.
 	batch := s.db.Session().Batch(gocql.LoggedBatch)
 	batch.Query(`DELETE FROM share_links WHERE link_token = ?`, shareToken)
 	batch.Query(`DELETE FROM share_links_by_creator WHERE org_id = ? AND created_by = ? AND created_at = ? AND link_token = ?`,
 		orgID, createdBy, createdAt, shareToken)
-	batch.Query(`DELETE FROM share_links_by_org WHERE org_id = ? AND created_at = ? AND link_token = ?`,
-		orgID, createdAt, shareToken)
 	batch.Query(`DELETE FROM share_links_by_library WHERE org_id = ? AND library_id = ? AND link_token = ?`,
 		orgID, libraryID, shareToken)
+	db.AddDeleteAdminLinkReadModelQuery(batch, linkType, createdAt, orgID, shareToken)
 	return batch.Exec()
 }
 
@@ -888,8 +887,6 @@ func (s *CassandraStore) DeleteShareLinksByLibrary(orgID, libraryID uuid.UUID) (
 		batch.Query(`DELETE FROM share_links WHERE link_token = ?`, link.token)
 		batch.Query(`DELETE FROM share_links_by_creator WHERE org_id = ? AND created_by = ? AND created_at = ? AND link_token = ?`,
 			orgID.String(), link.createdBy, link.createdAt, link.token)
-		batch.Query(`DELETE FROM share_links_by_org WHERE org_id = ? AND created_at = ? AND link_token = ?`,
-			orgID.String(), link.createdAt, link.token)
 		batch.Query(`DELETE FROM share_links_by_library WHERE org_id = ? AND library_id = ? AND link_token = ?`,
 			orgID.String(), libraryID.String(), link.token)
 		db.AddDeleteAdminLinkReadModelQuery(batch, link.linkType, link.createdAt, orgID.String(), link.token)
