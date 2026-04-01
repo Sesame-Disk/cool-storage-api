@@ -6,12 +6,70 @@ SesameFS uses Apache Cassandra for metadata storage. This document explains each
 
 ---
 
+## Schema Migrations
+
+### System overview
+
+Migrations are managed by `internal/db/migrator.go` using versioned `.cql` files embedded in the binary at compile time. Applied migrations are tracked in the `schema_migrations` table with SHA-256 checksums.
+
+```
+internal/db/migrations/
+  001_initial_schema.cql   ← complete baseline schema (50 tables)
+  NNN_description.cql      ← future incremental changes
+```
+
+### Tracking table
+
+```cql
+CREATE TABLE IF NOT EXISTS schema_migrations (
+    version    INT PRIMARY KEY,
+    name       TEXT,
+    applied_at TIMESTAMP,
+    checksum   TEXT        -- SHA-256 of the .cql file; mismatch = startup failure
+);
+```
+
+### How it works
+
+| Scenario | Behaviour |
+|----------|-----------|
+| Fresh install | Applies migrations in version order |
+| Existing DB (first deploy of new system) | Detects legacy tables → stamps all migrations as applied without executing |
+| Normal restart | Skips already-applied migrations; applies any new ones |
+| Modified migration file | Checksum mismatch → server refuses to boot |
+| Failed statement | Migration is not stamped → retried on next startup |
+
+### Adding a new migration
+
+1. Create `internal/db/migrations/NNN_description.cql` with the new CQL statements.
+2. Deploy — the migration runs automatically on startup.
+3. **Never edit a migration file after it has been applied.** Create a new numbered file instead.
+
+### CLI commands
+
+```bash
+sesamefs migrate               # apply pending migrations + seed (normal operation)
+sesamefs migrate --status      # show applied/pending table with checksums
+sesamefs migrate --dry-run     # list pending migrations without applying them
+sesamefs migrate --check       # exit non-zero if any migration is pending (CI)
+```
+
+### Key files
+
+| File | Purpose |
+|------|---------|
+| `internal/db/migrator.go` | `Migrator` — `Run()`, `Status()`, `DryRun()`, `Check()` |
+| `internal/db/migrations/*.cql` | Versioned schema files (embedded in binary) |
+| `internal/db/db.go` | `DB.Migrate()` — calls runner + idempotent Go backfills |
+
+---
+
 ## Database Seeding / Bootstrap
 
 ### Problem Statement
 
 **Current Issue**: The database schema exists but contains no user records. When the application starts:
-- ✅ Tables are created via migrations
+- ✅ Tables are created via the versioned migration system (`sesamefs migrate`)
 - ❌ No default organization exists
 - ❌ No default admin user exists
 - ❌ Permission middleware fails (queries empty `users` table)
@@ -203,7 +261,7 @@ admin@sesamefs.local   | 00000000-0000-0000-0000-000000000001 | 00000000-0000-00
 
 ---
 
-## Current Tables (24 in schema, 24 in DB)
+## Current Tables (50 in schema — see `internal/db/migrations/001_initial_schema.cql`)
 
 ### 1. `organizations`
 **Purpose:** Multi-tenant organization/company records

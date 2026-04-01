@@ -175,50 +175,51 @@ directly. The existing logic moves, it does not change.
 
 ---
 
-### 4. Robust Database Migration System
+### 4. Robust Database Migration System ✅ DONE (2026-04-01)
 
-**Current state:** All migrations are inline string arrays in `internal/db/db.go`, executed at
-every startup. There is no version registry, no checksum validation, no rollback capability,
-and no way to know which migrations have been applied to a given instance. `ALTER TABLE`
-statements that fail (e.g., column already exists) are silently ignored.
+**Implemented:** Versioned CQL migration system with checksum validation, legacy-database
+bootstrap, and CLI tooling.
 
-**Problems for production:**
-- No audit trail of what schema version is running in any given environment.
-- A migration that partially fails leaves the database in an unknown state with no alert.
-- In a multi-region deployment, there is no mechanism to verify that all regions are on the
-  same schema version.
-- Rolling back a bad migration has no automated support — requires manual CQL intervention.
-- The current silent-ignore behavior masks real errors during schema evolution.
-
-**Proposed solution:**
+**What was built:**
 
 ```
 internal/db/migrations/
-  001_initial_schema.cql       ← current CREATE TABLE statements
-  002_add_status_columns.cql   ← current ALTER TABLE statements
-  003_add_traffic_tables.cql
-  ...
-  NNN_description.cql
+  001_initial_schema.cql   ← full current schema (all 50 tables, all columns)
+  NNN_description.cql      ← future migrations go here
 
-Cassandra table: schema_migrations
-  version    int          PRIMARY KEY
-  name       text
-  applied_at timestamp
-  checksum   text         ← SHA-256 of the .cql file contents
+internal/db/migrator.go    ← migration runner (go:embed, checksum validation)
+internal/db/db.go          ← stripped of all inline consts; Migrate() delegates to runner
 ```
 
-**Migration runner (`internal/db/migrator.go`):**
-- Reads all `.cql` files in `migrations/` sorted by number prefix.
-- Compares against `schema_migrations` in the database.
-- Applies only pending migrations, in order, within a logged batch where possible.
-- Records each applied migration with timestamp and checksum.
-- **Fails at startup** (non-zero exit) if a previously-applied migration's checksum no longer
-  matches its file — prevents silent drift after post-application edits.
-- Supports a `--dry-run` flag that reports pending migrations without applying them.
-- Supports a `--check` flag (suitable for CI) that exits non-zero if any migration is pending.
+**`schema_migrations` tracking table (created automatically):**
+```
+version    INT PRIMARY KEY
+name       TEXT
+applied_at TIMESTAMP
+checksum   TEXT   ← SHA-256 of the .cql file; mismatch = startup failure
+```
 
-**Migration:** The current inline CQL statements in `db.go` become the first numbered `.cql`
-files. No schema changes are needed — this is purely a reorganization of the runner.
+**Key behaviours:**
+- Migration files are embedded in the binary at compile time (`//go:embed migrations/*.cql`).
+- Applied migrations are tracked with SHA-256 checksums. If a file is edited after application
+  the server **refuses to boot** — prevents silent schema drift.
+- **Legacy bootstrap**: if `schema_migrations` is empty but `organizations` already exists,
+  all known migrations are stamped as applied without execution. Existing deployments upgrade
+  safely on first deploy.
+- A failed statement leaves the migration un-stamped; it will be retried on the next startup.
+
+**CLI flags (`sesamefs migrate`):**
+```
+sesamefs migrate               # apply pending + seed (normal operation)
+sesamefs migrate --status      # print applied/pending table with checksums
+sesamefs migrate --dry-run     # list pending migrations without applying
+sesamefs migrate --check       # exit non-zero if any migrations are pending (CI)
+```
+
+**Adding a new migration:**
+1. Create `internal/db/migrations/NNN_description.cql` with the CQL statements.
+2. Deploy the new binary — it applies the migration automatically on startup.
+3. Never edit a migration file after it has been applied; create a new numbered file instead.
 
 ---
 
@@ -536,7 +537,7 @@ the launch on Glacier since it requires AWS Glacier infrastructure setup and tes
 | 1 | Accounts ↔ SesameFS Phase 2 | **P0** | Phase 1 done, Phase 2 pending | 2–3 weeks |
 | 2 | Go code reorganization | **P0** | Not started | 3–4 weeks |
 | 3 | Frontend/Backend separation + Nginx | **P0** | ✅ DONE (2026-03-30/31) | — |
-| 4 | Robust DB migration system | **P0** | Not started | 1 week |
+| 4 | Robust DB migration system | **P0** | ✅ DONE (2026-04-01) | — |
 | 5 | Storage classes & multi-region | **P1** | Infra ready, ~30% | 2 weeks |
 | 6 | Antivirus / malware scanning | **P1** | 0% | 1–2 weeks |
 | 7 | Enforcement Phase 2 wire-up | **P1** | Resolver ready, not wired | 1 week |
@@ -551,9 +552,9 @@ the launch on Glacier since it requires AWS Glacier infrastructure setup and tes
 
 ## Recommended Execution Order
 
-### Sprint 1 — Infrastructure Foundation
-- [#4] DB migration system — enables safe schema changes for all subsequent work
-- [#3] Frontend/backend separation + Nginx — unblocks independent deploys
+### Sprint 1 — Infrastructure Foundation ✅ COMPLETE
+- [#3] ✅ Frontend/backend separation + Nginx — DONE (2026-03-30/31)
+- [#4] ✅ DB migration system — DONE (2026-04-01)
 
 ### Sprint 2 — Code Quality + Security Baseline
 - [#2] Go code reorganization — start with the four largest files
@@ -584,7 +585,9 @@ the launch on Glacier since it requires AWS Glacier infrastructure setup and tes
 | `internal/api/v2/enforcement.go` | Quota counters for enforcement checks |
 | `internal/traffic/checker.go` | Storage and traffic quota checks |
 | `internal/traffic/recorder.go` | Traffic recording (upload/download) |
-| `internal/db/db.go` | Current inline migrations — migrate to runner |
+| `internal/db/db.go` | DB connection bootstrap + `Migrate()` entry point |
+| `internal/db/migrator.go` | Migration runner — `Run()`, `Status()`, `DryRun()`, `Check()` |
+| `internal/db/migrations/` | CQL migration files (embedded in binary at compile time) |
 | `internal/api/server.go` | Frontend serving logic to remove |
 | `nginx/nginx.conf.template` | Base for updated Nginx architecture |
 | `docker-compose.prod.yml` | Starting point for production deployment |

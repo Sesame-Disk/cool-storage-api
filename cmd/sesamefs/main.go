@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"flag"
 	"fmt"
 	"log/slog"
 	"os"
@@ -111,6 +112,12 @@ func runHealthCheck() {
 }
 
 func runMigrations() {
+	fs := flag.NewFlagSet("migrate", flag.ExitOnError)
+	dryRun := fs.Bool("dry-run", false, "Print pending migrations without applying them")
+	check := fs.Bool("check", false, "Exit non-zero if any migrations are pending (for CI)")
+	status := fs.Bool("status", false, "Print the applied/pending status of all migrations")
+	fs.Parse(os.Args[2:]) //nolint:errcheck // ExitOnError handles errors
+
 	cfg, err := config.Load()
 	if err != nil {
 		slog.Error("Failed to load configuration", "error", err)
@@ -126,18 +133,63 @@ func runMigrations() {
 	}
 	defer database.Close()
 
-	slog.Info("Running database migrations...")
-	if err := database.Migrate(); err != nil {
-		slog.Error("Migration failed", "error", err)
-		os.Exit(1)
-	}
-	slog.Info("Migrations completed successfully")
+	migrator := db.NewMigrator(database.Session())
 
-	// Seed database with default data (idempotent)
-	slog.Info("Seeding database with default data...")
-	if err := database.SeedDatabase(cfg, cfg.Auth.DevMode, cfg.Auth.FirstSuperAdminEmail); err != nil {
-		slog.Error("Failed to seed database", "error", err)
-		os.Exit(1)
+	switch {
+	case *status:
+		statuses, err := migrator.Status()
+		if err != nil {
+			slog.Error("Failed to read migration status", "error", err)
+			os.Exit(1)
+		}
+		fmt.Printf("%-6s %-40s %-26s %s\n", "VER", "NAME", "APPLIED AT", "CHECKSUM")
+		fmt.Println("──────────────────────────────────────────────────────────────────────────────────────")
+		for _, s := range statuses {
+			applied := "pending"
+			appliedAt := ""
+			if s.Applied {
+				applied = "applied"
+				appliedAt = s.AppliedAt.Format("2006-01-02 15:04:05 UTC")
+			}
+			fmt.Printf("%-6d %-40s %-26s %s  [%s]\n",
+				s.Version, s.Name, appliedAt, s.Checksum[:12]+"…", applied)
+		}
+
+	case *dryRun:
+		pending, err := migrator.DryRun()
+		if err != nil {
+			slog.Error("Failed to compute pending migrations", "error", err)
+			os.Exit(1)
+		}
+		if len(pending) == 0 {
+			fmt.Println("No pending migrations.")
+			return
+		}
+		fmt.Printf("%d pending migration(s):\n", len(pending))
+		for _, mf := range pending {
+			fmt.Printf("  %03d_%s\n", mf.Version, mf.Name)
+		}
+
+	case *check:
+		if err := migrator.Check(); err != nil {
+			fmt.Fprintln(os.Stderr, "schema check failed:", err)
+			os.Exit(1)
+		}
+		fmt.Println("Schema is up to date.")
+
+	default:
+		slog.Info("Running database migrations...")
+		if err := database.Migrate(); err != nil {
+			slog.Error("Migration failed", "error", err)
+			os.Exit(1)
+		}
+		slog.Info("Migrations completed successfully")
+
+		slog.Info("Seeding database with default data...")
+		if err := database.SeedDatabase(cfg, cfg.Auth.DevMode, cfg.Auth.FirstSuperAdminEmail); err != nil {
+			slog.Error("Failed to seed database", "error", err)
+			os.Exit(1)
+		}
 	}
 }
 
