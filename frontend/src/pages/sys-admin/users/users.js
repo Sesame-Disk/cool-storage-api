@@ -56,7 +56,7 @@ class Users extends Component {
       const {
         currentPage, perPage,
         sortBy = '',
-        sortOrder = 'asc',
+        sortOrder = 'desc',
         statusFilter = 'all'
       } = this.state;
       this.setState({

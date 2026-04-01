@@ -21,7 +21,7 @@ class ShareLinks extends Component {
       currentPage: 1,
       hasNextPage: false,
       sortBy: '',
-      sortOrder: 'asc',
+      sortOrder: 'desc',
       activeFilter: 'all',
       expiredFilter: 'all',
       search: ''

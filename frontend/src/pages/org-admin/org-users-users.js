@@ -81,7 +81,7 @@ class OrgUsers extends Component {
       pageNext: false,
       statusFilter: 'all',
       sortBy: '',
-      sortOrder: 'asc',
+      sortOrder: 'desc',
       isShowAddOrgUserDialog: false,
       isImportOrgUsersDialogOpen: false,
       isInviteUserDialogOpen: false,

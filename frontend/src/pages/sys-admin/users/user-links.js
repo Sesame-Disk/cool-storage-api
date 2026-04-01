@@ -22,7 +22,7 @@ class Links extends Component {
       sharePageNext: false,
       sharePerPage: 25,
       shareSortBy: '',
-      shareSortOrder: 'asc',
+      shareSortOrder: 'desc',
       shareActiveFilter: 'all',
       shareExpiredFilter: 'all',
       uploadLoading: true,
@@ -32,7 +32,7 @@ class Links extends Component {
       uploadPageNext: false,
       uploadPerPage: 25,
       uploadSortBy: '',
-      uploadSortOrder: 'asc',
+      uploadSortOrder: 'desc',
       uploadActiveFilter: 'all',
       uploadExpiredFilter: 'all'
     };
