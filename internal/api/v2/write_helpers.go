@@ -58,7 +58,10 @@ func updateLibraryOwner(db interface{ Session() *gocql.Session }, orgID, library
 		UPDATE libraries_by_id SET owner_id = ?
 		WHERE library_id = ?
 	`, newOwnerID, libraryID)
-	return batch.Exec()
+	if err := batch.Exec(); err != nil {
+		return err
+	}
+	return dbpkg.SyncAdminLibraryReadModel(db.Session(), orgID, libraryID)
 }
 
 func createRepoAPIToken(db interface{ Session() *gocql.Session }, repoID, appName, apiToken, permission, generatedBy string, createdAt time.Time) error {
@@ -479,6 +482,24 @@ func rollbackNewLibrary(db interface{ Session() *gocql.Session }, orgID, library
 	return batch.Exec()
 }
 
+func syncAdminLibraryReadModel(db interface{ Session() *gocql.Session }, orgID, libraryID string) error {
+	return dbpkg.SyncAdminLibraryReadModel(db.Session(), orgID, libraryID)
+}
+
+func addDeleteAdminLibraryReadModelQueries(db interface{ Session() *gocql.Session }, batch *gocql.Batch, libraryID string) error {
+	state, err := dbpkg.ReadAdminLibraryProjectionState(db.Session(), libraryID)
+	if err == gocql.ErrNotFound {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+
+	dbpkg.AddDeleteAdminLibraryReadModelQuery(batch, state)
+	batch.Query(`DELETE FROM library_admin_projection_state WHERE library_id = ?`, libraryID)
+	return nil
+}
+
 // ── Library soft-delete / restore with storage accounting ─────────────────────
 
 // softDeleteLibrary marks a library as deleted and adjusts storage counters.
@@ -500,7 +521,7 @@ func softDeleteLibrary(db interface{ Session() *gocql.Session }, orgID, ownerID,
 
 	// Read the live lib-scope counter and subtract from aggregate scopes.
 	traffic.AdjustAggregateStorageCounters(db, orgID, ownerID, libraryID, false)
-	return nil
+	return syncAdminLibraryReadModel(db, orgID, libraryID)
 }
 
 // restoreDeletedLibrary clears deleted_at and re-adds the library's storage to
@@ -516,7 +537,7 @@ func restoreDeletedLibrary(db interface{ Session() *gocql.Session }, orgID, owne
 
 	// Re-add the library's storage to aggregates.
 	traffic.AdjustAggregateStorageCounters(db, orgID, ownerID, libraryID, true)
-	return nil
+	return syncAdminLibraryReadModel(db, orgID, libraryID)
 }
 
 // orgQuotas holds an organization's quota limits.

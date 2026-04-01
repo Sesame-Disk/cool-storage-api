@@ -981,6 +981,10 @@ func (h *GroupHandler) CreateGroupOwnedLibrary(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to share library with group"})
 		return
 	}
+	if err := syncAdminLibraryReadModel(h.db, orgID, newLibID); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to sync library read model"})
+		return
+	}
 
 	// Resolve caller email and name for the response
 	var ownerEmail, ownerName string
@@ -1058,11 +1062,7 @@ func (h *GroupHandler) DeleteGroupOwnedLibrary(c *gin.Context) {
 		return
 	}
 
-	now := time.Now()
-	if err := h.db.Session().Query(`
-		UPDATE libraries SET deleted_at = ?, deleted_by = ?
-		WHERE org_id = ? AND library_id = ?
-	`, now, userID, orgID, repoID).Exec(); err != nil {
+	if err := softDeleteLibrary(h.db, orgID, libOwnerID, userID, repoID); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete library"})
 		return
 	}

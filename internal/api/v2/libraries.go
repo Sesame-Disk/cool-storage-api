@@ -596,6 +596,10 @@ func (h *LibraryHandler) CreateLibrary(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create library", "details": err.Error()})
 		return
 	}
+	if err := syncAdminLibraryReadModel(h.db, orgID, newLibID.String()); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to sync library read model"})
+		return
+	}
 
 	// Get user email for response (normally set by auth middleware;
 	// fall back to a DB lookup in case the middleware did not populate it).
@@ -848,8 +852,21 @@ func (h *LibraryHandler) UpdateLibrary(c *gin.Context) {
 	}
 	query += " WHERE org_id = ? AND library_id = ?"
 
-	if err := h.db.Session().Query(query, values...).Exec(); err != nil {
+	batch := h.db.Session().Batch(gocql.LoggedBatch)
+	batch.Query(query, values...)
+	if req.Name != nil {
+		batch.Query(`
+			UPDATE libraries_by_id SET name = ?
+			WHERE library_id = ?
+		`, *req.Name, repoID)
+	}
+
+	if err := batch.Exec(); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update library"})
+		return
+	}
+	if err := syncAdminLibraryReadModel(h.db, orgID, repoID); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to sync library read model"})
 		return
 	}
 
@@ -961,6 +978,10 @@ func (h *LibraryHandler) RenameLibrary(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to rename library"})
 		return
 	}
+	if err := syncAdminLibraryReadModel(h.db, orgID, repoID); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to sync library read model"})
+		return
+	}
 
 	c.JSON(http.StatusOK, gin.H{"success": true})
 }
@@ -992,6 +1013,10 @@ func (h *LibraryHandler) ChangeStorageClass(c *gin.Context) {
 		WHERE org_id = ? AND library_id = ?
 	`, req.StorageClass, time.Now(), orgID, repoID).Exec(); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update storage class"})
+		return
+	}
+	if err := syncAdminLibraryReadModel(h.db, orgID, repoID); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to sync library read model"})
 		return
 	}
 

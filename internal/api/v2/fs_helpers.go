@@ -410,6 +410,9 @@ func (h *FSHelper) UpdateLibraryHead(orgID, repoID, commitID string) error {
 	if err := batch.Exec(); err != nil {
 		return fmt.Errorf("failed to update library head: %w", err)
 	}
+	if err := db.SyncAdminLibraryReadModel(h.db.Session(), orgID, repoID); err != nil {
+		return fmt.Errorf("failed to sync admin library read model: %w", err)
+	}
 
 	log.Printf("[UpdateLibraryHead] Updated library %s: size=%d bytes, files=%d", repoID, totalSize, fileCount)
 	return nil

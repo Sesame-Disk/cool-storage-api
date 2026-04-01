@@ -117,6 +117,79 @@ CREATE TABLE IF NOT EXISTS deleted_libraries (
     deleted_at TIMESTAMP
 ) WITH default_time_to_live = 7776000;
 
+-- Admin/org-admin library read models.
+CREATE TABLE IF NOT EXISTS libraries_by_owner (
+    org_id         UUID,
+    owner_id       UUID,
+    updated_at     TIMESTAMP,
+    library_id     UUID,
+    name           TEXT,
+    encrypted      BOOLEAN,
+    storage_class  TEXT,
+    size_bytes     BIGINT,
+    file_count     BIGINT,
+    deleted_at     TIMESTAMP,
+    PRIMARY KEY ((org_id, owner_id), updated_at, library_id)
+) WITH CLUSTERING ORDER BY (updated_at DESC, library_id ASC);
+
+CREATE TABLE IF NOT EXISTS libraries_by_org_updated (
+    org_id         UUID,
+    updated_at     TIMESTAMP,
+    library_id     UUID,
+    owner_id       UUID,
+    owner_email    TEXT,
+    owner_name     TEXT,
+    name           TEXT,
+    encrypted      BOOLEAN,
+    storage_class  TEXT,
+    size_bytes     BIGINT,
+    file_count     BIGINT,
+    deleted_at     TIMESTAMP,
+    PRIMARY KEY ((org_id), updated_at, library_id)
+) WITH CLUSTERING ORDER BY (updated_at DESC, library_id ASC);
+
+CREATE TABLE IF NOT EXISTS libraries_admin_global_by_updated (
+    bucket_day     TEXT,
+    updated_at     TIMESTAMP,
+    org_id         UUID,
+    library_id     UUID,
+    owner_id       UUID,
+    owner_email    TEXT,
+    owner_name     TEXT,
+    name           TEXT,
+    encrypted      BOOLEAN,
+    storage_class  TEXT,
+    size_bytes     BIGINT,
+    file_count     BIGINT,
+    deleted_at     TIMESTAMP,
+    PRIMARY KEY ((bucket_day), updated_at, org_id, library_id)
+) WITH CLUSTERING ORDER BY (updated_at DESC, org_id ASC, library_id ASC);
+
+CREATE TABLE IF NOT EXISTS libraries_deleted_by_org (
+    org_id         UUID,
+    deleted_at     TIMESTAMP,
+    library_id     UUID,
+    owner_id       UUID,
+    owner_email    TEXT,
+    owner_name     TEXT,
+    name           TEXT,
+    encrypted      BOOLEAN,
+    size_bytes     BIGINT,
+    PRIMARY KEY ((org_id), deleted_at, library_id)
+) WITH CLUSTERING ORDER BY (deleted_at DESC, library_id ASC);
+
+CREATE TABLE IF NOT EXISTS library_admin_global_buckets (
+    bucket_day TEXT PRIMARY KEY
+);
+
+CREATE TABLE IF NOT EXISTS library_admin_projection_state (
+    library_id UUID PRIMARY KEY,
+    org_id     UUID,
+    owner_id   UUID,
+    updated_at TIMESTAMP,
+    deleted_at TIMESTAMP
+);
+
 -- ─── File System ─────────────────────────────────────────────────────────────
 
 CREATE TABLE IF NOT EXISTS commits (
@@ -320,6 +393,66 @@ CREATE TABLE IF NOT EXISTS shares_by_user (
     PRIMARY KEY ((shared_to), library_id)
 );
 
+-- Admin/org-admin share read models.
+CREATE TABLE IF NOT EXISTS shares_by_group (
+    org_id            UUID,
+    group_id          UUID,
+    created_at        TIMESTAMP,
+    library_id        UUID,
+    share_id          UUID,
+    permission        TEXT,
+    shared_by         UUID,
+    shared_by_email   TEXT,
+    shared_by_name    TEXT,
+    repo_name         TEXT,
+    encrypted         BOOLEAN,
+    size_bytes        BIGINT,
+    PRIMARY KEY ((org_id, group_id), created_at, library_id, share_id)
+) WITH CLUSTERING ORDER BY (created_at DESC, library_id ASC, share_id ASC);
+
+CREATE TABLE IF NOT EXISTS shares_by_user_org (
+    org_id            UUID,
+    user_id           UUID,
+    created_at        TIMESTAMP,
+    library_id        UUID,
+    share_id          UUID,
+    permission        TEXT,
+    shared_by         UUID,
+    shared_by_email   TEXT,
+    shared_by_name    TEXT,
+    repo_name         TEXT,
+    encrypted         BOOLEAN,
+    size_bytes        BIGINT,
+    PRIMARY KEY ((org_id, user_id), created_at, library_id, share_id)
+) WITH CLUSTERING ORDER BY (created_at DESC, library_id ASC, share_id ASC);
+
+-- User-facing share lookup tables.
+CREATE TABLE IF NOT EXISTS shares_by_creator (
+    org_id         UUID,
+    shared_by      UUID,
+    created_at     TIMESTAMP,
+    library_id     UUID,
+    share_id       UUID,
+    shared_to      UUID,
+    shared_to_type TEXT,
+    permission     TEXT,
+    expires_at     TIMESTAMP,
+    PRIMARY KEY ((org_id, shared_by), created_at, library_id, share_id)
+) WITH CLUSTERING ORDER BY (created_at DESC, library_id ASC, share_id ASC);
+
+CREATE TABLE IF NOT EXISTS shares_by_recipient (
+    org_id         UUID,
+    shared_to_type TEXT,
+    shared_to      UUID,
+    created_at     TIMESTAMP,
+    library_id     UUID,
+    share_id       UUID,
+    shared_by      UUID,
+    permission     TEXT,
+    expires_at     TIMESTAMP,
+    PRIMARY KEY ((org_id, shared_to_type, shared_to), created_at, library_id, share_id)
+) WITH CLUSTERING ORDER BY (created_at DESC, library_id ASC, share_id ASC);
+
 -- Reusable per-user permission presets for share dialogs.
 CREATE TABLE IF NOT EXISTS custom_share_permissions (
     permission_id   UUID PRIMARY KEY,
@@ -431,6 +564,120 @@ CREATE TABLE IF NOT EXISTS groups_by_id (
     group_id UUID PRIMARY KEY,
     org_id   UUID,
     name     TEXT
+);
+
+-- Sys-admin group read model.
+CREATE TABLE IF NOT EXISTS group_admin_global_buckets (
+    bucket_day TEXT PRIMARY KEY
+);
+
+CREATE TABLE IF NOT EXISTS groups_admin_global_by_created (
+    bucket_day       TEXT,
+    created_at       TIMESTAMP,
+    org_id           UUID,
+    group_id         UUID,
+    name             TEXT,
+    creator_id       UUID,
+    owner_email      TEXT,
+    owner_name       TEXT,
+    parent_group_id  UUID,
+    is_department    BOOLEAN,
+    PRIMARY KEY ((bucket_day), created_at, org_id, group_id)
+) WITH CLUSTERING ORDER BY (created_at DESC, org_id ASC, group_id ASC);
+
+-- Sys-admin organization read models.
+CREATE TABLE IF NOT EXISTS organization_admin_buckets (
+    bucket_day TEXT PRIMARY KEY
+);
+
+CREATE TABLE IF NOT EXISTS organization_admin_buckets_by_status (
+    status     TEXT,
+    bucket_day TEXT,
+    PRIMARY KEY ((status), bucket_day)
+) WITH CLUSTERING ORDER BY (bucket_day DESC);
+
+CREATE TABLE IF NOT EXISTS organizations_admin_by_created (
+    bucket_day     TEXT,
+    created_at     TIMESTAMP,
+    org_id         UUID,
+    name           TEXT,
+    owner_email    TEXT,
+    owner_name     TEXT,
+    status         TEXT,
+    plan           TEXT,
+    storage_quota  BIGINT,
+    deleted_at     TIMESTAMP,
+    users_count    INT,
+    PRIMARY KEY ((bucket_day), created_at, org_id)
+) WITH CLUSTERING ORDER BY (created_at DESC, org_id ASC);
+
+CREATE TABLE IF NOT EXISTS organizations_admin_by_status_created (
+    status         TEXT,
+    bucket_day     TEXT,
+    created_at     TIMESTAMP,
+    org_id         UUID,
+    name           TEXT,
+    owner_email    TEXT,
+    owner_name     TEXT,
+    plan           TEXT,
+    storage_quota  BIGINT,
+    deleted_at     TIMESTAMP,
+    users_count    INT,
+    PRIMARY KEY ((status, bucket_day), created_at, org_id)
+) WITH CLUSTERING ORDER BY (created_at DESC, org_id ASC);
+
+CREATE TABLE IF NOT EXISTS organization_admin_projection_state (
+    org_id      UUID PRIMARY KEY,
+    status      TEXT,
+    created_at  TIMESTAMP
+);
+
+-- Sys-admin user read models.
+CREATE TABLE IF NOT EXISTS user_admin_global_buckets (
+    bucket_day TEXT PRIMARY KEY
+);
+
+CREATE TABLE IF NOT EXISTS user_admin_buckets_by_status (
+    status     TEXT,
+    bucket_day TEXT,
+    PRIMARY KEY ((status), bucket_day)
+) WITH CLUSTERING ORDER BY (bucket_day DESC);
+
+CREATE TABLE IF NOT EXISTS users_admin_global_by_created (
+    bucket_day              TEXT,
+    created_at              TIMESTAMP,
+    org_id                  UUID,
+    user_id                 UUID,
+    email                   TEXT,
+    name                    TEXT,
+    role                    TEXT,
+    status                  TEXT,
+    quota_bytes             BIGINT,
+    quota_usage             BIGINT,
+    last_login_at           TIMESTAMP,
+    PRIMARY KEY ((bucket_day), created_at, org_id, user_id)
+) WITH CLUSTERING ORDER BY (created_at DESC, org_id ASC, user_id ASC);
+
+CREATE TABLE IF NOT EXISTS users_admin_global_by_status_created (
+    status                  TEXT,
+    bucket_day              TEXT,
+    created_at              TIMESTAMP,
+    org_id                  UUID,
+    user_id                 UUID,
+    email                   TEXT,
+    name                    TEXT,
+    role                    TEXT,
+    quota_bytes             BIGINT,
+    quota_usage             BIGINT,
+    last_login_at           TIMESTAMP,
+    PRIMARY KEY ((status, bucket_day), created_at, org_id, user_id)
+) WITH CLUSTERING ORDER BY (created_at DESC, org_id ASC, user_id ASC);
+
+CREATE TABLE IF NOT EXISTS user_admin_projection_state (
+    user_id      UUID PRIMARY KEY,
+    org_id       UUID,
+    status       TEXT,
+    created_at   TIMESTAMP
 );
 
 -- ─── Features ────────────────────────────────────────────────────────────────

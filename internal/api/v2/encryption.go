@@ -296,6 +296,10 @@ func (h *EncryptionHandler) ChangePassword(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update library"})
 		return
 	}
+	if err := syncAdminLibraryReadModel(h.db, orgID, repoID); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to sync library read model"})
+		return
+	}
 
 	c.JSON(http.StatusOK, gin.H{"success": true})
 }

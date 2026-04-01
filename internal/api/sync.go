@@ -2069,6 +2069,9 @@ func (h *SyncHandler) updateLibraryHeadWithStats(orgID, repoID, commitID string,
 
 	// Async: recalculate stats from directory tree
 	go h.recalculateLibraryStats(orgID, repoID, commitID)
+	if err := db.SyncAdminLibraryReadModel(h.db.Session(), orgID, repoID); err != nil {
+		log.Printf("[updateLibraryHeadWithStats] WARNING: failed to sync admin library read model for %s: %v", repoID, err)
+	}
 
 	return nil
 }
@@ -2087,10 +2090,16 @@ func (h *SyncHandler) recalculateLibraryStats(orgID, repoID, commitID string) {
 
 	if rootFSID == "" || rootFSID == strings.Repeat("0", 40) {
 		// Empty library — set stats to zero
-		h.db.Session().Query(`
+		if err := h.db.Session().Query(`
 			UPDATE libraries SET size_bytes = ?, file_count = ?
 			WHERE org_id = ? AND library_id = ?
-		`, int64(0), int64(0), orgID, repoID).Exec()
+		`, int64(0), int64(0), orgID, repoID).Exec(); err != nil {
+			log.Printf("[updateLibraryStats] Failed to set empty stats for %s: %v", repoID, err)
+			return
+		}
+		if err := db.SyncAdminLibraryReadModel(h.db.Session(), orgID, repoID); err != nil {
+			log.Printf("[updateLibraryStats] Failed to sync admin library read model for %s: %v", repoID, err)
+		}
 		log.Printf("[updateLibraryStats] Library %s is empty, stats set to 0", repoID)
 		return
 	}
@@ -2104,6 +2113,9 @@ func (h *SyncHandler) recalculateLibraryStats(orgID, repoID, commitID string) {
 	if err != nil {
 		log.Printf("[updateLibraryStats] Failed to update stats for %s: %v", repoID, err)
 		return
+	}
+	if err := db.SyncAdminLibraryReadModel(h.db.Session(), orgID, repoID); err != nil {
+		log.Printf("[updateLibraryStats] Failed to sync admin library read model for %s: %v", repoID, err)
 	}
 
 	log.Printf("[updateLibraryStats] Updated library %s: size=%d bytes, files=%d", repoID, totalSize, fileCount)

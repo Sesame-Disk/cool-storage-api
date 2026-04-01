@@ -175,6 +175,10 @@ func (h *LibrarySettingsHandler) SetHistoryLimit(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update history limit"})
 		return
 	}
+	if err := syncAdminLibraryReadModel(h.db, orgID, repoID); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to sync library read model"})
+		return
+	}
 
 	c.JSON(http.StatusOK, gin.H{"keep_days": req.KeepDays})
 }
@@ -234,6 +238,10 @@ func (h *LibrarySettingsHandler) SetAutoDelete(c *gin.Context) {
 	`, req.AutoDeleteDays, time.Now(), orgID, repoID).Exec(); err != nil {
 		log.Printf("[SetAutoDelete] Failed to update: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update auto-delete settings"})
+		return
+	}
+	if err := syncAdminLibraryReadModel(h.db, orgID, repoID); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to sync library read model"})
 		return
 	}
 

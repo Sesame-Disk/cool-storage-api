@@ -699,6 +699,10 @@ func (h *OrgAdminHandler) AddOrgGroupOwnedLibrary(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to share library with group"})
 		return
 	}
+	if err := syncAdminLibraryReadModel(h.db, targetOrgID, newLibID); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to sync library read model"})
+		return
+	}
 
 	c.JSON(http.StatusOK, gin.H{
 		"repo_id":   newLibID,
@@ -719,9 +723,10 @@ func (h *OrgAdminHandler) DeleteOrgGroupOwnedLibrary(c *gin.Context) {
 
 	// Verify library exists and is not already deleted
 	var deletedAt time.Time
+	var ownerID string
 	if err := h.db.Session().Query(`
-		SELECT deleted_at FROM libraries WHERE org_id = ? AND library_id = ?
-	`, targetOrgID, repoID).Scan(&deletedAt); err != nil {
+		SELECT deleted_at, owner_id FROM libraries WHERE org_id = ? AND library_id = ?
+	`, targetOrgID, repoID).Scan(&deletedAt, &ownerID); err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "library not found"})
 		return
 	}
@@ -730,13 +735,8 @@ func (h *OrgAdminHandler) DeleteOrgGroupOwnedLibrary(c *gin.Context) {
 		return
 	}
 
-	// Soft-delete
 	callerUserID := c.GetString("user_id")
-	now := time.Now()
-	if err := h.db.Session().Query(`
-		UPDATE libraries SET deleted_at = ?, deleted_by = ?
-		WHERE org_id = ? AND library_id = ?
-	`, now, callerUserID, targetOrgID, repoID).Exec(); err != nil {
+	if err := softDeleteLibrary(h.db, targetOrgID, ownerID, callerUserID, repoID); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete library"})
 		return
 	}

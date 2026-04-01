@@ -116,37 +116,15 @@ func TestInitialSchemaContainsLookupNameAndStarredIndex(t *testing.T) {
 	assert.Contains(t, content, "CREATE TABLE IF NOT EXISTS admin_link_buckets")
 	assert.Contains(t, content, "CREATE TABLE IF NOT EXISTS admin_link_buckets_by_org")
 	assert.Contains(t, content, "CREATE TABLE IF NOT EXISTS admin_link_counts_by_org")
+	assert.Contains(t, content, "CREATE TABLE IF NOT EXISTS libraries_by_owner")
+	assert.Contains(t, content, "CREATE TABLE IF NOT EXISTS library_admin_projection_state")
+	assert.Contains(t, content, "CREATE TABLE IF NOT EXISTS shares_by_group")
+	assert.Contains(t, content, "CREATE TABLE IF NOT EXISTS shares_by_creator")
+	assert.Contains(t, content, "CREATE TABLE IF NOT EXISTS shares_by_recipient")
+	assert.Contains(t, content, "CREATE TABLE IF NOT EXISTS groups_admin_global_by_created")
+	assert.Contains(t, content, "CREATE TABLE IF NOT EXISTS organizations_admin_by_created")
+	assert.Contains(t, content, "CREATE TABLE IF NOT EXISTS organizations_admin_by_status_created")
+	assert.Contains(t, content, "CREATE TABLE IF NOT EXISTS users_admin_global_by_created")
+	assert.Contains(t, content, "CREATE TABLE IF NOT EXISTS users_admin_global_by_status_created")
 	assert.NotContains(t, content, "CREATE TABLE IF NOT EXISTS share_links_by_org")
-}
-
-func TestAdminReadModelMigrationsExist(t *testing.T) {
-	testCases := []struct {
-		filePath string
-		contains []string
-	}{
-		{
-			filePath: "migrations/002_library_admin_read_models.cql",
-			contains: []string{
-				"CREATE TABLE IF NOT EXISTS libraries_by_owner",
-				"CREATE TABLE IF NOT EXISTS libraries_by_org_updated",
-				"CREATE TABLE IF NOT EXISTS libraries_admin_global_by_updated",
-				"CREATE TABLE IF NOT EXISTS libraries_deleted_by_org",
-			},
-		},
-		{
-			filePath: "migrations/003_group_share_read_models.cql",
-			contains: []string{"CREATE TABLE IF NOT EXISTS shares_by_group", "CREATE TABLE IF NOT EXISTS shares_by_user_org"},
-		},
-	}
-
-	for _, tc := range testCases {
-		t.Run(tc.filePath, func(t *testing.T) {
-			raw, err := migrationsFS.ReadFile(tc.filePath)
-			require.NoError(t, err)
-			content := string(raw)
-			for _, needle := range tc.contains {
-				assert.Contains(t, content, needle)
-			}
-		})
-	}
 }

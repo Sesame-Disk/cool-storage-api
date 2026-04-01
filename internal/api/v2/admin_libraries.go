@@ -7,10 +7,12 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 
+	dbpkg "github.com/Sesame-Disk/sesamefs/internal/db"
 	"github.com/Sesame-Disk/sesamefs/internal/middleware"
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
 	"github.com/gin-gonic/gin"
@@ -64,6 +66,67 @@ func (h *AdminHandler) resolveOwnerName(orgID, ownerID string) string {
 		return strings.Split(email, "@")[0]
 	}
 	return ownerID
+}
+
+func adminLibraryResponseFromProjection(row dbpkg.AdminLibraryProjectionRow) adminLibraryResponse {
+	return adminLibraryResponse{
+		ID:          row.LibraryID,
+		RepoID:      row.LibraryID,
+		Name:        row.Name,
+		RepoName:    row.Name,
+		OwnerEmail:  row.OwnerEmail,
+		OwnerName:   row.OwnerName,
+		Size:        row.SizeBytes,
+		FileCount:   row.FileCount,
+		Encrypted:   row.Encrypted,
+		Permission:  "rw",
+		StorageName: row.StorageClass,
+		UpdatedAt:   row.UpdatedAt.Format(time.RFC3339),
+	}
+}
+
+func adminLibraryMatchesSearch(row dbpkg.AdminLibraryProjectionRow, queryLower string) bool {
+	libIDLower := strings.ToLower(row.LibraryID)
+	return strings.Contains(strings.ToLower(row.Name), queryLower) ||
+		strings.HasPrefix(libIDLower, queryLower) ||
+		libIDLower == queryLower
+}
+
+func sortAdminLibraryProjectionRows(rows []dbpkg.AdminLibraryProjectionRow, orderBy string) {
+	sort.SliceStable(rows, func(i, j int) bool {
+		switch orderBy {
+		case "size":
+			if rows[i].SizeBytes == rows[j].SizeBytes {
+				return rows[i].UpdatedAt.After(rows[j].UpdatedAt)
+			}
+			return rows[i].SizeBytes > rows[j].SizeBytes
+		case "file_count":
+			if rows[i].FileCount == rows[j].FileCount {
+				return rows[i].UpdatedAt.After(rows[j].UpdatedAt)
+			}
+			return rows[i].FileCount > rows[j].FileCount
+		default:
+			if rows[i].UpdatedAt.Equal(rows[j].UpdatedAt) {
+				if rows[i].OrgID == rows[j].OrgID {
+					return rows[i].LibraryID < rows[j].LibraryID
+				}
+				return rows[i].OrgID < rows[j].OrgID
+			}
+			return rows[i].UpdatedAt.After(rows[j].UpdatedAt)
+		}
+	})
+}
+
+func sortDeletedAdminLibraryRows(rows []dbpkg.AdminDeletedLibraryProjectionRow) {
+	sort.SliceStable(rows, func(i, j int) bool {
+		if rows[i].DeletedAt.Equal(rows[j].DeletedAt) {
+			if rows[i].OrgID == rows[j].OrgID {
+				return rows[i].LibraryID < rows[j].LibraryID
+			}
+			return rows[i].OrgID < rows[j].OrgID
+		}
+		return rows[i].DeletedAt.After(rows[j].DeletedAt)
+	})
 }
 
 // AdminListAllLibraries lists all libraries visible to the admin.
@@ -145,74 +208,58 @@ func (h *AdminHandler) AdminListAllLibraries(c *gin.Context) {
 
 	// Determine which orgs to query: platform superadmin may query all orgs.
 	callerRole, _ := h.permMiddleware.GetUserOrgRole(callerOrgID, callerUserID)
-	var orgIDs []string
-	if middleware.IsPlatformSuperAdmin(callerOrgID, callerRole) {
-		// Superadmin: query all orgs
-		orgIter := h.db.Session().Query(`SELECT org_id FROM organizations`).Iter()
-		var oid string
-		for orgIter.Scan(&oid) {
-			orgIDs = append(orgIDs, oid)
+	isSuperAdmin := middleware.IsPlatformSuperAdmin(callerOrgID, callerRole)
+	filterOrgID := strings.TrimSpace(c.Query("org_id"))
+	ownerFilter := strings.TrimSpace(c.Query("owner"))
+	orderBy := strings.TrimSpace(c.Query("order_by"))
+
+	var rows []dbpkg.AdminLibraryProjectionRow
+	var err error
+
+	switch {
+	case ownerFilter != "":
+		ownerID, ownerOrgID, lookupErr := h.lookupUserByEmail(ownerFilter)
+		if lookupErr != nil {
+			rows = []dbpkg.AdminLibraryProjectionRow{}
+			break
 		}
-		orgIter.Close()
-	} else {
-		orgIDs = []string{callerOrgID}
+		if filterOrgID != "" && filterOrgID != ownerOrgID {
+			rows = []dbpkg.AdminLibraryProjectionRow{}
+			break
+		}
+		if !isSuperAdmin && ownerOrgID != callerOrgID {
+			rows = []dbpkg.AdminLibraryProjectionRow{}
+			break
+		}
+		rows, err = dbpkg.ListAdminOwnerLibraryRows(h.db.Session(), ownerOrgID, ownerID)
+	case filterOrgID != "":
+		if !isSuperAdmin && filterOrgID != callerOrgID {
+			rows = []dbpkg.AdminLibraryProjectionRow{}
+			break
+		}
+		rows, err = dbpkg.ListAdminOrgLibraryRows(h.db.Session(), filterOrgID)
+	case isSuperAdmin:
+		rows, err = dbpkg.ListAdminGlobalLibraryRows(h.db.Session())
+	default:
+		rows, err = dbpkg.ListAdminOrgLibraryRows(h.db.Session(), callerOrgID)
+	}
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list libraries"})
+		return
 	}
 
-	// Collect all libraries across target orgs
-	var allLibs []adminLibraryResponse
-	for _, orgID := range orgIDs {
-		iter := h.db.Session().Query(`
-			SELECT library_id, owner_id, name, encrypted, storage_class,
-			       size_bytes, file_count, created_at, updated_at, deleted_at
-			FROM libraries WHERE org_id = ?
-		`, orgID).Iter()
-
-		var libID, ownerID, name, storageClass string
-		var encrypted bool
-		var sizeBytes, fileCount int64
-		var createdAt, updatedAt, deletedAt time.Time
-
-		for iter.Scan(&libID, &ownerID, &name, &encrypted, &storageClass,
-			&sizeBytes, &fileCount, &createdAt, &updatedAt, &deletedAt) {
-			if !deletedAt.IsZero() {
-				continue
-			}
-			ownerEmail := h.resolveOwnerEmail(orgID, ownerID)
-			ownerName := h.resolveOwnerName(orgID, ownerID)
-			allLibs = append(allLibs, adminLibraryResponse{
-				ID:          libID,
-				RepoID:      libID,
-				Name:        name,
-				RepoName:    name,
-				OwnerEmail:  ownerEmail,
-				Permission:  "rw", // Admin always has rw over all libraries
-				OwnerName:   ownerName,
-				Size:        sizeBytes,
-				FileCount:   fileCount,
-				Encrypted:   encrypted,
-				StorageName: storageClass,
-				CreatedAt:   createdAt.Format(time.RFC3339),
-				UpdatedAt:   updatedAt.Format(time.RFC3339),
-			})
+	activeRows := make([]dbpkg.AdminLibraryProjectionRow, 0, len(rows))
+	for _, row := range rows {
+		if row.DeletedAt != nil && !row.DeletedAt.IsZero() {
+			continue
 		}
-		iter.Close()
+		activeRows = append(activeRows, row)
 	}
+	sortAdminLibraryProjectionRows(activeRows, orderBy)
 
-	if allLibs == nil {
-		allLibs = []adminLibraryResponse{}
-	}
-
-	// Apply ordering
-	orderBy := c.Query("order_by")
-	if orderBy == "size" {
-		// Sort descending by size
-		for i := 0; i < len(allLibs); i++ {
-			for j := i + 1; j < len(allLibs); j++ {
-				if allLibs[j].Size > allLibs[i].Size {
-					allLibs[i], allLibs[j] = allLibs[j], allLibs[i]
-				}
-			}
-		}
+	allLibs := make([]adminLibraryResponse, 0, len(activeRows))
+	for _, row := range activeRows {
+		allLibs = append(allLibs, adminLibraryResponseFromProjection(row))
 	}
 
 	// Paginate
@@ -265,67 +312,42 @@ func (h *AdminHandler) AdminSearchLibraries(c *gin.Context) {
 	}
 
 	callerRole, _ := h.permMiddleware.GetUserOrgRole(callerOrgID, callerUserID)
-	var orgIDs []string
-	if middleware.IsPlatformSuperAdmin(callerOrgID, callerRole) {
-		orgIter := h.db.Session().Query(`SELECT org_id FROM organizations`).Iter()
-		var oid string
-		for orgIter.Scan(&oid) {
-			orgIDs = append(orgIDs, oid)
-		}
-		orgIter.Close()
-	} else {
-		orgIDs = []string{callerOrgID}
-	}
-
+	isSuperAdmin := middleware.IsPlatformSuperAdmin(callerOrgID, callerRole)
+	filterOrgID := strings.TrimSpace(c.Query("org_id"))
 	queryLower := strings.ToLower(query)
 
-	var results []adminLibraryResponse
-	for _, orgID := range orgIDs {
-		iter := h.db.Session().Query(`
-			SELECT library_id, owner_id, name, encrypted, storage_class,
-			       size_bytes, file_count, created_at, updated_at, deleted_at
-			FROM libraries WHERE org_id = ?
-		`, orgID).Iter()
-
-		var libID, ownerID, name, storageClass string
-		var encrypted bool
-		var sizeBytes, fileCount int64
-		var createdAt, updatedAt, deletedAt time.Time
-
-		for iter.Scan(&libID, &ownerID, &name, &encrypted, &storageClass,
-			&sizeBytes, &fileCount, &createdAt, &updatedAt, &deletedAt) {
-			if !deletedAt.IsZero() {
-				continue
-			}
-			// Match by name (case-insensitive substring) or by ID (exact or prefix)
-			libIDLower := strings.ToLower(libID)
-			if strings.Contains(strings.ToLower(name), queryLower) ||
-				strings.HasPrefix(libIDLower, queryLower) || libIDLower == queryLower {
-				ownerEmail := h.resolveOwnerEmail(orgID, ownerID)
-				ownerName := h.resolveOwnerName(orgID, ownerID)
-				results = append(results, adminLibraryResponse{
-					ID:          libID,
-					Name:        name,
-					OwnerEmail:  ownerEmail,
-					Permission:  "rw", // Admin always has rw over all libraries
-					OwnerName:   ownerName,
-					Size:        sizeBytes,
-					FileCount:   fileCount,
-					Encrypted:   encrypted,
-					StorageName: storageClass,
-					CreatedAt:   createdAt.Format(time.RFC3339),
-					UpdatedAt:   updatedAt.Format(time.RFC3339),
-				})
-			}
+	var rows []dbpkg.AdminLibraryProjectionRow
+	var err error
+	if filterOrgID != "" {
+		if !isSuperAdmin && filterOrgID != callerOrgID {
+			rows = []dbpkg.AdminLibraryProjectionRow{}
+		} else {
+			rows, err = dbpkg.ListAdminOrgLibraryRows(h.db.Session(), filterOrgID)
 		}
-		iter.Close()
+	} else if isSuperAdmin {
+		rows, err = dbpkg.ListAdminGlobalLibraryRows(h.db.Session())
+	} else {
+		rows, err = dbpkg.ListAdminOrgLibraryRows(h.db.Session(), callerOrgID)
+	}
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to search libraries"})
+		return
 	}
 
-	if results == nil {
+	var results []adminLibraryResponse
+	for _, row := range rows {
+		if row.DeletedAt != nil && !row.DeletedAt.IsZero() {
+			continue
+		}
+		if adminLibraryMatchesSearch(row, queryLower) {
+			results = append(results, adminLibraryResponseFromProjection(row))
+		}
+	}
+	if len(results) == 0 {
 		results = []adminLibraryResponse{}
 	}
 
-	log.Printf("[AdminSearchLibraries] found %d results for query=%q across %d orgs", len(results), query, len(orgIDs))
+	log.Printf("[AdminSearchLibraries] found %d results for query=%q", len(results), query)
 
 	// Paginate
 	total := len(results)
@@ -557,6 +579,10 @@ func (h *AdminHandler) AdminCreateLibrary(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create library"})
 		return
 	}
+	if err := syncAdminLibraryReadModel(h.db, ownerOrgID, newLibID.String()); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to sync library read model"})
+		return
+	}
 
 	log.Printf("[AdminCreateLibrary] Admin %s created library %s for user %s", callerUserID, newLibID.String(), ownerEmail)
 
@@ -709,12 +735,17 @@ func (h *AdminHandler) AdminUpdateHistorySetting(c *gin.Context) {
 		return
 	}
 
+	now := time.Now()
 	if err := h.db.Session().Query(`
 		UPDATE libraries SET version_ttl_days = ?, updated_at = ?
 		WHERE org_id = ? AND library_id = ?
-	`, req.KeepDays, time.Now(), orgID, libraryID).Exec(); err != nil {
+	`, req.KeepDays, now, orgID, libraryID).Exec(); err != nil {
 		log.Printf("[AdminUpdateHistorySetting] Failed to update: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update history setting"})
+		return
+	}
+	if err := syncAdminLibraryReadModel(h.db, orgID, libraryID); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to sync library read model"})
 		return
 	}
 
@@ -1040,14 +1071,18 @@ func (h *AdminHandler) AdminListTrashLibraries(c *gin.Context) {
 	}
 
 	callerRole, _ := h.permMiddleware.GetUserOrgRole(callerOrgID, callerUserID)
+	isSuperAdmin := middleware.IsPlatformSuperAdmin(callerOrgID, callerRole)
 	var orgIDs []string
-	if middleware.IsPlatformSuperAdmin(callerOrgID, callerRole) {
+	if isSuperAdmin {
 		orgIter := h.db.Session().Query(`SELECT org_id FROM organizations`).Iter()
 		var oid string
 		for orgIter.Scan(&oid) {
 			orgIDs = append(orgIDs, oid)
 		}
-		orgIter.Close()
+		if err := orgIter.Close(); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list organizations"})
+			return
+		}
 	} else {
 		orgIDs = []string{callerOrgID}
 	}
@@ -1055,44 +1090,39 @@ func (h *AdminHandler) AdminListTrashLibraries(c *gin.Context) {
 	// Filter by owner email if provided
 	ownerFilter := c.Query("owner")
 
-	var trashed []gin.H
+	var trashed []dbpkg.AdminDeletedLibraryProjectionRow
 	for _, orgID := range orgIDs {
-		iter := h.db.Session().Query(`
-			SELECT library_id, owner_id, name, size_bytes, deleted_at
-			FROM libraries WHERE org_id = ?
-		`, orgID).Iter()
-
-		var libID, ownerID, name string
-		var sizeBytes int64
-		var deletedAt time.Time
-
-		for iter.Scan(&libID, &ownerID, &name, &sizeBytes, &deletedAt) {
-			if deletedAt.IsZero() {
-				continue // Not deleted
-			}
-			ownerEmail := h.resolveOwnerEmail(orgID, ownerID)
-			if ownerFilter != "" && ownerEmail != ownerFilter {
+		rows, err := dbpkg.ListDeletedAdminLibraryRowsByOrg(h.db.Session(), orgID)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list trash libraries"})
+			return
+		}
+		for _, row := range rows {
+			if ownerFilter != "" && row.OwnerEmail != ownerFilter {
 				continue
 			}
-			ownerName := h.resolveOwnerName(orgID, ownerID)
-			trashed = append(trashed, gin.H{
-				"id":          libID,
-				"name":        name,
-				"owner":       ownerEmail,
-				"owner_name":  ownerName,
-				"size":        sizeBytes,
-				"delete_time": deletedAt.Format(time.RFC3339),
-			})
+			trashed = append(trashed, row)
 		}
-		iter.Close()
 	}
+	if len(trashed) == 0 {
+		trashed = []dbpkg.AdminDeletedLibraryProjectionRow{}
+	}
+	sortDeletedAdminLibraryRows(trashed)
 
-	if trashed == nil {
-		trashed = []gin.H{}
+	response := make([]gin.H, 0, len(trashed))
+	for _, row := range trashed {
+		response = append(response, gin.H{
+			"id":          row.LibraryID,
+			"name":        row.Name,
+			"owner":       row.OwnerEmail,
+			"owner_name":  row.OwnerName,
+			"size":        row.SizeBytes,
+			"delete_time": row.DeletedAt.Format(time.RFC3339),
+		})
 	}
 
 	// Paginate
-	total := len(trashed)
+	total := len(response)
 	start := (page - 1) * perPage
 	if start > total {
 		start = total
@@ -1103,7 +1133,7 @@ func (h *AdminHandler) AdminListTrashLibraries(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"repos": trashed[start:end],
+		"repos": response[start:end],
 		"page_info": gin.H{
 			"has_next_page": end < total,
 			"current_page":  page,
@@ -1175,6 +1205,10 @@ func (h *AdminHandler) AdminCleanTrashLibraries(c *gin.Context) {
 
 			// 3. Hard-delete library rows (same batch approach as PermanentDeleteRepo)
 			batch := h.db.Session().Batch(gocql.LoggedBatch)
+			if err := addDeleteAdminLibraryReadModelQueries(h.db, batch, lib.libID); err != nil {
+				log.Printf("[AdminCleanTrashLibraries] failed to stage read model delete for library %s (org %s): %v", lib.libID, orgID, err)
+				continue
+			}
 			batch.Query(`DELETE FROM libraries WHERE org_id = ? AND library_id = ?`, orgID, lib.libID)
 			batch.Query(`DELETE FROM libraries_by_id WHERE library_id = ?`, lib.libID)
 

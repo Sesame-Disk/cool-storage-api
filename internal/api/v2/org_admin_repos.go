@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	dbpkg "github.com/Sesame-Disk/sesamefs/internal/db"
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
 	"github.com/gin-gonic/gin"
 )
@@ -34,12 +35,6 @@ func (h *OrgAdminHandler) ListOrgRepos(c *gin.Context) {
 		perPage = 25
 	}
 
-	iter := h.db.Session().Query(`
-		SELECT library_id, owner_id, name, encrypted, size_bytes, file_count,
-		       created_at, deleted_at
-		FROM libraries WHERE org_id = ?
-	`, targetOrgID).Iter()
-
 	type repoRow struct {
 		RepoID           string `json:"repo_id"`
 		RepoName         string `json:"repo_name"`
@@ -51,37 +46,30 @@ func (h *OrgAdminHandler) ListOrgRepos(c *gin.Context) {
 		IsDepartmentRepo bool   `json:"is_department_repo"`
 		GroupID          *int   `json:"group_id"`
 	}
-
-	usersMap := h.resolveUsersMap(targetOrgID)
+	rows, err := dbpkg.ListAdminOrgLibraryRows(h.db.Session(), targetOrgID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list repositories"})
+		return
+	}
 
 	var all []repoRow
-	var libID, ownerID, name string
-	var encrypted bool
-	var sizeBytes, fileCount int64
-	var createdAt, deletedAt time.Time
-
-	for iter.Scan(&libID, &ownerID, &name, &encrypted, &sizeBytes, &fileCount,
-		&createdAt, &deletedAt) {
-		// Skip deleted libraries
-		if !deletedAt.IsZero() {
+	for _, row := range rows {
+		if row.DeletedAt != nil && !row.DeletedAt.IsZero() {
 			continue
 		}
-		u := usersMap[ownerID]
 		all = append(all, repoRow{
-			RepoID:           libID,
-			RepoName:         name,
-			OwnerName:        u.Name,
-			OwnerEmail:       u.Email,
-			Size:             sizeBytes,
-			FileCount:        fileCount,
-			Encrypted:        encrypted,
+			RepoID:           row.LibraryID,
+			RepoName:         row.Name,
+			OwnerName:        row.OwnerName,
+			OwnerEmail:       row.OwnerEmail,
+			Size:             row.SizeBytes,
+			FileCount:        row.FileCount,
+			Encrypted:        row.Encrypted,
 			IsDepartmentRepo: false,
 			GroupID:          nil,
 		})
 	}
-	iter.Close()
-
-	if all == nil {
+	if len(all) == 0 {
 		all = []repoRow{}
 	}
 
@@ -130,9 +118,10 @@ func (h *OrgAdminHandler) DeleteOrgRepo(c *gin.Context) {
 
 	// Verify library exists and is not already deleted
 	var deletedAt time.Time
+	var ownerID string
 	if err := h.db.Session().Query(`
-		SELECT deleted_at FROM libraries WHERE org_id = ? AND library_id = ?
-	`, targetOrgID, repoID).Scan(&deletedAt); err != nil {
+		SELECT deleted_at, owner_id FROM libraries WHERE org_id = ? AND library_id = ?
+	`, targetOrgID, repoID).Scan(&deletedAt, &ownerID); err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "library not found"})
 		return
 	}
@@ -141,13 +130,8 @@ func (h *OrgAdminHandler) DeleteOrgRepo(c *gin.Context) {
 		return
 	}
 
-	// Soft-delete
 	callerUserID := c.GetString("user_id")
-	now := time.Now()
-	if err := h.db.Session().Query(`
-		UPDATE libraries SET deleted_at = ?, deleted_by = ?
-		WHERE org_id = ? AND library_id = ?
-	`, now, callerUserID, targetOrgID, repoID).Exec(); err != nil {
+	if err := softDeleteLibrary(h.db, targetOrgID, ownerID, callerUserID, repoID); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete library"})
 		return
 	}
@@ -358,38 +342,25 @@ func (h *OrgAdminHandler) ListOrgTrashLibraries(c *gin.Context) {
 	if perPage < 1 || perPage > 100 {
 		perPage = 25
 	}
-
-	iter := h.db.Session().Query(`
-		SELECT library_id, owner_id, name, encrypted, size_bytes, deleted_at
-		FROM libraries WHERE org_id = ?
-	`, targetOrgID).Iter()
-
-	usersMap := h.resolveUsersMap(targetOrgID)
+	rows, err := dbpkg.ListDeletedAdminLibraryRowsByOrg(h.db.Session(), targetOrgID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list trash libraries"})
+		return
+	}
 
 	var trashed []gin.H
-	var libID, ownerID, name string
-	var encrypted bool
-	var sizeBytes int64
-	var deletedAt time.Time
-
-	for iter.Scan(&libID, &ownerID, &name, &encrypted, &sizeBytes, &deletedAt) {
-		if deletedAt.IsZero() {
-			continue
-		}
-		u := usersMap[ownerID]
+	for _, row := range rows {
 		trashed = append(trashed, gin.H{
-			"id":          libID,
-			"name":        name,
-			"owner":       u.Email,
-			"owner_name":  u.Name,
+			"id":          row.LibraryID,
+			"name":        row.Name,
+			"owner":       row.OwnerEmail,
+			"owner_name":  row.OwnerName,
 			"group_name":  "",
-			"delete_time": deletedAt.Format(time.RFC3339),
-			"encrypted":   encrypted,
+			"delete_time": row.DeletedAt.Format(time.RFC3339),
+			"encrypted":   row.Encrypted,
 		})
 	}
-	iter.Close()
-
-	if trashed == nil {
+	if len(trashed) == 0 {
 		trashed = []gin.H{}
 	}
 
@@ -440,6 +411,11 @@ func (h *OrgAdminHandler) CleanOrgTrashLibraries(c *gin.Context) {
 		}
 		// Hard-delete library rows + preserve org lookup for GC
 		batch := h.db.Session().Batch(gocql.LoggedBatch)
+		if err := addDeleteAdminLibraryReadModelQueries(h.db, batch, libID); err != nil {
+			iter.Close()
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to clean library read model"})
+			return
+		}
 		batch.Query(`DELETE FROM libraries WHERE org_id = ? AND library_id = ?`, targetOrgID, libID)
 		batch.Query(`DELETE FROM libraries_by_id WHERE library_id = ?`, libID)
 		batch.Query(`INSERT INTO deleted_libraries (library_id, org_id, deleted_at) VALUES (?, ?, ?)`, libID, targetOrgID, time.Now())
@@ -489,6 +465,10 @@ func (h *OrgAdminHandler) DeleteOrgTrashLibrary(c *gin.Context) {
 
 	// Hard-delete + preserve org lookup for GC
 	batch := h.db.Session().Batch(gocql.LoggedBatch)
+	if err := addDeleteAdminLibraryReadModelQueries(h.db, batch, repoID); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to clean library read model"})
+		return
+	}
 	batch.Query(`DELETE FROM libraries WHERE org_id = ? AND library_id = ?`, targetOrgID, repoID)
 	batch.Query(`DELETE FROM libraries_by_id WHERE library_id = ?`, repoID)
 	batch.Query(`INSERT INTO deleted_libraries (library_id, org_id, deleted_at) VALUES (?, ?, ?)`, repoID, targetOrgID, time.Now())
@@ -512,9 +492,10 @@ func (h *OrgAdminHandler) RestoreOrgTrashLibrary(c *gin.Context) {
 
 	// Verify it's actually trashed
 	var deletedAt time.Time
+	var ownerID string
 	if err := h.db.Session().Query(`
-		SELECT deleted_at FROM libraries WHERE org_id = ? AND library_id = ?
-	`, targetOrgID, repoID).Scan(&deletedAt); err != nil {
+		SELECT deleted_at, owner_id FROM libraries WHERE org_id = ? AND library_id = ?
+	`, targetOrgID, repoID).Scan(&deletedAt, &ownerID); err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "library not found"})
 		return
 	}
@@ -523,11 +504,7 @@ func (h *OrgAdminHandler) RestoreOrgTrashLibrary(c *gin.Context) {
 		return
 	}
 
-	// Clear deleted_at and deleted_by to restore
-	err := h.db.Session().Query(`
-		DELETE deleted_at, deleted_by FROM libraries WHERE org_id = ? AND library_id = ?
-	`, targetOrgID, repoID).Exec()
-	if err != nil {
+	if err := restoreDeletedLibrary(h.db, targetOrgID, ownerID, repoID); err != nil {
 		log.Printf("[RestoreOrgTrashLibrary] Failed to restore library %s: %v", repoID, err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to restore library"})
 		return
