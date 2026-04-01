@@ -393,6 +393,17 @@ func (h *FSHelper) UpdateLibraryHead(orgID, repoID, commitID string) error {
 	}
 
 	now := time.Now()
+	state, err := readAdminLibraryProjectionStateOptional(h.db, repoID)
+	if err != nil {
+		return fmt.Errorf("failed to read library projection state: %w", err)
+	}
+	projectionRow, err := db.ReadAdminLibraryProjectionRow(h.db.Session(), orgID, repoID)
+	if err != nil {
+		return fmt.Errorf("failed to read library projection row: %w", err)
+	}
+	projectionRow.SizeBytes = totalSize
+	projectionRow.FileCount = fileCount
+	projectionRow.UpdatedAt = now
 	batch := h.db.Session().Batch(gocql.LoggedBatch)
 
 	// Update main table with stats
@@ -406,12 +417,10 @@ func (h *FSHelper) UpdateLibraryHead(orgID, repoID, commitID string) error {
 		UPDATE libraries_by_id SET head_commit_id = ?
 		WHERE library_id = ?
 	`, commitID, repoID)
+	addAdminLibraryReadModelRefreshQueries(batch, projectionRow, state)
 
 	if err := batch.Exec(); err != nil {
 		return fmt.Errorf("failed to update library head: %w", err)
-	}
-	if err := db.SyncAdminLibraryReadModel(h.db.Session(), orgID, repoID); err != nil {
-		return fmt.Errorf("failed to sync admin library read model: %w", err)
 	}
 
 	log.Printf("[UpdateLibraryHead] Updated library %s: size=%d bytes, files=%d", repoID, totalSize, fileCount)
@@ -434,6 +443,10 @@ func (h *FSHelper) InitializeLibraryFS(orgID, repoID, userID, repoName string) e
 	commitData := fmt.Sprintf("%s:%s:%d", repoID, repoName, now.UnixNano())
 	commitHash := sha1.Sum([]byte(commitData))
 	headCommitID := hex.EncodeToString(commitHash[:])
+	projectionRow, err := db.ReadAdminLibraryProjectionRow(h.db.Session(), orgID, repoID)
+	if err != nil {
+		return fmt.Errorf("failed to read library projection row: %w", err)
+	}
 
 	// 3. Persist root object, initial commit, and head_commit atomically.
 	batch := h.db.Session().Batch(gocql.LoggedBatch)
@@ -451,6 +464,7 @@ func (h *FSHelper) InitializeLibraryFS(orgID, repoID, userID, repoName string) e
 	batch.Query(`
 		UPDATE libraries_by_id SET head_commit_id = ? WHERE library_id = ?
 	`, headCommitID, repoID)
+	addAdminLibraryReadModelRefreshQueries(batch, projectionRow, nil)
 	if err := batch.Exec(); err != nil {
 		return fmt.Errorf("failed to initialize library fs state: %w", err)
 	}

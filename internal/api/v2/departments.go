@@ -192,6 +192,7 @@ func (h *DepartmentHandler) CreateDepartment(c *gin.Context) {
 	groupUUID := uuid.New()
 	groupID := groupUUID.String()
 	now := time.Now()
+	projectionRow := buildAdminGroupProjectionRow(h.db, orgID, groupID, req.Name, userID, parentGroupID, true, now)
 
 	// Atomic batch: create department + lookup + creator membership
 	batch := h.db.Session().Batch(gocql.LoggedBatch)
@@ -211,13 +212,10 @@ func (h *DepartmentHandler) CreateDepartment(c *gin.Context) {
 	batch.Query(`INSERT INTO groups_by_member (org_id, user_id, group_id, group_name, role, added_at)
 		VALUES (?, ?, ?, ?, ?, ?)`,
 		orgID, userID, groupID, req.Name, "owner", now)
+	addAdminGroupReadModelUpsertQuery(batch, projectionRow)
 	if err := batch.Exec(); err != nil {
 		slog.Error("failed to create department", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create department"})
-		return
-	}
-	if err := syncAdminGroupReadModel(h.db, orgID, groupID); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to sync group read model"})
 		return
 	}
 
@@ -352,40 +350,17 @@ func (h *DepartmentHandler) DeleteDepartment(c *gin.Context) {
 	h.db.Session().Query(`SELECT name FROM groups WHERE org_id = ? AND group_id = ?`,
 		orgID, groupID).Scan(&deptName)
 
-	// Collect members before deletion (for groups_by_member cleanup)
-	memIter := h.db.Session().Query(`SELECT user_id FROM group_members WHERE group_id = ?`, groupID).Iter()
-	var memberID string
-	var memberIDs []string
-	for memIter.Scan(&memberID) {
-		memberIDs = append(memberIDs, memberID)
+	deleteState, err := loadGroupDeleteState(h.db, orgID, groupID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to load department cleanup state"})
+		return
 	}
-	memIter.Close()
 
-	// Atomic batch: delete group + groups_by_id + group_members
-	groupRow, _ := readAdminGroupReadModelRow(h.db, orgID, groupID)
+	// Atomic batch: delete group + indexes + shares + read model
 	batch := h.db.Session().Batch(gocql.LoggedBatch)
-	batch.Query(`DELETE FROM groups WHERE org_id = ? AND group_id = ?`, orgID, groupID)
-	batch.Query(`DELETE FROM groups_by_id WHERE group_id = ?`, groupID)
-	batch.Query(`DELETE FROM group_members WHERE group_id = ?`, groupID)
+	addDeleteGroupMutationQueries(batch, orgID, groupID, deleteState)
 	if err := batch.Exec(); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete department"})
-		return
-	}
-
-	if err := cleanupGroupsByMember(h.db, orgID, groupID, memberIDs); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to clean department membership index"})
-		return
-	}
-	if groupRow.GroupID != "" {
-		if err := deleteAdminGroupReadModel(h.db, groupRow); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to clean group read model"})
-			return
-		}
-	}
-
-	groupUUID, _ := uuid.Parse(groupID)
-	if err := cleanupGroupShares(h.db, groupUUID); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to clean department shares"})
 		return
 	}
 
@@ -393,7 +368,7 @@ func (h *DepartmentHandler) DeleteDepartment(c *gin.Context) {
 	orgUUID, _ := uuid.Parse(orgID)
 	auditDetails, _ := json.Marshal(map[string]interface{}{
 		"name":          deptName,
-		"members_count": len(memberIDs),
+		"members_count": len(deleteState.memberIDs),
 	})
 	h.db.Session().Query(`
 		INSERT INTO audit_log (org_id, timestamp, action, target_type, target_id, actor_id, details)
@@ -401,7 +376,7 @@ func (h *DepartmentHandler) DeleteDepartment(c *gin.Context) {
 	`, orgUUID.String(), time.Now(), "delete_department", "department", groupID, callerUserID,
 		string(auditDetails)).Exec()
 
-	log.Printf("[Department] Deleted department %s (%s) with %d members", groupID, deptName, len(memberIDs))
+	log.Printf("[Department] Deleted department %s (%s) with %d members", groupID, deptName, len(deleteState.memberIDs))
 	c.JSON(http.StatusOK, gin.H{"success": true})
 }
 

@@ -433,11 +433,35 @@ func (h *AdminHandler) AdminAddAddressBookGroup(c *gin.Context) {
 		}
 	}
 
+	staffIDs := map[string]struct{}{}
+	if groupStaff != "" {
+		for _, staffEmail := range strings.Split(groupStaff, ",") {
+			staffEmail = strings.TrimSpace(staffEmail)
+			if staffEmail == "" {
+				continue
+			}
+			staffID, _, err := h.lookupUserByEmail(staffEmail)
+			if err != nil || staffID == "" || staffID == creatorID {
+				continue
+			}
+			staffIDs[staffID] = struct{}{}
+		}
+	}
+
+	projectionRow := buildAdminGroupProjectionRow(h.db, callerOrgID, newGroupID, groupName, creatorID, parentGroup, true, now)
+
 	batch := h.db.Session().Batch(gocql.LoggedBatch)
-	batch.Query(`
-		INSERT INTO groups (org_id, group_id, name, creator_id, parent_group_id, is_department, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-	`, callerOrgID, newGroupID, groupName, creatorID, parentGroup, true, now, now)
+	if parentGroup != "" {
+		batch.Query(`
+			INSERT INTO groups (org_id, group_id, name, creator_id, parent_group_id, is_department, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		`, callerOrgID, newGroupID, groupName, creatorID, parentGroup, true, now, now)
+	} else {
+		batch.Query(`
+			INSERT INTO groups (org_id, group_id, name, creator_id, is_department, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?)
+		`, callerOrgID, newGroupID, groupName, creatorID, true, now, now)
+	}
 	batch.Query(`
 		INSERT INTO groups_by_id (group_id, org_id, name) VALUES (?, ?, ?)
 	`, newGroupID, callerOrgID, groupName)
@@ -449,31 +473,20 @@ func (h *AdminHandler) AdminAddAddressBookGroup(c *gin.Context) {
 		INSERT INTO groups_by_member (org_id, user_id, group_id, group_name, role, added_at)
 		VALUES (?, ?, ?, ?, ?, ?)
 	`, callerOrgID, creatorID, newGroupID, groupName, "owner", now)
+	for staffID := range staffIDs {
+		batch.Query(`
+			INSERT INTO group_members (group_id, user_id, role, added_at)
+			VALUES (?, ?, ?, ?)
+		`, newGroupID, staffID, "member", now)
+		batch.Query(`
+			INSERT INTO groups_by_member (org_id, user_id, group_id, group_name, role, added_at)
+			VALUES (?, ?, ?, ?, ?, ?)
+		`, callerOrgID, staffID, newGroupID, groupName, "member", now)
+	}
+	addAdminGroupReadModelUpsertQuery(batch, projectionRow)
 	if err := batch.Exec(); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create address-book group"})
 		return
-	}
-	if err := syncAdminGroupReadModel(h.db, callerOrgID, newGroupID); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to sync group read model"})
-		return
-	}
-
-	// Add staff members if specified
-	if groupStaff != "" {
-		for _, staffEmail := range strings.Split(groupStaff, ",") {
-			staffEmail = strings.TrimSpace(staffEmail)
-			if staffEmail == "" {
-				continue
-			}
-			staffID, _, err := h.lookupUserByEmail(staffEmail)
-			if err != nil {
-				continue
-			}
-			if err := upsertGroupMember(h.db, callerOrgID, newGroupID, staffID, groupName, "member", now); err != nil {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to add address-book group staff"})
-				return
-			}
-		}
 	}
 
 	c.JSON(http.StatusOK, gin.H{
@@ -587,7 +600,6 @@ func (h *AdminHandler) AdminDeleteAddressBookGroup(c *gin.Context) {
 	}
 
 	groupID := c.Param("group_id")
-	groupRow, _ := readAdminGroupReadModelRow(h.db, callerOrgID, groupID)
 
 	var groupName string
 	if err := h.db.Session().Query(`
@@ -597,41 +609,17 @@ func (h *AdminHandler) AdminDeleteAddressBookGroup(c *gin.Context) {
 		return
 	}
 
-	// Collect members before deletion (for groups_by_member cleanup)
-	memIter := h.db.Session().Query(`
-		SELECT user_id FROM group_members WHERE group_id = ?
-	`, groupID).Iter()
-	var memberID string
-	var memberIDs []string
-	for memIter.Scan(&memberID) {
-		memberIDs = append(memberIDs, memberID)
+	deleteState, err := loadGroupDeleteState(h.db, callerOrgID, groupID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to load group cleanup state"})
+		return
 	}
-	memIter.Close()
 
-	// Atomic batch: delete group + groups_by_id + group_members
+	// Atomic batch: delete group + indexes + shares + read model
 	batch := h.db.Session().Batch(gocql.LoggedBatch)
-	batch.Query(`DELETE FROM groups WHERE org_id = ? AND group_id = ?`, callerOrgID, groupID)
-	batch.Query(`DELETE FROM groups_by_id WHERE group_id = ?`, groupID)
-	batch.Query(`DELETE FROM group_members WHERE group_id = ?`, groupID)
+	addDeleteGroupMutationQueries(batch, callerOrgID, groupID, deleteState)
 	if err := batch.Exec(); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete group"})
-		return
-	}
-	if groupRow.GroupID != "" {
-		if err := deleteAdminGroupReadModel(h.db, groupRow); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to clean group read model"})
-			return
-		}
-	}
-
-	if err := cleanupGroupsByMember(h.db, callerOrgID, groupID, memberIDs); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to clean group membership index"})
-		return
-	}
-
-	groupUUID, _ := uuid.Parse(groupID)
-	if err := cleanupGroupShares(h.db, groupUUID); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to clean group shares"})
 		return
 	}
 
@@ -639,7 +627,7 @@ func (h *AdminHandler) AdminDeleteAddressBookGroup(c *gin.Context) {
 	orgUUID, _ := uuid.Parse(callerOrgID)
 	auditDetails, _ := json.Marshal(map[string]interface{}{
 		"group_name":    groupName,
-		"members_count": len(memberIDs),
+		"members_count": len(deleteState.memberIDs),
 	})
 	if err := h.db.Session().Query(`
 		INSERT INTO audit_log (org_id, timestamp, action, target_type, target_id, actor_id, details)
@@ -718,10 +706,6 @@ func (h *AdminHandler) AdminAddGroupOwnedLibrary(c *gin.Context) {
 	if err := createLibraryShare(h.db, newLibID, shareID, callerUserID, groupID, "group", "rw", now, nil); err != nil {
 		_ = rollbackNewLibrary(h.db, callerOrgID, newLibID)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to share library with group"})
-		return
-	}
-	if err := syncAdminLibraryReadModel(h.db, callerOrgID, newLibID); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to sync library read model"})
 		return
 	}
 

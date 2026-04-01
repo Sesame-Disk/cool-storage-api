@@ -83,6 +83,23 @@ func (h *OrgAdminHandler) AddOrgAddressBookGroup(c *gin.Context) {
 		}
 	}
 
+	staffIDs := map[string]struct{}{}
+	if groupStaff != "" {
+		for _, staffEmail := range strings.Split(groupStaff, ",") {
+			staffEmail = strings.TrimSpace(staffEmail)
+			if staffEmail == "" {
+				continue
+			}
+			staffID, err := h.lookupOrgUserByEmail(targetOrgID, staffEmail)
+			if err != nil || staffID == "" || staffID == creatorID {
+				continue
+			}
+			staffIDs[staffID] = struct{}{}
+		}
+	}
+
+	projectionRow := buildAdminGroupProjectionRow(h.db, targetOrgID, newGroupID, groupName, creatorID, parentGroup, true, now)
+
 	batch := h.db.Session().Batch(gocql.LoggedBatch)
 	if parentGroup != "" {
 		batch.Query(`
@@ -106,31 +123,20 @@ func (h *OrgAdminHandler) AddOrgAddressBookGroup(c *gin.Context) {
 		INSERT INTO groups_by_member (org_id, user_id, group_id, group_name, role, added_at)
 		VALUES (?, ?, ?, ?, ?, ?)
 	`, targetOrgID, creatorID, newGroupID, groupName, "owner", now)
+	for staffID := range staffIDs {
+		batch.Query(`
+			INSERT INTO group_members (group_id, user_id, role, added_at)
+			VALUES (?, ?, ?, ?)
+		`, newGroupID, staffID, "member", now)
+		batch.Query(`
+			INSERT INTO groups_by_member (org_id, user_id, group_id, group_name, role, added_at)
+			VALUES (?, ?, ?, ?, ?, ?)
+		`, targetOrgID, staffID, newGroupID, groupName, "member", now)
+	}
+	addAdminGroupReadModelUpsertQuery(batch, projectionRow)
 	if err := batch.Exec(); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create department"})
 		return
-	}
-	if err := syncAdminGroupReadModel(h.db, targetOrgID, newGroupID); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to sync group read model"})
-		return
-	}
-
-	// Add staff members if specified
-	if groupStaff != "" {
-		for _, staffEmail := range strings.Split(groupStaff, ",") {
-			staffEmail = strings.TrimSpace(staffEmail)
-			if staffEmail == "" {
-				continue
-			}
-			staffID, err := h.lookupOrgUserByEmail(targetOrgID, staffEmail)
-			if err != nil {
-				continue
-			}
-			if err := upsertGroupMember(h.db, targetOrgID, newGroupID, staffID, groupName, "member", now); err != nil {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to add department staff"})
-				return
-			}
-		}
 	}
 
 	c.JSON(http.StatusOK, gin.H{
@@ -299,7 +305,6 @@ func (h *OrgAdminHandler) DeleteOrgAddressBookGroup(c *gin.Context) {
 	}
 
 	groupID := c.Param("gid")
-	groupRow, _ := readAdminGroupReadModelRow(h.db, targetOrgID, groupID)
 
 	// Verify group exists
 	if err := h.db.Session().Query(`
@@ -309,44 +314,17 @@ func (h *OrgAdminHandler) DeleteOrgAddressBookGroup(c *gin.Context) {
 		return
 	}
 
-	// Delete group members from lookup table
-	memIter := h.db.Session().Query(`
-		SELECT user_id FROM group_members WHERE group_id = ?
-	`, groupID).Iter()
-	var memberID string
-	var memberIDs []string
-	for memIter.Scan(&memberID) {
-		memberIDs = append(memberIDs, memberID)
-	}
-	if err := memIter.Close(); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to load group members"})
+	deleteState, err := loadGroupDeleteState(h.db, targetOrgID, groupID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to load department cleanup state"})
 		return
 	}
 
 	batch := h.db.Session().Batch(gocql.LoggedBatch)
-	batch.Query(`DELETE FROM group_members WHERE group_id = ?`, groupID)
-	batch.Query(`DELETE FROM groups WHERE org_id = ? AND group_id = ?`, targetOrgID, groupID)
-	batch.Query(`DELETE FROM groups_by_id WHERE group_id = ?`, groupID)
+	addDeleteGroupMutationQueries(batch, targetOrgID, groupID, deleteState)
 	if err := batch.Exec(); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete department"})
 		return
-	}
-	if groupRow.GroupID != "" {
-		if err := deleteAdminGroupReadModel(h.db, groupRow); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to clean group read model"})
-			return
-		}
-	}
-	if err := cleanupGroupsByMember(h.db, targetOrgID, groupID, memberIDs); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to clean department membership index"})
-		return
-	}
-	groupUUID, err := uuid.Parse(groupID)
-	if err == nil {
-		if err := cleanupGroupShares(h.db, groupUUID); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to clean department shares"})
-			return
-		}
 	}
 
 	c.JSON(http.StatusOK, gin.H{"success": true})

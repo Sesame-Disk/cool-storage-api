@@ -566,20 +566,32 @@ func (h *AdminHandler) AdminCreateLibrary(c *gin.Context) {
 		INSERT INTO commits (library_id, commit_id, root_fs_id, creator_id, description, created_at)
 		VALUES (?, ?, ?, ?, ?, ?)
 	`, newLibID.String(), headCommitID, rootFSID, callerUserID, "Initial commit", now)
+	ownerName := h.resolveOwnerName(ownerOrgID, ownerUserID)
+	if ownerName == "" {
+		ownerName = strings.Split(ownerEmail, "@")[0]
+	}
+	addAdminLibraryReadModelRefreshQueries(batch, dbpkg.AdminLibraryProjectionRow{
+		OrgID:        ownerOrgID,
+		LibraryID:    newLibID.String(),
+		OwnerID:      ownerUserID,
+		OwnerEmail:   ownerEmail,
+		OwnerName:    ownerName,
+		Name:         repoName,
+		Encrypted:    false,
+		StorageClass: storageClass,
+		SizeBytes:    0,
+		FileCount:    0,
+		UpdatedAt:    now,
+	}, nil)
 
 	if err := batch.Exec(); err != nil {
 		log.Printf("[AdminCreateLibrary] Failed to create library: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create library"})
 		return
 	}
-	if err := syncAdminLibraryReadModel(h.db, ownerOrgID, newLibID.String()); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to sync library read model"})
-		return
-	}
 
 	log.Printf("[AdminCreateLibrary] Admin %s created library %s for user %s", callerUserID, newLibID.String(), ownerEmail)
 
-	ownerName := h.resolveOwnerName(ownerOrgID, ownerUserID)
 	c.JSON(http.StatusOK, adminLibraryResponse{
 		ID:         newLibID.String(),
 		Name:       repoName,
@@ -729,16 +741,26 @@ func (h *AdminHandler) AdminUpdateHistorySetting(c *gin.Context) {
 	}
 
 	now := time.Now()
-	if err := h.db.Session().Query(`
-		UPDATE libraries SET version_ttl_days = ?, updated_at = ?
-		WHERE org_id = ? AND library_id = ?
-	`, req.KeepDays, now, orgID, libraryID).Exec(); err != nil {
-		log.Printf("[AdminUpdateHistorySetting] Failed to update: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update history setting"})
+	state, err := readAdminLibraryProjectionStateOptional(h.db, libraryID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read library projection state"})
 		return
 	}
-	if err := syncAdminLibraryReadModel(h.db, orgID, libraryID); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to sync library read model"})
+	projectionRow, err := dbpkg.ReadAdminLibraryProjectionRow(h.db.Session(), orgID, libraryID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read library projection row"})
+		return
+	}
+	projectionRow.UpdatedAt = now
+	batch := h.db.Session().Batch(gocql.LoggedBatch)
+	batch.Query(`
+		UPDATE libraries SET version_ttl_days = ?, updated_at = ?
+		WHERE org_id = ? AND library_id = ?
+	`, req.KeepDays, now, orgID, libraryID)
+	addAdminLibraryReadModelRefreshQueries(batch, projectionRow, state)
+	if err := batch.Exec(); err != nil {
+		log.Printf("[AdminUpdateHistorySetting] Failed to update: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update history setting"})
 		return
 	}
 

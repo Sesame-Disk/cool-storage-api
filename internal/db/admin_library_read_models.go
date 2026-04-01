@@ -152,11 +152,17 @@ func AddUpsertAdminLibraryReadModelQuery(batch *gocql.Batch, row AdminLibraryPro
 				org_id, deleted_at, library_id, owner_id, owner_email, owner_name, name, encrypted, size_bytes
 			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 		`, row.OrgID, *row.DeletedAt, row.LibraryID, row.OwnerID, row.OwnerEmail, row.OwnerName, row.Name, row.Encrypted, row.SizeBytes)
+		batch.Query(`
+			INSERT INTO library_admin_projection_state (library_id, org_id, owner_id, updated_at, deleted_at)
+			VALUES (?, ?, ?, ?, ?)
+		`, row.LibraryID, row.OrgID, row.OwnerID, row.UpdatedAt, row.DeletedAt)
+		return
 	}
 	batch.Query(`
-		INSERT INTO library_admin_projection_state (library_id, org_id, owner_id, updated_at, deleted_at)
-		VALUES (?, ?, ?, ?, ?)
-	`, row.LibraryID, row.OrgID, row.OwnerID, row.UpdatedAt, row.DeletedAt)
+		INSERT INTO library_admin_projection_state (library_id, org_id, owner_id, updated_at)
+		VALUES (?, ?, ?, ?)
+	`, row.LibraryID, row.OrgID, row.OwnerID, row.UpdatedAt)
+	batch.Query(`DELETE deleted_at FROM library_admin_projection_state WHERE library_id = ?`, row.LibraryID)
 }
 
 func ListAdminLibraryBucketDays(session *gocql.Session) ([]string, error) {

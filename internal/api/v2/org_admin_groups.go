@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	dbpkg "github.com/Sesame-Disk/sesamefs/internal/db"
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -221,13 +222,12 @@ func (h *OrgAdminHandler) TransferOrgGroup(c *gin.Context) {
 	}
 
 	// Verify group exists and get current owner
-	var creatorID string
-	if err := h.db.Session().Query(`
-		SELECT creator_id FROM groups WHERE org_id = ? AND group_id = ?
-	`, targetOrgID, groupID).Scan(&creatorID); err != nil {
+	projectionRow, err := readAdminGroupReadModelRow(h.db, targetOrgID, groupID)
+	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "group not found"})
 		return
 	}
+	creatorID := projectionRow.CreatorID
 
 	// Resolve new owner (must belong to this org)
 	newOwnerID, err := h.lookupOrgUserByEmail(targetOrgID, newOwnerEmail)
@@ -237,11 +237,13 @@ func (h *OrgAdminHandler) TransferOrgGroup(c *gin.Context) {
 	}
 
 	now := time.Now()
-
-	// Read group name and created_at for lookup table and response
-	var groupName string
-	var createdAt time.Time
-	h.db.Session().Query(`SELECT name, created_at FROM groups WHERE org_id = ? AND group_id = ?`, targetOrgID, groupID).Scan(&groupName, &createdAt)
+	updatedProjectionRow := projectionRow
+	updatedProjectionRow.CreatorID = newOwnerID
+	updatedProjectionRow.OwnerEmail, updatedProjectionRow.OwnerName = dbpkg.ResolveAdminGroupOwnerFields(
+		h.db.Session(),
+		targetOrgID,
+		newOwnerID,
+	)
 
 	batch := h.db.Session().Batch(gocql.LoggedBatch)
 	batch.Query(`
@@ -260,13 +262,10 @@ func (h *OrgAdminHandler) TransferOrgGroup(c *gin.Context) {
 	batch.Query(`
 		INSERT INTO groups_by_member (org_id, user_id, group_id, group_name, role, added_at)
 		VALUES (?, ?, ?, ?, ?, ?)
-	`, targetOrgID, newOwnerID, groupID, groupName, "owner", now)
+	`, targetOrgID, newOwnerID, groupID, projectionRow.Name, "owner", now)
+	addAdminGroupReadModelUpsertQuery(batch, updatedProjectionRow)
 	if err := batch.Exec(); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to transfer group ownership"})
-		return
-	}
-	if err := syncAdminGroupReadModel(h.db, targetOrgID, groupID); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to sync group read model"})
 		return
 	}
 
@@ -279,11 +278,11 @@ func (h *OrgAdminHandler) TransferOrgGroup(c *gin.Context) {
 	// Return full group object so frontend can update the list item directly
 	c.JSON(http.StatusOK, gin.H{
 		"id":                    groupID,
-		"group_name":            groupName,
+		"group_name":            projectionRow.Name,
 		"creator_name":          newOwnerName,
 		"creator_email":         newOwnerEmail,
 		"creator_contact_email": "",
-		"ctime":                 createdAt.Format(time.RFC3339),
+		"ctime":                 projectionRow.CreatedAt.Format(time.RFC3339),
 	})
 }
 
@@ -296,7 +295,6 @@ func (h *OrgAdminHandler) DeleteOrgGroup(c *gin.Context) {
 	}
 
 	groupID := c.Param("gid")
-	groupRow, _ := readAdminGroupReadModelRow(h.db, targetOrgID, groupID)
 
 	// Verify group exists
 	if err := h.db.Session().Query(`
@@ -306,39 +304,17 @@ func (h *OrgAdminHandler) DeleteOrgGroup(c *gin.Context) {
 		return
 	}
 
-	// Get all members before deleting, so we can clean up groups_by_member
-	memberIter := h.db.Session().Query(`SELECT user_id FROM group_members WHERE group_id = ?`, groupID).Iter()
-	var memberID string
-	var memberIDs []string
-	for memberIter.Scan(&memberID) {
-		memberIDs = append(memberIDs, memberID)
+	deleteState, err := loadGroupDeleteState(h.db, targetOrgID, groupID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to load group cleanup state"})
+		return
 	}
-	memberIter.Close()
 
 	batch := h.db.Session().Batch(gocql.LoggedBatch)
-	batch.Query(`DELETE FROM groups WHERE org_id = ? AND group_id = ?`, targetOrgID, groupID)
-	batch.Query(`DELETE FROM groups_by_id WHERE group_id = ?`, groupID)
-	batch.Query(`DELETE FROM group_members WHERE group_id = ?`, groupID)
+	addDeleteGroupMutationQueries(batch, targetOrgID, groupID, deleteState)
 	if err := batch.Exec(); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete group"})
 		return
-	}
-	if groupRow.GroupID != "" {
-		if err := deleteAdminGroupReadModel(h.db, groupRow); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to clean group read model"})
-			return
-		}
-	}
-	if err := cleanupGroupsByMember(h.db, targetOrgID, groupID, memberIDs); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to clean group membership index"})
-		return
-	}
-	groupUUID, err := uuid.Parse(groupID)
-	if err == nil {
-		if err := cleanupGroupShares(h.db, groupUUID); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to clean group shares"})
-			return
-		}
 	}
 
 	c.JSON(http.StatusOK, gin.H{"success": true})
@@ -680,10 +656,6 @@ func (h *OrgAdminHandler) AddOrgGroupOwnedLibrary(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create library"})
 		return
 	}
-	if err := syncAdminGroupReadModel(h.db, targetOrgID, groupID); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to sync group read model"})
-		return
-	}
 
 	// Initialize filesystem (root dir + initial commit)
 	fsHelper := NewFSHelper(h.db)
@@ -698,10 +670,6 @@ func (h *OrgAdminHandler) AddOrgGroupOwnedLibrary(c *gin.Context) {
 	if err := createLibraryShare(h.db, newLibID, shareID, callerUserID, groupID, "group", "rw", now, nil); err != nil {
 		_ = rollbackNewLibrary(h.db, targetOrgID, newLibID)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to share library with group"})
-		return
-	}
-	if err := syncAdminLibraryReadModel(h.db, targetOrgID, newLibID); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to sync library read model"})
 		return
 	}
 

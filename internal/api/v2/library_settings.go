@@ -10,6 +10,7 @@ import (
 	"github.com/Sesame-Disk/sesamefs/internal/config"
 	"github.com/Sesame-Disk/sesamefs/internal/db"
 	"github.com/Sesame-Disk/sesamefs/internal/middleware"
+	gocql "github.com/apache/cassandra-gocql-driver/v2"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 )
@@ -167,16 +168,27 @@ func (h *LibrarySettingsHandler) SetHistoryLimit(c *gin.Context) {
 	}
 
 	// Store in version_ttl_days column
-	if err := h.db.Session().Query(`
-		UPDATE libraries SET version_ttl_days = ?, updated_at = ?
-		WHERE org_id = ? AND library_id = ?
-	`, req.KeepDays, time.Now(), orgID, repoID).Exec(); err != nil {
-		log.Printf("[SetHistoryLimit] Failed to update: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update history limit"})
+	now := time.Now()
+	state, err := readAdminLibraryProjectionStateOptional(h.db, repoID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read library projection state"})
 		return
 	}
-	if err := syncAdminLibraryReadModel(h.db, orgID, repoID); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to sync library read model"})
+	projectionRow, err := db.ReadAdminLibraryProjectionRow(h.db.Session(), orgID, repoID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read library projection row"})
+		return
+	}
+	projectionRow.UpdatedAt = now
+	batch := h.db.Session().Batch(gocql.LoggedBatch)
+	batch.Query(`
+		UPDATE libraries SET version_ttl_days = ?, updated_at = ?
+		WHERE org_id = ? AND library_id = ?
+	`, req.KeepDays, now, orgID, repoID)
+	addAdminLibraryReadModelRefreshQueries(batch, projectionRow, state)
+	if err := batch.Exec(); err != nil {
+		log.Printf("[SetHistoryLimit] Failed to update: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update history limit"})
 		return
 	}
 
@@ -232,16 +244,27 @@ func (h *LibrarySettingsHandler) SetAutoDelete(c *gin.Context) {
 		return
 	}
 
-	if err := h.db.Session().Query(`
-		UPDATE libraries SET auto_delete_days = ?, updated_at = ?
-		WHERE org_id = ? AND library_id = ?
-	`, req.AutoDeleteDays, time.Now(), orgID, repoID).Exec(); err != nil {
-		log.Printf("[SetAutoDelete] Failed to update: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update auto-delete settings"})
+	now := time.Now()
+	state, err := readAdminLibraryProjectionStateOptional(h.db, repoID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read library projection state"})
 		return
 	}
-	if err := syncAdminLibraryReadModel(h.db, orgID, repoID); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to sync library read model"})
+	projectionRow, err := db.ReadAdminLibraryProjectionRow(h.db.Session(), orgID, repoID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read library projection row"})
+		return
+	}
+	projectionRow.UpdatedAt = now
+	batch := h.db.Session().Batch(gocql.LoggedBatch)
+	batch.Query(`
+		UPDATE libraries SET auto_delete_days = ?, updated_at = ?
+		WHERE org_id = ? AND library_id = ?
+	`, req.AutoDeleteDays, now, orgID, repoID)
+	addAdminLibraryReadModelRefreshQueries(batch, projectionRow, state)
+	if err := batch.Exec(); err != nil {
+		log.Printf("[SetAutoDelete] Failed to update: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update auto-delete settings"})
 		return
 	}
 

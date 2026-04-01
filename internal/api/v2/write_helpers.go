@@ -48,7 +48,89 @@ func createUserWithEmailLookup(db interface{ Session() *gocql.Session }, orgID, 
 	return batch.Exec()
 }
 
+func readAdminLibraryProjectionStateOptional(db interface{ Session() *gocql.Session }, libraryID string) (*dbpkg.AdminLibraryProjectionState, error) {
+	state, err := dbpkg.ReadAdminLibraryProjectionState(db.Session(), libraryID)
+	if err == gocql.ErrNotFound {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &state, nil
+}
+
+func addAdminLibraryReadModelRefreshQueries(batch *gocql.Batch, row dbpkg.AdminLibraryProjectionRow, state *dbpkg.AdminLibraryProjectionState) {
+	if state != nil {
+		dbpkg.AddDeleteAdminLibraryReadModelQuery(batch, *state)
+	}
+	dbpkg.AddUpsertAdminLibraryReadModelQuery(batch, row)
+}
+
+func buildShareReadModelRow(
+	db interface{ Session() *gocql.Session },
+	libraryID, shareID, sharedBy, sharedTo, sharedToType, permission string,
+	createdAt time.Time,
+	expiresAt *time.Time,
+) (dbpkg.ShareReadModelRow, error) {
+	row := dbpkg.ShareReadModelRow{
+		LibraryID:    libraryID,
+		ShareID:      shareID,
+		SharedBy:     sharedBy,
+		SharedTo:     sharedTo,
+		SharedToType: sharedToType,
+		Permission:   permission,
+		CreatedAt:    createdAt,
+		ExpiresAt:    expiresAt,
+	}
+	if err := db.Session().Query(`
+		SELECT org_id, name, encrypted FROM libraries_by_id WHERE library_id = ?
+	`, libraryID).Scan(&row.OrgID, &row.RepoName, &row.Encrypted); err != nil {
+		return dbpkg.ShareReadModelRow{}, err
+	}
+	_ = db.Session().Query(`
+		SELECT size_bytes FROM libraries WHERE org_id = ? AND library_id = ?
+	`, row.OrgID, libraryID).Scan(&row.SizeBytes)
+	row.SharedByEmail, row.SharedByName = dbpkg.ResolveAdminLibraryOwnerFields(db.Session(), row.OrgID, sharedBy)
+	return row, nil
+}
+
+func buildAdminGroupProjectionRow(
+	db interface{ Session() *gocql.Session },
+	orgID, groupID, name, creatorID, parentGroupID string,
+	isDepartment bool,
+	createdAt time.Time,
+) dbpkg.AdminGroupProjectionRow {
+	ownerEmail, ownerName := dbpkg.ResolveAdminGroupOwnerFields(db.Session(), orgID, creatorID)
+	return dbpkg.AdminGroupProjectionRow{
+		OrgID:         orgID,
+		GroupID:       groupID,
+		Name:          name,
+		CreatorID:     creatorID,
+		OwnerEmail:    ownerEmail,
+		OwnerName:     ownerName,
+		ParentGroupID: parentGroupID,
+		IsDepartment:  isDepartment,
+		CreatedAt:     createdAt,
+	}
+}
+
+func addAdminGroupReadModelUpsertQuery(batch *gocql.Batch, row dbpkg.AdminGroupProjectionRow) {
+	dbpkg.AddUpsertAdminGroupReadModelQuery(batch, row)
+}
+
 func updateLibraryOwner(db interface{ Session() *gocql.Session }, orgID, libraryID, newOwnerID string, updatedAt time.Time) error {
+	state, err := readAdminLibraryProjectionStateOptional(db, libraryID)
+	if err != nil {
+		return err
+	}
+	row, err := dbpkg.ReadAdminLibraryProjectionRow(db.Session(), orgID, libraryID)
+	if err != nil {
+		return err
+	}
+	row.OwnerID = newOwnerID
+	row.OwnerEmail, row.OwnerName = dbpkg.ResolveAdminLibraryOwnerFields(db.Session(), orgID, newOwnerID)
+	row.UpdatedAt = updatedAt
+
 	batch := db.Session().Batch(gocql.LoggedBatch)
 	batch.Query(`
 		UPDATE libraries SET owner_id = ?, updated_at = ?
@@ -58,10 +140,8 @@ func updateLibraryOwner(db interface{ Session() *gocql.Session }, orgID, library
 		UPDATE libraries_by_id SET owner_id = ?
 		WHERE library_id = ?
 	`, newOwnerID, libraryID)
-	if err := batch.Exec(); err != nil {
-		return err
-	}
-	return dbpkg.SyncAdminLibraryReadModel(db.Session(), orgID, libraryID)
+	addAdminLibraryReadModelRefreshQueries(batch, row, state)
+	return batch.Exec()
 }
 
 func createRepoAPIToken(db interface{ Session() *gocql.Session }, repoID, appName, apiToken, permission, generatedBy string, createdAt time.Time) error {
@@ -102,6 +182,11 @@ func deleteRepoAPIToken(db interface{ Session() *gocql.Session }, repoID, appNam
 }
 
 func createLibraryShare(db interface{ Session() *gocql.Session }, libraryID, shareID, sharedBy, sharedTo, sharedToType, permission string, createdAt time.Time, expiresAt *time.Time) error {
+	row, err := buildShareReadModelRow(db, libraryID, shareID, sharedBy, sharedTo, sharedToType, permission, createdAt, expiresAt)
+	if err != nil {
+		return err
+	}
+
 	batch := db.Session().Batch(gocql.LoggedBatch)
 	batch.Query(`
 		INSERT INTO shares (
@@ -113,13 +198,17 @@ func createLibraryShare(db interface{ Session() *gocql.Session }, libraryID, sha
 		INSERT INTO shares_by_user (shared_to, library_id, shared_to_type, permission, shared_by, created_at)
 		VALUES (?, ?, ?, ?, ?, ?)
 	`, sharedTo, libraryID, sharedToType, permission, sharedBy, createdAt)
-	if err := batch.Exec(); err != nil {
-		return err
-	}
-	return dbpkg.SyncShareReadModel(db.Session(), libraryID, shareID)
+	dbpkg.AddUpsertShareReadModelQuery(batch, row)
+	return batch.Exec()
 }
 
 func updateLibrarySharePermission(db interface{ Session() *gocql.Session }, libraryID, shareID, sharedTo, permission string) error {
+	row, err := dbpkg.ReadShareReadModelRow(db.Session(), libraryID, shareID)
+	if err != nil {
+		return err
+	}
+	row.Permission = permission
+
 	batch := db.Session().Batch(gocql.LoggedBatch)
 	batch.Query(`
 		UPDATE shares SET permission = ? WHERE library_id = ? AND share_id = ?
@@ -127,10 +216,8 @@ func updateLibrarySharePermission(db interface{ Session() *gocql.Session }, libr
 	batch.Query(`
 		UPDATE shares_by_user SET permission = ? WHERE shared_to = ? AND library_id = ?
 	`, permission, sharedTo, libraryID)
-	if err := batch.Exec(); err != nil {
-		return err
-	}
-	return dbpkg.SyncShareReadModel(db.Session(), libraryID, shareID)
+	dbpkg.AddUpsertShareReadModelQuery(batch, row)
+	return batch.Exec()
 }
 
 func deleteLibraryShare(db interface{ Session() *gocql.Session }, libraryID, shareID, sharedTo string) error {
@@ -162,14 +249,8 @@ func deleteAdminGroupReadModel(db interface{ Session() *gocql.Session }, row dbp
 }
 
 func renameGroup(db interface{ Session() *gocql.Session }, orgID, groupID, newName string, updatedAt time.Time) error {
-	batch := db.Session().Batch(gocql.LoggedBatch)
-	batch.Query(`
-		UPDATE groups SET name = ?, updated_at = ? WHERE org_id = ? AND group_id = ?
-	`, newName, updatedAt, orgID, groupID)
-	batch.Query(`
-		UPDATE groups_by_id SET name = ? WHERE group_id = ?
-	`, newName, groupID)
-	if err := batch.Exec(); err != nil {
+	groupRow, err := readAdminGroupReadModelRow(db, orgID, groupID)
+	if err != nil {
 		return err
 	}
 
@@ -186,29 +267,25 @@ func renameGroup(db interface{ Session() *gocql.Session }, orgID, groupID, newNa
 		return err
 	}
 
-	var failedCount int
-	for i := 0; i < len(memberIDs); i += 50 {
-		end := i + 50
-		if end > len(memberIDs) {
-			end = len(memberIDs)
-		}
-		memberBatch := db.Session().Batch(gocql.UnloggedBatch)
-		batchSize := end - i
-		for _, userID := range memberIDs[i:end] {
-			memberBatch.Query(`
-				UPDATE groups_by_member SET group_name = ? WHERE org_id = ? AND user_id = ? AND group_id = ?
-			`, newName, orgID, userID, groupID)
-		}
-		if err := memberBatch.Exec(); err != nil {
-			failedCount += batchSize
-		}
+	batch := db.Session().Batch(gocql.LoggedBatch)
+	batch.Query(`
+		UPDATE groups SET name = ?, updated_at = ? WHERE org_id = ? AND group_id = ?
+	`, newName, updatedAt, orgID, groupID)
+	batch.Query(`
+		UPDATE groups_by_id SET name = ? WHERE group_id = ?
+	`, newName, groupID)
+	for _, userID := range memberIDs {
+		batch.Query(`
+			UPDATE groups_by_member SET group_name = ? WHERE org_id = ? AND user_id = ? AND group_id = ?
+		`, newName, orgID, userID, groupID)
 	}
 
-	if failedCount > 0 {
-		return fmt.Errorf("group renamed but failed to update %d member index rows", failedCount)
+	groupRow.Name = newName
+	addAdminGroupReadModelUpsertQuery(batch, groupRow)
+	if err := batch.Exec(); err != nil {
+		return fmt.Errorf("rename group: %w", err)
 	}
-
-	return syncAdminGroupReadModel(db, orgID, groupID)
+	return nil
 }
 
 // SessionInvalidator can revoke all sessions for a given user.
@@ -534,33 +611,65 @@ func addDeleteAdminLibraryReadModelQueries(db interface{ Session() *gocql.Sessio
 // traffic.DeleteLibraryStorageCounter.
 func softDeleteLibrary(db interface{ Session() *gocql.Session }, orgID, ownerID, deletedBy, libraryID string) error {
 	now := time.Now()
-	if err := db.Session().Query(`
-		UPDATE libraries SET deleted_at = ?, deleted_by = ?
+	state, err := readAdminLibraryProjectionStateOptional(db, libraryID)
+	if err != nil {
+		return fmt.Errorf("read library projection state: %w", err)
+	}
+	projectionRow, err := dbpkg.ReadAdminLibraryProjectionRow(db.Session(), orgID, libraryID)
+	if err != nil {
+		return fmt.Errorf("read library projection row: %w", err)
+	}
+	projectionRow.UpdatedAt = now
+	projectionRow.DeletedAt = &now
+	batch := db.Session().Batch(gocql.LoggedBatch)
+	batch.Query(`
+		UPDATE libraries SET deleted_at = ?, deleted_by = ?, updated_at = ?
 		WHERE org_id = ? AND library_id = ?`,
-		now, deletedBy, orgID, libraryID,
-	).Exec(); err != nil {
+		now, deletedBy, now, orgID, libraryID,
+	)
+	addAdminLibraryReadModelRefreshQueries(batch, projectionRow, state)
+	if err := batch.Exec(); err != nil {
 		return fmt.Errorf("soft-delete library: %w", err)
 	}
 
 	// Read the live lib-scope counter and subtract from aggregate scopes.
 	traffic.AdjustAggregateStorageCounters(db, orgID, ownerID, libraryID, false)
-	return syncAdminLibraryReadModel(db, orgID, libraryID)
+	return nil
 }
 
 // restoreDeletedLibrary clears deleted_at and re-adds the library's storage to
 // aggregate counters. Mirror image of softDeleteLibrary.
 func restoreDeletedLibrary(db interface{ Session() *gocql.Session }, orgID, ownerID, libraryID string) error {
-	if err := db.Session().Query(`
+	now := time.Now()
+	state, err := readAdminLibraryProjectionStateOptional(db, libraryID)
+	if err != nil {
+		return fmt.Errorf("read library projection state: %w", err)
+	}
+	projectionRow, err := dbpkg.ReadAdminLibraryProjectionRow(db.Session(), orgID, libraryID)
+	if err != nil {
+		return fmt.Errorf("read library projection row: %w", err)
+	}
+	projectionRow.UpdatedAt = now
+	projectionRow.DeletedAt = nil
+	batch := db.Session().Batch(gocql.LoggedBatch)
+	batch.Query(`
+		UPDATE libraries SET updated_at = ?
+		WHERE org_id = ? AND library_id = ?`,
+		now, orgID, libraryID,
+	)
+	batch.Query(`
 		DELETE deleted_at, deleted_by FROM libraries
 		WHERE org_id = ? AND library_id = ?`,
 		orgID, libraryID,
-	).Exec(); err != nil {
+	)
+	addAdminLibraryReadModelRefreshQueries(batch, projectionRow, state)
+	if err := batch.Exec(); err != nil {
 		return fmt.Errorf("restore library: %w", err)
 	}
 
 	// Re-add the library's storage to aggregates.
 	traffic.AdjustAggregateStorageCounters(db, orgID, ownerID, libraryID, true)
-	return syncAdminLibraryReadModel(db, orgID, libraryID)
+	return nil
 }
 
 // orgQuotas holds an organization's quota limits.

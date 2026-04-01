@@ -233,6 +233,7 @@ func (h *AdminHandler) AdminCreateGroup(c *gin.Context) {
 
 	groupUUID := uuid.New()
 	now := time.Now()
+	projectionRow := buildAdminGroupProjectionRow(h.db, orgID, groupUUID.String(), groupName, ownerID, "", false, now)
 
 	// Atomic batch: create group + lookup + owner membership
 	batch := h.db.Session().Batch(gocql.LoggedBatch)
@@ -246,20 +247,17 @@ func (h *AdminHandler) AdminCreateGroup(c *gin.Context) {
 	batch.Query(`INSERT INTO groups_by_member (org_id, user_id, group_id, group_name, role, added_at)
 		VALUES (?, ?, ?, ?, ?, ?)`,
 		orgID, ownerID, groupUUID.String(), groupName, "owner", now)
+	addAdminGroupReadModelUpsertQuery(batch, projectionRow)
 	if err := batch.Exec(); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create group"})
-		return
-	}
-	if err := syncAdminGroupReadModel(h.db, orgID, groupUUID.String()); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to sync group read model"})
 		return
 	}
 
 	c.JSON(http.StatusCreated, adminGroupResponse{
 		ID:            groupUUID.String(),
 		Name:          groupName,
-		Owner:         ownerEmail,
-		OwnerName:     ownerEmail,
+		Owner:         projectionRow.OwnerEmail,
+		OwnerName:     projectionRow.OwnerName,
 		CreatedAt:     now.Format(time.RFC3339),
 		ParentGroupID: 0,
 	})
@@ -277,7 +275,6 @@ func (h *AdminHandler) AdminDeleteGroup(c *gin.Context) {
 
 	groupID := c.Param("group_id")
 	orgID := callerOrgID
-	groupRow, _ := readAdminGroupReadModelRow(h.db, orgID, groupID)
 
 	// Verify group exists
 	var name string
@@ -288,39 +285,17 @@ func (h *AdminHandler) AdminDeleteGroup(c *gin.Context) {
 		return
 	}
 
-	// Get all members before deleting (for groups_by_member cleanup)
-	memberIter := h.db.Session().Query(`SELECT user_id FROM group_members WHERE group_id = ?`, groupID).Iter()
-	var memberID string
-	var memberIDs []string
-	for memberIter.Scan(&memberID) {
-		memberIDs = append(memberIDs, memberID)
+	deleteState, err := loadGroupDeleteState(h.db, orgID, groupID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to load group cleanup state"})
+		return
 	}
-	memberIter.Close()
 
-	// Atomic batch: delete group + groups_by_id + group_members
+	// Atomic batch: delete group + indexes + shares + read model
 	batch := h.db.Session().Batch(gocql.LoggedBatch)
-	batch.Query(`DELETE FROM groups WHERE org_id = ? AND group_id = ?`, orgID, groupID)
-	batch.Query(`DELETE FROM groups_by_id WHERE group_id = ?`, groupID)
-	batch.Query(`DELETE FROM group_members WHERE group_id = ?`, groupID)
+	addDeleteGroupMutationQueries(batch, orgID, groupID, deleteState)
 	if err := batch.Exec(); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete group"})
-		return
-	}
-	if groupRow.GroupID != "" {
-		if err := deleteAdminGroupReadModel(h.db, groupRow); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to clean group read model"})
-			return
-		}
-	}
-
-	if err := cleanupGroupsByMember(h.db, orgID, groupID, memberIDs); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to clean group membership index"})
-		return
-	}
-
-	groupUUID, _ := uuid.Parse(groupID)
-	if err := cleanupGroupShares(h.db, groupUUID); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to clean group shares"})
 		return
 	}
 
@@ -328,7 +303,7 @@ func (h *AdminHandler) AdminDeleteGroup(c *gin.Context) {
 	orgUUID, _ := uuid.Parse(orgID)
 	auditDetails, _ := json.Marshal(map[string]interface{}{
 		"group_name":    name,
-		"members_count": len(memberIDs),
+		"members_count": len(deleteState.memberIDs),
 	})
 	if err := h.db.Session().Query(`
 		INSERT INTO audit_log (org_id, timestamp, action, target_type, target_id, actor_id, details)
@@ -401,13 +376,12 @@ func (h *AdminHandler) AdminTransferGroup(c *gin.Context) {
 	}
 
 	// Verify group exists
-	var creatorID string
-	if err := h.db.Session().Query(`
-		SELECT creator_id FROM groups WHERE org_id = ? AND group_id = ?
-	`, orgID, groupID).Scan(&creatorID); err != nil {
+	projectionRow, err := readAdminGroupReadModelRow(h.db, orgID, groupID)
+	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "group not found"})
 		return
 	}
+	creatorID := projectionRow.CreatorID
 
 	// Resolve new owner
 	newOwnerID, newOwnerOrgID, err := h.lookupUserByEmail(newOwnerEmail)
@@ -421,8 +395,9 @@ func (h *AdminHandler) AdminTransferGroup(c *gin.Context) {
 	}
 
 	now := time.Now()
-	var groupName string
-	h.db.Session().Query(`SELECT name FROM groups WHERE org_id = ? AND group_id = ?`, orgID, groupID).Scan(&groupName)
+	updatedProjectionRow := projectionRow
+	updatedProjectionRow.CreatorID = newOwnerID
+	updatedProjectionRow.OwnerEmail, updatedProjectionRow.OwnerName = dbpkg.ResolveAdminGroupOwnerFields(h.db.Session(), orgID, newOwnerID)
 
 	batch := h.db.Session().Batch(gocql.LoggedBatch)
 	batch.Query(`
@@ -441,13 +416,10 @@ func (h *AdminHandler) AdminTransferGroup(c *gin.Context) {
 	batch.Query(`
 		INSERT INTO groups_by_member (org_id, user_id, group_id, group_name, role, added_at)
 		VALUES (?, ?, ?, ?, ?, ?)
-	`, orgID, newOwnerID, groupID, groupName, "owner", now)
+	`, orgID, newOwnerID, groupID, projectionRow.Name, "owner", now)
+	addAdminGroupReadModelUpsertQuery(batch, updatedProjectionRow)
 	if err := batch.Exec(); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to transfer group ownership"})
-		return
-	}
-	if err := syncAdminGroupReadModel(h.db, orgID, groupID); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to sync group read model"})
 		return
 	}
 
@@ -459,7 +431,7 @@ func (h *AdminHandler) AdminTransferGroup(c *gin.Context) {
 	}
 	c.JSON(http.StatusOK, adminGroupResponse{
 		ID:            groupID,
-		Name:          groupName,
+		Name:          projectionRow.Name,
 		Owner:         newOwnerEmail,
 		OwnerName:     newOwnerName,
 		CreatedAt:     now.Format(time.RFC3339),

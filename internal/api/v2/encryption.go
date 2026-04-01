@@ -8,6 +8,7 @@ import (
 
 	"github.com/Sesame-Disk/sesamefs/internal/crypto"
 	"github.com/Sesame-Disk/sesamefs/internal/db"
+	gocql "github.com/apache/cassandra-gocql-driver/v2"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 )
@@ -280,7 +281,20 @@ func (h *EncryptionHandler) ChangePassword(c *gin.Context) {
 	}
 
 	// Update database with new encryption params
-	if err := h.db.Session().Query(`
+	now := time.Now()
+	state, err := readAdminLibraryProjectionStateOptional(h.db, repoID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read library projection state"})
+		return
+	}
+	projectionRow, err := db.ReadAdminLibraryProjectionRow(h.db.Session(), orgID, repoID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read library projection row"})
+		return
+	}
+	projectionRow.UpdatedAt = now
+	batch := h.db.Session().Batch(gocql.LoggedBatch)
+	batch.Query(`
 		UPDATE libraries SET
 			enc_version = ?,
 			salt = ?,
@@ -291,13 +305,11 @@ func (h *EncryptionHandler) ChangePassword(c *gin.Context) {
 			updated_at = ?
 		WHERE org_id = ? AND library_id = ?
 	`, newParams.EncVersion, newParams.Salt, newParams.Magic, newParams.RandomKey,
-		newParams.MagicStrong, newParams.RandomKeyStrong, time.Now(),
-		orgID, repoID).Exec(); err != nil {
+		newParams.MagicStrong, newParams.RandomKeyStrong, now,
+		orgID, repoID)
+	addAdminLibraryReadModelRefreshQueries(batch, projectionRow, state)
+	if err := batch.Exec(); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update library"})
-		return
-	}
-	if err := syncAdminLibraryReadModel(h.db, orgID, repoID); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to sync library read model"})
 		return
 	}
 

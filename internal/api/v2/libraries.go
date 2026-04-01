@@ -533,6 +533,11 @@ func (h *LibraryHandler) CreateLibrary(c *gin.Context) {
 
 	// Insert into database with head_commit_id and encryption params
 	// Use batched writes to maintain consistency between libraries and libraries_by_id
+	userEmail := c.GetString("user_email")
+	if userEmail == "" {
+		userEmail = h.resolveOwnerEmail(orgID, userID)
+	}
+	ownerName := strings.Split(userEmail, "@")[0]
 	batch := h.db.Session().Batch(gocql.LoggedBatch)
 	batch.Query(`
 		INSERT INTO fs_objects (library_id, fs_id, obj_type, obj_name, dir_entries, mtime)
@@ -591,21 +596,23 @@ func (h *LibraryHandler) CreateLibrary(c *gin.Context) {
 		INSERT INTO commits (library_id, commit_id, root_fs_id, creator_id, description, created_at)
 		VALUES (?, ?, ?, ?, ?, ?)
 	`, newLibID.String(), headCommitID, rootFSID, userID, "Initial commit", now)
+	addAdminLibraryReadModelRefreshQueries(batch, db.AdminLibraryProjectionRow{
+		OrgID:        orgID,
+		LibraryID:    newLibID.String(),
+		OwnerID:      userID,
+		OwnerEmail:   userEmail,
+		OwnerName:    ownerName,
+		Name:         library.Name,
+		Encrypted:    library.Encrypted,
+		StorageClass: library.StorageClass,
+		SizeBytes:    library.SizeBytes,
+		FileCount:    library.FileCount,
+		UpdatedAt:    library.UpdatedAt,
+	}, nil)
 
 	if err := batch.Exec(); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create library", "details": err.Error()})
 		return
-	}
-	if err := syncAdminLibraryReadModel(h.db, orgID, newLibID.String()); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to sync library read model"})
-		return
-	}
-
-	// Get user email for response (normally set by auth middleware;
-	// fall back to a DB lookup in case the middleware did not populate it).
-	userEmail := c.GetString("user_email")
-	if userEmail == "" {
-		userEmail = h.resolveOwnerEmail(orgID, userID)
 	}
 
 	// Generate sync token if token creator is available
@@ -860,13 +867,24 @@ func (h *LibraryHandler) UpdateLibrary(c *gin.Context) {
 			WHERE library_id = ?
 		`, *req.Name, repoID)
 	}
+	state, err := readAdminLibraryProjectionStateOptional(h.db, repoID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read library projection state"})
+		return
+	}
+	projectionRow, err := db.ReadAdminLibraryProjectionRow(h.db.Session(), orgID, repoID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read library projection row"})
+		return
+	}
+	if req.Name != nil {
+		projectionRow.Name = *req.Name
+	}
+	projectionRow.UpdatedAt = values[len(values)-3].(time.Time)
+	addAdminLibraryReadModelRefreshQueries(batch, projectionRow, state)
 
 	if err := batch.Exec(); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update library"})
-		return
-	}
-	if err := syncAdminLibraryReadModel(h.db, orgID, repoID); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to sync library read model"})
 		return
 	}
 
@@ -964,6 +982,18 @@ func (h *LibraryHandler) RenameLibrary(c *gin.Context) {
 	}
 
 	now := time.Now()
+	state, err := readAdminLibraryProjectionStateOptional(h.db, repoID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read library projection state"})
+		return
+	}
+	projectionRow, err := db.ReadAdminLibraryProjectionRow(h.db.Session(), orgID, repoID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read library projection row"})
+		return
+	}
+	projectionRow.Name = req.RepoName
+	projectionRow.UpdatedAt = now
 	batch := h.db.Session().Batch(gocql.LoggedBatch)
 	batch.Query(`
 		UPDATE libraries SET name = ?, updated_at = ?
@@ -973,13 +1003,10 @@ func (h *LibraryHandler) RenameLibrary(c *gin.Context) {
 		UPDATE libraries_by_id SET name = ?
 		WHERE library_id = ?
 	`, req.RepoName, repoID)
+	addAdminLibraryReadModelRefreshQueries(batch, projectionRow, state)
 
 	if err := batch.Exec(); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to rename library"})
-		return
-	}
-	if err := syncAdminLibraryReadModel(h.db, orgID, repoID); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to sync library read model"})
 		return
 	}
 
@@ -1008,15 +1035,27 @@ func (h *LibraryHandler) ChangeStorageClass(c *gin.Context) {
 		return
 	}
 
-	if err := h.db.Session().Query(`
-		UPDATE libraries SET storage_class = ?, updated_at = ?
-		WHERE org_id = ? AND library_id = ?
-	`, req.StorageClass, time.Now(), orgID, repoID).Exec(); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update storage class"})
+	now := time.Now()
+	state, err := readAdminLibraryProjectionStateOptional(h.db, repoID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read library projection state"})
 		return
 	}
-	if err := syncAdminLibraryReadModel(h.db, orgID, repoID); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to sync library read model"})
+	projectionRow, err := db.ReadAdminLibraryProjectionRow(h.db.Session(), orgID, repoID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read library projection row"})
+		return
+	}
+	projectionRow.StorageClass = req.StorageClass
+	projectionRow.UpdatedAt = now
+	batch := h.db.Session().Batch(gocql.LoggedBatch)
+	batch.Query(`
+		UPDATE libraries SET storage_class = ?, updated_at = ?
+		WHERE org_id = ? AND library_id = ?
+	`, req.StorageClass, now, orgID, repoID)
+	addAdminLibraryReadModelRefreshQueries(batch, projectionRow, state)
+	if err := batch.Exec(); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update storage class"})
 		return
 	}
 
