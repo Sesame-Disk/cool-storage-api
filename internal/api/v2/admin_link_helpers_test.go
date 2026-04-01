@@ -1,6 +1,7 @@
 package v2
 
 import (
+	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -74,6 +75,35 @@ func TestAdminLinkListFilters_MatchesStateAndSearch(t *testing.T) {
 	}
 	if filters.MatchesSearch("Quarterly Plan.pdf", "bob@example.com") {
 		t.Fatal("expected unrelated values not to match search")
+	}
+}
+
+func TestParseAdminLinkListFiltersFromContext_IncludeActive(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	req := httptest.NewRequest("GET", "/?active=false&expired=false&search=Alpha", nil)
+	c.Request = req
+
+	filters, err := parseAdminLinkListFiltersFromContext(c, true)
+	if err != nil {
+		t.Fatalf("parseAdminLinkListFiltersFromContext returned error: %v", err)
+	}
+	if !filters.HasActiveFilter || filters.ActiveFilter {
+		t.Fatalf("expected active filter false to be applied: %#v", filters)
+	}
+	if !filters.HasExpiredFilter || filters.ExpiredFilter {
+		t.Fatalf("expected expired filter false to be applied: %#v", filters)
+	}
+	if filters.Search != "alpha" {
+		t.Fatalf("search = %q, want %q", filters.Search, "alpha")
+	}
+
+	filters, err = parseAdminLinkListFiltersFromContext(c, false)
+	if err != nil {
+		t.Fatalf("parseAdminLinkListFiltersFromContext returned error: %v", err)
+	}
+	if filters.HasActiveFilter {
+		t.Fatalf("expected active filter to be ignored when includeActive=false: %#v", filters)
 	}
 }
 

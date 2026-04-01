@@ -45,6 +45,10 @@ func TestOrgAdminRequireOrgAccess_Unauthenticated(t *testing.T) {
 	r.DELETE("/org/:org_id/admin/devices/", h.UnlinkOrgDevice)
 	r.GET("/org/:org_id/admin/devices-errors/", h.ListOrgDeviceErrors)
 	r.DELETE("/org/:org_id/admin/devices-errors/", h.ClearOrgDeviceErrors)
+	r.GET("/org/:org_id/admin/links/", h.ListOrgLinks)
+	r.DELETE("/org/:org_id/admin/links/:token/", h.DeleteOrgLink)
+	r.GET("/org/:org_id/admin/upload-links/", h.ListOrgUploadLinks)
+	r.DELETE("/org/:org_id/admin/upload-links/:token/", h.DeleteOrgUploadLink)
 	r.DELETE("/org/:org_id/admin/trash-libraries/", h.CleanOrgTrashLibraries)
 	r.DELETE("/org/:org_id/admin/trash-libraries/:rid/", h.DeleteOrgTrashLibrary)
 	r.DELETE("/org/:org_id/admin/groups/:gid/group-owned-libraries/:rid/", h.DeleteOrgGroupOwnedLibrary)
@@ -61,6 +65,10 @@ func TestOrgAdminRequireOrgAccess_Unauthenticated(t *testing.T) {
 		{name: "unlink device unauthenticated", method: http.MethodDelete, path: "/org/00000000-0000-0000-0000-000000000001/admin/devices/"},
 		{name: "list device errors unauthenticated", method: http.MethodGet, path: "/org/00000000-0000-0000-0000-000000000001/admin/devices-errors/"},
 		{name: "clear device errors unauthenticated", method: http.MethodDelete, path: "/org/00000000-0000-0000-0000-000000000001/admin/devices-errors/"},
+		{name: "list links unauthenticated", method: http.MethodGet, path: "/org/00000000-0000-0000-0000-000000000001/admin/links/"},
+		{name: "delete link unauthenticated", method: http.MethodDelete, path: "/org/00000000-0000-0000-0000-000000000001/admin/links/token-1/"},
+		{name: "list upload links unauthenticated", method: http.MethodGet, path: "/org/00000000-0000-0000-0000-000000000001/admin/upload-links/"},
+		{name: "delete upload link unauthenticated", method: http.MethodDelete, path: "/org/00000000-0000-0000-0000-000000000001/admin/upload-links/token-1/"},
 		{name: "clean trash unauthenticated", method: http.MethodDelete, path: "/org/00000000-0000-0000-0000-000000000001/admin/trash-libraries/"},
 		{name: "delete trash library unauthenticated", method: http.MethodDelete, path: "/org/00000000-0000-0000-0000-000000000001/admin/trash-libraries/11111111-1111-1111-1111-111111111111/"},
 		{name: "delete group-owned library unauthenticated", method: http.MethodDelete, path: "/org/00000000-0000-0000-0000-000000000001/admin/groups/22222222-2222-2222-2222-222222222222/group-owned-libraries/11111111-1111-1111-1111-111111111111/"},
@@ -134,6 +142,22 @@ func TestOrgAdminRequireOrgAccess_CrossOrgForbidden(t *testing.T) {
 			},
 		},
 		{
+			name:   "list links org B rejected for admin of org A",
+			method: http.MethodGet,
+			path:   "/org/" + orgB + "/admin/links/",
+			setup: func(r *gin.Engine) {
+				r.GET("/org/:org_id/admin/links/", h.ListOrgLinks)
+			},
+		},
+		{
+			name:   "list upload links org B rejected for admin of org A",
+			method: http.MethodGet,
+			path:   "/org/" + orgB + "/admin/upload-links/",
+			setup: func(r *gin.Engine) {
+				r.GET("/org/:org_id/admin/upload-links/", h.ListOrgUploadLinks)
+			},
+		},
+		{
 			name:   "delete repo org B rejected for admin of org A",
 			method: http.MethodDelete,
 			path:   "/org/" + orgB + "/admin/repos/repo-b/",
@@ -150,10 +174,6 @@ func TestOrgAdminRequireOrgAccess_CrossOrgForbidden(t *testing.T) {
 			},
 		},
 		{
-			// ListOrgLinks uses c.GetString("org_id") from the auth context (always
-			// the caller's own org), so cross-org cannot be attempted via the URL.
-			// ClearOrgDeviceErrors uses requireOrgAccess with c.Param("org_id") and
-			// is a representative destructive link-adjacent operation.
 			name:   "clear device errors org B rejected for admin of org A",
 			method: http.MethodDelete,
 			path:   "/org/" + orgB + "/admin/devices-errors/",

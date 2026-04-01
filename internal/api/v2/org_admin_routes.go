@@ -36,6 +36,10 @@ func registerOrgAdminSharedRoutes(noIDGroup *gin.RouterGroup, h *OrgAdminHandler
 }
 
 func registerOrgAdminScopedRoutes(idGroup *gin.RouterGroup, h *OrgAdminHandler) {
+	registerGetWithSlashVariants(idGroup, "/links", h.ListOrgLinks)
+	registerDeleteWithSlashVariants(idGroup, "/links/:token", h.DeleteOrgLink)
+	registerGetWithSlashVariants(idGroup, "/upload-links", h.ListOrgUploadLinks)
+	registerDeleteWithSlashVariants(idGroup, "/upload-links/:token", h.DeleteOrgUploadLink)
 	registerOrgAdminUserRoutes(idGroup, h)
 	registerPutWithSlashVariants(idGroup, "/transfer-ownership", h.TransferOrgOwnership)
 	registerOrgAdminGroupRoutes(idGroup, h)

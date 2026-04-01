@@ -234,6 +234,7 @@ class Links extends Component {
                 loading={loading}
                 errorMsg={errorMsg}
                 items={items}
+                isShareLink={isShare}
                 currentPage={currentPage}
                 perPage={perPage}
                 hasNextPage={hasNextPage}

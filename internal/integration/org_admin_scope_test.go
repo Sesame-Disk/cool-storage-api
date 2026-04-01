@@ -18,16 +18,22 @@ func TestOrgAdminScopedIsolation(t *testing.T) {
 		assertScopedStatus(t, adminClient, http.MethodGet, fmt.Sprintf("/api/v2.1/org/%s/admin/users/", defaultOrgID), http.StatusOK)
 		assertScopedStatus(t, adminClient, http.MethodGet, fmt.Sprintf("/api/v2.1/org/%s/admin/repos/", defaultOrgID), http.StatusOK)
 		assertScopedStatus(t, adminClient, http.MethodGet, fmt.Sprintf("/api/v2.1/org/%s/admin/devices-errors/", defaultOrgID), http.StatusOK)
+		assertScopedStatus(t, adminClient, http.MethodGet, fmt.Sprintf("/api/v2.1/org/%s/admin/links/", defaultOrgID), http.StatusOK)
+		assertScopedStatus(t, adminClient, http.MethodGet, fmt.Sprintf("/api/v2.1/org/%s/admin/upload-links/", defaultOrgID), http.StatusOK)
 	})
 
 	t.Run("org admin is forbidden from tenant and platform orgs", func(t *testing.T) {
 		assertScopedStatus(t, adminClient, http.MethodGet, fmt.Sprintf("/api/v2.1/org/%s/admin/users/", tenantOrgID), http.StatusForbidden)
 		assertScopedStatus(t, adminClient, http.MethodGet, fmt.Sprintf("/api/v2.1/org/%s/admin/repos/", tenantOrgID), http.StatusForbidden)
 		assertScopedStatus(t, adminClient, http.MethodGet, fmt.Sprintf("/api/v2.1/org/%s/admin/devices-errors/", tenantOrgID), http.StatusForbidden)
+		assertScopedStatus(t, adminClient, http.MethodGet, fmt.Sprintf("/api/v2.1/org/%s/admin/links/", tenantOrgID), http.StatusForbidden)
+		assertScopedStatus(t, adminClient, http.MethodGet, fmt.Sprintf("/api/v2.1/org/%s/admin/upload-links/", tenantOrgID), http.StatusForbidden)
 
 		assertScopedStatus(t, adminClient, http.MethodGet, fmt.Sprintf("/api/v2.1/org/%s/admin/users/", platformOrgID), http.StatusForbidden)
 		assertScopedStatus(t, adminClient, http.MethodGet, fmt.Sprintf("/api/v2.1/org/%s/admin/repos/", platformOrgID), http.StatusForbidden)
 		assertScopedStatus(t, adminClient, http.MethodGet, fmt.Sprintf("/api/v2.1/org/%s/admin/devices-errors/", platformOrgID), http.StatusForbidden)
+		assertScopedStatus(t, adminClient, http.MethodGet, fmt.Sprintf("/api/v2.1/org/%s/admin/links/", platformOrgID), http.StatusForbidden)
+		assertScopedStatus(t, adminClient, http.MethodGet, fmt.Sprintf("/api/v2.1/org/%s/admin/upload-links/", platformOrgID), http.StatusForbidden)
 	})
 
 	t.Run("org admin delete endpoints still reject cross org before resource lookup", func(t *testing.T) {
@@ -40,6 +46,8 @@ func TestOrgAdminScopedIsolation(t *testing.T) {
 			assertScopedStatus(t, superadminClient, http.MethodGet, fmt.Sprintf("/api/v2.1/org/%s/admin/users/", orgID), http.StatusOK)
 			assertScopedStatus(t, superadminClient, http.MethodGet, fmt.Sprintf("/api/v2.1/org/%s/admin/repos/", orgID), http.StatusOK)
 			assertScopedStatus(t, superadminClient, http.MethodGet, fmt.Sprintf("/api/v2.1/org/%s/admin/devices-errors/", orgID), http.StatusOK)
+			assertScopedStatus(t, superadminClient, http.MethodGet, fmt.Sprintf("/api/v2.1/org/%s/admin/links/", orgID), http.StatusOK)
+			assertScopedStatus(t, superadminClient, http.MethodGet, fmt.Sprintf("/api/v2.1/org/%s/admin/upload-links/", orgID), http.StatusOK)
 		}
 	})
 

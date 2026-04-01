@@ -10,6 +10,26 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+func (h *OrgAdminHandler) resolveManagedLinkOrgID(c *gin.Context) (string, error) {
+	targetOrgID := c.Param("org_id")
+	if targetOrgID != "" {
+		if err := h.requireOrgAccess(c, targetOrgID); err != nil {
+			return "", err
+		}
+		return targetOrgID, nil
+	}
+
+	orgID := c.GetString("org_id")
+	userID := c.GetString("user_id")
+	role, err := h.permMiddleware.GetUserOrgRole(orgID, userID)
+	if err != nil || (!middleware.HasRequiredOrgRole(role, middleware.RoleAdmin) && !middleware.IsPlatformSuperAdmin(orgID, role)) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "insufficient permissions"})
+		return "", fmt.Errorf("insufficient permissions")
+	}
+
+	return orgID, nil
+}
+
 // Links (public share links)
 // ============================================================================
 
@@ -17,16 +37,12 @@ import (
 // GET /org/admin/links/?page=N
 // Frontend reads: res.data.link_list, res.data.page, res.data.page_next
 func (h *OrgAdminHandler) ListOrgLinks(c *gin.Context) {
-	orgID := c.GetString("org_id")
-	userID := c.GetString("user_id")
-
-	role, err := h.permMiddleware.GetUserOrgRole(orgID, userID)
-	if err != nil || !middleware.HasRequiredOrgRole(role, middleware.RoleAdmin) {
-		c.JSON(http.StatusForbidden, gin.H{"error": "insufficient permissions"})
+	orgID, err := h.resolveManagedLinkOrgID(c)
+	if err != nil {
 		return
 	}
 
-	filters, err := parseAdminLinkListFiltersFromContext(c, false)
+	filters, err := parseAdminLinkListFiltersFromContext(c, true)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
@@ -168,12 +184,8 @@ func (h *OrgAdminHandler) ListOrgLinks(c *gin.Context) {
 // DeleteOrgLink deletes a public share link.
 // DELETE /org/admin/links/:token/
 func (h *OrgAdminHandler) DeleteOrgLink(c *gin.Context) {
-	orgID := c.GetString("org_id")
-	userID := c.GetString("user_id")
-
-	role, err := h.permMiddleware.GetUserOrgRole(orgID, userID)
-	if err != nil || !middleware.HasRequiredOrgRole(role, middleware.RoleAdmin) {
-		c.JSON(http.StatusForbidden, gin.H{"error": "insufficient permissions"})
+	orgID, err := h.resolveManagedLinkOrgID(c)
+	if err != nil {
 		return
 	}
 
@@ -212,16 +224,12 @@ func (h *OrgAdminHandler) DeleteOrgLink(c *gin.Context) {
 // GET /org/admin/upload-links/?page=N
 // Frontend reads: res.data.upload_link_list, res.data.count
 func (h *OrgAdminHandler) ListOrgUploadLinks(c *gin.Context) {
-	orgID := c.GetString("org_id")
-	userID := c.GetString("user_id")
-
-	role, err := h.permMiddleware.GetUserOrgRole(orgID, userID)
-	if err != nil || !middleware.HasRequiredOrgRole(role, middleware.RoleAdmin) {
-		c.JSON(http.StatusForbidden, gin.H{"error": "insufficient permissions"})
+	orgID, err := h.resolveManagedLinkOrgID(c)
+	if err != nil {
 		return
 	}
 
-	filters, err := parseAdminLinkListFiltersFromContext(c, false)
+	filters, err := parseAdminLinkListFiltersFromContext(c, true)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
@@ -345,12 +353,8 @@ func (h *OrgAdminHandler) ListOrgUploadLinks(c *gin.Context) {
 // DeleteOrgUploadLink deletes an upload link.
 // DELETE /org/admin/upload-links/:token/
 func (h *OrgAdminHandler) DeleteOrgUploadLink(c *gin.Context) {
-	orgID := c.GetString("org_id")
-	userID := c.GetString("user_id")
-
-	role, err := h.permMiddleware.GetUserOrgRole(orgID, userID)
-	if err != nil || !middleware.HasRequiredOrgRole(role, middleware.RoleAdmin) {
-		c.JSON(http.StatusForbidden, gin.H{"error": "insufficient permissions"})
+	orgID, err := h.resolveManagedLinkOrgID(c)
+	if err != nil {
 		return
 	}
 

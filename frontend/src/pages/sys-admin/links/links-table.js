@@ -91,6 +91,7 @@ class LinksContent extends Component {
                             <LinksRow
                                 key={index}
                                 item={item}
+                                isShareLink={this.props.isShareLink}
                                 onDelete={onDelete}
                                 onToggleActive={onToggleActive}
                             />
@@ -170,6 +171,7 @@ LinksContent.propTypes = {
     emptyTitle: PropTypes.string.isRequired,
     onDelete: PropTypes.func.isRequired,
     onToggleActive: PropTypes.func.isRequired,
+    isShareLink: PropTypes.bool,
     enableSort: PropTypes.bool,
     sortBy: PropTypes.string,
     sortOrder: PropTypes.string,
@@ -274,7 +276,7 @@ class LinksRow extends Component {
                         password={item.password || ''}
                         hasPassword={item.has_password === true}
                         viewCount={item.view_cnt}
-                        isShareLink={item.link_type !== 'upload'}
+                        isShareLink={this.props.isShareLink !== false}
                         toggleDialog={this.toggleLinkDialog}
                     />
                 )}
@@ -285,6 +287,7 @@ class LinksRow extends Component {
 
 LinksRow.propTypes = {
     item: PropTypes.object.isRequired,
+    isShareLink: PropTypes.bool,
     onDelete: PropTypes.func.isRequired,
     onToggleActive: PropTypes.func.isRequired,
 };

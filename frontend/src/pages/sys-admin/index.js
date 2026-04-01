@@ -60,6 +60,7 @@ import OrgInfo from './orgs/org-info';
 import OrgUsers from './orgs/org-users';
 import OrgGroups from './orgs/org-groups';
 import OrgRepos from './orgs/org-repos';
+import OrgLinks from './orgs/org-links';
 
 import Institutions from './institutions/institutions';
 import InstitutionInfo from './institutions/institution-info';
@@ -252,6 +253,7 @@ class SysAdmin extends React.Component {
             <OrgUsers path={siteRoot + 'sys/organizations/:orgID/users'} {...commonProps} />
             <OrgGroups path={siteRoot + 'sys/organizations/:orgID/groups'} {...commonProps} />
             <OrgRepos path={siteRoot + 'sys/organizations/:orgID/libraries'} {...commonProps} />
+            <OrgLinks path={siteRoot + 'sys/organizations/:orgID/links'} {...commonProps} />
             <Institutions path={siteRoot + 'sys/institutions'} {...commonProps} />
             <InstitutionInfo path={siteRoot + 'sys/institutions/:institutionID/info'} {...commonProps} />
             <InstitutionUsers path={siteRoot + 'sys/institutions/:institutionID/members'} {...commonProps} />
