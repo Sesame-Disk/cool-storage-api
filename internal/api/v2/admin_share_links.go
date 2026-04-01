@@ -4,7 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"strings"
 	"time"
 
 	db "github.com/Sesame-Disk/sesamefs/internal/db"
@@ -448,95 +447,109 @@ func (h *AdminHandler) AdminListUserShareLinks(c *gin.Context) {
 		return
 	}
 	page, perPage := parseAdminLinkPageParams(c.DefaultQuery("page", "1"), c.DefaultQuery("per_page", "25"), 25, 0)
-
-	creatorName := email
-	_ = h.db.Session().Query(`SELECT name FROM users WHERE org_id = ? AND user_id = ?`, targetOrgID, targetUserID).Scan(&creatorName)
-	if creatorName == "" {
-		creatorName = email
-	}
+	sortBy := c.Query("order_by")
+	direction := c.Query("direction")
 
 	var links []gin.H
-	iter := h.db.Session().Query(`
-		SELECT link_token, link_type, library_id, file_path, permission, expires_at, has_password, active, view_count, download_count, created_at
-		FROM share_links_by_creator WHERE org_id = ? AND created_by = ?`,
-		targetOrgID, targetUserID).Iter()
-
-	var token, linkType, libID, filePath, permission string
-	var expiresAt *time.Time
-	var hasPassword, active bool
-	var viewCount, downloadCount int
-	var createdAt time.Time
-
-	libNameCache := map[string]string{}
-
-	for iter.Scan(&token, &linkType, &libID, &filePath, &permission, &expiresAt, &hasPassword, &active, &viewCount, &downloadCount, &createdAt) {
-		if linkType != "share" {
-			continue
+	if isDefaultAdminLinkSort(sortBy, direction) {
+		rows, total, _, err := listAdminLinkProjectionPageByCreator(h.db.Session(), targetOrgID, targetUserID, "share", filters, page, perPage)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list user share links"})
+			return
 		}
 
-		objName := filePath
-		if idx := strings.LastIndex(filePath, "/"); idx >= 0 && idx < len(filePath)-1 {
-			objName = filePath[idx+1:]
+		links = make([]gin.H, 0, len(rows))
+		for _, row := range rows {
+			repoName, objName, creatorEmail, creatorName := adminLinkProjectionDisplay(row)
+			isExpired := false
+			expireDateStr := ""
+			if row.ExpiresAt != nil && !row.ExpiresAt.IsZero() {
+				isExpired = row.ExpiresAt.Before(time.Now())
+				expireDateStr = row.ExpiresAt.Format("2006-01-02T15:04:05+00:00")
+			}
+			status := "active"
+			if !row.Active {
+				status = "inactive"
+			}
+			linkURL := fmt.Sprintf("%s/d/%s", getBrowserURL(c, ""), row.Token)
+			links = append(links, gin.H{
+				"obj_name":      objName,
+				"token":         row.Token,
+				"link":          linkURL,
+				"repo_id":       row.LibraryID,
+				"repo_name":     repoName,
+				"path":          row.FilePath,
+				"creator_email": creatorEmail,
+				"creator_name":  creatorName,
+				"ctime":         row.CreatedAt.Format(time.RFC3339),
+				"view_cnt":      row.ViewCount,
+				"expire_date":   expireDateStr,
+				"is_expired":    isExpired,
+				"active":        row.Active,
+				"has_password":  row.HasPassword,
+				"status":        status,
+			})
 		}
+
+		c.JSON(http.StatusOK, gin.H{
+			"share_link_list": links,
+			"count":           total,
+		})
+		return
+	}
+
+	rows, err := listAdminLinkProjectionRowsByCreator(h.db.Session(), targetOrgID, targetUserID, "share")
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list user share links"})
+		return
+	}
+
+	for _, row := range rows {
+		repoName, objName, creatorEmail, creatorName := adminLinkProjectionDisplay(row)
 
 		isExpired := false
 		expireDateStr := ""
-		if expiresAt != nil && !expiresAt.IsZero() {
-			isExpired = expiresAt.Before(time.Now())
-			expireDateStr = expiresAt.Format("2006-01-02T15:04:05+00:00")
+		if row.ExpiresAt != nil && !row.ExpiresAt.IsZero() {
+			isExpired = row.ExpiresAt.Before(time.Now())
+			expireDateStr = row.ExpiresAt.Format("2006-01-02T15:04:05+00:00")
 		}
-		if !filters.MatchesState(active, isExpired) {
+		if !filters.MatchesState(row.Active, isExpired) {
 			continue
 		}
 
 		status := "active"
-		if !active {
+		if !row.Active {
 			status = "inactive"
 		}
 
-		repoName, ok := libNameCache[libID]
-		if !ok {
-			h.db.Session().Query(`SELECT name FROM libraries WHERE org_id = ? AND library_id = ?`, targetOrgID, libID).Scan(&repoName)
-			if repoName == "" {
-				repoName = "Unknown Library"
-			}
-			libNameCache[libID] = repoName
-		}
-
-		linkURL := fmt.Sprintf("%s/d/%s", getBrowserURL(c, ""), token)
-		if !filters.MatchesSearch(objName, token, filePath, repoName, email, creatorName, linkURL) {
+		linkURL := fmt.Sprintf("%s/d/%s", getBrowserURL(c, ""), row.Token)
+		if !filters.MatchesSearch(objName, row.Token, row.FilePath, repoName, creatorEmail, creatorName, linkURL) {
 			continue
 		}
 
 		links = append(links, gin.H{
 			"obj_name":      objName,
-			"token":         token,
+			"token":         row.Token,
 			"link":          linkURL,
-			"repo_id":       libID,
+			"repo_id":       row.LibraryID,
 			"repo_name":     repoName,
-			"path":          filePath,
-			"creator_email": email,
+			"path":          row.FilePath,
+			"creator_email": creatorEmail,
 			"creator_name":  creatorName,
-			"ctime":         createdAt.Format(time.RFC3339),
-			"view_cnt":      viewCount,
+			"ctime":         row.CreatedAt.Format(time.RFC3339),
+			"view_cnt":      row.ViewCount,
 			"expire_date":   expireDateStr,
 			"is_expired":    isExpired,
-			"active":        active,
-			"has_password":  hasPassword,
+			"active":        row.Active,
+			"has_password":  row.HasPassword,
 			"status":        status,
 		})
-	}
-	if err := iter.Close(); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list user share links"})
-		return
 	}
 
 	if links == nil {
 		links = []gin.H{}
 	}
 
-	sortBy := c.Query("order_by")
-	direction := c.Query("direction")
 	sortAdminLinks(links, sortBy, direction)
 	pagedLinks, total, _ := paginateAdminLinks(links, page, perPage)
 
@@ -571,100 +584,109 @@ func (h *AdminHandler) AdminListUserUploadLinks(c *gin.Context) {
 		return
 	}
 	page, perPage := parseAdminLinkPageParams(c.DefaultQuery("page", "1"), c.DefaultQuery("per_page", "25"), 25, 0)
-
-	creatorName := email
-	_ = h.db.Session().Query(`SELECT name FROM users WHERE org_id = ? AND user_id = ?`, targetOrgID, targetUserID).Scan(&creatorName)
-	if creatorName == "" {
-		creatorName = email
-	}
+	sortBy := c.Query("order_by")
+	direction := c.Query("direction")
 
 	var links []gin.H
-	iter := h.db.Session().Query(`
-		SELECT link_token, link_type, library_id, file_path, expires_at, active, has_password, upload_count, created_at
-		FROM share_links_by_creator WHERE org_id = ? AND created_by = ?`,
-		targetOrgID, targetUserID).Iter()
-
-	var token, linkType, libID, filePath string
-	var expiresAt *time.Time
-	var active, hasPassword bool
-	var uploadCount *int
-	var createdAt time.Time
-
-	libNameCache := map[string]string{}
-
-	for iter.Scan(&token, &linkType, &libID, &filePath, &expiresAt, &active, &hasPassword, &uploadCount, &createdAt) {
-		if linkType != "upload" {
-			continue
+	if isDefaultAdminLinkSort(sortBy, direction) {
+		rows, total, _, err := listAdminLinkProjectionPageByCreator(h.db.Session(), targetOrgID, targetUserID, "upload", filters, page, perPage)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list user upload links"})
+			return
 		}
 
-		objName := filePath
-		if idx := strings.LastIndex(filePath, "/"); idx >= 0 && idx < len(filePath)-1 {
-			objName = filePath[idx+1:]
+		links = make([]gin.H, 0, len(rows))
+		for _, row := range rows {
+			repoName, objName, creatorEmail, creatorName := adminLinkProjectionDisplay(row)
+			isExpired := false
+			expireDateStr := ""
+			if row.ExpiresAt != nil && !row.ExpiresAt.IsZero() {
+				isExpired = row.ExpiresAt.Before(time.Now())
+				expireDateStr = row.ExpiresAt.Format("2006-01-02T15:04:05+00:00")
+			}
+			status := "active"
+			if !row.Active {
+				status = "inactive"
+			}
+			linkURL := fmt.Sprintf("%s/u/d/%s", getBrowserURL(c, ""), row.Token)
+			links = append(links, gin.H{
+				"obj_name":      objName,
+				"path":          row.FilePath,
+				"token":         row.Token,
+				"link":          linkURL,
+				"repo_id":       row.LibraryID,
+				"repo_name":     repoName,
+				"creator_email": creatorEmail,
+				"creator_name":  creatorName,
+				"ctime":         row.CreatedAt.Format(time.RFC3339),
+				"view_cnt":      row.UploadCount,
+				"expire_date":   expireDateStr,
+				"is_expired":    isExpired,
+				"active":        row.Active,
+				"has_password":  row.HasPassword,
+				"status":        status,
+			})
 		}
+
+		c.JSON(http.StatusOK, gin.H{
+			"upload_link_list": links,
+			"count":            total,
+		})
+		return
+	}
+
+	rows, err := listAdminLinkProjectionRowsByCreator(h.db.Session(), targetOrgID, targetUserID, "upload")
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list user upload links"})
+		return
+	}
+
+	for _, row := range rows {
+		repoName, objName, creatorEmail, creatorName := adminLinkProjectionDisplay(row)
 
 		isExpired := false
 		expireDateStr := ""
-		if expiresAt != nil && !expiresAt.IsZero() {
-			isExpired = expiresAt.Before(time.Now())
-			expireDateStr = expiresAt.Format("2006-01-02T15:04:05+00:00")
+		if row.ExpiresAt != nil && !row.ExpiresAt.IsZero() {
+			isExpired = row.ExpiresAt.Before(time.Now())
+			expireDateStr = row.ExpiresAt.Format("2006-01-02T15:04:05+00:00")
 		}
-		if !filters.MatchesState(active, isExpired) {
+		if !filters.MatchesState(row.Active, isExpired) {
 			continue
 		}
 
 		status := "active"
-		if !active {
+		if !row.Active {
 			status = "inactive"
 		}
 
-		repoName, ok := libNameCache[libID]
-		if !ok {
-			h.db.Session().Query(`SELECT name FROM libraries WHERE org_id = ? AND library_id = ?`, targetOrgID, libID).Scan(&repoName)
-			if repoName == "" {
-				repoName = "Unknown Library"
-			}
-			libNameCache[libID] = repoName
-		}
-
-		count := 0
-		if uploadCount != nil {
-			count = *uploadCount
-		}
-
-		linkURL := fmt.Sprintf("%s/u/d/%s", getBrowserURL(c, ""), token)
-		if !filters.MatchesSearch(objName, token, filePath, repoName, email, creatorName, linkURL) {
+		linkURL := fmt.Sprintf("%s/u/d/%s", getBrowserURL(c, ""), row.Token)
+		if !filters.MatchesSearch(objName, row.Token, row.FilePath, repoName, creatorEmail, creatorName, linkURL) {
 			continue
 		}
 
 		links = append(links, gin.H{
 			"obj_name":      objName,
-			"path":          filePath,
-			"token":         token,
+			"path":          row.FilePath,
+			"token":         row.Token,
 			"link":          linkURL,
-			"repo_id":       libID,
+			"repo_id":       row.LibraryID,
 			"repo_name":     repoName,
-			"creator_email": email,
+			"creator_email": creatorEmail,
 			"creator_name":  creatorName,
-			"ctime":         createdAt.Format(time.RFC3339),
-			"view_cnt":      count,
+			"ctime":         row.CreatedAt.Format(time.RFC3339),
+			"view_cnt":      row.UploadCount,
 			"expire_date":   expireDateStr,
 			"is_expired":    isExpired,
-			"active":        active,
-			"has_password":  hasPassword,
+			"active":        row.Active,
+			"has_password":  row.HasPassword,
 			"status":        status,
 		})
-	}
-	if err := iter.Close(); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list user upload links"})
-		return
 	}
 
 	if links == nil {
 		links = []gin.H{}
 	}
 
-	sortBy := c.Query("order_by")
-	direction := c.Query("direction")
 	sortAdminLinks(links, sortBy, direction)
 	pagedLinks, total, _ := paginateAdminLinks(links, page, perPage)
 

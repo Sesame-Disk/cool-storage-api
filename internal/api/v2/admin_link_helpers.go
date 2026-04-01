@@ -348,6 +348,52 @@ func listAdminLinkProjectionRowsByOrg(session *gocql.Session, orgID, linkType st
 	return rows, nil
 }
 
+func listAdminLinkProjectionRowsByCreator(session *gocql.Session, orgID, createdBy, linkType string) ([]adminLinkProjectionRow, error) {
+	buckets, err := listAdminLinkBucketsByOrg(session, orgID, linkType)
+	if err != nil {
+		return nil, err
+	}
+	var rows []adminLinkProjectionRow
+	for _, bucketDay := range buckets {
+		iter := session.Query(`
+			SELECT link_token, library_id, repo_name, file_path, obj_name,
+			       created_by, creator_email, creator_name, permission, expires_at,
+			       has_password, active, view_count, upload_count, created_at
+			FROM admin_links_by_org_created
+			WHERE org_id = ? AND link_type = ? AND bucket_day = ?
+		`, orgID, linkType, bucketDay).Iter()
+
+		var row adminLinkProjectionRow
+		for iter.Scan(
+			&row.Token,
+			&row.LibraryID,
+			&row.RepoName,
+			&row.FilePath,
+			&row.ObjName,
+			&row.CreatedBy,
+			&row.CreatorEmail,
+			&row.CreatorName,
+			&row.Permission,
+			&row.ExpiresAt,
+			&row.HasPassword,
+			&row.Active,
+			&row.ViewCount,
+			&row.UploadCount,
+			&row.CreatedAt,
+		) {
+			if row.CreatedBy == createdBy {
+				row.OrgID = orgID
+				rows = append(rows, row)
+			}
+			row = adminLinkProjectionRow{}
+		}
+		if err := iter.Close(); err != nil {
+			return nil, err
+		}
+	}
+	return rows, nil
+}
+
 func normalizedAdminLinkRepoName(projected string) string {
 	repoName := strings.TrimSpace(projected)
 	if repoName == "" {
@@ -489,6 +535,61 @@ func listAdminLinkProjectionPageByOrg(session *gocql.Session, orgID, linkType st
 		) {
 			row.OrgID = orgID
 			if adminLinkProjectionMatches(row, filters) {
+				if total >= offset && len(rows) < perPage {
+					rows = append(rows, row)
+				}
+				total++
+			}
+			row = adminLinkProjectionRow{}
+		}
+		if err := iter.Close(); err != nil {
+			return nil, 0, false, err
+		}
+	}
+	return rows, total, offset+len(rows) < total, nil
+}
+
+func listAdminLinkProjectionPageByCreator(session *gocql.Session, orgID, createdBy, linkType string, filters adminLinkListFilters, page, perPage int) ([]adminLinkProjectionRow, int, bool, error) {
+	buckets, err := listAdminLinkBucketsByOrg(session, orgID, linkType)
+	if err != nil {
+		return nil, 0, false, err
+	}
+	sort.Sort(sort.Reverse(sort.StringSlice(buckets)))
+	offset := (page - 1) * perPage
+	if offset < 0 {
+		offset = 0
+	}
+	rows := make([]adminLinkProjectionRow, 0, perPage)
+	total := 0
+	for _, bucketDay := range buckets {
+		iter := session.Query(`
+			SELECT link_token, library_id, repo_name, file_path, obj_name,
+			       created_by, creator_email, creator_name, permission, expires_at,
+			       has_password, active, view_count, upload_count, created_at
+			FROM admin_links_by_org_created
+			WHERE org_id = ? AND link_type = ? AND bucket_day = ?
+		`, orgID, linkType, bucketDay).Iter()
+
+		var row adminLinkProjectionRow
+		for iter.Scan(
+			&row.Token,
+			&row.LibraryID,
+			&row.RepoName,
+			&row.FilePath,
+			&row.ObjName,
+			&row.CreatedBy,
+			&row.CreatorEmail,
+			&row.CreatorName,
+			&row.Permission,
+			&row.ExpiresAt,
+			&row.HasPassword,
+			&row.Active,
+			&row.ViewCount,
+			&row.UploadCount,
+			&row.CreatedAt,
+		) {
+			row.OrgID = orgID
+			if row.CreatedBy == createdBy && adminLinkProjectionMatches(row, filters) {
 				if total >= offset && len(rows) < perPage {
 					rows = append(rows, row)
 				}
