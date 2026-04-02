@@ -7,7 +7,7 @@ import { siteRoot, isPro, gettext, appAvatarURL, enableSSOToThirdpartWebsite } f
 import toaster from '../toast';
 import UpgradeEntry from './upgrade-entry';
 
-const isOrgContext = window.app?.pageOptions?.isOrgContext ?? true;
+const isCurrentOrgOwner = () => window.app?.pageOptions?.isOrgOwner === true;
 
 const propTypes = {
   isAdminPanel: PropTypes.bool,
@@ -191,7 +191,7 @@ class Account extends Component {
             </div>
             <UpgradeEntry isOrgStaff={this.state.isOrgStaff} />
             <a href={siteRoot + 'profile/'} className="item">{gettext('Settings')}</a>
-            {(this.state.enableSubscription && !isOrgContext) && <a href={siteRoot + 'subscription/'} className="item">{gettext('Subscription')}</a>}
+            {(this.state.enableSubscription && isCurrentOrgOwner()) && <a href={siteRoot + 'org/subscription/'} className="item">{gettext('Subscription')}</a>}
             {this.renderMenu()}
             {enableSSOToThirdpartWebsite && <a href={siteRoot + 'sso-to-thirdpart/'} className="item">{gettext('Customer Portal')}</a>}
             <a href={siteRoot + 'accounts/logout/'} className="item" onClick={() => { localStorage.removeItem('sesamefs_auth_token'); for (const k of Object.keys(localStorage)) { if (k.startsWith('custom_permissions_')) localStorage.removeItem(k); } }}>{gettext('Log out')}</a>

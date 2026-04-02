@@ -98,7 +98,6 @@ module.exports = function (proxy, allowedHost) {
       rewrites: [
         { from: /^\/org(?:\/.*)?$/, to: '/orgadmin.html' },
         { from: /^\/sys(?:\/.*)?$/, to: '/sysadmin.html' },
-        { from: /^\/subscription(?:\/.*)?$/, to: '/subscription.html' },
       ],
       index: paths.publicUrlOrPath,
     },

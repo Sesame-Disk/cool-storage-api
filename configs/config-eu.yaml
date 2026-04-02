@@ -102,7 +102,7 @@ versioning:
 
 # File preview and streaming settings
 fileview:
-  max_preview_bytes: 1073741824       # 1 GB - General files
-  max_video_bytes: 10737418240        # 10 GB - Videos (4K recordings, long videos)
+  max_preview_bytes: 1073741824       # 1 GiB - General files
+  max_video_bytes: 10737418240        # 10 GiB - Videos (4K recordings, long videos)
   max_text_bytes: 52428800            # 50 MB - Text files
   max_iwork_preview_bytes: 52428800   # 50 MB - iWork previews

@@ -1,7 +1,7 @@
 import React, { Component, Fragment } from 'react';
 import { Button } from 'reactstrap';
 import { seafileAPI } from '../../utils/seafile-api';
-import { gettext, isOrgOwner, orgID, subscriptionDetailsUrl, username } from '../../utils/constants';
+import { billingUrl, gettext, isOrgOwner, orgID, username } from '../../utils/constants';
 import { Utils } from '../../utils/utils';
 import MainPanelTopbar from './main-panel-topbar';
 import TransferOrgOwnershipDialog from '../../components/dialog/transfer-org-ownership-dialog';
@@ -191,11 +191,11 @@ class OrgInfo extends Component {
 
                 {showsMemberLimit ? <dd>{(this.state.active_members > 0) ? this.state.active_members : '--'} / {(this.state.member_usage > 0) ? this.state.member_usage : '--'} / {memberQuota}</dd> : <dd>{this.state.active_members > 0 ? this.state.active_members : '--'} / {this.state.member_usage > 0 ? this.state.member_usage : '--'}</dd>}
 
-                {subscriptionDetailsUrl && (
+                {billingUrl && (
                   <Fragment>
                     <dt>{gettext('Billing Details')}</dt>
                     <dd>
-                      <a rel="noopener noreferrer" target="_blank" href={subscriptionDetailsUrl}>{gettext('View Details')}</a>
+                      <a rel="noopener noreferrer" target="_blank" href={billingUrl}>{gettext('Manage Billing')}</a>
                     </dd>
                   </Fragment>
                 )}

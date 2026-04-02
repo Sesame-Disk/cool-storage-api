@@ -394,14 +394,11 @@ test.describe('Desktop split smoke', () => {
     await expect(page.getByText('system admin access', { exact: false })).toBeVisible();
   });
 
-  test('loads standalone and org subscription views when subscriptions are enabled', async ({ page }) => {
+  test('org subscription view', async ({ page }) => {
     await login(page, credentials.orgAdmin, '/dashboard/');
 
     const subscriptionEnabled = await page.evaluate(() => Boolean(window.app?.pageOptions?.enableSubscription));
     test.skip(!subscriptionEnabled, 'Subscriptions are disabled in the current environment.');
-
-    await page.goto('/subscription/');
-    await expect(page.locator('#current-plan')).toBeVisible();
 
     await page.goto('/org/subscription/');
     await expect(page.locator('#current-plan')).toBeVisible();

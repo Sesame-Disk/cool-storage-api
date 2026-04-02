@@ -36,7 +36,6 @@ export const useGoFileserver = appConfig.useGoFileserver || false;
 export const seafileVersion = appConfig.seafileVersion || '';
 export const serviceURL = appConfig.serviceURL || '';
 export const billingUrl = appConfig.billingUrl || `${siteRoot}billing/`;
-export const subscriptionDetailsUrl = appConfig.subscriptionDetailsUrl || billingUrl;
 export const appAvatarURL = appConfig.avatarURL || '';
 export const faviconPath = appConfig.faviconPath || '';
 export const loginBGPath = appConfig.loginBGPath || '';

@@ -40,7 +40,6 @@ const entryFiles = {
   sysAdmin: '/pages/sys-admin/bootstrap-entry.js',
   search: '/pages/search',
   uploadLink: '/pages/upload-link/bootstrap-entry.js',
-  subscription: '/subscription.js',
   institutionAdmin: '/pages/institution-admin/index.js'
 };
 
