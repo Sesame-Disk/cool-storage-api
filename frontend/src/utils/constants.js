@@ -162,8 +162,9 @@ export let orgEnableAdminInviteUser = orgPageOptions.orgEnableAdminInviteUser ==
 export let enableMultiADFS = orgPageOptions.enableMultiADFS === 'True';
 export let enableSubscription = orgPageOptions.enableSubscription || false;
 
-// Called by the org-admin entry point (index.js) after the bootstrap fetch resolves.
-// Updates the live bindings so all importers see the correct org context.
+// NOTE: _updateOrgContext is currently unused (dead code) because bootstrap-entry.js
+// uses dynamic import() which guarantees window.org.pageOptions is populated before
+// constants.js evaluates. Kept as a safety net in case the entry point changes.
 export function _updateOrgContext(pageOptions) {
   if (!pageOptions) return;
   if (pageOptions.orgID !== undefined) orgID = pageOptions.orgID;

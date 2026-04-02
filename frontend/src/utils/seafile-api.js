@@ -1,5 +1,6 @@
 import { SeafileAPI } from 'seafile-js';
 import { serviceURL } from './constants';
+import { quotaWarningInterceptor } from './quota-warning';
 
 const TOKEN_KEY = 'sesamefs_auth_token';
 
@@ -29,13 +30,13 @@ function syncAuthCookie(token) {
   document.cookie = 'sesamefs_auth=' + encodeURIComponent(token) + '; path=/; SameSite=Lax';
 }
 
-// Global 401 interceptor: redirect to login when session expires.
-// This prevents the frontend from getting stuck in loading states
-// when the backend returns 401 for an expired/invalid token.
+// Global response interceptor:
+// 1. On success: show quota warning toast if X-Quota-Warning header is present.
+// 2. On 401 error: redirect to login when session expires.
 function setupResponseInterceptor() {
   if (!seafileAPI.req) return;
   seafileAPI.req.interceptors.response.use(
-    response => response,
+    quotaWarningInterceptor,
     error => {
       if (error.response && error.response.status === 401) {
         // Clear stale token and session cookie, then redirect to login

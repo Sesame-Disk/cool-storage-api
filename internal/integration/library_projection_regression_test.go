@@ -104,6 +104,11 @@ func TestSyncHeadUpdateKeepsLookupAndAdminProjectionAligned(t *testing.T) {
 
 	nextHead := fmt.Sprintf("%040x", time.Now().UnixNano())
 	insertSyntheticCommitForTest(t, session, repoID, nextHead, initial.HeadCommitID, initial.RootFSID, "integration head advance")
+	t.Cleanup(func() {
+		if err := session.Query(`DELETE FROM commits WHERE library_id = ? AND commit_id = ?`, repoID, nextHead).Exec(); err != nil {
+			t.Errorf("cleanup synthetic commit %s failed: %v", nextHead, err)
+		}
+	})
 
 	resp := adminClient.Do(t, http.MethodPut, fmt.Sprintf("/seafhttp/repo/%s/commit/HEAD?head=%s", repoID, url.QueryEscape(nextHead)), nil)
 	if resp.StatusCode != http.StatusOK {
@@ -131,6 +136,13 @@ func TestSyncHeadConflictReturnsOKWithoutRollback(t *testing.T) {
 	staleHead := fmt.Sprintf("%040x", time.Now().UnixNano()+1)
 	insertSyntheticCommitForTest(t, session, repoID, acceptedHead, initial.HeadCommitID, initial.RootFSID, "integration accepted head")
 	insertSyntheticCommitForTest(t, session, repoID, staleHead, initial.HeadCommitID, initial.RootFSID, "integration stale head")
+	t.Cleanup(func() {
+		for _, commitID := range []string{acceptedHead, staleHead} {
+			if err := session.Query(`DELETE FROM commits WHERE library_id = ? AND commit_id = ?`, repoID, commitID).Exec(); err != nil {
+				t.Errorf("cleanup synthetic commit %s failed: %v", commitID, err)
+			}
+		}
+	})
 
 	resp := adminClient.Do(t, http.MethodPut, fmt.Sprintf("/seafhttp/repo/%s/commit/HEAD?head=%s", repoID, url.QueryEscape(acceptedHead)), nil)
 	if resp.StatusCode != http.StatusOK {
@@ -189,6 +201,25 @@ func TestSyncHeadStaleAsyncStatsDoNotOverwriteCurrentHead(t *testing.T) {
 	insertSyntheticDirObjectForTest(t, session, repoID, emptyRootFSID, nil)
 	insertSyntheticCommitForTest(t, session, repoID, heavyHead, initial.HeadCommitID, heavyRootFSID, "integration heavy head")
 	insertSyntheticCommitForTest(t, session, repoID, finalHead, heavyHead, emptyRootFSID, "integration final empty head")
+	t.Cleanup(func() {
+		// Delete synthetic commits inserted directly into Cassandra.
+		for _, commitID := range []string{heavyHead, finalHead} {
+			if err := session.Query(`DELETE FROM commits WHERE library_id = ? AND commit_id = ?`, repoID, commitID).Exec(); err != nil {
+				t.Errorf("cleanup synthetic commit %s failed: %v", commitID, err)
+			}
+		}
+		// Delete synthetic fs_objects: heavy root + 256 child dirs + empty root.
+		fsIDs := make([]string, 0, 258)
+		fsIDs = append(fsIDs, heavyRootFSID, emptyRootFSID)
+		for i := 0; i < 256; i++ {
+			fsIDs = append(fsIDs, fmt.Sprintf("%s-dir-%03d", heavyRootFSID, i))
+		}
+		for _, fsID := range fsIDs {
+			if err := session.Query(`DELETE FROM fs_objects WHERE library_id = ? AND fs_id = ?`, repoID, fsID).Exec(); err != nil {
+				t.Errorf("cleanup synthetic fs_object %s failed: %v", fsID, err)
+			}
+		}
+	})
 
 	resp := adminClient.Do(t, http.MethodPut, fmt.Sprintf("/seafhttp/repo/%s/commit/HEAD?head=%s", repoID, url.QueryEscape(heavyHead)), nil)
 	if resp.StatusCode != http.StatusOK {

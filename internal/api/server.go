@@ -249,7 +249,7 @@ func buildCORSConfig(cfg *config.Config) cors.Config {
 			"Seafile-Repo-Token",
 			"X-Requested-With", // Common AJAX header
 		},
-		ExposeHeaders:    []string{"Content-Length", "Content-Type"},
+		ExposeHeaders:    []string{"Content-Length", "Content-Type", "X-Quota-Warning"},
 		AllowCredentials: true,
 		MaxAge:           12 * time.Hour,
 	}

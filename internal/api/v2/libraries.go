@@ -362,9 +362,11 @@ func (h *LibraryHandler) ListLibraries(c *gin.Context) {
 	c.JSON(http.StatusOK, libraries)
 }
 
-// formatSize returns a human-readable size string
+// formatSize returns a human-readable size string using decimal (SI) units
+// to match the frontend's bytesToSize() which also uses base-1000.
+// Seafile desktop client compatibility uses FormatSizeSeafile (base-1024) instead.
 func formatSize(bytes int64) string {
-	const unit = 1024
+	const unit = 1000
 	if bytes < unit {
 		return fmt.Sprintf("%d B", bytes)
 	}

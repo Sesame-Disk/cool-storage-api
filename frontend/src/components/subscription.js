@@ -4,6 +4,7 @@ import toaster from './toast';
 import { InputGroup, InputGroupAddon, InputGroupText, Input, Button } from 'reactstrap';
 import { gettext, serviceURL, subscriptionDetailsUrl } from '../utils/constants';
 import { Utils } from '../utils/utils';
+import { BYTES_IN_GB } from '../utils/quota-units';
 import { subscriptionAPI } from '../utils/subscription-api';
 import Loading from './loading';
 
@@ -11,8 +12,6 @@ import '../css/layout.css';
 import '../css/subscription.css';
 
 const isOrgContext = window.app?.pageOptions?.isOrgContext ?? true;
-
-const BYTES_IN_GB = 1000 * 1000 * 1000;
 
 const formatPlanName = (plan, orgContext) => {
   if (!plan) {

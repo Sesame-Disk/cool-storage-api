@@ -23,10 +23,13 @@
          Períodos siempre mensuales. Accounts es fuente de verdad para paid, cron resetea free.
 
     PENDIENTE — P1 (frontend Phase 3):
-    [ ] Quota warning banners — backend envía X-Quota-Warning, frontend no lo consume
-    [ ] Estandarización unidades GB (decimal 1000³ vs binario 1024³)
-    [ ] pageOptions placeholders en org-admin (5-6 archivos)
-    [ ] Vista personal de quota (endpoint subscription/ existe, no hay página)
+    [ok] Quota warning banners — interceptor axios en quota-warning.js + CORS ExposeHeaders fix (2026-04-02)
+    [ok] Estandarización unidades GB — defaults backend a decimal (1000³), formatSize a base-1000 (2026-04-02)
+         Frontend ya era consistente. subscription.js duplica BYTES_IN_GB (cleanup menor).
+    [ok] pageOptions placeholders en org-admin — verificado funcional, no es bloqueante (2026-04-02)
+    [ok] Vista personal de quota — SPA standalone ya existía (src/subscription.js → subscription.html),
+         side-nav con secciones plan/storage/traffic/billing. Webpack entry, nginx location, dev server
+         rewrite, y link en account.js condicionado a enable_subscription todo funcional. (2026-04-02)
 
     PENDIENTE — Phase 4 (post-lanzamiento):
     [ ] Service token M2M (Accounts → SesameFS)

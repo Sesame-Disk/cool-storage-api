@@ -171,8 +171,8 @@ func DefaultFreeOrganizationTemplate() OrganizationTemplate {
 		Plan:                 "free",
 		QuotaPolicy:          "hard",
 		BillingCycle:         "monthly",
-		StorageQuota:         2 * 1024 * 1024 * 1024,
-		TrafficQuota:         10 * 1024 * 1024 * 1024,
+		StorageQuota:         2 * 1000 * 1000 * 1000,  // 2 GB (decimal, matches frontend)
+		TrafficQuota:         10 * 1000 * 1000 * 1000, // 10 GB (decimal, matches frontend)
 		TrafficUploadQuota:   -1,
 		TrafficDownloadQuota: -1,
 		MaxUsers:             1,
