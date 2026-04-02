@@ -605,9 +605,15 @@ Recent refactors moved the backend toward a stable initial Cassandra schema with
 |-------|----------|-------|
 | Sync `HEAD` derived-state update is split-phase | High | `libraries` advances via CAS first, then `libraries_by_id` plus admin projection are resynced immediately afterward. This is an intentional Cassandra limitation, not a fully atomic multi-table transaction. |
 | Async library stats are still eventual | Medium | `size_bytes` / `file_count` are recalculated asynchronously after sync `HEAD` changes, so brief staleness is expected. The stale-overwrite bug was closed by conditioning stat persistence on the current `head_commit_id`, but recomputation still remains asynchronous by design. |
+| Conditional stats write still resyncs projection in a second step | Medium | After the guarded stats update succeeds on `libraries`, the admin library projection is refreshed in a separate step. A short immediate retry now reduces transient failures, but if all attempts fail the canonical stats remain correct while the admin projection can still lag until another repair or write occurs. |
 | Admin library/group lists still paginate in memory | Medium | Read models removed earlier lookup pain, but list handlers still materialize rows and sort/page in Go. Acceptable for initial scale; revisit before large-cardinality admin usage. |
 | Best-effort counters require recount fallback | Medium | `admin_link_counts_by_org` is a cached accelerator, not source of truth. Recount/invalidations are part of the design and must not be removed by future cleanup. |
 | Docs must stay aligned with code, not old roadmap text | Medium | `CHANGELOG`, `CASSANDRA-OPTIMIZATION-GUIDE`, and `V1-PRODUCTION-ROADMAP` drifted once the read-model work landed. Future refactors should update docs in the same change. |
+
+**Current mitigation and remaining solutions for the conditional stats/projection gap:**
+- Current mitigation: a small immediate retry loop now wraps the projection refresh after a successful conditional stats update, reducing transient Cassandra/network failures.
+- Stronger follow-up: persist a repair marker or enqueue a background resync job so projection repair survives process restarts and can always rebuild from canonical state.
+- Operational contract: canonical rows remain authoritative, and admin projections may temporarily lag if the second-step refresh still fails after retries.
 
 **Required engineering pattern going forward:**
 - Canonical rows remain authoritative.

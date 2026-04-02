@@ -280,14 +280,14 @@ func (c *OIDCClient) GetAuthorizationURL(ctx context.Context, redirectURI, retur
 
 // ExchangeCode exchanges an authorization code for tokens
 func (c *OIDCClient) ExchangeCode(ctx context.Context, code, state, redirectURI string) (*AuthResult, error) {
-	if !c.isValidRedirectURI(redirectURI) {
-		return nil, fmt.Errorf("invalid redirect URI: %s", redirectURI)
-	}
-
 	// Validate and consume state
 	authState, err := c.consumeState(state)
 	if err != nil {
 		return nil, fmt.Errorf("invalid state: %w", err)
+	}
+
+	if !c.isValidRedirectURI(redirectURI) {
+		return nil, fmt.Errorf("invalid redirect URI: %s", redirectURI)
 	}
 
 	// Verify redirect URI matches

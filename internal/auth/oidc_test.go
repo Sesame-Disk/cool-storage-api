@@ -417,6 +417,9 @@ func TestOIDCClient_ExchangeCodeRejectsInvalidRedirectURI(t *testing.T) {
 	if err == nil {
 		t.Fatal("ExchangeCode() should reject invalid redirect URI")
 	}
+	if _, err := client.consumeState("test-state"); err == nil {
+		t.Fatal("ExchangeCode() should consume state even when redirect URI is invalid")
+	}
 }
 
 // TestOIDCClient_StateManagement tests state storage and consumption

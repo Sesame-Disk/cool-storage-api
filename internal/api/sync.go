@@ -2134,6 +2134,11 @@ func (h *SyncHandler) recalculateLibraryStats(orgID, repoID, commitID string) {
 	log.Printf("[updateLibraryStats] Updated library %s: size=%d bytes, files=%d", repoID, totalSize, fileCount)
 }
 
+const (
+	libraryStatsProjectionRetryAttempts = 3
+	libraryStatsProjectionRetryDelay    = 50 * time.Millisecond
+)
+
 func (h *SyncHandler) persistLibraryStatsIfCurrentHead(orgID, repoID, commitID string, totalSize, fileCount int64) bool {
 	casState := map[string]interface{}{}
 	applied, err := h.db.Session().Query(`
@@ -2151,19 +2156,39 @@ func (h *SyncHandler) persistLibraryStatsIfCurrentHead(orgID, repoID, commitID s
 		return false
 	}
 
-	projectionRow, err := db.ReadAdminLibraryProjectionRow(h.db.Session(), orgID, repoID)
+	err = retryLibraryStatsProjectionSync(func() error {
+		projectionRow, err := db.ReadAdminLibraryProjectionRow(h.db.Session(), orgID, repoID)
+		if err != nil {
+			return fmt.Errorf("read projection row: %w", err)
+		}
+		batch := h.db.Session().Batch(gocql.LoggedBatch)
+		db.AddUpsertAdminLibraryReadModelQuery(batch, projectionRow)
+		if err := batch.Exec(); err != nil {
+			return fmt.Errorf("sync projection stats: %w", err)
+		}
+		return nil
+	}, time.Sleep)
 	if err != nil {
-		log.Printf("[updateLibraryStats] Failed to read projection row for %s: %v", repoID, err)
-		return false
-	}
-	batch := h.db.Session().Batch(gocql.LoggedBatch)
-	db.AddUpsertAdminLibraryReadModelQuery(batch, projectionRow)
-	if err := batch.Exec(); err != nil {
-		log.Printf("[updateLibraryStats] Failed to sync projection stats for %s: %v", repoID, err)
+		log.Printf("[updateLibraryStats] Failed to sync projection stats for %s after %d attempts: %v", repoID, libraryStatsProjectionRetryAttempts, err)
 		return false
 	}
 
 	return true
+}
+
+func retryLibraryStatsProjectionSync(sync func() error, sleep func(time.Duration)) error {
+	var lastErr error
+	for attempt := 1; attempt <= libraryStatsProjectionRetryAttempts; attempt++ {
+		if err := sync(); err == nil {
+			return nil
+		} else {
+			lastErr = err
+		}
+		if attempt < libraryStatsProjectionRetryAttempts && sleep != nil {
+			sleep(libraryStatsProjectionRetryDelay)
+		}
+	}
+	return lastErr
 }
 
 // calculateDirStats recursively calculates total size and file count for a directory.

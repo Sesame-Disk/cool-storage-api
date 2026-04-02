@@ -3,6 +3,7 @@ package api
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -760,6 +761,52 @@ func TestFormatSizeSeafile_ContainsNBSP(t *testing.T) {
 	}
 }
 
+func TestRetryLibraryStatsProjectionSync(t *testing.T) {
+	t.Run("succeeds after retry", func(t *testing.T) {
+		attempts := 0
+		sleeps := 0
+		err := retryLibraryStatsProjectionSync(func() error {
+			attempts++
+			if attempts < 2 {
+				return errors.New("transient failure")
+			}
+			return nil
+		}, func(time.Duration) {
+			sleeps++
+		})
+		if err != nil {
+			t.Fatalf("retryLibraryStatsProjectionSync() error = %v, want nil", err)
+		}
+		if attempts != 2 {
+			t.Fatalf("attempts = %d, want 2", attempts)
+		}
+		if sleeps != 1 {
+			t.Fatalf("sleeps = %d, want 1", sleeps)
+		}
+	})
+
+	t.Run("returns last error after max attempts", func(t *testing.T) {
+		attempts := 0
+		sleeps := 0
+		wantErr := errors.New("still failing")
+		err := retryLibraryStatsProjectionSync(func() error {
+			attempts++
+			return wantErr
+		}, func(time.Duration) {
+			sleeps++
+		})
+		if !errors.Is(err, wantErr) {
+			t.Fatalf("retryLibraryStatsProjectionSync() error = %v, want %v", err, wantErr)
+		}
+		if attempts != libraryStatsProjectionRetryAttempts {
+			t.Fatalf("attempts = %d, want %d", attempts, libraryStatsProjectionRetryAttempts)
+		}
+		if sleeps != libraryStatsProjectionRetryAttempts-1 {
+			t.Fatalf("sleeps = %d, want %d", sleeps, libraryStatsProjectionRetryAttempts-1)
+		}
+	})
+}
+
 // =============================================================================
 // formatRelativeTimeHTML Tests
 // =============================================================================
@@ -913,11 +960,11 @@ func TestSHA256Computation(t *testing.T) {
 // TestHashTypeParameter tests the hash_type query parameter handling
 func TestHashTypeParameter(t *testing.T) {
 	tests := []struct {
-		name       string
-		blockID    string
-		hashType   string
-		isLegacy   bool
-		isDirect   bool
+		name     string
+		blockID  string
+		hashType string
+		isLegacy bool
+		isDirect bool
 	}{
 		{
 			name:     "SHA-1 without hash_type (legacy)",
