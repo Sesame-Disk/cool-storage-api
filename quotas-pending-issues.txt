@@ -20,16 +20,17 @@
 
     PENDIENTE — P0 (bloqueadores):
     [ok] Rollover job de períodos — internal/traffic/rollover.go + gc.go loop cada 1h (2026-04-02)
-         Períodos siempre mensuales. Accounts es fuente de verdad para paid, cron resetea free.
+            Períodos siempre mensuales. Accounts es fuente de verdad para paid, pero el cron avanza igual el período mensual vencido para no depender del sync externo.
+            Seed/default templates y rollover usan la misma helper explícita de quota period: +1 mes calendario con clamping del día, sin depender de billing_cycle.
 
     PENDIENTE — P1 (frontend Phase 3):
     [ok] Quota warning banners — interceptor axios en quota-warning.js + CORS ExposeHeaders fix (2026-04-02)
     [ok] Estandarización unidades GB — defaults backend a decimal (1000³), formatSize a base-1000 (2026-04-02)
-         Frontend ya era consistente. subscription.js duplica BYTES_IN_GB (cleanup menor).
+            Contrato de quota en GB/TB = decimal. Los 1024 restantes se reservan para límites técnicos/compatibilidad.
     [ok] pageOptions placeholders en org-admin — verificado funcional, no es bloqueante (2026-04-02)
-    [ok] Vista personal de quota — SPA standalone ya existía (src/subscription.js → subscription.html),
-         side-nav con secciones plan/storage/traffic/billing. Webpack entry, nginx location, dev server
-         rewrite, y link en account.js condicionado a enable_subscription todo funcional. (2026-04-02)
+     [ok] Vista de subscription/quota para owner — unificada en `/org/subscription/` (2026-04-02)
+            El link del owner en account.js ahora apunta directo al org-admin subscription view.
+                Se eliminó la SPA standalone `subscription.html` del build. La página activa es solo la vista org-admin y sigue siendo informativa; el único camino de acción es `/billing/`.
 
     PENDIENTE — Phase 4 (post-lanzamiento):
     [ ] Service token M2M (Accounts → SesameFS)
@@ -64,13 +65,13 @@
                     pero todavía puede desalinear otras pantallas de org-admin
                 - Candidatos conocidos: invite flags, web settings, navegación subscription/SAML
 
-[ ] Desalineación de unidades GB entre frontend y backend/utilidades
-                - Hay indicios de que parte del frontend interpreta "GB" en base decimal (`1000^3`)
-                    mientras otras utilidades/backend trabajan con bytes binarios (`1024^3`)
-                - Esto puede explicar diferencias visibles entre inputs/labels del frontend y límites
-                    efectivos/formatos calculados por backend
-                - Pendiente: estandarizar una sola convención y etiquetarla bien
-                    (`GB` decimal o `GiB` binario) en toda la UI de quotas
+[ok] Convención de unidades de quota ya quedó alineada
+                - El contrato de quotas/planes usa `GB`/`TB` decimales (`1000^3`, `1000^4`) en backend,
+                    frontend, defaults y documentación pública
+                - Los límites técnicos internos que siguen siendo binarios ahora se etiquetan como `GiB`
+                    para no mezclar capacidad contratada con umbrales de preview/streaming
+                - Queda aceptado que valores arbitrarios de tests/fixtures puedan no ser múltiplos exactos
+                    de GB/TB, pero ya no se documentan como si fueran tamaños comerciales
 
 ## UPDATE 2026-03-28 — PHASE 2 BACKEND COMPLETADA
 
@@ -543,9 +544,9 @@
 
 ## FRONTEND PARCIAL O AUSENTE (Backend listo)
 
-[ ] Warning de quota al usuario
+[ok] Warning de quota al usuario
     - Backend envía header X-Quota-Warning cuando uso >80%
-    - Frontend no consume este header para mostrar avisos/toast/banner
+    - Frontend ya lo consume vía interceptor axios global y muestra toast de warning
     - Afecta: uploads y downloads
 
 [ ] Mensajes de error de quota específicos
@@ -553,10 +554,10 @@
     - Frontend no distingue qué quota se excedió (storage vs traffic vs max_users)
     - No hay guía al usuario sobre qué hacer (contactar admin, liberar espacio, etc.)
 
-[ ] Vista personal de quota para usuario regular
+[ok] Vista personal de quota para usuario regular
     - Endpoint GET /api/v2.1/subscription/ existe y devuelve datos
-    - No hay página en account settings para que el usuario vea su consumo
-    - El usuario no sabe cuánto ha usado ni cuánto le queda
+    - La vista activa quedó unificada en `/org/subscription/` con plan/storage/traffic/billing
+    - El link aparece para el owner y abre el org-admin subscription view; `/subscription/` solo redirige
 
 [ ] UI de configuración de traffic quota por organización
     - Backend soporta traffic_quota, traffic_upload_quota, traffic_download_quota
@@ -714,7 +715,9 @@
             + `current_period_ends_at` de la org
         - `current_period_ends_at` es la referencia canónica para saber si el período venció
         - Accounts puede mandar `current_period_ends_at`; si no lo manda, SesameFS lo deriva
-            desde `current_period_started_at` con la fórmula mensual estándar tipo Stripe
+            desde `current_period_started_at` con una helper mensual explícita compartida por creación y rollover
+        - Aunque `billing_cycle` sea anual, el período de tráfico vigente sigue siendo mensual
+        - El cron local debe avanzar ese período mensual vencido aunque Accounts luego pueda volver a pisar fechas para orgs paid
         - Hace falta una agregación optimizada por período efectivo de la org
             para no depender del mes natural ni recalcular desde cero en cada request
         - Hace falta un job periódico de rollover del período actual para cualquier org vencida,
@@ -820,9 +823,9 @@
         — Eliminados. Solo queda `isFreeUser` como alias @deprecated en constants.js:232
 16. [PARTIAL] Upgrade CTA con `upgrade_features` + `can_upgrade` (owner near limits)
         — Backend envía los datos. Frontend upgrade-state.js los consume. Falta: banners de warning
-17. [ ] Quota warning banners con `storage.over_quota`, `traffic.over_quota`,
+17. [DONE] Quota warning banners con `storage.over_quota`, `traffic.over_quota`,
     `traffic.upload_over_quota`, `traffic.download_over_quota`
-        — Backend envía X-Quota-Warning header. Frontend no lo intercepta aún
+        — Backend envía X-Quota-Warning header. Frontend lo intercepta vía axios y muestra warning toast (2026-04-02)
 18. [ ] Endpoint preview/evaluate para downgrade/cambios de plan
 19. [DONE] Job periódico de rollover del período vigente de quotas — P0
         — internal/traffic/rollover.go implementado (2026-04-02)

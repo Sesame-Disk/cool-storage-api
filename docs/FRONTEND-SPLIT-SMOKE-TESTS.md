@@ -154,12 +154,10 @@ Expected:
 ### 9. Subscription page
 
 1. Log in as an org owner.
-2. Open `/subscription/`.
-3. Open `/org/subscription`.
+2. Open `/org/subscription`.
 
 Expected:
 
-- Standalone subscription page loads via `subscription.html`.
 - Org-scoped subscription view loads inside the org admin shell.
 
 ### 10. SAML and org custom routes

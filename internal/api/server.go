@@ -1459,7 +1459,7 @@ func (s *Server) handleAccountInfo(c *gin.Context) {
 	isOrgOwner := role == "owner"
 	canUpgrade := plans.ComputeCanUpgrade(role, quotaPolicy, storagePct, trafficPct, storageOverQuota, trafficOverQuota)
 
-	trafficResetDate := traffic.EffectiveTrafficResetDate(currentPeriodEndsAt, now)
+	trafficResetDate := traffic.EffectiveTrafficResetDate(currentPeriodStartedAt, currentPeriodEndsAt, now)
 
 	// Return account info.
 	// CRITICAL: Preserve all Seafile-compatible fields for desktop client.
@@ -1604,7 +1604,7 @@ func (s *Server) handleGetSubscription(c *gin.Context) {
 	uploadOverQuota := trafficUploadQuota > 0 && orgTrafficUsage.Upload > trafficUploadQuota
 	downloadOverQuota := trafficDownloadQuota > 0 && orgTrafficUsage.Download > trafficDownloadQuota
 
-	trafficResetDate := traffic.EffectiveTrafficResetDate(currentPeriodEndsAt, now)
+	trafficResetDate := traffic.EffectiveTrafficResetDate(currentPeriodStartedAt, currentPeriodEndsAt, now)
 
 	// Per-user traffic for the caller.
 	userTrafficUsage := traffic.ReadUserPeriodUsage(s.db, orgID, userID, periodStartedAt)

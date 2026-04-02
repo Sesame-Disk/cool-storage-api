@@ -97,7 +97,7 @@ sesamefs migrate --check       # exit non-zero if any migration is pending (CI)
 org_id:   00000000-0000-0000-0000-000000000001 (fixed UUID for dev)
 name:     "Default Organization"
 settings: { "theme": "default", "features": "all" }
-storage_quota:  1TB (1099511627776 bytes)
+storage_quota:  1TB (1000000000000 bytes)
 storage_used:   0
 chunking_polynomial: 17592186044415 (default Rabin polynomial)
 created_at:     now()
@@ -116,7 +116,7 @@ email:     "admin@sesamefs.local"
 name:      "System Administrator"
 role:      "admin"  // ← CRITICAL: admin role for full permissions
 oidc_sub:  null
-quota_bytes:  100GB (107374182400 bytes)
+quota_bytes:  100GB (100000000000 bytes)
 used_bytes:   0
 created_at:   now()
 ```
@@ -320,7 +320,7 @@ PRIMARY KEY ((org_id), user_id)  -- Partition by org, cluster by user
 **API Usage:**
 ```bash
 GET /api2/account/info/
-# Returns: { "email": "user@acme.com", "usage": 1234567, "total": 10737418240 }
+# Returns: { "email": "user@acme.com", "usage": 1234567, "total": 10000000000 }
 ```
 
 **Why partitioned by org_id?**

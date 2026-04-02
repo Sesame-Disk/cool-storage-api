@@ -30,7 +30,7 @@ func TestEffectiveTrafficResetDate_UsesExplicitPeriodEnd(t *testing.T) {
 	now := time.Date(2026, time.March, 28, 12, 0, 0, 0, time.UTC)
 	periodEnd := time.Date(2026, time.April, 14, 23, 59, 59, 0, time.FixedZone("UTC+2", 2*60*60))
 
-	got := EffectiveTrafficResetDate(&periodEnd, now)
+	got := EffectiveTrafficResetDate(nil, &periodEnd, now)
 	want := periodEnd.UTC().Format("2006-01-02")
 	if got != want {
 		t.Fatalf("EffectiveTrafficResetDate() = %s, want %s", got, want)
@@ -40,8 +40,18 @@ func TestEffectiveTrafficResetDate_UsesExplicitPeriodEnd(t *testing.T) {
 func TestEffectiveTrafficResetDate_FallsBackToNextMonth(t *testing.T) {
 	now := time.Date(2026, time.March, 28, 12, 0, 0, 0, time.UTC)
 
-	got := EffectiveTrafficResetDate(nil, now)
+	got := EffectiveTrafficResetDate(nil, nil, now)
 	if got != "2026-04-01" {
 		t.Fatalf("EffectiveTrafficResetDate(nil) = %s, want 2026-04-01", got)
+	}
+}
+
+func TestEffectiveTrafficResetDate_DerivesFromEffectivePeriodStart(t *testing.T) {
+	now := time.Date(2026, time.March, 28, 12, 0, 0, 0, time.UTC)
+	periodStart := time.Date(2026, time.March, 14, 10, 45, 0, 0, time.FixedZone("UTC-5", -5*60*60))
+
+	got := EffectiveTrafficResetDate(&periodStart, nil, now)
+	if got != "2026-04-14" {
+		t.Fatalf("EffectiveTrafficResetDate(periodStart,nil) = %s, want 2026-04-14", got)
 	}
 }

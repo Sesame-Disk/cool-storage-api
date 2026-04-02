@@ -1,5 +1,4 @@
 import React, { Component, Fragment } from 'react';
-import PropTypes from 'prop-types';
 import { gettext, billingUrl } from '../utils/constants';
 import { Utils } from '../utils/utils';
 import { subscriptionAPI } from '../utils/subscription-api';
@@ -54,10 +53,6 @@ const quotaUsagePercent = (used, limit) => {
   return `${((used || 0) / limit * 100).toFixed(1)}%`;
 };
 
-const propTypes = {
-  handleContentScroll: PropTypes.func,
-};
-
 class Subscription extends Component {
 
   constructor(props) {
@@ -66,7 +61,6 @@ class Subscription extends Component {
       isLoading: true,
       errorMsg: '',
       subscriptionData: null,
-      fallbackDetails: null,
     };
   }
 
@@ -79,33 +73,15 @@ class Subscription extends Component {
           isLoading: false,
           errorMsg: '',
           subscriptionData: data,
-          fallbackDetails: null,
         });
         return;
       }
 
-      const subscription = data.subscription;
-      if (!subscription) {
-        this.setState({
-          isLoading: false,
-          subscriptionData: null,
-          fallbackDetails: null,
-        });
-      } else {
-        let isActive = subscription.is_active;
-        let plan = subscription.plan || {};
-        let storageQuota = isActive ? subscription.asset_quota : plan.asset_quota;
-        this.setState({
-          isLoading: false,
-          subscriptionData: null,
-          fallbackDetails: {
-            planName: plan.name || gettext('Organization'),
-            userLimit: subscription.user_limit > 0 ? String(subscription.user_limit) : gettext('Unlimited'),
-            storageSummary: storageQuota > 0 ? `${storageQuota} GB` : gettext('Unlimited'),
-            billingSummary: isActive ? subscription.term_end : '--',
-          },
-        });
-      }
+      this.setState({
+        isLoading: false,
+        subscriptionData: null,
+        errorMsg: gettext('Internal Server Error'),
+      });
     }).catch(error => {
       let errorMsg = Utils.getErrorMsg(error);
       this.setState({
@@ -182,7 +158,7 @@ class Subscription extends Component {
   };
 
   render() {
-    const { isLoading, errorMsg, subscriptionData, fallbackDetails } = this.state;
+    const { isLoading, errorMsg, subscriptionData } = this.state;
     if (isLoading) {
       return <Loading />;
     }
@@ -191,27 +167,8 @@ class Subscription extends Component {
     }
     return (
       <Fragment>
-        <div className="content subscription-content position-relative" onScroll={this.props.handleContentScroll}>
-          {subscriptionData ? this.renderCurrentSubscription() : fallbackDetails && (
-            <Fragment>
-              <div id="current-plan" className="subscription-info">
-                <h3 className="subscription-info-heading">{gettext('Current Plan')}</h3>
-                <p className="mb-2">{fallbackDetails.planName}</p>
-              </div>
-              <div id="user-limit" className="subscription-info">
-                <h3 className="subscription-info-heading">{gettext('User Limit')}</h3>
-                <p className="mb-2">{fallbackDetails.userLimit}</p>
-              </div>
-              <div id="asset-quota" className="subscription-info">
-                <h3 className="subscription-info-heading">{gettext('Storage')}</h3>
-                <p className="mb-2">{fallbackDetails.storageSummary}</p>
-              </div>
-              <div id="current-subscription-period" className="subscription-info">
-                <h3 className="subscription-info-heading">{gettext('Billing Cycle')}</h3>
-                <p className="mb-2">{fallbackDetails.billingSummary}</p>
-              </div>
-            </Fragment>
-          )}
+        <div className="content subscription-content position-relative">
+          {this.renderCurrentSubscription()}
           <div id="product-price" className="subscription-info">
             <h3 className="subscription-info-heading">{gettext('Billing Details')}</h3>
             <p className="mb-2 text-secondary">{gettext('Plan changes and billing are managed in the billing service.')}</p>
@@ -226,7 +183,5 @@ class Subscription extends Component {
     );
   }
 }
-
-Subscription.propTypes = propTypes;
 
 export default Subscription;

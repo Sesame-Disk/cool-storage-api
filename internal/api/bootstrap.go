@@ -337,7 +337,7 @@ func (s *Server) buildAppBootstrapPageOptions(identity bootstrapIdentity, userDa
 		"download_used":       orgTrafficUsage.Download,
 		"download_quota":      orgData.TrafficDownloadQuota,
 		"download_over_quota": downloadOverQuota,
-		"reset_date":          traffic.EffectiveTrafficResetDate(orgData.CurrentPeriodEndsAt, now),
+		"reset_date":          traffic.EffectiveTrafficResetDate(orgData.CurrentPeriodStartedAt, orgData.CurrentPeriodEndsAt, now),
 	}
 
 	return pageOptions

@@ -26,38 +26,44 @@ func TestFormatSize(t *testing.T) {
 		{0, "0 B"},
 		{1, "1 B"},
 		{512, "512 B"},
-		{1023, "1023 B"},
+		{999, "999 B"},
 
 		// Kilobytes
+		{1000, "1.0 KB"},
 		{1024, "1.0 KB"},
 		{1536, "1.5 KB"},
 		{2048, "2.0 KB"},
-		{10240, "10.0 KB"},
-		{1048575, "1024.0 KB"}, // Just under 1 MB
+		{10240, "10.2 KB"},
+		{999999, "1000.0 KB"}, // Just under 1 MB
 
 		// Megabytes
+		{1000000, "1.0 MB"},
 		{1048576, "1.0 MB"},
-		{1572864, "1.5 MB"},
-		{10485760, "10.0 MB"},
-		{104857600, "100.0 MB"},
-		{1073741823, "1024.0 MB"}, // Just under 1 GB
+		{1572864, "1.6 MB"},
+		{10485760, "10.5 MB"},
+		{104857600, "104.9 MB"},
+		{999999999, "1000.0 MB"}, // Just under 1 GB
 
 		// Gigabytes
-		{1073741824, "1.0 GB"},
-		{1610612736, "1.5 GB"},
-		{10737418240, "10.0 GB"},
-		{107374182400, "100.0 GB"},
+		{1000000000, "1.0 GB"},
+		{1073741824, "1.1 GB"},
+		{1610612736, "1.6 GB"},
+		{10737418240, "10.7 GB"},
+		{107374182400, "107.4 GB"},
 
 		// Terabytes
-		{1099511627776, "1.0 TB"},
-		{1649267441664, "1.5 TB"},
-		{10995116277760, "10.0 TB"},
+		{1000000000000, "1.0 TB"},
+		{1099511627776, "1.1 TB"},
+		{1649267441664, "1.6 TB"},
+		{10995116277760, "11.0 TB"},
 
 		// Petabytes
-		{1125899906842624, "1.0 PB"},
+		{1000000000000000, "1.0 PB"},
+		{1125899906842624, "1.1 PB"},
 
 		// Exabytes
-		{1152921504606846976, "1.0 EB"},
+		{1000000000000000000, "1.0 EB"},
+		{1152921504606846976, "1.2 EB"},
 	}
 
 	for _, tt := range tests {
@@ -74,38 +80,38 @@ func TestFormatSize(t *testing.T) {
 func TestFormatSizeEdgeCases(t *testing.T) {
 	// Test boundary between units
 	t.Run("KB boundary", func(t *testing.T) {
-		below := formatSize(1023)
-		at := formatSize(1024)
+		below := formatSize(999)
+		at := formatSize(1000)
 
-		if below != "1023 B" {
-			t.Errorf("1023 bytes should be '1023 B', got %q", below)
+		if below != "999 B" {
+			t.Errorf("999 bytes should be '999 B', got %q", below)
 		}
 		if at != "1.0 KB" {
-			t.Errorf("1024 bytes should be '1.0 KB', got %q", at)
+			t.Errorf("1000 bytes should be '1.0 KB', got %q", at)
 		}
 	})
 
 	t.Run("MB boundary", func(t *testing.T) {
-		below := formatSize(1048575)
-		at := formatSize(1048576)
+		below := formatSize(999999)
+		at := formatSize(1000000)
 
-		if below != "1024.0 KB" {
-			t.Errorf("1048575 bytes should be '1024.0 KB', got %q", below)
+		if below != "1000.0 KB" {
+			t.Errorf("999999 bytes should be '1000.0 KB', got %q", below)
 		}
 		if at != "1.0 MB" {
-			t.Errorf("1048576 bytes should be '1.0 MB', got %q", at)
+			t.Errorf("1000000 bytes should be '1.0 MB', got %q", at)
 		}
 	})
 
 	t.Run("GB boundary", func(t *testing.T) {
-		below := formatSize(1073741823)
-		at := formatSize(1073741824)
+		below := formatSize(999999999)
+		at := formatSize(1000000000)
 
-		if below != "1024.0 MB" {
-			t.Errorf("1073741823 bytes should be '1024.0 MB', got %q", below)
+		if below != "1000.0 MB" {
+			t.Errorf("999999999 bytes should be '1000.0 MB', got %q", below)
 		}
 		if at != "1.0 GB" {
-			t.Errorf("1073741824 bytes should be '1.0 GB', got %q", at)
+			t.Errorf("1000000000 bytes should be '1.0 GB', got %q", at)
 		}
 	})
 }
@@ -118,11 +124,11 @@ func TestFormatSizeRealistic(t *testing.T) {
 		expected string
 	}{
 		{"small text file", 1500, "1.5 KB"},
-		{"word document", 52428, "51.2 KB"},
-		{"photo", 3145728, "3.0 MB"},
-		{"video clip", 157286400, "150.0 MB"},
-		{"movie file", 4718592000, "4.4 GB"},
-		{"backup archive", 53687091200, "50.0 GB"},
+		{"word document", 52428, "52.4 KB"},
+		{"photo", 3145728, "3.1 MB"},
+		{"video clip", 157286400, "157.3 MB"},
+		{"movie file", 4718592000, "4.7 GB"},
+		{"backup archive", 53687091200, "53.7 GB"},
 	}
 
 	for _, tt := range tests {

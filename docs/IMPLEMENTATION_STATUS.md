@@ -24,7 +24,7 @@
 4. ~~Frontend/Backend Separation~~ - ✅ COMPLETE (2026-03-30/31) — separate React/nginx container, bootstrap API, nginx production hardening
 5. **Programmatic Auth (PATs)** - ❌ PENDING — `server.go:1141` TODO. Desktop/CLI cannot auth in OIDC-only mode. See `docs/TECHNICAL-DEBT.md` §6
 6. **GC Multi-Instance Safety** - ❌ PENDING — `gc.go:99` Start() has no leader election. Unsafe with >1 replica
-7. **Quota Period Rollover** - ❌ PENDING — No code to reset `traffic_period_usage` when period expires. Paid users permanently blocked after month 1
+7. ~~Quota Period Rollover~~ - ✅ COMPLETE — Period rollover job advances expired org quota periods and keeps monthly traffic enforcement moving
 
 ---
 

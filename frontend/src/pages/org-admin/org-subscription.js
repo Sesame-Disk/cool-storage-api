@@ -18,7 +18,7 @@ class OrgSubscription extends Component {
             <div className="cur-view-path">
               <h2 className="sf-heading">{gettext('Subscription')}</h2>
             </div>
-            <div className="pt-2 h-100 o-auto">
+            <div className="cur-view-content pt-2">
               <Subscription />
             </div>
           </div>

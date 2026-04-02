@@ -3,6 +3,7 @@ package traffic
 import (
 	"time"
 
+	"github.com/Sesame-Disk/sesamefs/internal/config"
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
 )
 
@@ -27,14 +28,14 @@ func EffectivePeriodStart(periodStart *time.Time, now time.Time) time.Time {
 
 // EffectiveTrafficResetDate returns the human-facing reset date used by Phase 2
 // payloads. When the org has an explicit period end, that is authoritative.
-// Otherwise it falls back to the first day of the next UTC calendar month.
-func EffectiveTrafficResetDate(periodEnd *time.Time, now time.Time) string {
+// Otherwise it derives the period end from the effective quota period start so
+// traffic reset messaging matches monthly rollover semantics everywhere.
+func EffectiveTrafficResetDate(periodStart *time.Time, periodEnd *time.Time, now time.Time) string {
 	if periodEnd != nil && !periodEnd.IsZero() {
 		return periodEnd.UTC().Format("2006-01-02")
 	}
-	utcNow := now.UTC()
-	nextMonth := time.Date(utcNow.Year(), utcNow.Month()+1, 1, 0, 0, 0, 0, time.UTC)
-	return nextMonth.Format("2006-01-02")
+	effectiveStart := EffectivePeriodStart(periodStart, now)
+	return config.QuotaPeriodEnd(effectiveStart).Format("2006-01-02")
 }
 
 // CurrentMonth returns the current UTC month in yyyymm format.

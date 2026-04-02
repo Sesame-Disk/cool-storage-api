@@ -139,7 +139,9 @@ func (r *Recorder) recordCounters(orgID, userID, month string, day, now, periodH
 		log.Printf("[traffic] platform per-user aggregate error user=%s type=%s: %v", userID, trafficType, err)
 	}
 
-	// 4–6. Monthly aggregates — used for quota enforcement (1 partition read).
+	// 4–6. Aggregate counters for two different read models:
+	//   - traffic_monthly for natural-month reporting and dashboards
+	//   - traffic_period_usage for quota enforcement and current-period payloads
 	scopes := []string{
 		fmt.Sprintf("org:%s", direction),        // per-direction org total
 		"org:combined",                          // combined upload+download org total

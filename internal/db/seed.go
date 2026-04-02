@@ -109,7 +109,7 @@ func (db *DB) createPlatformOrganization(orgID uuid.UUID) error {
 		"default_backend": "s3",
 	}
 
-	periodEnd := now.AddDate(0, 1, 0) // +1 month
+	periodEnd := config.QuotaPeriodEnd(now)
 
 	err := db.Session().Query(query,
 		orgID.String(),

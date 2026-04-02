@@ -6,7 +6,7 @@ server:
   read_timeout: 0s         # No full-body read timeout — large uploads can take minutes
   read_header_timeout: 10s # Timeout for reading request headers only (Slowloris protection)
   write_timeout: 0s        # No write timeout — large downloads/zips can take minutes
-  max_upload_mb: 20480     # 20 GB max upload size
+  max_upload_mb: 20480     # 20480 MB (~20 GiB) max upload size
 
 database:
   hosts:
@@ -158,8 +158,8 @@ organizations:
       plan: free
       quota_policy: hard
       billing_cycle: monthly
-      storage_quota: 2147483648
-      traffic_quota: 10737418240
+      storage_quota: 2000000000
+      traffic_quota: 10000000000
       traffic_upload_quota: -1
       traffic_download_quota: -1
       max_users: 1
@@ -185,8 +185,8 @@ versioning:
 # File preview and streaming settings
 # These limits protect against memory exhaustion and browser freezing
 fileview:
-  max_preview_bytes: 1073741824       # 1 GB - General files (images, PDFs, etc.)
-  max_video_bytes: 10737418240        # 10 GB - Videos (4K recordings, long videos)
+  max_preview_bytes: 1073741824       # 1 GiB - General files (images, PDFs, etc.)
+  max_video_bytes: 10737418240        # 10 GiB - Videos (4K recordings, long videos)
   max_text_bytes: 52428800            # 50 MB - Text files (prevent browser freeze)
   max_iwork_preview_bytes: 52428800   # 50 MB - Extracted iWork previews
 

@@ -268,7 +268,7 @@ GET /api/v2.1/admin/organizations/
     {
       "org_id": "550e8400-e29b-41d4-a716-446655440000",
       "name": "Acme Corp",
-      "storage_quota": 1099511627776,
+      "storage_quota": 1000000000000,
       "storage_used": 52428800,
       "settings": {"theme": "default", "features": "all"},
       "created_at": "2026-01-29T10:00:00Z"
@@ -284,18 +284,18 @@ Content-Type: application/json
 
 {
   "name": "Acme Corp",
-  "storage_quota": 1099511627776
+  "storage_quota": 1000000000000
 }
 ```
 - `name` (string, **required**): Organization display name
-- `storage_quota` (int64, optional): Storage quota in bytes. Default: 1TB (1099511627776)
+- `storage_quota` (int64, optional): Storage quota in bytes. Default: 1TB (1000000000000)
 
 **Response** `201`:
 ```json
 {
   "org_id": "generated-uuid",
   "name": "Acme Corp",
-  "storage_quota": 1099511627776,
+  "storage_quota": 1000000000000,
   "created_at": "2026-01-29T10:00:00Z"
 }
 ```
@@ -309,7 +309,7 @@ GET /api/v2.1/admin/organizations/:org_id/
 {
   "org_id": "550e8400-...",
   "name": "Acme Corp",
-  "storage_quota": 1099511627776,
+  "storage_quota": 1000000000000,
   "storage_used": 52428800,
   "settings": {"theme": "default", "features": "all"},
   "created_at": "2026-01-29T10:00:00Z"

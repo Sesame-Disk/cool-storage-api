@@ -3,9 +3,11 @@ package traffic
 import (
 	"testing"
 	"time"
+
+	"github.com/Sesame-Disk/sesamefs/internal/config"
 )
 
-func TestAddMonth_Normal(t *testing.T) {
+func TestQuotaPeriodEnd_Monthly(t *testing.T) {
 	tests := []struct {
 		name string
 		in   time.Time
@@ -17,16 +19,16 @@ func TestAddMonth_Normal(t *testing.T) {
 		{"first-of-month", d(2026, 6, 1), d(2026, 7, 1)},
 	}
 	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := addMonth(tt.in)
+			t.Run(tt.name, func(t *testing.T) {
+			got := config.QuotaPeriodEnd(tt.in)
 			if !got.Equal(tt.want) {
-				t.Errorf("addMonth(%v) = %v, want %v", tt.in, got, tt.want)
+				t.Errorf("QuotaPeriodEnd(%v) = %v, want %v", tt.in, got, tt.want)
 			}
 		})
 	}
 }
 
-func TestAddMonth_DayClamping(t *testing.T) {
+func TestQuotaPeriodEnd_MonthlyDayClamping(t *testing.T) {
 	tests := []struct {
 		name string
 		in   time.Time
@@ -43,10 +45,10 @@ func TestAddMonth_DayClamping(t *testing.T) {
 		{"nov30-to-dec30", d(2026, 11, 30), d(2026, 12, 30)},
 	}
 	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := addMonth(tt.in)
+			t.Run(tt.name, func(t *testing.T) {
+			got := config.QuotaPeriodEnd(tt.in)
 			if !got.Equal(tt.want) {
-				t.Errorf("addMonth(%v) = %v, want %v", tt.in, got, tt.want)
+				t.Errorf("QuotaPeriodEnd(%v) = %v, want %v", tt.in, got, tt.want)
 			}
 		})
 	}
@@ -97,7 +99,7 @@ func TestAdvancePeriodUntilCurrent_ExactlyOnBoundary(t *testing.T) {
 
 func TestAdvancePeriodUntilCurrent_ClampingAcrossMultiple(t *testing.T) {
 	// Period ended Jan 31, server down until April 5.
-	// Jan 31 → Feb 28 → Mar 28 → Apr 28 (all via addMonth).
+	// Jan 31 → Feb 28 → Mar 28 → Apr 28 (all via the shared clamped-month helper).
 	// Apr 28 + 1 month = May 28 > Apr 5, so: start=Mar 28, end=Apr 28.
 	expiredEnd := d(2026, 1, 31)
 	now := d(2026, 4, 5)

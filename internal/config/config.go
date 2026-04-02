@@ -252,16 +252,36 @@ func (c *Config) GetOrganizationTemplate(name string) OrganizationTemplate {
 	return tpl
 }
 
-// PeriodEnd returns the billing period end for a template starting at start.
+// QuotaPeriodEnd returns the next org quota-period boundary.
+//
+// Traffic quota periods are always monthly regardless of billing_cycle. This
+// helper is shared by org creation defaults and rollover so both paths use the
+// same monthly clamped-month semantics.
+func QuotaPeriodEnd(start time.Time) time.Time {
+	return addClampedMonth(start.UTC())
+}
+
+// PeriodEnd returns the persisted org quota-period end for a template starting at start.
 func (t OrganizationTemplate) PeriodEnd(start time.Time) time.Time {
-	switch strings.ToLower(strings.TrimSpace(t.BillingCycle)) {
-	case "annual", "yearly":
-		return start.AddDate(1, 0, 0)
-	case "weekly":
-		return start.AddDate(0, 0, 7)
-	default:
-		return start.AddDate(0, 1, 0)
+	return QuotaPeriodEnd(start)
+}
+
+func addClampedMonth(t time.Time) time.Time {
+	y, m, d := t.Date()
+
+	targetM := m + 1
+	targetY := y
+	if targetM > 12 {
+		targetM = 1
+		targetY++
 	}
+
+	maxDay := time.Date(targetY, targetM+1, 0, 0, 0, 0, 0, time.UTC).Day()
+	if d > maxDay {
+		d = maxDay
+	}
+
+	return time.Date(targetY, targetM, d, t.Hour(), t.Minute(), t.Second(), t.Nanosecond(), time.UTC)
 }
 
 // FileViewConfig holds file preview and streaming settings
@@ -914,7 +934,6 @@ func hasConfiguredStrings(values []string) bool {
 	return false
 }
 
-// getEnv returns environment variable or default
 func getEnv(key, defaultValue string) string {
 	if v := os.Getenv(key); v != "" {
 		return v

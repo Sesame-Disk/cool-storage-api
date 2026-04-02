@@ -40,9 +40,6 @@ checks on share links, upload links, library creation, and group creation.
 
 **What is still missing:**
 
-- **Rollover job** — `traffic_period_usage` is never reset. Without a scheduled job that fires at
-  the start of each billing period, traffic quotas will never roll over and paying customers will
-  be permanently blocked after their first month. **This is P0.**
 - **M2M auth (service tokens)** — there is no authenticated channel for the Accounts service to
   call SesameFS and update a plan, change a quota, or provision a new org. Any plan change currently
   requires a manual DB edit or superadmin session.
@@ -50,7 +47,6 @@ checks on share links, upload links, library creation, and group creation.
   from Accounts.
 
 **Implications of shipping without remaining items:**
-- Traffic quotas are never reset → customers get permanently blocked after month 1.
 - Plan upgrades cannot be applied without direct DB access or superadmin session.
 
 **Key files:**
@@ -541,8 +537,7 @@ the launch on Glacier since it requires AWS Glacier infrastructure setup and tes
 | 13 | Cold storage / Glacier | **P2** | ~30% | 2–3 weeks |
 | **14** | **Programmatic auth (PATs)** | **P0** | **0% — `server.go:1141` TODO. Desktop/CLI cannot auth in OIDC-only mode** | **1–2 days** |
 | **15** | **GC multi-instance safety** | **P0** | **0% — `gc.go:99` Start() has no leader election or lock** | **1 day** |
-| **16** | **Quota period rollover job** | **P0** | **0% — no code exists. Without this, traffic quotas never reset** | **1 day** |
-| 17 | Frontend Phase 3 cleanup | **P1** | Mostly done. Legacy `personalfree/business/pay_restricted*` removed. Remaining: quota warning banners, GB unit standardization, pageOptions placeholders | 2–3 days |
+| 16 | Frontend Phase 3 cleanup | **P1** | Mostly done. Legacy `personalfree/business/pay_restricted*` removed. Remaining: pageOptions placeholders and minor cleanup | 2–3 days |
 
 ---
 
@@ -556,7 +551,6 @@ the launch on Glacier since it requires AWS Glacier infrastructure setup and tes
 ### Sprint 2 — Hard Blockers (CURRENT)
 - [#14] Programmatic auth (PATs or Device Flow) — desktop sync is broken without this
 - [#15] GC multi-instance safety — env var guard or Cassandra LWT leader lease
-- [#16] Quota period rollover job — without this, paid users are permanently blocked after month 1
 - [#9] Security hardening — small effort, high impact
 
 ### Sprint 3 — Production Essentials

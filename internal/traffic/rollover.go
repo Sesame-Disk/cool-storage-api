@@ -4,6 +4,7 @@ import (
 	"log"
 	"time"
 
+	"github.com/Sesame-Disk/sesamefs/internal/config"
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
 )
 
@@ -77,37 +78,15 @@ func RolloverExpiredPeriods(session *gocql.Session, now time.Time) (int, error) 
 
 // advancePeriodUntilCurrent advances the period forward by monthly increments
 // (possibly multiple if the server was down for a long time) until the period
-// end is strictly after now.
+// end is strictly after now. It intentionally reuses the same monthly helper
+// used by org creation defaults so creation and rollover stay aligned.
 func advancePeriodUntilCurrent(expiredEnd time.Time, now time.Time) (newStart, newEnd time.Time) {
 	start := expiredEnd.UTC()
 	for {
-		end := addMonth(start)
+		end := config.QuotaPeriodEnd(start)
 		if end.After(now) {
 			return start, end
 		}
 		start = end
 	}
-}
-
-// addMonth advances a timestamp by exactly one calendar month, clamping the
-// day to the last day of the target month. This way a period starting on
-// Jan 31 rolls to Feb 28 (not Mar 3), then Mar 31, Apr 30, etc.
-func addMonth(t time.Time) time.Time {
-	y, m, d := t.Date()
-
-	targetM := m + 1
-	targetY := y
-	if targetM > 12 {
-		targetM = 1
-		targetY++
-	}
-
-	// Clamp day to last day of target month.
-	// Day 0 of the month after target = last day of target month.
-	maxDay := time.Date(targetY, targetM+1, 0, 0, 0, 0, 0, time.UTC).Day()
-	if d > maxDay {
-		d = maxDay
-	}
-
-	return time.Date(targetY, targetM, d, t.Hour(), t.Minute(), t.Second(), 0, time.UTC)
 }

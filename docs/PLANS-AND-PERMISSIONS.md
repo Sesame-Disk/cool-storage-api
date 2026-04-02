@@ -387,21 +387,21 @@ func ResolveCapabilities(role string, quotaPolicy string, profile *EnforcementPr
   "current_period_ends_at": "2026-04-14T23:59:59Z",
 
   "storage": {
-    "used": 1610612736,
-    "quota": 2147483648,
+    "used": 1500000000,
+    "quota": 2000000000,
     "percent": 75.0,
     "over_quota": false
   },
 
   "traffic": {
-    "used": 8589934592,
-    "quota": 10737418240,
+    "used": 8000000000,
+    "quota": 10000000000,
     "percent": 80.0,
     "over_quota": false,
-    "upload_used": 2147483648,
+    "upload_used": 2000000000,
     "upload_quota": -1,
     "upload_over_quota": false,
-    "download_used": 6442450944,
+    "download_used": 6000000000,
     "download_quota": -1,
     "download_over_quota": false,
     "reset_date": "2026-04-14"
@@ -436,6 +436,8 @@ func ResolveCapabilities(role string, quotaPolicy string, profile *EnforcementPr
 - **`current_period_started_at` / `current_period_ends_at`**: Current quota period boundaries for the org. `current_period_ends_at` is the canonical source for reset timing and rollover checks.
 - **`is_org_owner`**: Derived from `role == "owner"`. Determines if the user has billing authority.
 - **`can_upgrade`**: `true` when the user is the org owner AND there's a reason to upgrade. See below.
+- **Subscription scope**: The contract is always org-level. A "personal" account is modeled as an org with a single active user, so the same org quota/subscription semantics apply in both personal and org-admin UI.
+- **Billing path**: The subscription page is informational only. Plan changes, renewals, extra users, and extra storage are handled in the billing service via the single `/billing/` redirect path.
 - **`storage`**: Simple quota state. Storage has no monthly period. Either usage is within limit or writes are blocked.
 - **`traffic`**: Pre-digested traffic state for the current quota period. Frontend reads `over_quota`, `percent`, `reset_date` and upload/download sub-limits directly — no calculations needed.
 - **`can_X` flags**: Already resolved by `role AND enforcement_profile`. Frontend treats as final booleans.
@@ -544,7 +546,7 @@ Every org MUST be born with an explicit plan and quota_policy. No more ambiguous
 | `quota_policy` | `"hard"` |
 | `billing_cycle` | `"monthly"` |
 | `current_period_started_at` | org creation time |
-| `current_period_ends_at` | from Accounts if provided, else SesameFS derives it from start using the standard monthly formula |
+| `current_period_ends_at` | from Accounts if provided, else SesameFS derives it from start using the shared monthly quota-period helper |
 | `storage_quota` | 2 GB |
 | `traffic_quota` | 10 GB |
 | `traffic_upload_quota` | -1 |
@@ -604,7 +606,7 @@ new capabilities, new limits, upgrade_features is now empty
 - No persistent local overrides. If a custom deal is needed, it's configured in Accounts
 - Accounts may send `current_period_started_at` and optionally `current_period_ends_at`
 - If Accounts sends `current_period_ends_at`, SesameFS uses it as authoritative
-- If Accounts sends only `current_period_started_at`, SesameFS derives `current_period_ends_at` with the standard monthly formula
+- If Accounts sends only `current_period_started_at`, SesameFS derives `current_period_ends_at` with the shared quota-period helper used by org creation and rollover (always advance one calendar month, clamping the day when the target month is shorter)
 - If Accounts sends both start and end, SesameFS should validate that they are coherent before persisting them
 
 ### Internal Handler Separation
@@ -690,7 +692,11 @@ After the org pays again and Accounts upgrades it back to a paid profile, user r
 
 Traffic enforcement uses the org's current quota period, not the natural UTC month. Every org has `current_period_started_at` and `current_period_ends_at`, and traffic usage is evaluated within that window even for annual billing plans. The rollover job should select orgs by `current_period_ends_at <= now`, advance them in a loop until the end is in the future, and never delete historical counters.
 
-The monthly period formula should follow the same standard anchor semantics used by Stripe. Accounts may provide the end explicitly; otherwise SesameFS derives it from the start.
+Even when `billing_cycle="annual"`, traffic still resets monthly. Accounts may update the period boundaries and remains the source of truth for paid orgs, but the local rollover cron still advances expired monthly periods so enforcement never stalls if Accounts is delayed.
+
+When Accounts does not send the end explicitly, SesameFS derives monthly period ends with the same shared quota-period helper used during org creation defaults and rollover: advance one calendar month and clamp the day when the target month is shorter. `current_period_ends_at` is a quota-period boundary, not a commercial billing anchor.
+
+Quota contract units use decimal storage units: `GB`/`TB` in plan defaults, API payloads, and quota UI mean base-1000 bytes. Binary units are reserved for technical/internal thresholds and should be labeled `GiB`/`MiB` if they ever surface in user-facing text.
 
 Storage does not use rolling periods. Storage is simple: either current usage is within the limit or additional writes are blocked.
 
@@ -770,7 +776,7 @@ Phase 2 implementation notes:
 - `traffic_period_usage` is now the canonical source for quota enforcement and for the Phase 2 `traffic{}` objects returned by `account/info` and `subscription`.
 - `traffic_monthly` remains in place for natural-month reporting and dashboards.
 - `upgrade_features` now follows the documented frontend contract and returns short names such as `add_group` instead of raw `can_*` keys.
-- `traffic.reset_date` now reflects `current_period_ends_at` when present and falls back to the next UTC calendar month only for backward compatibility.
+- `traffic.reset_date` now reflects `current_period_ends_at` when present and otherwise derives the boundary from `current_period_started_at` with the shared monthly quota-period helper.
 
 ### Phase 3: Frontend Migration
 
@@ -798,15 +804,15 @@ Phase 2 implementation notes:
 
 | # | Item | Files | Effort | Status |
 |---|------|-------|--------|--------|
-| 3.1 | Axios interceptor for `X-Quota-Warning` header → toast/banner | `seafile-api.js` or Axios defaults | 1 session | ❌ |
+| 3.1 | Axios interceptor for `X-Quota-Warning` header → toast/banner | `seafile-api.js` or Axios defaults | 1 session | ✅ |
 | 3.2 | Permanent quota banners for `storage.over_quota` / `traffic.over_quota` | Layout/header components | 1 session | ❌ |
-| 3.3 | Standardize `formatBytes()` — binary GiB or decimal GB, label consistently | `frontend/src/utils/utils.js`, quota inputs | 1 session | ❌ |
+| 3.3 | Standardize quota unit labels: decimal GB/TB for quota contract, binary GiB for technical thresholds | `frontend/src/utils/utils.js`, quota inputs | 1 session | ✅ |
 | 3.4 | Remove `window.org.pageOptions` placeholder deps in org-admin | `org-group-info/members/repos.js`, `org-user-profile/repos/shared-repos.js` | 1 session | ❌ |
-| 3.5 | Personal quota view page in account settings | New page consuming `GET /api/v2.1/subscription/` | 1 session | ❌ |
+| 3.5 | Org-owner subscription entry | Account menu link to org-admin subscription view consuming `GET /api/v2.1/subscription/` | 1 session | ✅ |
 | 3.6 | Remove `isFreeUser` deprecated alias | `constants.js:232` + consumers | 30 min | ❌ |
 
 **Conclusion:**
-- **Phase 3 is mostly done.** Legacy code is clean. 6 remaining items are frontend-only, independent, ~1 session each.
+- **Phase 3 is mostly done.** Legacy code is clean. 5 remaining items are frontend-only, independent, ~1 session each.
 - None block backend functionality or production deployment.
 - Items 3.1-3.2 (quota warnings) are the most user-visible.
 

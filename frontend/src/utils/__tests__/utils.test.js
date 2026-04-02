@@ -16,10 +16,11 @@ describe('Utils', () => {
 
     test('handles bytes', () => {
       expect(Utils.bytesToSize(500)).toBe('500 bytes');
+      expect(Utils.bytesToSize(999)).toBe('999 bytes');
     });
 
     test('handles kilobytes', () => {
-      expect(Utils.bytesToSize(1024)).toBe('1.0 KB');
+      expect(Utils.bytesToSize(1000)).toBe('1.0 KB');
       expect(Utils.bytesToSize(1500)).toBe('1.5 KB');
     });
 

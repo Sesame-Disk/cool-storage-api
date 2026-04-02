@@ -11,7 +11,10 @@ The current agreed design is now implemented in the backend through Phase 2:
 - `traffic_period_usage` is the canonical aggregate for quota enforcement and Phase 2 account/subscription traffic payloads.
 - `billing_cycle` remains commercial metadata only; even annual plans still enforce monthly traffic quotas.
 - Storage does not use periods. Storage is simply current usage vs current limit.
-- Accounts may send `current_period_ends_at` explicitly. If it does not, SesameFS derives it from `current_period_started_at` using the same monthly anchor semantics used by Stripe.
+- Accounts may send `current_period_ends_at` explicitly. If it does not, SesameFS derives it from `current_period_started_at` with the same shared quota-period helper used by org creation defaults and rollover: always advance one calendar month and clamp the day when the target month is shorter.
+- The local rollover cron still advances expired monthly periods even for annual billing plans. Accounts can later overwrite the dates for paid orgs, but enforcement must never wait on an external sync to keep monthly traffic moving.
+- Quota contract units use decimal storage units: `GB`/`TB` in plans, defaults, API payloads and quota UI mean base-1000 bytes. Binary units remain reserved for technical/internal thresholds and should be labeled `GiB`/`MiB` if exposed.
+- The subscription page is informational only. Billing actions happen through SesameFS `/billing/`, which redirects authenticated users to the external billing portal. The active UI route is the org-admin subscription view at `/org/subscription/`.
 
 Where this document refers to "monthly traffic reset" for enforcement, read it as "quota-period rollover" under the current design.
 
@@ -282,12 +285,14 @@ Internal logic:
 1. Compute `month := time.Now().Format("200601")` and `day := time.Now().Truncate(24h)`
 2. Increment `traffic_counters` with (org_id, month, day, user_id, traffic_type)
 3. Determine direction: if trafficType contains "upload" → direction="upload"; if "download" → direction="download"
-4. Increment `traffic_monthly` with 3 scopes:
-   - `"org:<direction>"` (e.g., `"org:upload"`) — for individual quota check
-   - `"org:combined"` — for combined quota check
-   - `"<userID>:<direction>"` — for per-user quota check
-5. All inside `go func() { ... }()` — fire-and-forget
-6. Errors are logged, never propagated
+4. Increment `traffic_monthly` with 3 scopes for natural-month reporting:
+    - `"org:<direction>"` (e.g., `"org:upload"`) — monthly directional totals
+    - `"org:combined"` — monthly combined total
+    - `"<userID>:<direction>"` — monthly per-user directional total
+5. Increment `traffic_period_usage` with the same 3 scopes keyed by `current_period_started_at`
+    - this is the aggregate used for quota enforcement and current-period account/subscription payloads
+6. All inside `go func() { ... }()` — fire-and-forget
+7. Errors are logged, never propagated
 
 ### 2.2 Constants
 
@@ -465,20 +470,24 @@ func (c *Checker) CheckMaxUsers(orgID string) (QuotaStatus, error)
 ```
 CheckTrafficQuota(orgID, userID, direction, additionalBytes):
 
-  1. SELECT traffic_quota, traffic_upload_quota, traffic_download_quota, plan
+    1. SELECT traffic_quota, traffic_upload_quota, traffic_download_quota, plan,
+         current_period_started_at
      FROM organizations WHERE org_id = ?
 
-  2. month = time.Now().Format("200601")
+    2. period_started_at = current_period_started_at if present,
+         else first day of current UTC month (backward-compatible fallback)
 
   3. CHECK 1: Combined quota (traffic_quota)
      If traffic_quota != -1:
-       SELECT bytes FROM traffic_monthly WHERE org_id=? AND month=? AND scope='org:combined'
+             SELECT bytes FROM traffic_period_usage
+             WHERE org_id=? AND period_started_at=? AND scope='org:combined'
        Evaluate: combined_used + additional > traffic_quota
 
   4. CHECK 2: Direction quota (traffic_upload_quota or traffic_download_quota)
      quota = traffic_upload_quota if direction=="upload", else traffic_download_quota
      If quota != -1:
-       SELECT bytes FROM traffic_monthly WHERE scope='org:<direction>'
+             SELECT bytes FROM traffic_period_usage
+             WHERE org_id=? AND period_started_at=? AND scope='org:<direction>'
        Evaluate: direction_used + additional > quota
 
   5. CHECK 3: Per-user quota
@@ -486,7 +495,8 @@ CheckTrafficQuota(orgID, userID, direction, additionalBytes):
        SELECT traffic_upload_quota, traffic_download_quota FROM users WHERE org_id=? AND user_id=?
        user_quota = the one corresponding to direction
        If user_quota != -1:
-         SELECT bytes FROM traffic_monthly WHERE scope='<userID>:<direction>'
+                 SELECT bytes FROM traffic_period_usage
+                 WHERE org_id=? AND period_started_at=? AND scope='<userID>:<direction>'
          Evaluate: user_used + additional > user_quota
 
   6. For each check that fails:
@@ -644,8 +654,8 @@ billing_cycle            (string, "monthly"|"annual") — NEW
 {
     "plan": "free",
     "billing_cycle": "monthly",
-    "storage_quota": 2147483648,
-    "traffic_quota": 10737418240,
+    "storage_quota": 2000000000,
+    "traffic_quota": 10000000000,
     "traffic_upload_quota": -1,
     "traffic_download_quota": -1,
     "max_users": 1
@@ -657,10 +667,10 @@ billing_cycle            (string, "monthly"|"annual") — NEW
 {
     "plan": "starter",
     "billing_cycle": "monthly",
-    "storage_quota": 268435456000,
+    "storage_quota": 250000000000,
     "traffic_quota": -1,
-    "traffic_upload_quota": 54975581388800,
-    "traffic_download_quota": 268435456000,
+    "traffic_upload_quota": 50000000000000,
+    "traffic_download_quota": 250000000000,
     "max_users": -1
 }
 ```
@@ -683,15 +693,15 @@ Returns current plan info for the authenticated user's org. Consumed by the fron
 {
     "plan": "free",
     "billing_cycle": "monthly",
-    "storage_quota": 2147483648,
-    "storage_used": 1073741824,
+    "storage_quota": 2000000000,
+    "storage_used": 1000000000,
     "storage_percent": 50.0,
-    "traffic_quota": 10737418240,
-    "traffic_combined_used": 5368709120,
+    "traffic_quota": 10000000000,
+    "traffic_combined_used": 5000000000,
     "traffic_upload_quota": -1,
-    "traffic_upload_used": 2684354560,
+    "traffic_upload_used": 2500000000,
     "traffic_download_quota": -1,
-    "traffic_download_used": 2684354560,
+    "traffic_download_used": 2500000000,
     "traffic_reset_date": "2026-04-01",
     "max_users": 1,
     "current_users": 1
@@ -703,12 +713,12 @@ Returns current plan info for the authenticated user's org. Consumed by the fron
 Already returns `storage_quota` and `storage_usage`. Add:
 ```json
 {
-    "traffic_quota": 10737418240,
-    "traffic_combined_used": 5368709120,
+    "traffic_quota": 10000000000,
+    "traffic_combined_used": 5000000000,
     "traffic_upload_quota": -1,
-    "traffic_upload_used": 2684354560,
+    "traffic_upload_used": 2500000000,
     "traffic_download_quota": -1,
-    "traffic_download_used": 2684354560,
+    "traffic_download_used": 2500000000,
     "max_users": 1,
     "plan": "free",
     "billing_cycle": "monthly"
@@ -822,7 +832,7 @@ Phase 2 (TrafficRecorder core)
 - `TrafficRecorder` now writes both `traffic_monthly` and `traffic_period_usage` on every transfer.
 - `QuotaChecker` now enforces traffic quotas against `traffic_period_usage` keyed by `current_period_started_at`.
 - `account/info` and `subscription` now expose current-period traffic usage and use `current_period_ends_at` for reset timing.
-- Natural-month analytics remain on `traffic_monthly`; the period rollover job is still a later phase item.
+- Natural-month analytics remain on `traffic_monthly`; period rollover is now handled by the quota-period job that advances orgs whose `current_period_ends_at <= now`.
 
 ### Post-implementation fixes (2026-03-25)
 - **Recorder semaphore**: Moved `select` outside goroutine — drops records without spawning goroutines under load

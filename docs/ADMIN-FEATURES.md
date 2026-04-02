@@ -129,7 +129,7 @@ password=ignored  ← accepted but not used (OIDC-only system)
 
 **JSON** (direct API calls):
 ```json
-{ "name": "Acme Corp", "owner_email": "alice@acme.com", "storage_quota": 1099511627776 }
+{ "name": "Acme Corp", "owner_email": "alice@acme.com", "storage_quota": 1000000000000 }
 ```
 
 If `owner_email` is provided, an admin user is created in the new org (dual-write to
