@@ -8,6 +8,8 @@ import (
 	"net/url"
 	"testing"
 	"time"
+
+	gocql "github.com/apache/cassandra-gocql-driver/v2"
 )
 
 func TestLibraryProjectionRegression_CreateRenameDeleteRestore(t *testing.T) {
@@ -90,6 +92,85 @@ func TestLibraryProjectionRegression_FileCreateUpdatesAdminStats(t *testing.T) {
 		fileCount, ok := row["file_count"].(float64)
 		return ok && fileCount >= 1
 	})
+}
+
+func TestSyncHeadUpdateKeepsLookupAndAdminProjectionAligned(t *testing.T) {
+	name := fmt.Sprintf("inttest-sync-head-%d", time.Now().UnixNano())
+	repoID := createTestLibrary(t, adminClient, name)
+	session := shareProjectionDBForTest(t).Session()
+
+	initial := readLibrarySyncHeadState(t, session, repoID)
+
+	nextHead := fmt.Sprintf("%040x", time.Now().UnixNano())
+	insertSyntheticCommitForTest(t, session, repoID, nextHead, initial.HeadCommitID, initial.RootFSID, "integration head advance")
+
+	resp := adminClient.Do(t, http.MethodPut, fmt.Sprintf("/seafhttp/repo/%s/commit/HEAD?head=%s", repoID, url.QueryEscape(nextHead)), nil)
+	if resp.StatusCode != http.StatusOK {
+		body := responseBody(t, resp)
+		t.Fatalf("sync HEAD update failed: status=%d body=%s", resp.StatusCode, body)
+	}
+	resp.Body.Close()
+
+	waitForIntegrationCondition(t, "sync HEAD dual-write to align canonical, lookup, and admin projection rows", func() bool {
+		current := readLibrarySyncHeadState(t, session, repoID)
+		return current.HeadCommitID == nextHead &&
+			current.LookupHeadCommitID == nextHead &&
+			current.UpdatedAt.After(initial.UpdatedAt) &&
+			current.ProjectionUpdatedAt.Equal(current.UpdatedAt)
+	})
+}
+
+func TestSyncHeadConflictReturnsOKWithoutRollback(t *testing.T) {
+	name := fmt.Sprintf("inttest-sync-conflict-%d", time.Now().UnixNano())
+	repoID := createTestLibrary(t, adminClient, name)
+	session := shareProjectionDBForTest(t).Session()
+
+	initial := readLibrarySyncHeadState(t, session, repoID)
+	acceptedHead := fmt.Sprintf("%040x", time.Now().UnixNano())
+	staleHead := fmt.Sprintf("%040x", time.Now().UnixNano()+1)
+	insertSyntheticCommitForTest(t, session, repoID, acceptedHead, initial.HeadCommitID, initial.RootFSID, "integration accepted head")
+	insertSyntheticCommitForTest(t, session, repoID, staleHead, initial.HeadCommitID, initial.RootFSID, "integration stale head")
+
+	resp := adminClient.Do(t, http.MethodPut, fmt.Sprintf("/seafhttp/repo/%s/commit/HEAD?head=%s", repoID, url.QueryEscape(acceptedHead)), nil)
+	if resp.StatusCode != http.StatusOK {
+		body := responseBody(t, resp)
+		t.Fatalf("initial sync HEAD update failed: status=%d body=%s", resp.StatusCode, body)
+	}
+	resp.Body.Close()
+
+	var advanced librarySyncHeadState
+	waitForIntegrationCondition(t, "accepted sync head to become authoritative", func() bool {
+		current := readLibrarySyncHeadState(t, session, repoID)
+		if current.HeadCommitID != acceptedHead || current.LookupHeadCommitID != acceptedHead {
+			return false
+		}
+		if !current.UpdatedAt.After(initial.UpdatedAt) || !current.ProjectionUpdatedAt.Equal(current.UpdatedAt) {
+			return false
+		}
+		advanced = current
+		return true
+	})
+
+	conflictResp := adminClient.Do(t, http.MethodPut, fmt.Sprintf("/seafhttp/repo/%s/commit/HEAD?head=%s", repoID, url.QueryEscape(staleHead)), nil)
+	if conflictResp.StatusCode != http.StatusOK {
+		body := responseBody(t, conflictResp)
+		t.Fatalf("conflicting sync HEAD update returned status=%d body=%s", conflictResp.StatusCode, body)
+	}
+	conflictResp.Body.Close()
+
+	stabilized := readLibrarySyncHeadState(t, session, repoID)
+	if stabilized.HeadCommitID != acceptedHead {
+		t.Fatalf("canonical head rolled back to %q, want %q", stabilized.HeadCommitID, acceptedHead)
+	}
+	if stabilized.LookupHeadCommitID != acceptedHead {
+		t.Fatalf("lookup head rolled back to %q, want %q", stabilized.LookupHeadCommitID, acceptedHead)
+	}
+	if !stabilized.UpdatedAt.Equal(advanced.UpdatedAt) {
+		t.Fatalf("canonical updated_at changed on stale conflict: got %s want %s", stabilized.UpdatedAt.Format(time.RFC3339Nano), advanced.UpdatedAt.Format(time.RFC3339Nano))
+	}
+	if !stabilized.ProjectionUpdatedAt.Equal(advanced.ProjectionUpdatedAt) {
+		t.Fatalf("projection updated_at changed on stale conflict: got %s want %s", stabilized.ProjectionUpdatedAt.Format(time.RFC3339Nano), advanced.ProjectionUpdatedAt.Format(time.RFC3339Nano))
+	}
 }
 
 func TestAdminCreateLibraryProjectionVisibleImmediately(t *testing.T) {
@@ -221,4 +302,54 @@ func adminTrashContainsRepo(t *testing.T, c *testClient, repoID, ownerEmail stri
 		return false
 	}
 	return containsEntry(entries, "id", repoID)
+}
+
+type librarySyncHeadState struct {
+	HeadCommitID       string
+	LookupHeadCommitID string
+	RootFSID           string
+	UpdatedAt          time.Time
+	ProjectionUpdatedAt time.Time
+}
+
+func readLibrarySyncHeadState(t *testing.T, session interface {
+	Query(stmt string, values ...interface{}) *gocql.Query
+}, repoID string) librarySyncHeadState {
+	t.Helper()
+
+	var state librarySyncHeadState
+	if err := session.Query(`
+		SELECT head_commit_id, updated_at FROM libraries WHERE org_id = ? AND library_id = ?
+	`, defaultOrgID, repoID).Scan(&state.HeadCommitID, &state.UpdatedAt); err != nil {
+		t.Fatalf("failed to read canonical sync head state for %s: %v", repoID, err)
+	}
+	if err := session.Query(`
+		SELECT head_commit_id FROM libraries_by_id WHERE library_id = ?
+	`, repoID).Scan(&state.LookupHeadCommitID); err != nil {
+		t.Fatalf("failed to read lookup sync head state for %s: %v", repoID, err)
+	}
+	if err := session.Query(`
+		SELECT updated_at FROM libraries_by_org_updated WHERE org_id = ? AND library_id = ?
+	`, defaultOrgID, repoID).Scan(&state.ProjectionUpdatedAt); err != nil {
+		t.Fatalf("failed to read projection sync head state for %s: %v", repoID, err)
+	}
+	if err := session.Query(`
+		SELECT root_fs_id FROM commits WHERE library_id = ? AND commit_id = ?
+	`, repoID, state.HeadCommitID).Scan(&state.RootFSID); err != nil {
+		t.Fatalf("failed to read root fs id for %s/%s: %v", repoID, state.HeadCommitID, err)
+	}
+
+	return state
+}
+
+func insertSyntheticCommitForTest(t *testing.T, session interface {
+	Query(stmt string, values ...interface{}) *gocql.Query
+}, repoID, commitID, parentID, rootFSID, description string) {
+	t.Helper()
+	if err := session.Query(`
+		INSERT INTO commits (library_id, commit_id, parent_id, root_fs_id, creator_id, description, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+	`, repoID, commitID, parentID, rootFSID, defaultOrgID, description, time.Now().UTC()).Exec(); err != nil {
+		t.Fatalf("failed to insert synthetic commit %s for %s: %v", commitID, repoID, err)
+	}
 }

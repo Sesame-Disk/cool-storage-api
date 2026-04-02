@@ -2024,30 +2024,32 @@ func (h *SyncHandler) updateLibraryHeadWithStats(orgID, repoID, commitID string,
 	wantCAS := len(expectedHead) > 0 && expectedHead[0] != ""
 
 	if wantCAS {
-		// CAS update: only update if current HEAD matches expected value
-		// This prevents stale/retried commits from overwriting a HEAD
-		// that was advanced by web uploads or other clients.
-		var currentHead string
+		// Cassandra does not allow conditional batches across multiple tables, so
+		// advance the authoritative libraries row via CAS first and then
+		// immediately resync the dependent lookup/admin projection rows from the
+		// canonical state we just committed.
+		var previousUpdatedAt time.Time
+		if err := h.db.Session().Query(`
+			SELECT updated_at FROM libraries WHERE org_id = ? AND library_id = ?
+		`, orgID, repoID).Scan(&previousUpdatedAt); err != nil {
+			return fmt.Errorf("failed to read library updated_at: %w", err)
+		}
+
+		casState := map[string]interface{}{}
 		applied, err := h.db.Session().Query(`
 			UPDATE libraries SET head_commit_id = ?, updated_at = ?
 			WHERE org_id = ? AND library_id = ?
-			IF head_commit_id = ?
-		`, commitID, now, orgID, repoID, expectedHead[0]).ScanCAS(&currentHead)
+			IF head_commit_id = ? AND updated_at = ?
+		`, commitID, now, orgID, repoID, expectedHead[0], previousUpdatedAt).MapScanCAS(casState)
 		if err != nil {
-			return fmt.Errorf("CAS update failed: %w", err)
+			return fmt.Errorf("conditional head update failed: %w", err)
 		}
 		if !applied {
+			currentHead, _ := casState["head_commit_id"].(string)
 			return fmt.Errorf("%w: expected %s but found %s", ErrHeadConflict, expectedHead[0], currentHead)
 		}
-
-		// CAS succeeded on authoritative table. Update lookup table separately.
-		// Brief inconsistency between the two tables is acceptable because
-		// libraries is authoritative for sync operations.
-		if err := h.db.Session().Query(`
-			UPDATE libraries_by_id SET head_commit_id = ?
-			WHERE library_id = ?
-		`, commitID, repoID).Exec(); err != nil {
-			log.Printf("[updateLibraryHeadWithStats] WARNING: libraries_by_id update failed for %s: %v (libraries table was updated)", repoID, err)
+		if err := h.syncLibraryHeadDerivedState(orgID, repoID); err != nil {
+			return err
 		}
 	} else {
 		// Unconditional update (for initial commit creation and other cases
@@ -2075,10 +2077,31 @@ func (h *SyncHandler) updateLibraryHeadWithStats(orgID, repoID, commitID string,
 
 	// Async: recalculate stats from directory tree
 	go h.recalculateLibraryStats(orgID, repoID, commitID)
-	if wantCAS {
-		if err := db.SyncAdminLibraryReadModel(h.db.Session(), orgID, repoID); err != nil {
-			log.Printf("[updateLibraryHeadWithStats] WARNING: failed to sync admin library read model for %s: %v", repoID, err)
-		}
+
+	return nil
+}
+
+func (h *SyncHandler) syncLibraryHeadDerivedState(orgID, repoID string) error {
+	var headCommitID string
+	if err := h.db.Session().Query(`
+		SELECT head_commit_id FROM libraries WHERE org_id = ? AND library_id = ?
+	`, orgID, repoID).Scan(&headCommitID); err != nil {
+		return fmt.Errorf("failed to read canonical head after sync update: %w", err)
+	}
+
+	projectionRow, err := db.ReadAdminLibraryProjectionRow(h.db.Session(), orgID, repoID)
+	if err != nil {
+		return fmt.Errorf("failed to read library projection row: %w", err)
+	}
+
+	batch := h.db.Session().Batch(gocql.LoggedBatch)
+	batch.Query(`
+		UPDATE libraries_by_id SET head_commit_id = ?
+		WHERE library_id = ?
+	`, headCommitID, repoID)
+	db.AddUpsertAdminLibraryReadModelQuery(batch, projectionRow)
+	if err := batch.Exec(); err != nil {
+		return fmt.Errorf("failed to sync head lookup/admin projection: %w", err)
 	}
 
 	return nil
