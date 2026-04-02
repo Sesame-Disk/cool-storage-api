@@ -852,8 +852,9 @@ func (m *PermissionMiddleware) GetUserLibraries(orgID, userID string) ([]Library
 	}
 
 	// 2. Get all libraries directly shared with user
-	// Note: ALLOW FILTERING used here - acceptable for shares table as it's typically small
-	// TODO: Create shares_by_recipient table for better performance at scale
+	// Note: ALLOW FILTERING used here — shares_by_recipient table exists but this
+	// query path uses the canonical shares table for permission resolution.
+	// Consider migrating to shares_by_recipient for better performance at scale.
 	iter = m.db.Session().Query(`
 		SELECT library_id, permission FROM shares
 		WHERE shared_to = ? AND shared_to_type = 'user'

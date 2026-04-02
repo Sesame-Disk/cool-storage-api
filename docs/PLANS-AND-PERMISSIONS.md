@@ -785,26 +785,30 @@ Phase 2 implementation notes:
 | 3.7 | Add quota warning banners from `storage.over_quota` / `traffic.over_quota` | Layout/header components | Medium |
 | 3.8 | Remove all `personalfree`/`business`/`pay_restricted*` references | Multiple files | Medium |
 
-### Phase 3 Progress Update (2026-03-30)
+### Phase 3 Progress Update (2026-04-02, verified against code)
 
-Already landed:
-- `frontend/src/app.js` now consumes the new account/subscription contract fields used by the upgrade-state helpers (`plan`, `can_upgrade`, `maxUsers`, `currentUsers`, quota objects, current period data).
-- Sysadmin org surfaces now present org semantics as `owner` and `plan`, not `creator` and fake `role`.
-- Ownership transfer is exposed from both the sysadmin member-management flow and the org-admin users page.
-- The critical member-limit UI now reads live org data on the affected pages:
-  - sysadmin org users gates `Add Member` from `sysAdminGetOrg()`
-  - org-admin users gates `Add user` / invites from `orgAdminGetOrgInfo()`
-  - org-admin info derives member-limit visibility from real quota values instead of shell placeholders
+**Already landed:**
+- ✅ `frontend/src/app.js` consumes new account/subscription contract fields (plan, can_upgrade, maxUsers, quota objects, current period data).
+- ✅ Sysadmin org surfaces present org semantics as `owner` and `plan`, not `creator` and fake `role`.
+- ✅ Ownership transfer exposed from sysadmin and org-admin users pages.
+- ✅ Critical member-limit UI reads live org data (sysadmin + org-admin users pages).
+- ✅ Legacy plan-role code (`personalfree`, `business`, `pay_restricted*`) **removed from frontend**. Only `isFreeUser` remains as `@deprecated` alias in `constants.js:232`.
 
-Still pending before Phase 3 can be considered closed:
-- Remove remaining frontend legacy plan-role code paths (`personalfree`, `business`, `pay_restricted*`) and converge all CTAs on `can_upgrade` + `upgrade_features`.
-- Eliminate remaining org-admin dependencies on placeholder `window.org.pageOptions` values for invite/config/navigation flags.
-- Standardize quota-size units in the UI: some screens appear to use decimal `GB` (`1000^3`) while backend/utilities use binary byte conversions (`1024^3`). The product must choose one convention and label it consistently.
-- Finish warning/banner UX for quota states (`storage.over_quota`, `traffic.over_quota`, upload/download overages).
+**Remaining checklist to close Phase 3:**
 
-Conclusion:
-- **Phase 3 is not done yet.**
-- It is materially advanced, but still open due to frontend cleanup and bootstrap consistency work.
+| # | Item | Files | Effort | Status |
+|---|------|-------|--------|--------|
+| 3.1 | Axios interceptor for `X-Quota-Warning` header → toast/banner | `seafile-api.js` or Axios defaults | 1 session | ❌ |
+| 3.2 | Permanent quota banners for `storage.over_quota` / `traffic.over_quota` | Layout/header components | 1 session | ❌ |
+| 3.3 | Standardize `formatBytes()` — binary GiB or decimal GB, label consistently | `frontend/src/utils/utils.js`, quota inputs | 1 session | ❌ |
+| 3.4 | Remove `window.org.pageOptions` placeholder deps in org-admin | `org-group-info/members/repos.js`, `org-user-profile/repos/shared-repos.js` | 1 session | ❌ |
+| 3.5 | Personal quota view page in account settings | New page consuming `GET /api/v2.1/subscription/` | 1 session | ❌ |
+| 3.6 | Remove `isFreeUser` deprecated alias | `constants.js:232` + consumers | 30 min | ❌ |
+
+**Conclusion:**
+- **Phase 3 is mostly done.** Legacy code is clean. 6 remaining items are frontend-only, independent, ~1 session each.
+- None block backend functionality or production deployment.
+- Items 3.1-3.2 (quota warnings) are the most user-visible.
 
 ### Phase 4: Provisioning Integration (when Accounts is ready)
 

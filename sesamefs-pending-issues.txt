@@ -1,32 +1,49 @@
 =======================================
 SesameFS — Pending Issues & Open Items
 =======================================
-Last Updated: 2026-02-26
+Last Updated: 2026-04-02
 
-Overall: ~80% production ready
-Backend API: ~97% | Frontend UI: ~83%
+Overall: ~87% production ready
+Backend API: ~98% | Frontend UI: ~85%
 Active Bugs: 0 open
 
 =======================================
 1. SECURITY (Open)
 =======================================
 
-1.1 CORS Defaults to Allow All Origins [MEDIUM]
-    File: internal/api/server.go (~line 175)
-    - In production, if CORS.AllowedOrigins is not configured, defaults to AllowAllOrigins = true
-    - Should default to same-origin or reject if unconfigured
+1.1 Programmatic Auth Broken (PATs/Device Flow) [P0 — BLOCKS PRODUCTION]
+    File: internal/api/server.go:1141
+    - `POST /api2/auth-token/` returns 401 in OIDC-only mode (TODO in code)
+    - Desktop client, seaf-cli, scripts, CI pipelines cannot authenticate
+    - Workaround: AUTH_DEV_MODE=true (not suitable for production)
+    - Solution: Personal Access Tokens (~200 lines) or OIDC Device Flow
+    - See docs/TECHNICAL-DEBT.md §6 for full analysis
+
+1.2 GC Multi-Instance Not Safe [P0 — BLOCKS SCALING]
+    File: internal/gc/gc.go:99
+    - Start() launches goroutines without coordination between replicas
+    - Multiple replicas = duplicate scans + race conditions on dequeue
+    - Solution: env var GC_ENABLED (simple) or Cassandra LWT leader lease (robust)
+
+1.3 Quota Period Rollover Job Missing [P0 — BLOCKS PAID USERS]
+    - No code exists to reset traffic_period_usage when current_period_ends_at <= now
+    - Without this, traffic quotas never roll over → paid users permanently blocked after month 1
+    - Fields current_period_started_at/ends_at exist on organizations table
+    - Solution: Ticker in GC or standalone job
+
+1.4 CORS Defaults to Allow All Origins [MEDIUM]
+    File: internal/api/server.go (~line 256)
+    - Verified 2026-04-02: prod mode actually defaults to deny-all (correct)
+    - Missing: startup WARNING when AllowedOrigins is empty in production
     - Dev mode allowing all origins is fine
 
-1.2 Silent DB Error Swallowing in Sync [LOW]
-    File: internal/api/sync.go
+1.5 Silent DB Error Swallowing in Sync [LOW]
+    File: internal/api/sync.go (~line 700)
     - Block metadata write failures silently fall back to "hot" storage class
-    - Errors should at minimum be logged
-    - Not a data loss risk, but makes debugging harder
+    - Fix: add slog.Warn() (5 minutes, no behavior change)
 
-1.3 Anonymous Auth Bypass in Dev Mode [LOW - dev only]
+1.6 Anonymous Auth Bypass in Dev Mode [LOW - dev only]
     File: internal/api/server.go (~line 870)
-    - When AllowAnonymous && DevMode, requests without auth token get
-      authenticated as the first dev token user
     - Only affects dev mode, not production — low risk
 
 =======================================
@@ -55,17 +72,18 @@ Active Bugs: 0 open
     - Cross-repo returns 501 Not Implemented
     - Same-repo has TODO for FS tree update optimization
 
-2.5 Tenant Quota Enforcement [LOW]
-    File: internal/api/sync.go (~line 1635)
-    - QuotaCheck always returns {has_quota: true}
-    - Quotas are stored in DB but never enforced on upload
-    - Only matters when billing/limits are needed
+2.5 Tenant Quota Enforcement — ✅ IMPLEMENTED (2026-03-25)
+    - CheckStorageQuota, CheckTrafficQuota, CheckMaxUsers in internal/traffic/checker.go
+    - Enforcement: hard block (free/quota_policy="hard") or soft warning (paid/quota_policy="soft")
+    - Pre-checks in: HandleUpload, HandleDownload, UploadFile, AdminCreateUser, AddOrgUser
+    - X-Quota-Warning header sent at 80% threshold
+    - See docs/QUOTAS-AND-TRAFFIC-PLAN.md for full design
 
-2.6 Storage Policy Evaluation [LOW]
+2.6 Storage Policy Evaluation [LOW — P2, not blocking]
     File: internal/storage/storage.go (~line 392)
     - SelectBackend() always returns the default storage class
-    - Policy evaluation based on tenant/file type/size not implemented
-    - Only matters for tiered storage workflows
+    - Only matters for tiered storage workflows (cold/hot/warm)
+    - Can ship v1.0 without this
 
 =======================================
 3. INTENTIONAL STUBS (Not bugs — features not yet needed)
@@ -90,11 +108,12 @@ They exist so the frontend doesn't break. Implement when needed.
 4. DATABASE / PERFORMANCE
 =======================================
 
-4.1 Missing Optimization Tables [MEDIUM]
-    - shares_by_creator — needed for efficient "my shared items" queries
-    - shares_by_recipient — needed for efficient "shared with me" queries
-    - Currently does full table scan per library to find shares
-    Files: internal/api/v2/file_shares.go, internal/middleware/permissions.go
+4.1 Share Optimization Tables — ✅ IMPLEMENTED (2026-04-01)
+    - shares_by_creator — EXISTS in 001_initial_schema.cql:431, dual-write in share_read_models.go:83
+    - shares_by_recipient — EXISTS in 001_initial_schema.cql:444, dual-write in share_read_models.go:88
+    - Queries use these tables: file_shares.go:751 (by creator), file_shares.go:952 (by recipient)
+    - Integration tests in share_projection_regression_test.go
+    - NOTE: permissions.go:856 has a stale TODO saying "Create shares_by_recipient table" — the table already exists
 
 =======================================
 5. TECHNICAL DEBT
@@ -109,7 +128,7 @@ They exist so the frontend doesn't break. Implement when needed.
 | No CI pipeline                    | GitHub Actions workflow not configured                                        |
 | Missing production docs           | No user guide, admin guide, deployment guide, backup/restore, migration guide |
 | ~51 ModalPortal wrappers          | Harmless but unnecessary, clean up opportunistically                          |
-| Bandwidth metering for billing    | Not implemented — needed for paid tiers                                       |
+| Bandwidth metering for billing    | ✅ IMPLEMENTED — traffic_counters, traffic_monthly, traffic_period_usage      |
 +-----------------------------------+-------------------------------------------------------------------------------+
 
 =======================================
@@ -138,9 +157,26 @@ They exist so the frontend doesn't break. Implement when needed.
   Code exists and includes conflict handling, needs manual testing.
 
 =======================================
-PRIORITIES (Next 3 highest-value items)
+PRIORITIES (Updated 2026-04-02, verified against code)
 =======================================
 
-1. Audit Logs & Activity Feed — largest scope, most user-visible gap
-2. Share optimization tables (shares_by_creator/recipient) — performance
-3. CORS production default — security hardening
+P0 — HARD BLOCKERS:
+1. Programmatic auth (PATs) — desktop sync broken without this
+2. GC multi-instance safety — needed before scaling to >1 replica
+3. Quota period rollover job — paid users permanently blocked without this
+
+P1 — PRODUCTION ESSENTIALS:
+4. Audit logs persistentes — compliance (framework ready, TODO in audit.go:87)
+5. Security hardening — Go-level headers, IdleTimeout, brute force per-user
+6. Backup/DR scripts + runbook
+
+P1 — FRONTEND PHASE 3:
+7. Quota warning banners (backend sends X-Quota-Warning, frontend doesn't consume)
+8. Estandarizar unidades GB (decimal vs binario)
+9. Personal quota view page (endpoint exists, no UI)
+
+P2 — POST-LAUNCH:
+10. Go code reorganization (functional but hard to maintain)
+11. Test coverage push (25% → 40%)
+12. Email/notifications
+13. Antivirus ClamAV

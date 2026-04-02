@@ -6,22 +6,25 @@
 
 ## Project Completeness Summary
 
-**Overall Production Readiness**: ~80%
+**Overall Production Readiness**: ~87%
 
 | Area | Completeness | Notes |
 |------|--------------|-------|
 | Sync Protocol (Desktop) | 100% ✅ | 🔒 FROZEN - Working perfectly |
-| Core Backend API | ~98% | GC ✅, OIDC ✅, Library Settings ✅, Monitoring ✅ |
+| Core Backend API | ~98% | GC ✅, OIDC ✅, Library Settings ✅, Monitoring ✅, Quotas ✅, Plans/Permissions Phase 1+2 ✅ |
 | Admin Panels | ~95% | Superadmin ✅, Org Admin ✅, both at parity. Audit logs pending |
-| Frontend UI | ~85% | All 122 modals migrated ✅, File History UI ✅, permission UI (~75% with granular flags), ~51 ModalPortal wrappers to clean up |
-| Authentication | ~80% | OIDC Phase 1 complete, JWT revocation hardened (2026-03-31), dev tokens supported |
+| Frontend UI | ~85% | All 122 modals migrated ✅, File History UI ✅, permission UI (~75% with granular flags), ~51 ModalPortal wrappers to clean up, Phase 3 quota/plan UI in progress |
+| Authentication | ~80% | OIDC Phase 1 complete, JWT revocation hardened (2026-03-31). **PATs/Device Flow missing — desktop sync broken in OIDC-only** |
 | Production Infrastructure | ✅ ~97% | GC ✅, Monitoring ✅, Health checks ✅, Structured logging ✅, Frontend/Backend separation ✅, Nginx production hardening ✅ |
 
-**✅ Production Blockers — ALL COMPLETE**:
+**Production Blockers (verified against code 2026-04-02)**:
 1. ~~OIDC Authentication~~ - ✅ COMPLETE (Phase 1 - Basic Login)
 2. ~~Garbage Collection~~ - ✅ COMPLETE (Queue worker + scanner + admin API)
 3. ~~Monitoring/Health Checks~~ - ✅ COMPLETE (slog logging, `/health`, `/ready`, `/metrics`)
 4. ~~Frontend/Backend Separation~~ - ✅ COMPLETE (2026-03-30/31) — separate React/nginx container, bootstrap API, nginx production hardening
+5. **Programmatic Auth (PATs)** - ❌ PENDING — `server.go:1141` TODO. Desktop/CLI cannot auth in OIDC-only mode. See `docs/TECHNICAL-DEBT.md` §6
+6. **GC Multi-Instance Safety** - ❌ PENDING — `gc.go:99` Start() has no leader election. Unsafe with >1 replica
+7. **Quota Period Rollover** - ❌ PENDING — No code to reset `traffic_period_usage` when period expires. Paid users permanently blocked after month 1
 
 ---
 
@@ -73,7 +76,7 @@
 | **OIDC Group/Dept Sync** | ✅ COMPLETE | Mostly stable | ❌ No | 2026-02-02 | Claims extraction, sync on login, full sync mode |
 | **Garbage Collection** | ✅ COMPLETE | Mostly stable | ❌ No | 2026-03-18 | 9 item types (incl. `user_cascade`, `library_cascade`, `org_cascade`), 12 scanner phases, soft-delete cascades for users (7-day grace), libraries (30-day trash), orgs (30-day grace). Full artifact cleanup, atomic group deletion, audit log, health metrics |
 | **Admin Panel (Groups/Users)** | ✅ COMPLETE | Mostly stable | ❌ No | 2026-02-02 | 16 admin endpoints + OIDC group/dept sync, 29 tests |
-| **Admin Dashboard KPIs** | 🟡 PARTIAL | Mostly stable | ❌ No | 2026-03-26 | Sysadmin and org-admin overview KPIs now use real storage, file, active-user, and this-month/this-year traffic data. Remaining gaps: device counts are unavailable and sysadmin license metadata is still stubbed. Redesign backlog remains documented in `docs/DASHBOARD-REDESIGN-PLAN.md` and `docs/ADMIN-DASHBOARD-WIREFRAMES.md`. |
+| **Admin Dashboard KPIs** | ✅ COMPLETE | Mostly stable | ❌ No | 2026-04-02 | Sysadmin and org-admin overview KPIs use real storage, file, active-user, and traffic data. Storage time-series uses `storage_daily_delta` for historical charts. Traffic stats use `traffic_counters` with per-type desglose. Remaining gaps: device counts unavailable, sysadmin license metadata stubbed. |
 | **Admin Library Management** | ✅ COMPLETE | Mostly stable | ❌ No | 2026-02-12 | 12 endpoints in admin.go + seafile-api.js methods + trash libraries |
 | **Admin Link Management** | ✅ COMPLETE | Mostly stable | ❌ No | 2026-02-12 | 13 endpoints: share link admin (list/delete), upload links (user CRUD + admin), per-user links. See [ADMIN-FEATURES.md](ADMIN-FEATURES.md) § 2 |
 | **Superadmin Departments/Address Book** | ✅ COMPLETE | Mostly stable | ❌ No | 2026-03-05 | 9 endpoints: dept CRUD, address book groups, group-owned libraries. See [ADMIN-FEATURES.md](ADMIN-FEATURES.md) § 4 |

@@ -1,6 +1,42 @@
 ================================================================================
   QUOTAS — PENDIENTES Y GAPS CONOCIDOS
-    Última actualización: 2026-03-30
+    Última actualización: 2026-04-02
+================================================================================
+
+## RESUMEN DE ESTADO (verificado contra código 2026-04-02)
+
+    IMPLEMENTADO:
+    [ok] Phase 1 backend — owner role, quota_policy, enforcement profiles, defaults (2026-03-27)
+    [ok] Phase 2 backend — capability resolver wired a account/info (server.go:1438) y
+         bootstrap (bootstrap.go:271), enforcement en share links (share_links.go:515),
+         upload links (upload_links.go:281), libraries (libraries.go:447),
+         groups (groups.go:337), traffic_period_usage table (2026-03-28)
+    [ok] Quota enforcement — CheckStorageQuota, CheckTrafficQuota, CheckMaxUsers en 11 archivos
+    [ok] Traffic recording — 6 tipos, per-org/user/platform, monthly + period aggregates
+    [ok] Storage time-series — storage_daily_delta con ReconstructStorageHistory()
+    [ok] Share optimization — shares_by_creator y shares_by_recipient existen y se usan
+    [ok] Frontend stats — gráficas de tráfico y storage con datos reales (sysadmin + org-admin)
+    [ok] Legacy frontend — personalfree/business/pay_restricted* eliminados; isFreeUser es alias @deprecated
+
+    PENDIENTE — P0 (bloqueadores):
+    [ ] Rollover job de períodos — traffic_period_usage nunca se resetea (0% implementado)
+
+    PENDIENTE — P1 (frontend Phase 3):
+    [ ] Quota warning banners — backend envía X-Quota-Warning, frontend no lo consume
+    [ ] Estandarización unidades GB (decimal 1000³ vs binario 1024³)
+    [ ] pageOptions placeholders en org-admin (5-6 archivos)
+    [ ] Vista personal de quota (endpoint subscription/ existe, no hay página)
+
+    PENDIENTE — Phase 4 (post-lanzamiento):
+    [ ] Service token M2M (Accounts → SesameFS)
+    [ ] Preview/evaluate endpoint para cambios de plan
+    [ ] Flujo de invite/create users via Accounts
+
+    DECISIONES PENDIENTES:
+    [ ] ¿Accounts enviará siempre el org_id interno?
+    [ ] ¿Guardar accounts_org_id / subscription_id?
+    [ ] ¿Snapshot de users pre-downgrade para reactivación automática?
+
 ================================================================================
 
 ## UPDATE 2026-03-30 — PHASE 3 FRONTEND EN PROGRESO (NO CERRADA)
@@ -766,19 +802,27 @@
 9. [DONE] Defaults en seed (soft), admin create (hard/free), OIDC (hard/free), role=owner para creador
 9a.[DONE] Endpoint de ownership transfer: PUT /org/:org_id/admin/transfer-ownership/
 9b.[DONE] max_users check en OIDC auto-provision (skip para org nueva)
-10. Crear `ResolveCapabilities(role, quotaPolicy)` con `upgrade_features` list
-11. Agregar agregación de tráfico por período efectivo para enforcement
-12. Actualizar `/api2/account/info/` con: storage{}, traffic{}, current_period_*, upgrade_features, can_upgrade, is_org_owner
-13. Extender `traffic{}` con granularidad upload/download + reset_date
-14. Agregar enforcement por profile en: share links, upload links, libraries, groups
-15. Migrar frontend off legacy `personalfree/business/pay_restricted_owner`
-16. Upgrade CTA con `upgrade_features` + `can_upgrade` (owner near limits)
-17. Quota warning banners con `storage.over_quota`, `traffic.over_quota`,
+10. [DONE] Crear `ResolveCapabilities(role, quotaPolicy)` con `upgrade_features` list
+        — internal/plans/resolver.go implementado y testeado (2026-03-28)
+11. [DONE] Agregar agregación de tráfico por período efectivo para enforcement
+        — traffic_period_usage table implementada (2026-03-28)
+12. [DONE] Actualizar `/api2/account/info/` con: storage{}, traffic{}, current_period_*, upgrade_features, can_upgrade, is_org_owner
+        — server.go:1438 llama ResolveCapabilities(), server.go:1493 devuelve can_upgrade (2026-03-28)
+13. [DONE] Extender `traffic{}` con granularidad upload/download + reset_date
+        — Incluido en Phase 2 backend (2026-03-28)
+14. [DONE] Agregar enforcement por profile en: share links, upload links, libraries, groups
+        — share_links.go:515, upload_links.go:281, libraries.go:447, groups.go:337 (2026-03-28)
+15. [DONE] Migrar frontend off legacy `personalfree/business/pay_restricted_owner`
+        — Eliminados. Solo queda `isFreeUser` como alias @deprecated en constants.js:232
+16. [PARTIAL] Upgrade CTA con `upgrade_features` + `can_upgrade` (owner near limits)
+        — Backend envía los datos. Frontend upgrade-state.js los consume. Falta: banners de warning
+17. [ ] Quota warning banners con `storage.over_quota`, `traffic.over_quota`,
     `traffic.upload_over_quota`, `traffic.download_over_quota`
-18. Endpoint preview/evaluate para downgrade/cambios de plan
-19. Job periódico de rollover del período vigente de quotas
-20. Service token para provisioning Accounts → SesameFS (M2M path interno)
-21. Flujo de invite/create users via Accounts (pendiente coordinación con Accounts)
+        — Backend envía X-Quota-Warning header. Frontend no lo intercepta aún
+18. [ ] Endpoint preview/evaluate para downgrade/cambios de plan
+19. [ ] Job periódico de rollover del período vigente de quotas — P0
+20. [ ] Service token para provisioning Accounts → SesameFS (M2M path interno)
+21. [ ] Flujo de invite/create users via Accounts (pendiente coordinación con Accounts)
 
 ## ASUNTOS PENDIENTES DE COORDINACIÓN CON ACCOUNTS
 

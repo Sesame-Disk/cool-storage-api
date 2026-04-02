@@ -21,36 +21,37 @@ concrete implications, and pointers to the relevant code.
 
 ## P0 — Hard Blockers
 
-### 1. Accounts ↔ SesameFS Integration (Phase 2)
+### 1. Accounts ↔ SesameFS Integration (Phase 2) — ✅ Phase 2 DONE (2026-03-28), remaining items below
 
-**Current state:** Phase 1 is implemented — `quota_policy` column, `period` columns, `EnforcementProfile`
-config struct, `isHardEnforcement()`, ownership transfer endpoint, `max_users` check on OIDC login.
-Phase 2 is **not yet implemented**.
+**Current state:** Phase 1 AND Phase 2 are implemented. `quota_policy` column, `period` columns,
+`EnforcementProfile` config struct, `isHardEnforcement()`, ownership transfer endpoint, `max_users`
+check on OIDC login, `ResolveCapabilities()` wired to `account/info` and `bootstrap`, enforcement
+checks on share links, upload links, library creation, and group creation.
 
-**What is missing:**
+**What was implemented (Phase 2, 2026-03-28):**
 
-- **`GET /api/v2.1/account/info/`** — must return resolved capabilities to the frontend.
-  `plans/resolver.go` already has `ResolveCapabilities()` fully implemented and tested, but it is
-  not wired to any HTTP handler yet.
-- **`GET /api/v2.1/subscription/`** — endpoint exists but returns stub data, not integrated with
-  real Accounts data.
+- ✅ **`GET /api/v2.1/account/info/`** — calls `plans.ResolveCapabilities()` (server.go:1438),
+  returns resolved capabilities, `upgrade_features`, `can_upgrade`, `storage{}`, `traffic{}`.
+- ✅ **`GET /api/v2.1/subscription/`** — returns real quota data from org + traffic counters.
+- ✅ **Enforcement on group creation** — `groups.go:337` gates `CanAddGroup` feature flag.
+- ✅ **Enforcement on library creation** — `libraries.go:447` gates `MaxLibraries` limit.
+- ✅ **Enforcement on share/upload links** — `share_links.go:515` and `upload_links.go:281` gate limits.
+- ✅ **`traffic_period_usage`** table for period-based enforcement.
+
+**What is still missing:**
+
 - **Rollover job** — `traffic_period_usage` is never reset. Without a scheduled job that fires at
   the start of each billing period, traffic quotas will never roll over and paying customers will
-  be permanently blocked after their first month.
+  be permanently blocked after their first month. **This is P0.**
 - **M2M auth (service tokens)** — there is no authenticated channel for the Accounts service to
   call SesameFS and update a plan, change a quota, or provision a new org. Any plan change currently
-  requires a manual DB edit.
+  requires a manual DB edit or superadmin session.
 - **Accounts → SesameFS sync** — no webhook receiver or polling loop to apply plan changes pushed
-  from Accounts. Manual DB edits are ephemeral; the next Accounts sync will overwrite them.
-- **Enforcement on group and library creation** — share links ✓ and upload links ✓ already enforce
-  quotas, but `groups.go` (max_groups) and `libraries.go` (publish feature flag) still need the
-  same treatment.
+  from Accounts.
 
-**Implications of shipping without Phase 2:**
-- Paid customers are subject to the same `hard` enforcement profile as free users.
+**Implications of shipping without remaining items:**
 - Traffic quotas are never reset → customers get permanently blocked after month 1.
-- Plan upgrades cannot be applied without direct DB access.
-- The `account/info` endpoint returns stale/incomplete data → frontend capabilities UI is broken.
+- Plan upgrades cannot be applied without direct DB access or superadmin session.
 
 **Key files:**
 - `internal/plans/resolver.go` — `ResolveCapabilities()` ready to use, do not duplicate
@@ -62,7 +63,7 @@ Phase 2 is **not yet implemented**.
 
 ---
 
-### 2. Go Code Reorganization
+### 2. Go Code Reorganization — Reclassified to P2 (2026-04-02)
 
 **Current state:** `internal/api/v2/` contains 64 Go files (~45,000 lines) with no separation
 between the HTTP handler layer, business logic, and data access.
@@ -82,11 +83,12 @@ There is **no service layer** (`internal/services/` does not exist). Handlers ca
 `storage.*` directly. There is **no repository layer**; Cassandra queries are scattered across
 handler files. `internal/models/` has only ~550 lines and only defines basic structs.
 
-**Why this is P0, not P2:**
-In production, when an incident occurs, you need to locate the bug, understand the impact, and
-ship a fix fast. In a 4,000-line file with no layer separation, this is dangerous. This is an
-operational risk, not just a code quality issue. Every on-call engineer who touches this codebase
-carries this risk.
+**Reclassified from P0 to P2 (2026-04-02):**
+The code is functional and all features work correctly. The large files create operational risk
+for incident response (harder to locate and fix bugs quickly), but this is a code quality issue,
+not a functional blocker. The real P0 blockers are programmatic auth (PATs), GC multi-instance
+safety, and quota period rollover — all of which are missing functionality, not code organization.
+Reorganization should happen post-launch when stability allows for large refactors.
 
 **Proposed structure (move code, do not rewrite):**
 
@@ -313,31 +315,27 @@ file contents are sent to a third-party service. Not recommended for a file stor
 
 ---
 
-### 7. Enforcement Phase 2 — Capability Resolver Wire-Up
+### 7. Enforcement Phase 2 — Capability Resolver Wire-Up — ✅ DONE (2026-03-28)
 
-**Current state:** `internal/plans/resolver.go` is fully implemented and has comprehensive tests
-(`resolver_test.go`, `roles_test.go`). It is not wired to any HTTP handler.
+**Verified against code 2026-04-02:** Fully implemented and wired.
 
-**What is missing:**
+**What was implemented:**
 
-- **`GET /api/v2.1/account/info/`** — must call `plans.ResolveCapabilities()` and return the
-  resolved capability map, upgrade features list, limits, and storage/traffic digests. The frontend
-  currently consumes a legacy response format that does not include the new capability system.
-- **Group creation enforcement** — `internal/api/v2/groups.go` must check `max_groups` limit via
-  `enforcement.CountActiveGroups()` (function does not exist yet, needs to be added to
-  `enforcement.go` following the same pattern as `CountActiveLibraries()`).
-- **Guest invitation enforcement** — `can_invite_guests` feature flag must gate the invite endpoint.
-- **Publish repository enforcement** — `can_publish_repo` feature flag must gate library publishing.
-- **Frontend migration** — `frontend/src/utils/seafile-api.js` and the components that consume
-  `account/info` need to be updated to read from the new capabilities contract.
+- ✅ **`GET /api/v2.1/account/info/`** — calls `plans.ResolveCapabilities()` at `server.go:1438`.
+  Returns resolved capability map, `upgrade_features` list, `can_upgrade`, `is_org_owner`,
+  `storage{}` and `traffic{}` pre-digested objects, and all `can_*` feature flags.
+- ✅ **`GET /api/v2.1/bootstrap/`** — also calls `ResolveCapabilities()` at `bootstrap.go:271`.
+- ✅ **Group creation enforcement** — `groups.go:337` checks `!enforcement.Profile.Features.CanAddGroup`.
+  Also checks `MaxLibraries` for group-owned library creation at `groups.go:903`.
+- ✅ **Library creation enforcement** — `libraries.go:447` checks `MaxLibraries` via `CountActiveLibraries()`.
+- ✅ **Share link enforcement** — `share_links.go:515` checks `MaxShareLinks` (single + batch at :927).
+- ✅ **Upload link enforcement** — `upload_links.go:281` checks `MaxUploadLinks`.
 
-**Key files:**
-- `internal/plans/resolver.go:28-56` — `ResolveCapabilities()`, ready to use
-- `internal/plans/roles.go` — `AllFeatureFlags`, `RolePermissions`, `ProfileFeatureMap()`
-- `internal/api/v2/enforcement.go` — add `CountActiveGroups()` here
-- `internal/api/v2/groups.go` — wire enforcement on group creation
-- `internal/api/v2/libraries.go` — wire enforcement on publish
-- `frontend/src/utils/seafile-api.js` — update `getAccountInfo()` consumer
+**Minor remaining items (not blocking):**
+
+- `can_invite_guest` — no invite endpoint exists yet (feature deferred, see User Creation section in PLANS-AND-PERMISSIONS.md)
+- `can_publish_repo` — wiki/publish feature is a stub (nav hidden, endpoint returns `[]`)
+- `CountActiveGroups()` — not needed because `can_add_group` is a boolean feature flag (not a numeric limit). Free plan has `can_add_group=false`, paid has `true`. No count needed.
 
 ---
 
@@ -524,21 +522,27 @@ the launch on Glacier since it requires AWS Glacier infrastructure setup and tes
 
 ## Executive Summary
 
+**Last verified against code**: 2026-04-02
+
 | # | Area | Priority | Current State | Estimated Effort |
 |---|------|----------|---------------|-----------------|
-| 1 | Accounts ↔ SesameFS Phase 2 | **P0** | Phase 1 done, Phase 2 pending | 2–3 weeks |
-| 2 | Go code reorganization | **P0** | Not started | 3–4 weeks |
-| 3 | Frontend/Backend separation + Nginx | **P0** | ✅ DONE (2026-03-30/31) | — |
-| 4 | Robust DB migration system | **P0** | ✅ DONE (2026-04-01) | — |
+| 1 | Accounts ↔ SesameFS integration | **P0** | Phase 1 ✅, Phase 2 ✅ (2026-03-28). Remaining: rollover job, M2M service token | 1–2 weeks |
+| 2 | Go code reorganization | **P2** | Not started. Functional but operationally risky for incident response | 3–4 weeks |
+| 3 | Frontend/Backend separation + Nginx | ✅ DONE | ✅ DONE (2026-03-30/31) | — |
+| 4 | Robust DB migration system | ✅ DONE | ✅ DONE (2026-04-01) | — |
 | 5 | Storage classes & multi-region | **P1** | Infra ready, ~30% | 2 weeks |
 | 6 | Antivirus / malware scanning | **P1** | 0% | 1–2 weeks |
-| 7 | Enforcement Phase 2 wire-up | **P1** | Resolver ready, not wired | 1 week |
-| 8 | Persistent audit logs | **P1** | Framework only, not persisted | 3–4 days |
-| 9 | Security hardening | **P1** | Partial (Nginx has headers) | 2–3 days |
+| 7 | Enforcement Phase 2 wire-up | ✅ DONE | ✅ DONE (2026-03-28). `ResolveCapabilities` wired to `account/info` (server.go:1438) + `bootstrap` (bootstrap.go:271). Group creation gates `CanAddGroup`. Library creation gates `MaxLibraries`. Share/upload links gate `MaxShareLinks`/`MaxUploadLinks`. | — |
+| 8 | Persistent audit logs | **P1** | Framework only, not persisted (TODO audit.go:87) | 3–4 days |
+| 9 | Security hardening | **P1** | Partial (Nginx has headers, Go does not) | 2–3 days |
 | 10 | Backup and disaster recovery | **P1** | Nothing exists | 1 week |
 | 11 | Email / notifications | **P2** | 0% | 1 week |
 | 12 | Cursor-based pagination | **P2** | Admin links done; library/group admin lists still pending | 2-4 days |
 | 13 | Cold storage / Glacier | **P2** | ~30% | 2–3 weeks |
+| **14** | **Programmatic auth (PATs)** | **P0** | **0% — `server.go:1141` TODO. Desktop/CLI cannot auth in OIDC-only mode** | **1–2 days** |
+| **15** | **GC multi-instance safety** | **P0** | **0% — `gc.go:99` Start() has no leader election or lock** | **1 day** |
+| **16** | **Quota period rollover job** | **P0** | **0% — no code exists. Without this, traffic quotas never reset** | **1 day** |
+| 17 | Frontend Phase 3 cleanup | **P1** | Mostly done. Legacy `personalfree/business/pay_restricted*` removed. Remaining: quota warning banners, GB unit standardization, pageOptions placeholders | 2–3 days |
 
 ---
 
@@ -547,20 +551,24 @@ the launch on Glacier since it requires AWS Glacier infrastructure setup and tes
 ### Sprint 1 — Infrastructure Foundation ✅ COMPLETE
 - [#3] ✅ Frontend/backend separation + Nginx — DONE (2026-03-30/31)
 - [#4] ✅ DB migration system — DONE (2026-04-01)
+- [#7] ✅ Enforcement Phase 2 wire-up — DONE (2026-03-28)
 
-### Sprint 2 — Code Quality + Security Baseline
-- [#2] Go code reorganization — start with the four largest files
+### Sprint 2 — Hard Blockers (CURRENT)
+- [#14] Programmatic auth (PATs or Device Flow) — desktop sync is broken without this
+- [#15] GC multi-instance safety — env var guard or Cassandra LWT leader lease
+- [#16] Quota period rollover job — without this, paid users are permanently blocked after month 1
 - [#9] Security hardening — small effort, high impact
+
+### Sprint 3 — Production Essentials
 - [#8] Persistent audit logs — framework already exists, wire it up
+- [#1] Remaining Accounts integration — M2M service token, provisioning endpoint
+- [#10] Backup and disaster recovery — scripts + runbook + restore drill
+- [#17] Frontend Phase 3 — quota warning banners, unit standardization
 
-### Sprint 3 — Business Logic
-- [#1] Accounts ↔ SesameFS Phase 2 — rollover job, M2M auth, enforcement
-- [#7] Enforcement Phase 2 — wire `account/info`, groups, guests, publish
-
-### Sprint 4 — Storage + Safety
+### Sprint 4 — Robustness
 - [#5] Storage classes and multi-region UI
 - [#6] Antivirus / ClamAV
-- [#10] Backup and disaster recovery
+- [#2] Go code reorganization (operational risk reduction, not a feature)
 
 ### Post-launch
 - [#11] Email notifications
