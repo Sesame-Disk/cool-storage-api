@@ -24,10 +24,10 @@ func RegisterRestoreRoutes(rg *gin.RouterGroup, database *db.DB, cfg *config.Con
 	// Restore operations on files
 	rg.POST("/repos/:repo_id/file/restore", h.InitiateRestore)
 	rg.GET("/repos/:repo_id/file/restore-status", h.GetRestoreStatus)
+	rg.GET("/repos/:repo_id/restore-jobs/:job_id", h.GetRestoreJob)
 
 	// List all restore jobs
 	rg.GET("/restore-jobs", h.ListRestoreJobs)
-	rg.GET("/restore-jobs/:job_id", h.GetRestoreJob)
 }
 
 // InitiateRestoreRequest represents the request for initiating a restore
@@ -182,8 +182,14 @@ func (h *RestoreHandler) ListRestoreJobs(c *gin.Context) {
 
 // GetRestoreJob returns a specific restore job
 func (h *RestoreHandler) GetRestoreJob(c *gin.Context) {
+	repoID := c.Param("repo_id")
 	jobIDParam := c.Param("job_id")
 	orgID := c.GetString("org_id")
+
+	if _, err := uuid.Parse(repoID); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid repo_id"})
+		return
+	}
 
 	if _, err := uuid.Parse(jobIDParam); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid job_id"})
@@ -200,8 +206,8 @@ func (h *RestoreHandler) GetRestoreJob(c *gin.Context) {
 	if err := h.db.Session().Query(`
 		SELECT job_id, library_id, block_ids, glacier_job_id, status,
 			   requested_at, completed_at, expires_at
-		FROM restore_jobs WHERE org_id = ? AND job_id = ?
-	`, orgID, jobIDParam).Scan(
+		FROM restore_jobs WHERE org_id = ? AND library_id = ? AND job_id = ?
+	`, orgID, repoID, jobIDParam).Scan(
 		&jobID, &libID, &blockIDs, &glacierJobID,
 		&status, &requestedAt, &completedAt, &expiresAt,
 	); err != nil {

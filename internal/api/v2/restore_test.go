@@ -52,9 +52,9 @@ func TestGetRestoreJob_InvalidJobID(t *testing.T) {
 	})
 
 	h := &RestoreHandler{db: nil, config: nil}
-	r.GET("/api/v2.1/restore-jobs/:job_id", h.GetRestoreJob)
+	r.GET("/api/v2.1/repos/:repo_id/restore-jobs/:job_id", h.GetRestoreJob)
 
-	req, _ := http.NewRequest("GET", "/api/v2.1/restore-jobs/not-a-uuid", nil)
+	req, _ := http.NewRequest("GET", "/api/v2.1/repos/00000000-0000-0000-0000-000000000001/restore-jobs/not-a-uuid", nil)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -66,6 +66,33 @@ func TestGetRestoreJob_InvalidJobID(t *testing.T) {
 	json.Unmarshal(w.Body.Bytes(), &resp)
 	if resp["error"] != "invalid job_id" {
 		t.Errorf("error = %v, want 'invalid job_id'", resp["error"])
+	}
+}
+
+func TestGetRestoreJob_InvalidRepoID(t *testing.T) {
+	r := gin.New()
+	r.Use(gin.Recovery())
+	r.Use(func(c *gin.Context) {
+		c.Set("org_id", "00000000-0000-0000-0000-000000000001")
+		c.Set("user_id", "00000000-0000-0000-0000-000000000001")
+		c.Next()
+	})
+
+	h := &RestoreHandler{db: nil, config: nil}
+	r.GET("/api/v2.1/repos/:repo_id/restore-jobs/:job_id", h.GetRestoreJob)
+
+	req, _ := http.NewRequest("GET", "/api/v2.1/repos/not-a-uuid/restore-jobs/00000000-0000-0000-0000-000000000001", nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusBadRequest)
+	}
+
+	var resp map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp["error"] != "invalid repo_id" {
+		t.Errorf("error = %v, want 'invalid repo_id'", resp["error"])
 	}
 }
 
@@ -103,6 +130,7 @@ func TestRegisterRestoreRoutes(t *testing.T) {
 	}{
 		{"POST", "/api/v2.1/repos/test-repo/file/restore"},
 		{"GET", "/api/v2.1/repos/test-repo/file/restore-status"},
+		{"GET", "/api/v2.1/repos/test-repo/restore-jobs/00000000-0000-0000-0000-000000000001"},
 		// ListRestoreJobs and GetRestoreJob access db directly, so skip those
 		// in route registration test (they panic with nil db even with Recovery)
 	}

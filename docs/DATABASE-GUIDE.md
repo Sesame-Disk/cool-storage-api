@@ -655,7 +655,7 @@ GET /api2/repos/
 
 **Schema:**
 ```sql
-PRIMARY KEY ((org_id), job_id)
+PRIMARY KEY ((org_id), library_id, job_id)
 ```
 
 **API Usage:**
@@ -666,7 +666,7 @@ POST /api/v2/repos/{repo_id}/file/restore
 # Returns: { "job_id": "xyz", "status": "pending", "eta_hours": 3 }
 
 # Check status
-GET /api/v2/restore-jobs/{job_id}
+GET /api/v2/repos/{repo_id}/restore-jobs/{job_id}
 # Returns: { "status": "completed", "expires_at": "2024-01-05T00:00:00Z" }
 ```
 

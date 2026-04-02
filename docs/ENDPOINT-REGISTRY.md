@@ -96,6 +96,24 @@
 **Purpose**: Restore a deleted folder from trash
 **Added**: 2026-02-05
 
+### GET /api/v2/repos/:repo_id/file/restore-status
+**Handler**: `RestoreHandler.GetRestoreStatus`
+**File**: `internal/api/v2/restore.go`
+**Purpose**: Get the latest cold-storage restore status for a repository
+**Added**: 2026-04-02
+
+### GET /api/v2/restore-jobs
+**Handler**: `RestoreHandler.ListRestoreJobs`
+**File**: `internal/api/v2/restore.go`
+**Purpose**: List cold-storage restore jobs for the current organization
+**Added**: 2026-04-02
+
+### GET /api/v2/repos/:repo_id/restore-jobs/:job_id
+**Handler**: `RestoreHandler.GetRestoreJob`
+**File**: `internal/api/v2/restore.go`
+**Purpose**: Get one cold-storage restore job scoped to a repository
+**Added**: 2026-04-02
+
 ### GET /api/v2.1/repos/:repo_id/commit/:commit_id/dir/
 **Handler**: `TrashHandler.ListCommitDir`
 **File**: `internal/api/v2/trash.go`
