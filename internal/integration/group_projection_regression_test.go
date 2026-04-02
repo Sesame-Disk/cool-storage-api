@@ -75,13 +75,11 @@ func TestAdminCreateGroupProjectionSyncAllowsRootGroups(t *testing.T) {
 
 func createGroupForRegressionTest(t *testing.T, c *testClient, groupName string) string {
 	t.Helper()
+	ensureDefaultOrgSupportsGroups(t)
 
 	createResp := c.PostJSON(t, "/api/v2.1/groups/", map[string]string{"name": groupName})
 	if createResp.StatusCode != http.StatusCreated {
 		body := responseJSON(t, createResp)
-		if upgradeRequired, _ := body["upgrade_required"].(bool); upgradeRequired {
-			t.Skip("group creation is disabled by the current org plan in this integration environment")
-		}
 		t.Fatalf("create group %q failed: status=%d body=%v", groupName, createResp.StatusCode, body)
 	}
 

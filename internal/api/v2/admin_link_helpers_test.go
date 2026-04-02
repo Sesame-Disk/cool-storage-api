@@ -161,6 +161,82 @@ func TestPaginateAdminLinks_ReturnsWindowAndNextFlag(t *testing.T) {
 	}
 }
 
+func TestAdminLinkCursor_RoundTrip(t *testing.T) {
+	cursorValue, err := buildAdminLinkCursor(adminLinkPageCursor{
+		BucketDay: "2026-04-02",
+		CreatedAt: time.Date(2026, 4, 2, 8, 30, 0, 0, time.UTC),
+		OrgID:     "org-1",
+		Token:     "tok-1",
+	})
+	if err != nil {
+		t.Fatalf("buildAdminLinkCursor returned error: %v", err)
+	}
+
+	parsed, ok, err := parseAdminLinkCursor(cursorValue)
+	if err != nil {
+		t.Fatalf("parseAdminLinkCursor returned error: %v", err)
+	}
+	if !ok {
+		t.Fatal("expected cursor to be present")
+	}
+	if parsed.BucketDay != "2026-04-02" || parsed.OrgID != "org-1" || parsed.Token != "tok-1" {
+		t.Fatalf("unexpected parsed cursor: %#v", parsed)
+	}
+	if !parsed.CreatedAt.Equal(time.Date(2026, 4, 2, 8, 30, 0, 0, time.UTC)) {
+		t.Fatalf("created_at = %v, want exact roundtrip", parsed.CreatedAt)
+	}
+}
+
+func TestParseAdminLinkCursor_RejectsInvalidPayload(t *testing.T) {
+	if _, ok, err := parseAdminLinkCursor(""); err != nil || ok {
+		t.Fatalf("empty cursor should be ignored, got ok=%v err=%v", ok, err)
+	}
+	if _, _, err := parseAdminLinkCursor("not-base64"); err == nil {
+		t.Fatal("expected invalid base64 cursor to fail")
+	}
+}
+
+func TestAdminLinkCursorComparisons(t *testing.T) {
+	cursor := adminLinkPageCursor{
+		BucketDay: "2026-04-02",
+		CreatedAt: time.Date(2026, 4, 2, 8, 30, 0, 0, time.UTC),
+		OrgID:     "80000000-0000-0000-0000-000000000000",
+		Token:     "tok-2",
+	}
+
+	if !adminLinkBucketBeforeCursor("2026-04-03", cursor, true) {
+		t.Fatal("expected newer bucket to be skipped")
+	}
+	if adminLinkBucketBeforeCursor("2026-04-01", cursor, true) {
+		t.Fatal("did not expect older bucket to be skipped")
+	}
+
+	newerRow := adminLinkProjectionRow{OrgID: "70000000-0000-0000-0000-000000000000", Token: "tok-1", CreatedAt: cursor.CreatedAt.Add(time.Minute)}
+	if !adminLinkGlobalRowAtOrBeforeCursor(newerRow, cursor) {
+		t.Fatal("expected newer global row to be treated as already seen")
+	}
+	olderRow := adminLinkProjectionRow{OrgID: "90000000-0000-0000-0000-000000000000", Token: "tok-9", CreatedAt: cursor.CreatedAt.Add(-time.Minute)}
+	if adminLinkGlobalRowAtOrBeforeCursor(olderRow, cursor) {
+		t.Fatal("did not expect older global row to be treated as already seen")
+	}
+	sameGlobalRow := adminLinkProjectionRow{OrgID: "80000000-0000-0000-0000-000000000000", Token: "tok-2", CreatedAt: cursor.CreatedAt}
+	if !adminLinkGlobalRowAtOrBeforeCursor(sameGlobalRow, cursor) {
+		t.Fatal("expected identical global row to be skipped on resume")
+	}
+	afterCursorByCassandraOrder := adminLinkProjectionRow{OrgID: "7fffffff-ffff-ffff-ffff-ffffffffffff", Token: "tok-1", CreatedAt: cursor.CreatedAt}
+	if adminLinkGlobalRowAtOrBeforeCursor(afterCursorByCassandraOrder, cursor) {
+		t.Fatal("did not expect row with later Cassandra UUID order to be skipped")
+	}
+	sameScopedRow := adminLinkProjectionRow{Token: "tok-2", CreatedAt: cursor.CreatedAt}
+	if !adminLinkScopedRowAtOrBeforeCursor(sameScopedRow, cursor) {
+		t.Fatal("expected identical scoped row to be skipped on resume")
+	}
+	afterScopedRow := adminLinkProjectionRow{Token: "tok-3", CreatedAt: cursor.CreatedAt}
+	if adminLinkScopedRowAtOrBeforeCursor(afterScopedRow, cursor) {
+		t.Fatal("did not expect later scoped row to be skipped")
+	}
+}
+
 func TestValidateAdminLinkScope(t *testing.T) {
 	tests := []struct {
 		name          string

@@ -1,6 +1,9 @@
 package v2
 
 import (
+	"encoding/base64"
+	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"sort"
 	"strconv"
@@ -161,6 +164,107 @@ func paginateAdminLinks(links []gin.H, page, perPage int) ([]gin.H, int, bool) {
 	}
 
 	return links[start:end], total, end < total
+}
+
+type adminLinkPageCursor struct {
+	BucketDay string    `json:"bucket_day"`
+	CreatedAt time.Time `json:"created_at"`
+	OrgID     string    `json:"org_id,omitempty"`
+	Token     string    `json:"token"`
+}
+
+func parseAdminLinkCursor(cursorParam string) (adminLinkPageCursor, bool, error) {
+	cursorParam = strings.TrimSpace(cursorParam)
+	if cursorParam == "" {
+		return adminLinkPageCursor{}, false, nil
+	}
+	decoded, err := base64.RawURLEncoding.DecodeString(cursorParam)
+	if err != nil {
+		return adminLinkPageCursor{}, false, errors.New("invalid cursor")
+	}
+	var cursor adminLinkPageCursor
+	if err := json.Unmarshal(decoded, &cursor); err != nil {
+		return adminLinkPageCursor{}, false, errors.New("invalid cursor")
+	}
+	if cursor.BucketDay == "" || cursor.CreatedAt.IsZero() || cursor.Token == "" {
+		return adminLinkPageCursor{}, false, errors.New("invalid cursor")
+	}
+	return cursor, true, nil
+}
+
+func buildAdminLinkCursor(cursor adminLinkPageCursor) (string, error) {
+	payload, err := json.Marshal(cursor)
+	if err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(payload), nil
+}
+
+func adminLinkCursorFromRow(bucketDay string, row adminLinkProjectionRow) (string, error) {
+	return buildAdminLinkCursor(adminLinkPageCursor{
+		BucketDay: bucketDay,
+		CreatedAt: row.CreatedAt,
+		OrgID:     row.OrgID,
+		Token:     row.Token,
+	})
+}
+
+func adminLinkBucketBeforeCursor(bucketDay string, cursor adminLinkPageCursor, hasCursor bool) bool {
+	return hasCursor && bucketDay > cursor.BucketDay
+}
+
+func compareCassandraUUIDStrings(left, right string) int {
+	leftUUID, leftErr := gocql.ParseUUID(left)
+	rightUUID, rightErr := gocql.ParseUUID(right)
+	if leftErr != nil || rightErr != nil {
+		return strings.Compare(left, right)
+	}
+
+	leftMSB := int64(binary.BigEndian.Uint64(leftUUID[:8]))
+	rightMSB := int64(binary.BigEndian.Uint64(rightUUID[:8]))
+	if leftMSB < rightMSB {
+		return -1
+	}
+	if leftMSB > rightMSB {
+		return 1
+	}
+
+	leftLSB := int64(binary.BigEndian.Uint64(leftUUID[8:]))
+	rightLSB := int64(binary.BigEndian.Uint64(rightUUID[8:]))
+	if leftLSB < rightLSB {
+		return -1
+	}
+	if leftLSB > rightLSB {
+		return 1
+	}
+	return 0
+}
+
+func adminLinkGlobalRowAtOrBeforeCursor(row adminLinkProjectionRow, cursor adminLinkPageCursor) bool {
+	if row.CreatedAt.After(cursor.CreatedAt) {
+		return true
+	}
+	if row.CreatedAt.Before(cursor.CreatedAt) {
+		return false
+	}
+	orgCmp := compareCassandraUUIDStrings(row.OrgID, cursor.OrgID)
+	if orgCmp < 0 {
+		return true
+	}
+	if orgCmp > 0 {
+		return false
+	}
+	return row.Token <= cursor.Token
+}
+
+func adminLinkScopedRowAtOrBeforeCursor(row adminLinkProjectionRow, cursor adminLinkPageCursor) bool {
+	if row.CreatedAt.After(cursor.CreatedAt) {
+		return true
+	}
+	if row.CreatedAt.Before(cursor.CreatedAt) {
+		return false
+	}
+	return row.Token <= cursor.Token
 }
 
 func normalizeAdminLinkSort(sortBy, direction string) (string, string) {
@@ -437,6 +541,274 @@ func adminLinkProjectionMatches(row adminLinkProjectionRow, filters adminLinkLis
 	searchValues := []string{objName, row.Token, row.FilePath, repoName, creatorEmail, creatorName}
 	searchValues = append(searchValues, extraSearch...)
 	return filters.MatchesSearch(searchValues...)
+}
+
+func listAdminLinkProjectionCursorPage(session *gocql.Session, linkType string, filters adminLinkListFilters, cursorParam string, perPage int) ([]adminLinkProjectionRow, string, bool, error) {
+	buckets, err := listAdminLinkBuckets(session, linkType)
+	if err != nil {
+		return nil, "", false, err
+	}
+	sort.Sort(sort.Reverse(sort.StringSlice(buckets)))
+	cursor, hasCursor, err := parseAdminLinkCursor(cursorParam)
+	if err != nil {
+		return nil, "", false, err
+	}
+	rows := make([]adminLinkProjectionRow, 0, perPage)
+	var lastRow adminLinkProjectionRow
+	var lastBucketDay string
+	hasNext := false
+
+	for _, bucketDay := range buckets {
+		if adminLinkBucketBeforeCursor(bucketDay, cursor, hasCursor) {
+			continue
+		}
+		query := `
+			SELECT org_id, link_token, library_id, repo_name, file_path, obj_name,
+			       created_by, creator_email, creator_name, permission, expires_at,
+			       has_password, active, view_count, upload_count, created_at
+			FROM admin_links_by_created
+			WHERE link_type = ? AND bucket_day = ?
+		`
+		args := []interface{}{linkType, bucketDay}
+		if hasCursor && bucketDay == cursor.BucketDay {
+			query += ` AND created_at <= ?`
+			args = append(args, cursor.CreatedAt)
+		}
+		iter := session.Query(query, args...).Iter()
+
+		var row adminLinkProjectionRow
+		for iter.Scan(
+			&row.OrgID,
+			&row.Token,
+			&row.LibraryID,
+			&row.RepoName,
+			&row.FilePath,
+			&row.ObjName,
+			&row.CreatedBy,
+			&row.CreatorEmail,
+			&row.CreatorName,
+			&row.Permission,
+			&row.ExpiresAt,
+			&row.HasPassword,
+			&row.Active,
+			&row.ViewCount,
+			&row.UploadCount,
+			&row.CreatedAt,
+		) {
+			if hasCursor && bucketDay == cursor.BucketDay && adminLinkGlobalRowAtOrBeforeCursor(row, cursor) {
+				row = adminLinkProjectionRow{}
+				continue
+			}
+			if !adminLinkProjectionMatches(row, filters) {
+				row = adminLinkProjectionRow{}
+				continue
+			}
+			if len(rows) < perPage {
+				rows = append(rows, row)
+				lastRow = row
+				lastBucketDay = bucketDay
+				row = adminLinkProjectionRow{}
+				continue
+			}
+			hasNext = true
+			break
+		}
+		if err := iter.Close(); err != nil {
+			return nil, "", false, err
+		}
+		if hasNext {
+			break
+		}
+	}
+
+	nextCursor := ""
+	if hasNext && len(rows) > 0 {
+		nextCursor, err = adminLinkCursorFromRow(lastBucketDay, lastRow)
+		if err != nil {
+			return nil, "", false, err
+		}
+	}
+	return rows, nextCursor, hasNext, nil
+}
+
+func listAdminLinkProjectionCursorPageByOrg(session *gocql.Session, orgID, linkType string, filters adminLinkListFilters, cursorParam string, perPage int) ([]adminLinkProjectionRow, string, bool, error) {
+	buckets, err := listAdminLinkBucketsByOrg(session, orgID, linkType)
+	if err != nil {
+		return nil, "", false, err
+	}
+	sort.Sort(sort.Reverse(sort.StringSlice(buckets)))
+	cursor, hasCursor, err := parseAdminLinkCursor(cursorParam)
+	if err != nil {
+		return nil, "", false, err
+	}
+	rows := make([]adminLinkProjectionRow, 0, perPage)
+	var lastRow adminLinkProjectionRow
+	var lastBucketDay string
+	hasNext := false
+
+	for _, bucketDay := range buckets {
+		if adminLinkBucketBeforeCursor(bucketDay, cursor, hasCursor) {
+			continue
+		}
+		query := `
+			SELECT link_token, library_id, repo_name, file_path, obj_name,
+			       created_by, creator_email, creator_name, permission, expires_at,
+			       has_password, active, view_count, upload_count, created_at
+			FROM admin_links_by_org_created
+			WHERE org_id = ? AND link_type = ? AND bucket_day = ?
+		`
+		args := []interface{}{orgID, linkType, bucketDay}
+		if hasCursor && bucketDay == cursor.BucketDay {
+			query += ` AND created_at <= ?`
+			args = append(args, cursor.CreatedAt)
+		}
+		iter := session.Query(query, args...).Iter()
+
+		var row adminLinkProjectionRow
+		for iter.Scan(
+			&row.Token,
+			&row.LibraryID,
+			&row.RepoName,
+			&row.FilePath,
+			&row.ObjName,
+			&row.CreatedBy,
+			&row.CreatorEmail,
+			&row.CreatorName,
+			&row.Permission,
+			&row.ExpiresAt,
+			&row.HasPassword,
+			&row.Active,
+			&row.ViewCount,
+			&row.UploadCount,
+			&row.CreatedAt,
+		) {
+			row.OrgID = orgID
+			if hasCursor && bucketDay == cursor.BucketDay && adminLinkScopedRowAtOrBeforeCursor(row, cursor) {
+				row = adminLinkProjectionRow{}
+				continue
+			}
+			if !adminLinkProjectionMatches(row, filters) {
+				row = adminLinkProjectionRow{}
+				continue
+			}
+			if len(rows) < perPage {
+				rows = append(rows, row)
+				lastRow = row
+				lastBucketDay = bucketDay
+				row = adminLinkProjectionRow{}
+				continue
+			}
+			hasNext = true
+			break
+		}
+		if err := iter.Close(); err != nil {
+			return nil, "", false, err
+		}
+		if hasNext {
+			break
+		}
+	}
+
+	nextCursor := ""
+	if hasNext && len(rows) > 0 {
+		nextCursor, err = adminLinkCursorFromRow(lastBucketDay, lastRow)
+		if err != nil {
+			return nil, "", false, err
+		}
+	}
+	return rows, nextCursor, hasNext, nil
+}
+
+func listAdminLinkProjectionCursorPageByCreator(session *gocql.Session, orgID, createdBy, linkType string, filters adminLinkListFilters, cursorParam string, perPage int) ([]adminLinkProjectionRow, string, bool, error) {
+	buckets, err := listAdminLinkBucketsByOrg(session, orgID, linkType)
+	if err != nil {
+		return nil, "", false, err
+	}
+	sort.Sort(sort.Reverse(sort.StringSlice(buckets)))
+	cursor, hasCursor, err := parseAdminLinkCursor(cursorParam)
+	if err != nil {
+		return nil, "", false, err
+	}
+	rows := make([]adminLinkProjectionRow, 0, perPage)
+	var lastRow adminLinkProjectionRow
+	var lastBucketDay string
+	hasNext := false
+
+	for _, bucketDay := range buckets {
+		if adminLinkBucketBeforeCursor(bucketDay, cursor, hasCursor) {
+			continue
+		}
+		query := `
+			SELECT link_token, library_id, repo_name, file_path, obj_name,
+			       created_by, creator_email, creator_name, permission, expires_at,
+			       has_password, active, view_count, upload_count, created_at
+			FROM admin_links_by_org_created
+			WHERE org_id = ? AND link_type = ? AND bucket_day = ?
+		`
+		args := []interface{}{orgID, linkType, bucketDay}
+		if hasCursor && bucketDay == cursor.BucketDay {
+			query += ` AND created_at <= ?`
+			args = append(args, cursor.CreatedAt)
+		}
+		iter := session.Query(query, args...).Iter()
+
+		var row adminLinkProjectionRow
+		for iter.Scan(
+			&row.Token,
+			&row.LibraryID,
+			&row.RepoName,
+			&row.FilePath,
+			&row.ObjName,
+			&row.CreatedBy,
+			&row.CreatorEmail,
+			&row.CreatorName,
+			&row.Permission,
+			&row.ExpiresAt,
+			&row.HasPassword,
+			&row.Active,
+			&row.ViewCount,
+			&row.UploadCount,
+			&row.CreatedAt,
+		) {
+			row.OrgID = orgID
+			if row.CreatedBy != createdBy {
+				row = adminLinkProjectionRow{}
+				continue
+			}
+			if hasCursor && bucketDay == cursor.BucketDay && adminLinkScopedRowAtOrBeforeCursor(row, cursor) {
+				row = adminLinkProjectionRow{}
+				continue
+			}
+			if !adminLinkProjectionMatches(row, filters) {
+				row = adminLinkProjectionRow{}
+				continue
+			}
+			if len(rows) < perPage {
+				rows = append(rows, row)
+				lastRow = row
+				lastBucketDay = bucketDay
+				row = adminLinkProjectionRow{}
+				continue
+			}
+			hasNext = true
+			break
+		}
+		if err := iter.Close(); err != nil {
+			return nil, "", false, err
+		}
+		if hasNext {
+			break
+		}
+	}
+
+	nextCursor := ""
+	if hasNext && len(rows) > 0 {
+		nextCursor, err = adminLinkCursorFromRow(lastBucketDay, lastRow)
+		if err != nil {
+			return nil, "", false, err
+		}
+	}
+	return rows, nextCursor, hasNext, nil
 }
 
 func listAdminLinkProjectionPage(session *gocql.Session, linkType string, filters adminLinkListFilters, page, perPage int) ([]adminLinkProjectionRow, int, bool, error) {

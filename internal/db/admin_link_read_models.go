@@ -3,10 +3,13 @@ package db
 import (
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
 )
+
+var adminOrgLinkCountRefreshes sync.Map
 
 type AdminOrgLinkIndexRow struct {
 	LinkType  string
@@ -76,9 +79,27 @@ func InvalidateAdminOrgLinkCount(session *gocql.Session, orgID, linkType string)
 	return session.Query(`DELETE FROM admin_link_counts_by_org WHERE org_id = ? AND link_type = ?`, orgID, linkType).Exec()
 }
 
+func ReplaceAdminOrgLinkCount(session *gocql.Session, orgID, linkType string, exactCount int) error {
+	if !IsAdminLinkType(linkType) {
+		return nil
+	}
+	if err := InvalidateAdminOrgLinkCount(session, orgID, linkType); err != nil {
+		return err
+	}
+	if exactCount <= 0 {
+		return nil
+	}
+	return session.Query(`
+		UPDATE admin_link_counts_by_org
+		SET link_count = link_count + ?
+		WHERE org_id = ? AND link_type = ?
+	`, int64(exactCount), orgID, linkType).Exec()
+}
+
 func BestEffortAdjustAdminOrgLinkCount(session *gocql.Session, orgID, linkType string, delta int) {
 	if err := AdjustAdminOrgLinkCount(session, orgID, linkType, delta); err != nil {
 		_ = InvalidateAdminOrgLinkCount(session, orgID, linkType)
+		ScheduleAdminOrgLinkCountRefresh(session, orgID, linkType)
 	}
 }
 
@@ -339,6 +360,34 @@ func recountAdminOrgLinks(session *gocql.Session, orgID, linkType string) (int, 
 	return count, nil
 }
 
+func RefreshAdminOrgLinkCount(session *gocql.Session, orgID, linkType string) (int, error) {
+	if !IsAdminLinkType(linkType) {
+		return 0, nil
+	}
+	recount, err := recountAdminOrgLinks(session, orgID, linkType)
+	if err != nil {
+		return 0, err
+	}
+	if err := ReplaceAdminOrgLinkCount(session, orgID, linkType, recount); err != nil {
+		return 0, err
+	}
+	return recount, nil
+}
+
+func ScheduleAdminOrgLinkCountRefresh(session *gocql.Session, orgID, linkType string) {
+	if !IsAdminLinkType(linkType) {
+		return
+	}
+	key := orgID + ":" + linkType
+	if _, loaded := adminOrgLinkCountRefreshes.LoadOrStore(key, struct{}{}); loaded {
+		return
+	}
+	go func() {
+		defer adminOrgLinkCountRefreshes.Delete(key)
+		_, _ = RefreshAdminOrgLinkCount(session, orgID, linkType)
+	}()
+}
+
 func CountAdminOrgLinks(session *gocql.Session, orgID, linkType string) (int, error) {
 	if !IsAdminLinkType(linkType) {
 		return 0, nil
@@ -351,17 +400,12 @@ func CountAdminOrgLinks(session *gocql.Session, orgID, linkType string) (int, er
 			return int(count), nil
 		}
 		_ = InvalidateAdminOrgLinkCount(session, orgID, linkType)
+		ScheduleAdminOrgLinkCountRefresh(session, orgID, linkType)
+		return 0, nil
 	}
-	if err != nil && err != gocql.ErrNotFound {
+	if err != gocql.ErrNotFound {
 		return 0, err
 	}
-
-	recount, recountErr := recountAdminOrgLinks(session, orgID, linkType)
-	if recountErr != nil {
-		return 0, recountErr
-	}
-	if recount > 0 {
-		BestEffortAdjustAdminOrgLinkCount(session, orgID, linkType, recount)
-	}
-	return recount, nil
+	ScheduleAdminOrgLinkCountRefresh(session, orgID, linkType)
+	return 0, nil
 }

@@ -48,8 +48,65 @@ func (h *OrgAdminHandler) ListOrgLinks(c *gin.Context) {
 		return
 	}
 	page, perPage := parseAdminLinkPageParams(c.DefaultQuery("page", "1"), c.DefaultQuery("per_page", "25"), 25, 100)
+	cursorParam, cursorRequested := c.GetQuery("cursor")
 	sortBy := c.Query("order_by")
 	direction := c.Query("direction")
+	if isDefaultAdminLinkSort(sortBy, direction) && cursorRequested {
+		rows, nextCursor, hasNext, err := listAdminLinkProjectionCursorPageByOrg(h.db.Session(), orgID, "share", filters, cursorParam, perPage)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid cursor"})
+			return
+		}
+
+		links := make([]gin.H, 0, len(rows))
+		for _, row := range rows {
+			repoName, linkName, creatorEmail, creatorName := adminLinkProjectionDisplay(row)
+			isExpired := false
+			expireDateStr := ""
+			if row.ExpiresAt != nil && !row.ExpiresAt.IsZero() {
+				isExpired = row.ExpiresAt.Before(time.Now())
+				expireDateStr = row.ExpiresAt.Format(time.RFC3339)
+			}
+			linkURL := fmt.Sprintf("%s/d/%s", getBrowserURL(c, ""), row.Token)
+			perms := parsePermsJSON(row.Permission)
+			status := "active"
+			if !row.Active {
+				status = "inactive"
+			}
+			links = append(links, gin.H{
+				"obj_name":      linkName,
+				"name":          linkName,
+				"path":          row.FilePath,
+				"token":         row.Token,
+				"link":          linkURL,
+				"repo_id":       row.LibraryID,
+				"repo_name":     repoName,
+				"owner_email":   creatorEmail,
+				"owner_name":    creatorName,
+				"creator_email": creatorEmail,
+				"creator_name":  creatorName,
+				"created_time":  row.CreatedAt.Format(time.RFC3339),
+				"ctime":         row.CreatedAt.Format(time.RFC3339),
+				"view_count":    row.ViewCount,
+				"view_cnt":      row.ViewCount,
+				"expire_date":   expireDateStr,
+				"is_expired":    isExpired,
+				"active":        row.Active,
+				"status":        status,
+				"has_password":  row.HasPassword,
+				"permissions":   gin.H{"can_download": perms.CanDownload, "can_edit": perms.CanEdit},
+			})
+		}
+
+		c.JSON(http.StatusOK, gin.H{
+			"link_list":     links,
+			"page":          page,
+			"page_next":     hasNext,
+			"next_cursor":   nextCursor,
+			"has_next_page": hasNext,
+		})
+		return
+	}
 	if isDefaultAdminLinkSort(sortBy, direction) {
 		rows, total, pageNext, err := listAdminLinkProjectionPageByOrg(h.db.Session(), orgID, "share", filters, page, perPage)
 		if err != nil {
@@ -235,8 +292,58 @@ func (h *OrgAdminHandler) ListOrgUploadLinks(c *gin.Context) {
 		return
 	}
 	page, perPage := parseAdminLinkPageParams(c.DefaultQuery("page", "1"), c.DefaultQuery("per_page", "25"), 25, 100)
+	cursorParam, cursorRequested := c.GetQuery("cursor")
 	sortBy := c.Query("order_by")
 	direction := c.Query("direction")
+	if isDefaultAdminLinkSort(sortBy, direction) && cursorRequested {
+		rows, nextCursor, hasNext, err := listAdminLinkProjectionCursorPageByOrg(h.db.Session(), orgID, "upload", filters, cursorParam, perPage)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid cursor"})
+			return
+		}
+
+		links := make([]gin.H, 0, len(rows))
+		for _, row := range rows {
+			repoName, objName, creatorEmail, creatorName := adminLinkProjectionDisplay(row)
+			isExpired := false
+			expireDateStr := ""
+			if row.ExpiresAt != nil && !row.ExpiresAt.IsZero() {
+				isExpired = row.ExpiresAt.Before(time.Now())
+				expireDateStr = row.ExpiresAt.Format(time.RFC3339)
+			}
+			uploadLinkURL := fmt.Sprintf("%s/u/d/%s", getBrowserURL(c, ""), row.Token)
+			status := "active"
+			if !row.Active {
+				status = "inactive"
+			}
+			links = append(links, gin.H{
+				"obj_name":      objName,
+				"path":          row.FilePath,
+				"token":         row.Token,
+				"link":          uploadLinkURL,
+				"repo_id":       row.LibraryID,
+				"repo_name":     repoName,
+				"creator_email": creatorEmail,
+				"creator_name":  creatorName,
+				"ctime":         row.CreatedAt.Format(time.RFC3339),
+				"view_cnt":      row.UploadCount,
+				"expire_date":   expireDateStr,
+				"is_expired":    isExpired,
+				"active":        row.Active,
+				"status":        status,
+				"has_password":  row.HasPassword,
+			})
+		}
+
+		c.JSON(http.StatusOK, gin.H{
+			"upload_link_list": links,
+			"page":             page,
+			"page_next":        hasNext,
+			"next_cursor":      nextCursor,
+			"has_next_page":    hasNext,
+		})
+		return
+	}
 	if isDefaultAdminLinkSort(sortBy, direction) {
 		rows, total, _, err := listAdminLinkProjectionPageByOrg(h.db.Session(), orgID, "upload", filters, page, perPage)
 		if err != nil {
