@@ -106,7 +106,7 @@ func TestNewService_WithMockStore(t *testing.T) {
 	}
 
 	store := NewMockStore()
-	svc := NewService(store, nil, cfg)
+	svc := NewService(store, nil, cfg, nil)
 
 	if svc == nil {
 		t.Fatal("NewService returned nil")
@@ -136,7 +136,7 @@ func TestNewService_ConfigPropagation(t *testing.T) {
 	}
 
 	store := NewMockStore()
-	svc := NewService(store, nil, cfg)
+	svc := NewService(store, nil, cfg, nil)
 
 	if svc.config.BatchSize != 50 {
 		t.Errorf("config.BatchSize = %d, want 50", svc.config.BatchSize)
@@ -159,7 +159,7 @@ func TestService_SetDryRun(t *testing.T) {
 	}
 
 	store := NewMockStore()
-	svc := NewService(store, nil, cfg)
+	svc := NewService(store, nil, cfg, nil)
 
 	if svc.config.DryRun {
 		t.Error("initial DryRun should be false")
@@ -188,7 +188,7 @@ func TestService_SetDryRun_Concurrent(t *testing.T) {
 	}
 
 	store := NewMockStore()
-	svc := NewService(store, nil, cfg)
+	svc := NewService(store, nil, cfg, nil)
 
 	// Concurrent SetDryRun calls should not race
 	done := make(chan struct{})
@@ -218,7 +218,7 @@ func TestService_StartStop(t *testing.T) {
 	}
 
 	store := NewMockStore()
-	svc := NewService(store, nil, cfg)
+	svc := NewService(store, nil, cfg, nil)
 
 	// Start the service
 	svc.Start()
@@ -256,7 +256,7 @@ func TestService_StartStop_Concurrent(t *testing.T) {
 	}
 
 	store := NewMockStore()
-	svc := NewService(store, nil, cfg)
+	svc := NewService(store, nil, cfg, nil)
 
 	// Concurrent Start/Stop/SetDryRun should not race
 	done := make(chan struct{})
@@ -293,7 +293,7 @@ func TestService_StatusAfterActivity(t *testing.T) {
 	}
 
 	store := NewMockStore()
-	svc := NewService(store, nil, cfg)
+	svc := NewService(store, nil, cfg, nil)
 
 	svc.Start()
 	time.Sleep(150 * time.Millisecond)
@@ -323,7 +323,7 @@ func TestService_ManualTrigger(t *testing.T) {
 	}
 
 	store := NewMockStore()
-	svc := NewService(store, nil, cfg)
+	svc := NewService(store, nil, cfg, nil)
 	svc.Start()
 
 	// Trigger worker manually
@@ -344,7 +344,7 @@ func TestService_DisabledDoesNotStart(t *testing.T) {
 	}
 
 	store := NewMockStore()
-	svc := NewService(store, nil, cfg)
+	svc := NewService(store, nil, cfg, nil)
 	svc.Start()
 
 	if svc.started {
@@ -361,7 +361,7 @@ func TestService_TriggerChannels(t *testing.T) {
 	}
 
 	store := NewMockStore()
-	svc := NewService(store, nil, cfg)
+	svc := NewService(store, nil, cfg, nil)
 
 	// Triggers should not block even when service is not running
 	svc.TriggerWorker()
@@ -381,7 +381,7 @@ func TestService_StatusWithMockStore(t *testing.T) {
 	}
 
 	store := NewMockStore()
-	svc := NewService(store, nil, cfg)
+	svc := NewService(store, nil, cfg, nil)
 	status := svc.Status()
 
 	if status.Enabled {
@@ -404,7 +404,7 @@ func TestService_StatusWithMockStore(t *testing.T) {
 func TestService_Queue(t *testing.T) {
 	cfg := config.GCConfig{}
 	store := NewMockStore()
-	svc := NewService(store, nil, cfg)
+	svc := NewService(store, nil, cfg, nil)
 
 	if svc.Queue() == nil {
 		t.Error("Queue() should not return nil")
@@ -420,7 +420,7 @@ func TestService_PersistAndRestoreStats(t *testing.T) {
 	cfg := config.GCConfig{Enabled: true}
 
 	// Create service and set some stats
-	svc := NewService(store, nil, cfg)
+	svc := NewService(store, nil, cfg, nil)
 	workerTime := time.Date(2026, 3, 15, 10, 30, 0, 0, time.UTC)
 	scanTime := time.Date(2026, 3, 15, 11, 0, 0, 0, time.UTC)
 	svc.stats.SetLastWorkerRun(workerTime)
@@ -431,7 +431,7 @@ func TestService_PersistAndRestoreStats(t *testing.T) {
 	svc.persistStats()
 
 	// Create a new service and restore — should recover the stats
-	svc2 := NewService(store, nil, cfg)
+	svc2 := NewService(store, nil, cfg, nil)
 	svc2.restoreStats()
 
 	if got := svc2.stats.LastWorkerRun(); !got.Equal(workerTime) {
@@ -449,7 +449,7 @@ func TestService_RestoreStats_Empty(t *testing.T) {
 	store := NewMockStore()
 	cfg := config.GCConfig{Enabled: true}
 
-	svc := NewService(store, nil, cfg)
+	svc := NewService(store, nil, cfg, nil)
 	svc.restoreStats()
 
 	// Should be zero values when nothing was persisted
@@ -468,7 +468,7 @@ func TestService_PersistStats_SkipsZeroTimes(t *testing.T) {
 	store := NewMockStore()
 	cfg := config.GCConfig{Enabled: true}
 
-	svc := NewService(store, nil, cfg)
+	svc := NewService(store, nil, cfg, nil)
 	// Only set blocksDeleted, leave times at zero
 	svc.stats.blocksDeleted.Store(10)
 	svc.persistStats()

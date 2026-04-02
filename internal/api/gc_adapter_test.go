@@ -12,7 +12,7 @@ import (
 func newTestGCService() *gc.Service {
 	cfg := config.GCConfig{Enabled: false}
 	store := gc.NewMockStore()
-	return gc.NewService(store, nil, cfg)
+	return gc.NewService(store, nil, cfg, nil)
 }
 
 func TestGCBlockEnqueuer_InvalidOrgID(t *testing.T) {

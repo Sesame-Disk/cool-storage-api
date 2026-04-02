@@ -9,8 +9,11 @@ import (
 	"sync/atomic"
 	"time"
 
+	gocql "github.com/apache/cassandra-gocql-driver/v2"
+
 	"github.com/Sesame-Disk/sesamefs/internal/config"
 	"github.com/Sesame-Disk/sesamefs/internal/metrics"
+	"github.com/Sesame-Disk/sesamefs/internal/traffic"
 	"github.com/google/uuid"
 )
 
@@ -63,6 +66,11 @@ type Service struct {
 	scanner *Scanner
 	stats   *Stats
 
+	// dbSession is the raw gocql session used for quota-period rollover.
+	// Kept separate from store because rollover operates on organizations,
+	// not on the GC queue.
+	dbSession *gocql.Session
+
 	cancel  context.CancelFunc
 	wg      sync.WaitGroup
 	started bool
@@ -78,7 +86,8 @@ type Service struct {
 }
 
 // NewService creates a new GC service using the provided store and storage provider.
-func NewService(store GCStore, storage StorageProvider, cfg config.GCConfig) *Service {
+// dbSession is used for quota-period rollover; pass nil to disable rollover.
+func NewService(store GCStore, storage StorageProvider, cfg config.GCConfig, dbSession *gocql.Session) *Service {
 	queue := NewQueue(store)
 	stats := &Stats{}
 
@@ -90,6 +99,7 @@ func NewService(store GCStore, storage StorageProvider, cfg config.GCConfig) *Se
 		worker:         NewWorker(store, storage, queue, cfg.BatchSize, cfg.GracePeriod, cfg.DryRun, stats),
 		scanner:        NewScanner(store, queue, stats, cfg),
 		stats:          stats,
+		dbSession:      dbSession,
 		triggerWorker:  make(chan struct{}, 1),
 		triggerScanner: make(chan struct{}, 1),
 	}
@@ -129,6 +139,15 @@ func (s *Service) Start() {
 		defer s.wg.Done()
 		s.runScannerLoop(ctx)
 	}()
+
+	// Start rollover goroutine — advances expired quota billing periods
+	if s.dbSession != nil {
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			s.runRolloverLoop(ctx)
+		}()
+	}
 
 	log.Printf("[GC] Started (worker every %v, scanner every %v, grace %v, batch %d, dry_run=%v)",
 		s.config.WorkerInterval, s.config.ScanInterval, s.config.GracePeriod,
@@ -311,6 +330,38 @@ func (s *Service) SetDryRun(dryRun bool) {
 	defer s.mu.Unlock()
 	s.config.DryRun = dryRun
 	s.worker.dryRun = dryRun
+}
+
+// rolloverInterval is how often the rollover loop checks for expired billing
+// periods. 1 hour strikes a balance between prompt rollover and low overhead
+// (full-table scan of organizations).
+const rolloverInterval = 1 * time.Hour
+
+func (s *Service) runRolloverLoop(ctx context.Context) {
+	// Run once on startup to catch periods that expired during downtime.
+	s.runRolloverOnce()
+
+	ticker := time.NewTicker(rolloverInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			s.runRolloverOnce()
+		}
+	}
+}
+
+func (s *Service) runRolloverOnce() {
+	n, err := traffic.RolloverExpiredPeriods(s.dbSession, time.Now())
+	if err != nil {
+		log.Printf("[GC] Rollover error: %v", err)
+	}
+	if n > 0 {
+		log.Printf("[GC] Rollover: advanced billing period for %d org(s)", n)
+	}
 }
 
 // persistStats saves GC stats to the database for recovery after restart.

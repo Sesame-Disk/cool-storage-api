@@ -202,7 +202,7 @@ func NewServer(cfg *config.Config, database *db.DB, version string) *Server {
 		if storageManager != nil {
 			storageProvider = gc.NewStorageManagerAdapter(storageManager)
 		}
-		gcService = gc.NewService(store, storageProvider, cfg.GC)
+		gcService = gc.NewService(store, storageProvider, cfg.GC, database.Session())
 	}
 
 	// Initialize rate limiter for auth endpoints (~10 req/min per IP)

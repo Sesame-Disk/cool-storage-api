@@ -19,7 +19,8 @@
     [ok] Legacy frontend — personalfree/business/pay_restricted* eliminados; isFreeUser es alias @deprecated
 
     PENDIENTE — P0 (bloqueadores):
-    [ ] Rollover job de períodos — traffic_period_usage nunca se resetea (0% implementado)
+    [ok] Rollover job de períodos — internal/traffic/rollover.go + gc.go loop cada 1h (2026-04-02)
+         Períodos siempre mensuales. Accounts es fuente de verdad para paid, cron resetea free.
 
     PENDIENTE — P1 (frontend Phase 3):
     [ ] Quota warning banners — backend envía X-Quota-Warning, frontend no lo consume
@@ -820,7 +821,10 @@
     `traffic.upload_over_quota`, `traffic.download_over_quota`
         — Backend envía X-Quota-Warning header. Frontend no lo intercepta aún
 18. [ ] Endpoint preview/evaluate para downgrade/cambios de plan
-19. [ ] Job periódico de rollover del período vigente de quotas — P0
+19. [DONE] Job periódico de rollover del período vigente de quotas — P0
+        — internal/traffic/rollover.go implementado (2026-04-02)
+        — Integrado en GC service (gc.go) como goroutine cada 1h
+        — Períodos siempre mensuales, Accounts es fuente de verdad para paid
 20. [ ] Service token para provisioning Accounts → SesameFS (M2M path interno)
 21. [ ] Flujo de invite/create users via Accounts (pendiente coordinación con Accounts)
 
