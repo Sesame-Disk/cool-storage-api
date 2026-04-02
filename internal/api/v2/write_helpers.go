@@ -48,20 +48,29 @@ func createUserWithEmailLookup(db interface{ Session() *gocql.Session }, orgID, 
 	return batch.Exec()
 }
 
-func readAdminLibraryProjectionStateOptional(db interface{ Session() *gocql.Session }, libraryID string) (*dbpkg.AdminLibraryProjectionState, error) {
-	state, err := dbpkg.ReadAdminLibraryProjectionState(db.Session(), libraryID)
-	if err == gocql.ErrNotFound {
-		return nil, nil
+func adminLibraryProjectionDeletedAtEqual(left, right *time.Time) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
 	}
-	if err != nil {
-		return nil, err
-	}
-	return &state, nil
+	return left.Equal(*right)
 }
 
-func addAdminLibraryReadModelRefreshQueries(batch *gocql.Batch, row dbpkg.AdminLibraryProjectionRow, state *dbpkg.AdminLibraryProjectionState) {
-	if state != nil {
-		dbpkg.AddDeleteAdminLibraryReadModelQuery(batch, *state)
+func adminLibraryProjectionDeleteRequired(previous, next dbpkg.AdminLibraryProjectionRow) bool {
+	if previous.OrgID != next.OrgID || previous.OwnerID != next.OwnerID || !previous.CreatedAt.Equal(next.CreatedAt) {
+		return true
+	}
+	return false
+}
+
+func addAdminLibraryReadModelRefreshQueries(batch *gocql.Batch, row dbpkg.AdminLibraryProjectionRow, previous *dbpkg.AdminLibraryProjectionRow) {
+	if previous != nil && adminLibraryProjectionDeleteRequired(*previous, row) {
+		dbpkg.AddDeleteAdminLibraryReadModelQuery(batch, *previous)
+	}
+	if previous != nil && !adminLibraryProjectionDeletedAtEqual(previous.DeletedAt, row.DeletedAt) && previous.DeletedAt != nil && !previous.DeletedAt.IsZero() && row.DeletedAt == nil {
+		batch.Query(`
+			DELETE FROM libraries_deleted_by_org
+			WHERE org_id = ? AND deleted_at = ? AND library_id = ?
+		`, previous.OrgID, *previous.DeletedAt, previous.LibraryID)
 	}
 	dbpkg.AddUpsertAdminLibraryReadModelQuery(batch, row)
 }
@@ -119,17 +128,14 @@ func addAdminGroupReadModelUpsertQuery(batch *gocql.Batch, row dbpkg.AdminGroupP
 }
 
 func updateLibraryOwner(db interface{ Session() *gocql.Session }, orgID, libraryID, newOwnerID string, updatedAt time.Time) error {
-	state, err := readAdminLibraryProjectionStateOptional(db, libraryID)
+	previousRow, err := dbpkg.ReadAdminLibraryProjectionRow(db.Session(), orgID, libraryID)
 	if err != nil {
 		return err
 	}
-	row, err := dbpkg.ReadAdminLibraryProjectionRow(db.Session(), orgID, libraryID)
-	if err != nil {
-		return err
-	}
-	row.OwnerID = newOwnerID
-	row.OwnerEmail, row.OwnerName = dbpkg.ResolveAdminLibraryOwnerFields(db.Session(), orgID, newOwnerID)
-	row.UpdatedAt = updatedAt
+	nextRow := previousRow
+	nextRow.OwnerID = newOwnerID
+	nextRow.OwnerEmail, nextRow.OwnerName = dbpkg.ResolveAdminLibraryOwnerFields(db.Session(), orgID, newOwnerID)
+	nextRow.UpdatedAt = updatedAt
 
 	batch := db.Session().Batch(gocql.LoggedBatch)
 	batch.Query(`
@@ -140,7 +146,7 @@ func updateLibraryOwner(db interface{ Session() *gocql.Session }, orgID, library
 		UPDATE libraries_by_id SET owner_id = ?
 		WHERE library_id = ?
 	`, newOwnerID, libraryID)
-	addAdminLibraryReadModelRefreshQueries(batch, row, state)
+	addAdminLibraryReadModelRefreshQueries(batch, nextRow, &previousRow)
 	return batch.Exec()
 }
 
@@ -595,8 +601,8 @@ func syncAdminLibraryReadModel(db interface{ Session() *gocql.Session }, orgID, 
 	return dbpkg.SyncAdminLibraryReadModel(db.Session(), orgID, libraryID)
 }
 
-func addDeleteAdminLibraryReadModelQueries(db interface{ Session() *gocql.Session }, batch *gocql.Batch, libraryID string) error {
-	state, err := dbpkg.ReadAdminLibraryProjectionState(db.Session(), libraryID)
+func addDeleteAdminLibraryReadModelQueries(db interface{ Session() *gocql.Session }, batch *gocql.Batch, orgID, libraryID string) error {
+	projectionRow, err := dbpkg.ReadAdminLibraryProjectionRow(db.Session(), orgID, libraryID)
 	if err == gocql.ErrNotFound {
 		return nil
 	}
@@ -604,8 +610,7 @@ func addDeleteAdminLibraryReadModelQueries(db interface{ Session() *gocql.Sessio
 		return err
 	}
 
-	dbpkg.AddDeleteAdminLibraryReadModelQuery(batch, state)
-	batch.Query(`DELETE FROM library_admin_projection_state WHERE library_id = ?`, libraryID)
+	dbpkg.AddDeleteAdminLibraryReadModelQuery(batch, projectionRow)
 	return nil
 }
 
@@ -620,23 +625,20 @@ func addDeleteAdminLibraryReadModelQueries(db interface{ Session() *gocql.Sessio
 // traffic.DeleteLibraryStorageCounter.
 func softDeleteLibrary(db interface{ Session() *gocql.Session }, orgID, ownerID, deletedBy, libraryID string) error {
 	now := time.Now()
-	state, err := readAdminLibraryProjectionStateOptional(db, libraryID)
-	if err != nil {
-		return fmt.Errorf("read library projection state: %w", err)
-	}
-	projectionRow, err := dbpkg.ReadAdminLibraryProjectionRow(db.Session(), orgID, libraryID)
+	previousRow, err := dbpkg.ReadAdminLibraryProjectionRow(db.Session(), orgID, libraryID)
 	if err != nil {
 		return fmt.Errorf("read library projection row: %w", err)
 	}
-	projectionRow.UpdatedAt = now
-	projectionRow.DeletedAt = &now
+	nextRow := previousRow
+	nextRow.UpdatedAt = now
+	nextRow.DeletedAt = &now
 	batch := db.Session().Batch(gocql.LoggedBatch)
 	batch.Query(`
 		UPDATE libraries SET deleted_at = ?, deleted_by = ?, updated_at = ?
 		WHERE org_id = ? AND library_id = ?`,
 		now, deletedBy, now, orgID, libraryID,
 	)
-	addAdminLibraryReadModelRefreshQueries(batch, projectionRow, state)
+	addAdminLibraryReadModelRefreshQueries(batch, nextRow, &previousRow)
 	if err := batch.Exec(); err != nil {
 		return fmt.Errorf("soft-delete library: %w", err)
 	}
@@ -650,16 +652,13 @@ func softDeleteLibrary(db interface{ Session() *gocql.Session }, orgID, ownerID,
 // aggregate counters. Mirror image of softDeleteLibrary.
 func restoreDeletedLibrary(db interface{ Session() *gocql.Session }, orgID, ownerID, libraryID string) error {
 	now := time.Now()
-	state, err := readAdminLibraryProjectionStateOptional(db, libraryID)
-	if err != nil {
-		return fmt.Errorf("read library projection state: %w", err)
-	}
-	projectionRow, err := dbpkg.ReadAdminLibraryProjectionRow(db.Session(), orgID, libraryID)
+	previousRow, err := dbpkg.ReadAdminLibraryProjectionRow(db.Session(), orgID, libraryID)
 	if err != nil {
 		return fmt.Errorf("read library projection row: %w", err)
 	}
-	projectionRow.UpdatedAt = now
-	projectionRow.DeletedAt = nil
+	nextRow := previousRow
+	nextRow.UpdatedAt = now
+	nextRow.DeletedAt = nil
 	batch := db.Session().Batch(gocql.LoggedBatch)
 	batch.Query(`
 		UPDATE libraries SET updated_at = ?
@@ -671,7 +670,7 @@ func restoreDeletedLibrary(db interface{ Session() *gocql.Session }, orgID, owne
 		WHERE org_id = ? AND library_id = ?`,
 		orgID, libraryID,
 	)
-	addAdminLibraryReadModelRefreshQueries(batch, projectionRow, state)
+	addAdminLibraryReadModelRefreshQueries(batch, nextRow, &previousRow)
 	if err := batch.Exec(); err != nil {
 		return fmt.Errorf("restore library: %w", err)
 	}

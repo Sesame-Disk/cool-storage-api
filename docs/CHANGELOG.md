@@ -15,12 +15,11 @@ Session-by-session development history for SesameFS.
 Introduced denormalized projection tables for all admin list endpoints, eliminating full-table-scans and N+1 query patterns across libraries, groups, shares, and links.
 
 **Library projections** (`internal/db/admin_library_read_models.go`):
-- `libraries_by_owner` — per-owner view, partition `(org_id, owner_id)`, clustering `updated_at DESC`
-- `libraries_by_org_updated` — org-wide view with denormalized `owner_email/name`, partition `org_id`
-- `libraries_admin_global_by_updated` — superadmin global view, bucketed by `bucket_day`
+- `libraries_by_owner` — per-owner view, partition `(org_id, owner_id)`, immutable clustering by `library_id`
+- `libraries_by_org_updated` — org-wide view with denormalized `owner_email/name`, partition `org_id`, immutable clustering by `library_id`
+- `libraries_admin_global_by_updated` — superadmin global view, bucketed by immutable `created_at` day
 - `libraries_deleted_by_org` — soft-deleted libraries per org, clustering `deleted_at DESC`
-- `library_admin_global_buckets` — day-bucket index for efficient iteration
-- `library_admin_projection_state` — state tracker enabling safe idempotent sync (keyed by `library_id`)
+- `library_admin_global_buckets` — creation-day bucket index for efficient iteration
 
 **Group projections** (`internal/db/admin_group_read_models.go`):
 - `groups_admin_global_by_created` — superadmin global view, bucketed by `bucket_day`, clustering `created_at DESC`
@@ -38,7 +37,7 @@ Introduced denormalized projection tables for all admin list endpoints, eliminat
 - `shares_by_creator` — creator view, partition `(org_id, shared_by)`
 - `shares_by_recipient` — recipient view, partition `(org_id, shared_to_type, shared_to)`
 
-All projections maintained via `LoggedBatch` dual-writes. Libraries use a state-tracker table for idempotent re-sync. Groups use upsert semantics (immutable `created_at` clustering key).
+All projections maintained via `LoggedBatch` dual-writes. Libraries now use immutable primary keys plus regular-column `updated_at`, avoiding delete+reinsert churn on normal dashboard updates. Groups use upsert semantics (immutable `created_at` clustering key).
 
 ### Changed — `shares` table: denormalized fields
 

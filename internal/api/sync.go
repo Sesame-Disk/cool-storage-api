@@ -2052,12 +2052,6 @@ func (h *SyncHandler) updateLibraryHeadWithStats(orgID, repoID, commitID string,
 	} else {
 		// Unconditional update (for initial commit creation and other cases
 		// where CAS is not needed)
-		state, err := db.ReadAdminLibraryProjectionState(h.db.Session(), repoID)
-		if err == gocql.ErrNotFound {
-			state = db.AdminLibraryProjectionState{}
-		} else if err != nil {
-			return fmt.Errorf("failed to read library projection state: %w", err)
-		}
 		projectionRow, err := db.ReadAdminLibraryProjectionRow(h.db.Session(), orgID, repoID)
 		if err != nil {
 			return fmt.Errorf("failed to read library projection row: %w", err)
@@ -2072,9 +2066,6 @@ func (h *SyncHandler) updateLibraryHeadWithStats(orgID, repoID, commitID string,
 			UPDATE libraries_by_id SET head_commit_id = ?
 			WHERE library_id = ?
 		`, commitID, repoID)
-		if state.LibraryID != "" {
-			db.AddDeleteAdminLibraryReadModelQuery(batch, state)
-		}
 		db.AddUpsertAdminLibraryReadModelQuery(batch, projectionRow)
 
 		if err := batch.Exec(); err != nil {
@@ -2107,13 +2098,6 @@ func (h *SyncHandler) recalculateLibraryStats(orgID, repoID, commitID string) {
 
 	if rootFSID == "" || rootFSID == strings.Repeat("0", 40) {
 		// Empty library — set stats to zero
-		state, err := db.ReadAdminLibraryProjectionState(h.db.Session(), repoID)
-		if err == gocql.ErrNotFound {
-			state = db.AdminLibraryProjectionState{}
-		} else if err != nil {
-			log.Printf("[updateLibraryStats] Failed to read projection state for %s: %v", repoID, err)
-			return
-		}
 		projectionRow, err := db.ReadAdminLibraryProjectionRow(h.db.Session(), orgID, repoID)
 		if err != nil {
 			log.Printf("[updateLibraryStats] Failed to read projection row for %s: %v", repoID, err)
@@ -2126,9 +2110,6 @@ func (h *SyncHandler) recalculateLibraryStats(orgID, repoID, commitID string) {
 			UPDATE libraries SET size_bytes = ?, file_count = ?
 			WHERE org_id = ? AND library_id = ?
 		`, int64(0), int64(0), orgID, repoID)
-		if state.LibraryID != "" {
-			db.AddDeleteAdminLibraryReadModelQuery(batch, state)
-		}
 		db.AddUpsertAdminLibraryReadModelQuery(batch, projectionRow)
 		if err := batch.Exec(); err != nil {
 			log.Printf("[updateLibraryStats] Failed to set empty stats for %s: %v", repoID, err)
@@ -2140,13 +2121,6 @@ func (h *SyncHandler) recalculateLibraryStats(orgID, repoID, commitID string) {
 
 	totalSize, fileCount := h.calculateDirStats(repoID, rootFSID)
 
-	state, err := db.ReadAdminLibraryProjectionState(h.db.Session(), repoID)
-	if err == gocql.ErrNotFound {
-		state = db.AdminLibraryProjectionState{}
-	} else if err != nil {
-		log.Printf("[updateLibraryStats] Failed to read projection state for %s: %v", repoID, err)
-		return
-	}
 	projectionRow, err := db.ReadAdminLibraryProjectionRow(h.db.Session(), orgID, repoID)
 	if err != nil {
 		log.Printf("[updateLibraryStats] Failed to read projection row for %s: %v", repoID, err)
@@ -2159,9 +2133,6 @@ func (h *SyncHandler) recalculateLibraryStats(orgID, repoID, commitID string) {
 		UPDATE libraries SET size_bytes = ?, file_count = ?
 		WHERE org_id = ? AND library_id = ?
 	`, totalSize, fileCount, orgID, repoID)
-	if state.LibraryID != "" {
-		db.AddDeleteAdminLibraryReadModelQuery(batch, state)
-	}
 	db.AddUpsertAdminLibraryReadModelQuery(batch, projectionRow)
 	err = batch.Exec()
 	if err != nil {

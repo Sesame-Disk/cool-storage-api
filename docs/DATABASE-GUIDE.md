@@ -959,9 +959,11 @@ These tables are **denormalized projections** maintained by dual-write. They are
 **Purpose:** Per-owner library listing for admin "filter by owner" view
 
 ```sql
-PRIMARY KEY ((org_id, owner_id), updated_at, library_id)
-CLUSTERING ORDER BY (updated_at DESC, library_id ASC)
+PRIMARY KEY ((org_id, owner_id), library_id)
+CLUSTERING ORDER BY (library_id ASC)
 ```
+
+`updated_at` remains a regular column. Rows are sorted in Go after read, so the projection no longer needs delete+reinsert churn on every mutable update.
 
 ---
 
@@ -969,8 +971,8 @@ CLUSTERING ORDER BY (updated_at DESC, library_id ASC)
 **Purpose:** Org-wide library listing ordered by last update — default admin view
 
 ```sql
-PRIMARY KEY ((org_id), updated_at, library_id)
-CLUSTERING ORDER BY (updated_at DESC, library_id ASC)
+PRIMARY KEY ((org_id), library_id)
+CLUSTERING ORDER BY (library_id ASC)
 -- Denormalized: owner_email, owner_name
 ```
 
@@ -980,9 +982,9 @@ CLUSTERING ORDER BY (updated_at DESC, library_id ASC)
 **Purpose:** Superadmin global library listing across all orgs, bucketed by day
 
 ```sql
-PRIMARY KEY ((bucket_day), updated_at, org_id, library_id)
-CLUSTERING ORDER BY (updated_at DESC, org_id ASC, library_id ASC)
--- bucket_day = updated_at truncated to YYYY-MM-DD (UTC)
+PRIMARY KEY ((bucket_day), org_id, library_id)
+CLUSTERING ORDER BY (org_id ASC, library_id ASC)
+-- bucket_day = created_at truncated to YYYY-MM-DD (UTC)
 ```
 
 Use `library_admin_global_buckets` to enumerate active `bucket_day` values before querying.
@@ -1006,19 +1008,7 @@ CLUSTERING ORDER BY (deleted_at DESC, library_id ASC)
 PRIMARY KEY (bucket_day)
 ```
 
-One row per day that has at least one library. Scanned by `ListAdminGlobalLibraryRows` before iterating bucket partitions.
-
----
-
-#### `library_admin_projection_state`
-**Purpose:** Current state tracker for each library's projection, enabling safe idempotent re-sync
-
-```sql
-PRIMARY KEY (library_id)
--- Columns: org_id, owner_id, updated_at, deleted_at
-```
-
-Before upserting a projection, the old state is read, the old rows are deleted, then new rows are inserted — all in one `LoggedBatch`. This prevents stale entries when `updated_at` or `owner_id` changes (clustering key values would differ).
+One row per creation day that has at least one library. Scanned by `ListAdminGlobalLibraryRows` before iterating bucket partitions.
 
 ---
 

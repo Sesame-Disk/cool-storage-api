@@ -254,7 +254,7 @@ func (h *DeletedLibraryHandler) PermanentDeleteRepo(c *gin.Context) {
 
 	// Hard delete the library records
 	batch := h.db.Session().Batch(gocql.LoggedBatch)
-	if err := addDeleteAdminLibraryReadModelQueries(h.db, batch, repoID); err != nil {
+	if err := addDeleteAdminLibraryReadModelQueries(h.db, batch, orgID, repoID); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to clean library read model"})
 		return
 	}

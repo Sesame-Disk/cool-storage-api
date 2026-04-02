@@ -169,23 +169,19 @@ func (h *LibrarySettingsHandler) SetHistoryLimit(c *gin.Context) {
 
 	// Store in version_ttl_days column
 	now := time.Now()
-	state, err := readAdminLibraryProjectionStateOptional(h.db, repoID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read library projection state"})
-		return
-	}
-	projectionRow, err := db.ReadAdminLibraryProjectionRow(h.db.Session(), orgID, repoID)
+	previousRow, err := db.ReadAdminLibraryProjectionRow(h.db.Session(), orgID, repoID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read library projection row"})
 		return
 	}
+	projectionRow := previousRow
 	projectionRow.UpdatedAt = now
 	batch := h.db.Session().Batch(gocql.LoggedBatch)
 	batch.Query(`
 		UPDATE libraries SET version_ttl_days = ?, updated_at = ?
 		WHERE org_id = ? AND library_id = ?
 	`, req.KeepDays, now, orgID, repoID)
-	addAdminLibraryReadModelRefreshQueries(batch, projectionRow, state)
+	addAdminLibraryReadModelRefreshQueries(batch, projectionRow, &previousRow)
 	if err := batch.Exec(); err != nil {
 		log.Printf("[SetHistoryLimit] Failed to update: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update history limit"})
@@ -245,23 +241,19 @@ func (h *LibrarySettingsHandler) SetAutoDelete(c *gin.Context) {
 	}
 
 	now := time.Now()
-	state, err := readAdminLibraryProjectionStateOptional(h.db, repoID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read library projection state"})
-		return
-	}
-	projectionRow, err := db.ReadAdminLibraryProjectionRow(h.db.Session(), orgID, repoID)
+	previousRow, err := db.ReadAdminLibraryProjectionRow(h.db.Session(), orgID, repoID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read library projection row"})
 		return
 	}
+	projectionRow := previousRow
 	projectionRow.UpdatedAt = now
 	batch := h.db.Session().Batch(gocql.LoggedBatch)
 	batch.Query(`
 		UPDATE libraries SET auto_delete_days = ?, updated_at = ?
 		WHERE org_id = ? AND library_id = ?
 	`, req.AutoDeleteDays, now, orgID, repoID)
-	addAdminLibraryReadModelRefreshQueries(batch, projectionRow, state)
+	addAdminLibraryReadModelRefreshQueries(batch, projectionRow, &previousRow)
 	if err := batch.Exec(); err != nil {
 		log.Printf("[SetAutoDelete] Failed to update: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update auto-delete settings"})

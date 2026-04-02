@@ -581,6 +581,7 @@ func (h *AdminHandler) AdminCreateLibrary(c *gin.Context) {
 		StorageClass: storageClass,
 		SizeBytes:    0,
 		FileCount:    0,
+		CreatedAt:    now,
 		UpdatedAt:    now,
 	}, nil)
 
@@ -741,23 +742,19 @@ func (h *AdminHandler) AdminUpdateHistorySetting(c *gin.Context) {
 	}
 
 	now := time.Now()
-	state, err := readAdminLibraryProjectionStateOptional(h.db, libraryID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read library projection state"})
-		return
-	}
-	projectionRow, err := dbpkg.ReadAdminLibraryProjectionRow(h.db.Session(), orgID, libraryID)
+	previousRow, err := dbpkg.ReadAdminLibraryProjectionRow(h.db.Session(), orgID, libraryID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read library projection row"})
 		return
 	}
+	projectionRow := previousRow
 	projectionRow.UpdatedAt = now
 	batch := h.db.Session().Batch(gocql.LoggedBatch)
 	batch.Query(`
 		UPDATE libraries SET version_ttl_days = ?, updated_at = ?
 		WHERE org_id = ? AND library_id = ?
 	`, req.KeepDays, now, orgID, libraryID)
-	addAdminLibraryReadModelRefreshQueries(batch, projectionRow, state)
+	addAdminLibraryReadModelRefreshQueries(batch, projectionRow, &previousRow)
 	if err := batch.Exec(); err != nil {
 		log.Printf("[AdminUpdateHistorySetting] Failed to update: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update history setting"})
@@ -1220,7 +1217,7 @@ func (h *AdminHandler) AdminCleanTrashLibraries(c *gin.Context) {
 
 			// 3. Hard-delete library rows (same batch approach as PermanentDeleteRepo)
 			batch := h.db.Session().Batch(gocql.LoggedBatch)
-			if err := addDeleteAdminLibraryReadModelQueries(h.db, batch, lib.libID); err != nil {
+			if err := addDeleteAdminLibraryReadModelQueries(h.db, batch, orgID, lib.libID); err != nil {
 				log.Printf("[AdminCleanTrashLibraries] failed to stage read model delete for library %s (org %s): %v", lib.libID, orgID, err)
 				continue
 			}

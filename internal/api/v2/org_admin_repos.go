@@ -411,7 +411,7 @@ func (h *OrgAdminHandler) CleanOrgTrashLibraries(c *gin.Context) {
 		}
 		// Hard-delete library rows + preserve org lookup for GC
 		batch := h.db.Session().Batch(gocql.LoggedBatch)
-		if err := addDeleteAdminLibraryReadModelQueries(h.db, batch, libID); err != nil {
+		if err := addDeleteAdminLibraryReadModelQueries(h.db, batch, targetOrgID, libID); err != nil {
 			iter.Close()
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to clean library read model"})
 			return
@@ -465,7 +465,7 @@ func (h *OrgAdminHandler) DeleteOrgTrashLibrary(c *gin.Context) {
 
 	// Hard-delete + preserve org lookup for GC
 	batch := h.db.Session().Batch(gocql.LoggedBatch)
-	if err := addDeleteAdminLibraryReadModelQueries(h.db, batch, repoID); err != nil {
+	if err := addDeleteAdminLibraryReadModelQueries(h.db, batch, targetOrgID, repoID); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to clean library read model"})
 		return
 	}

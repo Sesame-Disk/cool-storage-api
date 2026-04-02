@@ -121,20 +121,20 @@ CREATE TABLE IF NOT EXISTS deleted_libraries (
 CREATE TABLE IF NOT EXISTS libraries_by_owner (
     org_id         UUID,
     owner_id       UUID,
-    updated_at     TIMESTAMP,
     library_id     UUID,
     name           TEXT,
     encrypted      BOOLEAN,
     storage_class  TEXT,
     size_bytes     BIGINT,
     file_count     BIGINT,
+    created_at     TIMESTAMP,
+    updated_at     TIMESTAMP,
     deleted_at     TIMESTAMP,
-    PRIMARY KEY ((org_id, owner_id), updated_at, library_id)
-) WITH CLUSTERING ORDER BY (updated_at DESC, library_id ASC);
+    PRIMARY KEY ((org_id, owner_id), library_id)
+) WITH CLUSTERING ORDER BY (library_id ASC);
 
 CREATE TABLE IF NOT EXISTS libraries_by_org_updated (
     org_id         UUID,
-    updated_at     TIMESTAMP,
     library_id     UUID,
     owner_id       UUID,
     owner_email    TEXT,
@@ -144,13 +144,14 @@ CREATE TABLE IF NOT EXISTS libraries_by_org_updated (
     storage_class  TEXT,
     size_bytes     BIGINT,
     file_count     BIGINT,
+    created_at     TIMESTAMP,
+    updated_at     TIMESTAMP,
     deleted_at     TIMESTAMP,
-    PRIMARY KEY ((org_id), updated_at, library_id)
-) WITH CLUSTERING ORDER BY (updated_at DESC, library_id ASC);
+    PRIMARY KEY ((org_id), library_id)
+) WITH CLUSTERING ORDER BY (library_id ASC);
 
 CREATE TABLE IF NOT EXISTS libraries_admin_global_by_updated (
     bucket_day     TEXT,
-    updated_at     TIMESTAMP,
     org_id         UUID,
     library_id     UUID,
     owner_id       UUID,
@@ -161,9 +162,11 @@ CREATE TABLE IF NOT EXISTS libraries_admin_global_by_updated (
     storage_class  TEXT,
     size_bytes     BIGINT,
     file_count     BIGINT,
+    created_at     TIMESTAMP,
+    updated_at     TIMESTAMP,
     deleted_at     TIMESTAMP,
-    PRIMARY KEY ((bucket_day), updated_at, org_id, library_id)
-) WITH CLUSTERING ORDER BY (updated_at DESC, org_id ASC, library_id ASC);
+    PRIMARY KEY ((bucket_day), org_id, library_id)
+) WITH CLUSTERING ORDER BY (org_id ASC, library_id ASC);
 
 CREATE TABLE IF NOT EXISTS libraries_deleted_by_org (
     org_id         UUID,
@@ -180,14 +183,6 @@ CREATE TABLE IF NOT EXISTS libraries_deleted_by_org (
 
 CREATE TABLE IF NOT EXISTS library_admin_global_buckets (
     bucket_day TEXT PRIMARY KEY
-);
-
-CREATE TABLE IF NOT EXISTS library_admin_projection_state (
-    library_id UUID PRIMARY KEY,
-    org_id     UUID,
-    owner_id   UUID,
-    updated_at TIMESTAMP,
-    deleted_at TIMESTAMP
 );
 
 -- ─── File System ─────────────────────────────────────────────────────────────

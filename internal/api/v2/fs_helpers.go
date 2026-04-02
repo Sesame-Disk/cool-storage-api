@@ -393,14 +393,11 @@ func (h *FSHelper) UpdateLibraryHead(orgID, repoID, commitID string) error {
 	}
 
 	now := time.Now()
-	state, err := readAdminLibraryProjectionStateOptional(h.db, repoID)
-	if err != nil {
-		return fmt.Errorf("failed to read library projection state: %w", err)
-	}
-	projectionRow, err := db.ReadAdminLibraryProjectionRow(h.db.Session(), orgID, repoID)
+	previousRow, err := db.ReadAdminLibraryProjectionRow(h.db.Session(), orgID, repoID)
 	if err != nil {
 		return fmt.Errorf("failed to read library projection row: %w", err)
 	}
+	projectionRow := previousRow
 	projectionRow.SizeBytes = totalSize
 	projectionRow.FileCount = fileCount
 	projectionRow.UpdatedAt = now
@@ -417,7 +414,7 @@ func (h *FSHelper) UpdateLibraryHead(orgID, repoID, commitID string) error {
 		UPDATE libraries_by_id SET head_commit_id = ?
 		WHERE library_id = ?
 	`, commitID, repoID)
-	addAdminLibraryReadModelRefreshQueries(batch, projectionRow, state)
+	addAdminLibraryReadModelRefreshQueries(batch, projectionRow, &previousRow)
 
 	if err := batch.Exec(); err != nil {
 		return fmt.Errorf("failed to update library head: %w", err)

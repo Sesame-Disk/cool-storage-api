@@ -607,6 +607,7 @@ func (h *LibraryHandler) CreateLibrary(c *gin.Context) {
 		StorageClass: library.StorageClass,
 		SizeBytes:    library.SizeBytes,
 		FileCount:    library.FileCount,
+		CreatedAt:    library.CreatedAt,
 		UpdatedAt:    library.UpdatedAt,
 	}, nil)
 
@@ -867,21 +868,17 @@ func (h *LibraryHandler) UpdateLibrary(c *gin.Context) {
 			WHERE library_id = ?
 		`, *req.Name, repoID)
 	}
-	state, err := readAdminLibraryProjectionStateOptional(h.db, repoID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read library projection state"})
-		return
-	}
-	projectionRow, err := db.ReadAdminLibraryProjectionRow(h.db.Session(), orgID, repoID)
+	previousRow, err := db.ReadAdminLibraryProjectionRow(h.db.Session(), orgID, repoID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read library projection row"})
 		return
 	}
+	projectionRow := previousRow
 	if req.Name != nil {
 		projectionRow.Name = *req.Name
 	}
 	projectionRow.UpdatedAt = values[len(values)-3].(time.Time)
-	addAdminLibraryReadModelRefreshQueries(batch, projectionRow, state)
+	addAdminLibraryReadModelRefreshQueries(batch, projectionRow, &previousRow)
 
 	if err := batch.Exec(); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update library"})
@@ -982,16 +979,12 @@ func (h *LibraryHandler) RenameLibrary(c *gin.Context) {
 	}
 
 	now := time.Now()
-	state, err := readAdminLibraryProjectionStateOptional(h.db, repoID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read library projection state"})
-		return
-	}
-	projectionRow, err := db.ReadAdminLibraryProjectionRow(h.db.Session(), orgID, repoID)
+	previousRow, err := db.ReadAdminLibraryProjectionRow(h.db.Session(), orgID, repoID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read library projection row"})
 		return
 	}
+	projectionRow := previousRow
 	projectionRow.Name = req.RepoName
 	projectionRow.UpdatedAt = now
 	batch := h.db.Session().Batch(gocql.LoggedBatch)
@@ -1003,7 +996,7 @@ func (h *LibraryHandler) RenameLibrary(c *gin.Context) {
 		UPDATE libraries_by_id SET name = ?
 		WHERE library_id = ?
 	`, req.RepoName, repoID)
-	addAdminLibraryReadModelRefreshQueries(batch, projectionRow, state)
+	addAdminLibraryReadModelRefreshQueries(batch, projectionRow, &previousRow)
 
 	if err := batch.Exec(); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to rename library"})
@@ -1036,16 +1029,12 @@ func (h *LibraryHandler) ChangeStorageClass(c *gin.Context) {
 	}
 
 	now := time.Now()
-	state, err := readAdminLibraryProjectionStateOptional(h.db, repoID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read library projection state"})
-		return
-	}
-	projectionRow, err := db.ReadAdminLibraryProjectionRow(h.db.Session(), orgID, repoID)
+	previousRow, err := db.ReadAdminLibraryProjectionRow(h.db.Session(), orgID, repoID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read library projection row"})
 		return
 	}
+	projectionRow := previousRow
 	projectionRow.StorageClass = req.StorageClass
 	projectionRow.UpdatedAt = now
 	batch := h.db.Session().Batch(gocql.LoggedBatch)
@@ -1053,7 +1042,7 @@ func (h *LibraryHandler) ChangeStorageClass(c *gin.Context) {
 		UPDATE libraries SET storage_class = ?, updated_at = ?
 		WHERE org_id = ? AND library_id = ?
 	`, req.StorageClass, now, orgID, repoID)
-	addAdminLibraryReadModelRefreshQueries(batch, projectionRow, state)
+	addAdminLibraryReadModelRefreshQueries(batch, projectionRow, &previousRow)
 	if err := batch.Exec(); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update storage class"})
 		return

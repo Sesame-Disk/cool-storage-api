@@ -79,78 +79,13 @@ func (db *DB) Ping(ctx context.Context) error {
 	return db.session.Query(`SELECT now() FROM system.local`).ExecContext(ctx)
 }
 
-// Migrate runs the schema migration runner and then applies idempotent data
-// backfills for columns that require Go-level logic (not expressible in CQL).
+// Migrate runs the schema migration runner.
 func (db *DB) Migrate() error {
 	m := NewMigrator(db.session)
 	if err := m.Run(); err != nil {
 		return err
 	}
-	// Data backfills — idempotent; skip rows that are already populated.
-	db.backfillUserStatus()
-	db.backfillOrgStatus()
 	return nil
-}
-
-// backfillUserStatus populates the status column for users that predate the
-// status/role separation migration. Legacy data may carry role="deactivated"
-// or role="deleted" which are split into the dedicated status column.
-func (db *DB) backfillUserStatus() {
-	orgIter := db.session.Query(`SELECT org_id FROM organizations`).Iter()
-	var orgIDStr string
-	for orgIter.Scan(&orgIDStr) {
-		iter := db.session.Query(
-			`SELECT user_id, role, status FROM users WHERE org_id = ?`, orgIDStr,
-		).Iter()
-		var userID, role, status string
-		for iter.Scan(&userID, &role, &status) {
-			if status != "" {
-				continue // already backfilled
-			}
-			switch role {
-			case "deactivated":
-				db.session.Query(
-					`UPDATE users SET status = ?, role = ? WHERE org_id = ? AND user_id = ?`,
-					"deactivated", "user", orgIDStr, userID,
-				).Exec()
-			case "deleted":
-				db.session.Query(
-					`UPDATE users SET status = ? WHERE org_id = ? AND user_id = ?`,
-					"deleted", orgIDStr, userID,
-				).Exec()
-			default:
-				db.session.Query(
-					`UPDATE users SET status = ? WHERE org_id = ? AND user_id = ?`,
-					"active", orgIDStr, userID,
-				).Exec()
-			}
-		}
-		iter.Close()
-	}
-	orgIter.Close()
-}
-
-// backfillOrgStatus populates the status column for organizations that predate
-// the migration. Legacy data stored lifecycle state in settings["status"].
-func (db *DB) backfillOrgStatus() {
-	iter := db.session.Query(
-		`SELECT org_id, status, settings FROM organizations`,
-	).Iter()
-	var orgIDStr, status string
-	var settings map[string]string
-	for iter.Scan(&orgIDStr, &status, &settings) {
-		if status != "" {
-			continue // already backfilled
-		}
-		newStatus := "active"
-		if legacyStatus, ok := settings["status"]; ok && legacyStatus != "" {
-			newStatus = legacyStatus
-		}
-		db.session.Query(
-			`UPDATE organizations SET status = ? WHERE org_id = ?`, newStatus, orgIDStr,
-		).Exec()
-	}
-	iter.Close()
 }
 
 // parseConsistency converts a string to a gocql.Consistency level.

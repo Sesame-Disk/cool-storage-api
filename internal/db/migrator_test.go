@@ -117,7 +117,7 @@ func TestInitialSchemaContainsLookupNameAndStarredIndex(t *testing.T) {
 	assert.Contains(t, content, "CREATE TABLE IF NOT EXISTS admin_link_buckets_by_org")
 	assert.Contains(t, content, "CREATE TABLE IF NOT EXISTS admin_link_counts_by_org")
 	assert.Contains(t, content, "CREATE TABLE IF NOT EXISTS libraries_by_owner")
-	assert.Contains(t, content, "CREATE TABLE IF NOT EXISTS library_admin_projection_state")
+	assert.Contains(t, content, "CREATE TABLE IF NOT EXISTS library_admin_global_buckets")
 	assert.Contains(t, content, "CREATE TABLE IF NOT EXISTS shares_by_group")
 	assert.Contains(t, content, "CREATE TABLE IF NOT EXISTS shares_by_creator")
 	assert.Contains(t, content, "CREATE TABLE IF NOT EXISTS shares_by_recipient")

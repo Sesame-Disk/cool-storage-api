@@ -282,16 +282,12 @@ func (h *EncryptionHandler) ChangePassword(c *gin.Context) {
 
 	// Update database with new encryption params
 	now := time.Now()
-	state, err := readAdminLibraryProjectionStateOptional(h.db, repoID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read library projection state"})
-		return
-	}
-	projectionRow, err := db.ReadAdminLibraryProjectionRow(h.db.Session(), orgID, repoID)
+	previousRow, err := db.ReadAdminLibraryProjectionRow(h.db.Session(), orgID, repoID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read library projection row"})
 		return
 	}
+	projectionRow := previousRow
 	projectionRow.UpdatedAt = now
 	batch := h.db.Session().Batch(gocql.LoggedBatch)
 	batch.Query(`
@@ -307,7 +303,7 @@ func (h *EncryptionHandler) ChangePassword(c *gin.Context) {
 	`, newParams.EncVersion, newParams.Salt, newParams.Magic, newParams.RandomKey,
 		newParams.MagicStrong, newParams.RandomKeyStrong, now,
 		orgID, repoID)
-	addAdminLibraryReadModelRefreshQueries(batch, projectionRow, state)
+	addAdminLibraryReadModelRefreshQueries(batch, projectionRow, &previousRow)
 	if err := batch.Exec(); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update library"})
 		return
