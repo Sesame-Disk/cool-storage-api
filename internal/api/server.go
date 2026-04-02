@@ -157,33 +157,7 @@ func NewServer(cfg *config.Config, database *db.DB, version string) *Server {
 	}
 
 	// CORS middleware for frontend access
-	corsConfig := cors.Config{
-		AllowMethods: []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
-		AllowHeaders: []string{
-			"Origin",
-			"Content-Type",
-			"Content-Length",
-			"Content-Range",       // Required for resumable.js chunked uploads
-			"Content-Disposition", // Required for filename in uploads
-			"Accept",
-			"Authorization",
-			"Seafile-Repo-Token",
-			"X-Requested-With", // Common AJAX header
-		},
-		ExposeHeaders:    []string{"Content-Length", "Content-Type"},
-		AllowCredentials: true,
-		MaxAge:           12 * time.Hour,
-	}
-	// In dev mode, allow all origins; in production, use configured origins
-	if cfg.Auth.DevMode {
-		corsConfig.AllowAllOrigins = true
-	} else if len(cfg.CORS.AllowedOrigins) > 0 {
-		corsConfig.AllowOrigins = cfg.CORS.AllowedOrigins
-	} else {
-		// Default to allowing all origins if not configured
-		corsConfig.AllowAllOrigins = true
-	}
-	router.Use(cors.New(corsConfig))
+	router.Use(cors.New(buildCORSConfig(cfg)))
 
 	// Initialize storage manager with multi-backend support
 	storageManager := initStorageManager(cfg)
@@ -258,6 +232,47 @@ func NewServer(cfg *config.Config, database *db.DB, version string) *Server {
 	}
 
 	return s
+}
+
+func buildCORSConfig(cfg *config.Config) cors.Config {
+	allowedOrigins := configuredOrigins(cfg.CORS.AllowedOrigins)
+	corsConfig := cors.Config{
+		AllowMethods: []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
+		AllowHeaders: []string{
+			"Origin",
+			"Content-Type",
+			"Content-Length",
+			"Content-Range",       // Required for resumable.js chunked uploads
+			"Content-Disposition", // Required for filename in uploads
+			"Accept",
+			"Authorization",
+			"Seafile-Repo-Token",
+			"X-Requested-With", // Common AJAX header
+		},
+		ExposeHeaders:    []string{"Content-Length", "Content-Type"},
+		AllowCredentials: true,
+		MaxAge:           12 * time.Hour,
+	}
+	if cfg.Auth.DevMode {
+		corsConfig.AllowAllOrigins = true
+	} else if len(allowedOrigins) > 0 {
+		corsConfig.AllowOrigins = allowedOrigins
+	} else {
+		corsConfig.AllowOriginFunc = func(string) bool { return false }
+	}
+	return corsConfig
+}
+
+func configuredOrigins(origins []string) []string {
+	configured := make([]string, 0, len(origins))
+	for _, origin := range origins {
+		origin = strings.TrimSpace(origin)
+		if origin == "" {
+			continue
+		}
+		configured = append(configured, origin)
+	}
+	return configured
 }
 
 // initStorageManager initializes the multi-backend storage manager

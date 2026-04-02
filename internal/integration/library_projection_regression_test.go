@@ -3,6 +3,7 @@
 package integration
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -173,6 +174,65 @@ func TestSyncHeadConflictReturnsOKWithoutRollback(t *testing.T) {
 	}
 }
 
+func TestSyncHeadStaleAsyncStatsDoNotOverwriteCurrentHead(t *testing.T) {
+	name := fmt.Sprintf("inttest-sync-stats-race-%d", time.Now().UnixNano())
+	repoID := createTestLibrary(t, adminClient, name)
+	session := shareProjectionDBForTest(t).Session()
+
+	initial := readLibrarySyncHeadState(t, session, repoID)
+	heavyHead := fmt.Sprintf("%040x", time.Now().UnixNano())
+	finalHead := fmt.Sprintf("%040x", time.Now().UnixNano()+1)
+	heavyRootFSID := fmt.Sprintf("heavy-root-%d", time.Now().UnixNano())
+	emptyRootFSID := fmt.Sprintf("empty-root-%d", time.Now().UnixNano()+1)
+
+	insertSyntheticDirectoryTreeForTest(t, session, repoID, heavyRootFSID, 256, 256, 4096)
+	insertSyntheticDirObjectForTest(t, session, repoID, emptyRootFSID, nil)
+	insertSyntheticCommitForTest(t, session, repoID, heavyHead, initial.HeadCommitID, heavyRootFSID, "integration heavy head")
+	insertSyntheticCommitForTest(t, session, repoID, finalHead, heavyHead, emptyRootFSID, "integration final empty head")
+
+	resp := adminClient.Do(t, http.MethodPut, fmt.Sprintf("/seafhttp/repo/%s/commit/HEAD?head=%s", repoID, url.QueryEscape(heavyHead)), nil)
+	if resp.StatusCode != http.StatusOK {
+		body := responseBody(t, resp)
+		t.Fatalf("heavy sync HEAD update failed: status=%d body=%s", resp.StatusCode, body)
+	}
+	resp.Body.Close()
+
+	resp = adminClient.Do(t, http.MethodPut, fmt.Sprintf("/seafhttp/repo/%s/commit/HEAD?head=%s", repoID, url.QueryEscape(finalHead)), nil)
+	if resp.StatusCode != http.StatusOK {
+		body := responseBody(t, resp)
+		t.Fatalf("final sync HEAD update failed: status=%d body=%s", resp.StatusCode, body)
+	}
+	resp.Body.Close()
+
+	waitForIntegrationCondition(t, "final sync head stats to reflect newest empty tree", func() bool {
+		current := readLibrarySyncHeadState(t, session, repoID)
+		return current.HeadCommitID == finalHead &&
+			current.LookupHeadCommitID == finalHead &&
+			current.SizeBytes == 0 &&
+			current.FileCount == 0 &&
+			current.ProjectionSizeBytes == 0 &&
+			current.ProjectionFileCount == 0
+	})
+
+	stabilityDeadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(stabilityDeadline) {
+		current := readLibrarySyncHeadState(t, session, repoID)
+		if current.HeadCommitID != finalHead {
+			t.Fatalf("canonical head changed during stat race stabilization: got %q want %q", current.HeadCommitID, finalHead)
+		}
+		if current.LookupHeadCommitID != finalHead {
+			t.Fatalf("lookup head changed during stat race stabilization: got %q want %q", current.LookupHeadCommitID, finalHead)
+		}
+		if current.SizeBytes != 0 || current.FileCount != 0 {
+			t.Fatalf("canonical stats were overwritten by stale recompute: size=%d files=%d", current.SizeBytes, current.FileCount)
+		}
+		if current.ProjectionSizeBytes != 0 || current.ProjectionFileCount != 0 {
+			t.Fatalf("projection stats were overwritten by stale recompute: size=%d files=%d", current.ProjectionSizeBytes, current.ProjectionFileCount)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
 func TestAdminCreateLibraryProjectionVisibleImmediately(t *testing.T) {
 	name := fmt.Sprintf("inttest-admin-lib-projection-%d", time.Now().UnixNano())
 	createResp := superadminClient.PostJSON(t, "/api/v2.1/admin/libraries/", map[string]string{
@@ -305,11 +365,15 @@ func adminTrashContainsRepo(t *testing.T, c *testClient, repoID, ownerEmail stri
 }
 
 type librarySyncHeadState struct {
-	HeadCommitID       string
-	LookupHeadCommitID string
-	RootFSID           string
-	UpdatedAt          time.Time
+	HeadCommitID        string
+	LookupHeadCommitID  string
+	RootFSID            string
+	UpdatedAt           time.Time
+	SizeBytes           int64
+	FileCount           int64
 	ProjectionUpdatedAt time.Time
+	ProjectionSizeBytes int64
+	ProjectionFileCount int64
 }
 
 func readLibrarySyncHeadState(t *testing.T, session interface {
@@ -319,8 +383,8 @@ func readLibrarySyncHeadState(t *testing.T, session interface {
 
 	var state librarySyncHeadState
 	if err := session.Query(`
-		SELECT head_commit_id, updated_at FROM libraries WHERE org_id = ? AND library_id = ?
-	`, defaultOrgID, repoID).Scan(&state.HeadCommitID, &state.UpdatedAt); err != nil {
+		SELECT head_commit_id, updated_at, size_bytes, file_count FROM libraries WHERE org_id = ? AND library_id = ?
+	`, defaultOrgID, repoID).Scan(&state.HeadCommitID, &state.UpdatedAt, &state.SizeBytes, &state.FileCount); err != nil {
 		t.Fatalf("failed to read canonical sync head state for %s: %v", repoID, err)
 	}
 	if err := session.Query(`
@@ -329,8 +393,8 @@ func readLibrarySyncHeadState(t *testing.T, session interface {
 		t.Fatalf("failed to read lookup sync head state for %s: %v", repoID, err)
 	}
 	if err := session.Query(`
-		SELECT updated_at FROM libraries_by_org_updated WHERE org_id = ? AND library_id = ?
-	`, defaultOrgID, repoID).Scan(&state.ProjectionUpdatedAt); err != nil {
+		SELECT updated_at, size_bytes, file_count FROM libraries_by_org_updated WHERE org_id = ? AND library_id = ?
+	`, defaultOrgID, repoID).Scan(&state.ProjectionUpdatedAt, &state.ProjectionSizeBytes, &state.ProjectionFileCount); err != nil {
 		t.Fatalf("failed to read projection sync head state for %s: %v", repoID, err)
 	}
 	if err := session.Query(`
@@ -351,5 +415,58 @@ func insertSyntheticCommitForTest(t *testing.T, session interface {
 		VALUES (?, ?, ?, ?, ?, ?, ?)
 	`, repoID, commitID, parentID, rootFSID, defaultOrgID, description, time.Now().UTC()).Exec(); err != nil {
 		t.Fatalf("failed to insert synthetic commit %s for %s: %v", commitID, repoID, err)
+	}
+}
+
+type syntheticDirEntry struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+	Mode int    `json:"mode"`
+	Size int64  `json:"size,omitempty"`
+}
+
+func insertSyntheticDirectoryTreeForTest(t *testing.T, session interface {
+	Query(stmt string, values ...interface{}) *gocql.Query
+}, repoID, rootFSID string, childDirCount, filesPerChild int, fileSize int64) {
+	t.Helper()
+
+	rootEntries := make([]syntheticDirEntry, 0, childDirCount)
+	for dirIndex := 0; dirIndex < childDirCount; dirIndex++ {
+		childFSID := fmt.Sprintf("%s-dir-%03d", rootFSID, dirIndex)
+		rootEntries = append(rootEntries, syntheticDirEntry{
+			ID:   childFSID,
+			Name: fmt.Sprintf("dir-%03d", dirIndex),
+			Mode: 16384,
+		})
+
+		childEntries := make([]syntheticDirEntry, 0, filesPerChild)
+		for fileIndex := 0; fileIndex < filesPerChild; fileIndex++ {
+			childEntries = append(childEntries, syntheticDirEntry{
+				ID:   fmt.Sprintf("%s-file-%03d-%03d", rootFSID, dirIndex, fileIndex),
+				Name: fmt.Sprintf("file-%03d.dat", fileIndex),
+				Mode: 33188,
+				Size: fileSize,
+			})
+		}
+		insertSyntheticDirObjectForTest(t, session, repoID, childFSID, childEntries)
+	}
+
+	insertSyntheticDirObjectForTest(t, session, repoID, rootFSID, rootEntries)
+}
+
+func insertSyntheticDirObjectForTest(t *testing.T, session interface {
+	Query(stmt string, values ...interface{}) *gocql.Query
+}, repoID, fsID string, entries []syntheticDirEntry) {
+	t.Helper()
+
+	entriesJSON, err := json.Marshal(entries)
+	if err != nil {
+		t.Fatalf("failed to marshal synthetic fs object %s: %v", fsID, err)
+	}
+	if err := session.Query(`
+		INSERT INTO fs_objects (library_id, fs_id, obj_type, obj_name, full_path, dir_entries, size_bytes, mtime)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+	`, repoID, fsID, "dir", fsID, "/", string(entriesJSON), int64(0), time.Now().Unix()).Exec(); err != nil {
+		t.Fatalf("failed to insert synthetic fs object %s for %s: %v", fsID, repoID, err)
 	}
 }

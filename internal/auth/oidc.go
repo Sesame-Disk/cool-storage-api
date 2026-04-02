@@ -280,6 +280,10 @@ func (c *OIDCClient) GetAuthorizationURL(ctx context.Context, redirectURI, retur
 
 // ExchangeCode exchanges an authorization code for tokens
 func (c *OIDCClient) ExchangeCode(ctx context.Context, code, state, redirectURI string) (*AuthResult, error) {
+	if !c.isValidRedirectURI(redirectURI) {
+		return nil, fmt.Errorf("invalid redirect URI: %s", redirectURI)
+	}
+
 	// Validate and consume state
 	authState, err := c.consumeState(state)
 	if err != nil {
@@ -1092,10 +1096,11 @@ func (c *OIDCClient) normalizeRoleForOrg(orgID, role string) string {
 // isValidRedirectURI checks if a redirect URI is in the allowed list
 func (c *OIDCClient) isValidRedirectURI(uri string) bool {
 	if len(c.config.RedirectURIs) == 0 {
-		return true // No restrictions
+		return false
 	}
 	for _, allowed := range c.config.RedirectURIs {
-		if uri == allowed {
+		allowed = strings.TrimSpace(allowed)
+		if allowed != "" && uri == allowed {
 			return true
 		}
 	}

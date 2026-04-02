@@ -224,6 +224,52 @@ func TestExtractRequestAuthToken(t *testing.T) {
 	}
 }
 
+func TestBuildCORSConfig(t *testing.T) {
+	t.Run("dev mode allows all origins", func(t *testing.T) {
+		cfg := config.DefaultConfig()
+		cfg.Auth.DevMode = true
+
+		corsConfig := buildCORSConfig(cfg)
+		if !corsConfig.AllowAllOrigins {
+			t.Fatal("expected dev mode to allow all origins")
+		}
+	})
+
+	t.Run("production uses configured allowlist", func(t *testing.T) {
+		cfg := config.DefaultConfig()
+		cfg.Auth.DevMode = false
+		cfg.CORS.AllowedOrigins = []string{" https://app.example.com ", "https://admin.example.com"}
+
+		corsConfig := buildCORSConfig(cfg)
+		if corsConfig.AllowAllOrigins {
+			t.Fatal("expected production allowlist to disable allow-all")
+		}
+		if len(corsConfig.AllowOrigins) != 2 {
+			t.Fatalf("AllowOrigins length = %d, want 2", len(corsConfig.AllowOrigins))
+		}
+		if corsConfig.AllowOrigins[0] != "https://app.example.com" {
+			t.Fatalf("AllowOrigins[0] = %q, want %q", corsConfig.AllowOrigins[0], "https://app.example.com")
+		}
+	})
+
+	t.Run("production without allowlist fails closed", func(t *testing.T) {
+		cfg := config.DefaultConfig()
+		cfg.Auth.DevMode = false
+		cfg.CORS.AllowedOrigins = nil
+
+		corsConfig := buildCORSConfig(cfg)
+		if corsConfig.AllowAllOrigins {
+			t.Fatal("expected production without allowlist to disable allow-all")
+		}
+		if corsConfig.AllowOriginFunc == nil {
+			t.Fatal("expected fail-closed AllowOriginFunc when allowlist is missing")
+		}
+		if corsConfig.AllowOriginFunc("https://attacker.example.com") {
+			t.Fatal("expected missing production allowlist to reject origins")
+		}
+	})
+}
+
 // TestHandleAccountInfo tests the account info endpoint
 func TestHandleAccountInfo(t *testing.T) {
 	t.Skip("Requires database connection - run as integration test")

@@ -497,21 +497,13 @@ sending code exists anywhere in the codebase.
 ### 12. Cursor-Based Pagination
 
 **Current state:**
-- `internal/api/v2/share_links.go:408` — `// In-memory pagination (TODO: migrate to PageState cursor-based pagination)`
-- `internal/api/v2/upload_links.go:191` — same comment
+- Admin and org-admin share/upload link endpoints already support cursor pagination using bucketed read models and opaque `next_cursor` tokens.
+- Legacy `page/per_page` remains for backward compatibility on those endpoints.
+- The main remaining pagination debt is **not** admin links anymore; it is admin library/group lists, which still load projection rows into memory and paginate after sorting in Go.
 
-The current implementation fetches all rows for an org and paginates in memory. For orgs with
-thousands of links, this loads unbounded data into RAM on every page request.
-
-**Fix:** Use gocql's `PageState` for cursor-based pagination:
-```go
-query.PageSize(pageSize)
-query.PageState(decodedCursor)
-iter := query.Iter()
-// ...
-nextCursor := base64.StdEncoding.EncodeToString(iter.PageState())
-```
-Return `next_cursor` in the response. Clients pass `cursor=` on subsequent requests.
+**Remaining work:**
+- Decide whether admin library/group lists should adopt the same bucketed cursor pattern or a simpler capped streaming strategy.
+- Keep offset pagination only where backward compatibility is required and result sets are known to stay small.
 
 ---
 
@@ -545,7 +537,7 @@ the launch on Glacier since it requires AWS Glacier infrastructure setup and tes
 | 9 | Security hardening | **P1** | Partial (Nginx has headers) | 2–3 days |
 | 10 | Backup and disaster recovery | **P1** | Nothing exists | 1 week |
 | 11 | Email / notifications | **P2** | 0% | 1 week |
-| 12 | Cursor-based pagination | **P2** | TODO stubs | 3 days |
+| 12 | Cursor-based pagination | **P2** | Admin links done; library/group admin lists still pending | 2-4 days |
 | 13 | Cold storage / Glacier | **P2** | ~30% | 2–3 weeks |
 
 ---

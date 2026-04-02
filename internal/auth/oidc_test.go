@@ -277,10 +277,10 @@ func TestOIDCClient_ValidateRedirectURI(t *testing.T) {
 			shouldBeValid: false,
 		},
 		{
-			name:          "empty allowed list allows all",
+			name:          "empty allowed list rejects all",
 			allowedURIs:   []string{},
 			testURI:       "http://anything.com/callback",
-			shouldBeValid: true,
+			shouldBeValid: false,
 		},
 		{
 			name:          "case sensitive match",
@@ -355,6 +355,24 @@ func TestOIDCClient_GetAuthorizationURL(t *testing.T) {
 		}
 	})
 
+	t.Run("reject when redirect allowlist is empty", func(t *testing.T) {
+		emptyListClient := &OIDCClient{
+			config: &config.OIDCConfig{
+				Enabled:      true,
+				Issuer:       server.URL,
+				ClientID:     "test-client",
+				RedirectURIs: nil,
+				Scopes:       []string{"openid", "profile", "email"},
+			},
+			states: make(map[string]*AuthState),
+		}
+
+		_, err := emptyListClient.GetAuthorizationURL(context.Background(), "http://localhost:3000/sso", "/")
+		if err == nil {
+			t.Error("GetAuthorizationURL() should reject empty redirect allowlist")
+		}
+	})
+
 	t.Run("generate URL with PKCE", func(t *testing.T) {
 		pkceClient := &OIDCClient{
 			config: &config.OIDCConfig{
@@ -380,6 +398,25 @@ func TestOIDCClient_GetAuthorizationURL(t *testing.T) {
 			t.Error("URL should contain code_challenge_method=S256")
 		}
 	})
+}
+
+func TestOIDCClient_ExchangeCodeRejectsInvalidRedirectURI(t *testing.T) {
+	client := &OIDCClient{
+		config: &config.OIDCConfig{
+			RedirectURIs: []string{"http://localhost:3000/sso"},
+		},
+		states: make(map[string]*AuthState),
+	}
+	client.storeState("test-state", &AuthState{
+		State:       "test-state",
+		RedirectURI: "http://attacker.com/callback",
+		CreatedAt:   time.Now(),
+	})
+
+	_, err := client.ExchangeCode(context.Background(), "code", "test-state", "http://attacker.com/callback")
+	if err == nil {
+		t.Fatal("ExchangeCode() should reject invalid redirect URI")
+	}
 }
 
 // TestOIDCClient_StateManagement tests state storage and consumption

@@ -896,7 +896,22 @@ func (c *Config) Validate() error {
 	if !c.Auth.DevMode && (c.Auth.ShareLinkHMACKey == "" || c.Auth.ShareLinkHMACKey == insecureDefaultHMACKey) {
 		return fmt.Errorf("auth.share_link_hmac_key must be set to a secure secret in production (set SHARE_LINK_HMAC_KEY env var)")
 	}
+	if !c.Auth.DevMode && !hasConfiguredStrings(c.CORS.AllowedOrigins) {
+		return fmt.Errorf("cors.allowed_origins must contain at least one origin in production")
+	}
+	if c.Auth.OIDC.Enabled && !hasConfiguredStrings(c.Auth.OIDC.RedirectURIs) {
+		return fmt.Errorf("auth.oidc.redirect_uris must contain at least one redirect URI when OIDC is enabled")
+	}
 	return nil
+}
+
+func hasConfiguredStrings(values []string) bool {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return true
+		}
+	}
+	return false
 }
 
 // getEnv returns environment variable or default

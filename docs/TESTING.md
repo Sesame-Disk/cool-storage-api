@@ -231,7 +231,7 @@ docker compose --profile test run --rm --build go-integration-test
 
 **Build tag**: `//go:build integration` — these tests are excluded from normal `go test ./...` runs.
 
-**Test Files:**
+**Representative test files:**
 | File | Tests | Description |
 |------|-------|-------------|
 | `integration_test.go` | TestMain | Health check, client setup for 5 roles, graceful skip |
@@ -240,11 +240,15 @@ docker compose --profile test run --rm --build go-integration-test
 | `files_test.go` | 5 | CreateDirectory, FileUpload, FileDownload, Move+Copy, FileDelete |
 | `permissions_test.go` | 4 | ReadonlyCannotWrite, GuestCannotCreate, AdminManageOther, CrossUserIsolation |
 
-**Total: 14 test functions, 19 subtests**
-
 These tests make HTTP requests to the running backend (same model as bash scripts) and exercise the full stack: API handlers → middleware → database → storage. They don't contribute to `go test -cover` numbers since they're in a separate package making external HTTP calls.
 
 **Docker-first default**: `test.sh` prefers the `go-integration-test` compose service, which waits for `sesamefs` and runs against the compose network.
+
+**Integration-test-first rule for backend refactors:**
+- If a change touches dual-write behavior, denormalized projections, counters, sync `HEAD` semantics, cleanup cascades, or cursor pagination boundaries, start with an integration regression before trusting the refactor.
+- Prefer HTTP-level tests in `internal/integration/` and add direct Cassandra assertions when the invariant spans multiple tables.
+- Unit tests remain useful for helper logic, cursor parsing, and pure functions; they are not sufficient by themselves for projection consistency work.
+- When a refactor fixes a cross-table bug, keep the regression test close to the entity area (`*_projection_regression_test.go`, `*_cursor_test.go`, etc.) so future rewrites inherit the coverage.
 
 ### Frontend Tests (`frontend`)
 
@@ -433,9 +437,9 @@ npm test -- --coverage           # With coverage
 | `bootstrap.sh` | Environment setup | — | Docker |
 | `bootstrap-multiregion.sh` | Legacy multi-region setup | — | Docker |
 
-| Go integration tests | `internal/integration/*_test.go` | 14 (19 subtests) | Backend |
+| Go integration tests | `internal/integration/*_test.go` | Backend regression and end-to-end invariants | Backend |
 
-**Important**: When adding a new bash integration test script, always register it in `test.sh` → `run_api_tests()` so it runs as part of the unified suite. For Go integration tests, add to `internal/integration/` with the `//go:build integration` tag.
+**Important**: When adding a new bash integration test script, always register it in `test.sh` → `run_api_tests()` so it runs as part of the unified suite. For Go integration tests, add to `internal/integration/` with the `//go:build integration` tag. For backend refactors that touch canonical/projection consistency, integration coverage is the default entry point, not an optional follow-up.
 
 ---
 

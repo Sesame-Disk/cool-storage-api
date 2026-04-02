@@ -945,7 +945,18 @@ Written/updated/deleted atomically alongside `shares` and projection tables in `
 
 ### 25–32. Admin Read Model Tables
 
-These tables are **denormalized projections** maintained by dual-write. They are never the source of truth — always derive from `libraries`, `groups`, `shares`, `share_links`. All are written atomically in `LoggedBatch` together with their canonical table.
+These tables are **denormalized projections** maintained by dual-write. They are never the source of truth — always derive from `libraries`, `groups`, `shares`, `share_links`.
+
+**Projection contract:**
+- Canonical tables are authoritative. If a projection row disagrees with the canonical row, repair the projection, not the source row.
+- Default pattern: write canonical row plus all affected projections in the same `LoggedBatch`.
+- Cassandra exception: conditional writes cannot span multiple tables. For sync `HEAD` updates, the canonical `libraries` row advances first via CAS, then `libraries_by_id` plus the admin library projection are resynced immediately from canonical state.
+- COUNTER tables are best-effort accelerators, not source of truth. `admin_link_counts_by_org` may be invalidated and rebuilt by recount.
+
+**Current launch caveats:**
+- `size_bytes` / `file_count` for libraries are derived values. They are recomputed asynchronously after sync `HEAD` updates, so admin views can observe brief staleness.
+- Admin library and group list endpoints now avoid earlier table-scan query shapes, but they still materialize full projection result sets and paginate in Go. That is acceptable for initial scale, not for very large cardinality.
+- New projection work should preserve immutable primary keys where possible. Mutable sort fields such as `updated_at` should stay as regular columns unless there is a strong reason to pay the delete+reinsert cost.
 
 **Implementation files:**
 - `internal/db/admin_library_read_models.go`

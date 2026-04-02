@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -175,13 +176,23 @@ func TestDefaultConfig(t *testing.T) {
 
 func TestConfigValidate(t *testing.T) {
 	tests := []struct {
-		name    string
-		modify  func(*Config)
-		wantErr bool
+		name           string
+		modify         func(*Config)
+		wantErr        bool
+		wantErrContain string
 	}{
 		{
 			name:    "valid config",
 			modify:  func(c *Config) {},
+			wantErr: false,
+		},
+		{
+			name: "valid production config",
+			modify: func(c *Config) {
+				c.Auth.DevMode = false
+				c.Auth.ShareLinkHMACKey = "very-secure-test-key"
+				c.CORS.AllowedOrigins = []string{"https://app.example.com"}
+			},
 			wantErr: false,
 		},
 		{
@@ -205,6 +216,25 @@ func TestConfigValidate(t *testing.T) {
 			},
 			wantErr: true,
 		},
+		{
+			name: "production requires cors allowlist",
+			modify: func(c *Config) {
+				c.Auth.DevMode = false
+				c.Auth.ShareLinkHMACKey = "very-secure-test-key"
+				c.CORS.AllowedOrigins = nil
+			},
+			wantErr:        true,
+			wantErrContain: "cors.allowed_origins",
+		},
+		{
+			name: "oidc requires redirect allowlist",
+			modify: func(c *Config) {
+				c.Auth.OIDC.Enabled = true
+				c.Auth.OIDC.RedirectURIs = nil
+			},
+			wantErr:        true,
+			wantErrContain: "auth.oidc.redirect_uris",
+		},
 	}
 
 	for _, tt := range tests {
@@ -215,6 +245,9 @@ func TestConfigValidate(t *testing.T) {
 			err := cfg.Validate()
 			if (err != nil) != tt.wantErr {
 				t.Errorf("Validate() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if tt.wantErrContain != "" && err != nil && !strings.Contains(err.Error(), tt.wantErrContain) {
+				t.Fatalf("Validate() error = %q, want substring %q", err.Error(), tt.wantErrContain)
 			}
 		})
 	}

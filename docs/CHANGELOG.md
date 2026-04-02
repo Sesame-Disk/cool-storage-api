@@ -8,11 +8,29 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-04-02 — Session 61: Sync Stats Guard + Fail-Closed OIDC/CORS Defaults
+
+### Fixed — Stale async library stats overwrite
+
+Sync `HEAD` updates already advanced the canonical `libraries` row first and then resynced derived state. The remaining bug was in async stat recomputation: a slower recalculation for an older commit tree could finish after a newer `HEAD` had already won and overwrite `size_bytes` / `file_count`.
+
+That path now persists stats only when the current canonical `head_commit_id` still matches the commit being recomputed, and then refreshes the admin library projection from canonical state.
+
+- `internal/api/sync.go` — conditional stat persistence keyed by current `head_commit_id`
+- `internal/integration/library_projection_regression_test.go` — regression proving a stale recomputation no longer overwrites the newest `HEAD`
+
+### Hardened — Production auth and browser defaults
+
+- `internal/auth/oidc.go` — empty redirect allowlists now fail closed, and redirect URIs are revalidated during code exchange
+- `internal/api/server.go` — production CORS no longer falls back to allow-all when no allowlist is configured
+- `internal/config/config.go` — production config validation now requires `cors.allowed_origins`, and OIDC validation now requires `auth.oidc.redirect_uris` when OIDC is enabled
+- `internal/auth/oidc_test.go`, `internal/api/server_test.go`, `internal/config/config_test.go` — coverage for the new fail-closed behavior
+
 ## 2026-04-01 — Session 60: Admin Read Model Projections + Share Denormalization + Integrity Fixes
 
 ### Added — Admin Read Model System
 
-Introduced denormalized projection tables for all admin list endpoints, eliminating full-table-scans and N+1 query patterns across libraries, groups, shares, and links.
+Introduced denormalized projection tables for all admin list endpoints, eliminating the earlier full-scan query shapes and N+1 lookup patterns across libraries, groups, shares, and links. Some admin library/group list handlers still materialize projection result sets in memory before pagination, so the read-model refactor is not yet the final scalability pass for those endpoints.
 
 **Library projections** (`internal/db/admin_library_read_models.go`):
 - `libraries_by_owner` — per-owner view, partition `(org_id, owner_id)`, immutable clustering by `library_id`

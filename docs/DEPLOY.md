@@ -365,7 +365,7 @@ Settings that **cannot** be set via env vars and must be in this file:
 - `onlyoffice.server_url` — internal Docker URL for OnlyOffice → sesamefs
 - `onlyoffice.internal_url` — internal Docker URL for sesamefs → OnlyOffice
 - `onlyoffice.view_extensions` / `edit_extensions`
-- `cors.allowed_origins` — set to `["https://files.yourdomain.com"]` for strict CORS
+- `cors.allowed_origins` — required in production. Set it explicitly, for example `["https://files.yourdomain.com"]`. SesameFS now fails closed when the list is empty.
 
 ### All env var overrides
 
@@ -377,7 +377,7 @@ Settings that **cannot** be set via env vars and must be in this file:
 | `OIDC_ISSUER` | `auth.oidc.issuer` | Default in config.prod.yaml |
 | `OIDC_CLIENT_ID` | `auth.oidc.client_id` | Secret |
 | `OIDC_CLIENT_SECRET` | `auth.oidc.client_secret` | Secret |
-| `OIDC_REDIRECT_URIS` | `auth.oidc.redirect_uris` | Computed by compose |
+| `OIDC_REDIRECT_URIS` | `auth.oidc.redirect_uris` | Required when OIDC is enabled. Computed by compose in the standard production setup. |
 | `OIDC_JWT_SIGNING_KEY` | `auth.oidc.jwt_signing_key` | Secret. When set, sessions are signed JWTs instead of opaque tokens. **NEVER change after deploy** — all active sessions are immediately invalidated. Revoked JWTs (logout/user deactivation) are verified against the DB so revocation is effective even in JWT mode. |
 | `OIDC_DEFAULT_ROLE` | `auth.oidc.default_role` | |
 | `OIDC_AUTO_PROVISION` | `auth.oidc.auto_provision` | |
@@ -433,7 +433,14 @@ sesamefs can't reach S3. Check:
    - `https://files.yourdomain.com/sso/`
    - `https://files.yourdomain.com/oauth/callback/`
 2. Check `OIDC_CLIENT_ID` and `OIDC_CLIENT_SECRET` in `.env`
-3. Check sesamefs logs for OIDC errors
+3. Check that `OIDC_REDIRECT_URIS` is not empty and exactly matches the callback URLs you registered. SesameFS now rejects OIDC login in fail-closed mode when no redirect allowlist is configured.
+4. Check sesamefs logs for OIDC errors
+
+### Browser requests fail with CORS errors
+
+1. Check `cors.allowed_origins` in `config.yaml`
+2. In production, make sure the browser origin is listed explicitly, for example `https://files.yourdomain.com`
+3. If the allowlist is empty, SesameFS now fails closed instead of allowing all origins
 
 ### OnlyOffice not loading in documents
 

@@ -597,6 +597,25 @@ Commit `305d8b21` introduced atomic `LoggedBatch` operations and DRY helper func
 | `renameGroup` Phase 1/Phase 2 non-atomic | Low | Phase 1 (groups+groups_by_id) succeeds but Phase 2 (groups_by_member) can partially fail. Inherent to Cassandra denormalization — document as known limitation |
 | `file_count` counter increment (tags.go) | Low | Simple Cassandra counter, can lose increments under network partitions. UI-only impact |
 
+### Read-Model And Sync Hardening (2026-04-02)
+
+Recent refactors moved the backend toward a stable initial Cassandra schema with canonical tables plus denormalized read models. The direction is sound, but a few important caveats remain and should stay visible:
+
+| Issue | Severity | Notes |
+|-------|----------|-------|
+| Sync `HEAD` derived-state update is split-phase | High | `libraries` advances via CAS first, then `libraries_by_id` plus admin projection are resynced immediately afterward. This is an intentional Cassandra limitation, not a fully atomic multi-table transaction. |
+| Async library stats are still eventual | Medium | `size_bytes` / `file_count` are recalculated asynchronously after sync `HEAD` changes, so brief staleness is expected. The stale-overwrite bug was closed by conditioning stat persistence on the current `head_commit_id`, but recomputation still remains asynchronous by design. |
+| Admin library/group lists still paginate in memory | Medium | Read models removed earlier lookup pain, but list handlers still materialize rows and sort/page in Go. Acceptable for initial scale; revisit before large-cardinality admin usage. |
+| Best-effort counters require recount fallback | Medium | `admin_link_counts_by_org` is a cached accelerator, not source of truth. Recount/invalidations are part of the design and must not be removed by future cleanup. |
+| Docs must stay aligned with code, not old roadmap text | Medium | `CHANGELOG`, `CASSANDRA-OPTIMIZATION-GUIDE`, and `V1-PRODUCTION-ROADMAP` drifted once the read-model work landed. Future refactors should update docs in the same change. |
+
+**Required engineering pattern going forward:**
+- Canonical rows remain authoritative.
+- New read models should use immutable primary keys when possible.
+- Use `LoggedBatch` dual-write by default.
+- If a conditional write is needed and Cassandra cannot span tables, CAS the canonical row first, then resync derived rows immediately from canonical state.
+- For refactors touching projections/counters/sync state, write integration regressions first and keep them in `internal/integration/`.
+
 ---
 
 ## 12. Storage & Traffic Quotas — Scalability Debt (2026-03-25)
