@@ -4,15 +4,17 @@ import { seafileAPI } from '../../utils/seafile-api';
 import { Utils } from '../../utils/utils';
 import toaster from '../toast';
 
-const {
-  fileUpdatesEmailInterval,
-  collaborateEmailInterval
-} = window.app.pageOptions;
+function getSettingsPageOptions() {
+  return window.app?.pageOptions || {};
+}
 
 class EmailNotice extends React.Component {
 
   constructor(props) {
     super(props);
+    const pageOptions = getSettingsPageOptions();
+    const fileUpdatesEmailInterval = Number(pageOptions.fileUpdatesEmailInterval) || 0;
+    const collaborateEmailInterval = Number(pageOptions.collaborateEmailInterval) || 0;
 
     // interval: in seconds
     this.fileUpdatesOptions = [

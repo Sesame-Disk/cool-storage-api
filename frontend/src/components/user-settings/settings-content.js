@@ -20,23 +20,26 @@ import DeleteAccount from './delete-account';
 
 import './settings-content.css';
 
-const {
-    canUpdatePassword, passwordOperationText,
-    enableGetAuthToken,
-    enableWebdavSecret,
-    enableAddressBook,
-    twoFactorAuthEnabled,
-    enableWechatWork,
-    enableDingtalk,
-    isOrgContext,
-    enableADFS,
-    enableMultiADFS,
-    enableDeleteAccount
-} = window.app.pageOptions;
+function getSettingsPageOptions() {
+    return window.app?.pageOptions || {};
+}
 
 class SettingsContent extends React.Component {
     constructor(props) {
         super(props);
+        const pageOptions = getSettingsPageOptions();
+        const canUpdatePassword = Boolean(pageOptions.canUpdatePassword);
+        const enableGetAuthToken = Boolean(pageOptions.enableGetAuthToken);
+        const enableWebdavSecret = Boolean(pageOptions.enableWebdavSecret);
+        const enableAddressBook = Boolean(pageOptions.enableAddressBook);
+        const twoFactorAuthEnabled = Boolean(pageOptions.twoFactorAuthEnabled);
+        const enableWechatWork = Boolean(pageOptions.enableWechatWork);
+        const enableDingtalk = Boolean(pageOptions.enableDingtalk);
+        const isOrgContext = Boolean(pageOptions.isOrgContext);
+        const enableADFS = Boolean(pageOptions.enableADFS);
+        const enableMultiADFS = Boolean(pageOptions.enableMultiADFS);
+        const enableDeleteAccount = Boolean(pageOptions.enableDeleteAccount);
+
         this.sideNavItems = [
             { show: true, href: '#user-basic-info', text: gettext('Profile') },
             { show: canUpdatePassword, href: '#update-user-passwd', text: gettext('Password') },
@@ -92,13 +95,27 @@ class SettingsContent extends React.Component {
     };
 
     render() {
+        const pageOptions = getSettingsPageOptions();
+        const canUpdatePassword = Boolean(pageOptions.canUpdatePassword);
+        const passwordOperationText = pageOptions.passwordOperationText || gettext('Change');
+        const enableGetAuthToken = Boolean(pageOptions.enableGetAuthToken);
+        const enableWebdavSecret = Boolean(pageOptions.enableWebdavSecret);
+        const enableAddressBook = Boolean(pageOptions.enableAddressBook);
+        const twoFactorAuthEnabled = Boolean(pageOptions.twoFactorAuthEnabled);
+        const enableWechatWork = Boolean(pageOptions.enableWechatWork);
+        const enableDingtalk = Boolean(pageOptions.enableDingtalk);
+        const isOrgContext = Boolean(pageOptions.isOrgContext);
+        const enableADFS = Boolean(pageOptions.enableADFS);
+        const enableMultiADFS = Boolean(pageOptions.enableMultiADFS);
+        const enableDeleteAccount = Boolean(pageOptions.enableDeleteAccount);
+
         return (
             <div className={`user-settings-layout ${this.props.className}`.trim()}>
                 <div className="user-settings-layout__nav">
                     <SideNav data={this.sideNavItems} curItemID={this.state.curItemID} />
                 </div>
                 <div className="user-settings-layout__main">
-                    <h2 className="user-settings-layout__heading">{gettext('Settings')}</h2>
+                    {this.props.showHeading && <h2 className="user-settings-layout__heading">{gettext('Settings')}</h2>}
                     <div className="user-settings-layout__content position-relative" onScroll={this.handleContentScroll}>
                         <div id="user-basic-info" className="user-settings-layout__section">
                             <h3 className="user-settings-layout__section-heading">{gettext('Profile Setting')}</h3>
@@ -132,10 +149,12 @@ class SettingsContent extends React.Component {
 
 SettingsContent.propTypes = {
     className: PropTypes.string,
+    showHeading: PropTypes.bool,
 };
 
 SettingsContent.defaultProps = {
     className: '',
+    showHeading: true,
 };
 
 export default SettingsContent;

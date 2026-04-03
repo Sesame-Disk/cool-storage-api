@@ -3,9 +3,9 @@ import { gettext, siteRoot } from '../../utils/constants';
 import ModalPortal from '../modal-portal';
 import ConfirmDeleteAccount from '../dialog/confirm-delete-account';
 
-const {
-  csrfToken
-} = window.app.pageOptions;
+function getSettingsPageOptions() {
+  return window.app?.pageOptions || {};
+}
 
 class DeleteAccount extends React.Component {
 
@@ -30,6 +30,8 @@ class DeleteAccount extends React.Component {
   };
 
   render() {
+    const pageOptions = getSettingsPageOptions();
+    const csrfToken = pageOptions.csrfToken || '';
     return (
       <React.Fragment>
         <div className="setting-item" id="del-account">

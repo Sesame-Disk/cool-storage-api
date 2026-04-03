@@ -3,12 +3,9 @@ import { gettext, siteRoot } from '../../utils/constants';
 import ModalPortal from '../modal-portal';
 import ConfirmDisconnectDingtalk from '../dialog/confirm-disconnect-dingtalk';
 
-const {
-  csrfToken,
-  langCode,
-  socialConnectedDingtalk,
-  socialNextPage
-} = window.app.pageOptions;
+function getSettingsPageOptions() {
+  return window.app?.pageOptions || {};
+}
 
 class SocialLoginDintalk extends React.Component {
 
@@ -32,6 +29,11 @@ class SocialLoginDintalk extends React.Component {
   };
 
   render() {
+    const pageOptions = getSettingsPageOptions();
+    const csrfToken = pageOptions.csrfToken || '';
+    const langCode = pageOptions.langCode || 'en';
+    const socialConnectedDingtalk = Boolean(pageOptions.socialConnectedDingtalk);
+    const socialNextPage = pageOptions.socialNextPage || '/';
     return (
       <React.Fragment>
         <div className="setting-item" id="social-auth">

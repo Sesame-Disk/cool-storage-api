@@ -224,12 +224,31 @@ func (s *Server) buildAppBootstrapPageOptions(identity bootstrapIdentity, userDa
 	if name == "" {
 		name = identity.UserID
 	}
+	authenticated := identity.UserID != "" && identity.OrgID != ""
 
 	pageOptions := gin.H{
-		"name":                    "",
-		"username":                email,
-		"contactEmail":            email,
+		"name":                      name,
+		"username":                  email,
+		"contactEmail":              email,
+		"loginID":                   email,
+		"avatarURL":                 "/media/avatars/default.png",
+		"nameLabel":                 "Name:",
+		"enableUpdateUserInfo":      authenticated,
+		"enableUserSetContactEmail": authenticated,
+		"enableUserSetName":         authenticated,
+		"langCode":                  "en",
+		"currentLang": gin.H{
+			"langCode": "en",
+			"langName": "en",
+		},
+		"langList": []gin.H{
+			{
+				"langCode": "en",
+				"langName": "en",
+			},
+		},
 		"userRole":                role,
+		"orgID":                   identity.OrgID,
 		"canAddRepo":              false,
 		"canShareRepo":            false,
 		"canAddGroup":             false,
@@ -258,7 +277,7 @@ func (s *Server) buildAppBootstrapPageOptions(identity bootstrapIdentity, userDa
 		"enableSubscription":      true,
 	}
 
-	if s.db == nil || identity.UserID == "" || identity.OrgID == "" {
+	if s.db == nil || !authenticated {
 		return pageOptions
 	}
 
@@ -296,6 +315,11 @@ func (s *Server) buildAppBootstrapPageOptions(identity bootstrapIdentity, userDa
 	pageOptions["name"] = name
 	pageOptions["username"] = email
 	pageOptions["contactEmail"] = email
+	pageOptions["loginID"] = email
+	pageOptions["avatarURL"] = "/media/avatars/default.png"
+	pageOptions["enableUpdateUserInfo"] = true
+	pageOptions["enableUserSetContactEmail"] = true
+	pageOptions["enableUserSetName"] = true
 	pageOptions["userRole"] = role
 	pageOptions["canAddRepo"] = resolved.Capabilities["can_add_repo"]
 	pageOptions["canShareRepo"] = resolved.Capabilities["can_share_repo"]

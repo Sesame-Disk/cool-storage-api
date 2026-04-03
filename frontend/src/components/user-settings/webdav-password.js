@@ -8,14 +8,17 @@ import SetWebdavPassword from '../dialog/set-webdav-password';
 import ResetWebdavPassword from '../dialog/reset-webdav-password';
 import RemoveWebdavPassword from '../dialog/remove-webdav-password';
 
-const { username, webdavUrl, webdavPasswordSetted } = window.app.pageOptions;
+function getSettingsPageOptions() {
+  return window.app?.pageOptions || {};
+}
 
 class WebdavPassword extends React.Component {
 
   constructor(props) {
     super(props);
+    const pageOptions = getSettingsPageOptions();
     this.state = {
-      isWebdavPasswordSetted: webdavPasswordSetted,
+      isWebdavPasswordSetted: Boolean(pageOptions.webdavPasswordSetted),
       isSetPasserdDialogOpen: false,
       isResetPasserdDialogOpen: false,
       isRemovePasserdDialogOpen: false,
@@ -86,6 +89,9 @@ class WebdavPassword extends React.Component {
   };
 
   render() {
+    const pageOptions = getSettingsPageOptions();
+    const username = pageOptions.username || pageOptions.loginID || '';
+    const webdavUrl = pageOptions.webdavUrl || `${window.location.origin}/seafdav`;
     const { isWebdavPasswordSetted } = this.state;
     return (
       <React.Fragment>

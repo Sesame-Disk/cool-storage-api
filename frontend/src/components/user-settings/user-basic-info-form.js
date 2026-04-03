@@ -2,12 +2,9 @@ import React from 'react';
 import PropTypes from 'prop-types';
 import { gettext } from '../../utils/constants';
 
-const {
-  nameLabel,
-  enableUpdateUserInfo,
-  enableUserSetContactEmail,
-  enableUserSetName
-} = window.app.pageOptions;
+function getSettingsPageOptions() {
+  return window.app?.pageOptions || {};
+}
 
 class UserBasicInfoForm extends React.Component {
 
@@ -39,6 +36,9 @@ class UserBasicInfoForm extends React.Component {
 
   handleSubmit = (e) => {
     e.preventDefault();
+    const pageOptions = getSettingsPageOptions();
+    const enableUserSetName = pageOptions.enableUserSetName !== false;
+    const enableUserSetContactEmail = pageOptions.enableUserSetContactEmail !== false;
     let data = {};
     if (enableUserSetName) {
       data.name = this.state.name;
@@ -50,6 +50,11 @@ class UserBasicInfoForm extends React.Component {
   };
 
   render() {
+    const pageOptions = getSettingsPageOptions();
+    const nameLabel = pageOptions.nameLabel || gettext('Name:');
+    const enableUpdateUserInfo = pageOptions.enableUpdateUserInfo !== false;
+    const enableUserSetContactEmail = pageOptions.enableUserSetContactEmail !== false;
+    const enableUserSetName = pageOptions.enableUserSetName !== false;
     const {
       contactEmail,
       loginID,

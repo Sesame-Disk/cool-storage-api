@@ -1,10 +1,9 @@
 import React from 'react';
 import { gettext, siteRoot } from '../../utils/constants';
 
-const {
-  defaultDevice,
-  backupTokens
-} = window.app.pageOptions;
+function getSettingsPageOptions() {
+  return window.app?.pageOptions || {};
+}
 
 class TwoFactorAuthentication extends React.Component {
 
@@ -13,6 +12,10 @@ class TwoFactorAuthentication extends React.Component {
   }
 
   renderEnabled = () => {
+    const pageOptions = getSettingsPageOptions();
+    const backupTokens = Array.isArray(pageOptions.backupTokens)
+      ? pageOptions.backupTokens.length
+      : (Number(pageOptions.backupTokens) || 0);
     return (
       <React.Fragment>
         <p className="mb-2">{gettext('Status: enabled')}</p>
@@ -40,6 +43,8 @@ class TwoFactorAuthentication extends React.Component {
   };
 
   render() {
+    const pageOptions = getSettingsPageOptions();
+    const defaultDevice = pageOptions.defaultDevice || '';
     return (
       <div className="setting-item" id="two-factor-auth">
         <h3 className="setting-item-heading">{gettext('Two-Factor Authentication')}</h3>

@@ -3,12 +3,9 @@ import { gettext, siteRoot } from '../../utils/constants';
 import ModalPortal from '../modal-portal';
 import ConfirmDisconnectWechat from '../dialog/confirm-disconnect-wechat';
 
-const {
-  csrfToken,
-  langCode,
-  socialConnected,
-  socialNextPage
-} = window.app.pageOptions;
+function getSettingsPageOptions() {
+  return window.app?.pageOptions || {};
+}
 
 class SocialLogin extends React.Component {
 
@@ -32,6 +29,11 @@ class SocialLogin extends React.Component {
   };
 
   render() {
+    const pageOptions = getSettingsPageOptions();
+    const csrfToken = pageOptions.csrfToken || '';
+    const langCode = pageOptions.langCode || 'en';
+    const socialConnected = Boolean(pageOptions.socialConnected);
+    const socialNextPage = pageOptions.socialNextPage || '/';
     return (
       <React.Fragment>
         <div className="setting-item" id="social-auth">

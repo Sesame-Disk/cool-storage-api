@@ -4,14 +4,17 @@ import { seafileAPI } from '../../utils/seafile-api';
 import toaster from '../toast';
 import { Utils } from '../../utils/utils';
 
-const { avatarURL, csrfToken } = window.app.pageOptions;
+function getSettingsPageOptions() {
+  return window.app?.pageOptions || {};
+}
 
 class UserAvatarForm extends React.Component {
 
   constructor(props) {
     super(props);
+    const pageOptions = getSettingsPageOptions();
     this.state = {
-      avatarSrc: avatarURL,
+      avatarSrc: pageOptions.avatarURL || '/static/img/default-avatar.png',
       isEditShown: false
     };
     this.fileInput = React.createRef();
@@ -87,6 +90,8 @@ class UserAvatarForm extends React.Component {
   };
 
   render() {
+    const pageOptions = getSettingsPageOptions();
+    const csrfToken = pageOptions.csrfToken || '';
     return (
       <form ref={this.form} className="form-group row" encType="multipart/form-data" method="post" action={`${siteRoot}avatar/add/`}>
         <input type="hidden" name="csrfmiddlewaretoken" value={csrfToken} />

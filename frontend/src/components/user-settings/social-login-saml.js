@@ -3,15 +3,9 @@ import { Button } from 'reactstrap';
 import { gettext, siteRoot } from '../../utils/constants';
 import ModalPortal from '../modal-portal';
 
-const {
-  csrfToken,
-  isOrgContext,
-  orgID,
-  samlConnected,
-  enableMultiADFS,
-  orgSamlConnected,
-  socialNextPage
-} = window.app.pageOptions;
+function getSettingsPageOptions() {
+  return window.app?.pageOptions || {};
+}
 
 class SocialLoginSAML extends React.Component {
 
@@ -40,6 +34,14 @@ class SocialLoginSAML extends React.Component {
   };
 
   render() {
+    const pageOptions = getSettingsPageOptions();
+    const csrfToken = pageOptions.csrfToken || '';
+    const isOrgContext = Boolean(pageOptions.isOrgContext);
+    const orgID = pageOptions.orgID || '';
+    const samlConnected = Boolean(pageOptions.samlConnected);
+    const enableMultiADFS = Boolean(pageOptions.enableMultiADFS);
+    const orgSamlConnected = Boolean(pageOptions.orgSamlConnected);
+    const socialNextPage = pageOptions.socialNextPage || '/';
     let connectUrl = (enableMultiADFS && isOrgContext) ? `${siteRoot}org/custom/${orgID}/saml2/connect/?next=${encodeURIComponent(socialNextPage)}` : `${siteRoot}saml2/connect/?next=${encodeURIComponent(socialNextPage)}`;
     let disconnectUrl = (orgSamlConnected && isOrgContext) ? `${siteRoot}org/custom/${orgID}/saml2/disconnect/?next=${encodeURIComponent(socialNextPage)}` : `${siteRoot}saml2/disconnect/?next=${encodeURIComponent(socialNextPage)}`;
 
@@ -56,27 +58,27 @@ class SocialLoginSAML extends React.Component {
         {this.state.isConfirmDialogOpen && (
           <ModalPortal>
             <div className="modal show d-block" tabIndex="-1" style={{ backgroundColor: 'rgba(0,0,0,0.5)' }}>
-          <div className="modal-dialog modal-dialog-centered">
-            <div className="modal-content">
-              <div className="modal-header">
-              <h5 className="modal-title">{gettext('Disconnect')}</h5>
-              <button type="button" className="close" onClick={this.toggleDialog} aria-label="Close">
-                <span aria-hidden="true">&times;</span>
-              </button>
-            </div>
-              <div className="modal-body">
-                <p>{gettext('Are you sure you want to disconnect?')}</p>
-                <form ref={this.form} className="d-none" method="post" action={disconnectUrl}>
-                  <input type="hidden" name="csrfmiddlewaretoken" value={csrfToken} />
-                </form>
+              <div className="modal-dialog modal-dialog-centered">
+                <div className="modal-content">
+                  <div className="modal-header">
+                    <h5 className="modal-title">{gettext('Disconnect')}</h5>
+                    <button type="button" className="close" onClick={this.toggleDialog} aria-label="Close">
+                      <span aria-hidden="true">&times;</span>
+                    </button>
+                  </div>
+                  <div className="modal-body">
+                    <p>{gettext('Are you sure you want to disconnect?')}</p>
+                    <form ref={this.form} className="d-none" method="post" action={disconnectUrl}>
+                      <input type="hidden" name="csrfmiddlewaretoken" value={csrfToken} />
+                    </form>
+                  </div>
+                  <div className="modal-footer">
+                    <Button color="secondary" onClick={this.toggleDialog}>{gettext('Cancel')}</Button>
+                    <Button color="primary" onClick={this.disconnect}>{gettext('Disconnect')}</Button>
+                  </div>
+                </div>
               </div>
-              <div className="modal-footer">
-                <Button color="secondary" onClick={this.toggleDialog}>{gettext('Cancel')}</Button>
-                <Button color="primary" onClick={this.disconnect}>{gettext('Disconnect')}</Button>
-              </div>
             </div>
-          </div>
-        </div>
           </ModalPortal>
         )}
       </React.Fragment>
