@@ -1,9 +1,16 @@
 import React from 'react';
-import { gettext, siteRoot } from '../utils/constants';
+
+function getGettext() {
+  return typeof window.gettext === 'function' ? window.gettext : (message) => message;
+}
+
+function getSiteRoot() {
+  const siteRoot = window.app?.config?.siteRoot || '/';
+  return siteRoot.endsWith('/') ? siteRoot : `${siteRoot}/`;
+}
 
 function buildPublicLinkPasswordCheckUrl(token) {
-  const normalizedSiteRoot = siteRoot.endsWith('/') ? siteRoot : `${siteRoot}/`;
-  return `${normalizedSiteRoot}api/v2.1/public-links/${encodeURIComponent(token)}/check-password`;
+  return `${getSiteRoot()}api/v2.1/public-links/${encodeURIComponent(token)}/check-password`;
 }
 
 class SharedLinkPasswordDialog extends React.Component {
@@ -23,6 +30,7 @@ class SharedLinkPasswordDialog extends React.Component {
 
   handleSubmit = (e) => {
     e.preventDefault();
+    const gettext = getGettext();
     const { password } = this.state;
     const { token } = this.props;
 
@@ -57,6 +65,7 @@ class SharedLinkPasswordDialog extends React.Component {
   };
 
   render() {
+    const gettext = getGettext();
     const { password, error, isSubmitting } = this.state;
 
     return (

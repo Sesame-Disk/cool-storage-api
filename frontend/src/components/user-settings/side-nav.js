@@ -3,9 +3,11 @@ import PropTypes from 'prop-types';
 
 class SideNav extends React.Component {
   render() {
+    const items = Array.isArray(this.props.data) ? this.props.data : [];
+
     return (
       <ul className="nav flex-column user-setting-nav">
-        {this.props.data.map((item, index) => {
+        {items.map((item, index) => {
           return item.show ?
             <li key={index} className={`nav-item${this.props.curItemID === item.href.substr(1) ? ' active' : ''}`}><a className="nav-link" href={item.href}>{item.text}</a></li> : null;
         })}
@@ -16,7 +18,11 @@ class SideNav extends React.Component {
 
 SideNav.propTypes = {
   curItemID: PropTypes.string.isRequired,
-  data: PropTypes.array.isRequired,
+  data: PropTypes.array,
+};
+
+SideNav.defaultProps = {
+  data: [],
 };
 
 export default SideNav;

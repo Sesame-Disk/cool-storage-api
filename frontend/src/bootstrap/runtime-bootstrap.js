@@ -26,10 +26,20 @@ function getDefaultAppConfig() {
     };
 }
 
+function getDefaultLanguageOption(langCode = 'en') {
+    return {
+        langCode,
+        langName: langCode,
+    };
+}
+
 const APP_PAGE_OPTION_DEFAULTS = {
     name: '',
     username: '',
     contactEmail: '',
+    langCode: 'en',
+    currentLang: getDefaultLanguageOption(),
+    langList: [],
     canAddRepo: false,
     canShareRepo: false,
     canAddGroup: false,
@@ -60,6 +70,11 @@ const APP_PAGE_OPTION_DEFAULTS = {
     canPublishRepo: false,
     canInvitePeople: false,
     canLockUnlockFile: false,
+    canUpdatePassword: false,
+    passwordOperationText: 'Change',
+    enableGetAuthToken: false,
+    enableWebdavSecret: false,
+    enableAddressBook: false,
     showLogoutIcon: true,
     shareLinkForceUsePassword: false,
     shareLinkPasswordMinLength: 8,
@@ -99,6 +114,20 @@ const APP_PAGE_OPTION_DEFAULTS = {
     curNoteMsg: '',
     curNoteID: '',
     guideEnabled: false,
+    fileUpdatesEmailInterval: 0,
+    collaborateEmailInterval: 0,
+    enableWechatWork: false,
+    enableDingtalk: false,
+    isOrgContext: false,
+    enableADFS: false,
+    enableDeleteAccount: false,
+    csrfToken: '',
+    orgID: '',
+    samlConnected: false,
+    orgSamlConnected: false,
+    socialNextPage: '/',
+    defaultDevice: '',
+    backupTokens: [],
 };
 
 const ORG_APP_PAGE_OPTION_OVERRIDES = {

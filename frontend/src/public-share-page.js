@@ -4,7 +4,6 @@ import ReactDom from 'react-dom';
 import 'bootstrap/dist/css/bootstrap.min.css';
 
 import SharedLinkPasswordDialog from './components/shared-link-password-dialog';
-import { Utils } from './utils/utils';
 import {
     buildShareBootstrapUrl,
     ensureAppGlobals,
@@ -38,6 +37,28 @@ function renderLoading() {
       <div class="loading-spinner"></div>
       <span>Loading share link...</span>
     </div>`;
+}
+
+function bytesToSize(bytes) {
+    if (typeof bytes === 'undefined') {
+        return ' ';
+    }
+
+    if (bytes < 0) {
+        return '--';
+    }
+
+    const sizes = ['bytes', 'KB', 'MB', 'GB', 'TB', 'PB'];
+    if (bytes === 0) {
+        return `${bytes} ${sizes[0]}`;
+    }
+
+    const index = parseInt(Math.floor(Math.log(bytes) / Math.log(1000)), 10);
+    if (index === 0) {
+        return `${bytes} ${sizes[index]}`;
+    }
+
+    return `${(bytes / (1000 ** index)).toFixed(1)} ${sizes[index]}`;
 }
 
 function mapErrorTitle(status, message) {
@@ -114,7 +135,7 @@ function OnlyOfficeSharePreview({ pageOptions }) {
                     </div>
                 </div>
                 <div className="page-header-right">
-                    {canDownload && <a href={downloadPath} className="btn-download">Download ({Utils.bytesToSize(fileSize)})</a>}
+                    {canDownload && <a href={downloadPath} className="btn-download">Download ({bytesToSize(fileSize)})</a>}
                 </div>
             </div>
             <div className="preview-container" id="oo-preview-container" ref={editorRef}>

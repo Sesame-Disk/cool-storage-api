@@ -2,10 +2,6 @@ import React from 'react';
 import { gettext, siteRoot } from '../../utils/constants';
 import { SeahubSelect } from '../common/select';
 
-const {
-  currentLang, langList
-} = window.app.pageOptions;
-
 class LanguageSetting extends React.Component {
 
   onSelectChange = (selectedItem) => {
@@ -14,6 +10,11 @@ class LanguageSetting extends React.Component {
   };
 
   render() {
+    const pageOptions = window.app?.pageOptions || {};
+    const currentLang = pageOptions.currentLang || { langCode: pageOptions.langCode || 'en', langName: pageOptions.langCode || 'en' };
+    const langList = Array.isArray(pageOptions.langList) && pageOptions.langList.length > 0
+      ? pageOptions.langList
+      : [currentLang];
     const options = langList.map((item, index) => {
       return {
         value: item.langCode,
