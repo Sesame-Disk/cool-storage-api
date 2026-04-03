@@ -1,7 +1,7 @@
 import React, { Component, Fragment } from 'react';
 import PropTypes from 'prop-types';
 import { seafileAPI } from '../../utils/seafile-api';
-import { gettext } from '../../utils/constants';
+import { gettext, orgID, orgName } from '../../utils/constants';
 import { Utils } from '../../utils/utils';
 import Loading from '../../components/loading';
 import OrgAdminUserNav from '../../components/org-admin-user-nav';
@@ -23,7 +23,6 @@ class OrgUserProfile extends Component {
   }
 
   componentDidMount() {
-    const { orgID } = window.org.pageOptions;
     const email = decodeURIComponent(this.props.email);
     seafileAPI.orgAdminGetOrgUserInfo(orgID, email).then((res) => {
       this.setState(Object.assign({
@@ -105,7 +104,6 @@ class Content extends Component {
   };
 
   render() {
-    const { orgID, orgName } = window.org.pageOptions;
     const {
       loading, errorMsg,
       avatar_url, email, contact_email,

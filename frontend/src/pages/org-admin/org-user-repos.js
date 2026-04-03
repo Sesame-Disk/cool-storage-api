@@ -2,7 +2,7 @@ import React, { Component, Fragment } from 'react';
 import PropTypes from 'prop-types';
 import moment from 'moment';
 import { seafileAPI } from '../../utils/seafile-api';
-import { gettext } from '../../utils/constants';
+import { gettext, orgID } from '../../utils/constants';
 import { Utils } from '../../utils/utils';
 import Loading from '../../components/loading';
 import toaster from '../../components/toast';
@@ -23,7 +23,6 @@ class OrgUserOwnedRepos extends Component {
   }
 
   componentDidMount() {
-    const { orgID } = window.org.pageOptions;
     const email = decodeURIComponent(this.props.email);
     seafileAPI.orgAdminGetOrgUserOwnedRepos(orgID, email).then((res) => {
       this.setState(Object.assign({
@@ -132,7 +131,6 @@ class Item extends Component {
   };
 
   deleteRepo = () => {
-    const { orgID } = window.org.pageOptions;
     const repo = this.props.data;
     seafileAPI.orgAdminDeleteOrgRepo(orgID, repo.repo_id).then((res) => {
       this.setState({

@@ -2,7 +2,7 @@ import React, { Component, Fragment } from 'react';
 import PropTypes from 'prop-types';
 import { Link } from '@gatsbyjs/reach-router';
 import { seafileAPI } from '../../utils/seafile-api';
-import { gettext, siteRoot } from '../../utils/constants';
+import { gettext, orgID, siteRoot } from '../../utils/constants';
 import { Utils } from '../../utils/utils';
 import Loading from '../../components/loading';
 import OrgAdminGroupNav from '../../components/org-admin-group-nav';
@@ -21,7 +21,6 @@ class OrgGroupInfo extends Component {
   }
 
   componentDidMount() {
-    const { orgID } = window.org.pageOptions;
     seafileAPI.orgAdminGetGroup(orgID, this.props.groupID).then((res) => {
       this.setState(Object.assign({
         loading: false
@@ -37,7 +36,7 @@ class OrgGroupInfo extends Component {
   render() {
     return (
       <Fragment>
-        <MainPanelTopbar/>
+        <MainPanelTopbar />
         <div className="main-panel-center flex-row">
           <div className="cur-view-container">
             <OrgAdminGroupNav groupID={this.props.groupID} currentItem='info' />

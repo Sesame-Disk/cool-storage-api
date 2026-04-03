@@ -2,7 +2,7 @@ import React, { Component, Fragment } from 'react';
 import PropTypes from 'prop-types';
 import moment from 'moment';
 import { seafileAPI } from '../../utils/seafile-api';
-import { gettext } from '../../utils/constants';
+import { gettext, orgID } from '../../utils/constants';
 import { Utils } from '../../utils/utils';
 import Loading from '../../components/loading';
 import OrgAdminUserNav from '../../components/org-admin-user-nav';
@@ -21,7 +21,6 @@ class OrgUserSharedRepos extends Component {
   }
 
   componentDidMount() {
-    const { orgID } = window.org.pageOptions;
     const email = decodeURIComponent(this.props.email);
     seafileAPI.orgAdminGetOrgUserBesharedRepos(orgID, email).then((res) => {
       this.setState(Object.assign({

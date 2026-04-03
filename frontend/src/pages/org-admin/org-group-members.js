@@ -2,7 +2,7 @@ import React, { Component, Fragment } from 'react';
 import PropTypes from 'prop-types';
 import { Link } from '@gatsbyjs/reach-router';
 import { seafileAPI } from '../../utils/seafile-api';
-import { gettext, siteRoot } from '../../utils/constants';
+import { gettext, orgID, siteRoot } from '../../utils/constants';
 import { Utils } from '../../utils/utils';
 import Loading from '../../components/loading';
 import toaster from '../../components/toast';
@@ -25,7 +25,6 @@ class OrgGroupMembers extends Component {
   }
 
   componentDidMount() {
-    const { orgID } = window.org.pageOptions;
     seafileAPI.orgAdminListGroupMembers(orgID, this.props.groupID).then((res) => {
       this.setState({
         loading: false,
@@ -40,7 +39,6 @@ class OrgGroupMembers extends Component {
   }
 
   updateMemberRole = (email, role) => {
-    const { orgID } = window.org.pageOptions;
     const isAdmin = role === 'Admin';
     seafileAPI.orgAdminSetGroupMemberRole(orgID, this.props.groupID, email, isAdmin).then(() => {
       const members = this.state.members.map(m => {
@@ -63,7 +61,7 @@ class OrgGroupMembers extends Component {
     const { loading, errorMsg, members, isItemFreezed } = this.state;
     return (
       <Fragment>
-        <MainPanelTopbar/>
+        <MainPanelTopbar />
         <div className="main-panel-center flex-row">
           <div className="cur-view-container">
             <OrgAdminGroupNav groupID={this.props.groupID} currentItem='members' />

@@ -59,7 +59,7 @@ API Response → Dirent Model → React State → Component Render
 
 1. **Removed Django Integration** - No server-side rendering, no CSRF tokens
 2. **Token-Based Auth Only** - Uses `Authorization: Token xyz` header
-3. **Runtime Bootstrap** - The SPA/admin shells are static HTML containers; `src/bootstrap/runtime-bootstrap.js` initializes `window.app`, merges optional `window.SESAMEFS_CONFIG`, and hydrates page options from `/api/v2.1/bootstrap/`
+3. **Runtime Bootstrap** - The SPA/admin shells are static HTML containers; `src/bootstrap/runtime-bootstrap.js` initializes `window.app`, merges optional `window.SESAMEFS_CONFIG`, and hydrates page options from `/api/v2.1/bootstrap/`. Public share/upload shells follow the same pattern through `src/bootstrap/share-runtime-bootstrap.js`.
 4. **Login Page** - Custom login component instead of Django views
 
 ---

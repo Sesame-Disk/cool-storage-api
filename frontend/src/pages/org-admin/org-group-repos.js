@@ -2,7 +2,7 @@ import React, { Component, Fragment } from 'react';
 import PropTypes from 'prop-types';
 import { Link } from '@gatsbyjs/reach-router';
 import { seafileAPI } from '../../utils/seafile-api';
-import { gettext, siteRoot } from '../../utils/constants';
+import { gettext, orgID, siteRoot } from '../../utils/constants';
 import { Utils } from '../../utils/utils';
 import Loading from '../../components/loading';
 import toaster from '../../components/toast';
@@ -23,7 +23,6 @@ class OrgGroupRepos extends Component {
   }
 
   componentDidMount() {
-    const { orgID } = window.org.pageOptions;
     seafileAPI.orgAdminListGroupRepos(orgID, this.props.groupID).then((res) => {
       this.setState(Object.assign({
         loading: false
@@ -39,7 +38,7 @@ class OrgGroupRepos extends Component {
   render() {
     return (
       <Fragment>
-        <MainPanelTopbar/>
+        <MainPanelTopbar />
         <div className="main-panel-center flex-row">
           <div className="cur-view-container">
             <OrgAdminGroupNav groupID={this.props.groupID} currentItem='repos' />
@@ -136,7 +135,6 @@ class Item extends Component {
   };
 
   deleteRepo = () => {
-    const { orgID } = window.org.pageOptions;
     const repo = this.props.data;
     seafileAPI.orgAdminDeleteOrgRepo(orgID, repo.repo_id).then((res) => {
       this.setState({
@@ -149,7 +147,7 @@ class Item extends Component {
       const errorMsg = Utils.getErrorMsg(error);
       toaster.danger(errorMsg);
 
-      this.setState({isRepoDeleted: false});
+      this.setState({ isRepoDeleted: false });
     });
   };
 

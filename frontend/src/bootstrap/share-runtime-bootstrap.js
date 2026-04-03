@@ -7,13 +7,56 @@ function escapeHtml(value) {
     .replace(/'/g, '&#39;');
 }
 
-export function ensureAppGlobals() {
-  window.app = window.app || {};
-  window.app.config = {
+function getDefaultShareAppConfig() {
+  return {
     serviceURL: '',
+    mediaUrl: '/static/',
     siteRoot: '/',
     staticUrl: '/static/',
+    logoPath: 'img/logo.png',
+    logoWidth: 128,
+    logoHeight: 40,
+    siteTitle: 'SesameFS',
+    fileServerRoot: '/seafhttp/',
+    useGoFileserver: true,
+    lang: 'en',
+  };
+}
+
+export function ensureAppGlobals() {
+  if (typeof window.gettext !== 'function') {
+    window.gettext = (message) => message;
+  }
+
+  if (typeof window.ngettext !== 'function') {
+    window.ngettext = (singular, plural, count) => (count === 1 ? singular : plural);
+  }
+
+  if (typeof window.pgettext !== 'function') {
+    window.pgettext = (_context, message) => message;
+  }
+
+  if (typeof window.interpolate !== 'function') {
+    window.interpolate = (format, values, named) => {
+      if (named) {
+        return format.replace(/%\((\w+)\)s/g, (match, key) => (values?.[key] !== undefined ? values[key] : match));
+      }
+      const queue = Array.isArray(values) ? [...values] : [];
+      return format.replace(/%s/g, () => (queue.length > 0 ? queue.shift() : '%s'));
+    };
+  }
+
+  window.app = window.app || {};
+  window.app.config = {
+    ...getDefaultShareAppConfig(),
     ...(window.app.config || {}),
+    ...(typeof window.SESAMEFS_CONFIG === 'object' ? window.SESAMEFS_CONFIG : {}),
+  };
+  window.app.pageOptions = {
+    name: '',
+    username: '',
+    contactEmail: '',
+    ...(window.app.pageOptions || {}),
   };
   window.shared = window.shared || {};
   window.shared.pageOptions = window.shared.pageOptions || {};
