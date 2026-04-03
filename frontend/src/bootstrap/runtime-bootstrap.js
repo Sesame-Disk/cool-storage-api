@@ -40,7 +40,7 @@ function getDefaultBackendRoutes() {
         twoFactorSetup: 'profile/two_factor_authentication/setup/',
         twoFactorDisable: 'profile/two_factor_authentication/disable/',
         twoFactorBackupTokens: 'profile/two_factor_authentication/backup/tokens/',
-        deleteAccount: 'profile/delete/',
+        deleteAccount: 'accounts/delete/',
         wechatWorkConnect: 'work-weixin/oauth-connect/?next={next}',
         wechatWorkDisconnect: 'work-weixin/oauth-disconnect/?next={next}',
         dingtalkConnect: 'dingtalk/connect/?next={next}',

@@ -125,6 +125,13 @@ billing:
   # In local Docker compose, BILLING_URL defaults to the Sesame test portal.
   url: ""                           # Override with BILLING_URL env var
 
+accounts:
+  # External Accounts URLs used by SesameFS internal redirect routes.
+  # Frontend links stay inside SesameFS at /accounts/password/change/ and /accounts/delete/;
+  # the backend validates auth and redirects to these external destinations.
+  password_change_url: ""           # Override with ACCOUNTS_PASSWORD_CHANGE_URL env var
+  delete_account_url: ""            # Override with ACCOUNTS_DELETE_ACCOUNT_URL env var
+
 organizations:
   # New organizations, OIDC auto-provisioned orgs, and the seeded default org
   # all inherit from this template. Adjust these values here instead of editing code.

@@ -151,6 +151,12 @@ billing:
   # Docker/local testing billing portal. Frontend opens /billing/ and the backend redirects here.
   url: "https://t-accounts.sesamedisk.com/billing/"
 
+accounts:
+  # Docker/local testing Accounts portal. Frontend opens the internal SesameFS routes,
+  # and the backend redirects authenticated users to these external destinations.
+  password_change_url: "https://t-accounts.sesamedisk.com/accounts/password/change/"
+  delete_account_url: "https://t-accounts.sesamedisk.com/accounts/delete/"
+
 organizations:
   default_template: free
   templates:

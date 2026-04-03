@@ -16,6 +16,7 @@ type Config struct {
 	Database            DatabaseConfig                `yaml:"database"`
 	Storage             StorageConfig                 `yaml:"storage"`
 	Billing             BillingConfig                 `yaml:"billing"`
+	Accounts            AccountsConfig                `yaml:"accounts"`
 	Organizations       OrganizationsConfig           `yaml:"organizations"`
 	Auth                AuthConfig                    `yaml:"auth"`
 	Chunking            ChunkingConfig                `yaml:"chunking"`
@@ -142,6 +143,12 @@ type MonitoringConfig struct {
 // BillingConfig holds external billing portal integration settings.
 type BillingConfig struct {
 	URL string `yaml:"url"`
+}
+
+// AccountsConfig holds external account-management integration settings.
+type AccountsConfig struct {
+	PasswordChangeURL string `yaml:"password_change_url"`
+	DeleteAccountURL  string `yaml:"delete_account_url"`
 }
 
 // OrganizationsConfig holds reusable organization plan/template defaults.
@@ -563,7 +570,8 @@ func DefaultConfig() *Config {
 				},
 			},
 		},
-		Billing: BillingConfig{},
+		Billing:  BillingConfig{},
+		Accounts: AccountsConfig{},
 		Organizations: OrganizationsConfig{
 			DefaultTemplate: "free",
 			Templates: map[string]OrganizationTemplate{
@@ -717,6 +725,12 @@ func (c *Config) applyEnvOverrides() {
 	// Billing
 	if v := os.Getenv("BILLING_URL"); v != "" {
 		c.Billing.URL = v
+	}
+	if v := os.Getenv("ACCOUNTS_PASSWORD_CHANGE_URL"); v != "" {
+		c.Accounts.PasswordChangeURL = v
+	}
+	if v := os.Getenv("ACCOUNTS_DELETE_ACCOUNT_URL"); v != "" {
+		c.Accounts.DeleteAccountURL = v
 	}
 
 	// Auth

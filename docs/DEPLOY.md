@@ -188,6 +188,10 @@ SHARE_LINK_HMAC_KEY=<from step 0.3 — third openssl output>
 # External billing portal used by /billing/
 BILLING_URL=https://accounts.yourdomain.com/billing/
 
+# External Accounts URLs used by /accounts/password/change/ and /accounts/delete/
+ACCOUNTS_PASSWORD_CHANGE_URL=https://accounts.yourdomain.com/accounts/password/change/
+ACCOUNTS_DELETE_ACCOUNT_URL=https://accounts.yourdomain.com/accounts/delete/
+
 # OnlyOffice
 ONLYOFFICE_JWT_SECRET=<from step 0.3 — second openssl output>
 ```
@@ -197,6 +201,8 @@ ONLYOFFICE_JWT_SECRET=<from step 0.3 — second openssl output>
 > `${OFFICE_DOMAIN}`. You don't need to set those manually.
 
 > `BILLING_URL` is different: it is the external billing portal destination. Users click SesameFS `/billing/`, and the backend redirects authenticated sessions to this external URL in a new tab.
+
+> `ACCOUNTS_PASSWORD_CHANGE_URL` and `ACCOUNTS_DELETE_ACCOUNT_URL` work the same way for `/accounts/password/change/` and `/accounts/delete/`.
 
 ---
 

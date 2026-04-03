@@ -38,6 +38,28 @@ func createTestServer() *Server {
 	}
 }
 
+func TestExternalRedirectTarget(t *testing.T) {
+	target, err := externalRedirectTarget("https://accounts.example.com/accounts/password/change/?source=accounts", "next=%2Fprofile%2F")
+	if err != nil {
+		t.Fatalf("externalRedirectTarget returned error: %v", err)
+	}
+
+	parsed, err := url.Parse(target)
+	if err != nil {
+		t.Fatalf("url.Parse returned error: %v", err)
+	}
+	if parsed.Scheme != "https" || parsed.Host != "accounts.example.com" {
+		t.Fatalf("redirect target = %s, want https://accounts.example.com", target)
+	}
+	values := parsed.Query()
+	if values.Get("source") != "accounts" {
+		t.Fatalf("source query = %q, want %q", values.Get("source"), "accounts")
+	}
+	if values.Get("next") != "/profile/" {
+		t.Fatalf("next query = %q, want %q", values.Get("next"), "/profile/")
+	}
+}
+
 // TestHandlePing tests the ping endpoint
 func TestHandlePing(t *testing.T) {
 	s := createTestServer()

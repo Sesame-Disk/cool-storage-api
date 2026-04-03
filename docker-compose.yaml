@@ -9,6 +9,8 @@ services:
       - PORT=${PORT:-8080}
       - SERVER_URL=${SERVER_URL}
       - BILLING_URL=${BILLING_URL:-https://t-accounts.sesamedisk.com/billing/}
+      - ACCOUNTS_PASSWORD_CHANGE_URL=${ACCOUNTS_PASSWORD_CHANGE_URL:-https://t-accounts.sesamedisk.com/accounts/password/change/}
+      - ACCOUNTS_DELETE_ACCOUNT_URL=${ACCOUNTS_DELETE_ACCOUNT_URL:-https://t-accounts.sesamedisk.com/accounts/delete/}
       - CASSANDRA_HOSTS=${CASSANDRA_HOSTS:-cassandra:9042}
       - CASSANDRA_KEYSPACE=${CASSANDRA_KEYSPACE:-sesamefs}
       - CASSANDRA_LOCAL_DC=${CASSANDRA_LOCAL_DC:-datacenter1}

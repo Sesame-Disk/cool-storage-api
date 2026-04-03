@@ -102,6 +102,15 @@ billing:
   url: ""                      # Required in production via BILLING_URL
 
 # =============================================================================
+# Accounts Redirects
+# Frontend links to /accounts/password/change/ and /accounts/delete/ inside SesameFS;
+# the backend redirects authenticated users to the external Accounts service.
+# =============================================================================
+accounts:
+  password_change_url: ""      # Required in production via ACCOUNTS_PASSWORD_CHANGE_URL
+  delete_account_url: ""       # Required in production via ACCOUNTS_DELETE_ACCOUNT_URL
+
+# =============================================================================
 # Organization plan/template defaults
 # Any future free-tier adjustment should happen here, not in code.
 # Used by superadmin org creation, OIDC auto-provisioning, and initial default org seed.

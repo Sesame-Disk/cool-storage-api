@@ -322,6 +322,10 @@ class App extends Component {
 
   render() {
     let { currentTab, isSidePanelClosed, isCheckingAuth, isLoggedIn, isSSOCallback } = this.state;
+    const normalizedPath = window.location.pathname.replace(/\/+$/, '') || '/';
+    const normalizedSiteRoot = siteRoot === '/' ? '' : siteRoot.replace(/\/+$/, '');
+    const settingsRoutePath = `${normalizedSiteRoot}/profile`;
+    const isStandaloneSettingsRoute = normalizedPath === settingsRoutePath;
 
     // Show loading while checking auth
     if (isCheckingAuth) {
@@ -353,7 +357,9 @@ class App extends Component {
         <SystemNotification />
         <QuotaBanner />
         <div id="main">
-          <SidePanel isSidePanelClosed={this.state.isSidePanelClosed} onCloseSidePanel={this.onCloseSidePanel} currentTab={currentTab} tabItemClick={this.tabItemClick} />
+          {!isStandaloneSettingsRoute && (
+            <SidePanel isSidePanelClosed={this.state.isSidePanelClosed} onCloseSidePanel={this.onCloseSidePanel} currentTab={currentTab} tabItemClick={this.tabItemClick} />
+          )}
           <MainPanel>
             <Router className="reach-router">
               {home}
@@ -391,9 +397,11 @@ class App extends Component {
               <InvitationsView path={siteRoot + 'invitations/'} onShowSidePanel={this.onShowSidePanel} onSearchedClick={this.onSearchedClick} />
             </Router>
           </MainPanel>
-          <MediaQuery query="(max-width: 767.8px)">
-            <Modal zIndex="1030" isOpen={!isSidePanelClosed} toggle={this.toggleSidePanel} contentClassName="d-none"></Modal>
-          </MediaQuery>
+          {!isStandaloneSettingsRoute && (
+            <MediaQuery query="(max-width: 767.8px)">
+              <Modal zIndex="1030" isOpen={!isSidePanelClosed} toggle={this.toggleSidePanel} contentClassName="d-none"></Modal>
+            </MediaQuery>
+          )}
         </div>
       </React.Fragment>
     );

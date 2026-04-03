@@ -2,7 +2,7 @@ import React from 'react';
 import { gettext } from '../../utils/constants';
 import ModalPortal from '../modal-portal';
 import ConfirmDeleteAccount from '../dialog/confirm-delete-account';
-import { getSettingsPageOptions, getSettingsRoute } from './page-options';
+import { getSettingsRoute } from './page-options';
 
 class DeleteAccount extends React.Component {
 
@@ -27,9 +27,7 @@ class DeleteAccount extends React.Component {
   };
 
   render() {
-    const pageOptions = getSettingsPageOptions();
-    const csrfToken = pageOptions.csrfToken || '';
-    const deleteAccountUrl = getSettingsRoute('deleteAccount', 'profile/delete/');
+    const deleteAccountUrl = getSettingsRoute('deleteAccount', 'accounts/delete/');
     return (
       <React.Fragment>
         <div className="setting-item" id="del-account">
@@ -40,8 +38,7 @@ class DeleteAccount extends React.Component {
         {this.state.isConfirmDialogOpen && (
           <ModalPortal>
             <ConfirmDeleteAccount
-              formActionURL={deleteAccountUrl}
-              csrfToken={csrfToken}
+              actionURL={deleteAccountUrl}
               toggle={this.toggleDialog}
             />
           </ModalPortal>

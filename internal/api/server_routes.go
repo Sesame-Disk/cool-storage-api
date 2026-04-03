@@ -225,6 +225,17 @@ func (s *Server) registerPublicRoutes(serverURL string) {
 	s.router.GET("/smart-link/:token", s.smartLinkAuthMiddleware(), smartLinkHandler.ResolveSmartLink)
 	s.router.GET("/smart-link/:token/", s.smartLinkAuthMiddleware(), smartLinkHandler.ResolveSmartLink)
 
+	s.router.GET("/accounts/password/change", s.handlePasswordChangeRedirect)
+	s.router.GET("/accounts/password/change/", s.handlePasswordChangeRedirect)
+	s.router.GET("/accounts/delete", s.handleDeleteAccountRedirect)
+	s.router.GET("/accounts/delete/", s.handleDeleteAccountRedirect)
+	s.router.POST("/accounts/delete", s.handleDeleteAccountRedirect)
+	s.router.POST("/accounts/delete/", s.handleDeleteAccountRedirect)
+	s.router.GET("/profile/delete", s.handleDeleteAccountRedirect)
+	s.router.GET("/profile/delete/", s.handleDeleteAccountRedirect)
+	s.router.POST("/profile/delete", s.handleDeleteAccountRedirect)
+	s.router.POST("/profile/delete/", s.handleDeleteAccountRedirect)
+
 	s.router.GET("/billing", s.handleBillingRedirect)
 	s.router.GET("/billing/", s.handleBillingRedirect)
 

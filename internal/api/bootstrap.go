@@ -51,7 +51,7 @@ func buildBootstrapBackendRoutes() gin.H {
 		"twoFactorSetup":        "profile/two_factor_authentication/setup/",
 		"twoFactorDisable":      "profile/two_factor_authentication/disable/",
 		"twoFactorBackupTokens": "profile/two_factor_authentication/backup/tokens/",
-		"deleteAccount":         "profile/delete/",
+		"deleteAccount":         "accounts/delete/",
 		"wechatWorkConnect":     "work-weixin/oauth-connect/?next={next}",
 		"wechatWorkDisconnect":  "work-weixin/oauth-disconnect/?next={next}",
 		"dingtalkConnect":       "dingtalk/connect/?next={next}",
@@ -244,6 +244,8 @@ func (s *Server) buildAppBootstrapPageOptions(identity bootstrapIdentity, userDa
 		name = identity.UserID
 	}
 	authenticated := identity.UserID != "" && identity.OrgID != ""
+	hasPasswordChange := strings.TrimSpace(s.config.Accounts.PasswordChangeURL) != ""
+	hasDeleteAccount := strings.TrimSpace(s.config.Accounts.DeleteAccountURL) != ""
 
 	pageOptions := gin.H{
 		"name":                      name,
@@ -255,6 +257,9 @@ func (s *Server) buildAppBootstrapPageOptions(identity bootstrapIdentity, userDa
 		"enableUpdateUserInfo":      authenticated,
 		"enableUserSetContactEmail": authenticated,
 		"enableUserSetName":         authenticated,
+		"canUpdatePassword":         authenticated && hasPasswordChange,
+		"passwordOperationText":     "Change",
+		"enableDeleteAccount":       authenticated && hasDeleteAccount,
 		"langCode":                  "en",
 		"currentLang": gin.H{
 			"langCode": "en",
@@ -340,6 +345,9 @@ func (s *Server) buildAppBootstrapPageOptions(identity bootstrapIdentity, userDa
 	pageOptions["enableUpdateUserInfo"] = true
 	pageOptions["enableUserSetContactEmail"] = true
 	pageOptions["enableUserSetName"] = true
+	pageOptions["canUpdatePassword"] = hasPasswordChange
+	pageOptions["passwordOperationText"] = "Change"
+	pageOptions["enableDeleteAccount"] = hasDeleteAccount
 	pageOptions["userRole"] = role
 	pageOptions["canAddRepo"] = resolved.Capabilities["can_add_repo"]
 	pageOptions["canShareRepo"] = resolved.Capabilities["can_share_repo"]

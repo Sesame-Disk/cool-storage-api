@@ -493,8 +493,16 @@ func (s *Server) billingRedirectTarget(rawQuery string) (string, error) {
 	if portalURL == "" {
 		return "", fmt.Errorf("billing portal is not configured")
 	}
+	return externalRedirectTarget(portalURL, rawQuery)
+}
 
-	target, err := url.Parse(portalURL)
+func externalRedirectTarget(targetURL, rawQuery string) (string, error) {
+	targetURL = strings.TrimSpace(targetURL)
+	if targetURL == "" {
+		return "", fmt.Errorf("redirect target is not configured")
+	}
+
+	target, err := url.Parse(targetURL)
 	if err != nil {
 		return "", err
 	}
@@ -518,6 +526,22 @@ func (s *Server) billingRedirectTarget(rawQuery string) (string, error) {
 	return target.String(), nil
 }
 
+func (s *Server) passwordChangeRedirectTarget(rawQuery string) (string, error) {
+	targetURL := strings.TrimSpace(s.config.Accounts.PasswordChangeURL)
+	if targetURL == "" {
+		return "", fmt.Errorf("accounts password change URL is not configured")
+	}
+	return externalRedirectTarget(targetURL, rawQuery)
+}
+
+func (s *Server) deleteAccountRedirectTarget(rawQuery string) (string, error) {
+	targetURL := strings.TrimSpace(s.config.Accounts.DeleteAccountURL)
+	if targetURL == "" {
+		return "", fmt.Errorf("accounts delete account URL is not configured")
+	}
+	return externalRedirectTarget(targetURL, rawQuery)
+}
+
 func (s *Server) handleBillingRedirect(c *gin.Context) {
 	if _, orgID, _ := s.resolveUserAuth(c); orgID == "" {
 		c.Redirect(http.StatusFound, "/accounts/login/?next="+url.QueryEscape(c.Request.URL.RequestURI()))
@@ -525,6 +549,36 @@ func (s *Server) handleBillingRedirect(c *gin.Context) {
 	}
 
 	target, err := s.billingRedirectTarget(c.Request.URL.RawQuery)
+	if err != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.Redirect(http.StatusTemporaryRedirect, target)
+}
+
+func (s *Server) handlePasswordChangeRedirect(c *gin.Context) {
+	if _, orgID, _ := s.resolveUserAuth(c); orgID == "" {
+		c.Redirect(http.StatusFound, "/accounts/login/?next="+url.QueryEscape(c.Request.URL.RequestURI()))
+		return
+	}
+
+	target, err := s.passwordChangeRedirectTarget(c.Request.URL.RawQuery)
+	if err != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.Redirect(http.StatusTemporaryRedirect, target)
+}
+
+func (s *Server) handleDeleteAccountRedirect(c *gin.Context) {
+	if _, orgID, _ := s.resolveUserAuth(c); orgID == "" {
+		c.Redirect(http.StatusFound, "/accounts/login/?next="+url.QueryEscape(c.Request.URL.RequestURI()))
+		return
+	}
+
+	target, err := s.deleteAccountRedirectTarget(c.Request.URL.RawQuery)
 	if err != nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
 		return
