@@ -11,6 +11,18 @@ const BYPASS_TOKEN = 'dev-token-admin'; // Default admin token for testing
 
 let seafileAPI = new SeafileAPI();
 
+function normalizeAccountInfo(data = {}) {
+  const email = data.email || data.contact_email || data.login_id || '';
+  return {
+    ...data,
+    email,
+    contact_email: data.contact_email || email,
+    login_id: data.login_id || email,
+    name: data.name || email,
+    avatar_url: data.avatar_url || '/static/img/default-avatar.png',
+  };
+}
+
 function createAPIError(message, responseData, status) {
   const error = new Error(message);
   error.response = {
@@ -211,6 +223,16 @@ initAPI();
 // OIDC API methods - for SSO authentication
 // These use fetch directly because they're called before user is authenticated
 // ============================================================================
+
+// Settings/account info compatibility with SesameFS backend.
+seafileAPI.getUserInfo = function () {
+  const server = this.server || serviceURL || window.location.origin;
+  const url = server + '/api2/account/info/';
+  return this.req.get(url).then((response) => ({
+    ...response,
+    data: normalizeAccountInfo(response.data),
+  }));
+};
 
 // Get OIDC configuration (public endpoint)
 seafileAPI.getOIDCConfig = async function () {

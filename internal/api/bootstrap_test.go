@@ -25,8 +25,8 @@ func TestBuildAppBootstrapPageOptionsIncludesSettingsBasics(t *testing.T) {
 	if pageOptions["orgID"] != "org-1" {
 		t.Fatalf("orgID = %v, want %q", pageOptions["orgID"], "org-1")
 	}
-	if pageOptions["avatarURL"] != "/media/avatars/default.png" {
-		t.Fatalf("avatarURL = %v, want %q", pageOptions["avatarURL"], "/media/avatars/default.png")
+	if pageOptions["avatarURL"] != "/static/img/default-avatar.png" {
+		t.Fatalf("avatarURL = %v, want %q", pageOptions["avatarURL"], "/static/img/default-avatar.png")
 	}
 	if enabled, ok := pageOptions["enableUpdateUserInfo"].(bool); !ok || !enabled {
 		t.Fatalf("enableUpdateUserInfo = %v, want true", pageOptions["enableUpdateUserInfo"])

@@ -21,6 +21,22 @@ import { getSettingsPageOptions, getSettingsRoute } from './page-options';
 
 import './settings-content.css';
 
+function buildUserInfoFromPageOptions() {
+    const pageOptions = getSettingsPageOptions();
+    const email = pageOptions.username || '';
+    if (!email) {
+        return null;
+    }
+
+    return {
+        email,
+        contact_email: pageOptions.contactEmail || email,
+        login_id: pageOptions.loginID || email,
+        name: pageOptions.name || email,
+        avatar_url: pageOptions.avatarURL || '/static/img/default-avatar.png',
+    };
+}
+
 class SettingsContent extends React.Component {
     constructor(props) {
         super(props);
@@ -52,7 +68,7 @@ class SettingsContent extends React.Component {
 
         this.state = {
             curItemID: this.sideNavItems[0].href.substr(1),
-            userInfo: null,
+            userInfo: buildUserInfoFromPageOptions(),
         };
     }
 
@@ -62,7 +78,9 @@ class SettingsContent extends React.Component {
                 userInfo: res.data
             });
         }).catch((error) => {
-            toaster.danger(Utils.getErrorMsg(error));
+            if (!this.state.userInfo) {
+                toaster.danger(Utils.getErrorMsg(error));
+            }
         });
     }
 
