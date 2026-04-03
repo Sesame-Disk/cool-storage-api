@@ -18,52 +18,5 @@
   <div id="wrapper"></div>
   <div id="root"></div>
   <div id="modal-wrapper"></div>
-  <script>
-    // SesameFS configuration - replaces Django template injection
-    // These values are read by src/utils/constants.js
-    window.gettext = function(s) { return s; }; // i18n placeholder
-    window.ngettext = function(s, p, n) { return n === 1 ? s : p; };
-
-    window.app = {
-      config: {
-        // Core URLs - same-origin by default in both production and npm-start dev mode.
-        siteRoot: '/',
-        loginUrl: '/login/',
-        serviceURL: '',
-        fileServerRoot: window.location.origin + '/seafhttp/',
-        mediaUrl: '/static/',
-
-        // Branding
-        siteTitle: 'Sesame Disk',
-        siteName: 'Sesame Disk',
-        logoPath: 'img/logo.png',
-        faviconPath: '/favicon.png',
-        logoWidth: 147,
-        logoHeight: 64,
-        loginBGPath: '',
-        avatarInfo: { defaultUrl: '/static/img/default-avatar.png' },
-        avatarURL: '/static/img/default-avatar.png',
-
-        // Feature flags - match SesameFS capabilities
-        isPro: 'True',
-        isDocs: 'False',
-        isDBSqlite3: 'False',
-        useGoFileserver: 'True',
-        seafileVersion: '11.0.0',
-        lang: 'en',
-        enableRepoAutoDel: 'True',
-      },
-
-      pageOptions: {}
-    };
-
-    // Load runtime config if available (for Docker deployments)
-    if (typeof window.SESAMEFS_CONFIG === 'object') {
-      Object.assign(window.app.config, window.SESAMEFS_CONFIG);
-    }
-
-    // Username is hydrated by the bootstrap endpoint before the app bundle loads.
-    window.app.pageOptions.username="";
-  </script>
 </body>
 </html>

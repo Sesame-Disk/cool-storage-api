@@ -1,5 +1,31 @@
 import React from 'react';
 
+function getDefaultAppConfig() {
+    return {
+        siteRoot: '/',
+        loginUrl: '/login/',
+        serviceURL: '',
+        fileServerRoot: `${window.location.origin}/seafhttp/`,
+        mediaUrl: '/static/',
+        siteTitle: 'Sesame Disk',
+        siteName: 'Sesame Disk',
+        logoPath: 'img/logo.png',
+        faviconPath: '/favicon.png',
+        logoWidth: 147,
+        logoHeight: 64,
+        loginBGPath: '',
+        avatarInfo: { defaultUrl: '/static/img/default-avatar.png' },
+        avatarURL: '/static/img/default-avatar.png',
+        isPro: 'True',
+        isDocs: 'False',
+        isDBSqlite3: 'False',
+        useGoFileserver: 'True',
+        seafileVersion: '11.0.0',
+        lang: 'en',
+        enableRepoAutoDel: 'True',
+    };
+}
+
 const APP_PAGE_OPTION_DEFAULTS = {
     name: '',
     username: '',
@@ -145,8 +171,20 @@ function getAppPageOptionDefaults(scope) {
 }
 
 function ensureBootstrapGlobals(scope) {
+    if (typeof window.gettext !== 'function') {
+        window.gettext = (message) => message;
+    }
+
+    if (typeof window.ngettext !== 'function') {
+        window.ngettext = (singular, plural, count) => (count === 1 ? singular : plural);
+    }
+
     window.app = window.app || {};
-    window.app.config = window.app.config || {};
+    window.app.config = {
+        ...getDefaultAppConfig(),
+        ...(window.app.config || {}),
+        ...(typeof window.SESAMEFS_CONFIG === 'object' ? window.SESAMEFS_CONFIG : {}),
+    };
     window.app.pageOptions = { ...getAppPageOptionDefaults(scope), ...(window.app.pageOptions || {}) };
     window.org = window.org || {};
     window.org.pageOptions = { ...ORG_PAGE_OPTION_DEFAULTS, ...(window.org.pageOptions || {}) };

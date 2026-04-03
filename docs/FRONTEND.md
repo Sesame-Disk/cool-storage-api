@@ -59,7 +59,7 @@ API Response → Dirent Model → React State → Component Render
 
 1. **Removed Django Integration** - No server-side rendering, no CSRF tokens
 2. **Token-Based Auth Only** - Uses `Authorization: Token xyz` header
-3. **Standalone HTML** - Static `window.app` config instead of Django templates
+3. **Runtime Bootstrap** - The SPA/admin shells are static HTML containers; `src/bootstrap/runtime-bootstrap.js` initializes `window.app`, merges optional `window.SESAMEFS_CONFIG`, and hydrates page options from `/api/v2.1/bootstrap/`
 4. **Login Page** - Custom login component instead of Django views
 
 ---
@@ -106,7 +106,7 @@ Example: `admin@sesamefs.local` / `dev-token-123`
 ```
 frontend/
 ├── public/
-│   ├── index.html          # Standalone HTML with window.app config
+│   ├── index.html          # Static app shell; runtime-bootstrap provides globals/defaults
 │   └── static/
 │       ├── css/
 │       │   ├── seahub.css  # Seafile base styles
@@ -119,6 +119,8 @@ frontend/
 │           └── file-locked-32.png  # Lock overlay icon
 ├── src/
 │   ├── app.js              # Main app with auth routing
+│   ├── bootstrap/
+│   │   └── runtime-bootstrap.js  # Initializes globals and loads bootstrap payloads
 │   ├── models/
 │   │   └── dirent.js       # File/folder data model
 │   ├── components/

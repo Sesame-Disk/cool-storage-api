@@ -18,54 +18,5 @@
   <div id="wrapper"></div>
   <div id="root"></div>
   <div id="modal-wrapper"></div>
-  <script>
-    // SesameFS base configuration - read by src/utils/constants.js
-    window.gettext = function(s) { return s; };
-    window.ngettext = function(s, p, n) { return n === 1 ? s : p; };
-
-    window.app = {
-      config: {
-        siteRoot: '/',
-        loginUrl: '/login/',
-        serviceURL: '',
-        fileServerRoot: window.location.origin + '/seafhttp/',
-        mediaUrl: '/static/',
-
-        // Branding
-        siteTitle: 'Sesame Disk',
-        siteName: 'Sesame Disk',
-        logoPath: 'img/logo.png',
-        faviconPath: '/favicon.png',
-        logoWidth: 147,
-        logoHeight: 64,
-        loginBGPath: '',
-        avatarInfo: { defaultUrl: '/static/img/default-avatar.png' },
-        avatarURL: '/static/img/default-avatar.png',
-
-        // Feature flags
-        isPro: 'True',
-        isDocs: 'False',
-        isDBSqlite3: 'False',
-        useGoFileserver: 'True',
-        seafileVersion: '11.0.0',
-        lang: 'en',
-        enableRepoAutoDel: 'True',
-        enableMultiADFS: 'False',
-      },
-
-      pageOptions: {}
-    };
-
-    // Load runtime config if available (for Docker deployments)
-    if (typeof window.SESAMEFS_CONFIG === 'object') {
-      Object.assign(window.app.config, window.SESAMEFS_CONFIG);
-    }
-
-    // Username is hydrated by the bootstrap endpoint before the org-admin bundle loads.
-    window.app.pageOptions.username="";
-
-    // Org-admin page options are hydrated by the bootstrap entrypoint.
-    window.org = { pageOptions: {} };
-  </script>
 </body>
 </html>
