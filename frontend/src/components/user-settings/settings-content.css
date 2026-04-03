@@ -1,0 +1,75 @@
+.user-settings-layout {
+  display: flex;
+  min-height: 0;
+  height: 100%;
+  overflow: hidden;
+}
+
+.user-settings-layout__nav {
+  flex: 0 0 22%;
+  padding: 1rem;
+  border-right: 1px solid #eee;
+  overflow: auto;
+}
+
+.user-settings-layout__main {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.user-settings-layout__heading {
+  padding: 8px 16px;
+  background: #f9f9f9;
+  font-size: 1rem;
+  color: #322;
+  font-weight: normal;
+  line-height: 1.5;
+  margin: 0;
+  position: relative;
+}
+
+.user-settings-layout__heading::after {
+  position: absolute;
+  left: 16px;
+  right: 16px;
+  bottom: 0;
+  content: '';
+  border-bottom: 1px solid #e8e8e8;
+}
+
+.user-settings-layout__content {
+  padding: 0 1rem 8rem;
+  overflow: auto;
+}
+
+.user-settings-layout__section {
+  font-size: 0.875rem;
+  margin: 1em 0 3em;
+}
+
+.user-settings-layout__section-heading {
+  font-size: 0.9375rem;
+  font-weight: normal;
+  padding-bottom: 0.3rem;
+  border-bottom: 1px solid #ddd;
+  margin-bottom: 0.7rem;
+}
+
+@media (max-width: 767.98px) {
+  .user-settings-layout {
+    flex-direction: column;
+    overflow: auto;
+  }
+
+  .user-settings-layout__nav {
+    flex: 0 0 auto;
+    border-right: 0;
+    border-bottom: 1px solid #eee;
+  }
+
+  .user-settings-layout__main {
+    min-height: 0;
+  }
+}

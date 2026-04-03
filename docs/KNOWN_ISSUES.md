@@ -924,19 +924,20 @@ If only 2-3 instances will run, overhead is minimal and all logic is already ide
 **Current Behavior:**
 - Clicking a text file (`.py`, `.md`, `.json`, `.txt`, `.css`, `.js`, etc.) opens `FilePreviewDialog` — a read-only modal that renders `<pre><code>` with no edit capability.
 - The `isModalPreviewable()` function in `lib-content-view.js:1395` intercepts these file types before they ever reach `fileview.go`.
-- For non-intercepted files, `fileview.go` serves a custom static HTML page with only a Download button — it does NOT load the React editor app.
+- For non-intercepted files, `fileview.go` serves backend-rendered preview HTML or OnlyOffice — it does NOT load a React editor/app shell for authenticated file editing.
 
-**Expected Behavior (Seahub original):**
-- Clicking a `.md` file opens the **Markdown Editor** (separate React entry point at `frontend/src/index.js` → `MarkdownEditor`).
-- Clicking other text files opens a **file view page** that loads the full React SPA with `window.app.pageOptions` containing `canEditFile`, `filePerm`, `fileType`, etc.
+**Expected Behavior:**
+- Clicking a `.md` file should open an editor experience instead of a read-only preview.
+- Clicking other text files should open an authenticated editor/view page with `window.app.pageOptions` containing `canEditFile`, `filePerm`, `fileType`, etc.
 - The `FileToolbar` component (`frontend/src/components/file-view/file-toolbar.js`) reads `canEditFile` from `pageOptions` to show Save/Edit buttons.
 
 **What Works Today:**
 - OnlyOffice editing (`.docx`, `.xlsx`, `.pptx`) works if OnlyOffice is configured — `fileview.go:serveOnlyOfficeEditor()` renders the editor correctly.
 - File download works for all types.
+- Legacy standalone preview bundles (`frontend/src/file-view.js`, `history-trash-file-view.js`, `view-file-*.js`) were removed because the live backend preview flow no longer loads them.
 
 **Implementation Plan:**
-1. **Option A (Quick):** Remove text file types from `isModalPreviewable()` so clicks go to `/lib/:repo_id/file/*`, then update `fileview.go` to serve the React editor SPA (with `pageOptions`) instead of static HTML for editable text files.
+1. **Option A (Quick):** Remove text file types from `isModalPreviewable()` so clicks go to `/lib/:repo_id/file/*`, then update `fileview.go` to serve an authenticated editor shell (with `pageOptions`) instead of static/backend-rendered preview HTML for editable text files.
 2. **Option B (Full):** Build an in-app editor component (CodeMirror/Monaco) embedded in the `FilePreviewDialog` modal, with save-back-to-API capability.
 3. Either option needs: permission check in `fileview.go` to set `canEditFile` based on `GetLibraryPermission()` result.
 

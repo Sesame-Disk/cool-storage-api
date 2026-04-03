@@ -15,6 +15,7 @@ import MainPanel from './components/main-panel';
 import FilesActivities from './pages/dashboard/files-activities';
 import MyFileActivities from './pages/dashboard/my-file-activities';
 import Starred from './pages/starred/starred';
+import SettingsPage from './pages/settings';
 import LinkedDevices from './pages/linked-devices/linked-devices';
 import ShareAdminLibraries from './pages/share-admin/libraries';
 import ShareAdminFolders from './pages/share-admin/folders';
@@ -50,6 +51,7 @@ import './services/css.css';
 const FilesActivitiesWrapper = MainContentWrapper(FilesActivities);
 const MyFileActivitiesWrapper = MainContentWrapper(MyFileActivities);
 const StarredWrapper = MainContentWrapper(Starred);
+const SettingsPageWrapper = MainContentWrapper(SettingsPage);
 const LinkedDevicesWrapper = MainContentWrapper(LinkedDevices);
 const SharedLibrariesWrapper = MainContentWrapper(SharedLibraries);
 const SharedWithOCMWrapper = MainContentWrapper(ShareWithOCM);
@@ -358,6 +360,8 @@ class App extends Component {
               <FilesActivitiesWrapper path={siteRoot + 'dashboard'} onShowSidePanel={this.onShowSidePanel} onSearchedClick={this.onSearchedClick} />
               <MyFileActivitiesWrapper path={siteRoot + 'my-activities'} onShowSidePanel={this.onShowSidePanel} onSearchedClick={this.onSearchedClick} />
               <StarredWrapper path={siteRoot + 'starred'} onShowSidePanel={this.onShowSidePanel} onSearchedClick={this.onSearchedClick} />
+              <SettingsPageWrapper path={siteRoot + 'profile'} onShowSidePanel={this.onShowSidePanel} onSearchedClick={this.onSearchedClick} />
+              <SettingsPageWrapper path={siteRoot + 'profile/'} onShowSidePanel={this.onShowSidePanel} onSearchedClick={this.onSearchedClick} />
               <LinkedDevicesWrapper path={siteRoot + 'linked-devices'} onShowSidePanel={this.onShowSidePanel} onSearchedClick={this.onSearchedClick} />
               <ShareAdminLibrariesWrapper path={siteRoot + 'share-admin-libs'} onShowSidePanel={this.onShowSidePanel} onSearchedClick={this.onSearchedClick} />
               <ShareAdminFoldersWrapper path={siteRoot + 'share-admin-folders'} onShowSidePanel={this.onShowSidePanel} onSearchedClick={this.onSearchedClick} />
