@@ -44,6 +44,25 @@ type bootstrapOrgData struct {
 	CurrentPeriodEndsAt    *time.Time
 }
 
+func buildBootstrapBackendRoutes() gin.H {
+	return gin.H{
+		"languageChange":        "i18n/?lang={langCode}",
+		"passwordChange":        "accounts/password/change/",
+		"twoFactorSetup":        "profile/two_factor_authentication/setup/",
+		"twoFactorDisable":      "profile/two_factor_authentication/disable/",
+		"twoFactorBackupTokens": "profile/two_factor_authentication/backup/tokens/",
+		"deleteAccount":         "profile/delete/",
+		"wechatWorkConnect":     "work-weixin/oauth-connect/?next={next}",
+		"wechatWorkDisconnect":  "work-weixin/oauth-disconnect/?next={next}",
+		"dingtalkConnect":       "dingtalk/connect/?next={next}",
+		"dingtalkDisconnect":    "dingtalk/disconnect/?next={next}",
+		"samlConnect":           "saml2/connect/?next={next}",
+		"samlDisconnect":        "saml2/disconnect/?next={next}",
+		"orgSamlConnect":        "org/custom/{orgID}/saml2/connect/?next={next}",
+		"orgSamlDisconnect":     "org/custom/{orgID}/saml2/disconnect/?next={next}",
+	}
+}
+
 // handleBootstrap returns app bootstrap data for the SPA.
 //
 // This endpoint is public (no auth required). It returns the authenticated
@@ -241,6 +260,7 @@ func (s *Server) buildAppBootstrapPageOptions(identity bootstrapIdentity, userDa
 			"langCode": "en",
 			"langName": "en",
 		},
+		"backendRoutes": buildBootstrapBackendRoutes(),
 		"langList": []gin.H{
 			{
 				"langCode": "en",

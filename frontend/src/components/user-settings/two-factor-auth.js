@@ -1,9 +1,6 @@
 import React from 'react';
-import { gettext, siteRoot } from '../../utils/constants';
-
-function getSettingsPageOptions() {
-  return window.app?.pageOptions || {};
-}
+import { gettext } from '../../utils/constants';
+import { getSettingsPageOptions, getSettingsRoute } from './page-options';
 
 class TwoFactorAuthentication extends React.Component {
 
@@ -16,27 +13,30 @@ class TwoFactorAuthentication extends React.Component {
     const backupTokens = Array.isArray(pageOptions.backupTokens)
       ? pageOptions.backupTokens.length
       : (Number(pageOptions.backupTokens) || 0);
+    const disableUrl = getSettingsRoute('twoFactorDisable', 'profile/two_factor_authentication/disable/');
+    const backupTokensUrl = getSettingsRoute('twoFactorBackupTokens', 'profile/two_factor_authentication/backup/tokens/');
     return (
       <React.Fragment>
         <p className="mb-2">{gettext('Status: enabled')}</p>
-        <a className="btn btn-outline-primary mb-4" href={`${siteRoot}profile/two_factor_authentication/disable/`}>
+        <a className="btn btn-outline-primary mb-4" href={disableUrl}>
           {gettext('Disable Two-Factor Authentication')}</a>
         <p className="mb-2">
           {gettext('If you don\'t have any device with you, you can access your account using backup codes.')}
           {backupTokens === 1 ? gettext('You have only one backup code remaining.') :
             gettext('You have {num} backup codes remaining.').replace('{num}', backupTokens)}
         </p>
-        <a href={`${siteRoot}profile/two_factor_authentication/backup/tokens/`}
+        <a href={backupTokensUrl}
           className="btn btn-outline-primary">{gettext('Show Codes')}</a>
       </React.Fragment>
     );
   };
 
   renderDisabled = () => {
+    const setupUrl = getSettingsRoute('twoFactorSetup', 'profile/two_factor_authentication/setup/');
     return (
       <React.Fragment>
         <p className="mb-2">{gettext('Two-factor authentication is not enabled for your account. Enable two-factor authentication for enhanced account security.')}</p>
-        <a href={`${siteRoot}profile/two_factor_authentication/setup/`} className="btn btn-outline-primary">
+        <a href={setupUrl} className="btn btn-outline-primary">
           {gettext('Enable Two-Factor Authentication')}</a>
       </React.Fragment>
     );

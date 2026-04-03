@@ -47,4 +47,11 @@ func TestBuildAppBootstrapPageOptionsIncludesSettingsBasics(t *testing.T) {
 	if currentLang["langCode"] != "en" {
 		t.Fatalf("currentLang.langCode = %v, want %q", currentLang["langCode"], "en")
 	}
+	backendRoutes, ok := pageOptions["backendRoutes"].(gin.H)
+	if !ok {
+		t.Fatalf("backendRoutes has unexpected type: %T", pageOptions["backendRoutes"])
+	}
+	if backendRoutes["passwordChange"] != "accounts/password/change/" {
+		t.Fatalf("backendRoutes.passwordChange = %v, want %q", backendRoutes["passwordChange"], "accounts/password/change/")
+	}
 }

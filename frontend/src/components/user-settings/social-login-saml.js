@@ -1,11 +1,8 @@
 import React from 'react';
 import { Button } from 'reactstrap';
-import { gettext, siteRoot } from '../../utils/constants';
+import { gettext } from '../../utils/constants';
 import ModalPortal from '../modal-portal';
-
-function getSettingsPageOptions() {
-  return window.app?.pageOptions || {};
-}
+import { getSettingsPageOptions, getSettingsRoute } from './page-options';
 
 class SocialLoginSAML extends React.Component {
 
@@ -42,8 +39,12 @@ class SocialLoginSAML extends React.Component {
     const enableMultiADFS = Boolean(pageOptions.enableMultiADFS);
     const orgSamlConnected = Boolean(pageOptions.orgSamlConnected);
     const socialNextPage = pageOptions.socialNextPage || '/';
-    let connectUrl = (enableMultiADFS && isOrgContext) ? `${siteRoot}org/custom/${orgID}/saml2/connect/?next=${encodeURIComponent(socialNextPage)}` : `${siteRoot}saml2/connect/?next=${encodeURIComponent(socialNextPage)}`;
-    let disconnectUrl = (orgSamlConnected && isOrgContext) ? `${siteRoot}org/custom/${orgID}/saml2/disconnect/?next=${encodeURIComponent(socialNextPage)}` : `${siteRoot}saml2/disconnect/?next=${encodeURIComponent(socialNextPage)}`;
+    let connectUrl = (enableMultiADFS && isOrgContext)
+      ? getSettingsRoute('orgSamlConnect', 'org/custom/{orgID}/saml2/connect/?next={next}', { orgID, next: socialNextPage })
+      : getSettingsRoute('samlConnect', 'saml2/connect/?next={next}', { next: socialNextPage });
+    let disconnectUrl = (orgSamlConnected && isOrgContext)
+      ? getSettingsRoute('orgSamlDisconnect', 'org/custom/{orgID}/saml2/disconnect/?next={next}', { orgID, next: socialNextPage })
+      : getSettingsRoute('samlDisconnect', 'saml2/disconnect/?next={next}', { next: socialNextPage });
 
     return (
       <React.Fragment>

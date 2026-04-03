@@ -1,12 +1,9 @@
 import React from 'react';
-import { gettext, siteRoot } from '../../utils/constants';
+import { gettext } from '../../utils/constants';
 import { seafileAPI } from '../../utils/seafile-api';
 import toaster from '../toast';
 import { Utils } from '../../utils/utils';
-
-function getSettingsPageOptions() {
-  return window.app?.pageOptions || {};
-}
+import { getSettingsPageOptions } from './page-options';
 
 class UserAvatarForm extends React.Component {
 
@@ -18,7 +15,6 @@ class UserAvatarForm extends React.Component {
       isEditShown: false
     };
     this.fileInput = React.createRef();
-    this.form = React.createRef();
   }
 
   fileInputChange = () => {
@@ -90,18 +86,15 @@ class UserAvatarForm extends React.Component {
   };
 
   render() {
-    const pageOptions = getSettingsPageOptions();
-    const csrfToken = pageOptions.csrfToken || '';
     return (
-      <form ref={this.form} className="form-group row" encType="multipart/form-data" method="post" action={`${siteRoot}avatar/add/`}>
-        <input type="hidden" name="csrfmiddlewaretoken" value={csrfToken} />
+      <div className="form-group row">
         <label className="col-sm-1 col-form-label">{gettext('Avatar:')}</label>
         <div className="col-auto position-relative" onMouseOver={this.handleMouseOver} onMouseOut={this.handleMouseOut} onFocus={this.handleMouseOver} tabIndex="0">
           <img src={this.state.avatarSrc} width="80" height="80" alt="" className="user-avatar" />
           <input type="file" name="avatar" className="d-none" onChange={this.fileInputChange} ref={this.fileInput} />
           <span className={`avatar-edit fas fa-edit ${!this.state.isEditShown && 'd-none'}`} onClick={this.openFileInput} role="button" aria-label={gettext('Edit')} tabIndex="0" onKeyDown={this.onEditIconKeyDown}></span>
         </div>
-      </form>
+      </div>
     );
   }
 }

@@ -17,12 +17,9 @@ import SocialLogin from './social-login';
 import SocialLoginDingtalk from './social-login-dingtalk';
 import SocialLoginSAML from './social-login-saml';
 import DeleteAccount from './delete-account';
+import { getSettingsPageOptions, getSettingsRoute } from './page-options';
 
 import './settings-content.css';
-
-function getSettingsPageOptions() {
-    return window.app?.pageOptions || {};
-}
 
 class SettingsContent extends React.Component {
     constructor(props) {
@@ -108,6 +105,7 @@ class SettingsContent extends React.Component {
         const enableADFS = Boolean(pageOptions.enableADFS);
         const enableMultiADFS = Boolean(pageOptions.enableMultiADFS);
         const enableDeleteAccount = Boolean(pageOptions.enableDeleteAccount);
+        const passwordChangeUrl = getSettingsRoute('passwordChange', 'accounts/password/change/');
 
         return (
             <div className={`user-settings-layout ${this.props.className}`.trim()}>
@@ -125,7 +123,7 @@ class SettingsContent extends React.Component {
                         {canUpdatePassword &&
                             <div id="update-user-passwd" className="user-settings-layout__section">
                                 <h3 className="user-settings-layout__section-heading">{gettext('Password')}</h3>
-                                <a href="/accounts/password/change/" className="btn btn-outline-primary">{passwordOperationText}</a>
+                                <a href={passwordChangeUrl} className="btn btn-outline-primary">{passwordOperationText}</a>
                             </div>
                         }
 

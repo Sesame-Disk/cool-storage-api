@@ -33,6 +33,25 @@ function getDefaultLanguageOption(langCode = 'en') {
     };
 }
 
+function getDefaultBackendRoutes() {
+    return {
+        languageChange: 'i18n/?lang={langCode}',
+        passwordChange: 'accounts/password/change/',
+        twoFactorSetup: 'profile/two_factor_authentication/setup/',
+        twoFactorDisable: 'profile/two_factor_authentication/disable/',
+        twoFactorBackupTokens: 'profile/two_factor_authentication/backup/tokens/',
+        deleteAccount: 'profile/delete/',
+        wechatWorkConnect: 'work-weixin/oauth-connect/?next={next}',
+        wechatWorkDisconnect: 'work-weixin/oauth-disconnect/?next={next}',
+        dingtalkConnect: 'dingtalk/connect/?next={next}',
+        dingtalkDisconnect: 'dingtalk/disconnect/?next={next}',
+        samlConnect: 'saml2/connect/?next={next}',
+        samlDisconnect: 'saml2/disconnect/?next={next}',
+        orgSamlConnect: 'org/custom/{orgID}/saml2/connect/?next={next}',
+        orgSamlDisconnect: 'org/custom/{orgID}/saml2/disconnect/?next={next}',
+    };
+}
+
 const APP_PAGE_OPTION_DEFAULTS = {
     name: '',
     username: '',
@@ -40,6 +59,7 @@ const APP_PAGE_OPTION_DEFAULTS = {
     langCode: 'en',
     currentLang: getDefaultLanguageOption(),
     langList: [],
+    backendRoutes: getDefaultBackendRoutes(),
     canAddRepo: false,
     canShareRepo: false,
     canAddGroup: false,

@@ -2,7 +2,7 @@ import React from 'react';
 import ReactDom from 'react-dom';
 import { navigate } from '@gatsbyjs/reach-router';
 import { Utils } from './utils/utils';
-import { gettext, siteRoot, mediaUrl, logoPath, logoHeight, siteTitle } from './utils/constants';
+import { siteRoot, mediaUrl, logoPath, logoHeight, siteTitle } from './utils/constants';
 import { getToken } from './utils/seafile-api';
 import CommonToolbar from './components/toolbar/common-toolbar';
 import SettingsContent from './components/user-settings/settings-content';

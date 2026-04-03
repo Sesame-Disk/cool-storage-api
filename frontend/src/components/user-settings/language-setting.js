@@ -1,16 +1,19 @@
 import React from 'react';
-import { gettext, siteRoot } from '../../utils/constants';
+import { gettext } from '../../utils/constants';
 import { SeahubSelect } from '../common/select';
+import { getSettingsPageOptions, getSettingsRoute } from './page-options';
 
 class LanguageSetting extends React.Component {
 
   onSelectChange = (selectedItem) => {
     // selectedItem: {value: '...', label: '...'}
-    location.href = `${siteRoot}i18n/?lang=${selectedItem.value}`;
+    location.href = getSettingsRoute('languageChange', 'i18n/?lang={langCode}', {
+      langCode: selectedItem.value
+    });
   };
 
   render() {
-    const pageOptions = window.app?.pageOptions || {};
+    const pageOptions = getSettingsPageOptions();
     const currentLang = pageOptions.currentLang || { langCode: pageOptions.langCode || 'en', langName: pageOptions.langCode || 'en' };
     const langList = Array.isArray(pageOptions.langList) && pageOptions.langList.length > 0
       ? pageOptions.langList
