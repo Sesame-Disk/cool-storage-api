@@ -1264,6 +1264,15 @@ seafileAPI.revertRepo = function (repoID, commitID) {
   return this.req.put(url, { commit_id: commitID });
 };
 
+// Update a share link's permissions and/or expiration
+seafileAPI.updateShareLink = function (token, permissions, expirationTime) {
+  let url = this.server + '/api/v2.1/share-links/' + token + '/';
+  let data = {};
+  if (permissions) data.permissions = permissions;
+  if (expirationTime) data.expiration_time = expirationTime;
+  return this.req.put(url, data);
+};
+
 // Update the password of a share link. Pass null or '' to remove the password.
 seafileAPI.updateShareLinkPassword = function (token, newPassword) {
   let url = this.server + '/api/v2.1/share-links/' + token + '/';
