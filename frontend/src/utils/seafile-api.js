@@ -224,11 +224,36 @@ initAPI();
 // These use fetch directly because they're called before user is authenticated
 // ============================================================================
 
-// Settings/account info compatibility with SesameFS backend.
-seafileAPI.getUserInfo = function () {
+seafileAPI.getAccountInfo = function () {
   const server = this.server || serviceURL || window.location.origin;
   const url = server + '/api2/account/info/';
   return this.req.get(url).then((response) => ({
+    ...response,
+    data: normalizeAccountInfo(response.data),
+  }));
+};
+
+// Settings/account info compatibility with SesameFS backend.
+seafileAPI.getUserInfo = function () {
+  return this.getAccountInfo();
+};
+
+seafileAPI.updateUserInfo = function (data = {}) {
+  const server = this.server || serviceURL || window.location.origin;
+  const url = server + '/api2/account/info/';
+  const payload = {};
+
+  if (typeof data.name === 'string') {
+    payload.name = data.name;
+  }
+
+  if (Object.keys(payload).length === 0) {
+    return Promise.reject(createAPIError('No supported profile fields were provided', {
+      error: 'no supported profile fields were provided'
+    }, 400));
+  }
+
+  return this.req.put(url, payload).then((response) => ({
     ...response,
     data: normalizeAccountInfo(response.data),
   }));

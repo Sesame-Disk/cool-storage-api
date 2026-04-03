@@ -33,6 +33,9 @@ services:
       - ONLYOFFICE_API_JS_URL=https://${OFFICE_DOMAIN}/web-apps/apps/api/documents/api.js
       - ONLYOFFICE_JWT_SECRET=${ONLYOFFICE_JWT_SECRET}
       - FRONTEND_URL=${FRONTEND_URL:-http://frontend:80}
+      - BILLING_URL=${BILLING_URL}
+      - ACCOUNTS_PASSWORD_CHANGE_URL=${ACCOUNTS_PASSWORD_CHANGE_URL}
+      - ACCOUNTS_DELETE_ACCOUNT_URL=${ACCOUNTS_DELETE_ACCOUNT_URL}
 
       # Cassandra — defaults work for single-region; override in .env for multi-region
       - CASSANDRA_HOSTS=${CASSANDRA_HOSTS:-cassandra:9042}

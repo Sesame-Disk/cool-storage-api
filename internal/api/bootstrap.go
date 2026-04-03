@@ -255,7 +255,7 @@ func (s *Server) buildAppBootstrapPageOptions(identity bootstrapIdentity, userDa
 		"avatarURL":                 "/static/img/default-avatar.png",
 		"nameLabel":                 "Name:",
 		"enableUpdateUserInfo":      authenticated,
-		"enableUserSetContactEmail": authenticated,
+		"enableUserSetContactEmail": false,
 		"enableUserSetName":         authenticated,
 		"canUpdatePassword":         authenticated && hasPasswordChange,
 		"passwordOperationText":     "Change",
@@ -343,7 +343,7 @@ func (s *Server) buildAppBootstrapPageOptions(identity bootstrapIdentity, userDa
 	pageOptions["loginID"] = email
 	pageOptions["avatarURL"] = "/static/img/default-avatar.png"
 	pageOptions["enableUpdateUserInfo"] = true
-	pageOptions["enableUserSetContactEmail"] = true
+	pageOptions["enableUserSetContactEmail"] = false
 	pageOptions["enableUserSetName"] = true
 	pageOptions["canUpdatePassword"] = hasPasswordChange
 	pageOptions["passwordOperationText"] = "Change"

@@ -115,6 +115,8 @@ func (s *Server) registerLegacyAPIV2Routes(serverURL string) {
 	api2.GET("/auth/ping", s.authMiddleware(), s.handlePing)
 	api2.GET("/auth/ping/", s.authMiddleware(), s.handlePing)
 	api2.GET("/account/info", s.authMiddleware(), s.handleAccountInfo)
+	api2.PUT("/account/info", s.authMiddleware(), s.handleUpdateAccountInfo)
+	api2.PATCH("/account/info", s.authMiddleware(), s.handleUpdateAccountInfo)
 	v2.RegisterStarredRoutes(api2.Group("", s.authMiddleware()), s.db)
 	api2.GET("/avatars/user/:email/resized/:size", s.handleUserAvatar)
 	api2.GET("/avatars/user/:email/resized/:size/", s.handleUserAvatar)

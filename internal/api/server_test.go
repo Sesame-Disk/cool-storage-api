@@ -332,6 +332,27 @@ func TestHandleAccountInfo(t *testing.T) {
 	}
 }
 
+func TestHandleUpdateAccountInfoRejectsUnsupportedContactEmail(t *testing.T) {
+	s := createTestServer()
+	s.router.PUT("/api2/account/info/", func(c *gin.Context) {
+		c.Set("user_id", "00000000-0000-0000-0000-000000000001")
+		c.Set("org_id", "00000000-0000-0000-0000-000000000001")
+		c.Next()
+	}, s.handleUpdateAccountInfo)
+
+	req, _ := http.NewRequest(http.MethodPut, "/api2/account/info/", strings.NewReader(`{"contact_email":"new@example.com"}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	s.router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusBadRequest)
+	}
+	if !strings.Contains(w.Body.String(), "contact email updates are not supported") {
+		t.Fatalf("body = %q, want unsupported contact email message", w.Body.String())
+	}
+}
+
 // TestAuthMiddleware tests the authentication middleware
 func TestAuthMiddleware(t *testing.T) {
 	s := createTestServer()

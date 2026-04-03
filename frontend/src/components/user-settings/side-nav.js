@@ -9,7 +9,9 @@ class SideNav extends React.Component {
       <ul className="nav flex-column user-setting-nav">
         {items.map((item, index) => {
           return item.show ?
-            <li key={index} className={`nav-item${this.props.curItemID === item.href.substr(1) ? ' active' : ''}`}><a className="nav-link" href={item.href}>{item.text}</a></li> : null;
+            <li key={index} className={`nav-item${this.props.curItemID === item.href.substr(1) ? ' active' : ''}`}>
+              <a className="nav-link" href={item.href} onClick={(event) => this.props.onItemClick(event, item.href)}>{item.text}</a>
+            </li> : null;
         })}
       </ul>
     );
@@ -19,6 +21,7 @@ class SideNav extends React.Component {
 SideNav.propTypes = {
   curItemID: PropTypes.string.isRequired,
   data: PropTypes.array,
+  onItemClick: PropTypes.func.isRequired,
 };
 
 SideNav.defaultProps = {

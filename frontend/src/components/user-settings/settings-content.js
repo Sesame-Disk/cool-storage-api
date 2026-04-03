@@ -65,14 +65,21 @@ class SettingsContent extends React.Component {
             { show: (enableWechatWork || enableDingtalk || enableADFS || (enableMultiADFS || isOrgContext)), href: '#social-auth', text: gettext('Social Login') },
             { show: enableDeleteAccount, href: '#del-account', text: gettext('Delete Account') },
         ];
+        this.contentRef = React.createRef();
+        const firstVisibleItem = this.sideNavItems.find((item) => item.show) || this.sideNavItems[0];
+        const hashSectionID = window.location.hash.replace(/^#/, '');
+        const initialItemID = this.sideNavItems.some((item) => item.show && item.href.substr(1) === hashSectionID)
+            ? hashSectionID
+            : firstVisibleItem.href.substr(1);
 
         this.state = {
-            curItemID: this.sideNavItems[0].href.substr(1),
+            curItemID: initialItemID,
             userInfo: buildUserInfoFromPageOptions(),
         };
     }
 
     componentDidMount() {
+        this.scrollToHashSection();
         seafileAPI.getUserInfo().then((res) => {
             this.setState({
                 userInfo: res.data
@@ -83,6 +90,43 @@ class SettingsContent extends React.Component {
             }
         });
     }
+
+    getSectionTop = (section) => {
+        const content = this.contentRef.current;
+        if (!content || !section) {
+            return 0;
+        }
+
+        return section.getBoundingClientRect().top - content.getBoundingClientRect().top + content.scrollTop;
+    };
+
+    scrollToSection = (sectionID, behavior) => {
+        const content = this.contentRef.current;
+        const section = document.getElementById(sectionID);
+        if (!content || !section) {
+            return;
+        }
+
+        const nextTop = Math.max(this.getSectionTop(section) - 8, 0);
+        if (behavior) {
+            content.scrollTo({ top: nextTop, behavior });
+        } else {
+            content.scrollTop = nextTop;
+        }
+
+        this.setState({ curItemID: sectionID });
+    };
+
+    scrollToHashSection = () => {
+        const sectionID = window.location.hash.replace(/^#/, '');
+        if (!sectionID) {
+            return;
+        }
+
+        window.requestAnimationFrame(() => {
+            this.scrollToSection(sectionID);
+        });
+    };
 
     updateUserInfo = (data) => {
         seafileAPI.updateUserInfo(data).then((res) => {
@@ -95,11 +139,19 @@ class SettingsContent extends React.Component {
         });
     };
 
+    handleNavItemClick = (event, href) => {
+        event.preventDefault();
+        const sectionID = href.replace(/^#/, '');
+        const nextUrl = `${window.location.pathname}${window.location.search}${href}`;
+        window.history.replaceState(window.history.state, '', nextUrl);
+        this.scrollToSection(sectionID, 'smooth');
+    };
+
     handleContentScroll = (event) => {
         const scrollTop = event.target.scrollTop;
         const scrolled = this.sideNavItems.filter((item) => {
             const section = document.getElementById(item.href.substr(1));
-            return item.show && section && section.offsetTop - 45 < scrollTop;
+            return item.show && section && this.getSectionTop(section) - 45 <= scrollTop;
         });
 
         if (scrolled.length) {
@@ -128,11 +180,11 @@ class SettingsContent extends React.Component {
         return (
             <div className={`user-settings-layout ${this.props.className}`.trim()}>
                 <div className="user-settings-layout__nav">
-                    <SideNav data={this.sideNavItems} curItemID={this.state.curItemID} />
+                    <SideNav data={this.sideNavItems} curItemID={this.state.curItemID} onItemClick={this.handleNavItemClick} />
                 </div>
                 <div className="user-settings-layout__main">
                     {this.props.showHeading && <h2 className="user-settings-layout__heading">{gettext('Settings')}</h2>}
-                    <div className="user-settings-layout__content position-relative" onScroll={this.handleContentScroll}>
+                    <div className="user-settings-layout__content position-relative" onScroll={this.handleContentScroll} ref={this.contentRef}>
                         <div id="user-basic-info" className="user-settings-layout__section">
                             <h3 className="user-settings-layout__section-heading">{gettext('Profile Setting')}</h3>
                             <UserAvatarForm />

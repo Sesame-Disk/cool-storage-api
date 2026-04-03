@@ -1604,6 +1604,59 @@ func (s *Server) handleAccountInfo(c *gin.Context) {
 	})
 }
 
+// handleUpdateAccountInfo updates editable account profile fields for the authenticated user.
+// PUT/PATCH /api2/account/info/
+func (s *Server) handleUpdateAccountInfo(c *gin.Context) {
+	var req struct {
+		Name         *string `json:"name"`
+		ContactEmail *string `json:"contact_email"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		return
+	}
+	if req.ContactEmail != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "contact email updates are not supported"})
+		return
+	}
+	if req.Name == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "no supported profile fields were provided"})
+		return
+	}
+	if s.db == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "database is not available"})
+		return
+	}
+
+	name := strings.TrimSpace(*req.Name)
+	if name == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "name cannot be empty"})
+		return
+	}
+
+	userID := c.GetString("user_id")
+	orgID := c.GetString("org_id")
+	orgUUID, err := gocql.ParseUUID(orgID)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid organization id"})
+		return
+	}
+	userUUID, err := gocql.ParseUUID(userID)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid user id"})
+		return
+	}
+
+	if err := s.db.Session().Query(`
+		UPDATE users SET name = ? WHERE org_id = ? AND user_id = ?
+	`, name, orgUUID, userUUID).Exec(); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update profile"})
+		return
+	}
+
+	s.handleAccountInfo(c)
+}
+
 // handleGetSubscription returns the current org's plan and usage info.
 // GET /api/v2.1/subscription/
 func (s *Server) handleGetSubscription(c *gin.Context) {

@@ -33,8 +33,8 @@ func TestBuildAppBootstrapPageOptionsIncludesSettingsBasics(t *testing.T) {
 	if enabled, ok := pageOptions["enableUpdateUserInfo"].(bool); !ok || !enabled {
 		t.Fatalf("enableUpdateUserInfo = %v, want true", pageOptions["enableUpdateUserInfo"])
 	}
-	if enabled, ok := pageOptions["enableUserSetContactEmail"].(bool); !ok || !enabled {
-		t.Fatalf("enableUserSetContactEmail = %v, want true", pageOptions["enableUserSetContactEmail"])
+	if enabled, ok := pageOptions["enableUserSetContactEmail"].(bool); !ok || enabled {
+		t.Fatalf("enableUserSetContactEmail = %v, want false", pageOptions["enableUserSetContactEmail"])
 	}
 	if enabled, ok := pageOptions["enableUserSetName"].(bool); !ok || !enabled {
 		t.Fatalf("enableUserSetName = %v, want true", pageOptions["enableUserSetName"])
