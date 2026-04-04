@@ -25,3 +25,13 @@ CREATE TABLE IF NOT EXISTS api_keys_by_user (
     expires_at   timestamp,
     PRIMARY KEY ((org_id, user_id), created_at)
 ) WITH CLUSTERING ORDER BY (created_at DESC);
+
+ALTER TABLE sessions ADD source_api_key_hash text;
+
+CREATE TABLE IF NOT EXISTS sessions_by_api_key (
+    api_key_hash text,
+    token_hash   text,
+    org_id       uuid,
+    user_id      uuid,
+    PRIMARY KEY ((api_key_hash), token_hash)
+);

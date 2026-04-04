@@ -15,6 +15,8 @@ import (
 type adminAPIKeyManager interface {
 	CreateKey(userID, orgID gocql.UUID, label, scope string, expiresAt *time.Time) (string, *apikeys.APIKey, error)
 	ListUserKeys(orgID, userID gocql.UUID) ([]apikeys.APIKey, error)
+	GetOwnedKey(orgID, userID gocql.UUID, keyHash string) (*apikeys.APIKey, error)
+	RestoreKey(key *apikeys.APIKey) error
 	RevokeKey(orgID, userID gocql.UUID, keyHash string) error
 	InvalidateUserAPIKeys(orgID, userID gocql.UUID) error
 }
@@ -233,6 +235,19 @@ func (h *AdminHandler) AdminRevokeUserAPIKey(c *gin.Context) {
 		return
 	}
 
+	key, err := mgr.GetOwnedKey(orgUUID, userUUID, keyHash)
+	if err != nil {
+		switch {
+		case errors.Is(err, apikeys.ErrKeyNotFound):
+			c.JSON(http.StatusNotFound, gin.H{"error": "API key not found"})
+		case errors.Is(err, apikeys.ErrNotOwner):
+			c.JSON(http.StatusForbidden, gin.H{"error": "API key does not belong to this user"})
+		default:
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to revoke API key"})
+		}
+		return
+	}
+
 	if err := mgr.RevokeKey(orgUUID, userUUID, keyHash); err != nil {
 		switch {
 		case errors.Is(err, apikeys.ErrKeyNotFound):
@@ -243,6 +258,17 @@ func (h *AdminHandler) AdminRevokeUserAPIKey(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to revoke API key"})
 		}
 		return
+	}
+
+	if h.sessions != nil {
+		if err := h.sessions.InvalidateAPIKeySessions(keyHash); err != nil {
+			if restoreErr := mgr.RestoreKey(key); restoreErr != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to revoke API key"})
+				return
+			}
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to revoke API key"})
+			return
+		}
 	}
 
 	c.JSON(http.StatusOK, gin.H{"success": true})

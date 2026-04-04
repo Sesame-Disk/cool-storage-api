@@ -223,24 +223,16 @@ func (m *Manager) ValidateKey(rawToken string) (*APIKey, error) {
 
 // RevokeKey deletes an API key. Verifies ownership before deletion.
 func (m *Manager) RevokeKey(orgID, userID gocql.UUID, keyHash string) error {
-	// Verify ownership by reading the key.
-	var keyUserID gocql.UUID
-	var createdAt time.Time
-	err := m.db.Session().Query(`
-		SELECT user_id, created_at FROM api_keys WHERE key_hash = ?
-	`, keyHash).Scan(&keyUserID, &createdAt)
+	key, err := m.GetOwnedKey(orgID, userID, keyHash)
 	if err != nil {
-		return ErrKeyNotFound
-	}
-	if keyUserID != userID {
-		return ErrNotOwner
+		return err
 	}
 
 	// Delete from both tables.
 	batch := m.db.Session().Batch(gocql.LoggedBatch)
 	batch.Query(`DELETE FROM api_keys WHERE key_hash = ?`, keyHash)
 	batch.Query(`DELETE FROM api_keys_by_user WHERE org_id = ? AND user_id = ? AND created_at = ?`,
-		orgID, userID, createdAt)
+		orgID, userID, key.CreatedAt)
 	if err := batch.Exec(); err != nil {
 		return fmt.Errorf("revoke api key: %w", err)
 	}
@@ -248,6 +240,76 @@ func (m *Manager) RevokeKey(orgID, userID gocql.UUID, keyHash string) error {
 	// Evict from cache.
 	m.cacheMu.Lock()
 	delete(m.cache, keyHash)
+	m.cacheMu.Unlock()
+
+	return nil
+}
+
+// GetOwnedKey verifies ownership of an API key and returns its metadata.
+func (m *Manager) GetOwnedKey(orgID, userID gocql.UUID, keyHash string) (*APIKey, error) {
+	// Verify ownership by reading the key.
+	key := &APIKey{KeyHash: keyHash}
+	err := m.db.Session().Query(`
+		SELECT key_prefix, user_id, org_id, label, scope, created_at, last_used_at, expires_at
+		FROM api_keys WHERE key_hash = ?
+	`, keyHash).Scan(
+		&key.KeyPrefix, &key.UserID, &key.OrgID, &key.Label, &key.Scope,
+		&key.CreatedAt, &key.LastUsedAt, &key.ExpiresAt,
+	)
+	if err != nil {
+		return nil, ErrKeyNotFound
+	}
+	if key.UserID != userID || key.OrgID != orgID {
+		return nil, ErrNotOwner
+	}
+
+	return key, nil
+}
+
+// RestoreKey recreates a previously deleted API key row pair.
+func (m *Manager) RestoreKey(key *APIKey) error {
+	if key == nil {
+		return errors.New("api key is required")
+	}
+
+	now := time.Now().UTC()
+	ttlSeconds, err := ttlFromExpiry(now, key.ExpiresAt)
+	if err != nil && !errors.Is(err, ErrInvalidExpiry) {
+		return err
+	}
+	if errors.Is(err, ErrInvalidExpiry) {
+		return nil
+	}
+
+	batch := m.db.Session().Batch(gocql.LoggedBatch)
+	if ttlSeconds > 0 {
+		batch.Query(`
+			INSERT INTO api_keys (key_hash, key_prefix, user_id, org_id, label, scope, created_at, last_used_at, expires_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+			USING TTL ?
+		`, key.KeyHash, key.KeyPrefix, key.UserID, key.OrgID, key.Label, key.Scope, key.CreatedAt, key.LastUsedAt, key.ExpiresAt, ttlSeconds)
+		batch.Query(`
+			INSERT INTO api_keys_by_user (org_id, user_id, key_hash, key_prefix, label, scope, created_at, last_used_at, expires_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+			USING TTL ?
+		`, key.OrgID, key.UserID, key.KeyHash, key.KeyPrefix, key.Label, key.Scope, key.CreatedAt, key.LastUsedAt, key.ExpiresAt, ttlSeconds)
+	} else {
+		batch.Query(`
+			INSERT INTO api_keys (key_hash, key_prefix, user_id, org_id, label, scope, created_at, last_used_at, expires_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`, key.KeyHash, key.KeyPrefix, key.UserID, key.OrgID, key.Label, key.Scope, key.CreatedAt, key.LastUsedAt, key.ExpiresAt)
+		batch.Query(`
+			INSERT INTO api_keys_by_user (org_id, user_id, key_hash, key_prefix, label, scope, created_at, last_used_at, expires_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`, key.OrgID, key.UserID, key.KeyHash, key.KeyPrefix, key.Label, key.Scope, key.CreatedAt, key.LastUsedAt, key.ExpiresAt)
+	}
+
+	if err := batch.Exec(); err != nil {
+		return fmt.Errorf("restore api key: %w", err)
+	}
+
+	m.cacheMu.Lock()
+	m.cache[key.KeyHash] = &cacheEntry{key: key, cachedAt: now}
 	m.cacheMu.Unlock()
 
 	return nil

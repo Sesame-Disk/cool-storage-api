@@ -1234,8 +1234,8 @@ func (s *Server) handleAuthToken(c *gin.Context) {
 						var email, role string
 						_ = s.db.Session().Query(`SELECT email, role FROM users WHERE org_id = ? AND user_id = ?`,
 							orgUUID, userUUID).Scan(&email, &role)
-						session, sErr := sessionMgr.CreateAPITokenSession(
-							userUUID.String(), orgUUID.String(), email, role,
+						session, sErr := sessionMgr.CreateAPITokenSessionFromAPIKey(
+							userUUID.String(), orgUUID.String(), email, role, apiKey.KeyHash, apiKey.ExpiresAt,
 						)
 						if sErr == nil {
 							s.touchUserLastLogin(orgUUID.String(), userUUID.String(), time.Now().UTC())
@@ -2383,8 +2383,22 @@ func (s *Server) handleRevokeAPIKey(c *gin.Context) {
 
 	userUUID, _ := gocql.ParseUUID(userID)
 	orgUUID, _ := gocql.ParseUUID(orgID)
+	key, err := s.apiKeyManager.GetOwnedKey(orgUUID, userUUID, keyHash)
+	if err != nil {
+		if errors.Is(err, apikeys.ErrKeyNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "API key not found"})
+			return
+		}
+		if errors.Is(err, apikeys.ErrNotOwner) {
+			c.JSON(http.StatusForbidden, gin.H{"error": "API key does not belong to this user"})
+			return
+		}
+		log.Printf("[apikeys] revoke precheck error user=%s key=%s: %v", userID, keyHash[:16], err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to revoke API key"})
+		return
+	}
 
-	err := s.apiKeyManager.RevokeKey(orgUUID, userUUID, keyHash)
+	err = s.apiKeyManager.RevokeKey(orgUUID, userUUID, keyHash)
 	if err != nil {
 		if errors.Is(err, apikeys.ErrKeyNotFound) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "API key not found"})
@@ -2397,6 +2411,20 @@ func (s *Server) handleRevokeAPIKey(c *gin.Context) {
 		log.Printf("[apikeys] revoke error user=%s key=%s: %v", userID, keyHash[:16], err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to revoke API key"})
 		return
+	}
+
+	if s.authHandler != nil {
+		sessionMgr := s.authHandler.GetSessionManager()
+		if sessionMgr != nil {
+			if err := sessionMgr.InvalidateAPIKeySessions(keyHash); err != nil {
+				if restoreErr := s.apiKeyManager.RestoreKey(key); restoreErr != nil {
+					log.Printf("[apikeys] failed to restore key after session invalidation error user=%s key=%s: %v", userID, keyHash[:16], restoreErr)
+				}
+				log.Printf("[apikeys] failed to invalidate derived sessions user=%s key=%s: %v", userID, keyHash[:16], err)
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to revoke API key"})
+				return
+			}
+		}
 	}
 
 	c.JSON(http.StatusOK, gin.H{"success": true})

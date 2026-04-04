@@ -308,6 +308,7 @@ func renameGroup(db interface{ Session() *gocql.Session }, orgID, groupID, newNa
 // when a user is deactivated or deleted.
 type SessionInvalidator interface {
 	InvalidateUserSessions(orgID, userID string) error
+	InvalidateAPIKeySessions(apiKeyHash string) error
 }
 
 // APIKeyInvalidator can revoke all API keys for a given user.

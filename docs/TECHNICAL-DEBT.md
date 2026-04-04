@@ -194,70 +194,44 @@ Add to `.github/workflows/test.yml`:
 
 ---
 
-## 6. Programmatic Auth Gap — ⚠️ BLOCKS PROD (2026-02-18)
+## 6. Programmatic Auth Follow-ups — ✅ Core gap fixed (2026-04-03)
 
-### Problem
+### Current Supported Flow
 
-In production (`dev_mode=false`, OIDC-only), there is **no way to get an API token
-programmatically** — without a browser. This blocks two critical scenarios:
+OIDC-only production deployments are no longer blocked for non-browser clients:
 
-1. **Seafile desktop/mobile client login** — the client calls
-   `POST /api2/auth-token/` with username+password to get a session token.
-   In prod this endpoint always returns `401` (there is a `// TODO` in the code).
+1. Users create API keys through `GET/POST/DELETE /api/v2.1/api-keys/`.
+2. Desktop clients, SeaDrive, and CLI tools call `POST /api2/auth-token/` with:
+   - `username` = user email
+   - `password` = raw API key
+3. The server validates the key and returns a long-lived session token.
 
-2. **Programmatic/admin access** — scripts, CI pipelines, the `seaf-cli` tool,
-   or any API consumer that can't open a browser has no way to authenticate.
+### What This Now Covers
 
-### Root Cause
+- Desktop/mobile sync clients in OIDC-only deployments
+- `seaf-cli` and similar headless user tools
+- User-scoped automation without relying on dev tokens
+- Strong revocation: revoking an API key also invalidates sessions minted from it
+- Expiry inheritance: derived sessions cannot outlive the source API key
 
-`internal/api/server.go` — `handleAuthToken` function:
+### Remaining Debt
 
-```go
-// In dev mode: checks dev tokens by username match → works
-if s.config.Auth.DevMode {
-    // ... matches dev tokens ...
-}
-
-// In prod: TODO, falls through to 401
-// TODO: Implement OIDC password grant or redirect to OIDC flow
-c.JSON(http.StatusUnauthorized, gin.H{
-    "non_field_errors": "Unable to login with provided credentials.",
-})
-```
-
-### What Exists Today
-
-| Method | Status | Notes |
+| Item | Status | Notes |
 |---|---|---|
-| `POST /api2/auth-token/` username+password | ❌ Broken in prod | TODO in server.go |
-| OIDC browser flow (`/api/v2.1/auth/oidc/login`) | ✅ Works | Browser only |
-| Library-scoped API tokens | ✅ Works | Requires browser login first; single-library scope |
-| Personal Access Tokens (user-level) | ❌ Not implemented | - |
-| OIDC Device Flow (RFC 8628) | ❌ Not implemented | Best fit for CLI tools |
-| OIDC Client Credentials grant | ❌ Not implemented | For service-to-service |
+| OIDC browser flow (`/api/v2.1/auth/oidc/login`) | ✅ Works | Primary browser login |
+| User API keys (`/api/v2.1/api-keys/`) | ✅ Works | Current answer for desktop/CLI/automation |
+| OIDC Device Flow (RFC 8628) | ❌ Not implemented | Still the best fit for shared/headless sign-in UX |
+| Service-account / client-credentials flow | ❌ Not implemented | Still needed for userless machine-to-machine auth |
 
-### Impact
+### Why This Is Still Debt
 
-- Seafile desktop client **cannot log in** in production → sync is broken
-- `seaf-cli` **cannot authenticate** without dev tokens
-- Admin scripts **cannot automate** API calls
-- Users **cannot get tokens** without a browser
+The product now has a working user-scoped auth path, but it still lacks a first-class answer for:
 
-### Solutions (pick one or combine)
+- userless automation
+- centrally managed machine credentials
+- browser-assisted device login without pre-created API keys
 
-**Option A — OIDC Device Authorization Flow (RFC 8628)** ← Recommended
-
-The cleanest long-term solution for CLI tools and headless clients:
-1. Client calls `POST /api2/auth-token/` → server responds with a device code + URL
-2. User opens the URL in a browser, approves
-3. Client polls until approved → gets session token
-
-Requires the OIDC provider (`accounts.sesamedisk.com`) to support Device Flow.
-
-**Option B — Personal Access Tokens (PATs)**
-
-Admin/users generate long-lived tokens via the web UI or admin API.
-The token is a random string stored in Cassandra, scoped to the user (not a library).
+Those are no longer production blockers for user-driven clients, but they are still legitimate backlog items.
 
 ---
 
@@ -293,31 +267,7 @@ This is deferred on purpose. It is safe to keep the current backend-rendered pre
 - Endpoints: `POST/GET/DELETE /api/v2.1/user/access-tokens/`
 - Storage: new `personal_access_tokens` Cassandra table
 
-**Option C — Allow OIDC-issued tokens in `/api2/auth-token/`**
-
-After the user completes browser OIDC login, generate a longer-lived token they
-can copy and use for CLI/API access. Simpler than PATs, less elegant.
-
-### Workaround for Current Testing Phase
-
-Keep `AUTH_DEV_MODE=true` with specific dev tokens while testing in prod.
-This unblocks desktop client and CLI testing at the cost of real OIDC auth.
-
-```bash
-# In .env — temporary workaround while PATs / Device Flow are not implemented:
-AUTH_DEV_MODE=true
-AUTH_ALLOW_ANONYMOUS=false
-# dev tokens defined in config.prod.yaml → auth.dev_tokens
-```
-
-### Priority
-
-**High** — blocks any non-browser client (desktop sync, CLI, automation).
-Must be resolved before promoting to general availability.
-
----
-
-## 7. Fake `UUID@sesamefs.local` Emails — ⚠️ Partially Fixed (2026-02-22)
+## 8. Fake `UUID@sesamefs.local` Emails — ⚠️ Partially Fixed (2026-02-22)
 
 ### Status
 
@@ -374,32 +324,30 @@ The `modifier` field is part of the Seafile FS object hash (`fs_id`). Changing i
 - [x] **Fix serviceURL** - Changed to use `window.location.origin` ✅ (2026-02-09)
 - [ ] **Document modal pattern** in CLAUDE.md (done)
 
-### High Priority — Blocks Production
-- [ ] **Programmatic auth gap** (Section 6) — Seafile clients and CLI cannot auth in OIDC-only mode.
-  Implement Personal Access Tokens (PATs) or OIDC Device Flow.
-  Workaround: keep `AUTH_DEV_MODE=true` with specific dev tokens during testing phase.
+### High Priority
+- [ ] **Device Flow / service-account auth follow-up** (Section 6) — user-scoped API keys are complete, but there is still no first-class userless automation flow.
 
 ### Short-Term (As Encountered)
 - [ ] Fix dialogs as users report issues
 - [ ] Add tests when fixing bugs
-- [ ] Fix remaining fake-email display fields (Section 7) — `files.go`, `seafhttp.go`, `starred.go`
-- [x] **Extract `cleanupLibraryTags` to batch** (Section 11) — 6 separate DELETEs → 1 LoggedBatch ✅ (2026-03-18)
-- [ ] **Extract share link helpers** (Section 11) — `createShareLink`/`deleteShareLink` touch 4 tables
-- [ ] **Add test for `LeaveShareRepo`** (Section 11) — bug was undetected due to missing test
-- [ ] **Standardize logging to `slog`** (Section 11) — new helpers use `log.Printf`, inconsistent
+- [ ] Fix remaining fake-email display fields (Section 8) — `files.go`, `seafhttp.go`, `starred.go`
+- [x] **Extract `cleanupLibraryTags` to batch** (Section 12) — 6 separate DELETEs → 1 LoggedBatch ✅ (2026-03-18)
+- [ ] **Extract share link helpers** (Section 12) — `createShareLink`/`deleteShareLink` touch 4 tables
+- [ ] **Add test for `LeaveShareRepo`** (Section 12) — bug was undetected due to missing test
+- [ ] **Standardize logging to `slog`** (Section 12) — new helpers use `log.Printf`, inconsistent
 
 ### Long-Term (Backlog)
 - [ ] Migrate all ~100 dialogs (can be automated with script)
 - [ ] Increase test coverage to 40%
 - [ ] Consider forking seafile-js for any customization needs
-- [ ] OIDC JWT signature verification (Section 6)
-- [ ] Decide on FS object modifier fix (Section 7) — accept mixed-state history or leave as-is
-- [ ] **Extract remaining ~41 inline batches to DRY helpers** (Section 11) — incremental migration
-- [ ] **Add concurrency tests for `renameGroup` and `reserveNextFileTagID`** (Section 11)
+- [ ] OIDC JWT signature verification
+- [ ] Decide on FS object modifier fix (Section 8) — accept mixed-state history or leave as-is
+- [ ] **Extract remaining ~41 inline batches to DRY helpers** (Section 12) — incremental migration
+- [ ] **Add concurrency tests for `renameGroup` and `reserveNextFileTagID`** (Section 12)
 
 ---
 
-## 8. SeafHTTP Token Auth: 403 → 401 — ✅ FIXED (2026-02-22)
+## 9. SeafHTTP Token Auth: 403 → 401 — ✅ FIXED (2026-02-22)
 
 ### Status
 Fixed. SeafHTTP endpoints (`HandleUpload`, `HandleDownload`, `HandleZipDownload`) now return `401 Unauthorized` instead of `403 Forbidden` for invalid/expired operation tokens. The `authMiddleware` also returns a specific `"session expired"` error when the session validation fails due to expiry, rather than the generic `"invalid token"`.
@@ -418,7 +366,7 @@ Fixed. SeafHTTP endpoints (`HandleUpload`, `HandleDownload`, `HandleZipDownload`
 
 ---
 
-## 9. Library Deletion: Cleanup Paths — ✅ RESOLVED (2026-03-18), Gap B pending
+## 10. Library Deletion: Cleanup Paths — ✅ RESOLVED (2026-03-18), Gap B pending
 
 ### Status
 ~~Known gaps. Fully documented 2026-02-24. Implementation planned (see below).~~
@@ -551,7 +499,7 @@ grep -r "localhost:8080" frontend/src/
 
 ---
 
-## 10. Inline HTML in Go Code — ✅ FIXED (2026-03-05)
+## 11. Inline HTML in Go Code — ✅ FIXED (2026-03-05)
 
 ### Status
 All inline HTML has been migrated from Go source files to `html/template` files with base template inheritance and external CSS.
@@ -573,7 +521,7 @@ All inline HTML has been migrated from Go source files to `html/template` files 
 
 ---
 
-## 11. Atomic Batch Operations & DRY Helpers Refactoring — 🟡 PARTIAL (2026-03-18)
+## 12. Atomic Batch Operations & DRY Helpers Refactoring — 🟡 PARTIAL (2026-03-18)
 
 ### Status
 Commit `305d8b21` introduced atomic `LoggedBatch` operations and DRY helper functions for dual-table writes. Local fixes applied for 4 bugs introduced in the commit. **Core pattern established; remaining inline batches should migrate to helpers incrementally.**
@@ -654,7 +602,7 @@ Recent refactors moved the backend toward a stable initial Cassandra schema with
 
 ---
 
-## 12. Storage & Traffic Quotas — Scalability Debt (2026-03-25)
+## 13. Storage & Traffic Quotas — Scalability Debt (2026-03-25)
 
 ### 12a. `COUNT(*)` for Max Users Check
 

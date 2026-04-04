@@ -12,7 +12,7 @@ SesameFS aims to be a world-class replacement for enterprise file sync and share
 2. **Smart Two-Tier Storage**: Hot (S3 Standard/IA) and cold (Glacier IR/Deep Archive) with automatic tiering
 3. **Distributed-First Architecture**: Cassandra + stateless API servers = global scale
 4. **SHA-256 Internal Storage**: Modern security with transparent SHA-1 translation for Seafile compatibility
-5. **Modern Authentication**: OIDC-native with accounts.sesamedisk.com
+5. **Modern Authentication**: OIDC-native with accounts.sesamedisk.com plus user API keys for desktop clients, CLI, and automation
 6. **True Multi-Tenancy**: Complete tenant isolation with per-tenant storage backends
 7. **Seafile Client Compatible**: Works with existing Seafile desktop and mobile apps
 
@@ -74,7 +74,7 @@ SesameFS aims to be a world-class replacement for enterprise file sync and share
 - [x] `/api2/` legacy route aliases
 - [x] `GET /api2/repos/` - List libraries
 - [x] `GET /api2/repos/:id/dir/?p=/` - Directory listing
-- [x] `GET /api2/auth-token/` - Auth token endpoint
+- [x] `POST /api2/auth-token/` - Auth token exchange (dev credentials or `email + API key`)
 - [x] Sync protocol endpoints (`/seafhttp/repo/:id/*`)
 - [x] Commit/FS object model in Cassandra
 

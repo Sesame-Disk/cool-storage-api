@@ -1,6 +1,6 @@
 # Known Issues - SesameFS
 
-**Last Updated**: 2026-03-26
+**Last Updated**: 2026-04-03
 
 This document tracks all known bugs, limitations, and issues in SesameFS.
 
@@ -17,7 +17,7 @@ This document tracks all known bugs, limitations, and issues in SesameFS.
 | Sync Protocol Permissions | ✅ Complete (2026-02-11) | All 15 sync endpoints enforce library permissions; `syncAuthMiddleware` hardened |
 | Sync Race Condition | ✅ Fixed (2026-02-18) | 7 bugs fixed: CAS HEAD updates, parent-chain validation, empty root handling |
 | Secrets/Env Management | ✅ Complete (2026-02-11) | All docker-compose vars from `.env`; no hardcoded credentials; JWT secret externalized |
-| **Programmatic Auth Gap** | ⚠️ Workaround only | `POST /api2/auth-token/` returns 401 in prod — desktop client & CLI cannot authenticate. See below + `docs/TECHNICAL-DEBT.md` §6 |
+| **Programmatic Auth (API keys)** | ✅ Fixed (2026-04-03) | User API keys now support desktop client, CLI, and automation auth in OIDC-only prod |
 
 ### 🟡 High Priority (Core Feature Gaps)
 | Issue | Status | Details |
@@ -967,36 +967,27 @@ Web browser logins are unaffected — they still redirect to `/`.
 
 ---
 
-### Programmatic Auth Gap — No Token Without a Browser in Prod
-**Status**: ⚠️ Workaround active (`AUTH_DEV_MODE=true`)
+### Programmatic Auth in OIDC-only Production — FIXED ✅
+**Status**: ✅ Fixed (2026-04-03)
 **Discovered**: 2026-02-18
-**Severity**: High — Blocks desktop client sync, CLI tools, and all programmatic API access in OIDC-only mode
+**Severity**: Resolved for desktop client sync, CLI tools, and user-scoped automation
 
-**Issue**: In production (`dev_mode=false`, OIDC-only), `POST /api2/auth-token/` always returns `401 Unauthorized`. This is the endpoint the Seafile desktop client and `seaf-cli` call to get a session token by submitting a username+password. The handler has an explicit `// TODO` comment and falls through to the error response.
+**Current behavior**:
+- Users can create/revoke user API keys via `GET/POST/DELETE /api/v2.1/api-keys/`
+- Desktop clients, SeaDrive, and CLI tools call `POST /api2/auth-token/` with `username=<email>` and `password=<raw API key>`
+- The server returns a long-lived session token for sync/API access
+- Revoking the API key invalidates any sessions minted from that key
+- If the API key expires, the derived session cannot outlive the key
 
-**Impact**:
-- Seafile desktop client **cannot log in** → sync is broken in pure OIDC production
-- `seaf-cli` cannot authenticate
-- Scripts, CI pipelines, and API consumers with no browser cannot get tokens
-- Users have no way to generate personal API tokens for programmatic use (only per-library tokens exist, and those require a browser login first)
+**What remains out of scope**:
+- OIDC Device Flow is still not implemented
+- There is still no separate service-account or client-credentials flow for userless automation
 
-**Current Workaround** (active during testing phase):
-```bash
-# In .env — keep until PATs or Device Flow are implemented:
-AUTH_DEV_MODE=true
-AUTH_ALLOW_ANONYMOUS=false
-# Define per-user dev tokens in config.prod.yaml → auth.dev_tokens
-```
-
-**Permanent Solutions** (pick one — see `docs/TECHNICAL-DEBT.md` §6 for full analysis):
-
-| Option | Effort | Notes |
-|--------|--------|-------|
-| **Personal Access Tokens (PATs)** | ~200 lines | New `personal_access_tokens` Cassandra table; `POST/GET/DELETE /api/v2.1/user/access-tokens/`; generated in web UI |
-| **OIDC Device Flow (RFC 8628)** | Medium | Best for CLI/headless; requires OIDC provider support; `POST /api2/auth-token/` returns device code + URL |
-| **OIDC-issued copy-able token** | Low | After browser login, expose a long-lived token user can copy; simpler than PATs |
-
-**Root cause file**: `internal/api/server.go` → `handleAuthToken()` — the `// TODO: Implement OIDC password grant` block
+**Relevant files**:
+- `internal/api/server.go` — `/api2/auth-token/` API-key exchange + self-service revoke path
+- `internal/auth/session.go` — session provenance and invalidation by API key
+- `internal/api/v2/admin_api_keys.go` — superadmin API key management for platform users
+- `frontend/src/components/user-settings/api-keys.js` — self-service profile UI
 
 ---
 

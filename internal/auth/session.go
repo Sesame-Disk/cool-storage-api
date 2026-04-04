@@ -40,13 +40,14 @@ func IsSessionRevoked(err error) bool {
 
 // Session represents an authenticated user session
 type Session struct {
-	Token     string    `json:"token"`
-	UserID    string    `json:"user_id"`
-	OrgID     string    `json:"org_id"`
-	Email     string    `json:"email"`
-	Role      string    `json:"role"`
-	CreatedAt time.Time `json:"created_at"`
-	ExpiresAt time.Time `json:"expires_at"`
+	Token            string    `json:"token"`
+	UserID           string    `json:"user_id"`
+	OrgID            string    `json:"org_id"`
+	Email            string    `json:"email"`
+	Role             string    `json:"role"`
+	CreatedAt        time.Time `json:"created_at"`
+	ExpiresAt        time.Time `json:"expires_at"`
+	SourceAPIKeyHash string    `json:"-"`
 }
 
 // SessionClaims represents the JWT claims for a session token
@@ -91,17 +92,39 @@ func (sm *SessionManager) CreateSession(userID, orgID, email, role string) (*Ses
 // CreateAPITokenSession creates a long-lived session for desktop/mobile sync clients.
 // Seafile/SeaDrive clients don't support token refresh, so this uses APITokenTTL (default 180 days).
 func (sm *SessionManager) CreateAPITokenSession(userID, orgID, email, role string) (*Session, error) {
+	return sm.CreateAPITokenSessionFromAPIKey(userID, orgID, email, role, "", nil)
+}
+
+// CreateAPITokenSessionFromAPIKey creates a long-lived session derived from an API key exchange.
+func (sm *SessionManager) CreateAPITokenSessionFromAPIKey(userID, orgID, email, role, sourceAPIKeyHash string, apiKeyExpiresAt *time.Time) (*Session, error) {
 	ttl := sm.config.APITokenTTL
 	if ttl <= 0 {
 		ttl = sm.config.SessionTTL // fallback to session TTL if not configured
 	}
-	return sm.CreateSessionWithTTL(userID, orgID, email, role, ttl)
+
+	now := time.Now()
+	expiresAt := now.Add(ttl)
+	if apiKeyExpiresAt != nil && apiKeyExpiresAt.Before(expiresAt) {
+		expiresAt = *apiKeyExpiresAt
+	}
+	if !expiresAt.After(now) {
+		return nil, ErrSessionExpired
+	}
+
+	return sm.createSessionWithExpiry(userID, orgID, email, role, now, expiresAt, sourceAPIKeyHash)
 }
 
 // CreateSessionWithTTL creates a new session with a custom TTL.
 func (sm *SessionManager) CreateSessionWithTTL(userID, orgID, email, role string, ttl time.Duration) (*Session, error) {
 	now := time.Now()
 	expiresAt := now.Add(ttl)
+	return sm.createSessionWithExpiry(userID, orgID, email, role, now, expiresAt, "")
+}
+
+func (sm *SessionManager) createSessionWithExpiry(userID, orgID, email, role string, createdAt, expiresAt time.Time, sourceAPIKeyHash string) (*Session, error) {
+	if !expiresAt.After(createdAt) {
+		return nil, ErrSessionExpired
+	}
 
 	// Generate session token
 	var token string
@@ -122,13 +145,14 @@ func (sm *SessionManager) CreateSessionWithTTL(userID, orgID, email, role string
 	}
 
 	session := &Session{
-		Token:     token,
-		UserID:    userID,
-		OrgID:     orgID,
-		Email:     email,
-		Role:      role,
-		CreatedAt: now,
-		ExpiresAt: expiresAt,
+		Token:            token,
+		UserID:           userID,
+		OrgID:            orgID,
+		Email:            email,
+		Role:             role,
+		CreatedAt:        createdAt,
+		ExpiresAt:        expiresAt,
+		SourceAPIKeyHash: sourceAPIKeyHash,
 	}
 
 	// Store session in database
@@ -136,7 +160,7 @@ func (sm *SessionManager) CreateSessionWithTTL(userID, orgID, email, role string
 		if err := sm.storeSession(session); err != nil {
 			return nil, fmt.Errorf("failed to store session: %w", err)
 		}
-		sm.touchUserLastLogin(userID, orgID, now)
+		sm.touchUserLastLogin(userID, orgID, createdAt)
 	}
 
 	// Cache session
@@ -304,17 +328,24 @@ func (sm *SessionManager) storeSession(session *Session) error {
 
 	batch := sm.db.Session().Batch(gocql.LoggedBatch) // atomic: both inserts must succeed together
 	batch.Query(`
-		INSERT INTO sessions (token_hash, user_id, org_id, email, role, created_at, expires_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO sessions (token_hash, user_id, org_id, email, role, created_at, expires_at, source_api_key_hash)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 		USING TTL ?
 	`, tokenHash, session.UserID, session.OrgID, session.Email, session.Role,
-		session.CreatedAt, session.ExpiresAt,
+		session.CreatedAt, session.ExpiresAt, session.SourceAPIKeyHash,
 		ttlSeconds)
 	batch.Query(`
 		INSERT INTO sessions_by_user (org_id, user_id, token_hash)
 		VALUES (?, ?, ?)
 		USING TTL ?
 	`, session.OrgID, session.UserID, tokenHash, ttlSeconds)
+	if session.SourceAPIKeyHash != "" {
+		batch.Query(`
+			INSERT INTO sessions_by_api_key (api_key_hash, token_hash, org_id, user_id)
+			VALUES (?, ?, ?, ?)
+			USING TTL ?
+		`, session.SourceAPIKeyHash, tokenHash, session.OrgID, session.UserID, ttlSeconds)
+	}
 	return batch.Exec()
 }
 
@@ -337,10 +368,10 @@ func (sm *SessionManager) loadSession(token string) (*Session, error) {
 	session.Token = token
 
 	err := sm.db.Session().Query(`
-		SELECT user_id, org_id, email, role, created_at, expires_at
+		SELECT user_id, org_id, email, role, created_at, expires_at, source_api_key_hash
 		FROM sessions WHERE token_hash = ?
 	`, tokenHash).Scan(&session.UserID, &session.OrgID, &session.Email, &session.Role,
-		&session.CreatedAt, &session.ExpiresAt)
+		&session.CreatedAt, &session.ExpiresAt, &session.SourceAPIKeyHash)
 
 	if err != nil {
 		if errors.Is(err, gocql.ErrNotFound) {
@@ -358,14 +389,20 @@ func (sm *SessionManager) deleteSession(token string) error {
 
 	// Also need org_id/user_id to delete from sessions_by_user.
 	// Read them from the primary table first.
-	var orgID, userID string
+	var orgID, userID, sourceAPIKeyHash string
 	if err := sm.db.Session().Query(
-		`SELECT org_id, user_id FROM sessions WHERE token_hash = ?`, tokenHash,
-	).Scan(&orgID, &userID); err == nil && orgID != "" {
+		`SELECT org_id, user_id, source_api_key_hash FROM sessions WHERE token_hash = ?`, tokenHash,
+	).Scan(&orgID, &userID, &sourceAPIKeyHash); err == nil && orgID != "" {
 		sm.db.Session().Query(
 			`DELETE FROM sessions_by_user WHERE org_id = ? AND user_id = ? AND token_hash = ?`,
 			orgID, userID, tokenHash,
 		).Exec() //nolint:errcheck
+		if sourceAPIKeyHash != "" {
+			sm.db.Session().Query(
+				`DELETE FROM sessions_by_api_key WHERE api_key_hash = ? AND token_hash = ?`,
+				sourceAPIKeyHash, tokenHash,
+			).Exec() //nolint:errcheck
+		}
 	}
 
 	return sm.db.Session().Query(`
@@ -408,11 +445,21 @@ func (sm *SessionManager) InvalidateUserSessions(orgID, userID string) error {
 		}
 		batch := sm.db.Session().Batch(gocql.UnloggedBatch) // deletes are idempotent, no log needed
 		for _, th := range hashes[i:end] {
+			var sourceAPIKeyHash string
+			_ = sm.db.Session().Query(
+				`SELECT source_api_key_hash FROM sessions WHERE token_hash = ?`, th,
+			).Scan(&sourceAPIKeyHash)
 			batch.Query(`DELETE FROM sessions WHERE token_hash = ?`, th)
 			batch.Query(`DELETE FROM sessions_by_user WHERE org_id = ? AND user_id = ? AND token_hash = ?`,
 				orgID, userID, th)
+			if sourceAPIKeyHash != "" {
+				batch.Query(`DELETE FROM sessions_by_api_key WHERE api_key_hash = ? AND token_hash = ?`,
+					sourceAPIKeyHash, th)
+			}
 		}
-		batch.Exec() //nolint:errcheck
+		if err := batch.Exec(); err != nil {
+			return fmt.Errorf("invalidate user sessions batch: %w", err)
+		}
 	}
 
 	// 3. Evict from in-memory cache (scan for matching user)
@@ -420,6 +467,64 @@ func (sm *SessionManager) InvalidateUserSessions(orgID, userID string) error {
 	for tok, sess := range sm.cache {
 		if sess.UserID == userID && sess.OrgID == orgID {
 			delete(sm.cache, tok)
+		}
+	}
+	sm.cacheMu.Unlock()
+
+	return nil
+}
+
+// InvalidateAPIKeySessions invalidates all sessions minted from a specific API key.
+func (sm *SessionManager) InvalidateAPIKeySessions(apiKeyHash string) error {
+	if sm.db == nil || apiKeyHash == "" {
+		return nil
+	}
+
+	iter := sm.db.Session().Query(
+		`SELECT token_hash, org_id, user_id FROM sessions_by_api_key WHERE api_key_hash = ?`,
+		apiKeyHash,
+	).Iter()
+
+	type apiKeySessionRef struct {
+		tokenHash string
+		orgID     string
+		userID    string
+	}
+	var refs []apiKeySessionRef
+	var ref apiKeySessionRef
+	for iter.Scan(&ref.tokenHash, &ref.orgID, &ref.userID) {
+		refs = append(refs, ref)
+	}
+	if err := iter.Close(); err != nil {
+		return fmt.Errorf("read sessions_by_api_key: %w", err)
+	}
+
+	if len(refs) == 0 {
+		return nil
+	}
+
+	for i := 0; i < len(refs); i += 25 {
+		end := i + 25
+		if end > len(refs) {
+			end = len(refs)
+		}
+		batch := sm.db.Session().Batch(gocql.UnloggedBatch)
+		for _, item := range refs[i:end] {
+			batch.Query(`DELETE FROM sessions WHERE token_hash = ?`, item.tokenHash)
+			batch.Query(`DELETE FROM sessions_by_user WHERE org_id = ? AND user_id = ? AND token_hash = ?`,
+				item.orgID, item.userID, item.tokenHash)
+			batch.Query(`DELETE FROM sessions_by_api_key WHERE api_key_hash = ? AND token_hash = ?`,
+				apiKeyHash, item.tokenHash)
+		}
+		if err := batch.Exec(); err != nil {
+			return fmt.Errorf("invalidate api key sessions batch: %w", err)
+		}
+	}
+
+	sm.cacheMu.Lock()
+	for token, sess := range sm.cache {
+		if sess.SourceAPIKeyHash == apiKeyHash {
+			delete(sm.cache, token)
 		}
 	}
 	sm.cacheMu.Unlock()

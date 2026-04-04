@@ -544,8 +544,53 @@ These endpoints are used by Seafile desktop/mobile clients for sync. **DO NOT MO
 ### POST /api2/auth-token/
 **Handler**: `AuthHandler.Login`
 **File**: `internal/api/server.go`
-**Purpose**: Username/password login (dev mode only)
+**Purpose**: Desktop/CLI auth-token exchange. In dev mode accepts dev credentials; in production accepts `email + API key`
 **Added**: 2024-12-01
+
+### GET /api/v2.1/api-keys/
+**Handler**: `Server.handleListAPIKeys`
+**File**: `internal/api/server.go`
+**Registration**: `internal/api/server_routes.go`
+**Purpose**: List API keys for the authenticated user
+**Auth**: `authMiddleware`
+**Added**: 2026-04-03
+
+### POST /api/v2.1/api-keys/
+**Handler**: `Server.handleCreateAPIKey`
+**File**: `internal/api/server.go`
+**Registration**: `internal/api/server_routes.go`
+**Purpose**: Create a user API key. Raw key is returned once and never persisted in plaintext
+**Auth**: `authMiddleware`
+**Added**: 2026-04-03
+
+### DELETE /api/v2.1/api-keys/:key_hash/
+**Handler**: `Server.handleRevokeAPIKey`
+**File**: `internal/api/server.go`
+**Registration**: `internal/api/server_routes.go`
+**Purpose**: Revoke a user API key and invalidate any derived long-lived sessions
+**Auth**: `authMiddleware`
+**Added**: 2026-04-03
+
+### GET /api/v2.1/admin/users/:email/api-keys/
+**Handler**: `AdminHandler.AdminListUserAPIKeys`
+**File**: `internal/api/v2/admin_api_keys.go`
+**Registration**: `internal/api/v2/admin.go`
+**Purpose**: List API keys for a platform-org user
+**Added**: 2026-04-03
+
+### POST /api/v2.1/admin/users/:email/api-keys/
+**Handler**: `AdminHandler.AdminCreateUserAPIKey`
+**File**: `internal/api/v2/admin_api_keys.go`
+**Registration**: `internal/api/v2/admin.go`
+**Purpose**: Create an API key for a platform-org user
+**Added**: 2026-04-03
+
+### DELETE /api/v2.1/admin/users/:email/api-keys/:key_hash/
+**Handler**: `AdminHandler.AdminRevokeUserAPIKey`
+**File**: `internal/api/v2/admin_api_keys.go`
+**Registration**: `internal/api/v2/admin.go`
+**Purpose**: Revoke an API key for a platform-org user and invalidate any derived long-lived sessions
+**Added**: 2026-04-03
 
 ### GET /api/v2.1/auth/oidc/config/
 **Handler**: `AuthHandler.GetOIDCConfig`

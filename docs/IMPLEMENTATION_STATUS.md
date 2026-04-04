@@ -1,6 +1,6 @@
 # Implementation Status - SesameFS
 
-**Last Updated**: 2026-03-30
+**Last Updated**: 2026-04-03
 
 ---
 
@@ -14,15 +14,15 @@
 | Core Backend API | ~98% | GC ✅, OIDC ✅, Library Settings ✅, Monitoring ✅, Quotas ✅, Plans/Permissions Phase 1+2 ✅ |
 | Admin Panels | ~95% | Superadmin ✅, Org Admin ✅, both at parity. Audit logs pending |
 | Frontend UI | ~85% | All 122 modals migrated ✅, File History UI ✅, permission UI (~75% with granular flags), ~51 ModalPortal wrappers to clean up, Phase 3 quota/plan UI in progress |
-| Authentication | ~80% | OIDC Phase 1 complete, JWT revocation hardened (2026-03-31). **PATs/Device Flow missing — desktop sync broken in OIDC-only** |
+| Authentication | ~90% | OIDC Phase 1 complete, JWT revocation hardened (2026-03-31), and user API keys now cover desktop/CLI/automation auth in OIDC-only deployments. Device Flow and service-account flows remain future enhancements. |
 | Production Infrastructure | ✅ ~97% | GC ✅, Monitoring ✅, Health checks ✅, Structured logging ✅, Frontend/Backend separation ✅, Nginx production hardening ✅ |
 
-**Production Blockers (verified against code 2026-04-02)**:
+**Production Blockers (verified against code 2026-04-03)**:
 1. ~~OIDC Authentication~~ - ✅ COMPLETE (Phase 1 - Basic Login)
 2. ~~Garbage Collection~~ - ✅ COMPLETE (Queue worker + scanner + admin API)
 3. ~~Monitoring/Health Checks~~ - ✅ COMPLETE (slog logging, `/health`, `/ready`, `/metrics`)
 4. ~~Frontend/Backend Separation~~ - ✅ COMPLETE (2026-03-30/31) — separate React/nginx container, bootstrap API, nginx production hardening
-5. **Programmatic Auth (PATs)** - ❌ PENDING — `server.go:1141` TODO. Desktop/CLI cannot auth in OIDC-only mode. See `docs/TECHNICAL-DEBT.md` §6
+5. ~~Programmatic Auth (PATs)~~ - ✅ COMPLETE — user API keys ship via `/api/v2.1/api-keys/`, and `/api2/auth-token/` now exchanges `email + API key` for desktop/CLI tokens. Device Flow remains optional future work.
 6. **GC Multi-Instance Safety** - ❌ PENDING — `gc.go:99` Start() has no leader election. Unsafe with >1 replica
 7. ~~Quota Period Rollover~~ - ✅ COMPLETE — Period rollover job advances expired org quota periods and keeps monthly traffic enforcement moving
 
@@ -72,7 +72,7 @@
 | **File Tags** | ✅ COMPLETE | Mostly stable | ❌ No | 2026-02-12 | Repo tags + file tagging + cascade cleanup on delete/move + tag migration on rename |
 | **Batch Operations** | ✅ COMPLETE | Mostly stable | ❌ No | 2026-01-27 | Sync/async move/copy, task tracking |
 | **Search** | ✅ COMPLETE | Mostly stable | ❌ No | 2026-01-22 | Cassandra SASI implementation |
-| **OIDC Authentication** | ✅ COMPLETE | Mostly stable | ❌ No | 2026-03-31 | Phase 1 complete - SSO login working. JWT revocation hardened: revoked JWT tokens now checked against DB on cache miss (prevents re-authentication after logout/deactivation when `OIDC_JWT_SIGNING_KEY` is set) |
+| **OIDC Authentication** | ✅ COMPLETE | Mostly stable | ❌ No | 2026-04-03 | Phase 1 complete - SSO login working. JWT revocation hardened: revoked JWT tokens now checked against DB on cache miss (prevents re-authentication after logout/deactivation when `OIDC_JWT_SIGNING_KEY` is set). User API keys now cover non-browser auth and `/api2/auth-token/` exchange for desktop/CLI clients. |
 | **OIDC Group/Dept Sync** | ✅ COMPLETE | Mostly stable | ❌ No | 2026-02-02 | Claims extraction, sync on login, full sync mode |
 | **Garbage Collection** | ✅ COMPLETE | Mostly stable | ❌ No | 2026-03-18 | 9 item types (incl. `user_cascade`, `library_cascade`, `org_cascade`), 12 scanner phases, soft-delete cascades for users (7-day grace), libraries (30-day trash), orgs (30-day grace). Full artifact cleanup, atomic group deletion, audit log, health metrics |
 | **Admin Panel (Groups/Users)** | ✅ COMPLETE | Mostly stable | ❌ No | 2026-02-02 | 16 admin endpoints + OIDC group/dept sync, 29 tests |
@@ -326,7 +326,10 @@ Pending compatibility cleanup:
 
 | Endpoint | Status | Stability | Notes |
 |----------|--------|-----------|-------|
-| `POST /api2/auth-token/` | ✅ COMPLETE | Mostly stable | Login (dev mode only) |
+| `POST /api2/auth-token/` | ✅ COMPLETE | Mostly stable | Login via dev credentials or `email + API key` exchange |
+| `GET /api/v2.1/api-keys/` | ✅ COMPLETE | Mostly stable | List authenticated user's API keys |
+| `POST /api/v2.1/api-keys/` | ✅ COMPLETE | Mostly stable | Create authenticated user's API key |
+| `DELETE /api/v2.1/api-keys/:key_hash/` | ✅ COMPLETE | Mostly stable | Revoke API key and invalidate derived sessions |
 | `GET /api2/account/info/` | ✅ COMPLETE | Mostly stable | User info with permission flags |
 | `GET /api2/server-info/` | ✅ COMPLETE | Mostly stable | Server capabilities |
 | `GET /api/v2.1/auth/oidc/config/` | ✅ COMPLETE | Mostly stable | Public OIDC configuration (2026-01-28) |
@@ -595,7 +598,7 @@ These MUST be completed before production deployment:
 - ❌ TODO: ~2 components (audit logs, monitored-repos)
 
 **Production Readiness**:
-- Backend: ~98% (all production blockers complete, both admin panels implemented)
+- Backend: ~98% (core auth blocker complete, both admin panels implemented; GC multi-instance safety still pending)
 - Frontend: ~85% (modals done, granular permission flags enforced, missing: some permission UI edge cases, ~51 ModalPortal wrapper cleanup)
 - Infrastructure: ~95% (monitoring ✅, health checks ✅, GC ✅)
 - Documentation: ~70% (missing: user/admin guides, deployment guide)

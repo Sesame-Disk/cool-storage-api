@@ -103,13 +103,33 @@ Object data starts with a type byte:
 
 ---
 
-## Authentication - ✅ Basic Complete
+## Authentication and API Keys - ✅ Complete
 
 | Endpoint | Method | Status | Notes |
 |----------|--------|--------|-------|
-| `/api2/auth-token/` | POST | ✅ | Login (dev mode) |
+| `/api2/auth-token/` | POST | ✅ | Desktop/CLI login. In dev mode accepts dev credentials; in production accepts `email + API key` |
+| `/api/v2.1/api-keys/` | GET | ✅ | List API keys for the authenticated user |
+| `/api/v2.1/api-keys/` | POST | ✅ | Create user API key (raw key returned once) |
+| `/api/v2.1/api-keys/:key_hash/` | DELETE | ✅ | Revoke user API key and invalidate derived sessions |
 | `/api2/account/info/` | GET | ✅ | User info |
 | `/api2/server-info/` | GET | ✅ | Server capabilities |
+
+### API Key Semantics
+
+- Scopes: `read`, `read-write`, `admin`
+- Raw API keys are only returned on creation and are never persisted in plaintext
+- Revoking an API key also invalidates sync/API-token sessions minted from that key
+- If an API key has an expiry, the `/api2/auth-token/` session created from it cannot outlive that key
+
+### Admin User API Keys - ✅ Complete
+
+Platform superadmins can manage API keys for platform-org users through the admin user subresource.
+
+| Endpoint | Method | Status | Notes |
+|----------|--------|--------|-------|
+| `/api/v2.1/admin/users/:email/api-keys/` | GET | ✅ | List API keys for a platform user |
+| `/api/v2.1/admin/users/:email/api-keys/` | POST | ✅ | Create API key for a platform user |
+| `/api/v2.1/admin/users/:email/api-keys/:key_hash/` | DELETE | ✅ | Revoke API key and invalidate derived sessions |
 
 ---
 

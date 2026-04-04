@@ -391,6 +391,51 @@ func TestSessionManager_CreateAPITokenSession(t *testing.T) {
 	if apiDuration <= webDuration {
 		t.Errorf("API token duration (%v) should be longer than web session duration (%v)", apiDuration, webDuration)
 	}
+	if session.SourceAPIKeyHash != "" {
+		t.Errorf("SourceAPIKeyHash = %q, want empty for non-derived API token sessions", session.SourceAPIKeyHash)
+	}
+}
+
+func TestSessionManager_CreateAPITokenSessionFromAPIKey(t *testing.T) {
+	cfg := &config.OIDCConfig{
+		SessionTTL:  24 * time.Hour,
+		APITokenTTL: 180 * 24 * time.Hour,
+	}
+	sm := &SessionManager{
+		config: cfg,
+		cache:  make(map[string]*Session),
+	}
+
+	session, err := sm.CreateAPITokenSessionFromAPIKey("user-api", "org-api", "api@example.com", "user", "hash-123", nil)
+	if err != nil {
+		t.Fatalf("CreateAPITokenSessionFromAPIKey() error = %v", err)
+	}
+	if session.SourceAPIKeyHash != "hash-123" {
+		t.Fatalf("SourceAPIKeyHash = %q, want %q", session.SourceAPIKeyHash, "hash-123")
+	}
+}
+
+func TestSessionManager_CreateAPITokenSessionFromAPIKey_InheritsShorterKeyExpiry(t *testing.T) {
+	cfg := &config.OIDCConfig{
+		SessionTTL:  24 * time.Hour,
+		APITokenTTL: 180 * 24 * time.Hour,
+	}
+	sm := &SessionManager{
+		config: cfg,
+		cache:  make(map[string]*Session),
+	}
+
+	apiKeyExpiresAt := time.Now().Add(2 * time.Hour)
+	session, err := sm.CreateAPITokenSessionFromAPIKey("user-api", "org-api", "api@example.com", "user", "hash-123", &apiKeyExpiresAt)
+	if err != nil {
+		t.Fatalf("CreateAPITokenSessionFromAPIKey() error = %v", err)
+	}
+	if session.ExpiresAt.After(apiKeyExpiresAt.Add(100 * time.Millisecond)) {
+		t.Fatalf("session.ExpiresAt = %v, want <= apiKeyExpiresAt %v", session.ExpiresAt, apiKeyExpiresAt)
+	}
+	if session.ExpiresAt.Before(apiKeyExpiresAt.Add(-1 * time.Second)) {
+		t.Fatalf("session.ExpiresAt = %v, want close to apiKeyExpiresAt %v", session.ExpiresAt, apiKeyExpiresAt)
+	}
 }
 
 // TestSessionManager_CreateSessionWithTTL tests custom TTL session creation

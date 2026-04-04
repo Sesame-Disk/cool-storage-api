@@ -61,6 +61,7 @@ API Response → Dirent Model → React State → Component Render
 2. **Token-Based Auth Only** - Uses `Authorization: Token xyz` header
 3. **Runtime Bootstrap** - The SPA/admin shells are static HTML containers; `src/bootstrap/runtime-bootstrap.js` initializes `window.app`, merges optional `window.SESAMEFS_CONFIG`, and hydrates page options from `/api/v2.1/bootstrap/`. Public share/upload shells follow the same pattern through `src/bootstrap/share-runtime-bootstrap.js`.
 4. **Login Page** - Custom login component instead of Django views
+5. **Profile API Keys UI** - `/profile/#api-keys` is now a first-class self-service screen behind the bootstrap flag `enableAPIKeys`. The older Web API Auth Token screen remains as a legacy compatibility surface.
 
 ---
 
@@ -250,6 +251,13 @@ function logout() {
   window.location.href = '/login/';
 }
 ```
+
+### Programmatic Access Surfaces
+
+- Web sessions still use the frontend login flow above.
+- User API keys are managed from `/profile/#api-keys` when `enableAPIKeys` is true in bootstrap page options.
+- Desktop clients, SeaDrive, and CLI tools authenticate by calling `POST /api2/auth-token/` with the user email as `username` and the raw API key as `password`.
+- Revoking a key from the profile UI or from the sysadmin user page invalidates any long-lived sessions created from that key.
 
 ---
 

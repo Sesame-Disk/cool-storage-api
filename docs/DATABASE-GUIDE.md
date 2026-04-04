@@ -15,7 +15,8 @@ Migrations are managed by `internal/db/migrator.go` using versioned `.cql` files
 ```
 internal/db/migrations/
   001_initial_schema.cql   ← complete baseline schema (50 tables)
-  NNN_description.cql      ← future incremental changes
+    002_api_keys.cql         ← user API keys + API-key-derived session provenance
+    NNN_description.cql      ← future incremental changes
 ```
 
 ### Tracking table
@@ -61,6 +62,21 @@ sesamefs migrate --check       # exit non-zero if any migration is pending (CI)
 | `internal/db/migrator.go` | `Migrator` — `Run()`, `Status()`, `DryRun()`, `Check()` |
 | `internal/db/migrations/*.cql` | Versioned schema files (embedded in binary) |
 | `internal/db/db.go` | `DB.Migrate()` — calls runner + idempotent Go backfills |
+
+---
+
+## API Keys and Derived Sessions
+
+`002_api_keys.cql` currently owns both the API key tables and the session provenance needed for strong revocation semantics.
+
+| Schema element | Purpose |
+|------|---------|
+| `api_keys` | Primary table keyed by `key_hash` |
+| `api_keys_by_user` | Reverse index for listing a user's keys newest-first |
+| `sessions.source_api_key_hash` | Records which API key minted a long-lived session |
+| `sessions_by_api_key` | Reverse index used to invalidate all sessions derived from a revoked key |
+
+Operational note: because migrations are checksum-validated, any future change to this schema must go into a new migration file. Do not edit `002_api_keys.cql` after it has been applied in any environment.
 
 ---
 
