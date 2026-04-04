@@ -588,7 +588,8 @@ User completes payment in Accounts
         |
         v
 Accounts calls PUT /api/v2.1/admin/organizations/:org_id/
-with service token + new plan + quota_policy + quota values + current period values
+with a dedicated platform service account API key (admin scope)
+with new plan + quota_policy + quota values + current period values
         |
         v
 SesameFS updates org: plan (display), quota_policy, current period fields and quota fields
@@ -630,16 +631,37 @@ if isServiceAuth {
 
 If the M2M flow needs a dedicated endpoint later, the handler internals are already separated.
 
-### Service Token (future)
+### Accounts Provisioning Auth (current plan)
 
-Not implemented yet. This section is only about Accounts -> SesameFS machine-to-machine provisioning.
-User-scoped non-browser auth is already covered separately by user API keys plus `/api2/auth-token/` exchange.
+Accounts will authenticate with a dedicated technical user in the platform org, not with a human session.
 
-Design:
-- Dedicated `service_tokens` table with hashed tokens, name, scope, expiry
-- Separate middleware (`serviceAuthMiddleware`) validates `X-Service-Token` header
-- Initial scope: full superadmin-equivalent for provisioning simplicity
-- Future: granular scopes (`provisioning.organizations.write`, etc.)
+Runbook:
+- See [ACCOUNTS-PROVISIONING-RUNBOOK.md](ACCOUNTS-PROVISIONING-RUNBOOK.md) for the exact bootstrap, rotation, smoke-test, and revocation procedure.
+
+Operational contract:
+- create a non-human platform user such as `accounts-provisioner`
+- keep that user in the platform org with role `superadmin`
+- generate an admin-scope API key for that user
+- Accounts sends the raw key through the normal API auth header: `Authorization: Token <raw_api_key>`
+- Accounts calls the existing admin/org-admin endpoints directly; it does not use `/api2/auth-token/` or browser-style session flows
+- use one service account key per environment and rotate it explicitly
+- label the key clearly and treat it as a machine credential, not as a shared human token
+
+Why this is acceptable now:
+- platform admin routes already require both platform-superadmin privilege and admin API key scope
+- the auth path is already implemented and tested through the normal API key middleware
+- this avoids adding a second auth system before launch when the existing API key model already satisfies the privilege boundary
+
+### Future Hardening Option
+
+A dedicated `service_tokens` model remains optional future work if we later need stronger separation between human API keys and machine identities.
+
+Possible future design:
+- dedicated `service_tokens` table with hashed tokens, name, scope, expiry
+- separate middleware (`serviceAuthMiddleware`) for non-user machine identities
+- granular scopes such as `provisioning.organizations.write`, `provisioning.users.write`, `provisioning.subscriptions.write`
+
+This is now a hardening/cleanliness improvement, not a launch blocker.
 
 ---
 
@@ -825,8 +847,8 @@ Phase 2 implementation notes:
 |------|------|--------|
 | 4.1 | Add preview/evaluate endpoint for proposed plan/quota changes | Medium |
 | 4.2 | ✅ Periodic quota-period rollover job for orgs with `current_period_ends_at <= now` | Done |
-| 4.3 | Implement `service_tokens` table + middleware | Medium |
-| 4.4 | Add M2M code path in admin org update handler (idempotency, audit) | Medium |
+| 4.3 | Provision dedicated platform service account + admin API key for Accounts | Low |
+| 4.4 | Add/finish M2M code path in admin org update handler (idempotency, audit, source tagging) | Medium |
 | 4.5 | Design invite flow for user creation | Medium |
 | 4.6 | ✅ `max_users` enforcement in OIDC provision | Done |
 

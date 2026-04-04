@@ -1,867 +1,184 @@
 ================================================================================
-  QUOTAS — PENDIENTES Y GAPS CONOCIDOS
-    Última actualización: 2026-04-02
+  QUOTAS — PENDIENTES VIGENTES
+    Última actualización: 2026-04-04
 ================================================================================
 
-## RESUMEN DE ESTADO (verificado contra código 2026-04-02)
-
-    IMPLEMENTADO:
-    [ok] Phase 1 backend — owner role, quota_policy, enforcement profiles, defaults (2026-03-27)
-    [ok] Phase 2 backend — capability resolver wired a account/info (server.go:1438) y
-         bootstrap (bootstrap.go:271), enforcement en share links (share_links.go:515),
-         upload links (upload_links.go:281), libraries (libraries.go:447),
-         groups (groups.go:337), traffic_period_usage table (2026-03-28)
-    [ok] Quota enforcement — CheckStorageQuota, CheckTrafficQuota, CheckMaxUsers en 11 archivos
-    [ok] Traffic recording — 6 tipos, per-org/user/platform, monthly + period aggregates
-    [ok] Storage time-series — storage_daily_delta con ReconstructStorageHistory()
-    [ok] Share optimization — shares_by_creator y shares_by_recipient existen y se usan
-    [ok] Frontend stats — gráficas de tráfico y storage con datos reales (sysadmin + org-admin)
-    [ok] Legacy frontend — personalfree/business/pay_restricted* eliminados; isFreeUser es alias @deprecated
-
-    PENDIENTE — P0 (bloqueadores):
-    [ok] Rollover job de períodos — internal/traffic/rollover.go + gc.go loop cada 1h (2026-04-02)
-            Períodos siempre mensuales. Accounts es fuente de verdad para paid, pero el cron avanza igual el período mensual vencido para no depender del sync externo.
-            Seed/default templates y rollover usan la misma helper explícita de quota period: +1 mes calendario con clamping del día, sin depender de billing_cycle.
-
-    PENDIENTE — P1 (frontend Phase 3):
-    [ok] Quota warning banners — interceptor axios en quota-warning.js + CORS ExposeHeaders fix (2026-04-02)
-    [ok] Estandarización unidades GB — defaults backend a decimal (1000³), formatSize a base-1000 (2026-04-02)
-            Contrato de quota en GB/TB = decimal. Los 1024 restantes se reservan para límites técnicos/compatibilidad.
-    [ok] pageOptions placeholders en org-admin — verificado funcional, no es bloqueante (2026-04-02)
-     [ok] Vista de subscription/quota para owner — unificada en `/org/subscription/` (2026-04-02)
-            El link del owner en account.js ahora apunta directo al org-admin subscription view.
-                Se eliminó la SPA standalone `subscription.html` del build. La página activa es solo la vista org-admin y sigue siendo informativa; el único camino de acción es `/billing/`.
-
-    PENDIENTE — Phase 4 (post-lanzamiento):
-    [ ] Service token M2M (Accounts → SesameFS)
-    [ ] Preview/evaluate endpoint para cambios de plan
-    [ ] Flujo de invite/create users via Accounts
-
-    DECISIONES PENDIENTES:
-    [ ] ¿Accounts enviará siempre el org_id interno?
-    [ ] ¿Guardar accounts_org_id / subscription_id?
-    [ ] ¿Snapshot de users pre-downgrade para reactivación automática?
-
-================================================================================
-
-## UPDATE 2026-03-30 — PHASE 3 FRONTEND EN PROGRESO (NO CERRADA)
-
-[ok] Defaults de organizaciones ya salen del template/config y no de hardcodes dispersos
-                - create organization (superadmin) usa template configurable
-                - auto-provision OIDC usa template configurable
-                - seed/default org usa template configurable
-                - sysadmin orgs ya muestra `owner` / `plan` en vez de `creator` / `role`
-
-[ok] Ownership transfer y límites de miembros ya tienen cobertura funcional en las vistas críticas
-                - superadmin puede transferir ownership vía cambio de role a `owner`
-                - org-admin ahora ve `Transfer ownership` también desde la pantalla de users
-                - sysadmin users bloquea `Add Member` cuando `max_users` ya fue alcanzado
-                - org-admin users ahora calcula el límite con `orgAdminGetOrgInfo()` real, no con placeholders
-
-[ ] Phase 3 frontend sigue abierta por dependencias legacy y bootstrap incompleto
-                - `window.org.pageOptions` en org-admin todavía inyecta placeholders (`hasUserAvailability=true`,
-                    `orgMembersQuota=0`, flags de invite/custom-branding/subscription/SAML en falso)
-                - Ya no afecta el gating principal de users ni el bloque de límites en info,
-                    pero todavía puede desalinear otras pantallas de org-admin
-                - Candidatos conocidos: invite flags, web settings, navegación subscription/SAML
-
-[ok] Convención de unidades de quota ya quedó alineada
-                - El contrato de quotas/planes usa `GB`/`TB` decimales (`1000^3`, `1000^4`) en backend,
-                    frontend, defaults y documentación pública
-                - Los límites técnicos internos que siguen siendo binarios ahora se etiquetan como `GiB`
-                    para no mezclar capacidad contratada con umbrales de preview/streaming
-                - Queda aceptado que valores arbitrarios de tests/fixtures puedan no ser múltiplos exactos
-                    de GB/TB, pero ya no se documentan como si fueran tamaños comerciales
-
-## UPDATE 2026-03-28 — PHASE 2 BACKEND COMPLETADA
-
-[ok] `traffic_period_usage` ya existe como agregado canónico por período de quota
-                - Se agregó la tabla counter en migraciones
-                - `TrafficRecorder` ahora escribe tanto `traffic_monthly` (analytics natural-month)
-                    como `traffic_period_usage` (enforcement y payloads Phase 2)
-                - `QuotaChecker` dejó de evaluar tráfico contra `traffic_monthly` y ahora usa
-                    `current_period_started_at` + `traffic_period_usage`
-
-[ok] `/api2/account/info/` y `/api/v2.1/subscription/` ya usan tráfico por período efectivo
-                - Los objetos `traffic{}` ahora leen uso del período actual
-                - `traffic_reset_date` vuelve a tomar `current_period_ends_at` como fuente canónica
-                - `upgrade_features` se alinea con el contrato del frontend (`add_group`, etc.)
-
-[ok] Los checks de enforcement profile de Phase 2 quedaron cableados en operaciones clave
-                - creación de share links
-                - creación de upload links
-                - creación de libraries
-                - creación de groups / group-owned libraries
-
-[>] Lo pendiente principal ya no es Phase 2 backend, sino fases posteriores
-                - migración/consumo frontend completo del nuevo contrato (Phase 3)
-                - rollover job por `current_period_ends_at <= now` (Phase 4)
-                - auth M2M / service tokens para provisioning externo (Phase 4)
-
-## CONTEXTO NUEVO / DIRECCION ACORDADA (2026-03-26)
-
-- **Accounts será la fuente externa de verdad** para planes, ciclo de billing y límites.
-- SesameFS **no debe inferir negocio desde nombres de plan** ni convertirse en el sistema de billing.
-- Los cambios de plan y límites llegarán desde Accounts vía **API superadmin**.
-- Para esa integración hace falta una autenticación de servicio: idealmente **token de provisioning dedicado**, no una sesión humana de superadmin reciclada.
-- Ese token no será solo para quotas: debe poder ejecutar operaciones de aprovisionamiento con alcance de **superadmin técnico** (crear orgs, crear/asignar users, actualizar subscription, etc.).
-- `users.role` debe seguir significando **permisos del usuario dentro de su organización**.
-- `organizations.plan` debe pasar a significar **identificador opaco del plan externo**. No debe reutilizarse para lógica de permisos.
-- El legacy `personalfree`, `business`, `pay_restricted_owner`, `restricted` pertenece a una semántica vieja mezclada entre plan, owner y estado de quota. Eso hay que separarlo.
-
-
-## HALLAZGOS IMPORTANTES (2026-03-26)
-
-[ ] El "Role" de la lista de organizaciones no es real
-        - Backend devuelve `role: "default"` fijo en el listado de orgs
-        - Frontend lo muestra como selector editable
-        - El endpoint de update de organización no persiste ese campo
-        - Conclusión: esa columna induce a error; debe renombrarse a `Plan` o eliminarse
-
-[ ] Hoy se mezcla `role` de usuario con semántica legacy de plan en frontend
-        - `GET /api2/account/info/` devuelve `role=admin|user|readonly|guest|superadmin`
-        - `frontend/src/app.js` copia ese valor a `window.app.pageOptions.userRole`
-        - Pero `footer-upgrade.js`, `ad.js` y `constants.js` esperan valores como
-            `personalfree`, `business`, `restricted`, `pay_restricted_owner`
-        - Resultado: la capa de UI no tiene un modelo canónico para subscription/plan
-
-[ ] Las organizaciones nuevas no reciben un default free plan consistente
-        - Seed, auto-provision OIDC y create organization insertan storage quota por defecto
-            pero no fijan `plan`, `billing_cycle`, `traffic_quota`, `traffic_upload_quota`,
-            `traffic_download_quota` ni `max_users`
-        - El checker actual trata `plan == ""` como free, pero los límites reales pueden quedar abiertos
-        - Resultado: una org "nueva" puede ser semánticamente free y operativamente no-free al mismo tiempo
-
-[ ] La lógica de free/pago depende demasiado del nombre textual del plan
-        - Hoy `isFree(plan)` devuelve true solo para `""` o `"free"`
-        - Eso no escala si Accounts cambia el catálogo o introduce más tiers/nombres
-        - La política de enforcement debe modelarse explícitamente y no deducirse del string
-
-
-## CRUCE CON LOS DOCS DEL PROYECTO (2026-03-26)
-
-[ok] `docs/ROLES-AND-PERMISSIONS.md` ya define que `users.role` es solo permiso
-    - El doc separa explícitamente `role` (permiso) de `status` (lifecycle)
-    - La jerarquía actual `superadmin/admin/user/readonly/guest` es tenant/platform auth
-    - Conclusión: no conviene reintroducir semántica de billing en `users.role`
-
-[ok] `docs/ROLES-AND-PERMISSIONS.md` + `docs/KNOWN_ISSUES.md` documentan que el frontend actual recibe flags de permiso desde backend
-    - `can_add_repo`, `can_share_repo`, `can_add_group`, `can_generate_share_link`, etc.
-    - Hoy esos flags salen principalmente del `role`
-    - Conclusión: la evolución correcta es que esos flags pasen a resolverse por `role base` AND `plan profile`
-
-[ok] `docs/QUOTAS-AND-TRAFFIC-PLAN.md` ya alinea el sistema con billing externo por org
-    - El documento dice que un billing service externo actualiza `plan`, `billing_cycle` y límites en `organizations`
-    - Todo el enforcement de quota está pensado a nivel de org y user quota override, no a nivel de pseudo-role comercial
-    - Conclusión: el diseño correcto sigue siendo org-centric, no owner-role-centric
-
-[ok] `docs/OIDC.md` y `docs/ADMIN-FEATURES.md` ya asumen que endpoints admin pueden ser llamados por sistemas externos
-    - OIDC.md habla de management UIs / provider webhooks sobre `/api/v2.1/admin/`
-    - Admin features documenta que `CreateOrganization`, `UpdateOrganization` y lifecycle org son superadmin-only
-    - Conclusión: extender esto a un provisioning token técnico encaja con la arquitectura actual
-
-[ok] `docs/ARCHITECTURE.md` refuerza que la unidad de aislamiento es la org
-    - La multi-tenancy está planteada por `org_id`
-    - La fase 2 habla de aislamiento configurable per-customer, storage classes por customer y políticas por org
-    - Conclusión: subscription, quotas y features comerciales deben vivir en la org, no en strings de role del user
-
-[ok] `docs/DASHBOARD-REDESIGN-PLAN.md` ya pide una capa explícita de quota/subscription
-    - Superadmin y org-admin dashboards deben mostrar quota status, billing cycle, watchlists de riesgo y warnings
-    - Se propone una `Quota and subscription template`
-    - Conclusión: hace falta exponer `plan/subscription` como concepto de primera clase al frontend
-
-
-## CONCLUSIONES DE ARQUITECTURA (legacy Seafile -> SesameFS robusto)
-
-[ok] El modelo legacy de Seafile mezclaba 4 dimensiones en un solo "role"
-    - permisos del usuario
-    - plan/comercial del tenant
-    - condición especial del owner creador
-    - estado de restricción por quota
-    - Conclusión: en SesameFS esas dimensiones deben separarse explícitamente
-
-[ok] En SesameFS el `role` debe quedarse solo como autorización
-    - `superadmin/admin/user/readonly/guest`
-    - Aplica a seguridad, navegación y acciones base del usuario
-    - No debe cargar `personalfree`, `business`, `pay_restricted_owner`, etc.
-
-[ok] El `plan` y sus capacidades deben ser org-level
-    - El tenant/org es la unidad natural de subscription según docs y esquema multi-tenant
-    - Los templates de config y los updates de Accounts deben aterrizar sobre la org
-    - El enforcement de quotas/features debe leer el estado efectivo de la org
-
-[ok] El owner creador debe modelarse como condición separada, no como role comercial
-    - En Seafile solo el owner entraba en perfiles tipo `personalfree/personalpro/business`
-    - Eso sugiere que el concepto real no era un role de seguridad, sino una condición especial del owner frente a billing/subscription
-    - En SesameFS eso debería modelarse como `org owner` o capacidad equivalente, separado del `role`
-
-[ok] `restricted`, `pay_restricted` y `pay_restricted_owner` deben migrarse a estado de restricción
-    - No como roles
-    - Sí como un `restriction_state` o perfil derivado por quota/impago/limitación comercial
-    - La excepción del owner se resuelve combinando `restriction_state + owner capability`, no inventando otro role
-
-[ok] El cálculo correcto de capacidades debe ser por capas
-    - `role base del user`
-    - AND `feature flags del plan/org`
-    - AND `restriction state` si aplica
-    - AND `owner capabilities` cuando corresponda
-
-[ok] La primera versión no necesita portar todos los flags legacy de Seafile
-    - Priorizar flags ya vivos o cercanos:
-      `can_add_repo`, `can_share_repo`, `can_add_group`,
-      `can_generate_share_link`, `can_generate_upload_link`,
-      `can_invite_guest`, `can_send_share_link_mail`, `can_publish_repo`
-    - Dejar para más tarde flags de clientes mobile/desktop, rate limits y otros gating legacy menos críticos
-
-[ok] El frontend debe dejar de usar `userRole` como contenedor universal
-    - `userRole` debe representar solo permisos del usuario
-    - `plan/subscription` debe viajar aparte
-    - `restriction_state` y `is_org_owner` también deben ser conceptos separados en responses/UI si hacen falta
-
-[ok] Traducción conceptual del legacy de Seafile al modelo nuevo
-    - `default` -> perfil base/template de org, no role de user
-    - `guest` -> sigue siendo role de user
-    - `personalfree/personalpro/business/pro` -> templates o plan profiles de org
-    - `restricted/pay_restricted` -> restriction state
-    - `pay_restricted_owner` -> restriction state + owner capability
-
-
-## PLAN PROPUESTO — MODELO CANONICO ACCOUNTS -> SESAMEFS
-
-### Flujo operativo esperado
-
-1. Usuario crea una cuenta/servicio de cloud storage en Accounts.
-2. Accounts aprovisiona la org en SesameFS vía API.
-3. SesameFS crea la org con un estado efectivo inicial en DB.
-4. Si el usuario hace upgrade, downgrade, deja de pagar o cambia de subscription,
-    Accounts envía otro update a SesameFS.
-5. SesameFS actualiza la org y la nueva subscription efectiva entra a regir.
-6. El superadmin puede seguir haciendo ajustes manuales para personalizaciones,
-    incidentes o acuerdos especiales.
-7. Si luego Accounts vuelve a sincronizar esa org, **Accounts tiene la última palabra**
-    salvo que se defina explícitamente un mecanismo de override persistente.
-
-### 1. Separar definitivamente identidad, permisos y subscription
-
-- **Usuario / permisos**: `users.role`
-    - Valores actuales: `superadmin`, `admin`, `user`, `readonly`, `guest`
-    - Solo define autorización funcional dentro de la org
-
-- **Organización / subscription**: `organizations.*`
-    - `plan`: identificador opaco enviado por Accounts
-    - `billing_cycle`: mensual/anual si Accounts lo quiere exponer
-    - `storage_quota`, `traffic_quota`, `traffic_upload_quota`, `traffic_download_quota`, `max_users`
-    - Hace falta agregar una señal explícita de enforcement, por ejemplo:
-        - `quota_policy = hard-stop | soft-overage`
-        - o equivalente booleano/enum controlado por Accounts
-
-- **Estado derivado para UX**: respuesta de API al frontend
-    - El frontend no debe leer plan desde `role`
-    - Debe recibir un objeto o flags de subscription separados, por ejemplo:
-        - `plan_code`
-        - `is_paid`
-        - `quota_policy`
-        - `is_over_quota`
-        - `can_upgrade`
-        - `is_org_owner` si hiciera falta para CTA/banners
-
-### 2. Accounts define catálogo; SesameFS solo materializa y aplica
-
-- El catálogo de 4 planes actuales sirve como contexto, pero **no debe codificarse como enum fijo** en SesameFS
-- SesameFS solo necesita:
-    - recibir el identificador del plan
-    - guardar los límites concretos
-    - guardar la política de enforcement
-    - aplicar checks técnicos y exponer estado al frontend
-
-- En la práctica:
-    - el nombre del plan puede cambiar sin romper enforcement
-    - la lógica de free vs pago sale de `quota_policy`, no de comparar strings
-
-### 2.1. Catálogo de planes en archivo de config: sí, pero con un rol acotado
-
-- Tener planes en config **sí puede servir**, pero no como source of truth final.
-- Lo correcto sería usar config para uno o más de estos fines:
-    - catálogo local de planes conocidos (`free`, `starter`, `business`, etc.)
-    - valores por defecto para aprovisionamiento inicial
-    - presets reutilizables para asignación manual de orgs desde superadmin
-    - validación/normalización de planes conocidos
-
-- Lo que **no** conviene hacer:
-    - depender solo del archivo para saber el estado actual de una org
-    - impedir que Accounts envíe límites custom que no existan en config
-    - recalcular en cada request los límites de la org leyendo el catálogo y olvidando la DB
-
-- Regla recomendada:
-    - **Config = catálogo/presets**
-    - **DB organization row = estado efectivo actual**
-    - **Accounts = última palabra para updates de billing/subscription**
-
-- Esto permite dos cosas a la vez:
-    - tener planes estándar definidos localmente
-    - soportar personalizaciones por org sin romper el modelo
-
-### 2.2. Overrides manuales del superadmin
-
-- Si el superadmin va a poder personalizar quotas, hay que modelarlo explícitamente.
-- Hay 3 opciones razonables:
-
-- **Opción A: override efímero/manual**
-    - superadmin cambia límites en la org
-    - Accounts puede pisarlos en el próximo sync
-    - simple, pero propenso a sorpresas
-
-- **Opción B: override persistente local**
-    - la org guarda además un bloque de overrides locales
-    - el estado efectivo se calcula como `subscription base + overrides`
-    - útil si realmente habrá acuerdos especiales frecuentes
-
-- **Opción C: personalización solo en Accounts**
-    - superadmin no edita límites directamente o solo en modo break-glass
-    - la personalización real se registra en Accounts y luego se sincroniza hacia SesameFS
-    - es el modelo más limpio si Accounts gobierna el billing
-
-- Recomendación actual:
-    - si la personalización va a existir de verdad, el modelo más sólido es **base desde Accounts + override local explícito**
-    - si será algo raro, mejor **override efímero** con advertencia clara de que Accounts lo puede pisar
-
-### 3. Provisioning inbound desde Accounts
-
-- Recomendado: **endpoint idempotente de provisioning** para updates externos
-- Opciones:
-    - reutilizar `PUT /api/v2.1/admin/organizations/:org_id/` ampliándolo con auth de servicio
-    - o crear un endpoint dedicado tipo `/api/v2.1/admin/provisioning/organizations/:org_id/subscription/`
-
-- Payload mínimo sugerido:
-    - `plan`
-    - `billing_cycle`
-    - `quota_policy`
-    - `storage_quota`
-    - `traffic_quota`
-    - `traffic_upload_quota`
-    - `traffic_download_quota`
-    - `max_users`
-    - `updated_at` o `version`
-    - `source = "accounts"`
-
-- Requisitos:
-    - idempotencia
-    - trazabilidad
-    - validación fuerte de límites
-    - protección contra updates viejos fuera de orden
-
-### 4. Autenticación para provisioning externo
-
-- **No recomendado**: usar un token de sesión de un humano superadmin
-    - expira/rota como sesión humana
-    - cuesta auditarlo como integración máquina-a-máquina
-    - mezcla identidad personal con identidad de servicio
-
-- **Recomendado**: token dedicado de servicio
-    - un solo propósito: provisioning Accounts -> SesameFS
-    - con rotación explícita
-    - con scope acotado a endpoints de provisioning/admin necesarios
-    - con audit log propio
-
-- Importante: este token debe modelarse como una **identidad técnica con privilegios de superadmin para aprovisionamiento**.
-    - No significa reutilizar el modelo de sesión de un humano superadmin.
-    - Sí significa que puede invocar endpoints equivalentes a tareas de superadmin cuando el caso de uso lo requiera.
-    - Ejemplos: crear org, crear usuario owner inicial, actualizar plan/quotas, dar de alta/baja orgs o usuarios si Accounts gobierna ese ciclo.
-
-- Recomendación de diseño:
-    - usar un middleware de `service auth` separado
-    - fase inicial: tratarlo como `superadmin-equivalent` completo para simplificar
-    - fase posterior: si hace falta, endurecerlo con scopes concretos, por ejemplo:
-        - `provisioning.organizations.write`
-        - `provisioning.users.write`
-        - `provisioning.subscriptions.write`
-    - o sea: empezar simple, pero sin cerrar la puerta a scopes granulares después
-
-- A nivel de implementación puede entrar como:
-    - `Authorization: Bearer <provisioning-token>`
-    - o `X-Provisioning-Token: <token>`
-    - pero debe validarse en middleware aparte, no como sesión normal de usuario
-
-### 5. Default plan obligatorio al crear org
-
-- Toda org nueva debe nacer con un **default plan explícito** aunque luego Accounts la actualice
-- Recomendación inicial:
-    - `plan = "free"` o el code canónico que defina Accounts
-    - `billing_cycle = "monthly"`
-    - `quota_policy = "hard-stop"`
-    - límites free completos y explícitos
-
-- Esto debe aplicarse en:
-    - seed de default org
-    - create organization en admin
-    - auto-provision OIDC de orgs nuevas
-
-- Objetivo:
-    - evitar orgs "sin plan" ambiguas
-    - evitar depender de `plan == ""`
-    - asegurar enforcement consistente desde el primer request
-
-### 6. Migración del legacy frontend
-
-- El frontend necesita una migración en dos capas:
-
-- **Capa 1: compatibilidad inmediata**
-    - dejar de escribir `app.pageOptions.userRole` con semántica de plan
-    - introducir `app.pageOptions.plan` o `subscription`
-    - mantener `userRole` solo para permisos
-
-- **Capa 2: limpieza funcional**
-    - mover `personalfree`, `business`, `pay_restricted_owner`, `restricted`
-        a flags de subscription/estado de quota
-    - reescribir `footer-upgrade.js`, `ad.js`, `constants.js` y cualquier CTA equivalente
-
-- `pay_restricted_owner` no debe existir como role
-    - semánticamente describe estado de subscription/quota, no permisos del usuario
-
-### 7. Restricciones funcionales para free
-
-- Las restricciones del free deben evaluarse por plan/subscription, no por role
-- Role sigue contestando: "¿puede este usuario hacer X por permisos?"
-- Plan debe contestar: "¿esta org tiene incluido X?"
-
-- Sitios probables para enforcement adicional por plan:
-    - create library
-    - create group
-    - create share link
-    - batch create share links
-    - create upload link
-    - límites de expiración/link caps en UI y backend
-
-- El orden correcto es:
-    1. comprobar auth
-    2. comprobar role/permisos
-    3. comprobar plan/subscription
-    4. comprobar quota/uso actual
-
-## BUGS CORREGIDOS (2026-03-26)
-
-[x] sysAdminStatisticTraffic() y sysAdminStatisticStorages() no existían
-    - seafile-api.js no tenía estas 2 funciones
-    - Las páginas sysadmin de Traffic (gráficas) y Storage crasheaban
-    - FIX: Añadidas ambas funciones apuntando a /api/v2.1/admin/statistics/
-
-[x] OrgStatisticUserTraffic devolvía campos incompatibles con frontend
-    - Backend devolvía upload_bytes/download_bytes/total_bytes
-    - Frontend esperaba sync_file_upload/sync_file_download/web_file_upload/etc.
-    - Todas las columnas mostraban "0 bytes"
-    - Además: backend no soportaba parámetro order_by (ignoraba sorting)
-    - FIX: Reescrito endpoint para usar traffic_counters (desglose por tipo)
-      con sortTrafficRows() y paginación post-sort, igual que AdminListUserTraffic
-
-[x] Args invertidos en resetPerPage de statistic-traffic-orgs.js
-    - Llamaba getTrafficList(page, month) en vez de (month, page)
-    - Cambiar per_page en tab de orgs mandaba request con month=1
-    - FIX: Corregido orden de argumentos
-
-[x] Fallback muerto a org_monthly_traffic_list
-    - statistic-traffic-orgs.js tenía fallback innecesario
-    - Backend siempre devuelve org_traffic_list
-    - FIX: Eliminado fallback
-
-[x] Traffic off-by-one (tráfico de hoy aparecía como ayer)
-    - Backend devuelve datetime "2026-03-26T00:00:00+00:00" (medianoche UTC)
-    - moment(item.datetime) en el browser convierte a hora local: en UTC-X queda como día anterior
-    - FIX (backend): parseDateParam() acepta ambos formatos y trunca a midnight UTC
-    - FIX (frontend): 8 archivos de estadísticas cambiados a moment.utc(item.datetime)
-      sys-admin: statistic-traffic.js, statistic-storage.js, statistic-file.js, statistic-users.js
-      org-admin: statistic-traffic.js, statistic-storage.js, statistic-file.js, statistic-users.js
-
-[x] Storage charts mostraban línea plana (valor actual repetido)
-    - No existía tracking histórico de storage, solo snapshot live
-    - AdminStatisticStorage y OrgStatisticStorage repetían el valor actual
-    - FIX: Rediseño de storage_counters con (scope, day) como PRIMARY KEY
-      - day=1970-01-01 → total acumulado (quotas rápidas, 1 query)
-      - day=<fecha real> → delta diario (gráficas time-series)
-      - Una sola tabla, mismo patrón que traffic_counters + traffic_monthly
-      - ReconstructStorageHistory() reconstruye historial desde total + deltas
-      - NOTA: historial empieza a acumularse desde el deploy
-
-
-## VERIFICADO OK (2026-03-26)
-
-[ok] Sysadmin: gráficas de tráfico (system-traffic)
-     - Backend devuelve array con datetime + 6 tipos de tráfico
-     - Frontend parsea correctamente los 6 campos con guiones
-     - queryTrafficStats() agrupa por day/week/month correctamente
-
-[ok] Sysadmin: tabla de tráfico por org (org-traffic)
-     - Backend devuelve org_traffic_list con upload_bytes/download_bytes/total_bytes
-     - Frontend TrafficTableBody renderiza 4 columnas para type='org'
-     - Sorting server-side funciona con sortTrafficRows()
-
-[ok] Sysadmin: tabla de tráfico por usuario (user-traffic)
-     - Backend devuelve user_monthly_traffic_list con 6 campos per-type
-     - Frontend TrafficTableBody renderiza 7 columnas para type='user'
-     - Sorting server-side funciona
-
-[ok] Org-admin: gráficas de tráfico (system-traffic)
-     - Usa orgAdminStatisticSystemTraffic() → queryTrafficStats(orgUUID)
-     - Mismo formato que sysadmin, funciona correctamente
-
-[ok] Org-admin: gráfica de storage (total-storage)
-     - Usa orgAdminStatisticStorages() → OrgStatisticStorage
-     - Devuelve snapshot actual (línea plana — limitación conocida, no bug)
-
-[ok] Org-admin: tabla de tráfico por usuario (user-traffic)
-     - CORREGIDO: ahora usa traffic_counters con desglose por tipo
-     - Matching perfecto con frontend
-
-[ok] MainPanelTopbar en org-admin no necesita props
-     - Solo usa children y search (opcionales), statistics no los pasa
-     - No es bug
-
-
-## LIMITACIONES CONOCIDAS (no son bugs)
-
-[ ] La política actual free/pago es implícita y frágil
-    - Depende del valor textual de `plan`
-    - No hay columna/campo canónico para `quota_policy`
-    - Mientras no se separe eso, el catálogo externo de Accounts queda acoplado al string local
-
-[ ] Storage charts sin historial previo al deploy
-    - storage_counters registra deltas diarios desde el primer deploy
-    - Días sin datos de delta muestran el valor actual (aproximación correcta)
-    - Con el tiempo, la gráfica reflejará cambios reales día a día
-
-[ ] Active Users endpoint no implementado (org-admin)
-    - Devuelve notImplemented
-    - GET /org/:org_id/admin/statistics/active-users/
-
-[ ] File Operations endpoint no implementado (org-admin)
-    - Devuelve notImplemented
-    - GET /org/:org_id/admin/statistics/file-operations/
-
-[ ] Paginación in-memory para org-traffic y user-traffic
-    - Lee TODAS las orgs/usuarios, ordena en Go, luego pagina
-    - Funciona pero será lento con miles de orgs
-    - Optimizar si hay problemas de rendimiento
-
-
-## FRONTEND PARCIAL O AUSENTE (Backend listo)
-
-[ok] Warning de quota al usuario
-    - Backend envía header X-Quota-Warning cuando uso >80%
-    - Frontend ya lo consume vía interceptor axios global y muestra toast de warning
-    - Afecta: uploads y downloads
-
-[ ] Mensajes de error de quota específicos
-    - Backend devuelve 403 genérico "quota exceeded"
-    - Frontend no distingue qué quota se excedió (storage vs traffic vs max_users)
-    - No hay guía al usuario sobre qué hacer (contactar admin, liberar espacio, etc.)
-
-[ok] Vista personal de quota para usuario regular
-    - Endpoint GET /api/v2.1/subscription/ existe y devuelve datos
-    - La vista activa quedó unificada en `/org/subscription/` con plan/storage/traffic/billing
-    - El link aparece para el owner y abre el org-admin subscription view; `/subscription/` solo redirige
-
-[ ] UI de configuración de traffic quota por organización
-    - Backend soporta traffic_quota, traffic_upload_quota, traffic_download_quota
-    - No hay formulario en sysadmin para editarlos (solo vía API directa)
-    - Con Accounts como source of truth, esta UI deja de ser prioritaria
-    - Decidir si se mantiene como override de emergencia o solo lectura/debug
-
-[ ] Visualización de herencia de quota usuario→org
-    - Backend: si usuario no tiene límite propio, usa el de la org
-    - No hay UI que muestre esta herencia ni que permita override claro
-
-[ ] Frontend usa `userRole` para semántica de plan/billing legacy
-    - `footer-upgrade.js`, `ad.js` y `constants.js` esperan `personalfree`, `business`, etc.
-    - Pero el backend actual devuelve roles reales de permisos (`admin`, `user`, `readonly`, ...)
-    - DECISIÓN: backend devolverá `plan`, `quota_policy`, `is_org_owner`, `can_upgrade` como campos separados
-    - Frontend debe usar esos campos. `personalfree/business/restricted/pay_restricted*` son código muerto.
-    - Ver docs/PLANS-AND-PERMISSIONS.md sección "Frontend Contract"
-
-[ ] Bootstrap org-admin aún usa pageOptions placeholders en el shell servido por Go
-        - `internal/api/server.go` inyecta valores default/estáticos en `window.org.pageOptions`
-        - Esto ya causó bugs reales en gating de usuarios hasta que la página de users se desligó
-            de esos flags y empezó a consultar `orgAdminGetOrgInfo()` directamente
-        - Si el split frontend/backend ocurre antes del cleanup final, este bootstrap debe rediseñarse
-            para no reintroducir drift entre shell y APIs reales
-
-[ ] Inconsistencia pendiente de tamaño "GB" vs bytes binarios
-        - Parte de la migración a inputs en GB quedó hecha, pero todavía hay sospecha de mezcla
-            entre cálculo decimal (1000) y binario (1024)
-        - Riesgo: un mismo valor visible en UI no representa exactamente el mismo límite efectivo
-            que persiste o devuelve backend
-        - Resolver junto con el cierre de Phase 3 frontend y la limpieza final de quotas UI
-
-
-## NO IMPLEMENTADO
-
-[ ] Endpoint/flujo formal de provisioning desde Accounts
-    - Hoy existe update manual superadmin de organización, pero no un flujo formal M2M
-    - Hace falta definir contrato idempotente y versionado para sync externo
-
-[ ] Token de provisioning de servicio
-    - Hoy `Authorization: Token` funciona con sesiones de usuario/API session
-    - No hay una credencial dedicada para integración Accounts -> SesameFS
-    - Hace falta rotación, revocación y scope mínimo
-    - Debe cubrir no solo quotas sino aprovisionamiento completo con privilegios equivalentes a superadmin
-    - Decisión provisional: arrancar con alcance completo de superadmin técnico y refinar luego si hiciera falta
-
-[ ] Notificaciones por email/in-app
-    - No hay alerta al llegar a 80%, 90%, 100% de quota
-    - Ni para el usuario ni para el admin de la org
-    - Solo se detecta en el momento de la operación
-
-[ ] Dashboard de riesgo de quotas
-    - No hay vista para ver qué orgs/usuarios están cerca del límite
-    - Admin tiene que revisar org por org manualmente
-    - Sería útil una tabla ordenable por % de uso
-
-[ ] Audit log de cambios de quota
-    - No se registra quién cambió qué quota ni cuándo
-    - Sin trazabilidad para compliance
-
-[ ] Audit log de provisioning / sync de subscription
-    - Además del cambio de quota, hace falta saber qué mandó Accounts y cuándo
-    - Idealmente guardar source, actor técnico, payload mínimo y versión/timestamp remoto
-
-[ ] Métricas de drops del recorder
-    - Si se saturan las 256 goroutines del recorder, se descartan registros silenciosamente
-    - No hay logging ni métricas de esto
-    - Potencial pérdida de datos de tráfico sin que nadie lo sepa
-
-
-## DECISIONES TOMADAS (2026-03-27)
-## Ver docs/PLANS-AND-PERMISSIONS.md para diseño completo
-
-[DECIDIDO] Campo canónico para enforcement de negocio
-    - DECISIÓN: `quota_policy` ("hard" | "soft") como campo explícito en organizations
-    - `isFree()` se reemplaza por `isHardEnforcement(quotaPolicy)`
-    - Default: "hard" (safe default, ninguna org escapa sin enforcement explícito)
-
-[DECIDIDO] Columna "Role" del listado de organizaciones
-    - DECISIÓN: Renombrar a "Plan" y mostrar el plan real de la org
-
-[DECIDIDO] Override manual del superadmin vs Accounts
-    - DECISIÓN: Override efímero. Accounts pisa duro en el siguiente sync.
-    - Superadmin puede editar manualmente para emergencias/debug
-    - Incluye cambio manual de plan / quota_policy (`hard` <-> `soft`) y quotas
-    - No hay overrides persistentes locales
-
-[ISSUE ABIERTO] Sync de roles OIDC vs cambios manuales en SesameFS
-    - Decisión operativa actual: transfer de ownership o fixes manuales hechos por superadmin NO deben ser sobreescritos por sync automático de role desde OIDC
-    - El mapping de roles OIDC se mantiene, pero la reconciliación fina IdP vs overrides manuales queda como deuda pendiente
-    - Requiere diseño específico antes de reactivar cualquier sync agresivo de roles
-
-[DECIDIDO] Endpoints del provisioning token
-    - DECISIÓN: Alcance completo superadmin-equivalent en primera versión
-    - Reutilizar PUT /admin/organizations/:id/ con service token como auth alternativa
-    - Internamente separar M2M path (idempotencia, audit source=accounts) de manual path
-    - Refinar scopes después si hace falta
-
-[DECIDIDO] Config de enforcement profiles
-    - DECISIÓN: Config organizado por `quota_policy` ("hard"/"soft"), NO por nombre de plan
-    - Todos los planes de pago comparten el mismo enforcement profile ("soft")
-    - Solo free tiene restricciones de features/límites ("hard")
-    - Agregar nuevo plan en Accounts = 0 cambios en SesameFS (solo enviar quota_policy + números)
-    - `plan` es string opaco de display, NUNCA se lee para decisiones de lógica de negocio
-
-[DECIDIDO] Dos clases de límites
-    - Quotas operativas (storage, traffic, max_users): DB columns, Accounts customiza por org
-    - Feature limits (max_libraries, max_share_links, expiry caps): config por quota_policy, NO customizables por org
-    - Feature flags (can_add_group, etc.): config por quota_policy, NO customizables por org
-    - Si Accounts necesita customizar feature limits por org → migrar a organizations.settings map
-
-[DECIDIDO] Modelo del viejo `pay_restricted_owner`
-    - DECISIÓN: No existe en SesameFS. El owner es un role ("owner") en la jerarquía.
-    - Owner siempre tiene acceso a admin panel y billing, independiente de quota.
-    - Quota enforcement nunca cambia roles ni quita features. Solo bloquea operaciones de datos.
-    - `pay_restricted` / `pay_restricted_owner` / `restricted` son código muerto a eliminar del frontend.
-
-[DECIDIDO] Owner de la organización
-    - DECISIÓN: Modelar como ROLE (no campo separado). Mismo patrón que grupos.
-    - Son 3 dimensiones (role, enforcement profile, quota state), NO 4.
-    - Owner es un nivel de autorización privilegiado que incluye billing responsibility.
-    - Jerarquía: superadmin(5) > owner(4) > admin(3) > user(2) > readonly(1) > guest(0)
-    - Owner puede: ver billing, iniciar upgrade, transferir ownership, eliminar/deactivar org
-    - Transfer: swap roles (old owner→admin, new→owner). Solo 1 owner por org.
-    - Creador de la org = role owner (no admin como antes)
-    - Si en el futuro se necesita co-owner o billing-viewer, se extrae a campo separado
-
-[DECIDIDO] Features limitadas en free
-    - DECISIÓN: Matriz completa definida. Ver docs/PLANS-AND-PERMISSIONS.md
-    - Free NO puede: crear grupos, invitar guests, publish repo, send share link mail, global address book
-    - Free SÍ puede (con límites): crear repos (max 3), share links (max 3, 3 días), upload links (max 1, 3 días)
-    - Free SÍ puede: conectar clientes desktop/mobile
-    - Quotas free: 2GB storage, 10GB tráfico/mes combinado, 1 user max
-
-[DECIDIDO] Paid plan enforcement
-    - DECISIÓN: Soft warning confirmado. Paid = soft, uploads/downloads PASAN con warning.
-    - max_users es siempre hard block (si existe límite explícito)
-    - Billing en Accounts se encarga de cobrar overage
-
-[DECIDIDO] Planes disponibles
-        - DECISIÓN: En SesameFS hay 2 enforcement profiles canónicos: `hard` y `soft`.
-        - `hard` = comportamiento free; `soft` = comportamiento paid.
-        - El nombre del plan es un display string opaco enviado por Accounts y NO se usa para lógica.
-        - Puede haber muchos nombres comerciales de planes pagados (`Starter`, `Business`, etc.)
-            mapeando al mismo enforcement profile `soft`.
-        - Org base de la plataforma (seed) = profile `soft` con cuotas ilimitadas por defecto.
-
-[DECIDIDO] Tráfico free
-    - DECISIÓN: 10GB combinado sin sub-límites upload/download
-    - traffic_quota = 10GB, traffic_upload_quota = -1, traffic_download_quota = -1
-    - Planes de pago sí tienen sub-límites separados (Accounts los fija)
-        - El contrato API debe contemplar tanto tráfico combinado como upload/download por separado
-            para warnings y enforcement granular cuando existan sub-límites
-        - El enforcement de tráfico no debe basarse en mes natural sino en `current_period_started_at`
-            + `current_period_ends_at` de la org
-        - `current_period_ends_at` es la referencia canónica para saber si el período venció
-        - Accounts puede mandar `current_period_ends_at`; si no lo manda, SesameFS lo deriva
-            desde `current_period_started_at` con una helper mensual explícita compartida por creación y rollover
-        - Aunque `billing_cycle` sea anual, el período de tráfico vigente sigue siendo mensual
-        - El cron local debe avanzar ese período mensual vencido aunque Accounts luego pueda volver a pisar fechas para orgs paid
-        - Hace falta una agregación optimizada por período efectivo de la org
-            para no depender del mes natural ni recalcular desde cero en cada request
-        - Hace falta un job periódico de rollover del período actual para cualquier org vencida,
-            no solo free; puede vivir junto al scheduler del GC si conviene operativamente
-        - Ese job debe seleccionar por `current_period_ends_at <= now` y avanzar múltiples períodos
-            si la org quedó atrasada por downtime o retrasos
-        - No hay que limpiar histórico: solo avanzar el período efectivo
-
-[DECIDIDO] Contrato backend → frontend
-    - DECISIÓN: Backend envía estado pre-digerido, frontend no hace cálculos de negocio
-    - `storage: {used, quota, percent, over_quota}` — objeto pre-calculado
-        - Storage no tiene períodos: o está dentro del límite o se bloquean writes
-        - `traffic: {used, quota, percent, over_quota, upload_used, upload_quota,
-            upload_over_quota, download_used, download_quota, download_over_quota, reset_date}`
-            — objeto pre-calculado
-        - `current_period_started_at` + `current_period_ends_at` deben viajar aparte como
-            source of truth del período vigente; `reset_date` se deriva de ahí
-    - `upgrade_features: [...]` — lista de features bloqueadas por plan (no por role)
-    - `can_upgrade: true/false` — pre-calculado por backend, frontend solo lo muestra
-    - El frontend NUNCA compara plan names ni compara role contra features
-    - Ver docs/PLANS-AND-PERMISSIONS.md sección "Frontend Contract"
-
-[DECIDIDO] `can_upgrade` para owners
-    - DECISIÓN: `can_upgrade=true` para CUALQUIER owner cuando hay razón para upgrade
-    - Free owner → siempre true (upgrade a paid)
-    - Paid owner con storage o traffic >= 80% → true (upgrade a más capacidad)
-    - Paid owner con storage o traffic over_quota → true
-    - Paid owner con uso holgado → false (no hay razón para CTA)
-    - Non-owner → siempre false (solo info, "contact your admin")
-
-[DECIDIDO] UX de features bloqueadas por plan
-    - DECISIÓN: Frontend muestra la feature como disabled/locked con badge de upgrade
-    - Backend envía `upgrade_features` list — frontend lee directamente sin lógica de negocio
-    - Owner: "Upgrade to unlock" + botón de upgrade
-    - Non-owner: "Contact your admin" o solo locked icon
-
-[DECIDIDO] Lifecycle comercial (impago, suspensión, downgrade)
-    - DECISIÓN: Por ahora impago = Accounts envía status=deactivated. Todo bloqueado.
-        - Grace period lo maneja Accounts externamente y dura 1 mes desde el vencimiento.
-        - Si ese período expira sin pago, Accounts aplica el cambio correspondiente.
-        - Downgrade paid -> free: Accounts envía `quota_policy=hard` + cuotas free.
-        - Si la org downgraded queda pasada de tráfico:
-            se bloquean las operaciones afectadas por traffic quota hasta el próximo período.
-        - Si la org downgraded queda pasada de max_users:
-            pueden desactivarse usuarios regulares, pero se mantienen activos owner y admins.
-        - La API de org-admin no debe permitir reactivar users si eso vuelve a exceder el límite efectivo.
-        - El superadmin no queda sujeto a esa restricción operativa.
-        - Si la org downgraded queda pasada de storage:
-            no se permite subir más contenido; todos los writes quedan bloqueados.
-        - En downgrade no se borran datos existentes.
-        - Lecturas/descargas existentes se preservan salvo que otro enforcement específico lo bloquee.
-        - Si luego la org vuelve a un plan pago, la reactivación de usuarios no es automática:
-            owner y admins deciden a quién reactivar manualmente.
-    - Si se necesitan estados intermedios ("past_due" = lectura sí, escritura no), agregar
-      `billing_status` a organizations. Explícitamente diferido hasta que Accounts lo requiera.
-
-[DECIDIDO] Endpoint de preview/evaluate para cambios de plan
-        - DECISIÓN: Sí conviene tenerlo desde temprano.
-        - Sirve para que Accounts evalúe el impacto de un downgrade o cambio de plan antes de aplicarlo.
-        - Debe permitir detectar si la org quedaría pasada de storage, tráfico combinado,
-            upload traffic, download traffic o max_users.
-        - La simulación debe evaluar contra el período vigente/propuesto de la org,
-            no contra el mes natural UTC.
-        - También puede devolver warnings/impactos derivados, por ejemplo writes bloqueados
-            o cantidad estimada de users a desactivar.
-        - No reemplaza el enforcement real; es una capacidad de simulación previa.
-
-## DECISIONES PENDIENTES
-
-[ ] ¿Accounts enviará siempre el `org_id` interno o hará falta external_org_id?
-
-[ ] ¿Queremos guardar `accounts_org_id` / `subscription_id` en organizations?
-
-[ ] ¿Queremos guardar snapshot de qué users estaban activos antes del downgrade?
-    - Serviría para reactivar automáticamente esos mismos users cuando la org vuelva a paid
-    - Si no se implementa, la reactivación sigue siendo manual por parte del owner
-
-
-## PRIORIDAD DE IMPLEMENTACIÓN (actualizada 2026-03-27)
-
-1. [DONE] Verificar y corregir estadísticas sysadmin + org-admin
-2. [DONE] Storage time-series (storage_counters rediseñado con day)
-3. [DONE] Diseño completo de plans & permissions (docs/PLANS-AND-PERMISSIONS.md)
-4. [DONE] Agregar role "owner" a jerarquía + OIDC mapping + IsOrgStaff() centralizado
-5. [DONE] Agregar `quota_policy` a organizations + migration
-6. [DONE] Agregar `current_period_started_at` + `current_period_ends_at` a organizations
-7. [DONE] Crear enforcement profiles config (keyed by quota_policy) + loader
-8. [DONE] Reemplazar `isFree()` por `isHardEnforcement(quota_policy)` — queries leen quota_policy
-9. [DONE] Defaults en seed (soft), admin create (hard/free), OIDC (hard/free), role=owner para creador
-9a.[DONE] Endpoint de ownership transfer: PUT /org/:org_id/admin/transfer-ownership/
-9b.[DONE] max_users check en OIDC auto-provision (skip para org nueva)
-10. [DONE] Crear `ResolveCapabilities(role, quotaPolicy)` con `upgrade_features` list
-        — internal/plans/resolver.go implementado y testeado (2026-03-28)
-11. [DONE] Agregar agregación de tráfico por período efectivo para enforcement
-        — traffic_period_usage table implementada (2026-03-28)
-12. [DONE] Actualizar `/api2/account/info/` con: storage{}, traffic{}, current_period_*, upgrade_features, can_upgrade, is_org_owner
-        — server.go:1438 llama ResolveCapabilities(), server.go:1493 devuelve can_upgrade (2026-03-28)
-13. [DONE] Extender `traffic{}` con granularidad upload/download + reset_date
-        — Incluido en Phase 2 backend (2026-03-28)
-14. [DONE] Agregar enforcement por profile en: share links, upload links, libraries, groups
-        — share_links.go:515, upload_links.go:281, libraries.go:447, groups.go:337 (2026-03-28)
-15. [DONE] Migrar frontend off legacy `personalfree/business/pay_restricted_owner`
-        — Eliminados. Solo queda `isFreeUser` como alias @deprecated en constants.js:232
-16. [PARTIAL] Upgrade CTA con `upgrade_features` + `can_upgrade` (owner near limits)
-        — Backend envía los datos. Frontend upgrade-state.js los consume. Falta: banners de warning
-17. [DONE] Quota warning banners con `storage.over_quota`, `traffic.over_quota`,
-    `traffic.upload_over_quota`, `traffic.download_over_quota`
-        — Backend envía X-Quota-Warning header. Frontend lo intercepta vía axios y muestra warning toast (2026-04-02)
-18. [ ] Endpoint preview/evaluate para downgrade/cambios de plan
-19. [DONE] Job periódico de rollover del período vigente de quotas — P0
-        — internal/traffic/rollover.go implementado (2026-04-02)
-        — Integrado en GC service (gc.go) como goroutine cada 1h
-        — Períodos siempre mensuales, Accounts es fuente de verdad para paid
-20. [ ] Service token para provisioning Accounts → SesameFS (M2M path interno)
-21. [ ] Flujo de invite/create users via Accounts (pendiente coordinación con Accounts)
-
-## ASUNTOS PENDIENTES DE COORDINACIÓN CON ACCOUNTS
-
-[?] ¿Accounts enviará siempre el `org_id` interno de SesameFS o hará falta resolver por `external_org_id`?
-
-[?] ¿Queremos guardar un identificador externo estable (`accounts_org_id`, `subscription_id`) en organizations?
-
-[?] ¿Queremos snapshot de users activos pre-downgrade para reactivación automática al volver a paid?
-
-[PENDIENTE] Flujo de creación de usuarios desde org-admin
-    - Hoy AddOrgUser crea users localmente sin identidad en Accounts (roto conceptualmente)
-    - Target: "Invitar usuario" redirige a Accounts, user hace signup allí, OIDC auto-join
-    - O bien: Accounts llama provisioning API de SesameFS para crear user
-    - Requiere coordinación con equipo de Accounts
-    - Documentado en docs/PLANS-AND-PERMISSIONS.md sección "User Creation"
-
-## PROGRESO DE IMPLEMENTACIÓN
-
-[2026-03-27] Phase 1 — Backend Model: COMPLETA
-    - Role "owner" en jerarquía (5>4>3>2>1>0) + IsOrgStaff() helper centralizado
-    - OIDC mapping ampliado: "owner", "org_owner", "tenant_admin"
-    - Columnas: quota_policy, current_period_started_at, current_period_ends_at (ALTER TABLE + models)
-    - EnforcementProfile struct en config.go (Features + Limits), GetEnforcementProfile(), defaults hard/soft
-    - isFree(plan) → isHardEnforcement(quotaPolicy), queries leen quota_policy
-    - Org creation (seed, admin, OIDC) con todos los campos de plan+período
-    - Creador de org = role owner (admin.go + OIDC isNewOrg)
-    - PUT /org/:org_id/admin/transfer-ownership/ (owner o superadmin; permite bootstrap si la org no tiene owner)
-    - max_users check en OIDC provisionUser (skip para org nueva)
-    - UpdateOrganization acepta quota_policy, current_period_started_at, current_period_ends_at
-    - GetOrganization y GetOrgInfo devuelven los nuevos campos
-    - Legacy handlers ajustados para no degradar `owner` vía toggles de `is_staff` y para tratar `owner` como admin-level en account/info y trash libs
-    - Build limpio, todos los tests pasan
+Este archivo fue limpiado para dejar solo trabajo pendiente real.
+
+El historial de decisiones y lo ya implementado vive en:
+- docs/PLANS-AND-PERMISSIONS.md
+- docs/QUOTAS-AND-TRAFFIC-PLAN.md
+- docs/V1-PRODUCTION-ROADMAP.md
+- docs/CHANGELOG.md
+
+
+## ESTADO REAL HOY
+
+- Phase 1 backend de plans/permissions: lista
+- Phase 2 backend de quotas/traffic: lista
+- Rollover mensual por período efectivo: listo
+- Contrato base Accounts -> SesameFS: decidido
+- Auth base para Accounts provisioning: decidido
+  - usuario técnico dedicado en org plataforma
+  - role `superadmin`
+  - API key scope `admin`
+  - `Authorization: Token <raw_api_key>`
+  - sin sesión humana
+  - sin `/api2/auth-token/`
+
+Lo pendiente ya no es el modelo base de quotas. Lo pendiente es cerrar la integración operativa con Accounts y algunos remates de UX/auditoría.
+
+
+## PENDIENTE — ALTA PRIORIDAD
+
+### 1. Formalizar el path M2M interno de Accounts -> SesameFS
+
+Ya está decidida la credencial y ya existe runbook operativo. Lo que falta es cerrar el comportamiento interno del backend para el path máquina-a-máquina.
+
+Pendiente:
+- separar internamente cambios manuales de superadmin vs sync M2M de Accounts
+- marcar auditoría con `source=accounts`
+- registrar actor técnico/credencial de servicio
+- agregar idempotencia por `version` o `updated_at`
+- rechazar updates viejos o fuera de orden
+- dejar trazabilidad clara de provisioning y sync de subscription
+
+Estado actual:
+- hoy existen endpoints admin reutilizables
+- hoy existe el modelo de API keys endurecido
+- hoy existe runbook en `docs/ACCOUNTS-PROVISIONING-RUNBOOK.md`
+- falta la formalización del path interno, no la credencial base
+
+
+### 2. Endpoint preview/evaluate para cambios de plan
+
+Hace falta un endpoint de simulación para que Accounts pueda evaluar el impacto de un downgrade o cambio de plan antes de aplicarlo.
+
+Debe responder, como mínimo:
+- si la org quedaría pasada de storage
+- si quedaría pasada de tráfico total
+- si quedaría pasada de upload traffic
+- si quedaría pasada de download traffic
+- si quedaría pasada de `max_users`
+- cuántos usuarios habría que desactivar
+- si los writes quedarían bloqueados
+
+Esto no reemplaza el enforcement real. Es una simulación previa para UX y coordinación con Accounts.
+
+
+### 3. Flujo de invite/create users vía Accounts
+
+Hoy `AddOrgUser` sigue creando usuarios locales en SesameFS y eso no encaja bien con el modelo donde Accounts gobierna identidad.
+
+Hay que cerrar una de estas rutas:
+- invite flow: SesameFS inicia el invite, Accounts crea la identidad, OIDC auto-provision completa el alta
+- provisioning flow: Accounts crea/provisiona el usuario y luego llama a SesameFS para reflejarlo localmente
+
+Puntos a resolver:
+- quién es source of truth del alta de usuario
+- cómo se coordina con `max_users`
+- qué queda disponible para owner/org-admin dentro de SesameFS
+
+
+## PENDIENTE — DECISIONES ABIERTAS CON ACCOUNTS
+
+### 4. Identificador de organización en el contrato externo
+
+Falta decidir si Accounts enviará siempre el `org_id` interno de SesameFS o si hace falta resolver por un identificador externo estable.
+
+Opciones abiertas:
+- solo `org_id` interno
+- `external_org_id`
+- ambos
+
+
+### 5. Persistencia de IDs externos de billing
+
+Falta decidir si conviene guardar en `organizations` alguno de estos campos:
+- `accounts_org_id`
+- `subscription_id`
+
+Esto afecta trazabilidad, reconciliación y debugging de syncs externos.
+
+
+### 6. Snapshot pre-downgrade de usuarios activos
+
+Falta decidir si SesameFS debe guardar qué usuarios estaban activos antes de un downgrade a free para poder reactivarlos automáticamente cuando la org vuelva a paid.
+
+Si no se implementa:
+- la reactivación sigue siendo manual por owner/admins
+
+Si se implementa:
+- hace falta definir formato, lifecycle y reglas de restauración
+
+
+## PENDIENTE — UX / OPERACIÓN / OBSERVABILIDAD
+
+### 7. Mensajes de error de quota más específicos
+
+Hoy el frontend todavía no distingue bien entre:
+- storage quota exceeded
+- traffic quota exceeded
+- upload traffic quota exceeded
+- download traffic quota exceeded
+- max users reached
+
+Hace falta devolver y mostrar errores más accionables.
+
+
+### 8. Visualización de herencia de quota user -> org
+
+El backend ya soporta herencia cuando el usuario no tiene límite propio. Falta una UI clara para:
+- ver cuándo un user hereda de la org
+- distinguir override explícito vs herencia
+
+
+### 9. UI/admin story para traffic quotas
+
+El backend soporta:
+- `traffic_quota`
+- `traffic_upload_quota`
+- `traffic_download_quota`
+
+Falta decidir si el panel sysadmin tendrá:
+- edición manual de emergencia
+- solo vista de lectura/debug
+- o nada, delegando todo a Accounts
+
+
+### 10. Audit log de quotas y provisioning
+
+Sigue pendiente persistir y exponer trazabilidad de:
+- cambios de quota manuales
+- provisioning/sync enviados por Accounts
+- actor humano vs actor técnico
+- source, timestamp y payload mínimo relevante
+
+
+### 11. Métricas de drops del recorder
+
+Si el recorder se satura y descarta eventos, hoy no hay suficiente visibilidad operativa.
+
+Hace falta:
+- contador/métrica de drops
+- logging razonable
+- visibilidad para detectar pérdida de telemetría de tráfico
+
+
+### 12. Dashboard de riesgo y notificaciones
+
+No existe todavía:
+- vista de riesgo de quotas por org/usuario
+- alertas proactivas por cercanía a límites
+- notificaciones email/in-app asociadas a quota o downgrade
+
+Esto es útil, pero no forma parte del núcleo ya implementado de enforcement.
+
+
+## ORDEN PRACTICO RECOMENDADO
+
+1. Formalizar path M2M interno de Accounts
+2. Diseñar y exponer preview/evaluate endpoint
+3. Cerrar el flujo de invite/create users vía Accounts
+4. Resolver identificadores externos y snapshot pre-downgrade
+5. Completar auditoría, UX fina y observabilidad

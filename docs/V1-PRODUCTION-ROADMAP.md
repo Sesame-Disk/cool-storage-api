@@ -40,14 +40,17 @@ checks on share links, upload links, library creation, and group creation.
 
 **What is still missing:**
 
-- **M2M auth (service tokens)** — there is no authenticated channel for the Accounts service to
-  call SesameFS and update a plan, change a quota, or provision a new org. Any plan change currently
-  requires a manual DB edit or superadmin session.
+- **Accounts provisioning operationalization** — the authenticated channel can now be a dedicated
+  platform service account API key with admin scope, but the environment-level setup, rotation,
+  idempotency path, and audit/source tagging still need to be formalized.
 - **Accounts → SesameFS sync** — no webhook receiver or polling loop to apply plan changes pushed
   from Accounts.
 
 **Implications of shipping without remaining items:**
-- Plan upgrades cannot be applied without direct DB access or superadmin session.
+- Plan upgrades still need the formal Accounts provisioning path and runbook to avoid ad-hoc manual operations.
+
+Operational reference:
+- [ACCOUNTS-PROVISIONING-RUNBOOK.md](ACCOUNTS-PROVISIONING-RUNBOOK.md) — bootstrap and rotation procedure for the dedicated platform service account API key.
 
 **Key files:**
 - `internal/plans/resolver.go` — `ResolveCapabilities()` ready to use, do not duplicate
@@ -524,7 +527,7 @@ the launch on Glacier since it requires AWS Glacier infrastructure setup and tes
 
 | # | Area | Priority | Current State | Estimated Effort |
 |---|------|----------|---------------|-----------------|
-| 1 | Accounts ↔ SesameFS integration | **P0** | Phase 1 ✅, Phase 2 ✅ (2026-03-28). Remaining: M2M service token + provisioning sync from Accounts | 1–2 weeks |
+| 1 | Accounts ↔ SesameFS integration | **P0** | Phase 1 ✅, Phase 2 ✅ (2026-03-28). Remaining: operationalize dedicated platform service account API key + provisioning sync/idempotency/audit from Accounts | 1–2 weeks |
 | 2 | Go code reorganization | **P2** | Not started. Functional but operationally risky for incident response | 3–4 weeks |
 | 3 | Frontend/Backend separation + Nginx | ✅ DONE | ✅ DONE (2026-03-30/31) | — |
 | 4 | Robust DB migration system | ✅ DONE | ✅ DONE (2026-04-01) | — |
@@ -537,8 +540,8 @@ the launch on Glacier since it requires AWS Glacier infrastructure setup and tes
 | 11 | Email / notifications | **P2** | 0% | 1 week |
 | 12 | Cursor-based pagination | **P2** | Admin links done; library/group admin lists still pending | 2-4 days |
 | 13 | Cold storage / Glacier | **P2** | ~30% | 2–3 weeks |
-| **14** | **User-scoped programmatic auth (API keys)** | **✅ DONE** | **User API keys + `/api2/auth-token/` are live. 2026-04-04 hardening now propagates scope to derived sessions, caps effective role, and enforces central library/sync scope checks. Remaining M2M service auth belongs to item #1.** | — |
-| **15** | **GC multi-instance safety** | **P0** | **0% — `gc.go:99` Start() has no leader election or lock** | **1 day** |
+| **14** | **User-scoped programmatic auth (API keys)** | **✅ DONE** | **User API keys + `/api2/auth-token/` are live. 2026-04-04 hardening now propagates scope to derived sessions, caps effective role, and enforces central library/sync scope checks. Accounts can reuse the same API key system through a dedicated platform service account; the remaining work belongs to item #1.** | — |
+| **15** | **GC multi-instance safety** | **P0** | **Temporary prod guard landed: `GC_ENABLED` can disable GC on non-GC replicas. Real leader election/lease is still pending because `gc.go:99` Start() has no distributed lock.** | **1 day** |
 | 16 | Frontend Phase 3 cleanup | **P1** | Mostly done. Legacy `personalfree/business/pay_restricted*` removed. Remaining: pageOptions placeholders and minor cleanup | 2–3 days |
 
 ---
@@ -551,9 +554,9 @@ the launch on Glacier since it requires AWS Glacier infrastructure setup and tes
 - [#7] ✅ Enforcement Phase 2 wire-up — DONE (2026-03-28)
 
 ### Sprint 2 — Hard Blockers (CURRENT)
-- [#15] GC multi-instance safety — env var guard or Cassandra LWT leader lease
+- [#15] GC multi-instance safety — temporary `GC_ENABLED` guard is available; Cassandra LWT leader lease still pending
 - [#9] Security hardening — small effort, high impact
-- [#1] Remaining Accounts integration — M2M service token, provisioning endpoint
+- [#1] Remaining Accounts integration — formalize service-account API key auth, provisioning endpoint, idempotency/audit
 
 ### Sprint 3 — Production Essentials
 - [#8] Persistent audit logs — framework already exists, wire it up

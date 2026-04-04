@@ -12,6 +12,7 @@
 #   AUTH_DEV_MODE, AUTH_ALLOW_ANONYMOUS, OIDC_*, ONLYOFFICE_*,
 #   CASSANDRA_*, S3_BUCKET, S3_REGION, S3_ENDPOINT,
 #   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, BILLING_URL,
+#   GC_ENABLED,
 #   ACCOUNTS_PASSWORD_CHANGE_URL, ACCOUNTS_DELETE_ACCOUNT_URL
 # =============================================================================
 
@@ -177,6 +178,10 @@ gc:
   batch_size: 100
   grace_period: 1h
   dry_run: false
+
+# Multi-replica production workaround:
+# leave gc.enabled=true here, but set GC_ENABLED=false on every non-GC replica.
+# Only one backend instance should run GC until leader election/lease exists.
 
 # =============================================================================
 # CORS

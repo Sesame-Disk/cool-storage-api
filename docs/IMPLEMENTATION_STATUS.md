@@ -23,7 +23,7 @@
 3. ~~Monitoring/Health Checks~~ - ✅ COMPLETE (slog logging, `/health`, `/ready`, `/metrics`)
 4. ~~Frontend/Backend Separation~~ - ✅ COMPLETE (2026-03-30/31) — separate React/nginx container, bootstrap API, nginx production hardening
 5. ~~Programmatic Auth (PATs)~~ - ✅ COMPLETE — user API keys ship via `/api/v2.1/api-keys/`, and `/api2/auth-token/` now exchanges `email + API key` for desktop/CLI tokens. Device Flow remains optional future work.
-6. **GC Multi-Instance Safety** - ❌ PENDING — `gc.go:99` Start() has no leader election. Unsafe with >1 replica
+6. **GC Multi-Instance Safety** - ⚠️ PARTIAL — temporary `GC_ENABLED` operational guard exists for production, but `gc.go:99` Start() still has no leader election/distributed lease. Safe only if exactly one replica runs GC.
 7. ~~Quota Period Rollover~~ - ✅ COMPLETE — Period rollover job advances expired org quota periods and keeps monthly traffic enforcement moving
 
 ---
@@ -598,7 +598,7 @@ These MUST be completed before production deployment:
 - ❌ TODO: ~2 components (audit logs, monitored-repos)
 
 **Production Readiness**:
-- Backend: ~98% (core auth blocker complete, both admin panels implemented; GC multi-instance safety still pending)
+- Backend: ~98% (core auth blocker complete, both admin panels implemented; GC multi-instance safety still needs a real distributed lease beyond the temporary `GC_ENABLED` guard)
 - Frontend: ~85% (modals done, granular permission flags enforced, missing: some permission UI edge cases, ~51 ModalPortal wrapper cleanup)
 - Infrastructure: ~95% (monitoring ✅, health checks ✅, GC ✅)
 - Documentation: ~70% (missing: user/admin guides, deployment guide)

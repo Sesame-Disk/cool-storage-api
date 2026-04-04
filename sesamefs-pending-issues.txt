@@ -1,182 +1,185 @@
 =======================================
 SesameFS — Pending Issues & Open Items
 =======================================
-Last Updated: 2026-04-02
+Last Updated: 2026-04-04
 
-Overall: ~87% production ready
-Backend API: ~98% | Frontend UI: ~85%
-Active Bugs: 0 open
+Este archivo fue limpiado para dejar solo pendientes vigentes verificados contra el código y los docs actuales.
 
-=======================================
-1. SECURITY (Open)
-=======================================
-
-1.1 Programmatic Auth Broken (PATs/Device Flow) [P0 — BLOCKS PRODUCTION]
-    File: internal/api/server.go:1141
-    - `POST /api2/auth-token/` returns 401 in OIDC-only mode (TODO in code)
-    - Desktop client, seaf-cli, scripts, CI pipelines cannot authenticate
-    - Workaround: AUTH_DEV_MODE=true (not suitable for production)
-    - Solution: Personal Access Tokens (~200 lines) or OIDC Device Flow
-    - See docs/TECHNICAL-DEBT.md §6 for full analysis
-
-1.2 GC Multi-Instance Not Safe [P0 — BLOCKS SCALING]
-    File: internal/gc/gc.go:99
-    - Start() launches goroutines without coordination between replicas
-    - Multiple replicas = duplicate scans + race conditions on dequeue
-    - Solution: env var GC_ENABLED (simple) or Cassandra LWT leader lease (robust)
-
-1.3 Quota Period Rollover Job Missing [P0 — BLOCKS PAID USERS]
-    - No code exists to reset traffic_period_usage when current_period_ends_at <= now
-    - Without this, traffic quotas never roll over → paid users permanently blocked after month 1
-    - Fields current_period_started_at/ends_at exist on organizations table
-    - Solution: Ticker in GC or standalone job
-
-1.4 CORS Defaults to Allow All Origins [MEDIUM]
-    File: internal/api/server.go (~line 256)
-    - Verified 2026-04-02: prod mode actually defaults to deny-all (correct)
-    - Missing: startup WARNING when AllowedOrigins is empty in production
-    - Dev mode allowing all origins is fine
-
-1.5 Silent DB Error Swallowing in Sync [LOW]
-    File: internal/api/sync.go (~line 700)
-    - Block metadata write failures silently fall back to "hot" storage class
-    - Fix: add slog.Warn() (5 minutes, no behavior change)
-
-1.6 Anonymous Auth Bypass in Dev Mode [LOW - dev only]
-    File: internal/api/server.go (~line 870)
-    - Only affects dev mode, not production — low risk
+Referencias canónicas:
+- docs/V1-PRODUCTION-ROADMAP.md
+- docs/IMPLEMENTATION_STATUS.md
+- docs/TECHNICAL-DEBT.md
+- docs/KNOWN_ISSUES.md
+- docs/PLANS-AND-PERMISSIONS.md
+- docs/QUOTAS-AND-TRAFFIC-PLAN.md
+- quotas-pending-issues.txt  (pendientes específicos de Accounts/quota/subscription)
 
 =======================================
-2. UNIMPLEMENTED FEATURES
+1. HARD BLOCKERS / LAUNCH-CRITICAL
 =======================================
 
-2.1 Audit Logs & Activity Feed [HIGH]
-    - GET /api/v2.1/activities/ returns stub {events:[]}
-    - Needs: 5 DB tables, ~5 endpoints, ~15 handler integrations
-    - Largest remaining feature gap
+1.1 GC multi-instance safety [P0 — partial workaround only]
+    File: internal/gc/gc.go
+    - Existe workaround operativo temporal: GC_ENABLED=true en una sola réplica
+    - Falta solución real con liderazgo distribuido / lease
+    - Safe today only if exactly one replica runs GC
+    - Ver: docs/KNOWN_ISSUES.md, docs/V1-PRODUCTION-ROADMAP.md
 
-2.2 Diff View Between File Versions [MEDIUM]
-    - No backend endpoint for text diff between two file revisions
-    - Seafile uses GET /api2/repos/:id/file/diff/
-    - File history list/revert/download all work — only diff is missing
+1.2 Accounts/quota/subscription remaining work
+        - Este backlog ya no se duplica aquí
+        - Todo lo pendiente específico de Accounts, M2M provisioning, preview/evaluate,
+            invite/create users y decisiones de contrato externo vive en quotas-pending-issues.txt
 
-2.3 Cold Storage Restore [LOW]
+=======================================
+2. PRODUCTION ESSENTIALS
+=======================================
+
+2.1 Persistent audit logs [P1]
+    File: internal/middleware/audit.go
+    - El framework existe, pero sigue pendiente persistir el audit trail general
+    - /api/v2.1/activities/ sigue devolviendo stub vacío
+    - TODO vigente en audit.go: persistir a tabla dedicada
+
+2.2 Security hardening [P1]
+    - Siguen pendientes:
+      - security headers del lado Go
+      - IdleTimeout / MaxHeaderBytes del http.Server
+      - rate limiting específico para API keys directas
+      - revisión de rutas auth-only fuera de checks centrales
+    - Ver: docs/V1-PRODUCTION-ROADMAP.md
+
+2.3 Backup / disaster recovery [P1]
+    - Faltan scripts, runbook y restore drill
+    - Sigue siendo gap real para producción
+    - Ver: docs/V1-PRODUCTION-ROADMAP.md
+
+2.4 Storage classes / multi-region completion [P1]
+    - Infra base existe, pero faltan piezas reales:
+      - SelectBackend() policy evaluation
+      - migration job de storage class
+      - UI/flujo para elegir región/storage class
+      - configuración productiva de replication factor > 1
+    - Ver: docs/V1-PRODUCTION-ROADMAP.md
+
+2.5 Antivirus / malware scanning [P1]
+    - No hay implementación real todavía
+    - Sigue como gap de producto para v1.0 / fast-follow cercano
+    - Ver: docs/V1-PRODUCTION-ROADMAP.md
+
+=======================================
+3. PRODUCT / FEATURE GAPS REALES
+=======================================
+
+3.1 Audit/activity UX
+    - Backend general de audit sigue parcial
+    - Activity feed sigue siendo stub
+    - Esto es más que UI: falta persistencia base
+
+3.2 Diff view between file versions
+    - No aparece endpoint backend real para diff textual entre revisiones
+    - History/revert/download sí existen; diff sigue faltando
+
+3.3 Cold storage restore end-to-end
     File: internal/api/v2/restore.go
-    - Glacier restore handler creates placeholder job but does nothing
-    - No actual S3 Glacier restore initiation
-    - Only relevant when cold storage is actively used
+    - Existe infraestructura de restore en storage/S3
+    - El handler v2 sigue con TODOs y flujo placeholder
+    - Solo relevante si cold storage se usa de verdad
 
-2.4 Batch Cross-Repo Move/Copy [LOW]
+3.4 Batch cross-repo move/copy
     File: internal/api/v2/files.go
-    - Same-repo batch move/copy works
-    - Cross-repo returns 501 Not Implemented
-    - Same-repo has TODO for FS tree update optimization
-
-2.5 Tenant Quota Enforcement — ✅ IMPLEMENTED (2026-03-25)
-    - CheckStorageQuota, CheckTrafficQuota, CheckMaxUsers in internal/traffic/checker.go
-    - Enforcement: hard block (free/quota_policy="hard") or soft warning (paid/quota_policy="soft")
-    - Pre-checks in: HandleUpload, HandleDownload, UploadFile, AdminCreateUser, AddOrgUser
-    - X-Quota-Warning header sent at 80% threshold
-    - See docs/QUOTAS-AND-TRAFFIC-PLAN.md for full design
-
-2.6 Storage Policy Evaluation [LOW — P2, not blocking]
-    File: internal/storage/storage.go (~line 392)
-    - SelectBackend() always returns the default storage class
-    - Only matters for tiered storage workflows (cold/hot/warm)
-    - Can ship v1.0 without this
+    - Same-repo funciona
+    - Cross-repo sigue como hueco funcional
 
 =======================================
-3. INTENTIONAL STUBS (Not bugs — features not yet needed)
+4. INTENTIONAL STUBS / NOT YET BUILT
 =======================================
 
-These endpoints return valid empty responses by design.
-They exist so the frontend doesn't break. Implement when needed.
+Estos no son bugs activos, pero siguen sin implementación real:
 
-+------------------------------+---------------------+-----------------------------------+
-|           Endpoint           |       Returns       |             Implement When        |
-+------------------------------+---------------------+-----------------------------------+
-| GET /api2/devices/           | []                  | Device tracking for sync clients  |
-| GET /api/v2.1/activities/    | {events:[]}         | Audit logs (see 2.1 above)        |
-| GET /api/v2.1/notifications/ | {unseen_count: 0}   | Notification system               |
-| GET /api2/shared-repos/      | []                  | Shared repos listing              |
-| GET /api2/shared-folders/    | []                  | Shared folders listing            |
-| GET /api/v2.1/wikis/         | []                  | Published libraries / wikis       |
-| POST /office-convert/status/ | {status: "ERROR"}   | Office file conversion pipeline   |
-+------------------------------+---------------------+-----------------------------------+
+4.1 Activities endpoint
+    - GET /api/v2.1/activities/
+    - Hoy devuelve stub vacío
+    - Debe resolverse junto con audit logs persistentes
 
-=======================================
-4. DATABASE / PERFORMANCE
-=======================================
+4.2 Notifications
+    - GET /api/v2.1/notifications/
+    - Sigue vacío / básico
+    - Requiere sistema real de notificaciones
 
-4.1 Share Optimization Tables — ✅ IMPLEMENTED (2026-04-01)
-    - shares_by_creator — EXISTS in 001_initial_schema.cql:431, dual-write in share_read_models.go:83
-    - shares_by_recipient — EXISTS in 001_initial_schema.cql:444, dual-write in share_read_models.go:88
-    - Queries use these tables: file_shares.go:751 (by creator), file_shares.go:952 (by recipient)
-    - Integration tests in share_projection_regression_test.go
-    - NOTE: permissions.go:856 has a stale TODO saying "Create shares_by_recipient table" — the table already exists
+4.3 Devices / device tracking
+    - GET /api2/devices/
+    - Endpoints admin/org-admin de devices siguen sin tracking real detrás
+    - Hoy son stubs operativos
 
-=======================================
-5. TECHNICAL DEBT
-=======================================
+4.4 Shared folders
+    - GET /api/v2.1/shared-folders/
+    - Sigue como stub
 
-+-----------------------------------+-------------------------------------------------------------------------------+
-|               Item                |                                    Detail                                     |
-+-----------------------------------+-------------------------------------------------------------------------------+
-| Test coverage ~25% Go overall     | Target 40%; internal/api/v2 at 20.5% (14K lines)                              |
-| Frontend test coverage ~0.6%      | 6-7 test files for 620+ source files                                          |
-| No E2E tests (Cypress/Playwright) | Not started                                                                   |
-| No CI pipeline                    | GitHub Actions workflow not configured                                        |
-| Missing production docs           | No user guide, admin guide, deployment guide, backup/restore, migration guide |
-| ~51 ModalPortal wrappers          | Harmless but unnecessary, clean up opportunistically                          |
-| Bandwidth metering for billing    | ✅ IMPLEMENTED — traffic_counters, traffic_monthly, traffic_period_usage      |
-+-----------------------------------+-------------------------------------------------------------------------------+
+4.5 Wikis / published libraries
+    - GET /api/v2.1/wikis/
+    - Sigue oculto/no implementado como feature completa
 
 =======================================
-6. LOW-PRIORITY FEATURES (Backlog)
+5. TECHNICAL DEBT / QUALITY
 =======================================
 
-+-------------------------------+-----------------------------------------------------+
-|            Feature            |                        Detail                        |
-+-------------------------------+-----------------------------------------------------+
-| Watch/Unwatch Libraries       | Needs full notification system                       |
-| Published Libraries (Wikis)   | Nav hidden, stub returns []                          |
-| Linked Devices                | Nav hidden, needs device tracking on sync            |
-| Thumbnails                    | Image processing pipeline, visual polish             |
-| User Avatars                  | Profile picture storage, visual polish               |
-| Multi-owner / Group ownership | Single owner_id only today, design needed            |
-| Multi-region Replication      | Future — not started                                 |
-+-------------------------------+-----------------------------------------------------+
+5.1 Go code reorganization [P2]
+    - Funciona, pero sigue habiendo archivos gigantes en internal/api/v2
+    - Riesgo operativo, no blocker funcional
+    - Ver: docs/V1-PRODUCTION-ROADMAP.md
+
+5.2 Test coverage push
+    - Sigue bajo para tamaño del código
+    - Frontend coverage sigue muy baja
+    - E2E todavía no existe
+
+5.3 CI pipeline
+    - Sigue faltando pipeline de GitHub Actions o equivalente
+
+5.4 Production docs still incomplete
+    - Ya existe deploy guide
+    - Siguen faltando guías más completas de operación, backup y administración
 
 =======================================
-7. NEEDS VALIDATION (Implemented but untested)
+6. NEEDS VALIDATION
 =======================================
 
-- History TTL enforcement: GC Phase 5 scanExpiredVersions walks HEAD commit
-  chain and enqueues expired orphan commits. Code exists, needs production validation.
-- Directory revert: POST .../dir/?operation=revert with conflict dialog.
-  Code exists and includes conflict handling, needs manual testing.
+6.1 History TTL enforcement
+    - Código existe
+    - Falta validación real en producción / carga real
+
+6.2 Directory revert flow
+    - Código existe
+    - Falta validación manual más fuerte
 
 =======================================
-PRIORITIES (Updated 2026-04-02, verified against code)
+7. NO LONGER PENDING (REMOVED FROM THIS FILE)
 =======================================
 
-P0 — HARD BLOCKERS:
-1. Programmatic auth (PATs) — desktop sync broken without this
-2. GC multi-instance safety — needed before scaling to >1 replica
-3. Quota period rollover job — paid users permanently blocked without this
+Estos puntos ya no deben seguir apareciendo como pendientes aquí:
+- Programmatic auth for desktop/CLI via user API keys + /api2/auth-token/
+- Quota period rollover job
+- Quota enforcement backend
+- Quota warning header + frontend interceptor
+- Personal/org subscription view unification
+- Share optimization tables
 
-P1 — PRODUCTION ESSENTIALS:
-4. Audit logs persistentes — compliance (framework ready, TODO in audit.go:87)
-5. Security hardening — Go-level headers, IdleTimeout, brute force per-user
-6. Backup/DR scripts + runbook
+=======================================
+PRIORITIES (Verified 2026-04-04)
+=======================================
 
-P1 — FRONTEND PHASE 3:
-7. Quota warning banners (backend sends X-Quota-Warning, frontend doesn't consume)
-8. Estandarizar unidades GB (decimal vs binario)
-9. Personal quota view page (endpoint exists, no UI)
+P0:
+1. GC multi-instance real leadership beyond GC_ENABLED workaround
+2. Accounts/quota/subscription pending work -> ver quotas-pending-issues.txt
 
-P2 — POST-LAUNCH:
-10. Go code reorganization (functional but hard to maintain)
-11. Test coverage push (25% → 40%)
-12. Email/notifications
-13. Antivirus ClamAV
+P1:
+3. Persistent audit logs / activities
+4. Security hardening
+5. Backup / DR
+6. Storage classes & multi-region completion
+7. Antivirus / malware scanning
+
+P2:
+8. Diff view
+9. Cold storage restore completion
+10. Code reorganization, coverage, CI

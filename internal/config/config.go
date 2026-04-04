@@ -885,6 +885,11 @@ func (c *Config) applyEnvOverrides() {
 		}
 	}
 
+	// GC settings
+	if v := os.Getenv("GC_ENABLED"); v != "" {
+		c.GC.Enabled = v == "true" || v == "1"
+	}
+
 	// GC grace periods
 	if v := os.Getenv("GC_USER_GRACE_DAYS"); v != "" {
 		if i, err := strconv.Atoi(v); err == nil {

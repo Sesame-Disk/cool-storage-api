@@ -456,6 +456,36 @@ func TestEnvOverrideAuthDevMode(t *testing.T) {
 	}
 }
 
+// TestEnvOverrideGCEnabled tests various GC_ENABLED values.
+func TestEnvOverrideGCEnabled(t *testing.T) {
+	tests := []struct {
+		value    string
+		expected bool
+	}{
+		{"true", true},
+		{"1", true},
+		{"false", false},
+		{"0", false},
+		{"yes", false},
+	}
+
+	for _, tt := range tests {
+		t.Run("value="+tt.value, func(t *testing.T) {
+			cfg := DefaultConfig()
+			cfg.GC.Enabled = false
+
+			os.Setenv("GC_ENABLED", tt.value)
+			defer os.Unsetenv("GC_ENABLED")
+
+			cfg.applyEnvOverrides()
+
+			if cfg.GC.Enabled != tt.expected {
+				t.Errorf("GC.Enabled = %v, want %v", cfg.GC.Enabled, tt.expected)
+			}
+		})
+	}
+}
+
 // TestEnvOverridePriority tests that SERVER_PORT takes priority over PORT
 func TestEnvOverridePriority(t *testing.T) {
 	cfg := DefaultConfig()

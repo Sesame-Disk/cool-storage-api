@@ -869,7 +869,7 @@ Added `getEffectiveHostname(c *gin.Context) string` helper in `server.go` for th
 
 ### ISSUE-GC-MULTIINSTANCE-01: GC is not safe with multiple instances
 
-**Status**: 🟡 Pending
+**Status**: 🟡 Pending with temporary prod workaround
 **Discovered**: 2026-03-17
 **Priority**: 🟡 High — required before scaling to multiple replicas
 **Affected**: `internal/gc/worker.go`, `internal/gc/scanner.go`, `internal/gc/gc.go`
@@ -887,6 +887,11 @@ The GC (worker + scanner) has no coordination mechanism between instances. If mu
 - Cassandra DELETEs are idempotent
 
 **Actual impact**: Wasted work (CPU/network overhead) and slightly incorrect admin counters. No risk of data loss.
+
+**Current operational decision (2026-04-04):**
+- Production may proceed with a temporary guard: set `GC_ENABLED=true` on exactly one backend replica and `GC_ENABLED=false` on all others.
+- This avoids concurrent worker/scanner execution without introducing distributed coordination right now.
+- This is an operational workaround only; it does not solve failover or automatic leader transfer.
 
 **Proposed solution — Leader Election via LWT:**
 ```sql
@@ -906,6 +911,10 @@ applied, _ := session.Query(`
 - Heartbeat renewal every 10s with `UPDATE ... IF instance_id = ?`
 - If heartbeat expires (TTL 30s), another instance can take leadership
 - Separate roles: `worker` and `scanner` (can run on different instances)
+
+**Recommended future direction:**
+- Keep the temporary `GC_ENABLED` guard for short-term production unblock.
+- Replace it later with a Cassandra LWT lease so failover is automatic and operators no longer need to pin one GC replica manually.
 
 **Alternative — Org partitioning:**
 Each instance processes `hash(orgID) % numInstances == myIndex`. No coordination needed but requires knowing the total number of instances.
