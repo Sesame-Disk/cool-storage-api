@@ -326,6 +326,8 @@ The `modifier` field is part of the Seafile FS object hash (`fs_id`). Changing i
 
 ### High Priority
 - [ ] **Device Flow / service-account auth follow-up** (Section 6) — user-scoped API keys are complete, but there is still no first-class userless automation flow.
+- [ ] **Persist and enforce API key scope in derived sessions** (Section 14) — `/api2/auth-token/` currently drops API key scope when minting a session.
+- [ ] **Define SeafHTTP upload-token contract and resumability for public links** (Section 15) — TTL, retries, cleanup, and resume semantics are still inconsistent.
 
 ### Short-Term (As Encountered)
 - [ ] Fix dialogs as users report issues
@@ -639,4 +641,124 @@ The GC path now reuses the shared implementation via `traffic.AdjustAggregateSto
 
 ---
 
-*Last updated: 2026-03-25*
+## 14. API Key Scopes Are Not Preserved In Derived Sessions (2026-04-04)
+
+### Status
+
+Known design gap. Direct API key requests can be scope-limited, but sessions minted from API keys via `/api2/auth-token/` are not scope-limited today.
+
+### What Works Today
+
+- API keys support three scopes: `read`, `read-write`, `admin`
+- Direct API key authentication stores `api_key_scope` in request context
+- Routes that explicitly use `RequireScope(...)` enforce that scope correctly
+- Sessions minted from API keys retain:
+  - source provenance (`source_api_key_hash`)
+  - expiry inheritance from the API key
+  - revoke fan-out through `sessions_by_api_key`
+
+### The Gap
+
+`POST /api2/auth-token/` accepts `username + raw API key` and creates a normal long-lived session token. That session currently stores provenance and expiry, but not the API key scope.
+
+As a result:
+
+- a `read` API key can mint a session
+- the resulting session is treated like an ordinary session on routes that do not explicitly inspect API key scope
+- `RequireScope(...)` only helps for requests authenticated directly by API key, because the middleware relies on `api_key_scope` being present in the request context
+
+### Impact
+
+- least-privilege guarantees are weaker than the API key UI suggests
+- a user may believe a `read` key cannot be used for write-capable session workflows, but today it can
+- scope enforcement becomes route-fragile because it depends on using API key auth directly rather than exchanging the key for a session first
+
+### Current Code Shape
+
+- `internal/apikeys/scope_middleware.go` enforces scope only when `api_key_scope` exists in request context
+- `internal/api/server.go` sets `api_key_scope` for direct API key auth
+- `internal/auth/session.go` stores `source_api_key_hash` but not scope metadata on derived sessions
+
+### Recommended Fix Path
+
+1. Add `api_key_scope` to stored sessions and to the in-memory/auth payload used by middleware.
+2. Populate that scope when `/api2/auth-token/` creates a session from an API key.
+3. Enforce scope for both direct API key auth and derived-session auth.
+4. Add regression tests proving a `read` key cannot mint a write-capable session.
+
+### Acceptable Stopgap If Full Fix Is Deferred
+
+Reject `/api2/auth-token/` exchanges for `read` API keys. That does not solve the general model inconsistency, but it closes the most surprising least-privilege break with a smaller change.
+
+---
+
+## 15. SeafHTTP Upload Tokens: TTL, Resume Semantics, And Public-Link Fragility (2026-04-04)
+
+### Status
+
+Known behavior gap. The transport path is mostly unified, but token lifecycle and resumability semantics are not clearly defined across authenticated uploads, share-link uploads, and public upload links.
+
+### Important Clarification
+
+Normal authenticated uploads and upload-link uploads both end up using the same SeafHTTP endpoint:
+
+- upload URL shape: `/seafhttp/upload-api/:token`
+- request validation: `internal/api/seafhttp.go`
+- token storage: `access_tokens` with Cassandra TTL
+
+So raw upload throughput is not inherently different just because one flow uses an upload token. Normal uploads also use upload tokens.
+
+### Why Public / Upload-Link Flows Feel Slower
+
+The main difference is resumability and recovery, not the underlying upload pipe.
+
+Authenticated uploader flow:
+- calls `getFileServerUploadLink(...)` to mint the SeafHTTP upload URL
+- can also call `getFileUploadedBytes(...)`
+- resumes from the already-uploaded offset when retrying a file
+
+Public/upload-link uploader flow:
+- calls `sharedUploadLinkGetFileUploadUrl(...)` or `sharedLinkGetFileUploadUrl(...)` to mint the SeafHTTP upload URL
+- cannot call `getFileUploadedBytes(...)` because there is no authenticated user session/token for that API
+- explicitly falls back to `markChunksCompleted(0)` and restarts from byte 0 on retry
+
+That means the public/upload-link path is usually perceived as slower or more fragile after interruptions, even though the actual chunk upload endpoint is the same.
+
+### Current Token Semantics
+
+- upload/download tokens are stored in `access_tokens`
+- expiration is TTL-based, default `1h`
+- token validity is checked at request start
+- a single long-running request that starts before expiry can usually finish
+- the next chunk/request after expiry fails
+
+### Remaining Ambiguities / Risks
+
+| Issue | Risk | Notes |
+|-------|------|-------|
+| TTL-only token model | Medium | There is no explicit persisted `expires_at`; expiration is implicit in Cassandra TTL. |
+| Public-link uploads cannot resume from server-known offset | High | Retries re-upload from zero, which is expensive for large files or flaky networks. |
+| One-shot vs reusable token contract is unclear | Medium | Current flow looks TTL-based, not strictly single-use per upload attempt. |
+| Abandoned chunk-upload cleanup is unclear | Medium | `ChunkManager` cleanup is obvious on successful completion, but there is no documented sweeper contract for interrupted uploads. |
+| Expiry semantics across multi-request uploads are under-documented | Medium | A file may partially upload successfully, then fail on the next chunk after token expiry. |
+
+### Recommended Fix Path
+
+1. Define the product contract explicitly:
+  - whether upload tokens are single-use or reusable until TTL expiry
+  - whether expiry is checked only at request start or also during long uploads
+  - what the supported resume behavior is for public-link uploads
+2. Add an authenticated-equivalent offset probe for public/share upload flows, or another signed mechanism that allows safe resume without a full user session.
+3. Add cleanup/expiration handling for abandoned chunk-upload state and document the retention window.
+4. Add integration tests for:
+  - token expiry between chunks
+  - interrupted public upload resume
+  - abandoned partial upload cleanup
+
+### Operational Note
+
+If users report that “normal uploads are faster than upload-token uploads”, the likely explanation is not the tokenized SeafHTTP path itself. The more likely cause is that authenticated uploads can resume from server-known progress while public/upload-link uploads restart from zero after interruption.
+
+---
+
+*Last updated: 2026-04-04*

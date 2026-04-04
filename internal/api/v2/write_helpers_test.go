@@ -12,6 +12,28 @@ type fakeQuotaDB struct{}
 
 func (fakeQuotaDB) Session() *gocql.Session { return nil }
 
+type fakeSessionInvalidator struct {
+	called [][2]string
+}
+
+func (f *fakeSessionInvalidator) InvalidateUserSessions(orgID, userID string) error {
+	f.called = append(f.called, [2]string{orgID, userID})
+	return nil
+}
+
+func (f *fakeSessionInvalidator) InvalidateAPIKeySessions(apiKeyHash string) error {
+	return nil
+}
+
+type fakeAPIKeyInvalidator struct {
+	called [][2]gocql.UUID
+}
+
+func (f *fakeAPIKeyInvalidator) InvalidateUserAPIKeys(orgID, userID gocql.UUID) error {
+	f.called = append(f.called, [2]gocql.UUID{orgID, userID})
+	return nil
+}
+
 func TestValidateUserQuotaAgainstOrg(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -174,4 +196,42 @@ func TestReadAndValidateUserQuotaLimits(t *testing.T) {
 		assert.Equal(t, int64(70), oq.TrafficUploadQuota)
 		assert.Equal(t, int64(80), oq.TrafficDownloadQuota)
 	})
+}
+
+func TestInvalidateUserCredentials_InvalidatesSessionsAndAPIKeys(t *testing.T) {
+	orgID := gocql.TimeUUID().String()
+	userID := gocql.TimeUUID().String()
+	sessions := &fakeSessionInvalidator{}
+	apiKeys := &fakeAPIKeyInvalidator{}
+
+	invalidateUserCredentials(sessions, apiKeys, orgID, userID)
+
+	assert.Equal(t, [][2]string{{orgID, userID}}, sessions.called)
+	if assert.Len(t, apiKeys.called, 1) {
+		assert.Equal(t, orgID, apiKeys.called[0][0].String())
+		assert.Equal(t, userID, apiKeys.called[0][1].String())
+	}
+}
+
+func TestInvalidateUserCredentials_InvalidatesAPIKeysWithoutSessionInvalidator(t *testing.T) {
+	orgID := gocql.TimeUUID().String()
+	userID := gocql.TimeUUID().String()
+	apiKeys := &fakeAPIKeyInvalidator{}
+
+	invalidateUserCredentials(nil, apiKeys, orgID, userID)
+
+	if assert.Len(t, apiKeys.called, 1) {
+		assert.Equal(t, orgID, apiKeys.called[0][0].String())
+		assert.Equal(t, userID, apiKeys.called[0][1].String())
+	}
+}
+
+func TestInvalidateUserCredentials_SkipsAPIKeyInvalidationForInvalidUUIDs(t *testing.T) {
+	sessions := &fakeSessionInvalidator{}
+	apiKeys := &fakeAPIKeyInvalidator{}
+
+	invalidateUserCredentials(sessions, apiKeys, "not-a-uuid", "also-not-a-uuid")
+
+	assert.Equal(t, [][2]string{{"not-a-uuid", "also-not-a-uuid"}}, sessions.called)
+	assert.Empty(t, apiKeys.called)
 }
