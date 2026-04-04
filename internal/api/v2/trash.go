@@ -325,13 +325,18 @@ func (h *TrashHandler) GetRepoFolderTrash(c *gin.Context) {
 
 // RestoreTrashItem restores a deleted file or folder from trash
 // POST /api/v2.1/repos/:repo_id/file/restore/ or /dir/restore/
-// Body: commit_id=xxx&p=/path/to/file
+// JSON body: {"commit_id":"xxx","p":"/path/to/file"}
 func (h *TrashHandler) RestoreTrashItem(c *gin.Context) {
 	repoID := c.Param("repo_id")
 	orgID := c.GetString("org_id")
 	userID := c.GetString("user_id")
-	commitID := c.PostForm("commit_id")
-	filePath := c.PostForm("p")
+	var restoreReq struct {
+		CommitID string `json:"commit_id"`
+		Path     string `json:"p"`
+	}
+	_ = c.ShouldBindJSON(&restoreReq)
+	commitID := restoreReq.CommitID
+	filePath := restoreReq.Path
 
 	if commitID == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error_msg": "commit_id is required"})

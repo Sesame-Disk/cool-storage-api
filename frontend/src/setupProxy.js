@@ -12,6 +12,16 @@ const { createProxyMiddleware } = require('http-proxy-middleware');
 
 const backendURL = process.env.SESAMEFS_BACKEND_URL || 'http://localhost:8080';
 
+function shouldProxyRepoPath(pathname) {
+  if (typeof pathname !== 'string') {
+    return false;
+  }
+
+  pathname = pathname.split('?')[0].split('#')[0];
+
+  return /^\/repo\/[^/]+\/(?:raw(?:\/|$)|history\/(?:download|view|raw)(?:\/|$))/.test(pathname);
+}
+
 module.exports = function (app) {
   const proxy = createProxyMiddleware({
     target: backendURL,
@@ -33,7 +43,12 @@ module.exports = function (app) {
   app.use('/d', proxy);          // share link views
   app.use('/u', proxy);          // upload link views
   app.use('/lib', proxy);        // file view routes
-  app.use('/repo', proxy);       // raw/history/snapshot routes
+  app.use((req, res, next) => {
+    if (shouldProxyRepoPath(req.path || req.url || '')) {
+      return proxy(req, res, next);
+    }
+    return next();
+  });
   app.use('/onlyoffice', proxy);
   app.use('/office-convert', proxy);
   app.use('/smart-link', proxy);
@@ -43,3 +58,5 @@ module.exports = function (app) {
   app.use('/org/custom', proxy);
   app.use('/accounts', proxy);   // OIDC redirect targets
 };
+
+module.exports.shouldProxyRepoPath = shouldProxyRepoPath;

@@ -465,13 +465,13 @@ seafileAPI.deleteRepoTrash = function (repoID, keepDays) {
 };
 
 seafileAPI.restoreFile = function (repoID, commitID, path) {
-  let url = this.server + '/api/v2.1/repos/' + repoID + '/file/restore/?p=' + encodeURIComponent(path);
-  return this.req.post(url, { commit_id: commitID });
+  let url = this.server + '/api/v2.1/repos/' + repoID + '/file/restore/';
+  return this.req.post(url, { commit_id: commitID, p: path });
 };
 
 seafileAPI.restoreFolder = function (repoID, commitID, path) {
-  let url = this.server + '/api/v2.1/repos/' + repoID + '/dir/restore/?p=' + encodeURIComponent(path);
-  return this.req.post(url, { commit_id: commitID });
+  let url = this.server + '/api/v2.1/repos/' + repoID + '/dir/restore/';
+  return this.req.post(url, { commit_id: commitID, p: path });
 };
 
 seafileAPI.listCommitDir = function (repoID, commitID, path) {
