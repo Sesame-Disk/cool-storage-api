@@ -87,12 +87,6 @@ type ErrorPageData struct {
 	Message string
 }
 
-// AccessDeniedData holds data for access_denied.html
-type AccessDeniedData struct {
-	Title   string
-	Message string
-}
-
 // LoginSuccessData holds data for login_success.html
 type LoginSuccessData struct {
 	ReturnURL string

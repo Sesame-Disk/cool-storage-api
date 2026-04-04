@@ -259,6 +259,36 @@ Requires the OIDC provider (`accounts.sesamedisk.com`) to support Device Flow.
 Admin/users generate long-lived tokens via the web UI or admin API.
 The token is a random string stored in Cassandra, scoped to the user (not a library).
 
+---
+
+## 7. Backend HTML Preview Debt (2026-04-03)
+
+### Status
+Authenticated file preview pages are still rendered server-side for a narrow set of flows.
+
+### What Remains Backend-Owned
+- `file_preview.html` for inline authenticated file preview
+- `file_preview_historic.html` for historic revision preview
+- `onlyoffice_editor.html` for full-page OnlyOffice editor bootstrap
+- `error_page.html` as the fallback page for those flows
+- `login_success.html` for the desktop-client SSO callback bridge
+
+### Why This Is Debt
+The main app, share pages, upload pages, and login are already frontend-owned. Keeping preview/editor HTML in Go means:
+- duplicate presentation responsibility across backend and frontend
+- extra template maintenance for edge-case pages
+- harder UI consistency across product surfaces
+
+### Deferred Direction
+Move preview/editor shells into the frontend and leave the backend responsible only for:
+- bootstrap JSON
+- raw file/preview streams
+- OnlyOffice config APIs
+- auth/session redirects
+
+### Note
+This is deferred on purpose. It is safe to keep the current backend-rendered preview pages until the API key and auth work lands cleanly.
+
 - Implementation: ~200 lines in a new `internal/api/v2/access_tokens.go`
 - Endpoints: `POST/GET/DELETE /api/v2.1/user/access-tokens/`
 - Storage: new `personal_access_tokens` Cassandra table

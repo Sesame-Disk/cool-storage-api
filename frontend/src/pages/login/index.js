@@ -1,13 +1,10 @@
 import React, { useState, useEffect } from 'react';
-import { login, seafileAPI } from '../../utils/seafile-api';
+import { seafileAPI } from '../../utils/seafile-api';
 import { siteTitle, loginBGPath } from '../../utils/constants';
 import './login.css';
 
 function LoginPage() {
-  const [email, setEmail] = useState('');
-  const [password, setPassword] = useState('');
   const [error, setError] = useState('');
-  const [loading, setLoading] = useState(false);
   const [ssoLoading, setSsoLoading] = useState(false);
   const [oidcEnabled, setOidcEnabled] = useState(false);
 
@@ -17,6 +14,8 @@ function LoginPage() {
     const params = new URLSearchParams(window.location.search);
     if (params.get('expired') === '1') {
       setError('Your session has expired. Please log in again.');
+    } else if (params.get('error')) {
+      setError('The login flow could not be completed. Please try again.');
     }
 
     seafileAPI.getOIDCConfig()
@@ -26,31 +25,10 @@ function LoginPage() {
         }
       })
       .catch(() => {
-        // OIDC not available, use password login only
+        // No browser SSO available.
         setOidcEnabled(false);
       });
   }, []);
-
-  const handleSubmit = async (e) => {
-    e.preventDefault();
-    setError('');
-    setLoading(true);
-
-    try {
-      await login(email, password);
-      // Redirect to original URL or home (only allow relative paths to prevent open redirect)
-      const params = new URLSearchParams(window.location.search);
-      let next = params.get('next') || '/';
-      if (!next.startsWith('/') || next.startsWith('//')) {
-        next = '/';
-      }
-      window.location.href = next;
-    } catch (err) {
-      setError(err.message || 'Login failed. Please try again.');
-    } finally {
-      setLoading(false);
-    }
-  };
 
   const handleSSOLogin = async () => {
     setError('');
@@ -82,81 +60,59 @@ function LoginPage() {
   };
 
   const bgStyle = loginBGPath ? { backgroundImage: `url(${loginBGPath})` } : {};
+  const hasError = Boolean(error);
 
   return (
     <div className="login-page" style={bgStyle}>
-      <div className="login-container">
-        <div className="login-header">
-          <h1>{siteTitle || 'SesameFS'}</h1>
-        </div>
-
-        {/* SSO Login Button */}
-        {oidcEnabled && (
-          <div className="sso-login" style={{ marginBottom: '1.5rem' }}>
-            <button
-              type="button"
-              className="btn btn-outline-primary btn-block"
-              onClick={handleSSOLogin}
-              disabled={ssoLoading}
-              style={{ width: '100%' }}
-            >
-              {ssoLoading ? 'Redirecting...' : 'Login with SSO'}
-            </button>
-            <div className="login-divider" style={{
-              display: 'flex',
-              alignItems: 'center',
-              margin: '1.5rem 0',
-              color: '#6c757d'
-            }}>
-              <hr style={{ flex: 1, borderColor: '#dee2e6' }} />
-              <span style={{ padding: '0 1rem' }}>or</span>
-              <hr style={{ flex: 1, borderColor: '#dee2e6' }} />
-            </div>
+      <div className="login-shell">
+        <section className="login-hero">
+          <div className="login-hero__eyebrow">SesameFS Access</div>
+          <h1 className="login-hero__title">{siteTitle || 'SesameFS'}</h1>
+          <p className="login-hero__copy">
+            Sign in to reach your libraries, shares, and admin tools from one place.
+          </p>
+          <div className="login-hero__chips" aria-hidden="true">
+            <span>sync</span>
+            <span>share</span>
+            <span>admin</span>
           </div>
-        )}
+        </section>
 
-        <form className="login-form" onSubmit={handleSubmit}>
-          {error && (
-            <div className="login-error">
+        <section className="login-panel" aria-label="Login form">
+          <div className="login-panel__header">
+            <div>
+              <p className="login-panel__kicker">Workspace Login</p>
+              <h2>Continue with SSO</h2>
+            </div>
+            <p className="login-panel__hint">Password login is not enabled yet in SesameFS.</p>
+          </div>
+
+          {hasError && (
+            <div className="login-error" role="alert">
               {error}
             </div>
           )}
 
-          <div className="form-group">
-            <label htmlFor="email">Email</label>
-            <input
-              type="email"
-              id="email"
-              className="form-control"
-              value={email}
-              onChange={(e) => setEmail(e.target.value)}
-              placeholder="Enter your email"
-              required
-              autoFocus
-            />
-          </div>
-
-          <div className="form-group">
-            <label htmlFor="password">Password</label>
-            <input
-              type="password"
-              id="password"
-              className="form-control"
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
-              placeholder="Enter your password"
-              required
-            />
-          </div>
-
-          <button
-            type="submit"
-            className="btn btn-primary btn-block"
-            disabled={loading}
-          >
-            {loading ? 'Logging in...' : 'Log In'}
-          </button>
-        </form>
+          {oidcEnabled ? (
+            <div className="login-sso">
+              <button
+                type="button"
+                className="login-submit"
+                onClick={handleSSOLogin}
+                disabled={ssoLoading}
+              >
+                {ssoLoading ? 'Redirecting...' : 'Continue with SSO'}
+              </button>
+              <p className="login-note">
+                You will be redirected to the Accounts identity provider and then returned here.
+              </p>
+            </div>
+          ) : (
+            <div className="login-note login-note--warning">
+              SSO is not available in this environment, and password login is intentionally disabled for now.
+            </div>
+          )}
+        </section>
       </div>
     </div>
   );

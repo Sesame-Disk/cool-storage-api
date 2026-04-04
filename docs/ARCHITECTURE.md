@@ -1141,12 +1141,7 @@ internal/templates/
     file_preview.html       # File preview (images, video, audio, text, PDF)
     file_preview_historic.html  # Historic version preview
     login_success.html      # Desktop client SSO callback
-    logout.html             # Token cleanup + redirect
     onlyoffice_editor.html  # Full-page OnlyOffice editor
-    share_file_preview.html # Share link file preview with "Shared by"
-    share_onlyoffice_preview.html  # Share link OnlyOffice viewer
-    share_page.html         # Share link React SPA bootstrap
-    upload_link_page.html   # Upload link React SPA bootstrap
 
 frontend/public/static/css/
   sesamefs-pages.css       # Shared CSS for all backend-rendered pages
@@ -1174,25 +1169,9 @@ frontend/public/static/css/
 - Use `template.JS` type for trusted JSON injected into `<script>` blocks
 - Fallback one-liner HTML strings exist for when template rendering itself fails
 
-### Bundle Hash Resolution (Share Link / Upload Link Pages)
+### Public Share/Upload Pages
 
-Share link and upload link pages (`share_page.html`, `upload_link_page.html`) bootstrap the React SPA. These pages must reference the correct **hashed bundle filenames** (e.g., `sharedDirView.ef3d8149.js`) that webpack generates on every frontend build. The backend resolves these filenames at startup using a 3-level fallback:
-
-```
-1. HTTP fetch: GET ${FRONTEND_URL}/asset-manifest.json
-   ↓ (on failure)
-2. Filesystem scan: ./frontend/build/static/js/*.js, ./frontend/build/static/css/*.css
-   ↓ (on failure)
-3. Hardcoded fallbacks: known filenames from the last known build
-```
-
-**Why HTTP, not filesystem?** The frontend runs in a separate Docker container. The Go binary has no direct access to the frontend container's filesystem. Fetching `asset-manifest.json` over the Docker network is the clean, container-native approach.
-
-**Configuration:** `FRONTEND_URL` env var (default: `http://frontend:80`). Only the path `/asset-manifest.json` is appended — do not include a path in the env var.
-
-**Failure modes:**
-- Level 1 fails (frontend not yet started, network issue): falls back to filesystem scan.
-- Levels 1+2 fail (standalone binary, CI): uses hardcoded hashes. These become stale on every frontend rebuild — share link pages may 404 on their JS/CSS. Run as two containers in docker-compose to avoid this.
+Public share and upload pages are now frontend-owned shells. The backend no longer renders dedicated HTML templates for those routes; it only serves bootstrap/data endpoints and raw file actions.
 - The resolved map is cached at startup; a backend restart is required to pick up new bundle hashes after a frontend rebuild.
 
 **Implementation:** `internal/api/v2/sharelink_view.go` — `fetchBundleManifest()` + `NewShareLinkViewHandler()`.
