@@ -632,7 +632,10 @@ If the M2M flow needs a dedicated endpoint later, the handler internals are alre
 
 ### Service Token (future)
 
-Not implemented yet. Design:
+Not implemented yet. This section is only about Accounts -> SesameFS machine-to-machine provisioning.
+User-scoped non-browser auth is already covered separately by user API keys plus `/api2/auth-token/` exchange.
+
+Design:
 - Dedicated `service_tokens` table with hashed tokens, name, scope, expiry
 - Separate middleware (`serviceAuthMiddleware`) validates `X-Service-Token` header
 - Initial scope: full superadmin-equivalent for provisioning simplicity
@@ -667,11 +670,11 @@ Option B: Accounts provisions via API
 
 - OIDC auto-provision (`oidc.go:780-807`) creates users on first login
 - Users created via OIDC already have identity in the provider
-- `max_users` check exists in `AddOrgUser` and needs to be added to OIDC auto-provision
+- `max_users` enforcement already exists both in `AddOrgUser` and in OIDC auto-provision
 
 ### What needs to happen
 
-1. Add `max_users` check to OIDC `provisionUser()` — reject if org is full
+1. Keep the existing `max_users` check in OIDC `provisionUser()` aligned with any future invite/provisioning flow
 2. Design invite flow (SesameFS generates invite, user completes signup in Accounts)
 3. Repurpose `AddOrgUser` endpoint as internal provisioning API (Accounts calls it, not UI)
 4. **This is documented as a pending integration item, not blocking plan/permissions work**
@@ -821,11 +824,11 @@ Phase 2 implementation notes:
 | Step | What | Effort |
 |------|------|--------|
 | 4.1 | Add preview/evaluate endpoint for proposed plan/quota changes | Medium |
-| 4.2 | Add periodic quota-period rollover job for orgs with `current_period_ends_at <= now` | Medium |
+| 4.2 | ✅ Periodic quota-period rollover job for orgs with `current_period_ends_at <= now` | Done |
 | 4.3 | Implement `service_tokens` table + middleware | Medium |
 | 4.4 | Add M2M code path in admin org update handler (idempotency, audit) | Medium |
 | 4.5 | Design invite flow for user creation | Medium |
-| 4.6 | Add `max_users` enforcement to OIDC provision | Low |
+| 4.6 | ✅ `max_users` enforcement in OIDC provision | Done |
 
 ---
 

@@ -82,8 +82,8 @@ handler files. `internal/models/` has only ~550 lines and only defines basic str
 **Reclassified from P0 to P2 (2026-04-02):**
 The code is functional and all features work correctly. The large files create operational risk
 for incident response (harder to locate and fix bugs quickly), but this is a code quality issue,
-not a functional blocker. The real P0 blockers are programmatic auth (PATs), GC multi-instance
-safety, and quota period rollover — all of which are missing functionality, not code organization.
+not a functional blocker. The real remaining launch-critical gaps are Accounts M2M provisioning,
+GC multi-instance safety, and the general security-hardening checklist.
 Reorganization should happen post-launch when stability allows for large refactors.
 
 **Proposed structure (move code, do not rewrite):**
@@ -418,9 +418,11 @@ config always overrides this. Add a startup assertion that fails if `dev_mode = 
 `SESAME_ENV = production`.
 
 **E. API token revocation:**
-API tokens have a 180-day TTL with no bulk revocation. When an org admin deactivates a user,
-their API tokens are currently not invalidated. Add API token invalidation to `deactivateUser()`
-in `write_helpers.go`, following the same pattern as `InvalidateUserSessions()`.
+User API keys and sessions derived from them are now revoked on deactivate/delete, and API-key-derived
+sessions now preserve scope metadata with central sync/library enforcement. The remaining hardening debt is:
+- dedicated rate limiting for direct API key auth in `authMiddleware`
+- route-audit coverage for endpoints that rely only on bare authentication and not on central library/scope checks
+- Go-side security headers and HTTP server limits still missing
 
 ---
 
@@ -518,11 +520,11 @@ the launch on Glacier since it requires AWS Glacier infrastructure setup and tes
 
 ## Executive Summary
 
-**Last verified against code**: 2026-04-02
+**Last verified against code**: 2026-04-04
 
 | # | Area | Priority | Current State | Estimated Effort |
 |---|------|----------|---------------|-----------------|
-| 1 | Accounts ↔ SesameFS integration | **P0** | Phase 1 ✅, Phase 2 ✅ (2026-03-28). Remaining: rollover job, M2M service token | 1–2 weeks |
+| 1 | Accounts ↔ SesameFS integration | **P0** | Phase 1 ✅, Phase 2 ✅ (2026-03-28). Remaining: M2M service token + provisioning sync from Accounts | 1–2 weeks |
 | 2 | Go code reorganization | **P2** | Not started. Functional but operationally risky for incident response | 3–4 weeks |
 | 3 | Frontend/Backend separation + Nginx | ✅ DONE | ✅ DONE (2026-03-30/31) | — |
 | 4 | Robust DB migration system | ✅ DONE | ✅ DONE (2026-04-01) | — |
@@ -530,12 +532,12 @@ the launch on Glacier since it requires AWS Glacier infrastructure setup and tes
 | 6 | Antivirus / malware scanning | **P1** | 0% | 1–2 weeks |
 | 7 | Enforcement Phase 2 wire-up | ✅ DONE | ✅ DONE (2026-03-28). `ResolveCapabilities` wired to `account/info` (server.go:1438) + `bootstrap` (bootstrap.go:271). Group creation gates `CanAddGroup`. Library creation gates `MaxLibraries`. Share/upload links gate `MaxShareLinks`/`MaxUploadLinks`. | — |
 | 8 | Persistent audit logs | **P1** | Framework only, not persisted (TODO audit.go:87) | 3–4 days |
-| 9 | Security hardening | **P1** | Partial (Nginx has headers, Go does not) | 2–3 days |
+| 9 | Security hardening | **P1** | Partial. API key scope hardening landed (2026-04-04), but Go security headers, HTTP server limits, and direct API key rate limiting still remain | 2–3 days |
 | 10 | Backup and disaster recovery | **P1** | Nothing exists | 1 week |
 | 11 | Email / notifications | **P2** | 0% | 1 week |
 | 12 | Cursor-based pagination | **P2** | Admin links done; library/group admin lists still pending | 2-4 days |
 | 13 | Cold storage / Glacier | **P2** | ~30% | 2–3 weeks |
-| **14** | **Programmatic auth (PATs)** | **P0** | **0% — `server.go:1141` TODO. Desktop/CLI cannot auth in OIDC-only mode** | **1–2 days** |
+| **14** | **User-scoped programmatic auth (API keys)** | **✅ DONE** | **User API keys + `/api2/auth-token/` are live. 2026-04-04 hardening now propagates scope to derived sessions, caps effective role, and enforces central library/sync scope checks. Remaining M2M service auth belongs to item #1.** | — |
 | **15** | **GC multi-instance safety** | **P0** | **0% — `gc.go:99` Start() has no leader election or lock** | **1 day** |
 | 16 | Frontend Phase 3 cleanup | **P1** | Mostly done. Legacy `personalfree/business/pay_restricted*` removed. Remaining: pageOptions placeholders and minor cleanup | 2–3 days |
 
@@ -549,13 +551,12 @@ the launch on Glacier since it requires AWS Glacier infrastructure setup and tes
 - [#7] ✅ Enforcement Phase 2 wire-up — DONE (2026-03-28)
 
 ### Sprint 2 — Hard Blockers (CURRENT)
-- [#14] Programmatic auth (PATs or Device Flow) — desktop sync is broken without this
 - [#15] GC multi-instance safety — env var guard or Cassandra LWT leader lease
 - [#9] Security hardening — small effort, high impact
+- [#1] Remaining Accounts integration — M2M service token, provisioning endpoint
 
 ### Sprint 3 — Production Essentials
 - [#8] Persistent audit logs — framework already exists, wire it up
-- [#1] Remaining Accounts integration — M2M service token, provisioning endpoint
 - [#10] Backup and disaster recovery — scripts + runbook + restore drill
 - [#17] Frontend Phase 3 — quota warning banners, unit standardization
 

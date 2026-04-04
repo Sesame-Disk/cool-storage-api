@@ -873,6 +873,9 @@ func (s *Server) authMiddleware() gin.HandlerFunc {
 					c.Set("org_id", session.OrgID)
 					c.Set("email", session.Email)
 					c.Set("role", session.Role)
+					if session.APIKeyScope != "" {
+						c.Set("api_key_scope", session.APIKeyScope)
+					}
 					c.Next()
 					return
 				}
@@ -901,6 +904,7 @@ func (s *Server) authMiddleware() gin.HandlerFunc {
 				var email, role string
 				_ = s.db.Session().Query(`SELECT email, role FROM users WHERE org_id = ? AND user_id = ?`,
 					apiKey.OrgID, apiKey.UserID).Scan(&email, &role)
+				role = apikeys.ConstrainRoleForScope(role, apiKey.Scope)
 				c.Set("user_id", apiKey.UserID.String())
 				c.Set("org_id", apiKey.OrgID.String())
 				c.Set("email", email)
@@ -1234,8 +1238,9 @@ func (s *Server) handleAuthToken(c *gin.Context) {
 						var email, role string
 						_ = s.db.Session().Query(`SELECT email, role FROM users WHERE org_id = ? AND user_id = ?`,
 							orgUUID, userUUID).Scan(&email, &role)
+						role = apikeys.ConstrainRoleForScope(role, apiKey.Scope)
 						session, sErr := sessionMgr.CreateAPITokenSessionFromAPIKey(
-							userUUID.String(), orgUUID.String(), email, role, apiKey.KeyHash, apiKey.ExpiresAt,
+							userUUID.String(), orgUUID.String(), email, role, apiKey.KeyHash, apiKey.Scope, apiKey.ExpiresAt,
 						)
 						if sErr == nil {
 							s.touchUserLastLogin(orgUUID.String(), userUUID.String(), time.Now().UTC())

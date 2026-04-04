@@ -1,6 +1,7 @@
 package v2
 
 import (
+	"fmt"
 	"log"
 	"net/http"
 	"time"
@@ -43,6 +44,10 @@ type DeletedLibraryHandler struct {
 	libHandler     *LibraryHandler
 }
 
+type deletedLibraryRoleResolver interface {
+	GetUserOrgRole(orgID, userID string) (middleware.OrganizationRole, error)
+}
+
 // DeletedRepoInfo represents a deleted library in API responses
 type DeletedRepoInfo struct {
 	RepoID   string `json:"repo_id"`
@@ -50,6 +55,18 @@ type DeletedRepoInfo struct {
 	OwnerID  string `json:"owner"`
 	DelTime  string `json:"del_time"`
 	Size     int64  `json:"size"`
+}
+
+func resolveDeletedLibraryCallerRole(c *gin.Context, resolver deletedLibraryRoleResolver) (middleware.OrganizationRole, error) {
+	callerOrgID := c.GetString("org_id")
+	userID := c.GetString("user_id")
+	if callerOrgID == "" || userID == "" {
+		return middleware.RoleGuest, fmt.Errorf("missing caller identity")
+	}
+	if resolver == nil {
+		return middleware.RoleGuest, fmt.Errorf("permission middleware not available")
+	}
+	return resolver.GetUserOrgRole(callerOrgID, userID)
 }
 
 // ListDeletedRepos lists soft-deleted libraries for the current user
@@ -114,19 +131,24 @@ func (h *DeletedLibraryHandler) RestoreDeletedRepo(c *gin.Context) {
 		return
 	}
 
+	callerRole, err := resolveDeletedLibraryCallerRole(c, h.permMiddleware)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to check permissions"})
+		return
+	}
+
 	// Resolve the library's actual org_id. Admins can manage libraries that
 	// belong to any org, so we look up the real org via libraries_by_id first.
 	orgID := callerOrgID
 	var ownerID string
 	var deletedAt time.Time
-	err := h.db.Session().Query(`
+	err = h.db.Session().Query(`
 		SELECT owner_id, deleted_at FROM libraries WHERE org_id = ? AND library_id = ?
 	`, orgID, repoID).Scan(&ownerID, &deletedAt)
 	if err != nil {
 		// Not found in caller's org.
 		// Only superadmin can manage libraries across orgs; org admin is scoped to their own org.
-		userRole := middleware.OrganizationRole(c.GetString("user_org_role"))
-		if userRole != middleware.RoleSuperAdmin {
+		if !middleware.IsPlatformSuperAdmin(callerOrgID, callerRole) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "library not found"})
 			return
 		}
@@ -153,8 +175,7 @@ func (h *DeletedLibraryHandler) RestoreDeletedRepo(c *gin.Context) {
 	}
 
 	// Superadmin and org admin can restore any library in their scope; regular users only their own
-	userRole := middleware.OrganizationRole(c.GetString("user_org_role"))
-	isAdmin := middleware.HasRequiredOrgRole(userRole, middleware.RoleAdmin)
+	isAdmin := middleware.HasRequiredOrgRole(callerRole, middleware.RoleAdmin)
 	if ownerID != userID && !isAdmin {
 		c.JSON(http.StatusForbidden, gin.H{"error": "only library owner can restore"})
 		return
@@ -196,19 +217,24 @@ func (h *DeletedLibraryHandler) PermanentDeleteRepo(c *gin.Context) {
 		return
 	}
 
+	callerRole, err := resolveDeletedLibraryCallerRole(c, h.permMiddleware)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to check permissions"})
+		return
+	}
+
 	// Resolve the library's actual org_id. Admins can manage libraries that
 	// belong to any org, so we look up the real org via libraries_by_id first.
 	orgID := callerOrgID
 	var ownerID, storageClass string
 	var deletedAt time.Time
-	err := h.db.Session().Query(`
+	err = h.db.Session().Query(`
 		SELECT owner_id, storage_class, deleted_at FROM libraries WHERE org_id = ? AND library_id = ?
 	`, orgID, repoID).Scan(&ownerID, &storageClass, &deletedAt)
 	if err != nil {
 		// Not found in caller's org.
 		// Only superadmin can manage libraries across orgs; org admin is scoped to their own org.
-		userRole := middleware.OrganizationRole(c.GetString("user_org_role"))
-		if userRole != middleware.RoleSuperAdmin {
+		if !middleware.IsPlatformSuperAdmin(callerOrgID, callerRole) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "library not found"})
 			return
 		}
@@ -236,9 +262,7 @@ func (h *DeletedLibraryHandler) PermanentDeleteRepo(c *gin.Context) {
 
 	// Only owner (or admin) can permanently delete
 	if ownerID != userID {
-		// Check if user is admin via context role set by auth middleware
-		userRole := middleware.OrganizationRole(c.GetString("user_org_role"))
-		if !middleware.HasRequiredOrgRole(userRole, middleware.RoleAdmin) {
+		if !middleware.HasRequiredOrgRole(callerRole, middleware.RoleAdmin) {
 			c.JSON(http.StatusForbidden, gin.H{"error": "only library owner or admin can permanently delete"})
 			return
 		}

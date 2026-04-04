@@ -119,6 +119,12 @@ func (m *PermissionMiddleware) RequireOrgRole(requiredRole OrganizationRole) gin
 // Usage: RequireLibraryPermission("repo_id", PermissionRW)
 func (m *PermissionMiddleware) RequireLibraryPermission(paramName string, requiredPerm LibraryPermission) gin.HandlerFunc {
 	return func(c *gin.Context) {
+		if !apiKeyScopeAllowsLibraryPermission(c, requiredPerm) {
+			c.JSON(http.StatusForbidden, gin.H{"error": "insufficient api key scope"})
+			c.Abort()
+			return
+		}
+
 		userID := c.GetString("user_id")
 		orgID := c.GetString("org_id")
 		repoID := c.Param(paramName)
@@ -798,6 +804,10 @@ func (m *PermissionMiddleware) HasLibraryAccessCtx(c interface {
 	Get(any) (any, bool)
 	GetString(any) string
 }, orgID, userID, repoID string, requiredPermission LibraryPermission) (bool, error) {
+	if !apiKeyScopeAllowsLibraryPermission(c, requiredPermission) {
+		return false, nil
+	}
+
 	if isRepoToken, _ := c.Get("repo_api_token"); isRepoToken == true {
 		tokenRepoID := c.GetString("repo_api_token_repo_id")
 		tokenPerm := c.GetString("repo_api_token_permission")
@@ -819,6 +829,26 @@ func (m *PermissionMiddleware) HasLibraryAccessCtx(c interface {
 	}
 
 	return m.HasLibraryAccess(orgID, userID, repoID, requiredPermission)
+}
+
+func apiKeyScopeAllowsLibraryPermission(c interface {
+	Get(any) (any, bool)
+}, requiredPermission LibraryPermission) bool {
+	scopeValue, ok := c.Get("api_key_scope")
+	if !ok {
+		return true
+	}
+	scope, _ := scopeValue.(string)
+	switch requiredPermission {
+	case PermissionOwner, PermissionAdmin:
+		return scope == "admin"
+	case PermissionRW, PermissionCloudEdit:
+		return scope == "read-write" || scope == "admin"
+	case PermissionR, PermissionPreview, PermissionNone:
+		return scope == "read" || scope == "read-write" || scope == "admin"
+	default:
+		return false
+	}
 }
 
 // LibraryWithPermission represents a library along with the user's permission level

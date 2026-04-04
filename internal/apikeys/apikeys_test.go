@@ -39,6 +39,29 @@ func TestScopeAllows(t *testing.T) {
 	}
 }
 
+func TestConstrainRoleForScope(t *testing.T) {
+	tests := []struct {
+		name  string
+		role  string
+		scope string
+		want  string
+	}{
+		{name: "read caps admin to readonly", role: "admin", scope: ScopeRead, want: "readonly"},
+		{name: "read write caps owner to user", role: "owner", scope: ScopeReadWrite, want: "user"},
+		{name: "read write keeps readonly readonly", role: "readonly", scope: ScopeReadWrite, want: "readonly"},
+		{name: "admin keeps superadmin", role: "superadmin", scope: ScopeAdmin, want: "superadmin"},
+		{name: "unknown scope leaves role unchanged", role: "user", scope: "unknown", want: "user"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := ConstrainRoleForScope(tt.role, tt.scope); got != tt.want {
+				t.Fatalf("ConstrainRoleForScope(%q, %q) = %q, want %q", tt.role, tt.scope, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestIsValidScope(t *testing.T) {
 	for _, s := range []string{ScopeRead, ScopeReadWrite, ScopeAdmin} {
 		if !IsValidScope(s) {

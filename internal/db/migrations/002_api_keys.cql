@@ -27,6 +27,7 @@ CREATE TABLE IF NOT EXISTS api_keys_by_user (
 ) WITH CLUSTERING ORDER BY (created_at DESC);
 
 ALTER TABLE sessions ADD source_api_key_hash text;
+ALTER TABLE sessions ADD api_key_scope text;
 
 CREATE TABLE IF NOT EXISTS sessions_by_api_key (
     api_key_hash text,

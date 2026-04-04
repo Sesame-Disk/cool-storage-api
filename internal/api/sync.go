@@ -18,6 +18,7 @@ import (
 
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
 
+	"github.com/Sesame-Disk/sesamefs/internal/apikeys"
 	"github.com/Sesame-Disk/sesamefs/internal/db"
 	"github.com/Sesame-Disk/sesamefs/internal/httputil"
 	"github.com/Sesame-Disk/sesamefs/internal/middleware"
@@ -61,6 +62,17 @@ func NewSyncHandler(database *db.DB, s3Store *storage.S3Store, blockStore *stora
 func (h *SyncHandler) checkSyncPermission(c *gin.Context, repoID string, required middleware.LibraryPermission) bool {
 	if h.permMiddleware == nil {
 		return true
+	}
+	if scope, ok := c.Get("api_key_scope"); ok {
+		scopeStr, _ := scope.(string)
+		switch required {
+		case middleware.PermissionRW, middleware.PermissionCloudEdit, middleware.PermissionAdmin, middleware.PermissionOwner:
+			if !apikeys.ScopeAllows(scopeStr, apikeys.ScopeReadWrite) {
+				c.JSON(http.StatusForbidden, gin.H{"error": "insufficient api key scope"})
+				c.Abort()
+				return false
+			}
+		}
 	}
 	orgID := c.GetString("org_id")
 	userID := c.GetString("user_id")

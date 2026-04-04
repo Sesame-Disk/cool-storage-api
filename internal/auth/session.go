@@ -47,16 +47,18 @@ type Session struct {
 	Role             string    `json:"role"`
 	CreatedAt        time.Time `json:"created_at"`
 	ExpiresAt        time.Time `json:"expires_at"`
+	APIKeyScope      string    `json:"-"`
 	SourceAPIKeyHash string    `json:"-"`
 }
 
 // SessionClaims represents the JWT claims for a session token
 type SessionClaims struct {
 	jwt.RegisteredClaims
-	UserID string `json:"user_id"`
-	OrgID  string `json:"org_id"`
-	Email  string `json:"email"`
-	Role   string `json:"role"`
+	UserID      string `json:"user_id"`
+	OrgID       string `json:"org_id"`
+	Email       string `json:"email"`
+	Role        string `json:"role"`
+	APIKeyScope string `json:"api_key_scope,omitempty"`
 }
 
 // SessionManager handles session creation and validation
@@ -92,11 +94,11 @@ func (sm *SessionManager) CreateSession(userID, orgID, email, role string) (*Ses
 // CreateAPITokenSession creates a long-lived session for desktop/mobile sync clients.
 // Seafile/SeaDrive clients don't support token refresh, so this uses APITokenTTL (default 180 days).
 func (sm *SessionManager) CreateAPITokenSession(userID, orgID, email, role string) (*Session, error) {
-	return sm.CreateAPITokenSessionFromAPIKey(userID, orgID, email, role, "", nil)
+	return sm.CreateAPITokenSessionFromAPIKey(userID, orgID, email, role, "", "", nil)
 }
 
 // CreateAPITokenSessionFromAPIKey creates a long-lived session derived from an API key exchange.
-func (sm *SessionManager) CreateAPITokenSessionFromAPIKey(userID, orgID, email, role, sourceAPIKeyHash string, apiKeyExpiresAt *time.Time) (*Session, error) {
+func (sm *SessionManager) CreateAPITokenSessionFromAPIKey(userID, orgID, email, role, sourceAPIKeyHash, apiKeyScope string, apiKeyExpiresAt *time.Time) (*Session, error) {
 	ttl := sm.config.APITokenTTL
 	if ttl <= 0 {
 		ttl = sm.config.SessionTTL // fallback to session TTL if not configured
@@ -111,17 +113,17 @@ func (sm *SessionManager) CreateAPITokenSessionFromAPIKey(userID, orgID, email, 
 		return nil, ErrSessionExpired
 	}
 
-	return sm.createSessionWithExpiry(userID, orgID, email, role, now, expiresAt, sourceAPIKeyHash)
+	return sm.createSessionWithExpiry(userID, orgID, email, role, now, expiresAt, sourceAPIKeyHash, apiKeyScope)
 }
 
 // CreateSessionWithTTL creates a new session with a custom TTL.
 func (sm *SessionManager) CreateSessionWithTTL(userID, orgID, email, role string, ttl time.Duration) (*Session, error) {
 	now := time.Now()
 	expiresAt := now.Add(ttl)
-	return sm.createSessionWithExpiry(userID, orgID, email, role, now, expiresAt, "")
+	return sm.createSessionWithExpiry(userID, orgID, email, role, now, expiresAt, "", "")
 }
 
-func (sm *SessionManager) createSessionWithExpiry(userID, orgID, email, role string, createdAt, expiresAt time.Time, sourceAPIKeyHash string) (*Session, error) {
+func (sm *SessionManager) createSessionWithExpiry(userID, orgID, email, role string, createdAt, expiresAt time.Time, sourceAPIKeyHash, apiKeyScope string) (*Session, error) {
 	if !expiresAt.After(createdAt) {
 		return nil, ErrSessionExpired
 	}
@@ -132,7 +134,7 @@ func (sm *SessionManager) createSessionWithExpiry(userID, orgID, email, role str
 
 	if sm.config.JWTSigningKey != "" {
 		// Create JWT token
-		token, err = sm.createJWT(userID, orgID, email, role, expiresAt)
+		token, err = sm.createJWT(userID, orgID, email, role, apiKeyScope, expiresAt)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create JWT: %w", err)
 		}
@@ -152,6 +154,7 @@ func (sm *SessionManager) createSessionWithExpiry(userID, orgID, email, role str
 		Role:             role,
 		CreatedAt:        createdAt,
 		ExpiresAt:        expiresAt,
+		APIKeyScope:      apiKeyScope,
 		SourceAPIKeyHash: sourceAPIKeyHash,
 	}
 
@@ -266,7 +269,7 @@ func (sm *SessionManager) InvalidateSession(token string) error {
 }
 
 // createJWT creates a JWT token for a session
-func (sm *SessionManager) createJWT(userID, orgID, email, role string, expiresAt time.Time) (string, error) {
+func (sm *SessionManager) createJWT(userID, orgID, email, role, apiKeyScope string, expiresAt time.Time) (string, error) {
 	claims := SessionClaims{
 		RegisteredClaims: jwt.RegisteredClaims{
 			Issuer:    "sesamefs",
@@ -275,10 +278,11 @@ func (sm *SessionManager) createJWT(userID, orgID, email, role string, expiresAt
 			IssuedAt:  jwt.NewNumericDate(time.Now()),
 			ID:        generateTokenID(),
 		},
-		UserID: userID,
-		OrgID:  orgID,
-		Email:  email,
-		Role:   role,
+		UserID:      userID,
+		OrgID:       orgID,
+		Email:       email,
+		Role:        role,
+		APIKeyScope: apiKeyScope,
 	}
 
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
@@ -305,12 +309,13 @@ func (sm *SessionManager) validateJWT(tokenString string) (*Session, error) {
 	}
 
 	return &Session{
-		Token:     tokenString,
-		UserID:    claims.UserID,
-		OrgID:     claims.OrgID,
-		Email:     claims.Email,
-		Role:      claims.Role,
-		ExpiresAt: claims.ExpiresAt.Time,
+		Token:       tokenString,
+		UserID:      claims.UserID,
+		OrgID:       claims.OrgID,
+		Email:       claims.Email,
+		Role:        claims.Role,
+		APIKeyScope: claims.APIKeyScope,
+		ExpiresAt:   claims.ExpiresAt.Time,
 	}, nil
 }
 
@@ -328,11 +333,11 @@ func (sm *SessionManager) storeSession(session *Session) error {
 
 	batch := sm.db.Session().Batch(gocql.LoggedBatch) // atomic: both inserts must succeed together
 	batch.Query(`
-		INSERT INTO sessions (token_hash, user_id, org_id, email, role, created_at, expires_at, source_api_key_hash)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO sessions (token_hash, user_id, org_id, email, role, created_at, expires_at, source_api_key_hash, api_key_scope)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 		USING TTL ?
 	`, tokenHash, session.UserID, session.OrgID, session.Email, session.Role,
-		session.CreatedAt, session.ExpiresAt, session.SourceAPIKeyHash,
+		session.CreatedAt, session.ExpiresAt, session.SourceAPIKeyHash, session.APIKeyScope,
 		ttlSeconds)
 	batch.Query(`
 		INSERT INTO sessions_by_user (org_id, user_id, token_hash)
@@ -368,10 +373,10 @@ func (sm *SessionManager) loadSession(token string) (*Session, error) {
 	session.Token = token
 
 	err := sm.db.Session().Query(`
-		SELECT user_id, org_id, email, role, created_at, expires_at, source_api_key_hash
+		SELECT user_id, org_id, email, role, created_at, expires_at, source_api_key_hash, api_key_scope
 		FROM sessions WHERE token_hash = ?
 	`, tokenHash).Scan(&session.UserID, &session.OrgID, &session.Email, &session.Role,
-		&session.CreatedAt, &session.ExpiresAt, &session.SourceAPIKeyHash)
+		&session.CreatedAt, &session.ExpiresAt, &session.SourceAPIKeyHash, &session.APIKeyScope)
 
 	if err != nil {
 		if errors.Is(err, gocql.ErrNotFound) {

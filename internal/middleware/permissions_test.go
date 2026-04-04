@@ -11,6 +11,24 @@ import (
 	"github.com/google/uuid"
 )
 
+type scopeOnlyContext struct {
+	values map[any]any
+}
+
+func (c scopeOnlyContext) Get(key any) (any, bool) {
+	v, ok := c.values[key]
+	return v, ok
+}
+
+func (c scopeOnlyContext) GetString(key any) string {
+	v, ok := c.values[key]
+	if !ok {
+		return ""
+	}
+	s, _ := v.(string)
+	return s
+}
+
 func init() {
 	gin.SetMode(gin.TestMode)
 }
@@ -41,6 +59,24 @@ func TestRequireAuth_RejectsEmptyContext(t *testing.T) {
 	json.Unmarshal(w.Body.Bytes(), &body)
 	if body["error"] != "authentication required" {
 		t.Errorf("unexpected error: %v", body["error"])
+	}
+}
+
+func TestAPIKeyScopeAllowsLibraryPermission(t *testing.T) {
+	ctx := scopeOnlyContext{values: map[any]any{"api_key_scope": "read"}}
+	if !apiKeyScopeAllowsLibraryPermission(ctx, PermissionR) {
+		t.Fatal("read scope should allow read permission")
+	}
+	if apiKeyScopeAllowsLibraryPermission(ctx, PermissionRW) {
+		t.Fatal("read scope should not allow rw permission")
+	}
+
+	ctx = scopeOnlyContext{values: map[any]any{"api_key_scope": "read-write"}}
+	if !apiKeyScopeAllowsLibraryPermission(ctx, PermissionRW) {
+		t.Fatal("read-write scope should allow rw permission")
+	}
+	if apiKeyScopeAllowsLibraryPermission(ctx, PermissionAdmin) {
+		t.Fatal("read-write scope should not allow admin permission")
 	}
 }
 

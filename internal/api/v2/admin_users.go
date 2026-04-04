@@ -663,7 +663,7 @@ func (h *AdminHandler) ListAdminUsers(c *gin.Context) {
 		var createdAt, lastLoginAt time.Time
 
 		for iter.Scan(&userID, &email, &name, &role, &status, &quotaBytes, &createdAt, &lastLoginAt) {
-			if !seen[email] && role == "superadmin" {
+			if !seen[email] && middleware.IsPlatformSuperAdmin(orgID, middleware.OrganizationRole(role)) {
 				seen[email] = true
 				admins = append(admins, makeAdminUserResponse(email, name, role, status, quotaBytes, traffic.ReadStorageUsed(h.db, fmt.Sprintf("user:%s:%s", orgID, userID)), createdAt, lastLoginAt))
 			}

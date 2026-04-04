@@ -406,12 +406,15 @@ func TestSessionManager_CreateAPITokenSessionFromAPIKey(t *testing.T) {
 		cache:  make(map[string]*Session),
 	}
 
-	session, err := sm.CreateAPITokenSessionFromAPIKey("user-api", "org-api", "api@example.com", "user", "hash-123", nil)
+	session, err := sm.CreateAPITokenSessionFromAPIKey("user-api", "org-api", "api@example.com", "user", "hash-123", "read-write", nil)
 	if err != nil {
 		t.Fatalf("CreateAPITokenSessionFromAPIKey() error = %v", err)
 	}
 	if session.SourceAPIKeyHash != "hash-123" {
 		t.Fatalf("SourceAPIKeyHash = %q, want %q", session.SourceAPIKeyHash, "hash-123")
+	}
+	if session.APIKeyScope != "read-write" {
+		t.Fatalf("APIKeyScope = %q, want %q", session.APIKeyScope, "read-write")
 	}
 }
 
@@ -426,7 +429,7 @@ func TestSessionManager_CreateAPITokenSessionFromAPIKey_InheritsShorterKeyExpiry
 	}
 
 	apiKeyExpiresAt := time.Now().Add(2 * time.Hour)
-	session, err := sm.CreateAPITokenSessionFromAPIKey("user-api", "org-api", "api@example.com", "user", "hash-123", &apiKeyExpiresAt)
+	session, err := sm.CreateAPITokenSessionFromAPIKey("user-api", "org-api", "api@example.com", "user", "hash-123", "read-write", &apiKeyExpiresAt)
 	if err != nil {
 		t.Fatalf("CreateAPITokenSessionFromAPIKey() error = %v", err)
 	}
@@ -741,7 +744,7 @@ func TestCreateJWT(t *testing.T) {
 	}
 
 	expiresAt := time.Now().Add(24 * time.Hour)
-	token, err := sm.createJWT("user-123", "org-456", "test@example.com", "admin", expiresAt)
+	token, err := sm.createJWT("user-123", "org-456", "test@example.com", "admin", "admin", expiresAt)
 	if err != nil {
 		t.Fatalf("createJWT() error = %v", err)
 	}
@@ -769,5 +772,8 @@ func TestCreateJWT(t *testing.T) {
 	}
 	if session.Role != "admin" {
 		t.Errorf("Role = %v, want admin", session.Role)
+	}
+	if session.APIKeyScope != "admin" {
+		t.Errorf("APIKeyScope = %v, want admin", session.APIKeyScope)
 	}
 }

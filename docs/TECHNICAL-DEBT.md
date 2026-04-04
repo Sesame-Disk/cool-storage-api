@@ -641,54 +641,58 @@ The GC path now reuses the shared implementation via `traffic.AdjustAggregateSto
 
 ---
 
-## 14. API Key Scopes Are Not Preserved In Derived Sessions (2026-04-04)
+## 14. API Key Scope Hardening Follow-up (2026-04-04)
 
 ### Status
 
-Known design gap. Direct API key requests can be scope-limited, but sessions minted from API keys via `/api2/auth-token/` are not scope-limited today.
+Core hardening landed. Direct API key auth and sessions minted from API keys now preserve scope metadata, cap effective role by scope, and enforce scope in the central library/sync permission paths.
 
 ### What Works Today
 
 - API keys support three scopes: `read`, `read-write`, `admin`
 - Direct API key authentication stores `api_key_scope` in request context
-- Routes that explicitly use `RequireScope(...)` enforce that scope correctly
+- Sessions minted from API keys via `/api2/auth-token/` now also persist `api_key_scope`
+- Effective org role is capped by scope:
+  - `read` -> at most `readonly`
+  - `read-write` -> at most `user`
+  - `admin` -> actual org role
+- Central library permission checks and sync permission checks now enforce API key scope for both direct API key auth and derived sessions
+- Routes that explicitly use `RequireScope(...)` still enforce admin-only or CRUD-specific scope correctly
 - Sessions minted from API keys retain:
   - source provenance (`source_api_key_hash`)
   - expiry inheritance from the API key
   - revoke fan-out through `sessions_by_api_key`
 
-### The Gap
+### Remaining Debt
 
-`POST /api2/auth-token/` accepts `username + raw API key` and creates a normal long-lived session token. That session currently stores provenance and expiry, but not the API key scope.
-
-As a result:
-
-- a `read` API key can mint a session
-- the resulting session is treated like an ordinary session on routes that do not explicitly inspect API key scope
-- `RequireScope(...)` only helps for requests authenticated directly by API key, because the middleware relies on `api_key_scope` being present in the request context
+- direct API key auth inside `authMiddleware` still has no dedicated application-level rate limit beyond edge protections
+- scope enforcement is still partly route-fragile for endpoints that rely only on bare authentication and do not pass through the central library/sync checks or an explicit `RequireScope(...)`
+- `admin` scope keys remain intentionally powerful and should be issued only to trusted tooling
+- some legacy handlers still compare raw `superadmin` role strings; any cross-org authority checks should be normalized to `IsPlatformSuperAdmin(...)` rather than relying on role text alone
 
 ### Impact
 
-- least-privilege guarantees are weaker than the API key UI suggests
-- a user may believe a `read` key cannot be used for write-capable session workflows, but today it can
-- scope enforcement becomes route-fragile because it depends on using API key auth directly rather than exchanging the key for a session first
+- the current model is substantially safer than the initial implementation, but it still benefits from a route-by-route audit to prove that every sensitive endpoint is covered by role checks, library permission checks, or explicit scope middleware
+- brute-force protection for direct API key auth is still mostly delegated to edge rate limiting and token entropy rather than an application-specific limiter
 
 ### Current Code Shape
 
-- `internal/apikeys/scope_middleware.go` enforces scope only when `api_key_scope` exists in request context
-- `internal/api/server.go` sets `api_key_scope` for direct API key auth
-- `internal/auth/session.go` stores `source_api_key_hash` but not scope metadata on derived sessions
+- `internal/apikeys/scope_middleware.go` enforces scope when `api_key_scope` exists in request context
+- `internal/api/server.go` now sets constrained role + `api_key_scope` for direct API key auth
+- `internal/auth/session.go` now stores `source_api_key_hash` and `api_key_scope` on derived sessions
+- `internal/middleware/permissions.go` enforces API key scope in central library permission paths
+- `internal/api/sync.go` enforces API key scope in sync read/write permission checks
 
 ### Recommended Fix Path
 
-1. Add `api_key_scope` to stored sessions and to the in-memory/auth payload used by middleware.
-2. Populate that scope when `/api2/auth-token/` creates a session from an API key.
-3. Enforce scope for both direct API key auth and derived-session auth.
-4. Add regression tests proving a `read` key cannot mint a write-capable session.
+1. Add dedicated application-layer rate limiting for direct API key auth attempts, not only for `/api2/auth-token/`.
+2. Build an explicit route audit/test matrix for `read`, `read-write`, and `admin` API keys across the most sensitive endpoint families.
+3. Keep admin-scope key issuance narrow and document that these keys are equivalent to high-trust automation credentials.
 
-### Acceptable Stopgap If Full Fix Is Deferred
+### Non-Issues After Hardening
 
-Reject `/api2/auth-token/` exchanges for `read` API keys. That does not solve the general model inconsistency, but it closes the most surprising least-privilege break with a smaller change.
+- derived sessions are now invalidated on API key revocation through `sessions_by_api_key`
+- deactivate/delete flows now revoke user API keys in addition to user sessions
 
 ---
 
