@@ -30,15 +30,17 @@ type OrgAdminHandler struct {
 	config         *config.Config
 	permMiddleware orgRoleGetter
 	sessions       SessionInvalidator
+	apiKeys        APIKeyInvalidator
 }
 
 // NewOrgAdminHandler creates a new OrgAdminHandler.
-func NewOrgAdminHandler(database *db.DB, cfg *config.Config, perm *middleware.PermissionMiddleware, sessions SessionInvalidator) *OrgAdminHandler {
+func NewOrgAdminHandler(database *db.DB, cfg *config.Config, perm *middleware.PermissionMiddleware, sessions SessionInvalidator, apiKeys APIKeyInvalidator) *OrgAdminHandler {
 	return &OrgAdminHandler{
 		db:             database,
 		config:         cfg,
 		permMiddleware: perm,
 		sessions:       sessions,
+		apiKeys:        apiKeys,
 	}
 }
 

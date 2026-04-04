@@ -15,6 +15,7 @@ class Nav extends React.Component {
     super(props);
     this.navItems = [
       { name: 'info', urlPart: '', text: gettext('Info') },
+      { name: 'api-keys', urlPart: 'api-keys', text: gettext('API Keys') },
       { name: 'owned-repos', urlPart: 'owned-libraries', text: gettext('Owned Libraries') },
       { name: 'shared-repos', urlPart: 'shared-libraries', text: gettext('Shared Libraries') },
       { name: 'links', urlPart: 'shared-links', text: gettext('Shared Links') },

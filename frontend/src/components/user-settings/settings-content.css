@@ -130,6 +130,15 @@
   width: 260px;
 }
 
+.user-settings-layout .api-keys-table-wrap code {
+  word-break: break-all;
+}
+
+.user-settings-layout .api-keys-table td,
+.user-settings-layout .api-keys-table th {
+  vertical-align: middle;
+}
+
 .user-settings-page .cur-view-content {
   padding: 0;
 }

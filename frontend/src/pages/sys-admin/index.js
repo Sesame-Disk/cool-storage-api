@@ -29,6 +29,7 @@ import LDAPImportedUsers from './users/ldap-imported-users';
 import LDAPUsers from './users/ldap-users';
 import SearchUsers from './users/search-users';
 import User from './users/user-info';
+import UserAPIKeys from './users/user-api-keys';
 import UserOwnedRepos from './users/user-repos';
 import UserSharedRepos from './users/user-shared-repos';
 import UserLinks from './users/user-links';
@@ -271,6 +272,7 @@ class SysAdmin extends React.Component {
             <LDAPUsers path={siteRoot + 'sys/users/ldap'} {...commonProps} />
             <SearchUsers path={siteRoot + 'sys/search-users'} {...commonProps} />
             <User path={siteRoot + 'sys/users/:email'} {...commonProps} />
+            <UserAPIKeys path={siteRoot + 'sys/users/:email/api-keys'} {...commonProps} />
             <UserOwnedRepos path={siteRoot + 'sys/users/:email/owned-libraries'} {...commonProps} />
             <UserSharedRepos path={siteRoot + 'sys/users/:email/shared-libraries'} {...commonProps} />
             <UserLinks path={siteRoot + 'sys/users/:email/shared-links'} {...commonProps} />

@@ -7,6 +7,7 @@ import toaster from '../toast';
 import SideNav from './side-nav';
 import UserAvatarForm from './user-avatar-form';
 import UserBasicInfoForm from './user-basic-info-form';
+import APIKeys from './api-keys';
 import WebAPIAuthToken from './web-api-auth-token';
 import WebdavPassword from './webdav-password';
 import LanguageSetting from './language-setting';
@@ -42,6 +43,7 @@ class SettingsContent extends React.Component {
         super(props);
         const pageOptions = getSettingsPageOptions();
         const canUpdatePassword = Boolean(pageOptions.canUpdatePassword);
+        const enableAPIKeys = Boolean(pageOptions.enableAPIKeys);
         const enableGetAuthToken = Boolean(pageOptions.enableGetAuthToken);
         const enableWebdavSecret = Boolean(pageOptions.enableWebdavSecret);
         const enableAddressBook = Boolean(pageOptions.enableAddressBook);
@@ -56,6 +58,7 @@ class SettingsContent extends React.Component {
         this.sideNavItems = [
             { show: true, href: '#user-basic-info', text: gettext('Profile') },
             { show: canUpdatePassword, href: '#update-user-passwd', text: gettext('Password') },
+            { show: enableAPIKeys, href: '#api-keys', text: gettext('API Keys') },
             { show: enableGetAuthToken, href: '#get-auth-token', text: gettext('Web API Auth Token') },
             { show: enableWebdavSecret, href: '#update-webdav-passwd', text: gettext('WebDav Password') },
             { show: enableAddressBook, href: '#list-in-address-book', text: gettext('Global Address Book') },
@@ -165,6 +168,7 @@ class SettingsContent extends React.Component {
         const pageOptions = getSettingsPageOptions();
         const canUpdatePassword = Boolean(pageOptions.canUpdatePassword);
         const passwordOperationText = pageOptions.passwordOperationText || gettext('Change');
+        const enableAPIKeys = Boolean(pageOptions.enableAPIKeys);
         const enableGetAuthToken = Boolean(pageOptions.enableGetAuthToken);
         const enableWebdavSecret = Boolean(pageOptions.enableWebdavSecret);
         const enableAddressBook = Boolean(pageOptions.enableAddressBook);
@@ -197,6 +201,7 @@ class SettingsContent extends React.Component {
                             </div>
                         }
 
+                        {enableAPIKeys && <APIKeys />}
                         {enableGetAuthToken && <WebAPIAuthToken />}
                         {enableWebdavSecret && <WebdavPassword />}
                         {enableAddressBook && this.state.userInfo &&

@@ -1,6 +1,7 @@
 package v2
 
 import (
+	"github.com/Sesame-Disk/sesamefs/internal/apikeys"
 	"github.com/Sesame-Disk/sesamefs/internal/config"
 	"github.com/Sesame-Disk/sesamefs/internal/db"
 	"github.com/Sesame-Disk/sesamefs/internal/middleware"
@@ -9,9 +10,9 @@ import (
 
 // RegisterAdminRoutes registers platform-admin API routes under the given router group.
 // All /admin endpoints are reserved for platform superadmins.
-func RegisterAdminRoutes(rg *gin.RouterGroup, database *db.DB, cfg *config.Config, perm *middleware.PermissionMiddleware, tokenCreator TokenCreator, sessions SessionInvalidator, serverURL string) {
-	h := NewAdminHandler(database, cfg, perm, tokenCreator, sessions, serverURL)
-	admin := rg.Group("/admin", perm.RequireSuperAdmin())
+func RegisterAdminRoutes(rg *gin.RouterGroup, database *db.DB, cfg *config.Config, perm *middleware.PermissionMiddleware, tokenCreator TokenCreator, sessions SessionInvalidator, apiKeys APIKeyInvalidator, serverURL string) {
+	h := NewAdminHandler(database, cfg, perm, tokenCreator, sessions, apiKeys, serverURL)
+	admin := rg.Group("/admin", perm.RequireSuperAdmin(), apikeys.RequireScope(apikeys.ScopeAdmin))
 	superadminOnly := admin.Group("", perm.RequireSuperAdmin())
 
 	registerAdminOrganizationRoutes(admin, superadminOnly, h)

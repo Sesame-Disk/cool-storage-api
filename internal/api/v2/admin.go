@@ -25,17 +25,19 @@ type AdminHandler struct {
 	permMiddleware *middleware.PermissionMiddleware
 	tokenCreator   TokenCreator
 	sessions       SessionInvalidator
+	apiKeys        APIKeyInvalidator
 	serverURL      string
 }
 
 // NewAdminHandler creates a new AdminHandler
-func NewAdminHandler(database *db.DB, cfg *config.Config, perm *middleware.PermissionMiddleware, tokenCreator TokenCreator, sessions SessionInvalidator, serverURL string) *AdminHandler {
+func NewAdminHandler(database *db.DB, cfg *config.Config, perm *middleware.PermissionMiddleware, tokenCreator TokenCreator, sessions SessionInvalidator, apiKeys APIKeyInvalidator, serverURL string) *AdminHandler {
 	return &AdminHandler{
 		db:             database,
 		config:         cfg,
 		permMiddleware: perm,
 		tokenCreator:   tokenCreator,
 		sessions:       sessions,
+		apiKeys:        apiKeys,
 		serverURL:      serverURL,
 	}
 }
@@ -592,7 +594,7 @@ func (h *AdminHandler) SoftDeleteOrganization(c *gin.Context) {
 		return
 	}
 
-	if err := softDeleteOrg(h.db, h.sessions, orgID, time.Now()); err != nil {
+	if err := softDeleteOrg(h.db, h.sessions, h.apiKeys, orgID, time.Now()); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete organization"})
 		return
 	}
@@ -625,7 +627,7 @@ func (h *AdminHandler) DeactivateOrganization(c *gin.Context) {
 		return
 	}
 
-	if err := deactivateOrg(h.db, h.sessions, orgID); err != nil {
+	if err := deactivateOrg(h.db, h.sessions, h.apiKeys, orgID); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to deactivate organization"})
 		return
 	}
@@ -786,6 +788,8 @@ func (h *AdminHandler) adminUsersHandler(c *gin.Context) {
 		switch c.Request.Method {
 		case "GET":
 			switch {
+			case strings.HasPrefix(subResource, "api-keys"):
+				h.AdminListUserAPIKeys(c)
 			case strings.HasPrefix(subResource, "share-links"):
 				h.AdminListUserShareLinks(c)
 			case strings.HasPrefix(subResource, "upload-links"):
@@ -802,8 +806,19 @@ func (h *AdminHandler) adminUsersHandler(c *gin.Context) {
 			} else {
 				h.UpdateUser(c)
 			}
+		case "POST":
+			if strings.HasPrefix(subResource, "api-keys") {
+				h.AdminCreateUserAPIKey(c)
+			} else {
+				c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
+			}
 		case "DELETE":
-			h.SoftDeleteUser(c)
+			if strings.HasPrefix(subResource, "api-keys/") {
+				c.Set("resolved_api_key_hash", strings.Trim(strings.TrimPrefix(subResource, "api-keys/"), "/"))
+				h.AdminRevokeUserAPIKey(c)
+			} else {
+				h.SoftDeleteUser(c)
+			}
 		default:
 			c.JSON(http.StatusMethodNotAllowed, gin.H{"error": "method not allowed"})
 		}
@@ -1005,7 +1020,7 @@ func (h *AdminHandler) SoftDeleteUser(c *gin.Context) {
 	orgID := callerOrgID
 
 	// Soft-delete: mark as "deleted" with timestamp for grace period cascade
-	if err := softDeleteUser(h.db, h.sessions, orgID, targetUserID, time.Now()); err != nil {
+	if err := softDeleteUser(h.db, h.sessions, h.apiKeys, orgID, targetUserID, time.Now()); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete user"})
 		return
 	}

@@ -65,6 +65,9 @@ func TestBuildAppBootstrapPageOptionsIncludesSettingsBasics(t *testing.T) {
 	if pageOptions["passwordOperationText"] != "Change" {
 		t.Fatalf("passwordOperationText = %v, want %q", pageOptions["passwordOperationText"], "Change")
 	}
+	if enabled, ok := pageOptions["enableAPIKeys"].(bool); !ok || !enabled {
+		t.Fatalf("enableAPIKeys = %v, want true", pageOptions["enableAPIKeys"])
+	}
 	if enabled, ok := pageOptions["enableDeleteAccount"].(bool); !ok || !enabled {
 		t.Fatalf("enableDeleteAccount = %v, want true", pageOptions["enableDeleteAccount"])
 	}

@@ -240,7 +240,7 @@ func (w *Worker) processFSObject(ctx context.Context, item QueueItem) error {
 	// If it's a file with blocks, decrement ref counts
 	if len(fsObj.BlockIDs) > 0 {
 		// Create a deterministic task ID for this specific decrement operation
-		// based on the fs_object and the specific queue item timestamp to ensure 
+		// based on the fs_object and the specific queue item timestamp to ensure
 		// retries of this exact queue item don't double-decrement.
 		taskIDStr := fmt.Sprintf("%s-%d", item.ItemID, item.QueuedAt.UnixNano())
 		taskID := uuid.NewMD5(uuid.NameSpaceOID, []byte(taskIDStr))
@@ -416,6 +416,7 @@ func (w *Worker) processUserCascade(ctx context.Context, item QueueItem) error {
 	// 4. Delete starred files and monitored repos
 	w.store.DeleteStarredFilesByUser(userID)
 	w.store.DeleteMonitoredReposByUser(userID)
+	w.store.DeleteAPIKeysByUser(item.OrgID, userID)
 
 	// 5. Hard-delete user record + email lookup
 	if err := w.store.HardDeleteUser(item.OrgID, userID, email); err != nil {
@@ -559,6 +560,7 @@ func (w *Worker) processOrgCascade(ctx context.Context, item QueueItem) error {
 			// Clean personal data
 			w.store.DeleteStarredFilesByUser(u.UserID)
 			w.store.DeleteMonitoredReposByUser(u.UserID)
+			w.store.DeleteAPIKeysByUser(orgID, u.UserID)
 			// Hard-delete user
 			w.store.HardDeleteUser(orgID, u.UserID, u.Email)
 		}

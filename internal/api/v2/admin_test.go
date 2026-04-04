@@ -394,6 +394,27 @@ func TestAdminUsersHandler_Dispatch(t *testing.T) {
 			wantBody: "method not allowed",
 		},
 		{
+			name:     "GET api-keys subresource dispatches",
+			method:   "GET",
+			path:     "/admin/users/user@example.com/api-keys",
+			wantCode: http.StatusForbidden,
+			wantBody: "insufficient permissions",
+		},
+		{
+			name:     "POST api-keys subresource dispatches",
+			method:   "POST",
+			path:     "/admin/users/user@example.com/api-keys",
+			wantCode: http.StatusForbidden,
+			wantBody: "insufficient permissions",
+		},
+		{
+			name:     "DELETE api-keys subresource dispatches",
+			method:   "DELETE",
+			path:     "/admin/users/user@example.com/api-keys/hash123",
+			wantCode: http.StatusForbidden,
+			wantBody: "insufficient permissions",
+		},
+		{
 			name:     "OPTIONS method returns 405",
 			method:   "OPTIONS",
 			path:     "/admin/users",
@@ -937,7 +958,7 @@ func TestRegisterAdminRoutes_RoutesExist(t *testing.T) {
 	pm := middleware.NewPermissionMiddleware(nil)
 	cfg := &config.Config{}
 	rg := r.Group("/api/v2.1")
-	RegisterAdminRoutes(rg, nil, cfg, pm, nil, nil, "")
+	RegisterAdminRoutes(rg, nil, cfg, pm, nil, nil, nil, "")
 
 	tests := []struct {
 		name   string
@@ -950,6 +971,7 @@ func TestRegisterAdminRoutes_RoutesExist(t *testing.T) {
 		{"GET search-group", "GET", "/api/v2.1/admin/search-group/"},
 		{"GET search-user", "GET", "/api/v2.1/admin/search-user/"},
 		{"GET admins", "GET", "/api/v2.1/admin/admins/"},
+		{"GET user api-keys", "GET", "/api/v2.1/admin/users/user@example.com/api-keys/"},
 		{"POST org soft-delete", "POST", "/api/v2.1/admin/organizations/00000000-0000-0000-0000-000000000001/delete/"},
 		{"POST org deactivate", "POST", "/api/v2.1/admin/organizations/00000000-0000-0000-0000-000000000001/deactivate/"},
 		{"POST org restore", "POST", "/api/v2.1/admin/organizations/00000000-0000-0000-0000-000000000001/restore/"},
@@ -1098,10 +1120,15 @@ func TestNewAdminHandler(t *testing.T) {
 	pm := middleware.NewPermissionMiddleware(nil)
 	cfg := &config.Config{}
 
-	handler := NewAdminHandler(nil, cfg, pm, nil, nil, "")
+	handler := NewAdminHandler(nil, cfg, pm, nil, nil, nil, "")
 
 	assert.NotNil(t, handler)
 	assert.Nil(t, handler.db)
 	assert.Equal(t, cfg, handler.config)
 	assert.Equal(t, pm, handler.permMiddleware)
+}
+
+func TestMakeAdminUserResponse_DefaultsIsPlatformOrgFalse(t *testing.T) {
+	resp := makeAdminUserResponse("user@example.com", "User", "user", "active", 0, 0, time.Time{}, time.Time{})
+	assert.False(t, resp.IsPlatformOrg)
 }

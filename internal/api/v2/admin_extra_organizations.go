@@ -182,7 +182,7 @@ func (h *AdminHandler) AdminUpdateOrgUser(c *gin.Context) {
 
 	if updateReq.Active != nil {
 		if !*updateReq.Active {
-			if err := deactivateUser(h.db, h.sessions, targetOrgID, userID); err != nil {
+			if err := deactivateUser(h.db, h.sessions, h.apiKeys, targetOrgID, userID); err != nil {
 				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update user"})
 				return
 			}
@@ -373,7 +373,7 @@ func (h *AdminHandler) AdminDeleteOrgUser(c *gin.Context) {
 		return
 	}
 
-	if err := softDeleteUser(h.db, h.sessions, targetOrgID, foundUID, time.Now()); err != nil {
+	if err := softDeleteUser(h.db, h.sessions, h.apiKeys, targetOrgID, foundUID, time.Now()); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete user"})
 		return
 	}

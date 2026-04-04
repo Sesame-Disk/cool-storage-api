@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	v2 "github.com/Sesame-Disk/sesamefs/internal/api/v2"
+	"github.com/Sesame-Disk/sesamefs/internal/apikeys"
 	"github.com/Sesame-Disk/sesamefs/internal/health"
 	"github.com/Sesame-Disk/sesamefs/internal/traffic"
 	"github.com/gin-gonic/gin"
@@ -151,16 +152,17 @@ func (s *Server) registerAPIV21Routes(serverURL string) {
 
 	protected := apiV21.Group("")
 	protected.Use(s.authMiddleware())
+	apiKeyCreateRL := s.authRateLimiter.Limit()
 
 	var sessionInvalidator v2.SessionInvalidator
 	if s.authHandler != nil {
 		sessionInvalidator = s.authHandler.GetSessionManager()
 	}
 
-	v2.RegisterAdminRoutes(protected, s.db, s.config, s.permMiddleware, s.tokenStore, sessionInvalidator, serverURL)
-	v2.RegisterOrgAdminRoutes(protected, s.db, s.config, s.permMiddleware, sessionInvalidator)
+	v2.RegisterAdminRoutes(protected, s.db, s.config, s.permMiddleware, s.tokenStore, sessionInvalidator, s.apiKeyManager, serverURL)
+	v2.RegisterOrgAdminRoutes(protected, s.db, s.config, s.permMiddleware, sessionInvalidator, s.apiKeyManager)
 	if s.gcService != nil {
-		gcAdmin := protected.Group("/admin", s.permMiddleware.RequireSuperAdmin())
+		gcAdmin := protected.Group("/admin", s.permMiddleware.RequireSuperAdmin(), apikeys.RequireScope(apikeys.ScopeAdmin))
 		gcAdmin.GET("/gc/status", s.handleGCStatus)
 		gcAdmin.GET("/gc/status/", s.handleGCStatus)
 		gcAdmin.POST("/gc/run", s.handleGCRun)
@@ -213,6 +215,14 @@ func (s *Server) registerAPIV21Routes(serverURL string) {
 	v2.RegisterTagRoutes(protected, s.db)
 	protected.GET("/subscription/", s.handleGetSubscription)
 	protected.GET("/subscription", s.handleGetSubscription)
+
+	// API Keys management
+	protected.POST("/api-keys/", apiKeyCreateRL, apikeys.RequireScope(apikeys.ScopeReadWrite), s.handleCreateAPIKey)
+	protected.POST("/api-keys", apiKeyCreateRL, apikeys.RequireScope(apikeys.ScopeReadWrite), s.handleCreateAPIKey)
+	protected.GET("/api-keys/", apikeys.RequireScope(apikeys.ScopeRead), s.handleListAPIKeys)
+	protected.GET("/api-keys", apikeys.RequireScope(apikeys.ScopeRead), s.handleListAPIKeys)
+	protected.DELETE("/api-keys/:key_hash/", apikeys.RequireScope(apikeys.ScopeReadWrite), s.handleRevokeAPIKey)
+	protected.DELETE("/api-keys/:key_hash", apikeys.RequireScope(apikeys.ScopeReadWrite), s.handleRevokeAPIKey)
 }
 
 func (s *Server) registerPublicRoutes(serverURL string) {

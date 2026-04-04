@@ -22,6 +22,8 @@ type adminUserResponse struct {
 	Email                string `json:"email"`
 	Name                 string `json:"name"`
 	Status               string `json:"status"`
+	OrgID                string `json:"org_id,omitempty"`
+	IsPlatformOrg        bool   `json:"is_platform_org,omitempty"`
 	IsActive             bool   `json:"is_active"`
 	IsStaff              bool   `json:"is_staff"`
 	Role                 string `json:"role"`
@@ -372,6 +374,8 @@ func (h *AdminHandler) GetUserByEmail(c *gin.Context, email string) {
 	}
 
 	resp := makeAdminUserResponse(email, name, role, status, quotaBytes, traffic.ReadStorageUsed(h.db, fmt.Sprintf("user:%s:%s", userOrgID, userID)), createdAt, lastLoginAt)
+	resp.OrgID = userOrgID
+	resp.IsPlatformOrg = userOrgID == middleware.PlatformOrgID
 	resp.TrafficUploadQuota = trafficUploadQuota
 	resp.TrafficDownloadQuota = trafficDownloadQuota
 	oq, _ := readOrgQuotas(h.db, userOrgID) // best-effort for display
@@ -526,7 +530,7 @@ func (h *AdminHandler) UpdateUserByEmail(c *gin.Context, email string) {
 	}
 
 	if updateReq.IsActive != nil && !*updateReq.IsActive {
-		if err := deactivateUser(h.db, h.sessions, userOrgID, userID); err != nil {
+		if err := deactivateUser(h.db, h.sessions, h.apiKeys, userOrgID, userID); err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update user"})
 			return
 		}
@@ -572,7 +576,7 @@ func (h *AdminHandler) DeleteUserByEmail(c *gin.Context, email string) {
 	}
 
 	// Soft-delete: mark as "deleted" with timestamp for grace period cascade
-	if err := softDeleteUser(h.db, h.sessions, userOrgID, userID, time.Now()); err != nil {
+	if err := softDeleteUser(h.db, h.sessions, h.apiKeys, userOrgID, userID, time.Now()); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete user"})
 		return
 	}

@@ -92,6 +92,7 @@ const APP_PAGE_OPTION_DEFAULTS = {
     canLockUnlockFile: false,
     canUpdatePassword: false,
     passwordOperationText: 'Change',
+    enableAPIKeys: false,
     enableGetAuthToken: false,
     enableWebdavSecret: false,
     enableAddressBook: false,

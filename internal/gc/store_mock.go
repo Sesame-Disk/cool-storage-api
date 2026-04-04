@@ -1364,6 +1364,9 @@ func (m *MockStore) DeleteMonitoredReposByUser(userID uuid.UUID) error {
 	delete(m.monitoredRepos, userID)
 	return nil
 }
+func (m *MockStore) DeleteAPIKeysByUser(orgID, userID uuid.UUID) error {
+	return nil
+}
 func (m *MockStore) HardDeleteUser(orgID, userID uuid.UUID, email string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()

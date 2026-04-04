@@ -259,6 +259,25 @@ seafileAPI.updateUserInfo = function (data = {}) {
   }));
 };
 
+seafileAPI.listAPIKeys = function () {
+  const server = this.server || serviceURL || window.location.origin;
+  return this.req.get(server + '/api/v2.1/api-keys/');
+};
+
+seafileAPI.createAPIKey = function (label, scope, expiresInDays) {
+  const server = this.server || serviceURL || window.location.origin;
+  const payload = { label, scope };
+  if (expiresInDays !== undefined && expiresInDays !== null) {
+    payload.expires_in_days = expiresInDays;
+  }
+  return this.req.post(server + '/api/v2.1/api-keys/', payload);
+};
+
+seafileAPI.revokeAPIKey = function (keyHash) {
+  const server = this.server || serviceURL || window.location.origin;
+  return this.req.delete(server + '/api/v2.1/api-keys/' + encodeURIComponent(keyHash) + '/');
+};
+
 // Get OIDC configuration (public endpoint)
 seafileAPI.getOIDCConfig = async function () {
   const server = this.server || serviceURL || window.location.origin;
@@ -987,6 +1006,28 @@ seafileAPI.sysAdminListAdmins = function () {
 seafileAPI.sysAdminGetUser = function (email) {
   let url = this.server + '/api/v2.1/admin/users/' + encodeURIComponent(email) + '/';
   return this.req.get(url);
+};
+
+// Admin: list API keys for a platform-org user
+seafileAPI.sysAdminListUserAPIKeys = function (email) {
+  let url = this.server + '/api/v2.1/admin/users/' + encodeURIComponent(email) + '/api-keys/';
+  return this.req.get(url);
+};
+
+// Admin: create an API key for a platform-org user
+seafileAPI.sysAdminCreateUserAPIKey = function (email, label, scope, expiresInDays) {
+  let url = this.server + '/api/v2.1/admin/users/' + encodeURIComponent(email) + '/api-keys/';
+  const data = { label, scope };
+  if (expiresInDays !== undefined && expiresInDays !== null) {
+    data.expires_in_days = expiresInDays;
+  }
+  return this.req.post(url, data);
+};
+
+// Admin: revoke an API key for a platform-org user
+seafileAPI.sysAdminRevokeUserAPIKey = function (email, keyHash) {
+  let url = this.server + '/api/v2.1/admin/users/' + encodeURIComponent(email) + '/api-keys/' + encodeURIComponent(keyHash) + '/';
+  return this.req.delete(url);
 };
 
 // Admin: update user

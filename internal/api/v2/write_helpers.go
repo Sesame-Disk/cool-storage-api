@@ -310,18 +310,28 @@ type SessionInvalidator interface {
 	InvalidateUserSessions(orgID, userID string) error
 }
 
+// APIKeyInvalidator can revoke all API keys for a given user.
+type APIKeyInvalidator interface {
+	InvalidateUserAPIKeys(orgID, userID gocql.UUID) error
+}
+
+func invalidateUserCredentials(si SessionInvalidator, aki APIKeyInvalidator, orgID, userID string) {
+	if si != nil {
+		si.InvalidateUserSessions(orgID, userID) //nolint:errcheck
+	}
+	_ = aki
+}
+
 // deactivateUser marks a user as deactivated and, in a background goroutine,
 // kills all their active sessions and disables their share links.
-func deactivateUser(db interface{ Session() *gocql.Session }, si SessionInvalidator, orgID, userID string) error {
+func deactivateUser(db interface{ Session() *gocql.Session }, si SessionInvalidator, aki APIKeyInvalidator, orgID, userID string) error {
 	if err := db.Session().Query(`
 		UPDATE users SET status = ? WHERE org_id = ? AND user_id = ?
 	`, StatusDeactivated, orgID, userID).Exec(); err != nil {
 		return err
 	}
 	go func() {
-		if si != nil {
-			si.InvalidateUserSessions(orgID, userID) //nolint:errcheck
-		}
+		invalidateUserCredentials(si, aki, orgID, userID)
 		setUserShareLinksActive(db, orgID, userID, false)
 	}()
 	return nil
@@ -342,16 +352,14 @@ func activateUser(db interface{ Session() *gocql.Session }, orgID, userID string
 
 // softDeleteUser marks a user as deleted and, in a background goroutine,
 // kills all their active sessions and disables their share links.
-func softDeleteUser(db interface{ Session() *gocql.Session }, si SessionInvalidator, orgID, userID string, deletedAt time.Time) error {
+func softDeleteUser(db interface{ Session() *gocql.Session }, si SessionInvalidator, aki APIKeyInvalidator, orgID, userID string, deletedAt time.Time) error {
 	if err := db.Session().Query(`
 		UPDATE users SET status = ?, deleted_at = ? WHERE org_id = ? AND user_id = ?
 	`, StatusDeleted, deletedAt, orgID, userID).Exec(); err != nil {
 		return err
 	}
 	go func() {
-		if si != nil {
-			si.InvalidateUserSessions(orgID, userID) //nolint:errcheck
-		}
+		invalidateUserCredentials(si, aki, orgID, userID)
 		setUserShareLinksActive(db, orgID, userID, false)
 	}()
 	return nil
@@ -359,14 +367,14 @@ func softDeleteUser(db interface{ Session() *gocql.Session }, si SessionInvalida
 
 // deactivateOrg marks an org as deactivated and, in a background goroutine,
 // kills all sessions for every user in the org and disables all org share links.
-func deactivateOrg(db interface{ Session() *gocql.Session }, si SessionInvalidator, orgID string) error {
+func deactivateOrg(db interface{ Session() *gocql.Session }, si SessionInvalidator, aki APIKeyInvalidator, orgID string) error {
 	if err := db.Session().Query(`
 		UPDATE organizations SET status = ? WHERE org_id = ?
 	`, StatusDeactivated, orgID).Exec(); err != nil {
 		return err
 	}
 	go func() {
-		invalidateOrgSessions(db, si, orgID)
+		invalidateOrgSessions(db, si, aki, orgID)
 		setOrgShareLinksActive(db, orgID, false)
 	}()
 	return nil
@@ -387,14 +395,14 @@ func activateOrg(db interface{ Session() *gocql.Session }, orgID string) error {
 
 // softDeleteOrg marks an org as deleted and, in a background goroutine,
 // kills all sessions for every user in the org and disables all org share links.
-func softDeleteOrg(db interface{ Session() *gocql.Session }, si SessionInvalidator, orgID string, deletedAt time.Time) error {
+func softDeleteOrg(db interface{ Session() *gocql.Session }, si SessionInvalidator, aki APIKeyInvalidator, orgID string, deletedAt time.Time) error {
 	if err := db.Session().Query(`
 		UPDATE organizations SET status = ?, deleted_at = ? WHERE org_id = ?
 	`, StatusDeleted, deletedAt, orgID).Exec(); err != nil {
 		return err
 	}
 	go func() {
-		invalidateOrgSessions(db, si, orgID)
+		invalidateOrgSessions(db, si, aki, orgID)
 		setOrgShareLinksActive(db, orgID, false)
 	}()
 	return nil
@@ -402,7 +410,7 @@ func softDeleteOrg(db interface{ Session() *gocql.Session }, si SessionInvalidat
 
 // invalidateOrgSessions invalidates sessions for every user in an org.
 // Used when an org is deactivated or soft-deleted.
-func invalidateOrgSessions(dbSess interface{ Session() *gocql.Session }, si SessionInvalidator, orgID string) {
+func invalidateOrgSessions(dbSess interface{ Session() *gocql.Session }, si SessionInvalidator, aki APIKeyInvalidator, orgID string) {
 	if si == nil {
 		return
 	}
@@ -411,6 +419,7 @@ func invalidateOrgSessions(dbSess interface{ Session() *gocql.Session }, si Sess
 	for iter.Scan(&uid) {
 		si.InvalidateUserSessions(orgID, uid) //nolint:errcheck
 	}
+	_ = aki
 	iter.Close() //nolint:errcheck
 }
 

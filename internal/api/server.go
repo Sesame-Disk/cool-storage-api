@@ -17,6 +17,7 @@ import (
 	"time"
 
 	v2 "github.com/Sesame-Disk/sesamefs/internal/api/v2"
+	"github.com/Sesame-Disk/sesamefs/internal/apikeys"
 	authpkg "github.com/Sesame-Disk/sesamefs/internal/auth"
 	"github.com/Sesame-Disk/sesamefs/internal/config"
 	"github.com/Sesame-Disk/sesamefs/internal/db"
@@ -116,6 +117,7 @@ type Server struct {
 	gcService       *gc.Service             // Garbage collection service
 	ssoStore        *clientSSOStore         // Pending desktop-client SSO tokens
 	authRateLimiter *middleware.RateLimiter // Per-IP rate limiter for auth endpoints
+	apiKeyManager   *apikeys.Manager        // API key manager for programmatic auth
 	version         string                  // Build version string
 	router          *gin.Engine
 	server          *http.Server
@@ -220,6 +222,7 @@ func NewServer(cfg *config.Config, database *db.DB, version string) *Server {
 		gcService:       gcService,
 		ssoStore:        newClientSSOStore(),
 		authRateLimiter: authRL,
+		apiKeyManager:   apikeys.NewManager(database),
 		version:         version,
 		router:          router,
 	}
@@ -888,6 +891,26 @@ func (s *Server) authMiddleware() gin.HandlerFunc {
 			}
 		}
 
+		// Try to validate as a user/service API key
+		if s.apiKeyManager != nil {
+			apiKey, err := s.apiKeyManager.ValidateKey(token)
+			if err == nil {
+				if err := s.enforceAccountStatus(c, apiKey.UserID.String(), apiKey.OrgID.String()); err != nil {
+					return
+				}
+				var email, role string
+				_ = s.db.Session().Query(`SELECT email, role FROM users WHERE org_id = ? AND user_id = ?`,
+					apiKey.OrgID, apiKey.UserID).Scan(&email, &role)
+				c.Set("user_id", apiKey.UserID.String())
+				c.Set("org_id", apiKey.OrgID.String())
+				c.Set("email", email)
+				c.Set("role", role)
+				c.Set("api_key_scope", apiKey.Scope)
+				c.Next()
+				return
+			}
+		}
+
 		// Try to validate as a repo API token (library-scoped access)
 		if s.db != nil {
 			var repoID, permission, generatedBy string
@@ -1192,7 +1215,40 @@ func (s *Server) handleAuthToken(c *gin.Context) {
 		}
 	}
 
-	// TODO: Implement OIDC password grant or redirect to OIDC flow
+	// Try API key auth: user sends email + api_key as password.
+	if s.db != nil && s.apiKeyManager != nil {
+		var userUUID, orgUUID gocql.UUID
+		err := s.db.Session().Query(
+			`SELECT user_id, org_id FROM users_by_email WHERE email = ?`, username,
+		).Scan(&userUUID, &orgUUID)
+		if err == nil {
+			apiKey, err := s.apiKeyManager.ValidateKey(password)
+			if err == nil && apiKey.UserID == userUUID && apiKey.OrgID == orgUUID {
+				if err := s.enforceAccountStatus(c, userUUID.String(), orgUUID.String()); err != nil {
+					return
+				}
+				// API key matches — create a long-lived session for the desktop client.
+				if s.authHandler != nil {
+					sessionMgr := s.authHandler.GetSessionManager()
+					if sessionMgr != nil {
+						var email, role string
+						_ = s.db.Session().Query(`SELECT email, role FROM users WHERE org_id = ? AND user_id = ?`,
+							orgUUID, userUUID).Scan(&email, &role)
+						session, sErr := sessionMgr.CreateAPITokenSession(
+							userUUID.String(), orgUUID.String(), email, role,
+						)
+						if sErr == nil {
+							s.touchUserLastLogin(orgUUID.String(), userUUID.String(), time.Now().UTC())
+							c.JSON(http.StatusOK, gin.H{"token": session.Token})
+							return
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// Generic rejection — same message for user-not-found and wrong-key.
 	c.JSON(http.StatusUnauthorized, gin.H{
 		"non_field_errors": "Unable to login with provided credentials.",
 	})
@@ -2195,4 +2251,153 @@ func (s *Server) handleGCRun(c *gin.Context) {
 		s.gcService.TriggerWorker()
 		c.JSON(http.StatusOK, gin.H{"started": true, "message": "GC worker triggered"})
 	}
+}
+
+// ---------------------------------------------------------------------------
+// API Keys CRUD
+// ---------------------------------------------------------------------------
+
+// handleCreateAPIKey creates a new API key for the authenticated user.
+// POST /api/v2.1/api-keys/
+func (s *Server) handleCreateAPIKey(c *gin.Context) {
+	userID := c.GetString("user_id")
+	orgID := c.GetString("org_id")
+	role := c.GetString("role")
+
+	userUUID, err := gocql.ParseUUID(userID)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid user"})
+		return
+	}
+	orgUUID, err := gocql.ParseUUID(orgID)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid organization"})
+		return
+	}
+
+	var req struct {
+		Label         string `json:"label" form:"label"`
+		Scope         string `json:"scope" form:"scope"`
+		ExpiresInDays *int   `json:"expires_in_days" form:"expires_in_days"`
+	}
+	if err := c.ShouldBind(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		return
+	}
+	if req.Label == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "label is required"})
+		return
+	}
+	if req.ExpiresInDays != nil && *req.ExpiresInDays <= 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "expires_in_days must be greater than zero"})
+		return
+	}
+	if !apikeys.IsValidScope(req.Scope) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "scope must be 'read', 'read-write', or 'admin'"})
+		return
+	}
+	// Only admins/owners/superadmins can create admin-scoped keys.
+	if req.Scope == apikeys.ScopeAdmin {
+		if role != "superadmin" && role != "owner" && role != "admin" {
+			c.JSON(http.StatusForbidden, gin.H{"error": "admin scope requires admin role"})
+			return
+		}
+	}
+
+	var expiresAt *time.Time
+	if req.ExpiresInDays != nil && *req.ExpiresInDays > 0 {
+		t := time.Now().UTC().AddDate(0, 0, *req.ExpiresInDays)
+		expiresAt = &t
+	}
+
+	rawToken, key, err := s.apiKeyManager.CreateKey(userUUID, orgUUID, req.Label, req.Scope, expiresAt)
+	if err != nil {
+		if errors.Is(err, apikeys.ErrKeyLimitReached) {
+			c.JSON(http.StatusConflict, gin.H{"error": "maximum number of API keys reached"})
+			return
+		}
+		if errors.Is(err, apikeys.ErrInvalidExpiry) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid API key expiry"})
+			return
+		}
+		log.Printf("[apikeys] create error user=%s: %v", userID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create API key"})
+		return
+	}
+
+	c.JSON(http.StatusCreated, gin.H{
+		"key":        rawToken,
+		"key_hash":   key.KeyHash,
+		"key_prefix": key.KeyPrefix,
+		"label":      key.Label,
+		"scope":      key.Scope,
+		"created_at": key.CreatedAt,
+		"expires_at": key.ExpiresAt,
+	})
+}
+
+// handleListAPIKeys lists all API keys for the authenticated user.
+// GET /api/v2.1/api-keys/
+func (s *Server) handleListAPIKeys(c *gin.Context) {
+	userID := c.GetString("user_id")
+	orgID := c.GetString("org_id")
+
+	userUUID, _ := gocql.ParseUUID(userID)
+	orgUUID, _ := gocql.ParseUUID(orgID)
+
+	keys, err := s.apiKeyManager.ListUserKeys(orgUUID, userUUID)
+	if err != nil {
+		log.Printf("[apikeys] list error user=%s: %v", userID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list API keys"})
+		return
+	}
+
+	// Return keys without raw tokens — only prefix for identification.
+	result := make([]gin.H, 0, len(keys))
+	for _, k := range keys {
+		result = append(result, gin.H{
+			"key_hash":     k.KeyHash,
+			"key_prefix":   k.KeyPrefix,
+			"label":        k.Label,
+			"scope":        k.Scope,
+			"created_at":   k.CreatedAt,
+			"last_used_at": k.LastUsedAt,
+			"expires_at":   k.ExpiresAt,
+		})
+	}
+
+	c.JSON(http.StatusOK, result)
+}
+
+// handleRevokeAPIKey revokes an API key belonging to the authenticated user.
+// DELETE /api/v2.1/api-keys/:key_hash/
+func (s *Server) handleRevokeAPIKey(c *gin.Context) {
+	userID := c.GetString("user_id")
+	orgID := c.GetString("org_id")
+	keyHash := c.Param("key_hash")
+
+	if keyHash == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "key_hash is required"})
+		return
+	}
+
+	userUUID, _ := gocql.ParseUUID(userID)
+	orgUUID, _ := gocql.ParseUUID(orgID)
+
+	err := s.apiKeyManager.RevokeKey(orgUUID, userUUID, keyHash)
+	if err != nil {
+		if errors.Is(err, apikeys.ErrKeyNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "API key not found"})
+			return
+		}
+		if errors.Is(err, apikeys.ErrNotOwner) {
+			c.JSON(http.StatusForbidden, gin.H{"error": "API key does not belong to this user"})
+			return
+		}
+		log.Printf("[apikeys] revoke error user=%s key=%s: %v", userID, keyHash[:16], err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to revoke API key"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"success": true})
 }

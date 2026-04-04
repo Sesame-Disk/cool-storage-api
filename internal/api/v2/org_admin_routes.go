@@ -1,6 +1,7 @@
 package v2
 
 import (
+	"github.com/Sesame-Disk/sesamefs/internal/apikeys"
 	"github.com/Sesame-Disk/sesamefs/internal/config"
 	"github.com/Sesame-Disk/sesamefs/internal/db"
 	"github.com/Sesame-Disk/sesamefs/internal/middleware"
@@ -14,10 +15,10 @@ import (
 //   - /org/:org_id/admin/...  — endpoints that require an explicit org_id parameter
 //
 // All endpoints require the user to be an org admin of the specified org or a superadmin.
-func RegisterOrgAdminRoutes(rg *gin.RouterGroup, database *db.DB, cfg *config.Config, perm *middleware.PermissionMiddleware, sessions SessionInvalidator) {
-	h := NewOrgAdminHandler(database, cfg, perm, sessions)
+func RegisterOrgAdminRoutes(rg *gin.RouterGroup, database *db.DB, cfg *config.Config, perm *middleware.PermissionMiddleware, sessions SessionInvalidator, apiKeys APIKeyInvalidator) {
+	h := NewOrgAdminHandler(database, cfg, perm, sessions, apiKeys)
 	orgBase := rg.Group("/org")
-	orgBase.Use(perm.RequireAdminOrAbove())
+	orgBase.Use(perm.RequireAdminOrAbove(), apikeys.RequireScope(apikeys.ScopeAdmin))
 
 	registerOrgAdminSharedRoutes(orgBase.Group("/admin"), h)
 	registerOrgAdminScopedRoutes(orgBase.Group("/:org_id/admin"), h)

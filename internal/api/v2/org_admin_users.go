@@ -254,7 +254,7 @@ func (h *OrgAdminHandler) UpdateOrgUser(c *gin.Context) {
 
 	if updateReq.IsActive != nil {
 		if !*updateReq.IsActive {
-			if err := deactivateUser(h.db, h.sessions, targetOrgID, userID); err != nil {
+			if err := deactivateUser(h.db, h.sessions, h.apiKeys, targetOrgID, userID); err != nil {
 				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update user"})
 				return
 			}
@@ -382,7 +382,7 @@ func (h *OrgAdminHandler) DeleteOrgUser(c *gin.Context) {
 	}
 
 	// Soft-delete: mark as "deleted" with timestamp for grace period cascade
-	if err := softDeleteUser(h.db, h.sessions, targetOrgID, userID, time.Now()); err != nil {
+	if err := softDeleteUser(h.db, h.sessions, h.apiKeys, targetOrgID, userID, time.Now()); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete user"})
 		return
 	}

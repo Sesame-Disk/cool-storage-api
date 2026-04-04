@@ -1291,6 +1291,46 @@ func (s *CassandraStore) DeleteMonitoredReposByUser(userID uuid.UUID) error {
 	`, userID.String()).Exec()
 }
 
+func (s *CassandraStore) DeleteAPIKeysByUser(orgID, userID uuid.UUID) error {
+	iter := s.db.Session().Query(
+		`SELECT key_hash, created_at FROM api_keys_by_user WHERE org_id = ? AND user_id = ?`,
+		orgID, userID,
+	).Iter()
+
+	type keyRef struct {
+		hash      string
+		createdAt time.Time
+	}
+	var refs []keyRef
+	var ref keyRef
+	for iter.Scan(&ref.hash, &ref.createdAt) {
+		refs = append(refs, ref)
+	}
+	if err := iter.Close(); err != nil {
+		return err
+	}
+	if len(refs) == 0 {
+		return nil
+	}
+
+	for i := 0; i < len(refs); i += 25 {
+		end := i + 25
+		if end > len(refs) {
+			end = len(refs)
+		}
+		batch := s.db.Session().Batch(gocql.UnloggedBatch)
+		for _, r := range refs[i:end] {
+			batch.Query(`DELETE FROM api_keys WHERE key_hash = ?`, r.hash)
+			batch.Query(`DELETE FROM api_keys_by_user WHERE org_id = ? AND user_id = ? AND created_at = ?`, orgID, userID, r.createdAt)
+		}
+		if err := batch.Exec(); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
 func (s *CassandraStore) HardDeleteUser(orgID, userID uuid.UUID, email string) error {
 	batch := s.db.Session().Batch(gocql.LoggedBatch)
 	batch.Query(`

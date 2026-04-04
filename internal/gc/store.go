@@ -118,6 +118,7 @@ type GCStore interface {
 	ListSharesByUser(userID uuid.UUID) ([]ShareByUserInfo, error)
 	DeleteStarredFilesByUser(userID uuid.UUID) error
 	DeleteMonitoredReposByUser(userID uuid.UUID) error
+	DeleteAPIKeysByUser(orgID, userID uuid.UUID) error
 	HardDeleteUser(orgID, userID uuid.UUID, email string) error
 	GetUserEmail(orgID, userID uuid.UUID) (string, error)
 

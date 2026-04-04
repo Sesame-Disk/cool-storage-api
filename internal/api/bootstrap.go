@@ -259,6 +259,7 @@ func (s *Server) buildAppBootstrapPageOptions(identity bootstrapIdentity, userDa
 		"enableUserSetName":         authenticated,
 		"canUpdatePassword":         authenticated && hasPasswordChange,
 		"passwordOperationText":     "Change",
+		"enableAPIKeys":             authenticated,
 		"enableDeleteAccount":       authenticated && hasDeleteAccount,
 		"langCode":                  "en",
 		"currentLang": gin.H{
@@ -347,6 +348,7 @@ func (s *Server) buildAppBootstrapPageOptions(identity bootstrapIdentity, userDa
 	pageOptions["enableUserSetName"] = true
 	pageOptions["canUpdatePassword"] = hasPasswordChange
 	pageOptions["passwordOperationText"] = "Change"
+	pageOptions["enableAPIKeys"] = true
 	pageOptions["enableDeleteAccount"] = hasDeleteAccount
 	pageOptions["userRole"] = role
 	pageOptions["canAddRepo"] = resolved.Capabilities["can_add_repo"]
