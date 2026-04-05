@@ -340,6 +340,15 @@ func (h *OrgAdminHandler) UpdateOrgUser(c *gin.Context) {
 		}
 	}
 
+	if err := syncAdminUserReadModel(h.db, targetOrgID, userID); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to sync user read model"})
+		return
+	}
+	if err := syncAdminOrganizationReadModel(h.db, targetOrgID); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to sync organization read model"})
+		return
+	}
+
 	row := buildOrgUserRowWithTraffic(email, name, role, status, targetOrgID, quota, traffic.ReadStorageUsed(h.db, fmt.Sprintf("user:%s:%s", targetOrgID, userID)), trafficUploadQuota, trafficDownloadQuota, created, lastLogin)
 	row.OrgStorageQuota = oq.StorageQuota
 	row.OrgTrafficQuota = oq.TrafficQuota

@@ -739,6 +739,8 @@ func (c *OIDCClient) provisionUser(ctx context.Context, claims *IDTokenClaims, u
 			if createErr != nil {
 				fmt.Printf("Warning: failed to auto-provision org %s: %v\n", orgID, createErr)
 				// Continue - the org might have been created concurrently
+			} else if syncErr := db.SyncAdminOrganizationReadModel(c.db.Session(), orgID); syncErr != nil {
+				fmt.Printf("Warning: failed to sync admin org projection for %s: %v\n", orgID, syncErr)
 			}
 		}
 	}
@@ -799,6 +801,13 @@ func (c *OIDCClient) provisionUser(ctx context.Context, claims *IDTokenClaims, u
 							UPDATE users SET role = ? WHERE org_id = ? AND user_id = ?
 						`, normalizedDBRole, orgID, userID).Exec(); updateErr != nil {
 							fmt.Printf("Warning: failed to normalize role for existing user: %v\n", updateErr)
+						} else {
+							if syncErr := db.SyncAdminUserReadModel(c.db.Session(), orgID, userID); syncErr != nil {
+								fmt.Printf("Warning: failed to sync admin user projection for %s/%s: %v\n", orgID, userID, syncErr)
+							}
+							if syncErr := db.SyncAdminOrganizationReadModel(c.db.Session(), orgID); syncErr != nil {
+								fmt.Printf("Warning: failed to sync admin org projection for %s: %v\n", orgID, syncErr)
+							}
 						}
 					}
 					role = normalizedDBRole
@@ -876,6 +885,13 @@ func (c *OIDCClient) provisionUser(ctx context.Context, claims *IDTokenClaims, u
 					UPDATE users SET role = ? WHERE org_id = ? AND user_id = ?
 				`, normalizedDBRole, orgID, userID).Exec(); updateErr != nil {
 					fmt.Printf("Warning: failed to normalize role from DB: %v\n", updateErr)
+				} else {
+					if syncErr := db.SyncAdminUserReadModel(c.db.Session(), orgID, userID); syncErr != nil {
+						fmt.Printf("Warning: failed to sync admin user projection for %s/%s: %v\n", orgID, userID, syncErr)
+					}
+					if syncErr := db.SyncAdminOrganizationReadModel(c.db.Session(), orgID); syncErr != nil {
+						fmt.Printf("Warning: failed to sync admin org projection for %s: %v\n", orgID, syncErr)
+					}
 				}
 				dbRole = normalizedDBRole
 			}
@@ -892,6 +908,13 @@ func (c *OIDCClient) provisionUser(ctx context.Context, claims *IDTokenClaims, u
 					UPDATE users SET role = ? WHERE org_id = ? AND user_id = ?
 				`, role, orgID, userID).Exec(); updateErr != nil {
 					fmt.Printf("Warning: failed to sync role from OIDC: %v\n", updateErr)
+				} else {
+					if syncErr := db.SyncAdminUserReadModel(c.db.Session(), orgID, userID); syncErr != nil {
+						fmt.Printf("Warning: failed to sync admin user projection for %s/%s: %v\n", orgID, userID, syncErr)
+					}
+					if syncErr := db.SyncAdminOrganizationReadModel(c.db.Session(), orgID); syncErr != nil {
+						fmt.Printf("Warning: failed to sync admin org projection for %s: %v\n", orgID, syncErr)
+					}
 				}
 			}
 		}
@@ -996,8 +1019,22 @@ func (c *OIDCClient) createUser(ctx context.Context, userID, orgID, email, name,
 			VALUES (?, ?, ?)
 		`, email, userID, orgID)
 	}
+	db.AddUpsertAdminUserReadModelQuery(batch, db.AdminUserProjectionRow{
+		OrgID:      orgID,
+		UserID:     userID,
+		Email:      email,
+		Name:       name,
+		Role:       role,
+		Status:     "active",
+		QuotaBytes: int64(-2),
+		QuotaUsage: int64(0),
+		CreatedAt:  now,
+	})
 	if err := batch.Exec(); err != nil {
 		return fmt.Errorf("failed to create user records: %w", err)
+	}
+	if err := db.SyncAdminOrganizationReadModel(c.db.Session(), orgID); err != nil {
+		fmt.Printf("Warning: failed to sync admin org projection for %s: %v\n", orgID, err)
 	}
 
 	return nil

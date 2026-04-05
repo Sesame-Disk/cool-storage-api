@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	dbpkg "github.com/Sesame-Disk/sesamefs/internal/db"
 	"github.com/Sesame-Disk/sesamefs/internal/middleware"
 	"github.com/Sesame-Disk/sesamefs/internal/traffic"
 	"github.com/gin-gonic/gin"
@@ -124,18 +125,43 @@ func (h *AdminHandler) ListAllUsers(c *gin.Context) {
 
 	// Determine which orgs to query: platform superadmin may query all orgs.
 	callerRole, _ := h.permMiddleware.GetUserOrgRole(callerOrgID, callerUserID)
-	var orgIDs []string
 	if middleware.IsPlatformSuperAdmin(callerOrgID, callerRole) {
-		orgIter := h.db.Session().Query(`SELECT org_id FROM organizations`).Iter()
-		var oid string
-		for orgIter.Scan(&oid) {
-			orgIDs = append(orgIDs, oid)
+		rows, err := dbpkg.ListAdminUserRows(h.db.Session(), statusFilter)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list users"})
+			return
 		}
-		orgIter.Close()
-	} else {
-		orgIDs = []string{callerOrgID}
+		allUsers := make([]adminUserResponse, 0, len(rows))
+		for _, row := range rows {
+			lastLogin := time.Time{}
+			if row.LastLoginAt != nil {
+				lastLogin = *row.LastLoginAt
+			}
+			allUsers = append(allUsers, makeAdminUserResponse(row.Email, row.Name, row.Role, row.Status, row.QuotaBytes, traffic.ReadStorageUsed(h.db, fmt.Sprintf("user:%s:%s", row.OrgID, row.UserID)), row.CreatedAt, lastLogin))
+		}
+
+		total := len(allUsers)
+		start := (page - 1) * perPage
+		if start > total {
+			start = total
+		}
+		end := start + perPage
+		if end > total {
+			end = total
+		}
+		pageUsers := allUsers[start:end]
+		if pageUsers == nil {
+			pageUsers = []adminUserResponse{}
+		}
+
+		c.JSON(http.StatusOK, gin.H{
+			"data":        pageUsers,
+			"total_count": total,
+		})
+		return
 	}
 
+	orgIDs := []string{callerOrgID}
 	var allUsers []adminUserResponse
 	seen := make(map[string]bool) // deduplicate by email
 	for _, orgID := range orgIDs {
@@ -214,23 +240,56 @@ func (h *AdminHandler) SearchUsers(c *gin.Context) {
 
 	// Determine which orgs to query
 	callerRole, _ := h.permMiddleware.GetUserOrgRole(callerOrgID, callerUserID)
-	var orgIDs []string
 
 	// If superadmin passes org_id param, restrict search to that org
 	filterOrgID := c.Query("org_id")
-	if filterOrgID != "" && middleware.IsPlatformSuperAdmin(callerOrgID, callerRole) {
-		orgIDs = []string{filterOrgID}
-	} else if middleware.IsPlatformSuperAdmin(callerOrgID, callerRole) {
-		orgIter := h.db.Session().Query(`SELECT org_id FROM organizations`).Iter()
-		var oid string
-		for orgIter.Scan(&oid) {
-			orgIDs = append(orgIDs, oid)
+	if middleware.IsPlatformSuperAdmin(callerOrgID, callerRole) {
+		rows, err := dbpkg.ListAdminUserRows(h.db.Session(), "")
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list users"})
+			return
 		}
-		orgIter.Close()
-	} else {
-		orgIDs = []string{callerOrgID}
+
+		var results []adminUserResponse
+		for _, row := range rows {
+			if filterOrgID != "" && row.OrgID != filterOrgID {
+				continue
+			}
+			if !strings.Contains(strings.ToLower(row.Email), query) && !strings.Contains(strings.ToLower(row.Name), query) {
+				continue
+			}
+			lastLogin := time.Time{}
+			if row.LastLoginAt != nil {
+				lastLogin = *row.LastLoginAt
+			}
+			results = append(results, makeAdminUserResponse(row.Email, row.Name, row.Role, row.Status, row.QuotaBytes, traffic.ReadStorageUsed(h.db, fmt.Sprintf("user:%s:%s", row.OrgID, row.UserID)), row.CreatedAt, lastLogin))
+		}
+
+		if results == nil {
+			results = []adminUserResponse{}
+		}
+
+		total := len(results)
+		start := (page - 1) * perPage
+		if start > total {
+			start = total
+		}
+		end := start + perPage
+		if end > total {
+			end = total
+		}
+
+		c.JSON(http.StatusOK, gin.H{
+			"user_list": results[start:end],
+			"page_info": gin.H{
+				"current_page":  page,
+				"has_next_page": end < total,
+			},
+		})
+		return
 	}
 
+	orgIDs := []string{callerOrgID}
 	var results []adminUserResponse
 	seen := make(map[string]bool)
 	for _, orgID := range orgIDs {
@@ -547,6 +606,15 @@ func (h *AdminHandler) UpdateUserByEmail(c *gin.Context, email string) {
 		currentStatus = "active"
 	}
 
+	if err := syncAdminUserReadModel(h.db, userOrgID, userID); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to sync user read model"})
+		return
+	}
+	if err := syncAdminOrganizationReadModel(h.db, userOrgID); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to sync organization read model"})
+		return
+	}
+
 	resp := makeAdminUserResponse(email, currentName, currentRole, currentStatus, currentQuota, traffic.ReadStorageUsed(h.db, fmt.Sprintf("user:%s:%s", userOrgID, userID)), currentCreated, currentLastLogin)
 	resp.TrafficUploadQuota = currentTrafficUploadQuota
 	resp.TrafficDownloadQuota = currentTrafficDownloadQuota
@@ -642,18 +710,31 @@ func (h *AdminHandler) ListAdminUsers(c *gin.Context) {
 
 	// Determine which orgs to query
 	callerRole, _ := h.permMiddleware.GetUserOrgRole(callerOrgID, callerUserID)
-	var orgIDs []string
 	if middleware.IsPlatformSuperAdmin(callerOrgID, callerRole) {
-		orgIter := h.db.Session().Query(`SELECT org_id FROM organizations`).Iter()
-		var oid string
-		for orgIter.Scan(&oid) {
-			orgIDs = append(orgIDs, oid)
+		rows, err := dbpkg.ListAdminUserRows(h.db.Session(), "")
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list users"})
+			return
 		}
-		orgIter.Close()
-	} else {
-		orgIDs = []string{callerOrgID}
+		var admins []adminUserResponse
+		for _, row := range rows {
+			if !middleware.IsPlatformSuperAdmin(row.OrgID, middleware.OrganizationRole(row.Role)) {
+				continue
+			}
+			lastLogin := time.Time{}
+			if row.LastLoginAt != nil {
+				lastLogin = *row.LastLoginAt
+			}
+			admins = append(admins, makeAdminUserResponse(row.Email, row.Name, row.Role, row.Status, row.QuotaBytes, traffic.ReadStorageUsed(h.db, fmt.Sprintf("user:%s:%s", row.OrgID, row.UserID)), row.CreatedAt, lastLogin))
+		}
+		if admins == nil {
+			admins = []adminUserResponse{}
+		}
+		c.JSON(http.StatusOK, gin.H{"admin_user_list": admins})
+		return
 	}
 
+	orgIDs := []string{callerOrgID}
 	var admins []adminUserResponse
 	seen := make(map[string]bool)
 	for _, orgID := range orgIDs {
@@ -719,6 +800,14 @@ func (h *AdminHandler) BatchAddAdmins(c *gin.Context) {
 		if err := h.db.Session().Query(`UPDATE users SET role = ? WHERE org_id = ? AND user_id = ?`,
 			"superadmin", userOrgID, userID).Exec(); err != nil {
 			failed = append(failed, gin.H{"email": email, "error_msg": "failed to update user"})
+			continue
+		}
+		if err := syncAdminUserReadModel(h.db, userOrgID, userID); err != nil {
+			failed = append(failed, gin.H{"email": email, "error_msg": "failed to sync user read model"})
+			continue
+		}
+		if err := syncAdminOrganizationReadModel(h.db, userOrgID); err != nil {
+			failed = append(failed, gin.H{"email": email, "error_msg": "failed to sync organization read model"})
 			continue
 		}
 

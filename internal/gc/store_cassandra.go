@@ -1360,6 +1360,9 @@ func (s *CassandraStore) DeleteAPIKeysByUser(orgID, userID uuid.UUID) error {
 }
 
 func (s *CassandraStore) HardDeleteUser(orgID, userID uuid.UUID, email string) error {
+	if err := db.DeleteAdminUserReadModel(s.db.Session(), userID.String()); err != nil {
+		return err
+	}
 	batch := s.db.Session().Batch(gocql.LoggedBatch)
 	batch.Query(`
 		DELETE FROM users WHERE org_id = ? AND user_id = ?
@@ -1369,7 +1372,10 @@ func (s *CassandraStore) HardDeleteUser(orgID, userID uuid.UUID, email string) e
 			DELETE FROM users_by_email WHERE email = ?
 		`, email)
 	}
-	return batch.Exec()
+	if err := batch.Exec(); err != nil {
+		return err
+	}
+	return db.SyncAdminOrganizationReadModel(s.db.Session(), orgID.String())
 }
 
 func (s *CassandraStore) GetUserEmail(orgID, userID uuid.UUID) (string, error) {
@@ -1535,6 +1541,9 @@ func (s *CassandraStore) DeleteGroupFull(orgID, groupID uuid.UUID) error {
 }
 
 func (s *CassandraStore) HardDeleteOrg(orgID uuid.UUID) error {
+	if err := db.DeleteAdminOrganizationReadModel(s.db.Session(), orgID.String()); err != nil {
+		return err
+	}
 	batch := s.db.Session().Batch(gocql.LoggedBatch)
 	batch.Query(`DELETE FROM organizations WHERE org_id = ?`, orgID.String())
 	batch.Query(`DELETE FROM deleted_organizations WHERE org_id = ?`, orgID.String())

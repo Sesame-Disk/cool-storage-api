@@ -1714,6 +1714,14 @@ func (s *Server) handleUpdateAccountInfo(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update profile"})
 		return
 	}
+	if err := db.SyncAdminUserReadModel(s.db.Session(), orgID, userID); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to sync profile"})
+		return
+	}
+	if err := db.SyncAdminOrganizationReadModel(s.db.Session(), orgID); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to sync organization read model"})
+		return
+	}
 
 	s.handleAccountInfo(c)
 }

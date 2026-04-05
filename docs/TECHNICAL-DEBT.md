@@ -204,39 +204,21 @@ OIDC-only production deployments are no longer blocked for non-browser clients:
 2. Desktop clients, SeaDrive, and CLI tools call `POST /api2/auth-token/` with:
    - `username` = user email
    - `password` = raw API key
-3. The server validates the key and returns a long-lived session token.
-
-### What This Now Covers
-
 - Desktop/mobile sync clients in OIDC-only deployments
 - `seaf-cli` and similar headless user tools
 - User-scoped automation without relying on dev tokens
-- Strong revocation: revoking an API key also invalidates sessions minted from it
-- Expiry inheritance: derived sessions cannot outlive the source API key
-
 ### Remaining Debt
 
 | Item | Status | Notes |
 |---|---|---|
 | OIDC browser flow (`/api/v2.1/auth/oidc/login`) | ✅ Works | Primary browser login |
 | User API keys (`/api/v2.1/api-keys/`) | ✅ Works | Current answer for desktop/CLI/automation |
-| OIDC Device Flow (RFC 8628) | ❌ Not implemented | Still the best fit for shared/headless sign-in UX |
-| Service-account / client-credentials flow | ❌ Not implemented | Still needed for userless machine-to-machine auth |
-
-### Why This Is Still Debt
 
 The product now has a working user-scoped auth path, but it still lacks a first-class answer for:
 
-- userless automation
-- centrally managed machine credentials
 - browser-assisted device login without pre-created API keys
 
 Those are no longer production blockers for user-driven clients, but they are still legitimate backlog items.
-
----
-
-## 7. Backend HTML Preview Debt (2026-04-03)
-
 ### Status
 Authenticated file preview pages are still rendered server-side for a narrow set of flows.
 
@@ -246,8 +228,6 @@ Authenticated file preview pages are still rendered server-side for a narrow set
 - `onlyoffice_editor.html` for full-page OnlyOffice editor bootstrap
 - `error_page.html` as the fallback page for those flows
 - `login_success.html` for the desktop-client SSO callback bridge
-
-### Why This Is Debt
 The main app, share pages, upload pages, and login are already frontend-owned. Keeping preview/editor HTML in Go means:
 - duplicate presentation responsibility across backend and frontend
 - extra template maintenance for edge-case pages
@@ -260,9 +240,6 @@ Move preview/editor shells into the frontend and leave the backend responsible o
 - OnlyOffice config APIs
 - auth/session redirects
 
-### Note
-This is deferred on purpose. It is safe to keep the current backend-rendered preview pages until the API key and auth work lands cleanly.
-
 - Implementation: ~200 lines in a new `internal/api/v2/access_tokens.go`
 - Endpoints: `POST/GET/DELETE /api/v2.1/user/access-tokens/`
 - Storage: new `personal_access_tokens` Cassandra table
@@ -270,24 +247,13 @@ This is deferred on purpose. It is safe to keep the current backend-rendered pre
 ## 8. Fake `UUID@sesamefs.local` Emails — ⚠️ Partially Fixed (2026-02-22)
 
 ### Status
-
-Several endpoints were hardcoding a fake email (`userID + "@sesamefs.local"`) instead of querying the real user email from the `users` table. This was a dev shortcut that leaked into production paths.
-
 ### What Was Fixed
 
-A `resolveOwnerEmail(orgID, userID string) string` method was added to `LibraryHandler`. It performs `SELECT email FROM users WHERE org_id = ? AND user_id = ?` and falls back to `UUID@sesamefs.local` only when the user genuinely doesn't exist in the DB.
-
-Fixed in `internal/api/v2/libraries.go` (5 occurrences: `ListLibraries`, `GetLibraryDetail`, `ListLibrariesV21`, `GetLibraryDetailV21`, `CreateLibrary`) and `internal/api/v2/deleted_libraries.go` (`ListDeletedRepos`).
 
 ### Remaining: Display Fields (Safe to Fix, Low Risk)
 
 These return incorrect data to the client but do not affect stored data. Fix by using a similar `resolveOwnerEmail`-style DB lookup.
 
-| File | Line(s) | Context |
-|------|---------|---------|
-| `internal/api/v2/files.go` | 1493 | `GetFileDetail` response |
-| `internal/api/v2/files.go` | 2557 | Sync token response `"email"` field |
-| `internal/api/v2/files.go` | 3384, 3525, 3669 | File version history `CreatorEmail` |
 | `internal/api/seafhttp.go` | 1860 | Download-info `"email"` field |
 | `internal/api/v2/starred.go` | 127, 258 | Starred files response `userEmail` |
 
@@ -765,4 +731,71 @@ If users report that “normal uploads are faster than upload-token uploads”, 
 
 ---
 
-*Last updated: 2026-04-04*
+## 16. Admin Organization/User Projections And Recipient Share Reads — 🟡 Activated, Still Maturing (2026-04-05)
+
+### Status
+
+The optimization tables are no longer schema-only.
+
+What is now live in code:
+
+- `PermissionMiddleware.GetUserLibraries()` now resolves direct-user and group shares through `shares_by_recipient`, removing the old `ALLOW FILTERING` recipient scans from that path.
+- Sys-admin organization list/search now reads from the organization admin projection tables.
+- Sys-admin user list/search and sys-admin listing now read from the user admin projection tables.
+- User/org projection rows are now synchronized from the main create/update/status-change paths, OIDC auto-provisioning, `last_login_at` touches, and GC hard deletes.
+
+Activated admin projection tables:
+
+- `organization_admin_buckets`
+- `organization_admin_buckets_by_status`
+- `organizations_admin_by_created`
+- `organizations_admin_by_status_created`
+- `organization_admin_projection_state`
+- `user_admin_global_buckets`
+- `user_admin_buckets_by_status`
+- `users_admin_global_by_created`
+- `users_admin_global_by_status_created`
+- `user_admin_projection_state`
+
+### Evidence From Code
+
+- `internal/db/admin_identity_read_models.go` now contains the read-model sync/list/delete helpers for organizations and users.
+- `internal/api/v2/admin.go` and `internal/api/v2/admin_extra_organizations.go` now read sys-admin organization views from projection tables.
+- `internal/api/v2/admin_users.go` now reads superadmin global user views from projection tables.
+- `internal/middleware/permissions.go` now uses `shares_by_recipient` for recipient-centric accessible-library enumeration.
+
+### Why This Is Debt
+
+- The tables are active now, but they still need more operational maturity than the older read models.
+- The sync coverage is strong on runtime mutation paths, but seed/bootstrap style paths are still not treated as first-class projection writers.
+- There is still no explicit rebuild/backfill command for these projections if they drift or if old data predates the new dual-writes.
+
+### Decision For Now
+
+Keep the projections and use them for sys-admin global views. The current implementation already justifies the tables.
+
+Remaining follow-ups:
+
+1. Add a rebuild/backfill command for `organizations_admin_*` and `users_admin_*` from canonical `organizations` and `users`.
+2. Decide whether seed/bootstrap flows should populate these projections directly or rely on an explicit rebuild step.
+3. Add focused regression coverage for projection sync on ownership transfer, OIDC role normalization, and hard-delete cascades.
+
+### Important Non-Issue: Other Read Models Are Already Live
+
+This audit does **not** apply to the following tables, which do have live runtime wiring:
+
+- Group admin projections via `internal/db/admin_group_read_models.go` and `internal/api/v2/admin_groups.go`
+- Library admin projections via `internal/db/admin_library_read_models.go` and `internal/api/v2/write_helpers.go`
+- Admin link projections via `internal/db/admin_link_read_models.go`, `internal/api/v2/share_links.go`, and GC cleanup paths
+- Share recipient projections via `internal/db/share_read_models.go` and `internal/api/v2/file_shares.go`
+
+### Clarification: `shares_by_recipient` Is Now Used Where It Fits Best
+
+- Recipient-centric accessible-library enumeration now uses `shares_by_recipient`.
+- Repo-centric permission checks still query canonical `shares` by `library_id`, which is already the natural primary-key path for those checks and does not rely on `ALLOW FILTERING`.
+
+That means the remaining split is intentional by access pattern, not a leftover `ALLOW FILTERING` gap in `GetUserLibraries` anymore.
+
+---
+
+*Last updated: 2026-04-05*

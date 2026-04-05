@@ -61,49 +61,31 @@ func (h *AdminHandler) ListOrganizations(c *gin.Context) {
 		return
 	}
 
-	iter := h.db.Session().Query(`
-		SELECT org_id, name, status, storage_quota, plan, created_at, deleted_at
-		FROM organizations
-	`).Iter()
-
-	var orgs []gin.H
-	var orgID, name, status, plan string
-	var storageQuota int64
-	var createdAt time.Time
-	var deletedAt *time.Time
-
-	for iter.Scan(&orgID, &name, &status, &storageQuota, &plan, &createdAt, &deletedAt) {
-		effectiveStatus := status
-		if effectiveStatus == "" {
-			effectiveStatus = StatusActive
-		}
-		if statusFilter != "" && effectiveStatus != statusFilter {
-			continue
-		}
-
-		usersCount := h.countOrgUsers(orgID)
-		ownerEmail, ownerName := h.resolveOrgCreator(orgID)
-		var deletedAtStr interface{}
-		if deletedAt != nil {
-			deletedAtStr = deletedAt.Format(time.RFC3339)
-		}
-		orgs = append(orgs, gin.H{
-			"org_id":      orgID,
-			"org_name":    name,
-			"owner_email": ownerEmail,
-			"owner_name":  ownerName,
-			"status":      effectiveStatus,
-			"deleted_at":  deletedAtStr,
-			"plan":        plan,
-			"quota_usage": traffic.ReadStorageUsed(h.db, fmt.Sprintf("org:%s", orgID)),
-			"quota":       storageQuota,
-			"ctime":       createdAt.Format(time.RFC3339),
-			"users_count": usersCount,
-		})
-	}
-	if err := iter.Close(); err != nil {
+	rows, err := db.ListAdminOrganizationRows(h.db.Session(), statusFilter)
+	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list organizations"})
 		return
+	}
+
+	var orgs []gin.H
+	for _, row := range rows {
+		var deletedAtStr interface{}
+		if row.DeletedAt != nil {
+			deletedAtStr = row.DeletedAt.Format(time.RFC3339)
+		}
+		orgs = append(orgs, gin.H{
+			"org_id":      row.OrgID,
+			"org_name":    row.Name,
+			"owner_email": row.OwnerEmail,
+			"owner_name":  row.OwnerName,
+			"status":      row.Status,
+			"deleted_at":  deletedAtStr,
+			"plan":        row.Plan,
+			"quota_usage": traffic.ReadStorageUsed(h.db, fmt.Sprintf("org:%s", row.OrgID)),
+			"quota":       row.StorageQuota,
+			"ctime":       row.CreatedAt.Format(time.RFC3339),
+			"users_count": row.UsersCount,
+		})
 	}
 
 	if orgs == nil {
@@ -229,11 +211,20 @@ func (h *AdminHandler) CreateOrganization(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create organization"})
 			return
 		}
+		if err := syncAdminUserReadModel(h.db, orgID.String(), ownerUserID.String()); err != nil {
+			log.Printf("CreateOrganization: failed to sync admin user projection for org %s owner %s: %v", orgID, ownerUserID, err)
+		}
+		if err := syncAdminOrganizationReadModel(h.db, orgID.String()); err != nil {
+			log.Printf("CreateOrganization: failed to sync admin org projection for org %s: %v", orgID, err)
+		}
 	} else {
 		if err := h.db.Session().Query(orgInsertQuery, orgInsertArgs...).Exec(); err != nil {
 			log.Printf("CreateOrganization: failed to insert org %s: %v", orgName, err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create organization"})
 			return
+		}
+		if err := syncAdminOrganizationReadModel(h.db, orgID.String()); err != nil {
+			log.Printf("CreateOrganization: failed to sync admin org projection for org %s: %v", orgID, err)
 		}
 	}
 
@@ -561,6 +552,10 @@ func (h *AdminHandler) UpdateOrganization(c *gin.Context) {
 
 	if err := batch.Exec(); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update organization"})
+		return
+	}
+	if err := syncAdminOrganizationReadModel(h.db, orgID); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to sync organization read model"})
 		return
 	}
 
@@ -995,6 +990,15 @@ func (h *AdminHandler) UpdateUser(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update user"})
 			return
 		}
+	}
+
+	if err := syncAdminUserReadModel(h.db, orgID, targetUserID); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to sync user read model"})
+		return
+	}
+	if err := syncAdminOrganizationReadModel(h.db, orgID); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to sync organization read model"})
+		return
 	}
 
 	c.JSON(http.StatusOK, gin.H{"success": true})

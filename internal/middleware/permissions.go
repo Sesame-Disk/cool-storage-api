@@ -857,6 +857,33 @@ type LibraryWithPermission struct {
 	Permission LibraryPermission
 }
 
+func mergeLibraryPermission(librariesMap map[uuid.UUID]LibraryPermission, libraryID uuid.UUID, permission LibraryPermission, pm *PermissionMiddleware) {
+	if existingPerm, exists := librariesMap[libraryID]; exists {
+		if pm.hasRequiredLibraryPermission(permission, existingPerm) {
+			librariesMap[libraryID] = permission
+		}
+		return
+	}
+	librariesMap[libraryID] = permission
+}
+
+func (m *PermissionMiddleware) addRecipientSharedLibraries(librariesMap map[uuid.UUID]LibraryPermission, orgID, recipientType, recipientID string) error {
+	iter := m.db.Session().Query(`
+		SELECT library_id, permission FROM shares_by_recipient
+		WHERE org_id = ? AND shared_to_type = ? AND shared_to = ?
+	`, orgID, recipientType, recipientID).Iter()
+
+	var libIDStr, permission string
+	for iter.Scan(&libIDStr, &permission) {
+		libID, err := uuid.Parse(libIDStr)
+		if err != nil {
+			continue
+		}
+		mergeLibraryPermission(librariesMap, libID, LibraryPermission(permission), m)
+	}
+	return iter.Close()
+}
+
 // GetUserLibraries returns all libraries the user has access to (owned + shared)
 // This is used for filtering library lists to show only accessible libraries
 func (m *PermissionMiddleware) GetUserLibraries(orgID, userID string) ([]LibraryWithPermission, error) {
@@ -881,29 +908,8 @@ func (m *PermissionMiddleware) GetUserLibraries(orgID, userID string) ([]Library
 		return nil, err
 	}
 
-	// 2. Get all libraries directly shared with user
-	// Note: ALLOW FILTERING used here — shares_by_recipient table exists but this
-	// query path uses the canonical shares table for permission resolution.
-	// Consider migrating to shares_by_recipient for better performance at scale.
-	iter = m.db.Session().Query(`
-		SELECT library_id, permission FROM shares
-		WHERE shared_to = ? AND shared_to_type = 'user'
-		ALLOW FILTERING
-	`, userID).Iter()
-
-	var permission string
-	for iter.Scan(&libIDStr, &permission) {
-		libID, _ := uuid.Parse(libIDStr)
-		// If user is owner, keep owner permission (highest)
-		if existingPerm, exists := librariesMap[libID]; exists {
-			if m.hasRequiredLibraryPermission(LibraryPermission(permission), existingPerm) {
-				librariesMap[libID] = LibraryPermission(permission)
-			}
-		} else {
-			librariesMap[libID] = LibraryPermission(permission)
-		}
-	}
-	if err := iter.Close(); err != nil {
+	// 2. Get all libraries directly shared with user via the recipient read model.
+	if err := m.addRecipientSharedLibraries(librariesMap, orgID, "user", userID); err != nil {
 		return nil, err
 	}
 
@@ -923,27 +929,9 @@ func (m *PermissionMiddleware) GetUserLibraries(orgID, userID string) ([]Library
 		return nil, err
 	}
 
-	// 4. For each group, get libraries shared with that group
+	// 4. For each group, get libraries shared with that group.
 	for _, groupID := range groupIDs {
-		// Note: ALLOW FILTERING used here - acceptable for shares table as it's typically small
-		iter := m.db.Session().Query(`
-			SELECT library_id, permission FROM shares
-			WHERE shared_to = ? AND shared_to_type = 'group'
-			ALLOW FILTERING
-		`, groupID).Iter()
-
-		for iter.Scan(&libIDStr, &permission) {
-			libID, _ := uuid.Parse(libIDStr)
-			// Keep highest permission level
-			if existingPerm, exists := librariesMap[libID]; exists {
-				if m.hasRequiredLibraryPermission(LibraryPermission(permission), existingPerm) {
-					librariesMap[libID] = LibraryPermission(permission)
-				}
-			} else {
-				librariesMap[libID] = LibraryPermission(permission)
-			}
-		}
-		if err := iter.Close(); err != nil {
+		if err := m.addRecipientSharedLibraries(librariesMap, orgID, "group", groupID); err != nil {
 			return nil, err
 		}
 	}

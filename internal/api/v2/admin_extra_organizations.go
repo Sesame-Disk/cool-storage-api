@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	dbpkg "github.com/Sesame-Disk/sesamefs/internal/db"
 	"github.com/Sesame-Disk/sesamefs/internal/middleware"
 	"github.com/Sesame-Disk/sesamefs/internal/traffic"
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
@@ -21,40 +22,30 @@ func (h *AdminHandler) AdminSearchOrganizations(c *gin.Context) {
 
 	query := strings.ToLower(c.Query("query"))
 
-	iter := h.db.Session().Query(`
-		SELECT org_id, name, status, storage_quota, plan, created_at
-		FROM organizations
-	`).Iter()
+	rows, err := dbpkg.ListAdminOrganizationRows(h.db.Session(), "")
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list organizations"})
+		return
+	}
 
 	var orgs []gin.H
-	var orgID, name, status, plan string
-	var storageQuota int64
-	var createdAt time.Time
-
-	for iter.Scan(&orgID, &name, &status, &storageQuota, &plan, &createdAt) {
-		if query != "" && !strings.Contains(strings.ToLower(name), query) {
+	for _, row := range rows {
+		if query != "" && !strings.Contains(strings.ToLower(row.Name), query) {
 			continue
 		}
-		effectiveStatus := status
-		if effectiveStatus == "" {
-			effectiveStatus = StatusActive
-		}
-		usersCount := h.countOrgUsers(orgID)
-		ownerEmail, ownerName := h.resolveOrgCreator(orgID)
 		orgs = append(orgs, gin.H{
-			"org_id":      orgID,
-			"org_name":    name,
-			"owner_email": ownerEmail,
-			"owner_name":  ownerName,
-			"status":      effectiveStatus,
-			"plan":        plan,
-			"quota_usage": traffic.ReadStorageUsed(h.db, fmt.Sprintf("org:%s", orgID)),
-			"quota":       storageQuota,
-			"ctime":       createdAt.Format(time.RFC3339),
-			"users_count": usersCount,
+			"org_id":      row.OrgID,
+			"org_name":    row.Name,
+			"owner_email": row.OwnerEmail,
+			"owner_name":  row.OwnerName,
+			"status":      row.Status,
+			"plan":        row.Plan,
+			"quota_usage": traffic.ReadStorageUsed(h.db, fmt.Sprintf("org:%s", row.OrgID)),
+			"quota":       row.StorageQuota,
+			"ctime":       row.CreatedAt.Format(time.RFC3339),
+			"users_count": row.UsersCount,
 		})
 	}
-	iter.Close()
 
 	if orgs == nil {
 		orgs = []gin.H{}
@@ -252,6 +243,20 @@ func (h *AdminHandler) AdminUpdateOrgUser(c *gin.Context) {
 			batch.Query(`UPDATE users SET role = ? WHERE org_id = ? AND user_id = ?`, "owner", targetOrgID, plan.PromoteUserID)
 			if err := batch.Exec(); err != nil {
 				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to transfer ownership"})
+				return
+			}
+			if plan.DemoteOwnerID != "" {
+				if err := syncAdminUserReadModel(h.db, targetOrgID, plan.DemoteOwnerID); err != nil {
+					c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to sync previous owner read model"})
+					return
+				}
+			}
+			if err := syncAdminUserReadModel(h.db, targetOrgID, plan.PromoteUserID); err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to sync new owner read model"})
+				return
+			}
+			if err := syncAdminOrganizationReadModel(h.db, targetOrgID); err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to sync organization read model"})
 				return
 			}
 			// Demoted owner goes from "owner" to "admin" — invalidate their sessions.

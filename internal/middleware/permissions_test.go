@@ -391,6 +391,32 @@ func TestLibraryWithPermissionStruct(t *testing.T) {
 	}
 }
 
+func TestMergeLibraryPermissionPrefersHigherAccess(t *testing.T) {
+	pm := setupTestDB(t)
+	librariesMap := make(map[uuid.UUID]LibraryPermission)
+	libraryID := uuid.New()
+
+	mergeLibraryPermission(librariesMap, libraryID, PermissionR, pm)
+	mergeLibraryPermission(librariesMap, libraryID, PermissionRW, pm)
+
+	if got := librariesMap[libraryID]; got != PermissionRW {
+		t.Fatalf("merged permission = %s, want %s", got, PermissionRW)
+	}
+}
+
+func TestMergeLibraryPermissionKeepsExistingHigherAccess(t *testing.T) {
+	pm := setupTestDB(t)
+	librariesMap := make(map[uuid.UUID]LibraryPermission)
+	libraryID := uuid.New()
+
+	mergeLibraryPermission(librariesMap, libraryID, PermissionOwner, pm)
+	mergeLibraryPermission(librariesMap, libraryID, PermissionR, pm)
+
+	if got := librariesMap[libraryID]; got != PermissionOwner {
+		t.Fatalf("merged permission = %s, want %s", got, PermissionOwner)
+	}
+}
+
 func TestPlatformOrgID(t *testing.T) {
 	expected := "00000000-0000-0000-0000-000000000000"
 	if PlatformOrgID != expected {

@@ -45,7 +45,21 @@ func createUserWithEmailLookup(db interface{ Session() *gocql.Session }, orgID, 
 		INSERT INTO users_by_email (email, user_id, org_id)
 		VALUES (?, ?, ?)
 	`, email, userID, orgID)
-	return batch.Exec()
+	dbpkg.AddUpsertAdminUserReadModelQuery(batch, dbpkg.AdminUserProjectionRow{
+		OrgID:      orgID,
+		UserID:     userID,
+		Email:      email,
+		Name:       name,
+		Role:       role,
+		Status:     StatusActive,
+		QuotaBytes: quotaBytes,
+		QuotaUsage: usedBytes,
+		CreatedAt:  createdAt,
+	})
+	if err := batch.Exec(); err != nil {
+		return err
+	}
+	return dbpkg.SyncAdminOrganizationReadModel(db.Session(), orgID)
 }
 
 func adminLibraryProjectionDeletedAtEqual(left, right *time.Time) bool {
@@ -255,6 +269,14 @@ func syncAdminGroupReadModel(db interface{ Session() *gocql.Session }, orgID, gr
 	return dbpkg.SyncAdminGroupReadModel(db.Session(), orgID, groupID)
 }
 
+func syncAdminOrganizationReadModel(db interface{ Session() *gocql.Session }, orgID string) error {
+	return dbpkg.SyncAdminOrganizationReadModel(db.Session(), orgID)
+}
+
+func syncAdminUserReadModel(db interface{ Session() *gocql.Session }, orgID, userID string) error {
+	return dbpkg.SyncAdminUserReadModel(db.Session(), orgID, userID)
+}
+
 func readAdminGroupReadModelRow(db interface{ Session() *gocql.Session }, orgID, groupID string) (dbpkg.AdminGroupProjectionRow, error) {
 	return dbpkg.ReadAdminGroupProjectionRow(db.Session(), orgID, groupID)
 }
@@ -380,6 +402,9 @@ func deactivateUser(db interface{ Session() *gocql.Session }, si SessionInvalida
 	`, StatusDeactivated, orgID, userID).Exec(); err != nil {
 		return err
 	}
+	if err := syncAdminUserReadModel(db, orgID, userID); err != nil {
+		return err
+	}
 	go func() {
 		invalidateUserCredentials(si, aki, orgID, userID)
 		setUserShareLinksActive(db, orgID, userID, false)
@@ -396,6 +421,9 @@ func activateUser(db interface{ Session() *gocql.Session }, orgID, userID string
 	`, StatusActive, nil, orgID, userID).Exec(); err != nil {
 		return err
 	}
+	if err := syncAdminUserReadModel(db, orgID, userID); err != nil {
+		return err
+	}
 	go setUserShareLinksActive(db, orgID, userID, true)
 	return nil
 }
@@ -406,6 +434,9 @@ func softDeleteUser(db interface{ Session() *gocql.Session }, si SessionInvalida
 	if err := db.Session().Query(`
 		UPDATE users SET status = ?, deleted_at = ? WHERE org_id = ? AND user_id = ?
 	`, StatusDeleted, deletedAt, orgID, userID).Exec(); err != nil {
+		return err
+	}
+	if err := syncAdminUserReadModel(db, orgID, userID); err != nil {
 		return err
 	}
 	go func() {
@@ -426,6 +457,9 @@ func deactivateOrg(db interface{ Session() *gocql.Session }, si SessionInvalidat
 	if err := batch.Exec(); err != nil {
 		return err
 	}
+	if err := syncAdminOrganizationReadModel(db, orgID); err != nil {
+		return err
+	}
 	go func() {
 		invalidateOrgSessions(db, si, aki, orgID)
 		setOrgShareLinksActive(db, orgID, false)
@@ -443,6 +477,9 @@ func activateOrg(db interface{ Session() *gocql.Session }, orgID string) error {
 	`, StatusActive, nil, orgID)
 	batch.Query(`DELETE FROM deleted_organizations WHERE org_id = ?`, orgID)
 	if err := batch.Exec(); err != nil {
+		return err
+	}
+	if err := syncAdminOrganizationReadModel(db, orgID); err != nil {
 		return err
 	}
 	go setOrgShareLinksActive(db, orgID, true)
@@ -465,6 +502,9 @@ func softDeleteOrg(db interface{ Session() *gocql.Session }, si SessionInvalidat
 		INSERT INTO deleted_organizations (org_id, name, deleted_at) VALUES (?, ?, ?)
 	`, orgID, name, deletedAt)
 	if err := batch.Exec(); err != nil {
+		return err
+	}
+	if err := syncAdminOrganizationReadModel(db, orgID); err != nil {
 		return err
 	}
 	go func() {

@@ -337,6 +337,10 @@ func (h *OrgAdminHandler) UpdateOrgInfo(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update organization"})
 			return
 		}
+		if err := syncAdminOrganizationReadModel(h.db, orgID); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to sync organization read model"})
+			return
+		}
 	}
 
 	c.JSON(http.StatusOK, gin.H{"success": true})
@@ -519,6 +523,20 @@ func (h *OrgAdminHandler) TransferOrgOwnership(c *gin.Context) {
 		"owner", orgID, plan.PromoteUserID)
 	if err := batch.Exec(); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to transfer ownership"})
+		return
+	}
+	if plan.DemoteOwnerID != "" {
+		if err := syncAdminUserReadModel(h.db, orgID, plan.DemoteOwnerID); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to sync previous owner read model"})
+			return
+		}
+	}
+	if err := syncAdminUserReadModel(h.db, orgID, plan.PromoteUserID); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to sync new owner read model"})
+		return
+	}
+	if err := syncAdminOrganizationReadModel(h.db, orgID); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to sync organization read model"})
 		return
 	}
 
