@@ -1,7 +1,8 @@
 -- Migration 001: Initial schema
 -- Canonical baseline for all SesameFS tables.
--- Includes every column that exists in production (including columns that were
--- historically added via ALTER TABLE — they are baked in here for clean installs).
+-- In design mode this file is the single source of truth for the full schema:
+-- all known columns, reverse indexes, and read models required for a clean boot
+-- are baked in here directly instead of being layered through historical ALTERs.
 --
 -- Existing deployments that intentionally reuse this baseline will re-run the
 -- CREATE TABLE / CREATE INDEX statements safely where the schema already exists.
@@ -29,6 +30,14 @@ CREATE TABLE IF NOT EXISTS organizations (
     quota_policy              TEXT,
     current_period_started_at TIMESTAMP,
     current_period_ends_at    TIMESTAMP
+);
+
+-- Mirror of soft-deleted orgs used by GC so the scanner only touches deleted
+-- rows instead of scanning the full organizations table.
+CREATE TABLE IF NOT EXISTS deleted_organizations (
+    org_id     UUID PRIMARY KEY,
+    name       TEXT,
+    deleted_at TIMESTAMP
 );
 
 CREATE TABLE IF NOT EXISTS users (
@@ -112,9 +121,10 @@ CREATE TABLE IF NOT EXISTS libraries_by_id (
 -- 90-day TTL: ensures GC scanner can resolve org_id for orphaned blocks
 -- before the record expires.
 CREATE TABLE IF NOT EXISTS deleted_libraries (
-    library_id UUID PRIMARY KEY,
-    org_id     UUID,
-    deleted_at TIMESTAMP
+    library_id    UUID PRIMARY KEY,
+    org_id        UUID,
+    deleted_at    TIMESTAMP,
+    storage_class TEXT
 ) WITH default_time_to_live = 7776000;
 
 -- Admin/org-admin library read models.
@@ -478,21 +488,69 @@ CREATE TABLE IF NOT EXISTS custom_share_permissions_by_user (
 
 -- token_hash is the SHA-256 of the raw session token (raw tokens are never stored).
 CREATE TABLE IF NOT EXISTS sessions (
-    token_hash TEXT PRIMARY KEY,
-    user_id    UUID,
-    org_id     UUID,
-    email      TEXT,
-    role       TEXT,
-    created_at TIMESTAMP,
-    expires_at TIMESTAMP
+    token_hash          TEXT PRIMARY KEY,
+    user_id             UUID,
+    org_id              UUID,
+    email               TEXT,
+    role                TEXT,
+    created_at          TIMESTAMP,
+    expires_at          TIMESTAMP,
+    source_api_key_hash TEXT,
+    api_key_scope       TEXT
 );
 
 -- Reverse index for bulk invalidation when a user is deactivated or deleted.
 CREATE TABLE IF NOT EXISTS sessions_by_user (
-    org_id     UUID,
-    user_id    UUID,
-    token_hash TEXT,
+    org_id              UUID,
+    user_id             UUID,
+    token_hash          TEXT,
+    source_api_key_hash TEXT,
     PRIMARY KEY ((org_id, user_id), token_hash)
+);
+
+-- Reverse index for org-wide invalidation without scanning every user first.
+CREATE TABLE IF NOT EXISTS sessions_by_org (
+    org_id              UUID,
+    token_hash          TEXT,
+    user_id             UUID,
+    source_api_key_hash TEXT,
+    PRIMARY KEY ((org_id), token_hash)
+);
+
+-- API Keys: unified authentication for user API access, Accounts M2M, and
+-- Seafile legacy client compatibility. Raw tokens are shown once on creation
+-- and only their SHA-256 hashes are persisted.
+CREATE TABLE IF NOT EXISTS api_keys (
+    key_hash     TEXT PRIMARY KEY,
+    key_prefix   TEXT,
+    user_id      UUID,
+    org_id       UUID,
+    label        TEXT,
+    scope        TEXT,
+    created_at   TIMESTAMP,
+    last_used_at TIMESTAMP,
+    expires_at   TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS api_keys_by_user (
+    org_id       UUID,
+    user_id      UUID,
+    key_hash     TEXT,
+    key_prefix   TEXT,
+    label        TEXT,
+    scope        TEXT,
+    created_at   TIMESTAMP,
+    last_used_at TIMESTAMP,
+    expires_at   TIMESTAMP,
+    PRIMARY KEY ((org_id, user_id), created_at)
+) WITH CLUSTERING ORDER BY (created_at DESC);
+
+CREATE TABLE IF NOT EXISTS sessions_by_api_key (
+    api_key_hash TEXT,
+    token_hash   TEXT,
+    org_id       UUID,
+    user_id      UUID,
+    PRIMARY KEY ((api_key_hash), token_hash)
 );
 
 -- Per-library API tokens for programmatic access.
@@ -709,6 +767,13 @@ CREATE TABLE IF NOT EXISTS monitored_repos (
     repo_id      UUID,
     monitored_at TIMESTAMP,
     PRIMARY KEY ((user_id), repo_id)
+);
+
+CREATE TABLE IF NOT EXISTS monitored_repos_by_repo (
+    repo_id       UUID,
+    user_id       UUID,
+    monitored_at  TIMESTAMP,
+    PRIMARY KEY ((repo_id), user_id)
 );
 
 CREATE TABLE IF NOT EXISTS restore_jobs (

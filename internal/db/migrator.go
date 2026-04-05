@@ -36,7 +36,7 @@ var migrationsFS embed.FS
 //
 // All statements in 001_initial_schema.cql use CREATE TABLE IF NOT EXISTS and
 // CREATE INDEX IF NOT EXISTS, making them safe to re-run on any database state.
-// Incremental migrations (002+) use ALTER TABLE or other non-idempotent
+// Any later incremental migrations may use ALTER TABLE or other non-idempotent
 // statements and are only executed once — tracked via schema_migrations.
 type Migrator struct {
 	session *gocql.Session
