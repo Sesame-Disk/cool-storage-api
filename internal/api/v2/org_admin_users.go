@@ -315,6 +315,7 @@ func (h *OrgAdminHandler) UpdateOrgUser(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update user"})
 			return
 		}
+		invalidateSessionsOnDemotion(h.sessions, targetOrgID, userID, originalRole, role)
 	}
 
 	if newUploadQuota != trafficUploadQuota {

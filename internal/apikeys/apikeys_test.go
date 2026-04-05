@@ -50,7 +50,7 @@ func TestConstrainRoleForScope(t *testing.T) {
 		{name: "read write caps owner to user", role: "owner", scope: ScopeReadWrite, want: "user"},
 		{name: "read write keeps readonly readonly", role: "readonly", scope: ScopeReadWrite, want: "readonly"},
 		{name: "admin keeps superadmin", role: "superadmin", scope: ScopeAdmin, want: "superadmin"},
-		{name: "unknown scope leaves role unchanged", role: "user", scope: "unknown", want: "user"},
+		{name: "unknown scope caps to readonly", role: "user", scope: "unknown", want: "readonly"},
 	}
 
 	for _, tt := range tests {

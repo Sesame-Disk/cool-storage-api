@@ -20,7 +20,7 @@ func ConstrainRoleForScope(actualRole, scope string) string {
 	case ScopeAdmin:
 		return actualRole
 	default:
-		return actualRole
+		return minRole(actualRole, "readonly")
 	}
 }
 

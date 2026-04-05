@@ -427,6 +427,8 @@ func (h *AdminHandler) UpdateUserByEmail(c *gin.Context, email string) {
 		return
 	}
 
+	roleBeforeUpdate := currentRole
+
 	if updateReq.Role != nil {
 		newRole := *updateReq.Role
 		validRoles := map[string]bool{"admin": true, "user": true, "readonly": true, "guest": true}
@@ -467,6 +469,8 @@ func (h *AdminHandler) UpdateUserByEmail(c *gin.Context, email string) {
 			}
 		}
 	}
+
+	invalidateSessionsOnDemotion(h.sessions, userOrgID, userID, roleBeforeUpdate, currentRole)
 
 	if updateReq.Name != nil {
 		currentName = *updateReq.Name

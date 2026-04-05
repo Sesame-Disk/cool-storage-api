@@ -953,6 +953,10 @@ func (h *AdminHandler) UpdateUser(c *gin.Context) {
 
 	// Validate role if provided
 	if req.Role != nil {
+		var oldRole string
+		_ = h.db.Session().Query(`SELECT role FROM users WHERE org_id = ? AND user_id = ?`,
+			orgID, targetUserID).Scan(&oldRole)
+
 		validRoles := map[string]bool{"admin": true, "user": true, "readonly": true, "guest": true}
 		// Only superadmin can assign superadmin role
 		if *req.Role == "superadmin" {
@@ -977,6 +981,7 @@ func (h *AdminHandler) UpdateUser(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update user"})
 			return
 		}
+		invalidateSessionsOnDemotion(h.sessions, orgID, targetUserID, oldRole, *req.Role)
 	}
 
 	if req.QuotaBytes != nil {

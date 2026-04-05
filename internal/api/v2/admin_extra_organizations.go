@@ -196,6 +196,8 @@ func (h *AdminHandler) AdminUpdateOrgUser(c *gin.Context) {
 		}
 	}
 
+	roleBeforeUpdate := role
+
 	staffPtr := updateReq.IsOrgStaff
 	if staffPtr == nil {
 		staffPtr = updateReq.IsStaff
@@ -252,6 +254,10 @@ func (h *AdminHandler) AdminUpdateOrgUser(c *gin.Context) {
 				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to transfer ownership"})
 				return
 			}
+			// Demoted owner goes from "owner" to "admin" — invalidate their sessions.
+			if plan.DemoteOwnerID != "" {
+				invalidateSessionsOnDemotion(h.sessions, targetOrgID, plan.DemoteOwnerID, "owner", "admin")
+			}
 		}
 		role = string(middleware.RoleOwner)
 	} else if updateReq.Role != nil {
@@ -265,6 +271,8 @@ func (h *AdminHandler) AdminUpdateOrgUser(c *gin.Context) {
 			}
 		}
 	}
+
+	invalidateSessionsOnDemotion(h.sessions, targetOrgID, userID, roleBeforeUpdate, role)
 
 	originalQuota := quotaBytes
 	if updateReq.QuotaTotal != nil {

@@ -335,9 +335,40 @@ func invalidateUserAPIKeys(aki APIKeyInvalidator, orgID, userID string) {
 
 func invalidateUserCredentials(si SessionInvalidator, aki APIKeyInvalidator, orgID, userID string) {
 	if si != nil {
-		si.InvalidateUserSessions(orgID, userID) //nolint:errcheck
+		if err := si.InvalidateUserSessions(orgID, userID); err != nil {
+			log.Printf("[write_helpers] failed to invalidate sessions for user %s in org %s: %v", userID, orgID, err)
+		}
 	}
 	invalidateUserAPIKeys(aki, orgID, userID)
+}
+
+// orgRoleRanks maps role names to their hierarchy rank for demotion detection.
+var orgRoleRanks = map[string]int{
+	"superadmin": 5,
+	"owner":      4,
+	"admin":      3,
+	"user":       2,
+	"readonly":   1,
+	"guest":      0,
+}
+
+// isRoleDemotion returns true if newRole is strictly lower than oldRole in the hierarchy.
+func isRoleDemotion(oldRole, newRole string) bool {
+	return orgRoleRanks[newRole] < orgRoleRanks[oldRole]
+}
+
+// invalidateSessionsOnDemotion kills all user sessions when their role is lowered.
+// This prevents stale sessions from retaining elevated privileges after a demotion.
+func invalidateSessionsOnDemotion(si SessionInvalidator, orgID, userID, oldRole, newRole string) {
+	if si == nil || !isRoleDemotion(oldRole, newRole) {
+		return
+	}
+	go func() {
+		if err := si.InvalidateUserSessions(orgID, userID); err != nil {
+			log.Printf("[write_helpers] failed to invalidate sessions on demotion for user %s (org %s, %s→%s): %v",
+				userID, orgID, oldRole, newRole, err)
+		}
+	}()
 }
 
 // deactivateUser marks a user as deactivated and, in a background goroutine,

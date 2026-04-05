@@ -522,6 +522,11 @@ func (h *OrgAdminHandler) TransferOrgOwnership(c *gin.Context) {
 		return
 	}
 
+	// Demoted owner goes from "owner" to "admin" — invalidate their sessions.
+	if plan.DemoteOwnerID != "" {
+		invalidateSessionsOnDemotion(h.sessions, orgID, plan.DemoteOwnerID, "owner", "admin")
+	}
+
 	c.JSON(http.StatusOK, gin.H{
 		"success":   true,
 		"new_owner": req.NewOwner,
