@@ -13,7 +13,13 @@ type fakeQuotaDB struct{}
 func (fakeQuotaDB) Session() *gocql.Session { return nil }
 
 type fakeSessionInvalidator struct {
-	called [][2]string
+	orgCalls []string
+	called   [][2]string
+}
+
+func (f *fakeSessionInvalidator) InvalidateOrgSessions(orgID string) error {
+	f.orgCalls = append(f.orgCalls, orgID)
+	return nil
 }
 
 func (f *fakeSessionInvalidator) InvalidateUserSessions(orgID, userID string) error {
@@ -234,4 +240,14 @@ func TestInvalidateUserCredentials_SkipsAPIKeyInvalidationForInvalidUUIDs(t *tes
 
 	assert.Equal(t, [][2]string{{"not-a-uuid", "also-not-a-uuid"}}, sessions.called)
 	assert.Empty(t, apiKeys.called)
+}
+
+func TestInvalidateOrgSessions_UsesOrgWideSessionInvalidator(t *testing.T) {
+	orgID := gocql.TimeUUID().String()
+	sessions := &fakeSessionInvalidator{}
+
+	invalidateOrgSessions(fakeQuotaDB{}, sessions, nil, orgID)
+
+	assert.Equal(t, []string{orgID}, sessions.orgCalls)
+	assert.Empty(t, sessions.called)
 }

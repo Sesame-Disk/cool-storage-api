@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/Sesame-Disk/sesamefs/internal/db"
+	gocql "github.com/apache/cassandra-gocql-driver/v2"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 )
@@ -75,10 +76,16 @@ func (h *MonitoredRepoHandler) MonitorRepo(c *gin.Context) {
 
 	// Insert monitored repo
 	now := time.Now()
-	err = h.db.Session().Query(`
+	batch := h.db.Session().Batch(gocql.LoggedBatch)
+	batch.Query(`
 		INSERT INTO monitored_repos (user_id, repo_id, monitored_at)
 		VALUES (?, ?, ?)
-	`, userID, req.RepoID, now).Exec()
+	`, userID, req.RepoID, now)
+	batch.Query(`
+		INSERT INTO monitored_repos_by_repo (repo_id, user_id, monitored_at)
+		VALUES (?, ?, ?)
+	`, req.RepoID, userID, now)
+	err = batch.Exec()
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to monitor repo"})
 		return
@@ -120,9 +127,10 @@ func (h *MonitoredRepoHandler) UnmonitorRepo(c *gin.Context) {
 		return
 	}
 
-	err := h.db.Session().Query(`
-		DELETE FROM monitored_repos WHERE user_id = ? AND repo_id = ?
-	`, userID, repoID).Exec()
+	batch := h.db.Session().Batch(gocql.LoggedBatch)
+	batch.Query(`DELETE FROM monitored_repos WHERE user_id = ? AND repo_id = ?`, userID, repoID)
+	batch.Query(`DELETE FROM monitored_repos_by_repo WHERE repo_id = ? AND user_id = ?`, repoID, userID)
+	err := batch.Exec()
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to unmonitor repo"})
 		return

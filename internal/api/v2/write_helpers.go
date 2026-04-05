@@ -307,6 +307,7 @@ func renameGroup(db interface{ Session() *gocql.Session }, orgID, groupID, newNa
 // Implemented by auth.SessionManager; used by admin handlers to kill sessions
 // when a user is deactivated or deleted.
 type SessionInvalidator interface {
+	InvalidateOrgSessions(orgID string) error
 	InvalidateUserSessions(orgID, userID string) error
 	InvalidateAPIKeySessions(apiKeyHash string) error
 }
@@ -417,9 +418,12 @@ func softDeleteUser(db interface{ Session() *gocql.Session }, si SessionInvalida
 // deactivateOrg marks an org as deactivated and, in a background goroutine,
 // kills all sessions for every user in the org and disables all org share links.
 func deactivateOrg(db interface{ Session() *gocql.Session }, si SessionInvalidator, aki APIKeyInvalidator, orgID string) error {
-	if err := db.Session().Query(`
-		UPDATE organizations SET status = ? WHERE org_id = ?
-	`, StatusDeactivated, orgID).Exec(); err != nil {
+	batch := db.Session().Batch(gocql.LoggedBatch)
+	batch.Query(`
+		UPDATE organizations SET status = ?, deleted_at = ? WHERE org_id = ?
+	`, StatusDeactivated, nil, orgID)
+	batch.Query(`DELETE FROM deleted_organizations WHERE org_id = ?`, orgID)
+	if err := batch.Exec(); err != nil {
 		return err
 	}
 	go func() {
@@ -433,9 +437,12 @@ func deactivateOrg(db interface{ Session() *gocql.Session }, si SessionInvalidat
 // goroutine re-enables all org share links. Works for both reactivation
 // (deactivated → active) and restore (deleted → active).
 func activateOrg(db interface{ Session() *gocql.Session }, orgID string) error {
-	if err := db.Session().Query(`
+	batch := db.Session().Batch(gocql.LoggedBatch)
+	batch.Query(`
 		UPDATE organizations SET status = ?, deleted_at = ? WHERE org_id = ?
-	`, StatusActive, nil, orgID).Exec(); err != nil {
+	`, StatusActive, nil, orgID)
+	batch.Query(`DELETE FROM deleted_organizations WHERE org_id = ?`, orgID)
+	if err := batch.Exec(); err != nil {
 		return err
 	}
 	go setOrgShareLinksActive(db, orgID, true)
@@ -445,9 +452,19 @@ func activateOrg(db interface{ Session() *gocql.Session }, orgID string) error {
 // softDeleteOrg marks an org as deleted and, in a background goroutine,
 // kills all sessions for every user in the org and disables all org share links.
 func softDeleteOrg(db interface{ Session() *gocql.Session }, si SessionInvalidator, aki APIKeyInvalidator, orgID string, deletedAt time.Time) error {
-	if err := db.Session().Query(`
+	var name string
+	_ = db.Session().Query(`
+		SELECT name FROM organizations WHERE org_id = ?
+	`, orgID).Scan(&name)
+
+	batch := db.Session().Batch(gocql.LoggedBatch)
+	batch.Query(`
 		UPDATE organizations SET status = ?, deleted_at = ? WHERE org_id = ?
-	`, StatusDeleted, deletedAt, orgID).Exec(); err != nil {
+	`, StatusDeleted, deletedAt, orgID)
+	batch.Query(`
+		INSERT INTO deleted_organizations (org_id, name, deleted_at) VALUES (?, ?, ?)
+	`, orgID, name, deletedAt)
+	if err := batch.Exec(); err != nil {
 		return err
 	}
 	go func() {
@@ -463,12 +480,18 @@ func invalidateOrgSessions(dbSess interface{ Session() *gocql.Session }, si Sess
 	if si == nil && aki == nil {
 		return
 	}
+	if si != nil {
+		if err := si.InvalidateOrgSessions(orgID); err != nil {
+			log.Printf("[write_helpers] failed to invalidate org sessions for org %q: %v", orgID, err)
+		}
+	}
+	if aki == nil {
+		return
+	}
+
 	iter := dbSess.Session().Query(`SELECT user_id FROM users WHERE org_id = ?`, orgID).Iter()
 	var uid string
 	for iter.Scan(&uid) {
-		if si != nil {
-			si.InvalidateUserSessions(orgID, uid) //nolint:errcheck
-		}
 		invalidateUserAPIKeys(aki, orgID, uid)
 	}
 	if err := iter.Close(); err != nil {
@@ -678,7 +701,8 @@ func addDeleteAdminLibraryReadModelQueries(db interface{ Session() *gocql.Sessio
 
 // ── Library soft-delete / restore with storage accounting ─────────────────────
 
-// softDeleteLibrary marks a library as deleted and adjusts storage counters.
+// softDeleteLibrary marks a library as deleted, persists a GC marker, and
+// adjusts storage counters.
 // This is the canonical soft-delete path — all callers (user, admin, GC) must
 // route through equivalent logic to keep storage accounting consistent.
 //
@@ -700,6 +724,11 @@ func softDeleteLibrary(db interface{ Session() *gocql.Session }, orgID, ownerID,
 		WHERE org_id = ? AND library_id = ?`,
 		now, deletedBy, now, orgID, libraryID,
 	)
+	batch.Query(`
+		INSERT INTO deleted_libraries (library_id, org_id, deleted_at, storage_class)
+		VALUES (?, ?, ?, ?)`,
+		libraryID, orgID, now, previousRow.StorageClass,
+	)
 	addAdminLibraryReadModelRefreshQueries(batch, nextRow, &previousRow)
 	if err := batch.Exec(); err != nil {
 		return fmt.Errorf("soft-delete library: %w", err)
@@ -710,8 +739,8 @@ func softDeleteLibrary(db interface{ Session() *gocql.Session }, orgID, ownerID,
 	return nil
 }
 
-// restoreDeletedLibrary clears deleted_at and re-adds the library's storage to
-// aggregate counters. Mirror image of softDeleteLibrary.
+// restoreDeletedLibrary clears deleted_at, removes the GC marker, and re-adds
+// the library's storage to aggregate counters. Mirror image of softDeleteLibrary.
 func restoreDeletedLibrary(db interface{ Session() *gocql.Session }, orgID, ownerID, libraryID string) error {
 	now := time.Now()
 	previousRow, err := dbpkg.ReadAdminLibraryProjectionRow(db.Session(), orgID, libraryID)
@@ -732,6 +761,7 @@ func restoreDeletedLibrary(db interface{ Session() *gocql.Session }, orgID, owne
 		WHERE org_id = ? AND library_id = ?`,
 		orgID, libraryID,
 	)
+	batch.Query(`DELETE FROM deleted_libraries WHERE library_id = ?`, libraryID)
 	addAdminLibraryReadModelRefreshQueries(batch, nextRow, &previousRow)
 	if err := batch.Exec(); err != nil {
 		return fmt.Errorf("restore library: %w", err)

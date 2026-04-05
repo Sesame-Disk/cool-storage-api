@@ -617,13 +617,17 @@ func (h *AdminHandler) DeactivateOrganization(c *gin.Context) {
 		return
 	}
 
-	// Verify org exists
-	var name string
+	// Verify org exists and is not already soft-deleted.
+	var name, status string
 	err := h.db.Session().Query(`
-		SELECT name FROM organizations WHERE org_id = ?
-	`, orgID).Scan(&name)
+		SELECT name, status FROM organizations WHERE org_id = ?
+	`, orgID).Scan(&name, &status)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "organization not found"})
+		return
+	}
+	if status == StatusDeleted {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "organization is deleted; use restore instead"})
 		return
 	}
 

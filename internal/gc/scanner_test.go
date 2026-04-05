@@ -879,6 +879,39 @@ func TestScanner_ScanExpiredDeletedLibraries_EnqueuesExpired(t *testing.T) {
 	}
 }
 
+func TestScanner_ScanExpiredDeletedLibraries_UsesDeletedMarkerStorageClassWithoutLiveLibrary(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	s := NewScanner(store, q, stats, config.GCConfig{TrashRetentionDays: 30})
+
+	orgID := uuid.New()
+	store.AddOrganization(orgID)
+
+	expiredLib := uuid.New()
+	store.AddDeletedLibrary(orgID, expiredLib, "archive", time.Now().AddDate(0, 0, -45))
+
+	store.mu.Lock()
+	delete(store.libraries, expiredLib)
+	store.mu.Unlock()
+
+	n, err := s.scanExpiredDeletedLibraries(context.Background())
+	if err != nil {
+		t.Fatalf("scanExpiredDeletedLibraries failed: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("expected 1 expired library enqueued, got %d", n)
+	}
+
+	items := store.QueueItems(orgID)
+	if len(items) != 1 {
+		t.Fatalf("expected 1 queued item, got %d", len(items))
+	}
+	if items[0].StorageClass != "archive" {
+		t.Fatalf("expected queue item storage class archive, got %q", items[0].StorageClass)
+	}
+}
+
 func TestScanner_ScanExpiredDeletedLibraries_NoneExpired(t *testing.T) {
 	store := NewMockStore()
 	stats := &Stats{}

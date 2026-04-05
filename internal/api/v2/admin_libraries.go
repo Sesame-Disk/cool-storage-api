@@ -1225,7 +1225,7 @@ func (h *AdminHandler) AdminCleanTrashLibraries(c *gin.Context) {
 			batch.Query(`DELETE FROM libraries_by_id WHERE library_id = ?`, lib.libID)
 
 			// Preserve the org lookup for the Garbage Collector
-			batch.Query(`INSERT INTO deleted_libraries (library_id, org_id, deleted_at) VALUES (?, ?, ?)`, lib.libID, orgID, time.Now())
+			batch.Query(`INSERT INTO deleted_libraries (library_id, org_id, deleted_at, storage_class) VALUES (?, ?, ?, ?)`, lib.libID, orgID, time.Now(), lib.storageClass)
 
 			if err := batch.Exec(); err != nil {
 				log.Printf("[AdminCleanTrashLibraries] failed to delete library %s (org %s): %v", lib.libID, orgID, err)

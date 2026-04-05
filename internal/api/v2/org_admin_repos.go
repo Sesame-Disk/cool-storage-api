@@ -393,14 +393,14 @@ func (h *OrgAdminHandler) CleanOrgTrashLibraries(c *gin.Context) {
 	}
 
 	iter := h.db.Session().Query(`
-		SELECT library_id, deleted_at FROM libraries WHERE org_id = ?
+		SELECT library_id, storage_class, deleted_at FROM libraries WHERE org_id = ?
 	`, targetOrgID).Iter()
 
-	var libID string
+	var libID, storageClass string
 	var deletedAt time.Time
 	cleaned := 0
 
-	for iter.Scan(&libID, &deletedAt) {
+	for iter.Scan(&libID, &storageClass, &deletedAt) {
 		if deletedAt.IsZero() {
 			continue
 		}
@@ -418,7 +418,7 @@ func (h *OrgAdminHandler) CleanOrgTrashLibraries(c *gin.Context) {
 		}
 		batch.Query(`DELETE FROM libraries WHERE org_id = ? AND library_id = ?`, targetOrgID, libID)
 		batch.Query(`DELETE FROM libraries_by_id WHERE library_id = ?`, libID)
-		batch.Query(`INSERT INTO deleted_libraries (library_id, org_id, deleted_at) VALUES (?, ?, ?)`, libID, targetOrgID, time.Now())
+		batch.Query(`INSERT INTO deleted_libraries (library_id, org_id, deleted_at, storage_class) VALUES (?, ?, ?, ?)`, libID, targetOrgID, time.Now(), storageClass)
 		if err := batch.Exec(); err != nil {
 			iter.Close()
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete library"})
@@ -447,9 +447,10 @@ func (h *OrgAdminHandler) DeleteOrgTrashLibrary(c *gin.Context) {
 
 	// Verify it's actually trashed
 	var deletedAt time.Time
+	var storageClass string
 	if err := h.db.Session().Query(`
-		SELECT deleted_at FROM libraries WHERE org_id = ? AND library_id = ?
-	`, targetOrgID, repoID).Scan(&deletedAt); err != nil {
+		SELECT deleted_at, storage_class FROM libraries WHERE org_id = ? AND library_id = ?
+	`, targetOrgID, repoID).Scan(&deletedAt, &storageClass); err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "library not found"})
 		return
 	}
@@ -471,7 +472,7 @@ func (h *OrgAdminHandler) DeleteOrgTrashLibrary(c *gin.Context) {
 	}
 	batch.Query(`DELETE FROM libraries WHERE org_id = ? AND library_id = ?`, targetOrgID, repoID)
 	batch.Query(`DELETE FROM libraries_by_id WHERE library_id = ?`, repoID)
-	batch.Query(`INSERT INTO deleted_libraries (library_id, org_id, deleted_at) VALUES (?, ?, ?)`, repoID, targetOrgID, time.Now())
+	batch.Query(`INSERT INTO deleted_libraries (library_id, org_id, deleted_at, storage_class) VALUES (?, ?, ?, ?)`, repoID, targetOrgID, time.Now(), storageClass)
 	if err := batch.Exec(); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete library"})
 		return

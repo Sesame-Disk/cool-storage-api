@@ -340,10 +340,15 @@ func (sm *SessionManager) storeSession(session *Session) error {
 		session.CreatedAt, session.ExpiresAt, session.SourceAPIKeyHash, session.APIKeyScope,
 		ttlSeconds)
 	batch.Query(`
-		INSERT INTO sessions_by_user (org_id, user_id, token_hash)
-		VALUES (?, ?, ?)
+		INSERT INTO sessions_by_user (org_id, user_id, token_hash, source_api_key_hash)
+		VALUES (?, ?, ?, ?)
 		USING TTL ?
-	`, session.OrgID, session.UserID, tokenHash, ttlSeconds)
+	`, session.OrgID, session.UserID, tokenHash, session.SourceAPIKeyHash, ttlSeconds)
+	batch.Query(`
+		INSERT INTO sessions_by_org (org_id, token_hash, user_id, source_api_key_hash)
+		VALUES (?, ?, ?, ?)
+		USING TTL ?
+	`, session.OrgID, tokenHash, session.UserID, session.SourceAPIKeyHash, ttlSeconds)
 	if session.SourceAPIKeyHash != "" {
 		batch.Query(`
 			INSERT INTO sessions_by_api_key (api_key_hash, token_hash, org_id, user_id)
@@ -398,16 +403,23 @@ func (sm *SessionManager) deleteSession(token string) error {
 	if err := sm.db.Session().Query(
 		`SELECT org_id, user_id, source_api_key_hash FROM sessions WHERE token_hash = ?`, tokenHash,
 	).Scan(&orgID, &userID, &sourceAPIKeyHash); err == nil && orgID != "" {
-		sm.db.Session().Query(
+		batch := sm.db.Session().Batch(gocql.UnloggedBatch)
+		batch.Query(
 			`DELETE FROM sessions_by_user WHERE org_id = ? AND user_id = ? AND token_hash = ?`,
 			orgID, userID, tokenHash,
-		).Exec() //nolint:errcheck
+		)
+		batch.Query(
+			`DELETE FROM sessions_by_org WHERE org_id = ? AND token_hash = ?`,
+			orgID, tokenHash,
+		)
 		if sourceAPIKeyHash != "" {
-			sm.db.Session().Query(
+			batch.Query(
 				`DELETE FROM sessions_by_api_key WHERE api_key_hash = ? AND token_hash = ?`,
 				sourceAPIKeyHash, tokenHash,
-			).Exec() //nolint:errcheck
+			)
 		}
+		batch.Query(`DELETE FROM sessions WHERE token_hash = ?`, tokenHash)
+		return batch.Exec()
 	}
 
 	return sm.db.Session().Query(`
@@ -425,41 +437,43 @@ func (sm *SessionManager) InvalidateUserSessions(orgID, userID string) error {
 
 	// 1. Read all token_hashes from the reverse-index table
 	iter := sm.db.Session().Query(
-		`SELECT token_hash FROM sessions_by_user WHERE org_id = ? AND user_id = ?`,
+		`SELECT token_hash, source_api_key_hash FROM sessions_by_user WHERE org_id = ? AND user_id = ?`,
 		orgID, userID,
 	).Iter()
 
-	var hashes []string
-	var h string
-	for iter.Scan(&h) {
-		hashes = append(hashes, h)
+	type sessionRef struct {
+		tokenHash        string
+		sourceAPIKeyHash string
+	}
+	var refs []sessionRef
+	var ref sessionRef
+	for iter.Scan(&ref.tokenHash, &ref.sourceAPIKeyHash) {
+		refs = append(refs, ref)
 	}
 	if err := iter.Close(); err != nil {
 		return fmt.Errorf("read sessions_by_user: %w", err)
 	}
 
-	if len(hashes) == 0 {
+	if len(refs) == 0 {
 		return nil
 	}
 
 	// 2. Batch-delete from both tables (chunks of 25)
-	for i := 0; i < len(hashes); i += 25 {
+	for i := 0; i < len(refs); i += 25 {
 		end := i + 25
-		if end > len(hashes) {
-			end = len(hashes)
+		if end > len(refs) {
+			end = len(refs)
 		}
 		batch := sm.db.Session().Batch(gocql.UnloggedBatch) // deletes are idempotent, no log needed
-		for _, th := range hashes[i:end] {
-			var sourceAPIKeyHash string
-			_ = sm.db.Session().Query(
-				`SELECT source_api_key_hash FROM sessions WHERE token_hash = ?`, th,
-			).Scan(&sourceAPIKeyHash)
-			batch.Query(`DELETE FROM sessions WHERE token_hash = ?`, th)
+		for _, item := range refs[i:end] {
+			batch.Query(`DELETE FROM sessions WHERE token_hash = ?`, item.tokenHash)
 			batch.Query(`DELETE FROM sessions_by_user WHERE org_id = ? AND user_id = ? AND token_hash = ?`,
-				orgID, userID, th)
-			if sourceAPIKeyHash != "" {
+				orgID, userID, item.tokenHash)
+			batch.Query(`DELETE FROM sessions_by_org WHERE org_id = ? AND token_hash = ?`,
+				orgID, item.tokenHash)
+			if item.sourceAPIKeyHash != "" {
 				batch.Query(`DELETE FROM sessions_by_api_key WHERE api_key_hash = ? AND token_hash = ?`,
-					sourceAPIKeyHash, th)
+					item.sourceAPIKeyHash, item.tokenHash)
 			}
 		}
 		if err := batch.Exec(); err != nil {
@@ -518,6 +532,8 @@ func (sm *SessionManager) InvalidateAPIKeySessions(apiKeyHash string) error {
 			batch.Query(`DELETE FROM sessions WHERE token_hash = ?`, item.tokenHash)
 			batch.Query(`DELETE FROM sessions_by_user WHERE org_id = ? AND user_id = ? AND token_hash = ?`,
 				item.orgID, item.userID, item.tokenHash)
+			batch.Query(`DELETE FROM sessions_by_org WHERE org_id = ? AND token_hash = ?`,
+				item.orgID, item.tokenHash)
 			batch.Query(`DELETE FROM sessions_by_api_key WHERE api_key_hash = ? AND token_hash = ?`,
 				apiKeyHash, item.tokenHash)
 		}
@@ -529,6 +545,64 @@ func (sm *SessionManager) InvalidateAPIKeySessions(apiKeyHash string) error {
 	sm.cacheMu.Lock()
 	for token, sess := range sm.cache {
 		if sess.SourceAPIKeyHash == apiKeyHash {
+			delete(sm.cache, token)
+		}
+	}
+	sm.cacheMu.Unlock()
+
+	return nil
+}
+
+// InvalidateOrgSessions invalidates all active sessions for an organization.
+func (sm *SessionManager) InvalidateOrgSessions(orgID string) error {
+	if sm.db == nil || orgID == "" {
+		return nil
+	}
+
+	iter := sm.db.Session().Query(
+		`SELECT token_hash, user_id, source_api_key_hash FROM sessions_by_org WHERE org_id = ?`,
+		orgID,
+	).Iter()
+
+	type orgSessionRef struct {
+		tokenHash        string
+		userID           string
+		sourceAPIKeyHash string
+	}
+	var refs []orgSessionRef
+	var ref orgSessionRef
+	for iter.Scan(&ref.tokenHash, &ref.userID, &ref.sourceAPIKeyHash) {
+		refs = append(refs, ref)
+	}
+	if err := iter.Close(); err != nil {
+		return fmt.Errorf("read sessions_by_org: %w", err)
+	}
+
+	for i := 0; i < len(refs); i += 25 {
+		end := i + 25
+		if end > len(refs) {
+			end = len(refs)
+		}
+		batch := sm.db.Session().Batch(gocql.UnloggedBatch)
+		for _, item := range refs[i:end] {
+			batch.Query(`DELETE FROM sessions WHERE token_hash = ?`, item.tokenHash)
+			batch.Query(`DELETE FROM sessions_by_org WHERE org_id = ? AND token_hash = ?`,
+				orgID, item.tokenHash)
+			batch.Query(`DELETE FROM sessions_by_user WHERE org_id = ? AND user_id = ? AND token_hash = ?`,
+				orgID, item.userID, item.tokenHash)
+			if item.sourceAPIKeyHash != "" {
+				batch.Query(`DELETE FROM sessions_by_api_key WHERE api_key_hash = ? AND token_hash = ?`,
+					item.sourceAPIKeyHash, item.tokenHash)
+			}
+		}
+		if err := batch.Exec(); err != nil {
+			return fmt.Errorf("invalidate org sessions batch: %w", err)
+		}
+	}
+
+	sm.cacheMu.Lock()
+	for token, sess := range sm.cache {
+		if sess.OrgID == orgID {
 			delete(sm.cache, token)
 		}
 	}

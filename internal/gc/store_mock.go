@@ -169,9 +169,10 @@ type mockUser struct {
 }
 
 type mockDeletedLibrary struct {
-	OrgID     uuid.UUID
-	LibraryID uuid.UUID
-	DeletedAt time.Time
+	OrgID        uuid.UUID
+	LibraryID    uuid.UUID
+	StorageClass string
+	DeletedAt    time.Time
 }
 
 type mockShareByUser struct {
@@ -440,7 +441,7 @@ func (m *MockStore) AddDeletedLibrary(orgID, libraryID uuid.UUID, storageClass s
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.libraries[libraryID] = &mockLibrary{OrgID: orgID, LibraryID: libraryID, StorageClass: storageClass}
-	m.deletedLibraries[libraryID] = &mockDeletedLibrary{OrgID: orgID, LibraryID: libraryID, DeletedAt: deletedAt}
+	m.deletedLibraries[libraryID] = &mockDeletedLibrary{OrgID: orgID, LibraryID: libraryID, StorageClass: storageClass, DeletedAt: deletedAt}
 }
 
 // AddShareByUser adds a share_by_user entry (for cascade tests).
@@ -1268,14 +1269,10 @@ func (m *MockStore) ListExpiredDeletedLibraries(retentionDays int) ([]DeletedLib
 	var result []DeletedLibraryInfo
 	for _, dl := range m.deletedLibraries {
 		if dl.DeletedAt.Before(cutoff) {
-			sc := ""
-			if lib, ok := m.libraries[dl.LibraryID]; ok {
-				sc = lib.StorageClass
-			}
 			result = append(result, DeletedLibraryInfo{
 				OrgID:        dl.OrgID,
 				LibraryID:    dl.LibraryID,
-				StorageClass: sc,
+				StorageClass: dl.StorageClass,
 				DeletedAt:    dl.DeletedAt,
 			})
 		}

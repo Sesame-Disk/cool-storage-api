@@ -941,10 +941,8 @@ func (s *CassandraStore) DeleteStarredFilesByLibrary(libraryID uuid.UUID) error 
 }
 
 func (s *CassandraStore) DeleteMonitoredReposByLibrary(libraryID uuid.UUID) error {
-	// monitored_repos is partitioned by user_id — need to scan or use secondary index
-	// We'll do a full scan filtered by repo_id (acceptable in GC context)
 	iter := s.db.Session().Query(`
-		SELECT user_id FROM monitored_repos WHERE repo_id = ? ALLOW FILTERING
+		SELECT user_id FROM monitored_repos_by_repo WHERE repo_id = ?
 	`, libraryID.String()).Iter()
 
 	var userIDs []string
@@ -963,6 +961,8 @@ func (s *CassandraStore) DeleteMonitoredReposByLibrary(libraryID uuid.UUID) erro
 		for _, uid := range userIDs[i:end] {
 			batch.Query(`DELETE FROM monitored_repos WHERE user_id = ? AND repo_id = ?`,
 				uid, libraryID.String())
+			batch.Query(`DELETE FROM monitored_repos_by_repo WHERE repo_id = ? AND user_id = ?`,
+				libraryID.String(), uid)
 		}
 		if err := batch.Exec(); err != nil {
 			log.Printf("[GC Store] Warning: failed to batch delete monitored repos for library %s: %v", libraryID, err)
@@ -1207,11 +1207,11 @@ func (s *CassandraStore) ListLibrariesByOwner(orgID, ownerID uuid.UUID) ([]uuid.
 
 func (s *CassandraStore) SoftDeleteLibrary(orgID, libraryID, deletedBy uuid.UUID) error {
 	// Look up the library owner for storage counter adjustment.
-	var ownerID string
+	var ownerID, storageClass string
 	_ = s.db.Session().Query(
-		`SELECT owner_id FROM libraries WHERE org_id = ? AND library_id = ?`,
+		`SELECT owner_id, storage_class FROM libraries WHERE org_id = ? AND library_id = ?`,
 		orgID.String(), libraryID.String(),
-	).Scan(&ownerID)
+	).Scan(&ownerID, &storageClass)
 
 	now := time.Now()
 	batch := s.db.Session().Batch(gocql.LoggedBatch)
@@ -1219,8 +1219,8 @@ func (s *CassandraStore) SoftDeleteLibrary(orgID, libraryID, deletedBy uuid.UUID
 		UPDATE libraries SET deleted_at = ?, deleted_by = ? WHERE org_id = ? AND library_id = ?
 	`, now, deletedBy.String(), orgID.String(), libraryID.String())
 	batch.Query(`
-		INSERT INTO deleted_libraries (library_id, org_id, deleted_at) VALUES (?, ?, ?)
-	`, libraryID.String(), orgID.String(), now)
+		INSERT INTO deleted_libraries (library_id, org_id, deleted_at, storage_class) VALUES (?, ?, ?, ?)
+	`, libraryID.String(), orgID.String(), now, storageClass)
 	if err := batch.Exec(); err != nil {
 		return err
 	}
@@ -1286,9 +1286,37 @@ func (s *CassandraStore) DeleteStarredFilesByUser(userID uuid.UUID) error {
 }
 
 func (s *CassandraStore) DeleteMonitoredReposByUser(userID uuid.UUID) error {
-	return s.db.Session().Query(`
-		DELETE FROM monitored_repos WHERE user_id = ?
-	`, userID.String()).Exec()
+	iter := s.db.Session().Query(`
+		SELECT repo_id FROM monitored_repos WHERE user_id = ?
+	`, userID.String()).Iter()
+
+	var repoIDs []string
+	var repoID string
+	for iter.Scan(&repoID) {
+		repoIDs = append(repoIDs, repoID)
+	}
+	if err := iter.Close(); err != nil {
+		return err
+	}
+	if len(repoIDs) == 0 {
+		return nil
+	}
+
+	for i := 0; i < len(repoIDs); i += maxBatchSize {
+		end := i + maxBatchSize
+		if end > len(repoIDs) {
+			end = len(repoIDs)
+		}
+		batch := s.db.Session().Batch(gocql.UnloggedBatch)
+		for _, rid := range repoIDs[i:end] {
+			batch.Query(`DELETE FROM monitored_repos WHERE user_id = ? AND repo_id = ?`, userID.String(), rid)
+			batch.Query(`DELETE FROM monitored_repos_by_repo WHERE repo_id = ? AND user_id = ?`, rid, userID.String())
+		}
+		if err := batch.Exec(); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *CassandraStore) DeleteAPIKeysByUser(orgID, userID uuid.UUID) error {
@@ -1359,18 +1387,20 @@ func (s *CassandraStore) GetUserEmail(orgID, userID uuid.UUID) (string, error) {
 
 func (s *CassandraStore) ListExpiredDeletedLibraries(retentionDays int) ([]DeletedLibraryInfo, error) {
 	iter := s.db.Session().Query(`
-		SELECT library_id, org_id, deleted_at FROM deleted_libraries
+		SELECT library_id, org_id, deleted_at, storage_class FROM deleted_libraries
 	`).Iter()
 
 	cutoff := time.Now().AddDate(0, 0, -retentionDays)
-	var libIDStr, orgIDStr string
+	var libIDStr, orgIDStr, storageClass string
 	var deletedAt time.Time
 	var result []DeletedLibraryInfo
-	for iter.Scan(&libIDStr, &orgIDStr, &deletedAt) {
+	for iter.Scan(&libIDStr, &orgIDStr, &deletedAt, &storageClass) {
 		if deletedAt.Before(cutoff) {
 			orgID := parseUUID(orgIDStr)
 			libID := parseUUID(libIDStr)
-			storageClass, _ := s.GetLibraryStorageClass(orgID, libID)
+			if storageClass == "" {
+				storageClass, _ = s.GetLibraryStorageClass(orgID, libID)
+			}
 			result = append(result, DeletedLibraryInfo{
 				OrgID:        orgID,
 				LibraryID:    libID,
@@ -1398,22 +1428,19 @@ func (s *CassandraStore) HardDeleteLibrary(orgID, libraryID uuid.UUID) error {
 
 func (s *CassandraStore) ListExpiredDeletedOrgs(graceDays int) ([]DeletedOrgInfo, error) {
 	iter := s.db.Session().Query(`
-		SELECT org_id, name, status, deleted_at FROM organizations
+		SELECT org_id, name, deleted_at FROM deleted_organizations
 	`).Iter()
 
 	cutoff := time.Now().AddDate(0, 0, -graceDays)
-	var orgIDStr, name, status string
-	var deletedAt *time.Time
+	var orgIDStr, name string
+	var deletedAt time.Time
 	var result []DeletedOrgInfo
-	for iter.Scan(&orgIDStr, &name, &status, &deletedAt) {
-		if status != "deleted" || deletedAt == nil || deletedAt.IsZero() {
-			continue
-		}
-		if deletedAt.Before(cutoff) {
+	for iter.Scan(&orgIDStr, &name, &deletedAt) {
+		if !deletedAt.IsZero() && deletedAt.Before(cutoff) {
 			result = append(result, DeletedOrgInfo{
 				OrgID:     parseUUID(orgIDStr),
 				Name:      name,
-				DeletedAt: *deletedAt,
+				DeletedAt: deletedAt,
 			})
 		}
 	}
@@ -1508,9 +1535,10 @@ func (s *CassandraStore) DeleteGroupFull(orgID, groupID uuid.UUID) error {
 }
 
 func (s *CassandraStore) HardDeleteOrg(orgID uuid.UUID) error {
-	return s.db.Session().Query(`
-		DELETE FROM organizations WHERE org_id = ?
-	`, orgID.String()).Exec()
+	batch := s.db.Session().Batch(gocql.LoggedBatch)
+	batch.Query(`DELETE FROM organizations WHERE org_id = ?`, orgID.String())
+	batch.Query(`DELETE FROM deleted_organizations WHERE org_id = ?`, orgID.String())
+	return batch.Exec()
 }
 
 func (s *CassandraStore) GetOrgName(orgID uuid.UUID) (string, error) {
