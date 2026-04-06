@@ -1076,7 +1076,7 @@ func (h *FileHandler) CreateFile(c *gin.Context) {
 	var fileSize int64
 	var blockIDs []string
 
-	if templateContent != nil && len(templateContent) > 0 && h.blockStore != nil {
+	if len(templateContent) > 0 && h.blockStore != nil {
 		// Office file - store the template content as a block
 		fileSize = int64(len(templateContent))
 
