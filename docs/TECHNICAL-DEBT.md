@@ -731,18 +731,24 @@ If users report that “normal uploads are faster than upload-token uploads”, 
 
 ---
 
-## 16. Admin Organization/User Projections And Recipient Share Reads — 🟡 Activated, Still Maturing (2026-04-05)
+## 16. Admin Organization/User Projections And Recipient Share Reads — 🟡 Live, Performance-Relevant, Still Maturing (2026-04-06)
 
 ### Status
 
-The optimization tables are no longer schema-only.
+The optimization tables are no longer schema-only, and they are no longer just write-side scaffolding.
 
 What is now live in code:
 
 - `PermissionMiddleware.GetUserLibraries()` now resolves direct-user and group shares through `shares_by_recipient`, removing the old `ALLOW FILTERING` recipient scans from that path.
 - Sys-admin organization list/search now reads from the organization admin projection tables.
 - Sys-admin user list/search and sys-admin listing now read from the user admin projection tables.
-- User/org projection rows are now synchronized from the main create/update/status-change paths, OIDC auto-provisioning, `last_login_at` touches, and GC hard deletes.
+- User/org projection rows are now synchronized from the main create/update/status-change paths, OIDC auto-provisioning, OIDC email-adoption/relogin reconciliation, `last_login_at` touches, and GC hard deletes.
+
+That means the read-model work is already improving API behavior in production-shaped paths:
+
+- Sys-admin global user/org APIs avoid the older canonical fan-out + recompute path and serve directly from denormalized projection rows.
+- Recipient-centric library resolution now uses the recipient-oriented table that matches the access pattern instead of filtering canonical share rows.
+- The remaining debt is operational maturity and repairability, not “should we use these tables at all?”.
 
 Activated admin projection tables:
 
@@ -763,22 +769,32 @@ Activated admin projection tables:
 - `internal/api/v2/admin.go` and `internal/api/v2/admin_extra_organizations.go` now read sys-admin organization views from projection tables.
 - `internal/api/v2/admin_users.go` now reads superadmin global user views from projection tables.
 - `internal/middleware/permissions.go` now uses `shares_by_recipient` for recipient-centric accessible-library enumeration.
+- `internal/auth/oidc.go` now batches canonical OIDC provisioning/reconciliation writes together with the affected admin user/org projection rows instead of trailing `SyncAdmin*ReadModel` calls.
+- `internal/integration/admin_identity_projection_regression_test.go` and `internal/integration/oidc_projection_regression_test.go` now cover ownership transfer, hard-delete cascades, OIDC auto-provision, OIDC email adoption, and mapped-user relogin reconciliation.
 
 ### Why This Is Debt
 
 - The tables are active now, but they still need more operational maturity than the older read models.
 - The sync coverage is strong on runtime mutation paths, but seed/bootstrap style paths are still not treated as first-class projection writers.
-- There is still no explicit rebuild/backfill command for these projections if they drift or if old data predates the new dual-writes.
+- There is still no explicit rebuild/backfill command for these projections if they drift later, but that is not a launch blocker while the database is still effectively greenfield.
 
 ### Decision For Now
 
 Keep the projections and use them for sys-admin global views. The current implementation already justifies the tables.
 
+For the current pre-production phase, the priority is:
+
+1. Integrity and atomicity from day 0.
+2. Runtime coverage on the real write paths.
+3. A reliable base for future org-admin and superadmin queries.
+
+Because there is no meaningful production data to salvage yet, explicit rebuild/backfill tooling is deferred work rather than immediate debt.
+
 Remaining follow-ups:
 
-1. Add a rebuild/backfill command for `organizations_admin_*` and `users_admin_*` from canonical `organizations` and `users`.
-2. Decide whether seed/bootstrap flows should populate these projections directly or rely on an explicit rebuild step.
-3. Add focused regression coverage for projection sync on ownership transfer, OIDC role normalization, and hard-delete cascades.
+1. Decide whether seed/bootstrap flows should populate these projections directly or whether pre-prod/test bootstrap can continue to rely on normal runtime writes.
+2. After this V1 base is stable, add rebuild/backfill tooling for `organizations_admin_*` and `users_admin_*` from canonical `organizations` and `users` if operations actually need it.
+3. After this V1 base is stable, decide whether to add an operator-facing audit/rebuild verification command so drift can be detected before an admin notices stale list/search results.
 
 ### Important Non-Issue: Other Read Models Are Already Live
 
@@ -798,4 +814,4 @@ That means the remaining split is intentional by access pattern, not a leftover 
 
 ---
 
-*Last updated: 2026-04-05*
+*Last updated: 2026-04-06*

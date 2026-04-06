@@ -1,12 +1,13 @@
 # Cassandra Performance Optimization Guide
 
 **Date**: 2026-01-19
-**Status**: Living optimization backlog (updated 2026-04-02)
+**Status**: Living optimization backlog (updated 2026-04-06)
 **Goal**: Eliminate ALLOW FILTERING queries and optimize Cassandra schema
 
 **Current status snapshot:**
 - Major admin/share/link/group lookup problems have already been refactored to denormalized read models and lookup tables.
-- `groups_by_id`, share projections, admin link projections, admin link bucket tables, and library/group admin read models now exist in the initial schema.
+- `groups_by_id`, share projections, admin link projections, admin link bucket tables, library/group admin read models, and admin org/user identity projections now exist in the initial schema.
+- Sys-admin organization/user APIs already read from those projection tables, and recipient-centric library resolution already reads from `shares_by_recipient`.
 - This document should now be read as the **remaining** Cassandra optimization backlog, not as a greenfield plan.
 
 ---
@@ -22,6 +23,7 @@
 ### Remaining focus
 
 - Move admin library and group lists away from full materialization + in-memory pagination
+- Keep projection families atomic and trustworthy now; add rebuild/audit tooling later if operations actually need post-facto repair support
 - Keep pruning stale roadmap items now that admin link cursor pagination and read models are implemented
 - Document the operational contract for best-effort counters, recount fallback, and canonical-vs-projection repair
 

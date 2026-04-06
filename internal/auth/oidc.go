@@ -712,35 +712,10 @@ func (c *OIDCClient) provisionUser(ctx context.Context, claims *IDTokenClaims, u
 			}
 			now := time.Now()
 			template := c.appConfig.GetOrganizationTemplate("")
-			periodEnd := template.PeriodEnd(now)
-			createErr := c.db.Session().Query(`
-				INSERT INTO organizations (
-					org_id, name, status, settings, storage_quota, storage_used,
-					chunking_polynomial, storage_config, created_at,
-					plan, quota_policy, billing_cycle,
-					traffic_quota, traffic_upload_quota, traffic_download_quota, max_users,
-					current_period_started_at, current_period_ends_at
-				) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-			`, orgID, orgName, "active",
-				template.Settings,
-				template.StorageQuota, int64(0), template.ChunkingPolynomial,
-				template.StorageConfig,
-				now,
-				template.Plan,
-				template.QuotaPolicy,
-				template.BillingCycle,
-				template.TrafficQuota,
-				template.TrafficUploadQuota,
-				template.TrafficDownloadQuota,
-				template.MaxUsers,
-				now,
-				periodEnd,
-			).Exec()
+			createErr := c.createOrganizationWithAdminReadModel(orgID, orgName, template, now)
 			if createErr != nil {
 				fmt.Printf("Warning: failed to auto-provision org %s: %v\n", orgID, createErr)
 				// Continue - the org might have been created concurrently
-			} else if syncErr := db.SyncAdminOrganizationReadModel(c.db.Session(), orgID); syncErr != nil {
-				fmt.Printf("Warning: failed to sync admin org projection for %s: %v\n", orgID, syncErr)
 			}
 		}
 	}
@@ -789,6 +764,7 @@ func (c *OIDCClient) provisionUser(ctx context.Context, claims *IDTokenClaims, u
 				// and create the OIDC mapping so future logins are fast
 				userID = emailUserID
 				orgID = emailOrgID
+				attachedOIDCIdentity := false
 
 				// Check the role in their actual org
 				var dbRole string
@@ -797,24 +773,18 @@ func (c *OIDCClient) provisionUser(ctx context.Context, claims *IDTokenClaims, u
 				`, orgID, userID).Scan(&dbRole); roleErr == nil {
 					normalizedDBRole := c.normalizeRoleForOrg(orgID, dbRole)
 					if normalizedDBRole != dbRole {
-						if updateErr := c.db.Session().Query(`
-							UPDATE users SET role = ? WHERE org_id = ? AND user_id = ?
-						`, normalizedDBRole, orgID, userID).Exec(); updateErr != nil {
-							fmt.Printf("Warning: failed to normalize role for existing user: %v\n", updateErr)
-						} else {
-							if syncErr := db.SyncAdminUserReadModel(c.db.Session(), orgID, userID); syncErr != nil {
-								fmt.Printf("Warning: failed to sync admin user projection for %s/%s: %v\n", orgID, userID, syncErr)
-							}
-							if syncErr := db.SyncAdminOrganizationReadModel(c.db.Session(), orgID); syncErr != nil {
-								fmt.Printf("Warning: failed to sync admin org projection for %s: %v\n", orgID, syncErr)
-							}
+						if attachErr := c.updateUserRoleAttachOIDCIdentityAndAdminReadModels(orgID, userID, email, claims.Subject, normalizedDBRole); attachErr != nil {
+							return nil, fmt.Errorf("failed to normalize role and attach OIDC identity: %w", attachErr)
 						}
+						attachedOIDCIdentity = true
 					}
 					role = normalizedDBRole
 				}
 
-				if err := c.attachOIDCIdentity(userID, orgID, email, claims.Subject); err != nil {
-					return nil, fmt.Errorf("failed to attach OIDC identity: %w", err)
+				if !attachedOIDCIdentity {
+					if err := c.attachOIDCIdentity(userID, orgID, email, claims.Subject); err != nil {
+						return nil, fmt.Errorf("failed to attach OIDC identity: %w", err)
+					}
 				}
 
 				goto userReady
@@ -881,17 +851,8 @@ func (c *OIDCClient) provisionUser(ctx context.Context, claims *IDTokenClaims, u
 		if roleErr == nil {
 			normalizedDBRole := c.normalizeRoleForOrg(orgID, dbRole)
 			if normalizedDBRole != dbRole {
-				if updateErr := c.db.Session().Query(`
-					UPDATE users SET role = ? WHERE org_id = ? AND user_id = ?
-				`, normalizedDBRole, orgID, userID).Exec(); updateErr != nil {
+				if updateErr := c.updateUserRoleAndAdminReadModels(orgID, userID, normalizedDBRole); updateErr != nil {
 					fmt.Printf("Warning: failed to normalize role from DB: %v\n", updateErr)
-				} else {
-					if syncErr := db.SyncAdminUserReadModel(c.db.Session(), orgID, userID); syncErr != nil {
-						fmt.Printf("Warning: failed to sync admin user projection for %s/%s: %v\n", orgID, userID, syncErr)
-					}
-					if syncErr := db.SyncAdminOrganizationReadModel(c.db.Session(), orgID); syncErr != nil {
-						fmt.Printf("Warning: failed to sync admin org projection for %s: %v\n", orgID, syncErr)
-					}
 				}
 				dbRole = normalizedDBRole
 			}
@@ -904,17 +865,8 @@ func (c *OIDCClient) provisionUser(ctx context.Context, claims *IDTokenClaims, u
 				// OIDC did not send a role claim — keep the DB role as-is
 				role = dbRole
 			} else if dbRole != role {
-				if updateErr := c.db.Session().Query(`
-					UPDATE users SET role = ? WHERE org_id = ? AND user_id = ?
-				`, role, orgID, userID).Exec(); updateErr != nil {
+				if updateErr := c.updateUserRoleAndAdminReadModels(orgID, userID, role); updateErr != nil {
 					fmt.Printf("Warning: failed to sync role from OIDC: %v\n", updateErr)
-				} else {
-					if syncErr := db.SyncAdminUserReadModel(c.db.Session(), orgID, userID); syncErr != nil {
-						fmt.Printf("Warning: failed to sync admin user projection for %s/%s: %v\n", orgID, userID, syncErr)
-					}
-					if syncErr := db.SyncAdminOrganizationReadModel(c.db.Session(), orgID); syncErr != nil {
-						fmt.Printf("Warning: failed to sync admin org projection for %s: %v\n", orgID, syncErr)
-					}
 				}
 			}
 		}
@@ -981,10 +933,18 @@ userReady:
 
 func (c *OIDCClient) attachOIDCIdentity(userID, orgID, email, oidcSub string) error {
 	batch := c.db.Session().Batch(gocql.LoggedBatch)
+	addAttachOIDCIdentityQueries(batch, c.config.Issuer, userID, orgID, email, oidcSub)
+	if err := batch.Exec(); err != nil {
+		return fmt.Errorf("failed to persist OIDC identity mapping: %w", err)
+	}
+	return nil
+}
+
+func addAttachOIDCIdentityQueries(batch *gocql.Batch, issuer, userID, orgID, email, oidcSub string) {
 	batch.Query(`
 		INSERT INTO users_by_oidc (oidc_issuer, oidc_sub, user_id, org_id)
 		VALUES (?, ?, ?, ?)
-	`, c.config.Issuer, oidcSub, userID, orgID)
+	`, issuer, oidcSub, userID, orgID)
 	batch.Query(`
 		UPDATE users SET oidc_sub = ? WHERE org_id = ? AND user_id = ?
 	`, oidcSub, orgID, userID)
@@ -994,21 +954,164 @@ func (c *OIDCClient) attachOIDCIdentity(userID, orgID, email, oidcSub string) er
 			VALUES (?, ?, ?)
 		`, email, userID, orgID)
 	}
+}
+
+func (c *OIDCClient) createOrganizationWithAdminReadModel(orgID, orgName string, template config.OrganizationTemplate, now time.Time) error {
+	periodEnd := template.PeriodEnd(now)
+	batch := c.db.Session().Batch(gocql.LoggedBatch)
+	batch.Query(`
+		INSERT INTO organizations (
+			org_id, name, status, settings, storage_quota, storage_used,
+			chunking_polynomial, storage_config, created_at,
+			plan, quota_policy, billing_cycle,
+			traffic_quota, traffic_upload_quota, traffic_download_quota, max_users,
+			current_period_started_at, current_period_ends_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, orgID, orgName, "active",
+		template.Settings,
+		template.StorageQuota, int64(0), template.ChunkingPolynomial,
+		template.StorageConfig,
+		now,
+		template.Plan,
+		template.QuotaPolicy,
+		template.BillingCycle,
+		template.TrafficQuota,
+		template.TrafficUploadQuota,
+		template.TrafficDownloadQuota,
+		template.MaxUsers,
+		now,
+		periodEnd,
+	)
+	db.AddUpsertAdminOrganizationReadModelQuery(batch, db.AdminOrganizationProjectionRow{
+		OrgID:        orgID,
+		Name:         orgName,
+		Status:       "active",
+		Plan:         template.Plan,
+		StorageQuota: template.StorageQuota,
+		CreatedAt:    now,
+		UsersCount:   0,
+	})
 	if err := batch.Exec(); err != nil {
-		return fmt.Errorf("failed to persist OIDC identity mapping: %w", err)
+		return fmt.Errorf("failed to create org records: %w", err)
 	}
 	return nil
+}
+
+func (c *OIDCClient) buildAdminOrganizationProjectionRowForNewUser(orgID, email, name, role string) (db.AdminOrganizationProjectionRow, error) {
+	row, err := db.ReadAdminOrganizationProjectionRow(c.db.Session(), orgID)
+	if err != nil {
+		return db.AdminOrganizationProjectionRow{}, err
+	}
+	row.UsersCount++
+	if row.OwnerEmail == "" || role == "owner" {
+		row.OwnerEmail = email
+		row.OwnerName = name
+	}
+	return row, nil
+}
+
+func (c *OIDCClient) buildAdminOrganizationProjectionRowForUpdatedUser(orgID, updatedUserID, updatedUserName, updatedUserRole string) (db.AdminOrganizationProjectionRow, error) {
+	row := db.AdminOrganizationProjectionRow{OrgID: orgID}
+	var deletedAt *time.Time
+	if err := c.db.Session().Query(`
+		SELECT name, status, plan, storage_quota, deleted_at, created_at
+		FROM organizations WHERE org_id = ?
+	`, orgID).Scan(&row.Name, &row.Status, &row.Plan, &row.StorageQuota, &deletedAt, &row.CreatedAt); err != nil {
+		return db.AdminOrganizationProjectionRow{}, err
+	}
+	if row.Status == "" {
+		row.Status = "active"
+	}
+	row.DeletedAt = deletedAt
+
+	iter := c.db.Session().Query(`
+		SELECT user_id, email, name, role FROM users WHERE org_id = ?
+	`, orgID).Iter()
+
+	var userID, email, name, role string
+	var firstEmail, firstName string
+	firstRemaining := true
+	for iter.Scan(&userID, &email, &name, &role) {
+		if userID == updatedUserID {
+			name = updatedUserName
+			role = updatedUserRole
+		}
+		row.UsersCount++
+		if firstRemaining {
+			firstEmail, firstName = email, name
+			firstRemaining = false
+		}
+		if row.OwnerEmail == "" && (role == "superadmin" || role == "owner" || role == "admin") {
+			row.OwnerEmail = email
+			row.OwnerName = name
+		}
+	}
+	if err := iter.Close(); err != nil {
+		return db.AdminOrganizationProjectionRow{}, err
+	}
+	if row.OwnerEmail == "" {
+		row.OwnerEmail = firstEmail
+		row.OwnerName = firstName
+	}
+	return row, nil
+}
+
+func (c *OIDCClient) updateUserRoleAndAdminReadModels(orgID, userID, role string) error {
+	userProjectionRow, err := db.ReadAdminUserProjectionRow(c.db.Session(), orgID, userID)
+	if err != nil {
+		return err
+	}
+	userProjectionRow.Role = role
+
+	orgProjectionRow, err := c.buildAdminOrganizationProjectionRowForUpdatedUser(orgID, userID, userProjectionRow.Name, role)
+	if err != nil {
+		return err
+	}
+
+	batch := c.db.Session().Batch(gocql.LoggedBatch)
+	batch.Query(`
+		UPDATE users SET role = ? WHERE org_id = ? AND user_id = ?
+	`, role, orgID, userID)
+	db.AddUpsertAdminUserReadModelQuery(batch, userProjectionRow)
+	db.AddUpsertAdminOrganizationReadModelQuery(batch, orgProjectionRow)
+	return batch.Exec()
+}
+
+func (c *OIDCClient) updateUserRoleAttachOIDCIdentityAndAdminReadModels(orgID, userID, email, oidcSub, role string) error {
+	userProjectionRow, err := db.ReadAdminUserProjectionRow(c.db.Session(), orgID, userID)
+	if err != nil {
+		return err
+	}
+	userProjectionRow.Role = role
+
+	orgProjectionRow, err := c.buildAdminOrganizationProjectionRowForUpdatedUser(orgID, userID, userProjectionRow.Name, role)
+	if err != nil {
+		return err
+	}
+
+	batch := c.db.Session().Batch(gocql.LoggedBatch)
+	batch.Query(`
+		UPDATE users SET role = ? WHERE org_id = ? AND user_id = ?
+	`, role, orgID, userID)
+	addAttachOIDCIdentityQueries(batch, c.config.Issuer, userID, orgID, email, oidcSub)
+	db.AddUpsertAdminUserReadModelQuery(batch, userProjectionRow)
+	db.AddUpsertAdminOrganizationReadModelQuery(batch, orgProjectionRow)
+	return batch.Exec()
 }
 
 // createUser creates a new user record in the database
 func (c *OIDCClient) createUser(ctx context.Context, userID, orgID, email, name, role, oidcSub string) error {
 	now := time.Now()
+	orgProjectionRow, err := c.buildAdminOrganizationProjectionRowForNewUser(orgID, email, name, role)
+	if err != nil {
+		return fmt.Errorf("build admin org projection for new user %s in org %s: %w", userID, orgID, err)
+	}
 
 	batch := c.db.Session().Batch(gocql.LoggedBatch)
 	batch.Query(`
-		INSERT INTO users (org_id, user_id, email, name, role, status, quota_bytes, used_bytes, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, orgID, userID, email, name, role, "active", int64(-2), int64(0), now)
+		INSERT INTO users (org_id, user_id, email, name, role, status, quota_bytes, used_bytes, created_at, oidc_sub)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, orgID, userID, email, name, role, "active", int64(-2), int64(0), now, oidcSub)
 	batch.Query(`
 		INSERT INTO users_by_oidc (oidc_issuer, oidc_sub, user_id, org_id)
 		VALUES (?, ?, ?, ?)
@@ -1030,11 +1133,9 @@ func (c *OIDCClient) createUser(ctx context.Context, userID, orgID, email, name,
 		QuotaUsage: int64(0),
 		CreatedAt:  now,
 	})
+	db.AddUpsertAdminOrganizationReadModelQuery(batch, orgProjectionRow)
 	if err := batch.Exec(); err != nil {
 		return fmt.Errorf("failed to create user records: %w", err)
-	}
-	if err := db.SyncAdminOrganizationReadModel(c.db.Session(), orgID); err != nil {
-		fmt.Printf("Warning: failed to sync admin org projection for %s: %v\n", orgID, err)
 	}
 
 	return nil
