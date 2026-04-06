@@ -82,9 +82,8 @@ function LoginPage() {
           <div className="login-panel__header">
             <div>
               <p className="login-panel__kicker">Workspace Login</p>
-              <h2>Continue with SSO</h2>
+              <h2>Continue with SesameDisk account</h2>
             </div>
-            <p className="login-panel__hint">Password login is not enabled yet in SesameFS.</p>
           </div>
 
           {hasError && (

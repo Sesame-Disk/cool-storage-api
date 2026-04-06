@@ -145,29 +145,36 @@
 .login-submit {
   width: 100%;
   border: 0;
+  margin-top: 4px;
+  padding: 16px 20px;
   border-radius: 14px;
   cursor: pointer;
-  transition: transform 0.18s ease, box-shadow 0.18s ease, opacity 0.18s ease;
-}
-
-.login-submit:hover:not(:disabled) {
-  transform: translateY(-1px);
-}
-
-.login-submit {
-  margin-top: 4px;
-  padding: 15px 18px;
+  background: var(--login-accent);
   background: linear-gradient(135deg, var(--login-accent) 0%, #d88b2d 100%);
   color: #fffaf0;
   font-size: 1rem;
   font-weight: 700;
   box-shadow: 0 16px 28px rgba(191, 91, 44, 0.22);
   font-family: "Trebuchet MS", "Gill Sans", sans-serif;
+  transition: all 0.22s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.login-submit:hover:not(:disabled) {
+  transform: translateY(-2px);
+  background: linear-gradient(135deg, #d88b2d 0%, var(--login-accent) 100%);
+  box-shadow: 0 20px 36px rgba(191, 91, 44, 0.32);
+  color: #fff;
+}
+
+.login-submit:active:not(:disabled) {
+  transform: translateY(1px);
+  box-shadow: 0 8px 16px rgba(191, 91, 44, 0.2);
 }
 
 .login-submit:disabled {
-  opacity: 0.72;
+  opacity: 0.65;
   cursor: not-allowed;
+  transform: none;
 }
 
 .login-note {
