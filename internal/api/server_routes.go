@@ -90,7 +90,7 @@ func (s *Server) registerAPIV2Routes(serverURL string) {
 	protected.Use(s.authMiddleware())
 
 	v2.RegisterLibraryRoutesWithToken(protected, s.db, s.config, s.tokenStore)
-	v2.RegisterFileRoutes(protected, s.db, s.config, s.storage, s.tokenStore, serverURL)
+	v2.RegisterFileRoutes(protected, s.db, s.config, s.storage, s.blockStore, s.storageManager, s.tokenStore, serverURL)
 	if s.blockStore != nil || s.storageManager != nil {
 		v2.RegisterBlockRoutes(protected, s.blockStore, s.storageManager, s.config)
 	}
@@ -126,7 +126,7 @@ func (s *Server) registerLegacyAPIV2Routes(serverURL string) {
 	protected.Use(s.authMiddleware())
 
 	v2.RegisterLibraryRoutesWithToken(protected, s.db, s.config, s.tokenStore)
-	v2.RegisterFileRoutes(protected, s.db, s.config, s.storage, s.tokenStore, serverURL)
+	v2.RegisterFileRoutes(protected, s.db, s.config, s.storage, s.blockStore, s.storageManager, s.tokenStore, serverURL)
 	v2.RegisterFileShareRoutes(protected, s.db, s.permMiddleware)
 	protected.GET("/search-user", s.handleSearchUser)
 	protected.GET("/search-user/", s.handleSearchUser)

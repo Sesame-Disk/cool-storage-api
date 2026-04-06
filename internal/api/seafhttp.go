@@ -24,6 +24,7 @@ import (
 	v2 "github.com/Sesame-Disk/sesamefs/internal/api/v2"
 	"github.com/Sesame-Disk/sesamefs/internal/crypto"
 	"github.com/Sesame-Disk/sesamefs/internal/db"
+	"github.com/Sesame-Disk/sesamefs/internal/httputil"
 	"github.com/Sesame-Disk/sesamefs/internal/middleware"
 	"github.com/Sesame-Disk/sesamefs/internal/storage"
 	"github.com/Sesame-Disk/sesamefs/internal/streaming"
@@ -509,10 +510,10 @@ func (h *SeafHTTPHandler) lookupLibraryStorageClass(orgID, repoID string) string
 	return storageClass
 }
 
-func (h *SeafHTTPHandler) resolveLibraryBlockStore(orgID, repoID string) (*storage.BlockStore, string, error) {
+func (h *SeafHTTPHandler) resolveLibraryBlockStore(hostname, orgID, repoID string) (*storage.BlockStore, string, error) {
 	libraryClass := h.lookupLibraryStorageClass(orgID, repoID)
 	if h.storageManager != nil {
-		preferredClass := h.storageManager.ResolveStorageClass("", libraryClass, "hot")
+		preferredClass := h.storageManager.ResolveStorageClass(hostname, libraryClass, "hot")
 		return h.storageManager.GetHealthyBlockStore(preferredClass)
 	}
 	if h.storage != nil {
@@ -747,7 +748,7 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 
 	// Store using PutAuto (automatically uses multipart for large files)
 	ctx := context.Background()
-	blockStore, actualStorageClass, err := h.resolveLibraryBlockStore(token.OrgID, token.RepoID)
+	blockStore, actualStorageClass, err := h.resolveLibraryBlockStore(httputil.GetRoutingHostname(c), token.OrgID, token.RepoID)
 	if err != nil {
 		log.Printf("[HandleUpload] Failed to get block store: %v, falling back to S3", err)
 		_, err = h.storage.PutAuto(c.Request.Context(), storageKey, newBytesReader(storedContent), int64(len(storedContent)))
@@ -839,7 +840,7 @@ func (h *SeafHTTPHandler) finalizeUploadStreaming(c *gin.Context, token *AccessT
 		}
 	}
 
-	blockStore, actualStorageClass, err := h.resolveLibraryBlockStore(token.OrgID, token.RepoID)
+	blockStore, actualStorageClass, err := h.resolveLibraryBlockStore(httputil.GetRoutingHostname(c), token.OrgID, token.RepoID)
 	if err != nil {
 		return "", "", fmt.Errorf("block store not available: %w", err)
 	}
@@ -1477,7 +1478,7 @@ func (h *SeafHTTPHandler) resolveBlockID(orgID, blockID string) string {
 
 // lookupFileBlocks resolves a token's path to its block IDs, file size, encryption key, and block store.
 // This is the common metadata lookup used by both download and streaming paths.
-func (h *SeafHTTPHandler) lookupFileBlocks(token *AccessToken) (blockIDs []string, fileSize int64, fileKey []byte, blockStore *storage.BlockStore, err error) {
+func (h *SeafHTTPHandler) lookupFileBlocks(hostname string, token *AccessToken) (blockIDs []string, fileSize int64, fileKey []byte, blockStore *storage.BlockStore, err error) {
 	// Check encryption
 	var encrypted bool
 	err = h.db.Session().Query(`
@@ -1544,7 +1545,7 @@ func (h *SeafHTTPHandler) lookupFileBlocks(token *AccessToken) (blockIDs []strin
 		return nil, 0, nil, nil, fmt.Errorf("file metadata not found: %w", err)
 	}
 
-	blockStore, _, err = h.resolveLibraryBlockStore(token.OrgID, token.RepoID)
+	blockStore, _, err = h.resolveLibraryBlockStore(hostname, token.OrgID, token.RepoID)
 	if err != nil {
 		return nil, 0, nil, nil, fmt.Errorf("block store not available: %w", err)
 	}
@@ -1556,7 +1557,7 @@ func (h *SeafHTTPHandler) lookupFileBlocks(token *AccessToken) (blockIDs []strin
 // Uses prefetching (overlap S3 fetch with HTTP write) and 4MB io.CopyBuffer
 // for maximum throughput. Only O(2 × block_size) RAM.
 func (h *SeafHTTPHandler) streamFileFromBlocks(c *gin.Context, token *AccessToken, filename string, periodStartedAt time.Time) error {
-	blockIDs, fileSize, fileKey, blockStore, err := h.lookupFileBlocks(token)
+	blockIDs, fileSize, fileKey, blockStore, err := h.lookupFileBlocks(httputil.GetRoutingHostname(c), token)
 	if err != nil {
 		return err
 	}
@@ -1597,7 +1598,7 @@ func (h *SeafHTTPHandler) streamFileFromBlocks(c *gin.Context, token *AccessToke
 // DEPRECATED: Use streamFileFromBlocks for downloads. This is kept only for
 // upload metadata (commitUploadedFile) where the full content is already in memory.
 func (h *SeafHTTPHandler) getFileFromBlocks(c *gin.Context, token *AccessToken) ([]byte, error) {
-	blockIDs, _, fileKey, blockStore, err := h.lookupFileBlocks(token)
+	blockIDs, _, fileKey, blockStore, err := h.lookupFileBlocks(httputil.GetRoutingHostname(c), token)
 	if err != nil {
 		return nil, err
 	}
@@ -1857,7 +1858,7 @@ func (h *SeafHTTPHandler) HandleZipDownload(c *gin.Context) {
 	bytesBefore := int64(c.Writer.Size())
 
 	// Recursively add directory contents to the ZIP
-	h.addDirToZip(c.Request.Context(), zipWriter, token.RepoID, token.OrgID, targetFSID, "", fileKey)
+	h.addDirToZip(c.Request.Context(), httputil.GetRoutingHostname(c), zipWriter, token.RepoID, token.OrgID, targetFSID, "", fileKey)
 
 	// Record traffic for the bytes actually sent (zip overhead included is fine for billing granularity).
 	if rec := traffic.Get(); rec != nil {
@@ -1880,7 +1881,7 @@ func (h *SeafHTTPHandler) HandleZipDownload(c *gin.Context) {
 }
 
 // addDirToZip recursively adds directory contents to a ZIP archive
-func (h *SeafHTTPHandler) addDirToZip(ctx context.Context, zw *zip.Writer, repoID, orgID, dirFSID, prefix string, fileKey []byte) {
+func (h *SeafHTTPHandler) addDirToZip(ctx context.Context, hostname string, zw *zip.Writer, repoID, orgID, dirFSID, prefix string, fileKey []byte) {
 	var dirEntriesJSON string
 	err := h.db.Session().Query(`
 		SELECT dir_entries FROM fs_objects WHERE library_id = ? AND fs_id = ?
@@ -1911,9 +1912,9 @@ func (h *SeafHTTPHandler) addDirToZip(ctx context.Context, zw *zip.Writer, repoI
 		mode := int(modeFloat)
 
 		if mode == 16384 || mode&0170000 == 040000 { // Directory
-			h.addDirToZip(ctx, zw, repoID, orgID, id, entryPath, fileKey)
+			h.addDirToZip(ctx, hostname, zw, repoID, orgID, id, entryPath, fileKey)
 		} else { // File
-			h.addFileToZip(ctx, zw, repoID, orgID, id, entryPath, fileKey)
+			h.addFileToZip(ctx, hostname, zw, repoID, orgID, id, entryPath, fileKey)
 		}
 	}
 }
@@ -1922,7 +1923,7 @@ func (h *SeafHTTPHandler) addDirToZip(ctx context.Context, zw *zip.Writer, repoI
 // Uses zip.Store (no compression) for maximum throughput — the data is already
 // compressed by S3/MinIO or is binary data where deflate adds CPU cost for minimal gain.
 // For encrypted files, one block at a time is loaded, decrypted, and written.
-func (h *SeafHTTPHandler) addFileToZip(ctx context.Context, zw *zip.Writer, repoID, orgID, fileFSID, zipPath string, fileKey []byte) {
+func (h *SeafHTTPHandler) addFileToZip(ctx context.Context, hostname string, zw *zip.Writer, repoID, orgID, fileFSID, zipPath string, fileKey []byte) {
 	var blockIDs []string
 	var fileSize int64
 	err := h.db.Session().Query(`
@@ -1948,7 +1949,7 @@ func (h *SeafHTTPHandler) addFileToZip(ctx context.Context, zw *zip.Writer, repo
 		return
 	}
 
-	blockStore, _, err := h.resolveLibraryBlockStore(orgID, repoID)
+	blockStore, _, err := h.resolveLibraryBlockStore(hostname, orgID, repoID)
 	if err != nil {
 		log.Printf("[addFileToZip] Block store not available: %v", err)
 		return

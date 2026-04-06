@@ -212,7 +212,7 @@ func TestResolveLibraryBlockStoreUsesDefaultStorageClass(t *testing.T) {
 
 	h := &SeafHTTPHandler{storageManager: manager}
 
-	blockStore, storageClass, err := h.resolveLibraryBlockStore("org-id", "repo-id")
+	blockStore, storageClass, err := h.resolveLibraryBlockStore("", "org-id", "repo-id")
 	if err != nil {
 		t.Fatalf("resolveLibraryBlockStore returned error: %v", err)
 	}
@@ -221,6 +221,32 @@ func TestResolveLibraryBlockStoreUsesDefaultStorageClass(t *testing.T) {
 	}
 	if storageClass != "hot-minio-local" {
 		t.Fatalf("resolveLibraryBlockStore storage class = %q, want %q", storageClass, "hot-minio-local")
+	}
+}
+
+func TestResolveLibraryBlockStoreUsesHostnameFallback(t *testing.T) {
+	manager := storage.NewManager()
+	manager.SetDefaultClass("hot-minio-local")
+	manager.SetEndpointRegions(map[string]string{"eu.example.com": "eu"})
+	manager.SetRegionClasses(map[string]storage.RegionClassConfig{
+		"eu": {Hot: "hot-minio-eu"},
+	})
+	manager.RegisterBackend("hot-minio-local", &storage.S3Store{}, "")
+	manager.RegisterBackend("hot-minio-eu", &storage.S3Store{}, "")
+
+	h := &SeafHTTPHandler{
+		storageManager: manager,
+	}
+
+	blockStore, storageClass, err := h.resolveLibraryBlockStore("eu.example.com", "org-id", "repo-id")
+	if err != nil {
+		t.Fatalf("resolveLibraryBlockStore returned error: %v", err)
+	}
+	if blockStore == nil {
+		t.Fatal("resolveLibraryBlockStore returned nil block store")
+	}
+	if storageClass != "hot-minio-eu" {
+		t.Fatalf("resolveLibraryBlockStore storage class = %q, want %q", storageClass, "hot-minio-eu")
 	}
 }
 
