@@ -11,6 +11,7 @@ import (
 	"github.com/Sesame-Disk/sesamefs/internal/config"
 	"github.com/Sesame-Disk/sesamefs/internal/db"
 	dbpkg "github.com/Sesame-Disk/sesamefs/internal/db"
+	"github.com/Sesame-Disk/sesamefs/internal/httputil"
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -186,6 +187,7 @@ func (h *GroupHandler) getGroupRepos(orgID, groupID string) []GroupRepoResponse 
 	var createdAt time.Time
 	var encrypted bool
 	var sizeBytes int64
+	storageHelper := &LibraryHandler{config: h.config}
 
 	for iter.Scan(&createdAt, &libID, &shareID, &perm, &sharedBy, &sharedByEmail, &sharedByName, &libName, &encrypted, &sizeBytes) {
 		if libRow, err := dbpkg.ReadAdminLibraryProjectionRow(h.db.Session(), orgID, libID); err == nil {
@@ -211,7 +213,7 @@ func (h *GroupHandler) getGroupRepos(orgID, groupID string) []GroupRepoResponse 
 			ModifierContactEmail: sharedByEmail,
 			ModifierName:         sharedByName,
 			Type:                 "repo",
-			StorageName:          storageClass,
+			StorageName:          storageHelper.displayStorageName(storageClass),
 		})
 	}
 	iter.Close()
@@ -913,13 +915,25 @@ func (h *GroupHandler) CreateGroupOwnedLibrary(c *gin.Context) {
 	}
 
 	var createLibReq struct {
-		Name string `json:"name"`
+		Name         string `json:"name" form:"name"`
+		StorageID    string `json:"storage_id,omitempty" form:"storage_id"`
+		StorageClass string `json:"storage_class,omitempty" form:"storage_class"`
 	}
-	if err := c.ShouldBindJSON(&createLibReq); err != nil || createLibReq.Name == "" {
+	if err := c.ShouldBind(&createLibReq); err != nil || createLibReq.Name == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "name is required"})
 		return
 	}
 	repoName := createLibReq.Name
+	storageHelper := &LibraryHandler{config: h.config}
+	requestedStorageClass := createLibReq.StorageID
+	if requestedStorageClass == "" {
+		requestedStorageClass = createLibReq.StorageClass
+	}
+	resolvedStorageClass, err := storageHelper.resolveRequestedStorageClass(httputil.GetRoutingHostname(c), requestedStorageClass)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
 
 	newLibID := uuid.New().String()
 	now := time.Now()
@@ -927,9 +941,9 @@ func (h *GroupHandler) CreateGroupOwnedLibrary(c *gin.Context) {
 	// Create library (owned by the requesting user on behalf of the group)
 	batch := h.db.Session().Batch(gocql.LoggedBatch)
 	batch.Query(`
-		INSERT INTO libraries (org_id, library_id, owner_id, name, encrypted, size_bytes, file_count, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, orgID, newLibID, userID, repoName, false, int64(0), int64(0), now, now)
+		INSERT INTO libraries (org_id, library_id, owner_id, name, encrypted, storage_class, size_bytes, file_count, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, orgID, newLibID, userID, repoName, false, resolvedStorageClass, int64(0), int64(0), now, now)
 	batch.Query(`
 		INSERT INTO libraries_by_id (library_id, org_id, owner_id, name, encrypted)
 		VALUES (?, ?, ?, ?, ?)
@@ -978,6 +992,8 @@ func (h *GroupHandler) CreateGroupOwnedLibrary(c *gin.Context) {
 		"modifier_email":         ownerEmail,
 		"modifier_contact_email": ownerEmail,
 		"modifier_name":          ownerName,
+		"storage_id":             resolvedStorageClass,
+		"storage_name":           storageHelper.displayStorageName(resolvedStorageClass),
 		"group_name":             groupName,
 		"type":                   "repo",
 	})

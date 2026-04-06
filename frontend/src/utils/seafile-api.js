@@ -520,6 +520,7 @@ seafileAPI.createGroupRepo = function (groupID, repo) {
   let data = { name: repo.repo_name };
   if (repo.password) data.passwd = repo.password;
   if (repo.permission) data.permission = repo.permission;
+  if (repo.storage_id) data.storage_id = repo.storage_id;
   return this.req.post(url, data);
 };
 
@@ -528,6 +529,7 @@ seafileAPI.createGroupOwnedLibrary = function (groupID, repo) {
   let url = this.server + '/api/v2.1/groups/' + groupID + '/group-owned-libraries/';
   let data = { name: repo.repo_name, permission: 'rw' };
   if (repo.passwd) data.passwd = repo.passwd;
+  if (repo.storage_id) data.storage_id = repo.storage_id;
   return this.req.post(url, data);
 };
 

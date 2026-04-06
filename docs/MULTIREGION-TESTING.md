@@ -160,6 +160,41 @@ Then run:
 ./scripts/bootstrap.sh multiregion --clean
 ```
 
+## Focused Integrity Tests
+
+For the current safe slice, the most important backend checks are the Go integration tests
+that verify region-pinned libraries keep reading and writing from the persisted storage
+class instead of the request host default.
+
+```bash
+# Create-library explicit/default region selection
+docker compose run --build --rm -e SESAMEFS_URL=http://sesamefs:8080 \
+  gotest go test -tags integration \
+  -run TestCreateLibraryStorageSelection -count=1 -v ./internal/integration/...
+
+# Read-path integrity for region-pinned libraries
+docker compose run --build --rm -e SESAMEFS_URL=http://sesamefs:8080 \
+  gotest go test -tags integration \
+  -run 'TestRegionPinnedLibraryReadPaths|TestRegionPinnedHistoricReadPaths|TestRegionPinnedShareLinkRaw' \
+  -count=1 -v ./internal/integration/...
+```
+
+These tests currently cover:
+
+- explicit `storage_id` on create-library
+- hostname-derived default region on create-library
+- `seafhttp/upload-api` + `seafhttp/files/:token`
+- `/repo/:repo_id/raw/*filepath`
+- `/repo/:repo_id/history/download`
+- `/repo/:repo_id/history/raw`
+- `/d/:token?raw=1` share-link serving
+
+If backend code changes, rebuild the running service before trusting integration results:
+
+```bash
+docker compose up -d --build sesamefs
+```
+
 ## Available Test Scripts
 
 | Script | Purpose |
@@ -232,6 +267,21 @@ curl -X PUT "http://us.sesamefs.local:8080/seafhttp/repo/$REPO/block/$HASH" \
 # Verify block is in USA bucket
 docker exec sesamefs-multiregion-minio-1 mc ls local/sesamefs-usa/
 ```
+
+### 2.1 Region-Pinned Library Behavior
+
+Expected behavior in the current implementation:
+
+- A library created with explicit `storage_id` stays pinned to that storage class.
+- A library created without `storage_id` inherits the region mapped from the request hostname.
+- Later reads must follow the persisted library choice even if the request hits a different hostname.
+- Historic downloads/raw previews and raw share-link responses must behave the same way.
+
+What is not covered by this safe slice:
+
+- migrating existing libraries between regions after data already exists
+- automatic rebalancing of old blocks between regions
+- region-isolated deduplication/GC redesign
 
 ### 3. Failover Testing
 

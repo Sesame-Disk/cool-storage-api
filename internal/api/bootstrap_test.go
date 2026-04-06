@@ -3,6 +3,7 @@ package api
 import (
 	"testing"
 
+	"github.com/Sesame-Disk/sesamefs/internal/config"
 	"github.com/gin-gonic/gin"
 )
 
@@ -70,5 +71,59 @@ func TestBuildAppBootstrapPageOptionsIncludesSettingsBasics(t *testing.T) {
 	}
 	if enabled, ok := pageOptions["enableDeleteAccount"].(bool); !ok || !enabled {
 		t.Fatalf("enableDeleteAccount = %v, want true", pageOptions["enableDeleteAccount"])
+	}
+}
+
+func TestBuildBootstrapStorageOptionsUsesRegionLabelsAndDefault(t *testing.T) {
+	s := createTestServer()
+	s.config.Storage.DefaultClass = "hot-usa"
+	s.config.Storage.EndpointRegions = map[string]string{
+		"us.example.com": "usa",
+		"eu.example.com": "eu",
+	}
+	s.config.Storage.RegionClasses = map[string]config.RegionClassConfig{
+		"usa": {Hot: "hot-usa"},
+		"eu":  {Hot: "hot-eu"},
+	}
+	s.config.Storage.Classes = map[string]config.StorageClassConfig{
+		"hot-usa": {},
+		"hot-eu":  {},
+	}
+	s.config.Storage.Backends = map[string]config.BackendConfig{}
+
+	options := s.buildBootstrapStorageOptions("eu.example.com")
+	if len(options) < 2 {
+		t.Fatalf("len(options) = %d, want at least 2", len(options))
+	}
+
+	var foundEU bool
+	for _, option := range options {
+		if option["id"] == "hot-eu" {
+			foundEU = true
+			if option["name"] != "EU" {
+				t.Fatalf("eu option name = %v, want %q", option["name"], "EU")
+			}
+			if option["is_default"] != true {
+				t.Fatalf("eu option is_default = %v, want true", option["is_default"])
+			}
+		}
+	}
+
+	if !foundEU {
+		t.Fatalf("expected hot-eu option in %v", options)
+	}
+}
+
+func TestResolveBootstrapDefaultStorageClassUsesDeterministicSortedFallback(t *testing.T) {
+	s := createTestServer()
+	s.config.Storage.DefaultClass = "missing"
+	s.config.Storage.Classes = map[string]config.StorageClassConfig{
+		"hot-zeta":  {},
+		"hot-alpha": {},
+	}
+	s.config.Storage.Backends = map[string]config.BackendConfig{}
+
+	if got := s.resolveBootstrapDefaultStorageClass("unknown.example.com"); got != "hot-alpha" {
+		t.Fatalf("resolveBootstrapDefaultStorageClass = %q, want %q", got, "hot-alpha")
 	}
 }

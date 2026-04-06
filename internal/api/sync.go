@@ -95,6 +95,44 @@ func (h *SyncHandler) SetTokenCreator(tc SyncTokenCreator) {
 	h.tokenCreator = tc
 }
 
+func (h *SyncHandler) lookupLibraryStorageClass(orgID, repoID string) string {
+	if h == nil || h.db == nil || orgID == "" || repoID == "" {
+		return ""
+	}
+
+	var storageClass string
+	if err := h.db.Session().Query(`
+		SELECT storage_class FROM libraries WHERE org_id = ? AND library_id = ?
+	`, orgID, repoID).Scan(&storageClass); err != nil {
+		return ""
+	}
+
+	return storageClass
+}
+
+func (h *SyncHandler) resolvePreferredLibraryStorageClass(c *gin.Context, orgID, repoID string) string {
+	libraryClass := h.lookupLibraryStorageClass(orgID, repoID)
+	if h.storageManager != nil {
+		return h.storageManager.ResolveStorageClass(httputil.GetRoutingHostname(c), libraryClass, "hot")
+	}
+	if libraryClass != "" {
+		return libraryClass
+	}
+	return "hot"
+}
+
+func (h *SyncHandler) resolveBlockLookupFallbackClass(c *gin.Context, orgID, repoID, storageClass string) string {
+	preferredClass := strings.TrimSpace(h.resolvePreferredLibraryStorageClass(c, orgID, repoID))
+	if preferredClass != "" {
+		return preferredClass
+	}
+	storageClass = strings.TrimSpace(storageClass)
+	if storageClass != "" {
+		return storageClass
+	}
+	return "hot"
+}
+
 // formatSizeSeafile delegates to httputil.FormatSizeSeafile.
 var formatSizeSeafile = httputil.FormatSizeSeafile
 
@@ -716,10 +754,10 @@ func (h *SyncHandler) GetBlock(c *gin.Context) {
 		`, orgID, internalID).Scan(&storageClass)
 
 		if err != nil || storageClass == "" {
-			storageClass = "hot"
+			storageClass = h.resolveBlockLookupFallbackClass(c, orgID, repoID, storageClass)
 		}
 	} else {
-		storageClass = "hot"
+		storageClass = h.resolveBlockLookupFallbackClass(c, orgID, repoID, storageClass)
 	}
 
 	// Get the appropriate BlockStore using StorageManager
@@ -729,8 +767,9 @@ func (h *SyncHandler) GetBlock(c *gin.Context) {
 	if h.storageManager != nil {
 		blockStore, err = h.storageManager.GetBlockStore(storageClass)
 		if err != nil {
-			log.Printf("GetBlock: storage class %s not found: %v, trying default\n", storageClass, err)
-			blockStore, _, err = h.storageManager.GetHealthyBlockStore(h.storageManager.ResolveStorageClass("", "", "hot"))
+			fallbackClass := h.resolveBlockLookupFallbackClass(c, orgID, repoID, storageClass)
+			log.Printf("GetBlock: storage class %s not found: %v, trying %s\n", storageClass, err, fallbackClass)
+			blockStore, _, err = h.storageManager.GetHealthyBlockStore(fallbackClass)
 			if err != nil {
 				blockStore = h.blockStore
 			}
@@ -843,27 +882,21 @@ func (h *SyncHandler) PutBlock(c *gin.Context) {
 		return
 	}
 
-	// Resolve storage class based on request hostname
-	hostname := c.Request.Host
-	if colonIdx := strings.Index(hostname, ":"); colonIdx > 0 {
-		hostname = hostname[:colonIdx] // Strip port
-	}
-
 	// Get the appropriate BlockStore using StorageManager with failover
 	var blockStore *storage.BlockStore
 	var storageClass string
 
 	if h.storageManager != nil {
-		preferredClass := h.storageManager.ResolveStorageClass(hostname, "", "hot")
+		preferredClass := h.resolvePreferredLibraryStorageClass(c, orgID, repoID)
 		blockStore, storageClass, err = h.storageManager.GetHealthyBlockStore(preferredClass)
 		if err != nil {
 			log.Printf("PutBlock: failed to get healthy backend: %v, falling back to legacy\n", err)
 			blockStore = h.blockStore
-			storageClass = "hot"
+			storageClass = preferredClass
 		}
 	} else {
 		blockStore = h.blockStore
-		storageClass = "hot"
+		storageClass = h.resolvePreferredLibraryStorageClass(c, orgID, repoID)
 	}
 
 	if blockStore == nil {
@@ -993,17 +1026,11 @@ func (h *SyncHandler) CheckBlocks(c *gin.Context) {
 		internalIDs = append(internalIDs, internalID)
 	}
 
-	// Resolve storage class based on request hostname
-	hostname := c.Request.Host
-	if colonIdx := strings.Index(hostname, ":"); colonIdx > 0 {
-		hostname = hostname[:colonIdx] // Strip port
-	}
-
 	// Get the appropriate BlockStore using StorageManager with failover
 	var blockStore *storage.BlockStore
 
 	if h.storageManager != nil {
-		preferredClass := h.storageManager.ResolveStorageClass(hostname, "", "hot")
+		preferredClass := h.resolvePreferredLibraryStorageClass(c, orgID, repoID)
 		blockStore, _, err = h.storageManager.GetHealthyBlockStore(preferredClass)
 		if err != nil {
 			log.Printf("CheckBlocks: failed to get healthy backend: %v, falling back to legacy\n", err)

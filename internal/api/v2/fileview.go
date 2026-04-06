@@ -547,10 +547,12 @@ func (h *FileViewHandler) ServeRawFile(c *gin.Context) {
 
 	// Get block store
 	if h.storageManager == nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "storage not available"})
-		return
+		if h.storage == nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "storage not available"})
+			return
+		}
 	}
-	blockStore, _, err := h.storageManager.GetHealthyBlockStore("")
+	blockStore, _, err := resolveLibraryBlockStoreForRequest(c, h.db, h.config, h.storageManager, h.storage, orgID, repoID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "storage not available"})
 		return
@@ -856,13 +858,15 @@ func (h *FileViewHandler) DownloadHistoricFile(c *gin.Context) {
 	}
 
 	if h.storageManager == nil {
-		log.Printf("[DownloadHistoricFile] Storage manager not available")
-		c.Header("Content-Type", "text/html; charset=utf-8")
-		c.String(http.StatusInternalServerError, errorPageHTML("Internal Error", "Storage not available."))
-		return
+		if h.storage == nil {
+			log.Printf("[DownloadHistoricFile] Storage manager not available")
+			c.Header("Content-Type", "text/html; charset=utf-8")
+			c.String(http.StatusInternalServerError, errorPageHTML("Internal Error", "Storage not available."))
+			return
+		}
 	}
 
-	blockStore, _, err := h.storageManager.GetHealthyBlockStore("")
+	blockStore, _, err := resolveLibraryBlockStoreForRequest(c, h.db, h.config, h.storageManager, h.storage, orgID, repoID)
 	if err != nil {
 		log.Printf("[DownloadHistoricFile] Block store not available: %v", err)
 		c.Header("Content-Type", "text/html; charset=utf-8")
@@ -1062,10 +1066,12 @@ func (h *FileViewHandler) ServeHistoricFileRaw(c *gin.Context) {
 	}
 
 	if h.storageManager == nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "storage not available"})
-		return
+		if h.storage == nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "storage not available"})
+			return
+		}
 	}
-	blockStore, _, err := h.storageManager.GetHealthyBlockStore("")
+	blockStore, _, err := resolveLibraryBlockStoreForRequest(c, h.db, h.config, h.storageManager, h.storage, orgID, repoID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "storage not available"})
 		return

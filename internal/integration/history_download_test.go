@@ -162,6 +162,113 @@ func TestHistoryDownloadMissingObjID(t *testing.T) {
 	}
 }
 
+func TestRegionPinnedHistoricReadPaths(t *testing.T) {
+	const requestHost = "eu.sesamefs.local"
+	name := fmt.Sprintf("inttest-hist-region-%d", time.Now().UnixNano())
+	createResp := adminClient.PostJSONWithHost(t, "/api2/repos/", map[string]string{
+		"name":       name,
+		"storage_id": "hot-s3-usa",
+	}, requestHost)
+	expectStatus(t, createResp, http.StatusOK)
+
+	result := responseJSON(t, createResp)
+	repoID, _ := result["repo_id"].(string)
+	if repoID == "" {
+		t.Fatalf("expected repo_id in create response: %v", result)
+	}
+
+	t.Cleanup(func() {
+		cleanup := adminClient.Delete(t, fmt.Sprintf("/api/v2.1/repos/%s/", repoID))
+		cleanup.Body.Close()
+	})
+
+	fileName := "historic-region-test.txt"
+	v1Content := "historic region version 1\n"
+	v2Content := "historic region version 2\n"
+
+	upload := func(content string) {
+		t.Helper()
+		resp := adminClient.Get(t, fmt.Sprintf("/api2/repos/%s/upload-link/?p=/", repoID))
+		expectStatus(t, resp, http.StatusOK)
+		uploadURL := strings.Trim(responseBody(t, resp), "\" \n\r")
+
+		var buf bytes.Buffer
+		writer := multipart.NewWriter(&buf)
+		part, err := writer.CreateFormFile("file", fileName)
+		if err != nil {
+			t.Fatalf("CreateFormFile failed: %v", err)
+		}
+		if _, err := part.Write([]byte(content)); err != nil {
+			t.Fatalf("writing upload body failed: %v", err)
+		}
+		if err := writer.WriteField("parent_dir", "/"); err != nil {
+			t.Fatalf("WriteField failed: %v", err)
+		}
+		if err := writer.Close(); err != nil {
+			t.Fatalf("closing multipart writer failed: %v", err)
+		}
+
+		req, err := http.NewRequest(http.MethodPost, uploadURL, &buf)
+		if err != nil {
+			t.Fatalf("creating upload request failed: %v", err)
+		}
+		req.Header.Set("Authorization", "Token "+adminClient.token)
+		req.Header.Set("Content-Type", writer.FormDataContentType())
+		uploadResp, err := adminClient.http.Do(req)
+		if err != nil {
+			t.Fatalf("upload request failed: %v", err)
+		}
+		if uploadResp.StatusCode != http.StatusOK && uploadResp.StatusCode != http.StatusCreated {
+			body, _ := io.ReadAll(uploadResp.Body)
+			uploadResp.Body.Close()
+			t.Fatalf("upload failed with status %d: %s", uploadResp.StatusCode, string(body))
+		}
+		uploadResp.Body.Close()
+	}
+
+	upload(v1Content)
+	upload(v2Content)
+
+	revisionsResp := adminClient.Get(t, fmt.Sprintf("/api2/repo/file_revisions/%s/?p=/%s", repoID, fileName))
+	expectStatus(t, revisionsResp, http.StatusOK)
+
+	var revisionsPayload map[string]interface{}
+	decodeJSON(t, revisionsResp, &revisionsPayload)
+	revisionItems, ok := revisionsPayload["data"].([]interface{})
+	if !ok || len(revisionItems) < 2 {
+		t.Fatalf("expected at least 2 revisions, got %v", revisionsPayload)
+	}
+
+	var revisionIDs []string
+	for _, item := range revisionItems {
+		entry, _ := item.(map[string]interface{})
+		if revID, _ := entry["rev_file_id"].(string); revID != "" {
+			revisionIDs = append(revisionIDs, revID)
+		}
+	}
+	if len(revisionIDs) < 2 {
+		t.Fatalf("expected rev_file_id values, got %v", revisionsPayload)
+	}
+
+	assertHistoricContent := func(path string, wantOneOf ...string) {
+		t.Helper()
+		resp := adminClient.GetWithHost(t, path, requestHost)
+		expectStatus(t, resp, http.StatusOK)
+		body := responseBody(t, resp)
+		for _, want := range wantOneOf {
+			if body == want {
+				return
+			}
+		}
+		t.Fatalf("historic content = %q, want one of %q", body, wantOneOf)
+	}
+
+	for _, revID := range revisionIDs {
+		assertHistoricContent(fmt.Sprintf("/repo/%s/history/download?obj_id=%s&p=/%s", repoID, revID, fileName), v1Content, v2Content)
+		assertHistoricContent(fmt.Sprintf("/repo/%s/history/raw?obj_id=%s&p=/%s", repoID, revID, fileName), v1Content, v2Content)
+	}
+}
+
 // TestHistoryDownloadInvalidObjID tests that a nonexistent obj_id returns 404.
 func TestHistoryDownloadInvalidObjID(t *testing.T) {
 	name := fmt.Sprintf("inttest-histbadid-%d", time.Now().UnixNano())

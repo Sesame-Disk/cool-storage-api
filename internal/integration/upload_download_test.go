@@ -187,6 +187,107 @@ func TestDownloadLinkURL(t *testing.T) {
 	}
 }
 
+func TestRegionPinnedLibraryReadPaths(t *testing.T) {
+	const requestHost = "eu.sesamefs.local"
+	name := fmt.Sprintf("inttest-region-read-%d", time.Now().UnixNano())
+	createResp := adminClient.PostJSONWithHost(t, "/api2/repos/", map[string]string{
+		"name":       name,
+		"storage_id": "hot-s3-usa",
+	}, requestHost)
+	expectStatus(t, createResp, http.StatusOK)
+
+	result := responseJSON(t, createResp)
+	repoID, _ := result["repo_id"].(string)
+	if repoID == "" {
+		t.Fatalf("expected repo_id in create response: %v", result)
+	}
+	if result["storage_id"] != "hot-s3-usa" {
+		t.Fatalf("storage_id = %v, want %q", result["storage_id"], "hot-s3-usa")
+	}
+
+	t.Cleanup(func() {
+		cleanup := adminClient.Delete(t, fmt.Sprintf("/api/v2.1/repos/%s/", repoID))
+		cleanup.Body.Close()
+	})
+
+	fileName := "region-read-test.txt"
+	fileContent := "region-pinned read path verification\n"
+
+	resp := adminClient.Get(t, fmt.Sprintf("/api2/repos/%s/upload-link/?p=/", repoID))
+	expectStatus(t, resp, http.StatusOK)
+	uploadURL := strings.Trim(responseBody(t, resp), "\" \n\r")
+
+	var buf bytes.Buffer
+	writer := multipart.NewWriter(&buf)
+	part, err := writer.CreateFormFile("file", fileName)
+	if err != nil {
+		t.Fatalf("CreateFormFile failed: %v", err)
+	}
+	if _, err := part.Write([]byte(fileContent)); err != nil {
+		t.Fatalf("writing upload body failed: %v", err)
+	}
+	if err := writer.WriteField("parent_dir", "/"); err != nil {
+		t.Fatalf("WriteField failed: %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("closing multipart writer failed: %v", err)
+	}
+
+	req, err := http.NewRequest(http.MethodPost, uploadURL, &buf)
+	if err != nil {
+		t.Fatalf("creating upload request failed: %v", err)
+	}
+	req.Header.Set("Authorization", "Token "+adminClient.token)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	uploadResp, err := adminClient.http.Do(req)
+	if err != nil {
+		t.Fatalf("upload request failed: %v", err)
+	}
+	if uploadResp.StatusCode != http.StatusOK && uploadResp.StatusCode != http.StatusCreated {
+		body, _ := io.ReadAll(uploadResp.Body)
+		uploadResp.Body.Close()
+		t.Fatalf("upload failed with status %d: %s", uploadResp.StatusCode, string(body))
+	}
+	uploadResp.Body.Close()
+
+	t.Run("seafhttp download reads persisted storage class", func(t *testing.T) {
+		dlResp := adminClient.Get(t, fmt.Sprintf("/api2/repos/%s/file/?p=/%s", repoID, fileName))
+		expectStatus(t, dlResp, http.StatusOK)
+		downloadURL := strings.Trim(responseBody(t, dlResp), "\" \n\r")
+
+		req, err := http.NewRequest(http.MethodGet, downloadURL, nil)
+		if err != nil {
+			t.Fatalf("creating download request failed: %v", err)
+		}
+		downloadResp, err := adminClient.http.Do(req)
+		if err != nil {
+			t.Fatalf("download request failed: %v", err)
+		}
+		if downloadResp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(downloadResp.Body)
+			downloadResp.Body.Close()
+			t.Fatalf("download failed with status %d: %s", downloadResp.StatusCode, string(body))
+		}
+		content, err := io.ReadAll(downloadResp.Body)
+		downloadResp.Body.Close()
+		if err != nil {
+			t.Fatalf("reading download response failed: %v", err)
+		}
+		if string(content) != fileContent {
+			t.Fatalf("download content = %q, want %q", string(content), fileContent)
+		}
+	})
+
+	t.Run("raw reader ignores conflicting host when library storage is pinned", func(t *testing.T) {
+		rawResp := adminClient.GetWithHost(t, fmt.Sprintf("/repo/%s/raw/%s", repoID, fileName), requestHost)
+		expectStatus(t, rawResp, http.StatusOK)
+		content := responseBody(t, rawResp)
+		if content != fileContent {
+			t.Fatalf("raw content = %q, want %q", content, fileContent)
+		}
+	})
+}
+
 // TestUploadOverwrite verifies that uploading to the same path overwrites the file.
 func TestUploadOverwrite(t *testing.T) {
 	name := fmt.Sprintf("inttest-overwrite-%d", time.Now().UnixNano())

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -108,10 +109,10 @@ func RegisterLibraryRoutesWithToken(rg *gin.RouterGroup, database *db.DB, cfg *c
 }
 
 // RegisterV21LibraryRoutes registers v2.1 library routes with Seahub-compatible response format
-func RegisterV21LibraryRoutes(rg *gin.RouterGroup, database *db.DB, cfg *config.Config, tokenCreator LibraryTokenCreator, s3Store *storage.S3Store, blockStore *storage.BlockStore, serverURL string) {
+func RegisterV21LibraryRoutes(rg *gin.RouterGroup, database *db.DB, cfg *config.Config, tokenCreator LibraryTokenCreator, s3Store *storage.S3Store, blockStore *storage.BlockStore, storageManager *storage.Manager, serverURL string) {
 	permMiddleware := middleware.NewPermissionMiddleware(database)
 	h := &LibraryHandler{db: database, config: cfg, tokenCreator: tokenCreator, permMiddleware: permMiddleware, gcEnqueuer: getLibraryEnqueuer()}
-	fh := &FileHandler{db: database, config: cfg, serverURL: serverURL, permMiddleware: permMiddleware, gcEnqueuer: getBlockEnqueuer(), zipTokenCreator: tokenCreator}
+	fh := &FileHandler{db: database, config: cfg, serverURL: serverURL, permMiddleware: permMiddleware, gcEnqueuer: getBlockEnqueuer(), zipTokenCreator: tokenCreator, storageManager: storageManager}
 	eh := NewEncryptionHandler(database)
 	sh := NewFileShareHandler(database, permMiddleware)
 
@@ -330,7 +331,7 @@ func (h *LibraryHandler) ListLibraries(c *gin.Context) {
 			"salt":                   "", // CRITICAL: always present (stock Seafile format)
 			"file_count":             fileCount,
 			"storage_id":             storageClass,
-			"storage_name":           storageClass,
+			"storage_name":           h.displayStorageName(storageClass),
 		}
 
 		// Add encryption fields for encrypted libraries
@@ -378,20 +379,154 @@ func formatSize(bytes int64) string {
 	return fmt.Sprintf("%.1f %cB", float64(bytes)/float64(div), "KMGTPE"[exp])
 }
 
+func (h *LibraryHandler) isKnownStorageClass(class string) bool {
+	class = strings.TrimSpace(class)
+	if class == "" || h == nil || h.config == nil {
+		return false
+	}
+	if _, ok := h.config.Storage.Classes[class]; ok {
+		return true
+	}
+	if _, ok := h.config.Storage.Backends[class]; ok {
+		return true
+	}
+	return false
+}
+
+func (h *LibraryHandler) resolveEndpointRegion(hostname string) string {
+	if h == nil || h.config == nil {
+		return "default"
+	}
+
+	hostname = strings.TrimSpace(hostname)
+	if region, ok := h.config.Storage.EndpointRegions[hostname]; ok {
+		return region
+	}
+
+	for pattern, region := range h.config.Storage.EndpointRegions {
+		if len(pattern) > 1 && pattern[0] == '*' {
+			suffix := pattern[1:]
+			if strings.HasSuffix(hostname, suffix) && len(hostname) > len(suffix) {
+				return region
+			}
+		}
+	}
+
+	if region, ok := h.config.Storage.EndpointRegions["*"]; ok {
+		return region
+	}
+
+	return "default"
+}
+
+func formatRegionLabel(region string) string {
+	region = strings.TrimSpace(region)
+	if region == "" {
+		return ""
+	}
+
+	parts := strings.FieldsFunc(region, func(r rune) bool {
+		return r == '-' || r == '_' || r == ' '
+	})
+	for i, part := range parts {
+		lower := strings.ToLower(part)
+		switch lower {
+		case "us", "usa", "eu", "uk", "uae":
+			parts[i] = strings.ToUpper(lower)
+		default:
+			parts[i] = strings.ToUpper(lower[:1]) + lower[1:]
+		}
+	}
+
+	return strings.Join(parts, " ")
+}
+
+func (h *LibraryHandler) resolveDefaultStorageClass(hostname string) string {
+	if h == nil || h.config == nil {
+		return ""
+	}
+
+	region := h.resolveEndpointRegion(hostname)
+	if regionConfig, ok := h.config.Storage.RegionClasses[region]; ok {
+		if regionConfig.Hot != "" && h.isKnownStorageClass(regionConfig.Hot) {
+			return regionConfig.Hot
+		}
+	}
+
+	if h.isKnownStorageClass(h.config.Storage.DefaultClass) {
+		return h.config.Storage.DefaultClass
+	}
+
+	classNames := make([]string, 0, len(h.config.Storage.Classes))
+	for name := range h.config.Storage.Classes {
+		classNames = append(classNames, name)
+	}
+	sort.Strings(classNames)
+	for _, name := range classNames {
+		if h.isKnownStorageClass(name) {
+			return name
+		}
+	}
+	backendNames := make([]string, 0, len(h.config.Storage.Backends))
+	for name := range h.config.Storage.Backends {
+		backendNames = append(backendNames, name)
+	}
+	sort.Strings(backendNames)
+	for _, name := range backendNames {
+		if h.isKnownStorageClass(name) {
+			return name
+		}
+	}
+
+	return ""
+}
+
+func (h *LibraryHandler) resolveRequestedStorageClass(hostname, requestedClass string) (string, error) {
+	requestedClass = strings.TrimSpace(requestedClass)
+	if requestedClass == "" {
+		resolvedClass := h.resolveDefaultStorageClass(hostname)
+		if resolvedClass == "" {
+			return "", fmt.Errorf("no valid storage class configured")
+		}
+		return resolvedClass, nil
+	}
+	if !h.isKnownStorageClass(requestedClass) {
+		return "", fmt.Errorf("invalid storage class")
+	}
+	return requestedClass, nil
+}
+
+func (h *LibraryHandler) displayStorageName(storageClass string) string {
+	storageClass = strings.TrimSpace(storageClass)
+	if storageClass == "" || h == nil || h.config == nil {
+		return storageClass
+	}
+
+	for region, regionConfig := range h.config.Storage.RegionClasses {
+		if regionConfig.Hot == storageClass || regionConfig.Cold == storageClass {
+			return formatRegionLabel(region)
+		}
+	}
+
+	return storageClass
+}
+
 // CreateLibraryRequest represents the request body for creating a library
 type CreateLibraryRequest struct {
-	Name        string `json:"name" form:"name"`
-	RepoName    string `json:"repo_name" form:"repo_name"` // Seafile v2.1 API uses repo_name
-	Description string `json:"description" form:"desc"`    // Seafile uses "desc" in form
-	Encrypted   bool   `json:"encrypted" form:"encrypted"`
-	Password    string `json:"passwd,omitempty" form:"passwd"` // Seafile uses "passwd" everywhere
+	Name         string `json:"name" form:"name"`
+	RepoName     string `json:"repo_name" form:"repo_name"` // Seafile v2.1 API uses repo_name
+	Description  string `json:"description" form:"desc"`    // Seafile uses "desc" in form
+	Encrypted    bool   `json:"encrypted" form:"encrypted"`
+	Password     string `json:"passwd,omitempty" form:"passwd"` // Seafile uses "passwd" everywhere
+	StorageID    string `json:"storage_id,omitempty" form:"storage_id"`
+	StorageClass string `json:"storage_class,omitempty" form:"storage_class"`
 }
 
 // CreateLibrary creates a new library
 func (h *LibraryHandler) CreateLibrary(c *gin.Context) {
 	var req CreateLibraryRequest
 
-	if err := c.ShouldBindJSON(&req); err != nil {
+	if err := c.ShouldBind(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
@@ -488,6 +623,15 @@ func (h *LibraryHandler) CreateLibrary(c *gin.Context) {
 	orgUUID, _ := uuid.Parse(orgID)
 	userUUID, _ := uuid.Parse(userID)
 	newLibID := uuid.New()
+	requestedStorageClass := req.StorageID
+	if requestedStorageClass == "" {
+		requestedStorageClass = req.StorageClass
+	}
+	resolvedStorageClass, err := h.resolveRequestedStorageClass(httputil.GetRoutingHostname(c), requestedStorageClass)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
 
 	now := time.Now()
 	library := models.Library{
@@ -497,7 +641,7 @@ func (h *LibraryHandler) CreateLibrary(c *gin.Context) {
 		Name:           req.Name,
 		Description:    req.Description,
 		Encrypted:      req.Encrypted,
-		StorageClass:   h.config.Storage.DefaultClass,
+		StorageClass:   resolvedStorageClass,
 		SizeBytes:      0,
 		FileCount:      0,
 		VersionTTLDays: h.config.Versioning.DefaultTTLDays,
@@ -649,6 +793,8 @@ func (h *LibraryHandler) CreateLibrary(c *gin.Context) {
 		"salt":                "",
 		"magic":               "",
 		"random_key":          "",
+		"storage_id":          library.StorageClass,
+		"storage_name":        h.displayStorageName(library.StorageClass),
 		"repo_version":        1,
 		"head_commit_id":      headCommitID,
 		"permission":          "rw", // Owner always has rw
@@ -784,7 +930,7 @@ func (h *LibraryHandler) GetLibrary(c *gin.Context) {
 		"size_formatted":      formatSize(sizeBytes),
 		"file_count":          fileCount,
 		"storage_id":          storageClass,
-		"storage_name":        storageClass,
+		"storage_name":        h.displayStorageName(storageClass),
 	}
 
 	// Add encryption fields if library is encrypted
@@ -1025,7 +1171,7 @@ func (h *LibraryHandler) ChangeStorageClass(c *gin.Context) {
 	}
 
 	// Validate storage class
-	if _, ok := h.config.Storage.Backends[req.StorageClass]; !ok {
+	if !h.isKnownStorageClass(req.StorageClass) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid storage class"})
 		return
 	}
@@ -1246,7 +1392,7 @@ func (h *LibraryHandler) ListLibrariesV21(c *gin.Context) {
 			Monitored:            monitoredLibs[libID],
 			Status:               "normal",
 			Salt:                 "",
-			StorageName:          storageClass,
+			StorageName:          h.displayStorageName(storageClass),
 		})
 	}
 

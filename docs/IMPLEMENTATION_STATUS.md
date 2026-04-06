@@ -1,6 +1,6 @@
 # Implementation Status - SesameFS
 
-**Last Updated**: 2026-04-03
+**Last Updated**: 2026-04-06
 
 ---
 
@@ -17,7 +17,7 @@
 | Authentication | ~90% | OIDC Phase 1 complete, JWT revocation hardened (2026-03-31), and user API keys now cover desktop/CLI/automation auth in OIDC-only deployments. Device Flow and service-account flows remain future enhancements. |
 | Production Infrastructure | ✅ ~97% | GC ✅, Monitoring ✅, Health checks ✅, Structured logging ✅, Frontend/Backend separation ✅, Nginx production hardening ✅ |
 
-**Production Blockers (verified against code 2026-04-03)**:
+**Production Blockers (verified against code 2026-04-06)**:
 1. ~~OIDC Authentication~~ - ✅ COMPLETE (Phase 1 - Basic Login)
 2. ~~Garbage Collection~~ - ✅ COMPLETE (Queue worker + scanner + admin API)
 3. ~~Monitoring/Health Checks~~ - ✅ COMPLETE (slog logging, `/health`, `/ready`, `/metrics`)
@@ -25,6 +25,7 @@
 5. ~~Programmatic Auth (PATs)~~ - ✅ COMPLETE — user API keys ship via `/api/v2.1/api-keys/`, and `/api2/auth-token/` now exchanges `email + API key` for desktop/CLI tokens. Device Flow remains optional future work.
 6. **GC Multi-Instance Safety** - ⚠️ PARTIAL — temporary `GC_ENABLED` operational guard exists for production, but `gc.go:99` Start() still has no leader election/distributed lease. Safe only if exactly one replica runs GC.
 7. ~~Quota Period Rollover~~ - ✅ COMPLETE — Period rollover job advances expired org quota periods and keeps monthly traffic enforcement moving
+8. **Production Multi-Region Topology** - ⚠️ PARTIAL — region-aware library selection/read/write routing is implemented and covered by focused integration tests, but the stock production config/compose files still ship as single-region examples. Per-region `classes`, `endpoint_regions`, ingress host preservation, and rollout/migration steps remain operator work.
 
 ---
 
@@ -53,10 +54,10 @@
 | **File Block Encryption (AES-256-CBC)** | ✅ COMPLETE | Mostly stable | ⚠️ Partial | 2026-01-09 | Works with desktop client |
 | **Block Storage (S3)** | ✅ COMPLETE | Mostly stable | ⚠️ Partial | 2026-02-16 | SHA-1→SHA-256 mapping working. Custom HTTP transport (64 conn/host, 128KB buffers). |
 | **Block ID Mapping (SHA-1→SHA-256)** | ✅ COMPLETE | Mostly stable | ✅ Yes | 2026-02-16 | Batch IN queries (100/batch) for downloads. Per-block fallback still works. |
-| **File Upload (REST API)** | ✅ COMPLETE | Mostly stable | ❌ No | 2026-03-04 | Replace/autorename fix: `replace=0` triggers auto-rename (`file (1).ext`), default is overwrite for desktop client compat |
-| **File Download (REST API)** | ✅ COMPLETE | Mostly stable | ❌ No | 2026-02-16 | Optimized: shared `streaming` package — prefetch pipeline, 4MB buffers, batch block resolve, ZIP Store. ~300 MB/s for 11 GB. |
+| **File Upload (REST API)** | ✅ COMPLETE | Mostly stable | ❌ No | 2026-04-06 | Replace/autorename fix: `replace=0` triggers auto-rename (`file (1).ext`), default is overwrite for desktop client compat. Region-pinned libraries now propagate `storage_class` through `upload-link` and `seafhttp/upload-api`. |
+| **File Download (REST API)** | ✅ COMPLETE | Mostly stable | ❌ No | 2026-04-06 | Optimized: shared `streaming` package — prefetch pipeline, 4MB buffers, batch block resolve, ZIP Store. Region-pinned libraries now resolve reads by persisted library storage instead of host default. |
 | **Directory Listing** | ✅ COMPLETE | Mostly stable | ❌ No | 2026-01-08 | Frontend integration works |
-| **Library CRUD** | ✅ COMPLETE | Mostly stable | ⚠️ Partial | 2026-01-08 | Create/delete/list working |
+| **Library CRUD** | ✅ COMPLETE | Mostly stable | ⚠️ Partial | 2026-04-06 | Create/delete/list working. Library create flows now support explicit `storage_id` plus hostname-derived default region selection. Migration/change-region for non-empty libraries is still not implemented. |
 | **Starred Files** | ✅ COMPLETE | Mostly stable | ❌ No | 2026-01-08 | Fixed Cassandra query issue |
 | **OnlyOffice Integration** | 🔒 FROZEN | **STABLE** | ❌ No | 2026-02-12 | Document editing stable — doc key rotation fix (was causing toolbar greying out) + JWT 8h expiry |
 | **Frontend (React)** | 🟡 PARTIAL | **UNSTABLE** | N/A | 2026-03-30 | Library list works, all modals migrated, ~51 ModalPortal wrappers to remove. Plans/permissions Phase 3 is in progress: owner/plan terminology and member-limit gating now use live data in key admin screens, but legacy plan-role code paths, org-admin shell placeholders, and quota unit standardization still remain. |
@@ -91,9 +92,10 @@
 | **Admin Link Management** | ✅ COMPLETE | Mostly stable | ❌ No | 2026-02-12 | 13 endpoints: share link admin (list/delete), upload links (user CRUD + admin), per-user links. See [ADMIN-FEATURES.md](ADMIN-FEATURES.md) § 2 |
 | **Audit Logs** | 🟡 PARTIAL | Mostly stable | ❌ No | 2026-03-26 | `audit_log` table with 365-day TTL exists for deletion events (GC, groups, departments), and `users.last_login_at` now covers latest successful login. Historical login logs and file-operation/file-access event tables are still missing, so login audit pages and file statistics pages remain pending. See [ADMIN-FEATURES.md](ADMIN-FEATURES.md) § 3 |
 | **Version History UI** | ✅ COMPLETE | Mostly stable | ❌ No | 2026-02-26 | Detail sidebar History tab + full-page view + revert conflict dialog (Replace/Keep Both/Cancel) + View action + proper user name resolution. 17 integration tests. |
-| **File Preview & Raw Serving** | ✅ COMPLETE | Mostly stable | ❌ No | 2026-02-12 | Inline preview for PDF/images/video/audio/text, OnlyOffice for docs. Auth token handling fixed for search results. 14 unit + 28 integration tests. |
+| **File Preview & Raw Serving** | ✅ COMPLETE | Mostly stable | ❌ No | 2026-04-06 | Inline preview for PDF/images/video/audio/text, OnlyOffice for docs. Auth token handling fixed for search results. Region-pinned library coverage now includes raw file, historic raw/download, and share-link raw readers. |
+| **Region-Aware Library Storage Selection** | ✅ COMPLETE | Mostly stable | ⚠️ Partial | 2026-04-06 | Safe slice complete: bootstrap exposes region options, web/mobile/group library creation persist `storage_class`, and write/read paths follow the persisted class. Remaining work is production topology, migration of existing data, and broader multi-region operations. |
 | **Monitoring/Health Checks** | 🔒 FROZEN | **STABLE** | ❌ No | 2026-02-04 | Structured logging, `/health`, `/ready`, `/metrics`. 5 unit + 21 integration tests. |
-| **Multi-Region Replication** | ❌ TODO | N/A | ❌ No | - | Future feature |
+| **Multi-Region Replication** | ❌ TODO | N/A | ❌ No | - | Future feature beyond the current safe slice. Current work only pins new libraries to storage classes and keeps reads/writes consistent with that persisted choice. |
 
 ---
 
@@ -536,10 +538,9 @@ These MUST be completed before production deployment:
 ### Priority 4: Documentation
 
 4. **Missing documentation**
-   - User documentation (how to use)
-   - Admin documentation (deployment, backup)
-   - Production deployment guide
-   - Migration guide (from Seafile)
+   - End-user documentation (how to use key workflows)
+   - Operational admin runbooks (backup/restore, incident response)
+   - Expanded org-admin and sysadmin usage guides
 
 ### Future Features (Lower Priority)
 
@@ -576,7 +577,7 @@ These MUST be completed before production deployment:
 
 ## Metrics
 
-**Last Updated**: 2026-03-11
+**Last Updated**: 2026-04-06
 
 | Metric | Value | Notes |
 |--------|-------|-------|
@@ -589,7 +590,7 @@ These MUST be completed before production deployment:
 | Test Coverage (Go) | ~30% overall | chunker 79%, crypto 90.8%, config 73%, auth 56%, health 100% |
 | Integration Tests | 335+ tests | All passing (incl. OIDC, GC, file preview) |
 | Frontend Tests | 165+ tests | 7 test files (incl. OIDC API) |
-| Documentation Coverage | ~90% | Missing: user/admin docs |
+| Documentation Coverage | ~85% | Core API, deploy, migration, testing, architecture, and admin feature docs exist. Missing: end-user guides and deeper operational runbooks. |
 
 **Stability Breakdown**:
 - 🔒 FROZEN: ~22 components (sync protocol, encryption, OnlyOffice, monitoring/health)
@@ -601,4 +602,4 @@ These MUST be completed before production deployment:
 - Backend: ~98% (core auth blocker complete, both admin panels implemented; GC multi-instance safety still needs a real distributed lease beyond the temporary `GC_ENABLED` guard)
 - Frontend: ~85% (modals done, granular permission flags enforced, missing: some permission UI edge cases, ~51 ModalPortal wrapper cleanup)
 - Infrastructure: ~95% (monitoring ✅, health checks ✅, GC ✅)
-- Documentation: ~70% (missing: user/admin guides, deployment guide)
+- Documentation: ~85% (deployment, migration, testing, API, architecture, and feature docs exist; missing: end-user guides and operational admin runbooks)

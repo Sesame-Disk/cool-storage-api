@@ -4,6 +4,21 @@ import { Button, Input, Form, FormGroup, Label, Alert } from 'reactstrap';
 import { gettext, enableEncryptedLibrary, repoPasswordMinLength, storages, libraryTemplates } from '../../utils/constants';
 import { SeahubSelect } from '../common/select';
 
+const normalizedStorages = Array.isArray(storages)
+  ? storages.map((item) => {
+    if (typeof item === 'string') {
+      return { id: item, name: item, is_default: false };
+    }
+    return {
+      id: item?.id || '',
+      name: item?.name || item?.id || '',
+      is_default: item?.is_default === true,
+    };
+  }).filter((item) => item.id)
+  : [];
+
+const defaultStorage = normalizedStorages.find((item) => item.is_default) || normalizedStorages[0] || null;
+
 const propTypes = {
   libraryType: PropTypes.string.isRequired,
   onCreateRepo: PropTypes.func.isRequired,
@@ -21,7 +36,7 @@ class CreateRepoDialog extends React.Component {
       password2: '',
       errMessage: '',
       permission: 'rw',
-      storage_id: storages.length ? storages[0].id : '',
+      storage_id: defaultStorage ? defaultStorage.id : '',
       library_template: libraryTemplates.length ? libraryTemplates[0] : '',
       isSubmitBtnActive: false,
     };
@@ -30,8 +45,8 @@ class CreateRepoDialog extends React.Component {
     if (Array.isArray(libraryTemplates) && libraryTemplates.length) {
       this.templateOptions = libraryTemplates.map((item) => { return {value: item, label: item}; });
     }
-    if (Array.isArray(storages) && storages.length) {
-      this.storageOptions = storages.map((item) => { return {value: item.id, label: item.name}; });
+    if (normalizedStorages.length) {
+      this.storageOptions = normalizedStorages.map((item) => { return {value: item.id, label: item.name}; });
     }
   }
 
@@ -216,11 +231,11 @@ class CreateRepoDialog extends React.Component {
                   </FormGroup>
                 )}
 
-                {storages.length > 0 && (
+                {normalizedStorages.length > 0 && (
                   <FormGroup>
-                    <Label>{gettext('Storage Backend')}</Label>
+                    <Label>{gettext('Region')}</Label>
                     <SeahubSelect
-                      defaultValue={this.storageOptions[0]}
+                      defaultValue={this.storageOptions.find(opt => opt.value === this.state.storage_id) || this.storageOptions[0]}
                       options={this.storageOptions}
                       onChange={this.handleStorageInputChange}
                       value={this.storageOptions.find(opt => opt.value === this.state.storage_id) || null}

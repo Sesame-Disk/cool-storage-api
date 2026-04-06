@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Sesame-Disk/sesamefs/internal/storage"
 	"github.com/gin-gonic/gin"
 )
 
@@ -190,6 +191,43 @@ func TestFSEntryJSONKeyOrder(t *testing.T) {
 	// Verify order: id < mode < modifier < mtime < name < size
 	if !(idIdx < modeIdx && modeIdx < modifierIdx && modifierIdx < mtimeIdx && mtimeIdx < nameIdx && nameIdx < sizeIdx) {
 		t.Errorf("FSEntry JSON keys are not in alphabetical order.\nExpected order: id, mode, modifier, mtime, name, size\nGot JSON: %s", jsonStr)
+	}
+}
+
+func TestResolvePreferredLibraryStorageClassUsesEndpointRouting(t *testing.T) {
+	manager := storage.NewManager()
+	manager.SetDefaultClass("hot-minio-local")
+	manager.SetEndpointRegions(map[string]string{"eu.sesamefs.local": "eu"})
+	manager.SetRegionClasses(map[string]storage.RegionClassConfig{
+		"eu": {Hot: "hot-s3-eu"},
+	})
+	h := &SyncHandler{storageManager: manager}
+
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/seafhttp/repo/repo-id/block/block-id", nil)
+	c.Request.Host = "eu.sesamefs.local"
+
+	if got := h.resolvePreferredLibraryStorageClass(c, "org-id", "repo-id"); got != "hot-s3-eu" {
+		t.Fatalf("resolvePreferredLibraryStorageClass = %q, want %q", got, "hot-s3-eu")
+	}
+}
+
+func TestResolveBlockLookupFallbackClassUsesLibraryPreference(t *testing.T) {
+	manager := storage.NewManager()
+	manager.SetDefaultClass("hot-minio-local")
+	manager.SetEndpointRegions(map[string]string{"eu.sesamefs.local": "eu"})
+	manager.SetRegionClasses(map[string]storage.RegionClassConfig{
+		"eu": {Hot: "hot-s3-eu"},
+	})
+	h := &SyncHandler{storageManager: manager}
+
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodGet, "/seafhttp/repo/repo-id/block/block-id", nil)
+	c.Request.Host = "eu.sesamefs.local"
+	t.Setenv("SERVER_URL", "https://files.example.com")
+
+	if got := h.resolveBlockLookupFallbackClass(c, "org-id", "repo-id", "missing-class"); got != "hot-s3-eu" {
+		t.Fatalf("resolveBlockLookupFallbackClass = %q, want %q", got, "hot-s3-eu")
 	}
 }
 

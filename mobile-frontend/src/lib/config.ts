@@ -134,6 +134,10 @@ export function getConfig(): AppConfig {
 }
 
 export function getPageOptions(): PageOptions {
+  if (typeof window === 'undefined') {
+    return { ...DEV_PAGE_OPTIONS };
+  }
+
   const raw = window.app?.pageOptions;
   if (!raw) return { ...DEV_PAGE_OPTIONS };
 

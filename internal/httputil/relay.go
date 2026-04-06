@@ -9,26 +9,50 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+func hostnameFromServerURL(serverURL string) string {
+	host := strings.TrimSpace(serverURL)
+	if host == "" {
+		return ""
+	}
+	if idx := strings.Index(host, "://"); idx != -1 {
+		host = host[idx+3:]
+	}
+	if idx := strings.Index(host, "/"); idx != -1 {
+		host = host[:idx]
+	}
+	if idx := strings.LastIndex(host, ":"); idx != -1 {
+		host = host[:idx]
+	}
+	return NormalizeHostname(host)
+}
+
+// GetRoutingHostname returns the hostname that should drive request-scoped routing
+// decisions such as region-aware storage selection.
+//
+// Precedence (highest to lowest):
+//  1. X-Forwarded-Host header — preserves the original public hostname through proxies
+//  2. c.Request.Host — direct client host when no forwarding proxy is present
+//  3. SERVER_URL env var — last-resort fallback only when the request carries no host context
+func GetRoutingHostname(c *gin.Context) string {
+	if c != nil {
+		if fwdHost := c.GetHeader("X-Forwarded-Host"); fwdHost != "" {
+			return NormalizeHostname(fwdHost)
+		}
+		if host := NormalizeHostname(c.Request.Host); host != "" {
+			return host
+		}
+	}
+	return hostnameFromServerURL(os.Getenv("SERVER_URL"))
+}
+
 // GetEffectiveHostname returns the real external hostname for relay_id / relay_addr.
 // Precedence (highest to lowest):
 //  1. SERVER_URL env var — explicitly configured by the admin
 //  2. X-Forwarded-Host header — set by nginx/traefik when proxying
 //  3. c.Request.Host — last resort (works for direct connections)
 func GetEffectiveHostname(c *gin.Context) string {
-	if serverURL := os.Getenv("SERVER_URL"); serverURL != "" {
-		host := serverURL
-		if idx := strings.Index(host, "://"); idx != -1 {
-			host = host[idx+3:]
-		}
-		if idx := strings.Index(host, "/"); idx != -1 {
-			host = host[:idx]
-		}
-		if idx := strings.LastIndex(host, ":"); idx != -1 {
-			host = host[:idx]
-		}
-		if host != "" {
-			return host
-		}
+	if host := hostnameFromServerURL(os.Getenv("SERVER_URL")); host != "" {
+		return host
 	}
 	if fwdHost := c.GetHeader("X-Forwarded-Host"); fwdHost != "" {
 		return NormalizeHostname(fwdHost)

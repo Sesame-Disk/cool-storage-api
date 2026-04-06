@@ -732,7 +732,7 @@ func (h *ShareLinkViewHandler) handleShareLinkRaw(c *gin.Context, sl *shareLinkD
 		return
 	}
 
-	blockStore, _, err := h.storageManager.GetHealthyBlockStore("")
+	blockStore, _, err := resolveLibraryBlockStoreForRequest(c, h.db, h.config, h.storageManager, h.storage, sl.orgID, sl.libraryID)
 	if err != nil {
 		slog.Error("Block store not available for share link raw", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "storage not available"})
@@ -840,7 +840,7 @@ func (h *ShareLinkViewHandler) readFileContentAsText(sl *shareLinkData) string {
 		return ""
 	}
 
-	blockStore, _, err := h.storageManager.GetHealthyBlockStore("")
+	blockStore, _, err := resolveLibraryBlockStoreForRequest(nil, h.db, h.config, h.storageManager, h.storage, sl.orgID, sl.libraryID)
 	if err != nil {
 		return ""
 	}

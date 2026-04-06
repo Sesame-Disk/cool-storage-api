@@ -169,9 +169,9 @@ func (s *Server) registerAPIV21Routes(serverURL string) {
 		gcAdmin.POST("/gc/run/", s.handleGCRun)
 	}
 
-	v2.RegisterV21LibraryRoutes(protected, s.db, s.config, s.tokenStore, s.storage, s.blockStore, serverURL)
+	v2.RegisterV21LibraryRoutes(protected, s.db, s.config, s.tokenStore, s.storage, s.blockStore, s.storageManager, serverURL)
 
-	fileHandler := v2.NewFileHandler(s.db, s.config, s.storage, s.tokenStore, serverURL, s.permMiddleware)
+	fileHandler := v2.NewFileHandler(s.db, s.config, s.storage, s.blockStore, s.storageManager, s.tokenStore, serverURL, s.permMiddleware)
 	fileHandler.SetGCEnqueuer(v2.GetBlockEnqueuerFunc())
 	protected.DELETE("/repos/batch-delete-item/", fileHandler.BatchDeleteItems)
 	protected.DELETE("/repos/batch-delete-item", fileHandler.BatchDeleteItems)
@@ -182,7 +182,7 @@ func (s *Server) registerAPIV21Routes(serverURL string) {
 	protected.GET("/repos/:repo_id/history/", fileHandler.GetRepoHistory)
 	protected.GET("/repos/:repo_id/history", fileHandler.GetRepoHistory)
 	v2.RegisterBatchOperationRoutes(protected, s.db, s.config)
-	v2.RegisterOnlyOfficeRoutes(protected, s.db, s.config, s.storage, s.tokenStore, serverURL)
+	v2.RegisterOnlyOfficeRoutes(protected, s.db, s.config, s.storage, s.blockStore, s.storageManager, s.tokenStore, serverURL)
 	v2.RegisterV21StarredRoutes(protected, s.db)
 	v2.RegisterShareLinkRoutes(protected, s.db, serverURL, s.permMiddleware, s.config)
 	v2.RegisterUploadLinkRoutes(protected, s.db, serverURL, s.permMiddleware, s.config)
@@ -227,13 +227,13 @@ func (s *Server) registerAPIV21Routes(serverURL string) {
 
 func (s *Server) registerPublicRoutes(serverURL string) {
 	onlyoffice := s.router.Group("/onlyoffice")
-	v2.RegisterOnlyOfficeCallbackRoutes(onlyoffice, s.db, s.config, s.storage, serverURL)
+	v2.RegisterOnlyOfficeCallbackRoutes(onlyoffice, s.db, s.config, s.storage, s.blockStore, s.storageManager, serverURL)
 
 	exportHandler := v2.NewShareLinkHandler(s.db, serverURL, s.permMiddleware, s.config)
 	s.router.GET("/share/link/export-excel/", s.authMiddleware(), exportHandler.ExportShareLinksExcel)
 	s.router.GET("/share/link/export-excel", s.authMiddleware(), exportHandler.ExportShareLinksExcel)
 
-	smartLinkHandler := v2.NewFileHandler(s.db, s.config, s.storage, s.tokenStore, serverURL, s.permMiddleware)
+	smartLinkHandler := v2.NewFileHandler(s.db, s.config, s.storage, s.blockStore, s.storageManager, s.tokenStore, serverURL, s.permMiddleware)
 	s.router.GET("/smart-link/:token", s.smartLinkAuthMiddleware(), smartLinkHandler.ResolveSmartLink)
 	s.router.GET("/smart-link/:token/", s.smartLinkAuthMiddleware(), smartLinkHandler.ResolveSmartLink)
 

@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Sesame-Disk/sesamefs/internal/config"
+	"github.com/Sesame-Disk/sesamefs/internal/storage"
 	"github.com/gin-gonic/gin"
 )
 
@@ -170,6 +172,28 @@ func TestDeleteDirectory_InvalidPath(t *testing.T) {
 				t.Errorf("status = %d, want %d", w.Code, http.StatusBadRequest)
 			}
 		})
+	}
+}
+
+func TestResolveLibraryBlockStoreFallsBackToLegacyBlockStore(t *testing.T) {
+	h := &FileHandler{
+		config:     &config.Config{Storage: config.StorageConfig{DefaultClass: "hot-minio-local"}},
+		blockStore: storage.NewBlockStore(nil, "blocks/"),
+	}
+
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/api/v2.1/repos/repo-id/file/", nil)
+	c.Request.Host = "localhost"
+
+	blockStore, storageClass, err := h.resolveLibraryBlockStore(c, "org-id", "repo-id")
+	if err != nil {
+		t.Fatalf("resolveLibraryBlockStore returned error: %v", err)
+	}
+	if blockStore == nil {
+		t.Fatal("expected blockStore, got nil")
+	}
+	if storageClass != "hot-minio-local" {
+		t.Fatalf("storageClass = %q, want %q", storageClass, "hot-minio-local")
 	}
 }
 

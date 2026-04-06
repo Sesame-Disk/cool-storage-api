@@ -581,11 +581,15 @@ export async function createRepo(
   name: string,
   encrypted?: boolean,
   password?: string,
+  storageID?: string,
 ): Promise<Repo> {
   const body: Record<string, string> = { name };
   if (encrypted) {
     body.encrypted = 'true';
     if (password) body.passwd = password;
+  }
+  if (storageID) {
+    body.storage_id = storageID;
   }
   const res = await fetch(`${serviceURL()}/api2/repos/`, {
     method: 'POST',

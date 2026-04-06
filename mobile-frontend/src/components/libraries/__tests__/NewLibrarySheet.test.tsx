@@ -9,6 +9,15 @@ vi.mock('../../../lib/api', () => ({
   createRepo: (...args: unknown[]) => mockCreateRepo(...args),
 }));
 
+vi.mock('../../../lib/config', () => ({
+  getPageOptions: () => ({
+    storages: [
+      { id: 'hot-usa', name: 'USA' },
+      { id: 'hot-eu', name: 'EU', is_default: true },
+    ],
+  }),
+}));
+
 describe('NewLibrarySheet', () => {
   const onClose = vi.fn();
   const onCreated = vi.fn();
@@ -20,6 +29,7 @@ describe('NewLibrarySheet', () => {
   it('renders form fields when open', () => {
     render(<NewLibrarySheet isOpen={true} onClose={onClose} onCreated={onCreated} />);
     expect(screen.getByLabelText('Name')).toBeInTheDocument();
+    expect(screen.getByLabelText('Region')).toBeInTheDocument();
     expect(screen.getByText('Encrypt this library')).toBeInTheDocument();
     expect(screen.getByText('Create Library')).toBeInTheDocument();
   });
@@ -45,7 +55,7 @@ describe('NewLibrarySheet', () => {
     fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'Test Library' } });
     fireEvent.click(screen.getByText('Create Library'));
     await waitFor(() => {
-      expect(mockCreateRepo).toHaveBeenCalledWith('Test Library', false, undefined);
+      expect(mockCreateRepo).toHaveBeenCalledWith('Test Library', false, undefined, 'hot-eu');
     });
     expect(onCreated).toHaveBeenCalled();
     expect(onClose).toHaveBeenCalled();

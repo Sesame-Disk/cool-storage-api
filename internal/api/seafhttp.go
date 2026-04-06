@@ -494,6 +494,34 @@ func (h *SeafHTTPHandler) RegisterSeafHTTPRoutes(router *gin.Engine) {
 	}
 }
 
+func (h *SeafHTTPHandler) lookupLibraryStorageClass(orgID, repoID string) string {
+	if h == nil || h.db == nil || orgID == "" || repoID == "" {
+		return ""
+	}
+
+	var storageClass string
+	if err := h.db.Session().Query(`
+		SELECT storage_class FROM libraries WHERE org_id = ? AND library_id = ?
+	`, orgID, repoID).Scan(&storageClass); err != nil {
+		return ""
+	}
+
+	return storageClass
+}
+
+func (h *SeafHTTPHandler) resolveLibraryBlockStore(orgID, repoID string) (*storage.BlockStore, string, error) {
+	libraryClass := h.lookupLibraryStorageClass(orgID, repoID)
+	if h.storageManager != nil {
+		preferredClass := h.storageManager.ResolveStorageClass("", libraryClass, "hot")
+		return h.storageManager.GetHealthyBlockStore(preferredClass)
+	}
+	if h.storage != nil {
+		return storage.NewBlockStore(h.storage, "blocks/"), libraryClass, nil
+	}
+
+	return nil, libraryClass, fmt.Errorf("block storage not available")
+}
+
 // uploadBlockSize is the block size used when splitting large uploads into blocks.
 // 8 MB matches Seafile's default CDC block size for good deduplication compatibility.
 const uploadBlockSize = 8 * 1024 * 1024 // 8 MB
@@ -719,7 +747,7 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 
 	// Store using PutAuto (automatically uses multipart for large files)
 	ctx := context.Background()
-	blockStore, _, err := h.storageManager.GetHealthyBlockStore("")
+	blockStore, actualStorageClass, err := h.resolveLibraryBlockStore(token.OrgID, token.RepoID)
 	if err != nil {
 		log.Printf("[HandleUpload] Failed to get block store: %v, falling back to S3", err)
 		_, err = h.storage.PutAuto(c.Request.Context(), storageKey, newBytesReader(storedContent), int64(len(storedContent)))
@@ -752,8 +780,8 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 
 	// Register block metadata for size lookups (used by video/audio Range requests)
 	if err := h.db.Session().Query(`
-		INSERT INTO blocks (org_id, block_id, size_bytes, created_at) VALUES (?, ?, ?, toTimestamp(now()))
-	`, token.OrgID, sha256ID, len(storedContent)).Exec(); err != nil {
+		INSERT INTO blocks (org_id, block_id, size_bytes, storage_class, created_at) VALUES (?, ?, ?, ?, toTimestamp(now()))
+	`, token.OrgID, sha256ID, len(storedContent), actualStorageClass).Exec(); err != nil {
 		log.Printf("[HandleUpload] WARNING: Failed to write block metadata org=%s block=%s: %v", token.OrgID, sha256ID[:16], err)
 	}
 
@@ -811,7 +839,7 @@ func (h *SeafHTTPHandler) finalizeUploadStreaming(c *gin.Context, token *AccessT
 		}
 	}
 
-	blockStore, _, err := h.storageManager.GetHealthyBlockStore("")
+	blockStore, actualStorageClass, err := h.resolveLibraryBlockStore(token.OrgID, token.RepoID)
 	if err != nil {
 		return "", "", fmt.Errorf("block store not available: %w", err)
 	}
@@ -876,8 +904,8 @@ func (h *SeafHTTPHandler) finalizeUploadStreaming(c *gin.Context, token *AccessT
 
 		// Register block metadata for size lookups (used by video/audio Range requests)
 		if err := h.db.Session().Query(`
-			INSERT INTO blocks (org_id, block_id, size_bytes, created_at) VALUES (?, ?, ?, toTimestamp(now()))
-		`, token.OrgID, sha256ID, len(storedBlock)).Exec(); err != nil {
+			INSERT INTO blocks (org_id, block_id, size_bytes, storage_class, created_at) VALUES (?, ?, ?, ?, toTimestamp(now()))
+		`, token.OrgID, sha256ID, len(storedBlock), actualStorageClass).Exec(); err != nil {
 			log.Printf("[finalizeUploadStreaming] WARNING: Failed to write block metadata org=%s block=%s: %v", token.OrgID, sha256ID[:16], err)
 		}
 
@@ -1516,7 +1544,7 @@ func (h *SeafHTTPHandler) lookupFileBlocks(token *AccessToken) (blockIDs []strin
 		return nil, 0, nil, nil, fmt.Errorf("file metadata not found: %w", err)
 	}
 
-	blockStore, _, err = h.storageManager.GetHealthyBlockStore("")
+	blockStore, _, err = h.resolveLibraryBlockStore(token.OrgID, token.RepoID)
 	if err != nil {
 		return nil, 0, nil, nil, fmt.Errorf("block store not available: %w", err)
 	}
@@ -1920,7 +1948,7 @@ func (h *SeafHTTPHandler) addFileToZip(ctx context.Context, zw *zip.Writer, repo
 		return
 	}
 
-	blockStore, _, err := h.storageManager.GetHealthyBlockStore("")
+	blockStore, _, err := h.resolveLibraryBlockStore(orgID, repoID)
 	if err != nil {
 		log.Printf("[addFileToZip] Block store not available: %v", err)
 		return

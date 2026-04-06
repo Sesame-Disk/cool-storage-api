@@ -1,7 +1,6 @@
 package v2
 
 import (
-	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -98,6 +97,7 @@ type FileHandler struct {
 	config          *config.Config
 	storage         *storage.S3Store
 	blockStore      *storage.BlockStore
+	storageManager  *storage.Manager
 	tokenCreator    TokenCreator
 	zipTokenCreator LibraryTokenCreator // For zip-task endpoint (only needs CreateDownloadToken)
 	serverURL       string              // Base URL of the server for generating seafhttp URLs
@@ -106,11 +106,13 @@ type FileHandler struct {
 }
 
 // NewFileHandler creates a new FileHandler instance
-func NewFileHandler(database *db.DB, cfg *config.Config, s3Store *storage.S3Store, tokenCreator TokenCreator, serverURL string, permMiddleware *middleware.PermissionMiddleware) *FileHandler {
+func NewFileHandler(database *db.DB, cfg *config.Config, s3Store *storage.S3Store, blockStore *storage.BlockStore, storageManager *storage.Manager, tokenCreator TokenCreator, serverURL string, permMiddleware *middleware.PermissionMiddleware) *FileHandler {
 	return &FileHandler{
 		db:             database,
 		config:         cfg,
 		storage:        s3Store,
+		blockStore:     blockStore,
+		storageManager: storageManager,
 		tokenCreator:   tokenCreator,
 		serverURL:      serverURL,
 		permMiddleware: permMiddleware,
@@ -120,6 +122,41 @@ func NewFileHandler(database *db.DB, cfg *config.Config, s3Store *storage.S3Stor
 // SetGCEnqueuer sets the GC enqueuer for inline block enqueue on deletion.
 func (h *FileHandler) SetGCEnqueuer(enqueuer GCEnqueuer) {
 	h.gcEnqueuer = enqueuer
+}
+
+func (h *FileHandler) lookupLibraryStorageClass(orgID, repoID string) string {
+	if h == nil || h.db == nil || orgID == "" || repoID == "" {
+		return ""
+	}
+
+	var storageClass string
+	if err := h.db.Session().Query(`
+		SELECT storage_class FROM libraries WHERE org_id = ? AND library_id = ?
+	`, orgID, repoID).Scan(&storageClass); err != nil {
+		return ""
+	}
+
+	return storageClass
+}
+
+func (h *FileHandler) resolveLibraryBlockStore(c *gin.Context, orgID, repoID string) (*storage.BlockStore, string, error) {
+	libraryClass := h.lookupLibraryStorageClass(orgID, repoID)
+	if h.storageManager != nil {
+		preferredClass := h.storageManager.ResolveStorageClass(httputil.GetRoutingHostname(c), libraryClass, "hot")
+		return h.storageManager.GetHealthyBlockStore(preferredClass)
+	}
+
+	if libraryClass == "" && h.config != nil {
+		libraryClass = h.config.Storage.DefaultClass
+	}
+	if h.blockStore != nil {
+		return h.blockStore, libraryClass, nil
+	}
+	if h.storage != nil {
+		return storage.NewBlockStore(h.storage, "blocks/"), libraryClass, nil
+	}
+
+	return nil, libraryClass, fmt.Errorf("block storage not available")
 }
 
 // requireDecryptSession checks if a library is encrypted and requires an active decrypt session.
@@ -2653,24 +2690,30 @@ func (h *FileHandler) UploadFile(c *gin.Context) {
 		SELECT block_id FROM blocks WHERE org_id = ? AND block_id = ?
 	`, orgID, blockID).Scan(&existingBlockID)
 
-	// Storage key format: org_id/block_id (content-addressed)
-	storageKey := fmt.Sprintf("%s/%s", orgID, blockID)
+	blockStore, storageClass, err := h.resolveLibraryBlockStore(c, orgID, repoID)
+	if err != nil || blockStore == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "block storage not available"})
+		return
+	}
+
+	storageKey := ""
 
 	if existingBlockID == "" {
-		// Upload block to S3 if storage is available
-		if h.storage != nil {
-			_, err := h.storage.Put(c.Request.Context(), storageKey, bytes.NewReader(content), int64(len(content)))
-			if err != nil {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to upload to storage"})
-				return
-			}
+		storageKey, err = blockStore.PutBlockData(c.Request.Context(), &storage.BlockData{
+			Hash: blockID,
+			Data: content,
+			Size: int64(len(content)),
+		})
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to upload to storage"})
+			return
 		}
 
 		// Store block metadata in database
 		if err := h.db.Session().Query(`
 			INSERT INTO blocks (org_id, block_id, size_bytes, storage_class, storage_key, ref_count, created_at, last_accessed)
 			VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-		`, orgID, blockID, len(content), h.config.Storage.DefaultClass,
+		`, orgID, blockID, len(content), storageClass,
 			storageKey, 1, time.Now(), time.Now(),
 		).Exec(); err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to store block metadata"})

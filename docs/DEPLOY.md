@@ -599,6 +599,68 @@ Create a `config.prod.yaml` per region (or a single one that uses
 `configs/config-usa.yaml` and `configs/config-eu.yaml` for the structure —
 replace MinIO endpoints with real S3 buckets.
 
+### Current status of the region-aware library feature
+
+What already works in the backend/frontend stack:
+
+- new libraries can persist an explicit `storage_id`
+- when no `storage_id` is provided, the backend can derive the default region from the request hostname
+- later writes and reads follow the persisted library `storage_class` instead of the request host default
+- focused integration tests cover create-library, raw serving, historic reads, and share-link raw serving
+
+What the stock production deploy does **not** provide by itself yet:
+
+- `config.prod.yaml` still ships as a single-region example using legacy `backends:`
+- `docker-compose.prod.yml` does not spin up per-region SesameFS front doors or per-region storage configs automatically
+- there is no built-in migration workflow for existing non-empty libraries that need to move from one storage class to another
+- GC is still guarded operationally (`GC_ENABLED`) rather than by leader election, so multi-replica backend deployments need manual discipline
+
+For production multi-region, treat this feature as requiring operator-provided topology plus the config changes below.
+
+### Step M2.1 — Required config for region-pinned libraries
+
+In production multi-region, `config.prod.yaml` must stop using the single `backends:` example and define all of these:
+
+- `storage.classes`
+- `storage.default_class`
+- `storage.endpoint_regions`
+- `storage.region_classes`
+
+Use `config.example.yaml` as the canonical structure. At minimum, you need one hot class per region, for example:
+
+```yaml
+storage:
+  default_class: hot-s3-usa
+  classes:
+    hot-s3-usa:
+      type: s3
+      tier: hot
+      bucket: sesamefs-usa
+      region: us-east-1
+    hot-s3-eu:
+      type: s3
+      tier: hot
+      bucket: sesamefs-eu
+      region: eu-west-1
+
+  endpoint_regions:
+    "us.files.yourdomain.com": "usa"
+    "eu.files.yourdomain.com": "eu"
+    "*": "usa"
+
+  region_classes:
+    usa:
+      hot: hot-s3-usa
+    eu:
+      hot: hot-s3-eu
+```
+
+### Step M2.2 — Ingress requirement
+
+The backend must receive the original external hostname. If you terminate TLS or proxy through nginx/traefik/LB, preserve `Host` or forward `X-Forwarded-Host` correctly.
+
+Without that, hostname-derived default region selection on library creation will silently fall back to the global default region.
+
 ### Step M3 — Firewall (private network)
 
 Allow Cassandra inter-node traffic **only on the private interface**:
@@ -679,6 +741,23 @@ curl https://eu.files.sesamedisk.com/ready       # {"database":"ok","storage":"o
 docker compose -f docker-compose.prod.yml exec cassandra nodetool status
 ```
 
+### Step M6 — Verify region-pinned library behavior
+
+After deploying the multi-region config, verify the behavior that matters for data integrity:
+
+```bash
+# Rebuild the running backend after backend changes
+docker compose -f docker-compose.prod.yml up -d --build sesamefs
+
+# Focused integrity checks (run from a test-capable environment)
+docker compose run --build --rm -e SESAMEFS_URL=http://sesamefs:8080 \
+  gotest go test -tags integration \
+  -run 'TestCreateLibraryStorageSelection|TestRegionPinnedLibraryReadPaths|TestRegionPinnedHistoricReadPaths|TestRegionPinnedShareLinkRaw' \
+  -count=1 -v ./internal/integration/...
+```
+
+These are the minimum checks that prove a library created in one region does not start reading from another region just because the request lands on a different hostname.
+
 ### Cassandra tips for multi-DC
 
 - **Consistency:** `LOCAL_QUORUM` reads/writes stay within the local DC
@@ -740,3 +819,4 @@ username+password) **always returns 401** when `AUTH_DEV_MODE=false`.
   and early production. For HA, deploy multi-region (see above).
 - **No Cassandra backup** configured — set up snapshots before storing
   important data.
+- **Existing-library migration is still manual** — the current feature set safely pins new libraries and preserves consistent reads/writes, but does not yet provide a production migration workflow for moving already-populated libraries between storage classes or regions.

@@ -145,3 +145,76 @@ func TestEncryptedLibrary(t *testing.T) {
 	}
 	setPassResp.Body.Close()
 }
+
+func TestCreateLibraryStorageSelection(t *testing.T) {
+	t.Run("explicit storage_id wins over endpoint default", func(t *testing.T) {
+		name := fmt.Sprintf("inttest-storage-explicit-%d", time.Now().UnixNano())
+		resp := adminClient.PostJSONWithHost(t, "/api2/repos/", map[string]string{
+			"name":       name,
+			"storage_id": "hot-s3-usa",
+		}, "eu.sesamefs.local")
+		expectStatus(t, resp, http.StatusOK)
+
+		result := responseJSON(t, resp)
+		repoID, _ := result["repo_id"].(string)
+		if repoID == "" {
+			t.Fatalf("expected repo_id in create response: %v", result)
+		}
+		if result["storage_id"] != "hot-s3-usa" {
+			t.Fatalf("storage_id = %v, want %q", result["storage_id"], "hot-s3-usa")
+		}
+		if result["storage_name"] != "USA" {
+			t.Fatalf("storage_name = %v, want %q", result["storage_name"], "USA")
+		}
+
+		t.Cleanup(func() {
+			cleanup := adminClient.Delete(t, fmt.Sprintf("/api/v2.1/repos/%s/", repoID))
+			cleanup.Body.Close()
+		})
+
+		getResp := adminClient.Get(t, fmt.Sprintf("/api2/repos/%s/", repoID))
+		expectStatus(t, getResp, http.StatusOK)
+		getResult := responseJSON(t, getResp)
+		if getResult["storage_id"] != "hot-s3-usa" {
+			t.Fatalf("persisted storage_id = %v, want %q", getResult["storage_id"], "hot-s3-usa")
+		}
+		if getResult["storage_name"] != "USA" {
+			t.Fatalf("persisted storage_name = %v, want %q", getResult["storage_name"], "USA")
+		}
+	})
+
+	t.Run("endpoint host selects default region", func(t *testing.T) {
+		name := fmt.Sprintf("inttest-storage-default-%d", time.Now().UnixNano())
+		resp := adminClient.PostJSONWithHost(t, "/api2/repos/", map[string]string{
+			"name": name,
+		}, "eu.sesamefs.local")
+		expectStatus(t, resp, http.StatusOK)
+
+		result := responseJSON(t, resp)
+		repoID, _ := result["repo_id"].(string)
+		if repoID == "" {
+			t.Fatalf("expected repo_id in create response: %v", result)
+		}
+		if result["storage_id"] != "hot-s3-eu" {
+			t.Fatalf("storage_id = %v, want %q", result["storage_id"], "hot-s3-eu")
+		}
+		if result["storage_name"] != "EU" {
+			t.Fatalf("storage_name = %v, want %q", result["storage_name"], "EU")
+		}
+
+		t.Cleanup(func() {
+			cleanup := adminClient.Delete(t, fmt.Sprintf("/api/v2.1/repos/%s/", repoID))
+			cleanup.Body.Close()
+		})
+
+		getResp := adminClient.GetWithHost(t, fmt.Sprintf("/api2/repos/%s/", repoID), "eu.sesamefs.local")
+		expectStatus(t, getResp, http.StatusOK)
+		getResult := responseJSON(t, getResp)
+		if getResult["storage_id"] != "hot-s3-eu" {
+			t.Fatalf("persisted storage_id = %v, want %q", getResult["storage_id"], "hot-s3-eu")
+		}
+		if getResult["storage_name"] != "EU" {
+			t.Fatalf("persisted storage_name = %v, want %q", getResult["storage_name"], "EU")
+		}
+	})
+}

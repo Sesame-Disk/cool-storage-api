@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Sesame-Disk/sesamefs/internal/storage"
 	"github.com/gin-gonic/gin"
 )
 
@@ -201,6 +202,25 @@ func TestTokenManagerGetToken(t *testing.T) {
 				t.Error("token should not be nil when ok is true")
 			}
 		})
+	}
+}
+
+func TestResolveLibraryBlockStoreUsesDefaultStorageClass(t *testing.T) {
+	manager := storage.NewManager()
+	manager.SetDefaultClass("hot-minio-local")
+	manager.RegisterBackend("hot-minio-local", &storage.S3Store{}, "")
+
+	h := &SeafHTTPHandler{storageManager: manager}
+
+	blockStore, storageClass, err := h.resolveLibraryBlockStore("org-id", "repo-id")
+	if err != nil {
+		t.Fatalf("resolveLibraryBlockStore returned error: %v", err)
+	}
+	if blockStore == nil {
+		t.Fatal("resolveLibraryBlockStore returned nil block store")
+	}
+	if storageClass != "hot-minio-local" {
+		t.Fatalf("resolveLibraryBlockStore storage class = %q, want %q", storageClass, "hot-minio-local")
 	}
 }
 

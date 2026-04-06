@@ -32,18 +32,22 @@ type OnlyOfficeHandler struct {
 	db             *db.DB
 	config         *config.Config
 	storage        *storage.S3Store
+	blockStore     *storage.BlockStore
+	storageManager *storage.Manager
 	tokenCreator   TokenCreator
 	serverURL      string
 	permMiddleware *middleware.PermissionMiddleware
 }
 
 // RegisterOnlyOfficeRoutes registers OnlyOffice routes
-func RegisterOnlyOfficeRoutes(rg *gin.RouterGroup, database *db.DB, cfg *config.Config, s3Store *storage.S3Store, tokenCreator TokenCreator, serverURL string) {
+func RegisterOnlyOfficeRoutes(rg *gin.RouterGroup, database *db.DB, cfg *config.Config, s3Store *storage.S3Store, blockStore *storage.BlockStore, storageManager *storage.Manager, tokenCreator TokenCreator, serverURL string) {
 	permMiddleware := middleware.NewPermissionMiddleware(database)
 	h := &OnlyOfficeHandler{
 		db:             database,
 		config:         cfg,
 		storage:        s3Store,
+		blockStore:     blockStore,
+		storageManager: storageManager,
 		tokenCreator:   tokenCreator,
 		serverURL:      serverURL,
 		permMiddleware: permMiddleware,
@@ -58,12 +62,14 @@ func RegisterOnlyOfficeRoutes(rg *gin.RouterGroup, database *db.DB, cfg *config.
 }
 
 // RegisterOnlyOfficeCallbackRoutes registers the callback route (under /onlyoffice/)
-func RegisterOnlyOfficeCallbackRoutes(rg *gin.RouterGroup, database *db.DB, cfg *config.Config, s3Store *storage.S3Store, serverURL string) {
+func RegisterOnlyOfficeCallbackRoutes(rg *gin.RouterGroup, database *db.DB, cfg *config.Config, s3Store *storage.S3Store, blockStore *storage.BlockStore, storageManager *storage.Manager, serverURL string) {
 	permMiddleware := middleware.NewPermissionMiddleware(database)
 	h := &OnlyOfficeHandler{
 		db:             database,
 		config:         cfg,
 		storage:        s3Store,
+		blockStore:     blockStore,
+		storageManager: storageManager,
 		serverURL:      serverURL,
 		permMiddleware: permMiddleware,
 	}
@@ -120,6 +126,42 @@ type OnlyOfficeConfig struct {
 	DocumentType string                 `json:"documentType"`
 	EditorConfig OnlyOfficeEditorConfig `json:"editorConfig"`
 	Token        string                 `json:"token,omitempty"`
+}
+
+func (h *OnlyOfficeHandler) lookupLibraryStorageClass(orgID, repoID string) string {
+	if h == nil || h.db == nil || orgID == "" || repoID == "" {
+		return ""
+	}
+
+	var storageClass string
+	if err := h.db.Session().Query(`
+		SELECT storage_class FROM libraries WHERE org_id = ? AND library_id = ?
+	`, orgID, repoID).Scan(&storageClass); err != nil {
+		return ""
+	}
+
+	return storageClass
+}
+
+func (h *OnlyOfficeHandler) resolveLibraryBlockStore(orgID, repoID string) (*storage.BlockStore, string, error) {
+	libraryClass := h.lookupLibraryStorageClass(orgID, repoID)
+	if h.storageManager != nil {
+		preferredClass := libraryClass
+		if preferredClass == "" && h.config != nil {
+			preferredClass = h.config.Storage.DefaultClass
+		}
+		return h.storageManager.GetHealthyBlockStore(preferredClass)
+	}
+	if libraryClass == "" && h.config != nil {
+		libraryClass = h.config.Storage.DefaultClass
+	}
+	if h.blockStore != nil {
+		return h.blockStore, libraryClass, nil
+	}
+	if h.storage != nil {
+		return storage.NewBlockStore(h.storage, "blocks/"), libraryClass, nil
+	}
+	return nil, libraryClass, fmt.Errorf("block storage not available")
 }
 
 // OnlyOfficeResponse represents the API response
@@ -671,18 +713,18 @@ func (h *OnlyOfficeHandler) saveEditedDocument(ctx context.Context, repoID, file
 	sha256Hash := sha256.Sum256(content)
 	internalBlockID := hex.EncodeToString(sha256Hash[:])
 
-	// Store the block using BlockStore with SHA-256 key
-	if h.storage != nil {
-		blockStore := storage.NewBlockStore(h.storage, "blocks/")
-		block := &storage.BlockData{
-			Hash: internalBlockID,
-			Data: content,
-			Size: int64(len(content)),
-		}
-		_, err = blockStore.PutBlockData(ctx, block)
-		if err != nil {
-			return fmt.Errorf("failed to store block: %w", err)
-		}
+	blockStore, storageClass, err := h.resolveLibraryBlockStore(orgID, repoID)
+	if err != nil || blockStore == nil {
+		return fmt.Errorf("failed to resolve block storage: %w", err)
+	}
+
+	storageKey, err := blockStore.PutBlockData(ctx, &storage.BlockData{
+		Hash: internalBlockID,
+		Data: content,
+		Size: int64(len(content)),
+	})
+	if err != nil {
+		return fmt.Errorf("failed to store block: %w", err)
 	}
 
 	// Create SHA-1 → SHA-256 mapping for sync protocol compatibility (dual-write: forward + reverse)
@@ -701,11 +743,10 @@ func (h *OnlyOfficeHandler) saveEditedDocument(ctx context.Context, repoID, file
 
 	// Store block metadata using internal (SHA-256) ID
 	now := time.Now()
-	storageKey := fmt.Sprintf("blocks/%s/%s/%s", internalBlockID[:2], internalBlockID[2:4], internalBlockID)
 	if err := h.db.Session().Query(`
 		INSERT INTO blocks (org_id, block_id, size_bytes, storage_class, storage_key, ref_count, created_at, last_accessed)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-	`, orgID, internalBlockID, len(content), h.config.Storage.DefaultClass, storageKey, 1, now, now).Exec(); err != nil {
+	`, orgID, internalBlockID, len(content), storageClass, storageKey, 1, now, now).Exec(); err != nil {
 		log.Printf("Failed to store block metadata: %v", err)
 	}
 

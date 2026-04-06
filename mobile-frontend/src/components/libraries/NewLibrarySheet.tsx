@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import BottomSheet from '../ui/BottomSheet';
 import { createRepo } from '../../lib/api';
+import { getPageOptions } from '../../lib/config';
 
 interface NewLibrarySheetProps {
   isOpen: boolean;
@@ -8,11 +9,27 @@ interface NewLibrarySheetProps {
   onCreated: () => void;
 }
 
+function normalizeStorageOptions() {
+  return (getPageOptions().storages || []).map((item: any) => {
+    if (typeof item === 'string') {
+      return { id: item, name: item, is_default: false };
+    }
+    return {
+      id: item?.id ?? '',
+      name: item?.name ?? item?.id ?? '',
+      is_default: item?.is_default === true,
+    };
+  }).filter((item: { id: string }) => item.id);
+}
+
 export default function NewLibrarySheet({ isOpen, onClose, onCreated }: NewLibrarySheetProps) {
+  const storageOptions = normalizeStorageOptions();
+  const defaultStorageID = storageOptions.find((item) => item.is_default)?.id || storageOptions[0]?.id || '';
   const [name, setName] = useState('');
   const [encrypted, setEncrypted] = useState(false);
   const [password, setPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
+  const [storageID, setStorageID] = useState(defaultStorageID);
   const [error, setError] = useState('');
   const [submitting, setSubmitting] = useState(false);
 
@@ -21,6 +38,7 @@ export default function NewLibrarySheet({ isOpen, onClose, onCreated }: NewLibra
     setEncrypted(false);
     setPassword('');
     setConfirmPassword('');
+    setStorageID(defaultStorageID);
     setError('');
   };
 
@@ -52,7 +70,7 @@ export default function NewLibrarySheet({ isOpen, onClose, onCreated }: NewLibra
 
     setSubmitting(true);
     try {
-      await createRepo(trimmedName, encrypted, encrypted ? password : undefined);
+      await createRepo(trimmedName, encrypted, encrypted ? password : undefined, storageID || undefined);
       reset();
       onCreated();
       onClose();
@@ -80,6 +98,24 @@ export default function NewLibrarySheet({ isOpen, onClose, onCreated }: NewLibra
             autoFocus
           />
         </div>
+
+        {storageOptions.length > 0 && (
+          <div>
+            <label htmlFor="lib-region" className="block text-sm font-medium text-text dark:text-dark-text mb-1">
+              Region
+            </label>
+            <select
+              id="lib-region"
+              value={storageID}
+              onChange={(e) => setStorageID(e.target.value)}
+              className="w-full px-3 py-2 border border-gray-300 dark:border-dark-border rounded-lg bg-white dark:bg-dark-surface text-text dark:text-dark-text min-h-[44px]"
+            >
+              {storageOptions.map((option) => (
+                <option key={option.id} value={option.id}>{option.name}</option>
+              ))}
+            </select>
+          </div>
+        )}
 
         <label className="flex items-center gap-3 min-h-[44px] cursor-pointer">
           <input

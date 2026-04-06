@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/Sesame-Disk/sesamefs/internal/config"
 	"github.com/Sesame-Disk/sesamefs/internal/middleware"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
@@ -138,6 +139,103 @@ func TestFormatSizeRealistic(t *testing.T) {
 				t.Errorf("formatSize(%d) = %q, want %q", tt.bytes, result, tt.expected)
 			}
 		})
+	}
+}
+
+func TestResolveRequestedStorageClass(t *testing.T) {
+	h := &LibraryHandler{
+		config: &config.Config{
+			Storage: config.StorageConfig{
+				DefaultClass: "hot-usa",
+				Classes: map[string]config.StorageClassConfig{
+					"hot-usa": {},
+					"hot-eu":  {},
+				},
+				EndpointRegions: map[string]string{
+					"eu.example.com": "eu",
+				},
+				RegionClasses: map[string]config.RegionClassConfig{
+					"eu": {Hot: "hot-eu"},
+				},
+			},
+		},
+	}
+
+	t.Run("uses explicit selection", func(t *testing.T) {
+		got, err := h.resolveRequestedStorageClass("eu.example.com", "hot-usa")
+		if err != nil {
+			t.Fatalf("resolveRequestedStorageClass returned error: %v", err)
+		}
+		if got != "hot-usa" {
+			t.Fatalf("got %q, want %q", got, "hot-usa")
+		}
+	})
+
+	t.Run("uses endpoint default when request is empty", func(t *testing.T) {
+		got, err := h.resolveRequestedStorageClass("eu.example.com", "")
+		if err != nil {
+			t.Fatalf("resolveRequestedStorageClass returned error: %v", err)
+		}
+		if got != "hot-eu" {
+			t.Fatalf("got %q, want %q", got, "hot-eu")
+		}
+	})
+
+	t.Run("rejects invalid explicit class", func(t *testing.T) {
+		_, err := h.resolveRequestedStorageClass("eu.example.com", "missing")
+		if err == nil {
+			t.Fatal("expected error for invalid storage class")
+		}
+	})
+
+	t.Run("uses deterministic sorted fallback when default is invalid", func(t *testing.T) {
+		h.config.Storage.DefaultClass = "missing-default"
+		h.config.Storage.EndpointRegions = map[string]string{}
+		h.config.Storage.RegionClasses = map[string]config.RegionClassConfig{}
+		h.config.Storage.Classes = map[string]config.StorageClassConfig{
+			"hot-zeta":  {},
+			"hot-alpha": {},
+		}
+		h.config.Storage.Backends = map[string]config.BackendConfig{}
+
+		got, err := h.resolveRequestedStorageClass("unknown.example.com", "")
+		if err != nil {
+			t.Fatalf("resolveRequestedStorageClass returned error: %v", err)
+		}
+		if got != "hot-alpha" {
+			t.Fatalf("got %q, want %q", got, "hot-alpha")
+		}
+	})
+
+	t.Run("errors when no valid storage class exists", func(t *testing.T) {
+		h.config.Storage.DefaultClass = ""
+		h.config.Storage.Classes = map[string]config.StorageClassConfig{}
+		h.config.Storage.Backends = map[string]config.BackendConfig{}
+
+		_, err := h.resolveRequestedStorageClass("unknown.example.com", "")
+		if err == nil {
+			t.Fatal("expected error when no valid storage class is configured")
+		}
+	})
+}
+
+func TestDisplayStorageNameUsesRegionLabel(t *testing.T) {
+	h := &LibraryHandler{
+		config: &config.Config{
+			Storage: config.StorageConfig{
+				RegionClasses: map[string]config.RegionClassConfig{
+					"usa": {Hot: "hot-usa"},
+					"eu":  {Hot: "hot-eu"},
+				},
+			},
+		},
+	}
+
+	if got := h.displayStorageName("hot-eu"); got != "EU" {
+		t.Fatalf("displayStorageName = %q, want %q", got, "EU")
+	}
+	if got := h.displayStorageName("custom-class"); got != "custom-class" {
+		t.Fatalf("displayStorageName = %q, want %q", got, "custom-class")
 	}
 }
 
@@ -466,18 +564,18 @@ func TestGetRepoFolderShareInfo(t *testing.T) {
 // TestV21LibraryStruct tests V21Library JSON serialization
 func TestV21LibraryStruct(t *testing.T) {
 	lib := V21Library{
-		Type:              "mine",
-		RepoID:            "12345678-1234-1234-1234-123456789012",
-		RepoName:          "Test Library",
-		OwnerEmail:        "user@example.com",
-		OwnerName:         "user",
-		LastModified:      "2026-01-01T00:00:00Z",
-		Size:              1024,
-		Encrypted:         0, // Must be int (0 or 1), not bool
-		Permission:        "rw",
-		Starred:           false,
-		Monitored:         false,
-		Status:            "normal",
+		Type:         "mine",
+		RepoID:       "12345678-1234-1234-1234-123456789012",
+		RepoName:     "Test Library",
+		OwnerEmail:   "user@example.com",
+		OwnerName:    "user",
+		LastModified: "2026-01-01T00:00:00Z",
+		Size:         1024,
+		Encrypted:    0, // Must be int (0 or 1), not bool
+		Permission:   "rw",
+		Starred:      false,
+		Monitored:    false,
+		Status:       "normal",
 	}
 
 	data, err := json.Marshal(lib)

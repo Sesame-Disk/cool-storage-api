@@ -3,10 +3,12 @@ package api
 import (
 	"fmt"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/Sesame-Disk/sesamefs/internal/httputil"
 	"github.com/Sesame-Disk/sesamefs/internal/middleware"
 	"github.com/Sesame-Disk/sesamefs/internal/plans"
 	"github.com/Sesame-Disk/sesamefs/internal/traffic"
@@ -82,6 +84,7 @@ func (s *Server) handleBootstrap(c *gin.Context) {
 	}
 	orgData := s.loadBootstrapOrgData(identity.OrgID)
 	appPageOptions := s.buildAppBootstrapPageOptions(identity, userData, orgData)
+	appPageOptions["storages"] = s.buildBootstrapStorageOptions(httputil.GetRoutingHostname(c))
 	orgPageOptions := s.buildOrgBootstrapPageOptions(identity.OrgID, orgData)
 	canAccessOrgAdmin := middleware.IsOrgStaff(identity.Role)
 	canAccessSysAdmin := middleware.IsPlatformSuperAdmin(identity.OrgID, middleware.OrganizationRole(identity.Role))
@@ -99,6 +102,181 @@ func (s *Server) handleBootstrap(c *gin.Context) {
 			"canAccessSysAdmin": canAccessSysAdmin,
 		},
 	})
+}
+
+func formatBootstrapRegionLabel(region string) string {
+	region = strings.TrimSpace(region)
+	if region == "" {
+		return ""
+	}
+
+	parts := strings.FieldsFunc(region, func(r rune) bool {
+		return r == '-' || r == '_' || r == ' '
+	})
+	for i, part := range parts {
+		lower := strings.ToLower(part)
+		switch lower {
+		case "us", "usa", "eu", "uk", "uae":
+			parts[i] = strings.ToUpper(lower)
+		default:
+			parts[i] = strings.ToUpper(lower[:1]) + lower[1:]
+		}
+	}
+
+	return strings.Join(parts, " ")
+}
+
+func (s *Server) resolveBootstrapEndpointRegion(hostname string) string {
+	if s == nil || s.config == nil {
+		return "default"
+	}
+
+	hostname = strings.TrimSpace(hostname)
+	if region, ok := s.config.Storage.EndpointRegions[hostname]; ok {
+		return region
+	}
+
+	for pattern, region := range s.config.Storage.EndpointRegions {
+		if len(pattern) > 1 && pattern[0] == '*' {
+			suffix := pattern[1:]
+			if strings.HasSuffix(hostname, suffix) && len(hostname) > len(suffix) {
+				return region
+			}
+		}
+	}
+
+	if region, ok := s.config.Storage.EndpointRegions["*"]; ok {
+		return region
+	}
+
+	return "default"
+}
+
+func (s *Server) bootstrapStorageDisplayName(storageClass string) string {
+	storageClass = strings.TrimSpace(storageClass)
+	if storageClass == "" || s == nil || s.config == nil {
+		return storageClass
+	}
+
+	for region, regionConfig := range s.config.Storage.RegionClasses {
+		if regionConfig.Hot == storageClass || regionConfig.Cold == storageClass {
+			return formatBootstrapRegionLabel(region)
+		}
+	}
+
+	return storageClass
+}
+
+func (s *Server) resolveBootstrapDefaultStorageClass(hostname string) string {
+	if s == nil || s.config == nil {
+		return ""
+	}
+
+	region := s.resolveBootstrapEndpointRegion(hostname)
+	if regionConfig, ok := s.config.Storage.RegionClasses[region]; ok && s.isBootstrapKnownStorageClass(regionConfig.Hot) {
+		return regionConfig.Hot
+	}
+	if s.isBootstrapKnownStorageClass(s.config.Storage.DefaultClass) {
+		return s.config.Storage.DefaultClass
+	}
+	classNames := make([]string, 0, len(s.config.Storage.Classes))
+	for name := range s.config.Storage.Classes {
+		classNames = append(classNames, name)
+	}
+	sort.Strings(classNames)
+	for _, name := range classNames {
+		if s.isBootstrapKnownStorageClass(name) {
+			return name
+		}
+	}
+	backendNames := make([]string, 0, len(s.config.Storage.Backends))
+	for name := range s.config.Storage.Backends {
+		backendNames = append(backendNames, name)
+	}
+	sort.Strings(backendNames)
+	for _, name := range backendNames {
+		if s.isBootstrapKnownStorageClass(name) {
+			return name
+		}
+	}
+	return ""
+}
+
+func (s *Server) isBootstrapKnownStorageClass(storageClass string) bool {
+	storageClass = strings.TrimSpace(storageClass)
+	if storageClass == "" || s == nil || s.config == nil {
+		return false
+	}
+	if _, ok := s.config.Storage.Classes[storageClass]; ok {
+		return true
+	}
+	if _, ok := s.config.Storage.Backends[storageClass]; ok {
+		return true
+	}
+	return false
+}
+
+func (s *Server) buildBootstrapStorageOptions(hostname string) []gin.H {
+	if s == nil || s.config == nil {
+		return []gin.H{}
+	}
+
+	defaultClass := s.resolveBootstrapDefaultStorageClass(hostname)
+	options := make([]gin.H, 0)
+	seen := make(map[string]struct{})
+	appendOption := func(id, name string) {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			return
+		}
+		if _, ok := seen[id]; ok {
+			return
+		}
+		option := gin.H{"id": id, "name": name}
+		if id == defaultClass {
+			option["is_default"] = true
+		}
+		options = append(options, option)
+		seen[id] = struct{}{}
+	}
+
+	regions := make([]string, 0, len(s.config.Storage.RegionClasses))
+	for region, regionConfig := range s.config.Storage.RegionClasses {
+		if strings.TrimSpace(regionConfig.Hot) == "" {
+			continue
+		}
+		regions = append(regions, region)
+	}
+	sort.Strings(regions)
+	for _, region := range regions {
+		appendOption(s.config.Storage.RegionClasses[region].Hot, formatBootstrapRegionLabel(region))
+	}
+
+	if len(options) == 0 {
+		classNames := make([]string, 0, len(s.config.Storage.Classes))
+		for className := range s.config.Storage.Classes {
+			classNames = append(classNames, className)
+		}
+		sort.Strings(classNames)
+		for _, className := range classNames {
+			appendOption(className, className)
+		}
+
+		backendNames := make([]string, 0, len(s.config.Storage.Backends))
+		for backendName := range s.config.Storage.Backends {
+			backendNames = append(backendNames, backendName)
+		}
+		sort.Strings(backendNames)
+		for _, backendName := range backendNames {
+			appendOption(backendName, backendName)
+		}
+	}
+
+	if defaultClass != "" {
+		appendOption(defaultClass, s.bootstrapStorageDisplayName(defaultClass))
+	}
+
+	return options
 }
 
 func (s *Server) resolveBootstrapIdentity(c *gin.Context) bootstrapIdentity {
