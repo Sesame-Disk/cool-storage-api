@@ -776,32 +776,35 @@ func (h *AdminHandler) BatchAddAdmins(c *gin.Context) {
 			continue
 		}
 
-		// Set role to superadmin
-		if err := h.db.Session().Query(`UPDATE users SET role = ? WHERE org_id = ? AND user_id = ?`,
-			"superadmin", userOrgID, userID).Exec(); err != nil {
-			failed = append(failed, gin.H{"email": email, "error_msg": "failed to update user"})
-			continue
-		}
-		if err := syncAdminUserReadModel(h.db, userOrgID, userID); err != nil {
-			failed = append(failed, gin.H{"email": email, "error_msg": "failed to sync user read model"})
-			continue
-		}
-		if err := syncAdminOrganizationReadModel(h.db, userOrgID); err != nil {
-			failed = append(failed, gin.H{"email": email, "error_msg": "failed to sync organization read model"})
-			continue
-		}
-
-		// Read back updated user data
 		var name, role, status string
-		var quotaBytes int64
+		var quotaBytes, trafficUploadQuota, trafficDownloadQuota int64
+		var deletedAt *time.Time
 		var createdAt, lastLoginAt time.Time
 		if err := h.db.Session().Query(`
-			SELECT name, role, status, quota_bytes, created_at, last_login_at
+			SELECT name, role, status, quota_bytes, traffic_upload_quota, traffic_download_quota, deleted_at, created_at, last_login_at
 			FROM users WHERE org_id = ? AND user_id = ?
-		`, userOrgID, userID).Scan(&name, &role, &status, &quotaBytes, &createdAt, &lastLoginAt); err != nil {
+		`, userOrgID, userID).Scan(&name, &role, &status, &quotaBytes, &trafficUploadQuota, &trafficDownloadQuota, &deletedAt, &createdAt, &lastLoginAt); err != nil {
 			failed = append(failed, gin.H{"email": email, "error_msg": "failed to read user"})
 			continue
 		}
+
+		// Set role to superadmin
+		if err := updateUserAndAdminReadModels(h.db, userOrgID, userID, batchedUserUpdate{
+			Name:                 name,
+			Role:                 "superadmin",
+			Status:               status,
+			DeletedAt:            deletedAt,
+			QuotaBytes:           quotaBytes,
+			TrafficUploadQuota:   trafficUploadQuota,
+			TrafficDownloadQuota: trafficDownloadQuota,
+		}); err != nil {
+			failed = append(failed, gin.H{"email": email, "error_msg": "failed to update user"})
+			continue
+		}
+		invalidateSessionsOnDemotion(h.sessions, userOrgID, userID, role, "superadmin")
+
+		// Read back updated user data
+		role = "superadmin"
 		success = append(success, makeAdminUserResponse(email, name, role, status, quotaBytes, traffic.ReadStorageUsed(h.db, fmt.Sprintf("user:%s:%s", userOrgID, userID)), createdAt, lastLoginAt))
 	}
 

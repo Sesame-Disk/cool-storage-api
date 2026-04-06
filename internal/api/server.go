@@ -1708,18 +1708,29 @@ func (s *Server) handleUpdateAccountInfo(c *gin.Context) {
 		return
 	}
 
-	if err := s.db.Session().Query(`
+	userProjectionRow, err := db.ReadAdminUserProjectionRow(s.db.Session(), orgID, userID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to build profile read model"})
+		return
+	}
+	orgProjectionRow, err := db.ReadAdminOrganizationProjectionRow(s.db.Session(), orgID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to build organization read model"})
+		return
+	}
+	userProjectionRow.Name = name
+	if orgProjectionRow.OwnerEmail == userProjectionRow.Email {
+		orgProjectionRow.OwnerName = name
+	}
+
+	batch := s.db.Session().Batch(gocql.LoggedBatch)
+	batch.Query(`
 		UPDATE users SET name = ? WHERE org_id = ? AND user_id = ?
-	`, name, orgUUID, userUUID).Exec(); err != nil {
+	`, name, orgUUID, userUUID)
+	db.AddUpsertAdminUserReadModelQuery(batch, userProjectionRow)
+	db.AddUpsertAdminOrganizationReadModelQuery(batch, orgProjectionRow)
+	if err := batch.Exec(); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update profile"})
-		return
-	}
-	if err := db.SyncAdminUserReadModel(s.db.Session(), orgID, userID); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to sync profile"})
-		return
-	}
-	if err := db.SyncAdminOrganizationReadModel(s.db.Session(), orgID); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to sync organization read model"})
 		return
 	}
 

@@ -363,14 +363,20 @@ func (sm *SessionManager) touchUserLastLogin(userID, orgID string, at time.Time)
 	if sm.db == nil || userID == "" || orgID == "" {
 		return
 	}
-	if err := sm.db.Session().Query(`
-		UPDATE users SET last_login_at = ? WHERE org_id = ? AND user_id = ?
-	`, at, orgID, userID).Exec(); err != nil {
-		log.Printf("[auth] failed to update last_login_at org=%s user=%s: %v", orgID, userID, err)
+	row, err := db.ReadAdminUserProjectionRow(sm.db.Session(), orgID, userID)
+	if err != nil {
+		log.Printf("[auth] failed to build admin user projection org=%s user=%s: %v", orgID, userID, err)
 		return
 	}
-	if err := db.SyncAdminUserReadModel(sm.db.Session(), orgID, userID); err != nil {
-		log.Printf("[auth] failed to sync admin user read model org=%s user=%s: %v", orgID, userID, err)
+	row.LastLoginAt = &at
+
+	batch := sm.db.Session().Batch(gocql.LoggedBatch)
+	batch.Query(`
+		UPDATE users SET last_login_at = ? WHERE org_id = ? AND user_id = ?
+	`, at, orgID, userID)
+	db.AddUpsertAdminUserReadModelQuery(batch, row)
+	if err := batch.Exec(); err != nil {
+		log.Printf("[auth] failed to update last_login_at org=%s user=%s: %v", orgID, userID, err)
 	}
 }
 

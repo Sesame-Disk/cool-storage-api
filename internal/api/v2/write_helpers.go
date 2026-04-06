@@ -173,6 +173,42 @@ func updateUserAndAdminReadModels(
 	return batch.Exec()
 }
 
+type batchedOrganizationLifecycleUpdate struct {
+	Status              string
+	DeletedAt           *time.Time
+	DeletedMarkerName   string
+	DeletedMarkerAt     *time.Time
+	DeleteDeletedMarker bool
+}
+
+func updateOrganizationLifecycleAndReadModel(
+	db interface{ Session() *gocql.Session },
+	orgID string,
+	next batchedOrganizationLifecycleUpdate,
+) error {
+	orgProjectionRow, err := dbpkg.ReadAdminOrganizationProjectionRow(db.Session(), orgID)
+	if err != nil {
+		return err
+	}
+	orgProjectionRow.Status = next.Status
+	orgProjectionRow.DeletedAt = next.DeletedAt
+
+	batch := db.Session().Batch(gocql.LoggedBatch)
+	batch.Query(`
+		UPDATE organizations SET status = ?, deleted_at = ? WHERE org_id = ?
+	`, next.Status, next.DeletedAt, orgID)
+	if next.DeleteDeletedMarker {
+		batch.Query(`DELETE FROM deleted_organizations WHERE org_id = ?`, orgID)
+	}
+	if next.DeletedMarkerAt != nil {
+		batch.Query(`
+			INSERT INTO deleted_organizations (org_id, name, deleted_at) VALUES (?, ?, ?)
+		`, orgID, next.DeletedMarkerName, *next.DeletedMarkerAt)
+	}
+	dbpkg.AddUpsertAdminOrganizationReadModelQuery(batch, orgProjectionRow)
+	return batch.Exec()
+}
+
 func adminLibraryProjectionDeletedAtEqual(left, right *time.Time) bool {
 	if left == nil || right == nil {
 		return left == nil && right == nil
@@ -380,14 +416,6 @@ func syncAdminGroupReadModel(db interface{ Session() *gocql.Session }, orgID, gr
 	return dbpkg.SyncAdminGroupReadModel(db.Session(), orgID, groupID)
 }
 
-func syncAdminOrganizationReadModel(db interface{ Session() *gocql.Session }, orgID string) error {
-	return dbpkg.SyncAdminOrganizationReadModel(db.Session(), orgID)
-}
-
-func syncAdminUserReadModel(db interface{ Session() *gocql.Session }, orgID, userID string) error {
-	return dbpkg.SyncAdminUserReadModel(db.Session(), orgID, userID)
-}
-
 func readAdminGroupReadModelRow(db interface{ Session() *gocql.Session }, orgID, groupID string) (dbpkg.AdminGroupProjectionRow, error) {
 	return dbpkg.ReadAdminGroupProjectionRow(db.Session(), orgID, groupID)
 }
@@ -528,12 +556,24 @@ func runUserStatusSideEffects(
 // deactivateUser marks a user as deactivated and, in a background goroutine,
 // kills all their active sessions and disables their share links.
 func deactivateUser(db interface{ Session() *gocql.Session }, si SessionInvalidator, aki APIKeyInvalidator, orgID, userID string) error {
+	var name, role, status string
+	var quotaBytes, trafficUploadQuota, trafficDownloadQuota int64
+	var deletedAt *time.Time
 	if err := db.Session().Query(`
-		UPDATE users SET status = ? WHERE org_id = ? AND user_id = ?
-	`, StatusDeactivated, orgID, userID).Exec(); err != nil {
+		SELECT name, role, status, quota_bytes, traffic_upload_quota, traffic_download_quota, deleted_at
+		FROM users WHERE org_id = ? AND user_id = ?
+	`, orgID, userID).Scan(&name, &role, &status, &quotaBytes, &trafficUploadQuota, &trafficDownloadQuota, &deletedAt); err != nil {
 		return err
 	}
-	if err := syncAdminUserReadModel(db, orgID, userID); err != nil {
+	if err := updateUserAndAdminReadModels(db, orgID, userID, batchedUserUpdate{
+		Name:                 name,
+		Role:                 role,
+		Status:               StatusDeactivated,
+		DeletedAt:            deletedAt,
+		QuotaBytes:           quotaBytes,
+		TrafficUploadQuota:   trafficUploadQuota,
+		TrafficDownloadQuota: trafficDownloadQuota,
+	}); err != nil {
 		return err
 	}
 	go func() {
@@ -547,12 +587,24 @@ func deactivateUser(db interface{ Session() *gocql.Session }, si SessionInvalida
 // goroutine re-enables their share links. Works for both reactivation
 // (deactivated → active) and restore (deleted → active).
 func activateUser(db interface{ Session() *gocql.Session }, orgID, userID string) error {
+	var name, role, status string
+	var quotaBytes, trafficUploadQuota, trafficDownloadQuota int64
+	var deletedAt *time.Time
 	if err := db.Session().Query(`
-		UPDATE users SET status = ?, deleted_at = ? WHERE org_id = ? AND user_id = ?
-	`, StatusActive, nil, orgID, userID).Exec(); err != nil {
+		SELECT name, role, status, quota_bytes, traffic_upload_quota, traffic_download_quota, deleted_at
+		FROM users WHERE org_id = ? AND user_id = ?
+	`, orgID, userID).Scan(&name, &role, &status, &quotaBytes, &trafficUploadQuota, &trafficDownloadQuota, &deletedAt); err != nil {
 		return err
 	}
-	if err := syncAdminUserReadModel(db, orgID, userID); err != nil {
+	if err := updateUserAndAdminReadModels(db, orgID, userID, batchedUserUpdate{
+		Name:                 name,
+		Role:                 role,
+		Status:               StatusActive,
+		DeletedAt:            nil,
+		QuotaBytes:           quotaBytes,
+		TrafficUploadQuota:   trafficUploadQuota,
+		TrafficDownloadQuota: trafficDownloadQuota,
+	}); err != nil {
 		return err
 	}
 	go setUserShareLinksActive(db, orgID, userID, true)
@@ -562,12 +614,24 @@ func activateUser(db interface{ Session() *gocql.Session }, orgID, userID string
 // softDeleteUser marks a user as deleted and, in a background goroutine,
 // kills all their active sessions and disables their share links.
 func softDeleteUser(db interface{ Session() *gocql.Session }, si SessionInvalidator, aki APIKeyInvalidator, orgID, userID string, deletedAt time.Time) error {
+	var name, role, status string
+	var quotaBytes, trafficUploadQuota, trafficDownloadQuota int64
+	var currentDeletedAt *time.Time
 	if err := db.Session().Query(`
-		UPDATE users SET status = ?, deleted_at = ? WHERE org_id = ? AND user_id = ?
-	`, StatusDeleted, deletedAt, orgID, userID).Exec(); err != nil {
+		SELECT name, role, status, quota_bytes, traffic_upload_quota, traffic_download_quota, deleted_at
+		FROM users WHERE org_id = ? AND user_id = ?
+	`, orgID, userID).Scan(&name, &role, &status, &quotaBytes, &trafficUploadQuota, &trafficDownloadQuota, &currentDeletedAt); err != nil {
 		return err
 	}
-	if err := syncAdminUserReadModel(db, orgID, userID); err != nil {
+	if err := updateUserAndAdminReadModels(db, orgID, userID, batchedUserUpdate{
+		Name:                 name,
+		Role:                 role,
+		Status:               StatusDeleted,
+		DeletedAt:            &deletedAt,
+		QuotaBytes:           quotaBytes,
+		TrafficUploadQuota:   trafficUploadQuota,
+		TrafficDownloadQuota: trafficDownloadQuota,
+	}); err != nil {
 		return err
 	}
 	go func() {
@@ -580,15 +644,11 @@ func softDeleteUser(db interface{ Session() *gocql.Session }, si SessionInvalida
 // deactivateOrg marks an org as deactivated and, in a background goroutine,
 // kills all sessions for every user in the org and disables all org share links.
 func deactivateOrg(db interface{ Session() *gocql.Session }, si SessionInvalidator, aki APIKeyInvalidator, orgID string) error {
-	batch := db.Session().Batch(gocql.LoggedBatch)
-	batch.Query(`
-		UPDATE organizations SET status = ?, deleted_at = ? WHERE org_id = ?
-	`, StatusDeactivated, nil, orgID)
-	batch.Query(`DELETE FROM deleted_organizations WHERE org_id = ?`, orgID)
-	if err := batch.Exec(); err != nil {
-		return err
-	}
-	if err := syncAdminOrganizationReadModel(db, orgID); err != nil {
+	if err := updateOrganizationLifecycleAndReadModel(db, orgID, batchedOrganizationLifecycleUpdate{
+		Status:              StatusDeactivated,
+		DeletedAt:           nil,
+		DeleteDeletedMarker: true,
+	}); err != nil {
 		return err
 	}
 	go func() {
@@ -602,15 +662,11 @@ func deactivateOrg(db interface{ Session() *gocql.Session }, si SessionInvalidat
 // goroutine re-enables all org share links. Works for both reactivation
 // (deactivated → active) and restore (deleted → active).
 func activateOrg(db interface{ Session() *gocql.Session }, orgID string) error {
-	batch := db.Session().Batch(gocql.LoggedBatch)
-	batch.Query(`
-		UPDATE organizations SET status = ?, deleted_at = ? WHERE org_id = ?
-	`, StatusActive, nil, orgID)
-	batch.Query(`DELETE FROM deleted_organizations WHERE org_id = ?`, orgID)
-	if err := batch.Exec(); err != nil {
-		return err
-	}
-	if err := syncAdminOrganizationReadModel(db, orgID); err != nil {
+	if err := updateOrganizationLifecycleAndReadModel(db, orgID, batchedOrganizationLifecycleUpdate{
+		Status:              StatusActive,
+		DeletedAt:           nil,
+		DeleteDeletedMarker: true,
+	}); err != nil {
 		return err
 	}
 	go setOrgShareLinksActive(db, orgID, true)
@@ -620,22 +676,16 @@ func activateOrg(db interface{ Session() *gocql.Session }, orgID string) error {
 // softDeleteOrg marks an org as deleted and, in a background goroutine,
 // kills all sessions for every user in the org and disables all org share links.
 func softDeleteOrg(db interface{ Session() *gocql.Session }, si SessionInvalidator, aki APIKeyInvalidator, orgID string, deletedAt time.Time) error {
-	var name string
-	_ = db.Session().Query(`
-		SELECT name FROM organizations WHERE org_id = ?
-	`, orgID).Scan(&name)
-
-	batch := db.Session().Batch(gocql.LoggedBatch)
-	batch.Query(`
-		UPDATE organizations SET status = ?, deleted_at = ? WHERE org_id = ?
-	`, StatusDeleted, deletedAt, orgID)
-	batch.Query(`
-		INSERT INTO deleted_organizations (org_id, name, deleted_at) VALUES (?, ?, ?)
-	`, orgID, name, deletedAt)
-	if err := batch.Exec(); err != nil {
+	orgProjectionRow, err := dbpkg.ReadAdminOrganizationProjectionRow(db.Session(), orgID)
+	if err != nil {
 		return err
 	}
-	if err := syncAdminOrganizationReadModel(db, orgID); err != nil {
+	if err := updateOrganizationLifecycleAndReadModel(db, orgID, batchedOrganizationLifecycleUpdate{
+		Status:            StatusDeleted,
+		DeletedAt:         &deletedAt,
+		DeletedMarkerName: orgProjectionRow.Name,
+		DeletedMarkerAt:   &deletedAt,
+	}); err != nil {
 		return err
 	}
 	go func() {
