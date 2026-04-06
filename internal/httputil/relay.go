@@ -3,6 +3,7 @@
 package httputil
 
 import (
+	"net/url"
 	"os"
 	"strings"
 
@@ -26,6 +27,90 @@ func hostnameFromServerURL(serverURL string) string {
 	return NormalizeHostname(host)
 }
 
+func firstForwardedValue(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	if idx := strings.Index(value, ","); idx != -1 {
+		value = value[:idx]
+	}
+	return strings.TrimSpace(value)
+}
+
+func getBrowserHost(c *gin.Context) string {
+	if c == nil {
+		return ""
+	}
+	if fwdHost := firstForwardedValue(c.GetHeader("X-Forwarded-Host")); fwdHost != "" {
+		return fwdHost
+	}
+	return strings.TrimSpace(c.Request.Host)
+}
+
+func getExplicitPort(host string) string {
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return ""
+	}
+	if idx := strings.LastIndex(host, ":"); idx != -1 {
+		if strings.Contains(host[idx+1:], "]") {
+			return ""
+		}
+		return host[idx+1:]
+	}
+	return ""
+}
+
+func getBrowserScheme(c *gin.Context, host string) string {
+	if c == nil {
+		return "http"
+	}
+	if proto := firstForwardedValue(c.GetHeader("X-Forwarded-Proto")); proto != "" {
+		return proto
+	}
+	if c.Request.TLS != nil {
+		return "https"
+	}
+	host = NormalizeHostname(host)
+	if strings.HasPrefix(host, "localhost") || strings.HasPrefix(host, "127.0.0.1") {
+		return "http"
+	}
+	return "http"
+}
+
+// GetBrowserURL derives the browser-facing base URL for absolute links returned by the API.
+// If configuredURL is provided it takes priority, except that a stale http URL is upgraded to
+// https when the current request is clearly https for the same host.
+func GetBrowserURL(c *gin.Context, configuredURL string) string {
+	configuredURL = strings.TrimSuffix(strings.TrimSpace(configuredURL), "/")
+	host := getBrowserHost(c)
+	scheme := getBrowserScheme(c, host)
+
+	if configuredURL != "" {
+		if scheme == "https" && host != "" {
+			configured, err := url.Parse(configuredURL)
+			if err == nil && strings.EqualFold(configured.Scheme, "http") {
+				requestURL := &url.URL{Host: host}
+				if strings.EqualFold(configured.Hostname(), requestURL.Hostname()) {
+					configuredPort := configured.Port()
+					requestPort := requestURL.Port()
+					if configuredPort == "" || configuredPort == requestPort {
+						return "https://" + host
+					}
+				}
+			}
+		}
+		return configuredURL
+	}
+
+	if host != "" {
+		return scheme + "://" + host
+	}
+
+	return "http://localhost:8080"
+}
+
 // GetRoutingHostname returns the hostname that should drive request-scoped routing
 // decisions such as region-aware storage selection.
 //
@@ -35,7 +120,7 @@ func hostnameFromServerURL(serverURL string) string {
 //  3. SERVER_URL env var — last-resort fallback only when the request carries no host context
 func GetRoutingHostname(c *gin.Context) string {
 	if c != nil {
-		if fwdHost := c.GetHeader("X-Forwarded-Host"); fwdHost != "" {
+		if fwdHost := firstForwardedValue(c.GetHeader("X-Forwarded-Host")); fwdHost != "" {
 			return NormalizeHostname(fwdHost)
 		}
 		if host := NormalizeHostname(c.Request.Host); host != "" {
@@ -54,7 +139,7 @@ func GetEffectiveHostname(c *gin.Context) string {
 	if host := hostnameFromServerURL(os.Getenv("SERVER_URL")); host != "" {
 		return host
 	}
-	if fwdHost := c.GetHeader("X-Forwarded-Host"); fwdHost != "" {
+	if fwdHost := firstForwardedValue(c.GetHeader("X-Forwarded-Host")); fwdHost != "" {
 		return NormalizeHostname(fwdHost)
 	}
 	return NormalizeHostname(c.Request.Host)
@@ -65,13 +150,15 @@ func GetEffectiveHostname(c *gin.Context) string {
 func GetRelayPortFromRequest(c *gin.Context) string {
 	// If SERVER_URL is set, extract port from it
 	if serverURL := os.Getenv("SERVER_URL"); serverURL != "" {
-		serverURL = strings.TrimSuffix(serverURL, "/")
-		after := serverURL
-		if idx := strings.Index(after, "://"); idx != -1 {
-			after = after[idx+3:]
-		}
-		if idx := strings.LastIndex(after, ":"); idx != -1 {
-			return after[idx+1:]
+		serverURL = strings.TrimSuffix(strings.TrimSpace(serverURL), "/")
+		if parsed, err := url.Parse(serverURL); err == nil {
+			if port := parsed.Port(); port != "" {
+				return port
+			}
+			if strings.EqualFold(parsed.Scheme, "https") {
+				return "443"
+			}
+			return "80"
 		}
 		if strings.HasPrefix(serverURL, "https") {
 			return "443"
@@ -79,14 +166,20 @@ func GetRelayPortFromRequest(c *gin.Context) string {
 		return "80"
 	}
 
+	// Preserve a forwarded public port before falling back to the internal host.
+	if host := firstForwardedValue(c.GetHeader("X-Forwarded-Host")); host != "" {
+		if port := getExplicitPort(host); port != "" {
+			return port
+		}
+	}
+
 	// Extract from Host header (e.g., "localhost:3000" → "3000")
-	host := c.Request.Host
-	if idx := strings.LastIndex(host, ":"); idx != -1 {
-		return host[idx+1:]
+	if port := getExplicitPort(c.Request.Host); port != "" {
+		return port
 	}
 
 	// No explicit port — use scheme default
-	if proto := c.GetHeader("X-Forwarded-Proto"); proto == "https" {
+	if proto := firstForwardedValue(c.GetHeader("X-Forwarded-Proto")); proto == "https" {
 		return "443"
 	}
 	if c.Request.TLS != nil {
@@ -98,17 +191,7 @@ func GetRelayPortFromRequest(c *gin.Context) string {
 // GetBaseURLFromRequest derives the server base URL from the incoming request.
 // Respects SERVER_URL env var, X-Forwarded-Proto/Host headers, and TLS state.
 func GetBaseURLFromRequest(c *gin.Context) string {
-	if serverURL := os.Getenv("SERVER_URL"); serverURL != "" {
-		return strings.TrimSuffix(serverURL, "/")
-	}
-	scheme := "https"
-	host := GetEffectiveHostname(c)
-	if proto := c.GetHeader("X-Forwarded-Proto"); proto != "" {
-		scheme = proto
-	} else if c.Request.TLS == nil && (strings.HasPrefix(host, "localhost") || strings.HasPrefix(host, "127.0.0.1")) {
-		scheme = "http"
-	}
-	return scheme + "://" + host
+	return GetBrowserURL(c, os.Getenv("SERVER_URL"))
 }
 
 // NormalizeHostname normalises a hostname for comparison: lowercase, strip port,

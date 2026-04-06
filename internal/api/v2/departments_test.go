@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Sesame-Disk/sesamefs/internal/httputil"
 	"github.com/gin-gonic/gin"
 )
 
@@ -382,6 +383,27 @@ func TestGetBrowserURL(t *testing.T) {
 			want:          "http://localhost:8080",
 		},
 		{
+			name:          "configured http URL upgrades to https for same host",
+			host:          "sfs.nihaoshares.com",
+			xProto:        "https",
+			configuredURL: "http://sfs.nihaoshares.com",
+			want:          "https://sfs.nihaoshares.com",
+		},
+		{
+			name:          "configured http URL with same host and port upgrades to https",
+			host:          "sfs.nihaoshares.com:443",
+			xProto:        "https",
+			configuredURL: "http://sfs.nihaoshares.com:443",
+			want:          "https://sfs.nihaoshares.com:443",
+		},
+		{
+			name:          "configured URL keeps alternate host",
+			host:          "sfs.nihaoshares.com",
+			xProto:        "https",
+			configuredURL: "http://sesamefs.internal",
+			want:          "http://sesamefs.internal",
+		},
+		{
 			name:          "configured URL takes priority without proxy",
 			host:          "localhost:3000",
 			xProto:        "",
@@ -423,9 +445,9 @@ func TestGetBrowserURL(t *testing.T) {
 				c.Request.Header.Set("X-Forwarded-Proto", tt.xProto)
 			}
 
-			got := getBrowserURL(c, tt.configuredURL)
+			got := httputil.GetBrowserURL(c, tt.configuredURL)
 			if got != tt.want {
-				t.Errorf("getBrowserURL() = %q, want %q", got, tt.want)
+				t.Errorf("GetBrowserURL() = %q, want %q", got, tt.want)
 			}
 		})
 	}

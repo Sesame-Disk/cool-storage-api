@@ -8,6 +8,7 @@ import (
 
 	"github.com/Sesame-Disk/sesamefs/internal/config"
 	"github.com/Sesame-Disk/sesamefs/internal/db"
+	"github.com/Sesame-Disk/sesamefs/internal/httputil"
 	"github.com/Sesame-Disk/sesamefs/internal/middleware"
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
 	"github.com/gin-gonic/gin"
@@ -173,7 +174,7 @@ func (h *UploadLinkHandler) ListUploadLinks(c *gin.Context) {
 			ExpireDate:  expireDate,
 			UserEmail:   userEmail,
 			CreatorName: uploaderName,
-			LinkURL:     fmt.Sprintf("%s/u/d/%s", getBrowserURL(c, h.serverURL), token),
+			LinkURL:     fmt.Sprintf("%s/u/d/%s", httputil.GetBrowserURL(c, h.serverURL), token),
 			IsOwner:     true,
 			HasPassword: hasPassword,
 		})
@@ -379,7 +380,7 @@ func (h *UploadLinkHandler) CreateUploadLink(c *gin.Context) {
 		ExpireDate:  expireDate,
 		UserEmail:   userEmail,
 		CreatorName: userName,
-		LinkURL:     fmt.Sprintf("%s/u/d/%s", getBrowserURL(c, h.serverURL), token),
+		LinkURL:     fmt.Sprintf("%s/u/d/%s", httputil.GetBrowserURL(c, h.serverURL), token),
 		IsOwner:     true,
 		Password:    req.Password,
 		HasPassword: req.Password != "",

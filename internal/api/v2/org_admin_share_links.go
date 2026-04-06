@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/Sesame-Disk/sesamefs/internal/httputil"
 	"github.com/Sesame-Disk/sesamefs/internal/middleware"
 	"github.com/gin-gonic/gin"
 )
@@ -67,7 +68,7 @@ func (h *OrgAdminHandler) ListOrgLinks(c *gin.Context) {
 				isExpired = row.ExpiresAt.Before(time.Now())
 				expireDateStr = row.ExpiresAt.Format(time.RFC3339)
 			}
-			linkURL := fmt.Sprintf("%s/d/%s", getBrowserURL(c, ""), row.Token)
+			linkURL := fmt.Sprintf("%s/d/%s", httputil.GetBrowserURL(c, ""), row.Token)
 			perms := parsePermsJSON(row.Permission)
 			status := "active"
 			if !row.Active {
@@ -123,7 +124,7 @@ func (h *OrgAdminHandler) ListOrgLinks(c *gin.Context) {
 				isExpired = row.ExpiresAt.Before(time.Now())
 				expireDateStr = row.ExpiresAt.Format(time.RFC3339)
 			}
-			linkURL := fmt.Sprintf("%s/d/%s", getBrowserURL(c, ""), row.Token)
+			linkURL := fmt.Sprintf("%s/d/%s", httputil.GetBrowserURL(c, ""), row.Token)
 			perms := parsePermsJSON(row.Permission)
 			status := "active"
 			if !row.Active {
@@ -187,7 +188,7 @@ func (h *OrgAdminHandler) ListOrgLinks(c *gin.Context) {
 			continue
 		}
 
-		linkURL := fmt.Sprintf("%s/d/%s", getBrowserURL(c, ""), row.Token)
+		linkURL := fmt.Sprintf("%s/d/%s", httputil.GetBrowserURL(c, ""), row.Token)
 		perms := parsePermsJSON(row.Permission)
 		status := "active"
 		if !row.Active {
@@ -311,7 +312,7 @@ func (h *OrgAdminHandler) ListOrgUploadLinks(c *gin.Context) {
 				isExpired = row.ExpiresAt.Before(time.Now())
 				expireDateStr = row.ExpiresAt.Format(time.RFC3339)
 			}
-			uploadLinkURL := fmt.Sprintf("%s/u/d/%s", getBrowserURL(c, ""), row.Token)
+			uploadLinkURL := fmt.Sprintf("%s/u/d/%s", httputil.GetBrowserURL(c, ""), row.Token)
 			status := "active"
 			if !row.Active {
 				status = "inactive"
@@ -360,7 +361,7 @@ func (h *OrgAdminHandler) ListOrgUploadLinks(c *gin.Context) {
 				isExpired = row.ExpiresAt.Before(time.Now())
 				expireDateStr = row.ExpiresAt.Format(time.RFC3339)
 			}
-			uploadLinkURL := fmt.Sprintf("%s/u/d/%s", getBrowserURL(c, ""), row.Token)
+			uploadLinkURL := fmt.Sprintf("%s/u/d/%s", httputil.GetBrowserURL(c, ""), row.Token)
 			status := "active"
 			if !row.Active {
 				status = "inactive"
@@ -415,7 +416,7 @@ func (h *OrgAdminHandler) ListOrgUploadLinks(c *gin.Context) {
 			continue
 		}
 
-		uploadLinkURL := fmt.Sprintf("%s/u/d/%s", getBrowserURL(c, ""), row.Token)
+		uploadLinkURL := fmt.Sprintf("%s/u/d/%s", httputil.GetBrowserURL(c, ""), row.Token)
 		status := "active"
 		if !row.Active {
 			status = "inactive"

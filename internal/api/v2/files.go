@@ -1388,7 +1388,7 @@ func (h *FileHandler) GetFileInfo(c *gin.Context) {
 	starred = starredHandler.IsFileStarred(userID, repoID, filePath)
 
 	// Construct view_url using the request origin for browser accessibility
-	viewURL := fmt.Sprintf("%s/lib/%s/file%s", getBrowserURL(c, h.serverURL), repoID, filePath)
+	viewURL := fmt.Sprintf("%s/lib/%s/file%s", httputil.GetBrowserURL(c, h.serverURL), repoID, filePath)
 
 	// Resolve actual permission for the user
 	perm := "rw"
@@ -1431,39 +1431,10 @@ func (h *FileHandler) getFileDownloadURL(c *gin.Context, orgID, userID, repoID, 
 	}
 
 	filename := filepath.Base(filePath)
-	downloadURL := fmt.Sprintf("%s/seafhttp/files/%s/%s", getBrowserURL(c, h.serverURL), token, filename)
+	downloadURL := fmt.Sprintf("%s/seafhttp/files/%s/%s", httputil.GetBrowserURL(c, h.serverURL), token, filename)
 	// Return as JSON-encoded string (with double quotes).
 	// Seafile clients strip the first and last character (the quotes) to extract the URL.
 	c.JSON(http.StatusOK, downloadURL)
-}
-
-// getBrowserURL returns the base URL that the browser should use to reach the server.
-// If serverURL is explicitly configured (FILE_SERVER_ROOT or SERVER_URL env), it takes priority.
-// Otherwise, auto-detects from the request's Host header.
-func getBrowserURL(c *gin.Context, configuredURL string) string {
-	// If explicitly configured via FILE_SERVER_ROOT or SERVER_URL, use it.
-	// This avoids issues when behind a reverse proxy that passes through the
-	// browser's Host header (e.g., nginx with proxy_set_header Host $http_host).
-	if configuredURL != "" {
-		return configuredURL
-	}
-
-	// Auto-detect from request headers
-	// Use X-Forwarded-Proto + Host if behind a proxy (nginx)
-	proto := c.GetHeader("X-Forwarded-Proto")
-	host := c.Request.Host
-	if proto != "" && host != "" {
-		return proto + "://" + host
-	}
-	// Use the request's scheme + host
-	if host != "" {
-		scheme := "http"
-		if c.Request.TLS != nil {
-			scheme = "https"
-		}
-		return scheme + "://" + host
-	}
-	return "http://localhost:8080"
 }
 
 // GetFileDetail returns detailed information about a file
@@ -1680,7 +1651,7 @@ func (h *FileHandler) GetSmartLink(c *gin.Context) {
 	for iter.Scan(&existingToken, &lt, &lid, &fp) {
 		if lt == "internal" && lid == repoID && fp == itemPath {
 			iter.Close()
-			baseURL := getBrowserURL(c, h.serverURL)
+			baseURL := httputil.GetBrowserURL(c, h.serverURL)
 			c.JSON(http.StatusOK, gin.H{
 				"smart_link": fmt.Sprintf("%s/smart-link/%s", baseURL, existingToken),
 			})
@@ -1707,7 +1678,7 @@ func (h *FileHandler) GetSmartLink(c *gin.Context) {
 		return
 	}
 
-	baseURL := getBrowserURL(c, h.serverURL)
+	baseURL := httputil.GetBrowserURL(c, h.serverURL)
 	c.JSON(http.StatusOK, gin.H{
 		"smart_link": fmt.Sprintf("%s/smart-link/%s", baseURL, token),
 	})
@@ -1748,7 +1719,7 @@ func (h *FileHandler) ResolveSmartLink(c *gin.Context) {
 	}()
 
 	// Determine redirect URL based on path
-	baseURL := getBrowserURL(c, h.serverURL)
+	baseURL := httputil.GetBrowserURL(c, h.serverURL)
 	var redirectURL string
 	if filePath == "/" || strings.HasSuffix(filePath, "/") {
 		redirectURL = fmt.Sprintf("%s/library/%s/%s", baseURL, libraryID, strings.TrimPrefix(filePath, "/"))
@@ -2575,7 +2546,7 @@ func (h *FileHandler) GetDownloadLink(c *gin.Context) {
 
 	// Build the Seafile-compatible download URL using the browser-facing URL
 	// Format: {server}/seafhttp/files/{token}/{filename}
-	downloadURL := fmt.Sprintf("%s/seafhttp/files/%s/%s", getBrowserURL(c, h.serverURL), token, filename)
+	downloadURL := fmt.Sprintf("%s/seafhttp/files/%s/%s", httputil.GetBrowserURL(c, h.serverURL), token, filename)
 
 	// Return as JSON-encoded string (with double quotes).
 	// Seafile clients strip the first and last character (the quotes) to extract the URL.
@@ -2619,7 +2590,7 @@ func (h *FileHandler) GetUploadLink(c *gin.Context) {
 
 	// Build the Seafile-compatible upload URL using the browser-facing URL
 	// Format: {server}/seafhttp/upload-api/{token}
-	uploadURL := fmt.Sprintf("%s/seafhttp/upload-api/%s", getBrowserURL(c, h.serverURL), token)
+	uploadURL := fmt.Sprintf("%s/seafhttp/upload-api/%s", httputil.GetBrowserURL(c, h.serverURL), token)
 
 	// Return as JSON-encoded string (with double quotes).
 	// Seafile clients strip the first and last character (the quotes) to extract the URL.

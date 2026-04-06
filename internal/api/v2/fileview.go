@@ -20,6 +20,7 @@ import (
 	"github.com/Sesame-Disk/sesamefs/internal/config"
 	"github.com/Sesame-Disk/sesamefs/internal/crypto"
 	"github.com/Sesame-Disk/sesamefs/internal/db"
+	"github.com/Sesame-Disk/sesamefs/internal/httputil"
 	"github.com/Sesame-Disk/sesamefs/internal/middleware"
 	"github.com/Sesame-Disk/sesamefs/internal/storage"
 	"github.com/Sesame-Disk/sesamefs/internal/streaming"
@@ -301,7 +302,7 @@ func (h *FileViewHandler) redirectToDownload(c *gin.Context, repoID, filePath, f
 
 	// Redirect to seafhttp download endpoint which sets Content-Disposition: attachment
 	// Use browser-reachable URL (not internal serverURL which may be on a different port)
-	downloadURL := getBrowserURL(c, h.serverURL) + "/seafhttp/files/" + token + "/" + filename
+	downloadURL := httputil.GetBrowserURL(c, h.serverURL) + "/seafhttp/files/" + token + "/" + filename
 	c.Redirect(http.StatusFound, downloadURL)
 }
 

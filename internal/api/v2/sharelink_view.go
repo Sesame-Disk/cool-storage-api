@@ -21,6 +21,7 @@ import (
 	"github.com/Sesame-Disk/sesamefs/internal/config"
 	"github.com/Sesame-Disk/sesamefs/internal/crypto"
 	"github.com/Sesame-Disk/sesamefs/internal/db"
+	"github.com/Sesame-Disk/sesamefs/internal/httputil"
 	"github.com/Sesame-Disk/sesamefs/internal/storage"
 	"github.com/Sesame-Disk/sesamefs/internal/streaming"
 	"github.com/Sesame-Disk/sesamefs/internal/traffic"
@@ -39,10 +40,10 @@ type ShareLinkViewHandler struct {
 }
 
 type pageBootstrapResponse struct {
-	RenderMode string `json:"render_mode"`
-	Bundle     string `json:"bundle,omitempty"`
-	Title      string `json:"title"`
-	PageOptions any   `json:"page_options,omitempty"`
+	RenderMode  string `json:"render_mode"`
+	Bundle      string `json:"bundle,omitempty"`
+	Title       string `json:"title"`
+	PageOptions any    `json:"page_options,omitempty"`
 }
 
 // NewShareLinkViewHandler creates a new ShareLinkViewHandler for public share/upload link APIs.
@@ -189,9 +190,9 @@ func (h *ShareLinkViewHandler) buildSharedDirPageBootstrap(c *gin.Context, sl *s
 	}
 
 	return pageBootstrapResponse{
-		RenderMode: "bundle",
-		Bundle:     "sharedDirView",
-		Title:      dirName + " - SesameFS",
+		RenderMode:  "bundle",
+		Bundle:      "sharedDirView",
+		Title:       dirName + " - SesameFS",
 		PageOptions: pageOptions,
 	}
 }
@@ -225,9 +226,9 @@ func (h *ShareLinkViewHandler) buildSharedFileBundleBootstrap(c *gin.Context, sl
 	}
 
 	return pageBootstrapResponse{
-		RenderMode: "bundle",
-		Bundle:     bundleName,
-		Title:      filename + " - SesameFS",
+		RenderMode:  "bundle",
+		Bundle:      bundleName,
+		Title:       filename + " - SesameFS",
 		PageOptions: pageOptions,
 	}
 }
@@ -299,12 +300,12 @@ func (h *ShareLinkViewHandler) buildOnlyOfficeShareBootstrap(sl *shareLinkData, 
 		RenderMode: "onlyoffice",
 		Title:      filename + " - SesameFS",
 		PageOptions: map[string]any{
-			"fileName":      filename,
-			"fileSize":      fileSize,
-			"sharedBy":      sl.creatorName,
-			"canDownload":   sl.canDownload,
-			"downloadPath":  buildShareDownloadPath(sl),
-			"apiJSURL":      h.config.OnlyOffice.APIJSURL,
+			"fileName":         filename,
+			"fileSize":         fileSize,
+			"sharedBy":         sl.creatorName,
+			"canDownload":      sl.canDownload,
+			"downloadPath":     buildShareDownloadPath(sl),
+			"apiJSURL":         h.config.OnlyOffice.APIJSURL,
 			"onlyOfficeConfig": docConfig,
 		},
 	}, nil
@@ -323,9 +324,9 @@ func (h *ShareLinkViewHandler) buildUploadLinkPageBootstrap(token, libraryID, fi
 	}
 
 	return pageBootstrapResponse{
-		RenderMode: "bundle",
-		Bundle:     "uploadLink",
-		Title:      dirName + " - Upload - SesameFS",
+		RenderMode:  "bundle",
+		Bundle:      "uploadLink",
+		Title:       dirName + " - Upload - SesameFS",
 		PageOptions: pageOptions,
 	}
 }
@@ -680,7 +681,7 @@ func (h *ShareLinkViewHandler) handleShareLinkDownload(c *gin.Context, sl *share
 		}
 	}()
 
-	downloadURL := getBrowserURL(c, h.serverURL) + "/seafhttp/files/" + downloadToken + "/" + filename
+	downloadURL := httputil.GetBrowserURL(c, h.serverURL) + "/seafhttp/files/" + downloadToken + "/" + filename
 	c.Redirect(http.StatusFound, downloadURL)
 }
 
@@ -918,6 +919,7 @@ func (h *ShareLinkViewHandler) buildShareFileBootstrapResponse(c *gin.Context, s
 
 	return h.buildSharedFileBundleBootstrap(c, sl, bundleName, rawPath, filename, ext, fileSize, fileContent), http.StatusOK, nil
 }
+
 // isOnlyOfficeViewable checks if a file extension can be viewed with OnlyOffice
 func isOnlyOfficeViewable(ext string) bool {
 	switch ext {
@@ -929,6 +931,7 @@ func isOnlyOfficeViewable(ext string) bool {
 	}
 	return false
 }
+
 // extensionToBundleName maps a file extension to the appropriate shared view bundle
 func extensionToBundleName(ext string) string {
 	switch ext {
@@ -1303,6 +1306,7 @@ func (h *ShareLinkViewHandler) GetUploadLinkBootstrap(c *gin.Context) {
 
 	c.JSON(http.StatusOK, h.buildUploadLinkPageBootstrap(token, libraryID, filePath, dirName, creatorName, needPassword))
 }
+
 // GetUploadLinkUploadURL handles GET /api/v2.1/upload-links/:token/upload/
 // Returns the upload URL for an upload link.
 func (h *ShareLinkViewHandler) GetUploadLinkUploadURL(c *gin.Context) {
@@ -1343,7 +1347,7 @@ func (h *ShareLinkViewHandler) GetUploadLinkUploadURL(c *gin.Context) {
 		return
 	}
 
-	uploadURL := getBrowserURL(c, h.serverURL) + "/seafhttp/upload-api/" + uploadToken
+	uploadURL := httputil.GetBrowserURL(c, h.serverURL) + "/seafhttp/upload-api/" + uploadToken
 	c.JSON(http.StatusOK, gin.H{
 		"upload_link": uploadURL,
 	})
@@ -1439,7 +1443,7 @@ func (h *ShareLinkViewHandler) GetShareLinkUploadURL(c *gin.Context) {
 		return
 	}
 
-	uploadURL := getBrowserURL(c, h.serverURL) + "/seafhttp/upload-api/" + uploadToken
+	uploadURL := httputil.GetBrowserURL(c, h.serverURL) + "/seafhttp/upload-api/" + uploadToken
 	c.JSON(http.StatusOK, gin.H{
 		"upload_link": uploadURL,
 	})

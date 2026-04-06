@@ -7,6 +7,7 @@ import (
 	"time"
 
 	db "github.com/Sesame-Disk/sesamefs/internal/db"
+	"github.com/Sesame-Disk/sesamefs/internal/httputil"
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
 	"github.com/gin-gonic/gin"
 )
@@ -566,7 +567,7 @@ func (h *AdminHandler) AdminListUserShareLinks(c *gin.Context) {
 			if !row.Active {
 				status = "inactive"
 			}
-			linkURL := fmt.Sprintf("%s/d/%s", getBrowserURL(c, ""), row.Token)
+			linkURL := fmt.Sprintf("%s/d/%s", httputil.GetBrowserURL(c, ""), row.Token)
 			links = append(links, gin.H{
 				"obj_name":      objName,
 				"token":         row.Token,
@@ -613,7 +614,7 @@ func (h *AdminHandler) AdminListUserShareLinks(c *gin.Context) {
 			if !row.Active {
 				status = "inactive"
 			}
-			linkURL := fmt.Sprintf("%s/d/%s", getBrowserURL(c, ""), row.Token)
+			linkURL := fmt.Sprintf("%s/d/%s", httputil.GetBrowserURL(c, ""), row.Token)
 			links = append(links, gin.H{
 				"obj_name":      objName,
 				"token":         row.Token,
@@ -664,7 +665,7 @@ func (h *AdminHandler) AdminListUserShareLinks(c *gin.Context) {
 			status = "inactive"
 		}
 
-		linkURL := fmt.Sprintf("%s/d/%s", getBrowserURL(c, ""), row.Token)
+		linkURL := fmt.Sprintf("%s/d/%s", httputil.GetBrowserURL(c, ""), row.Token)
 		if !filters.MatchesSearch(objName, row.Token, row.FilePath, repoName, creatorEmail, creatorName, linkURL) {
 			continue
 		}
@@ -751,7 +752,7 @@ func (h *AdminHandler) AdminListUserUploadLinks(c *gin.Context) {
 			if !row.Active {
 				status = "inactive"
 			}
-			linkURL := fmt.Sprintf("%s/u/d/%s", getBrowserURL(c, ""), row.Token)
+			linkURL := fmt.Sprintf("%s/u/d/%s", httputil.GetBrowserURL(c, ""), row.Token)
 			links = append(links, gin.H{
 				"obj_name":      objName,
 				"path":          row.FilePath,
@@ -798,7 +799,7 @@ func (h *AdminHandler) AdminListUserUploadLinks(c *gin.Context) {
 			if !row.Active {
 				status = "inactive"
 			}
-			linkURL := fmt.Sprintf("%s/u/d/%s", getBrowserURL(c, ""), row.Token)
+			linkURL := fmt.Sprintf("%s/u/d/%s", httputil.GetBrowserURL(c, ""), row.Token)
 			links = append(links, gin.H{
 				"obj_name":      objName,
 				"path":          row.FilePath,
@@ -849,7 +850,7 @@ func (h *AdminHandler) AdminListUserUploadLinks(c *gin.Context) {
 			status = "inactive"
 		}
 
-		linkURL := fmt.Sprintf("%s/u/d/%s", getBrowserURL(c, ""), row.Token)
+		linkURL := fmt.Sprintf("%s/u/d/%s", httputil.GetBrowserURL(c, ""), row.Token)
 		if !filters.MatchesSearch(objName, row.Token, row.FilePath, repoName, creatorEmail, creatorName, linkURL) {
 			continue
 		}

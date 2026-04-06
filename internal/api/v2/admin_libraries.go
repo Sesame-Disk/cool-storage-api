@@ -13,6 +13,7 @@ import (
 	"time"
 
 	dbpkg "github.com/Sesame-Disk/sesamefs/internal/db"
+	"github.com/Sesame-Disk/sesamefs/internal/httputil"
 	"github.com/Sesame-Disk/sesamefs/internal/middleware"
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
 	"github.com/gin-gonic/gin"
@@ -819,7 +820,7 @@ func (h *AdminHandler) AdminGetDownloadLink(c *gin.Context) {
 	if idx := strings.LastIndex(filePath, "/"); idx >= 0 {
 		filename = filePath[idx+1:]
 	}
-	downloadURL := fmt.Sprintf("%s/seafhttp/files/%s/%s", getBrowserURL(c, h.serverURL), token, filename)
+	downloadURL := fmt.Sprintf("%s/seafhttp/files/%s/%s", httputil.GetBrowserURL(c, h.serverURL), token, filename)
 	c.JSON(http.StatusOK, gin.H{"download_url": downloadURL})
 }
 

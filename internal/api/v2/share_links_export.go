@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/Sesame-Disk/sesamefs/internal/httputil"
 	"github.com/gin-gonic/gin"
 	"github.com/xuri/excelize/v2"
 )
@@ -45,7 +46,7 @@ func (h *ShareLinkHandler) ExportShareLinksExcel(c *gin.Context) {
 			continue
 		}
 
-		linkURL := fmt.Sprintf("%s/d/%s", getBrowserURL(c, h.serverURL), token)
+		linkURL := fmt.Sprintf("%s/d/%s", httputil.GetBrowserURL(c, h.serverURL), token)
 		hasPassword := "No"
 		if passwordHash != "" {
 			hasPassword = "Yes"

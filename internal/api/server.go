@@ -1368,20 +1368,7 @@ func (s *Server) handleClientSSOLink(c *gin.Context) {
 		return
 	}
 
-	// Build base URL (respects SERVER_URL env var for reverse proxy)
-	var baseURL string
-	if serverURL := os.Getenv("SERVER_URL"); serverURL != "" {
-		baseURL = strings.TrimSuffix(serverURL, "/")
-	} else {
-		scheme := "https"
-		host := c.Request.Host
-		if proto := c.GetHeader("X-Forwarded-Proto"); proto != "" {
-			scheme = proto
-		} else if c.Request.TLS == nil && (strings.HasPrefix(host, "localhost") || strings.HasPrefix(host, "127.0.0.1")) {
-			scheme = "http"
-		}
-		baseURL = scheme + "://" + host
-	}
+	baseURL := httputil.GetBrowserURL(c, os.Getenv("SERVER_URL"))
 
 	// Use /client-sso/TOKEN/ path — matches seahub's reverse('client_sso', args=[token]).
 	// Seafile desktop clients parse the pending token from the last path segment.

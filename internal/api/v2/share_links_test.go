@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/Sesame-Disk/sesamefs/internal/httputil"
 	"github.com/gin-gonic/gin"
 )
 
@@ -299,9 +300,9 @@ func TestShareLinkURL_IncludesServerURL(t *testing.T) {
 			c.Request = httptest.NewRequest("GET", "/test", nil)
 			c.Request.Host = tc.host
 
-			url := getBrowserURL(c, tc.serverURL)
+			url := httputil.GetBrowserURL(c, tc.serverURL)
 			if url != tc.wantPrefix {
-				t.Errorf("getBrowserURL() = %q, want %q", url, tc.wantPrefix)
+				t.Errorf("GetBrowserURL() = %q, want %q", url, tc.wantPrefix)
 			}
 
 			// Verify share link URL format matches what ListShareLinks/CreateShareLink produce

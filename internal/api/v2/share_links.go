@@ -12,6 +12,7 @@ import (
 
 	"github.com/Sesame-Disk/sesamefs/internal/config"
 	"github.com/Sesame-Disk/sesamefs/internal/db"
+	"github.com/Sesame-Disk/sesamefs/internal/httputil"
 	"github.com/Sesame-Disk/sesamefs/internal/middleware"
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
 	"github.com/gin-gonic/gin"
@@ -405,7 +406,7 @@ func (h *ShareLinkHandler) ListShareLinks(c *gin.Context) {
 			Permissions: perms,
 			UserEmail:   userEmail,
 			CreatorName: userName,
-			LinkURL:     fmt.Sprintf("%s/d/%s", getBrowserURL(c, h.serverURL), token),
+			LinkURL:     fmt.Sprintf("%s/d/%s", httputil.GetBrowserURL(c, h.serverURL), token),
 			IsOwner:     true,
 			HasPassword: hasPassword,
 		})
@@ -619,7 +620,7 @@ func (h *ShareLinkHandler) CreateShareLink(c *gin.Context) {
 		Permissions: perms,
 		UserEmail:   userEmail,
 		CreatorName: userName,
-		LinkURL:     fmt.Sprintf("%s/d/%s", getBrowserURL(c, h.serverURL), token),
+		LinkURL:     fmt.Sprintf("%s/d/%s", httputil.GetBrowserURL(c, h.serverURL), token),
 		IsOwner:     true,
 		Password:    req.Password,
 		HasPassword: req.Password != "",
@@ -808,7 +809,7 @@ func (h *ShareLinkHandler) UpdateShareLink(c *gin.Context) {
 		Permissions: perms,
 		UserEmail:   userEmail,
 		CreatorName: updateUserName,
-		LinkURL:     fmt.Sprintf("%s/d/%s", getBrowserURL(c, h.serverURL), token),
+		LinkURL:     fmt.Sprintf("%s/d/%s", httputil.GetBrowserURL(c, h.serverURL), token),
 		IsOwner:     true,
 		Password:    returnedPassword,
 		HasPassword: newPasswordHash != "",
@@ -1021,7 +1022,7 @@ func (h *ShareLinkHandler) BatchCreateShareLinks(c *gin.Context) {
 			Permissions: perms,
 			UserEmail:   userEmail,
 			CreatorName: userName,
-			LinkURL:     fmt.Sprintf("%s/d/%s", getBrowserURL(c, h.serverURL), token),
+			LinkURL:     fmt.Sprintf("%s/d/%s", httputil.GetBrowserURL(c, h.serverURL), token),
 			IsOwner:     true,
 			Password:    password,
 			HasPassword: password != "",
