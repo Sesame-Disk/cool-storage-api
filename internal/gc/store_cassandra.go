@@ -1359,11 +1359,74 @@ func (s *CassandraStore) DeleteAPIKeysByUser(orgID, userID uuid.UUID) error {
 	return nil
 }
 
+func (s *CassandraStore) buildAdminOrganizationProjectionRowAfterUserDelete(orgID, deletedUserID string) (db.AdminOrganizationProjectionRow, error) {
+	row := db.AdminOrganizationProjectionRow{OrgID: orgID}
+	var deletedAt *time.Time
+	if err := s.db.Session().Query(`
+		SELECT name, status, plan, storage_quota, deleted_at, created_at
+		FROM organizations WHERE org_id = ?
+	`, orgID).Scan(&row.Name, &row.Status, &row.Plan, &row.StorageQuota, &deletedAt, &row.CreatedAt); err != nil {
+		return db.AdminOrganizationProjectionRow{}, err
+	}
+	if row.Status == "" {
+		row.Status = "active"
+	}
+	row.DeletedAt = deletedAt
+
+	iter := s.db.Session().Query(`
+		SELECT user_id, email, name, role FROM users WHERE org_id = ?
+	`, orgID).Iter()
+
+	var userID, email, name, role string
+	var firstEmail, firstName string
+	firstRemaining := true
+	for iter.Scan(&userID, &email, &name, &role) {
+		if userID == deletedUserID {
+			continue
+		}
+		row.UsersCount++
+		if firstRemaining {
+			firstEmail, firstName = email, name
+			firstRemaining = false
+		}
+		if row.OwnerEmail == "" && (role == "superadmin" || role == "owner" || role == "admin") {
+			row.OwnerEmail, row.OwnerName = email, name
+		}
+	}
+	if err := iter.Close(); err != nil {
+		return db.AdminOrganizationProjectionRow{}, err
+	}
+	if row.OwnerEmail == "" {
+		row.OwnerEmail, row.OwnerName = firstEmail, firstName
+	}
+	return row, nil
+}
+
 func (s *CassandraStore) HardDeleteUser(orgID, userID uuid.UUID, email string) error {
-	if err := db.DeleteAdminUserReadModel(s.db.Session(), userID.String()); err != nil {
+	session := s.db.Session()
+
+	userState, err := db.ReadAdminUserProjectionState(session, userID.String())
+	hasUserState := err == nil
+	if err != nil && !errors.Is(err, gocql.ErrNotFound) {
 		return err
 	}
-	batch := s.db.Session().Batch(gocql.LoggedBatch)
+
+	orgState, err := db.ReadAdminOrganizationProjectionState(session, orgID.String())
+	hasOrgState := err == nil
+	if err != nil && !errors.Is(err, gocql.ErrNotFound) {
+		return err
+	}
+
+	nextOrgRow, err := s.buildAdminOrganizationProjectionRowAfterUserDelete(orgID.String(), userID.String())
+	hasNextOrgRow := err == nil
+	if err != nil && !errors.Is(err, gocql.ErrNotFound) {
+		return err
+	}
+
+	batch := session.Batch(gocql.LoggedBatch)
+	if hasUserState {
+		db.AddDeleteAdminUserReadModelQuery(batch, userState)
+	}
 	batch.Query(`
 		DELETE FROM users WHERE org_id = ? AND user_id = ?
 	`, orgID.String(), userID.String())
@@ -1372,10 +1435,18 @@ func (s *CassandraStore) HardDeleteUser(orgID, userID uuid.UUID, email string) e
 			DELETE FROM users_by_email WHERE email = ?
 		`, email)
 	}
+	if hasOrgState && hasNextOrgRow && (orgState.Status != nextOrgRow.Status || !orgState.CreatedAt.Equal(nextOrgRow.CreatedAt)) {
+		db.AddDeleteAdminOrganizationReadModelQuery(batch, orgState)
+	}
+	if hasNextOrgRow {
+		db.AddUpsertAdminOrganizationReadModelQuery(batch, nextOrgRow)
+	} else if hasOrgState {
+		db.AddDeleteAdminOrganizationReadModelQuery(batch, orgState)
+	}
 	if err := batch.Exec(); err != nil {
 		return err
 	}
-	return db.SyncAdminOrganizationReadModel(s.db.Session(), orgID.String())
+	return nil
 }
 
 func (s *CassandraStore) GetUserEmail(orgID, userID uuid.UUID) (string, error) {
@@ -1541,10 +1612,16 @@ func (s *CassandraStore) DeleteGroupFull(orgID, groupID uuid.UUID) error {
 }
 
 func (s *CassandraStore) HardDeleteOrg(orgID uuid.UUID) error {
-	if err := db.DeleteAdminOrganizationReadModel(s.db.Session(), orgID.String()); err != nil {
+	session := s.db.Session()
+	orgState, err := db.ReadAdminOrganizationProjectionState(session, orgID.String())
+	hasOrgState := err == nil
+	if err != nil && !errors.Is(err, gocql.ErrNotFound) {
 		return err
 	}
-	batch := s.db.Session().Batch(gocql.LoggedBatch)
+	batch := session.Batch(gocql.LoggedBatch)
+	if hasOrgState {
+		db.AddDeleteAdminOrganizationReadModelQuery(batch, orgState)
+	}
 	batch.Query(`DELETE FROM organizations WHERE org_id = ?`, orgID.String())
 	batch.Query(`DELETE FROM deleted_organizations WHERE org_id = ?`, orgID.String())
 	return batch.Exec()

@@ -331,14 +331,20 @@ func (h *OrgAdminHandler) UpdateOrgInfo(c *gin.Context) {
 	}
 
 	if body.OrgName != "" {
-		if err := h.db.Session().Query(`
-			UPDATE organizations SET name = ? WHERE org_id = ?
-		`, body.OrgName, orgID).Exec(); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update organization"})
+		orgProjectionRow, err := db.ReadAdminOrganizationProjectionRow(h.db.Session(), orgID)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to build organization read model"})
 			return
 		}
-		if err := syncAdminOrganizationReadModel(h.db, orgID); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to sync organization read model"})
+		orgProjectionRow.Name = body.OrgName
+
+		batch := h.db.Session().Batch(gocql.LoggedBatch)
+		batch.Query(`
+			UPDATE organizations SET name = ? WHERE org_id = ?
+		`, body.OrgName, orgID)
+		db.AddUpsertAdminOrganizationReadModelQuery(batch, orgProjectionRow)
+		if err := batch.Exec(); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update organization"})
 			return
 		}
 	}
@@ -514,29 +520,40 @@ func (h *OrgAdminHandler) TransferOrgOwnership(c *gin.Context) {
 	}
 
 	// Swap roles atomically: existing owner → admin (if any), new owner → owner.
+	promotedRow, err := db.ReadAdminUserProjectionRow(h.db.Session(), orgID, plan.PromoteUserID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to build new owner read model"})
+		return
+	}
+	orgProjectionRow, err := db.ReadAdminOrganizationProjectionRow(h.db.Session(), orgID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to build organization read model"})
+		return
+	}
+	promotedRow.Role = "owner"
+	orgProjectionRow.OwnerEmail = promotedRow.Email
+	orgProjectionRow.OwnerName = promotedRow.Name
+
 	batch := h.db.Session().Batch(gocql.LoggedBatch)
+	if plan.DemoteOwnerID != "" {
+		demotedRow, err := db.ReadAdminUserProjectionRow(h.db.Session(), orgID, plan.DemoteOwnerID)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to build previous owner read model"})
+			return
+		}
+		demotedRow.Role = "admin"
+		db.AddUpsertAdminUserReadModelQuery(batch, demotedRow)
+	}
 	if plan.DemoteOwnerID != "" {
 		batch.Query(`UPDATE users SET role = ? WHERE org_id = ? AND user_id = ?`,
 			"admin", orgID, plan.DemoteOwnerID)
 	}
 	batch.Query(`UPDATE users SET role = ? WHERE org_id = ? AND user_id = ?`,
 		"owner", orgID, plan.PromoteUserID)
+	db.AddUpsertAdminUserReadModelQuery(batch, promotedRow)
+	db.AddUpsertAdminOrganizationReadModelQuery(batch, orgProjectionRow)
 	if err := batch.Exec(); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to transfer ownership"})
-		return
-	}
-	if plan.DemoteOwnerID != "" {
-		if err := syncAdminUserReadModel(h.db, orgID, plan.DemoteOwnerID); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to sync previous owner read model"})
-			return
-		}
-	}
-	if err := syncAdminUserReadModel(h.db, orgID, plan.PromoteUserID); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to sync new owner read model"})
-		return
-	}
-	if err := syncAdminOrganizationReadModel(h.db, orgID); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to sync organization read model"})
 		return
 	}
 

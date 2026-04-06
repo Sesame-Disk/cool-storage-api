@@ -188,9 +188,20 @@ func (h *AdminHandler) CreateOrganization(c *gin.Context) {
 
 	// ── Optionally create the owner user ──────────────────────────────────
 	ownerName := ""
+	orgProjectionRow := db.AdminOrganizationProjectionRow{
+		OrgID:        orgID.String(),
+		Name:         orgName,
+		Status:       StatusActive,
+		Plan:         template.Plan,
+		StorageQuota: storageQuota,
+		CreatedAt:    now,
+	}
 	if ownerEmail != "" {
 		ownerName = strings.Split(ownerEmail, "@")[0]
 		ownerUserID := uuid.New()
+		orgProjectionRow.OwnerEmail = ownerEmail
+		orgProjectionRow.OwnerName = ownerName
+		orgProjectionRow.UsersCount = 1
 
 		batch := h.db.Session().Batch(gocql.LoggedBatch)
 		batch.Query(orgInsertQuery, orgInsertArgs...)
@@ -204,6 +215,18 @@ func (h *AdminHandler) CreateOrganization(c *gin.Context) {
 			INSERT INTO users_by_email (email, user_id, org_id)
 			VALUES (?, ?, ?)
 		`, ownerEmail, ownerUserID.String(), orgID.String())
+		db.AddUpsertAdminUserReadModelQuery(batch, db.AdminUserProjectionRow{
+			OrgID:      orgID.String(),
+			UserID:     ownerUserID.String(),
+			Email:      ownerEmail,
+			Name:       ownerName,
+			Role:       "owner",
+			Status:     StatusActive,
+			QuotaBytes: storageQuota,
+			QuotaUsage: int64(0),
+			CreatedAt:  now,
+		})
+		db.AddUpsertAdminOrganizationReadModelQuery(batch, orgProjectionRow)
 
 		if err := batch.Exec(); err != nil {
 			log.Printf("CreateOrganization: failed to create org %s with owner %s: %v",
@@ -211,20 +234,14 @@ func (h *AdminHandler) CreateOrganization(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create organization"})
 			return
 		}
-		if err := syncAdminUserReadModel(h.db, orgID.String(), ownerUserID.String()); err != nil {
-			log.Printf("CreateOrganization: failed to sync admin user projection for org %s owner %s: %v", orgID, ownerUserID, err)
-		}
-		if err := syncAdminOrganizationReadModel(h.db, orgID.String()); err != nil {
-			log.Printf("CreateOrganization: failed to sync admin org projection for org %s: %v", orgID, err)
-		}
 	} else {
-		if err := h.db.Session().Query(orgInsertQuery, orgInsertArgs...).Exec(); err != nil {
+		batch := h.db.Session().Batch(gocql.LoggedBatch)
+		batch.Query(orgInsertQuery, orgInsertArgs...)
+		db.AddUpsertAdminOrganizationReadModelQuery(batch, orgProjectionRow)
+		if err := batch.Exec(); err != nil {
 			log.Printf("CreateOrganization: failed to insert org %s: %v", orgName, err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create organization"})
 			return
-		}
-		if err := syncAdminOrganizationReadModel(h.db, orgID.String()); err != nil {
-			log.Printf("CreateOrganization: failed to sync admin org projection for org %s: %v", orgID, err)
 		}
 	}
 
@@ -529,6 +546,20 @@ func (h *AdminHandler) UpdateOrganization(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"success": true})
 		return
 	}
+	orgProjectionRow, err := db.ReadAdminOrganizationProjectionRow(h.db.Session(), orgID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to build organization read model"})
+		return
+	}
+	if req.Name != nil {
+		orgProjectionRow.Name = *req.Name
+	}
+	if req.StorageQuota != nil {
+		orgProjectionRow.StorageQuota = *req.StorageQuota
+	}
+	if req.Plan != nil {
+		orgProjectionRow.Plan = *req.Plan
+	}
 
 	batch := h.db.Session().Batch(gocql.LoggedBatch)
 	for _, u := range updates {
@@ -549,13 +580,10 @@ func (h *AdminHandler) UpdateOrganization(c *gin.Context) {
 		INSERT INTO audit_log (org_id, timestamp, action, target_type, target_id, actor_id, details)
 		VALUES (?, ?, ?, ?, ?, ?, ?)
 	`, orgUUID, time.Now().UTC(), "organization.update", "organization", orgID, actorID, string(auditDetails))
+	db.AddUpsertAdminOrganizationReadModelQuery(batch, orgProjectionRow)
 
 	if err := batch.Exec(); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update organization"})
-		return
-	}
-	if err := syncAdminOrganizationReadModel(h.db, orgID); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to sync organization read model"})
 		return
 	}
 
@@ -951,10 +979,20 @@ func (h *AdminHandler) UpdateUser(c *gin.Context) {
 	orgID := callerOrgID
 
 	// Validate role if provided
+	var currentName, currentRole, currentStatus string
+	var currentQuota, currentTrafficUploadQuota, currentTrafficDownloadQuota int64
+	var currentDeletedAt *time.Time
+	if err := h.db.Session().Query(`
+		SELECT name, role, status, quota_bytes, traffic_upload_quota, traffic_download_quota, deleted_at
+		FROM users WHERE org_id = ? AND user_id = ?
+	`, orgID, targetUserID).Scan(&currentName, &currentRole, &currentStatus, &currentQuota, &currentTrafficUploadQuota, &currentTrafficDownloadQuota, &currentDeletedAt); err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "user not found"})
+		return
+	}
+
+	roleBeforeUpdate := currentRole
+
 	if req.Role != nil {
-		var oldRole string
-		_ = h.db.Session().Query(`SELECT role FROM users WHERE org_id = ? AND user_id = ?`,
-			orgID, targetUserID).Scan(&oldRole)
 
 		validRoles := map[string]bool{"admin": true, "user": true, "readonly": true, "guest": true}
 		// Only superadmin can assign superadmin role
@@ -974,32 +1012,29 @@ func (h *AdminHandler) UpdateUser(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid role"})
 			return
 		}
-		if err := h.db.Session().Query(`
-			UPDATE users SET role = ? WHERE org_id = ? AND user_id = ?
-		`, *req.Role, orgID, targetUserID).Exec(); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update user"})
-			return
-		}
-		invalidateSessionsOnDemotion(h.sessions, orgID, targetUserID, oldRole, *req.Role)
+		currentRole = *req.Role
 	}
 
 	if req.QuotaBytes != nil {
-		if err := h.db.Session().Query(`
-			UPDATE users SET quota_bytes = ? WHERE org_id = ? AND user_id = ?
-		`, *req.QuotaBytes, orgID, targetUserID).Exec(); err != nil {
+		currentQuota = *req.QuotaBytes
+	}
+
+	if currentRole != roleBeforeUpdate || req.QuotaBytes != nil {
+		if err := updateUserAndAdminReadModels(h.db, orgID, targetUserID, batchedUserUpdate{
+			Name:                 currentName,
+			Role:                 currentRole,
+			Status:               currentStatus,
+			DeletedAt:            currentDeletedAt,
+			QuotaBytes:           currentQuota,
+			TrafficUploadQuota:   currentTrafficUploadQuota,
+			TrafficDownloadQuota: currentTrafficDownloadQuota,
+		}); err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update user"})
 			return
 		}
 	}
 
-	if err := syncAdminUserReadModel(h.db, orgID, targetUserID); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to sync user read model"})
-		return
-	}
-	if err := syncAdminOrganizationReadModel(h.db, orgID); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to sync organization read model"})
-		return
-	}
+	invalidateSessionsOnDemotion(h.sessions, orgID, targetUserID, roleBeforeUpdate, currentRole)
 
 	c.JSON(http.StatusOK, gin.H{"success": true})
 }

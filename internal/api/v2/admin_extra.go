@@ -11,7 +11,6 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
-	"strconv"
 	"strings"
 	"time"
 
@@ -806,8 +805,4 @@ func (h *AdminHandler) resolveOrgCreator(orgID string) (string, string) {
 	}
 	iter.Close()
 	return firstEmail, firstName
-}
-
-func generateUserID() string {
-	return "u-" + time.Now().Format("20060102150405") + "-" + strconv.FormatInt(time.Now().UnixNano()%10000, 10)
 }

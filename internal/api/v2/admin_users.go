@@ -2,6 +2,7 @@ package v2
 
 import (
 	"fmt"
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -393,6 +394,7 @@ func (h *AdminHandler) AdminCreateUser(c *gin.Context) {
 	now := time.Now()
 
 	if err := createUserWithEmailLookup(h.db, orgID, userID, email, name, role, int64(-2), int64(0), now); err != nil {
+		log.Printf("AdminCreateUser: failed to create user %s in org %s: %v", email, orgID, err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create user"})
 		return
 	}
@@ -466,11 +468,15 @@ func (h *AdminHandler) UpdateUserByEmail(c *gin.Context, email string) {
 	var currentQuota int64
 	var currentTrafficUploadQuota int64
 	var currentTrafficDownloadQuota int64
+	var currentDeletedAt *time.Time
 	var currentCreated, currentLastLogin time.Time
-	h.db.Session().Query(`
-		SELECT name, role, status, quota_bytes, traffic_upload_quota, traffic_download_quota, created_at, last_login_at
+	if err := h.db.Session().Query(`
+		SELECT name, role, status, quota_bytes, traffic_upload_quota, traffic_download_quota, deleted_at, created_at, last_login_at
 		FROM users WHERE org_id = ? AND user_id = ?
-	`, userOrgID, userID).Scan(&currentName, &currentRole, &currentStatus, &currentQuota, &currentTrafficUploadQuota, &currentTrafficDownloadQuota, &currentCreated, &currentLastLogin)
+	`, userOrgID, userID).Scan(&currentName, &currentRole, &currentStatus, &currentQuota, &currentTrafficUploadQuota, &currentTrafficDownloadQuota, &currentDeletedAt, &currentCreated, &currentLastLogin); err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "user not found"})
+		return
+	}
 
 	var updateReq struct {
 		Role                 *string `json:"role"`
@@ -487,6 +493,11 @@ func (h *AdminHandler) UpdateUserByEmail(c *gin.Context, email string) {
 	}
 
 	roleBeforeUpdate := currentRole
+	statusBeforeUpdate := currentStatus
+	nameBeforeUpdate := currentName
+	quotaBeforeUpdate := currentQuota
+	uploadQuotaBeforeUpdate := currentTrafficUploadQuota
+	downloadQuotaBeforeUpdate := currentTrafficDownloadQuota
 
 	if updateReq.Role != nil {
 		newRole := *updateReq.Role
@@ -508,37 +519,17 @@ func (h *AdminHandler) UpdateUserByEmail(c *gin.Context, email string) {
 			return
 		}
 		currentRole = newRole
-		if err := h.db.Session().Query(`
-			UPDATE users SET role = ? WHERE org_id = ? AND user_id = ?
-		`, newRole, userOrgID, userID).Exec(); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update user"})
-			return
-		}
 	}
 
 	if updateReq.IsStaff != nil {
 		nextRole := applyLegacyStaffToggle(currentRole, *updateReq.IsStaff)
 		if nextRole != currentRole {
 			currentRole = nextRole
-			if err := h.db.Session().Query(`
-				UPDATE users SET role = ? WHERE org_id = ? AND user_id = ?
-			`, currentRole, userOrgID, userID).Exec(); err != nil {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update user"})
-				return
-			}
 		}
 	}
 
-	invalidateSessionsOnDemotion(h.sessions, userOrgID, userID, roleBeforeUpdate, currentRole)
-
 	if updateReq.Name != nil {
 		currentName = *updateReq.Name
-		if err := h.db.Session().Query(`
-			UPDATE users SET name = ? WHERE org_id = ? AND user_id = ?
-		`, currentName, userOrgID, userID).Exec(); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update user"})
-			return
-		}
 	}
 
 	// Compute new quota values for validation before writing.
@@ -562,58 +553,47 @@ func (h *AdminHandler) UpdateUserByEmail(c *gin.Context, email string) {
 		return
 	}
 
-	if newQuota != currentQuota {
-		currentQuota = newQuota
-		if err := h.db.Session().Query(`
-			UPDATE users SET quota_bytes = ? WHERE org_id = ? AND user_id = ?
-		`, currentQuota, userOrgID, userID).Exec(); err != nil {
+	nextDeletedAt := currentDeletedAt
+	if updateReq.IsActive != nil {
+		if !*updateReq.IsActive {
+			currentStatus = StatusDeactivated
+		} else {
+			currentStatus = StatusActive
+			nextDeletedAt = nil
+		}
+	}
+
+	deletedAtChanged := (currentDeletedAt == nil) != (nextDeletedAt == nil)
+	if !deletedAtChanged && currentDeletedAt != nil && nextDeletedAt != nil {
+		deletedAtChanged = !currentDeletedAt.Equal(*nextDeletedAt)
+	}
+	userChanged := nameBeforeUpdate != currentName ||
+		roleBeforeUpdate != currentRole ||
+		quotaBeforeUpdate != newQuota ||
+		uploadQuotaBeforeUpdate != newUploadQuota ||
+		downloadQuotaBeforeUpdate != newDownloadQuota ||
+		normalizeUserStatus(statusBeforeUpdate) != normalizeUserStatus(currentStatus) ||
+		deletedAtChanged
+	if userChanged {
+		if err := updateUserAndAdminReadModels(h.db, userOrgID, userID, batchedUserUpdate{
+			Name:                 currentName,
+			Role:                 currentRole,
+			Status:               currentStatus,
+			DeletedAt:            nextDeletedAt,
+			QuotaBytes:           newQuota,
+			TrafficUploadQuota:   newUploadQuota,
+			TrafficDownloadQuota: newDownloadQuota,
+		}); err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update user"})
 			return
 		}
 	}
 
-	if newUploadQuota != currentTrafficUploadQuota {
-		currentTrafficUploadQuota = newUploadQuota
-		if err := h.db.Session().Query(`
-			UPDATE users SET traffic_upload_quota = ? WHERE org_id = ? AND user_id = ?
-		`, currentTrafficUploadQuota, userOrgID, userID).Exec(); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update user"})
-			return
-		}
-	}
-
-	if newDownloadQuota != currentTrafficDownloadQuota {
-		currentTrafficDownloadQuota = newDownloadQuota
-		if err := h.db.Session().Query(`
-			UPDATE users SET traffic_download_quota = ? WHERE org_id = ? AND user_id = ?
-		`, currentTrafficDownloadQuota, userOrgID, userID).Exec(); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update user"})
-			return
-		}
-	}
-
-	if updateReq.IsActive != nil && !*updateReq.IsActive {
-		if err := deactivateUser(h.db, h.sessions, h.apiKeys, userOrgID, userID); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update user"})
-			return
-		}
-		currentStatus = "deactivated"
-	} else if updateReq.IsActive != nil && *updateReq.IsActive {
-		if err := activateUser(h.db, userOrgID, userID); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update user"})
-			return
-		}
-		currentStatus = "active"
-	}
-
-	if err := syncAdminUserReadModel(h.db, userOrgID, userID); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to sync user read model"})
-		return
-	}
-	if err := syncAdminOrganizationReadModel(h.db, userOrgID); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to sync organization read model"})
-		return
-	}
+	invalidateSessionsOnDemotion(h.sessions, userOrgID, userID, roleBeforeUpdate, currentRole)
+	runUserStatusSideEffects(h.db, h.sessions, h.apiKeys, userOrgID, userID, statusBeforeUpdate, currentStatus)
+	currentQuota = newQuota
+	currentTrafficUploadQuota = newUploadQuota
+	currentTrafficDownloadQuota = newDownloadQuota
 
 	resp := makeAdminUserResponse(email, currentName, currentRole, currentStatus, currentQuota, traffic.ReadStorageUsed(h.db, fmt.Sprintf("user:%s:%s", userOrgID, userID)), currentCreated, currentLastLogin)
 	resp.TrafficUploadQuota = currentTrafficUploadQuota

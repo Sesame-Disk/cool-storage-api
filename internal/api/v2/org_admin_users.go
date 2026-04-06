@@ -4,6 +4,7 @@ import (
 	"encoding/csv"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -12,7 +13,6 @@ import (
 	dbpkg "github.com/Sesame-Disk/sesamefs/internal/db"
 	"github.com/Sesame-Disk/sesamefs/internal/middleware"
 	"github.com/Sesame-Disk/sesamefs/internal/traffic"
-	gocql "github.com/apache/cassandra-gocql-driver/v2"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 )
@@ -145,6 +145,7 @@ func (h *OrgAdminHandler) AddOrgUser(c *gin.Context) {
 	now := time.Now()
 
 	if err := createUserWithEmailLookup(h.db, targetOrgID, userID, email, name, "user", int64(-2), int64(0), now); err != nil {
+		log.Printf("AddOrgUser: failed to create user %s in org %s: %v", email, targetOrgID, err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create user"})
 		return
 	}
@@ -207,12 +208,13 @@ func (h *OrgAdminHandler) UpdateOrgUser(c *gin.Context) {
 
 	var name, role, status string
 	var quota, trafficUploadQuota, trafficDownloadQuota int64
+	var deletedAt *time.Time
 	var created, lastLogin time.Time
 
 	if err := h.db.Session().Query(`
-		SELECT name, role, status, quota_bytes, traffic_upload_quota, traffic_download_quota, created_at, last_login_at
+		SELECT name, role, status, quota_bytes, traffic_upload_quota, traffic_download_quota, deleted_at, created_at, last_login_at
 		FROM users WHERE org_id = ? AND user_id = ?
-	`, targetOrgID, userID).Scan(&name, &role, &status, &quota, &trafficUploadQuota, &trafficDownloadQuota, &created, &lastLogin); err != nil {
+	`, targetOrgID, userID).Scan(&name, &role, &status, &quota, &trafficUploadQuota, &trafficDownloadQuota, &deletedAt, &created, &lastLogin); err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "user not found"})
 		return
 	}
@@ -220,6 +222,10 @@ func (h *OrgAdminHandler) UpdateOrgUser(c *gin.Context) {
 	originalRole := role
 	originalName := name
 	originalQuota := quota
+	originalStatus := status
+	originalTrafficUploadQuota := trafficUploadQuota
+	originalTrafficDownloadQuota := trafficDownloadQuota
+	originalDeletedAt := deletedAt
 
 	// Protect the org owner: only a platform superadmin can modify the owner.
 	callerOrgID := c.GetString("org_id")
@@ -252,19 +258,13 @@ func (h *OrgAdminHandler) UpdateOrgUser(c *gin.Context) {
 		return
 	}
 
+	nextDeletedAt := deletedAt
 	if updateReq.IsActive != nil {
 		if !*updateReq.IsActive {
-			if err := deactivateUser(h.db, h.sessions, h.apiKeys, targetOrgID, userID); err != nil {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update user"})
-				return
-			}
 			status = StatusDeactivated
 		} else {
-			if err := activateUser(h.db, targetOrgID, userID); err != nil {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update user"})
-				return
-			}
 			status = StatusActive
+			nextDeletedAt = nil
 		}
 	}
 
@@ -297,57 +297,36 @@ func (h *OrgAdminHandler) UpdateOrgUser(c *gin.Context) {
 		return
 	}
 
-	if role != originalRole || name != originalName || quota != originalQuota {
-		batch := h.db.Session().Batch(gocql.LoggedBatch)
-		if role != originalRole {
-			batch.Query(`UPDATE users SET role = ? WHERE org_id = ? AND user_id = ?`,
-				role, targetOrgID, userID)
-		}
-		if name != originalName {
-			batch.Query(`UPDATE users SET name = ? WHERE org_id = ? AND user_id = ?`,
-				name, targetOrgID, userID)
-		}
-		if quota != originalQuota {
-			batch.Query(`UPDATE users SET quota_bytes = ? WHERE org_id = ? AND user_id = ?`,
-				quota, targetOrgID, userID)
-		}
-		if err := batch.Exec(); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update user"})
-			return
-		}
-		invalidateSessionsOnDemotion(h.sessions, targetOrgID, userID, originalRole, role)
+	deletedAtChanged := (originalDeletedAt == nil) != (nextDeletedAt == nil)
+	if !deletedAtChanged && originalDeletedAt != nil && nextDeletedAt != nil {
+		deletedAtChanged = !originalDeletedAt.Equal(*nextDeletedAt)
 	}
-
-	if newUploadQuota != trafficUploadQuota {
-		trafficUploadQuota = newUploadQuota
-		if err := h.db.Session().Query(
-			`UPDATE users SET traffic_upload_quota = ? WHERE org_id = ? AND user_id = ?`,
-			trafficUploadQuota, targetOrgID, userID,
-		).Exec(); err != nil {
+	userChanged := role != originalRole ||
+		name != originalName ||
+		quota != originalQuota ||
+		newUploadQuota != originalTrafficUploadQuota ||
+		newDownloadQuota != originalTrafficDownloadQuota ||
+		normalizeUserStatus(status) != normalizeUserStatus(originalStatus) ||
+		deletedAtChanged
+	if userChanged {
+		if err := updateUserAndAdminReadModels(h.db, targetOrgID, userID, batchedUserUpdate{
+			Name:                 name,
+			Role:                 role,
+			Status:               status,
+			DeletedAt:            nextDeletedAt,
+			QuotaBytes:           quota,
+			TrafficUploadQuota:   newUploadQuota,
+			TrafficDownloadQuota: newDownloadQuota,
+		}); err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update user"})
 			return
 		}
 	}
 
-	if newDownloadQuota != trafficDownloadQuota {
-		trafficDownloadQuota = newDownloadQuota
-		if err := h.db.Session().Query(
-			`UPDATE users SET traffic_download_quota = ? WHERE org_id = ? AND user_id = ?`,
-			trafficDownloadQuota, targetOrgID, userID,
-		).Exec(); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update user"})
-			return
-		}
-	}
-
-	if err := syncAdminUserReadModel(h.db, targetOrgID, userID); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to sync user read model"})
-		return
-	}
-	if err := syncAdminOrganizationReadModel(h.db, targetOrgID); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to sync organization read model"})
-		return
-	}
+	invalidateSessionsOnDemotion(h.sessions, targetOrgID, userID, originalRole, role)
+	runUserStatusSideEffects(h.db, h.sessions, h.apiKeys, targetOrgID, userID, originalStatus, status)
+	trafficUploadQuota = newUploadQuota
+	trafficDownloadQuota = newDownloadQuota
 
 	row := buildOrgUserRowWithTraffic(email, name, role, status, targetOrgID, quota, traffic.ReadStorageUsed(h.db, fmt.Sprintf("user:%s:%s", targetOrgID, userID)), trafficUploadQuota, trafficDownloadQuota, created, lastLogin)
 	row.OrgStorageQuota = oq.StorageQuota
@@ -734,6 +713,7 @@ func (h *OrgAdminHandler) ImportOrgUsers(c *gin.Context) {
 
 		userID := uuid.New().String()
 		if err := createUserWithEmailLookup(h.db, targetOrgID, userID, email, name, "user", int64(-2), int64(0), now); err != nil {
+			log.Printf("ImportOrgUsers: failed to create user %s in org %s: %v", email, targetOrgID, err)
 			failed = append(failed, gin.H{"email": email, "error": "database error"})
 			continue
 		}

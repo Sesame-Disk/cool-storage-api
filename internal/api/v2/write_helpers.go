@@ -35,7 +35,28 @@ func formatOptionalTimestamp(ts time.Time) string {
 	return ts.UTC().Format(time.RFC3339)
 }
 
+func buildAdminOrganizationProjectionRowForNewUser(
+	db interface{ Session() *gocql.Session },
+	orgID, email, name, role string,
+) (dbpkg.AdminOrganizationProjectionRow, error) {
+	row, err := dbpkg.ReadAdminOrganizationProjectionRow(db.Session(), orgID)
+	if err != nil {
+		return dbpkg.AdminOrganizationProjectionRow{}, err
+	}
+	row.UsersCount++
+	if row.OwnerEmail == "" || role == "owner" {
+		row.OwnerEmail = email
+		row.OwnerName = name
+	}
+	return row, nil
+}
+
 func createUserWithEmailLookup(db interface{ Session() *gocql.Session }, orgID, userID, email, name, role string, quotaBytes, usedBytes int64, createdAt time.Time) error {
+	orgProjectionRow, err := buildAdminOrganizationProjectionRowForNewUser(db, orgID, email, name, role)
+	if err != nil {
+		return fmt.Errorf("build admin org projection for new user %s in org %s: %w", userID, orgID, err)
+	}
+
 	batch := db.Session().Batch(gocql.LoggedBatch)
 	batch.Query(`
 		INSERT INTO users (org_id, user_id, email, name, role, status, quota_bytes, used_bytes, created_at)
@@ -56,10 +77,100 @@ func createUserWithEmailLookup(db interface{ Session() *gocql.Session }, orgID, 
 		QuotaUsage: usedBytes,
 		CreatedAt:  createdAt,
 	})
+	dbpkg.AddUpsertAdminOrganizationReadModelQuery(batch, orgProjectionRow)
 	if err := batch.Exec(); err != nil {
+		return fmt.Errorf("exec create user batch for user %s in org %s: %w", userID, orgID, err)
+	}
+	return nil
+}
+
+type batchedUserUpdate struct {
+	Name                 string
+	Role                 string
+	Status               string
+	DeletedAt            *time.Time
+	QuotaBytes           int64
+	TrafficUploadQuota   int64
+	TrafficDownloadQuota int64
+}
+
+func buildAdminOrganizationProjectionRowForUpdatedUser(
+	db interface{ Session() *gocql.Session },
+	orgID, updatedUserID, updatedName, updatedRole string,
+) (dbpkg.AdminOrganizationProjectionRow, error) {
+	row := dbpkg.AdminOrganizationProjectionRow{OrgID: orgID}
+	var deletedAt *time.Time
+	if err := db.Session().Query(`
+		SELECT name, status, plan, storage_quota, deleted_at, created_at
+		FROM organizations WHERE org_id = ?
+	`, orgID).Scan(&row.Name, &row.Status, &row.Plan, &row.StorageQuota, &deletedAt, &row.CreatedAt); err != nil {
+		return dbpkg.AdminOrganizationProjectionRow{}, err
+	}
+	if row.Status == "" {
+		row.Status = StatusActive
+	}
+	row.DeletedAt = deletedAt
+
+	iter := db.Session().Query(`
+		SELECT user_id, email, name, role FROM users WHERE org_id = ?
+	`, orgID).Iter()
+
+	var userID, email, name, role string
+	var firstEmail, firstName string
+	firstRemaining := true
+	for iter.Scan(&userID, &email, &name, &role) {
+		if userID == updatedUserID {
+			name = updatedName
+			role = updatedRole
+		}
+		row.UsersCount++
+		if firstRemaining {
+			firstEmail, firstName = email, name
+			firstRemaining = false
+		}
+		if row.OwnerEmail == "" && (role == "superadmin" || role == "owner" || role == "admin") {
+			row.OwnerEmail = email
+			row.OwnerName = name
+		}
+	}
+	if err := iter.Close(); err != nil {
+		return dbpkg.AdminOrganizationProjectionRow{}, err
+	}
+	if row.OwnerEmail == "" {
+		row.OwnerEmail = firstEmail
+		row.OwnerName = firstName
+	}
+	return row, nil
+}
+
+func updateUserAndAdminReadModels(
+	db interface{ Session() *gocql.Session },
+	orgID, userID string,
+	next batchedUserUpdate,
+) error {
+	userProjectionRow, err := dbpkg.ReadAdminUserProjectionRow(db.Session(), orgID, userID)
+	if err != nil {
 		return err
 	}
-	return dbpkg.SyncAdminOrganizationReadModel(db.Session(), orgID)
+	userProjectionRow.Name = next.Name
+	userProjectionRow.Role = next.Role
+	userProjectionRow.Status = next.Status
+	userProjectionRow.QuotaBytes = next.QuotaBytes
+
+	orgProjectionRow, err := buildAdminOrganizationProjectionRowForUpdatedUser(db, orgID, userID, next.Name, next.Role)
+	if err != nil {
+		return err
+	}
+
+	batch := db.Session().Batch(gocql.LoggedBatch)
+	batch.Query(`
+		UPDATE users
+		SET name = ?, role = ?, status = ?, deleted_at = ?, quota_bytes = ?, traffic_upload_quota = ?, traffic_download_quota = ?
+		WHERE org_id = ? AND user_id = ?
+	`, next.Name, next.Role, next.Status, next.DeletedAt, next.QuotaBytes, next.TrafficUploadQuota, next.TrafficDownloadQuota, orgID, userID)
+	dbpkg.AddUpsertAdminUserReadModelQuery(batch, userProjectionRow)
+	dbpkg.AddUpsertAdminOrganizationReadModelQuery(batch, orgProjectionRow)
+	return batch.Exec()
 }
 
 func adminLibraryProjectionDeletedAtEqual(left, right *time.Time) bool {
@@ -392,6 +503,26 @@ func invalidateSessionsOnDemotion(si SessionInvalidator, orgID, userID, oldRole,
 				userID, orgID, oldRole, newRole, err)
 		}
 	}()
+}
+
+func runUserStatusSideEffects(
+	db interface{ Session() *gocql.Session },
+	si SessionInvalidator,
+	aki APIKeyInvalidator,
+	orgID, userID, oldStatus, newStatus string,
+) {
+	if normalizeUserStatus(oldStatus) == normalizeUserStatus(newStatus) {
+		return
+	}
+	switch normalizeUserStatus(newStatus) {
+	case StatusActive:
+		go setUserShareLinksActive(db, orgID, userID, true)
+	case StatusDeactivated, StatusDeleted:
+		go func() {
+			invalidateUserCredentials(si, aki, orgID, userID)
+			setUserShareLinksActive(db, orgID, userID, false)
+		}()
+	}
 }
 
 // deactivateUser marks a user as deactivated and, in a background goroutine,

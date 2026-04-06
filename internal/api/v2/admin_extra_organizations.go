@@ -2,6 +2,7 @@ package v2
 
 import (
 	"fmt"
+	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -11,6 +12,7 @@ import (
 	"github.com/Sesame-Disk/sesamefs/internal/traffic"
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 )
 
 func (h *AdminHandler) AdminSearchOrganizations(c *gin.Context) {
@@ -98,7 +100,7 @@ func (h *AdminHandler) AdminAddOrgUser(c *gin.Context) {
 		}
 	}
 
-	userID := generateUserID()
+	userID := uuid.New().String()
 	now := time.Now()
 	role := "user"
 
@@ -107,6 +109,7 @@ func (h *AdminHandler) AdminAddOrgUser(c *gin.Context) {
 	}
 
 	if err := createUserWithEmailLookup(h.db, targetOrgID, userID, req.Email, req.Name, role, int64(-2), int64(0), now); err != nil {
+		log.Printf("AdminAddOrgUser: failed to create user %s in org %s: %v", req.Email, targetOrgID, err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create user"})
 		return
 	}
@@ -145,16 +148,24 @@ func (h *AdminHandler) AdminUpdateOrgUser(c *gin.Context) {
 	}
 
 	var name, role, status string
-	var quotaBytes int64
+	var quotaBytes, trafficUploadQuota, trafficDownloadQuota int64
+	var deletedAt *time.Time
 	var createdAt, lastLoginAt time.Time
 
 	if err := h.db.Session().Query(`
-		SELECT name, role, status, quota_bytes, created_at, last_login_at
+		SELECT name, role, status, quota_bytes, traffic_upload_quota, traffic_download_quota, deleted_at, created_at, last_login_at
 		FROM users WHERE org_id = ? AND user_id = ?
-	`, targetOrgID, userID).Scan(&name, &role, &status, &quotaBytes, &createdAt, &lastLoginAt); err != nil {
+	`, targetOrgID, userID).Scan(&name, &role, &status, &quotaBytes, &trafficUploadQuota, &trafficDownloadQuota, &deletedAt, &createdAt, &lastLoginAt); err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "user not found"})
 		return
 	}
+	originalName := name
+	originalRole := role
+	originalStatus := status
+	originalQuota := quotaBytes
+	originalTrafficUploadQuota := trafficUploadQuota
+	originalTrafficDownloadQuota := trafficDownloadQuota
+	originalDeletedAt := deletedAt
 
 	var updateReq struct {
 		Active               *bool   `json:"active"`
@@ -171,19 +182,14 @@ func (h *AdminHandler) AdminUpdateOrgUser(c *gin.Context) {
 		return
 	}
 
+	nextDeletedAt := deletedAt
+	ownerTransferExecuted := false
 	if updateReq.Active != nil {
 		if !*updateReq.Active {
-			if err := deactivateUser(h.db, h.sessions, h.apiKeys, targetOrgID, userID); err != nil {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update user"})
-				return
-			}
 			status = StatusDeactivated
 		} else {
-			if err := activateUser(h.db, targetOrgID, userID); err != nil {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update user"})
-				return
-			}
 			status = StatusActive
+			nextDeletedAt = nil
 		}
 	}
 
@@ -195,20 +201,10 @@ func (h *AdminHandler) AdminUpdateOrgUser(c *gin.Context) {
 	}
 	if staffPtr != nil {
 		role = applyLegacyStaffToggle(role, *staffPtr)
-		if err := h.db.Session().Query(`UPDATE users SET role = ? WHERE org_id = ? AND user_id = ?`,
-			role, targetOrgID, userID).Exec(); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update user"})
-			return
-		}
 	}
 
 	if updateReq.Name != nil && *updateReq.Name != "" {
 		name = *updateReq.Name
-		if err := h.db.Session().Query(`UPDATE users SET name = ? WHERE org_id = ? AND user_id = ?`,
-			name, targetOrgID, userID).Exec(); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update user"})
-			return
-		}
 	}
 
 	if updateReq.Role != nil && *updateReq.Role == string(middleware.RoleOwner) {
@@ -236,27 +232,38 @@ func (h *AdminHandler) AdminUpdateOrgUser(c *gin.Context) {
 			return
 		}
 		if !plan.NoOp {
+			promotedRow, err := dbpkg.ReadAdminUserProjectionRow(h.db.Session(), targetOrgID, plan.PromoteUserID)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to build new owner read model"})
+				return
+			}
+			orgProjectionRow, err := dbpkg.ReadAdminOrganizationProjectionRow(h.db.Session(), targetOrgID)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to build organization read model"})
+				return
+			}
+			promotedRow.Role = "owner"
+			orgProjectionRow.OwnerEmail = promotedRow.Email
+			orgProjectionRow.OwnerName = promotedRow.Name
+
 			batch := h.db.Session().Batch(gocql.LoggedBatch)
+			if plan.DemoteOwnerID != "" {
+				demotedRow, err := dbpkg.ReadAdminUserProjectionRow(h.db.Session(), targetOrgID, plan.DemoteOwnerID)
+				if err != nil {
+					c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to build previous owner read model"})
+					return
+				}
+				demotedRow.Role = "admin"
+				dbpkg.AddUpsertAdminUserReadModelQuery(batch, demotedRow)
+			}
 			if plan.DemoteOwnerID != "" {
 				batch.Query(`UPDATE users SET role = ? WHERE org_id = ? AND user_id = ?`, "admin", targetOrgID, plan.DemoteOwnerID)
 			}
 			batch.Query(`UPDATE users SET role = ? WHERE org_id = ? AND user_id = ?`, "owner", targetOrgID, plan.PromoteUserID)
+			dbpkg.AddUpsertAdminUserReadModelQuery(batch, promotedRow)
+			dbpkg.AddUpsertAdminOrganizationReadModelQuery(batch, orgProjectionRow)
 			if err := batch.Exec(); err != nil {
 				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to transfer ownership"})
-				return
-			}
-			if plan.DemoteOwnerID != "" {
-				if err := syncAdminUserReadModel(h.db, targetOrgID, plan.DemoteOwnerID); err != nil {
-					c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to sync previous owner read model"})
-					return
-				}
-			}
-			if err := syncAdminUserReadModel(h.db, targetOrgID, plan.PromoteUserID); err != nil {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to sync new owner read model"})
-				return
-			}
-			if err := syncAdminOrganizationReadModel(h.db, targetOrgID); err != nil {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to sync organization read model"})
 				return
 			}
 			// Demoted owner goes from "owner" to "admin" — invalidate their sessions.
@@ -264,31 +271,20 @@ func (h *AdminHandler) AdminUpdateOrgUser(c *gin.Context) {
 				invalidateSessionsOnDemotion(h.sessions, targetOrgID, plan.DemoteOwnerID, "owner", "admin")
 			}
 		}
+		ownerTransferExecuted = true
 		role = string(middleware.RoleOwner)
 	} else if updateReq.Role != nil {
 		validRoles := map[string]bool{"admin": true, "user": true, "readonly": true, "guest": true}
 		if validRoles[*updateReq.Role] {
 			role = *updateReq.Role
-			if err := h.db.Session().Query(`UPDATE users SET role = ? WHERE org_id = ? AND user_id = ?`,
-				role, targetOrgID, userID).Exec(); err != nil {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update user"})
-				return
-			}
 		}
 	}
 
 	invalidateSessionsOnDemotion(h.sessions, targetOrgID, userID, roleBeforeUpdate, role)
 
-	originalQuota := quotaBytes
 	if updateReq.QuotaTotal != nil {
 		quotaBytes = *updateReq.QuotaTotal
 	}
-
-	var trafficUploadQuota, trafficDownloadQuota int64
-	_ = h.db.Session().Query(
-		`SELECT traffic_upload_quota, traffic_download_quota FROM users WHERE org_id = ? AND user_id = ?`,
-		targetOrgID, userID,
-	).Scan(&trafficUploadQuota, &trafficDownloadQuota)
 
 	newUploadQuota := trafficUploadQuota
 	newDownloadQuota := trafficDownloadQuota
@@ -305,31 +301,35 @@ func (h *AdminHandler) AdminUpdateOrgUser(c *gin.Context) {
 		return
 	}
 
-	if quotaBytes != originalQuota {
-		if err := h.db.Session().Query(`UPDATE users SET quota_bytes = ? WHERE org_id = ? AND user_id = ?`,
-			quotaBytes, targetOrgID, userID).Exec(); err != nil {
+	deletedAtChanged := (originalDeletedAt == nil) != (nextDeletedAt == nil)
+	if !deletedAtChanged && originalDeletedAt != nil && nextDeletedAt != nil {
+		deletedAtChanged = !originalDeletedAt.Equal(*nextDeletedAt)
+	}
+	userChanged := originalName != name ||
+		originalRole != role ||
+		originalQuota != quotaBytes ||
+		originalTrafficUploadQuota != newUploadQuota ||
+		originalTrafficDownloadQuota != newDownloadQuota ||
+		normalizeUserStatus(originalStatus) != normalizeUserStatus(status) ||
+		deletedAtChanged
+	if userChanged && !ownerTransferExecuted {
+		if err := updateUserAndAdminReadModels(h.db, targetOrgID, userID, batchedUserUpdate{
+			Name:                 name,
+			Role:                 role,
+			Status:               status,
+			DeletedAt:            nextDeletedAt,
+			QuotaBytes:           quotaBytes,
+			TrafficUploadQuota:   newUploadQuota,
+			TrafficDownloadQuota: newDownloadQuota,
+		}); err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update user"})
 			return
 		}
 	}
 
-	if newUploadQuota != trafficUploadQuota {
-		if err := h.db.Session().Query(`UPDATE users SET traffic_upload_quota = ? WHERE org_id = ? AND user_id = ?`,
-			newUploadQuota, targetOrgID, userID).Exec(); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update user"})
-			return
-		}
-		trafficUploadQuota = newUploadQuota
-	}
-
-	if newDownloadQuota != trafficDownloadQuota {
-		if err := h.db.Session().Query(`UPDATE users SET traffic_download_quota = ? WHERE org_id = ? AND user_id = ?`,
-			newDownloadQuota, targetOrgID, userID).Exec(); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update user"})
-			return
-		}
-		trafficDownloadQuota = newDownloadQuota
-	}
+	runUserStatusSideEffects(h.db, h.sessions, h.apiKeys, targetOrgID, userID, originalStatus, status)
+	trafficUploadQuota = newUploadQuota
+	trafficDownloadQuota = newDownloadQuota
 
 	isActive := IsUserUsable(status)
 	isOrgStaff := middleware.IsOrgStaff(role)
