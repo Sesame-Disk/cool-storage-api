@@ -3,7 +3,7 @@ import ReactDom from 'react-dom';
 import { MarkdownViewer } from '@seafile/seafile-editor';
 import { seafileAPI } from './utils/seafile-api';
 import { Utils } from './utils/utils';
-import { serviceURL, mediaUrl } from './utils/constants';
+import { mediaUrl } from './utils/constants';
 import { rewriteSharedMarkdownNode } from './utils/share-link-markdown-url';
 import SharedFileView from './components/shared-file-view/shared-file-view';
 import SharedFileViewTip from './components/shared-file-view/shared-file-view-tip';
@@ -49,7 +49,6 @@ class FileContent extends React.Component {
       sharedToken,
       currentFilePath: filePath,
       smartLinkMap,
-      serviceURL,
     });
   };
 

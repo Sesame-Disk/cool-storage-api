@@ -4,6 +4,7 @@ import ReactDOM from 'react-dom';
 import 'bootstrap/dist/css/bootstrap.min.css';
 
 import { getAuthToken, isAuthenticated, redirectToLogin } from './utils/auth-state';
+import PDFViewer from './components/pdf-viewer';
 
 const IMAGE_EXTENSIONS = new Set(['png', 'jpg', 'jpeg', 'gif', 'bmp', 'webp', 'svg', 'ico', 'tiff', 'tif']);
 const VIDEO_EXTENSIONS = new Set(['mp4', 'webm', 'ogg', 'mov']);
@@ -173,7 +174,7 @@ function FilePreviewPage() {
     );
 
     if (extension === 'pdf') {
-        content = <embed src={rawURL} type="application/pdf" width="100%" height="100%" style={{ border: 'none' }} />;
+        content = <PDFViewer src={rawURL} title={fileName} />;
     } else if (IMAGE_EXTENSIONS.has(extension)) {
         content = (
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%', padding: '20px', overflow: 'auto' }}>

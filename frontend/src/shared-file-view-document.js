@@ -1,7 +1,7 @@
 import React from 'react';
 import ReactDom from 'react-dom';
 import { seafileAPI } from './utils/seafile-api';
-import { gettext, mediaUrl } from './utils/constants';
+import { gettext, siteRoot } from './utils/constants';
 import SharedFileView from './components/shared-file-view/shared-file-view';
 import SharedFileViewTip from './components/shared-file-view/shared-file-view-tip';
 import Loading from './components/loading';
@@ -11,9 +11,13 @@ import 'bootstrap/dist/css/bootstrap.min.css';
 import './css/pdf-file-view.css';
 
 const {
-  repoID, filePath, err,
+  repoID, filePath, fileName, err,
   commitID, fileType, sharedToken
 } = window.shared.pageOptions;
+
+function buildOfficeConvertedPDFURL() {
+  return `${siteRoot}office-convert/static/${repoID}/${commitID}${encodeURIComponent(filePath)}/1.pdf?token=${sharedToken}`;
+}
 
 class SharedFileViewDocument extends React.Component {
   render() {
@@ -57,11 +61,6 @@ class FileContent extends React.Component {
               isLoading: false,
               errorMsg: ''
             });
-            // eslint-disable-next-line
-            let scriptNode = document.createElement('script');
-            scriptNode.type = 'text/javascript';
-            scriptNode.src = `${mediaUrl}js/pdf/web/viewer.js`;
-            document.body.append(scriptNode);
         }
       }).catch((error) => {
         if (error.response) {
@@ -98,7 +97,7 @@ class FileContent extends React.Component {
 
     return (
       <div className="shared-file-view-body pdf-file-view">
-        <PDFViewer />
+        <PDFViewer src={buildOfficeConvertedPDFURL()} title={fileName} />
       </div>
     );
   }
