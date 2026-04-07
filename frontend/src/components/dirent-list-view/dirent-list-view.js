@@ -640,11 +640,11 @@ class DirentListView extends React.Component {
                 </th>
                 <th width="3%" className="pl10">{/*icon */}</th>
                 <th width="5%" className="pl10">{/*star */}</th>
-                <th width="39%"><a className="d-block table-sort-op" href="#" onClick={this.sortByName}>{gettext('Name')} {sortByName && sortIcon}</a></th>
+                <th width="39%"><button type="button" className="d-block table-sort-op bg-transparent border-0 p-0 text-left w-100" onClick={this.sortByName}>{gettext('Name')} {sortByName && sortIcon}</button></th>
                 <th width="6%">{/*tag */}</th>
                 <th width="18%">{/*operation */}</th>
-                <th width="11%"><a className="d-block table-sort-op" href="#" onClick={this.sortBySize}>{gettext('Size')} {sortBySize && sortIcon}</a></th>
-                <th width="15%"><a className="d-block table-sort-op" href="#" onClick={this.sortByTime}>{gettext('Last Update')} {sortByTime && sortIcon}</a></th>
+                <th width="11%"><button type="button" className="d-block table-sort-op bg-transparent border-0 p-0 text-left w-100" onClick={this.sortBySize}>{gettext('Size')} {sortBySize && sortIcon}</button></th>
+                <th width="15%"><button type="button" className="d-block table-sort-op bg-transparent border-0 p-0 text-left w-100" onClick={this.sortByTime}>{gettext('Last Update')} {sortByTime && sortIcon}</button></th>
               </tr>
             </thead>
           ) : (

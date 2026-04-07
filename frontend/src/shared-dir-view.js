@@ -5,7 +5,7 @@ import ReactDom from 'react-dom';
 import { Button, Dropdown, DropdownToggle, DropdownItem, UncontrolledTooltip } from 'reactstrap';
 import moment from 'moment';
 import Account from './components/common/account';
-import { useGoFileserver, fileServerRoot, gettext, siteRoot, mediaUrl, logoPath, logoWidth, logoHeight, siteTitle, thumbnailSizeForOriginal } from './utils/constants';
+import { useGoFileserver, fileServerRoot, gettext, siteRoot, mediaUrl, logoPath, logoHeight, siteTitle } from './utils/constants';
 import { Utils } from './utils/utils';
 import { seafileAPI } from './utils/seafile-api';
 import Loading from './components/loading';
@@ -453,13 +453,17 @@ render() {
                       className={`${modeBaseClass} sf2-icon-list-view ${mode === 'list' ? 'current-mode' : ''}`}
                       title={gettext('List')}
                       aria-label={gettext('List')}
-                    ></a>
+                    >
+                      <span className="sr-only">{gettext('List')}</span>
+                    </a>
                     <a
                       href={`?p=${encodeURIComponent(relativePath)}&mode=grid`}
                       className={`${modeBaseClass} sf2-icon-grid-view ${mode === 'grid' ? 'current-mode' : ''}`}
                       title={gettext('Grid')}
                       aria-label={gettext('Grid')}
-                    ></a>
+                    >
+                      <span className="sr-only">{gettext('Grid')}</span>
+                    </a>
                   </div>
                 }
                 {canUpload && (
@@ -574,10 +578,6 @@ render() {
 
 class Content extends React.Component {
 
-  constructor(props) {
-    super(props);
-  }
-
   sortByName = (e) => {
     e.preventDefault();
     const sortBy = 'name';
@@ -656,10 +656,10 @@ class Content extends React.Component {
               </th>
             }
             <th width="5%"></th>
-            <th width={showDownloadIcon ? '50%' : '53%'}><a className="d-block table-sort-op" href="#" onClick={this.sortByName}>{gettext('Name')} {sortBy === 'name' && sortIcon}</a></th>
+            <th width={showDownloadIcon ? '50%' : '53%'}><button type="button" className="d-block table-sort-op bg-transparent border-0 p-0 text-left w-100" onClick={this.sortByName}>{gettext('Name')} {sortBy === 'name' && sortIcon}</button></th>
             <th width="8%"></th>
-            <th width="14%"><a className="d-block table-sort-op" href="#" onClick={this.sortBySize}>{gettext('Size')} {sortBy === 'size' && sortIcon}</a></th>
-            <th width="13%"><a className="d-block table-sort-op" href="#" onClick={this.sortByTime}>{gettext('Last Update')} {sortBy === 'time' && sortIcon}</a></th>
+            <th width="14%"><button type="button" className="d-block table-sort-op bg-transparent border-0 p-0 text-left w-100" onClick={this.sortBySize}>{gettext('Size')} {sortBy === 'size' && sortIcon}</button></th>
+            <th width="13%"><button type="button" className="d-block table-sort-op bg-transparent border-0 p-0 text-left w-100" onClick={this.sortByTime}>{gettext('Last Update')} {sortBy === 'time' && sortIcon}</button></th>
             <th width="7%"></th>
           </tr>
         </thead>
@@ -764,8 +764,9 @@ class Item extends React.Component {
           <td title={moment(item.last_modified).format('llll')}>{moment(item.last_modified).fromNow()}</td>
           <td>
             {showDownloadIcon &&
-              <a role="button" className={`action-icon sf2-icon-download${isIconShown ? '' : ' invisible'}`} href="#" onClick={this.zipDownloadFolder} title={gettext('Download')} aria-label={gettext('Download')}>
-              </a>
+              <button type="button" className={`action-icon sf2-icon-download${isIconShown ? '' : ' invisible'} border-0 bg-transparent p-0`} onClick={this.zipDownloadFolder} title={gettext('Download')} aria-label={gettext('Download')}>
+                <span className="sr-only">{gettext('Download')}</span>
+              </button>
             }
           </td>
         </tr>
@@ -839,7 +840,9 @@ class Item extends React.Component {
           <td title={moment(item.last_modified).format('llll')}>{moment(item.last_modified).fromNow()}</td>
           <td>
             {showDownloadIcon &&
-              <a className={`action-icon sf2-icon-download${isIconShown ? '' : ' invisible'}`} href={`${fileURL}&dl=1`} title={gettext('Download')} aria-label={gettext('Download')}></a>
+              <a className={`action-icon sf2-icon-download${isIconShown ? '' : ' invisible'}`} href={`${fileURL}&dl=1`} title={gettext('Download')} aria-label={gettext('Download')}>
+                <span className="sr-only">{gettext('Download')}</span>
+              </a>
             }
           </td>
         </tr>
@@ -940,8 +943,9 @@ class GridItem extends React.Component {
           </a>
           <a href={folderURL} className="grid-file-name grid-file-name-link">{item.folder_name}</a>
           {showDownloadIcon &&
-            <a role="button" className={`action-icon sf2-icon-download${isIconShown ? '' : ' invisible'}`} href="#" onClick={this.zipDownloadFolder} title={gettext('Download')} aria-label={gettext('Download')}>
-            </a>
+            <button type="button" className={`action-icon sf2-icon-download${isIconShown ? '' : ' invisible'} border-0 bg-transparent p-0`} onClick={this.zipDownloadFolder} title={gettext('Download')} aria-label={gettext('Download')}>
+              <span className="sr-only">{gettext('Download')}</span>
+            </button>
           }
         </li>
       );

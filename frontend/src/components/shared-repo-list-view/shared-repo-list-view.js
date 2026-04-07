@@ -119,10 +119,10 @@ class SharedRepoListView extends React.Component {
           <tr>
             <th width="4%"></th>
             <th width="4%"><span className="sr-only">{gettext('Library Type')}</span></th>
-            <th width="36%"><a className="d-block table-sort-op" href="#" onClick={this.sortByName}>{gettext('Name')} {sortByName && sortIcon}</a></th>
+            <th width="36%"><button type="button" className="d-block table-sort-op bg-transparent border-0 p-0 text-left w-100" onClick={this.sortByName}>{gettext('Name')} {sortByName && sortIcon}</button></th>
             <th width="12%"><span className="sr-only">{gettext('Actions')}</span></th>
-            <th width={'14%'}><a className="d-block table-sort-op" href="#" onClick={this.sortBySize}>{gettext('Size')} {sortBySize && sortIcon}</a></th>
-            <th width={'14%'}><a className="d-block table-sort-op" href="#" onClick={this.sortByTime}>{gettext('Last Update')} {sortByTime && sortIcon}</a></th>
+            <th width={'14%'}><button type="button" className="d-block table-sort-op bg-transparent border-0 p-0 text-left w-100" onClick={this.sortBySize}>{gettext('Size')} {sortBySize && sortIcon}</button></th>
+            <th width={'14%'}><button type="button" className="d-block table-sort-op bg-transparent border-0 p-0 text-left w-100" onClick={this.sortByTime}>{gettext('Last Update')} {sortByTime && sortIcon}</button></th>
             <th width="16%">{gettext('Owner')}</th>
           </tr>
         </thead>

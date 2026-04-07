@@ -84,11 +84,11 @@ class Content extends Component {
             {isDesktop ? (
               <tr>
                 <th width="4%">{/*icon*/}</th>
-                <th width="31%"><a className="d-block table-sort-op" href="#" onClick={this.sortByName}>{gettext('Name')} {sortByName && sortIcon}</a></th>
+                <th width="31%"><button type="button" className="d-block table-sort-op bg-transparent border-0 p-0 text-left w-100" onClick={this.sortByName}>{gettext('Name')} {sortByName && sortIcon}</button></th>
                 <th width={columnWidths[0]}>{gettext('Library')}</th>
                 {isPro && <th width="20%">{gettext('Permission')}</th>}
                 <th width={columnWidths[1]}>{gettext('Visits')}</th>
-                <th width={columnWidths[2]}><a className="d-block table-sort-op" href="#" onClick={this.sortByTime}>{gettext('Expiration')} {sortByTime && sortIcon}</a></th>
+                <th width={columnWidths[2]}><button type="button" className="d-block table-sort-op bg-transparent border-0 p-0 text-left w-100" onClick={this.sortByTime}>{gettext('Expiration')} {sortByTime && sortIcon}</button></th>
                 <th width="10%">{/*Operations*/}</th>
               </tr>
             ) : (
@@ -293,8 +293,14 @@ class Item extends Component {
         <td>{item.view_cnt}</td>
         <td>{this.renderExpiration()}</td>
         <td>
-          {!item.is_expired && <a href="#" className={`sf2-icon-link action-icon ${isOpIconShown ? '' : 'invisible'}`} title={gettext('View')} aria-label={gettext('View')} role="button" onClick={this.viewLink}></a>}
-          <a href="#" className={`sf2-icon-delete action-icon ${isOpIconShown ? '' : 'invisible'}`} title={gettext('Remove')} aria-label={gettext('Remove')} role="button" onClick={this.removeLink}></a>
+          {!item.is_expired && (
+            <button type="button" className={`sf2-icon-link action-icon ${isOpIconShown ? '' : 'invisible'} border-0 bg-transparent p-0`} title={gettext('View')} aria-label={gettext('View')} onClick={this.viewLink}>
+              <span className="sr-only">{gettext('View')}</span>
+            </button>
+          )}
+          <button type="button" className={`sf2-icon-delete action-icon ${isOpIconShown ? '' : 'invisible'} border-0 bg-transparent p-0`} title={gettext('Remove')} aria-label={gettext('Remove')} onClick={this.removeLink}>
+            <span className="sr-only">{gettext('Remove')}</span>
+          </button>
         </td>
       </tr>
     );
