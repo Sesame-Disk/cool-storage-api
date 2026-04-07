@@ -398,12 +398,7 @@ func TestFileViewAuthWrapperQueryParamPromotion(t *testing.T) {
 // TestViewFileRedirectsNonOfficeFiles tests that non-office files redirect to download
 func TestViewFileRedirectsNonOfficeFiles(t *testing.T) {
 	h := &FileViewHandler{
-		config: &config.Config{
-			OnlyOffice: config.OnlyOfficeConfig{
-				Enabled:        true,
-				ViewExtensions: []string{"docx", "xlsx", "pptx"},
-			},
-		},
+		config:       config.DefaultConfig(),
 		serverURL:    "http://localhost:8080",
 		tokenCreator: &mockTokenCreator{},
 	}
@@ -479,7 +474,7 @@ func TestViewFileRedirectsNonOfficeFiles(t *testing.T) {
 
 func TestViewHistoricFileRedirectsPreviewableFilesToFrontendShell(t *testing.T) {
 	h := &FileViewHandler{
-		config: &config.Config{},
+		config: config.DefaultConfig(),
 	}
 
 	r := gin.New()
@@ -510,6 +505,68 @@ func TestViewHistoricFileRedirectsPreviewableFilesToFrontendShell(t *testing.T) 
 	}
 	if !strings.Contains(location, "p=%2Fdocs%2Freadme.txt") {
 		t.Errorf("redirect location = %q, expected encoded path query parameter", location)
+	}
+}
+
+func TestBuildFrontendErrorPageURL(t *testing.T) {
+	result := buildFrontendErrorPageURL(http.StatusBadRequest, "Bad Request", "Missing obj_id parameter.")
+	if !strings.HasPrefix(result, "/file-error/?") {
+		t.Fatalf("expected /file-error redirect, got %q", result)
+	}
+	if !strings.Contains(result, "status=400") {
+		t.Fatalf("expected status query parameter, got %q", result)
+	}
+	if !strings.Contains(result, "title=Bad+Request") {
+		t.Fatalf("expected encoded title, got %q", result)
+	}
+	if !strings.Contains(result, "message=Missing+obj_id+parameter.") {
+		t.Fatalf("expected encoded message, got %q", result)
+	}
+}
+
+func TestResolveInlineContentType(t *testing.T) {
+	tests := []struct {
+		ext  string
+		want string
+	}{
+		{ext: "pdf", want: "application/pdf"},
+		{ext: "mov", want: "video/quicktime"},
+		{ext: "mp3", want: "audio/mpeg"},
+		{ext: "bin", want: "application/octet-stream"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.ext, func(t *testing.T) {
+			if got := resolveInlineContentType(tt.ext); got != tt.want {
+				t.Fatalf("resolveInlineContentType(%q) = %q, want %q", tt.ext, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestViewHistoricFileInvalidRequestRedirectsToFrontendErrorShell(t *testing.T) {
+	h := &FileViewHandler{config: config.DefaultConfig()}
+
+	r := gin.New()
+	r.GET("/repo/:repo_id/history/view", h.ViewHistoricFile)
+
+	req, _ := http.NewRequest("GET", "/repo/repo-123/history/view?p=/docs/readme.txt", nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusFound {
+		t.Fatalf("expected redirect to frontend error shell, got %d", w.Code)
+	}
+
+	location := w.Header().Get("Location")
+	if !strings.HasPrefix(location, "/file-error/?") {
+		t.Fatalf("redirect location = %q, expected frontend error shell", location)
+	}
+	if !strings.Contains(location, "status=400") {
+		t.Fatalf("redirect location = %q, expected status=400", location)
+	}
+	if !strings.Contains(location, "Missing+obj_id+parameter.") {
+		t.Fatalf("redirect location = %q, expected missing obj_id message", location)
 	}
 }
 
@@ -913,6 +970,7 @@ func TestOnlyOfficeEditorHTMLErrorHandling(t *testing.T) {
 
 // TestIsInlinePreviewable tests the file type checker for inline previews
 func TestIsInlinePreviewable(t *testing.T) {
+	previewExtensions := config.DefaultConfig().FileView.PreviewExtensions
 	tests := []struct {
 		ext      string
 		expected bool
@@ -940,7 +998,7 @@ func TestIsInlinePreviewable(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.ext, func(t *testing.T) {
-			result := isInlinePreviewable(tt.ext)
+			result := isInlinePreviewable(tt.ext, previewExtensions)
 			if result != tt.expected {
 				t.Errorf("isInlinePreviewable(%q) = %v, want %v", tt.ext, result, tt.expected)
 			}
@@ -1265,8 +1323,13 @@ func TestViewFileOnlyOfficeRouting(t *testing.T) {
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
-	// Should NOT redirect — OnlyOffice handler runs (and fails with 500 due to nil db)
-	if w.Code == http.StatusFound {
-		t.Error("docx should not redirect to download when OnlyOffice is enabled")
+	// Missing OnlyOffice backing data now redirects browser users to the frontend error shell.
+	if w.Code != http.StatusFound {
+		t.Fatalf("expected redirect to frontend error shell, got %d", w.Code)
+	}
+
+	location := w.Header().Get("Location")
+	if !strings.HasPrefix(location, "/file-error/?") {
+		t.Fatalf("redirect location = %q, expected frontend error shell", location)
 	}
 }

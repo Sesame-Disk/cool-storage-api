@@ -235,6 +235,21 @@ func TestConfigValidate(t *testing.T) {
 			wantErr:        true,
 			wantErrContain: "auth.oidc.redirect_uris",
 		},
+		{
+			name: "preview extensions are normalized",
+			modify: func(c *Config) {
+				c.FileView.PreviewExtensions = []string{" MD ", "png", "md"}
+			},
+			wantErr: false,
+		},
+		{
+			name: "preview extensions reject unsupported values",
+			modify: func(c *Config) {
+				c.FileView.PreviewExtensions = []string{"exe"}
+			},
+			wantErr:        true,
+			wantErrContain: "unsupported extension",
+		},
 	}
 
 	for _, tt := range tests {
@@ -248,6 +263,12 @@ func TestConfigValidate(t *testing.T) {
 			}
 			if tt.wantErrContain != "" && err != nil && !strings.Contains(err.Error(), tt.wantErrContain) {
 				t.Fatalf("Validate() error = %q, want substring %q", err.Error(), tt.wantErrContain)
+			}
+			if tt.name == "preview extensions are normalized" {
+				got := strings.Join(cfg.FileView.PreviewExtensions, ",")
+				if got != "md,png" {
+					t.Fatalf("normalized preview extensions = %q, want %q", got, "md,png")
+				}
 			}
 		})
 	}

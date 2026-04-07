@@ -145,7 +145,7 @@ func (h *FileViewHandler) ViewFile(c *gin.Context) {
 	}
 
 	// For previewable files, serve an inline preview page
-	if isInlinePreviewable(ext) {
+	if isInlinePreviewable(ext, h.config.FileView.PreviewExtensions) {
 		h.serveInlinePreview(c, repoID, filePath, filename, ext)
 		return
 	}
@@ -154,32 +154,16 @@ func (h *FileViewHandler) ViewFile(c *gin.Context) {
 	h.redirectToDownload(c, repoID, filePath, filename)
 }
 
-// isInlinePreviewable returns true for file types that can be previewed inline
-func isInlinePreviewable(ext string) bool {
-	switch ext {
-	// PDF
-	case "pdf":
-		return true
-	// Images
-	case "png", "jpg", "jpeg", "gif", "bmp", "webp", "svg", "ico", "tiff", "tif":
-		return true
-	// Video
-	case "mp4", "webm", "ogg", "mov":
-		return true
-	// Audio
-	case "mp3", "wav", "flac", "aac":
-		return true
-	// Text / code files
-	case "txt", "md", "markdown", "json", "yaml", "yml", "xml", "csv",
-		"html", "htm", "css", "js", "ts", "jsx", "tsx",
-		"py", "go", "rs", "java", "c", "cpp", "h", "hpp",
-		"sh", "bash", "zsh", "fish",
-		"toml", "ini", "cfg", "conf", "env",
-		"sql", "graphql", "proto",
-		"dockerfile", "makefile",
-		"rb", "php", "swift", "kt", "scala", "r", "lua", "pl",
-		"log", "diff", "patch":
-		return true
+// isInlinePreviewable returns true when the file extension is enabled in config.
+func isInlinePreviewable(ext string, previewExtensions []string) bool {
+	ext = strings.ToLower(strings.TrimSpace(ext))
+	if ext == "" || len(previewExtensions) == 0 {
+		return false
+	}
+	for _, configured := range previewExtensions {
+		if ext == strings.ToLower(strings.TrimSpace(configured)) {
+			return true
+		}
 	}
 	return false
 }
@@ -214,6 +198,18 @@ func buildFrontendFilePreviewURL(repoID, filePath, objID string) string {
 		params.Set("obj_id", objID)
 	}
 	return "/file-preview/?" + params.Encode()
+}
+
+func buildFrontendErrorPageURL(status int, title, message string) string {
+	params := url.Values{}
+	params.Set("status", strconv.Itoa(status))
+	params.Set("title", title)
+	params.Set("message", message)
+	return "/file-error/?" + params.Encode()
+}
+
+func redirectToFrontendErrorPage(c *gin.Context, status int, title, message string) {
+	c.Redirect(http.StatusFound, buildFrontendErrorPageURL(status, title, message))
 }
 
 // buildPreviewContent returns an HTML snippet for the preview area based on file type.
@@ -273,8 +269,7 @@ func (h *FileViewHandler) redirectToDownload(c *gin.Context, repoID, filePath, f
 	// Generate download token
 	token, err := h.tokenCreator.CreateDownloadToken(orgID, repoID, filePath, userID)
 	if err != nil {
-		c.Header("Content-Type", "text/html; charset=utf-8")
-		c.String(http.StatusInternalServerError, errorPageHTML("Download Error", "Failed to generate download link."))
+		redirectToFrontendErrorPage(c, http.StatusInternalServerError, "Download Error", "Failed to generate download link.")
 		return
 	}
 
@@ -311,8 +306,7 @@ func (h *FileViewHandler) serveOnlyOfficeEditor(c *gin.Context, repoID, filePath
 	// Get file ID
 	fileID, err := ooHandler.getFileID(repoID, orgID, filePath)
 	if err != nil {
-		c.Header("Content-Type", "text/html; charset=utf-8")
-		c.String(http.StatusNotFound, errorPageHTML("File Not Found", "The requested file could not be found."))
+		redirectToFrontendErrorPage(c, http.StatusNotFound, "File Not Found", "The requested file could not be found.")
 		return
 	}
 
@@ -329,8 +323,7 @@ func (h *FileViewHandler) serveOnlyOfficeEditor(c *gin.Context, repoID, filePath
 	// Generate download URL
 	downloadToken, err := h.tokenCreator.CreateDownloadToken(orgID, repoID, filePath, userID)
 	if err != nil {
-		c.Header("Content-Type", "text/html; charset=utf-8")
-		c.String(http.StatusInternalServerError, errorPageHTML("Internal Error", "Failed to generate download token."))
+		redirectToFrontendErrorPage(c, http.StatusInternalServerError, "Internal Error", "Failed to generate download token.")
 		return
 	}
 
@@ -612,10 +605,7 @@ func (h *FileViewHandler) ServeRawFile(c *gin.Context) {
 	}
 
 	// Normal file serving
-	mimeType := mime.TypeByExtension("." + ext)
-	if mimeType == "" {
-		mimeType = "application/octet-stream"
-	}
+	mimeType := resolveInlineContentType(ext)
 
 	// Batch resolve all block IDs upfront to avoid per-block Cassandra queries
 	resolvedIDs := streaming.BatchResolveBlockIDs(h.db, orgID, blockIDs)
@@ -637,6 +627,7 @@ func (h *FileViewHandler) ServeRawFile(c *gin.Context) {
 
 		rs := streaming.NewBlockReadSeeker(ctx, blockStore, resolvedIDs, blockSizes, fileSize, fileKeyParam)
 		c.Header("Content-Disposition", fmt.Sprintf(`inline; filename="%s"`, sanitizeFilename(filename)))
+		c.Header("Content-Type", mimeType)
 		http.ServeContent(c.Writer, c.Request, filename, time.Time{}, rs)
 		return
 	}
@@ -655,6 +646,66 @@ func (h *FileViewHandler) ServeRawFile(c *gin.Context) {
 // sanitizeFilename removes characters that could cause header injection in Content-Disposition.
 func sanitizeFilename(name string) string {
 	return strings.NewReplacer(`"`, `'`, "\r", "", "\n", "").Replace(name)
+}
+
+func resolveInlineContentType(ext string) string {
+	ext = strings.ToLower(strings.TrimSpace(strings.TrimPrefix(ext, ".")))
+	switch ext {
+	case "pdf":
+		return "application/pdf"
+	case "png":
+		return "image/png"
+	case "jpg", "jpeg":
+		return "image/jpeg"
+	case "gif":
+		return "image/gif"
+	case "bmp":
+		return "image/bmp"
+	case "webp":
+		return "image/webp"
+	case "svg":
+		return "image/svg+xml"
+	case "ico":
+		return "image/x-icon"
+	case "tif", "tiff":
+		return "image/tiff"
+	case "mp4", "m4v":
+		return "video/mp4"
+	case "webm":
+		return "video/webm"
+	case "ogg", "ogv":
+		return "video/ogg"
+	case "mov":
+		return "video/quicktime"
+	case "avi":
+		return "video/x-msvideo"
+	case "mkv":
+		return "video/x-matroska"
+	case "mpg", "mpeg":
+		return "video/mpeg"
+	case "flv":
+		return "video/x-flv"
+	case "wmv":
+		return "video/x-ms-wmv"
+	case "mp3":
+		return "audio/mpeg"
+	case "wav":
+		return "audio/wav"
+	case "flac":
+		return "audio/flac"
+	case "aac":
+		return "audio/aac"
+	case "m4a":
+		return "audio/mp4"
+	case "wma":
+		return "audio/x-ms-wma"
+	}
+
+	mimeType := mime.TypeByExtension("." + ext)
+	if mimeType == "" {
+		return "application/octet-stream"
+	}
+	return mimeType
 }
 
 // isAppleIWorkFile returns true for Apple iWork file extensions
@@ -882,8 +933,7 @@ func (h *FileViewHandler) ViewHistoricFile(c *gin.Context) {
 	filePath := c.Query("p")
 
 	if objID == "" {
-		c.Header("Content-Type", "text/html; charset=utf-8")
-		c.String(http.StatusBadRequest, errorPageHTML("Bad Request", "Missing obj_id parameter."))
+		redirectToFrontendErrorPage(c, http.StatusBadRequest, "Bad Request", "Missing obj_id parameter.")
 		return
 	}
 	if filePath == "" {
@@ -892,15 +942,14 @@ func (h *FileViewHandler) ViewHistoricFile(c *gin.Context) {
 
 	filename := filepath.Base(filePath)
 	if filename == "" || filename == "." || filename == "/" || filename == "\\" {
-		c.Header("Content-Type", "text/html; charset=utf-8")
-		c.String(http.StatusBadRequest, errorPageHTML("Bad Request", "Invalid file path."))
+		redirectToFrontendErrorPage(c, http.StatusBadRequest, "Bad Request", "Invalid file path.")
 		return
 	}
 
 	ext := strings.ToLower(strings.TrimPrefix(filepath.Ext(filename), "."))
 
 	// If file is not previewable, fall back to download
-	if !isInlinePreviewable(ext) {
+	if !isInlinePreviewable(ext, h.config.FileView.PreviewExtensions) {
 		token := c.Query("token")
 		params := fmt.Sprintf("obj_id=%s&p=%s", url.QueryEscape(objID), url.QueryEscape(filePath))
 		if token != "" {
@@ -1024,10 +1073,7 @@ func (h *FileViewHandler) ServeHistoricFileRaw(c *gin.Context) {
 	}
 
 	// Determine MIME type
-	mimeType := mime.TypeByExtension("." + ext)
-	if mimeType == "" {
-		mimeType = "application/octet-stream"
-	}
+	mimeType := resolveInlineContentType(ext)
 
 	c.Header("Content-Disposition", fmt.Sprintf(`inline; filename="%s"`, sanitizeFilename(filename)))
 	c.Header("Content-Type", mimeType)

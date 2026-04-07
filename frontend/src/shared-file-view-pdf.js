@@ -2,12 +2,11 @@ import React from 'react';
 import ReactDom from 'react-dom';
 import SharedFileView from './components/shared-file-view/shared-file-view';
 import SharedFileViewTip from './components/shared-file-view/shared-file-view-tip';
-import PDFViewer from './components/pdf-viewer';
 
 import 'bootstrap/dist/css/bootstrap.min.css';
 import './css/pdf-file-view.css';
 
-const { err } = window.shared.pageOptions;
+const { rawPath, fileName, err } = window.shared.pageOptions;
 
 class SharedFileViewPDF extends React.Component {
   render() {
@@ -23,7 +22,7 @@ class FileContent extends React.Component {
 
     return (
       <div className="shared-file-view-body pdf-file-view">
-        <PDFViewer />
+        <embed src={rawPath} type="application/pdf" title={fileName || 'PDF preview'} width="100%" height="100%" style={{ border: 'none' }} />
       </div>
     );
   }

@@ -9,11 +9,11 @@ import (
 	"fmt"
 	"log"
 	"log/slog"
-	"mime"
 	"net/http"
 	"net/url"
 	"path"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -94,6 +94,13 @@ type pathSegment struct {
 	Name string `json:"name"`
 	Path string `json:"path"`
 }
+
+type sharedMarkdownSmartLinkTarget struct {
+	Path  string `json:"path"`
+	IsDir bool   `json:"isDir"`
+}
+
+var sharedMarkdownSmartLinkPattern = regexp.MustCompile(`(?:https?://[^\s)"'>]+)?/smart-link/([A-Za-z0-9_-]+)`)
 
 func marshalPageOptionsJSON(pageOptions any) string {
 	data, err := json.Marshal(pageOptions)
@@ -197,10 +204,11 @@ func (h *ShareLinkViewHandler) buildSharedDirPageBootstrap(c *gin.Context, sl *s
 	}
 }
 
-func (h *ShareLinkViewHandler) buildSharedFileBundleBootstrap(c *gin.Context, sl *shareLinkData, bundleName, rawPath, filename, ext string, fileSize int64, fileContent string) pageBootstrapResponse {
+func (h *ShareLinkViewHandler) buildSharedFileBundleBootstrap(c *gin.Context, sl *shareLinkData, bundleName, rawPath, filename, ext string, fileSize int64, fileContent string, smartLinkMap map[string]sharedMarkdownSmartLinkTarget) pageBootstrapResponse {
 	passwordVerified := h.verifyShareLinkPasswordCookie(c, sl.token, sl.passwordHash)
 	noPassword := sl.passwordHash == "" || passwordVerified
 	needPassword := sl.passwordHash != "" && !passwordVerified
+	rawContentType := resolveInlineContentType(ext)
 
 	pageOptions := map[string]any{
 		"sharedToken":                sl.token,
@@ -210,6 +218,8 @@ func (h *ShareLinkViewHandler) buildSharedFileBundleBootstrap(c *gin.Context, sl
 		"fileName":                   filename,
 		"fileSize":                   fileSize,
 		"rawPath":                    rawPath,
+		"rawContentType":             rawContentType,
+		"downloadPath":               buildShareDownloadPath(sl),
 		"canDownload":                sl.canDownload,
 		"canEdit":                    sl.canEdit,
 		"sharedBy":                   sl.creatorName,
@@ -222,6 +232,7 @@ func (h *ShareLinkViewHandler) buildSharedFileBundleBootstrap(c *gin.Context, sl
 		"zipped":                     nil,
 		"enableShareLinkReportAbuse": false,
 		"fileContent":                fileContent,
+		"smartLinkMap":               smartLinkMap,
 		"err":                        "",
 	}
 
@@ -238,6 +249,71 @@ func buildShareDownloadPath(sl *shareLinkData) string {
 		return fmt.Sprintf("/d/%s/files/?p=%s&dl=1", sl.token, url.QueryEscape(sl.fileSubPath))
 	}
 	return fmt.Sprintf("/d/%s?dl=1", sl.token)
+}
+
+func extractSharedMarkdownSmartLinkTokens(content string) []string {
+	if content == "" {
+		return nil
+	}
+
+	matches := sharedMarkdownSmartLinkPattern.FindAllStringSubmatch(content, -1)
+	if len(matches) == 0 {
+		return nil
+	}
+
+	seen := make(map[string]struct{}, len(matches))
+	tokens := make([]string, 0, len(matches))
+	for _, match := range matches {
+		if len(match) < 2 || match[1] == "" {
+			continue
+		}
+		if _, ok := seen[match[1]]; ok {
+			continue
+		}
+		seen[match[1]] = struct{}{}
+		tokens = append(tokens, match[1])
+	}
+
+	return tokens
+}
+
+func (h *ShareLinkViewHandler) buildSharedMarkdownSmartLinkMap(sl *shareLinkData, content string) map[string]sharedMarkdownSmartLinkTarget {
+	tokens := extractSharedMarkdownSmartLinkTokens(content)
+	if len(tokens) == 0 {
+		return nil
+	}
+
+	result := make(map[string]sharedMarkdownSmartLinkTarget, len(tokens))
+	for _, token := range tokens {
+		var linkType, orgID, libraryID, filePath string
+		var active bool
+		err := h.db.Session().Query(`
+			SELECT link_type, org_id, library_id, file_path, active
+			FROM share_links WHERE link_token = ?
+		`, token).Scan(&linkType, &orgID, &libraryID, &filePath, &active)
+		if err != nil || linkType != "internal" || !active {
+			continue
+		}
+		if orgID != sl.orgID || libraryID != sl.libraryID {
+			continue
+		}
+
+		isDir, dirErr := resolveLibraryPathIsDir(h.db, libraryID, filePath)
+		if dirErr != nil {
+			isDir = filePath == "/" || strings.HasSuffix(filePath, "/")
+		}
+
+		result[token] = sharedMarkdownSmartLinkTarget{
+			Path:  filePath,
+			IsDir: isDir,
+		}
+	}
+
+	if len(result) == 0 {
+		return nil
+	}
+
+	return result
 }
 
 func (h *ShareLinkViewHandler) buildOnlyOfficeShareBootstrap(sl *shareLinkData, filename, ext string, fileSize int64) (pageBootstrapResponse, error) {
@@ -760,10 +836,7 @@ func (h *ShareLinkViewHandler) handleShareLinkRaw(c *gin.Context, sl *shareLinkD
 	}
 
 	// Determine MIME type from extension
-	mimeType := mime.TypeByExtension("." + ext)
-	if mimeType == "" {
-		mimeType = "application/octet-stream"
-	}
+	mimeType := resolveInlineContentType(ext)
 
 	// Batch resolve all block IDs upfront to avoid per-block Cassandra queries
 	resolvedIDs := streaming.BatchResolveBlockIDs(h.db, sl.orgID, blockIDs)
@@ -786,13 +859,14 @@ func (h *ShareLinkViewHandler) handleShareLinkRaw(c *gin.Context, sl *shareLinkD
 		}
 
 		rs := streaming.NewBlockReadSeeker(ctx, blockStore, resolvedIDs, blockSizes, fileSize, fileKeyParam)
-		c.Header("Content-Disposition", fmt.Sprintf(`inline; filename="%s"`, filename))
+		c.Header("Content-Disposition", fmt.Sprintf(`inline; filename="%s"`, sanitizeFilename(filename)))
+		c.Header("Content-Type", mimeType)
 		http.ServeContent(c.Writer, c.Request, filename, time.Time{}, rs)
 		return
 	}
 
 	// Non-video/audio: stream block-by-block, O(block_size) RAM
-	c.Header("Content-Disposition", fmt.Sprintf(`inline; filename="%s"`, filename))
+	c.Header("Content-Disposition", fmt.Sprintf(`inline; filename="%s"`, sanitizeFilename(filename)))
 	c.Header("Content-Type", mimeType)
 	if fileSize > 0 && !encrypted {
 		c.Header("Content-Length", strconv.FormatInt(fileSize, 10))
@@ -913,11 +987,15 @@ func (h *ShareLinkViewHandler) buildShareFileBootstrapResponse(c *gin.Context, s
 	bundleName := extensionToBundleName(ext)
 
 	fileContent := ""
+	var smartLinkMap map[string]sharedMarkdownSmartLinkTarget
 	if bundleName == "sharedFileViewText" || bundleName == "sharedFileViewMarkdown" {
 		fileContent = h.readFileContentAsText(sl)
+		if bundleName == "sharedFileViewMarkdown" {
+			smartLinkMap = h.buildSharedMarkdownSmartLinkMap(sl, fileContent)
+		}
 	}
 
-	return h.buildSharedFileBundleBootstrap(c, sl, bundleName, rawPath, filename, ext, fileSize, fileContent), http.StatusOK, nil
+	return h.buildSharedFileBundleBootstrap(c, sl, bundleName, rawPath, filename, ext, fileSize, fileContent, smartLinkMap), http.StatusOK, nil
 }
 
 // isOnlyOfficeViewable checks if a file extension can be viewed with OnlyOffice

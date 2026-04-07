@@ -7,17 +7,17 @@ const { rawPath } = window.app.pageOptions;
 
 class FileContent extends React.Component {
   render() {
-    const videoJsOptions = {
+    const audioOptions = {
       autoplay: false,
       controls: true,
-      preload: 'auto',
+      preload: 'metadata',
       sources: [{
         src: rawPath
       }]
     };
     return (
       <div className="file-view-content flex-1 audio-file-view">
-        <AudioPlayer { ...videoJsOptions } />
+        <AudioPlayer {...audioOptions} />
       </div>
     );
   }

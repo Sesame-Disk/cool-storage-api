@@ -1,32 +1,81 @@
 import React from 'react';
 
-import videojs from 'video.js';
-import 'video.js/dist/video-js.css';
-
 class VideoPlayer extends React.Component {
-  componentDidMount() {
-    // instantiate Video.js
-    this.player = videojs(this.videoNode, this.props, function onPlayerReady() {
-    });
+  constructor(props) {
+    super(props);
+    this.state = {
+      nativeVideoIsPortrait: false
+    };
   }
 
-  // destroy player on unmount
-  componentWillUnmount() {
-    if (this.player) {
-      this.player.dispose();
+  componentDidUpdate(prevProps) {
+    if (prevProps.sources !== this.props.sources) {
+      if (this.state.nativeVideoIsPortrait) {
+        this.setState({ nativeVideoIsPortrait: false });
+      }
     }
   }
 
-  // wrap the player in a div with a `data-vjs-player` attribute
-  // so videojs won't create additional wrapper in the DOM
-  // see https://github.com/videojs/video.js/pull/3856
   render() {
+    const videoProps = { ...this.props };
+    const sources = videoProps.sources || [];
+    const className = videoProps.className || 'video-js';
+    const controls = videoProps.controls !== undefined ? videoProps.controls : true;
+    const autoPlay = videoProps.autoPlay !== undefined ? videoProps.autoPlay : false;
+    const preload = videoProps.preload || 'metadata';
+    const playsInline = videoProps.playsInline !== undefined ? videoProps.playsInline : true;
+    delete videoProps.sources;
+    delete videoProps.className;
+    delete videoProps.controls;
+    delete videoProps.autoPlay;
+    delete videoProps.preload;
+    delete videoProps.playsInline;
+    delete videoProps.fallbackToNative;
+    delete videoProps.playbackRates;
+    delete videoProps.preferNative;
+
+    const nativePlayerStyle = this.state.nativeVideoIsPortrait
+      ? {
+        width: 'auto',
+        maxWidth: 'min(100%, 28rem)',
+        maxHeight: '70vh',
+        margin: '0 auto',
+        display: 'block',
+        backgroundColor: '#000'
+      }
+      : {
+        maxHeight: '70vh',
+        margin: '0 auto',
+        display: 'block',
+        backgroundColor: '#000'
+      };
+
     return (
-      <div data-vjs-player>
-        <video ref={ node => this.videoNode = node } className="video-js"></video>
-      </div>
+      <video
+        className={className}
+        controls={controls}
+        autoPlay={autoPlay}
+        playsInline={playsInline}
+        preload={preload}
+        onLoadedMetadata={this.handleNativeMetadata}
+        style={nativePlayerStyle}
+        {...videoProps}
+      >
+        {sources.map((source, index) => (
+          <source key={`${source.src || 'source'}-${index}`} src={source.src} type={source.type} />
+        ))}
+        Your browser does not support video playback.
+      </video>
     );
   }
+
+  handleNativeMetadata = (event) => {
+    const { videoWidth, videoHeight } = event.currentTarget;
+    const nativeVideoIsPortrait = Boolean(videoWidth && videoHeight && videoHeight > videoWidth);
+    if (nativeVideoIsPortrait !== this.state.nativeVideoIsPortrait) {
+      this.setState({ nativeVideoIsPortrait });
+    }
+  };
 }
 
 export default VideoPlayer;

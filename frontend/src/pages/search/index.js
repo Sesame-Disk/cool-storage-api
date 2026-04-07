@@ -4,8 +4,8 @@ import CommonToolbar from '../../components/toolbar/common-toolbar';
 import Logo from '../../components/logo';
 import SearchViewPanel from './main-panel';
 import { siteRoot } from '../../utils/constants';
-import { Utils } from '../../utils/utils';
 import { getToken } from '../../utils/seafile-api';
+import { buildFileViewURL } from '../../utils/file-view-url';
 
 import '../../css/layout.css';
 import '../../css/toolbar.css';
@@ -21,7 +21,7 @@ class SearchView extends React.Component {
     const token = getToken();
     let url = selectedItem.is_dir ?
       siteRoot + 'library/' + selectedItem.repo_id + '/' + selectedItem.repo_name + selectedItem.path :
-      siteRoot + 'lib/' + selectedItem.repo_id + '/file' + Utils.encodePath(selectedItem.path) + (token ? '?token=' + encodeURIComponent(token) : '');
+      buildFileViewURL({ repoID: selectedItem.repo_id, filePath: selectedItem.path, token });
     let newWindow = window.open('about:blank');
     newWindow.location.href = url;
   };

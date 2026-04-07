@@ -25,6 +25,10 @@ These authenticated preview routes now land on a frontend-owned standalone shell
 
 The backend still owns download/raw endpoints and auth enforcement for those flows, but no longer owns the page shell itself.
 
+The normal frontend UI now links previewable files directly to `/file-preview/` using the bootstrap-provided `inlinePreviewExtensions` list from backend config. The backend preview routes remain in place mainly for compatibility with old links, bookmarks, and non-migrated callers.
+
+Browser-facing fileview errors now also have a frontend-owned shell at `/file-error/` for the migrated routes. Backend `error_page.html` still exists as fallback for non-migrated paths and shared-link error cases.
+
 ## Backend-Owned HTML Pages
 
 | Template / Source | Browser Route(s) | Handler | Purpose | Migration Fit |
@@ -46,6 +50,7 @@ The backend still owns download/raw endpoints and auth enforcement for those flo
 - Current split:
   - Backend still owns auth enforcement plus raw/download endpoints.
   - Frontend owns the preview shell and rendering.
+  - The main SPA now prefers linking directly to `/file-preview/` for previewable files, reducing normal browser navigation through `/lib/:repo_id/file/*filepath`.
 
 ### 2. Historic file preview
 
@@ -56,6 +61,7 @@ The backend still owns download/raw endpoints and auth enforcement for those flo
 - Current split:
   - Backend still owns auth enforcement plus raw/download endpoints.
   - Frontend owns the preview shell and rendering.
+  - The history UI now links previewable revisions directly to `/file-preview/` and only uses `/repo/:repo_id/history/view` as backend fallback/compatibility.
 
 ### 3. OnlyOffice full-page editor
 
@@ -72,11 +78,11 @@ The backend still owns download/raw endpoints and auth enforcement for those flo
 
 - Source: `error_page.html` rendered through `templates.RenderString(...)`.
 - Current use:
-  - File download token failures.
-  - Missing preview file states.
-  - OnlyOffice config/render failures.
+  - Shared-link and non-migrated error branches.
+  - Fallback template rendering inside backend code paths that still have no frontend shell.
 - Migration fit:
-  - Best moved alongside preview/editor shells so visual ownership stays in one place.
+  - Fileview/browser error routing now uses the frontend shell `/file-error/` for migrated paths.
+  - Remaining work is mostly shared-link and residual fallback cleanup.
 
 ### 5. Desktop SSO success page
 

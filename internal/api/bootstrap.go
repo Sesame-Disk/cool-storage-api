@@ -444,7 +444,8 @@ func (s *Server) buildAppBootstrapPageOptions(identity bootstrapIdentity, userDa
 			"langCode": "en",
 			"langName": "en",
 		},
-		"backendRoutes": buildBootstrapBackendRoutes(),
+		"backendRoutes":           buildBootstrapBackendRoutes(),
+		"inlinePreviewExtensions": append([]string(nil), s.config.FileView.PreviewExtensions...),
 		"langList": []gin.H{
 			{
 				"langCode": "en",

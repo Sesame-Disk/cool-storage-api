@@ -7,7 +7,7 @@ import VideoPlayer from './components/video-player';
 import 'bootstrap/dist/css/bootstrap.min.css';
 import './css/video-file-view.css';
 
-const { rawPath, err } = window.shared.pageOptions;
+const { rawPath, rawContentType, err } = window.shared.pageOptions;
 
 class SharedFileViewImage extends React.Component {
   render() {
@@ -21,19 +21,17 @@ class FileContent extends React.Component {
       return <SharedFileViewTip />;
     }
 
-    const videoJsOptions = {
+    const videoOptions = {
       autoplay: false,
       controls: true,
-      preload: 'auto',
-      playbackRates: [0.5, 1, 1.5, 2],
-      sources: [{
-        src: rawPath
-      }]
+      preload: 'metadata',
+      sources: rawContentType ? [{ src: rawPath, type: rawContentType }, { src: rawPath }] : [{ src: rawPath }]
     };
+
     return (
       <div className="shared-file-view-body d-flex">
         <div className="flex-1">
-          <VideoPlayer {...videoJsOptions} />
+          <VideoPlayer {...videoOptions} />
         </div>
       </div>
     );

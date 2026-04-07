@@ -1,30 +1,29 @@
 import React from 'react';
 
-import videojs from 'video.js';
-import 'video.js/dist/video-js.css';
-
 class AudioPlayer extends React.Component {
-  componentDidMount() {
-    // instantiate Video.js
-    this.player = videojs(this.videoNode, this.props, function onPlayerReady() {
-    });
-  }
-
-  // destroy player on unmount
-  componentWillUnmount() {
-    if (this.player) {
-      this.player.dispose();
-    }
-  }
-
-  // wrap the player in a div with a `data-vjs-player` attribute
-  // so videojs won't create additional wrapper in the DOM
-  // see https://github.com/videojs/video.js/pull/3856
   render() {
+    const audioProps = { ...this.props };
+    const sources = audioProps.sources || [];
+    const className = audioProps.className || 'video-js vjs-has-started';
+    const controls = audioProps.controls !== undefined ? audioProps.controls : true;
+    const autoPlay = audioProps.autoPlay !== undefined ? audioProps.autoPlay : false;
+    const preload = audioProps.preload || 'metadata';
+    delete audioProps.sources;
+    delete audioProps.className;
+    delete audioProps.controls;
+    delete audioProps.autoPlay;
+    delete audioProps.preload;
+    delete audioProps.fallbackToNative;
+    delete audioProps.playbackRates;
+    delete audioProps.preferNative;
+
     return (
-      <div data-vjs-player>
-        <audio ref={ node => this.videoNode = node } className="video-js vjs-has-started"></audio>
-      </div>
+      <audio className={className} controls={controls} autoPlay={autoPlay} preload={preload} {...audioProps}>
+        {sources.map((source, index) => (
+          <source key={`${source.src || 'source'}-${index}`} src={source.src} type={source.type} />
+        ))}
+        Your browser does not support audio playback.
+      </audio>
     );
   }
 }

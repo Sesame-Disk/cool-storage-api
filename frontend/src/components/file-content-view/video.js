@@ -9,18 +9,17 @@ const {
 
 class FileContent extends React.Component {
   render() {
-    const videoJsOptions = {
+    const videoOptions = {
       autoplay: false,
       controls: true,
-      preload: 'auto',
-      playbackRates: [0.5, 1, 1.5, 2],
+      preload: 'metadata',
       sources: [{
         src: rawPath
       }]
     };
     return (
       <div className="file-view-content flex-1 video-file-view">
-        <VideoPlayer { ...videoJsOptions } />
+        <VideoPlayer {...videoOptions} />
       </div>
     );
   }

@@ -5,6 +5,7 @@ import { Dropdown, DropdownToggle, DropdownMenu, DropdownItem } from 'reactstrap
 import { gettext, siteRoot, serviceURL } from '../../utils/constants';
 import { seafileAPI, getToken } from '../../utils/seafile-api';
 import { Utils } from '../../utils/utils';
+import { buildHistoricFileViewURL } from '../../utils/file-view-url';
 import Loading from '../loading';
 import toaster from '../toast';
 import ConflictDialog from '../dialog/conflict-dialog';
@@ -110,8 +111,7 @@ class FileHistoryPanel extends React.Component {
     const { repoID, filePath } = this.props;
     const token = getToken();
 
-    const params = `obj_id=${item.rev_file_id}&p=${encodeURIComponent(filePath)}` + (token ? `&token=${token}` : '');
-    const viewUrl = `${siteRoot}repo/${repoID}/history/view?${params}`;
+    const viewUrl = buildHistoricFileViewURL({ repoID, filePath, objID: item.rev_file_id, token });
     window.open(viewUrl);
   };
 

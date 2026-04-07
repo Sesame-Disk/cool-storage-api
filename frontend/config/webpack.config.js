@@ -686,6 +686,33 @@ module.exports = function (webpackEnv) {
           {},
           {
             inject: true,
+            template: path.resolve(paths.appPublic, 'errorpage.html'),
+            filename: 'errorpage.html',
+            chunks: ['fileErrorPage'],
+          },
+          isEnvProduction
+            ? {
+              minify: {
+                removeComments: false,
+                collapseWhitespace: true,
+                removeRedundantAttributes: true,
+                useShortDoctype: true,
+                removeEmptyAttributes: true,
+                removeStyleLinkTypeAttributes: true,
+                keepClosingSlash: true,
+                minifyJS: true,
+                minifyCSS: true,
+                minifyURLs: true,
+              },
+            }
+            : undefined
+        )
+      ),
+      new HtmlWebpackPlugin(
+        Object.assign(
+          {},
+          {
+            inject: true,
             template: path.resolve(paths.appPublic, 'sharelink.html'),
             filename: 'sharelink.html',
             chunks: ['publicSharePage'],

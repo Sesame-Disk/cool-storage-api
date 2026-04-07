@@ -3,6 +3,7 @@ import PropTypes from 'prop-types';
 import moment from 'moment';
 import { gettext, siteRoot } from '../../utils/constants';
 import { Utils } from '../../utils/utils';
+import { buildFileViewURL } from '../../utils/file-view-url';
 
 const propTypes = {
   noticeItem: PropTypes.object.isRequired,
@@ -191,7 +192,7 @@ class NoticeItem extends React.Component {
     if (noticeType === MSG_TYPE_FILE_UPLOADED) {
       let avatar_url = detail.uploaded_user_avatar_url;
       let fileName = detail.file_name;
-      let fileLink = siteRoot + 'lib/' + detail.repo_id + '/' + 'file' + detail.file_path;
+      let fileLink = buildFileViewURL({ repoID: detail.repo_id, filePath: detail.file_path });
 
       let folderName = detail.folder_name;
       let folderLink = siteRoot + 'library/' + detail.repo_id + '/' + detail.repo_name + detail.folder_path;

@@ -7,7 +7,7 @@ import AudioPlayer from './components/audio-player';
 import 'bootstrap/dist/css/bootstrap.min.css';
 import './css/audio-file-view.css';
 
-const { rawPath, err } = window.shared.pageOptions;
+const { rawPath, rawContentType, err } = window.shared.pageOptions;
 
 class SharedFileViewAudio extends React.Component {
   render() {
@@ -21,18 +21,17 @@ class FileContent extends React.Component {
       return <SharedFileViewTip />;
     }
 
-    const videoJsOptions = {
+    const audioOptions = {
       autoplay: false,
       controls: true,
-      preload: 'auto',
-      sources: [{
-        src: rawPath
-      }]
+      preload: 'metadata',
+      sources: rawContentType ? [{ src: rawPath, type: rawContentType }, { src: rawPath }] : [{ src: rawPath }]
     };
+
     return (
       <div className="shared-file-view-body d-flex">
         <div className="flex-1">
-          <AudioPlayer {...videoJsOptions} />
+          <AudioPlayer {...audioOptions} />
         </div>
       </div>
     );

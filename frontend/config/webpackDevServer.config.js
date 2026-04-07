@@ -98,6 +98,7 @@ module.exports = function (proxy, allowedHost) {
       // See https://github.com/facebook/create-react-app/issues/387.
       disableDotRule: true,
       rewrites: [
+        { from: /^\/file-error(?:\/.*)?$/, to: '/errorpage.html' },
         { from: /^\/file-preview(?:\/.*)?$/, to: '/filepreview.html' },
         { from: /^\/org(?:\/.*)?$/, to: '/orgadmin.html' },
         { from: /^\/sys(?:\/.*)?$/, to: '/sysadmin.html' },

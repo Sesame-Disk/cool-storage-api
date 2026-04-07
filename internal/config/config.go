@@ -293,10 +293,61 @@ func addClampedMonth(t time.Time) time.Time {
 
 // FileViewConfig holds file preview and streaming settings
 type FileViewConfig struct {
-	MaxPreviewBytes      int64 `yaml:"max_preview_bytes"`       // Maximum file size for general inline preview (default: 1GB)
-	MaxVideoBytes        int64 `yaml:"max_video_bytes"`         // Maximum file size for video preview (default: 10GB)
-	MaxTextBytes         int64 `yaml:"max_text_bytes"`          // Maximum file size for text preview (default: 50MB)
-	MaxIWorkPreviewBytes int64 `yaml:"max_iwork_preview_bytes"` // Maximum size for extracted iWork preview (default: 50MB)
+	MaxPreviewBytes      int64    `yaml:"max_preview_bytes"`       // Maximum file size for general inline preview (default: 1GB)
+	MaxVideoBytes        int64    `yaml:"max_video_bytes"`         // Maximum file size for video preview (default: 10GB)
+	MaxTextBytes         int64    `yaml:"max_text_bytes"`          // Maximum file size for text preview (default: 50MB)
+	MaxIWorkPreviewBytes int64    `yaml:"max_iwork_preview_bytes"` // Maximum size for extracted iWork preview (default: 50MB)
+	PreviewExtensions    []string `yaml:"preview_extensions"`      // Extensions that should route to the frontend preview shell
+}
+
+var supportedFileViewPreviewExtensions = []string{
+	"pdf",
+	"png", "jpg", "jpeg", "gif", "bmp", "webp", "svg", "ico", "tiff", "tif",
+	"mp4", "webm", "ogg", "mov",
+	"mp3", "wav", "flac", "aac",
+	"txt", "md", "markdown", "json", "yaml", "yml", "xml", "csv",
+	"html", "htm", "css", "js", "ts", "jsx", "tsx",
+	"py", "go", "rs", "java", "c", "cpp", "h", "hpp",
+	"sh", "bash", "zsh", "fish",
+	"toml", "ini", "cfg", "conf", "env",
+	"sql", "graphql", "proto",
+	"dockerfile", "makefile",
+	"rb", "php", "swift", "kt", "scala", "r", "lua", "pl",
+	"log", "diff", "patch",
+}
+
+func defaultFileViewPreviewExtensions() []string {
+	return append([]string(nil), supportedFileViewPreviewExtensions...)
+}
+
+func normalizeFileViewPreviewExtensions(values []string) ([]string, error) {
+	if len(values) == 0 {
+		return []string{}, nil
+	}
+
+	allowed := make(map[string]struct{}, len(supportedFileViewPreviewExtensions))
+	for _, ext := range supportedFileViewPreviewExtensions {
+		allowed[ext] = struct{}{}
+	}
+
+	normalized := make([]string, 0, len(values))
+	seen := make(map[string]struct{}, len(values))
+	for _, raw := range values {
+		ext := strings.ToLower(strings.TrimSpace(raw))
+		if ext == "" {
+			continue
+		}
+		if _, ok := allowed[ext]; !ok {
+			return nil, fmt.Errorf("fileview.preview_extensions contains unsupported extension %q", raw)
+		}
+		if _, ok := seen[ext]; ok {
+			continue
+		}
+		seen[ext] = struct{}{}
+		normalized = append(normalized, ext)
+	}
+
+	return normalized, nil
 }
 
 // OnlyOfficeConfig holds OnlyOffice Document Server integration settings
@@ -667,6 +718,7 @@ func DefaultConfig() *Config {
 			MaxVideoBytes:        10 * 1024 * 1024 * 1024, // 10 GB for videos (4K, long recordings)
 			MaxTextBytes:         50 * 1024 * 1024,        // 50 MB for text files (prevent browser freeze)
 			MaxIWorkPreviewBytes: 50 * 1024 * 1024,        // 50 MB for iWork previews
+			PreviewExtensions:    defaultFileViewPreviewExtensions(),
 		},
 		EnforcementProfiles: map[string]EnforcementProfile{
 			"hard": DefaultHardProfile(),
@@ -884,6 +936,9 @@ func (c *Config) applyEnvOverrides() {
 			c.FileView.MaxIWorkPreviewBytes = i
 		}
 	}
+	if v := os.Getenv("FILEVIEW_PREVIEW_EXTENSIONS"); v != "" {
+		c.FileView.PreviewExtensions = strings.Split(v, ",")
+	}
 
 	// GC settings
 	if v := os.Getenv("GC_ENABLED"); v != "" {
@@ -938,6 +993,11 @@ func (c *Config) Validate() error {
 	if !c.Auth.DevMode && !hasConfiguredStrings(c.CORS.AllowedOrigins) {
 		return fmt.Errorf("cors.allowed_origins must contain at least one origin in production")
 	}
+	normalizedPreviewExtensions, err := normalizeFileViewPreviewExtensions(c.FileView.PreviewExtensions)
+	if err != nil {
+		return err
+	}
+	c.FileView.PreviewExtensions = normalizedPreviewExtensions
 	if c.Auth.OIDC.Enabled && !hasConfiguredStrings(c.Auth.OIDC.RedirectURIs) {
 		return fmt.Errorf("auth.oidc.redirect_uris must contain at least one redirect URI when OIDC is enabled")
 	}

@@ -3,6 +3,7 @@ import PropTypes from 'prop-types';
 import { Utils } from '../../utils/utils';
 import { gettext, siteRoot } from '../../utils/constants';
 import SeafileMarkdownViewer from '../seafile-markdown-viewer';
+import { buildFileViewURL } from '../../utils/file-view-url';
 
 const propTypes = {
   path: PropTypes.string.isRequired,
@@ -22,7 +23,7 @@ class DirColumnFile extends React.Component {
   componentDidMount() {
     if (this.props.hash) {
       let hash = this.props.hash;
-      setTimeout(function() {
+      setTimeout(function () {
         window.location.hash = hash;
       }, 500);
     }
@@ -38,7 +39,7 @@ class DirColumnFile extends React.Component {
   onOpenFile = (e) => {
     e.preventDefault();
     let { path, repoID } = this.props;
-    let newUrl = siteRoot + 'lib/' + repoID + '/file' + Utils.encodePath(path);
+    let newUrl = buildFileViewURL({ repoID, filePath: path });
     window.open(newUrl, '_blank');
   };
 
@@ -53,7 +54,7 @@ class DirColumnFile extends React.Component {
         isTOCShow={false}
         isFileLoading={this.props.isFileLoading}
         markdownContent={this.props.content}
-        lastModified = {this.props.lastModified}
+        lastModified={this.props.lastModified}
         latestContributor={this.props.latestContributor}
         onLinkClick={this.props.onLinkClick}
         repoID={this.props.repoID}

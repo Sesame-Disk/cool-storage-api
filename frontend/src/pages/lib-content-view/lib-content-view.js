@@ -24,6 +24,7 @@ import CopyMoveDirentProgressDialog from '../../components/dialog/copy-move-dire
 import CopyMoveConflictDialog from '../../components/dialog/copy-move-conflict-dialog';
 import DeleteFolderDialog from '../../components/dialog/delete-folder-dialog';
 import FilePreviewDialog from '../../components/dialog/file-preview-dialog';
+import { buildFileViewURL } from '../../utils/file-view-url';
 
 const propTypes = {
   pathPrefix: PropTypes.array.isRequired,
@@ -994,7 +995,7 @@ class LibContentView extends React.Component {
         if (Utils.isMarkdownFile(path)) {
           this.showFile(path);
         } else {
-          let url = siteRoot + 'lib/' + item.repo_id + '/file' + Utils.encodePath(path);
+          let url = buildFileViewURL({ repoID: item.repo_id, filePath: path });
           let isWeChat = Utils.isWeChat();
           if (!isWeChat) {
             let newWindow = window.open('about:blank');
@@ -1008,7 +1009,7 @@ class LibContentView extends React.Component {
       if (item.is_dir) {
         this.showDir(path);
       } else {
-        let url = siteRoot + 'lib/' + item.repo_id + '/file' + Utils.encodePath(path);
+        let url = buildFileViewURL({ repoID: item.repo_id, filePath: path });
         let isWeChat = Utils.isWeChat();
         if (!isWeChat) {
           let newWindow = window.open('about:blank');
@@ -1379,15 +1380,9 @@ class LibContentView extends React.Component {
           previewFileName: dirent.name,
         });
       } else {
-        let url = siteRoot + 'lib/' + repoID + '/file' + Utils.encodePath(direntPath);
+        let url = buildFileViewURL({ repoID, filePath: direntPath, token: getToken() });
         if (dirent.is_sdoc_revision && dirent.revision_id) {
           url = siteRoot + 'lib/' + repoID + '/revisions/' + dirent.revision_id + '/';
-        }
-
-        // Add auth token to URL for file viewer (opens in new tab)
-        const token = getToken();
-        if (token) {
-          url += (url.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(token);
         }
 
         let isWeChat = Utils.isWeChat();
@@ -1780,7 +1775,7 @@ class LibContentView extends React.Component {
           this.showColumnMarkdownFile(node.path);
         }
       } else {
-        let url = siteRoot + 'lib/' + repoID + '/file' + Utils.encodePath(node.path);
+        let url = buildFileViewURL({ repoID, filePath: node.path });
         let dirent = node.object;
         if (dirent.is_sdoc_revision && dirent.revision_id) {
           url = siteRoot + 'lib/' + repoID + '/revisions/' + dirent.revision_id + '/';
@@ -1796,7 +1791,7 @@ class LibContentView extends React.Component {
       if (res.data.size === 0) {
         // loading of asynchronously obtained data may be blocked
         const w = window.open('about:blank');
-        const url = siteRoot + 'lib/' + repoID + '/file' + Utils.encodePath(filePath);
+        const url = buildFileViewURL({ repoID, filePath });
         w.location.href = url;
       } else {
         this.showFile(filePath);

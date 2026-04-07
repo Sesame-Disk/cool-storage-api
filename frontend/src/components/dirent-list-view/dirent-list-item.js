@@ -21,6 +21,7 @@ import EditFileTagPopover from '../popover/edit-filetag-popover';
 import LibSubFolderPermissionDialog from '../dialog/lib-sub-folder-permission-dialog';
 import toaster from '../toast';
 import FileTag from './file-tag';
+import { buildFileViewURL } from '../../utils/file-view-url';
 
 import '../../css/dirent-list-item.css';
 
@@ -691,7 +692,7 @@ class DirentListItem extends React.Component {
     if (this.props.currentRepoInfo) {
       dirHref = siteRoot + 'library/' + this.props.repoID + '/' + this.props.currentRepoInfo.repo_name + Utils.encodePath(direntPath);
     }
-    let fileHref = siteRoot + 'lib/' + this.props.repoID + '/file' + Utils.encodePath(direntPath);
+    let fileHref = buildFileViewURL({ repoID: this.props.repoID, filePath: direntPath });
     if (dirent.is_sdoc_revision && dirent.revision_id) {
       fileHref = siteRoot + 'lib/' + this.props.repoID + '/revisions/' + dirent.revision_id + '/';
     }

@@ -2,7 +2,15 @@ import React from 'react';
 import PropTypes from 'prop-types';
 import { gettext } from '../../utils/constants';
 
-const { err, trafficOverLimit, zipped, filePath, canDownload } = window.shared.pageOptions;
+function getDownloadHref(downloadPath, zipped, filePath) {
+  if (downloadPath) {
+    return downloadPath;
+  }
+
+  return `?${zipped ? 'p=' + encodeURIComponent(filePath) + '&' : ''}dl=1`;
+}
+
+const { err, trafficOverLimit, zipped, filePath, canDownload, downloadPath } = window.shared.pageOptions;
 
 const propTypes = {
   errorMsg: PropTypes.string
@@ -24,7 +32,7 @@ class SharedFileViewTip extends React.Component {
         <div className={`file-view-tip ${!isShowDownloadBtn ? 'pt-7' : ''}`}>
           {errorMsg}
           {isShowDownloadBtn &&
-            <a href={`?${zipped ? 'p=' + encodeURIComponent(filePath) + '&' : ''}dl=1`} className="btn btn-secondary">{gettext('Download')}</a>
+            <a href={getDownloadHref(downloadPath, zipped, filePath)} className="btn btn-secondary">{gettext('Download')}</a>
           }
         </div>
       </div>

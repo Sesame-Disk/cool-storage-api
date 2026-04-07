@@ -72,6 +72,16 @@ func TestBuildAppBootstrapPageOptionsIncludesSettingsBasics(t *testing.T) {
 	if enabled, ok := pageOptions["enableDeleteAccount"].(bool); !ok || !enabled {
 		t.Fatalf("enableDeleteAccount = %v, want true", pageOptions["enableDeleteAccount"])
 	}
+	inlinePreviewExtensions, ok := pageOptions["inlinePreviewExtensions"].([]string)
+	if !ok {
+		t.Fatalf("inlinePreviewExtensions has unexpected type: %T", pageOptions["inlinePreviewExtensions"])
+	}
+	if len(inlinePreviewExtensions) == 0 {
+		t.Fatalf("inlinePreviewExtensions should not be empty")
+	}
+	if inlinePreviewExtensions[0] != s.config.FileView.PreviewExtensions[0] {
+		t.Fatalf("inlinePreviewExtensions[0] = %q, want %q", inlinePreviewExtensions[0], s.config.FileView.PreviewExtensions[0])
+	}
 }
 
 func TestBuildBootstrapStorageOptionsUsesRegionLabelsAndDefault(t *testing.T) {

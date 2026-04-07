@@ -5,6 +5,7 @@ import MediaQuery from 'react-responsive';
 import { Modal } from 'reactstrap';
 import { siteRoot } from './utils/constants';
 import { Utils } from './utils/utils';
+import { buildFileViewURL } from './utils/file-view-url';
 import { isAuthenticated, seafileAPI, getToken } from './utils/seafile-api';
 import LoginPage from './pages/login';
 import SSOPage from './pages/sso';
@@ -232,7 +233,7 @@ class App extends Component {
       navigate(url, { repalce: true });
     } else {
       const token = getToken();
-      let url = siteRoot + 'lib/' + selectedItem.repo_id + '/file' + Utils.encodePath(selectedItem.path) + (token ? '?token=' + encodeURIComponent(token) : '');
+      let url = buildFileViewURL({ repoID: selectedItem.repo_id, filePath: selectedItem.path, token });
       let isWeChat = Utils.isWeChat();
       if (!isWeChat) {
         let newWindow = window.open('about:blank');

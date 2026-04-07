@@ -4,6 +4,7 @@ import React from 'react';
 import toaster from '../components/toast';
 import PermissionDeniedTip from '../components/permission-denied-tip';
 import { compareTwoString } from './compare-two-string';
+import { buildFileViewURL } from './file-view-url';
 
 export const Utils = {
 
@@ -1472,7 +1473,7 @@ export const Utils = {
       let newWindow = window.open('about:blank');
       newWindow.location.href = url;
     } else {
-      let url = siteRoot + 'lib/' + searchedItem.repo_id + '/file' + Utils.encodePath(searchedItem.path);
+      let url = buildFileViewURL({ repoID: searchedItem.repo_id, filePath: searchedItem.path });
       let newWindow = window.open('about:blank');
       newWindow.location.href = url;
     }

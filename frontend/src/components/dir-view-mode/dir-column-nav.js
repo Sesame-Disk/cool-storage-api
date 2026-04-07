@@ -12,6 +12,7 @@ import ImageDialog from '../../components/dialog/image-dialog';
 import { siteRoot, thumbnailSizeForOriginal } from '../../utils/constants';
 import { getToken } from '../../utils/seafile-api';
 import { Utils } from '../../utils/utils';
+import { buildFileViewURL } from '../../utils/file-view-url';
 
 const propTypes = {
   currentPath: PropTypes.string.isRequired,
@@ -56,11 +57,11 @@ class DirColumnNav extends React.Component {
   }
 
   UNSAFE_componentWillReceiveProps(nextProps) {
-    this.setState({opNode: nextProps.currentNode});
+    this.setState({ opNode: nextProps.currentNode });
   }
 
   onNodeClick = (node) => {
-    this.setState({opNode: node});
+    this.setState({ opNode: node });
     if (Utils.imageCheck(node.object.name)) {
       this.showNodeImagePopup(node);
       return;
@@ -69,7 +70,7 @@ class DirColumnNav extends React.Component {
   };
 
   onMenuItemClick = (operation, node) => {
-    this.setState({opNode: node});
+    this.setState({ opNode: node });
     switch (operation) {
       case 'New Folder':
         if (!node) {
@@ -111,7 +112,7 @@ class DirColumnNav extends React.Component {
         opNode: root,
       });
     } else {
-      this.setState({isAddFileDialogShow: !this.state.isAddFileDialogShow});
+      this.setState({ isAddFileDialogShow: !this.state.isAddFileDialogShow });
     }
   };
 
@@ -123,29 +124,29 @@ class DirColumnNav extends React.Component {
         opNode: root,
       });
     } else {
-      this.setState({isAddFolderDialogShow: !this.state.isAddFolderDialogShow});
+      this.setState({ isAddFolderDialogShow: !this.state.isAddFolderDialogShow });
     }
   };
 
   onRenameToggle = () => {
-    this.setState({isRenameDialogShow: !this.state.isRenameDialogShow});
+    this.setState({ isRenameDialogShow: !this.state.isRenameDialogShow });
   };
 
   onCopyToggle = () => {
-    this.setState({isCopyDialogShow: !this.state.isCopyDialogShow});
+    this.setState({ isCopyDialogShow: !this.state.isCopyDialogShow });
   };
 
   onMoveToggle = () => {
-    this.setState({isMoveDialogShow: !this.state.isMoveDialogShow});
+    this.setState({ isMoveDialogShow: !this.state.isMoveDialogShow });
   };
 
   onAddFolderNode = (dirPath) => {
-    this.setState({isAddFolderDialogShow: !this.state.isAddFolderDialogShow});
+    this.setState({ isAddFolderDialogShow: !this.state.isAddFolderDialogShow });
     this.props.onAddFolderNode(dirPath);
   };
 
   onRenameNode = (newName) => {
-    this.setState({isRenameDialogShow: !this.state.isRenameDialogShow});
+    this.setState({ isRenameDialogShow: !this.state.isRenameDialogShow });
     let node = this.state.opNode;
     this.props.onRenameNode(node, newName);
   };
@@ -155,7 +156,7 @@ class DirColumnNav extends React.Component {
   };
 
   onOpenFile = (node) => {
-    let newUrl = siteRoot + 'lib/' + this.props.repoID + '/file' + Utils.encodePath(node.path);
+    let newUrl = buildFileViewURL({ repoID: this.props.repoID, filePath: node.path });
     window.open(newUrl, '_blank');
   };
 
@@ -253,9 +254,9 @@ class DirColumnNav extends React.Component {
     const select = this.props.inResizing ? 'none' : '';
     return (
       <Fragment>
-        <div className="dir-content-nav" role="navigation" style={{flex: (flex), userSelect: select}} onScroll={this.stopTreeScrollPropagation}>
+        <div className="dir-content-nav" role="navigation" style={{ flex: (flex), userSelect: select }} onScroll={this.stopTreeScrollPropagation}>
           {this.props.isTreeDataLoading ?
-            (<Loading/>) :
+            (<Loading />) :
             (<TreeView
               userPerm={this.props.userPerm}
               isNodeMenuShow={this.isNodeMenuShow}
@@ -346,7 +347,7 @@ class DirColumnNav extends React.Component {
   }
 }
 
-DirColumnNav.defaultProps={
+DirColumnNav.defaultProps = {
   navRate: 0.25
 };
 

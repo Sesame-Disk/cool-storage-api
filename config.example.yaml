@@ -193,6 +193,74 @@ fileview:
   max_video_bytes: 10737418240        # 10 GiB - Videos (4K recordings, long videos)
   max_text_bytes: 52428800            # 50 MB - Text files (prevent browser freeze)
   max_iwork_preview_bytes: 52428800   # 50 MB - Extracted iWork previews
+  preview_extensions:
+    - pdf
+    - png
+    - jpg
+    - jpeg
+    - gif
+    - bmp
+    - webp
+    - svg
+    - ico
+    - tiff
+    - tif
+    - mp4
+    - webm
+    - ogg
+    - mov
+    - mp3
+    - wav
+    - flac
+    - aac
+    - txt
+    - md
+    - markdown
+    - json
+    - yaml
+    - yml
+    - xml
+    - csv
+    - html
+    - htm
+    - css
+    - js
+    - ts
+    - jsx
+    - tsx
+    - py
+    - go
+    - rs
+    - java
+    - c
+    - cpp
+    - h
+    - hpp
+    - sh
+    - bash
+    - zsh
+    - fish
+    - toml
+    - ini
+    - cfg
+    - conf
+    - env
+    - sql
+    - graphql
+    - proto
+    - dockerfile
+    - makefile
+    - rb
+    - php
+    - swift
+    - kt
+    - scala
+    - r
+    - lua
+    - pl
+    - log
+    - diff
+    - patch
 
 # OnlyOffice Document Server integration
 onlyoffice:

@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"path"
 	"path/filepath"
 	"sort"
@@ -1624,6 +1625,7 @@ func (h *FileHandler) GetDirDetail(c *gin.Context) {
 func (h *FileHandler) GetSmartLink(c *gin.Context) {
 	repoID := c.Query("repo_id")
 	itemPath := c.Query("path")
+	isDir := c.Query("is_dir") == "true" || c.Query("is_dir") == "1"
 
 	if repoID == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error_msg": "repo_id is required"})
@@ -1632,7 +1634,7 @@ func (h *FileHandler) GetSmartLink(c *gin.Context) {
 	if itemPath == "" {
 		itemPath = "/"
 	}
-	itemPath = normalizePath(itemPath)
+	itemPath = normalizeSmartLinkPath(itemPath, isDir)
 
 	orgID := c.GetString("org_id")
 	userID := c.GetString("user_id")
@@ -1720,14 +1722,74 @@ func (h *FileHandler) ResolveSmartLink(c *gin.Context) {
 
 	// Determine redirect URL based on path
 	baseURL := httputil.GetBrowserURL(c, h.serverURL)
-	var redirectURL string
-	if filePath == "/" || strings.HasSuffix(filePath, "/") {
-		redirectURL = fmt.Sprintf("%s/library/%s/%s", baseURL, libraryID, strings.TrimPrefix(filePath, "/"))
-	} else {
-		redirectURL = fmt.Sprintf("%s/lib/%s/file%s", baseURL, libraryID, filePath)
+	isDir, dirErr := resolveLibraryPathIsDir(h.db, libraryID, filePath)
+	if dirErr != nil {
+		isDir = filePath == "/" || strings.HasSuffix(filePath, "/")
 	}
+	var repoName string
+	if queryErr := h.db.Session().Query(`SELECT name FROM libraries_by_id WHERE library_id = ?`, libraryID).Scan(&repoName); queryErr != nil {
+		repoName = libraryID
+	}
+	redirectURL := buildSmartLinkRedirectURL(baseURL, libraryID, repoName, filePath, h.config.FileView.PreviewExtensions, isDir)
 
 	c.Redirect(http.StatusFound, redirectURL)
+}
+
+func buildSmartLinkRedirectURL(baseURL, libraryID, repoName, filePath string, previewExtensions []string, isDir bool) string {
+	if isDir {
+		normalizedPath := normalizePath(filePath)
+		repoSegment := url.PathEscape(repoName)
+		if repoSegment == "" {
+			repoSegment = libraryID
+		}
+		if normalizedPath == "/" {
+			return fmt.Sprintf("%s/library/%s/%s/", baseURL, libraryID, repoSegment)
+		}
+		return fmt.Sprintf("%s/library/%s/%s%s", baseURL, libraryID, repoSegment, normalizedPath)
+	}
+
+	filename := filepath.Base(filePath)
+	ext := strings.ToLower(strings.TrimPrefix(filepath.Ext(filename), "."))
+	if isInlinePreviewable(ext, previewExtensions) {
+		return baseURL + buildFrontendFilePreviewURL(libraryID, filePath, "")
+	}
+
+	return fmt.Sprintf("%s/lib/%s/file%s", baseURL, libraryID, filePath)
+}
+
+func normalizeSmartLinkPath(p string, isDir bool) string {
+	normalized := normalizePath(p)
+	if isDir && normalized != "/" {
+		return normalized + "/"
+	}
+	return normalized
+}
+
+func resolveLibraryPathIsDir(database *db.DB, libraryID, filePath string) (bool, error) {
+	if database == nil {
+		return false, fmt.Errorf("database not available")
+	}
+
+	normalizedPath := normalizePath(filePath)
+	if normalizedPath == "/" {
+		return true, nil
+	}
+
+	fsHelper := NewFSHelper(database)
+	rootFSID, _, err := fsHelper.GetRootFSID(libraryID)
+	if err != nil {
+		return false, err
+	}
+
+	result, err := fsHelper.TraverseToPathFromRoot(libraryID, rootFSID, normalizedPath)
+	if err != nil {
+		return false, err
+	}
+	if result == nil || result.TargetEntry == nil {
+		return false, fmt.Errorf("path not found")
+	}
+
+	return result.TargetEntry.Mode == ModeDir || result.TargetEntry.Mode&0170000 == 040000, nil
 }
 
 // DeleteFile deletes a file

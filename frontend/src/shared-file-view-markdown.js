@@ -4,6 +4,7 @@ import { MarkdownViewer } from '@seafile/seafile-editor';
 import { seafileAPI } from './utils/seafile-api';
 import { Utils } from './utils/utils';
 import { serviceURL, mediaUrl } from './utils/constants';
+import { rewriteSharedMarkdownNode } from './utils/share-link-markdown-url';
 import SharedFileView from './components/shared-file-view/shared-file-view';
 import SharedFileViewTip from './components/shared-file-view/shared-file-view-tip';
 import Loading from './components/loading';
@@ -11,7 +12,7 @@ import toaster from './components/toast';
 
 import 'bootstrap/dist/css/bootstrap.min.css';
 
-const { repoID, sharedToken, rawPath, err } = window.shared.pageOptions;
+const { repoID, sharedToken, rawPath, filePath, smartLinkMap, err } = window.shared.pageOptions;
 
 class SharedFileViewMarkdown extends React.Component {
   render() {
@@ -37,34 +38,23 @@ class FileContent extends React.Component {
       });
     }).catch(error => {
       let errMessage = Utils.getErrorMsg(error);
+      this.setState({ loading: false });
       toaster.danger(errMessage);
     });
   }
 
-  changeImageURL = (innerNode) => {
-    if (innerNode.type === 'image') {
-      let imageUrl = innerNode.data.src;
-
-      const re = new RegExp(serviceURL + '/lib/' + repoID + '/file.*raw=1');
-
-      // different repo
-      if (!re.test(imageUrl)) {
-        return;
-      }
-      // get image path
-      let imagePath = imageUrl.substring(serviceURL.length);
-      let index = imagePath.indexOf('/file');
-      let index2 = imagePath.indexOf('?');
-      imagePath = imagePath.substring(index + 5, index2);
-      // change image url
-      // the image path has been encoded when inserting the image
-      innerNode.data.src = serviceURL + '/view-image-via-share-link/?token=' + sharedToken + '&path=' + imagePath;
-    }
-    return innerNode;
+  rewriteMarkdownNode = (innerNode) => {
+    return rewriteSharedMarkdownNode(innerNode, {
+      repoID,
+      sharedToken,
+      currentFilePath: filePath,
+      smartLinkMap,
+      serviceURL,
+    });
   };
 
   modifyValueBeforeRender = (value) => {
-    return Utils.changeMarkdownNodes(value, this.changeImageURL);
+    return Utils.changeMarkdownNodes(value, this.rewriteMarkdownNode);
   };
 
   render() {
