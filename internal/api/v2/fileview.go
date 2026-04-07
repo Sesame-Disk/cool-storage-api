@@ -201,41 +201,19 @@ func isTextFile(ext string) bool {
 	return false
 }
 
-// serveInlinePreview renders an HTML page with inline file preview
+// serveInlinePreview redirects previewable files to the frontend-owned standalone preview shell.
 func (h *FileViewHandler) serveInlinePreview(c *gin.Context, repoID, filePath, filename, ext string) {
-	// Build the raw file URL (served inline with correct MIME type)
-	// Pass the auth token so the raw endpoint can authenticate
-	token := c.Query("token")
-	if token == "" {
-		// Extract from Authorization header (set by fileViewAuthWrapper)
-		auth := c.GetHeader("Authorization")
-		if strings.HasPrefix(auth, "Token ") {
-			token = strings.TrimPrefix(auth, "Token ")
-		} else if strings.HasPrefix(auth, "Bearer ") {
-			token = strings.TrimPrefix(auth, "Bearer ")
-		}
-	}
-	// Fallback: if still no token (e.g. anonymous/dev mode), use first dev token
-	if token == "" && h.config.Auth.DevMode && len(h.config.Auth.DevTokens) > 0 {
-		token = h.config.Auth.DevTokens[0].Token
-	}
-	rawURL := fmt.Sprintf("/repo/%s/raw%s?token=%s", repoID, filePath, url.QueryEscape(token))
-	downloadURL := fmt.Sprintf("/lib/%s/file%s?dl=1&token=%s", repoID, filePath, url.QueryEscape(token))
+	c.Redirect(http.StatusFound, buildFrontendFilePreviewURL(repoID, filePath, ""))
+}
 
-	previewContent := buildPreviewContent(ext, rawURL, filename)
-
-	data := templates.FilePreviewData{
-		Filename:       filename,
-		DownloadURL:    downloadURL,
-		PreviewContent: htmltemplate.HTML(previewContent),
+func buildFrontendFilePreviewURL(repoID, filePath, objID string) string {
+	params := url.Values{}
+	params.Set("repo_id", repoID)
+	params.Set("p", filePath)
+	if objID != "" {
+		params.Set("obj_id", objID)
 	}
-
-	c.Header("Content-Type", "text/html; charset=utf-8")
-	c.Header("Cache-Control", "no-store")
-	if err := templates.Render(c.Writer, "file_preview.html", data); err != nil {
-		log.Printf("[serveInlinePreview] template error: %v", err)
-		c.String(http.StatusInternalServerError, "Internal Server Error")
-	}
+	return "/file-preview/?" + params.Encode()
 }
 
 // buildPreviewContent returns an HTML snippet for the preview area based on file type.
@@ -896,9 +874,8 @@ func (h *FileViewHandler) DownloadHistoricFile(c *gin.Context) {
 	}
 }
 
-// ViewHistoricFile serves an HTML preview page for a historic file revision.
-// It renders the same inline preview UI as ViewFile but uses the history/raw
-// endpoint to fetch the file content by FS object ID instead of HEAD commit.
+// ViewHistoricFile redirects previewable historic revisions to the frontend-owned
+// standalone preview shell while leaving raw/download handling on the backend.
 func (h *FileViewHandler) ViewHistoricFile(c *gin.Context) {
 	repoID := c.Param("repo_id")
 	objID := c.Query("obj_id")
@@ -933,39 +910,7 @@ func (h *FileViewHandler) ViewHistoricFile(c *gin.Context) {
 		return
 	}
 
-	// Build the raw URL pointing to the historic raw endpoint
-	token := c.Query("token")
-	if token == "" {
-		auth := c.GetHeader("Authorization")
-		if strings.HasPrefix(auth, "Token ") {
-			token = strings.TrimPrefix(auth, "Token ")
-		} else if strings.HasPrefix(auth, "Bearer ") {
-			token = strings.TrimPrefix(auth, "Bearer ")
-		}
-	}
-	if token == "" && h.config.Auth.DevMode && len(h.config.Auth.DevTokens) > 0 {
-		token = h.config.Auth.DevTokens[0].Token
-	}
-
-	rawURL := fmt.Sprintf("/repo/%s/history/raw?obj_id=%s&p=%s&token=%s",
-		repoID, url.QueryEscape(objID), url.QueryEscape(filePath), url.QueryEscape(token))
-	downloadURL := fmt.Sprintf("/repo/%s/history/download?obj_id=%s&p=%s&token=%s",
-		repoID, url.QueryEscape(objID), url.QueryEscape(filePath), url.QueryEscape(token))
-
-	previewContent := buildPreviewContent(ext, rawURL, filename)
-
-	data := templates.FilePreviewData{
-		Filename:       filename,
-		DownloadURL:    downloadURL,
-		PreviewContent: htmltemplate.HTML(previewContent),
-	}
-
-	c.Header("Content-Type", "text/html; charset=utf-8")
-	c.Header("Cache-Control", "no-store")
-	if err := templates.Render(c.Writer, "file_preview_historic.html", data); err != nil {
-		log.Printf("[ViewHistoricFile] template error: %v", err)
-		c.String(http.StatusInternalServerError, "Internal Server Error")
-	}
+	c.Redirect(http.StatusFound, buildFrontendFilePreviewURL(repoID, filePath, objID))
 }
 
 // ServeHistoricFileRaw serves the raw content of a historic file revision inline.

@@ -435,15 +435,15 @@ func TestViewFileRedirectsNonOfficeFiles(t *testing.T) {
 			expectRedirect: true,
 		},
 		{
-			name:           "png file serves inline preview",
+			name:           "png file redirects to frontend preview shell",
 			filepath:       "/image.png",
-			expectStatus:   http.StatusOK,
+			expectStatus:   http.StatusFound,
 			expectRedirect: false,
 		},
 		{
-			name:           "txt file serves inline preview",
+			name:           "txt file redirects to frontend preview shell",
 			filepath:       "/readme.txt",
-			expectStatus:   http.StatusOK,
+			expectStatus:   http.StatusFound,
 			expectRedirect: false,
 		},
 	}
@@ -464,8 +464,52 @@ func TestViewFileRedirectsNonOfficeFiles(t *testing.T) {
 				if !strings.Contains(location, "/seafhttp/files/") {
 					t.Errorf("redirect location = %q, expected seafhttp download URL", location)
 				}
+			} else {
+				location := w.Header().Get("Location")
+				if !strings.HasPrefix(location, "/file-preview/?") {
+					t.Errorf("redirect location = %q, expected frontend preview shell", location)
+				}
+				if !strings.Contains(location, "repo_id=repo-123") {
+					t.Errorf("redirect location = %q, expected repo_id query parameter", location)
+				}
 			}
 		})
+	}
+}
+
+func TestViewHistoricFileRedirectsPreviewableFilesToFrontendShell(t *testing.T) {
+	h := &FileViewHandler{
+		config: &config.Config{},
+	}
+
+	r := gin.New()
+	r.Use(func(c *gin.Context) {
+		c.Set("user_id", "test-user")
+		c.Set("org_id", "test-org")
+		c.Next()
+	})
+	r.GET("/repo/:repo_id/history/view", h.ViewHistoricFile)
+
+	req, _ := http.NewRequest("GET", "/repo/repo-123/history/view?obj_id=abc123&p=/docs/readme.txt", nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusFound {
+		t.Fatalf("expected 302 redirect, got %d", w.Code)
+	}
+
+	location := w.Header().Get("Location")
+	if !strings.HasPrefix(location, "/file-preview/?") {
+		t.Fatalf("redirect location = %q, expected frontend preview shell", location)
+	}
+	if !strings.Contains(location, "repo_id=repo-123") {
+		t.Errorf("redirect location = %q, expected repo_id query parameter", location)
+	}
+	if !strings.Contains(location, "obj_id=abc123") {
+		t.Errorf("redirect location = %q, expected obj_id query parameter", location)
+	}
+	if !strings.Contains(location, "p=%2Fdocs%2Freadme.txt") {
+		t.Errorf("redirect location = %q, expected encoded path query parameter", location)
 	}
 }
 

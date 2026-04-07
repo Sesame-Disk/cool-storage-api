@@ -249,19 +249,21 @@ Treat real multilingual support as a tracked migration, not a quick patch. For n
 
 ### Backend-Owned HTML Surfaces
 The backend still renders a narrow but important set of full HTML pages:
-- `file_preview.html` for inline authenticated file preview
-- `file_preview_historic.html` for historic revision preview
 - `onlyoffice_editor.html` for full-page OnlyOffice editor bootstrap
 - `error_page.html` as the fallback page for those flows
 - `login_success.html` for the desktop-client SSO callback bridge
 
+Detailed route and ownership map: `docs/BACKEND-HTML-SURFACES.md`.
+
 ### Migration Assessment
-Good candidates to move to frontend-owned shells now:
-- `file_preview.html`
-- `file_preview_historic.html`
+Completed safely now:
+- inline authenticated file preview now redirects to a frontend-owned standalone shell
+- historic file preview now redirects to the same frontend-owned standalone shell
+
+Good candidates to move next:
 - `error_page.html`
 
-These are mostly presentation shells around data or stream URLs, so moving them would reduce duplicated UI ownership without changing core backend responsibilities.
+The remaining low-risk win is `error_page.html`, because it is still a presentation shell around existing backend flows.
 
 Medium-complexity migration:
 - `onlyoffice_editor.html`

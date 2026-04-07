@@ -8,6 +8,7 @@ const entryFiles = {
   wiki: '/wiki.js',
   fileHistory: '/file-history.js',
   fileHistoryOld: '/file-history-old.js',
+  filePreviewPage: '/file-preview-page.js',
   sdocFileHistory: '/pages/sdoc/sdoc-file-history/index.js',
   sdocPublishedRevision: '/pages/sdoc/sdoc-published-revision/index.js',
   app: '/app-entry.js',
