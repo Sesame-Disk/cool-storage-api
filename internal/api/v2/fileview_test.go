@@ -35,55 +35,6 @@ func (m *mockTokenCreator) CreateLinkDownloadToken(orgID, repoID, path, userID s
 	return "mock-link-download-token-" + repoID, nil
 }
 
-// TestErrorPageHTML tests the error page HTML generator
-func TestErrorPageHTML(t *testing.T) {
-	tests := []struct {
-		title    string
-		message  string
-		expected []string
-	}{
-		{
-			title:   "File Not Found",
-			message: "The requested file could not be found.",
-			expected: []string{
-				"<title>File Not Found - SesameFS</title>",
-				"<h1>File Not Found</h1>",
-				"<p>The requested file could not be found.</p>",
-			},
-		},
-		{
-			title:   "Authentication Required",
-			message: "Please provide a valid authentication token.",
-			expected: []string{
-				"<title>Authentication Required - SesameFS</title>",
-				"<h1>Authentication Required</h1>",
-				"<p>Please provide a valid authentication token.</p>",
-			},
-		},
-		{
-			title:   "Internal Error",
-			message: "Something went wrong.",
-			expected: []string{
-				"<!DOCTYPE html>",
-				"error-container",
-				"Something went wrong.",
-			},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.title, func(t *testing.T) {
-			result := errorPageHTML(tt.title, tt.message)
-
-			for _, exp := range tt.expected {
-				if !strings.Contains(result, exp) {
-					t.Errorf("errorPageHTML(%q, %q) missing expected content: %q", tt.title, tt.message, exp)
-				}
-			}
-		})
-	}
-}
-
 // TestOnlyOfficeEditorHTML tests the OnlyOffice editor HTML generator
 func TestOnlyOfficeEditorHTML(t *testing.T) {
 	config := OnlyOfficeConfig{
@@ -811,15 +762,16 @@ func TestDownloadHistoricFileMissingObjID(t *testing.T) {
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
-	if w.Code != http.StatusBadRequest {
-		t.Errorf("expected 400 for missing obj_id, got %d", w.Code)
+	if w.Code != http.StatusFound {
+		t.Errorf("expected 302 for missing obj_id, got %d", w.Code)
 	}
-	if !strings.Contains(w.Body.String(), "Missing obj_id") {
-		t.Error("response should mention missing obj_id")
+	loc := w.Header().Get("Location")
+	if !strings.Contains(loc, "/file-error/") || !strings.Contains(loc, "status=400") || !strings.Contains(loc, "Missing+obj_id") {
+		t.Errorf("expected redirect to /file-error/ with status=400 and missing obj_id message, got %q", loc)
 	}
 }
 
-// TestDownloadHistoricFileInvalidPath tests that invalid path returns 400
+// TestDownloadHistoricFileInvalidPath tests that invalid path redirects to /file-error/
 func TestDownloadHistoricFileInvalidPath(t *testing.T) {
 	h := &FileViewHandler{
 		config: &config.Config{},
@@ -838,11 +790,12 @@ func TestDownloadHistoricFileInvalidPath(t *testing.T) {
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
-	if w.Code != http.StatusBadRequest {
-		t.Errorf("expected 400 for invalid path, got %d", w.Code)
+	if w.Code != http.StatusFound {
+		t.Errorf("expected 302 for invalid path, got %d", w.Code)
 	}
-	if !strings.Contains(w.Body.String(), "Invalid file path") {
-		t.Error("response should mention invalid file path")
+	loc := w.Header().Get("Location")
+	if !strings.Contains(loc, "/file-error/") || !strings.Contains(loc, "status=400") || !strings.Contains(loc, "Invalid+file+path") {
+		t.Errorf("expected redirect to /file-error/ with status=400 and invalid path message, got %q", loc)
 	}
 }
 
@@ -866,8 +819,12 @@ func TestDownloadHistoricFileDefaultPath(t *testing.T) {
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
-	if w.Code != http.StatusBadRequest {
-		t.Errorf("expected 400 for default path /, got %d", w.Code)
+	if w.Code != http.StatusFound {
+		t.Errorf("expected 302 for default path /, got %d", w.Code)
+	}
+	loc := w.Header().Get("Location")
+	if !strings.Contains(loc, "/file-error/") || !strings.Contains(loc, "status=400") {
+		t.Errorf("expected redirect to /file-error/ with status=400, got %q", loc)
 	}
 }
 
@@ -893,12 +850,12 @@ func TestRegisterFileViewRoutesIncludesHistoryDownload(t *testing.T) {
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
-	// Missing obj_id should return 400, not 404
+	// Missing obj_id should redirect (302), not 404
 	if w.Code == http.StatusNotFound {
 		t.Error("route /repo/:repo_id/history/download not registered")
 	}
-	if w.Code != http.StatusBadRequest {
-		t.Errorf("expected 400 for missing obj_id, got %d", w.Code)
+	if w.Code != http.StatusFound {
+		t.Errorf("expected 302 for missing obj_id, got %d", w.Code)
 	}
 }
 
@@ -922,8 +879,8 @@ func TestDownloadHistoricFileNoStorageManager(t *testing.T) {
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
-	if w.Code != http.StatusBadRequest {
-		t.Errorf("expected 400 for missing obj_id, got %d", w.Code)
+	if w.Code != http.StatusFound {
+		t.Errorf("expected 302 for missing obj_id, got %d", w.Code)
 	}
 }
 

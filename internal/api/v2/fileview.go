@@ -402,9 +402,8 @@ func (h *FileViewHandler) serveOnlyOfficeEditor(c *gin.Context, repoID, filePath
 func onlyOfficeEditorHTML(apiJSURL string, cfg OnlyOfficeConfig, filename string) string {
 	configJSON, err := json.Marshal(cfg)
 	if err != nil {
-		errData := templates.ErrorPageData{Title: "Config Error", Message: err.Error()}
-		s, _ := templates.RenderString("error_page.html", errData)
-		return s
+		log.Printf("[onlyOfficeEditorHTML] failed to marshal config: %v", err)
+		return "<html><body><h1>Config Error</h1><p>" + html.EscapeString(err.Error()) + "</p></body></html>"
 	}
 
 	data := templates.OnlyOfficeData{
@@ -821,8 +820,7 @@ func (h *FileViewHandler) DownloadHistoricFile(c *gin.Context) {
 	filePath := c.Query("p")
 
 	if objID == "" {
-		c.Header("Content-Type", "text/html; charset=utf-8")
-		c.String(http.StatusBadRequest, errorPageHTML("Bad Request", "Missing obj_id parameter."))
+		redirectToFrontendErrorPage(c, http.StatusBadRequest, "Bad Request", "Missing obj_id parameter.")
 		return
 	}
 	if filePath == "" {
@@ -831,8 +829,7 @@ func (h *FileViewHandler) DownloadHistoricFile(c *gin.Context) {
 
 	filename := filepath.Base(filePath)
 	if filename == "" || filename == "." || filename == "/" || filename == "\\" {
-		c.Header("Content-Type", "text/html; charset=utf-8")
-		c.String(http.StatusBadRequest, errorPageHTML("Bad Request", "Invalid file path."))
+		redirectToFrontendErrorPage(c, http.StatusBadRequest, "Bad Request", "Invalid file path.")
 		return
 	}
 
@@ -861,16 +858,14 @@ func (h *FileViewHandler) DownloadHistoricFile(c *gin.Context) {
 	`, orgID, repoID).Scan(&encrypted)
 	if err != nil {
 		log.Printf("[DownloadHistoricFile] Failed to query library: %v", err)
-		c.Header("Content-Type", "text/html; charset=utf-8")
-		c.String(http.StatusNotFound, errorPageHTML("Not Found", "Library not found."))
+		redirectToFrontendErrorPage(c, http.StatusNotFound, "Not Found", "Library not found.")
 		return
 	}
 
 	if encrypted {
 		fileKey = GetDecryptSessions().GetFileKey(userID, repoID)
 		if fileKey == nil {
-			c.Header("Content-Type", "text/html; charset=utf-8")
-			c.String(http.StatusForbidden, errorPageHTML("Library Locked", "This library is encrypted. Please unlock it first."))
+			redirectToFrontendErrorPage(c, http.StatusForbidden, "Library Locked", "This library is encrypted. Please unlock it first.")
 			return
 		}
 	}
@@ -882,16 +877,14 @@ func (h *FileViewHandler) DownloadHistoricFile(c *gin.Context) {
 	`, repoID, objID).Scan(&blockIDs)
 	if err != nil {
 		log.Printf("[DownloadHistoricFile] FS object not found: repo=%s obj=%s err=%v", repoID, objID, err)
-		c.Header("Content-Type", "text/html; charset=utf-8")
-		c.String(http.StatusNotFound, errorPageHTML("Not Found", "The requested file revision could not be found."))
+		redirectToFrontendErrorPage(c, http.StatusNotFound, "Not Found", "The requested file revision could not be found.")
 		return
 	}
 
 	if h.storageManager == nil {
 		if h.storage == nil {
 			log.Printf("[DownloadHistoricFile] Storage manager not available")
-			c.Header("Content-Type", "text/html; charset=utf-8")
-			c.String(http.StatusInternalServerError, errorPageHTML("Internal Error", "Storage not available."))
+			redirectToFrontendErrorPage(c, http.StatusInternalServerError, "Internal Error", "Storage not available.")
 			return
 		}
 	}
@@ -899,8 +892,7 @@ func (h *FileViewHandler) DownloadHistoricFile(c *gin.Context) {
 	blockStore, _, err := resolveLibraryBlockStoreForRequest(c, h.db, h.config, h.storageManager, h.storage, orgID, repoID)
 	if err != nil {
 		log.Printf("[DownloadHistoricFile] Block store not available: %v", err)
-		c.Header("Content-Type", "text/html; charset=utf-8")
-		c.String(http.StatusInternalServerError, errorPageHTML("Internal Error", "Block storage not available."))
+		redirectToFrontendErrorPage(c, http.StatusInternalServerError, "Internal Error", "Block storage not available.")
 		return
 	}
 
@@ -1086,12 +1078,3 @@ func (h *FileViewHandler) ServeHistoricFileRaw(c *gin.Context) {
 	streaming.StreamBlocks(c, c.Request.Context(), blockStore, resolvedIDs, fileKey, "ServeHistoricFileRaw")
 }
 
-// errorPageHTML generates a simple error page
-func errorPageHTML(title, message string) string {
-	data := templates.ErrorPageData{Title: title, Message: message}
-	s, err := templates.RenderString("error_page.html", data)
-	if err != nil {
-		return "<html><body><h1>" + html.EscapeString(title) + "</h1><p>" + html.EscapeString(message) + "</p></body></html>"
-	}
-	return s
-}

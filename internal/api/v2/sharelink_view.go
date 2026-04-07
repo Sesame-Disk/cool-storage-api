@@ -728,8 +728,7 @@ func (h *ShareLinkViewHandler) GetShareLinkFileBootstrap(c *gin.Context) {
 func (h *ShareLinkViewHandler) handleShareLinkDownload(c *gin.Context, sl *shareLinkData, fsHelper *FSHelper, rootFSID string) {
 	// Check download permission
 	if !sl.canDownload {
-		c.Header("Content-Type", "text/html; charset=utf-8")
-		c.String(http.StatusForbidden, errorPageHTML("Download Disabled", "Downloading is not allowed for this share link."))
+		redirectToFrontendErrorPage(c, http.StatusForbidden, "Download Disabled", "Downloading is not allowed for this share link.")
 		return
 	}
 
@@ -738,8 +737,7 @@ func (h *ShareLinkViewHandler) handleShareLinkDownload(c *gin.Context, sl *share
 	// Generate download token using the share link creator's user ID
 	downloadToken, err := h.tokenCreator.CreateLinkDownloadToken(sl.orgID, sl.libraryID, sl.filePath, sl.createdBy)
 	if err != nil {
-		c.Header("Content-Type", "text/html; charset=utf-8")
-		c.String(http.StatusInternalServerError, errorPageHTML("Download Error", "Failed to generate download link."))
+		redirectToFrontendErrorPage(c, http.StatusInternalServerError, "Download Error", "Failed to generate download link.")
 		return
 	}
 

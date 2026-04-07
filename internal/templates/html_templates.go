@@ -67,24 +67,11 @@ func RenderString(name string, data interface{}) (string, error) {
 	return buf.String(), nil
 }
 
-// FilePreviewData holds data for file_preview.html and file_preview_historic.html
-type FilePreviewData struct {
-	Filename       string
-	DownloadURL    string
-	PreviewContent template.HTML // pre-built HTML snippet, trusted
-}
-
 // OnlyOfficeData holds data for onlyoffice_editor.html
 type OnlyOfficeData struct {
 	Filename   string
 	APIJSURL   string
 	ConfigJSON template.JS // raw JSON for JS config, trusted
-}
-
-// ErrorPageData holds data for error_page.html
-type ErrorPageData struct {
-	Title   string
-	Message string
 }
 
 // LoginSuccessData holds data for login_success.html
