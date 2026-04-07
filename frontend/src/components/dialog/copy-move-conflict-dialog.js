@@ -31,7 +31,7 @@ class CopyMoveConflictDialog extends Component {
           <div className="modal-content">
             <div className="modal-header">
               <h5 className="modal-title">{gettext('Name Conflict')}</h5>
-              <button type="button" className="btn-close" onClick={onCancel} aria-label="Close"></button>
+              <button type="button" className="close" onClick={onCancel} aria-label="Close"><span aria-hidden="true">&times;</span></button>
             </div>
             <div className="modal-body">
               <p>{title}</p>

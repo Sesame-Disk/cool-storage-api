@@ -116,7 +116,7 @@ class ChangeRepoPasswordDialog extends React.Component {
               <h5 className="modal-title">
                 <span dangerouslySetInnerHTML={{ __html: title }} className="d-flex mw-100"></span>
               </h5>
-              <button type="button" className="btn-close" onClick={toggleDialog} aria-label="Close"></button>
+              <button type="button" className="close" onClick={toggleDialog} aria-label="Close"><span aria-hidden="true">&times;</span></button>
             </div>
             <div className="modal-body">
               <form id="repo-change-passwd-form" action="" method="post">

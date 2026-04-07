@@ -57,13 +57,13 @@ const usesBootstrapModal = (content) => {
   return /className\s*=\s*(?:"[^"]*\bmodal\b[^"]*\bshow\b[^"]*\bd-block\b[^"]*"|'[^']*\bmodal\b[^']*\bshow\b[^']*\bd-block\b[^']*'|\{`[^`]*\bmodal\b[^`]*\bshow\b[^`]*\bd-block\b[^`]*`\})/.test(content);
 };
 
-// Helper to check for close button pattern
-// Supports both Bootstrap 4 (close) and Bootstrap 5 (btn-close) patterns
+// Helper to check for close button pattern.
+// Project uses Bootstrap 4.x, so the correct class is `close` (not `btn-close`,
+// which is Bootstrap 5 and renders as an empty button here because the SVG
+// background-image rule does not exist in Bootstrap 4's stylesheet).
 const hasCloseButton = (content) => {
   return content.includes('className="close"') ||
-    content.includes("className='close'") ||
-    content.includes('className="btn-close"') ||
-    content.includes("className='btn-close'");
+    content.includes("className='close'");
 };
 
 describe('Modal Pattern Tests - Dialog Components', () => {

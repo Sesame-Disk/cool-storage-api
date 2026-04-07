@@ -204,7 +204,7 @@ class CreateRepoDialog extends React.Component {
           <div className="modal-content">
             <div className="modal-header">
               <h5 className="modal-title">{gettext('New Library')}</h5>
-              <button type="button" className="btn-close" onClick={this.toggle} aria-label="Close"></button>
+              <button type="button" className="close" onClick={this.toggle} aria-label="Close"><span aria-hidden="true">&times;</span></button>
             </div>
             <div className="modal-body">
               <Form>
