@@ -559,15 +559,6 @@ class FileUploader extends React.Component {
   };
 
   retryUploadFile = (resumableFile) => {
-    let { repoID, path } = this.props;
-    let fileName = resumableFile.fileName;
-    let isFile = resumableFile.fileName === resumableFile.relativePath;
-    if (!isFile) {
-      let relative_path = resumableFile.formData.relative_path;
-      let prefix = path === '/' ? (path + relative_path) : (path + '/' + relative_path);
-      fileName = prefix + fileName;
-    }
-
     resumableFile.bootstrap();
     var firedRetry = false;
     resumableFile.resumableObj.on('chunkingComplete', () => {

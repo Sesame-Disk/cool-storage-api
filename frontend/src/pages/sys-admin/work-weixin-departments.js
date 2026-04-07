@@ -52,7 +52,9 @@ class WorkWeixinDepartments extends Component {
     let cloneData = deepCopy(list);
     return cloneData.filter(father => {
       let branchArr = cloneData.filter(child => father.id === child.parentid);
-      branchArr.length > 0 ? father.children = branchArr : '';
+      if (branchArr.length > 0) {
+        father.children = branchArr;
+      }
       return rootIds.indexOf(father.parentid) !== -1;
     });
   };

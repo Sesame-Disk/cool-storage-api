@@ -7,10 +7,6 @@ import { buildFileViewURL } from '../../utils/file-view-url';
 
 class ResultsItem extends React.Component {
 
-  constructor(props) {
-    super(props);
-  }
-
   handlerFileURL = (item) => {
     return item.is_dir ? siteRoot + 'library/' + item.repo_id + '/' + item.repo_name + item.fullpath :
       buildFileViewURL({ repoID: item.repo_id, filePath: item.fullpath });
@@ -62,10 +58,6 @@ const resultsItemPropTypes = {
 ResultsItem.propTypes = resultsItemPropTypes;
 
 class SearchResults extends React.Component {
-
-  constructor(props) {
-    super(props);
-  }
 
   render() {
     const { resultItems, total } = this.props;

@@ -200,7 +200,7 @@ class UserItem extends React.Component {
 
   render() {
     const { highlight, isConfirmInactiveDialogOpen, isRestoreUserDialogOpen } = this.state;
-    let { user, currentTab } = this.props;
+    let { user } = this.props;
     let href = siteRoot + 'org/useradmin/info/' + encodeURIComponent(user.email) + '/';
     let isOperationMenuShow = (user.email !== username) && this.state.showMenu;
     const effectiveStatus = user.status || (user.is_active ? 'active' : 'deactivated');

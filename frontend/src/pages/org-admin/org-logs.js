@@ -6,10 +6,6 @@ import MainPanelTopbar from './main-panel-topbar';
 
 class OrgLogs extends Component {
 
-  constructor(props) {
-    super(props);
-  }
-
   tabItemClick = (param) => {
     this.props.tabItemClick(param);
   };

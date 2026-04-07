@@ -10,10 +10,6 @@ const { repo_name, search_repo } = window.search.pageOptions;
 
 class AdvancedSearch extends React.Component {
 
-  constructor(props) {
-    super(props);
-  }
-
   getFileTypesList = (fileTypes) => {
     const fileTypeItems = [gettext('Text'), gettext('Document'), gettext('Image'), gettext('Video'), gettext('Audio'), 'PDF', 'Markdown'];
     let ftype = [];

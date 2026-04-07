@@ -5,10 +5,6 @@ import MainPanelTopbar from '../main-panel-topbar';
 
 class OrgDesktopDevices extends Component {
 
-  constructor(props) {
-    super(props);
-  }
-
   render() {
     return (
       <Fragment>

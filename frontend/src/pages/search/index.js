@@ -13,10 +13,6 @@ import '../../css/search.css';
 
 class SearchView extends React.Component {
 
-  constructor(props) {
-    super(props);
-  }
-
   onSearchedClick = (selectedItem) => {
     const token = getToken();
     let url = selectedItem.is_dir ?

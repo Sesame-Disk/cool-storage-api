@@ -43,7 +43,7 @@ class Picker extends React.Component {
                   placeholder="yyyy-mm-dd"
                   tabIndex="-1"
                   readOnly
-                  value={value && value.format(FORMAT) || ''}
+                  value={value ? value.format(FORMAT) : ''}
                   className="form-control system-statistic-input"
                 />
               </span>

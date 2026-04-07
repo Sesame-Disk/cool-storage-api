@@ -13,10 +13,6 @@ import UserLink from '../user-link';
 
 class Content extends Component {
 
-  constructor(props) {
-    super(props);
-  }
-
   getPreviousPage = () => {
     this.props.getLogsByPage(this.props.currentPage - 1);
   };

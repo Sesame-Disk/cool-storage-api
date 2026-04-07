@@ -132,7 +132,6 @@ class RepoHistoryView extends React.Component {
                           item={item}
                           repoID={repoID}
                           isFirstCommit={currentPage === 1 && index === 0}
-                          showDetails={hasNextPage || index !== items.length - 1}
                           userPerm={userPerm}
                         />
                       ))}
@@ -173,7 +172,7 @@ class HistoryItem extends React.Component {
   handleMouseOut = () => this.setState({ isIconShown: false });
 
   render() {
-    const { item, repoID, isFirstCommit, showDetails, userPerm } = this.props;
+    const { item, repoID, isFirstCommit, userPerm } = this.props;
     const { isIconShown } = this.state;
 
     let name = '';
@@ -211,7 +210,6 @@ HistoryItem.propTypes = {
   item: PropTypes.object.isRequired,
   repoID: PropTypes.string.isRequired,
   isFirstCommit: PropTypes.bool.isRequired,
-  showDetails: PropTypes.bool.isRequired,
   userPerm: PropTypes.string.isRequired,
 };
 

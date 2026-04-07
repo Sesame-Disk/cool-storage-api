@@ -5,10 +5,6 @@ import MainPanelTopbar from '../main-panel-topbar';
 
 class MobileDevices extends Component {
 
-  constructor(props) {
-    super(props);
-  }
-
   render() {
     return (
       <Fragment>
