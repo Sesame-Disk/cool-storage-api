@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Page not found — SesameFS</title>
+  <link rel="icon" href="/favicon.png">
+  <style>
+    :root {
+      --bg: #f3f5f9;
+      --panel: #ffffff;
+      --ink: #1f2a44;
+      --muted: #67728b;
+      --line: rgba(31, 42, 68, 0.1);
+      --accent: #2d6bff;
+      --shadow: 0 18px 50px rgba(21, 31, 53, 0.1);
+    }
+    * { box-sizing: border-box; }
+    html, body {
+      margin: 0;
+      padding: 0;
+      height: 100%;
+      font-family: "Avenir Next", "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+      color: var(--ink);
+      background: linear-gradient(180deg, #f8fafc, var(--bg));
+    }
+    .wrap {
+      min-height: 100%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 1.5rem;
+    }
+    .card {
+      max-width: 32rem;
+      width: 100%;
+      text-align: center;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 20px;
+      padding: 2.25rem 2rem;
+      box-shadow: var(--shadow);
+    }
+    .code {
+      font-size: 5rem;
+      font-weight: 700;
+      line-height: 1;
+      margin: 0 0 1rem;
+      color: var(--accent);
+    }
+    h1 {
+      font-size: 1.8rem;
+      line-height: 1.1;
+      margin: 0 0 0.8rem;
+      font-weight: 650;
+    }
+    p {
+      color: var(--muted);
+      margin: 0 0 1.6rem;
+      line-height: 1.6;
+    }
+    .actions {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: center;
+      gap: 0.75rem;
+    }
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 2.8rem;
+      padding: 0.75rem 1.15rem;
+      border-radius: 999px;
+      text-decoration: none;
+      font-weight: 600;
+      transition: background 0.16s ease, transform 0.16s ease;
+    }
+    .btn:hover {
+      transform: translateY(-1px);
+    }
+    .btn.primary {
+      color: #fff;
+      background: var(--accent);
+    }
+    .btn.secondary {
+      color: var(--ink);
+      background: #f7f9fc;
+      border: 1px solid rgba(24, 32, 51, 0.12);
+    }
+    @media (max-width: 760px) {
+      .card {
+        padding: 2rem 1.25rem;
+      }
+      .actions {
+        flex-direction: column;
+      }
+      .btn {
+        width: 100%;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <p class="code">404</p>
+      <h1>Page not found</h1>
+      <p>The page you requested does not exist or is no longer available.</p>
+      <div class="actions">
+        <a class="btn primary" href="/">Back to home</a>
+        <a class="btn secondary" href="javascript:window.history.length > 1 ? window.history.back() : window.location.assign('/')">Go back</a>
+      </div>
+    </div>
+  </div>
+</body>
+</html>

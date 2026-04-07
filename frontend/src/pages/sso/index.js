@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { seafileAPI, setAuthToken } from '../../utils/seafile-api';
+import { getReturnURL } from '../../utils/auth-state';
 import { siteTitle } from '../../utils/constants';
 import '../login/login.css';
 
@@ -56,7 +57,10 @@ function SSOPage() {
       const response = await seafileAPI.exchangeOIDCCode(code, state, redirectURI);
 
       if (response.data && response.data.token) {
-        // Store the session token
+        // Store the session token in localStorage. Importantly, setAuthToken
+        // does NOT write the sesamefs_auth cookie — the backend already set
+        // it via Set-Cookie in the OIDC exchange response with the canonical
+        // `email@token` format. Writing it again from JS would corrupt it.
         setAuthToken(response.data.token);
 
         // Store additional user info if needed
@@ -69,14 +73,12 @@ function SSOPage() {
 
         setStatus('success');
 
-        // Get return URL from localStorage or default to home (validate to prevent open redirect)
-        let returnURL = localStorage.getItem('sso_return_url') || '/';
-        localStorage.removeItem('sso_return_url');
-        if (!returnURL.startsWith('/') || returnURL.startsWith('//')) {
-          returnURL = '/';
-        }
+        // getReturnURL reads from sessionStorage and only returns site-relative
+        // paths; missing or unsafe values fall back to '/'.
+        const returnURL = getReturnURL();
 
-        // Redirect to the app
+        // Small delay gives the browser time to persist the Set-Cookie header
+        // from the exchange response before we navigate away.
         setTimeout(() => {
           window.location.href = returnURL;
         }, 1000);
@@ -91,8 +93,8 @@ function SSOPage() {
   };
 
   const handleRetry = () => {
-    // Clear any stored state and redirect to login
-    localStorage.removeItem('sso_return_url');
+    // Drop any half-consumed return URL and go back to login.
+    try { sessionStorage.removeItem('sso_return_url'); } catch (e) { /* ignore */ }
     window.location.href = '/login/';
   };
 

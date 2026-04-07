@@ -88,6 +88,7 @@ import AdminOperationLogs from './admin-logs/operation-logs';
 import AdminLoginLogs from './admin-logs/login-logs';
 
 import AbuseReports from './abuse-reports';
+import NotFoundPage from '../../components/common/not-found-page';
 
 import '../../css/layout.css';
 import '../../css/toolbar.css';
@@ -288,6 +289,13 @@ class SysAdmin extends React.Component {
             <WorkWeixinDepartments path={siteRoot + 'sys/work-weixin'} {...commonProps} />
             <DingtalkDepartments path={siteRoot + 'sys/dingtalk'} {...commonProps} />
             <AbuseReports path={siteRoot + 'sys/abuse-reports'} {...commonProps} />
+            <NotFoundPage
+              default
+              title={window.gettext('System admin page not found')}
+              message={window.gettext('This system admin URL does not exist or is no longer available.')}
+              primaryHref={siteRoot + 'sys/info'}
+              primaryLabel={window.gettext('Back to system admin')}
+            />
           </Router>
         </MainPanel>
         <MediaQuery query="(max-width: 767.8px)">

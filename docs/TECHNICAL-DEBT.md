@@ -219,30 +219,67 @@ The product now has a working user-scoped auth path, but it still lacks a first-
 - browser-assisted device login without pre-created API keys
 
 Those are no longer production blockers for user-driven clients, but they are still legitimate backlog items.
-### Status
-Authenticated file preview pages are still rendered server-side for a narrow set of flows.
 
-### What Remains Backend-Owned
+---
+
+## 7. Real Multilingual Support and Backend HTML Ownership — ⚠️ Deferred
+
+### Status
+Spanish and Chinese support are not blocked by a single missing catalog. The current stack is effectively English-first end to end.
+
+### Why This Is Larger Than a Simple Frontend Translation Pass
+- `internal/api/bootstrap.go` hardcodes `langCode: "en"`, `currentLang.langCode: "en"`, and a one-item `langList`.
+- `internal/api/bootstrap_test.go` asserts that English-only bootstrap shape, so current tests encode the limitation.
+- `internal/templates/html/base.html` still renders `<html lang="en">` and backend-owned HTML pages contain hardcoded English labels.
+- Frontend runtime defaults in `frontend/src/bootstrap/runtime-bootstrap.js` also fall back to English-only bootstrap data.
+- Locale naming is inconsistent across the stack: `zh-CN`, `zh_CN`, and `zh-cn` all appear in different places.
+- Much of the app still depends on `window.gettext(...)` strings. If the gettext catalogs are not loaded for a page, the current fallback is to return the English source string.
+
+### What Real Spanish and Chinese Support Would Require
+1. Make bootstrap language-aware instead of hardcoding English.
+2. Decide and enforce one locale format across backend, frontend, and vendor editors.
+3. Define the supported language list in backend config and expose it through bootstrap.
+4. Implement or replace the advertised `languageChange` flow so language selection persists across requests.
+5. Audit frontend strings that currently rely on English-source `gettext(...)` fallbacks.
+6. Verify vendor editor locale assets and namespace loading for both Seafile editor and SDoc editor.
+7. Localize the remaining backend-served HTML pages or migrate those pages into frontend-owned shells.
+
+### Recommended Near-Term Direction
+Treat real multilingual support as a tracked migration, not a quick patch. For now, keep English as the supported product language and avoid presenting Spanish/Chinese as partially available until bootstrap, locale normalization, and backend-owned HTML are aligned.
+
+### Backend-Owned HTML Surfaces
+The backend still renders a narrow but important set of full HTML pages:
 - `file_preview.html` for inline authenticated file preview
 - `file_preview_historic.html` for historic revision preview
 - `onlyoffice_editor.html` for full-page OnlyOffice editor bootstrap
 - `error_page.html` as the fallback page for those flows
 - `login_success.html` for the desktop-client SSO callback bridge
-The main app, share pages, upload pages, and login are already frontend-owned. Keeping preview/editor HTML in Go means:
-- duplicate presentation responsibility across backend and frontend
-- extra template maintenance for edge-case pages
-- harder UI consistency across product surfaces
+
+### Migration Assessment
+Good candidates to move to frontend-owned shells now:
+- `file_preview.html`
+- `file_preview_historic.html`
+- `error_page.html`
+
+These are mostly presentation shells around data or stream URLs, so moving them would reduce duplicated UI ownership without changing core backend responsibilities.
+
+Medium-complexity migration:
+- `onlyoffice_editor.html`
+
+This can likely move to a frontend-owned shell, but the replacement must preserve secure OnlyOffice bootstrap/config loading and current auth/error handling.
+
+Keep backend-owned for now:
+- `login_success.html`
+
+This page is acting as a browser-to-desktop bridge for `sesamefs://` return URLs. Keeping that bridge in Go is reasonable until there is a dedicated frontend-safe handoff design for native client login completion.
 
 ### Deferred Direction
 Move preview/editor shells into the frontend and leave the backend responsible only for:
 - bootstrap JSON
-- raw file/preview streams
+- raw file and preview streams
 - OnlyOffice config APIs
-- auth/session redirects
-
-- Implementation: ~200 lines in a new `internal/api/v2/access_tokens.go`
-- Endpoints: `POST/GET/DELETE /api/v2.1/user/access-tokens/`
-- Storage: new `personal_access_tokens` Cassandra table
+- auth and session redirects
+- native-client callback bridges that must complete before the SPA loads
 
 ## 8. Fake `UUID@sesamefs.local` Emails — ⚠️ Partially Fixed (2026-02-22)
 

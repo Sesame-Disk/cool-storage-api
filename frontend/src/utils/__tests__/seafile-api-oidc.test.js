@@ -25,6 +25,12 @@ const getSeafileApiContent = () => {
   return fs.readFileSync(filePath, 'utf8');
 };
 
+// Read the auth-state.js file (single source of truth for token storage)
+const getAuthStateContent = () => {
+  const filePath = path.join(__dirname, '..', 'auth-state.js');
+  return fs.readFileSync(filePath, 'utf8');
+};
+
 describe('OIDC API Methods in seafile-api.js', () => {
 
   let apiContent;
@@ -271,8 +277,8 @@ describe('OIDC API Endpoint Patterns', () => {
 
 describe('Token Storage', () => {
 
-  test('TOKEN_KEY constant exists', () => {
-    const content = getSeafileApiContent();
+  test('TOKEN_KEY constant exists in auth-state', () => {
+    const content = getAuthStateContent();
     expect(content).toMatch(/const\s+TOKEN_KEY\s*=\s*['"]sesamefs_auth_token['"]/);
   });
 

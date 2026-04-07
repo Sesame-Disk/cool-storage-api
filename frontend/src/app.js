@@ -38,6 +38,7 @@ import Groups from './pages/groups/groups-view';
 import InvitationsView from './pages/invitations/invitations-view';
 import Wikis from './pages/wikis/wikis';
 import MainContentWrapper from './components/main-content-wrapper';
+import NotFoundPage from './components/common/not-found-page';
 
 // Bootstrap CSS (required for reactstrap components)
 import 'bootstrap/dist/css/bootstrap.min.css';
@@ -394,6 +395,7 @@ class App extends Component {
               <Wikis path={siteRoot + 'published'} onShowSidePanel={this.onShowSidePanel} onSearchedClick={this.onSearchedClick} />
               <PublicSharedView path={siteRoot + 'org/'} onShowSidePanel={this.onShowSidePanel} onSearchedClick={this.onSearchedClick} onTabNavClick={this.tabItemClick} />
               <InvitationsView path={siteRoot + 'invitations/'} onShowSidePanel={this.onShowSidePanel} onSearchedClick={this.onSearchedClick} />
+              <NotFoundPage default />
             </Router>
           </MainPanel>
           {!isStandaloneSettingsRoute && (

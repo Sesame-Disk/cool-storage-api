@@ -1,8 +1,13 @@
 import { SeafileAPI } from 'seafile-js';
 import { serviceURL } from './constants';
 import { quotaWarningInterceptor } from './quota-warning';
-
-const TOKEN_KEY = 'sesamefs_auth_token';
+import {
+  getAuthToken,
+  isAuthenticated as authStateIsAuthenticated,
+  setAuthTokenAndCookie,
+  clearAuth,
+  redirectToLogin,
+} from './auth-state';
 
 // Login bypass for testing - set REACT_APP_BYPASS_LOGIN=true to skip login
 // When enabled, uses 'dev-token-admin' which the backend accepts in dev mode
@@ -34,30 +39,19 @@ function createAPIError(message, responseData, status) {
   return error;
 }
 
-function syncAuthCookie(token) {
-  if (!token) {
-    document.cookie = 'sesamefs_auth=; expires=Thu, 01 Jan 1970 00:00:00 GMT; path=/';
-    return;
-  }
-  document.cookie = 'sesamefs_auth=' + encodeURIComponent(token) + '; path=/; SameSite=Lax';
-}
-
 // Global response interceptor:
 // 1. On success: show quota warning toast if X-Quota-Warning header is present.
-// 2. On 401 error: redirect to login when session expires.
+// 2. On 401 error: clear auth state and redirect to login.
 function setupResponseInterceptor() {
   if (!seafileAPI.req) return;
   seafileAPI.req.interceptors.response.use(
     quotaWarningInterceptor,
     error => {
       if (error.response && error.response.status === 401) {
-        // Clear stale token and session cookie, then redirect to login
-        localStorage.removeItem(TOKEN_KEY);
-        syncAuthCookie('');
-        // Avoid redirect loops: only redirect if not already on login page
+        clearAuth();
+        // Avoid redirect loops: only redirect if not already on login page.
         if (window.location.pathname !== '/login/' && window.location.pathname !== '/login') {
-          const next = encodeURIComponent(window.location.pathname + window.location.search + window.location.hash);
-          window.location.href = '/login/?expired=1&next=' + next;
+          redirectToLogin('expired');
           // Return a pending promise to prevent further .catch() handling
           return new Promise(() => { });
         }
@@ -67,16 +61,15 @@ function setupResponseInterceptor() {
   );
 }
 
-// Initialize with token from localStorage if available
+// Initialize with token from localStorage/cookie if available
 function initAPI() {
-  let token = getToken();
+  let token = getAuthToken();
   const server = serviceURL || window.location.origin;
 
   // If bypass is enabled and no token stored, use the bypass token
   if (BYPASS_LOGIN && !token) {
     token = BYPASS_TOKEN;
-    localStorage.setItem(TOKEN_KEY, token);
-    syncAuthCookie(token);
+    setAuthTokenAndCookie(token);
   }
 
   if (token) {
@@ -96,7 +89,7 @@ function isAuthenticated() {
   if (BYPASS_LOGIN) {
     return true;
   }
-  return !!getToken();
+  return authStateIsAuthenticated();
 }
 
 // Login and store token
@@ -134,9 +127,11 @@ async function login(username, password) {
   const data = await response.json();
 
   if (data.token) {
-    localStorage.setItem(TOKEN_KEY, data.token);
-    syncAuthCookie(data.token);
-    // Reinitialize API with the new token
+    // The backend's /api2/auth-token/ response does NOT set the sesamefs_auth
+    // cookie — that only happens on the OIDC exchange endpoint. For this
+    // legacy password-login path we persist the token in localStorage and
+    // let future requests use the Authorization header.
+    setAuthTokenAndCookie(data.token);
     seafileAPI.init({ server, token: data.token });
     setupResponseInterceptor();
     return data;
@@ -154,13 +149,10 @@ async function logout() {
     const response = await fetch(server + '/api/v2.1/auth/oidc/logout/');
     if (response.ok) {
       const data = await response.json();
-      // Clear local token and session cookie
-      localStorage.removeItem(TOKEN_KEY);
-      syncAuthCookie('');
-
+      clearAuth();
       if (data.logout_url) {
-        // Redirect to OIDC provider's logout endpoint for single logout
-        // This will clear the SSO session and redirect back to our login page
+        // Redirect to OIDC provider's logout endpoint for single logout.
+        // This will clear the SSO session and redirect back to our login page.
         window.location.href = data.logout_url;
         return;
       }
@@ -169,49 +161,25 @@ async function logout() {
     // OIDC logout not available, fall back to local logout
   }
 
-  // Fallback: just clear local token and session cookie, then redirect to login
-  localStorage.removeItem(TOKEN_KEY);
-  syncAuthCookie('');
+  // Fallback: just clear local state and redirect to login.
+  clearAuth();
   window.location.href = '/login/';
 }
 
-// Get stored token
+// Get stored token (delegates to auth-state — single source of truth).
 function getToken() {
-  // 1. Try localStorage (primary storage)
-  const token = localStorage.getItem(TOKEN_KEY);
-  if (token) return token;
-
-  // 2. Fallback: extract from sesamefs_auth cookie (format: "email@token")
-  // The cookie is set by the backend during OIDC login with httpOnly=false,
-  // so JavaScript can read it. This handles cases where localStorage was
-  // cleared (e.g., by a 401 interceptor) but the session cookie is still valid.
-  try {
-    const cookies = document.cookie.split(';');
-    for (let i = 0; i < cookies.length; i++) {
-      const cookie = cookies[i].trim();
-      if (cookie.startsWith('sesamefs_auth=')) {
-        const value = decodeURIComponent(cookie.substring('sesamefs_auth='.length));
-        const lastAt = value.lastIndexOf('@');
-        if (lastAt > 0 && lastAt < value.length - 1) {
-          const cookieToken = value.substring(lastAt + 1);
-          // Re-store in localStorage so subsequent calls are fast
-          localStorage.setItem(TOKEN_KEY, cookieToken);
-          return cookieToken;
-        }
-      }
-    }
-  } catch (e) {
-    // Cookie parsing failed — ignore
-  }
-
-  return null;
+  return getAuthToken();
 }
 
-// Set auth token (used after OIDC login)
+// Set auth token (used after OIDC login).
+//
+// IMPORTANT: does NOT write the `sesamefs_auth` cookie. The backend already set
+// it via Set-Cookie on the OIDC exchange response in the correct `email@token`
+// format. Overwriting it from JS (as the old code did) would corrupt the
+// format and cause the server to reject it.
 function setAuthToken(token) {
   const server = serviceURL || window.location.origin;
-  localStorage.setItem(TOKEN_KEY, token);
-  syncAuthCookie(token);
+  setAuthTokenAndCookie(token);
   seafileAPI.init({ server, token });
   setupResponseInterceptor();
 }

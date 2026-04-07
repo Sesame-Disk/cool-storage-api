@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Something went wrong — SesameFS</title>
+  <link rel="icon" href="/favicon.png">
+  <style>
+    :root {
+      --bg: #11182a;
+      --panel: rgba(18, 24, 40, 0.94);
+      --ink: #eef2f8;
+      --muted: rgba(238, 242, 248, 0.74);
+      --line: rgba(255, 255, 255, 0.1);
+      --accent: #ff855f;
+      --shadow: 0 18px 50px rgba(3, 6, 14, 0.3);
+    }
+    * { box-sizing: border-box; }
+    html, body {
+      margin: 0;
+      padding: 0;
+      height: 100%;
+      font-family: "Avenir Next", "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+      color: var(--ink);
+      background: linear-gradient(180deg, #16203a, var(--bg));
+    }
+    .wrap {
+      min-height: 100%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 1.5rem;
+    }
+    .card {
+      max-width: 32rem;
+      width: 100%;
+      text-align: center;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 20px;
+      padding: 2.25rem 2rem;
+      box-shadow: var(--shadow);
+    }
+    .code {
+      font-size: 5rem;
+      font-weight: 700;
+      line-height: 1;
+      margin: 0 0 1rem;
+      color: var(--accent);
+    }
+    h1 {
+      font-size: 1.8rem;
+      line-height: 1.1;
+      margin: 0 0 0.8rem;
+      font-weight: 650;
+    }
+    p {
+      color: var(--muted);
+      margin: 0 0 1.6rem;
+      line-height: 1.6;
+    }
+    .actions {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: center;
+      gap: 0.75rem;
+    }
+    .btn,
+    button.btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 2.8rem;
+      padding: 0.75rem 1.15rem;
+      border-radius: 999px;
+      text-decoration: none;
+      font-weight: 600;
+      border: 0;
+      cursor: pointer;
+      transition: background 0.16s ease, transform 0.16s ease;
+    }
+    .btn:hover,
+    button.btn:hover {
+      transform: translateY(-1px);
+    }
+    .btn.primary,
+    button.btn.primary {
+      color: #fff;
+      background: var(--accent);
+    }
+    .btn.secondary,
+    button.btn.secondary {
+      color: var(--ink);
+      background: rgba(255, 255, 255, 0.06);
+      border: 1px solid rgba(255, 255, 255, 0.14);
+    }
+    @media (max-width: 760px) {
+      .card {
+        padding: 2rem 1.25rem;
+      }
+      .actions {
+        flex-direction: column;
+      }
+      .btn,
+      button.btn {
+        width: 100%;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <p class="code">500</p>
+      <h1>Something went wrong</h1>
+      <p>We could not complete this request. Try again in a moment.</p>
+      <div class="actions">
+        <button class="btn primary" type="button" onclick="window.location.reload()">Retry</button>
+        <a class="btn secondary" href="/">Back to home</a>
+      </div>
+    </div>
+  </div>
+</body>
+</html>

@@ -37,6 +37,7 @@ import OrgLogsFileUpdate from './org-logs-file-update';
 import OrgLogsPermAudit from './org-logs-perm-audit';
 import OrgSAMLConfig from './org-saml-config';
 import OrgSubscription from './org-subscription';
+import NotFoundPage from '../../components/common/not-found-page';
 
 import '../../css/layout.css';
 import '../../css/toolbar.css';
@@ -124,6 +125,13 @@ class Org extends React.Component {
             {enableMultiADFS &&
               <OrgSAMLConfig path={siteRoot + 'org/samlconfig/'} />
             }
+            <NotFoundPage
+              default
+              title={window.gettext('Organization admin page not found')}
+              message={window.gettext('This organization admin URL does not exist or is no longer available.')}
+              primaryHref={siteRoot + 'org/info/'}
+              primaryLabel={window.gettext('Back to org admin')}
+            />
           </Router>
         </div>
       </div>

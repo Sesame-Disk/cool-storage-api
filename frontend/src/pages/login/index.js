@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { seafileAPI } from '../../utils/seafile-api';
+import { setReturnURL } from '../../utils/auth-state';
 import { siteTitle, loginBGPath } from '../../utils/constants';
 import './login.css';
 
@@ -35,12 +36,10 @@ function LoginPage() {
     setSsoLoading(true);
 
     try {
-      // Store return URL for after SSO (only allow relative paths to prevent open redirect)
-      let returnURL = new URLSearchParams(window.location.search).get('next') || '/';
-      if (!returnURL.startsWith('/') || returnURL.startsWith('//')) {
-        returnURL = '/';
-      }
-      localStorage.setItem('sso_return_url', returnURL);
+      // Store return URL for after SSO. setReturnURL only accepts site-relative
+      // paths, which blocks open redirects while preserving valid deep links.
+      const returnURL = new URLSearchParams(window.location.search).get('next') || '/';
+      setReturnURL(returnURL);
 
       // Get OIDC login URL
       const redirectURI = window.location.origin + '/sso/';

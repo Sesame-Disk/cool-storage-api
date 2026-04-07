@@ -1,10 +1,12 @@
 const fs = require('fs');
+const express = require('express');
 const evalSourceMapMiddleware = require('react-dev-utils/evalSourceMapMiddleware');
 const noopServiceWorkerMiddleware = require('react-dev-utils/noopServiceWorkerMiddleware');
 const ignoredFiles = require('react-dev-utils/ignoredFiles');
 const redirectServedPath = require('react-dev-utils/redirectServedPathMiddleware');
 const paths = require('./paths');
 const getHttpsConfig = require('./getHttpsConfig');
+const { getVendorPublicAssetMappings } = require('./vendorPublicAssets');
 
 const host = process.env.HOST || '0.0.0.0';
 const sockHost = process.env.WDS_SOCKET_HOST;
@@ -108,6 +110,14 @@ module.exports = function (proxy, allowedHost) {
       // middlewares before `redirectServedPath` otherwise will not have any effect
       // This lets us fetch source contents from webpack for the error overlay
       devServer.app.use(evalSourceMapMiddleware(devServer));
+
+      getVendorPublicAssetMappings(paths.appPath).forEach(({ route, source }) => {
+        if (!fs.existsSync(source)) {
+          return;
+        }
+
+        devServer.app.use(route, express.static(source));
+      });
 
       if (fs.existsSync(paths.proxySetup)) {
         // This registers user provided middleware for proxy reasons

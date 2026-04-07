@@ -3,6 +3,7 @@ import PropTypes from 'prop-types';
 import ReactDOM from 'react-dom';
 import { Utils } from '../../utils/utils';
 import { seafileAPI } from '../../utils/seafile-api';
+import { clearAuth } from '../../utils/auth-state';
 import { siteRoot, isPro, gettext, appAvatarURL, enableSSOToThirdpartWebsite } from '../../utils/constants';
 import toaster from '../toast';
 import UpgradeEntry from './upgrade-entry';
@@ -194,7 +195,7 @@ class Account extends Component {
             {(this.state.enableSubscription && isCurrentOrgOwner()) && <a href={siteRoot + 'org/subscription/'} className="item">{gettext('Subscription')}</a>}
             {this.renderMenu()}
             {enableSSOToThirdpartWebsite && <a href={siteRoot + 'sso-to-thirdpart/'} className="item">{gettext('Customer Portal')}</a>}
-            <a href={siteRoot + 'accounts/logout/'} className="item" onClick={() => { localStorage.removeItem('sesamefs_auth_token'); for (const k of Object.keys(localStorage)) { if (k.startsWith('custom_permissions_')) localStorage.removeItem(k); } }}>{gettext('Log out')}</a>
+            <a href={siteRoot + 'accounts/logout/'} className="item" onClick={clearAuth}>{gettext('Log out')}</a>
           </div>
         </div>
       </div>

@@ -91,6 +91,19 @@ server {
         return 403;
     }
 
+    # Upstream failure fallback: when the frontend or API upstream is down,
+    # fetch the branded 500 page from the frontend container instead of
+    # returning nginx's default error page. We only intercept 5xx — 404 is
+    # left to the frontend SPA (handles /not-found internally) and to the
+    # backend (returns JSON errors for API routes).
+    error_page 502 503 504 /__sesamefs_error_500;
+    location = /__sesamefs_error_500 {
+        internal;
+        proxy_pass http://sesamefs_frontend/500.html;
+        proxy_set_header Host $${host};
+        proxy_intercept_errors off;
+    }
+
     # File transfer routes → Go backend
     # These are long-lived connections (large file up/download), not high-frequency short requests.
     # Use a separate rate limit zone to avoid starving API calls with transfer bursts.
