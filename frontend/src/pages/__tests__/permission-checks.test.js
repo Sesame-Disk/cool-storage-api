@@ -120,7 +120,6 @@ describe('Permission System Documentation', () => {
       can_use_global_address_book: 'Can search all users',
       can_generate_share_link: 'Can create public share links',
       can_generate_upload_link: 'Can create upload links',
-      can_invite_guest: 'Can invite guest users',
     };
 
     expect(Object.keys(permissionFlags).length).toBeGreaterThan(0);

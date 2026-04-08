@@ -1629,7 +1629,6 @@ func (s *Server) handleAccountInfo(c *gin.Context) {
 		"can_generate_share_link":            resolved.Capabilities["can_generate_share_link"],
 		"can_generate_upload_link":           resolved.Capabilities["can_generate_upload_link"],
 		"can_send_share_link_mail":           resolved.Capabilities["can_send_share_link_mail"],
-		"can_invite_guest":                   resolved.Capabilities["can_invite_guest"],
 		"can_publish_repo":                   resolved.Capabilities["can_publish_repo"],
 		"can_use_global_address_book":        resolved.Capabilities["can_use_global_address_book"],
 		"can_connect_with_desktop_clients":   resolved.Capabilities["can_connect_with_desktop_clients"],

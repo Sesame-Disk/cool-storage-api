@@ -46,7 +46,6 @@ type EnforcementFeatures struct {
 	CanGenerateShareLink          bool `yaml:"can_generate_share_link" json:"can_generate_share_link"`
 	CanGenerateUploadLink         bool `yaml:"can_generate_upload_link" json:"can_generate_upload_link"`
 	CanSendShareLinkMail          bool `yaml:"can_send_share_link_mail" json:"can_send_share_link_mail"`
-	CanInviteGuest                bool `yaml:"can_invite_guest" json:"can_invite_guest"`
 	CanPublishRepo                bool `yaml:"can_publish_repo" json:"can_publish_repo"`
 	CanUseGlobalAddressBook       bool `yaml:"can_use_global_address_book" json:"can_use_global_address_book"`
 	CanConnectWithDesktopClients  bool `yaml:"can_connect_with_desktop_clients" json:"can_connect_with_desktop_clients"`
@@ -87,7 +86,6 @@ func DefaultHardProfile() EnforcementProfile {
 			CanGenerateShareLink:          true,
 			CanGenerateUploadLink:         true,
 			CanSendShareLinkMail:          false,
-			CanInviteGuest:                false,
 			CanPublishRepo:                false,
 			CanUseGlobalAddressBook:       false,
 			CanConnectWithDesktopClients:  true,
@@ -115,7 +113,6 @@ func DefaultSoftProfile() EnforcementProfile {
 			CanGenerateShareLink:          true,
 			CanGenerateUploadLink:         true,
 			CanSendShareLinkMail:          true,
-			CanInviteGuest:                true,
 			CanPublishRepo:                true,
 			CanUseGlobalAddressBook:       true,
 			CanConnectWithDesktopClients:  true,

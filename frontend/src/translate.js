@@ -13,7 +13,6 @@ gettext('No notifications');
 gettext('Notification Detail');
 gettext('No share links');
 gettext('No upload links');
-gettext('No invitations');
 gettext('No terms and conditions');
 gettext('Tip: libraries deleted {trashReposExpireDays} days ago will be cleaned automatically.');
 gettext('No favorites');

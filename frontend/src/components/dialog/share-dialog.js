@@ -1,12 +1,11 @@
 import React, { Fragment } from 'react';
 import PropTypes from 'prop-types';
 import { TabContent, TabPane, Nav, NavItem, NavLink } from 'reactstrap';
-import { gettext, username, canInvitePeople, additionalShareDialogNote, enableOCM, isPro } from '../../utils/constants';
+import { gettext, username, additionalShareDialogNote, enableOCM, isPro } from '../../utils/constants';
 import ShareLinkPanel from '../share-link-panel';
 import GenerateUploadLink from './generate-upload-link';
 import ShareToUser from './share-to-user';
 import ShareToGroup from './share-to-group';
-import ShareToInvitePeople from './share-to-invite-people';
 import ShareToOtherServer from './share-to-other-server';
 import InternalLink from './internal-link';
 import { seafileAPI } from '../../utils/seafile-api';
@@ -157,13 +156,6 @@ class ShareDialog extends React.Component {
                     </NavLink>
                   </NavItem>
                 )}
-                {canInvitePeople &&
-                  <NavItem role="tab" aria-selected={activeTab === 'invitePeople'} aria-controls="invite-people-panel">
-                    <NavLink className={activeTab === 'invitePeople' ? 'active' : ''} onClick={this.toggle.bind(this, 'invitePeople')} tabIndex="0" onKeyDown={this.onTabKeyDown}>
-                      {gettext('Invite Guest')}
-                    </NavLink>
-                  </NavItem>
-                }
               </Fragment>
             }
             {enableOCM && itemType === 'library' && this.state.isRepoOwner &&
@@ -248,11 +240,6 @@ class ShareDialog extends React.Component {
                     <CustomPermissionManager repoID={this.props.repoID} />
                   </TabPane>
                 )}
-                {(canInvitePeople && activeTab === 'invitePeople') &&
-                  <TabPane tabId="invitePeople" role="tabpanel" id="invite-people-panel">
-                    <ShareToInvitePeople itemPath={this.props.itemPath} repoID={this.props.repoID} />
-                  </TabPane>
-                }
               </Fragment>
             }
             {enableOCM && itemType === 'library' && activeTab === 'shareToOtherServer' &&

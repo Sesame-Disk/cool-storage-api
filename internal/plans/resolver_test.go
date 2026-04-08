@@ -25,7 +25,7 @@ func TestResolveCapabilities_UserHard(t *testing.T) {
 		found[f] = true
 	}
 	expectedUpgrade := []string{
-		"add_group", "invite_guest", "publish_repo",
+		"add_group", "publish_repo",
 		"send_share_link_mail", "use_global_address_book",
 	}
 	for _, f := range expectedUpgrade {
@@ -123,9 +123,6 @@ func TestUpgradeFeaturesNaming(t *testing.T) {
 	}
 	if !found["add_group"] {
 		t.Error("expected 'add_group' in upgrade_features, got full flag name or missing")
-	}
-	if !found["invite_guest"] {
-		t.Error("expected 'invite_guest' in upgrade_features, got full flag name or missing")
 	}
 }
 

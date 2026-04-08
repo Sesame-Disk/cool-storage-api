@@ -1,8 +1,8 @@
 package v2
 
 // admin_extra.go — Additional admin panel endpoints (sysinfo, statistics, devices,
-// web-settings, logs, share links, notifications, institutions, invitations, org
-// user management, search organizations).
+// web-settings, logs, share links, notifications, institutions, org user
+// management, search organizations).
 //
 // These are stub implementations returning realistic empty/default data matching
 // the response format expected by the Seahub-compatible frontend.
@@ -136,31 +136,6 @@ func (h *AdminHandler) AdminUpdateInstitution(c *gin.Context) {
 }
 
 func (h *AdminHandler) AdminDeleteInstitution(c *gin.Context) {
-	callerOrgID := c.GetString("org_id")
-	callerUserID := c.GetString("user_id")
-	if err := h.requireAdminAccess(c, callerOrgID, callerUserID); err != nil {
-		return
-	}
-	c.JSON(http.StatusOK, gin.H{"success": true})
-}
-
-// ============================================================================
-// Invitations — GET/DELETE /admin/invitations/
-// ============================================================================
-
-func (h *AdminHandler) AdminListInvitations(c *gin.Context) {
-	callerOrgID := c.GetString("org_id")
-	callerUserID := c.GetString("user_id")
-	if err := h.requireAdminAccess(c, callerOrgID, callerUserID); err != nil {
-		return
-	}
-	c.JSON(http.StatusOK, gin.H{
-		"invitation_list": []gin.H{},
-		"total_count":     0,
-	})
-}
-
-func (h *AdminHandler) AdminDeleteInvitation(c *gin.Context) {
 	callerOrgID := c.GetString("org_id")
 	callerUserID := c.GetString("user_id")
 	if err := h.requireAdminAccess(c, callerOrgID, callerUserID); err != nil {

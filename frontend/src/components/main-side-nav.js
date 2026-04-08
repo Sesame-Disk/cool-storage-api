@@ -1,14 +1,14 @@
 import React from 'react';
 import PropTypes from 'prop-types';
 import { Link } from '@gatsbyjs/reach-router';
-import { gettext, siteRoot, canInvitePeople, enableOCM, enableOCMViaWebdav } from '../utils/constants';
+import { gettext, siteRoot, enableOCM, enableOCMViaWebdav } from '../utils/constants';
 import { seafileAPI } from '../utils/seafile-api';
 import { Utils } from '../utils/utils';
 import toaster from './toast';
 import Group from '../models/group';
 import InsertAd from '../services/ad';
 
-import { canViewOrg, isDocs, isPro, isDBSqlite3, customNavItems } from '../utils/constants';
+import { canViewOrg, customNavItems } from '../utils/constants';
 
 const propTypes = {
   currentTab: PropTypes.oneOfType([PropTypes.string, PropTypes.number]).isRequired,
@@ -177,7 +177,6 @@ class MainSideNav extends React.Component {
   }
 
   render() {
-    let showActivity = isDocs || isPro || !isDBSqlite3;
     return (
       <div className="side-nav">
         <div className="side-nav-con">
@@ -240,27 +239,13 @@ class MainSideNav extends React.Component {
                 <span className="nav-text">{gettext('Favorites')}</span>
               </Link>
             </li>
-            {showActivity &&
-              <li className="nav-item">
-                <Link className={`nav-link ellipsis ${this.getActiveClass('dashboard')}`} to={siteRoot + 'dashboard/'} title={gettext('Activities')} onClick={(e) => this.tabItemClick(e, 'dashboard')}>
-                  <span className="sf2-icon-clock" aria-hidden="true"></span>
-                  <span className="nav-text">{gettext('Activities')}</span>
-                </Link>
-              </li>
-            }
             {/* Hidden nav items (backend stubs only):
+                - Activities (/api/v2.1/activities/)
                 - Published Libraries (/api/v2.1/wikis/)
                 - Linked Devices (/api2/devices/)
                 - Share Admin (/api/v2.1/shared-repos/, /api/v2.1/shared-folders/)
+                - Invite Guest (removed, no backend)
             */}
-            {canInvitePeople &&
-              <li className="nav-item">
-                <Link className={`nav-link ellipsis ${this.getActiveClass('invitations')}`} to={siteRoot + 'invitations/'} title={gettext('Invite Guest')} onClick={(e) => this.tabItemClick(e, 'invitations')}>
-                  <span className="sf2-icon-invite" aria-hidden="true"></span>
-                  <span className="nav-text">{gettext('Invite Guest')}</span>
-                </Link>
-              </li>
-            }
             {customNavItems && this.renderCustomNavItems()}
           </ul>
           <InsertAd zone='main-side-nav' />

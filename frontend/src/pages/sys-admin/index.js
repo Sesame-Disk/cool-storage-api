@@ -78,7 +78,6 @@ import Notifications from './notifications/notifications';
 import FileScanRecords from './file-scan-records';
 import WorkWeixinDepartments from './work-weixin-departments';
 import DingtalkDepartments from './dingtalk-departments';
-import Invitations from './invitations/invitations';
 import TermsAndConditions from './terms-and-conditions/terms-and-conditions';
 
 import AllVirusFiles from './virus-scan/all-virus-files';
@@ -279,7 +278,6 @@ class SysAdmin extends React.Component {
             <UserLinks path={siteRoot + 'sys/users/:email/shared-links'} {...commonProps} />
             <UserGroups path={siteRoot + 'sys/users/:email/groups'} {...commonProps} />
 
-            <Invitations path={siteRoot + 'sys/invitations'} {...commonProps} />
             <TermsAndConditions path={siteRoot + 'sys/terms-and-conditions/'} {...commonProps} />
 
             <AllVirusFiles path={siteRoot + 'sys/virus-files/all'} {...commonProps} />

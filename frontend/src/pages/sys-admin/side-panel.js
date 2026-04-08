@@ -6,7 +6,7 @@ import {
   gettext, siteRoot, isPro, otherPermission, canViewSystemInfo, canViewStatistic,
   canConfigSystem, canManageLibrary, canManageUser, canManageGroup, canViewUserLog,
   canViewAdminLog, constanceEnabled, multiTenancy, multiInstitution, sysadminExtraEnabled,
-  enableGuestInvitation, enableTermsAndConditions, enableFileScan, enableWorkWeixin, enableDingtalk,
+  enableTermsAndConditions, enableFileScan, enableWorkWeixin, enableDingtalk,
   enableShareLinkReportAbuse, isDBSqlite3
 } from '../../utils/constants';
 
@@ -210,18 +210,6 @@ class SidePanel extends React.Component {
                     >
                       <span className="sf2-icon-security" aria-hidden="true"></span>
                       <span className="nav-text">{gettext('Virus Scan')}</span>
-                    </Link>
-                  </li>
-                }
-                {isPro && enableGuestInvitation && otherPermission &&
-                  <li className="nav-item">
-                    <Link
-                      className={`nav-link ellipsis ${this.getActiveClass('invitations')}`}
-                      to={siteRoot + 'sys/invitations/'}
-                      onClick={() => this.props.tabItemClick('invitations')}
-                    >
-                      <span className="sf2-icon-invite" aria-hidden="true"></span>
-                      <span className="nav-text">{gettext('Invitations')}</span>
                     </Link>
                   </li>
                 }

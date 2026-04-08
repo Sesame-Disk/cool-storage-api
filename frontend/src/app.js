@@ -36,7 +36,6 @@ import RepoHistoryView from './pages/repo-history-view';
 import RepoSnapshot from './pages/repo-snapshot';
 import Group from './pages/groups/group-view';
 import Groups from './pages/groups/groups-view';
-import InvitationsView from './pages/invitations/invitations-view';
 import Wikis from './pages/wikis/wikis';
 import MainContentWrapper from './components/main-content-wrapper';
 import NotFoundPage from './components/common/not-found-page';
@@ -177,7 +176,6 @@ class App extends Component {
       window.app.pageOptions.canGenerateShareLink = data.can_generate_share_link !== undefined ? data.can_generate_share_link : canWrite;
       window.app.pageOptions.canGenerateUploadLink = data.can_generate_upload_link !== undefined ? data.can_generate_upload_link : canWrite;
       window.app.pageOptions.canSendShareLinkMail = data.can_send_share_link_mail !== undefined ? data.can_send_share_link_mail : canWrite;
-      window.app.pageOptions.canInviteGuest = data.can_invite_guest !== undefined ? data.can_invite_guest : false;
       window.app.pageOptions.canPublishRepo = data.can_publish_repo !== undefined ? data.can_publish_repo : false;
 
       // Plan & upgrade CTA
@@ -395,7 +393,6 @@ class App extends Component {
               />
               <Wikis path={siteRoot + 'published'} onShowSidePanel={this.onShowSidePanel} onSearchedClick={this.onSearchedClick} />
               <PublicSharedView path={siteRoot + 'org/'} onShowSidePanel={this.onShowSidePanel} onSearchedClick={this.onSearchedClick} onTabNavClick={this.tabItemClick} />
-              <InvitationsView path={siteRoot + 'invitations/'} onShowSidePanel={this.onShowSidePanel} onSearchedClick={this.onSearchedClick} />
               <NotFoundPage default />
             </Router>
           </MainPanel>

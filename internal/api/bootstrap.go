@@ -461,8 +461,6 @@ func (s *Server) buildAppBootstrapPageOptions(identity bootstrapIdentity, userDa
 		"canGenerateUploadLink":   false,
 		"canSendShareLinkEmail":   false,
 		"canSendShareLinkMail":    false,
-		"canInviteGuest":          false,
-		"canInvitePeople":         false,
 		"canPublishRepo":          false,
 		"canViewOrg":              false,
 		"isSystemStaff":           false,
@@ -514,7 +512,6 @@ func (s *Server) buildAppBootstrapPageOptions(identity bootstrapIdentity, userDa
 	canUpgrade := plans.ComputeCanUpgrade(role, orgData.QuotaPolicy, storagePct, trafficPct, storageOverQuota, trafficOverQuota)
 	isStaff := middleware.IsPlatformSuperAdmin(identity.OrgID, middleware.OrganizationRole(role))
 	canViewOrg := middleware.IsOrgStaff(role)
-	canInviteGuest := resolved.Capabilities["can_invite_guest"]
 	canSendShareLinkEmail := resolved.Capabilities["can_send_share_link_mail"]
 
 	pageOptions["name"] = name
@@ -537,8 +534,6 @@ func (s *Server) buildAppBootstrapPageOptions(identity bootstrapIdentity, userDa
 	pageOptions["canGenerateUploadLink"] = resolved.Capabilities["can_generate_upload_link"]
 	pageOptions["canSendShareLinkEmail"] = canSendShareLinkEmail
 	pageOptions["canSendShareLinkMail"] = canSendShareLinkEmail
-	pageOptions["canInviteGuest"] = canInviteGuest
-	pageOptions["canInvitePeople"] = canInviteGuest
 	pageOptions["canPublishRepo"] = resolved.Capabilities["can_publish_repo"]
 	pageOptions["canViewOrg"] = canViewOrg
 	pageOptions["isSystemStaff"] = isStaff
@@ -638,7 +633,6 @@ func (s *Server) buildSysAdminBootstrapPageOptions(canAccessSysAdmin bool) gin.H
 		"multi_tenancy":                  true,
 		"multi_institution":              false,
 		"sysadmin_extra_enabled":         false,
-		"enable_guest_invitation":        false,
 		"enable_terms_and_conditions":    false,
 		"is_default_admin":               canAccessSysAdmin,
 		"enable_file_scan":               false,

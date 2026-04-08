@@ -65,7 +65,6 @@ window.app = {
     thumbnailSizeForOriginal: 1024,
     repoPasswordMinLength: 8,
     canAddPublicRepo: false,
-    canInvitePeople: true,
     canLockUnlockFile: true,
     customNavItems: [],
     enableShowContactEmailWhenSearchUser: false,

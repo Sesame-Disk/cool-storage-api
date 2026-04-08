@@ -586,9 +586,6 @@ func TestDefaultHardProfile(t *testing.T) {
 	if p.Features.CanAddGroup {
 		t.Error("hard profile: CanAddGroup should be false")
 	}
-	if p.Features.CanInviteGuest {
-		t.Error("hard profile: CanInviteGuest should be false")
-	}
 	if p.Features.CanPublishRepo {
 		t.Error("hard profile: CanPublishRepo should be false")
 	}
@@ -637,9 +634,6 @@ func TestDefaultSoftProfile(t *testing.T) {
 	// Soft profile enables all features
 	if !p.Features.CanAddGroup {
 		t.Error("soft profile: CanAddGroup should be true")
-	}
-	if !p.Features.CanInviteGuest {
-		t.Error("soft profile: CanInviteGuest should be true")
 	}
 	if !p.Features.CanPublishRepo {
 		t.Error("soft profile: CanPublishRepo should be true")

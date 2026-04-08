@@ -124,8 +124,6 @@ func registerAdminLinkRoutes(admin *gin.RouterGroup, h *AdminHandler) {
 	registerPostWithSlashVariants(admin, "/sys-notifications", h.AdminAddSysNotification)
 	registerPutWithSlashVariants(admin, "/sys-notifications/:id", h.AdminUpdateSysNotification)
 	registerDeleteWithSlashVariants(admin, "/sys-notifications/:id", h.AdminDeleteSysNotification)
-	registerGetWithSlashVariants(admin, "/invitations", h.AdminListInvitations)
-	registerDeleteWithSlashVariants(admin, "/invitations/:token", h.AdminDeleteInvitation)
 }
 
 func registerAdminInstitutionRoutes(admin *gin.RouterGroup, h *AdminHandler) {

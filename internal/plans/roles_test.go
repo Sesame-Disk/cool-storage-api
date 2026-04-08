@@ -7,8 +7,8 @@ import (
 )
 
 func TestAllFeatureFlagsCount(t *testing.T) {
-	if len(AllFeatureFlags) != 13 {
-		t.Errorf("AllFeatureFlags has %d entries, want 13", len(AllFeatureFlags))
+	if len(AllFeatureFlags) != 12 {
+		t.Errorf("AllFeatureFlags has %d entries, want 12", len(AllFeatureFlags))
 	}
 }
 
@@ -64,9 +64,6 @@ func TestProfileFeatureMap_HardProfile(t *testing.T) {
 	if m["can_add_group"] {
 		t.Error("hard profile: can_add_group should be false")
 	}
-	if m["can_invite_guest"] {
-		t.Error("hard profile: can_invite_guest should be false")
-	}
 	if !m["can_add_repo"] {
 		t.Error("hard profile: can_add_repo should be true")
 	}
@@ -89,7 +86,7 @@ func TestProfileFeatureMap_SoftProfile(t *testing.T) {
 func TestProfileFeatureMap_KeyCount(t *testing.T) {
 	p := config.DefaultSoftProfile()
 	m := ProfileFeatureMap(p.Features)
-	if len(m) != 13 {
-		t.Errorf("ProfileFeatureMap returned %d keys, want 13", len(m))
+	if len(m) != 12 {
+		t.Errorf("ProfileFeatureMap returned %d keys, want 12", len(m))
 	}
 }
