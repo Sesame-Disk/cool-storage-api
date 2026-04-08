@@ -242,6 +242,13 @@ func listAdminOrganizationStatusBucketDays(session *gocql.Session, status string
 func ListAdminOrganizationRows(session *gocql.Session, statusFilter string) ([]AdminOrganizationProjectionRow, error) {
 	var buckets []string
 	var err error
+	// "all" is an alias for no filter — callers in the admin API pass it from
+	// the query string verbatim. Treat it the same as an empty string so we
+	// query the unfiltered bucket index instead of literally filtering by
+	// status = "all" (which matches zero rows).
+	if statusFilter == "all" {
+		statusFilter = ""
+	}
 	filtered := statusFilter != ""
 	if filtered {
 		statusFilter = normalizeAdminProjectionStatus(statusFilter)
@@ -439,6 +446,13 @@ func listAdminUserStatusBucketDays(session *gocql.Session, status string) ([]str
 func ListAdminUserRows(session *gocql.Session, statusFilter string) ([]AdminUserProjectionRow, error) {
 	var buckets []string
 	var err error
+	// "all" is an alias for no filter — callers in the admin API pass it from
+	// the query string verbatim. Treat it the same as an empty string so we
+	// query the unfiltered bucket index instead of literally filtering by
+	// status = "all" (which matches zero rows).
+	if statusFilter == "all" {
+		statusFilter = ""
+	}
 	filtered := statusFilter != ""
 	if filtered {
 		buckets, err = listAdminUserStatusBucketDays(session, statusFilter)

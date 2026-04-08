@@ -135,13 +135,13 @@ check_response "$response" "201" "Create /source-dir/copyable.txt" || true
 echo ""
 echo "=== Test: Rename File ==="
 info "Renaming /test-file.txt to /renamed-file.txt..."
-response=$(api_post "/api2/repos/$REPO_ID/file/?p=/test-file.txt&operation=rename" "newname=renamed-file.txt")
+response=$(api_post_json "/api2/repos/$REPO_ID/file/?p=/test-file.txt&operation=rename" '{"newname":"renamed-file.txt"}')
 check_response "$response" "200" "Rename file"
 
 echo ""
 echo "=== Test: Rename Directory ==="
 info "Renaming /test-dir to /renamed-dir..."
-response=$(api_post "/api2/repos/$REPO_ID/dir/?p=/test-dir&operation=rename" "newname=renamed-dir")
+response=$(api_post_json "/api2/repos/$REPO_ID/dir/?p=/test-dir&operation=rename" '{"newname":"renamed-dir"}')
 check_response "$response" "200" "Rename directory"
 
 echo ""

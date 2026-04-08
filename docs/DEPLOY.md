@@ -32,6 +32,26 @@ accounts.sesamedisk.com ← sesamefs (OIDC, outbound HTTPS)
 
 ---
 
+## Config Resolution
+
+SesameFS resolves configuration in this order:
+
+1. `internal/config.DefaultConfig()` provides built-in defaults.
+2. The YAML file pointed to by `CONFIG_PATH` is loaded on top of those defaults.
+  In production compose, that is `config.prod.yaml` mounted as `/app/config.yaml`.
+3. Environment variables are applied last via `applyEnvOverrides()`, so env always wins.
+
+That is why `config.prod.yaml` can look thinner than `config.docker.yaml` or a local test config:
+production only needs to pin the non-secret structural values that differ from the code defaults,
+while local/test often pins more knobs explicitly for reproducibility.
+
+GC is a good example:
+
+- If `user_grace_days`, `org_grace_days`, `trash_retention_days`, or `audit_retention_days` are omitted from YAML, SesameFS keeps the built-in defaults from `DefaultConfig()`.
+- If you set `GC_USER_GRACE_DAYS`, `GC_ORG_GRACE_DAYS`, `GC_TRASH_RETENTION_DAYS`, or `GC_AUDIT_RETENTION_DAYS` in `.env`, those override both the YAML and the code defaults.
+
+---
+
 ## Server Requirements
 
 | Resource | Minimum | Recommended |

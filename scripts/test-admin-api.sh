@@ -45,6 +45,8 @@ GUEST_TOKEN="dev-token-guest"
 PLATFORM_ORG_ID="00000000-0000-0000-0000-000000000000"
 # Default org
 DEFAULT_ORG_ID="00000000-0000-0000-0000-000000000001"
+ADMIN_EMAIL="admin@sesamefs.local"
+USER_EMAIL="user@sesamefs.local"
 
 # Will be set during test
 TENANT_ORG_ID=""
@@ -54,6 +56,7 @@ TENANT_USER_ID=""
 # Options
 QUICK_MODE=false
 VERBOSE=false
+CLEANUP_DONE=false
 
 # Colors
 RED='\033[0;31m'
@@ -245,7 +248,7 @@ test_org_crud_superadmin() {
     run_test "Superadmin: get org detail returns 200" "200" "$status"
 
     local detail=$(api_body "GET" "/api/v2.1/admin/organizations/${TENANT_ORG_ID}/" "$SUPERADMIN_TOKEN")
-    local org_name=$(echo "$detail" | jq -r '.name')
+    local org_name=$(echo "$detail" | jq -r '.org_name // .name')
     run_test "Superadmin: org name matches" "true" "$(echo "$org_name" | grep -q "Test Tenant" && echo true || echo false)"
 
     # --- Update org ---
@@ -255,7 +258,7 @@ test_org_crud_superadmin() {
 
     # Verify update
     detail=$(api_body "GET" "/api/v2.1/admin/organizations/${TENANT_ORG_ID}/" "$SUPERADMIN_TOKEN")
-    org_name=$(echo "$detail" | jq -r '.name')
+    org_name=$(echo "$detail" | jq -r '.org_name // .name')
     run_test "Superadmin: org name updated" "true" "$(echo "$org_name" | grep -q "Updated Tenant" && echo true || echo false)"
 }
 
@@ -350,12 +353,12 @@ test_user_management_superadmin() {
 test_tenant_admin_management() {
     log_section "5. Tenant Admin User Management"
 
-    # Admin of default org should be able to list their own org's users
-    local status=$(api_status "GET" "/api/v2.1/admin/organizations/${DEFAULT_ORG_ID}/users/" "$ADMIN_TOKEN")
+    # Org admin should be able to list their own org's users via the org-scoped surface.
+    local status=$(api_status "GET" "/api/v2.1/org/${DEFAULT_ORG_ID}/admin/users/" "$ADMIN_TOKEN")
     run_test "Tenant admin: list own org users returns 200" "200" "$status"
 
-    local body=$(api_body "GET" "/api/v2.1/admin/organizations/${DEFAULT_ORG_ID}/users/" "$ADMIN_TOKEN")
-    local user_count=$(echo "$body" | jq '.users | length')
+    local body=$(api_body "GET" "/api/v2.1/org/${DEFAULT_ORG_ID}/admin/users/" "$ADMIN_TOKEN")
+    local user_count=$(echo "$body" | jq '.user_list | length')
     log_info "Tenant admin sees $user_count users in their org"
     run_test "Tenant admin: sees at least 1 user" "true" "$([ "$user_count" -ge 1 ] && echo true || echo false)"
 }
@@ -369,24 +372,24 @@ test_cross_tenant_isolation() {
 
     # Tenant admin should NOT be able to list users in another org
     if [ -n "$TENANT_ORG_ID" ]; then
-        local status=$(api_status "GET" "/api/v2.1/admin/organizations/${TENANT_ORG_ID}/users/" "$ADMIN_TOKEN")
+        local status=$(api_status "GET" "/api/v2.1/org/${TENANT_ORG_ID}/admin/users/" "$ADMIN_TOKEN")
         run_test "Tenant admin: list other org users returns 403" "403" "$status"
     fi
 
     # Tenant admin should NOT be able to list platform org users
-    local status=$(api_status "GET" "/api/v2.1/admin/organizations/${PLATFORM_ORG_ID}/users/" "$ADMIN_TOKEN")
+    local status=$(api_status "GET" "/api/v2.1/org/${PLATFORM_ORG_ID}/admin/users/" "$ADMIN_TOKEN")
     run_test "Tenant admin: list platform org users returns 403" "403" "$status"
 
     # Regular user should NOT be able to list any org users
-    status=$(api_status "GET" "/api/v2.1/admin/organizations/${DEFAULT_ORG_ID}/users/" "$USER_TOKEN")
+    status=$(api_status "GET" "/api/v2.1/org/${DEFAULT_ORG_ID}/admin/users/" "$USER_TOKEN")
     run_test "User: list org users returns 403" "403" "$status"
 
     # Readonly should NOT be able to list any org users
-    status=$(api_status "GET" "/api/v2.1/admin/organizations/${DEFAULT_ORG_ID}/users/" "$READONLY_TOKEN")
+    status=$(api_status "GET" "/api/v2.1/org/${DEFAULT_ORG_ID}/admin/users/" "$READONLY_TOKEN")
     run_test "Readonly: list org users returns 403" "403" "$status"
 
     # Guest should NOT be able to list any org users
-    status=$(api_status "GET" "/api/v2.1/admin/organizations/${DEFAULT_ORG_ID}/users/" "$GUEST_TOKEN")
+    status=$(api_status "GET" "/api/v2.1/org/${DEFAULT_ORG_ID}/admin/users/" "$GUEST_TOKEN")
     run_test "Guest: list org users returns 403" "403" "$status"
 }
 
@@ -454,7 +457,7 @@ test_role_hierarchy_account_info() {
         fi
 
         local is_staff=$(echo "$info" | jq -r '.is_staff')
-        if [ "$role" = "superadmin" ] || [ "$role" = "admin" ]; then
+        if [ "$role" = "superadmin" ]; then
             run_test "Account info: ${role} is_staff = true" "true" "$is_staff"
         else
             run_test "Account info: ${role} is_staff = false" "false" "$is_staff"
@@ -475,35 +478,46 @@ test_platform_org_protection() {
 }
 
 # =============================================================================
-# Test 9: User Update (Role, Quota)
+# Test 9: Org-Admin User Writes Disabled
 # =============================================================================
 
 test_user_update() {
-    log_section "9. User Update (Role, Quota)"
+    log_section "9. Org-Admin User Writes Disabled"
 
-    # Tenant admin updates a user's quota in their own org
-    local user_id="00000000-0000-0000-0000-000000000002"  # user@sesamefs.local
+    # Org-admin user lifecycle writes are disabled when Accounts is authoritative.
+    local detail=$(api_body "GET" "/api/v2.1/org/${DEFAULT_ORG_ID}/admin/users/${USER_EMAIL}/" "$ADMIN_TOKEN")
+    local original_quota=$(echo "$detail" | jq -r '.quota_total')
+    local original_is_org_staff=$(echo "$detail" | jq -r '.is_org_staff')
 
-    local status=$(api_status "PUT" "/api/v2.1/admin/users/${user_id}/" "$ADMIN_TOKEN" \
-        '{"quota_bytes": 5368709120}')
-    run_test "Tenant admin: update user quota returns 200" "200" "$status"
+    local status=$(api_status "PUT" "/api/v2.1/org/${DEFAULT_ORG_ID}/admin/users/${USER_EMAIL}/" "$ADMIN_TOKEN" \
+        '{"quota_total": 5368709120}')
+    local body=$(api_body "PUT" "/api/v2.1/org/${DEFAULT_ORG_ID}/admin/users/${USER_EMAIL}/" "$ADMIN_TOKEN" \
+        '{"quota_total": 5368709120}')
+    run_test "Tenant admin: update user quota returns 403" "403" "$status"
+    run_test "Tenant admin: user writes managed by Accounts" "accounts" "$(echo "$body" | jq -r '.managed_by // empty')"
 
-    # Tenant admin updates a user's role
-    status=$(api_status "PUT" "/api/v2.1/admin/users/${user_id}/" "$ADMIN_TOKEN" \
-        '{"role": "readonly"}')
-    run_test "Tenant admin: update user role returns 200" "200" "$status"
+    detail=$(api_body "GET" "/api/v2.1/org/${DEFAULT_ORG_ID}/admin/users/${USER_EMAIL}/" "$ADMIN_TOKEN")
+    local updated_quota=$(echo "$detail" | jq -r '.quota_total')
+    run_test "Tenant admin: quota remains unchanged" "$original_quota" "$updated_quota"
 
-    # Restore user role
-    api_status "PUT" "/api/v2.1/admin/users/${user_id}/" "$ADMIN_TOKEN" '{"role": "user"}' > /dev/null
+    status=$(api_status "PUT" "/api/v2.1/org/${DEFAULT_ORG_ID}/admin/users/${USER_EMAIL}/" "$ADMIN_TOKEN" \
+        '{"is_staff": true}')
+    body=$(api_body "PUT" "/api/v2.1/org/${DEFAULT_ORG_ID}/admin/users/${USER_EMAIL}/" "$ADMIN_TOKEN" \
+        '{"is_staff": true}')
+    run_test "Tenant admin: promote user to org staff returns 403" "403" "$status"
+
+    detail=$(api_body "GET" "/api/v2.1/org/${DEFAULT_ORG_ID}/admin/users/${USER_EMAIL}/" "$ADMIN_TOKEN")
+    local updated_is_org_staff=$(echo "$detail" | jq -r '.is_org_staff')
+    run_test "Tenant admin: org staff flag remains unchanged" "$original_is_org_staff" "$updated_is_org_staff"
 
     # Non-superadmin should NOT be able to assign superadmin role
-    status=$(api_status "PUT" "/api/v2.1/admin/users/${user_id}/" "$ADMIN_TOKEN" \
+    status=$(api_status "PUT" "/api/v2.1/admin/users/${USER_EMAIL}/" "$ADMIN_TOKEN" \
         '{"role": "superadmin"}')
     run_test "Tenant admin: assign superadmin role returns 403" "403" "$status"
 
     # Regular user should NOT be able to update anyone
-    status=$(api_status "PUT" "/api/v2.1/admin/users/${user_id}/" "$USER_TOKEN" \
-        '{"role": "admin"}')
+    status=$(api_status "PUT" "/api/v2.1/org/${DEFAULT_ORG_ID}/admin/users/${USER_EMAIL}/" "$USER_TOKEN" \
+        '{"quota_total": 1073741824}')
     run_test "User: update user returns 403" "403" "$status"
 }
 
@@ -514,10 +528,9 @@ test_user_update() {
 test_self_deactivation() {
     log_section "10. Self-Deactivation Prevention"
 
-    # Admin should NOT be able to deactivate themselves
-    local admin_user_id="00000000-0000-0000-0000-000000000001"
-    local status=$(api_status "DELETE" "/api/v2.1/admin/users/${admin_user_id}/" "$ADMIN_TOKEN")
-    run_test "Admin: cannot deactivate self (400)" "400" "$status"
+    # Org-admin self-delete is also blocked because Accounts owns org user lifecycle.
+    local status=$(api_status "DELETE" "/api/v2.1/org/${DEFAULT_ORG_ID}/admin/users/${ADMIN_EMAIL}/" "$ADMIN_TOKEN")
+    run_test "Admin: cannot deactivate self while Accounts manages lifecycle (403)" "403" "$status"
 }
 
 # =============================================================================
@@ -555,6 +568,10 @@ test_superadmin_library_creation() {
 # =============================================================================
 
 cleanup() {
+    if [ "$CLEANUP_DONE" = true ]; then
+        return
+    fi
+
     log_section "Cleanup"
 
     if [ "$QUICK_MODE" = true ]; then
@@ -565,16 +582,21 @@ cleanup() {
         return
     fi
 
-    # Deactivate the test tenant org
+    # Soft-delete the test tenant org. Deleted orgs can remain pending GC.
     if [ -n "$TENANT_ORG_ID" ]; then
         local status=$(api_status "DELETE" "/api/v2.1/admin/organizations/${TENANT_ORG_ID}/" "$SUPERADMIN_TOKEN")
         if [ "$status" = "200" ]; then
-            log_success "Deactivated test tenant org: $TENANT_ORG_ID"
+            log_success "Soft-deleted test tenant org: $TENANT_ORG_ID"
         else
             log_info "Tenant org deactivation returned: $status (may already be cleaned)"
         fi
+        TENANT_ORG_ID=""
     fi
+
+    CLEANUP_DONE=true
 }
+
+trap cleanup EXIT
 
 # =============================================================================
 # Summary

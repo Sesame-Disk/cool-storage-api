@@ -10,10 +10,85 @@ import (
 	"github.com/google/uuid"
 )
 
-// SeedDatabase creates platform org, default organization, and admin users if they don't exist.
-// This runs automatically on application startup.
-// firstSuperAdminEmail: if non-empty, seeds a superadmin in the platform org with this email
-// so the user can log in via OIDC and be matched to the superadmin account on first login.
+type seedUserSpec struct {
+	UserID     uuid.UUID
+	Email      string
+	Name       string
+	Role       string
+	QuotaBytes int64
+}
+
+const devSeedUserQuotaBytes = int64(53687091200) // 50GB
+
+func platformDevSeedUsers() []seedUserSpec {
+	return []seedUserSpec{
+		{
+			UserID:     uuid.MustParse("00000000-0000-0000-0000-000000000099"),
+			Email:      "superadmin@sesamefs.local",
+			Name:       "Platform Super Admin",
+			Role:       "superadmin",
+			QuotaBytes: int64(-2),
+		},
+	}
+}
+
+func platformSeedUsers(devMode bool) []seedUserSpec {
+	if !devMode {
+		return nil
+	}
+	return platformDevSeedUsers()
+}
+
+func defaultDevSeedUsers() []seedUserSpec {
+	return []seedUserSpec{
+		{
+			UserID:     uuid.MustParse("00000000-0000-0000-0000-000000000001"),
+			Email:      "admin@sesamefs.local",
+			Name:       "Admin User",
+			Role:       "admin",
+			QuotaBytes: devSeedUserQuotaBytes,
+		},
+		{
+			UserID:     uuid.MustParse("00000000-0000-0000-0000-000000000002"),
+			Email:      "user@sesamefs.local",
+			Name:       "Test User",
+			Role:       "user",
+			QuotaBytes: devSeedUserQuotaBytes,
+		},
+		{
+			UserID:     uuid.MustParse("00000000-0000-0000-0000-000000000003"),
+			Email:      "readonly@sesamefs.local",
+			Name:       "Read-Only User",
+			Role:       "readonly",
+			QuotaBytes: devSeedUserQuotaBytes,
+		},
+		{
+			UserID:     uuid.MustParse("00000000-0000-0000-0000-000000000004"),
+			Email:      "guest@sesamefs.local",
+			Name:       "Guest User",
+			Role:       "guest",
+			QuotaBytes: devSeedUserQuotaBytes,
+		},
+	}
+}
+
+func defaultSeedUsers(devMode bool) []seedUserSpec {
+	if !devMode {
+		return nil
+	}
+	return defaultDevSeedUsers()
+}
+
+// SeedDatabase creates platform org, default organization, and admin users if
+// they don't exist. This runs automatically on application startup.
+//
+// firstSuperAdminEmail: if non-empty, seeds a superadmin in the platform org
+// with this email so the user can log in via OIDC and be matched to the
+// superadmin account on first login.
+//
+// Each org-scoped seed runs in a single LoggedBatch so canonical rows and
+// admin read-model projections are written atomically — there is no state
+// where the org/user exists but its projection is missing.
 func (db *DB) SeedDatabase(cfg *config.Config, devMode bool, firstSuperAdminEmail string) error {
 	platformOrgID := uuid.MustParse("00000000-0000-0000-0000-000000000000")
 	defaultOrgID := uuid.MustParse("00000000-0000-0000-0000-000000000001")
@@ -42,152 +117,74 @@ func (db *DB) SeedDatabase(cfg *config.Config, devMode bool, firstSuperAdminEmai
 
 	if platformExists && defaultExists {
 		log.Println("✓ Core organizations already seeded")
+		if !devMode {
+			return nil
+		}
 	} else {
 		log.Println("→ Seeding database with default data...")
 	}
 
-	// Create platform organization first (for superadmin users)
 	if !platformExists {
-		if err := db.createPlatformOrganization(platformOrgID); err != nil {
+		if err := db.seedPlatform(platformOrgID, devMode, firstSuperAdminEmail); err != nil {
 			return err
 		}
-		// Create first superadmin in platform org (production bootstrap)
-		if firstSuperAdminEmail != "" {
-			if err := db.createSuperAdmin(platformOrgID, uuid.New(), firstSuperAdminEmail, "System Administrator"); err != nil {
-				return err
-			}
+	} else if devMode {
+		if err := db.ensureSeedUsers(platformOrgID, platformSeedUsers(devMode)); err != nil {
+			return err
 		}
 	}
 
-	// Create default organization
 	if !defaultExists {
-		if err := db.createDefaultOrganization(defaultOrgID, cfg.GetOrganizationTemplate("")); err != nil {
+		if err := db.seedDefault(defaultOrgID, cfg.GetOrganizationTemplate(""), devMode); err != nil {
 			return err
 		}
-	}
-
-	// Create test users in dev mode only
-	if devMode {
-		log.Println("→ Dev mode: Creating test users")
-		if err := db.createTestUsers(defaultOrgID); err != nil {
+	} else if devMode {
+		if err := db.ensureSeedUsers(defaultOrgID, defaultSeedUsers(devMode)); err != nil {
 			return err
 		}
-		if err := db.createSuperAdmin(platformOrgID, uuid.MustParse("00000000-0000-0000-0000-000000000099"), "superadmin@sesamefs.local", "Platform Super Admin"); err != nil {
-			return err
-		}
-	}
-
-	if platformExists && defaultExists && !devMode {
-		log.Println("✓ Database already seeded, skipping")
-		return nil
 	}
 
 	log.Println("✓ Database seeding completed successfully")
 	return nil
 }
 
-// createPlatformOrganization creates the platform-level organization for superadmin users
-func (db *DB) createPlatformOrganization(orgID uuid.UUID) error {
+// seedPlatform writes the platform organization together with any bootstrap
+// superadmins (production first-admin and/or dev-mode superadmin) in a single
+// atomic batch, including all admin read-model projections.
+func (db *DB) seedPlatform(orgID uuid.UUID, devMode bool, firstSuperAdminEmail string) error {
 	now := time.Now()
 
-	query := `
-		INSERT INTO organizations (
-			org_id, name, status, settings, storage_quota, storage_used,
-			chunking_polynomial, storage_config, created_at,
-			plan, quota_policy, billing_cycle,
-			traffic_quota, traffic_upload_quota, traffic_download_quota, max_users,
-			current_period_started_at, current_period_ends_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`
-
+	orgName := "SesameFS Platform"
+	plan := "platform"
+	storageQuota := int64(-1)
 	settings := map[string]string{
 		"theme":    "default",
 		"features": "all",
 	}
-
 	storageConfig := map[string]string{
 		"default_backend": "s3",
 	}
-
 	periodEnd := config.QuotaPeriodEnd(now)
 
-	err := db.Session().Query(query,
-		orgID.String(),
-		"SesameFS Platform",
-		"active",
-		settings,
-		int64(-1), // unlimited storage
-		int64(0),
-		int64(17592186044415),
-		storageConfig,
-		now,
-		"platform", // plan (display)
-		"soft",     // quota_policy
-		"monthly",  // billing_cycle
-		int64(-1),  // traffic_quota unlimited
-		int64(-1),  // traffic_upload_quota unlimited
-		int64(-1),  // traffic_download_quota unlimited
-		int(-1),    // max_users unlimited
-		now,        // current_period_started_at
-		periodEnd,  // current_period_ends_at
-	).Exec()
-
-	if err != nil {
-		log.Printf("✗ Failed to create platform organization: %v", err)
-		return err
+	// Collect the superadmins we will create so the org projection can be
+	// written with the correct users_count + owner fields in a single pass.
+	var admins []seedUserSpec
+	if firstSuperAdminEmail != "" {
+		admins = append(admins, seedUserSpec{
+			UserID:     uuid.New(),
+			Email:      firstSuperAdminEmail,
+			Name:       "System Administrator",
+			Role:       "superadmin",
+			QuotaBytes: int64(-2),
+		})
 	}
-
-	log.Printf("✓ Created platform organization: %s", orgID)
-	return nil
-}
-
-// createSuperAdmin creates a superadmin user in the platform org.
-// userID is fixed for dev seeds; pass uuid.New() for production bootstrapping.
-func (db *DB) createSuperAdmin(platformOrgID uuid.UUID, userID uuid.UUID, email, name string) error {
-	now := time.Now()
+	if devMode {
+		admins = append(admins, platformSeedUsers(devMode)...)
+	}
 
 	batch := db.Session().Batch(gocql.LoggedBatch)
 
 	batch.Query(`
-		INSERT INTO users (
-			org_id, user_id, email, name, role, status,
-			quota_bytes, used_bytes, created_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`,
-		platformOrgID.String(),
-		userID.String(),
-		email,
-		name,
-		"superadmin",
-		"active",
-		int64(-2), // unlimited
-		int64(0),
-		now,
-	)
-
-	batch.Query(`
-		INSERT INTO users_by_email (email, user_id, org_id)
-		VALUES (?, ?, ?)
-	`,
-		email,
-		userID.String(),
-		platformOrgID.String(),
-	)
-
-	if err := batch.Exec(); err != nil {
-		log.Printf("✗ Failed to create superadmin %s: %v", email, err)
-		return err
-	}
-
-	log.Printf("✓ Created superadmin: %s (%s) in platform org", email, userID)
-	return nil
-}
-
-// createDefaultOrganization creates the default organization
-func (db *DB) createDefaultOrganization(orgID uuid.UUID, template config.OrganizationTemplate) error {
-	now := time.Now()
-
-	query := `
 		INSERT INTO organizations (
 			org_id, name, status, settings, storage_quota, storage_used,
 			chunking_polynomial, storage_config, created_at,
@@ -195,113 +192,200 @@ func (db *DB) createDefaultOrganization(orgID uuid.UUID, template config.Organiz
 			traffic_quota, traffic_upload_quota, traffic_download_quota, max_users,
 			current_period_started_at, current_period_ends_at
 		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`
+	`,
+		orgID.String(), orgName, "active", settings,
+		storageQuota, int64(0), int64(17592186044415), storageConfig, now,
+		plan, "soft", "monthly",
+		int64(-1), int64(-1), int64(-1), int(-1),
+		now, periodEnd,
+	)
 
-	periodEnd := template.PeriodEnd(now)
-
-	err := db.Session().Query(query,
-		orgID.String(),
-		"Default Organization",
-		"active",
-		template.Settings,
-		template.StorageQuota,
-		int64(0), // 0 bytes used
-		template.ChunkingPolynomial,
-		template.StorageConfig,
-		now,
-		template.Plan,
-		template.QuotaPolicy,
-		template.BillingCycle,
-		template.TrafficQuota,
-		template.TrafficUploadQuota,
-		template.TrafficDownloadQuota,
-		template.MaxUsers,
-		now,       // current_period_started_at
-		periodEnd, // current_period_ends_at
-	).Exec()
-
-	if err != nil {
-		log.Printf("✗ Failed to create default organization: %v", err)
-		return err
-	}
-
-	log.Printf("✓ Created default organization: %s", orgID)
-	return nil
-}
-
-// createTestUsers creates test users for development/testing
-func (db *DB) createTestUsers(orgID uuid.UUID) error {
-	now := time.Now()
-
-	testUsers := []struct {
-		userID uuid.UUID
-		email  string
-		name   string
-		role   string
-	}{
-		{
-			userID: uuid.MustParse("00000000-0000-0000-0000-000000000001"),
-			email:  "admin@sesamefs.local",
-			name:   "Admin User",
-			role:   "admin",
-		},
-		{
-			userID: uuid.MustParse("00000000-0000-0000-0000-000000000002"),
-			email:  "user@sesamefs.local",
-			name:   "Test User",
-			role:   "user",
-		},
-		{
-			userID: uuid.MustParse("00000000-0000-0000-0000-000000000003"),
-			email:  "readonly@sesamefs.local",
-			name:   "Read-Only User",
-			role:   "readonly",
-		},
-		{
-			userID: uuid.MustParse("00000000-0000-0000-0000-000000000004"),
-			email:  "guest@sesamefs.local",
-			name:   "Guest User",
-			role:   "guest",
-		},
-	}
-
-	for _, user := range testUsers {
-		batch := db.Session().Batch(gocql.LoggedBatch)
-
-		// Insert into users table
+	for _, u := range admins {
 		batch.Query(`
 			INSERT INTO users (
 				org_id, user_id, email, name, role, status,
 				quota_bytes, used_bytes, created_at
 			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-		`,
-			orgID.String(),       // Convert UUID to string
-			user.userID.String(), // Convert UUID to string
-			user.email,
-			user.name,
-			user.role,
-			"active",
-			int64(53687091200), // 50GB for test users
-			int64(0),
-			now,
-		)
-
-		// Insert into users_by_email lookup table
+		`, orgID.String(), u.UserID.String(), u.Email, u.Name,
+			u.Role, "active", u.QuotaBytes, int64(0), now)
 		batch.Query(`
 			INSERT INTO users_by_email (email, user_id, org_id)
 			VALUES (?, ?, ?)
-		`,
-			user.email,
-			user.userID.String(), // Convert UUID to string
-			orgID.String(),       // Convert UUID to string
-		)
+		`, u.Email, u.UserID.String(), orgID.String())
+		AddUpsertAdminUserReadModelQuery(batch, AdminUserProjectionRow{
+			OrgID:      orgID.String(),
+			UserID:     u.UserID.String(),
+			Email:      u.Email,
+			Name:       u.Name,
+			Role:       u.Role,
+			Status:     "active",
+			QuotaBytes: u.QuotaBytes,
+			QuotaUsage: int64(0),
+			CreatedAt:  now,
+		})
+	}
 
-		if err := batch.Exec(); err != nil {
-			log.Printf("✗ Failed to create test user %s: %v", user.email, err)
-			return err
+	orgProjection := AdminOrganizationProjectionRow{
+		OrgID:        orgID.String(),
+		Name:         orgName,
+		Status:       "active",
+		Plan:         plan,
+		StorageQuota: storageQuota,
+		CreatedAt:    now,
+		UsersCount:   len(admins),
+	}
+	if len(admins) > 0 {
+		orgProjection.OwnerEmail = admins[0].Email
+		orgProjection.OwnerName = admins[0].Name
+	}
+	AddUpsertAdminOrganizationReadModelQuery(batch, orgProjection)
+
+	if err := batch.Exec(); err != nil {
+		log.Printf("✗ Failed to seed platform org %s: %v", orgID, err)
+		return fmt.Errorf("seed platform org: %w", err)
+	}
+
+	log.Printf("✓ Created platform organization: %s", orgID)
+	for _, u := range admins {
+		log.Printf("✓ Created superadmin: %s (%s) in platform org", u.Email, u.UserID)
+	}
+	return nil
+}
+
+// seedDefault writes the default organization together with any dev-mode test
+// users in a single atomic batch, including all admin read-model projections.
+func (db *DB) seedDefault(orgID uuid.UUID, template config.OrganizationTemplate, devMode bool) error {
+	now := time.Now()
+	orgName := "Default Organization"
+	periodEnd := template.PeriodEnd(now)
+
+	var users []seedUserSpec
+	if devMode {
+		users = defaultSeedUsers(devMode)
+	}
+
+	batch := db.Session().Batch(gocql.LoggedBatch)
+
+	batch.Query(`
+		INSERT INTO organizations (
+			org_id, name, status, settings, storage_quota, storage_used,
+			chunking_polynomial, storage_config, created_at,
+			plan, quota_policy, billing_cycle,
+			traffic_quota, traffic_upload_quota, traffic_download_quota, max_users,
+			current_period_started_at, current_period_ends_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`,
+		orgID.String(), orgName, "active",
+		template.Settings,
+		template.StorageQuota, int64(0),
+		template.ChunkingPolynomial, template.StorageConfig, now,
+		template.Plan, template.QuotaPolicy, template.BillingCycle,
+		template.TrafficQuota, template.TrafficUploadQuota, template.TrafficDownloadQuota,
+		template.MaxUsers,
+		now, periodEnd,
+	)
+
+	for _, u := range users {
+		batch.Query(`
+			INSERT INTO users (
+				org_id, user_id, email, name, role, status,
+				quota_bytes, used_bytes, created_at
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`, orgID.String(), u.UserID.String(), u.Email, u.Name,
+			u.Role, "active", u.QuotaBytes, int64(0), now)
+		batch.Query(`
+			INSERT INTO users_by_email (email, user_id, org_id)
+			VALUES (?, ?, ?)
+		`, u.Email, u.UserID.String(), orgID.String())
+		AddUpsertAdminUserReadModelQuery(batch, AdminUserProjectionRow{
+			OrgID:      orgID.String(),
+			UserID:     u.UserID.String(),
+			Email:      u.Email,
+			Name:       u.Name,
+			Role:       u.Role,
+			Status:     "active",
+			QuotaBytes: u.QuotaBytes,
+			QuotaUsage: int64(0),
+			CreatedAt:  now,
+		})
+	}
+
+	// Owner fields: prefer a user with an elevated role, else the first user.
+	orgProjection := AdminOrganizationProjectionRow{
+		OrgID:        orgID.String(),
+		Name:         orgName,
+		Status:       "active",
+		Plan:         template.Plan,
+		StorageQuota: template.StorageQuota,
+		CreatedAt:    now,
+		UsersCount:   len(users),
+	}
+	for _, u := range users {
+		if u.Role == "owner" || u.Role == "admin" || u.Role == "superadmin" {
+			orgProjection.OwnerEmail = u.Email
+			orgProjection.OwnerName = u.Name
+			break
+		}
+	}
+	if orgProjection.OwnerEmail == "" && len(users) > 0 {
+		orgProjection.OwnerEmail = users[0].Email
+		orgProjection.OwnerName = users[0].Name
+	}
+	AddUpsertAdminOrganizationReadModelQuery(batch, orgProjection)
+
+	if err := batch.Exec(); err != nil {
+		log.Printf("✗ Failed to seed default org %s: %v", orgID, err)
+		return fmt.Errorf("seed default org: %w", err)
+	}
+
+	log.Printf("✓ Created default organization: %s", orgID)
+	for _, u := range users {
+		log.Printf("✓ Created test user: %s (%s) with role '%s'", u.Email, u.UserID, u.Role)
+	}
+	return nil
+}
+
+func (db *DB) ensureSeedUsers(orgID uuid.UUID, users []seedUserSpec) error {
+	if len(users) == 0 {
+		return nil
+	}
+
+	for _, u := range users {
+		var existingUserID string
+		err := db.Session().Query(`
+			SELECT user_id FROM users WHERE org_id = ? AND user_id = ?
+		`, orgID.String(), u.UserID.String()).Scan(&existingUserID)
+		switch err {
+		case nil:
+			// Canonical row already exists; refresh lookup/projection below.
+		case gocql.ErrNotFound:
+			now := time.Now()
+			if err := db.Session().Query(`
+				INSERT INTO users (
+					org_id, user_id, email, name, role, status,
+					quota_bytes, used_bytes, created_at
+				) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+			`, orgID.String(), u.UserID.String(), u.Email, u.Name, u.Role, "active", u.QuotaBytes, int64(0), now).Exec(); err != nil {
+				return fmt.Errorf("seed: create missing user %s: %w", u.Email, err)
+			}
+			log.Printf("✓ Repaired missing seed user: %s (%s)", u.Email, u.UserID)
+		default:
+			return fmt.Errorf("seed: check user %s: %w", u.Email, err)
 		}
 
-		log.Printf("✓ Created test user: %s (%s) with role '%s'", user.email, user.userID, user.role)
+		if err := db.Session().Query(`
+			INSERT INTO users_by_email (email, user_id, org_id)
+			VALUES (?, ?, ?)
+		`, u.Email, u.UserID.String(), orgID.String()).Exec(); err != nil {
+			return fmt.Errorf("seed: upsert email lookup for %s: %w", u.Email, err)
+		}
+		if err := SyncAdminUserReadModel(db.Session(), orgID.String(), u.UserID.String()); err != nil {
+			return fmt.Errorf("seed: sync admin user projection for %s: %w", u.Email, err)
+		}
+	}
+
+	if err := SyncAdminOrganizationReadModel(db.Session(), orgID.String()); err != nil {
+		return fmt.Errorf("seed: sync org projection for %s: %w", orgID, err)
 	}
 
 	return nil

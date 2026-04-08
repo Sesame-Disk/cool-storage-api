@@ -28,7 +28,7 @@ set -e
 API_URL="${API_URL:-http://localhost:8082}"
 
 # Dev tokens
-ADMIN_TOKEN="dev-token-admin"
+SUPERADMIN_TOKEN="dev-token-superadmin"
 USER_TOKEN="dev-token-user"
 
 # Options
@@ -131,12 +131,20 @@ run_test \
     "Admin can get GC status" \
     "200" "GET" \
     "$API_URL/api/v2.1/admin/gc/status" \
-    "$ADMIN_TOKEN"
+    "$SUPERADMIN_TOKEN"
 
 # Validate status response fields
 check_json_field "Status has 'enabled' field" ".enabled" "true"
 check_json_field "Status has 'dry_run' field" ".dry_run" "false"
-check_json_field "Status has 'queue_size' field (number)" ".queue_size" "0"
+TOTAL=$((TOTAL + 1))
+queue_size=$(jq -r ".queue_size" /tmp/gc_test_response.json 2>/dev/null)
+if echo "$queue_size" | grep -Eq '^[0-9]+$'; then
+    PASSED=$((PASSED + 1))
+    echo -e "${GREEN}[PASS]${NC} Status has 'queue_size' field (number) (.queue_size = $queue_size)"
+else
+    FAILED=$((FAILED + 1))
+    echo -e "${RED}[FAIL]${NC} Status has 'queue_size' field (number) (.queue_size: expected numeric, got '$queue_size')"
+fi
 check_json_field "Status has 'blocks_deleted_total' field" ".blocks_deleted_total" "0"
 
 # Check last_worker_run and last_scan_run exist (may be "never" or a timestamp)
@@ -187,7 +195,7 @@ run_test \
     "Admin can trigger GC worker" \
     "200" "POST" \
     "$API_URL/api/v2.1/admin/gc/run" \
-    "$ADMIN_TOKEN" \
+    "$SUPERADMIN_TOKEN" \
     '{"type":"worker"}'
 
 check_json_field "Worker trigger returns started=true" ".started" "true"
@@ -197,7 +205,7 @@ run_test \
     "Admin can trigger GC scanner" \
     "200" "POST" \
     "$API_URL/api/v2.1/admin/gc/run" \
-    "$ADMIN_TOKEN" \
+    "$SUPERADMIN_TOKEN" \
     '{"type":"scanner"}'
 
 check_json_field "Scanner trigger returns started=true" ".started" "true"
@@ -207,7 +215,7 @@ run_test \
     "Admin can trigger GC with dry_run override" \
     "200" "POST" \
     "$API_URL/api/v2.1/admin/gc/run" \
-    "$ADMIN_TOKEN" \
+    "$SUPERADMIN_TOKEN" \
     '{"type":"worker","dry_run":true}'
 
 check_json_field "Dry run trigger returns started=true" ".started" "true"
@@ -224,7 +232,7 @@ run_test \
     "Status updates after worker trigger" \
     "200" "GET" \
     "$API_URL/api/v2.1/admin/gc/status" \
-    "$ADMIN_TOKEN"
+    "$SUPERADMIN_TOKEN"
 
 # last_worker_run should now be a timestamp (not "never")
 TOTAL=$((TOTAL + 1))
@@ -239,7 +247,7 @@ fi
 
 # Reset dry_run back to false
 curl -s -X POST \
-    -H "Authorization: Token $ADMIN_TOKEN" \
+    -H "Authorization: Token $SUPERADMIN_TOKEN" \
     -H "Content-Type: application/json" \
     -d '{"type":"worker","dry_run":false}' \
     "$API_URL/api/v2.1/admin/gc/run" > /dev/null 2>&1
@@ -253,14 +261,14 @@ run_test \
     "Empty POST body defaults to worker trigger" \
     "200" "POST" \
     "$API_URL/api/v2.1/admin/gc/run" \
-    "$ADMIN_TOKEN" \
+    "$SUPERADMIN_TOKEN" \
     ''
 
 run_test \
     "Invalid JSON body still triggers worker" \
     "200" "POST" \
     "$API_URL/api/v2.1/admin/gc/run" \
-    "$ADMIN_TOKEN" \
+    "$SUPERADMIN_TOKEN" \
     'not-json'
 
 echo ""

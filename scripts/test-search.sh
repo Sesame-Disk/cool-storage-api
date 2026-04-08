@@ -270,14 +270,7 @@ echo ""
 echo -e "${CYAN}--- Test: Root file has correct fullpath ---${NC}"
 
 # Filter by our specific repo_id to avoid picking up old test data
-ROOT_FILE_PATH=$(echo "$BODY" | python3 -c "
-import json, sys
-data = json.load(sys.stdin)
-for r in data.get('results', []):
-    if r.get('repo_id') == '$REPO_ID' and r.get('name') == 'searchable-root.txt':
-        print(r.get('fullpath', ''))
-        break
-" 2>/dev/null)
+ROOT_FILE_PATH=$(echo "$BODY" | jq -r --arg repo "$REPO_ID" '([.results[]? | select(.repo_id == $repo and .name == "searchable-root.txt")][0].fullpath) // ""')
 log_verbose "Root file fullpath: $ROOT_FILE_PATH"
 
 if [ "$ROOT_FILE_PATH" = "/searchable-root.txt" ]; then
@@ -293,14 +286,7 @@ echo ""
 echo -e "${CYAN}--- Test: Nested file has correct fullpath ---${NC}"
 
 # Check level 2 file - filter by our specific repo_id
-L2_FILE_PATH=$(echo "$BODY" | python3 -c "
-import json, sys
-data = json.load(sys.stdin)
-for r in data.get('results', []):
-    if r.get('repo_id') == '$REPO_ID' and r.get('name') == 'searchable-l2.txt':
-        print(r.get('fullpath', ''))
-        break
-" 2>/dev/null)
+L2_FILE_PATH=$(echo "$BODY" | jq -r --arg repo "$REPO_ID" '([.results[]? | select(.repo_id == $repo and .name == "searchable-l2.txt")][0].fullpath) // ""')
 log_verbose "Level 2 file fullpath: $L2_FILE_PATH"
 
 if [ "$L2_FILE_PATH" = "/level1/level2/searchable-l2.txt" ]; then
@@ -315,14 +301,7 @@ fi
 echo ""
 echo -e "${CYAN}--- Test: Deep nested file has correct fullpath ---${NC}"
 
-DEEP_FILE_PATH=$(echo "$BODY" | python3 -c "
-import json, sys
-data = json.load(sys.stdin)
-for r in data.get('results', []):
-    if r.get('repo_id') == '$REPO_ID' and r.get('name') == 'searchable-deep.txt':
-        print(r.get('fullpath', ''))
-        break
-" 2>/dev/null)
+DEEP_FILE_PATH=$(echo "$BODY" | jq -r --arg repo "$REPO_ID" '([.results[]? | select(.repo_id == $repo and .name == "searchable-deep.txt")][0].fullpath) // ""')
 log_verbose "Deep file fullpath: $DEEP_FILE_PATH"
 
 if [ "$DEEP_FILE_PATH" = "/level1/level2/level3/searchable-deep.txt" ]; then

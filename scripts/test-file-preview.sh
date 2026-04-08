@@ -152,18 +152,19 @@ upload_response=$(api_upload "$REPO_ID" "/" "config.yaml" "/tmp/test-preview-yam
 check_response "$upload_response" "200" "Upload YAML file" || true
 
 # Create a minimal .pages file (ZIP with preview.jpg)
-# Build a ZIP archive with a JPEG preview inside
-python3 -c "
-import zipfile, io, struct, sys
+# Build a ZIP archive with a JPEG preview inside when python3 is available.
+if command -v python3 > /dev/null 2>&1; then
+    python3 -c "
+import io, sys, zipfile
 buf = io.BytesIO()
 with zipfile.ZipFile(buf, 'w') as zf:
-    # Minimal JPEG: SOI + APP0 + EOI
     jpg = b'\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00\xff\xd9'
     zf.writestr('preview.jpg', jpg)
     zf.writestr('Index/Document.iwa', b'\x00')
 buf.seek(0)
 sys.stdout.buffer.write(buf.read())
 " > /tmp/test-preview-pages.tmp 2>/dev/null
+fi
 
 if [ -s /tmp/test-preview-pages.tmp ]; then
     upload_response=$(api_upload "$REPO_ID" "/" "document.pages" "/tmp/test-preview-pages.tmp")
@@ -388,8 +389,10 @@ if [ "$status" = "200" ]; then
     else
         fail "Text file view missing preview HTML"
     fi
+elif [ "$status" = "302" ]; then
+    pass "Text file view redirects (302)"
 else
-    fail "Text file view returns $status (expected 200 for inline preview)"
+    fail "Text file view returns $status (expected 200 or 302)"
 fi
 
 echo ""

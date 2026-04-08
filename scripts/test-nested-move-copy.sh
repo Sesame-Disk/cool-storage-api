@@ -1183,14 +1183,18 @@ test_copy_nested_to_root_conflict() {
 cleanup() {
     log_section "Cleanup"
     if [ -n "$REPO_ID" ]; then
-        delete_library "$REPO_ID"
+        delete_library "$REPO_ID" || true
         log_info "Deleted test library: $REPO_ID"
+        REPO_ID=""
     fi
     if [ -n "$REPO_ID2" ]; then
-        delete_library "$REPO_ID2"
+        delete_library "$REPO_ID2" || true
         log_info "Deleted second test library: $REPO_ID2"
+        REPO_ID2=""
     fi
 }
+
+trap cleanup EXIT
 
 # =============================================================================
 # Summary
@@ -1286,11 +1290,8 @@ main() {
     test_move_autorename_source_removed
     test_copy_nested_to_root_conflict
 
-    # Cleanup
-    if [ "$QUICK_MODE" = false ]; then
-        cleanup
-    else
-        log_info "Skipping cleanup (--quick mode) — library: $REPO_ID"
+    if [ "$QUICK_MODE" = true ]; then
+        log_info "Quick mode still performs cleanup on exit"
     fi
 
     print_summary

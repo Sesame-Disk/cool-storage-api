@@ -190,6 +190,18 @@ versioning:
   min_ttl_days: 7
   gc_interval: 24h
 
+gc:
+  enabled: true
+  worker_interval: 30s
+  scan_interval: 24h
+  batch_size: 100
+  grace_period: 1m                    # Shorter than prod so GC timing stays testable
+  dry_run: false
+  user_grace_days: 1                  # Keep a real grace window; GC should purge later
+  org_grace_days: 1                   # Keep a real grace window; tests should tolerate deleted orgs pending GC
+  trash_retention_days: 1
+  audit_retention_days: 365
+
 # File preview and streaming settings
 # These limits protect against memory exhaustion and browser freezing
 fileview:

@@ -80,11 +80,41 @@ func TestSeedDatabase_DevModeUsers(t *testing.T) {
 		assert.Equal(t, 5, expectedUserCount)
 	})
 
-	t.Run("production mode creates only admin", func(t *testing.T) {
-		// In production: only admin user (no superadmin or test users)
-		expectedUserCount := 1
-		assert.Equal(t, 1, expectedUserCount)
+	t.Run("production mode does not create dev-only seed users", func(t *testing.T) {
+		assert.Empty(t, platformSeedUsers(false))
+		assert.Empty(t, defaultSeedUsers(false))
 	})
+}
+
+func TestPlatformDevSeedUsers(t *testing.T) {
+	users := platformDevSeedUsers()
+	if assert.Len(t, users, 1) {
+		assert.Equal(t, "superadmin@sesamefs.local", users[0].Email)
+		assert.Equal(t, "Platform Super Admin", users[0].Name)
+		assert.Equal(t, "superadmin", users[0].Role)
+		assert.Equal(t, int64(-2), users[0].QuotaBytes)
+	}
+}
+
+func TestDefaultDevSeedUsers(t *testing.T) {
+	users := defaultDevSeedUsers()
+	if assert.Len(t, users, 4) {
+		assert.Equal(t, []string{
+			"admin@sesamefs.local",
+			"user@sesamefs.local",
+			"readonly@sesamefs.local",
+			"guest@sesamefs.local",
+		}, []string{users[0].Email, users[1].Email, users[2].Email, users[3].Email})
+		assert.Equal(t, []string{
+			"Admin User",
+			"Test User",
+			"Read-Only User",
+			"Guest User",
+		}, []string{users[0].Name, users[1].Name, users[2].Name, users[3].Name})
+		for _, user := range users {
+			assert.Equal(t, devSeedUserQuotaBytes, user.QuotaBytes)
+		}
+	}
 }
 
 // TestSeedDatabase_PlatformOrg tests that platform org is created

@@ -183,9 +183,12 @@ services:
     command:
       - /bin/sh
       - -c
-      - go test ./... -short -cover && ./scripts/wait-for-http.sh http://sesamefs:8080/health sesamefs && go test -tags integration -v -count=1 -timeout 5m ./internal/integration/...
+      - go test ./... -short -cover && ./scripts/wait-for-http.sh http://sesamefs:8080/health sesamefs && go test -tags integration -v -count=1 -timeout 5m ./internal/integration/... && ./scripts/test.sh api && ./scripts/test.sh oidc
     environment:
       - SESAMEFS_URL=http://sesamefs:8080
+      - SESAMEFS_TEST_IN_CONTAINER=1
+      - SESAMEFS_CLEAN_TEST_REPOS=1
+      - SESAMEFS_FAIL_FAST=1
     depends_on:
       - sesamefs
     profiles:
@@ -200,6 +203,7 @@ services:
     environment:
       - SESAMEFS_URL=http://sesamefs:8080
       - SESAMEFS_TEST_IN_CONTAINER=1
+      - SESAMEFS_CLEAN_TEST_REPOS=1
     depends_on:
       - sesamefs
     profiles:

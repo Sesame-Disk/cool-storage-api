@@ -3,6 +3,13 @@
 # =============================================================================
 # This file contains STRUCTURAL configuration only — no secrets.
 # All secrets (keys, passwords, tokens) come from environment variables.
+# Load order at runtime:
+#   1. internal/config.DefaultConfig() code defaults
+#   2. YAML from CONFIG_PATH (this file in prod)
+#   3. Environment variable overrides via applyEnvOverrides()
+# Any key omitted here keeps the code default.
+# This file is intentionally thinner than config.docker.yaml, which pins more
+# non-secret knobs explicitly for local/test reproducibility.
 #
 # This file is mounted over the config baked into the Docker image:
 #   volumes:
@@ -12,7 +19,8 @@
 #   AUTH_DEV_MODE, AUTH_ALLOW_ANONYMOUS, OIDC_*, ONLYOFFICE_*,
 #   CASSANDRA_*, S3_BUCKET, S3_REGION, S3_ENDPOINT,
 #   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, BILLING_URL,
-#   GC_ENABLED,
+#   GC_ENABLED, GC_USER_GRACE_DAYS, GC_ORG_GRACE_DAYS,
+#   GC_TRASH_RETENTION_DAYS, GC_AUDIT_RETENTION_DAYS,
 #   ACCOUNTS_PASSWORD_CHANGE_URL, ACCOUNTS_DELETE_ACCOUNT_URL,
 #   ACCOUNTS_DISABLE_ORG_USER_WRITES
 # =============================================================================
@@ -181,6 +189,10 @@ gc:
   batch_size: 100
   grace_period: 1h
   dry_run: false
+  user_grace_days: 7
+  org_grace_days: 30
+  trash_retention_days: 30
+  audit_retention_days: 365
 
 # Multi-replica production workaround:
 # leave gc.enabled=true here, but set GC_ENABLED=false on every non-GC replica.

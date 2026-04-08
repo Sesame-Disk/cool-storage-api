@@ -69,6 +69,7 @@ QUICK_MODE=false
 VERBOSE=false
 LIST_ONLY=false
 COMPOSE_BUILD=true
+FAIL_FAST=false
 
 # Parse arguments
 CATEGORY=""
@@ -85,6 +86,9 @@ for arg in "$@"; do
             ;;
         --no-build)
             COMPOSE_BUILD=false
+            ;;
+        --fail-fast)
+            FAIL_FAST=true
             ;;
         --help|-h)
             head -50 "$0" | grep "^#" | sed 's/^# //' | sed 's/^#//'
@@ -105,12 +109,53 @@ done
 # Default category
 CATEGORY="${CATEGORY:-api}"
 
+if [ "${SESAMEFS_FAIL_FAST:-0}" = "1" ]; then
+    FAIL_FAST=true
+fi
+
 # Helper functions
 log_info() { echo -e "${BLUE}[INFO]${NC} $1"; }
 log_success() { echo -e "${GREEN}[PASS]${NC} $1"; }
 log_error() { echo -e "${RED}[FAIL]${NC} $1"; }
 log_warning() { echo -e "${YELLOW}[WARN]${NC} $1"; }
 log_section() { echo -e "\n${CYAN}=== $1 ===${NC}\n"; }
+
+cleanup_backend_test_repos() {
+    if [ "${SESAMEFS_CLEAN_TEST_REPOS:-0}" != "1" ]; then
+        return 0
+    fi
+
+    if [ ! -x "$SCRIPT_DIR/cleanup-test-repos.sh" ]; then
+        log_warning "cleanup-test-repos.sh not found or not executable; skipping stale repo cleanup"
+        return 0
+    fi
+
+    log_info "Cleaning stale backend test repositories"
+    if ! "$SCRIPT_DIR/cleanup-test-repos.sh" "${SESAMEFS_URL:-http://localhost:3000}"; then
+        log_warning "Stale backend test repository cleanup failed; continuing"
+    fi
+}
+
+cleanup_backend_test_orgs() {
+    if [ "${SESAMEFS_CLEAN_TEST_REPOS:-0}" != "1" ]; then
+        return 0
+    fi
+
+    if [ ! -x "$SCRIPT_DIR/cleanup-test-orgs.sh" ]; then
+        log_warning "cleanup-test-orgs.sh not found or not executable; skipping stale org cleanup"
+        return 0
+    fi
+
+    log_info "Cleaning stale backend test organizations"
+    if ! "$SCRIPT_DIR/cleanup-test-orgs.sh"; then
+        log_warning "Stale backend test organization cleanup failed; continuing"
+    fi
+}
+
+cleanup_backend_test_state() {
+    cleanup_backend_test_repos
+    cleanup_backend_test_orgs
+}
 
 # Check if a service is available
 check_backend() {
@@ -217,6 +262,7 @@ run_suite() {
     local script="$2"
     shift 2
     local args="$@"
+    local suite_status=0
 
     TOTAL_SUITES=$((TOTAL_SUITES + 1))
 
@@ -227,21 +273,35 @@ run_suite() {
 
     log_section "Running: $name"
 
+    cleanup_backend_test_state
+
     if [ -f "$SCRIPT_DIR/$script" ]; then
         if BASE_URL="${SESAMEFS_URL:-http://localhost:3000}" API_URL="${SESAMEFS_URL:-http://localhost:3000}" bash "$SCRIPT_DIR/$script" $args; then
             PASSED_SUITES=$((PASSED_SUITES + 1))
             log_success "$name completed"
-            return 0
         else
             FAILED_SUITES=$((FAILED_SUITES + 1))
             log_error "$name failed"
-            return 1
+            suite_status=1
         fi
     else
         log_error "Script not found: $script"
         FAILED_SUITES=$((FAILED_SUITES + 1))
-        return 1
+        suite_status=1
     fi
+
+    cleanup_backend_test_state
+    return $suite_status
+}
+
+run_suite_with_policy() {
+    if ! run_suite "$@"; then
+        if [ "$FAIL_FAST" = true ]; then
+            log_error "Fail-fast enabled; stopping after first failing suite"
+            return 1
+        fi
+    fi
+    return 0
 }
 
 # ==========================================================================
@@ -265,37 +325,40 @@ run_api_tests() {
     fi
 
     log_success "Backend is available"
+    cleanup_backend_test_repos
 
     # Run test suites
-    run_suite "Permission System" "test-permissions.sh" || true
-    run_suite "Admin API + Multi-Tenant" "test-admin-api.sh" || true
-    run_suite "File Operations" "test-file-operations.sh" || true
-    run_suite "Batch Operations" "test-batch-operations.sh" || true
-    run_suite "Library Settings" "test-library-settings.sh" || true
+    run_suite_with_policy "Permission System" "test-permissions.sh" || return 1
+    run_suite_with_policy "Admin API + Multi-Tenant" "test-admin-api.sh" || return 1
+    run_suite_with_policy "File Operations" "test-file-operations.sh" || return 1
+    run_suite_with_policy "Batch Operations" "test-batch-operations.sh" || return 1
+    run_suite_with_policy "Library Settings" "test-library-settings.sh" || return 1
     local nested_args=""
     [ "$QUICK_MODE" = true ] && nested_args="--quick"
-    run_suite "Nested Folders" "test-nested-folders.sh" $nested_args || true
+    run_suite_with_policy "Nested Folders" "test-nested-folders.sh" $nested_args || return 1
     local nested_mc_args=""
     [ "$QUICK_MODE" = true ] && nested_mc_args="--quick"
-    run_suite "Nested Move/Copy" "test-nested-move-copy.sh" $nested_mc_args || true
-    run_suite "Cross-Library Integrity" "test-cross-library-integrity.sh" || true
-    run_suite "Departments" "test-departments.sh" || true
-    run_suite "Admin Panel (Groups + Users)" "test-admin-panel.sh" || true
-    run_suite "Garbage Collection Admin API" "test-gc.sh" || true
-    run_suite "Repo API Tokens" "test-repo-api-tokens.sh" || true
-    run_suite "Directory with_parents" "test-dir-with-parents.sh" || true
-    run_suite "File History API" "test-file-history.sh" || true
-    run_suite "File Preview & Raw Serving" "test-file-preview.sh" || true
-    run_suite "Tag API (Bug Fix)" "test-tags.sh" || true
-    run_suite "Search API (Full Path)" "test-search.sh" || true
-    run_suite "Repo History API" "test-repo-history.sh" || true
-    run_suite "Health, Readiness & Metrics" "test-health.sh" || true
+    run_suite_with_policy "Nested Move/Copy" "test-nested-move-copy.sh" $nested_mc_args || return 1
+    run_suite_with_policy "Cross-Library Integrity" "test-cross-library-integrity.sh" || return 1
+    run_suite_with_policy "Departments" "test-departments.sh" || return 1
+    run_suite_with_policy "Admin Panel (Groups + Users)" "test-admin-panel.sh" || return 1
+    run_suite_with_policy "Garbage Collection Admin API" "test-gc.sh" || return 1
+    run_suite_with_policy "Repo API Tokens" "test-repo-api-tokens.sh" || return 1
+    run_suite_with_policy "Directory with_parents" "test-dir-with-parents.sh" || return 1
+    run_suite_with_policy "File History API" "test-file-history.sh" || return 1
+    run_suite_with_policy "File Preview & Raw Serving" "test-file-preview.sh" || return 1
+    run_suite_with_policy "Tag API (Bug Fix)" "test-tags.sh" || return 1
+    run_suite_with_policy "Search API (Full Path)" "test-search.sh" || return 1
+    run_suite_with_policy "Repo History API" "test-repo-history.sh" || return 1
+    run_suite_with_policy "Health, Readiness & Metrics" "test-health.sh" || return 1
 
     if [ "$QUICK_MODE" = false ]; then
-        run_suite "Encrypted Library Security" "test-encrypted-library-security.sh" || true
+        run_suite_with_policy "Encrypted Library Security" "test-encrypted-library-security.sh" || return 1
     else
         log_info "Skipping encrypted library tests (--quick mode)"
     fi
+
+    [ "$FAILED_SUITES" -eq 0 ]
 }
 
 # ==========================================================================

@@ -312,8 +312,8 @@ if [ "$COMMIT_COUNT" -ge 2 ]; then
     REVERT_COMMIT=$(echo "$COMMIT_IDS" | sed -n '2p')
     info "Reverting to commit: $REVERT_COMMIT"
 
-    response=$(api_post "/api/v2.1/repos/$REPO_ID/file/?p=%2Fhistory-test.txt" \
-        "operation=revert&commit_id=$REVERT_COMMIT&conflict_policy=replace")
+    response=$(api_post_json "/api/v2.1/repos/$REPO_ID/file/?p=%2Fhistory-test.txt&operation=revert" \
+        "{\"commit_id\":\"$REVERT_COMMIT\",\"conflict_policy\":\"replace\"}")
     status=$(get_status "$response")
 
     if [ "$status" = "200" ] || [ "$status" = "201" ]; then
@@ -336,9 +336,9 @@ if [ "$COMMIT_COUNT" -ge 2 ]; then
     REVERT_COMMIT=$(echo "$COMMIT_IDS" | sed -n '2p')
     response=$(curl -s -w "\n%{http_code}" -X POST \
         -H "Authorization: Token $READONLY_TOKEN" \
-        -H "Content-Type: application/x-www-form-urlencoded" \
-        -d "operation=revert&commit_id=$REVERT_COMMIT" \
-        "$BASE_URL/api/v2.1/repos/$REPO_ID/file/?p=%2Fhistory-test.txt")
+        -H "Content-Type: application/json" \
+        -d "{\"commit_id\":\"$REVERT_COMMIT\"}" \
+        "$BASE_URL/api/v2.1/repos/$REPO_ID/file/?p=%2Fhistory-test.txt&operation=revert")
     status=$(get_status "$response")
 
     if [ "$status" = "403" ] || [ "$status" = "401" ]; then

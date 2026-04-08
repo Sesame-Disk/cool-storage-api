@@ -1,7 +1,7 @@
 FROM golang:1.25-trixie
 
 RUN apt-get update \
-	&& apt-get install -y --no-install-recommends curl ca-certificates \
+	&& apt-get install -y --no-install-recommends bash curl ca-certificates jq \
 	&& rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
@@ -10,5 +10,8 @@ COPY go.mod go.sum ./
 RUN go mod download -x 2>&1 | tail -3
 
 COPY . .
+
+RUN find ./scripts -type f -name '*.sh' -exec sed -i 's/\r$//' {} + \
+	&& find ./scripts -type f -name '*.sh' -exec chmod +x {} +
 
 CMD ["go", "test", "./..."]

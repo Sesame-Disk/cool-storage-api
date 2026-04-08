@@ -27,7 +27,7 @@ api_call() {
     if [ -n "$data" ]; then
         curl -s -w "\n%{http_code}" -X "$method" \
             -H "Authorization: Token $TOKEN" \
-            -H "Content-Type: application/x-www-form-urlencoded" \
+            -H "Content-Type: application/json" \
             -d "$data" \
             "${BASE_URL}${endpoint}"
     else
@@ -63,7 +63,7 @@ echo ""
 
 # First, create a test library
 echo -e "${YELLOW}→${NC} Creating test library..."
-RESPONSE=$(api_call POST "/api/v2.1/repos/" "name=tag-test-library-$(date +%s)")
+RESPONSE=$(api_call POST "/api/v2.1/repos/" "{\"repo_name\":\"tag-test-library-$(date +%s)\"}")
 HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
 BODY=$(echo "$RESPONSE" | head -n-1)
 
@@ -93,7 +93,7 @@ trap cleanup EXIT
 
 # Test 1: Create a tag
 echo -e "${CYAN}--- Test 1: Create a tag ---${NC}"
-RESPONSE=$(api_call POST "/api/v2.1/repos/$REPO_ID/repo-tags/" "name=ImportantTag&color=#FF0000")
+RESPONSE=$(api_call POST "/api/v2.1/repos/$REPO_ID/repo-tags/" '{"name":"ImportantTag","color":"#FF0000"}')
 HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
 BODY=$(echo "$RESPONSE" | head -n-1)
 check "Create tag" "200" "$HTTP_CODE" "$BODY"
@@ -121,7 +121,7 @@ echo ""
 
 # Test 3: Update a tag
 echo -e "${CYAN}--- Test 3: Update a tag ---${NC}"
-RESPONSE=$(api_call PUT "/api/v2.1/repos/$REPO_ID/repo-tags/$TAG_ID/" "name=UpdatedTag&color=#00FF00")
+RESPONSE=$(api_call PUT "/api/v2.1/repos/$REPO_ID/repo-tags/$TAG_ID/" '{"name":"UpdatedTag","color":"#00FF00"}')
 HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
 BODY=$(echo "$RESPONSE" | head -n-1)
 check "Update tag" "200" "$HTTP_CODE" "$BODY"
@@ -165,7 +165,7 @@ echo ""
 echo -e "${CYAN}--- Test 6: Delete tag with file associations (Cassandra primary key test) ---${NC}"
 
 # Create a new tag
-RESPONSE=$(api_call POST "/api/v2.1/repos/$REPO_ID/repo-tags/" "name=FileTag&color=#0000FF")
+RESPONSE=$(api_call POST "/api/v2.1/repos/$REPO_ID/repo-tags/" '{"name":"FileTag","color":"#0000FF"}')
 HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
 BODY=$(echo "$RESPONSE" | head -n-1)
 TAG_ID2=$(echo "$BODY" | grep -o '"repo_tag_id":[0-9]*' | head -1 | cut -d':' -f2)

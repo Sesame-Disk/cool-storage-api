@@ -1,5 +1,10 @@
 # SesameFS Configuration
-# Copy this file to config.yaml and customize for your environment
+# Copy this file to config.yaml and customize for your environment.
+# Runtime load order is:
+#   1. internal/config.DefaultConfig() code defaults
+#   2. YAML from CONFIG_PATH (typically this file copied to config.yaml)
+#   3. Environment variable overrides via applyEnvOverrides()
+# Keys omitted here keep the code defaults.
 
 server:
   port: ":8080"
@@ -189,6 +194,18 @@ versioning:
   default_ttl_days: 90                # 0 = keep forever
   min_ttl_days: 7
   gc_interval: 24h
+
+gc:
+  enabled: true
+  worker_interval: 30s
+  scan_interval: 24h
+  batch_size: 100
+  grace_period: 1h
+  dry_run: false
+  user_grace_days: 7                 # soft-deleted users purge after this many days
+  org_grace_days: 30                 # soft-deleted orgs purge after this many days
+  trash_retention_days: 30
+  audit_retention_days: 365
 
 # File preview and streaming settings
 # These limits protect against memory exhaustion and browser freezing

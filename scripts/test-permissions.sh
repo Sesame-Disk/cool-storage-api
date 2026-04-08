@@ -12,6 +12,7 @@ ADMIN_TOKEN="dev-token-admin"
 USER_TOKEN="dev-token-user"
 READONLY_TOKEN="dev-token-readonly"
 GUEST_TOKEN="dev-token-guest"
+DEFAULT_ORG_ID="00000000-0000-0000-0000-000000000001"
 
 # Colors for output
 RED='\033[0;31m'
@@ -27,6 +28,9 @@ FAILED_TESTS=0
 
 # Test result tracking
 declare -a FAILED_TEST_NAMES
+CLEANUP_DONE=false
+ORG_UPGRADE_ACTIVE=false
+ORG_ORIGINAL_PAYLOAD=""
 
 log_info() {
     echo -e "${BLUE}[INFO]${NC} $1"
@@ -100,6 +104,26 @@ api_get_body() {
     curl -s -H "Authorization: Token $token" "$url"
 }
 
+api_json() {
+    local method="$1"
+    local endpoint="$2"
+    local token="$3"
+    local data="$4"
+
+    local url="${API_URL}${endpoint}"
+    local opts=(-s -H "Content-Type: application/json")
+
+    if [ -n "$token" ]; then
+        opts+=(-H "Authorization: Token $token")
+    fi
+
+    if [ -n "$data" ]; then
+        opts+=(-d "$data")
+    fi
+
+    curl "${opts[@]}" -X "$method" "$url"
+}
+
 # Cleanup test libraries created by this test run
 cleanup_test_libraries() {
     log_info "Cleaning up test libraries..."
@@ -114,6 +138,58 @@ cleanup_test_libraries() {
         done
     done
 }
+
+upgrade_default_org_for_permission_tests() {
+    log_info "Upgrading default org for permission tests"
+
+    local org_body
+    org_body=$(api_get_body "/api/v2.1/admin/organizations/${DEFAULT_ORG_ID}/" "$SUPERADMIN_TOKEN")
+
+    ORG_ORIGINAL_PAYLOAD=$(echo "$org_body" | jq -c '{
+        storage_quota: .storage_quota,
+        traffic_quota: .traffic_quota,
+        traffic_upload_quota: .traffic_upload_quota,
+        traffic_download_quota: .traffic_download_quota,
+        max_users: .max_users,
+        plan: .plan,
+        quota_policy: .quota_policy,
+        billing_cycle: .billing_cycle,
+        current_period_started_at: .current_period_started_at,
+        current_period_ends_at: .current_period_ends_at
+    }')
+
+    local upgrade_payload='{"storage_quota":-1,"traffic_quota":-1,"traffic_upload_quota":-1,"traffic_download_quota":-1,"max_users":50,"plan":"test-soft-upgraded","quota_policy":"soft","billing_cycle":"monthly"}'
+    local status
+    status=$(api_call "PUT" "/api/v2.1/admin/organizations/${DEFAULT_ORG_ID}/" "$SUPERADMIN_TOKEN" "$upgrade_payload")
+    run_test "Default org upgrade returns 200" "200" "$status"
+
+    if [ "$status" = "200" ]; then
+        ORG_UPGRADE_ACTIVE=true
+    fi
+}
+
+restore_default_org_after_permission_tests() {
+    if [ "$ORG_UPGRADE_ACTIVE" != true ] || [ -z "$ORG_ORIGINAL_PAYLOAD" ]; then
+        return
+    fi
+
+    log_info "Restoring default org after permission tests"
+    api_json "PUT" "/api/v2.1/admin/organizations/${DEFAULT_ORG_ID}/" "$SUPERADMIN_TOKEN" "$ORG_ORIGINAL_PAYLOAD" > /dev/null 2>&1 || true
+    ORG_UPGRADE_ACTIVE=false
+}
+
+cleanup() {
+    if [ "$CLEANUP_DONE" = true ]; then
+        return
+    fi
+
+    log_section "Cleanup"
+    restore_default_org_after_permission_tests
+    cleanup_test_libraries
+    CLEANUP_DONE=true
+}
+
+trap cleanup EXIT
 
 # ============================================
 # Account Info Tests
@@ -139,7 +215,7 @@ test_account_info() {
 
     run_test "Admin: can_add_repo should be true" "true" "$admin_can_add"
     run_test "Admin: role should be admin" "admin" "$admin_role"
-    run_test "Admin: name should not be UUID" "System Administrator" "$admin_name"
+    run_test "Admin: name should match seeded name" "Admin User" "$admin_name"
 
     # Test user account info
     local user_info=$(api_get_body "/api2/account/info/" "$USER_TOKEN")
@@ -386,6 +462,7 @@ main() {
 
     # Clean up any leftover test data before starting
     cleanup_test_libraries
+    upgrade_default_org_for_permission_tests
 
     # Run test suites
     test_account_info
@@ -396,8 +473,7 @@ main() {
     test_write_operations
 
     # Final cleanup
-    log_section "Cleanup"
-    cleanup_test_libraries
+    cleanup
 
     # Print summary
     print_summary

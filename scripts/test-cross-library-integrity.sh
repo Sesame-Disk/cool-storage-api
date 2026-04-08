@@ -695,14 +695,18 @@ test_cross_copy_to_subdir_downloadable() {
 cleanup() {
     log_section "Cleanup"
     if [ -n "$SRC_REPO" ]; then
-        delete_library "$SRC_REPO"
+        delete_library "$SRC_REPO" || true
         log_info "Deleted source library: $SRC_REPO"
+        SRC_REPO=""
     fi
     if [ -n "$DST_REPO" ]; then
-        delete_library "$DST_REPO"
+        delete_library "$DST_REPO" || true
         log_info "Deleted destination library: $DST_REPO"
+        DST_REPO=""
     fi
 }
+
+trap cleanup EXIT
 
 # =============================================================================
 # Summary
@@ -763,7 +767,6 @@ main() {
     test_cross_copy_multiple_downloadable
     test_cross_copy_to_subdir_downloadable
 
-    cleanup
     print_summary
 
     [ $FAILED_TESTS -eq 0 ]

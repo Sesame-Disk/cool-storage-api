@@ -45,6 +45,10 @@ TOTAL_TESTS=0
 PASSED_TESTS=0
 FAILED_TESTS=0
 declare -a FAILED_TEST_NAMES
+CLEANUP_DONE=false
+
+REPO_A=""
+REPO_B=""
 
 # =============================================================================
 # Helpers
@@ -130,6 +134,28 @@ run_test_not_contains() {
         log_fail "$description (unexpectedly found '$unexpected_substr')"
     fi
 }
+
+cleanup() {
+    if [ "$CLEANUP_DONE" = true ]; then
+        return
+    fi
+
+    if [ -n "$REPO_A" ]; then
+        api_status "DELETE" "/api/v2.1/repos/${REPO_A}/" "$ADMIN_TOKEN" "" > /dev/null 2>&1 || true
+        log_info "Deleted test library A: $REPO_A"
+        REPO_A=""
+    fi
+
+    if [ -n "$REPO_B" ]; then
+        api_status "DELETE" "/api/v2.1/repos/${REPO_B}/" "$ADMIN_TOKEN" "" > /dev/null 2>&1 || true
+        log_info "Deleted test library B: $REPO_B"
+        REPO_B=""
+    fi
+
+    CLEANUP_DONE=true
+}
+
+trap cleanup EXIT
 
 # =============================================================================
 # Pre-flight
@@ -292,16 +318,13 @@ run_test "RW token for B cannot list A" "403" "$STATUS"
 
 log_section "7. Invalid and missing tokens"
 
-# Completely bogus token (will fall through to anonymous in dev mode)
-# 404 is correct: invalid tokens fall through to anonymous in dev mode.
-# Returning 404 (not 403) prevents information disclosure — anonymous users
-# should not be able to discover which library IDs exist.
+# Completely bogus token
 STATUS=$(api_status "GET" "/api/v2.1/repos/${REPO_A}/dir/?p=/" "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef")
-run_test "Bogus token cannot access library" "404" "$STATUS"
+run_test "Bogus token cannot access library" "401" "$STATUS"
 
 # Empty token
 STATUS=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Token " "${API_URL}/api/v2.1/repos/${REPO_A}/dir/?p=/")
-run_test "Empty token cannot access library" "404" "$STATUS"
+run_test "Empty token cannot access library" "401" "$STATUS"
 
 # =============================================================================
 # 8. Token permission update
@@ -351,10 +374,8 @@ STATUS=$(api_status "DELETE" "/api/v2.1/repos/${REPO_A}/repo-api-tokens/rw-test-
 run_test "Delete token returns 200" "200" "$STATUS"
 
 # Verify deleted token no longer works
-# 404 is correct: deleted tokens fall through to anonymous in dev mode.
-# Returning 404 (not 403) prevents information disclosure.
 STATUS=$(api_status "GET" "/api/v2.1/repos/${REPO_A}/dir/?p=/" "$RW_TOKEN")
-run_test "Deleted token cannot access library" "404" "$STATUS"
+run_test "Deleted token cannot access library" "401" "$STATUS"
 
 # Verify RO token still works
 STATUS=$(api_status "GET" "/api/v2.1/repos/${REPO_A}/dir/?p=/" "$RO_TOKEN")
@@ -378,11 +399,7 @@ run_test "Non-owner cannot create tokens" "403" "$STATUS"
 # =============================================================================
 
 log_section "Cleanup"
-
-api_status "DELETE" "/api/v2.1/repos/${REPO_A}/" "$ADMIN_TOKEN" > /dev/null
-log_info "Deleted test library A: $REPO_A"
-api_status "DELETE" "/api/v2.1/repos/${REPO_B}/" "$ADMIN_TOKEN" > /dev/null
-log_info "Deleted test library B: $REPO_B"
+cleanup
 
 # =============================================================================
 # Summary
