@@ -123,7 +123,7 @@ class MoreMenu extends React.PureComponent {
         >
         </DropdownToggle>
         <DropdownMenu className="drop-list" right={true}>
-          {index !== 0 && <a href="#" onClick={onItemRestore}><DropdownItem>{gettext('Restore')}</DropdownItem></a>}
+          {index !== 0 && <DropdownItem tag="button" onClick={onItemRestore}>{gettext('Restore')}</DropdownItem>}
           {canDownload && <a href={downloadUrl}><DropdownItem>{gettext('Download')}</DropdownItem></a>}
           <a href={viewUrl}><DropdownItem>{gettext('View')}</DropdownItem></a>
           {/*canCompare && <a href={diffUrl}><DropdownItem>{gettext('Diff')}</DropdownItem></a>*/}

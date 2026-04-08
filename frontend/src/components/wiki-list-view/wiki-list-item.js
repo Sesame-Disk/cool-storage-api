@@ -151,7 +151,9 @@ class WikiListItem extends Component {
         <td><a href={userProfileURL} target='_blank' rel="noreferrer">{wiki.owner_nickname}</a></td>
         <td>{moment(wiki.updated_at).fromNow()}</td>
         <td className="text-center cursor-pointer">
-          <a href="#" role="button" aria-label={gettext('Unpublish')} title={gettext('Unpublish')} className={deleteIcon} onClick={this.onDeleteToggle}></a>
+          <button type="button" aria-label={gettext('Unpublish')} title={gettext('Unpublish')} className={`${deleteIcon} border-0 bg-transparent p-0`} onClick={this.onDeleteToggle}>
+            <span className="sr-only">{gettext('Unpublish')}</span>
+          </button>
         </td>
       </tr>
     );

@@ -51,9 +51,9 @@ class FileHistory extends React.Component {
         <div className="flex-fill d-flex flex-column text-truncate">
           <div className="history-header file-history-header flex-shrink-0">
             <div className="title d-flex mw-100">
-              <a href="#" className="go-back" title="Back" onClick={this.onBackClick}>
+              <button type="button" className="go-back border-0 bg-transparent p-0" title="Back" aria-label="Back" onClick={this.onBackClick}>
                 <span className="fas fa-chevron-left"></span>
-              </a>
+              </button>
               <span className="name text-truncate" title={fileName}>{fileName}</span>
             </div>
           </div>

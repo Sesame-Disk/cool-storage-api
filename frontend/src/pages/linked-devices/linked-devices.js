@@ -145,7 +145,9 @@ class Item extends Component {
         <td>{data.last_login_ip}</td>
         <td>{moment(data.last_accessed).fromNow()}</td>
         <td>
-          <a href="#" className={opClasses} title={gettext('Unlink')} role="button" aria-label={gettext('Unlink')} onClick={this.handleClick}></a>
+          <button type="button" className={`${opClasses} border-0 bg-transparent p-0`} title={gettext('Unlink')} aria-label={gettext('Unlink')} onClick={this.handleClick}>
+            <span className="sr-only">{gettext('Unlink')}</span>
+          </button>
         </td>
       </tr>
     );

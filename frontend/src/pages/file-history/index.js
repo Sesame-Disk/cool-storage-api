@@ -203,7 +203,6 @@ class FileHistory extends React.Component {
   };
 
   renderBreadcrumb = () => {
-    const { repoID } = this.props;
     const { filePath, repoName } = this.state;
 
     // Split path into segments: /folder/sub/file.txt → ['folder', 'sub', 'file.txt']
@@ -215,17 +214,17 @@ class FileHistory extends React.Component {
       <div className="path-container">
         <Link to={`${siteRoot}my-libs/`} className="normal">{gettext('Libraries')}</Link>
         <span className="path-split">/</span>
-        <a className="path-link" data-path="/" onClick={this.onPathClick} href="#">
+        <button type="button" className="path-link border-0 bg-transparent p-0" data-path="/" onClick={this.onPathClick}>
           {repoName || gettext('Library')}
-        </a>
+        </button>
         {folders.map((folder, i) => {
           const partialPath = '/' + parts.slice(0, i + 1).join('/') + '/';
           return (
             <Fragment key={i}>
               <span className="path-split">/</span>
-              <a className="path-link" data-path={partialPath} onClick={this.onPathClick} href="#">
+              <button type="button" className="path-link border-0 bg-transparent p-0" data-path={partialPath} onClick={this.onPathClick}>
                 {folder}
-              </a>
+              </button>
             </Fragment>
           );
         })}

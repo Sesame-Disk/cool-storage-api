@@ -231,9 +231,9 @@ class FileHistory extends React.Component {
         <div id="main" onScroll={this.onScrollHandler}>
           <div className="old-history-main">
             <Fragment>
-              <a href="#" className="go-back" title="Back" onClick={this.goBack}>
+              <button type="button" className="go-back border-0 bg-transparent p-0" title="Back" aria-label="Back" onClick={this.goBack}>
                 <span className="fas fa-chevron-left"></span>
-              </a>
+              </button>
               <h2><span className="file-name">{fileName}</span>{' '}{gettext('History Versions')}</h2>
             </Fragment>
             <Fragment>

@@ -173,9 +173,11 @@ class DeletedRepoItem extends Component {
         <td className="name">{this.props.repo.repo_name}</td>
         <td className="update">{localTime}</td>
         <td>
-          <a href="#" onClick={this.restoreDeletedRepo} title={gettext('Restore')}
-            role="button" aria-label={gettext('Restore')}
-            className={`sf2-icon-reply action-icon ${this.state.highlight ? '' : 'vh'}`}></a>
+          <button type="button" onClick={this.restoreDeletedRepo} title={gettext('Restore')}
+            aria-label={gettext('Restore')}
+            className={`sf2-icon-reply action-icon ${this.state.highlight ? '' : 'vh'} border-0 bg-transparent p-0`}>
+            <span className="sr-only">{gettext('Restore')}</span>
+          </button>
         </td>
       </tr>
     );

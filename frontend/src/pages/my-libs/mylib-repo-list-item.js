@@ -349,9 +349,9 @@ class MylibRepoListItem extends React.Component {
           </td>
         )}
         <td className="text-center">
-          <a href="#" role="button" aria-label={this.state.isStarred ? gettext('Unstar') : gettext('Star')} onClick={this.onToggleStarRepo}>
+          <button type="button" aria-label={this.state.isStarred ? gettext('Unstar') : gettext('Star')} className="border-0 bg-transparent p-0" onClick={this.onToggleStarRepo}>
             <i className={`fa-star ${this.state.isStarred ? 'fas' : 'far star-empty'}`}></i>
-          </a>
+          </button>
         </td>
         <td><img src={iconUrl} title={iconTitle} alt={iconTitle} width="24" /></td>
         <td>
@@ -375,8 +375,12 @@ class MylibRepoListItem extends React.Component {
         <td>
           {(repo.repo_name && this.state.isOpIconShow) && (
             <div>
-              <a href="#" className="op-icon sf2-icon-share" title={gettext('Share')} role="button" aria-label={gettext('Share')} onClick={this.onShareToggle}></a>
-              <a href="#" className="op-icon sf2-icon-delete" title={gettext('Delete')} role="button" aria-label={gettext('Delete')} onClick={this.onDeleteToggle}></a>
+              <button type="button" className="op-icon sf2-icon-share border-0 bg-transparent p-0" title={gettext('Share')} aria-label={gettext('Share')} onClick={this.onShareToggle}>
+                <span className="sr-only">{gettext('Share')}</span>
+              </button>
+              <button type="button" className="op-icon sf2-icon-delete border-0 bg-transparent p-0" title={gettext('Delete')} aria-label={gettext('Delete')} onClick={this.onDeleteToggle}>
+                <span className="sr-only">{gettext('Delete')}</span>
+              </button>
               <MylibRepoMenu
                 isPC={true}
                 repo={this.props.repo}

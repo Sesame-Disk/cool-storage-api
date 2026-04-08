@@ -121,8 +121,12 @@ class LinkItem extends React.Component {
             ) : '--'}
           </td>
           <td>
-            <a href="#" role="button" onClick={this.onCopyIconClicked} className={`sf2-icon-copy action-icon ${isItemOpVisible ? '' : 'invisible'}`} title={gettext('Copy')} aria-label={gettext('Copy')}></a>
-            <a href="#" role="button" onClick={this.onDeleteIconClicked} className={`sf2-icon-delete action-icon ${isItemOpVisible ? '' : 'invisible'}`} title={gettext('Delete')} aria-label={gettext('Delete')}></a>
+            <button type="button" onClick={this.onCopyIconClicked} className={`sf2-icon-copy action-icon ${isItemOpVisible ? '' : 'invisible'} border-0 bg-transparent p-0`} title={gettext('Copy')} aria-label={gettext('Copy')}>
+              <span className="sr-only">{gettext('Copy')}</span>
+            </button>
+            <button type="button" onClick={this.onDeleteIconClicked} className={`sf2-icon-delete action-icon ${isItemOpVisible ? '' : 'invisible'} border-0 bg-transparent p-0`} title={gettext('Delete')} aria-label={gettext('Delete')}>
+              <span className="sr-only">{gettext('Delete')}</span>
+            </button>
           </td>
         </tr>
         {this.state.isDeleteShareLinkDialogOpen && (
