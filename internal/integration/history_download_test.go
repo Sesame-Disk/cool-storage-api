@@ -146,19 +146,43 @@ func TestHistoryDownloadRoundTrip(t *testing.T) {
 	})
 }
 
-// TestHistoryDownloadMissingObjID tests that the endpoint returns an error for missing obj_id.
+// historyDownloadNoRedirect issues a GET that does NOT follow redirects, so we
+// can inspect the 302 → /file-error/ contract used by the historic file handlers.
+func historyDownloadNoRedirect(t *testing.T, path string) *http.Response {
+	t.Helper()
+	client := &http.Client{
+		Timeout: 30 * time.Second,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	req, err := http.NewRequest(http.MethodGet, baseURL+path, nil)
+	if err != nil {
+		t.Fatalf("failed to create request: %v", err)
+	}
+	req.Header.Set("Authorization", "Token "+adminClient.token)
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("GET %s failed: %v", path, err)
+	}
+	return resp
+}
+
+// TestHistoryDownloadMissingObjID verifies that a request with no obj_id redirects
+// to the frontend error page with status=400 and a "Missing obj_id" message.
 func TestHistoryDownloadMissingObjID(t *testing.T) {
 	name := fmt.Sprintf("inttest-histnoid-%d", time.Now().UnixNano())
 	repoID := createTestLibrary(t, adminClient, name)
 
-	resp := adminClient.Get(t, fmt.Sprintf("/repo/%s/history/download?p=/test.txt", repoID))
+	resp := historyDownloadNoRedirect(t, fmt.Sprintf("/repo/%s/history/download?p=/test.txt", repoID))
+	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusBadRequest {
-		t.Errorf("expected 400 for missing obj_id, got %d", resp.StatusCode)
+	if resp.StatusCode != http.StatusFound {
+		t.Errorf("expected 302 redirect for missing obj_id, got %d", resp.StatusCode)
 	}
-	body := responseBody(t, resp)
-	if !strings.Contains(body, "Missing obj_id") {
-		t.Error("response should mention missing obj_id")
+	loc := resp.Header.Get("Location")
+	if !strings.Contains(loc, "/file-error/") || !strings.Contains(loc, "status=400") || !strings.Contains(loc, "Missing+obj_id") {
+		t.Errorf("expected redirect to /file-error/ with status=400 and missing obj_id message, got %q", loc)
 	}
 }
 
@@ -269,31 +293,39 @@ func TestRegionPinnedHistoricReadPaths(t *testing.T) {
 	}
 }
 
-// TestHistoryDownloadInvalidObjID tests that a nonexistent obj_id returns 404.
+// TestHistoryDownloadInvalidObjID verifies that a nonexistent obj_id redirects
+// to the frontend error page with status=404.
 func TestHistoryDownloadInvalidObjID(t *testing.T) {
 	name := fmt.Sprintf("inttest-histbadid-%d", time.Now().UnixNano())
 	repoID := createTestLibrary(t, adminClient, name)
 
-	resp := adminClient.Get(t, fmt.Sprintf("/repo/%s/history/download?obj_id=nonexistent_id_abc123&p=/test.txt", repoID))
+	resp := historyDownloadNoRedirect(t, fmt.Sprintf("/repo/%s/history/download?obj_id=nonexistent_id_abc123&p=/test.txt", repoID))
+	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusNotFound {
-		t.Errorf("expected 404 for invalid obj_id, got %d", resp.StatusCode)
+	if resp.StatusCode != http.StatusFound {
+		t.Errorf("expected 302 redirect for invalid obj_id, got %d", resp.StatusCode)
 	}
-	body := responseBody(t, resp)
-	if !strings.Contains(body, "file revision could not be found") {
-		t.Errorf("response should mention file revision not found, got: %s", body)
+	loc := resp.Header.Get("Location")
+	if !strings.Contains(loc, "/file-error/") || !strings.Contains(loc, "status=404") {
+		t.Errorf("expected redirect to /file-error/ with status=404, got %q", loc)
 	}
 }
 
-// TestHistoryDownloadInvalidPath tests that invalid path returns 400.
+// TestHistoryDownloadInvalidPath verifies that p=/ redirects to the frontend
+// error page with status=400.
 func TestHistoryDownloadInvalidPath(t *testing.T) {
 	name := fmt.Sprintf("inttest-histbadpath-%d", time.Now().UnixNano())
 	repoID := createTestLibrary(t, adminClient, name)
 
-	resp := adminClient.Get(t, fmt.Sprintf("/repo/%s/history/download?obj_id=abc&p=/", repoID))
+	resp := historyDownloadNoRedirect(t, fmt.Sprintf("/repo/%s/history/download?obj_id=abc&p=/", repoID))
+	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusBadRequest {
-		t.Errorf("expected 400 for path=/, got %d", resp.StatusCode)
+	if resp.StatusCode != http.StatusFound {
+		t.Errorf("expected 302 redirect for path=/, got %d", resp.StatusCode)
+	}
+	loc := resp.Header.Get("Location")
+	if !strings.Contains(loc, "/file-error/") || !strings.Contains(loc, "status=400") {
+		t.Errorf("expected redirect to /file-error/ with status=400, got %q", loc)
 	}
 }
 
