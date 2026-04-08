@@ -3302,10 +3302,10 @@ func (h *FileHandler) RevertFile(c *gin.Context) {
 	filePath := c.Query("p")
 
 	var restoreFileReq struct {
-		CommitID       string `json:"commit_id"`
-		ConflictPolicy string `json:"conflict_policy"`
+		CommitID       string `json:"commit_id" form:"commit_id"`
+		ConflictPolicy string `json:"conflict_policy" form:"conflict_policy"`
 	}
-	c.ShouldBindJSON(&restoreFileReq) //nolint:errcheck
+	c.ShouldBind(&restoreFileReq) //nolint:errcheck
 	commitID := restoreFileReq.CommitID
 	conflictPolicy := restoreFileReq.ConflictPolicy
 
@@ -3447,10 +3447,10 @@ func (h *FileHandler) RevertDirectory(c *gin.Context) {
 	dirPath := c.Query("p")
 
 	var revertDirReq struct {
-		CommitID       string `json:"commit_id"`
-		ConflictPolicy string `json:"conflict_policy"`
+		CommitID       string `json:"commit_id" form:"commit_id"`
+		ConflictPolicy string `json:"conflict_policy" form:"conflict_policy"`
 	}
-	c.ShouldBindJSON(&revertDirReq) //nolint:errcheck
+	c.ShouldBind(&revertDirReq) //nolint:errcheck
 	commitID := revertDirReq.CommitID
 	conflictPolicy := revertDirReq.ConflictPolicy
 

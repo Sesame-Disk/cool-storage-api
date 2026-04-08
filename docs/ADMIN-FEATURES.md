@@ -622,6 +622,10 @@ The org admin uses two route groups:
 - **`/api/v2.1/org/admin/`** — Endpoints without org_id in URL (org from JWT): links, upload-links, logs
 - **`/api/v2.1/org/:org_id/admin/`** — Endpoints with org_id in URL: users, groups, repos, trash, etc.
 
+Default operational safeguard:
+- `accounts.disable_org_user_writes=true` by default, so tenant org-admin membership/user-lifecycle write routes are blocked unless explicitly re-enabled.
+- Platform superadmins still bypass that tenant lock as an operational fallback, although Accounts should prefer the `/api/v2.1/admin/...` surface.
+
 ### Fully Implemented Endpoints
 
 #### Org Info (2 endpoints)
@@ -634,16 +638,16 @@ The org admin uses two route groups:
 | Method | Endpoint | Handler | Notes |
 |--------|----------|---------|-------|
 | GET | `/org/:org_id/admin/users/` | `ListOrgUsers` | Paginated, batch user resolution |
-| POST | `/org/:org_id/admin/users/` | `AddOrgUser` | Creates user in org |
+| POST | `/org/:org_id/admin/users/` | `AddOrgUser` | Creates user in org. Blocked for tenant org-admin by default. |
 | GET | `/org/:org_id/admin/users/:email/` | `GetOrgUser` | |
-| PUT | `/org/:org_id/admin/users/:email/` | `UpdateOrgUser` | Role, quota, name |
-| DELETE | `/org/:org_id/admin/users/:email/` | `DeleteOrgUser` | |
-| PUT | `/org/:org_id/admin/users/:email/set-password/` | `ResetOrgUserPassword` | |
+| PUT | `/org/:org_id/admin/users/:email/` | `UpdateOrgUser` | Role, quota, name. Blocked for tenant org-admin by default. |
+| DELETE | `/org/:org_id/admin/users/:email/` | `DeleteOrgUser` | Blocked for tenant org-admin by default. |
+| PUT | `/org/:org_id/admin/users/:email/set-password/` | `ResetOrgUserPassword` | Blocked for tenant org-admin by default. |
 | GET | `/org/:org_id/admin/users/:email/repos/` | `GetOrgUserOwnedRepos` | |
 | GET | `/org/:org_id/admin/users/:email/beshared-repos/` | `GetOrgUserBesharedRepos` | |
 | GET | `/org/:org_id/admin/search-user/` | `SearchOrgUser` | |
-| POST | `/org/:org_id/admin/import-users/` | `ImportOrgUsers` | CSV import |
-| POST | `/org/:org_id/admin/invite-users/` | `InviteOrgUsers` | Email invitations |
+| POST | `/org/:org_id/admin/import-users/` | `ImportOrgUsers` | CSV import. Blocked for tenant org-admin by default. |
+| POST | `/org/:org_id/admin/invite-users/` | `InviteOrgUsers` | Email invitations. Blocked for tenant org-admin by default. |
 
 #### Groups (8 endpoints + members 4 + libraries 1)
 | Method | Endpoint | Handler | Notes |

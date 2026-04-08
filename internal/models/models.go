@@ -17,16 +17,16 @@ type Organization struct {
 	ChunkingPolynomial int64             `json:"-"` // Per-tenant security
 	StorageConfig      map[string]string `json:"storage_config,omitempty"`
 	// Plan and quota fields — set by external billing service
-	Plan                 string    `json:"plan,omitempty"`
-	QuotaPolicy          string    `json:"quota_policy,omitempty"`  // "hard" (free) | "soft" (paid)
-	BillingCycle         string    `json:"billing_cycle,omitempty"` // "monthly" | "annual"
+	Plan                   string     `json:"plan,omitempty"`
+	QuotaPolicy            string     `json:"quota_policy,omitempty"`              // "hard" (free) | "soft" (paid)
+	BillingCycle           string     `json:"billing_cycle,omitempty"`             // "monthly" | "annual"
 	CurrentPeriodStartedAt *time.Time `json:"current_period_started_at,omitempty"` // quota period start
 	CurrentPeriodEndsAt    *time.Time `json:"current_period_ends_at,omitempty"`    // quota period end
-	TrafficQuota         int64     `json:"traffic_quota"`           // combined monthly limit, -1=N/A
-	TrafficUploadQuota   int64     `json:"traffic_upload_quota"`    // upload monthly limit, -1=unlimited
-	TrafficDownloadQuota int64     `json:"traffic_download_quota"`  // download monthly limit, -1=unlimited
-	MaxUsers             int       `json:"max_users"`               // hard cap, -1=unlimited
-	CreatedAt            time.Time `json:"created_at"`
+	TrafficQuota           int64      `json:"traffic_quota"`                       // combined monthly limit; values <= 0 mean unlimited in SesameFS enforcement
+	TrafficUploadQuota     int64      `json:"traffic_upload_quota"`                // upload monthly limit; values <= 0 mean unlimited in SesameFS enforcement
+	TrafficDownloadQuota   int64      `json:"traffic_download_quota"`              // download monthly limit; values <= 0 mean unlimited in SesameFS enforcement
+	MaxUsers               int        `json:"max_users"`                           // hard cap; values <= 0 mean unlimited in SesameFS enforcement
+	CreatedAt              time.Time  `json:"created_at"`
 }
 
 // User represents a user in the system

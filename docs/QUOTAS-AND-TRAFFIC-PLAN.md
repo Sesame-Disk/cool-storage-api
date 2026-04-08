@@ -64,22 +64,24 @@ Paid plans include 1 user. Beyond what is included:
 
 Billing sets these fields on each org via `PUT /admin/organizations/:org_id/`:
 
+For org-level quotas, any value `<= 0` means SesameFS treats that dimension as unlimited for enforcement. That does not imply free billing: Accounts may still charge overages, extra included capacity, or extra seats commercially.
+
 | Field | Type | Free | Starter | Enterprise | Meaning |
 |-------|------|------|---------|------------|---------|
 | `plan` | string | `"free"` | `"starter"` | `"enterprise-acme"` | Plan name |
 | `billing_cycle` | string | `"monthly"` | `"monthly"` | `"annual"` | Billing cycle |
 | `current_period_started_at` | timestamp | org create time | billing anchor | billing anchor | Current quota period start |
 | `current_period_ends_at` | timestamp | derived or provided | derived or provided | derived or provided | Current quota period end |
-| `storage_quota` | int64 | 2 GB | 250 GB | custom | Storage limit. -1 = unlimited |
-| `traffic_quota` | int64 | 10 GB | -1 | custom | Combined monthly limit (upload+download). Universal field — if set, it IS the limit. -1 = no combined limit |
-| `traffic_upload_quota` | int64 | -1 | 50 TB | custom | Monthly upload limit. -1 = no individual upload limit |
-| `traffic_download_quota` | int64 | -1 | 250 GB | custom | Monthly download limit. -1 = no individual download limit |
-| `max_users` | int | 1 | -1 | 50 | Hard user cap. -1 = unlimited (billing charges extra) |
+| `storage_quota` | int64 | 2 GB | 250 GB | custom | Storage limit. Any value `<= 0` = unlimited in SesameFS enforcement |
+| `traffic_quota` | int64 | 10 GB | -1 | custom | Combined monthly limit (upload+download). Universal field — if positive, it is the limit. Any value `<= 0` = no combined limit |
+| `traffic_upload_quota` | int64 | -1 | 50 TB | custom | Monthly upload limit. Any value `<= 0` = no individual upload limit |
+| `traffic_download_quota` | int64 | -1 | 250 GB | custom | Monthly download limit. Any value `<= 0` = no individual download limit |
+| `max_users` | int | 1 | -1 | 50 | Hard user cap. Any value `<= 0` = unlimited in SesameFS enforcement; Accounts may still bill extra seats |
 
 **Traffic evaluation logic (most restrictive wins):**
-1. If `traffic_quota != -1` → check `upload_used + download_used <= traffic_quota`
-2. If `traffic_upload_quota != -1` → check `upload_used <= traffic_upload_quota`
-3. If `traffic_download_quota != -1` → check `download_used <= traffic_download_quota`
+1. If `traffic_quota > 0` → check `upload_used + download_used <= traffic_quota`
+2. If `traffic_upload_quota > 0` → check `upload_used <= traffic_upload_quota`
+3. If `traffic_download_quota > 0` → check `download_used <= traffic_download_quota`
 4. Any check that fails → blocked (free) or warning (paid)
 
 `traffic_quota` is the universal field. Billing can use it alone (simple) or combine it with individual limits (granular). Examples:
@@ -99,7 +101,7 @@ Billing sets these fields on each org via `PUT /admin/organizations/:org_id/`:
 |----------|-----------|-----------|
 | Storage exceeded | **Hard block** — reject upload with 403 | **Soft warning** — allow, billing charges overage |
 | Traffic exceeded (any check) | **Hard block** — reject with 403 | **Soft warning** — allow, billing charges overage |
-| Max users exceeded | **Hard block** — reject user creation with 403 | If max_users=-1: allow, billing charges. If max_users>0: hard block |
+| Max users exceeded | **Hard block** — reject user creation with 403 | If `max_users <= 0`: allow in SesameFS, billing may charge extra seats. If `max_users > 0`: hard block |
 | Warning threshold | N/A (blocked directly) | Warn at 80% of included limit |
 
 ### Per-User Quotas
@@ -478,14 +480,14 @@ CheckTrafficQuota(orgID, userID, direction, additionalBytes):
          else first day of current UTC month (backward-compatible fallback)
 
   3. CHECK 1: Combined quota (traffic_quota)
-     If traffic_quota != -1:
+         If traffic_quota > 0:
              SELECT bytes FROM traffic_period_usage
              WHERE org_id=? AND period_started_at=? AND scope='org:combined'
        Evaluate: combined_used + additional > traffic_quota
 
   4. CHECK 2: Direction quota (traffic_upload_quota or traffic_download_quota)
      quota = traffic_upload_quota if direction=="upload", else traffic_download_quota
-     If quota != -1:
+         If quota > 0:
              SELECT bytes FROM traffic_period_usage
              WHERE org_id=? AND period_started_at=? AND scope='org:<direction>'
        Evaluate: direction_used + additional > quota
@@ -850,7 +852,7 @@ Phase 2 (TrafficRecorder core)
 
 ### Unit Tests
 - TrafficRecorder: mock session, verify generated queries
-- QuotaChecker: test with free (hard block), paid (soft warning), unlimited (-1)
+- QuotaChecker: test with free (hard block), paid (soft warning), and org quotas set to values `<= 0` (treated as unlimited in SesameFS)
 - Storage counters: correct increment/decrement
 
 ### Integration Tests

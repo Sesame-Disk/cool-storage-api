@@ -68,6 +68,7 @@ FAILED_SUITES=0
 QUICK_MODE=false
 VERBOSE=false
 LIST_ONLY=false
+COMPOSE_BUILD=true
 
 # Parse arguments
 CATEGORY=""
@@ -81,6 +82,9 @@ for arg in "$@"; do
             ;;
         --list)
             LIST_ONLY=true
+            ;;
+        --no-build)
+            COMPOSE_BUILD=false
             ;;
         --help|-h)
             head -50 "$0" | grep "^#" | sed 's/^# //' | sed 's/^#//'
@@ -179,6 +183,7 @@ check_docker_compose() {
 run_compose_service() {
     local service="$1"
     local name="$2"
+    local compose_args="--profile test run --rm"
 
     TOTAL_SUITES=$((TOTAL_SUITES + 1))
 
@@ -189,7 +194,13 @@ run_compose_service() {
 
     log_section "Running: $name"
 
-    if docker compose --profile test run --rm --build "$service"; then
+    if [ "$COMPOSE_BUILD" = true ]; then
+        compose_args="$compose_args --build"
+    fi
+
+    log_info "docker compose $compose_args $service"
+
+    if docker compose $compose_args "$service"; then
         PASSED_SUITES=$((PASSED_SUITES + 1))
         log_success "$name completed"
         return 0

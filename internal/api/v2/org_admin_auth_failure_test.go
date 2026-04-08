@@ -5,8 +5,10 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
+	"github.com/Sesame-Disk/sesamefs/internal/config"
 	"github.com/Sesame-Disk/sesamefs/internal/middleware"
 	"github.com/gin-gonic/gin"
 )
@@ -23,6 +25,12 @@ func (m *fixedRoleGetter) GetUserOrgRole(orgID, _ string) (middleware.Organizati
 		return m.role, nil
 	}
 	return middleware.RoleGuest, fmt.Errorf("user not found in org")
+}
+
+type errorRoleGetter struct{}
+
+func (m *errorRoleGetter) GetUserOrgRole(_, _ string) (middleware.OrganizationRole, error) {
+	return middleware.RoleGuest, fmt.Errorf("temporary role lookup failure")
 }
 
 // injectIdentity returns a gin middleware that sets org_id and user_id in the
@@ -255,5 +263,110 @@ func TestOrgAdminListDeviceErrors_ResponseShape(t *testing.T) {
 	}
 	if _, ok := payload["device_errors"].([]interface{}); !ok {
 		t.Fatalf("device_errors = %T, want array", payload["device_errors"])
+	}
+}
+
+func TestOrgAdminAddOrgUser_BlockedWhenAccountsManagesUserWrites(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	const orgID = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+	const adminUser = "user-admin-a"
+
+	h := &OrgAdminHandler{
+		config:         &config.Config{Accounts: config.AccountsConfig{DisableOrgUserWrites: true}},
+		permMiddleware: &fixedRoleGetter{orgID: orgID, role: middleware.RoleAdmin},
+	}
+
+	r := gin.New()
+	r.Use(injectIdentity(orgID, adminUser))
+	r.POST("/org/:org_id/admin/users/", h.AddOrgUser)
+
+	req, err := http.NewRequest(http.MethodPost, "/org/"+orgID+"/admin/users/", strings.NewReader(`{"email":"new@example.com","name":"New User"}`))
+	if err != nil {
+		t.Fatalf("failed to build request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d, body=%s", w.Code, http.StatusForbidden, w.Body.String())
+	}
+
+	var payload map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("response is not valid JSON: %v", err)
+	}
+	if payload["managed_by"] != "accounts" {
+		t.Fatalf("managed_by = %v, want accounts", payload["managed_by"])
+	}
+}
+
+func TestOrgAdminUserWritesDisabledForCaller_SuperAdminBypassesFlag(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	h := &OrgAdminHandler{
+		config:         &config.Config{Accounts: config.AccountsConfig{DisableOrgUserWrites: true}},
+		permMiddleware: &fixedRoleGetter{orgID: middleware.PlatformOrgID, role: middleware.RoleSuperAdmin},
+	}
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Set("org_id", middleware.PlatformOrgID)
+	c.Set("user_id", "platform-admin")
+
+	if h.orgUserWritesDisabledForCaller(c) {
+		t.Fatal("platform superadmin should bypass org-admin user write lock")
+	}
+}
+
+func TestOrgUserManagementAuthorityForCaller_ReflectsEffectiveCallerMode(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	adminHandler := &OrgAdminHandler{
+		config:         &config.Config{Accounts: config.AccountsConfig{DisableOrgUserWrites: true}},
+		permMiddleware: &fixedRoleGetter{orgID: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", role: middleware.RoleAdmin},
+	}
+	adminRecorder := httptest.NewRecorder()
+	adminCtx, _ := gin.CreateTestContext(adminRecorder)
+	adminCtx.Set("org_id", "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+	adminCtx.Set("user_id", "tenant-admin")
+
+	blocked, authority := adminHandler.orgUserManagementAuthorityForCaller(adminCtx)
+	if !blocked || authority != "accounts" {
+		t.Fatalf("tenant admin authority = (%v, %q), want (true, %q)", blocked, authority, "accounts")
+	}
+
+	superadminHandler := &OrgAdminHandler{
+		config:         &config.Config{Accounts: config.AccountsConfig{DisableOrgUserWrites: true}},
+		permMiddleware: &fixedRoleGetter{orgID: middleware.PlatformOrgID, role: middleware.RoleSuperAdmin},
+	}
+	superadminRecorder := httptest.NewRecorder()
+	superadminCtx, _ := gin.CreateTestContext(superadminRecorder)
+	superadminCtx.Set("org_id", middleware.PlatformOrgID)
+	superadminCtx.Set("user_id", "platform-admin")
+
+	blocked, authority = superadminHandler.orgUserManagementAuthorityForCaller(superadminCtx)
+	if blocked || authority != "sesamefs" {
+		t.Fatalf("platform superadmin authority = (%v, %q), want (false, %q)", blocked, authority, "sesamefs")
+	}
+}
+
+func TestOrgUserWritesDisabledForCaller_FailsClosedOnRoleLookupError(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	h := &OrgAdminHandler{
+		config:         &config.Config{Accounts: config.AccountsConfig{DisableOrgUserWrites: true}},
+		permMiddleware: &errorRoleGetter{},
+	}
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Set("org_id", "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+	c.Set("user_id", "tenant-admin")
+
+	if !h.orgUserWritesDisabledForCaller(c) {
+		t.Fatal("role lookup failures should keep org-admin user writes disabled")
 	}
 }

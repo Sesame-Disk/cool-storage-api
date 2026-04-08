@@ -46,6 +46,12 @@ checks on share links, upload links, library creation, and group creation.
 - **Accounts → SesameFS sync** — no webhook receiver or polling loop to apply plan changes pushed
   from Accounts.
 
+**What was added on 2026-04-08:**
+
+- ✅ `POST /api/v2.1/admin/organizations/:org_id/preview-plan-change/` for downgrade and quota-impact simulation before apply.
+- ✅ `accounts.disable_org_user_writes=true` as the default local safeguard so tenant org-admin membership writes are disabled unless explicitly re-enabled.
+- ✅ Org-admin info now exposes authority flags so the SesameFS frontend can hide disabled membership actions.
+
 **Implications of shipping without remaining items:**
 - Plan upgrades still need the formal Accounts provisioning path and runbook to avoid ad-hoc manual operations.
 

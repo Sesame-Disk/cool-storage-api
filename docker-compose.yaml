@@ -168,7 +168,7 @@ services:
     command:
       - /bin/sh
       - -c
-      - until curl -fsS http://sesamefs:8080/health > /dev/null; do sleep 2; done; go test -tags integration -v -count=1 -timeout 5m ./internal/integration/...
+      - ./scripts/wait-for-http.sh http://sesamefs:8080/health sesamefs; go test -tags integration -v -count=1 -timeout 5m ./internal/integration/...
     environment:
       - SESAMEFS_URL=http://sesamefs:8080
     depends_on:
@@ -183,7 +183,7 @@ services:
     command:
       - /bin/sh
       - -c
-      - go test ./... -short -cover && until curl -fsS http://sesamefs:8080/health > /dev/null; do sleep 2; done; go test -tags integration -v -count=1 -timeout 5m ./internal/integration/...
+      - go test ./... -short -cover && ./scripts/wait-for-http.sh http://sesamefs:8080/health sesamefs && go test -tags integration -v -count=1 -timeout 5m ./internal/integration/...
     environment:
       - SESAMEFS_URL=http://sesamefs:8080
     depends_on:
@@ -195,7 +195,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.test
-    command: until curl -fsS http://sesamefs:8080/health > /dev/null; do sleep 2; done; ./scripts/test.sh api
+    command:
+      - ./scripts/wait-for-http.sh http://sesamefs:8080/health sesamefs; ./scripts/test.sh api
     environment:
       - SESAMEFS_URL=http://sesamefs:8080
       - SESAMEFS_TEST_IN_CONTAINER=1
@@ -208,7 +209,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.test
-    command: until curl -fsS http://sesamefs:8080/health > /dev/null; do sleep 2; done; ./scripts/test.sh oidc
+    command:
+      - ./scripts/wait-for-http.sh http://sesamefs:8080/health sesamefs; ./scripts/test.sh oidc
     environment:
       - SESAMEFS_URL=http://sesamefs:8080
       - SESAMEFS_TEST_IN_CONTAINER=1
@@ -232,7 +234,7 @@ services:
       - /bin/sh
       - -c
       - >
-        until node -e 'const http = require("http"); const target = process.env.DESKTOP_BASE_URL || "http://frontend"; http.get(target, (res) => process.exit(res.statusCode < 500 ? 0 : 1)).on("error", () => process.exit(1));'; do sleep 2; done;
+        ./scripts/wait-for-http.sh "${DESKTOP_BASE_URL:-http://frontend}" frontend;
         npm run check && npm run test:smoke
     environment:
       - DESKTOP_BASE_URL=http://frontend

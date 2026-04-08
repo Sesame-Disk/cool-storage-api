@@ -317,43 +317,20 @@ func TestAdminIdentityProjectionRegression_AdminUpdateOrgUserBatch(t *testing.T)
 	})
 }
 
-func TestAdminIdentityProjectionRegression_OrgAdminUpdateUserBatch(t *testing.T) {
-	originalUser := snapshotAdminUserForUpdate(t, defaultUserEmail)
-	originalOrg := getAdminOrganizationInfo(t, defaultOrgID)
-	restoreOrgQuotasOnCleanup(t, originalOrg)
-	updateAdminOrganizationQuotas(t, defaultOrgID, map[string]interface{}{
-		"storage_quota":          testStorageQuota,
-		"traffic_quota":          testTrafficQuota,
-		"traffic_upload_quota":   testTrafficUpload,
-		"traffic_download_quota": testTrafficDownload,
-	})
-	t.Cleanup(func() {
-		restoreAdminUserAfterUpdate(t, defaultUserEmail, originalUser)
-	})
-
-	updatedName := fmt.Sprintf("default-user-update-%d", time.Now().UnixNano())
-	updatedQuota := int64(987654)
-	updatedUpload := int64(3100)
-	updatedDownload := int64(4100)
+func TestAdminIdentityProjectionRegression_OrgAdminUpdateUserBatchBlockedByAccountsAuthority(t *testing.T) {
 	updateResp := adminClient.PutJSON(t, "/api/v2.1/org/"+defaultOrgID+"/admin/users/"+url.PathEscape(defaultUserEmail)+"/", map[string]interface{}{
-		"name":                   updatedName,
-		"quota_total":            updatedQuota,
-		"traffic_upload_quota":   updatedUpload,
-		"traffic_download_quota": updatedDownload,
+		"name":                   fmt.Sprintf("default-user-update-%d", time.Now().UnixNano()),
+		"quota_total":            int64(987654),
+		"traffic_upload_quota":   int64(3100),
+		"traffic_download_quota": int64(4100),
 		"is_staff":               true,
 		"is_active":              false,
 	})
-	expectStatus(t, updateResp, http.StatusOK)
-	updateResp.Body.Close()
-
-	waitForIntegrationCondition(t, "org-admin update to align admin user projection immediately", func() bool {
-		row, ok := adminUserProjectionByEmail(t, defaultUserEmail)
-		return ok && row.OrgID == defaultOrgID && row.Name == updatedName && row.Role == "admin" && row.Status == "deactivated" && row.QuotaBytes == updatedQuota
-	})
-	waitForIntegrationCondition(t, "org-admin update to remain visible in org-admin user detail with final state", func() bool {
-		payload := getOrgAdminUserByEmail(t, defaultUserEmail)
-		return payload["name"] == updatedName && payload["role"] == "admin" && payload["status"] == "deactivated" && jsonInt64(payload, "quota_total") == updatedQuota
-	})
+	expectStatus(t, updateResp, http.StatusForbidden)
+	body := responseJSON(t, updateResp)
+	if body["managed_by"] != "accounts" {
+		t.Fatalf("managed_by = %v, want accounts", body["managed_by"])
+	}
 }
 
 func createAdminIdentityTestOrganization(t *testing.T, name, ownerEmail string) string {

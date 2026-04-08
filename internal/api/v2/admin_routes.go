@@ -37,6 +37,7 @@ func registerAdminOrganizationRoutes(admin, superadminOnly *gin.RouterGroup, h *
 	registerPostWithSlashVariants(superadminOnly, "/organizations/:org_id/deactivate", h.DeactivateOrganization)
 	registerPostWithSlashVariants(superadminOnly, "/organizations/:org_id/reactivate", h.ReactivateOrganization)
 	registerPostWithSlashVariants(superadminOnly, "/organizations/:org_id/restore", h.RestoreOrganization)
+	registerPostWithSlashVariants(superadminOnly, "/organizations/:org_id/preview-plan-change", h.PreviewOrganizationPlanChange)
 
 	registerGetWithSlashVariants(admin, "/organizations/:org_id/users", h.ListOrgUsers)
 	registerPostWithSlashVariants(admin, "/organizations/:org_id/users", h.AdminAddOrgUser)

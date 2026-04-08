@@ -104,6 +104,9 @@ func (h *OrgAdminHandler) AddOrgUser(c *gin.Context) {
 	if err := h.requireOrgAccess(c, targetOrgID); err != nil {
 		return
 	}
+	if h.rejectOrgUserWriteIfDisabled(c) {
+		return
+	}
 
 	var body struct {
 		Email string `json:"email"`
@@ -197,6 +200,9 @@ func (h *OrgAdminHandler) UpdateOrgUser(c *gin.Context) {
 	targetOrgID := c.Param("org_id")
 	email := c.Param("email")
 	if err := h.requireOrgAccess(c, targetOrgID); err != nil {
+		return
+	}
+	if h.rejectOrgUserWriteIfDisabled(c) {
 		return
 	}
 
@@ -345,6 +351,9 @@ func (h *OrgAdminHandler) DeleteOrgUser(c *gin.Context) {
 	if err := h.requireOrgAccess(c, targetOrgID); err != nil {
 		return
 	}
+	if h.rejectOrgUserWriteIfDisabled(c) {
+		return
+	}
 
 	callerUserID := c.GetString("user_id")
 
@@ -386,6 +395,9 @@ func (h *OrgAdminHandler) RestoreOrgUser(c *gin.Context) {
 	if err := h.requireOrgAccess(c, targetOrgID); err != nil {
 		return
 	}
+	if h.rejectOrgUserWriteIfDisabled(c) {
+		return
+	}
 
 	userID, err := h.lookupOrgUserByEmail(targetOrgID, email)
 	if err != nil {
@@ -418,6 +430,9 @@ func (h *OrgAdminHandler) RestoreOrgUser(c *gin.Context) {
 func (h *OrgAdminHandler) ResetOrgUserPassword(c *gin.Context) {
 	targetOrgID := c.Param("org_id")
 	if err := h.requireOrgAccess(c, targetOrgID); err != nil {
+		return
+	}
+	if h.rejectOrgUserWriteIfDisabled(c) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{
@@ -642,6 +657,9 @@ func (h *OrgAdminHandler) ImportOrgUsers(c *gin.Context) {
 	if err := h.requireOrgAccess(c, targetOrgID); err != nil {
 		return
 	}
+	if h.rejectOrgUserWriteIfDisabled(c) {
+		return
+	}
 
 	file, _, err := c.Request.FormFile("file")
 	if err != nil {
@@ -740,6 +758,9 @@ func (h *OrgAdminHandler) ImportOrgUsers(c *gin.Context) {
 func (h *OrgAdminHandler) InviteOrgUsers(c *gin.Context) {
 	targetOrgID := c.Param("org_id")
 	if err := h.requireOrgAccess(c, targetOrgID); err != nil {
+		return
+	}
+	if h.rejectOrgUserWriteIfDisabled(c) {
 		return
 	}
 

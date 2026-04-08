@@ -6,6 +6,8 @@ import UserItem from './org-user-item';
 import '../../css/org-admin-paginator.css';
 
 const propTypes = {
+  accountsOrgManagementURL: PropTypes.string,
+  canManageUsers: PropTypes.bool,
   currentTab: PropTypes.string.isRequired,
   toggleDelete: PropTypes.func.isRequired,
   toggleRevokeAdmin: PropTypes.func.isRequired,
@@ -28,11 +30,11 @@ class OrgAdminList extends React.Component {
   }
 
   onFreezedItem = () => {
-    this.setState({isItemFreezed: true});
+    this.setState({ isItemFreezed: true });
   };
 
   onUnfreezedItem = () => {
-    this.setState({isItemFreezed: false});
+    this.setState({ isItemFreezed: false });
   };
 
   toggleItemFreezed = (isFreezed) => {
@@ -61,6 +63,8 @@ class OrgAdminList extends React.Component {
                   key={index}
                   user={item}
                   currentTab="admins"
+                  canManageUsers={this.props.canManageUsers}
+                  accountsOrgManagementURL={this.props.accountsOrgManagementURL}
                   isItemFreezed={this.state.isItemFreezed}
                   toggleDelete={this.props.toggleDelete}
                   toggleRevokeAdmin={this.props.toggleRevokeAdmin}

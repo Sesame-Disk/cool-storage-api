@@ -253,13 +253,22 @@ test_oidc_login() {
         return
     fi
 
-    # Test login URL generation
+    local login_redirect_uri
+    login_redirect_uri=$(echo "$config" | jq -r '.redirect_uris[0] // empty')
+    if [ -z "$login_redirect_uri" ]; then
+        login_redirect_uri="http://localhost:3000/sso"
+    fi
+
+    local encoded_redirect_uri
+    encoded_redirect_uri=$(printf '%s' "$login_redirect_uri" | jq -sRr @uri)
+
+    # Test login URL generation using a configured redirect URI when available.
     run_test "GET /api/v2.1/auth/oidc/login/ returns 200" \
-        "http_get '$BASE_URL/api/v2.1/auth/oidc/login/?redirect_uri=http://localhost:3000/sso'" \
+        "http_get '$BASE_URL/api/v2.1/auth/oidc/login/?redirect_uri=$encoded_redirect_uri'" \
         "200"
 
     # Verify authorization_url is returned
-    local response=$(curl -s "$BASE_URL/api/v2.1/auth/oidc/login/?redirect_uri=http://localhost:3000/sso")
+    local response=$(curl -s "$BASE_URL/api/v2.1/auth/oidc/login/?redirect_uri=$encoded_redirect_uri")
 
     TOTAL=$((TOTAL + 1))
     local auth_url=$(echo "$response" | jq -r '.authorization_url')

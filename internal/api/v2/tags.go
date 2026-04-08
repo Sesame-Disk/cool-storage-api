@@ -125,7 +125,7 @@ func (h *TagHandler) CreateRepoTag(c *gin.Context) {
 	repoID := c.Param("repo_id")
 
 	var req CreateRepoTagRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
+	if err := c.ShouldBind(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
@@ -208,7 +208,7 @@ func (h *TagHandler) UpdateRepoTag(c *gin.Context) {
 	}
 
 	var req CreateRepoTagRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
+	if err := c.ShouldBind(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}

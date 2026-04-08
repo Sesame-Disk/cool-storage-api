@@ -108,8 +108,9 @@ If in the future we need co-owners, billing-viewer, or owner-without-admin, we c
 ### Known Issue: OIDC Role Sync vs Manual Overrides
 
 Current policy decision:
-- Manual role changes done inside SesameFS (for example, owner transfer or superadmin repairs) must remain effective.
-- Automatic OIDC role synchronization must not overwrite those manual changes for now.
+- Accounts is the operational authority for org membership, ownership, and quota lifecycle.
+- Manual role changes done inside SesameFS should be limited to superadmin repair flows or explicit ownership-transfer flows.
+- Automatic OIDC role synchronization must not silently become the primary provisioning path for tenant operations.
 
 Status:
 - This remains **technical debt / open issue**.
@@ -262,7 +263,7 @@ func isHardEnforcement(quotaPolicy string) bool {
 | Max users exceeded | **BLOCK** (403) | **BLOCK** (403)* |
 | 80% threshold | N/A (blocked directly when hit) | WARN via `X-Quota-Warning` header |
 
-\* Max users is always a hard block. If `max_users=-1`, there's no limit. The billing service charges for extra users on paid plans — but SesameFS doesn't know billing, so if there's a cap, it's hard.
+\* Max users is always a hard block. If `max_users<=0`, there's no limit in SesameFS. The billing service may still charge for extra users or included overages — but SesameFS only knows whether a hard cap exists.
 
 ---
 
@@ -332,11 +333,11 @@ Feature limits come from config (enforcement profile). Quotas come from DB (set 
 
 | Limit | Source | hard (free) | soft (paid) |
 |-------|--------|------|----------|
-| `storage_quota` | DB | 2 GB (default) | unlimited (-1, default) |
-| `traffic_quota` (combined/month) | DB | 10 GB (default) | unlimited (-1, default) |
-| `traffic_upload_quota` | DB | no sub-limit (-1) | set by Accounts |
-| `traffic_download_quota` | DB | no sub-limit (-1) | set by Accounts |
-| `max_users` | DB | 1 (default) | unlimited (-1, default) |
+| `storage_quota` | DB | 2 GB (default) | unlimited (`<=0`) |
+| `traffic_quota` (combined/month) | DB | 10 GB (default) | unlimited (`<=0`) |
+| `traffic_upload_quota` | DB | no sub-limit (`<=0`) | set by Accounts |
+| `traffic_download_quota` | DB | no sub-limit (`<=0`) | set by Accounts |
+| `max_users` | DB | 1 (default) | unlimited (`<=0`) |
 | `max_libraries` | Config | 3 | unlimited (-1) |
 | `max_share_links` | Config | 3 | unlimited (-1) |
 | `max_upload_links` | Config | 1 | unlimited (-1) |
@@ -437,12 +438,13 @@ func ResolveCapabilities(role string, quotaPolicy string, profile *EnforcementPr
 - **`is_org_owner`**: Derived from `role == "owner"`. Determines if the user has billing authority.
 - **`can_upgrade`**: `true` when the user is the org owner AND there's a reason to upgrade. See below.
 - **Subscription scope**: The contract is always org-level. A "personal" account is modeled as an org with a single active user, so the same org quota/subscription semantics apply in both personal and org-admin UI.
-- **Billing path**: The subscription page is informational only. Plan changes, renewals, extra users, and extra storage are handled in the billing service via the single `/billing/` redirect path.
+- **Billing path**: The subscription page is informational only. Plan changes, renewals, extra users, extra storage, and traffic overages are handled in the billing service via the single `/billing/` redirect path.
 - **`storage`**: Simple quota state. Storage has no monthly period. Either usage is within limit or writes are blocked.
 - **`traffic`**: Pre-digested traffic state for the current quota period. Frontend reads `over_quota`, `percent`, `reset_date` and upload/download sub-limits directly — no calculations needed.
 - **`can_X` flags**: Already resolved by `role AND enforcement_profile`. Frontend treats as final booleans.
 - **`upgrade_features`**: List of features blocked by plan (not by role). Backend computes this. Frontend uses it for upgrade CTAs without duplicating business logic.
 - **`share_link_expire_days_max` / `upload_link_expire_days_max`**: From enforcement profile. Frontend enforces in UI datepicker. 0 = no limit.
+- **Quota sentinel values**: For Accounts-managed org quotas, any quota field `<=0` means SesameFS should treat it as unlimited for enforcement. That does not imply free billing.
 
 ### `can_upgrade` Logic
 
@@ -609,6 +611,7 @@ new capabilities, new limits, upgrade_features is now empty
 - If Accounts sends `current_period_ends_at`, SesameFS uses it as authoritative
 - If Accounts sends only `current_period_started_at`, SesameFS derives `current_period_ends_at` with the shared quota-period helper used by org creation and rollover (always advance one calendar month, clamping the day when the target month is shorter)
 - If Accounts sends both start and end, SesameFS should validate that they are coherent before persisting them
+- If Accounts sets any quota field to `<=0`, SesameFS treats that dimension as unlimited while Accounts remains free to bill overages commercially
 
 ### Internal Handler Separation
 

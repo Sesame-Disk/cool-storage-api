@@ -104,6 +104,46 @@ func (h *OrgAdminHandler) requireOrgAccess(c *gin.Context, targetOrgID string) e
 	return nil
 }
 
+func (h *OrgAdminHandler) orgUserWritesDisabledForCaller(c *gin.Context) bool {
+	if h.config == nil || !h.config.Accounts.DisableOrgUserWrites {
+		return false
+	}
+	callerOrgID := c.GetString("org_id")
+	callerUserID := c.GetString("user_id")
+	if callerOrgID == "" || callerUserID == "" {
+		return false
+	}
+	if h.permMiddleware == nil {
+		return true
+	}
+	role, err := h.permMiddleware.GetUserOrgRole(callerOrgID, callerUserID)
+	if err != nil {
+		return true
+	}
+	return !middleware.IsPlatformSuperAdmin(callerOrgID, role)
+}
+
+func (h *OrgAdminHandler) rejectOrgUserWriteIfDisabled(c *gin.Context) bool {
+	if !h.orgUserWritesDisabledForCaller(c) {
+		return false
+	}
+	c.JSON(http.StatusForbidden, gin.H{
+		"error":                     "organization membership and user lifecycle are managed by Accounts; org-admin user writes are disabled",
+		"managed_by":                "accounts",
+		"org_user_writes_disabled":  true,
+		"user_management_authority": "accounts",
+	})
+	return true
+}
+
+func (h *OrgAdminHandler) orgUserManagementAuthorityForCaller(c *gin.Context) (bool, string) {
+	disabled := h.orgUserWritesDisabledForCaller(c)
+	if disabled {
+		return true, "accounts"
+	}
+	return false, "sesamefs"
+}
+
 // lookupOrgUserByEmail finds the user_id for a user identified by email within
 // a specific org. It uses the users_by_email index first and then verifies the
 // user belongs to the expected org.
@@ -267,6 +307,8 @@ func (h *OrgAdminHandler) GetOrgInfo(c *gin.Context) {
 	}
 	_ = iter.Close()
 
+	orgUserWritesDisabled, userManagementAuthority := h.orgUserManagementAuthorityForCaller(c)
+
 	c.JSON(http.StatusOK, gin.H{
 		"org_id":            orgID,
 		"org_name":          name,
@@ -280,24 +322,27 @@ func (h *OrgAdminHandler) GetOrgInfo(c *gin.Context) {
 		"active_members":    activeUsersCount,
 		"ctime":             createdAt.Format(time.RFC3339),
 		// Traffic quota info
-		"plan":                      plan,
-		"quota_policy":              quotaPolicy,
-		"billing_cycle":             billingCycle,
-		"current_period_started_at": currentPeriodStartedAt,
-		"current_period_ends_at":    currentPeriodEndsAt,
-		"traffic_quota":             trafficQuota,
-		"traffic_month_total":       monthlyUsage.Combined,
-		"traffic_month_upload":      monthlyUsage.Upload,
-		"traffic_month_download":    monthlyUsage.Download,
-		"traffic_combined_used":     periodUsage.Combined,
-		"traffic_upload_quota":      trafficUploadQuota,
-		"traffic_upload_used":       periodUsage.Upload,
-		"traffic_download_quota":    trafficDownloadQuota,
-		"traffic_download_used":     periodUsage.Download,
-		"traffic_year_total":        yearlyUsage.Combined,
-		"traffic_year_upload":       yearlyUsage.Upload,
-		"traffic_year_download":     yearlyUsage.Download,
-		"max_users":                 maxUsers,
+		"plan":                             plan,
+		"quota_policy":                     quotaPolicy,
+		"billing_cycle":                    billingCycle,
+		"current_period_started_at":        currentPeriodStartedAt,
+		"current_period_ends_at":           currentPeriodEndsAt,
+		"traffic_quota":                    trafficQuota,
+		"traffic_month_total":              monthlyUsage.Combined,
+		"traffic_month_upload":             monthlyUsage.Upload,
+		"traffic_month_download":           monthlyUsage.Download,
+		"traffic_combined_used":            periodUsage.Combined,
+		"traffic_upload_quota":             trafficUploadQuota,
+		"traffic_upload_used":              periodUsage.Upload,
+		"traffic_download_quota":           trafficDownloadQuota,
+		"traffic_download_used":            periodUsage.Download,
+		"traffic_year_total":               yearlyUsage.Combined,
+		"traffic_year_upload":              yearlyUsage.Upload,
+		"traffic_year_download":            yearlyUsage.Download,
+		"max_users":                        maxUsers,
+		"accounts_org_user_management_url": h.config.ResolveAccountsOrgUserManagementURL(orgID),
+		"org_user_writes_disabled":         orgUserWritesDisabled,
+		"user_management_authority":        userManagementAuthority,
 	})
 }
 
@@ -442,6 +487,9 @@ func (h *OrgAdminHandler) updateOrgSetting(orgID, key, value string) error {
 func (h *OrgAdminHandler) TransferOrgOwnership(c *gin.Context) {
 	orgID := c.Param("org_id")
 	if err := h.requireOrgAccess(c, orgID); err != nil {
+		return
+	}
+	if h.rejectOrgUserWriteIfDisabled(c) {
 		return
 	}
 

@@ -620,7 +620,7 @@ SELECT COUNT(*) FROM users WHERE org_id = ?
 ```
 
 Full partition scan on every user-add. Acceptable for v1 because:
-- Enterprise orgs have `max_users = -1` → check skipped entirely
+- Enterprise orgs often have `max_users <= 0` → check skipped entirely
 - Free orgs are small (1 user) → scan is trivial
 - Paid orgs with explicit limit are rare and small
 

@@ -191,6 +191,7 @@ BILLING_URL=https://accounts.yourdomain.com/billing/
 # External Accounts URLs used by /accounts/password/change/ and /accounts/delete/
 ACCOUNTS_PASSWORD_CHANGE_URL=https://accounts.yourdomain.com/accounts/password/change/
 ACCOUNTS_DELETE_ACCOUNT_URL=https://accounts.yourdomain.com/accounts/delete/
+ACCOUNTS_DISABLE_ORG_USER_WRITES=true
 
 # Temporary GC guard for multi-replica prod: keep this true on exactly one backend replica.
 GC_ENABLED=true
@@ -206,6 +207,8 @@ ONLYOFFICE_JWT_SECRET=<from step 0.3 — second openssl output>
 > `BILLING_URL` is different: it is the external billing portal destination. Users click SesameFS `/billing/`, and the backend redirects authenticated sessions to this external URL in a new tab.
 
 > `ACCOUNTS_PASSWORD_CHANGE_URL` and `ACCOUNTS_DELETE_ACCOUNT_URL` work the same way for `/accounts/password/change/` and `/accounts/delete/`.
+
+> `ACCOUNTS_DISABLE_ORG_USER_WRITES` should normally stay `true`. That keeps tenant org-admin user lifecycle writes disabled so Accounts remains the operational authority. Platform superadmins still bypass that tenant lock as an operational fallback, but Accounts should prefer the `/admin/...` surface.
 
 > `GC_ENABLED` is a temporary production guard. Until GC has leader election, only one backend replica should run GC. In a single-node deployment, leave it as `true`.
 

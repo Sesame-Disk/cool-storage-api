@@ -89,9 +89,9 @@ func TestInvalidUserQuotaUpdatesAreRejected(t *testing.T) {
 
 	t.Run("org admin user update rejects combined overflow", func(t *testing.T) {
 		resp := adminClient.PutJSON(t, "/api/v2.1/org/"+defaultOrgID+"/admin/users/"+url.PathEscape(defaultUserEmail)+"/", body)
-		expectStatus(t, resp, http.StatusBadRequest)
+		expectStatus(t, resp, http.StatusForbidden)
 		body := responseJSON(t, resp)
-		if body["error"] != "upload + download quota sum (110000000) exceeds organization combined traffic limit (100000000)" {
+		if body["error"] != "organization membership and user lifecycle are managed by Accounts; org-admin user writes are disabled" {
 			t.Fatalf("unexpected error: %v", body["error"])
 		}
 	})

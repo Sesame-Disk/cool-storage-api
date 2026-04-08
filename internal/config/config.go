@@ -144,8 +144,24 @@ type BillingConfig struct {
 
 // AccountsConfig holds external account-management integration settings.
 type AccountsConfig struct {
-	PasswordChangeURL string `yaml:"password_change_url"`
-	DeleteAccountURL  string `yaml:"delete_account_url"`
+	PasswordChangeURL    string `yaml:"password_change_url"`
+	DeleteAccountURL     string `yaml:"delete_account_url"`
+	OrgUserManagementURL string `yaml:"org_user_management_url"`
+	DisableOrgUserWrites bool   `yaml:"disable_org_user_writes"`
+}
+
+// ResolveAccountsOrgUserManagementURL returns the configured external Accounts
+// URL for org membership/role management. The optional {org_id} placeholder is
+// replaced when present.
+func (c *Config) ResolveAccountsOrgUserManagementURL(orgID string) string {
+	if c == nil {
+		return ""
+	}
+	target := strings.TrimSpace(c.Accounts.OrgUserManagementURL)
+	if target == "" {
+		return ""
+	}
+	return strings.ReplaceAll(target, "{org_id}", strings.TrimSpace(orgID))
 }
 
 // OrganizationsConfig holds reusable organization plan/template defaults.
@@ -618,8 +634,10 @@ func DefaultConfig() *Config {
 				},
 			},
 		},
-		Billing:  BillingConfig{},
-		Accounts: AccountsConfig{},
+		Billing: BillingConfig{},
+		Accounts: AccountsConfig{
+			DisableOrgUserWrites: true,
+		},
 		Organizations: OrganizationsConfig{
 			DefaultTemplate: "free",
 			Templates: map[string]OrganizationTemplate{
@@ -780,6 +798,12 @@ func (c *Config) applyEnvOverrides() {
 	}
 	if v := os.Getenv("ACCOUNTS_DELETE_ACCOUNT_URL"); v != "" {
 		c.Accounts.DeleteAccountURL = v
+	}
+	if v := os.Getenv("ACCOUNTS_ORG_USER_MANAGEMENT_URL"); v != "" {
+		c.Accounts.OrgUserManagementURL = v
+	}
+	if v := os.Getenv("ACCOUNTS_DISABLE_ORG_USER_WRITES"); v != "" {
+		c.Accounts.DisableOrgUserWrites = v == "true" || v == "1"
 	}
 
 	// Auth

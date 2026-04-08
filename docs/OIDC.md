@@ -7,11 +7,11 @@
 
 ## Overview
 
-SesameFS will use OIDC (OpenID Connect) for user authentication and tenant/organization management. The OIDC provider will be the source of truth for:
+SesameFS will use OIDC (OpenID Connect) for user authentication and identity attachment. In the current Accounts integration contract, OIDC is the login boundary and Accounts is the operational writer through SesameFS admin APIs. The OIDC provider remains the source of truth for:
 
 - User accounts (creation, deletion, profile data)
-- Organization/tenant management
-- User roles and permissions
+- Login identity claims used for attachment/reconciliation
+- Any claim-driven role mapping that a deployment explicitly chooses to keep enabled
 - Multi-tenant isolation
 
 ---
@@ -244,7 +244,7 @@ Every time an existing user logs in, SesameFS compares the normalized role from 
 
 ## Admin API Endpoints (For Management UIs / OIDC Provider Webhooks)
 
-These endpoints are available at `/api/v2.1/admin/` and allow managing tenants and users programmatically. The OIDC provider (or an admin dashboard) can call these to pre-create orgs, list users, etc.
+These endpoints are available at `/api/v2.1/admin/` and allow managing tenants and users programmatically. Accounts should use these routes with a dedicated platform service account API key for provisioning, quota changes, and lifecycle actions.
 
 ### Authentication
 
@@ -389,7 +389,7 @@ Content-Type: application/json
 **Response** `200`: `{"success": true}`
 **Response** `403`: `{"error": "only superadmin can assign superadmin role"}`
 
-**Note**: Role changes via this endpoint will be overwritten on the user's next OIDC login (OIDC is source of truth). To permanently change a user's role, update it in the OIDC provider.
+**Note**: If claim-driven role sync is enabled for a deployment, role changes via this endpoint can be overwritten on the user's next OIDC login. The current Accounts dashboard contract should treat the admin API as the operational write path and keep claim behavior aligned with that policy.
 
 #### Deactivate User
 ```

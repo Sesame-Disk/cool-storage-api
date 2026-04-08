@@ -3,14 +3,17 @@ import PropTypes from 'prop-types';
 import { Dropdown, DropdownToggle, DropdownMenu, DropdownItem } from 'reactstrap';
 import { gettext, siteRoot, orgID, username } from '../../utils/constants';
 import { seafileAPI } from '../../utils/seafile-api';
+import { ACCOUNTS_ORG_USER_ACTIONS, ACCOUNTS_ORG_USER_VIEWS, buildAccountsOrgUserManagementURL } from '../../utils/accounts-org-user-management';
 import { Utils } from '../../utils/utils';
 import toaster from '../../components/toast';
 import Selector from '../../components/single-selector';
 import CommonOperationConfirmationDialog from '../../components/dialog/common-operation-confirmation-dialog';
 
 const propTypes = {
+  accountsOrgManagementURL: PropTypes.string,
   user: PropTypes.object,
   currentTab: PropTypes.string,
+  canManageUsers: PropTypes.bool,
   toggleRevokeAdmin: PropTypes.func,
   isItemFreezed: PropTypes.bool.isRequired,
   toggleDelete: PropTypes.func.isRequired,
@@ -151,7 +154,19 @@ class UserItem extends React.Component {
     this.setState({ isRestoreUserDialogOpen: !this.state.isRestoreUserDialogOpen });
   };
 
+  getAccountsURL = (action, extraOptions = {}) => {
+    return buildAccountsOrgUserManagementURL(this.props.accountsOrgManagementURL, {
+      view: ACCOUNTS_ORG_USER_VIEWS.USER,
+      action,
+      userEmail: this.props.user.email,
+      ...extraOptions,
+    });
+  };
+
   getMenuOperations = () => {
+    if (this.props.canManageUsers === false) {
+      return [];
+    }
     const { currentTab, user } = this.props;
     if (user.status === 'deleted') {
       return ['Restore'];
@@ -179,6 +194,66 @@ class UserItem extends React.Component {
     }
   };
 
+  getExternalMenuOperations = (effectiveStatus) => {
+    const operations = [];
+    const manageUserURL = this.getAccountsURL(ACCOUNTS_ORG_USER_ACTIONS.MANAGE_USER);
+
+    if (manageUserURL) {
+      operations.push({
+        label: gettext('Manage in Accounts'),
+        url: manageUserURL,
+      });
+    }
+
+    if (effectiveStatus === 'deleted') {
+      const restoreURL = this.getAccountsURL(ACCOUNTS_ORG_USER_ACTIONS.RESTORE_USER);
+      if (restoreURL) {
+        operations.push({
+          label: gettext('Restore'),
+          url: restoreURL,
+        });
+      }
+      return operations;
+    }
+
+    const targetStatus = effectiveStatus === 'active' ? 'deactivated' : 'active';
+    const statusURL = this.getAccountsURL(ACCOUNTS_ORG_USER_ACTIONS.SET_STATUS, { status: targetStatus });
+    if (statusURL) {
+      operations.push({
+        label: targetStatus === 'active' ? gettext('Activate') : gettext('Deactivate'),
+        url: statusURL,
+      });
+    }
+
+    const deleteURL = this.getAccountsURL(ACCOUNTS_ORG_USER_ACTIONS.DELETE_USER);
+    if (deleteURL) {
+      operations.push({
+        label: gettext('Delete'),
+        url: deleteURL,
+      });
+    }
+
+    const resetPasswordURL = this.getAccountsURL(ACCOUNTS_ORG_USER_ACTIONS.RESET_PASSWORD);
+    if (resetPasswordURL) {
+      operations.push({
+        label: gettext('ResetPwd'),
+        url: resetPasswordURL,
+      });
+    }
+
+    if (this.props.currentTab === 'admins') {
+      const revokeAdminURL = this.getAccountsURL(ACCOUNTS_ORG_USER_ACTIONS.REVOKE_ADMIN);
+      if (revokeAdminURL) {
+        operations.push({
+          label: gettext('Revoke Admin'),
+          url: revokeAdminURL,
+        });
+      }
+    }
+
+    return operations;
+  };
+
   onMenuItemClick = (operation) => {
     switch (operation) {
       case 'Delete':
@@ -202,9 +277,12 @@ class UserItem extends React.Component {
     const { highlight, isConfirmInactiveDialogOpen, isRestoreUserDialogOpen } = this.state;
     let { user } = this.props;
     let href = siteRoot + 'org/useradmin/info/' + encodeURIComponent(user.email) + '/';
-    let isOperationMenuShow = (user.email !== username) && this.state.showMenu;
     const effectiveStatus = user.status || (user.is_active ? 'active' : 'deactivated');
     const isDeleted = effectiveStatus === 'deleted';
+    const canManageUsers = this.props.canManageUsers !== false;
+    const externalMenuOperations = canManageUsers ? [] : this.getExternalMenuOperations(effectiveStatus);
+    const manageUserURL = this.getAccountsURL(ACCOUNTS_ORG_USER_ACTIONS.MANAGE_USER);
+    let isOperationMenuShow = (user.email !== username) && this.state.showMenu && (canManageUsers || externalMenuOperations.length > 0);
 
     // for 'user status'
     const curStatus = effectiveStatus === 'active' ? 'active' : 'deactivated';
@@ -227,19 +305,31 @@ class UserItem extends React.Component {
         <tr className={this.state.highlight ? 'tr-highlight' : ''} onMouseEnter={this.onMouseEnter} onMouseLeave={this.onMouseLeave}>
           <td>
             <a href={href}>{user.name}</a>
+            {manageUserURL && (
+              <a
+                href={manageUserURL}
+                className="attr-action-icon fas fa-external-link-alt ml-2 text-secondary"
+                target="_blank"
+                rel="noopener noreferrer"
+                title={gettext('Manage in Accounts')}
+                aria-label={gettext('Manage in Accounts')}
+              ></a>
+            )}
           </td>
           <td>
             {isDeleted ?
               <span className="badge badge-danger">{gettext('Deleted')}</span>
-              :
-              <Selector
-                isDropdownToggleShown={highlight}
-                currentSelectedOption={currentSelectedStatusOption}
-                options={this.statusOptions}
-                selectOption={this.changeStatus}
-                toggleItemFreezed={this.props.toggleItemFreezed}
-                operationBeforeSelect={effectiveStatus === 'active' ? this.toggleConfirmInactiveDialog : undefined}
-              />
+              : !canManageUsers ?
+                <span>{this.translateStatus(curStatus)}</span>
+                :
+                <Selector
+                  isDropdownToggleShown={highlight}
+                  currentSelectedOption={currentSelectedStatusOption}
+                  options={this.statusOptions}
+                  selectOption={this.changeStatus}
+                  toggleItemFreezed={this.props.toggleItemFreezed}
+                  operationBeforeSelect={effectiveStatus === 'active' ? this.toggleConfirmInactiveDialog : undefined}
+                />
             }
           </td>
           <td>{`${Utils.bytesToSize(user.quota_usage)} / ${this.getQuotaTotal(user.quota_total)}`}</td>
@@ -261,9 +351,17 @@ class UserItem extends React.Component {
                   onClick={this.onDropdownToggleClick}
                 />
                 <DropdownMenu>
-                  {menuOperations.map((operation, index) => (
-                    <DropdownItem key={index} onClick={() => this.onMenuItemClick(operation)}>{this.translateOperation(operation)}</DropdownItem>
-                  ))}
+                  {canManageUsers ? (
+                    menuOperations.map((operation, index) => (
+                      <DropdownItem key={index} onClick={() => this.onMenuItemClick(operation)}>{this.translateOperation(operation)}</DropdownItem>
+                    ))
+                  ) : (
+                    externalMenuOperations.map((operation, index) => (
+                      <DropdownItem key={index} tag="a" href={operation.url} target="_blank" rel="noopener noreferrer">
+                        <i className="fas fa-external-link-alt text-secondary mr-1"></i>{operation.label}
+                      </DropdownItem>
+                    ))
+                  )}
                 </DropdownMenu>
               </Dropdown>
             )}

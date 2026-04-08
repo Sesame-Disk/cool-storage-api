@@ -29,6 +29,13 @@ type AdminHandler struct {
 	serverURL      string
 }
 
+type orgPlanPreviewMemberStats struct {
+	TotalMembers           int
+	ActiveMembers          int
+	ProtectedActiveMembers int
+	RegularActiveMembers   int
+}
+
 // NewAdminHandler creates a new AdminHandler
 func NewAdminHandler(database *db.DB, cfg *config.Config, perm *middleware.PermissionMiddleware, tokenCreator TokenCreator, sessions SessionInvalidator, apiKeys APIKeyInvalidator, serverURL string) *AdminHandler {
 	return &AdminHandler{
@@ -374,6 +381,249 @@ func (h *AdminHandler) GetOrganization(c *gin.Context) {
 		"groups_count":              groupsCount,
 		"max_users":                 maxUserNumber,
 		"max_user_number":           maxUserNumber,
+	})
+}
+
+func (h *AdminHandler) readOrgPlanPreviewMemberStats(orgID string) (orgPlanPreviewMemberStats, error) {
+	iter := h.db.Session().Query(`
+		SELECT role, status FROM users WHERE org_id = ?
+	`, orgID).Iter()
+
+	stats := orgPlanPreviewMemberStats{}
+	var role, status string
+	for iter.Scan(&role, &status) {
+		stats.TotalMembers++
+		if normalizeUserStatus(status) != StatusActive {
+			continue
+		}
+		stats.ActiveMembers++
+		if role == string(middleware.RoleOwner) || role == string(middleware.RoleAdmin) || role == string(middleware.RoleSuperAdmin) {
+			stats.ProtectedActiveMembers++
+		} else {
+			stats.RegularActiveMembers++
+		}
+	}
+	if err := iter.Close(); err != nil {
+		return orgPlanPreviewMemberStats{}, err
+	}
+	return stats, nil
+}
+
+func calculateUsersToDeactivateForMaxUsers(maxUsers int, stats orgPlanPreviewMemberStats) int {
+	if maxUsers <= 0 {
+		return 0
+	}
+	if stats.ProtectedActiveMembers >= maxUsers {
+		return stats.RegularActiveMembers
+	}
+	allowedRegular := maxUsers - stats.ProtectedActiveMembers
+	if stats.RegularActiveMembers > allowedRegular {
+		return stats.RegularActiveMembers - allowedRegular
+	}
+	return 0
+}
+
+// PreviewOrganizationPlanChange evaluates the impact of a proposed org quota or plan change.
+// POST /admin/organizations/:org_id/preview-plan-change/
+func (h *AdminHandler) PreviewOrganizationPlanChange(c *gin.Context) {
+	callerOrgID := c.GetString("org_id")
+	callerUserID := c.GetString("user_id")
+	if err := h.requireAdminAccess(c, callerOrgID, callerUserID); err != nil {
+		return
+	}
+
+	orgID := c.Param("org_id")
+
+	var req struct {
+		Plan                   *string    `json:"plan"`
+		QuotaPolicy            *string    `json:"quota_policy"`
+		BillingCycle           *string    `json:"billing_cycle"`
+		StorageQuota           *int64     `json:"storage_quota"`
+		TrafficQuota           *int64     `json:"traffic_quota"`
+		TrafficUploadQuota     *int64     `json:"traffic_upload_quota"`
+		TrafficDownloadQuota   *int64     `json:"traffic_download_quota"`
+		MaxUsers               *int       `json:"max_users"`
+		CurrentPeriodStartedAt *time.Time `json:"current_period_started_at"`
+		CurrentPeriodEndsAt    *time.Time `json:"current_period_ends_at"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		return
+	}
+
+	var currentPlan, currentQuotaPolicy, currentBillingCycle string
+	var currentStorageQuota, currentTrafficQuota, currentTrafficUploadQuota, currentTrafficDownloadQuota int64
+	var currentMaxUsers int
+	var currentPeriodStartedAt, currentPeriodEndsAt *time.Time
+	if err := h.db.Session().Query(`
+		SELECT plan, quota_policy, billing_cycle,
+		       storage_quota, traffic_quota, traffic_upload_quota, traffic_download_quota,
+		       max_users, current_period_started_at, current_period_ends_at
+		FROM organizations WHERE org_id = ?
+	`, orgID).Scan(
+		&currentPlan,
+		&currentQuotaPolicy,
+		&currentBillingCycle,
+		&currentStorageQuota,
+		&currentTrafficQuota,
+		&currentTrafficUploadQuota,
+		&currentTrafficDownloadQuota,
+		&currentMaxUsers,
+		&currentPeriodStartedAt,
+		&currentPeriodEndsAt,
+	); err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "organization not found"})
+		return
+	}
+
+	proposedPlan := currentPlan
+	if req.Plan != nil {
+		proposedPlan = strings.TrimSpace(*req.Plan)
+	}
+	proposedQuotaPolicy := currentQuotaPolicy
+	if req.QuotaPolicy != nil {
+		proposedQuotaPolicy = strings.TrimSpace(*req.QuotaPolicy)
+	}
+	if proposedQuotaPolicy == "" {
+		proposedQuotaPolicy = "hard"
+	}
+	if proposedQuotaPolicy != "hard" && proposedQuotaPolicy != "soft" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "quota_policy must be 'hard' or 'soft'"})
+		return
+	}
+
+	proposedBillingCycle := currentBillingCycle
+	if req.BillingCycle != nil {
+		proposedBillingCycle = strings.TrimSpace(*req.BillingCycle)
+	}
+	proposedStorageQuota := currentStorageQuota
+	if req.StorageQuota != nil {
+		proposedStorageQuota = *req.StorageQuota
+	}
+	proposedTrafficQuota := currentTrafficQuota
+	if req.TrafficQuota != nil {
+		proposedTrafficQuota = *req.TrafficQuota
+	}
+	proposedTrafficUploadQuota := currentTrafficUploadQuota
+	if req.TrafficUploadQuota != nil {
+		proposedTrafficUploadQuota = *req.TrafficUploadQuota
+	}
+	proposedTrafficDownloadQuota := currentTrafficDownloadQuota
+	if req.TrafficDownloadQuota != nil {
+		proposedTrafficDownloadQuota = *req.TrafficDownloadQuota
+	}
+	proposedMaxUsers := currentMaxUsers
+	if req.MaxUsers != nil {
+		proposedMaxUsers = *req.MaxUsers
+	}
+
+	previewPeriodStart := currentPeriodStartedAt
+	if req.CurrentPeriodStartedAt != nil {
+		previewPeriodStart = req.CurrentPeriodStartedAt
+	}
+	previewPeriodEnd := currentPeriodEndsAt
+	if req.CurrentPeriodEndsAt != nil {
+		previewPeriodEnd = req.CurrentPeriodEndsAt
+	}
+	if previewPeriodStart != nil && previewPeriodEnd != nil && previewPeriodEnd.Before(*previewPeriodStart) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "current_period_ends_at must be greater than or equal to current_period_started_at"})
+		return
+	}
+
+	now := time.Now().UTC()
+	effectivePeriodStart := traffic.EffectivePeriodStart(previewPeriodStart, now)
+	if previewPeriodEnd == nil || previewPeriodEnd.IsZero() {
+		derived := config.QuotaPeriodEnd(effectivePeriodStart)
+		previewPeriodEnd = &derived
+	}
+
+	storageSnapshot := traffic.ReadStorageSnapshot(h.db, fmt.Sprintf("org:%s", orgID))
+	periodUsage := traffic.ReadOrgPeriodUsage(h.db, orgID, effectivePeriodStart)
+	memberStats, err := h.readOrgPlanPreviewMemberStats(orgID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to evaluate organization members"})
+		return
+	}
+
+	wouldExceedStorage := proposedStorageQuota > 0 && storageSnapshot.BytesUsed > proposedStorageQuota
+	wouldExceedTraffic := proposedTrafficQuota > 0 && periodUsage.Combined > proposedTrafficQuota
+	wouldExceedUploadTraffic := proposedTrafficUploadQuota > 0 && periodUsage.Upload > proposedTrafficUploadQuota
+	wouldExceedDownloadTraffic := proposedTrafficDownloadQuota > 0 && periodUsage.Download > proposedTrafficDownloadQuota
+	wouldExceedMaxUsers := proposedMaxUsers > 0 && memberStats.TotalMembers > proposedMaxUsers
+	newUserCreationWouldBeBlocked := proposedMaxUsers > 0 && memberStats.TotalMembers >= proposedMaxUsers
+	usersToDeactivateCount := calculateUsersToDeactivateForMaxUsers(proposedMaxUsers, memberStats)
+	writesWouldBeBlocked := proposedQuotaPolicy == "hard" && (wouldExceedStorage || wouldExceedTraffic || wouldExceedUploadTraffic || wouldExceedDownloadTraffic)
+
+	warnings := []string{}
+	if wouldExceedStorage {
+		warnings = append(warnings, "Current storage usage is above the proposed storage quota.")
+	}
+	if wouldExceedTraffic {
+		warnings = append(warnings, "Current combined traffic usage for the active quota period is above the proposed traffic quota.")
+	}
+	if wouldExceedUploadTraffic {
+		warnings = append(warnings, "Current upload traffic usage for the active quota period is above the proposed upload traffic quota.")
+	}
+	if wouldExceedDownloadTraffic {
+		warnings = append(warnings, "Current download traffic usage for the active quota period is above the proposed download traffic quota.")
+	}
+	if wouldExceedMaxUsers {
+		warnings = append(warnings, "Current organization membership exceeds the proposed max_users limit.")
+	} else if newUserCreationWouldBeBlocked {
+		warnings = append(warnings, "The organization would be exactly at the proposed max_users limit; new user creation would be blocked until membership drops below the limit.")
+	}
+	if usersToDeactivateCount > 0 {
+		warnings = append(warnings, fmt.Sprintf("Up to %d active non-staff member(s) may need deactivation if the proposed max_users limit must be enforced operationally.", usersToDeactivateCount))
+	}
+	if writesWouldBeBlocked {
+		warnings = append(warnings, "Because the proposed quota_policy is hard, storage or traffic writes would be blocked immediately after the change if applied now.")
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"org_id":                             orgID,
+		"safe_to_apply":                      !wouldExceedStorage && !wouldExceedTraffic && !wouldExceedUploadTraffic && !wouldExceedDownloadTraffic && !wouldExceedMaxUsers,
+		"would_exceed_storage":               wouldExceedStorage,
+		"would_exceed_traffic":               wouldExceedTraffic,
+		"would_exceed_upload_traffic":        wouldExceedUploadTraffic,
+		"would_exceed_download_traffic":      wouldExceedDownloadTraffic,
+		"would_exceed_max_users":             wouldExceedMaxUsers,
+		"new_user_creation_would_be_blocked": newUserCreationWouldBeBlocked,
+		"users_to_deactivate_count":          usersToDeactivateCount,
+		"writes_would_be_blocked":            writesWouldBeBlocked,
+		"traffic_would_reset_on":             previewPeriodEnd.UTC().Format(time.RFC3339),
+		"storage_used":                       storageSnapshot.BytesUsed,
+		"traffic_combined_used":              periodUsage.Combined,
+		"traffic_upload_used":                periodUsage.Upload,
+		"traffic_download_used":              periodUsage.Download,
+		"current_members":                    memberStats.TotalMembers,
+		"active_members":                     memberStats.ActiveMembers,
+		"protected_active_members":           memberStats.ProtectedActiveMembers,
+		"regular_active_members":             memberStats.RegularActiveMembers,
+		"current": gin.H{
+			"plan":                      currentPlan,
+			"quota_policy":              currentQuotaPolicy,
+			"billing_cycle":             currentBillingCycle,
+			"storage_quota":             currentStorageQuota,
+			"traffic_quota":             currentTrafficQuota,
+			"traffic_upload_quota":      currentTrafficUploadQuota,
+			"traffic_download_quota":    currentTrafficDownloadQuota,
+			"max_users":                 currentMaxUsers,
+			"current_period_started_at": currentPeriodStartedAt,
+			"current_period_ends_at":    currentPeriodEndsAt,
+		},
+		"proposed": gin.H{
+			"plan":                      proposedPlan,
+			"quota_policy":              proposedQuotaPolicy,
+			"billing_cycle":             proposedBillingCycle,
+			"storage_quota":             proposedStorageQuota,
+			"traffic_quota":             proposedTrafficQuota,
+			"traffic_upload_quota":      proposedTrafficUploadQuota,
+			"traffic_download_quota":    proposedTrafficDownloadQuota,
+			"max_users":                 proposedMaxUsers,
+			"current_period_started_at": effectivePeriodStart,
+			"current_period_ends_at":    previewPeriodEnd,
+		},
+		"warnings": warnings,
 	})
 }
 

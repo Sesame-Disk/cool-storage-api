@@ -157,6 +157,7 @@ export const orgEnableAdminCustomName = orgPageOptions.orgEnableAdminCustomName 
 export const orgEnableAdminInviteUser = orgPageOptions.orgEnableAdminInviteUser === 'True';
 export const enableMultiADFS = orgPageOptions.enableMultiADFS === 'True';
 export const enableSubscription = orgPageOptions.enableSubscription || false;
+export const accountsOrgUserManagementURL = orgPageOptions.accountsOrgUserManagementURL || '';
 
 // sys admin
 export const constanceEnabled = sysAdminPageOptions.constance_enabled || '';

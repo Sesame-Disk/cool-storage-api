@@ -13,7 +13,8 @@
 #   CASSANDRA_*, S3_BUCKET, S3_REGION, S3_ENDPOINT,
 #   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, BILLING_URL,
 #   GC_ENABLED,
-#   ACCOUNTS_PASSWORD_CHANGE_URL, ACCOUNTS_DELETE_ACCOUNT_URL
+#   ACCOUNTS_PASSWORD_CHANGE_URL, ACCOUNTS_DELETE_ACCOUNT_URL,
+#   ACCOUNTS_DISABLE_ORG_USER_WRITES
 # =============================================================================
 
 server:
@@ -111,6 +112,8 @@ billing:
 accounts:
   password_change_url: ""      # Required in production via ACCOUNTS_PASSWORD_CHANGE_URL
   delete_account_url: ""       # Required in production via ACCOUNTS_DELETE_ACCOUNT_URL
+  org_user_management_url: ""  # Optional Accounts org-member base URL; supports {org_id}. SesameFS appends view/action/user_email query params. Override with ACCOUNTS_ORG_USER_MANAGEMENT_URL
+  disable_org_user_writes: true # Keep tenant org-admin user writes disabled unless explicitly re-enabled
 
 # =============================================================================
 # Organization plan/template defaults
@@ -124,11 +127,11 @@ organizations:
       plan: free
       quota_policy: hard
       billing_cycle: monthly
-      storage_quota: 2000000000
-      traffic_quota: 10000000000
-      traffic_upload_quota: -1
-      traffic_download_quota: -1
-      max_users: 1
+      storage_quota: 2000000000      # any value <= 0 disables the org storage cap in SesameFS
+      traffic_quota: 10000000000     # any value <= 0 disables the combined traffic cap in SesameFS
+      traffic_upload_quota: -1       # any value <= 0 disables the upload-direction cap
+      traffic_download_quota: -1     # any value <= 0 disables the download-direction cap
+      max_users: 1                   # any value <= 0 disables the member cap in SesameFS
       chunking_polynomial: 17592186044415
       settings:
         theme: default

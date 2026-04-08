@@ -607,6 +607,7 @@ func (s *Server) buildOrgBootstrapPageOptions(orgID string, orgData bootstrapOrg
 	pageOptions["orgMembers"] = orgData.CurrentUsers
 	pageOptions["orgMembersQuota"] = effectiveMaxUsers
 	pageOptions["hasUserAvailability"] = hasUserAvailability
+	pageOptions["accountsOrgUserManagementURL"] = s.config.ResolveAccountsOrgUserManagementURL(orgID)
 	pageOptions["orgEnableAdminCustomLogo"] = "True"
 	pageOptions["orgEnableAdminCustomName"] = "True"
 	pageOptions["orgEnableAdminInviteUser"] = "True"

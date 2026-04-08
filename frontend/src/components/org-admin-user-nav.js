@@ -5,13 +5,14 @@ import { siteRoot, gettext } from '../utils/constants';
 
 const propTypes = {
   email: PropTypes.string.isRequired,
-  currentItem: PropTypes.string.isRequired
+  currentItem: PropTypes.string.isRequired,
+  manageInAccountsURL: PropTypes.string,
 };
 
 class OrgAdminUserNav extends React.Component {
 
   render() {
-    const { email, currentItem } = this.props;
+    const { email, currentItem, manageInAccountsURL } = this.props;
     const urlBase = `${siteRoot}org/useradmin/info/${encodeURIComponent(email)}/`;
     return (
       <div className="cur-view-path org-admin-user-nav">
@@ -25,6 +26,13 @@ class OrgAdminUserNav extends React.Component {
           <li className="nav-item">
             <Link to={`${urlBase}shared-repos/`} className={`nav-link${currentItem === 'shared-repos' ? ' active' : ''}`}>{gettext('Shared Libraries')}</Link>
           </li>
+          {manageInAccountsURL && (
+            <li className="nav-item">
+              <a href={manageInAccountsURL} className="nav-link" target="_blank" rel="noopener noreferrer">
+                <i className="fas fa-external-link-alt mr-1"></i>{gettext('Manage in Accounts')}
+              </a>
+            </li>
+          )}
         </ul>
       </div>
     );

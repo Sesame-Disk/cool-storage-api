@@ -7,7 +7,8 @@ import ModalPortal from '../../components/modal-portal';
 import toaster from '../../components/toast';
 import { seafileAPI } from '../../utils/seafile-api';
 import OrgUserInfo from '../../models/org-user';
-import { gettext, orgID } from '../../utils/constants';
+import { accountsOrgUserManagementURL, gettext, orgID } from '../../utils/constants';
+import { ACCOUNTS_ORG_USER_ACTIONS, ACCOUNTS_ORG_USER_VIEWS, buildAccountsOrgUserManagementURL } from '../../utils/accounts-org-user-management';
 import { Utils } from '../../utils/utils';
 
 class OrgUsers extends Component {
@@ -16,8 +17,21 @@ class OrgUsers extends Component {
     super(props);
     this.state = {
       orgAdminUsers: [],
-      isShowAddOrgAdminDialog: false
+      isShowAddOrgAdminDialog: false,
+      userWritesDisabled: false,
+      accountsOrgManagementURL: accountsOrgUserManagementURL,
     };
+  }
+
+  componentDidMount() {
+    seafileAPI.orgAdminGetOrgInfo().then((res) => {
+      this.setState({
+        userWritesDisabled: !!res.data.org_user_writes_disabled,
+        accountsOrgManagementURL: res.data.accounts_org_user_management_url || accountsOrgUserManagementURL,
+      });
+    }).catch(() => {
+      this.setState({ userWritesDisabled: false });
+    });
   }
 
   toggleAddOrgAdmin = () => {
@@ -93,13 +107,25 @@ class OrgUsers extends Component {
 
   render() {
     const topBtn = 'btn btn-secondary operation-item';
+    const addAdminURL = buildAccountsOrgUserManagementURL(this.state.accountsOrgManagementURL, {
+      view: ACCOUNTS_ORG_USER_VIEWS.ADMINS,
+      action: ACCOUNTS_ORG_USER_ACTIONS.ADD_ADMIN,
+    });
     let topbarChildren;
     topbarChildren = (
       <Fragment>
-        <button className={topBtn} title={gettext('Add admin')} onClick={this.toggleAddOrgAdmin}>
-          <i className="fas fa-plus-square text-secondary mr-1"></i>{gettext('Add admin')}
-        </button>
-        {this.state.isShowAddOrgAdminDialog &&
+        {this.state.userWritesDisabled ? (
+          addAdminURL && (
+            <a href={addAdminURL} className={topBtn} target="_blank" rel="noopener noreferrer" title={gettext('Add admin in Accounts')}>
+              <i className="fas fa-external-link-alt text-secondary mr-1"></i>{gettext('Add admin')}
+            </a>
+          )
+        ) : (
+          <button className={topBtn} title={gettext('Add admin')} onClick={this.toggleAddOrgAdmin}>
+            <i className="fas fa-plus-square text-secondary mr-1"></i>{gettext('Add admin')}
+          </button>
+        )}
+        {!this.state.userWritesDisabled && this.state.isShowAddOrgAdminDialog &&
           <ModalPortal>
             <AddOrgAdminDialog toggle={this.toggleAddOrgAdmin} onAddedOrgAdmin={this.onAddedOrgAdmin} />
           </ModalPortal>
@@ -114,6 +140,8 @@ class OrgUsers extends Component {
           <div className="cur-view-container">
             <Nav currentItem="admins" />
             <OrgAdminList
+              canManageUsers={!this.state.userWritesDisabled}
+              accountsOrgManagementURL={this.state.accountsOrgManagementURL}
               currentTab="admins"
               toggleDelete={this.toggleOrgAdminDelete}
               toggleRevokeAdmin={this.toggleRevokeAdmin}

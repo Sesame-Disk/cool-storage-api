@@ -196,10 +196,11 @@ func (h *AuthHandler) GetOIDCConfig(c *gin.Context) {
 
 	// Return public configuration (no secrets)
 	c.JSON(http.StatusOK, gin.H{
-		"enabled":   true,
-		"issuer":    h.config.Auth.OIDC.Issuer,
-		"client_id": h.config.Auth.OIDC.ClientID,
-		"scopes":    h.config.Auth.OIDC.Scopes,
+		"enabled":       true,
+		"issuer":        h.config.Auth.OIDC.Issuer,
+		"client_id":     h.config.Auth.OIDC.ClientID,
+		"scopes":        h.config.Auth.OIDC.Scopes,
+		"redirect_uris": h.config.Auth.OIDC.RedirectURIs,
 	})
 }
 

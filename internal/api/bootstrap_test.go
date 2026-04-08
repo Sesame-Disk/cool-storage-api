@@ -124,6 +124,17 @@ func TestBuildBootstrapStorageOptionsUsesRegionLabelsAndDefault(t *testing.T) {
 	}
 }
 
+func TestBuildOrgBootstrapPageOptionsIncludesAccountsOrgManagementURL(t *testing.T) {
+	s := createTestServer()
+	s.config.Accounts.OrgUserManagementURL = "https://accounts.example.com/orgs/{org_id}/users/"
+
+	pageOptions := s.buildOrgBootstrapPageOptions("org-123", bootstrapOrgData{Loaded: true, Name: "Test Org"})
+
+	if pageOptions["accountsOrgUserManagementURL"] != "https://accounts.example.com/orgs/org-123/users/" {
+		t.Fatalf("accountsOrgUserManagementURL = %v, want %q", pageOptions["accountsOrgUserManagementURL"], "https://accounts.example.com/orgs/org-123/users/")
+	}
+}
+
 func TestResolveBootstrapDefaultStorageClassUsesDeterministicSortedFallback(t *testing.T) {
 	s := createTestServer()
 	s.config.Storage.DefaultClass = "missing"

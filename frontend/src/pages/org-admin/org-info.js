@@ -1,7 +1,8 @@
 import React, { Component, Fragment } from 'react';
 import { Button } from 'reactstrap';
 import { seafileAPI } from '../../utils/seafile-api';
-import { billingUrl, gettext, isOrgOwner, orgID, username } from '../../utils/constants';
+import { accountsOrgUserManagementURL, billingUrl, gettext, isOrgOwner, orgID, username } from '../../utils/constants';
+import { ACCOUNTS_ORG_USER_ACTIONS, ACCOUNTS_ORG_USER_VIEWS, buildAccountsOrgUserManagementURL } from '../../utils/accounts-org-user-management';
 import { Utils } from '../../utils/utils';
 import MainPanelTopbar from './main-panel-topbar';
 import TransferOrgOwnershipDialog from '../../components/dialog/transfer-org-ownership-dialog';
@@ -37,6 +38,8 @@ class OrgInfo extends Component {
       active_members: 0,
       isTransferOwnershipDialogOpen: false,
       canTransferOwnership: isOrgOwner,
+      userWritesDisabled: false,
+      accountsOrgManagementURL: accountsOrgUserManagementURL,
     };
   }
 
@@ -90,7 +93,9 @@ class OrgInfo extends Component {
         max_users: res.data.max_users,
         member_quota: res.data.member_quota,
         member_usage: res.data.member_usage,
-        active_members: res.data.active_members
+        active_members: res.data.active_members,
+        userWritesDisabled: !!res.data.org_user_writes_disabled,
+        accountsOrgManagementURL: res.data.accounts_org_user_management_url || accountsOrgUserManagementURL,
       });
     }).catch((error) => {
       this.setState({
@@ -134,6 +139,10 @@ class OrgInfo extends Component {
 
     const memberQuota = this.state.max_users > 0 ? this.state.max_users : this.state.member_quota;
     const showsMemberLimit = memberQuota > 0;
+    const transferOwnershipURL = buildAccountsOrgUserManagementURL(this.state.accountsOrgManagementURL, {
+      view: ACCOUNTS_ORG_USER_VIEWS.MEMBERS,
+      action: ACCOUNTS_ORG_USER_ACTIONS.TRANSFER_OWNERSHIP,
+    });
     const formatQuota = (used, quota) => {
       return quota > 0 ? `${Utils.bytesToSize(used)} / ${Utils.bytesToSize(quota)}` : `${Utils.bytesToSize(used)} / ${gettext('Unlimited')}`;
     };
@@ -152,9 +161,17 @@ class OrgInfo extends Component {
             <div className="cur-view-content">
               {canTransferOwnership && (
                 <div className="mb-3">
-                  <Button color="outline-primary" onClick={this.toggleTransferOwnershipDialog}>
-                    {gettext('Transfer ownership')}
-                  </Button>
+                  {this.state.userWritesDisabled ? (
+                    transferOwnershipURL ? (
+                      <a className="btn btn-outline-primary" href={transferOwnershipURL} target="_blank" rel="noopener noreferrer">
+                        <i className="fas fa-external-link-alt mr-1"></i>{gettext('Transfer ownership')}
+                      </a>
+                    ) : null
+                  ) : (
+                    <Button color="outline-primary" onClick={this.toggleTransferOwnershipDialog}>
+                      {gettext('Transfer ownership')}
+                    </Button>
+                  )}
                 </div>
               )}
               <dl>
@@ -204,7 +221,7 @@ class OrgInfo extends Component {
             </div>
           </div>
         </div>
-        {isTransferOwnershipDialogOpen && (
+        {isTransferOwnershipDialogOpen && !this.state.userWritesDisabled && (
           <TransferOrgOwnershipDialog
             currentOwner={username}
             searchFunc={this.searchOrgAdmins}

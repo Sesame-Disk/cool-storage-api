@@ -3,7 +3,8 @@ import PropTypes from 'prop-types';
 import { Form, FormGroup, Input, Col } from 'reactstrap';
 import { Utils } from '../../utils/utils';
 import { seafileAPI } from '../../utils/seafile-api';
-import { gettext, orgID } from '../../utils/constants';
+import { accountsOrgUserManagementURL, gettext, orgID } from '../../utils/constants';
+import { ACCOUNTS_ORG_USER_ACTIONS, ACCOUNTS_ORG_USER_VIEWS, buildAccountsOrgUserManagementURL } from '../../utils/accounts-org-user-management';
 import toaster from '../../components/toast';
 import UserItem from './org-user-item';
 import OrgUserInfo from '../../models/org-user';
@@ -39,7 +40,7 @@ class OrgUsersSearchUsersResult extends React.Component {
               <th width="30%">{gettext('Name')}</th>
               <th width="15%">{gettext('Status')}</th>
               <th width="20%">
-                <a className="d-inline-block table-sort-op" href="#" >{gettext('Space Used')}</a> / {gettext('Quota')}
+                <span className="d-inline-block table-sort-op">{gettext('Space Used')}</span> / {gettext('Quota')}
               </th>
               <th width="25%">{gettext('Created At')} / {gettext('Last Login')}</th>
               <th width="10%">{/*Operations*/}</th>
@@ -52,6 +53,8 @@ class OrgUsersSearchUsersResult extends React.Component {
                   key={index}
                   user={item}
                   currentTab="users"
+                  canManageUsers={this.props.canManageUsers}
+                  accountsOrgManagementURL={this.props.accountsOrgManagementURL}
                   isItemFreezed={this.state.isItemFreezed}
                   toggleDelete={this.props.toggleDelete}
                   restoreUser={restoreUser}
@@ -70,6 +73,8 @@ class OrgUsersSearchUsersResult extends React.Component {
 }
 
 OrgUsersSearchUsersResult.propTypes = {
+  accountsOrgManagementURL: PropTypes.string,
+  canManageUsers: PropTypes.bool,
   toggleDelete: PropTypes.func.isRequired,
   restoreUser: PropTypes.func,
   orgUsers: PropTypes.array.isRequired,
@@ -94,6 +99,8 @@ class OrgUsersSearchUsers extends Component {
         current_page: 1,
         has_next_page: false,
       },
+      userWritesDisabled: false,
+      accountsOrgManagementURL: accountsOrgUserManagementURL,
     };
   }
 
@@ -104,7 +111,17 @@ class OrgUsersSearchUsers extends Component {
       statusFilter: params.get('status') || 'all',
       currentPage: parseInt(params.get('page') || 1),
       perPage: parseInt(params.get('per_page') || 25)
-    }, () => { this.getItems(this.state.currentPage); });
+    }, () => {
+      seafileAPI.orgAdminGetOrgInfo().then((res) => {
+        this.setState({
+          userWritesDisabled: !!res.data.org_user_writes_disabled,
+          accountsOrgManagementURL: res.data.accounts_org_user_management_url || accountsOrgUserManagementURL,
+        });
+      }).catch(() => {
+        this.setState({ userWritesDisabled: false });
+      });
+      this.getItems(this.state.currentPage);
+    });
   }
 
   getItems = (page = 1) => {
@@ -212,6 +229,12 @@ class OrgUsersSearchUsers extends Component {
 
   render() {
     const { query, isSubmitBtnActive } = this.state;
+    const manageSearchURL = buildAccountsOrgUserManagementURL(this.state.accountsOrgManagementURL, {
+      view: ACCOUNTS_ORG_USER_VIEWS.MEMBERS,
+      action: ACCOUNTS_ORG_USER_ACTIONS.SEARCH_USERS,
+      query: query.trim(),
+      status: this.state.statusFilter,
+    });
 
     return (
       <Fragment>
@@ -237,7 +260,14 @@ class OrgUsersSearchUsers extends Component {
                 </Form>
               </div>
               <div className="mt-4 mb-6">
-                <h4 className="border-bottom font-weight-normal mb-2 pb-1">{gettext('Result')}</h4>
+                <div className="border-bottom font-weight-normal mb-2 pb-1 d-flex align-items-center justify-content-between">
+                  <h4 className="mb-0">{gettext('Result')}</h4>
+                  {this.state.userWritesDisabled && manageSearchURL && (
+                    <a href={manageSearchURL} className="btn btn-outline-secondary btn-sm" target="_blank" rel="noopener noreferrer">
+                      <i className="fas fa-external-link-alt mr-1"></i>{gettext('Manage in Accounts')}
+                    </a>
+                  )}
+                </div>
                 <div className="d-flex align-items-center mb-3">
                   <span className="mr-2">{gettext('Status')}</span>
                   {['all', 'active', 'deactivated', 'deleted'].map(status => {
@@ -260,15 +290,17 @@ class OrgUsersSearchUsers extends Component {
                   })}
                 </div>
                 <OrgUsersSearchUsersResult
+                  accountsOrgManagementURL={this.state.accountsOrgManagementURL}
+                  canManageUsers={!this.state.userWritesDisabled}
                   toggleDelete={this.deleteUser}
                   restoreUser={this.restoreUser}
                   changeStatus={this.changeStatus}
                   orgUsers={this.state.orgUsers}
                 />
                 <div className="paginator">
-                  {this.state.pageInfo.current_page > 1 && <a href="#" onClick={(e) => { e.preventDefault(); this.getPreviousPageList(); }}>{gettext('Previous')}</a>}
+                  {this.state.pageInfo.current_page > 1 && <button type="button" className="btn btn-link p-0" onClick={this.getPreviousPageList}>{gettext('Previous')}</button>}
                   {(this.state.pageInfo.current_page > 1 && this.state.pageInfo.has_next_page) && <span> | </span>}
-                  {this.state.pageInfo.has_next_page && <a href="#" onClick={(e) => { e.preventDefault(); this.getNextPageList(); }}>{gettext('Next')}</a>}
+                  {this.state.pageInfo.has_next_page && <button type="button" className="btn btn-link p-0" onClick={this.getNextPageList}>{gettext('Next')}</button>}
                 </div>
               </div>
             </div>

@@ -13,7 +13,8 @@ import TransferOrgOwnershipDialog from '../../components/dialog/transfer-org-own
 import toaster from '../../components/toast';
 import { seafileAPI } from '../../utils/seafile-api';
 import OrgUserInfo from '../../models/org-user';
-import { billingUrl, gettext, invitationLink, isOrgOwner, orgID, siteRoot, orgEnableAdminInviteUser, username } from '../../utils/constants';
+import { accountsOrgUserManagementURL, billingUrl, gettext, invitationLink, isOrgOwner, orgID, siteRoot, orgEnableAdminInviteUser, username } from '../../utils/constants';
+import { ACCOUNTS_ORG_USER_ACTIONS, ACCOUNTS_ORG_USER_VIEWS, buildAccountsOrgUserManagementURL } from '../../utils/accounts-org-user-management';
 import { getUpgradeState } from '../../utils/upgrade-state';
 import { Utils } from '../../utils/utils';
 
@@ -92,6 +93,8 @@ class OrgUsers extends Component {
       maxUsers: 0,
       currentUsers: 0,
       limitsLoaded: false,
+      userWritesDisabled: false,
+      accountsOrgManagementURL: accountsOrgUserManagementURL,
     };
   }
 
@@ -120,6 +123,8 @@ class OrgUsers extends Component {
         maxUsers: Number(res.data.max_users) || 0,
         currentUsers: Number(res.data.member_usage) || 0,
         limitsLoaded: true,
+        userWritesDisabled: !!res.data.org_user_writes_disabled,
+        accountsOrgManagementURL: res.data.accounts_org_user_management_url || accountsOrgUserManagementURL,
       });
     }).catch(() => {
       this.setState({ limitsLoaded: true });
@@ -346,22 +351,52 @@ class OrgUsers extends Component {
   render() {
     const topBtn = 'btn btn-secondary operation-item';
     const { isFeatureLockedOwner } = getUpgradeState();
-    const { canTransferOwnership, isTransferOwnershipDialogOpen, currentUsers, limitsLoaded, maxUsers, orgPlan } = this.state;
+    const { canTransferOwnership, isTransferOwnershipDialogOpen, currentUsers, limitsLoaded, maxUsers, orgPlan, userWritesDisabled, accountsOrgManagementURL } = this.state;
     const hasUserAvailability = maxUsers <= 0 || currentUsers < maxUsers;
-    const canAddUsers = limitsLoaded && !isFeatureLockedOwner && hasUserAvailability;
+    const canAddUsers = limitsLoaded && !isFeatureLockedOwner && hasUserAvailability && !userWritesDisabled;
+    const addUserURL = buildAccountsOrgUserManagementURL(accountsOrgManagementURL, {
+      view: ACCOUNTS_ORG_USER_VIEWS.MEMBERS,
+      action: ACCOUNTS_ORG_USER_ACTIONS.ADD_USER,
+    });
+    const inviteUsersURL = buildAccountsOrgUserManagementURL(accountsOrgManagementURL, {
+      view: ACCOUNTS_ORG_USER_VIEWS.MEMBERS,
+      action: ACCOUNTS_ORG_USER_ACTIONS.INVITE_USERS,
+    });
+    const transferOwnershipURL = buildAccountsOrgUserManagementURL(accountsOrgManagementURL, {
+      view: ACCOUNTS_ORG_USER_VIEWS.MEMBERS,
+      action: ACCOUNTS_ORG_USER_ACTIONS.TRANSFER_OWNERSHIP,
+    });
 
     let topbarChildren;
     topbarChildren = (
       <Fragment>
         {/* <button className="btn btn-secondary operation-item" onClick={this.toggleImportOrgUsersDialog}>{gettext('Import users')}</button> */}
 
-        {canTransferOwnership && (
+        {canTransferOwnership && !userWritesDisabled && (
           <button className={topBtn} onClick={this.toggleTransferOwnershipDialog}>
             {gettext('Transfer ownership')}
           </button>
         )}
 
-        {isFeatureLockedOwner ? (
+        {userWritesDisabled ? (
+          <Fragment>
+            {canTransferOwnership && transferOwnershipURL && (
+              <a href={transferOwnershipURL} className={topBtn} target="_blank" rel="noopener noreferrer" title={gettext('Transfer ownership in Accounts')}>
+                <i className="fas fa-external-link-alt text-secondary mr-1"></i>{gettext('Transfer ownership')}
+              </a>
+            )}
+            {addUserURL && (
+              <a className={topBtn} href={addUserURL} target="_blank" rel="noopener noreferrer" title={gettext('Add user in Accounts')}>
+                <i className="fas fa-external-link-alt text-secondary mr-1"></i>{gettext('Add user')}
+              </a>
+            )}
+            {orgEnableAdminInviteUser && inviteUsersURL && (
+              <a className={topBtn} href={inviteUsersURL} target="_blank" rel="noopener noreferrer" title={gettext('Invite users in Accounts')}>
+                <i className="fas fa-external-link-alt text-secondary mr-1"></i>{gettext('Invite users')}
+              </a>
+            )}
+          </Fragment>
+        ) : isFeatureLockedOwner ? (
           <div className="d-flex align-items-center">
             <span className="mr-3" style={{ color: '#666' }}>{gettext('Upgrade your plan to unlock additional seats and member management.')}</span>
             <a href={billingUrl} className="btn btn-primary" target="_blank" rel="noopener noreferrer">{gettext('Upgrade Plan')}</a>
@@ -451,6 +486,8 @@ class OrgUsers extends Component {
               })}
             </div>
             <OrgUsersList
+              canManageUsers={!this.state.userWritesDisabled}
+              accountsOrgManagementURL={this.state.accountsOrgManagementURL}
               initOrgUsersData={this.initOrgUsersData}
               toggleDelete={this.toggleOrgUsersDelete}
               restoreUser={this.restoreUser}

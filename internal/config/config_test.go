@@ -375,9 +375,13 @@ func TestEnvOverrideAccounts(t *testing.T) {
 
 	os.Setenv("ACCOUNTS_PASSWORD_CHANGE_URL", "https://accounts.example.com/accounts/password/change/")
 	os.Setenv("ACCOUNTS_DELETE_ACCOUNT_URL", "https://accounts.example.com/accounts/delete/")
+	os.Setenv("ACCOUNTS_ORG_USER_MANAGEMENT_URL", "https://accounts.example.com/orgs/{org_id}/users/")
+	os.Setenv("ACCOUNTS_DISABLE_ORG_USER_WRITES", "true")
 	defer func() {
 		os.Unsetenv("ACCOUNTS_PASSWORD_CHANGE_URL")
 		os.Unsetenv("ACCOUNTS_DELETE_ACCOUNT_URL")
+		os.Unsetenv("ACCOUNTS_ORG_USER_MANAGEMENT_URL")
+		os.Unsetenv("ACCOUNTS_DISABLE_ORG_USER_WRITES")
 	}()
 
 	cfg.applyEnvOverrides()
@@ -387,6 +391,20 @@ func TestEnvOverrideAccounts(t *testing.T) {
 	}
 	if cfg.Accounts.DeleteAccountURL != "https://accounts.example.com/accounts/delete/" {
 		t.Errorf("Accounts.DeleteAccountURL = %s, want https://accounts.example.com/accounts/delete/", cfg.Accounts.DeleteAccountURL)
+	}
+	if cfg.Accounts.OrgUserManagementURL != "https://accounts.example.com/orgs/{org_id}/users/" {
+		t.Errorf("Accounts.OrgUserManagementURL = %s, want https://accounts.example.com/orgs/{org_id}/users/", cfg.Accounts.OrgUserManagementURL)
+	}
+	if !cfg.Accounts.DisableOrgUserWrites {
+		t.Fatalf("Accounts.DisableOrgUserWrites = false, want true")
+	}
+}
+
+func TestDefaultAccountsConfig(t *testing.T) {
+	cfg := DefaultConfig()
+
+	if !cfg.Accounts.DisableOrgUserWrites {
+		t.Fatalf("Accounts.DisableOrgUserWrites = false, want true by default")
 	}
 }
 

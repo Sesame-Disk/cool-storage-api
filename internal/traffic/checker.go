@@ -14,7 +14,7 @@ type QuotaStatus struct {
 	Allowed         bool      // may the operation proceed?
 	Warning         bool      // >80% of the included limit (paid plans only)
 	UsedBytes       int64     // current usage relevant to the check
-	LimitBytes      int64     // limit that was evaluated (-1 = unlimited)
+	LimitBytes      int64     // limit that was evaluated; values <= 0 mean unlimited in SesameFS enforcement
 	Reason          string    // "storage", "traffic-combined", "traffic-upload", "traffic-download", "max-users"
 	Plan            string    // plan name from organizations table
 	PeriodStartedAt time.Time // the quota period resolved during CheckTrafficQuota; zero for non-traffic checks
@@ -57,7 +57,7 @@ func (c *Checker) CheckStorageQuota(orgID string, additionalBytes int64) (QuotaS
 	storageUsed, _ := c.readStorageCounter(fmt.Sprintf("org:%s", orgID))
 
 	if storageQuota <= 0 {
-		// -1 or 0 means unlimited
+		// Any value <= 0 means unlimited.
 		return QuotaStatus{Allowed: true, LimitBytes: -1, UsedBytes: storageUsed, Plan: quotaPolicy}, nil
 	}
 
@@ -211,14 +211,14 @@ func (c *Checker) CheckMaxUsers(orgID string) (QuotaStatus, error) {
 		return QuotaStatus{Allowed: true}, nil
 	}
 
-	// -1 or 0 = unlimited
+	// Any value <= 0 means unlimited.
 	if maxUsers <= 0 {
 		return QuotaStatus{Allowed: true, LimitBytes: -1, Plan: quotaPolicy}, nil
 	}
 
 	// Count current users.
 	// NOTE: COUNT(*) performs a full partition scan in ScyllaDB. Acceptable for v1
-	// because orgs with many users are enterprise (max_users typically -1/unlimited).
+	// because orgs with many users are enterprise (max_users typically <= 0 / unlimited).
 	// For v2, consider a dedicated user_count counter table.
 	var currentUsers int
 	countErr := c.session.Query(`

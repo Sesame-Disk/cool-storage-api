@@ -156,6 +156,8 @@ accounts:
   # and the backend redirects authenticated users to these external destinations.
   password_change_url: "https://t-accounts.sesamedisk.com/accounts/password/change/"
   delete_account_url: "https://t-accounts.sesamedisk.com/accounts/delete/"
+  org_user_management_url: "https://t-accounts.sesamedisk.com/orgs/{org_id}/users/"  # Accounts org-member base URL; SesameFS replaces {org_id} and appends view/action/user_email query params
+  disable_org_user_writes: true   # Keep tenant org-admin user writes disabled by default in local/docker too
 
 organizations:
   default_template: free
@@ -164,11 +166,11 @@ organizations:
       plan: free
       quota_policy: hard
       billing_cycle: monthly
-      storage_quota: 2000000000
-      traffic_quota: 10000000000
-      traffic_upload_quota: -1
-      traffic_download_quota: -1
-      max_users: 1
+      storage_quota: 2000000000      # any value <= 0 disables the org storage cap in SesameFS
+      traffic_quota: 10000000000     # any value <= 0 disables the combined traffic cap in SesameFS
+      traffic_upload_quota: -1       # any value <= 0 disables the upload-direction cap
+      traffic_download_quota: -1     # any value <= 0 disables the download-direction cap
+      max_users: 1                   # any value <= 0 disables the member cap in SesameFS
       chunking_polynomial: 17592186044415
       settings:
         theme: default

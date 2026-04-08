@@ -4,6 +4,8 @@ import { gettext } from '../../utils/constants';
 import UserItem from './org-user-item';
 
 const propTypes = {
+  accountsOrgManagementURL: PropTypes.string,
+  canManageUsers: PropTypes.bool,
   initOrgUsersData: PropTypes.func.isRequired,
   toggleDelete: PropTypes.func.isRequired,
   restoreUser: PropTypes.func,
@@ -86,6 +88,8 @@ class OrgUsersList extends React.Component {
                   key={index}
                   user={item}
                   currentTab="users"
+                  canManageUsers={this.props.canManageUsers}
+                  accountsOrgManagementURL={this.props.accountsOrgManagementURL}
                   isItemFreezed={this.state.isItemFreezed}
                   toggleDelete={this.props.toggleDelete}
                   restoreUser={this.props.restoreUser}

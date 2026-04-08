@@ -131,6 +131,10 @@ accounts:
   # the backend validates auth and redirects to these external destinations.
   password_change_url: ""           # Override with ACCOUNTS_PASSWORD_CHANGE_URL env var
   delete_account_url: ""            # Override with ACCOUNTS_DELETE_ACCOUNT_URL env var
+  org_user_management_url: ""       # Optional Accounts org-member base URL; supports {org_id}. SesameFS appends view/action/user_email query params. Override with ACCOUNTS_ORG_USER_MANAGEMENT_URL
+  # Default is true: tenant org-admin user writes under /api/v2.1/org/:org_id/admin/... are blocked.
+  # Platform superadmins still bypass this tenant lock as an operational fallback, but Accounts should prefer /api/v2.1/admin/.
+  disable_org_user_writes: true      # Override with ACCOUNTS_DISABLE_ORG_USER_WRITES env var
 
 organizations:
   # New organizations, OIDC auto-provisioned orgs, and the seeded default org
@@ -143,9 +147,9 @@ organizations:
       billing_cycle: monthly
       storage_quota: 2000000000          # 2 GB (decimal)
       traffic_quota: 10000000000         # 10 GB combined per period (decimal)
-      traffic_upload_quota: -1           # unlimited per-direction cap
-      traffic_download_quota: -1         # unlimited per-direction cap
-      max_users: 1
+      traffic_upload_quota: -1           # any value <= 0 disables the per-direction upload cap
+      traffic_download_quota: -1         # any value <= 0 disables the per-direction download cap
+      max_users: 1                       # any value <= 0 disables the member cap
       chunking_polynomial: 17592186044415
       settings:
         theme: default

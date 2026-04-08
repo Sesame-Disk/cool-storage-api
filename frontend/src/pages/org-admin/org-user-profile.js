@@ -1,7 +1,8 @@
 import React, { Component, Fragment } from 'react';
 import PropTypes from 'prop-types';
 import { seafileAPI } from '../../utils/seafile-api';
-import { gettext, orgID, orgName } from '../../utils/constants';
+import { accountsOrgUserManagementURL, gettext, orgID, orgName } from '../../utils/constants';
+import { ACCOUNTS_ORG_USER_ACTIONS, ACCOUNTS_ORG_USER_VIEWS, buildAccountsOrgUserManagementURL } from '../../utils/accounts-org-user-management';
 import { Utils } from '../../utils/utils';
 import Loading from '../../components/loading';
 import OrgAdminUserNav from '../../components/org-admin-user-nav';
@@ -18,12 +19,14 @@ class OrgUserProfile extends Component {
     super(props);
     this.state = {
       loading: true,
-      errorMsg: ''
+      errorMsg: '',
+      userWritesDisabled: false,
+      accountsOrgManagementURL: accountsOrgUserManagementURL,
     };
   }
 
   componentDidMount() {
-    const email = decodeURIComponent(this.props.email);
+    const email = this.props.email;
     seafileAPI.orgAdminGetOrgUserInfo(orgID, email).then((res) => {
       this.setState(Object.assign({
         loading: false
@@ -32,6 +35,17 @@ class OrgUserProfile extends Component {
       this.setState({
         loading: false,
         errorMsg: Utils.getErrorMsg(error, true) // true: show login tip if 403
+      });
+    });
+    seafileAPI.orgAdminGetOrgInfo().then((res) => {
+      this.setState({
+        userWritesDisabled: !!res.data.org_user_writes_disabled,
+        accountsOrgManagementURL: res.data.accounts_org_user_management_url || accountsOrgUserManagementURL,
+      });
+    }).catch(() => {
+      this.setState({
+        userWritesDisabled: false,
+        accountsOrgManagementURL: accountsOrgUserManagementURL,
       });
     });
   }
@@ -53,15 +67,38 @@ class OrgUserProfile extends Component {
   };
 
   render() {
+    const email = this.props.email;
+    const manageInAccountsURL = buildAccountsOrgUserManagementURL(this.state.accountsOrgManagementURL, {
+      view: ACCOUNTS_ORG_USER_VIEWS.USER,
+      action: ACCOUNTS_ORG_USER_ACTIONS.MANAGE_USER,
+      userEmail: email,
+    });
+
     return (
       <Fragment>
-        <MainPanelTopbar />
+        <MainPanelTopbar children={manageInAccountsURL ? (
+          <a href={manageInAccountsURL} className="btn btn-secondary operation-item" target="_blank" rel="noopener noreferrer" title={gettext('Manage in Accounts')}>
+            <i className="fas fa-external-link-alt text-secondary mr-1"></i>{gettext('Manage in Accounts')}
+          </a>
+        ) : null} />
         <div className="main-panel-center flex-row">
           <div className="cur-view-container">
-            <OrgAdminUserNav email={this.props.email} currentItem='profile' />
+            <OrgAdminUserNav email={this.props.email} currentItem='profile' manageInAccountsURL={manageInAccountsURL} />
             <div className="cur-view-content">
               <Content
                 data={this.state}
+                canManageIdentity={!this.state.userWritesDisabled}
+                accountsManageUserURL={manageInAccountsURL}
+                accountsEditNameURL={buildAccountsOrgUserManagementURL(this.state.accountsOrgManagementURL, {
+                  view: ACCOUNTS_ORG_USER_VIEWS.USER,
+                  action: ACCOUNTS_ORG_USER_ACTIONS.EDIT_NAME,
+                  userEmail: email,
+                })}
+                accountsEditContactEmailURL={buildAccountsOrgUserManagementURL(this.state.accountsOrgManagementURL, {
+                  view: ACCOUNTS_ORG_USER_VIEWS.USER,
+                  action: ACCOUNTS_ORG_USER_ACTIONS.EDIT_CONTACT_EMAIL,
+                  userEmail: email,
+                })}
                 updateName={this.updateName}
                 updateContactEmail={this.updateContactEmail}
                 updateQuota={this.updateQuota}
@@ -111,6 +148,12 @@ class Content extends Component {
       traffic_upload_quota, traffic_download_quota,
       org_storage_quota, org_traffic_quota, org_traffic_upload_quota, org_traffic_download_quota,
     } = this.props.data;
+    const {
+      canManageIdentity,
+      accountsEditNameURL,
+      accountsEditContactEmailURL,
+      accountsManageUserURL,
+    } = this.props;
     const { isSetNameDialogOpen, isSetContactEmailDialogOpen, isSetQuotaDialogOpen } = this.state;
 
     // Effective quota: use user's individual quota, fall back to org per-direction, then org combined.
@@ -147,17 +190,30 @@ class Content extends Component {
           <dt>{gettext('Name')}</dt>
           <dd>
             {name || '--'}
-            <span title={gettext('Edit')} className="attr-action-icon fa fa-pencil-alt" onClick={this.toggleSetNameDialog}></span>
+            {canManageIdentity ? (
+              <span title={gettext('Edit')} className="attr-action-icon fa fa-pencil-alt" onClick={this.toggleSetNameDialog}></span>
+            ) : accountsEditNameURL ? (
+              <a href={accountsEditNameURL} target="_blank" rel="noopener noreferrer" title={gettext('Edit in Accounts')} className="attr-action-icon fas fa-external-link-alt"></a>
+            ) : null}
           </dd>
 
           <dt>{gettext('Contact Email')}</dt>
           <dd>
             {contact_email || '--'}
-            <span title={gettext('Edit')} className="attr-action-icon fa fa-pencil-alt" onClick={this.toggleSetContactEmailDialog}></span>
+            {canManageIdentity ? (
+              <span title={gettext('Edit')} className="attr-action-icon fa fa-pencil-alt" onClick={this.toggleSetContactEmailDialog}></span>
+            ) : accountsEditContactEmailURL ? (
+              <a href={accountsEditContactEmailURL} target="_blank" rel="noopener noreferrer" title={gettext('Edit in Accounts')} className="attr-action-icon fas fa-external-link-alt"></a>
+            ) : null}
           </dd>
 
           <dt>{gettext('Organization')}</dt>
-          <dd>{orgName}</dd>
+          <dd>
+            {orgName}
+            {accountsManageUserURL && (
+              <a href={accountsManageUserURL} target="_blank" rel="noopener noreferrer" title={gettext('Manage in Accounts')} className="attr-action-icon fas fa-external-link-alt"></a>
+            )}
+          </dd>
 
           <dt>{gettext('Space Used / Quota')}</dt>
           <dd>
@@ -216,6 +272,10 @@ class Content extends Component {
 }
 
 Content.propTypes = {
+  accountsEditContactEmailURL: PropTypes.string,
+  accountsEditNameURL: PropTypes.string,
+  accountsManageUserURL: PropTypes.string,
+  canManageIdentity: PropTypes.bool,
   data: PropTypes.object.isRequired,
   updateName: PropTypes.func.isRequired,
   updateContactEmail: PropTypes.func.isRequired,

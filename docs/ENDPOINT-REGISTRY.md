@@ -1051,6 +1051,15 @@ Before implementing a new endpoint:
 **Response**: `{ "success": true }`
 **Added**: 2026-03-18
 
+### POST /api/v2.1/admin/organizations/:org_id/preview-plan-change/
+**Handler**: `AdminHandler.PreviewOrganizationPlanChange`
+**File**: `internal/api/v2/admin.go`
+**Registration**: `RegisterAdminRoutes` in admin.go (superadminOnly group)
+**Purpose**: Preview the impact of proposed plan, quota, and quota-period changes before applying them.
+**Auth**: Superadmin only.
+**Response**: Impact summary including `would_exceed_*`, `users_to_deactivate_count`, `writes_would_be_blocked`, `traffic_would_reset_on`, and `current`/`proposed` snapshots. Proposed quota values `<=0` are treated as unlimited for SesameFS enforcement.
+**Added**: 2026-04-08
+
 ---
 
 ## Superadmin — Departments, Address Book, Group-Owned Libraries (2026-03-05)
@@ -1128,7 +1137,7 @@ Two route groups: `/api/v2.1/org/admin/` (no org_id) and `/api/v2.1/org/:org_id/
 ### GET /api/v2.1/org/admin/info/
 **Handler**: `OrgAdminHandler.GetOrgInfo`
 **File**: `internal/api/v2/org_admin.go`
-**Purpose**: Get organization info for org admin
+**Purpose**: Get organization info for org admin, including `org_user_writes_disabled` and `user_management_authority`
 **Added**: 2026-03-05
 
 ### PUT /api/v2.1/org/admin/info/
@@ -1146,7 +1155,7 @@ Two route groups: `/api/v2.1/org/admin/` (no org_id) and `/api/v2.1/org/:org_id/
 ### POST /api/v2.1/org/:org_id/admin/users/
 **Handler**: `OrgAdminHandler.AddOrgUser`
 **File**: `internal/api/v2/org_admin.go`
-**Purpose**: Add user to org
+**Purpose**: Add user to org. Blocked for tenant org-admin by default when `accounts.disable_org_user_writes=true`; platform superadmins still bypass that tenant lock as an operational fallback.
 **Added**: 2026-03-05
 
 ### GET /api/v2.1/org/:org_id/admin/users/:email/
@@ -1158,19 +1167,19 @@ Two route groups: `/api/v2.1/org/admin/` (no org_id) and `/api/v2.1/org/:org_id/
 ### PUT /api/v2.1/org/:org_id/admin/users/:email/
 **Handler**: `OrgAdminHandler.UpdateOrgUser`
 **File**: `internal/api/v2/org_admin.go`
-**Purpose**: Update user role, quota, name
+**Purpose**: Update user role, quota, name. Blocked for tenant org-admin by default when `accounts.disable_org_user_writes=true`; platform superadmins still bypass that tenant lock as an operational fallback.
 **Added**: 2026-03-05
 
 ### DELETE /api/v2.1/org/:org_id/admin/users/:email/
 **Handler**: `OrgAdminHandler.DeleteOrgUser`
 **File**: `internal/api/v2/org_admin.go`
-**Purpose**: Delete user from org
+**Purpose**: Delete user from org. Blocked for tenant org-admin by default when `accounts.disable_org_user_writes=true`; platform superadmins still bypass that tenant lock as an operational fallback.
 **Added**: 2026-03-05
 
 ### PUT /api/v2.1/org/:org_id/admin/users/:email/set-password/
 **Handler**: `OrgAdminHandler.ResetOrgUserPassword`
 **File**: `internal/api/v2/org_admin.go`
-**Purpose**: Reset user password
+**Purpose**: Reset user password. Blocked for tenant org-admin by default when `accounts.disable_org_user_writes=true`; platform superadmins still bypass that tenant lock as an operational fallback.
 **Added**: 2026-03-05
 
 ### GET /api/v2.1/org/:org_id/admin/users/:email/repos/

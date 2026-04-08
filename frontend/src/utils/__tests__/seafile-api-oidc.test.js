@@ -147,8 +147,10 @@ describe('OIDC API Methods in seafile-api.js', () => {
       expect(apiContent).toMatch(/logout[\s\S]*?\/api\/v2\.1\/auth\/oidc\/logout\//);
     });
 
-    test('logout function clears local token', () => {
-      expect(apiContent).toMatch(/logout[\s\S]*?localStorage\.removeItem.*TOKEN_KEY/);
+    test('logout function clears auth state through auth-state helper', () => {
+      const authStateContent = getAuthStateContent();
+      expect(apiContent).toMatch(/logout[\s\S]*?clearAuth\(/);
+      expect(authStateContent).toMatch(/clearAuth[\s\S]*?localStorage\.removeItem\(TOKEN_KEY\)/);
     });
 
     test('logout function redirects to OIDC logout URL if available', () => {
@@ -168,8 +170,10 @@ describe('OIDC API Methods in seafile-api.js', () => {
       expect(apiContent).toMatch(/function\s+setAuthToken\s*\(/);
     });
 
-    test('setAuthToken stores token in localStorage', () => {
-      expect(apiContent).toMatch(/setAuthToken[\s\S]*?localStorage\.setItem.*TOKEN_KEY/);
+    test('setAuthToken delegates token persistence to auth-state', () => {
+      const authStateContent = getAuthStateContent();
+      expect(apiContent).toMatch(/setAuthToken[\s\S]*?setAuthTokenAndCookie/);
+      expect(authStateContent).toMatch(/setAuthTokenAndCookie[\s\S]*?localStorage\.setItem\(TOKEN_KEY, token\)/);
     });
 
     test('setAuthToken reinitializes seafileAPI', () => {
