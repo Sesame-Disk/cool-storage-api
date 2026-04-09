@@ -643,7 +643,7 @@ func TestWorker_ProcessUserCascade_FullCascade(t *testing.T) {
 	store.AddOrganization(orgID)
 	store.AddUser(orgID, userID, "alice@test.com")
 	store.AddGroupMembership(orgID, userID, groupID)
-	store.AddShareByUser(userID, libID)
+	store.AddShareByUser(orgID, userID, libID)
 	store.AddStarredFile(userID)
 	store.AddMonitoredRepo(userID)
 
@@ -669,6 +669,9 @@ func TestWorker_ProcessUserCascade_FullCascade(t *testing.T) {
 	}
 	if store.HasMonitoredRepos(userID) {
 		t.Error("monitored repos should be deleted after user cascade")
+	}
+	if store.HasShareByUser(userID, libID) {
+		t.Error("received share index should be deleted after user cascade")
 	}
 
 	// Audit log should have an entry

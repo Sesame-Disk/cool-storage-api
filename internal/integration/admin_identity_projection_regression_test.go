@@ -3,6 +3,7 @@
 package integration
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -209,10 +210,98 @@ func TestAdminIdentityProjectionRegression_HardDeleteUser(t *testing.T) {
 	})
 }
 
+func TestAdminIdentityProjectionRegression_GCDeletedPlatformUser(t *testing.T) {
+	userEmail := fmt.Sprintf("inttest-platform-deleted-user-%d@sesamefs.local", time.Now().UnixNano())
+	userName := "platform-gc-user"
+
+	createResp := superadminClient.PostJSON(t, "/api/v2.1/admin/users/", map[string]string{
+		"email": userEmail,
+		"name":  userName,
+	})
+	expectStatus(t, createResp, http.StatusCreated)
+	createResp.Body.Close()
+
+	userID, found := lookupUserIDByEmail(t, userEmail)
+	if !found {
+		t.Fatalf("expected user_id for %s", userEmail)
+	}
+
+	t.Cleanup(func() {
+		if !canonicalUserExists(t, platformOrgID, userID, userEmail) {
+			return
+		}
+		store := gcpkg.NewCassandraStore(shareProjectionDBForTest(t))
+		if err := store.HardDeleteUser(mustParseUUID(t, platformOrgID), mustParseUUID(t, userID), userEmail); err != nil {
+			t.Fatalf("cleanup hard delete platform user %s failed: %v", userEmail, err)
+		}
+	})
+
+	deleteResp := superadminClient.Delete(t, "/api/v2.1/admin/users/"+url.PathEscape(userEmail)+"/")
+	expectStatus(t, deleteResp, http.StatusOK)
+	deleteResp.Body.Close()
+
+	waitForIntegrationCondition(t, "soft-deleted platform user to appear in deleted admin user list before GC hard delete", func() bool {
+		return adminUserPresentInStatusList(t, "deleted", userEmail)
+	})
+
+	waitForIntegrationCondition(t, "soft-deleted platform user to remain in canonical deleted state before GC hard delete", func() bool {
+		return canonicalUserStatusIs(t, platformOrgID, userID, "deleted")
+	})
+
+	store := gcpkg.NewCassandraStore(shareProjectionDBForTest(t))
+	deletedUsers, err := store.ListDeletedUsersExpired(0)
+	if err != nil {
+		t.Fatalf("list deleted users expired failed: %v", err)
+	}
+
+	foundDeletedUser := false
+	for _, item := range deletedUsers {
+		if item.OrgID == mustParseUUID(t, platformOrgID) && item.UserID == mustParseUUID(t, userID) && item.Email == userEmail {
+			foundDeletedUser = true
+			break
+		}
+	}
+	if !foundDeletedUser {
+		t.Fatalf("expected deleted platform user %s (%s) to be returned by ListDeletedUsersExpired", userEmail, userID)
+	}
+
+	if err := store.HardDeleteUser(mustParseUUID(t, platformOrgID), mustParseUUID(t, userID), userEmail); err != nil {
+		t.Fatalf("hard delete platform user failed: %v", err)
+	}
+
+	waitForIntegrationCondition(t, "hard-deleted platform user to disappear from canonical and deleted admin user list", func() bool {
+		if canonicalUserExists(t, platformOrgID, userID, userEmail) {
+			return false
+		}
+		if _, ok := adminUserProjectionByID(t, platformOrgID, userID); ok {
+			return false
+		}
+		return !adminUserPresentInStatusList(t, "deleted", userEmail)
+	})
+}
+
 func TestAdminIdentityProjectionRegression_HardDeleteOrganization(t *testing.T) {
 	orgName := fmt.Sprintf("inttest-admin-hard-delete-org-%d", time.Now().UnixNano())
 	ownerEmail := fmt.Sprintf("inttest-admin-hard-delete-org-owner-%d@sesamefs.local", time.Now().UnixNano())
 	orgID := createAdminIdentityTestOrganization(t, orgName, ownerEmail)
+	ownerUserID, found := lookupUserIDByEmail(t, ownerEmail)
+	if !found {
+		t.Fatalf("expected owner user_id for %s", ownerEmail)
+	}
+
+	t.Cleanup(func() {
+		store := gcpkg.NewCassandraStore(shareProjectionDBForTest(t))
+		if canonicalUserExists(t, orgID, ownerUserID, ownerEmail) {
+			if err := store.HardDeleteUser(mustParseUUID(t, orgID), mustParseUUID(t, ownerUserID), ownerEmail); err != nil {
+				t.Fatalf("cleanup hard delete owner user %s failed: %v", ownerEmail, err)
+			}
+		}
+		if canonicalOrganizationExists(t, orgID) {
+			if err := store.HardDeleteOrg(mustParseUUID(t, orgID)); err != nil {
+				t.Fatalf("cleanup hard delete organization %s failed: %v", orgID, err)
+			}
+		}
+	})
 
 	deleteResp := superadminClient.Delete(t, "/api/v2.1/admin/organizations/"+orgID+"/")
 	expectStatus(t, deleteResp, http.StatusOK)
@@ -230,8 +319,19 @@ func TestAdminIdentityProjectionRegression_HardDeleteOrganization(t *testing.T) 
 	})
 
 	store := gcpkg.NewCassandraStore(shareProjectionDBForTest(t))
-	if err := store.HardDeleteOrg(mustParseUUID(t, orgID)); err != nil {
-		t.Fatalf("hard delete organization failed: %v", err)
+	queue := gcpkg.NewQueue(store)
+	queuedAt := time.Now().Add(-time.Second)
+	orgUUID := mustParseUUID(t, orgID)
+	if err := store.EnqueueItem(orgUUID, queuedAt, gcpkg.ItemOrgCascade, orgID, uuid.Nil, "", 0); err != nil {
+		t.Fatalf("enqueue org cascade failed: %v", err)
+	}
+	worker := gcpkg.NewWorker(store, nil, queue, 100, 0, false, &gcpkg.Stats{})
+	processed, err := worker.ProcessOnce(context.Background())
+	if err != nil {
+		t.Fatalf("process org cascade failed: %v", err)
+	}
+	if processed == 0 {
+		t.Fatalf("expected org cascade worker to process at least one item")
 	}
 
 	waitForIntegrationCondition(t, "hard-deleted organization to disappear from canonical and admin projections", func() bool {
@@ -244,7 +344,10 @@ func TestAdminIdentityProjectionRegression_HardDeleteOrganization(t *testing.T) 
 		if _, ok := adminOrganizationProjectionByID(t, orgID); ok {
 			return false
 		}
-		return !adminOrganizationPresentInStatusList(t, "deleted", orgID, orgName, ownerEmail)
+		if canonicalUserExists(t, orgID, ownerUserID, ownerEmail) {
+			return false
+		}
+		return !adminOrganizationPresentInStatusList(t, "deleted", orgID, orgName, ownerEmail) && !adminUserPresentInStatusList(t, "active", ownerEmail)
 	})
 }
 
@@ -645,6 +748,29 @@ func adminUserPresentInSearch(t *testing.T, email, role string) bool {
 		rowEmail, _ := row["email"].(string)
 		rowRole, _ := row["role"].(string)
 		if rowEmail == email && rowRole == role {
+			return true
+		}
+	}
+	return false
+}
+
+func adminUserPresentInStatusList(t *testing.T, status, email string) bool {
+	t.Helper()
+
+	resp := superadminClient.Get(t, "/api/v2.1/admin/users/?status="+url.QueryEscape(status)+"&page=1&per_page=100")
+	expectStatus(t, resp, http.StatusOK)
+	payload := responseJSON(t, resp)
+	entries, ok := payload["data"].([]interface{})
+	if !ok {
+		return false
+	}
+	for _, entry := range entries {
+		row, ok := entry.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		rowEmail, _ := row["email"].(string)
+		if rowEmail == email {
 			return true
 		}
 	}

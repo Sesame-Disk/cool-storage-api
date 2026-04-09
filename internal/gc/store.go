@@ -67,7 +67,6 @@ type GCStore interface {
 	// Expired shares (user-to-user library shares)
 	ListExpiredShares() ([]ExpiredShareInfo, error)
 	DeleteShare(libraryID, shareID uuid.UUID) error
-	DeleteShareByUser(sharedTo, libraryID uuid.UUID) error
 
 	// Expired restore jobs
 	ListExpiredRestoreJobs() ([]ExpiredRestoreJobInfo, error)
@@ -115,7 +114,7 @@ type GCStore interface {
 	ListGroupMembershipsByUser(orgID, userID uuid.UUID) ([]uuid.UUID, error)
 	DeleteGroupMember(groupID, userID uuid.UUID) error
 	DeleteGroupByMember(orgID, userID, groupID uuid.UUID) error
-	ListSharesByUser(userID uuid.UUID) ([]ShareByUserInfo, error)
+	ListSharesByUser(orgID, userID uuid.UUID) ([]ShareByUserInfo, error)
 	DeleteStarredFilesByUser(userID uuid.UUID) error
 	DeleteMonitoredReposByUser(userID uuid.UUID) error
 	DeleteAPIKeysByUser(orgID, userID uuid.UUID) error
@@ -298,6 +297,7 @@ type OrgLibraryInfo struct {
 type ShareByUserInfo struct {
 	SharedTo  uuid.UUID // user_id
 	LibraryID uuid.UUID
+	ShareID   uuid.UUID
 }
 
 // AuditLogEntry records a deletion event for compliance/traceability.

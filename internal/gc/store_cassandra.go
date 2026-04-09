@@ -687,15 +687,25 @@ func (s *CassandraStore) ListExpiredShares() ([]ExpiredShareInfo, error) {
 }
 
 func (s *CassandraStore) DeleteShare(libraryID, shareID uuid.UUID) error {
-	return s.db.Session().Query(`
-		DELETE FROM shares WHERE library_id = ? AND share_id = ?
-	`, libraryID.String(), shareID.String()).Exec()
-}
+	row, err := db.ReadShareReadModelRow(s.db.Session(), libraryID.String(), shareID.String())
+	if err != nil {
+		if errors.Is(err, gocql.ErrNotFound) {
+			return nil
+		}
+		return err
+	}
 
-func (s *CassandraStore) DeleteShareByUser(sharedTo, libraryID uuid.UUID) error {
-	return s.db.Session().Query(`
-		DELETE FROM shares_by_user WHERE shared_to = ? AND library_id = ?
-	`, sharedTo.String(), libraryID.String()).Exec()
+	batch := s.db.Session().Batch(gocql.LoggedBatch)
+	batch.Query(`
+		DELETE FROM shares WHERE library_id = ? AND share_id = ?
+	`, libraryID.String(), shareID.String())
+	if row.SharedToType == "user" {
+		batch.Query(`
+			DELETE FROM shares_by_user WHERE shared_to = ? AND library_id = ?
+		`, row.SharedTo, row.LibraryID)
+	}
+	db.AddDeleteShareReadModelQuery(batch, row)
+	return batch.Exec()
 }
 
 // --- Expired restore jobs ---
@@ -1156,8 +1166,8 @@ func (s *CassandraStore) ListDeletedUsersExpired(graceDays int) ([]DeletedUserIn
 	var result []DeletedUserInfo
 
 	for orgIter.Scan(&orgIDStr) {
-		orgID := parseUUID(orgIDStr)
-		if orgID == uuid.Nil {
+		orgID, err := uuid.Parse(orgIDStr)
+		if err != nil {
 			continue
 		}
 
@@ -1171,10 +1181,14 @@ func (s *CassandraStore) ListDeletedUsersExpired(graceDays int) ([]DeletedUserIn
 			if status != "deleted" || deletedAt == nil || deletedAt.IsZero() {
 				continue
 			}
+			userID, err := uuid.Parse(userIDStr)
+			if err != nil {
+				continue
+			}
 			if deletedAt.Before(cutoff) {
 				result = append(result, DeletedUserInfo{
 					OrgID:     orgID,
-					UserID:    parseUUID(userIDStr),
+					UserID:    userID,
 					Email:     email,
 					DeletedAt: *deletedAt,
 				})
@@ -1260,17 +1274,18 @@ func (s *CassandraStore) DeleteGroupByMember(orgID, userID, groupID uuid.UUID) e
 	`, orgID.String(), userID.String(), groupID.String()).Exec()
 }
 
-func (s *CassandraStore) ListSharesByUser(userID uuid.UUID) ([]ShareByUserInfo, error) {
+func (s *CassandraStore) ListSharesByUser(orgID, userID uuid.UUID) ([]ShareByUserInfo, error) {
 	iter := s.db.Session().Query(`
-		SELECT shared_to, library_id FROM shares_by_user WHERE shared_to = ?
-	`, userID.String()).Iter()
+		SELECT user_id, library_id, share_id FROM shares_by_user_org WHERE org_id = ? AND user_id = ?
+	`, orgID.String(), userID.String()).Iter()
 
-	var sharedToStr, libIDStr string
+	var sharedToStr, libIDStr, shareIDStr string
 	var result []ShareByUserInfo
-	for iter.Scan(&sharedToStr, &libIDStr) {
+	for iter.Scan(&sharedToStr, &libIDStr, &shareIDStr) {
 		result = append(result, ShareByUserInfo{
 			SharedTo:  parseUUID(sharedToStr),
 			LibraryID: parseUUID(libIDStr),
+			ShareID:   parseUUID(shareIDStr),
 		})
 	}
 	if err := iter.Close(); err != nil {
@@ -1493,9 +1508,21 @@ func (s *CassandraStore) ListExpiredDeletedLibraries(retentionDays int) ([]Delet
 }
 
 func (s *CassandraStore) HardDeleteLibrary(orgID, libraryID uuid.UUID) error {
-	batch := s.db.Session().Batch(gocql.LoggedBatch)
+	session := s.db.Session()
+	projectionRow, err := db.ReadAdminLibraryProjectionRow(session, orgID.String(), libraryID.String())
+	hasProjectionRow := err == nil
+	if err != nil && !errors.Is(err, gocql.ErrNotFound) {
+		return err
+	}
+
+	batch := session.Batch(gocql.LoggedBatch)
+	if hasProjectionRow {
+		db.AddDeleteAdminLibraryReadModelQuery(batch, projectionRow)
+	}
 	batch.Query(`DELETE FROM libraries WHERE org_id = ? AND library_id = ?`,
 		orgID.String(), libraryID.String())
+	batch.Query(`DELETE FROM libraries_by_id WHERE library_id = ?`,
+		libraryID.String())
 	batch.Query(`DELETE FROM deleted_libraries WHERE library_id = ?`,
 		libraryID.String())
 	return batch.Exec()
@@ -1590,24 +1617,73 @@ func (s *CassandraStore) DeleteLibraryStorageCounter(orgID, libraryID uuid.UUID)
 }
 
 func (s *CassandraStore) DeleteGroupFull(orgID, groupID uuid.UUID) error {
+	session := s.db.Session()
+	projectionRow, err := db.ReadAdminGroupProjectionRow(session, orgID.String(), groupID.String())
+	hasProjectionRow := err == nil
+	if err != nil && !errors.Is(err, gocql.ErrNotFound) {
+		return err
+	}
+
 	// Clean up groups_by_member for each member
-	iter := s.db.Session().Query(`
+	iter := session.Query(`
 		SELECT user_id FROM group_members WHERE group_id = ?
 	`, groupID.String()).Iter()
 
+	memberIDs := make([]string, 0)
 	var userIDStr string
 	for iter.Scan(&userIDStr) {
-		s.db.Session().Query(`
-			DELETE FROM groups_by_member WHERE org_id = ? AND user_id = ? AND group_id = ?
-		`, orgID.String(), userIDStr, groupID.String()).Exec()
+		memberIDs = append(memberIDs, userIDStr)
 	}
-	iter.Close()
+	if err := iter.Close(); err != nil {
+		return err
+	}
 
-	// Delete members, group record, and by_id lookup
-	batch := s.db.Session().Batch(gocql.LoggedBatch)
+	shareIter := session.Query(`
+		SELECT created_at, library_id, share_id, permission,
+		       shared_by, shared_by_email, shared_by_name, repo_name, encrypted, size_bytes
+		FROM shares_by_group WHERE org_id = ? AND group_id = ?
+	`, orgID.String(), groupID.String()).Iter()
+
+	shareRows := make([]db.ShareReadModelRow, 0)
+	var shareRow db.ShareReadModelRow
+	for shareIter.Scan(
+		&shareRow.CreatedAt,
+		&shareRow.LibraryID,
+		&shareRow.ShareID,
+		&shareRow.Permission,
+		&shareRow.SharedBy,
+		&shareRow.SharedByEmail,
+		&shareRow.SharedByName,
+		&shareRow.RepoName,
+		&shareRow.Encrypted,
+		&shareRow.SizeBytes,
+	) {
+		shareRow.OrgID = orgID.String()
+		shareRow.SharedTo = groupID.String()
+		shareRow.SharedToType = "group"
+		shareRows = append(shareRows, shareRow)
+		shareRow = db.ShareReadModelRow{}
+	}
+	if err := shareIter.Close(); err != nil {
+		return err
+	}
+
+	// Delete members, shares, group record, and by_id lookup
+	batch := session.Batch(gocql.LoggedBatch)
+	for _, memberID := range memberIDs {
+		batch.Query(`DELETE FROM groups_by_member WHERE org_id = ? AND user_id = ? AND group_id = ?`,
+			orgID.String(), memberID, groupID.String())
+	}
+	for _, share := range shareRows {
+		batch.Query(`DELETE FROM shares WHERE library_id = ? AND share_id = ?`, share.LibraryID, share.ShareID)
+		db.AddDeleteShareReadModelQuery(batch, share)
+	}
 	batch.Query(`DELETE FROM group_members WHERE group_id = ?`, groupID.String())
 	batch.Query(`DELETE FROM groups WHERE org_id = ? AND group_id = ?`, orgID.String(), groupID.String())
 	batch.Query(`DELETE FROM groups_by_id WHERE group_id = ?`, groupID.String())
+	if hasProjectionRow {
+		db.AddDeleteAdminGroupReadModelQuery(batch, projectionRow)
+	}
 	return batch.Exec()
 }
 

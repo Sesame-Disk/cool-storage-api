@@ -476,7 +476,6 @@ func (s *Scanner) scanExpiredShares(ctx context.Context) (int, error) {
 
 		// Delete directly — shares are small metadata, no need for queue
 		if err := s.store.DeleteShare(share.LibraryID, share.ShareID); err == nil {
-			s.store.DeleteShareByUser(share.SharedTo, share.LibraryID)
 			enqueued++
 		}
 	}
@@ -552,7 +551,6 @@ func (s *Scanner) scanOrphanedGroupShares(ctx context.Context) (int, error) {
 		if !exists {
 			// Group deleted — clean up the orphaned share
 			if err := s.store.DeleteShare(gs.LibraryID, gs.ShareID); err == nil {
-				s.store.DeleteShareByUser(gs.SharedTo, gs.LibraryID)
 				cleaned++
 			}
 		}

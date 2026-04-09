@@ -444,10 +444,19 @@ func (m *MockStore) AddDeletedLibrary(orgID, libraryID uuid.UUID, storageClass s
 	m.deletedLibraries[libraryID] = &mockDeletedLibrary{OrgID: orgID, LibraryID: libraryID, StorageClass: storageClass, DeletedAt: deletedAt}
 }
 
-// AddShareByUser adds a share_by_user entry (for cascade tests).
-func (m *MockStore) AddShareByUser(userID, libraryID uuid.UUID) {
+// AddShareByUser adds a user share plus its legacy recipient index entry.
+func (m *MockStore) AddShareByUser(orgID, userID, libraryID uuid.UUID) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	shareID := uuid.New()
+	shareKey := fmt.Sprintf("%s:%s", libraryID, shareID)
+	m.shares[shareKey] = &mockShare{
+		OrgID:        orgID,
+		LibraryID:    libraryID,
+		ShareID:      shareID,
+		SharedTo:     userID,
+		SharedToType: "user",
+	}
 	key := fmt.Sprintf("%s:%s", userID, libraryID)
 	m.sharesByUser[key] = &mockShareByUser{SharedTo: userID, LibraryID: libraryID}
 }
@@ -1040,12 +1049,11 @@ func (m *MockStore) DeleteShare(libraryID, shareID uuid.UUID) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	key := fmt.Sprintf("%s:%s", libraryID, shareID)
+	share := m.shares[key]
 	delete(m.shares, key)
-	return nil
-}
-
-func (m *MockStore) DeleteShareByUser(sharedTo, libraryID uuid.UUID) error {
-	// In mock, shares_by_user is implicit in the shares map
+	if share != nil && share.SharedToType == "user" {
+		delete(m.sharesByUser, fmt.Sprintf("%s:%s", share.SharedTo, share.LibraryID))
+	}
 	return nil
 }
 
@@ -1077,6 +1085,14 @@ func (m *MockStore) DeleteRestoreJob(orgID, libraryID, jobID uuid.UUID) error {
 	key := fmt.Sprintf("%s:%s:%s", orgID, libraryID, jobID)
 	delete(m.restoreJobs, key)
 	return nil
+}
+
+// HasShareByUser returns true if the legacy recipient index still has a row.
+func (m *MockStore) HasShareByUser(userID, libraryID uuid.UUID) bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	_, ok := m.sharesByUser[fmt.Sprintf("%s:%s", userID, libraryID)]
+	return ok
 }
 
 // --- Library artifact cleanup ---
@@ -1337,14 +1353,13 @@ func (m *MockStore) DeleteGroupByMember(orgID, userID, groupID uuid.UUID) error 
 	delete(m.groupsByMember, fmt.Sprintf("%s:%s:%s", orgID, userID, groupID))
 	return nil
 }
-func (m *MockStore) ListSharesByUser(userID uuid.UUID) ([]ShareByUserInfo, error) {
+func (m *MockStore) ListSharesByUser(orgID, userID uuid.UUID) ([]ShareByUserInfo, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	prefix := fmt.Sprintf("%s:", userID)
 	var result []ShareByUserInfo
-	for key, s := range m.sharesByUser {
-		if len(key) > len(prefix) && key[:len(prefix)] == prefix {
-			result = append(result, ShareByUserInfo{SharedTo: s.SharedTo, LibraryID: s.LibraryID})
+	for _, share := range m.shares {
+		if share.OrgID == orgID && share.SharedTo == userID && share.SharedToType == "user" {
+			result = append(result, ShareByUserInfo{SharedTo: share.SharedTo, LibraryID: share.LibraryID, ShareID: share.ShareID})
 		}
 	}
 	return result, nil

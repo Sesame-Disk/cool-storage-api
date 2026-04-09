@@ -404,12 +404,12 @@ func (w *Worker) processUserCascade(ctx context.Context, item QueueItem) error {
 	}
 
 	// 3. Clean up shares received by this user
-	shares, err := w.store.ListSharesByUser(userID)
+	shares, err := w.store.ListSharesByUser(item.OrgID, userID)
 	if err != nil {
 		log.Printf("[GC Worker] Failed to list shares for user %s: %v", item.ItemID, err)
 	} else {
 		for _, share := range shares {
-			w.store.DeleteShareByUser(share.SharedTo, share.LibraryID)
+			w.store.DeleteShare(share.LibraryID, share.ShareID)
 		}
 	}
 
@@ -553,9 +553,9 @@ func (w *Worker) processOrgCascade(ctx context.Context, item QueueItem) error {
 				w.store.DeleteGroupByMember(orgID, u.UserID, gid)
 			}
 			// Clean shares
-			shares, _ := w.store.ListSharesByUser(u.UserID)
+			shares, _ := w.store.ListSharesByUser(orgID, u.UserID)
 			for _, s := range shares {
-				w.store.DeleteShareByUser(s.SharedTo, s.LibraryID)
+				w.store.DeleteShare(s.LibraryID, s.ShareID)
 			}
 			// Clean personal data
 			w.store.DeleteStarredFilesByUser(u.UserID)
@@ -681,7 +681,6 @@ func (w *Worker) enqueueLibraryArtifacts(orgID, libraryID uuid.UUID) {
 	if err == nil {
 		for _, share := range shares {
 			w.store.DeleteShare(libraryID, share.ShareID)
-			w.store.DeleteShareByUser(share.SharedTo, libraryID)
 		}
 		if len(shares) > 0 {
 			log.Printf("[GC Worker] Cleaned up %d shares for deleted library %s", len(shares), libraryID)
