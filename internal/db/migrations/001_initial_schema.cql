@@ -233,6 +233,14 @@ CREATE TABLE IF NOT EXISTS blocks (
     PRIMARY KEY ((org_id), block_id)
 );
 
+CREATE TABLE IF NOT EXISTS gc_block_candidates (
+    org_id        UUID,
+    block_id      TEXT,
+    storage_class TEXT,
+    candidate_at  TIMESTAMP,
+    PRIMARY KEY ((org_id), block_id)
+);
+
 -- SHA-1 (external/Seafile client) → SHA-256 (internal) content-address mapping.
 CREATE TABLE IF NOT EXISTS block_id_mappings (
     org_id      UUID,

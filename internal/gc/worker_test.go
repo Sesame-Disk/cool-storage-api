@@ -2,6 +2,7 @@ package gc
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -641,16 +642,17 @@ func TestWorker_ProcessUserCascade_FullCascade(t *testing.T) {
 	receivedLibID := uuid.New()
 	createdLibID := uuid.New()
 	recipientID := uuid.New()
+	deletedAt := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
 
 	store.AddOrganization(orgID)
-	store.AddUser(orgID, userID, "alice@test.com")
+	store.AddDeletedUser(orgID, userID, "alice@test.com", deletedAt)
 	store.AddGroupMembership(orgID, userID, groupID)
 	receivedShareID := store.AddShareByUser(orgID, userID, receivedLibID)
 	createdShareID := store.AddShareCreatedByUser(orgID, userID, recipientID, createdLibID)
 	store.AddStarredFile(userID)
 	store.AddMonitoredRepo(userID)
 
-	store.EnqueueItem(orgID, time.Now().Add(-2*time.Hour), ItemUserCascade, userID.String(), uuid.Nil, "", 0)
+	store.EnqueueItem(orgID, deletedAt, ItemUserCascade, userID.String(), uuid.Nil, "", 0)
 
 	ctx := context.Background()
 	n, err := w.ProcessOnce(ctx)
@@ -697,13 +699,14 @@ func TestWorker_ProcessLibraryCascade_FullCascade(t *testing.T) {
 
 	orgID := uuid.New()
 	libID := uuid.New()
+	deletedAt := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
 
 	store.AddOrganization(orgID)
-	store.AddLibrary(orgID, libID, "hot")
+	store.AddDeletedLibrary(orgID, libID, "hot", deletedAt)
 	store.AddCommit(libID, "commit-1", "fs-root")
 	store.AddFSObject(libID, "fs-root", "dir", nil)
 
-	store.EnqueueItem(orgID, time.Now().Add(-2*time.Hour), ItemLibraryCascade, libID.String(), uuid.Nil, "hot", 0)
+	store.EnqueueItem(orgID, deletedAt, ItemLibraryCascade, libID.String(), uuid.Nil, "hot", 0)
 
 	ctx := context.Background()
 	n, err := w.ProcessOnce(ctx)
@@ -765,8 +768,9 @@ func TestWorker_ProcessOrgCascade_FullCascade(t *testing.T) {
 	userID2 := uuid.New()
 	groupID := uuid.New()
 	libID := uuid.New()
+	deletedAt := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
 
-	store.AddOrganizationWithName(orgID, "Doomed Corp")
+	store.AddDeletedOrg(orgID, "Doomed Corp", deletedAt)
 	store.AddUser(orgID, userID1, "alice@doomed.com")
 	store.AddUser(orgID, userID2, "bob@doomed.com")
 	store.AddStarredFile(userID1)
@@ -775,7 +779,7 @@ func TestWorker_ProcessOrgCascade_FullCascade(t *testing.T) {
 	store.AddGroupMembership(orgID, userID1, groupID)
 	store.AddLibrary(orgID, libID, "hot")
 
-	store.EnqueueItem(orgID, time.Now().Add(-2*time.Hour), ItemOrgCascade, orgID.String(), uuid.Nil, "", 0)
+	store.EnqueueItem(orgID, deletedAt, ItemOrgCascade, orgID.String(), uuid.Nil, "", 0)
 
 	ctx := context.Background()
 	n, err := w.ProcessOnce(ctx)
@@ -889,5 +893,99 @@ func TestWorker_ProcessOrgCascade_AlreadyDeleted(t *testing.T) {
 	// Should gracefully skip (returns nil when org name lookup fails)
 	if n != 1 {
 		t.Errorf("expected 1 processed (skipped gracefully), got %d", n)
+	}
+}
+
+func TestWorker_ProcessUserCascade_SkipsRestoredUser(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	w := NewWorker(store, nil, q, 100, 0, false, stats)
+
+	orgID := uuid.New()
+	userID := uuid.New()
+	deletedAt := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
+	userKey := fmt.Sprintf("%s:%s", orgID, userID)
+
+	store.AddOrganization(orgID)
+	store.AddDeletedUser(orgID, userID, "alice@test.com", deletedAt)
+	store.EnqueueItem(orgID, deletedAt, ItemUserCascade, userID.String(), uuid.Nil, "", 0)
+
+	store.users[userKey].Status = "active"
+	store.users[userKey].DeletedAt = nil
+
+	n, err := w.ProcessOnce(context.Background())
+	if err != nil {
+		t.Fatalf("ProcessOnce failed: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("expected 1 processed stale item, got %d", n)
+	}
+	if !store.HasUser(orgID, userID) {
+		t.Fatal("restored user should not be hard-deleted by stale queue item")
+	}
+	if len(store.QueueItems(orgID)) != 0 {
+		t.Fatal("stale user queue item should be completed")
+	}
+}
+
+func TestWorker_ProcessLibraryCascade_SkipsRestoredLibrary(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	w := NewWorker(store, nil, q, 100, 0, false, stats)
+
+	orgID := uuid.New()
+	libID := uuid.New()
+	deletedAt := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
+
+	store.AddOrganization(orgID)
+	store.AddDeletedLibrary(orgID, libID, "hot", deletedAt)
+	store.EnqueueItem(orgID, deletedAt, ItemLibraryCascade, libID.String(), uuid.Nil, "hot", 0)
+
+	delete(store.deletedLibraries, libID)
+
+	n, err := w.ProcessOnce(context.Background())
+	if err != nil {
+		t.Fatalf("ProcessOnce failed: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("expected 1 processed stale item, got %d", n)
+	}
+	if _, err := store.GetLibraryStorageClass(orgID, libID); err != nil {
+		t.Fatal("restored library should not be hard-deleted by stale queue item")
+	}
+	if len(store.QueueItems(orgID)) != 0 {
+		t.Fatal("stale library queue item should be completed")
+	}
+}
+
+func TestWorker_ProcessOrgCascade_SkipsRestoredOrg(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	w := NewWorker(store, nil, q, 100, 0, false, stats)
+
+	orgID := uuid.New()
+	deletedAt := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
+
+	store.AddDeletedOrg(orgID, "Recovered Corp", deletedAt)
+	store.EnqueueItem(orgID, deletedAt, ItemOrgCascade, orgID.String(), uuid.Nil, "", 0)
+
+	store.orgStatus[orgID] = "active"
+	delete(store.orgDeletedAt, orgID)
+
+	n, err := w.ProcessOnce(context.Background())
+	if err != nil {
+		t.Fatalf("ProcessOnce failed: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("expected 1 processed stale item, got %d", n)
+	}
+	if !store.HasOrg(orgID) {
+		t.Fatal("restored org should not be hard-deleted by stale queue item")
+	}
+	if len(store.QueueItems(orgID)) != 0 {
+		t.Fatal("stale org queue item should be completed")
 	}
 }

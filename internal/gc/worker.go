@@ -142,6 +142,9 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 	// 2. If it didn't apply, it means ref_count > 0 or it was already deleted.
 	// We skip deleting from S3 to avoid data loss.
 	if !applied {
+		if err := w.store.DeleteBlockGCCandidate(item.OrgID, item.ItemID); err != nil {
+			return fmt.Errorf("failed to clear stale block GC candidate: %w", err)
+		}
 		log.Printf("[GC Worker] Block %s LWT delete not applied (ref_count > 0 or already deleted), skipping S3 deletion", item.ItemID)
 		metrics.GCItemsSkippedTotal.Inc()
 		return nil
@@ -172,6 +175,10 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 		for _, mapping := range mappings {
 			w.store.DeleteBlockMapping(item.OrgID, mapping.ExternalID)
 		}
+	}
+
+	if err := w.store.DeleteBlockGCCandidate(item.OrgID, item.ItemID); err != nil {
+		return fmt.Errorf("failed to clear block GC candidate: %w", err)
 	}
 
 	w.stats.IncrBlocksDeleted()
@@ -254,22 +261,10 @@ func (w *Worker) processFSObject(ctx context.Context, item QueueItem) error {
 			// First time processing this exact task, safe to decrement
 			zeroRefBlocks := w.decrementAndFindZeroRef(item.OrgID, fsObj.BlockIDs)
 			storageClass, _ := w.store.GetLibraryStorageClass(item.OrgID, item.LibraryID)
-
-			var blockBatch []QueueItem
-			now := time.Now()
-			for _, blockID := range zeroRefBlocks {
-				blockBatch = append(blockBatch, QueueItem{
-					OrgID:        item.OrgID,
-					QueuedAt:     now,
-					ItemType:     ItemBlock,
-					ItemID:       blockID,
-					LibraryID:    item.LibraryID,
-					StorageClass: storageClass,
-					RetryCount:   0,
-				})
-			}
-			if len(blockBatch) > 0 {
-				w.queue.EnqueueBatch(blockBatch)
+			if len(zeroRefBlocks) > 0 {
+				if err := w.enqueueZeroRefBlocks(item.OrgID, item.LibraryID, zeroRefBlocks, storageClass); err != nil {
+					return fmt.Errorf("failed to enqueue zero-ref blocks for fs_object %s: %w", item.ItemID, err)
+				}
 			}
 		} else {
 			log.Printf("[GC Worker] Skipping decrement for %s (already processed task %s)", item.ItemID, taskID)
@@ -371,6 +366,15 @@ func (w *Worker) processUserCascade(ctx context.Context, item QueueItem) error {
 	userID, err := uuid.Parse(item.ItemID)
 	if err != nil {
 		return fmt.Errorf("invalid user ID: %w", err)
+	}
+
+	deletedAt, err := w.store.GetUserDeletedAt(item.OrgID, userID)
+	if err != nil {
+		return fmt.Errorf("failed to read deleted user marker for %s: %w", item.ItemID, err)
+	}
+	if deletedAt == nil || !deletedAt.Equal(item.QueuedAt) {
+		log.Printf("[GC Worker] Skipping stale user cascade for %s (current deleted_at=%v queued_at=%v)", item.ItemID, deletedAt, item.QueuedAt)
+		return nil
 	}
 
 	// Get user email before deletion (needed for users_by_email cleanup)
@@ -479,6 +483,15 @@ func (w *Worker) processLibraryCascade(ctx context.Context, item QueueItem) erro
 		return fmt.Errorf("invalid library ID: %w", err)
 	}
 
+	deletedAt, err := w.store.GetLibraryDeletedAt(libraryID)
+	if err != nil {
+		return fmt.Errorf("failed to read deleted library marker for %s: %w", item.ItemID, err)
+	}
+	if deletedAt == nil || !deletedAt.Equal(item.QueuedAt) {
+		log.Printf("[GC Worker] Skipping stale library cascade for %s (current deleted_at=%v queued_at=%v)", item.ItemID, deletedAt, item.QueuedAt)
+		return nil
+	}
+
 	return w.cascadeDeleteLibrary(item.OrgID, libraryID, item.StorageClass)
 }
 
@@ -524,6 +537,15 @@ func (w *Worker) processOrgCascade(ctx context.Context, item QueueItem) error {
 	}
 
 	orgID := item.OrgID
+	deletedAt, err := w.store.GetOrgDeletedAt(orgID)
+	if err != nil {
+		return fmt.Errorf("failed to read deleted org marker for %s: %w", item.ItemID, err)
+	}
+	if deletedAt == nil || !deletedAt.Equal(item.QueuedAt) {
+		log.Printf("[GC Worker] Skipping stale org cascade for %s (current deleted_at=%v queued_at=%v)", item.ItemID, deletedAt, item.QueuedAt)
+		return nil
+	}
+
 	orgName, err := w.store.GetOrgName(orgID)
 	if err != nil {
 		log.Printf("[GC Worker] Org %s name lookup failed (may already be deleted): %v", item.ItemID, err)
@@ -611,6 +633,36 @@ func (w *Worker) decrementAndFindZeroRef(orgID uuid.UUID, blockIDs []string) []s
 		}
 	}
 	return zeroRef
+}
+
+func (w *Worker) enqueueZeroRefBlocks(orgID, libraryID uuid.UUID, blockIDs []string, storageClass string) error {
+	var blockBatch []QueueItem
+	for _, blockID := range blockIDs {
+		candidateAt, err := w.store.EnsureBlockGCCandidate(orgID, blockID, storageClass, time.Now())
+		if err != nil {
+			return err
+		}
+		exists, err := w.store.QueueItemExists(orgID, candidateAt, ItemBlock, blockID)
+		if err != nil {
+			return err
+		}
+		if exists {
+			continue
+		}
+		blockBatch = append(blockBatch, QueueItem{
+			OrgID:        orgID,
+			QueuedAt:     candidateAt,
+			ItemType:     ItemBlock,
+			ItemID:       blockID,
+			LibraryID:    libraryID,
+			StorageClass: storageClass,
+			RetryCount:   0,
+		})
+	}
+	if len(blockBatch) == 0 {
+		return nil
+	}
+	return w.queue.EnqueueBatch(blockBatch)
 }
 
 // EnqueueLibraryContents enqueues all contents of a deleted library for GC.

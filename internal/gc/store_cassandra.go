@@ -121,6 +121,21 @@ func (s *CassandraStore) EnqueueBatch(items []QueueItem) error {
 	return counterBatch.Exec()
 }
 
+func (s *CassandraStore) QueueItemExists(orgID uuid.UUID, queuedAt time.Time, itemType ItemType, itemID string) (bool, error) {
+	var existingItemID string
+	err := s.db.Session().Query(`
+		SELECT item_id FROM gc_queue
+		WHERE org_id = ? AND queued_at = ? AND item_type = ? AND item_id = ?
+	`, orgID.String(), queuedAt, string(itemType), itemID).Scan(&existingItemID)
+	if err != nil {
+		if errors.Is(err, gocql.ErrNotFound) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
 func (s *CassandraStore) DequeueBatch(orgID uuid.UUID, batchSize int, cutoff time.Time) ([]QueueItem, error) {
 	iter := s.db.Session().Query(`
 		SELECT org_id, queued_at, item_type, item_id, library_id, storage_class, retry_count
@@ -239,6 +254,117 @@ func (s *CassandraStore) MarkItemProcessed(taskID uuid.UUID) (bool, error) {
 		INSERT INTO gc_processed_items (task_id) VALUES (?) IF NOT EXISTS
 	`, taskID.String()).ScanCAS(&existingTaskID)
 	return applied, err
+}
+
+func (s *CassandraStore) GetUserDeletedAt(orgID, userID uuid.UUID) (*time.Time, error) {
+	var status string
+	var deletedAt *time.Time
+	err := s.db.Session().Query(`
+		SELECT status, deleted_at FROM users WHERE org_id = ? AND user_id = ?
+	`, orgID.String(), userID.String()).Scan(&status, &deletedAt)
+	if err != nil {
+		if errors.Is(err, gocql.ErrNotFound) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	if status != "deleted" || deletedAt == nil {
+		return nil, nil
+	}
+	deletedAtCopy := *deletedAt
+	return &deletedAtCopy, nil
+}
+
+func (s *CassandraStore) GetLibraryDeletedAt(libraryID uuid.UUID) (*time.Time, error) {
+	var deletedAt time.Time
+	err := s.db.Session().Query(`
+		SELECT deleted_at FROM deleted_libraries WHERE library_id = ?
+	`, libraryID.String()).Scan(&deletedAt)
+	if err != nil {
+		if errors.Is(err, gocql.ErrNotFound) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	deletedAtCopy := deletedAt
+	return &deletedAtCopy, nil
+}
+
+func (s *CassandraStore) GetOrgDeletedAt(orgID uuid.UUID) (*time.Time, error) {
+	var status string
+	var deletedAt *time.Time
+	err := s.db.Session().Query(`
+		SELECT status, deleted_at FROM organizations WHERE org_id = ?
+	`, orgID.String()).Scan(&status, &deletedAt)
+	if err != nil {
+		if errors.Is(err, gocql.ErrNotFound) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	if status != "deleted" || deletedAt == nil {
+		return nil, nil
+	}
+	deletedAtCopy := *deletedAt
+	return &deletedAtCopy, nil
+}
+
+func (s *CassandraStore) EnsureBlockGCCandidate(orgID uuid.UUID, blockID, storageClass string, candidateAt time.Time) (time.Time, error) {
+	var existingOrgID string
+	var existingBlockID string
+	var existingStorageClass string
+	var existingCandidateAt time.Time
+	applied, err := s.db.Session().Query(`
+		INSERT INTO gc_block_candidates (org_id, block_id, storage_class, candidate_at)
+		VALUES (?, ?, ?, ?) IF NOT EXISTS
+	`, orgID.String(), blockID, storageClass, candidateAt).ScanCAS(&existingOrgID, &existingBlockID, &existingStorageClass, &existingCandidateAt)
+	if err != nil {
+		return time.Time{}, err
+	}
+	if applied {
+		return candidateAt, nil
+	}
+	return existingCandidateAt, nil
+}
+
+func (s *CassandraStore) DeleteBlockGCCandidate(orgID uuid.UUID, blockID string) error {
+	return s.db.Session().Query(`
+		DELETE FROM gc_block_candidates WHERE org_id = ? AND block_id = ?
+	`, orgID.String(), blockID).Exec()
+}
+
+func (s *CassandraStore) ListBlockGCCandidateOrgs() ([]uuid.UUID, error) {
+	iter := s.db.Session().Query(`SELECT DISTINCT org_id FROM gc_block_candidates`).Iter()
+	var orgs []uuid.UUID
+	var orgIDStr string
+	for iter.Scan(&orgIDStr) {
+		orgs = append(orgs, parseUUID(orgIDStr))
+	}
+	if err := iter.Close(); err != nil {
+		return nil, fmt.Errorf("failed to list block GC candidate orgs: %w", err)
+	}
+	return orgs, nil
+}
+
+func (s *CassandraStore) ListBlockGCCandidates(orgID uuid.UUID) ([]BlockGCCandidateInfo, error) {
+	iter := s.db.Session().Query(`
+		SELECT block_id, storage_class, candidate_at
+		FROM gc_block_candidates WHERE org_id = ?
+	`, orgID.String()).Iter()
+	var candidates []BlockGCCandidateInfo
+	var blockID, storageClass string
+	var candidateAt time.Time
+	for iter.Scan(&blockID, &storageClass, &candidateAt) {
+		candidates = append(candidates, BlockGCCandidateInfo{
+			BlockID:      blockID,
+			StorageClass: storageClass,
+			CandidateAt:  candidateAt,
+		})
+	}
+	if err := iter.Close(); err != nil {
+		return nil, fmt.Errorf("failed to list block GC candidates for org %s: %w", orgID, err)
+	}
+	return candidates, nil
 }
 
 // --- Block operations ---
@@ -431,15 +557,14 @@ func (s *CassandraStore) ListOrganizations() ([]uuid.UUID, error) {
 
 func (s *CassandraStore) ListBlocksForOrg(orgID uuid.UUID) ([]BlockInfo, error) {
 	iter := s.db.Session().Query(`
-		SELECT block_id, storage_class, ref_count FROM blocks
-		WHERE org_id = ? AND ref_count <= 0 ALLOW FILTERING
+		SELECT block_id, storage_class, ref_count FROM blocks WHERE org_id = ?
 	`, orgID.String()).Iter()
 
 	var blocks []BlockInfo
 	var blockID, storageClass string
 	var refCount int
 	for iter.Scan(&blockID, &storageClass, &refCount) {
-		blocks = append(blocks, BlockInfo{BlockID: blockID, StorageClass: storageClass, RefCount: refCount, HasRefCount: true})
+		blocks = append(blocks, BlockInfo{BlockID: blockID, StorageClass: storageClass, RefCount: refCount})
 	}
 	if err := iter.Close(); err != nil {
 		return nil, err

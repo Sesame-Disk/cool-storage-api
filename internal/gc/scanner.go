@@ -80,17 +80,16 @@ func (s *Scanner) ScanOnce(ctx context.Context) error {
 	return nil
 }
 
-// scanOrphanedBlocks finds blocks with ref_count <= 0 and enqueues them.
+// scanOrphanedBlocks re-enqueues zero-ref block candidates that should still be in GC.
 func (s *Scanner) scanOrphanedBlocks(ctx context.Context) (int, error) {
 	log.Println("[GC Scanner] Phase 1: Scanning for orphaned blocks...")
 
-	orgs, err := s.store.ListOrganizations()
+	orgs, err := s.store.ListBlockGCCandidateOrgs()
 	if err != nil {
 		return 0, err
 	}
 
 	enqueued := 0
-	now := time.Now()
 	for _, orgID := range orgs {
 		select {
 		case <-ctx.Done():
@@ -98,23 +97,29 @@ func (s *Scanner) scanOrphanedBlocks(ctx context.Context) (int, error) {
 		default:
 		}
 
-		blocks, err := s.store.ListBlocksForOrg(orgID)
+		candidates, err := s.store.ListBlockGCCandidates(orgID)
 		if err != nil {
 			continue
 		}
 
 		var batch []QueueItem
-		for _, b := range blocks {
-			if b.HasRefCount && b.RefCount <= 0 {
-				batch = append(batch, QueueItem{
-					OrgID:        orgID,
-					QueuedAt:     now,
-					ItemType:     ItemBlock,
-					ItemID:       b.BlockID,
-					LibraryID:    uuid.Nil,
-					StorageClass: b.StorageClass,
-				})
+		for _, candidate := range candidates {
+			exists, err := s.store.QueueItemExists(orgID, candidate.CandidateAt, ItemBlock, candidate.BlockID)
+			if err != nil {
+				log.Printf("[GC Scanner] Phase 1: failed to inspect queue for block %s in org %s: %v", candidate.BlockID, orgID, err)
+				continue
 			}
+			if exists {
+				continue
+			}
+			batch = append(batch, QueueItem{
+				OrgID:        orgID,
+				QueuedAt:     candidate.CandidateAt,
+				ItemType:     ItemBlock,
+				ItemID:       candidate.BlockID,
+				LibraryID:    uuid.Nil,
+				StorageClass: candidate.StorageClass,
+			})
 		}
 		if len(batch) > 0 {
 			if err := s.queue.EnqueueBatch(batch); err != nil {

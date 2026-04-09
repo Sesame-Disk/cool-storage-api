@@ -222,7 +222,18 @@ func (s *Service) Queue() *Queue {
 
 // EnqueueBlock is a convenience method for enqueuing a block from application code.
 func (s *Service) EnqueueBlock(orgID uuid.UUID, blockID string, libraryID uuid.UUID, storageClass string) error {
-	return s.queue.Enqueue(orgID, ItemBlock, blockID, libraryID, storageClass)
+	candidateAt, err := s.store.EnsureBlockGCCandidate(orgID, blockID, storageClass, time.Now())
+	if err != nil {
+		return err
+	}
+	exists, err := s.store.QueueItemExists(orgID, candidateAt, ItemBlock, blockID)
+	if err != nil {
+		return err
+	}
+	if exists {
+		return nil
+	}
+	return s.store.EnqueueItem(orgID, candidateAt, ItemBlock, blockID, libraryID, storageClass, 0)
 }
 
 // EnqueueLibraryDeletion enqueues all contents of a library for GC.

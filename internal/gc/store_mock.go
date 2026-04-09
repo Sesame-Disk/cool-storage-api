@@ -21,6 +21,9 @@ type MockStore struct {
 	// blocks keyed by "orgID:blockID"
 	blocks map[string]*mockBlock
 
+	// block GC candidates keyed by "orgID:blockID"
+	blockGCCandidates map[string]*mockBlockGCCandidate
+
 	// block_id_mappings keyed by "orgID:externalID"
 	mappings map[string]string // externalID -> internalID
 
@@ -93,7 +96,13 @@ type mockBlock struct {
 	BlockID      string
 	StorageClass string
 	RefCount     int
-	HasRefCount  bool
+}
+
+type mockBlockGCCandidate struct {
+	OrgID        uuid.UUID
+	BlockID      string
+	StorageClass string
+	CandidateAt  time.Time
 }
 
 type mockCommit struct {
@@ -178,31 +187,32 @@ type mockDeletedLibrary struct {
 // NewMockStore creates a new in-memory mock store.
 func NewMockStore() *MockStore {
 	return &MockStore{
-		queue:            make(map[uuid.UUID][]QueueItem),
-		blocks:           make(map[string]*mockBlock),
-		mappings:         make(map[string]string),
-		commits:          make(map[string]*mockCommit),
-		fsObjects:        make(map[string]*mockFSObject),
-		libraries:        make(map[uuid.UUID]*mockLibrary),
-		orgNames:         make(map[uuid.UUID]string),
-		orgStatus:        make(map[uuid.UUID]string),
-		orgDeletedAt:     make(map[uuid.UUID]time.Time),
-		users:            make(map[string]*mockUser),
-		groups:           make(map[string]bool),
-		groupMembers:     make(map[string]bool),
-		groupsByMember:   make(map[string]bool),
-		deletedLibraries: make(map[uuid.UUID]*mockDeletedLibrary),
-		shareLinks:       make(map[string]*mockShareLink),
-		shares:           make(map[string]*mockShare),
-		restoreJobs:      make(map[string]*mockRestoreJob),
-		repoTags:         make(map[string]bool),
-		fileTags:         make(map[string]*mockFileTag),
-		apiTokens:        make(map[string]*mockAPIToken),
-		lockedFiles:      make(map[string]bool),
-		starredFiles:     make(map[uuid.UUID]bool),
-		monitoredRepos:   make(map[uuid.UUID]bool),
-		gcStats:          make(map[string]string),
-		organizations:    nil,
+		queue:             make(map[uuid.UUID][]QueueItem),
+		blocks:            make(map[string]*mockBlock),
+		blockGCCandidates: make(map[string]*mockBlockGCCandidate),
+		mappings:          make(map[string]string),
+		commits:           make(map[string]*mockCommit),
+		fsObjects:         make(map[string]*mockFSObject),
+		libraries:         make(map[uuid.UUID]*mockLibrary),
+		orgNames:          make(map[uuid.UUID]string),
+		orgStatus:         make(map[uuid.UUID]string),
+		orgDeletedAt:      make(map[uuid.UUID]time.Time),
+		users:             make(map[string]*mockUser),
+		groups:            make(map[string]bool),
+		groupMembers:      make(map[string]bool),
+		groupsByMember:    make(map[string]bool),
+		deletedLibraries:  make(map[uuid.UUID]*mockDeletedLibrary),
+		shareLinks:        make(map[string]*mockShareLink),
+		shares:            make(map[string]*mockShare),
+		restoreJobs:       make(map[string]*mockRestoreJob),
+		repoTags:          make(map[string]bool),
+		fileTags:          make(map[string]*mockFileTag),
+		apiTokens:         make(map[string]*mockAPIToken),
+		lockedFiles:       make(map[string]bool),
+		starredFiles:      make(map[uuid.UUID]bool),
+		monitoredRepos:    make(map[uuid.UUID]bool),
+		gcStats:           make(map[string]string),
+		organizations:     nil,
 	}
 }
 
@@ -224,19 +234,18 @@ func (m *MockStore) AddBlock(orgID uuid.UUID, blockID, storageClass string, refC
 		BlockID:      blockID,
 		StorageClass: storageClass,
 		RefCount:     refCount,
-		HasRefCount:  true,
 	}
 }
 
-func (m *MockStore) AddBlockWithoutRefCount(orgID uuid.UUID, blockID, storageClass string) {
+func (m *MockStore) AddBlockGCCandidate(orgID uuid.UUID, blockID, storageClass string, candidateAt time.Time) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	key := fmt.Sprintf("%s:%s", orgID, blockID)
-	m.blocks[key] = &mockBlock{
+	m.blockGCCandidates[key] = &mockBlockGCCandidate{
 		OrgID:        orgID,
 		BlockID:      blockID,
 		StorageClass: storageClass,
-		HasRefCount:  false,
+		CandidateAt:  candidateAt,
 	}
 }
 
@@ -620,6 +629,17 @@ func (m *MockStore) EnqueueBatch(items []QueueItem) error {
 	return nil
 }
 
+func (m *MockStore) QueueItemExists(orgID uuid.UUID, queuedAt time.Time, itemType ItemType, itemID string) (bool, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for _, item := range m.queue[orgID] {
+		if item.QueuedAt.Equal(queuedAt) && item.ItemType == itemType && item.ItemID == itemID {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 func (m *MockStore) DequeueBatch(orgID uuid.UUID, batchSize int, cutoff time.Time) ([]QueueItem, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -712,6 +732,42 @@ func (m *MockStore) MarkItemProcessed(taskID uuid.UUID) (bool, error) {
 	return true, nil
 }
 
+func (m *MockStore) GetUserDeletedAt(orgID, userID uuid.UUID) (*time.Time, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	user, ok := m.users[fmt.Sprintf("%s:%s", orgID, userID)]
+	if !ok || user.Status != "deleted" || user.DeletedAt == nil {
+		return nil, nil
+	}
+	deletedAt := *user.DeletedAt
+	return &deletedAt, nil
+}
+
+func (m *MockStore) GetLibraryDeletedAt(libraryID uuid.UUID) (*time.Time, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	marker, ok := m.deletedLibraries[libraryID]
+	if !ok {
+		return nil, nil
+	}
+	deletedAt := marker.DeletedAt
+	return &deletedAt, nil
+}
+
+func (m *MockStore) GetOrgDeletedAt(orgID uuid.UUID) (*time.Time, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	deletedAt, ok := m.orgDeletedAt[orgID]
+	if !ok || m.orgStatus[orgID] != "deleted" {
+		return nil, nil
+	}
+	deletedAtCopy := deletedAt
+	return &deletedAtCopy, nil
+}
+
 func (m *MockStore) GetBlockRefCount(orgID uuid.UUID, blockID string) (int, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -722,6 +778,68 @@ func (m *MockStore) GetBlockRefCount(orgID uuid.UUID, blockID string) (int, erro
 		return 0, fmt.Errorf("block not found: %s", blockID)
 	}
 	return b.RefCount, nil
+}
+
+func (m *MockStore) EnsureBlockGCCandidate(orgID uuid.UUID, blockID, storageClass string, candidateAt time.Time) (time.Time, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	key := fmt.Sprintf("%s:%s", orgID, blockID)
+	if existing, ok := m.blockGCCandidates[key]; ok {
+		return existing.CandidateAt, nil
+	}
+	m.blockGCCandidates[key] = &mockBlockGCCandidate{
+		OrgID:        orgID,
+		BlockID:      blockID,
+		StorageClass: storageClass,
+		CandidateAt:  candidateAt,
+	}
+	return candidateAt, nil
+}
+
+func (m *MockStore) DeleteBlockGCCandidate(orgID uuid.UUID, blockID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.blockGCCandidates, fmt.Sprintf("%s:%s", orgID, blockID))
+	return nil
+}
+
+func (m *MockStore) ListBlockGCCandidateOrgs() ([]uuid.UUID, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	seen := make(map[uuid.UUID]bool)
+	var orgs []uuid.UUID
+	for _, candidate := range m.blockGCCandidates {
+		if seen[candidate.OrgID] {
+			continue
+		}
+		seen[candidate.OrgID] = true
+		orgs = append(orgs, candidate.OrgID)
+	}
+	sort.Slice(orgs, func(i, j int) bool {
+		return orgs[i].String() < orgs[j].String()
+	})
+	return orgs, nil
+}
+
+func (m *MockStore) ListBlockGCCandidates(orgID uuid.UUID) ([]BlockGCCandidateInfo, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	prefix := fmt.Sprintf("%s:", orgID)
+	var candidates []BlockGCCandidateInfo
+	for key, candidate := range m.blockGCCandidates {
+		if len(key) <= len(prefix) || key[:len(prefix)] != prefix {
+			continue
+		}
+		candidates = append(candidates, BlockGCCandidateInfo{
+			BlockID:      candidate.BlockID,
+			StorageClass: candidate.StorageClass,
+			CandidateAt:  candidate.CandidateAt,
+		})
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		return candidates[i].CandidateAt.Before(candidates[j].CandidateAt)
+	})
+	return candidates, nil
 }
 
 func (m *MockStore) DeleteBlock(orgID uuid.UUID, blockID string) (bool, error) {
@@ -887,7 +1005,6 @@ func (m *MockStore) ListBlocksForOrg(orgID uuid.UUID) ([]BlockInfo, error) {
 				BlockID:      b.BlockID,
 				StorageClass: b.StorageClass,
 				RefCount:     b.RefCount,
-				HasRefCount:  b.HasRefCount,
 			})
 		}
 	}

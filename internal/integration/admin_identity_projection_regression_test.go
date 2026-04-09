@@ -320,7 +320,7 @@ func TestAdminIdentityProjectionRegression_HardDeleteOrganization(t *testing.T) 
 
 	store := gcpkg.NewCassandraStore(shareProjectionDBForTest(t))
 	queue := gcpkg.NewQueue(store)
-	queuedAt := time.Now().Add(-time.Second)
+	queuedAt := deletedOrganizationMarkerDeletedAt(t, orgID)
 	orgUUID := mustParseUUID(t, orgID)
 	if err := store.EnqueueItem(orgUUID, queuedAt, gcpkg.ItemOrgCascade, orgID, uuid.Nil, "", 0); err != nil {
 		t.Fatalf("enqueue org cascade failed: %v", err)
@@ -682,6 +682,17 @@ func deletedOrganizationMarkerExists(t *testing.T, orgID string) bool {
 		t.Fatalf("read deleted_organizations %s failed: %v", orgID, err)
 	}
 	return false
+}
+
+func deletedOrganizationMarkerDeletedAt(t *testing.T, orgID string) time.Time {
+	t.Helper()
+
+	session := shareProjectionDBForTest(t).Session()
+	var deletedAt time.Time
+	if err := session.Query(`SELECT deleted_at FROM deleted_organizations WHERE org_id = ?`, orgID).Scan(&deletedAt); err != nil {
+		t.Fatalf("read deleted_organizations deleted_at %s failed: %v", orgID, err)
+	}
+	return deletedAt
 }
 
 func snapshotAdminUserForUpdate(t *testing.T, email string) adminUserUpdateSnapshot {

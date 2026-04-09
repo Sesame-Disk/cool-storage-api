@@ -13,6 +13,7 @@ type GCStore interface {
 	// Queue operations
 	EnqueueItem(orgID uuid.UUID, queuedAt time.Time, itemType ItemType, itemID string, libraryID uuid.UUID, storageClass string, retryCount int) error
 	EnqueueBatch(items []QueueItem) error
+	QueueItemExists(orgID uuid.UUID, queuedAt time.Time, itemType ItemType, itemID string) (bool, error)
 	DequeueBatch(orgID uuid.UUID, batchSize int, cutoff time.Time) ([]QueueItem, error)
 	CompleteItem(orgID uuid.UUID, queuedAt time.Time, itemType ItemType, itemID string) error
 	UpdateRetryCount(orgID uuid.UUID, queuedAt time.Time, itemType ItemType, itemID string, retryCount int) error
@@ -20,12 +21,19 @@ type GCStore interface {
 	GetTotalQueueSize() (int, error)
 	ListOrgsWithQueuedItems() ([]uuid.UUID, error)
 	MarkItemProcessed(taskID uuid.UUID) (bool, error)
+	GetUserDeletedAt(orgID, userID uuid.UUID) (*time.Time, error)
+	GetLibraryDeletedAt(libraryID uuid.UUID) (*time.Time, error)
+	GetOrgDeletedAt(orgID uuid.UUID) (*time.Time, error)
 
 	// Block operations (worker)
 	GetBlockRefCount(orgID uuid.UUID, blockID string) (int, error)
 	DeleteBlock(orgID uuid.UUID, blockID string) (bool, error)
 	DecrementBlockRefCount(orgID uuid.UUID, blockID string) error
 	DeleteBlockMapping(orgID uuid.UUID, externalID string) error
+	EnsureBlockGCCandidate(orgID uuid.UUID, blockID, storageClass string, candidateAt time.Time) (time.Time, error)
+	DeleteBlockGCCandidate(orgID uuid.UUID, blockID string) error
+	ListBlockGCCandidateOrgs() ([]uuid.UUID, error)
+	ListBlockGCCandidates(orgID uuid.UUID) ([]BlockGCCandidateInfo, error)
 
 	// Reverse lookup: find block mappings by internal_id (avoids full scan)
 	ListBlockMappingsByInternalID(orgID uuid.UUID, internalID string) ([]BlockMapping, error)
@@ -176,7 +184,12 @@ type BlockInfo struct {
 	BlockID      string
 	StorageClass string
 	RefCount     int
-	HasRefCount  bool
+}
+
+type BlockGCCandidateInfo struct {
+	BlockID      string
+	StorageClass string
+	CandidateAt  time.Time
 }
 
 // ShareLinkInfo holds data about a share link needed by the scanner.

@@ -29,12 +29,10 @@ func TestScanner_ScanOrphanedBlocks(t *testing.T) {
 	s := NewScanner(store, q, stats, config.GCConfig{})
 
 	orgID := uuid.New()
-	store.AddOrganization(orgID)
-
-	// 3 blocks: ref_count=0, ref_count=1, ref_count=0
-	store.AddBlock(orgID, "block-orphan-1", "hot", 0)
-	store.AddBlock(orgID, "block-alive", "hot", 1)
-	store.AddBlock(orgID, "block-orphan-2", "cold", 0)
+	candidateAt1 := time.Now().Add(-2 * time.Minute)
+	candidateAt2 := time.Now().Add(-1 * time.Minute)
+	store.AddBlockGCCandidate(orgID, "block-orphan-1", "hot", candidateAt1)
+	store.AddBlockGCCandidate(orgID, "block-orphan-2", "cold", candidateAt2)
 
 	ctx := context.Background()
 	err := s.ScanOnce(ctx)
@@ -53,6 +51,14 @@ func TestScanner_ScanOrphanedBlocks(t *testing.T) {
 	if blockItems != 2 {
 		t.Errorf("expected 2 orphaned blocks enqueued, got %d", blockItems)
 	}
+	for _, item := range items {
+		if item.ItemID == "block-orphan-1" && !item.QueuedAt.Equal(candidateAt1) {
+			t.Fatalf("block-orphan-1 queued_at = %v, want %v", item.QueuedAt, candidateAt1)
+		}
+		if item.ItemID == "block-orphan-2" && !item.QueuedAt.Equal(candidateAt2) {
+			t.Fatalf("block-orphan-2 queued_at = %v, want %v", item.QueuedAt, candidateAt2)
+		}
+	}
 
 	// Stats should be updated
 	if stats.LastScanRun().IsZero() {
@@ -60,30 +66,25 @@ func TestScanner_ScanOrphanedBlocks(t *testing.T) {
 	}
 }
 
-func TestScanner_ScanOrphanedBlocks_SkipsMissingRefCount(t *testing.T) {
+func TestScanner_ScanOrphanedBlocks_SkipsAlreadyQueuedCandidate(t *testing.T) {
 	store := NewMockStore()
 	stats := &Stats{}
 	q := NewQueue(store)
 	s := NewScanner(store, q, stats, config.GCConfig{})
 
 	orgID := uuid.New()
-	store.AddOrganization(orgID)
-	store.AddBlock(orgID, "block-orphan", "hot", 0)
-	store.AddBlockWithoutRefCount(orgID, "block-legacy-null", "hot")
+	candidateAt := time.Now().Add(-1 * time.Minute)
+	store.AddBlockGCCandidate(orgID, "block-orphan", "hot", candidateAt)
+	if err := store.EnqueueItem(orgID, candidateAt, ItemBlock, "block-orphan", uuid.Nil, "hot", 0); err != nil {
+		t.Fatalf("failed to seed queue item: %v", err)
+	}
 
 	if err := s.ScanOnce(context.Background()); err != nil {
 		t.Fatalf("ScanOnce failed: %v", err)
 	}
 
-	items := store.QueueItems(orgID)
-	blockItems := 0
-	for _, item := range items {
-		if item.ItemType == ItemBlock {
-			blockItems++
-		}
-	}
-	if blockItems != 1 {
-		t.Errorf("expected only explicit zero-ref block to be enqueued, got %d", blockItems)
+	if got := len(store.QueueItems(orgID)); got != 1 {
+		t.Errorf("expected scanner to avoid duplicate queue entries, got %d items", got)
 	}
 }
 
@@ -291,8 +292,9 @@ func TestScanner_ScanOnce_FullPipeline(t *testing.T) {
 	store.AddOrganization(orgID)
 
 	// Phase 1: orphaned blocks
-	store.AddBlock(orgID, "orphan-blk", "hot", 0)
 	store.AddBlock(orgID, "alive-blk", "hot", 5)
+	orphanCandidateAt := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
+	store.AddBlockGCCandidate(orgID, "orphan-blk", "hot", orphanCandidateAt)
 
 	// Phase 2: expired share links
 	store.AddShareLink("expired-token", orgID, time.Now().Add(-1*time.Hour))
@@ -325,6 +327,11 @@ func TestScanner_ScanOnce_FullPipeline(t *testing.T) {
 	}
 	if typeCount[ItemShareLink] != 1 {
 		t.Errorf("expected 1 share_link item, got %d", typeCount[ItemShareLink])
+	}
+	for _, item := range items {
+		if item.ItemType == ItemBlock && !item.QueuedAt.Equal(orphanCandidateAt) {
+			t.Errorf("expected block queued_at %v, got %v", orphanCandidateAt, item.QueuedAt)
+		}
 	}
 }
 
@@ -767,7 +774,8 @@ func TestScanner_IdempotentEnqueue(t *testing.T) {
 
 	orgID := uuid.New()
 	store.AddOrganization(orgID)
-	store.AddBlock(orgID, "orphan-blk", "hot", 0)
+	candidateAt := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
+	store.AddBlockGCCandidate(orgID, "orphan-blk", "hot", candidateAt)
 
 	ctx := context.Background()
 
@@ -780,9 +788,8 @@ func TestScanner_IdempotentEnqueue(t *testing.T) {
 	if firstCount != 1 {
 		t.Errorf("first scan should enqueue 1 item, got %d", firstCount)
 	}
-	// Mock doesn't deduplicate, so second count will be 2
-	if secondCount != 2 {
-		t.Errorf("expected 2 items after second scan (mock doesn't deduplicate), got %d", secondCount)
+	if secondCount != 1 {
+		t.Errorf("expected 1 item after second scan, got %d", secondCount)
 	}
 }
 
