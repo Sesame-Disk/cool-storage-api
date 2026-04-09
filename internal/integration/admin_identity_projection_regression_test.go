@@ -218,6 +218,13 @@ func TestAdminIdentityProjectionRegression_HardDeleteOrganization(t *testing.T) 
 	expectStatus(t, deleteResp, http.StatusOK)
 	deleteResp.Body.Close()
 
+	waitForIntegrationCondition(t, "soft-deleted organization to leave the active admin org list and appear in deleted status list", func() bool {
+		if adminOrganizationPresentInStatusList(t, "active", orgID, orgName, ownerEmail) {
+			return false
+		}
+		return adminOrganizationPresentInStatusList(t, "deleted", orgID, orgName, ownerEmail)
+	})
+
 	waitForIntegrationCondition(t, "soft-deleted organization to keep its deleted marker before GC hard delete", func() bool {
 		return deletedOrganizationMarkerExists(t, orgID)
 	})

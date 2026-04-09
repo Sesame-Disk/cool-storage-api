@@ -327,7 +327,17 @@ async_batch_move_with_policy() {
 # Delete a library
 delete_library() {
     local repo_id="$1"
-    api_status "DELETE" "/api/v2.1/repos/${repo_id}/" "$ADMIN_TOKEN" > /dev/null
+    local attempt
+    for attempt in 1 2 3; do
+        api_status "DELETE" "/api/v2.1/repos/${repo_id}/" "$ADMIN_TOKEN" "" > /dev/null || true
+        local status
+        status=$(api_status "GET" "/api/v2.1/repos/${repo_id}/" "$ADMIN_TOKEN" "")
+        if [ "$status" = "404" ]; then
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
 }
 
 # Parse options
@@ -1183,13 +1193,19 @@ test_copy_nested_to_root_conflict() {
 cleanup() {
     log_section "Cleanup"
     if [ -n "$REPO_ID" ]; then
-        delete_library "$REPO_ID" || true
-        log_info "Deleted test library: $REPO_ID"
+        if delete_library "$REPO_ID"; then
+            log_info "Deleted test library: $REPO_ID"
+        else
+            log_fail "Failed to delete test library: $REPO_ID"
+        fi
         REPO_ID=""
     fi
     if [ -n "$REPO_ID2" ]; then
-        delete_library "$REPO_ID2" || true
-        log_info "Deleted second test library: $REPO_ID2"
+        if delete_library "$REPO_ID2"; then
+            log_info "Deleted second test library: $REPO_ID2"
+        else
+            log_fail "Failed to delete second test library: $REPO_ID2"
+        fi
         REPO_ID2=""
     fi
 }

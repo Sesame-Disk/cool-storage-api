@@ -7,7 +7,7 @@ SUPERADMIN_TOKEN="${SUPERADMIN_TOKEN:-dev-token-superadmin}"
 
 curl -fsS -H "Authorization: Token $SUPERADMIN_TOKEN" \
   "$BASE_URL/api/v2.1/admin/organizations/" | \
-  jq -r '.organizations[]? | select(((.org_name // .name) | test("^(Test Tenant|Updated Tenant)")) and (.status != "deleted")) | [.org_id, (.org_name // .name), .status] | @tsv' | \
+  jq -r '.organizations[]? | select(((.org_name // .name) | test("^(Test Tenant|Updated Tenant|inttest-)")) and (.status != "deleted")) | [.org_id, (.org_name // .name), .status] | @tsv' | \
   while IFS="	" read -r org_id org_name org_status; do
     if [ -z "$org_id" ]; then
       continue

@@ -182,6 +182,15 @@ func AddDeleteAdminOrganizationReadModelQuery(batch *gocql.Batch, state AdminOrg
 	batch.Query(`DELETE FROM organization_admin_projection_state WHERE org_id = ?`, state.OrgID)
 }
 
+func AddDeleteAdminOrganizationStatusProjectionEntryQuery(batch *gocql.Batch, state AdminOrganizationProjectionState) {
+	status := normalizeAdminProjectionStatus(state.Status)
+	bucketDay := AdminOrganizationBucketDay(state.CreatedAt)
+	batch.Query(`
+		DELETE FROM organizations_admin_by_status_created
+		WHERE status = ? AND bucket_day = ? AND created_at = ? AND org_id = ?
+	`, status, bucketDay, state.CreatedAt, state.OrgID)
+}
+
 func SyncAdminOrganizationReadModel(session *gocql.Session, orgID string) error {
 	row, err := ReadAdminOrganizationProjectionRow(session, orgID)
 	if err != nil {
@@ -272,6 +281,19 @@ func ListAdminOrganizationRows(session *gocql.Session, statusFilter string) ([]A
 			var row AdminOrganizationProjectionRow
 			var deletedAt *time.Time
 			for iter.Scan(&row.CreatedAt, &row.OrgID, &row.Name, &row.OwnerEmail, &row.OwnerName, &row.Plan, &row.StorageQuota, &deletedAt, &row.UsersCount) {
+				state, stateErr := ReadAdminOrganizationProjectionState(session, row.OrgID)
+				if stateErr == gocql.ErrNotFound {
+					row = AdminOrganizationProjectionRow{}
+					continue
+				}
+				if stateErr != nil {
+					_ = iter.Close()
+					return nil, stateErr
+				}
+				if state.Status != statusFilter || !state.CreatedAt.Equal(row.CreatedAt) {
+					row = AdminOrganizationProjectionRow{}
+					continue
+				}
 				row.Status = statusFilter
 				row.DeletedAt = deletedAt
 				rows = append(rows, row)
@@ -386,6 +408,15 @@ func AddDeleteAdminUserReadModelQuery(batch *gocql.Batch, state AdminUserProject
 	batch.Query(`DELETE FROM user_admin_projection_state WHERE user_id = ?`, state.UserID)
 }
 
+func AddDeleteAdminUserStatusProjectionEntryQuery(batch *gocql.Batch, state AdminUserProjectionState) {
+	status := normalizeAdminProjectionStatus(state.Status)
+	bucketDay := AdminUserBucketDay(state.CreatedAt)
+	batch.Query(`
+		DELETE FROM users_admin_global_by_status_created
+		WHERE status = ? AND bucket_day = ? AND created_at = ? AND org_id = ? AND user_id = ?
+	`, status, bucketDay, state.CreatedAt, state.OrgID, state.UserID)
+}
+
 func SyncAdminUserReadModel(session *gocql.Session, orgID, userID string) error {
 	row, err := ReadAdminUserProjectionRow(session, orgID, userID)
 	if err != nil {
@@ -475,6 +506,19 @@ func ListAdminUserRows(session *gocql.Session, statusFilter string) ([]AdminUser
 			var row AdminUserProjectionRow
 			var lastLoginAt *time.Time
 			for iter.Scan(&row.CreatedAt, &row.OrgID, &row.UserID, &row.Email, &row.Name, &row.Role, &row.QuotaBytes, &row.QuotaUsage, &lastLoginAt) {
+				state, stateErr := ReadAdminUserProjectionState(session, row.UserID)
+				if stateErr == gocql.ErrNotFound {
+					row = AdminUserProjectionRow{}
+					continue
+				}
+				if stateErr != nil {
+					_ = iter.Close()
+					return nil, stateErr
+				}
+				if state.Status != statusFilter || state.OrgID != row.OrgID || !state.CreatedAt.Equal(row.CreatedAt) {
+					row = AdminUserProjectionRow{}
+					continue
+				}
 				row.Status = normalizeAdminProjectionStatus(statusFilter)
 				row.LastLoginAt = lastLoginAt
 				rows = append(rows, row)

@@ -96,6 +96,16 @@ func TestPlatformDevSeedUsers(t *testing.T) {
 	}
 }
 
+func TestFirstSuperAdminSeedUser(t *testing.T) {
+	user := firstSuperAdminSeedUser("root@example.com")
+
+	assert.Equal(t, uuid.Nil, user.UserID)
+	assert.Equal(t, "root@example.com", user.Email)
+	assert.Equal(t, "System Administrator", user.Name)
+	assert.Equal(t, "superadmin", user.Role)
+	assert.Equal(t, int64(-2), user.QuotaBytes)
+}
+
 func TestDefaultDevSeedUsers(t *testing.T) {
 	users := defaultDevSeedUsers()
 	if assert.Len(t, users, 4) {

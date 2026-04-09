@@ -162,94 +162,48 @@ func (h *AdminHandler) CreateOrganization(c *gin.Context) {
 		}
 	}
 
-	// ── Create the organization ────────────────────────────────────────────
 	orgID := uuid.New()
 	now := time.Now()
 	periodEnd := template.PeriodEnd(now)
-	settings := template.Settings
-	storageConfig := template.StorageConfig
-
-	orgInsertQuery := `
-		INSERT INTO organizations (
-			org_id, name, status, settings, storage_quota, storage_used,
-			chunking_polynomial, storage_config, created_at,
-			plan, quota_policy, billing_cycle,
-			traffic_quota, traffic_upload_quota, traffic_download_quota, max_users,
-			current_period_started_at, current_period_ends_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`
-	orgInsertArgs := []interface{}{
-		orgID.String(), orgName, StatusActive, settings,
-		storageQuota, int64(0), template.ChunkingPolynomial,
-		storageConfig, now,
-		template.Plan,
-		template.QuotaPolicy,
-		template.BillingCycle,
-		template.TrafficQuota,
-		template.TrafficUploadQuota,
-		template.TrafficDownloadQuota,
-		template.MaxUsers,
-		now,       // current_period_started_at
-		periodEnd, // current_period_ends_at
-	}
-
-	// ── Optionally create the owner user ──────────────────────────────────
 	ownerName := ""
-	orgProjectionRow := db.AdminOrganizationProjectionRow{
-		OrgID:        orgID.String(),
-		Name:         orgName,
-		Status:       StatusActive,
-		Plan:         template.Plan,
-		StorageQuota: storageQuota,
-		CreatedAt:    now,
-	}
+	users := []db.AdminUserWriteSpec{}
 	if ownerEmail != "" {
 		ownerName = strings.Split(ownerEmail, "@")[0]
-		ownerUserID := uuid.New()
-		orgProjectionRow.OwnerEmail = ownerEmail
-		orgProjectionRow.OwnerName = ownerName
-		orgProjectionRow.UsersCount = 1
-
-		batch := h.db.Session().Batch(gocql.LoggedBatch)
-		batch.Query(orgInsertQuery, orgInsertArgs...)
-		batch.Query(`
-			INSERT INTO users (org_id, user_id, email, name, role, status, quota_bytes, used_bytes, created_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-		`, orgID.String(), ownerUserID.String(), ownerEmail, ownerName, "owner", StatusActive,
-			storageQuota, int64(0), now)
-
-		batch.Query(`
-			INSERT INTO users_by_email (email, user_id, org_id)
-			VALUES (?, ?, ?)
-		`, ownerEmail, ownerUserID.String(), orgID.String())
-		db.AddUpsertAdminUserReadModelQuery(batch, db.AdminUserProjectionRow{
+		users = append(users, db.AdminUserWriteSpec{
 			OrgID:      orgID.String(),
-			UserID:     ownerUserID.String(),
+			UserID:     uuid.NewString(),
 			Email:      ownerEmail,
 			Name:       ownerName,
 			Role:       "owner",
 			Status:     StatusActive,
 			QuotaBytes: storageQuota,
-			QuotaUsage: int64(0),
+			UsedBytes:  int64(0),
 			CreatedAt:  now,
 		})
-		db.AddUpsertAdminOrganizationReadModelQuery(batch, orgProjectionRow)
-
-		if err := batch.Exec(); err != nil {
-			log.Printf("CreateOrganization: failed to create org %s with owner %s: %v",
-				orgID, ownerEmail, err)
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create organization"})
-			return
-		}
-	} else {
-		batch := h.db.Session().Batch(gocql.LoggedBatch)
-		batch.Query(orgInsertQuery, orgInsertArgs...)
-		db.AddUpsertAdminOrganizationReadModelQuery(batch, orgProjectionRow)
-		if err := batch.Exec(); err != nil {
-			log.Printf("CreateOrganization: failed to insert org %s: %v", orgName, err)
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create organization"})
-			return
-		}
+	}
+	if err := db.CreateOrganizationWithUsersAndReadModels(h.db.Session(), db.AdminOrganizationWriteSpec{
+		OrgID:                  orgID.String(),
+		Name:                   orgName,
+		Status:                 StatusActive,
+		Settings:               template.Settings,
+		StorageQuota:           storageQuota,
+		StorageUsed:            int64(0),
+		ChunkingPolynomial:     template.ChunkingPolynomial,
+		StorageConfig:          template.StorageConfig,
+		CreatedAt:              now,
+		Plan:                   template.Plan,
+		QuotaPolicy:            template.QuotaPolicy,
+		BillingCycle:           template.BillingCycle,
+		TrafficQuota:           template.TrafficQuota,
+		TrafficUploadQuota:     template.TrafficUploadQuota,
+		TrafficDownloadQuota:   template.TrafficDownloadQuota,
+		MaxUsers:               template.MaxUsers,
+		CurrentPeriodStartedAt: now,
+		CurrentPeriodEndsAt:    periodEnd,
+	}, users); err != nil {
+		log.Printf("CreateOrganization: failed to create org %s: %v", orgName, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create organization"})
+		return
 	}
 
 	c.JSON(http.StatusCreated, gin.H{

@@ -39,6 +39,16 @@ func platformSeedUsers(devMode bool) []seedUserSpec {
 	return platformDevSeedUsers()
 }
 
+func firstSuperAdminSeedUser(email string) seedUserSpec {
+	return seedUserSpec{
+		UserID:     uuid.Nil,
+		Email:      email,
+		Name:       "System Administrator",
+		Role:       "superadmin",
+		QuotaBytes: int64(-2),
+	}
+}
+
 func defaultDevSeedUsers() []seedUserSpec {
 	return []seedUserSpec{
 		{
@@ -128,9 +138,11 @@ func (db *DB) SeedDatabase(cfg *config.Config, devMode bool, firstSuperAdminEmai
 		if err := db.seedPlatform(platformOrgID, devMode, firstSuperAdminEmail); err != nil {
 			return err
 		}
-	} else if devMode {
-		if err := db.ensureSeedUsers(platformOrgID, platformSeedUsers(devMode)); err != nil {
-			return err
+	} else {
+		if devMode {
+			if err := db.ensureSeedUsers(platformOrgID, platformSeedUsers(devMode)); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -170,77 +182,51 @@ func (db *DB) seedPlatform(orgID uuid.UUID, devMode bool, firstSuperAdminEmail s
 	// written with the correct users_count + owner fields in a single pass.
 	var admins []seedUserSpec
 	if firstSuperAdminEmail != "" {
-		admins = append(admins, seedUserSpec{
-			UserID:     uuid.New(),
-			Email:      firstSuperAdminEmail,
-			Name:       "System Administrator",
-			Role:       "superadmin",
-			QuotaBytes: int64(-2),
-		})
+		admins = append(admins, firstSuperAdminSeedUser(firstSuperAdminEmail))
 	}
 	if devMode {
 		admins = append(admins, platformSeedUsers(devMode)...)
 	}
-
-	batch := db.Session().Batch(gocql.LoggedBatch)
-
-	batch.Query(`
-		INSERT INTO organizations (
-			org_id, name, status, settings, storage_quota, storage_used,
-			chunking_polynomial, storage_config, created_at,
-			plan, quota_policy, billing_cycle,
-			traffic_quota, traffic_upload_quota, traffic_download_quota, max_users,
-			current_period_started_at, current_period_ends_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`,
-		orgID.String(), orgName, "active", settings,
-		storageQuota, int64(0), int64(17592186044415), storageConfig, now,
-		plan, "soft", "monthly",
-		int64(-1), int64(-1), int64(-1), int(-1),
-		now, periodEnd,
-	)
-
-	for _, u := range admins {
-		batch.Query(`
-			INSERT INTO users (
-				org_id, user_id, email, name, role, status,
-				quota_bytes, used_bytes, created_at
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-		`, orgID.String(), u.UserID.String(), u.Email, u.Name,
-			u.Role, "active", u.QuotaBytes, int64(0), now)
-		batch.Query(`
-			INSERT INTO users_by_email (email, user_id, org_id)
-			VALUES (?, ?, ?)
-		`, u.Email, u.UserID.String(), orgID.String())
-		AddUpsertAdminUserReadModelQuery(batch, AdminUserProjectionRow{
+	adminWrites := make([]AdminUserWriteSpec, 0, len(admins))
+	for _, user := range admins {
+		userID := user.UserID
+		if userID == uuid.Nil {
+			userID = uuid.New()
+		}
+		user.UserID = userID
+		adminWrites = append(adminWrites, AdminUserWriteSpec{
 			OrgID:      orgID.String(),
-			UserID:     u.UserID.String(),
-			Email:      u.Email,
-			Name:       u.Name,
-			Role:       u.Role,
-			Status:     "active",
-			QuotaBytes: u.QuotaBytes,
-			QuotaUsage: int64(0),
+			UserID:     userID.String(),
+			Email:      user.Email,
+			Name:       user.Name,
+			Role:       user.Role,
+			Status:     adminIdentityStatusActive,
+			QuotaBytes: user.QuotaBytes,
+			UsedBytes:  int64(0),
 			CreatedAt:  now,
 		})
 	}
 
-	orgProjection := AdminOrganizationProjectionRow{
-		OrgID:        orgID.String(),
-		Name:         orgName,
-		Status:       "active",
-		Plan:         plan,
-		StorageQuota: storageQuota,
-		CreatedAt:    now,
-		UsersCount:   len(admins),
-	}
-	if len(admins) > 0 {
-		orgProjection.OwnerEmail = admins[0].Email
-		orgProjection.OwnerName = admins[0].Name
-	}
-	AddUpsertAdminOrganizationReadModelQuery(batch, orgProjection)
-
-	if err := batch.Exec(); err != nil {
+	if err := CreateOrganizationWithUsersAndReadModels(db.Session(), AdminOrganizationWriteSpec{
+		OrgID:                  orgID.String(),
+		Name:                   orgName,
+		Status:                 adminIdentityStatusActive,
+		Settings:               settings,
+		StorageQuota:           storageQuota,
+		StorageUsed:            int64(0),
+		ChunkingPolynomial:     int64(17592186044415),
+		StorageConfig:          storageConfig,
+		CreatedAt:              now,
+		Plan:                   plan,
+		QuotaPolicy:            "soft",
+		BillingCycle:           "monthly",
+		TrafficQuota:           int64(-1),
+		TrafficUploadQuota:     int64(-1),
+		TrafficDownloadQuota:   int64(-1),
+		MaxUsers:               int(-1),
+		CurrentPeriodStartedAt: now,
+		CurrentPeriodEndsAt:    periodEnd,
+	}, adminWrites); err != nil {
 		log.Printf("✗ Failed to seed platform org %s: %v", orgID, err)
 		return fmt.Errorf("seed platform org: %w", err)
 	}
@@ -263,77 +249,41 @@ func (db *DB) seedDefault(orgID uuid.UUID, template config.OrganizationTemplate,
 	if devMode {
 		users = defaultSeedUsers(devMode)
 	}
-
-	batch := db.Session().Batch(gocql.LoggedBatch)
-
-	batch.Query(`
-		INSERT INTO organizations (
-			org_id, name, status, settings, storage_quota, storage_used,
-			chunking_polynomial, storage_config, created_at,
-			plan, quota_policy, billing_cycle,
-			traffic_quota, traffic_upload_quota, traffic_download_quota, max_users,
-			current_period_started_at, current_period_ends_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`,
-		orgID.String(), orgName, "active",
-		template.Settings,
-		template.StorageQuota, int64(0),
-		template.ChunkingPolynomial, template.StorageConfig, now,
-		template.Plan, template.QuotaPolicy, template.BillingCycle,
-		template.TrafficQuota, template.TrafficUploadQuota, template.TrafficDownloadQuota,
-		template.MaxUsers,
-		now, periodEnd,
-	)
-
-	for _, u := range users {
-		batch.Query(`
-			INSERT INTO users (
-				org_id, user_id, email, name, role, status,
-				quota_bytes, used_bytes, created_at
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-		`, orgID.String(), u.UserID.String(), u.Email, u.Name,
-			u.Role, "active", u.QuotaBytes, int64(0), now)
-		batch.Query(`
-			INSERT INTO users_by_email (email, user_id, org_id)
-			VALUES (?, ?, ?)
-		`, u.Email, u.UserID.String(), orgID.String())
-		AddUpsertAdminUserReadModelQuery(batch, AdminUserProjectionRow{
+	adminWrites := make([]AdminUserWriteSpec, 0, len(users))
+	for _, user := range users {
+		adminWrites = append(adminWrites, AdminUserWriteSpec{
 			OrgID:      orgID.String(),
-			UserID:     u.UserID.String(),
-			Email:      u.Email,
-			Name:       u.Name,
-			Role:       u.Role,
-			Status:     "active",
-			QuotaBytes: u.QuotaBytes,
-			QuotaUsage: int64(0),
+			UserID:     user.UserID.String(),
+			Email:      user.Email,
+			Name:       user.Name,
+			Role:       user.Role,
+			Status:     adminIdentityStatusActive,
+			QuotaBytes: user.QuotaBytes,
+			UsedBytes:  int64(0),
 			CreatedAt:  now,
 		})
 	}
 
-	// Owner fields: prefer a user with an elevated role, else the first user.
-	orgProjection := AdminOrganizationProjectionRow{
-		OrgID:        orgID.String(),
-		Name:         orgName,
-		Status:       "active",
-		Plan:         template.Plan,
-		StorageQuota: template.StorageQuota,
-		CreatedAt:    now,
-		UsersCount:   len(users),
-	}
-	for _, u := range users {
-		if u.Role == "owner" || u.Role == "admin" || u.Role == "superadmin" {
-			orgProjection.OwnerEmail = u.Email
-			orgProjection.OwnerName = u.Name
-			break
-		}
-	}
-	if orgProjection.OwnerEmail == "" && len(users) > 0 {
-		orgProjection.OwnerEmail = users[0].Email
-		orgProjection.OwnerName = users[0].Name
-	}
-	AddUpsertAdminOrganizationReadModelQuery(batch, orgProjection)
-
-	if err := batch.Exec(); err != nil {
+	if err := CreateOrganizationWithUsersAndReadModels(db.Session(), AdminOrganizationWriteSpec{
+		OrgID:                  orgID.String(),
+		Name:                   orgName,
+		Status:                 adminIdentityStatusActive,
+		Settings:               template.Settings,
+		StorageQuota:           template.StorageQuota,
+		StorageUsed:            int64(0),
+		ChunkingPolynomial:     template.ChunkingPolynomial,
+		StorageConfig:          template.StorageConfig,
+		CreatedAt:              now,
+		Plan:                   template.Plan,
+		QuotaPolicy:            template.QuotaPolicy,
+		BillingCycle:           template.BillingCycle,
+		TrafficQuota:           template.TrafficQuota,
+		TrafficUploadQuota:     template.TrafficUploadQuota,
+		TrafficDownloadQuota:   template.TrafficDownloadQuota,
+		MaxUsers:               template.MaxUsers,
+		CurrentPeriodStartedAt: now,
+		CurrentPeriodEndsAt:    periodEnd,
+	}, adminWrites); err != nil {
 		log.Printf("✗ Failed to seed default org %s: %v", orgID, err)
 		return fmt.Errorf("seed default org: %w", err)
 	}
@@ -360,15 +310,21 @@ func (db *DB) ensureSeedUsers(orgID uuid.UUID, users []seedUserSpec) error {
 			// Canonical row already exists; refresh lookup/projection below.
 		case gocql.ErrNotFound:
 			now := time.Now()
-			if err := db.Session().Query(`
-				INSERT INTO users (
-					org_id, user_id, email, name, role, status,
-					quota_bytes, used_bytes, created_at
-				) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-			`, orgID.String(), u.UserID.String(), u.Email, u.Name, u.Role, "active", u.QuotaBytes, int64(0), now).Exec(); err != nil {
+			if err := CreateUserWithLookupsAndReadModels(db.Session(), AdminUserWriteSpec{
+				OrgID:      orgID.String(),
+				UserID:     u.UserID.String(),
+				Email:      u.Email,
+				Name:       u.Name,
+				Role:       u.Role,
+				Status:     adminIdentityStatusActive,
+				QuotaBytes: u.QuotaBytes,
+				UsedBytes:  int64(0),
+				CreatedAt:  now,
+			}); err != nil {
 				return fmt.Errorf("seed: create missing user %s: %w", u.Email, err)
 			}
 			log.Printf("✓ Repaired missing seed user: %s (%s)", u.Email, u.UserID)
+			continue
 		default:
 			return fmt.Errorf("seed: check user %s: %w", u.Email, err)
 		}

@@ -128,10 +128,10 @@ api_json() {
 cleanup_test_libraries() {
     log_info "Cleaning up test libraries..."
 
-    # Get all libraries for admin and user, delete any starting with "test-"
-    for token in "$ADMIN_TOKEN" "$USER_TOKEN"; do
+    # Get all libraries for superadmin/admin/user, delete ephemeral test libraries.
+    for token in "$SUPERADMIN_TOKEN" "$ADMIN_TOKEN" "$USER_TOKEN"; do
         local libs=$(api_get_body "/api/v2.1/repos/?type=mine" "$token")
-        local lib_ids=$(echo "$libs" | jq -r '.repos[] | select(.repo_name | startswith("test-")) | .repo_id')
+        local lib_ids=$(echo "$libs" | jq -r '.repos[] | select(.repo_name | test("^(test-|sa-test-lib-)")) | .repo_id')
 
         for lib_id in $lib_ids; do
             api_call "DELETE" "/api/v2.1/repos/${lib_id}/" "$token" > /dev/null 2>&1
@@ -254,7 +254,12 @@ test_library_creation() {
     local timestamp=$(date +%s)
 
     # Superadmin should be able to create libraries
-    local sa_status=$(api_call "POST" "/api/v2.1/repos/" "$SUPERADMIN_TOKEN" "{\"repo_name\":\"test-sa-lib-${timestamp}\"}")
+    local sa_resp=$(curl -s -H "Authorization: Token $SUPERADMIN_TOKEN" \
+        -H "Content-Type: application/json" \
+        -d "{\"repo_name\":\"test-sa-lib-${timestamp}\"}" \
+        "${API_URL}/api/v2.1/repos/")
+    local sa_lib_id=$(echo "$sa_resp" | jq -r '.repo_id // empty')
+    local sa_status=$(api_call "POST" "/api/v2.1/repos/" "$SUPERADMIN_TOKEN" "{\"repo_name\":\"test-sa-lib2-${timestamp}\"}")
     run_test "Superadmin: create library should succeed (200)" "200" "$sa_status"
 
     # Admin should be able to create libraries
@@ -284,6 +289,10 @@ test_library_creation() {
     run_test "Guest: create library should fail (403)" "403" "$status"
 
     # Cleanup: delete created libraries
+    if [ -n "$sa_lib_id" ] && [ "$sa_lib_id" != "null" ]; then
+        api_call "DELETE" "/api/v2.1/repos/${sa_lib_id}/" "$SUPERADMIN_TOKEN" > /dev/null 2>&1
+        log_info "Cleaned up superadmin test library"
+    fi
     if [ -n "$admin_lib_id" ] && [ "$admin_lib_id" != "null" ]; then
         api_call "DELETE" "/api/v2.1/repos/${admin_lib_id}/" "$ADMIN_TOKEN" > /dev/null 2>&1
         log_info "Cleaned up admin test library"

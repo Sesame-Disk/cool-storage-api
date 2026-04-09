@@ -35,38 +35,8 @@ func formatOptionalTimestamp(ts time.Time) string {
 	return ts.UTC().Format(time.RFC3339)
 }
 
-func buildAdminOrganizationProjectionRowForNewUser(
-	db interface{ Session() *gocql.Session },
-	orgID, email, name, role string,
-) (dbpkg.AdminOrganizationProjectionRow, error) {
-	row, err := dbpkg.ReadAdminOrganizationProjectionRow(db.Session(), orgID)
-	if err != nil {
-		return dbpkg.AdminOrganizationProjectionRow{}, err
-	}
-	row.UsersCount++
-	if row.OwnerEmail == "" || role == "owner" {
-		row.OwnerEmail = email
-		row.OwnerName = name
-	}
-	return row, nil
-}
-
 func createUserWithEmailLookup(db interface{ Session() *gocql.Session }, orgID, userID, email, name, role string, quotaBytes, usedBytes int64, createdAt time.Time) error {
-	orgProjectionRow, err := buildAdminOrganizationProjectionRowForNewUser(db, orgID, email, name, role)
-	if err != nil {
-		return fmt.Errorf("build admin org projection for new user %s in org %s: %w", userID, orgID, err)
-	}
-
-	batch := db.Session().Batch(gocql.LoggedBatch)
-	batch.Query(`
-		INSERT INTO users (org_id, user_id, email, name, role, status, quota_bytes, used_bytes, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, orgID, userID, email, name, role, StatusActive, quotaBytes, usedBytes, createdAt)
-	batch.Query(`
-		INSERT INTO users_by_email (email, user_id, org_id)
-		VALUES (?, ?, ?)
-	`, email, userID, orgID)
-	dbpkg.AddUpsertAdminUserReadModelQuery(batch, dbpkg.AdminUserProjectionRow{
+	return dbpkg.CreateUserWithLookupsAndReadModels(db.Session(), dbpkg.AdminUserWriteSpec{
 		OrgID:      orgID,
 		UserID:     userID,
 		Email:      email,
@@ -74,14 +44,9 @@ func createUserWithEmailLookup(db interface{ Session() *gocql.Session }, orgID, 
 		Role:       role,
 		Status:     StatusActive,
 		QuotaBytes: quotaBytes,
-		QuotaUsage: usedBytes,
+		UsedBytes:  usedBytes,
 		CreatedAt:  createdAt,
 	})
-	dbpkg.AddUpsertAdminOrganizationReadModelQuery(batch, orgProjectionRow)
-	if err := batch.Exec(); err != nil {
-		return fmt.Errorf("exec create user batch for user %s in org %s: %w", userID, orgID, err)
-	}
-	return nil
 }
 
 type batchedUserUpdate struct {
@@ -94,83 +59,20 @@ type batchedUserUpdate struct {
 	TrafficDownloadQuota int64
 }
 
-func buildAdminOrganizationProjectionRowForUpdatedUser(
-	db interface{ Session() *gocql.Session },
-	orgID, updatedUserID, updatedName, updatedRole string,
-) (dbpkg.AdminOrganizationProjectionRow, error) {
-	row := dbpkg.AdminOrganizationProjectionRow{OrgID: orgID}
-	var deletedAt *time.Time
-	if err := db.Session().Query(`
-		SELECT name, status, plan, storage_quota, deleted_at, created_at
-		FROM organizations WHERE org_id = ?
-	`, orgID).Scan(&row.Name, &row.Status, &row.Plan, &row.StorageQuota, &deletedAt, &row.CreatedAt); err != nil {
-		return dbpkg.AdminOrganizationProjectionRow{}, err
-	}
-	if row.Status == "" {
-		row.Status = StatusActive
-	}
-	row.DeletedAt = deletedAt
-
-	iter := db.Session().Query(`
-		SELECT user_id, email, name, role FROM users WHERE org_id = ?
-	`, orgID).Iter()
-
-	var userID, email, name, role string
-	var firstEmail, firstName string
-	firstRemaining := true
-	for iter.Scan(&userID, &email, &name, &role) {
-		if userID == updatedUserID {
-			name = updatedName
-			role = updatedRole
-		}
-		row.UsersCount++
-		if firstRemaining {
-			firstEmail, firstName = email, name
-			firstRemaining = false
-		}
-		if row.OwnerEmail == "" && (role == "superadmin" || role == "owner" || role == "admin") {
-			row.OwnerEmail = email
-			row.OwnerName = name
-		}
-	}
-	if err := iter.Close(); err != nil {
-		return dbpkg.AdminOrganizationProjectionRow{}, err
-	}
-	if row.OwnerEmail == "" {
-		row.OwnerEmail = firstEmail
-		row.OwnerName = firstName
-	}
-	return row, nil
-}
-
 func updateUserAndAdminReadModels(
 	db interface{ Session() *gocql.Session },
 	orgID, userID string,
 	next batchedUserUpdate,
 ) error {
-	userProjectionRow, err := dbpkg.ReadAdminUserProjectionRow(db.Session(), orgID, userID)
-	if err != nil {
-		return err
-	}
-	userProjectionRow.Name = next.Name
-	userProjectionRow.Role = next.Role
-	userProjectionRow.Status = next.Status
-	userProjectionRow.QuotaBytes = next.QuotaBytes
-
-	orgProjectionRow, err := buildAdminOrganizationProjectionRowForUpdatedUser(db, orgID, userID, next.Name, next.Role)
-	if err != nil {
-		return err
-	}
-
-	batch := db.Session().Batch(gocql.LoggedBatch)
-	batch.Query(`
-		UPDATE users
-		SET name = ?, role = ?, status = ?, deleted_at = ?, quota_bytes = ?, traffic_upload_quota = ?, traffic_download_quota = ?
-		WHERE org_id = ? AND user_id = ?
-	`, next.Name, next.Role, next.Status, next.DeletedAt, next.QuotaBytes, next.TrafficUploadQuota, next.TrafficDownloadQuota, orgID, userID)
-	dbpkg.AddUpsertAdminUserReadModelQuery(batch, userProjectionRow)
-	dbpkg.AddUpsertAdminOrganizationReadModelQuery(batch, orgProjectionRow)
-	return batch.Exec()
+	return dbpkg.UpdateUserAndAdminReadModels(db.Session(), orgID, userID, dbpkg.AdminUserUpdateSpec{
+		Name:                 next.Name,
+		Role:                 next.Role,
+		Status:               next.Status,
+		DeletedAt:            next.DeletedAt,
+		QuotaBytes:           next.QuotaBytes,
+		TrafficUploadQuota:   next.TrafficUploadQuota,
+		TrafficDownloadQuota: next.TrafficDownloadQuota,
+	})
 }
 
 type batchedOrganizationLifecycleUpdate struct {
@@ -186,27 +88,13 @@ func updateOrganizationLifecycleAndReadModel(
 	orgID string,
 	next batchedOrganizationLifecycleUpdate,
 ) error {
-	orgProjectionRow, err := dbpkg.ReadAdminOrganizationProjectionRow(db.Session(), orgID)
-	if err != nil {
-		return err
-	}
-	orgProjectionRow.Status = next.Status
-	orgProjectionRow.DeletedAt = next.DeletedAt
-
-	batch := db.Session().Batch(gocql.LoggedBatch)
-	batch.Query(`
-		UPDATE organizations SET status = ?, deleted_at = ? WHERE org_id = ?
-	`, next.Status, next.DeletedAt, orgID)
-	if next.DeleteDeletedMarker {
-		batch.Query(`DELETE FROM deleted_organizations WHERE org_id = ?`, orgID)
-	}
-	if next.DeletedMarkerAt != nil {
-		batch.Query(`
-			INSERT INTO deleted_organizations (org_id, name, deleted_at) VALUES (?, ?, ?)
-		`, orgID, next.DeletedMarkerName, *next.DeletedMarkerAt)
-	}
-	dbpkg.AddUpsertAdminOrganizationReadModelQuery(batch, orgProjectionRow)
-	return batch.Exec()
+	return dbpkg.UpdateOrganizationLifecycleAndReadModel(db.Session(), orgID, dbpkg.AdminOrganizationLifecycleUpdate{
+		Status:              next.Status,
+		DeletedAt:           next.DeletedAt,
+		DeletedMarkerName:   next.DeletedMarkerName,
+		DeletedMarkerAt:     next.DeletedMarkerAt,
+		DeleteDeletedMarker: next.DeleteDeletedMarker,
+	})
 }
 
 func adminLibraryProjectionDeletedAtEqual(left, right *time.Time) bool {
