@@ -93,6 +93,7 @@ type mockBlock struct {
 	BlockID      string
 	StorageClass string
 	RefCount     int
+	HasRefCount  bool
 }
 
 type mockCommit struct {
@@ -223,6 +224,19 @@ func (m *MockStore) AddBlock(orgID uuid.UUID, blockID, storageClass string, refC
 		BlockID:      blockID,
 		StorageClass: storageClass,
 		RefCount:     refCount,
+		HasRefCount:  true,
+	}
+}
+
+func (m *MockStore) AddBlockWithoutRefCount(orgID uuid.UUID, blockID, storageClass string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	key := fmt.Sprintf("%s:%s", orgID, blockID)
+	m.blocks[key] = &mockBlock{
+		OrgID:        orgID,
+		BlockID:      blockID,
+		StorageClass: storageClass,
+		HasRefCount:  false,
 	}
 }
 
@@ -873,6 +887,7 @@ func (m *MockStore) ListBlocksForOrg(orgID uuid.UUID) ([]BlockInfo, error) {
 				BlockID:      b.BlockID,
 				StorageClass: b.StorageClass,
 				RefCount:     b.RefCount,
+				HasRefCount:  b.HasRefCount,
 			})
 		}
 	}

@@ -176,6 +176,7 @@ type BlockInfo struct {
 	BlockID      string
 	StorageClass string
 	RefCount     int
+	HasRefCount  bool
 }
 
 // ShareLinkInfo holds data about a share link needed by the scanner.

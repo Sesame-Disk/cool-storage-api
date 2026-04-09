@@ -105,7 +105,7 @@ func (s *Scanner) scanOrphanedBlocks(ctx context.Context) (int, error) {
 
 		var batch []QueueItem
 		for _, b := range blocks {
-			if b.RefCount <= 0 {
+			if b.HasRefCount && b.RefCount <= 0 {
 				batch = append(batch, QueueItem{
 					OrgID:        orgID,
 					QueuedAt:     now,

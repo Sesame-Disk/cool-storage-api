@@ -781,8 +781,9 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 
 	// Register block metadata for size lookups (used by video/audio Range requests)
 	if err := h.db.Session().Query(`
-		INSERT INTO blocks (org_id, block_id, size_bytes, storage_class, created_at) VALUES (?, ?, ?, ?, toTimestamp(now()))
-	`, token.OrgID, sha256ID, len(storedContent), actualStorageClass).Exec(); err != nil {
+		INSERT INTO blocks (org_id, block_id, size_bytes, storage_class, ref_count, created_at, last_accessed)
+		VALUES (?, ?, ?, ?, ?, toTimestamp(now()), toTimestamp(now()))
+	`, token.OrgID, sha256ID, len(storedContent), actualStorageClass, 1).Exec(); err != nil {
 		log.Printf("[HandleUpload] WARNING: Failed to write block metadata org=%s block=%s: %v", token.OrgID, sha256ID[:16], err)
 	}
 
@@ -905,8 +906,9 @@ func (h *SeafHTTPHandler) finalizeUploadStreaming(c *gin.Context, token *AccessT
 
 		// Register block metadata for size lookups (used by video/audio Range requests)
 		if err := h.db.Session().Query(`
-			INSERT INTO blocks (org_id, block_id, size_bytes, storage_class, created_at) VALUES (?, ?, ?, ?, toTimestamp(now()))
-		`, token.OrgID, sha256ID, len(storedBlock), actualStorageClass).Exec(); err != nil {
+			INSERT INTO blocks (org_id, block_id, size_bytes, storage_class, ref_count, created_at, last_accessed)
+			VALUES (?, ?, ?, ?, ?, toTimestamp(now()), toTimestamp(now()))
+		`, token.OrgID, sha256ID, len(storedBlock), actualStorageClass, 1).Exec(); err != nil {
 			log.Printf("[finalizeUploadStreaming] WARNING: Failed to write block metadata org=%s block=%s: %v", token.OrgID, sha256ID[:16], err)
 		}
 

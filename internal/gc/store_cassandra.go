@@ -234,9 +234,10 @@ func (s *CassandraStore) ListOrgsWithQueuedItems() ([]uuid.UUID, error) {
 func (s *CassandraStore) MarkItemProcessed(taskID uuid.UUID) (bool, error) {
 	// USING TTL must come before IF NOT EXISTS in CQL syntax.
 	// We omit USING TTL here because the table already has default_time_to_live = 172800.
+	var existingTaskID string
 	applied, err := s.db.Session().Query(`
 		INSERT INTO gc_processed_items (task_id) VALUES (?) IF NOT EXISTS
-	`, taskID.String()).ScanCAS()
+	`, taskID.String()).ScanCAS(&existingTaskID)
 	return applied, err
 }
 
@@ -430,14 +431,15 @@ func (s *CassandraStore) ListOrganizations() ([]uuid.UUID, error) {
 
 func (s *CassandraStore) ListBlocksForOrg(orgID uuid.UUID) ([]BlockInfo, error) {
 	iter := s.db.Session().Query(`
-		SELECT block_id, storage_class, ref_count FROM blocks WHERE org_id = ?
+		SELECT block_id, storage_class, ref_count FROM blocks
+		WHERE org_id = ? AND ref_count <= 0 ALLOW FILTERING
 	`, orgID.String()).Iter()
 
 	var blocks []BlockInfo
 	var blockID, storageClass string
 	var refCount int
 	for iter.Scan(&blockID, &storageClass, &refCount) {
-		blocks = append(blocks, BlockInfo{BlockID: blockID, StorageClass: storageClass, RefCount: refCount})
+		blocks = append(blocks, BlockInfo{BlockID: blockID, StorageClass: storageClass, RefCount: refCount, HasRefCount: true})
 	}
 	if err := iter.Close(); err != nil {
 		return nil, err

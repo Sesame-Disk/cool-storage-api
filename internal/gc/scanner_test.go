@@ -60,6 +60,33 @@ func TestScanner_ScanOrphanedBlocks(t *testing.T) {
 	}
 }
 
+func TestScanner_ScanOrphanedBlocks_SkipsMissingRefCount(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	s := NewScanner(store, q, stats, config.GCConfig{})
+
+	orgID := uuid.New()
+	store.AddOrganization(orgID)
+	store.AddBlock(orgID, "block-orphan", "hot", 0)
+	store.AddBlockWithoutRefCount(orgID, "block-legacy-null", "hot")
+
+	if err := s.ScanOnce(context.Background()); err != nil {
+		t.Fatalf("ScanOnce failed: %v", err)
+	}
+
+	items := store.QueueItems(orgID)
+	blockItems := 0
+	for _, item := range items {
+		if item.ItemType == ItemBlock {
+			blockItems++
+		}
+	}
+	if blockItems != 1 {
+		t.Errorf("expected only explicit zero-ref block to be enqueued, got %d", blockItems)
+	}
+}
+
 func TestScanner_ScanExpiredShareLinks(t *testing.T) {
 	store := NewMockStore()
 	stats := &Stats{}
