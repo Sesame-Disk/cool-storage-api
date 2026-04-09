@@ -2,6 +2,7 @@ package gc
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"time"
 
@@ -9,6 +10,10 @@ import (
 	"github.com/Sesame-Disk/sesamefs/internal/metrics"
 	"github.com/google/uuid"
 )
+
+func scanTaskID(kind string, orgID uuid.UUID, itemID string, markerTime time.Time) uuid.UUID {
+	return uuid.NewMD5(uuid.NameSpaceOID, []byte(fmt.Sprintf("%s:%s:%s:%d", kind, orgID, itemID, markerTime.UTC().UnixNano())))
+}
 
 // Scanner periodically finds orphaned items that were missed by inline enqueue
 // and adds them to the gc_queue for processing.
@@ -573,12 +578,20 @@ func (s *Scanner) scanExpiredDeletedUsers(ctx context.Context) (int, error) {
 	}
 
 	enqueued := 0
-	now := time.Now()
 	var batch []QueueItem
 	for _, u := range users {
+		taskID := scanTaskID("user_cascade", u.OrgID, u.UserID.String(), u.DeletedAt)
+		applied, err := s.store.MarkItemProcessed(taskID)
+		if err != nil {
+			log.Printf("[GC Scanner] Phase 10: failed to dedupe expired deleted user %s: %v", u.UserID, err)
+			continue
+		}
+		if !applied {
+			continue
+		}
 		batch = append(batch, QueueItem{
 			OrgID:    u.OrgID,
-			QueuedAt: now,
+			QueuedAt: u.DeletedAt,
 			ItemType: ItemUserCascade,
 			ItemID:   u.UserID.String(),
 		})
@@ -609,12 +622,20 @@ func (s *Scanner) scanExpiredDeletedLibraries(ctx context.Context) (int, error) 
 	}
 
 	enqueued := 0
-	now := time.Now()
 	var batch []QueueItem
 	for _, lib := range libs {
+		taskID := scanTaskID("library_cascade", lib.OrgID, lib.LibraryID.String(), lib.DeletedAt)
+		applied, err := s.store.MarkItemProcessed(taskID)
+		if err != nil {
+			log.Printf("[GC Scanner] Phase 11: failed to dedupe expired deleted library %s: %v", lib.LibraryID, err)
+			continue
+		}
+		if !applied {
+			continue
+		}
 		batch = append(batch, QueueItem{
 			OrgID:        lib.OrgID,
-			QueuedAt:     now,
+			QueuedAt:     lib.DeletedAt,
 			ItemType:     ItemLibraryCascade,
 			ItemID:       lib.LibraryID.String(),
 			StorageClass: lib.StorageClass,
@@ -645,12 +666,20 @@ func (s *Scanner) scanExpiredDeletedOrgs(ctx context.Context) (int, error) {
 	}
 
 	enqueued := 0
-	now := time.Now()
 	var batch []QueueItem
 	for _, org := range orgs {
+		taskID := scanTaskID("org_cascade", org.OrgID, org.OrgID.String(), org.DeletedAt)
+		applied, err := s.store.MarkItemProcessed(taskID)
+		if err != nil {
+			log.Printf("[GC Scanner] Phase 12: failed to dedupe expired deleted org %s: %v", org.OrgID, err)
+			continue
+		}
+		if !applied {
+			continue
+		}
 		batch = append(batch, QueueItem{
 			OrgID:    org.OrgID,
-			QueuedAt: now,
+			QueuedAt: org.DeletedAt,
 			ItemType: ItemOrgCascade,
 			ItemID:   org.OrgID.String(),
 		})

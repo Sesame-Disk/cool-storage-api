@@ -832,6 +832,25 @@ func TestScanner_ScanExpiredDeletedUsers_NoneExpired(t *testing.T) {
 	}
 }
 
+func TestScanner_ScanExpiredDeletedUsers_DeduplicatesAcrossRuns(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	s := NewScanner(store, q, stats, config.GCConfig{UserGraceDays: 7})
+
+	orgID := uuid.New()
+	store.AddOrganization(orgID)
+	deletedAt := time.Now().AddDate(0, 0, -10)
+	store.AddDeletedUser(orgID, uuid.New(), "expired@test.com", deletedAt)
+
+	if n, err := s.scanExpiredDeletedUsers(context.Background()); err != nil || n != 1 {
+		t.Fatalf("first scanExpiredDeletedUsers = (%d, %v), want (1, nil)", n, err)
+	}
+	if n, err := s.scanExpiredDeletedUsers(context.Background()); err != nil || n != 0 {
+		t.Fatalf("second scanExpiredDeletedUsers = (%d, %v), want (0, nil)", n, err)
+	}
+}
+
 // === Phase 11: Expired Deleted Libraries ===
 
 func TestScanner_ScanExpiredDeletedLibraries_EnqueuesExpired(t *testing.T) {
@@ -958,6 +977,25 @@ func TestScanner_ScanExpiredDeletedLibraries_Multiple(t *testing.T) {
 	}
 }
 
+func TestScanner_ScanExpiredDeletedLibraries_DeduplicatesAcrossRuns(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	s := NewScanner(store, q, stats, config.GCConfig{TrashRetentionDays: 30})
+
+	orgID := uuid.New()
+	store.AddOrganization(orgID)
+	deletedAt := time.Now().AddDate(0, 0, -45)
+	store.AddDeletedLibrary(orgID, uuid.New(), "hot", deletedAt)
+
+	if n, err := s.scanExpiredDeletedLibraries(context.Background()); err != nil || n != 1 {
+		t.Fatalf("first scanExpiredDeletedLibraries = (%d, %v), want (1, nil)", n, err)
+	}
+	if n, err := s.scanExpiredDeletedLibraries(context.Background()); err != nil || n != 0 {
+		t.Fatalf("second scanExpiredDeletedLibraries = (%d, %v), want (0, nil)", n, err)
+	}
+}
+
 // === Phase 12: Expired Deleted Orgs ===
 
 func TestScanner_ScanExpiredDeletedOrgs_EnqueuesExpired(t *testing.T) {
@@ -1044,6 +1082,24 @@ func TestScanner_ScanExpiredDeletedOrgs_Multiple(t *testing.T) {
 	}
 	if n != 3 {
 		t.Errorf("expected 3 expired orgs enqueued, got %d", n)
+	}
+}
+
+func TestScanner_ScanExpiredDeletedOrgs_DeduplicatesAcrossRuns(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	s := NewScanner(store, q, stats, config.GCConfig{OrgGraceDays: 30})
+
+	orgID := uuid.New()
+	deletedAt := time.Now().AddDate(0, 0, -45)
+	store.AddDeletedOrg(orgID, "Expired Corp", deletedAt)
+
+	if n, err := s.scanExpiredDeletedOrgs(context.Background()); err != nil || n != 1 {
+		t.Fatalf("first scanExpiredDeletedOrgs = (%d, %v), want (1, nil)", n, err)
+	}
+	if n, err := s.scanExpiredDeletedOrgs(context.Background()); err != nil || n != 0 {
+		t.Fatalf("second scanExpiredDeletedOrgs = (%d, %v), want (0, nil)", n, err)
 	}
 }
 
