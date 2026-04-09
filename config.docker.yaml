@@ -194,7 +194,7 @@ gc:
   enabled: true
   worker_interval: 30s
   scan_interval: 30s                 # Keep scanner fast in docker/test so deleted users/orgs are enqueued promptly
-  batch_size: 100
+  batch_size: 1000                   # Local/docker only: drain large post-test GC queues faster
   grace_period: 1m                    # Shorter than prod so GC timing stays testable
   dry_run: false
   user_grace_days: 0                  # Keep a real grace window; GC should purge later
