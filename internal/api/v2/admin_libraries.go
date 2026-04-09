@@ -31,6 +31,7 @@ type adminLibraryResponse struct {
 	RepoID      string `json:"repo_id"`
 	Name        string `json:"name"`
 	RepoName    string `json:"repo_name"`
+	StorageID   string `json:"storage_id,omitempty"`
 	OwnerEmail  string `json:"owner_email"`
 	OwnerName   string `json:"owner_name"`
 	Size        int64  `json:"size"`
@@ -75,6 +76,7 @@ func adminLibraryResponseFromProjection(row dbpkg.AdminLibraryProjectionRow) adm
 		RepoID:      row.LibraryID,
 		Name:        row.Name,
 		RepoName:    row.Name,
+		StorageID:   row.StorageClass,
 		OwnerEmail:  row.OwnerEmail,
 		OwnerName:   row.OwnerName,
 		Size:        row.SizeBytes,
@@ -494,8 +496,10 @@ func (h *AdminHandler) AdminCreateLibrary(c *gin.Context) {
 	}
 
 	var createLibReq struct {
-		Name  string `json:"name"`
-		Owner string `json:"owner"`
+		Name         string `json:"name"`
+		Owner        string `json:"owner"`
+		StorageID    string `json:"storage_id,omitempty"`
+		StorageClass string `json:"storage_class,omitempty"`
 	}
 	if err := c.ShouldBindJSON(&createLibReq); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
@@ -533,9 +537,14 @@ func (h *AdminHandler) AdminCreateLibrary(c *gin.Context) {
 	commitHash := sha1.Sum([]byte(commitData))
 	headCommitID := hex.EncodeToString(commitHash[:])
 
-	storageClass := "default"
-	if h.config != nil && h.config.Storage.DefaultClass != "" {
-		storageClass = h.config.Storage.DefaultClass
+	requestedStorageClass := createLibReq.StorageID
+	if requestedStorageClass == "" {
+		requestedStorageClass = createLibReq.StorageClass
+	}
+	storageClass, err := resolveCreateStorageClassForOrg(h.db, h.config, ownerOrgID, httputil.GetRoutingHostname(c), requestedStorageClass)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
 	}
 	versionTTLDays := 90
 	if h.config != nil && h.config.Versioning.DefaultTTLDays > 0 {
@@ -595,16 +604,20 @@ func (h *AdminHandler) AdminCreateLibrary(c *gin.Context) {
 	log.Printf("[AdminCreateLibrary] Admin %s created library %s for user %s", callerUserID, newLibID.String(), ownerEmail)
 
 	c.JSON(http.StatusOK, adminLibraryResponse{
-		ID:         newLibID.String(),
-		Name:       repoName,
-		OwnerEmail: ownerEmail,
-		OwnerName:  ownerName,
-		Size:       0,
-		FileCount:  0,
-		Encrypted:  false,
-		Permission: "rw",
-		CreatedAt:  now.Format(time.RFC3339),
-		UpdatedAt:  now.Format(time.RFC3339),
+		ID:          newLibID.String(),
+		RepoID:      newLibID.String(),
+		Name:        repoName,
+		RepoName:    repoName,
+		StorageID:   storageClass,
+		StorageName: displayStorageNameForConfig(h.config, storageClass),
+		OwnerEmail:  ownerEmail,
+		OwnerName:   ownerName,
+		Size:        0,
+		FileCount:   0,
+		Encrypted:   false,
+		Permission:  "rw",
+		CreatedAt:   now.Format(time.RFC3339),
+		UpdatedAt:   now.Format(time.RFC3339),
 	})
 }
 

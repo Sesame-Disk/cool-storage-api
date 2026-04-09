@@ -166,6 +166,12 @@ For the current safe slice, the most important backend checks are the Go integra
 that verify region-pinned libraries keep reading and writing from the persisted storage
 class instead of the request host default.
 
+That safe slice now also includes org-level create-time policy for new libraries:
+
+- `flexible` keeps hostname-first routing for new libraries
+- `strict` pins new libraries to the org-approved region
+- existing libraries are not moved by policy changes
+
 ```bash
 # Create-library explicit/default region selection
 docker compose run --build --rm -e SESAMEFS_URL=http://sesamefs:8080 \
@@ -176,6 +182,12 @@ docker compose run --build --rm -e SESAMEFS_URL=http://sesamefs:8080 \
 docker compose run --build --rm -e SESAMEFS_URL=http://sesamefs:8080 \
   gotest go test -tags integration \
   -run 'TestRegionPinnedLibraryReadPaths|TestRegionPinnedHistoricReadPaths|TestRegionPinnedShareLinkRaw' \
+  -count=1 -v ./internal/integration/...
+
+# Org-level residency policy enforcement on new-library create flows
+docker compose run --build --rm -e SESAMEFS_URL=http://sesamefs:8080 \
+  gotest go test -tags integration \
+  -run 'TestOrgStoragePolicyStrictAcrossCreateFlows|TestOrgStoragePolicyFlexibleAcrossCreateFlows' \
   -count=1 -v ./internal/integration/...
 ```
 
@@ -188,12 +200,23 @@ These tests currently cover:
 - `/repo/:repo_id/history/download`
 - `/repo/:repo_id/history/raw`
 - `/d/:token?raw=1` share-link serving
+- org `storage_policy` enforcement for new libraries in `strict` and `flexible` modes
+- personal library create flow
+- group-owned library create flow
+- org-admin group-owned library create flow
+- superadmin create-on-behalf-of-user flow
 
 If backend code changes, rebuild the running service before trusting integration results:
 
 ```bash
 docker compose up -d --build sesamefs
 ```
+
+Current limitations of this slice:
+
+- no frontend UI yet for setting org residency policy
+- no migration workflow for existing non-empty libraries
+- no create-time primary placement into cold classes
 
 ## Available Test Scripts
 

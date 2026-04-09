@@ -7,6 +7,7 @@ import (
 	"time"
 
 	dbpkg "github.com/Sesame-Disk/sesamefs/internal/db"
+	"github.com/Sesame-Disk/sesamefs/internal/httputil"
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -618,7 +619,9 @@ func (h *OrgAdminHandler) AddOrgGroupOwnedLibrary(c *gin.Context) {
 
 	groupID := c.Param("gid")
 	var req struct {
-		RepoName string `json:"repo_name"`
+		RepoName     string `json:"repo_name"`
+		StorageID    string `json:"storage_id,omitempty"`
+		StorageClass string `json:"storage_class,omitempty"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
@@ -642,12 +645,21 @@ func (h *OrgAdminHandler) AddOrgGroupOwnedLibrary(c *gin.Context) {
 	callerUserID := c.GetString("user_id")
 	newLibID := uuid.New().String()
 	now := time.Now()
+	requestedStorageClass := req.StorageID
+	if requestedStorageClass == "" {
+		requestedStorageClass = req.StorageClass
+	}
+	resolvedStorageClass, err := resolveCreateStorageClassForOrg(h.db, h.config, targetOrgID, httputil.GetRoutingHostname(c), requestedStorageClass)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
 
 	batch := h.db.Session().Batch(gocql.LoggedBatch)
 	batch.Query(`
-		INSERT INTO libraries (org_id, library_id, owner_id, name, encrypted, size_bytes, file_count, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, targetOrgID, newLibID, callerUserID, repoName, false, int64(0), int64(0), now, now)
+		INSERT INTO libraries (org_id, library_id, owner_id, name, encrypted, storage_class, size_bytes, file_count, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, targetOrgID, newLibID, callerUserID, repoName, false, resolvedStorageClass, int64(0), int64(0), now, now)
 	batch.Query(`
 		INSERT INTO libraries_by_id (library_id, org_id, owner_id, name, encrypted)
 		VALUES (?, ?, ?, ?, ?)
@@ -674,9 +686,11 @@ func (h *OrgAdminHandler) AddOrgGroupOwnedLibrary(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"repo_id":   newLibID,
-		"repo_name": repoName,
-		"group_id":  groupID,
+		"repo_id":      newLibID,
+		"repo_name":    repoName,
+		"group_id":     groupID,
+		"storage_id":   resolvedStorageClass,
+		"storage_name": displayStorageNameForConfig(h.config, resolvedStorageClass),
 	})
 }
 

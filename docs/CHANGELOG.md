@@ -8,6 +8,44 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-04-09 — Session 62: Org Storage Policy Backend Base + Multi-Region Create-Time Enforcement
+
+### Added — Org storage policy for new library creation
+
+Introduced a backend-only org storage policy base that governs where **new** libraries are created in multi-region deployments.
+
+What now exists in code:
+
+- `organizations.storage_config` is parsed as org `storage_policy`
+- supported policy values are `data_residency: strict|flexible` plus optional `default_region`
+- create-time storage resolution now honors org policy across:
+   - personal library create
+   - group-owned library create
+   - org-admin group-owned library create
+   - superadmin create-on-behalf-of-user
+- create-time selection is restricted to hot classes only in this slice
+
+### Added — Focused regression coverage
+
+- unit tests for policy parsing and strict/flexible storage resolution
+- integration coverage proving policy enforcement across user, group, org-admin, and superadmin create flows
+
+### Documented — Current scope and remaining debt
+
+Updated the docs to reflect that this is a backend base, not a full end-to-end product surface yet:
+
+- `docs/IMPLEMENTATION_STATUS.md` — status updated for library CRUD and region-aware storage selection
+- `docs/DEPLOY.md` — documented `storage_policy` behavior and the current admin API write path
+- `docs/MULTIREGION-TESTING.md` — added focused org policy integration commands
+- `docs/TECHNICAL-DEBT.md` — recorded deferred frontend, migration, and operational follow-ups
+
+### Remaining explicitly out of scope
+
+- frontend/admin UI for org storage policy
+- migration of existing non-empty libraries between regions
+- cold-tier primary placement at create time
+- broader multi-region replication/orchestration work beyond the current safe slice
+
 ## 2026-04-02 — Session 61: Sync Stats Guard + Fail-Closed OIDC/CORS Defaults
 
 ### Fixed — Stale async library stats overwrite

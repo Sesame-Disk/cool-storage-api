@@ -249,6 +249,7 @@ func (h *AdminHandler) GetOrganization(c *gin.Context) {
 	var billingCycle string
 	var currentPeriodStartedAt *time.Time
 	var currentPeriodEndsAt *time.Time
+	var storageConfig map[string]string
 	var settings map[string]string
 	var createdAt time.Time
 	var deletedAt *time.Time
@@ -257,7 +258,7 @@ func (h *AdminHandler) GetOrganization(c *gin.Context) {
 		SELECT name, status, storage_quota, traffic_quota, traffic_upload_quota,
 		       traffic_download_quota, max_users, plan, quota_policy, billing_cycle,
 		       current_period_started_at, current_period_ends_at,
-		       settings, created_at, deleted_at
+		       storage_config, settings, created_at, deleted_at
 		FROM organizations WHERE org_id = ?
 	`, orgID).Scan(
 		&name,
@@ -272,6 +273,7 @@ func (h *AdminHandler) GetOrganization(c *gin.Context) {
 		&billingCycle,
 		&currentPeriodStartedAt,
 		&currentPeriodEndsAt,
+		&storageConfig,
 		&settings,
 		&createdAt,
 		&deletedAt,
@@ -279,6 +281,12 @@ func (h *AdminHandler) GetOrganization(c *gin.Context) {
 
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "organization not found"})
+		return
+	}
+
+	storagePolicy, err := normalizeOrgStoragePolicy(storageConfig)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "invalid organization storage policy"})
 		return
 	}
 
@@ -326,6 +334,7 @@ func (h *AdminHandler) GetOrganization(c *gin.Context) {
 		"traffic_download_used":     periodUsage.Download,
 		"plan":                      plan,
 		"quota_policy":              quotaPolicy,
+		"storage_policy":            storagePolicy.storageConfig(),
 		"billing_cycle":             billingCycle,
 		"current_period_started_at": currentPeriodStartedAt,
 		"current_period_ends_at":    currentPeriodEndsAt,
@@ -587,14 +596,18 @@ func (h *AdminHandler) UpdateOrganization(c *gin.Context) {
 	orgID := c.Param("org_id")
 
 	var req struct {
-		Name                   *string    `json:"name"`
-		StorageQuota           *int64     `json:"storage_quota"`
-		TrafficQuota           *int64     `json:"traffic_quota"`
-		TrafficUploadQuota     *int64     `json:"traffic_upload_quota"`
-		TrafficDownloadQuota   *int64     `json:"traffic_download_quota"`
-		MaxUsers               *int       `json:"max_users"`
-		Plan                   *string    `json:"plan"`
-		QuotaPolicy            *string    `json:"quota_policy"`
+		Name                 *string `json:"name"`
+		StorageQuota         *int64  `json:"storage_quota"`
+		TrafficQuota         *int64  `json:"traffic_quota"`
+		TrafficUploadQuota   *int64  `json:"traffic_upload_quota"`
+		TrafficDownloadQuota *int64  `json:"traffic_download_quota"`
+		MaxUsers             *int    `json:"max_users"`
+		Plan                 *string `json:"plan"`
+		QuotaPolicy          *string `json:"quota_policy"`
+		StoragePolicy        *struct {
+			DataResidency string `json:"data_residency"`
+			DefaultRegion string `json:"default_region"`
+		} `json:"storage_policy"`
 		BillingCycle           *string    `json:"billing_cycle"`
 		CurrentPeriodStartedAt *time.Time `json:"current_period_started_at"`
 		CurrentPeriodEndsAt    *time.Time `json:"current_period_ends_at"`
@@ -614,12 +627,13 @@ func (h *AdminHandler) UpdateOrganization(c *gin.Context) {
 	var existingMaxUsers int
 	var existingPlan string
 	var existingQuotaPolicy string
+	var existingStorageConfig map[string]string
 	var existingBillingCycle string
 	var existingCurrentPeriodStartedAt *time.Time
 	var existingCurrentPeriodEndsAt *time.Time
 	err := h.db.Session().Query(`
 		SELECT name, storage_quota, traffic_quota, traffic_upload_quota, traffic_download_quota,
-		       max_users, plan, quota_policy, billing_cycle,
+		       max_users, plan, quota_policy, storage_config, billing_cycle,
 		       current_period_started_at, current_period_ends_at
 		FROM organizations WHERE org_id = ?
 	`, orgID).Scan(
@@ -631,6 +645,7 @@ func (h *AdminHandler) UpdateOrganization(c *gin.Context) {
 		&existingMaxUsers,
 		&existingPlan,
 		&existingQuotaPolicy,
+		&existingStorageConfig,
 		&existingBillingCycle,
 		&existingCurrentPeriodStartedAt,
 		&existingCurrentPeriodEndsAt,
@@ -712,6 +727,29 @@ func (h *AdminHandler) UpdateOrganization(c *gin.Context) {
 		updates = append(updates, colUpdate{"quota_policy", qp})
 		if qp != existingQuotaPolicy {
 			setAuditChange("quota_policy", existingQuotaPolicy, qp)
+		}
+	}
+	if req.StoragePolicy != nil {
+		storagePolicy, err := normalizeOrgStoragePolicy(map[string]string{
+			"data_residency": req.StoragePolicy.DataResidency,
+			"default_region": req.StoragePolicy.DefaultRegion,
+		})
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		if err := validateOrgStoragePolicy(h.config, storagePolicy); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		updates = append(updates, colUpdate{"storage_config", storagePolicy.storageConfig()})
+		existingPolicy, err := normalizeOrgStoragePolicy(existingStorageConfig)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "invalid organization storage policy"})
+			return
+		}
+		if storagePolicy.DataResidency != existingPolicy.DataResidency || storagePolicy.DefaultRegion != existingPolicy.DefaultRegion {
+			setAuditChange("storage_policy", existingPolicy.storageConfig(), storagePolicy.storageConfig())
 		}
 	}
 	if req.BillingCycle != nil {

@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"log"
 	"net/http"
-	"sort"
 	"strings"
 	"time"
 
@@ -380,43 +379,17 @@ func formatSize(bytes int64) string {
 }
 
 func (h *LibraryHandler) isKnownStorageClass(class string) bool {
-	class = strings.TrimSpace(class)
-	if class == "" || h == nil || h.config == nil {
+	if h == nil {
 		return false
 	}
-	if _, ok := h.config.Storage.Classes[class]; ok {
-		return true
-	}
-	if _, ok := h.config.Storage.Backends[class]; ok {
-		return true
-	}
-	return false
+	return isKnownStorageClass(h.config, class)
 }
 
 func (h *LibraryHandler) resolveEndpointRegion(hostname string) string {
-	if h == nil || h.config == nil {
+	if h == nil {
 		return "default"
 	}
-
-	hostname = strings.TrimSpace(hostname)
-	if region, ok := h.config.Storage.EndpointRegions[hostname]; ok {
-		return region
-	}
-
-	for pattern, region := range h.config.Storage.EndpointRegions {
-		if len(pattern) > 1 && pattern[0] == '*' {
-			suffix := pattern[1:]
-			if strings.HasSuffix(hostname, suffix) && len(hostname) > len(suffix) {
-				return region
-			}
-		}
-	}
-
-	if region, ok := h.config.Storage.EndpointRegions["*"]; ok {
-		return region
-	}
-
-	return "default"
+	return resolveEndpointRegion(h.config, hostname)
 }
 
 func formatRegionLabel(region string) string {
@@ -442,73 +415,24 @@ func formatRegionLabel(region string) string {
 }
 
 func (h *LibraryHandler) resolveDefaultStorageClass(hostname string) string {
-	if h == nil || h.config == nil {
+	if h == nil {
 		return ""
 	}
-
-	region := h.resolveEndpointRegion(hostname)
-	if regionConfig, ok := h.config.Storage.RegionClasses[region]; ok {
-		if regionConfig.Hot != "" && h.isKnownStorageClass(regionConfig.Hot) {
-			return regionConfig.Hot
-		}
-	}
-
-	if h.isKnownStorageClass(h.config.Storage.DefaultClass) {
-		return h.config.Storage.DefaultClass
-	}
-
-	classNames := make([]string, 0, len(h.config.Storage.Classes))
-	for name := range h.config.Storage.Classes {
-		classNames = append(classNames, name)
-	}
-	sort.Strings(classNames)
-	for _, name := range classNames {
-		if h.isKnownStorageClass(name) {
-			return name
-		}
-	}
-	backendNames := make([]string, 0, len(h.config.Storage.Backends))
-	for name := range h.config.Storage.Backends {
-		backendNames = append(backendNames, name)
-	}
-	sort.Strings(backendNames)
-	for _, name := range backendNames {
-		if h.isKnownStorageClass(name) {
-			return name
-		}
-	}
-
-	return ""
+	return resolveDefaultHotStorageClass(h.config, hostname)
 }
 
 func (h *LibraryHandler) resolveRequestedStorageClass(hostname, requestedClass string) (string, error) {
-	requestedClass = strings.TrimSpace(requestedClass)
-	if requestedClass == "" {
-		resolvedClass := h.resolveDefaultStorageClass(hostname)
-		if resolvedClass == "" {
-			return "", fmt.Errorf("no valid storage class configured")
-		}
-		return resolvedClass, nil
+	if h == nil {
+		return "", fmt.Errorf("no valid storage class configured")
 	}
-	if !h.isKnownStorageClass(requestedClass) {
-		return "", fmt.Errorf("invalid storage class")
-	}
-	return requestedClass, nil
+	return resolveCreateStorageClass(h.config, defaultOrgStoragePolicy(), hostname, requestedClass)
 }
 
 func (h *LibraryHandler) displayStorageName(storageClass string) string {
-	storageClass = strings.TrimSpace(storageClass)
-	if storageClass == "" || h == nil || h.config == nil {
-		return storageClass
+	if h == nil {
+		return strings.TrimSpace(storageClass)
 	}
-
-	for region, regionConfig := range h.config.Storage.RegionClasses {
-		if regionConfig.Hot == storageClass || regionConfig.Cold == storageClass {
-			return formatRegionLabel(region)
-		}
-	}
-
-	return storageClass
+	return displayStorageNameForConfig(h.config, storageClass)
 }
 
 // CreateLibraryRequest represents the request body for creating a library
@@ -627,7 +551,7 @@ func (h *LibraryHandler) CreateLibrary(c *gin.Context) {
 	if requestedStorageClass == "" {
 		requestedStorageClass = req.StorageClass
 	}
-	resolvedStorageClass, err := h.resolveRequestedStorageClass(httputil.GetRoutingHostname(c), requestedStorageClass)
+	resolvedStorageClass, err := resolveCreateStorageClassForOrg(h.db, h.config, orgID, httputil.GetRoutingHostname(c), requestedStorageClass)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return

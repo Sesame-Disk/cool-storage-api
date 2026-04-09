@@ -853,4 +853,50 @@ That means the remaining split is intentional by access pattern, not a leftover 
 
 ---
 
-*Last updated: 2026-04-06*
+## 17. Org Storage Policy: Frontend, Migration, And Operational Follow-ups — 🟡 Backend base complete (2026-04-09)
+
+### Status
+
+The backend base for org-level storage policy is now live for **new library creation**.
+
+What is implemented:
+
+- `organizations.storage_config` stores `data_residency` (`strict` / `flexible`) and optional `default_region`
+- sys-admin org detail/update endpoints expose and persist `storage_policy`
+- create-time storage resolution honors org policy for:
+  - personal library creation
+  - group-owned library creation
+  - org-admin group-owned library creation
+  - superadmin create-on-behalf-of-user
+- focused integration tests validate both `strict` and `flexible` modes across those flows
+- create-time placement is intentionally restricted to hot classes only
+
+### What Is Still Deferred
+
+1. Frontend/admin UI for viewing and editing org `storage_policy`
+2. Migration or background job support for moving existing libraries between regions
+3. Policy effects beyond create-time, such as retroactive enforcement or relocation
+4. Product/UX decisions for cold-tier primary placement during create flows
+5. Optional org projection denormalization of `storage_config` if list/search views ever need it
+
+### Why This Is Still Debt
+
+The backend slice is enough to enforce residency for new libraries, but it is not yet a full product surface:
+
+- operators still need API-level knowledge to configure policy
+- existing libraries remain where they are until an explicit migration design exists
+- the frontend cannot yet explain or visualize the org policy state to admins
+
+### Decision For Now
+
+Keep this as backend-first infrastructure. Do not expand it implicitly into migration or frontend behavior until those pieces are designed as separate work.
+
+When resuming this line of work, the recommended order is:
+
+1. Add org-admin/sys-admin UI for `storage_policy`
+2. Design migration semantics for existing libraries
+3. Decide whether policy should stay create-time-only or become enforceable for post-create operations
+
+---
+
+*Last updated: 2026-04-09*

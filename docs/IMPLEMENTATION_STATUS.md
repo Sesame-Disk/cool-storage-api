@@ -1,6 +1,6 @@
 # Implementation Status - SesameFS
 
-**Last Updated**: 2026-04-06
+**Last Updated**: 2026-04-09
 
 ---
 
@@ -11,13 +11,13 @@
 | Area | Completeness | Notes |
 |------|--------------|-------|
 | Sync Protocol (Desktop) | 100% ✅ | 🔒 FROZEN - Working perfectly |
-| Core Backend API | ~98% | GC ✅, OIDC ✅, Library Settings ✅, Monitoring ✅, Quotas ✅, Plans/Permissions Phase 1+2 ✅ |
+| Core Backend API | ~98% | GC ✅, OIDC ✅, Library Settings ✅, Monitoring ✅, Quotas ✅, Plans/Permissions Phase 1+2 ✅, org storage policy backend base ✅ |
 | Admin Panels | ~95% | Superadmin ✅, Org Admin ✅, both at parity. Audit logs pending |
 | Frontend UI | ~85% | All 122 modals migrated ✅, File History UI ✅, permission UI (~75% with granular flags), ~51 ModalPortal wrappers to clean up, Phase 3 quota/plan UI in progress |
 | Authentication | ~90% | OIDC Phase 1 complete, JWT revocation hardened (2026-03-31), and user API keys now cover desktop/CLI/automation auth in OIDC-only deployments. Device Flow and service-account flows remain future enhancements. |
 | Production Infrastructure | ✅ ~97% | GC ✅, Monitoring ✅, Health checks ✅, Structured logging ✅, Frontend/Backend separation ✅, Nginx production hardening ✅ |
 
-**Production Blockers (verified against code 2026-04-06)**:
+**Production Blockers (verified against code 2026-04-09)**:
 1. ~~OIDC Authentication~~ - ✅ COMPLETE (Phase 1 - Basic Login)
 2. ~~Garbage Collection~~ - ✅ COMPLETE (Queue worker + scanner + admin API)
 3. ~~Monitoring/Health Checks~~ - ✅ COMPLETE (slog logging, `/health`, `/ready`, `/metrics`)
@@ -25,7 +25,7 @@
 5. ~~Programmatic Auth (PATs)~~ - ✅ COMPLETE — user API keys ship via `/api/v2.1/api-keys/`, and `/api2/auth-token/` now exchanges `email + API key` for desktop/CLI tokens. Device Flow remains optional future work.
 6. **GC Multi-Instance Safety** - ⚠️ PARTIAL — temporary `GC_ENABLED` operational guard exists for production, but `gc.go:99` Start() still has no leader election/distributed lease. Safe only if exactly one replica runs GC.
 7. ~~Quota Period Rollover~~ - ✅ COMPLETE — Period rollover job advances expired org quota periods and keeps monthly traffic enforcement moving
-8. **Production Multi-Region Topology** - ⚠️ PARTIAL — region-aware library selection/read/write routing is implemented and covered by focused integration tests, but the stock production config/compose files still ship as single-region examples. Per-region `classes`, `endpoint_regions`, ingress host preservation, and rollout/migration steps remain operator work.
+8. **Production Multi-Region Topology** - ⚠️ PARTIAL — region-aware library selection/read/write routing is implemented and covered by focused integration tests, and org-level create-time residency policy now exists in the backend. The stock production config/compose files still ship as single-region examples, and per-region `classes`, `endpoint_regions`, ingress host preservation, rollout, migration, and frontend policy controls remain operator work.
 
 ---
 
@@ -57,7 +57,7 @@
 | **File Upload (REST API)** | ✅ COMPLETE | Mostly stable | ❌ No | 2026-04-06 | Replace/autorename fix: `replace=0` triggers auto-rename (`file (1).ext`), default is overwrite for desktop client compat. Region-pinned libraries now propagate `storage_class` through `upload-link` and `seafhttp/upload-api`. |
 | **File Download (REST API)** | ✅ COMPLETE | Mostly stable | ❌ No | 2026-04-06 | Optimized: shared `streaming` package — prefetch pipeline, 4MB buffers, batch block resolve, ZIP Store. Region-pinned libraries now resolve reads by persisted library storage instead of host default. |
 | **Directory Listing** | ✅ COMPLETE | Mostly stable | ❌ No | 2026-01-08 | Frontend integration works |
-| **Library CRUD** | ✅ COMPLETE | Mostly stable | ⚠️ Partial | 2026-04-06 | Create/delete/list working. Library create flows now support explicit `storage_id` plus hostname-derived default region selection. Migration/change-region for non-empty libraries is still not implemented. |
+| **Library CRUD** | ✅ COMPLETE | Mostly stable | ⚠️ Partial | 2026-04-09 | Create/delete/list working. Library create flows now support explicit `storage_id`, hostname-derived default region selection, and org-level `storage_policy` (`strict` / `flexible`) for new libraries. Migration/change-region for non-empty libraries is still not implemented. |
 | **Starred Files** | ✅ COMPLETE | Mostly stable | ❌ No | 2026-01-08 | Fixed Cassandra query issue |
 | **OnlyOffice Integration** | 🔒 FROZEN | **STABLE** | ❌ No | 2026-02-12 | Document editing stable — doc key rotation fix (was causing toolbar greying out) + JWT 8h expiry |
 | **Frontend (React)** | 🟡 PARTIAL | **UNSTABLE** | N/A | 2026-03-30 | Library list works, all modals migrated, ~51 ModalPortal wrappers to remove. Plans/permissions Phase 3 is in progress: owner/plan terminology and member-limit gating now use live data in key admin screens, but legacy plan-role code paths, org-admin shell placeholders, and quota unit standardization still remain. |
@@ -93,7 +93,7 @@
 | **Audit Logs** | 🟡 PARTIAL | Mostly stable | ❌ No | 2026-03-26 | `audit_log` table with 365-day TTL exists for deletion events (GC, groups, departments), and `users.last_login_at` now covers latest successful login. Historical login logs and file-operation/file-access event tables are still missing, so login audit pages and file statistics pages remain pending. See [ADMIN-FEATURES.md](ADMIN-FEATURES.md) § 3 |
 | **Version History UI** | ✅ COMPLETE | Mostly stable | ❌ No | 2026-02-26 | Detail sidebar History tab + full-page view + revert conflict dialog (Replace/Keep Both/Cancel) + View action + proper user name resolution. 17 integration tests. |
 | **File Preview & Raw Serving** | ✅ COMPLETE | Mostly stable | ❌ No | 2026-04-06 | Inline preview for PDF/images/video/audio/text, OnlyOffice for docs. Auth token handling fixed for search results. Region-pinned library coverage now includes raw file, historic raw/download, and share-link raw readers. |
-| **Region-Aware Library Storage Selection** | ✅ COMPLETE | Mostly stable | ⚠️ Partial | 2026-04-06 | Safe slice complete: bootstrap exposes region options, web/mobile/group library creation persist `storage_class`, and write/read paths follow the persisted class. Remaining work is production topology, migration of existing data, and broader multi-region operations. |
+| **Region-Aware Library Storage Selection** | ✅ COMPLETE | Mostly stable | ⚠️ Partial | 2026-04-09 | Safe slice complete: bootstrap exposes region options, personal/group/admin create flows persist `storage_class`, org `storage_policy` now controls create-time placement for new libraries, and write/read paths follow the persisted class. Focused integrations cover user, group, org-admin, and superadmin create flows under `strict` and `flexible` policy modes. Remaining work is frontend policy management UX, migration of existing data, and broader multi-region operations. |
 | **Monitoring/Health Checks** | 🔒 FROZEN | **STABLE** | ❌ No | 2026-02-04 | Structured logging, `/health`, `/ready`, `/metrics`. 5 unit + 21 integration tests. |
 | **Multi-Region Replication** | ❌ TODO | N/A | ❌ No | - | Future feature beyond the current safe slice. Current work only pins new libraries to storage classes and keeps reads/writes consistent with that persisted choice. |
 

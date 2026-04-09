@@ -628,6 +628,8 @@ What already works in the backend/frontend stack:
 
 - new libraries can persist an explicit `storage_id`
 - when no `storage_id` is provided, the backend can derive the default region from the request hostname
+- orgs can now persist `storage_policy` with `data_residency: strict|flexible` plus optional `default_region`
+- new-library create flows honor org policy for personal libraries, group-owned libraries, org-admin group-owned libraries, and superadmin-created libraries
 - later writes and reads follow the persisted library `storage_class` instead of the request host default
 - focused integration tests cover create-library, raw serving, historic reads, and share-link raw serving
 
@@ -635,7 +637,10 @@ What the stock production deploy does **not** provide by itself yet:
 
 - `config.prod.yaml` still ships as a single-region example using legacy `backends:`
 - `docker-compose.prod.yml` does not spin up per-region SesameFS front doors or per-region storage configs automatically
+- there is no frontend/admin UI yet for org storage policy management; the current write path is the admin API
 - there is no built-in migration workflow for existing non-empty libraries that need to move from one storage class to another
+- org policy only affects **new library creation** in this slice; it does not relocate existing libraries
+- create-time placement is intentionally limited to hot classes; cold-tier primary placement remains future design work
 - GC is still guarded operationally (`GC_ENABLED`) rather than by leader election, so multi-replica backend deployments need manual discipline
 
 For production multi-region, treat this feature as requiring operator-provided topology plus the config changes below.
@@ -683,6 +688,42 @@ storage:
 The backend must receive the original external hostname. If you terminate TLS or proxy through nginx/traefik/LB, preserve `Host` or forward `X-Forwarded-Host` correctly.
 
 Without that, hostname-derived default region selection on library creation will silently fall back to the global default region.
+
+### Step M2.3 — Optional org-level residency policy
+
+By default, organizations behave as `flexible`: new libraries prefer the request hostname region, then the org `default_region`, then the global storage default.
+
+If an organization must pin new libraries to a specific region regardless of ingress hostname, set:
+
+- `data_residency: strict`
+- `default_region: <region-name>`
+
+Current write path:
+
+```bash
+curl -X PUT https://admin.yourdomain.com/api/v2.1/admin/organizations/<org_id>/ \
+  -H "Authorization: Token <superadmin-token>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "storage_policy": {
+      "data_residency": "strict",
+      "default_region": "usa"
+    }
+  }'
+```
+
+Read back the effective value with:
+
+```bash
+curl -H "Authorization: Token <superadmin-token>" \
+  https://admin.yourdomain.com/api/v2.1/admin/organizations/<org_id>/
+```
+
+Notes:
+
+- `flexible` is the default when no `storage_policy` is stored
+- `default_region` must map to a configured `storage.region_classes.<region>.hot`
+- this slice affects only **new** libraries; existing libraries keep their persisted `storage_class`
 
 ### Step M3 — Firewall (private network)
 
@@ -780,6 +821,17 @@ docker compose run --build --rm -e SESAMEFS_URL=http://sesamefs:8080 \
 ```
 
 These are the minimum checks that prove a library created in one region does not start reading from another region just because the request lands on a different hostname.
+
+For org-level residency policy on new libraries, also run:
+
+```bash
+docker compose run --build --rm -e SESAMEFS_URL=http://sesamefs:8080 \
+  go-integration-test go test -tags integration \
+  -run 'TestOrgStoragePolicyStrictAcrossCreateFlows|TestOrgStoragePolicyFlexibleAcrossCreateFlows' \
+  -count=1 -v ./internal/integration/...
+```
+
+These checks prove that `strict` and `flexible` policy modes are enforced consistently for user, group, org-admin, and superadmin create flows.
 
 ### Cassandra tips for multi-DC
 

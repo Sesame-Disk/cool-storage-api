@@ -929,7 +929,7 @@ func (h *GroupHandler) CreateGroupOwnedLibrary(c *gin.Context) {
 	if requestedStorageClass == "" {
 		requestedStorageClass = createLibReq.StorageClass
 	}
-	resolvedStorageClass, err := storageHelper.resolveRequestedStorageClass(httputil.GetRoutingHostname(c), requestedStorageClass)
+	resolvedStorageClass, err := resolveCreateStorageClassForOrg(h.db, h.config, orgID, httputil.GetRoutingHostname(c), requestedStorageClass)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
