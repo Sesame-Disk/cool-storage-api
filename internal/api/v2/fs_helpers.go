@@ -11,7 +11,9 @@ import (
 	"time"
 
 	"github.com/Sesame-Disk/sesamefs/internal/db"
+	"github.com/Sesame-Disk/sesamefs/internal/streaming"
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
+	"github.com/google/uuid"
 )
 
 // FSHelper provides helper functions for file system operations
@@ -549,6 +551,61 @@ func (h *FSHelper) CollectBlockIDsRecursive(repoID, fsID string) ([]string, erro
 	return blockIDs, err
 }
 
+func (h *FSHelper) resolveStoredBlockIDs(orgID string, blockIDs []string) []string {
+	if len(blockIDs) == 0 {
+		return nil
+	}
+	return streaming.BatchResolveBlockIDs(h.db, orgID, blockIDs)
+}
+
+func (h *FSHelper) markBlockMutationProcessed(operationKey string) (bool, error) {
+	if strings.TrimSpace(operationKey) == "" {
+		return false, fmt.Errorf("operation key is required")
+	}
+	taskID := uuid.NewMD5(uuid.NameSpaceOID, []byte("block_ref_mutation:"+operationKey))
+	var existingTaskID string
+	return h.db.Session().Query(`
+		INSERT INTO gc_processed_items (task_id) VALUES (?) IF NOT EXISTS
+	`, taskID.String()).ScanCAS(&existingTaskID)
+}
+
+func (h *FSHelper) IncrementOrCreateBlock(orgID, blockID string, sizeBytes int, storageClass, storageKey string) error {
+	now := time.Now()
+	applied, err := h.db.Session().Query(`
+		UPDATE blocks SET ref_count = ref_count + 1, last_accessed = ?
+		WHERE org_id = ? AND block_id = ? IF EXISTS
+	`, now, orgID, blockID).MapScanCAS(map[string]interface{}{})
+	if err != nil {
+		return err
+	}
+	if applied {
+		return nil
+	}
+
+	applied, err = h.db.Session().Query(`
+		INSERT INTO blocks (org_id, block_id, size_bytes, storage_class, storage_key, ref_count, created_at, last_accessed)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?) IF NOT EXISTS
+	`, orgID, blockID, sizeBytes, storageClass, storageKey, 1, now, now).MapScanCAS(map[string]interface{}{})
+	if err != nil {
+		return err
+	}
+	if applied {
+		return nil
+	}
+
+	applied, err = h.db.Session().Query(`
+		UPDATE blocks SET ref_count = ref_count + 1, last_accessed = ?
+		WHERE org_id = ? AND block_id = ? IF EXISTS
+	`, now, orgID, blockID).MapScanCAS(map[string]interface{}{})
+	if err != nil {
+		return err
+	}
+	if !applied {
+		return fmt.Errorf("failed to increment block %s after concurrent insert", blockID)
+	}
+	return nil
+}
+
 // collectDirStats recursively collects block IDs, total size in bytes, and file count
 // for a directory tree rooted at the given fs_object.
 func (h *FSHelper) collectDirStats(repoID, fsID string) (blockIDs []string, totalSize int64, fileCount int64, err error) {
@@ -588,28 +645,41 @@ func (h *FSHelper) collectDirStats(repoID, fsID string) (blockIDs []string, tota
 	return blockIDs, totalSize, fileCount, nil
 }
 
-// DecrementBlockRefCounts decrements ref_count for blocks (for deletion).
-// Returns the list of block IDs whose ref_count reached 0.
-func (h *FSHelper) DecrementBlockRefCounts(orgID string, blockIDs []string) []string {
+// DecrementBlockRefCountsOnce decrements ref_count for blocks (for deletion).
+// The operation is idempotent per operationKey and resolves SHA-1 block IDs to
+// the internal SHA-256 IDs stored in the blocks table.
+func (h *FSHelper) DecrementBlockRefCountsOnce(orgID, operationKey string, blockIDs []string) []string {
+	applied, err := h.markBlockMutationProcessed(operationKey)
+	if err != nil {
+		log.Printf("[DecrementBlockRefCountsOnce] WARNING: failed to mark operation %q processed: %v", operationKey, err)
+		return nil
+	}
+	if !applied {
+		return nil
+	}
+
+	resolvedBlockIDs := h.resolveStoredBlockIDs(orgID, blockIDs)
 	var zeroRefBlocks []string
-	for _, blockID := range blockIDs {
-		err := h.db.Session().Query(`
-			UPDATE blocks SET ref_count = ref_count - 1, last_accessed = ?
-			WHERE org_id = ? AND block_id = ?
-		`, time.Now(), orgID, blockID).Exec()
+	for _, blockID := range resolvedBlockIDs {
+		now := time.Now()
+		hitZero, err := h.db.Session().Query(`
+			UPDATE blocks SET ref_count = 0, last_accessed = ?
+			WHERE org_id = ? AND block_id = ? IF ref_count = 1
+		`, now, orgID, blockID).MapScanCAS(map[string]interface{}{})
 		if err != nil {
 			continue
 		}
-
-		// Check if ref_count hit 0
-		var refCount int
-		if err := h.db.Session().Query(`
-			SELECT ref_count FROM blocks WHERE org_id = ? AND block_id = ?
-		`, orgID, blockID).Scan(&refCount); err != nil {
+		if hitZero {
+			zeroRefBlocks = append(zeroRefBlocks, blockID)
 			continue
 		}
-		if refCount <= 0 {
-			zeroRefBlocks = append(zeroRefBlocks, blockID)
+
+		_, err = h.db.Session().Query(`
+			UPDATE blocks SET ref_count = ref_count - 1, last_accessed = ?
+			WHERE org_id = ? AND block_id = ? IF ref_count > 1
+		`, now, orgID, blockID).MapScanCAS(map[string]interface{}{})
+		if err != nil {
+			continue
 		}
 	}
 	return zeroRefBlocks
@@ -678,12 +748,8 @@ func (h *FSHelper) CopyFSObjectToLibrary(srcRepoID, dstRepoID, fsID string) (str
 
 // IncrementBlockRefCounts increments ref_count for blocks (for copy)
 func (h *FSHelper) IncrementBlockRefCounts(orgID string, blockIDs []string) error {
-	for _, blockID := range blockIDs {
-		err := h.db.Session().Query(`
-			UPDATE blocks SET ref_count = ref_count + 1, last_accessed = ?
-			WHERE org_id = ? AND block_id = ?
-		`, time.Now(), orgID, blockID).Exec()
-		if err != nil {
+	for _, blockID := range h.resolveStoredBlockIDs(orgID, blockIDs) {
+		if err := h.IncrementOrCreateBlock(orgID, blockID, 0, "", ""); err != nil {
 			continue
 		}
 	}

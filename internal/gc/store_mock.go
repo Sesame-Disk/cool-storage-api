@@ -780,6 +780,23 @@ func (m *MockStore) GetBlockRefCount(orgID uuid.UUID, blockID string) (int, erro
 	return b.RefCount, nil
 }
 
+func (m *MockStore) ResolveBlockIDs(orgID uuid.UUID, blockIDs []string) ([]string, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	resolved := make([]string, len(blockIDs))
+	copy(resolved, blockIDs)
+	for i, blockID := range blockIDs {
+		if len(blockID) != 40 {
+			continue
+		}
+		if internalID, ok := m.mappings[fmt.Sprintf("%s:%s", orgID, blockID)]; ok && internalID != "" {
+			resolved[i] = internalID
+		}
+	}
+	return resolved, nil
+}
+
 func (m *MockStore) EnsureBlockGCCandidate(orgID uuid.UUID, blockID, storageClass string, candidateAt time.Time) (time.Time, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

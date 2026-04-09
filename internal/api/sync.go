@@ -18,6 +18,7 @@ import (
 
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
 
+	v2 "github.com/Sesame-Disk/sesamefs/internal/api/v2"
 	"github.com/Sesame-Disk/sesamefs/internal/apikeys"
 	"github.com/Sesame-Disk/sesamefs/internal/db"
 	"github.com/Sesame-Disk/sesamefs/internal/httputil"
@@ -926,10 +927,7 @@ func (h *SyncHandler) PutBlock(c *gin.Context) {
 		now := time.Now()
 
 		// Store block metadata using internal ID
-		_ = h.db.Session().Query(`
-			INSERT INTO blocks (org_id, block_id, size_bytes, storage_class, ref_count, created_at, last_accessed)
-			VALUES (?, ?, ?, ?, 1, ?, ?)
-		`, orgID, internalID, len(data), storageClass, now, now).Exec()
+		_ = v2.NewFSHelper(h.db).IncrementOrCreateBlock(orgID, internalID, len(data), storageClass, "")
 
 		// If legacy SHA-1 client, store mapping external→internal (dual-write: forward + reverse)
 		if isLegacySHA1 {

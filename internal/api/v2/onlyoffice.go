@@ -742,11 +742,7 @@ func (h *OnlyOfficeHandler) saveEditedDocument(ctx context.Context, repoID, file
 	}
 
 	// Store block metadata using internal (SHA-256) ID
-	now := time.Now()
-	if err := h.db.Session().Query(`
-		INSERT INTO blocks (org_id, block_id, size_bytes, storage_class, storage_key, ref_count, created_at, last_accessed)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-	`, orgID, internalBlockID, len(content), storageClass, storageKey, 1, now, now).Exec(); err != nil {
+	if err := NewFSHelper(h.db).IncrementOrCreateBlock(orgID, internalBlockID, len(content), storageClass, storageKey); err != nil {
 		log.Printf("Failed to store block metadata: %v", err)
 	}
 

@@ -1285,7 +1285,7 @@ func (h *FileHandler) DeleteDirectory(c *gin.Context) {
 	// Decrement block ref counts and enqueue zero-ref blocks for GC
 	go func() {
 		if len(blockIDs) > 0 {
-			zeroRefBlocks := fsHelper.DecrementBlockRefCounts(orgID, blockIDs)
+			zeroRefBlocks := fsHelper.DecrementBlockRefCountsOnce(orgID, newCommitID, blockIDs)
 			if len(zeroRefBlocks) > 0 && h.gcEnqueuer != nil {
 				// Get storage class for the library
 				var storageClass string
@@ -1913,7 +1913,7 @@ func (h *FileHandler) DeleteFile(c *gin.Context) {
 		if result.TargetEntry != nil {
 			blockIDs, _ := fsHelper.CollectBlockIDsRecursive(repoID, result.TargetFSID)
 			if len(blockIDs) > 0 {
-				zeroRefBlocks := fsHelper.DecrementBlockRefCounts(orgID, blockIDs)
+				zeroRefBlocks := fsHelper.DecrementBlockRefCountsOnce(orgID, newCommitID, blockIDs)
 				if len(zeroRefBlocks) > 0 && h.gcEnqueuer != nil {
 					var storageClass string
 					h.db.Session().Query(`
@@ -2730,6 +2730,7 @@ func (h *FileHandler) UploadFile(c *gin.Context) {
 	}
 
 	storageKey := ""
+	fsHelper := NewFSHelper(h.db)
 
 	if existingBlockID == "" {
 		storageKey, err = blockStore.PutBlockData(c.Request.Context(), &storage.BlockData{
@@ -2741,23 +2742,12 @@ func (h *FileHandler) UploadFile(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to upload to storage"})
 			return
 		}
-
-		// Store block metadata in database
-		if err := h.db.Session().Query(`
-			INSERT INTO blocks (org_id, block_id, size_bytes, storage_class, storage_key, ref_count, created_at, last_accessed)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-		`, orgID, blockID, len(content), storageClass,
-			storageKey, 1, time.Now(), time.Now(),
-		).Exec(); err != nil {
+		if err := fsHelper.IncrementOrCreateBlock(orgID, blockID, len(content), storageClass, storageKey); err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to store block metadata"})
 			return
 		}
 	} else {
-		// Block exists, increment ref count
-		if err := h.db.Session().Query(`
-			UPDATE blocks SET ref_count = ref_count + 1, last_accessed = ?
-			WHERE org_id = ? AND block_id = ?
-		`, time.Now(), orgID, blockID).Exec(); err != nil {
+		if err := fsHelper.IncrementOrCreateBlock(orgID, blockID, len(content), storageClass, storageKey); err != nil {
 			// Non-fatal error, continue
 		}
 	}

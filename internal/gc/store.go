@@ -27,6 +27,7 @@ type GCStore interface {
 
 	// Block operations (worker)
 	GetBlockRefCount(orgID uuid.UUID, blockID string) (int, error)
+	ResolveBlockIDs(orgID uuid.UUID, blockIDs []string) ([]string, error)
 	DeleteBlock(orgID uuid.UUID, blockID string) (bool, error)
 	DecrementBlockRefCount(orgID uuid.UUID, blockID string) error
 	DeleteBlockMapping(orgID uuid.UUID, externalID string) error

@@ -559,8 +559,7 @@ func (w *Worker) processOrgCascade(ctx context.Context, item QueueItem) error {
 		for _, lib := range libs {
 			if lib.DeletedAt.IsZero() {
 				if err := w.store.SoftDeleteLibrary(orgID, lib.LibraryID, uuid.Nil); err != nil {
-					log.Printf("[GC Worker] Failed to soft-delete library %s during org cascade: %v", lib.LibraryID, err)
-					continue
+					return fmt.Errorf("failed to soft-delete library %s during org cascade: %w", lib.LibraryID, err)
 				}
 			}
 			if err := w.cascadeDeleteLibrary(orgID, lib.LibraryID, lib.StorageClass); err != nil {
@@ -617,8 +616,14 @@ func (w *Worker) processOrgCascade(ctx context.Context, item QueueItem) error {
 
 // decrementAndFindZeroRef decrements ref_count for blocks and returns those that hit 0.
 func (w *Worker) decrementAndFindZeroRef(orgID uuid.UUID, blockIDs []string) []string {
+	resolvedBlockIDs, err := w.store.ResolveBlockIDs(orgID, blockIDs)
+	if err != nil {
+		log.Printf("[GC Worker] Failed to resolve block IDs for org %s: %v", orgID, err)
+		return nil
+	}
+
 	var zeroRef []string
-	for _, blockID := range blockIDs {
+	for _, blockID := range resolvedBlockIDs {
 		if err := w.store.DecrementBlockRefCount(orgID, blockID); err != nil {
 			continue
 		}
