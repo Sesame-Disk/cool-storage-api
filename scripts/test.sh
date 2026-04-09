@@ -152,9 +152,26 @@ cleanup_backend_test_orgs() {
     fi
 }
 
+cleanup_backend_test_groups() {
+    if [ "${SESAMEFS_CLEAN_TEST_REPOS:-0}" != "1" ]; then
+        return 0
+    fi
+
+    if [ ! -x "$SCRIPT_DIR/cleanup-test-groups.sh" ]; then
+        log_warning "cleanup-test-groups.sh not found or not executable; skipping stale group cleanup"
+        return 0
+    fi
+
+    log_info "Cleaning stale backend test groups"
+    if ! "$SCRIPT_DIR/cleanup-test-groups.sh" "${SESAMEFS_URL:-http://localhost:3000}"; then
+        log_warning "Stale backend test group cleanup failed; continuing"
+    fi
+}
+
 cleanup_backend_test_state() {
     cleanup_backend_test_repos
     cleanup_backend_test_orgs
+    cleanup_backend_test_groups
 }
 
 # Check if a service is available

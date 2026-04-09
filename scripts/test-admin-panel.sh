@@ -152,6 +152,28 @@ api_body() {
     echo "$body"
 }
 
+api_body_with_status() {
+    local method="$1"
+    local endpoint="$2"
+    local token="$3"
+    local data="$4"
+
+    local url="${API_URL}${endpoint}"
+    local opts=(-s)
+
+    if [ -n "$token" ]; then
+        opts+=(-H "Authorization: Token $token")
+    fi
+
+    opts+=(-H "Content-Type: application/json")
+
+    if [ -n "$data" ]; then
+        opts+=(-d "$data")
+    fi
+
+    curl "${opts[@]}" -X "$method" -w "\n__STATUS__:%{http_code}" "$url"
+}
+
 # Returns HTTP status code for form data requests
 api_form_status() {
     local method="$1"
@@ -244,10 +266,10 @@ HAS_GROUPS=$(echo "$BODY" | jq 'has("groups")')
 run_test "List groups response has 'groups' array" "true" "$HAS_GROUPS"
 
 # 2. Create group via admin API
-BODY=$(api_body "POST" "/api/v2.1/admin/groups/" "$SUPERADMIN_TOKEN" \
+GROUP_CREATE_RESPONSE=$(api_body_with_status "POST" "/api/v2.1/admin/groups/" "$SUPERADMIN_TOKEN" \
     "{\"group_name\":\"${GROUP_TEST_NAME}\"}")
-STATUS=$(api_status "POST" "/api/v2.1/admin/groups/" "$SUPERADMIN_TOKEN" \
-    "{\"group_name\":\"${GROUP_TEST_NAME}\"}")
+BODY=$(printf '%s\n' "$GROUP_CREATE_RESPONSE" | sed '/^__STATUS__:/d')
+STATUS=$(printf '%s\n' "$GROUP_CREATE_RESPONSE" | sed -n 's/^__STATUS__://p')
 run_test "Create group via admin API returns 201" "201" "$STATUS"
 
 GROUP_ID=$(echo "$BODY" | jq -r '.id // empty')
