@@ -88,6 +88,38 @@ func TestScanner_ScanOrphanedBlocks_SkipsAlreadyQueuedCandidate(t *testing.T) {
 	}
 }
 
+func TestScanner_ScanOrphanedBlocks_BackfillsMissingCandidateFromBlocksTable(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	s := NewScanner(store, q, stats, config.GCConfig{})
+
+	orgID := uuid.New()
+	store.AddOrganization(orgID)
+	store.AddBlock(orgID, "block-zero-ref", "hot", 0)
+	store.AddBlock(orgID, "block-still-live", "hot", 2)
+
+	if err := s.ScanOnce(context.Background()); err != nil {
+		t.Fatalf("ScanOnce failed: %v", err)
+	}
+
+	items := store.QueueItems(orgID)
+	if len(items) != 1 {
+		t.Fatalf("expected 1 queued item, got %d", len(items))
+	}
+	if items[0].ItemType != ItemBlock || items[0].ItemID != "block-zero-ref" {
+		t.Fatalf("unexpected queued item: %+v", items[0])
+	}
+
+	candidates, err := store.ListBlockGCCandidates(orgID)
+	if err != nil {
+		t.Fatalf("ListBlockGCCandidates failed: %v", err)
+	}
+	if len(candidates) != 1 || candidates[0].BlockID != "block-zero-ref" {
+		t.Fatalf("expected reconciled GC candidate for block-zero-ref, got %+v", candidates)
+	}
+}
+
 func TestScanner_ScanExpiredShareLinks(t *testing.T) {
 	store := NewMockStore()
 	stats := &Stats{}

@@ -748,6 +748,7 @@ func (h *OnlyOfficeHandler) saveEditedDocument(ctx context.Context, repoID, file
 
 	// Use FSHelper to properly update the file tree and create a commit
 	fsHelper := NewFSHelper(h.db)
+	now := time.Now()
 	filename := path.Base(filePath)
 
 	// Create new FS object for the file (use external SHA-1 block ID for Seafile client compatibility)

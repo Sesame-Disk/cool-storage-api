@@ -84,9 +84,30 @@ func (s *Scanner) ScanOnce(ctx context.Context) error {
 func (s *Scanner) scanOrphanedBlocks(ctx context.Context) (int, error) {
 	log.Println("[GC Scanner] Phase 1: Scanning for orphaned blocks...")
 
-	orgs, err := s.store.ListBlockGCCandidateOrgs()
+	candidateOrgs, err := s.store.ListBlockGCCandidateOrgs()
 	if err != nil {
 		return 0, err
+	}
+	allOrgs, err := s.store.ListOrganizations()
+	if err != nil {
+		return 0, err
+	}
+
+	orgSeen := make(map[uuid.UUID]struct{}, len(candidateOrgs)+len(allOrgs))
+	orgs := make([]uuid.UUID, 0, len(candidateOrgs)+len(allOrgs))
+	for _, orgID := range candidateOrgs {
+		if _, ok := orgSeen[orgID]; ok {
+			continue
+		}
+		orgSeen[orgID] = struct{}{}
+		orgs = append(orgs, orgID)
+	}
+	for _, orgID := range allOrgs {
+		if _, ok := orgSeen[orgID]; ok {
+			continue
+		}
+		orgSeen[orgID] = struct{}{}
+		orgs = append(orgs, orgID)
 	}
 
 	enqueued := 0
@@ -101,8 +122,13 @@ func (s *Scanner) scanOrphanedBlocks(ctx context.Context) (int, error) {
 		if err != nil {
 			continue
 		}
+		blocks, err := s.store.ListBlocksForOrg(orgID)
+		if err != nil {
+			continue
+		}
 
 		var batch []QueueItem
+		queuedBlocks := make(map[string]struct{}, len(candidates))
 		for _, candidate := range candidates {
 			exists, err := s.store.QueueItemExists(orgID, candidate.CandidateAt, ItemBlock, candidate.BlockID)
 			if err != nil {
@@ -110,8 +136,10 @@ func (s *Scanner) scanOrphanedBlocks(ctx context.Context) (int, error) {
 				continue
 			}
 			if exists {
+				queuedBlocks[candidate.BlockID] = struct{}{}
 				continue
 			}
+			queuedBlocks[candidate.BlockID] = struct{}{}
 			batch = append(batch, QueueItem{
 				OrgID:        orgID,
 				QueuedAt:     candidate.CandidateAt,
@@ -119,6 +147,37 @@ func (s *Scanner) scanOrphanedBlocks(ctx context.Context) (int, error) {
 				ItemID:       candidate.BlockID,
 				LibraryID:    uuid.Nil,
 				StorageClass: candidate.StorageClass,
+			})
+		}
+		for _, block := range blocks {
+			if block.RefCount > 0 {
+				continue
+			}
+			if _, ok := queuedBlocks[block.BlockID]; ok {
+				continue
+			}
+			candidateAt, err := s.store.EnsureBlockGCCandidate(orgID, block.BlockID, block.StorageClass, time.Now())
+			if err != nil {
+				log.Printf("[GC Scanner] Phase 1: failed to backfill GC candidate for block %s in org %s: %v", block.BlockID, orgID, err)
+				continue
+			}
+			exists, err := s.store.QueueItemExists(orgID, candidateAt, ItemBlock, block.BlockID)
+			if err != nil {
+				log.Printf("[GC Scanner] Phase 1: failed to inspect queue for reconciled block %s in org %s: %v", block.BlockID, orgID, err)
+				continue
+			}
+			if exists {
+				queuedBlocks[block.BlockID] = struct{}{}
+				continue
+			}
+			queuedBlocks[block.BlockID] = struct{}{}
+			batch = append(batch, QueueItem{
+				OrgID:        orgID,
+				QueuedAt:     candidateAt,
+				ItemType:     ItemBlock,
+				ItemID:       block.BlockID,
+				LibraryID:    uuid.Nil,
+				StorageClass: block.StorageClass,
 			})
 		}
 		if len(batch) > 0 {

@@ -4,6 +4,8 @@ package integration
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"mime/multipart"
@@ -12,6 +14,43 @@ import (
 	"testing"
 	"time"
 )
+
+func uploadFileThroughLink(t *testing.T, c *testClient, uploadURL, fileName, parentDir, content string) {
+	t.Helper()
+
+	var buf bytes.Buffer
+	writer := multipart.NewWriter(&buf)
+	part, err := writer.CreateFormFile("file", fileName)
+	if err != nil {
+		t.Fatalf("CreateFormFile failed: %v", err)
+	}
+	if _, err := part.Write([]byte(content)); err != nil {
+		t.Fatalf("writing upload content failed: %v", err)
+	}
+	if err := writer.WriteField("parent_dir", parentDir); err != nil {
+		t.Fatalf("WriteField failed: %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("closing multipart writer failed: %v", err)
+	}
+
+	req, err := http.NewRequest(http.MethodPost, uploadURL, &buf)
+	if err != nil {
+		t.Fatalf("creating upload request failed: %v", err)
+	}
+	req.Header.Set("Authorization", "Token "+c.token)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		t.Fatalf("upload request failed: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("upload failed with status %d: %s", resp.StatusCode, string(body))
+	}
+}
 
 // TestUploadAndDownloadRoundTrip simulates the full frontend upload/download flow:
 //
@@ -184,6 +223,35 @@ func TestDownloadLinkURL(t *testing.T) {
 	// URL must start with the base URL we're testing against
 	if !strings.HasPrefix(downloadURL, baseURL) {
 		t.Errorf("download URL %q does not start with base URL %q", downloadURL, baseURL)
+	}
+}
+
+func TestDuplicateSeafhttpUploadIncrementsBlockRefCount(t *testing.T) {
+	name := fmt.Sprintf("inttest-dedup-refcount-%d", time.Now().UnixNano())
+	repoID := createTestLibrary(t, adminClient, name)
+
+	resp := adminClient.Get(t, fmt.Sprintf("/api2/repos/%s/upload-link/?p=/", repoID))
+	expectStatus(t, resp, http.StatusOK)
+	uploadURL := strings.Trim(responseBody(t, resp), "\" \n\r")
+
+	fileContent := "same-content-across-uploads\n"
+	uploadFileThroughLink(t, adminClient, uploadURL, "dup-a.txt", "/", fileContent)
+	uploadFileThroughLink(t, adminClient, uploadURL, "dup-b.txt", "/", fileContent)
+
+	session := shareProjectionDBForTest(t).Session()
+	var orgID string
+	if err := session.Query(`SELECT org_id FROM libraries_by_id WHERE library_id = ?`, repoID).Scan(&orgID); err != nil {
+		t.Fatalf("failed to resolve org_id for repo %s: %v", repoID, err)
+	}
+
+	hash := sha256.Sum256([]byte(fileContent))
+	blockID := hex.EncodeToString(hash[:])
+	var refCount int
+	if err := session.Query(`SELECT ref_count FROM blocks WHERE org_id = ? AND block_id = ?`, orgID, blockID).Scan(&refCount); err != nil {
+		t.Fatalf("failed to read block ref_count for %s: %v", blockID, err)
+	}
+	if refCount != 2 {
+		t.Fatalf("ref_count after duplicate uploads = %d, want 2", refCount)
 	}
 }
 
