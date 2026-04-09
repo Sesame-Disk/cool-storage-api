@@ -699,11 +699,6 @@ func (s *CassandraStore) DeleteShare(libraryID, shareID uuid.UUID) error {
 	batch.Query(`
 		DELETE FROM shares WHERE library_id = ? AND share_id = ?
 	`, libraryID.String(), shareID.String())
-	if row.SharedToType == "user" {
-		batch.Query(`
-			DELETE FROM shares_by_user WHERE shared_to = ? AND library_id = ?
-		`, row.SharedTo, row.LibraryID)
-	}
 	db.AddDeleteShareReadModelQuery(batch, row)
 	return batch.Exec()
 }
@@ -1294,6 +1289,25 @@ func (s *CassandraStore) ListSharesByUser(orgID, userID uuid.UUID) ([]ShareByUse
 	return result, nil
 }
 
+func (s *CassandraStore) ListSharesCreatedByUser(orgID, userID uuid.UUID) ([]ShareByCreatorInfo, error) {
+	iter := s.db.Session().Query(`
+		SELECT library_id, share_id FROM shares_by_creator WHERE org_id = ? AND shared_by = ?
+	`, orgID.String(), userID.String()).Iter()
+
+	var libIDStr, shareIDStr string
+	var result []ShareByCreatorInfo
+	for iter.Scan(&libIDStr, &shareIDStr) {
+		result = append(result, ShareByCreatorInfo{
+			LibraryID: parseUUID(libIDStr),
+			ShareID:   parseUUID(shareIDStr),
+		})
+	}
+	if err := iter.Close(); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
 func (s *CassandraStore) DeleteStarredFilesByUser(userID uuid.UUID) error {
 	return s.db.Session().Query(`
 		DELETE FROM starred_files WHERE user_id = ?
@@ -1689,6 +1703,23 @@ func (s *CassandraStore) DeleteGroupFull(orgID, groupID uuid.UUID) error {
 
 func (s *CassandraStore) HardDeleteOrg(orgID uuid.UUID) error {
 	session := s.db.Session()
+	var childID string
+	if err := session.Query(`SELECT library_id FROM libraries WHERE org_id = ? LIMIT 1`, orgID.String()).Scan(&childID); err == nil {
+		return fmt.Errorf("org %s still has live libraries", orgID)
+	} else if !errors.Is(err, gocql.ErrNotFound) {
+		return err
+	}
+	if err := session.Query(`SELECT user_id FROM users WHERE org_id = ? LIMIT 1`, orgID.String()).Scan(&childID); err == nil {
+		return fmt.Errorf("org %s still has live users", orgID)
+	} else if !errors.Is(err, gocql.ErrNotFound) {
+		return err
+	}
+	if err := session.Query(`SELECT group_id FROM groups WHERE org_id = ? LIMIT 1`, orgID.String()).Scan(&childID); err == nil {
+		return fmt.Errorf("org %s still has live groups", orgID)
+	} else if !errors.Is(err, gocql.ErrNotFound) {
+		return err
+	}
+
 	orgState, err := db.ReadAdminOrganizationProjectionState(session, orgID.String())
 	hasOrgState := err == nil
 	if err != nil && !errors.Is(err, gocql.ErrNotFound) {

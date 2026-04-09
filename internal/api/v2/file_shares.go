@@ -603,7 +603,7 @@ func (h *FileShareHandler) UpdateSharePermission(c *gin.Context) {
 		return
 	}
 
-	if err := updateLibrarySharePermission(h.db, repoUUID.String(), shareIDUUID.String(), sharedToID, permission); err != nil {
+	if err := updateLibrarySharePermission(h.db, repoUUID.String(), shareIDUUID.String(), permission); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update share"})
 		return
 	}
@@ -714,7 +714,7 @@ func (h *FileShareHandler) DeleteShare(c *gin.Context) {
 		return
 	}
 
-	if err := deleteLibraryShare(h.db, repoUUID.String(), shareIDUUID.String(), sharedToID); err != nil {
+	if err := deleteLibraryShare(h.db, repoUUID.String(), shareIDUUID.String()); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete share"})
 		return
 	}
@@ -868,7 +868,7 @@ func (h *FileShareHandler) LeaveShareRepo(c *gin.Context) {
 		return
 	}
 
-	if err := deleteLibraryShare(h.db, repoUUID.String(), foundShareID, userID); err != nil {
+	if err := deleteLibraryShare(h.db, repoUUID.String(), foundShareID); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete share"})
 		return
 	}

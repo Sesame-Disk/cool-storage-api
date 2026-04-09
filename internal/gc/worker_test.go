@@ -638,12 +638,15 @@ func TestWorker_ProcessUserCascade_FullCascade(t *testing.T) {
 	orgID := uuid.New()
 	userID := uuid.New()
 	groupID := uuid.New()
-	libID := uuid.New()
+	receivedLibID := uuid.New()
+	createdLibID := uuid.New()
+	recipientID := uuid.New()
 
 	store.AddOrganization(orgID)
 	store.AddUser(orgID, userID, "alice@test.com")
 	store.AddGroupMembership(orgID, userID, groupID)
-	store.AddShareByUser(orgID, userID, libID)
+	receivedShareID := store.AddShareByUser(orgID, userID, receivedLibID)
+	createdShareID := store.AddShareCreatedByUser(orgID, userID, recipientID, createdLibID)
 	store.AddStarredFile(userID)
 	store.AddMonitoredRepo(userID)
 
@@ -670,8 +673,11 @@ func TestWorker_ProcessUserCascade_FullCascade(t *testing.T) {
 	if store.HasMonitoredRepos(userID) {
 		t.Error("monitored repos should be deleted after user cascade")
 	}
-	if store.HasShareByUser(userID, libID) {
-		t.Error("received share index should be deleted after user cascade")
+	if store.HasShare(receivedLibID, receivedShareID) {
+		t.Error("received share should be deleted after user cascade")
+	}
+	if store.HasShare(createdLibID, createdShareID) {
+		t.Error("created share should be deleted after user cascade")
 	}
 
 	// Audit log should have an entry
@@ -797,6 +803,9 @@ func TestWorker_ProcessOrgCascade_FullCascade(t *testing.T) {
 	if store.HasGroup(orgID, groupID) {
 		t.Error("group should be deleted after org cascade")
 	}
+	if _, err := store.GetLibraryStorageClass(orgID, libID); err == nil {
+		t.Error("library should be hard-deleted after org cascade")
+	}
 
 	// Starred/monitored should be cleaned
 	if store.HasStarredFiles(userID1) {
@@ -806,7 +815,7 @@ func TestWorker_ProcessOrgCascade_FullCascade(t *testing.T) {
 		t.Error("monitored repos should be deleted after org cascade")
 	}
 
-	// Library should be enqueued as LibraryCascade
+	// Library cascade should run synchronously, so no library_cascade item remains queued
 	items := store.QueueItems(orgID)
 	libCascadeCount := 0
 	for _, item := range items {
@@ -814,16 +823,27 @@ func TestWorker_ProcessOrgCascade_FullCascade(t *testing.T) {
 			libCascadeCount++
 		}
 	}
-	if libCascadeCount != 1 {
-		t.Errorf("expected 1 library_cascade enqueued, got %d", libCascadeCount)
+	if libCascadeCount != 0 {
+		t.Errorf("expected 0 library_cascade queued, got %d", libCascadeCount)
 	}
 
 	// Audit log
 	entries := store.AuditLogEntries()
-	if len(entries) != 1 {
-		t.Errorf("expected 1 audit log entry, got %d", len(entries))
-	} else if entries[0].Action != "gc_org_cascade_deleted" {
-		t.Errorf("expected action gc_org_cascade_deleted, got %s", entries[0].Action)
+	if len(entries) != 3 {
+		t.Errorf("expected 3 audit log entries, got %d", len(entries))
+	}
+	actions := map[string]bool{}
+	for _, e := range entries {
+		actions[e.Action] = true
+	}
+	if !actions["gc_library_artifacts_cleaned"] {
+		t.Error("expected gc_library_artifacts_cleaned audit entry")
+	}
+	if !actions["gc_library_cascade_deleted"] {
+		t.Error("expected gc_library_cascade_deleted audit entry")
+	}
+	if !actions["gc_org_cascade_deleted"] {
+		t.Error("expected gc_org_cascade_deleted audit entry")
 	}
 }
 

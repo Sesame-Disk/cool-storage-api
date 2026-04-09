@@ -928,38 +928,7 @@ Dual-write with `groups` table — every INSERT/UPDATE/DELETE on `groups` must a
 
 ---
 
-### 24. `shares_by_user`
-**Purpose:** GC reverse-index — "what libraries are shared to this user?" Used exclusively for user-deletion cascade cleanup.
-
-**Schema:**
-```sql
-PRIMARY KEY ((shared_to), library_id)  -- Partition by recipient
-```
-
-**Fields:**
-| Field | Type | Description |
-|-------|------|-------------|
-| `shared_to` | UUID | Recipient user ID (partition key) |
-| `library_id` | UUID | Shared library ID (clustering key) |
-| `shared_to_type` | TEXT | `"user"` |
-| `permission` | TEXT | `"r"` or `"rw"` |
-| `shared_by` | UUID | User who created the share |
-| `created_at` | TIMESTAMP | When the share was created |
-
-**Scope:** Written only for `shared_to_type == "user"`. Group shares are **not** stored here; group cleanup uses `shares_by_group` instead.
-
-**Readers:**
-- `gc.CassandraStore.ListSharesByUser(userID)` — user-deletion cascade, finds all libraries shared to this user for cleanup
-- `gc.CassandraStore.DeleteShareByUser(sharedTo, libraryID)` — per-share cleanup during cascade
-
-**Not used for API queries.** Admin panel queries use `shares_by_user_org`. Application "shared with me" views use `shares_by_recipient`.
-
-**Consistency Pattern:**
-Written/updated/deleted atomically alongside `shares` and projection tables in `LoggedBatch`. Only for `shared_to_type == "user"` — see `createLibraryShare`, `updateLibrarySharePermission`, `deleteLibraryShare` in `write_helpers.go`.
-
----
-
-### 25–32. Admin Read Model Tables
+### 24–31. Admin Read Model Tables
 
 These tables are **denormalized projections** maintained by dual-write. They are never the source of truth — always derive from `libraries`, `groups`, `shares`, `share_links`.
 

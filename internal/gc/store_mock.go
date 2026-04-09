@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -58,9 +59,6 @@ type MockStore struct {
 
 	// shares keyed by "libraryID:shareID"
 	shares map[string]*mockShare
-
-	// shares_by_user keyed by "userID:libraryID"
-	sharesByUser map[string]*mockShareByUser
 
 	// restore_jobs keyed by "orgID:libraryID:jobID"
 	restoreJobs map[string]*mockRestoreJob
@@ -134,6 +132,7 @@ type mockShare struct {
 	OrgID        uuid.UUID
 	LibraryID    uuid.UUID
 	ShareID      uuid.UUID
+	SharedBy     uuid.UUID
 	SharedTo     uuid.UUID
 	SharedToType string
 	ExpiresAt    time.Time
@@ -175,11 +174,6 @@ type mockDeletedLibrary struct {
 	DeletedAt    time.Time
 }
 
-type mockShareByUser struct {
-	SharedTo  uuid.UUID
-	LibraryID uuid.UUID
-}
-
 // NewMockStore creates a new in-memory mock store.
 func NewMockStore() *MockStore {
 	return &MockStore{
@@ -199,7 +193,6 @@ func NewMockStore() *MockStore {
 		deletedLibraries: make(map[uuid.UUID]*mockDeletedLibrary),
 		shareLinks:       make(map[string]*mockShareLink),
 		shares:           make(map[string]*mockShare),
-		sharesByUser:     make(map[string]*mockShareByUser),
 		restoreJobs:      make(map[string]*mockRestoreJob),
 		repoTags:         make(map[string]bool),
 		fileTags:         make(map[string]*mockFileTag),
@@ -444,8 +437,8 @@ func (m *MockStore) AddDeletedLibrary(orgID, libraryID uuid.UUID, storageClass s
 	m.deletedLibraries[libraryID] = &mockDeletedLibrary{OrgID: orgID, LibraryID: libraryID, StorageClass: storageClass, DeletedAt: deletedAt}
 }
 
-// AddShareByUser adds a user share plus its legacy recipient index entry.
-func (m *MockStore) AddShareByUser(orgID, userID, libraryID uuid.UUID) {
+// AddShareByUser adds a share received by a user.
+func (m *MockStore) AddShareByUser(orgID, userID, libraryID uuid.UUID) uuid.UUID {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	shareID := uuid.New()
@@ -454,11 +447,28 @@ func (m *MockStore) AddShareByUser(orgID, userID, libraryID uuid.UUID) {
 		OrgID:        orgID,
 		LibraryID:    libraryID,
 		ShareID:      shareID,
+		SharedBy:     uuid.New(),
 		SharedTo:     userID,
 		SharedToType: "user",
 	}
-	key := fmt.Sprintf("%s:%s", userID, libraryID)
-	m.sharesByUser[key] = &mockShareByUser{SharedTo: userID, LibraryID: libraryID}
+	return shareID
+}
+
+// AddShareCreatedByUser adds a user-to-user share created by a specific user.
+func (m *MockStore) AddShareCreatedByUser(orgID, userID, recipientID, libraryID uuid.UUID) uuid.UUID {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	shareID := uuid.New()
+	shareKey := fmt.Sprintf("%s:%s", libraryID, shareID)
+	m.shares[shareKey] = &mockShare{
+		OrgID:        orgID,
+		LibraryID:    libraryID,
+		ShareID:      shareID,
+		SharedBy:     userID,
+		SharedTo:     recipientID,
+		SharedToType: "user",
+	}
+	return shareID
 }
 
 // AddStarredFile adds a starred file entry for a user.
@@ -1049,11 +1059,7 @@ func (m *MockStore) DeleteShare(libraryID, shareID uuid.UUID) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	key := fmt.Sprintf("%s:%s", libraryID, shareID)
-	share := m.shares[key]
 	delete(m.shares, key)
-	if share != nil && share.SharedToType == "user" {
-		delete(m.sharesByUser, fmt.Sprintf("%s:%s", share.SharedTo, share.LibraryID))
-	}
 	return nil
 }
 
@@ -1087,11 +1093,11 @@ func (m *MockStore) DeleteRestoreJob(orgID, libraryID, jobID uuid.UUID) error {
 	return nil
 }
 
-// HasShareByUser returns true if the legacy recipient index still has a row.
-func (m *MockStore) HasShareByUser(userID, libraryID uuid.UUID) bool {
+// HasShare returns true if the canonical share row still exists.
+func (m *MockStore) HasShare(libraryID, shareID uuid.UUID) bool {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	_, ok := m.sharesByUser[fmt.Sprintf("%s:%s", userID, libraryID)]
+	_, ok := m.shares[fmt.Sprintf("%s:%s", libraryID, shareID)]
 	return ok
 }
 
@@ -1364,6 +1370,17 @@ func (m *MockStore) ListSharesByUser(orgID, userID uuid.UUID) ([]ShareByUserInfo
 	}
 	return result, nil
 }
+func (m *MockStore) ListSharesCreatedByUser(orgID, userID uuid.UUID) ([]ShareByCreatorInfo, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	var result []ShareByCreatorInfo
+	for _, share := range m.shares {
+		if share.OrgID == orgID && share.SharedBy == userID {
+			result = append(result, ShareByCreatorInfo{LibraryID: share.LibraryID, ShareID: share.ShareID})
+		}
+	}
+	return result, nil
+}
 func (m *MockStore) DeleteStarredFilesByUser(userID uuid.UUID) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -1476,6 +1493,21 @@ func (m *MockStore) DeleteGroupFull(orgID, groupID uuid.UUID) error {
 func (m *MockStore) HardDeleteOrg(orgID uuid.UUID) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	for _, lib := range m.libraries {
+		if lib.OrgID == orgID {
+			return fmt.Errorf("org %s still has live libraries", orgID)
+		}
+	}
+	for _, user := range m.users {
+		if user.OrgID == orgID {
+			return fmt.Errorf("org %s still has live users", orgID)
+		}
+	}
+	for key := range m.groups {
+		if strings.HasPrefix(key, orgID.String()+":") {
+			return fmt.Errorf("org %s still has live groups", orgID)
+		}
+	}
 	for i, id := range m.organizations {
 		if id == orgID {
 			m.organizations = append(m.organizations[:i], m.organizations[i+1:]...)

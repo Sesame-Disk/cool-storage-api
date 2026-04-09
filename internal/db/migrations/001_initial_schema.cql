@@ -394,16 +394,6 @@ CREATE TABLE IF NOT EXISTS shares (
     PRIMARY KEY ((library_id), share_id)
 );
 
-CREATE TABLE IF NOT EXISTS shares_by_user (
-    shared_to      UUID,
-    library_id     UUID,
-    shared_to_type TEXT,
-    permission     TEXT,
-    shared_by      UUID,
-    created_at     TIMESTAMP,
-    PRIMARY KEY ((shared_to), library_id)
-);
-
 -- Admin/org-admin share read models.
 CREATE TABLE IF NOT EXISTS shares_by_group (
     org_id            UUID,

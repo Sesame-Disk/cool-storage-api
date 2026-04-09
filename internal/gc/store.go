@@ -115,6 +115,7 @@ type GCStore interface {
 	DeleteGroupMember(groupID, userID uuid.UUID) error
 	DeleteGroupByMember(orgID, userID, groupID uuid.UUID) error
 	ListSharesByUser(orgID, userID uuid.UUID) ([]ShareByUserInfo, error)
+	ListSharesCreatedByUser(orgID, userID uuid.UUID) ([]ShareByCreatorInfo, error)
 	DeleteStarredFilesByUser(userID uuid.UUID) error
 	DeleteMonitoredReposByUser(userID uuid.UUID) error
 	DeleteAPIKeysByUser(orgID, userID uuid.UUID) error
@@ -296,6 +297,12 @@ type OrgLibraryInfo struct {
 // ShareByUserInfo holds data about a share received by a user.
 type ShareByUserInfo struct {
 	SharedTo  uuid.UUID // user_id
+	LibraryID uuid.UUID
+	ShareID   uuid.UUID
+}
+
+// ShareByCreatorInfo holds data about a share created by a user.
+type ShareByCreatorInfo struct {
 	LibraryID uuid.UUID
 	ShareID   uuid.UUID
 }

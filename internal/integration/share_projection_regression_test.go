@@ -61,12 +61,6 @@ type shareRecipientState struct {
 	Permission string
 }
 
-type legacyUserShareState struct {
-	SharedToType string
-	Permission   string
-	SharedBy     string
-}
-
 func TestShareProjectionConsistency_UserShareLifecycle(t *testing.T) {
 	repoName := fmt.Sprintf("inttest-share-user-%d", time.Now().UnixNano())
 	repoID := createTestLibrary(t, adminClient, repoName)
@@ -255,11 +249,6 @@ func baseShareMatchesExpectation(state shareProjectionState, repoName, permissio
 func userShareMatchesAllTables(t *testing.T, state shareProjectionState) bool {
 	t.Helper()
 
-	legacy, ok := legacyUserShareRow(t, state)
-	if !ok || legacy.SharedToType != "user" || legacy.Permission != state.Permission || legacy.SharedBy != state.SharedBy {
-		return false
-	}
-
 	if _, ok := shareByGroupRow(t, state); ok {
 		return false
 	}
@@ -285,9 +274,6 @@ func userShareMatchesAllTables(t *testing.T, state shareProjectionState) bool {
 func groupShareMatchesAllTables(t *testing.T, state shareProjectionState) bool {
 	t.Helper()
 
-	if _, ok := legacyUserShareRow(t, state); ok {
-		return false
-	}
 	if _, ok := shareByUserOrgRow(t, state); ok {
 		return false
 	}
@@ -314,9 +300,6 @@ func shareAbsentFromAllTables(t *testing.T, state shareProjectionState) bool {
 	t.Helper()
 
 	if shareBaseRowExists(t, state) {
-		return false
-	}
-	if _, ok := legacyUserShareRow(t, state); ok {
 		return false
 	}
 	if _, ok := shareByGroupRow(t, state); ok {
@@ -352,17 +335,6 @@ func shareBaseRowExists(t *testing.T, state shareProjectionState) bool {
 		SELECT share_id FROM shares WHERE library_id = ? AND share_id = ?
 	`, state.LibraryID, state.ShareID).Scan(&shareID)
 	return scanFound(t, err, "shares", state.LibraryID, state.ShareID)
-}
-
-func legacyUserShareRow(t *testing.T, state shareProjectionState) (legacyUserShareState, bool) {
-	t.Helper()
-
-	var row legacyUserShareState
-	err := shareProjectionDBForTest(t).Session().Query(`
-		SELECT shared_to_type, permission, shared_by
-		FROM shares_by_user WHERE shared_to = ? AND library_id = ?
-	`, state.SharedTo, state.LibraryID).Scan(&row.SharedToType, &row.Permission, &row.SharedBy)
-	return row, scanFound(t, err, "shares_by_user", state.SharedTo, state.LibraryID)
 }
 
 func shareByGroupRow(t *testing.T, state shareProjectionState) (shareReadModelState, bool) {
