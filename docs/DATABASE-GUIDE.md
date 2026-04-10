@@ -1138,6 +1138,8 @@ Covers both user and group recipients. Complement to `shares_by_user_org` (which
 - Both write `ref_count = 6`
 - Actual should be `7`
 
+**Status: ✅ RESOLVED (2026-04-10).** `IncrementOrCreateBlock` and `decrementBlockRefCount` now use LWT (CAS) with retry loops: `SELECT ref_count` → `UPDATE IF ref_count = X`. Concurrent writers retry on CAS failure. GC uses a two-phase LWT with sentinel value (-999) to prevent upload-vs-GC races. See `ARCHITECTURE.md` for the full ref_count lifecycle.
+
 #### 3. Commit Chain Integrity
 **Scenario:** Creating a commit requires:
 1. Write `fs_objects` (new file)
@@ -1214,23 +1216,17 @@ func CreateUser(user User) error {
 }
 ```
 
-### Phase 4: Use Counters Properly
+### Phase 4: ~~Use Counters Properly~~ — SUPERSEDED
 
-Replace `ref_count INT` with Cassandra counter columns:
+~~Replace `ref_count INT` with Cassandra counter columns.~~
 
-```sql
-CREATE TABLE block_ref_counts (
-    org_id UUID,
-    block_id TEXT,
-    ref_count COUNTER,
-    PRIMARY KEY ((org_id), block_id)
-);
+**Decision (2026-04-10):** Counter columns are **not compatible with LWT (IF clauses)**. Since GC's two-phase delete requires `UPDATE SET ref_count = -999 IF ref_count <= 0`, and uploads require `UPDATE SET ref_count = ? IF ref_count = ?` for CAS, we must keep `ref_count` as a regular INT column with explicit SELECT→UPDATE→LWT cycles. This is now implemented with retry loops in `IncrementOrCreateBlock` and `decrementBlockRefCount`.
 
--- Atomic increment
-UPDATE block_ref_counts
-SET ref_count = ref_count + 1
-WHERE org_id = ? AND block_id = ?;
-```
+Cassandra counters (`ref_count COUNTER`) would provide atomic `ref_count = ref_count + 1` without read-before-write, but:
+- Cannot use `IF` conditions (LWT) with counter tables
+- Cannot set sentinel values for GC coordination
+- Cannot conditionally gate deletion on current value
+- Race between "increment counter" and "read counter for GC decision" is worse than the current LWT approach
 
 ### Phase 5: Consistency Level Configuration
 
@@ -1241,7 +1237,8 @@ Set appropriate consistency levels per operation:
 | User login | `LOCAL_QUORUM` | Must be consistent |
 | File listing | `LOCAL_ONE` | Can be slightly stale |
 | Commit creation | `QUORUM` | Must be durable |
-| Block upload | `ONE` | Speed matters, ref_count eventually consistent |
+| Block ref_count mutation (LWT) | `SERIAL` (default) | Global Paxos for multi-DC safety — do NOT change to `LOCAL_SERIAL` |
+| Block upload (non-LWT reads) | `LOCAL_QUORUM` | Reads before LWT must see latest state |
 | Share link validation | `LOCAL_QUORUM` | Security-critical |
 
 **Implementation in config.yaml:**
@@ -1270,10 +1267,8 @@ database:
 ### Pending
 - [ ] Implement LWT for user creation
 - [ ] Implement LWT for `head_commit_id` updates (optimistic locking)
-- [ ] Convert `blocks.ref_count` to counter table
-- [ ] Add consistency level configuration
-- [ ] Implement saga pattern for cross-partition writes
-- [ ] Add idempotency keys for retryable operations
+- [x] ~~Convert `blocks.ref_count` to counter table~~ — SUPERSEDED: LWT (IF clauses) incompatible with counter columns. Solved with SELECT→CAS retry loops instead (2026-04-10)
+- [x] Add idempotency keys for retryable operations — DONE: `gc_processed_items` table with `INSERT IF NOT EXISTS` prevents double-decrements (2026-04-10)
 
 ---
 

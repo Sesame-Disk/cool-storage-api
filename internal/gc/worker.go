@@ -203,8 +203,13 @@ func (w *Worker) processCommit(ctx context.Context, item QueueItem) error {
 
 	// Enqueue the root fs_object for cascading deletion (fs_object → blocks).
 	// Use parent's QueuedAt so cascade children skip the grace period.
+	// CRITICAL: if enqueue fails, we must NOT delete the commit — otherwise
+	// the root fs_object becomes an orphan with no GC entry. The next scanner
+	// sweep will re-discover and re-enqueue this commit.
 	if commit.RootFSID != "" {
-		w.queue.EnqueueCascade(item.OrgID, item.QueuedAt, ItemFSObject, commit.RootFSID, item.LibraryID, "")
+		if err := w.queue.EnqueueCascade(item.OrgID, item.QueuedAt, ItemFSObject, commit.RootFSID, item.LibraryID, ""); err != nil {
+			return fmt.Errorf("failed to enqueue root fs_object %s for commit %s: %w", commit.RootFSID, item.ItemID, err)
+		}
 	}
 
 	if err := w.store.DeleteCommit(item.LibraryID, item.ItemID); err != nil {

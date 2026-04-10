@@ -438,6 +438,18 @@ Session 2 (China): Block abc123 → DB lookup finds it exists in hot-s3-usa
 
 ## Garbage Collection Architecture
 
+### Design Principle: Tolerate Before Doubt
+
+The GC system is designed around a single overriding principle: **it is always better to leave garbage and retry than to delete data that might still be referenced**. Every decision in the GC pipeline favors data safety over cleanup speed:
+
+- If a block's `ref_count` is ambiguous (concurrent mutation), skip it — the next scanner sweep will re-enqueue it if it's truly orphaned.
+- If enqueueing a child item fails, do NOT delete the parent — let the worker retry the entire operation.
+- If a block has been claimed by GC (sentinel -999) but a concurrent upload needs it, the upload waits and creates a fresh copy rather than fighting the GC.
+- Grace periods (1h default) ensure that recently-enqueued items have time for in-flight operations to complete before processing.
+- The scanner runs every 24h — any item missed in one pass will be caught in the next.
+
+This principle applies to **all flows**: blocks, commits, fs_objects, cascades, and cross-region replication scenarios.
+
 ### Components
 
 The GC system has two independent goroutines: a **Worker** (every 30s) and a **Scanner** (every 24h).
@@ -461,7 +473,9 @@ Drains the `gc_queue` table. Each item has a type; the worker dispatches accordi
 
 **Two-phase deletion**: items sit in `gc_queue` for a grace period (default 1h) before the worker processes them. The `gc_queue` table has a 7-day TTL for auto-cleanup of stuck items.
 
-**Cascading**: Commit → fs_object → blocks. The worker only enqueues commits and fs_objects when a library is deleted; blocks are discovered and enqueued during fs_object processing.
+**Cascading**: Commit → fs_object → blocks. The worker only enqueues commits and fs_objects when a library is deleted; blocks are discovered and enqueued during fs_object processing. Cascade items use the parent's `queued_at` timestamp (`EnqueueCascade`) so they skip the grace period — the parent already waited.
+
+**Error tolerance**: All cascade enqueue operations propagate errors. If enqueueing a child item fails, the parent is NOT deleted — the worker returns an error, the item stays in the queue, and the next worker sweep retries it. Principle: **better to leave garbage and retry than to delete and lose a reference chain**.
 
 **Library deletion** also enqueues artifact cleanup: shares, share links, repo tags, file tags, API tokens, locked files, starred files, monitored repos, restore jobs, and tag counters.
 
@@ -492,9 +506,15 @@ Drains the `gc_queue` table. Each item has a type; the worker dispatches accordi
 **Audit logging**: Deletion events (library artifacts cleaned, blocks deleted, groups deleted) are written to the `audit_log` table (365-day TTL, partitioned by `org_id`).
 
 **Safety measures**:
+- **"Tolerate before doubt"**: GC always errs on the side of keeping data. If any check is ambiguous, the item stays in the queue for the next sweep rather than being deleted.
 - Never delete HEAD commit or its ancestors within TTL
 - Grace period: items wait 1h in queue before processing
-- `gc_queue` has 7-day Cassandra TTL for stuck items
+- `gc_queue` has 7-day Cassandra TTL for auto-cleanup of stuck items
+- **Two-phase LWT block deletion**: Phase 1: `UPDATE SET ref_count = -999 IF ref_count <= 0` (atomic claim via Paxos). Phase 2: unconditional `DELETE`. If Phase 1 fails (ref_count > 0, i.e., a concurrent upload incremented it), the block is skipped — no S3 deletion occurs.
+- **Sentinel protection for uploads**: `IncrementOrCreateBlock` detects sentinel `-999` (`ref_count < 0`) and backs off with exponential delay, waiting for GC Phase 2 to complete the DELETE. Then it creates a fresh row via `INSERT IF NOT EXISTS`. This prevents the race where an upload's UPDATE would be clobbered by GC's unconditional DELETE.
+- **Idempotent decrements**: `gc_processed_items` table (48h TTL) with `INSERT IF NOT EXISTS` prevents double-decrements on worker retries. Task IDs are deterministic (MD5 of fs_object_id + queued_at).
+- **Head-of-line blocking prevention**: Failed items are requeued with a new `queued_at` timestamp (delete old + insert new in a LoggedBatch), placing them at the back of the queue.
+- **Cascade error propagation**: If enqueueing child items fails, the parent item is NOT deleted — the worker returns an error and the item stays in queue for retry.
 - Dry-run mode for testing (toggle at runtime via admin API)
 - Prometheus metrics: `gc_worker_duration`, `gc_scanner_duration`, `gc_queue_size`, `gc_blocks_deleted_total`, `gc_worker_consecutive_errors`, `gc_queue_growth_rate`, `gc_worker_last_success_timestamp_seconds`
 - Scanner runs immediately on startup to catch anything missed during downtime
@@ -502,11 +522,22 @@ Drains the `gc_queue` table. Each item has a type; the worker dispatches accordi
 
 #### Reference Counting
 
-**Operations**:
-- **File upload**: `ref_count = 1` (new block) or increment if dedup
-- **File copy**: increment `ref_count`
-- **Commit deletion**: decrement `ref_count` for all blocks in commit
-- **Block deletion**: only when `ref_count = 0`
+**Operations** (all use Cassandra LWT for atomicity):
+- **File upload**: `IncrementOrCreateBlock` — SELECT → UPDATE IF ref_count = X (increment) or INSERT IF NOT EXISTS (new block). Retries on CAS failure, backs off on sentinel.
+- **File copy**: `IncrementOrCreateBlock` — same flow, deduplicated by block hash.
+- **File/commit deletion**: `decrementBlockRefCount` — SELECT → UPDATE IF ref_count = X (decrement) with retry loop. Returns true only if **this** call caused the transition to 0.
+- **GC block deletion**: Two-phase LWT — `UPDATE SET ref_count = -999 IF ref_count <= 0` then `DELETE`.
+
+**ref_count lifecycle**:
+```
+Upload/Copy:  0 → 1 → 2 → ... (increment via LWT)
+Delete:       ... → 2 → 1 → 0  (decrement via LWT, enqueue when hits 0)
+GC claim:     0 → -999          (LWT sentinel, Phase 1)
+GC delete:    -999 → [row deleted] (unconditional DELETE, Phase 2)
+Upload race:  -999 → [wait] → [row deleted] → INSERT fresh ref_count=1
+```
+
+**Multi-region considerations**: All LWT operations on the `blocks` table use Cassandra's default `SERIAL` consistency (global Paxos). This ensures uploads in DC-A and GC in DC-B are serialized correctly. GC must be enabled in only one DC (see `config.prod.yaml` comments and KNOWN_ISSUES.md `ISSUE-GC-MULTIINSTANCE-01`). The 1h grace period (>>200ms cross-DC replication lag) ensures non-LWT reads are also consistent before processing.
 
 #### Reverse Lookup Table
 

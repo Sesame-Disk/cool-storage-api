@@ -916,6 +916,16 @@ applied, _ := session.Query(`
 - Keep the temporary `GC_ENABLED` guard for short-term production unblock.
 - Replace it later with a Cassandra LWT lease so failover is automatic and operators no longer need to pin one GC replica manually.
 
+**Multi-region deployment note (2026-04-10):**
+Running GC in a single DC is **critical** for multi-region deployments with Cassandra replication. Even though LWT operations use `SERIAL` consistency (global Paxos) by default, running GC on multiple DCs would cause:
+- `DequeueBatch` (non-LWT SELECT) returning the same items to workers in different DCs
+- Scanner in both DCs enqueueing duplicate orphans
+- Unnecessary cross-DC Paxos contention on every LWT
+
+The existing `GC_ENABLED=true` on exactly one DC / `GC_ENABLED=false` on all others is the correct topology for multi-region. The LWT leader election proposal above still applies — it would provide automatic failover within a single DC or across DCs.
+
+All block-level operations (`IncrementOrCreateBlock`, `decrementBlockRefCount`, `DeleteBlock` Phase 1) use LWT which defaults to `SERIAL` (global Paxos). Do NOT change to `LOCAL_SERIAL` — this would break cross-DC serialization and allow split-brain scenarios where GC in DC-A claims a block that an upload in DC-B is concurrently referencing.
+
 **Alternative — Org partitioning:**
 Each instance processes `hash(orgID) % numInstances == myIndex`. No coordination needed but requires knowing the total number of instances.
 

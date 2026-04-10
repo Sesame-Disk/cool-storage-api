@@ -570,7 +570,7 @@ func (h *FSHelper) markBlockMutationProcessed(operationKey string) (bool, error)
 }
 
 func (h *FSHelper) IncrementOrCreateBlock(orgID, blockID string, sizeBytes int, storageClass, storageKey string) error {
-	const maxRetries = 5
+	const maxRetries = 10
 
 	for attempt := 0; attempt < maxRetries; attempt++ {
 		now := time.Now()
@@ -586,7 +586,8 @@ func (h *FSHelper) IncrementOrCreateBlock(orgID, blockID string, sizeBytes int, 
 				// GC sentinel (-999): the GC worker has claimed this row and will
 				// DELETE it momentarily (Phase 2). We must NOT touch it — any
 				// UPDATE would be clobbered by the unconditional DELETE.
-				// Retry until the row disappears, then INSERT fresh.
+				// Back off with exponential delay to let GC finish Phase 2.
+				time.Sleep(time.Duration(50<<uint(attempt)) * time.Millisecond) // 50ms, 100ms, 200ms, ...
 				continue
 			}
 
@@ -620,7 +621,7 @@ func (h *FSHelper) IncrementOrCreateBlock(orgID, blockID string, sizeBytes int, 
 		// Race: someone inserted concurrently, retry to increment
 	}
 
-	return fmt.Errorf("failed to increment/create block %s after %d retries (persistent contention)", blockID, maxRetries)
+	return fmt.Errorf("failed to increment/create block %s after %d retries (persistent contention or GC stall)", blockID, maxRetries)
 }
 
 // collectDirStats recursively collects block IDs, total size in bytes, and file count

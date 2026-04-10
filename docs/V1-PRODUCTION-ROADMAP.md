@@ -547,7 +547,7 @@ the launch on Glacier since it requires AWS Glacier infrastructure setup and tes
 | 12 | Cursor-based pagination | **P2** | Admin links done; library/group admin lists still pending | 2-4 days |
 | 13 | Cold storage / Glacier | **P2** | ~30% | 2–3 weeks |
 | **14** | **User-scoped programmatic auth (API keys)** | **✅ DONE** | **User API keys + `/api2/auth-token/` are live. 2026-04-04 hardening now propagates scope to derived sessions, caps effective role, and enforces central library/sync scope checks. Accounts can reuse the same API key system through a dedicated platform service account; the remaining work belongs to item #1.** | — |
-| **15** | **GC multi-instance safety** | **P0** | **Temporary prod guard landed: `GC_ENABLED` can disable GC on non-GC replicas. Real leader election/lease is still pending because `gc.go:99` Start() has no distributed lock.** | **1 day** |
+| **15** | **GC multi-instance safety** | **P0** | **Temporary prod guard landed: `GC_ENABLED` can disable GC on non-GC replicas. Real leader election/lease is still pending because `gc.go:99` Start() has no distributed lock. For multi-region: GC MUST run in exactly one DC. LWT operations use `SERIAL` (global Paxos) — do NOT change to `LOCAL_SERIAL`. Two-phase LWT block deletion with sentinel (-999) + upload backoff hardened (2026-04-10).** | **1 day** |
 | 16 | Frontend Phase 3 cleanup | **P1** | Mostly done. Legacy `personalfree/business/pay_restricted*` removed. Remaining: pageOptions placeholders and minor cleanup | 2–3 days |
 
 ---
