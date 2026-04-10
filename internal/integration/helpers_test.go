@@ -201,6 +201,31 @@ func (c *testClient) Delete(t *testing.T, path string) *http.Response {
 	return c.Do(t, http.MethodDelete, path, nil)
 }
 
+// DeleteJSON sends a DELETE request with a JSON body.
+func (c *testClient) DeleteJSON(t *testing.T, path string, body interface{}) *http.Response {
+	t.Helper()
+
+	data, err := json.Marshal(body)
+	if err != nil {
+		t.Fatalf("failed to marshal JSON body: %v", err)
+	}
+
+	buf := bytes.NewBuffer(data)
+	req, err := http.NewRequest(http.MethodDelete, c.baseURL+path, buf)
+	if err != nil {
+		t.Fatalf("failed to create request: %v", err)
+	}
+
+	req.Header.Set("Authorization", "Token "+c.token)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		t.Fatalf("DELETE %s failed: %v", path, err)
+	}
+	return resp
+}
+
 // responseBody reads and returns the response body as a string, closing the body.
 func responseBody(t *testing.T, resp *http.Response) string {
 	t.Helper()

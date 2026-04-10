@@ -67,9 +67,10 @@ func (q *Queue) Complete(orgID uuid.UUID, queuedAt time.Time, itemType ItemType,
 	return q.store.CompleteItem(orgID, queuedAt, itemType, itemID)
 }
 
-// IncrementRetry updates the retry count for a failed item.
-func (q *Queue) IncrementRetry(orgID uuid.UUID, queuedAt time.Time, itemType ItemType, itemID string, currentRetry int) error {
-	return q.store.UpdateRetryCount(orgID, queuedAt, itemType, itemID, currentRetry+1)
+// IncrementRetry updates the retry count for a failed item and requeues it at the back of the queue.
+func (q *Queue) IncrementRetry(item QueueItem) error {
+	newQueuedAt := time.Now()
+	return q.store.RequeueItem(item.OrgID, item.QueuedAt, newQueuedAt, item.ItemType, item.ItemID, item.LibraryID, item.StorageClass, item.RetryCount+1)
 }
 
 // GetQueueSize returns the approximate number of items in the queue for an org.

@@ -12,6 +12,10 @@ import (
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
 )
 
+// errFileTagNotFound is returned when a file tag lookup fails (SELECT miss).
+// Callers should map this to HTTP 404 rather than 500.
+var errFileTagNotFound = errors.New("file tag not found")
+
 // User/Org status constants — lifecycle state independent of role.
 const (
 	StatusActive      = "active"
@@ -933,4 +937,188 @@ func validateUserTrafficQuotasAgainstOrg(uploadQuota, downloadQuota int64, oq or
 		}
 	}
 	return ""
+}
+
+// createCustomSharePermission handles the dual-writes for creating a new custom share permission.
+func createCustomSharePermission(sess *gocql.Session, permID, userID, name, description, permissionJSON string, createdAt time.Time) error {
+	batch := sess.Batch(gocql.LoggedBatch)
+	batch.Query(`
+		INSERT INTO custom_share_permissions (permission_id, creator_id, name, description, permission_json, created_at)
+		VALUES (?, ?, ?, ?, ?, ?)
+	`, permID, userID, name, description, permissionJSON, createdAt)
+	batch.Query(`
+		INSERT INTO custom_share_permissions_by_user (creator_id, permission_id, name, description, permission_json, created_at)
+		VALUES (?, ?, ?, ?, ?, ?)
+	`, userID, permID, name, description, permissionJSON, createdAt)
+	return batch.Exec()
+}
+
+// updateCustomSharePermission handles the dual-writes for updating a custom share permission.
+func updateCustomSharePermission(sess *gocql.Session, permID, userID, name, description, permissionJSON string) error {
+	batch := sess.Batch(gocql.LoggedBatch)
+	batch.Query(`
+		UPDATE custom_share_permissions SET name = ?, description = ?, permission_json = ? WHERE permission_id = ?
+	`, name, description, permissionJSON, permID)
+	batch.Query(`
+		UPDATE custom_share_permissions_by_user SET name = ?, description = ?, permission_json = ? WHERE creator_id = ? AND permission_id = ?
+	`, name, description, permissionJSON, userID, permID)
+	return batch.Exec()
+}
+
+// deleteCustomSharePermission handles the dual-writes for deleting a custom share permission.
+func deleteCustomSharePermission(sess *gocql.Session, permID, userID string) error {
+	batch := sess.Batch(gocql.LoggedBatch)
+	batch.Query(`DELETE FROM custom_share_permissions WHERE permission_id = ?`, permID)
+	batch.Query(`DELETE FROM custom_share_permissions_by_user WHERE creator_id = ? AND permission_id = ?`, userID, permID)
+	return batch.Exec()
+}
+
+// createRepoTag creates a new repository tag in the database and updates the counter.
+func createRepoTag(sess *gocql.Session, repoID gocql.UUID, name, color string, createdAt time.Time) (int, error) {
+	var tagID int = 1
+	err := sess.Query(`
+		SELECT next_tag_id FROM repo_tag_counters WHERE repo_id = ?
+	`, repoID).Scan(&tagID)
+
+	if err != nil {
+		tagID = 1
+		err = sess.Query(`
+			INSERT INTO repo_tag_counters (repo_id, next_tag_id) VALUES (?, ?)
+		`, repoID, 2).Exec()
+		if err != nil {
+			return 0, fmt.Errorf("failed to initialize tag counter: %w", err)
+		}
+	} else {
+		err = sess.Query(`
+			UPDATE repo_tag_counters SET next_tag_id = ? WHERE repo_id = ?
+		`, tagID+1, repoID).Exec()
+		if err != nil {
+			return 0, fmt.Errorf("failed to update tag counter: %w", err)
+		}
+	}
+
+	err = sess.Query(`
+		INSERT INTO repo_tags (repo_id, tag_id, name, color, created_at)
+		VALUES (?, ?, ?, ?, ?)
+	`, repoID, tagID, name, color, createdAt).Exec()
+	if err != nil {
+		return 0, fmt.Errorf("failed to create tag: %w", err)
+	}
+
+	return tagID, nil
+}
+
+// updateRepoTag updates the name and color of an existing repository tag.
+func updateRepoTag(sess *gocql.Session, repoID gocql.UUID, tagID int, name, color string) error {
+	return sess.Query(`
+		UPDATE repo_tags SET name = ?, color = ? WHERE repo_id = ? AND tag_id = ?
+	`, name, color, repoID, tagID).Exec()
+}
+
+// deleteRepoTag deletes a repository tag and all its file_tags associations, cleaning counters.
+func deleteRepoTag(sess *gocql.Session, repoID gocql.UUID, tagID int) error {
+	iter := sess.Query(`
+		SELECT file_path, file_tag_id FROM file_tags WHERE repo_id = ? AND tag_id = ? ALLOW FILTERING
+	`, repoID, tagID).Iter()
+
+	var filePath string
+	var fileTagID int
+	batch := sess.Batch(gocql.LoggedBatch)
+
+	batch.Query(`
+		DELETE FROM repo_tags WHERE repo_id = ? AND tag_id = ?
+	`, repoID, tagID)
+
+	for iter.Scan(&filePath, &fileTagID) {
+		batch.Query(`
+			DELETE FROM file_tags WHERE repo_id = ? AND file_path = ? AND tag_id = ?
+		`, repoID, filePath, tagID)
+		batch.Query(`
+			DELETE FROM file_tags_by_id WHERE repo_id = ? AND file_tag_id = ?
+		`, repoID, fileTagID)
+	}
+	iter.Close()
+
+	if err := batch.Exec(); err != nil {
+		return fmt.Errorf("failed to delete tag: %w", err)
+	}
+
+	if err := sess.Query(`
+		DELETE FROM repo_tag_file_counts WHERE repo_id = ? AND tag_id = ?
+	`, repoID, tagID).Exec(); err != nil {
+		log.Printf("[DeleteRepoTag] failed to clean repo_tag_file_counts for repo %s tag %d: %v", repoID.String(), tagID, err)
+	}
+
+	return nil
+}
+
+// addFileTag adds a file tag mapping and increments the tag's file usage counter.
+func addFileTag(sess *gocql.Session, repoID gocql.UUID, filePath string, repoTagID, fileTagID int, createdAt time.Time) error {
+	batch := sess.Batch(gocql.LoggedBatch)
+	batch.Query(`
+		INSERT INTO file_tags (repo_id, file_path, tag_id, file_tag_id, created_at)
+		VALUES (?, ?, ?, ?, ?)
+	`, repoID, filePath, repoTagID, fileTagID, createdAt)
+	batch.Query(`
+		INSERT INTO file_tags_by_id (repo_id, file_tag_id, file_path, tag_id, created_at)
+		VALUES (?, ?, ?, ?, ?)
+	`, repoID, fileTagID, filePath, repoTagID, createdAt)
+
+	if err := batch.Exec(); err != nil {
+		return fmt.Errorf("failed to add file tag: %w", err)
+	}
+
+	if err := sess.Query(`
+		UPDATE repo_tag_file_counts SET file_count = file_count + 1
+		WHERE repo_id = ? AND tag_id = ?
+	`, repoID, repoTagID).Exec(); err != nil {
+		log.Printf("[AddFileTag] failed to increment repo_tag_file_counts for repo %s tag %d: %v", repoID.String(), repoTagID, err)
+	}
+	return nil
+}
+
+// removeFileTag removes a file tag mapping and decrements the tag's file usage counter.
+func removeFileTag(sess *gocql.Session, repoID gocql.UUID, fileTagID int) error {
+	var filePath string
+	var tagID int
+	if err := sess.Query(`
+		SELECT file_path, tag_id FROM file_tags_by_id WHERE repo_id = ? AND file_tag_id = ?
+	`, repoID, fileTagID).Scan(&filePath, &tagID); err != nil {
+		return fmt.Errorf("%w: %v", errFileTagNotFound, err)
+	}
+
+	batch := sess.Batch(gocql.LoggedBatch)
+	batch.Query(`
+		DELETE FROM file_tags WHERE repo_id = ? AND file_path = ? AND tag_id = ?
+	`, repoID, filePath, tagID)
+	batch.Query(`
+		DELETE FROM file_tags_by_id WHERE repo_id = ? AND file_tag_id = ?
+	`, repoID, fileTagID)
+
+	if err := batch.Exec(); err != nil {
+		return fmt.Errorf("failed to remove file tag: %w", err)
+	}
+
+	if err := sess.Query(`
+		UPDATE repo_tag_file_counts SET file_count = file_count - 1
+		WHERE repo_id = ? AND tag_id = ?
+	`, repoID, tagID).Exec(); err != nil {
+		log.Printf("[RemoveFileTag] failed to decrement repo_tag_file_counts for repo %s tag %d: %v", repoID.String(), tagID, err)
+	}
+	return nil
+}
+
+// starFile adds a file to the user's starred files list.
+func starFile(sess *gocql.Session, userID, repoID, path string, starredAt time.Time) error {
+	return sess.Query(`
+		INSERT INTO starred_files (user_id, repo_id, path, starred_at)
+		VALUES (?, ?, ?, ?)
+	`, userID, repoID, path, starredAt).Exec()
+}
+
+// unstarFile removes a file from the user's starred files list.
+func unstarFile(sess *gocql.Session, userID, repoID, path string) error {
+	return sess.Query(`
+		DELETE FROM starred_files WHERE user_id = ? AND repo_id = ? AND path = ?
+	`, userID, repoID, path).Exec()
 }

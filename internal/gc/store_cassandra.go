@@ -189,11 +189,24 @@ func (s *CassandraStore) CompleteItem(orgID uuid.UUID, queuedAt time.Time, itemT
 	return nil
 }
 
-func (s *CassandraStore) UpdateRetryCount(orgID uuid.UUID, queuedAt time.Time, itemType ItemType, itemID string, retryCount int) error {
-	return s.db.Session().Query(`
-		UPDATE gc_queue SET retry_count = ?
+// RequeueItem moves a failed item to the back of the queue to prevent head-of-line blocking.
+// It deletes the old queue record and inserts a new one with a new queued_at timestamp and incremented retry count.
+func (s *CassandraStore) RequeueItem(orgID uuid.UUID, oldQueuedAt, newQueuedAt time.Time, itemType ItemType, itemID string, libraryID uuid.UUID, storageClass string, newRetryCount int) error {
+	batch := s.db.Session().Batch(gocql.LoggedBatch)
+	
+	// Delete old item
+	batch.Query(`
+		DELETE FROM gc_queue
 		WHERE org_id = ? AND queued_at = ? AND item_type = ? AND item_id = ?
-	`, retryCount, orgID.String(), queuedAt, string(itemType), itemID).Exec()
+	`, orgID.String(), oldQueuedAt, string(itemType), itemID)
+	
+	// Insert new item at the end of the queue
+	batch.Query(`
+		INSERT INTO gc_queue (org_id, queued_at, item_type, item_id, library_id, storage_class, retry_count)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+	`, orgID.String(), newQueuedAt, string(itemType), itemID, libraryID.String(), storageClass, newRetryCount)
+	
+	return batch.Exec()
 }
 
 func (s *CassandraStore) GetQueueSize(orgID uuid.UUID) (int, error) {

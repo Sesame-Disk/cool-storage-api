@@ -570,40 +570,49 @@ func (h *FSHelper) markBlockMutationProcessed(operationKey string) (bool, error)
 }
 
 func (h *FSHelper) IncrementOrCreateBlock(orgID, blockID string, sizeBytes int, storageClass, storageKey string) error {
-	now := time.Now()
-	applied, err := h.db.Session().Query(`
-		UPDATE blocks SET ref_count = ref_count + 1, last_accessed = ?
-		WHERE org_id = ? AND block_id = ? IF EXISTS
-	`, now, orgID, blockID).MapScanCAS(map[string]interface{}{})
-	if err != nil {
-		return err
-	}
-	if applied {
-		return nil
+	const maxRetries = 5
+
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		now := time.Now()
+
+		// 1. Try to increment existing block using LWT (non-counter column requires Read-Update cycle)
+		var currentRefCount int
+		err := h.db.Session().Query(`
+			SELECT ref_count FROM blocks WHERE org_id = ? AND block_id = ?
+		`, orgID, blockID).Scan(&currentRefCount)
+
+		if err == nil {
+			// Block exists, increment it
+			applied, err := h.db.Session().Query(`
+				UPDATE blocks SET ref_count = ?, last_accessed = ?
+				WHERE org_id = ? AND block_id = ? IF ref_count = ?
+			`, currentRefCount+1, now, orgID, blockID, currentRefCount).MapScanCAS(map[string]interface{}{})
+			if err != nil {
+				return err
+			}
+			if applied {
+				return nil
+			}
+			// Race condition: someone else updated ref_count, retry
+			continue
+		}
+
+		// 2. Block doesn't exist, try to insert it
+		applied, err := h.db.Session().Query(`
+			INSERT INTO blocks (org_id, block_id, size_bytes, storage_class, storage_key, ref_count, created_at, last_accessed)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?) IF NOT EXISTS
+		`, orgID, blockID, sizeBytes, storageClass, storageKey, 1, now, now).MapScanCAS(map[string]interface{}{})
+		if err != nil {
+			return err
+		}
+		if applied {
+			return nil
+		}
+
+		// 3. Race condition: someone inserted it concurrently, retry increment
 	}
 
-	applied, err = h.db.Session().Query(`
-		INSERT INTO blocks (org_id, block_id, size_bytes, storage_class, storage_key, ref_count, created_at, last_accessed)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?) IF NOT EXISTS
-	`, orgID, blockID, sizeBytes, storageClass, storageKey, 1, now, now).MapScanCAS(map[string]interface{}{})
-	if err != nil {
-		return err
-	}
-	if applied {
-		return nil
-	}
-
-	applied, err = h.db.Session().Query(`
-		UPDATE blocks SET ref_count = ref_count + 1, last_accessed = ?
-		WHERE org_id = ? AND block_id = ? IF EXISTS
-	`, now, orgID, blockID).MapScanCAS(map[string]interface{}{})
-	if err != nil {
-		return err
-	}
-	if !applied {
-		return fmt.Errorf("failed to increment block %s after concurrent insert", blockID)
-	}
-	return nil
+	return fmt.Errorf("failed to increment/create block %s after %d retries (persistent contention)", blockID, maxRetries)
 }
 
 // collectDirStats recursively collects block IDs, total size in bytes, and file count
@@ -655,34 +664,60 @@ func (h *FSHelper) DecrementBlockRefCountsOnce(orgID, operationKey string, block
 		return nil
 	}
 	if !applied {
+		log.Printf("[DecrementBlockRefCountsOnce] INFO: skipping already processed operation %q", operationKey)
 		return nil
 	}
 
 	resolvedBlockIDs := h.resolveStoredBlockIDs(orgID, blockIDs)
 	var zeroRefBlocks []string
 	for _, blockID := range resolvedBlockIDs {
-		now := time.Now()
-		hitZero, err := h.db.Session().Query(`
-			UPDATE blocks SET ref_count = 0, last_accessed = ?
-			WHERE org_id = ? AND block_id = ? IF ref_count = 1
-		`, now, orgID, blockID).MapScanCAS(map[string]interface{}{})
-		if err != nil {
-			continue
-		}
+		hitZero := h.decrementBlockRefCount(orgID, blockID)
 		if hitZero {
 			zeroRefBlocks = append(zeroRefBlocks, blockID)
-			continue
-		}
-
-		_, err = h.db.Session().Query(`
-			UPDATE blocks SET ref_count = ref_count - 1, last_accessed = ?
-			WHERE org_id = ? AND block_id = ? IF ref_count > 1
-		`, now, orgID, blockID).MapScanCAS(map[string]interface{}{})
-		if err != nil {
-			continue
 		}
 	}
 	return zeroRefBlocks
+}
+
+// decrementBlockRefCount performs a single block's ref_count decrement with LWT
+// and retries on CAS failure to guarantee the decrement is never silently lost.
+// Returns true if the block reached zero refs (eligible for GC).
+func (h *FSHelper) decrementBlockRefCount(orgID, blockID string) bool {
+	const maxRetries = 5
+
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		now := time.Now()
+
+		var currentRefCount int
+		err := h.db.Session().Query(`
+			SELECT ref_count FROM blocks WHERE org_id = ? AND block_id = ?
+		`, orgID, blockID).Scan(&currentRefCount)
+		if err != nil {
+			log.Printf("[decrementBlockRefCount] block %s (org=%s) not found, skipping", blockID, orgID)
+			return false
+		}
+
+		if currentRefCount <= 0 {
+			return true
+		}
+
+		newRefCount := currentRefCount - 1
+		applied, err := h.db.Session().Query(`
+			UPDATE blocks SET ref_count = ?, last_accessed = ?
+			WHERE org_id = ? AND block_id = ? IF ref_count = ?
+		`, newRefCount, now, orgID, blockID, currentRefCount).MapScanCAS(map[string]interface{}{})
+		if err != nil {
+			log.Printf("[decrementBlockRefCount] ERROR: block %s (org=%s): %v", blockID, orgID, err)
+			return false
+		}
+		if applied {
+			return newRefCount == 0
+		}
+		// CAS failed — ref_count changed concurrently, retry
+	}
+
+	log.Printf("[decrementBlockRefCount] ERROR: block %s (org=%s) failed after %d retries (persistent contention)", blockID, orgID, maxRetries)
+	return false
 }
 
 // CopyFSObjectToLibrary recursively copies an fs_object (file or directory) from

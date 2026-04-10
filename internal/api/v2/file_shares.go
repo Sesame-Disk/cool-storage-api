@@ -10,7 +10,6 @@ import (
 
 	"github.com/Sesame-Disk/sesamefs/internal/db"
 	"github.com/Sesame-Disk/sesamefs/internal/middleware"
-	gocql "github.com/apache/cassandra-gocql-driver/v2"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 )
@@ -1082,17 +1081,7 @@ func (h *FileShareHandler) CreateCustomSharePermission(c *gin.Context) {
 	now := time.Now()
 
 	// Dual-write: main table + by-user lookup
-	batch := h.db.Session().Batch(gocql.LoggedBatch)
-	batch.Query(`
-		INSERT INTO custom_share_permissions (permission_id, creator_id, name, description, permission_json, created_at)
-		VALUES (?, ?, ?, ?, ?, ?)
-	`, permID.String(), userID, body.Name, body.Description, body.Permission, now)
-	batch.Query(`
-		INSERT INTO custom_share_permissions_by_user (creator_id, permission_id, name, description, permission_json, created_at)
-		VALUES (?, ?, ?, ?, ?, ?)
-	`, userID, permID.String(), body.Name, body.Description, body.Permission, now)
-
-	if err := batch.Exec(); err != nil {
+	if err := createCustomSharePermission(h.db.Session(), permID.String(), userID, body.Name, body.Description, body.Permission, now); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create custom permission"})
 		return
 	}
@@ -1153,15 +1142,7 @@ func (h *FileShareHandler) UpdateCustomSharePermission(c *gin.Context) {
 	}
 
 	// Dual-write update
-	batch := h.db.Session().Batch(gocql.LoggedBatch)
-	batch.Query(`
-		UPDATE custom_share_permissions SET name = ?, description = ?, permission_json = ? WHERE permission_id = ?
-	`, body.Name, body.Description, body.Permission, permID)
-	batch.Query(`
-		UPDATE custom_share_permissions_by_user SET name = ?, description = ?, permission_json = ? WHERE creator_id = ? AND permission_id = ?
-	`, body.Name, body.Description, body.Permission, userID, permID)
-
-	if err := batch.Exec(); err != nil {
+	if err := updateCustomSharePermission(h.db.Session(), permID, userID, body.Name, body.Description, body.Permission); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update custom permission"})
 		return
 	}
@@ -1201,11 +1182,7 @@ func (h *FileShareHandler) DeleteCustomSharePermission(c *gin.Context) {
 	}
 
 	// Dual-write delete
-	batch := h.db.Session().Batch(gocql.LoggedBatch)
-	batch.Query(`DELETE FROM custom_share_permissions WHERE permission_id = ?`, permID)
-	batch.Query(`DELETE FROM custom_share_permissions_by_user WHERE creator_id = ? AND permission_id = ?`, userID, permID)
-
-	if err := batch.Exec(); err != nil {
+	if err := deleteCustomSharePermission(h.db.Session(), permID, userID); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete custom permission"})
 		return
 	}

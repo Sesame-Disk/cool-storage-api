@@ -274,3 +274,169 @@ func TestCrossLibraryBatchCopyIncrementsBlockRefCount(t *testing.T) {
 		t.Fatalf("ref_count after cross-library batch copy = %d, want 2", refCount)
 	}
 }
+
+// TestCrossLibraryBatchCopy_DeleteSourceBlockSurvives verifies that after a
+// cross-library batch copy, deleting the source file decrements ref_count to 1
+// (not 0), so the block remains accessible in the destination library and will
+// NOT be garbage-collected.
+func TestCrossLibraryBatchCopy_DeleteSourceBlockSurvives(t *testing.T) {
+	srcName := fmt.Sprintf("inttest-copydel-src-%d", time.Now().UnixNano())
+	dstName := fmt.Sprintf("inttest-copydel-dst-%d", time.Now().UnixNano())
+	srcRepoID := createTestLibrary(t, adminClient, srcName)
+	dstRepoID := createTestLibrary(t, adminClient, dstName)
+
+	fileName := "survive-gc-test.txt"
+	fileContent := fmt.Sprintf("survive-gc-content-%d\n", time.Now().UnixNano())
+
+	// 1. Upload file to source library.
+	uploadLinkResp := adminClient.Get(t, fmt.Sprintf("/api2/repos/%s/upload-link/?p=/", srcRepoID))
+	expectStatus(t, uploadLinkResp, http.StatusOK)
+	uploadURL := strings.Trim(responseBody(t, uploadLinkResp), "\" \n\r")
+	uploadFileThroughLink(t, adminClient, uploadURL, fileName, "/", fileContent)
+
+	// 2. Cross-library batch copy: src → dst.
+	copyBody := map[string]interface{}{
+		"src_repo_id":     srcRepoID,
+		"dst_repo_id":     dstRepoID,
+		"src_parent_dir":  "/",
+		"dst_parent_dir":  "/",
+		"src_dirents":     []string{fileName},
+		"conflict_policy": "autorename",
+	}
+	taskResp := adminClient.PostJSON(t, "/api/v2.1/repos/async-batch-copy-item/", copyBody)
+	expectStatus(t, taskResp, http.StatusOK)
+	taskResult := responseJSON(t, taskResp)
+	taskID, _ := taskResult["task_id"].(string)
+	if taskID == "" {
+		t.Fatal("async-batch-copy-item response missing task_id")
+	}
+
+	// Wait for copy task to complete.
+	deadline := time.Now().Add(10 * time.Second)
+	done := false
+	for time.Now().Before(deadline) {
+		progress := responseJSON(t, adminClient.Get(t, "/api/v2.1/query-copy-move-progress/?task_id="+taskID))
+		if d, _ := progress["done"].(bool); d {
+			done = true
+			break
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	if !done {
+		t.Fatal("async batch copy task did not complete within 10 s")
+	}
+
+	// 3. Verify ref_count = 2 after copy.
+	session := shareProjectionDBForTest(t).Session()
+	var orgID string
+	if err := session.Query(`SELECT org_id FROM libraries_by_id WHERE library_id = ?`, srcRepoID).Scan(&orgID); err != nil {
+		t.Fatalf("failed to resolve org_id: %v", err)
+	}
+	hash := sha256.Sum256([]byte(fileContent))
+	blockID := hex.EncodeToString(hash[:])
+
+	var refCount int
+	if err := session.Query(`SELECT ref_count FROM blocks WHERE org_id = ? AND block_id = ?`, orgID, blockID).Scan(&refCount); err != nil {
+		t.Fatalf("failed to read block ref_count: %v", err)
+	}
+	if refCount != 2 {
+		t.Fatalf("ref_count after copy = %d, want 2", refCount)
+	}
+
+	// 4. Delete the source file.
+	delResp := adminClient.Delete(t, fmt.Sprintf("/api2/repos/%s/file/?p=/%s", srcRepoID, fileName))
+	expectStatus(t, delResp, http.StatusOK)
+	delResp.Body.Close()
+
+	// 5. Wait for the async decrement goroutine to complete (DecrementBlockRefCountsOnce).
+	deadline = time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if err := session.Query(`SELECT ref_count FROM blocks WHERE org_id = ? AND block_id = ?`, orgID, blockID).Scan(&refCount); err != nil {
+			t.Fatalf("failed to read block ref_count after delete: %v", err)
+		}
+		if refCount == 1 {
+			break
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	if refCount != 1 {
+		t.Fatalf("ref_count after deleting source file = %d, want 1 (block should survive for dst)", refCount)
+	}
+
+	// 6. Verify file is still accessible in destination library.
+	listResp := adminClient.Get(t, fmt.Sprintf("/api/v2.1/repos/%s/dir/?p=/", dstRepoID))
+	expectStatus(t, listResp, http.StatusOK)
+	listResult := responseJSON(t, listResp)
+	dstEntries, _ := listResult["dirent_list"].([]interface{})
+	if !containsEntry(dstEntries, "name", fileName) {
+		t.Fatalf("file %q not found in dstRepo after source deletion", fileName)
+	}
+
+	// 7. Verify the file is downloadable from the destination.
+	dlResp := adminClient.Get(t, fmt.Sprintf("/api2/repos/%s/file/?p=/%s", dstRepoID, fileName))
+	if dlResp.StatusCode != http.StatusOK {
+		t.Fatalf("download link for dst file returned %d, want 200", dlResp.StatusCode)
+	}
+	dlResp.Body.Close()
+}
+
+// TestBatchDeleteItems_DecrementsBlockRefCount verifies that deleting via the new
+// batch operation properly initiates the Garbage Collector flow by decrementing
+// the block's ref_count to 0. (Preventing storage leaks).
+func TestBatchDeleteItems_DecrementsBlockRefCount(t *testing.T) {
+	name := fmt.Sprintf("inttest-batchdel-gc-%d", time.Now().UnixNano())
+	repoID := createTestLibrary(t, adminClient, name)
+
+	fileName := "batch-del-gc-test.txt"
+	fileContent := fmt.Sprintf("batch-del-gc-content-%d\n", time.Now().UnixNano())
+
+	// 1. Upload file
+	uploadLinkResp := adminClient.Get(t, fmt.Sprintf("/api2/repos/%s/upload-link/?p=/", repoID))
+	expectStatus(t, uploadLinkResp, http.StatusOK)
+	uploadURL := strings.Trim(responseBody(t, uploadLinkResp), "\" \n\r")
+	uploadFileThroughLink(t, adminClient, uploadURL, fileName, "/", fileContent)
+
+	session := shareProjectionDBForTest(t).Session()
+	var orgID string
+	if err := session.Query(`SELECT org_id FROM libraries_by_id WHERE library_id = ?`, repoID).Scan(&orgID); err != nil {
+		t.Fatalf("failed to resolve org_id: %v", err)
+	}
+
+	hash := sha256.Sum256([]byte(fileContent))
+	blockID := hex.EncodeToString(hash[:])
+
+	// Verify ref_count is 1
+	var refCount int
+	if err := session.Query(`SELECT ref_count FROM blocks WHERE org_id = ? AND block_id = ?`, orgID, blockID).Scan(&refCount); err != nil {
+		t.Fatalf("failed to read block ref_count: %v", err)
+	}
+	if refCount != 1 {
+		t.Fatalf("ref_count before batch delete = %d, want 1", refCount)
+	}
+
+	// 2. Batch Delete the file
+	delBody := map[string]interface{}{
+		"repo_id":    repoID,
+		"parent_dir": "/",
+		"dirents":    []string{fileName},
+	}
+	delResp := adminClient.DeleteJSON(t, "/api/v2.1/repos/batch-delete-item/", delBody)
+	expectStatus(t, delResp, http.StatusOK)
+	delResp.Body.Close()
+
+	// 3. Wait for the async ref_count decrement goroutine
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if err := session.Query(`SELECT ref_count FROM blocks WHERE org_id = ? AND block_id = ?`, orgID, blockID).Scan(&refCount); err != nil {
+			t.Fatalf("failed to read block ref_count after delete: %v", err)
+		}
+		if refCount <= 0 {
+			break
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	if refCount > 0 {
+		t.Fatalf("ref_count after batch deletion = %d, want 0 (so GC can collect it) - possible storage leak", refCount)
+	}
+}
+

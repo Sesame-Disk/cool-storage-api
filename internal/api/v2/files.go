@@ -1307,7 +1307,7 @@ func (h *FileHandler) DeleteDirectory(c *gin.Context) {
 
 	c.JSON(http.StatusOK, gin.H{
 		"success":   true,
-		"commit_id": headCommitID,
+		"commit_id": newCommitID,
 	})
 }
 
@@ -1937,7 +1937,7 @@ func (h *FileHandler) DeleteFile(c *gin.Context) {
 
 	c.JSON(http.StatusOK, gin.H{
 		"success":   true,
-		"commit_id": headCommitID,
+		"commit_id": newCommitID,
 	})
 }
 
@@ -4444,6 +4444,9 @@ func (h *FileHandler) BatchDeleteItems(c *gin.Context) {
 		return
 	}
 
+	// Lookup library storage class before the async operation
+	libraryClass := h.lookupLibraryStorageClass(orgID, req.RepoID)
+
 	// Traverse to parent directory
 	result, err := fsHelper.TraverseToPath(req.RepoID, parentDir)
 	if err != nil {
@@ -4549,25 +4552,42 @@ func (h *FileHandler) BatchDeleteItems(c *gin.Context) {
 
 	// Clean up file tags and decrement storage counters for all deleted items (async, non-blocking)
 	go func() {
+		var allDeletedBlockIDs []string
+
 		for _, entry := range deletedEntries {
 			deletedPath := path.Join(parentDir, entry.Name)
-			h.cleanupFileTagsForPath(req.RepoID, deletedPath)
-
-			// Decrement storage counters per deleted entry.
+			
+			// Clean up tags
 			if entry.Mode == ModeDir || entry.Mode&0170000 == 040000 {
-				_, totalSize, fileCount, err := fsHelper.collectDirStats(req.RepoID, entry.ID)
-				if err == nil && totalSize > 0 {
+				h.cleanupFileTagsForPrefix(req.RepoID, deletedPath)
+			} else {
+				h.cleanupFileTagsForPath(req.RepoID, deletedPath)
+			}
+
+			// Collect stats and block IDs
+			blocks, totalSize, fileCount, err := fsHelper.collectDirStats(req.RepoID, entry.ID)
+			if err == nil {
+				if len(blocks) > 0 {
+					allDeletedBlockIDs = append(allDeletedBlockIDs, blocks...)
+				}
+				if totalSize > 0 || fileCount > 0 {
 					traffic.DecrementStorageCounters(h.db, orgID, userID, req.RepoID, totalSize, fileCount)
 				}
-			} else if entry.Size > 0 {
-				traffic.DecrementStorageCounters(h.db, orgID, userID, req.RepoID, entry.Size, 1)
+			}
+		}
+
+		// Enqueue blocks to Garbage Collector
+		if len(allDeletedBlockIDs) > 0 {
+			zeroRefBlocks := fsHelper.DecrementBlockRefCountsOnce(orgID, newCommitID, allDeletedBlockIDs)
+			if len(zeroRefBlocks) > 0 && h.gcEnqueuer != nil {
+				h.gcEnqueuer.EnqueueBlocks(orgID, zeroRefBlocks, libraryClass)
 			}
 		}
 	}()
 
 	c.JSON(http.StatusOK, gin.H{
 		"success":   true,
-		"commit_id": headCommitID,
+		"commit_id": newCommitID,
 	})
 }
 

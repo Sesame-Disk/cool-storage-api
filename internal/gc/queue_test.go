@@ -160,7 +160,7 @@ func TestQueue_IncrementRetry(t *testing.T) {
 	}
 
 	// Increment retry
-	err = q.IncrementRetry(orgID, items[0].QueuedAt, items[0].ItemType, items[0].ItemID, 0)
+	err = q.IncrementRetry(items[0])
 	if err != nil {
 		t.Fatalf("IncrementRetry failed: %v", err)
 	}
@@ -175,7 +175,7 @@ func TestQueue_IncrementRetry(t *testing.T) {
 	}
 
 	// Increment again
-	q.IncrementRetry(orgID, items[0].QueuedAt, items[0].ItemType, items[0].ItemID, 1)
+	q.IncrementRetry(items[0])
 	items, _ = q.DequeueBatch(orgID, 10, 0)
 	if items[0].RetryCount != 2 {
 		t.Errorf("RetryCount = %d after 2nd increment, want 2", items[0].RetryCount)

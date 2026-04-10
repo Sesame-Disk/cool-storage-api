@@ -1,6 +1,7 @@
 package v2
 
 import (
+	"errors"
 	"log"
 	"net/http"
 	"strconv"
@@ -147,38 +148,7 @@ func (h *TagHandler) CreateRepoTag(c *gin.Context) {
 			return
 		}
 
-		// Get current tag ID counter
-		err = h.db.Session().Query(`
-			SELECT next_tag_id FROM repo_tag_counters WHERE repo_id = ?
-		`, repoUUID).Scan(&tagID)
-
-		if err != nil {
-			// Counter doesn't exist, create it with initial value 1
-			tagID = 1
-			err = h.db.Session().Query(`
-				INSERT INTO repo_tag_counters (repo_id, next_tag_id) VALUES (?, ?)
-			`, repoUUID, 2).Exec()
-			if err != nil {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to initialize tag counter"})
-				return
-			}
-		} else {
-			// Counter exists, increment it
-			err = h.db.Session().Query(`
-				UPDATE repo_tag_counters SET next_tag_id = ? WHERE repo_id = ?
-			`, tagID+1, repoUUID).Exec()
-			if err != nil {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update tag counter"})
-				return
-			}
-		}
-
-		// Create the tag
-		err = h.db.Session().Query(`
-			INSERT INTO repo_tags (repo_id, tag_id, name, color, created_at)
-			VALUES (?, ?, ?, ?, ?)
-		`, repoUUID, tagID, req.Name, req.Color, time.Now()).Exec()
-
+		tagID, err = createRepoTag(h.db.Session(), repoUUID, req.Name, req.Color, time.Now())
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create tag"})
 			return
@@ -220,9 +190,7 @@ func (h *TagHandler) UpdateRepoTag(c *gin.Context) {
 			return
 		}
 
-		err = h.db.Session().Query(`
-			UPDATE repo_tags SET name = ?, color = ? WHERE repo_id = ? AND tag_id = ?
-		`, req.Name, req.Color, repoUUID, tagID).Exec()
+		err = updateRepoTag(h.db.Session(), repoUUID, tagID, req.Name, req.Color)
 
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update tag"})
@@ -259,43 +227,9 @@ func (h *TagHandler) DeleteRepoTag(c *gin.Context) {
 			return
 		}
 
-		// First, find all file_tags with this tag_id (need file_path for full primary key)
-		iter := h.db.Session().Query(`
-			SELECT file_path, file_tag_id FROM file_tags WHERE repo_id = ? AND tag_id = ? ALLOW FILTERING
-		`, repoUUID, tagID).Iter()
-
-		var filePath string
-		var fileTagID int
-		batch := h.db.Session().Batch(gocql.LoggedBatch)
-
-		// Delete the repo tag itself
-		batch.Query(`
-			DELETE FROM repo_tags WHERE repo_id = ? AND tag_id = ?
-		`, repoUUID, tagID)
-
-		for iter.Scan(&filePath, &fileTagID) {
-			// Delete from file_tags with full primary key
-			batch.Query(`
-				DELETE FROM file_tags WHERE repo_id = ? AND file_path = ? AND tag_id = ?
-			`, repoUUID, filePath, tagID)
-			// Delete from lookup table
-			batch.Query(`
-				DELETE FROM file_tags_by_id WHERE repo_id = ? AND file_tag_id = ?
-			`, repoUUID, fileTagID)
-		}
-		iter.Close()
-
-		err = batch.Exec()
-		if err != nil {
+		if err := deleteRepoTag(h.db.Session(), repoUUID, tagID); err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete tag"})
 			return
-		}
-
-		// Counter updates must be separate from non-counter operations in Cassandra
-		if err := h.db.Session().Query(`
-			DELETE FROM repo_tag_file_counts WHERE repo_id = ? AND tag_id = ?
-		`, repoUUID, tagID).Exec(); err != nil {
-			log.Printf("[DeleteRepoTag] failed to clean repo_tag_file_counts for repo %s tag %d: %v", repoID, tagID, err)
 		}
 	}
 
@@ -464,35 +398,9 @@ func (h *TagHandler) AddFileTag(c *gin.Context) {
 
 		now := time.Now()
 
-		// Use batch for non-counter inserts
-		batch := h.db.Session().Batch(gocql.LoggedBatch)
-
-		// Add file tag to main table (includes file_tag_id for efficient lookups)
-		batch.Query(`
-			INSERT INTO file_tags (repo_id, file_path, tag_id, file_tag_id, created_at)
-			VALUES (?, ?, ?, ?, ?)
-		`, repoUUID, filePath, repoTagID, fileTagID, now)
-
-		// Add to lookup table with unique file_tag_id
-		batch.Query(`
-			INSERT INTO file_tags_by_id (repo_id, file_tag_id, file_path, tag_id, created_at)
-			VALUES (?, ?, ?, ?, ?)
-		`, repoUUID, fileTagID, filePath, repoTagID, now)
-
-		err = batch.Exec()
-		if err != nil {
+		if err := addFileTag(h.db.Session(), repoUUID, filePath, repoTagID, fileTagID, now); err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to add file tag"})
 			return
-		}
-
-		// Counter updates must be separate from non-counter operations in Cassandra
-		// Use an unlogged batch or individual query
-		err = h.db.Session().Query(`
-			UPDATE repo_tag_file_counts SET file_count = file_count + 1
-			WHERE repo_id = ? AND tag_id = ?
-		`, repoUUID, repoTagID).Exec()
-		if err != nil {
-			log.Printf("[AddFileTag] failed to increment repo_tag_file_counts for repo %s tag %d: %v", repoID, repoTagID, err)
 		}
 	} else {
 		tagName = "Tag"
@@ -528,42 +436,13 @@ func (h *TagHandler) RemoveFileTag(c *gin.Context) {
 			return
 		}
 
-		// Look up the file_tag by ID to get file_path and tag_id
-		var filePath string
-		var tagID int
-		err = h.db.Session().Query(`
-			SELECT file_path, tag_id FROM file_tags_by_id WHERE repo_id = ? AND file_tag_id = ?
-		`, repoUUID, fileTagID).Scan(&filePath, &tagID)
-
-		if err != nil {
-			c.JSON(http.StatusNotFound, gin.H{"error": "file tag not found"})
+		if err := removeFileTag(h.db.Session(), repoUUID, fileTagID); err != nil {
+			if errors.Is(err, errFileTagNotFound) {
+				c.JSON(http.StatusNotFound, gin.H{"error": "file tag not found"})
+			} else {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to remove file tag"})
+			}
 			return
-		}
-
-		// Delete from both tables
-		batch := h.db.Session().Batch(gocql.LoggedBatch)
-
-		batch.Query(`
-			DELETE FROM file_tags WHERE repo_id = ? AND file_path = ? AND tag_id = ?
-		`, repoUUID, filePath, tagID)
-
-		batch.Query(`
-			DELETE FROM file_tags_by_id WHERE repo_id = ? AND file_tag_id = ?
-		`, repoUUID, fileTagID)
-
-		err = batch.Exec()
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to remove file tag"})
-			return
-		}
-
-		// Counter updates must be separate from non-counter operations in Cassandra
-		err = h.db.Session().Query(`
-			UPDATE repo_tag_file_counts SET file_count = file_count - 1
-			WHERE repo_id = ? AND tag_id = ?
-		`, repoUUID, tagID).Exec()
-		if err != nil {
-			log.Printf("[RemoveFileTag] failed to decrement repo_tag_file_counts for repo %s tag %d: %v", repoID, tagID, err)
 		}
 	}
 

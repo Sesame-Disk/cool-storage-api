@@ -225,10 +225,7 @@ func (h *StarredHandler) StarFile(c *gin.Context) {
 
 	// Insert starred file
 	now := time.Now()
-	err = h.db.Session().Query(`
-		INSERT INTO starred_files (user_id, repo_id, path, starred_at)
-		VALUES (?, ?, ?, ?)
-	`, userID, req.RepoID, filePath, now).Exec()
+	err = starFile(h.db.Session(), userID, req.RepoID, filePath, now)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to star file"})
 		return
@@ -311,9 +308,7 @@ func (h *StarredHandler) UnstarFile(c *gin.Context) {
 	}
 
 	// Delete starred file
-	err := h.db.Session().Query(`
-		DELETE FROM starred_files WHERE user_id = ? AND repo_id = ? AND path = ?
-	`, userID, repoID, filePath).Exec()
+	err := unstarFile(h.db.Session(), userID, repoID, filePath)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to unstar file"})
 		return

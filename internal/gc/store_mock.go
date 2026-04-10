@@ -738,13 +738,22 @@ func (m *MockStore) CompleteItem(orgID uuid.UUID, queuedAt time.Time, itemType I
 	return nil
 }
 
-func (m *MockStore) UpdateRetryCount(orgID uuid.UUID, queuedAt time.Time, itemType ItemType, itemID string, retryCount int) error {
+func (m *MockStore) RequeueItem(orgID uuid.UUID, oldQueuedAt, newQueuedAt time.Time, itemType ItemType, itemID string, libraryID uuid.UUID, storageClass string, newRetryCount int) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	for i, item := range m.queue[orgID] {
-		if item.QueuedAt.Equal(queuedAt) && item.ItemType == itemType && item.ItemID == itemID {
-			m.queue[orgID][i].RetryCount = retryCount
+	items := m.queue[orgID]
+	for i, item := range items {
+		if item.QueuedAt.Equal(oldQueuedAt) && item.ItemType == itemType && item.ItemID == itemID {
+			// Remove the old item
+			m.queue[orgID] = append(items[:i], items[i+1:]...)
+			
+			// Append the new recreated item
+			newItem := item
+			newItem.QueuedAt = newQueuedAt
+			newItem.RetryCount = newRetryCount
+			m.queue[orgID] = append(m.queue[orgID], newItem)
+			
 			return nil
 		}
 	}

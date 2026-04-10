@@ -82,7 +82,7 @@ func (w *Worker) processOrg(ctx context.Context, orgID uuid.UUID) (int, error) {
 
 			// Increment retry count; if too many retries, let TTL clean it up
 			if item.RetryCount < 5 {
-				w.queue.IncrementRetry(item.OrgID, item.QueuedAt, item.ItemType, item.ItemID, item.RetryCount)
+				w.queue.IncrementRetry(item)
 			}
 			continue
 		}
