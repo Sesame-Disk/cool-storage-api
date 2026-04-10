@@ -1763,6 +1763,36 @@ func (s *CassandraStore) HardDeleteUser(orgID, userID uuid.UUID, email string) e
 	return nil
 }
 
+func (s *CassandraStore) AcquireUserHardDeleteLock(userID uuid.UUID) (bool, error) {
+	applied, err := s.db.Session().Query(`
+		INSERT INTO gc_user_hard_delete_locks (user_id, started_at)
+		VALUES (?, ?) IF NOT EXISTS
+	`, userID.String(), time.Now()).MapScanCAS(map[string]interface{}{})
+	if err != nil {
+		return false, err
+	}
+	return applied, nil
+}
+
+func (s *CassandraStore) ReleaseUserHardDeleteLock(userID uuid.UUID) error {
+	return s.db.Session().Query(`DELETE FROM gc_user_hard_delete_locks WHERE user_id = ?`, userID.String()).Exec()
+}
+
+func (s *CassandraStore) AcquireLibraryHardDeleteLock(libraryID uuid.UUID) (bool, error) {
+	applied, err := s.db.Session().Query(`
+		INSERT INTO gc_library_hard_delete_locks (library_id, started_at)
+		VALUES (?, ?) IF NOT EXISTS
+	`, libraryID.String(), time.Now()).MapScanCAS(map[string]interface{}{})
+	if err != nil {
+		return false, err
+	}
+	return applied, nil
+}
+
+func (s *CassandraStore) ReleaseLibraryHardDeleteLock(libraryID uuid.UUID) error {
+	return s.db.Session().Query(`DELETE FROM gc_library_hard_delete_locks WHERE library_id = ?`, libraryID.String()).Exec()
+}
+
 func (s *CassandraStore) GetUserEmail(orgID, userID uuid.UUID) (string, error) {
 	var email string
 	err := s.db.Session().Query(`

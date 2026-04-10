@@ -131,6 +131,17 @@ type GCStore interface {
 	DeleteAPIKeysByUser(orgID, userID uuid.UUID) error
 	HardDeleteUser(orgID, userID uuid.UUID, email string) error
 	GetUserEmail(orgID, userID uuid.UUID) (string, error)
+	// AcquireUserHardDeleteLock acquires a short-lived lock for a user cascade
+	// delete. Returns (true, nil) when the lock is successfully acquired.
+	// activateUser checks this table to block concurrent restores.
+	AcquireUserHardDeleteLock(userID uuid.UUID) (bool, error)
+	ReleaseUserHardDeleteLock(userID uuid.UUID) error
+
+	// AcquireLibraryHardDeleteLock acquires a short-lived lock for a library
+	// cascade delete. Returns (true, nil) when the lock is successfully acquired.
+	// restoreDeletedLibrary checks this table to block concurrent restores.
+	AcquireLibraryHardDeleteLock(libraryID uuid.UUID) (bool, error)
+	ReleaseLibraryHardDeleteLock(libraryID uuid.UUID) error
 
 	// Library trash auto-purge (soft-deleted libraries past retention period)
 	ListExpiredDeletedLibraries(retentionDays int) ([]DeletedLibraryInfo, error)

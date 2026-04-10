@@ -902,6 +902,22 @@ CREATE TABLE IF NOT EXISTS gc_org_hard_delete_locks (
     started_at TIMESTAMP
 ) WITH default_time_to_live = 3600;
 
+-- Short-lived lock acquired while a user is being hard-deleted. This blocks
+-- a concurrent restore attempt from racing the cascade worker between the
+-- stale-check and the final HardDeleteUser write.
+CREATE TABLE IF NOT EXISTS gc_user_hard_delete_locks (
+    user_id    UUID PRIMARY KEY,
+    started_at TIMESTAMP
+) WITH default_time_to_live = 3600;
+
+-- Short-lived lock acquired while a library is being hard-deleted. This blocks
+-- a concurrent restore attempt from racing the cascade worker between the
+-- stale-check and the final HardDeleteLibrary write.
+CREATE TABLE IF NOT EXISTS gc_library_hard_delete_locks (
+    library_id UUID PRIMARY KEY,
+    started_at TIMESTAMP
+) WITH default_time_to_live = 3600;
+
 -- ─── Audit ───────────────────────────────────────────────────────────────────
 
 -- 365-day TTL; partitioned by org for efficient recent-first queries.

@@ -377,6 +377,28 @@ func (w *Worker) processUserCascade(ctx context.Context, item QueueItem) error {
 		return nil
 	}
 
+	// Acquire a short-lived lock so a concurrent activateUser (restore) cannot
+	// race between the stale-check above and the final HardDeleteUser write.
+	acquired, err := w.store.AcquireUserHardDeleteLock(userID)
+	if err != nil {
+		return fmt.Errorf("failed to acquire user hard-delete lock for %s: %w", item.ItemID, err)
+	}
+	if !acquired {
+		return fmt.Errorf("user %s hard delete already in progress", item.ItemID)
+	}
+	defer w.store.ReleaseUserHardDeleteLock(userID)
+
+	// Secondary stale-check after the lock: if the user was restored in the
+	// window between the first stale-check and the lock acquisition, skip.
+	deletedAt2, err := w.store.GetUserDeletedAt(item.OrgID, userID)
+	if err != nil {
+		return fmt.Errorf("failed to re-read deleted user marker for %s: %w", item.ItemID, err)
+	}
+	if deletedAt2 == nil || !deletedAt2.Equal(item.QueuedAt) {
+		log.Printf("[GC Worker] Skipping user cascade for %s after lock: restored between checks (deleted_at=%v)", item.ItemID, deletedAt2)
+		return nil
+	}
+
 	// Get user email before deletion (needed for users_by_email cleanup)
 	email, err := w.store.GetUserEmail(item.OrgID, userID)
 	if err != nil {
@@ -489,6 +511,25 @@ func (w *Worker) processLibraryCascade(ctx context.Context, item QueueItem) erro
 	}
 	if deletedAt == nil || !deletedAt.Equal(item.QueuedAt) {
 		log.Printf("[GC Worker] Skipping stale library cascade for %s (current deleted_at=%v queued_at=%v)", item.ItemID, deletedAt, item.QueuedAt)
+		return nil
+	}
+
+	acquired, err := w.store.AcquireLibraryHardDeleteLock(libraryID)
+	if err != nil {
+		return fmt.Errorf("failed to acquire library hard-delete lock for %s: %w", item.ItemID, err)
+	}
+	if !acquired {
+		return fmt.Errorf("library %s hard delete already in progress", item.ItemID)
+	}
+	defer w.store.ReleaseLibraryHardDeleteLock(libraryID) //nolint:errcheck
+
+	// Second stale-check after acquiring the lock.
+	deletedAt2, err := w.store.GetLibraryDeletedAt(libraryID)
+	if err != nil {
+		return fmt.Errorf("failed to re-read deleted library marker for %s: %w", item.ItemID, err)
+	}
+	if deletedAt2 == nil || !deletedAt2.Equal(item.QueuedAt) {
+		log.Printf("[GC Worker] Skipping stale library cascade for %s after lock (current deleted_at=%v queued_at=%v)", item.ItemID, deletedAt2, item.QueuedAt)
 		return nil
 	}
 

@@ -403,40 +403,19 @@ func runUserStatusSideEffects(
 	}
 }
 
-// deactivateUser marks a user as deactivated and, in a background goroutine,
-// kills all their active sessions and disables their share links.
-func deactivateUser(db interface{ Session() *gocql.Session }, si SessionInvalidator, aki APIKeyInvalidator, orgID, userID string) error {
-	var name, role, status string
-	var quotaBytes, trafficUploadQuota, trafficDownloadQuota int64
-	var deletedAt *time.Time
-	if err := db.Session().Query(`
-		SELECT name, role, status, quota_bytes, traffic_upload_quota, traffic_download_quota, deleted_at
-		FROM users WHERE org_id = ? AND user_id = ?
-	`, orgID, userID).Scan(&name, &role, &status, &quotaBytes, &trafficUploadQuota, &trafficDownloadQuota, &deletedAt); err != nil {
-		return err
-	}
-	if err := updateUserAndAdminReadModels(db, orgID, userID, batchedUserUpdate{
-		Name:                 name,
-		Role:                 role,
-		Status:               StatusDeactivated,
-		DeletedAt:            deletedAt,
-		QuotaBytes:           quotaBytes,
-		TrafficUploadQuota:   trafficUploadQuota,
-		TrafficDownloadQuota: trafficDownloadQuota,
-	}); err != nil {
-		return err
-	}
-	go func() {
-		invalidateUserCredentials(si, aki, orgID, userID)
-		setUserShareLinksActive(db, orgID, userID, false)
-	}()
-	return nil
-}
-
 // activateUser marks a user as active, clears deleted_at, and in a background
 // goroutine re-enables their share links. Works for both reactivation
 // (deactivated → active) and restore (deleted → active).
 func activateUser(db interface{ Session() *gocql.Session }, orgID, userID string) error {
+	var lockedUserID string
+	if err := db.Session().Query(`
+		SELECT user_id FROM gc_user_hard_delete_locks WHERE user_id = ?
+	`, userID).Scan(&lockedUserID); err == nil {
+		return fmt.Errorf("user is pending permanent deletion")
+	} else if !errors.Is(err, gocql.ErrNotFound) {
+		return err
+	}
+
 	var name, role, status string
 	var quotaBytes, trafficUploadQuota, trafficDownloadQuota int64
 	var deletedAt *time.Time
@@ -814,6 +793,15 @@ func softDeleteLibrary(db interface{ Session() *gocql.Session }, orgID, ownerID,
 // restoreDeletedLibrary clears deleted_at, removes the GC marker, and re-adds
 // the library's storage to aggregate counters. Mirror image of softDeleteLibrary.
 func restoreDeletedLibrary(db interface{ Session() *gocql.Session }, orgID, ownerID, libraryID string) error {
+	var lockedLibraryID string
+	if err := db.Session().Query(`
+		SELECT library_id FROM gc_library_hard_delete_locks WHERE library_id = ?
+	`, libraryID).Scan(&lockedLibraryID); err == nil {
+		return fmt.Errorf("library is pending permanent deletion")
+	} else if !errors.Is(err, gocql.ErrNotFound) {
+		return err
+	}
+
 	now := time.Now().UTC()
 	previousRow, err := dbpkg.ReadAdminLibraryProjectionRow(db.Session(), orgID, libraryID)
 	if err != nil {

@@ -67,6 +67,12 @@ type MockStore struct {
 	// in-progress org hard-delete locks keyed by orgID.
 	orgHardDeleteLocks map[uuid.UUID]time.Time
 
+	// in-progress user hard-delete locks keyed by userID.
+	userHardDeleteLocks map[uuid.UUID]time.Time
+
+	// in-progress library hard-delete locks keyed by libraryID.
+	libraryHardDeleteLocks map[uuid.UUID]time.Time
+
 	// share_links keyed by shareToken
 	shareLinks map[string]*mockShareLink
 
@@ -222,6 +228,8 @@ func NewMockStore() *MockStore {
 		storageSnapshots:              make(map[string]traffic.StorageSnapshot),
 		storageCounterReconciliations: make(map[string]*mockStorageCounterReconciliation),
 		orgHardDeleteLocks:            make(map[uuid.UUID]time.Time),
+		userHardDeleteLocks:           make(map[uuid.UUID]time.Time),
+		libraryHardDeleteLocks:        make(map[uuid.UUID]time.Time),
 		shareLinks:                    make(map[string]*mockShareLink),
 		shares:                        make(map[string]*mockShare),
 		restoreJobs:                   make(map[string]*mockRestoreJob),
@@ -1677,6 +1685,41 @@ func (m *MockStore) HardDeleteUser(orgID, userID uuid.UUID, email string) error 
 	delete(m.users, fmt.Sprintf("%s:%s", orgID, userID))
 	return nil
 }
+
+func (m *MockStore) AcquireUserHardDeleteLock(userID uuid.UUID) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, locked := m.userHardDeleteLocks[userID]; locked {
+		return false, nil
+	}
+	m.userHardDeleteLocks[userID] = time.Now()
+	return true, nil
+}
+
+func (m *MockStore) ReleaseUserHardDeleteLock(userID uuid.UUID) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.userHardDeleteLocks, userID)
+	return nil
+}
+
+func (m *MockStore) AcquireLibraryHardDeleteLock(libraryID uuid.UUID) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, locked := m.libraryHardDeleteLocks[libraryID]; locked {
+		return false, nil
+	}
+	m.libraryHardDeleteLocks[libraryID] = time.Now()
+	return true, nil
+}
+
+func (m *MockStore) ReleaseLibraryHardDeleteLock(libraryID uuid.UUID) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.libraryHardDeleteLocks, libraryID)
+	return nil
+}
+
 func (m *MockStore) GetUserEmail(orgID, userID uuid.UUID) (string, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
