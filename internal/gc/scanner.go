@@ -2,7 +2,6 @@ package gc
 
 import (
 	"context"
-	"fmt"
 	"log"
 	"time"
 
@@ -10,10 +9,6 @@ import (
 	"github.com/Sesame-Disk/sesamefs/internal/metrics"
 	"github.com/google/uuid"
 )
-
-func scanTaskID(kind string, orgID uuid.UUID, itemID string, markerTime time.Time) uuid.UUID {
-	return uuid.NewMD5(uuid.NameSpaceOID, []byte(fmt.Sprintf("%s:%s:%s:%d", kind, orgID, itemID, markerTime.UTC().UnixNano())))
-}
 
 // Scanner periodically finds orphaned items that were missed by inline enqueue
 // and adds them to the gc_queue for processing.
@@ -55,6 +50,7 @@ func (s *Scanner) ScanOnce(ctx context.Context) error {
 		{"expired_restore_jobs", s.scanExpiredRestoreJobs},
 		{"orphaned_group_shares", s.scanOrphanedGroupShares},
 		{"expired_deleted_users", s.scanExpiredDeletedUsers},
+		{"storage_counter_reconciliation", s.scanPendingStorageCounterReconciliation},
 		{"expired_deleted_libraries", s.scanExpiredDeletedLibraries},
 		{"expired_deleted_orgs", s.scanExpiredDeletedOrgs},
 	}
@@ -78,6 +74,23 @@ func (s *Scanner) ScanOnce(ctx context.Context) error {
 	log.Printf("[GC Scanner] Safety scan complete: enqueued %d items in %v", enqueued, elapsed)
 	s.stats.SetLastScanRun(time.Now())
 	return nil
+}
+
+func (s *Scanner) scanPendingStorageCounterReconciliation(ctx context.Context) (int, error) {
+	select {
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	default:
+	}
+
+	log.Println("[GC Scanner] Phase 11: Reconciling pending storage counters...")
+	reconciled, err := s.store.ReconcilePendingStorageCounters()
+	if err != nil {
+		return reconciled, err
+	}
+	log.Printf("[GC Scanner] Phase 11 complete: reconciled %d storage counter scopes", reconciled)
+	metrics.GCScannerLastPhaseRun.WithLabelValues("storage_counter_reconciliation").SetToCurrentTime()
+	return 0, nil
 }
 
 // scanOrphanedBlocks re-enqueues zero-ref block candidates that should still be in GC.
@@ -644,13 +657,12 @@ func (s *Scanner) scanExpiredDeletedUsers(ctx context.Context) (int, error) {
 	enqueued := 0
 	var batch []QueueItem
 	for _, u := range users {
-		taskID := scanTaskID("user_cascade", u.OrgID, u.UserID.String(), u.DeletedAt)
-		applied, err := s.store.MarkItemProcessed(taskID)
+		exists, err := s.store.QueueItemExists(u.OrgID, u.DeletedAt, ItemUserCascade, u.UserID.String())
 		if err != nil {
 			log.Printf("[GC Scanner] Phase 10: failed to dedupe expired deleted user %s: %v", u.UserID, err)
 			continue
 		}
-		if !applied {
+		if exists {
 			continue
 		}
 		batch = append(batch, QueueItem{
@@ -688,13 +700,12 @@ func (s *Scanner) scanExpiredDeletedLibraries(ctx context.Context) (int, error) 
 	enqueued := 0
 	var batch []QueueItem
 	for _, lib := range libs {
-		taskID := scanTaskID("library_cascade", lib.OrgID, lib.LibraryID.String(), lib.DeletedAt)
-		applied, err := s.store.MarkItemProcessed(taskID)
+		exists, err := s.store.QueueItemExists(lib.OrgID, lib.DeletedAt, ItemLibraryCascade, lib.LibraryID.String())
 		if err != nil {
 			log.Printf("[GC Scanner] Phase 11: failed to dedupe expired deleted library %s: %v", lib.LibraryID, err)
 			continue
 		}
-		if !applied {
+		if exists {
 			continue
 		}
 		batch = append(batch, QueueItem{
@@ -732,13 +743,12 @@ func (s *Scanner) scanExpiredDeletedOrgs(ctx context.Context) (int, error) {
 	enqueued := 0
 	var batch []QueueItem
 	for _, org := range orgs {
-		taskID := scanTaskID("org_cascade", org.OrgID, org.OrgID.String(), org.DeletedAt)
-		applied, err := s.store.MarkItemProcessed(taskID)
+		exists, err := s.store.QueueItemExists(org.OrgID, org.DeletedAt, ItemOrgCascade, org.OrgID.String())
 		if err != nil {
 			log.Printf("[GC Scanner] Phase 12: failed to dedupe expired deleted org %s: %v", org.OrgID, err)
 			continue
 		}
-		if !applied {
+		if exists {
 			continue
 		}
 		batch = append(batch, QueueItem{

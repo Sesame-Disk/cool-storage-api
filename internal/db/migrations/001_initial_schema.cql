@@ -884,6 +884,24 @@ CREATE TABLE IF NOT EXISTS gc_processed_items (
     task_id UUID PRIMARY KEY
 ) WITH default_time_to_live = 172800;
 
+-- Pending scope-level storage counter reconciliation requests. The scanner
+-- recomputes the expected aggregate totals for these scopes and corrects any
+-- drift left behind by partial soft-delete/restore flows.
+CREATE TABLE IF NOT EXISTS gc_storage_counter_reconciliation (
+    scope        TEXT PRIMARY KEY,
+    org_id       UUID,
+    owner_id     UUID,
+    requested_at TIMESTAMP
+);
+
+-- Short-lived lock acquired while an org is being hard-deleted. This blocks
+-- concurrent reactivation attempts while GC verifies child tables and removes
+-- the canonical org rows.
+CREATE TABLE IF NOT EXISTS gc_org_hard_delete_locks (
+    org_id     UUID PRIMARY KEY,
+    started_at TIMESTAMP
+) WITH default_time_to_live = 3600;
+
 -- ─── Audit ───────────────────────────────────────────────────────────────────
 
 -- 365-day TTL; partitioned by org for efficient recent-first queries.

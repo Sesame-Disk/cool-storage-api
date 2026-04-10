@@ -62,6 +62,7 @@ type GCStore interface {
 	FindOrgForLibrary(libraryID uuid.UUID) (uuid.UUID, error)
 	ListCommitIDsForLibrary(libraryID uuid.UUID) ([]string, error)
 	ListFSObjectIDsForLibrary(libraryID uuid.UUID) ([]string, error)
+	ReconcilePendingStorageCounters() (int, error)
 
 	// Version TTL enforcement
 	ListLibrariesWithVersionTTL() ([]LibraryTTLInfo, error)

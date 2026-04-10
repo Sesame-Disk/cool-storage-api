@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/Sesame-Disk/sesamefs/internal/config"
+	"github.com/Sesame-Disk/sesamefs/internal/traffic"
 	"github.com/google/uuid"
 )
 
@@ -117,6 +118,58 @@ func TestScanner_ScanOrphanedBlocks_BackfillsMissingCandidateFromBlocksTable(t *
 	}
 	if len(candidates) != 1 || candidates[0].BlockID != "block-zero-ref" {
 		t.Fatalf("expected reconciled GC candidate for block-zero-ref, got %+v", candidates)
+	}
+}
+
+func TestScanner_ScanOnce_ReconcilesPendingStorageCounters(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	s := NewScanner(store, q, stats, config.GCConfig{})
+
+	orgID := uuid.New()
+	ownerID := uuid.New()
+	activeLibID := uuid.New()
+	deletedLibID := uuid.New()
+
+	store.AddOrganization(orgID)
+	store.AddLibraryWithOwner(orgID, activeLibID, ownerID, "hot")
+	store.AddLibraryWithOwner(orgID, deletedLibID, ownerID, "hot")
+	store.mu.Lock()
+	store.libraries[deletedLibID].DeletedAt = time.Now().Add(-time.Hour)
+	store.mu.Unlock()
+
+	store.AddStorageSnapshot(traffic.LibraryStorageScope(orgID.String(), activeLibID.String()), 100, 2)
+	store.AddStorageSnapshot(traffic.LibraryStorageScope(orgID.String(), deletedLibID.String()), 50, 1)
+	store.AddStorageSnapshot(traffic.PlatformStorageScope(), 999, 9)
+	store.AddStorageSnapshot(traffic.OrganizationStorageScope(orgID.String()), 999, 9)
+	store.AddStorageSnapshot(traffic.UserStorageScope(orgID.String(), ownerID.String()), 999, 9)
+
+	store.AddPendingStorageCounterReconciliation(traffic.PlatformStorageScope(), uuid.Nil, uuid.Nil)
+	store.AddPendingStorageCounterReconciliation(traffic.OrganizationStorageScope(orgID.String()), orgID, uuid.Nil)
+	store.AddPendingStorageCounterReconciliation(traffic.UserStorageScope(orgID.String(), ownerID.String()), orgID, ownerID)
+
+	if err := s.ScanOnce(context.Background()); err != nil {
+		t.Fatalf("ScanOnce failed: %v", err)
+	}
+
+	if got := store.StorageSnapshot(traffic.PlatformStorageScope()); got.BytesUsed != 100 || got.FileCount != 2 {
+		t.Fatalf("platform snapshot = %+v, want bytes=100 files=2", got)
+	}
+	if got := store.StorageSnapshot(traffic.OrganizationStorageScope(orgID.String())); got.BytesUsed != 100 || got.FileCount != 2 {
+		t.Fatalf("org snapshot = %+v, want bytes=100 files=2", got)
+	}
+	if got := store.StorageSnapshot(traffic.UserStorageScope(orgID.String(), ownerID.String())); got.BytesUsed != 100 || got.FileCount != 2 {
+		t.Fatalf("user snapshot = %+v, want bytes=100 files=2", got)
+	}
+	if got, err := store.ReconcilePendingStorageCounters(); err != nil || got != 0 {
+		t.Fatalf("expected no remaining reconciliation work, got count=%d err=%v", got, err)
+	}
+	if store.QueueLen() != 0 {
+		t.Fatalf("storage reconciliation should not enqueue GC items, got %d", store.QueueLen())
+	}
+	if stats.LastScanRun().IsZero() {
+		t.Fatal("LastScanRun should be updated after reconciliation pass")
 	}
 }
 

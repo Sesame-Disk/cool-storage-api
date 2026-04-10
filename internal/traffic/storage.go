@@ -36,13 +36,33 @@ type StorageSnapshot struct {
 // after this sentinel, so range queries for graphs never include it.
 var storageTotalDay = time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC)
 
-// storageUpdate writes a single counter update for the given scope and day.
-func storageUpdate(session *gocql.Session, scope string, day time.Time, deltaBytes, deltaFiles int64) {
-	if err := session.Query(
+func PlatformStorageScope() string {
+	return "platform"
+}
+
+func OrganizationStorageScope(orgID string) string {
+	return fmt.Sprintf("org:%s", orgID)
+}
+
+func UserStorageScope(orgID, userID string) string {
+	return fmt.Sprintf("user:%s:%s", orgID, userID)
+}
+
+func LibraryStorageScope(orgID, libraryID string) string {
+	return fmt.Sprintf("lib:%s:%s", orgID, libraryID)
+}
+
+func storageUpdateErr(session *gocql.Session, scope string, day time.Time, deltaBytes, deltaFiles int64) error {
+	return session.Query(
 		`UPDATE storage_counters SET bytes_used = bytes_used + ?, file_count = file_count + ?
 		 WHERE scope = ? AND day = ?`,
 		deltaBytes, deltaFiles, scope, day,
-	).Exec(); err != nil {
+	).Exec()
+}
+
+// storageUpdate writes a single counter update for the given scope and day.
+func storageUpdate(session *gocql.Session, scope string, day time.Time, deltaBytes, deltaFiles int64) {
+	if err := storageUpdateErr(session, scope, day, deltaBytes, deltaFiles); err != nil {
 		log.Printf("[storage] update error scope=%s day=%s: %v", scope, day.Format("2006-01-02"), err)
 	}
 }
@@ -55,10 +75,10 @@ func IncrementStorageCounters(db DBSession, orgID, userID, libraryID string, del
 	go func() {
 		session := db.Session()
 		scopes := []string{
-			"platform",
-			fmt.Sprintf("org:%s", orgID),
-			fmt.Sprintf("user:%s:%s", orgID, userID),
-			fmt.Sprintf("lib:%s:%s", orgID, libraryID),
+			PlatformStorageScope(),
+			OrganizationStorageScope(orgID),
+			UserStorageScope(orgID, userID),
+			LibraryStorageScope(orgID, libraryID),
 		}
 		for _, scope := range scopes {
 			storageUpdate(session, scope, storageTotalDay, deltaBytes, deltaFiles)
@@ -78,10 +98,10 @@ func DecrementStorageCounters(db DBSession, orgID, userID, libraryID string, del
 	go func() {
 		session := db.Session()
 		scopes := []string{
-			"platform",
-			fmt.Sprintf("org:%s", orgID),
-			fmt.Sprintf("user:%s:%s", orgID, userID),
-			fmt.Sprintf("lib:%s:%s", orgID, libraryID),
+			PlatformStorageScope(),
+			OrganizationStorageScope(orgID),
+			UserStorageScope(orgID, userID),
+			LibraryStorageScope(orgID, libraryID),
 		}
 		for _, scope := range scopes {
 			var curBytes, curFiles int64
@@ -169,7 +189,7 @@ func ReconstructStorageHistory(db DBSession, scope string, start, end time.Time)
 // scopes by that amount. Runs synchronously because callers need the adjustment
 // to be visible before returning (e.g. quota checks right after restore).
 func AdjustAggregateStorageCounters(db DBSession, orgID, ownerID, libraryID string, increment bool) {
-	libScope := fmt.Sprintf("lib:%s:%s", orgID, libraryID)
+	libScope := LibraryStorageScope(orgID, libraryID)
 	var bytesUsed, fileCount int64
 	_ = db.Session().Query(
 		`SELECT bytes_used, file_count FROM storage_counters WHERE scope = ? AND day = ?`,
@@ -183,9 +203,9 @@ func AdjustAggregateStorageCounters(db DBSession, orgID, ownerID, libraryID stri
 	today := time.Now().UTC().Truncate(24 * time.Hour)
 	session := db.Session()
 	scopes := []string{
-		"platform",
-		fmt.Sprintf("org:%s", orgID),
-		fmt.Sprintf("user:%s:%s", orgID, ownerID),
+		PlatformStorageScope(),
+		OrganizationStorageScope(orgID),
+		UserStorageScope(orgID, ownerID),
 	}
 
 	if increment {
@@ -212,9 +232,49 @@ func AdjustAggregateStorageCounters(db DBSession, orgID, ownerID, libraryID stri
 	}
 }
 
+// AddAggregateStorageReconciliationQueries records the aggregate scopes that
+// must be recomputed after a library soft-delete or restore.
+func AddAggregateStorageReconciliationQueries(batch *gocql.Batch, orgID, ownerID string, requestedAt time.Time) {
+	batch.Query(
+		`INSERT INTO gc_storage_counter_reconciliation (scope, org_id, owner_id, requested_at) VALUES (?, ?, ?, ?)`,
+		PlatformStorageScope(), gocql.UUID{}, gocql.UUID{}, requestedAt,
+	)
+	batch.Query(
+		`INSERT INTO gc_storage_counter_reconciliation (scope, org_id, owner_id, requested_at) VALUES (?, ?, ?, ?)`,
+		OrganizationStorageScope(orgID), orgID, gocql.UUID{}, requestedAt,
+	)
+	if ownerID != "" {
+		batch.Query(
+			`INSERT INTO gc_storage_counter_reconciliation (scope, org_id, owner_id, requested_at) VALUES (?, ?, ?, ?)`,
+			UserStorageScope(orgID, ownerID), orgID, ownerID, requestedAt,
+		)
+	}
+}
+
+// ReconcileStorageScope corrects a scope to the expected running total.
+// The delta is derived from the current live total, so repeated runs converge.
+func ReconcileStorageScope(db DBSession, scope string, expected StorageSnapshot) error {
+	current := ReadStorageSnapshot(db, scope)
+	deltaBytes := expected.BytesUsed - current.BytesUsed
+	deltaFiles := expected.FileCount - current.FileCount
+	if deltaBytes == 0 && deltaFiles == 0 {
+		return nil
+	}
+
+	today := time.Now().UTC().Truncate(24 * time.Hour)
+	session := db.Session()
+	if err := storageUpdateErr(session, scope, storageTotalDay, deltaBytes, deltaFiles); err != nil {
+		return err
+	}
+	if err := storageUpdateErr(session, scope, today, deltaBytes, deltaFiles); err != nil {
+		return err
+	}
+	return nil
+}
+
 // DeleteLibraryStorageCounter removes all rows for the lib-scope after permanent
 // deletion. Aggregate scopes were already adjusted by a prior soft-delete.
 func DeleteLibraryStorageCounter(db DBSession, orgID, libraryID string) {
-	scope := fmt.Sprintf("lib:%s:%s", orgID, libraryID)
+	scope := LibraryStorageScope(orgID, libraryID)
 	_ = db.Session().Query(`DELETE FROM storage_counters WHERE scope = ?`, scope).Exec()
 }

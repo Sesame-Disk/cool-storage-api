@@ -7,10 +7,15 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"strings"
 	"testing"
 	"time"
 
+	dbpkg "github.com/Sesame-Disk/sesamefs/internal/db"
+	gcpkg "github.com/Sesame-Disk/sesamefs/internal/gc"
+	"github.com/Sesame-Disk/sesamefs/internal/traffic"
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
+	"github.com/google/uuid"
 )
 
 func TestLibraryProjectionRegression_CreateRenameDeleteRestore(t *testing.T) {
@@ -92,6 +97,225 @@ func TestLibraryProjectionRegression_FileCreateUpdatesAdminStats(t *testing.T) {
 		}
 		fileCount, ok := row["file_count"].(float64)
 		return ok && fileCount >= 1
+	})
+}
+
+func TestLibraryProjectionRegression_ReconcilePendingStorageCountersAfterSoftDelete(t *testing.T) {
+	name := fmt.Sprintf("inttest-lib-storage-reconcile-%d", time.Now().UnixNano())
+	repoID := createTestLibrary(t, adminClient, name)
+	database := shareProjectionDBForTest(t)
+	session := database.Session()
+	store := gcpkg.NewCassandraStore(database)
+
+	var ownerID string
+	if err := session.Query(`SELECT owner_id FROM libraries WHERE org_id = ? AND library_id = ?`, defaultOrgID, repoID).Scan(&ownerID); err != nil {
+		t.Fatalf("failed to read owner_id for repo %s: %v", repoID, err)
+	}
+
+	platformScope := traffic.PlatformStorageScope()
+	orgScope := traffic.OrganizationStorageScope(defaultOrgID)
+	userScope := traffic.UserStorageScope(defaultOrgID, ownerID)
+	libScope := traffic.LibraryStorageScope(defaultOrgID, repoID)
+
+	baselinePlatform := traffic.ReadStorageSnapshot(database, platformScope)
+	baselineOrg := traffic.ReadStorageSnapshot(database, orgScope)
+	baselineUser := traffic.ReadStorageSnapshot(database, userScope)
+
+	uploadResp := adminClient.Get(t, fmt.Sprintf("/api2/repos/%s/upload-link/?p=/", repoID))
+	expectStatus(t, uploadResp, http.StatusOK)
+	uploadURL := strings.Trim(responseBody(t, uploadResp), "\" \n\r")
+	uploadFileThroughLink(t, adminClient, uploadURL, "reconcile.txt", "/", "strong-reconciliation-content\n")
+
+	var uploadedLibSnapshot traffic.StorageSnapshot
+	waitForIntegrationCondition(t, "library upload to update storage counters", func() bool {
+		uploadedLibSnapshot = traffic.ReadStorageSnapshot(database, libScope)
+		if uploadedLibSnapshot.BytesUsed <= 0 || uploadedLibSnapshot.FileCount <= 0 {
+			return false
+		}
+		platformNow := traffic.ReadStorageSnapshot(database, platformScope)
+		orgNow := traffic.ReadStorageSnapshot(database, orgScope)
+		userNow := traffic.ReadStorageSnapshot(database, userScope)
+		return platformNow.BytesUsed >= baselinePlatform.BytesUsed+uploadedLibSnapshot.BytesUsed &&
+			orgNow.BytesUsed >= baselineOrg.BytesUsed+uploadedLibSnapshot.BytesUsed &&
+			userNow.BytesUsed >= baselineUser.BytesUsed+uploadedLibSnapshot.BytesUsed
+	})
+
+	deleteResp := adminClient.Delete(t, fmt.Sprintf("/api/v2.1/repos/%s/", repoID))
+	expectStatus(t, deleteResp, http.StatusOK)
+	deleteResp.Body.Close()
+
+	waitForIntegrationCondition(t, "soft-deleted library to leave aggregate storage counters at baseline", func() bool {
+		if !deletedLibraryMarkerExistsForTest(t, store, repoID) {
+			return false
+		}
+		platformNow := traffic.ReadStorageSnapshot(database, platformScope)
+		orgNow := traffic.ReadStorageSnapshot(database, orgScope)
+		userNow := traffic.ReadStorageSnapshot(database, userScope)
+		libNow := traffic.ReadStorageSnapshot(database, libScope)
+		return platformNow == baselinePlatform && orgNow == baselineOrg && userNow == baselineUser && libNow == uploadedLibSnapshot
+	})
+
+	const driftBytes int64 = 777
+	const driftFiles int64 = 3
+	for _, scope := range []string{platformScope, orgScope, userScope} {
+		addStorageCounterDriftForTest(t, session, scope, driftBytes, driftFiles)
+	}
+	insertStorageReconciliationRequestForTest(t, session, platformScope, "", "")
+	insertStorageReconciliationRequestForTest(t, session, orgScope, defaultOrgID, "")
+	insertStorageReconciliationRequestForTest(t, session, userScope, defaultOrgID, ownerID)
+
+	reconciled, err := store.ReconcilePendingStorageCounters()
+	if err != nil {
+		t.Fatalf("ReconcilePendingStorageCounters failed: %v", err)
+	}
+	if reconciled < 3 {
+		t.Fatalf("reconciled scopes = %d, want at least 3 target scopes", reconciled)
+	}
+
+	if got := traffic.ReadStorageSnapshot(database, platformScope); got != baselinePlatform {
+		t.Fatalf("platform snapshot after reconciliation = %+v, want %+v", got, baselinePlatform)
+	}
+	if got := traffic.ReadStorageSnapshot(database, orgScope); got != baselineOrg {
+		t.Fatalf("org snapshot after reconciliation = %+v, want %+v", got, baselineOrg)
+	}
+	if got := traffic.ReadStorageSnapshot(database, userScope); got != baselineUser {
+		t.Fatalf("user snapshot after reconciliation = %+v, want %+v", got, baselineUser)
+	}
+	if storageReconciliationRequestExistsForTest(t, session, platformScope) ||
+		storageReconciliationRequestExistsForTest(t, session, orgScope) ||
+		storageReconciliationRequestExistsForTest(t, session, userScope) {
+		t.Fatal("expected reconciliation requests to be cleared after reconciliation")
+	}
+}
+
+func TestLibraryProjectionRegression_GCSoftDeleteUsesCanonicalReadModelHelper(t *testing.T) {
+	name := fmt.Sprintf("inttest-gc-soft-delete-%d", time.Now().UnixNano())
+	repoID := createTestLibrary(t, adminClient, name)
+	database := shareProjectionDBForTest(t)
+	store := gcpkg.NewCassandraStore(database)
+
+	var ownerID string
+	if err := database.Session().Query(`SELECT owner_id FROM libraries WHERE org_id = ? AND library_id = ?`, defaultOrgID, repoID).Scan(&ownerID); err != nil {
+		t.Fatalf("failed to read owner_id for repo %s: %v", repoID, err)
+	}
+	ownerUUID, err := uuid.Parse(ownerID)
+	if err != nil {
+		t.Fatalf("failed to parse owner UUID %q: %v", ownerID, err)
+	}
+	repoUUID, err := uuid.Parse(repoID)
+	if err != nil {
+		t.Fatalf("failed to parse repo UUID %q: %v", repoID, err)
+	}
+	orgUUID, err := uuid.Parse(defaultOrgID)
+	if err != nil {
+		t.Fatalf("failed to parse org UUID %q: %v", defaultOrgID, err)
+	}
+
+	if err := store.SoftDeleteLibrary(orgUUID, repoUUID, ownerUUID); err != nil {
+		t.Fatalf("GC SoftDeleteLibrary failed: %v", err)
+	}
+
+	waitForIntegrationCondition(t, "GC soft-delete to mark canonical admin projection deleted", func() bool {
+		row, ok := adminLibraryProjectionRowForTest(t, database.Session(), defaultOrgID, repoID)
+		return ok && row.DeletedAt != nil && !row.DeletedAt.IsZero()
+	})
+	waitForIntegrationCondition(t, "GC soft-delete to populate canonical trash projection", func() bool {
+		_, ok := deletedAdminLibraryProjectionRowForTest(t, database.Session(), defaultOrgID, repoID)
+		return ok
+	})
+	if !deletedLibraryMarkerExistsForTest(t, store, repoID) {
+		t.Fatalf("expected deleted_libraries marker for repo %s after GC soft-delete", repoID)
+	}
+	restoreResp := adminClient.Do(t, http.MethodPut, fmt.Sprintf("/api/v2.1/repos/deleted/%s/", repoID), nil)
+	expectStatus(t, restoreResp, http.StatusOK)
+	restoreResp.Body.Close()
+}
+
+func TestLibraryProjectionRegression_GCSoftDeleteFallsBackToBaseLibraryRowWhenProjectionMissing(t *testing.T) {
+	name := fmt.Sprintf("inttest-gc-soft-delete-fallback-%d", time.Now().UnixNano())
+	repoID := createTestLibrary(t, adminClient, name)
+	database := shareProjectionDBForTest(t)
+	store := gcpkg.NewCassandraStore(database)
+	session := database.Session()
+
+	var ownerID, storageClass string
+	if err := session.Query(`SELECT owner_id, storage_class FROM libraries WHERE org_id = ? AND library_id = ?`, defaultOrgID, repoID).Scan(&ownerID, &storageClass); err != nil {
+		t.Fatalf("failed to read base library row for repo %s: %v", repoID, err)
+	}
+	removeAdminLibraryProjectionRowsForSoftDeleteFallbackTest(t, session, defaultOrgID, repoID, ownerID)
+
+	repoUUID, err := uuid.Parse(repoID)
+	if err != nil {
+		t.Fatalf("failed to parse repo UUID %q: %v", repoID, err)
+	}
+	orgUUID, err := uuid.Parse(defaultOrgID)
+	if err != nil {
+		t.Fatalf("failed to parse org UUID %q: %v", defaultOrgID, err)
+	}
+	ownerUUID, err := uuid.Parse(ownerID)
+	if err != nil {
+		t.Fatalf("failed to parse owner UUID %q: %v", ownerID, err)
+	}
+
+	if err := store.SoftDeleteLibrary(orgUUID, repoUUID, ownerUUID); err != nil {
+		t.Fatalf("GC SoftDeleteLibrary fallback failed: %v", err)
+	}
+
+	waitForIntegrationCondition(t, "GC soft-delete fallback to write deleted_libraries marker", func() bool {
+		return deletedLibraryMarkerExistsForTest(t, store, repoID)
+	})
+	waitForIntegrationCondition(t, "GC soft-delete fallback to enqueue user reconciliation", func() bool {
+		return storageReconciliationRequestExistsForTest(t, session, traffic.UserStorageScope(defaultOrgID, ownerID))
+	})
+
+	var gotStorageClass string
+	if err := session.Query(`SELECT storage_class FROM deleted_libraries WHERE library_id = ?`, repoID).Scan(&gotStorageClass); err != nil {
+		t.Fatalf("failed to read deleted_libraries row for repo %s: %v", repoID, err)
+	}
+	if gotStorageClass != storageClass {
+		t.Fatalf("deleted_libraries storage_class = %q, want %q", gotStorageClass, storageClass)
+	}
+
+	restoreResp := adminClient.Do(t, http.MethodPut, fmt.Sprintf("/api/v2.1/repos/deleted/%s/", repoID), nil)
+	expectStatus(t, restoreResp, http.StatusOK)
+	restoreResp.Body.Close()
+}
+
+func TestLibraryProjectionRegression_GCHardDeleteCleansCanonicalTrashProjectionWithoutBaseRow(t *testing.T) {
+	name := fmt.Sprintf("inttest-gc-hard-delete-%d", time.Now().UnixNano())
+	repoID := createDisposableTestLibrary(t, adminClient, name)
+	database := shareProjectionDBForTest(t)
+	store := gcpkg.NewCassandraStore(database)
+	session := database.Session()
+
+	deleteResp := adminClient.Delete(t, fmt.Sprintf("/api/v2.1/repos/%s/", repoID))
+	expectStatus(t, deleteResp, http.StatusOK)
+	deleteResp.Body.Close()
+	waitForIntegrationCondition(t, "deleted library to appear in admin trash projection", func() bool {
+		return adminTrashContainsRepo(t, superadminClient, repoID, defaultAdminEmail)
+	})
+
+	removeLibraryBaseRowsForFallbackTest(t, session, repoID)
+
+	repoUUID, err := uuid.Parse(repoID)
+	if err != nil {
+		t.Fatalf("failed to parse repo UUID %q: %v", repoID, err)
+	}
+	orgUUID, err := uuid.Parse(defaultOrgID)
+	if err != nil {
+		t.Fatalf("failed to parse org UUID %q: %v", defaultOrgID, err)
+	}
+
+	if err := store.HardDeleteLibrary(orgUUID, repoUUID); err != nil {
+		t.Fatalf("GC HardDeleteLibrary failed: %v", err)
+	}
+	waitForIntegrationCondition(t, "GC hard-delete to clear canonical trash projection fallback", func() bool {
+		_, ok := deletedAdminLibraryProjectionRowForTest(t, database.Session(), defaultOrgID, repoID)
+		return !ok
+	})
+	waitForIntegrationCondition(t, "GC hard-delete to clear canonical admin projection fallback", func() bool {
+		_, ok := adminLibraryProjectionRowForTest(t, database.Session(), defaultOrgID, repoID)
+		return !ok
 	})
 }
 
@@ -446,6 +670,138 @@ func insertSyntheticCommitForTest(t *testing.T, session interface {
 		VALUES (?, ?, ?, ?, ?, ?, ?)
 	`, repoID, commitID, parentID, rootFSID, defaultOrgID, description, time.Now().UTC()).Exec(); err != nil {
 		t.Fatalf("failed to insert synthetic commit %s for %s: %v", commitID, repoID, err)
+	}
+}
+
+var storageCounterTotalDayForTest = time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC)
+
+func addStorageCounterDriftForTest(t *testing.T, session interface {
+	Query(stmt string, values ...interface{}) *gocql.Query
+}, scope string, deltaBytes, deltaFiles int64) {
+	t.Helper()
+	today := time.Now().UTC().Truncate(24 * time.Hour)
+	for _, day := range []time.Time{storageCounterTotalDayForTest, today} {
+		if err := session.Query(`
+			UPDATE storage_counters SET bytes_used = bytes_used + ?, file_count = file_count + ?
+			WHERE scope = ? AND day = ?
+		`, deltaBytes, deltaFiles, scope, day).Exec(); err != nil {
+			t.Fatalf("failed to add storage drift for scope %s on %s: %v", scope, day.Format(time.RFC3339), err)
+		}
+	}
+}
+
+func insertStorageReconciliationRequestForTest(t *testing.T, session interface {
+	Query(stmt string, values ...interface{}) *gocql.Query
+}, scope, orgID, ownerID string) {
+	t.Helper()
+	orgUUID := gocql.UUID{}
+	ownerUUID := gocql.UUID{}
+	if orgID != "" {
+		parsed, err := gocql.ParseUUID(orgID)
+		if err != nil {
+			t.Fatalf("failed to parse org UUID %q: %v", orgID, err)
+		}
+		orgUUID = parsed
+	}
+	if ownerID != "" {
+		parsed, err := gocql.ParseUUID(ownerID)
+		if err != nil {
+			t.Fatalf("failed to parse owner UUID %q: %v", ownerID, err)
+		}
+		ownerUUID = parsed
+	}
+	if err := session.Query(`
+		INSERT INTO gc_storage_counter_reconciliation (scope, org_id, owner_id, requested_at)
+		VALUES (?, ?, ?, ?)
+	`, scope, orgUUID, ownerUUID, time.Now().UTC()).Exec(); err != nil {
+		t.Fatalf("failed to insert storage reconciliation request for %s: %v", scope, err)
+	}
+}
+
+func storageReconciliationRequestExistsForTest(t *testing.T, session interface {
+	Query(stmt string, values ...interface{}) *gocql.Query
+}, scope string) bool {
+	t.Helper()
+	var existingScope string
+	return session.Query(`SELECT scope FROM gc_storage_counter_reconciliation WHERE scope = ?`, scope).Scan(&existingScope) == nil
+}
+
+func deletedLibraryMarkerExistsForTest(t *testing.T, store interface {
+	GetLibraryDeletedAt(libraryID uuid.UUID) (*time.Time, error)
+}, repoID string) bool {
+	t.Helper()
+	repoUUID, err := uuid.Parse(repoID)
+	if err != nil {
+		t.Fatalf("failed to parse repo UUID %q: %v", repoID, err)
+	}
+	deletedAt, err := store.GetLibraryDeletedAt(repoUUID)
+	if err != nil {
+		t.Fatalf("failed to read deleted_libraries marker for repo %s: %v", repoID, err)
+	}
+	return deletedAt != nil
+}
+
+func adminLibraryProjectionRowForTest(t *testing.T, session *gocql.Session, orgID, repoID string) (dbpkg.AdminLibraryProjectionRow, bool) {
+	t.Helper()
+	rows, err := dbpkg.ListAdminOrgLibraryRows(session, orgID)
+	if err != nil {
+		t.Fatalf("failed to list admin library projection rows for org %s: %v", orgID, err)
+	}
+	for _, row := range rows {
+		if row.LibraryID == repoID {
+			return row, true
+		}
+	}
+	return dbpkg.AdminLibraryProjectionRow{}, false
+}
+
+func deletedAdminLibraryProjectionRowForTest(t *testing.T, session *gocql.Session, orgID, repoID string) (dbpkg.AdminDeletedLibraryProjectionRow, bool) {
+	t.Helper()
+	rows, err := dbpkg.ListDeletedAdminLibraryRowsByOrg(session, orgID)
+	if err != nil {
+		t.Fatalf("failed to list deleted admin library projection rows for org %s: %v", orgID, err)
+	}
+	for _, row := range rows {
+		if row.LibraryID == repoID {
+			return row, true
+		}
+	}
+	return dbpkg.AdminDeletedLibraryProjectionRow{}, false
+}
+
+func removeAdminLibraryProjectionRowsForSoftDeleteFallbackTest(t *testing.T, session *gocql.Session, orgID, repoID, ownerID string) {
+	t.Helper()
+	if err := session.Query(`DELETE FROM libraries_by_org_updated WHERE org_id = ? AND library_id = ?`, orgID, repoID).Exec(); err != nil {
+		t.Fatalf("failed to remove org projection row for repo %s: %v", repoID, err)
+	}
+	if err := session.Query(`DELETE FROM libraries_by_owner WHERE org_id = ? AND owner_id = ? AND library_id = ?`, orgID, ownerID, repoID).Exec(); err != nil {
+		t.Fatalf("failed to remove owner projection row for repo %s: %v", repoID, err)
+	}
+	buckets, err := dbpkg.ListAdminLibraryBucketDays(session)
+	if err != nil {
+		t.Fatalf("failed to list admin library bucket days for repo %s: %v", repoID, err)
+	}
+	for _, bucketDay := range buckets {
+		if err := session.Query(`DELETE FROM libraries_admin_global_by_updated WHERE bucket_day = ? AND org_id = ? AND library_id = ?`, bucketDay, orgID, repoID).Exec(); err != nil {
+			t.Fatalf("failed to remove global projection row for repo %s bucket %s: %v", repoID, bucketDay, err)
+		}
+	}
+}
+
+// removeLibraryBaseRowsForFallbackTest deliberately corrupts the base library
+// rows to verify GC hard-delete fallback cleanup when only the denormalized
+// trash projection remains. There is no canonical API for constructing this
+// broken state, so the fixture is intentionally low-level.
+func removeLibraryBaseRowsForFallbackTest(t *testing.T, session *gocql.Session, repoID string) {
+	t.Helper()
+	if err := session.Query(`DELETE FROM libraries WHERE org_id = ? AND library_id = ?`, defaultOrgID, repoID).Exec(); err != nil {
+		t.Fatalf("failed to remove base library row for repo %s: %v", repoID, err)
+	}
+	if err := session.Query(`DELETE FROM libraries_by_id WHERE library_id = ?`, repoID).Exec(); err != nil {
+		t.Fatalf("failed to remove library lookup row for repo %s: %v", repoID, err)
+	}
+	if err := session.Query(`DELETE FROM deleted_libraries WHERE library_id = ?`, repoID).Exec(); err != nil {
+		t.Fatalf("failed to remove deleted_libraries marker for repo %s: %v", repoID, err)
 	}
 }
 

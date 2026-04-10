@@ -724,6 +724,99 @@ func (s *CassandraStore) ListFSObjectIDsForLibrary(libraryID uuid.UUID) ([]strin
 	return ids, nil
 }
 
+func (s *CassandraStore) ReconcilePendingStorageCounters() (int, error) {
+	type reconcileRequest struct {
+		Scope   string
+		OrgID   uuid.UUID
+		OwnerID uuid.UUID
+	}
+
+	iter := s.db.Session().Query(`
+		SELECT scope, org_id, owner_id FROM gc_storage_counter_reconciliation
+	`).Iter()
+
+	requests := make(map[string]reconcileRequest)
+	var scope, orgIDStr, ownerIDStr string
+	for iter.Scan(&scope, &orgIDStr, &ownerIDStr) {
+		requests[scope] = reconcileRequest{
+			Scope:   scope,
+			OrgID:   parseUUID(orgIDStr),
+			OwnerID: parseUUID(ownerIDStr),
+		}
+	}
+	if err := iter.Close(); err != nil {
+		return 0, fmt.Errorf("failed to list pending storage counter reconciliation scopes: %w", err)
+	}
+	if len(requests) == 0 {
+		return 0, nil
+	}
+
+	expected := make(map[string]traffic.StorageSnapshot, len(requests))
+	libIter := s.db.Session().Query(`
+		SELECT org_id, library_id, owner_id, deleted_at FROM libraries
+	`).Iter()
+
+	var libOrgIDStr, libraryIDStr, libraryOwnerIDStr string
+	var deletedAt time.Time
+	for libIter.Scan(&libOrgIDStr, &libraryIDStr, &libraryOwnerIDStr, &deletedAt) {
+		if !deletedAt.IsZero() {
+			continue
+		}
+
+		libScope := traffic.LibraryStorageScope(libOrgIDStr, libraryIDStr)
+		libSnapshot := traffic.ReadStorageSnapshot(s.db, libScope)
+		if libSnapshot.BytesUsed == 0 && libSnapshot.FileCount == 0 {
+			continue
+		}
+
+		if _, ok := requests[traffic.PlatformStorageScope()]; ok {
+			snap := expected[traffic.PlatformStorageScope()]
+			snap.BytesUsed += libSnapshot.BytesUsed
+			snap.FileCount += libSnapshot.FileCount
+			expected[traffic.PlatformStorageScope()] = snap
+		}
+
+		orgScope := traffic.OrganizationStorageScope(libOrgIDStr)
+		if _, ok := requests[orgScope]; ok {
+			snap := expected[orgScope]
+			snap.BytesUsed += libSnapshot.BytesUsed
+			snap.FileCount += libSnapshot.FileCount
+			expected[orgScope] = snap
+		}
+
+		userScope := traffic.UserStorageScope(libOrgIDStr, libraryOwnerIDStr)
+		if _, ok := requests[userScope]; ok {
+			snap := expected[userScope]
+			snap.BytesUsed += libSnapshot.BytesUsed
+			snap.FileCount += libSnapshot.FileCount
+			expected[userScope] = snap
+		}
+	}
+	if err := libIter.Close(); err != nil {
+		return 0, fmt.Errorf("failed to scan libraries for storage reconciliation: %w", err)
+	}
+
+	reconciled := 0
+	var firstErr error
+	for _, request := range requests {
+		if err := traffic.ReconcileStorageScope(s.db, request.Scope, expected[request.Scope]); err != nil {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("failed to reconcile storage scope %s: %w", request.Scope, err)
+			}
+			continue
+		}
+		if err := s.db.Session().Query(`DELETE FROM gc_storage_counter_reconciliation WHERE scope = ?`, request.Scope).Exec(); err != nil {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("failed to delete reconciled storage scope %s: %w", request.Scope, err)
+			}
+			continue
+		}
+		reconciled++
+	}
+
+	return reconciled, firstErr
+}
+
 // --- Version TTL ---
 
 func (s *CassandraStore) ListLibrariesWithVersionTTL() ([]LibraryTTLInfo, error) {
@@ -1392,21 +1485,36 @@ func (s *CassandraStore) ListLibrariesByOwner(orgID, ownerID uuid.UUID) ([]uuid.
 }
 
 func (s *CassandraStore) SoftDeleteLibrary(orgID, libraryID, deletedBy uuid.UUID) error {
-	// Look up the library owner for storage counter adjustment.
-	var ownerID, storageClass string
-	_ = s.db.Session().Query(
-		`SELECT owner_id, storage_class FROM libraries WHERE org_id = ? AND library_id = ?`,
-		orgID.String(), libraryID.String(),
-	).Scan(&ownerID, &storageClass)
+	previousRow, err := db.ReadAdminLibraryProjectionRow(s.db.Session(), orgID.String(), libraryID.String())
+	if err != nil && !errors.Is(err, gocql.ErrNotFound) {
+		return err
+	}
+	ownerID := previousRow.OwnerID
+	storageClass := previousRow.StorageClass
+	if errors.Is(err, gocql.ErrNotFound) {
+		if baseErr := s.db.Session().Query(
+			`SELECT owner_id, storage_class FROM libraries WHERE org_id = ? AND library_id = ?`,
+			orgID.String(), libraryID.String(),
+		).Scan(&ownerID, &storageClass); baseErr != nil && !errors.Is(baseErr, gocql.ErrNotFound) {
+			return baseErr
+		}
+	}
 
-	now := time.Now()
+	now := time.Now().UTC()
 	batch := s.db.Session().Batch(gocql.LoggedBatch)
 	batch.Query(`
-		UPDATE libraries SET deleted_at = ?, deleted_by = ? WHERE org_id = ? AND library_id = ?
-	`, now, deletedBy.String(), orgID.String(), libraryID.String())
+		UPDATE libraries SET deleted_at = ?, deleted_by = ?, updated_at = ? WHERE org_id = ? AND library_id = ?
+	`, now, deletedBy.String(), now, orgID.String(), libraryID.String())
 	batch.Query(`
 		INSERT INTO deleted_libraries (library_id, org_id, deleted_at, storage_class) VALUES (?, ?, ?, ?)
 	`, libraryID.String(), orgID.String(), now, storageClass)
+	traffic.AddAggregateStorageReconciliationQueries(batch, orgID.String(), ownerID, now)
+	if err == nil {
+		nextRow := previousRow
+		nextRow.UpdatedAt = now
+		nextRow.DeletedAt = &now
+		db.AddRefreshAdminLibraryReadModelQueries(batch, nextRow, &previousRow)
+	}
 	if err := batch.Exec(); err != nil {
 		return err
 	}
@@ -1700,16 +1808,11 @@ func (s *CassandraStore) ListExpiredDeletedLibraries(retentionDays int) ([]Delet
 
 func (s *CassandraStore) HardDeleteLibrary(orgID, libraryID uuid.UUID) error {
 	session := s.db.Session()
-	projectionRow, err := db.ReadAdminLibraryProjectionRow(session, orgID.String(), libraryID.String())
-	hasProjectionRow := err == nil
-	if err != nil && !errors.Is(err, gocql.ErrNotFound) {
+	batch := session.Batch(gocql.LoggedBatch)
+	if err := db.AddDeleteAdminLibraryReadModelQueries(session, batch, orgID.String(), libraryID.String()); err != nil {
 		return err
 	}
 
-	batch := session.Batch(gocql.LoggedBatch)
-	if hasProjectionRow {
-		db.AddDeleteAdminLibraryReadModelQuery(batch, projectionRow)
-	}
 	batch.Query(`DELETE FROM libraries WHERE org_id = ? AND library_id = ?`,
 		orgID.String(), libraryID.String())
 	batch.Query(`DELETE FROM libraries_by_id WHERE library_id = ?`,
@@ -1880,6 +1983,29 @@ func (s *CassandraStore) DeleteGroupFull(orgID, groupID uuid.UUID) error {
 
 func (s *CassandraStore) HardDeleteOrg(orgID uuid.UUID) error {
 	session := s.db.Session()
+	if applied, err := session.Query(`
+		INSERT INTO gc_org_hard_delete_locks (org_id, started_at)
+		VALUES (?, ?) IF NOT EXISTS
+	`, orgID.String(), time.Now()).MapScanCAS(map[string]interface{}{}); err != nil {
+		return err
+	} else if !applied {
+		return fmt.Errorf("org %s hard delete already in progress", orgID)
+	}
+	cleanupLock := true
+	defer func() {
+		if cleanupLock {
+			_ = session.Query(`DELETE FROM gc_org_hard_delete_locks WHERE org_id = ?`, orgID.String()).Exec()
+		}
+	}()
+
+	var orgStatus string
+	if err := session.Query(`SELECT status FROM organizations WHERE org_id = ?`, orgID.String()).Scan(&orgStatus); err != nil {
+		return err
+	}
+	if orgStatus != "deleted" {
+		return fmt.Errorf("org %s is not in deleted state", orgID)
+	}
+
 	var childID string
 	if err := session.Query(`SELECT library_id FROM libraries WHERE org_id = ? LIMIT 1`, orgID.String()).Scan(&childID); err == nil {
 		return fmt.Errorf("org %s still has live libraries", orgID)
@@ -1908,7 +2034,12 @@ func (s *CassandraStore) HardDeleteOrg(orgID uuid.UUID) error {
 	}
 	batch.Query(`DELETE FROM organizations WHERE org_id = ?`, orgID.String())
 	batch.Query(`DELETE FROM deleted_organizations WHERE org_id = ?`, orgID.String())
-	return batch.Exec()
+	batch.Query(`DELETE FROM gc_org_hard_delete_locks WHERE org_id = ?`, orgID.String())
+	if err := batch.Exec(); err != nil {
+		return err
+	}
+	cleanupLock = false
+	return nil
 }
 
 func (s *CassandraStore) GetOrgName(orgID uuid.UUID) (string, error) {

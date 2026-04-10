@@ -513,13 +513,11 @@ func deactivateOrg(db interface{ Session() *gocql.Session }, si SessionInvalidat
 // (deactivated → active) and restore (deleted → active).
 func activateOrg(db interface{ Session() *gocql.Session }, orgID string) error {
 	var lockedOrgID string
-	err := db.Session().Query(`
+	if err := db.Session().Query(`
 		SELECT org_id FROM gc_org_hard_delete_locks WHERE org_id = ?
-	`, orgID).Scan(&lockedOrgID)
-	if err == nil {
+	`, orgID).Scan(&lockedOrgID); err == nil {
 		return fmt.Errorf("organization is pending permanent deletion")
-	}
-	if err != nil && !errors.Is(err, gocql.ErrNotFound) {
+	} else if !errors.Is(err, gocql.ErrNotFound) {
 		return err
 	}
 

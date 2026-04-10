@@ -8,38 +8,28 @@ import (
 	"net/url"
 	"testing"
 	"time"
-
-	"github.com/google/uuid"
 )
 
 func TestRestoreJobsRegression_CreateListStatusAndDetail(t *testing.T) {
 	repoName := fmt.Sprintf("inttest-restore-%d", time.Now().UnixNano())
 	repoID := createTestLibrary(t, adminClient, repoName)
-	session := shareProjectionDBForTest(t).Session()
 	restorePath := "/archive/restore-target.bin"
-	jobID := uuid.NewString()
-	requestedAt := time.Now().UTC().Truncate(time.Millisecond)
 
-	var orgID string
-	if err := session.Query(`
-		SELECT org_id FROM libraries_by_id WHERE library_id = ?
-	`, repoID).Scan(&orgID); err != nil {
-		t.Fatalf("failed to resolve org_id for repo %s: %v", repoID, err)
-	}
-
-	if err := session.Query(`
-		INSERT INTO restore_jobs (org_id, job_id, library_id, block_ids, status, requested_at)
-		VALUES (?, ?, ?, ?, ?, ?)
-	`, orgID, jobID, repoID, []string{"block-a"}, "pending", requestedAt).Exec(); err != nil {
-		t.Fatalf("failed to seed restore job %s: %v", jobID, err)
-	}
-	t.Cleanup(func() {
-		if err := session.Query(`
-			DELETE FROM restore_jobs WHERE org_id = ? AND library_id = ? AND job_id = ?
-		`, orgID, repoID, jobID).Exec(); err != nil {
-			t.Errorf("cleanup restore job %s failed: %v", jobID, err)
-		}
+	initiateResp := adminClient.PostJSON(t, fmt.Sprintf("/api/v2/repos/%s/file/restore", repoID), map[string]string{
+		"path": restorePath,
 	})
+	if initiateResp.StatusCode != http.StatusAccepted {
+		body := responseBody(t, initiateResp)
+		t.Fatalf("restore initiation returned status=%d body=%s", initiateResp.StatusCode, body)
+	}
+	initiateResult := responseJSON(t, initiateResp)
+	jobID, _ := initiateResult["job_id"].(string)
+	if jobID == "" {
+		t.Fatalf("restore initiation response missing job_id: %v", initiateResult)
+	}
+	if got, _ := initiateResult["status"].(string); got != "pending" {
+		t.Fatalf("restore initiation status = %q, want pending", got)
+	}
 
 	statusResp := adminClient.Get(t, fmt.Sprintf("/api/v2/repos/%s/file/restore-status?p=%s", repoID, url.QueryEscape(restorePath)))
 	if statusResp.StatusCode != http.StatusOK {

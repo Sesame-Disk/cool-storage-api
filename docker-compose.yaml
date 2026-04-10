@@ -46,8 +46,8 @@ services:
     depends_on:
       cassandra:
         condition: service_healthy
-      minio:
-        condition: service_started
+      minio-init:
+        condition: service_completed_successfully
     # Config is baked into the image - no volume mount needed
     restart: unless-stopped
 

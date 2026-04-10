@@ -788,9 +788,12 @@ func legacySearchUserPresent(t *testing.T, client *testClient, query, email stri
 	return false
 }
 
-func TestSuperadminLegacySearchUserAcrossOrgs(t *testing.T) {
-	if !legacySearchUserPresent(t, superadminClient, defaultUserEmail, defaultUserEmail) {
-		t.Fatalf("superadmin legacy search did not return %q across orgs", defaultUserEmail)
+func TestSuperadminSearchUsesAdminEndpointAcrossOrgs(t *testing.T) {
+	if legacySearchUserPresent(t, superadminClient, defaultUserEmail, defaultUserEmail) {
+		t.Fatalf("superadmin legacy search unexpectedly returned %q across orgs", defaultUserEmail)
+	}
+	if !adminUserPresentInSearch(t, defaultUserEmail, "user") {
+		t.Fatalf("superadmin admin search did not return %q across orgs", defaultUserEmail)
 	}
 }
 

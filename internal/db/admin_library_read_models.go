@@ -36,6 +36,20 @@ type AdminDeletedLibraryProjectionRow struct {
 	DeletedAt  time.Time
 }
 
+func adminLibraryProjectionDeletedAtEqual(left, right *time.Time) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	return left.Equal(*right)
+}
+
+func adminLibraryProjectionDeleteRequired(previous, next AdminLibraryProjectionRow) bool {
+	if previous.OrgID != next.OrgID || previous.OwnerID != next.OwnerID || !previous.CreatedAt.Equal(next.CreatedAt) {
+		return true
+	}
+	return false
+}
+
 func AdminLibraryBucketDay(createdAt time.Time) string {
 	return createdAt.UTC().Format("2006-01-02")
 }
@@ -102,6 +116,50 @@ func AddDeleteAdminLibraryReadModelQuery(batch *gocql.Batch, row AdminLibraryPro
 			WHERE org_id = ? AND deleted_at = ? AND library_id = ?
 		`, row.OrgID, *row.DeletedAt, row.LibraryID)
 	}
+}
+
+func AddDeleteDeletedAdminLibraryReadModelQuery(batch *gocql.Batch, row AdminDeletedLibraryProjectionRow) {
+	batch.Query(`
+		DELETE FROM libraries_deleted_by_org
+		WHERE org_id = ? AND deleted_at = ? AND library_id = ?
+	`, row.OrgID, row.DeletedAt, row.LibraryID)
+}
+
+func AddDeleteDeletedAdminLibraryReadModelFallbackQueries(session *gocql.Session, batch *gocql.Batch, row AdminDeletedLibraryProjectionRow) error {
+	AddDeleteDeletedAdminLibraryReadModelQuery(batch, row)
+	batch.Query(`
+		DELETE FROM libraries_by_org_updated
+		WHERE org_id = ? AND library_id = ?
+	`, row.OrgID, row.LibraryID)
+	batch.Query(`
+		DELETE FROM libraries_by_owner
+		WHERE org_id = ? AND owner_id = ? AND library_id = ?
+	`, row.OrgID, row.OwnerID, row.LibraryID)
+
+	buckets, err := ListAdminLibraryBucketDays(session)
+	if err != nil {
+		return err
+	}
+	for _, bucketDay := range buckets {
+		batch.Query(`
+			DELETE FROM libraries_admin_global_by_updated
+			WHERE bucket_day = ? AND org_id = ? AND library_id = ?
+		`, bucketDay, row.OrgID, row.LibraryID)
+	}
+	return nil
+}
+
+func AddRefreshAdminLibraryReadModelQueries(batch *gocql.Batch, row AdminLibraryProjectionRow, previous *AdminLibraryProjectionRow) {
+	if previous != nil && adminLibraryProjectionDeleteRequired(*previous, row) {
+		AddDeleteAdminLibraryReadModelQuery(batch, *previous)
+	}
+	if previous != nil && !adminLibraryProjectionDeletedAtEqual(previous.DeletedAt, row.DeletedAt) && previous.DeletedAt != nil && !previous.DeletedAt.IsZero() && row.DeletedAt == nil {
+		batch.Query(`
+			DELETE FROM libraries_deleted_by_org
+			WHERE org_id = ? AND deleted_at = ? AND library_id = ?
+		`, previous.OrgID, *previous.DeletedAt, previous.LibraryID)
+	}
+	AddUpsertAdminLibraryReadModelQuery(batch, row)
 }
 
 func AddUpsertAdminLibraryReadModelQuery(batch *gocql.Batch, row AdminLibraryProjectionRow) {
@@ -353,6 +411,39 @@ func ListDeletedAdminLibraryRowsByOrg(session *gocql.Session, orgID string) ([]A
 		return nil, err
 	}
 	return rows, nil
+}
+
+func ReadDeletedAdminLibraryProjectionRow(session *gocql.Session, orgID, libraryID string) (AdminDeletedLibraryProjectionRow, error) {
+	rows, err := ListDeletedAdminLibraryRowsByOrg(session, orgID)
+	if err != nil {
+		return AdminDeletedLibraryProjectionRow{}, err
+	}
+	for _, row := range rows {
+		if row.LibraryID == libraryID {
+			return row, nil
+		}
+	}
+	return AdminDeletedLibraryProjectionRow{}, gocql.ErrNotFound
+}
+
+func AddDeleteAdminLibraryReadModelQueries(session *gocql.Session, batch *gocql.Batch, orgID, libraryID string) error {
+	projectionRow, err := ReadAdminLibraryProjectionRow(session, orgID, libraryID)
+	if err == nil {
+		AddDeleteAdminLibraryReadModelQuery(batch, projectionRow)
+		return nil
+	}
+	if err != gocql.ErrNotFound {
+		return err
+	}
+
+	deletedRow, err := ReadDeletedAdminLibraryProjectionRow(session, orgID, libraryID)
+	if err == nil {
+		return AddDeleteDeletedAdminLibraryReadModelFallbackQueries(session, batch, deletedRow)
+	}
+	if err == gocql.ErrNotFound {
+		return nil
+	}
+	return err
 }
 
 func SyncAdminLibraryReadModel(session *gocql.Session, orgID, libraryID string) error {

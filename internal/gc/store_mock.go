@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Sesame-Disk/sesamefs/internal/traffic"
 	"github.com/google/uuid"
 )
 
@@ -56,6 +57,15 @@ type MockStore struct {
 
 	// deleted_libraries keyed by "libraryID"
 	deletedLibraries map[uuid.UUID]*mockDeletedLibrary
+
+	// storage snapshots keyed by storage scope.
+	storageSnapshots map[string]traffic.StorageSnapshot
+
+	// pending aggregate storage reconciliation keyed by scope.
+	storageCounterReconciliations map[string]*mockStorageCounterReconciliation
+
+	// in-progress org hard-delete locks keyed by orgID.
+	orgHardDeleteLocks map[uuid.UUID]time.Time
 
 	// share_links keyed by shareToken
 	shareLinks map[string]*mockShareLink
@@ -184,35 +194,45 @@ type mockDeletedLibrary struct {
 	DeletedAt    time.Time
 }
 
+type mockStorageCounterReconciliation struct {
+	Scope       string
+	OrgID       uuid.UUID
+	OwnerID     uuid.UUID
+	RequestedAt time.Time
+}
+
 // NewMockStore creates a new in-memory mock store.
 func NewMockStore() *MockStore {
 	return &MockStore{
-		queue:             make(map[uuid.UUID][]QueueItem),
-		blocks:            make(map[string]*mockBlock),
-		blockGCCandidates: make(map[string]*mockBlockGCCandidate),
-		mappings:          make(map[string]string),
-		commits:           make(map[string]*mockCommit),
-		fsObjects:         make(map[string]*mockFSObject),
-		libraries:         make(map[uuid.UUID]*mockLibrary),
-		orgNames:          make(map[uuid.UUID]string),
-		orgStatus:         make(map[uuid.UUID]string),
-		orgDeletedAt:      make(map[uuid.UUID]time.Time),
-		users:             make(map[string]*mockUser),
-		groups:            make(map[string]bool),
-		groupMembers:      make(map[string]bool),
-		groupsByMember:    make(map[string]bool),
-		deletedLibraries:  make(map[uuid.UUID]*mockDeletedLibrary),
-		shareLinks:        make(map[string]*mockShareLink),
-		shares:            make(map[string]*mockShare),
-		restoreJobs:       make(map[string]*mockRestoreJob),
-		repoTags:          make(map[string]bool),
-		fileTags:          make(map[string]*mockFileTag),
-		apiTokens:         make(map[string]*mockAPIToken),
-		lockedFiles:       make(map[string]bool),
-		starredFiles:      make(map[uuid.UUID]bool),
-		monitoredRepos:    make(map[uuid.UUID]bool),
-		gcStats:           make(map[string]string),
-		organizations:     nil,
+		queue:                         make(map[uuid.UUID][]QueueItem),
+		blocks:                        make(map[string]*mockBlock),
+		blockGCCandidates:             make(map[string]*mockBlockGCCandidate),
+		mappings:                      make(map[string]string),
+		commits:                       make(map[string]*mockCommit),
+		fsObjects:                     make(map[string]*mockFSObject),
+		libraries:                     make(map[uuid.UUID]*mockLibrary),
+		orgNames:                      make(map[uuid.UUID]string),
+		orgStatus:                     make(map[uuid.UUID]string),
+		orgDeletedAt:                  make(map[uuid.UUID]time.Time),
+		users:                         make(map[string]*mockUser),
+		groups:                        make(map[string]bool),
+		groupMembers:                  make(map[string]bool),
+		groupsByMember:                make(map[string]bool),
+		deletedLibraries:              make(map[uuid.UUID]*mockDeletedLibrary),
+		storageSnapshots:              make(map[string]traffic.StorageSnapshot),
+		storageCounterReconciliations: make(map[string]*mockStorageCounterReconciliation),
+		orgHardDeleteLocks:            make(map[uuid.UUID]time.Time),
+		shareLinks:                    make(map[string]*mockShareLink),
+		shares:                        make(map[string]*mockShare),
+		restoreJobs:                   make(map[string]*mockRestoreJob),
+		repoTags:                      make(map[string]bool),
+		fileTags:                      make(map[string]*mockFileTag),
+		apiTokens:                     make(map[string]*mockAPIToken),
+		lockedFiles:                   make(map[string]bool),
+		starredFiles:                  make(map[uuid.UUID]bool),
+		monitoredRepos:                make(map[uuid.UUID]bool),
+		gcStats:                       make(map[string]string),
+		organizations:                 nil,
 	}
 }
 
@@ -254,6 +274,29 @@ func (m *MockStore) AddBlockMapping(orgID uuid.UUID, externalID, internalID stri
 	defer m.mu.Unlock()
 	key := fmt.Sprintf("%s:%s", orgID, externalID)
 	m.mappings[key] = internalID
+}
+
+func (m *MockStore) AddStorageSnapshot(scope string, bytesUsed, fileCount int64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.storageSnapshots[scope] = traffic.StorageSnapshot{BytesUsed: bytesUsed, FileCount: fileCount}
+}
+
+func (m *MockStore) StorageSnapshot(scope string) traffic.StorageSnapshot {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.storageSnapshots[scope]
+}
+
+func (m *MockStore) AddPendingStorageCounterReconciliation(scope string, orgID, ownerID uuid.UUID) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.storageCounterReconciliations[scope] = &mockStorageCounterReconciliation{
+		Scope:       scope,
+		OrgID:       orgID,
+		OwnerID:     ownerID,
+		RequestedAt: time.Now(),
+	}
 }
 
 func (m *MockStore) AddCommit(libraryID uuid.UUID, commitID, rootFSID string) {
@@ -340,6 +383,17 @@ func (m *MockStore) AddLibrary(orgID, libraryID uuid.UUID, storageClass string) 
 	m.libraries[libraryID] = &mockLibrary{
 		OrgID:        orgID,
 		LibraryID:    libraryID,
+		StorageClass: storageClass,
+	}
+}
+
+func (m *MockStore) AddLibraryWithOwner(orgID, libraryID, ownerID uuid.UUID, storageClass string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.libraries[libraryID] = &mockLibrary{
+		OrgID:        orgID,
+		LibraryID:    libraryID,
+		OwnerID:      ownerID,
 		StorageClass: storageClass,
 	}
 }
@@ -1121,6 +1175,58 @@ func (m *MockStore) ListFSObjectIDsForLibrary(libraryID uuid.UUID) ([]string, er
 	return ids, nil
 }
 
+func (m *MockStore) ReconcilePendingStorageCounters() (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if len(m.storageCounterReconciliations) == 0 {
+		return 0, nil
+	}
+
+	expected := make(map[string]traffic.StorageSnapshot, len(m.storageCounterReconciliations))
+	for _, lib := range m.libraries {
+		if !lib.DeletedAt.IsZero() {
+			continue
+		}
+		libScope := traffic.LibraryStorageScope(lib.OrgID.String(), lib.LibraryID.String())
+		libSnapshot := m.storageSnapshots[libScope]
+		if libSnapshot.BytesUsed == 0 && libSnapshot.FileCount == 0 {
+			continue
+		}
+
+		if _, ok := m.storageCounterReconciliations[traffic.PlatformStorageScope()]; ok {
+			snap := expected[traffic.PlatformStorageScope()]
+			snap.BytesUsed += libSnapshot.BytesUsed
+			snap.FileCount += libSnapshot.FileCount
+			expected[traffic.PlatformStorageScope()] = snap
+		}
+
+		orgScope := traffic.OrganizationStorageScope(lib.OrgID.String())
+		if _, ok := m.storageCounterReconciliations[orgScope]; ok {
+			snap := expected[orgScope]
+			snap.BytesUsed += libSnapshot.BytesUsed
+			snap.FileCount += libSnapshot.FileCount
+			expected[orgScope] = snap
+		}
+
+		userScope := traffic.UserStorageScope(lib.OrgID.String(), lib.OwnerID.String())
+		if _, ok := m.storageCounterReconciliations[userScope]; ok {
+			snap := expected[userScope]
+			snap.BytesUsed += libSnapshot.BytesUsed
+			snap.FileCount += libSnapshot.FileCount
+			expected[userScope] = snap
+		}
+	}
+
+	reconciled := 0
+	for scope := range m.storageCounterReconciliations {
+		m.storageSnapshots[scope] = expected[scope]
+		delete(m.storageCounterReconciliations, scope)
+		reconciled++
+	}
+	return reconciled, nil
+}
+
 func (m *MockStore) ListLibrariesWithVersionTTL() ([]LibraryTTLInfo, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -1480,7 +1586,27 @@ func (m *MockStore) ListDeletedUsersExpired(graceDays int) ([]DeletedUserInfo, e
 func (m *MockStore) ListLibrariesByOwner(orgID, ownerID uuid.UUID) ([]uuid.UUID, error) {
 	return nil, nil
 }
-func (m *MockStore) SoftDeleteLibrary(orgID, libraryID, deletedBy uuid.UUID) error { return nil }
+func (m *MockStore) SoftDeleteLibrary(orgID, libraryID, deletedBy uuid.UUID) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	lib, ok := m.libraries[libraryID]
+	if !ok {
+		return nil
+	}
+	lib.DeletedAt = time.Now()
+	m.deletedLibraries[libraryID] = &mockDeletedLibrary{
+		OrgID:        orgID,
+		LibraryID:    libraryID,
+		StorageClass: lib.StorageClass,
+		DeletedAt:    lib.DeletedAt,
+	}
+	m.storageCounterReconciliations[traffic.PlatformStorageScope()] = &mockStorageCounterReconciliation{Scope: traffic.PlatformStorageScope(), RequestedAt: time.Now()}
+	m.storageCounterReconciliations[traffic.OrganizationStorageScope(orgID.String())] = &mockStorageCounterReconciliation{Scope: traffic.OrganizationStorageScope(orgID.String()), OrgID: orgID, RequestedAt: time.Now()}
+	if lib.OwnerID != uuid.Nil {
+		m.storageCounterReconciliations[traffic.UserStorageScope(orgID.String(), lib.OwnerID.String())] = &mockStorageCounterReconciliation{Scope: traffic.UserStorageScope(orgID.String(), lib.OwnerID.String()), OrgID: orgID, OwnerID: lib.OwnerID, RequestedAt: time.Now()}
+	}
+	return nil
+}
 func (m *MockStore) ListGroupMembershipsByUser(orgID, userID uuid.UUID) ([]uuid.UUID, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -1642,6 +1768,14 @@ func (m *MockStore) DeleteGroupFull(orgID, groupID uuid.UUID) error {
 func (m *MockStore) HardDeleteOrg(orgID uuid.UUID) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if _, locked := m.orgHardDeleteLocks[orgID]; locked {
+		return fmt.Errorf("org %s hard delete already in progress", orgID)
+	}
+	m.orgHardDeleteLocks[orgID] = time.Now()
+	defer delete(m.orgHardDeleteLocks, orgID)
+	if m.orgStatus[orgID] != "deleted" {
+		return fmt.Errorf("org %s is not in deleted state", orgID)
+	}
 	for _, lib := range m.libraries {
 		if lib.OrgID == orgID {
 			return fmt.Errorf("org %s still has live libraries", orgID)

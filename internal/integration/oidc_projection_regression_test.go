@@ -200,7 +200,10 @@ func prepareOIDCProjectionExchange(t *testing.T, client *authpkg.OIDCClient, pro
 	return state
 }
 
-func forceCanonicalUserRole(t *testing.T, orgID, userID, role string) {
+// seedLegacyTenantRoleForTest is a last-resort fixture helper for legacy OIDC
+// states that the public admin APIs intentionally reject, such as tenant users
+// carrying a stale superadmin role from older deployments.
+func seedLegacyTenantRoleForTest(t *testing.T, orgID, userID, role string) {
 	t.Helper()
 	if err := shareProjectionDBForTest(t).Session().Query(`
 		UPDATE users SET role = ? WHERE org_id = ? AND user_id = ?
@@ -209,7 +212,9 @@ func forceCanonicalUserRole(t *testing.T, orgID, userID, role string) {
 	}
 }
 
-func attachOIDCIdentityForTest(t *testing.T, issuer, subject, orgID, userID string) {
+// seedOIDCIdentityMappingForTest is an exceptional fixture helper for tests
+// that need a pre-existing OIDC link before running the canonical login flow.
+func seedOIDCIdentityMappingForTest(t *testing.T, issuer, subject, orgID, userID string) {
 	t.Helper()
 	session := shareProjectionDBForTest(t).Session()
 	if err := session.Query(`
@@ -334,7 +339,7 @@ func TestOIDCProjectionRegression_EmailAdoptionNormalizesLegacyTenantSuperadmin(
 	if !found {
 		t.Fatalf("expected user_id for %s", email)
 	}
-	forceCanonicalUserRole(t, orgID, userID, "superadmin")
+	seedLegacyTenantRoleForTest(t, orgID, userID, "superadmin")
 
 	provider := newOIDCProjectionMockProvider(t, oidcProjectionIdentity{
 		Subject: subject,
@@ -409,7 +414,7 @@ func TestOIDCProjectionRegression_ExistingOIDCUserReloginReconcilesRoleToProject
 		OrgID:   orgID,
 		Roles:   []string{"superadmin"},
 	})
-	attachOIDCIdentityForTest(t, provider.server.URL, subject, orgID, userID)
+	seedOIDCIdentityMappingForTest(t, provider.server.URL, subject, orgID, userID)
 	client := newOIDCProjectionTestClient(t, provider.server.URL, "unused")
 	state := prepareOIDCProjectionExchange(t, client, provider)
 

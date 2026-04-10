@@ -180,6 +180,62 @@ api_body() {
     echo "$body"
 }
 
+API_CALL_STATUS=""
+API_CALL_BODY=""
+
+# Executes a request and stores both HTTP status and response body in globals.
+api_call() {
+    local method="$1" endpoint="$2" token="$3" data="$4"
+    local url="${API_URL}${endpoint}"
+    local opts=(-s -w "\n__HTTP_STATUS__:%{http_code}")
+    if [ -n "$token" ]; then opts+=(-H "Authorization: Token $token"); fi
+    opts+=(-H "Content-Type: application/json")
+    if [ -n "$data" ]; then opts+=(-d "$data"); fi
+
+    local response
+    response=$(curl "${opts[@]}" -X "$method" "$url")
+    API_CALL_STATUS="${response##*$'\n'__HTTP_STATUS__:}"
+    API_CALL_BODY="${response%$'\n'__HTTP_STATUS__:*}"
+
+    if [ "$VERBOSE" = true ]; then
+        echo -e "${YELLOW}[RESP]${NC} $method $endpoint (status=${API_CALL_STATUS})" >&2
+        echo "$API_CALL_BODY" | jq . 2>/dev/null >&2 || echo "$API_CALL_BODY" >&2
+    fi
+}
+
+wait_for_copy_move_task() {
+    local task_id="$1" description="$2"
+    local attempt done failed reason
+
+    for attempt in $(seq 1 20); do
+        api_call "GET" "/api/v2.1/copy-move-task/?task_id=${task_id}" "$ADMIN_TOKEN" ""
+        if [ "$API_CALL_STATUS" != "200" ]; then
+            sleep 1
+            continue
+        fi
+
+        done=$(echo "$API_CALL_BODY" | jq -r '.done // false')
+        if [ "$done" = "true" ]; then
+            failed=$(echo "$API_CALL_BODY" | jq -r '.failed // 0')
+            if [ "$failed" != "0" ]; then
+                reason=$(echo "$API_CALL_BODY" | jq -r '.failed_reason // empty')
+                if [ -n "$reason" ]; then
+                    log_info "$description task failed: $reason"
+                fi
+                return 1
+            fi
+            return 0
+        fi
+
+        sleep 1
+    done
+
+    if [ -n "$API_CALL_BODY" ] && [ "$VERBOSE" = true ]; then
+        echo -e "  ${YELLOW}Last task response:${NC} $API_CALL_BODY"
+    fi
+    return 1
+}
+
 # Create a library, return repo_id
 create_library() {
     local name="$1"
@@ -1075,12 +1131,29 @@ test_cross_repo_copy_replace() {
     # Create source file
     create_file "$REPO_ID" "/cross-replace.md"
 
-    # Copy with replace policy — should succeed (returns task_id for async)
-    local status=$(async_batch_copy_with_policy "$REPO_ID" "/" "$REPO_ID2" "/" "replace" "cross-replace.md")
-    run_test "Cross-repo copy with replace returns 200" "200" "$status"
+    # Copy with replace policy — should succeed and return a task_id for async polling.
+    api_call "POST" "/api/v2.1/repos/async-batch-copy-item/" "$ADMIN_TOKEN" \
+        "{\"src_repo_id\":\"${REPO_ID}\",\"src_parent_dir\":\"/\",\"dst_repo_id\":\"${REPO_ID2}\",\"dst_parent_dir\":\"/\",\"src_dirents\":[\"cross-replace.md\"],\"conflict_policy\":\"replace\"}"
+    run_test "Cross-repo copy with replace returns 200" "200" "$API_CALL_STATUS"
 
-    # Wait for async task to complete
-    sleep 2
+    local task_id
+    task_id=$(echo "$API_CALL_BODY" | jq -r '.task_id // empty')
+    local has_task_id="no"
+    if [ -n "$task_id" ]; then
+        has_task_id="yes"
+    fi
+    run_test "Cross-repo copy with replace returns task_id" "yes" "$has_task_id"
+    if [ -z "$task_id" ]; then
+        return
+    fi
+    local wait_status="completed"
+    if ! wait_for_copy_move_task "$task_id" "Cross-repo replace-copy"; then
+        wait_status="incomplete"
+    fi
+    run_test "Cross-repo replace-copy task completes" "completed" "$wait_status"
+    if [ "$wait_status" != "completed" ]; then
+        return
+    fi
 
     # Source should still exist (it's a copy)
     local body=$(list_dir "$REPO_ID" "/")
@@ -1101,12 +1174,29 @@ test_cross_repo_copy_autorename() {
     # Create source file
     create_file "$REPO_ID" "/cross-rename.md"
 
-    # Copy with autorename
-    local status=$(async_batch_copy_with_policy "$REPO_ID" "/" "$REPO_ID2" "/" "autorename" "cross-rename.md")
-    run_test "Cross-repo copy with autorename returns 200" "200" "$status"
+    # Copy with autorename and wait for the canonical async task to finish.
+    api_call "POST" "/api/v2.1/repos/async-batch-copy-item/" "$ADMIN_TOKEN" \
+        "{\"src_repo_id\":\"${REPO_ID}\",\"src_parent_dir\":\"/\",\"dst_repo_id\":\"${REPO_ID2}\",\"dst_parent_dir\":\"/\",\"src_dirents\":[\"cross-rename.md\"],\"conflict_policy\":\"autorename\"}"
+    run_test "Cross-repo copy with autorename returns 200" "200" "$API_CALL_STATUS"
 
-    # Wait for async task
-    sleep 2
+    local task_id
+    task_id=$(echo "$API_CALL_BODY" | jq -r '.task_id // empty')
+    local has_task_id="no"
+    if [ -n "$task_id" ]; then
+        has_task_id="yes"
+    fi
+    run_test "Cross-repo copy with autorename returns task_id" "yes" "$has_task_id"
+    if [ -z "$task_id" ]; then
+        return
+    fi
+    local wait_status="completed"
+    if ! wait_for_copy_move_task "$task_id" "Cross-repo autorename-copy"; then
+        wait_status="incomplete"
+    fi
+    run_test "Cross-repo autorename-copy task completes" "completed" "$wait_status"
+    if [ "$wait_status" != "completed" ]; then
+        return
+    fi
 
     # Both original and renamed should exist in destination
     local body=$(list_dir "$REPO_ID2" "/")

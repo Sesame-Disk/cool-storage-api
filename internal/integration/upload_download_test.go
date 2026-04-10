@@ -234,7 +234,7 @@ func TestDuplicateSeafhttpUploadIncrementsBlockRefCount(t *testing.T) {
 	expectStatus(t, resp, http.StatusOK)
 	uploadURL := strings.Trim(responseBody(t, resp), "\" \n\r")
 
-	fileContent := "same-content-across-uploads\n"
+	fileContent := fmt.Sprintf("same-content-across-uploads-%s\n", repoID)
 	uploadFileThroughLink(t, adminClient, uploadURL, "dup-a.txt", "/", fileContent)
 	uploadFileThroughLink(t, adminClient, uploadURL, "dup-b.txt", "/", fileContent)
 
