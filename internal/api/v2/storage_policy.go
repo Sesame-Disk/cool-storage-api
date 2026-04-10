@@ -199,6 +199,9 @@ func validateRequestedCreateStorageClass(cfg *config.Config, requestedClass stri
 }
 
 func validateOrgStoragePolicy(cfg *config.Config, policy orgStoragePolicy) error {
+	if policy.DataResidency == orgDataResidencyStrict && policy.DefaultRegion == "" {
+		return fmt.Errorf("strict data residency requires a default_region")
+	}
 	if policy.DefaultRegion == "" {
 		return nil
 	}
@@ -237,15 +240,10 @@ func resolveFlexibleCreateStorageClass(cfg *config.Config, policy orgStoragePoli
 func resolveStrictCreateStorageClass(cfg *config.Config, policy orgStoragePolicy, hostname, requestedClass string) (string, error) {
 	allowedRegion := strings.ToLower(strings.TrimSpace(policy.DefaultRegion))
 	if allowedRegion == "" {
-		if region := resolveEndpointRegion(cfg, hostname); region != "" && region != "default" {
-			allowedRegion = region
-		}
+		return "", fmt.Errorf("organization data residency policy is misconfigured; contact an administrator or support")
 	}
-	if allowedRegion == "" {
-		allowedRegion = storageClassRegion(cfg, resolveGlobalDefaultHotStorageClass(cfg))
-	}
-	if allowedRegion == "" {
-		return "", fmt.Errorf("no valid hot storage class configured")
+	if hotStorageClassForRegion(cfg, allowedRegion) == "" {
+		return "", fmt.Errorf("organization data residency policy is misconfigured; contact an administrator or support")
 	}
 
 	requestedClass = strings.TrimSpace(requestedClass)
@@ -262,7 +260,7 @@ func resolveStrictCreateStorageClass(cfg *config.Config, policy orgStoragePolicy
 	if storageClass := hotStorageClassForRegion(cfg, allowedRegion); storageClass != "" {
 		return storageClass, nil
 	}
-	return "", fmt.Errorf("no valid hot storage class configured for region %q", allowedRegion)
+	return "", fmt.Errorf("organization data residency policy is misconfigured; contact an administrator or support")
 }
 
 func resolveCreateStorageClass(cfg *config.Config, policy orgStoragePolicy, hostname, requestedClass string) (string, error) {
@@ -293,6 +291,21 @@ func resolveCreateStorageClassForOrg(database *db.DB, cfg *config.Config, orgID,
 		return "", err
 	}
 	return resolveCreateStorageClass(cfg, policy, hostname, requestedClass)
+}
+
+func listConfiguredStorageRegions(cfg *config.Config) []string {
+	if cfg == nil {
+		return []string{}
+	}
+
+	regions := make([]string, 0, len(cfg.Storage.RegionClasses))
+	for region := range cfg.Storage.RegionClasses {
+		if hotStorageClassForRegion(cfg, region) != "" {
+			regions = append(regions, strings.ToLower(strings.TrimSpace(region)))
+		}
+	}
+	sort.Strings(regions)
+	return regions
 }
 
 func displayStorageNameForConfig(cfg *config.Config, storageClass string) string {

@@ -136,6 +136,48 @@ func createSuperadminRepoWithHost(t *testing.T, ownerEmail, name, host string) s
 	return repoID
 }
 
+func TestOrgAdminCanReadAndUpdateOwnStoragePolicy(t *testing.T) {
+	setOrgStoragePolicyForTest(t, defaultOrgID, "flexible", "usa")
+
+	getResp := adminClient.Get(t, "/api/v2.1/org/admin/info/")
+	expectStatus(t, getResp, http.StatusOK)
+	getPayload := responseJSON(t, getResp)
+	policy, ok := getPayload["storage_policy"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("org-admin info missing storage_policy: %v", getPayload)
+	}
+	if got, _ := policy["data_residency"].(string); got != "flexible" {
+		t.Fatalf("initial data_residency = %q, want %q", got, "flexible")
+	}
+	regions, ok := getPayload["available_storage_regions"].([]interface{})
+	if !ok || len(regions) == 0 {
+		t.Fatalf("org-admin info missing available_storage_regions: %v", getPayload)
+	}
+
+	updateResp := adminClient.PutJSON(t, "/api/v2.1/org/admin/info/", map[string]interface{}{
+		"storage_policy": map[string]interface{}{
+			"data_residency": "strict",
+			"default_region": "usa",
+		},
+	})
+	expectStatus(t, updateResp, http.StatusOK)
+	updateResp.Body.Close()
+
+	verifyResp := adminClient.Get(t, "/api/v2.1/org/admin/info/")
+	expectStatus(t, verifyResp, http.StatusOK)
+	verifyPayload := responseJSON(t, verifyResp)
+	verifyPolicy, ok := verifyPayload["storage_policy"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("updated org-admin info missing storage_policy: %v", verifyPayload)
+	}
+	if got, _ := verifyPolicy["data_residency"].(string); got != "strict" {
+		t.Fatalf("updated data_residency = %q, want %q", got, "strict")
+	}
+	if got, _ := verifyPolicy["default_region"].(string); got != "usa" {
+		t.Fatalf("updated default_region = %q, want %q", got, "usa")
+	}
+}
+
 func TestOrgStoragePolicyStrictAcrossCreateFlows(t *testing.T) {
 	setOrgStoragePolicyForTest(t, defaultOrgID, "strict", "usa")
 	host := "eu.sesamefs.local"

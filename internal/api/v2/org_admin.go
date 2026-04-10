@@ -254,6 +254,7 @@ func (h *OrgAdminHandler) GetOrgInfo(c *gin.Context) {
 	}
 
 	var name, plan, quotaPolicy, billingCycle string
+	var storageConfig map[string]string
 	var storageQuota int64
 	var trafficQuota, trafficUploadQuota, trafficDownloadQuota int64
 	var maxUsers int
@@ -263,15 +264,21 @@ func (h *OrgAdminHandler) GetOrgInfo(c *gin.Context) {
 	err = h.db.Session().Query(`
 		SELECT name, storage_quota, created_at,
 		       traffic_quota, traffic_upload_quota, traffic_download_quota,
-		       max_users, plan, quota_policy, billing_cycle,
+		       max_users, plan, quota_policy, storage_config, billing_cycle,
 		       current_period_started_at, current_period_ends_at
 		FROM organizations WHERE org_id = ?
 	`, orgID).Scan(&name, &storageQuota, &createdAt,
 		&trafficQuota, &trafficUploadQuota, &trafficDownloadQuota,
-		&maxUsers, &plan, &quotaPolicy, &billingCycle,
+		&maxUsers, &plan, &quotaPolicy, &storageConfig, &billingCycle,
 		&currentPeriodStartedAt, &currentPeriodEndsAt)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "organization not found"})
+		return
+	}
+
+	storagePolicy, err := normalizeOrgStoragePolicy(storageConfig)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "invalid organization storage policy"})
 		return
 	}
 
@@ -324,6 +331,8 @@ func (h *OrgAdminHandler) GetOrgInfo(c *gin.Context) {
 		// Traffic quota info
 		"plan":                             plan,
 		"quota_policy":                     quotaPolicy,
+		"storage_policy":                   storagePolicy.storageConfig(),
+		"available_storage_regions":        listConfiguredStorageRegions(h.config),
 		"billing_cycle":                    billingCycle,
 		"current_period_started_at":        currentPeriodStartedAt,
 		"current_period_ends_at":           currentPeriodEndsAt,
@@ -364,6 +373,10 @@ func (h *OrgAdminHandler) UpdateOrgInfo(c *gin.Context) {
 		TrafficQuota         *int64 `json:"traffic_quota"`
 		TrafficUploadQuota   *int64 `json:"traffic_upload_quota"`
 		TrafficDownloadQuota *int64 `json:"traffic_download_quota"`
+		StoragePolicy        *struct {
+			DataResidency string `json:"data_residency"`
+			DefaultRegion string `json:"default_region"`
+		} `json:"storage_policy"`
 	}
 	if err := c.ShouldBindJSON(&body); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
@@ -375,6 +388,9 @@ func (h *OrgAdminHandler) UpdateOrgInfo(c *gin.Context) {
 		return
 	}
 
+	batch := h.db.Session().Batch(gocql.LoggedBatch)
+	hasUpdates := false
+
 	if body.OrgName != "" {
 		orgProjectionRow, err := db.ReadAdminOrganizationProjectionRow(h.db.Session(), orgID)
 		if err != nil {
@@ -383,11 +399,33 @@ func (h *OrgAdminHandler) UpdateOrgInfo(c *gin.Context) {
 		}
 		orgProjectionRow.Name = body.OrgName
 
-		batch := h.db.Session().Batch(gocql.LoggedBatch)
 		batch.Query(`
 			UPDATE organizations SET name = ? WHERE org_id = ?
 		`, body.OrgName, orgID)
 		db.AddUpsertAdminOrganizationReadModelQuery(batch, orgProjectionRow)
+		hasUpdates = true
+	}
+
+	if body.StoragePolicy != nil {
+		storagePolicy, err := normalizeOrgStoragePolicy(map[string]string{
+			"data_residency": body.StoragePolicy.DataResidency,
+			"default_region": body.StoragePolicy.DefaultRegion,
+		})
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		if err := validateOrgStoragePolicy(h.config, storagePolicy); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		batch.Query(`
+			UPDATE organizations SET storage_config = ? WHERE org_id = ?
+		`, storagePolicy.storageConfig(), orgID)
+		hasUpdates = true
+	}
+
+	if hasUpdates {
 		if err := batch.Exec(); err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update organization"})
 			return

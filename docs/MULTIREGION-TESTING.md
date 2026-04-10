@@ -214,9 +214,9 @@ docker compose up -d --build sesamefs
 
 Current limitations of this slice:
 
-- no frontend UI yet for setting org residency policy
 - no migration workflow for existing non-empty libraries
 - no create-time primary placement into cold classes
+- no policy-driven relocation of libraries created before a policy change
 
 ## Available Test Scripts
 

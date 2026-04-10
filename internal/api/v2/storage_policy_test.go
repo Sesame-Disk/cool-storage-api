@@ -102,7 +102,28 @@ func TestValidateOrgStoragePolicy(t *testing.T) {
 		t.Fatalf("validateOrgStoragePolicy returned unexpected error: %v", err)
 	}
 
+	if err := validateOrgStoragePolicy(cfg, orgStoragePolicy{DataResidency: orgDataResidencyStrict}); err == nil {
+		t.Fatal("expected error for strict policy without default_region")
+	}
+
 	if err := validateOrgStoragePolicy(cfg, orgStoragePolicy{DataResidency: orgDataResidencyStrict, DefaultRegion: "apac"}); err == nil {
 		t.Fatal("expected error for unknown default_region")
+	}
+}
+
+func TestListConfiguredStorageRegions(t *testing.T) {
+	regions := listConfiguredStorageRegions(testStoragePolicyConfig())
+	if len(regions) != 2 {
+		t.Fatalf("len(regions) = %d, want 2", len(regions))
+	}
+	if regions[0] != "eu" || regions[1] != "usa" {
+		t.Fatalf("regions = %v, want [eu usa]", regions)
+	}
+}
+
+func TestResolveStrictCreateStorageClassRequiresConfiguredRegion(t *testing.T) {
+	_, err := resolveCreateStorageClass(testStoragePolicyConfig(), orgStoragePolicy{DataResidency: orgDataResidencyStrict}, "eu.example.com", "")
+	if err == nil {
+		t.Fatal("expected error for strict policy without configured region")
 	}
 }

@@ -17,7 +17,8 @@ Introduced a backend-only org storage policy base that governs where **new** lib
 What now exists in code:
 
 - `organizations.storage_config` is parsed as org `storage_policy`
-- supported policy values are `data_residency: strict|flexible` plus optional `default_region`
+- supported policy values are `data_residency: strict|flexible`; `default_region` is fallback-only in `flexible` and required in `strict`
+- sys-admin and org-admin info pages now expose policy editing UI
 - create-time storage resolution now honors org policy across:
    - personal library create
    - group-owned library create

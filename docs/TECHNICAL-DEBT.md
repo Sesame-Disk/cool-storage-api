@@ -853,7 +853,7 @@ That means the remaining split is intentional by access pattern, not a leftover 
 
 ---
 
-## 17. Org Storage Policy: Frontend, Migration, And Operational Follow-ups — 🟡 Backend base complete (2026-04-09)
+## 17. Org Storage Policy: Migration And Operational Follow-ups — 🟡 Sys-admin and org-admin UI landed (2026-04-09)
 
 ### Status
 
@@ -861,8 +861,9 @@ The backend base for org-level storage policy is now live for **new library crea
 
 What is implemented:
 
-- `organizations.storage_config` stores `data_residency` (`strict` / `flexible`) and optional `default_region`
+- `organizations.storage_config` stores `data_residency` (`strict` / `flexible`) plus `default_region` semantics: fallback in `flexible`, required pinned region in `strict`
 - sys-admin org detail/update endpoints expose and persist `storage_policy`
+- sys-admin and org-admin info pages can view and edit `storage_policy`
 - create-time storage resolution honors org policy for:
   - personal library creation
   - group-owned library creation
@@ -873,19 +874,18 @@ What is implemented:
 
 ### What Is Still Deferred
 
-1. Frontend/admin UI for viewing and editing org `storage_policy`
-2. Migration or background job support for moving existing libraries between regions
-3. Policy effects beyond create-time, such as retroactive enforcement or relocation
-4. Product/UX decisions for cold-tier primary placement during create flows
-5. Optional org projection denormalization of `storage_config` if list/search views ever need it
+1. Migration or background job support for moving existing libraries between regions
+2. Policy effects beyond create-time, such as retroactive enforcement or relocation
+3. Product/UX decisions for cold-tier primary placement during create flows
+4. Optional org projection denormalization of `storage_config` if list/search views ever need it
 
 ### Why This Is Still Debt
 
-The backend slice is enough to enforce residency for new libraries, but it is not yet a full product surface:
+The current slice is enough to enforce residency for new libraries and to manage policy from the admin UI, but it is not yet the full lifecycle:
 
-- operators still need API-level knowledge to configure policy
 - existing libraries remain where they are until an explicit migration design exists
-- the frontend cannot yet explain or visualize the org policy state to admins
+- policy changes are not retroactive
+- cold-tier create semantics are still intentionally deferred
 
 ### Decision For Now
 
@@ -893,9 +893,9 @@ Keep this as backend-first infrastructure. Do not expand it implicitly into migr
 
 When resuming this line of work, the recommended order is:
 
-1. Add org-admin/sys-admin UI for `storage_policy`
-2. Design migration semantics for existing libraries
-3. Decide whether policy should stay create-time-only or become enforceable for post-create operations
+1. Design migration semantics for existing libraries
+2. Decide whether policy should stay create-time-only or become enforceable for post-create operations
+3. Decide whether org policy should appear in additional admin list/search surfaces beyond org info
 
 ---
 

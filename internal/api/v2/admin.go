@@ -335,6 +335,7 @@ func (h *AdminHandler) GetOrganization(c *gin.Context) {
 		"plan":                      plan,
 		"quota_policy":              quotaPolicy,
 		"storage_policy":            storagePolicy.storageConfig(),
+		"available_storage_regions": listConfiguredStorageRegions(h.config),
 		"billing_cycle":             billingCycle,
 		"current_period_started_at": currentPeriodStartedAt,
 		"current_period_ends_at":    currentPeriodEndsAt,

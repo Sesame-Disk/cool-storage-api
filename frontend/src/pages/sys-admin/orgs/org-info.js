@@ -9,9 +9,20 @@ import Loading from '../../../components/loading';
 import SysAdminSetOrgQuotaDialog from '../../../components/dialog/sysadmin-dialog/set-org-traffic-quotas';
 import SysAdminSetOrgNameDialog from '../../../components/dialog/sysadmin-dialog/sysadmin-set-org-name-dialog';
 import SysAdminSetOrgMaxUserNumberDialog from '../../../components/dialog/sysadmin-dialog/sysadmin-set-org-max-user-number-dialog';
+import SetOrgStoragePolicyDialog from '../../../components/dialog/set-org-storage-policy-dialog';
 import TransferOrgOwnershipDialog from '../../../components/dialog/transfer-org-ownership-dialog';
 import MainPanelTopbar from '../main-panel-topbar';
 import OrgNav from './org-nav';
+
+const formatStoragePolicyLabel = (policy) => {
+  const effectivePolicy = policy || {};
+  const dataResidency = effectivePolicy.data_residency || 'flexible';
+  const defaultRegion = effectivePolicy.default_region || '';
+  if (dataResidency === 'strict') {
+    return defaultRegion ? gettext('Strict') + ' (' + defaultRegion + ')' : gettext('Strict');
+  }
+  return defaultRegion ? gettext('Flexible') + ' (' + defaultRegion + ')' : gettext('Flexible');
+};
 
 class Content extends Component {
 
@@ -21,6 +32,7 @@ class Content extends Component {
       isSetQuotaDialogOpen: false,
       isSetNameDialogOpen: false,
       isSetMaxUserNumberDialogOpen: false,
+      isSetStoragePolicyDialogOpen: false,
       isTransferOwnershipDialogOpen: false
     };
   }
@@ -35,6 +47,10 @@ class Content extends Component {
 
   toggleSetMaxUserNumberDialog = () => {
     this.setState({ isSetMaxUserNumberDialogOpen: !this.state.isSetMaxUserNumberDialogOpen });
+  };
+
+  toggleSetStoragePolicyDialog = () => {
+    this.setState({ isSetStoragePolicyDialogOpen: !this.state.isSetStoragePolicyDialogOpen });
   };
 
   toggleTransferOwnershipDialog = () => {
@@ -63,8 +79,9 @@ class Content extends Component {
         quota, quota_usage, traffic_quota, traffic_upload_quota, traffic_download_quota,
         traffic_combined_used, traffic_upload_used, traffic_download_used,
         plan, billing_cycle, owner_email, owner_name, enable_saml_login, metadata_url, domain,
+        storage_policy, available_storage_regions,
       } = this.props.orgInfo;
-      const { isSetQuotaDialogOpen, isSetNameDialogOpen, isSetMaxUserNumberDialogOpen, isTransferOwnershipDialogOpen } = this.state;
+      const { isSetQuotaDialogOpen, isSetNameDialogOpen, isSetMaxUserNumberDialogOpen, isSetStoragePolicyDialogOpen, isTransferOwnershipDialogOpen } = this.state;
       const formatTrafficQuota = (used, limit) => {
         return `${Utils.bytesToSize(used || 0)} / ${limit > 0 ? Utils.bytesToSize(limit) : gettext('Unlimited')}`;
       };
@@ -106,6 +123,12 @@ class Content extends Component {
 
             <dt className="info-item-heading">{gettext('Billing Cycle')}</dt>
             <dd className="info-item-content">{billing_cycle || '--'}</dd>
+
+            <dt className="info-item-heading">{gettext('Storage Policy')}</dt>
+            <dd className="info-item-content">
+              {formatStoragePolicyLabel(storage_policy)}
+              {this.showEditIcon(this.toggleSetStoragePolicyDialog)}
+            </dd>
 
             <dt className="info-item-heading">{gettext('Space Used')}</dt>
             <dd className="info-item-content">
@@ -175,6 +198,14 @@ class Content extends Component {
               toggle={this.toggleSetMaxUserNumberDialog}
             />
           }
+          {isSetStoragePolicyDialogOpen &&
+            <SetOrgStoragePolicyDialog
+              policy={storage_policy}
+              availableRegions={available_storage_regions || []}
+              updatePolicy={this.props.updateStoragePolicy}
+              toggleDialog={this.toggleSetStoragePolicyDialog}
+            />
+          }
           {isTransferOwnershipDialogOpen &&
             <TransferOrgOwnershipDialog
               currentOwner={owner_email}
@@ -201,6 +232,7 @@ Content.propTypes = {
   updateQuota: PropTypes.func.isRequired,
   updateName: PropTypes.func.isRequired,
   updateMaxUserNumber: PropTypes.func.isRequired,
+  updateStoragePolicy: PropTypes.func.isRequired,
   searchOrgAdmins: PropTypes.func.isRequired,
   transferOwnership: PropTypes.func.isRequired,
 };
@@ -278,6 +310,19 @@ class OrgInfo extends Component {
     });
   };
 
+  updateStoragePolicy = (storagePolicy) => {
+    return seafileAPI.sysAdminUpdateOrg(this.props.orgID, { storage_policy: storagePolicy }).then(() => {
+      this.setState((prevState) => ({
+        orgInfo: Object.assign({}, prevState.orgInfo, { storage_policy: storagePolicy })
+      }));
+      toaster.success(gettext('Successfully updated storage policy.'));
+    }).catch((error) => {
+      const errMessage = Utils.getErrorMsg(error);
+      toaster.danger(errMessage);
+      return Promise.reject(errMessage);
+    });
+  };
+
   searchOrgAdmins = (query) => {
     return seafileAPI.sysAdminSearchUsers(query, 1, 25, this.props.orgID).then((res) => {
       const users = (res.data.users || res.data.user_list || []).filter((user) => user.is_staff || user.is_org_staff || user.role === 'owner');
@@ -315,6 +360,7 @@ class OrgInfo extends Component {
                 updateQuota={this.updateQuota}
                 updateName={this.updateName}
                 updateMaxUserNumber={this.updateMaxUserNumber}
+                updateStoragePolicy={this.updateStoragePolicy}
                 searchOrgAdmins={this.searchOrgAdmins}
                 transferOwnership={this.transferOwnership}
               />

@@ -113,6 +113,9 @@ func TestBuildBootstrapStorageOptionsUsesRegionLabelsAndDefault(t *testing.T) {
 			if option["name"] != "EU" {
 				t.Fatalf("eu option name = %v, want %q", option["name"], "EU")
 			}
+			if option["region"] != "eu" {
+				t.Fatalf("eu option region = %v, want %q", option["region"], "eu")
+			}
 			if option["is_default"] != true {
 				t.Fatalf("eu option is_default = %v, want true", option["is_default"])
 			}
@@ -146,5 +149,24 @@ func TestResolveBootstrapDefaultStorageClassUsesDeterministicSortedFallback(t *t
 
 	if got := s.resolveBootstrapDefaultStorageClass("unknown.example.com"); got != "hot-alpha" {
 		t.Fatalf("resolveBootstrapDefaultStorageClass = %q, want %q", got, "hot-alpha")
+	}
+}
+
+func TestBuildAppBootstrapPageOptionsIncludesOrgStoragePolicy(t *testing.T) {
+	s := createTestServer()
+	identity := bootstrapIdentity{UserID: "user-1", OrgID: "org-1", Role: "user", Email: "user@example.com"}
+	userData := bootstrapUserData{Email: "user@example.com", Name: "Test User", Role: "user"}
+	orgData := bootstrapOrgData{StorageConfig: map[string]string{"data_residency": "strict", "default_region": "usa"}}
+
+	pageOptions := s.buildAppBootstrapPageOptions(identity, userData, orgData)
+	policy, ok := pageOptions["orgStoragePolicy"].(map[string]string)
+	if !ok {
+		t.Fatalf("orgStoragePolicy has unexpected type: %T", pageOptions["orgStoragePolicy"])
+	}
+	if policy["data_residency"] != "strict" {
+		t.Fatalf("data_residency = %q, want %q", policy["data_residency"], "strict")
+	}
+	if policy["default_region"] != "usa" {
+		t.Fatalf("default_region = %q, want %q", policy["default_region"], "usa")
 	}
 }

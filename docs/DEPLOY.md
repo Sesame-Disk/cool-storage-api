@@ -628,7 +628,7 @@ What already works in the backend/frontend stack:
 
 - new libraries can persist an explicit `storage_id`
 - when no `storage_id` is provided, the backend can derive the default region from the request hostname
-- orgs can now persist `storage_policy` with `data_residency: strict|flexible` plus optional `default_region`
+- orgs can now persist `storage_policy` with `data_residency: strict|flexible`; `default_region` is an org fallback in `flexible` mode and is required in `strict` mode
 - new-library create flows honor org policy for personal libraries, group-owned libraries, org-admin group-owned libraries, and superadmin-created libraries
 - later writes and reads follow the persisted library `storage_class` instead of the request host default
 - focused integration tests cover create-library, raw serving, historic reads, and share-link raw serving
@@ -637,7 +637,7 @@ What the stock production deploy does **not** provide by itself yet:
 
 - `config.prod.yaml` still ships as a single-region example using legacy `backends:`
 - `docker-compose.prod.yml` does not spin up per-region SesameFS front doors or per-region storage configs automatically
-- there is no frontend/admin UI yet for org storage policy management; the current write path is the admin API
+- sys-admin and org-admin info pages can now edit org storage policy; direct API writes remain available for automation
 - there is no built-in migration workflow for existing non-empty libraries that need to move from one storage class to another
 - org policy only affects **new library creation** in this slice; it does not relocate existing libraries
 - create-time placement is intentionally limited to hot classes; cold-tier primary placement remains future design work
@@ -723,6 +723,8 @@ Notes:
 
 - `flexible` is the default when no `storage_policy` is stored
 - `default_region` must map to a configured `storage.region_classes.<region>.hot`
+- in `flexible`, `default_region` is only a fallback after hostname-based resolution
+- in `strict`, `default_region` is required; invalid strict configs make create requests fail explicitly so operators can correct the org policy
 - this slice affects only **new** libraries; existing libraries keep their persisted `storage_class`
 
 ### Step M3 — Firewall (private network)

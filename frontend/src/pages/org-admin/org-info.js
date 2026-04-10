@@ -6,7 +6,18 @@ import { ACCOUNTS_ORG_USER_ACTIONS, ACCOUNTS_ORG_USER_VIEWS, buildAccountsOrgUse
 import { Utils } from '../../utils/utils';
 import MainPanelTopbar from './main-panel-topbar';
 import TransferOrgOwnershipDialog from '../../components/dialog/transfer-org-ownership-dialog';
+import SetOrgStoragePolicyDialog from '../../components/dialog/set-org-storage-policy-dialog';
 import toaster from '../../components/toast';
+
+const formatStoragePolicyLabel = (policy) => {
+  const effectivePolicy = policy || {};
+  const dataResidency = effectivePolicy.data_residency || 'flexible';
+  const defaultRegion = effectivePolicy.default_region || '';
+  if (dataResidency === 'strict') {
+    return defaultRegion ? gettext('Strict') + ' (' + defaultRegion + ')' : gettext('Strict');
+  }
+  return defaultRegion ? gettext('Flexible') + ' (' + defaultRegion + ')' : gettext('Flexible');
+};
 
 class OrgInfo extends Component {
 
@@ -36,7 +47,10 @@ class OrgInfo extends Component {
       member_quota: 0,
       member_usage: 0,
       active_members: 0,
+      storage_policy: { data_residency: 'flexible', default_region: '' },
+      available_storage_regions: [],
       isTransferOwnershipDialogOpen: false,
+      isSetStoragePolicyDialogOpen: false,
       canTransferOwnership: isOrgOwner,
       userWritesDisabled: false,
       accountsOrgManagementURL: accountsOrgUserManagementURL,
@@ -45,6 +59,10 @@ class OrgInfo extends Component {
 
   toggleTransferOwnershipDialog = () => {
     this.setState({ isTransferOwnershipDialogOpen: !this.state.isTransferOwnershipDialogOpen });
+  };
+
+  toggleSetStoragePolicyDialog = () => {
+    this.setState({ isSetStoragePolicyDialogOpen: !this.state.isSetStoragePolicyDialogOpen });
   };
 
   searchOrgAdmins = (query) => {
@@ -94,6 +112,8 @@ class OrgInfo extends Component {
         member_quota: res.data.member_quota,
         member_usage: res.data.member_usage,
         active_members: res.data.active_members,
+        storage_policy: res.data.storage_policy || { data_residency: 'flexible', default_region: '' },
+        available_storage_regions: res.data.available_storage_regions || [],
         userWritesDisabled: !!res.data.org_user_writes_disabled,
         accountsOrgManagementURL: res.data.accounts_org_user_management_url || accountsOrgUserManagementURL,
       });
@@ -105,8 +125,22 @@ class OrgInfo extends Component {
     });
   }
 
+  updateStoragePolicy = (storagePolicy) => {
+    return seafileAPI.orgAdminUpdateOrgInfo({ storage_policy: storagePolicy }).then(() => {
+      if (window.app && window.app.pageOptions) {
+        window.app.pageOptions.orgStoragePolicy = storagePolicy;
+      }
+      this.setState({ storage_policy: storagePolicy });
+      toaster.success(gettext('Successfully updated storage policy.'));
+    }).catch((error) => {
+      const errMessage = Utils.getErrorMsg(error);
+      toaster.danger(errMessage);
+      return Promise.reject(errMessage);
+    });
+  };
+
   render() {
-    const { loading, errorMsg, canTransferOwnership, isTransferOwnershipDialogOpen } = this.state;
+    const { loading, errorMsg, canTransferOwnership, isTransferOwnershipDialogOpen, isSetStoragePolicyDialogOpen } = this.state;
     if (loading) {
       return (
         <Fragment>
@@ -182,6 +216,16 @@ class OrgInfo extends Component {
                 <dt>{gettext('Billing Cycle')}</dt>
                 <dd>{this.state.billing_cycle || '--'}</dd>
 
+                <dt>{gettext('Storage Policy')}</dt>
+                <dd>
+                  {formatStoragePolicyLabel(this.state.storage_policy)}
+                  <span
+                    title={gettext('Edit')}
+                    className="fa fa-pencil-alt attr-action-icon"
+                    onClick={this.toggleSetStoragePolicyDialog}>
+                  </span>
+                </dd>
+
                 <dt>{gettext('Libraries')} / {gettext('Files')} / {gettext('Groups')}</dt>
                 <dd>{this.state.repos_count || 0} / {this.state.total_files_count || 0} / {this.state.groups_count || 0}</dd>
 
@@ -227,6 +271,14 @@ class OrgInfo extends Component {
             searchFunc={this.searchOrgAdmins}
             onSubmit={this.transferOwnership}
             toggleDialog={this.toggleTransferOwnershipDialog}
+          />
+        )}
+        {isSetStoragePolicyDialogOpen && (
+          <SetOrgStoragePolicyDialog
+            policy={this.state.storage_policy}
+            availableRegions={this.state.available_storage_regions}
+            updatePolicy={this.updateStoragePolicy}
+            toggleDialog={this.toggleSetStoragePolicyDialog}
           />
         )}
       </Fragment>

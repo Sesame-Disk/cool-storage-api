@@ -33,6 +33,7 @@ type bootstrapOrgData struct {
 	Loaded                 bool
 	Name                   string
 	Settings               map[string]string
+	StorageConfig          map[string]string
 	MaxUsers               int
 	CurrentUsers           int
 	Plan                   string
@@ -124,6 +125,36 @@ func formatBootstrapRegionLabel(region string) string {
 	}
 
 	return strings.Join(parts, " ")
+}
+
+func normalizeBootstrapOrgStoragePolicy(raw map[string]string) map[string]string {
+	policy := map[string]string{"data_residency": "flexible"}
+	if len(raw) == 0 {
+		return policy
+	}
+
+	if residency := strings.ToLower(strings.TrimSpace(raw["data_residency"])); residency == "strict" || residency == "flexible" {
+		policy["data_residency"] = residency
+	}
+	if defaultRegion := strings.ToLower(strings.TrimSpace(raw["default_region"])); defaultRegion != "" {
+		policy["default_region"] = defaultRegion
+	}
+	return policy
+}
+
+func (s *Server) bootstrapStorageOptionRegion(storageClass string) string {
+	storageClass = strings.TrimSpace(storageClass)
+	if storageClass == "" || s == nil || s.config == nil {
+		return ""
+	}
+
+	for region, regionConfig := range s.config.Storage.RegionClasses {
+		if regionConfig.Hot == storageClass || regionConfig.Cold == storageClass {
+			return strings.ToLower(strings.TrimSpace(region))
+		}
+	}
+
+	return ""
 }
 
 func (s *Server) resolveBootstrapEndpointRegion(hostname string) string {
@@ -233,6 +264,9 @@ func (s *Server) buildBootstrapStorageOptions(hostname string) []gin.H {
 			return
 		}
 		option := gin.H{"id": id, "name": name}
+		if region := s.bootstrapStorageOptionRegion(id); region != "" {
+			option["region"] = region
+		}
 		if id == defaultClass {
 			option["is_default"] = true
 		}
@@ -372,6 +406,7 @@ func (s *Server) loadBootstrapOrgData(orgID string) bootstrapOrgData {
 	data := bootstrapOrgData{}
 	if err := s.db.Session().Query(`
 		SELECT name, settings, max_users, plan, billing_cycle, quota_policy,
+		       storage_config,
 		       storage_quota, traffic_quota, traffic_upload_quota, traffic_download_quota,
 		       current_period_started_at, current_period_ends_at
 		FROM organizations WHERE org_id = ?
@@ -382,6 +417,7 @@ func (s *Server) loadBootstrapOrgData(orgID string) bootstrapOrgData {
 		&data.Plan,
 		&data.BillingCycle,
 		&data.QuotaPolicy,
+		&data.StorageConfig,
 		&data.StorageQuota,
 		&data.TrafficQuota,
 		&data.TrafficUploadQuota,
@@ -476,6 +512,7 @@ func (s *Server) buildAppBootstrapPageOptions(identity bootstrapIdentity, userDa
 		"shareLinkExpireDaysMax":  0,
 		"uploadLinkExpireDaysMax": 0,
 		"storageInfo":             nil,
+		"orgStoragePolicy":        normalizeBootstrapOrgStoragePolicy(orgData.StorageConfig),
 		"trafficInfo":             nil,
 		"enableSubscription":      true,
 	}

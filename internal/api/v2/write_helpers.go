@@ -1,6 +1,7 @@
 package v2
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -97,31 +98,8 @@ func updateOrganizationLifecycleAndReadModel(
 	})
 }
 
-func adminLibraryProjectionDeletedAtEqual(left, right *time.Time) bool {
-	if left == nil || right == nil {
-		return left == nil && right == nil
-	}
-	return left.Equal(*right)
-}
-
-func adminLibraryProjectionDeleteRequired(previous, next dbpkg.AdminLibraryProjectionRow) bool {
-	if previous.OrgID != next.OrgID || previous.OwnerID != next.OwnerID || !previous.CreatedAt.Equal(next.CreatedAt) {
-		return true
-	}
-	return false
-}
-
 func addAdminLibraryReadModelRefreshQueries(batch *gocql.Batch, row dbpkg.AdminLibraryProjectionRow, previous *dbpkg.AdminLibraryProjectionRow) {
-	if previous != nil && adminLibraryProjectionDeleteRequired(*previous, row) {
-		dbpkg.AddDeleteAdminLibraryReadModelQuery(batch, *previous)
-	}
-	if previous != nil && !adminLibraryProjectionDeletedAtEqual(previous.DeletedAt, row.DeletedAt) && previous.DeletedAt != nil && !previous.DeletedAt.IsZero() && row.DeletedAt == nil {
-		batch.Query(`
-			DELETE FROM libraries_deleted_by_org
-			WHERE org_id = ? AND deleted_at = ? AND library_id = ?
-		`, previous.OrgID, *previous.DeletedAt, previous.LibraryID)
-	}
-	dbpkg.AddUpsertAdminLibraryReadModelQuery(batch, row)
+	dbpkg.AddRefreshAdminLibraryReadModelQueries(batch, row, previous)
 }
 
 func buildShareReadModelRow(
@@ -534,6 +512,17 @@ func deactivateOrg(db interface{ Session() *gocql.Session }, si SessionInvalidat
 // goroutine re-enables all org share links. Works for both reactivation
 // (deactivated → active) and restore (deleted → active).
 func activateOrg(db interface{ Session() *gocql.Session }, orgID string) error {
+	var lockedOrgID string
+	err := db.Session().Query(`
+		SELECT org_id FROM gc_org_hard_delete_locks WHERE org_id = ?
+	`, orgID).Scan(&lockedOrgID)
+	if err == nil {
+		return fmt.Errorf("organization is pending permanent deletion")
+	}
+	if err != nil && !errors.Is(err, gocql.ErrNotFound) {
+		return err
+	}
+
 	if err := updateOrganizationLifecycleAndReadModel(db, orgID, batchedOrganizationLifecycleUpdate{
 		Status:              StatusActive,
 		DeletedAt:           nil,
@@ -780,16 +769,7 @@ func syncAdminLibraryReadModel(db interface{ Session() *gocql.Session }, orgID, 
 }
 
 func addDeleteAdminLibraryReadModelQueries(db interface{ Session() *gocql.Session }, batch *gocql.Batch, orgID, libraryID string) error {
-	projectionRow, err := dbpkg.ReadAdminLibraryProjectionRow(db.Session(), orgID, libraryID)
-	if err == gocql.ErrNotFound {
-		return nil
-	}
-	if err != nil {
-		return err
-	}
-
-	dbpkg.AddDeleteAdminLibraryReadModelQuery(batch, projectionRow)
-	return nil
+	return dbpkg.AddDeleteAdminLibraryReadModelQueries(db.Session(), batch, orgID, libraryID)
 }
 
 // ── Library soft-delete / restore with storage accounting ─────────────────────
@@ -803,7 +783,7 @@ func addDeleteAdminLibraryReadModelQueries(db interface{ Session() *gocql.Sessio
 // operation. Permanent delete (or GC cascade) cleans up the lib-scope row via
 // traffic.DeleteLibraryStorageCounter.
 func softDeleteLibrary(db interface{ Session() *gocql.Session }, orgID, ownerID, deletedBy, libraryID string) error {
-	now := time.Now()
+	now := time.Now().UTC()
 	previousRow, err := dbpkg.ReadAdminLibraryProjectionRow(db.Session(), orgID, libraryID)
 	if err != nil {
 		return fmt.Errorf("read library projection row: %w", err)
@@ -822,6 +802,7 @@ func softDeleteLibrary(db interface{ Session() *gocql.Session }, orgID, ownerID,
 		VALUES (?, ?, ?, ?)`,
 		libraryID, orgID, now, previousRow.StorageClass,
 	)
+	traffic.AddAggregateStorageReconciliationQueries(batch, orgID, ownerID, now)
 	addAdminLibraryReadModelRefreshQueries(batch, nextRow, &previousRow)
 	if err := batch.Exec(); err != nil {
 		return fmt.Errorf("soft-delete library: %w", err)
@@ -835,7 +816,7 @@ func softDeleteLibrary(db interface{ Session() *gocql.Session }, orgID, ownerID,
 // restoreDeletedLibrary clears deleted_at, removes the GC marker, and re-adds
 // the library's storage to aggregate counters. Mirror image of softDeleteLibrary.
 func restoreDeletedLibrary(db interface{ Session() *gocql.Session }, orgID, ownerID, libraryID string) error {
-	now := time.Now()
+	now := time.Now().UTC()
 	previousRow, err := dbpkg.ReadAdminLibraryProjectionRow(db.Session(), orgID, libraryID)
 	if err != nil {
 		return fmt.Errorf("read library projection row: %w", err)
@@ -855,6 +836,7 @@ func restoreDeletedLibrary(db interface{ Session() *gocql.Session }, orgID, owne
 		orgID, libraryID,
 	)
 	batch.Query(`DELETE FROM deleted_libraries WHERE library_id = ?`, libraryID)
+	traffic.AddAggregateStorageReconciliationQueries(batch, orgID, ownerID, now)
 	addAdminLibraryReadModelRefreshQueries(batch, nextRow, &previousRow)
 	if err := batch.Exec(); err != nil {
 		return fmt.Errorf("restore library: %w", err)

@@ -4,20 +4,34 @@ import { Button, Input, Form, FormGroup, Label, Alert } from 'reactstrap';
 import { gettext, enableEncryptedLibrary, repoPasswordMinLength, storages, libraryTemplates } from '../../utils/constants';
 import { SeahubSelect } from '../common/select';
 
-const normalizedStorages = Array.isArray(storages)
-  ? storages.map((item) => {
+const normalizeStorages = (storageList) => (Array.isArray(storageList)
+  ? storageList.map((item) => {
     if (typeof item === 'string') {
-      return { id: item, name: item, is_default: false };
+      return { id: item, name: item, is_default: false, region: '' };
     }
     return {
       id: item?.id || '',
       name: item?.name || item?.id || '',
       is_default: item?.is_default === true,
+      region: typeof item?.region === 'string' ? item.region.trim().toLowerCase() : '',
     };
   }).filter((item) => item.id)
-  : [];
+  : []);
 
-const defaultStorage = normalizedStorages.find((item) => item.is_default) || normalizedStorages[0] || null;
+const readCreateRepoContext = () => {
+  const pageOptions = window.app?.pageOptions || {};
+  const normalizedStorages = normalizeStorages(pageOptions.storages || storages);
+  const rawPolicy = pageOptions.orgStoragePolicy || {};
+  const dataResidency = rawPolicy.data_residency === 'strict' ? 'strict' : 'flexible';
+  const defaultRegion = typeof rawPolicy.default_region === 'string' ? rawPolicy.default_region.trim().toLowerCase() : '';
+  const pinnedStorage = defaultRegion ? normalizedStorages.find((item) => item.region === defaultRegion) || null : null;
+
+  return {
+    normalizedStorages,
+    storagePolicy: { dataResidency, defaultRegion },
+    pinnedStorage,
+  };
+};
 
 const propTypes = {
   libraryType: PropTypes.string.isRequired,
@@ -28,6 +42,10 @@ const propTypes = {
 class CreateRepoDialog extends React.Component {
   constructor(props) {
     super(props);
+    const createRepoContext = readCreateRepoContext();
+    this.normalizedStorages = createRepoContext.normalizedStorages;
+    this.storagePolicy = createRepoContext.storagePolicy;
+    this.pinnedStorage = createRepoContext.pinnedStorage;
     this.state = {
       repoName: '',
       disabled: true,
@@ -36,17 +54,18 @@ class CreateRepoDialog extends React.Component {
       password2: '',
       errMessage: '',
       permission: 'rw',
-      storage_id: defaultStorage ? defaultStorage.id : '',
+      storage_id: '',
       library_template: libraryTemplates.length ? libraryTemplates[0] : '',
       isSubmitBtnActive: false,
     };
     this.templateOptions = [];
     this.storageOptions = [];
+    this.automaticStorageOption = { value: '', label: gettext('Automatic') };
     if (Array.isArray(libraryTemplates) && libraryTemplates.length) {
       this.templateOptions = libraryTemplates.map((item) => { return {value: item, label: item}; });
     }
-    if (normalizedStorages.length) {
-      this.storageOptions = normalizedStorages.map((item) => { return {value: item.id, label: item.name}; });
+    if (this.normalizedStorages.length) {
+      this.storageOptions = this.normalizedStorages.map((item) => { return {value: item.id, label: item.name}; });
     }
   }
 
@@ -104,6 +123,11 @@ class CreateRepoDialog extends React.Component {
       this.setState({errMessage: errMessage});
       return false;
     }
+    if (this.storagePolicy.dataResidency === 'strict' && !this.pinnedStorage) {
+      errMessage = gettext('This organization storage policy is misconfigured. Please contact an administrator or support.');
+      this.setState({errMessage: errMessage});
+      return false;
+    }
     if (this.state.encrypt) {
       let password1 = this.state.password1.trim();
       let password2 = this.state.password2.trim();
@@ -137,7 +161,7 @@ class CreateRepoDialog extends React.Component {
   };
 
   handleStorageInputChange = (selectedItem) => {
-    this.setState({storage_id: selectedItem.value});
+    this.setState({storage_id: selectedItem ? selectedItem.value : ''});
   };
 
   handlelibraryTemplatesInputChange = (selectedItem) => {
@@ -185,7 +209,7 @@ class CreateRepoDialog extends React.Component {
     }
 
     const storage_id = this.state.storage_id;
-    if (storage_id) {
+    if (this.storagePolicy.dataResidency !== 'strict' && storage_id) {
       repo.storage_id = storage_id;
     }
 
@@ -198,6 +222,9 @@ class CreateRepoDialog extends React.Component {
   };
 
   render() {
+    const isStrictPolicy = this.storagePolicy.dataResidency === 'strict';
+    const selectedStorageOption = this.storageOptions.find((opt) => opt.value === this.state.storage_id) || this.automaticStorageOption;
+
     return (
       <div className="modal show d-block" tabIndex="-1" style={{ backgroundColor: 'rgba(0,0,0,0.5)' }}>
         <div className="modal-dialog modal-dialog-centered">
@@ -231,15 +258,30 @@ class CreateRepoDialog extends React.Component {
                   </FormGroup>
                 )}
 
-                {normalizedStorages.length > 0 && (
+                {isStrictPolicy && (
+                  <FormGroup>
+                    <Label>{gettext('Pinned region')}</Label>
+                    <Input value={this.pinnedStorage ? this.pinnedStorage.name : gettext('Unavailable')} disabled={true} />
+                    <p className="text-muted mb-0 mt-2">
+                      {this.pinnedStorage
+                        ? gettext('This organization uses strict data residency. New libraries are pinned to this region.')
+                        : gettext('This organization storage policy is misconfigured. Please contact an administrator or support.')}
+                    </p>
+                  </FormGroup>
+                )}
+
+                {!isStrictPolicy && this.normalizedStorages.length > 0 && (
                   <FormGroup>
                     <Label>{gettext('Region')}</Label>
                     <SeahubSelect
-                      defaultValue={this.storageOptions.find(opt => opt.value === this.state.storage_id) || this.storageOptions[0]}
-                      options={this.storageOptions}
+                      defaultValue={this.automaticStorageOption}
+                      options={[this.automaticStorageOption].concat(this.storageOptions)}
                       onChange={this.handleStorageInputChange}
-                      value={this.storageOptions.find(opt => opt.value === this.state.storage_id) || null}
+                      value={selectedStorageOption}
                     />
+                    <p className="text-muted mb-0 mt-2">
+                      {gettext('Automatic uses the request region first, then the organization fallback region, then the global storage default. Choosing a region here overrides that automatic resolution.')}
+                    </p>
                   </FormGroup>
                 )}
 
