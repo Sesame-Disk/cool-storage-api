@@ -1,6 +1,7 @@
 package v2
 
 import (
+	"crypto/sha1"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -17,6 +18,7 @@ import (
 	"time"
 
 	"github.com/Sesame-Disk/sesamefs/internal/config"
+	"github.com/Sesame-Disk/sesamefs/internal/crypto"
 	"github.com/Sesame-Disk/sesamefs/internal/db"
 	"github.com/Sesame-Disk/sesamefs/internal/httputil"
 	"github.com/Sesame-Disk/sesamefs/internal/middleware"
@@ -2415,7 +2417,7 @@ func (h *FileHandler) CopyFile(c *gin.Context) {
 
 	// For batch operations (multiple files), handle differently
 	if len(srcPaths) > 1 {
-		h.copyBatchFiles(c, srcPaths, srcRepoID, dstRepoID, dstDir, orgID, userID)
+		h.copyBatchFiles(c, srcPaths, srcRepoID, dstRepoID, dstDir, orgID, userID, req.ConflictPolicy)
 		return
 	}
 
@@ -2663,9 +2665,16 @@ func (h *FileHandler) GetUploadLink(c *gin.Context) {
 // UploadFile handles direct file uploads (for smaller files)
 func (h *FileHandler) UploadFile(c *gin.Context) {
 	repoID := c.Param("repo_id")
-	parentDir := c.DefaultPostForm("parent_dir", "/")
 	orgID := c.GetString("org_id")
 	userID := c.GetString("user_id")
+
+	parentDir := c.DefaultPostForm("parent_dir", "/")
+	if parentDir == "" {
+		parentDir = "/"
+	}
+	parentDir = normalizePath(parentDir)
+
+	replace := c.DefaultPostForm("replace", "0") == "1"
 
 	// CUSTOM PERMISSION CHECK: upload flag
 	if h.permMiddleware != nil && !h.permMiddleware.RequirePermFlag(c, "upload") {
@@ -2678,7 +2687,12 @@ func (h *FileHandler) UploadFile(c *gin.Context) {
 		return
 	}
 
-	// Quota pre-check — evaluated before reading the body so we can fail fast.
+	if h.db == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "database not available"})
+		return
+	}
+
+	// Quota pre-check (storage + traffic) — before reading the body to fail fast
 	uploadTrafficStatus := traffic.QuotaStatus{Allowed: true}
 	if checker := traffic.GetChecker(); checker != nil {
 		contentLength := c.Request.ContentLength
@@ -2693,13 +2707,13 @@ func (h *FileHandler) UploadFile(c *gin.Context) {
 		if !uploadTrafficStatus.Allowed {
 			c.JSON(http.StatusForbidden, traffic.TrafficQuotaExceededResponse(uploadTrafficStatus, "traffic quota exceeded", true))
 			return
-		} else {
-			if warning, ok := traffic.TrafficQuotaWarningHeader(uploadTrafficStatus); ok {
-				c.Header("X-Quota-Warning", warning)
-			}
+		}
+		if warning, ok := traffic.TrafficQuotaWarningHeader(uploadTrafficStatus); ok {
+			c.Header("X-Quota-Warning", warning)
 		}
 	}
 
+	// Read file from multipart form
 	file, header, err := c.Request.FormFile("file")
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "file is required"})
@@ -2707,98 +2721,342 @@ func (h *FileHandler) UploadFile(c *gin.Context) {
 	}
 	defer file.Close()
 
-	// Read file content and calculate hash
 	content, err := io.ReadAll(file)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read file"})
 		return
 	}
+	fileSize := int64(len(content))
+	filename := header.Filename
 
-	hash := sha256.Sum256(content)
-	blockID := hex.EncodeToString(hash[:])
+	// SHA-1 of plaintext → fileID (Seafile protocol: block ID used in fs_object's block_ids)
+	sha1Hash := sha1.Sum(content)
+	fileID := hex.EncodeToString(sha1Hash[:])
 
-	// Check if block already exists (deduplication)
-	var existingBlockID string
-	_ = h.db.Session().Query(`
-		SELECT block_id FROM blocks WHERE org_id = ? AND block_id = ?
-	`, orgID, blockID).Scan(&existingBlockID)
+	// Check encryption and encrypt content if needed
+	storedContent := content
+	var encrypted bool
+	h.db.Session().Query(
+		`SELECT encrypted FROM libraries WHERE org_id = ? AND library_id = ?`,
+		orgID, repoID,
+	).Scan(&encrypted)
+	if encrypted {
+		fileKey, fileIV := GetDecryptSessions().GetFileKeyAndIV(userID, repoID)
+		if fileKey == nil {
+			c.JSON(http.StatusForbidden, gin.H{"error": "library is encrypted and not unlocked"})
+			return
+		}
+		encryptedContent, err := crypto.EncryptBlockSeafile(content, fileKey, fileIV)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to encrypt content"})
+			return
+		}
+		storedContent = encryptedContent
+	}
 
+	// SHA-256 of stored content (used as key in block store and blocks table)
+	sha256Hash := sha256.Sum256(storedContent)
+	sha256ID := hex.EncodeToString(sha256Hash[:])
+
+	// Store block
 	blockStore, storageClass, err := h.resolveLibraryBlockStore(c, orgID, repoID)
-	if err != nil || blockStore == nil {
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "block storage not available"})
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "storage not available"})
+		return
+	}
+	if _, err := blockStore.PutBlockAuto(c.Request.Context(), sha256ID, storedContent); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to store block"})
 		return
 	}
 
-	storageKey := ""
+	// Create SHA-1 → SHA-256 mapping (dual-write: forward + reverse)
+	if err := h.db.Session().Query(
+		`INSERT INTO block_id_mappings (org_id, external_id, internal_id) VALUES (?, ?, ?)`,
+		orgID, fileID, sha256ID,
+	).Exec(); err != nil {
+		log.Printf("[UploadFile] CRITICAL: failed to write block_id_mapping org=%s: %v", orgID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create block mapping"})
+		return
+	}
+	if err := h.db.Session().Query(
+		`INSERT INTO block_id_mappings_by_internal (org_id, internal_id, external_id, created_at) VALUES (?, ?, ?, toTimestamp(now()))`,
+		orgID, sha256ID, fileID,
+	).Exec(); err != nil {
+		log.Printf("[UploadFile] WARNING: failed to write reverse block_id_mapping: %v", err)
+	}
+
+	// Increment/create block ref_count in blocks table
 	fsHelper := NewFSHelper(h.db)
+	if err := fsHelper.IncrementOrCreateBlock(orgID, sha256ID, len(storedContent), storageClass, ""); err != nil {
+		log.Printf("[UploadFile] WARNING: failed to register block metadata: %v", err)
+	}
 
-	if existingBlockID == "" {
-		storageKey, err = blockStore.PutBlockData(c.Request.Context(), &storage.BlockData{
-			Hash: blockID,
-			Data: content,
-			Size: int64(len(content)),
-		})
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to upload to storage"})
-			return
-		}
-		if err := fsHelper.IncrementOrCreateBlock(orgID, blockID, len(content), storageClass, storageKey); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to store block metadata"})
-			return
-		}
+	// Create file fs_object (block_ids uses SHA-1 fileID for Seafile protocol compatibility)
+	fileFSID, err := fsHelper.CreateFileFSObject(repoID, filename, fileSize, []string{fileID})
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create file metadata"})
+		return
+	}
+
+	// Get head commit ID (used as parent for the new commit)
+	headCommitID, err := fsHelper.GetHeadCommitID(repoID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "library not found"})
+		return
+	}
+
+	// Traverse to parent directory
+	parentResult, err := fsHelper.TraverseToPath(repoID, parentDir)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "parent directory not found: " + err.Error()})
+		return
+	}
+
+	// Get the entries currently in parentDir
+	var dirEntries []FSEntry
+	if parentDir == "/" {
+		dirEntries = parentResult.Entries
 	} else {
-		if err := fsHelper.IncrementOrCreateBlock(orgID, blockID, len(content), storageClass, storageKey); err != nil {
-			// Non-fatal error, continue
+		if parentResult.TargetEntry == nil {
+			c.JSON(http.StatusNotFound, gin.H{"error": "parent directory not found"})
+			return
+		}
+		dirEntries, err = fsHelper.GetDirectoryEntries(repoID, parentResult.TargetFSID)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read parent directory"})
+			return
 		}
 	}
 
-	// TODO: Create/update fs_object and commit
-
-	filePath := path.Join(parentDir, header.Filename)
-
-	// Record upload traffic and storage — fire-and-forget.
-	if rec := traffic.Get(); rec != nil {
-		traffic.RecordCheckedTransfer(rec, uploadTrafficStatus, orgID, userID, traffic.WebUpload, int64(len(content)))
+	// Handle filename conflict
+	actualFilename := filename
+	if FindEntryInList(dirEntries, filename) != nil {
+		if replace {
+			dirEntries = RemoveEntryFromList(dirEntries, filename)
+		} else {
+			actualFilename = GenerateUniqueName(dirEntries, filename)
+		}
 	}
-	traffic.IncrementStorageCounters(h.db, orgID, userID, repoID, int64(len(content)), 1)
 
-	c.JSON(http.StatusOK, gin.H{
-		"success":     true,
-		"id":          blockID,
-		"name":        header.Filename,
-		"path":        filePath,
-		"size":        len(content),
-		"repo_id":     repoID,
-		"storage_key": storageKey,
-	})
+	// Add new file entry to the directory
+	newEntry := FSEntry{
+		ID:    fileFSID,
+		Name:  actualFilename,
+		Mode:  ModeFile,
+		MTime: time.Now().Unix(),
+		Size:  fileSize,
+	}
+	newDirEntries := AddEntryToList(dirEntries, newEntry)
+	newDirFSID, err := fsHelper.CreateDirectoryFSObject(repoID, newDirEntries)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update directory"})
+		return
+	}
+
+	// Rebuild file tree back to root
+	var newRootFSID string
+	if parentDir == "/" {
+		// The updated directory IS the root
+		newRootFSID = newDirFSID
+	} else {
+		// Update the parent-of-parentDir to point to the new parentDir fs_object
+		parentDirName := path.Base(parentDir)
+		grandParentEntries := make([]FSEntry, len(parentResult.Entries))
+		copy(grandParentEntries, parentResult.Entries)
+		for i := range grandParentEntries {
+			if grandParentEntries[i].Name == parentDirName {
+				grandParentEntries[i].ID = newDirFSID
+				break
+			}
+		}
+		newGrandParentFSID, err := fsHelper.CreateDirectoryFSObject(repoID, grandParentEntries)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update parent directory"})
+			return
+		}
+		newRootFSID, err = fsHelper.RebuildPathToRoot(repoID, parentResult, newGrandParentFSID)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to rebuild path"})
+			return
+		}
+	}
+
+	// Create commit
+	description := fmt.Sprintf("Added or modified \"%s\".\n", actualFilename)
+	newCommitID, err := fsHelper.CreateCommit(repoID, userID, newRootFSID, headCommitID, description)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create commit"})
+		return
+	}
+
+	// Update library head
+	if err := fsHelper.UpdateLibraryHead(orgID, repoID, newCommitID); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update library"})
+		return
+	}
+
+	// Record traffic (fire-and-forget)
+	if rec := traffic.Get(); rec != nil {
+		traffic.RecordCheckedTransfer(rec, uploadTrafficStatus, orgID, userID, traffic.WebUpload, fileSize)
+	}
+	traffic.IncrementStorageCounters(h.db, orgID, userID, repoID, fileSize, 1)
+
+	// Return Seafile-compatible response
+	c.JSON(http.StatusOK, []gin.H{{"name": actualFilename, "id": fileID, "size": strconv.FormatInt(fileSize, 10)}})
 }
 
-// copyBatchFiles handles copying multiple files in a single operation
-func (h *FileHandler) copyBatchFiles(c *gin.Context, srcPaths []string, srcRepoID, dstRepoID, dstDir, orgID, userID string) {
-	// Cross-repo batch copy not yet implemented
+// copyBatchFiles handles copying multiple files in a single operation.
+// Each file gets its own commit so that the head advances correctly between copies.
+func (h *FileHandler) copyBatchFiles(c *gin.Context, srcPaths []string, srcRepoID, dstRepoID, dstDir, orgID, userID, conflictPolicy string) {
 	if srcRepoID != dstRepoID {
 		c.JSON(http.StatusNotImplemented, gin.H{"error": "cross-repo batch copy not yet implemented"})
 		return
 	}
 
-	// For same-repo batch copies, copy files sequentially
-	// In production, this should be done as a background job for large batches
-	var copiedFiles []string
-	var failedFiles []map[string]string
+	repoID := srcRepoID
+	dstDir = normalizePath(dstDir)
 
-	for _, srcPath := range srcPaths {
-		fileName := path.Base(srcPath)
-		// Create a mock gin.Context for the single file copy
-		// For now, return a simplified response
-		copiedFiles = append(copiedFiles, fileName)
+	if h.db == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "database not available"})
+		return
 	}
 
-	// TODO: Implement actual batch copy logic with FS tree updates
-	// For now, return success for same-repo copies
+	fsHelper := NewFSHelper(h.db)
+
+	type copyResult struct {
+		Name string `json:"name"`
+		Path string `json:"path"`
+	}
+	var results []copyResult
+
+	for _, rawSrcPath := range srcPaths {
+		srcPath := normalizePath(rawSrcPath)
+
+		// Get head commit ID fresh at the start of each iteration:
+		// the previous iteration may have advanced the head.
+		headCommitID, err := fsHelper.GetHeadCommitID(repoID)
+		if err != nil {
+			c.JSON(http.StatusNotFound, gin.H{"error": "library not found"})
+			return
+		}
+
+		// Traverse to source file/directory
+		srcResult, err := fsHelper.TraverseToPath(repoID, srcPath)
+		if err != nil || srcResult.TargetEntry == nil {
+			log.Printf("[copyBatchFiles] source not found, skipping: %s", srcPath)
+			continue
+		}
+
+		// Traverse to destination directory
+		dstResult, err := fsHelper.TraverseToPath(repoID, dstDir)
+		if err != nil {
+			c.JSON(http.StatusNotFound, gin.H{"error": "destination not found: " + err.Error()})
+			return
+		}
+
+		// Get entries inside the destination directory
+		var dstDirEntries []FSEntry
+		if dstDir == "/" {
+			dstDirEntries = dstResult.Entries
+		} else {
+			if dstResult.TargetEntry == nil {
+				c.JSON(http.StatusNotFound, gin.H{"error": "destination directory not found"})
+				return
+			}
+			dstDirEntries, err = fsHelper.GetDirectoryEntries(repoID, dstResult.TargetFSID)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read destination directory"})
+				return
+			}
+		}
+
+		fileName := path.Base(srcPath)
+
+		// Handle conflict
+		if FindEntryInList(dstDirEntries, fileName) != nil {
+			switch conflictPolicy {
+			case "replace":
+				dstDirEntries = RemoveEntryFromList(dstDirEntries, fileName)
+			case "autorename":
+				fileName = GenerateUniqueName(dstDirEntries, fileName)
+			case "skip":
+				results = append(results, copyResult{Name: fileName, Path: path.Join(dstDir, fileName)})
+				continue
+			default:
+				// conflict with no policy → skip this file in batch mode
+				log.Printf("[copyBatchFiles] skipping %s: conflict and no policy", srcPath)
+				continue
+			}
+		}
+
+		// Copy the entry (same fs_id, same blocks — ref counts incremented below)
+		copiedEntry := *srcResult.TargetEntry
+		copiedEntry.Name = fileName
+		copiedEntry.MTime = time.Now().Unix()
+
+		// Add to destination directory
+		dstNewEntries := AddEntryToList(dstDirEntries, copiedEntry)
+		newDstFSID, err := fsHelper.CreateDirectoryFSObject(repoID, dstNewEntries)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update destination directory"})
+			return
+		}
+
+		// Rebuild tree back to root
+		var newRootFSID string
+		if dstDir == "/" {
+			newRootFSID = newDstFSID
+		} else {
+			dstDirName := path.Base(dstDir)
+			parentEntries := make([]FSEntry, len(dstResult.Entries))
+			copy(parentEntries, dstResult.Entries)
+			for i := range parentEntries {
+				if parentEntries[i].Name == dstDirName {
+					parentEntries[i].ID = newDstFSID
+					break
+				}
+			}
+			newParentFSID, err := fsHelper.CreateDirectoryFSObject(repoID, parentEntries)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update parent directory"})
+				return
+			}
+			newRootFSID, err = fsHelper.RebuildPathToRoot(repoID, dstResult, newParentFSID)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to rebuild path"})
+				return
+			}
+		}
+
+		// Create commit
+		description := fmt.Sprintf("Copied \"%s\" to \"%s\"", fileName, dstDir)
+		newCommitID, err := fsHelper.CreateCommit(repoID, userID, newRootFSID, headCommitID, description)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create commit"})
+			return
+		}
+
+		// Update library head
+		if err := fsHelper.UpdateLibraryHead(orgID, repoID, newCommitID); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update library"})
+			return
+		}
+
+		// Increment block ref counts in background
+		go func(srcFSID string) {
+			blockIDs, _ := fsHelper.CollectBlockIDsRecursive(repoID, srcFSID)
+			if len(blockIDs) > 0 {
+				fsHelper.IncrementBlockRefCounts(orgID, blockIDs)
+			}
+		}(srcResult.TargetFSID)
+
+		results = append(results, copyResult{Name: fileName, Path: path.Join(dstDir, fileName)})
+	}
+
 	c.JSON(http.StatusOK, gin.H{
-		"success": true,
-		"copied":  len(copiedFiles),
-		"failed":  len(failedFiles),
+		"repo_id":    dstRepoID,
+		"parent_dir": dstDir,
+		"dst_items":  results,
 	})
 }
 

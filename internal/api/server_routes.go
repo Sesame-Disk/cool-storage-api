@@ -175,6 +175,8 @@ func (s *Server) registerAPIV21Routes(serverURL string) {
 	fileHandler.SetGCEnqueuer(v2.GetBlockEnqueuerFunc())
 	protected.DELETE("/repos/batch-delete-item/", fileHandler.BatchDeleteItems)
 	protected.DELETE("/repos/batch-delete-item", fileHandler.BatchDeleteItems)
+	protected.POST("/repos/:repo_id/upload", fileHandler.UploadFile)
+	protected.POST("/repos/:repo_id/upload/", fileHandler.UploadFile)
 	protected.GET("/repos/:repo_id/file/new_history/", fileHandler.GetFileHistoryV21)
 	protected.GET("/repos/:repo_id/file/new_history", fileHandler.GetFileHistoryV21)
 	protected.GET("/repos/:repo_id/file/history/", fileHandler.GetFileHistoryV21)

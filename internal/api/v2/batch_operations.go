@@ -415,6 +415,20 @@ func (h *BatchOperationHandler) processSingleItem(orgID, userID, srcRepoID, dstR
 			return fmt.Errorf("failed to copy fs_objects to destination library: %w", err)
 		}
 		entryFSID = newFSID
+
+		// Increment ref_count for every block referenced by the copied fs tree.
+		// Without this, if the source library is later GC'd, ref_count reaches 0
+		// and the GC deletes the blocks from S3 — corrupting the destination copy.
+		// Synchronous: this task already runs in a background job (TaskStore).
+		blockIDs, err := fsHelper.CollectBlockIDsRecursive(dstRepoID, newFSID)
+		if err != nil {
+			return fmt.Errorf("failed to collect block IDs for cross-library %s: %w", opType, err)
+		}
+		if len(blockIDs) > 0 {
+			if err := fsHelper.IncrementBlockRefCounts(orgID, blockIDs); err != nil {
+				return fmt.Errorf("failed to increment block ref counts for cross-library %s: %w", opType, err)
+			}
+		}
 	}
 
 	// Add source entry to destination

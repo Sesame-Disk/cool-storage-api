@@ -445,3 +445,81 @@ func TestGuestCannotUpload(t *testing.T) {
 	}
 	resp.Body.Close()
 }
+
+// TestV2DirectUploadRoundTrip verifies the POST /api/v2.1/repos/:id/upload endpoint:
+// the file must appear in the directory listing and the block ref_count must be 1 after upload.
+func TestV2DirectUploadRoundTrip(t *testing.T) {
+	name := fmt.Sprintf("inttest-v2upload-%d", time.Now().UnixNano())
+	repoID := createTestLibrary(t, adminClient, name)
+
+	fileName := "v2-upload-test.txt"
+	fileContent := fmt.Sprintf("v2-direct-upload-content-%s\n", repoID)
+
+	var buf bytes.Buffer
+	writer := multipart.NewWriter(&buf)
+	part, err := writer.CreateFormFile("file", fileName)
+	if err != nil {
+		t.Fatalf("CreateFormFile failed: %v", err)
+	}
+	if _, err := part.Write([]byte(fileContent)); err != nil {
+		t.Fatalf("writing upload content failed: %v", err)
+	}
+	if err := writer.WriteField("parent_dir", "/"); err != nil {
+		t.Fatalf("WriteField failed: %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("closing multipart writer failed: %v", err)
+	}
+
+	req, err := http.NewRequest(http.MethodPost, adminClient.baseURL+"/api/v2.1/repos/"+repoID+"/upload", &buf)
+	if err != nil {
+		t.Fatalf("creating upload request failed: %v", err)
+	}
+	req.Header.Set("Authorization", "Token "+adminClient.token)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+
+	uploadResp, err := adminClient.http.Do(req)
+	if err != nil {
+		t.Fatalf("v2 upload request failed: %v", err)
+	}
+	if uploadResp.StatusCode != http.StatusOK && uploadResp.StatusCode != http.StatusCreated {
+		body, _ := io.ReadAll(uploadResp.Body)
+		uploadResp.Body.Close()
+		t.Fatalf("v2 upload got status %d: %s", uploadResp.StatusCode, string(body))
+	}
+
+	// Response must be [{name, id, size}].
+	var uploadResult []map[string]interface{}
+	decodeJSON(t, uploadResp, &uploadResult)
+	if len(uploadResult) == 0 {
+		t.Fatal("v2 upload response payload is empty")
+	}
+	if uploadResult[0]["name"] != fileName {
+		t.Fatalf("upload response name = %v, want %q", uploadResult[0]["name"], fileName)
+	}
+
+	// File must appear in the directory listing.
+	listResp := adminClient.Get(t, fmt.Sprintf("/api/v2.1/repos/%s/dir/?p=/", repoID))
+	expectStatus(t, listResp, http.StatusOK)
+	listResult := responseJSON(t, listResp)
+	entries, _ := listResult["dirent_list"].([]interface{})
+	if !containsEntry(entries, "name", fileName) {
+		t.Fatalf("file %q not found in directory listing after v2 upload", fileName)
+	}
+
+	// Block ref_count must be 1 (one unique write).
+	session := shareProjectionDBForTest(t).Session()
+	var orgID string
+	if err := session.Query(`SELECT org_id FROM libraries_by_id WHERE library_id = ?`, repoID).Scan(&orgID); err != nil {
+		t.Fatalf("failed to resolve org_id for repo %s: %v", repoID, err)
+	}
+	hash := sha256.Sum256([]byte(fileContent))
+	blockID := hex.EncodeToString(hash[:])
+	var refCount int
+	if err := session.Query(`SELECT ref_count FROM blocks WHERE org_id = ? AND block_id = ?`, orgID, blockID).Scan(&refCount); err != nil {
+		t.Fatalf("failed to read block ref_count for block %s: %v", blockID, err)
+	}
+	if refCount != 1 {
+		t.Fatalf("ref_count after v2 upload = %d, want 1", refCount)
+	}
+}

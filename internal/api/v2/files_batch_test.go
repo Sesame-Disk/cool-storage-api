@@ -454,7 +454,7 @@ func TestBatchCopyFiles_FilenameArray(t *testing.T) {
 				"dst_dir":  "/destination",
 				"filename": []string{"file1.txt", "file2.txt", "file3.txt"},
 			},
-			wantStatus: http.StatusOK, // Batch handler returns OK with summary
+			wantStatus: http.StatusInternalServerError, // No DB available in unit tests
 		},
 		{
 			name: "batch copy with array - cross repo not implemented",
