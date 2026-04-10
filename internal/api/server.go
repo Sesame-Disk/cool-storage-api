@@ -1827,60 +1827,80 @@ func (s *Server) handleGetSubscription(c *gin.Context) {
 	})
 }
 
-// handleSearchUser searches for users within the same organization
+// handleSearchUser searches for users within the caller organization.
+// Platform superadmins can search across organizations.
 // GET /api2/search-user/?q=<query>
 // Returns users matching the query string (by email or name)
 func (s *Server) handleSearchUser(c *gin.Context) {
 	query := c.Query("q")
 	orgID := c.GetString("org_id")
+	userID := c.GetString("user_id")
+	role := c.GetString("role")
 
 	if query == "" {
 		c.JSON(http.StatusOK, gin.H{"users": []gin.H{}})
 		return
 	}
+	if role == "" && orgID != "" && userID != "" {
+		_ = s.db.Session().Query(`
+			SELECT role FROM users WHERE org_id = ? AND user_id = ?
+		`, orgID, userID).Scan(&role)
+	}
 
-	// Query all users in the organization
+	users := make([]gin.H, 0)
+	queryLower := strings.ToLower(query)
+	appendMatchedUser := func(email, name, status string) {
+		if !v2.IsUserUsable(status) {
+			return
+		}
+		if !strings.Contains(strings.ToLower(email), queryLower) && !strings.Contains(strings.ToLower(name), queryLower) {
+			return
+		}
+		displayName := name
+		if displayName == "" {
+			if atIdx := strings.Index(email, "@"); atIdx > 0 {
+				displayName = email[:atIdx]
+			} else {
+				displayName = email
+			}
+		}
+		users = append(users, gin.H{
+			"email":         email,
+			"name":          displayName,
+			"avatar_url":    getBaseURLFromRequest(c) + "/static/img/default-avatar.png",
+			"contact_email": email,
+			"login_id":      email,
+		})
+	}
+
+	if middleware.IsPlatformSuperAdmin(orgID, middleware.OrganizationRole(role)) {
+		rows, err := db.ListAdminUserRows(s.db.Session(), "")
+		if err != nil {
+			slog.Error("search-user query failed", "error", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "search failed"})
+			return
+		}
+		for _, row := range rows {
+			appendMatchedUser(row.Email, row.Name, row.Status)
+		}
+		c.JSON(http.StatusOK, gin.H{"users": users})
+		return
+	}
+
+	// Query all users in the caller organization.
 	iter := s.db.Session().Query(`
 		SELECT user_id, email, name, role, status FROM users WHERE org_id = ?
 	`, orgID).Iter()
 
-	var users []gin.H
-	var userID, email, name, role, status string
-	queryLower := strings.ToLower(query)
+	var iterUserID, email, name, iterRole, status string
 
-	for iter.Scan(&userID, &email, &name, &role, &status) {
-		// Skip non-active users
-		if !v2.IsUserUsable(status) {
-			continue
-		}
-		// Match against email or name (case-insensitive)
-		if strings.Contains(strings.ToLower(email), queryLower) ||
-			strings.Contains(strings.ToLower(name), queryLower) {
-			displayName := name
-			if displayName == "" {
-				if atIdx := strings.Index(email, "@"); atIdx > 0 {
-					displayName = email[:atIdx]
-				} else {
-					displayName = email
-				}
-			}
-			users = append(users, gin.H{
-				"email":         email,
-				"name":          displayName,
-				"avatar_url":    getBaseURLFromRequest(c) + "/static/img/default-avatar.png",
-				"contact_email": email,
-				"login_id":      email,
-			})
-		}
+	for iter.Scan(&iterUserID, &email, &name, &iterRole, &status) {
+		appendMatchedUser(email, name, status)
 	}
 	if err := iter.Close(); err != nil {
 		slog.Error("search-user query failed", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "search failed"})
 		return
-	}
-
-	if users == nil {
-		users = []gin.H{}
 	}
 	c.JSON(http.StatusOK, gin.H{"users": users})
 }

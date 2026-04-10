@@ -505,23 +505,29 @@ func (h *AdminHandler) AdminCreateLibrary(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
 		return
 	}
-	repoName := createLibReq.Name
-	ownerEmail := createLibReq.Owner
+	repoName := strings.TrimSpace(createLibReq.Name)
+	ownerEmail := strings.TrimSpace(createLibReq.Owner)
+	var ownerUserID, ownerOrgID string
 
 	if repoName == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "name is required"})
 		return
 	}
 	if ownerEmail == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "owner email is required"})
-		return
-	}
-
-	// Lookup owner by email
-	ownerUserID, ownerOrgID, err := h.lookupUserByEmail(ownerEmail)
-	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "owner user not found"})
-		return
+		ownerUserID = callerUserID
+		ownerOrgID = callerOrgID
+		ownerEmail = c.GetString("email")
+		if ownerEmail == "" && ownerOrgID != "" && ownerUserID != "" {
+			ownerEmail = h.resolveOwnerEmail(ownerOrgID, ownerUserID)
+		}
+	} else {
+		// Lookup owner by email
+		var err error
+		ownerUserID, ownerOrgID, err = h.lookupUserByEmail(ownerEmail)
+		if err != nil {
+			c.JSON(http.StatusNotFound, gin.H{"error": "owner user not found"})
+			return
+		}
 	}
 
 	newLibID := uuid.New()

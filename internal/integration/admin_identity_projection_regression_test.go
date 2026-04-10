@@ -765,6 +765,35 @@ func adminUserPresentInSearch(t *testing.T, email, role string) bool {
 	return false
 }
 
+func legacySearchUserPresent(t *testing.T, client *testClient, query, email string) bool {
+	t.Helper()
+
+	resp := client.Get(t, "/api2/search-user/?q="+url.QueryEscape(query))
+	expectStatus(t, resp, http.StatusOK)
+	payload := responseJSON(t, resp)
+	entries, ok := payload["users"].([]interface{})
+	if !ok {
+		return false
+	}
+	for _, entry := range entries {
+		row, ok := entry.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		rowEmail, _ := row["email"].(string)
+		if rowEmail == email {
+			return true
+		}
+	}
+	return false
+}
+
+func TestSuperadminLegacySearchUserAcrossOrgs(t *testing.T) {
+	if !legacySearchUserPresent(t, superadminClient, defaultUserEmail, defaultUserEmail) {
+		t.Fatalf("superadmin legacy search did not return %q across orgs", defaultUserEmail)
+	}
+}
+
 func adminUserPresentInStatusList(t *testing.T, status, email string) bool {
 	t.Helper()
 
