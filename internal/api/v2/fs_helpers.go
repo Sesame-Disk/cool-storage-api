@@ -575,14 +575,22 @@ func (h *FSHelper) IncrementOrCreateBlock(orgID, blockID string, sizeBytes int, 
 	for attempt := 0; attempt < maxRetries; attempt++ {
 		now := time.Now()
 
-		// 1. Try to increment existing block using LWT (non-counter column requires Read-Update cycle)
+		// 1. Try to read existing block
 		var currentRefCount int
 		err := h.db.Session().Query(`
 			SELECT ref_count FROM blocks WHERE org_id = ? AND block_id = ?
 		`, orgID, blockID).Scan(&currentRefCount)
 
 		if err == nil {
-			// Block exists, increment it
+			if currentRefCount < 0 {
+				// GC sentinel (-999): the GC worker has claimed this row and will
+				// DELETE it momentarily (Phase 2). We must NOT touch it — any
+				// UPDATE would be clobbered by the unconditional DELETE.
+				// Retry until the row disappears, then INSERT fresh.
+				continue
+			}
+
+			// Block exists with ref_count >= 0 — increment it via LWT
 			applied, err := h.db.Session().Query(`
 				UPDATE blocks SET ref_count = ?, last_accessed = ?
 				WHERE org_id = ? AND block_id = ? IF ref_count = ?
@@ -593,11 +601,11 @@ func (h *FSHelper) IncrementOrCreateBlock(orgID, blockID string, sizeBytes int, 
 			if applied {
 				return nil
 			}
-			// Race condition: someone else updated ref_count, retry
+			// Race: ref_count changed between SELECT and UPDATE, retry
 			continue
 		}
 
-		// 2. Block doesn't exist, try to insert it
+		// 2. Block doesn't exist — insert fresh
 		applied, err := h.db.Session().Query(`
 			INSERT INTO blocks (org_id, block_id, size_bytes, storage_class, storage_key, ref_count, created_at, last_accessed)
 			VALUES (?, ?, ?, ?, ?, ?, ?, ?) IF NOT EXISTS
@@ -609,7 +617,7 @@ func (h *FSHelper) IncrementOrCreateBlock(orgID, blockID string, sizeBytes int, 
 			return nil
 		}
 
-		// 3. Race condition: someone inserted it concurrently, retry increment
+		// Race: someone inserted concurrently, retry to increment
 	}
 
 	return fmt.Errorf("failed to increment/create block %s after %d retries (persistent contention)", blockID, maxRetries)
@@ -698,7 +706,10 @@ func (h *FSHelper) decrementBlockRefCount(orgID, blockID string) bool {
 		}
 
 		if currentRefCount <= 0 {
-			return true
+			// Already at zero or below — no decrement needed from us.
+			// Return false: this call did NOT cause the transition to zero,
+			// so we must not re-enqueue the block for GC.
+			return false
 		}
 
 		newRefCount := currentRefCount - 1

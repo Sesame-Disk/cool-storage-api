@@ -201,9 +201,10 @@ func (w *Worker) processCommit(ctx context.Context, item QueueItem) error {
 		return nil
 	}
 
-	// Enqueue the root fs_object for cascading deletion (fs_object → blocks)
+	// Enqueue the root fs_object for cascading deletion (fs_object → blocks).
+	// Use parent's QueuedAt so cascade children skip the grace period.
 	if commit.RootFSID != "" {
-		w.queue.Enqueue(item.OrgID, ItemFSObject, commit.RootFSID, item.LibraryID, "")
+		w.queue.EnqueueCascade(item.OrgID, item.QueuedAt, ItemFSObject, commit.RootFSID, item.LibraryID, "")
 	}
 
 	if err := w.store.DeleteCommit(item.LibraryID, item.ItemID); err != nil {
@@ -223,14 +224,14 @@ func (w *Worker) processFSObject(ctx context.Context, item QueueItem) error {
 		return nil
 	}
 
-	// If it's a directory, enqueue child fs_objects for recursive deletion
+	// If it's a directory, enqueue child fs_objects for recursive deletion.
+	// Use parent's QueuedAt so cascade children skip the grace period.
 	if len(fsObj.DirEntries) > 0 {
 		var batch []QueueItem
-		now := time.Now()
 		for _, childID := range fsObj.DirEntries {
 			batch = append(batch, QueueItem{
 				OrgID:        item.OrgID,
-				QueuedAt:     now,
+				QueuedAt:     item.QueuedAt,
 				ItemType:     ItemFSObject,
 				ItemID:       childID,
 				LibraryID:    item.LibraryID,

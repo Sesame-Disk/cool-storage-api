@@ -145,7 +145,15 @@ else
     FAILED=$((FAILED + 1))
     echo -e "${RED}[FAIL]${NC} Status has 'queue_size' field (number) (.queue_size: expected numeric, got '$queue_size')"
 fi
-check_json_field "Status has 'blocks_deleted_total' field" ".blocks_deleted_total" "0"
+TOTAL=$((TOTAL + 1))
+blocks_deleted=$(jq -r ".blocks_deleted_total" /tmp/gc_test_response.json 2>/dev/null)
+if echo "$blocks_deleted" | grep -Eq '^[0-9]+$'; then
+    PASSED=$((PASSED + 1))
+    echo -e "${GREEN}[PASS]${NC} Status has 'blocks_deleted_total' field (number) (.blocks_deleted_total = $blocks_deleted)"
+else
+    FAILED=$((FAILED + 1))
+    echo -e "${RED}[FAIL]${NC} Status has 'blocks_deleted_total' field (number) (.blocks_deleted_total: expected numeric, got '$blocks_deleted')"
+fi
 
 # Check last_worker_run and last_scan_run exist (may be "never" or a timestamp)
 TOTAL=$((TOTAL + 1))

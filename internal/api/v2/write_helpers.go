@@ -1084,7 +1084,10 @@ func removeFileTag(sess *gocql.Session, repoID gocql.UUID, fileTagID int) error 
 	if err := sess.Query(`
 		SELECT file_path, tag_id FROM file_tags_by_id WHERE repo_id = ? AND file_tag_id = ?
 	`, repoID, fileTagID).Scan(&filePath, &tagID); err != nil {
-		return fmt.Errorf("%w: %v", errFileTagNotFound, err)
+		if errors.Is(err, gocql.ErrNotFound) {
+			return errFileTagNotFound
+		}
+		return fmt.Errorf("failed to lookup file tag: %w", err)
 	}
 
 	batch := sess.Batch(gocql.LoggedBatch)

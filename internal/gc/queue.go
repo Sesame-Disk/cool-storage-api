@@ -47,6 +47,14 @@ func (q *Queue) Enqueue(orgID uuid.UUID, itemType ItemType, itemID string, libra
 	return q.store.EnqueueItem(orgID, time.Now(), itemType, itemID, libraryID, storageClass, 0)
 }
 
+// EnqueueCascade inserts a cascade-generated item into the gc_queue using the
+// parent's QueuedAt timestamp. Since the parent already passed the grace period,
+// cascade children become immediately eligible for processing — they are known
+// to be unreferenced (the parent object is being deleted).
+func (q *Queue) EnqueueCascade(orgID uuid.UUID, parentQueuedAt time.Time, itemType ItemType, itemID string, libraryID uuid.UUID, storageClass string) error {
+	return q.store.EnqueueItem(orgID, parentQueuedAt, itemType, itemID, libraryID, storageClass, 0)
+}
+
 // EnqueueBatch inserts multiple items into the gc_queue efficiently.
 func (q *Queue) EnqueueBatch(items []QueueItem) error {
 	if len(items) == 0 {
