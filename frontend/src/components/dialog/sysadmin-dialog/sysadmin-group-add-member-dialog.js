@@ -2,11 +2,13 @@ import React from 'react';
 import PropTypes from 'prop-types';
 import { Button } from 'reactstrap';
 import { gettext } from '../../../utils/constants';
+import { seafileAPI } from '../../../utils/seafile-api';
 import UserSelect from '../../user-select';
 
 const propTypes = {
   toggle: PropTypes.func.isRequired,
-  addMembers: PropTypes.func.isRequired
+  addMembers: PropTypes.func.isRequired,
+  orgId: PropTypes.string,
 };
 
 class SysAdminGroupAddMemberDialog extends React.Component {
@@ -51,6 +53,7 @@ class SysAdminGroupAddMemberDialog extends React.Component {
             className="reviewer-select"
             placeholder={gettext('Search users')}
             onSelectChange={this.handleSelectChange}
+            searchFunc={(query) => seafileAPI.sysAdminSearchUsersForSelect(query, this.props.orgId)}
           />
         </div>
         <div className="modal-footer">

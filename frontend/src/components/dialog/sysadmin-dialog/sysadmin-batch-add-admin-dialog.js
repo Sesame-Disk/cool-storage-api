@@ -3,6 +3,7 @@ import PropTypes from 'prop-types';
 import { Button } from 'reactstrap';
 import UserSelect from '../../user-select';
 import { gettext } from '../../../utils/constants';
+import { seafileAPI } from '../../../utils/seafile-api';
 
 const propTypes = {
   toggle: PropTypes.func.isRequired,
@@ -51,6 +52,7 @@ class SysAdminBatchAddAdminDialog extends React.Component {
             className="reviewer-select"
             placeholder={gettext('Search users')}
             onSelectChange={this.handleSelectChange}
+            searchFunc={(query) => seafileAPI.sysAdminSearchUsersForSelect(query)}
           />
         </div>
         <div className="modal-footer">

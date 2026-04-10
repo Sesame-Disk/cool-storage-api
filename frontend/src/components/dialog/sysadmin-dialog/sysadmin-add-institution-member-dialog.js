@@ -2,6 +2,7 @@ import React from 'react';
 import PropTypes from 'prop-types';
 import { Button } from 'reactstrap';
 import { gettext } from '../../../utils/constants';
+import { seafileAPI } from '../../../utils/seafile-api';
 import UserSelect from '../../user-select';
 
 const propTypes = {
@@ -45,6 +46,7 @@ class AddMemberDialog extends React.Component {
             onSelectChange={this.handleSelectChange}
             isMulti={true}
             className='org-add-member-select'
+            searchFunc={(query) => seafileAPI.sysAdminSearchUsersForSelect(query)}
           />
         </div>
         <div className="modal-footer">

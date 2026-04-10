@@ -11,6 +11,7 @@ const propTypes = {
   itemPath: PropTypes.string.isRequired,
   toggleDialog: PropTypes.func.isRequired,
   repoID: PropTypes.string.isRequired,
+  orgId: PropTypes.string,
   isGroupOwnedRepo: PropTypes.bool.isRequired,
   repoEncrypted: PropTypes.bool,
   userPerm: PropTypes.string,
@@ -64,7 +65,7 @@ class SysAdminShareDialog extends React.Component {
             {enableDirPrivateShare &&
               <Fragment>
                 <TabPane tabId="shareToUser">
-                  <SysAdminShareToUser itemType={'library'} isGroupOwnedRepo={isGroupOwnedRepo} itemPath={this.props.itemPath} repoID={this.props.repoID} isRepoOwner={this.state.isRepoOwner}/>
+                  <SysAdminShareToUser itemType={'library'} isGroupOwnedRepo={isGroupOwnedRepo} itemPath={this.props.itemPath} repoID={this.props.repoID} orgId={this.props.orgId} isRepoOwner={this.state.isRepoOwner}/>
                 </TabPane>
                 <TabPane tabId="shareToGroup">
                   <SysAdminShareToGroup itemType={'library'} isGroupOwnedRepo={isGroupOwnedRepo} itemPath={this.props.itemPath} repoID={this.props.repoID} isRepoOwner={this.state.isRepoOwner}/>

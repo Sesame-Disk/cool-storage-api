@@ -342,6 +342,7 @@ class Item extends Component {
               itemName={repo.name}
               itemPath={'/'}
               repoID={repo.id}
+              orgId={repo.org_id}
               isGroupOwnedRepo={isGroupOwnedRepo}
               repoEncrypted={repo.encrypted}
               enableDirPrivateShare={true}
@@ -367,6 +368,7 @@ class Item extends Component {
               submit={this.onTransferRepo}
               toggleDialog={this.toggleTransferDialog}
               isSysAdmin={true}
+              orgId={repo.org_id}
             />
           </ModalPortal>
         }

@@ -106,8 +106,13 @@ const propTypes = {
   isGroupOwnedRepo: PropTypes.bool,
   itemPath: PropTypes.string.isRequired,
   itemType: PropTypes.string.isRequired,
-  repoID: PropTypes.string.isRequired
+  repoID: PropTypes.string.isRequired,
+  orgId: PropTypes.string,
 };
+
+function getShareErrorMessages(error) {
+  return [Utils.getErrorMsg(error)];
+}
 
 class SysAdminShareToUser extends React.Component {
 
@@ -174,15 +179,10 @@ class SysAdminShareToUser extends React.Component {
       });
       this.refs.userSelect.clearSelect();
     }).catch(error => {
-      if (error.response) {
-        let message = gettext('Library can not be shared to owner.');
-        let errMessage = [];
-        errMessage.push(message);
-        this.setState({
-          errorMsg: errMessage,
-          selectedOption: null,
-        });
-      }
+      this.setState({
+        errorMsg: getShareErrorMessages(error),
+        selectedOption: null,
+      });
     });
   };
 
@@ -243,6 +243,7 @@ class SysAdminShareToUser extends React.Component {
                   className="reviewer-select"
                   placeholder={gettext('Search users')}
                   onSelectChange={this.handleSelectChange}
+                  searchFunc={(query) => seafileAPI.sysAdminSearchUsersForSelect(query, this.props.orgId)}
                 />
               </td>
               <td>

@@ -209,6 +209,7 @@ class GroupMembers extends Component {
       loading: true,
       errorMsg: '',
       groupName: '',
+      groupOrgId: '',
       memberList: [],
       pageInfo: {},
       currentPage: 1,
@@ -236,6 +237,7 @@ class GroupMembers extends Component {
         loading: false,
         memberList: res.data.members,
         groupName: res.data.group_name,
+        groupOrgId: res.data.org_id,
         pageInfo: res.data.page_info
       });
     }).catch((error) => {
@@ -351,6 +353,7 @@ class GroupMembers extends Component {
         {isAddMemberDialogOpen &&
           <SysAdminGroupAddMemberDialog
             addMembers={this.addMembers}
+            orgId={this.state.groupOrgId}
             toggle={this.toggleAddMemgerDialog}
           />
         }

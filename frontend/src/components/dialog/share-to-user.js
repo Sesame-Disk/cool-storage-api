@@ -13,6 +13,10 @@ import '../../css/invitations.css';
 
 import '../../css/share-to-user.css';
 
+function getShareErrorMessages(error) {
+  return [Utils.getErrorMsg(error)];
+}
+
 class UserItem extends React.Component {
 
   constructor(props) {
@@ -245,15 +249,10 @@ class ShareToUser extends React.Component {
         });
         this.refs.userSelect.clearSelect();
       }).catch(error => {
-        if (error.response) {
-          let message = gettext('Library can not be shared to owner.');
-          let errMessage = [];
-          errMessage.push(message);
-          this.setState({
-            errorMsg: errMessage,
-            selectedOption: null,
-          });
-        }
+        this.setState({
+          errorMsg: getShareErrorMessages(error),
+          selectedOption: null,
+        });
       });
     } else {
       seafileAPI.shareFolder(repoID, path, 'user', this.state.permission, users).then(res => {
@@ -271,15 +270,10 @@ class ShareToUser extends React.Component {
         });
         this.refs.userSelect.clearSelect();
       }).catch(error => {
-        if (error.response) {
-          let message = gettext('Library can not be shared to owner.');
-          let errMessage = [];
-          errMessage.push(message);
-          this.setState({
-            errorMsg: errMessage,
-            selectedOption: null,
-          });
-        }
+        this.setState({
+          errorMsg: getShareErrorMessages(error),
+          selectedOption: null,
+        });
       });
     }
   };

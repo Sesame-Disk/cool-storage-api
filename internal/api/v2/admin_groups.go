@@ -506,6 +506,7 @@ func (h *AdminHandler) AdminListGroupMembers(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"members":    members,
 		"group_name": groupName,
+		"org_id":     orgID,
 		"page_info": gin.H{
 			"has_next_page": false,
 			"current_page":  1,

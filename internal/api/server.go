@@ -1828,23 +1828,15 @@ func (s *Server) handleGetSubscription(c *gin.Context) {
 }
 
 // handleSearchUser searches for users within the caller organization.
-// Platform superadmins can search across organizations.
 // GET /api2/search-user/?q=<query>
 // Returns users matching the query string (by email or name)
 func (s *Server) handleSearchUser(c *gin.Context) {
 	query := c.Query("q")
 	orgID := c.GetString("org_id")
-	userID := c.GetString("user_id")
-	role := c.GetString("role")
 
 	if query == "" {
 		c.JSON(http.StatusOK, gin.H{"users": []gin.H{}})
 		return
-	}
-	if role == "" && orgID != "" && userID != "" {
-		_ = s.db.Session().Query(`
-			SELECT role FROM users WHERE org_id = ? AND user_id = ?
-		`, orgID, userID).Scan(&role)
 	}
 
 	users := make([]gin.H, 0)
@@ -1871,20 +1863,6 @@ func (s *Server) handleSearchUser(c *gin.Context) {
 			"contact_email": email,
 			"login_id":      email,
 		})
-	}
-
-	if middleware.IsPlatformSuperAdmin(orgID, middleware.OrganizationRole(role)) {
-		rows, err := db.ListAdminUserRows(s.db.Session(), "")
-		if err != nil {
-			slog.Error("search-user query failed", "error", err)
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "search failed"})
-			return
-		}
-		for _, row := range rows {
-			appendMatchedUser(row.Email, row.Name, row.Status)
-		}
-		c.JSON(http.StatusOK, gin.H{"users": users})
-		return
 	}
 
 	// Query all users in the caller organization.

@@ -24,6 +24,7 @@ const propTypes = {
   canTransferToDept: PropTypes.bool,
   isOrgAdmin: PropTypes.bool,
   isSysAdmin: PropTypes.bool,
+  orgId: PropTypes.string,
 
 };
 
@@ -141,6 +142,7 @@ class TransferDialog extends React.Component {
                   className="reviewer-select"
                   placeholder={gettext('Select a user')}
                   onSelectChange={this.handleSelectChange}
+                  searchFunc={this.props.isSysAdmin ? (query) => seafileAPI.sysAdminSearchUsersForSelect(query, this.props.orgId) : undefined}
                 />
               </TabPane>
               {isPro && canTransferToDept &&

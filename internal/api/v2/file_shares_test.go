@@ -1,6 +1,8 @@
 package v2
 
 import (
+	"bytes"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -99,7 +101,7 @@ func TestCreateShare_Validation(t *testing.T) {
 		name       string
 		repoID     string
 		path       string
-		formData   map[string][]string
+		body       map[string]interface{}
 		wantStatus int
 		wantError  string
 	}{
@@ -107,8 +109,8 @@ func TestCreateShare_Validation(t *testing.T) {
 			name:   "missing share_type",
 			repoID: "123e4567-e89b-12d3-a456-426614174000",
 			path:   "/",
-			formData: map[string][]string{
-				"permission": {"r"},
+			body: map[string]interface{}{
+				"permission": "r",
 			},
 			wantStatus: http.StatusBadRequest,
 			wantError:  "share_type is required",
@@ -117,10 +119,10 @@ func TestCreateShare_Validation(t *testing.T) {
 			name:   "invalid repo_id",
 			repoID: "not-a-uuid",
 			path:   "/",
-			formData: map[string][]string{
-				"share_type": {"user"},
-				"permission": {"r"},
-				"username":   {"test@example.com"},
+			body: map[string]interface{}{
+				"share_type": "user",
+				"permission": "r",
+				"username":   []string{"test@example.com"},
 			},
 			wantStatus: http.StatusBadRequest,
 			wantError:  "invalid repo_id",
@@ -134,15 +136,13 @@ func TestCreateShare_Validation(t *testing.T) {
 				reqURL += "?p=" + url.QueryEscape(tt.path)
 			}
 
-			formData := url.Values{}
-			for key, values := range tt.formData {
-				for _, value := range values {
-					formData.Add(key, value)
-				}
+			bodyBytes, err := json.Marshal(tt.body)
+			if err != nil {
+				t.Fatalf("marshal body: %v", err)
 			}
 
-			req := httptest.NewRequest("PUT", reqURL, strings.NewReader(formData.Encode()))
-			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			req := httptest.NewRequest("PUT", reqURL, bytes.NewReader(bodyBytes))
+			req.Header.Set("Content-Type", "application/json")
 			w := httptest.NewRecorder()
 
 			r.ServeHTTP(w, req)
@@ -170,7 +170,7 @@ func TestCreateShare_Integration(t *testing.T) {
 		name       string
 		repoID     string
 		path       string
-		formData   map[string][]string
+		body       map[string]interface{}
 		wantStatus int
 		wantError  string
 	}{
@@ -178,9 +178,9 @@ func TestCreateShare_Integration(t *testing.T) {
 			name:   "share to user missing username",
 			repoID: "123e4567-e89b-12d3-a456-426614174000",
 			path:   "/test",
-			formData: map[string][]string{
-				"share_type": {"user"},
-				"permission": {"rw"},
+			body: map[string]interface{}{
+				"share_type": "user",
+				"permission": "rw",
 			},
 			wantStatus: http.StatusBadRequest,
 			wantError:  "username is required",
@@ -189,9 +189,9 @@ func TestCreateShare_Integration(t *testing.T) {
 			name:   "share to group missing group_id",
 			repoID: "123e4567-e89b-12d3-a456-426614174000",
 			path:   "/test",
-			formData: map[string][]string{
-				"share_type": {"group"},
-				"permission": {"r"},
+			body: map[string]interface{}{
+				"share_type": "group",
+				"permission": "r",
 			},
 			wantStatus: http.StatusBadRequest,
 			wantError:  "group_id is required",
@@ -200,10 +200,10 @@ func TestCreateShare_Integration(t *testing.T) {
 			name:   "invalid share_type",
 			repoID: "123e4567-e89b-12d3-a456-426614174000",
 			path:   "/",
-			formData: map[string][]string{
-				"share_type": {"invalid"},
-				"permission": {"r"},
-				"username":   {"test@example.com"},
+			body: map[string]interface{}{
+				"share_type": "invalid",
+				"permission": "r",
+				"username":   []string{"test@example.com"},
 			},
 			wantStatus: http.StatusBadRequest,
 			wantError:  "invalid share_type",
@@ -217,15 +217,13 @@ func TestCreateShare_Integration(t *testing.T) {
 				reqURL += "?p=" + url.QueryEscape(tt.path)
 			}
 
-			formData := url.Values{}
-			for key, values := range tt.formData {
-				for _, value := range values {
-					formData.Add(key, value)
-				}
+			bodyBytes, err := json.Marshal(tt.body)
+			if err != nil {
+				t.Fatalf("marshal body: %v", err)
 			}
 
-			req := httptest.NewRequest("PUT", reqURL, strings.NewReader(formData.Encode()))
-			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			req := httptest.NewRequest("PUT", reqURL, bytes.NewReader(bodyBytes))
+			req.Header.Set("Content-Type", "application/json")
 			w := httptest.NewRecorder()
 
 			r.ServeHTTP(w, req)

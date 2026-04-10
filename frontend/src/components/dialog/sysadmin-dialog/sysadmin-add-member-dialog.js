@@ -65,6 +65,7 @@ class AddMemberDialog extends React.Component {
             ref="orgSelect"
             isMulti={true}
             className='org-add-member-select'
+            searchFunc={(query) => seafileAPI.sysAdminSearchUsersForSelect(query)}
           />
           { this.state.errMessage && <p className="error">{this.state.errMessage}</p> }
         </div>

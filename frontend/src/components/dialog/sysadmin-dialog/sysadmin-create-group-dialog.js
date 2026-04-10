@@ -2,6 +2,7 @@ import React from 'react';
 import PropTypes from 'prop-types';
 import { Button, Input, Form, FormGroup, Label, Alert } from 'reactstrap';
 import { gettext } from '../../../utils/constants';
+import { seafileAPI } from '../../../utils/seafile-api';
 import UserSelect from '../../user-select';
 
 const propTypes = {
@@ -85,6 +86,7 @@ class SysAdminCreateGroupDialog extends React.Component {
                 className="reviewer-select"
                 placeholder={gettext('Select a user')}
                 onSelectChange={this.handleSelectChange}
+                searchFunc={(query) => seafileAPI.sysAdminSearchUsersForSelect(query)}
               />
             </FormGroup>
           </Form>

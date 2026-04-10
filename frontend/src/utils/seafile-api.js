@@ -39,6 +39,21 @@ function createAPIError(message, responseData, status) {
   return error;
 }
 
+function mapAdminSearchUsersToUserSelectResponse(response) {
+  const userList = response?.data?.user_list || [];
+  return {
+    data: {
+      users: userList.map(user => normalizeAccountInfo({
+        email: user.email,
+        contact_email: user.contact_email || user.email,
+        login_id: user.login_id || user.email,
+        name: user.name,
+        avatar_url: user.avatar_url,
+      })),
+    },
+  };
+}
+
 // Global response interceptor:
 // 1. On success: show quota warning toast if X-Quota-Warning header is present.
 // 2. On 401 error: clear auth state and redirect to login.
@@ -1038,6 +1053,22 @@ seafileAPI.sysAdminSearchUsers = function (query, page, perPage, orgId) {
   if (orgId) params.set('org_id', orgId);
   url += '?' + params.toString();
   return this.req.get(url);
+};
+
+seafileAPI.sysAdminSearchUsersForSelect = function (query, orgId) {
+  return this.sysAdminSearchUsers(query, null, null, orgId).then(mapAdminSearchUsersToUserSelectResponse);
+};
+
+seafileAPI.shareFolder = function (repoID, path, shareType, permission, shareTargets) {
+  const encodedPath = encodeURIComponent(path);
+  const url = this.server + '/api2/repos/' + repoID + '/dir/shared_items/?p=' + encodedPath;
+  const data = { share_type: shareType, permission };
+  if (shareType === 'user') {
+    data.username = shareTargets;
+  } else {
+    data.group_id = shareTargets;
+  }
+  return this.req.put(url, data);
 };
 
 // Admin: list repos owned by user

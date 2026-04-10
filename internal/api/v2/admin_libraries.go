@@ -29,6 +29,7 @@ import (
 type adminLibraryResponse struct {
 	ID          string `json:"id"`
 	RepoID      string `json:"repo_id"`
+	OrgID       string `json:"org_id,omitempty"`
 	Name        string `json:"name"`
 	RepoName    string `json:"repo_name"`
 	StorageID   string `json:"storage_id,omitempty"`
@@ -74,6 +75,7 @@ func adminLibraryResponseFromProjection(row dbpkg.AdminLibraryProjectionRow) adm
 	return adminLibraryResponse{
 		ID:          row.LibraryID,
 		RepoID:      row.LibraryID,
+		OrgID:       row.OrgID,
 		Name:        row.Name,
 		RepoName:    row.Name,
 		StorageID:   row.StorageClass,
@@ -612,6 +614,7 @@ func (h *AdminHandler) AdminCreateLibrary(c *gin.Context) {
 	c.JSON(http.StatusOK, adminLibraryResponse{
 		ID:          newLibID.String(),
 		RepoID:      newLibID.String(),
+		OrgID:       ownerOrgID,
 		Name:        repoName,
 		RepoName:    repoName,
 		StorageID:   storageClass,
