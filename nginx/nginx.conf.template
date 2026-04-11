@@ -7,12 +7,27 @@
 # - $${nginx_var}    → becomes $nginx_var after substitution (nginx syntax)
 # =============================================================================
 
+# Canonical client IP forwarded by the central nginx. If this internal nginx is
+# reached directly, fall back to the socket peer IP.
+map $${http_x_real_ip} $${sesamefs_client_ip} {
+    default $${http_x_real_ip};
+    ""      $${remote_addr};
+}
+
+# Preserve the forwarded chain from the central nginx instead of appending the
+# private proxy hop again. If no upstream proxy provided a chain, start one
+# with the direct peer IP.
+map $${http_x_forwarded_for} $${sesamefs_forwarded_for} {
+    default $${http_x_forwarded_for};
+    ""      $${remote_addr};
+}
+
 # Rate limiting zones (http context — applies to all server blocks below)
 # API zone: general API calls — 100 req/s with burst
-limit_req_zone $${binary_remote_addr} zone=api:10m rate=100r/s;
+limit_req_zone $${sesamefs_client_ip} zone=api:10m rate=100r/s;
 # Transfer zone: file upload/download routes — 20 concurrent transfers per IP is plenty;
 # these are long-lived connections, not high-frequency short requests
-limit_req_zone $${binary_remote_addr} zone=transfer:10m rate=20r/s;
+limit_req_zone $${sesamefs_client_ip} zone=transfer:10m rate=20r/s;
 
 # Mobile User-Agent detection — single authoritative location (Go no longer duplicates this)
 map $${http_user_agent} $${is_mobile} {
@@ -115,8 +130,8 @@ server {
         proxy_set_header Connection "";
 
         proxy_set_header Host              $${host};
-        proxy_set_header X-Real-IP         $${remote_addr};
-        proxy_set_header X-Forwarded-For   $${proxy_add_x_forwarded_for};
+        proxy_set_header X-Real-IP         $${sesamefs_client_ip};
+        proxy_set_header X-Forwarded-For   $${sesamefs_forwarded_for};
         proxy_set_header X-Forwarded-Proto $${scheme};
 
         proxy_request_buffering off;
@@ -141,8 +156,8 @@ server {
         proxy_set_header Connection "";
 
         proxy_set_header Host              $${host};
-        proxy_set_header X-Real-IP         $${remote_addr};
-        proxy_set_header X-Forwarded-For   $${proxy_add_x_forwarded_for};
+        proxy_set_header X-Real-IP         $${sesamefs_client_ip};
+        proxy_set_header X-Forwarded-For   $${sesamefs_forwarded_for};
         proxy_set_header X-Forwarded-Proto $${scheme};
 
         proxy_request_buffering off;
@@ -168,8 +183,8 @@ server {
         proxy_set_header Connection "";
 
         proxy_set_header Host              $${host};
-        proxy_set_header X-Real-IP         $${remote_addr};
-        proxy_set_header X-Forwarded-For   $${proxy_add_x_forwarded_for};
+        proxy_set_header X-Real-IP         $${sesamefs_client_ip};
+        proxy_set_header X-Forwarded-For   $${sesamefs_forwarded_for};
         proxy_set_header X-Forwarded-Proto $${scheme};
 
         proxy_buffering         off;
@@ -212,8 +227,8 @@ server {
         proxy_set_header Connection "upgrade";
 
         proxy_set_header Host              $${host};
-        proxy_set_header X-Real-IP         $${remote_addr};
-        proxy_set_header X-Forwarded-For   $${proxy_add_x_forwarded_for};
+        proxy_set_header X-Real-IP         $${sesamefs_client_ip};
+        proxy_set_header X-Forwarded-For   $${sesamefs_forwarded_for};
         proxy_set_header X-Forwarded-Proto $${scheme};
 
         proxy_buffering    off;

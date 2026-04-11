@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"strings"
 	"sync"
 	"time"
 
@@ -39,6 +40,8 @@ var (
 	ErrKeyLimitReached = errors.New("maximum api keys per user reached")
 	ErrInvalidScope    = errors.New("invalid scope")
 	ErrNotOwner        = errors.New("api key does not belong to this user")
+
+	invalidLookupToken = tokenPrefix + strings.Repeat("0", tokenBytes*2)
 )
 
 // APIKey represents a stored API key (without the raw token).
@@ -63,8 +66,10 @@ type cacheEntry struct {
 type Manager struct {
 	db *db.DB
 
-	cacheMu sync.RWMutex
-	cache   map[string]*cacheEntry // keyed by key_hash
+	cacheMu  sync.RWMutex
+	cache    map[string]*cacheEntry // keyed by key_hash
+	done     chan struct{}
+	stopOnce sync.Once
 }
 
 // NewManager creates a new API key manager.
@@ -72,6 +77,7 @@ func NewManager(database *db.DB) *Manager {
 	m := &Manager{
 		db:    database,
 		cache: make(map[string]*cacheEntry),
+		done:  make(chan struct{}),
 	}
 	go m.cleanupLoop()
 	return m
@@ -180,13 +186,22 @@ func (m *Manager) CreateKey(userID, orgID gocql.UUID, label, scope string, expir
 
 // ValidateKey validates a raw token and returns the associated API key.
 // Returns ErrKeyNotFound if the token doesn't exist, ErrKeyExpired if expired.
+//
+// Security: malformed tokens are normalized onto a fixed dummy lookup token
+// before hashing so callers don't get a cheaper "bad format" path than a
+// well-formed but unknown token. Database hit-vs-miss timing is a separate
+// concern and is not papered over here with misleading constant-time claims.
 func (m *Manager) ValidateKey(rawToken string) (*APIKey, error) {
-	keyHash := HashToken(rawToken)
+	lookupToken, validShape := normalizeLookupToken(rawToken)
+	keyHash := HashToken(lookupToken)
 
 	// Check cache first.
 	m.cacheMu.RLock()
 	if entry, ok := m.cache[keyHash]; ok && time.Since(entry.cachedAt) < cacheTTL {
 		m.cacheMu.RUnlock()
+		if !validShape {
+			return nil, ErrKeyNotFound
+		}
 		if err := checkExpiry(entry.key); err != nil {
 			return nil, err
 		}
@@ -196,15 +211,11 @@ func (m *Manager) ValidateKey(rawToken string) (*APIKey, error) {
 	m.cacheMu.RUnlock()
 
 	// Cache miss — query DB.
-	key := &APIKey{KeyHash: keyHash}
-	err := m.db.Session().Query(`
-		SELECT key_prefix, user_id, org_id, label, scope, created_at, last_used_at, expires_at
-		FROM api_keys WHERE key_hash = ?
-	`, keyHash).Scan(
-		&key.KeyPrefix, &key.UserID, &key.OrgID, &key.Label, &key.Scope,
-		&key.CreatedAt, &key.LastUsedAt, &key.ExpiresAt,
-	)
+	key, err := m.lookupKeyByHash(keyHash)
 	if err != nil {
+		return nil, ErrKeyNotFound
+	}
+	if !validShape {
 		return nil, ErrKeyNotFound
 	}
 
@@ -218,6 +229,29 @@ func (m *Manager) ValidateKey(rawToken string) (*APIKey, error) {
 	m.cacheMu.Unlock()
 
 	go m.updateLastUsed(key)
+	return key, nil
+}
+
+func normalizeLookupToken(rawToken string) (string, bool) {
+	expectedLen := len(tokenPrefix) + 2*tokenBytes
+	if len(rawToken) != expectedLen || !strings.HasPrefix(rawToken, tokenPrefix) {
+		return invalidLookupToken, false
+	}
+	return rawToken, true
+}
+
+func (m *Manager) lookupKeyByHash(keyHash string) (*APIKey, error) {
+	key := &APIKey{KeyHash: keyHash}
+	err := m.db.Session().Query(`
+		SELECT key_prefix, user_id, org_id, label, scope, created_at, last_used_at, expires_at
+		FROM api_keys WHERE key_hash = ?
+	`, keyHash).Scan(
+		&key.KeyPrefix, &key.UserID, &key.OrgID, &key.Label, &key.Scope,
+		&key.CreatedAt, &key.LastUsedAt, &key.ExpiresAt,
+	)
+	if err != nil {
+		return nil, err
+	}
 	return key, nil
 }
 
@@ -459,8 +493,13 @@ func (m *Manager) countUserKeys(orgID, userID gocql.UUID) (int, error) {
 func (m *Manager) cleanupLoop() {
 	ticker := time.NewTicker(cacheTTL)
 	defer ticker.Stop()
-	for range ticker.C {
-		m.cleanupExpired()
+	for {
+		select {
+		case <-ticker.C:
+			m.cleanupExpired()
+		case <-m.done:
+			return
+		}
 	}
 }
 
@@ -473,4 +512,11 @@ func (m *Manager) cleanupExpired() {
 			delete(m.cache, hash)
 		}
 	}
+}
+
+// Stop shuts down the cache cleanup goroutine.
+func (m *Manager) Stop() {
+	m.stopOnce.Do(func() {
+		close(m.done)
+	})
 }

@@ -46,10 +46,25 @@ type OIDCClient struct {
 	jwksKeys map[string]crypto.PublicKey // kid -> public key
 	jwksAt   time.Time
 
-	// PKCE state storage (state -> code_verifier)
-	stateMu sync.RWMutex
-	states  map[string]*AuthState
+	// PKCE state storage (state -> code_verifier). Bounded in size and
+	// swept by a background goroutine to cap memory use under load or
+	// under a state-flooding attack (M-6).
+	stateMu     sync.RWMutex
+	states      map[string]*AuthState
+	stateSweep  chan struct{} // closed to stop the sweeper goroutine
+	sweepCtlMu  sync.Mutex
+	sweepActive bool
 }
+
+// maxPendingStates caps the PKCE state map. An attacker who can reach
+// /oauth/authorize unauthenticated could otherwise flood the map. Each
+// AuthState is small (~few hundred bytes), so 10k entries ≈ a couple MB;
+// plenty of headroom for real traffic, small enough to bound blast radius.
+const maxPendingStates = 10000
+
+// stateTTL is how long a PKCE state is honored before the sweeper reaps it.
+// Matches pruneExpiredStatesLocked (10 minutes).
+const stateTTL = 10 * time.Minute
 
 // OIDCDiscovery represents the OIDC discovery document
 type OIDCDiscovery struct {
@@ -153,14 +168,58 @@ type AuthResult struct {
 
 // NewOIDCClient creates a new OIDC client
 func NewOIDCClient(appCfg *config.Config, database *db.DB, sessions *SessionManager) *OIDCClient {
-	return &OIDCClient{
-		appConfig: appCfg,
-		config:    &appCfg.Auth.OIDC,
-		db:        database,
-		sessions:  sessions,
-		states:    make(map[string]*AuthState),
-		jwksKeys:  make(map[string]crypto.PublicKey),
+	c := &OIDCClient{
+		appConfig:  appCfg,
+		config:     &appCfg.Auth.OIDC,
+		db:         database,
+		sessions:   sessions,
+		states:     make(map[string]*AuthState),
+		jwksKeys:   make(map[string]crypto.PublicKey),
+		stateSweep: make(chan struct{}),
 	}
+	c.startStateSweeper()
+	return c
+}
+
+// startStateSweeper launches a background goroutine that periodically reaps
+// expired PKCE states. The lazy prune inside storeState/consumeState only
+// runs on traffic — if a burst of states arrives and then traffic stops,
+// the map would pin memory until the next hit. This ticker guarantees
+// cleanup even under idle conditions.
+func (c *OIDCClient) startStateSweeper() {
+	c.sweepCtlMu.Lock()
+	if c.sweepActive {
+		c.sweepCtlMu.Unlock()
+		return
+	}
+	c.sweepActive = true
+	c.sweepCtlMu.Unlock()
+
+	go func() {
+		ticker := time.NewTicker(stateTTL / 2)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				c.stateMu.Lock()
+				c.pruneExpiredStatesLocked()
+				c.stateMu.Unlock()
+			case <-c.stateSweep:
+				return
+			}
+		}
+	}()
+}
+
+// StopStateSweeper halts the background sweeper. Safe to call multiple times.
+func (c *OIDCClient) StopStateSweeper() {
+	c.sweepCtlMu.Lock()
+	defer c.sweepCtlMu.Unlock()
+	if !c.sweepActive {
+		return
+	}
+	close(c.stateSweep)
+	c.sweepActive = false
 }
 
 // IsEnabled returns whether OIDC authentication is enabled
@@ -434,8 +493,22 @@ func (c *OIDCClient) parseIDToken(idToken, expectedNonce string) (*IDTokenClaims
 	if v, ok := mapClaims["sub"].(string); ok {
 		claims.Subject = v
 	}
-	if v, ok := mapClaims["aud"].(string); ok {
+	// `aud` can be a string or an array of strings per RFC 7519. Normalize to
+	// a slice so we can enforce audience below regardless of provider shape.
+	var audiences []string
+	switch v := mapClaims["aud"].(type) {
+	case string:
 		claims.Audience = v
+		audiences = []string{v}
+	case []interface{}:
+		for _, item := range v {
+			if s, ok := item.(string); ok {
+				audiences = append(audiences, s)
+			}
+		}
+		if len(audiences) > 0 {
+			claims.Audience = audiences[0]
+		}
 	}
 	if v, ok := mapClaims["exp"].(float64); ok {
 		claims.ExpiresAt = int64(v)
@@ -473,6 +546,27 @@ func (c *OIDCClient) parseIDToken(idToken, expectedNonce string) (*IDTokenClaims
 	actualIssuer := strings.TrimSuffix(claims.Issuer, "/")
 	if actualIssuer != expectedIssuer {
 		return nil, fmt.Errorf("issuer mismatch: expected %s, got %s", expectedIssuer, actualIssuer)
+	}
+
+	// Validate audience. Per OpenID Connect Core 1.0 §3.1.3.7 step 3, the RP
+	// MUST reject an ID token whose `aud` does not list the configured client
+	// ID. This prevents tokens minted for a different RP from being replayed
+	// against SesameFS. Respect ValidateAudience so deployments can opt out
+	// explicitly, but keep the secure default enabled.
+	if c.config.ValidateAudience && c.config.ClientID != "" {
+		if len(audiences) == 0 {
+			return nil, fmt.Errorf("audience mismatch: token is missing a usable aud claim")
+		}
+		matched := false
+		for _, aud := range audiences {
+			if aud == c.config.ClientID {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			return nil, fmt.Errorf("audience mismatch: token aud does not include client ID %s", c.config.ClientID)
+		}
 	}
 
 	// Validate nonce if provided
@@ -690,6 +784,7 @@ func (c *OIDCClient) provisionUser(ctx context.Context, claims *IDTokenClaims, u
 	// Extract roles from custom claim
 	roles := c.extractRoles(claims, userInfo)
 	oidcProvidedRole := len(roles) > 0
+	blockedPrivilegedOIDCRole := oidcProvidedRole && isPrivilegedOIDCRoleClaim(roles[0])
 	role := c.config.DefaultRole
 	if oidcProvidedRole {
 		role = c.mapOIDCRole(roles[0])
@@ -840,10 +935,10 @@ func (c *OIDCClient) provisionUser(ctx context.Context, claims *IDTokenClaims, u
 			orgID = oidcOrgID
 		}
 
-		// Sync role from OIDC (OIDC is source of truth when it provides roles) —
-		// but not for superadmins promoted via script (their DB role takes precedence).
-		// If OIDC did NOT send a role claim, preserve the DB role (e.g. org admin
-		// promoted via the admin panel).
+		// Sync role from OIDC when it provides an allowed role claim. Claims that
+		// attempt to grant superadmin-like access are ignored for existing users:
+		// they must not escalate privileges, but they also must not downgrade a
+		// persisted owner/admin role during relogin.
 		var dbRole string
 		roleErr := c.db.Session().Query(`
 			SELECT role FROM users WHERE org_id = ? AND user_id = ?
@@ -860,6 +955,9 @@ func (c *OIDCClient) provisionUser(ctx context.Context, claims *IDTokenClaims, u
 			role = c.normalizeRoleForOrg(orgID, role)
 			if dbRole == "superadmin" && orgID == c.config.PlatformOrgID {
 				// Superadmin promoted via script — preserve their role
+				role = dbRole
+			} else if blockedPrivilegedOIDCRole {
+				// Ignore forbidden superadmin-like claims for existing users.
 				role = dbRole
 			} else if !oidcProvidedRole {
 				// OIDC did not send a role claim — keep the DB role as-is
@@ -1077,11 +1175,18 @@ func (c *OIDCClient) extractRoles(claims *IDTokenClaims, userInfo *UserInfo) []s
 	return nil
 }
 
-// mapOIDCRole maps an OIDC role to a SesameFS role
+// mapOIDCRole maps an OIDC role claim to a SesameFS role.
+//
+// Security (H-4): superadmin is NEVER granted from a claim. Any IdP that can
+// mint tokens for a SesameFS user could otherwise take over the platform by
+// asserting `role: superadmin`. Superadmin is a DB-only role, bootstrapped
+// manually and resolved from the stored user record (see the DB role paths
+// that call normalizeRoleForOrg). Claims asking for superadmin are downgraded
+// to the configured DefaultRole.
 func (c *OIDCClient) mapOIDCRole(oidcRole string) string {
 	switch strings.ToLower(oidcRole) {
 	case "superadmin", "super_admin", "platform_admin":
-		return "superadmin"
+		return c.config.DefaultRole
 	case "owner", "org_owner":
 		return "owner"
 	case "admin", "administrator", "tenant_admin":
@@ -1094,6 +1199,15 @@ func (c *OIDCClient) mapOIDCRole(oidcRole string) string {
 		return "guest"
 	default:
 		return c.config.DefaultRole
+	}
+}
+
+func isPrivilegedOIDCRoleClaim(oidcRole string) bool {
+	switch strings.ToLower(strings.TrimSpace(oidcRole)) {
+	case "superadmin", "super_admin", "platform_admin":
+		return true
+	default:
+		return false
 	}
 }
 
@@ -1118,12 +1232,30 @@ func (c *OIDCClient) isValidRedirectURI(uri string) bool {
 	return false
 }
 
-// storeState stores an auth state for later validation
+// storeState stores an auth state for later validation. If the map is at
+// capacity even after pruning expired entries, the oldest in-window state is
+// evicted. This bounds memory under a state-flooding attack (M-6).
 func (c *OIDCClient) storeState(state string, authState *AuthState) {
 	c.stateMu.Lock()
 	defer c.stateMu.Unlock()
 
 	c.pruneExpiredStatesLocked()
+
+	if len(c.states) >= maxPendingStates {
+		// Evict the oldest entry by CreatedAt so honest clients in-flight
+		// still succeed as long as they complete within stateTTL.
+		var oldestKey string
+		var oldestTime time.Time
+		for k, v := range c.states {
+			if oldestKey == "" || v.CreatedAt.Before(oldestTime) {
+				oldestKey = k
+				oldestTime = v.CreatedAt
+			}
+		}
+		if oldestKey != "" {
+			delete(c.states, oldestKey)
+		}
+	}
 
 	c.states[state] = authState
 }

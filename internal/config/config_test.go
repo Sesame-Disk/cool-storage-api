@@ -169,6 +169,9 @@ func TestDefaultConfig(t *testing.T) {
 	if cfg.Chunking.Algorithm != "fastcdc" {
 		t.Errorf("Chunking.Algorithm = %s, want fastcdc", cfg.Chunking.Algorithm)
 	}
+	if len(cfg.Server.TrustedProxies) != 0 {
+		t.Errorf("Server.TrustedProxies = %v, want empty by default", cfg.Server.TrustedProxies)
+	}
 	if cfg.Versioning.DefaultTTLDays != 90 {
 		t.Errorf("Versioning.DefaultTTLDays = %d, want 90", cfg.Versioning.DefaultTTLDays)
 	}
@@ -250,6 +253,21 @@ func TestConfigValidate(t *testing.T) {
 			wantErr:        true,
 			wantErrContain: "unsupported extension",
 		},
+		{
+			name: "trusted proxies are normalized",
+			modify: func(c *Config) {
+				c.Server.TrustedProxies = []string{" 10.0.0.0/8 ", "192.168.1.10", "10.0.0.0/8", ""}
+			},
+			wantErr: false,
+		},
+		{
+			name: "trusted proxies reject invalid values",
+			modify: func(c *Config) {
+				c.Server.TrustedProxies = []string{"not-a-cidr"}
+			},
+			wantErr:        true,
+			wantErrContain: "server.trusted_proxies",
+		},
 	}
 
 	for _, tt := range tests {
@@ -271,7 +289,36 @@ func TestConfigValidate(t *testing.T) {
 					t.Fatalf("normalized preview extensions = %q, want %q", got, "md,png")
 				}
 			}
+			if tt.name == "trusted proxies are normalized" {
+				got := strings.Join(cfg.Server.TrustedProxies, ",")
+				if got != "10.0.0.0/8,192.168.1.10" {
+					t.Fatalf("normalized trusted proxies = %q, want %q", got, "10.0.0.0/8,192.168.1.10")
+				}
+			}
 		})
+	}
+}
+
+func TestEnvOverrideServerTrustedProxies(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Auth.DevMode = true
+
+	os.Setenv("SERVER_TRUSTED_PROXIES", "10.0.0.0/8, 192.168.1.10 ")
+	defer os.Unsetenv("SERVER_TRUSTED_PROXIES")
+
+	cfg.applyEnvOverrides()
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate() error = %v", err)
+	}
+
+	if len(cfg.Server.TrustedProxies) != 2 {
+		t.Fatalf("Server.TrustedProxies length = %d, want 2", len(cfg.Server.TrustedProxies))
+	}
+	if cfg.Server.TrustedProxies[0] != "10.0.0.0/8" {
+		t.Fatalf("Server.TrustedProxies[0] = %q, want %q", cfg.Server.TrustedProxies[0], "10.0.0.0/8")
+	}
+	if cfg.Server.TrustedProxies[1] != "192.168.1.10" {
+		t.Fatalf("Server.TrustedProxies[1] = %q, want %q", cfg.Server.TrustedProxies[1], "192.168.1.10")
 	}
 }
 

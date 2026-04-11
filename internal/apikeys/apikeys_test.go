@@ -112,6 +112,29 @@ func TestTokenFormat(t *testing.T) {
 	}
 }
 
+func TestNormalizeLookupToken(t *testing.T) {
+	t.Run("valid token preserved", func(t *testing.T) {
+		raw := tokenPrefix + strings.Repeat("ab", tokenBytes)
+		got, ok := normalizeLookupToken(raw)
+		if !ok {
+			t.Fatal("normalizeLookupToken(valid) should mark token as valid")
+		}
+		if got != raw {
+			t.Fatalf("normalizeLookupToken(valid) = %q, want %q", got, raw)
+		}
+	})
+
+	t.Run("invalid token normalized to dummy", func(t *testing.T) {
+		got, ok := normalizeLookupToken("not-a-real-key")
+		if ok {
+			t.Fatal("normalizeLookupToken(invalid) should mark token as invalid")
+		}
+		if got != invalidLookupToken {
+			t.Fatalf("normalizeLookupToken(invalid) = %q, want dummy token", got)
+		}
+	})
+}
+
 func TestCheckExpiry(t *testing.T) {
 	// nil expiry = no expiration
 	key := &APIKey{ExpiresAt: nil}

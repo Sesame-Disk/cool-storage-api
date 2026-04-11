@@ -49,6 +49,9 @@ The desktop frontend now assumes same-origin routing:
 - **Development with `npm start`:** `src/setupProxy.js` proxies API/file routes to the backend, so same-origin requests still work.
 - **No desktop runtime API injection:** the old `SESAMEFS_API_URL` + `docker-entrypoint.sh` path is no longer used by the desktop frontend container.
 
+Production note:
+The nginx inside the frontend container may preserve `X-Real-IP` and `X-Forwarded-For` values already canonicalized by an upstream reverse proxy. That is only safe when this frontend container is reachable exclusively from trusted internal network paths, not directly from arbitrary external clients.
+
 ## CSS & Styling
 
 The frontend uses multiple CSS sources for styling:

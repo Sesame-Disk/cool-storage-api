@@ -106,21 +106,22 @@ func (s *clientSSOStore) cleanupLoop() {
 
 // Server represents the HTTP API server
 type Server struct {
-	config          *config.Config
-	db              *db.DB
-	storage         *storage.S3Store    // Legacy single S3 store
-	storageManager  *storage.Manager    // Multi-backend storage manager
-	blockStore      *storage.BlockStore // Legacy single block store
-	tokenStore      TokenStore
-	permMiddleware  *middleware.PermissionMiddleware
-	authHandler     *v2.AuthHandler         // OIDC authentication handler
-	gcService       *gc.Service             // Garbage collection service
-	ssoStore        *clientSSOStore         // Pending desktop-client SSO tokens
-	authRateLimiter *middleware.RateLimiter // Per-IP rate limiter for auth endpoints
-	apiKeyManager   *apikeys.Manager        // API key manager for programmatic auth
-	version         string                  // Build version string
-	router          *gin.Engine
-	server          *http.Server
+	config               *config.Config
+	db                   *db.DB
+	storage              *storage.S3Store    // Legacy single S3 store
+	storageManager       *storage.Manager    // Multi-backend storage manager
+	blockStore           *storage.BlockStore // Legacy single block store
+	tokenStore           TokenStore
+	permMiddleware       *middleware.PermissionMiddleware
+	authHandler          *v2.AuthHandler         // OIDC authentication handler
+	gcService            *gc.Service             // Garbage collection service
+	ssoStore             *clientSSOStore         // Pending desktop-client SSO tokens
+	authRateLimiter      *middleware.RateLimiter // Per-IP rate limiter for auth endpoints
+	shareLinkRateLimiter *middleware.RateLimiter // Per-IP rate limiter for public share-link endpoints
+	apiKeyManager        *apikeys.Manager        // API key manager for programmatic auth
+	version              string                  // Build version string
+	router               *gin.Engine
+	server               *http.Server
 }
 
 // NewServer creates a new API server
@@ -136,8 +137,12 @@ func NewServer(cfg *config.Config, database *db.DB, version string) *Server {
 	router.RedirectTrailingSlash = false
 	router.RedirectFixedPath = false
 	router.HandleMethodNotAllowed = true
+	if err := configureTrustedProxies(router, cfg); err != nil {
+		panic(fmt.Errorf("configure trusted proxies: %w", err))
+	}
 
 	router.Use(gin.Recovery())
+	router.Use(middleware.SecurityHeaders())
 	router.Use(logging.GinMiddleware())
 	// Gzip for API responses but exclude binary file transfer paths.
 	// These paths stream large files and gzip would buffer them entirely,
@@ -210,21 +215,34 @@ func NewServer(cfg *config.Config, database *db.DB, version string) *Server {
 	// Initialize rate limiter for auth endpoints (~10 req/min per IP)
 	authRL := middleware.NewRateLimiter(rate.Every(6*time.Second), 10)
 
+	// Share-link endpoints are public (no auth) and keyed only by an
+	// opaque token. Without a limiter here an attacker can enumerate
+	// valid tokens by brute force (H-5). Allow a small burst so legit
+	// page loads with parallel bootstrap/dirents calls don't trip it,
+	// then steady ~1 req/sec per IP.
+	shareLinkRL := middleware.NewRateLimiter(rate.Every(time.Second), 20)
+
+	var apiKeyManager *apikeys.Manager
+	if database != nil {
+		apiKeyManager = apikeys.NewManager(database)
+	}
+
 	s := &Server{
-		config:          cfg,
-		db:              database,
-		storage:         s3Store,
-		storageManager:  storageManager,
-		blockStore:      blockStore,
-		tokenStore:      tokenStore,
-		permMiddleware:  permMiddleware,
-		authHandler:     authHandler,
-		gcService:       gcService,
-		ssoStore:        newClientSSOStore(),
-		authRateLimiter: authRL,
-		apiKeyManager:   apikeys.NewManager(database),
-		version:         version,
-		router:          router,
+		config:               cfg,
+		db:                   database,
+		storage:              s3Store,
+		storageManager:       storageManager,
+		blockStore:           blockStore,
+		tokenStore:           tokenStore,
+		permMiddleware:       permMiddleware,
+		authHandler:          authHandler,
+		gcService:            gcService,
+		ssoStore:             newClientSSOStore(),
+		authRateLimiter:      authRL,
+		shareLinkRateLimiter: shareLinkRL,
+		apiKeyManager:        apiKeyManager,
+		version:              version,
+		router:               router,
 	}
 
 	s.setupRoutes()
@@ -266,6 +284,10 @@ func buildCORSConfig(cfg *config.Config) cors.Config {
 	return corsConfig
 }
 
+func configureTrustedProxies(router *gin.Engine, cfg *config.Config) error {
+	return router.SetTrustedProxies(configuredTrustedProxies(cfg.Server.TrustedProxies))
+}
+
 func configuredOrigins(origins []string) []string {
 	configured := make([]string, 0, len(origins))
 	for _, origin := range origins {
@@ -274,6 +296,21 @@ func configuredOrigins(origins []string) []string {
 			continue
 		}
 		configured = append(configured, origin)
+	}
+	return configured
+}
+
+func configuredTrustedProxies(values []string) []string {
+	configured := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		configured = append(configured, value)
+	}
+	if len(configured) == 0 {
+		return nil
 	}
 	return configured
 }
@@ -1926,6 +1963,18 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	if s.gcService != nil {
 		s.gcService.Stop()
 	}
+	if s.authRateLimiter != nil {
+		s.authRateLimiter.Stop()
+	}
+	if s.shareLinkRateLimiter != nil {
+		s.shareLinkRateLimiter.Stop()
+	}
+	if s.apiKeyManager != nil {
+		s.apiKeyManager.Stop()
+	}
+	if s.authHandler != nil && s.authHandler.GetOIDCClient() != nil {
+		s.authHandler.GetOIDCClient().StopStateSweeper()
+	}
 
 	if s.server != nil {
 		return s.server.Shutdown(ctx)
@@ -2217,6 +2266,11 @@ func (s *Server) handleGCRun(c *gin.Context) {
 // handleCreateAPIKey creates a new API key for the authenticated user.
 // POST /api/v2.1/api-keys/
 func (s *Server) handleCreateAPIKey(c *gin.Context) {
+	if s.apiKeyManager == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "api key management unavailable"})
+		return
+	}
+
 	userID := c.GetString("user_id")
 	orgID := c.GetString("org_id")
 	role := c.GetString("role")
@@ -2296,6 +2350,11 @@ func (s *Server) handleCreateAPIKey(c *gin.Context) {
 // handleListAPIKeys lists all API keys for the authenticated user.
 // GET /api/v2.1/api-keys/
 func (s *Server) handleListAPIKeys(c *gin.Context) {
+	if s.apiKeyManager == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "api key management unavailable"})
+		return
+	}
+
 	userID := c.GetString("user_id")
 	orgID := c.GetString("org_id")
 
@@ -2329,6 +2388,11 @@ func (s *Server) handleListAPIKeys(c *gin.Context) {
 // handleRevokeAPIKey revokes an API key belonging to the authenticated user.
 // DELETE /api/v2.1/api-keys/:key_hash/
 func (s *Server) handleRevokeAPIKey(c *gin.Context) {
+	if s.apiKeyManager == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "api key management unavailable"})
+		return
+	}
+
 	userID := c.GetString("user_id")
 	orgID := c.GetString("org_id")
 	keyHash := c.Param("key_hash")

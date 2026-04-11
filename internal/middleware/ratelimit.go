@@ -1,7 +1,9 @@
 package middleware
 
 import (
+	"math"
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
 
@@ -22,6 +24,7 @@ type RateLimiter struct {
 	rate     rate.Limit
 	burst    int
 	done     chan struct{}
+	stopOnce sync.Once
 }
 
 // NewRateLimiter creates a per-IP rate limiter.
@@ -44,7 +47,14 @@ func (rl *RateLimiter) Limit() gin.HandlerFunc {
 		ip := c.ClientIP()
 		limiter := rl.getVisitor(ip)
 		if !limiter.Allow() {
-			c.Header("Retry-After", "6")
+			retryAfter := time.Second
+			if rl.rate > 0 {
+				retryAfter = time.Duration(float64(time.Second) / float64(rl.rate))
+				if retryAfter < time.Second {
+					retryAfter = time.Second
+				}
+			}
+			c.Header("Retry-After", strconv.Itoa(int(math.Ceil(retryAfter.Seconds()))))
 			c.JSON(http.StatusTooManyRequests, gin.H{
 				"error": "too many requests, please try again later",
 			})
@@ -91,5 +101,7 @@ func (rl *RateLimiter) cleanupLoop() {
 
 // Stop shuts down the background cleanup goroutine.
 func (rl *RateLimiter) Stop() {
-	close(rl.done)
+	rl.stopOnce.Do(func() {
+		close(rl.done)
+	})
 }

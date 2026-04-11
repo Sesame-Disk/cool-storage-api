@@ -12,6 +12,7 @@ server:
   read_header_timeout: 10s # Timeout for reading request headers only (Slowloris protection)
   write_timeout: 0s        # No write timeout — large downloads/zips can take minutes
   max_upload_mb: 10240     # 10240 MB (~10 GiB) max upload size
+  trusted_proxies: []      # Secure default: trust no forwarded client IP headers; set exact reverse-proxy IP/CIDRs in prod
 
 database:
   hosts:

@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -495,12 +496,58 @@ func (h *ShareLinkViewHandler) resolveShareLink(token string, countView bool) (*
 	}, nil
 }
 
-// unavailableJSON returns the appropriate error payload based on why the link is unavailable.
-func (sl *shareLinkData) unavailableJSON() gin.H {
-	if sl.isDisabled {
-		return gin.H{"error": "share link has been disabled"}
+// respondShareLinkUnavailable emits a uniform 404 for every "not available"
+// reason: nonexistent token, expired, disabled. The previous code returned
+// 404 on miss and 410 with distinct bodies on expired/disabled, which acted
+// as an enumeration oracle — an unauthenticated attacker could probe random
+// tokens and distinguish "never existed" from "real but stale". Collapsing
+// all of those into the same response closes the oracle (H-5). Viewer HTML
+// pages still show a generic "link unavailable" state; the precise reason is
+// intentionally not disclosed to unauthenticated clients.
+func respondShareLinkUnavailable(c *gin.Context) {
+	c.JSON(http.StatusNotFound, gin.H{"error": "share link unavailable"})
+}
+
+// respondUploadLinkUnavailable emits the same opaque 404 for public upload-link
+// endpoints. These routes are also keyed only by an opaque token, so leaking
+// whether the token exists, expired, or was disabled creates the same class of
+// enumeration signal as public share links.
+func respondUploadLinkUnavailable(c *gin.Context) {
+	c.JSON(http.StatusNotFound, gin.H{"error": "upload link unavailable"})
+}
+
+type uploadLinkData struct {
+	orgID        string
+	libraryID    string
+	filePath     string
+	createdBy    string
+	passwordHash string
+	expiresAt    *time.Time
+	active       bool
+	singleUse    bool
+	createdAt    time.Time
+}
+
+func (h *ShareLinkViewHandler) resolveUploadLink(token string) (*uploadLinkData, error) {
+	data := &uploadLinkData{}
+	err := h.db.Session().Query(`
+		SELECT org_id, library_id, file_path, created_by, password_hash, expires_at, active, single_use, created_at
+		FROM share_links WHERE link_token = ?
+	`, token).Scan(
+		&data.orgID, &data.libraryID, &data.filePath, &data.createdBy,
+		&data.passwordHash, &data.expiresAt, &data.active, &data.singleUse, &data.createdAt,
+	)
+	if err != nil {
+		return nil, err
 	}
-	return gin.H{"error": "share link has expired"}
+	return data, nil
+}
+
+func (ul *uploadLinkData) isUnavailable() bool {
+	if !ul.active {
+		return true
+	}
+	return ul.expiresAt != nil && time.Now().After(*ul.expiresAt)
 }
 
 // parseShareLinkPermission parses permission which can be either:
@@ -545,11 +592,11 @@ func (h *ShareLinkViewHandler) ServeShareLinkPage(c *gin.Context) {
 	token := c.Param("token")
 	sl, err := h.resolveShareLink(token, false)
 	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "share link not found"})
+		respondShareLinkUnavailable(c)
 		return
 	}
 	if sl.isExpired || sl.isDisabled {
-		c.JSON(http.StatusGone, sl.unavailableJSON())
+		respondShareLinkUnavailable(c)
 		return
 	}
 
@@ -599,12 +646,12 @@ func (h *ShareLinkViewHandler) GetShareLinkBootstrap(c *gin.Context) {
 
 	sl, err := h.resolveShareLink(token, false)
 	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "share link not found"})
+		respondShareLinkUnavailable(c)
 		return
 	}
 
 	if sl.isExpired || sl.isDisabled {
-		c.JSON(http.StatusGone, sl.unavailableJSON())
+		respondShareLinkUnavailable(c)
 		return
 	}
 
@@ -675,12 +722,12 @@ func (h *ShareLinkViewHandler) GetShareLinkFileBootstrap(c *gin.Context) {
 
 	sl, err := h.resolveShareLink(token, false)
 	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "share link not found"})
+		respondShareLinkUnavailable(c)
 		return
 	}
 
 	if sl.isExpired || sl.isDisabled {
-		c.JSON(http.StatusGone, sl.unavailableJSON())
+		respondShareLinkUnavailable(c)
 		return
 	}
 
@@ -1073,12 +1120,12 @@ func (h *ShareLinkViewHandler) ListShareLinkDirents(c *gin.Context) {
 
 	sl, err := h.resolveShareLink(token, false)
 	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "share link not found"})
+		respondShareLinkUnavailable(c)
 		return
 	}
 
 	if sl.isExpired || sl.isDisabled {
-		c.JSON(http.StatusGone, sl.unavailableJSON())
+		respondShareLinkUnavailable(c)
 		return
 	}
 
@@ -1194,12 +1241,12 @@ func (h *ShareLinkViewHandler) GetShareLinkRepoTags(c *gin.Context) {
 
 	sl, err := h.resolveShareLink(token, false)
 	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "share link not found"})
+		respondShareLinkUnavailable(c)
 		return
 	}
 
 	if sl.isExpired || sl.isDisabled {
-		c.JSON(http.StatusGone, sl.unavailableJSON())
+		respondShareLinkUnavailable(c)
 		return
 	}
 
@@ -1227,11 +1274,11 @@ func (h *ShareLinkViewHandler) ServeShareLinkFilePage(c *gin.Context) {
 
 	sl, err := h.resolveShareLink(token, false)
 	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "share link not found"})
+		respondShareLinkUnavailable(c)
 		return
 	}
 	if sl.isExpired || sl.isDisabled {
-		c.JSON(http.StatusGone, sl.unavailableJSON())
+		respondShareLinkUnavailable(c)
 		return
 	}
 
@@ -1280,12 +1327,12 @@ func (h *ShareLinkViewHandler) GetShareLinkZipTask(c *gin.Context) {
 
 	sl, err := h.resolveShareLink(token, false)
 	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "share link not found"})
+		respondShareLinkUnavailable(c)
 		return
 	}
 
 	if sl.isExpired || sl.isDisabled {
-		c.JSON(http.StatusGone, sl.unavailableJSON())
+		respondShareLinkUnavailable(c)
 		return
 	}
 
@@ -1336,43 +1383,32 @@ func (h *ShareLinkViewHandler) ServeUploadLinkPage(c *gin.Context) {
 func (h *ShareLinkViewHandler) GetUploadLinkBootstrap(c *gin.Context) {
 	token := c.Param("token")
 
-	var orgID, libraryID, filePath, createdBy, passwordHash string
-	var expiresAt *time.Time
-	var active bool
-
-	err := h.db.Session().Query(`
-		SELECT org_id, library_id, file_path, created_by, password_hash, expires_at, active
-		FROM share_links WHERE link_token = ?
-	`, token).Scan(&orgID, &libraryID, &filePath, &createdBy, &passwordHash, &expiresAt, &active)
+	ul, err := h.resolveUploadLink(token)
 	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "upload link not found"})
+		respondUploadLinkUnavailable(c)
 		return
 	}
 
-	if !active {
-		c.JSON(http.StatusGone, gin.H{"error": "upload link has been disabled"})
-		return
-	}
-	if expiresAt != nil && time.Now().After(*expiresAt) {
-		c.JSON(http.StatusGone, gin.H{"error": "upload link has expired"})
+	if ul.isUnavailable() {
+		respondUploadLinkUnavailable(c)
 		return
 	}
 
-	needPassword := passwordHash != "" && !h.verifyUploadLinkPasswordCookie(c, token, passwordHash)
+	needPassword := ul.passwordHash != "" && !h.verifyUploadLinkPasswordCookie(c, token, ul.passwordHash)
 
 	var repoName string
-	h.db.Session().Query(`SELECT name FROM libraries_by_id WHERE library_id = ?`, libraryID).Scan(&repoName)
+	h.db.Session().Query(`SELECT name FROM libraries_by_id WHERE library_id = ?`, ul.libraryID).Scan(&repoName)
 	if repoName == "" {
 		repoName = "Shared folder"
 	}
 
-	dirName := filepath.Base(filePath)
-	if filePath == "/" || filePath == "" {
+	dirName := filepath.Base(ul.filePath)
+	if ul.filePath == "/" || ul.filePath == "" {
 		dirName = repoName
 	}
 
 	var creatorName, creatorEmail string
-	h.db.Session().Query(`SELECT name, email FROM users WHERE org_id = ? AND user_id = ?`, orgID, createdBy).Scan(&creatorName, &creatorEmail)
+	h.db.Session().Query(`SELECT name, email FROM users WHERE org_id = ? AND user_id = ?`, ul.orgID, ul.createdBy).Scan(&creatorName, &creatorEmail)
 	if creatorName == "" {
 		creatorName = creatorEmail
 	}
@@ -1380,7 +1416,7 @@ func (h *ShareLinkViewHandler) GetUploadLinkBootstrap(c *gin.Context) {
 		creatorName = "Unknown"
 	}
 
-	c.JSON(http.StatusOK, h.buildUploadLinkPageBootstrap(token, libraryID, filePath, dirName, creatorName, needPassword))
+	c.JSON(http.StatusOK, h.buildUploadLinkPageBootstrap(token, ul.libraryID, ul.filePath, dirName, creatorName, needPassword))
 }
 
 // GetUploadLinkUploadURL handles GET /api/v2.1/upload-links/:token/upload/
@@ -1388,36 +1424,24 @@ func (h *ShareLinkViewHandler) GetUploadLinkBootstrap(c *gin.Context) {
 func (h *ShareLinkViewHandler) GetUploadLinkUploadURL(c *gin.Context) {
 	token := c.Param("token")
 
-	// Resolve upload link
-	var orgID, libraryID, filePath, createdBy, passwordHash string
-	var expiresAt *time.Time
-	var active bool
-	err := h.db.Session().Query(`
-		SELECT org_id, library_id, file_path, created_by, password_hash, expires_at, active
-		FROM share_links WHERE link_token = ?
-	`, token).Scan(&orgID, &libraryID, &filePath, &createdBy, &passwordHash, &expiresAt, &active)
+	ul, err := h.resolveUploadLink(token)
 	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "upload link not found"})
+		respondUploadLinkUnavailable(c)
 		return
 	}
 
-	// Check disabled (admin) and expiration separately
-	if !active {
-		c.JSON(http.StatusGone, gin.H{"error": "upload link has been disabled"})
+	if ul.isUnavailable() {
+		respondUploadLinkUnavailable(c)
 		return
 	}
-	if expiresAt != nil && time.Now().After(*expiresAt) {
-		c.JSON(http.StatusGone, gin.H{"error": "upload link has expired"})
-		return
-	}
-	if passwordHash != "" && !h.verifyUploadLinkPasswordCookie(c, token, passwordHash) {
+	if ul.passwordHash != "" && !h.verifyUploadLinkPasswordCookie(c, token, ul.passwordHash) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "Password required"})
 		return
 	}
 
 	// Generate an upload URL using the seafhttp upload mechanism
 	// Create a token that the file-upload handler will accept
-	uploadToken, err := h.tokenCreator.CreateLinkUploadToken(orgID, libraryID, filePath, createdBy)
+	uploadToken, err := h.tokenCreator.CreateLinkUploadToken(ul.orgID, ul.libraryID, ul.filePath, ul.createdBy)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate upload URL"})
 		return
@@ -1434,37 +1458,25 @@ func (h *ShareLinkViewHandler) GetUploadLinkUploadURL(c *gin.Context) {
 func (h *ShareLinkViewHandler) PostUploadLinkDone(c *gin.Context) {
 	token := c.Param("token")
 
-	// Validate the upload link before incrementing counters.
-	var orgID, libraryID, createdBy, passwordHash string
-	var expiresAt *time.Time
-	var active, singleUse bool
-	var createdAt time.Time
-	err := h.db.Session().Query(`
-		SELECT org_id, library_id, created_by, password_hash, expires_at, active, single_use, created_at
-		FROM share_links WHERE link_token = ?
-	`, token).Scan(&orgID, &libraryID, &createdBy, &passwordHash, &expiresAt, &active, &singleUse, &createdAt)
+	ul, err := h.resolveUploadLink(token)
 	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "upload link not found"})
+		respondUploadLinkUnavailable(c)
 		return
 	}
 
-	if !active {
-		c.JSON(http.StatusGone, gin.H{"error": "upload link has been disabled"})
+	if ul.isUnavailable() {
+		respondUploadLinkUnavailable(c)
 		return
 	}
-	if expiresAt != nil && time.Now().After(*expiresAt) {
-		c.JSON(http.StatusGone, gin.H{"error": "upload link has expired"})
-		return
-	}
-	if passwordHash != "" && !h.verifyUploadLinkPasswordCookie(c, token, passwordHash) {
+	if ul.passwordHash != "" && !h.verifyUploadLinkPasswordCookie(c, token, ul.passwordHash) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "Password required"})
 		return
 	}
 
 	// Increment upload_count or, for single-use links, delete from all tables (fire-and-forget)
 	go func() {
-		if singleUse {
-			deleteConsumedShareLink(h.db, token, orgID, libraryID, createdBy, createdAt)
+		if ul.singleUse {
+			deleteConsumedShareLink(h.db, token, ul.orgID, ul.libraryID, ul.createdBy, ul.createdAt)
 		} else {
 			now := time.Now()
 			if err := incrementShareLinkCounterDualWrite(h.db, token, "upload_count", now); err != nil {
@@ -1484,12 +1496,12 @@ func (h *ShareLinkViewHandler) GetShareLinkUploadURL(c *gin.Context) {
 
 	sl, err := h.resolveShareLink(token, false)
 	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "share link not found"})
+		respondShareLinkUnavailable(c)
 		return
 	}
 
 	if sl.isExpired || sl.isDisabled {
-		c.JSON(http.StatusGone, sl.unavailableJSON())
+		respondShareLinkUnavailable(c)
 		return
 	}
 
@@ -1533,12 +1545,12 @@ func (h *ShareLinkViewHandler) PostShareLinkUploadDone(c *gin.Context) {
 	// Validate the share link exists and has upload permissions
 	sl, err := h.resolveShareLink(token, false)
 	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "share link not found"})
+		respondShareLinkUnavailable(c)
 		return
 	}
 
 	if sl.isExpired || sl.isDisabled {
-		c.JSON(http.StatusGone, sl.unavailableJSON())
+		respondShareLinkUnavailable(c)
 		return
 	}
 
@@ -1576,7 +1588,7 @@ func (h *ShareLinkViewHandler) verifyShareLinkPasswordCookie(c *gin.Context, tok
 	if err != nil {
 		return false
 	}
-	return cookieValue == expected
+	return subtle.ConstantTimeCompare([]byte(cookieValue), []byte(expected)) == 1
 }
 
 func buildPublicLinkPasswordCookie(linkType, token, passwordHash, hmacKey string) (string, string) {
@@ -1606,15 +1618,31 @@ func (h *ShareLinkViewHandler) CheckPublicLinkPassword(c *gin.Context) {
 	}
 
 	var linkType, passwordHash string
+	var expiresAt *time.Time
+	var active bool
+	var downloadCount int
+	var maxDownloads *int
 	err := h.db.Session().Query(
-		`SELECT link_type, password_hash FROM share_links WHERE link_token = ?`, token,
-	).Scan(&linkType, &passwordHash)
+		`SELECT link_type, password_hash, expires_at, active, download_count, max_downloads FROM share_links WHERE link_token = ?`, token,
+	).Scan(&linkType, &passwordHash, &expiresAt, &active, &downloadCount, &maxDownloads)
 	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "public link not found"})
+		c.JSON(http.StatusNotFound, gin.H{"error": "public link unavailable"})
+		return
+	}
+	if !active {
+		c.JSON(http.StatusNotFound, gin.H{"error": "public link unavailable"})
+		return
+	}
+	if expiresAt != nil && time.Now().After(*expiresAt) {
+		c.JSON(http.StatusNotFound, gin.H{"error": "public link unavailable"})
+		return
+	}
+	if linkType == "share" && maxDownloads != nil && downloadCount >= *maxDownloads {
+		c.JSON(http.StatusNotFound, gin.H{"error": "public link unavailable"})
 		return
 	}
 	if passwordHash == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "link does not require password"})
+		c.JSON(http.StatusNotFound, gin.H{"error": "public link unavailable"})
 		return
 	}
 
@@ -1639,5 +1667,5 @@ func (h *ShareLinkViewHandler) verifyUploadLinkPasswordCookie(c *gin.Context, to
 	if err != nil {
 		return false
 	}
-	return cookieValue == expected
+	return subtle.ConstantTimeCompare([]byte(cookieValue), []byte(expected)) == 1
 }

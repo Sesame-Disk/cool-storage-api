@@ -530,11 +530,11 @@ func TestOIDCClient_MapOIDCRole(t *testing.T) {
 		oidcRole     string
 		expectedRole string
 	}{
-		{"superadmin", "superadmin"},
-		{"super_admin", "superadmin"},
-		{"platform_admin", "superadmin"},
-		{"Superadmin", "superadmin"},
-		{"SUPER_ADMIN", "superadmin"},
+		{"superadmin", "user"},
+		{"super_admin", "user"},
+		{"platform_admin", "user"},
+		{"Superadmin", "user"},
+		{"SUPER_ADMIN", "user"},
 		{"admin", "admin"},
 		{"administrator", "admin"},
 		{"Admin", "admin"},
@@ -552,6 +552,29 @@ func TestOIDCClient_MapOIDCRole(t *testing.T) {
 			got := client.mapOIDCRole(tt.oidcRole)
 			if got != tt.expectedRole {
 				t.Errorf("mapOIDCRole(%q) = %q, want %q", tt.oidcRole, got, tt.expectedRole)
+			}
+		})
+	}
+}
+
+func TestIsPrivilegedOIDCRoleClaim(t *testing.T) {
+	tests := []struct {
+		role string
+		want bool
+	}{
+		{role: "superadmin", want: true},
+		{role: "super_admin", want: true},
+		{role: "platform_admin", want: true},
+		{role: " SuperAdmin ", want: true},
+		{role: "owner", want: false},
+		{role: "admin", want: false},
+		{role: "unknown-role", want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.role, func(t *testing.T) {
+			if got := isPrivilegedOIDCRoleClaim(tt.role); got != tt.want {
+				t.Fatalf("isPrivilegedOIDCRoleClaim(%q) = %v, want %v", tt.role, got, tt.want)
 			}
 		})
 	}

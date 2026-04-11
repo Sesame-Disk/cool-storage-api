@@ -2,7 +2,6 @@
 
 This guide covers deploying SesameFS on a single VPS using Docker Compose, Nginx, and Let's Encrypt SSL.
 The same `docker-compose.prod.yml` supports both single-region and multi-region deployments — the only difference is the `.env` file. See [Multi-Region Deployment](#multi-region-deployment) below.
-
 ---
 
 ## Architecture
@@ -44,6 +43,33 @@ SesameFS resolves configuration in this order:
 That is why `config.prod.yaml` can look thinner than `config.docker.yaml` or a local test config:
 production only needs to pin the non-secret structural values that differ from the code defaults,
 while local/test often pins more knobs explicitly for reproducibility.
+
+`server.trusted_proxies` follows the same rule. The secure code default is empty, which disables trust in `X-Forwarded-For` and `X-Real-IP` entirely. When SesameFS is deployed behind nginx, Traefik, HAProxy, or a cloud load balancer, set `server.trusted_proxies` in YAML or `SERVER_TRUSTED_PROXIES` in `.env` to the exact proxy IPs or CIDRs that are allowed to define the client IP.
+
+For the standard production topology used here:
+
+`client -> central nginx -> internal SesameFS nginx -> Go backend`
+
+the central nginx is the authority that resolves the real client IP. The internal SesameFS nginx, which in this deployment is typically the nginx inside the `frontend` container, preserves that canonicalized `X-Real-IP` and `X-Forwarded-For` chain when proxying to Go, instead of overwriting them with its own private proxy IP.
+
+That means the Go backend only needs to trust the proxy hop directly in front of it: the internal SesameFS nginx.
+
+This model assumes that the internal nginx is not exposed directly to the internet and only accepts traffic from the central nginx or from a private, trusted internal network. If that assumption does not hold, do not preserve incoming `X-Real-IP` / `X-Forwarded-For` headers as-is; configure explicit nginx real-IP trust rules instead.
+
+Example:
+
+```env
+SERVER_TRUSTED_PROXIES=172.20.0.0/16
+```
+
+Why this is the supported deploy model:
+
+- if the variable is left empty, Gin uses the direct peer IP and every request appears to come from the internal nginx
+- if the variable trusts the internal nginx network, Gin accepts the already-canonicalized client IP preserved by that nginx
+- the central nginx does not need to be listed in `SERVER_TRUSTED_PROXIES` as long as the internal nginx is the only hop that talks directly to Go and it preserves the forwarded headers instead of rewriting them
+- this remains safe only while that internal nginx hop stays private and unreachable from arbitrary external callers
+
+If you use a different proxy chain and do not preserve the canonicalized client IP at the last nginx hop, adjust `SERVER_TRUSTED_PROXIES` for that topology instead.
 
 GC is a good example:
 
@@ -212,6 +238,16 @@ ACCOUNTS_PASSWORD_CHANGE_URL=https://accounts.yourdomain.com/accounts/password/c
 ACCOUNTS_DELETE_ACCOUNT_URL=https://accounts.yourdomain.com/accounts/delete/
 ACCOUNTS_DISABLE_ORG_USER_WRITES=true
 
+# Reverse proxy IPs/CIDRs allowed to define the client IP via X-Forwarded-For.
+# Supported prod topology here is:
+#   client -> central nginx -> internal SesameFS nginx -> Go
+# The internal nginx preserves the client IP already resolved by the central
+# nginx, so Go only needs to trust the internal nginx hop.
+# Example:
+# SERVER_TRUSTED_PROXIES=172.20.0.0/16
+# If you use the bundled nginx on Docker's external sfs-net network, inspect the
+# actual subnet first and use that exact CIDR instead of guessing.
+
 # Temporary GC guard for multi-replica prod: keep this true on exactly one backend replica.
 GC_ENABLED=true
 
@@ -230,6 +266,10 @@ ONLYOFFICE_JWT_SECRET=<from step 0.3 — second openssl output>
 > `ACCOUNTS_DISABLE_ORG_USER_WRITES` should normally stay `true`. That keeps tenant org-admin user lifecycle writes disabled so Accounts remains the operational authority. Platform superadmins still bypass that tenant lock as an operational fallback, but Accounts should prefer the `/admin/...` surface.
 
 > `GC_ENABLED` is a temporary production guard. Until GC has leader election, only one backend replica should run GC. In a single-node deployment, leave it as `true`.
+
+> `SERVER_TRUSTED_PROXIES` should never be set to `0.0.0.0/0`, `::/0`, or another blanket range. In the supported two-nginx topology above, trust only the internal SesameFS nginx network that talks directly to Go. If you leave it unset, SesameFS ignores forwarded-IP headers and uses the direct socket peer instead.
+
+> The simplified two-nginx model above depends on the internal nginx being reachable only from trusted internal paths. If you ever expose that hop more broadly, switch to explicit nginx real-IP trust configuration before relying on preserved forwarded headers.
 
 ---
 

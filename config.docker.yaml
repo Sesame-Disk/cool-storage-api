@@ -7,6 +7,7 @@ server:
   read_header_timeout: 10s # Timeout for reading request headers only (Slowloris protection)
   write_timeout: 0s        # No write timeout — large downloads/zips can take minutes
   max_upload_mb: 20480     # 20480 MB (~20 GiB) max upload size
+  trusted_proxies: []      # Leave empty to ignore forwarded IP headers; set Docker/nginx proxy CIDRs only if you need real client IPs
 
 database:
   hosts:

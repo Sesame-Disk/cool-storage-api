@@ -154,6 +154,7 @@ func TestLibraryProjectionRegression_ReconcilePendingStorageCountersAfterSoftDel
 		libNow := traffic.ReadStorageSnapshot(database, libScope)
 		return platformNow == baselinePlatform && orgNow == baselineOrg && userNow == baselineUser && libNow == uploadedLibSnapshot
 	})
+	expectedAfterReconcile := expectedAggregateStorageSnapshotsForScopes(t, database, platformScope, orgScope, userScope)
 
 	const driftBytes int64 = 777
 	const driftFiles int64 = 3
@@ -172,14 +173,14 @@ func TestLibraryProjectionRegression_ReconcilePendingStorageCountersAfterSoftDel
 		t.Fatalf("reconciled scopes = %d, want at least 3 target scopes", reconciled)
 	}
 
-	if got := traffic.ReadStorageSnapshot(database, platformScope); got != baselinePlatform {
-		t.Fatalf("platform snapshot after reconciliation = %+v, want %+v", got, baselinePlatform)
+	if got := traffic.ReadStorageSnapshot(database, platformScope); got != expectedAfterReconcile[platformScope] {
+		t.Fatalf("platform snapshot after reconciliation = %+v, want %+v", got, expectedAfterReconcile[platformScope])
 	}
-	if got := traffic.ReadStorageSnapshot(database, orgScope); got != baselineOrg {
-		t.Fatalf("org snapshot after reconciliation = %+v, want %+v", got, baselineOrg)
+	if got := traffic.ReadStorageSnapshot(database, orgScope); got != expectedAfterReconcile[orgScope] {
+		t.Fatalf("org snapshot after reconciliation = %+v, want %+v", got, expectedAfterReconcile[orgScope])
 	}
-	if got := traffic.ReadStorageSnapshot(database, userScope); got != baselineUser {
-		t.Fatalf("user snapshot after reconciliation = %+v, want %+v", got, baselineUser)
+	if got := traffic.ReadStorageSnapshot(database, userScope); got != expectedAfterReconcile[userScope] {
+		t.Fatalf("user snapshot after reconciliation = %+v, want %+v", got, expectedAfterReconcile[userScope])
 	}
 	if storageReconciliationRequestExistsForTest(t, session, platformScope) ||
 		storageReconciliationRequestExistsForTest(t, session, orgScope) ||
@@ -674,6 +675,61 @@ func insertSyntheticCommitForTest(t *testing.T, session interface {
 }
 
 var storageCounterTotalDayForTest = time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC)
+
+func expectedAggregateStorageSnapshotsForScopes(t *testing.T, database *dbpkg.DB, scopes ...string) map[string]traffic.StorageSnapshot {
+	t.Helper()
+
+	expected := make(map[string]traffic.StorageSnapshot, len(scopes))
+	requested := make(map[string]struct{}, len(scopes))
+	for _, scope := range scopes {
+		requested[scope] = struct{}{}
+	}
+
+	iter := database.Session().Query(`
+		SELECT org_id, library_id, owner_id, deleted_at FROM libraries
+	`).Iter()
+
+	var orgID, libraryID, ownerID string
+	var deletedAt *time.Time
+	for iter.Scan(&orgID, &libraryID, &ownerID, &deletedAt) {
+		if deletedAt != nil && !deletedAt.IsZero() {
+			continue
+		}
+
+		libSnapshot := traffic.ReadStorageSnapshot(database, traffic.LibraryStorageScope(orgID, libraryID))
+		if libSnapshot.BytesUsed == 0 && libSnapshot.FileCount == 0 {
+			continue
+		}
+
+		if _, ok := requested[traffic.PlatformStorageScope()]; ok {
+			snap := expected[traffic.PlatformStorageScope()]
+			snap.BytesUsed += libSnapshot.BytesUsed
+			snap.FileCount += libSnapshot.FileCount
+			expected[traffic.PlatformStorageScope()] = snap
+		}
+
+		orgScope := traffic.OrganizationStorageScope(orgID)
+		if _, ok := requested[orgScope]; ok {
+			snap := expected[orgScope]
+			snap.BytesUsed += libSnapshot.BytesUsed
+			snap.FileCount += libSnapshot.FileCount
+			expected[orgScope] = snap
+		}
+
+		userScope := traffic.UserStorageScope(orgID, ownerID)
+		if _, ok := requested[userScope]; ok {
+			snap := expected[userScope]
+			snap.BytesUsed += libSnapshot.BytesUsed
+			snap.FileCount += libSnapshot.FileCount
+			expected[userScope] = snap
+		}
+	}
+	if err := iter.Close(); err != nil {
+		t.Fatalf("failed to scan libraries for expected storage reconciliation snapshots: %v", err)
+	}
+
+	return expected
+}
 
 func addStorageCounterDriftForTest(t *testing.T, session interface {
 	Query(stmt string, values ...interface{}) *gocql.Query

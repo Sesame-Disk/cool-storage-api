@@ -291,6 +291,59 @@ func TestBuildCORSConfig(t *testing.T) {
 	})
 }
 
+func TestConfigureTrustedProxies(t *testing.T) {
+	t.Run("disabled by default uses direct peer IP", func(t *testing.T) {
+		cfg := config.DefaultConfig()
+		router := gin.New()
+		if err := configureTrustedProxies(router, cfg); err != nil {
+			t.Fatalf("configureTrustedProxies() error = %v", err)
+		}
+
+		router.GET("/ip", func(c *gin.Context) {
+			c.String(http.StatusOK, c.ClientIP())
+		})
+
+		req := httptest.NewRequest(http.MethodGet, "/ip", nil)
+		req.RemoteAddr = "10.1.2.3:12345"
+		req.Header.Set("X-Forwarded-For", "198.51.100.9")
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want %d", w.Code, http.StatusOK)
+		}
+		if body := strings.TrimSpace(w.Body.String()); body != "10.1.2.3" {
+			t.Fatalf("ClientIP() = %q, want %q", body, "10.1.2.3")
+		}
+	})
+
+	t.Run("trusted proxy honors forwarded client IP", func(t *testing.T) {
+		cfg := config.DefaultConfig()
+		cfg.Server.TrustedProxies = []string{"10.0.0.0/8"}
+		router := gin.New()
+		if err := configureTrustedProxies(router, cfg); err != nil {
+			t.Fatalf("configureTrustedProxies() error = %v", err)
+		}
+
+		router.GET("/ip", func(c *gin.Context) {
+			c.String(http.StatusOK, c.ClientIP())
+		})
+
+		req := httptest.NewRequest(http.MethodGet, "/ip", nil)
+		req.RemoteAddr = "10.1.2.3:12345"
+		req.Header.Set("X-Forwarded-For", "198.51.100.9")
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want %d", w.Code, http.StatusOK)
+		}
+		if body := strings.TrimSpace(w.Body.String()); body != "198.51.100.9" {
+			t.Fatalf("ClientIP() = %q, want %q", body, "198.51.100.9")
+		}
+	})
+}
+
 // TestHandleAccountInfo tests the account info endpoint
 func TestHandleAccountInfo(t *testing.T) {
 	t.Skip("Requires database connection - run as integration test")

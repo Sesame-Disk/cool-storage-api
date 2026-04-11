@@ -19,6 +19,7 @@
 #   AUTH_DEV_MODE, OIDC_*, ONLYOFFICE_*,
 #   CASSANDRA_*, S3_BUCKET, S3_REGION, S3_ENDPOINT,
 #   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, BILLING_URL,
+#   SERVER_TRUSTED_PROXIES,
 #   GC_ENABLED, GC_USER_GRACE_DAYS, GC_ORG_GRACE_DAYS,
 #   GC_TRASH_RETENTION_DAYS, GC_AUDIT_RETENTION_DAYS,
 #   ACCOUNTS_PASSWORD_CHANGE_URL, ACCOUNTS_DELETE_ACCOUNT_URL,
@@ -31,6 +32,7 @@ server:
   read_header_timeout: 10s      # Slowloris protection
   write_timeout: 0s             # No timeout — large downloads can take minutes
   max_upload_mb: 20480          # 20480 MB (~20 GiB) max upload
+  trusted_proxies: []           # Configure exact nginx/load-balancer IP/CIDRs; empty disables X-Forwarded-For trust
 
 # =============================================================================
 # Database — host/credentials come from env vars

@@ -65,12 +65,6 @@ function mapErrorTitle(status, message) {
     if (status === 404) {
         return 'Not Found';
     }
-    if (status === 410 && /disabled/i.test(message || '')) {
-        return 'Link Disabled';
-    }
-    if (status === 410) {
-        return 'Link Expired';
-    }
     if (status === 403) {
         return 'Forbidden';
     }

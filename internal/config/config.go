@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"os"
 	"strconv"
 	"strings"
@@ -401,6 +402,7 @@ type ServerConfig struct {
 	ReadHeaderTimeout  time.Duration `yaml:"read_header_timeout"`
 	WriteTimeout       time.Duration `yaml:"write_timeout"`
 	MaxUploadMB        int64         `yaml:"max_upload_mb"`
+	TrustedProxies     []string      `yaml:"trusted_proxies"`
 	MobileFrontendPath string        `yaml:"mobile_frontend_path"` // Path to mobile frontend dist (default: ./mobile-frontend/dist)
 }
 
@@ -615,6 +617,7 @@ func DefaultConfig() *Config {
 			ReadHeaderTimeout:  10 * time.Second,         // Timeout for reading request headers only (Slowloris protection)
 			WriteTimeout:       0,                        // No write timeout — large downloads/zips can take minutes
 			MaxUploadMB:        20480,                    // 20 GB
+			TrustedProxies:     nil,                      // Secure default: do not trust forwarded client IP headers unless explicitly configured
 			MobileFrontendPath: "./mobile-frontend/dist", // Mobile frontend build directory
 		},
 		Database: DatabaseConfig{
@@ -743,6 +746,9 @@ func (c *Config) applyEnvOverrides() {
 	}
 	if v := os.Getenv("SERVER_PORT"); v != "" {
 		c.Server.Port = v
+	}
+	if v := os.Getenv("SERVER_TRUSTED_PROXIES"); v != "" {
+		c.Server.TrustedProxies = strings.Split(v, ",")
 	}
 
 	// Database
@@ -1009,10 +1015,44 @@ func (c *Config) Validate() error {
 		return err
 	}
 	c.FileView.PreviewExtensions = normalizedPreviewExtensions
+	normalizedTrustedProxies, err := normalizeTrustedProxies(c.Server.TrustedProxies)
+	if err != nil {
+		return err
+	}
+	c.Server.TrustedProxies = normalizedTrustedProxies
 	if c.Auth.OIDC.Enabled && !hasConfiguredStrings(c.Auth.OIDC.RedirectURIs) {
 		return fmt.Errorf("auth.oidc.redirect_uris must contain at least one redirect URI when OIDC is enabled")
 	}
 	return nil
+}
+
+func normalizeTrustedProxies(values []string) ([]string, error) {
+	if len(values) == 0 {
+		return nil, nil
+	}
+
+	normalized := make([]string, 0, len(values))
+	seen := make(map[string]struct{}, len(values))
+	for _, raw := range values {
+		value := strings.TrimSpace(raw)
+		if value == "" {
+			continue
+		}
+		if ip := net.ParseIP(value); ip == nil {
+			if _, _, err := net.ParseCIDR(value); err != nil {
+				return nil, fmt.Errorf("server.trusted_proxies contains invalid IP or CIDR %q", raw)
+			}
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		normalized = append(normalized, value)
+	}
+	if len(normalized) == 0 {
+		return nil, nil
+	}
+	return normalized, nil
 }
 
 func hasConfiguredStrings(values []string) bool {

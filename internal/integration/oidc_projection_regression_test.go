@@ -388,7 +388,7 @@ func TestOIDCProjectionRegression_EmailAdoptionNormalizesLegacyTenantSuperadmin(
 	})
 }
 
-func TestOIDCProjectionRegression_ExistingOIDCUserReloginReconcilesRoleToProjection(t *testing.T) {
+func TestOIDCProjectionRegression_ExistingOIDCUserReloginIgnoresForbiddenPrivilegedClaimAndPreservesStoredRole(t *testing.T) {
 	orgName := fmt.Sprintf("inttest-oidc-relogin-org-%d", time.Now().UnixNano())
 	ownerEmail := fmt.Sprintf("inttest-oidc-relogin-owner-%d@sesamefs.local", time.Now().UnixNano())
 	orgID := createAdminIdentityTestOrganization(t, orgName, ownerEmail)
@@ -425,22 +425,22 @@ func TestOIDCProjectionRegression_ExistingOIDCUserReloginReconcilesRoleToProject
 	if result.IsNewUser {
 		t.Fatalf("expected existing mapped user relogin")
 	}
-	if result.Role != "owner" {
-		t.Fatalf("result role = %s, want owner", result.Role)
+	if result.Role != "user" {
+		t.Fatalf("result role = %s, want user", result.Role)
 	}
 
-	waitForIntegrationCondition(t, "OIDC relogin to reconcile canonical role and admin user projection", func() bool {
+	waitForIntegrationCondition(t, "OIDC relogin to preserve stored role while ignoring forbidden privileged claim", func() bool {
 		mappedUserID, mappedOrgID, ok := oidcMappingForSubject(t, provider.server.URL, subject)
 		if !ok || mappedUserID != userID || mappedOrgID != orgID {
 			return false
 		}
-		if canonicalUserRole(t, orgID, userID) != "owner" {
+		if canonicalUserRole(t, orgID, userID) != "user" {
 			return false
 		}
 		userRow, ok := adminUserProjectionByEmail(t, email)
-		if !ok || userRow.OrgID != orgID || userRow.Role != "owner" || userRow.Status != "active" {
+		if !ok || userRow.OrgID != orgID || userRow.Role != "user" || userRow.Status != "active" {
 			return false
 		}
-		return adminUserPresentInSearch(t, email, "owner")
+		return adminUserPresentInSearch(t, email, "user")
 	})
 }
