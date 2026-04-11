@@ -458,7 +458,6 @@ type BackendConfig struct {
 // AuthConfig holds authentication settings
 type AuthConfig struct {
 	DevMode              bool            `yaml:"dev_mode"`
-	AllowAnonymous       bool            `yaml:"allow_anonymous"` // Allow unauthenticated access (uses first dev token) - FOR TESTING ONLY
 	DevTokens            []DevTokenEntry `yaml:"dev_tokens"`
 	OIDC                 OIDCConfig      `yaml:"oidc"`
 	FirstSuperAdminEmail string          `yaml:"first_superadmin_email"` // Email of the first superadmin to seed in the platform org on first startup
@@ -645,15 +644,9 @@ func DefaultConfig() *Config {
 			},
 		},
 		Auth: AuthConfig{
-			DevMode:          true,
+			DevMode:          false,
 			ShareLinkHMACKey: "sesamefs-default-share-hmac-key-change-me",
-			DevTokens: []DevTokenEntry{
-				{
-					Token:  "dev-token-123",
-					UserID: "00000000-0000-0000-0000-000000000001",
-					OrgID:  "00000000-0000-0000-0000-000000000001",
-				},
-			},
+			DevTokens:        []DevTokenEntry{},
 			OIDC: OIDCConfig{
 				Enabled:          false, // Disabled by default, use dev tokens
 				Scopes:           []string{"openid", "profile", "email"},
@@ -809,9 +802,6 @@ func (c *Config) applyEnvOverrides() {
 	// Auth
 	if v := os.Getenv("AUTH_DEV_MODE"); v != "" {
 		c.Auth.DevMode = v == "true" || v == "1"
-	}
-	if v := os.Getenv("AUTH_ALLOW_ANONYMOUS"); v != "" {
-		c.Auth.AllowAnonymous = v == "true" || v == "1"
 	}
 	if v := os.Getenv("FIRST_SUPERADMIN_EMAIL"); v != "" {
 		c.Auth.FirstSuperAdminEmail = v

@@ -32,7 +32,6 @@ automatically.
 | Env var | Required | Must not be |
 |---|---|---|
 | `AUTH_DEV_MODE` | `false` | any truthy value |
-| `AUTH_ALLOW_ANONYMOUS` | `false` | any truthy value |
 | `SHARE_LINK_HMAC_KEY` | ≥32 random bytes | known dev default, empty |
 | `SERVER_URL` | full https URL | empty |
 | `BILLING_URL` | full https URL | empty |
@@ -118,14 +117,13 @@ unaffected — the preflight simply isn't part of the graph they run.
 The preflight neutralizes these classes of problem so they do not appear in
 [Code vulnerabilities](#code-vulnerabilities) below:
 
-- dev-mode anonymous superadmin (`AUTH_DEV_MODE=true` / `AUTH_ALLOW_ANONYMOUS=true`),
+- dev-mode superadmin (`AUTH_DEV_MODE=true`),
 - `ONLYOFFICE_JWT_SECRET` left at its documented default,
 - MinIO defaults (`minioadmin:minioadmin`) reaching prod,
 - missing `SHARE_LINK_HMAC_KEY` / too-short key,
 - missing required external URLs,
 - `OIDC_ENABLED=true` with blank issuer / client / signing key,
-- baked-in `auth.dev_mode: true` or `allow_anonymous: true` in a mounted
-  config file.
+- baked-in `auth.dev_mode: true` in a mounted config file.
 
 ---
 
@@ -859,7 +857,7 @@ The test fails on the current source and passes once the `if c.config.ValidateAu
 
 These are things a reader might expect to see in the list but which are deliberately excluded, with the reason:
 
-1. **Dev-mode anonymous superadmin** — with `AUTH_DEV_MODE=true` and `AUTH_ALLOW_ANONYMOUS=true` (the default of `docker compose up`), every unauthenticated request becomes superadmin. This is a dev-convenience behavior. The [preflight gate](#production-prerequisites--the-preflight-gate) refuses to let a production deployment start with these values.
+1. **Dev-mode superadmin** — with `AUTH_DEV_MODE=true` (the default of `docker compose up`), dev tokens bypass OIDC. This is a dev-convenience behavior. The [preflight gate](#production-prerequisites--the-preflight-gate) refuses to let a production deployment start with this value. The `AUTH_ALLOW_ANONYMOUS` option (implicit token injection for unauthenticated requests) was removed from the codebase.
 2. **MinIO / OnlyOffice `:latest` Docker tags** — production deployment uses AWS S3 (not MinIO) and a pinned OnlyOffice build, per operator confirmation. Local compose uses `:latest` for evaluation convenience; the preflight catches the `change-me-to-a-random-string` OnlyOffice secret and the `minioadmin` S3 creds, which is where the real risk lived.
 3. **Cassandra 5.0 CVE-2025-23015** — requires an authenticated CQL user; in the intended deployment Cassandra is on a private subnet with sesamefs as the sole client, so external reachability is zero. Patch on the next routine dependency update.
 

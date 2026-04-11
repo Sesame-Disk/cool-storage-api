@@ -197,7 +197,6 @@ CASSANDRA_HEAP_NEWSIZE=400M
 # OIDC
 OIDC_ENABLED=true
 AUTH_DEV_MODE=false
-AUTH_ALLOW_ANONYMOUS=false
 OIDC_CLIENT_ID=<from step 0.2>
 OIDC_CLIENT_SECRET=<from step 0.2>
 OIDC_JWT_SIGNING_KEY=<from step 0.3 — first openssl output>
@@ -406,7 +405,6 @@ Settings that **cannot** be set via env vars and must be in this file:
 | Env var | Config field | Notes |
 |---|---|---|
 | `AUTH_DEV_MODE` | `auth.dev_mode` | Set `false` in prod |
-| `AUTH_ALLOW_ANONYMOUS` | `auth.allow_anonymous` | Set `false` in prod |
 | `OIDC_ENABLED` | `auth.oidc.enabled` | Set `true` in prod |
 | `OIDC_ISSUER` | `auth.oidc.issuer` | Default in config.prod.yaml |
 | `OIDC_CLIENT_ID` | `auth.oidc.client_id` | Secret |

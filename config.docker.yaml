@@ -110,8 +110,7 @@ seafhttp:
   token_ttl: 24h  # Upload/download tokens valid for 24 hours (needed for large uploads and Seafile client syncs)
 
 auth:
-  dev_mode: true                      # Set to false in production
-  allow_anonymous: true               # Allow unauthenticated access (FOR TESTING ONLY)
+  dev_mode: false                       # Dev only — never enable in production
   dev_tokens:
     - token: "dev-token-superadmin"
       user_id: "00000000-0000-0000-0000-000000000099"

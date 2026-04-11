@@ -16,7 +16,7 @@
 #     - ./config.prod.yaml:/app/config.yaml:ro
 #
 # Env var overrides (applied after this file is loaded):
-#   AUTH_DEV_MODE, AUTH_ALLOW_ANONYMOUS, OIDC_*, ONLYOFFICE_*,
+#   AUTH_DEV_MODE, OIDC_*, ONLYOFFICE_*,
 #   CASSANDRA_*, S3_BUCKET, S3_REGION, S3_ENDPOINT,
 #   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, BILLING_URL,
 #   GC_ENABLED, GC_USER_GRACE_DAYS, GC_ORG_GRACE_DAYS,
@@ -73,8 +73,7 @@ storage:
 # Authentication
 # =============================================================================
 auth:
-  dev_mode: false               # Overridden by AUTH_DEV_MODE=false in compose
-  allow_anonymous: false        # Overridden by AUTH_ALLOW_ANONYMOUS=false in compose
+  dev_mode: false               # Secure default; never enable in production
   dev_tokens: []                # Empty — no dev tokens in production
 
   # share_link_hmac_key → SHARE_LINK_HMAC_KEY env var (REQUIRED in production)

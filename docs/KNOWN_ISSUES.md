@@ -1197,10 +1197,8 @@ The sys-admin panel is fully accessible at `/sys/` in Docker deployments. Webpac
 **Discovered**: 2026-01-29
 **Detail**: The account info endpoint returns `can_generate_share_link` (not `can_generate_shared_link`). Integration tests initially used the wrong field name. Not a bug in the API — just a test expectation mismatch.
 
-### Anonymous Auth Bypasses Admin API Endpoints
-**Status**: ⚠️ Low risk (dev-only config)
-**Discovered**: 2026-01-29
-**Detail**: When `allow_anonymous: true` is set in config (dev/test only), unauthenticated requests to `/api/v2.1/admin/organizations/` return 200. The `RequireSuperAdmin()` middleware checks `user_id` and `org_id` context values, but anonymous auth sets empty strings which causes the middleware to return 401. However, the order of middleware execution may differ. This is acceptable since `allow_anonymous` should never be enabled in production.
+### Anonymous Auth Bypasses Admin API Endpoints — REMOVED ✅
+**Status**: Removed 2026-04-10 — `AllowAnonymous` config option and its anonymous fallback in `authMiddleware` have been deleted. Dev tokens must be provided explicitly.
 
 ### Change Password Shows for Non-Encrypted Libraries - FIXED ✅
 **Fixed**: 2026-01-28
@@ -1491,14 +1489,10 @@ If a name existed at the grandparent level, it would incorrectly return 409.
 **Fix**: Added `/accounts/` location block to `frontend/nginx.conf`
 **Files**: `frontend/nginx.conf` (lines 77-83)
 
-### Anonymous Access for Testing - IMPLEMENTED ✅
-**Implemented**: 2026-01-27
-**Status**: Working - FOR TESTING ONLY
-**Feature**: Backend allows unauthenticated requests when `AUTH_ALLOW_ANONYMOUS=true`
-**Files**:
-- `internal/api/server.go:516-590` - authMiddleware with anonymous fallback
-- `internal/config/config.go` - AllowAnonymous config option
-- `config.docker.yaml` - Dev tokens for all 4 test users
+### Anonymous Access for Testing — REMOVED ✅
+**Removed**: 2026-04-10
+**Was**: `AUTH_ALLOW_ANONYMOUS=true` allowed unauthenticated requests to be injected as the first dev token user.
+**Why removed**: Redundant — `AUTH_DEV_MODE=true` with an `Authorization: Token <dev-token>` header achieves the same without an implicit bypass. The feature was deleted along with `AllowAnonymous` config field and `applyAnonymousDevAuth()`.
 
 ### Frontend Login Bypass - IMPLEMENTED ✅
 **Implemented**: 2026-01-27

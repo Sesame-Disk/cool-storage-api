@@ -301,16 +301,10 @@ test_org_crud_denied() {
     status=$(api_status "GET" "/api/v2.1/admin/organizations/" "$GUEST_TOKEN")
     run_test "Guest: list orgs returns 403" "403" "$status"
 
-    # Unauthenticated should fail (note: if allow_anonymous=true in config, this will be 200
-    # because anonymous auth bypasses the auth middleware entirely. Test is only meaningful
-    # when allow_anonymous=false.)
+    # Unauthenticated should fail
     status=$(api_status "GET" "/api/v2.1/admin/organizations/" "")
     if [ "$status" = "401" ] || [ "$status" = "403" ]; then
         run_test "Unauthenticated: list orgs returns 401 or 403" "true" "true"
-    elif [ "$status" = "200" ]; then
-        log_info "Unauthenticated: got 200 (allow_anonymous=true in config, skipping)"
-        TOTAL_TESTS=$((TOTAL_TESTS + 1))
-        PASSED_TESTS=$((PASSED_TESTS + 1))
     else
         run_test "Unauthenticated: list orgs returns 401/403" "401" "$status"
     fi

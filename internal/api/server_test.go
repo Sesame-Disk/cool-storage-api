@@ -11,7 +11,6 @@ import (
 
 	"github.com/Sesame-Disk/sesamefs/internal/config"
 	"github.com/Sesame-Disk/sesamefs/internal/health"
-	"github.com/Sesame-Disk/sesamefs/internal/middleware"
 	"github.com/gin-gonic/gin"
 )
 
@@ -508,48 +507,6 @@ func TestResolveUserEmailDoesNotFallbackToFirstDevToken(t *testing.T) {
 	email := s.resolveUserEmail(c)
 	if email != "" {
 		t.Fatalf("resolveUserEmail() = %q, want empty string when no token is present", email)
-	}
-}
-
-func TestAuthMiddlewareAnonymousOrgRouteUsesRequestedOrg(t *testing.T) {
-	cfg := config.DefaultConfig()
-	cfg.Auth.DevMode = true
-	cfg.Auth.AllowAnonymous = true
-	cfg.Auth.DevTokens = []config.DevTokenEntry{
-		{Token: "platform-token", UserID: "platform-admin", OrgID: middleware.PlatformOrgID, Role: "superadmin"},
-		{Token: "tenant-token", UserID: "tenant-admin", OrgID: "org-tenant", Role: "admin"},
-	}
-
-	s := &Server{
-		config: cfg,
-		router: gin.New(),
-	}
-
-	s.router.GET("/api/v2.1/org/:org_id/admin/groups/", s.authMiddleware(), func(c *gin.Context) {
-		c.JSON(http.StatusOK, gin.H{
-			"user_id": c.GetString("user_id"),
-			"org_id":  c.GetString("org_id"),
-			"role":    c.GetString("role"),
-		})
-	})
-
-	req, _ := http.NewRequest("GET", "/api/v2.1/org/org-tenant/admin/groups/", nil)
-	w := httptest.NewRecorder()
-	s.router.ServeHTTP(w, req)
-
-	if w.Code != http.StatusOK {
-		t.Fatalf("status = %d, want %d, body: %s", w.Code, http.StatusOK, w.Body.String())
-	}
-
-	var response map[string]string
-	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
-		t.Fatalf("failed to parse response: %v", err)
-	}
-	if response["org_id"] != "org-tenant" {
-		t.Fatalf("org_id = %q, want %q", response["org_id"], "org-tenant")
-	}
-	if response["user_id"] != "tenant-admin" {
-		t.Fatalf("user_id = %q, want %q", response["user_id"], "tenant-admin")
 	}
 }
 

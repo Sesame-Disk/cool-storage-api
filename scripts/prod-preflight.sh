@@ -291,13 +291,6 @@ check_auth_flags() {
     pass "AUTH_DEV_MODE is false/unset"
   fi
 
-  if is_true AUTH_ALLOW_ANONYMOUS; then
-    fail "AUTH_ALLOW_ANONYMOUS is set to a truthy value. It MUST be false in production."
-    fail "  Risk: same as AUTH_DEV_MODE — total auth bypass for anyone reachable."
-    fail "  Fix:  export AUTH_ALLOW_ANONYMOUS=false"
-  else
-    pass "AUTH_ALLOW_ANONYMOUS is false/unset"
-  fi
 }
 
 check_share_link_hmac_key() {
@@ -468,9 +461,6 @@ check_config_file() {
 
   if grep -Eq '^[[:space:]]*dev_mode:[[:space:]]*true' "$cfg"; then
     fail "Config file $cfg has auth.dev_mode: true baked in. Mount config.prod.yaml over it."
-  fi
-  if grep -Eq '^[[:space:]]*allow_anonymous:[[:space:]]*true' "$cfg"; then
-    fail "Config file $cfg has auth.allow_anonymous: true baked in."
   fi
   if grep -Eq '^[[:space:]]*-[[:space:]]*"\*"' "$cfg" \
      && grep -q 'allowed_origins' "$cfg"; then

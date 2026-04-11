@@ -47,7 +47,6 @@ services:
 
       # Force production mode (overrides any accidental dev values in .env)
       - AUTH_DEV_MODE=false
-      - AUTH_ALLOW_ANONYMOUS=false
       - OIDC_ENABLED=true
       - ONLYOFFICE_ENABLED=true
       - METRICS_ENABLED=true

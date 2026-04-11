@@ -1510,7 +1510,7 @@ Replaced 4 direct UPDATE queries with calls to the new method:
 - **Impact**: Only affected large files because the upload took longer than the 30-second polling interval, causing the 401 error to occur during the upload. Small files completed before the next poll cycle.
 - **Fix**: Added `useAnonymous()` fallback to `syncAuthMiddleware`, mirroring the existing pattern in `authMiddleware`
 - **File**: `internal/api/server.go` — `syncAuthMiddleware()`
-- **Security Note**: Anonymous fallback only active when BOTH `auth.dev_mode: true` AND `auth.allow_anonymous: true`. Neither should be enabled in production. In production with OIDC, the client would need to implement proper SSO token flow for this endpoint.
+- **Note**: `AllowAnonymous` and the anonymous fallback were subsequently removed (2026-04-10). Dev mode testing now requires an explicit `Authorization: Token <dev-token>` header.
 
 ### Seafile Desktop Client Protocol Observations (9.0.16 Windows)
 

@@ -682,39 +682,6 @@ func (s *Server) touchUserLastLogin(orgID, userID string, at time.Time) {
 	}
 }
 
-func (s *Server) applyAnonymousDevAuth(c *gin.Context) bool {
-	if !s.config.Auth.AllowAnonymous || !s.config.Auth.DevMode || len(s.config.Auth.DevTokens) == 0 {
-		return false
-	}
-
-	if orgID := requestOrgScopeHint(c); orgID != "" {
-		for _, devToken := range s.config.Auth.DevTokens {
-			if devToken.OrgID == orgID {
-				s.applyDevToken(c, devToken)
-				c.Next()
-				return true
-			}
-		}
-		return false
-	}
-
-	path := c.Request.URL.Path
-	if strings.HasPrefix(path, "/api/v2.1/org/") || path == "/org" || strings.HasPrefix(path, "/org/") {
-		for _, devToken := range s.config.Auth.DevTokens {
-			if devToken.OrgID != middleware.PlatformOrgID {
-				s.applyDevToken(c, devToken)
-				c.Next()
-				return true
-			}
-		}
-		return false
-	}
-
-	s.applyDevToken(c, s.config.Auth.DevTokens[0])
-	c.Next()
-	return true
-}
-
 // resolveOrgForPanel extracts orgID/orgName for HTML page injection (best-effort, never blocks).
 // Order: dev tokens → sesamefs_auth cookie → Authorization header → OIDC session → empty.
 func (s *Server) resolveOrgForPanel(c *gin.Context) (orgID, orgName string) {
@@ -846,9 +813,6 @@ func (s *Server) authMiddleware() gin.HandlerFunc {
 		token := extractRequestAuthToken(c)
 
 		if token == "" {
-			if s.applyAnonymousDevAuth(c) {
-				return
-			}
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "missing authorization header"})
 			c.Abort()
 			return
@@ -942,11 +906,6 @@ func (s *Server) authMiddleware() gin.HandlerFunc {
 			}
 		}
 
-		// Token not found - try anonymous fallback before rejecting
-		if s.applyAnonymousDevAuth(c) {
-			return
-		}
-
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid token"})
 		c.Abort()
 	}
@@ -972,9 +931,6 @@ func (s *Server) smartLinkAuthMiddleware() gin.HandlerFunc {
 		token := extractRequestAuthToken(c)
 
 		if token == "" {
-			if s.applyAnonymousDevAuth(c) {
-				return
-			}
 			redirectToLogin(false)
 			return
 		}
@@ -1037,9 +993,6 @@ func (s *Server) smartLinkAuthMiddleware() gin.HandlerFunc {
 			}
 		}
 
-		if s.applyAnonymousDevAuth(c) {
-			return
-		}
 		redirectToLogin(false)
 	}
 }
@@ -1077,11 +1030,7 @@ func (s *Server) syncAuthMiddleware() gin.HandlerFunc {
 			token = c.PostForm("token")
 		}
 
-		// No token provided — try anonymous fallback, otherwise reject
 		if token == "" {
-			if s.applyAnonymousDevAuth(c) {
-				return
-			}
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "authentication required"})
 			c.Abort()
 			return
