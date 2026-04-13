@@ -127,7 +127,41 @@ The preflight neutralizes these classes of problem so they do not appear in
 
 ---
 
-## TL;DR
+## Remediation status (updated 2026-04-13)
+
+> **All critical and must-fix findings from this assessment have been resolved.**
+> See the [v2 assessment](./SECURITY-ASSESSMENT-2026-04-v2.md) for the current
+> status of each finding. The sections below preserve the original assessment
+> text for historical reference.
+>
+> | Finding | Original severity | Current status |
+> |---------|------------------|----------------|
+> | C-1 OnlyOffice SSRF | Critical | **FIXED** — JWT verify + URL allowlist + hardened HTTP client |
+> | C-2 Inline SVG/HTML XSS | Critical | **FIXED** — `forcedAttachmentTypes` + `nosniff` |
+> | H-1 golang-jwt CVE | High | **FIXED** — upgraded to v5.3.1 |
+> | H-2 API key timing | High | **MITIGATED** — malformed tokens normalized |
+> | H-3 Repo token status bypass | High | **OPEN** — `syncAuthMiddleware` missing `enforceAccountStatus` |
+> | H-4 OIDC role escalation | High | **FIXED** — `superadmin` blocked from claims |
+> | H-5 Share-link enumeration | High | **IMPROVED** — opaque 404 for all unavailable states |
+> | H-6 Share-link cookie == | High | **FIXED** — `subtle.ConstantTimeCompare` |
+> | H-7 Auth rate limit | High | **IMPROVED** — tighter limits |
+> | H-8 Zip bomb | High | **FIXED** — configurable traversal budgets + rate limiter |
+> | H-9 OIDC DNS rebinding | High | **OPEN** — no DNS pinning |
+> | L-1 OIDC aud validation | Latent | **FIXED** — full audience validation |
+> | M-1 CSRF logout | Medium | **FIXED** — requires valid auth token |
+> | M-2 CORS wildcard | Medium | **FIXED** — env var + prod rejects `*` |
+> | M-3 Security headers | Medium | **FIXED** — CSP + nosniff + HSTS + Referrer-Policy |
+> | M-4 Avatar enumeration | Medium | **FIXED** — generic response for all emails |
+> | M-5 /metrics exposed | Medium | **FIXED** — internal-only middleware |
+> | M-6 OIDC state flood | Medium | **FIXED** — TTL + cap + eviction |
+> | M-7 Session node-local | Medium | **OPEN** — no distributed revocation |
+> | M-8 PBKDF2 iterations | Medium | **OPEN** — compat requirement |
+> | M-9 OnlyOffice JWT TTL | Medium | **OPEN** — still 8 hours |
+> | M-10 Frontend deps | Medium | **OPEN** — outdated moment, socket.io |
+
+---
+
+## TL;DR (original assessment — 2026-04-09)
 
 With the preflight in place, the production-reachable issues that remain are
 code and dependency bugs that no amount of configuration hygiene will fix.
@@ -874,40 +908,42 @@ The [preflight section at the top](#production-prerequisites--the-preflight-gate
 
 ---
 
-## Recommended priority order
+## Recommended priority order (updated 2026-04-13)
 
-**Immediate:**
+**COMPLETED (Immediate tier):**
 
-- Ship the preflight gate in prod: run `docker compose -f docker-compose.yaml -f docker-compose.prod-gate.yaml --profile prod up -d` at every rollout, and add a CI job that runs `./scripts/prod-preflight.sh` against the prod env block before merge.
-- **C-1** OnlyOffice callback — enforce JWT gate first, then add SSRF protections; rotate any default secret.
-- **C-2** `Content-Disposition: attachment` + `X-Content-Type-Options: nosniff` on user file serving; start planning the sandbox-origin move.
-- **H-1** upgrade `golang-jwt/jwt` v5 to the patched release.
+- ~~Ship the preflight gate in prod~~ DONE
+- ~~**C-1** OnlyOffice callback JWT + SSRF protection~~ **FIXED**
+- ~~**C-2** `Content-Disposition: attachment` + `nosniff`~~ **FIXED**
+- ~~**H-1** upgrade golang-jwt~~ **FIXED** (v5.3.1)
 
-**This week:**
+**COMPLETED (This week tier):**
 
-- **H-2** constant-time API-key compare; **H-3** repo-token account-status gate; **H-4** OIDC role allow-list + email-domain allow-list.
-- **H-5** uniform 404 + rate limit on `/api/v2.1/share-links/:token/*`; confirm token entropy.
-- **H-6** constant-time share-link cookie compare.
-- **H-7** tighten auth-token rate limit, add upload/download throttles, enforce `max_upload_mb`.
-- **H-8** zip-bomb protections landed; keep regression coverage around traversal budgets.
-- **L-1** land the two-line `validate_audience` fix **and** the regression unit test in `internal/auth/oidc_aud_test.go`. Cheap, permanent, protects against the most plausible regression.
+- ~~**H-4** OIDC role allow-list~~ **FIXED**
+- ~~**H-5** uniform 404 + rate limit on share links~~ **IMPROVED**
+- ~~**H-6** constant-time share-link cookie compare~~ **FIXED**
+- ~~**H-8** zip-bomb protections~~ **FIXED** (configurable budgets + rate limiter)
+- ~~**L-1** audience validation + regression test~~ **FIXED**
+- ~~**M-3** security-headers middleware~~ **FIXED** (CSP + nosniff + HSTS + Referrer-Policy)
+- ~~**M-2** explicit CORS allow-list~~ **FIXED** (env var + prod rejects `*`)
+- ~~**M-4** avatar endpoint~~ **FIXED** (generic response)
+- ~~**M-5** `/metrics` internal-only~~ **FIXED**
+- ~~**M-6** OIDC state TTL + sweeper~~ **FIXED**
+- ~~**M-1** strict auth on session DELETE~~ **FIXED**
 
-**Next:**
+**Remaining (should-fix):**
 
-- **M-3** security-headers middleware.
-- **M-2** explicit CORS allow-list.
-- **M-4** auth on avatar endpoint.
-- **M-5** `/metrics` is now internal-only in the app; keep the proxy block as a second layer.
-- **M-6** OIDC state TTL + sweeper.
-- **M-7** distributed session revocation.
-- **H-9** DNS-rebinding defense.
-- **M-1** strict auth on `/auth/session` DELETE is now in place; preserve it across client changes.
-- **M-10** frontend dep upgrades; plan React 17 → 18.
+- **H-3** repo-token account-status gate
+- **H-2** constant-time API-key compare for malformed tokens
+- **H-7** tighter auth-token rate limit + per-account throttling
+- **H-9** DNS-rebinding defense on OIDC discovery/JWKS
+- **M-9** shorten OnlyOffice JWT TTL to 1h
+- **M-10** frontend dep upgrades (moment, socket.io); plan React 17 → 18
 
 **Planned:**
 
-- **M-8** deprecate PBKDF2 compat path or raise iterations.
-- **M-9** shorten OnlyOffice JWT TTL.
+- **M-7** distributed session revocation
+- **M-8** deprecate PBKDF2 compat path or raise iterations
 
 ---
 

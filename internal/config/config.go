@@ -393,7 +393,10 @@ type CORSConfig struct {
 
 // SeafHTTPConfig holds Seafile-compatible file transfer settings
 type SeafHTTPConfig struct {
-	TokenTTL time.Duration `yaml:"token_ttl"` // How long upload/download tokens are valid
+	TokenTTL      time.Duration `yaml:"token_ttl"`       // How long upload/download tokens are valid
+	ZipMaxEntries int           `yaml:"zip_max_entries"` // Maximum files allowed in a streamed ZIP download
+	ZipMaxDepth   int           `yaml:"zip_max_depth"`   // Maximum directory nesting allowed in a streamed ZIP download
+	ZipMaxBytes   int64         `yaml:"zip_max_bytes"`   // Maximum total uncompressed bytes allowed in a streamed ZIP download
 }
 
 // ServerConfig holds HTTP server settings
@@ -706,7 +709,10 @@ func DefaultConfig() *Config {
 			AuditRetentionDays: 365,
 		},
 		SeafHTTP: SeafHTTPConfig{
-			TokenTTL: 1 * time.Hour,
+			TokenTTL:      1 * time.Hour,
+			ZipMaxEntries: 100000,
+			ZipMaxDepth:   64,
+			ZipMaxBytes:   10 * 1024 * 1024 * 1024,
 		},
 		OnlyOffice: OnlyOfficeConfig{
 			Enabled:           false,
@@ -827,6 +833,21 @@ func (c *Config) applyEnvOverrides() {
 	if v := os.Getenv("SEAFHTTP_TOKEN_TTL"); v != "" {
 		if d, err := time.ParseDuration(v); err == nil {
 			c.SeafHTTP.TokenTTL = d
+		}
+	}
+	if v := os.Getenv("SEAFHTTP_ZIP_MAX_ENTRIES"); v != "" {
+		if i, err := strconv.Atoi(v); err == nil {
+			c.SeafHTTP.ZipMaxEntries = i
+		}
+	}
+	if v := os.Getenv("SEAFHTTP_ZIP_MAX_DEPTH"); v != "" {
+		if i, err := strconv.Atoi(v); err == nil {
+			c.SeafHTTP.ZipMaxDepth = i
+		}
+	}
+	if v := os.Getenv("SEAFHTTP_ZIP_MAX_BYTES"); v != "" {
+		if i, err := strconv.ParseInt(v, 10, 64); err == nil {
+			c.SeafHTTP.ZipMaxBytes = i
 		}
 	}
 	// OIDC settings
@@ -1056,6 +1077,24 @@ func (c *Config) Validate() error {
 	}
 	if c.OnlyOffice.MaxDocumentBytes <= 0 {
 		return fmt.Errorf("onlyoffice.max_document_bytes must be greater than zero")
+	}
+	if c.SeafHTTP.ZipMaxEntries <= 0 {
+		return fmt.Errorf("seafhttp.zip_max_entries must be greater than zero")
+	}
+	if c.SeafHTTP.ZipMaxEntries > 1000000 {
+		return fmt.Errorf("seafhttp.zip_max_entries must be less than or equal to 1000000")
+	}
+	if c.SeafHTTP.ZipMaxDepth <= 0 {
+		return fmt.Errorf("seafhttp.zip_max_depth must be greater than zero")
+	}
+	if c.SeafHTTP.ZipMaxDepth > 256 {
+		return fmt.Errorf("seafhttp.zip_max_depth must be less than or equal to 256")
+	}
+	if c.SeafHTTP.ZipMaxBytes <= 0 {
+		return fmt.Errorf("seafhttp.zip_max_bytes must be greater than zero")
+	}
+	if c.SeafHTTP.ZipMaxBytes > 100*1024*1024*1024 {
+		return fmt.Errorf("seafhttp.zip_max_bytes must be less than or equal to 107374182400")
 	}
 	normalizedPreviewExtensions, err := normalizeFileViewPreviewExtensions(c.FileView.PreviewExtensions)
 	if err != nil {

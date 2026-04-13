@@ -118,6 +118,7 @@ type Server struct {
 	ssoStore             *clientSSOStore         // Pending desktop-client SSO tokens
 	authRateLimiter      *middleware.RateLimiter // Per-IP rate limiter for auth endpoints
 	shareLinkRateLimiter *middleware.RateLimiter // Per-IP rate limiter for public share-link endpoints
+	zipRateLimiter       *middleware.RateLimiter // Per-IP rate limiter for streamed ZIP downloads
 	apiKeyManager        *apikeys.Manager        // API key manager for programmatic auth
 	version              string                  // Build version string
 	router               *gin.Engine
@@ -222,6 +223,10 @@ func NewServer(cfg *config.Config, database *db.DB, version string) *Server {
 	// then steady ~1 req/sec per IP.
 	shareLinkRL := middleware.NewRateLimiter(rate.Every(time.Second), 20)
 
+	// ZIP creation is CPU/IO-heavy even with a valid token. Keep this
+	// strictly per-IP for now to suppress repeated abuse bursts.
+	zipRL := middleware.NewRateLimiter(rate.Every(15*time.Second), 3)
+
 	var apiKeyManager *apikeys.Manager
 	if database != nil {
 		apiKeyManager = apikeys.NewManager(database)
@@ -240,6 +245,7 @@ func NewServer(cfg *config.Config, database *db.DB, version string) *Server {
 		ssoStore:             newClientSSOStore(),
 		authRateLimiter:      authRL,
 		shareLinkRateLimiter: shareLinkRL,
+		zipRateLimiter:       zipRL,
 		apiKeyManager:        apiKeyManager,
 		version:              version,
 		router:               router,
@@ -1968,6 +1974,9 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	}
 	if s.shareLinkRateLimiter != nil {
 		s.shareLinkRateLimiter.Stop()
+	}
+	if s.zipRateLimiter != nil {
+		s.zipRateLimiter.Stop()
 	}
 	if s.apiKeyManager != nil {
 		s.apiKeyManager.Stop()

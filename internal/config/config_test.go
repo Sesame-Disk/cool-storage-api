@@ -175,6 +175,15 @@ func TestDefaultConfig(t *testing.T) {
 	if cfg.Versioning.DefaultTTLDays != 90 {
 		t.Errorf("Versioning.DefaultTTLDays = %d, want 90", cfg.Versioning.DefaultTTLDays)
 	}
+	if cfg.SeafHTTP.ZipMaxEntries != 100000 {
+		t.Errorf("SeafHTTP.ZipMaxEntries = %d, want 100000", cfg.SeafHTTP.ZipMaxEntries)
+	}
+	if cfg.SeafHTTP.ZipMaxDepth != 64 {
+		t.Errorf("SeafHTTP.ZipMaxDepth = %d, want 64", cfg.SeafHTTP.ZipMaxDepth)
+	}
+	if cfg.SeafHTTP.ZipMaxBytes != 10*1024*1024*1024 {
+		t.Errorf("SeafHTTP.ZipMaxBytes = %d, want %d", cfg.SeafHTTP.ZipMaxBytes, int64(10*1024*1024*1024))
+	}
 }
 
 func TestConfigValidate(t *testing.T) {
@@ -284,6 +293,30 @@ func TestConfigValidate(t *testing.T) {
 			},
 			wantErr:        true,
 			wantErrContain: "onlyoffice.jwt_secret",
+		},
+		{
+			name: "zip max entries must be positive",
+			modify: func(c *Config) {
+				c.SeafHTTP.ZipMaxEntries = 0
+			},
+			wantErr:        true,
+			wantErrContain: "seafhttp.zip_max_entries",
+		},
+		{
+			name: "zip max depth must be bounded",
+			modify: func(c *Config) {
+				c.SeafHTTP.ZipMaxDepth = 257
+			},
+			wantErr:        true,
+			wantErrContain: "seafhttp.zip_max_depth",
+		},
+		{
+			name: "zip max bytes must be bounded",
+			modify: func(c *Config) {
+				c.SeafHTTP.ZipMaxBytes = 101 * 1024 * 1024 * 1024
+			},
+			wantErr:        true,
+			wantErrContain: "seafhttp.zip_max_bytes",
 		},
 	}
 
@@ -521,7 +554,13 @@ func TestEnvOverrideSeafHTTP(t *testing.T) {
 	cfg := DefaultConfig()
 
 	os.Setenv("SEAFHTTP_TOKEN_TTL", "2h")
+	os.Setenv("SEAFHTTP_ZIP_MAX_ENTRIES", "12345")
+	os.Setenv("SEAFHTTP_ZIP_MAX_DEPTH", "32")
+	os.Setenv("SEAFHTTP_ZIP_MAX_BYTES", "4294967296")
 	defer os.Unsetenv("SEAFHTTP_TOKEN_TTL")
+	defer os.Unsetenv("SEAFHTTP_ZIP_MAX_ENTRIES")
+	defer os.Unsetenv("SEAFHTTP_ZIP_MAX_DEPTH")
+	defer os.Unsetenv("SEAFHTTP_ZIP_MAX_BYTES")
 
 	cfg.applyEnvOverrides()
 
@@ -529,21 +568,48 @@ func TestEnvOverrideSeafHTTP(t *testing.T) {
 	if cfg.SeafHTTP.TokenTTL.Hours() != 2 {
 		t.Errorf("SeafHTTP.TokenTTL = %v, want 2h", cfg.SeafHTTP.TokenTTL)
 	}
+	if cfg.SeafHTTP.ZipMaxEntries != 12345 {
+		t.Errorf("SeafHTTP.ZipMaxEntries = %d, want 12345", cfg.SeafHTTP.ZipMaxEntries)
+	}
+	if cfg.SeafHTTP.ZipMaxDepth != 32 {
+		t.Errorf("SeafHTTP.ZipMaxDepth = %d, want 32", cfg.SeafHTTP.ZipMaxDepth)
+	}
+	if cfg.SeafHTTP.ZipMaxBytes != 4294967296 {
+		t.Errorf("SeafHTTP.ZipMaxBytes = %d, want 4294967296", cfg.SeafHTTP.ZipMaxBytes)
+	}
 }
 
 // TestEnvOverrideSeafHTTPInvalid tests invalid duration is ignored
 func TestEnvOverrideSeafHTTPInvalid(t *testing.T) {
 	cfg := DefaultConfig()
 	originalTTL := cfg.SeafHTTP.TokenTTL
+	originalEntries := cfg.SeafHTTP.ZipMaxEntries
+	originalDepth := cfg.SeafHTTP.ZipMaxDepth
+	originalBytes := cfg.SeafHTTP.ZipMaxBytes
 
 	os.Setenv("SEAFHTTP_TOKEN_TTL", "invalid")
+	os.Setenv("SEAFHTTP_ZIP_MAX_ENTRIES", "invalid")
+	os.Setenv("SEAFHTTP_ZIP_MAX_DEPTH", "invalid")
+	os.Setenv("SEAFHTTP_ZIP_MAX_BYTES", "invalid")
 	defer os.Unsetenv("SEAFHTTP_TOKEN_TTL")
+	defer os.Unsetenv("SEAFHTTP_ZIP_MAX_ENTRIES")
+	defer os.Unsetenv("SEAFHTTP_ZIP_MAX_DEPTH")
+	defer os.Unsetenv("SEAFHTTP_ZIP_MAX_BYTES")
 
 	cfg.applyEnvOverrides()
 
 	// Should keep default since parse failed
 	if cfg.SeafHTTP.TokenTTL != originalTTL {
 		t.Errorf("SeafHTTP.TokenTTL = %v, want %v (unchanged)", cfg.SeafHTTP.TokenTTL, originalTTL)
+	}
+	if cfg.SeafHTTP.ZipMaxEntries != originalEntries {
+		t.Errorf("SeafHTTP.ZipMaxEntries = %d, want %d (unchanged)", cfg.SeafHTTP.ZipMaxEntries, originalEntries)
+	}
+	if cfg.SeafHTTP.ZipMaxDepth != originalDepth {
+		t.Errorf("SeafHTTP.ZipMaxDepth = %d, want %d (unchanged)", cfg.SeafHTTP.ZipMaxDepth, originalDepth)
+	}
+	if cfg.SeafHTTP.ZipMaxBytes != originalBytes {
+		t.Errorf("SeafHTTP.ZipMaxBytes = %d, want %d (unchanged)", cfg.SeafHTTP.ZipMaxBytes, originalBytes)
 	}
 }
 

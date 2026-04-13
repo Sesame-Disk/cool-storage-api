@@ -468,12 +468,15 @@ type SeafHTTPHandler struct {
 	db             *db.DB
 	tokenStore     TokenStore
 	permMiddleware *middleware.PermissionMiddleware
+	zipMaxEntries  int
+	zipMaxDepth    int
+	zipMaxBytes    int64
 }
 
 const (
-	maxZipEntries = 100000
-	maxZipDepth   = 64
-	maxZipBytes   = 10 * 1024 * 1024 * 1024 // 10 GiB of uncompressed file content
+	defaultZipMaxEntries = 100000
+	defaultZipMaxDepth   = 64
+	defaultZipMaxBytes   = 10 * 1024 * 1024 * 1024 // 10 GiB of uncompressed file content
 )
 
 type zipLimitError struct {
@@ -495,14 +498,6 @@ type zipTraversalBudget struct {
 	maxBytes   int64
 	entries    int
 	totalBytes int64
-}
-
-func newZipTraversalBudget() *zipTraversalBudget {
-	return &zipTraversalBudget{
-		maxEntries: maxZipEntries,
-		maxDepth:   maxZipDepth,
-		maxBytes:   maxZipBytes,
-	}
 }
 
 func (b *zipTraversalBudget) noteDirectory(depth int) error {
@@ -535,11 +530,46 @@ func NewSeafHTTPHandler(s3Store *storage.S3Store, storageManager *storage.Manage
 		db:             database,
 		tokenStore:     tokenStore,
 		permMiddleware: permMiddleware,
+		zipMaxEntries:  defaultZipMaxEntries,
+		zipMaxDepth:    defaultZipMaxDepth,
+		zipMaxBytes:    defaultZipMaxBytes,
+	}
+}
+
+func (h *SeafHTTPHandler) SetZipLimits(maxEntries, maxDepth int, maxBytes int64) {
+	if maxEntries > 0 {
+		h.zipMaxEntries = maxEntries
+	}
+	if maxDepth > 0 {
+		h.zipMaxDepth = maxDepth
+	}
+	if maxBytes > 0 {
+		h.zipMaxBytes = maxBytes
+	}
+}
+
+func (h *SeafHTTPHandler) newZipTraversalBudget() *zipTraversalBudget {
+	maxEntries := h.zipMaxEntries
+	if maxEntries <= 0 {
+		maxEntries = defaultZipMaxEntries
+	}
+	maxDepth := h.zipMaxDepth
+	if maxDepth <= 0 {
+		maxDepth = defaultZipMaxDepth
+	}
+	maxBytes := h.zipMaxBytes
+	if maxBytes <= 0 {
+		maxBytes = defaultZipMaxBytes
+	}
+	return &zipTraversalBudget{
+		maxEntries: maxEntries,
+		maxDepth:   maxDepth,
+		maxBytes:   maxBytes,
 	}
 }
 
 // RegisterSeafHTTPRoutes registers the seafhttp routes
-func (h *SeafHTTPHandler) RegisterSeafHTTPRoutes(router *gin.Engine) {
+func (h *SeafHTTPHandler) RegisterSeafHTTPRoutes(router *gin.Engine, zipRL ...gin.HandlerFunc) {
 	seafhttp := router.Group("/seafhttp")
 	{
 		// Upload endpoint - receives files and stores them in S3
@@ -549,7 +579,12 @@ func (h *SeafHTTPHandler) RegisterSeafHTTPRoutes(router *gin.Engine) {
 		seafhttp.GET("/files/:token/*filepath", h.HandleDownload)
 
 		// ZIP download endpoint - creates a ZIP of a directory on-the-fly
-		seafhttp.GET("/zip/:token", h.HandleZipDownload)
+		zipHandlers := make([]gin.HandlerFunc, 0, 2)
+		if len(zipRL) > 0 && zipRL[0] != nil {
+			zipHandlers = append(zipHandlers, zipRL[0])
+		}
+		zipHandlers = append(zipHandlers, h.HandleZipDownload)
+		seafhttp.GET("/zip/:token", zipHandlers...)
 	}
 }
 
@@ -1899,7 +1934,7 @@ func (h *SeafHTTPHandler) HandleZipDownload(c *gin.Context) {
 		}
 	}
 
-	preflightBudget := newZipTraversalBudget()
+	preflightBudget := h.newZipTraversalBudget()
 	if err := h.validateZipDirectory(token.RepoID, targetFSID, 0, preflightBudget); err != nil {
 		if isZipLimitError(err) {
 			c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": err.Error()})
@@ -1923,7 +1958,7 @@ func (h *SeafHTTPHandler) HandleZipDownload(c *gin.Context) {
 	bytesBefore := int64(c.Writer.Size())
 
 	// Recursively add directory contents to the ZIP
-	runtimeBudget := newZipTraversalBudget()
+	runtimeBudget := h.newZipTraversalBudget()
 	if err := h.addDirToZip(c.Request.Context(), httputil.GetRoutingHostname(c), zipWriter, token.RepoID, token.OrgID, targetFSID, "", fileKey, 0, runtimeBudget); err != nil {
 		log.Printf("[HandleZipDownload] ZIP stream aborted: %v", err)
 		return

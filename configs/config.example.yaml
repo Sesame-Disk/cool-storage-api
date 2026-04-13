@@ -217,6 +217,12 @@ versioning:
   min_ttl_days: 7
   gc_interval: 24h
 
+seafhttp:
+  token_ttl: 24h
+  zip_max_entries: 100000            # max files included in a streamed ZIP download
+  zip_max_depth: 64                  # max directory nesting when traversing a ZIP download
+  zip_max_bytes: 10737418240         # 10 GiB max total uncompressed bytes in a ZIP download
+
 gc:
   enabled: true
   worker_interval: 30s

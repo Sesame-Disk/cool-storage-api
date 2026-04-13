@@ -9,8 +9,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Sesame-Disk/sesamefs/internal/middleware"
 	"github.com/Sesame-Disk/sesamefs/internal/storage"
 	"github.com/gin-gonic/gin"
+	"golang.org/x/time/rate"
 )
 
 func init() {
@@ -992,6 +994,7 @@ func TestRegisterSeafHTTPRoutes(t *testing.T) {
 	}{
 		{"POST", "/seafhttp/upload-api/test-token"},
 		{"GET", "/seafhttp/files/test-token/file.txt"},
+		{"GET", "/seafhttp/zip/test-token"},
 	}
 
 	for _, tt := range tests {
@@ -1003,5 +1006,31 @@ func TestRegisterSeafHTTPRoutes(t *testing.T) {
 		if w.Code == http.StatusNotFound {
 			t.Errorf("%s %s returned 404, route not registered", tt.method, tt.path)
 		}
+	}
+}
+
+func TestRegisterSeafHTTPRoutesZipRateLimit(t *testing.T) {
+	tokenStore := NewMockTokenStore()
+	handler := NewSeafHTTPHandler(nil, nil, nil, tokenStore, nil)
+
+	r := gin.New()
+	rl := middleware.NewRateLimiter(rate.Every(time.Hour), 1)
+	defer rl.Stop()
+	handler.RegisterSeafHTTPRoutes(r, rl.Limit())
+
+	req1 := httptest.NewRequest(http.MethodGet, "/seafhttp/zip/test-token", nil)
+	req1.RemoteAddr = "198.51.100.10:12345"
+	w1 := httptest.NewRecorder()
+	r.ServeHTTP(w1, req1)
+	if w1.Code != http.StatusUnauthorized {
+		t.Fatalf("first status = %d, want %d", w1.Code, http.StatusUnauthorized)
+	}
+
+	req2 := httptest.NewRequest(http.MethodGet, "/seafhttp/zip/test-token", nil)
+	req2.RemoteAddr = "198.51.100.10:12345"
+	w2 := httptest.NewRecorder()
+	r.ServeHTTP(w2, req2)
+	if w2.Code != http.StatusTooManyRequests {
+		t.Fatalf("second status = %d, want %d", w2.Code, http.StatusTooManyRequests)
 	}
 }

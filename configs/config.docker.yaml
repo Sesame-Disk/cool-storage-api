@@ -105,6 +105,9 @@ storage:
 
 seafhttp:
   token_ttl: 24h  # Upload/download tokens valid for 24 hours (needed for large uploads and Seafile client syncs)
+  zip_max_entries: 100000
+  zip_max_depth: 64
+  zip_max_bytes: 10737418240
 
 auth:
   dev_mode: false                       # Dev only — never enable in production

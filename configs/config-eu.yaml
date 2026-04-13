@@ -176,6 +176,9 @@ gc:
 
 seafhttp:
   token_ttl: 24h
+  zip_max_entries: 100000
+  zip_max_depth: 64
+  zip_max_bytes: 10737418240
 
 cors:
   allowed_origins:
