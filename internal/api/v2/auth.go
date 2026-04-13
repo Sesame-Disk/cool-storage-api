@@ -194,13 +194,11 @@ func (h *AuthHandler) GetOIDCConfig(c *gin.Context) {
 		return
 	}
 
-	// Return public configuration (no secrets)
+	// Return only the minimum public signal the unauthenticated login shell needs.
+	// Login URL construction happens on a separate endpoint, so exposing issuer,
+	// client_id, scopes, or redirect URIs here only increases reconnaissance value.
 	c.JSON(http.StatusOK, gin.H{
-		"enabled":       true,
-		"issuer":        h.config.Auth.OIDC.Issuer,
-		"client_id":     h.config.Auth.OIDC.ClientID,
-		"scopes":        h.config.Auth.OIDC.Scopes,
-		"redirect_uris": h.config.Auth.OIDC.RedirectURIs,
+		"enabled": true,
 	})
 }
 

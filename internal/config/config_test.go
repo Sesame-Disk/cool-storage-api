@@ -341,6 +341,7 @@ func TestEnvOverrideServerTrustedProxies(t *testing.T) {
 
 func TestEnvOverrideOnlyOfficeMaxDocumentBytes(t *testing.T) {
 	cfg := DefaultConfig()
+	cfg.Auth.DevMode = true
 
 	os.Setenv("ONLYOFFICE_MAX_DOCUMENT_BYTES", "1048576")
 	defer os.Unsetenv("ONLYOFFICE_MAX_DOCUMENT_BYTES")

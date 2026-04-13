@@ -173,7 +173,7 @@ config applied. The scorecard:
 | **H-5** share-link token enumeration via `/api/v2.1/share-links/:token/dirents/` (non-existent → `404 {"error":"share link not found"}`, existent → `200` with dir listing) | ✅ oracle confirmed |
 | **H-7** `/api2/auth-token/` rate limit | ⚠️ 24 / 120 login attempts accepted in a single burst — tighter than initially reported but still loose for distributed stuffing |
 | **M-5** `/metrics` on the public listener | ❌ **blocked at the reverse proxy (HTTP 403)** on the probed deployment — see finding for why it still counts as a defense-in-depth concern |
-| **LOW** `/api/v2.1/bootstrap`, `/api2/server-info`, `/health`, `/ready`, `/api/v2.1/auth/oidc/config` reachable unauth | ✅ all 200 — leak version, features, issuer URL, and the configured OIDC client id |
+| **LOW** `/api/v2.1/bootstrap`, `/api2/server-info`, `/health`, `/ready`, `/api/v2.1/auth/oidc/config` reachable unauth | ✅ historical probe returned 200 for all; current code redacts the OIDC config response to `enabled` only |
 | **H-1** golang-jwt memory DoS | ⏳ not demonstrated at safe default probe size; requires a larger payload on infrastructure you own to visibly trip |
 
 The remaining findings either need credentials, an IdP-issued token, or a
@@ -438,7 +438,7 @@ content-type: application/json
 # A valid token returns HTTP 200 and the directory listing JSON.
 ```
 
-There is no per-IP or global rate limit on this path beyond the generic auth rate limiter (which is `rate.Every(6s), burst 10` — see H-7). Whether the oracle is usefully exploitable depends on the entropy of share-link tokens: if tokens are ≥128 bits of `crypto/rand` output, brute force is infeasible at any realistic rate, and the oracle is purely a "confirm-if-you-already-have-a-guess" tool. Verify the entropy in `generateShareLinkToken`.
+Current code has improved this path by collapsing missing/expired/disabled links into an opaque unavailable response while keeping public share-link throttling per IP. A valid token still returns 200, so the residual issue is best understood as a confirmation oracle if an attacker already has a high-confidence guess. Whether that residual signal is useful still depends on the entropy of share-link tokens: if tokens are ≥128 bits of `crypto/rand` output, brute force is infeasible at any realistic rate.
 
 **Fix:**
 
@@ -731,7 +731,7 @@ None are direct RCE, but the ReDoS in client-side date parsing is reachable via 
 
 - **`/api/v2.1/bootstrap` and `/api2/server-info` leak version (`11.0.0`), brand, feature flags, role list, storage class names, inline-preview extension list** unauth. Expected for an SPA, but trim to only what the unauthenticated UI needs.
 - **`/health` and `/ready` expose per-component status** (database/storage). Minor recon aid — `/ready` returned a ~950-byte status blob on the pre-prod deployment, so expect the attacker to know your infra layout.
-- **`/api/v2.1/auth/oidc/config` is reachable unauth** and returns the configured `issuer`, `client_id`, and scope list. Useful input for a targeted phishing campaign that spins up a pixel-perfect fake broker login page. Consider requiring auth, or at least stripping the `client_id` from the unauthenticated response.
+- **`/api/v2.1/auth/oidc/config` is reachable unauth.** Historical builds returned `issuer`, `client_id`, and scope list, which was useful input for a targeted phishing campaign. Current code now returns only the `enabled` flag for unauthenticated callers.
 - **`/api/v2.1/query-zip-progress` and `/api/v2.1/cancel-zip-task` return stub success unauth.** Not dangerous in isolation, but a sign the router mounts stubs on public prefixes; audit for drift.
 - **Nonce check in `oidc.go:478` is conditional** — only enforced if the server emitted a nonce. Make it mandatory.
 - **No `/debug/pprof`, `/debug/vars`, `.git`, `.env`, source maps, or swagger exposed.** Confirmed absent on the live pre-prod instance. Good.

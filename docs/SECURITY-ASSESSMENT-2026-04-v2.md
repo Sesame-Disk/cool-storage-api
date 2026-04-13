@@ -56,7 +56,7 @@ reassessment identified **3 new findings** not covered in v1.
 | H-2 | API key timing oracle | High | **MITIGATED** | Malformed tokens normalized; DB hit/miss timing acknowledged but not fully fixed |
 | H-3 | Repo token skips account-status | High | **NEEDS RETEST** | Requires deactivated user to verify |
 | H-4 | OIDC role escalation | High | **FIXED** | `superadmin` blocked from claims; `mapOIDCRole` enforces allow-list |
-| H-5 | Share-link enumeration oracle | High | **OPEN** | 404 vs 200 still distinguishable |
+| H-5 | Share-link enumeration oracle | High | **IMPROVED** | Missing/expired/disabled now collapse to opaque unavailable responses; public routes remain per-IP throttled, but valid tokens still return 200 |
 | H-6 | Share-link cookie `==` | High | **FIXED** | Now uses `subtle.ConstantTimeCompare` |
 | H-7 | Weak auth rate limit | High | **IMPROVED** | 10/120 get through locally (was 24/120 in v1) |
 | H-8 | Zip bomb / dir download DoS | High | **OPEN** | No file count, depth, or total byte limits |
@@ -79,7 +79,7 @@ reassessment identified **3 new findings** not covered in v1.
 |----|---------|----------|-------|
 | **V2-C1** | OnlyOffice callback completely unauthenticated | **Critical** | No JWT verification, no auth middleware. Confirmed on both local and prod |
 | **V2-L1** | `/ready` leaks component status | Low | Exposes database/storage health unauthenticated (local only; prod catches via nginx) |
-| **V2-L2** | OIDC config leaks `client_id` and `issuer` | Low | Enables targeted phishing. Confirmed on prod: `client_id: "622935"` |
+| **V2-L2** | OIDC config leaks `client_id` and `issuer` | Low | **FIXED in code** | Public endpoint now returns only `enabled`; historical prod probe leaked `client_id: "622935"` |
 
 ---
 
@@ -90,7 +90,7 @@ All unauthenticated probes were run against both targets. Key differences:
 | Probe | Local (`localhost:8082`) | Production (`sfs.nihaoshares.com`) |
 |-------|------------------------|-------------------------------------|
 | **H-1** JWT DoS | No latency growth at 1000 dots | No latency growth at 1000 dots |
-| **H-5** Share-link enum | 404 oracle confirmed (20/50 not rate-limited) | 404 oracle confirmed (50/50, no rate limiting on this path) |
+| **H-5** Share-link enum | Historical probe confirmed confirmation oracle | Historical probe confirmed confirmation oracle; current code adds opaque unavailable responses for inactive links and keeps per-IP throttling |
 | **H-7** Auth rate limit | 10/120 got through (~8%) | 26/120 got through (~22%) |
 | **M-1** CSRF logout | HTTP 200 - reproduced | HTTP 200 - reproduced |
 | **M-2** CORS wildcard | ACAO:* + ACAC:true (dev mode) | **ACAO:* + ACAC:true (PRODUCTION!)** |
@@ -98,7 +98,7 @@ All unauthenticated probes were run against both targets. Key differences:
 | **M-5** Metrics | HTTP 200 - exposed | HTTP 403 - blocked by nginx |
 | **V2-C1** OnlyOffice unauth | HTTP 200 - **reproduced** | HTTP 200 - **reproduced** |
 | **V2-L1** /ready info leak | JSON with db/storage status | Caught by nginx (returns frontend HTML) |
-| **V2-L2** OIDC config leak | `enabled: false` (dev mode) | **Leaks client_id, issuer, scopes** |
+| **V2-L2** OIDC config leak | `enabled: false` (dev mode) | Historical probe leaked client_id/issuer/scopes; current code now returns only `enabled` |
 | **Info disclosure** | All info endpoints return 200 | All info endpoints return 200 |
 
 ### Critical difference: Production CORS
@@ -210,10 +210,16 @@ which prevents existing users from being escalated. Superadmin is DB-only.
 
 ---
 
-#### H-5 Share-link enumeration oracle (STILL OPEN)
+#### H-5 Share-link enumeration oracle (IMPROVED, confirmation signal remains)
 
-**Live results:** On production, 50/50 random token probes returned HTTP 404 with no rate
-limiting on this specific path. A valid token returns 200. The oracle is confirmed.
+**Historical live results:** On production, 50/50 random token probes returned HTTP 404 with no rate
+limiting on this specific path. A valid token returns 200.
+
+**Current code status:** public share-link handlers now collapse missing, expired, and disabled
+tokens into the same opaque `share link unavailable` response, while public routes remain
+throttled per IP. A valid token still returns 200, so
+this should now be treated as a confirmation oracle with improved throttling rather than an
+unbounded enumeration path.
 
 ---
 
@@ -303,9 +309,9 @@ but the app-level endpoint is still exposed.
 
 ---
 
-#### V2-L2 OIDC config leaks IdP details (NEW)
+#### V2-L2 OIDC config leaks IdP details (FIXED IN CODE AFTER ASSESSMENT)
 
-**Production confirmed:**
+**Historical production probe:**
 ```json
 {
   "client_id": "622935",
@@ -314,7 +320,11 @@ but the app-level endpoint is still exposed.
   "scopes": ["openid", "profile", "email"]
 }
 ```
-Enables targeted phishing with a pixel-perfect fake login page.
+That response enabled targeted phishing with a pixel-perfect fake login page.
+
+**Current code status:** `GET /api/v2.1/auth/oidc/config` now returns only `{ "enabled": true|false }`
+for unauthenticated callers. The login shell only needs to know whether browser SSO is available;
+the login URL itself is still obtained from the dedicated login endpoint.
 
 ---
 
@@ -418,10 +428,10 @@ all database traffic.
 
 ### Should-fix soon
 
-5. **H-5:** Uniform response for share-link token lookup + rate limiting
+5. **H-5:** Further reduce the remaining share-link confirmation signal if product requirements allow it
 6. **H-7:** Tighter auth rate limit + per-account throttling
 7. **H-8:** Add file count/depth/size limits to zip download
-8. **V2-L2:** Strip `client_id` from unauthenticated OIDC config response
+8. **V2-L2:** Monitor for regressions; unauthenticated OIDC config no longer exposes IdP details
 9. **M-5:** Bind `/metrics` to internal-only listener
 10. **S3 SSE:** Add `ServerSideEncryption` to Put operations
 

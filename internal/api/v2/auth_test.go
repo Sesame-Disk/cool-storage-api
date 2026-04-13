@@ -127,16 +127,13 @@ func TestGetOIDCConfig(t *testing.T) {
 		if response["enabled"] != true {
 			t.Error("enabled should be true")
 		}
-		if response["issuer"] != "https://test-issuer.example.com" {
-			t.Errorf("issuer = %v", response["issuer"])
+		if len(response) != 1 {
+			t.Fatalf("response = %v, want only enabled flag", response)
 		}
-		if response["client_id"] != "test-client-id" {
-			t.Errorf("client_id = %v", response["client_id"])
-		}
-
-		// Verify client_secret is NOT exposed
-		if _, exists := response["client_secret"]; exists {
-			t.Error("client_secret should NOT be returned")
+		for _, field := range []string{"issuer", "client_id", "scopes", "redirect_uris", "client_secret"} {
+			if _, exists := response[field]; exists {
+				t.Errorf("%s should NOT be returned", field)
+			}
 		}
 	})
 

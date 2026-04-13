@@ -249,7 +249,7 @@ describe('OIDC API Endpoint Patterns', () => {
         method: 'GET',
         url: '/api/v2.1/auth/oidc/config/',
         auth: false,
-        response: { enabled: 'boolean', issuer: 'string', client_id: 'string' },
+        response: { enabled: 'boolean' },
       },
       getOIDCLoginURL: {
         method: 'GET',
