@@ -19,7 +19,7 @@
 #   AUTH_DEV_MODE, OIDC_*, ONLYOFFICE_*,
 #   CASSANDRA_*, S3_BUCKET, S3_REGION, S3_ENDPOINT,
 #   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, BILLING_URL,
-#   SERVER_TRUSTED_PROXIES,
+#   SERVER_TRUSTED_PROXIES, FIRST_SUPERADMIN_EMAIL,
 #   GC_ENABLED, GC_USER_GRACE_DAYS, GC_ORG_GRACE_DAYS,
 #   GC_TRASH_RETENTION_DAYS, GC_AUDIT_RETENTION_DAYS,
 #   ACCOUNTS_PASSWORD_CHANGE_URL, ACCOUNTS_DELETE_ACCOUNT_URL,
@@ -33,6 +33,7 @@ server:
   write_timeout: 0s             # No timeout — large downloads can take minutes
   max_upload_mb: 20480          # 20480 MB (~20 GiB) max upload
   trusted_proxies: []           # Configure exact nginx/load-balancer IP/CIDRs; empty disables X-Forwarded-For trust
+  mobile_frontend_path: "./mobile-frontend/dist" # Built mobile frontend directory
 
 # =============================================================================
 # Database — host/credentials come from env vars
@@ -68,6 +69,9 @@ storage:
   backends:
     hot:
       type: s3
+      bucket: ""                     # Set via S3_BUCKET env var
+      region: ""                     # Set via S3_REGION env var
+      endpoint: ""                   # Optional S3-compatible endpoint via S3_ENDPOINT env var
       # bucket, region, endpoint → overridden by S3_BUCKET, S3_REGION, S3_ENDPOINT
       # credentials → overridden by AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
 
@@ -77,6 +81,8 @@ storage:
 auth:
   dev_mode: false               # Secure default; never enable in production
   dev_tokens: []                # Empty — no dev tokens in production
+  first_superadmin_email: ""   # Optional bootstrap email via FIRST_SUPERADMIN_EMAIL env var
+  share_link_hmac_key: ""      # REQUIRED via SHARE_LINK_HMAC_KEY env var in production
 
   # share_link_hmac_key → SHARE_LINK_HMAC_KEY env var (REQUIRED in production)
   # Generate: openssl rand -hex 32
@@ -88,7 +94,14 @@ auth:
     issuer: ""                                # Required: set OIDC_ISSUER in .env
     # client_id     → OIDC_CLIENT_ID
     # client_secret → OIDC_CLIENT_SECRET
-    # redirect_uris → OIDC_REDIRECT_URIS (set in compose: https://${DOMAIN}/sso)
+    redirect_uris: []                         # Required when OIDC is enabled; set via OIDC_REDIRECT_URIS
+    org_claim: ""                            # Optional custom org claim via OIDC_ORG_CLAIM
+    roles_claim: ""                          # Optional custom roles claim via OIDC_ROLES_CLAIM
+    default_org_id: ""                       # Optional fallback org UUID via OIDC_DEFAULT_ORG_ID
+    default_org_name: ""                     # Optional fallback org name via OIDC_DEFAULT_ORG_NAME
+    allowed_org_claims: ""                   # Optional allowlist via OIDC_ALLOWED_ORG_CLAIMS
+    platform_org_id: "00000000-0000-0000-0000-000000000000"
+    platform_org_claim_value: ""             # Optional claim value that maps to the platform org
     # jwt_signing_key → OIDC_JWT_SIGNING_KEY
 
     scopes:
@@ -101,6 +114,13 @@ auth:
     session_ttl: 24h             # Web browser sessions
     api_token_ttl: 4320h         # 180 days — desktop/mobile sync clients (Seafile/SeaDrive)
     refresh_token_ttl: 168h      # 7 days
+    allow_offline_token: false
+    groups_claim: ""                     # Optional group-membership claim via OIDC_GROUPS_CLAIM
+    departments_claim: ""                # Optional department-membership claim via OIDC_DEPARTMENTS_CLAIM
+    sync_groups_on_login: false
+    sync_departments_on_login: false
+    full_sync_groups: false
+    full_sync_departments: false
     require_pkce: true
     validate_audience: true
     allowed_clock_skew: 2m
@@ -145,6 +165,8 @@ organizations:
       settings:
         theme: default
         features: all
+      storage_config:
+        default_backend: ""          # Optional; defaults to storage.default_class when empty
 
 # =============================================================================
 # Seafile HTTP (sync protocol token TTL)
@@ -210,6 +232,17 @@ cors:
     - "*"
 
 # =============================================================================
+# Search Backend
+# Search defaults to Cassandra indexes; keep Elasticsearch disabled unless a real
+# cluster is provisioned and wired via env or structural config.
+# =============================================================================
+elasticsearch:
+  enabled: false
+  urls:
+    - "http://localhost:9200"
+  index: sesamefs-files
+
+# =============================================================================
 # Monitoring
 # =============================================================================
 monitoring:
@@ -225,6 +258,122 @@ fileview:
   max_video_bytes: 10737418240     # 10 GiB - videos
   max_text_bytes: 52428800         # 50 MB — text files
   max_iwork_preview_bytes: 52428800 # 50 MB — iWork previews
+  preview_extensions:
+    - pdf
+    - png
+    - jpg
+    - jpeg
+    - gif
+    - bmp
+    - webp
+    - svg
+    - ico
+    - tiff
+    - tif
+    - mp4
+    - webm
+    - ogg
+    - mov
+    - mp3
+    - wav
+    - flac
+    - aac
+    - txt
+    - md
+    - markdown
+    - json
+    - yaml
+    - yml
+    - xml
+    - csv
+    - html
+    - htm
+    - css
+    - js
+    - ts
+    - jsx
+    - tsx
+    - py
+    - go
+    - rs
+    - java
+    - c
+    - cpp
+    - h
+    - hpp
+    - sh
+    - bash
+    - zsh
+    - fish
+    - toml
+    - ini
+    - cfg
+    - conf
+    - env
+    - sql
+    - graphql
+    - proto
+    - dockerfile
+    - makefile
+    - rb
+    - php
+    - swift
+    - kt
+    - scala
+    - r
+    - lua
+    - pl
+    - log
+    - diff
+    - patch
+
+# =============================================================================
+# Enforcement Profiles
+# Feature flags and numeric product-policy limits are keyed by quota_policy.
+# Quota numbers themselves still come from organizations.* or Accounts.
+# =============================================================================
+enforcement_profiles:
+  hard:
+    features:
+      can_add_repo: true
+      can_share_repo: true
+      can_add_group: false
+      can_generate_share_link: true
+      can_generate_upload_link: true
+      can_send_share_link_mail: false
+      can_publish_repo: false
+      can_use_global_address_book: false
+      can_connect_with_desktop_clients: true
+      can_connect_with_android_clients: true
+      can_connect_with_ios_clients: true
+      can_export_files_via_mobile_client: true
+    limits:
+      max_libraries: 3
+      max_share_links: 3
+      max_upload_links: 1
+      share_link_expire_days_max: 3
+      upload_link_expire_days_max: 3
+
+  soft:
+    features:
+      can_add_repo: true
+      can_share_repo: true
+      can_add_group: true
+      can_generate_share_link: true
+      can_generate_upload_link: true
+      can_send_share_link_mail: true
+      can_publish_repo: true
+      can_use_global_address_book: true
+      can_connect_with_desktop_clients: true
+      can_connect_with_android_clients: true
+      can_connect_with_ios_clients: true
+      can_export_files_via_mobile_client: true
+    limits:
+      max_libraries: -1
+      max_share_links: -1
+      max_upload_links: -1
+      share_link_expire_days_max: 0
+      upload_link_expire_days_max: 0
 
 # =============================================================================
 # OnlyOffice Document Server
@@ -233,8 +382,8 @@ fileview:
 # =============================================================================
 onlyoffice:
   enabled: true                 # Overridden by ONLYOFFICE_ENABLED=true in compose
-  # jwt_secret   → ONLYOFFICE_JWT_SECRET
-  # api_js_url   → ONLYOFFICE_API_JS_URL (set in compose: https://${OFFICE_DOMAIN}/...)
+  jwt_secret: ""                # Set via ONLYOFFICE_JWT_SECRET env var
+  api_js_url: ""                # Set via ONLYOFFICE_API_JS_URL env var
 
   # Internal Docker network — OnlyOffice fetches files from sesamefs
   server_url: "http://sesamefs:8080"

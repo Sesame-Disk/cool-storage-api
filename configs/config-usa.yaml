@@ -1,6 +1,7 @@
 # SesameFS Configuration - USA Region Server
 #
-# This server defaults to USA storage and fails over to EU
+# Complete structural config for the USA multiregion test node.
+# Secrets and credentials must come from env vars.
 
 server:
   port: ":8080"
@@ -8,6 +9,8 @@ server:
   read_header_timeout: 10s
   write_timeout: 0s
   max_upload_mb: 10240
+  trusted_proxies: []
+  mobile_frontend_path: "./mobile-frontend/dist"
 
 database:
   hosts:
@@ -17,54 +20,45 @@ database:
   local_dc: datacenter1
 
 storage:
-  # USA server defaults to USA bucket
   default_class: hot-s3-usa
 
   classes:
-    # USA Region - Primary for this server
     hot-s3-usa:
       type: s3
       tier: hot
       endpoint: "http://minio:9000"
       bucket: sesamefs-usa
       region: us-east-1
-      access_key: minioadmin
-      secret_key: minioadmin
       use_path_style: true
-      failover_class: hot-s3-eu  # Failover to EU if USA fails
+      failover_class: hot-s3-eu
+      # credentials → provide via AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY env vars
 
-    # EU Region - Failover for USA
     hot-s3-eu:
       type: s3
       tier: hot
       endpoint: "http://minio:9000"
       bucket: sesamefs-eu
       region: eu-west-1
-      access_key: minioadmin
-      secret_key: minioadmin
       use_path_style: true
-      failover_class: hot-s3-usa  # Failover back to USA
+      failover_class: hot-s3-usa
+      # credentials → provide via AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY env vars
 
-    # Archive storage
     cold-glacier-usa:
       type: s3
       tier: cold
       endpoint: "http://minio:9000"
       bucket: sesamefs-archive
       region: us-east-1
-      access_key: minioadmin
-      secret_key: minioadmin
       use_path_style: true
+      # credentials → provide via AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY env vars
 
-  # Map hostnames to regions
   endpoint_regions:
     "us.sesamefs.local": "usa"
     "eu.sesamefs.local": "eu"
-    "sesamefs.local": "usa"    # Default to USA for this server
+    "sesamefs.local": "usa"
     "localhost": "usa"
-    "*": "usa"                  # Fallback to USA
+    "*": "usa"
 
-  # Map regions to storage classes
   region_classes:
     usa:
       hot: hot-s3-usa
@@ -73,36 +67,271 @@ storage:
       hot: hot-s3-eu
       cold: cold-glacier-usa
 
+billing:
+  url: ""
+
+accounts:
+  password_change_url: ""
+  delete_account_url: ""
+  org_user_management_url: ""
+  disable_org_user_writes: true
+
+organizations:
+  default_template: free
+  templates:
+    free:
+      plan: free
+      quota_policy: hard
+      billing_cycle: monthly
+      storage_quota: 2000000000
+      traffic_quota: 10000000000
+      traffic_upload_quota: -1
+      traffic_download_quota: -1
+      max_users: 1
+      chunking_polynomial: 17592186044415
+      settings:
+        theme: default
+        features: all
+      storage_config:
+        default_backend: hot-s3-usa
+
 auth:
   dev_mode: true
   dev_tokens:
     - token: "dev-token-123"
       user_id: "00000000-0000-0000-0000-000000000001"
       org_id: "00000000-0000-0000-0000-000000000001"
+  first_superadmin_email: ""
+  share_link_hmac_key: ""
   oidc:
+    enabled: false
     issuer: https://accounts.sesamedisk.com
     client_id: ""
     client_secret: ""
+    redirect_uris: []
     scopes:
       - openid
       - profile
       - email
+    org_claim: ""
+    roles_claim: ""
+    auto_provision: true
+    default_role: user
+    default_org_id: ""
+    default_org_name: ""
+    allowed_org_claims: ""
+    platform_org_id: "00000000-0000-0000-0000-000000000000"
+    platform_org_claim_value: ""
+    session_ttl: 24h
+    api_token_ttl: 4320h
+    refresh_token_ttl: 168h
+    jwt_signing_key: ""
+    allow_offline_token: false
+    groups_claim: ""
+    departments_claim: ""
+    sync_groups_on_login: false
+    sync_departments_on_login: false
+    full_sync_groups: false
+    full_sync_departments: false
+    require_pkce: true
+    validate_audience: true
+    allowed_clock_skew: 2m
 
 chunking:
   algorithm: fastcdc
-  min_size: 524288
-  avg_size: 2097152
-  max_size: 8388608
   hash_algorithm: sha256
+  adaptive:
+    enabled: true
+    absolute_min: 524288
+    absolute_max: 8388608
+    initial_size: 2097152
+    target_seconds: 8
+  probe:
+    size: 1048576
+    timeout: 30s
+  retry:
+    chunk_timeout: 60s
+    max_retries: 5
+    reduce_on_timeout: 0.5
+    reduce_on_failure: 0.5
+    backoff_base: 1s
+    backoff_max_jitter: 500ms
 
 versioning:
   default_ttl_days: 90
   min_ttl_days: 7
   gc_interval: 24h
 
-# File preview and streaming settings
+gc:
+  enabled: true
+  worker_interval: 30s
+  scan_interval: 24h
+  batch_size: 100
+  grace_period: 1h
+  dry_run: false
+  user_grace_days: 7
+  org_grace_days: 30
+  trash_retention_days: 30
+  audit_retention_days: 365
+
+seafhttp:
+  token_ttl: 24h
+
+cors:
+  allowed_origins:
+    - "*"
+
+elasticsearch:
+  enabled: false
+  urls:
+    - "http://elasticsearch:9200"
+  index: sesamefs-files
+
+monitoring:
+  metrics_enabled: true
+  metrics_path: /metrics
+  health_timeout: 3s
+
 fileview:
-  max_preview_bytes: 1073741824       # 1 GiB - General files
-  max_video_bytes: 10737418240        # 10 GiB - Videos (4K recordings, long videos)
-  max_text_bytes: 52428800            # 50 MB - Text files
-  max_iwork_preview_bytes: 52428800   # 50 MB - iWork previews
+  max_preview_bytes: 1073741824
+  max_video_bytes: 10737418240
+  max_text_bytes: 52428800
+  max_iwork_preview_bytes: 52428800
+  preview_extensions:
+    - pdf
+    - png
+    - jpg
+    - jpeg
+    - gif
+    - bmp
+    - webp
+    - svg
+    - ico
+    - tiff
+    - tif
+    - mp4
+    - webm
+    - ogg
+    - mov
+    - mp3
+    - wav
+    - flac
+    - aac
+    - txt
+    - md
+    - markdown
+    - json
+    - yaml
+    - yml
+    - xml
+    - csv
+    - html
+    - htm
+    - css
+    - js
+    - ts
+    - jsx
+    - tsx
+    - py
+    - go
+    - rs
+    - java
+    - c
+    - cpp
+    - h
+    - hpp
+    - sh
+    - bash
+    - zsh
+    - fish
+    - toml
+    - ini
+    - cfg
+    - conf
+    - env
+    - sql
+    - graphql
+    - proto
+    - dockerfile
+    - makefile
+    - rb
+    - php
+    - swift
+    - kt
+    - scala
+    - r
+    - lua
+    - pl
+    - log
+    - diff
+    - patch
+
+onlyoffice:
+  enabled: false
+  api_js_url: ""
+  jwt_secret: ""
+  verify_certificate: false
+  force_save: true
+  server_url: ""
+  internal_url: ""
+  view_extensions:
+    - doc
+    - docx
+    - ppt
+    - pptx
+    - xls
+    - xlsx
+    - odt
+    - fodt
+    - odp
+    - fodp
+    - ods
+    - fods
+    - pdf
+  edit_extensions:
+    - docx
+    - pptx
+    - xlsx
+
+enforcement_profiles:
+  hard:
+    features:
+      can_add_repo: true
+      can_share_repo: true
+      can_add_group: false
+      can_generate_share_link: true
+      can_generate_upload_link: true
+      can_send_share_link_mail: false
+      can_publish_repo: false
+      can_use_global_address_book: false
+      can_connect_with_desktop_clients: true
+      can_connect_with_android_clients: true
+      can_connect_with_ios_clients: true
+      can_export_files_via_mobile_client: true
+    limits:
+      max_libraries: 3
+      max_share_links: 3
+      max_upload_links: 1
+      share_link_expire_days_max: 3
+      upload_link_expire_days_max: 3
+
+  soft:
+    features:
+      can_add_repo: true
+      can_share_repo: true
+      can_add_group: true
+      can_generate_share_link: true
+      can_generate_upload_link: true
+      can_send_share_link_mail: true
+      can_publish_repo: true
+      can_use_global_address_book: true
+      can_connect_with_desktop_clients: true
+      can_connect_with_android_clients: true
+      can_connect_with_ios_clients: true
+      can_export_files_via_mobile_client: true
+    limits:
+      max_libraries: -1
+      max_share_links: -1
+      max_upload_links: -1
+      share_link_expire_days_max: 0
+      upload_link_expire_days_max: 0

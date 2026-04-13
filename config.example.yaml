@@ -13,6 +13,7 @@ server:
   write_timeout: 0s        # No write timeout — large downloads/zips can take minutes
   max_upload_mb: 10240     # 10240 MB (~10 GiB) max upload size
   trusted_proxies: []      # Secure default: trust no forwarded client IP headers; set exact reverse-proxy IP/CIDRs in prod
+  mobile_frontend_path: "./mobile-frontend/dist" # Built mobile frontend directory
 
 database:
   hosts:
@@ -67,9 +68,8 @@ storage:
       endpoint: "http://localhost:9000"
       bucket: sesamefs-blocks
       region: us-east-1
-      access_key: minioadmin
-      secret_key: minioadmin
       use_path_style: true            # Required for MinIO
+      # credentials → provide via AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY env vars
 
   # Map API hostnames to regions
   endpoint_regions:
@@ -102,11 +102,9 @@ storage:
   #     bucket: sesamefs-blocks-hot
 
 auth:
-  dev_mode: true                      # Set to false in production
-  dev_tokens:
-    - token: "dev-token-123"
-      user_id: "00000000-0000-0000-0000-000000000001"
-      org_id: "00000000-0000-0000-0000-000000000001"
+  dev_mode: false                     # Enable only for local development with explicit test tokens
+  dev_tokens: []                      # Define local-only dev tokens in a private config, not in shared examples
+  first_superadmin_email: ""         # Optional bootstrap email via FIRST_SUPERADMIN_EMAIL env var
 
   # HMAC key used to sign password-unlock cookies for password-protected share/upload links.
   # Allows the browser to remember the password for 24 hours without re-prompting.
@@ -115,15 +113,38 @@ auth:
   share_link_hmac_key: ""             # Set via SHARE_LINK_HMAC_KEY env var
 
   oidc:
+    enabled: false
     issuer: https://accounts.sesamedisk.com
     client_id: ""                     # Set via OIDC_CLIENT_ID env var
     client_secret: ""                 # Set via OIDC_CLIENT_SECRET env var
+    redirect_uris: []                  # Set via OIDC_REDIRECT_URIS env var
     scopes:
       - openid
       - profile
       - email
-    # session_ttl: 24h           # Web browser sessions (default: 24h)
-    # api_token_ttl: 4320h       # Desktop/mobile sync client tokens (default: 180 days)
+    org_claim: ""                     # Set via OIDC_ORG_CLAIM when org membership comes from a custom claim
+    roles_claim: ""                   # Set via OIDC_ROLES_CLAIM when roles come from a custom claim
+    auto_provision: true
+    default_role: user
+    default_org_id: ""                # Optional fallback org UUID via OIDC_DEFAULT_ORG_ID
+    default_org_name: ""              # Optional fallback org name via OIDC_DEFAULT_ORG_NAME
+    allowed_org_claims: ""            # Optional allowlist via OIDC_ALLOWED_ORG_CLAIMS
+    platform_org_id: "00000000-0000-0000-0000-000000000000"
+    platform_org_claim_value: ""      # Optional claim value that maps to the platform org
+    session_ttl: 24h
+    api_token_ttl: 4320h
+    refresh_token_ttl: 168h
+    jwt_signing_key: ""               # Set via OIDC_JWT_SIGNING_KEY env var
+    allow_offline_token: false
+    groups_claim: ""                  # Optional group-membership claim
+    departments_claim: ""             # Optional department-membership claim
+    sync_groups_on_login: false
+    sync_departments_on_login: false
+    full_sync_groups: false
+    full_sync_departments: false
+    require_pkce: true
+    validate_audience: true
+    allowed_clock_skew: 2m
 
 billing:
   # External billing portal URL. The frontend always links to /billing/ inside SesameFS;
@@ -207,6 +228,21 @@ gc:
   org_grace_days: 30                 # soft-deleted orgs purge after this many days
   trash_retention_days: 30
   audit_retention_days: 365
+
+cors:
+  allowed_origins:
+    - "*"                           # Tighten this in production if browser origins are known
+
+elasticsearch:
+  enabled: false                    # Search defaults to Cassandra indexes; enable only when wiring a real ES cluster
+  urls:
+    - "http://localhost:9200"
+  index: sesamefs-files
+
+monitoring:
+  metrics_enabled: true
+  metrics_path: /metrics
+  health_timeout: 3s
 
 # File preview and streaming settings
 # These limits protect against memory exhaustion and browser freezing
@@ -294,6 +330,7 @@ onlyoffice:
   # server_url: Public URL for OnlyOffice to fetch documents (required for remote OnlyOffice servers)
   # If not set, uses SERVER_URL env var or defaults to localhost
   # server_url: "https://files.sesamedisk.com"
+  internal_url: ""                     # Optional internal URL for SesameFS to reach OnlyOffice directly
   view_extensions:
     - doc
     - docx
@@ -312,6 +349,49 @@ onlyoffice:
     - docx
     - pptx
     - xlsx
+
+enforcement_profiles:
+  hard:
+    features:
+      can_add_repo: true
+      can_share_repo: true
+      can_add_group: false
+      can_generate_share_link: true
+      can_generate_upload_link: true
+      can_send_share_link_mail: false
+      can_publish_repo: false
+      can_use_global_address_book: false
+      can_connect_with_desktop_clients: true
+      can_connect_with_android_clients: true
+      can_connect_with_ios_clients: true
+      can_export_files_via_mobile_client: true
+    limits:
+      max_libraries: 3
+      max_share_links: 3
+      max_upload_links: 1
+      share_link_expire_days_max: 3
+      upload_link_expire_days_max: 3
+
+  soft:
+    features:
+      can_add_repo: true
+      can_share_repo: true
+      can_add_group: true
+      can_generate_share_link: true
+      can_generate_upload_link: true
+      can_send_share_link_mail: true
+      can_publish_repo: true
+      can_use_global_address_book: true
+      can_connect_with_desktop_clients: true
+      can_connect_with_android_clients: true
+      can_connect_with_ios_clients: true
+      can_export_files_via_mobile_client: true
+    limits:
+      max_libraries: -1
+      max_share_links: -1
+      max_upload_links: -1
+      share_link_expire_days_max: 0
+      upload_link_expire_days_max: 0
 
 # lifecycle:
 #   enabled: true

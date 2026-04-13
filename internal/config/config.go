@@ -856,6 +856,12 @@ func (c *Config) applyEnvOverrides() {
 	if v := os.Getenv("OIDC_DEFAULT_ORG_ID"); v != "" {
 		c.Auth.OIDC.DefaultOrgID = v
 	}
+	if v := os.Getenv("OIDC_DEFAULT_ORG_NAME"); v != "" {
+		c.Auth.OIDC.DefaultOrgName = v
+	}
+	if v := os.Getenv("OIDC_ALLOWED_ORG_CLAIMS"); v != "" {
+		c.Auth.OIDC.AllowedOrgClaims = v
+	}
 	if v := os.Getenv("OIDC_SESSION_TTL"); v != "" {
 		if d, err := time.ParseDuration(v); err == nil {
 			c.Auth.OIDC.SessionTTL = d
@@ -866,11 +872,27 @@ func (c *Config) applyEnvOverrides() {
 			c.Auth.OIDC.APITokenTTL = d
 		}
 	}
+	if v := os.Getenv("OIDC_REFRESH_TOKEN_TTL"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			c.Auth.OIDC.RefreshTokenTTL = d
+		}
+	}
 	if v := os.Getenv("OIDC_JWT_SIGNING_KEY"); v != "" {
 		c.Auth.OIDC.JWTSigningKey = v
 	}
+	if v := os.Getenv("OIDC_ALLOW_OFFLINE_TOKEN"); v != "" {
+		c.Auth.OIDC.AllowOfflineToken = v == "true" || v == "1"
+	}
 	if v := os.Getenv("OIDC_REQUIRE_PKCE"); v != "" {
 		c.Auth.OIDC.RequirePKCE = v == "true" || v == "1"
+	}
+	if v := os.Getenv("OIDC_VALIDATE_AUDIENCE"); v != "" {
+		c.Auth.OIDC.ValidateAudience = v == "true" || v == "1"
+	}
+	if v := os.Getenv("OIDC_ALLOWED_CLOCK_SKEW"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			c.Auth.OIDC.AllowedClockSkew = d
+		}
 	}
 	if v := os.Getenv("OIDC_PLATFORM_ORG_ID"); v != "" {
 		c.Auth.OIDC.PlatformOrgID = v

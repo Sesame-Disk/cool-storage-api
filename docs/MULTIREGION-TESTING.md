@@ -396,12 +396,14 @@ docker-compose -f docker-compose-multiregion.yaml down -v
 | `docker-compose-multiregion.yaml` | Multi-region stack definition |
 | `Dockerfile.test` | Test container image |
 | `configs/nginx-multiregion.conf` | Nginx load balancer config |
-| `configs/config-usa.yaml` | USA server configuration |
-| `configs/config-eu.yaml` | EU server configuration |
+| `configs/config-usa.yaml` | USA server structural configuration; credentials and other secrets still come from compose env vars |
+| `configs/config-eu.yaml` | EU server structural configuration; credentials and other secrets still come from compose env vars |
 | `scripts/bootstrap.sh` | Unified environment setup (dev/multiregion) |
 | `scripts/run-tests.sh` | Container-based test runner |
 | `scripts/test-multiregion.sh` | Multi-region test script |
 | `scripts/test-failover.sh` | Failover test script |
+
+The multiregion YAML files are intentionally complete under the current config schema. They still keep `auth.dev_tokens` because this stack is test-oriented, but S3/MinIO credentials and other secrets belong in compose env vars, not in the YAML files.
 
 ## Differences from Single-Server Setup
 

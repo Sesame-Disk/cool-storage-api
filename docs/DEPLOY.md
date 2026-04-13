@@ -453,9 +453,27 @@ Settings that **cannot** be set via env vars and must be in this file:
 | `OIDC_JWT_SIGNING_KEY` | `auth.oidc.jwt_signing_key` | Secret. When set, sessions are signed JWTs instead of opaque tokens. **NEVER change after deploy** — all active sessions are immediately invalidated. Revoked JWTs (logout/user deactivation) are verified against the DB so revocation is effective even in JWT mode. |
 | `OIDC_DEFAULT_ROLE` | `auth.oidc.default_role` | |
 | `OIDC_AUTO_PROVISION` | `auth.oidc.auto_provision` | |
+| `OIDC_DEFAULT_ORG_ID` | `auth.oidc.default_org_id` | Optional fallback org UUID when the IdP does not provide one. |
+| `OIDC_DEFAULT_ORG_NAME` | `auth.oidc.default_org_name` | Optional fallback org name for auto-provisioned org creation. |
+| `OIDC_ALLOWED_ORG_CLAIMS` | `auth.oidc.allowed_org_claims` | Optional comma-separated allowlist for tenant claim values. |
 | `OIDC_SESSION_TTL` | `auth.oidc.session_ttl` | Web browser sessions (default: 24h) |
 | `OIDC_API_TOKEN_TTL` | `auth.oidc.api_token_ttl` | Desktop/mobile client tokens (default: 180 days) |
+| `OIDC_REFRESH_TOKEN_TTL` | `auth.oidc.refresh_token_ttl` | Refresh-token lifetime (default: 7 days) |
+| `OIDC_ALLOW_OFFLINE_TOKEN` | `auth.oidc.allow_offline_token` | Enables offline/refresh-token behavior when supported by the IdP flow. |
+| `OIDC_VALIDATE_AUDIENCE` | `auth.oidc.validate_audience` | Defaults to `true`; keep enabled unless you have a specific interoperability reason. |
+| `OIDC_ALLOWED_CLOCK_SKEW` | `auth.oidc.allowed_clock_skew` | Token validation tolerance (default: `2m`). |
+| `OIDC_ORG_CLAIM` | `auth.oidc.org_claim` | Optional custom organization claim name. |
+| `OIDC_ROLES_CLAIM` | `auth.oidc.roles_claim` | Optional custom roles claim name. |
+| `OIDC_PLATFORM_ORG_ID` | `auth.oidc.platform_org_id` | Optional platform-org UUID override. |
+| `OIDC_PLATFORM_ORG_CLAIM_VALUE` | `auth.oidc.platform_org_claim_value` | Optional claim value that maps into the platform org. |
+| `OIDC_GROUPS_CLAIM` | `auth.oidc.groups_claim` | Optional claim containing group memberships. |
+| `OIDC_DEPARTMENTS_CLAIM` | `auth.oidc.departments_claim` | Optional claim containing department memberships. |
+| `OIDC_SYNC_GROUPS_ON_LOGIN` | `auth.oidc.sync_groups_on_login` | Sync group memberships at login. |
+| `OIDC_SYNC_DEPARTMENTS_ON_LOGIN` | `auth.oidc.sync_departments_on_login` | Sync department memberships at login. |
+| `OIDC_FULL_SYNC_GROUPS` | `auth.oidc.full_sync_groups` | Remove memberships absent from the claim instead of additive-only sync. |
+| `OIDC_FULL_SYNC_DEPARTMENTS` | `auth.oidc.full_sync_departments` | Remove department memberships absent from the claim instead of additive-only sync. |
 | `SERVER_REGION` | — (server metadata) | Region id: `usa`, `eu`, etc. Empty = single-region |
+| `SERVER_TRUSTED_PROXIES` | `server.trusted_proxies` | Comma-separated exact proxy IPs/CIDRs that are allowed to define client IP headers. |
 | `CASSANDRA_HOSTS` | `database.hosts` | Default: `cassandra:9042`. Multi-region: private IPs |
 | `CASSANDRA_KEYSPACE` | `database.keyspace` | |
 | `CASSANDRA_LOCAL_DC` | `database.local_dc` | |
@@ -466,6 +484,11 @@ Settings that **cannot** be set via env vars and must be in this file:
 | `S3_ENDPOINT` | `storage.backends.hot.endpoint` | Empty = real AWS |
 | `AWS_ACCESS_KEY_ID` | (AWS SDK) | Auto-picked by SDK |
 | `AWS_SECRET_ACCESS_KEY` | (AWS SDK) | Auto-picked by SDK |
+| `FIRST_SUPERADMIN_EMAIL` | `auth.first_superadmin_email` | Optional bootstrap email used only on the first successful seed. |
+| `ACCOUNTS_PASSWORD_CHANGE_URL` | `accounts.password_change_url` | External Accounts password-change URL. |
+| `ACCOUNTS_DELETE_ACCOUNT_URL` | `accounts.delete_account_url` | External Accounts account-deletion URL. |
+| `ACCOUNTS_ORG_USER_MANAGEMENT_URL` | `accounts.org_user_management_url` | Optional external Accounts org-member management base URL. |
+| `ACCOUNTS_DISABLE_ORG_USER_WRITES` | `accounts.disable_org_user_writes` | Defaults to `true`; keeps tenant org-admin user writes disabled. |
 | `SHARE_LINK_HMAC_KEY` | `auth.share_link_hmac_key` | **Required in prod** — signs password-unlock cookies for share/upload links. Generate with `openssl rand -hex 32`. sesamefs refuses to start without it. |
 | `ONLYOFFICE_ENABLED` | `onlyoffice.enabled` | |
 | `ONLYOFFICE_JWT_SECRET` | `onlyoffice.jwt_secret` | Secret |

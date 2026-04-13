@@ -159,7 +159,7 @@ storage:
 
 **`classes:` — multi-region (future prod / current dev)**
 
-Used in `config.docker.yaml` and `config.example.yaml`. Multiple named backends with per-class bucket/region hardcoded in YAML + `endpoint_regions` + `region_classes` for geo-routing. `initStorageManager` reads `cfg.Storage.Classes`.
+Used in `config.docker.yaml`, `config.example.yaml`, and the multiregion test configs under `configs/`. These files now carry the full structural topology in YAML (`bucket`, `region`, `endpoint`, `use_path_style`, `failover_class`, routing maps), while credentials still come from env vars. `initStorageManager` reads `cfg.Storage.Classes`.
 
 ```yaml
 storage:
