@@ -8,6 +8,7 @@ import (
 	v2 "github.com/Sesame-Disk/sesamefs/internal/api/v2"
 	"github.com/Sesame-Disk/sesamefs/internal/apikeys"
 	"github.com/Sesame-Disk/sesamefs/internal/health"
+	"github.com/Sesame-Disk/sesamefs/internal/middleware"
 	"github.com/Sesame-Disk/sesamefs/internal/traffic"
 	"github.com/gin-gonic/gin"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -32,16 +33,21 @@ func (s *Server) registerCoreRoutes() {
 	// Health check endpoints.
 	s.router.GET("/ping", s.handlePing)
 
+	var databaseChecker health.DatabaseChecker
+	if s.db != nil {
+		databaseChecker = s.db
+	}
 	var storageChecker health.StorageChecker
 	if s.storage != nil {
 		storageChecker = s.storage
 	}
-	healthChecker := health.NewChecker(s.db, storageChecker, s.config.Monitoring.HealthTimeout, s.version)
+	healthChecker := health.NewChecker(databaseChecker, storageChecker, s.config.Monitoring.HealthTimeout, s.version)
+	internalOnly := middleware.InternalOnly()
 	s.router.GET("/health", healthChecker.HandleLiveness)
-	s.router.GET("/ready", healthChecker.HandleReadiness)
+	s.router.GET("/ready", internalOnly, healthChecker.HandleReadiness)
 
 	if s.config.Monitoring.MetricsEnabled {
-		s.router.GET(s.config.Monitoring.MetricsPath, gin.WrapH(promhttp.Handler()))
+		s.router.GET(s.config.Monitoring.MetricsPath, internalOnly, gin.WrapH(promhttp.Handler()))
 	}
 
 	// Logout endpoint - clears token and redirects to home.

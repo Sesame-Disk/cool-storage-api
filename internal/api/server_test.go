@@ -11,7 +11,9 @@ import (
 
 	"github.com/Sesame-Disk/sesamefs/internal/config"
 	"github.com/Sesame-Disk/sesamefs/internal/health"
+	"github.com/Sesame-Disk/sesamefs/internal/middleware"
 	"github.com/gin-gonic/gin"
+	"golang.org/x/time/rate"
 )
 
 func init() {
@@ -98,6 +100,53 @@ func TestHandleHealth(t *testing.T) {
 	if response["status"] != "healthy" {
 		t.Errorf("status = %v, want healthy", response["status"])
 	}
+}
+
+func TestRegisterCoreRoutes_InternalOnlyReadyAndMetrics(t *testing.T) {
+	s := createTestServer()
+	s.authRateLimiter = middleware.NewRateLimiter(rate.Every(time.Minute), 1)
+	defer s.authRateLimiter.Stop()
+	s.registerCoreRoutes()
+
+	t.Run("external client cannot access ready", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/ready", nil)
+		req.RemoteAddr = "198.51.100.9:12345"
+		w := httptest.NewRecorder()
+		s.router.ServeHTTP(w, req)
+		if w.Code != http.StatusNotFound {
+			t.Fatalf("status = %d, want %d", w.Code, http.StatusNotFound)
+		}
+	})
+
+	t.Run("loopback can access ready", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/ready", nil)
+		req.RemoteAddr = "127.0.0.1:12345"
+		w := httptest.NewRecorder()
+		s.router.ServeHTTP(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want %d", w.Code, http.StatusOK)
+		}
+	})
+
+	t.Run("external client cannot access metrics", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, s.config.Monitoring.MetricsPath, nil)
+		req.RemoteAddr = "198.51.100.9:12345"
+		w := httptest.NewRecorder()
+		s.router.ServeHTTP(w, req)
+		if w.Code != http.StatusNotFound {
+			t.Fatalf("status = %d, want %d", w.Code, http.StatusNotFound)
+		}
+	})
+
+	t.Run("private client can access metrics", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, s.config.Monitoring.MetricsPath, nil)
+		req.RemoteAddr = "10.1.2.3:12345"
+		w := httptest.NewRecorder()
+		s.router.ServeHTTP(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want %d", w.Code, http.StatusOK)
+		}
+	})
 }
 
 // TestHandleServerInfo tests the server info endpoint

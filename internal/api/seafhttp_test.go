@@ -224,6 +224,45 @@ func TestResolveLibraryBlockStoreUsesDefaultStorageClass(t *testing.T) {
 	}
 }
 
+func TestZipTraversalBudgetRejectsDepthLimit(t *testing.T) {
+	budget := &zipTraversalBudget{maxEntries: 10, maxDepth: 1, maxBytes: 1024}
+	err := budget.noteDirectory(2)
+	if err == nil {
+		t.Fatal("expected depth limit error")
+	}
+	if !isZipLimitError(err) {
+		t.Fatalf("expected zip limit error, got %v", err)
+	}
+}
+
+func TestZipTraversalBudgetRejectsFileCountLimit(t *testing.T) {
+	budget := &zipTraversalBudget{maxEntries: 1, maxDepth: 10, maxBytes: 1024}
+	if err := budget.noteFile(100); err != nil {
+		t.Fatalf("first noteFile() error = %v", err)
+	}
+	err := budget.noteFile(100)
+	if err == nil {
+		t.Fatal("expected file count limit error")
+	}
+	if !isZipLimitError(err) {
+		t.Fatalf("expected zip limit error, got %v", err)
+	}
+}
+
+func TestZipTraversalBudgetRejectsByteLimit(t *testing.T) {
+	budget := &zipTraversalBudget{maxEntries: 10, maxDepth: 10, maxBytes: 100}
+	if err := budget.noteFile(60); err != nil {
+		t.Fatalf("first noteFile() error = %v", err)
+	}
+	err := budget.noteFile(50)
+	if err == nil {
+		t.Fatal("expected byte limit error")
+	}
+	if !isZipLimitError(err) {
+		t.Fatalf("expected zip limit error, got %v", err)
+	}
+}
+
 func TestResolveLibraryBlockStoreUsesHostnameFallback(t *testing.T) {
 	manager := storage.NewManager()
 	manager.SetDefaultClass("hot-minio-local")

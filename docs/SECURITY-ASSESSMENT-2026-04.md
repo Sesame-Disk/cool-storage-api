@@ -167,13 +167,13 @@ config applied. The scorecard:
 
 | Finding | Status on the live instance |
 |---|---|
-| **M-1** unauth `DELETE /api/v2.1/auth/session` → HTTP 200 | ✅ reproduced |
+| **M-1** unauth `DELETE /api/v2.1/auth/session` → HTTP 200 | ✅ reproduced historically; current code now returns `401` without a valid Authorization token |
 | **M-2** CORS: `Access-Control-Allow-Origin: *` + `Access-Control-Allow-Credentials: true` | ✅ reproduced |
 | **M-3** missing `CSP`, `X-Frame-Options`, `X-Content-Type-Options`, `Strict-Transport-Security`, `Referrer-Policy` | ✅ 5 / 5 missing |
 | **H-5** share-link token enumeration via `/api/v2.1/share-links/:token/dirents/` (non-existent → `404 {"error":"share link not found"}`, existent → `200` with dir listing) | ✅ oracle confirmed |
 | **H-7** `/api2/auth-token/` rate limit | ⚠️ 24 / 120 login attempts accepted in a single burst — tighter than initially reported but still loose for distributed stuffing |
-| **M-5** `/metrics` on the public listener | ❌ **blocked at the reverse proxy (HTTP 403)** on the probed deployment — see finding for why it still counts as a defense-in-depth concern |
-| **LOW** `/api/v2.1/bootstrap`, `/api2/server-info`, `/health`, `/ready`, `/api/v2.1/auth/oidc/config` reachable unauth | ✅ historical probe returned 200 for all; current code redacts the OIDC config response to `enabled` only |
+| **M-5** `/metrics` on the public listener | ❌ **blocked at the reverse proxy (HTTP 403)** on the probed deployment; current code also restricts the route to internal clients |
+| **LOW** `/api/v2.1/bootstrap`, `/api2/server-info`, `/health`, `/ready`, `/api/v2.1/auth/oidc/config` reachable unauth | ✅ historical probe returned 200 for all; current code redacts the OIDC config response to `enabled` only and restricts `/ready` to internal clients |
 | **H-1** golang-jwt memory DoS | ⏳ not demonstrated at safe default probe size; requires a larger payload on infrastructure you own to visibly trip |
 
 The remaining findings either need credentials, an IdP-issued token, or a
@@ -513,14 +513,14 @@ Prints how many of 120 serial login attempts were accepted vs rate-limited.
 
 ---
 
-#### H-8 Zip/archive bomb on directory download
+#### H-8 Zip/archive bomb on directory download (FIXED IN CODE AFTER ASSESSMENT)
 
-**File:** `internal/api/seafhttp.go:1884-1997` (`addDirToZip`, `addFileToZip`).
+**Files:** `internal/api/seafhttp.go`, `internal/api/seafhttp_test.go`.
 **Severity:** High.
 
-The "download directory as ZIP" path has no file-count cap, no depth cap, and no total-byte cap. A shared directory with a million files (or a constructed directory tree that cycles through aliases) will OOM the server. The streaming writer must have hard ceilings.
+The assessed issue was real at the time: the "download directory as ZIP" path had no file-count cap, no depth cap, and no total-byte cap. That path now enforces centralized traversal budgets before headers are written and again while streaming ZIP entries.
 
-**Fix:** enforce `MaxEntries`, `MaxDepth`, `MaxTotalBytes` in `addDirToZip`; wrap the writer with a counter that aborts on overrun; set a deadline on the request.
+Current code rejects oversized/deep trees with `413` instead of traversing them unbounded, and regression tests cover depth, entry-count, and total-byte limits.
 
 **Reproduce:** [`h8-zip-bomb.sh`](./exploit-scripts/h8-zip-bomb.sh)
 
@@ -552,14 +552,14 @@ Discovery and JWKS are fetched via the default `http.Client` with a 10-second ti
 
 ### MEDIUM
 
-#### M-1 Unauthenticated CSRF logout on `DELETE /api/v2.1/auth/session`
+#### M-1 Unauthenticated CSRF logout on `DELETE /api/v2.1/auth/session` (FIXED IN CODE AFTER ASSESSMENT)
 
-**File:** `internal/api/v2/auth.go:301-324`.
+**Files:** `internal/api/v2/auth.go`, `internal/api/v2/auth_test.go`.
 **Severity:** Medium (annoyance-grade CSRF, not an auth bypass — logging a victim out is not a privilege event).
 
-The handler clears the `sesamefs_auth` cookie without requiring the caller to present it. Any HTML form or `fetch` from a third-party origin that hits the URL logs the victim out. **Confirmed live** on a pre-production deployment: `curl -X DELETE` with no credentials returns `HTTP/2 200`. Combined with M-3 (no `X-Frame-Options: DENY`), the attacker page can also embed the login flow in an iframe and clickjack the re-login, chaining M-1 + M-3 into a credential-phishing primitive.
+The handler used to clear the `sesamefs_auth` cookie without requiring the caller to present valid session material. That behavior was confirmed live during the assessment. Current code now requires a valid Authorization token, validates the session before invalidation, and returns `401` for missing or invalid callers.
 
-**Fix:** require the session cookie and a valid CSRF token, or rely on strict `SameSite` cookies and verify the Origin/Referer header.
+This removes the unauthenticated logout primitive on this endpoint. The assessment evidence remains historically accurate for the version that was probed.
 
 **Reproduce:** [`m1-csrf-logout.sh`](./exploit-scripts/m1-csrf-logout.sh)
 
@@ -567,7 +567,7 @@ The handler clears the `sesamefs_auth` cookie without requiring the caller to pr
 ./docs/exploit-scripts/m1-csrf-logout.sh --host https://storage.example.com
 ```
 
-No credentials required. Exit 0 means `DELETE /api/v2.1/auth/session` returned 2xx without an authenticated caller.
+No credentials required. Exit 0 means `DELETE /api/v2.1/auth/session` returned 2xx without an authenticated caller on a vulnerable build.
 
 ---
 
@@ -648,13 +648,13 @@ Optional `--unknown EMAIL`; defaults to a random non-existent address. Exit 0 me
 
 ---
 
-#### M-5 `/metrics` exposed on the public listener (defense in depth)
+#### M-5 `/metrics` exposed on the public listener (FIXED IN CODE AFTER ASSESSMENT)
 
 **Live status:** on the pre-production deployment that was probed, `/metrics` returned `HTTP 403` from the reverse proxy — the upstream nginx layer correctly refuses external access. This is the right operational posture and it is working. ✅
 
-The finding is kept because sesamefs itself serves Prometheus metrics unauthenticated on its own port, and the histogram labels include the `path` label — effectively a real-time map of every distinct route accessed. The day an operator misconfigures the proxy, sets up a direct port-forward for debugging, runs sesamefs in an environment without a proxy, or changes ingress controllers, the leak is back. **Do not rely on the reverse proxy alone.**
+The finding was kept because sesamefs itself served Prometheus metrics unauthenticated on its own port, and the histogram labels included the `path` label. That is no longer true for current code: `/metrics` is now guarded by internal-only middleware in the Go app, so external clients receive `404` even before the proxy layer.
 
-**Fix:** bind `/metrics` to a separate local-only listener in the Go binary (e.g. `127.0.0.1:9090`), or require an internal-auth token on the metrics handler. Either makes the finding impossible regardless of upstream configuration.
+The nginx `403` remains useful as a second layer, but the app no longer relies on proxy configuration alone.
 
 **Reproduce:** [`m5-metrics-exposure.sh`](./exploit-scripts/m5-metrics-exposure.sh)
 
@@ -662,7 +662,7 @@ The finding is kept because sesamefs itself serves Prometheus metrics unauthenti
 ./docs/exploit-scripts/m5-metrics-exposure.sh --host https://storage.example.com
 ```
 
-Exit 0 means `/metrics` returned 200 with Prometheus exposition content unauthenticated on the public listener. Exit 1 (as observed on the probed pre-prod deployment) means the proxy layer is blocking it — the underlying code issue is still open.
+Exit 0 means `/metrics` returned 200 with Prometheus exposition content unauthenticated on the public listener. Exit 1 means external access is blocked; on current code this should now happen even without relying solely on the proxy layer.
 
 ---
 
@@ -730,7 +730,7 @@ None are direct RCE, but the ReDoS in client-side date parsing is reachable via 
 ### LOW / informational
 
 - **`/api/v2.1/bootstrap` and `/api2/server-info` leak version (`11.0.0`), brand, feature flags, role list, storage class names, inline-preview extension list** unauth. Expected for an SPA, but trim to only what the unauthenticated UI needs.
-- **`/health` and `/ready` expose per-component status** (database/storage). Minor recon aid — `/ready` returned a ~950-byte status blob on the pre-prod deployment, so expect the attacker to know your infra layout.
+- **`/health` and `/ready` expose per-component status** (database/storage) on historical builds. `/ready` returned a ~950-byte status blob on the pre-prod deployment that was probed; current code now restricts `/ready` to internal clients, while `/health` remains public.
 - **`/api/v2.1/auth/oidc/config` is reachable unauth.** Historical builds returned `issuer`, `client_id`, and scope list, which was useful input for a targeted phishing campaign. Current code now returns only the `enabled` flag for unauthenticated callers.
 - **`/api/v2.1/query-zip-progress` and `/api/v2.1/cancel-zip-task` return stub success unauth.** Not dangerous in isolation, but a sign the router mounts stubs on public prefixes; audit for drift.
 - **Nonce check in `oidc.go:478` is conditional** — only enforced if the server emitted a nonce. Make it mandatory.
@@ -889,7 +889,7 @@ The [preflight section at the top](#production-prerequisites--the-preflight-gate
 - **H-5** uniform 404 + rate limit on `/api/v2.1/share-links/:token/*`; confirm token entropy.
 - **H-6** constant-time share-link cookie compare.
 - **H-7** tighten auth-token rate limit, add upload/download throttles, enforce `max_upload_mb`.
-- **H-8** zip-bomb protections.
+- **H-8** zip-bomb protections landed; keep regression coverage around traversal budgets.
 - **L-1** land the two-line `validate_audience` fix **and** the regression unit test in `internal/auth/oidc_aud_test.go`. Cheap, permanent, protects against the most plausible regression.
 
 **Next:**
@@ -897,11 +897,11 @@ The [preflight section at the top](#production-prerequisites--the-preflight-gate
 - **M-3** security-headers middleware.
 - **M-2** explicit CORS allow-list.
 - **M-4** auth on avatar endpoint.
-- **M-5** bind `/metrics` to an internal-only listener (don't rely on upstream nginx alone).
+- **M-5** `/metrics` is now internal-only in the app; keep the proxy block as a second layer.
 - **M-6** OIDC state TTL + sweeper.
 - **M-7** distributed session revocation.
 - **H-9** DNS-rebinding defense.
-- **M-1** CSRF protection on `/auth/session` DELETE.
+- **M-1** strict auth on `/auth/session` DELETE is now in place; preserve it across client changes.
 - **M-10** frontend dep upgrades; plan React 17 → 18.
 
 **Planned:**

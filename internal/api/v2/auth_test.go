@@ -3,6 +3,7 @@ package v2
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -302,7 +303,7 @@ func TestGetSessionInfo(t *testing.T) {
 
 // TestLogout tests the logout endpoint
 func TestLogout(t *testing.T) {
-	t.Run("returns success even without token", func(t *testing.T) {
+	t.Run("rejects missing token", func(t *testing.T) {
 		router, _ := setupAuthTestRouter()
 
 		req := httptest.NewRequest("DELETE", "/api/v2.1/auth/session/", nil)
@@ -310,30 +311,44 @@ func TestLogout(t *testing.T) {
 
 		router.ServeHTTP(w, req)
 
-		// Logout should succeed even without a token (no-op)
-		if w.Code != http.StatusOK {
-			t.Errorf("Status code = %d, want %d", w.Code, http.StatusOK)
-		}
-
-		var response map[string]interface{}
-		json.Unmarshal(w.Body.Bytes(), &response)
-
-		if response["success"] != true {
-			t.Error("success should be true")
+		if w.Code != http.StatusUnauthorized {
+			t.Errorf("Status code = %d, want %d", w.Code, http.StatusUnauthorized)
 		}
 	})
 
-	t.Run("returns success with token", func(t *testing.T) {
-		router, _ := setupAuthTestRouter()
+	t.Run("returns success with valid token and invalidates session", func(t *testing.T) {
+		router, handler := setupAuthTestRouter()
+		session, err := handler.sessions.CreateSession("user-123", "org-123", "test@example.com", "user")
+		if err != nil {
+			t.Fatalf("CreateSession() error = %v", err)
+		}
 
 		req := httptest.NewRequest("DELETE", "/api/v2.1/auth/session/", nil)
-		req.Header.Set("Authorization", "Token some-session-token")
+		req.Header.Set("Authorization", "Token "+session.Token)
 		w := httptest.NewRecorder()
 
 		router.ServeHTTP(w, req)
 
 		if w.Code != http.StatusOK {
 			t.Errorf("Status code = %d, want %d", w.Code, http.StatusOK)
+		}
+
+		if _, err := handler.sessions.ValidateSession(session.Token); !errors.Is(err, auth.ErrSessionNotFound) {
+			t.Fatalf("ValidateSession() error = %v, want %v", err, auth.ErrSessionNotFound)
+		}
+	})
+
+	t.Run("rejects invalid token", func(t *testing.T) {
+		router, _ := setupAuthTestRouter()
+
+		req := httptest.NewRequest("DELETE", "/api/v2.1/auth/session/", nil)
+		req.Header.Set("Authorization", "Token invalid-session-token")
+		w := httptest.NewRecorder()
+
+		router.ServeHTTP(w, req)
+
+		if w.Code != http.StatusUnauthorized {
+			t.Errorf("Status code = %d, want %d", w.Code, http.StatusUnauthorized)
 		}
 	})
 }

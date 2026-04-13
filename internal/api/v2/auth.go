@@ -202,17 +202,21 @@ func (h *AuthHandler) GetOIDCConfig(c *gin.Context) {
 	})
 }
 
+func extractAuthorizationToken(authHeader string) string {
+	if strings.HasPrefix(authHeader, "Token ") {
+		return strings.TrimPrefix(authHeader, "Token ")
+	}
+	if strings.HasPrefix(authHeader, "Bearer ") {
+		return strings.TrimPrefix(authHeader, "Bearer ")
+	}
+	return ""
+}
+
 // GetSessionInfo returns information about the current session
 // GET /api/v2.1/auth/session
 func (h *AuthHandler) GetSessionInfo(c *gin.Context) {
 	// Get token from Authorization header
-	authHeader := c.GetHeader("Authorization")
-	var token string
-	if strings.HasPrefix(authHeader, "Token ") {
-		token = strings.TrimPrefix(authHeader, "Token ")
-	} else if strings.HasPrefix(authHeader, "Bearer ") {
-		token = strings.TrimPrefix(authHeader, "Bearer ")
-	}
+	token := extractAuthorizationToken(c.GetHeader("Authorization"))
 
 	if token == "" {
 		c.JSON(http.StatusUnauthorized, gin.H{
@@ -297,19 +301,28 @@ func (h *AuthHandler) GetOIDCLogoutURL(c *gin.Context) {
 // Logout invalidates the current session
 // DELETE /api/v2.1/auth/session
 func (h *AuthHandler) Logout(c *gin.Context) {
-	// Get token from Authorization header
-	authHeader := c.GetHeader("Authorization")
-	var token string
-	if strings.HasPrefix(authHeader, "Token ") {
-		token = strings.TrimPrefix(authHeader, "Token ")
-	} else if strings.HasPrefix(authHeader, "Bearer ") {
-		token = strings.TrimPrefix(authHeader, "Bearer ")
+	token := extractAuthorizationToken(c.GetHeader("Authorization"))
+	if token == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "No token provided"})
+		return
 	}
 
-	if token != "" {
-		if err := h.sessions.InvalidateSession(token); err != nil {
-			log.Printf("Failed to invalidate session: %v", err)
+	if _, err := h.sessions.ValidateSession(token); err != nil {
+		if !errors.Is(err, auth.ErrSessionExpired) &&
+			!errors.Is(err, auth.ErrSessionInvalid) &&
+			!errors.Is(err, auth.ErrSessionRevoked) &&
+			!errors.Is(err, auth.ErrSessionNotFound) {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Session validation unavailable"})
+			return
 		}
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid or expired session"})
+		return
+	}
+
+	if err := h.sessions.InvalidateSession(token); err != nil {
+		log.Printf("Failed to invalidate session: %v", err)
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Failed to invalidate session"})
+		return
 	}
 
 	// Clear the sesamefs_auth session cookie (match flags from login: path="/", httpOnly=false)

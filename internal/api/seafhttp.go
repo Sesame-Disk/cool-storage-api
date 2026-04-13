@@ -9,6 +9,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -467,6 +468,63 @@ type SeafHTTPHandler struct {
 	db             *db.DB
 	tokenStore     TokenStore
 	permMiddleware *middleware.PermissionMiddleware
+}
+
+const (
+	maxZipEntries = 100000
+	maxZipDepth   = 64
+	maxZipBytes   = 10 * 1024 * 1024 * 1024 // 10 GiB of uncompressed file content
+)
+
+type zipLimitError struct {
+	message string
+}
+
+func (e *zipLimitError) Error() string {
+	return e.message
+}
+
+func isZipLimitError(err error) bool {
+	var target *zipLimitError
+	return errors.As(err, &target)
+}
+
+type zipTraversalBudget struct {
+	maxEntries int
+	maxDepth   int
+	maxBytes   int64
+	entries    int
+	totalBytes int64
+}
+
+func newZipTraversalBudget() *zipTraversalBudget {
+	return &zipTraversalBudget{
+		maxEntries: maxZipEntries,
+		maxDepth:   maxZipDepth,
+		maxBytes:   maxZipBytes,
+	}
+}
+
+func (b *zipTraversalBudget) noteDirectory(depth int) error {
+	if depth > b.maxDepth {
+		return &zipLimitError{message: fmt.Sprintf("zip download exceeds maximum directory depth of %d", b.maxDepth)}
+	}
+	return nil
+}
+
+func (b *zipTraversalBudget) noteFile(size int64) error {
+	if b.entries+1 > b.maxEntries {
+		return &zipLimitError{message: fmt.Sprintf("zip download exceeds maximum file count of %d", b.maxEntries)}
+	}
+	if size < 0 {
+		size = 0
+	}
+	if b.totalBytes+size > b.maxBytes {
+		return &zipLimitError{message: fmt.Sprintf("zip download exceeds maximum total size of %d bytes", b.maxBytes)}
+	}
+	b.entries++
+	b.totalBytes += size
+	return nil
 }
 
 // NewSeafHTTPHandler creates a new SeafHTTP handler
@@ -1841,6 +1899,17 @@ func (h *SeafHTTPHandler) HandleZipDownload(c *gin.Context) {
 		}
 	}
 
+	preflightBudget := newZipTraversalBudget()
+	if err := h.validateZipDirectory(token.RepoID, targetFSID, 0, preflightBudget); err != nil {
+		if isZipLimitError(err) {
+			c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": err.Error()})
+			return
+		}
+		log.Printf("[HandleZipDownload] Failed to validate ZIP directory: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to prepare zip download"})
+		return
+	}
+
 	// Stream ZIP to response
 	zipFilename := dirName + ".zip"
 	c.Header("Content-Type", "application/zip")
@@ -1854,7 +1923,11 @@ func (h *SeafHTTPHandler) HandleZipDownload(c *gin.Context) {
 	bytesBefore := int64(c.Writer.Size())
 
 	// Recursively add directory contents to the ZIP
-	h.addDirToZip(c.Request.Context(), httputil.GetRoutingHostname(c), zipWriter, token.RepoID, token.OrgID, targetFSID, "", fileKey)
+	runtimeBudget := newZipTraversalBudget()
+	if err := h.addDirToZip(c.Request.Context(), httputil.GetRoutingHostname(c), zipWriter, token.RepoID, token.OrgID, targetFSID, "", fileKey, 0, runtimeBudget); err != nil {
+		log.Printf("[HandleZipDownload] ZIP stream aborted: %v", err)
+		return
+	}
 
 	// Record traffic for the bytes actually sent (zip overhead included is fine for billing granularity).
 	if rec := traffic.Get(); rec != nil {
@@ -1876,20 +1949,74 @@ func (h *SeafHTTPHandler) HandleZipDownload(c *gin.Context) {
 	}
 }
 
-// addDirToZip recursively adds directory contents to a ZIP archive
-func (h *SeafHTTPHandler) addDirToZip(ctx context.Context, hostname string, zw *zip.Writer, repoID, orgID, dirFSID, prefix string, fileKey []byte) {
+func (h *SeafHTTPHandler) validateZipDirectory(repoID, dirFSID string, depth int, budget *zipTraversalBudget) error {
+	if budget == nil {
+		return nil
+	}
+	if err := budget.noteDirectory(depth); err != nil {
+		return err
+	}
+
 	var dirEntriesJSON string
 	err := h.db.Session().Query(`
 		SELECT dir_entries FROM fs_objects WHERE library_id = ? AND fs_id = ?
 	`, repoID, dirFSID).Scan(&dirEntriesJSON)
 	if err != nil || dirEntriesJSON == "" || dirEntriesJSON == "[]" {
-		return
+		return err
 	}
 
 	var entries []map[string]interface{}
 	if err := json.Unmarshal([]byte(dirEntriesJSON), &entries); err != nil {
-		log.Printf("[addDirToZip] Failed to parse dir entries: %v", err)
-		return
+		return fmt.Errorf("parse dir entries: %w", err)
+	}
+
+	for _, entry := range entries {
+		id, _ := entry["id"].(string)
+		if id == "" {
+			continue
+		}
+		modeFloat, _ := entry["mode"].(float64)
+		mode := int(modeFloat)
+		if mode == 16384 || mode&0170000 == 040000 {
+			if err := h.validateZipDirectory(repoID, id, depth+1, budget); err != nil {
+				return err
+			}
+			continue
+		}
+
+		var fileSize int64
+		if err := h.db.Session().Query(`
+			SELECT size_bytes FROM fs_objects WHERE library_id = ? AND fs_id = ?
+		`, repoID, id).Scan(&fileSize); err != nil {
+			return fmt.Errorf("load zip file metadata: %w", err)
+		}
+		if err := budget.noteFile(fileSize); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// addDirToZip recursively adds directory contents to a ZIP archive
+func (h *SeafHTTPHandler) addDirToZip(ctx context.Context, hostname string, zw *zip.Writer, repoID, orgID, dirFSID, prefix string, fileKey []byte, depth int, budget *zipTraversalBudget) error {
+	if budget != nil {
+		if err := budget.noteDirectory(depth); err != nil {
+			return err
+		}
+	}
+
+	var dirEntriesJSON string
+	err := h.db.Session().Query(`
+		SELECT dir_entries FROM fs_objects WHERE library_id = ? AND fs_id = ?
+	`, repoID, dirFSID).Scan(&dirEntriesJSON)
+	if err != nil || dirEntriesJSON == "" || dirEntriesJSON == "[]" {
+		return err
+	}
+
+	var entries []map[string]interface{}
+	if err := json.Unmarshal([]byte(dirEntriesJSON), &entries); err != nil {
+		return fmt.Errorf("parse dir entries: %w", err)
 	}
 
 	for _, entry := range entries {
@@ -1908,26 +2035,36 @@ func (h *SeafHTTPHandler) addDirToZip(ctx context.Context, hostname string, zw *
 		mode := int(modeFloat)
 
 		if mode == 16384 || mode&0170000 == 040000 { // Directory
-			h.addDirToZip(ctx, hostname, zw, repoID, orgID, id, entryPath, fileKey)
+			if err := h.addDirToZip(ctx, hostname, zw, repoID, orgID, id, entryPath, fileKey, depth+1, budget); err != nil {
+				return err
+			}
 		} else { // File
-			h.addFileToZip(ctx, hostname, zw, repoID, orgID, id, entryPath, fileKey)
+			if err := h.addFileToZip(ctx, hostname, zw, repoID, orgID, id, entryPath, fileKey, budget); err != nil {
+				return err
+			}
 		}
 	}
+
+	return nil
 }
 
 // addFileToZip streams a file's blocks into a ZIP archive entry.
 // Uses zip.Store (no compression) for maximum throughput — the data is already
 // compressed by S3/MinIO or is binary data where deflate adds CPU cost for minimal gain.
 // For encrypted files, one block at a time is loaded, decrypted, and written.
-func (h *SeafHTTPHandler) addFileToZip(ctx context.Context, hostname string, zw *zip.Writer, repoID, orgID, fileFSID, zipPath string, fileKey []byte) {
+func (h *SeafHTTPHandler) addFileToZip(ctx context.Context, hostname string, zw *zip.Writer, repoID, orgID, fileFSID, zipPath string, fileKey []byte, budget *zipTraversalBudget) error {
 	var blockIDs []string
 	var fileSize int64
 	err := h.db.Session().Query(`
 		SELECT block_ids, size_bytes FROM fs_objects WHERE library_id = ? AND fs_id = ?
 	`, repoID, fileFSID).Scan(&blockIDs, &fileSize)
 	if err != nil {
-		log.Printf("[addFileToZip] Failed to get blocks for %s: %v", zipPath, err)
-		return
+		return fmt.Errorf("load blocks for %s: %w", zipPath, err)
+	}
+	if budget != nil {
+		if err := budget.noteFile(fileSize); err != nil {
+			return err
+		}
 	}
 
 	// Use Store (no compression) for maximum throughput.
@@ -1941,14 +2078,12 @@ func (h *SeafHTTPHandler) addFileToZip(ctx context.Context, hostname string, zw 
 	}
 	w, err := zw.CreateHeader(header)
 	if err != nil {
-		log.Printf("[addFileToZip] Failed to create zip entry %s: %v", zipPath, err)
-		return
+		return fmt.Errorf("create zip entry %s: %w", zipPath, err)
 	}
 
 	blockStore, _, err := h.resolveLibraryBlockStore(hostname, orgID, repoID)
 	if err != nil {
-		log.Printf("[addFileToZip] Block store not available: %v", err)
-		return
+		return fmt.Errorf("block store not available: %w", err)
 	}
 
 	// Batch resolve all block IDs upfront
@@ -1966,28 +2101,28 @@ func (h *SeafHTTPHandler) addFileToZip(ctx context.Context, hostname string, zw 
 			// Encrypted: load block, decrypt, write
 			blockData, err := blockStore.GetBlock(ctx, internalID)
 			if err != nil {
-				log.Printf("[addFileToZip] Failed to get block %s for %s: %v", blockIDs[i], zipPath, err)
-				return
+				return fmt.Errorf("get block %s for %s: %w", blockIDs[i], zipPath, err)
 			}
 			decrypted, err := crypto.DecryptBlock(blockData, fileKey)
 			if err != nil {
-				log.Printf("[addFileToZip] Failed to decrypt block for %s: %v", zipPath, err)
-				return
+				return fmt.Errorf("decrypt block for %s: %w", zipPath, err)
 			}
-			w.Write(decrypted)
+			if _, err := w.Write(decrypted); err != nil {
+				return fmt.Errorf("write decrypted block for %s: %w", zipPath, err)
+			}
 		} else {
 			// Unencrypted: stream directly from S3 → ZIP writer with 4MB buffer
 			reader, err := blockStore.GetBlockReader(ctx, internalID)
 			if err != nil {
-				log.Printf("[addFileToZip] Failed to get block reader %s for %s: %v", blockIDs[i], zipPath, err)
-				return
+				return fmt.Errorf("get block reader %s for %s: %w", blockIDs[i], zipPath, err)
 			}
 			_, err = io.CopyBuffer(w, reader, buf)
 			reader.Close()
 			if err != nil {
-				log.Printf("[addFileToZip] Failed to stream block %s for %s: %v", blockIDs[i], zipPath, err)
-				return
+				return fmt.Errorf("stream block %s for %s: %w", blockIDs[i], zipPath, err)
 			}
 		}
 	}
+
+	return nil
 }

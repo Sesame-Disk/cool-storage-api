@@ -59,14 +59,14 @@ reassessment identified **3 new findings** not covered in v1.
 | H-5 | Share-link enumeration oracle | High | **IMPROVED** | Missing/expired/disabled now collapse to opaque unavailable responses; public routes remain per-IP throttled, but valid tokens still return 200 |
 | H-6 | Share-link cookie `==` | High | **FIXED** | Now uses `subtle.ConstantTimeCompare` |
 | H-7 | Weak auth rate limit | High | **IMPROVED** | 10/120 get through locally (was 24/120 in v1) |
-| H-8 | Zip bomb / dir download DoS | High | **OPEN** | No file count, depth, or total byte limits |
+| H-8 | Zip bomb / dir download DoS | High | **FIXED** | ZIP directory downloads now enforce centralized entry, depth, and total-byte budgets before and during streaming |
 | H-9 | OIDC DNS rebinding | High | **OPEN** | No DNS pinning on discovery/JWKS fetch |
 | L-1 | OIDC `aud` not validated | Latent | **FIXED** | Full audience validation implemented with multi-aud support |
-| M-1 | CSRF logout | Medium | **OPEN** | Still returns 200 without auth on both targets |
+| M-1 | CSRF logout | Medium | **FIXED IN CODE** | `DELETE /api/v2.1/auth/session` now requires a valid Authorization token and rejects unauthenticated callers |
 | M-2 | CORS `*` + credentials | Medium | **OPEN** | `configs/config.prod.yaml` still ships `allowed_origins: ["*"]` |
 | M-3 | Missing security headers | Medium | **PARTIALLY FIXED** | 3/5 now set by app; CSP still missing; prod nginx adds X-Frame-Options |
 | M-4 | Avatar email enumeration | Medium | **NEEDS RETEST** | Requires known email |
-| M-5 | `/metrics` exposed | Medium | **MITIGATED (prod)** | Blocked by nginx (403); still exposed at app level |
+| M-5 | `/metrics` exposed | Medium | **FIXED IN CODE** | Route is now internal-only at the application layer; nginx blocking remains a secondary control |
 | M-6 | OIDC state flood | Medium | **FIXED** | State map now has TTL (10 min), cap (10k), and eviction |
 | M-7 | Session invalidation node-local | Medium | **OPEN** | No distributed revocation |
 | M-8 | PBKDF2 at 1000 iterations | Medium | **OPEN** | Compat mode still uses 1000 iterations (required for Seafile clients) |
@@ -78,7 +78,7 @@ reassessment identified **3 new findings** not covered in v1.
 | ID | Finding | Severity | Notes |
 |----|---------|----------|-------|
 | **V2-C1** | OnlyOffice callback completely unauthenticated | **Critical** | No JWT verification, no auth middleware. Confirmed on both local and prod |
-| **V2-L1** | `/ready` leaks component status | Low | Exposes database/storage health unauthenticated (local only; prod catches via nginx) |
+| **V2-L1** | `/ready` leaks component status | Low | **FIXED in code** | Route is now internal-only and returns 404 to external clients |
 | **V2-L2** | OIDC config leaks `client_id` and `issuer` | Low | **FIXED in code** | Public endpoint now returns only `enabled`; historical prod probe leaked `client_id: "622935"` |
 
 ---
@@ -92,12 +92,12 @@ All unauthenticated probes were run against both targets. Key differences:
 | **H-1** JWT DoS | No latency growth at 1000 dots | No latency growth at 1000 dots |
 | **H-5** Share-link enum | Historical probe confirmed confirmation oracle | Historical probe confirmed confirmation oracle; current code adds opaque unavailable responses for inactive links and keeps per-IP throttling |
 | **H-7** Auth rate limit | 10/120 got through (~8%) | 26/120 got through (~22%) |
-| **M-1** CSRF logout | HTTP 200 - reproduced | HTTP 200 - reproduced |
+| **M-1** CSRF logout | Historical probe reproduced; current code returns 401 without auth token | Historical probe reproduced; current code returns 401 without auth token |
 | **M-2** CORS wildcard | ACAO:* + ACAC:true (dev mode) | **ACAO:* + ACAC:true (PRODUCTION!)** |
 | **M-3** Security headers | 3/5 present (no CSP, no X-Frame-Options) | 5/7 present (nginx adds X-Frame-Options, X-Robots-Tag; CSP still missing) |
-| **M-5** Metrics | HTTP 200 - exposed | HTTP 403 - blocked by nginx |
+| **M-5** Metrics | Historical probe exposed; current code restricts route to internal clients | Historical probe blocked by nginx; current code also restricts route to internal clients |
 | **V2-C1** OnlyOffice unauth | HTTP 200 - **reproduced** | HTTP 200 - **reproduced** |
-| **V2-L1** /ready info leak | JSON with db/storage status | Caught by nginx (returns frontend HTML) |
+| **V2-L1** /ready info leak | Historical local behavior leaked status JSON; current code returns 404 to external clients | Historical prod path was caught by nginx; current code also restricts route to internal clients |
 | **V2-L2** OIDC config leak | `enabled: false` (dev mode) | Historical probe leaked client_id/issuer/scopes; current code now returns only `enabled` |
 | **Info disclosure** | All info endpoints return 200 | All info endpoints return 200 |
 
@@ -240,19 +240,31 @@ Still loose for distributed credential stuffing. No per-account throttling.
 
 ---
 
-#### H-8 Zip bomb / directory download DoS (STILL OPEN)
+#### H-8 Zip bomb / directory download DoS (FIXED IN CODE)
 
-**File:** `internal/api/seafhttp.go:1885-1916`
-`addDirToZip` still recurses without file count cap, depth cap, or total byte cap.
+**Files:** `internal/api/seafhttp.go`, `internal/api/seafhttp_test.go`
+Directory ZIP downloads now run through a centralized traversal budget that enforces:
+- maximum entry count
+- maximum directory depth
+- maximum total uncompressed bytes
+
+The handler validates the tree before headers are committed and re-checks the same budget while
+streaming, so oversized trees fail with `413` instead of consuming unbounded memory/CPU.
 
 ---
 
 ### MEDIUM
 
-#### M-1 CSRF logout (STILL OPEN)
+#### M-1 CSRF logout (FIXED IN CODE AFTER ASSESSMENT)
 
-Confirmed on both local and production: `DELETE /api/v2.1/auth/session` returns 200 without
-any authentication.
+**Files:** `internal/api/v2/auth.go`, `internal/api/v2/auth_test.go`
+The vulnerable behavior was the unauthenticated success path: `DELETE /api/v2.1/auth/session`
+returned `200` even when the caller presented no session material. The handler now requires a
+valid Authorization token, validates the session before invalidation, and returns `401` for
+missing or invalid callers.
+
+This closes the browser-driven logout primitive described in the assessment because third-party
+sites cannot trigger a successful logout without the victim's bearer token.
 
 ---
 
@@ -283,9 +295,13 @@ This results in `ACAO: *` with `ACAC: true` on **production**. Confirmed live.
 
 ---
 
-#### M-5 Metrics — MITIGATED in production
+#### M-5 Metrics — FIXED IN CODE AFTER ASSESSMENT
 
-Blocked by nginx (403) on production. Still exposed unauthenticated at the application level.
+**Files:** `internal/api/server_routes.go`, `internal/api/server_test.go`, `internal/middleware/internal_only.go`
+`/metrics` is now guarded by internal-only middleware in the Go application itself. External
+clients receive `404`, while loopback/private addresses continue to work for local scraping.
+
+The old nginx `403` remains useful as an outer layer, but it is no longer the only barrier.
 
 ---
 
@@ -301,11 +317,11 @@ State map now has:
 
 ### LOW / INFORMATIONAL
 
-#### V2-L1 /ready leaks component status (NEW)
+#### V2-L1 /ready leaks component status (FIXED IN CODE AFTER ASSESSMENT)
 
-**Local:** Returns `{"checks":{"database":"ok","storage":"ok"},"status":"ready"}` unauthenticated.
-**Production:** Caught by nginx (returns frontend HTML). Not directly exploitable in prod,
-but the app-level endpoint is still exposed.
+**Files:** `internal/api/server_routes.go`, `internal/api/server_test.go`, `internal/middleware/internal_only.go`
+`/ready` is now protected by the same internal-only middleware as `/metrics`. External clients
+receive `404`, so database/storage component health is no longer exposed on the public surface.
 
 ---
 
@@ -430,14 +446,14 @@ all database traffic.
 
 5. **H-5:** Further reduce the remaining share-link confirmation signal if product requirements allow it
 6. **H-7:** Tighter auth rate limit + per-account throttling
-7. **H-8:** Add file count/depth/size limits to zip download
+7. **H-8:** Monitor the new ZIP traversal budgets for regressions and tune limits only if real workloads require it
 8. **V2-L2:** Monitor for regressions; unauthenticated OIDC config no longer exposes IdP details
-9. **M-5:** Bind `/metrics` to internal-only listener
+9. **M-5:** Internal-only guard is now in code; keep the proxy block as a second layer and watch for route regressions
 10. **S3 SSE:** Add `ServerSideEncryption` to Put operations
 
 ### Nice to have
 
-11. **M-1:** CSRF protection on session DELETE
+11. **M-1:** Strict auth requirement is now in place on session DELETE; preserve this contract in future clients
 12. **M-7:** Distributed session revocation
 13. **M-8:** Raise PBKDF2 iterations or deprecate compat mode
 14. **Permissions-Policy** header
