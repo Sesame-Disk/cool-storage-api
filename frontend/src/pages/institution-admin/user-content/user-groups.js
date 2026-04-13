@@ -1,5 +1,6 @@
 import { useParams } from '@gatsbyjs/reach-router';
 import React, { useEffect, useState } from 'react';
+import { normalizeEmailRouteParam } from '../../../utils/email-route';
 import { gettext } from '../../../utils/constants';
 import Loading from '../../../components/loading';
 import EmptyTip from '../../../components/empty-tip';
@@ -13,7 +14,7 @@ export default function UsersGroups() {
   const params = useParams();
 
   useEffect(() => {
-    instAdminAPI.listInstitutionUserGroups(decodeURIComponent(params.email)).then(res => {
+    instAdminAPI.listInstitutionUserGroups(normalizeEmailRouteParam(params.email)).then(res => {
       const { groups_list } = res.data;
       setGroups(groups_list);
       setIsLoading(false);

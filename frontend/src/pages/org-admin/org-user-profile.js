@@ -3,6 +3,7 @@ import PropTypes from 'prop-types';
 import { seafileAPI } from '../../utils/seafile-api';
 import { accountsOrgUserManagementURL, gettext, orgID, orgName } from '../../utils/constants';
 import { ACCOUNTS_ORG_USER_ACTIONS, ACCOUNTS_ORG_USER_VIEWS, buildAccountsOrgUserManagementURL } from '../../utils/accounts-org-user-management';
+import { normalizeEmailRouteParam } from '../../utils/email-route';
 import { Utils } from '../../utils/utils';
 import Loading from '../../components/loading';
 import OrgAdminUserNav from '../../components/org-admin-user-nav';
@@ -26,7 +27,7 @@ class OrgUserProfile extends Component {
   }
 
   componentDidMount() {
-    const email = this.props.email;
+    const email = normalizeEmailRouteParam(this.props.email);
     seafileAPI.orgAdminGetOrgUserInfo(orgID, email).then((res) => {
       this.setState(Object.assign({
         loading: false
@@ -67,7 +68,7 @@ class OrgUserProfile extends Component {
   };
 
   render() {
-    const email = this.props.email;
+    const email = normalizeEmailRouteParam(this.props.email);
     const manageInAccountsURL = buildAccountsOrgUserManagementURL(this.state.accountsOrgManagementURL, {
       view: ACCOUNTS_ORG_USER_VIEWS.USER,
       action: ACCOUNTS_ORG_USER_ACTIONS.MANAGE_USER,
@@ -83,7 +84,7 @@ class OrgUserProfile extends Component {
         ) : null} />
         <div className="main-panel-center flex-row">
           <div className="cur-view-container">
-            <OrgAdminUserNav email={this.props.email} currentItem='profile' manageInAccountsURL={manageInAccountsURL} />
+            <OrgAdminUserNav email={email} currentItem='profile' manageInAccountsURL={manageInAccountsURL} />
             <div className="cur-view-content">
               <Content
                 data={this.state}

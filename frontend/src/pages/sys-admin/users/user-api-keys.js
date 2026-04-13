@@ -3,6 +3,7 @@ import PropTypes from 'prop-types';
 import { Button, FormGroup, Input, Label, Modal, ModalBody, ModalFooter, ModalHeader } from 'reactstrap';
 import moment from 'moment';
 import copy from 'copy-to-clipboard';
+import { normalizeEmailRouteParam } from '../../../utils/email-route';
 import { gettext } from '../../../utils/constants';
 import { Utils } from '../../../utils/utils';
 import { seafileAPI } from '../../../utils/seafile-api';
@@ -37,7 +38,7 @@ class UserAPIKeys extends Component {
     }
 
     componentDidMount() {
-        const email = decodeURIComponent(this.props.email);
+        const email = normalizeEmailRouteParam(this.props.email);
         seafileAPI.sysAdminGetUser(email).then((res) => {
             const userInfo = res.data;
             if (!userInfo.is_platform_org) {
@@ -114,7 +115,7 @@ class UserAPIKeys extends Component {
     };
 
     createAPIKey = () => {
-        const email = decodeURIComponent(this.props.email);
+        const email = normalizeEmailRouteParam(this.props.email);
         const { label, scope, expiration } = this.state.createForm;
         const expiresInDays = expiration === 'never' ? null : parseInt(expiration, 10);
 
@@ -143,7 +144,7 @@ class UserAPIKeys extends Component {
     };
 
     revokeAPIKey = () => {
-        const email = decodeURIComponent(this.props.email);
+        const email = normalizeEmailRouteParam(this.props.email);
         const keyToRevoke = this.state.keyToRevoke;
         if (!keyToRevoke) {
             return;
@@ -299,7 +300,7 @@ class UserAPIKeys extends Component {
                 <MainPanelTopbar {...this.props} />
                 <div className="main-panel-center flex-row">
                     <div className="cur-view-container">
-                        <Nav currentItem="api-keys" email={this.props.email} userName={this.state.userInfo.name || this.state.userInfo.email || decodeURIComponent(this.props.email)} />
+                        <Nav currentItem="api-keys" email={this.props.email} userName={this.state.userInfo.name || this.state.userInfo.email || normalizeEmailRouteParam(this.props.email)} />
                         <div className="cur-view-content">
                             {this.state.errorMsg ? <p className="error text-center mt-4">{this.state.errorMsg}</p> : this.renderContent()}
                         </div>

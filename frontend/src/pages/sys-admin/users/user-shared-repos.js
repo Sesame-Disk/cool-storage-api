@@ -2,6 +2,7 @@ import React, { Component, Fragment } from 'react';
 import PropTypes from 'prop-types';
 import { Link } from '@gatsbyjs/reach-router';
 import moment from 'moment';
+import { normalizeEmailRouteParam } from '../../../utils/email-route';
 import { Utils } from '../../../utils/utils';
 import { seafileAPI } from '../../../utils/seafile-api';
 import { isPro, siteRoot, gettext } from '../../../utils/constants';
@@ -125,7 +126,7 @@ class Repos extends Component {
   }
 
   componentDidMount() {
-    const email = decodeURIComponent(this.props.email);
+    const email = normalizeEmailRouteParam(this.props.email);
     seafileAPI.sysAdminGetUser(email).then((res) => {
       this.setState({
         userInfo: res.data

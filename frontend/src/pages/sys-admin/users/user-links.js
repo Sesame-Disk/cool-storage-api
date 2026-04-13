@@ -1,5 +1,6 @@
 import React, { Component, Fragment } from 'react';
 import PropTypes from 'prop-types';
+import { normalizeEmailRouteParam } from '../../../utils/email-route';
 import { Utils } from '../../../utils/utils';
 import { seafileAPI } from '../../../utils/seafile-api';
 import { gettext } from '../../../utils/constants';
@@ -39,7 +40,7 @@ class Links extends Component {
   }
 
   componentDidMount() {
-    const email = decodeURIComponent(this.props.email);
+    const email = normalizeEmailRouteParam(this.props.email);
     seafileAPI.sysAdminGetUser(email).then((res) => {
       this.setState({
         userInfo: res.data
@@ -55,7 +56,7 @@ class Links extends Component {
   };
 
   listShareLinks = (page) => {
-    const email = decodeURIComponent(this.props.email);
+    const email = normalizeEmailRouteParam(this.props.email);
     const { sharePerPage, shareSortBy, shareSortOrder, shareActiveFilter, shareExpiredFilter } = this.state;
     const activeParam = shareActiveFilter === 'all' ? 'all' : (shareActiveFilter === 'active');
     const expiredParam = shareExpiredFilter === 'all' ? 'all' : (shareExpiredFilter === 'expired');
@@ -77,7 +78,7 @@ class Links extends Component {
   };
 
   listUploadLinks = (page) => {
-    const email = decodeURIComponent(this.props.email);
+    const email = normalizeEmailRouteParam(this.props.email);
     const { uploadPerPage, uploadSortBy, uploadSortOrder, uploadActiveFilter, uploadExpiredFilter } = this.state;
     const activeParam = uploadActiveFilter === 'all' ? 'all' : (uploadActiveFilter === 'active');
     const expiredParam = uploadExpiredFilter === 'all' ? 'all' : (uploadExpiredFilter === 'expired');

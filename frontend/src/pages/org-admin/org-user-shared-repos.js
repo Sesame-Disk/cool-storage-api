@@ -1,6 +1,7 @@
 import React, { Component, Fragment } from 'react';
 import PropTypes from 'prop-types';
 import moment from 'moment';
+import { normalizeEmailRouteParam } from '../../utils/email-route';
 import { seafileAPI } from '../../utils/seafile-api';
 import { gettext, orgID } from '../../utils/constants';
 import { Utils } from '../../utils/utils';
@@ -21,7 +22,7 @@ class OrgUserSharedRepos extends Component {
   }
 
   componentDidMount() {
-    const email = this.props.email;
+    const email = normalizeEmailRouteParam(this.props.email);
     seafileAPI.orgAdminGetOrgUserBesharedRepos(orgID, email).then((res) => {
       this.setState(Object.assign({
         loading: false
@@ -35,12 +36,13 @@ class OrgUserSharedRepos extends Component {
   }
 
   render() {
+    const email = normalizeEmailRouteParam(this.props.email);
     return (
       <Fragment>
         <MainPanelTopbar />
         <div className="main-panel-center flex-row">
           <div className="cur-view-container">
-            <OrgAdminUserNav email={this.props.email} currentItem='shared-repos' />
+            <OrgAdminUserNav email={email} currentItem='shared-repos' />
             <div className="cur-view-content">
               <Content
                 data={this.state}

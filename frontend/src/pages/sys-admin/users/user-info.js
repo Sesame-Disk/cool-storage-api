@@ -1,6 +1,7 @@
 import React, { Component, Fragment } from 'react';
 import PropTypes from 'prop-types';
 import { FormGroup, Label, Input, Button } from 'reactstrap';
+import { normalizeEmailRouteParam } from '../../../utils/email-route';
 import { Utils } from '../../../utils/utils';
 import { seafileAPI } from '../../../utils/seafile-api';
 import { gettext, isPro } from '../../../utils/constants';
@@ -284,7 +285,7 @@ class User extends Component {
 
   componentDidMount() {
     // avatar size: 160
-    const email = decodeURIComponent(this.props.email);
+    const email = normalizeEmailRouteParam(this.props.email);
     seafileAPI.sysAdminGetUser(email, 160).then((res) => {
       this.setState({
         loading: false,

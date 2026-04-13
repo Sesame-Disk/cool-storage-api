@@ -1,6 +1,7 @@
 import React from 'react';
 import PropTypes from 'prop-types';
 import { Link } from '@gatsbyjs/reach-router';
+import { normalizeEmailRouteParam } from '../../../utils/email-route';
 import { siteRoot, gettext } from '../../../utils/constants';
 
 const propTypes = {
@@ -25,6 +26,7 @@ class Nav extends React.Component {
 
   render() {
     const { currentItem, email, userName } = this.props;
+    const normalizedEmail = normalizeEmailRouteParam(email);
     return (
       <div>
         <div className="cur-view-path">
@@ -34,7 +36,7 @@ class Nav extends React.Component {
           {this.navItems.map((item, index) => {
             return (
               <li className="nav-item mr-2" key={index}>
-                <Link to={`${siteRoot}sys/users/${encodeURIComponent(email)}/${item.urlPart}`} className={`nav-link ${currentItem === item.name ? ' active' : ''}`}>{item.text}</Link>
+                <Link to={`${siteRoot}sys/users/${encodeURIComponent(normalizedEmail)}/${item.urlPart}`} className={`nav-link ${currentItem === item.name ? ' active' : ''}`}>{item.text}</Link>
               </li>
             );
           })}

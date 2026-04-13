@@ -1,5 +1,6 @@
 import { useParams } from '@gatsbyjs/reach-router';
 import React, { useEffect, useState } from 'react';
+import { normalizeEmailRouteParam } from '../../../utils/email-route';
 import { gettext } from '../../../utils/constants';
 import Loading from '../../../components/loading';
 import EmptyTip from '../../../components/empty-tip';
@@ -13,7 +14,7 @@ export default function UserRepos() {
   const params = useParams();
 
   useEffect(() => {
-    instAdminAPI.listInstitutionUserRepos(decodeURIComponent(params.email)).then(res => {
+    instAdminAPI.listInstitutionUserRepos(normalizeEmailRouteParam(params.email)).then(res => {
       const { repo_list } = res.data;
       setRepos(repo_list);
       setIsLoading(false);

@@ -1,6 +1,7 @@
 import React from 'react';
 import PropTypes from 'prop-types';
 import { Link } from '@gatsbyjs/reach-router';
+import { normalizeEmailRouteParam } from '../utils/email-route';
 import { siteRoot, gettext } from '../utils/constants';
 
 const propTypes = {
@@ -13,7 +14,7 @@ class OrgAdminUserNav extends React.Component {
 
   render() {
     const { email, currentItem, manageInAccountsURL } = this.props;
-    const urlBase = `${siteRoot}org/useradmin/info/${encodeURIComponent(email)}/`;
+    const urlBase = `${siteRoot}org/useradmin/info/${encodeURIComponent(normalizeEmailRouteParam(email))}/`;
     return (
       <div className="cur-view-path org-admin-user-nav">
         <ul className="nav">

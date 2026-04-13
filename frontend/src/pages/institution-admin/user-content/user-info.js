@@ -1,5 +1,6 @@
 import { useParams } from '@gatsbyjs/reach-router';
 import React, { useCallback, useEffect, useState } from 'react';
+import { normalizeEmailRouteParam } from '../../../utils/email-route';
 import { Utils } from '../../../utils/utils';
 import { gettext } from '../../../utils/constants';
 import Loading from '../../../components/loading';
@@ -14,7 +15,7 @@ export default function UserInfo() {
   const params = useParams();
 
   useEffect(() => {
-    instAdminAPI.getInstitutionUserInfo(decodeURIComponent(params.email)).then(res => {
+    instAdminAPI.getInstitutionUserInfo(normalizeEmailRouteParam(params.email)).then(res => {
       const user = res.data;
       setUser(user);
       setIsLoading(false);
