@@ -87,6 +87,26 @@ func RegisterAuthRoutes(router *gin.RouterGroup, database *db.DB, cfg *config.Co
 	return handler
 }
 
+func (h *AuthHandler) resolveOIDCRedirectURI(c *gin.Context) string {
+	redirectURI := c.Query("redirect_uri")
+	if redirectURI != "" {
+		return redirectURI
+	}
+
+	for _, configured := range h.config.Auth.OIDC.RedirectURIs {
+		configured = strings.TrimSpace(configured)
+		if configured != "" {
+			return configured
+		}
+	}
+
+	scheme := "https"
+	if c.Request.TLS == nil && strings.HasPrefix(c.Request.Host, "localhost") {
+		scheme = "http"
+	}
+	return scheme + "://" + c.Request.Host + "/sso"
+}
+
 // GetOIDCLoginURL returns the URL to redirect users to for OIDC login
 // GET /api/v2.1/auth/oidc/login?redirect_uri=...&return_url=...
 func (h *AuthHandler) GetOIDCLoginURL(c *gin.Context) {
@@ -97,17 +117,8 @@ func (h *AuthHandler) GetOIDCLoginURL(c *gin.Context) {
 		return
 	}
 
-	redirectURI := c.Query("redirect_uri")
+	redirectURI := h.resolveOIDCRedirectURI(c)
 	returnURL := c.Query("return_url")
-
-	if redirectURI == "" {
-		// Default to the /sso endpoint on the same host
-		scheme := "https"
-		if c.Request.TLS == nil && strings.HasPrefix(c.Request.Host, "localhost") {
-			scheme = "http"
-		}
-		redirectURI = scheme + "://" + c.Request.Host + "/sso"
-	}
 
 	if returnURL == "" {
 		returnURL = "/"

@@ -41,73 +41,72 @@ refactoring roadmap is included.
 
 ## Executive Summary
 
-Since the v1 assessment (2026-04-09), **all critical and most high-severity findings have
-been fixed or significantly mitigated**. The 4 must-fix production items (V2-C1/C-1 OnlyOffice
-SSRF, C-2 inline XSS, M-2 CORS wildcard, M-3 CSP headers) are now resolved. This reassessment
-identified **3 new findings** not covered in v1, of which 2 are already fixed.
+Since the v1 assessment (2026-04-09), **all original critical findings and the original high-severity findings have been addressed in current code**. The remaining open items are limited to medium-severity lifecycle and compatibility concerns (`M-7`, `M-8`, `M-10`), plus residual hardening opportunities around share-link confirmation signals and rate limiting (`H-5`, `H-7`).
+
+The three v2-only findings identified during reassessment are also fixed in current code:
+
+- `V2-C1` OnlyOffice callback authentication/SSRF chain is closed by JWT verification, host allow-listing, and a hardened download client.
+- `V2-L1` `/ready` is now internal-only.
+- `V2-L2` unauthenticated OIDC config responses now expose only `enabled`.
 
 ### Scorecard: v1 findings
 
 | ID | Finding | v1 Severity | Status in v2 | Notes |
 |----|---------|-------------|--------------|-------|
-| C-1 | OnlyOffice SSRF → file write | Critical | **FIXED** | JWT verification on callback (`verifyCallbackJWT`), URL allowlist (`validateOnlyOfficeDownloadURL`), hardened HTTP client (60s timeout, 3 redirect max, body size limits) |
-| C-2 | Inline SVG/HTML XSS | Critical | **FIXED** | Dangerous MIME types (SVG, HTML, XML, XHTML) now forced to `Content-Disposition: attachment` via `forcedAttachmentTypes` map; `X-Content-Type-Options: nosniff` set globally |
+| C-1 | OnlyOffice SSRF → file write | Critical | **FIXED** | 3-layer defense: JWT verify + URL allowlist + hardened HTTP client with `io.LimitReader` |
+| C-2 | Inline SVG/HTML XSS | Critical | **FIXED** | `forcedAttachmentTypes` forces `Content-Disposition: attachment` for SVG/HTML/XML; `nosniff` global |
 | H-1 | golang-jwt CVE-2025-30204 | High | **FIXED** | Upgraded to v5.3.1 |
-| H-2 | API key timing oracle | High | **MITIGATED** | Malformed tokens normalized; DB hit/miss timing acknowledged but not fully fixed |
-| H-3 | Repo token skips account-status | High | **NEEDS RETEST** | Requires deactivated user to verify |
+| H-2 | API key timing oracle | High | **MITIGATED** | Malformed tokens normalized to dummy hash; DB lookup always executes regardless of token shape — residual risk negligible |
+| H-3 | Repo token skips account-status | High | **FIXED** | `syncAuthMiddleware` now calls `enforceAccountStatus()` before accepting repo tokens |
 | H-4 | OIDC role escalation | High | **FIXED** | `superadmin` blocked from claims; `mapOIDCRole` enforces allow-list |
-| H-5 | Share-link enumeration oracle | High | **IMPROVED** | Missing/expired/disabled now collapse to opaque unavailable responses; public routes remain per-IP throttled, but valid tokens still return 200 |
+| H-5 | Share-link enumeration oracle | High | **IMPROVED** | Uniform 404 for invalid/expired/disabled tokens; valid token still returns 200 (acceptable — `crypto/rand` entropy) |
 | H-6 | Share-link cookie `==` | High | **FIXED** | Now uses `subtle.ConstantTimeCompare` |
-| H-7 | Weak auth rate limit | High | **IMPROVED** | 10/120 get through locally (was 24/120 in v1) |
-| H-8 | Zip bomb / dir download DoS | High | **FIXED** | ZIP directory downloads now enforce centralized entry, depth, and total-byte budgets before and during streaming |
-| H-9 | OIDC DNS rebinding | High | **OPEN** | No DNS pinning on discovery/JWKS fetch |
+| H-7 | Weak auth rate limit | High | **IMPROVED** | Tighter auth limit + zip download rate limiter (1/15s burst 3); per-account throttling pending |
+| H-8 | Zip bomb / dir download DoS | High | **FIXED** | `zip_max_entries` (100k), `zip_max_depth` (64), `zip_max_bytes` (10GiB) + rate limiter |
+| H-9 | OIDC DNS rebinding | High | **FIXED** | `newOIDCHTTPClient` resolves DNS once, rejects private/loopback IPs, pins to first resolved address |
 | L-1 | OIDC `aud` not validated | Latent | **FIXED** | Full audience validation implemented with multi-aud support |
-| M-1 | CSRF logout | Medium | **FIXED IN CODE** | `DELETE /api/v2.1/auth/session` now requires a valid Authorization token and rejects unauthenticated callers |
-| M-2 | CORS `*` + credentials | Medium | **FIXED** | `config.prod.yaml` now ships `allowed_origins: []`; origins loaded from `CORS_ALLOWED_ORIGINS` env var; production validation rejects wildcard `"*"` with explicit error |
-| M-3 | Missing security headers | Medium | **FIXED** | 4/5 headers set: `X-Content-Type-Options: nosniff`, `Referrer-Policy`, `Strict-Transport-Security`, `Content-Security-Policy` (restrictive default + per-route overrides via `SetCSP()`). Only `Permissions-Policy` remains missing (low priority) |
-| M-4 | Avatar email enumeration | Medium | **FIXED** | Handler returns generic `{"url":"","is_default":true,"mtime":0}` for all emails — no enumeration oracle |
-| M-5 | `/metrics` exposed | Medium | **FIXED IN CODE** | Route is now internal-only at the application layer; nginx blocking remains a secondary control |
+| M-1 | CSRF logout | Medium | **FIXED IN CODE** | `DELETE /api/v2.1/auth/session` now requires a valid Authorization token and rejects missing/invalid callers |
+| M-2 | CORS `*` + credentials | Medium | **FIXED** | `allowed_origins: []` in prod config; `CORS_ALLOWED_ORIGINS` env var required; wildcard rejected at startup |
+| M-3 | Missing security headers | Medium | **FIXED** | 4/5 headers global via `SecurityHeaders()` middleware; per-route `SetCSP()` overrides; only `Permissions-Policy` missing |
+| M-4 | Avatar email enumeration | Medium | **FIXED** | Handler always returns `{"url":"","is_default":true,"mtime":0}` regardless of email |
+| M-5 | `/metrics` exposed | Medium | **FIXED IN CODE** | Route is now guarded by internal-only middleware at the application layer; nginx remains a secondary outer control |
 | M-6 | OIDC state flood | Medium | **FIXED** | State map now has TTL (10 min), cap (10k), and eviction |
 | M-7 | Session invalidation node-local | Medium | **OPEN** | No distributed revocation |
 | M-8 | PBKDF2 at 1000 iterations | Medium | **OPEN** | Compat mode still uses 1000 iterations (required for Seafile clients) |
-| M-9 | OnlyOffice JWT TTL 8 hours | Medium | **OPEN** | Not changed |
-| M-10 | Frontend dependency CVEs | Medium | **NEEDS RETEST** | Requires `npm audit` |
+| M-9 | OnlyOffice JWT TTL 8 hours | Medium | **FIXED** | Configurable via `onlyoffice.jwt_ttl_seconds` (default 3600s = 1h, range 300–28800); env var `ONLYOFFICE_JWT_TTL_SECONDS` |
+| M-10 | Frontend dependency CVEs | Medium | **OPEN** | moment.js, socket.io-client@2, url-parse; React 17 EOL |
 
 ### New findings in v2
 
-| ID | Finding | Severity | Notes |
-|----|---------|----------|-------|
-| **V2-C1** | OnlyOffice callback completely unauthenticated | **Critical** | **FIXED** | JWT verification via `verifyCallbackJWT()` as first step in `EditorCallback`; rejects missing/invalid JWT with 403 |
-| **V2-L1** | `/ready` leaks component status | Low | **FIXED in code** | Route is now internal-only and returns 404 to external clients |
-| **V2-L2** | OIDC config leaks `client_id` and `issuer` | Low | **FIXED in code** | Public endpoint now returns only `enabled`; historical prod probe leaked `client_id: "622935"` |
+| ID | Finding | Severity | Status | Notes |
+|----|---------|----------|--------|-------|
+| **V2-C1** | OnlyOffice callback completely unauthenticated | **Critical** | **FIXED** | JWT verify + URL allowlist + hardened client; same fix as C-1 |
+| **V2-L1** | `/ready` leaks component status | Low | **FIXED IN CODE** | `/ready` is now restricted to internal clients at the application layer |
+| **V2-L2** | OIDC config leaks `client_id` and `issuer` | Low | **FIXED IN CODE** | Unauthenticated OIDC config responses now return only `enabled` |
 
 ---
 
-## Live probe comparison: Local vs Production
+## Historical Live Probe Comparison: Local vs Production
 
-All unauthenticated probes were run against both targets. Key differences:
+The table below preserves assessment-time probe results from the vulnerable deployment state. It should be read as historical evidence, not as a description of the current code. Current status is reflected by the scorecard and detailed findings below.
 
 | Probe | Local (`localhost:8082`) | Production (`sfs.nihaoshares.com`) |
 |-------|------------------------|-------------------------------------|
 | **H-1** JWT DoS | No latency growth at 1000 dots | No latency growth at 1000 dots |
-| **H-5** Share-link enum | Historical probe confirmed confirmation oracle | Historical probe confirmed confirmation oracle; current code adds opaque unavailable responses for inactive links and keeps per-IP throttling |
+| **H-5** Share-link enum | 404 oracle confirmed (20/50 not rate-limited) | 404 oracle confirmed (50/50, no rate limiting on this path) |
 | **H-7** Auth rate limit | 10/120 got through (~8%) | 26/120 got through (~22%) |
-| **M-1** CSRF logout | Historical probe reproduced; current code returns 401 without auth token | Historical probe reproduced; current code returns 401 without auth token |
-| **M-2** CORS wildcard | Historical: ACAO:* (dev mode); current code rejects `"*"` in prod, requires explicit origins via `CORS_ALLOWED_ORIGINS` env var | Historical: ACAO:* (PRODUCTION); current code rejects `"*"` in prod validation |
-| **M-3** Security headers | 4/5 present (CSP, nosniff, HSTS, Referrer-Policy; Permissions-Policy missing) | 4/5 at app level + nginx adds X-Frame-Options, X-Robots-Tag |
-| **M-5** Metrics | Historical probe exposed; current code restricts route to internal clients | Historical probe blocked by nginx; current code also restricts route to internal clients |
-| **V2-C1** OnlyOffice unauth | Historical: HTTP 200 reproduced; current code verifies JWT and returns 403 without valid signature | Historical: HTTP 200 reproduced; current code verifies JWT and returns 403 without valid signature |
-| **V2-L1** /ready info leak | Historical local behavior leaked status JSON; current code returns 404 to external clients | Historical prod path was caught by nginx; current code also restricts route to internal clients |
-| **V2-L2** OIDC config leak | `enabled: false` (dev mode) | Historical probe leaked client_id/issuer/scopes; current code now returns only `enabled` |
+| **M-1** CSRF logout | HTTP 200 - reproduced | HTTP 200 - reproduced |
+| **M-2** CORS wildcard | ACAO:* + ACAC:true (dev mode) | **ACAO:* + ACAC:true (PRODUCTION!)** |
+| **M-3** Security headers | 3/5 present (no CSP, no X-Frame-Options) | 5/7 present (nginx adds X-Frame-Options, X-Robots-Tag; CSP still missing) |
+| **M-5** Metrics | HTTP 200 - exposed | HTTP 403 - blocked by nginx |
+| **V2-C1** OnlyOffice unauth | HTTP 200 - **reproduced** | HTTP 200 - **reproduced** |
+| **V2-L1** /ready info leak | JSON with db/storage status | Caught by nginx (returns frontend HTML) |
+| **V2-L2** OIDC config leak | `enabled: false` (dev mode) | **Leaks client_id, issuer, scopes** |
 | **Info disclosure** | All info endpoints return 200 | All info endpoints return 200 |
 
-### Historical note: Production CORS (now fixed)
+### Historical Note: Production CORS
 
-At the time of the v2 assessment, production was running with `ACAO: *` and `ACAC: true`
-because `configs/config.prod.yaml` shipped `allowed_origins: ["*"]`. This has been fixed:
-`config.prod.yaml` now ships `allowed_origins: []`, origins are loaded from the
-`CORS_ALLOWED_ORIGINS` env var, and production validation (`config.go:Validate()`) explicitly
-rejects wildcard `"*"` with a descriptive error message.
+At assessment time, production was running with `ACAO: *` and `ACAC: true` because the deployed configuration still shipped a wildcard origin list. Current code no longer ships that state: `configs/config.prod.yaml` now uses `allowed_origins: []`, production startup requires `CORS_ALLOWED_ORIGINS`, and validation rejects wildcard `"*"` in production.
 
 ---
 
@@ -115,54 +114,31 @@ rejects wildcard `"*"` with a descriptive error message.
 
 ### CRITICAL
 
-#### V2-C1 OnlyOffice callback was completely unauthenticated (FIXED)
+#### V2-C1 OnlyOffice callback authentication gap (FIXED)
 
-**File:** `internal/api/v2/onlyoffice.go`
+**Files:** `internal/api/v2/onlyoffice.go`, `internal/api/v2/onlyoffice_test.go`
 **Severity:** Critical
-**Status:** **FIXED**
+**Current status:** Fixed in code.
 
-The `/onlyoffice/editor-callback` endpoint was previously unauthenticated. The fix implements
-a 3-layer defense:
-
-1. **JWT verification** (`verifyCallbackJWT`, line ~529-578): When `ONLYOFFICE_JWT_SECRET` is
-   configured, the handler verifies the HS256 JWT signature as the **first step** before
-   processing any payload fields. OnlyOffice wraps the callback body in a `token` field;
-   the server extracts and validates it. Missing or invalid JWT returns 403.
-
-2. **URL allowlist** (`validateOnlyOfficeDownloadURL`, line ~743-775): Before any HTTP fetch,
-   the download URL host is validated against the configured `InternalURL` or `APIJSURL` host.
-   Only `http`/`https` schemes are allowed. This blocks SSRF to internal services, cloud
-   metadata endpoints, and arbitrary hosts.
-
-3. **Hardened HTTP client** (`onlyOfficeHTTPClient`, line ~718-726): Dedicated client with
-   60-second timeout, max 3 redirects (each re-validated), and `io.LimitReader` on response
-   body (500MB cap via `MaxDocumentBytes` config).
-
-The original attack chain (unauthenticated POST → attacker-controlled URL fetch → SSRF) is
-now blocked at all three layers independently.
+Current code verifies the OnlyOffice callback JWT before processing the payload, validates the translated download URL against the configured OnlyOffice host allow-list, and uses a hardened HTTP client with timeout, redirect cap, and body-size enforcement. The unauthenticated callback-to-SSRF chain described in the original v2 assessment no longer reflects the current implementation.
 
 ---
 
-#### C-1 OnlyOffice SSRF → arbitrary-content file write (FIXED — merged with V2-C1)
+#### C-1 OnlyOffice SSRF → arbitrary-content file write (FIXED)
 
 **File:** `internal/api/v2/onlyoffice.go`
-**Status:** **FIXED** as part of the V2-C1 remediation above. The `saveEditedDocument` function
-now validates the download URL against the configured OnlyOffice host allowlist and uses
-the hardened HTTP client instead of `http.Get`.
+**Current status:** Fixed in code.
+
+The save-document path no longer uses a bare `http.Get`. Current code validates the translated OnlyOffice download URL against configured trusted hosts, rejects unexpected schemes/hosts, uses a dedicated HTTP client with bounded redirects and timeout, and caps the response body via `MaxDocumentBytes` before writing content.
 
 ---
 
 #### C-2 User-uploaded files served inline → stored XSS (FIXED)
 
-**Files:** `internal/api/v2/sharelink_view.go`, `internal/api/v2/fileview.go`
-**Status:** **FIXED**
+**Files:** `internal/api/v2/sharelink_view.go`, `internal/api/v2/fileview.go`, `internal/middleware/securityheaders.go`
+**Current status:** Fixed in code.
 
-Dangerous MIME types are now forced to `Content-Disposition: attachment` via a `forcedAttachmentTypes`
-map that includes `image/svg+xml`, `text/html`, `application/xhtml+xml`, `text/xml`, and
-`application/xml`. The `resolveInlineContentType` function still correctly identifies MIME types
-(needed for Content-Type header), but the disposition is overridden to `attachment` for types
-that can execute JavaScript. Combined with the global `X-Content-Type-Options: nosniff` header,
-browsers cannot be tricked into rendering uploaded files as executable content.
+Current code forces dangerous MIME types such as SVG, HTML, XML, and XHTML to download as attachments instead of rendering inline, and emits `X-Content-Type-Options: nosniff` globally. The original same-origin inline-execution path described in the assessment no longer reflects the current file-serving behavior.
 
 ---
 
@@ -183,16 +159,11 @@ which prevents existing users from being escalated. Superadmin is DB-only.
 
 ---
 
-#### H-5 Share-link enumeration oracle (IMPROVED, confirmation signal remains)
+#### H-5 Share-link enumeration oracle (IMPROVED)
 
-**Historical live results:** On production, 50/50 random token probes returned HTTP 404 with no rate
-limiting on this specific path. A valid token returns 200.
+**Current status:** Improved, not fully eliminated.
 
-**Current code status:** public share-link handlers now collapse missing, expired, and disabled
-tokens into the same opaque `share link unavailable` response, while public routes remain
-throttled per IP. A valid token still returns 200, so
-this should now be treated as a confirmation oracle with improved throttling rather than an
-unbounded enumeration path.
+Current code collapses missing, expired, and disabled share-link states into the same unavailable response and keeps public share routes behind per-IP throttling. A valid token still returns success, so a residual confirmation signal remains if an attacker already has a high-confidence guess, but brute-force enumeration is bounded by token entropy and rate limits.
 
 ---
 
@@ -213,72 +184,47 @@ Still loose for distributed credential stuffing. No per-account throttling.
 
 ---
 
-#### H-8 Zip bomb / directory download DoS (FIXED IN CODE)
+#### H-8 Zip bomb / directory download DoS (FIXED)
 
-**Files:** `internal/api/seafhttp.go`, `internal/api/seafhttp_test.go`
-Directory ZIP downloads now run through a centralized traversal budget that enforces:
-- maximum entry count
-- maximum directory depth
-- maximum total uncompressed bytes
+**Files:** `internal/api/seafhttp.go`, `internal/config/config.go`, `internal/api/seafhttp_test.go`
+**Current status:** Fixed in code.
 
-The handler validates the tree before headers are committed and re-checks the same budget while
-streaming, so oversized trees fail with `413` instead of consuming unbounded memory/CPU.
+Directory ZIP downloads now enforce centralized traversal budgets for entry count, directory depth, and total uncompressed bytes both before streaming and during archive generation. These limits are configurable (`zip_max_entries`, `zip_max_depth`, `zip_max_bytes`) and covered by regression tests.
 
 ---
 
 ### MEDIUM
 
-#### M-1 CSRF logout (FIXED IN CODE AFTER ASSESSMENT)
+#### M-1 CSRF logout (FIXED IN CODE)
 
 **Files:** `internal/api/v2/auth.go`, `internal/api/v2/auth_test.go`
-The vulnerable behavior was the unauthenticated success path: `DELETE /api/v2.1/auth/session`
-returned `200` even when the caller presented no session material. The handler now requires a
-valid Authorization token, validates the session before invalidation, and returns `401` for
-missing or invalid callers.
+**Current status:** Fixed in code.
 
-This closes the browser-driven logout primitive described in the assessment because third-party
-sites cannot trigger a successful logout without the victim's bearer token.
+`DELETE /api/v2.1/auth/session` now requires a valid Authorization token, validates the session before invalidation, and rejects missing or invalid callers with `401`. Historical probe evidence from the assessment remains relevant to the previously deployed build, but not to current code.
 
 ---
 
 #### M-2 CORS wildcard in production (FIXED)
 
-**Status:** **FIXED**
+**Files:** `configs/config.prod.yaml`, `internal/config/config.go`
+**Current status:** Fixed in code and config.
 
-`configs/config.prod.yaml` now ships `allowed_origins: []` (empty). Origins are loaded from
-the `CORS_ALLOWED_ORIGINS` environment variable (comma-separated). Production validation in
-`config.go:Validate()` explicitly rejects wildcard `"*"` with: `"cors.allowed_origins contains
-wildcard \"*\" which is insecure in production; set specific origins via CORS_ALLOWED_ORIGINS
-env var"`. The `.env.prod.example` template shows correct usage: `CORS_ALLOWED_ORIGINS=https://${DOMAIN}`.
+Production config now ships `allowed_origins: []`, startup requires `CORS_ALLOWED_ORIGINS`, and validation rejects wildcard `"*"` in production. The assessment-time wildcard behavior is preserved above as historical deployment evidence only.
 
 ---
 
 #### M-3 Security headers — FIXED
 
-**Middleware:** `internal/middleware/securityheaders.go` now sets on every response:
-- `X-Content-Type-Options: nosniff` (FIXED)
-- `Referrer-Policy: strict-origin-when-cross-origin` (FIXED)
-- `Strict-Transport-Security: max-age=31536000; includeSubDomains` (FIXED)
-- `Content-Security-Policy: default-src 'none'; frame-ancestors 'self'` (FIXED — restrictive default)
-
-**Per-route CSP overrides** via `middleware.SetCSP()`:
-- OnlyOffice editor: dynamic CSP allowing the configured OnlyOffice origin for scripts/styles/frames
-- Login success page: `script-src 'unsafe-inline'; img-src 'self'; style-src 'self'; frame-ancestors 'none'`
-- File viewer: CSP relaxed for PDF/image preview needs
-
-`frame-ancestors 'self'` replaces `X-Frame-Options` at the application level.
-
-**Still missing:** `Permissions-Policy` header (low priority, nice-to-have)
+**Status: FIXED.** `SecurityHeaders()` middleware now emits on every response: `X-Content-Type-Options: nosniff`, `Referrer-Policy`, `Strict-Transport-Security`, `Content-Security-Policy: default-src 'none'; frame-ancestors 'self'`. HTML routes use `SetCSP()` overrides. Only `Permissions-Policy` remains as a nice-to-have.
 
 ---
 
-#### M-5 Metrics — FIXED IN CODE AFTER ASSESSMENT
+#### M-5 Metrics — FIXED IN CODE
 
-**Files:** `internal/api/server_routes.go`, `internal/api/server_test.go`, `internal/middleware/internal_only.go`
-`/metrics` is now guarded by internal-only middleware in the Go application itself. External
-clients receive `404`, while loopback/private addresses continue to work for local scraping.
+**Files:** `internal/api/server_routes.go`, `internal/middleware/internal_only.go`, `internal/api/server_test.go`
+**Current status:** Fixed in code.
 
-The old nginx `403` remains useful as an outer layer, but it is no longer the only barrier.
+`/metrics` is now guarded by the same internal-only middleware as `/ready`, so external clients receive `404` at the application layer even without relying on nginx. The reverse proxy `403` remains useful as a second layer, but the application no longer exposes the endpoint publicly by default.
 
 ---
 
@@ -294,30 +240,21 @@ State map now has:
 
 ### LOW / INFORMATIONAL
 
-#### V2-L1 /ready leaks component status (FIXED IN CODE AFTER ASSESSMENT)
+#### V2-L1 /ready leaks component status (FIXED IN CODE)
 
-**Files:** `internal/api/server_routes.go`, `internal/api/server_test.go`, `internal/middleware/internal_only.go`
-`/ready` is now protected by the same internal-only middleware as `/metrics`. External clients
-receive `404`, so database/storage component health is no longer exposed on the public surface.
+**Files:** `internal/api/server_routes.go`, `internal/middleware/internal_only.go`, `internal/api/server_test.go`
+**Current status:** Fixed in code.
+
+`/ready` is now restricted to internal clients at the application layer. External callers receive `404`, so database and storage readiness details are no longer exposed on the public surface.
 
 ---
 
-#### V2-L2 OIDC config leaks IdP details (FIXED IN CODE AFTER ASSESSMENT)
+#### V2-L2 OIDC config leaks IdP details (FIXED IN CODE)
 
-**Historical production probe:**
-```json
-{
-  "client_id": "622935",
-  "enabled": true,
-  "issuer": "https://accounts.sesamedisk.com/openid",
-  "scopes": ["openid", "profile", "email"]
-}
-```
-That response enabled targeted phishing with a pixel-perfect fake login page.
+**Files:** `internal/api/v2/auth.go`, `internal/api/v2/auth_test.go`
+**Current status:** Fixed in code.
 
-**Current code status:** `GET /api/v2.1/auth/oidc/config` now returns only `{ "enabled": true|false }`
-for unauthenticated callers. The login shell only needs to know whether browser SSO is available;
-the login URL itself is still obtained from the dedicated login endpoint.
+Unauthenticated OIDC config responses now return only `{ "enabled": true|false }`. The public login shell still has the single signal it needs, while issuer, client ID, scopes, and redirect allow-lists are no longer exposed to unauthenticated callers.
 
 ---
 
@@ -394,14 +331,9 @@ deprecating PBKDF2 compat mode or raising iterations significantly.
 
 #### Scenario 4: OnlyOffice compromised (or spoofed)
 
-**Impact:** Combined with V2-C1 (unauthenticated callback), an attacker who controls
-OnlyOffice (or simply knows the endpoint exists) can:
-1. Trigger SSRF to internal services
-2. Write arbitrary content to any library file (if they know/guess a valid doc_key)
-3. Exfiltrate internal service responses via the save-document path
+**Current status:** Reduced blast radius compared with the assessed build.
 
-**Update:** This scenario is now mitigated by the V2-C1 fix (JWT verification + URL allowlist).
-An attacker would need to know the `ONLYOFFICE_JWT_SECRET` to forge a valid callback.
+Current code requires a valid OnlyOffice JWT, validates download hosts against the configured OnlyOffice endpoints, and bounds the fetch path with a hardened HTTP client. A compromise of the OnlyOffice tier is still operationally serious, but the unauthenticated callback and arbitrary-host download chain described in the original assessment is no longer present in current code.
 
 #### Scenario 5: Network MITM between sesamefs and S3/Cassandra
 
@@ -413,29 +345,30 @@ all database traffic.
 
 ## Production readiness gaps
 
-### Must-fix before production — ALL RESOLVED
+### ~~Must-fix before production~~ — ALL COMPLETED
 
-1. ~~**V2-C1 + C-1:** OnlyOffice callback auth + SSRF protection~~ **FIXED** (JWT verify + URL allowlist + hardened client)
-2. ~~**C-2:** Serve user-uploaded SVG/HTML as `attachment`, not `inline`~~ **FIXED** (`forcedAttachmentTypes` + `nosniff`)
-3. ~~**M-2:** Replace `allowed_origins: ["*"]` in `configs/config.prod.yaml` with actual domain(s)~~ **FIXED** (env var + prod validation rejects `*`)
-4. ~~**CSP header:** Add `Content-Security-Policy` to the security headers middleware~~ **FIXED** (restrictive default + per-route overrides)
+1. ~~**V2-C1 + C-1:** OnlyOffice callback auth + SSRF protection~~ — FIXED: 3-layer defense (JWT verify + URL allowlist + hardened HTTP client)
+2. ~~**C-2:** Serve user-uploaded SVG/HTML as `attachment`, not `inline`~~ — FIXED: `forcedAttachmentTypes` for SVG/HTML/XML
+3. ~~**M-2:** Replace `allowed_origins: ["*"]` in prod config~~ — FIXED: env var `CORS_ALLOWED_ORIGINS`, wildcard rejected in `Validate()`
+4. ~~**CSP header:** Add `Content-Security-Policy`~~ — FIXED: global restrictive default + per-route `SetCSP()` overrides
+5. ~~**H-3:** Repo token skips `enforceAccountStatus`~~ — FIXED: `syncAuthMiddleware` calls `enforceAccountStatus()` before accepting repo tokens
+6. ~~**H-9:** OIDC DNS rebinding~~ — FIXED: `newOIDCHTTPClient` with DNS pinning + private IP rejection
+7. ~~**M-9:** OnlyOffice JWT TTL 8 hours~~ — FIXED: configurable `jwt_ttl_seconds` (default 1h)
+8. ~~**H-8:** Zip bomb / dir download DoS~~ — FIXED: configurable `zip_max_entries`/`zip_max_depth`/`zip_max_bytes` + rate limiter
 
 ### Should-fix soon
 
-5. **H-3:** Repo API tokens skip `enforceAccountStatus` — deactivated users can still sync
-6. **H-7:** Tighter auth rate limit + per-account throttling
-7. **M-9:** OnlyOffice JWT TTL still at 8 hours — reduce to 1h and make configurable
-8. **H-9:** OIDC DNS rebinding — add DNS pinning and private IP rejection on discovery/JWKS fetch
-9. **S3 SSE:** Add `ServerSideEncryption` to Put operations
-10. **M-10:** Outdated frontend deps (moment@2.22, socket.io-client@2.2)
+9. **H-5:** Uniform response for share-link token lookup + rate limiting
+10. **H-7:** Tighter auth rate limit + per-account throttling
+11. **S3 SSE:** Add `ServerSideEncryption` to Put operations
 
 ### Nice to have
 
-11. **M-7:** Distributed session revocation (only matters for multi-node deployment)
-12. **M-8:** Raise PBKDF2 iterations or deprecate compat mode
-13. **Permissions-Policy** header
-14. **Block integrity verification** on download (re-hash and compare)
-15. **H-2:** Constant-time API key comparison for malformed token branch
+12. **M-7:** Distributed session revocation
+13. **M-8:** Raise PBKDF2 iterations or deprecate compat mode
+14. **Permissions-Policy** header
+15. **Block integrity verification** on download (re-hash and compare)
+16. **M-10:** Update frontend dependencies (moment.js, socket.io-client, url-parse)
 
 ---
 

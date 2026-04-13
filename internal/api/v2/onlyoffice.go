@@ -238,8 +238,9 @@ func (h *OnlyOfficeHandler) signJWT(payload interface{}) (string, error) {
 		return "", err
 	}
 
-	// Set expiration to 8 hours to prevent stale sessions
-	claims["exp"] = time.Now().Add(8 * time.Hour).Unix()
+	// Token lifetime from config (default 1h, max 8h).
+	ttl := time.Duration(h.config.OnlyOffice.JWTTTLSeconds) * time.Second
+	claims["exp"] = time.Now().Add(ttl).Unix()
 
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
 	return token.SignedString([]byte(secret))

@@ -273,6 +273,7 @@ onlyoffice:
   enabled: false
   api_js_url: ""
   jwt_secret: ""
+  jwt_ttl_seconds: 3600
   max_document_bytes: 524288000
   verify_certificate: false
   force_save: true

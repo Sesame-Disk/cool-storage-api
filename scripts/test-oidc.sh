@@ -221,12 +221,11 @@ test_oidc_config() {
 
     if [ "$enabled" = "true" ]; then
         TOTAL=$((TOTAL + 1))
-        local issuer=$(echo "$response" | jq -r '.issuer')
-        if [ -n "$issuer" ] && [ "$issuer" != "null" ]; then
-            log_success "Issuer URL configured: $issuer"
+        if echo "$response" | jq -e 'keys == ["enabled"]' > /dev/null 2>&1; then
+            log_success "Public OIDC config exposes only the enabled flag"
             PASSED=$((PASSED + 1))
         else
-            log_error "Missing issuer URL"
+            log_error "OIDC config exposes unexpected public fields"
             FAILED=$((FAILED + 1))
         fi
     fi
@@ -253,22 +252,14 @@ test_oidc_login() {
         return
     fi
 
-    local login_redirect_uri
-    login_redirect_uri=$(echo "$config" | jq -r '.redirect_uris[0] // empty')
-    if [ -z "$login_redirect_uri" ]; then
-        login_redirect_uri="http://localhost:3000/sso"
-    fi
-
-    local encoded_redirect_uri
-    encoded_redirect_uri=$(printf '%s' "$login_redirect_uri" | jq -sRr @uri)
-
-    # Test login URL generation using a configured redirect URI when available.
+    # Let the server choose the configured redirect URI. The public config
+    # endpoint intentionally does not expose redirect allowlists anymore.
     run_test "GET /api/v2.1/auth/oidc/login/ returns 200" \
-        "http_get '$BASE_URL/api/v2.1/auth/oidc/login/?redirect_uri=$encoded_redirect_uri'" \
+        "http_get '$BASE_URL/api/v2.1/auth/oidc/login/'" \
         "200"
 
     # Verify authorization_url is returned
-    local response=$(curl -s "$BASE_URL/api/v2.1/auth/oidc/login/?redirect_uri=$encoded_redirect_uri")
+    local response=$(curl -s "$BASE_URL/api/v2.1/auth/oidc/login/")
 
     TOTAL=$((TOTAL + 1))
     local auth_url=$(echo "$response" | jq -r '.authorization_url')
@@ -416,22 +407,22 @@ test_session_endpoints() {
         FAILED=$((FAILED + 1))
     fi
 
-    # Test logout without token (should succeed)
-    run_test "DELETE /api/v2.1/auth/session/ succeeds without token" \
+    # Test logout without token (strict contract: token required)
+    run_test "DELETE /api/v2.1/auth/session/ rejects missing token" \
         "http_delete '$BASE_URL/api/v2.1/auth/session/'" \
-        "200"
+        "401"
 
-    # Test logout with token
+    # Test logout with invalid token
     TOTAL=$((TOTAL + 1))
     response=$(curl -s -w "\nHTTP_CODE:%{http_code}" -X DELETE \
         -H "Authorization: Token some-token" \
         "$BASE_URL/api/v2.1/auth/session/")
     http_code=$(echo "$response" | grep "HTTP_CODE:" | cut -d: -f2)
-    if [ "$http_code" = "200" ]; then
-        log_success "DELETE /api/v2.1/auth/session/ succeeds with token"
+    if [ "$http_code" = "401" ]; then
+        log_success "DELETE /api/v2.1/auth/session/ rejects invalid token"
         PASSED=$((PASSED + 1))
     else
-        log_error "DELETE /api/v2.1/auth/session/ failed (got $http_code)"
+        log_error "DELETE /api/v2.1/auth/session/ should reject invalid token (got $http_code)"
         FAILED=$((FAILED + 1))
     fi
 }

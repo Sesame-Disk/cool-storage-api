@@ -174,6 +174,31 @@ func TestGetOIDCLoginURL(t *testing.T) {
 		}
 	})
 
+	t.Run("uses configured redirect when query is omitted", func(t *testing.T) {
+		_, handler := setupAuthTestRouter()
+		ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+		ctx.Request = httptest.NewRequest("GET", "/api/v2.1/auth/oidc/login", nil)
+		ctx.Request.Host = "storage.example.com"
+
+		got := handler.resolveOIDCRedirectURI(ctx)
+		want := "http://localhost:3000/sso"
+		if got != want {
+			t.Fatalf("resolveOIDCRedirectURI() = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("uses explicit redirect query when provided", func(t *testing.T) {
+		_, handler := setupAuthTestRouter()
+		ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+		ctx.Request = httptest.NewRequest("GET", "/api/v2.1/auth/oidc/login?redirect_uri=http://localhost:8080/sso", nil)
+
+		got := handler.resolveOIDCRedirectURI(ctx)
+		want := "http://localhost:8080/sso"
+		if got != want {
+			t.Fatalf("resolveOIDCRedirectURI() = %q, want %q", got, want)
+		}
+	})
+
 	// Note: Full login URL generation requires a working OIDC discovery endpoint
 	// which we can't easily mock in this unit test without more infrastructure.
 	// Integration tests would cover this better.

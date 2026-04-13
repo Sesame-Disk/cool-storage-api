@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"io"
 	"math/big"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -28,6 +29,50 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
 )
+
+// isPrivateIP returns true if ip is a loopback, link-local, or RFC-1918/4193
+// private address. Used to prevent DNS-rebinding SSRF in OIDC fetches (H-9).
+func isPrivateIP(ip net.IP) bool {
+	return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() ||
+		ip.IsLinkLocalMulticast() || ip.IsUnspecified()
+}
+
+// newOIDCHTTPClient builds an HTTP client whose dialer rejects connections to
+// private/loopback IPs. This defends against DNS-rebinding attacks where an
+// attacker-controlled OIDC issuer resolves to an internal address after initial
+// validation (H-9). Pass allowPrivate=true only in tests that use httptest.Server.
+func newOIDCHTTPClient(timeout time.Duration, allowPrivate bool) *http.Client {
+	if allowPrivate {
+		return &http.Client{Timeout: timeout}
+	}
+	dialer := &net.Dialer{Timeout: 5 * time.Second}
+	return &http.Client{
+		Timeout: timeout,
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				host, port, err := net.SplitHostPort(addr)
+				if err != nil {
+					return nil, fmt.Errorf("invalid address %q: %w", addr, err)
+				}
+				ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+				if err != nil {
+					return nil, fmt.Errorf("DNS resolution failed for %q: %w", host, err)
+				}
+				for _, ipAddr := range ips {
+					if isPrivateIP(ipAddr.IP) {
+						return nil, fmt.Errorf("OIDC endpoint %q resolved to private IP %s — blocked", host, ipAddr.IP)
+					}
+				}
+				// Connect to the first resolved IP to pin the address and
+				// prevent a second resolution from returning a different IP.
+				return dialer.DialContext(ctx, network, net.JoinHostPort(ips[0].IP.String(), port))
+			},
+			TLSHandshakeTimeout: 5 * time.Second,
+			MaxIdleConns:        4,
+			IdleConnTimeout:     30 * time.Second,
+		},
+	}
+}
 
 // OIDCClient handles OIDC authentication flows
 type OIDCClient struct {
@@ -45,6 +90,10 @@ type OIDCClient struct {
 	jwksMu   sync.RWMutex
 	jwksKeys map[string]crypto.PublicKey // kid -> public key
 	jwksAt   time.Time
+
+	// allowPrivateIPs disables the DNS-rebinding guard so httptest.Server
+	// (127.0.0.1) works in tests. MUST be false in production.
+	allowPrivateIPs bool
 
 	// PKCE state storage (state -> code_verifier). Bounded in size and
 	// swept by a background goroutine to cap memory use under load or
@@ -181,6 +230,16 @@ func NewOIDCClient(appCfg *config.Config, database *db.DB, sessions *SessionMana
 	return c
 }
 
+// AllowPrivateIPsForTesting disables the DNS-rebinding guard so tests that
+// use httptest.Server on 127.0.0.1 can exercise the OIDC flow end-to-end.
+// Never enable this in production code.
+func (c *OIDCClient) AllowPrivateIPsForTesting() {
+	if c == nil {
+		return
+	}
+	c.allowPrivateIPs = true
+}
+
 // startStateSweeper launches a background goroutine that periodically reaps
 // expired PKCE states. The lazy prune inside storeState/consumeState only
 // runs on traffic — if a burst of states arrives and then traffic stops,
@@ -244,7 +303,7 @@ func (c *OIDCClient) GetDiscovery(ctx context.Context) (*OIDCDiscovery, error) {
 		return nil, fmt.Errorf("failed to create discovery request: %w", err)
 	}
 
-	client := &http.Client{Timeout: 10 * time.Second}
+	client := newOIDCHTTPClient(10*time.Second, c.allowPrivateIPs)
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch discovery document: %w", err)
@@ -379,7 +438,7 @@ func (c *OIDCClient) ExchangeCode(ctx context.Context, code, state, redirectURI 
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
-	client := &http.Client{Timeout: 30 * time.Second}
+	client := newOIDCHTTPClient(30*time.Second, c.allowPrivateIPs)
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to exchange code: %w", err)
@@ -596,7 +655,7 @@ func (c *OIDCClient) fetchJWKS(ctx context.Context) error {
 		return fmt.Errorf("failed to create JWKS request: %w", err)
 	}
 
-	client := &http.Client{Timeout: 10 * time.Second}
+	client := newOIDCHTTPClient(10*time.Second, c.allowPrivateIPs)
 	resp, err := client.Do(req)
 	if err != nil {
 		return fmt.Errorf("failed to fetch JWKS: %w", err)
@@ -749,7 +808,7 @@ func (c *OIDCClient) getUserInfo(ctx context.Context, accessToken string) (*User
 	}
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 
-	client := &http.Client{Timeout: 10 * time.Second}
+	client := newOIDCHTTPClient(10*time.Second, c.allowPrivateIPs)
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err

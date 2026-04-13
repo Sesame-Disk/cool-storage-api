@@ -1088,6 +1088,11 @@ func (s *Server) syncAuthMiddleware() gin.HandlerFunc {
 
 		// Check if it's a valid repo token (from download-info)
 		if accessToken, valid := s.tokenStore.GetToken(token, TokenTypeDownload); valid {
+			// Repo tokens are long-lived — verify the account hasn't been
+			// deactivated or deleted since the token was issued.
+			if err := s.enforceAccountStatus(c, accessToken.UserID, accessToken.OrgID); err != nil {
+				return // enforceAccountStatus already wrote 403 + Abort
+			}
 			c.Set("user_id", accessToken.UserID)
 			c.Set("org_id", accessToken.OrgID)
 			c.Set("repo_id", accessToken.RepoID)

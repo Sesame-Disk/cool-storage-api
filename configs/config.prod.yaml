@@ -386,6 +386,7 @@ onlyoffice:
   enabled: true                 # Overridden by ONLYOFFICE_ENABLED=true in compose
   jwt_secret: ""                # Set via ONLYOFFICE_JWT_SECRET env var (required when enabled)
   api_js_url: ""                # Set via ONLYOFFICE_API_JS_URL env var
+  jwt_ttl_seconds: 3600         # Override via ONLYOFFICE_JWT_TTL_SECONDS (default 1 hour)
   max_document_bytes: 524288000 # Reject callback downloads larger than 500 MiB
 
   # Internal Docker network — OnlyOffice fetches files from sesamefs

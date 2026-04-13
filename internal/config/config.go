@@ -377,6 +377,7 @@ type OnlyOfficeConfig struct {
 	ServerURL         string   `yaml:"server_url"`         // URL for OnlyOffice to reach SesameFS (e.g., http://sesamefs:8080)
 	InternalURL       string   `yaml:"internal_url"`       // URL for SesameFS to reach OnlyOffice internally (e.g., http://onlyoffice:80)
 	MaxDocumentBytes  int64    `yaml:"max_document_bytes"` // Maximum OnlyOffice callback download size before rejecting the save
+	JWTTTLSeconds     int      `yaml:"jwt_ttl_seconds"`    // JWT token lifetime in seconds (default 3600 = 1 hour)
 }
 
 // ElasticsearchConfig holds Elasticsearch search backend settings
@@ -721,6 +722,7 @@ func DefaultConfig() *Config {
 			ViewExtensions:    []string{"doc", "docx", "ppt", "pptx", "xls", "xlsx", "odt", "fodt", "odp", "fodp", "ods", "fods"},
 			EditExtensions:    []string{"docx", "pptx", "xlsx"},
 			MaxDocumentBytes:  500 * 1024 * 1024,
+			JWTTTLSeconds:     3600, // 1 hour
 		},
 		Elasticsearch: ElasticsearchConfig{
 			Enabled: true,
@@ -962,6 +964,11 @@ func (c *Config) applyEnvOverrides() {
 			c.OnlyOffice.MaxDocumentBytes = i
 		}
 	}
+	if v := os.Getenv("ONLYOFFICE_JWT_TTL_SECONDS"); v != "" {
+		if i, err := strconv.Atoi(v); err == nil {
+			c.OnlyOffice.JWTTTLSeconds = i
+		}
+	}
 
 	// Elasticsearch
 	if v := os.Getenv("ELASTICSEARCH_ENABLED"); v != "" {
@@ -1077,6 +1084,12 @@ func (c *Config) Validate() error {
 	}
 	if c.OnlyOffice.MaxDocumentBytes <= 0 {
 		return fmt.Errorf("onlyoffice.max_document_bytes must be greater than zero")
+	}
+	if c.OnlyOffice.JWTTTLSeconds < 300 {
+		return fmt.Errorf("onlyoffice.jwt_ttl_seconds must be at least 300 (5 minutes)")
+	}
+	if c.OnlyOffice.JWTTTLSeconds > 28800 {
+		return fmt.Errorf("onlyoffice.jwt_ttl_seconds must be at most 28800 (8 hours)")
 	}
 	if c.SeafHTTP.ZipMaxEntries <= 0 {
 		return fmt.Errorf("seafhttp.zip_max_entries must be greater than zero")

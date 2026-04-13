@@ -180,7 +180,7 @@ func TestOIDCClient_IsEnabled(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			c := &OIDCClient{config: tt.config}
+			c := &OIDCClient{allowPrivateIPs: true, config: tt.config}
 			if got := c.IsEnabled(); got != tt.want {
 				t.Errorf("IsEnabled() = %v, want %v", got, tt.want)
 			}
@@ -199,7 +199,7 @@ func TestOIDCClient_GetDiscovery(t *testing.T) {
 		ClientID: "test-client",
 	}
 
-	client := &OIDCClient{
+	client := &OIDCClient{allowPrivateIPs: true,
 		config: cfg,
 		states: make(map[string]*AuthState),
 	}
@@ -242,7 +242,7 @@ func TestOIDCClient_GetDiscovery_InvalidIssuer(t *testing.T) {
 		ClientID: "test-client",
 	}
 
-	client := &OIDCClient{
+	client := &OIDCClient{allowPrivateIPs: true,
 		config: cfg,
 		states: make(map[string]*AuthState),
 	}
@@ -292,7 +292,7 @@ func TestOIDCClient_ValidateRedirectURI(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			client := &OIDCClient{
+			client := &OIDCClient{allowPrivateIPs: true,
 				config: &config.OIDCConfig{
 					RedirectURIs: tt.allowedURIs,
 				},
@@ -319,7 +319,7 @@ func TestOIDCClient_GetAuthorizationURL(t *testing.T) {
 		Scopes:       []string{"openid", "profile", "email"},
 	}
 
-	client := &OIDCClient{
+	client := &OIDCClient{allowPrivateIPs: true,
 		config: cfg,
 		states: make(map[string]*AuthState),
 	}
@@ -356,7 +356,7 @@ func TestOIDCClient_GetAuthorizationURL(t *testing.T) {
 	})
 
 	t.Run("reject when redirect allowlist is empty", func(t *testing.T) {
-		emptyListClient := &OIDCClient{
+		emptyListClient := &OIDCClient{allowPrivateIPs: true,
 			config: &config.OIDCConfig{
 				Enabled:      true,
 				Issuer:       server.URL,
@@ -374,7 +374,7 @@ func TestOIDCClient_GetAuthorizationURL(t *testing.T) {
 	})
 
 	t.Run("generate URL with PKCE", func(t *testing.T) {
-		pkceClient := &OIDCClient{
+		pkceClient := &OIDCClient{allowPrivateIPs: true,
 			config: &config.OIDCConfig{
 				Enabled:      true,
 				Issuer:       server.URL,
@@ -401,7 +401,7 @@ func TestOIDCClient_GetAuthorizationURL(t *testing.T) {
 }
 
 func TestOIDCClient_ExchangeCodeRejectsInvalidRedirectURI(t *testing.T) {
-	client := &OIDCClient{
+	client := &OIDCClient{allowPrivateIPs: true,
 		config: &config.OIDCConfig{
 			RedirectURIs: []string{"http://localhost:3000/sso"},
 		},
@@ -424,7 +424,7 @@ func TestOIDCClient_ExchangeCodeRejectsInvalidRedirectURI(t *testing.T) {
 
 // TestOIDCClient_StateManagement tests state storage and consumption
 func TestOIDCClient_StateManagement(t *testing.T) {
-	client := &OIDCClient{
+	client := &OIDCClient{allowPrivateIPs: true,
 		config: &config.OIDCConfig{},
 		states: make(map[string]*AuthState),
 	}
@@ -487,7 +487,7 @@ func TestOIDCClient_GetLogoutURL(t *testing.T) {
 		ClientID: "test-client",
 	}
 
-	client := &OIDCClient{
+	client := &OIDCClient{allowPrivateIPs: true,
 		config: cfg,
 		states: make(map[string]*AuthState),
 	}
@@ -520,7 +520,7 @@ func TestOIDCClient_GetLogoutURL(t *testing.T) {
 
 // TestOIDCClient_MapOIDCRole tests role mapping
 func TestOIDCClient_MapOIDCRole(t *testing.T) {
-	client := &OIDCClient{
+	client := &OIDCClient{allowPrivateIPs: true,
 		config: &config.OIDCConfig{
 			DefaultRole: "user",
 		},
@@ -581,7 +581,7 @@ func TestIsPrivilegedOIDCRoleClaim(t *testing.T) {
 }
 
 func TestOIDCClient_NormalizeRoleForOrg(t *testing.T) {
-	client := &OIDCClient{
+	client := &OIDCClient{allowPrivateIPs: true,
 		config: &config.OIDCConfig{
 			PlatformOrgID: "00000000-0000-0000-0000-000000000000",
 		},
@@ -728,7 +728,7 @@ func TestOIDCClient_ExtractOrgID(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			client := &OIDCClient{
+			client := &OIDCClient{allowPrivateIPs: true,
 				config: &config.OIDCConfig{
 					OrgClaim:              tt.orgClaim,
 					PlatformOrgID:         "00000000-0000-0000-0000-000000000000",
@@ -808,7 +808,7 @@ func mockJWKSServer(t *testing.T, issuer string) *httptest.Server {
 
 // newTestOIDCClient creates an OIDCClient pointing at the mock server.
 func newTestOIDCClient(serverURL string) *OIDCClient {
-	return &OIDCClient{
+	return &OIDCClient{allowPrivateIPs: true,
 		config: &config.OIDCConfig{
 			Issuer:           serverURL,
 			AllowedClockSkew: 2 * time.Minute,
@@ -980,7 +980,7 @@ func TestParseIDToken_InvalidFormat(t *testing.T) {
 }
 
 func TestParseIDToken_EmptyToken(t *testing.T) {
-	client := &OIDCClient{
+	client := &OIDCClient{allowPrivateIPs: true,
 		config: &config.OIDCConfig{
 			Issuer: "https://auth.example.com",
 		},
@@ -1283,7 +1283,7 @@ func TestParseDepartmentClaims(t *testing.T) {
 
 // TestOIDCClient_GetClaimValue tests claim value retrieval from ID token extra claims
 func TestOIDCClient_GetClaimValue(t *testing.T) {
-	client := &OIDCClient{config: &config.OIDCConfig{}}
+	client := &OIDCClient{allowPrivateIPs: true, config: &config.OIDCConfig{}}
 
 	t.Run("existing claim", func(t *testing.T) {
 		claims := &IDTokenClaims{
@@ -1320,7 +1320,7 @@ func TestOIDCClient_GetClaimValue(t *testing.T) {
 // TestOIDCClient_ExtractGroups tests group extraction from OIDC claims
 func TestOIDCClient_ExtractGroups(t *testing.T) {
 	t.Run("extracts groups from claims", func(t *testing.T) {
-		client := &OIDCClient{
+		client := &OIDCClient{allowPrivateIPs: true,
 			config: &config.OIDCConfig{GroupsClaim: "groups"},
 		}
 		claims := &IDTokenClaims{
@@ -1338,7 +1338,7 @@ func TestOIDCClient_ExtractGroups(t *testing.T) {
 	})
 
 	t.Run("no groups claim configured", func(t *testing.T) {
-		client := &OIDCClient{
+		client := &OIDCClient{allowPrivateIPs: true,
 			config: &config.OIDCConfig{GroupsClaim: ""},
 		}
 		claims := &IDTokenClaims{
@@ -1353,7 +1353,7 @@ func TestOIDCClient_ExtractGroups(t *testing.T) {
 	})
 
 	t.Run("claim not present in token", func(t *testing.T) {
-		client := &OIDCClient{
+		client := &OIDCClient{allowPrivateIPs: true,
 			config: &config.OIDCConfig{GroupsClaim: "groups"},
 		}
 		claims := &IDTokenClaims{
@@ -1369,7 +1369,7 @@ func TestOIDCClient_ExtractGroups(t *testing.T) {
 // TestOIDCClient_ExtractDepartments tests department extraction from OIDC claims
 func TestOIDCClient_ExtractDepartments(t *testing.T) {
 	t.Run("extracts departments from claims", func(t *testing.T) {
-		client := &OIDCClient{
+		client := &OIDCClient{allowPrivateIPs: true,
 			config: &config.OIDCConfig{DepartmentsClaim: "departments"},
 		}
 		claims := &IDTokenClaims{
@@ -1389,7 +1389,7 @@ func TestOIDCClient_ExtractDepartments(t *testing.T) {
 	})
 
 	t.Run("no departments claim configured", func(t *testing.T) {
-		client := &OIDCClient{
+		client := &OIDCClient{allowPrivateIPs: true,
 			config: &config.OIDCConfig{DepartmentsClaim: ""},
 		}
 		claims := &IDTokenClaims{
@@ -1411,7 +1411,7 @@ func TestOIDCClient_GetUserInfo(t *testing.T) {
 
 	t.Run("successful userinfo fetch", func(t *testing.T) {
 		// Pre-cache the discovery with the mock server's actual URL
-		client := &OIDCClient{
+		client := &OIDCClient{allowPrivateIPs: true,
 			config: &config.OIDCConfig{
 				Enabled:  true,
 				Issuer:   server.URL,
@@ -1455,7 +1455,7 @@ func TestOIDCClient_GetUserInfo(t *testing.T) {
 		noUIServer := httptest.NewServer(noUserInfoMux)
 		defer noUIServer.Close()
 
-		client := &OIDCClient{
+		client := &OIDCClient{allowPrivateIPs: true,
 			config: &config.OIDCConfig{
 				Enabled:  true,
 				Issuer:   noUIServer.URL,
@@ -1548,7 +1548,7 @@ func TestOIDCClient_ExtractRoles(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			client := &OIDCClient{
+			client := &OIDCClient{allowPrivateIPs: true,
 				config: &config.OIDCConfig{
 					RolesClaim: tt.rolesClaim,
 				},

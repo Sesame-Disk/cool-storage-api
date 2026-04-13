@@ -178,7 +178,9 @@ func newOIDCProjectionTestClient(t *testing.T, issuer, defaultOrgName string) *a
 	}
 
 	sessions := authpkg.NewSessionManager(&appCfg.Auth.OIDC, database)
-	return authpkg.NewOIDCClient(appCfg, database, sessions)
+	client := authpkg.NewOIDCClient(appCfg, database, sessions)
+	client.AllowPrivateIPsForTesting()
+	return client
 }
 
 func prepareOIDCProjectionExchange(t *testing.T, client *authpkg.OIDCClient, provider *oidcProjectionMockProvider) string {

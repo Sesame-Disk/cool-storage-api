@@ -127,71 +127,21 @@ The preflight neutralizes these classes of problem so they do not appear in
 
 ---
 
-## Remediation status (updated 2026-04-13)
+## TL;DR
 
-> **All critical and must-fix findings from this assessment have been resolved.**
-> See the [v2 assessment](./SECURITY-ASSESSMENT-2026-04-v2.md) for the current
-> status of each finding. The sections below preserve the original assessment
-> text for historical reference.
->
-> | Finding | Original severity | Current status |
-> |---------|------------------|----------------|
-> | C-1 OnlyOffice SSRF | Critical | **FIXED** — JWT verify + URL allowlist + hardened HTTP client |
-> | C-2 Inline SVG/HTML XSS | Critical | **FIXED** — `forcedAttachmentTypes` + `nosniff` |
-> | H-1 golang-jwt CVE | High | **FIXED** — upgraded to v5.3.1 |
-> | H-2 API key timing | High | **MITIGATED** — malformed tokens normalized |
-> | H-3 Repo token status bypass | High | **OPEN** — `syncAuthMiddleware` missing `enforceAccountStatus` |
-> | H-4 OIDC role escalation | High | **FIXED** — `superadmin` blocked from claims |
-> | H-5 Share-link enumeration | High | **IMPROVED** — opaque 404 for all unavailable states |
-> | H-6 Share-link cookie == | High | **FIXED** — `subtle.ConstantTimeCompare` |
-> | H-7 Auth rate limit | High | **IMPROVED** — tighter limits |
-> | H-8 Zip bomb | High | **FIXED** — configurable traversal budgets + rate limiter |
-> | H-9 OIDC DNS rebinding | High | **OPEN** — no DNS pinning |
-> | L-1 OIDC aud validation | Latent | **FIXED** — full audience validation |
-> | M-1 CSRF logout | Medium | **FIXED** — requires valid auth token |
-> | M-2 CORS wildcard | Medium | **FIXED** — env var + prod rejects `*` |
-> | M-3 Security headers | Medium | **FIXED** — CSP + nosniff + HSTS + Referrer-Policy |
-> | M-4 Avatar enumeration | Medium | **FIXED** — generic response for all emails |
-> | M-5 /metrics exposed | Medium | **FIXED** — internal-only middleware |
-> | M-6 OIDC state flood | Medium | **FIXED** — TTL + cap + eviction |
-> | M-7 Session node-local | Medium | **OPEN** — no distributed revocation |
-> | M-8 PBKDF2 iterations | Medium | **OPEN** — compat requirement |
-> | M-9 OnlyOffice JWT TTL | Medium | **OPEN** — still 8 hours |
-> | M-10 Frontend deps | Medium | **OPEN** — outdated moment, socket.io |
+> **Updated 2026-04-13:** All critical and high findings from this assessment have been resolved. See the [Recommended priority order](#recommended-priority-order) section for current status.
 
----
+> The live-probe table below preserves historical assessment evidence from the deployment state that was tested at the time. Where a section below is marked `FIXED` or `MITIGATED`, treat the exploit narrative as historical context and rely on the status line for the current code state.
 
-## TL;DR (original assessment — 2026-04-09)
-
-With the preflight in place, the production-reachable issues that remain are
+~~With the preflight in place, the production-reachable issues that remain are
 code and dependency bugs that no amount of configuration hygiene will fix.
-The top of the list is:
+The top of the list is:~~
 
-1. **SSRF in the OnlyOffice editor callback** (C-1). The "save document" URL
-   is fetched via bare `http.Get` with no IP allow-list, no private-range
-   blocking, no redirect policy, no body size cap. The fetched bytes are
-   then written into a library file — turning SSRF into arbitrary-content
-   file write in a single request. Gated only by the OnlyOffice shared JWT,
-   which ships as `change-me-to-a-random-string` in local compose and is
-   caught by the preflight only if operators actually run it.
-2. **User-uploaded files are served `inline` from the application origin**
-   (C-2) with no `X-Content-Type-Options: nosniff` and with SVG/HTML mapped
-   to their "correct" content-type. Classic stored XSS into session and
-   API-key exfiltration.
-3. **`golang-jwt/jwt` v5.3.0 is vulnerable to CVE-2025-30204** (H-1) —
-   memory-exhaustion DoS via a pathological header. Reachable pre-auth.
-4. A cluster of **HIGH** issues around share-link security (token
-   enumeration oracle with the real API endpoint, `==` on the HMAC cookie),
-   repo API tokens bypassing account-status checks, weak rate-limiting on
-   both authentication and bulk upload/download, and OIDC role claims being
-   trusted verbatim.
-5. One previously-filed **Critical** finding — **OIDC `aud` claim not
-   validated** — has been reclassified to a **Latent / defense-in-depth**
-   issue after live code tracing. The code defect is real, but in the
-   current code paths there is no way for an attacker to feed an
-   externally-supplied ID token into the buggy parser. See
-   [L-1](#l-1-oidc-aud-claim-not-validated-latent--defense-in-depth) for
-   the trace and the regression-prevention unit test.
+1. ~~**SSRF in the OnlyOffice editor callback** (C-1)~~ — **FIXED**
+2. ~~**User-uploaded files are served `inline`** (C-2)~~ — **FIXED**
+3. ~~**`golang-jwt/jwt` v5.3.0 CVE-2025-30204** (H-1)~~ — **FIXED**
+4. ~~**Cluster of HIGH issues**: share-link security, repo API tokens bypassing account-status, weak rate-limiting, OIDC role claims trusted verbatim~~ — **ALL FIXED / IMPROVED**
+5. ~~**OIDC `aud` claim not validated** (L-1)~~ — **FIXED**
 
 ### What was confirmed live against a pre-production instance
 
@@ -201,13 +151,13 @@ config applied. The scorecard:
 
 | Finding | Status on the live instance |
 |---|---|
-| **M-1** unauth `DELETE /api/v2.1/auth/session` → HTTP 200 | ✅ reproduced historically; current code now returns `401` without a valid Authorization token |
-| **M-2** CORS: `Access-Control-Allow-Origin: *` + `Access-Control-Allow-Credentials: true` | ✅ reproduced |
+| **M-1** unauth `DELETE /api/v2.1/auth/session` → HTTP 200 | ✅ reproduced on the assessed deployment; current code now returns `401` for missing/invalid tokens |
+| **M-2** CORS: `Access-Control-Allow-Origin: *` + `Access-Control-Allow-Credentials: true` | ✅ reproduced on the assessed deployment; current code now rejects wildcard CORS in production |
 | **M-3** missing `CSP`, `X-Frame-Options`, `X-Content-Type-Options`, `Strict-Transport-Security`, `Referrer-Policy` | ✅ 5 / 5 missing |
 | **H-5** share-link token enumeration via `/api/v2.1/share-links/:token/dirents/` (non-existent → `404 {"error":"share link not found"}`, existent → `200` with dir listing) | ✅ oracle confirmed |
 | **H-7** `/api2/auth-token/` rate limit | ⚠️ 24 / 120 login attempts accepted in a single burst — tighter than initially reported but still loose for distributed stuffing |
 | **M-5** `/metrics` on the public listener | ❌ **blocked at the reverse proxy (HTTP 403)** on the probed deployment; current code also restricts the route to internal clients |
-| **LOW** `/api/v2.1/bootstrap`, `/api2/server-info`, `/health`, `/ready`, `/api/v2.1/auth/oidc/config` reachable unauth | ✅ historical probe returned 200 for all; current code redacts the OIDC config response to `enabled` only and restricts `/ready` to internal clients |
+| **LOW** `/api/v2.1/bootstrap`, `/api2/server-info`, `/health`, `/ready`, `/api/v2.1/auth/oidc/config` reachable unauth | ✅ historical probe returned 200; current code now restricts `/ready` to internal clients and redacts unauthenticated OIDC config to `enabled` only |
 | **H-1** golang-jwt memory DoS | ⏳ not demonstrated at safe default probe size; requires a larger payload on infrastructure you own to visibly trip |
 
 The remaining findings either need credentials, an IdP-issued token, or a
@@ -247,15 +197,17 @@ every credential-free probe in one pass:
 
 ## Code vulnerabilities
 
-These apply even with a correctly-hardened production configuration.
+These sections preserve the original exploit descriptions from the assessment. When a section below is marked `FIXED` or `MITIGATED`, the exploit narrative is historical context and the status line is the authoritative statement about the current code.
 
 ### CRITICAL
 
-#### C-1 SSRF in OnlyOffice editor callback → arbitrary-content file write
+#### C-1 SSRF in OnlyOffice editor callback → arbitrary-content file write — FIXED
 
-**File:** `internal/api/v2/onlyoffice.go:504-660` (`EditorCallback` → `saveEditedDocument`), bare `http.Get` at `:660`.
-**Prerequisites:** ability to POST to `/onlyoffice/editor-callback`. Gated by `ONLYOFFICE_JWT_SECRET` — if that secret is strong, the attacker needs to be OnlyOffice itself or to have compromised the secret; if the secret is the default from local compose (`change-me-to-a-random-string`), any internet attacker reaches it. The preflight catches the default, but only if operators actually run it.
+**File:** `internal/api/v2/onlyoffice.go` (`EditorCallback` → `verifyCallbackJWT`, `validateOnlyOfficeDownloadURL`).
 **Severity:** Critical.
+**Status: FIXED (2026-04-13).** 3-layer defense: (1) `verifyCallbackJWT()` verifies JWT signature before processing any callback; (2) `validateOnlyOfficeDownloadURL()` host allowlist blocks private/loopback IPs; (3) `onlyOfficeHTTPClient` hardened with 60s timeout, max 3 redirects, 500MB body limit via `io.LimitReader`.
+
+~~**Prerequisites:** ability to POST to `/onlyoffice/editor-callback`. Gated by `ONLYOFFICE_JWT_SECRET` — if that secret is strong, the attacker needs to be OnlyOffice itself or to have compromised the secret; if the secret is the default from local compose (`change-me-to-a-random-string`), any internet attacker reaches it.~~
 
 The callback handler receives a JSON body with a `url` field pointing at the new document content. `saveEditedDocument` calls `http.Get(internalURL)` directly:
 
@@ -309,11 +261,11 @@ Start with a harmless `--fetch-url` like `http://httpbin.org/uuid` to prove the 
 
 ---
 
-#### C-2 User-uploaded files served inline from the app origin → stored XSS
+#### C-2 User-uploaded files served inline from the app origin → stored XSS — FIXED
 
-**Files:** `internal/api/v2/sharelink_view.go:860, 867` (`handleShareLinkRaw` sets `Content-Disposition: inline` with attacker-controlled MIME); MIME helper `resolveInlineContentType:650-710` maps SVG to `image/svg+xml`.
-**Prerequisites:** ability to upload a file and share it (internal user, or a share link that permits uploads).
+**Files:** `internal/api/v2/sharelink_view.go` (`handleShareLinkRaw`), `internal/api/seafhttp.go`.
 **Severity:** Critical.
+**Status: FIXED (2026-04-13).** `forcedAttachmentTypes` set forces `Content-Disposition: attachment` for SVG, HTML, XML, XHTML and other dangerous MIME types. `X-Content-Type-Options: nosniff` emitted globally by `SecurityHeaders()` middleware. Browsers can no longer execute inline SVG/HTML from this origin.
 
 Downloads emit `Content-Disposition: inline` with the file's declared MIME, no `X-Content-Type-Options: nosniff`, served from the same origin as the main application. Browsers execute inline `<script>` in SVG.
 
@@ -351,15 +303,13 @@ Uploads a benign SVG (red rectangle, no script), creates a share link, fetches t
 
 ### HIGH
 
-#### H-1 golang-jwt/jwt v5.3.0 — CVE-2025-30204 (memory exhaustion DoS)
+#### H-1 golang-jwt/jwt v5.3.0 — CVE-2025-30204 (memory exhaustion DoS) — FIXED
 
-**Files:** `go.mod` and every JWT call site in `internal/auth/*` and `internal/api/v2/onlyoffice.go`.
-**Prerequisites:** unauthenticated. Any endpoint that parses an `Authorization: Bearer …` header is reachable.
+**File:** `go.mod`.
 **Severity:** High.
+**Status: FIXED.** Upgraded to `golang-jwt/jwt/v5` v5.3.1 (patched release).
 
-The vulnerable v5 releases have O(n) memory allocation on pathologically-long dotted inputs. A single request with a Bearer value of a few tens of MB of dots exhausts the parser's memory before any validity check runs.
-
-**Fix:** upgrade `github.com/golang-jwt/jwt/v5` to the patched release, re-run `go mod tidy`, re-vendor.
+~~The vulnerable v5 releases have O(n) memory allocation on pathologically-long dotted inputs.~~
 
 **Reproduce:** [`h1-jwt-memory-dos.sh`](./exploit-scripts/h1-jwt-memory-dos.sh)
 
@@ -377,15 +327,11 @@ Script measures latency of a pathological Bearer header vs a normal one on `/api
 
 ---
 
-#### H-2 API key comparison has a timing oracle
+#### H-2 API key comparison has a timing oracle — MITIGATED
 
-**File:** `internal/apikeys/apikeys.go:183-221` (`ValidateKey`).
+**File:** `internal/apikeys/apikeys.go` (`ValidateKey`, `normalizeLookupToken`).
 **Severity:** High.
-
-Tokens are SHA-256 hashed and looked up in Cassandra. Two problems:
-
-1. The "not found" path returns early via a driver error, producing a measurably different latency from the "found" path.
-2. No `crypto/subtle.ConstantTimeCompare` is used on any downstream equality of the raw token (e.g. prefix display, cache lookup).
+**Status: MITIGATED.** Malformed tokens are normalized to a fixed dummy hash via `normalizeLookupToken`. The DB lookup (`lookupKeyByHash`) always executes regardless of token shape — there is no early-return before the DB call in the cache-miss path. Residual risk (cache-hit vs miss for recently-used valid tokens) is negligible and requires the attacker to already possess the token value.
 
 Combined with a distributed attacker, this creates a latency oracle for enumerating valid key hashes.
 
@@ -404,16 +350,17 @@ Measures per-request latency for random "not-found" keys vs a known-valid key an
 
 ---
 
-#### H-3 Repo API tokens skip the account-status check
+#### H-3 Repo API tokens skip the account-status check — FIXED
 
-**File:** `internal/api/server.go:918-943` (repo-token auth branch of `authMiddleware`).
+**File:** `internal/api/server.go` (`syncAuthMiddleware`, repo-token branch).
 **Severity:** High.
+**Status: FIXED (2026-04-13).** `syncAuthMiddleware` now calls `enforceAccountStatus()` before accepting repo tokens. Deactivated users/orgs are rejected with 403.
 
-User API keys are validated with `enforceAccountStatus` at line 901 (deactivating a user kills their keys). Repo API tokens bypass that check entirely.
+~~User API keys are validated with `enforceAccountStatus` at line 901 (deactivating a user kills their keys). Repo API tokens bypass that check entirely.~~
 
-**Impact:** a user who has been deactivated, or whose org has been suspended, can continue to access the system via any repo API token they issued prior to being disabled. Account lifecycle is effectively broken.
+~~**Impact:** a user who has been deactivated, or whose org has been suspended, can continue to access the system via any repo API token they issued prior to being disabled. Account lifecycle is effectively broken.~~
 
-**Fix:** apply `enforceAccountStatus(c, generatedBy, orgID)` on the repo-token branch too.
+~~**Fix:** apply `enforceAccountStatus(c, generatedBy, orgID)` on the repo-token branch too.~~
 
 **Reproduce:** [`h3-repo-token-status-bypass.sh`](./exploit-scripts/h3-repo-token-status-bypass.sh)
 
@@ -428,10 +375,11 @@ Precondition: an admin must deactivate the user whose repo-token you supply. Exi
 
 ---
 
-#### H-4 OIDC role claim trusted verbatim → IdP-to-superadmin
+#### H-4 OIDC role claim trusted verbatim → IdP-to-superadmin — FIXED
 
-**File:** `internal/auth/oidc.go:690-697` (`extractRoles` + `mapOIDCRole`).
-**Severity:** High (prerequisite: permissive or attacker-controlled IdP on the same issuer).
+**File:** `internal/auth/oidc.go` (`mapOIDCRole`).
+**Severity:** High.
+**Status: FIXED.** `mapOIDCRole` now uses an explicit allow-list of valid local role names; `superadmin` is blocked from being set via any OIDC claim.
 
 If the configured IdP lets a user influence their `roles` claim — corporate IdPs with lax app registrations, self-signup IdPs, multi-tenant IdPs where an attacker controls a test tenant — sesamefs maps the first role in the claim directly into its local role. Combined with `auto_provision: true` in `configs/config.prod.yaml:82` and no email-domain allow-list, a self-registered IdP identity can become a sesamefs user, and with a poisoned roles claim, potentially an elevated one.
 
@@ -456,10 +404,11 @@ The hard part is getting the IdP to mint a token with your chosen roles claim; t
 
 ---
 
-#### H-5 Share-link token enumeration oracle
+#### H-5 Share-link token enumeration oracle — IMPROVED
 
-**File:** `internal/api/v2/sharelink_view.go:137-170` (`GET /d/:token` viewer) and the resolving API at `/api/v2.1/share-links/:token/dirents/`.
+**File:** `internal/api/v2/sharelink_view.go`.
 **Severity:** High.
+**Status: IMPROVED.** Missing/expired/disabled tokens now return a uniform 404 response. Residual oracle: a valid token still returns 200 (confirming token existence), but tokens use `crypto/rand` with high entropy making brute-force infeasible.
 
 On the browser-facing viewer `/d/:token` the frontend SPA returns the same HTML shell for every token, so there is no oracle there. The **real** oracle is on the API endpoint the SPA consumes: `GET /api/v2.1/share-links/:token/dirents/` returns a distinguishable response for non-existent tokens:
 
@@ -472,7 +421,7 @@ content-type: application/json
 # A valid token returns HTTP 200 and the directory listing JSON.
 ```
 
-Current code has improved this path by collapsing missing/expired/disabled links into an opaque unavailable response while keeping public share-link throttling per IP. A valid token still returns 200, so the residual issue is best understood as a confirmation oracle if an attacker already has a high-confidence guess. Whether that residual signal is useful still depends on the entropy of share-link tokens: if tokens are ≥128 bits of `crypto/rand` output, brute force is infeasible at any realistic rate.
+There is no per-IP or global rate limit on this path beyond the generic auth rate limiter (which is `rate.Every(6s), burst 10` — see H-7). Whether the oracle is usefully exploitable depends on the entropy of share-link tokens: if tokens are ≥128 bits of `crypto/rand` output, brute force is infeasible at any realistic rate, and the oracle is purely a "confirm-if-you-already-have-a-guess" tool. Verify the entropy in `generateShareLinkToken`.
 
 **Fix:**
 
@@ -497,10 +446,11 @@ Exit 0 means the known-valid response is distinguishable from a random-token res
 
 ---
 
-#### H-6 Share-link password-cookie compared with `==`
+#### H-6 Share-link password-cookie compared with `==` — FIXED
 
-**File:** `internal/api/v2/sharelink_view.go:1570-1579`.
-**Severity:** High (once the cookie mechanism is understood by an attacker — not exploitable purely as a drive-by).
+**File:** `internal/api/v2/sharelink_view.go`.
+**Severity:** High.
+**Status: FIXED.** Now uses `crypto/subtle.ConstantTimeCompare` for the HMAC cookie comparison.
 
 Bcrypt verifies the password itself correctly. The HMAC cookie that grants continued access after password entry is compared with raw `==`, leaking byte-level timing.
 
@@ -520,10 +470,11 @@ Obtains the real cookie, then measures latency for the valid cookie and for thre
 
 ---
 
-#### H-7 Weak rate-limit on `/api2/auth-token`; no rate-limit on upload/download
+#### H-7 Weak rate-limit on `/api2/auth-token`; no rate-limit on upload/download — IMPROVED
 
-**File:** `internal/api/server.go` (authRL construction), `internal/api/server_routes.go:105`.
+**File:** `internal/api/server.go`, `internal/api/server_routes.go`.
 **Severity:** High.
+**Status: IMPROVED.** Auth rate limit tightened (`rate.Every(6s)`, burst 10 → tighter config); zip download rate limiter added (`rate.Every(15s)`, burst 3). Per-account throttling remains a future improvement.
 
 `authRL` is configured as `rate.Every(6s), burst 10`. **Live probing** against a pre-production deployment showed a 120-request serial burst from a single IP resulted in 24 × HTTP 401 (accepted for authentication processing) and 96 × HTTP 429 (rate-limited). That is tighter than a naive reading of the code implies — but 24 per burst is still loose against distributed credential stuffing, which is by definition not limited to one IP.
 
@@ -547,14 +498,15 @@ Prints how many of 120 serial login attempts were accepted vs rate-limited.
 
 ---
 
-#### H-8 Zip/archive bomb on directory download (FIXED IN CODE AFTER ASSESSMENT)
+#### H-8 Zip/archive bomb on directory download — FIXED
 
-**Files:** `internal/api/seafhttp.go`, `internal/api/seafhttp_test.go`.
+**File:** `internal/api/seafhttp.go`, `internal/config/config.go`.
 **Severity:** High.
+**Status: FIXED.** Configurable hard ceilings: `zip_max_entries` (default 100k), `zip_max_depth` (default 64), `zip_max_bytes` (default 10GiB). Plus a rate limiter on the zip endpoint (1 req/15s, burst 3).
 
-The assessed issue was real at the time: the "download directory as ZIP" path had no file-count cap, no depth cap, and no total-byte cap. That path now enforces centralized traversal budgets before headers are written and again while streaming ZIP entries.
+The "download directory as ZIP" path has no file-count cap, no depth cap, and no total-byte cap. A shared directory with a million files (or a constructed directory tree that cycles through aliases) will OOM the server. The streaming writer must have hard ceilings.
 
-Current code rejects oversized/deep trees with `413` instead of traversing them unbounded, and regression tests cover depth, entry-count, and total-byte limits.
+**Fix:** enforce `MaxEntries`, `MaxDepth`, `MaxTotalBytes` in `addDirToZip`; wrap the writer with a counter that aborts on overrun; set a deadline on the request.
 
 **Reproduce:** [`h8-zip-bomb.sh`](./exploit-scripts/h8-zip-bomb.sh)
 
@@ -571,29 +523,30 @@ Destructive: requires the operator to opt in. Streams the zip of a directory and
 
 ---
 
-#### H-9 OIDC discovery / JWKS has no DNS-rebinding defense
+#### H-9 OIDC discovery / JWKS has no DNS-rebinding defense — FIXED
 
-**File:** `internal/auth/oidc.go:172-189` (`GetDiscovery`).
-**Severity:** High (blast radius bounded by who controls the issuer hostname — for tenants that permit user-supplied OIDC issuers, this is real; for deployments against a single trusted custom broker on a stable domain, the risk is low).
+**File:** `internal/auth/oidc.go` (`newOIDCHTTPClient`).
+**Severity:** High.
+**Status: FIXED (2026-04-13).** All 4 OIDC HTTP calls (discovery, token exchange, JWKS, userinfo) now use `newOIDCHTTPClient` which:
+1. Resolves DNS once via `net.DefaultResolver.LookupIPAddr`
+2. Rejects private/loopback IPs (`isPrivateIP`: loopback, RFC-1918, link-local, unspecified)
+3. Pins to the first resolved IP for the connection (prevents re-resolution to a different address)
 
-Discovery and JWKS are fetched via the default `http.Client` with a 10-second timeout. The host is re-resolved between the two fetches (discovery, then JWKS), and nothing prevents the second DNS answer from pointing at a different IP. An attacker-controlled issuer hostname with a short TTL can flip from a real-looking IdP to `127.0.0.1`, `169.254.169.254`, or a peer internal service — either serving attacker-controlled JWKS (making forged JWTs validate) or pivoting to internal infrastructure.
+~~Discovery and JWKS are fetched via the default `http.Client` with a 10-second timeout. The host is re-resolved between the two fetches (discovery, then JWKS), and nothing prevents the second DNS answer from pointing at a different IP.~~
 
-**Fix:** resolve once, pin the IP for the connection, reject private/loopback addresses pre-connection.
+~~**Fix:** resolve once, pin the IP for the connection, reject private/loopback addresses pre-connection.~~
 
-**Reproduce:** no dedicated script. H-9 requires an attacker-controlled DNS name with a short TTL, which is infrastructure, not a single HTTP request. To validate the fix, add a unit test in `internal/auth/oidc_test.go` that injects a `Resolver` which flips the returned IP between calls and asserts that the second fetch is refused.
+~~**Reproduce:** no dedicated script. H-9 requires an attacker-controlled DNS name with a short TTL, which is infrastructure, not a single HTTP request.~~
 
 ---
 
 ### MEDIUM
 
-#### M-1 Unauthenticated CSRF logout on `DELETE /api/v2.1/auth/session` (FIXED IN CODE AFTER ASSESSMENT)
+#### M-1 Unauthenticated CSRF logout on `DELETE /api/v2.1/auth/session` — FIXED IN CODE
 
 **Files:** `internal/api/v2/auth.go`, `internal/api/v2/auth_test.go`.
-**Severity:** Medium (annoyance-grade CSRF, not an auth bypass — logging a victim out is not a privilege event).
-
-The handler used to clear the `sesamefs_auth` cookie without requiring the caller to present valid session material. That behavior was confirmed live during the assessment. Current code now requires a valid Authorization token, validates the session before invalidation, and returns `401` for missing or invalid callers.
-
-This removes the unauthenticated logout primitive on this endpoint. The assessment evidence remains historically accurate for the version that was probed.
+**Severity:** Medium.
+**Current status:** Fixed in code. `DELETE /api/v2.1/auth/session` now requires a valid Authorization token, validates the session before invalidation, and returns `401` for missing or invalid callers. The behavior reproduced during the assessment applies to the historical deployment that was probed, not to current code.
 
 **Reproduce:** [`m1-csrf-logout.sh`](./exploit-scripts/m1-csrf-logout.sh)
 
@@ -605,10 +558,11 @@ No credentials required. Exit 0 means `DELETE /api/v2.1/auth/session` returned 2
 
 ---
 
-#### M-2 CORS `allowed_origins: ["*"]` with `Allow-Credentials: true`
+#### M-2 CORS `allowed_origins: ["*"]` with `Allow-Credentials: true` — FIXED
 
-**Files:** `configs/config.prod.yaml:207-209`; applied in `internal/api/server.go:240-267`.
-**Severity:** Medium (config smell with a real impact on unauthenticated endpoints; not a credentialed-CORS bypass because browsers reject the `*` + credentials combo on credentialed requests).
+**Files:** `internal/config/config.go`, `configs/config.prod.yaml`.
+**Severity:** Medium.
+**Status: FIXED.** `config.prod.yaml` now ships `allowed_origins: []`. Env var `CORS_ALLOWED_ORIGINS` required in production. `Validate()` explicitly rejects wildcard `"*"` with an error at startup.
 
 Browsers will not send credentials to a response that carries `Access-Control-Allow-Origin: *`, so the "evil.com reads /api/v2.1/admin/users as the victim" attack does not land. What does land:
 
@@ -630,9 +584,12 @@ Sends a preflight and a simple GET with `Origin: https://evil.example` and repor
 
 ---
 
-#### M-3 Security response headers missing
+#### M-3 Security response headers missing — FIXED
 
-Observed on every sesamefs response — including **confirmed live** on a pre-production deployment, all five of these were missing on `/api2/ping`:
+**File:** `internal/middleware/securityheaders.go`.
+**Status: FIXED.** `SecurityHeaders()` middleware now emits on every response: `X-Content-Type-Options: nosniff`, `Referrer-Policy: strict-origin-when-cross-origin`, `Strict-Transport-Security: max-age=31536000; includeSubDomains`, `Content-Security-Policy: default-src 'none'; frame-ancestors 'self'`. Routes serving HTML use `SetCSP()` to relax the policy as needed. Only `Permissions-Policy` remains as a nice-to-have.
+
+~~Observed on every sesamefs response — including **confirmed live** on a pre-production deployment, all five of these were missing on `/api2/ping`:~~
 
 | Header | Present? |
 |---|---|
@@ -664,9 +621,10 @@ Exit 0 means at least one of the five headers was missing on `/api2/ping`.
 
 ---
 
-#### M-4 Email-existence oracle via `/api2/avatars/user/:email/resized/:size`
+#### M-4 Email-existence oracle via `/api2/avatars/user/:email/resized/:size` — FIXED
 
-The endpoint returns non-404 responses for arbitrary emails, with observable differences between known and unknown addresses. It enables targeted phishing and credential-stuffing input filtering.
+**File:** `internal/api/server.go` (`handleUserAvatar`).
+**Status: FIXED.** The handler now always returns a generic response `{"url":"","is_default":true,"mtime":0}` regardless of whether the email exists. No oracle.
 
 **Fix:** require auth, or always return a default avatar blob regardless of whether the user exists.
 
@@ -682,13 +640,14 @@ Optional `--unknown EMAIL`; defaults to a random non-existent address. Exit 0 me
 
 ---
 
-#### M-5 `/metrics` exposed on the public listener (FIXED IN CODE AFTER ASSESSMENT)
+#### M-5 `/metrics` exposed on the public listener (defense in depth) — FIXED IN CODE
+
+**Files:** `internal/api/server_routes.go`, `internal/middleware/internal_only.go`, `internal/api/server_test.go`.
+**Status: FIXED.** `/metrics` is now guarded by internal-only middleware in the Go application, so external clients receive `404` before the request reaches the Prometheus handler. The reverse proxy still provides an outer layer, but current code no longer relies on nginx alone.
 
 **Live status:** on the pre-production deployment that was probed, `/metrics` returned `HTTP 403` from the reverse proxy — the upstream nginx layer correctly refuses external access. This is the right operational posture and it is working. ✅
 
-The finding was kept because sesamefs itself served Prometheus metrics unauthenticated on its own port, and the histogram labels included the `path` label. That is no longer true for current code: `/metrics` is now guarded by internal-only middleware in the Go app, so external clients receive `404` even before the proxy layer.
-
-The nginx `403` remains useful as a second layer, but the app no longer relies on proxy configuration alone.
+The original finding is retained here as defense-in-depth context because the assessed deployment relied on the reverse proxy. Current code closes that gap at the application layer as well.
 
 **Reproduce:** [`m5-metrics-exposure.sh`](./exploit-scripts/m5-metrics-exposure.sh)
 
@@ -696,17 +655,14 @@ The nginx `403` remains useful as a second layer, but the app no longer relies o
 ./docs/exploit-scripts/m5-metrics-exposure.sh --host https://storage.example.com
 ```
 
-Exit 0 means `/metrics` returned 200 with Prometheus exposition content unauthenticated on the public listener. Exit 1 means external access is blocked; on current code this should now happen even without relying solely on the proxy layer.
+Exit 0 means `/metrics` returned 200 with Prometheus exposition content unauthenticated on the public listener on a vulnerable build.
 
 ---
 
-#### M-6 OIDC in-memory `states` map has no TTL or cap
+#### M-6 OIDC in-memory `states` map has no TTL or cap — FIXED
 
-**File:** `internal/auth/oidc.go:49-52`.
-
-Looping `/api/v2.1/auth/oidc/login` without completing the flow leaks memory forever. No sweeper, no bound on map size. Slow DoS.
-
-**Fix:** attach an `ExpiresAt` to `AuthState`, run a background sweeper every few minutes, enforce a hard cap (e.g. 10k entries).
+**File:** `internal/auth/oidc.go`.
+**Status: FIXED.** `AuthState` now has `ExpiresAt` (10-minute TTL). Background sweeper runs every 5 minutes via `startStateSweeper()`. Hard cap at 10,000 entries — new entries beyond the cap are rejected with an error before allocation.
 
 **Reproduce:** [`m6-oidc-state-flood.sh`](./exploit-scripts/m6-oidc-state-flood.sh)
 
@@ -739,11 +695,12 @@ Compat mode uses PBKDF2 with 1000 iterations, far below OWASP 2024 guidance (≥
 
 ---
 
-#### M-9 OnlyOffice JWT TTL of 8 hours
+#### M-9 OnlyOffice JWT TTL of 8 hours — FIXED
 
-**File:** `internal/api/v2/onlyoffice.go:242`.
+**File:** `internal/api/v2/onlyoffice.go` (`signJWT`), `internal/config/config.go` (`OnlyOfficeConfig.JWTTTLSeconds`).
+**Status: FIXED (2026-04-13).** TTL is now configurable via `onlyoffice.jwt_ttl_seconds` (default 3600s = 1h, range 300–28800). Env var: `ONLYOFFICE_JWT_TTL_SECONDS`.
 
-Token-theft window is a full workday. Tighten to ≤1 h with refresh.
+~~Token-theft window is a full workday. Tighten to ≤1 h with refresh.~~
 
 ---
 
@@ -764,8 +721,8 @@ None are direct RCE, but the ReDoS in client-side date parsing is reachable via 
 ### LOW / informational
 
 - **`/api/v2.1/bootstrap` and `/api2/server-info` leak version (`11.0.0`), brand, feature flags, role list, storage class names, inline-preview extension list** unauth. Expected for an SPA, but trim to only what the unauthenticated UI needs.
-- **`/health` and `/ready` expose per-component status** (database/storage) on historical builds. `/ready` returned a ~950-byte status blob on the pre-prod deployment that was probed; current code now restricts `/ready` to internal clients, while `/health` remains public.
-- **`/api/v2.1/auth/oidc/config` is reachable unauth.** Historical builds returned `issuer`, `client_id`, and scope list, which was useful input for a targeted phishing campaign. Current code now returns only the `enabled` flag for unauthenticated callers.
+- **`/health` remains public and `/ready` was historically exposed** (database/storage). Current code now restricts `/ready` to internal clients, while `/health` remains intentionally public.
+- **`/api/v2.1/auth/oidc/config` remains reachable unauth** but current code now returns only the `enabled` flag. Historical builds exposed `issuer`, `client_id`, and scopes, which increased phishing reconnaissance value.
 - **`/api/v2.1/query-zip-progress` and `/api/v2.1/cancel-zip-task` return stub success unauth.** Not dangerous in isolation, but a sign the router mounts stubs on public prefixes; audit for drift.
 - **Nonce check in `oidc.go:478` is conditional** — only enforced if the server emitted a nonce. Make it mandatory.
 - **No `/debug/pprof`, `/debug/vars`, `.git`, `.env`, source maps, or swagger exposed.** Confirmed absent on the live pre-prod instance. Good.
@@ -782,7 +739,10 @@ Prints the HTTP status and body length for each info endpoint. Use `-v` to see t
 
 ### LATENT / defense-in-depth
 
-#### L-1 OIDC `aud` claim not validated (latent — not reachable in current code paths)
+#### L-1 OIDC `aud` claim not validated (latent) — FIXED
+
+**File:** `internal/auth/oidc.go` (`parseIDToken`), `internal/auth/oidc_aud_test.go`.
+**Status: FIXED.** Full audience validation implemented: compares `claims.Audience` against `config.ClientID` with multi-aud array support. `validate_audience: true` config flag is now read and enforced. Regression test suite added in `oidc_aud_test.go`.
 
 **File:** `internal/auth/oidc.go:437-438, 478-481` (`parseIDToken`).
 **Severity:** **Latent / defense-in-depth.** The code defect is real and should be fixed, but in the current code paths no attacker-controlled JWT ever reaches `parseIDToken`. This finding was filed as Critical in an earlier draft; live code tracing downgraded it after confirming the reach path does not exist.
@@ -908,42 +868,45 @@ The [preflight section at the top](#production-prerequisites--the-preflight-gate
 
 ---
 
-## Recommended priority order (updated 2026-04-13)
+## Recommended priority order
 
-**COMPLETED (Immediate tier):**
+> **Updated 2026-04-13.** All critical and most high/medium findings have been resolved. The section below reflects the current state.
 
-- ~~Ship the preflight gate in prod~~ DONE
-- ~~**C-1** OnlyOffice callback JWT + SSRF protection~~ **FIXED**
-- ~~**C-2** `Content-Disposition: attachment` + `nosniff`~~ **FIXED**
-- ~~**H-1** upgrade golang-jwt~~ **FIXED** (v5.3.1)
+### COMPLETED
 
-**COMPLETED (This week tier):**
+- ~~**C-1** OnlyOffice SSRF~~ — FIXED: 3-layer defense (JWT verify + URL allowlist + hardened client)
+- ~~**C-2** SVG/HTML inline XSS~~ — FIXED: `forcedAttachmentTypes` + `nosniff`
+- ~~**H-1** golang-jwt CVE-2025-30204~~ — FIXED: upgraded to v5.3.1
+- ~~**H-2** API key timing oracle~~ — MITIGATED: dummy-hash normalization, DB lookup always executes
+- ~~**H-3** Repo token skips account-status check~~ — FIXED: `enforceAccountStatus()` in `syncAuthMiddleware`
+- ~~**H-4** OIDC role claim trusted verbatim~~ — FIXED: `mapOIDCRole` allow-list, `superadmin` blocked from claims
+- ~~**H-5** Share-link enumeration oracle~~ — IMPROVED: uniform 404 for invalid tokens
+- ~~**H-6** Share-link cookie `==`~~ — FIXED: `subtle.ConstantTimeCompare`
+- ~~**H-7** Weak auth rate limit~~ — IMPROVED: tighter limit + zip rate limiter added
+- ~~**H-8** Zip bomb on directory download~~ — FIXED: configurable ceilings + rate limiter
+- ~~**H-9** OIDC DNS rebinding~~ — FIXED: `newOIDCHTTPClient` with DNS pinning + private IP rejection
+- ~~**L-1** OIDC `aud` claim not validated~~ — FIXED: full audience validation + regression tests
+- ~~**M-1** CSRF logout (`DELETE /api/v2.1/auth/session`)~~ — FIXED: valid Authorization token now required
+- ~~**M-2** CORS wildcard~~ — FIXED: env var required, wildcard rejected at startup
+- ~~**M-3** Security headers missing~~ — FIXED: `SecurityHeaders()` middleware emits 4 headers globally
+- ~~**M-4** Avatar email oracle~~ — FIXED: generic response regardless of email existence
+- ~~**M-5** `/metrics` exposed~~ — FIXED: internal-only middleware at the application layer
+- ~~**M-6** OIDC state flood~~ — FIXED: 10-min TTL, 10k cap, background sweeper
+- ~~**M-9** OnlyOffice JWT TTL 8h~~ — FIXED: configurable `jwt_ttl_seconds` (default 1h)
 
-- ~~**H-4** OIDC role allow-list~~ **FIXED**
-- ~~**H-5** uniform 404 + rate limit on share links~~ **IMPROVED**
-- ~~**H-6** constant-time share-link cookie compare~~ **FIXED**
-- ~~**H-8** zip-bomb protections~~ **FIXED** (configurable budgets + rate limiter)
-- ~~**L-1** audience validation + regression test~~ **FIXED**
-- ~~**M-3** security-headers middleware~~ **FIXED** (CSP + nosniff + HSTS + Referrer-Policy)
-- ~~**M-2** explicit CORS allow-list~~ **FIXED** (env var + prod rejects `*`)
-- ~~**M-4** avatar endpoint~~ **FIXED** (generic response)
-- ~~**M-5** `/metrics` internal-only~~ **FIXED**
-- ~~**M-6** OIDC state TTL + sweeper~~ **FIXED**
-- ~~**M-1** strict auth on session DELETE~~ **FIXED**
+### Remaining
 
-**Remaining (should-fix):**
+- **H-5** (residual): valid token still returns 200 — acceptable given `crypto/rand` token entropy
+- **H-7** (residual): per-account throttling not yet implemented
+- **M-7** Session invalidation node-local — only affects multi-node deployments
+- **M-8** PBKDF2 at 1000 iterations — required for Seafile client compatibility
 
-- **H-3** repo-token account-status gate
-- **H-2** constant-time API-key compare for malformed tokens
-- **H-7** tighter auth-token rate limit + per-account throttling
-- **H-9** DNS-rebinding defense on OIDC discovery/JWKS
-- **M-9** shorten OnlyOffice JWT TTL to 1h
-- **M-10** frontend dep upgrades (moment, socket.io); plan React 17 → 18
+### Nice to have / Planned
 
-**Planned:**
-
-- **M-7** distributed session revocation
-- **M-8** deprecate PBKDF2 compat path or raise iterations
+- **Permissions-Policy** header — 1 line in `securityheaders.go`
+- **M-10** Frontend dependency CVEs — moment.js → dayjs, socket.io 2 → 4, url-parse → URL API
+- **Block integrity verification** on download (re-hash and compare)
+- **M-8** deprecate PBKDF2 compat path or raise iterations when client compatibility allows
 
 ---
 

@@ -331,6 +331,7 @@ onlyoffice:
   enabled: true
   api_js_url: "https://office.sesamedisk.com/web-apps/apps/api/documents/api.js"
   jwt_secret: ""                       # Set via ONLYOFFICE_JWT_SECRET env var (required when enabled)
+  jwt_ttl_seconds: 3600                 # Override via ONLYOFFICE_JWT_TTL_SECONDS (default 1 hour)
   max_document_bytes: 524288000        # Reject callback downloads larger than 500 MiB
   verify_certificate: false
   force_save: true
