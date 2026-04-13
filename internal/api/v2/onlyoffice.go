@@ -1,7 +1,6 @@
 package v2
 
 import (
-	"bytes"
 	"context"
 	"crypto/md5"
 	"crypto/sha1"
@@ -223,8 +222,9 @@ func (h *OnlyOfficeHandler) canViewFile(filename string) bool {
 
 // signJWT creates a JWT token for OnlyOffice authentication
 func (h *OnlyOfficeHandler) signJWT(payload interface{}) (string, error) {
-	if h.config.OnlyOffice.JWTSecret == "" {
-		return "", nil
+	secret := strings.TrimSpace(h.config.OnlyOffice.JWTSecret)
+	if secret == "" {
+		return "", fmt.Errorf("OnlyOffice JWT secret is not configured")
 	}
 
 	// Convert payload to map for JWT claims
@@ -242,7 +242,7 @@ func (h *OnlyOfficeHandler) signJWT(payload interface{}) (string, error) {
 	claims["exp"] = time.Now().Add(8 * time.Hour).Unix()
 
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
-	return token.SignedString([]byte(h.config.OnlyOffice.JWTSecret))
+	return token.SignedString([]byte(secret))
 }
 
 // GetEditorConfig returns the OnlyOffice editor configuration
@@ -251,6 +251,10 @@ func (h *OnlyOfficeHandler) GetEditorConfig(c *gin.Context) {
 	// Check if OnlyOffice is enabled
 	if !h.config.OnlyOffice.Enabled {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error_msg": "OnlyOffice is not enabled"})
+		return
+	}
+	if strings.TrimSpace(h.config.OnlyOffice.JWTSecret) == "" {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error_msg": "OnlyOffice JWT secret is not configured"})
 		return
 	}
 
@@ -305,9 +309,10 @@ func (h *OnlyOfficeHandler) GetEditorConfig(c *gin.Context) {
 	}
 	downloadURL := fmt.Sprintf("%s/seafhttp/files/%s/%s", ooServerURL, downloadToken, filename)
 
-	// Generate callback URL (URL-encode file_path to handle spaces and special chars in nested paths)
-	callbackURL := fmt.Sprintf("%s/onlyoffice/editor-callback/?repo_id=%s&file_path=%s&doc_key=%s",
-		ooServerURL, repoID, url.QueryEscape(filePath), docKey)
+	// The callback only carries doc_key. The server resolves repo/file/user from the
+	// stored mapping so callback callers cannot override them with request params.
+	callbackURL := fmt.Sprintf("%s/onlyoffice/editor-callback/?doc_key=%s",
+		ooServerURL, url.QueryEscape(docKey))
 
 	// Get user info
 	userName := strings.Split(userID, "@")[0]
@@ -350,20 +355,21 @@ func (h *OnlyOfficeHandler) GetEditorConfig(c *gin.Context) {
 		},
 	}
 
-	// Sign JWT if secret is configured
-	if h.config.OnlyOffice.JWTSecret != "" {
-		token, err := h.signJWT(docConfig)
-		if err != nil {
-			log.Printf("Failed to sign OnlyOffice JWT: %v", err)
-		} else {
-			docConfig.Token = token
-		}
+	// Sign JWT. OnlyOffice sessions must never be served without a token.
+	token, err := h.signJWT(docConfig)
+	if err != nil {
+		log.Printf("Failed to sign OnlyOffice JWT: %v", err)
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error_msg": "Failed to initialize OnlyOffice JWT"})
+		return
 	}
+	docConfig.Token = token
 
-	// Store doc_key mapping in database for callback lookup
+	// Store doc_key mapping in database for callback lookup. Without this mapping,
+	// the callback cannot be bound safely to the original document and user.
 	if err := h.saveDocKeyMapping(docKey, userID, repoID, filePath); err != nil {
 		log.Printf("Failed to save doc_key mapping: %v", err)
-		// Non-fatal, continue
+		c.JSON(http.StatusInternalServerError, gin.H{"error_msg": "Failed to initialize OnlyOffice session"})
+		return
 	}
 
 	// Return response
@@ -491,6 +497,85 @@ type OnlyOfficeCallbackRequest struct {
 	URL    string   `json:"url,omitempty"`
 	Key    string   `json:"key"`
 	Users  []string `json:"users,omitempty"`
+	Token  string   `json:"token,omitempty"` // JWT token from OnlyOffice (when JWT is configured)
+}
+
+func extractOnlyOfficeJWT(body []byte, authHeader string) (string, error) {
+	authHeader = strings.TrimSpace(authHeader)
+	if authHeader != "" {
+		fields := strings.Fields(authHeader)
+		if len(fields) == 1 {
+			return fields[0], nil
+		}
+		if len(fields) == 2 {
+			if strings.EqualFold(fields[0], "Bearer") || strings.EqualFold(fields[0], "Token") {
+				return fields[1], nil
+			}
+		}
+	}
+
+	var outer struct {
+		Token string `json:"token"`
+	}
+	if err := json.Unmarshal(body, &outer); err != nil {
+		return "", fmt.Errorf("parse callback body: %w", err)
+	}
+	if strings.TrimSpace(outer.Token) == "" {
+		return "", fmt.Errorf("missing JWT token in callback body or Authorization header")
+	}
+	return strings.TrimSpace(outer.Token), nil
+}
+
+// verifyCallbackJWT verifies the JWT token sent by OnlyOffice in the callback.
+// When JWTSecret is configured, OnlyOffice wraps the real payload inside a JWT
+// in the "token" field of the JSON body (or in the Authorization header).
+// Returns the verified payload as an OnlyOfficeCallbackRequest, or an error.
+func (h *OnlyOfficeHandler) verifyCallbackJWT(body []byte, authHeader string) (*OnlyOfficeCallbackRequest, error) {
+	secret := strings.TrimSpace(h.config.OnlyOffice.JWTSecret)
+	if secret == "" {
+		return nil, fmt.Errorf("OnlyOffice JWT secret is not configured")
+	}
+
+	tokenString, err := extractOnlyOfficeJWT(body, authHeader)
+	if err != nil {
+		return nil, err
+	}
+
+	// Verify the JWT signature
+	token, err := jwt.Parse(tokenString, func(t *jwt.Token) (interface{}, error) {
+		if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
+			return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
+		}
+		return []byte(secret), nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("JWT verification failed: %w", err)
+	}
+
+	claims, ok := token.Claims.(jwt.MapClaims)
+	if !ok || !token.Valid {
+		return nil, fmt.Errorf("invalid JWT claims")
+	}
+
+	// OnlyOffice puts the real payload inside a "payload" claim
+	payloadRaw, exists := claims["payload"]
+	if !exists {
+		// Some OnlyOffice versions put fields directly in claims
+		payloadRaw = map[string]interface{}(claims)
+	}
+
+	// Re-marshal and unmarshal into our struct
+	payloadBytes, err := json.Marshal(payloadRaw)
+	if err != nil {
+		return nil, fmt.Errorf("marshal JWT payload: %w", err)
+	}
+
+	var req OnlyOfficeCallbackRequest
+	if err := json.Unmarshal(payloadBytes, &req); err != nil {
+		return nil, fmt.Errorf("parse JWT payload: %w", err)
+	}
+
+	return &req, nil
 }
 
 // EditorCallback handles the OnlyOffice callback
@@ -502,68 +587,53 @@ type OnlyOfficeCallbackRequest struct {
 // 4 - Document closed with no changes
 // 6 - Document editing error / force save in progress
 func (h *OnlyOfficeHandler) EditorCallback(c *gin.Context) {
-	var req OnlyOfficeCallbackRequest
+	if !h.config.OnlyOffice.Enabled {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": 1})
+		return
+	}
+	if strings.TrimSpace(h.config.OnlyOffice.JWTSecret) == "" {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": 1})
+		return
+	}
 
-	// Read the body for JWT verification if needed
-	body, err := io.ReadAll(c.Request.Body)
+	// Read body once (needed for JWT verification)
+	body, err := io.ReadAll(io.LimitReader(c.Request.Body, 1<<20)) // 1 MB max
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": 1})
 		return
 	}
-	c.Request.Body = io.NopCloser(bytes.NewBuffer(body))
 
-	// Parse the request
-	if err := json.Unmarshal(body, &req); err != nil {
-		log.Printf("OnlyOffice callback: failed to parse request: %v", err)
-		c.JSON(http.StatusBadRequest, gin.H{"error": 1})
+	// Verify JWT signature BEFORE processing the payload.
+	// When JWTSecret is configured, OnlyOffice signs the callback body.
+	// This prevents unauthenticated callers from triggering SSRF via the URL field.
+	reqPtr, err := h.verifyCallbackJWT(body, c.GetHeader("Authorization"))
+	if err != nil {
+		log.Printf("OnlyOffice callback: JWT verification failed: %v", err)
+		c.JSON(http.StatusForbidden, gin.H{"error": 1})
 		return
 	}
+	req := *reqPtr
 
 	log.Printf("OnlyOffice callback: status=%d, key=%s, url=%s", req.Status, req.Key, req.URL)
 
-	// Get document info from query params or database
-	repoID := c.Query("repo_id")
-	filePath := c.Query("file_path")
-	docKey := c.Query("doc_key")
-
-	// Normalize file path to ensure consistent format (handles URL decoding artifacts)
-	if filePath != "" {
-		filePath = normalizePath(filePath)
-	}
-
-	// Get user ID from doc_key mapping or callback request
-	var userID string
-
-	// If not in query params, try to get from database using the key
-	if repoID == "" || filePath == "" {
-		if req.Key != "" {
-			docKey = req.Key
-		}
-		if docKey != "" {
-			userID, repoID, filePath, err = h.getDocKeyMapping(docKey)
-			if err != nil {
-				log.Printf("OnlyOffice callback: failed to get doc_key mapping: %v", err)
-				// Still return success to OnlyOffice
-				c.JSON(http.StatusOK, gin.H{"error": 0})
-				return
-			}
-			// Normalize path from database as well
-			filePath = normalizePath(filePath)
-		}
-	}
-
-	// Try to get user ID from callback request if not from mapping
-	if userID == "" && len(req.Users) > 0 {
-		userID = req.Users[0]
-	}
-	// Fallback to a system UUID if no user ID available
-	if userID == "" {
-		userID = "00000000-0000-0000-0000-000000000000"
+	docKey := strings.TrimSpace(c.Query("doc_key"))
+	if strings.TrimSpace(req.Key) != "" {
+		docKey = strings.TrimSpace(req.Key)
 	}
 
 	switch req.Status {
 	case 1:
 		// Document is being edited - nothing to do
+		c.JSON(http.StatusOK, gin.H{"error": 0})
+
+	case 4:
+		// Document closed with no changes. If the mapping is already gone, keep the
+		// callback idempotent and return success.
+		if docKey != "" {
+			if err := h.deleteDocKeyMapping(docKey); err != nil {
+				log.Printf("OnlyOffice callback: failed to delete doc_key mapping: %v", err)
+			}
+		}
 		c.JSON(http.StatusOK, gin.H{"error": 0})
 
 	case 2, 6:
@@ -573,6 +643,19 @@ func (h *OnlyOfficeHandler) EditorCallback(c *gin.Context) {
 			c.JSON(http.StatusOK, gin.H{"error": 0})
 			return
 		}
+		if docKey == "" {
+			log.Printf("OnlyOffice callback: missing doc_key for save callback")
+			c.JSON(http.StatusOK, gin.H{"error": 1})
+			return
+		}
+
+		userID, repoID, filePath, err := h.getDocKeyMapping(docKey)
+		if err != nil {
+			log.Printf("OnlyOffice callback: failed to get doc_key mapping: %v", err)
+			c.JSON(http.StatusOK, gin.H{"error": 1})
+			return
+		}
+		filePath = normalizePath(filePath)
 
 		// ========================================================================
 		// PERMISSION CHECK: User must have write permission to save edits
@@ -608,7 +691,7 @@ func (h *OnlyOfficeHandler) EditorCallback(c *gin.Context) {
 		}
 
 		// Download the edited document from OnlyOffice
-		err := h.saveEditedDocument(c.Request.Context(), repoID, filePath, req.URL, userID)
+		err = h.saveEditedDocument(c.Request.Context(), repoID, filePath, req.URL, userID)
 		if err != nil {
 			log.Printf("OnlyOffice callback: failed to save document: %v", err)
 			c.JSON(http.StatusOK, gin.H{"error": 1})
@@ -624,19 +707,71 @@ func (h *OnlyOfficeHandler) EditorCallback(c *gin.Context) {
 
 		c.JSON(http.StatusOK, gin.H{"error": 0})
 
-	case 4:
-		// Document closed with no changes
-		if docKey != "" {
-			if err := h.deleteDocKeyMapping(docKey); err != nil {
-				log.Printf("OnlyOffice callback: failed to delete doc_key mapping: %v", err)
-			}
-		}
-		c.JSON(http.StatusOK, gin.H{"error": 0})
-
 	default:
 		log.Printf("OnlyOffice callback: unknown status %d", req.Status)
 		c.JSON(http.StatusOK, gin.H{"error": 0})
 	}
+}
+
+// onlyOfficeHTTPClient is a hardened HTTP client for downloading documents from OnlyOffice.
+// Timeout prevents hung connections; CheckRedirect prevents redirect-based SSRF.
+var onlyOfficeHTTPClient = &http.Client{
+	Timeout: 60 * time.Second,
+	CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		if len(via) >= 3 {
+			return fmt.Errorf("too many redirects")
+		}
+		return nil
+	},
+}
+
+func readOnlyOfficeDocument(reader io.Reader, maxDocSize int64) ([]byte, error) {
+	limited := &io.LimitedReader{R: reader, N: maxDocSize + 1}
+	content, err := io.ReadAll(limited)
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(content)) > maxDocSize {
+		return nil, fmt.Errorf("document exceeds maximum allowed size of %d bytes", maxDocSize)
+	}
+	return content, nil
+}
+
+// validateOnlyOfficeDownloadURL checks that the translated download URL points to
+// the configured OnlyOffice internal host. This prevents SSRF even if JWT is
+// compromised — the attacker cannot redirect downloads to arbitrary hosts.
+func (h *OnlyOfficeHandler) validateOnlyOfficeDownloadURL(downloadURL string) error {
+	parsed, err := url.Parse(downloadURL)
+	if err != nil {
+		return fmt.Errorf("invalid download URL: %w", err)
+	}
+
+	// Must be http or https
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return fmt.Errorf("download URL scheme %q not allowed", parsed.Scheme)
+	}
+
+	// If InternalURL is configured, the download must be on that host
+	if h.config.OnlyOffice.InternalURL != "" {
+		allowed, err := url.Parse(h.config.OnlyOffice.InternalURL)
+		if err != nil {
+			return fmt.Errorf("invalid OnlyOffice internal_url config: %w", err)
+		}
+		if !strings.EqualFold(parsed.Host, allowed.Host) {
+			return fmt.Errorf("download URL host %q does not match configured internal_url host %q", parsed.Host, allowed.Host)
+		}
+		return nil
+	}
+
+	// If APIJSURL is configured, allow that host too (non-internal setup)
+	if h.config.OnlyOffice.APIJSURL != "" {
+		apiParsed, err := url.Parse(h.config.OnlyOffice.APIJSURL)
+		if err == nil && strings.EqualFold(parsed.Host, apiParsed.Host) {
+			return nil
+		}
+	}
+
+	return fmt.Errorf("download URL host %q does not match any configured OnlyOffice host", parsed.Host)
 }
 
 // saveEditedDocument downloads the edited document and saves it to storage
@@ -654,10 +789,19 @@ func (h *OnlyOfficeHandler) saveEditedDocument(ctx context.Context, repoID, file
 		}
 	}
 
+	// Validate the download URL points to a known OnlyOffice host (SSRF protection)
+	if err := h.validateOnlyOfficeDownloadURL(internalURL); err != nil {
+		return fmt.Errorf("SSRF protection: %w", err)
+	}
+
 	log.Printf("OnlyOffice: downloading document from %s", internalURL)
 
-	// Download the document from OnlyOffice
-	resp, err := http.Get(internalURL)
+	// Download the document from OnlyOffice using a hardened HTTP client
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, internalURL, nil)
+	if err != nil {
+		return fmt.Errorf("failed to create download request: %w", err)
+	}
+	resp, err := onlyOfficeHTTPClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("failed to download document: %w", err)
 	}
@@ -667,8 +811,9 @@ func (h *OnlyOfficeHandler) saveEditedDocument(ctx context.Context, repoID, file
 		return fmt.Errorf("download returned status %d", resp.StatusCode)
 	}
 
-	// Read the content
-	content, err := io.ReadAll(resp.Body)
+	// Read the content with the configured size limit.
+	maxDocSize := h.config.OnlyOffice.MaxDocumentBytes
+	content, err := readOnlyOfficeDocument(resp.Body, maxDocSize)
 	if err != nil {
 		return fmt.Errorf("failed to read document: %w", err)
 	}

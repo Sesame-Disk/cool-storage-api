@@ -267,7 +267,7 @@ pieces are incomplete.
 - `internal/storage/storage.go:391-398` — `SelectBackend()` TODO
 - `internal/api/v2/restore.go` — Glacier restore (3 TODOs)
 - `internal/api/v2/libraries.go:998` — storage class migration job TODO
-- `config.example.yaml:69-77` — region/class config already documented
+- `configs/config.example.yaml:69-77` — region/class config already documented
 
 ---
 

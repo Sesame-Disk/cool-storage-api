@@ -278,8 +278,12 @@ sesamefs/
 ├── docs/                      # Detailed documentation
 ├── docker-compose.yaml        # Development stack (MinIO, dev tokens)
 ├── docker-compose.prod.yml    # Production stack (S3, OIDC, SSL)
-├── config.docker.yaml         # Config baked into the dev Docker image
-├── config.prod.yaml           # Config mounted in production
+├── configs/                   # YAML config files (dev, prod, regions)
+│   ├── config.docker.yaml     # Config baked into the dev Docker image
+│   ├── config.prod.yaml       # Config mounted in production
+│   ├── config.example.yaml    # Base example config
+│   ├── config-eu.yaml         # EU multiregion sample
+│   └── config-usa.yaml        # USA multiregion sample
 ├── .env.example               # Dev environment template
 └── .env.prod.example          # Production environment template
 ```

@@ -39,7 +39,7 @@ WORKDIR /app
 COPY --from=builder /build/sesamefs .
 
 # Copy config files for development
-COPY --from=builder /build/config.docker.yaml ./config.yaml
+COPY --from=builder /build/configs/config.docker.yaml ./config.yaml
 
 # Use non-root user
 USER sesamefs

@@ -416,7 +416,7 @@ The configuration must be minimal for reliable editing. Complex customization fi
     },
     "documentType": "word",
     "editorConfig": {
-      "callbackUrl": "http://sesamefs:8080/onlyoffice/editor-callback/?repo_id=...&file_path=...&doc_key=...",
+      "callbackUrl": "http://sesamefs:8080/onlyoffice/editor-callback/?doc_key=...",
       "mode": "edit",
       "user": { "id": "user-uuid", "name": "username" },
       "customization": {
@@ -429,6 +429,12 @@ The configuration must be minimal for reliable editing. Complex customization fi
   "api_js_url": "http://localhost:8088/web-apps/apps/api/documents/api.js"
 }
 ```
+
+The callback is bound to the server-side `doc_key` mapping. SesameFS requires a
+configured `ONLYOFFICE_JWT_SECRET` whenever OnlyOffice is enabled, resolves the
+canonical `repo_id`, `file_path`, and `user_id` from that mapping during save, and
+verifies the OnlyOffice JWT from either the callback body (`token`) or the
+`Authorization` header before downloading the edited document.
 
 **Critical Configuration Requirements:**
 

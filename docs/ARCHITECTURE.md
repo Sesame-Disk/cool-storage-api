@@ -145,7 +145,7 @@ The storage manager (`internal/api/server.go` → `initStorageManager`) supports
 
 **`backends:` — single-region (current prod)**
 
-Used in `config.prod.yaml`. One bucket, credentials from env vars. `initStorageManager` reads `cfg.Storage.Backends` and registers each entry under its name (e.g., `"hot"`).
+Used in `configs/config.prod.yaml`. One bucket, credentials from env vars. `initStorageManager` reads `cfg.Storage.Backends` and registers each entry under its name (e.g., `"hot"`).
 
 ```yaml
 storage:
@@ -159,7 +159,7 @@ storage:
 
 **`classes:` — multi-region (future prod / current dev)**
 
-Used in `config.docker.yaml`, `config.example.yaml`, and the multiregion test configs under `configs/`. These files now carry the full structural topology in YAML (`bucket`, `region`, `endpoint`, `use_path_style`, `failover_class`, routing maps), while credentials still come from env vars. `initStorageManager` reads `cfg.Storage.Classes`.
+Used in `configs/config.docker.yaml`, `configs/config.example.yaml`, and the multiregion test configs under `configs/`. These files now carry the full structural topology in YAML (`bucket`, `region`, `endpoint`, `use_path_style`, `failover_class`, routing maps), while credentials still come from env vars. `initStorageManager` reads `cfg.Storage.Classes`.
 
 ```yaml
 storage:
@@ -184,7 +184,7 @@ storage:
     eu:  { hot: hot-s3-eu }
 ```
 
-**Migration path**: When moving to multi-region, replace the `backends:` block in `config.prod.yaml` with `classes:` + `endpoint_regions:` + `region_classes:` following `config.example.yaml`. No code changes needed.
+**Migration path**: When moving to multi-region, replace the `backends:` block in `configs/config.prod.yaml` with `classes:` + `endpoint_regions:` + `region_classes:` following `configs/config.example.yaml`. No code changes needed.
 
 ---
 
@@ -537,7 +537,7 @@ GC delete:    -999 → [row deleted] (unconditional DELETE, Phase 2)
 Upload race:  -999 → [wait] → [row deleted] → INSERT fresh ref_count=1
 ```
 
-**Multi-region considerations**: All LWT operations on the `blocks` table use Cassandra's default `SERIAL` consistency (global Paxos). This ensures uploads in DC-A and GC in DC-B are serialized correctly. GC must be enabled in only one DC (see `config.prod.yaml` comments and KNOWN_ISSUES.md `ISSUE-GC-MULTIINSTANCE-01`). The 1h grace period (>>200ms cross-DC replication lag) ensures non-LWT reads are also consistent before processing.
+**Multi-region considerations**: All LWT operations on the `blocks` table use Cassandra's default `SERIAL` consistency (global Paxos). This ensures uploads in DC-A and GC in DC-B are serialized correctly. GC must be enabled in only one DC (see `configs/config.prod.yaml` comments and KNOWN_ISSUES.md `ISSUE-GC-MULTIINSTANCE-01`). The 1h grace period (>>200ms cross-DC replication lag) ensures non-LWT reads are also consistent before processing.
 
 #### Reverse Lookup Table
 

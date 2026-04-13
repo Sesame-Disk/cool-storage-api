@@ -686,9 +686,9 @@ Added `getEffectiveHostname(c *gin.Context) string` helper in `server.go` for th
 ### Production File Upload 500 — Storage Backend Not Registered — FIXED ✅
 **Fixed**: 2026-02-18
 **Was**: All file uploads in production returned HTTP 500 after successful streaming. Server log: `Finalization failed: block store not available: no healthy backend available for class hot`.
-**Root Cause**: `initStorageManager` only iterated `cfg.Storage.Classes` (new multi-region format). `config.prod.yaml` uses the legacy `backends:` key — so the storage manager started with zero backends. `finalizeUploadStreaming` called `storageManager.GetHealthyBlockStore("")` → resolved default class `"hot"` → not found → 500.
+**Root Cause**: `initStorageManager` only iterated `cfg.Storage.Classes` (new multi-region format). `configs/config.prod.yaml` uses the legacy `backends:` key — so the storage manager started with zero backends. `finalizeUploadStreaming` called `storageManager.GetHealthyBlockStore("")` → resolved default class `"hot"` → not found → 500.
 **Fix**: Added a second loop in `initStorageManager` that also registers backends from `cfg.Storage.Backends` (legacy format), skipping any name already registered via `classes:`. Both formats produce identical entries in the manager.
-**Files**: `internal/api/server.go`, `config.prod.yaml` (comment only)
+**Files**: `internal/api/server.go`, `configs/config.prod.yaml` (comment only)
 
 ---
 
@@ -1806,7 +1806,7 @@ If a name existed at the grandparent level, it would incorrectly return 409.
 
 ### Docker Compose Secrets Externalized - FIXED ✅
 **Fixed**: 2026-02-11
-**Was**: Production credentials (email/password) hardcoded in `docker-compose.yaml`, JWT secret hardcoded in `config.docker.yaml`
+**Was**: Production credentials (email/password) hardcoded in `docker-compose.yaml`, JWT secret hardcoded in `configs/config.docker.yaml`
 
 **What was fixed**:
 - All values now use `${VAR:-default}` syntax, read from `.env`
@@ -1815,7 +1815,7 @@ If a name existed at the grandparent level, it would incorrectly return 409.
 - JWT secret uses env var `ONLYOFFICE_JWT_SECRET`
 - `.reference.md` added to `.gitignore`
 
-**Files**: `docker-compose.yaml`, `docker-compose-multiregion.yaml`, `.env`, `.env.example`, `config.docker.yaml`, `.gitignore`
+**Files**: `docker-compose.yaml`, `docker-compose-multiregion.yaml`, `.env`, `.env.example`, `configs/config.docker.yaml`, `.gitignore`
 
 ---
 

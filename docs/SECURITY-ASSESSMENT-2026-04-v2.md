@@ -63,7 +63,7 @@ reassessment identified **3 new findings** not covered in v1.
 | H-9 | OIDC DNS rebinding | High | **OPEN** | No DNS pinning on discovery/JWKS fetch |
 | L-1 | OIDC `aud` not validated | Latent | **FIXED** | Full audience validation implemented with multi-aud support |
 | M-1 | CSRF logout | Medium | **OPEN** | Still returns 200 without auth on both targets |
-| M-2 | CORS `*` + credentials | Medium | **OPEN** | `config.prod.yaml` still ships `allowed_origins: ["*"]` |
+| M-2 | CORS `*` + credentials | Medium | **OPEN** | `configs/config.prod.yaml` still ships `allowed_origins: ["*"]` |
 | M-3 | Missing security headers | Medium | **PARTIALLY FIXED** | 3/5 now set by app; CSP still missing; prod nginx adds X-Frame-Options |
 | M-4 | Avatar email enumeration | Medium | **NEEDS RETEST** | Requires known email |
 | M-5 | `/metrics` exposed | Medium | **MITIGATED (prod)** | Blocked by nginx (403); still exposed at app level |
@@ -103,7 +103,7 @@ All unauthenticated probes were run against both targets. Key differences:
 
 ### Critical difference: Production CORS
 
-Production is running with `ACAO: *` and `ACAC: true`. This is because `config.prod.yaml`
+Production is running with `ACAO: *` and `ACAC: true`. This is because `configs/config.prod.yaml`
 ships `allowed_origins: ["*"]` and the CORS middleware treats `"*"` as a real origin, not
 as a special dev-mode flag. The `buildCORSConfig` function in `server.go:258-285` only
 uses `AllowAllOrigins` when `Auth.DevMode` is true, but when prod config has `["*"]` in
@@ -252,7 +252,7 @@ any authentication.
 
 #### M-2 CORS wildcard in production (STILL OPEN)
 
-**Critical for production:** `config.prod.yaml:209-210` still ships:
+**Critical for production:** `configs/config.prod.yaml:209-210` still ships:
 ```yaml
 cors:
   allowed_origins:
@@ -413,7 +413,7 @@ all database traffic.
 
 1. **V2-C1 + C-1:** OnlyOffice callback auth + SSRF protection
 2. **C-2:** Serve user-uploaded SVG/HTML as `attachment`, not `inline`
-3. **M-2:** Replace `allowed_origins: ["*"]` in `config.prod.yaml` with actual domain(s)
+3. **M-2:** Replace `allowed_origins: ["*"]` in `configs/config.prod.yaml` with actual domain(s)
 4. **CSP header:** Add `Content-Security-Policy` to the security headers middleware
 
 ### Should-fix soon
@@ -526,7 +526,7 @@ SesameFS itself is very lightweight at 86 MB. Cassandra dominates memory at ~1 G
 ### Running benchmarks
 
 ```bash
-# Against local (use dev token from config.docker.yaml)
+# Against local (use dev token from configs/config.docker.yaml)
 ./docs/benchmarks/benchmark-storage-ops.sh \
     --host http://localhost:8082 --token dev-token-superadmin --repo <repo-id>
 
@@ -584,5 +584,5 @@ containers. When benchmarking a remote host, those numbers are irrelevant to the
   - Metrics blocked by nginx (403)
   - /ready caught by nginx (returns frontend HTML)
   - X-Frame-Options: SAMEORIGIN (added by nginx)
-  - CORS: `ACAO: *` + `ACAC: true` (from `config.prod.yaml`)
+  - CORS: `ACAO: *` + `ACAC: true` (from `configs/config.prod.yaml`)
 - **Assessment date:** 2026-04-13

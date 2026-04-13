@@ -1,10 +1,12 @@
 package v2
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 
 	"github.com/Sesame-Disk/sesamefs/internal/config"
+	"github.com/golang-jwt/jwt/v5"
 )
 
 // TestGenerateDocKey tests the document key generation
@@ -150,11 +152,11 @@ func TestCanEditFile(t *testing.T) {
 		{"document.docx", true},
 		{"spreadsheet.xlsx", true},
 		{"presentation.pptx", true},
-		{"document.doc", false},  // Old format - view only
-		{"document.odt", false},  // ODF - view only
-		{"document.pdf", false},  // PDF - view only
+		{"document.doc", false}, // Old format - view only
+		{"document.odt", false}, // ODF - view only
+		{"document.pdf", false}, // PDF - view only
 		{"image.png", false},
-		{"DOCUMENT.DOCX", true},  // Case insensitive
+		{"DOCUMENT.DOCX", true}, // Case insensitive
 	}
 
 	for _, tt := range tests {
@@ -192,7 +194,7 @@ func TestCanViewFile(t *testing.T) {
 		{"image.png", false},
 		{"video.mp4", false},
 		{"archive.zip", false},
-		{"DOCUMENT.DOCX", true},  // Case insensitive
+		{"DOCUMENT.DOCX", true}, // Case insensitive
 	}
 
 	for _, tt := range tests {
@@ -255,8 +257,8 @@ func TestSignJWT(t *testing.T) {
 		payload := map[string]string{"test": "data"}
 		token, err := h.signJWT(payload)
 
-		if err != nil {
-			t.Fatalf("signJWT() error = %v", err)
+		if err == nil {
+			t.Fatal("signJWT() accepted an empty JWT secret")
 		}
 		if token != "" {
 			t.Errorf("signJWT() with empty secret should return empty token, got %q", token)
@@ -282,6 +284,106 @@ func TestSignJWT(t *testing.T) {
 			t.Error("signJWT() should be deterministic for same inputs")
 		}
 	})
+}
+
+func TestVerifyCallbackJWT(t *testing.T) {
+	newToken := func(t *testing.T, secret string, payload map[string]any) string {
+		t.Helper()
+		token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{"payload": payload})
+		signed, err := token.SignedString([]byte(secret))
+		if err != nil {
+			t.Fatalf("SignedString() error = %v", err)
+		}
+		return signed
+	}
+
+	t.Run("accepts token from body", func(t *testing.T) {
+		secret := "test-secret-key-12345"
+		h := &OnlyOfficeHandler{config: &config.Config{OnlyOffice: config.OnlyOfficeConfig{JWTSecret: secret}}}
+		payload := map[string]any{
+			"status": 2,
+			"key":    "doc-key-123",
+			"url":    "http://onlyoffice/files/doc.docx",
+			"users":  []string{"user-1"},
+		}
+		body, err := json.Marshal(map[string]string{"token": newToken(t, secret, payload)})
+		if err != nil {
+			t.Fatalf("Marshal() error = %v", err)
+		}
+
+		req, err := h.verifyCallbackJWT(body, "")
+		if err != nil {
+			t.Fatalf("verifyCallbackJWT() error = %v", err)
+		}
+		if req.Key != "doc-key-123" {
+			t.Fatalf("Key = %q, want %q", req.Key, "doc-key-123")
+		}
+		if req.URL != "http://onlyoffice/files/doc.docx" {
+			t.Fatalf("URL = %q, want callback URL", req.URL)
+		}
+	})
+
+	t.Run("accepts token from authorization header", func(t *testing.T) {
+		secret := "test-secret-key-12345"
+		h := &OnlyOfficeHandler{config: &config.Config{OnlyOffice: config.OnlyOfficeConfig{JWTSecret: secret}}}
+		payload := map[string]any{
+			"status": 6,
+			"key":    "doc-key-456",
+			"url":    "http://onlyoffice/files/doc.docx",
+		}
+		body := []byte(`{"status":6}`)
+
+		req, err := h.verifyCallbackJWT(body, "Bearer "+newToken(t, secret, payload))
+		if err != nil {
+			t.Fatalf("verifyCallbackJWT() error = %v", err)
+		}
+		if req.Key != "doc-key-456" {
+			t.Fatalf("Key = %q, want %q", req.Key, "doc-key-456")
+		}
+	})
+
+	t.Run("rejects missing token when secret is configured", func(t *testing.T) {
+		h := &OnlyOfficeHandler{config: &config.Config{OnlyOffice: config.OnlyOfficeConfig{JWTSecret: "test-secret-key-12345"}}}
+		if _, err := h.verifyCallbackJWT([]byte(`{"status":2}`), ""); err == nil {
+			t.Fatal("verifyCallbackJWT() accepted a callback without token")
+		}
+	})
+
+	t.Run("rejects plain body when jwt secret is missing", func(t *testing.T) {
+		h := &OnlyOfficeHandler{config: &config.Config{OnlyOffice: config.OnlyOfficeConfig{}}}
+		if _, err := h.verifyCallbackJWT([]byte(`{"status":2,"key":"doc-key-789","url":"http://onlyoffice/files/doc.docx"}`), ""); err == nil {
+			t.Fatal("verifyCallbackJWT() accepted a callback without configured JWT secret")
+		}
+	})
+}
+
+func TestReadOnlyOfficeDocument(t *testing.T) {
+	t.Run("reads document within limit", func(t *testing.T) {
+		content, err := readOnlyOfficeDocument(strings.NewReader("12345"), 5)
+		if err != nil {
+			t.Fatalf("readOnlyOfficeDocument() error = %v", err)
+		}
+		if got := string(content); got != "12345" {
+			t.Fatalf("content = %q, want %q", got, "12345")
+		}
+	})
+
+	t.Run("rejects document larger than limit", func(t *testing.T) {
+		content, err := readOnlyOfficeDocument(strings.NewReader("123456"), 5)
+		if err == nil {
+			t.Fatal("readOnlyOfficeDocument() accepted oversized content")
+		}
+		if content != nil {
+			t.Fatalf("content = %q, want nil", string(content))
+		}
+	})
+}
+
+func TestDefaultOnlyOfficeMaxDocumentBytes(t *testing.T) {
+	cfg := config.DefaultConfig()
+	if cfg.OnlyOffice.MaxDocumentBytes != 500*1024*1024 {
+		t.Fatalf("OnlyOffice.MaxDocumentBytes = %d, want %d", cfg.OnlyOffice.MaxDocumentBytes, int64(500*1024*1024))
+	}
 }
 
 // TestGenerateFSID tests FS object ID generation

@@ -25,7 +25,7 @@ accounts.sesamedisk.com ← sesamefs (OIDC, outbound HTTPS)
 | File | Purpose |
 |---|---|
 | `docker-compose.prod.yml` | Production stack (no MinIO, no dev tools) |
-| `config.prod.yaml` | Structural config — mounted over the baked image config |
+| `configs/config.prod.yaml` | Structural config — mounted over the baked image config |
 | `nginx/nginx.conf.template` | Nginx config — `${DOMAIN}` substituted at container start |
 | `.env.example` | Template for the single `.env` file you create on the server |
 
@@ -37,10 +37,10 @@ SesameFS resolves configuration in this order:
 
 1. `internal/config.DefaultConfig()` provides built-in defaults.
 2. The YAML file pointed to by `CONFIG_PATH` is loaded on top of those defaults.
-  In production compose, that is `config.prod.yaml` mounted as `/app/config.yaml`.
+  In production compose, that is `configs/config.prod.yaml` mounted as `/app/config.yaml`.
 3. Environment variables are applied last via `applyEnvOverrides()`, so env always wins.
 
-That is why `config.prod.yaml` can look thinner than `config.docker.yaml` or a local test config:
+That is why `configs/config.prod.yaml` can look thinner than `configs/config.docker.yaml` or a local test config:
 production only needs to pin the non-secret structural values that differ from the code defaults,
 while local/test often pins more knobs explicitly for reproducibility.
 
@@ -429,7 +429,7 @@ docker stats
 
 ## Configuration reference
 
-### `config.prod.yaml`
+### `configs/config.prod.yaml`
 
 Contains structural settings with no secrets. Mounted over the config
 baked into the Docker image. Edit and restart sesamefs to apply changes.
@@ -446,7 +446,7 @@ Settings that **cannot** be set via env vars and must be in this file:
 |---|---|---|
 | `AUTH_DEV_MODE` | `auth.dev_mode` | Set `false` in prod |
 | `OIDC_ENABLED` | `auth.oidc.enabled` | Set `true` in prod |
-| `OIDC_ISSUER` | `auth.oidc.issuer` | Default in config.prod.yaml |
+| `OIDC_ISSUER` | `auth.oidc.issuer` | Default in configs/config.prod.yaml |
 | `OIDC_CLIENT_ID` | `auth.oidc.client_id` | Secret |
 | `OIDC_CLIENT_SECRET` | `auth.oidc.client_secret` | Secret |
 | `OIDC_REDIRECT_URIS` | `auth.oidc.redirect_uris` | Required when OIDC is enabled. Computed by compose in the standard production setup. |
@@ -512,7 +512,7 @@ docker compose -f docker-compose.prod.yml logs sesamefs
 Common causes:
 - **Cassandra not ready yet** — wait 90s and retry, or check `docker compose ps`
 - **S3 connection failed** — verify bucket name, region, and credentials in `.env`
-- **Config parse error** — check `config.prod.yaml` for YAML syntax errors
+- **Config parse error** — check `configs/config.prod.yaml` for YAML syntax errors
 
 ### `/ready` returns storage error
 
@@ -675,10 +675,10 @@ CASSANDRA_BROADCAST_RPC_ADDRESS=10.0.2.20
 
 ### Step M2 — Storage config
 
-The default `config.prod.yaml` uses single-region storage (`backends:`).
+The default `configs/config.prod.yaml` uses single-region storage (`backends:`).
 For multi-region you need the `classes:` + `region_classes:` format.
 
-Create a `config.prod.yaml` per region (or a single one that uses
+Create a `configs/config.prod.yaml` per region (or a single one that uses
 `SERVER_REGION` to resolve the right storage class). See
 `configs/config-usa.yaml` and `configs/config-eu.yaml` for the structure —
 replace MinIO endpoints with real S3 buckets.
@@ -696,7 +696,7 @@ What already works in the backend/frontend stack:
 
 What the stock production deploy does **not** provide by itself yet:
 
-- `config.prod.yaml` still ships as a single-region example using legacy `backends:`
+- `configs/config.prod.yaml` still ships as a single-region example using legacy `backends:`
 - `docker-compose.prod.yml` does not spin up per-region SesameFS front doors or per-region storage configs automatically
 - sys-admin and org-admin info pages can now edit org storage policy; direct API writes remain available for automation
 - there is no built-in migration workflow for existing non-empty libraries that need to move from one storage class to another
@@ -708,14 +708,14 @@ For production multi-region, treat this feature as requiring operator-provided t
 
 ### Step M2.1 — Required config for region-pinned libraries
 
-In production multi-region, `config.prod.yaml` must stop using the single `backends:` example and define all of these:
+In production multi-region, `configs/config.prod.yaml` must stop using the single `backends:` example and define all of these:
 
 - `storage.classes`
 - `storage.default_class`
 - `storage.endpoint_regions`
 - `storage.region_classes`
 
-Use `config.example.yaml` as the canonical structure. At minimum, you need one hot class per region, for example:
+Use `configs/config.example.yaml` as the canonical structure. At minimum, you need one hot class per region, for example:
 
 ```yaml
 storage:
@@ -937,7 +937,7 @@ username+password) **always returns 401** when `AUTH_DEV_MODE=false`.
 **Not affected:** Seafile desktop app and mobile app (both use browser SSO).
 
 **Workaround for testing:** Keep `AUTH_DEV_MODE=true` with specific tokens in
-`config.prod.yaml → auth.dev_tokens`.
+`configs/config.prod.yaml → auth.dev_tokens`.
 
 **Permanent fix:** See [docs/TECHNICAL-DEBT.md](TECHNICAL-DEBT.md) for options
 (Personal Access Tokens, OIDC Device Flow).

@@ -376,6 +376,7 @@ type OnlyOfficeConfig struct {
 	EditExtensions    []string `yaml:"edit_extensions"`    // Extensions that can be edited (docx, pptx, xlsx)
 	ServerURL         string   `yaml:"server_url"`         // URL for OnlyOffice to reach SesameFS (e.g., http://sesamefs:8080)
 	InternalURL       string   `yaml:"internal_url"`       // URL for SesameFS to reach OnlyOffice internally (e.g., http://onlyoffice:80)
+	MaxDocumentBytes  int64    `yaml:"max_document_bytes"` // Maximum OnlyOffice callback download size before rejecting the save
 }
 
 // ElasticsearchConfig holds Elasticsearch search backend settings
@@ -713,6 +714,7 @@ func DefaultConfig() *Config {
 			ForceSave:         true,
 			ViewExtensions:    []string{"doc", "docx", "ppt", "pptx", "xls", "xlsx", "odt", "fodt", "odp", "fodp", "ods", "fods"},
 			EditExtensions:    []string{"docx", "pptx", "xlsx"},
+			MaxDocumentBytes:  500 * 1024 * 1024,
 		},
 		Elasticsearch: ElasticsearchConfig{
 			Enabled: true,
@@ -749,6 +751,11 @@ func (c *Config) applyEnvOverrides() {
 	}
 	if v := os.Getenv("SERVER_TRUSTED_PROXIES"); v != "" {
 		c.Server.TrustedProxies = strings.Split(v, ",")
+	}
+
+	// CORS
+	if v := os.Getenv("CORS_ALLOWED_ORIGINS"); v != "" {
+		c.CORS.AllowedOrigins = strings.Split(v, ",")
 	}
 
 	// Database
@@ -929,6 +936,11 @@ func (c *Config) applyEnvOverrides() {
 	if v := os.Getenv("ONLYOFFICE_JWT_SECRET"); v != "" {
 		c.OnlyOffice.JWTSecret = v
 	}
+	if v := os.Getenv("ONLYOFFICE_MAX_DOCUMENT_BYTES"); v != "" {
+		if i, err := strconv.ParseInt(v, 10, 64); err == nil {
+			c.OnlyOffice.MaxDocumentBytes = i
+		}
+	}
 
 	// Elasticsearch
 	if v := os.Getenv("ELASTICSEARCH_ENABLED"); v != "" {
@@ -1030,7 +1042,20 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("auth.share_link_hmac_key must be set to a secure secret in production (set SHARE_LINK_HMAC_KEY env var)")
 	}
 	if !c.Auth.DevMode && !hasConfiguredStrings(c.CORS.AllowedOrigins) {
-		return fmt.Errorf("cors.allowed_origins must contain at least one origin in production")
+		return fmt.Errorf("cors.allowed_origins must contain at least one origin in production (set CORS_ALLOWED_ORIGINS env var)")
+	}
+	if !c.Auth.DevMode {
+		for _, origin := range c.CORS.AllowedOrigins {
+			if strings.TrimSpace(origin) == "*" {
+				return fmt.Errorf("cors.allowed_origins contains wildcard \"*\" which is insecure in production; set specific origins via CORS_ALLOWED_ORIGINS env var")
+			}
+		}
+	}
+	if c.OnlyOffice.Enabled && strings.TrimSpace(c.OnlyOffice.JWTSecret) == "" {
+		return fmt.Errorf("onlyoffice.jwt_secret must be set when onlyoffice.enabled is true")
+	}
+	if c.OnlyOffice.MaxDocumentBytes <= 0 {
+		return fmt.Errorf("onlyoffice.max_document_bytes must be greater than zero")
 	}
 	normalizedPreviewExtensions, err := normalizeFileViewPreviewExtensions(c.FileView.PreviewExtensions)
 	if err != nil {

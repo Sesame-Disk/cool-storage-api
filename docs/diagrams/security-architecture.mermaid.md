@@ -161,7 +161,7 @@ flowchart TD
 | Check | Local :8082 | Prod sfs.nihaoshares.com |
 |-------|-------------|--------------------------|
 | OnlyOffice CB | HTTP 200, no auth | HTTP 200, no auth |
-| CORS | `*` (dev mode) | `*` (config.prod.yaml) |
+| CORS | `*` (dev mode) | `*` (configs/config.prod.yaml) |
 | /metrics | HTTP 200 exposed | HTTP 403 (nginx) |
 | /ready | JSON with db/storage | Caught by nginx |
 | OIDC config | `enabled: false` | Leaks client_id, issuer |

@@ -334,10 +334,15 @@ func (h *FileViewHandler) serveOnlyOfficeEditor(c *gin.Context, repoID, filePath
 		ooServerURL = h.serverURL
 	}
 	downloadURL := ooServerURL + "/seafhttp/files/" + downloadToken + "/" + filename
+	if strings.TrimSpace(h.config.OnlyOffice.JWTSecret) == "" {
+		redirectToFrontendErrorPage(c, http.StatusServiceUnavailable, "OnlyOffice Unavailable", "OnlyOffice JWT secret is not configured.")
+		return
+	}
 
-	// Generate callback URL (URL-encode file_path to handle spaces and special chars)
-	callbackURL := fmt.Sprintf("%s/onlyoffice/editor-callback/?repo_id=%s&file_path=%s&doc_key=%s",
-		ooServerURL, repoID, url.QueryEscape(filePath), docKey)
+	// The callback only carries doc_key. The server resolves repo/file/user from the
+	// stored mapping so callback callers cannot override them with request params.
+	callbackURL := fmt.Sprintf("%s/onlyoffice/editor-callback/?doc_key=%s",
+		ooServerURL, url.QueryEscape(docKey))
 
 	// Get user info
 	userName := strings.Split(userID, "@")[0]
@@ -378,20 +383,52 @@ func (h *FileViewHandler) serveOnlyOfficeEditor(c *gin.Context, repoID, filePath
 		},
 	}
 
-	// Sign JWT if secret is configured
-	if h.config.OnlyOffice.JWTSecret != "" {
-		token, err := ooHandler.signJWT(docConfig)
-		if err == nil {
-			docConfig.Token = token
-		}
+	// Sign JWT. OnlyOffice sessions must never be served without a token.
+	token, err := ooHandler.signJWT(docConfig)
+	if err != nil {
+		log.Printf("Failed to sign OnlyOffice JWT: %v", err)
+		redirectToFrontendErrorPage(c, http.StatusServiceUnavailable, "OnlyOffice Unavailable", "Failed to initialize OnlyOffice JWT.")
+		return
 	}
+	docConfig.Token = token
 
-	// Save doc key mapping
-	_ = ooHandler.saveDocKeyMapping(docKey, userID, repoID, filePath)
+	// Save doc key mapping. Without this mapping, the callback cannot be bound
+	// safely to the original document and user.
+	if err := ooHandler.saveDocKeyMapping(docKey, userID, repoID, filePath); err != nil {
+		log.Printf("Failed to save doc_key mapping: %v", err)
+		redirectToFrontendErrorPage(c, http.StatusInternalServerError, "Internal Error", "Failed to initialize OnlyOffice session.")
+		return
+	}
 
 	// Render the OnlyOffice editor page
 	html := onlyOfficeEditorHTML(h.config.OnlyOffice.APIJSURL, docConfig, filename)
 	c.Header("Content-Type", "text/html; charset=utf-8")
+
+	// CSP: allow the OnlyOffice API JS (external), inline scripts for the editor
+	// bootstrap, and same-origin framing (OnlyOffice renders in an iframe).
+	// 'self' covers favicon and CSS loaded from base.html via relative paths.
+	ooOrigin := extractOrigin(h.config.OnlyOffice.APIJSURL)
+	var csp string
+	if ooOrigin != "" {
+		csp = "default-src 'none'" +
+			"; script-src 'unsafe-inline' 'self' " + ooOrigin +
+			"; style-src 'unsafe-inline' 'self' " + ooOrigin +
+			"; img-src 'self' " + ooOrigin + " data:" +
+			"; font-src 'self' " + ooOrigin +
+			"; frame-src " + ooOrigin +
+			"; connect-src 'self' " + ooOrigin +
+			"; frame-ancestors 'self'"
+	} else {
+		csp = "default-src 'none'" +
+			"; script-src 'unsafe-inline' 'self'" +
+			"; style-src 'unsafe-inline' 'self'" +
+			"; img-src 'self' data:" +
+			"; font-src 'self'" +
+			"; connect-src 'self'" +
+			"; frame-ancestors 'self'"
+	}
+	middleware.SetCSP(c, csp)
+
 	c.String(http.StatusOK, html)
 }
 
@@ -625,14 +662,14 @@ func (h *FileViewHandler) ServeRawFile(c *gin.Context) {
 		}
 
 		rs := streaming.NewBlockReadSeeker(ctx, blockStore, resolvedIDs, blockSizes, fileSize, fileKeyParam)
-		c.Header("Content-Disposition", fmt.Sprintf(`inline; filename="%s"`, sanitizeFilename(filename)))
+		c.Header("Content-Disposition", resolveContentDisposition(ext, filename))
 		c.Header("Content-Type", mimeType)
 		http.ServeContent(c.Writer, c.Request, filename, time.Time{}, rs)
 		return
 	}
 
 	// Non-video/audio: stream block-by-block, O(block_size) RAM
-	c.Header("Content-Disposition", fmt.Sprintf(`inline; filename="%s"`, sanitizeFilename(filename)))
+	c.Header("Content-Disposition", resolveContentDisposition(ext, filename))
 	c.Header("Content-Type", mimeType)
 	if fileSize > 0 && !encrypted {
 		c.Header("Content-Length", strconv.FormatInt(fileSize, 10))
@@ -645,6 +682,40 @@ func (h *FileViewHandler) ServeRawFile(c *gin.Context) {
 // sanitizeFilename removes characters that could cause header injection in Content-Disposition.
 func sanitizeFilename(name string) string {
 	return strings.NewReplacer(`"`, `'`, "\r", "", "\n", "").Replace(name)
+}
+
+// extractOrigin returns "scheme://host" from a URL string, or "" on failure.
+// Used to build per-route CSP headers that allowlist OnlyOffice's origin.
+func extractOrigin(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Host == "" {
+		return ""
+	}
+	return u.Scheme + "://" + u.Host
+}
+
+// isActiveContentExt returns true for file extensions whose MIME types can
+// execute scripts when rendered by a browser. These MUST be served with
+// Content-Disposition: attachment to prevent stored-XSS via user-uploaded
+// files (C-2). SVG in an <img> tag is safe (browsers strip JS), but a
+// top-level navigation to a raw SVG URL would execute inline <script>.
+func isActiveContentExt(ext string) bool {
+	switch strings.ToLower(strings.TrimSpace(strings.TrimPrefix(ext, "."))) {
+	case "svg", "html", "htm", "xhtml", "xml", "xsl", "xslt", "mht", "mhtml":
+		return true
+	}
+	return false
+}
+
+// resolveContentDisposition returns "attachment" for active-content extensions
+// and "inline" for everything else. Callers use this to emit the correct
+// Content-Disposition header.
+func resolveContentDisposition(ext, filename string) string {
+	safe := sanitizeFilename(filename)
+	if isActiveContentExt(ext) {
+		return fmt.Sprintf(`attachment; filename="%s"`, safe)
+	}
+	return fmt.Sprintf(`inline; filename="%s"`, safe)
 }
 
 func resolveInlineContentType(ext string) string {
@@ -1067,7 +1138,7 @@ func (h *FileViewHandler) ServeHistoricFileRaw(c *gin.Context) {
 	// Determine MIME type
 	mimeType := resolveInlineContentType(ext)
 
-	c.Header("Content-Disposition", fmt.Sprintf(`inline; filename="%s"`, sanitizeFilename(filename)))
+	c.Header("Content-Disposition", resolveContentDisposition(ext, filename))
 	c.Header("Content-Type", mimeType)
 	if fileSize > 0 && !encrypted {
 		c.Header("Content-Length", strconv.FormatInt(fileSize, 10))
@@ -1077,4 +1148,3 @@ func (h *FileViewHandler) ServeHistoricFileRaw(c *gin.Context) {
 	resolvedIDs := streaming.BatchResolveBlockIDs(h.db, orgID, blockIDs)
 	streaming.StreamBlocks(c, c.Request.Context(), blockStore, resolvedIDs, fileKey, "ServeHistoricFileRaw")
 }
-

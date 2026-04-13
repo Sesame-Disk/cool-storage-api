@@ -365,13 +365,15 @@ func (h *ShareLinkViewHandler) buildOnlyOfficeShareBootstrap(sl *shareLinkData, 
 		},
 	}
 
-	if h.config.OnlyOffice.JWTSecret != "" {
-		ooHandler := &OnlyOfficeHandler{db: h.db, config: h.config}
-		token, signErr := ooHandler.signJWT(docConfig)
-		if signErr == nil {
-			docConfig.Token = token
-		}
+	if strings.TrimSpace(h.config.OnlyOffice.JWTSecret) == "" {
+		return pageBootstrapResponse{}, fmt.Errorf("OnlyOffice JWT secret is not configured")
 	}
+	ooHandler := &OnlyOfficeHandler{db: h.db, config: h.config}
+	token, signErr := ooHandler.signJWT(docConfig)
+	if signErr != nil {
+		return pageBootstrapResponse{}, fmt.Errorf("failed to sign OnlyOffice JWT: %w", signErr)
+	}
+	docConfig.Token = token
 
 	return pageBootstrapResponse{
 		RenderMode: "onlyoffice",
@@ -904,14 +906,14 @@ func (h *ShareLinkViewHandler) handleShareLinkRaw(c *gin.Context, sl *shareLinkD
 		}
 
 		rs := streaming.NewBlockReadSeeker(ctx, blockStore, resolvedIDs, blockSizes, fileSize, fileKeyParam)
-		c.Header("Content-Disposition", fmt.Sprintf(`inline; filename="%s"`, sanitizeFilename(filename)))
+		c.Header("Content-Disposition", resolveContentDisposition(ext, filename))
 		c.Header("Content-Type", mimeType)
 		http.ServeContent(c.Writer, c.Request, filename, time.Time{}, rs)
 		return
 	}
 
 	// Non-video/audio: stream block-by-block, O(block_size) RAM
-	c.Header("Content-Disposition", fmt.Sprintf(`inline; filename="%s"`, sanitizeFilename(filename)))
+	c.Header("Content-Disposition", resolveContentDisposition(ext, filename))
 	c.Header("Content-Type", mimeType)
 	if fileSize > 0 && !encrypted {
 		c.Header("Content-Length", strconv.FormatInt(fileSize, 10))

@@ -445,8 +445,8 @@ Audited and documented the **complete Share Dialog implementation** across front
 
 - `.env.prod.example` — new `Share Link Security` section with generation instructions
 - `.env.example` — dev default (`dev-share-link-hmac-key`) with security notes
-- `config.example.yaml` — `auth.share_link_hmac_key` field with env var reference
-- `config.prod.yaml` — comment block pointing to `SHARE_LINK_HMAC_KEY` env var
+- `configs/config.example.yaml` — `auth.share_link_hmac_key` field with env var reference
+- `configs/config.prod.yaml` — comment block pointing to `SHARE_LINK_HMAC_KEY` env var
 - `docs/DEPLOY.md` — Step 0.3 updated (third `openssl rand -hex 32`), Step 4 required vars, env-var reference table
 - `docs/IMPLEMENTATION_STATUS.md` — Sharing System row updated, new Share Dialog UI row, new password-check endpoints listed
 
@@ -456,8 +456,8 @@ Audited and documented the **complete Share Dialog implementation** across front
 
 - `.env.prod.example`
 - `.env.example`
-- `config.example.yaml`
-- `config.prod.yaml`
+- `configs/config.example.yaml`
+- `configs/config.prod.yaml`
 - `docs/DEPLOY.md`
 - `docs/IMPLEMENTATION_STATUS.md`
 - `docs/CHANGELOG.md`
@@ -714,7 +714,7 @@ Previously all sessions (web and desktop) shared the same `session_ttl: 24h`, ca
 - `internal/config/config.go` — new `APITokenTTL` field + env override `OIDC_API_TOKEN_TTL`
 - `internal/auth/session.go` — `CreateAPITokenSession()`, `CreateSessionWithTTL()`, fixed `storeSession()` TTL
 - `internal/auth/oidc.go` — SSO flow uses long TTL for desktop clients
-- `config.prod.yaml`, `config.example.yaml` — added `api_token_ttl` setting
+- `configs/config.prod.yaml`, `configs/config.example.yaml` — added `api_token_ttl` setting
 - `.env.example`, `docker-compose.yaml` — added `OIDC_API_TOKEN_TTL` env var
 - `docs/SEAFILE-SYNC-AUTH.md` — documented token lifetime differences
 - `docs/KNOWN_ISSUES.md` — added ISSUE-SESSION-02
@@ -1437,7 +1437,7 @@ No files could be stored even though the streaming phase completed successfully.
 
 ### Root Cause
 
-`initStorageManager` in `server.go` only iterated `cfg.Storage.Classes` (the new multi-region format) to register backends. `config.prod.yaml` uses the legacy single-bucket `backends:` key instead of `classes:`, so `cfg.Storage.Classes` was empty → the storage manager had zero registered backends.
+`initStorageManager` in `server.go` only iterated `cfg.Storage.Classes` (the new multi-region format) to register backends. `configs/config.prod.yaml` uses the legacy single-bucket `backends:` key instead of `classes:`, so `cfg.Storage.Classes` was empty → the storage manager had zero registered backends.
 
 When `finalizeUploadStreaming` called `storageManager.GetHealthyBlockStore("")` it resolved to the default class `"hot"`, found no backend registered under that name, and returned the error above.
 
@@ -1449,7 +1449,7 @@ Added a second loop in `initStorageManager` that reads `cfg.Storage.Backends` (l
 
 ### Files Changed
 - `internal/api/server.go` — Added legacy `backends:` loop in `initStorageManager`; improved doc comment explaining single-region vs multi-region config formats
-- `config.prod.yaml` — Updated storage section comment to explain why `backends:` is used intentionally and when to migrate to `classes:`
+- `configs/config.prod.yaml` — Updated storage section comment to explain why `backends:` is used intentionally and when to migrate to `classes:`
 
 ---
 
@@ -1646,8 +1646,8 @@ fileview:
 ### Files Changed
 - `internal/config/config.go` — Added `FileViewConfig` struct, defaults, env var parsing
 - `internal/api/v2/fileview.go` — Removed hardcoded limits, added `getMaxFileSizeForPreview()`, `isVideoFile()`, updated `readZipEntry()` signature
-- `config.example.yaml` — Added `fileview` section with documented limits
-- `config.docker.yaml` — Added `fileview` section
+- `configs/config.example.yaml` — Added `fileview` section with documented limits
+- `configs/config.docker.yaml` — Added `fileview` section
 - `configs/config-usa.yaml` — Added `fileview` section
 - `configs/config-eu.yaml` — Added `fileview` section
 

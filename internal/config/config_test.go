@@ -268,6 +268,23 @@ func TestConfigValidate(t *testing.T) {
 			wantErr:        true,
 			wantErrContain: "server.trusted_proxies",
 		},
+		{
+			name: "onlyoffice max document bytes must be positive",
+			modify: func(c *Config) {
+				c.OnlyOffice.MaxDocumentBytes = 0
+			},
+			wantErr:        true,
+			wantErrContain: "onlyoffice.max_document_bytes",
+		},
+		{
+			name: "onlyoffice enabled requires jwt secret",
+			modify: func(c *Config) {
+				c.OnlyOffice.Enabled = true
+				c.OnlyOffice.JWTSecret = ""
+			},
+			wantErr:        true,
+			wantErrContain: "onlyoffice.jwt_secret",
+		},
 	}
 
 	for _, tt := range tests {
@@ -319,6 +336,22 @@ func TestEnvOverrideServerTrustedProxies(t *testing.T) {
 	}
 	if cfg.Server.TrustedProxies[1] != "192.168.1.10" {
 		t.Fatalf("Server.TrustedProxies[1] = %q, want %q", cfg.Server.TrustedProxies[1], "192.168.1.10")
+	}
+}
+
+func TestEnvOverrideOnlyOfficeMaxDocumentBytes(t *testing.T) {
+	cfg := DefaultConfig()
+
+	os.Setenv("ONLYOFFICE_MAX_DOCUMENT_BYTES", "1048576")
+	defer os.Unsetenv("ONLYOFFICE_MAX_DOCUMENT_BYTES")
+
+	cfg.applyEnvOverrides()
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate() error = %v", err)
+	}
+
+	if cfg.OnlyOffice.MaxDocumentBytes != 1048576 {
+		t.Fatalf("OnlyOffice.MaxDocumentBytes = %d, want %d", cfg.OnlyOffice.MaxDocumentBytes, int64(1048576))
 	}
 }
 

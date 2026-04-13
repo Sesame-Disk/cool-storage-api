@@ -460,7 +460,7 @@ check_config_file() {
   fi
 
   if grep -Eq '^[[:space:]]*dev_mode:[[:space:]]*true' "$cfg"; then
-    fail "Config file $cfg has auth.dev_mode: true baked in. Mount config.prod.yaml over it."
+    fail "Config file $cfg has auth.dev_mode: true baked in. Mount configs/config.prod.yaml over it."
   fi
   if grep -Eq '^[[:space:]]*-[[:space:]]*"\*"' "$cfg" \
      && grep -q 'allowed_origins' "$cfg"; then

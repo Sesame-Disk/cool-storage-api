@@ -231,7 +231,7 @@ gc:
 
 cors:
   allowed_origins:
-    - "*"                           # Tighten this in production if browser origins are known
+    - "*"                           # OK for local dev; in production set CORS_ALLOWED_ORIGINS env var (wildcard rejected)
 
 elasticsearch:
   enabled: false                    # Search defaults to Cassandra indexes; enable only when wiring a real ES cluster
@@ -324,7 +324,8 @@ fileview:
 onlyoffice:
   enabled: true
   api_js_url: "https://office.sesamedisk.com/web-apps/apps/api/documents/api.js"
-  jwt_secret: ""                       # Set via ONLYOFFICE_JWT_SECRET env var
+  jwt_secret: ""                       # Set via ONLYOFFICE_JWT_SECRET env var (required when enabled)
+  max_document_bytes: 524288000        # Reject callback downloads larger than 500 MiB
   verify_certificate: false
   force_save: true
   # server_url: Public URL for OnlyOffice to fetch documents (required for remote OnlyOffice servers)

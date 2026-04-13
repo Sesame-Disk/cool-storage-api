@@ -399,7 +399,7 @@ Precondition: an admin must deactivate the user whose repo-token you supply. Exi
 **File:** `internal/auth/oidc.go:690-697` (`extractRoles` + `mapOIDCRole`).
 **Severity:** High (prerequisite: permissive or attacker-controlled IdP on the same issuer).
 
-If the configured IdP lets a user influence their `roles` claim — corporate IdPs with lax app registrations, self-signup IdPs, multi-tenant IdPs where an attacker controls a test tenant — sesamefs maps the first role in the claim directly into its local role. Combined with `auto_provision: true` in `config.prod.yaml:82` and no email-domain allow-list, a self-registered IdP identity can become a sesamefs user, and with a poisoned roles claim, potentially an elevated one.
+If the configured IdP lets a user influence their `roles` claim — corporate IdPs with lax app registrations, self-signup IdPs, multi-tenant IdPs where an attacker controls a test tenant — sesamefs maps the first role in the claim directly into its local role. Combined with `auto_provision: true` in `configs/config.prod.yaml:82` and no email-domain allow-list, a self-registered IdP identity can become a sesamefs user, and with a poisoned roles claim, potentially an elevated one.
 
 This is less dangerous in a deployment using a trusted custom broker that tightly controls which upstream providers are accepted and which claims are propagated — but the code defect remains, and anyone who later enables auto-provisioning for a less curated upstream inherits the risk.
 
@@ -493,7 +493,7 @@ Obtains the real cookie, then measures latency for the valid cookie and for thre
 
 `authRL` is configured as `rate.Every(6s), burst 10`. **Live probing** against a pre-production deployment showed a 120-request serial burst from a single IP resulted in 24 × HTTP 401 (accepted for authentication processing) and 96 × HTTP 429 (rate-limited). That is tighter than a naive reading of the code implies — but 24 per burst is still loose against distributed credential stuffing, which is by definition not limited to one IP.
 
-Upload, download, and `/api/v2/blocks/upload` have no rate limit at all — a single IP can saturate bandwidth, fill storage, or keep many concurrent chunked uploads open. The `max_upload_mb: 20480` config value in `config.prod.yaml:38` should be enforced end-to-end on the streaming path.
+Upload, download, and `/api/v2/blocks/upload` have no rate limit at all — a single IP can saturate bandwidth, fill storage, or keep many concurrent chunked uploads open. The `max_upload_mb: 20480` config value in `configs/config.prod.yaml:38` should be enforced end-to-end on the streaming path.
 
 **Fix:**
 
@@ -573,14 +573,14 @@ No credentials required. Exit 0 means `DELETE /api/v2.1/auth/session` returned 2
 
 #### M-2 CORS `allowed_origins: ["*"]` with `Allow-Credentials: true`
 
-**Files:** `config.prod.yaml:207-209`; applied in `internal/api/server.go:240-267`.
+**Files:** `configs/config.prod.yaml:207-209`; applied in `internal/api/server.go:240-267`.
 **Severity:** Medium (config smell with a real impact on unauthenticated endpoints; not a credentialed-CORS bypass because browsers reject the `*` + credentials combo on credentialed requests).
 
 Browsers will not send credentials to a response that carries `Access-Control-Allow-Origin: *`, so the "evil.com reads /api/v2.1/admin/users as the victim" attack does not land. What does land:
 
 - Any third-party origin can `fetch` unauthenticated endpoints (`/api/v2.1/bootstrap`, `/api2/server-info`, `/api/v2.1/auth/oidc/config`, public share-link routes) and read the bodies. That enables fingerprinting, tenant enumeration, and cross-origin timing attacks against the oracle-y endpoints in H-5.
 - The config is a footgun: if someone later "fixes" credentialed CORS by switching to reflected-origin without an allow-list, the server will silently become a full credentialed-CORS bypass.
-- The comment in `config.prod.yaml` claims "Safe to leave as `*` for bearer-token APIs (no cookie auth)" — but the app sets `sesamefs_auth` as an HTTP cookie during the OIDC flow. The comment is wrong about its own codebase.
+- The comment in `configs/config.prod.yaml` claims "Safe to leave as `*` for bearer-token APIs (no cookie auth)" — but the app sets `sesamefs_auth` as an HTTP cookie during the OIDC flow. The comment is wrong about its own codebase.
 
 **Confirmed live** on a pre-production deployment: the preflight returned `Access-Control-Allow-Origin: *` and `Access-Control-Allow-Credentials: true` on both `OPTIONS` and a simple `GET` of `/api/v2.1/bootstrap` with `Origin: https://evil.example`.
 
@@ -753,7 +753,7 @@ Prints the HTTP status and body length for each info endpoint. Use `-v` to see t
 **File:** `internal/auth/oidc.go:437-438, 478-481` (`parseIDToken`).
 **Severity:** **Latent / defense-in-depth.** The code defect is real and should be fixed, but in the current code paths no attacker-controlled JWT ever reaches `parseIDToken`. This finding was filed as Critical in an earlier draft; live code tracing downgraded it after confirming the reach path does not exist.
 
-**The defect.** Signature, `iss`, `exp`, `nbf`, and optionally `nonce` are checked. `claims.Audience` is extracted into the struct but is **never compared to `config.ClientID`**. `config.prod.yaml:89` has `validate_audience: true`, but the flag is not read on the verification path — effectively dead config.
+**The defect.** Signature, `iss`, `exp`, `nbf`, and optionally `nonce` are checked. `claims.Audience` is extracted into the struct but is **never compared to `config.ClientID`**. `configs/config.prod.yaml:89` has `validate_audience: true`, but the flag is not read on the verification path — effectively dead config.
 
 **Why it isn't reachable today.** A chain of facts in the current code and topology blocks the only exploitable scenario:
 
@@ -789,7 +789,7 @@ if c.config.ValidateAudience {
 }
 ```
 
-Also wire `validate_audience` from `config.prod.yaml:89` so the intent expressed there becomes real, default it to `true`, and support a `config.oidc.additional_audiences` allow-list for deployments with multiple legitimate client ids on the same RP.
+Also wire `validate_audience` from `configs/config.prod.yaml:89` so the intent expressed there becomes real, default it to `true`, and support a `config.oidc.additional_audiences` allow-list for deployments with multiple legitimate client ids on the same RP.
 
 **Regression-preventing unit test.** Add `internal/auth/oidc_aud_test.go` with a focused assertion that `parseIDToken` refuses a wrong-audience token. This is the high-value reproduction for a latent defect — far more reliable than a live replay, which cannot be constructed without a new code path:
 
@@ -870,7 +870,7 @@ Exploit-script filenames still use the prefix from an earlier numbering (`c1-oid
 The [preflight section at the top](#production-prerequisites--the-preflight-gate) covers the implementation that shipped with this assessment (bash script at `scripts/prod-preflight.sh`, `.env`-bootstrap via `--init-env`, wired into `docker-compose.yaml` under the `prod` profile, made mandatory via `docker-compose.prod-gate.yaml`). Two things are worth noting for the next iteration:
 
 1. **Port the preflight into the Go binary.** The bash implementation is a great first step and is enforced by compose, but a deployment that bypasses compose (systemd unit, bare `sesamefs serve`, k8s Deployment with the Go binary) can skip it. Add a `ValidateProductionReadiness()` pass in `internal/config/config.go` that runs when `SESAMEFS_ENV=production` or when the listener is bound to a non-loopback address. It can re-use the same rules as the bash script — the bash version becomes the portable CI check, the Go version becomes the runtime fail-closed gate.
-2. **Catch the `CORS allowed_origins: ["*"]` case.** The current script reads env vars only, so it cannot detect the CORS wildcard that lives inside `config.prod.yaml`. The Go-side version naturally can. In the meantime, the `SKIP=config`-disabled check in the bash script already greps the mounted config file for `- "*"` under `allowed_origins` and warns — operators should leave `SKIP` unset (or at least not include `config`) when running in prod.
+2. **Catch the `CORS allowed_origins: ["*"]` case.** The current script reads env vars only, so it cannot detect the CORS wildcard that lives inside `configs/config.prod.yaml`. The Go-side version naturally can. In the meantime, the `SKIP=config`-disabled check in the bash script already greps the mounted config file for `- "*"` under `allowed_origins` and warns — operators should leave `SKIP` unset (or at least not include `config`) when running in prod.
 
 ---
 

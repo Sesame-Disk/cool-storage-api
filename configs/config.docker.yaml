@@ -347,7 +347,8 @@ onlyoffice:
   enabled: true
   # URL to OnlyOffice api.js loaded by browser (external/host URL)
   api_js_url: "http://localhost:8088/web-apps/apps/api/documents/api.js"
-  jwt_secret: ""                     # Set via ONLYOFFICE_JWT_SECRET env var
+  jwt_secret: ""                     # Set via ONLYOFFICE_JWT_SECRET env var (required when enabled)
+  max_document_bytes: 524288000      # Reject callback downloads larger than 500 MiB
   verify_certificate: false
   force_save: true
   # URL for OnlyOffice container to reach SesameFS (docker network)

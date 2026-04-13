@@ -2172,6 +2172,7 @@ func (s *Server) handleOAuthCallback(c *gin.Context) {
 	if strings.HasPrefix(result.ReturnURL, "seafile://") {
 		data := templates.LoginSuccessData{ReturnURL: result.ReturnURL}
 		c.Header("Content-Type", "text/html; charset=utf-8")
+		middleware.SetCSP(c, "default-src 'none'; script-src 'unsafe-inline'; img-src 'self'; style-src 'self'; frame-ancestors 'none'")
 		if err := templates.Render(c.Writer, "login_success.html", data); err != nil {
 			log.Printf("[handleSSOCallback] template error: %v", err)
 			c.String(http.StatusInternalServerError, "Internal Server Error")

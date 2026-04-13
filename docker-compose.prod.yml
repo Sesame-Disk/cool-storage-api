@@ -54,7 +54,7 @@ services:
     volumes:
       # Mount prod config over the config baked into the Docker image.
       # This config has structural settings; all secrets come from env vars.
-      - ./config.prod.yaml:/app/config.yaml:ro
+      - ./configs/config.prod.yaml:/app/config.yaml:ro
     depends_on:
       cassandra:
         condition: service_healthy

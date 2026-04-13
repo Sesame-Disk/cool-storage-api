@@ -35,7 +35,7 @@ set -e
 # Configuration
 API_URL="${API_URL:-http://localhost:8082}"
 
-# Dev tokens (from config.yaml / config.docker.yaml)
+# Dev tokens (from config.yaml / configs/config.docker.yaml)
 ADMIN_TOKEN="dev-token-admin"
 USER_TOKEN="dev-token-user"
 

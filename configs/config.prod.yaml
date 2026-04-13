@@ -8,12 +8,12 @@
 #   2. YAML from CONFIG_PATH (this file in prod)
 #   3. Environment variable overrides via applyEnvOverrides()
 # Any key omitted here keeps the code default.
-# This file is intentionally thinner than config.docker.yaml, which pins more
+# This file is intentionally thinner than configs/config.docker.yaml, which pins more
 # non-secret knobs explicitly for local/test reproducibility.
 #
 # This file is mounted over the config baked into the Docker image:
 #   volumes:
-#     - ./config.prod.yaml:/app/config.yaml:ro
+#     - ./configs/config.prod.yaml:/app/config.yaml:ro
 #
 # Env var overrides (applied after this file is loaded):
 #   AUTH_DEV_MODE, OIDC_*, ONLYOFFICE_*,
@@ -55,7 +55,7 @@ database:
 # When to migrate to "classes:":
 #   When deploying multi-region (e.g. hot-s3-usa, hot-s3-eu, cold-glacier-usa),
 #   replace this section with "classes:" + "endpoint_regions:" + "region_classes:"
-#   following the structure in config.example.yaml.
+#   following the structure in configs/config.example.yaml.
 #
 # Env vars that control this section:
 #   S3_BUCKET    → bucket name
@@ -223,13 +223,12 @@ gc:
 
 # =============================================================================
 # CORS
-# NOTE: allowed_origins cannot be set via env vars.
-# Change "*" to your actual domain(s) for stricter security.
-# Safe to leave as "*" for bearer-token APIs (no cookie auth).
+# Set your production domain(s) via env var:
+#   CORS_ALLOWED_ORIGINS=https://sfs.example.com,https://app.example.com
+# Wildcard "*" is rejected in production mode.
 # =============================================================================
 cors:
-  allowed_origins:
-    - "*"
+  allowed_origins: []              # Required via CORS_ALLOWED_ORIGINS env var
 
 # =============================================================================
 # Search Backend
@@ -382,8 +381,9 @@ enforcement_profiles:
 # =============================================================================
 onlyoffice:
   enabled: true                 # Overridden by ONLYOFFICE_ENABLED=true in compose
-  jwt_secret: ""                # Set via ONLYOFFICE_JWT_SECRET env var
+  jwt_secret: ""                # Set via ONLYOFFICE_JWT_SECRET env var (required when enabled)
   api_js_url: ""                # Set via ONLYOFFICE_API_JS_URL env var
+  max_document_bytes: 524288000 # Reject callback downloads larger than 500 MiB
 
   # Internal Docker network — OnlyOffice fetches files from sesamefs
   server_url: "http://sesamefs:8080"
