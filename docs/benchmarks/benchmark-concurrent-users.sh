@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # Benchmark: Concurrent user simulation
-# Tests how the system handles multiple simultaneous authenticated users.
+# Tests how the system handles multiple simultaneous authenticated users
+# hitting the account/info endpoint (lightweight, auth-heavy).
 #
 # Usage:
-#   ./benchmark-concurrent-users.sh --host http://localhost:8082 --token TOKEN
+#   ./benchmark-concurrent-users.sh --host https://sfs.nihaoshares.com --token TOKEN
 
 set -euo pipefail
 
@@ -25,6 +26,7 @@ while [ $# -gt 0 ]; do
     --users)    USERS="${2:-}"; shift 2 ;;
     --requests) REQUESTS_PER_USER="${2:-}"; shift 2 ;;
     -k)         INSECURE="-k"; shift ;;
+    -h)         usage; exit 0 ;;
     *)          echo "Unknown: $1"; usage; exit 2 ;;
   esac
 done
@@ -32,11 +34,16 @@ done
 HOST="${HOST%/}"
 [ -z "$HOST" ] || [ -z "$TOKEN" ] && { usage; exit 2; }
 
+calc() { awk "BEGIN{printf \"%.1f\", $1}" 2>/dev/null || echo "?"; }
+
 echo "=========================================="
 echo " SesameFS Concurrent Users Benchmark"
 echo " Host: $HOST"
 echo " Requests/user: $REQUESTS_PER_USER"
 echo "=========================================="
+
+RESULTS_DIR=$(mktemp -d)
+trap "rm -rf $RESULTS_DIR" EXIT
 
 simulate_user() {
   local user_num=$1
@@ -61,56 +68,49 @@ simulate_user() {
     fi
   done
 
-  avg_ms=$((total_ms / count))
-  echo "$user_num,$successes,$failures,$avg_ms,$total_ms"
+  local avg_ms=$((total_ms / count))
+  echo "$successes,$failures,$avg_ms,$total_ms"
 }
 
+printf "\n  %-8s  %-10s  %-8s  %-8s  %-10s  %-10s  %-8s\n" \
+  "Users" "Requests" "Success" "Fail" "Time(ms)" "Req/s" "Avg(ms)"
+echo "  -------  ----------  --------  --------  ----------  ----------  --------"
+
 for user_count in $USERS; do
-  echo
-  echo "--- $user_count concurrent users x $REQUESTS_PER_USER requests ---"
+  total_requests=$((user_count * REQUESTS_PER_USER))
 
   start=$(date +%s%N)
-
-  RESULTS_DIR=$(mktemp -d)
   pids=()
-
   for u in $(seq 1 "$user_count"); do
     simulate_user "$u" "$REQUESTS_PER_USER" > "$RESULTS_DIR/user_$u.csv" &
     pids+=($!)
   done
-
   for pid in "${pids[@]}"; do wait "$pid" 2>/dev/null || true; done
   end=$(date +%s%N)
 
-  total_elapsed=$(echo "scale=3; ($end - $start) / 1000000000" | bc 2>/dev/null || echo "0")
-  total_requests=$((user_count * REQUESTS_PER_USER))
-  rps=$(echo "scale=1; $total_requests / $total_elapsed" | bc 2>/dev/null || echo "0")
+  wall_ms=$(( (end - start) / 1000000 ))
 
   total_success=0
   total_fail=0
-  total_avg_ms=0
-
+  total_avg=0
   for f in "$RESULTS_DIR"/user_*.csv; do
-    IFS=',' read -r _ succ fail avg _ < "$f"
+    IFS=',' read -r succ fail avg _ < "$f"
     total_success=$((total_success + succ))
     total_fail=$((total_fail + fail))
-    total_avg_ms=$((total_avg_ms + avg))
+    total_avg=$((total_avg + avg))
   done
-  overall_avg_ms=$((total_avg_ms / user_count))
+  overall_avg=$((total_avg / user_count))
 
-  printf "  Total requests:  %d\n" "$total_requests"
-  printf "  Successes:       %d\n" "$total_success"
-  printf "  Failures:        %d\n" "$total_fail"
-  printf "  Total time:      %ss\n" "$total_elapsed"
-  printf "  Throughput:      %s req/s\n" "$rps"
-  printf "  Avg latency:     %dms\n" "$overall_avg_ms"
-
-  if [ "$total_fail" -gt 0 ]; then
-    fail_pct=$(echo "scale=1; $total_fail * 100 / $total_requests" | bc 2>/dev/null || echo "?")
-    printf "  Failure rate:    %s%%\n" "$fail_pct"
+  if [ "$wall_ms" -gt 0 ]; then
+    rps=$(calc "$total_requests * 1000 / $wall_ms")
+  else
+    rps="inf"
   fi
 
-  rm -rf "$RESULTS_DIR"
+  printf "  %-8s  %-10s  %-8s  %-8s  %-10s  %-10s  %-8s\n" \
+    "$user_count" "$total_requests" "$total_success" "$total_fail" "$wall_ms" "$rps" "${overall_avg}ms"
+
+  rm -f "$RESULTS_DIR"/user_*.csv
 done
 
 echo

@@ -445,31 +445,104 @@ Benchmark scripts are provided in [`docs/benchmarks/`](./benchmarks/):
 | `benchmark-concurrent-users.sh` | Concurrent authenticated user simulation |
 | `benchmark-storage-ops.sh` | Block-level storage operations + endpoint latency profiling |
 
+### Local benchmark results (2026-04-13)
+
+**Environment:** Docker Compose on a single dev machine (sesamefs + Cassandra + MinIO).
+These numbers reflect local performance without network latency — useful as a ceiling
+for what the Go server and storage layer can do.
+
+#### Upload / Download throughput
+
+| Operation | Size | Time | Throughput |
+|-----------|------|------|------------|
+| Single upload | 1 MB | 90ms | 89 Mbps |
+| Single upload | 10 MB | 286ms | 280 Mbps |
+| Single upload | 100 MB | 3,326ms | 241 Mbps |
+| Single download | 1 MB | 39ms | 205 Mbps |
+| Single download | 10 MB | 59ms | 1,356 Mbps |
+| Single download | 100 MB | 230ms | 3,478 Mbps |
+
+Downloads are faster than uploads because MinIO serves reads from memory/disk cache
+while uploads require chunking, hashing, and S3 Put.
+
+#### Concurrent throughput (1 MB files)
+
+| Concurrency | Upload total | Upload Mbps | Download total | Download Mbps |
+|-------------|-------------|-------------|----------------|---------------|
+| 1 | 105ms | 76 | 33ms | 242 |
+| 4 | 230ms | 139 | 49ms | 653 |
+| 8 | 437ms | 147 | 100ms | 640 |
+| 16 | 529ms | 242 | 181ms | 707 |
+
+Upload throughput scales sub-linearly (bottlenecked by S3 Put latency). Download
+throughput scales well up to 8 concurrent, then plateaus around 700 Mbps.
+
+#### Block-level operations
+
+| Operation | Size | Time | Notes |
+|-----------|------|------|-------|
+| Block upload | 64 KB | 51ms | POST /api/v2/blocks/upload |
+| Block upload | 256 KB | 31ms | Includes hash + dedup check |
+| Block upload | 1 MB | 59ms | |
+| Block upload | 4 MB | 109ms | |
+| Block download | 256 KB | 20–25ms | GET /api/v2/blocks/:hash, 5 runs |
+
+#### API endpoint latency
+
+| Endpoint | p50 | p95 | Notes |
+|----------|-----|-----|-------|
+| /api2/ping | <1ms | 1ms | No auth, no DB |
+| /health | <1ms | <1ms | No auth, lightweight check |
+| /ready | 2ms | 8ms | Checks DB + storage health |
+| /api2/account/info | 12ms | 14ms | Auth + Cassandra query |
+| /api2/repos/ | 8ms | 11ms | Auth + Cassandra query |
+
+#### Concurrent user capacity
+
+| Users | Requests | Success | Fail | Wall time | Req/s | Avg latency |
+|-------|----------|---------|------|-----------|-------|-------------|
+| 1 | 20 | 20 | 0 | 514ms | 39 | 23ms |
+| 5 | 100 | 100 | 0 | 898ms | 111 | 37ms |
+| 10 | 200 | 200 | 0 | 1,492ms | 134 | 62ms |
+| 25 | 500 | 500 | 0 | 3,123ms | 160 | 128ms |
+
+Zero failures at 25 concurrent users. Throughput scales from 39 to 160 req/s.
+Latency increases linearly (23ms at 1 user, 128ms at 25 users) — consistent with
+serialized Cassandra queries and no connection pooling saturation.
+
+#### Resource usage (Docker containers, idle + post-benchmark)
+
+| Container | CPU | Memory |
+|-----------|-----|--------|
+| sesamefs | <1% | 86 MB |
+| Cassandra | 1.1% | 953 MB |
+| MinIO | <1% | 135 MB |
+| OnlyOffice | <1% | 713 MB |
+| Frontend (nginx) | <1% | 8 MB |
+
+SesameFS itself is very lightweight at 86 MB. Cassandra dominates memory at ~1 GB
+(expected — JVM heap). OnlyOffice is the second-heaviest container.
+
 ### Running benchmarks
 
 ```bash
-# Against local
+# Against local (use dev token from config.docker.yaml)
+./docs/benchmarks/benchmark-storage-ops.sh \
+    --host http://localhost:8082 --token dev-token-superadmin --repo <repo-id>
+
 ./docs/benchmarks/benchmark-upload-download.sh \
-    --host http://localhost:8082 --token dev-token-123 --repo <repo-id>
+    --host http://localhost:8082 --token dev-token-superadmin --repo <repo-id>
 
 ./docs/benchmarks/benchmark-concurrent-users.sh \
-    --host http://localhost:8082 --token dev-token-123
-
-./docs/benchmarks/benchmark-storage-ops.sh \
-    --host http://localhost:8082 --token dev-token-123 --repo <repo-id>
+    --host http://localhost:8082 --token dev-token-superadmin
 
 # Against production (use a real token)
 ./docs/benchmarks/benchmark-upload-download.sh \
     --host https://sfs.nihaoshares.com --token <real-token> --repo <repo-id>
 ```
 
-### Key metrics to track
-
-- **Upload throughput:** MB/s for 1MB, 10MB, 100MB files
-- **Download throughput:** MB/s single and concurrent
-- **API latency:** p50, p95, p99 for key endpoints
-- **Concurrent capacity:** Requests/second under load, error rate
-- **Memory usage:** `docker stats` during sustained load (especially zip downloads)
+**Note:** Resource usage (`docker stats`) in the script output only reflects local
+containers. When benchmarking a remote host, those numbers are irrelevant to the target.
 
 ---
 
