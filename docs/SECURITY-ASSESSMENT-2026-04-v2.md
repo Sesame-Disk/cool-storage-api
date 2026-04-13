@@ -10,6 +10,25 @@ unauthenticated probes were run against both targets for comparison.
 
 ---
 
+## Architecture Diagrams
+
+Visual diagrams of the system architecture, security controls, and attack surfaces are
+available in [`docs/diagrams/`](./diagrams/). Start with the summary page and drill into
+the detailed views as needed.
+
+| Diagram | What it shows |
+|---------|--------------|
+| [Summary (start here)](./diagrams/security-architecture.mermaid.md) | Quick-reference: overview, fix status, attack surface, local vs prod comparison |
+| [Architecture Overview](./diagrams/architecture-overview.md) | High-level components and data flow |
+| [Security Layer](./diagrams/security-layer.md) | Auth decision flow, OIDC login sequence, header status |
+| [Authentication Layer](./diagrams/auth-layer.md) | Token lifecycle, session invalidation, role mapping, rate limit coverage |
+| [Storage & Encryption](./diagrams/storage-layer.md) | Upload/download pipelines, key management, compromise impact matrix |
+| [Full Architecture](./diagrams/full-architecture.md) | Complete annotated system map + OnlyOffice attack chain |
+
+All diagrams use a consistent color scheme: **red** = critical, **orange** = gap, **yellow** = medium, **green** = working control, **blue** = encryption. Each page includes a "how to read" guide and explains the key issues shown.
+
+---
+
 ## Executive Summary
 
 Since the v1 assessment (2026-04-09), **6 of the original findings have been fixed or

@@ -1,6 +1,21 @@
 # SesameFS Storage & Encryption
 
+> How to read: Follow the arrows top-to-bottom to trace how data moves through the upload, download, and encryption pipelines. Green nodes are security controls that are working. Orange/yellow nodes are gaps. The compromise section shows what an attacker gains from breaching each component.
+
+### How to read colors
+
+| Color | Meaning |
+|-------|---------|
+| **Red** | Data exposed or critical finding |
+| **Orange** | Security gap (e.g. no S3 encryption) |
+| **Yellow** | Medium concern |
+| **Green** | Working security control or protected data |
+
+---
+
 ## Upload Flow
+
+**Key issue:** The S3 Put call (orange) does not set `ServerSideEncryption`. Blocks are stored unencrypted at the S3 layer unless the bucket has a default encryption policy.
 
 ```mermaid
 flowchart TD
@@ -25,7 +40,11 @@ flowchart TD
     style Auth fill:#28a745,color:#fff
 ```
 
+---
+
 ## Download Flow
+
+**Key issue:** Files are served with `Content-Disposition: inline` (yellow), which means SVG files execute JavaScript in the browser in the context of the application origin (stored XSS).
 
 ```mermaid
 flowchart TD
@@ -46,7 +65,11 @@ flowchart TD
     style Headers fill:#ffc107,color:#000
 ```
 
+---
+
 ## Key Management
+
+**Key issue:** The Seafile-compatible path (yellow) uses PBKDF2 with only 1,000 iterations — far below the OWASP 2024 recommendation of 600,000. This makes offline brute-force feasible for weak passwords if encryption parameters are leaked.
 
 ```mermaid
 flowchart TD
@@ -70,7 +93,11 @@ flowchart TD
     style Argon fill:#28a745,color:#fff
 ```
 
+---
+
 ## Compromise Scenarios
+
+**How to read:** Each box represents what an attacker gains if they breach that component. Red = data exposed, green = data protected even after breach, orange = brute-forceable.
 
 ```mermaid
 flowchart TD

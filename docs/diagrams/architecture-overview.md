@@ -1,6 +1,11 @@
 # SesameFS Architecture Overview
 
-## System Components
+> How to read: Colored nodes indicate security findings. Follow the arrows to trace how data flows between components. The "Unauthenticated" box shows routes an attacker can reach without any credentials.
+
+**Key issues visible here:**
+- The OnlyOffice callback (red) has zero authentication and can reach the OnlyOffice server via SSRF.
+- S3 (orange) stores blocks without server-side encryption.
+- Share links (yellow) serve SVG files inline, enabling stored XSS.
 
 ```mermaid
 flowchart TD
@@ -46,11 +51,14 @@ flowchart TD
     style Share fill:#ffc107,color:#000
 ```
 
-## Legend
+### How to read colors
 
 | Color | Meaning |
 |-------|---------|
-| Red | Critical vulnerability |
-| Orange | Security gap |
-| Yellow | Medium concern |
-| Default | Normal component |
+| **Red** | Critical vulnerability — must fix before production |
+| **Orange** | Security gap — should fix soon |
+| **Yellow** | Medium concern — defense-in-depth improvement needed |
+| **Green** | Security control working correctly |
+| **Blue** | Encryption / cryptographic module |
+| **Gray** | Infrastructure component (no finding) |
+| Default | Normal component (no finding) |

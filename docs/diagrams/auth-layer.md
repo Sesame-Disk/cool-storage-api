@@ -1,6 +1,20 @@
 # SesameFS Authentication Layer
 
+> How to read: Each section below is a separate stage of the auth lifecycle. Green = secure outcome, red = rejection, yellow = a gap or concern that needs attention. Diamonds are decision points.
+
+### How to read colors
+
+| Color | Meaning |
+|-------|---------|
+| **Red** | Auth rejection or critical finding |
+| **Yellow** | Security gap (e.g. cookie without httpOnly, node-local invalidation) |
+| **Green** | Secure outcome or working control |
+
+---
+
 ## Token Creation
+
+**Key issue:** The `sesamefs_auth` cookie is set with `httpOnly=false`, meaning JavaScript (and any XSS) can read it.
 
 ```mermaid
 flowchart TD
@@ -14,7 +28,11 @@ flowchart TD
     style SetCookie fill:#ffc107,color:#000
 ```
 
+---
+
 ## Token Validation
+
+**How it works:** Each request tries session lookup first, then API key, then repo token. API keys use normalized timing to prevent oracle attacks. Account status is enforced on every auth path.
 
 ```mermaid
 flowchart TD
@@ -50,7 +68,11 @@ flowchart TD
     style Reject403 fill:#dc3545,color:#fff
 ```
 
+---
+
 ## Session Invalidation
+
+**Key issue:** Invalidation only clears the current node's cache. In a multi-node deployment, other nodes will keep serving the revoked session until their cache TTL expires (finding M-7).
 
 ```mermaid
 flowchart TD
@@ -63,7 +85,11 @@ flowchart TD
     style Gap fill:#ffc107,color:#000
 ```
 
+---
+
 ## OIDC Role Mapping
+
+**Key fix since v1:** `superadmin` / `super_admin` / `platform_admin` claims from OIDC are now explicitly blocked and downgraded. Superadmin can only be set via a manual script in the database.
 
 ```mermaid
 flowchart TD
@@ -92,7 +118,11 @@ flowchart TD
     style Preserve fill:#28a745,color:#fff
 ```
 
+---
+
 ## Rate Limiting Coverage
+
+**Key issue:** Rate limiting is only applied to auth endpoints. Upload, download, share-link enumeration, and the OnlyOffice callback have no rate limiting at all.
 
 ```mermaid
 flowchart TD

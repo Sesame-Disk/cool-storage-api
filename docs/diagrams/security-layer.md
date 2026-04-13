@@ -1,6 +1,20 @@
 # SesameFS Security Layer
 
+> How to read: Green nodes are successful outcomes, red nodes are rejections. Yellow nodes indicate paths where an attacker can operate without authentication. Diamonds are decision points in the auth chain.
+
+### How to read colors
+
+| Color | Meaning |
+|-------|---------|
+| **Red** | Rejection / critical finding |
+| **Yellow** | Unauthenticated path or medium concern |
+| **Green** | Successful auth / working control |
+
+---
+
 ## Auth Flow
+
+**Key issue:** The yellow "Serve unauthenticated" path includes `/onlyoffice/editor-callback`, which has no auth middleware and no JWT verification — an attacker reaches the SSRF handler directly.
 
 ```mermaid
 flowchart TD
@@ -37,7 +51,11 @@ flowchart TD
     style Serve fill:#ffc107,color:#000
 ```
 
+---
+
 ## OIDC Login
+
+**Key fix since v1:** Audience validation (step "Check audience") is now implemented. Superadmin role claims from OIDC are blocked.
 
 ```mermaid
 sequenceDiagram
@@ -65,7 +83,11 @@ sequenceDiagram
     S-->>B: Set cookie + redirect
 ```
 
+---
+
 ## Headers Status
+
+**Key issue:** Content-Security-Policy is missing everywhere — no XSS mitigation at the header level. X-Frame-Options is only added by nginx in production, not by the Go app itself.
 
 | Header | App Level | Nginx (prod) |
 |--------|-----------|-------------|
