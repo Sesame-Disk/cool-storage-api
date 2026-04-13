@@ -1,115 +1,78 @@
 # SesameFS Security Layer
 
-## Authentication & Authorization Flow
+## Auth Flow
 
 ```mermaid
 flowchart TD
-    Request["Incoming HTTP Request"] --> Extract["Extract Token<br/>1. Authorization: Token/Bearer header<br/>2. sesamefs_auth cookie fallback"]
+    Req["Request"] --> Token{"Has token?"}
 
-    Extract --> HasToken{"Token found?"}
-    HasToken -->|"No"| PublicRoute{"Is public route?"}
-    PublicRoute -->|"Yes"| Public["Serve without auth<br/>/ping, /health, /ready<br/>/bootstrap, /server-info<br/>/d/:token (share links)<br/>/onlyoffice/editor-callback"]
-    PublicRoute -->|"No"| Reject401["401 Unauthorized"]
+    Token -->|No| PubRoute{"Public route?"}
+    PubRoute -->|Yes| Serve["Serve unauthenticated"]
+    PubRoute -->|No| R401["401"]
 
-    HasToken -->|"Yes"| DevMode{"Auth.DevMode?"}
-    DevMode -->|"Yes"| DevMatch{"Matches dev token?"}
-    DevMatch -->|"Yes"| DevAuth["Set user from dev config<br/>(plaintext == comparison)"]
-    DevMatch -->|"No"| SessionCheck
+    Token -->|Yes| Dev{"Dev mode?"}
+    Dev -->|Yes| DevMatch{"Match?"}
+    DevMatch -->|Yes| OK["Authenticated"]
+    DevMatch -->|No| Session
 
-    DevMode -->|"No"| SessionCheck["Session Validation<br/>SHA-256(token) lookup in cache"]
-    SessionCheck --> CacheHit{"In cache?"}
-    CacheHit -->|"Yes"| CheckExpiry{"Expired?"}
-    CheckExpiry -->|"No"| Authenticated["Authenticated"]
-    CheckExpiry -->|"Yes"| DBLookup
+    Dev -->|No| Session["Session check<br/>SHA-256 in cache"]
+    Session --> Hit{"Cache hit?"}
+    Hit -->|Yes + valid| OK
+    Hit -->|No| DB["Cassandra lookup"]
+    DB --> DBOk{"Found?"}
+    DBOk -->|Yes| OK
+    DBOk -->|No| APIKey["API Key check"]
+    APIKey --> KeyOk{"Valid?"}
+    KeyOk -->|Yes| Status{"Active?"}
+    Status -->|Yes| OK
+    Status -->|No| R403["403"]
+    KeyOk -->|No| R401
 
-    CacheHit -->|"No"| DBLookup["Cassandra Lookup<br/>SELECT from sessions"]
-    DBLookup --> Found{"Found + valid?"}
-    Found -->|"Yes"| CacheStore["Store in cache"] --> Authenticated
-    Found -->|"No"| APIKeyCheck["API Key Validation<br/>SHA-256(key) lookup<br/>Normalized timing on malformed"]
+    OK --> Perm["Permission check<br/>R / RW / flags"]
+    Perm --> Handler["Route handler"]
 
-    APIKeyCheck --> KeyValid{"Valid key?"}
-    KeyValid -->|"Yes"| EnforceStatus["Enforce account status<br/>(deactivated/deleted check)"]
-    KeyValid -->|"No"| RepoTokenCheck["Repo Token Check<br/>Lookup by token hash"]
-
-    RepoTokenCheck --> RepoValid{"Valid?"}
-    RepoValid -->|"Yes"| RepoAuth["Authenticated as repo token<br/>(account status check added)"]
-    RepoValid -->|"No"| Reject401
-
-    EnforceStatus --> StatusOK{"Active?"}
-    StatusOK -->|"Yes"| Authenticated
-    StatusOK -->|"No"| Reject403["403 Forbidden"]
-
-    Authenticated --> PermCheck["Permission Middleware<br/>Library access: R/RW<br/>Granular flags: upload/download"]
-    PermCheck --> Handler["Route Handler"]
-
-    style Public fill:#ffc107,color:#000,stroke:#d4a106,stroke-width:2px
-    style DevAuth fill:#ffc107,color:#000,stroke:#d4a106
-    style Authenticated fill:#28a745,color:#fff
-    style Reject401 fill:#dc3545,color:#fff
-    style Reject403 fill:#dc3545,color:#fff
+    style OK fill:#28a745,color:#fff
+    style R401 fill:#dc3545,color:#fff
+    style R403 fill:#dc3545,color:#fff
+    style Serve fill:#ffc107,color:#000
 ```
 
-## OIDC Login Flow
+## OIDC Login
 
 ```mermaid
 sequenceDiagram
-    participant Browser
-    participant SesameFS
-    participant IdP as OIDC Provider
+    participant B as Browser
+    participant S as SesameFS
+    participant I as OIDC Provider
 
-    Browser->>SesameFS: GET /api/v2.1/auth/oidc/login
-    SesameFS->>SesameFS: Generate state + nonce + PKCE verifier
-    SesameFS->>SesameFS: Store state (TTL=10min, cap=10k)
-    SesameFS-->>Browser: 302 Redirect to IdP authorize endpoint
+    B->>S: GET /auth/oidc/login
+    S->>S: state + nonce + PKCE
+    S-->>B: 302 -> IdP
 
-    Browser->>IdP: Authorize (client_id, scope, state, code_challenge)
-    IdP-->>Browser: Login page
-    Browser->>IdP: Credentials
-    IdP-->>Browser: 302 Redirect to /api/v2.1/auth/oidc/callback?code=...&state=...
+    B->>I: Authorize
+    I-->>B: 302 -> /callback?code=X
 
-    Browser->>SesameFS: GET /callback?code=...&state=...
-    SesameFS->>SesameFS: Consume state (one-time use)
-    SesameFS->>IdP: POST /token (code, client_secret, code_verifier)
-    IdP-->>SesameFS: id_token + access_token
+    B->>S: GET /callback?code=X
+    S->>I: POST /token (code, secret, verifier)
+    I-->>S: id_token
 
-    SesameFS->>SesameFS: Validate id_token signature (RSA/ECDSA only)
-    SesameFS->>SesameFS: Validate issuer
-    SesameFS->>SesameFS: Validate audience (FIXED in v2)
-    SesameFS->>SesameFS: Validate nonce
-    SesameFS->>SesameFS: Extract role (superadmin BLOCKED)
-    SesameFS->>SesameFS: Create/update user + session
-    SesameFS-->>Browser: Set sesamefs_auth cookie + redirect
-
-    Note over SesameFS: Session token stored as SHA-256 hash
+    S->>S: Verify signature (RSA/ECDSA)
+    S->>S: Check issuer
+    S->>S: Check audience (FIXED)
+    S->>S: Check nonce
+    S->>S: Map role (superadmin blocked)
+    S->>S: Create session
+    S-->>B: Set cookie + redirect
 ```
 
-## Security Headers Status
+## Headers Status
 
-```mermaid
-flowchart LR
-    subgraph AppLevel["Go Middleware (all environments)"]
-        H1["X-Content-Type-Options: nosniff"]
-        H2["Referrer-Policy: strict-origin-when-cross-origin"]
-        H3["Strict-Transport-Security: max-age=31536000"]
-    end
-
-    subgraph NginxLevel["Nginx (production only)"]
-        H4["X-Frame-Options: SAMEORIGIN"]
-        H5["X-Robots-Tag: noindex, nofollow, noarchive"]
-        H6["HSTS: max-age=63072000; preload"]
-    end
-
-    subgraph Missing["MISSING"]
-        H7["Content-Security-Policy"]
-        H8["Permissions-Policy"]
-    end
-
-    style H1 fill:#28a745,color:#fff
-    style H2 fill:#28a745,color:#fff
-    style H3 fill:#28a745,color:#fff
-    style H4 fill:#17a2b8,color:#fff
-    style H5 fill:#17a2b8,color:#fff
-    style H6 fill:#17a2b8,color:#fff
-    style H7 fill:#dc3545,color:#fff
-    style H8 fill:#ffc107,color:#000
-```
+| Header | App Level | Nginx (prod) |
+|--------|-----------|-------------|
+| X-Content-Type-Options: nosniff | Present | Present |
+| Referrer-Policy | Present | Present |
+| HSTS | Present | Present (preload) |
+| X-Frame-Options | **Missing** | SAMEORIGIN |
+| Content-Security-Policy | **Missing** | **Missing** |
+| Permissions-Policy | **Missing** | **Missing** |
+| X-Robots-Tag | **Missing** | Present |
