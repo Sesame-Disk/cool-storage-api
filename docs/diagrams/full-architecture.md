@@ -1,48 +1,153 @@
-C4Context
-    title 
+# SesameFS Full Architecture - Security Annotated
 
-    Container(internet, "Internet / Clients", "", "Browsers, Seafile Desktop/Mobile clients, API consumers")
-    Container(nginx, "Nginx Reverse Proxy", "", "TLS termination, rate limiting, security headers (X-Frame-Options, X-Robots-Tag), /metrics blocking, static file serving")
-    Container(frontend, "React Frontend (Seahub)", "", "React 17 SPA, Bootstrap 4.6, Webpack. Served via nginx:alpine container on :3000")
-    Container(sesamefs, "SesameFS API Server (Go)", "", "Gin HTTP framework, Go 1.25. Handles all API, sync, and file operations on :8080")
-    Container(auth_middleware, "Auth Middleware", "", "Token/session validation, dev-mode bypass, API key auth, repo-token auth. Security headers middleware (HSTS, nosniff, Referrer-Policy)")
-    Container(oidc, "OIDC Client", "", "OpenID Connect auth flow. Audience validation, role mapping (superadmin blocked), state management with TTL+cap, PKCE support")
-    Container(session_store, "Session Store", "", "In-memory cache + Cassandra persistence. SHA-256 hashed tokens. Node-local invalidation (M-7)")
-    Container(api_v2, "API v2 Handlers", "", "REST endpoints: libraries, files, shares, admin, search, tags, groups, departments")
-    Container(seafhttp, "Seafile HTTP Protocol", "", "Chunked upload/download, sync protocol, ZIP dir download (no size limits - H-8), token-based access")
-    Container(onlyoffice, "OnlyOffice Handler", "", "CRITICAL: editor-callback is UNAUTHENTICATED (V2-C1). No JWT verification. SSRF via http.Get on controlled URL (C-1)")
-    Container(onlyoffice_server, "OnlyOffice Document Server", "", "External document editing service on :8088. JWT-signed callbacks (but SesameFS doesn't verify them)")
-    Container(sharelink, "Share Link Handler", "", "Public share links. Content-Disposition: inline for SVG (C-2 XSS). Constant-time cookie comparison (H-6 fixed). Token enumeration oracle (H-5)")
-    Container(crypto, "Encryption Module", "", "Dual-mode: PBKDF2 (1000 iter, Seafile compat) + Argon2id (strong). AES-256-CBC per block. Per-library random file key")
-    Container(chunker, "FastCDC Chunker", "", "Content-defined chunking (2-256MB adaptive). SHA-256 block IDs. Deduplication via content addressing")
-    Container(block_store, "Block Store", "", "SHA-256 addressed blocks. Two-level sharding (blocks/xx/yy/hash). Path traversal safe. No integrity check on download")
-    ContainerDb(s3, "S3 / MinIO", "", "Object storage for file blocks. NO ServerSideEncryption in Put calls. Multi-region bucket support. TLS enabled")
-    ContainerDb(cassandra, "Apache Cassandra", "", "Metadata store: users, sessions, libraries, fs_objects, permissions, share links. Parameterized queries (no CQL injection)")
-    Container(idp, "OIDC Identity Provider", "", "External IdP (e.g., accounts.sesamedisk.com). Provides authentication, role claims, group claims")
-    Container(metrics, "Prometheus Metrics", "", "Exposed unauthenticated at app level (M-5). Blocked by nginx in prod. Contains path labels revealing route map")
-    Container(rate_limiter, "Rate Limiter", "", "Per-IP token bucket. Applied to auth endpoints. NOT applied to upload/download or share-link enumeration paths")
-    Container(gc, "Garbage Collector", "", "Background block cleanup. Grace period prevents premature deletion. Queue-based with persistence")
+```mermaid
+flowchart TB
+    subgraph External["External Actors"]
+        Browser["Browser"]
+        SeafileClient["Seafile Desktop/Mobile"]
+        APIConsumer["API Consumer"]
+        Attacker["Attacker"]
+        IdP["OIDC Provider<br/>accounts.sesamedisk.com"]
+    end
 
-    Rel(internet, nginx, "HTTPS", "")
-    Rel(nginx, frontend, "Static assets", "")
-    Rel(nginx, sesamefs, "/api*, /seafhttp, /onlyoffice", "")
-    Rel(sesamefs, auth_middleware, "Every request", "")
-    Rel(auth_middleware, oidc, "Session validation", "")
-    Rel(auth_middleware, session_store, "Token lookup", "")
-    Rel(auth_middleware, rate_limiter, "Per-IP check", "")
-    Rel(sesamefs, api_v2, "Protected routes", "")
-    Rel(sesamefs, seafhttp, "Sync protocol", "")
-    Rel(sesamefs, onlyoffice, "NO AUTH (V2-C1)", "")
-    Rel(sesamefs, sharelink, "Public share routes", "")
-    Rel(onlyoffice, onlyoffice_server, "SSRF: http.Get(url) (C-1)", "")
-    Rel(api_v2, cassandra, "Parameterized CQL", "")
-    Rel(api_v2, block_store, "File ops", "")
-    Rel(seafhttp, block_store, "Upload/download blocks", "")
-    Rel(seafhttp, crypto, "Encrypt/decrypt blocks", "")
-    Rel(block_store, s3, "Put/Get (no SSE)", "")
-    Rel(block_store, chunker, "Content-defined chunking", "")
-    Rel(session_store, cassandra, "Session persistence", "")
-    Rel(oidc, idp, "OIDC flow (code exchange)", "")
-    Rel(gc, s3, "Delete orphan blocks", "")
-    Rel(gc, cassandra, "Ref count queries", "")
-    Rel(metrics, sesamefs, "/metrics (unauth at app)", "")
+    subgraph Edge["Edge Layer"]
+        Nginx["Nginx Reverse Proxy<br/>TLS termination<br/>X-Frame-Options: SAMEORIGIN<br/>X-Robots-Tag: noindex<br/>HSTS: 63072000; preload<br/>/metrics -> 403"]
+    end
+
+    subgraph FE["Frontend Layer"]
+        ReactApp["React Frontend :3000<br/>React 17, Bootstrap 4.6"]
+    end
+
+    subgraph API["SesameFS Go API Server :8080"]
+        direction TB
+
+        subgraph MW["Middleware Stack"]
+            SecHeaders["Security Headers<br/>nosniff, HSTS, Referrer-Policy"]
+            CORS["CORS Middleware<br/>allowed_origins: * (PROBLEM)<br/>AllowCredentials: true"]
+            RateLimit["Rate Limiter<br/>Per-IP token bucket"]
+            AuthMW["Auth Middleware<br/>Session / API Key / Repo Token"]
+        end
+
+        subgraph OIDC_Module["OIDC Module"]
+            OIDCClient["OIDC Client<br/>Code flow + PKCE<br/>Audience + nonce validation"]
+            StateStore["State Store<br/>TTL: 10min, Cap: 10k"]
+            RoleMapper["Role Mapper<br/>superadmin BLOCKED"]
+        end
+
+        subgraph SessionMgmt["Session Management"]
+            SessionCache["In-Memory Cache<br/>(node-local)"]
+            SessionDB["Cassandra Sessions<br/>SHA-256 hashed tokens"]
+        end
+
+        subgraph Handlers["Route Handlers"]
+            subgraph AuthRequired["Auth Required"]
+                LibraryH["Library CRUD"]
+                FileH["File Operations"]
+                ShareH["Share Link Management"]
+                AdminH["Admin Endpoints"]
+                SearchH["Search (SASI)"]
+                BlockH["Block Upload/Download"]
+            end
+
+            subgraph NoAuth["NO Auth Required"]
+                ShareView["Share Link Viewer<br/>/d/:token<br/>inline SVG = XSS"]
+                OOCallback["OnlyOffice Callback<br/>ZERO AUTH<br/>ZERO JWT CHECK"]
+                InfoEP["Info Endpoints<br/>/ping, /health, /ready<br/>/bootstrap, /server-info"]
+                OIDCEndpoints["OIDC Endpoints<br/>/auth/oidc/config (leaks)"]
+                MetricsEP["/metrics (unauth)"]
+                CSRFLogout["DELETE /auth/session<br/>No auth (M-1)"]
+            end
+        end
+
+        subgraph Storage["Storage Subsystem"]
+            Chunker["FastCDC Chunker<br/>2-256MB, SHA-256"]
+            BlockStore["Block Store<br/>Content-addressed<br/>blocks/xx/yy/hash"]
+            ZipMod["ZIP Download<br/>NO limits"]
+        end
+
+        subgraph CryptoModule["Encryption"]
+            Argon2["Argon2id (strong)"]
+            PBKDF2["PBKDF2 1000 iter (compat)"]
+            AES["AES-256-CBC"]
+        end
+
+        subgraph GCSvc["Garbage Collection"]
+            GC["GC Scanner + Worker<br/>Grace period, queue-based"]
+        end
+    end
+
+    subgraph Infra["Infrastructure"]
+        OOServer["OnlyOffice Server :8088"]
+    end
+
+    subgraph Data["Data Layer"]
+        S3[("S3 / MinIO<br/>NO ServerSideEncryption")]
+        Cassandra[("Cassandra 5.0<br/>Parameterized queries")]
+    end
+
+    Browser -->|"HTTPS"| Nginx
+    SeafileClient -->|"HTTPS"| Nginx
+    APIConsumer -->|"HTTPS"| Nginx
+    Attacker -->|"HTTPS"| Nginx
+
+    Nginx --> ReactApp
+    Nginx -->|"/api*, /seafhttp"| SecHeaders
+    Nginx -->|"/onlyoffice"| OOCallback
+
+    SecHeaders --> CORS --> RateLimit --> AuthMW
+    AuthMW --> AuthRequired
+    AuthMW -.-> SessionCache
+    AuthMW -.-> OIDCClient
+    SessionCache -.-> SessionDB
+
+    OIDCClient -->|"Code exchange"| IdP
+    OIDCClient --> StateStore
+    OIDCClient --> RoleMapper
+
+    FileH --> BlockStore
+    FileH --> Chunker
+    BlockH --> BlockStore
+    ShareView --> BlockStore
+
+    OOCallback -->|"http.Get(url) SSRF"| OOServer
+
+    BlockStore --> S3
+    Chunker --> BlockStore
+    ZipMod --> BlockStore
+    ZipMod --> AES
+
+    LibraryH --> Cassandra
+    FileH --> Cassandra
+    ShareH --> Cassandra
+    AdminH --> Cassandra
+
+    GC --> S3
+    GC --> Cassandra
+
+    style OOCallback fill:#dc3545,color:#fff,stroke:#a71d2a,stroke-width:3px
+    style S3 fill:#e67700,color:#fff,stroke:#cc6600,stroke-width:2px
+    style ShareView fill:#ffc107,color:#000,stroke:#d4a106,stroke-width:2px
+    style CORS fill:#ffc107,color:#000,stroke:#d4a106,stroke-width:2px
+    style ZipMod fill:#ffc107,color:#000,stroke:#d4a106,stroke-width:2px
+    style CSRFLogout fill:#ffc107,color:#000,stroke:#d4a106
+    style MetricsEP fill:#ffc107,color:#000,stroke:#d4a106
+    style PBKDF2 fill:#ffc107,color:#000,stroke:#d4a106
+    style SecHeaders fill:#28a745,color:#fff,stroke:#1e7e34
+    style AuthMW fill:#28a745,color:#fff,stroke:#1e7e34
+    style OIDCClient fill:#28a745,color:#fff,stroke:#1e7e34
+    style RoleMapper fill:#28a745,color:#fff,stroke:#1e7e34
+    style Argon2 fill:#17a2b8,color:#fff,stroke:#138496
+    style AES fill:#17a2b8,color:#fff,stroke:#138496
+    style Nginx fill:#6c757d,color:#fff
+```
+
+## Legend
+
+| Color | Meaning |
+|-------|---------|
+| **Red** | Critical vulnerability - must fix before production |
+| **Orange** | Security gap - should fix soon |
+| **Yellow** | Medium concern - defense-in-depth |
+| **Green** | Security control working correctly |
+| **Blue** | Encryption / cryptographic module |
+| **Gray** | Infrastructure component |
