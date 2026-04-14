@@ -7,11 +7,14 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/Sesame-Disk/sesamefs/internal/config"
+	"github.com/Sesame-Disk/sesamefs/internal/middleware"
 	"github.com/Sesame-Disk/sesamefs/internal/storage"
 	"github.com/Sesame-Disk/sesamefs/internal/traffic"
 	"github.com/gin-gonic/gin"
+	"golang.org/x/time/rate"
 )
 
 // BlockHandler handles block-level API operations
@@ -30,10 +33,15 @@ func RegisterBlockRoutes(rg *gin.RouterGroup, blockStore *storage.BlockStore, st
 		config:         cfg,
 	}
 
+	// Per-IP rate limit for the block existence oracle.
+	// 60 req/min with burst 120 lets legitimate clients batch-check during
+	// resumable uploads while cutting off hash-enumeration probes.
+	checkBlocksLimiter := middleware.NewRateLimiter(rate.Every(time.Second), 120)
+
 	blocks := rg.Group("/blocks")
 	{
 		// Check which blocks exist (for deduplication and resume)
-		blocks.POST("/check", h.CheckBlocks)
+		blocks.POST("/check", checkBlocksLimiter.Limit(), h.CheckBlocks)
 
 		// Upload a single block
 		blocks.POST("/upload", h.UploadBlock)

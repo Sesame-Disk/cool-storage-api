@@ -1798,9 +1798,10 @@ func (h *SeafHTTPHandler) streamFileFromBlocks(c *gin.Context, token *AccessToke
 	// Set headers before streaming — Content-Length lets clients show progress
 	c.Header("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, filename))
 	c.Header("Content-Type", "application/octet-stream")
-	if fileSize > 0 && fileKey == nil {
-		// Only set Content-Length for unencrypted files where we know the exact size.
-		// Encrypted blocks may differ in size after decryption.
+	if fileSize > 0 {
+		// fs_objects.size_bytes is always the plaintext byte count — even for
+		// encrypted libraries — so the emitted stream length equals fileSize
+		// after decryption. Exposing this header lets clients show progress.
 		c.Header("Content-Length", strconv.FormatInt(fileSize, 10))
 	}
 	c.Status(http.StatusOK)

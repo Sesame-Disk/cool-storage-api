@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/Sesame-Disk/sesamefs/internal/crypto"
+	"github.com/Sesame-Disk/sesamefs/internal/middleware"
 	"github.com/gin-gonic/gin"
 )
 
@@ -245,6 +246,80 @@ func TestChangePassword_Validation(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestEncryptionHandler_RequireLibraryAccess_RepoToken(t *testing.T) {
+	h := &EncryptionHandler{permMiddleware: middleware.NewPermissionMiddleware(nil)}
+
+	tests := []struct {
+		name       string
+		tokenRepo  string
+		tokenPerm  string
+		required   middleware.LibraryPermission
+		wantOK     bool
+		wantStatus int
+	}{
+		{
+			name:      "set-password allows read token",
+			tokenRepo: "repo-1",
+			tokenPerm: "r",
+			required:  middleware.PermissionR,
+			wantOK:    true,
+		},
+		{
+			name:       "change-password rejects read token",
+			tokenRepo:  "repo-1",
+			tokenPerm:  "r",
+			required:   middleware.PermissionRW,
+			wantOK:     false,
+			wantStatus: http.StatusForbidden,
+		},
+		{
+			name:      "change-password allows write token",
+			tokenRepo: "repo-1",
+			tokenPerm: "rw",
+			required:  middleware.PermissionRW,
+			wantOK:    true,
+		},
+		{
+			name:       "repo token cannot access other repo",
+			tokenRepo:  "repo-2",
+			tokenPerm:  "rw",
+			required:   middleware.PermissionR,
+			wantOK:     false,
+			wantStatus: http.StatusForbidden,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			c.Set("org_id", "org-1")
+			c.Set("user_id", "user-1")
+			c.Set("repo_api_token", true)
+			c.Set("repo_api_token_repo_id", tt.tokenRepo)
+			c.Set("repo_api_token_permission", tt.tokenPerm)
+
+			ok := h.requireLibraryAccess(c, "repo-1", tt.required)
+			if ok != tt.wantOK {
+				t.Fatalf("requireLibraryAccess() = %v, want %v", ok, tt.wantOK)
+			}
+			if !tt.wantOK && w.Code != tt.wantStatus {
+				t.Fatalf("status = %d, want %d", w.Code, tt.wantStatus)
+			}
+		})
+	}
+}
+
+func TestEncryptionHandler_RequireLibraryAccess_NilPermMiddleware(t *testing.T) {
+	h := &EncryptionHandler{}
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+
+	if !h.requireLibraryAccess(c, "repo-1", middleware.PermissionR) {
+		t.Fatal("nil perm middleware should not block validation-only paths")
 	}
 }
 

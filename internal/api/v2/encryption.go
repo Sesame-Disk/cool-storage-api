@@ -2,12 +2,16 @@ package v2
 
 import (
 	"encoding/hex"
+	"errors"
+	"log"
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
 
 	"github.com/Sesame-Disk/sesamefs/internal/crypto"
 	"github.com/Sesame-Disk/sesamefs/internal/db"
+	"github.com/Sesame-Disk/sesamefs/internal/middleware"
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -15,13 +19,13 @@ import (
 
 // DecryptSession tracks which libraries a user has unlocked and their file keys
 type DecryptSession struct {
-	UnlockedAt         time.Time
-	OrgID              string
-	RepoID             string
-	UpdatedAt          time.Time
-	lastResolverCheck  time.Time // last time we queried the DB to validate UpdatedAt
-	FileKey            []byte    // The decrypted file encryption key (32 bytes)
-	FileIV             []byte    // The derived file encryption IV (16 bytes) - for Seafile v2 compat
+	UnlockedAt        time.Time
+	OrgID             string
+	RepoID            string
+	UpdatedAt         time.Time
+	lastResolverCheck time.Time // last time we queried the DB to validate UpdatedAt
+	FileKey           []byte    // The decrypted file encryption key (32 bytes)
+	FileIV            []byte    // The derived file encryption IV (16 bytes) - for Seafile v2 compat
 }
 
 type libraryUpdatedAtResolver func(orgID, repoID string) (time.Time, error)
@@ -34,10 +38,10 @@ const resolverCheckInterval = 30 * time.Second
 // DecryptSessionManager manages library decrypt sessions
 // Libraries are unlocked for 1 hour after password verification
 type DecryptSessionManager struct {
-	mu                 sync.RWMutex
-	sessions           map[string]*DecryptSession // key: "userID:repoID"
-	ttl                time.Duration
-	updatedAtResolver  libraryUpdatedAtResolver
+	mu                sync.RWMutex
+	sessions          map[string]*DecryptSession // key: "userID:repoID"
+	ttl               time.Duration
+	updatedAtResolver libraryUpdatedAtResolver
 }
 
 // Global session manager
@@ -180,21 +184,74 @@ func GetDecryptSessions() *DecryptSessionManager {
 
 // EncryptionHandler handles encrypted library password operations
 type EncryptionHandler struct {
-	db *db.DB
+	db             *db.DB
+	permMiddleware *middleware.PermissionMiddleware
+	rateLimiter    *PasswordRateLimiter
 }
 
 // NewEncryptionHandler creates a new encryption handler
-func NewEncryptionHandler(db *db.DB) *EncryptionHandler {
-	if db != nil {
+func NewEncryptionHandler(database *db.DB) *EncryptionHandler {
+	if database != nil {
 		decryptSessions.SetUpdatedAtResolver(func(orgID, repoID string) (time.Time, error) {
 			var updatedAt time.Time
-			err := db.Session().Query(`
+			err := database.Session().Query(`
 				SELECT updated_at FROM libraries WHERE org_id = ? AND library_id = ?
 			`, orgID, repoID).Scan(&updatedAt)
 			return updatedAt, err
 		})
 	}
-	return &EncryptionHandler{db: db}
+	return &EncryptionHandler{
+		db:             database,
+		permMiddleware: middleware.NewPermissionMiddleware(database),
+		rateLimiter:    NewPasswordRateLimiter(database),
+	}
+}
+
+func (h *EncryptionHandler) requireLibraryAccess(c *gin.Context, repoID string, required middleware.LibraryPermission) bool {
+	if h == nil || h.permMiddleware == nil {
+		return true
+	}
+
+	hasAccess, err := h.permMiddleware.HasLibraryAccessCtx(
+		c,
+		c.GetString("org_id"),
+		c.GetString("user_id"),
+		repoID,
+		required,
+	)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to check library permissions"})
+		return false
+	}
+	if !hasAccess {
+		c.JSON(http.StatusForbidden, gin.H{"error": "insufficient library permissions"})
+		return false
+	}
+	return true
+}
+
+// passwordActorKey identifies the caller for rate-limiting purposes.
+// Prefer user_id (authenticated), fall back to client IP so that unauthenticated
+// brute force via shared tokens is still tracked.
+func passwordActorKey(c *gin.Context) string {
+	if uid := c.GetString("user_id"); uid != "" {
+		return "u:" + uid
+	}
+	return "ip:" + c.ClientIP()
+}
+
+// writePasswordRateLimitError responds with 429 + Retry-After when the limiter
+// is active. Central so both SetPassword and ChangePassword behave identically.
+func writePasswordRateLimitError(c *gin.Context, retryAfter time.Duration) {
+	seconds := int(retryAfter.Seconds())
+	if seconds < 1 {
+		seconds = 1
+	}
+	c.Header("Retry-After", strconv.Itoa(seconds))
+	c.JSON(http.StatusTooManyRequests, gin.H{
+		"error_msg":           "Too many password attempts. Try again later.",
+		"retry_after_seconds": seconds,
+	})
 }
 
 // SetPasswordRequest is the request body for setting/verifying password
@@ -218,6 +275,9 @@ func (h *EncryptionHandler) SetPassword(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid repo_id"})
 		return
 	}
+	if !h.requireLibraryAccess(c, repoID, middleware.PermissionR) {
+		return
+	}
 
 	var req SetPasswordRequest
 	if err := c.ShouldBind(&req); err != nil {
@@ -227,6 +287,18 @@ func (h *EncryptionHandler) SetPassword(c *gin.Context) {
 
 	if req.Password == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "password is required"})
+		return
+	}
+
+	actorKey := passwordActorKey(c)
+	if retryAfter, err := h.rateLimiter.Check(repoID, actorKey); err != nil {
+		if errors.Is(err, ErrPasswordRateLimited) {
+			writePasswordRateLimitError(c, retryAfter)
+			return
+		}
+		log.Printf("[encryption] rate limit check failed: %v", err)
+		// Fail closed on limiter errors: an attacker benefits if we fail open.
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "rate limiter unavailable"})
 		return
 	}
 
@@ -270,6 +342,9 @@ func (h *EncryptionHandler) SetPassword(c *gin.Context) {
 	}
 
 	if !verified {
+		if err := h.rateLimiter.RecordFailure(repoID, actorKey); err != nil {
+			log.Printf("[encryption] record failure: %v", err)
+		}
 		c.JSON(http.StatusBadRequest, gin.H{"error_msg": "Wrong password"})
 		return
 	}
@@ -286,6 +361,10 @@ func (h *EncryptionHandler) SetPassword(c *gin.Context) {
 	userID := c.GetString("user_id")
 	decryptSessions.UnlockForLibrary(userID, orgID, repoID, updatedAt, fileKey, fileIV)
 
+	if err := h.rateLimiter.RecordSuccess(repoID, actorKey); err != nil {
+		log.Printf("[encryption] record success: %v", err)
+	}
+
 	c.JSON(http.StatusOK, gin.H{"success": true})
 }
 
@@ -299,6 +378,9 @@ func (h *EncryptionHandler) ChangePassword(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid repo_id"})
 		return
 	}
+	if !h.requireLibraryAccess(c, repoID, middleware.PermissionRW) {
+		return
+	}
 
 	var req ChangePasswordRequest
 	if err := c.ShouldBind(&req); err != nil {
@@ -308,6 +390,17 @@ func (h *EncryptionHandler) ChangePassword(c *gin.Context) {
 
 	if req.OldPassword == "" || req.NewPassword == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "old_password and new_password are required"})
+		return
+	}
+
+	actorKey := passwordActorKey(c)
+	if retryAfter, err := h.rateLimiter.Check(repoID, actorKey); err != nil {
+		if errors.Is(err, ErrPasswordRateLimited) {
+			writePasswordRateLimitError(c, retryAfter)
+			return
+		}
+		log.Printf("[encryption] rate limit check failed: %v", err)
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "rate limiter unavailable"})
 		return
 	}
 
@@ -341,6 +434,9 @@ func (h *EncryptionHandler) ChangePassword(c *gin.Context) {
 	newParams, err := crypto.ChangePassword(req.OldPassword, req.NewPassword, repoID, oldParams)
 	if err != nil {
 		if err.Error() == "wrong password" {
+			if rerr := h.rateLimiter.RecordFailure(repoID, actorKey); rerr != nil {
+				log.Printf("[encryption] record failure: %v", rerr)
+			}
 			c.JSON(http.StatusBadRequest, gin.H{"error_msg": "Wrong password"})
 			return
 		}
@@ -381,6 +477,10 @@ func (h *EncryptionHandler) ChangePassword(c *gin.Context) {
 	// to re-unlock. Without this, any user who unlocked with the old password
 	// could continue reading files via the cached file key for up to ttl.
 	decryptSessions.LockAllForRepo(repoID)
+
+	if err := h.rateLimiter.RecordSuccess(repoID, actorKey); err != nil {
+		log.Printf("[encryption] record success: %v", err)
+	}
 
 	c.JSON(http.StatusOK, gin.H{"success": true})
 }

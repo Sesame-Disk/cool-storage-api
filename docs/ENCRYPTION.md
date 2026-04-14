@@ -301,6 +301,75 @@ curl -X PUT -H "Authorization: Token $TOKEN" \
   -d "new_password=NewSecurePassword456"
 ```
 
+## Known Limitations
+
+These limitations are intentional — each represents a conscious trade-off
+between compatibility, UX, or design simplicity and absolute security. They
+are documented so operators can reason about the threat model and advise
+users accordingly.
+
+### Seafile compat uses a static IV per library (CBC)
+
+The Seafile-compatible block encryption path (`EncryptBlockSeafile`) derives a
+single `fileIV` from the library password and reuses it across every block
+uploaded via Seafile desktop/mobile clients. AES-256-CBC with a reused IV
+leaks equality of plaintext-prefix blocks between files in the same library
+— an attacker with read access to the block store can tell which encrypted
+files share an identical opening 16 bytes, though they still cannot recover
+plaintext without the password.
+
+The native SesameFS path (`EncryptBlock`) uses a fresh random IV per block
+and is not affected.
+
+- **Why we keep it**: removing the static IV would break compatibility with
+  shipped Seafile desktop and mobile clients, which expect the derived IV.
+- **Mitigation**: for data where block-prefix equality is sensitive
+  (e.g. structured files with identical headers), upload via the web UI or
+  the v2 API; those paths use random per-block IVs.
+
+### Metadata is not encrypted
+
+File names, paths, sizes, timestamps, and directory structure are stored in
+plaintext in Cassandra. Only block *contents* are encrypted.
+
+- **Why we keep it**: encrypting metadata breaks listing, search, quota
+  accounting, share links, admin panels, and GC. The engineering cost is
+  disproportionate to the threat — an attacker with Cassandra read access
+  already sees enough to compromise the service.
+- **Mitigation**: protect Cassandra with the same care as the block store
+  (network isolation, encryption-at-rest on disk, role separation).
+
+### Cross-method deduplication does not happen
+
+Blocks chunked by the web uploader (FastCDC, variable-size) and blocks
+chunked by the Seafile desktop client (CDC, different parameters) produce
+different SHA-256 hashes even for identical plaintext. The same file
+uploaded via both paths is stored twice.
+
+- **Why we keep it**: unifying the chunkers would require either rewriting
+  the Seafile client protocol or re-chunking server-side on upload (which
+  doubles upload CPU and breaks the streaming path). The storage cost of
+  duplicated blocks is bounded in practice — users rarely upload the same
+  file via multiple methods.
+- **Mitigation**: none needed. Dedup within each method still works.
+
+### Password brute-force: PBKDF2 compat + online rate limit
+
+The Seafile-compat key-derivation uses 1000 PBKDF2 iterations. This is fast
+enough that an attacker with Cassandra read access could mount an offline
+dictionary attack against stolen `magic` values. We keep PBKDF2 at 1000
+iterations for desktop/mobile client compatibility.
+
+- **Why we keep it**: the Seafile client protocol hardcodes 1000
+  iterations; raising this breaks every deployed client. The newer web/API
+  path already uses Argon2id (strong) and is the recommended mode for
+  sensitive libraries.
+- **Mitigation**: online brute-force is blocked by persistent rate limiting
+  on `set-password` — 5 wrong attempts trigger exponential backoff (1 min
+  → 2 min → 4 min → … up to 30 min per actor), counted in Cassandra with a
+  24-hour TTL. Offline brute-force requires Cassandra compromise; the
+  primary defense is network isolation plus password complexity policy.
+
 ## Security Audit Checklist
 
 - [ ] Passwords never logged or stored plaintext
