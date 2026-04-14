@@ -26,6 +26,13 @@ type GCStore interface {
 	GetOrgDeletedAt(orgID uuid.UUID) (*time.Time, error)
 
 	// Block operations (worker)
+	//
+	// GetBlockRefCount returns the current reference count for a block.
+	// It MUST return a non-nil error when the block row does not exist
+	// (e.g. gocql.ErrNotFound). RecoverS3Orphans relies on this to
+	// distinguish blocks that were claimed-but-not-finalized (row still
+	// present → skip) from blocks whose DB row was already removed
+	// (error → proceed with S3 cleanup).
 	GetBlockRefCount(orgID uuid.UUID, blockID string) (int, error)
 	ResolveBlockIDs(orgID uuid.UUID, blockIDs []string) ([]string, error)
 	ClaimBlockDelete(orgID uuid.UUID, blockID string) (bool, error)

@@ -15,15 +15,21 @@ import (
 
 // DecryptSession tracks which libraries a user has unlocked and their file keys
 type DecryptSession struct {
-	UnlockedAt time.Time
-	OrgID      string
-	RepoID     string
-	UpdatedAt  time.Time
-	FileKey    []byte // The decrypted file encryption key (32 bytes)
-	FileIV     []byte // The derived file encryption IV (16 bytes) - for Seafile v2 compat
+	UnlockedAt         time.Time
+	OrgID              string
+	RepoID             string
+	UpdatedAt          time.Time
+	lastResolverCheck  time.Time // last time we queried the DB to validate UpdatedAt
+	FileKey            []byte    // The decrypted file encryption key (32 bytes)
+	FileIV             []byte    // The derived file encryption IV (16 bytes) - for Seafile v2 compat
 }
 
 type libraryUpdatedAtResolver func(orgID, repoID string) (time.Time, error)
+
+// resolverCheckInterval is the minimum time between DB lookups for a single
+// session. Prevents hammering Cassandra on encrypted-file downloads where
+// GetFileKeyAndIV is called per block.
+const resolverCheckInterval = 30 * time.Second
 
 // DecryptSessionManager manages library decrypt sessions
 // Libraries are unlocked for 1 hour after password verification
@@ -107,12 +113,25 @@ func (m *DecryptSessionManager) getActiveSession(userID, repoID string) (*Decryp
 	snapshot := *session
 	m.mu.RUnlock()
 
-	if resolver != nil && snapshot.OrgID != "" && !snapshot.UpdatedAt.IsZero() {
+	// Cross-replica invalidation: check whether the library's updated_at has
+	// advanced (meaning another replica changed the password). Rate-limited to
+	// avoid a Cassandra query on every block download.
+	if resolver != nil && snapshot.OrgID != "" && !snapshot.UpdatedAt.IsZero() &&
+		time.Since(snapshot.lastResolverCheck) > resolverCheckInterval {
 		currentUpdatedAt, err := resolver(snapshot.OrgID, snapshot.RepoID)
-		if err != nil || currentUpdatedAt.After(snapshot.UpdatedAt) {
+		if err == nil && currentUpdatedAt.After(snapshot.UpdatedAt) {
+			// Password was rotated on another replica — evict.
 			m.Lock(userID, repoID)
 			return nil, key, false
 		}
+		// Regardless of success or transient error, update the check timestamp
+		// so we don't re-query immediately. A transient DB error should NOT
+		// revoke the session — it just means we couldn't verify this time.
+		m.mu.Lock()
+		if s, ok := m.sessions[key]; ok {
+			s.lastResolverCheck = time.Now()
+		}
+		m.mu.Unlock()
 	}
 
 	return &snapshot, key, true

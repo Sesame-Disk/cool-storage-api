@@ -2,6 +2,8 @@ package gc
 
 import (
 	"context"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -10,17 +12,44 @@ import (
 )
 
 type fakeLeaderLease struct {
-	allowed bool
-	err     error
-	calls   int
+	allowed  bool
+	err      error
+	delay    time.Duration
+	calls    int32
+	released atomic.Bool
+	leader   atomic.Bool
+	acquired chan struct{}
+	once     sync.Once
 }
 
 func (f *fakeLeaderLease) TryAcquireOrRenew(ctx context.Context) (bool, error) {
-	f.calls++
+	atomic.AddInt32(&f.calls, 1)
 	if err := ctx.Err(); err != nil {
 		return false, err
 	}
+	if f.delay > 0 {
+		select {
+		case <-ctx.Done():
+			return false, ctx.Err()
+		case <-time.After(f.delay):
+		}
+	}
+	f.leader.Store(f.allowed)
+	if f.allowed && f.acquired != nil {
+		f.once.Do(func() {
+			close(f.acquired)
+		})
+	}
 	return f.allowed, f.err
+}
+
+func (f *fakeLeaderLease) Release(ctx context.Context) {
+	f.leader.Store(false)
+	f.released.Store(true)
+}
+
+func (f *fakeLeaderLease) IsLeader() bool {
+	return f.leader.Load()
 }
 
 func TestStats_BlocksDeleted(t *testing.T) {
@@ -284,9 +313,6 @@ func TestService_RunWorkerOnce_SkipsWithoutLeadership(t *testing.T) {
 
 	svc.runWorkerOnce(context.Background())
 
-	if lease.calls != 1 {
-		t.Fatalf("lease should be consulted once, got %d calls", lease.calls)
-	}
 	if store.GetBlock(orgID, "lease-block") == nil {
 		t.Fatal("worker should not process blocks without leadership")
 	}
@@ -318,15 +344,60 @@ func TestService_RunWorkerOnce_ProcessesWithLeadership(t *testing.T) {
 
 	svc.runWorkerOnce(context.Background())
 
-	if lease.calls != 1 {
-		t.Fatalf("lease should be consulted once, got %d calls", lease.calls)
-	}
 	if stats.BlocksDeleted() != 1 {
 		t.Fatalf("expected 1 deleted block with leadership, got %d", stats.BlocksDeleted())
 	}
 	if store.GetBlock(orgID, "lease-block") != nil {
 		t.Fatal("worker should process blocks when leadership is held")
 	}
+}
+
+func TestService_Start_AcquiresLeaseBeforeImmediateScannerRun(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	lease := &fakeLeaderLease{
+		allowed:  true,
+		delay:    75 * time.Millisecond,
+		acquired: make(chan struct{}),
+	}
+
+	svc := &Service{
+		store:          store,
+		config:         config.GCConfig{Enabled: true, WorkerInterval: time.Minute, ScanInterval: time.Minute, BatchSize: 10, DryRun: true},
+		queue:          NewQueue(store),
+		worker:         NewWorker(store, nil, NewQueue(store), 10, 0, true, stats),
+		scanner:        NewScanner(store, NewQueue(store), stats, config.GCConfig{}),
+		stats:          stats,
+		lease:          lease,
+		triggerWorker:  make(chan struct{}, 1),
+		triggerScanner: make(chan struct{}, 1),
+	}
+
+	start := time.Now()
+	svc.Start()
+	defer svc.Stop()
+
+	if atomic.LoadInt32(&lease.calls) == 0 {
+		t.Fatal("Start should acquire the lease before returning")
+	}
+	if time.Since(start) < lease.delay {
+		t.Fatal("Start should wait for the initial lease acquisition")
+	}
+
+	select {
+	case <-lease.acquired:
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("expected lease acquisition signal")
+	}
+
+	deadline := time.Now().Add(250 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if !svc.stats.LastScanRun().IsZero() {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("expected immediate startup scan after acquiring lease")
 }
 
 func TestService_StartStop_Concurrent(t *testing.T) {

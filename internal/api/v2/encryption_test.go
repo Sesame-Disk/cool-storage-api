@@ -3,6 +3,7 @@ package v2
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -724,5 +725,76 @@ func TestDecryptSessionManager_ResolverKeepsCurrentRepoSession(t *testing.T) {
 
 	if !m.IsUnlocked("user-1", "repo-1") {
 		t.Fatal("session should remain valid when library updated_at is unchanged")
+	}
+}
+
+// TestDecryptSessionManager_ResolverTransientErrorKeepsSession verifies that a
+// transient DB error (e.g. Cassandra timeout) does NOT revoke the session.
+// The session should survive and the resolver should be retried later.
+func TestDecryptSessionManager_ResolverTransientErrorKeepsSession(t *testing.T) {
+	m := newTestSessionManager(time.Hour)
+	baseUpdatedAt := time.Now().Add(-time.Minute)
+
+	calls := 0
+	m.SetUpdatedAtResolver(func(orgID, repoID string) (time.Time, error) {
+		calls++
+		return time.Time{}, errors.New("cassandra timeout")
+	})
+
+	m.UnlockForLibrary("user-1", "org-1", "repo-1", baseUpdatedAt, []byte("key"), []byte("iv"))
+
+	if !m.IsUnlocked("user-1", "repo-1") {
+		t.Fatal("transient resolver error should NOT revoke the session")
+	}
+	if fk := m.GetFileKey("user-1", "repo-1"); fk == nil {
+		t.Fatal("file key should still be available after transient resolver error")
+	}
+	if calls != 1 {
+		t.Fatalf("expected exactly 1 resolver call, got %d", calls)
+	}
+}
+
+// TestDecryptSessionManager_ResolverRateLimited verifies that the resolver is
+// not called on every access — only once per resolverCheckInterval.
+func TestDecryptSessionManager_ResolverRateLimited(t *testing.T) {
+	m := newTestSessionManager(time.Hour)
+	baseUpdatedAt := time.Now().Add(-time.Minute)
+
+	calls := 0
+	m.SetUpdatedAtResolver(func(orgID, repoID string) (time.Time, error) {
+		calls++
+		return baseUpdatedAt, nil // unchanged
+	})
+
+	m.UnlockForLibrary("user-1", "org-1", "repo-1", baseUpdatedAt, []byte("key"), []byte("iv"))
+
+	// Call IsUnlocked 50 times in rapid succession — should only trigger 1
+	// resolver call since all calls are within resolverCheckInterval.
+	for i := 0; i < 50; i++ {
+		if !m.IsUnlocked("user-1", "repo-1") {
+			t.Fatalf("session should remain valid on call %d", i)
+		}
+	}
+
+	if calls != 1 {
+		t.Errorf("resolver called %d times, want 1 (rate-limited)", calls)
+	}
+}
+
+// TestDecryptSessionManager_ResolverSkippedForLegacyUnlock verifies that
+// sessions created via the old Unlock() (no orgID/updatedAt) never trigger
+// the resolver, preserving backward compatibility.
+func TestDecryptSessionManager_ResolverSkippedForLegacyUnlock(t *testing.T) {
+	m := newTestSessionManager(time.Hour)
+
+	m.SetUpdatedAtResolver(func(orgID, repoID string) (time.Time, error) {
+		t.Fatal("resolver should NOT be called for legacy sessions")
+		return time.Time{}, nil
+	})
+
+	m.Unlock("user-1", "repo-1", []byte("key"), []byte("iv"))
+
+	if !m.IsUnlocked("user-1", "repo-1") {
+		t.Fatal("legacy session should remain valid")
 	}
 }

@@ -5,6 +5,8 @@ services:
       dockerfile: Dockerfile
     ports:
       - "${SESAMEFS_HOST_PORT:-8080}:${PORT:-8080}"
+    env_file:
+      - .env                        # All secrets from .env
     environment:
       - PORT=${PORT:-8080}
       - SERVER_URL=${SERVER_URL}

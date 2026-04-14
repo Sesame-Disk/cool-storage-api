@@ -130,6 +130,17 @@ func (s *Service) Start() {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	s.cancel = cancel
+
+	// Acquire leadership once before starting worker/scanner so the immediate
+	// startup scan cannot race ahead of the first lease heartbeat.
+	if s.lease != nil {
+		if ok, err := s.lease.TryAcquireOrRenew(ctx); err != nil {
+			log.Printf("[GC] Initial lease acquisition failed: %v", err)
+		} else if ok {
+			log.Println("[GC] Acquired leader lease")
+		}
+	}
+
 	s.started = true
 
 	// Start worker goroutine
@@ -145,6 +156,17 @@ func (s *Service) Start() {
 		defer s.wg.Done()
 		s.runScannerLoop(ctx)
 	}()
+
+	// Start lease renewal goroutine — keeps the lease alive independently of
+	// worker/scanner duration so long-running ProcessOnce or ScanOnce calls
+	// (which can exceed the TTL) don't cause the lease to lapse.
+	if s.lease != nil {
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			s.runLeaseRenewalLoop(ctx)
+		}()
+	}
 
 	// Start rollover goroutine — advances expired quota billing periods
 	if s.dbSession != nil {
@@ -172,6 +194,12 @@ func (s *Service) Stop() {
 	log.Println("[GC] Stopping...")
 	s.cancel()
 	s.wg.Wait()
+
+	// Release leadership so another replica can take over without waiting
+	// for TTL expiry. Best-effort — if it fails, TTL handles it.
+	if s.lease != nil {
+		s.lease.Release(context.Background())
+	}
 
 	// Persist stats to database before shutdown
 	s.persistStats()
@@ -351,14 +379,44 @@ func (s *Service) runScannerOnce(ctx context.Context) {
 
 func (s *Service) hasLeadership(ctx context.Context, component string) bool {
 	if s.lease == nil {
-		return true
+		return true // no lease configured — single-instance mode
 	}
-	ok, err := s.lease.TryAcquireOrRenew(ctx)
-	if err != nil {
-		log.Printf("[GC] Failed to renew leader lease for %s: %v", component, err)
-		return false
+	// Fast check against the cached atomic — the background renewal goroutine
+	// keeps this up to date every TTL/3 seconds.
+	return s.lease.IsLeader()
+}
+
+// leaseRenewalInterval returns TTL/3 — frequent enough that a single missed
+// renewal doesn't lose the lease (which lives for the full TTL).
+func (s *Service) leaseRenewalInterval() time.Duration {
+	if s.lease == nil {
+		return time.Minute
 	}
-	return ok
+	cl, ok := s.lease.(*cassandraLeaderLease)
+	if !ok {
+		return 10 * time.Second
+	}
+	interval := time.Duration(cl.ttlSeconds) * time.Second / 3
+	if interval < 5*time.Second {
+		interval = 5 * time.Second
+	}
+	return interval
+}
+
+func (s *Service) runLeaseRenewalLoop(ctx context.Context) {
+	ticker := time.NewTicker(s.leaseRenewalInterval())
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if _, err := s.lease.TryAcquireOrRenew(ctx); err != nil {
+				log.Printf("[GC] Lease renewal failed: %v", err)
+			}
+		}
+	}
 }
 
 // SetDryRun changes the dry run mode at runtime (for admin API).

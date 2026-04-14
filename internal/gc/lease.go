@@ -3,7 +3,9 @@ package gc
 import (
 	"context"
 	"fmt"
+	"log"
 	"os"
+	"sync/atomic"
 	"time"
 
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
@@ -15,7 +17,16 @@ const (
 )
 
 type leaderLease interface {
+	// TryAcquireOrRenew attempts to claim or extend the lease. Thread-safe.
 	TryAcquireOrRenew(ctx context.Context) (bool, error)
+
+	// Release explicitly deletes the lease row so another replica can take
+	// over immediately instead of waiting for TTL expiry. Best-effort.
+	Release(ctx context.Context)
+
+	// IsLeader returns the most recently observed leadership state without
+	// hitting the database. Use this for fast checks in hot paths.
+	IsLeader() bool
 }
 
 type cassandraLeaderLease struct {
@@ -24,6 +35,10 @@ type cassandraLeaderLease struct {
 	instanceID string
 	ttlSeconds int
 	now        func() time.Time
+
+	// isLeader caches the result of the last TryAcquireOrRenew so that
+	// hasLeadership() can be a cheap read between renewal ticks.
+	isLeader atomic.Bool
 }
 
 func newCassandraLeaderLease(session *gocql.Session, role string, workerInterval time.Duration) leaderLease {
@@ -58,12 +73,14 @@ func (l *cassandraLeaderLease) TryAcquireOrRenew(ctx context.Context) (bool, err
 	now := l.now()
 	applied, err := l.session.Query(`
 		INSERT INTO gc_leases (role, instance_id, heartbeat)
-		VALUES (?, ?, ?) USING TTL ? IF NOT EXISTS
+		VALUES (?, ?, ?) IF NOT EXISTS USING TTL ?
 	`, l.role, l.instanceID, now, l.ttlSeconds).MapScanCAS(map[string]interface{}{})
 	if err != nil {
+		l.isLeader.Store(false)
 		return false, fmt.Errorf("gc leader lease insert failed: %w", err)
 	}
 	if applied {
+		l.isLeader.Store(true)
 		return true, nil
 	}
 	applied, err = l.session.Query(`
@@ -72,7 +89,22 @@ func (l *cassandraLeaderLease) TryAcquireOrRenew(ctx context.Context) (bool, err
 		WHERE role = ? IF instance_id = ?
 	`, l.ttlSeconds, l.instanceID, now, l.role, l.instanceID).MapScanCAS(map[string]interface{}{})
 	if err != nil {
+		l.isLeader.Store(false)
 		return false, fmt.Errorf("gc leader lease renew failed: %w", err)
 	}
+	l.isLeader.Store(applied)
 	return applied, nil
+}
+
+func (l *cassandraLeaderLease) Release(ctx context.Context) {
+	if err := l.session.Query(`
+		DELETE FROM gc_leases WHERE role = ? IF instance_id = ?
+	`, l.role, l.instanceID).WithContext(ctx).Exec(); err != nil {
+		log.Printf("[GC] Best-effort lease release failed: %v", err)
+	}
+	l.isLeader.Store(false)
+}
+
+func (l *cassandraLeaderLease) IsLeader() bool {
+	return l.isLeader.Load()
 }
