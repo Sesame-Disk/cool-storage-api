@@ -414,13 +414,15 @@ func initStorageClass(name string, cfg config.StorageClassConfig) (*storage.S3St
 	}
 
 	s3Cfg := storage.S3Config{
-		Endpoint:        cfg.Endpoint,
-		Bucket:          cfg.Bucket,
-		Region:          region,
-		AccessKeyID:     accessKey,
-		SecretAccessKey: secretKey,
-		UsePathStyle:    cfg.UsePathStyle || cfg.Endpoint != "",
-		AccessType:      accessType,
+		Endpoint:             cfg.Endpoint,
+		Bucket:               cfg.Bucket,
+		Region:               region,
+		AccessKeyID:          accessKey,
+		SecretAccessKey:      secretKey,
+		ServerSideEncryption: cfg.ServerSideEncryption,
+		SSEKMSKeyID:          cfg.SSEKMSKeyID,
+		UsePathStyle:         cfg.UsePathStyle || cfg.Endpoint != "",
+		AccessType:           accessType,
 	}
 
 	return storage.NewS3Store(context.Background(), s3Cfg)
@@ -434,6 +436,8 @@ func initS3Storage(cfg *config.Config) (*storage.S3Store, error) {
 	region := os.Getenv("AWS_REGION")
 	accessKey := os.Getenv("AWS_ACCESS_KEY_ID")
 	secretKey := os.Getenv("AWS_SECRET_ACCESS_KEY")
+	sseMode := os.Getenv("S3_SERVER_SIDE_ENCRYPTION")
+	sseKMSKeyID := os.Getenv("S3_SSE_KMS_KEY_ID")
 
 	// Fall back to config if not in environment
 	if bucket == "" {
@@ -452,6 +456,12 @@ func initS3Storage(cfg *config.Config) (*storage.S3Store, error) {
 			if secretKey == "" {
 				secretKey = defaultClass.SecretKey
 			}
+			if sseMode == "" {
+				sseMode = defaultClass.ServerSideEncryption
+			}
+			if sseKMSKeyID == "" {
+				sseKMSKeyID = defaultClass.SSEKMSKeyID
+			}
 		} else if hotBackend, ok := cfg.Storage.Backends["hot"]; ok {
 			// Fall back to legacy backends
 			if endpoint == "" {
@@ -460,6 +470,12 @@ func initS3Storage(cfg *config.Config) (*storage.S3Store, error) {
 			bucket = hotBackend.Bucket
 			if region == "" {
 				region = hotBackend.Region
+			}
+			if sseMode == "" {
+				sseMode = hotBackend.ServerSideEncryption
+			}
+			if sseKMSKeyID == "" {
+				sseKMSKeyID = hotBackend.SSEKMSKeyID
 			}
 		}
 	}
@@ -473,13 +489,15 @@ func initS3Storage(cfg *config.Config) (*storage.S3Store, error) {
 	}
 
 	s3Cfg := storage.S3Config{
-		Endpoint:        endpoint,
-		Bucket:          bucket,
-		Region:          region,
-		AccessKeyID:     accessKey,
-		SecretAccessKey: secretKey,
-		UsePathStyle:    endpoint != "", // Use path style for custom endpoints (MinIO)
-		AccessType:      storage.AccessImmediate,
+		Endpoint:             endpoint,
+		Bucket:               bucket,
+		Region:               region,
+		AccessKeyID:          accessKey,
+		SecretAccessKey:      secretKey,
+		ServerSideEncryption: sseMode,
+		SSEKMSKeyID:          sseKMSKeyID,
+		UsePathStyle:         endpoint != "", // Use path style for custom endpoints (MinIO)
+		AccessType:           storage.AccessImmediate,
 	}
 
 	return storage.NewS3Store(context.Background(), s3Cfg)

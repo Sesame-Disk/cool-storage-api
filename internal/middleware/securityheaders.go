@@ -10,6 +10,9 @@ import "github.com/gin-gonic/gin"
 // loaded inside the SPA). External sites cannot embed any response.
 const defaultCSP = "default-src 'none'; frame-ancestors 'self'"
 
+// defaultPermissionsPolicy disables browser capabilities SesameFS does not use.
+const defaultPermissionsPolicy = "accelerometer=(), camera=(), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), payment=(), usb=()"
+
 // SetCSP allows a handler to override the default CSP for routes that serve HTML.
 // Call this before c.HTML() or c.Data() — the value replaces the default header.
 func SetCSP(c *gin.Context, policy string) {
@@ -33,6 +36,7 @@ func SecurityHeaders() gin.HandlerFunc {
 		h.Set("Referrer-Policy", "strict-origin-when-cross-origin")
 		h.Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
 		h.Set("Content-Security-Policy", defaultCSP)
+		h.Set("Permissions-Policy", defaultPermissionsPolicy)
 		c.Next()
 	}
 }

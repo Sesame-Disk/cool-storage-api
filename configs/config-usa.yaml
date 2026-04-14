@@ -29,6 +29,8 @@ storage:
       endpoint: "http://minio:9000"
       bucket: sesamefs-usa
       region: us-east-1
+      server_side_encryption: ""
+      sse_kms_key_id: ""
       use_path_style: true
       failover_class: hot-s3-eu
       # credentials → provide via AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY env vars
@@ -39,6 +41,8 @@ storage:
       endpoint: "http://minio:9000"
       bucket: sesamefs-eu
       region: eu-west-1
+      server_side_encryption: ""
+      sse_kms_key_id: ""
       use_path_style: true
       failover_class: hot-s3-usa
       # credentials → provide via AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY env vars
@@ -49,6 +53,8 @@ storage:
       endpoint: "http://minio:9000"
       bucket: sesamefs-archive
       region: us-east-1
+      server_side_encryption: ""
+      sse_kms_key_id: ""
       use_path_style: true
       # credentials → provide via AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY env vars
 

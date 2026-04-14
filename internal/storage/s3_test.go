@@ -5,6 +5,9 @@ import (
 	"io"
 	"testing"
 	"time"
+
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 )
 
 var testTime = time.Date(2025, 12, 30, 10, 0, 0, 0, time.UTC)
@@ -260,14 +263,16 @@ func TestS3StoreKey(t *testing.T) {
 // TestS3Config tests the S3Config struct
 func TestS3Config(t *testing.T) {
 	cfg := S3Config{
-		Endpoint:        "http://localhost:9000",
-		Bucket:          "test-bucket",
-		Region:          "us-east-1",
-		AccessKeyID:     "minioadmin",
-		SecretAccessKey: "minioadmin",
-		Prefix:          "test/",
-		AccessType:      AccessImmediate,
-		UsePathStyle:    true,
+		Endpoint:             "http://localhost:9000",
+		Bucket:               "test-bucket",
+		Region:               "us-east-1",
+		AccessKeyID:          "minioadmin",
+		SecretAccessKey:      "minioadmin",
+		Prefix:               "test/",
+		AccessType:           AccessImmediate,
+		UsePathStyle:         true,
+		ServerSideEncryption: "AES256",
+		SSEKMSKeyID:          "",
 	}
 
 	if cfg.Endpoint != "http://localhost:9000" {
@@ -281,6 +286,60 @@ func TestS3Config(t *testing.T) {
 	}
 	if !cfg.UsePathStyle {
 		t.Error("UsePathStyle should be true")
+	}
+	if cfg.ServerSideEncryption != "AES256" {
+		t.Errorf("ServerSideEncryption = %s, want AES256", cfg.ServerSideEncryption)
+	}
+}
+
+func TestNormalizeServerSideEncryption(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   string
+		want    types.ServerSideEncryption
+		wantErr bool
+	}{
+		{name: "empty", input: "", want: ""},
+		{name: "aes256", input: "AES256", want: types.ServerSideEncryptionAes256},
+		{name: "kms", input: "aws:kms", want: types.ServerSideEncryptionAwsKms},
+		{name: "invalid", input: "kms", wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := normalizeServerSideEncryption(tt.input)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("normalizeServerSideEncryption(%q) error = %v, wantErr %v", tt.input, err, tt.wantErr)
+			}
+			if got != tt.want {
+				t.Fatalf("normalizeServerSideEncryption(%q) = %q, want %q", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestApplySSEToInputs(t *testing.T) {
+	store := &S3Store{
+		serverSideEncryption: types.ServerSideEncryptionAwsKms,
+		sseKMSKeyID:          "arn:aws:kms:us-east-1:123456789012:key/test",
+	}
+
+	putInput := &s3.PutObjectInput{}
+	store.applySSEToPutObjectInput(putInput)
+	if putInput.ServerSideEncryption != types.ServerSideEncryptionAwsKms {
+		t.Fatalf("PutObjectInput.ServerSideEncryption = %q, want %q", putInput.ServerSideEncryption, types.ServerSideEncryptionAwsKms)
+	}
+	if putInput.SSEKMSKeyId == nil || *putInput.SSEKMSKeyId != store.sseKMSKeyID {
+		t.Fatalf("PutObjectInput.SSEKMSKeyId = %v, want %q", putInput.SSEKMSKeyId, store.sseKMSKeyID)
+	}
+
+	createInput := &s3.CreateMultipartUploadInput{}
+	store.applySSEToCreateMultipartUploadInput(createInput)
+	if createInput.ServerSideEncryption != types.ServerSideEncryptionAwsKms {
+		t.Fatalf("CreateMultipartUploadInput.ServerSideEncryption = %q, want %q", createInput.ServerSideEncryption, types.ServerSideEncryptionAwsKms)
+	}
+	if createInput.SSEKMSKeyId == nil || *createInput.SSEKMSKeyId != store.sseKMSKeyID {
+		t.Fatalf("CreateMultipartUploadInput.SSEKMSKeyId = %v, want %q", createInput.SSEKMSKeyId, store.sseKMSKeyID)
 	}
 }
 

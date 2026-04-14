@@ -37,6 +37,8 @@ storage:
       endpoint: ""                    # Leave empty for AWS
       bucket: sesamefs-usa
       region: us-east-1
+      server_side_encryption: "AES256" # Recommended default for AWS S3
+      sse_kms_key_id: ""               # Optional; set only when using aws:kms
       failover_class: hot-s3-eu       # Failover if this backend is down
 
     hot-s3-eu:
@@ -45,6 +47,8 @@ storage:
       endpoint: ""
       bucket: sesamefs-eu
       region: eu-west-1
+      server_side_encryption: "AES256"
+      sse_kms_key_id: ""
       failover_class: hot-s3-usa
 
     hot-s3-china:
@@ -53,6 +57,8 @@ storage:
       endpoint: ""
       bucket: sesamefs-china
       region: cn-north-1
+      server_side_encryption: "AES256"
+      sse_kms_key_id: ""
 
     # Cold storage (delayed access)
     cold-glacier-usa:
@@ -68,6 +74,8 @@ storage:
       endpoint: "http://localhost:9000"
       bucket: sesamefs-blocks
       region: us-east-1
+      server_side_encryption: ""       # Optional; leave empty unless your local S3 backend supports SSE
+      sse_kms_key_id: ""
       use_path_style: true            # Required for MinIO
       # credentials → provide via AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY env vars
 

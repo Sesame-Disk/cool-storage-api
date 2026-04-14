@@ -61,6 +61,8 @@ database:
 #   S3_BUCKET    → bucket name
 #   S3_REGION    → AWS region (e.g. us-east-1)
 #   S3_ENDPOINT  → leave empty for real AWS; set for S3-compatible APIs (R2, Cloudflare, etc.)
+#   S3_SERVER_SIDE_ENCRYPTION → AES256 or aws:kms
+#   S3_SSE_KMS_KEY_ID         → optional KMS key ID/ARN when using aws:kms
 #   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY → picked up by AWS SDK automatically
 # =============================================================================
 storage:
@@ -72,6 +74,8 @@ storage:
       bucket: ""                     # Set via S3_BUCKET env var
       region: ""                     # Set via S3_REGION env var
       endpoint: ""                   # Optional S3-compatible endpoint via S3_ENDPOINT env var
+      server_side_encryption: "AES256" # Override via S3_SERVER_SIDE_ENCRYPTION; recommended for AWS S3
+      sse_kms_key_id: ""               # Optional via S3_SSE_KMS_KEY_ID when using aws:kms
       # bucket, region, endpoint → overridden by S3_BUCKET, S3_REGION, S3_ENDPOINT
       # credentials → overridden by AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
 

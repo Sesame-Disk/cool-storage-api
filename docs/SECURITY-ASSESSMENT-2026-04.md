@@ -587,7 +587,7 @@ Sends a preflight and a simple GET with `Origin: https://evil.example` and repor
 #### M-3 Security response headers missing — FIXED
 
 **File:** `internal/middleware/securityheaders.go`.
-**Status: FIXED.** `SecurityHeaders()` middleware now emits on every response: `X-Content-Type-Options: nosniff`, `Referrer-Policy: strict-origin-when-cross-origin`, `Strict-Transport-Security: max-age=31536000; includeSubDomains`, `Content-Security-Policy: default-src 'none'; frame-ancestors 'self'`. Routes serving HTML use `SetCSP()` to relax the policy as needed. Only `Permissions-Policy` remains as a nice-to-have.
+**Status: FIXED.** `SecurityHeaders()` middleware now emits on every response: `X-Content-Type-Options: nosniff`, `Referrer-Policy: strict-origin-when-cross-origin`, `Strict-Transport-Security: max-age=31536000; includeSubDomains`, `Content-Security-Policy: default-src 'none'; frame-ancestors 'self'`, and `Permissions-Policy: accelerometer=(), camera=(), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), payment=(), usb=()`. Routes serving HTML use `SetCSP()` to relax the policy as needed.
 
 ~~Observed on every sesamefs response — including **confirmed live** on a pre-production deployment, all five of these were missing on `/api2/ping`:~~
 
@@ -903,7 +903,8 @@ The [preflight section at the top](#production-prerequisites--the-preflight-gate
 
 ### Nice to have / Planned
 
-- **Permissions-Policy** header — 1 line in `securityheaders.go`
+- ~~**Permissions-Policy** header~~ — FIXED: emitted globally by `SecurityHeaders()` middleware
+- ~~**S3 server-side encryption**~~ — FIXED: configurable `server_side_encryption` (AES256/aws:kms) + `sse_kms_key_id` applied to `PutObject` + `CreateMultipartUpload`
 - **M-10** Frontend dependency CVEs — moment.js → dayjs, socket.io 2 → 4, url-parse → URL API
 - **Block integrity verification** on download (re-hash and compare)
 - **M-8** deprecate PBKDF2 compat path or raise iterations when client compatibility allows

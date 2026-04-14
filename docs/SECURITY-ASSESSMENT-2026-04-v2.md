@@ -67,7 +67,7 @@ The three v2-only findings identified during reassessment are also fixed in curr
 | L-1 | OIDC `aud` not validated | Latent | **FIXED** | Full audience validation implemented with multi-aud support |
 | M-1 | CSRF logout | Medium | **FIXED IN CODE** | `DELETE /api/v2.1/auth/session` now requires a valid Authorization token and rejects missing/invalid callers |
 | M-2 | CORS `*` + credentials | Medium | **FIXED** | `allowed_origins: []` in prod config; `CORS_ALLOWED_ORIGINS` env var required; wildcard rejected at startup |
-| M-3 | Missing security headers | Medium | **FIXED** | 4/5 headers global via `SecurityHeaders()` middleware; per-route `SetCSP()` overrides; only `Permissions-Policy` missing |
+| M-3 | Missing security headers | Medium | **FIXED** | 5/5 headers global via `SecurityHeaders()` middleware (incl. `Permissions-Policy`); per-route `SetCSP()` overrides |
 | M-4 | Avatar email enumeration | Medium | **FIXED** | Handler always returns `{"url":"","is_default":true,"mtime":0}` regardless of email |
 | M-5 | `/metrics` exposed | Medium | **FIXED IN CODE** | Route is now guarded by internal-only middleware at the application layer; nginx remains a secondary outer control |
 | M-6 | OIDC state flood | Medium | **FIXED** | State map now has TTL (10 min), cap (10k), and eviction |
@@ -215,7 +215,7 @@ Production config now ships `allowed_origins: []`, startup requires `CORS_ALLOWE
 
 #### M-3 Security headers — FIXED
 
-**Status: FIXED.** `SecurityHeaders()` middleware now emits on every response: `X-Content-Type-Options: nosniff`, `Referrer-Policy`, `Strict-Transport-Security`, `Content-Security-Policy: default-src 'none'; frame-ancestors 'self'`. HTML routes use `SetCSP()` overrides. Only `Permissions-Policy` remains as a nice-to-have.
+**Status: FIXED.** `SecurityHeaders()` middleware now emits on every response: `X-Content-Type-Options: nosniff`, `Referrer-Policy`, `Strict-Transport-Security`, `Content-Security-Policy: default-src 'none'; frame-ancestors 'self'`, and `Permissions-Policy: accelerometer=(), camera=(), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), payment=(), usb=()`. HTML routes use `SetCSP()` overrides.
 
 ---
 
@@ -291,12 +291,13 @@ SesameFS implements a **dual-mode encryption system** (`internal/crypto/crypto.g
 **Impact:** All unencrypted library blocks are exposed. Encrypted libraries remain protected
 by AES-256-CBC encryption (file key is NOT stored in S3).
 
-**Gap:** S3 `Put` operations do NOT use `ServerSideEncryption` (`internal/storage/s3.go:158-170`).
-Data at rest relies entirely on S3 bucket-level default encryption policy. If the bucket policy
-is not configured, blocks are stored unencrypted.
-
-**Recommendation:** Add `ServerSideEncryption: types.ServerSideEncryptionAes256` to all
-`PutObjectInput` calls as defense-in-depth.
+**Status: FIXED.** `S3Store` now applies `ServerSideEncryption` to every `PutObject` and
+`CreateMultipartUpload` request when configured. Modes: `AES256` or `aws:kms` (with optional
+`sse_kms_key_id`). Configurable per storage class (`storage.classes.*.server_side_encryption`),
+per legacy backend (`storage.backends.*.server_side_encryption`), and via env vars
+(`S3_SERVER_SIDE_ENCRYPTION`, `S3_SSE_KMS_KEY_ID`). `config.prod.yaml` + `config.example.yaml`
+default to `AES256` as the recommended defense-in-depth setting. Validation rejects unsupported
+modes and KMS key IDs without `aws:kms`.
 
 #### Scenario 2: Cassandra database compromised
 
@@ -360,13 +361,13 @@ all database traffic.
 
 9. **H-5:** Uniform response for share-link token lookup + rate limiting
 10. **H-7:** Tighter auth rate limit + per-account throttling
-11. **S3 SSE:** Add `ServerSideEncryption` to Put operations
+11. ~~**S3 SSE:** Add `ServerSideEncryption` to Put operations~~ — FIXED: configurable SSE (`AES256`/`aws:kms`) applied to `PutObject` + `CreateMultipartUpload`
 
 ### Nice to have
 
 12. **M-7:** Distributed session revocation
 13. **M-8:** Raise PBKDF2 iterations or deprecate compat mode
-14. **Permissions-Policy** header
+14. ~~**Permissions-Policy** header~~ — FIXED: `SecurityHeaders()` now emits `accelerometer=(), camera=(), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), payment=(), usb=()`
 15. **Block integrity verification** on download (re-hash and compare)
 16. **M-10:** Update frontend dependencies (moment.js, socket.io-client, url-parse)
 

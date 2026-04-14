@@ -213,7 +213,15 @@ AWS_ACCESS_KEY_ID=<from step 0.1>
 AWS_SECRET_ACCESS_KEY=<from step 0.1>
 S3_BUCKET=<your-bucket-name>
 S3_REGION=us-east-1
-S3_ENDPOINT=          # leave empty for real AWS S3
+S3_ENDPOINT=                      # leave empty for real AWS S3
+S3_SERVER_SIDE_ENCRYPTION=AES256  # AES256 (recommended) or aws:kms; leave empty to rely on bucket default
+S3_SSE_KMS_KEY_ID=                # optional — KMS key ID/ARN when using aws:kms
+
+# CORS (required in prod; wildcard "*" is rejected)
+CORS_ALLOWED_ORIGINS=https://files.yourdomain.com
+
+# OnlyOffice JWT token lifetime (seconds). Default 3600 (1h). Range: 300–28800.
+ONLYOFFICE_JWT_TTL_SECONDS=3600
 
 # Cassandra
 CASSANDRA_CLUSTER_NAME=sesamefs-prod
@@ -482,8 +490,12 @@ Settings that **cannot** be set via env vars and must be in this file:
 | `S3_BUCKET` | `storage.backends.hot.bucket` | |
 | `S3_REGION` | `storage.backends.hot.region` | |
 | `S3_ENDPOINT` | `storage.backends.hot.endpoint` | Empty = real AWS |
+| `S3_SERVER_SIDE_ENCRYPTION` | `storage.backends.hot.server_side_encryption` | `AES256` or `aws:kms`. Empty falls back to bucket default. Recommended: `AES256`. |
+| `S3_SSE_KMS_KEY_ID` | `storage.backends.hot.sse_kms_key_id` | Optional KMS key ID/ARN. Requires `aws:kms` mode. |
 | `AWS_ACCESS_KEY_ID` | (AWS SDK) | Auto-picked by SDK |
 | `AWS_SECRET_ACCESS_KEY` | (AWS SDK) | Auto-picked by SDK |
+| `CORS_ALLOWED_ORIGINS` | `cors.allowed_origins` | Comma-separated origins. Wildcard `"*"` is rejected in production. |
+| `ONLYOFFICE_JWT_TTL_SECONDS` | `onlyoffice.jwt_ttl_seconds` | OnlyOffice editor JWT lifetime in seconds. Default `3600` (1h). Range: 300–28800. |
 | `FIRST_SUPERADMIN_EMAIL` | `auth.first_superadmin_email` | Optional bootstrap email used only on the first successful seed. |
 | `ACCOUNTS_PASSWORD_CHANGE_URL` | `accounts.password_change_url` | External Accounts password-change URL. |
 | `ACCOUNTS_DELETE_ACCOUNT_URL` | `accounts.delete_account_url` | External Accounts account-deletion URL. |

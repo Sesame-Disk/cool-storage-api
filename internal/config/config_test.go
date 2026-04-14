@@ -318,6 +318,37 @@ func TestConfigValidate(t *testing.T) {
 			wantErr:        true,
 			wantErrContain: "seafhttp.zip_max_bytes",
 		},
+		{
+			name: "storage backend rejects unsupported sse mode",
+			modify: func(c *Config) {
+				hot := c.Storage.Backends["hot"]
+				hot.ServerSideEncryption = "bad-mode"
+				c.Storage.Backends["hot"] = hot
+			},
+			wantErr:        true,
+			wantErrContain: "server_side_encryption",
+		},
+		{
+			name: "storage backend rejects kms key without aws kms mode",
+			modify: func(c *Config) {
+				hot := c.Storage.Backends["hot"]
+				hot.ServerSideEncryption = "AES256"
+				hot.SSEKMSKeyID = "arn:aws:kms:us-east-1:123456789012:key/test"
+				c.Storage.Backends["hot"] = hot
+			},
+			wantErr:        true,
+			wantErrContain: "sse_kms_key_id",
+		},
+		{
+			name: "storage backend accepts aws kms mode with key",
+			modify: func(c *Config) {
+				hot := c.Storage.Backends["hot"]
+				hot.ServerSideEncryption = "aws:kms"
+				hot.SSEKMSKeyID = "arn:aws:kms:us-east-1:123456789012:key/test"
+				c.Storage.Backends["hot"] = hot
+			},
+			wantErr: false,
+		},
 	}
 
 	for _, tt := range tests {
@@ -465,10 +496,12 @@ func TestEnvOverrideS3(t *testing.T) {
 	os.Setenv("S3_BUCKET", "my-bucket")
 	os.Setenv("S3_REGION", "eu-west-1")
 	os.Setenv("S3_ENDPOINT", "http://localhost:9000")
+	os.Setenv("S3_SERVER_SIDE_ENCRYPTION", "AES256")
 	defer func() {
 		os.Unsetenv("S3_BUCKET")
 		os.Unsetenv("S3_REGION")
 		os.Unsetenv("S3_ENDPOINT")
+		os.Unsetenv("S3_SERVER_SIDE_ENCRYPTION")
 	}()
 
 	cfg.applyEnvOverrides()
@@ -482,6 +515,9 @@ func TestEnvOverrideS3(t *testing.T) {
 	}
 	if hot.Endpoint != "http://localhost:9000" {
 		t.Errorf("Storage.Backends[hot].Endpoint = %s, want http://localhost:9000", hot.Endpoint)
+	}
+	if hot.ServerSideEncryption != "AES256" {
+		t.Errorf("Storage.Backends[hot].ServerSideEncryption = %s, want AES256", hot.ServerSideEncryption)
 	}
 }
 

@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -17,23 +18,40 @@ import (
 
 // S3Store implements the Store interface for S3-compatible storage
 type S3Store struct {
-	client        *s3.Client
-	presignClient *s3.PresignClient
-	bucket        string
-	prefix        string // Optional prefix for all keys (e.g., org ID)
-	accessType    AccessType
+	client               *s3.Client
+	presignClient        *s3.PresignClient
+	bucket               string
+	prefix               string // Optional prefix for all keys (e.g., org ID)
+	accessType           AccessType
+	serverSideEncryption types.ServerSideEncryption
+	sseKMSKeyID          string
 }
 
 // S3Config holds configuration for S3 storage
 type S3Config struct {
-	Endpoint        string // Custom endpoint for S3-compatible storage (e.g., MinIO)
-	Bucket          string
-	Region          string
-	AccessKeyID     string
-	SecretAccessKey string
-	Prefix          string     // Optional key prefix
-	AccessType      AccessType // hot or cold
-	UsePathStyle    bool       // Use path-style addressing (required for MinIO)
+	Endpoint             string // Custom endpoint for S3-compatible storage (e.g., MinIO)
+	Bucket               string
+	Region               string
+	AccessKeyID          string
+	SecretAccessKey      string
+	Prefix               string     // Optional key prefix
+	AccessType           AccessType // hot or cold
+	UsePathStyle         bool       // Use path-style addressing (required for MinIO)
+	ServerSideEncryption string
+	SSEKMSKeyID          string
+}
+
+func normalizeServerSideEncryption(value string) (types.ServerSideEncryption, error) {
+	switch strings.TrimSpace(value) {
+	case "":
+		return "", nil
+	case string(types.ServerSideEncryptionAes256):
+		return types.ServerSideEncryptionAes256, nil
+	case string(types.ServerSideEncryptionAwsKms):
+		return types.ServerSideEncryptionAwsKms, nil
+	default:
+		return "", fmt.Errorf("unsupported server-side encryption mode %q", value)
+	}
 }
 
 // NewS3Store creates a new S3 storage backend
@@ -103,12 +121,22 @@ func NewS3Store(ctx context.Context, cfg S3Config) (*S3Store, error) {
 		accessType = AccessImmediate
 	}
 
+	serverSideEncryption, err := normalizeServerSideEncryption(cfg.ServerSideEncryption)
+	if err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(cfg.SSEKMSKeyID) != "" && serverSideEncryption != types.ServerSideEncryptionAwsKms {
+		return nil, fmt.Errorf("sse_kms_key_id requires server-side encryption mode aws:kms")
+	}
+
 	return &S3Store{
-		client:        client,
-		presignClient: presignClient,
-		bucket:        cfg.Bucket,
-		prefix:        cfg.Prefix,
-		accessType:    accessType,
+		client:               client,
+		presignClient:        presignClient,
+		bucket:               cfg.Bucket,
+		prefix:               cfg.Prefix,
+		accessType:           accessType,
+		serverSideEncryption: serverSideEncryption,
+		sseKMSKeyID:          strings.TrimSpace(cfg.SSEKMSKeyID),
 	}, nil
 }
 
@@ -118,6 +146,26 @@ func (s *S3Store) key(blockID string) string {
 		return s.prefix + "/" + blockID
 	}
 	return blockID
+}
+
+func (s *S3Store) applySSEToPutObjectInput(input *s3.PutObjectInput) {
+	if s.serverSideEncryption == "" {
+		return
+	}
+	input.ServerSideEncryption = s.serverSideEncryption
+	if s.serverSideEncryption == types.ServerSideEncryptionAwsKms && s.sseKMSKeyID != "" {
+		input.SSEKMSKeyId = aws.String(s.sseKMSKeyID)
+	}
+}
+
+func (s *S3Store) applySSEToCreateMultipartUploadInput(input *s3.CreateMultipartUploadInput) {
+	if s.serverSideEncryption == "" {
+		return
+	}
+	input.ServerSideEncryption = s.serverSideEncryption
+	if s.serverSideEncryption == types.ServerSideEncryptionAwsKms && s.sseKMSKeyID != "" {
+		input.SSEKMSKeyId = aws.String(s.sseKMSKeyID)
+	}
 }
 
 // Put stores a block in S3
@@ -161,6 +209,7 @@ func (s *S3Store) Put(ctx context.Context, blockID string, data io.Reader, size 
 		Body:          body,
 		ContentLength: aws.Int64(contentLength),
 	}
+	s.applySSEToPutObjectInput(input)
 
 	_, err := s.client.PutObject(ctx, input)
 	if err != nil {
@@ -190,10 +239,12 @@ func (s *S3Store) PutLarge(ctx context.Context, blockID string, data io.Reader, 
 	key := s.key(blockID)
 
 	// Initiate multipart upload
-	createResp, err := s.client.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{
+	createInput := &s3.CreateMultipartUploadInput{
 		Bucket: aws.String(s.bucket),
 		Key:    aws.String(key),
-	})
+	}
+	s.applySSEToCreateMultipartUploadInput(createInput)
+	createResp, err := s.client.CreateMultipartUpload(ctx, createInput)
 	if err != nil {
 		return "", fmt.Errorf("failed to initiate multipart upload: %w", err)
 	}
@@ -373,12 +424,7 @@ func (s *S3Store) Exists(ctx context.Context, storageKey string) (bool, error) {
 	_, err := s.client.HeadObject(ctx, input)
 	if err != nil {
 		// Check if it's a "not found" error
-		var notFound *types.NotFound
 		if ok := isNotFoundError(err); ok {
-			return false, nil
-		}
-		// Also check using the types package
-		if notFound != nil {
 			return false, nil
 		}
 		return false, fmt.Errorf("failed to check object existence: %w", err)

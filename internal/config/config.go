@@ -434,15 +434,17 @@ type StorageConfig struct {
 
 // StorageClassConfig holds configuration for a storage class (e.g., hot-s3-usa)
 type StorageClassConfig struct {
-	Type          string `yaml:"type"`           // s3, glacier, disk
-	Tier          string `yaml:"tier"`           // hot, cold
-	Endpoint      string `yaml:"endpoint"`       // Primary endpoint
-	Bucket        string `yaml:"bucket"`         // S3 bucket name
-	Region        string `yaml:"region"`         // AWS region
-	AccessKey     string `yaml:"access_key"`     // AWS access key (optional, can use env)
-	SecretKey     string `yaml:"secret_key"`     // AWS secret key (optional, can use env)
-	UsePathStyle  bool   `yaml:"use_path_style"` // For MinIO compatibility
-	FailoverClass string `yaml:"failover_class"` // Fallback class if this one is down
+	Type                 string `yaml:"type"`                   // s3, glacier, disk
+	Tier                 string `yaml:"tier"`                   // hot, cold
+	Endpoint             string `yaml:"endpoint"`               // Primary endpoint
+	Bucket               string `yaml:"bucket"`                 // S3 bucket name
+	Region               string `yaml:"region"`                 // AWS region
+	AccessKey            string `yaml:"access_key"`             // AWS access key (optional, can use env)
+	SecretKey            string `yaml:"secret_key"`             // AWS secret key (optional, can use env)
+	ServerSideEncryption string `yaml:"server_side_encryption"` // Optional SSE mode: AES256 or aws:kms
+	SSEKMSKeyID          string `yaml:"sse_kms_key_id"`         // Optional KMS key ID/ARN when using aws:kms
+	UsePathStyle         bool   `yaml:"use_path_style"`         // For MinIO compatibility
+	FailoverClass        string `yaml:"failover_class"`         // Fallback class if this one is down
 }
 
 // RegionClassConfig maps a region to its hot and cold storage classes
@@ -453,13 +455,15 @@ type RegionClassConfig struct {
 
 // BackendConfig holds configuration for a storage backend (legacy, deprecated)
 type BackendConfig struct {
-	Type         string `yaml:"type"`          // s3, glacier, filesystem
-	Endpoint     string `yaml:"endpoint"`      // S3 endpoint
-	Bucket       string `yaml:"bucket"`        // S3 bucket name
-	Region       string `yaml:"region"`        // AWS region
-	StorageClass string `yaml:"storage_class"` // S3 storage class
-	Vault        string `yaml:"vault"`         // Glacier vault name
-	Path         string `yaml:"path"`          // Filesystem path
+	Type                 string `yaml:"type"`                   // s3, glacier, filesystem
+	Endpoint             string `yaml:"endpoint"`               // S3 endpoint
+	Bucket               string `yaml:"bucket"`                 // S3 bucket name
+	Region               string `yaml:"region"`                 // AWS region
+	ServerSideEncryption string `yaml:"server_side_encryption"` // Optional SSE mode: AES256 or aws:kms
+	SSEKMSKeyID          string `yaml:"sse_kms_key_id"`         // Optional KMS key ID/ARN when using aws:kms
+	StorageClass         string `yaml:"storage_class"`          // S3 storage class
+	Vault                string `yaml:"vault"`                  // Glacier vault name
+	Path                 string `yaml:"path"`                   // Filesystem path
 }
 
 // AuthConfig holds authentication settings
@@ -802,6 +806,18 @@ func (c *Config) applyEnvOverrides() {
 			c.Storage.Backends["hot"] = hot
 		}
 	}
+	if v := os.Getenv("S3_SERVER_SIDE_ENCRYPTION"); v != "" {
+		if hot, ok := c.Storage.Backends["hot"]; ok {
+			hot.ServerSideEncryption = v
+			c.Storage.Backends["hot"] = hot
+		}
+	}
+	if v := os.Getenv("S3_SSE_KMS_KEY_ID"); v != "" {
+		if hot, ok := c.Storage.Backends["hot"]; ok {
+			hot.SSEKMSKeyID = v
+			c.Storage.Backends["hot"] = hot
+		}
+	}
 
 	// Billing
 	if v := os.Getenv("BILLING_URL"); v != "" {
@@ -1079,6 +1095,16 @@ func (c *Config) Validate() error {
 			}
 		}
 	}
+	for name, classCfg := range c.Storage.Classes {
+		if err := validateStorageEncryptionConfig("storage.classes."+name, classCfg.Type, classCfg.ServerSideEncryption, classCfg.SSEKMSKeyID); err != nil {
+			return err
+		}
+	}
+	for name, backendCfg := range c.Storage.Backends {
+		if err := validateStorageEncryptionConfig("storage.backends."+name, backendCfg.Type, backendCfg.ServerSideEncryption, backendCfg.SSEKMSKeyID); err != nil {
+			return err
+		}
+	}
 	if c.OnlyOffice.Enabled && strings.TrimSpace(c.OnlyOffice.JWTSecret) == "" {
 		return fmt.Errorf("onlyoffice.jwt_secret must be set when onlyoffice.enabled is true")
 	}
@@ -1121,6 +1147,28 @@ func (c *Config) Validate() error {
 	c.Server.TrustedProxies = normalizedTrustedProxies
 	if c.Auth.OIDC.Enabled && !hasConfiguredStrings(c.Auth.OIDC.RedirectURIs) {
 		return fmt.Errorf("auth.oidc.redirect_uris must contain at least one redirect URI when OIDC is enabled")
+	}
+	return nil
+}
+
+func validateStorageEncryptionConfig(scope, backendType, mode, kmsKeyID string) error {
+	mode = strings.TrimSpace(mode)
+	kmsKeyID = strings.TrimSpace(kmsKeyID)
+	if mode == "" && kmsKeyID == "" {
+		return nil
+	}
+	if strings.TrimSpace(backendType) != "s3" {
+		return fmt.Errorf("%s server-side encryption is only supported for s3 backends", scope)
+	}
+	switch mode {
+	case "AES256", "aws:kms":
+	case "":
+		return fmt.Errorf("%s.sse_kms_key_id requires storage encryption mode aws:kms", scope)
+	default:
+		return fmt.Errorf("%s.server_side_encryption must be one of: AES256, aws:kms", scope)
+	}
+	if kmsKeyID != "" && mode != "aws:kms" {
+		return fmt.Errorf("%s.sse_kms_key_id requires storage encryption mode aws:kms", scope)
 	}
 	return nil
 }

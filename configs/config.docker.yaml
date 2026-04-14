@@ -30,6 +30,8 @@ storage:
       endpoint: "http://minio:9000"
       bucket: sesamefs-usa
       region: us-east-1
+      server_side_encryption: ""     # Optional; keep empty for local MinIO unless SSE is configured there
+      sse_kms_key_id: ""
       use_path_style: true
       failover_class: hot-s3-eu
       # credentials → provide via AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY env vars
@@ -40,6 +42,8 @@ storage:
       endpoint: "http://minio:9000"
       bucket: sesamefs-eu
       region: eu-west-1
+      server_side_encryption: ""
+      sse_kms_key_id: ""
       use_path_style: true
       failover_class: hot-s3-usa
       # credentials → provide via AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY env vars
@@ -50,6 +54,8 @@ storage:
       endpoint: "http://minio:9000"
       bucket: sesamefs-china
       region: cn-north-1
+      server_side_encryption: ""
+      sse_kms_key_id: ""
       use_path_style: true
       # credentials → provide via AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY env vars
 
@@ -59,6 +65,8 @@ storage:
       endpoint: "http://minio:9000"
       bucket: sesamefs-archive
       region: us-east-1
+      server_side_encryption: ""
+      sse_kms_key_id: ""
       use_path_style: true
       # credentials → provide via AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY env vars
 
@@ -69,6 +77,8 @@ storage:
       endpoint: "http://minio:9000"
       bucket: sesamefs-blocks
       region: us-east-1
+      server_side_encryption: ""
+      sse_kms_key_id: ""
       use_path_style: true
       # credentials → provide via AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY env vars
 
@@ -102,6 +112,8 @@ storage:
       endpoint: "http://minio:9000"
       bucket: sesamefs-blocks
       region: us-east-1
+      server_side_encryption: ""
+      sse_kms_key_id: ""
 
 seafhttp:
   token_ttl: 24h  # Upload/download tokens valid for 24 hours (needed for large uploads and Seafile client syncs)
