@@ -10,13 +10,20 @@ import (
 	"github.com/google/uuid"
 )
 
+// OrphanRecoverer retries S3 deletes for blocks whose DB rows are gone but
+// whose S3 objects linger. Implemented by *Worker.
+type OrphanRecoverer interface {
+	RecoverS3Orphans(ctx context.Context, perOrgLimit int) (int, error)
+}
+
 // Scanner periodically finds orphaned items that were missed by inline enqueue
 // and adds them to the gc_queue for processing.
 type Scanner struct {
-	store  GCStore
-	queue  *Queue
-	stats  *Stats
-	config config.GCConfig
+	store           GCStore
+	queue           *Queue
+	stats           *Stats
+	config          config.GCConfig
+	orphanRecoverer OrphanRecoverer
 }
 
 // NewScanner creates a new safety scanner.
@@ -27,6 +34,12 @@ func NewScanner(store GCStore, queue *Queue, stats *Stats, cfg config.GCConfig) 
 		stats:  stats,
 		config: cfg,
 	}
+}
+
+// SetOrphanRecoverer wires the S3 orphan recovery dependency. Optional; if
+// unset, the s3_orphan_recovery phase is a no-op (useful for mock-only tests).
+func (s *Scanner) SetOrphanRecoverer(r OrphanRecoverer) {
+	s.orphanRecoverer = r
 }
 
 // ScanOnce performs a full scan of all phases.
@@ -53,6 +66,7 @@ func (s *Scanner) ScanOnce(ctx context.Context) error {
 		{"storage_counter_reconciliation", s.scanPendingStorageCounterReconciliation},
 		{"expired_deleted_libraries", s.scanExpiredDeletedLibraries},
 		{"expired_deleted_orgs", s.scanExpiredDeletedOrgs},
+		{"s3_orphan_recovery", s.scanS3OrphanRecovery},
 	}
 
 	for _, phase := range phases {
@@ -770,6 +784,24 @@ func (s *Scanner) scanExpiredDeletedOrgs(ctx context.Context) (int, error) {
 	metrics.GCItemsEnqueuedTotal.WithLabelValues("expired_deleted_orgs").Add(float64(enqueued))
 	metrics.GCScannerLastPhaseRun.WithLabelValues("expired_deleted_orgs").SetToCurrentTime()
 	return enqueued, nil
+}
+
+// scanS3OrphanRecovery retries S3 deletes for blocks whose DB rows were
+// removed successfully but whose S3 objects lingered because DeleteBlock
+// failed after the LWT step (see docs/GC-SERVICE-ANALYSIS.md).
+func (s *Scanner) scanS3OrphanRecovery(ctx context.Context) (int, error) {
+	log.Println("[GC Scanner] Phase 13: Recovering S3 orphans...")
+	if s.orphanRecoverer == nil {
+		return 0, nil
+	}
+	recovered, err := s.orphanRecoverer.RecoverS3Orphans(ctx, 500)
+	if err != nil {
+		log.Printf("[GC Scanner] Phase 13: recovery error: %v", err)
+	}
+	log.Printf("[GC Scanner] Phase 13 complete: recovered %d S3 orphans", recovered)
+	metrics.GCItemsEnqueuedTotal.WithLabelValues("s3_orphan_recovery").Add(float64(recovered))
+	metrics.GCScannerLastPhaseRun.WithLabelValues("s3_orphan_recovery").SetToCurrentTime()
+	return recovered, err
 }
 
 // walkFSTree iteratively walks a filesystem tree starting from fsID,

@@ -28,13 +28,21 @@ type GCStore interface {
 	// Block operations (worker)
 	GetBlockRefCount(orgID uuid.UUID, blockID string) (int, error)
 	ResolveBlockIDs(orgID uuid.UUID, blockIDs []string) ([]string, error)
-	DeleteBlock(orgID uuid.UUID, blockID string) (bool, error)
+	ClaimBlockDelete(orgID uuid.UUID, blockID string) (bool, error)
+	FinalizeBlockDelete(orgID uuid.UUID, blockID string) error
 	DecrementBlockRefCount(orgID uuid.UUID, blockID string) error
 	DeleteBlockMapping(orgID uuid.UUID, externalID string) error
 	EnsureBlockGCCandidate(orgID uuid.UUID, blockID, storageClass string, candidateAt time.Time) (time.Time, error)
 	DeleteBlockGCCandidate(orgID uuid.UUID, blockID string) error
 	ListBlockGCCandidateOrgs() ([]uuid.UUID, error)
 	ListBlockGCCandidates(orgID uuid.UUID) ([]BlockGCCandidateInfo, error)
+
+	// S3 orphan recovery / pending delete tracking for blocks claimed by GC.
+	RecordS3Orphan(orgID uuid.UUID, blockID, storageClass, errMsg string, now time.Time) error
+	ListS3OrphanOrgs() ([]uuid.UUID, error)
+	ListS3Orphans(orgID uuid.UUID, limit int) ([]S3OrphanInfo, error)
+	UpdateS3OrphanAttempt(orgID uuid.UUID, blockID, errMsg string, now time.Time) error
+	DeleteS3Orphan(orgID uuid.UUID, blockID string) error
 
 	// Reverse lookup: find block mappings by internal_id (avoids full scan)
 	ListBlockMappingsByInternalID(orgID uuid.UUID, internalID string) ([]BlockMapping, error)
@@ -203,6 +211,20 @@ type BlockGCCandidateInfo struct {
 	BlockID      string
 	StorageClass string
 	CandidateAt  time.Time
+}
+
+// S3OrphanInfo holds data about a block whose S3 deletion still needs recovery.
+// Rows are created as soon as GC claims the block for deletion, before the DB
+// row is physically removed, so a crash between DB and S3 phases remains
+// recoverable after restart.
+type S3OrphanInfo struct {
+	OrgID         uuid.UUID
+	BlockID       string
+	StorageClass  string
+	FirstSeenAt   time.Time
+	LastAttemptAt time.Time
+	RetryCount    int
+	LastError     string
 }
 
 // ShareLinkInfo holds data about a share link needed by the scanner.

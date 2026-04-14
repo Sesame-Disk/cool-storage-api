@@ -23,7 +23,7 @@
 3. ~~Monitoring/Health Checks~~ - ✅ COMPLETE (slog logging, `/health`, `/ready`, `/metrics`)
 4. ~~Frontend/Backend Separation~~ - ✅ COMPLETE (2026-03-30/31) — separate React/nginx container, bootstrap API, nginx production hardening
 5. ~~Programmatic Auth (PATs)~~ - ✅ COMPLETE — user API keys ship via `/api/v2.1/api-keys/`, and `/api2/auth-token/` now exchanges `email + API key` for desktop/CLI tokens. Device Flow remains optional future work.
-6. **GC Multi-Instance Safety** - ⚠️ PARTIAL — temporary `GC_ENABLED` operational guard exists for production, but `gc.go:99` Start() still has no leader election/distributed lease. Safe only if exactly one replica runs GC.
+6. **GC Multi-Instance Safety** - ✅ BASELINE HARDENED — GC now defaults off in YAML, activates explicitly via `GC_ENABLED=true`, and enabled replicas coordinate through a Cassandra LWT lease. Multi-region guidance still remains: enable GC in exactly one DC.
 7. ~~Quota Period Rollover~~ - ✅ COMPLETE — Period rollover job advances expired org quota periods and keeps monthly traffic enforcement moving
 8. **Production Multi-Region Topology** - ⚠️ PARTIAL — region-aware library selection/read/write routing is implemented and covered by focused integration tests, and org-level create-time residency policy now exists in the backend. The stock production config/compose files still ship as single-region examples, and per-region `classes`, `endpoint_regions`, ingress host preservation, rollout, migration, and frontend policy controls remain operator work.
 

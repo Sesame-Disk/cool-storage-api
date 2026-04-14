@@ -65,6 +65,7 @@ type Service struct {
 	worker  *Worker
 	scanner *Scanner
 	stats   *Stats
+	lease   leaderLease
 
 	// dbSession is the raw gocql session used for quota-period rollover.
 	// Kept separate from store because rollover operates on organizations,
@@ -91,14 +92,19 @@ func NewService(store GCStore, storage StorageProvider, cfg config.GCConfig, dbS
 	queue := NewQueue(store)
 	stats := &Stats{}
 
+	worker := NewWorker(store, storage, queue, cfg.BatchSize, cfg.GracePeriod, cfg.DryRun, stats)
+	scanner := NewScanner(store, queue, stats, cfg)
+	scanner.SetOrphanRecoverer(worker)
+
 	return &Service{
 		store:          store,
 		storage:        storage,
 		config:         cfg,
 		queue:          queue,
-		worker:         NewWorker(store, storage, queue, cfg.BatchSize, cfg.GracePeriod, cfg.DryRun, stats),
-		scanner:        NewScanner(store, queue, stats, cfg),
+		worker:         worker,
+		scanner:        scanner,
 		stats:          stats,
+		lease:          newCassandraLeaderLease(dbSession, gcLeaderRole, cfg.WorkerInterval),
 		dbSession:      dbSession,
 		triggerWorker:  make(chan struct{}, 1),
 		triggerScanner: make(chan struct{}, 1),
@@ -277,6 +283,10 @@ func (s *Service) runWorkerLoop(ctx context.Context) {
 }
 
 func (s *Service) runWorkerOnce(ctx context.Context) {
+	if !s.hasLeadership(ctx, "worker") {
+		return
+	}
+
 	queueBefore, _ := s.queue.GetTotalQueueSize()
 
 	start := time.Now()
@@ -329,10 +339,26 @@ func (s *Service) runScannerLoop(ctx context.Context) {
 }
 
 func (s *Service) runScannerOnce(ctx context.Context) {
+	if !s.hasLeadership(ctx, "scanner") {
+		return
+	}
+
 	start := time.Now()
 	s.scanner.ScanOnce(ctx)
 	metrics.GCScannerDuration.Observe(time.Since(start).Seconds())
 	metrics.GCLastScannerRun.Set(float64(time.Now().Unix()))
+}
+
+func (s *Service) hasLeadership(ctx context.Context, component string) bool {
+	if s.lease == nil {
+		return true
+	}
+	ok, err := s.lease.TryAcquireOrRenew(ctx)
+	if err != nil {
+		log.Printf("[GC] Failed to renew leader lease for %s: %v", component, err)
+		return false
+	}
+	return ok
 }
 
 // SetDryRun changes the dry run mode at runtime (for admin API).
@@ -366,6 +392,10 @@ func (s *Service) runRolloverLoop(ctx context.Context) {
 }
 
 func (s *Service) runRolloverOnce() {
+	if !s.hasLeadership(context.Background(), "rollover") {
+		return
+	}
+
 	n, err := traffic.RolloverExpiredPeriods(s.dbSession, time.Now())
 	if err != nil {
 		log.Printf("[GC] Rollover error: %v", err)

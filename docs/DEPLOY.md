@@ -273,7 +273,7 @@ ONLYOFFICE_JWT_SECRET=<from step 0.3 — second openssl output>
 
 > `ACCOUNTS_DISABLE_ORG_USER_WRITES` should normally stay `true`. That keeps tenant org-admin user lifecycle writes disabled so Accounts remains the operational authority. Platform superadmins still bypass that tenant lock as an operational fallback, but Accounts should prefer the `/admin/...` surface.
 
-> `GC_ENABLED` is a temporary production guard. Until GC has leader election, only one backend replica should run GC. In a single-node deployment, leave it as `true`.
+> `gc.enabled` now defaults to `false` in YAML. Activate GC explicitly with `GC_ENABLED=true` only on the replicas that are allowed to participate in GC. When more than one enabled replica is up, SesameFS now uses a short Cassandra LWT lease so only one replica runs worker/scanner/rollover work at a time. For multi-region, still enable GC in exactly one DC to avoid unnecessary cross-DC Paxos churn.
 
 > `SERVER_TRUSTED_PROXIES` should never be set to `0.0.0.0/0`, `::/0`, or another blanket range. In the supported two-nginx topology above, trust only the internal SesameFS nginx network that talks directly to Go. If you leave it unset, SesameFS ignores forwarded-IP headers and uses the direct socket peer instead.
 

@@ -888,33 +888,19 @@ The GC (worker + scanner) has no coordination mechanism between instances. If mu
 
 **Actual impact**: Wasted work (CPU/network overhead) and slightly incorrect admin counters. No risk of data loss.
 
-**Current operational decision (2026-04-04):**
-- Production may proceed with a temporary guard: set `GC_ENABLED=true` on exactly one backend replica and `GC_ENABLED=false` on all others.
-- This avoids concurrent worker/scanner execution without introducing distributed coordination right now.
-- This is an operational workaround only; it does not solve failover or automatic leader transfer.
+**Current operational decision (updated 2026-04-14):**
+- Keep `gc.enabled=false` in YAML and set `GC_ENABLED=true` only on the replicas that are allowed to run GC.
+- SesameFS now uses a Cassandra LWT lease (`gc_leases`) so if more than one enabled replica is up, only one runs worker/scanner/rollover work at a time.
+- In multi-region, still enable GC in exactly one DC. The lease protects overlap; it does not remove the cross-DC Paxos cost of competing leaders.
 
-**Proposed solution — Leader Election via LWT:**
-```sql
-CREATE TABLE IF NOT EXISTS gc_leader (
-    role TEXT PRIMARY KEY,
-    instance_id TEXT,
-    heartbeat TIMESTAMP
-) WITH default_time_to_live = 30;
-```
-```go
-// Only the leader runs worker/scanner. If it dies, the TTL expires and another takes over.
-applied, _ := session.Query(`
-    INSERT INTO gc_leader (role, instance_id, heartbeat)
-    VALUES (?, ?, ?) IF NOT EXISTS
-`, role, instanceID, time.Now()).ScanCAS()
-```
-- Heartbeat renewal every 10s with `UPDATE ... IF instance_id = ?`
-- If heartbeat expires (TTL 30s), another instance can take leadership
-- Separate roles: `worker` and `scanner` (can run on different instances)
+**Leader Election via LWT:**
+- Implemented with `gc_leases` and TTL-backed heartbeats.
+- Enabled replicas try `INSERT ... IF NOT EXISTS` first, then renew ownership with `UPDATE ... IF instance_id = ?`.
+- If the leader dies or loses its lease, another enabled replica can take over automatically after lease expiry.
 
 **Recommended future direction:**
-- Keep the temporary `GC_ENABLED` guard for short-term production unblock.
-- Replace it later with a Cassandra LWT lease so failover is automatic and operators no longer need to pin one GC replica manually.
+- Keep the explicit `GC_ENABLED=true` activation model so GC stays opt-in by replica.
+- Consider exposing lease state/owner in admin status if operators want clearer observability during failover drills.
 
 **Multi-region deployment note (2026-04-10):**
 Running GC in a single DC is **critical** for multi-region deployments with Cassandra replication. Even though LWT operations use `SERIAL` consistency (global Paxos) by default, running GC on multiple DCs would cause:
@@ -922,7 +908,7 @@ Running GC in a single DC is **critical** for multi-region deployments with Cass
 - Scanner in both DCs enqueueing duplicate orphans
 - Unnecessary cross-DC Paxos contention on every LWT
 
-The existing `GC_ENABLED=true` on exactly one DC / `GC_ENABLED=false` on all others is the correct topology for multi-region. The LWT leader election proposal above still applies — it would provide automatic failover within a single DC or across DCs.
+The existing `GC_ENABLED=true` on exactly one DC / `GC_ENABLED=false` on all others remains the correct topology for multi-region. The lease now provides automatic failover among enabled replicas, but you should still avoid enabling GC in multiple DCs at once.
 
 All block-level operations (`IncrementOrCreateBlock`, `decrementBlockRefCount`, `DeleteBlock` Phase 1) use LWT which defaults to `SERIAL` (global Paxos). Do NOT change to `LOCAL_SERIAL` — this would break cross-DC serialization and allow split-brain scenarios where GC in DC-A claims a block that an upload in DC-B is concurrently referencing.
 

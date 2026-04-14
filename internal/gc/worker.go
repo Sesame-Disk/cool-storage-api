@@ -10,6 +10,15 @@ import (
 	"github.com/google/uuid"
 )
 
+// s3DeleteRetryDelays is the backoff schedule used when S3 DeleteBlock fails.
+// Total in-worker wait budget: 100 + 500 + 2000 = 2.6s across 3 retries.
+// Exposed as a var so tests can shorten it.
+var s3DeleteRetryDelays = []time.Duration{
+	100 * time.Millisecond,
+	500 * time.Millisecond,
+	2 * time.Second,
+}
+
 // Worker drains the gc_queue and deletes items from S3 and the database.
 type Worker struct {
 	store       GCStore
@@ -19,6 +28,7 @@ type Worker struct {
 	gracePeriod time.Duration
 	dryRun      bool
 	stats       *Stats
+	clock       func() time.Time
 }
 
 // NewWorker creates a new GC worker.
@@ -31,6 +41,7 @@ func NewWorker(store GCStore, storage StorageProvider, queue *Queue, batchSize i
 		gracePeriod: gracePeriod,
 		dryRun:      dryRun,
 		stats:       stats,
+		clock:       time.Now,
 	}
 }
 
@@ -105,7 +116,7 @@ func (w *Worker) processItem(ctx context.Context, item QueueItem) error {
 	case ItemBlock:
 		return w.processBlock(ctx, item)
 	case ItemCommit:
-		return w.processCommit(ctx, item)
+		return w.processCommit(item)
 	case ItemFSObject:
 		return w.processFSObject(ctx, item)
 	case ItemBlockMapping:
@@ -133,10 +144,11 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 		return nil
 	}
 
-	// 1. Delete block record from DB using LWT (IF ref_count <= 0)
-	applied, err := w.store.DeleteBlock(item.OrgID, item.ItemID)
+	// 1. Claim the block row using LWT (IF ref_count <= 0). We defer the
+	// physical DELETE until after we've persisted S3-recovery state.
+	applied, err := w.store.ClaimBlockDelete(item.OrgID, item.ItemID)
 	if err != nil {
-		return fmt.Errorf("failed to execute LWT delete for block record: %w", err)
+		return fmt.Errorf("failed to claim block record for deletion: %w", err)
 	}
 
 	// 2. If it didn't apply, it means ref_count > 0 or it was already deleted.
@@ -150,10 +162,21 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 		return nil
 	}
 
-	// 3. Since DB delete succeeded (ref_count was 0), now safely delete from S3
+	// 3. Persist the S3-pending record BEFORE removing the DB row. This closes the
+	// crash window where the process dies after deleting the canonical row but
+	// before recording recovery metadata for the later S3 delete.
 	storageClass := item.StorageClass
 	if storageClass == "" {
 		storageClass = "hot"
+	}
+	if err := w.store.RecordS3Orphan(item.OrgID, item.ItemID, storageClass, "", w.clock()); err != nil {
+		return fmt.Errorf("failed to record pending S3 delete for block %s: %w", item.ItemID, err)
+	}
+
+	// 4. Now remove the claimed DB row. If this fails, the row stays at -999 and
+	// the queue item will retry; the pending S3 row already preserves recovery state.
+	if err := w.store.FinalizeBlockDelete(item.OrgID, item.ItemID); err != nil {
+		return fmt.Errorf("failed to finalize claimed block delete for %s: %w", item.ItemID, err)
 	}
 
 	if w.storage != nil {
@@ -161,15 +184,21 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 		if err != nil {
 			return fmt.Errorf("failed to get block store for class %s: %w", storageClass, err)
 		}
-		if err := blockStore.DeleteBlock(ctx, item.ItemID); err != nil {
-			// S3 deletion failed, but DB record is gone.
-			// This leaves an orphan in S3, which is safer than deleting live data.
-			log.Printf("[GC Worker] WARNING: Failed to delete block %s from S3 after DB deletion: %v", item.ItemID, err)
-			return fmt.Errorf("failed to delete block from S3: %w", err)
+		if delErr := w.deleteS3WithRetry(ctx, blockStore, item.ItemID); delErr != nil {
+			log.Printf("[GC Worker] WARNING: Failed to delete block %s from S3 after DB deletion: %v (recording for scanner recovery)", item.ItemID, delErr)
+			if recErr := w.store.UpdateS3OrphanAttempt(item.OrgID, item.ItemID, delErr.Error(), w.clock()); recErr != nil {
+				log.Printf("[GC Worker] ERROR: Failed to update S3 orphan %s: %v", item.ItemID, recErr)
+				metrics.GCErrorsTotal.WithLabelValues("s3_orphan_record").Inc()
+			}
+			metrics.GCAuditEventsTotal.WithLabelValues("gc_block_s3_orphaned").Inc()
+			// Do NOT return error — the block is recorded for recovery.
+			// Continue to mapping/candidate cleanup so the queue item completes.
+		} else if err := w.store.DeleteS3Orphan(item.OrgID, item.ItemID); err != nil {
+			log.Printf("[GC Worker] WARNING: S3 delete for block %s succeeded but failed to clear recovery row: %v", item.ItemID, err)
 		}
 	}
 
-	// 4. Clean up related mappings
+	// 5. Clean up related mappings
 	mappings, err := w.store.ListBlockMappingsByInternalID(item.OrgID, item.ItemID)
 	if err == nil {
 		for _, mapping := range mappings {
@@ -187,7 +216,100 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 	return nil
 }
 
-func (w *Worker) processCommit(ctx context.Context, item QueueItem) error {
+// deleteS3WithRetry attempts to delete a block from S3 with exponential backoff.
+// It is cancellable via the context. Returns nil on success; the last error
+// otherwise. Retries are NOT applied to context cancellation.
+func (w *Worker) deleteS3WithRetry(ctx context.Context, blockStore BlockStoreDeleter, blockID string) error {
+	var lastErr error
+	attempts := len(s3DeleteRetryDelays) + 1 // 1 initial try + N retries
+	for i := 0; i < attempts; i++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := blockStore.DeleteBlock(ctx, blockID); err == nil {
+			return nil
+		} else {
+			lastErr = err
+		}
+		if i >= len(s3DeleteRetryDelays) {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(s3DeleteRetryDelays[i]):
+		}
+	}
+	return lastErr
+}
+
+// RecoverS3Orphans retries S3 deletes for orphan rows in gc_s3_orphans.
+// Called by the scanner; exposed on the worker because it needs access to
+// w.storage. Returns the number of orphans successfully recovered.
+func (w *Worker) RecoverS3Orphans(ctx context.Context, perOrgLimit int) (int, error) {
+	if w.storage == nil {
+		return 0, nil
+	}
+	if w.dryRun {
+		log.Println("[GC Worker] DRY RUN: skipping S3 orphan recovery")
+		return 0, nil
+	}
+	orgs, err := w.store.ListS3OrphanOrgs()
+	if err != nil {
+		return 0, fmt.Errorf("failed to list S3 orphan orgs: %w", err)
+	}
+	recovered := 0
+	for _, orgID := range orgs {
+		select {
+		case <-ctx.Done():
+			return recovered, ctx.Err()
+		default:
+		}
+		orphans, err := w.store.ListS3Orphans(orgID, perOrgLimit)
+		if err != nil {
+			log.Printf("[GC Worker] Failed to list S3 orphans for org %s: %v", orgID, err)
+			continue
+		}
+		for _, orph := range orphans {
+			select {
+			case <-ctx.Done():
+				return recovered, ctx.Err()
+			default:
+			}
+			if _, err := w.store.GetBlockRefCount(orph.OrgID, orph.BlockID); err == nil {
+				// The canonical block row still exists (likely claimed but not yet finalized).
+				// Skip recovery for now; a later worker retry or startup scan will finish it.
+				continue
+			}
+
+			storageClass := orph.StorageClass
+			if storageClass == "" {
+				storageClass = "hot"
+			}
+			blockStore, err := w.storage.GetBlockStore(storageClass)
+			if err != nil {
+				log.Printf("[GC Worker] S3 orphan recovery: get block store for class %s failed: %v", storageClass, err)
+				continue
+			}
+			if err := blockStore.DeleteBlock(ctx, orph.BlockID); err != nil {
+				if updErr := w.store.UpdateS3OrphanAttempt(orph.OrgID, orph.BlockID, err.Error(), w.clock()); updErr != nil {
+					log.Printf("[GC Worker] S3 orphan recovery: update attempt for %s failed: %v", orph.BlockID, updErr)
+				}
+				continue
+			}
+			if err := w.store.DeleteS3Orphan(orph.OrgID, orph.BlockID); err != nil {
+				log.Printf("[GC Worker] S3 orphan recovery: failed to clear orphan row %s: %v", orph.BlockID, err)
+				continue
+			}
+			recovered++
+			metrics.GCAuditEventsTotal.WithLabelValues("gc_s3_orphan_recovered").Inc()
+			log.Printf("[GC Worker] Recovered S3 orphan %s (org=%s, retries=%d)", orph.BlockID, orph.OrgID, orph.RetryCount)
+		}
+	}
+	return recovered, nil
+}
+
+func (w *Worker) processCommit(item QueueItem) error {
 	// Get the commit to find its root_fs_id for cascading deletion
 	commit, err := w.store.GetCommit(item.LibraryID, item.ItemID)
 	if err != nil {

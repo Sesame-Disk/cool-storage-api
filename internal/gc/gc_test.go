@@ -1,11 +1,27 @@
 package gc
 
 import (
+	"context"
 	"testing"
 	"time"
 
 	"github.com/Sesame-Disk/sesamefs/internal/config"
+	"github.com/google/uuid"
 )
+
+type fakeLeaderLease struct {
+	allowed bool
+	err     error
+	calls   int
+}
+
+func (f *fakeLeaderLease) TryAcquireOrRenew(ctx context.Context) (bool, error) {
+	f.calls++
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	return f.allowed, f.err
+}
 
 func TestStats_BlocksDeleted(t *testing.T) {
 	s := &Stats{}
@@ -243,6 +259,74 @@ func TestService_StartStop(t *testing.T) {
 
 	// Double-stop should be safe
 	svc.Stop()
+}
+
+func TestService_RunWorkerOnce_SkipsWithoutLeadership(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	worker := NewWorker(store, nil, q, 100, 0, false, stats)
+	lease := &fakeLeaderLease{allowed: false}
+
+	orgID := uuid.New()
+	store.AddBlock(orgID, "lease-block", "hot", 0)
+	store.EnqueueItem(orgID, time.Now().Add(-2*time.Hour), ItemBlock, "lease-block", uuid.Nil, "hot", 0)
+
+	svc := &Service{
+		store:   store,
+		config:  config.GCConfig{Enabled: true},
+		queue:   q,
+		worker:  worker,
+		scanner: NewScanner(store, q, stats, config.GCConfig{}),
+		stats:   stats,
+		lease:   lease,
+	}
+
+	svc.runWorkerOnce(context.Background())
+
+	if lease.calls != 1 {
+		t.Fatalf("lease should be consulted once, got %d calls", lease.calls)
+	}
+	if store.GetBlock(orgID, "lease-block") == nil {
+		t.Fatal("worker should not process blocks without leadership")
+	}
+	if stats.BlocksDeleted() != 0 {
+		t.Fatalf("expected 0 deleted blocks without leadership, got %d", stats.BlocksDeleted())
+	}
+}
+
+func TestService_RunWorkerOnce_ProcessesWithLeadership(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	worker := NewWorker(store, nil, q, 100, 0, false, stats)
+	lease := &fakeLeaderLease{allowed: true}
+
+	orgID := uuid.New()
+	store.AddBlock(orgID, "lease-block", "hot", 0)
+	store.EnqueueItem(orgID, time.Now().Add(-2*time.Hour), ItemBlock, "lease-block", uuid.Nil, "hot", 0)
+
+	svc := &Service{
+		store:   store,
+		config:  config.GCConfig{Enabled: true},
+		queue:   q,
+		worker:  worker,
+		scanner: NewScanner(store, q, stats, config.GCConfig{}),
+		stats:   stats,
+		lease:   lease,
+	}
+
+	svc.runWorkerOnce(context.Background())
+
+	if lease.calls != 1 {
+		t.Fatalf("lease should be consulted once, got %d calls", lease.calls)
+	}
+	if stats.BlocksDeleted() != 1 {
+		t.Fatalf("expected 1 deleted block with leadership, got %d", stats.BlocksDeleted())
+	}
+	if store.GetBlock(orgID, "lease-block") != nil {
+		t.Fatal("worker should process blocks when leadership is held")
+	}
 }
 
 func TestService_StartStop_Concurrent(t *testing.T) {

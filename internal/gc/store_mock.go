@@ -105,6 +105,9 @@ type MockStore struct {
 
 	// audit_log entries
 	auditLog []AuditLogEntry
+
+	// S3 orphans keyed by "orgID:blockID"
+	s3Orphans map[string]*S3OrphanInfo
 }
 
 type mockBlock struct {
@@ -241,6 +244,7 @@ func NewMockStore() *MockStore {
 		monitoredRepos:                make(map[uuid.UUID]bool),
 		gcStats:                       make(map[string]string),
 		organizations:                 nil,
+		s3Orphans:                     make(map[string]*S3OrphanInfo),
 	}
 }
 
@@ -747,13 +751,13 @@ func (m *MockStore) RequeueItem(orgID uuid.UUID, oldQueuedAt, newQueuedAt time.T
 		if item.QueuedAt.Equal(oldQueuedAt) && item.ItemType == itemType && item.ItemID == itemID {
 			// Remove the old item
 			m.queue[orgID] = append(items[:i], items[i+1:]...)
-			
+
 			// Append the new recreated item
 			newItem := item
 			newItem.QueuedAt = newQueuedAt
 			newItem.RetryCount = newRetryCount
 			m.queue[orgID] = append(m.queue[orgID], newItem)
-			
+
 			return nil
 		}
 	}
@@ -930,7 +934,7 @@ func (m *MockStore) ListBlockGCCandidates(orgID uuid.UUID) ([]BlockGCCandidateIn
 	return candidates, nil
 }
 
-func (m *MockStore) DeleteBlock(orgID uuid.UUID, blockID string) (bool, error) {
+func (m *MockStore) ClaimBlockDelete(orgID uuid.UUID, blockID string) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -942,9 +946,17 @@ func (m *MockStore) DeleteBlock(orgID uuid.UUID, blockID string) (bool, error) {
 	if b.RefCount > 0 {
 		return false, nil
 	}
-
-	delete(m.blocks, key)
+	b.RefCount = -999
 	return true, nil
+}
+
+func (m *MockStore) FinalizeBlockDelete(orgID uuid.UUID, blockID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	key := fmt.Sprintf("%s:%s", orgID, blockID)
+	delete(m.blocks, key)
+	return nil
 }
 
 func (m *MockStore) DecrementBlockRefCount(orgID uuid.UUID, blockID string) error {
@@ -1887,6 +1899,15 @@ func (m *MockStore) LoadGCStats(key string) (string, error) {
 type MockStorageProvider struct {
 	mu          sync.Mutex
 	DeletedKeys []string
+
+	// failTimes is the number of upcoming DeleteBlock calls that should
+	// return an error before the next call succeeds. Decremented per call.
+	// Zero means "always succeed".
+	failTimes int
+	// failAlways overrides failTimes and makes every DeleteBlock fail.
+	failAlways bool
+	// failErr is the error returned while failing.
+	failErr error
 }
 
 func (p *MockStorageProvider) GetBlockStore(storageClass string) (BlockStoreDeleter, error) {
@@ -1900,6 +1921,33 @@ func (p *MockStorageProvider) DeletedBlocks() []string {
 	return append([]string{}, p.DeletedKeys...)
 }
 
+// FailNextN causes the next n DeleteBlock calls to return err. After that,
+// calls succeed as normal. Used to simulate transient S3 failures.
+func (p *MockStorageProvider) FailNextN(n int, err error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.failTimes = n
+	p.failAlways = false
+	p.failErr = err
+}
+
+// FailAlways causes every DeleteBlock call to return err until cleared.
+func (p *MockStorageProvider) FailAlways(err error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.failAlways = true
+	p.failErr = err
+}
+
+// ClearFailures stops injecting failures.
+func (p *MockStorageProvider) ClearFailures() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.failTimes = 0
+	p.failAlways = false
+	p.failErr = nil
+}
+
 type mockBlockDeleter struct {
 	provider *MockStorageProvider
 }
@@ -1907,6 +1955,102 @@ type mockBlockDeleter struct {
 func (d *mockBlockDeleter) DeleteBlock(ctx context.Context, blockID string) error {
 	d.provider.mu.Lock()
 	defer d.provider.mu.Unlock()
+	if d.provider.failAlways {
+		return d.provider.failErr
+	}
+	if d.provider.failTimes > 0 {
+		d.provider.failTimes--
+		return d.provider.failErr
+	}
 	d.provider.DeletedKeys = append(d.provider.DeletedKeys, blockID)
 	return nil
+}
+
+// --- S3 orphan recovery (mock) ---
+
+func (m *MockStore) RecordS3Orphan(orgID uuid.UUID, blockID, storageClass, errMsg string, now time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	key := fmt.Sprintf("%s:%s", orgID, blockID)
+	initialRetryCount := 0
+	if errMsg != "" {
+		initialRetryCount = 1
+	}
+	if existing, ok := m.s3Orphans[key]; ok {
+		if errMsg != "" {
+			existing.LastAttemptAt = now
+			existing.RetryCount++
+			existing.LastError = errMsg
+		}
+		return nil
+	}
+	m.s3Orphans[key] = &S3OrphanInfo{
+		OrgID:         orgID,
+		BlockID:       blockID,
+		StorageClass:  storageClass,
+		FirstSeenAt:   now,
+		LastAttemptAt: now,
+		RetryCount:    initialRetryCount,
+		LastError:     errMsg,
+	}
+	return nil
+}
+
+func (m *MockStore) UpdateS3OrphanAttempt(orgID uuid.UUID, blockID, errMsg string, now time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	key := fmt.Sprintf("%s:%s", orgID, blockID)
+	if existing, ok := m.s3Orphans[key]; ok {
+		existing.LastAttemptAt = now
+		existing.RetryCount++
+		existing.LastError = errMsg
+	}
+	return nil
+}
+
+func (m *MockStore) DeleteS3Orphan(orgID uuid.UUID, blockID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.s3Orphans, fmt.Sprintf("%s:%s", orgID, blockID))
+	return nil
+}
+
+func (m *MockStore) ListS3OrphanOrgs() ([]uuid.UUID, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	seen := make(map[uuid.UUID]bool)
+	for _, o := range m.s3Orphans {
+		seen[o.OrgID] = true
+	}
+	orgs := make([]uuid.UUID, 0, len(seen))
+	for o := range seen {
+		orgs = append(orgs, o)
+	}
+	return orgs, nil
+}
+
+func (m *MockStore) ListS3Orphans(orgID uuid.UUID, limit int) ([]S3OrphanInfo, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if limit <= 0 {
+		limit = 100
+	}
+	var out []S3OrphanInfo
+	for _, o := range m.s3Orphans {
+		if o.OrgID != orgID {
+			continue
+		}
+		out = append(out, *o)
+		if len(out) >= limit {
+			break
+		}
+	}
+	return out, nil
+}
+
+// S3OrphanCount is a test helper returning the total orphan count across orgs.
+func (m *MockStore) S3OrphanCount() int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return len(m.s3Orphans)
 }

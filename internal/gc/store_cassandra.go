@@ -193,19 +193,19 @@ func (s *CassandraStore) CompleteItem(orgID uuid.UUID, queuedAt time.Time, itemT
 // It deletes the old queue record and inserts a new one with a new queued_at timestamp and incremented retry count.
 func (s *CassandraStore) RequeueItem(orgID uuid.UUID, oldQueuedAt, newQueuedAt time.Time, itemType ItemType, itemID string, libraryID uuid.UUID, storageClass string, newRetryCount int) error {
 	batch := s.db.Session().Batch(gocql.LoggedBatch)
-	
+
 	// Delete old item
 	batch.Query(`
 		DELETE FROM gc_queue
 		WHERE org_id = ? AND queued_at = ? AND item_type = ? AND item_id = ?
 	`, orgID.String(), oldQueuedAt, string(itemType), itemID)
-	
+
 	// Insert new item at the end of the queue
 	batch.Query(`
 		INSERT INTO gc_queue (org_id, queued_at, item_type, item_id, library_id, storage_class, retry_count)
 		VALUES (?, ?, ?, ?, ?, ?, ?)
 	`, orgID.String(), newQueuedAt, string(itemType), itemID, libraryID.String(), storageClass, newRetryCount)
-	
+
 	return batch.Exec()
 }
 
@@ -380,6 +380,102 @@ func (s *CassandraStore) ListBlockGCCandidates(orgID uuid.UUID) ([]BlockGCCandid
 	return candidates, nil
 }
 
+// --- S3 orphan recovery ---
+
+// RecordS3Orphan upserts a gc_s3_orphans row preserving first_seen_at when the
+// row already exists. Called both for the initial "S3 pending" record and for
+// actual S3 delete failures.
+func (s *CassandraStore) RecordS3Orphan(orgID uuid.UUID, blockID, storageClass, errMsg string, now time.Time) error {
+	initialRetryCount := 0
+	if errMsg != "" {
+		initialRetryCount = 1
+	}
+	// INSERT IF NOT EXISTS preserves the original first_seen_at on conflict;
+	// if the row exists we fall through to UpdateS3OrphanAttempt-style update.
+	applied, err := s.db.Session().Query(`
+		INSERT INTO gc_s3_orphans (org_id, block_id, storage_class, first_seen_at, last_attempt_at, retry_count, last_error)
+		VALUES (?, ?, ?, ?, ?, ?, ?) IF NOT EXISTS
+	`, orgID.String(), blockID, storageClass, now, now, initialRetryCount, errMsg).ScanCAS(nil, nil, nil, nil, nil, nil, nil)
+	if err != nil {
+		return fmt.Errorf("failed to record S3 orphan: %w", err)
+	}
+	if applied {
+		return nil
+	}
+	if errMsg == "" {
+		return nil
+	}
+	// Already exists — bump retry_count and last_attempt_at.
+	return s.UpdateS3OrphanAttempt(orgID, blockID, errMsg, now)
+}
+
+func (s *CassandraStore) UpdateS3OrphanAttempt(orgID uuid.UUID, blockID, errMsg string, now time.Time) error {
+	// Cassandra UPDATE with counter-like increment requires a read-modify-write;
+	// do it with a simple UPDATE + read of the prior retry_count. Conflict is
+	// acceptable: worst case retry_count is off-by-one, which has no correctness
+	// impact — the field is a diagnostic.
+	var prev int
+	err := s.db.Session().Query(`
+		SELECT retry_count FROM gc_s3_orphans WHERE org_id = ? AND block_id = ?
+	`, orgID.String(), blockID).Scan(&prev)
+	if err != nil && !errors.Is(err, gocql.ErrNotFound) {
+		return fmt.Errorf("failed to read prior retry count: %w", err)
+	}
+	return s.db.Session().Query(`
+		UPDATE gc_s3_orphans
+		SET last_attempt_at = ?, retry_count = ?, last_error = ?
+		WHERE org_id = ? AND block_id = ?
+	`, now, prev+1, errMsg, orgID.String(), blockID).Exec()
+}
+
+func (s *CassandraStore) DeleteS3Orphan(orgID uuid.UUID, blockID string) error {
+	return s.db.Session().Query(`
+		DELETE FROM gc_s3_orphans WHERE org_id = ? AND block_id = ?
+	`, orgID.String(), blockID).Exec()
+}
+
+func (s *CassandraStore) ListS3OrphanOrgs() ([]uuid.UUID, error) {
+	iter := s.db.Session().Query(`SELECT DISTINCT org_id FROM gc_s3_orphans`).Iter()
+	var orgs []uuid.UUID
+	var orgIDStr string
+	for iter.Scan(&orgIDStr) {
+		orgs = append(orgs, parseUUID(orgIDStr))
+	}
+	if err := iter.Close(); err != nil {
+		return nil, fmt.Errorf("failed to list S3 orphan orgs: %w", err)
+	}
+	return orgs, nil
+}
+
+func (s *CassandraStore) ListS3Orphans(orgID uuid.UUID, limit int) ([]S3OrphanInfo, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	iter := s.db.Session().Query(`
+		SELECT block_id, storage_class, first_seen_at, last_attempt_at, retry_count, last_error
+		FROM gc_s3_orphans WHERE org_id = ? LIMIT ?
+	`, orgID.String(), limit).Iter()
+	var out []S3OrphanInfo
+	var blockID, storageClass, lastErr string
+	var firstSeen, lastAttempt time.Time
+	var retryCount int
+	for iter.Scan(&blockID, &storageClass, &firstSeen, &lastAttempt, &retryCount, &lastErr) {
+		out = append(out, S3OrphanInfo{
+			OrgID:         orgID,
+			BlockID:       blockID,
+			StorageClass:  storageClass,
+			FirstSeenAt:   firstSeen,
+			LastAttemptAt: lastAttempt,
+			RetryCount:    retryCount,
+			LastError:     lastErr,
+		})
+	}
+	if err := iter.Close(); err != nil {
+		return nil, fmt.Errorf("failed to list S3 orphans for org %s: %w", orgID, err)
+	}
+	return out, nil
+}
+
 // --- Block operations ---
 
 func (s *CassandraStore) GetBlockRefCount(orgID uuid.UUID, blockID string) (int, error) {
@@ -440,12 +536,10 @@ func (s *CassandraStore) ResolveBlockIDs(orgID uuid.UUID, blockIDs []string) ([]
 	return resolved, nil
 }
 
-// DeleteBlockIfUnreferenced atomically checks ref_count <= 0 and, if so, deletes the block.
-// Uses a two-phase approach because CQL does not support DELETE ... IF <non-key condition>.
-// Phase 1: UPDATE ... SET ref_count = -999 ... IF ref_count <= 0 (LWT marks for deletion)
-// Phase 2: DELETE the row (unconditional, since we own it after the LWT)
-// If ref_count > 0, the LWT fails and we skip deletion entirely.
-func (s *CassandraStore) DeleteBlock(orgID uuid.UUID, blockID string) (bool, error) {
+// ClaimBlockDelete atomically checks ref_count <= 0 and, if so, marks the row
+// with the GC sentinel (-999). The physical DELETE is deferred so the worker can
+// persist S3-recovery state before removing the canonical DB row.
+func (s *CassandraStore) ClaimBlockDelete(orgID uuid.UUID, blockID string) (bool, error) {
 	// Phase 1: Atomically claim the block for deletion via LWT.
 	// Setting ref_count to a sentinel value (-999) ensures that even if another
 	// process reads the row between phase 1 and 2, it won't treat it as valid.
@@ -461,17 +555,20 @@ func (s *CassandraStore) DeleteBlock(orgID uuid.UUID, blockID string) (bool, err
 	if !applied {
 		return false, nil
 	}
+	return true, nil
+}
 
-	// Phase 2: The LWT succeeded — we own this row. Delete it unconditionally.
+// FinalizeBlockDelete removes a block row that was previously claimed by GC.
+func (s *CassandraStore) FinalizeBlockDelete(orgID uuid.UUID, blockID string) error {
 	if err := s.db.Session().Query(`
 		DELETE FROM blocks WHERE org_id = ? AND block_id = ?
 	`, orgID.String(), blockID).Exec(); err != nil {
 		// If the DELETE fails, the row is left with ref_count = -999.
 		// The scanner will find it (ref_count <= 0) and re-enqueue for cleanup.
 		log.Printf("[GC Store] Warning: LWT succeeded but DELETE failed for block %s: %v", blockID, err)
-		return true, err
+		return err
 	}
-	return true, nil
+	return nil
 }
 
 func (s *CassandraStore) DecrementBlockRefCount(orgID uuid.UUID, blockID string) error {

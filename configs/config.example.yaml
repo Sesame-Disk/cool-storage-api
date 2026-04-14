@@ -232,7 +232,7 @@ seafhttp:
   zip_max_bytes: 10737418240         # 10 GiB max total uncompressed bytes in a ZIP download
 
 gc:
-  enabled: true
+  enabled: false                   # Safe default; enable explicitly with GC_ENABLED=true on the designated GC replica
   worker_interval: 30s
   scan_interval: 24h
   batch_size: 100

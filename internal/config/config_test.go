@@ -709,6 +709,13 @@ func TestEnvOverrideGCEnabled(t *testing.T) {
 	}
 }
 
+func TestDefaultConfig_GCDisabledByDefault(t *testing.T) {
+	cfg := DefaultConfig()
+	if cfg.GC.Enabled {
+		t.Error("DefaultConfig().GC.Enabled should be false; GC must be enabled explicitly")
+	}
+}
+
 // TestEnvOverridePriority tests that SERVER_PORT takes priority over PORT
 func TestEnvOverridePriority(t *testing.T) {
 	cfg := DefaultConfig()

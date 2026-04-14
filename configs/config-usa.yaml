@@ -169,7 +169,7 @@ versioning:
   gc_interval: 24h
 
 gc:
-  enabled: true
+  enabled: false
   worker_interval: 30s
   scan_interval: 24h
   batch_size: 100

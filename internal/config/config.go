@@ -580,7 +580,7 @@ type VersioningConfig struct {
 
 // GCConfig holds garbage collection settings
 type GCConfig struct {
-	Enabled        bool          `yaml:"enabled"`         // default: true
+	Enabled        bool          `yaml:"enabled"`         // default: false; enable explicitly via GC_ENABLED=true
 	WorkerInterval time.Duration `yaml:"worker_interval"` // default: 30s (queue poll)
 	ScanInterval   time.Duration `yaml:"scan_interval"`   // default: 24h (full scan)
 	BatchSize      int           `yaml:"batch_size"`      // default: 100 (items per tick)
@@ -702,7 +702,7 @@ func DefaultConfig() *Config {
 			GCInterval:     24 * time.Hour,
 		},
 		GC: GCConfig{
-			Enabled:            true,
+			Enabled:            false,
 			WorkerInterval:     30 * time.Second,
 			ScanInterval:       24 * time.Hour,
 			BatchSize:          100,
