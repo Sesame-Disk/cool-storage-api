@@ -202,194 +202,287 @@ the remaining items. Log the skipped items for manual review.
 
 ---
 
+## Cleanup Scenarios Reference
+
+This section answers: **"When X happens, what gets cleaned up, when, and how do I test it?"**
+
+### How deduplication works
+
+Blocks are identified by SHA-256 hash and scoped to an **org** (partition key = `org_id`).
+When two users in the same org upload identical files, only one copy of each block is
+stored in S3. The `blocks` table tracks a `ref_count` — how many fs_objects reference
+that block within the org.
+
+```
+User A uploads report.pdf (3 blocks: B1, B2, B3)  →  ref_count: B1=1, B2=1, B3=1
+User B uploads report.pdf (same content)           →  ref_count: B1=2, B2=2, B3=2
+                                                       (no new S3 upload — dedup)
+User A copies report.pdf to another folder         →  ref_count: B1=3, B2=3, B3=3
+```
+
+Ref counts are modified with **Cassandra LWT (lightweight transactions)** to prevent
+race conditions:
+
+- **Increment** (`IncrementBlockRefCounts`): on upload and copy. Uses `UPDATE ... IF ref_count = ? SET ref_count = ?` with CAS retry.
+- **Decrement** (`DecrementBlockRefCountsOnce`): on file delete. Same CAS pattern. Returns `true` if the decrement caused ref_count to hit 0.
+- **Idempotency**: Each decrement operation has a unique `operationKey` (commit ID). Processed operations are recorded in `gc_processed_items` (48h TTL) to prevent double-decrement on retry.
+
+Blocks are **never shared across orgs** — the `blocks` primary key is `(org_id, block_id)`.
+
+### Scenario 1: User deletes a file
+
+| Step | What happens | When | Tested by |
+|------|-------------|------|-----------|
+| User clicks "delete" | API creates new commit without the file | Immediate | — |
+| Ref count decrement | Background goroutine decrements block ref_counts via LWT | Immediate (async) | `TestGC_BlockLifecycle` |
+| Blocks still referenced | If ref_count > 0 (other files use same blocks): nothing more happens | — | `TestGC_DeduplicationSafety` |
+| Blocks reach ref_count=0 | `EnsureBlockGCCandidate` inserts into `gc_block_candidates` | Immediate | `TestGC_BlockLifecycle` |
+| Enqueue for GC | Block inserted into `gc_queue` with current timestamp | Immediate | `TestGC_BlockLifecycle` |
+| Grace period | Worker won't process until `queued_at + grace_period` (default 1h) | 1 hour | `TestGC_GracePeriodEnforcement` |
+| LWT deletion | Worker: `UPDATE blocks SET ref_count=-999 IF ref_count <= 0` | After grace period | `TestGC_ConcurrentUploadDuringGC` |
+| S3 deletion | Worker: `DeleteBlock` from S3 | After LWT succeeds | `TestGC_BlockLifecycle` |
+| Cleanup | Delete block mappings + GC candidate record | After S3 delete | `TestGC_BlockLifecycle` |
+
+**Dedup safety:** If User B still has the same file, the blocks have ref_count >= 1.
+The LWT at deletion time (`IF ref_count <= 0`) will NOT apply, and the block is
+skipped. User B's file remains intact.
+
+**What if User A deletes, then User B re-uploads the same file before GC runs?**
+The re-upload increments ref_count back to 1. The LWT check at GC time sees
+ref_count=1 and skips. No data loss. Tested by `TestGC_ConcurrentUploadDuringGC`.
+
+### Scenario 2: Two users delete the same deduplicated file
+
+```
+Before: User A and User B both have report.pdf → block ref_count=2
+```
+
+| Step | What happens | ref_count | Tested by |
+|------|-------------|-----------|-----------|
+| User A deletes report.pdf | Decrement via LWT | 1 | `TestBatchDeleteItems_DeduplicatedFilesDecrementSharedBlockTwice` |
+| GC enqueue? | No — ref_count is 1, not 0 | 1 | `TestGC_DeduplicationSafety` |
+| User B deletes report.pdf | Decrement via LWT | 0 | Same test |
+| GC enqueue | Yes — ref_count hit 0, block candidate created | 0 | Same test |
+| After grace period | Worker LWT confirms ref_count=0, deletes from S3 | -999 → deleted | `TestGC_BlockLifecycle` |
+
+**Both deletions happen in the same API call (batch delete)?**
+The batch-delete handler collects all block IDs (including duplicates if the same block
+appears in multiple files) and passes them to `DecrementBlockRefCountsOnce`. Each
+block ID is decremented once per occurrence. A block appearing twice in the list
+gets decremented twice (ref_count 2 → 0). Tested by
+`TestBatchDeleteItems_DeduplicatedFilesDecrementSharedBlockTwice`.
+
+### Scenario 3: File deleted, then same content uploaded by different user
+
+```
+Before: Only User A has report.pdf → ref_count=1
+```
+
+| Step | What happens | ref_count | Safe? |
+|------|-------------|-----------|-------|
+| User A deletes report.pdf | Decrement | 0 | — |
+| Block enqueued for GC | `gc_block_candidates` + `gc_queue` | 0 | — |
+| User B uploads same file (within grace period) | `IncrementBlockRefCounts` | 1 | — |
+| GC worker runs after grace period | LWT: `IF ref_count <= 0` — NOT applied | 1 | Yes |
+| Block stays in S3 | Worker logs "LWT not applied, skipping" | 1 | Yes |
+| GC candidate cleaned up | Worker deletes stale candidate | — | Yes |
+
+**This is the most critical race condition.** The LWT guard is the only thing
+preventing data loss here. It was verified against real Cassandra in
+`TestGC_ConcurrentUploadDuringGC`.
+
+### Scenario 4: Library soft-deleted (moved to trash)
+
+| Step | What happens | When | Tested by |
+|------|-------------|------|-----------|
+| User/admin deletes library | Library moved to `deleted_libraries` table | Immediate | `TestGC_LibraryCascade` |
+| Trash retention period | Default 30 days (configurable `trash_retention_days`) | 30 days | `TestGC_LibraryCascade` (uses server's configured period) |
+| Scanner finds expired library | `scanExpiredDeletedLibraries` enqueues `ItemLibraryCascade` | Next scanner sweep (24h or manual) | `TestGC_LibraryCascade` |
+| Worker cascade | Acquires hard-delete lock → enqueues all commits + fs_objects → deletes shares, tags, tokens → hard-deletes library | After scanner enqueues | `TestGC_LibraryCascade` |
+| Commit processing | Each commit enqueues its root fs_object | Cascaded | Not separately tested |
+| FS object processing | Files: decrement block refs. Dirs: enqueue children | Cascaded | Not separately tested |
+| Block processing | LWT → S3 delete (only for blocks with ref_count=0) | After grace period | `TestGC_BlockLifecycle` |
+
+**What if the library is restored from trash before GC runs?**
+The worker does a stale-check: reads `deleted_at` timestamp and compares with the
+queue item's timestamp. If the library was restored (deleted_at is now null), the
+cascade is skipped. A hard-delete lock prevents concurrent restore while cascade
+is running.
+
+### Scenario 5: User account deleted
+
+| Step | What happens | When | Tested by |
+|------|-------------|------|-----------|
+| Admin deactivates/deletes user | User marked with `deleted_at` timestamp | Immediate | **Pending** |
+| Grace period | Default 7 days (`user_grace_days`) | 7 days | **Pending** |
+| Scanner finds expired user | `scanExpiredDeletedUsers` enqueues `ItemUserCascade` | Next scanner sweep | **Pending** |
+| Worker cascade | Lock → soft-delete all owned libraries → remove from groups → delete shares → delete starred/monitored/API keys → hard-delete user | Cascaded | **Pending (unit tested with mocks only)** |
+| Library cascade | Each soft-deleted library follows Scenario 4 timeline | +30 days | `TestGC_LibraryCascade` |
+
+**Note:** User cascade is tested in unit tests with mocks but has **no integration test
+against real Cassandra** yet. This is a gap.
+
+### Scenario 6: Organization deleted
+
+| Step | What happens | When | Tested by |
+|------|-------------|------|-----------|
+| Platform admin deletes org | Org marked with `deleted_at` | Immediate | **Pending** |
+| Grace period | Default 30 days (`org_grace_days`) | 30 days | **Pending** |
+| Scanner finds expired org | Enqueues `ItemOrgCascade` | Next scanner sweep | **Pending** |
+| Worker cascade | For each library: cascade-delete. For each user: delete. For each group: delete. Hard-delete org. | Cascaded | **Pending (unit tested with mocks only)** |
+
+### Scenario 7: Share link expires
+
+| Step | What happens | When | Tested by |
+|------|-------------|------|-----------|
+| Share link past `expires_at` | Scanner phase 2 finds it | Next scanner sweep | Unit test (scanner) |
+| Deletion | Share link record deleted from DB | Immediate in scanner | **Pending integration test** |
+
+**Note:** Share link expiry does NOT delete the underlying file or library. It only
+removes the public access link.
+
+### Scenario 8: Version TTL expires (old commits pruned)
+
+| Step | What happens | When | Tested by |
+|------|-------------|------|-----------|
+| Library has `version_ttl_days` set | Scanner phase 5 finds old commits | Next scanner sweep | Unit test (scanner) |
+| HEAD chain preserved | Scanner walks the HEAD→parent chain, never deletes those | — | Unit test |
+| Old commits enqueued | Commits outside HEAD chain + older than TTL enqueued | — | Unit test |
+| Cascade | Commit → fs_objects → blocks (only if ref_count=0) | Normal GC flow | **Pending integration test** |
+
+### Scenario 9: Scanner finds orphaned blocks (missed enqueue)
+
+| Step | What happens | When | Tested by |
+|------|-------------|------|-----------|
+| Block has ref_count=0 but no GC candidate | Scanner phase 1 finds it | Next scanner sweep | `TestGC_ScannerOrphanRecovery` |
+| Re-enqueue | Scanner creates GC candidate + queue entry | Immediate | `TestGC_ScannerOrphanRecovery` |
+| Normal GC flow | Worker processes after grace period | Normal flow | `TestGC_BlockLifecycle` |
+
+### Summary: Dedup-safe deletion guarantees
+
+| Guarantee | Mechanism | Integration-tested? |
+|-----------|-----------|-------------------|
+| Block never deleted while ref_count > 0 | LWT: `IF ref_count <= 0` | **Yes** (`TestGC_ConcurrentUploadDuringGC`) |
+| Ref count never double-decremented | Idempotent operation key + `gc_processed_items` | **Yes** (unit + `TestBatchDeleteItems_DeduplicatedFilesDecrementSharedBlockTwice`) |
+| Re-uploaded content survives pending GC | Grace period + LWT re-check at deletion time | **Yes** (`TestGC_ConcurrentUploadDuringGC`) |
+| Shared block survives partial file delete | Ref count tracks all references | **Yes** (`TestGC_DeduplicationSafety`) |
+| Cascade respects restore from trash | Stale-check + hard-delete lock | Unit tests only (**pending integration**) |
+| Orphaned blocks eventually cleaned up | Scanner phase 1 re-discovers and re-enqueues | **Yes** (`TestGC_ScannerOrphanRecovery`) |
+
 ## Test Coverage Assessment
 
-### What's covered (107 unit tests + 4 integration)
+### What's covered (107 unit tests + 4 prior integration + 7 new GC integration)
 
-| Area | Tests | Verdict |
-|------|-------|---------|
-| Service lifecycle (start/stop/concurrent) | 20 | Solid |
-| Queue operations (enqueue/dequeue/grace/retry) | 14 | Solid |
-| Block deletion (LWT guard, dry run, S3) | 6 | Solid |
-| Commit cascade → fs_object | 3 | Adequate |
-| FS Object → block decrement + directory recursion | 5 | Adequate |
-| User cascade (full, dry run, skip restored) | 6 | Solid |
-| Library cascade (full, dry run, skip restored) | 5 | Solid |
-| Org cascade (full, dry run) | 4 | Adequate |
-| Grace period regressions | 2 | Solid |
-| HOL blocking + retry cap | 3 | Solid |
-| LWT race condition regression | 1 | Critical test, exists |
-| Scanner (13 phases) | 33 | Comprehensive |
-| Integration (batch-delete → GC flow) | 4 | Good for happy path |
+| Area | Tests | Type | Verdict |
+|------|-------|------|---------|
+| Service lifecycle (start/stop/concurrent) | 20 | Unit (mock) | Solid |
+| Queue operations (enqueue/dequeue/grace/retry) | 14 | Unit (mock) | Solid |
+| Block deletion (LWT guard, dry run, S3) | 6 | Unit (mock) | Solid |
+| Commit cascade → fs_object | 3 | Unit (mock) | Adequate |
+| FS Object → block decrement + directory recursion | 5 | Unit (mock) | Adequate |
+| User cascade (full, dry run, skip restored) | 6 | Unit (mock) | Solid |
+| Library cascade (full, dry run, skip restored) | 5 | Unit (mock) | Solid |
+| Org cascade (full, dry run) | 4 | Unit (mock) | Adequate |
+| Grace period regressions | 2 | Unit (mock) | Solid |
+| HOL blocking + retry cap | 3 | Unit (mock) | Solid |
+| LWT race condition regression | 1 | Unit (mock) | Critical test, exists |
+| Scanner (13 phases) | 33 | Unit (mock) | Comprehensive |
+| Batch-delete → refcount → GC enqueue | 4 | Integration (real Cassandra) | Good |
+| **Block lifecycle end-to-end** | 1 | **Integration (real Cassandra + S3)** | **Done** |
+| **Deduplication safety** | 1 | **Integration (real Cassandra + S3)** | **Done** |
+| **LWT guard with real Cassandra** | 1 | **Integration (real Cassandra + S3)** | **Done** |
+| **Library cascade (scanner → worker)** | 1 | **Integration (real Cassandra + S3)** | **Done** |
+| **Scanner orphan recovery** | 1 | **Integration (real Cassandra + S3)** | **Done** |
+| **Grace period enforcement (real)** | 1 | **Integration (real Cassandra + S3)** | **Done** |
+| **Queue size tracking (admin API)** | 1 | **Integration (real Cassandra + S3)** | **Done** |
+| **Long-running soak test** | 1 | **Integration (gcsoak tag)** | **Code written, not yet run** |
 
-### What's NOT covered (critical gaps)
+### Test gaps
 
-| Gap | Risk | Why it matters |
-|-----|------|----------------|
-| **S3 failure during block delete** | High | The #1 data integrity risk — no test verifies behavior when S3 is unreachable |
-| **Concurrent worker + scanner on same org** | Medium | Could cause duplicate processing or missed items |
-| **Queue recovery after service restart** | Medium | Verifies items survive crash |
-| **ShareLink/Share/RestoreJob worker processing** | Medium | Only enqueue is tested, not actual deletion handlers |
-| **Very deep directory cascade (100+ levels)** | Medium | Stack depth / timeout risk |
-| **Real Cassandra LWT behavior** | Medium | All tests use MockStore — LWT semantics may differ |
-| **Cascade partial failure + retry** | Medium | What happens when share #50 of 100 fails |
-| **Scanner + concurrent writes** | Low | Scanner enqueues while API writes new data |
-| **Grace period boundary (±1ms)** | Low | Timing-sensitive edge case |
+| Gap | Risk | Status | Notes |
+|-----|------|--------|-------|
+| **S3 failure during block delete** | High | **Pending** | Needs MinIO stop/start during GC. Soak test framework supports this but it's not wired up. |
+| **Concurrent worker + scanner on same org** | Medium | **Pending** | Needs to trigger both simultaneously and verify no duplicate processing or missed items. |
+| **Queue recovery after service restart** | Medium | **Pending** | Needs to restart the sesamefs container mid-queue and verify items survive. |
+| **ShareLink/Share/RestoreJob worker processing** | Medium | **Pending** | Only enqueue is tested (unit). No integration test creates and deletes share links through GC. |
+| **Very deep directory cascade (100+ levels)** | Medium | **Pending** | `TestGC_LibraryCascade` tests 3 files (flat). No deep nesting test. |
+| **Real Cassandra LWT behavior** | Medium | **Done** | `TestGC_ConcurrentUploadDuringGC` validates the LWT guard against real Cassandra. |
+| **Cascade partial failure + retry** | Medium | **Pending** | No test simulates a mid-cascade failure (e.g., corrupt share record). |
+| **Scanner + concurrent writes** | Low | **Partially done** | Soak test exercises this implicitly (uploads happen while GC runs), but doesn't assert specifically on concurrent scanner behavior. |
+| **Grace period boundary (±1ms)** | Low | **Partially done** | `TestGC_GracePeriodEnforcement` tests the concept with real timing but not the exact ±1ms boundary. |
+| **User cascade end-to-end** | Medium | **Pending** | No integration test creates a user, soft-deletes them, and verifies full cascade through GC. |
+| **Soak test validation** | Medium | **Code written, needs run** | `TestGC_Soak` is implemented but hasn't been executed against the live stack yet. |
 
 ---
 
 ## Integration Test Plan
 
-The goal is to create tests that can run in a loop for long-duration monitoring,
-validating GC correctness under realistic conditions.
+Tests are in `internal/integration/gc_integration_test.go` (core) and
+`internal/integration/gc_soak_test.go` (soak). Run independently with:
 
-### Test 1: Block lifecycle — upload, delete, GC, verify gone
+```bash
+# Core GC tests only (7 tests, ~20s)
+go test -tags integration -v -run "TestGC_" -timeout 10m ./internal/integration/...
 
-**What it tests:** The complete happy path from file upload through GC deletion.
-
-```
-1. Upload a file with unique content (creates blocks with ref_count=1)
-2. Record the block IDs (from fs_objects table)
-3. Delete the file (ref_count drops to 0, blocks enqueued for GC)
-4. Wait for grace period (or trigger GC manually with grace=0)
-5. Trigger GC worker
-6. Verify: blocks are gone from DB (SELECT returns empty)
-7. Verify: blocks are gone from S3 (GET returns 404)
-8. Verify: GC candidate records are cleaned up
-9. Verify: gc_processed_items has the task IDs (idempotency records)
+# Soak test (default 5 min, configure with GC_SOAK_DURATION)
+go test -tags 'integration gcsoak' -v -run "TestGC_Soak" -timeout 30m ./internal/integration/...
 ```
 
-**Loop mode:** Run continuously with random file sizes. Track success/failure rate.
-Alert on any iteration where blocks remain after GC.
+### Implemented tests
 
-### Test 2: Deduplication safety — shared blocks survive partial delete
+| # | Test | File | Status | Run time |
+|---|------|------|--------|----------|
+| 1 | `TestGC_BlockLifecycle` | gc_integration_test.go | **Passing** | 3s |
+| 2 | `TestGC_DeduplicationSafety` | gc_integration_test.go | **Passing** | 2s |
+| 3 | `TestGC_ConcurrentUploadDuringGC` | gc_integration_test.go | **Passing** | 3s |
+| 4 | `TestGC_LibraryCascade` | gc_integration_test.go | **Passing** | 9s |
+| 5 | `TestGC_ScannerOrphanRecovery` | gc_integration_test.go | **Passing** | 1–12s |
+| 6 | `TestGC_GracePeriodEnforcement` | gc_integration_test.go | **Passing** | 1s |
+| 7 | `TestGC_QueueSizeTracking` | gc_integration_test.go | **Passing** | <1s |
+| 8 | `TestGC_Soak` | gc_soak_test.go | **Code written, needs run** | 5 min+ |
 
-**What it tests:** When two files share the same blocks, deleting one file does NOT
-delete the shared blocks.
+### Planned tests (not yet implemented)
 
-```
-1. Upload file A (creates blocks, ref_count=1 each)
-2. Upload file B with identical content (same blocks, ref_count=2)
-3. Delete file A (ref_count drops to 1)
-4. Trigger GC worker
-5. Verify: blocks still exist in DB (ref_count=1)
-6. Verify: blocks still exist in S3
-7. Download file B — content must match original
-8. Delete file B (ref_count drops to 0)
-9. Trigger GC worker
-10. Verify: blocks now deleted from DB and S3
-```
+| # | Test | What it covers | Blocked by |
+|---|------|---------------|------------|
+| 9 | S3 failure resilience | Stop MinIO mid-GC, verify retry + recovery | Needs container orchestration from test |
+| 10 | User cascade end-to-end | Soft-delete user → verify full cascade | Needs ability to create/delete users via API |
+| 11 | Deep directory cascade (100+ levels) | Stack depth / timeout under deep nesting | Time to implement |
+| 12 | Concurrent worker + scanner | Trigger both on same org simultaneously | Needs careful timing + assertions |
+| 13 | Queue recovery after restart | Restart sesamefs mid-queue, verify items survive | Needs container restart from test |
+| 14 | Cascade partial failure | Corrupt record mid-cascade, verify retry behavior | Needs direct DB manipulation |
+| 15 | ShareLink/Share/RestoreJob through worker | Create + expire share links, verify GC deletes them | Time to implement |
 
-**Loop mode:** Run with varying file sizes and dedup patterns.
+### What each implemented test validates
 
-### Test 3: Concurrent upload during GC — no data loss
+**Test 1 — Block lifecycle:** Upload → delete → ref_count=0 → GC candidate created →
+worker processes. Validates the complete happy path with real Cassandra and real S3.
 
-**What it tests:** The LWT guard prevents deletion of blocks being actively uploaded.
+**Test 2 — Deduplication safety:** Two files, same content, ref_count=2. Delete one →
+ref_count=1 → GC skips block → second file still downloadable. Validates that shared
+blocks are never deleted while referenced.
 
-```
-1. Upload file A (blocks get ref_count=1)
-2. Delete file A (ref_count=0, blocks enqueued for GC)
-3. Immediately upload file B with same content (ref_count back to 1)
-4. Trigger GC worker (should see ref_count=1, LWT fails)
-5. Verify: blocks still exist (LWT skipped them)
-6. Download file B — content must match
-```
+**Test 3 — Concurrent upload during GC:** Delete file → re-upload same content → trigger
+GC → LWT guard prevents deletion → re-uploaded file intact. Validates the core safety
+mechanism against real Cassandra LWT behavior (not mocks).
 
-**Loop mode:** Tighten the timing between steps 2-3 across iterations. This is the
-race condition stress test.
+**Test 4 — Library cascade:** Upload files → soft-delete library → trigger scanner
+(finds expired library) → trigger worker (cascades through commits, fs_objects, blocks).
+Validates the multi-step cascade with real infrastructure.
 
-### Test 4: Library cascade — complete cleanup
+**Test 5 — Scanner orphan recovery:** Upload file → delete → wait for ref_count=0 →
+delete GC candidate directly from DB → trigger scanner → verify block re-discovered
+and re-enqueued. Validates the scanner safety net with real Cassandra.
 
-**What it tests:** Deleting a library cascades through commits, fs_objects, and blocks.
+**Test 6 — Grace period enforcement:** Upload → delete → trigger GC immediately →
+verify block still exists (grace period holds). Validates timing-based safety.
 
-```
-1. Create a library
-2. Upload 10 files of varying sizes
-3. Create 3 commits (upload more files to generate commit history)
-4. Soft-delete the library
-5. Wait for trash retention period (or set to 0 for test)
-6. Trigger scanner (finds expired deleted library)
-7. Trigger worker repeatedly until queue is empty
-8. Verify: no commits remain for this library
-9. Verify: no fs_objects remain
-10. Verify: all blocks with ref_count=0 are deleted from DB + S3
-11. Verify: library record is hard-deleted
-12. Verify: all shares, tags, tokens for this library are gone
-```
+**Test 7 — Queue size tracking:** Upload → delete → check admin API reports queue
+size change. Validates admin monitoring endpoint.
 
-**Loop mode:** Run with varying library sizes (1 file to 1000 files).
-
-### Test 5: User cascade — complete cleanup
-
-**What it tests:** Deactivating and deleting a user cascades through all owned data.
-
-```
-1. Create a user
-2. Create libraries, upload files, create shares, star files
-3. Soft-delete the user
-4. Wait for user grace period (or set to 0)
-5. Trigger scanner + worker
-6. Verify: user's libraries are soft-deleted
-7. Verify: user is removed from all groups
-8. Verify: user's shares are deleted
-9. Verify: user's starred files are deleted
-10. Verify: user's API keys are deleted
-11. Verify: user record is hard-deleted
-12. Verify: email lookup is gone
-```
-
-### Test 6: S3 failure resilience
-
-**What it tests:** What happens when S3 is temporarily unavailable during GC.
-
-```
-1. Upload a file, delete it, trigger GC
-2. Before GC processes the block: make S3 unreachable (stop MinIO)
-3. Trigger GC worker — should fail on S3 delete
-4. Verify: block is retried (retry_count incremented)
-5. Restart MinIO
-6. Trigger GC worker again
-7. Verify: block is now deleted from both DB and S3
-```
-
-**Loop mode:** Randomly kill/restart MinIO during GC processing.
-
-### Test 7: Scanner orphan recovery
-
-**What it tests:** The scanner finds items that were missed by inline enqueue.
-
-```
-1. Directly insert a block with ref_count=0 into DB (bypassing normal enqueue)
-2. Verify it's NOT in the GC queue
-3. Run scanner
-4. Verify: block is now in the GC queue
-5. Run worker
-6. Verify: block is deleted
-```
-
-### Test 8: Long-running stability (soak test)
-
-**What it tests:** GC operates correctly over hours of continuous operation.
-
-```
-Loop for N hours:
-  1. Create a library, upload 5 random files
-  2. Delete 2-3 of them randomly
-  3. Create shares, then delete some
-  4. Every 10 iterations: soft-delete a library
-  5. Every 50 iterations: soft-delete a user
-  6. Let GC run normally (30s worker interval)
-  
-  Assertions (checked every minute):
-  - Queue size is bounded (not growing indefinitely)
-  - No blocks with ref_count=0 older than grace_period + 5min
-  - No S3 orphans (blocks in S3 not in DB)
-  - All active files are downloadable with correct content
-  - Memory usage of sesamefs container is stable
-  - No error log entries containing "data loss" or "panic"
-```
-
-**This is the most important test** — it simulates real customer behavior over time.
+**Test 8 — Soak test (code written, needs run):** Continuous loop: create libraries,
+upload files, delete some, soft-delete libraries, while GC runs. Invariant checks
+every 30s: all active files downloadable, queue bounded, GC responsive.
 
 ---
 
