@@ -49,6 +49,13 @@ func (f *fakeLeaderLease) Release(ctx context.Context) {
 }
 
 func (f *fakeLeaderLease) IsLeader() bool {
+	// If TryAcquireOrRenew has never been called the leader atomic is still
+	// at its zero value (false). Fall back to the static field so tests that
+	// call runWorkerOnce / runScannerOnce directly — without going through
+	// Start() — don't need to prime the fake first.
+	if atomic.LoadInt32(&f.calls) == 0 {
+		return f.allowed
+	}
 	return f.leader.Load()
 }
 
