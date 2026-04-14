@@ -299,10 +299,10 @@ func TestEncryptionResponseFormat(t *testing.T) {
 // TestCreateLibraryRequest_EncryptedFields tests encrypted library creation request
 func TestCreateLibraryRequest_EncryptedFields(t *testing.T) {
 	tests := []struct {
-		name      string
-		body      string
-		wantEnc   bool
-		wantPwd   string
+		name    string
+		body    string
+		wantEnc bool
+		wantPwd string
 	}{
 		{
 			name:    "non-encrypted",
@@ -594,5 +594,135 @@ func TestNewEncryptionHandler(t *testing.T) {
 	}
 	if h.db != nil {
 		t.Error("db should be nil when created with nil")
+	}
+}
+
+// ============================================================================
+// LockAllForRepo / ChangePassword session invalidation
+// ============================================================================
+
+// TestDecryptSessionManager_LockAllForRepo_EvictsAllUsersForRepo confirms that
+// calling LockAllForRepo invalidates sessions for all users on that repo while
+// sessions for other repos remain active.
+func TestDecryptSessionManager_LockAllForRepo_EvictsAllUsersForRepo(t *testing.T) {
+	m := newTestSessionManager(time.Hour)
+
+	key, iv := []byte("filekey"), []byte("fileiv_")
+
+	// Two users unlocked on the same repo.
+	m.Unlock("user-A", "repo-X", key, iv)
+	m.Unlock("user-B", "repo-X", key, iv)
+	// One user on a different repo — must survive.
+	m.Unlock("user-A", "repo-Y", key, iv)
+
+	evicted := m.LockAllForRepo("repo-X")
+	if evicted != 2 {
+		t.Errorf("LockAllForRepo evicted %d sessions, want 2", evicted)
+	}
+	if m.IsUnlocked("user-A", "repo-X") {
+		t.Error("user-A:repo-X should be locked after LockAllForRepo")
+	}
+	if m.IsUnlocked("user-B", "repo-X") {
+		t.Error("user-B:repo-X should be locked after LockAllForRepo")
+	}
+	if !m.IsUnlocked("user-A", "repo-Y") {
+		t.Error("user-A:repo-Y should NOT be affected by LockAllForRepo(repo-X)")
+	}
+}
+
+// TestDecryptSessionManager_LockAllForRepo_EmptyMap ensures no panic when the
+// session map is empty.
+func TestDecryptSessionManager_LockAllForRepo_EmptyMap(t *testing.T) {
+	m := newTestSessionManager(time.Hour)
+	evicted := m.LockAllForRepo("repo-Z")
+	if evicted != 0 {
+		t.Errorf("expected 0 evictions on empty map, got %d", evicted)
+	}
+}
+
+// TestDecryptSessionManager_LockAllForRepo_NoMatchingRepo confirms that sessions
+// for other repos are untouched even when the target repo has no sessions.
+func TestDecryptSessionManager_LockAllForRepo_NoMatchingRepo(t *testing.T) {
+	m := newTestSessionManager(time.Hour)
+	m.Unlock("user-A", "repo-1", []byte("k"), []byte("v"))
+	m.Unlock("user-B", "repo-2", []byte("k"), []byte("v"))
+
+	evicted := m.LockAllForRepo("repo-nonexistent")
+	if evicted != 0 {
+		t.Errorf("expected 0 evictions, got %d", evicted)
+	}
+	if !m.IsUnlocked("user-A", "repo-1") {
+		t.Error("unrelated sessions should remain unlocked")
+	}
+	if !m.IsUnlocked("user-B", "repo-2") {
+		t.Error("unrelated sessions should remain unlocked")
+	}
+}
+
+// TestDecryptSessionManager_LockAllForRepo_Concurrent verifies there is no data
+// race when LockAllForRepo runs concurrently with Unlock/IsUnlocked.
+func TestDecryptSessionManager_LockAllForRepo_Concurrent(t *testing.T) {
+	m := newTestSessionManager(time.Hour)
+	repoID := "repo-shared"
+	key, iv := []byte("k"), []byte("v")
+
+	const goroutines = 20
+	var wg sync.WaitGroup
+	wg.Add(goroutines * 3)
+
+	for i := 0; i < goroutines; i++ {
+		userID := "user-" + string(rune('A'+i%26))
+		go func(uid string) {
+			defer wg.Done()
+			m.Unlock(uid, repoID, key, iv)
+		}(userID)
+		go func(uid string) {
+			defer wg.Done()
+			m.IsUnlocked(uid, repoID)
+		}(userID)
+		go func() {
+			defer wg.Done()
+			m.LockAllForRepo(repoID)
+		}()
+	}
+	wg.Wait()
+	// Just verify no panic and the manager is still usable.
+	m.Unlock("final", repoID, key, iv)
+	if !m.IsUnlocked("final", repoID) {
+		t.Error("manager should be functional after concurrent stress")
+	}
+}
+
+func TestDecryptSessionManager_ResolverInvalidatesStaleRepoSession(t *testing.T) {
+	m := newTestSessionManager(time.Hour)
+	baseUpdatedAt := time.Now().Add(-time.Minute)
+	m.SetUpdatedAtResolver(func(orgID, repoID string) (time.Time, error) {
+		if orgID != "org-1" || repoID != "repo-1" {
+			t.Fatalf("unexpected resolver lookup %s/%s", orgID, repoID)
+		}
+		return baseUpdatedAt.Add(time.Minute), nil
+	})
+
+	m.UnlockForLibrary("user-1", "org-1", "repo-1", baseUpdatedAt, []byte("key"), []byte("iv"))
+
+	if m.IsUnlocked("user-1", "repo-1") {
+		t.Fatal("session should be invalidated when library updated_at advances")
+	}
+	if m.GetFileKey("user-1", "repo-1") != nil {
+		t.Fatal("stale session key should not be returned after invalidation")
+	}
+}
+
+func TestDecryptSessionManager_ResolverKeepsCurrentRepoSession(t *testing.T) {
+	m := newTestSessionManager(time.Hour)
+	baseUpdatedAt := time.Now().Add(-time.Minute)
+	m.SetUpdatedAtResolver(func(orgID, repoID string) (time.Time, error) {
+		return baseUpdatedAt, nil
+	})
+
+	m.UnlockForLibrary("user-1", "org-1", "repo-1", baseUpdatedAt, []byte("key"), []byte("iv"))
+
+	if !m.IsUnlocked("user-1", "repo-1") {
+		t.Fatal("session should remain valid when library updated_at is unchanged")
 	}
 }

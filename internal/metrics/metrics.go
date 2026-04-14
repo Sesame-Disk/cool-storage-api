@@ -158,6 +158,16 @@ var (
 		},
 		[]string{"action"},
 	)
+
+	// ChunkUploadTempOrphansCleaned counts stale chunked-upload temp files
+	// reaped by the ChunkManager janitor goroutine.
+	ChunkUploadTempOrphansCleaned = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "chunk_upload_temp_orphans_cleaned_total",
+			Help: "Total number of abandoned chunked-upload temp files cleaned by the janitor.",
+		},
+		[]string{"source"}, // "tracker" (in-memory map) or "disk" (tempDir sweep)
+	)
 )
 
 // Register registers all custom metrics with the default Prometheus registry.
@@ -181,5 +191,6 @@ func Register() {
 		GCQueueGrowthRate,
 		GCWorkerLastSuccessTimestamp,
 		GCAuditEventsTotal,
+		ChunkUploadTempOrphansCleaned,
 	)
 }

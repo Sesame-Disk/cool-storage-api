@@ -6,6 +6,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"testing"
 	"time"
 
@@ -20,8 +21,174 @@ func init() {
 }
 
 // ============================================================================
-// TokenManager Tests (pure Go, no external dependencies)
+// ChunkManager janitor Tests
 // ============================================================================
+
+// newTestChunkManager creates a ChunkManager with a controllable clock and
+// isolated tempDir. It does NOT start the janitor goroutine — tests call
+// sweepOnce() directly.
+func newTestChunkManager(t *testing.T) (*ChunkManager, string) {
+	t.Helper()
+	dir := t.TempDir()
+	cm := &ChunkManager{
+		uploads:         make(map[string]*ChunkUpload),
+		tempDir:         dir,
+		janitorInterval: time.Hour, // irrelevant — goroutine not started
+		trackerTTL:      1 * time.Hour,
+		diskTTL:         2 * time.Hour,
+		now:             time.Now,
+		stopCh:          make(chan struct{}),
+	}
+	return cm, dir
+}
+
+// TestChunkJanitor_SweepStaleTracker verifies that a tracker with no recent
+// activity gets reaped and its temp file deleted.
+func TestChunkJanitor_SweepStaleTracker(t *testing.T) {
+	cm, dir := newTestChunkManager(t)
+
+	// Create a real temp file in the isolated dir.
+	f, err := os.CreateTemp(dir, "sesamefs_upload_tok1_file.txt")
+	if err != nil {
+		t.Fatalf("create temp: %v", err)
+	}
+	f.Close()
+
+	past := time.Now().Add(-90 * time.Minute)
+	upload := &ChunkUpload{
+		Token:     "tok1",
+		Filename:  "file.txt",
+		TempFile:  nil, // already closed above; Cleanup will fail on Close but Remove still runs
+		TempPath:  f.Name(),
+		updatedAt: past,
+	}
+	upload.TempFile, _ = os.OpenFile(f.Name(), os.O_RDWR, 0600)
+	cm.uploads["tok1:file.txt"] = upload
+
+	// Advance clock past trackerTTL.
+	cm.now = func() time.Time { return time.Now().Add(70 * time.Minute) }
+	cm.sweepOnce()
+
+	if _, exists := cm.uploads["tok1:file.txt"]; exists {
+		t.Error("stale tracker should have been removed from map")
+	}
+	if _, err := os.Stat(f.Name()); !os.IsNotExist(err) {
+		t.Errorf("temp file should be deleted, stat err=%v", err)
+	}
+}
+
+// TestChunkJanitor_ActiveTrackerNotSwept verifies that a tracker with recent
+// activity is NOT swept.
+func TestChunkJanitor_ActiveTrackerNotSwept(t *testing.T) {
+	cm, dir := newTestChunkManager(t)
+
+	f, err := os.CreateTemp(dir, "sesamefs_upload_tok2_file.txt")
+	if err != nil {
+		t.Fatalf("create temp: %v", err)
+	}
+	f.Close()
+
+	upload := &ChunkUpload{
+		Token:     "tok2",
+		Filename:  "file.txt",
+		TempFile:  nil,
+		TempPath:  f.Name(),
+		updatedAt: time.Now(), // just now
+	}
+	upload.TempFile, _ = os.OpenFile(f.Name(), os.O_RDWR, 0600)
+	cm.uploads["tok2:file.txt"] = upload
+
+	// Clock advances only 5 minutes — well below the 1-hour tracker TTL.
+	cm.now = func() time.Time { return time.Now().Add(5 * time.Minute) }
+	cm.sweepOnce()
+
+	if _, exists := cm.uploads["tok2:file.txt"]; !exists {
+		t.Error("active tracker should NOT be removed from map")
+	}
+	if _, err := os.Stat(f.Name()); err != nil {
+		t.Errorf("temp file should still exist, stat err=%v", err)
+	}
+	upload.TempFile.Close()
+}
+
+// TestChunkJanitor_DiskOrphanCleaned verifies that a prefixed temp file on
+// disk whose tracker is gone and whose mtime is past diskTTL gets deleted.
+func TestChunkJanitor_DiskOrphanCleaned(t *testing.T) {
+	cm, dir := newTestChunkManager(t)
+
+	// Create an "orphan" file (no in-memory tracker).
+	f, err := os.CreateTemp(dir, "sesamefs_upload_stale_orphan")
+	if err != nil {
+		t.Fatalf("create temp: %v", err)
+	}
+	f.Close()
+
+	// Back-date the file's mtime to 3 hours ago.
+	staleTime := time.Now().Add(-3 * time.Hour)
+	os.Chtimes(f.Name(), staleTime, staleTime)
+
+	cm.sweepOnce()
+
+	if _, err := os.Stat(f.Name()); !os.IsNotExist(err) {
+		t.Errorf("orphaned disk file should be removed, stat err=%v", err)
+	}
+}
+
+// TestChunkJanitor_DiskFileNotYetStale verifies that a newer orphan file is
+// left alone (still within diskTTL).
+func TestChunkJanitor_DiskFileNotYetStale(t *testing.T) {
+	cm, dir := newTestChunkManager(t)
+
+	f, err := os.CreateTemp(dir, "sesamefs_upload_fresh_orphan")
+	if err != nil {
+		t.Fatalf("create temp: %v", err)
+	}
+	f.Close()
+	// mtime is "now" by default — well within diskTTL.
+
+	cm.sweepOnce()
+
+	if _, err := os.Stat(f.Name()); err != nil {
+		t.Errorf("fresh file should survive sweep, stat err=%v", err)
+	}
+}
+
+// TestChunkJanitor_NonPrefixedFileIgnored verifies that files without the
+// sesamefs_upload_ prefix are never touched.
+func TestChunkJanitor_NonPrefixedFileIgnored(t *testing.T) {
+	cm, dir := newTestChunkManager(t)
+
+	f, err := os.CreateTemp(dir, "unrelated_file")
+	if err != nil {
+		t.Fatalf("create temp: %v", err)
+	}
+	f.Close()
+	// Back-date it so it would be cleaned if it had the right prefix.
+	old := time.Now().Add(-24 * time.Hour)
+	os.Chtimes(f.Name(), old, old)
+
+	cm.sweepOnce()
+
+	if _, err := os.Stat(f.Name()); err != nil {
+		t.Errorf("non-prefixed file should be ignored, stat err=%v", err)
+	}
+}
+
+func TestChunkUpload_TouchRefreshesActivity(t *testing.T) {
+	f, err := os.CreateTemp(t.TempDir(), "sesamefs_upload_touch")
+	if err != nil {
+		t.Fatalf("create temp: %v", err)
+	}
+	defer f.Close()
+
+	past := time.Now().Add(-2 * time.Hour)
+	upload := &ChunkUpload{TempFile: f, TempPath: f.Name(), updatedAt: past}
+	upload.Touch()
+
+	if !upload.updatedAt.After(past) {
+		t.Fatal("Touch should refresh updatedAt")
+	}
+}
 
 func TestNewTokenManager(t *testing.T) {
 	tests := []struct {

@@ -26,6 +26,7 @@ import (
 	"github.com/Sesame-Disk/sesamefs/internal/crypto"
 	"github.com/Sesame-Disk/sesamefs/internal/db"
 	"github.com/Sesame-Disk/sesamefs/internal/httputil"
+	"github.com/Sesame-Disk/sesamefs/internal/metrics"
 	"github.com/Sesame-Disk/sesamefs/internal/middleware"
 	"github.com/Sesame-Disk/sesamefs/internal/storage"
 	"github.com/Sesame-Disk/sesamefs/internal/streaming"
@@ -270,23 +271,65 @@ type ChunkUpload struct {
 	TempFile    *os.File
 	TempPath    string
 	ReceivedEnd int64 // Track the highest byte received
+	updatedAt   time.Time
 	mu          sync.Mutex
 }
+
+// Chunked upload janitor tunables. The in-memory tracker TTL must be longer
+// than any realistic pause between chunks. The disk TTL is the safety net for
+// temp files orphaned by a process restart (map is gone, file remains).
+const (
+	chunkJanitorInterval = 10 * time.Minute
+	chunkTrackerTTL      = 1 * time.Hour
+	chunkDiskTTL         = 2 * time.Hour
+)
 
 // ChunkManager manages chunked uploads
 type ChunkManager struct {
 	uploads map[string]*ChunkUpload // keyed by "token:filename"
 	mu      sync.RWMutex
 	tempDir string
+
+	// Janitor config — overridable in tests.
+	janitorInterval time.Duration
+	trackerTTL      time.Duration
+	diskTTL         time.Duration
+	now             func() time.Time
+
+	janitorOnce sync.Once
+	stopCh      chan struct{}
 }
 
-// NewChunkManager creates a new chunk manager
+// NewChunkManager creates a new chunk manager and starts its janitor goroutine.
 func NewChunkManager() *ChunkManager {
-	tempDir := os.TempDir()
-	return &ChunkManager{
-		uploads: make(map[string]*ChunkUpload),
-		tempDir: tempDir,
+	cm := &ChunkManager{
+		uploads:         make(map[string]*ChunkUpload),
+		tempDir:         os.TempDir(),
+		janitorInterval: chunkJanitorInterval,
+		trackerTTL:      chunkTrackerTTL,
+		diskTTL:         chunkDiskTTL,
+		now:             time.Now,
+		stopCh:          make(chan struct{}),
 	}
+	cm.StartJanitor()
+	return cm
+}
+
+// StartJanitor launches the background sweeper exactly once per manager.
+func (cm *ChunkManager) StartJanitor() {
+	cm.janitorOnce.Do(func() {
+		go cm.janitorLoop()
+	})
+}
+
+// Stop halts the janitor goroutine. Intended for tests.
+func (cm *ChunkManager) Stop() {
+	select {
+	case <-cm.stopCh:
+		return
+	default:
+	}
+	close(cm.stopCh)
 }
 
 // Global chunk manager instance
@@ -326,10 +369,98 @@ func (cm *ChunkManager) GetOrCreateUpload(token, filename, parentDir string, tot
 		TempFile:    tempFile,
 		TempPath:    tempPath,
 		ReceivedEnd: -1,
+		updatedAt:   cm.now(),
 	}
 	cm.uploads[key] = upload
 	log.Printf("[ChunkManager] Created upload tracker: %s, totalSize=%d", key, totalSize)
 	return upload, nil
+}
+
+// janitorLoop periodically reaps stale chunk uploads from memory and disk.
+func (cm *ChunkManager) janitorLoop() {
+	// First sweep runs one interval in — avoids a burst at process start
+	// when stats aren't warmed up yet.
+	ticker := time.NewTicker(cm.janitorInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-cm.stopCh:
+			return
+		case <-ticker.C:
+			cm.sweepOnce()
+		}
+	}
+}
+
+// sweepOnce performs one pass: (1) drop stale in-memory uploads and
+// (2) remove orphaned temp files from disk whose tracker is gone.
+func (cm *ChunkManager) sweepOnce() {
+	now := cm.now()
+	trackerCutoff := now.Add(-cm.trackerTTL)
+	diskCutoff := now.Add(-cm.diskTTL)
+
+	// (1) In-memory sweep — collect, release lock, then Cleanup() outside the
+	// write lock to avoid holding cm.mu during file I/O.
+	cm.mu.Lock()
+	var stale []*ChunkUpload
+	var staleKeys []string
+	for key, upload := range cm.uploads {
+		upload.mu.Lock()
+		updatedAt := upload.updatedAt
+		upload.mu.Unlock()
+		if updatedAt.Before(trackerCutoff) {
+			stale = append(stale, upload)
+			staleKeys = append(staleKeys, key)
+		}
+	}
+	for _, key := range staleKeys {
+		delete(cm.uploads, key)
+	}
+	aliveTempPaths := make(map[string]struct{}, len(cm.uploads))
+	for _, upload := range cm.uploads {
+		aliveTempPaths[upload.TempPath] = struct{}{}
+	}
+	cm.mu.Unlock()
+
+	for _, upload := range stale {
+		if err := upload.Cleanup(); err != nil && !os.IsNotExist(err) {
+			log.Printf("[ChunkManager] Janitor failed to clean tracker %s: %v", upload.TempPath, err)
+			continue
+		}
+		metrics.ChunkUploadTempOrphansCleaned.WithLabelValues("tracker").Inc()
+	}
+
+	// (2) Disk sweep — files that were never (or are no longer) in the map.
+	entries, err := os.ReadDir(cm.tempDir)
+	if err != nil {
+		log.Printf("[ChunkManager] Janitor: failed to read tempDir %s: %v", cm.tempDir, err)
+		return
+	}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		if !strings.HasPrefix(name, "sesamefs_upload_") {
+			continue
+		}
+		fullPath := filepath.Join(cm.tempDir, name)
+		if _, alive := aliveTempPaths[fullPath]; alive {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			continue
+		}
+		if info.ModTime().After(diskCutoff) {
+			continue
+		}
+		if err := os.Remove(fullPath); err != nil && !os.IsNotExist(err) {
+			log.Printf("[ChunkManager] Janitor failed to remove orphan %s: %v", fullPath, err)
+			continue
+		}
+		metrics.ChunkUploadTempOrphansCleaned.WithLabelValues("disk").Inc()
+	}
 }
 
 // WriteChunk writes a chunk to the correct position in the temp file
@@ -351,6 +482,7 @@ func (cu *ChunkUpload) WriteChunk(data []byte, start, end int64) error {
 	if end > cu.ReceivedEnd {
 		cu.ReceivedEnd = end
 	}
+	cu.updatedAt = time.Now()
 
 	log.Printf("[ChunkUpload] Wrote chunk: start=%d, end=%d, received_end=%d, total=%d",
 		start, end, cu.ReceivedEnd, cu.TotalSize)
@@ -382,6 +514,7 @@ func (cu *ChunkUpload) WriteChunkFromReader(r io.Reader, start, end int64) error
 	if actualEnd > cu.ReceivedEnd {
 		cu.ReceivedEnd = actualEnd
 	}
+	cu.updatedAt = time.Now()
 
 	log.Printf("[ChunkUpload] Streamed chunk: start=%d, written=%d, received_end=%d, total=%d",
 		start, written, cu.ReceivedEnd, cu.TotalSize)
@@ -410,6 +543,12 @@ func (cu *ChunkUpload) GetReader() (io.Reader, error) {
 		return nil, err
 	}
 	return cu.TempFile, nil
+}
+
+func (cu *ChunkUpload) Touch() {
+	cu.mu.Lock()
+	defer cu.mu.Unlock()
+	cu.updatedAt = time.Now()
 }
 
 // Cleanup removes the temp file
@@ -769,6 +908,7 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 
 		// All chunks received — finalize by streaming from temp file
 		log.Printf("[HandleUpload] All chunks received, finalizing upload (streaming)")
+		upload.Touch()
 		fileID, actualFilename, err := h.finalizeUploadStreaming(c, token, upload, parentDir, filename, storageKey, total, replaceFile)
 		chunkManager.CleanupUpload(tokenStr, filename)
 		if err != nil {
@@ -998,6 +1138,8 @@ func (h *SeafHTTPHandler) finalizeUploadStreaming(c *gin.Context, token *AccessT
 		if err := v2.NewFSHelper(h.db).IncrementOrCreateBlock(token.OrgID, sha256ID, len(storedBlock), actualStorageClass, ""); err != nil {
 			log.Printf("[finalizeUploadStreaming] WARNING: Failed to write block metadata org=%s block=%s: %v", token.OrgID, sha256ID[:16], err)
 		}
+
+		upload.Touch()
 
 		if readErr == io.EOF || readErr == io.ErrUnexpectedEOF {
 			break
