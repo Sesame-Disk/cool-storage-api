@@ -4,6 +4,7 @@
 **Scope:** Full reassessment of sesamefs backend (Go), frontend (React), dependencies,
 production deployment at `https://sfs.nihaoshares.com`, and local Docker Compose stack.
 **Previous assessment:** [SECURITY-ASSESSMENT-2026-04.md](./SECURITY-ASSESSMENT-2026-04.md) (2026-04-09)
+**Next assessment:** [SECURITY-ASSESSMENT-2026-04-v3.md](./SECURITY-ASSESSMENT-2026-04-v3.md) (2026-04-14) — post-fix verification
 **Methodology:** Static code review + live probing of both local (`http://localhost:8082`)
 and production (`https://sfs.nihaoshares.com`) using automated exploit scripts. All
 unauthenticated probes were run against both targets for comparison.
