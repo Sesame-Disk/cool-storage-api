@@ -28,15 +28,15 @@ the detailed views as needed.
 
 All diagrams use a consistent color scheme: **red** = critical, **orange** = gap, **yellow** = medium, **green** = working control, **blue** = encryption. Each page includes a "how to read" guide and explains the key issues shown.
 
-## Backend Reusability Analysis
+## Deep-dive analyses
 
-A separate analysis of the Go backend's code structure, coupling, and reusability is
-available at **[BACKEND-REUSABILITY-ANALYSIS.md](./BACKEND-REUSABILITY-ANALYSIS.md)**.
-
-Key findings: 7 packages (crypto, chunker, config, storage, plans, health, httputil) are
-standalone-ready. The API handler layer (`api/v2/`, 18K lines) has a 4,719-line god object,
-434 raw database queries scattered across 45 files, and no repository pattern. A prioritized
-refactoring roadmap is included.
+| Document | What it covers |
+|----------|---------------|
+| [Backend Reusability](./BACKEND-REUSABILITY-ANALYSIS.md) | Package coupling scores, god objects, refactoring roadmap |
+| [GC Service](./GC-SERVICE-ANALYSIS.md) | Deletion safety, cleanup scenarios, dedup guarantees, integration tests |
+| [Upload & Download](./UPLOAD-DOWNLOAD-ANALYSIS.md) | Token flows, chunked uploads, block streaming, temp files, memory usage |
+| [Encryption](./ENCRYPTION-ANALYSIS.md) | Key hierarchy, decrypt sessions, Seafile compat, compromise scenarios |
+| [Chunking](./CHUNKING-ANALYSIS.md) | FastCDC, SHA-1/SHA-256 mapping, dedup, client comparison |
 
 ---
 

@@ -10,6 +10,17 @@ Benchmarks re-run on local.
 **Diagrams:** [Architecture Diagrams](./diagrams/) |
 [Backend Reusability Analysis](./BACKEND-REUSABILITY-ANALYSIS.md)
 
+## Deep-dive analyses
+
+| Document | Diagrams | What it covers |
+|----------|----------|---------------|
+| [GC Service](./GC-SERVICE-ANALYSIS.md) | [GC Flows](./diagrams/gc-flow.md) | Deletion safety, cleanup scenarios, dedup guarantees, integration test plan + results |
+| [Upload & Download](./UPLOAD-DOWNLOAD-ANALYSIS.md) | [Upload/Download Flows](./diagrams/upload-download-flow.md) | Token flows, chunked uploads, streaming, Range requests, ZIP, test coverage + gaps |
+| [Encryption](./ENCRYPTION-ANALYSIS.md) | [Encryption Flows](./diagrams/encryption-flow.md) | Key hierarchy, decrypt sessions, block formats, compromise scenarios, test coverage + gaps |
+| [Chunking](./CHUNKING-ANALYSIS.md) | [Chunking Flows](./diagrams/chunking-flow.md) | FastCDC, SHA-1/SHA-256 mapping, dedup scenarios, client comparison, test coverage + gaps |
+| [Architecture](./diagrams/security-architecture.mermaid.md) | (self) | Security controls, attack surface, auth flow, storage pipelines |
+| [Backend Reusability](./BACKEND-REUSABILITY-ANALYSIS.md) | (included) | Package coupling, god objects, refactoring roadmap |
+
 ---
 
 ## Executive Summary

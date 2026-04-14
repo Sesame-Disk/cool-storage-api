@@ -1,266 +1,169 @@
-# Upload & Download Analysis
+# Upload & Download — Preproduction Assessment
 
 **Date:** 2026-04-14
-**Scope:** All upload and download code paths — web UI, Seafile sync, mobile API,
-share links, ZIP downloads, and Range requests.
+**Diagrams:** [Upload/Download Flow Diagrams](./diagrams/upload-download-flow.md)
 
 ---
 
-## How uploads work
+## Issues found
 
-### Step 1: Get an upload token
+### HIGH: Zombie temp files from abandoned chunked uploads
 
-```
-GET /api2/repos/{repo_id}/upload-link/?p=/target/dir
-Authorization: Token {user-token}
+**File:** `internal/api/seafhttp.go` (HandleUpload, chunked path)
 
-Response: "https://server/seafhttp/upload-api/{32-char-token}"
-```
+When a client starts a chunked upload (Content-Range) and disconnects, the temp file
+(`/tmp/sesamefs_upload_{token}_{filename}`) is left on disk. There is no cleanup job.
+The upload token expires in 1 hour, but the temp file persists indefinitely.
 
-The server creates a random 16-byte token stored in Cassandra with a 1-hour TTL.
-The token encodes: org_id, repo_id, target path, user_id, source (web/link).
+**Impact:** Disk exhaustion on servers with high upload traffic. A malicious client could
+intentionally start many chunked uploads without completing them.
 
-**Checks at this step:**
-- User authenticated
-- User has write permission + upload flag on the library
-- If library is encrypted: decrypt session must be active
+**Fix:** Add a periodic sweeper that deletes temp files older than the token TTL (1h).
+Alternatively, use `os.CreateTemp` with a prefix and sweep by `mtime`.
 
-### Step 2: Upload the file
-
-```
-POST /seafhttp/upload-api/{token}
-Content-Type: multipart/form-data
-
-file=@myfile.txt
-parent_dir=/target/dir
-```
-
-**Checks at this step (re-validated):**
-- Token exists and hasn't expired
-- User still has write permission
-- Storage quota not exceeded (checked BEFORE reading body — fail fast)
-- Traffic quota not exceeded
-
-**Two paths depending on file size:**
-
-#### Small files (single request, no Content-Range)
-
-```
-Client → [full file in multipart form] → Server
-Server:
-  1. Read file into memory
-  2. SHA-1(plaintext) → block ID for fs_object
-  3. If encrypted: AES-256-CBC encrypt with library's file key
-  4. SHA-256(stored content) → S3 storage key
-  5. Store block in S3 (if not already there — dedup)
-  6. Create block ID mapping (SHA-1 ↔ SHA-256)
-  7. Increment block ref_count via LWT
-  8. Create fs_object with block_ids list
-  9. Add to parent directory, create commit
-  10. Update library head
-```
-
-#### Large files (chunked, Content-Range header)
-
-```
-Client → [chunk 1: bytes 0-8388607] → Server (writes to temp file)
-Client → [chunk 2: bytes 8388608-16777215] → Server (appends to temp file)
-...
-Client → [final chunk] → Server (temp file complete)
-
-Server finalization:
-  1. Read temp file in 8MB blocks
-  2. For each block: SHA-1, encrypt (if needed), SHA-256, store in S3
-  3. Accumulate block_ids list
-  4. Create fs_object, commit, update library head
-  5. Delete temp file
-```
-
-**Temp file location:** `/tmp/sesamefs_upload_{token}_{filename}`
-**Temp file permissions:** 0600 (owner only)
-**Temp file cleanup:** Explicit on success. On failure/crash: **left on disk** (no cleanup job).
-
-### Upload flow diagram
-
-```mermaid
-flowchart TD
-    Client["Client"] -->|"GET upload-link"| Token["Create upload token<br/>1h TTL, Cassandra"]
-    Token -->|"Return URL"| Client
-
-    Client -->|"POST with file"| Validate["Validate token<br/>+ re-check permissions<br/>+ quota pre-check"]
-    Validate -->|"Quota exceeded"| Reject["403"]
-
-    Validate -->|"OK"| Size{"File size?"}
-    Size -->|"Small"| RAM["Read into memory"]
-    Size -->|"Large (Content-Range)"| Temp["Write to temp file<br/>chunk by chunk"]
-    Temp -->|"All chunks received"| Finalize["Finalize: read temp<br/>in 8MB blocks"]
-
-    RAM --> Hash["SHA-1 plaintext<br/>SHA-256 stored content"]
-    Finalize --> Hash
-
-    Hash --> Encrypted{"Library encrypted?"}
-    Encrypted -->|Yes| Encrypt["AES-256-CBC encrypt<br/>with library file key"]
-    Encrypted -->|No| Store
-
-    Encrypt --> Store["S3 PutBlock<br/>(skip if dedup match)"]
-    Store --> Meta["Create fs_object<br/>+ commit + update head"]
-    Meta --> Response["200 OK"]
-```
+**Tested:** No. No test verifies temp file cleanup on failure or abandonment.
 
 ---
 
-## How downloads work
+### HIGH: No integration test for encrypted upload/download
 
-### Step 1: Get a download link
+There is no test that uploads a file to an encrypted library and downloads it back with
+content verification. The encryption path (`EncryptBlockSeafile` on upload,
+`DecryptBlock` on download) is only tested in unit tests with mock data.
 
-```
-GET /api2/repos/{repo_id}/file/?p=/path/to/file
-Authorization: Token {user-token}
+**Risk:** A regression in the encrypt→store→fetch→decrypt pipeline would not be caught
+until a customer reports corrupted files.
 
-Response: "https://server/seafhttp/files/{32-char-token}/filename.txt"
-```
+**Fix:** Add integration test: create encrypted library → set password → upload file →
+download → verify SHA-256 matches original content.
 
-Same token pattern as upload: random 16-byte, 1h TTL, encodes org/repo/path/user.
+---
 
-**Checks:** Auth, read permission, download flag, decrypt session (if encrypted).
+### MEDIUM: Permission not rechecked during chunked upload streaming
 
-### Step 2: Fetch the file
+**File:** `internal/api/seafhttp.go:626`
 
-```
-GET /seafhttp/files/{token}/filename.txt
-```
+The upload token is validated once at the start. If a user's permission is revoked
+while a large chunked upload is in progress (which can take minutes for multi-GB files),
+the upload completes successfully. The token has a 1-hour TTL.
 
-**Server flow:**
-1. Validate token (type = download)
-2. Re-check read permission
-3. Navigate commit tree to find file's fs_object
-4. Get block_ids from fs_object
-5. Resolve SHA-1 → SHA-256 via mapping table
-6. Stream blocks from S3 one at a time
+**Risk:** Low in practice (permission revocation during active upload is rare), but
+violates the principle that access checks happen at the time of action.
 
-### Download streaming (memory-efficient)
+**Tested:** No.
 
-```
-Block 0: [prefetch from S3] → [write to HTTP response] → [start prefetch block 1]
-Block 1: [prefetch from S3] → [write to HTTP response] → [start prefetch block 2]
-...
-```
+---
 
-**Memory usage:** O(2 blocks) — one being written, one being prefetched.
-Uses a pooled 4MB copy buffer for unencrypted blocks.
+### MEDIUM: No test for resumable/chunked upload
 
-For **encrypted libraries**: each block is loaded fully into memory, decrypted,
-then written. Memory = O(1 block) per block, typically 8–16 MB.
+No integration test sends Content-Range headers to simulate a multi-chunk upload.
+The entire chunked upload path (temp file creation, chunk assembly, finalization)
+has zero end-to-end coverage.
 
-### Download flow diagram
+**Fix:** Add integration test: upload a 1MB file in 4 chunks with Content-Range headers,
+verify the assembled file matches.
 
-```mermaid
-flowchart TD
-    Client["Client"] -->|"GET download link"| Token["Create download token"]
-    Token -->|"Return URL"| Client
+---
 
-    Client -->|"GET file"| Validate["Validate token<br/>+ permission check"]
-    Validate --> Tree["Navigate commit tree<br/>to fs_object"]
-    Tree --> Blocks["Get block_ids<br/>Resolve SHA-1 → SHA-256"]
-    Blocks --> Enc{"Encrypted?"}
+### MEDIUM: Dedup doesn't save network bandwidth (web UI)
 
-    Enc -->|No| Stream["Stream from S3<br/>4MB buffer, prefetch next"]
-    Enc -->|Yes| Decrypt["Load block → decrypt<br/>→ write to response"]
+**File:** `internal/api/seafhttp.go` (HandleUpload, single-shot path)
 
-    Stream --> Client2["Client receives file"]
-    Decrypt --> Client2
+When a user uploads a file via the web UI, the full file content is transferred over
+the network even if every block already exists in S3. The dedup check only happens
+at the S3 storage level (skip write if exists). The Seafile sync protocol avoids this
+with `check-blocks`, but the web UI doesn't.
+
+**Impact:** Wasted bandwidth for re-uploads of existing files. Not a bug, but a
+performance gap that affects users with large files.
+
+**Fix:** Consider a client-side hash check before upload, or a server-side
+`check-blocks` step in the web upload flow.
+
+---
+
+### MEDIUM: Encrypted files don't send Content-Length
+
+**File:** `internal/api/seafhttp.go:1648` (streamFileFromBlocks)
+
+For encrypted files, `Content-Length` is omitted because the decrypted size may
+differ from the stored (encrypted) size. Clients cannot show download progress bars.
+
+**Impact:** Poor UX for large encrypted file downloads.
+
+**Fix:** Pre-compute decrypted size by summing original file sizes from `fs_objects`
+(which stores plaintext size) and set Content-Length from that.
+
+---
+
+### LOW: Block integrity not verified on download
+
+**File:** `internal/storage/blocks.go` (GetBlock)
+
+Blocks are hashed (SHA-256) on upload but the hash is not re-verified on download.
+If S3 returns corrupted data, it is streamed to the client as-is.
+
+**Impact:** Silent data corruption. Mitigated by S3's own integrity guarantees,
+but no defense-in-depth at the application layer.
+
+**Fix:** Optional hash verification on download, or add an `X-Block-Hash` response
+header so clients can verify.
+
+---
+
+## Test coverage
+
+### Existing tests: 32
+
+| What's tested | Count | Type |
+|---------------|-------|------|
+| Upload/download round-trip (content verified) | 1 | Integration |
+| Upload overwrite, URL format, region pinning | 4 | Integration |
+| Permission enforcement (readonly, guest blocked) | 2 | Integration |
+| v2 direct upload | 1 | Integration |
+| File CRUD + batch operations | 7 | Integration |
+| History download (round-trip + errors) | 5 | Integration |
+| ZIP download (region-pinned) | 1 | Integration |
+| ZIP traversal limits (depth/count/bytes) | 3 | Unit |
+| Token lifecycle (create/get/expire/delete) | 8 | Unit |
+
+### Critical gaps: 8
+
+| Gap | Risk | What to add |
+|-----|------|-------------|
+| Encrypted file upload/download | High | Create encrypted lib → upload → download → verify content |
+| Chunked/resumable upload | High | Upload 1MB in 4 chunks via Content-Range → verify |
+| Large file (>100 MB) | Medium | Upload 100MB+ file, verify block count and download |
+| Concurrent upload to same path | Medium | Two clients upload simultaneously → verify no corruption |
+| Quota exhaustion behavior | Medium | Fill quota → verify upload rejected with correct error |
+| Expired token during download | Medium | Start download, expire token, verify behavior |
+| Range request (video seek) | Medium | Upload video → Range request → verify partial content |
+| Temp file cleanup on failure | Low | Start chunked upload, abandon, verify temp file cleaned |
+
+### How to run
+
+```bash
+# All upload/download integration tests
+go test -tags integration -v -run "TestUpload\|TestDownload\|TestFile\|TestHistory\|TestZip" \
+    -timeout 5m ./internal/integration/...
+
+# Unit tests only
+go test -v -run "TestToken\|TestZipTraversal" ./internal/api/...
 ```
 
 ---
 
-## Range requests (video/audio seeking)
+## Best practices check
 
-For video and audio files, the server supports HTTP 206 Partial Content via
-`BlockReadSeeker`:
-
-1. Client sends `Range: bytes=1000000-2000000`
-2. Server builds an index of cumulative block offsets
-3. Binary search to find which block contains byte 1,000,000
-4. Load that one block, seek within it, stream from there
-5. **Memory: O(1 block)** — only the needed block is in RAM
-
-For encrypted files: the entire block must be decrypted before seeking within it.
-Can't seek within an encrypted block.
-
----
-
-## Share link downloads (public, no auth)
-
-```
-GET /d/{share-token}/files/?p=/filename&dl=1
-```
-
-No user authentication needed. The share link token grants implicit read permission.
-Traffic is counted against the share link **creator** (not the downloader).
-
-Same block-streaming logic as regular downloads. Supports Range requests for video.
-
----
-
-## ZIP directory downloads
-
-```
-GET /seafhttp/zip/{token}
-```
-
-Recursively adds all files in a directory to a ZIP archive streamed to the client.
-
-**Limits (configurable):**
-- Max files: 100,000
-- Max depth: 64 levels
-- Max uncompressed size: 10 GB
-
-Uses `zip.Store` (no compression) for maximum throughput. Encrypted blocks are
-decrypted during ZIP creation.
-
----
-
-## Cleanup scenarios
-
-| Scenario | What happens | When | Risk |
-|----------|-------------|------|------|
-| Upload succeeds | Temp file deleted, blocks in S3 | Immediate | None |
-| Upload fails mid-chunk | Temp file left on disk | Until manual cleanup | Disk leak |
-| Client abandons chunked upload | Temp file persists, token expires in 1h | Token expires | Disk leak |
-| Permission revoked during upload | Upload completes (token still valid) | Token TTL | 1h window |
-| Decrypt session expires mid-download | Prefetched blocks use captured key; new blocks fail | During stream | Partial file |
-| S3 unavailable during download | HTTP 500 to client | Immediate | Retry needed |
-| Network drop during download | Partial file received | Immediate | Client retries |
-
----
-
-## Edge cases and known issues
-
-1. **Zombie temp files:** Chunked uploads that never complete leave files in `/tmp`.
-   No server-side cleanup job exists. Recommendation: add a periodic sweeper for
-   files older than token TTL (1h).
-
-2. **Dedup doesn't save bandwidth:** If a block already exists in S3, the upload
-   still transfers the full content over the network before checking. The dedup
-   check only saves S3 storage, not network bandwidth. For network savings, use
-   the check-blocks endpoint first (Seafile sync protocol does this).
-
-3. **Encrypted file Content-Length:** Omitted for encrypted files because the
-   decrypted size may differ from stored size. Clients can't show progress bars.
-
-4. **No upload resume after token expiry:** If a chunked upload takes >1h, the
-   token expires. The temp file is orphaned. Client must restart from scratch.
-
----
-
-## Memory usage summary
-
-| Operation | Max RAM | Notes |
-|-----------|---------|-------|
-| Small file upload | File size | Read fully into memory |
-| Chunked upload (receiving) | ~8 MB | Per chunk, written to disk |
-| Chunked upload (finalizing) | ~8 MB | Processes temp file in 8MB blocks |
-| File download (unencrypted) | ~8 MB | 4MB buffer + 1 prefetched block |
-| File download (encrypted) | ~32 MB | 2 blocks in flight (decrypt requires full block) |
-| Range request | ~16 MB | 1 block loaded for seeking |
-| ZIP download | ~16 MB | 1 block at a time per file |
+| Practice | Status |
+|----------|--------|
+| Auth checked before any I/O | Yes (token validated first) |
+| Quota checked before reading body | Yes (fail-fast) |
+| File size limited | Only by quota (no hard max) |
+| Temp files in secure location | Yes (/tmp, 0600 perms) |
+| Temp files cleaned on success | Yes |
+| Temp files cleaned on failure | **No** |
+| Traffic recorded accurately | Yes (fire-and-forget) |
+| Streaming uses bounded memory | Yes (4MB buffer pool) |
+| Encrypted blocks never written to disk | Yes (memory only) |
+| Download tokens are single-use | No (reusable within TTL — acceptable) |
