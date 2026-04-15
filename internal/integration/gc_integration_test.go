@@ -454,41 +454,61 @@ func TestGC_ScannerOrphanRecovery(t *testing.T) {
 	t.Log("Scanner orphan recovery: block re-enqueued for GC — correct")
 }
 
+// getGCGracePeriod reads the configured grace period from the admin status API.
+// Returns 0 if the field is absent or the server is too old to expose it.
+func getGCGracePeriod(t *testing.T) time.Duration {
+	t.Helper()
+	resp := superadminClient.Get(t, "/api/v2.1/admin/gc/status")
+	if resp.StatusCode != http.StatusOK {
+		return 0
+	}
+	var body map[string]interface{}
+	decodeJSON(t, resp, &body)
+	if gps, ok := body["grace_period_seconds"].(float64); ok {
+		return time.Duration(gps) * time.Second
+	}
+	return 0
+}
+
 // TestGC_GracePeriodEnforcement verifies that the GC worker does not process
 // items that are within the grace period.
 func TestGC_GracePeriodEnforcement(t *testing.T) {
 	requireGCEnabled(t)
 	requireCassandra(t)
 
+	gracePeriod := getGCGracePeriod(t)
+	if gracePeriod == 0 {
+		t.Skip("grace_period_seconds=0 in server config — grace period enforcement is disabled; skipping")
+	}
+	t.Logf("Grace period configured: %v", gracePeriod)
+
 	repoID := createTestLibrary(t, adminClient, fmt.Sprintf("inttest-gc-grace-%d", time.Now().UnixNano()))
 	orgID := resolveOrgID(t, repoID)
 
-	// Upload and delete
 	_, blockID := uploadUniqueFile(t, adminClient, repoID, "grace.txt", "/")
 	batchDeleteFiles(t, adminClient, repoID, "/", []string{"grace.txt"})
 
-	// Wait for enqueue
+	// Wait for ref_count to drop to 0 and the GC candidate to be created.
 	ok := pollUntil(t, 20*time.Second, 200*time.Millisecond, func() bool {
-		return readBlockRefCount(t, orgID, blockID) <= 0
+		return readBlockRefCount(t, orgID, blockID) <= 0 && gcCandidateExists(t, orgID, blockID)
 	})
 	if !ok {
-		t.Fatalf("ref_count did not reach 0")
+		t.Fatalf("block did not reach ref_count=0 + gc_candidate within timeout (rc=%d, candidate=%v)",
+			readBlockRefCount(t, orgID, blockID), gcCandidateExists(t, orgID, blockID))
 	}
+	enqueuedAt := time.Now()
 
-	// Trigger GC immediately — block should still exist if grace period > 0
+	// Trigger GC immediately — the candidate was enqueued mere milliseconds ago,
+	// which is well within any non-zero grace period. The worker must skip it.
 	triggerGCWorker(t)
 
-	// Check block status
-	exists := blockExistsInDB(t, orgID, blockID)
-	rc := readBlockRefCount(t, orgID, blockID)
-
-	if exists && rc <= 0 {
-		t.Log("Grace period: block exists with ref_count<=0 after immediate GC trigger — grace period holding")
-	} else if !exists {
-		t.Log("Grace period: block already deleted — grace period may be 0 in dev config (acceptable)")
-	} else {
-		t.Logf("Grace period: block ref_count=%d — unexpected state", rc)
+	elapsed := time.Since(enqueuedAt)
+	if !blockExistsInDB(t, orgID, blockID) {
+		t.Fatalf("CRITICAL: grace period not enforced — block deleted ~%v after enqueue (grace_period=%v)",
+			elapsed, gracePeriod)
 	}
+	t.Logf("Grace period enforcement: block correctly preserved ~%v after enqueue (grace_period=%v) — correct",
+		elapsed, gracePeriod)
 }
 
 // TestGC_QueueSizeTracking verifies the admin API reports queue size changes.

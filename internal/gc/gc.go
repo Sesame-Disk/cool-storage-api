@@ -47,12 +47,13 @@ func (s *Stats) LastScanRun() time.Time {
 
 // GCStatus is the JSON response for the admin status endpoint.
 type GCStatus struct {
-	Enabled            bool   `json:"enabled"`
-	DryRun             bool   `json:"dry_run"`
-	LastWorkerRun      string `json:"last_worker_run"`
-	LastScanRun        string `json:"last_scan_run"`
-	QueueSize          int    `json:"queue_size"`
-	BlocksDeletedTotal int64  `json:"blocks_deleted_total"`
+	Enabled              bool   `json:"enabled"`
+	DryRun               bool   `json:"dry_run"`
+	LastWorkerRun        string `json:"last_worker_run"`
+	LastScanRun          string `json:"last_scan_run"`
+	QueueSize            int    `json:"queue_size"`
+	BlocksDeletedTotal   int64  `json:"blocks_deleted_total"`
+	GracePeriodSeconds   int64  `json:"grace_period_seconds"`
 }
 
 // Service is the top-level GC orchestrator.
@@ -246,6 +247,7 @@ func (s *Service) Status() GCStatus {
 		LastScanRun:        formatTime(lastScan),
 		QueueSize:          queueSize,
 		BlocksDeletedTotal: s.stats.BlocksDeleted(),
+		GracePeriodSeconds: int64(s.config.GracePeriod.Seconds()),
 	}
 }
 
