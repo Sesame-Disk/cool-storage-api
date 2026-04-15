@@ -249,6 +249,85 @@ func TestChangePassword_Validation(t *testing.T) {
 	}
 }
 
+// TestSetPassword_RateLimitedReturns429 verifies that the handler returns 429
+// with a Retry-After header when the per-actor limiter is active.
+func TestSetPassword_RateLimitedReturns429(t *testing.T) {
+	lim := &PasswordRateLimiter{store: newMemoryAttemptsStore(), now: time.Now}
+	actorKey := "u:user-1"
+	repoID := "543f7a13-7145-4d85-a768-8c91755cfb77"
+	for i := 0; i < softFailureThreshold; i++ {
+		if err := lim.RecordFailure(repoID, actorKey); err != nil {
+			t.Fatalf("RecordFailure: %v", err)
+		}
+	}
+
+	h := &EncryptionHandler{rateLimiter: lim}
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Set("user_id", "user-1")
+	c.Set("org_id", "00000000-0000-0000-0000-000000000001")
+	c.Params = gin.Params{{Key: "repo_id", Value: repoID}}
+
+	form := url.Values{}
+	form.Set("password", "SomePassword123")
+	c.Request = httptest.NewRequest(http.MethodPost, "/", strings.NewReader(form.Encode()))
+	c.Request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	h.SetPassword(c)
+
+	if w.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusTooManyRequests)
+	}
+	if ra := w.Header().Get("Retry-After"); ra == "" {
+		t.Fatal("Retry-After header missing on 429 response")
+	}
+	var resp map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+	if _, ok := resp["error_msg"]; !ok {
+		t.Error("response body missing error_msg field")
+	}
+	if _, ok := resp["retry_after_seconds"]; !ok {
+		t.Error("response body missing retry_after_seconds field")
+	}
+}
+
+// TestChangePassword_RateLimitedReturns429 verifies the same 429 path for the
+// ChangePassword handler.
+func TestChangePassword_RateLimitedReturns429(t *testing.T) {
+	lim := &PasswordRateLimiter{store: newMemoryAttemptsStore(), now: time.Now}
+	actorKey := "u:user-1"
+	repoID := "543f7a13-7145-4d85-a768-8c91755cfb77"
+	for i := 0; i < softFailureThreshold; i++ {
+		if err := lim.RecordFailure(repoID, actorKey); err != nil {
+			t.Fatalf("RecordFailure: %v", err)
+		}
+	}
+
+	h := &EncryptionHandler{rateLimiter: lim}
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Set("user_id", "user-1")
+	c.Set("org_id", "00000000-0000-0000-0000-000000000001")
+	c.Params = gin.Params{{Key: "repo_id", Value: repoID}}
+
+	form := url.Values{}
+	form.Set("old_password", "OldPassword123")
+	form.Set("new_password", "NewPassword456")
+	c.Request = httptest.NewRequest(http.MethodPut, "/", strings.NewReader(form.Encode()))
+	c.Request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	h.ChangePassword(c)
+
+	if w.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusTooManyRequests)
+	}
+	if ra := w.Header().Get("Retry-After"); ra == "" {
+		t.Fatal("Retry-After header missing on 429 response")
+	}
+}
+
 func TestEncryptionHandler_RequireLibraryAccess_RepoToken(t *testing.T) {
 	h := &EncryptionHandler{permMiddleware: middleware.NewPermissionMiddleware(nil)}
 
@@ -436,36 +515,6 @@ func TestEncryptionVersion(t *testing.T) {
 	}
 	if crypto.EncVersionSeafileV2 != 2 {
 		t.Errorf("EncVersionSeafileV2 = %d, want 2", crypto.EncVersionSeafileV2)
-	}
-}
-
-// TestPasswordMinLength tests password validation constants
-func TestPasswordMinLength(t *testing.T) {
-	// Seafile default minimum is 8 characters
-	minLen := 8
-
-	validPasswords := []string{
-		"12345678",
-		"Password123!",
-		"abcdefghijklmnop",
-	}
-
-	invalidPasswords := []string{
-		"1234567",
-		"abc",
-		"",
-	}
-
-	for _, pwd := range validPasswords {
-		if len(pwd) < minLen {
-			t.Errorf("Password %q should be valid (len=%d >= %d)", pwd, len(pwd), minLen)
-		}
-	}
-
-	for _, pwd := range invalidPasswords {
-		if len(pwd) >= minLen {
-			t.Errorf("Password %q should be invalid (len=%d < %d)", pwd, len(pwd), minLen)
-		}
 	}
 }
 
