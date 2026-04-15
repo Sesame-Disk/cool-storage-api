@@ -2,9 +2,6 @@ import { SeafileAPI } from 'seafile-js';
 import { serviceURL } from './constants';
 import { quotaWarningInterceptor } from './quota-warning';
 import {
-  getAuthToken,
-  isAuthenticated as authStateIsAuthenticated,
-  setAuthTokenAndCookie,
   clearAuth,
   redirectToLogin,
 } from './auth-state';
@@ -15,6 +12,13 @@ const BYPASS_LOGIN = process.env.REACT_APP_BYPASS_LOGIN === 'true';
 const BYPASS_TOKEN = 'dev-token-admin'; // Default admin token for testing
 
 let seafileAPI = new SeafileAPI();
+
+function initCookieBackedAPI(server) {
+  seafileAPI.initForSeahubUsage({ siteRoot: server + '/', xcsrfHeaders: '' });
+  if (seafileAPI.req) {
+    seafileAPI.req.defaults.withCredentials = true;
+  }
+}
 
 function normalizeAccountInfo(data = {}) {
   const email = data.email || data.contact_email || data.login_id || '';
@@ -76,38 +80,37 @@ function setupResponseInterceptor() {
   );
 }
 
-// Initialize with token from localStorage/cookie if available
+// Initialize the browser client against the backend cookie-backed session.
 function initAPI() {
-  let token = getAuthToken();
   const server = serviceURL || window.location.origin;
 
-  // If bypass is enabled and no token stored, use the bypass token
-  if (BYPASS_LOGIN && !token) {
-    token = BYPASS_TOKEN;
-    setAuthTokenAndCookie(token);
+  if (BYPASS_LOGIN) {
+    seafileAPI.init({ server, token: BYPASS_TOKEN });
+  } else {
+    initCookieBackedAPI(server);
   }
 
-  if (token) {
-    // Token-based authentication for SesameFS
-    seafileAPI.init({ server, token });
-  } else {
-    // Initialize without auth for anonymous access (e.g. share link views)
-    // Use initForSeahubUsage which creates this.req without requiring a token
-    seafileAPI.initForSeahubUsage({ siteRoot: server + '/', xcsrfHeaders: '' });
-  }
   // Set up global 401 interceptor after this.req is created
   setupResponseInterceptor();
 }
 
-// Check if user is authenticated
-function isAuthenticated() {
+async function hasActiveSession() {
   if (BYPASS_LOGIN) {
     return true;
   }
-  return authStateIsAuthenticated();
+
+  const server = serviceURL || window.location.origin;
+  try {
+    const response = await fetch(server + '/api2/auth/ping/', {
+      credentials: 'same-origin',
+    });
+    return response.ok;
+  } catch (err) {
+    return false;
+  }
 }
 
-// Login and store token
+// Legacy password login is kept in-memory only for the current page lifetime.
 async function login(username, password) {
   const server = serviceURL || window.location.origin;
 
@@ -142,12 +145,10 @@ async function login(username, password) {
   const data = await response.json();
 
   if (data.token) {
-    // The backend's /api2/auth-token/ response does NOT set the sesamefs_auth
-    // cookie — that only happens on the OIDC exchange endpoint. For this
-    // legacy password-login path we persist the token in localStorage and
-    // let future requests use the Authorization header.
-    setAuthTokenAndCookie(data.token);
     seafileAPI.init({ server, token: data.token });
+    if (seafileAPI.req) {
+      seafileAPI.req.defaults.withCredentials = true;
+    }
     setupResponseInterceptor();
     return data;
   }
@@ -178,29 +179,44 @@ async function logout() {
 
   // Fallback: just clear local state and redirect to login.
   clearAuth();
-  window.location.href = '/login/';
+  redirectToLogin('required', '/');
 }
 
-// Get stored token (delegates to auth-state — single source of truth).
-function getToken() {
-  return getAuthToken();
-}
-
-// Set auth token (used after OIDC login).
-//
-// IMPORTANT: does NOT write the `sesamefs_auth` cookie. The backend already set
-// it via Set-Cookie on the OIDC exchange response in the correct `email@token`
-// format. Overwriting it from JS (as the old code did) would corrupt the
-// format and cause the server to reject it.
-function setAuthToken(token) {
+// Invalidate only the local SesameFS session and clear client auth state.
+// This intentionally does NOT log out from the OIDC provider, so a follow-up
+// OIDC login can reuse the current Accounts browser session.
+async function invalidateSession() {
   const server = serviceURL || window.location.origin;
-  setAuthTokenAndCookie(token);
-  seafileAPI.init({ server, token });
+
+  try {
+    await fetch(server + '/api/v2.1/auth/session/', {
+      method: 'DELETE',
+      credentials: 'same-origin',
+    });
+  } catch (err) {
+    // Best-effort local logout. We still clear client state below.
+  }
+
+  clearAuth();
+}
+
+// Browser sessions are cookie-backed. Do not expose the session token to JS.
+function getToken() {
+  return BYPASS_LOGIN ? BYPASS_TOKEN : null;
+}
+
+// Reinitialize the client after OIDC login. The backend session cookie is the
+// source of truth; the returned token is intentionally not persisted in JS.
+function setAuthToken(_token) {
+  const server = serviceURL || window.location.origin;
+  initCookieBackedAPI(server);
   setupResponseInterceptor();
 }
 
 // Initialize on load
 initAPI();
+
+seafileAPI.invalidateSession = invalidateSession;
 
 // ============================================================================
 // OIDC API methods - for SSO authentication
@@ -1368,7 +1384,7 @@ seafileAPI.updateShareLinkPassword = function (token, newPassword) {
   return this.req.put(url, { password: newPassword === null || newPassword === '' ? '__remove__' : newPassword });
 };
 
-export { seafileAPI, isAuthenticated, login, logout, getToken, setAuthToken, initAPI };
+export { seafileAPI, hasActiveSession, login, logout, invalidateSession, getToken, setAuthToken, initAPI };
 
 // ============================================================================
 // Upload Link API methods (for public upload link pages)

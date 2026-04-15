@@ -3,7 +3,7 @@ import PropTypes from 'prop-types';
 import moment from 'moment';
 import { Dropdown, DropdownToggle, DropdownMenu, DropdownItem } from 'reactstrap';
 import { gettext, siteRoot, serviceURL } from '../../utils/constants';
-import { seafileAPI, getToken } from '../../utils/seafile-api';
+import { seafileAPI } from '../../utils/seafile-api';
 import { Utils } from '../../utils/utils';
 import { buildHistoricFileViewURL } from '../../utils/file-view-url';
 import Loading from '../loading';
@@ -57,11 +57,10 @@ class FileHistoryPanel extends React.Component {
   };
 
   fetchDirect = (repoID, filePath, page) => {
-    const token = getToken();
     const server = serviceURL || window.location.origin;
 
     fetch(`${server}/api2/repo/file_revisions/${repoID}/?p=${encodeURIComponent(filePath)}&page=${page}&per_page=${this.perPage}`, {
-      headers: { 'Authorization': `Token ${token}` }
+      credentials: 'same-origin'
     })
       .then(response => {
         if (!response.ok) throw new Error('Failed to fetch history');
@@ -109,9 +108,8 @@ class FileHistoryPanel extends React.Component {
 
   onView = (item) => {
     const { repoID, filePath } = this.props;
-    const token = getToken();
 
-    const viewUrl = buildHistoricFileViewURL({ repoID, filePath, objID: item.rev_file_id, token });
+    const viewUrl = buildHistoricFileViewURL({ repoID, filePath, objID: item.rev_file_id });
     window.open(viewUrl);
   };
 
@@ -154,11 +152,10 @@ class FileHistoryPanel extends React.Component {
 
   onDownload = (item) => {
     const { repoID, filePath } = this.props;
-    const token = getToken();
 
     if (item.rev_file_id) {
       // Use the history download endpoint with the FS object ID
-      const params = `obj_id=${item.rev_file_id}&p=${encodeURIComponent(filePath)}` + (token ? `&token=${token}` : '');
+      const params = `obj_id=${item.rev_file_id}&p=${encodeURIComponent(filePath)}`;
       const downloadUrl = `${siteRoot}repo/${repoID}/history/download?${params}`;
       window.open(downloadUrl);
       return;
@@ -169,7 +166,7 @@ class FileHistoryPanel extends React.Component {
     const apiUrl = `${server}/api2/repos/${repoID}/file/?p=${encodeURIComponent(filePath)}`;
 
     fetch(apiUrl, {
-      headers: { 'Authorization': `Token ${token}` }
+      credentials: 'same-origin'
     })
       .then(response => {
         if (!response.ok) throw new Error('Failed to get download link');

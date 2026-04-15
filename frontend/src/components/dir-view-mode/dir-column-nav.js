@@ -10,7 +10,6 @@ import CreateFolder from '../../components/dialog/create-folder-dialog';
 import CreateFile from '../../components/dialog/create-file-dialog';
 import ImageDialog from '../../components/dialog/image-dialog';
 import { siteRoot, thumbnailSizeForOriginal } from '../../utils/constants';
-import { getToken } from '../../utils/seafile-api';
 import { Utils } from '../../utils/utils';
 import { buildFileViewURL } from '../../utils/file-view-url';
 
@@ -208,11 +207,6 @@ class DirColumnNav extends React.Component {
         src = `${siteRoot}thumbnail/${repoID}/${thumbnailSizeForOriginal}${path}`;
       } else {
         src = `${siteRoot}repo/${repoID}/raw${path}`;
-      }
-
-      const token = getToken();
-      if (token) {
-        src += (src.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(token);
       }
 
       return {

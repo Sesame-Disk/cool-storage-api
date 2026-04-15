@@ -4,7 +4,7 @@ import moment from 'moment';
 import { navigate, Link } from '@gatsbyjs/reach-router';
 import { Dropdown, DropdownToggle, DropdownMenu, DropdownItem } from 'reactstrap';
 import { gettext, siteRoot, serviceURL } from '../../utils/constants';
-import { seafileAPI, getToken } from '../../utils/seafile-api';
+import { seafileAPI } from '../../utils/seafile-api';
 import Loading from '../../components/loading';
 import toaster from '../../components/toast';
 import ConflictDialog from '../../components/dialog/conflict-dialog';
@@ -72,13 +72,10 @@ class FileHistory extends React.Component {
   };
 
   fetchHistoryDirect = (repoID, filePath, page) => {
-    const token = getToken();
     const server = serviceURL || window.location.origin;
 
     fetch(`${server}/api2/repo/file_revisions/${repoID}/?p=${encodeURIComponent(filePath)}&page=${page}&per_page=${this.perPage}`, {
-      headers: {
-        'Authorization': `Token ${token}`,
-      }
+      credentials: 'same-origin'
     })
       .then(response => {
         if (!response.ok) throw new Error('Failed to fetch history');
@@ -170,18 +167,16 @@ class FileHistory extends React.Component {
   onView = (item) => {
     const { repoID } = this.props;
     const { filePath } = this.state;
-    const token = getToken();
 
-    const viewUrl = buildHistoricFileViewURL({ repoID, filePath, objID: item.rev_file_id, token });
+    const viewUrl = buildHistoricFileViewURL({ repoID, filePath, objID: item.rev_file_id });
     window.open(viewUrl);
   };
 
   onDownload = (item) => {
     const { repoID } = this.props;
     const { filePath } = this.state;
-    const token = getToken();
 
-    const params = `obj_id=${item.rev_file_id}&p=${encodeURIComponent(filePath)}` + (token ? `&token=${token}` : '');
+    const params = `obj_id=${item.rev_file_id}&p=${encodeURIComponent(filePath)}`;
     const downloadUrl = `${siteRoot}repo/${repoID}/history/download?${params}`;
     window.open(downloadUrl);
   };

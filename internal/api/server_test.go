@@ -78,6 +78,55 @@ func TestHandlePing(t *testing.T) {
 	}
 }
 
+func TestAuthPingRequiresAuthentication(t *testing.T) {
+	t.Run("legacy api2 auth ping accepts authenticated request", func(t *testing.T) {
+		s := createTestServer()
+		s.router.GET("/api2/auth/ping", s.authMiddleware(), s.handlePing)
+
+		req := httptest.NewRequest(http.MethodGet, "/api2/auth/ping", nil)
+		req.Header.Set("Authorization", "Token test-token-123")
+		w := httptest.NewRecorder()
+		s.router.ServeHTTP(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want %d", w.Code, http.StatusOK)
+		}
+		if w.Body.String() != "pong" {
+			t.Fatalf("body = %q, want %q", w.Body.String(), "pong")
+		}
+	})
+
+	t.Run("api v2.1 auth ping accepts authenticated request", func(t *testing.T) {
+		s := createTestServer()
+		s.router.GET("/api/v2.1/auth/ping", s.authMiddleware(), s.handlePing)
+
+		req := httptest.NewRequest(http.MethodGet, "/api/v2.1/auth/ping", nil)
+		req.Header.Set("Authorization", "Token test-token-123")
+		w := httptest.NewRecorder()
+		s.router.ServeHTTP(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want %d", w.Code, http.StatusOK)
+		}
+		if w.Body.String() != "pong" {
+			t.Fatalf("body = %q, want %q", w.Body.String(), "pong")
+		}
+	})
+
+	t.Run("auth ping rejects unauthenticated request", func(t *testing.T) {
+		s := createTestServer()
+		s.router.GET("/api/v2.1/auth/ping", s.authMiddleware(), s.handlePing)
+
+		req := httptest.NewRequest(http.MethodGet, "/api/v2.1/auth/ping", nil)
+		w := httptest.NewRecorder()
+		s.router.ServeHTTP(w, req)
+
+		if w.Code != http.StatusUnauthorized {
+			t.Fatalf("status = %d, want %d", w.Code, http.StatusUnauthorized)
+		}
+	})
+}
+
 // TestHandleHealth tests the health endpoint (via health.Checker)
 func TestHandleHealth(t *testing.T) {
 	s := createTestServer()

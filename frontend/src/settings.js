@@ -2,7 +2,6 @@ import React from 'react';
 import ReactDom from 'react-dom';
 import { navigate } from '@gatsbyjs/reach-router';
 import { siteRoot, mediaUrl, logoPath, logoHeight, siteTitle } from './utils/constants';
-import { getToken } from './utils/seafile-api';
 import CommonToolbar from './components/toolbar/common-toolbar';
 import SettingsContent from './components/user-settings/settings-content';
 
@@ -17,8 +16,7 @@ class Settings extends React.Component {
       let url = siteRoot + 'library/' + selectedItem.repo_id + '/' + selectedItem.repo_name + selectedItem.path;
       navigate(url, { repalce: true });
     } else {
-      const token = getToken();
-      let url = buildFileViewURL({ repoID: selectedItem.repo_id, filePath: selectedItem.path, token });
+      let url = buildFileViewURL({ repoID: selectedItem.repo_id, filePath: selectedItem.path });
       let newWindow = window.open('about:blank');
       newWindow.location.href = url;
     }

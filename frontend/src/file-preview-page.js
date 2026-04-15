@@ -3,7 +3,8 @@ import ReactDOM from 'react-dom';
 
 import 'bootstrap/dist/css/bootstrap.min.css';
 
-import { getAuthToken, isAuthenticated, redirectToLogin } from './utils/auth-state';
+import { redirectToLogin } from './utils/auth-state';
+import { hasActiveSession } from './utils/seafile-api';
 import PDFViewer from './components/pdf-viewer';
 
 const IMAGE_EXTENSIONS = new Set(['png', 'jpg', 'jpeg', 'gif', 'bmp', 'webp', 'svg', 'ico', 'tiff', 'tif']);
@@ -60,36 +61,22 @@ function getQueryState() {
     return { repoID, filePath, objectID };
 }
 
-function buildRawURL({ repoID, filePath, objectID, token }) {
+function buildRawURL({ repoID, filePath, objectID }) {
     if (objectID) {
         const params = new URLSearchParams({ obj_id: objectID, p: filePath });
-        if (token) {
-            params.set('token', token);
-        }
         return `/repo/${repoID}/history/raw?${params.toString()}`;
     }
 
-    let url = `/repo/${repoID}/raw${encodePath(filePath)}`;
-    if (token) {
-        url += `?token=${encodeURIComponent(token)}`;
-    }
-    return url;
+    return `/repo/${repoID}/raw${encodePath(filePath)}`;
 }
 
-function buildDownloadURL({ repoID, filePath, objectID, token }) {
+function buildDownloadURL({ repoID, filePath, objectID }) {
     if (objectID) {
         const params = new URLSearchParams({ obj_id: objectID, p: filePath });
-        if (token) {
-            params.set('token', token);
-        }
         return `/repo/${repoID}/history/download?${params.toString()}`;
     }
 
-    let url = `/lib/${repoID}/file${encodePath(filePath)}?dl=1`;
-    if (token) {
-        url += `&token=${encodeURIComponent(token)}`;
-    }
-    return url;
+    return `/lib/${repoID}/file${encodePath(filePath)}?dl=1`;
 }
 
 function renderCenteredMessage(title, message) {
@@ -103,15 +90,15 @@ function renderCenteredMessage(title, message) {
 
 function FilePreviewPage() {
     const [{ repoID, filePath, objectID }] = useState(() => getQueryState());
+    const [sessionReady, setSessionReady] = useState(false);
     const [textContent, setTextContent] = useState(null);
     const [textLoading, setTextLoading] = useState(false);
     const [textError, setTextError] = useState('');
 
-    const token = useMemo(() => getAuthToken(), []);
     const fileName = useMemo(() => getFileName(filePath), [filePath]);
     const extension = useMemo(() => getFileExtension(fileName), [fileName]);
-    const rawURL = useMemo(() => buildRawURL({ repoID, filePath, objectID, token }), [repoID, filePath, objectID, token]);
-    const downloadURL = useMemo(() => buildDownloadURL({ repoID, filePath, objectID, token }), [repoID, filePath, objectID, token]);
+    const rawURL = useMemo(() => buildRawURL({ repoID, filePath, objectID }), [repoID, filePath, objectID]);
+    const downloadURL = useMemo(() => buildDownloadURL({ repoID, filePath, objectID }), [repoID, filePath, objectID]);
     const isHistoric = !!objectID;
 
     useEffect(() => {
@@ -119,13 +106,28 @@ function FilePreviewPage() {
     }, [fileName]);
 
     useEffect(() => {
-        if (!isAuthenticated()) {
-            redirectToLogin('required');
-        }
+        let cancelled = false;
+
+        hasActiveSession().then((loggedIn) => {
+            if (cancelled) {
+                return;
+            }
+
+            if (!loggedIn) {
+                redirectToLogin('required');
+                return;
+            }
+
+            setSessionReady(true);
+        });
+
+        return () => {
+            cancelled = true;
+        };
     }, []);
 
     useEffect(() => {
-        if (!TEXT_EXTENSIONS.has(extension)) {
+        if (!sessionReady || !TEXT_EXTENSIONS.has(extension)) {
             return undefined;
         }
 
@@ -165,6 +167,10 @@ function FilePreviewPage() {
 
     if (!repoID || !filePath || !fileName) {
         return renderCenteredMessage(gettext('Preview unavailable'), gettext('The file preview request is missing required information.'));
+    }
+
+    if (!sessionReady) {
+        return renderCenteredMessage(gettext('Loading preview'), gettext('Checking your session...'));
     }
 
     let content = (

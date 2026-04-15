@@ -38,6 +38,14 @@ SesameFS uses organization-level roles:
 
 `owner` is not a separate field. It is a normal role value with higher privileges.
 
+### 2.2.1 Owner vs admin policy for the Accounts dashboard
+
+- The effective role hierarchy is `superadmin > owner > admin > user > readonly > guest`.
+- Both `owner` and `admin` are org-staff-level roles for SesameFS org-admin read surfaces.
+- Ownership transfer is a special operation. On the org-admin fallback surface, only the current `owner` or a platform `superadmin` can initiate it.
+- On the org-admin fallback surface, only a platform `superadmin` can directly modify or delete the current `owner`.
+- Accounts should not rely on the platform admin API to infer which human operator initiated the action. Accounts calls SesameFS with a platform service credential, so Accounts must enforce its own owner-versus-admin product policy in its own backend and UI.
+
 ### 2.3 Lifecycle model
 
 User lifecycle is separate from role:
@@ -91,6 +99,50 @@ Authorization: Token <raw_api_key>
 
 Accounts should not use browser session flows for provisioning.
 
+### 3.1 Browser login and SSO handoff for end users
+
+For human browser login into SesameFS, the low-level OIDC start endpoint is:
+
+#### `GET /auth/oidc/login/`
+
+Query parameters:
+
+- `redirect_uri` optional, but should normally be the SesameFS web callback such as `https://files.example.com/sso/`
+- `return_url` optional
+
+Response:
+
+```json
+{
+  "authorization_url": "https://accounts.example.com/openid/authorize?...",
+  "redirect_uri": "https://files.example.com/sso/"
+}
+```
+
+Important current behavior:
+
+- `redirect_uri` must be allowlisted in SesameFS OIDC configuration via `OIDC_REDIRECT_URIS`.
+- The standard web callback is `/sso/`. The frontend callback page then exchanges the code with `POST /api/v2.1/auth/oidc/callback/`.
+- The current web frontend stores the post-login destination in SesameFS browser `sessionStorage` and uses that client-side value after `/sso/` completes.
+- Accounts should not assume that passing `return_url` to `GET /auth/oidc/login/` by itself is enough to drive the final browser redirect after login.
+- There is now a dedicated public SesameFS URL whose purpose is "start browser SSO immediately for this user and preserve the next path": `GET /login/sso/?next=/desired/path/`.
+- There is currently no first-class support on this endpoint for forwarding IdP-specific parameters such as `login_hint`, `prompt`, or account-selection hints.
+
+Security properties of `GET /login/sso/`:
+
+- The `next` value is validated client-side to a site-relative path only. Absolute URLs and protocol-relative URLs are rejected and collapse to `/`.
+- The route clears only the local SesameFS session before starting OIDC. It does not perform IdP logout.
+- The actual OIDC redirect target still goes through SesameFS backend validation. The backend-generated authorization URL is based on a `redirect_uri` that must be present in the configured OIDC redirect allowlist.
+- The route is safe for one-click handoff from Accounts because it does not accept an external destination and does not trust Accounts to provide a raw IdP URL.
+
+Practical guidance for Accounts today:
+
+1. For service-to-service provisioning and admin operations, use the API-key-backed admin API only.
+2. For human browser login into SesameFS, Accounts can now use the direct entrypoint `https://files.example.com/login/sso/?next=/desired/path/`.
+3. `GET /login/sso/` clears the current local SesameFS session, preserves the site-relative `next` target, and immediately starts the browser OIDC flow.
+4. This local logout does not log the user out of the Accounts IdP. That is intentional: it forces SesameFS to re-authenticate against the current Accounts browser session.
+5. The older login shell entrypoint `https://files.example.com/login/?next=/` still works, but it is no longer required for one-click SSO handoff from Accounts.
+
 ## 4. Recommended High-Level Flows
 
 ### 4.1 Organization bootstrap after signup
@@ -140,6 +192,14 @@ Important contract rules:
 - SesameFS opens all Accounts links in a new tab and shows an external-link icon.
 - SesameFS keeps local views for org-member quotas, quota usage, owned libraries, shared libraries, and other storage-domain data.
 - SesameFS appends query parameters to the base URL so Accounts can route the operator to the right screen or pre-open the right workflow.
+- When `org_user_writes_disabled=true`, the current org-admin frontend already uses this contract in code. Accounts should treat these query parameters as the live UI integration contract, not as a future proposal.
+
+Accounts responsibility for org-admin user management:
+
+- All organization-member identity workflows should now live in Accounts.
+- That includes add user, invite users, add admin, transfer ownership, search users, manage user, edit name, edit contact email, activate/deactivate, delete, restore, reset password, and revoke admin.
+- SesameFS should remain the read surface for storage-domain data and quota details on the member profile, but not the source of truth for identity writes.
+- Accounts should respond to the emitted query parameters by rendering the corresponding organization dashboard view or pre-opening the requested workflow for the target user.
 
 Query parameters SesameFS appends:
 
@@ -184,6 +244,14 @@ Recommended mappings from SesameFS UI to Accounts URLs:
 - Revoke org-admin role: `view=user&action=revoke-admin&user_email=...`
 
 This gives Accounts one stable org-member base route and lets SesameFS derive all external user-management links without hardcoding many different Accounts paths.
+
+Current frontend coverage using this contract:
+
+- Org users list action bar: add user, invite users, transfer ownership.
+- Org admins list action bar: add admin.
+- Org user profile and side navigation: manage user, edit name, edit contact email.
+- Org user row overflow actions: manage user, activate/deactivate, delete, restore, reset password, revoke admin.
+- Org user search page: search users with `query` and `status` propagated.
 
 ## 5. Endpoints Accounts Should Use
 
@@ -702,6 +770,7 @@ These are not required for the current Accounts dashboard, but they are useful f
 - add webhook or polling reconciliation for out-of-band Accounts-side user changes if direct API orchestration is not always synchronous
 - add an org-scoped admin restore route under `/admin/organizations/:org_id/users/:email/restore/` if Accounts wants full symmetry in the platform admin surface
 - add an explicit Accounts-oriented organization membership API if future ergonomics matter more than Seafile compatibility
+- extend the existing `/login/sso/` handoff route only if future product requirements need safe support for `login_hint`, `prompt`, or account-selection hints
 
 ## 12. Current Boundary Summary
 

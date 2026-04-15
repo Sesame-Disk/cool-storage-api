@@ -1,4 +1,5 @@
 import React from 'react';
+import { getLoginURL } from '../utils/auth-state';
 
 function getDefaultAppConfig() {
     return {
@@ -283,6 +284,15 @@ export async function loadBootstrap(scope = 'app') {
     }
 }
 
+export function getBootstrapPermissions() {
+    const permissions = window.__SESAMEFS_BOOTSTRAP__?.permissions;
+    if (!permissions || typeof permissions.isAuthenticated !== 'boolean') {
+        return null;
+    }
+
+    return permissions;
+}
+
 export function BootstrapLoadError({ message, title }) {
     return (
         <div id="main" className="d-flex align-items-center justify-content-center min-vh-100">
@@ -309,8 +319,7 @@ export function getBootstrapErrorProps(data) {
 }
 
 export function AdminAccessDenied({ message, title }) {
-    const next = encodeURIComponent(window.location.pathname + window.location.search + window.location.hash);
-    const loginUrl = `${window.app?.config?.loginUrl || '/login/'}?next=${next}`;
+    const loginUrl = getLoginURL('required');
 
     return (
         <div id="main" className="d-flex align-items-center justify-content-center min-vh-100">
@@ -325,6 +334,24 @@ export function AdminAccessDenied({ message, title }) {
 
 export function getAdminDeniedProps(data, scope) {
     if (data?.bootstrapError) {
+        if (data.status === 401) {
+            return {
+                title: window.gettext('Authentication required'),
+                message: scope === 'org'
+                    ? window.gettext('Log in to continue to the organization admin panel.')
+                    : window.gettext('Log in to continue to the system admin panel.'),
+            };
+        }
+
+        if (data.status === 403) {
+            return {
+                title: window.gettext('Permission denied'),
+                message: scope === 'org'
+                    ? window.gettext('Your account does not have organization admin access for this panel.')
+                    : window.gettext('Your account does not have system admin access for this panel.'),
+            };
+        }
+
         return getBootstrapErrorProps(data);
     }
 

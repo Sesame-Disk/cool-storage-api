@@ -4,7 +4,6 @@ import PropTypes from 'prop-types';
 import { gettext } from '../../utils/constants';
 import { Utils } from '../../utils/utils';
 import { siteRoot, mediaUrl, logoPath, logoHeight, siteTitle } from '../../utils/constants';
-import { getToken } from '../../utils/seafile-api';
 import CommonToolbar from '../../components/toolbar/common-toolbar';
 import SettingsContent from '../../components/user-settings/settings-content';
 
@@ -16,8 +15,7 @@ const SettingsPage = ({ onSearchedClick }) => {
             return;
         }
 
-        const token = getToken();
-        const url = siteRoot + 'lib/' + selectedItem.repo_id + '/file' + Utils.encodePath(selectedItem.path) + (token ? '?token=' + encodeURIComponent(token) : '');
+        const url = siteRoot + 'lib/' + selectedItem.repo_id + '/file' + Utils.encodePath(selectedItem.path);
         const newWindow = window.open('about:blank');
         newWindow.location.href = url;
     });

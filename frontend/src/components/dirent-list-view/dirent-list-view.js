@@ -1,7 +1,6 @@
 import React, { Fragment } from 'react';
 import PropTypes from 'prop-types';
 import { siteRoot, gettext, username, enableSeadoc, thumbnailSizeForOriginal } from '../../utils/constants';
-import { getToken } from '../../utils/seafile-api';
 import { Utils } from '../../utils/utils';
 import TextTranslation from '../../utils/text-translation';
 import URLDecorator from '../../utils/url-decorator';
@@ -174,11 +173,6 @@ class DirentListView extends React.Component {
       src = `${siteRoot}thumbnail/${repoID}/${thumbnailSizeForOriginal}${path}`;
     } else {
       src = `${siteRoot}repo/${repoID}/raw${path}`;
-    }
-
-    const token = getToken();
-    if (token) {
-      src += (src.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(token);
     }
 
     return {

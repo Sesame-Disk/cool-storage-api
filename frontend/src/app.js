@@ -4,10 +4,13 @@ import { Router, navigate } from '@gatsbyjs/reach-router';
 import MediaQuery from 'react-responsive';
 import { Modal } from 'reactstrap';
 import { siteRoot } from './utils/constants';
+import { redirectToLogin } from './utils/auth-state';
 import { Utils } from './utils/utils';
+import { getBootstrapPermissions } from './bootstrap/runtime-bootstrap';
 import { buildFileViewURL } from './utils/file-view-url';
-import { isAuthenticated, seafileAPI, getToken } from './utils/seafile-api';
+import { hasActiveSession, seafileAPI } from './utils/seafile-api';
 import LoginPage from './pages/login';
+import LoginSSOPage from './pages/login-sso';
 import SSOPage from './pages/sso';
 import SystemNotification from './components/system-notification';
 import QuotaBanner from './components/quota-banner';
@@ -71,6 +74,7 @@ class App extends Component {
       isCheckingAuth: true,
       isLoggedIn: false,
       isSSOCallback: false,
+      isDirectSSOStart: false,
     };
     this.dirViewPanels = ['my-libs', 'shared-libs', 'org']; // and group
     window.onpopstate = this.onpopstate;
@@ -101,11 +105,19 @@ class App extends Component {
   };
 
   componentDidMount() {
-    // Check authentication status
-    const loggedIn = isAuthenticated();
     const pathname = window.location.pathname;
     const isLoginPage = pathname === '/login/' || pathname === '/login';
+    const isDirectSSOPage = pathname === '/login/sso/' || pathname === '/login/sso';
     const isSSOPage = pathname === '/sso/' || pathname === '/sso';
+
+    if (isDirectSSOPage) {
+      this.setState({
+        isCheckingAuth: false,
+        isLoggedIn: false,
+        isDirectSSOStart: true,
+      });
+      return;
+    }
 
     // SSO page handles its own auth flow
     if (isSSOPage) {
@@ -117,41 +129,40 @@ class App extends Component {
       return;
     }
 
-    if (!loggedIn && !isLoginPage) {
-      // Redirect to login if not authenticated, preserving the original URL
-      const next = encodeURIComponent(window.location.pathname + window.location.search + window.location.hash);
-      window.location.href = '/login/?next=' + next;
-      return;
-    }
+    const bootstrapPermissions = getBootstrapPermissions();
+    const initialAuthCheck = bootstrapPermissions
+      ? Promise.resolve(bootstrapPermissions.isAuthenticated)
+      : hasActiveSession();
 
-    if (loggedIn && isLoginPage) {
-      // Redirect to home if already authenticated and on login page
-      window.location.href = '/';
-      return;
-    }
+    initialAuthCheck.then((loggedIn) => {
+      if (!loggedIn && !isLoginPage) {
+        redirectToLogin('required');
+        return;
+      }
 
-    this.setState({
-      isCheckingAuth: false,
-      isLoggedIn: loggedIn,
+      if (loggedIn && isLoginPage) {
+        window.location.href = '/';
+        return;
+      }
+
+      this.setState({
+        isCheckingAuth: false,
+        isLoggedIn: loggedIn,
+      });
+
+      if (!loggedIn) {
+        return;
+      }
+
+      if (window.app?.pageOptions?.bootstrapReady !== true) {
+        this.loadUserPermissions();
+      }
+
+      this.navigateClientUrlToLib();
+
+      let href = window.location.href.split('/');
+      this.setState({ currentTab: href[href.length - 2] });
     });
-
-    if (!loggedIn) {
-      return; // Don't initialize app state for login page
-    }
-
-    // Bootstrap is the primary source of truth for page options.
-    // Keep account/info only as a fallback if bootstrap did not hydrate the page.
-    if (window.app?.pageOptions?.bootstrapReady !== true) {
-      this.loadUserPermissions();
-    }
-
-    // url from client  e.g. http://127.0.0.1:8000/#common/lib/34e7fb92-e91d-499d-bcde-c30ea8af9828/
-    // navigate to library page http://127.0.0.1:8000/library/34e7fb92-e91d-499d-bcde-c30ea8af9828/
-    this.navigateClientUrlToLib();
-
-    // Extract current tab from URL path segment
-    let href = window.location.href.split('/');
-    this.setState({ currentTab: href[href.length - 2] });
   }
 
   loadUserPermissions = () => {
@@ -230,8 +241,7 @@ class App extends Component {
       let url = siteRoot + 'library/' + selectedItem.repo_id + '/' + selectedItem.repo_name + selectedItem.path;
       navigate(url, { repalce: true });
     } else {
-      const token = getToken();
-      let url = buildFileViewURL({ repoID: selectedItem.repo_id, filePath: selectedItem.path, token });
+      let url = buildFileViewURL({ repoID: selectedItem.repo_id, filePath: selectedItem.path });
       let isWeChat = Utils.isWeChat();
       if (!isWeChat) {
         let newWindow = window.open('about:blank');
@@ -320,7 +330,7 @@ class App extends Component {
   };
 
   render() {
-    let { currentTab, isSidePanelClosed, isCheckingAuth, isLoggedIn, isSSOCallback } = this.state;
+    let { currentTab, isSidePanelClosed, isCheckingAuth, isLoggedIn, isSSOCallback, isDirectSSOStart } = this.state;
     const normalizedPath = window.location.pathname.replace(/\/+$/, '') || '/';
     const normalizedSiteRoot = siteRoot === '/' ? '' : siteRoot.replace(/\/+$/, '');
     const settingsRoutePath = `${normalizedSiteRoot}/profile`;
@@ -338,6 +348,10 @@ class App extends Component {
     // Show SSO callback page
     if (isSSOCallback) {
       return <SSOPage />;
+    }
+
+    if (isDirectSSOStart) {
+      return <LoginSSOPage />;
     }
 
     // Show login page if not authenticated

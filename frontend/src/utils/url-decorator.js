@@ -1,6 +1,5 @@
 import { siteRoot, historyRepoID } from './constants';
 import { Utils } from './utils';
-import { getToken } from './seafile-api';
 
 class URLDecorator {
 
@@ -10,14 +9,11 @@ class URLDecorator {
     switch (options.type) {
       case 'download_historic_file': {
         params = 'obj_id=' + options.objID + '&p=' + Utils.encodePath(options.filePath);
-        const historyToken = getToken();
-        url = siteRoot + 'repo/' + historyRepoID + '/history/download?' + params + (historyToken ? '&token=' + historyToken : '');
+        url = siteRoot + 'repo/' + historyRepoID + '/history/download?' + params;
         break;
       }
       case 'download_file_url':
-        // Include auth token in URL for downloads (opens in new tab without headers)
-        const token = getToken();
-        url = siteRoot + 'lib/' + options.repoID + '/file' + Utils.encodePath(options.filePath) + '?dl=1' + (token ? '&token=' + token : '');
+        url = siteRoot + 'lib/' + options.repoID + '/file' + Utils.encodePath(options.filePath) + '?dl=1';
         break;
       case 'file_revisions':
         params = 'p=' + Utils.encodePath(options.filePath);

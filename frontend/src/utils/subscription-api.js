@@ -1,22 +1,10 @@
-import axios from 'axios';
 import cookie from 'react-cookies';
 import { siteRoot } from './constants';
+import { initAxiosForSeahubUsage } from './seahub-client';
 
 class SubscriptionAPI {
   initForSeahubUsage({ siteRoot, xcsrfHeaders }) {
-    if (siteRoot && siteRoot.charAt(siteRoot.length - 1) === '/') {
-      var server = siteRoot.substring(0, siteRoot.length - 1);
-      this.server = server;
-    } else {
-      this.server = siteRoot;
-    }
-
-    this.req = axios.create({
-      headers: {
-        'X-CSRFToken': xcsrfHeaders,
-      }
-    });
-    return this;
+    return initAxiosForSeahubUsage(this, { siteRoot, xcsrfHeaders });
   }
 
   getSubscription() {

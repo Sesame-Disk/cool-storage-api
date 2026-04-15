@@ -50,26 +50,18 @@ export function buildFrontendFilePreviewURL({ repoID, filePath, objID }) {
     return url;
 }
 
-export function buildFileViewURL({ repoID, filePath, token }) {
+export function buildFileViewURL({ repoID, filePath }) {
     if (isInlinePreviewableFile(filePath)) {
         return buildFrontendFilePreviewURL({ repoID, filePath });
     }
 
-    let url = `${siteRoot}lib/${repoID}/file${encodePath(filePath)}`;
-    if (token) {
-        url += `?token=${encodeURIComponent(token)}`;
-    }
-    return url;
+    return `${siteRoot}lib/${repoID}/file${encodePath(filePath)}`;
 }
 
-export function buildHistoricFileViewURL({ repoID, filePath, objID, token }) {
+export function buildHistoricFileViewURL({ repoID, filePath, objID }) {
     if (isInlinePreviewableFile(filePath)) {
         return buildFrontendFilePreviewURL({ repoID, filePath, objID });
     }
 
-    let url = `${siteRoot}repo/${repoID}/history/view?obj_id=${encodeURIComponent(objID)}&p=${encodeURIComponent(filePath)}`;
-    if (token) {
-        url += `&token=${encodeURIComponent(token)}`;
-    }
-    return url;
+    return `${siteRoot}repo/${repoID}/history/view?obj_id=${encodeURIComponent(objID)}&p=${encodeURIComponent(filePath)}`;
 }

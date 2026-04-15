@@ -155,6 +155,8 @@ func (s *Server) registerAPIV21Routes(serverURL string) {
 	v2.RegisterAuthRoutes(apiV21, s.db, s.config, s.authRateLimiter.Limit())
 	apiV21.GET("/bootstrap/", s.handleBootstrap)
 	apiV21.GET("/bootstrap", s.handleBootstrap)
+	apiV21.GET("/auth/ping", s.authMiddleware(), s.handlePing)
+	apiV21.GET("/auth/ping/", s.authMiddleware(), s.handlePing)
 
 	protected := apiV21.Group("")
 	protected.Use(s.authMiddleware())

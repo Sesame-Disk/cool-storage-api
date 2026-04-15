@@ -35,10 +35,10 @@ describe('file-view-url helpers', () => {
 
     test('falls back to legacy backend routes when preview is not frontend-owned yet', () => {
         expect(buildFileViewURL({ repoID: 'repo-1', filePath: '/office/report.docx', token: 'secret' }))
-            .toBe('/lib/repo-1/file/office/report.docx?token=secret');
+            .toBe('/lib/repo-1/file/office/report.docx');
 
         expect(buildHistoricFileViewURL({ repoID: 'repo-1', filePath: '/office/report.docx', objID: 'obj-9', token: 'secret' }))
-            .toBe('/repo/repo-1/history/view?obj_id=obj-9&p=%2Foffice%2Freport.docx&token=secret');
+            .toBe('/repo/repo-1/history/view?obj_id=obj-9&p=%2Foffice%2Freport.docx');
     });
 
     test('uses frontend preview shell for previewable historic files', () => {

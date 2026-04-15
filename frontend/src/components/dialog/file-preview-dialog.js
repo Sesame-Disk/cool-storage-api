@@ -1,7 +1,6 @@
 import React from 'react';
 import PropTypes from 'prop-types';
 import { gettext, siteRoot } from '../../utils/constants';
-import { getToken } from '../../utils/seafile-api';
 import { Utils } from '../../utils/utils';
 
 import '../../css/file-preview-dialog.css';
@@ -51,23 +50,13 @@ class FilePreviewDialog extends React.Component {
   getRawURL = () => {
     const { repoID, filePath } = this.props;
     const path = Utils.encodePath(filePath);
-    let url = `${siteRoot}repo/${repoID}/raw${path}`;
-    const token = getToken();
-    if (token) {
-      url += '?token=' + encodeURIComponent(token);
-    }
-    return url;
+    return `${siteRoot}repo/${repoID}/raw${path}`;
   };
 
   getDownloadURL = () => {
     const { repoID, filePath } = this.props;
     const path = Utils.encodePath(filePath);
-    let url = `${siteRoot}lib/${repoID}/file${path}?dl=1`;
-    const token = getToken();
-    if (token) {
-      url += '&token=' + encodeURIComponent(token);
-    }
-    return url;
+    return `${siteRoot}lib/${repoID}/file${path}?dl=1`;
   };
 
   getFileExt = () => {
@@ -153,7 +142,7 @@ class FilePreviewDialog extends React.Component {
       return (
         <div className="file-preview-content file-preview-media">
           <img src={previewURL} alt={fileName}
-            style={{maxWidth: '90vw', maxHeight: '80vh', objectFit: 'contain', borderRadius: '4px'}}
+            style={{ maxWidth: '90vw', maxHeight: '80vh', objectFit: 'contain', borderRadius: '4px' }}
             onError={() => {
               // If image fails, try as PDF iframe
               this.setState({ iworkPreviewType: 'pdf' });

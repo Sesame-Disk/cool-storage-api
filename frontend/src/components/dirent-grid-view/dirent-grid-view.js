@@ -3,7 +3,7 @@ import PropTypes from 'prop-types';
 import { navigate } from '@gatsbyjs/reach-router';
 import { siteRoot, username, enableSeadoc, thumbnailSizeForOriginal } from '../../utils/constants';
 import { Utils } from '../../utils/utils';
-import { seafileAPI, getToken } from '../../utils/seafile-api';
+import { seafileAPI } from '../../utils/seafile-api';
 import URLDecorator from '../../utils/url-decorator';
 import Loading from '../loading';
 import ModalPortal from '../modal-portal';
@@ -363,11 +363,6 @@ class DirentGridView extends React.Component {
       src = `${siteRoot}thumbnail/${repoID}/${thumbnailSizeForOriginal}${path}`;
     } else {
       src = `${siteRoot}repo/${repoID}/raw${path}`;
-    }
-
-    const token = getToken();
-    if (token) {
-      src += (src.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(token);
     }
 
     return {

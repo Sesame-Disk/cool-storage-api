@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { seafileAPI, setAuthToken } from '../../utils/seafile-api';
-import { getReturnURL } from '../../utils/auth-state';
+import { clearReturnURL, getReturnURL, redirectToLogin } from '../../utils/auth-state';
 import { siteTitle } from '../../utils/constants';
 import '../login/login.css';
 
@@ -15,8 +15,8 @@ import '../login/login.css';
  * 3. User is redirected to OIDC provider (e.g., t-accounts.sesamedisk.com)
  * 4. User authenticates and is redirected back to /sso?code=xxx&state=yyy
  * 5. This page extracts code/state, exchanges via backend API
- * 6. Backend returns session token
- * 7. Token is stored in localStorage, user is redirected to dashboard
+ * 6. Backend creates the browser session cookie and returns session metadata
+ * 7. Frontend reinitializes the cookie-backed client and redirects to dashboard
  */
 function SSOPage() {
   const [status, setStatus] = useState('processing');
@@ -57,19 +57,7 @@ function SSOPage() {
       const response = await seafileAPI.exchangeOIDCCode(code, state, redirectURI);
 
       if (response.data && response.data.token) {
-        // Store the session token in localStorage. Importantly, setAuthToken
-        // does NOT write the sesamefs_auth cookie — the backend already set
-        // it via Set-Cookie in the OIDC exchange response with the canonical
-        // `email@token` format. Writing it again from JS would corrupt it.
         setAuthToken(response.data.token);
-
-        // Store additional user info if needed
-        if (response.data.email) {
-          localStorage.setItem('sesamefs_user_email', response.data.email);
-        }
-        if (response.data.name) {
-          localStorage.setItem('sesamefs_user_name', response.data.name);
-        }
 
         setStatus('success');
 
@@ -94,8 +82,8 @@ function SSOPage() {
 
   const handleRetry = () => {
     // Drop any half-consumed return URL and go back to login.
-    try { sessionStorage.removeItem('sso_return_url'); } catch (e) { /* ignore */ }
-    window.location.href = '/login/';
+    clearReturnURL();
+    redirectToLogin('required', '/');
   };
 
   return (

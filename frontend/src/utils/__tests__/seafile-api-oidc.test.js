@@ -13,7 +13,7 @@
  *
  * Also modified:
  * - logout() - Now supports OIDC Single Logout (SLO)
- * - setAuthToken(token) - Store token after OIDC login
+ * - setAuthToken(token) - Reinitialize the cookie-backed client after OIDC login
  */
 
 const fs = require('fs');
@@ -25,7 +25,7 @@ const getSeafileApiContent = () => {
   return fs.readFileSync(filePath, 'utf8');
 };
 
-// Read the auth-state.js file (single source of truth for token storage)
+// Read the auth-state.js file (single source of truth for browser auth state)
 const getAuthStateContent = () => {
   const filePath = path.join(__dirname, '..', 'auth-state.js');
   return fs.readFileSync(filePath, 'utf8');
@@ -150,7 +150,7 @@ describe('OIDC API Methods in seafile-api.js', () => {
     test('logout function clears auth state through auth-state helper', () => {
       const authStateContent = getAuthStateContent();
       expect(apiContent).toMatch(/logout[\s\S]*?clearAuth\(/);
-      expect(authStateContent).toMatch(/clearAuth[\s\S]*?localStorage\.removeItem\(TOKEN_KEY\)/);
+      expect(authStateContent).toMatch(/clearAuth[\s\S]*?document\.cookie\s*=\s*AUTH_COOKIE/);
     });
 
     test('logout function redirects to OIDC logout URL if available', () => {
@@ -159,8 +159,8 @@ describe('OIDC API Methods in seafile-api.js', () => {
     });
 
     test('logout function falls back to local logout if OIDC fails', () => {
-      // Should have a try-catch and fallback to /login/
-      expect(apiContent).toMatch(/logout[\s\S]*?catch[\s\S]*?window\.location\.href.*\/login\//);
+      // Should have a try-catch and fallback through the shared login redirect helper.
+      expect(apiContent).toMatch(/logout[\s\S]*?catch[\s\S]*?redirectToLogin\(/);
     });
   });
 
@@ -170,14 +170,12 @@ describe('OIDC API Methods in seafile-api.js', () => {
       expect(apiContent).toMatch(/function\s+setAuthToken\s*\(/);
     });
 
-    test('setAuthToken delegates token persistence to auth-state', () => {
-      const authStateContent = getAuthStateContent();
-      expect(apiContent).toMatch(/setAuthToken[\s\S]*?setAuthTokenAndCookie/);
-      expect(authStateContent).toMatch(/setAuthTokenAndCookie[\s\S]*?localStorage\.setItem\(TOKEN_KEY, token\)/);
+    test('setAuthToken reinitializes the cookie-backed client', () => {
+      expect(apiContent).toMatch(/setAuthToken[\s\S]*?initCookieBackedAPI/);
     });
 
-    test('setAuthToken reinitializes seafileAPI', () => {
-      expect(apiContent).toMatch(/setAuthToken[\s\S]*?seafileAPI\.init/);
+    test('setAuthToken no longer writes browser session tokens to localStorage', () => {
+      expect(apiContent).not.toMatch(/setAuthToken[\s\S]*?localStorage\.setItem/);
     });
 
     test('setAuthToken is exported', () => {
@@ -279,16 +277,27 @@ describe('OIDC API Endpoint Patterns', () => {
   });
 });
 
-describe('Token Storage', () => {
+describe('Browser Session Handling', () => {
 
-  test('TOKEN_KEY constant exists in auth-state', () => {
+  test('auth-state keeps the backend session cookie name', () => {
     const content = getAuthStateContent();
-    expect(content).toMatch(/const\s+TOKEN_KEY\s*=\s*['"]sesamefs_auth_token['"]/);
+    expect(content).toMatch(/const\s+AUTH_COOKIE\s*=\s*['"]sesamefs_auth['"]/);
   });
 
-  test('isAuthenticated function exists', () => {
+  test('hasActiveSession function exists', () => {
     const content = getSeafileApiContent();
-    expect(content).toMatch(/function\s+isAuthenticated\s*\(/);
+    expect(content).toMatch(/async\s+function\s+hasActiveSession\s*\(/);
+  });
+
+  test('hasActiveSession validates the backend session with auth ping', () => {
+    const content = getSeafileApiContent();
+    expect(content).toMatch(/hasActiveSession[\s\S]*?\/api2\/auth\/ping\//);
+    expect(content).toMatch(/hasActiveSession[\s\S]*?credentials:\s*['"]same-origin['"]/);
+  });
+
+  test('the web frontend no longer persists sesamefs_auth_token', () => {
+    const content = getAuthStateContent();
+    expect(content).not.toMatch(/sesamefs_auth_token/);
   });
 
   test('getToken function exists', () => {
@@ -298,7 +307,7 @@ describe('Token Storage', () => {
 
   test('authentication functions are exported', () => {
     const content = getSeafileApiContent();
-    expect(content).toMatch(/export\s*\{[\s\S]*?isAuthenticated[\s\S]*?\}/);
+    expect(content).toMatch(/export\s*\{[\s\S]*?hasActiveSession[\s\S]*?\}/);
     expect(content).toMatch(/export\s*\{[\s\S]*?login[\s\S]*?\}/);
     expect(content).toMatch(/export\s*\{[\s\S]*?logout[\s\S]*?\}/);
     expect(content).toMatch(/export\s*\{[\s\S]*?getToken[\s\S]*?\}/);
