@@ -11,7 +11,11 @@
 
 **All critical and high-severity security findings from v1-v3 have been resolved.** The remaining open items are limited to medium-severity compatibility constraints (PBKDF2 iterations for Seafile compatibility), architectural improvements needed for multi-node deployments (distributed session revocation), and frontend dependency updates.
 
-**NEW in v4:** Comprehensive multiregion storage analysis reveals that while the architecture includes sophisticated multiregion support with health-aware failover, **several critical production-readiness gaps exist** that would prevent graceful degradation when a region fails. Key issues: no automated health monitoring, untested failover chains, no partial-failure handling in upload/download paths, and missing integration tests for cross-region scenarios.
+**NEW in v4:** Comprehensive multiregion storage analysis with code audit and testing. Key findings:
+- ✅ **Good news:** Upload/download paths DO use health-aware backend selection (`GetHealthyBlockStore()`)
+- ❌ **Critical gap:** No automated health monitoring - backends remain `HealthUnknown` until user requests fail
+- ⚠️ **Testing gap:** Failover logic exists but edge cases (chains, circular) untested; no integration tests for region failures
+- **Conclusion:** Architecture is solid, but missing automated health checks prevents proactive failover
 
 ---
 
@@ -76,6 +80,8 @@
 
 ### Issues Found
 
+**Note:** Analysis methodology included code audit (`grep`, reading implementation files) and local testing where possible. Some claims were corrected after code inspection revealed the actual implementation differs from initial assumptions.
+
 #### HIGH: No automated health monitoring for storage backends
 
 **Files:** `internal/storage/storage.go` (CheckHealth, CheckAllHealth), `internal/api/server.go` (no background health checker initialization)
@@ -121,49 +127,30 @@ The `Manager` has `CheckHealth()` and `CheckAllHealth()` methods that perform ac
 
 ---
 
-#### HIGH: Upload and download paths don't use health-aware backend selection
+#### ~~HIGH: Upload and download paths don't use health-aware backend selection~~ — FALSE
 
-**Files:** `internal/storage/blocks.go` (PutBlock, GetBlock), `internal/api/v2/storage_blocks.go` (upload/download handlers)
+**Files:** `internal/api/v2/files.go`, `internal/api/v2/blocks.go`, `internal/api/seafhttp.go`, `internal/api/sync.go`
 
-When a library is pinned to a specific `storage_class` (e.g., `hot-s3-eu`), the upload and download handlers call:
-- `manager.GetBlockStore(library.StorageClass)` — returns the BlockStore for that specific class **without checking health**
+**Original claim:** Upload and download paths don't use health-aware backend selection.
 
-The health-aware method `GetHealthyBlockStore(preferredClass)` exists (line 459-471) but is **never used** in production code paths.
+**Actual finding:** This claim was **INCORRECT**. Code audit shows `GetHealthyBlockStore()` IS used in production paths:
 
-**Current behavior:**
-```go
-// internal/api/v2/storage_blocks.go (upload handler)
-blockStore, err := s.storageManager.GetBlockStore(library.StorageClass)
-// Does NOT check health, does NOT trigger failover
+**Evidence:**
+```bash
+$ grep -rn "GetHealthyBlockStore" internal/api/
+internal/api/v2/files.go:149:		return h.storageManager.GetHealthyBlockStore(preferredClass)
+internal/api/v2/onlyoffice.go:152:		return h.storageManager.GetHealthyBlockStore(preferredClass)
+internal/api/v2/blocks.go:74:	blockStore, actualClass, err := h.storageManager.GetHealthyBlockStore(storageClass)
+internal/api/v2/storage_resolution.go:53:		return storageManager.GetHealthyBlockStore(preferredClass)
+internal/api/seafhttp.go:749:		return h.storageManager.GetHealthyBlockStore(preferredClass)
+internal/api/sync.go:773:			blockStore, _, err = h.storageManager.GetHealthyBlockStore(fallbackClass)
+internal/api/sync.go:892:		blockStore, storageClass, err = h.storageManager.GetHealthyBlockStore(preferredClass)
+internal/api/sync.go:1032:		blockStore, _, err = h.storageManager.GetHealthyBlockStore(preferredClass)
 ```
 
-**Expected behavior:**
-```go
-blockStore, actualClass, err := s.storageManager.GetHealthyBlockStore(library.StorageClass)
-if actualClass != library.StorageClass {
-    log.Printf("Failover: library %s storage %s → %s", library.ID, library.StorageClass, actualClass)
-}
-```
+**Conclusion:** Health-aware backend selection **IS implemented** in upload/download paths. The failover logic exists and is used.
 
-**Risk:** When a region fails:
-1. Library has `storage_class="hot-s3-eu"` (EU region S3)
-2. EU S3 goes down
-3. Upload request calls `GetBlockStore("hot-s3-eu")` → returns EU backend
-4. S3 Put fails with network timeout (30s wait per request)
-5. **Failover is never attempted** because the health-aware code path wasn't used
-6. User gets error; no automatic recovery
-
-**Impact:**
-- All uploads/downloads for EU-pinned libraries fail until manual intervention
-- Even if `failover_class: "hot-s3-usa"` is configured, it's never used
-- Cascading timeouts if many requests pile up
-
-**Fix:**
-1. Replace `GetBlockStore()` with `GetHealthyBlockStore()` in all file operation handlers
-2. Update library's `storage_class` in DB if failover is used (optional: for permanent migration)
-3. Add request-scoped logging: `X-Storage-Class-Used: hot-s3-usa` header to indicate failover
-
-**Tested:** No. No test verifies that when a backend is marked unhealthy, file operations automatically failover to the configured `failover_class`.
+**Remaining issue:** Failover only works if health status is updated. Without automated health monitoring (see HIGH issue above), backends remain `HealthUnknown` until an actual error occurs, meaning first user request after a failure will still hit the failed backend.
 
 ---
 
@@ -595,13 +582,13 @@ health = storageManager.CheckHealth(context.Background(), "hot-s3-usa")
 | Category | Grade | Notes |
 |----------|-------|-------|
 | **Architecture** | A | Excellent design: region classes, failover chains, health tracking |
-| **Implementation** | C | Core logic exists but critical paths don't use it |
+| **Implementation** | B | Health-aware failover IS used; missing automated monitoring |
 | **Testing** | D | Basic unit tests; zero failover integration tests |
 | **Observability** | F | No metrics, no monitoring, no alerting for region health |
 | **Resilience** | D | Failover exists but untested; no automated health checks |
 | **Operations** | D | No migration tools, no region quotas, no admin visibility |
 
-**Overall: C-** — Good architectural foundation, significant implementation and testing gaps prevent production deployment.
+**Overall: B-** — Good architectural foundation, health-aware failover implemented. Critical gap: no automated health monitoring (prevents proactive failover). Testing gaps prevent production deployment.
 
 ---
 
@@ -613,14 +600,16 @@ health = storageManager.CheckHealth(context.Background(), "hot-s3-usa")
    - Background goroutine calling `CheckAllHealth()` every 30s
    - Update health status based on probe results
    - Increment `ConsecutiveFails` on errors
+   - **Critical:** Without this, failover only happens AFTER first user request fails
 
-2. **Use health-aware backend selection in file operations**
-   - Replace `GetBlockStore()` with `GetHealthyBlockStore()` in upload/download handlers
-   - Test failover with real backend failures (stop MinIO container, verify recovery)
-
-3. **Add circular failover detection**
+2. **Add circular failover detection**
    - Track visited backends in recursive `GetHealthyBackend()` calls
    - Return error instead of infinite loop
+
+3. **Test failover with real backend failures**
+   - Stop MinIO container, verify health check detects failure
+   - Upload when primary unhealthy → verify automatic failover succeeds
+   - Download from failed region → verify failover retrieves data
 
 4. **Add cross-region integration tests**
    - Upload when primary down → verify failover
@@ -661,18 +650,33 @@ health = storageManager.CheckHealth(context.Background(), "hot-s3-usa")
 
 **Security posture (v1-v3 findings):** ✅ Production-ready. All critical and high-severity issues resolved.
 
-**Multiregion resilience:** ⚠️ **Not production-ready**. The architecture is well-designed with sophisticated multiregion support, but critical implementation gaps exist:
-- No automated health monitoring (regions can fail silently)
-- Upload/download paths don't use failover logic
-- Zero integration tests for failover scenarios
-- No observability for region health
+**Multiregion resilience:** ⚠️ **Not production-ready without automated health monitoring**.
 
-**Recommendation:** Do not deploy to multiregion production until items 1-5 above are implemented and tested. Single-region deployments with external monitoring are safe to proceed.
+**What was verified:**
+- ✅ Code audit confirmed `GetHealthyBlockStore()` IS used in upload/download paths (original claim was incorrect)
+- ✅ Health check logic exists (`CheckHealth()`, `CheckAllHealth()`)
+- ✅ Failover logic exists and is recursive
+- ❌ No automated background health monitoring found in startup code
+- ❌ No integration tests for failover scenarios
+- ❌ No storage health metrics exposed
+
+**Corrected findings:**
+1. **FALSE CLAIM RETRACTED:** "Upload/download don't use health-aware selection" → They DO use `GetHealthyBlockStore()`
+2. **TRUE:** No automated health monitoring - backends stay `HealthUnknown` until errors occur
+3. **TRUE:** Failover chains untested (no circular detection, no multi-level tests)
+4. **TRUE:** No cross-region integration tests
+5. **TRUE:** No Prometheus metrics for storage health
+
+**Key insight:** The architecture and implementation are actually solid. The main gap is the missing **automated health monitoring background goroutine**. Without it, failover only triggers after a user request fails (reactive, not proactive).
+
+**Recommendation:** Multiregion production deployment safe AFTER implementing automated health monitoring (item #1). The failover logic already exists and is used correctly.
 
 **Timeline estimate:**
 - Must-fix items (1-5): 2-3 days development + 2 days testing = **5 days**
 - Should-fix items (6-8): 3-4 days development + 1 day testing = **5 days**
 - **Total: 10 days to production-ready multiregion deployment**
+
+**Single-region deployments:** Safe to proceed now with external monitoring.
 
 ---
 
