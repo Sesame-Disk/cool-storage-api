@@ -58,30 +58,75 @@ Deletion in SesameFS is soft-delete first. The existing lifecycle semantics must
 
 ### 2.4 Quota model
 
-Accounts sets limits. SesameFS enforces them.
+Accounts sets limits. SesameFS enforces them on storage writes (uploads), traffic writes (uploads/downloads), and member creation.
 
-Important fields on `organizations`:
+Persisted fields on `organizations`:
 
-- `plan`: opaque display string. Do not use it as a source of backend business logic.
-- `quota_policy`: `hard` or `soft`.
-- `storage_quota`
-- `traffic_quota`
-- `traffic_upload_quota`
-- `traffic_download_quota`
-- `max_users`
-- `current_period_started_at`
-- `current_period_ends_at`
-- `billing_cycle`
+| Field | Type | Meaning |
+|---|---|---|
+| `plan` | string | Opaque display label set by Accounts. **Never read by SesameFS for business logic.** |
+| `quota_policy` | `"hard"` or `"soft"` | How SesameFS reacts when a quota is exceeded. Empty defaults to `"hard"`. |
+| `billing_cycle` | string | Display-only on SesameFS. Period reset is **always monthly**, regardless of value. |
+| `storage_quota` | int64 bytes | Org-level storage cap. |
+| `traffic_quota` | int64 bytes | Org-level **combined** upload+download cap for the active period. |
+| `traffic_upload_quota` | int64 bytes | Org-level **upload-only** cap for the active period. |
+| `traffic_download_quota` | int64 bytes | Org-level **download-only** cap for the active period. |
+| `max_users` | int | Org-level member cap. |
+| `current_period_started_at` | timestamp UTC | Anchor of the active traffic-quota period. |
+| `current_period_ends_at` | timestamp UTC | Anchor of when the period rolls over and traffic counters reset. |
 
-Important rules:
+Persisted per-user quota fields on `users`:
 
-- Storage and traffic contract units are decimal bytes. `GB` and `TB` mean base-1000 units.
-- `storage_quota <= 0` means no SesameFS storage cap.
-- `traffic_quota <= 0`, `traffic_upload_quota <= 0`, and `traffic_download_quota <= 0` mean no SesameFS traffic cap for that dimension.
-- `max_users <= 0` means no SesameFS member cap.
-- Traffic quota periods are monthly, even if `billing_cycle="annual"`.
-- If `current_period_ends_at` is omitted, SesameFS derives the next boundary from `current_period_started_at` using the monthly clamped-month helper.
-- `<= 0` means "unlimited inside SesameFS enforcement", not "free in billing". Accounts billing may still charge overages or extra included capacity beyond the default tier while leaving SesameFS with no hard cap.
+| Field | Type | Meaning |
+|---|---|---|
+| `quota_total` | int64 bytes | Per-user storage cap. Validated against the org's `storage_quota` on write ([internal/api/v2/write_helpers.go:901-912](internal/api/v2/write_helpers.go#L901-L912)): a per-user value cannot exceed the org cap. |
+| `traffic_upload_quota` | int64 bytes | Per-user upload cap for the active period. Enforced ([internal/traffic/checker.go:164-197](internal/traffic/checker.go#L164-L197)). |
+| `traffic_download_quota` | int64 bytes | Per-user download cap for the active period. Enforced. |
+
+There is **no per-user combined `traffic_quota`** field. Per-user traffic enforcement is upload-only and download-only.
+
+A per-user quota value of `<= 0` means "no per-user override; the org-level cap applies". The validation helper accepts any non-positive value identically and never writes a per-user cap above the org cap.
+
+#### 2.4.1 Units and the meaning of `<= 0`
+
+- All byte values are **decimal**. `1 GB = 1_000_000_000` bytes. `1 TB = 1_000_000_000_000` bytes. SesameFS does not use base-1024.
+- A quota field with value `<= 0` (typical conventions: `-1` or `0`) is **not enforced by SesameFS**. The dimension behaves as on-demand: writes proceed, traffic accumulates, members are created. SesameFS will not block.
+- Important: `<= 0` does **not** mean "the user has no upper limit at all". It means "SesameFS does not gate this; whatever overage occurs is Accounts' responsibility to bill or to cap by another mechanism". Accounts is the only system that knows the contractual included tier; SesameFS just records and reports.
+- The traffic counters keep accumulating even when the corresponding quota is `<= 0`. Accounts can read them via the endpoints in §5.5 to invoice usage above the included tier.
+
+#### 2.4.2 Combined `traffic_quota` vs separated upload/download — when each applies
+
+All three caps (`traffic_quota`, `traffic_upload_quota`, `traffic_download_quota`) are evaluated in parallel on every transfer. The **most restrictive** result wins. A cap is **skipped entirely** when its value is `<= 0`. Real usage patterns:
+
+- **Free orgs (`quota_policy="hard"`)** typically use the **combined** cap. The built-in free template ships with `traffic_quota = 10 GB`, `traffic_upload_quota = -1`, `traffic_download_quota = -1` ([internal/config/config.go:189-206](internal/config/config.go#L189-L206)). Only the combined cap is enforced; once the org reaches 10 GB of upload+download in the period, **all** transfers are hard-blocked.
+- **Paid orgs (`quota_policy="soft"`)** typically use **separated** upload/download caps so Accounts can bill them as distinct line items (egress and ingress are different costs). Accounts sets `traffic_upload_quota` and `traffic_download_quota` to the included tier values and leaves `traffic_quota = -1` (combined cap off). At 80% of either separated cap SesameFS surfaces a warning; at 100% SesameFS does not block and traffic continues flowing — Accounts bills overage based on counter readings.
+- Mixed setups are supported but unusual. The contract does not forbid them; the most-restrictive rule applies.
+
+The same most-restrictive evaluation runs against per-user `traffic_upload_quota` and `traffic_download_quota` ([internal/traffic/checker.go:164-197](internal/traffic/checker.go#L164-L197)). A per-user cap that is `<= 0` is skipped.
+
+#### 2.4.3 `quota_policy` — what `hard` and `soft` actually do
+
+| Dimension | `quota_policy="hard"` (free) | `quota_policy="soft"` (paid) |
+|---|---|---|
+| `storage_quota` | Block uploads when projected usage exceeds the cap. | Allow uploads, surface a warning at ≥ 80%. Never blocks. |
+| `traffic_quota` (combined) | Block uploads/downloads when projected usage exceeds the cap. | Allow, warn at ≥ 80%. Never blocks. |
+| `traffic_upload_quota` | Block uploads when projected usage exceeds the cap. | Allow, warn at ≥ 80%. Never blocks. |
+| `traffic_download_quota` | Block downloads when projected usage exceeds the cap. | Allow, warn at ≥ 80%. Never blocks. |
+| `max_users` | Block member creation when current member count is at or above the cap. Hard-blocks in both `hard` and `soft` once a positive cap is hit, because creating an extra member breaks Accounts billing reality ([internal/traffic/checker.go:232-240](internal/traffic/checker.go#L232-L240)). |
+
+A cap of `<= 0` on **any** of these dimensions — including `max_users` — means "SesameFS does not enforce this dimension" ([internal/traffic/checker.go:59-61, 113, 141, 215](internal/traffic/checker.go#L59)). Same on-demand behavior described in §2.4.1.
+
+Empty `quota_policy` is treated as `"hard"` server-side ([internal/traffic/checker.go:36-38](internal/traffic/checker.go#L36-L38)). The default behavior is conservative.
+
+`quota_policy` is a single value for the whole org. It applies to all enforced dimensions. Mixing `hard` for storage and `soft` for traffic is not supported.
+
+#### 2.4.4 Period semantics
+
+- Periods are **always monthly**, no matter what `billing_cycle` says. `billing_cycle` is a display label that Accounts owns; SesameFS does not branch on it.
+- `current_period_started_at` and `current_period_ends_at` define the active window for traffic counters. Once `now >= current_period_ends_at`, Accounts is expected to roll the boundary forward via `PUT /admin/organizations/:org_id/`. SesameFS does not roll periods automatically on `UpdateOrganization`.
+- On `PUT /admin/organizations/:org_id/` the two period fields **must be sent together**. Sending only one returns 400 ([internal/api/v2/admin.go:765-770](internal/api/v2/admin.go#L765-L770)).
+- On `POST /admin/organizations/:org_id/preview-plan-change/` Accounts can send only `current_period_started_at`; SesameFS derives the end with the monthly clamped-month helper ([internal/config/config.go:281-306](internal/config/config.go#L281-L306)). 31-Jan + 1 month = 28-Feb (or 29-Feb in leap years); same logic for other short months.
+- Per-period traffic readings live in `traffic_period_usage` and are queried via the endpoints in §5.5. The natural-month traffic reading lives in `traffic_monthly` and is queried with `?month=YYYYMM`. They are not the same table; the period reading respects Accounts-anchored boundaries, the monthly reading respects calendar months UTC.
 
 ## 3. Authentication Contract for Accounts
 
@@ -127,6 +172,8 @@ Important current behavior:
 - Accounts should not assume that passing `return_url` to `GET /auth/oidc/login/` by itself is enough to drive the final browser redirect after login.
 - There is now a dedicated public SesameFS URL whose purpose is "start browser SSO immediately for this user and preserve the next path": `GET /login/sso/?next=/desired/path/`.
 - There is currently no first-class support on this endpoint for forwarding IdP-specific parameters such as `login_hint`, `prompt`, or account-selection hints.
+
+HTTP status codes: `200 OK` — returns `authorization_url`. `503 Service Unavailable` — OIDC is not enabled on this SesameFS deployment. `500 Internal Server Error` — failed to generate the authorization URL (e.g. OIDC provider not reachable during URL generation).
 
 Security properties of `GET /login/sso/`:
 
@@ -282,6 +329,8 @@ Response fields of interest:
 - `organizations[].users_count`
 - `organizations[].ctime`
 
+HTTP status codes: `200 OK`. `400 Bad Request` — `status` query param is not one of `all`, `active`, `deactivated`, `deleted`. `403 Forbidden` — caller is not a platform superadmin. `500 Internal Server Error` — database failure.
+
 #### `GET /admin/search-organization/`
 
 Search organizations by name.
@@ -289,6 +338,8 @@ Search organizations by name.
 Query parameters:
 
 - `query` optional
+
+HTTP status codes: `200 OK` (returns empty array if no match). `403 Forbidden` — caller is not a platform superadmin. `500 Internal Server Error` — database failure.
 
 #### `POST /admin/organizations/`
 
@@ -330,40 +381,63 @@ Response:
 }
 ```
 
+HTTP status codes: `201 Created`. `400 Bad Request` — malformed body; `org_name` and `name` are both absent; `owner_email` already exists in `users_by_email`. `403 Forbidden` — caller is not a platform superadmin. `500 Internal Server Error` — database failure.
+
 #### `GET /admin/organizations/:org_id/`
 
-Read the current organization state.
+Read the current organization state. This is the **rich single-call source of truth** for an org: configured limits + current usage + member counts in one response. Use it to drive an "org detail" page in the Accounts dashboard.
 
-Response fields of interest:
+Response fields ([internal/api/v2/admin.go:319-348](internal/api/v2/admin.go#L319-L348)):
+
+Identity and lifecycle:
 
 - `org_id`
 - `org_name`
+- `owner_email`, `owner_name`
 - `status`
-- `plan`
-- `quota_policy`
-- `billing_cycle`
+- `deleted_at` (RFC3339 string, or `null` while active)
+- `ctime` (RFC3339 string)
+
+Plan and policy:
+
+- `plan` (opaque label)
+- `quota_policy` (`"hard"` or `"soft"`; empty defaults to `"hard"`)
+- `billing_cycle` (display only)
+
+Configured quotas:
+
 - `storage_quota`
-- `quota_usage`
 - `traffic_quota`
 - `traffic_upload_quota`
 - `traffic_download_quota`
-- `traffic_combined_used`
-- `traffic_upload_used`
-- `traffic_download_used`
-- `current_period_started_at`
-- `current_period_ends_at`
 - `max_users`
-- `users_count`
-- `repos_count`
-- `groups_count`
-- `owner_email`
-- `owner_name`
+
+Current usage:
+
+- `quota_usage` (storage bytes currently in use)
+- `traffic_combined_used` (bytes upload+download in the active **period**, not calendar month)
+- `traffic_upload_used` (bytes upload in the active period)
+- `traffic_download_used` (bytes download in the active period)
+- `users_count`, `repos_count`, `groups_count`
+
+Period anchors:
+
+- `current_period_started_at` (RFC3339 UTC, or `null` if Accounts has never set it; usage falls back to first-of-month UTC server-side)
+- `current_period_ends_at` (RFC3339 UTC, or `null`)
+
+Storage placement (multi-region installations):
+
+- `storage_policy.data_residency` (e.g. `"eu"`, `"us"`)
+- `storage_policy.default_region`
+- `available_storage_regions[]` (regions configured on this SesameFS deployment that the org is allowed to choose from)
+
+HTTP status codes: `200 OK`. `403 Forbidden` — caller is not a platform superadmin. `404 Not Found` — org not found. `500 Internal Server Error` — invalid storage policy configuration or database failure.
 
 #### `PUT /admin/organizations/:org_id/`
 
-Update organization plan and quota configuration.
+Update organization plan and quota configuration. Sparse: every field is optional and only the fields present in the body are written ([internal/api/v2/admin.go:596-786](internal/api/v2/admin.go#L596-L786)).
 
-Request body fields are all optional:
+Request body:
 
 ```json
 {
@@ -376,18 +450,31 @@ Request body fields are all optional:
   "plan": "pro-monthly",
   "quota_policy": "soft",
   "billing_cycle": "monthly",
+  "storage_policy": {
+    "data_residency": "eu",
+    "default_region": "eu-west-1"
+  },
   "current_period_started_at": "2026-04-01T00:00:00Z",
   "current_period_ends_at": "2026-05-01T00:00:00Z"
 }
 ```
 
-Behavior:
+Field rules:
 
-- Accounts is expected to be the authoritative writer for these fields.
-- SesameFS immediately persists the new limits and uses them for enforcement.
-- Any quota field sent as `<= 0` is treated as unlimited by SesameFS for that dimension.
-- `quota_policy="hard"` means quota excess blocks operations.
-- `quota_policy="soft"` means quota excess warns but does not hard-block storage and traffic writes.
+- `quota_policy` only accepts `"hard"` or `"soft"`. Anything else returns 400.
+- `storage_policy.data_residency` and `storage_policy.default_region` are validated against the deployment's configured regions (the same set returned in `GET` as `available_storage_regions`). Unknown regions return 400.
+- `current_period_started_at` and `current_period_ends_at` **must be sent together**. Sending only one returns 400. End must be strictly after start. PUT does not derive the missing field — only `preview-plan-change` does.
+- All byte fields are decimal (`1 GB = 1_000_000_000`).
+
+Enforcement behavior after the write:
+
+- SesameFS persists the new limits immediately and uses them for the very next quota pre-check.
+- A quota field set to `<= 0` is **not enforced by SesameFS for that dimension**. The dimension behaves as on-demand: writes proceed, traffic accumulates, members are created. SesameFS will record the usage but will not block. This is the "Accounts will bill the overage beyond the included tier" mode — it is **not** "the user is unlimited"; SesameFS just stops gating that dimension.
+- `quota_policy="hard"`: when a positive cap is hit, the corresponding write is blocked.
+- `quota_policy="soft"`: positive caps surface a warning at ≥ 80% but do not block storage or traffic writes. `max_users` is the exception — it always blocks at the cap regardless of `quota_policy` (see §2.4.3).
+- Updating `current_period_started_at` / `current_period_ends_at` rolls the active traffic-quota window. The new period starts with zero traffic counters until usage accumulates (counters live in `traffic_period_usage`, keyed by the period start anchor).
+
+HTTP status codes: `200 OK` (including when the body contains no recognized fields — treated as a no-op). `400 Bad Request` — malformed body; `quota_policy` not `"hard"` or `"soft"`; unknown storage region; `current_period_started_at` sent without `current_period_ends_at` or vice-versa; `current_period_ends_at` is not after `current_period_started_at`. `403 Forbidden` — caller is not a platform superadmin. `404 Not Found` — org not found. `500 Internal Server Error` — database failure.
 
 #### `POST /admin/organizations/:org_id/preview-plan-change/`
 
@@ -466,28 +553,38 @@ Response:
 
 Semantics:
 
-- `would_exceed_*` evaluates current org usage against proposed limits.
-- Proposed quota values `<= 0` are treated as unlimited, so the corresponding `would_exceed_*` flag remains `false`.
-- `new_user_creation_would_be_blocked` matches SesameFS `max_users` semantics. If current membership is equal to the proposed limit, new user creation will already be blocked.
-- `users_to_deactivate_count` is an operational estimate that assumes owner and admins remain active first and regular members are the deactivation candidates.
-- `writes_would_be_blocked` is only about storage and traffic write operations under proposed `quota_policy="hard"`.
-- If Accounts proposes a new `current_period_started_at`, the traffic preview is evaluated against that period start. A new period with no counters will preview as zero traffic used.
+- `would_exceed_*` evaluates current org usage against the proposed limit. The flag answers "if I apply this body via PUT right now, will this dimension be over its cap?".
+- Proposed quota values `<= 0` mean "SesameFS will not enforce this dimension after the change", so the corresponding `would_exceed_*` flag is `false` (no enforcement = nothing to exceed). It does **not** mean usage drops to zero — counters keep their real values; only the gate is removed.
+- `new_user_creation_would_be_blocked` matches SesameFS `max_users` semantics: if current membership is at or above the proposed cap, the next member creation will be blocked. `max_users` always hard-blocks regardless of `quota_policy` (see §2.4.3).
+- `users_to_deactivate_count` is an **operational estimate** for downgrades. It assumes the owner and admins stay active; only regular members are deactivation candidates. SesameFS does not actually deactivate anyone during preview — applying the PUT does not trigger automatic deactivation either; this number is purely advisory for Accounts UI.
+- `writes_would_be_blocked` only applies to storage and traffic writes under proposed `quota_policy="hard"`. Under proposed `"soft"` it is `false` even when `would_exceed_*` is `true`.
+- Period: preview accepts only `current_period_started_at`. If the end is omitted, SesameFS derives it via the clamped-month helper ([internal/config/config.go:281-306](internal/config/config.go#L281-L306)). The traffic preview is read from the period anchored at the proposed `current_period_started_at`. If that period is brand-new (no counters yet), traffic-used previews as zero — that is correct behavior, not a bug. (Contrast with `PUT`, which requires both period fields together.)
+
+HTTP status codes: `200 OK`. `400 Bad Request` — malformed body; `quota_policy` not `"hard"` or `"soft"`; `current_period_ends_at` is before `current_period_started_at`. `403 Forbidden` — caller is not a platform superadmin. `404 Not Found` — org not found. `500 Internal Server Error` — failed to evaluate member stats.
 
 #### `POST /admin/organizations/:org_id/deactivate/`
 
 Set organization status to `deactivated`.
 
+HTTP status codes: `200 OK`. `400 Bad Request` — org is already `deleted`; restore it first before deactivating. `403 Forbidden` — caller is not a platform superadmin; or `org_id` is the platform organization. `404 Not Found` — org not found. `500 Internal Server Error` — database failure.
+
 #### `POST /admin/organizations/:org_id/reactivate/`
 
 Set organization status back to `active`.
+
+HTTP status codes: `200 OK`. `400 Bad Request` — org is not in `deactivated` state. `403 Forbidden` — caller is not a platform superadmin. `404 Not Found` — org not found. `500 Internal Server Error` — database failure.
 
 #### `DELETE /admin/organizations/:org_id/`
 
 Soft-delete the organization. Grace period and GC cascade happen later.
 
+HTTP status codes: `200 OK`. `403 Forbidden` — caller is not a platform superadmin; or `org_id` is the platform organization. `404 Not Found` — org not found. `500 Internal Server Error` — database failure.
+
 #### `POST /admin/organizations/:org_id/restore/`
 
 Restore a soft-deleted organization within the grace period.
+
+HTTP status codes: `200 OK`. `400 Bad Request` — org is not in `deleted` state. `403 Forbidden` — caller is not a platform superadmin. `404 Not Found` — org not found. `500 Internal Server Error` — database failure.
 
 ### 5.2 Platform admin organization user endpoints
 
@@ -515,9 +612,11 @@ Response fields of interest:
 - `last_login`
 - `org_id`
 
+HTTP status codes: `200 OK` (returns empty array if no users match). `403 Forbidden` — insufficient permissions. `500 Internal Server Error` — database failure.
+
 #### `POST /admin/organizations/:org_id/users/`
 
-Create a local user shadow row inside the organization.
+Create a local user shadow row inside the organization ([internal/api/v2/admin_extra_organizations.go:64-129](internal/api/v2/admin_extra_organizations.go#L64-L129)).
 
 Request body:
 
@@ -529,17 +628,40 @@ Request body:
 }
 ```
 
-Notes:
+Behavior:
 
-- `password` is accepted for compatibility but ignored. SesameFS does not manage local passwords.
-- This endpoint enforces `max_users`.
-- Accounts should call this only after it has already created the identity in Accounts or during a tightly controlled bootstrap flow.
+- `password` is accepted for compatibility but ignored. SesameFS is OIDC-first and does not manage local passwords.
+- `email` must not already exist in `users_by_email` globally (across all orgs); otherwise 400.
+- If `name` is empty, SesameFS uses the local-part of `email` as the display name.
+- The new user is created with `role="user"` and `status="active"`. Use `PUT` to elevate to `admin` or `owner` afterwards.
+- The new user is created with no per-user storage or traffic override (`quota_total`, `traffic_upload_quota`, `traffic_download_quota` are all `<= 0`). The org-level caps gate the user. If Accounts wants a per-user cap, send a follow-up `PUT`.
+- This endpoint enforces `max_users`. If the org is at the cap, returns 403 `user limit reached for this organization`.
+- Accounts should call this only after it has already created the identity in Accounts.
+
+Response (201 Created):
+
+```json
+{
+  "email": "member@acme.com",
+  "name": "Member Name",
+  "status": "active",
+  "active": true,
+  "is_org_staff": false,
+  "quota_usage": 0,
+  "quota_total": 0,
+  "create_time": "2026-04-21T10:00:00Z",
+  "last_login": null,
+  "org_id": "uuid"
+}
+```
+
+HTTP status codes: `201 Created`. `400 Bad Request` — malformed body; `email` is empty; email already exists in `users_by_email` (globally). `403 Forbidden` — caller is not a platform superadmin; or `max_users` cap is reached for the org. `500 Internal Server Error` — database failure.
 
 #### `PUT /admin/organizations/:org_id/users/:email/`
 
-Update a user shadow row.
+Update a user shadow row. Sparse: only the fields present in the body are written ([internal/api/v2/admin_extra_organizations.go:134-356](internal/api/v2/admin_extra_organizations.go#L134-L356)).
 
-Supported request body fields:
+Request body:
 
 ```json
 {
@@ -554,11 +676,55 @@ Supported request body fields:
 }
 ```
 
-Important behavior:
+Field rules and side effects:
 
-- `role="owner"` triggers ownership-transfer logic, not a trivial role update.
-- `active=false` maps to `status=deactivated`.
-- User quota fields are validated against organization-level quota ceilings.
+- `active`: `true` → `status="active"` and clears any deletion timestamp. `false` → `status="deactivated"`. To soft-delete, use the `DELETE` endpoint, not `active=false`.
+- `role`: accepted values are `admin`, `user`, `readonly`, `guest`, **and `owner` (special)**. Unknown values are silently ignored (the role does not change). `superadmin` is platform-only and cannot be set via this endpoint.
+- `is_org_staff` / `is_staff`: legacy boolean toggles for the `admin` role. `true` promotes a non-staff role to `admin`; `false` demotes `admin` back to `user`. They are aliases. If both are present, `is_org_staff` wins.
+- `name`: empty string is ignored (the name does not change). Use a non-empty string to update.
+- `quota_total`: per-user storage cap in bytes. Validated against the org's `storage_quota`; if both are positive and the requested value exceeds the org cap, returns 400 ([internal/api/v2/write_helpers.go:901-912](internal/api/v2/write_helpers.go#L901-L912)). Any `<= 0` value is accepted and means "no per-user override; the org cap applies".
+- `traffic_upload_quota` and `traffic_download_quota`: per-user period caps. Validated against the org's corresponding caps; if both are positive and the requested value exceeds the org cap, returns 400. Also validated against the org's combined `traffic_quota` (each direction must fit, and if both are set their sum must not exceed the combined cap). `<= 0` means SesameFS does not enforce that direction for this user (org cap still applies).
+
+Special behavior — **`role="owner"` is the canonical ownership-transfer**:
+
+- This is **not** a normal role update. Sending `role="owner"` triggers the same ownership-transfer logic as `PUT /org/:org_id/admin/transfer-ownership/`, but is the recommended path for Accounts because it is on the platform admin surface (no tenant-side authorization required).
+- Effect: the current `owner` (if any) is demoted to `admin` in the same batch; the target user becomes `owner`. If the target user's current role is below `admin`, SesameFS **forces them up to `admin` first** before promoting to owner — so a `user` can be made owner directly via this endpoint without a prior promote-to-admin call.
+- Sessions of the demoted owner are invalidated (they must reauthenticate to get the new admin scope).
+- If the target is already the current owner, the call is a no-op (still 200 OK).
+- This is the primary ownership-transfer path. The `/org/:org_id/admin/transfer-ownership/` route in §5.4 is a fallback for tenant-side flows.
+
+Side effects on status changes:
+
+- Activate/deactivate runs the same lifecycle side effects as the dedicated lifecycle endpoints: invalidates sessions and API keys when the status crosses to non-usable; reactivation rehydrates them.
+- Demoting from `owner` or `admin` to a lower role invalidates that user's sessions (so the new role takes effect immediately rather than after token expiry).
+
+Response (200 OK):
+
+```json
+{
+  "email": "member@acme.com",
+  "name": "New Name",
+  "role": "admin",
+  "status": "active",
+  "active": true,
+  "is_org_staff": true,
+  "quota_usage": 1234567,
+  "quota_total": 1000000000,
+  "traffic_upload_quota": 500000000,
+  "traffic_download_quota": 500000000,
+  "org_storage_quota": 500000000000,
+  "org_traffic_quota": 100000000000,
+  "org_traffic_upload_quota": 50000000000,
+  "org_traffic_download_quota": 50000000000,
+  "create_time": "2026-04-01T10:00:00Z",
+  "last_login": "2026-04-21T09:15:00Z",
+  "org_id": "uuid"
+}
+```
+
+The `org_*` fields in the response are the **org-level ceilings** ([internal/api/v2/admin_extra_organizations.go:348-351](internal/api/v2/admin_extra_organizations.go#L348-L351)). They are returned so Accounts knows the maximums it may set on per-user fields in subsequent calls without round-tripping through `GET /admin/organizations/:org_id/`.
+
+HTTP status codes: `200 OK`. `400 Bad Request` — malformed body; invalid `role` value; per-user quota exceeds org cap (storage or traffic). `403 Forbidden` — caller is not a platform superadmin. `404 Not Found` — user not found by email or not in the target org. `500 Internal Server Error` — database failure (including batch execution failure during ownership transfer).
 
 #### `DELETE /admin/organizations/:org_id/users/:email/`
 
@@ -569,6 +735,8 @@ Behavior:
 - preserves existing SesameFS lifecycle semantics
 - invalidates sessions and API keys
 - marks the user `deleted` for grace-period handling
+
+HTTP status codes: `200 OK`. `403 Forbidden` — caller is not a platform superadmin. `404 Not Found` — user not found in the target org. `500 Internal Server Error` — database failure.
 
 ### 5.3 Platform admin global user endpoints
 
@@ -584,6 +752,8 @@ Query parameters:
 - `per_page`
 - `status`
 
+HTTP status codes: `200 OK`. `400 Bad Request` — invalid `status` filter. `403 Forbidden` — caller is not a platform superadmin. `500 Internal Server Error` — database failure.
+
 #### `GET /admin/search-user/`
 
 Search users globally.
@@ -595,9 +765,13 @@ Query parameters:
 - `per_page`
 - `org_id` optional restriction for superadmin callers
 
+HTTP status codes: `200 OK` (returns empty array when `query` is empty or no match). `403 Forbidden` — caller is not a platform superadmin. `500 Internal Server Error` — database failure.
+
 #### `GET /admin/users/:email/`
 
 Get one user by email.
+
+HTTP status codes: `200 OK`. `403 Forbidden` — caller is not a platform superadmin. `404 Not Found` — user not found.
 
 #### `PUT /admin/users/:email/`
 
@@ -613,15 +787,21 @@ Supported fields:
 - `is_active`
 - `is_staff`
 
+HTTP status codes: `200 OK`. `400 Bad Request` — malformed body; invalid `role`; quota validation fails. `403 Forbidden` — caller is not a platform superadmin; or assigning `superadmin` to a non-platform-org user. `404 Not Found` — user not found. `500 Internal Server Error` — database failure.
+
 #### `DELETE /admin/users/:email/`
 
 Soft-delete one user by email.
+
+HTTP status codes: `200 OK`. `400 Bad Request` — caller is attempting to delete their own account (self-delete is blocked). `403 Forbidden` — caller is not a platform superadmin. `404 Not Found` — user not found. `500 Internal Server Error` — database failure.
 
 #### `PUT /admin/users/:email/restore/`
 
 Restore one soft-deleted user by email.
 
 This matters because there is currently no `/admin/organizations/:org_id/users/:email/restore/` route. If Accounts needs restore through the admin surface, it should use the global restore-by-email route.
+
+HTTP status codes: `200 OK`. `400 Bad Request` — identifier is not an email address; user is not in `deleted` state. `403 Forbidden` — caller is not a platform superadmin. `404 Not Found` — user not found. `500 Internal Server Error` — database failure.
 
 ### 5.4 Superadmin fallback routes under `/org`
 
@@ -645,9 +825,204 @@ Behavior:
 - current owner is demoted to `admin`
 - new owner must already exist in the org and be at least `admin`
 
+HTTP status codes: `200 OK` (including when target is already the owner — no-op). `400 Bad Request` — `new_owner` parameter missing; new owner is not at least `admin` in the org. `401 Unauthorized` — caller not authenticated. `403 Forbidden` — insufficient permissions; or `accounts.disable_org_user_writes=true` and caller is not a platform superadmin. `404 Not Found` — new owner user not found in the org. `500 Internal Server Error` — database failure.
+
 #### `PUT /org/:org_id/admin/users/:email/restore/`
 
 Restore a soft-deleted user within a specific organization. Use this only when the org-specific context is needed and the global restore-by-email route is not convenient.
+
+HTTP status codes: `200 OK`. `400 Bad Request` — user is not in `deleted` state. `401 Unauthorized` — caller not authenticated. `403 Forbidden` — insufficient permissions; or `accounts.disable_org_user_writes=true`. `404 Not Found` — user not found in the org. `500 Internal Server Error` — database failure.
+
+### 5.5 Reading usage for billing and dashboards
+
+These endpoints exist so Accounts can build billing rollups, top-consumer tables, and time-series charts without scraping primary tables. They are pure reads; they never mutate state.
+
+All counter-backed values are decimal bytes. All timestamps are RFC3339 UTC.
+
+#### Single-call rich snapshot
+
+For an "org detail" dashboard view, prefer **`GET /admin/organizations/:org_id/`** (§5.1). It already returns configured limits + current usage + member counts in one call, so most dashboards do not need to combine the time-series endpoints below with a separate config read.
+
+#### `GET /admin/statistics/total-storage`
+
+Time-series of platform-wide total storage in use ([internal/api/v2/admin_extra_stats.go:322-342](internal/api/v2/admin_extra_stats.go#L322-L342)).
+
+Query parameters:
+
+- `start` — `YYYY-MM-DD` or `YYYY-MM-DD HH:MM:SS`. Truncated to midnight UTC. Default: 7 days ago.
+- `end` — same formats. Default: today (UTC).
+- `group_by` — `day`, `week`, `month`. Default: `day`.
+
+Response:
+
+```json
+[
+  {"datetime": "2026-04-14T00:00:00+00:00", "total_storage": 12345678901},
+  {"datetime": "2026-04-15T00:00:00+00:00", "total_storage": 12389901002},
+  ...
+]
+```
+
+Notes:
+
+- Reconstructed by walking backwards from current platform counter using daily deltas in `storage_daily_delta`. The earliest date for which history is meaningful is the date the daily-delta table started receiving writes.
+- Always returns one row per bucket in the requested range. Buckets with no recorded delta carry the prior value forward.
+
+HTTP status codes: `200 OK`. `403 Forbidden` — caller is not a platform superadmin.
+
+#### `GET /admin/statistics/system-traffic`
+
+Time-series of platform-wide traffic broken down by source/direction ([internal/api/v2/admin_extra_stats.go:354-362](internal/api/v2/admin_extra_stats.go#L354-L362)).
+
+Query parameters: `start`, `end`, `group_by` (same as above).
+
+Response:
+
+```json
+[
+  {
+    "datetime": "2026-04-14T00:00:00+00:00",
+    "sync-file-upload": 0,
+    "sync-file-download": 0,
+    "web-file-upload": 1234567,
+    "web-file-download": 9876543,
+    "link-file-upload": 0,
+    "link-file-download": 543210
+  },
+  ...
+]
+```
+
+Notes:
+
+- The six columns are fixed and always present; zeros are returned when there is no traffic of that type in the bucket.
+- "sync" = desktop client, "web" = browser via web upload, "link" = anonymous via share/upload links. Combined upload/download for any direction = sum of `*-upload` or `*-download` columns.
+
+HTTP status codes: `200 OK`. `403 Forbidden` — caller is not a platform superadmin.
+
+#### `GET /admin/statistics/active-users`
+
+Time-series of distinct users that recorded any traffic in each bucket ([internal/api/v2/admin_extra_stats.go:344-352](internal/api/v2/admin_extra_stats.go#L344-L352)).
+
+Query parameters: `start`, `end`, `group_by`.
+
+Response:
+
+```json
+[
+  {"datetime": "2026-04-14T00:00:00+00:00", "count": 12},
+  ...
+]
+```
+
+Notes:
+
+- "Active" = generated traffic in the bucket. A user that only browsed (no transfer) does not count.
+- A user counts once per bucket regardless of status at query time. Deactivated users still appear in historical buckets where they were active.
+
+HTTP status codes: `200 OK`. `403 Forbidden` — caller is not a platform superadmin.
+
+#### `GET /admin/statistics/org-traffic`
+
+Per-org traffic totals for a single calendar month — the right endpoint for "top consumers by org" tables ([internal/api/v2/admin_extra_stats.go:519-580](internal/api/v2/admin_extra_stats.go#L519-L580)).
+
+Query parameters:
+
+- `month` — `YYYYMM`. Default: current month UTC.
+- `page` — default `1`.
+- `per_page` — default `25`. Capped at 100 server-side.
+- `order_by` — `total_bytes`, `upload_bytes`, `download_bytes`, `org_name`. Append `_asc` or `_desc` (default `_desc`). Empty defaults to `total_bytes_desc`.
+
+Response:
+
+```json
+{
+  "org_traffic_list": [
+    {
+      "org_id": "uuid",
+      "name": "Acme Storage",
+      "upload_bytes": 1234567,
+      "download_bytes": 9876543,
+      "total_bytes": 11111110
+    }
+  ],
+  "has_next_page": true
+}
+```
+
+Notes:
+
+- Reads `traffic_monthly` (calendar months UTC), **not** `traffic_period_usage` (Accounts-anchored periods). This endpoint is for billing rollups against the natural month, not against the org's quota period.
+- All orgs are listed. Orgs with zero traffic in the month appear with all zeros.
+
+HTTP status codes: `200 OK`. `403 Forbidden` — caller is not a platform superadmin.
+
+#### `GET /admin/statistics/user-traffic`
+
+Per-user traffic totals for a single calendar month, broken down by source/direction ([internal/api/v2/admin_extra_stats.go:582-662](internal/api/v2/admin_extra_stats.go#L582-L662)).
+
+Query parameters:
+
+- `month` — `YYYYMM`. Default: current month UTC.
+- `org_id` — optional. When omitted, aggregates across all orgs (uses the platform aggregate partition for speed; falls back to per-org scan if the aggregate is incomplete).
+- `page`, `per_page`, `order_by` — same as `org-traffic`. `order_by` accepts column names from the response below; default `link_file_download_desc`.
+
+Response:
+
+```json
+{
+  "user_monthly_traffic_list": [
+    {
+      "email": "user@acme.com",
+      "name": "User Name",
+      "sync_file_upload": 0,
+      "sync_file_download": 0,
+      "web_file_upload": 1234567,
+      "web_file_download": 9876543,
+      "link_file_upload": 0,
+      "link_file_download": 543210
+    }
+  ],
+  "has_next_page": true
+}
+```
+
+Notes:
+
+- Same six-column breakdown as `system-traffic`, per user.
+- Use `org_id` to scope a billing-per-org breakdown; omit it for a platform-wide top-N report.
+
+HTTP status codes: `200 OK`. `400 Bad Request` — `org_id` present but not a valid UUID. `403 Forbidden` — caller is not a platform superadmin.
+
+#### `GET /admin/statistics/file-operations`
+
+**Currently stubbed.** Returns one row per bucket with `added`, `deleted`, `modified`, `visited` all zero ([internal/api/v2/admin_extra_stats.go:301-320](internal/api/v2/admin_extra_stats.go#L301-L320)). Accounts should not depend on this endpoint for billing or display until the file-operations counter pipeline is implemented. The endpoint exists to keep the route reserved.
+
+HTTP status codes: `200 OK`. `403 Forbidden` — caller is not a platform superadmin.
+
+#### `GET /org/admin/info/`
+
+Org-scoped rich snapshot — same shape concept as `GET /admin/organizations/:org_id/` but called with org-scoped credentials (the org-admin SPA uses it). Accounts can use it on behalf of a tenant if it is logged in as an org admin, but for platform service-account workflows prefer the platform admin variant ([internal/api/v2/org_admin.go:246-355](internal/api/v2/org_admin.go#L246-L355)).
+
+Response includes (in addition to the fields documented in §9.2):
+
+- Identity and counts: `org_id`, `org_name`, `ctime`, `repos_count`, `groups_count`, `member_usage`, `member_quota`, `active_members`
+- Storage: `storage_quota`, `storage_usage`, `total_files_count`
+- Plan and policy: `plan`, `quota_policy`, `billing_cycle`, `storage_policy`, `available_storage_regions`
+- Period anchors: `current_period_started_at`, `current_period_ends_at`
+- Period traffic (Accounts-anchored): `traffic_quota`, `traffic_upload_quota`, `traffic_download_quota`, `traffic_combined_used`, `traffic_upload_used`, `traffic_download_used`
+- Calendar-month traffic: `traffic_month_total`, `traffic_month_upload`, `traffic_month_download`
+- Year-to-date traffic (sum of calendar months Jan–current of the current UTC year): `traffic_year_total`, `traffic_year_upload`, `traffic_year_download`
+- `max_users`
+- The org-user-management authority fields covered in §9.2.
+
+The two traffic blocks (period vs calendar month vs year-to-date) are intentional. Use:
+
+- `traffic_*_used` to evaluate against the active **quota period** (when does the user run out of their bucket).
+- `traffic_month_*` for billing rollups against the **calendar month**.
+- `traffic_year_*` for compliance / yearly-cap displays.
+
+HTTP status codes: `200 OK`. `403 Forbidden` — insufficient permissions (caller must be at least org admin). `404 Not Found` — org not found. `500 Internal Server Error` — invalid storage policy configuration.
 
 ## 6. Endpoints Accounts Should Not Use for Tenant-Admin User Writes
 
@@ -710,11 +1085,16 @@ Recommended UI logic inside Accounts:
 
 ### 8.3 Monthly period semantics
 
-Traffic quota periods are monthly, regardless of annual or monthly billing.
+Traffic quota periods are always monthly, regardless of `billing_cycle`. SesameFS does not branch on `billing_cycle` for enforcement.
 
-If Accounts sends only `current_period_started_at`, SesameFS can derive the end date.
+The two endpoints have different rules for the period fields:
 
-If Accounts sends both `current_period_started_at` and `current_period_ends_at`, they should be coherent.
+- **`PUT /admin/organizations/:org_id/`**: `current_period_started_at` and `current_period_ends_at` must be sent **together**. Sending only one returns 400. End must be strictly after start. PUT does not derive the missing field — Accounts is the source of truth ([internal/api/v2/admin.go:765-770](internal/api/v2/admin.go#L765-L770)).
+- **`POST /admin/organizations/:org_id/preview-plan-change/`**: `current_period_started_at` may be sent alone. SesameFS derives the end via the clamped-month helper (31-Jan + 1 month = 28-Feb or 29-Feb in leap years; same logic for other short months) ([internal/config/config.go:281-306](internal/config/config.go#L281-L306)).
+
+Why the difference: PUT mutates persistent state; ambiguity there would corrupt enforcement. Preview is read-only and used in interactive Accounts UI flows, so it is convenient to let it derive defaults.
+
+When the active period elapses (`now >= current_period_ends_at`), Accounts is expected to call `PUT /admin/organizations/:org_id/` with the next period's start and end. SesameFS does not roll periods automatically. Counters are keyed by the period start anchor (in `traffic_period_usage`), so a brand-new period starts at zero usage; the previous period's counters are preserved for historical reads.
 
 ## 9. Existing Local SesameFS Safeguards Relevant to Accounts
 

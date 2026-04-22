@@ -1,6 +1,6 @@
 ================================================================================
   QUOTAS — PENDIENTES VIGENTES
-    Última actualización: 2026-04-04
+    Última actualización: 2026-04-21
 ================================================================================
 
 Este archivo fue limpiado para dejar solo trabajo pendiente real.
@@ -31,7 +31,28 @@ Lo pendiente ya no es el modelo base de quotas. Lo pendiente es cerrar la integr
 
 ## PENDIENTE — ALTA PRIORIDAD
 
-### 1. Formalizar el path M2M interno de Accounts -> SesameFS
+### 1. BUG: Per-user storage quota no se enforza en uploads (ISSUE-USER-STORAGE-ENFORCE-01)
+
+`CheckStorageQuota` en `internal/traffic/checker.go:42-87` solo lee `organizations.storage_quota`.
+No consulta `users.quota_bytes`. El campo `quota_total` (API) / `quota_bytes` (DB) se persiste
+y valida al escribir, pero nunca se usa como gate en los pre-checks de upload.
+
+Resultado: un usuario con `quota_total=1GB` dentro de una org de 500GB puede subir hasta
+los 500GB de la org, no hasta su límite personal de 1GB.
+
+Per-user traffic (`traffic_upload_quota`, `traffic_download_quota`) SÍ está enforzado.
+Solo el storage per-user está roto.
+
+Fix requerido (ver docs/KNOWN_ISSUES.md ISSUE-USER-STORAGE-ENFORCE-01):
+- Agregar `userID` a `CheckStorageQuota`
+- Leer `users.quota_bytes` cuando `userID != ""`
+- Leer counter `user:<orgID>:<userID>` de `storage_counters`
+- Aplicar misma lógica hard/soft que el check de org
+- Actualizar callers en `HandleUpload`, `UploadFile`, `UploadBlock`
+- Test de regresión: user con 1GB cap inside 500GB org debe bloquearse a 1GB
+
+
+### 2. Formalizar el path M2M interno de Accounts -> SesameFS
 
 Ya está decidida la credencial y ya existe runbook operativo. Lo que falta es cerrar el comportamiento interno del backend para el path máquina-a-máquina.
 
@@ -50,23 +71,32 @@ Estado actual:
 - falta la formalización del path interno, no la credencial base
 
 
-### 2. Endpoint preview/evaluate para cambios de plan
+### 2. Formalizar el path M2M interno de Accounts -> SesameFS
 
-Hace falta un endpoint de simulación para que Accounts pueda evaluar el impacto de un downgrade o cambio de plan antes de aplicarlo.
+Ya está decidida la credencial y ya existe runbook operativo. Lo que falta es cerrar el comportamiento interno del backend para el path máquina-a-máquina.
 
-Debe responder, como mínimo:
-- si la org quedaría pasada de storage
-- si quedaría pasada de tráfico total
-- si quedaría pasada de upload traffic
-- si quedaría pasada de download traffic
-- si quedaría pasada de `max_users`
-- cuántos usuarios habría que desactivar
-- si los writes quedarían bloqueados
+Pendiente:
+- separar internamente cambios manuales de superadmin vs sync M2M de Accounts
+- marcar auditoría con `source=accounts`
+- registrar actor técnico/credencial de servicio
+- agregar idempotencia por `version` o `updated_at`
+- rechazar updates viejos o fuera de orden
+- dejar trazabilidad clara de provisioning y sync de subscription
 
-Esto no reemplaza el enforcement real. Es una simulación previa para UX y coordinación con Accounts.
+Estado actual:
+- hoy existen endpoints admin reutilizables
+- hoy existe el modelo de API keys endurecido
+- hoy existe runbook en `docs/ACCOUNTS-PROVISIONING-RUNBOOK.md`
+- falta la formalización del path interno, no la credencial base
 
 
-### 3. Flujo de invite/create users vía Accounts
+### 3. ~~Endpoint preview/evaluate para cambios de plan~~ ✅ COMPLETADO
+
+Implementado como `POST /api/v2.1/admin/organizations/:org_id/preview-plan-change/`.
+Ver `docs/ACCOUNTS-DASHBOARD-INTEGRATION.md` §5.1 para contrato completo.
+
+
+### 4. Flujo de invite/create users vía Accounts
 
 Hoy `AddOrgUser` sigue creando usuarios locales en SesameFS y eso no encaja bien con el modelo donde Accounts gobierna identidad.
 
@@ -82,7 +112,7 @@ Puntos a resolver:
 
 ## PENDIENTE — DECISIONES ABIERTAS CON ACCOUNTS
 
-### 4. Identificador de organización en el contrato externo
+### 5. Identificador de organización en el contrato externo
 
 Falta decidir si Accounts enviará siempre el `org_id` interno de SesameFS o si hace falta resolver por un identificador externo estable.
 
@@ -92,7 +122,7 @@ Opciones abiertas:
 - ambos
 
 
-### 5. Persistencia de IDs externos de billing
+### 6. Persistencia de IDs externos de billing
 
 Falta decidir si conviene guardar en `organizations` alguno de estos campos:
 - `accounts_org_id`
@@ -101,7 +131,7 @@ Falta decidir si conviene guardar en `organizations` alguno de estos campos:
 Esto afecta trazabilidad, reconciliación y debugging de syncs externos.
 
 
-### 6. Snapshot pre-downgrade de usuarios activos
+### 7. Snapshot pre-downgrade de usuarios activos
 
 Falta decidir si SesameFS debe guardar qué usuarios estaban activos antes de un downgrade a free para poder reactivarlos automáticamente cuando la org vuelva a paid.
 
@@ -114,7 +144,7 @@ Si se implementa:
 
 ## PENDIENTE — UX / OPERACIÓN / OBSERVABILIDAD
 
-### 7. Mensajes de error de quota más específicos
+### 8. Mensajes de error de quota más específicos
 
 Hoy el frontend todavía no distingue bien entre:
 - storage quota exceeded
@@ -126,14 +156,15 @@ Hoy el frontend todavía no distingue bien entre:
 Hace falta devolver y mostrar errores más accionables.
 
 
-### 8. Visualización de herencia de quota user -> org
+### 9. Visualización de quota user -> org
 
-El backend ya soporta herencia cuando el usuario no tiene límite propio. Falta una UI clara para:
-- ver cuándo un user hereda de la org
-- distinguir override explícito vs herencia
+Falta una UI clara para el panel admin que muestre:
+- si el usuario tiene override explícito de quota_total o hereda de la org
+- distinguir override explícito vs sin límite propio
+- nota: per-user storage enforcement no está implementado aún (ver item 1 / ISSUE-USER-STORAGE-ENFORCE-01)
 
 
-### 9. UI/admin story para traffic quotas
+### 10. UI/admin story para traffic quotas
 
 El backend soporta:
 - `traffic_quota`
@@ -146,7 +177,7 @@ Falta decidir si el panel sysadmin tendrá:
 - o nada, delegando todo a Accounts
 
 
-### 10. Audit log de quotas y provisioning
+### 11. Audit log de quotas y provisioning
 
 Sigue pendiente persistir y exponer trazabilidad de:
 - cambios de quota manuales
@@ -155,7 +186,7 @@ Sigue pendiente persistir y exponer trazabilidad de:
 - source, timestamp y payload mínimo relevante
 
 
-### 11. Métricas de drops del recorder
+### 12. Métricas de drops del recorder
 
 Si el recorder se satura y descarta eventos, hoy no hay suficiente visibilidad operativa.
 
@@ -165,7 +196,7 @@ Hace falta:
 - visibilidad para detectar pérdida de telemetría de tráfico
 
 
-### 12. Dashboard de riesgo y notificaciones
+### 13. Dashboard de riesgo y notificaciones
 
 No existe todavía:
 - vista de riesgo de quotas por org/usuario
@@ -177,8 +208,8 @@ Esto es útil, pero no forma parte del núcleo ya implementado de enforcement.
 
 ## ORDEN PRACTICO RECOMENDADO
 
-1. Formalizar path M2M interno de Accounts
-2. Diseñar y exponer preview/evaluate endpoint
+1. Corregir bug per-user storage enforcement (ISSUE-USER-STORAGE-ENFORCE-01) — blocker UX si Accounts ya configura limits per-user
+2. Formalizar path M2M interno de Accounts
 3. Cerrar el flujo de invite/create users vía Accounts
 4. Resolver identificadores externos y snapshot pre-downgrade
 5. Completar auditoría, UX fina y observabilidad

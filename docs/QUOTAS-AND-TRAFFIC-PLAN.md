@@ -108,12 +108,14 @@ For org-level quotas, any value `<= 0` means SesameFS treats that dimension as u
 
 Within an org, the admin can assign individual limits per user:
 
-- `quota_bytes` (storage) — already exists in schema
+- `quota_bytes` (storage) — already exists in schema (exposed as `quota_total` in API responses)
 - `traffic_upload_quota` — new
 - `traffic_download_quota` — new
-- Value -1 = inherit from org pool (no individual limit)
+- Value `<= 0` = no individual storage limit; the org-level cap applies
 - Most restrictive check wins: if the org is blocked, the user cannot upload even if they have individual quota remaining
 - No `traffic_quota` (combined) at user level — only at org level
+
+> **⚠️ Known issue (ISSUE-USER-STORAGE-ENFORCE-01):** Per-user storage enforcement (`quota_total`/`quota_bytes`) is NOT currently enforced at upload time. `CheckStorageQuota` only reads the org-level `storage_quota`; it does not consult `users.quota_bytes`. Per-user traffic (`traffic_upload_quota`, `traffic_download_quota`) IS enforced. See `docs/KNOWN_ISSUES.md` for the full description and fix plan.
 
 ---
 

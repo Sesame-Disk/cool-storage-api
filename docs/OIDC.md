@@ -358,14 +358,14 @@ GET /api/v2.1/admin/organizations/:org_id/users/
       "email": "alice@acme.com",
       "name": "Alice Smith",
       "role": "admin",
-      "quota_bytes": -2,
+      "quota_total": 0,
       "used_bytes": 1048576,
       "created_at": "2026-01-29T10:00:00Z"
     }
   ]
 }
 ```
-Note: `quota_bytes = -2` means "use org default quota".
+Note: `quota_total <= 0` means no per-user storage override is set; the org-level `storage_quota` applies.
 
 #### Get User
 ```
@@ -380,11 +380,11 @@ Content-Type: application/json
 
 {
   "role": "readonly",
-  "quota_bytes": 5368709120
+  "quota_total": 5368709120
 }
 ```
 - `role` (string, optional): New role. Valid values: `admin`, `user`, `readonly`, `guest`. Only superadmin can assign `superadmin`.
-- `quota_bytes` (int64, optional): Per-user storage quota in bytes.
+- `quota_total` (int64, optional): Per-user storage quota in bytes. `<= 0` means no per-user override.
 
 **Response** `200`: `{"success": true}`
 **Response** `403`: `{"error": "only superadmin can assign superadmin role"}`
@@ -539,7 +539,7 @@ auth:
     platform_org_claim_value: "platform"                       # When org_claim = this value, map to platform org
 
     # Auto-provisioning
-    auto_provision: true                # Create orgs/users on first OIDC login
+    auto_provision: false               # Keep disabled by default; Accounts should provision orgs/users explicitly
     default_role: "user"                # Fallback role when OIDC claim is unrecognized
     default_org_name: "New Organization" # Name for auto-provisioned orgs
 ```

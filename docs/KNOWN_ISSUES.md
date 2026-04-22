@@ -39,6 +39,7 @@ This document tracks all known bugs, limitations, and issues in SesameFS.
 | **Login Analytics History** | 🟡 Partial | `last_login` is now real and persisted in `users.last_login_at`, but there is still no historical login event dataset for trend analysis, login audit timelines, or period-based "users who logged in" charts. See ISSUE-LOGIN-ANALYTICS-01 below. |
 | **File Statistics Pages Are Still Stubbed** | 🟡 Pending | `/sys/statistics/file/` currently returns all-zero series and `/org/statistics-admin/file/` is still unimplemented. Real data depends on new `file_update_logs` and `file_access_logs` tables, not on `login_logs`. See ISSUE-FILE-STATS-01 below. |
 | **Org Admin Statistics Can Leak Platform Scope** | 🔴 Confirmed bug | When org-admin pages are mounted with platform-org context, traffic-based org-admin metrics can resolve to the global aggregate instead of a tenant scope. Affects at least org-admin traffic, org-admin per-user traffic, and org-admin active-users. See ISSUE-ORG-STATS-SCOPE-01 below. |
+| **Per-User Storage Quota Not Enforced at Upload Time** | 🔴 Confirmed bug | `quota_total` is persisted and validated on write but never consulted by `CheckStorageQuota` at upload time. Only the org-level `storage_quota` gates uploads. Per-user storage caps set via the admin API have no effect on actual upload blocking. See ISSUE-USER-STORAGE-ENFORCE-01 below. |
 
 ### 🟡 SeaDrive 3.x Missing Endpoints (Non-fatal, but degrade UX)
 | Issue | Status | Notes |
@@ -241,6 +242,41 @@ This is a scope-boundary bug, not a traffic math bug.
 
 - `docs/CURRENT_WORK.md`
 - `docs/IMPLEMENTATION_STATUS.md`
+
+---
+
+### ISSUE-USER-STORAGE-ENFORCE-01: Per-User Storage Quota Not Enforced at Upload Time
+
+**Status**: 🔴 Confirmed bug (2026-04-21)
+**Severity**: High — per-user storage caps set via the admin API have no effect on actual upload blocking
+**Affected**: `PUT /api/v2.1/admin/organizations/:org_id/users/:email/` (`quota_total` field); all upload handlers
+
+#### Problem
+
+`quota_total` is correctly persisted to the `users` table and validated on write against the org's `storage_quota` ([internal/api/v2/write_helpers.go:901-912](internal/api/v2/write_helpers.go#L901-L912)). However, `CheckStorageQuota` in [internal/traffic/checker.go:42-87](internal/traffic/checker.go#L42-L87) only reads `organizations.storage_quota` and the live counter for `org:<orgID>`. It never queries `users.quota_bytes`.
+
+As a result, a user whose `quota_total` is set to (for example) 1 GB within a 500 GB org can upload freely until the org-level 500 GB cap is hit, not until their personal 1 GB cap is hit.
+
+#### Root Cause
+
+- `CheckStorageQuota(orgID, additionalBytes)` receives only `orgID` — no `userID` parameter.
+- The function queries `organizations WHERE org_id = ?` for `storage_quota` and `quota_policy`. `users.quota_bytes` is never read here.
+- The `storage_counters` table stores per-user counters (`user:<orgID>:<userID>`) which are correctly maintained by `IncrementStorageCounters` / `DecrementStorageCounters`, but those counters are also never consulted during upload pre-checks.
+
+#### Remaining Work
+
+1. Add `userID` parameter to `CheckStorageQuota` (or create a new `CheckUserStorageQuota`).
+2. Read `users.quota_bytes` when `userID != ""`.
+3. If `userQuota > 0`: read `storage_counters` for `user:<orgID>:<userID>` and enforce the cap against `quota_policy` (same hard/soft logic as the org check).
+4. Return the more restrictive of org-level and user-level results.
+5. Update all callers in upload handlers (`HandleUpload`, `UploadFile`, `UploadBlock`) to pass `userID`.
+6. Add regression test: user with 1 GB cap inside a 500 GB org must be blocked at 1 GB.
+
+#### Related
+
+- `internal/traffic/checker.go` — `CheckStorageQuota` function
+- `internal/api/seafhttp.go` — `HandleUpload`, upload callers
+- `docs/ACCOUNTS-DASHBOARD-INTEGRATION.md` — §5.2 documents `quota_total` as enforced; fix here must make that description accurate
 
 ---
 
