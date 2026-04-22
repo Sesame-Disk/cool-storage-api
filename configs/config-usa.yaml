@@ -121,7 +121,7 @@ auth:
       - email
     org_claim: ""
     roles_claim: ""
-    auto_provision: true
+    auto_provision: false
     default_role: user
     default_org_id: ""
     default_org_name: ""

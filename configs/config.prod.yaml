@@ -113,7 +113,7 @@ auth:
       - profile
       - email
 
-    auto_provision: true         # Auto-create users on first OIDC login
+    auto_provision: false        # Keep disabled by default; Accounts should provision orgs/users explicitly
     default_role: user           # Role assigned to new users
     session_ttl: 24h             # Web browser sessions
     api_token_ttl: 4320h         # 180 days — desktop/mobile sync clients (Seafile/SeaDrive)

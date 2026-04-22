@@ -662,7 +662,7 @@ func DefaultConfig() *Config {
 			OIDC: OIDCConfig{
 				Enabled:          false, // Disabled by default, use dev tokens
 				Scopes:           []string{"openid", "profile", "email"},
-				AutoProvision:    true,
+				AutoProvision:    false,
 				DefaultRole:      "user",
 				PlatformOrgID:    "00000000-0000-0000-0000-000000000000",
 				SessionTTL:       24 * time.Hour,

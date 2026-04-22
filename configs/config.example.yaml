@@ -132,7 +132,7 @@ auth:
       - email
     org_claim: ""                     # Set via OIDC_ORG_CLAIM when org membership comes from a custom claim
     roles_claim: ""                   # Set via OIDC_ROLES_CLAIM when roles come from a custom claim
-    auto_provision: true
+    auto_provision: false                # Accounts should provision orgs/users explicitly; opt in only when desired
     default_role: user
     default_org_id: ""                # Optional fallback org UUID via OIDC_DEFAULT_ORG_ID
     default_org_name: ""              # Optional fallback org name via OIDC_DEFAULT_ORG_NAME

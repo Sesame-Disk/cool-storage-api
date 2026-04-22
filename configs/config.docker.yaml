@@ -163,7 +163,7 @@ auth:
       - email
     org_claim: ""                     # Optional custom org claim via OIDC_ORG_CLAIM
     roles_claim: ""                   # Optional custom roles claim via OIDC_ROLES_CLAIM
-    auto_provision: true
+    auto_provision: false
     default_role: user
     default_org_id: ""                # Optional fallback org UUID via OIDC_DEFAULT_ORG_ID
     default_org_name: ""              # Optional fallback org name via OIDC_DEFAULT_ORG_NAME
