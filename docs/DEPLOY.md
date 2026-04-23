@@ -244,6 +244,9 @@ BILLING_URL=https://accounts.yourdomain.com/billing/
 # External Accounts URLs used by /accounts/password/change/ and /accounts/delete/
 ACCOUNTS_PASSWORD_CHANGE_URL=https://accounts.yourdomain.com/accounts/password/change/
 ACCOUNTS_DELETE_ACCOUNT_URL=https://accounts.yourdomain.com/accounts/delete/
+# Org user management link in org-admin panel ({org_id} replaced at runtime).
+# Leave empty to hide the "Manage in Accounts" button.
+ACCOUNTS_ORG_USER_MANAGEMENT_URL=https://accounts.yourdomain.com/orgs/{org_id}/members/
 ACCOUNTS_DISABLE_ORG_USER_WRITES=true
 
 # Reverse proxy IPs/CIDRs allowed to define the client IP via X-Forwarded-For.

@@ -13,6 +13,8 @@ services:
       - BILLING_URL=${BILLING_URL:-https://t-accounts.sesamedisk.com/billing/}
       - ACCOUNTS_PASSWORD_CHANGE_URL=${ACCOUNTS_PASSWORD_CHANGE_URL:-https://t-accounts.sesamedisk.com/accounts/password/change/}
       - ACCOUNTS_DELETE_ACCOUNT_URL=${ACCOUNTS_DELETE_ACCOUNT_URL:-https://t-accounts.sesamedisk.com/accounts/delete/}
+      - ACCOUNTS_ORG_USER_MANAGEMENT_URL=${ACCOUNTS_ORG_USER_MANAGEMENT_URL:-https://t-accounts.sesamedisk.com/accounts/sesamefs/dashboard/}
+      - ACCOUNTS_DISABLE_ORG_USER_WRITES=${ACCOUNTS_DISABLE_ORG_USER_WRITES:-false}
       - CASSANDRA_HOSTS=${CASSANDRA_HOSTS:-cassandra:9042}
       - CASSANDRA_KEYSPACE=${CASSANDRA_KEYSPACE:-sesamefs}
       - CASSANDRA_LOCAL_DC=${CASSANDRA_LOCAL_DC:-datacenter1}
