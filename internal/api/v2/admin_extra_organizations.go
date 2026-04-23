@@ -128,6 +128,66 @@ func (h *AdminHandler) AdminAddOrgUser(c *gin.Context) {
 	})
 }
 
+// AdminGetOrgUser returns details for a user in an organization.
+// GET /admin/organizations/:org_id/users/:email/
+func (h *AdminHandler) AdminGetOrgUser(c *gin.Context) {
+	callerOrgID := c.GetString("org_id")
+	callerUserID := c.GetString("user_id")
+	if err := h.requireAdminAccess(c, callerOrgID, callerUserID); err != nil {
+		return
+	}
+
+	targetOrgID := c.Param("org_id")
+	email := c.Param("email")
+
+	userID, userOrgID, err := h.lookupUserByEmail(email)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "user not found"})
+		return
+	}
+
+	if userOrgID != targetOrgID {
+		c.JSON(http.StatusNotFound, gin.H{"error": "user not found in this organization"})
+		return
+	}
+
+	var name, role, status string
+	var quotaBytes, trafficUploadQuota, trafficDownloadQuota int64
+	var createdAt, lastLoginAt time.Time
+
+	if err := h.db.Session().Query(`
+		SELECT name, role, status, quota_bytes, traffic_upload_quota, traffic_download_quota, created_at, last_login_at
+		FROM users WHERE org_id = ? AND user_id = ?
+	`, targetOrgID, userID).Scan(&name, &role, &status, &quotaBytes, &trafficUploadQuota, &trafficDownloadQuota, &createdAt, &lastLoginAt); err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "user not found"})
+		return
+	}
+
+	isActive := IsUserUsable(status)
+	isOrgStaff := middleware.IsOrgStaff(role)
+	oq, _ := readOrgQuotas(h.db, targetOrgID)
+
+	c.JSON(http.StatusOK, gin.H{
+		"email":                      email,
+		"name":                       name,
+		"role":                       role,
+		"status":                     normalizeUserStatus(status),
+		"active":                     isActive,
+		"is_org_staff":               isOrgStaff,
+		"quota_usage":                traffic.ReadStorageUsed(h.db, fmt.Sprintf("user:%s:%s", targetOrgID, userID)),
+		"quota_total":                quotaBytes,
+		"traffic_upload_quota":       trafficUploadQuota,
+		"traffic_download_quota":     trafficDownloadQuota,
+		"org_storage_quota":          oq.StorageQuota,
+		"org_traffic_quota":          oq.TrafficQuota,
+		"org_traffic_upload_quota":   oq.TrafficUploadQuota,
+		"org_traffic_download_quota": oq.TrafficDownloadQuota,
+		"create_time":                createdAt.Format(time.RFC3339),
+		"last_login":                 formatOptionalTimestamp(lastLoginAt),
+		"org_id":                     targetOrgID,
+	})
+}
+
 // AdminUpdateOrgUser updates a user in an organization.
 // Accepts FormData: active, is_org_staff, is_staff, name, quota_total, role.
 // PUT /admin/organizations/:org_id/users/:email/
