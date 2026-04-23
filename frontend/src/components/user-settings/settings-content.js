@@ -57,10 +57,8 @@ class SettingsContent extends React.Component {
 
         this.sideNavItems = [
             { show: true, href: '#user-basic-info', text: gettext('Profile') },
-            { show: canUpdatePassword, href: '#update-user-passwd', text: gettext('Password') },
             { show: enableAPIKeys, href: '#api-keys', text: gettext('API Keys') },
             { show: enableGetAuthToken, href: '#get-auth-token', text: gettext('Web API Auth Token') },
-            { show: enableWebdavSecret, href: '#update-webdav-passwd', text: gettext('WebDav Password') },
             { show: enableAddressBook, href: '#list-in-address-book', text: gettext('Global Address Book') },
             { show: true, href: '#lang-setting', text: gettext('Language') },
             { show: isPro, href: '#email-notice', text: gettext('Email Notification') },
@@ -194,16 +192,10 @@ class SettingsContent extends React.Component {
                             <UserAvatarForm />
                             {this.state.userInfo && <UserBasicInfoForm userInfo={this.state.userInfo} updateUserInfo={this.updateUserInfo} />}
                         </div>
-                        {canUpdatePassword &&
-                            <div id="update-user-passwd" className="user-settings-layout__section">
-                                <h3 className="user-settings-layout__section-heading">{gettext('Password')}</h3>
-                                <a href={passwordChangeUrl} className="btn btn-outline-primary">{passwordOperationText}</a>
-                            </div>
-                        }
+
 
                         {enableAPIKeys && <APIKeys />}
                         {enableGetAuthToken && <WebAPIAuthToken />}
-                        {enableWebdavSecret && <WebdavPassword />}
                         {enableAddressBook && this.state.userInfo &&
                             <ListInAddressBook userInfo={this.state.userInfo} updateUserInfo={this.updateUserInfo} />}
                         <LanguageSetting />

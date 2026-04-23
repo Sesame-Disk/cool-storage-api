@@ -201,7 +201,7 @@ class Item extends Component {
       highlight: false,
       isSetQuotaDialogOpen: false,
       isDeleteUserDialogOpen: false,
-      isResetUserPasswordDialogOpen: false,
+
       isRevokeAdminDialogOpen: false,
       isConfirmInactiveDialogOpen: false,
       isRestoreUserDialogOpen: false
@@ -242,9 +242,7 @@ class Item extends Component {
     this.setState({ isDeleteUserDialogOpen: !this.state.isDeleteUserDialogOpen });
   };
 
-  toggleResetUserPasswordDialog = () => {
-    this.setState({ isResetUserPasswordDialogOpen: !this.state.isResetUserPasswordDialogOpen });
-  };
+
 
   toggleRevokeAdminDialog = () => {
     this.setState({ isRevokeAdminDialogOpen: !this.state.isRevokeAdminDialogOpen });
@@ -337,15 +335,7 @@ class Item extends Component {
     this.props.restoreUser(this.props.item.email, this.props.item.name);
   };
 
-  resetPassword = () => {
-    toaster.notify(gettext('It may take some time, please wait.'));
-    seafileAPI.sysAdminResetUserPassword(this.props.item.email).then(res => {
-      toaster.success(res.data.reset_tip);
-    }).catch((error) => {
-      let errMessage = Utils.getErrorMsg(error);
-      toaster.danger(errMessage);
-    });
-  };
+
 
   revokeAdmin = () => {
     const { item } = this.props;
@@ -361,10 +351,7 @@ class Item extends Component {
       return ['Restore'];
     }
     let list = ['Delete'];
-    if (!isLDAPImported ||
-      (isSearchResult && item.source === 'db')) {
-      list.push('Reset Password');
-    }
+
     if (isAdmin) {
       list = ['Revoke Admin'];
     }
@@ -377,9 +364,7 @@ class Item extends Component {
       case 'Delete':
         translateResult = gettext('Delete');
         break;
-      case 'Reset Password':
-        translateResult = gettext('Reset Password');
-        break;
+
       case 'Revoke Admin':
         translateResult = gettext('Revoke Admin');
         break;
@@ -396,9 +381,7 @@ class Item extends Component {
       case 'Delete':
         this.toggleDeleteUserDialog();
         break;
-      case 'Reset Password':
-        this.toggleResetUserPasswordDialog();
-        break;
+
       case 'Revoke Admin':
         this.toggleRevokeAdminDialog();
         break;
@@ -417,7 +400,7 @@ class Item extends Component {
       isOpIconShown,
       isSetQuotaDialogOpen,
       isDeleteUserDialogOpen,
-      isResetUserPasswordDialogOpen,
+
       isRevokeAdminDialogOpen,
       isConfirmInactiveDialogOpen,
       isRestoreUserDialogOpen
@@ -425,7 +408,7 @@ class Item extends Component {
 
     const itemName = '<span class="op-target">' + Utils.HTMLescape(item.name) + '</span>';
     const deleteDialogMsg = gettext('Are you sure you want to delete {placeholder} ?').replace('{placeholder}', itemName);
-    const resetPasswordDialogMsg = gettext('Are you sure you want to reset the password of {placeholder} ?').replace('{placeholder}', itemName);
+    const resetPasswordDialogMsg = '';
     const revokeAdminDialogMsg = gettext('Are you sure you want to revoke the admin permission of {placeholder} ?').replace('{placeholder}', itemName);
     const confirmSetUserInactiveMsg = gettext('Are you sure you want to set {user_placeholder} inactive?').replace('{user_placeholder}', itemName);
     const restoreUserDialogMsg = gettext('Are you sure you want to restore {placeholder} ?').replace('{placeholder}', itemName);
@@ -593,15 +576,7 @@ class Item extends Component {
             toggleDialog={this.toggleDeleteUserDialog}
           />
         }
-        {isResetUserPasswordDialogOpen &&
-          <CommonOperationConfirmationDialog
-            title={gettext('Reset Password')}
-            message={resetPasswordDialogMsg}
-            executeOperation={this.resetPassword}
-            confirmBtnText={gettext('Reset')}
-            toggleDialog={this.toggleResetUserPasswordDialog}
-          />
-        }
+
         {isRevokeAdminDialogOpen &&
           <CommonOperationConfirmationDialog
             title={gettext('Revoke Admin')}

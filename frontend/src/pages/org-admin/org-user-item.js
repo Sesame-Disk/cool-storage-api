@@ -61,22 +61,6 @@ class UserItem extends React.Component {
     this.props.toggleDelete(email, username);
   };
 
-  toggleResetPW = () => {
-    const { email, name } = this.props.user;
-    toaster.success(gettext('Resetting user\'s password, please wait for a moment.'));
-    seafileAPI.orgAdminResetOrgUserPassword(orgID, email).then(res => {
-      let msg;
-      msg = gettext('Successfully reset password to %(passwd)s for user %(user)s.');
-      msg = msg.replace('%(passwd)s', res.data.new_password);
-      msg = msg.replace('%(user)s', name);
-      toaster.success(msg, {
-        duration: 15
-      });
-    }).catch(error => {
-      let errMessage = Utils.getErrorMsg(error);
-      toaster.danger(errMessage);
-    });
-  };
 
   toggleRevokeAdmin = () => {
     const email = this.props.user.email;
@@ -172,7 +156,7 @@ class UserItem extends React.Component {
       return ['Restore'];
     }
 
-    const operations = ['Delete', 'ResetPwd'];
+    const operations = ['Delete'];
     if (currentTab === 'admins') {
       operations.push('Revoke Admin');
     }
@@ -183,8 +167,7 @@ class UserItem extends React.Component {
     switch (operation) {
       case 'Delete':
         return gettext('Delete');
-      case 'ResetPwd':
-        return gettext('ResetPwd');
+
       case 'Revoke Admin':
         return gettext('Revoke Admin');
       case 'Restore':
@@ -233,13 +216,6 @@ class UserItem extends React.Component {
       });
     }
 
-    const resetPasswordURL = this.getAccountsURL(ACCOUNTS_ORG_USER_ACTIONS.RESET_PASSWORD);
-    if (resetPasswordURL) {
-      operations.push({
-        label: gettext('ResetPwd'),
-        url: resetPasswordURL,
-      });
-    }
 
     if (this.props.currentTab === 'admins') {
       const revokeAdminURL = this.getAccountsURL(ACCOUNTS_ORG_USER_ACTIONS.REVOKE_ADMIN);
@@ -259,9 +235,7 @@ class UserItem extends React.Component {
       case 'Delete':
         this.toggleDelete();
         break;
-      case 'ResetPwd':
-        this.toggleResetPW();
-        break;
+
       case 'Revoke Admin':
         this.toggleRevokeAdmin();
         break;

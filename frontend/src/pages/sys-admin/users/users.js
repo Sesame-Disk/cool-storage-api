@@ -320,8 +320,8 @@ class Users extends Component {
   };
 
   addUser = (data) => {
-    const { email, name, role, password } = data;
-    return seafileAPI.sysAdminAddUser(email, name, password, role).then((res) => {
+    const { email, name, role } = data;
+    return seafileAPI.sysAdminAddUser(email, name, role).then((res) => {
       let userList = this.state.userList;
       userList.unshift(res.data);
       this.setState({

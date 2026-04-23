@@ -1052,9 +1052,9 @@ seafileAPI.sysAdminRestoreUser = function (email) {
 };
 
 // Admin: add new user
-seafileAPI.sysAdminAddUser = function (email, name, password, role) {
+seafileAPI.sysAdminAddUser = function (email, name, role) {
   let url = this.server + '/api/v2.1/admin/users/';
-  let data = { email, name, password };
+  let data = { email, name };
   if (role) data.role = role;
   return this.req.post(url, data);
 };
@@ -1167,9 +1167,9 @@ seafileAPI.sysAdminGetOrg = function (orgID) {
 };
 
 // Admin: create organization
-seafileAPI.sysAdminAddOrg = function (orgName, ownerEmail, password) {
+seafileAPI.sysAdminAddOrg = function (orgName, ownerEmail) {
   let url = this.server + '/api/v2.1/admin/organizations/';
-  let data = { org_name: orgName, owner_email: ownerEmail, password: password };
+  let data = { org_name: orgName, owner_email: ownerEmail };
   return this.req.post(url, data);
 };
 
@@ -1221,9 +1221,9 @@ seafileAPI.sysAdminListOrgUsers = function (orgID, status) {
 };
 
 // Admin: add user to org (sys-admin panel)
-seafileAPI.sysAdminAddOrgUser = function (orgID, email, name, password) {
+seafileAPI.sysAdminAddOrgUser = function (orgID, email, name) {
   let url = this.server + '/api/v2.1/admin/organizations/' + orgID + '/users/';
-  let data = { email: email, name: name, password: password };
+  let data = { email: email, name: name };
   return this.req.post(url, data);
 };
 
@@ -1479,7 +1479,7 @@ seafileAPI.orgAdminListOrgUsers = function (orgID, isStaff, page, sortBy, sortOr
 };
 
 // Org Admin: add org user
-seafileAPI.orgAdminAddOrgUser = function (orgID, email, name, password) {
+seafileAPI.orgAdminAddOrgUser = function (orgID, email, name) {
   let url = this.server + '/api/v2.1/org/' + orgID + '/admin/users/';
   return this.req.post(url, { email, name });
 };

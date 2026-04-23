@@ -104,7 +104,7 @@ class Item extends Component {
       isOpIconShown: false,
       highlight: false,
       isDeleteDialogOpen: false,
-      isResetPasswordDialogOpen: false,
+
       isRestoreDialogOpen: false,
       isConfirmInactiveDialogOpen: false,
       isConfirmTransferOwnershipDialogOpen: false
@@ -142,9 +142,7 @@ class Item extends Component {
       case 'Delete':
         this.toggleDeleteDialog();
         break;
-      case 'Reset Password':
-        this.toggleResetPasswordDialog();
-        break;
+
       case 'Restore':
         this.toggleRestoreDialog();
         break;
@@ -160,12 +158,7 @@ class Item extends Component {
     this.setState({ isDeleteDialogOpen: !this.state.isDeleteDialogOpen });
   };
 
-  toggleResetPasswordDialog = (e) => {
-    if (e) {
-      e.preventDefault();
-    }
-    this.setState({ isResetPasswordDialogOpen: !this.state.isResetPasswordDialogOpen });
-  };
+
 
   toggleRestoreDialog = (e) => {
     if (e) {
@@ -212,14 +205,7 @@ class Item extends Component {
     this.props.restoreUser(this.props.item.email);
   };
 
-  resetPassword = () => {
-    seafileAPI.sysAdminResetUserPassword(this.props.item.email).then(res => {
-      toaster.success(res.data.reset_tip);
-    }).catch((error) => {
-      let errMessage = Utils.getErrorMsg(error);
-      toaster.danger(errMessage);
-    });
-  };
+
 
   translateOperations = (item) => {
     let translateResult = '';
@@ -227,9 +213,7 @@ class Item extends Component {
       case 'Delete':
         translateResult = gettext('Delete');
         break;
-      case 'Reset Password':
-        translateResult = gettext('Reset Password');
-        break;
+
       case 'Restore':
         translateResult = gettext('Restore');
         break;
@@ -262,11 +246,11 @@ class Item extends Component {
 
   render() {
     const { item } = this.props;
-    const { highlight, isOpIconShown, isDeleteDialogOpen, isResetPasswordDialogOpen, isRestoreDialogOpen, isConfirmInactiveDialogOpen, isConfirmTransferOwnershipDialogOpen } = this.state;
+    const { highlight, isOpIconShown, isDeleteDialogOpen, isRestoreDialogOpen, isConfirmInactiveDialogOpen, isConfirmTransferOwnershipDialogOpen } = this.state;
 
     const itemName = '<span class="op-target">' + Utils.HTMLescape(item.name) + '</span>';
     let deleteDialogMsg = gettext('Are you sure you want to delete {placeholder} ?').replace('{placeholder}', itemName);
-    let resetPasswordDialogMsg = gettext('Are you sure you want to reset the password of {placeholder} ?').replace('{placeholder}', itemName);
+    let resetPasswordDialogMsg = '';
     const confirmSetUserInactiveMsg = gettext('Are you sure you want to set {user_placeholder} inactive?').replace('{user_placeholder}', itemName);
     const restoreDialogMsg = gettext('Are you sure you want to restore {placeholder} ?').replace('{placeholder}', itemName);
     const confirmTransferOwnershipMsg = gettext('Transfer organization ownership to {user_placeholder}? The current owner will be downgraded to admin.').replace('{user_placeholder}', itemName);
@@ -341,7 +325,7 @@ class Item extends Component {
           <td>
             {(isOpIconShown && item.email !== username) &&
               <OpMenu
-                operations={isDeleted ? ['Restore'] : ['Delete', 'Reset Password']}
+                operations={isDeleted ? ['Restore'] : ['Delete']}
                 translateOperations={this.translateOperations}
                 onMenuItemClick={this.onMenuItemClick}
                 onFreezedItem={this.props.onFreezedItem}
@@ -359,15 +343,7 @@ class Item extends Component {
             toggleDialog={this.toggleDeleteDialog}
           />
         }
-        {isResetPasswordDialogOpen &&
-          <CommonOperationConfirmationDialog
-            title={gettext('Reset Password')}
-            message={resetPasswordDialogMsg}
-            executeOperation={this.resetPassword}
-            confirmBtnText={gettext('Reset')}
-            toggleDialog={this.toggleResetPasswordDialog}
-          />
-        }
+
         {isConfirmInactiveDialogOpen &&
           <CommonOperationConfirmationDialog
             title={gettext('Set user inactive')}
@@ -481,8 +457,8 @@ class OrgUsers extends Component {
   };
 
   addUser = (newUserInfo) => {
-    const { email, name, password } = newUserInfo;
-    return seafileAPI.sysAdminAddOrgUser(this.props.orgID, email, name, password).then(res => {
+    const { email, name } = newUserInfo;
+    return seafileAPI.sysAdminAddOrgUser(this.props.orgID, email, name).then(res => {
       let userList = this.state.userList;
       userList.unshift(res.data);
       this.setState({ userList: userList });

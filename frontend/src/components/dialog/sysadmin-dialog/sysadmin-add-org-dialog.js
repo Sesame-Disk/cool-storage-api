@@ -14,24 +14,14 @@ class SysAdminAddOrgDialog extends React.Component {
     this.state = {
       name: '',
       email: '',
-      password: '',
-      passwordAgain: '',
       errorMsg: '',
       isSubmitBtnActive: false
     };
   }
 
   checkSubmitBtnActive = () => {
-    const { name, email, password, passwordAgain } = this.state;
-    let btnActive = true;
-    if (name.trim() != '' &&
-      email.trim() !== '' &&
-      password.trim() !== '' &&
-      passwordAgain.trim() !== '') {
-      btnActive = true;
-    } else {
-      btnActive = false;
-    }
+    const { name, email } = this.state;
+    let btnActive = name.trim() !== '' && email.trim() !== '';
     this.setState({
       isSubmitBtnActive: btnActive
     });
@@ -41,19 +31,7 @@ class SysAdminAddOrgDialog extends React.Component {
     this.props.toggleDialog();
   };
 
-  inputPassword = (e) => {
-    let passwd = e.target.value;
-    this.setState({
-      password: passwd
-    }, this.checkSubmitBtnActive);
-  };
 
-  inputPasswordAgain = (e) => {
-    let passwd = e.target.value;
-    this.setState({
-      passwordAgain: passwd
-    }, this.checkSubmitBtnActive);
-  };
 
   inputEmail = (e) => {
     let email = e.target.value;
@@ -70,22 +48,17 @@ class SysAdminAddOrgDialog extends React.Component {
   };
 
   handleSubmit = () => {
-    let { name, email, password, passwordAgain } = this.state;
-    if (password !== passwordAgain) {
-      this.setState({ errorMsg: gettext('Passwords do not match.') });
-      return;
-    }
+    let { name, email } = this.state;
     const data = {
       orgName: name.trim(),
-      ownerEmail: email.trim(),
-      password: password.trim()
+      ownerEmail: email.trim()
     };
     this.props.addOrg(data);
     this.toggle();
   };
 
   render() {
-    const { errorMsg, password, passwordAgain, email, name, isSubmitBtnActive } = this.state;
+    const { errorMsg, email, name, isSubmitBtnActive } = this.state;
     return (
       <div className="modal show d-block" tabIndex="-1" style={{ backgroundColor: 'rgba(0,0,0,0.5)' }}>
         <div className="modal-dialog modal-dialog-centered">
@@ -109,14 +82,7 @@ class SysAdminAddOrgDialog extends React.Component {
                   </Label>
                   <Input value={email} onChange={this.inputEmail} />
                 </FormGroup>
-                <FormGroup>
-                  <Label>{gettext('Password')}</Label>
-                  <Input type="password" value={password} onChange={this.inputPassword} />
-                </FormGroup>
-                <FormGroup>
-                  <Label>{gettext('Password again')}</Label>
-                  <Input type="password" value={passwordAgain} onChange={this.inputPasswordAgain} />
-                </FormGroup>
+
               </Form>
               {errorMsg && <Alert color="danger">{errorMsg}</Alert>}
             </div>

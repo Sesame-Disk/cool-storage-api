@@ -226,8 +226,8 @@ class OrgUsers extends Component {
     });
   };
 
-  addOrgUser = (email, name, password) => {
-    seafileAPI.orgAdminAddOrgUser(orgID, email, name, password).then(res => {
+  addOrgUser = (email, name) => {
+    seafileAPI.orgAdminAddOrgUser(orgID, email, name).then(res => {
       let userInfo = new OrgUserInfo(res.data);
       this.state.orgUsers.unshift(userInfo);
       this.setState({

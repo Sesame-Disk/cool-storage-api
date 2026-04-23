@@ -30,7 +30,7 @@ class LinkCreation extends React.Component {
     super(props);
 
     this.isExpireDaysNoLimit = (shareLinkExpireDaysMin === 0 && shareLinkExpireDaysMax === 0 && shareLinkExpireDaysDefault === 0);
-    this.defaultExpireDays = this.isExpireDaysNoLimit ? '' : shareLinkExpireDaysDefault;
+    this.defaultExpireDays = this.isExpireDaysNoLimit ? '' : (shareLinkExpireDaysDefault || shareLinkExpireDaysMax);
 
     this.state = {
       linkAmount: '',

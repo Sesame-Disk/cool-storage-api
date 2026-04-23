@@ -26,7 +26,7 @@ class GenerateUploadLink extends React.Component {
     super(props);
 
     this.isExpireDaysNoLimit = (uploadLinkExpireDaysMin === 0 && uploadLinkExpireDaysMax === 0 && uploadLinkExpireDaysDefault === 0);
-    this.defaultExpireDays = this.isExpireDaysNoLimit ? '' : uploadLinkExpireDaysDefault;
+    this.defaultExpireDays = this.isExpireDaysNoLimit ? '' : (uploadLinkExpireDaysDefault || uploadLinkExpireDaysMax);
 
     this.state = {
       showPasswordInput: shareLinkForceUsePassword ? true : false,

@@ -20,9 +20,6 @@ class SysAdminAddUserDialog extends React.Component {
     super(props);
     this.state = {
       errorMsg: '',
-      isPasswordVisible: false,
-      password: '',
-      passwordAgain: '',
       email: '',
       name: '',
       role: 'default',
@@ -31,15 +28,8 @@ class SysAdminAddUserDialog extends React.Component {
   }
 
   checkSubmitBtnActive = () => {
-    const { email, password, passwordAgain } = this.state;
-    let btnActive = true;
-    if (email.trim() &&
-      password.trim() &&
-      passwordAgain.trim()) {
-      btnActive = true;
-    } else {
-      btnActive = false;
-    }
+    const { email } = this.state;
+    let btnActive = !!email.trim();
     this.setState({
       isSubmitBtnActive: btnActive
     });
@@ -49,33 +39,7 @@ class SysAdminAddUserDialog extends React.Component {
     this.props.toggleDialog();
   };
 
-  togglePasswordVisible = () => {
-    this.setState({ isPasswordVisible: !this.state.isPasswordVisible });
-  };
 
-  inputPassword = (e) => {
-    let passwd = e.target.value;
-    this.setState({
-      password: passwd,
-      errorMsg: ''
-    }, this.checkSubmitBtnActive);
-  };
-
-  inputPasswordAgain = (e) => {
-    let passwd = e.target.value;
-    this.setState({
-      passwordAgain: passwd,
-      errorMsg: ''
-    }, this.checkSubmitBtnActive);
-  };
-
-  generatePassword = () => {
-    let val = Utils.generatePassword(8);
-    this.setState({
-      password: val,
-      passwordAgain: val
-    }, this.checkSubmitBtnActive);
-  };
 
   inputEmail = (e) => {
     let email = e.target.value;
@@ -98,15 +62,10 @@ class SysAdminAddUserDialog extends React.Component {
   };
 
   handleSubmit = () => {
-    const { email, password, passwordAgain, name, role } = this.state;
-    if (password !== passwordAgain) {
-      this.setState({ errorMsg: gettext('Passwords do not match.') });
-      return;
-    }
+    const { email, name, role } = this.state;
     let data = {
       email: email.trim(),
-      name: name.trim(),
-      password: password.trim()
+      name: name.trim()
     };
     if (this.props.showRole) {
       data.role = role;
@@ -124,8 +83,7 @@ class SysAdminAddUserDialog extends React.Component {
   render() {
     const { dialogTitle, showRole } = this.props;
     const {
-      errorMsg, isPasswordVisible,
-      email, name, role, password, passwordAgain,
+      errorMsg, email, name, role,
       isSubmitBtnActive
     } = this.state;
     return (
@@ -163,20 +121,7 @@ class SysAdminAddUserDialog extends React.Component {
                     />
                   </FormGroup>
                 }
-                <FormGroup>
-                  <Label>{gettext('Password')}</Label>
-                  <InputGroup>
-                    <Input autoComplete="new-password" type={isPasswordVisible ? 'text' : 'password'} value={password || ''} onChange={this.inputPassword} />
-                    <InputGroupAddon addonType="append">
-                      <Button className="mt-0" onClick={this.togglePasswordVisible}><i className={`link-operation-icon fas ${this.state.isPasswordVisible ? 'fa-eye' : 'fa-eye-slash'}`}></i></Button>
-                      <Button className="mt-0" onClick={this.generatePassword}><i className="link-operation-icon fas fa-magic"></i></Button>
-                    </InputGroupAddon>
-                  </InputGroup>
-                </FormGroup>
-                <FormGroup>
-                  <Label>{gettext('Password again')}</Label>
-                  <Input type={isPasswordVisible ? 'text' : 'password'} value={passwordAgain || ''} onChange={this.inputPasswordAgain} />
-                </FormGroup>
+
               </Form>
               {errorMsg && <Alert color="danger">{errorMsg}</Alert>}
             </div>
