@@ -50,7 +50,6 @@ type bootstrapOrgData struct {
 func buildBootstrapBackendRoutes() gin.H {
 	return gin.H{
 		"languageChange":        "i18n/?lang={langCode}",
-		"passwordChange":        "accounts/password/change/",
 		"twoFactorSetup":        "profile/two_factor_authentication/setup/",
 		"twoFactorDisable":      "profile/two_factor_authentication/disable/",
 		"twoFactorBackupTokens": "profile/two_factor_authentication/backup/tokens/",
@@ -458,7 +457,6 @@ func (s *Server) buildAppBootstrapPageOptions(identity bootstrapIdentity, userDa
 		name = identity.UserID
 	}
 	authenticated := identity.UserID != "" && identity.OrgID != ""
-	hasPasswordChange := strings.TrimSpace(s.config.Accounts.PasswordChangeURL) != ""
 	hasDeleteAccount := strings.TrimSpace(s.config.Accounts.DeleteAccountURL) != ""
 
 	pageOptions := gin.H{
@@ -471,8 +469,6 @@ func (s *Server) buildAppBootstrapPageOptions(identity bootstrapIdentity, userDa
 		"enableUpdateUserInfo":      authenticated,
 		"enableUserSetContactEmail": false,
 		"enableUserSetName":         authenticated,
-		"canUpdatePassword":         authenticated && hasPasswordChange,
-		"passwordOperationText":     "Change",
 		"enableAPIKeys":             authenticated,
 		"enableDeleteAccount":       authenticated && hasDeleteAccount,
 		"langCode":                  "en",
@@ -559,8 +555,6 @@ func (s *Server) buildAppBootstrapPageOptions(identity bootstrapIdentity, userDa
 	pageOptions["enableUpdateUserInfo"] = true
 	pageOptions["enableUserSetContactEmail"] = false
 	pageOptions["enableUserSetName"] = true
-	pageOptions["canUpdatePassword"] = hasPasswordChange
-	pageOptions["passwordOperationText"] = "Change"
 	pageOptions["enableAPIKeys"] = true
 	pageOptions["enableDeleteAccount"] = hasDeleteAccount
 	pageOptions["userRole"] = role

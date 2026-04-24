@@ -192,7 +192,6 @@ billing:
 accounts:
   # Docker/local testing Accounts portal. Frontend opens the internal SesameFS routes,
   # and the backend redirects authenticated users to these external destinations.
-  password_change_url: "https://t-accounts.sesamedisk.com/accounts/password/change/"
   delete_account_url: "https://t-accounts.sesamedisk.com/accounts/delete/"
   org_user_management_url: "https://t-accounts.sesamedisk.com/orgs/{org_id}/users/"  # Accounts org-member base URL; SesameFS replaces {org_id} and appends view/action/user_email query params
   disable_org_user_writes: true   # Keep tenant org-admin user writes disabled by default in local/docker too

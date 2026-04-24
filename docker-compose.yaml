@@ -11,7 +11,6 @@ services:
       - PORT=${PORT:-8080}
       - SERVER_URL=${SERVER_URL}
       - BILLING_URL=${BILLING_URL:-https://t-accounts.sesamedisk.com/billing/}
-      - ACCOUNTS_PASSWORD_CHANGE_URL=${ACCOUNTS_PASSWORD_CHANGE_URL:-https://t-accounts.sesamedisk.com/accounts/password/change/}
       - ACCOUNTS_DELETE_ACCOUNT_URL=${ACCOUNTS_DELETE_ACCOUNT_URL:-https://t-accounts.sesamedisk.com/accounts/delete/}
       - ACCOUNTS_ORG_USER_MANAGEMENT_URL=${ACCOUNTS_ORG_USER_MANAGEMENT_URL:-https://t-accounts.sesamedisk.com/accounts/sesamefs/dashboard/}
       - ACCOUNTS_DISABLE_ORG_USER_WRITES=${ACCOUNTS_DISABLE_ORG_USER_WRITES:-false}

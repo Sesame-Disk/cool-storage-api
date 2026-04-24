@@ -22,7 +22,7 @@
 #   SERVER_TRUSTED_PROXIES, FIRST_SUPERADMIN_EMAIL,
 #   GC_ENABLED, GC_USER_GRACE_DAYS, GC_ORG_GRACE_DAYS,
 #   GC_TRASH_RETENTION_DAYS, GC_AUDIT_RETENTION_DAYS,
-#   ACCOUNTS_PASSWORD_CHANGE_URL, ACCOUNTS_DELETE_ACCOUNT_URL,
+#   ACCOUNTS_DELETE_ACCOUNT_URL,
 #   ACCOUNTS_DISABLE_ORG_USER_WRITES
 # =============================================================================
 
@@ -143,7 +143,6 @@ billing:
 # the backend redirects authenticated users to the external Accounts service.
 # =============================================================================
 accounts:
-  password_change_url: ""      # Required in production via ACCOUNTS_PASSWORD_CHANGE_URL
   delete_account_url: ""       # Required in production via ACCOUNTS_DELETE_ACCOUNT_URL
   org_user_management_url: ""  # Optional Accounts org-member base URL; supports {org_id}. SesameFS appends view/action/user_email query params. Override with ACCOUNTS_ORG_USER_MANAGEMENT_URL
   disable_org_user_writes: true # Keep tenant org-admin user writes disabled unless explicitly re-enabled

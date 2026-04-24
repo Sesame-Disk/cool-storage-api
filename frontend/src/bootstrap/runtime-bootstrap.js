@@ -37,7 +37,6 @@ function getDefaultLanguageOption(langCode = 'en') {
 function getDefaultBackendRoutes() {
     return {
         languageChange: 'i18n/?lang={langCode}',
-        passwordChange: 'accounts/password/change/',
         twoFactorSetup: 'profile/two_factor_authentication/setup/',
         twoFactorDisable: 'profile/two_factor_authentication/disable/',
         twoFactorBackupTokens: 'profile/two_factor_authentication/backup/tokens/',
@@ -90,8 +89,6 @@ const APP_PAGE_OPTION_DEFAULTS = {
     canAddPublicRepo: false,
     canPublishRepo: false,
     canLockUnlockFile: false,
-    canUpdatePassword: false,
-    passwordOperationText: 'Change',
     enableAPIKeys: false,
     enableGetAuthToken: false,
     enableWebdavSecret: false,

@@ -524,12 +524,10 @@ func TestEnvOverrideS3(t *testing.T) {
 func TestEnvOverrideAccounts(t *testing.T) {
 	cfg := DefaultConfig()
 
-	os.Setenv("ACCOUNTS_PASSWORD_CHANGE_URL", "https://accounts.example.com/accounts/password/change/")
 	os.Setenv("ACCOUNTS_DELETE_ACCOUNT_URL", "https://accounts.example.com/accounts/delete/")
 	os.Setenv("ACCOUNTS_ORG_USER_MANAGEMENT_URL", "https://accounts.example.com/orgs/{org_id}/users/")
 	os.Setenv("ACCOUNTS_DISABLE_ORG_USER_WRITES", "true")
 	defer func() {
-		os.Unsetenv("ACCOUNTS_PASSWORD_CHANGE_URL")
 		os.Unsetenv("ACCOUNTS_DELETE_ACCOUNT_URL")
 		os.Unsetenv("ACCOUNTS_ORG_USER_MANAGEMENT_URL")
 		os.Unsetenv("ACCOUNTS_DISABLE_ORG_USER_WRITES")
@@ -537,9 +535,6 @@ func TestEnvOverrideAccounts(t *testing.T) {
 
 	cfg.applyEnvOverrides()
 
-	if cfg.Accounts.PasswordChangeURL != "https://accounts.example.com/accounts/password/change/" {
-		t.Errorf("Accounts.PasswordChangeURL = %s, want https://accounts.example.com/accounts/password/change/", cfg.Accounts.PasswordChangeURL)
-	}
 	if cfg.Accounts.DeleteAccountURL != "https://accounts.example.com/accounts/delete/" {
 		t.Errorf("Accounts.DeleteAccountURL = %s, want https://accounts.example.com/accounts/delete/", cfg.Accounts.DeleteAccountURL)
 	}

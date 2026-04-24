@@ -35,7 +35,6 @@ automatically.
 | `SHARE_LINK_HMAC_KEY` | ≥32 random bytes | known dev default, empty |
 | `SERVER_URL` | full https URL | empty |
 | `BILLING_URL` | full https URL | empty |
-| `ACCOUNTS_PASSWORD_CHANGE_URL` | full https URL | empty |
 | `ACCOUNTS_DELETE_ACCOUNT_URL` | full https URL | empty |
 | `OIDC_ISSUER` | https URL of your IdP | empty, plain http |
 | `OIDC_CLIENT_ID` / `OIDC_CLIENT_SECRET` | set | empty |

@@ -249,7 +249,6 @@ do_init_env() {
 
   needs_manual SERVER_URL                    "your public base URL"
   needs_manual BILLING_URL                   "accounts portal billing URL"
-  needs_manual ACCOUNTS_PASSWORD_CHANGE_URL  "accounts portal password-change URL"
   needs_manual ACCOUNTS_DELETE_ACCOUNT_URL   "accounts portal delete-account URL"
   needs_manual OIDC_ISSUER                   "your IdP issuer URL"
   needs_manual OIDC_CLIENT_ID                "issued by your IdP"
@@ -316,7 +315,7 @@ check_share_link_hmac_key() {
 check_external_urls() {
   section "External URLs"
 
-  local required=(SERVER_URL BILLING_URL ACCOUNTS_PASSWORD_CHANGE_URL ACCOUNTS_DELETE_ACCOUNT_URL)
+  local required=(SERVER_URL BILLING_URL ACCOUNTS_DELETE_ACCOUNT_URL)
   for v in "${required[@]}"; do
     if ! is_set "$v"; then
       fail "$v is unset. Required for user-facing redirects."

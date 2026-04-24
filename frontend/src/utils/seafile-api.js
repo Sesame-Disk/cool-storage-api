@@ -1269,12 +1269,6 @@ seafileAPI.sysAdminListOrgUploadLinks = function (orgID, page, perPage, sortBy, 
   return this.req.get(url);
 };
 
-// Admin: reset user password
-seafileAPI.sysAdminResetUserPassword = function (email) {
-  let url = this.server + '/api/v2.1/admin/users/' + encodeURIComponent(email) + '/reset-password/';
-  return this.req.put(url);
-};
-
 // ============================================================================
 // Repository History API methods
 // ============================================================================
@@ -1506,12 +1500,6 @@ seafileAPI.orgAdminRestoreOrgUser = function (orgID, email) {
 seafileAPI.orgAdminChangeOrgUserStatus = function (orgID, email, isActive) {
   let url = this.server + '/api/v2.1/org/' + orgID + '/admin/users/' + encodeURIComponent(email) + '/';
   return this.req.put(url, { is_active: !!isActive });
-};
-
-// Org Admin: reset org user password
-seafileAPI.orgAdminResetOrgUserPassword = function (orgID, email) {
-  let url = this.server + '/api/v2.1/org/' + orgID + '/admin/users/' + encodeURIComponent(email) + '/set-password/';
-  return this.req.put(url);
 };
 
 // Org Admin: set org user name

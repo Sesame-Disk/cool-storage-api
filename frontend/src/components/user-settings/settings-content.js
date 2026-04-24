@@ -9,7 +9,6 @@ import UserAvatarForm from './user-avatar-form';
 import UserBasicInfoForm from './user-basic-info-form';
 import APIKeys from './api-keys';
 import WebAPIAuthToken from './web-api-auth-token';
-import WebdavPassword from './webdav-password';
 import LanguageSetting from './language-setting';
 import ListInAddressBook from './list-in-address-book';
 import EmailNotice from './email-notice';
@@ -18,7 +17,7 @@ import SocialLogin from './social-login';
 import SocialLoginDingtalk from './social-login-dingtalk';
 import SocialLoginSAML from './social-login-saml';
 import DeleteAccount from './delete-account';
-import { getSettingsPageOptions, getSettingsRoute } from './page-options';
+import { getSettingsPageOptions } from './page-options';
 
 import './settings-content.css';
 
@@ -42,10 +41,8 @@ class SettingsContent extends React.Component {
     constructor(props) {
         super(props);
         const pageOptions = getSettingsPageOptions();
-        const canUpdatePassword = Boolean(pageOptions.canUpdatePassword);
         const enableAPIKeys = Boolean(pageOptions.enableAPIKeys);
         const enableGetAuthToken = Boolean(pageOptions.enableGetAuthToken);
-        const enableWebdavSecret = Boolean(pageOptions.enableWebdavSecret);
         const enableAddressBook = Boolean(pageOptions.enableAddressBook);
         const twoFactorAuthEnabled = Boolean(pageOptions.twoFactorAuthEnabled);
         const enableWechatWork = Boolean(pageOptions.enableWechatWork);
@@ -164,11 +161,8 @@ class SettingsContent extends React.Component {
 
     render() {
         const pageOptions = getSettingsPageOptions();
-        const canUpdatePassword = Boolean(pageOptions.canUpdatePassword);
-        const passwordOperationText = pageOptions.passwordOperationText || gettext('Change');
         const enableAPIKeys = Boolean(pageOptions.enableAPIKeys);
         const enableGetAuthToken = Boolean(pageOptions.enableGetAuthToken);
-        const enableWebdavSecret = Boolean(pageOptions.enableWebdavSecret);
         const enableAddressBook = Boolean(pageOptions.enableAddressBook);
         const twoFactorAuthEnabled = Boolean(pageOptions.twoFactorAuthEnabled);
         const enableWechatWork = Boolean(pageOptions.enableWechatWork);
@@ -177,7 +171,6 @@ class SettingsContent extends React.Component {
         const enableADFS = Boolean(pageOptions.enableADFS);
         const enableMultiADFS = Boolean(pageOptions.enableMultiADFS);
         const enableDeleteAccount = Boolean(pageOptions.enableDeleteAccount);
-        const passwordChangeUrl = getSettingsRoute('passwordChange', 'accounts/password/change/');
 
         return (
             <div className={`user-settings-layout ${this.props.className}`.trim()}>

@@ -9,7 +9,6 @@ import (
 
 func TestBuildAppBootstrapPageOptionsIncludesSettingsBasics(t *testing.T) {
 	s := createTestServer()
-	s.config.Accounts.PasswordChangeURL = "https://accounts.example.com/accounts/password/change/"
 	s.config.Accounts.DeleteAccountURL = "https://accounts.example.com/accounts/delete/"
 	identity := bootstrapIdentity{UserID: "user-1", OrgID: "org-1", Role: "user", Email: "user@example.com"}
 	userData := bootstrapUserData{Email: "user@example.com", Name: "Test User", Role: "user"}
@@ -54,17 +53,8 @@ func TestBuildAppBootstrapPageOptionsIncludesSettingsBasics(t *testing.T) {
 	if !ok {
 		t.Fatalf("backendRoutes has unexpected type: %T", pageOptions["backendRoutes"])
 	}
-	if backendRoutes["passwordChange"] != "accounts/password/change/" {
-		t.Fatalf("backendRoutes.passwordChange = %v, want %q", backendRoutes["passwordChange"], "accounts/password/change/")
-	}
 	if backendRoutes["deleteAccount"] != "accounts/delete/" {
 		t.Fatalf("backendRoutes.deleteAccount = %v, want %q", backendRoutes["deleteAccount"], "accounts/delete/")
-	}
-	if enabled, ok := pageOptions["canUpdatePassword"].(bool); !ok || !enabled {
-		t.Fatalf("canUpdatePassword = %v, want true", pageOptions["canUpdatePassword"])
-	}
-	if pageOptions["passwordOperationText"] != "Change" {
-		t.Fatalf("passwordOperationText = %v, want %q", pageOptions["passwordOperationText"], "Change")
 	}
 	if enabled, ok := pageOptions["enableAPIKeys"].(bool); !ok || !enabled {
 		t.Fatalf("enableAPIKeys = %v, want true", pageOptions["enableAPIKeys"])

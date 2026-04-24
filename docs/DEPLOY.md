@@ -241,8 +241,7 @@ SHARE_LINK_HMAC_KEY=<from step 0.3 — third openssl output>
 # External billing portal used by /billing/
 BILLING_URL=https://accounts.yourdomain.com/billing/
 
-# External Accounts URLs used by /accounts/password/change/ and /accounts/delete/
-ACCOUNTS_PASSWORD_CHANGE_URL=https://accounts.yourdomain.com/accounts/password/change/
+# External Accounts URLs used by /accounts/delete/
 ACCOUNTS_DELETE_ACCOUNT_URL=https://accounts.yourdomain.com/accounts/delete/
 # Org user management link in org-admin panel ({org_id} replaced at runtime).
 # Leave empty to hide the "Manage in Accounts" button.
@@ -272,7 +271,7 @@ ONLYOFFICE_JWT_SECRET=<from step 0.3 — second openssl output>
 
 > `BILLING_URL` is different: it is the external billing portal destination. Users click SesameFS `/billing/`, and the backend redirects authenticated sessions to this external URL in a new tab.
 
-> `ACCOUNTS_PASSWORD_CHANGE_URL` and `ACCOUNTS_DELETE_ACCOUNT_URL` work the same way for `/accounts/password/change/` and `/accounts/delete/`.
+> `ACCOUNTS_DELETE_ACCOUNT_URL` works the same way for `/accounts/delete/`.
 
 > `ACCOUNTS_DISABLE_ORG_USER_WRITES` should normally stay `true`. That keeps tenant org-admin user lifecycle writes disabled so Accounts remains the operational authority. Platform superadmins still bypass that tenant lock as an operational fallback, but Accounts should prefer the `/admin/...` surface.
 
@@ -500,7 +499,6 @@ Settings that **cannot** be set via env vars and must be in this file:
 | `CORS_ALLOWED_ORIGINS` | `cors.allowed_origins` | Comma-separated origins. Wildcard `"*"` is rejected in production. |
 | `ONLYOFFICE_JWT_TTL_SECONDS` | `onlyoffice.jwt_ttl_seconds` | OnlyOffice editor JWT lifetime in seconds. Default `3600` (1h). Range: 300–28800. |
 | `FIRST_SUPERADMIN_EMAIL` | `auth.first_superadmin_email` | Optional bootstrap email used only on the first successful seed. |
-| `ACCOUNTS_PASSWORD_CHANGE_URL` | `accounts.password_change_url` | External Accounts password-change URL. |
 | `ACCOUNTS_DELETE_ACCOUNT_URL` | `accounts.delete_account_url` | External Accounts account-deletion URL. |
 | `ACCOUNTS_ORG_USER_MANAGEMENT_URL` | `accounts.org_user_management_url` | Optional external Accounts org-member management base URL. |
 | `ACCOUNTS_DISABLE_ORG_USER_WRITES` | `accounts.disable_org_user_writes` | Defaults to `true`; keeps tenant org-admin user writes disabled. |

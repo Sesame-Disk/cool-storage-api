@@ -77,7 +77,6 @@ billing:
   url: ""
 
 accounts:
-  password_change_url: ""
   delete_account_url: ""
   org_user_management_url: ""
   disable_org_user_writes: true

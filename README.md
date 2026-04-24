@@ -180,9 +180,6 @@ curl http://localhost:3000/api2/account/info/ \
 
 # Billing portal redirect (Docker dev defaults to the Sesame test billing URL)
 curl -I http://localhost:3000/billing/
-
-# Accounts redirects (Docker dev defaults to the Sesame test accounts URLs)
-curl -I http://localhost:3000/accounts/password/change/
 curl -I http://localhost:3000/accounts/delete/
 
 # Stop when done
@@ -191,7 +188,9 @@ docker compose down
 
 `/billing/` is always an internal SesameFS route. The backend checks authentication and redirects to the external portal configured by `BILLING_URL`. In local Docker Compose, that env var defaults to `https://t-accounts.sesamedisk.com/billing/` for testing only.
 
-`/accounts/password/change/` and `/accounts/delete/` follow the same pattern. SesameFS validates authentication first, then redirects to the external Accounts URLs configured by `ACCOUNTS_PASSWORD_CHANGE_URL` and `ACCOUNTS_DELETE_ACCOUNT_URL`.
+`/accounts/delete/` follows the same pattern. SesameFS validates authentication first, then redirects to the external Accounts URL configured by `ACCOUNTS_DELETE_ACCOUNT_URL`.
+
+
 
 ### Local Development (Run Go outside Docker)
 

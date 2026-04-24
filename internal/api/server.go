@@ -590,14 +590,6 @@ func externalRedirectTarget(targetURL, rawQuery string) (string, error) {
 	return target.String(), nil
 }
 
-func (s *Server) passwordChangeRedirectTarget(rawQuery string) (string, error) {
-	targetURL := strings.TrimSpace(s.config.Accounts.PasswordChangeURL)
-	if targetURL == "" {
-		return "", fmt.Errorf("accounts password change URL is not configured")
-	}
-	return externalRedirectTarget(targetURL, rawQuery)
-}
-
 func (s *Server) deleteAccountRedirectTarget(rawQuery string) (string, error) {
 	targetURL := strings.TrimSpace(s.config.Accounts.DeleteAccountURL)
 	if targetURL == "" {
@@ -613,21 +605,6 @@ func (s *Server) handleBillingRedirect(c *gin.Context) {
 	}
 
 	target, err := s.billingRedirectTarget(c.Request.URL.RawQuery)
-	if err != nil {
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
-		return
-	}
-
-	c.Redirect(http.StatusTemporaryRedirect, target)
-}
-
-func (s *Server) handlePasswordChangeRedirect(c *gin.Context) {
-	if _, orgID, _ := s.resolveUserAuth(c); orgID == "" {
-		c.Redirect(http.StatusFound, "/accounts/login/?next="+url.QueryEscape(c.Request.URL.RequestURI()))
-		return
-	}
-
-	target, err := s.passwordChangeRedirectTarget(c.Request.URL.RawQuery)
 	if err != nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
 		return

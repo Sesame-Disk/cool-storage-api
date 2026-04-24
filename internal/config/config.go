@@ -145,7 +145,6 @@ type BillingConfig struct {
 
 // AccountsConfig holds external account-management integration settings.
 type AccountsConfig struct {
-	PasswordChangeURL    string `yaml:"password_change_url"`
 	DeleteAccountURL     string `yaml:"delete_account_url"`
 	OrgUserManagementURL string `yaml:"org_user_management_url"`
 	DisableOrgUserWrites bool   `yaml:"disable_org_user_writes"`
@@ -822,9 +821,6 @@ func (c *Config) applyEnvOverrides() {
 	// Billing
 	if v := os.Getenv("BILLING_URL"); v != "" {
 		c.Billing.URL = v
-	}
-	if v := os.Getenv("ACCOUNTS_PASSWORD_CHANGE_URL"); v != "" {
-		c.Accounts.PasswordChangeURL = v
 	}
 	if v := os.Getenv("ACCOUNTS_DELETE_ACCOUNT_URL"); v != "" {
 		c.Accounts.DeleteAccountURL = v

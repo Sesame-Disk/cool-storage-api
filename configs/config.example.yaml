@@ -162,9 +162,8 @@ billing:
 
 accounts:
   # External Accounts URLs used by SesameFS internal redirect routes.
-  # Frontend links stay inside SesameFS at /accounts/password/change/ and /accounts/delete/;
+  # Frontend links stay inside SesameFS at /accounts/delete/;
   # the backend validates auth and redirects to these external destinations.
-  password_change_url: ""           # Override with ACCOUNTS_PASSWORD_CHANGE_URL env var
   delete_account_url: ""            # Override with ACCOUNTS_DELETE_ACCOUNT_URL env var
   org_user_management_url: ""       # Optional Accounts org-member base URL; supports {org_id}. SesameFS appends view/action/user_email query params. Override with ACCOUNTS_ORG_USER_MANAGEMENT_URL
   # Default is true: tenant org-admin user writes under /api/v2.1/org/:org_id/admin/... are blocked.
