@@ -1,5 +1,6 @@
 import React from 'react';
 import { getLoginURL } from '../utils/auth-state';
+import { syncSesameAiWidget } from './sesame-ai-widget';
 
 function getDefaultAppConfig() {
     return {
@@ -250,6 +251,7 @@ export async function loadBootstrap(scope = 'app') {
     try {
         const response = await fetch(buildBootstrapUrl(), { credentials: 'same-origin' });
         if (!response.ok) {
+            syncSesameAiWidget({ isAuthenticated: false });
             return {
                 bootstrapError: true,
                 status: response.status,
@@ -272,8 +274,14 @@ export async function loadBootstrap(scope = 'app') {
 
         window.app.pageOptions.bootstrapReady = true;
         window.__SESAMEFS_BOOTSTRAP__ = data;
+        syncSesameAiWidget({
+            isAuthenticated: data?.permissions?.isAuthenticated === true,
+            pageOptions: window.app.pageOptions,
+            bootstrapPageOptions: data?.app_page_options,
+        });
         return data;
     } catch (error) {
+        syncSesameAiWidget({ isAuthenticated: false });
         return {
             bootstrapError: true,
             reason: 'network',

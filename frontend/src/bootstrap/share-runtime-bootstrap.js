@@ -1,3 +1,5 @@
+import { syncSesameAiWidget } from './sesame-ai-widget';
+
 function escapeHtml(value) {
   return String(value || '')
     .replace(/&/g, '&amp;')
@@ -150,6 +152,7 @@ export async function loadShareBootstrap() {
   ensureAppGlobals();
 
   if (Object.keys(window.shared.pageOptions || {}).length > 0) {
+    syncSesameAiWidget({ isAuthenticated: false, pageOptions: window.app.pageOptions });
     return {
       render_mode: 'bundle',
       page_options: window.shared.pageOptions,
@@ -163,6 +166,7 @@ export async function loadShareBootstrap() {
 
   window.shared.pageOptions = { ...(data?.page_options || {}) };
   window.shared.bootstrapMeta = data;
+  syncSesameAiWidget({ isAuthenticated: false, pageOptions: window.app.pageOptions });
   return data;
 }
 
@@ -170,6 +174,7 @@ export async function loadUploadLinkBootstrap() {
   ensureAppGlobals();
 
   if (Object.keys(window.uploadLink || {}).length > 0) {
+    syncSesameAiWidget({ isAuthenticated: false, pageOptions: window.app.pageOptions });
     return {
       render_mode: 'bundle',
       page_options: window.uploadLink,
@@ -190,5 +195,6 @@ export async function loadUploadLinkBootstrap() {
 
   Object.assign(window.uploadLink, data?.page_options || {});
   window.uploadLinkBootstrapMeta = data;
+  syncSesameAiWidget({ isAuthenticated: false, pageOptions: window.app.pageOptions });
   return data;
 }

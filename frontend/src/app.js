@@ -7,6 +7,7 @@ import { siteRoot } from './utils/constants';
 import { redirectToLogin } from './utils/auth-state';
 import { Utils } from './utils/utils';
 import { getBootstrapPermissions } from './bootstrap/runtime-bootstrap';
+import { syncSesameAiWidget } from './bootstrap/sesame-ai-widget';
 import { buildFileViewURL } from './utils/file-view-url';
 import { hasActiveSession, seafileAPI } from './utils/seafile-api';
 import LoginPage from './pages/login';
@@ -214,12 +215,18 @@ class App extends Component {
       //   download_over_quota, reset_date }
       window.app.pageOptions.trafficInfo = data.traffic || null;
 
+      syncSesameAiWidget({
+        isAuthenticated: true,
+        pageOptions: window.app.pageOptions,
+      });
+
       // Force a re-render to pick up new permissions
       this.forceUpdate();
     }).catch(error => {
       console.error('Failed to load user permissions:', error);
       // On error, default to restrictive permissions
       window.app.pageOptions.canAddRepo = false;
+      syncSesameAiWidget({ isAuthenticated: false, pageOptions: window.app.pageOptions });
     });
   };
 

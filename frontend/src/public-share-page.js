@@ -10,6 +10,7 @@ import {
     fetchBootstrap,
     renderPublicBootstrapError,
 } from './bootstrap/share-runtime-bootstrap';
+import { syncSesameAiWidget } from './bootstrap/sesame-ai-widget';
 
 const SHARE_MODULE_LOADERS = {
     sharedDirView: () => import('./shared-dir-view'),
@@ -160,6 +161,7 @@ async function bootstrapSharePage() {
     window.shared = window.shared || {};
     window.shared.pageOptions = pageOptions;
     window.shared.bootstrapMeta = data;
+    syncSesameAiWidget({ isAuthenticated: false, pageOptions: window.app.pageOptions });
 
     if (pageOptions.needPassword) {
         ReactDom.render(<PublicPasswordPrompt token={pageOptions.sharedToken || pageOptions.token} />, document.getElementById('wrapper'));
