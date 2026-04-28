@@ -2368,6 +2368,25 @@ func (s *Server) handleGCFailedItems(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"items": items})
 }
 
+func (s *Server) handleGCFailedItemOrgs(c *gin.Context) {
+	if s.gcService == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "GC service not available"})
+		return
+	}
+	limit := 20
+	if raw := strings.TrimSpace(c.Query("limit")); raw != "" {
+		if parsed, err := strconv.Atoi(raw); err == nil && parsed > 0 {
+			limit = parsed
+		}
+	}
+	orgs, err := s.gcService.ListFailedItemOrgs(limit)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"organizations": orgs})
+}
+
 func (s *Server) handleGCFailedItemRequeue(c *gin.Context) {
 	if s.gcService == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "GC service not available"})

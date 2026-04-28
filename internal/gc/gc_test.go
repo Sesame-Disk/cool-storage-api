@@ -497,6 +497,56 @@ func TestService_Status_SnapshotAgeReflectsRecentReconcile(t *testing.T) {
 	}
 }
 
+func TestService_ListFailedItemOrgs_SortsAndLimits(t *testing.T) {
+	store := NewMockStore()
+	orgA := uuid.New()
+	orgB := uuid.New()
+	orgC := uuid.New()
+	store.AddOrganizationWithName(orgA, "alpha")
+	store.AddOrganizationWithName(orgB, "beta")
+	store.AddOrganizationWithName(orgC, "gamma")
+	older := time.Now().UTC().Add(-2 * time.Hour)
+	newer := time.Now().UTC().Add(-1 * time.Hour)
+	if err := store.SaveOrgQueueStats(GCOrgStats{OrgID: orgA, FailedDepth: 2, UpdatedAt: older}); err != nil {
+		t.Fatalf("SaveOrgQueueStats(orgA): %v", err)
+	}
+	if err := store.SaveOrgQueueStats(GCOrgStats{OrgID: orgB, FailedDepth: 5, UpdatedAt: newer}); err != nil {
+		t.Fatalf("SaveOrgQueueStats(orgB): %v", err)
+	}
+	if err := store.SaveOrgQueueStats(GCOrgStats{OrgID: orgC, FailedDepth: 0, UpdatedAt: newer}); err != nil {
+		t.Fatalf("SaveOrgQueueStats(orgC): %v", err)
+	}
+	svc := NewService(store, nil, config.GCConfig{Enabled: true}, nil)
+
+	orgs, err := svc.ListFailedItemOrgs(1)
+	if err != nil {
+		t.Fatalf("ListFailedItemOrgs: %v", err)
+	}
+	if len(orgs) != 1 {
+		t.Fatalf("len(orgs) = %d, want 1", len(orgs))
+	}
+	if orgs[0].OrgID != orgB {
+		t.Fatalf("orgs[0].OrgID = %s, want %s", orgs[0].OrgID, orgB)
+	}
+	if orgs[0].OrgName != "beta" {
+		t.Fatalf("orgs[0].OrgName = %q, want beta", orgs[0].OrgName)
+	}
+	if orgs[0].FailedItemsTotal != 5 {
+		t.Fatalf("orgs[0].FailedItemsTotal = %d, want 5", orgs[0].FailedItemsTotal)
+	}
+
+	orgs, err = svc.ListFailedItemOrgs(10)
+	if err != nil {
+		t.Fatalf("ListFailedItemOrgs(all): %v", err)
+	}
+	if len(orgs) != 2 {
+		t.Fatalf("len(orgs) = %d, want 2", len(orgs))
+	}
+	if orgs[1].OrgID != orgA {
+		t.Fatalf("orgs[1].OrgID = %s, want %s", orgs[1].OrgID, orgA)
+	}
+}
+
 // TestService_DLQOps_SerializeUnderConcurrency exercises the dlqOpsMu guard
 // directly. The hook is wired to the store-level DLQ mutations so the test
 // observes overlap of the actual non-atomic SELECT+INSERT+DELETE in

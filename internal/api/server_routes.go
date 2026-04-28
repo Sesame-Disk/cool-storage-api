@@ -175,6 +175,8 @@ func (s *Server) registerAPIV21Routes(serverURL string) {
 		gcAdmin.GET("/gc/status/", s.handleGCStatus)
 		gcAdmin.POST("/gc/run", s.handleGCRun)
 		gcAdmin.POST("/gc/run/", s.handleGCRun)
+		gcAdmin.GET("/gc/failed-items/orgs", s.handleGCFailedItemOrgs)
+		gcAdmin.GET("/gc/failed-items/orgs/", s.handleGCFailedItemOrgs)
 		gcAdmin.GET("/gc/failed-items", s.handleGCFailedItems)
 		gcAdmin.GET("/gc/failed-items/", s.handleGCFailedItems)
 		gcAdmin.POST("/gc/failed-items/requeue", s.handleGCFailedItemRequeue)

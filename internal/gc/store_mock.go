@@ -894,6 +894,55 @@ func (m *MockStore) ListFailedItems(orgID uuid.UUID, limit int) ([]GCFailedItemI
 	return result, nil
 }
 
+func (m *MockStore) ListOrgsWithFailedItems(limit int) ([]GCFailedItemOrgInfo, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	results := make([]GCFailedItemOrgInfo, 0)
+	seen := make(map[uuid.UUID]struct{})
+	for orgID, stats := range m.orgQueueStats {
+		if stats.FailedDepth <= 0 {
+			continue
+		}
+		results = append(results, GCFailedItemOrgInfo{
+			OrgID:            orgID,
+			OrgName:          m.orgNames[orgID],
+			FailedItemsTotal: stats.FailedDepth,
+			UpdatedAt:        stats.UpdatedAt,
+		})
+		seen[orgID] = struct{}{}
+	}
+	for orgID, items := range m.failedItems {
+		if _, ok := seen[orgID]; ok || len(items) == 0 {
+			continue
+		}
+		updatedAt := time.Time{}
+		for _, item := range items {
+			if item.FailedAt.After(updatedAt) {
+				updatedAt = item.FailedAt
+			}
+		}
+		results = append(results, GCFailedItemOrgInfo{
+			OrgID:            orgID,
+			OrgName:          m.orgNames[orgID],
+			FailedItemsTotal: len(items),
+			UpdatedAt:        updatedAt,
+		})
+	}
+	sort.Slice(results, func(i, j int) bool {
+		if results[i].FailedItemsTotal != results[j].FailedItemsTotal {
+			return results[i].FailedItemsTotal > results[j].FailedItemsTotal
+		}
+		if !results[i].UpdatedAt.Equal(results[j].UpdatedAt) {
+			return results[i].UpdatedAt.After(results[j].UpdatedAt)
+		}
+		return results[i].OrgID.String() < results[j].OrgID.String()
+	})
+	if limit > 0 && len(results) > limit {
+		results = results[:limit]
+	}
+	return results, nil
+}
+
 func (m *MockStore) DeleteFailedItem(orgID uuid.UUID, failedAt time.Time, itemType ItemType, itemID string) error {
 	m.mu.RLock()
 	hook := m.dlqOpHook

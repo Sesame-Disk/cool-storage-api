@@ -87,6 +87,7 @@ import AdminOperationLogs from './admin-logs/operation-logs';
 import AdminLoginLogs from './admin-logs/login-logs';
 
 import AbuseReports from './abuse-reports';
+import GC from './gc';
 import NotFoundPage from '../../components/common/not-found-page';
 
 import '../../css/layout.css';
@@ -157,6 +158,10 @@ class SysAdmin extends React.Component {
       {
         tab: 'adminLogs',
         urlPartList: ['admin-logs/']
+      },
+      {
+        tab: 'gc',
+        urlPartList: ['gc/']
       }
     ];
     const tmpTab = this.getCurrentTabForPageList(pageList);
@@ -265,6 +270,7 @@ class SysAdmin extends React.Component {
             <SharePermissionLogs path={siteRoot + 'sys/logs/share-permission'} {...commonProps} />
             <AdminOperationLogs path={siteRoot + 'sys/admin-logs/operation'} {...commonProps} />
             <AdminLoginLogs path={siteRoot + 'sys/admin-logs/login'} {...commonProps} />
+            <GC path={siteRoot + 'sys/gc'} {...commonProps} />
 
             <Users path={siteRoot + 'sys/users'} {...commonProps} />
             <AdminUsers path={siteRoot + 'sys/users/admins'} {...commonProps} />

@@ -168,6 +168,18 @@ class SidePanel extends React.Component {
                 {otherPermission &&
                   <li className="nav-item">
                     <Link
+                      className={`nav-link ellipsis ${this.getActiveClass('gc')}`}
+                      to={siteRoot + 'sys/gc/'}
+                      onClick={() => this.props.tabItemClick('gc')}
+                    >
+                      <span className="sf2-icon-security" aria-hidden="true"></span>
+                      <span className="nav-text">{gettext('GC')}</span>
+                    </Link>
+                  </li>
+                }
+                {otherPermission &&
+                  <li className="nav-item">
+                    <Link
                       className={`nav-link ellipsis ${this.getActiveClass('links')}`}
                       to={siteRoot + 'sys/share-links/'}
                       onClick={() => this.props.tabItemClick('links')}

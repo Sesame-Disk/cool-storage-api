@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"log"
+	"sort"
 	"strconv"
 	"time"
 
@@ -353,6 +354,48 @@ func (s *CassandraStore) ListFailedItems(orgID uuid.UUID, limit int) ([]GCFailed
 		return nil, fmt.Errorf("list failed items for %s: %w", orgID, err)
 	}
 	return items, nil
+}
+
+func (s *CassandraStore) ListOrgsWithFailedItems(limit int) ([]GCFailedItemOrgInfo, error) {
+	iter := s.db.Session().Query(`SELECT org_id, failed_depth, updated_at FROM gc_org_stats`).Iter()
+	var (
+		orgIDStr    string
+		failedDepth int
+		updatedAt   time.Time
+	)
+	orgs := make([]GCFailedItemOrgInfo, 0)
+	for iter.Scan(&orgIDStr, &failedDepth, &updatedAt) {
+		if failedDepth <= 0 {
+			continue
+		}
+		orgID := parseUUID(orgIDStr)
+		orgName, err := s.GetOrgName(orgID)
+		if err != nil {
+			orgName = ""
+		}
+		orgs = append(orgs, GCFailedItemOrgInfo{
+			OrgID:            orgID,
+			OrgName:          orgName,
+			FailedItemsTotal: failedDepth,
+			UpdatedAt:        updatedAt,
+		})
+	}
+	if err := iter.Close(); err != nil {
+		return nil, fmt.Errorf("list orgs with failed items: %w", err)
+	}
+	sort.Slice(orgs, func(i, j int) bool {
+		if orgs[i].FailedItemsTotal != orgs[j].FailedItemsTotal {
+			return orgs[i].FailedItemsTotal > orgs[j].FailedItemsTotal
+		}
+		if !orgs[i].UpdatedAt.Equal(orgs[j].UpdatedAt) {
+			return orgs[i].UpdatedAt.After(orgs[j].UpdatedAt)
+		}
+		return orgs[i].OrgID.String() < orgs[j].OrgID.String()
+	})
+	if limit > 0 && len(orgs) > limit {
+		orgs = orgs[:limit]
+	}
+	return orgs, nil
 }
 
 func (s *CassandraStore) DeleteFailedItem(orgID uuid.UUID, failedAt time.Time, itemType ItemType, itemID string) error {

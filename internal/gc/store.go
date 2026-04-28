@@ -22,6 +22,7 @@ type GCStore interface {
 	GetTotalQueueSize() (int, error)
 	GetTotalFailedItems() (int, error)
 	ListOrgsWithQueuedItems() ([]uuid.UUID, error)
+	ListOrgsWithFailedItems(limit int) ([]GCFailedItemOrgInfo, error)
 	ListFailedItems(orgID uuid.UUID, limit int) ([]GCFailedItemInfo, error)
 	DeleteFailedItem(orgID uuid.UUID, failedAt time.Time, itemType ItemType, itemID string) error
 	RequeueFailedItem(orgID uuid.UUID, failedAt time.Time, itemType ItemType, itemID string, queuedAt time.Time) error
@@ -243,6 +244,14 @@ type GCOrgStats struct {
 	FailedDepth    int
 	OldestQueuedAt *time.Time
 	UpdatedAt      time.Time
+}
+
+// GCFailedItemOrgInfo summarizes one organization with items in the GC DLQ.
+type GCFailedItemOrgInfo struct {
+	OrgID            uuid.UUID `json:"org_id"`
+	OrgName          string    `json:"org_name"`
+	FailedItemsTotal int       `json:"failed_items_total"`
+	UpdatedAt        time.Time `json:"updated_at"`
 }
 
 // GCFailedItemInfo represents an item moved to the GC dead-letter queue.

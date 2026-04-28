@@ -1209,6 +1209,39 @@ seafileAPI.sysAdminRestoreOrg = function (orgID) {
   return this.req.post(url);
 };
 
+// Sys Admin: GC status and operations
+seafileAPI.sysAdminGetGCStatus = function () {
+  let url = this.server + '/api/v2.1/admin/gc/status/';
+  return this.req.get(url);
+};
+
+seafileAPI.sysAdminRunGC = function (type) {
+  let url = this.server + '/api/v2.1/admin/gc/run/';
+  return this.req.post(url, { type });
+};
+
+seafileAPI.sysAdminListGCFailedItems = function (orgID, limit) {
+  let url = this.server + '/api/v2.1/admin/gc/failed-items/?org_id=' + encodeURIComponent(orgID);
+  if (limit) url += '&limit=' + limit;
+  return this.req.get(url);
+};
+
+seafileAPI.sysAdminListGCFailedItemOrgs = function (limit) {
+  let url = this.server + '/api/v2.1/admin/gc/failed-items/orgs/';
+  if (limit) url += '?limit=' + limit;
+  return this.req.get(url);
+};
+
+seafileAPI.sysAdminRequeueGCFailedItem = function (item) {
+  let url = this.server + '/api/v2.1/admin/gc/failed-items/requeue/';
+  return this.req.post(url, item);
+};
+
+seafileAPI.sysAdminDeleteGCFailedItem = function (item) {
+  let url = this.server + '/api/v2.1/admin/gc/failed-items/';
+  return this.req.delete(url, { data: item });
+};
+
 // Admin: list org users (sys-admin panel)
 seafileAPI.sysAdminListOrgUsers = function (orgID, status) {
   let url = this.server + '/api/v2.1/admin/organizations/' + orgID + '/users/';

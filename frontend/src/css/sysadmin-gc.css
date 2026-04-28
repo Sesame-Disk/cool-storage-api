@@ -1,0 +1,153 @@
+.gc-admin-page .cur-view-content {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.gc-admin-section {
+  background: #fff;
+  border: 1px solid #e5e5e5;
+  border-radius: 8px;
+  padding: 16px;
+}
+
+.gc-admin-section-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 12px;
+}
+
+.gc-admin-section-title {
+  margin: 0 0 4px;
+  font-size: 1rem;
+  font-weight: 600;
+}
+
+.gc-admin-helper,
+.gc-admin-stat-description,
+.gc-admin-field-label,
+.gc-admin-empty {
+  color: #666;
+  font-size: 13px;
+}
+
+.gc-admin-summary-grid,
+.gc-admin-status-grid {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+}
+
+.gc-admin-stat-card {
+  min-height: 104px;
+  padding: 14px;
+  border: 1px solid #edf0f2;
+  border-radius: 8px;
+  background: #fbfcfd;
+}
+
+.gc-admin-stat-card.is-positive {
+  border-color: #bfe5d0;
+  background: #f2fbf5;
+}
+
+.gc-admin-stat-card.is-negative {
+  border-color: #f1c4c4;
+  background: #fdf4f4;
+}
+
+.gc-admin-stat-label {
+  color: #666;
+  font-size: 13px;
+  margin-bottom: 6px;
+}
+
+.gc-admin-stat-value {
+  font-size: 24px;
+  font-weight: 600;
+  line-height: 1.2;
+  margin-bottom: 4px;
+  word-break: break-word;
+}
+
+.gc-admin-action-buttons,
+.gc-admin-inline-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.gc-admin-filter-row {
+  display: grid;
+  grid-template-columns: minmax(260px, 2fr) minmax(90px, 120px) auto;
+  gap: 12px;
+  align-items: end;
+}
+
+.gc-admin-org-search-row {
+  display: grid;
+  grid-template-columns: minmax(260px, 2fr) auto;
+  gap: 12px;
+  align-items: end;
+}
+
+.gc-admin-filter-submit {
+  display: flex;
+  align-items: end;
+}
+
+.gc-admin-table-wrap {
+  overflow-x: auto;
+  margin-top: 16px;
+}
+
+.gc-admin-table {
+  margin-bottom: 0;
+}
+
+.gc-admin-break-word {
+  word-break: break-word;
+  min-width: 140px;
+}
+
+.gc-admin-selected-org {
+  border: 1px solid #e6edf3;
+  border-radius: 8px;
+  background: #f8fbfd;
+  padding: 12px 14px;
+}
+
+.gc-admin-selected-org-title {
+  font-size: 13px;
+  color: #666;
+  margin-bottom: 6px;
+}
+
+.gc-admin-selected-org-body {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+.gc-admin-selected-org-name {
+  font-weight: 600;
+}
+
+@media (max-width: 767.8px) {
+  .gc-admin-org-search-row,
+  .gc-admin-filter-row {
+    grid-template-columns: 1fr;
+  }
+
+  .gc-admin-filter-submit {
+    align-items: stretch;
+  }
+
+  .gc-admin-filter-submit .btn {
+    width: 100%;
+  }
+}

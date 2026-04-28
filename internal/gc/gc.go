@@ -48,19 +48,19 @@ func (s *Stats) LastScanRun() time.Time {
 
 // GCStatus is the JSON response for the admin status endpoint.
 type GCStatus struct {
-	Enabled            bool   `json:"enabled"`
-	DryRun             bool   `json:"dry_run"`
-	LastWorkerRun      string `json:"last_worker_run"`
-	LastScanRun        string `json:"last_scan_run"`
-	LastReconcileRun   string `json:"last_reconcile_run"`
-	QueueSize          int    `json:"queue_size"`
-	FailedItemsTotal   int    `json:"failed_items_total"`
-	DirtyOrgsTotal     int    `json:"dirty_orgs_total"`
+	Enabled          bool   `json:"enabled"`
+	DryRun           bool   `json:"dry_run"`
+	LastWorkerRun    string `json:"last_worker_run"`
+	LastScanRun      string `json:"last_scan_run"`
+	LastReconcileRun string `json:"last_reconcile_run"`
+	QueueSize        int    `json:"queue_size"`
+	FailedItemsTotal int    `json:"failed_items_total"`
+	DirtyOrgsTotal   int    `json:"dirty_orgs_total"`
 	// SnapshotAgeSeconds reports how long ago the queue/failed snapshots were
 	// last reconciled. -1 means no reconciliation has run yet (e.g. cold deploy).
 	SnapshotAgeSeconds int64 `json:"snapshot_age_seconds"`
-	BlocksDeletedTotal int64  `json:"blocks_deleted_total"`
-	GracePeriodSeconds int64  `json:"grace_period_seconds"`
+	BlocksDeletedTotal int64 `json:"blocks_deleted_total"`
+	GracePeriodSeconds int64 `json:"grace_period_seconds"`
 }
 
 const (
@@ -69,6 +69,7 @@ const (
 	gcStatKeyTotalDirtyOrgs      = "dirty_orgs_total"
 	gcStatKeyLastReconcile       = "last_reconcile_run"
 	gcDefaultFailedItemsPageSize = 100
+	gcDefaultFailedOrgPageSize   = 20
 	gcSnapshotDriftCheckEvery    = 10
 )
 
@@ -589,6 +590,13 @@ func (s *Service) ListFailedItems(orgID uuid.UUID, limit int) ([]GCFailedItemInf
 		limit = s.FailedItemsPageSize()
 	}
 	return s.store.ListFailedItems(orgID, limit)
+}
+
+func (s *Service) ListFailedItemOrgs(limit int) ([]GCFailedItemOrgInfo, error) {
+	if limit <= 0 {
+		limit = gcDefaultFailedOrgPageSize
+	}
+	return s.store.ListOrgsWithFailedItems(limit)
 }
 
 func (s *Service) DeleteFailedItem(orgID uuid.UUID, failedAt time.Time, itemType ItemType, itemID string) error {
