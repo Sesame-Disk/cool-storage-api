@@ -18,9 +18,11 @@ flowchart TD
     end
 
     subgraph Service["GC Service"]
-        Queue["Queue<br/>gc_queue table<br/>7-day TTL"]
+        Queue["Queue<br/>gc_queue table<br/>durable (no TTL)"]
         Worker["Worker<br/>Processes batch per org<br/>100 items/tick"]
         Scanner["Scanner<br/>13 safety phases<br/>Finds orphans"]
+        Reconciler["Reconciler<br/>Walks gc_dirty_orgs<br/>Maintains gc_stats snapshot"]
+        DLQ["Dead-Letter Queue<br/>gc_failed_items<br/>30-day TTL"]
     end
 
     subgraph Targets["Deletion Targets"]
@@ -37,7 +39,7 @@ flowchart TD
         LWT["LWT Guard<br/>IF ref_count <= 0"]
         Idempotent["Idempotency<br/>MarkItemProcessed<br/>48h TTL"]
         Lock["Hard-Delete Locks<br/>Prevents restore race"]
-        Retry["Retry Cap: 5<br/>Then TTL cleanup"]
+        Retry["Retry Cap: 5<br/>Then move to DLQ"]
     end
 
     API --> Queue
@@ -180,14 +182,40 @@ the read executes, the count could be back at 1.
 So this is a false-positive enqueue (block enqueued for deletion but LWT skips it),
 not a data loss scenario. The cost is a wasted queue entry that gets cleaned up.
 
-### MEDIUM: Counter drift (store_cassandra.go queue stats)
+### RESOLVED: Counter drift (was MEDIUM)
 
-The `gc_queue_stats` counter is updated in a separate Cassandra batch from the
-queue insert. If the counter batch fails, stats become inaccurate. This affects
-the admin status endpoint's `queue_size` number but not deletion correctness.
+**Resolved:** 2026-04-28 in the baseline schema (`001_initial_schema.cql`) and the
+accompanying GC service redesign.
 
-**Recommendation:** Log counter failures prominently. Add periodic reconciliation
-(count actual rows vs counter value) in the scanner.
+**Original problem:** the `gc_queue_stats` Cassandra counter table was updated
+in a separate batch from queue mutations. Drift accumulated whenever (a) the
+counter batch failed silently, (b) `gc_queue` rows were TTL-expired (no DELETE
+fired), or (c) Cassandra coordinator retries doubled the increment (counter
+writes are non-idempotent). In production this manifested as
+`/api/v2.1/admin/gc/status/` reporting `queue_size: 2757` while the live table
+held 0 rows.
+
+**New design:**
+- `gc_queue_stats` is dropped. Snapshots live in `gc_stats` (per-key) and
+  `gc_org_stats` (per-org).
+- Mutations write to `gc_dirty_orgs`. A serialized reconciler iterates dirty
+  orgs each worker/scanner tick, recomputes per-org depth via `SELECT COUNT(*)
+  FROM gc_queue WHERE org_id = ?` (partition-bounded), saves the per-org row,
+  and applies the delta to the global `gc_stats` totals.
+- Every 10 reconciler passes a full `SUM(queue_depth) FROM gc_org_stats` runs
+  as a drift safety net; mismatches overwrite the totals and bump
+  `gc_snapshot_drift_corrected_total`.
+- Admin DLQ mutations require leadership and serialize through `dlqOpsMu` so
+  the non-atomic `RequeueFailedItem` cannot duplicate queue rows under
+  concurrent admin requests.
+
+**New Prometheus metrics:** `gc_failed_items_total`, `gc_dirty_orgs_total`,
+`gc_snapshot_age_seconds`, `gc_snapshot_drift_corrected_total`,
+`gc_reconcile_duration_seconds`.
+
+`/api/v2.1/admin/gc/status/` now exposes `queue_size`, `failed_items_total`,
+`dirty_orgs_total`, `snapshot_age_seconds` (-1 when no reconcile has run yet),
+and `last_reconcile_run`.
 
 ### LOW: Cascade partial failure
 

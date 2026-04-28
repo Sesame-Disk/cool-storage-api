@@ -471,7 +471,7 @@ Drains the `gc_queue` table. Each item has a type; the worker dispatches accordi
 | `library_cascade` | Enqueue all library contents (commits, fs_objects, artifacts), hard-delete library + deleted_libraries |
 | `org_cascade` | Enqueue all libraries as `library_cascade`, clean up all users, delete all groups, hard-delete org |
 
-**Two-phase deletion**: items sit in `gc_queue` for a grace period (default 1h) before the worker processes them. The `gc_queue` table has a 7-day TTL for auto-cleanup of stuck items.
+**Two-phase deletion**: items sit in `gc_queue` for a grace period (default 1h) before the worker processes them. The `gc_queue` table is durable (no TTL); items are removed only by explicit `Complete` (success), `RequeueItem` (transient failure → back of the queue), or `FailItem` (retry-cap reached → moved to `gc_failed_items` DLQ).
 
 **Cascading**: Commit → fs_object → blocks. The worker only enqueues commits and fs_objects when a library is deleted; blocks are discovered and enqueued during fs_object processing. Cascade items use the parent's `queued_at` timestamp (`EnqueueCascade`) so they skip the grace period — the parent already waited.
 
@@ -509,14 +509,20 @@ Drains the `gc_queue` table. Each item has a type; the worker dispatches accordi
 - **"Tolerate before doubt"**: GC always errs on the side of keeping data. If any check is ambiguous, the item stays in the queue for the next sweep rather than being deleted.
 - Never delete HEAD commit or its ancestors within TTL
 - Grace period: items wait 1h in queue before processing
-- `gc_queue` has 7-day Cassandra TTL for auto-cleanup of stuck items
+- `gc_queue` is durable in the baseline schema. Stuck items reach the
+  retry cap (5 attempts) and are moved to `gc_failed_items` (DLQ, 30-day TTL)
+  for operator inspection via `GET /api/v2.1/admin/gc/failed-items`. If
+  `IncrementRetry` reports an error, the worker first verifies whether the
+  original queue row still exists: it escalates only when the old row is still
+  present, treats the requeue as successful when the old row is already gone,
+  and otherwise leaves the item untouched when the verification itself fails.
 - **Two-phase LWT block deletion**: Phase 1: `UPDATE SET ref_count = -999 IF ref_count <= 0` (atomic claim via Paxos). Phase 2: unconditional `DELETE`. If Phase 1 fails (ref_count > 0, i.e., a concurrent upload incremented it), the block is skipped — no S3 deletion occurs.
 - **Sentinel protection for uploads**: `IncrementOrCreateBlock` detects sentinel `-999` (`ref_count < 0`) and backs off with exponential delay, waiting for GC Phase 2 to complete the DELETE. Then it creates a fresh row via `INSERT IF NOT EXISTS`. This prevents the race where an upload's UPDATE would be clobbered by GC's unconditional DELETE.
 - **Idempotent decrements**: `gc_processed_items` table (48h TTL) with `INSERT IF NOT EXISTS` prevents double-decrements on worker retries. Task IDs are deterministic (MD5 of fs_object_id + queued_at).
 - **Head-of-line blocking prevention**: Failed items are requeued with a new `queued_at` timestamp (delete old + insert new in a LoggedBatch), placing them at the back of the queue.
 - **Cascade error propagation**: If enqueueing child items fails, the parent item is NOT deleted — the worker returns an error and the item stays in queue for retry.
 - Dry-run mode for testing (toggle at runtime via admin API)
-- Prometheus metrics: `gc_worker_duration`, `gc_scanner_duration`, `gc_queue_size`, `gc_blocks_deleted_total`, `gc_worker_consecutive_errors`, `gc_queue_growth_rate`, `gc_worker_last_success_timestamp_seconds`
+- Prometheus metrics: `gc_worker_duration`, `gc_scanner_duration`, `gc_queue_size`, `gc_blocks_deleted_total`, `gc_worker_consecutive_errors`, `gc_queue_growth_rate`, `gc_worker_last_success_timestamp_seconds`, `gc_failed_items_total`, `gc_dirty_orgs_total`, `gc_snapshot_age_seconds`, `gc_reconcile_duration_seconds`, `gc_snapshot_drift_corrected_total`
 - Scanner runs immediately on startup to catch anything missed during downtime
 - Health alerting: `gc_worker_consecutive_errors` tracks sequential failures (alert if > 5), `gc_queue_growth_rate` tracks net queue growth (positive = queue growing faster than worker can drain)
 

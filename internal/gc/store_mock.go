@@ -114,6 +114,21 @@ type MockStore struct {
 	// optional test hooks for reproducing concurrency windows deterministically.
 	getQueueSizeHook      func(orgID uuid.UUID, size int)
 	recountQueueDepthHook func(orgID uuid.UUID, depth int)
+	// requeueItemErr, when non-nil, forces RequeueItem to return this error
+	// without mutating state. Used to exercise IncrementRetry failure paths
+	// where the LoggedBatch never applied.
+	requeueItemErr error
+	// requeueItemErrAfterMutate, when non-nil, forces RequeueItem to apply
+	// the queue mutation AND THEN return this error. Models the ambiguous
+	// LoggedBatch case (Cassandra timeout / unavailable) where the batch
+	// committed at the cluster but the client observed a failure.
+	requeueItemErrAfterMutate error
+	// dlqOpHook is invoked at the very top of RequeueFailedItem and
+	// DeleteFailedItem on the mock — before the internal mutex is taken —
+	// so concurrency tests can observe whether two admin DLQ ops are
+	// allowed to overlap (i.e. whether dlqOpsMu in the Service is doing
+	// its job).
+	dlqOpHook func(orgID uuid.UUID, op string)
 
 	// audit_log entries
 	auditLog []AuditLogEntry
@@ -774,6 +789,10 @@ func (m *MockStore) RequeueItem(orgID uuid.UUID, oldQueuedAt, newQueuedAt time.T
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	if m.requeueItemErr != nil {
+		return m.requeueItemErr
+	}
+
 	items := m.queue[orgID]
 	for i, item := range items {
 		if item.QueuedAt.Equal(oldQueuedAt) && item.ItemType == itemType && item.ItemID == itemID {
@@ -788,6 +807,9 @@ func (m *MockStore) RequeueItem(orgID uuid.UUID, oldQueuedAt, newQueuedAt time.T
 			m.activeQueueOrgs[orgID] = time.Now().UTC()
 			m.dirtyQueueOrgs[orgID] = time.Now().UTC()
 
+			if m.requeueItemErrAfterMutate != nil {
+				return m.requeueItemErrAfterMutate
+			}
 			return nil
 		}
 	}
@@ -873,6 +895,12 @@ func (m *MockStore) ListFailedItems(orgID uuid.UUID, limit int) ([]GCFailedItemI
 }
 
 func (m *MockStore) DeleteFailedItem(orgID uuid.UUID, failedAt time.Time, itemType ItemType, itemID string) error {
+	m.mu.RLock()
+	hook := m.dlqOpHook
+	m.mu.RUnlock()
+	if hook != nil {
+		hook(orgID, "delete")
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	items := m.failedItems[orgID]
@@ -887,6 +915,12 @@ func (m *MockStore) DeleteFailedItem(orgID uuid.UUID, failedAt time.Time, itemTy
 }
 
 func (m *MockStore) RequeueFailedItem(orgID uuid.UUID, failedAt time.Time, itemType ItemType, itemID string, queuedAt time.Time) error {
+	m.mu.RLock()
+	hook := m.dlqOpHook
+	m.mu.RUnlock()
+	if hook != nil {
+		hook(orgID, "requeue")
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	items := m.failedItems[orgID]

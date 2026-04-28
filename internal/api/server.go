@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"log/slog"
 	"net/http"
@@ -2289,24 +2290,33 @@ func parseGCFailedItemSelector(c *gin.Context) (uuid.UUID, time.Time, gc.ItemTyp
 		itemID = strings.TrimSpace(c.PostForm("item_id"))
 	}
 
-	var body struct {
-		OrgID    string `json:"org_id"`
-		FailedAt string `json:"failed_at"`
-		ItemType string `json:"item_type"`
-		ItemID   string `json:"item_id"`
-	}
-	_ = c.ShouldBindJSON(&body)
-	if orgIDStr == "" {
-		orgIDStr = strings.TrimSpace(body.OrgID)
-	}
-	if failedAtStr == "" {
-		failedAtStr = strings.TrimSpace(body.FailedAt)
-	}
-	if itemTypeStr == "" {
-		itemTypeStr = strings.TrimSpace(body.ItemType)
-	}
-	if itemID == "" {
-		itemID = strings.TrimSpace(body.ItemID)
+	// Only attempt to parse a JSON body when the caller actually sent JSON.
+	// An empty body with Content-Type: application/json is legal — the
+	// selector may have arrived entirely via query string or form fields,
+	// and many HTTP clients set the JSON header by default. Surface real
+	// parse errors (malformed JSON), but do not penalise an empty body.
+	if strings.HasPrefix(strings.ToLower(c.ContentType()), "application/json") {
+		var body struct {
+			OrgID    string `json:"org_id"`
+			FailedAt string `json:"failed_at"`
+			ItemType string `json:"item_type"`
+			ItemID   string `json:"item_id"`
+		}
+		if err := c.ShouldBindJSON(&body); err != nil && !errors.Is(err, io.EOF) {
+			return uuid.Nil, time.Time{}, "", "", fmt.Errorf("invalid json body: %w", err)
+		}
+		if orgIDStr == "" {
+			orgIDStr = strings.TrimSpace(body.OrgID)
+		}
+		if failedAtStr == "" {
+			failedAtStr = strings.TrimSpace(body.FailedAt)
+		}
+		if itemTypeStr == "" {
+			itemTypeStr = strings.TrimSpace(body.ItemType)
+		}
+		if itemID == "" {
+			itemID = strings.TrimSpace(body.ItemID)
+		}
 	}
 
 	orgID, err := uuid.Parse(orgIDStr)

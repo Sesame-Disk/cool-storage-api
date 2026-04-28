@@ -1,4 +1,4 @@
--- Migration 003: encrypted_repo_password_failures
+-- Migration 002: encrypted_repo_password_failures
 --
 -- Online brute-force protection for encrypted libraries. PBKDF2 at 1000
 -- iterations (Seafile compat) is fast enough that an authenticated attacker

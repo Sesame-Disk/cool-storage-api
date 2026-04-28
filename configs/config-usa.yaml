@@ -172,6 +172,8 @@ gc:
   worker_interval: 30s
   scan_interval: 24h
   batch_size: 100
+  reconcile_batch_size: 256
+  failed_items_page_size: 100
   grace_period: 1h
   dry_run: false
   user_grace_days: 7

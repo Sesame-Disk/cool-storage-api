@@ -2,6 +2,8 @@ package gc
 
 import (
 	"context"
+	"errors"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -140,6 +142,106 @@ func TestWorker_MaxRetry_MovesItemToFailedQueue(t *testing.T) {
 	}
 	if !failed.QueuedAt.Equal(originalQueuedAt) {
 		t.Fatalf("failed item queued_at changed: got %v want %v", failed.QueuedAt, originalQueuedAt)
+	}
+}
+
+// TestWorker_IncrementRetryFailure_EscalatesToDLQ verifies that when the
+// underlying RequeueItem call fails (e.g. a transient DB error), the worker
+// escalates the item to the DLQ instead of leaving it in the live queue with
+// the same RetryCount — which would re-dequeue and re-fail every tick (livelock).
+func TestWorker_IncrementRetryFailure_EscalatesToDLQ(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	w := NewWorker(store, nil, q, 100, 0, false, stats)
+
+	orgID := uuid.New()
+	originalQueuedAt := time.Now().Add(-2 * time.Hour)
+
+	// retry_count=0 so the worker would normally call IncrementRetry. Item
+	// type is unknown so processItem returns an error, triggering the retry path.
+	if err := store.EnqueueItem(orgID, originalQueuedAt, ItemType("unknown_type"), "stuck-item", uuid.Nil, "", 0); err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+
+	store.requeueItemErr = errors.New("simulated DB outage on RequeueItem")
+
+	if _, err := w.ProcessOnce(context.Background()); err != nil {
+		t.Fatalf("ProcessOnce: %v", err)
+	}
+
+	failed := store.FailedItems(orgID)
+	if len(failed) != 1 {
+		t.Fatalf("expected 1 DLQ entry after IncrementRetry failure, got %d", len(failed))
+	}
+	if failed[0].ItemID != "stuck-item" {
+		t.Fatalf("DLQ entry id = %q, want %q", failed[0].ItemID, "stuck-item")
+	}
+	if failed[0].RetryCount != 0 {
+		t.Fatalf("DLQ entry RetryCount = %d, want 0 (escalation should preserve original count)", failed[0].RetryCount)
+	}
+	if failed[0].LastError == "" {
+		t.Fatal("expected DLQ entry to capture an error message that includes the requeue failure")
+	}
+	if !strings.Contains(failed[0].LastError, "requeue failed") {
+		t.Fatalf("expected DLQ LastError to mention requeue failure, got %q", failed[0].LastError)
+	}
+
+	if items := store.QueueItems(orgID); len(items) != 0 {
+		t.Fatalf("expected live queue to be drained after DLQ escalation, got %d items", len(items))
+	}
+}
+
+// TestWorker_IncrementRetryAmbiguousError_DoesNotDuplicate covers the
+// dangerous case the reviewer flagged: RequeueItem is a LoggedBatch
+// (DELETE old + INSERT new) and Cassandra timeout/unavailable responses
+// are ambiguous — the batch may have actually committed even though the
+// client received an error. Escalating blindly to the DLQ would create
+// both a live requeued row (in gc_queue) and a DLQ entry (in
+// gc_failed_items), causing double processing and a lying DLQ.
+//
+// The worker must verify the original row's existence after a failed
+// IncrementRetry: if the old row is gone, the batch did apply and we
+// must NOT touch the DLQ.
+func TestWorker_IncrementRetryAmbiguousError_DoesNotDuplicate(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	w := NewWorker(store, nil, q, 100, 0, false, stats)
+
+	orgID := uuid.New()
+	originalQueuedAt := time.Now().Add(-2 * time.Hour).UTC()
+
+	if err := store.EnqueueItem(orgID, originalQueuedAt, ItemType("unknown_type"), "ambiguous-item", uuid.Nil, "", 0); err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+
+	// Simulate the ambiguous case: the LoggedBatch APPLIED (mock mutates
+	// queue normally), but RequeueItem returns a timeout error to the
+	// caller — exactly the situation Cassandra produces under coordinator
+	// failover.
+	store.requeueItemErrAfterMutate = errors.New("simulated cassandra write timeout — batch may have applied")
+
+	if _, err := w.ProcessOnce(context.Background()); err != nil {
+		t.Fatalf("ProcessOnce: %v", err)
+	}
+
+	if failed := store.FailedItems(orgID); len(failed) != 0 {
+		t.Fatalf("expected NO DLQ entries when requeue actually applied, got %d entries: %#v", len(failed), failed)
+	}
+
+	items := store.QueueItems(orgID)
+	if len(items) != 1 {
+		t.Fatalf("expected exactly 1 live queue row after successful (but ambiguous) requeue, got %d", len(items))
+	}
+	if items[0].ItemID != "ambiguous-item" {
+		t.Fatalf("live queue item id = %q, want %q", items[0].ItemID, "ambiguous-item")
+	}
+	if items[0].RetryCount != 1 {
+		t.Fatalf("live queue item RetryCount = %d, want 1 (requeue should have bumped it)", items[0].RetryCount)
+	}
+	if items[0].QueuedAt.Equal(originalQueuedAt) {
+		t.Fatalf("live queue item still has the original queued_at; the requeue did not actually move it to the back of the queue")
 	}
 }
 

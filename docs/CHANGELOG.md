@@ -8,6 +8,134 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-04-28 — GC Queue Redesign: Honest Status, Durable Queue, DLQ
+
+### Problem
+
+`GET /api/v2.1/admin/gc/status/` was lying. In a clean local DB the
+endpoint reported `queue_size: 2757` while a `SELECT COUNT(*) FROM gc_queue`
+returned `0`. Three independent failure modes drove the drift:
+
+1. The legacy `gc_queue_stats` Cassandra **counter table** was decremented
+   only on explicit `Complete`. Items that exited the queue via the 7-day TTL
+   never decremented the counter.
+2. The previous worker simply abandoned items at the retry cap with the
+   comment *"let TTL clean it up"* — those items also bypassed the counter.
+3. Cassandra counter writes are **non-idempotent** under coordinator retries,
+   so the counter slowly drifted upward even on the happy path.
+
+### Fix — schema redesign + reconciler
+
+Schema is now baked into `internal/db/migrations/001_initial_schema.cql`:
+
+- `gc_queue_stats` is retired from the baseline.
+- `gc_queue` starts durable (`default_time_to_live = 0`).
+- `gc_active_orgs (bucket, org_id)` — sharded set of orgs with queue work
+  (32 hash buckets, no full-table `SELECT DISTINCT`).
+- `gc_dirty_orgs (bucket, org_id, marked_at)` — orgs needing snapshot
+  reconciliation.
+- `gc_org_stats (org_id, queue_depth, failed_depth, oldest_queued_at)` —
+  per-org snapshot maintained by the reconciler.
+- `gc_failed_items (org_id, failed_at, ...)` — DLQ with a 30-day TTL and a
+  `resolution_status` column for operator workflow.
+- Pre-seeds `gc_stats` keys: `total_queue_depth`, `total_failed_items`,
+  `dirty_orgs_total`, `last_reconcile_run`.
+
+### Fix — reconciler (`internal/gc/gc.go`)
+
+- Snapshot is read by `Status()` from `gc_stats` (single-key reads, no live
+  count). Snapshot is maintained by a `reconcileDirtyQueueStats` pass that
+  runs at the end of every worker tick and every scanner tick.
+- The reconciler is serialized via `reconcileMu` so concurrent worker /
+  scanner / admin paths cannot corrupt the global totals via interleaved
+  read-modify-write cycles.
+- Every 10 reconciler passes, a full `SUM(queue_depth) FROM gc_org_stats`
+  drift check runs. If the global total disagrees with the per-org sum, the
+  totals are overwritten and `gc_snapshot_drift_corrected_total` Prometheus
+  counter is bumped.
+- Admin DLQ mutations (`RequeueFailedItem`, `DeleteFailedItem`) now require
+  GC leadership and serialize through `dlqOpsMu` so the non-atomic
+  SELECT+INSERT+DELETE in the requeue path cannot duplicate queue rows under
+  concurrent admin requests.
+
+### Fix — durable queue (`internal/gc/worker.go`)
+
+- Items at retry cap are moved to `gc_failed_items` instead of being left for
+  TTL expiry.
+- If `IncrementRetry` reports an error, the worker now checks whether the
+  original row still exists before touching the DLQ. This avoids creating both
+  a live requeued row and a DLQ entry under ambiguous Cassandra batch errors,
+  while still breaking clear livelocks when the old row never moved.
+- `processOrg` captures `activeBefore = clock()` *before* dequeuing and uses
+  the strict CAS `IF last_enqueued_at < activeBefore` when removing the org
+  from `gc_active_orgs`. This closes a silent-data-loss race where a
+  concurrent enqueue could be stranded permanently.
+
+### Added — admin DLQ endpoints (`internal/api/server.go`)
+
+- `GET /api/v2.1/admin/gc/failed-items?org_id=…&limit=…`
+- `POST /api/v2.1/admin/gc/failed-items/requeue` — body or query/form:
+  `org_id`, `failed_at` (RFC3339 / RFC3339Nano), `item_type`, `item_id`
+- `DELETE /api/v2.1/admin/gc/failed-items` — same selector
+- All three return `503 ErrNotLeader` from non-leader replicas.
+- The selector parser now reports JSON parse errors instead of silently
+  dropping malformed bodies.
+
+### Status payload changes
+
+`/api/v2.1/admin/gc/status/` now includes:
+- `failed_items_total`
+- `dirty_orgs_total`
+- `last_reconcile_run` (`"never"` until the first pass)
+- `snapshot_age_seconds` (-1 sentinel until the first pass; otherwise seconds
+  since the snapshot was reconciled)
+
+### Metrics
+
+New Prometheus metrics: `gc_failed_items_total`, `gc_dirty_orgs_total`,
+`gc_snapshot_age_seconds`, `gc_reconcile_duration_seconds`,
+`gc_snapshot_drift_corrected_total`.
+
+### Config
+
+New `gc:` keys (added to `config.example.yaml`, `config.prod.yaml`,
+`config.docker.yaml`, `config-eu.yaml`, `config-usa.yaml`):
+
+- `reconcile_batch_size` (default 256) — dirty orgs reconciled per worker /
+  scanner tick. `0` means all dirty orgs each pass.
+- `failed_items_page_size` (default 100) — default page size for the admin
+  DLQ listing endpoint.
+
+Both are also overridable via `GC_RECONCILE_BATCH_SIZE` and
+`GC_FAILED_ITEMS_PAGE_SIZE`.
+
+### Tests
+
+- `internal/gc/gc_test.go` — drift correction, dirty-snapshot status,
+  reconciler serialization, snapshot-age sentinel, DLQ admin
+  serialization, leadership enforcement on admin DLQ ops.
+- `internal/gc/worker_regression_test.go` — retry-capped item lands in DLQ;
+  `IncrementRetry` failure escalates to DLQ; `processOrg` preserves
+  `gc_active_orgs` under a concurrent enqueue.
+- `internal/integration/gc_integration_test.go` — end-to-end: enqueue →
+  status snapshot, scanner reconciles a synthetic drift, max-retry item
+  travels from `gc_queue` to `gc_failed_items`, admin requeue + delete cycle.
+
+### Files changed
+
+- `internal/db/migrations/001_initial_schema.cql`
+- `internal/db/migrations/002_password_rate_limit.cql`
+- `internal/gc/{gc,worker,store,store_cassandra,store_mock}.go`
+- `internal/gc/{gc_test,worker_regression_test}.go`
+- `internal/integration/gc_integration_test.go`
+- `internal/api/{server,server_routes}.go`
+- `internal/config/{config,config_test}.go`
+- `internal/metrics/metrics.go`
+- `configs/{config.example,config.prod,config.docker,config-eu,config-usa}.yaml`
+- `docs/{ARCHITECTURE,GC-SERVICE-ANALYSIS,KNOWN_ISSUES,CHANGELOG}.md`
+
+---
+
 ## 2026-04-09 — Session 62: Org Storage Policy Backend Base + Multi-Region Create-Time Enforcement
 
 ### Added — Org storage policy for new library creation

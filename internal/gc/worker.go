@@ -93,10 +93,36 @@ func (w *Worker) processOrg(ctx context.Context, orgID uuid.UUID) (int, error) {
 			metrics.GCErrorsTotal.WithLabelValues(string(item.ItemType)).Inc()
 
 			// Requeue transient failures, but move retry-capped items into the DLQ
-			// so they stop polluting the live queue forever.
+			// so they stop polluting the live queue forever. If the requeue itself
+			// reports an error, do NOT blindly escalate to the DLQ: RequeueItem is
+			// a LoggedBatch (DELETE old + INSERT new) and Cassandra timeout /
+			// unavailable responses are ambiguous — the batch may have applied
+			// even though the client saw an error. Re-checking the original row
+			// tells us which side of the ambiguity we landed on:
+			//
+			//   - row gone  → batch applied, new requeued row is live; do nothing.
+			//   - row still → batch did not apply; safe to escalate to the DLQ.
+			//   - check err → unknown; leave the item in place rather than risk
+			//                 a duplicated processing path. Next tick will retry.
 			if item.RetryCount < 5 {
 				if incErr := w.queue.IncrementRetry(item); incErr != nil {
-					log.Printf("[GC Worker] Failed to requeue item %s/%s: %v", item.OrgID, item.ItemID, incErr)
+					log.Printf("[GC Worker] Failed to requeue item %s/%s after error %v: %v",
+						item.OrgID, item.ItemID, err, incErr)
+					stillExists, checkErr := w.store.QueueItemExists(item.OrgID, item.QueuedAt, item.ItemType, item.ItemID)
+					if checkErr != nil {
+						log.Printf("[GC Worker] Cannot verify requeue state for %s/%s (%v); leaving item untouched to avoid double-processing",
+							item.OrgID, item.ItemID, checkErr)
+						continue
+					}
+					if !stillExists {
+						log.Printf("[GC Worker] IncrementRetry returned %v but old row is already gone for %s/%s; treating as successful requeue",
+							incErr, item.OrgID, item.ItemID)
+						continue
+					}
+					escalation := fmt.Sprintf("requeue failed (%v) after processing error: %v", incErr, err)
+					if failErr := w.store.FailItem(item, w.clock(), escalation); failErr != nil {
+						log.Printf("[GC Worker] Failed to escalate item %s/%s to DLQ after requeue failure: %v", item.OrgID, item.ItemID, failErr)
+					}
 				}
 			} else {
 				if failErr := w.store.FailItem(item, w.clock(), err.Error()); failErr != nil {

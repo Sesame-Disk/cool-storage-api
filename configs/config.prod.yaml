@@ -216,6 +216,8 @@ gc:
   worker_interval: 30s
   scan_interval: 24h
   batch_size: 100
+  reconcile_batch_size: 256       # Dirty orgs reconciled per worker/scanner tick (0 = all). Drives gc_stats snapshot freshness.
+  failed_items_page_size: 100     # Default page size for the admin DLQ listing endpoint.
   grace_period: 1h
   dry_run: false
   user_grace_days: 7

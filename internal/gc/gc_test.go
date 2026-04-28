@@ -461,6 +461,116 @@ func TestService_ReconcileDirtyQueueStats_SerializesRuns(t *testing.T) {
 	}
 }
 
+// TestService_Status_SnapshotAgeSentinelWhenNeverReconciled verifies the
+// reporter distinguishes "no reconcile yet" (-1) from "reconciled 0s ago" (0).
+// Without the sentinel, dashboards would show fresh data on a cold deploy.
+func TestService_Status_SnapshotAgeSentinelWhenNeverReconciled(t *testing.T) {
+	store := NewMockStore()
+	// Mimic the migration's empty-string seed for last_reconcile_run.
+	store.gcStats[gcStatKeyLastReconcile] = ""
+
+	svc := &Service{store: store, config: config.GCConfig{Enabled: true}, stats: &Stats{}}
+	status := svc.Status()
+
+	if status.SnapshotAgeSeconds != -1 {
+		t.Fatalf("status.SnapshotAgeSeconds = %d, want -1 (no reconcile yet)", status.SnapshotAgeSeconds)
+	}
+	if status.LastReconcileRun != "never" {
+		t.Fatalf("status.LastReconcileRun = %q, want %q", status.LastReconcileRun, "never")
+	}
+}
+
+// TestService_Status_SnapshotAgeReflectsRecentReconcile verifies the snapshot
+// age is positive (or zero) once a reconcile has run.
+func TestService_Status_SnapshotAgeReflectsRecentReconcile(t *testing.T) {
+	store := NewMockStore()
+	store.gcStats[gcStatKeyLastReconcile] = time.Now().Add(-30 * time.Second).UTC().Format(time.RFC3339)
+
+	svc := &Service{store: store, config: config.GCConfig{Enabled: true}, stats: &Stats{}}
+	status := svc.Status()
+
+	if status.SnapshotAgeSeconds < 0 {
+		t.Fatalf("status.SnapshotAgeSeconds = %d, want >= 0 after a real reconcile", status.SnapshotAgeSeconds)
+	}
+	if status.SnapshotAgeSeconds > 60 {
+		t.Fatalf("status.SnapshotAgeSeconds = %d, want roughly ~30", status.SnapshotAgeSeconds)
+	}
+}
+
+// TestService_DLQOps_SerializeUnderConcurrency exercises the dlqOpsMu guard
+// directly. The hook is wired to the store-level DLQ mutations so the test
+// observes overlap of the actual non-atomic SELECT+INSERT+DELETE in
+// RequeueFailedItem, not the downstream reconcile (which is already
+// serialized by reconcileMu and would mask the absence of dlqOpsMu).
+//
+// Without dlqOpsMu, two concurrent admin requests would interleave inside
+// the store and the hook would record max in-flight > 1.
+func TestService_DLQOps_SerializeUnderConcurrency(t *testing.T) {
+	store := NewMockStore()
+	orgID := uuid.New()
+	failedAt := time.Now().UTC().Truncate(time.Millisecond)
+
+	store.failedItems[orgID] = []GCFailedItemInfo{
+		{OrgID: orgID, FailedAt: failedAt, QueuedAt: failedAt.Add(-time.Minute), ItemType: ItemBlock, ItemID: "race-item-a", RetryCount: 5},
+		{OrgID: orgID, FailedAt: failedAt.Add(time.Second), QueuedAt: failedAt, ItemType: ItemBlock, ItemID: "race-item-b", RetryCount: 5},
+	}
+
+	svc := &Service{
+		store:  store,
+		config: config.GCConfig{Enabled: true},
+		lease:  &fakeLeaderLease{allowed: true},
+	}
+
+	var inFlight atomic.Int32
+	var maxInFlight atomic.Int32
+	var sawRequeue, sawDelete atomic.Bool
+	// Hook fires at the top of the mock's DLQ store ops, BEFORE the
+	// internal mock mutex is taken. If dlqOpsMu were missing, both
+	// goroutines would enter here simultaneously and inFlight would
+	// reach 2 during the brief sleep.
+	store.dlqOpHook = func(_ uuid.UUID, op string) {
+		switch op {
+		case "requeue":
+			sawRequeue.Store(true)
+		case "delete":
+			sawDelete.Store(true)
+		}
+		current := inFlight.Add(1)
+		defer inFlight.Add(-1)
+		for {
+			max := maxInFlight.Load()
+			if current <= max || maxInFlight.CompareAndSwap(max, current) {
+				break
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	done := make(chan struct{}, 2)
+	go func() {
+		_ = svc.RequeueFailedItem(orgID, failedAt, ItemBlock, "race-item-a")
+		done <- struct{}{}
+	}()
+	go func() {
+		_ = svc.DeleteFailedItem(orgID, failedAt.Add(time.Second), ItemBlock, "race-item-b")
+		done <- struct{}{}
+	}()
+
+	for i := 0; i < 2; i++ {
+		<-done
+	}
+
+	// Sanity: both ops actually hit the store. If a code change ever
+	// short-circuited one of them before the store call, the hook
+	// signal-only result would be a false-negative on serialization.
+	if !sawRequeue.Load() || !sawDelete.Load() {
+		t.Fatalf("expected both DLQ ops to reach the store hook; saw requeue=%v delete=%v", sawRequeue.Load(), sawDelete.Load())
+	}
+	if got := maxInFlight.Load(); got > 1 {
+		t.Fatalf("expected DLQ admin ops to be serialized by dlqOpsMu, max concurrent store ops = %d", got)
+	}
+}
+
 func TestService_ReconcileDirtyQueueStats_CorrectsSnapshotDrift(t *testing.T) {
 	store := NewMockStore()
 	orgA := uuid.New()

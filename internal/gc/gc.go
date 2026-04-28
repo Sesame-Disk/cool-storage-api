@@ -56,7 +56,9 @@ type GCStatus struct {
 	QueueSize          int    `json:"queue_size"`
 	FailedItemsTotal   int    `json:"failed_items_total"`
 	DirtyOrgsTotal     int    `json:"dirty_orgs_total"`
-	SnapshotAgeSeconds int64  `json:"snapshot_age_seconds"`
+	// SnapshotAgeSeconds reports how long ago the queue/failed snapshots were
+	// last reconciled. -1 means no reconciliation has run yet (e.g. cold deploy).
+	SnapshotAgeSeconds int64 `json:"snapshot_age_seconds"`
 	BlocksDeletedTotal int64  `json:"blocks_deleted_total"`
 	GracePeriodSeconds int64  `json:"grace_period_seconds"`
 }
@@ -97,6 +99,11 @@ type Service struct {
 	// reconcileMu serializes snapshot reconciliation so global gc_stats totals
 	// are not corrupted by concurrent read-modify-write cycles.
 	reconcileMu sync.Mutex
+
+	// dlqOpsMu serializes admin DLQ mutations (requeue/delete) so the
+	// non-atomic SELECT+INSERT+DELETE in RequeueFailedItem cannot duplicate
+	// queue rows under concurrent admin requests on the same leader.
+	dlqOpsMu sync.Mutex
 
 	// reconcilePasses counts serialized reconcile runs so we can do occasional
 	// full drift checks without paying that cost on every pass.
@@ -259,7 +266,10 @@ func (s *Service) Status() GCStatus {
 	lastScan := s.stats.LastScanRun()
 	lastReconcile := s.loadStatTime(gcStatKeyLastReconcile)
 	dirtyOrgs := s.loadStatInt(gcStatKeyTotalDirtyOrgs)
-	snapshotAgeSeconds := int64(0)
+	// -1 means "no reconciliation has run yet" — distinct from "0 seconds old".
+	// Dashboards/alerts can branch on this sentinel instead of reading a falsely
+	// fresh age right after deploy.
+	snapshotAgeSeconds := int64(-1)
 	if !lastReconcile.IsZero() {
 		snapshotAgeSeconds = int64(time.Since(lastReconcile).Seconds())
 		if snapshotAgeSeconds < 0 {
@@ -585,6 +595,8 @@ func (s *Service) DeleteFailedItem(orgID uuid.UUID, failedAt time.Time, itemType
 	if !s.hasLeadership(context.Background(), "admin_failed_item_delete") {
 		return ErrNotLeader
 	}
+	s.dlqOpsMu.Lock()
+	defer s.dlqOpsMu.Unlock()
 	err := s.store.DeleteFailedItem(orgID, failedAt, itemType, itemID)
 	if err != nil {
 		return err
@@ -597,6 +609,14 @@ func (s *Service) RequeueFailedItem(orgID uuid.UUID, failedAt time.Time, itemTyp
 	if !s.hasLeadership(context.Background(), "admin_failed_item_requeue") {
 		return ErrNotLeader
 	}
+	// Serialize DLQ admin mutations: RequeueFailedItem performs a non-atomic
+	// SELECT+INSERT+DELETE in the store. Without this lock, two concurrent
+	// requeues of the same failed item would both succeed at SELECT, both
+	// INSERT into gc_queue (with different queued_at), and the second DELETE
+	// would no-op — leaving a duplicated queue row that the worker would
+	// process twice.
+	s.dlqOpsMu.Lock()
+	defer s.dlqOpsMu.Unlock()
 	err := s.store.RequeueFailedItem(orgID, failedAt, itemType, itemID, time.Now().UTC())
 	if err != nil {
 		return err

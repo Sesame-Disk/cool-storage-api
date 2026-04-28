@@ -855,7 +855,8 @@ CREATE TABLE IF NOT EXISTS repo_tag_file_counts (
 
 -- ─── GC ──────────────────────────────────────────────────────────────────────
 
--- 7-day TTL auto-cleans stale items; ordered ASC for worker FIFO processing.
+-- Durable queue: items are removed only by explicit completion, requeue, or
+-- DLQ transfer. Ordered ASC for worker FIFO processing.
 CREATE TABLE IF NOT EXISTS gc_queue (
     org_id        UUID,
     queued_at     TIMESTAMP,
@@ -865,8 +866,46 @@ CREATE TABLE IF NOT EXISTS gc_queue (
     storage_class TEXT,
     retry_count   INT,
     PRIMARY KEY ((org_id), queued_at, item_type, item_id)
-) WITH default_time_to_live = 604800
+) WITH default_time_to_live = 0
   AND CLUSTERING ORDER BY (queued_at ASC);
+
+CREATE TABLE IF NOT EXISTS gc_active_orgs (
+    bucket           INT,
+    org_id           UUID,
+    last_enqueued_at TIMESTAMP,
+    PRIMARY KEY ((bucket), org_id)
+);
+
+CREATE TABLE IF NOT EXISTS gc_dirty_orgs (
+    bucket    INT,
+    org_id    UUID,
+    marked_at TIMESTAMP,
+    PRIMARY KEY ((bucket), org_id)
+);
+
+CREATE TABLE IF NOT EXISTS gc_org_stats (
+    org_id           UUID PRIMARY KEY,
+    queue_depth      INT,
+    failed_depth     INT,
+    oldest_queued_at TIMESTAMP,
+    updated_at       TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS gc_failed_items (
+    org_id            UUID,
+    failed_at         TIMESTAMP,
+    queued_at         TIMESTAMP,
+    item_type         TEXT,
+    item_id           TEXT,
+    library_id        UUID,
+    storage_class     TEXT,
+    retry_count       INT,
+    last_error        TEXT,
+    resolution_status TEXT,
+    resolved_at       TIMESTAMP,
+    PRIMARY KEY ((org_id), failed_at, item_type, item_id)
+) WITH CLUSTERING ORDER BY (failed_at DESC, item_type ASC, item_id ASC)
+  AND default_time_to_live = 2592000;
 
 CREATE TABLE IF NOT EXISTS gc_stats (
     stat_key   TEXT PRIMARY KEY,
@@ -874,15 +913,48 @@ CREATE TABLE IF NOT EXISTS gc_stats (
     updated_at TIMESTAMP
 );
 
-CREATE TABLE IF NOT EXISTS gc_queue_stats (
-    stat_key   TEXT PRIMARY KEY,
-    queue_size COUNTER
-);
+INSERT INTO gc_stats (stat_key, stat_value, updated_at)
+VALUES ('total_queue_depth', '0', toTimestamp(now()))
+IF NOT EXISTS;
+
+INSERT INTO gc_stats (stat_key, stat_value, updated_at)
+VALUES ('total_failed_items', '0', toTimestamp(now()))
+IF NOT EXISTS;
+
+INSERT INTO gc_stats (stat_key, stat_value, updated_at)
+VALUES ('dirty_orgs_total', '0', toTimestamp(now()))
+IF NOT EXISTS;
+
+INSERT INTO gc_stats (stat_key, stat_value, updated_at)
+VALUES ('last_reconcile_run', '', toTimestamp(now()))
+IF NOT EXISTS;
 
 -- 48-hour TTL prevents double-decrement of ref_counts if the queue is slow.
 CREATE TABLE IF NOT EXISTS gc_processed_items (
     task_id UUID PRIMARY KEY
 ) WITH default_time_to_live = 172800;
+
+-- When the GC worker deletes the canonical `blocks` row before the backing S3
+-- object, any S3 failure would otherwise leak storage forever. This recovery
+-- table lets the scanner retry deletes later. The 90-day TTL bounds growth.
+CREATE TABLE IF NOT EXISTS gc_s3_orphans (
+    org_id          UUID,
+    block_id        TEXT,
+    storage_class   TEXT,
+    first_seen_at   TIMESTAMP,
+    last_attempt_at TIMESTAMP,
+    retry_count     INT,
+    last_error      TEXT,
+    PRIMARY KEY ((org_id), block_id)
+) WITH default_time_to_live = 7776000;
+
+-- Leadership lease so only one enabled replica runs worker/scanner/rollover
+-- work at a time.
+CREATE TABLE IF NOT EXISTS gc_leases (
+    role        TEXT PRIMARY KEY,
+    instance_id TEXT,
+    heartbeat   TIMESTAMP
+);
 
 -- Pending scope-level storage counter reconciliation requests. The scanner
 -- recomputes the expected aggregate totals for these scopes and corrects any

@@ -915,7 +915,7 @@ The GC (worker + scanner) has no coordination mechanism between instances. If mu
 
 1. **DequeueBatch without locking**: `SELECT ... LIMIT ?` returns the same items to all instances. Both process the same items simultaneously.
 2. **Scanner without leader election**: Multiple scanners enqueue the same orphans as duplicates (the PK includes `queued_at = time.Now()`, so each INSERT creates a distinct row).
-3. **gc_queue_stats counters out of sync**: Duplicate work causes extra counter decrements, skewing admin metrics.
+3. **Snapshot drift** (resolved 2026-04-28): the original `gc_queue_stats` counter table was retired from the baseline schema. Queue/DLQ totals now live in `gc_stats` and are reconciled per dirty org by a serialized reconciler (with a periodic full-sum drift check). See ARCHITECTURE.md / GC-SERVICE-ANALYSIS.md.
 
 **Is there data loss?** No. Destructive operations are protected:
 - `DeleteBlock` uses LWT two-phase (only one instance wins the `IF ref_count <= 0`)
