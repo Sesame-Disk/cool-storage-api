@@ -73,6 +73,7 @@ func (w *Worker) ProcessOnce(ctx context.Context) (int, error) {
 }
 
 func (w *Worker) processOrg(ctx context.Context, orgID uuid.UUID) (int, error) {
+	activeBefore := w.clock()
 	items, err := w.queue.DequeueBatch(orgID, w.batchSize, w.gracePeriod)
 	if err != nil {
 		return 0, err
@@ -91,9 +92,16 @@ func (w *Worker) processOrg(ctx context.Context, orgID uuid.UUID) (int, error) {
 				item.OrgID, item.ItemID, item.ItemType, err)
 			metrics.GCErrorsTotal.WithLabelValues(string(item.ItemType)).Inc()
 
-			// Increment retry count; if too many retries, let TTL clean it up
+			// Requeue transient failures, but move retry-capped items into the DLQ
+			// so they stop polluting the live queue forever.
 			if item.RetryCount < 5 {
-				w.queue.IncrementRetry(item)
+				if incErr := w.queue.IncrementRetry(item); incErr != nil {
+					log.Printf("[GC Worker] Failed to requeue item %s/%s: %v", item.OrgID, item.ItemID, incErr)
+				}
+			} else {
+				if failErr := w.store.FailItem(item, w.clock(), err.Error()); failErr != nil {
+					log.Printf("[GC Worker] Failed to move retry-capped item %s/%s to DLQ: %v", item.OrgID, item.ItemID, failErr)
+				}
 			}
 			continue
 		}
@@ -106,6 +114,16 @@ func (w *Worker) processOrg(ctx context.Context, orgID uuid.UUID) (int, error) {
 
 		metrics.GCItemsProcessedTotal.WithLabelValues(string(item.ItemType)).Inc()
 		processed++
+	}
+
+	if len(items) > 0 {
+		if remaining, sizeErr := w.queue.GetQueueSize(orgID); sizeErr != nil {
+			log.Printf("[GC Worker] Failed to get queue size for org %s after processing: %v", orgID, sizeErr)
+		} else if remaining == 0 {
+			if activeErr := w.store.RemoveOrgFromActiveSet(orgID, activeBefore); activeErr != nil {
+				log.Printf("[GC Worker] Failed to remove org %s from active set: %v", orgID, activeErr)
+			}
+		}
 	}
 
 	return processed, nil

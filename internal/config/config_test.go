@@ -711,6 +711,34 @@ func TestDefaultConfig_GCDisabledByDefault(t *testing.T) {
 	}
 }
 
+func TestEnvOverrideGCReconcileBatchSize(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.GC.ReconcileBatchSize = 256
+
+	os.Setenv("GC_RECONCILE_BATCH_SIZE", "17")
+	defer os.Unsetenv("GC_RECONCILE_BATCH_SIZE")
+
+	cfg.applyEnvOverrides()
+
+	if cfg.GC.ReconcileBatchSize != 17 {
+		t.Fatalf("GC.ReconcileBatchSize = %d, want 17", cfg.GC.ReconcileBatchSize)
+	}
+}
+
+func TestEnvOverrideGCFailedItemsPageSize(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.GC.FailedItemsPageSize = 100
+
+	os.Setenv("GC_FAILED_ITEMS_PAGE_SIZE", "33")
+	defer os.Unsetenv("GC_FAILED_ITEMS_PAGE_SIZE")
+
+	cfg.applyEnvOverrides()
+
+	if cfg.GC.FailedItemsPageSize != 33 {
+		t.Fatalf("GC.FailedItemsPageSize = %d, want 33", cfg.GC.FailedItemsPageSize)
+	}
+}
+
 // TestEnvOverridePriority tests that SERVER_PORT takes priority over PORT
 func TestEnvOverridePriority(t *testing.T) {
 	cfg := DefaultConfig()

@@ -2,6 +2,7 @@ package gc
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -356,6 +357,134 @@ func TestService_RunWorkerOnce_ProcessesWithLeadership(t *testing.T) {
 	}
 	if store.GetBlock(orgID, "lease-block") != nil {
 		t.Fatal("worker should process blocks when leadership is held")
+	}
+}
+
+func TestService_DeleteFailedItem_RequiresLeadership(t *testing.T) {
+	store := NewMockStore()
+	orgID := uuid.New()
+	failedAt := time.Now().UTC()
+	store.failedItems[orgID] = []GCFailedItemInfo{{
+		OrgID:      orgID,
+		FailedAt:   failedAt,
+		QueuedAt:   failedAt.Add(-time.Minute),
+		ItemType:   ItemBlock,
+		ItemID:     "blocked",
+		LibraryID:  uuid.Nil,
+		RetryCount: 5,
+	}}
+
+	svc := &Service{
+		store:  store,
+		config: config.GCConfig{Enabled: true},
+		lease:  &fakeLeaderLease{allowed: false},
+	}
+
+	err := svc.DeleteFailedItem(orgID, failedAt, ItemBlock, "blocked")
+	if !errors.Is(err, ErrNotLeader) {
+		t.Fatalf("DeleteFailedItem error = %v, want ErrNotLeader", err)
+	}
+	if got := len(store.FailedItems(orgID)); got != 1 {
+		t.Fatalf("expected failed item to remain untouched on follower, got %d items", got)
+	}
+}
+
+func TestService_Status_UsesDirtySnapshot(t *testing.T) {
+	store := NewMockStore()
+	store.gcStats[gcStatKeyTotalQueue] = "11"
+	store.gcStats[gcStatKeyTotalFailed] = "4"
+	store.gcStats[gcStatKeyTotalDirtyOrgs] = "7"
+	store.gcStats[gcStatKeyLastReconcile] = time.Now().UTC().Format(time.RFC3339)
+
+	store.dirtyQueueOrgs[uuid.New()] = time.Now().UTC()
+	store.dirtyQueueOrgs[uuid.New()] = time.Now().UTC()
+
+	svc := &Service{store: store, config: config.GCConfig{Enabled: true}, stats: &Stats{}}
+	status := svc.Status()
+
+	if status.QueueSize != 11 {
+		t.Fatalf("status.QueueSize = %d, want 11", status.QueueSize)
+	}
+	if status.FailedItemsTotal != 4 {
+		t.Fatalf("status.FailedItemsTotal = %d, want 4", status.FailedItemsTotal)
+	}
+	if status.DirtyOrgsTotal != 7 {
+		t.Fatalf("status.DirtyOrgsTotal = %d, want 7", status.DirtyOrgsTotal)
+	}
+}
+
+func TestService_ReconcileDirtyQueueStats_SerializesRuns(t *testing.T) {
+	store := NewMockStore()
+	orgA := uuid.New()
+	orgB := uuid.New()
+	store.dirtyQueueOrgs[orgA] = time.Now().Add(-time.Minute)
+	store.dirtyQueueOrgs[orgB] = time.Now().Add(-time.Minute)
+	store.activeQueueOrgs[orgA] = time.Now().Add(-time.Minute)
+	store.activeQueueOrgs[orgB] = time.Now().Add(-time.Minute)
+
+	var inFlight atomic.Int32
+	var maxInFlight atomic.Int32
+	release := make(chan struct{})
+	store.recountQueueDepthHook = func(orgID uuid.UUID, depth int) {
+		current := inFlight.Add(1)
+		for {
+			max := maxInFlight.Load()
+			if current <= max || maxInFlight.CompareAndSwap(max, current) {
+				break
+			}
+		}
+		<-release
+		inFlight.Add(-1)
+	}
+
+	svc := &Service{store: store, config: config.GCConfig{Enabled: true}}
+
+	done := make(chan struct{}, 2)
+	go func() {
+		svc.reconcileDirtyQueueStats(1)
+		done <- struct{}{}
+	}()
+	go func() {
+		svc.reconcileDirtyQueueStats(1)
+		done <- struct{}{}
+	}()
+
+	for i := 0; i < 2; i++ {
+		release <- struct{}{}
+	}
+	for i := 0; i < 2; i++ {
+		<-done
+	}
+
+	if got := maxInFlight.Load(); got != 1 {
+		t.Fatalf("expected serialized reconcile passes, max concurrent in-flight recounts = %d", got)
+	}
+}
+
+func TestService_ReconcileDirtyQueueStats_CorrectsSnapshotDrift(t *testing.T) {
+	store := NewMockStore()
+	orgA := uuid.New()
+	orgB := uuid.New()
+	store.orgQueueStats[orgA] = GCOrgStats{OrgID: orgA, QueueDepth: 3, FailedDepth: 1}
+	store.orgQueueStats[orgB] = GCOrgStats{OrgID: orgB, QueueDepth: 5, FailedDepth: 2}
+	store.gcStats[gcStatKeyTotalQueue] = "1"
+	store.gcStats[gcStatKeyTotalFailed] = "0"
+	store.gcStats[gcStatKeyTotalDirtyOrgs] = "9"
+
+	svc := &Service{store: store, config: config.GCConfig{Enabled: true}, reconcilePasses: gcSnapshotDriftCheckEvery - 1}
+	svc.reconcileDirtyQueueStats(0)
+
+	queueSnapshot, _ := store.LoadGCStats(gcStatKeyTotalQueue)
+	failedSnapshot, _ := store.LoadGCStats(gcStatKeyTotalFailed)
+	dirtySnapshot, _ := store.LoadGCStats(gcStatKeyTotalDirtyOrgs)
+	if queueSnapshot != "8" {
+		t.Fatalf("queue snapshot = %q, want 8", queueSnapshot)
+	}
+	if failedSnapshot != "3" {
+		t.Fatalf("failed snapshot = %q, want 3", failedSnapshot)
+	}
+	if dirtySnapshot != "0" {
+		t.Fatalf("dirty snapshot = %q, want 0", dirtySnapshot)
 	}
 }
 

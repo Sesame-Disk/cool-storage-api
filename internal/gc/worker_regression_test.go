@@ -2,6 +2,7 @@ package gc
 
 import (
 	"context"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -99,11 +100,10 @@ func TestWorker_HOLBlocking_RequeueMovesItemToBack(t *testing.T) {
 	}
 }
 
-// TestWorker_MaxRetry_StopsRequeuingAt5 verifies that when an item's RetryCount
-// reaches the cap (5), the worker does NOT call RequeueItem again (preventing
-// infinite requeue storms). The item stays in the queue and relies on Cassandra
-// TTL for eventual cleanup — this is intentional in the current design.
-func TestWorker_MaxRetry_StopsRequeuingAt5(t *testing.T) {
+// TestWorker_MaxRetry_MovesItemToFailedQueue verifies that retry-capped items
+// are removed from the live queue and captured in the DLQ instead of lingering
+// until queue TTL cleanup.
+func TestWorker_MaxRetry_MovesItemToFailedQueue(t *testing.T) {
 	store := NewMockStore()
 	stats := &Stats{}
 	q := NewQueue(store)
@@ -118,14 +118,76 @@ func TestWorker_MaxRetry_StopsRequeuingAt5(t *testing.T) {
 	ctx := context.Background()
 	_, _ = w.ProcessOnce(ctx)
 
-	// The item should still be in queue (not RequeueItem'd, not Complete'd)
+	// The item should leave the live queue and move to failedItems.
 	items := store.QueueItems(orgID)
-	if len(items) != 1 {
-		t.Errorf("expected 1 item still in queue after cap reached (awaiting TTL), got %d", len(items))
+	if len(items) != 0 {
+		t.Fatalf("expected 0 live queue items after retry cap, got %d", len(items))
 	}
-	// Crucially: QueuedAt must NOT have changed (RequeueItem was not called)
-	if len(items) == 1 && !items[0].QueuedAt.Equal(originalQueuedAt) {
-		t.Errorf("QueuedAt changed despite reaching retry cap — RequeueItem should not be called at RetryCount=5")
+
+	failedItems := store.FailedItems(orgID)
+	if len(failedItems) != 1 {
+		t.Fatalf("expected 1 failed item after retry cap, got %d", len(failedItems))
+	}
+	failed := failedItems[0]
+	if failed.ItemID != "maxed-item" {
+		t.Fatalf("failed item id = %q, want %q", failed.ItemID, "maxed-item")
+	}
+	if failed.RetryCount != 5 {
+		t.Fatalf("failed item retry count = %d, want 5", failed.RetryCount)
+	}
+	if failed.LastError == "" {
+		t.Fatal("expected failed item to retain the last error")
+	}
+	if !failed.QueuedAt.Equal(originalQueuedAt) {
+		t.Fatalf("failed item queued_at changed: got %v want %v", failed.QueuedAt, originalQueuedAt)
+	}
+}
+
+func TestWorker_ProcessOrg_PreservesActiveOrgOnConcurrentEnqueue(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	w := NewWorker(store, nil, q, 100, 0, false, stats)
+
+	orgID := uuid.New()
+	base := time.Now().UTC()
+	queuedAt := base.Add(-2 * time.Hour)
+	clockCalls := atomic.Int32{}
+	w.clock = func() time.Time {
+		if clockCalls.Add(1) == 1 {
+			return base
+		}
+		return base.Add(2 * time.Second)
+	}
+
+	store.AddBlock(orgID, "old-block", "hot", 0)
+	if err := store.EnqueueItem(orgID, queuedAt, ItemBlock, "old-block", uuid.Nil, "hot", 0); err != nil {
+		t.Fatalf("enqueue old item: %v", err)
+	}
+
+	hooked := atomic.Bool{}
+	store.getQueueSizeHook = func(hookOrgID uuid.UUID, size int) {
+		if hookOrgID != orgID || size != 0 || !hooked.CompareAndSwap(false, true) {
+			return
+		}
+		if err := store.EnqueueItem(orgID, base.Add(3*time.Second), ItemShareLink, "new-item", uuid.Nil, "", 0); err != nil {
+			t.Fatalf("enqueue concurrent item: %v", err)
+		}
+	}
+
+	processed, err := w.processOrg(context.Background(), orgID)
+	if err != nil {
+		t.Fatalf("processOrg failed: %v", err)
+	}
+	if processed != 1 {
+		t.Fatalf("processed = %d, want 1", processed)
+	}
+	if !store.IsOrgActive(orgID) {
+		t.Fatal("expected org to remain active after concurrent enqueue")
+	}
+	items := store.QueueItems(orgID)
+	if len(items) != 1 || items[0].ItemID != "new-item" {
+		t.Fatalf("expected concurrent queue item to remain live, got %#v", items)
 	}
 }
 

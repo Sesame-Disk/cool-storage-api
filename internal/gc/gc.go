@@ -2,6 +2,7 @@ package gc
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"strconv"
@@ -47,14 +48,29 @@ func (s *Stats) LastScanRun() time.Time {
 
 // GCStatus is the JSON response for the admin status endpoint.
 type GCStatus struct {
-	Enabled              bool   `json:"enabled"`
-	DryRun               bool   `json:"dry_run"`
-	LastWorkerRun        string `json:"last_worker_run"`
-	LastScanRun          string `json:"last_scan_run"`
-	QueueSize            int    `json:"queue_size"`
-	BlocksDeletedTotal   int64  `json:"blocks_deleted_total"`
-	GracePeriodSeconds   int64  `json:"grace_period_seconds"`
+	Enabled            bool   `json:"enabled"`
+	DryRun             bool   `json:"dry_run"`
+	LastWorkerRun      string `json:"last_worker_run"`
+	LastScanRun        string `json:"last_scan_run"`
+	LastReconcileRun   string `json:"last_reconcile_run"`
+	QueueSize          int    `json:"queue_size"`
+	FailedItemsTotal   int    `json:"failed_items_total"`
+	DirtyOrgsTotal     int    `json:"dirty_orgs_total"`
+	SnapshotAgeSeconds int64  `json:"snapshot_age_seconds"`
+	BlocksDeletedTotal int64  `json:"blocks_deleted_total"`
+	GracePeriodSeconds int64  `json:"grace_period_seconds"`
 }
+
+const (
+	gcStatKeyTotalQueue          = "total_queue_depth"
+	gcStatKeyTotalFailed         = "total_failed_items"
+	gcStatKeyTotalDirtyOrgs      = "dirty_orgs_total"
+	gcStatKeyLastReconcile       = "last_reconcile_run"
+	gcDefaultFailedItemsPageSize = 100
+	gcSnapshotDriftCheckEvery    = 10
+)
+
+var ErrNotLeader = errors.New("gc leadership required")
 
 // Service is the top-level GC orchestrator.
 // It starts and manages the worker and scanner goroutines.
@@ -77,6 +93,14 @@ type Service struct {
 	wg      sync.WaitGroup
 	started bool
 	mu      sync.Mutex
+
+	// reconcileMu serializes snapshot reconciliation so global gc_stats totals
+	// are not corrupted by concurrent read-modify-write cycles.
+	reconcileMu sync.Mutex
+
+	// reconcilePasses counts serialized reconcile runs so we can do occasional
+	// full drift checks without paying that cost on every pass.
+	reconcilePasses uint64
 
 	// consecutiveErrors is only accessed from the workerLoop goroutine
 	// (via runWorkerOnce). If this changes, protect with s.mu.
@@ -228,10 +252,20 @@ func (s *Service) TriggerScanner() {
 
 // Status returns the current GC status for the admin API.
 func (s *Service) Status() GCStatus {
-	queueSize, _ := s.queue.GetTotalQueueSize()
+	queueSize := s.loadStatInt(gcStatKeyTotalQueue)
+	failedItemsTotal := s.loadStatInt(gcStatKeyTotalFailed)
 
 	lastWorker := s.stats.LastWorkerRun()
 	lastScan := s.stats.LastScanRun()
+	lastReconcile := s.loadStatTime(gcStatKeyLastReconcile)
+	dirtyOrgs := s.loadStatInt(gcStatKeyTotalDirtyOrgs)
+	snapshotAgeSeconds := int64(0)
+	if !lastReconcile.IsZero() {
+		snapshotAgeSeconds = int64(time.Since(lastReconcile).Seconds())
+		if snapshotAgeSeconds < 0 {
+			snapshotAgeSeconds = 0
+		}
+	}
 
 	formatTime := func(t time.Time) string {
 		if t.IsZero() {
@@ -245,7 +279,11 @@ func (s *Service) Status() GCStatus {
 		DryRun:             s.config.DryRun,
 		LastWorkerRun:      formatTime(lastWorker),
 		LastScanRun:        formatTime(lastScan),
+		LastReconcileRun:   formatTime(lastReconcile),
 		QueueSize:          queueSize,
+		FailedItemsTotal:   failedItemsTotal,
+		DirtyOrgsTotal:     dirtyOrgs,
+		SnapshotAgeSeconds: snapshotAgeSeconds,
 		BlocksDeletedTotal: s.stats.BlocksDeleted(),
 		GracePeriodSeconds: int64(s.config.GracePeriod.Seconds()),
 	}
@@ -317,7 +355,7 @@ func (s *Service) runWorkerOnce(ctx context.Context) {
 		return
 	}
 
-	queueBefore, _ := s.queue.GetTotalQueueSize()
+	queueBefore := s.loadStatInt(gcStatKeyTotalQueue)
 
 	start := time.Now()
 	n, err := s.worker.ProcessOnce(ctx)
@@ -339,10 +377,11 @@ func (s *Service) runWorkerOnce(ctx context.Context) {
 		}
 	}
 
-	if queueAfter, qErr := s.queue.GetTotalQueueSize(); qErr == nil {
-		metrics.GCQueueSize.Set(float64(queueAfter))
-		metrics.GCQueueGrowthRate.Set(float64(queueAfter - queueBefore))
-	}
+	s.reconcileDirtyQueueStats(s.reconcileLimit())
+
+	queueAfter := s.loadStatInt(gcStatKeyTotalQueue)
+	metrics.GCQueueSize.Set(float64(queueAfter))
+	metrics.GCQueueGrowthRate.Set(float64(queueAfter - queueBefore))
 
 	if n > 0 {
 		log.Printf("[GC Worker] Processed %d items", n)
@@ -375,8 +414,195 @@ func (s *Service) runScannerOnce(ctx context.Context) {
 
 	start := time.Now()
 	s.scanner.ScanOnce(ctx)
+	s.reconcileDirtyQueueStats(s.reconcileLimit())
 	metrics.GCScannerDuration.Observe(time.Since(start).Seconds())
 	metrics.GCLastScannerRun.Set(float64(time.Now().Unix()))
+}
+
+func (s *Service) loadStatTime(key string) time.Time {
+	val, err := s.store.LoadGCStats(key)
+	if err != nil || val == "" {
+		return time.Time{}
+	}
+	t, err := time.Parse(time.RFC3339, val)
+	if err != nil {
+		return time.Time{}
+	}
+	return t
+}
+
+func (s *Service) loadStatInt(key string) int {
+	val, err := s.store.LoadGCStats(key)
+	if err != nil || val == "" {
+		return 0
+	}
+	n, err := strconv.Atoi(val)
+	if err != nil {
+		return 0
+	}
+	if n < 0 {
+		return 0
+	}
+	return n
+}
+
+func (s *Service) saveStatInt(key string, value int) {
+	if value < 0 {
+		value = 0
+	}
+	if err := s.store.SaveGCStats(key, strconv.Itoa(value)); err != nil {
+		log.Printf("[GC] Failed to persist %s=%d: %v", key, value, err)
+	}
+}
+
+func (s *Service) reconcileDirtyQueueStats(limit int) {
+	s.reconcileMu.Lock()
+	defer s.reconcileMu.Unlock()
+
+	start := time.Now()
+	defer func() {
+		metrics.GCReconcileDuration.Observe(time.Since(start).Seconds())
+	}()
+
+	dirtyOrgs, err := s.store.ListDirtyOrgs(limit)
+	if err != nil {
+		log.Printf("[GC] Failed to list dirty orgs: %v", err)
+		return
+	}
+	metrics.GCDirtyOrgsTotal.Set(float64(len(dirtyOrgs)))
+
+	totalQueue := s.loadStatInt(gcStatKeyTotalQueue)
+	totalFailed := s.loadStatInt(gcStatKeyTotalFailed)
+	remainingDirtyCount := len(dirtyOrgs)
+
+	if len(dirtyOrgs) > 0 {
+		for _, dirtyOrg := range dirtyOrgs {
+			recountedAt := time.Now().UTC()
+			prevStats, err := s.store.GetOrgQueueStats(dirtyOrg.OrgID)
+			if err != nil {
+				log.Printf("[GC] Failed to load org queue stats for %s: %v", dirtyOrg.OrgID, err)
+				continue
+			}
+			queueDepth, err := s.store.RecountOrgQueueDepth(dirtyOrg.OrgID)
+			if err != nil {
+				log.Printf("[GC] Failed to recount queue depth for %s: %v", dirtyOrg.OrgID, err)
+				continue
+			}
+			failedDepth, err := s.store.RecountOrgFailedDepth(dirtyOrg.OrgID)
+			if err != nil {
+				log.Printf("[GC] Failed to recount failed depth for %s: %v", dirtyOrg.OrgID, err)
+				continue
+			}
+			oldestQueuedAt, err := s.store.GetOldestQueuedAt(dirtyOrg.OrgID)
+			if err != nil {
+				log.Printf("[GC] Failed to read oldest queue item for %s: %v", dirtyOrg.OrgID, err)
+				continue
+			}
+
+			nextStats := GCOrgStats{
+				OrgID:          dirtyOrg.OrgID,
+				QueueDepth:     queueDepth,
+				FailedDepth:    failedDepth,
+				OldestQueuedAt: oldestQueuedAt,
+				UpdatedAt:      recountedAt,
+			}
+			if err := s.store.SaveOrgQueueStats(nextStats); err != nil {
+				log.Printf("[GC] Failed to save org queue stats for %s: %v", dirtyOrg.OrgID, err)
+				continue
+			}
+
+			totalQueue += queueDepth - prevStats.QueueDepth
+			if totalQueue < 0 {
+				totalQueue = 0
+			}
+			totalFailed += failedDepth - prevStats.FailedDepth
+			if totalFailed < 0 {
+				totalFailed = 0
+			}
+
+			if err := s.store.ClearDirtyOrg(dirtyOrg.OrgID, dirtyOrg.MarkedAt); err != nil {
+				log.Printf("[GC] Failed to clear dirty org %s: %v", dirtyOrg.OrgID, err)
+			}
+			if queueDepth == 0 {
+				if err := s.store.RemoveOrgFromActiveSet(dirtyOrg.OrgID, recountedAt); err != nil {
+					log.Printf("[GC] Failed to remove drained org %s from active set: %v", dirtyOrg.OrgID, err)
+				}
+			}
+		}
+	}
+
+	s.reconcilePasses++
+	if s.reconcilePasses%gcSnapshotDriftCheckEvery == 0 {
+		summedQueue, summedFailed, err := s.store.SumOrgQueueStats()
+		if err != nil {
+			log.Printf("[GC] Failed to sum org queue stats for drift check: %v", err)
+		} else if summedQueue != totalQueue || summedFailed != totalFailed {
+			log.Printf("[GC] Snapshot drift detected; correcting totals queue=%d->%d failed=%d->%d", totalQueue, summedQueue, totalFailed, summedFailed)
+			totalQueue = summedQueue
+			totalFailed = summedFailed
+			metrics.GCSnapshotDriftCorrectedTotal.Inc()
+		}
+	}
+
+	lastRun := time.Now().UTC()
+	if remainingDirty, err := s.store.ListDirtyOrgs(0); err == nil {
+		remainingDirtyCount = len(remainingDirty)
+	}
+	s.saveStatInt(gcStatKeyTotalQueue, totalQueue)
+	s.saveStatInt(gcStatKeyTotalFailed, totalFailed)
+	s.saveStatInt(gcStatKeyTotalDirtyOrgs, remainingDirtyCount)
+	if err := s.store.SaveGCStats(gcStatKeyLastReconcile, lastRun.Format(time.RFC3339)); err != nil {
+		log.Printf("[GC] Failed to persist last reconcile run: %v", err)
+	}
+	metrics.GCQueueSize.Set(float64(totalQueue))
+	metrics.GCFailedItemsTotal.Set(float64(totalFailed))
+	metrics.GCDirtyOrgsTotal.Set(float64(remainingDirtyCount))
+	metrics.GCSnapshotAgeSeconds.Set(0)
+}
+
+func (s *Service) reconcileLimit() int {
+	if s.config.ReconcileBatchSize > 0 {
+		return s.config.ReconcileBatchSize
+	}
+	return 0
+}
+
+func (s *Service) FailedItemsPageSize() int {
+	if s.config.FailedItemsPageSize > 0 {
+		return s.config.FailedItemsPageSize
+	}
+	return gcDefaultFailedItemsPageSize
+}
+
+func (s *Service) ListFailedItems(orgID uuid.UUID, limit int) ([]GCFailedItemInfo, error) {
+	if limit <= 0 {
+		limit = s.FailedItemsPageSize()
+	}
+	return s.store.ListFailedItems(orgID, limit)
+}
+
+func (s *Service) DeleteFailedItem(orgID uuid.UUID, failedAt time.Time, itemType ItemType, itemID string) error {
+	if !s.hasLeadership(context.Background(), "admin_failed_item_delete") {
+		return ErrNotLeader
+	}
+	err := s.store.DeleteFailedItem(orgID, failedAt, itemType, itemID)
+	if err != nil {
+		return err
+	}
+	s.reconcileDirtyQueueStats(s.reconcileLimit())
+	return nil
+}
+
+func (s *Service) RequeueFailedItem(orgID uuid.UUID, failedAt time.Time, itemType ItemType, itemID string) error {
+	if !s.hasLeadership(context.Background(), "admin_failed_item_requeue") {
+		return ErrNotLeader
+	}
+	err := s.store.RequeueFailedItem(orgID, failedAt, itemType, itemID, time.Now().UTC())
+	if err != nil {
+		return err
+	}
+	s.reconcileDirtyQueueStats(s.reconcileLimit())
+	return nil
 }
 
 func (s *Service) hasLeadership(ctx context.Context, component string) bool {

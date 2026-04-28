@@ -11,7 +11,7 @@ COPY . .
 RUN if [ ! -f .env ]; then \
     echo "NODE_MAX_MEMORY=4096" > .env && \
     echo "GENERATE_SOURCEMAP=false" >> .env && \
-    echo "WEBPACK_PARALLEL_BUILD=true" >> .env; \
+    echo "WEBPACK_PARALLEL_BUILD=false" >> .env; \
     fi
 
 RUN sed -i 's/\r$//' .env

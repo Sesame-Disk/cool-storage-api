@@ -579,12 +579,14 @@ type VersioningConfig struct {
 
 // GCConfig holds garbage collection settings
 type GCConfig struct {
-	Enabled        bool          `yaml:"enabled"`         // default: false; enable explicitly via GC_ENABLED=true
-	WorkerInterval time.Duration `yaml:"worker_interval"` // default: 30s (queue poll)
-	ScanInterval   time.Duration `yaml:"scan_interval"`   // default: 24h (full scan)
-	BatchSize      int           `yaml:"batch_size"`      // default: 100 (items per tick)
-	GracePeriod    time.Duration `yaml:"grace_period"`    // default: 1h (delay before S3 delete)
-	DryRun         bool          `yaml:"dry_run"`         // default: false
+	Enabled             bool          `yaml:"enabled"`                // default: false; enable explicitly via GC_ENABLED=true
+	WorkerInterval      time.Duration `yaml:"worker_interval"`        // default: 30s (queue poll)
+	ScanInterval        time.Duration `yaml:"scan_interval"`          // default: 24h (full scan)
+	BatchSize           int           `yaml:"batch_size"`             // default: 100 (items per tick)
+	ReconcileBatchSize  int           `yaml:"reconcile_batch_size"`   // default: 256 (dirty orgs per reconcile pass, 0 = all)
+	FailedItemsPageSize int           `yaml:"failed_items_page_size"` // default: 100 (admin DLQ listing page size)
+	GracePeriod         time.Duration `yaml:"grace_period"`           // default: 1h (delay before S3 delete)
+	DryRun              bool          `yaml:"dry_run"`                // default: false
 
 	// Soft-delete grace periods (0 = cascade immediately)
 	UserGraceDays      int `yaml:"user_grace_days"`      // default: 7 — days before deleted user is permanently purged
@@ -701,16 +703,18 @@ func DefaultConfig() *Config {
 			GCInterval:     24 * time.Hour,
 		},
 		GC: GCConfig{
-			Enabled:            false,
-			WorkerInterval:     30 * time.Second,
-			ScanInterval:       24 * time.Hour,
-			BatchSize:          100,
-			GracePeriod:        1 * time.Hour,
-			DryRun:             false,
-			UserGraceDays:      7,
-			OrgGraceDays:       30,
-			TrashRetentionDays: 30,
-			AuditRetentionDays: 365,
+			Enabled:             false,
+			WorkerInterval:      30 * time.Second,
+			ScanInterval:        24 * time.Hour,
+			BatchSize:           100,
+			ReconcileBatchSize:  256,
+			FailedItemsPageSize: 100,
+			GracePeriod:         1 * time.Hour,
+			DryRun:              false,
+			UserGraceDays:       7,
+			OrgGraceDays:        30,
+			TrashRetentionDays:  30,
+			AuditRetentionDays:  365,
 		},
 		SeafHTTP: SeafHTTPConfig{
 			TokenTTL:      1 * time.Hour,
@@ -1034,6 +1038,16 @@ func (c *Config) applyEnvOverrides() {
 	// GC settings
 	if v := os.Getenv("GC_ENABLED"); v != "" {
 		c.GC.Enabled = v == "true" || v == "1"
+	}
+	if v := os.Getenv("GC_RECONCILE_BATCH_SIZE"); v != "" {
+		if i, err := strconv.Atoi(v); err == nil {
+			c.GC.ReconcileBatchSize = i
+		}
+	}
+	if v := os.Getenv("GC_FAILED_ITEMS_PAGE_SIZE"); v != "" {
+		if i, err := strconv.Atoi(v); err == nil {
+			c.GC.FailedItemsPageSize = i
+		}
 	}
 
 	// GC grace periods

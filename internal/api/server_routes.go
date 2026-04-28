@@ -175,6 +175,12 @@ func (s *Server) registerAPIV21Routes(serverURL string) {
 		gcAdmin.GET("/gc/status/", s.handleGCStatus)
 		gcAdmin.POST("/gc/run", s.handleGCRun)
 		gcAdmin.POST("/gc/run/", s.handleGCRun)
+		gcAdmin.GET("/gc/failed-items", s.handleGCFailedItems)
+		gcAdmin.GET("/gc/failed-items/", s.handleGCFailedItems)
+		gcAdmin.POST("/gc/failed-items/requeue", s.handleGCFailedItemRequeue)
+		gcAdmin.POST("/gc/failed-items/requeue/", s.handleGCFailedItemRequeue)
+		gcAdmin.DELETE("/gc/failed-items", s.handleGCFailedItemDelete)
+		gcAdmin.DELETE("/gc/failed-items/", s.handleGCFailedItemDelete)
 	}
 
 	v2.RegisterV21LibraryRoutes(protected, s.db, s.config, s.tokenStore, s.storage, s.blockStore, s.storageManager, serverURL)

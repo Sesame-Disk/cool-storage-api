@@ -18,6 +18,14 @@ type MockStore struct {
 
 	// gc_queue items keyed by orgID
 	queue map[uuid.UUID][]QueueItem
+	// active queue orgs keyed by orgID
+	activeQueueOrgs map[uuid.UUID]time.Time
+	// dirty queue orgs keyed by orgID
+	dirtyQueueOrgs map[uuid.UUID]time.Time
+	// reconciled org-level queue stats keyed by orgID
+	orgQueueStats map[uuid.UUID]GCOrgStats
+	// failed GC items keyed by orgID
+	failedItems map[uuid.UUID][]GCFailedItemInfo
 
 	// blocks keyed by "orgID:blockID"
 	blocks map[string]*mockBlock
@@ -102,6 +110,10 @@ type MockStore struct {
 
 	// gc_stats keyed by stat_key
 	gcStats map[string]string
+
+	// optional test hooks for reproducing concurrency windows deterministically.
+	getQueueSizeHook      func(orgID uuid.UUID, size int)
+	recountQueueDepthHook func(orgID uuid.UUID, depth int)
 
 	// audit_log entries
 	auditLog []AuditLogEntry
@@ -214,6 +226,10 @@ type mockStorageCounterReconciliation struct {
 func NewMockStore() *MockStore {
 	return &MockStore{
 		queue:                         make(map[uuid.UUID][]QueueItem),
+		activeQueueOrgs:               make(map[uuid.UUID]time.Time),
+		dirtyQueueOrgs:                make(map[uuid.UUID]time.Time),
+		orgQueueStats:                 make(map[uuid.UUID]GCOrgStats),
+		failedItems:                   make(map[uuid.UUID][]GCFailedItemInfo),
 		blocks:                        make(map[string]*mockBlock),
 		blockGCCandidates:             make(map[string]*mockBlockGCCandidate),
 		mappings:                      make(map[string]string),
@@ -661,6 +677,13 @@ func (m *MockStore) QueueItems(orgID uuid.UUID) []QueueItem {
 	return append([]QueueItem{}, m.queue[orgID]...)
 }
 
+func (m *MockStore) IsOrgActive(orgID uuid.UUID) bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	_, ok := m.activeQueueOrgs[orgID]
+	return ok
+}
+
 // GetShareLink returns a share link for test assertions.
 func (m *MockStore) GetShareLink(shareToken string) *mockShareLink {
 	m.mu.RLock()
@@ -683,6 +706,8 @@ func (m *MockStore) EnqueueItem(orgID uuid.UUID, queuedAt time.Time, itemType It
 		RetryCount:   retryCount,
 	}
 	m.queue[orgID] = append(m.queue[orgID], item)
+	m.activeQueueOrgs[orgID] = time.Now().UTC()
+	m.dirtyQueueOrgs[orgID] = time.Now().UTC()
 	return nil
 }
 
@@ -691,6 +716,8 @@ func (m *MockStore) EnqueueBatch(items []QueueItem) error {
 	defer m.mu.Unlock()
 	for _, item := range items {
 		m.queue[item.OrgID] = append(m.queue[item.OrgID], item)
+		m.activeQueueOrgs[item.OrgID] = time.Now().UTC()
+		m.dirtyQueueOrgs[item.OrgID] = time.Now().UTC()
 	}
 	return nil
 }
@@ -736,6 +763,7 @@ func (m *MockStore) CompleteItem(orgID uuid.UUID, queuedAt time.Time, itemType I
 	for i, item := range items {
 		if item.QueuedAt.Equal(queuedAt) && item.ItemType == itemType && item.ItemID == itemID {
 			m.queue[orgID] = append(items[:i], items[i+1:]...)
+			m.dirtyQueueOrgs[orgID] = time.Now().UTC()
 			return nil
 		}
 	}
@@ -757,6 +785,8 @@ func (m *MockStore) RequeueItem(orgID uuid.UUID, oldQueuedAt, newQueuedAt time.T
 			newItem.QueuedAt = newQueuedAt
 			newItem.RetryCount = newRetryCount
 			m.queue[orgID] = append(m.queue[orgID], newItem)
+			m.activeQueueOrgs[orgID] = time.Now().UTC()
+			m.dirtyQueueOrgs[orgID] = time.Now().UTC()
 
 			return nil
 		}
@@ -764,10 +794,41 @@ func (m *MockStore) RequeueItem(orgID uuid.UUID, oldQueuedAt, newQueuedAt time.T
 	return nil
 }
 
+func (m *MockStore) FailItem(item QueueItem, failedAt time.Time, lastError string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	items := m.queue[item.OrgID]
+	for i, existing := range items {
+		if existing.QueuedAt.Equal(item.QueuedAt) && existing.ItemType == item.ItemType && existing.ItemID == item.ItemID {
+			m.queue[item.OrgID] = append(items[:i], items[i+1:]...)
+			break
+		}
+	}
+	m.failedItems[item.OrgID] = append(m.failedItems[item.OrgID], GCFailedItemInfo{
+		OrgID:        item.OrgID,
+		FailedAt:     failedAt,
+		QueuedAt:     item.QueuedAt,
+		ItemType:     item.ItemType,
+		ItemID:       item.ItemID,
+		LibraryID:    item.LibraryID,
+		StorageClass: item.StorageClass,
+		RetryCount:   item.RetryCount,
+		LastError:    lastError,
+	})
+	m.dirtyQueueOrgs[item.OrgID] = time.Now().UTC()
+	return nil
+}
+
 func (m *MockStore) GetQueueSize(orgID uuid.UUID) (int, error) {
 	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return len(m.queue[orgID]), nil
+	size := len(m.queue[orgID])
+	hook := m.getQueueSizeHook
+	m.mu.RUnlock()
+	if hook != nil {
+		hook(orgID, size)
+	}
+	return size, nil
 }
 
 func (m *MockStore) GetTotalQueueSize() (int, error) {
@@ -778,6 +839,75 @@ func (m *MockStore) GetTotalQueueSize() (int, error) {
 		total += len(items)
 	}
 	return total, nil
+}
+
+func (m *MockStore) GetTotalFailedItems() (int, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	total := 0
+	for _, items := range m.failedItems {
+		total += len(items)
+	}
+	return total, nil
+}
+
+func (m *MockStore) FailedItems(orgID uuid.UUID) []GCFailedItemInfo {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	items := m.failedItems[orgID]
+	result := make([]GCFailedItemInfo, len(items))
+	copy(result, items)
+	return result
+}
+
+func (m *MockStore) ListFailedItems(orgID uuid.UUID, limit int) ([]GCFailedItemInfo, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	items := m.failedItems[orgID]
+	result := make([]GCFailedItemInfo, len(items))
+	copy(result, items)
+	if limit > 0 && len(result) > limit {
+		result = result[:limit]
+	}
+	return result, nil
+}
+
+func (m *MockStore) DeleteFailedItem(orgID uuid.UUID, failedAt time.Time, itemType ItemType, itemID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	items := m.failedItems[orgID]
+	for i, item := range items {
+		if item.FailedAt.Equal(failedAt) && item.ItemType == itemType && item.ItemID == itemID {
+			m.failedItems[orgID] = append(items[:i], items[i+1:]...)
+			m.dirtyQueueOrgs[orgID] = time.Now().UTC()
+			return nil
+		}
+	}
+	return nil
+}
+
+func (m *MockStore) RequeueFailedItem(orgID uuid.UUID, failedAt time.Time, itemType ItemType, itemID string, queuedAt time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	items := m.failedItems[orgID]
+	for i, item := range items {
+		if item.FailedAt.Equal(failedAt) && item.ItemType == itemType && item.ItemID == itemID {
+			m.queue[orgID] = append(m.queue[orgID], QueueItem{
+				OrgID:        orgID,
+				QueuedAt:     queuedAt,
+				ItemType:     item.ItemType,
+				ItemID:       item.ItemID,
+				LibraryID:    item.LibraryID,
+				StorageClass: item.StorageClass,
+				RetryCount:   0,
+			})
+			m.failedItems[orgID] = append(items[:i], items[i+1:]...)
+			m.activeQueueOrgs[orgID] = time.Now().UTC()
+			m.dirtyQueueOrgs[orgID] = time.Now().UTC()
+			return nil
+		}
+	}
+	return fmt.Errorf("failed item not found")
 }
 
 func (m *MockStore) ListOrgsWithQueuedItems() ([]uuid.UUID, error) {
@@ -791,6 +921,117 @@ func (m *MockStore) ListOrgsWithQueuedItems() ([]uuid.UUID, error) {
 		}
 	}
 	return orgs, nil
+}
+
+func (m *MockStore) MarkOrgActive(orgID uuid.UUID, activeAt time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.activeQueueOrgs[orgID] = activeAt
+	return nil
+}
+
+func (m *MockStore) RemoveOrgFromActiveSet(orgID uuid.UUID, activeBefore time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if existing, ok := m.activeQueueOrgs[orgID]; ok && existing.Before(activeBefore) {
+		delete(m.activeQueueOrgs, orgID)
+	}
+	return nil
+}
+
+func (m *MockStore) MarkOrgDirty(orgID uuid.UUID, dirtyAt time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.dirtyQueueOrgs[orgID] = dirtyAt
+	return nil
+}
+
+func (m *MockStore) ListDirtyOrgs(limit int) ([]GCDirtyOrg, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	orgs := make([]GCDirtyOrg, 0, len(m.dirtyQueueOrgs))
+	for orgID, markedAt := range m.dirtyQueueOrgs {
+		orgs = append(orgs, GCDirtyOrg{OrgID: orgID, MarkedAt: markedAt})
+	}
+	sort.Slice(orgs, func(i, j int) bool {
+		return strings.Compare(orgs[i].OrgID.String(), orgs[j].OrgID.String()) < 0
+	})
+	if limit > 0 && len(orgs) > limit {
+		orgs = orgs[:limit]
+	}
+	return orgs, nil
+}
+
+func (m *MockStore) ClearDirtyOrg(orgID uuid.UUID, dirtyBefore time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if existing, ok := m.dirtyQueueOrgs[orgID]; ok && !existing.After(dirtyBefore) {
+		delete(m.dirtyQueueOrgs, orgID)
+	}
+	return nil
+}
+
+func (m *MockStore) GetOrgQueueStats(orgID uuid.UUID) (GCOrgStats, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	stats, ok := m.orgQueueStats[orgID]
+	if !ok {
+		return GCOrgStats{OrgID: orgID}, nil
+	}
+	return stats, nil
+}
+
+func (m *MockStore) SaveOrgQueueStats(stats GCOrgStats) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.orgQueueStats[stats.OrgID] = stats
+	return nil
+}
+
+func (m *MockStore) RecountOrgQueueDepth(orgID uuid.UUID) (int, error) {
+	m.mu.RLock()
+	depth := len(m.queue[orgID])
+	hook := m.recountQueueDepthHook
+	m.mu.RUnlock()
+	if hook != nil {
+		hook(orgID, depth)
+	}
+	return depth, nil
+}
+
+func (m *MockStore) RecountOrgFailedDepth(orgID uuid.UUID) (int, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return len(m.failedItems[orgID]), nil
+}
+
+func (m *MockStore) GetOldestQueuedAt(orgID uuid.UUID) (*time.Time, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	items := m.queue[orgID]
+	if len(items) == 0 {
+		return nil, nil
+	}
+	oldest := items[0].QueuedAt
+	for _, item := range items[1:] {
+		if item.QueuedAt.Before(oldest) {
+			oldest = item.QueuedAt
+		}
+	}
+	oldestCopy := oldest
+	return &oldestCopy, nil
+}
+
+func (m *MockStore) SumOrgQueueStats() (int, int, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	totalQueue := 0
+	totalFailed := 0
+	for _, stats := range m.orgQueueStats {
+		totalQueue += stats.QueueDepth
+		totalFailed += stats.FailedDepth
+	}
+	return totalQueue, totalFailed, nil
 }
 
 func (m *MockStore) MarkItemProcessed(taskID uuid.UUID) (bool, error) {

@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -34,6 +35,7 @@ import (
 	"github.com/gin-contrib/cors"
 	"github.com/gin-contrib/gzip"
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 	"golang.org/x/time/rate"
 )
 
@@ -2267,6 +2269,135 @@ func (s *Server) handleGCRun(c *gin.Context) {
 		s.gcService.TriggerWorker()
 		c.JSON(http.StatusOK, gin.H{"started": true, "message": "GC worker triggered"})
 	}
+}
+
+func parseGCFailedItemSelector(c *gin.Context) (uuid.UUID, time.Time, gc.ItemType, string, error) {
+	orgIDStr := strings.TrimSpace(c.Query("org_id"))
+	if orgIDStr == "" {
+		orgIDStr = strings.TrimSpace(c.PostForm("org_id"))
+	}
+	failedAtStr := strings.TrimSpace(c.Query("failed_at"))
+	if failedAtStr == "" {
+		failedAtStr = strings.TrimSpace(c.PostForm("failed_at"))
+	}
+	itemTypeStr := strings.TrimSpace(c.Query("item_type"))
+	if itemTypeStr == "" {
+		itemTypeStr = strings.TrimSpace(c.PostForm("item_type"))
+	}
+	itemID := strings.TrimSpace(c.Query("item_id"))
+	if itemID == "" {
+		itemID = strings.TrimSpace(c.PostForm("item_id"))
+	}
+
+	var body struct {
+		OrgID    string `json:"org_id"`
+		FailedAt string `json:"failed_at"`
+		ItemType string `json:"item_type"`
+		ItemID   string `json:"item_id"`
+	}
+	_ = c.ShouldBindJSON(&body)
+	if orgIDStr == "" {
+		orgIDStr = strings.TrimSpace(body.OrgID)
+	}
+	if failedAtStr == "" {
+		failedAtStr = strings.TrimSpace(body.FailedAt)
+	}
+	if itemTypeStr == "" {
+		itemTypeStr = strings.TrimSpace(body.ItemType)
+	}
+	if itemID == "" {
+		itemID = strings.TrimSpace(body.ItemID)
+	}
+
+	orgID, err := uuid.Parse(orgIDStr)
+	if err != nil {
+		return uuid.Nil, time.Time{}, "", "", fmt.Errorf("invalid org_id")
+	}
+	failedAt, err := time.Parse(time.RFC3339Nano, failedAtStr)
+	if err != nil {
+		failedAt, err = time.Parse(time.RFC3339, failedAtStr)
+		if err != nil {
+			return uuid.Nil, time.Time{}, "", "", fmt.Errorf("invalid failed_at")
+		}
+	}
+	if itemTypeStr == "" {
+		return uuid.Nil, time.Time{}, "", "", fmt.Errorf("item_type is required")
+	}
+	if itemID == "" {
+		return uuid.Nil, time.Time{}, "", "", fmt.Errorf("item_id is required")
+	}
+	return orgID, failedAt, gc.ItemType(itemTypeStr), itemID, nil
+}
+
+func (s *Server) handleGCFailedItems(c *gin.Context) {
+	if s.gcService == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "GC service not available"})
+		return
+	}
+	orgIDStr := strings.TrimSpace(c.Query("org_id"))
+	if orgIDStr == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "org_id is required"})
+		return
+	}
+	orgID, err := uuid.Parse(orgIDStr)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid org_id"})
+		return
+	}
+	limit := s.gcService.FailedItemsPageSize()
+	if raw := strings.TrimSpace(c.Query("limit")); raw != "" {
+		if parsed, err := strconv.Atoi(raw); err == nil && parsed > 0 {
+			limit = parsed
+		}
+	}
+	items, err := s.gcService.ListFailedItems(orgID, limit)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"items": items})
+}
+
+func (s *Server) handleGCFailedItemRequeue(c *gin.Context) {
+	if s.gcService == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "GC service not available"})
+		return
+	}
+	orgID, failedAt, itemType, itemID, err := parseGCFailedItemSelector(c)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if err := s.gcService.RequeueFailedItem(orgID, failedAt, itemType, itemID); err != nil {
+		if errors.Is(err, gc.ErrNotLeader) {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"requeued": true})
+}
+
+func (s *Server) handleGCFailedItemDelete(c *gin.Context) {
+	if s.gcService == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "GC service not available"})
+		return
+	}
+	orgID, failedAt, itemType, itemID, err := parseGCFailedItemSelector(c)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if err := s.gcService.DeleteFailedItem(orgID, failedAt, itemType, itemID); err != nil {
+		if errors.Is(err, gc.ErrNotLeader) {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"deleted": true})
 }
 
 // ---------------------------------------------------------------------------

@@ -142,6 +142,48 @@ var (
 		},
 	)
 
+	// GCFailedItemsTotal tracks how many items are currently in the GC DLQ.
+	GCFailedItemsTotal = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "gc_failed_items_total",
+			Help: "Current number of items in the GC dead-letter queue.",
+		},
+	)
+
+	// GCDirtyOrgsTotal tracks how many orgs still need queue snapshot reconciliation.
+	GCDirtyOrgsTotal = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "gc_dirty_orgs_total",
+			Help: "Current number of orgs marked dirty for GC queue snapshot reconciliation.",
+		},
+	)
+
+	// GCSnapshotAgeSeconds tracks how stale the GC queue snapshot is.
+	GCSnapshotAgeSeconds = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "gc_snapshot_age_seconds",
+			Help: "Age in seconds of the latest reconciled GC queue snapshot.",
+		},
+	)
+
+	// GCReconcileDuration observes the duration of queue snapshot reconciliation passes.
+	GCReconcileDuration = prometheus.NewHistogram(
+		prometheus.HistogramOpts{
+			Name:    "gc_reconcile_duration_seconds",
+			Help:    "Duration of GC queue snapshot reconciliation passes in seconds.",
+			Buckets: prometheus.DefBuckets,
+		},
+	)
+
+	// GCSnapshotDriftCorrectedTotal counts how many times the reconciler had to
+	// overwrite global queue snapshots because they diverged from summed org stats.
+	GCSnapshotDriftCorrectedTotal = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "gc_snapshot_drift_corrected_total",
+			Help: "Total number of GC snapshot drift corrections applied from summed org stats.",
+		},
+	)
+
 	// GCWorkerLastSuccessTimestamp records when the worker last successfully processed items.
 	GCWorkerLastSuccessTimestamp = prometheus.NewGauge(
 		prometheus.GaugeOpts{
@@ -189,6 +231,11 @@ func Register() {
 		ActiveSessions,
 		GCWorkerConsecutiveErrors,
 		GCQueueGrowthRate,
+		GCFailedItemsTotal,
+		GCDirtyOrgsTotal,
+		GCSnapshotAgeSeconds,
+		GCReconcileDuration,
+		GCSnapshotDriftCorrectedTotal,
 		GCWorkerLastSuccessTimestamp,
 		GCAuditEventsTotal,
 		ChunkUploadTempOrphansCleaned,

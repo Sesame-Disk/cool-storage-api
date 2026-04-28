@@ -17,9 +17,25 @@ type GCStore interface {
 	DequeueBatch(orgID uuid.UUID, batchSize int, cutoff time.Time) ([]QueueItem, error)
 	CompleteItem(orgID uuid.UUID, queuedAt time.Time, itemType ItemType, itemID string) error
 	RequeueItem(orgID uuid.UUID, oldQueuedAt, newQueuedAt time.Time, itemType ItemType, itemID string, libraryID uuid.UUID, storageClass string, newRetryCount int) error
+	FailItem(item QueueItem, failedAt time.Time, lastError string) error
 	GetQueueSize(orgID uuid.UUID) (int, error)
 	GetTotalQueueSize() (int, error)
+	GetTotalFailedItems() (int, error)
 	ListOrgsWithQueuedItems() ([]uuid.UUID, error)
+	ListFailedItems(orgID uuid.UUID, limit int) ([]GCFailedItemInfo, error)
+	DeleteFailedItem(orgID uuid.UUID, failedAt time.Time, itemType ItemType, itemID string) error
+	RequeueFailedItem(orgID uuid.UUID, failedAt time.Time, itemType ItemType, itemID string, queuedAt time.Time) error
+	MarkOrgActive(orgID uuid.UUID, activeAt time.Time) error
+	RemoveOrgFromActiveSet(orgID uuid.UUID, activeBefore time.Time) error
+	MarkOrgDirty(orgID uuid.UUID, dirtyAt time.Time) error
+	ListDirtyOrgs(limit int) ([]GCDirtyOrg, error)
+	ClearDirtyOrg(orgID uuid.UUID, dirtyBefore time.Time) error
+	GetOrgQueueStats(orgID uuid.UUID) (GCOrgStats, error)
+	SaveOrgQueueStats(stats GCOrgStats) error
+	RecountOrgQueueDepth(orgID uuid.UUID) (int, error)
+	RecountOrgFailedDepth(orgID uuid.UUID) (int, error)
+	GetOldestQueuedAt(orgID uuid.UUID) (*time.Time, error)
+	SumOrgQueueStats() (int, int, error)
 	MarkItemProcessed(taskID uuid.UUID) (bool, error)
 	GetUserDeletedAt(orgID, userID uuid.UUID) (*time.Time, error)
 	GetLibraryDeletedAt(libraryID uuid.UUID) (*time.Time, error)
@@ -218,6 +234,36 @@ type BlockGCCandidateInfo struct {
 	BlockID      string
 	StorageClass string
 	CandidateAt  time.Time
+}
+
+// GCOrgStats stores reconciled queue state for a single org.
+type GCOrgStats struct {
+	OrgID          uuid.UUID
+	QueueDepth     int
+	FailedDepth    int
+	OldestQueuedAt *time.Time
+	UpdatedAt      time.Time
+}
+
+// GCFailedItemInfo represents an item moved to the GC dead-letter queue.
+type GCFailedItemInfo struct {
+	OrgID         uuid.UUID
+	FailedAt      time.Time
+	QueuedAt      time.Time
+	ItemType      ItemType
+	ItemID        string
+	LibraryID     uuid.UUID
+	StorageClass  string
+	RetryCount    int
+	LastError     string
+	ResolvedAt    *time.Time
+	ResolvedState string
+}
+
+// GCDirtyOrg identifies an org whose queue snapshot needs reconciliation.
+type GCDirtyOrg struct {
+	OrgID    uuid.UUID
+	MarkedAt time.Time
 }
 
 // S3OrphanInfo holds data about a block whose S3 deletion still needs recovery.
