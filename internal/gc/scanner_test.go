@@ -8,8 +8,10 @@ import (
 
 	"github.com/Sesame-Disk/sesamefs/internal/config"
 	"github.com/Sesame-Disk/sesamefs/internal/db"
+	"github.com/Sesame-Disk/sesamefs/internal/metrics"
 	"github.com/Sesame-Disk/sesamefs/internal/traffic"
 	"github.com/google/uuid"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
 func TestNewScanner(t *testing.T) {
@@ -227,6 +229,7 @@ func TestScanner_ScanExpiredShareLinks_DeleteFailureKeepsCursorUnchanged(t *test
 	store.AddOrganization(orgID)
 	store.AddShareLink("token-expired", orgID, time.Now().Add(-24*time.Hour))
 	store.deleteExpiredShareLinkErr = fmt.Errorf("delete failed")
+	beforeFailed := testutil.ToFloat64(metrics.GCScannerActionsTotal.WithLabelValues("expired_links", "failed"))
 	previousCursor := db.GCProjectionDateString(expiredShareLinksCursorDay(time.Now().AddDate(0, 0, -1)))
 	if err := store.SaveGCStats(gcExpiredShareLinksCursorKey, previousCursor); err != nil {
 		t.Fatalf("SaveGCStats() failed: %v", err)
@@ -251,6 +254,10 @@ func TestScanner_ScanExpiredShareLinks_DeleteFailureKeepsCursorUnchanged(t *test
 	}
 	if store.QueueLen() != 0 {
 		t.Fatalf("delete failure should not enqueue GC items, got %d", store.QueueLen())
+	}
+	afterFailed := testutil.ToFloat64(metrics.GCScannerActionsTotal.WithLabelValues("expired_links", "failed"))
+	if afterFailed-beforeFailed != 1 {
+		t.Fatalf("expired_links failed metric delta = %v, want 1", afterFailed-beforeFailed)
 	}
 }
 
@@ -896,6 +903,7 @@ func TestScanner_ScanExpiredShares_DeleteFailureKeepsCursorUnchanged(t *testing.
 	store.AddLibrary(orgID, libID, "hot")
 	store.AddShare(libID, shareID, uuid.New(), time.Now().Add(-24*time.Hour))
 	store.deleteExpiredShareErr = fmt.Errorf("delete failed")
+	beforeFailed := testutil.ToFloat64(metrics.GCScannerActionsTotal.WithLabelValues("expired_shares", "failed"))
 	previousCursor := db.GCProjectionDateString(expiredSharesCursorDay(time.Now().AddDate(0, 0, -1)))
 	if err := store.SaveGCStats(gcExpiredSharesCursorKey, previousCursor); err != nil {
 		t.Fatalf("SaveGCStats() failed: %v", err)
@@ -917,6 +925,10 @@ func TestScanner_ScanExpiredShares_DeleteFailureKeepsCursorUnchanged(t *testing.
 	}
 	if gotCursor != previousCursor {
 		t.Fatalf("expired shares cursor = %q, want unchanged %q", gotCursor, previousCursor)
+	}
+	afterFailed := testutil.ToFloat64(metrics.GCScannerActionsTotal.WithLabelValues("expired_shares", "failed"))
+	if afterFailed-beforeFailed != 1 {
+		t.Fatalf("expired_shares failed metric delta = %v, want 1", afterFailed-beforeFailed)
 	}
 }
 

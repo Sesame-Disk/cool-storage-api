@@ -64,6 +64,11 @@ const gcDeletedUsersCursorKey = "gc.scan.expired_deleted_users.last_deleted_day"
 const gcExpiredShareLinksCursorKey = "gc.scan.expired_share_links.last_expiry_day"
 const gcExpiredSharesCursorKey = "gc.scan.expired_shares.last_expiry_day"
 
+const (
+	gcInitialScanLookbackDays = 7
+	gcScanOverlapDays         = 2
+)
+
 // NewCassandraStore creates a new CassandraStore.
 func NewCassandraStore(database *db.DB) *CassandraStore {
 	return &CassandraStore{db: database}
@@ -1198,9 +1203,9 @@ func (s *CassandraStore) loadExpiredShareLinksStartDay(cutoffDay time.Time) (tim
 
 func expiredShareLinksScanStartDay(lastProcessedDay, cutoffDay time.Time) time.Time {
 	if lastProcessedDay.IsZero() {
-		return cutoffDay
+		return cutoffDay.AddDate(0, 0, -gcInitialScanLookbackDays)
 	}
-	return lastProcessedDay
+	return lastProcessedDay.AddDate(0, 0, -gcScanOverlapDays)
 }
 
 func (s *CassandraStore) ListDistinctCommitLibraries() ([]uuid.UUID, error) {
@@ -1648,9 +1653,9 @@ func (s *CassandraStore) loadExpiredSharesStartDay(cutoffDay time.Time) (time.Ti
 
 func expiredSharesScanStartDay(lastProcessedDay, cutoffDay time.Time) time.Time {
 	if lastProcessedDay.IsZero() {
-		return cutoffDay
+		return cutoffDay.AddDate(0, 0, -gcInitialScanLookbackDays)
 	}
-	return lastProcessedDay
+	return lastProcessedDay.AddDate(0, 0, -gcScanOverlapDays)
 }
 
 func (s *CassandraStore) DeleteShare(libraryID, shareID uuid.UUID) error {
@@ -2254,12 +2259,10 @@ func (s *CassandraStore) loadDeletedUsersStartDay(cutoffDay time.Time) (time.Tim
 }
 
 func deletedUsersScanStartDay(lastProcessedDay, cutoffDay time.Time) time.Time {
-	// Re-scan the last processed day so same-day deletes remain visible even if
-	// another scanner/test already advanced the shared cursor in gc_stats.
 	if lastProcessedDay.IsZero() {
-		return cutoffDay
+		return cutoffDay.AddDate(0, 0, -gcInitialScanLookbackDays)
 	}
-	return lastProcessedDay
+	return lastProcessedDay.AddDate(0, 0, -gcScanOverlapDays)
 }
 
 func (s *CassandraStore) ListLibrariesByOwner(orgID, ownerID uuid.UUID) ([]uuid.UUID, error) {

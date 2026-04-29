@@ -254,6 +254,7 @@ func (s *Scanner) scanExpiredShareLinks(ctx context.Context) (int, error) {
 	}
 
 	cleaned := 0
+	failed := 0
 	var phaseErr error
 	for _, link := range links {
 		select {
@@ -264,6 +265,7 @@ func (s *Scanner) scanExpiredShareLinks(ctx context.Context) (int, error) {
 
 		if err := s.store.DeleteExpiredShareLink(link); err != nil {
 			log.Printf("[GC Scanner] Phase 2: failed to delete expired share link %s: %v", link.ShareToken, err)
+			failed++
 			if phaseErr == nil {
 				phaseErr = err
 			}
@@ -280,6 +282,7 @@ func (s *Scanner) scanExpiredShareLinks(ctx context.Context) (int, error) {
 
 	log.Printf("[GC Scanner] Phase 2 complete: cleaned %d expired share links", cleaned)
 	recordScannerAction("expired_links", "cleaned", cleaned)
+	recordScannerAction("expired_links", "failed", failed)
 	metrics.GCScannerLastPhaseRun.WithLabelValues("expired_links").SetToCurrentTime()
 	return cleaned, phaseErr
 }
@@ -589,6 +592,7 @@ func (s *Scanner) scanExpiredShares(ctx context.Context) (int, error) {
 	}
 
 	enqueued := 0
+	failed := 0
 	var phaseErr error
 	for _, share := range shares {
 		select {
@@ -600,6 +604,7 @@ func (s *Scanner) scanExpiredShares(ctx context.Context) (int, error) {
 		// Delete directly — shares are small metadata, no need for queue
 		if err := s.store.DeleteExpiredShare(share); err != nil {
 			log.Printf("[GC Scanner] Phase 7: failed to delete expired share %s for library %s: %v", share.ShareID, share.LibraryID, err)
+			failed++
 			if phaseErr == nil {
 				phaseErr = err
 			}
@@ -616,6 +621,7 @@ func (s *Scanner) scanExpiredShares(ctx context.Context) (int, error) {
 
 	log.Printf("[GC Scanner] Phase 7 complete: cleaned %d expired shares", enqueued)
 	recordScannerAction("expired_shares", "cleaned", enqueued)
+	recordScannerAction("expired_shares", "failed", failed)
 	metrics.GCScannerLastPhaseRun.WithLabelValues("expired_shares").SetToCurrentTime()
 	return enqueued, phaseErr
 }
@@ -630,6 +636,8 @@ func (s *Scanner) scanExpiredRestoreJobs(ctx context.Context) (int, error) {
 	}
 
 	enqueued := 0
+	failed := 0
+	var phaseErr error
 	for _, job := range jobs {
 		select {
 		case <-ctx.Done():
@@ -638,15 +646,22 @@ func (s *Scanner) scanExpiredRestoreJobs(ctx context.Context) (int, error) {
 		}
 
 		// Delete directly — restore jobs are small metadata
-		if err := s.store.DeleteRestoreJob(job.OrgID, job.LibraryID, job.JobID); err == nil {
-			enqueued++
+		if err := s.store.DeleteRestoreJob(job.OrgID, job.LibraryID, job.JobID); err != nil {
+			log.Printf("[GC Scanner] Phase 8: failed to delete restore job %s for library %s: %v", job.JobID, job.LibraryID, err)
+			failed++
+			if phaseErr == nil {
+				phaseErr = err
+			}
+			continue
 		}
+		enqueued++
 	}
 
 	log.Printf("[GC Scanner] Phase 8 complete: cleaned %d expired restore jobs", enqueued)
 	recordScannerAction("expired_restore_jobs", "cleaned", enqueued)
+	recordScannerAction("expired_restore_jobs", "failed", failed)
 	metrics.GCScannerLastPhaseRun.WithLabelValues("expired_restore_jobs").SetToCurrentTime()
-	return enqueued, nil
+	return enqueued, phaseErr
 }
 
 // scanOrphanedGroupShares finds shares where shared_to is a group that no longer exists.
@@ -662,6 +677,8 @@ func (s *Scanner) scanOrphanedGroupShares(ctx context.Context) (int, error) {
 	groupExistsCache := make(map[uuid.UUID]bool)
 
 	cleaned := 0
+	failed := 0
+	var phaseErr error
 	for _, gs := range groupShares {
 		select {
 		case <-ctx.Done():
@@ -684,16 +701,23 @@ func (s *Scanner) scanOrphanedGroupShares(ctx context.Context) (int, error) {
 
 		if !exists {
 			// Group deleted — clean up the orphaned share
-			if err := s.store.DeleteShare(gs.LibraryID, gs.ShareID); err == nil {
-				cleaned++
+			if err := s.store.DeleteShare(gs.LibraryID, gs.ShareID); err != nil {
+				log.Printf("[GC Scanner] Phase 9: failed to delete orphaned group share %s for library %s: %v", gs.ShareID, gs.LibraryID, err)
+				failed++
+				if phaseErr == nil {
+					phaseErr = err
+				}
+				continue
 			}
+			cleaned++
 		}
 	}
 
 	log.Printf("[GC Scanner] Phase 9 complete: cleaned %d orphaned group shares", cleaned)
 	recordScannerAction("orphaned_group_shares", "cleaned", cleaned)
+	recordScannerAction("orphaned_group_shares", "failed", failed)
 	metrics.GCScannerLastPhaseRun.WithLabelValues("orphaned_group_shares").SetToCurrentTime()
-	return cleaned, nil
+	return cleaned, phaseErr
 }
 
 // scanExpiredDeletedUsers finds soft-deleted users whose grace period has expired

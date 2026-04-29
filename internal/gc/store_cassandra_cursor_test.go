@@ -40,8 +40,9 @@ func TestExpiredShareLinksScanStartDay_RescansLastProcessedDay(t *testing.T) {
 	lastProcessedDay := cutoffDay
 
 	got := expiredShareLinksScanStartDay(lastProcessedDay, cutoffDay)
-	if !got.Equal(cutoffDay) {
-		t.Fatalf("expiredShareLinksScanStartDay() = %s, want %s", got.Format("2006-01-02"), cutoffDay.Format("2006-01-02"))
+	want := cutoffDay.AddDate(0, 0, -gcScanOverlapDays)
+	if !got.Equal(want) {
+		t.Fatalf("expiredShareLinksScanStartDay() = %s, want %s", got.Format("2006-01-02"), want.Format("2006-01-02"))
 	}
 }
 
@@ -49,8 +50,9 @@ func TestExpiredShareLinksScanStartDay_UsesCutoffWhenCursorMissing(t *testing.T)
 	cutoffDay := time.Date(2026, 4, 29, 0, 0, 0, 0, time.UTC)
 
 	got := expiredShareLinksScanStartDay(time.Time{}, cutoffDay)
-	if !got.Equal(cutoffDay) {
-		t.Fatalf("expiredShareLinksScanStartDay() = %s, want %s", got.Format("2006-01-02"), cutoffDay.Format("2006-01-02"))
+	want := cutoffDay.AddDate(0, 0, -gcInitialScanLookbackDays)
+	if !got.Equal(want) {
+		t.Fatalf("expiredShareLinksScanStartDay() = %s, want %s", got.Format("2006-01-02"), want.Format("2006-01-02"))
 	}
 }
 
@@ -59,8 +61,9 @@ func TestExpiredSharesScanStartDay_RescansLastProcessedDay(t *testing.T) {
 	lastProcessedDay := cutoffDay
 
 	got := expiredSharesScanStartDay(lastProcessedDay, cutoffDay)
-	if !got.Equal(cutoffDay) {
-		t.Fatalf("expiredSharesScanStartDay() = %s, want %s", got.Format("2006-01-02"), cutoffDay.Format("2006-01-02"))
+	want := cutoffDay.AddDate(0, 0, -gcScanOverlapDays)
+	if !got.Equal(want) {
+		t.Fatalf("expiredSharesScanStartDay() = %s, want %s", got.Format("2006-01-02"), want.Format("2006-01-02"))
 	}
 }
 
@@ -68,8 +71,9 @@ func TestExpiredSharesScanStartDay_UsesCutoffWhenCursorMissing(t *testing.T) {
 	cutoffDay := time.Date(2026, 4, 29, 0, 0, 0, 0, time.UTC)
 
 	got := expiredSharesScanStartDay(time.Time{}, cutoffDay)
-	if !got.Equal(cutoffDay) {
-		t.Fatalf("expiredSharesScanStartDay() = %s, want %s", got.Format("2006-01-02"), cutoffDay.Format("2006-01-02"))
+	want := cutoffDay.AddDate(0, 0, -gcInitialScanLookbackDays)
+	if !got.Equal(want) {
+		t.Fatalf("expiredSharesScanStartDay() = %s, want %s", got.Format("2006-01-02"), want.Format("2006-01-02"))
 	}
 }
 
@@ -78,8 +82,9 @@ func TestDeletedUsersScanStartDay_RescansLastProcessedDay(t *testing.T) {
 	lastProcessedDay := cutoffDay
 
 	got := deletedUsersScanStartDay(lastProcessedDay, cutoffDay)
-	if !got.Equal(cutoffDay) {
-		t.Fatalf("deletedUsersScanStartDay() = %s, want %s", got.Format("2006-01-02"), cutoffDay.Format("2006-01-02"))
+	want := cutoffDay.AddDate(0, 0, -gcScanOverlapDays)
+	if !got.Equal(want) {
+		t.Fatalf("deletedUsersScanStartDay() = %s, want %s", got.Format("2006-01-02"), want.Format("2006-01-02"))
 	}
 }
 
@@ -87,7 +92,8 @@ func TestDeletedUsersScanStartDay_UsesCutoffWhenCursorMissing(t *testing.T) {
 	cutoffDay := time.Date(2026, 4, 29, 0, 0, 0, 0, time.UTC)
 
 	got := deletedUsersScanStartDay(time.Time{}, cutoffDay)
-	if !got.Equal(cutoffDay) {
-		t.Fatalf("deletedUsersScanStartDay() = %s, want %s", got.Format("2006-01-02"), cutoffDay.Format("2006-01-02"))
+	want := cutoffDay.AddDate(0, 0, -gcInitialScanLookbackDays)
+	if !got.Equal(want) {
+		t.Fatalf("deletedUsersScanStartDay() = %s, want %s", got.Format("2006-01-02"), want.Format("2006-01-02"))
 	}
 }
