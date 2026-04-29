@@ -11,6 +11,8 @@ import '../../css/sysadmin-gc.css';
 
 class GC extends Component {
 
+    failedItemsSectionRef = React.createRef();
+
     constructor(props) {
         super(props);
         this.state = {
@@ -162,7 +164,16 @@ class GC extends Component {
             selectedOrg: org,
             failedItemsOrgID: org.org_id,
             failedItemsError: '',
-        }, this.loadFailedItems);
+        }, () => {
+            this.scrollToFailedItemsSection();
+            this.loadFailedItems();
+        });
+    };
+
+    scrollToFailedItemsSection = () => {
+        if (this.failedItemsSectionRef.current) {
+            this.failedItemsSectionRef.current.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        }
     };
 
     runGC = (type) => {
@@ -548,7 +559,7 @@ class GC extends Component {
                                 {failedItemOrgListLoading && failedItemOrgList.length === 0 && <div className="mt-3"><Loading /></div>}
                             </div>
 
-                            <div className="gc-admin-section">
+                            <div className="gc-admin-section" ref={this.failedItemsSectionRef}>
                                 <div className="gc-admin-section-header">
                                     <div>
                                         <h4 className="gc-admin-section-title">{gettext('Failed items')}</h4>

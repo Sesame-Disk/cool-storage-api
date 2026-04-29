@@ -2237,6 +2237,7 @@ func (s *Server) handleGCStatus(c *gin.Context) {
 		return
 	}
 
+	s.gcService.RefreshFailedItemSnapshot()
 	c.JSON(http.StatusOK, s.gcService.Status())
 }
 
@@ -2373,6 +2374,7 @@ func (s *Server) handleGCFailedItemOrgs(c *gin.Context) {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "GC service not available"})
 		return
 	}
+	s.gcService.RefreshFailedItemSnapshot()
 	limit := 20
 	if raw := strings.TrimSpace(c.Query("limit")); raw != "" {
 		if parsed, err := strconv.Atoi(raw); err == nil && parsed > 0 {

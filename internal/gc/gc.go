@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"sort"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -300,6 +301,18 @@ func (s *Service) Status() GCStatus {
 	}
 }
 
+// RefreshFailedItemSnapshot repairs stale failed-item counters derived from
+// gc_org_stats/gc_stats. This is needed because gc_failed_items rows expire via
+// TTL and those expirations do not mark orgs dirty on their own.
+func (s *Service) RefreshFailedItemSnapshot() {
+	s.reconcileMu.Lock()
+	defer s.reconcileMu.Unlock()
+
+	if err := s.refreshFailedItemSnapshotLocked(); err != nil {
+		log.Printf("[GC] Failed to refresh failed-item snapshot: %v", err)
+	}
+}
+
 // Queue returns the underlying queue for inline enqueue operations.
 func (s *Service) Queue() *Queue {
 	return s.queue
@@ -504,10 +517,9 @@ func (s *Service) reconcileDirtyQueueStats(limit int) {
 				log.Printf("[GC] Failed to recount failed depth for %s: %v", dirtyOrg.OrgID, err)
 				continue
 			}
-			oldestQueuedAt, err := s.store.GetOldestQueuedAt(dirtyOrg.OrgID)
-			if err != nil {
-				log.Printf("[GC] Failed to read oldest queue item for %s: %v", dirtyOrg.OrgID, err)
-				continue
+			oldestQueuedAt := prevStats.OldestQueuedAt
+			if queueDepth == 0 {
+				oldestQueuedAt = nil
 			}
 
 			nextStats := GCOrgStats{
@@ -542,6 +554,10 @@ func (s *Service) reconcileDirtyQueueStats(limit int) {
 		}
 	}
 
+	if err := s.refreshFailedItemSnapshotLocked(); err != nil {
+		log.Printf("[GC] Failed to repair stale failed-item snapshot: %v", err)
+	}
+
 	s.reconcilePasses++
 	if s.reconcilePasses%gcSnapshotDriftCheckEvery == 0 {
 		summedQueue, summedFailed, err := s.store.SumOrgQueueStats()
@@ -571,6 +587,60 @@ func (s *Service) reconcileDirtyQueueStats(limit int) {
 	metrics.GCSnapshotAgeSeconds.Set(0)
 }
 
+func (s *Service) refreshFailedItemSnapshotLocked() error {
+	snapshotOrgs, err := s.store.ListOrgsWithFailedItems(0)
+	if err != nil {
+		return err
+	}
+
+	if len(snapshotOrgs) == 0 {
+		if s.loadStatInt(gcStatKeyTotalFailed) != 0 {
+			s.saveStatInt(gcStatKeyTotalFailed, 0)
+			metrics.GCFailedItemsTotal.Set(0)
+		}
+		return nil
+	}
+
+	repaired := 0
+	now := time.Now().UTC()
+	for _, org := range snapshotOrgs {
+		failedDepth, err := s.store.RecountOrgFailedDepth(org.OrgID)
+		if err != nil {
+			log.Printf("[GC] Failed to recount stale failed depth for %s: %v", org.OrgID, err)
+			continue
+		}
+		if failedDepth == org.FailedItemsTotal {
+			continue
+		}
+
+		stats, err := s.store.GetOrgQueueStats(org.OrgID)
+		if err != nil {
+			log.Printf("[GC] Failed to load stale failed stats for %s: %v", org.OrgID, err)
+			continue
+		}
+		stats.FailedDepth = failedDepth
+		stats.UpdatedAt = now
+		if err := s.store.SaveOrgQueueStats(stats); err != nil {
+			log.Printf("[GC] Failed to save repaired failed stats for %s: %v", org.OrgID, err)
+			continue
+		}
+		repaired++
+	}
+
+	if repaired == 0 {
+		return nil
+	}
+
+	_, summedFailed, err := s.store.SumOrgQueueStats()
+	if err != nil {
+		return err
+	}
+	s.saveStatInt(gcStatKeyTotalFailed, summedFailed)
+	metrics.GCFailedItemsTotal.Set(float64(summedFailed))
+	log.Printf("[GC] Repaired stale failed-item snapshot for %d org(s); total_failed=%d", repaired, summedFailed)
+	return nil
+}
+
 func (s *Service) reconcileLimit() int {
 	if s.config.ReconcileBatchSize > 0 {
 		return s.config.ReconcileBatchSize
@@ -596,7 +666,55 @@ func (s *Service) ListFailedItemOrgs(limit int) ([]GCFailedItemOrgInfo, error) {
 	if limit <= 0 {
 		limit = gcDefaultFailedOrgPageSize
 	}
-	return s.store.ListOrgsWithFailedItems(limit)
+	orgIDs, err := s.store.ListOrganizations()
+	if err != nil {
+		return nil, err
+	}
+
+	orgs := make([]GCFailedItemOrgInfo, 0)
+	for _, orgID := range orgIDs {
+		failedDepth, err := s.store.RecountOrgFailedDepth(orgID)
+		if err != nil {
+			return nil, err
+		}
+		if failedDepth <= 0 {
+			continue
+		}
+
+		latestItems, err := s.store.ListFailedItems(orgID, 1)
+		if err != nil {
+			return nil, err
+		}
+		if len(latestItems) == 0 {
+			continue
+		}
+
+		orgName, err := s.store.GetOrgName(orgID)
+		if err != nil {
+			orgName = ""
+		}
+
+		orgs = append(orgs, GCFailedItemOrgInfo{
+			OrgID:            orgID,
+			OrgName:          orgName,
+			FailedItemsTotal: failedDepth,
+			UpdatedAt:        latestItems[0].FailedAt,
+		})
+	}
+
+	sort.Slice(orgs, func(i, j int) bool {
+		if orgs[i].FailedItemsTotal != orgs[j].FailedItemsTotal {
+			return orgs[i].FailedItemsTotal > orgs[j].FailedItemsTotal
+		}
+		if !orgs[i].UpdatedAt.Equal(orgs[j].UpdatedAt) {
+			return orgs[i].UpdatedAt.After(orgs[j].UpdatedAt)
+		}
+		return orgs[i].OrgID.String() < orgs[j].OrgID.String()
+	})
+	if len(orgs) > limit {
+		orgs = orgs[:limit]
+	}
+	return orgs, nil
 }
 
 func (s *Service) DeleteFailedItem(orgID uuid.UUID, failedAt time.Time, itemType ItemType, itemID string) error {

@@ -113,6 +113,7 @@ type MockStore struct {
 
 	// optional test hooks for reproducing concurrency windows deterministically.
 	getQueueSizeHook      func(orgID uuid.UUID, size int)
+	removeActiveOrgHook   func(orgID uuid.UUID, activeBefore time.Time)
 	recountQueueDepthHook func(orgID uuid.UUID, depth int)
 	// requeueItemErr, when non-nil, forces RequeueItem to return this error
 	// without mutating state. Used to exercise IncrementRetry failure paths
@@ -1014,6 +1015,13 @@ func (m *MockStore) MarkOrgActive(orgID uuid.UUID, activeAt time.Time) error {
 }
 
 func (m *MockStore) RemoveOrgFromActiveSet(orgID uuid.UUID, activeBefore time.Time) error {
+	m.mu.RLock()
+	hook := m.removeActiveOrgHook
+	m.mu.RUnlock()
+	if hook != nil {
+		hook(orgID, activeBefore)
+	}
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if existing, ok := m.activeQueueOrgs[orgID]; ok && existing.Before(activeBefore) {
@@ -1283,17 +1291,20 @@ func (m *MockStore) FinalizeBlockDelete(orgID uuid.UUID, blockID string) error {
 	return nil
 }
 
-func (m *MockStore) DecrementBlockRefCount(orgID uuid.UUID, blockID string) error {
+func (m *MockStore) DecrementBlockRefCount(orgID uuid.UUID, blockID string) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	key := fmt.Sprintf("%s:%s", orgID, blockID)
 	b, ok := m.blocks[key]
 	if !ok {
-		return fmt.Errorf("block not found: %s", blockID)
+		return false, fmt.Errorf("block not found: %s", blockID)
+	}
+	if b.RefCount <= 0 {
+		return false, nil
 	}
 	b.RefCount--
-	return nil
+	return b.RefCount == 0, nil
 }
 
 func (m *MockStore) ListBlockMappingsByInternalID(orgID uuid.UUID, internalID string) ([]BlockMapping, error) {
@@ -1455,8 +1466,11 @@ func (m *MockStore) ListDistinctCommitLibraries() ([]uuid.UUID, error) {
 	defer m.mu.RUnlock()
 
 	seen := make(map[uuid.UUID]bool)
-	for _, c := range m.commits {
-		seen[c.LibraryID] = true
+	for libraryID := range m.libraries {
+		seen[libraryID] = true
+	}
+	for libraryID := range m.deletedLibraries {
+		seen[libraryID] = true
 	}
 
 	var result []uuid.UUID
@@ -1471,8 +1485,11 @@ func (m *MockStore) ListDistinctFSObjectLibraries() ([]uuid.UUID, error) {
 	defer m.mu.RUnlock()
 
 	seen := make(map[uuid.UUID]bool)
-	for _, obj := range m.fsObjects {
-		seen[obj.LibraryID] = true
+	for libraryID := range m.libraries {
+		seen[libraryID] = true
+	}
+	for libraryID := range m.deletedLibraries {
+		seen[libraryID] = true
 	}
 
 	var result []uuid.UUID

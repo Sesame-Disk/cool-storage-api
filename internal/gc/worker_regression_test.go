@@ -268,8 +268,8 @@ func TestWorker_ProcessOrg_PreservesActiveOrgOnConcurrentEnqueue(t *testing.T) {
 	}
 
 	hooked := atomic.Bool{}
-	store.getQueueSizeHook = func(hookOrgID uuid.UUID, size int) {
-		if hookOrgID != orgID || size != 0 || !hooked.CompareAndSwap(false, true) {
+	store.removeActiveOrgHook = func(hookOrgID uuid.UUID, activeBefore time.Time) {
+		if hookOrgID != orgID || !hooked.CompareAndSwap(false, true) {
 			return
 		}
 		if err := store.EnqueueItem(orgID, base.Add(3*time.Second), ItemShareLink, "new-item", uuid.Nil, "", 0); err != nil {

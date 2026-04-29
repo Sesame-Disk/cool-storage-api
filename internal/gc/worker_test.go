@@ -989,3 +989,26 @@ func TestWorker_ProcessOrgCascade_SkipsRestoredOrg(t *testing.T) {
 		t.Fatal("stale org queue item should be completed")
 	}
 }
+
+func TestWorker_DecrementAndFindZeroRef_ReturnsOnlyZeroTransitions(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	w := NewWorker(store, nil, q, 100, 0, false, stats)
+
+	orgID := uuid.New()
+	store.AddBlock(orgID, "hits-zero", "hot", 1)
+	store.AddBlock(orgID, "stays-positive", "hot", 2)
+
+	zeroRef := w.decrementAndFindZeroRef(orgID, []string{"hits-zero", "stays-positive"})
+	if len(zeroRef) != 1 || zeroRef[0] != "hits-zero" {
+		t.Fatalf("zeroRef = %#v, want only hits-zero", zeroRef)
+	}
+
+	if got, err := store.GetBlockRefCount(orgID, "hits-zero"); err != nil || got != 0 {
+		t.Fatalf("hits-zero refcount = %d, err=%v; want 0,nil", got, err)
+	}
+	if got, err := store.GetBlockRefCount(orgID, "stays-positive"); err != nil || got != 1 {
+		t.Fatalf("stays-positive refcount = %d, err=%v; want 1,nil", got, err)
+	}
+}

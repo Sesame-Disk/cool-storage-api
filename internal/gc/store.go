@@ -54,7 +54,7 @@ type GCStore interface {
 	ResolveBlockIDs(orgID uuid.UUID, blockIDs []string) ([]string, error)
 	ClaimBlockDelete(orgID uuid.UUID, blockID string) (bool, error)
 	FinalizeBlockDelete(orgID uuid.UUID, blockID string) error
-	DecrementBlockRefCount(orgID uuid.UUID, blockID string) error
+	DecrementBlockRefCount(orgID uuid.UUID, blockID string) (bool, error)
 	DeleteBlockMapping(orgID uuid.UUID, externalID string) error
 	EnsureBlockGCCandidate(orgID uuid.UUID, blockID, storageClass string, candidateAt time.Time) (time.Time, error)
 	DeleteBlockGCCandidate(orgID uuid.UUID, blockID string) error

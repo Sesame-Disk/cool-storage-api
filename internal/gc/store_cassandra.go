@@ -945,11 +945,36 @@ func (s *CassandraStore) FinalizeBlockDelete(orgID uuid.UUID, blockID string) er
 	return nil
 }
 
-func (s *CassandraStore) DecrementBlockRefCount(orgID uuid.UUID, blockID string) error {
-	return s.db.Session().Query(`
-		UPDATE blocks SET ref_count = ref_count - 1, last_accessed = ?
-		WHERE org_id = ? AND block_id = ?
-	`, time.Now(), orgID.String(), blockID).Exec()
+func (s *CassandraStore) DecrementBlockRefCount(orgID uuid.UUID, blockID string) (bool, error) {
+	const maxRetries = 5
+
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		var currentRefCount int
+		err := s.db.Session().Query(`
+			SELECT ref_count FROM blocks WHERE org_id = ? AND block_id = ?
+		`, orgID.String(), blockID).Scan(&currentRefCount)
+		if err != nil {
+			return false, err
+		}
+
+		if currentRefCount <= 0 {
+			return false, nil
+		}
+
+		newRefCount := currentRefCount - 1
+		applied, err := s.db.Session().Query(`
+			UPDATE blocks SET ref_count = ?, last_accessed = ?
+			WHERE org_id = ? AND block_id = ? IF ref_count = ?
+		`, newRefCount, time.Now().UTC(), orgID.String(), blockID, currentRefCount).MapScanCAS(map[string]interface{}{})
+		if err != nil {
+			return false, err
+		}
+		if applied {
+			return newRefCount == 0, nil
+		}
+	}
+
+	return false, fmt.Errorf("decrement block ref_count for %s/%s: CAS retry limit reached", orgID, blockID)
 }
 
 func (s *CassandraStore) ListBlockMappingsByInternalID(orgID uuid.UUID, internalID string) ([]BlockMapping, error) {
@@ -1124,28 +1149,45 @@ func (s *CassandraStore) ListShareLinks() ([]ShareLinkInfo, error) {
 }
 
 func (s *CassandraStore) ListDistinctCommitLibraries() ([]uuid.UUID, error) {
-	iter := s.db.Session().Query(`SELECT DISTINCT library_id FROM commits`).Iter()
-	var ids []uuid.UUID
-	var idStr string
-	for iter.Scan(&idStr) {
-		ids = append(ids, parseUUID(idStr))
-	}
-	if err := iter.Close(); err != nil {
-		return nil, err
-	}
-	return ids, nil
+	return s.listGCArtifactLibraries()
 }
 
 func (s *CassandraStore) ListDistinctFSObjectLibraries() ([]uuid.UUID, error) {
-	iter := s.db.Session().Query(`SELECT DISTINCT library_id FROM fs_objects`).Iter()
-	var ids []uuid.UUID
-	var idStr string
-	for iter.Scan(&idStr) {
-		ids = append(ids, parseUUID(idStr))
+	return s.listGCArtifactLibraries()
+}
+
+func (s *CassandraStore) listGCArtifactLibraries() ([]uuid.UUID, error) {
+	seen := make(map[uuid.UUID]struct{})
+	ids := make([]uuid.UUID, 0)
+
+	liveIter := s.db.Session().Query(`SELECT library_id FROM libraries_by_id`).Iter()
+	var liveLibID string
+	for liveIter.Scan(&liveLibID) {
+		libraryID := parseUUID(liveLibID)
+		if _, ok := seen[libraryID]; ok {
+			continue
+		}
+		seen[libraryID] = struct{}{}
+		ids = append(ids, libraryID)
 	}
-	if err := iter.Close(); err != nil {
+	if err := liveIter.Close(); err != nil {
 		return nil, err
 	}
+
+	deletedIter := s.db.Session().Query(`SELECT library_id FROM deleted_libraries`).Iter()
+	var deletedLibID string
+	for deletedIter.Scan(&deletedLibID) {
+		libraryID := parseUUID(deletedLibID)
+		if _, ok := seen[libraryID]; ok {
+			continue
+		}
+		seen[libraryID] = struct{}{}
+		ids = append(ids, libraryID)
+	}
+	if err := deletedIter.Close(); err != nil {
+		return nil, err
+	}
+
 	return ids, nil
 }
 

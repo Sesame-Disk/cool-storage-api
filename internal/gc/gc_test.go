@@ -516,6 +516,17 @@ func TestService_ListFailedItemOrgs_SortsAndLimits(t *testing.T) {
 	if err := store.SaveOrgQueueStats(GCOrgStats{OrgID: orgC, FailedDepth: 0, UpdatedAt: newer}); err != nil {
 		t.Fatalf("SaveOrgQueueStats(orgC): %v", err)
 	}
+	store.failedItems[orgA] = []GCFailedItemInfo{
+		{OrgID: orgA, FailedAt: older.Add(1 * time.Minute), ItemType: ItemBlock, ItemID: "alpha-1"},
+		{OrgID: orgA, FailedAt: older.Add(2 * time.Minute), ItemType: ItemBlock, ItemID: "alpha-2"},
+	}
+	store.failedItems[orgB] = []GCFailedItemInfo{
+		{OrgID: orgB, FailedAt: newer.Add(1 * time.Minute), ItemType: ItemBlock, ItemID: "beta-1"},
+		{OrgID: orgB, FailedAt: newer.Add(2 * time.Minute), ItemType: ItemBlock, ItemID: "beta-2"},
+		{OrgID: orgB, FailedAt: newer.Add(3 * time.Minute), ItemType: ItemBlock, ItemID: "beta-3"},
+		{OrgID: orgB, FailedAt: newer.Add(4 * time.Minute), ItemType: ItemBlock, ItemID: "beta-4"},
+		{OrgID: orgB, FailedAt: newer.Add(5 * time.Minute), ItemType: ItemBlock, ItemID: "beta-5"},
+	}
 	svc := NewService(store, nil, config.GCConfig{Enabled: true}, nil)
 
 	orgs, err := svc.ListFailedItemOrgs(1)
@@ -544,6 +555,67 @@ func TestService_ListFailedItemOrgs_SortsAndLimits(t *testing.T) {
 	}
 	if orgs[1].OrgID != orgA {
 		t.Fatalf("orgs[1].OrgID = %s, want %s", orgs[1].OrgID, orgA)
+	}
+}
+
+func TestService_ListFailedItemOrgs_FiltersStaleSnapshotAndIncludesDirtyActualFailures(t *testing.T) {
+	store := NewMockStore()
+	staleOrg := uuid.New()
+	realOrg := uuid.New()
+	dirtyOrg := uuid.New()
+	store.AddOrganizationWithName(staleOrg, "stale")
+	store.AddOrganizationWithName(realOrg, "real")
+	store.AddOrganizationWithName(dirtyOrg, "dirty")
+	now := time.Now().UTC().Truncate(time.Second)
+
+	if err := store.SaveOrgQueueStats(GCOrgStats{OrgID: staleOrg, FailedDepth: 1, UpdatedAt: now.Add(-3 * time.Hour)}); err != nil {
+		t.Fatalf("SaveOrgQueueStats(staleOrg): %v", err)
+	}
+	if err := store.SaveOrgQueueStats(GCOrgStats{OrgID: realOrg, FailedDepth: 1, UpdatedAt: now.Add(-2 * time.Hour)}); err != nil {
+		t.Fatalf("SaveOrgQueueStats(realOrg): %v", err)
+	}
+	store.failedItems[realOrg] = []GCFailedItemInfo{{
+		OrgID:    realOrg,
+		FailedAt: now.Add(-10 * time.Minute),
+		ItemType: ItemBlock,
+		ItemID:   "real-item",
+	}}
+
+	if err := store.MarkOrgDirty(dirtyOrg, now); err != nil {
+		t.Fatalf("MarkOrgDirty(dirtyOrg): %v", err)
+	}
+	store.failedItems[dirtyOrg] = []GCFailedItemInfo{{
+		OrgID:    dirtyOrg,
+		FailedAt: now.Add(-5 * time.Minute),
+		ItemType: ItemBlock,
+		ItemID:   "dirty-item",
+	}}
+
+	svc := NewService(store, nil, config.GCConfig{Enabled: true}, nil)
+
+	orgs, err := svc.ListFailedItemOrgs(10)
+	if err != nil {
+		t.Fatalf("ListFailedItemOrgs: %v", err)
+	}
+	if len(orgs) != 2 {
+		t.Fatalf("len(orgs) = %d, want 2", len(orgs))
+	}
+	for _, org := range orgs {
+		if org.OrgID == staleOrg {
+			t.Fatalf("stale org %s should have been filtered out", staleOrg)
+		}
+	}
+	foundDirty := false
+	for _, org := range orgs {
+		if org.OrgID == dirtyOrg {
+			foundDirty = true
+			if org.FailedItemsTotal != 1 {
+				t.Fatalf("dirty org FailedItemsTotal = %d, want 1", org.FailedItemsTotal)
+			}
+		}
+	}
+	if !foundDirty {
+		t.Fatalf("dirty org %s was not included", dirtyOrg)
 	}
 }
 
@@ -627,6 +699,12 @@ func TestService_ReconcileDirtyQueueStats_CorrectsSnapshotDrift(t *testing.T) {
 	orgB := uuid.New()
 	store.orgQueueStats[orgA] = GCOrgStats{OrgID: orgA, QueueDepth: 3, FailedDepth: 1}
 	store.orgQueueStats[orgB] = GCOrgStats{OrgID: orgB, QueueDepth: 5, FailedDepth: 2}
+	now := time.Now().UTC()
+	store.failedItems[orgA] = []GCFailedItemInfo{{OrgID: orgA, FailedAt: now.Add(-3 * time.Minute), ItemType: ItemBlock, ItemID: "orgA-failed"}}
+	store.failedItems[orgB] = []GCFailedItemInfo{
+		{OrgID: orgB, FailedAt: now.Add(-2 * time.Minute), ItemType: ItemBlock, ItemID: "orgB-failed-1"},
+		{OrgID: orgB, FailedAt: now.Add(-1 * time.Minute), ItemType: ItemBlock, ItemID: "orgB-failed-2"},
+	}
 	store.gcStats[gcStatKeyTotalQueue] = "1"
 	store.gcStats[gcStatKeyTotalFailed] = "0"
 	store.gcStats[gcStatKeyTotalDirtyOrgs] = "9"
@@ -645,6 +723,64 @@ func TestService_ReconcileDirtyQueueStats_CorrectsSnapshotDrift(t *testing.T) {
 	}
 	if dirtySnapshot != "0" {
 		t.Fatalf("dirty snapshot = %q, want 0", dirtySnapshot)
+	}
+}
+
+func TestService_RefreshFailedItemSnapshot_ClearsExpiredFailedCounts(t *testing.T) {
+	store := NewMockStore()
+	staleOrgA := uuid.New()
+	staleOrgB := uuid.New()
+	store.AddOrganizationWithName(staleOrgA, "stale-a")
+	store.AddOrganizationWithName(staleOrgB, "stale-b")
+	store.orgQueueStats[staleOrgA] = GCOrgStats{OrgID: staleOrgA, FailedDepth: 1, UpdatedAt: time.Now().UTC().Add(-2 * time.Hour)}
+	store.orgQueueStats[staleOrgB] = GCOrgStats{OrgID: staleOrgB, FailedDepth: 2, UpdatedAt: time.Now().UTC().Add(-90 * time.Minute)}
+	store.gcStats[gcStatKeyTotalFailed] = "3"
+
+	svc := NewService(store, nil, config.GCConfig{Enabled: true}, nil)
+	svc.RefreshFailedItemSnapshot()
+
+	status := svc.Status()
+	if status.FailedItemsTotal != 0 {
+		t.Fatalf("status.FailedItemsTotal = %d, want 0", status.FailedItemsTotal)
+	}
+	if got := store.orgQueueStats[staleOrgA].FailedDepth; got != 0 {
+		t.Fatalf("staleOrgA failed depth = %d, want 0", got)
+	}
+	if got := store.orgQueueStats[staleOrgB].FailedDepth; got != 0 {
+		t.Fatalf("staleOrgB failed depth = %d, want 0", got)
+	}
+	orgs, err := svc.ListFailedItemOrgs(10)
+	if err != nil {
+		t.Fatalf("ListFailedItemOrgs: %v", err)
+	}
+	if len(orgs) != 0 {
+		t.Fatalf("len(orgs) = %d, want 0", len(orgs))
+	}
+}
+
+func TestMockStore_ListDistinctArtifactLibraries_UsesLiveAndDeletedLibraries(t *testing.T) {
+	store := NewMockStore()
+	liveLib := uuid.New()
+	deletedLib := uuid.New()
+	orgID := uuid.New()
+
+	store.libraries[liveLib] = &mockLibrary{OrgID: orgID, LibraryID: liveLib}
+	store.deletedLibraries[deletedLib] = &mockDeletedLibrary{OrgID: orgID, LibraryID: deletedLib, DeletedAt: time.Now().UTC()}
+
+	commitLibs, err := store.ListDistinctCommitLibraries()
+	if err != nil {
+		t.Fatalf("ListDistinctCommitLibraries: %v", err)
+	}
+	if len(commitLibs) != 2 {
+		t.Fatalf("len(commitLibs) = %d, want 2", len(commitLibs))
+	}
+
+	fsLibs, err := store.ListDistinctFSObjectLibraries()
+	if err != nil {
+		t.Fatalf("ListDistinctFSObjectLibraries: %v", err)
+	}
+	if len(fsLibs) != 2 {
+		t.Fatalf("len(fsLibs) = %d, want 2", len(fsLibs))
 	}
 }
 

@@ -142,13 +142,12 @@ func (w *Worker) processOrg(ctx context.Context, orgID uuid.UUID) (int, error) {
 		processed++
 	}
 
-	if len(items) > 0 {
-		if remaining, sizeErr := w.queue.GetQueueSize(orgID); sizeErr != nil {
-			log.Printf("[GC Worker] Failed to get queue size for org %s after processing: %v", orgID, sizeErr)
-		} else if remaining == 0 {
-			if activeErr := w.store.RemoveOrgFromActiveSet(orgID, activeBefore); activeErr != nil {
-				log.Printf("[GC Worker] Failed to remove org %s from active set: %v", orgID, activeErr)
-			}
+	if len(items) > 0 && len(items) < w.batchSize {
+		// A short batch strongly suggests this org drained for the current worker
+		// pass. Avoid a full-partition gc_queue read here; reconcile will correct
+		// the active set if a concurrent enqueue or a grace-blocked row still exists.
+		if activeErr := w.store.RemoveOrgFromActiveSet(orgID, activeBefore); activeErr != nil {
+			log.Printf("[GC Worker] Failed to remove org %s from active set: %v", orgID, activeErr)
 		}
 	}
 
@@ -837,16 +836,11 @@ func (w *Worker) decrementAndFindZeroRef(orgID uuid.UUID, blockIDs []string) []s
 
 	var zeroRef []string
 	for _, blockID := range resolvedBlockIDs {
-		if err := w.store.DecrementBlockRefCount(orgID, blockID); err != nil {
-			continue
-		}
-
-		refCount, err := w.store.GetBlockRefCount(orgID, blockID)
+		hitZero, err := w.store.DecrementBlockRefCount(orgID, blockID)
 		if err != nil {
 			continue
 		}
-
-		if refCount <= 0 {
+		if hitZero {
 			zeroRef = append(zeroRef, blockID)
 		}
 	}
