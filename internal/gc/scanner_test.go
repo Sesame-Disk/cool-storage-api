@@ -193,16 +193,17 @@ func TestScanner_ScanExpiredShareLinks(t *testing.T) {
 		t.Fatalf("ScanOnce failed: %v", err)
 	}
 
-	// Should enqueue only the expired share link
-	items := store.QueueItems(orgID)
-	shareLinkItems := 0
-	for _, item := range items {
-		if item.ItemType == ItemShareLink {
-			shareLinkItems++
-		}
+	if store.QueueLen() != 0 {
+		t.Fatalf("expired share links should be cleaned directly, got %d queued items", store.QueueLen())
 	}
-	if shareLinkItems != 1 {
-		t.Errorf("expected 1 expired share link enqueued, got %d", shareLinkItems)
+	if _, ok := store.shareLinks["token-expired"]; ok {
+		t.Fatalf("expected expired share link to be deleted")
+	}
+	if _, ok := store.shareLinks["token-active"]; !ok {
+		t.Fatalf("expected active share link to remain")
+	}
+	if _, ok := store.shareLinks["token-permanent"]; !ok {
+		t.Fatalf("expected permanent share link to remain")
 	}
 }
 
@@ -397,10 +398,10 @@ func TestScanner_ScanOnce_FullPipeline(t *testing.T) {
 		t.Fatalf("ScanOnce failed: %v", err)
 	}
 
-	// Should enqueue: 1 orphaned block + 1 expired share link = 2 items
+	// Should enqueue only the orphaned block; expired share links are cleaned directly.
 	items := store.QueueItems(orgID)
-	if len(items) != 2 {
-		t.Errorf("expected 2 items from full pipeline, got %d", len(items))
+	if len(items) != 1 {
+		t.Errorf("expected 1 item from full pipeline, got %d", len(items))
 	}
 
 	typeCount := make(map[ItemType]int)
@@ -410,8 +411,8 @@ func TestScanner_ScanOnce_FullPipeline(t *testing.T) {
 	if typeCount[ItemBlock] != 1 {
 		t.Errorf("expected 1 block item, got %d", typeCount[ItemBlock])
 	}
-	if typeCount[ItemShareLink] != 1 {
-		t.Errorf("expected 1 share_link item, got %d", typeCount[ItemShareLink])
+	if _, ok := store.shareLinks["expired-token"]; ok {
+		t.Errorf("expected expired share link to be cleaned during full pipeline scan")
 	}
 	for _, item := range items {
 		if item.ItemType == ItemBlock && !item.QueuedAt.Equal(orphanCandidateAt) {

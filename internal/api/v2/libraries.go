@@ -661,6 +661,9 @@ func (h *LibraryHandler) CreateLibrary(c *gin.Context) {
 		`, newLibID.String(), orgID, userID, library.Name, headCommitID, false,
 		)
 	}
+	if library.VersionTTLDays > 0 {
+		db.AddUpsertLibraryPolicyQuery(batch, db.GCLibraryPolicyVersionTTL, orgID, newLibID.String(), library.VersionTTLDays, headCommitID, library.UpdatedAt)
+	}
 
 	batch.Query(`
 		INSERT INTO commits (library_id, commit_id, root_fs_id, creator_id, description, created_at)
@@ -919,8 +922,9 @@ func (h *LibraryHandler) UpdateLibrary(c *gin.Context) {
 		return
 	}
 
+	now := time.Now()
 	updates = append(updates, "updated_at = ?")
-	values = append(values, time.Now())
+	values = append(values, now)
 	values = append(values, orgID, repoID) // Use strings for UUIDs
 
 	query := "UPDATE libraries SET "
@@ -934,6 +938,20 @@ func (h *LibraryHandler) UpdateLibrary(c *gin.Context) {
 
 	batch := h.db.Session().Batch(gocql.LoggedBatch)
 	batch.Query(query, values...)
+	if req.VersionTTLDays != nil {
+		var headCommitID string
+		if err := h.db.Session().Query(`
+			SELECT head_commit_id FROM libraries WHERE org_id = ? AND library_id = ?
+		`, orgID, repoID).Scan(&headCommitID); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read library head for GC policy projection"})
+			return
+		}
+		if *req.VersionTTLDays > 0 {
+			db.AddUpsertLibraryPolicyQuery(batch, db.GCLibraryPolicyVersionTTL, orgID, repoID, *req.VersionTTLDays, headCommitID, now)
+		} else {
+			db.AddDeleteLibraryPolicyQuery(batch, db.GCLibraryPolicyVersionTTL, orgID, repoID)
+		}
+	}
 	if req.Name != nil {
 		batch.Query(`
 			UPDATE libraries_by_id SET name = ?
@@ -949,7 +967,7 @@ func (h *LibraryHandler) UpdateLibrary(c *gin.Context) {
 	if req.Name != nil {
 		projectionRow.Name = *req.Name
 	}
-	projectionRow.UpdatedAt = values[len(values)-3].(time.Time)
+	projectionRow.UpdatedAt = now
 	addAdminLibraryReadModelRefreshQueries(batch, projectionRow, &previousRow)
 
 	if err := batch.Exec(); err != nil {

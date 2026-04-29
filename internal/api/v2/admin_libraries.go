@@ -584,6 +584,9 @@ func (h *AdminHandler) AdminCreateLibrary(c *gin.Context) {
 		INSERT INTO commits (library_id, commit_id, root_fs_id, creator_id, description, created_at)
 		VALUES (?, ?, ?, ?, ?, ?)
 	`, newLibID.String(), headCommitID, rootFSID, callerUserID, "Initial commit", now)
+	if versionTTLDays > 0 {
+		dbpkg.AddUpsertLibraryPolicyQuery(batch, dbpkg.GCLibraryPolicyVersionTTL, ownerOrgID, newLibID.String(), versionTTLDays, headCommitID, now)
+	}
 	ownerName := h.resolveOwnerName(ownerOrgID, ownerUserID)
 	if ownerName == "" {
 		ownerName = strings.Split(ownerEmail, "@")[0]
@@ -777,6 +780,18 @@ func (h *AdminHandler) AdminUpdateHistorySetting(c *gin.Context) {
 		UPDATE libraries SET version_ttl_days = ?, updated_at = ?
 		WHERE org_id = ? AND library_id = ?
 	`, req.KeepDays, now, orgID, libraryID)
+	var headCommitID string
+	if err := h.db.Session().Query(`
+		SELECT head_commit_id FROM libraries WHERE org_id = ? AND library_id = ?
+	`, orgID, libraryID).Scan(&headCommitID); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read library head for GC policy projection"})
+		return
+	}
+	if req.KeepDays > 0 {
+		dbpkg.AddUpsertLibraryPolicyQuery(batch, dbpkg.GCLibraryPolicyVersionTTL, orgID, libraryID, req.KeepDays, headCommitID, now)
+	} else {
+		dbpkg.AddDeleteLibraryPolicyQuery(batch, dbpkg.GCLibraryPolicyVersionTTL, orgID, libraryID)
+	}
 	addAdminLibraryReadModelRefreshQueries(batch, projectionRow, &previousRow)
 	if err := batch.Exec(); err != nil {
 		log.Printf("[AdminUpdateHistorySetting] Failed to update: %v", err)

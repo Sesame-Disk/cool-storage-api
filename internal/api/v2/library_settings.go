@@ -181,6 +181,18 @@ func (h *LibrarySettingsHandler) SetHistoryLimit(c *gin.Context) {
 		UPDATE libraries SET version_ttl_days = ?, updated_at = ?
 		WHERE org_id = ? AND library_id = ?
 	`, req.KeepDays, now, orgID, repoID)
+	var headCommitID string
+	if err := h.db.Session().Query(`
+		SELECT head_commit_id FROM libraries WHERE org_id = ? AND library_id = ?
+	`, orgID, repoID).Scan(&headCommitID); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read library head for GC policy projection"})
+		return
+	}
+	if req.KeepDays > 0 {
+		db.AddUpsertLibraryPolicyQuery(batch, db.GCLibraryPolicyVersionTTL, orgID, repoID, req.KeepDays, headCommitID, now)
+	} else {
+		db.AddDeleteLibraryPolicyQuery(batch, db.GCLibraryPolicyVersionTTL, orgID, repoID)
+	}
 	addAdminLibraryReadModelRefreshQueries(batch, projectionRow, &previousRow)
 	if err := batch.Exec(); err != nil {
 		log.Printf("[SetHistoryLimit] Failed to update: %v", err)
@@ -253,6 +265,18 @@ func (h *LibrarySettingsHandler) SetAutoDelete(c *gin.Context) {
 		UPDATE libraries SET auto_delete_days = ?, updated_at = ?
 		WHERE org_id = ? AND library_id = ?
 	`, req.AutoDeleteDays, now, orgID, repoID)
+	var headCommitID string
+	if err := h.db.Session().Query(`
+		SELECT head_commit_id FROM libraries WHERE org_id = ? AND library_id = ?
+	`, orgID, repoID).Scan(&headCommitID); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read library head for GC policy projection"})
+		return
+	}
+	if req.AutoDeleteDays > 0 {
+		db.AddUpsertLibraryPolicyQuery(batch, db.GCLibraryPolicyAutoDelete, orgID, repoID, req.AutoDeleteDays, headCommitID, now)
+	} else {
+		db.AddDeleteLibraryPolicyQuery(batch, db.GCLibraryPolicyAutoDelete, orgID, repoID)
+	}
 	addAdminLibraryReadModelRefreshQueries(batch, projectionRow, &previousRow)
 	if err := batch.Exec(); err != nil {
 		log.Printf("[SetAutoDelete] Failed to update: %v", err)

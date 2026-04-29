@@ -10,6 +10,11 @@ import (
 
 const GCDiscoveryBucketCount = 32
 
+const (
+	GCLibraryPolicyVersionTTL = "version_ttl"
+	GCLibraryPolicyAutoDelete = "auto_delete"
+)
+
 func GCDiscoveryBucket(parts ...string) int {
 	hasher := fnv.New32a()
 	for _, part := range parts {
@@ -69,4 +74,43 @@ func AddDeleteShareLinkExpiryQuery(batch *gocql.Batch, token string, expiresAt t
 		DELETE FROM gc_share_links_by_expiry
 		WHERE expiry_day = ? AND bucket = ? AND expires_at = ? AND link_token = ?
 	`, GCProjectionUTCDate(expiresAt), GCDiscoveryBucket(token), expiresAt.UTC(), token)
+}
+
+func AddUpsertShareExpiryQuery(batch *gocql.Batch, orgID, libraryID, shareID, sharedTo, sharedToType, sharedBy string, createdAt, expiresAt time.Time) {
+	if expiresAt.IsZero() {
+		return
+	}
+	batch.Query(`
+		INSERT INTO gc_shares_by_expiry (
+			expiry_day, bucket, expires_at, org_id, library_id, share_id, shared_to, shared_to_type, shared_by, created_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, GCProjectionUTCDate(expiresAt), GCDiscoveryBucket(shareID), expiresAt.UTC(), orgID, libraryID, shareID, sharedTo, sharedToType, sharedBy, createdAt.UTC())
+}
+
+func AddDeleteShareExpiryQuery(batch *gocql.Batch, shareID string, expiresAt time.Time, orgID, libraryID string) {
+	if expiresAt.IsZero() {
+		return
+	}
+	batch.Query(`
+		DELETE FROM gc_shares_by_expiry
+		WHERE expiry_day = ? AND bucket = ? AND expires_at = ? AND org_id = ? AND library_id = ? AND share_id = ?
+	`, GCProjectionUTCDate(expiresAt), GCDiscoveryBucket(shareID), expiresAt.UTC(), orgID, libraryID, shareID)
+}
+
+func AddUpsertLibraryPolicyQuery(batch *gocql.Batch, policyType, orgID, libraryID string, days int, cachedHeadCommitID string, policyUpdatedAt time.Time) {
+	if days <= 0 {
+		return
+	}
+	batch.Query(`
+		INSERT INTO gc_libraries_by_policy (
+			policy_type, bucket, org_id, library_id, days, cached_head_commit_id, policy_updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?)
+	`, policyType, GCDiscoveryBucket(libraryID), orgID, libraryID, days, cachedHeadCommitID, policyUpdatedAt.UTC())
+}
+
+func AddDeleteLibraryPolicyQuery(batch *gocql.Batch, policyType, orgID, libraryID string) {
+	batch.Query(`
+		DELETE FROM gc_libraries_by_policy
+		WHERE policy_type = ? AND bucket = ? AND org_id = ? AND library_id = ?
+	`, policyType, GCDiscoveryBucket(libraryID), orgID, libraryID)
 }

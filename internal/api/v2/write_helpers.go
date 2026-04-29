@@ -234,6 +234,9 @@ func createLibraryShare(db interface{ Session() *gocql.Session }, libraryID, sha
 	`, libraryID, shareID, row.OrgID, sharedBy, row.SharedByEmail, row.SharedByName,
 		sharedTo, sharedToType, row.RepoName, row.Encrypted, row.SizeBytes,
 		permission, createdAt, expiresAt)
+	if expiresAt != nil {
+		dbpkg.AddUpsertShareExpiryQuery(batch, row.OrgID, libraryID, shareID, sharedTo, sharedToType, sharedBy, createdAt, *expiresAt)
+	}
 	dbpkg.AddUpsertShareReadModelQuery(batch, row)
 	return batch.Exec()
 }
@@ -262,6 +265,9 @@ func deleteLibraryShare(db interface{ Session() *gocql.Session }, libraryID, sha
 	batch.Query(`
 		DELETE FROM shares WHERE library_id = ? AND share_id = ?
 	`, libraryID, shareID)
+	if row.ExpiresAt != nil && !row.ExpiresAt.IsZero() {
+		dbpkg.AddDeleteShareExpiryQuery(batch, shareID, *row.ExpiresAt, row.OrgID, libraryID)
+	}
 	dbpkg.AddDeleteShareReadModelQuery(batch, row)
 	return batch.Exec()
 }
@@ -734,6 +740,8 @@ func incrementShareLinkCounterDualWrite(db interface{ Session() *gocql.Session }
 
 func rollbackNewLibrary(db interface{ Session() *gocql.Session }, orgID, libraryID string) error {
 	batch := db.Session().Batch(gocql.LoggedBatch)
+	dbpkg.AddDeleteLibraryPolicyQuery(batch, dbpkg.GCLibraryPolicyVersionTTL, orgID, libraryID)
+	dbpkg.AddDeleteLibraryPolicyQuery(batch, dbpkg.GCLibraryPolicyAutoDelete, orgID, libraryID)
 	batch.Query(`
 		DELETE FROM libraries WHERE org_id = ? AND library_id = ?
 	`, orgID, libraryID)

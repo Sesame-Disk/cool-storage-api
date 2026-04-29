@@ -182,6 +182,10 @@ type mockLibrary struct {
 type mockShareLink struct {
 	ShareToken string
 	OrgID      uuid.UUID
+	LibraryID  uuid.UUID
+	CreatedBy  uuid.UUID
+	CreatedAt  time.Time
+	LinkType   string
 	ExpiresAt  time.Time
 }
 
@@ -192,6 +196,7 @@ type mockShare struct {
 	SharedBy     uuid.UUID
 	SharedTo     uuid.UUID
 	SharedToType string
+	CreatedAt    time.Time
 	ExpiresAt    time.Time
 }
 
@@ -445,9 +450,14 @@ func (m *MockStore) AddLibraryWithOwner(orgID, libraryID, ownerID uuid.UUID, sto
 func (m *MockStore) AddShareLink(shareToken string, orgID uuid.UUID, expiresAt time.Time) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	createdAt := time.Now()
 	m.shareLinks[shareToken] = &mockShareLink{
 		ShareToken: shareToken,
 		OrgID:      orgID,
+		LibraryID:  uuid.New(),
+		CreatedBy:  uuid.New(),
+		CreatedAt:  createdAt,
+		LinkType:   "file",
 		ExpiresAt:  expiresAt,
 	}
 }
@@ -464,8 +474,10 @@ func (m *MockStore) AddShare(libraryID, shareID, sharedTo uuid.UUID, expiresAt t
 		OrgID:        orgID,
 		LibraryID:    libraryID,
 		ShareID:      shareID,
+		SharedBy:     uuid.New(),
 		SharedTo:     sharedTo,
 		SharedToType: "user",
+		CreatedAt:    time.Now(),
 		ExpiresAt:    expiresAt,
 	}
 }
@@ -484,6 +496,8 @@ func (m *MockStore) AddGroupShare(libraryID, shareID, groupID uuid.UUID) {
 		ShareID:      shareID,
 		SharedTo:     groupID,
 		SharedToType: "group",
+		SharedBy:     uuid.New(),
+		CreatedAt:    time.Now(),
 	}
 }
 
@@ -1446,15 +1460,23 @@ func (m *MockStore) ListBlocksForOrg(orgID uuid.UUID) ([]BlockInfo, error) {
 	return blocks, nil
 }
 
-func (m *MockStore) ListShareLinks() ([]ShareLinkInfo, error) {
+func (m *MockStore) ListExpiredShareLinks() ([]ExpiredShareLinkInfo, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	var links []ShareLinkInfo
+	now := time.Now()
+	var links []ExpiredShareLinkInfo
 	for _, sl := range m.shareLinks {
-		links = append(links, ShareLinkInfo{
+		if sl.ExpiresAt.IsZero() || sl.ExpiresAt.After(now) {
+			continue
+		}
+		links = append(links, ExpiredShareLinkInfo{
 			ShareToken: sl.ShareToken,
 			OrgID:      sl.OrgID,
+			LibraryID:  sl.LibraryID,
+			CreatedBy:  sl.CreatedBy,
+			CreatedAt:  sl.CreatedAt,
+			LinkType:   sl.LinkType,
 			ExpiresAt:  sl.ExpiresAt,
 		})
 	}
@@ -1659,6 +1681,13 @@ func (m *MockStore) DeleteShareLink(shareToken string, orgID uuid.UUID, libraryI
 	return nil
 }
 
+func (m *MockStore) DeleteExpiredShareLink(link ExpiredShareLinkInfo) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.shareLinks, link.ShareToken)
+	return nil
+}
+
 // --- Expired shares ---
 
 func (m *MockStore) ListExpiredShares() ([]ExpiredShareInfo, error) {
@@ -1670,10 +1699,14 @@ func (m *MockStore) ListExpiredShares() ([]ExpiredShareInfo, error) {
 	for _, s := range m.shares {
 		if !s.ExpiresAt.IsZero() && s.ExpiresAt.Before(now) {
 			results = append(results, ExpiredShareInfo{
-				LibraryID: s.LibraryID,
-				ShareID:   s.ShareID,
-				SharedTo:  s.SharedTo,
-				ExpiresAt: s.ExpiresAt,
+				OrgID:        s.OrgID,
+				LibraryID:    s.LibraryID,
+				ShareID:      s.ShareID,
+				SharedBy:     s.SharedBy,
+				SharedTo:     s.SharedTo,
+				SharedToType: s.SharedToType,
+				CreatedAt:    s.CreatedAt,
+				ExpiresAt:    s.ExpiresAt,
 			})
 		}
 	}
@@ -1684,6 +1717,14 @@ func (m *MockStore) DeleteShare(libraryID, shareID uuid.UUID) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	key := fmt.Sprintf("%s:%s", libraryID, shareID)
+	delete(m.shares, key)
+	return nil
+}
+
+func (m *MockStore) DeleteExpiredShare(share ExpiredShareInfo) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	key := fmt.Sprintf("%s:%s", share.LibraryID, share.ShareID)
 	delete(m.shares, key)
 	return nil
 }

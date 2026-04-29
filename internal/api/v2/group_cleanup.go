@@ -69,6 +69,11 @@ func collectGroupShareReadModelRows(database *dbpkg.DB, orgID, groupID string) (
 		return nil, err
 	}
 
+	shareRows, err := dbpkg.HydrateShareReadModelRows(database.Session(), shareRows)
+	if err != nil {
+		return nil, err
+	}
+
 	if shareRows == nil {
 		shareRows = []dbpkg.ShareReadModelRow{}
 	}
@@ -78,6 +83,9 @@ func collectGroupShareReadModelRows(database *dbpkg.DB, orgID, groupID string) (
 func addDeleteGroupShareQueries(batch *gocql.Batch, shareRows []dbpkg.ShareReadModelRow) {
 	for _, row := range shareRows {
 		batch.Query(`DELETE FROM shares WHERE library_id = ? AND share_id = ?`, row.LibraryID, row.ShareID)
+		if row.ExpiresAt != nil {
+			dbpkg.AddDeleteShareExpiryQuery(batch, row.ShareID, *row.ExpiresAt, row.OrgID, row.LibraryID)
+		}
 		dbpkg.AddDeleteShareReadModelQuery(batch, row)
 	}
 }

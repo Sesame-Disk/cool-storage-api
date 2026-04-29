@@ -226,37 +226,28 @@ func (s *Scanner) scanOrphanedBlocks(ctx context.Context) (int, error) {
 func (s *Scanner) scanExpiredShareLinks(ctx context.Context) (int, error) {
 	log.Println("[GC Scanner] Phase 2: Scanning for expired share links...")
 
-	now := time.Now()
-	links, err := s.store.ListShareLinks()
+	links, err := s.store.ListExpiredShareLinks()
 	if err != nil {
 		return 0, err
 	}
 
-	enqueued := 0
-	var batch []QueueItem
-	batchTime := time.Now()
+	cleaned := 0
 	for _, link := range links {
-		if !link.ExpiresAt.IsZero() && link.ExpiresAt.Before(now) {
-			batch = append(batch, QueueItem{
-				OrgID:    link.OrgID,
-				QueuedAt: batchTime,
-				ItemType: ItemShareLink,
-				ItemID:   link.ShareToken,
-			})
+		select {
+		case <-ctx.Done():
+			return cleaned, ctx.Err()
+		default:
 		}
-	}
-	if len(batch) > 0 {
-		if err := s.queue.EnqueueBatch(batch); err != nil {
-			log.Printf("[GC Scanner] Phase 2: failed to batch enqueue expired links: %v", err)
-		} else {
-			enqueued = len(batch)
+
+		if err := s.store.DeleteExpiredShareLink(link); err == nil {
+			cleaned++
 		}
 	}
 
-	log.Printf("[GC Scanner] Phase 2 complete: enqueued %d expired share links", enqueued)
-	metrics.GCItemsEnqueuedTotal.WithLabelValues("expired_links").Add(float64(enqueued))
+	log.Printf("[GC Scanner] Phase 2 complete: cleaned %d expired share links", cleaned)
+	metrics.GCItemsEnqueuedTotal.WithLabelValues("expired_links").Add(float64(cleaned))
 	metrics.GCScannerLastPhaseRun.WithLabelValues("expired_links").SetToCurrentTime()
-	return enqueued, nil
+	return cleaned, nil
 }
 
 // scanOrphanedCommits finds commits whose library no longer exists.
@@ -571,7 +562,7 @@ func (s *Scanner) scanExpiredShares(ctx context.Context) (int, error) {
 		}
 
 		// Delete directly — shares are small metadata, no need for queue
-		if err := s.store.DeleteShare(share.LibraryID, share.ShareID); err == nil {
+		if err := s.store.DeleteExpiredShare(share); err == nil {
 			enqueued++
 		}
 	}

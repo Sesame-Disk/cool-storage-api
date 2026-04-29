@@ -87,7 +87,7 @@ type GCStore interface {
 	// Scanner operations
 	ListOrganizations() ([]uuid.UUID, error)
 	ListBlocksForOrg(orgID uuid.UUID) ([]BlockInfo, error)
-	ListShareLinks() ([]ShareLinkInfo, error)
+	ListExpiredShareLinks() ([]ExpiredShareLinkInfo, error)
 	ListDistinctCommitLibraries() ([]uuid.UUID, error)
 	ListDistinctFSObjectLibraries() ([]uuid.UUID, error)
 	LibraryExists(libraryID uuid.UUID) (bool, error)
@@ -105,10 +105,12 @@ type GCStore interface {
 
 	// Share link deletion (defensive: attempts index cleanup even if primary record is gone)
 	DeleteShareLink(shareToken string, orgID uuid.UUID, libraryID uuid.UUID) error
+	DeleteExpiredShareLink(link ExpiredShareLinkInfo) error
 
 	// Expired shares (user-to-user library shares)
 	ListExpiredShares() ([]ExpiredShareInfo, error)
 	DeleteShare(libraryID, shareID uuid.UUID) error
+	DeleteExpiredShare(share ExpiredShareInfo) error
 
 	// Expired restore jobs
 	ListExpiredRestoreJobs() ([]ExpiredRestoreJobInfo, error)
@@ -296,6 +298,17 @@ type ShareLinkInfo struct {
 	ExpiresAt  time.Time
 }
 
+// ExpiredShareLinkInfo holds the cleanup context from gc_share_links_by_expiry.
+type ExpiredShareLinkInfo struct {
+	ShareToken string
+	OrgID      uuid.UUID
+	LibraryID  uuid.UUID
+	CreatedBy  uuid.UUID
+	CreatedAt  time.Time
+	LinkType   string
+	ExpiresAt  time.Time
+}
+
 // LibraryTTLInfo holds library data needed for version TTL enforcement.
 type LibraryTTLInfo struct {
 	OrgID          uuid.UUID
@@ -322,10 +335,14 @@ type LibraryAutoDeleteInfo struct {
 
 // ExpiredShareInfo holds data about an expired user-to-user share.
 type ExpiredShareInfo struct {
-	LibraryID uuid.UUID
-	ShareID   uuid.UUID
-	SharedTo  uuid.UUID
-	ExpiresAt time.Time
+	OrgID        uuid.UUID
+	LibraryID    uuid.UUID
+	ShareID      uuid.UUID
+	SharedBy     uuid.UUID
+	SharedTo     uuid.UUID
+	SharedToType string
+	CreatedAt    time.Time
+	ExpiresAt    time.Time
 }
 
 // ExpiredRestoreJobInfo holds data about an expired/completed restore job.

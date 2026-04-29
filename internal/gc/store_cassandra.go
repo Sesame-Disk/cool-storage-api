@@ -61,6 +61,8 @@ type CassandraStore struct {
 }
 
 const gcDeletedUsersCursorKey = "gc.scan.expired_deleted_users.last_deleted_day"
+const gcExpiredShareLinksCursorKey = "gc.scan.expired_share_links.last_expiry_day"
+const gcExpiredSharesCursorKey = "gc.scan.expired_shares.last_expiry_day"
 
 // NewCassandraStore creates a new CassandraStore.
 func NewCassandraStore(database *db.DB) *CassandraStore {
@@ -1133,21 +1135,68 @@ func (s *CassandraStore) ListBlocksForOrg(orgID uuid.UUID) ([]BlockInfo, error) 
 	return blocks, nil
 }
 
-func (s *CassandraStore) ListShareLinks() ([]ShareLinkInfo, error) {
-	iter := s.db.Session().Query(`
-		SELECT link_token, org_id, expires_at FROM share_links
-	`).Iter()
-
-	var links []ShareLinkInfo
-	var shareToken, orgIDStr string
-	var expiresAt time.Time
-	for iter.Scan(&shareToken, &orgIDStr, &expiresAt) {
-		links = append(links, ShareLinkInfo{ShareToken: shareToken, OrgID: parseUUID(orgIDStr), ExpiresAt: expiresAt})
+func (s *CassandraStore) ListExpiredShareLinks() ([]ExpiredShareLinkInfo, error) {
+	now := time.Now()
+	cutoffDay := db.GCProjectionUTCDate(now)
+	startDay, err := s.loadExpiredShareLinksStartDay(cutoffDay)
+	if err != nil {
+		return nil, err
 	}
-	if err := iter.Close(); err != nil {
+	if startDay.After(cutoffDay) {
+		return nil, nil
+	}
+
+	var links []ExpiredShareLinkInfo
+	for day := startDay; !day.After(cutoffDay); day = day.AddDate(0, 0, 1) {
+		for bucket := 0; bucket < db.GCDiscoveryBucketCount; bucket++ {
+			iter := s.db.Session().Query(`
+				SELECT expires_at, link_token, org_id, library_id, created_by, created_at, link_type
+				FROM gc_share_links_by_expiry
+				WHERE expiry_day = ? AND bucket = ?
+			`, day, bucket).Iter()
+
+			var expiresAt time.Time
+			var shareToken, orgIDStr, libraryIDStr, createdByStr, linkType string
+			var createdAt time.Time
+			for iter.Scan(&expiresAt, &shareToken, &orgIDStr, &libraryIDStr, &createdByStr, &createdAt, &linkType) {
+				if expiresAt.IsZero() || expiresAt.After(now) {
+					continue
+				}
+				links = append(links, ExpiredShareLinkInfo{
+					ShareToken: shareToken,
+					OrgID:      parseUUID(orgIDStr),
+					LibraryID:  parseUUID(libraryIDStr),
+					CreatedBy:  parseUUID(createdByStr),
+					CreatedAt:  createdAt,
+					LinkType:   linkType,
+					ExpiresAt:  expiresAt,
+				})
+			}
+			if err := iter.Close(); err != nil {
+				return nil, err
+			}
+		}
+	}
+
+	if err := s.SaveGCStats(gcExpiredShareLinksCursorKey, db.GCProjectionDateString(cutoffDay)); err != nil {
 		return nil, err
 	}
 	return links, nil
+}
+
+func (s *CassandraStore) loadExpiredShareLinksStartDay(cutoffDay time.Time) (time.Time, error) {
+	value, err := s.LoadGCStats(gcExpiredShareLinksCursorKey)
+	if err != nil {
+		if errors.Is(err, gocql.ErrNotFound) {
+			return cutoffDay, nil
+		}
+		return time.Time{}, err
+	}
+	lastDay, err := db.ParseGCProjectionDate(value)
+	if err != nil {
+		return time.Time{}, err
+	}
+	return lastDay, nil
 }
 
 func (s *CassandraStore) ListDistinctCommitLibraries() ([]uuid.UUID, error) {
@@ -1348,27 +1397,7 @@ func (s *CassandraStore) ReconcilePendingStorageCounters() (int, error) {
 // --- Version TTL ---
 
 func (s *CassandraStore) ListLibrariesWithVersionTTL() ([]LibraryTTLInfo, error) {
-	iter := s.db.Session().Query(`
-		SELECT org_id, library_id, head_commit_id, version_ttl_days FROM libraries
-	`).Iter()
-
-	var results []LibraryTTLInfo
-	var orgIDStr, libIDStr, headCommitID string
-	var versionTTLDays int
-	for iter.Scan(&orgIDStr, &libIDStr, &headCommitID, &versionTTLDays) {
-		if versionTTLDays > 0 {
-			results = append(results, LibraryTTLInfo{
-				OrgID:          parseUUID(orgIDStr),
-				LibraryID:      parseUUID(libIDStr),
-				HeadCommitID:   headCommitID,
-				VersionTTLDays: versionTTLDays,
-			})
-		}
-	}
-	if err := iter.Close(); err != nil {
-		return nil, fmt.Errorf("failed to list libraries with version TTL: %w", err)
-	}
-	return results, nil
+	return s.listLibrariesByPolicy(db.GCLibraryPolicyVersionTTL)
 }
 
 func (s *CassandraStore) ListCommitsWithTimestamps(libraryID uuid.UUID) ([]CommitWithTimestamp, error) {
@@ -1396,25 +1425,66 @@ func (s *CassandraStore) ListCommitsWithTimestamps(libraryID uuid.UUID) ([]Commi
 // --- Auto-delete ---
 
 func (s *CassandraStore) ListLibrariesWithAutoDelete() ([]LibraryAutoDeleteInfo, error) {
-	iter := s.db.Session().Query(`
-		SELECT org_id, library_id, head_commit_id, auto_delete_days FROM libraries
-	`).Iter()
+	rows, err := s.listLibrariesByPolicy(db.GCLibraryPolicyAutoDelete)
+	if err != nil {
+		return nil, err
+	}
+	results := make([]LibraryAutoDeleteInfo, 0, len(rows))
+	for _, row := range rows {
+		results = append(results, LibraryAutoDeleteInfo{
+			OrgID:          row.OrgID,
+			LibraryID:      row.LibraryID,
+			HeadCommitID:   row.HeadCommitID,
+			AutoDeleteDays: row.VersionTTLDays,
+		})
+	}
+	return results, nil
+}
 
-	var results []LibraryAutoDeleteInfo
-	var orgIDStr, libIDStr, headCommitID string
-	var autoDeleteDays int
-	for iter.Scan(&orgIDStr, &libIDStr, &headCommitID, &autoDeleteDays) {
-		if autoDeleteDays > 0 {
-			results = append(results, LibraryAutoDeleteInfo{
+func (s *CassandraStore) listLibrariesByPolicy(policyType string) ([]LibraryTTLInfo, error) {
+	results := make([]LibraryTTLInfo, 0)
+	for bucket := 0; bucket < db.GCDiscoveryBucketCount; bucket++ {
+		iter := s.db.Session().Query(`
+			SELECT org_id, library_id FROM gc_libraries_by_policy WHERE policy_type = ? AND bucket = ?
+		`, policyType, bucket).Iter()
+
+		var orgIDStr, libraryIDStr string
+		for iter.Scan(&orgIDStr, &libraryIDStr) {
+			var headCommitID string
+			var versionTTLDays, autoDeleteDays int
+			var deletedAt *time.Time
+			err := s.db.Session().Query(`
+				SELECT head_commit_id, version_ttl_days, auto_delete_days, deleted_at FROM libraries WHERE org_id = ? AND library_id = ?
+			`, orgIDStr, libraryIDStr).Scan(&headCommitID, &versionTTLDays, &autoDeleteDays, &deletedAt)
+			if errors.Is(err, gocql.ErrNotFound) {
+				continue
+			}
+			if err != nil {
+				iter.Close()
+				return nil, fmt.Errorf("failed to revalidate library policy row for %s/%s: %w", orgIDStr, libraryIDStr, err)
+			}
+			if deletedAt != nil && !deletedAt.IsZero() {
+				continue
+			}
+
+			days := versionTTLDays
+			if policyType == db.GCLibraryPolicyAutoDelete {
+				days = autoDeleteDays
+			}
+			if days <= 0 {
+				continue
+			}
+
+			results = append(results, LibraryTTLInfo{
 				OrgID:          parseUUID(orgIDStr),
-				LibraryID:      parseUUID(libIDStr),
+				LibraryID:      parseUUID(libraryIDStr),
 				HeadCommitID:   headCommitID,
-				AutoDeleteDays: autoDeleteDays,
+				VersionTTLDays: days,
 			})
 		}
-	}
-	if err := iter.Close(); err != nil {
-		return nil, fmt.Errorf("failed to list libraries with auto delete: %w", err)
+		if err := iter.Close(); err != nil {
+			return nil, fmt.Errorf("failed to list libraries for policy %s: %w", policyType, err)
+		}
 	}
 	return results, nil
 }
@@ -1459,33 +1529,120 @@ func (s *CassandraStore) DeleteShareLink(shareToken string, fallbackOrgID uuid.U
 	return nil
 }
 
+func (s *CassandraStore) DeleteExpiredShareLink(link ExpiredShareLinkInfo) error {
+	orgID := link.OrgID.String()
+	libraryID := link.LibraryID.String()
+	createdBy := link.CreatedBy.String()
+	createdAt := link.CreatedAt
+	linkType := link.LinkType
+	expiresAt := link.ExpiresAt.UTC()
+
+	var canonicalOrgID, canonicalCreatedBy, canonicalLibraryID, canonicalLinkType string
+	var canonicalCreatedAt time.Time
+	var canonicalExpiresAt *time.Time
+	err := s.db.Session().Query(`
+		SELECT org_id, created_by, library_id, created_at, link_type, expires_at FROM share_links WHERE link_token = ?
+	`, link.ShareToken).Scan(&canonicalOrgID, &canonicalCreatedBy, &canonicalLibraryID, &canonicalCreatedAt, &canonicalLinkType, &canonicalExpiresAt)
+	if err != nil && !errors.Is(err, gocql.ErrNotFound) {
+		return err
+	}
+	if err == nil {
+		if canonicalExpiresAt == nil || canonicalExpiresAt.IsZero() || canonicalExpiresAt.After(time.Now()) {
+			batch := s.db.Session().Batch(gocql.LoggedBatch)
+			db.AddDeleteShareLinkExpiryQuery(batch, link.ShareToken, expiresAt)
+			return batch.Exec()
+		}
+		orgID = canonicalOrgID
+		libraryID = canonicalLibraryID
+		createdBy = canonicalCreatedBy
+		createdAt = canonicalCreatedAt
+		linkType = canonicalLinkType
+		expiresAt = canonicalExpiresAt.UTC()
+	}
+
+	batch := s.db.Session().Batch(gocql.LoggedBatch)
+	batch.Query(`DELETE FROM share_links WHERE link_token = ?`, link.ShareToken)
+	batch.Query(`DELETE FROM share_links_by_creator WHERE org_id = ? AND created_by = ? AND created_at = ? AND link_token = ?`,
+		orgID, createdBy, createdAt, link.ShareToken)
+	batch.Query(`DELETE FROM share_links_by_library WHERE org_id = ? AND library_id = ? AND link_token = ?`,
+		orgID, libraryID, link.ShareToken)
+	db.AddDeleteShareLinkExpiryQuery(batch, link.ShareToken, expiresAt)
+	if linkType != "" {
+		db.AddDeleteAdminLinkReadModelQuery(batch, linkType, createdAt, orgID, link.ShareToken)
+	}
+	if err := batch.Exec(); err != nil {
+		return err
+	}
+	if linkType != "" {
+		db.BestEffortAdjustAdminOrgLinkCount(s.db.Session(), orgID, linkType, db.AdminOrgLinkCountDelta(-1))
+	}
+	return nil
+}
+
 // --- Expired shares (user-to-user) ---
 
 func (s *CassandraStore) ListExpiredShares() ([]ExpiredShareInfo, error) {
 	now := time.Now()
-	// shares table doesn't have a global secondary index on expires_at,
-	// so we need to scan all shares. This is acceptable since it runs every 24h.
-	iter := s.db.Session().Query(`
-		SELECT library_id, share_id, shared_to, expires_at FROM shares
-	`).Iter()
+	cutoffDay := db.GCProjectionUTCDate(now)
+	startDay, err := s.loadExpiredSharesStartDay(cutoffDay)
+	if err != nil {
+		return nil, err
+	}
+	if startDay.After(cutoffDay) {
+		return nil, nil
+	}
 
 	var results []ExpiredShareInfo
-	var libIDStr, shareIDStr, sharedToStr string
-	var expiresAt time.Time
-	for iter.Scan(&libIDStr, &shareIDStr, &sharedToStr, &expiresAt) {
-		if !expiresAt.IsZero() && expiresAt.Before(now) {
-			results = append(results, ExpiredShareInfo{
-				LibraryID: parseUUID(libIDStr),
-				ShareID:   parseUUID(shareIDStr),
-				SharedTo:  parseUUID(sharedToStr),
-				ExpiresAt: expiresAt,
-			})
+	for day := startDay; !day.After(cutoffDay); day = day.AddDate(0, 0, 1) {
+		for bucket := 0; bucket < db.GCDiscoveryBucketCount; bucket++ {
+			iter := s.db.Session().Query(`
+				SELECT expires_at, org_id, library_id, share_id, shared_to, shared_to_type, shared_by, created_at
+				FROM gc_shares_by_expiry
+				WHERE expiry_day = ? AND bucket = ?
+			`, day, bucket).Iter()
+
+			var expiresAt, createdAt time.Time
+			var orgIDStr, libIDStr, shareIDStr, sharedToStr, sharedToType, sharedByStr string
+			for iter.Scan(&expiresAt, &orgIDStr, &libIDStr, &shareIDStr, &sharedToStr, &sharedToType, &sharedByStr, &createdAt) {
+				if expiresAt.IsZero() || expiresAt.After(now) {
+					continue
+				}
+				results = append(results, ExpiredShareInfo{
+					OrgID:        parseUUID(orgIDStr),
+					LibraryID:    parseUUID(libIDStr),
+					ShareID:      parseUUID(shareIDStr),
+					SharedBy:     parseUUID(sharedByStr),
+					SharedTo:     parseUUID(sharedToStr),
+					SharedToType: sharedToType,
+					CreatedAt:    createdAt,
+					ExpiresAt:    expiresAt,
+				})
+			}
+			if err := iter.Close(); err != nil {
+				return nil, fmt.Errorf("failed to list expired shares: %w", err)
+			}
 		}
 	}
-	if err := iter.Close(); err != nil {
-		return nil, fmt.Errorf("failed to list expired shares: %w", err)
+
+	if err := s.SaveGCStats(gcExpiredSharesCursorKey, db.GCProjectionDateString(cutoffDay)); err != nil {
+		return nil, err
 	}
 	return results, nil
+}
+
+func (s *CassandraStore) loadExpiredSharesStartDay(cutoffDay time.Time) (time.Time, error) {
+	value, err := s.LoadGCStats(gcExpiredSharesCursorKey)
+	if err != nil {
+		if errors.Is(err, gocql.ErrNotFound) {
+			return cutoffDay, nil
+		}
+		return time.Time{}, err
+	}
+	lastDay, err := db.ParseGCProjectionDate(value)
+	if err != nil {
+		return time.Time{}, err
+	}
+	return lastDay, nil
 }
 
 func (s *CassandraStore) DeleteShare(libraryID, shareID uuid.UUID) error {
@@ -1501,6 +1658,51 @@ func (s *CassandraStore) DeleteShare(libraryID, shareID uuid.UUID) error {
 	batch.Query(`
 		DELETE FROM shares WHERE library_id = ? AND share_id = ?
 	`, libraryID.String(), shareID.String())
+	if row.ExpiresAt != nil && !row.ExpiresAt.IsZero() {
+		db.AddDeleteShareExpiryQuery(batch, shareID.String(), *row.ExpiresAt, row.OrgID, libraryID.String())
+	}
+	db.AddDeleteShareReadModelQuery(batch, row)
+	return batch.Exec()
+}
+
+func (s *CassandraStore) DeleteExpiredShare(share ExpiredShareInfo) error {
+	row := db.ShareReadModelRow{
+		OrgID:        share.OrgID.String(),
+		LibraryID:    share.LibraryID.String(),
+		ShareID:      share.ShareID.String(),
+		SharedBy:     share.SharedBy.String(),
+		SharedTo:     share.SharedTo.String(),
+		SharedToType: share.SharedToType,
+		CreatedAt:    share.CreatedAt,
+		ExpiresAt:    &share.ExpiresAt,
+	}
+
+	var canonicalOrgID, canonicalSharedBy, canonicalSharedTo, canonicalSharedToType string
+	var canonicalCreatedAt time.Time
+	var canonicalExpiresAt *time.Time
+	err := s.db.Session().Query(`
+		SELECT org_id, shared_by, shared_to, shared_to_type, created_at, expires_at FROM shares WHERE library_id = ? AND share_id = ?
+	`, share.LibraryID.String(), share.ShareID.String()).Scan(&canonicalOrgID, &canonicalSharedBy, &canonicalSharedTo, &canonicalSharedToType, &canonicalCreatedAt, &canonicalExpiresAt)
+	if err != nil && !errors.Is(err, gocql.ErrNotFound) {
+		return err
+	}
+	if err == nil {
+		if canonicalExpiresAt == nil || canonicalExpiresAt.IsZero() || canonicalExpiresAt.After(time.Now()) {
+			batch := s.db.Session().Batch(gocql.LoggedBatch)
+			db.AddDeleteShareExpiryQuery(batch, share.ShareID.String(), share.ExpiresAt, share.OrgID.String(), share.LibraryID.String())
+			return batch.Exec()
+		}
+		row.OrgID = canonicalOrgID
+		row.SharedBy = canonicalSharedBy
+		row.SharedTo = canonicalSharedTo
+		row.SharedToType = canonicalSharedToType
+		row.CreatedAt = canonicalCreatedAt
+		row.ExpiresAt = canonicalExpiresAt
+	}
+
+	batch := s.db.Session().Batch(gocql.LoggedBatch)
+	batch.Query(`DELETE FROM shares WHERE library_id = ? AND share_id = ?`, share.LibraryID.String(), share.ShareID.String())
+	db.AddDeleteShareExpiryQuery(batch, share.ShareID.String(), *row.ExpiresAt, row.OrgID, row.LibraryID)
 	db.AddDeleteShareReadModelQuery(batch, row)
 	return batch.Exec()
 }
@@ -2443,6 +2645,8 @@ func (s *CassandraStore) HardDeleteLibrary(orgID, libraryID uuid.UUID) error {
 		return err
 	}
 
+	db.AddDeleteLibraryPolicyQuery(batch, db.GCLibraryPolicyVersionTTL, orgID.String(), libraryID.String())
+	db.AddDeleteLibraryPolicyQuery(batch, db.GCLibraryPolicyAutoDelete, orgID.String(), libraryID.String())
 	batch.Query(`DELETE FROM libraries WHERE org_id = ? AND library_id = ?`,
 		orgID.String(), libraryID.String())
 	batch.Query(`DELETE FROM libraries_by_id WHERE library_id = ?`,
@@ -2591,6 +2795,10 @@ func (s *CassandraStore) DeleteGroupFull(orgID, groupID uuid.UUID) error {
 	if err := shareIter.Close(); err != nil {
 		return err
 	}
+	shareRows, err = db.HydrateShareReadModelRows(session, shareRows)
+	if err != nil {
+		return err
+	}
 
 	// Delete members, shares, group record, and by_id lookup
 	batch := session.Batch(gocql.LoggedBatch)
@@ -2600,6 +2808,9 @@ func (s *CassandraStore) DeleteGroupFull(orgID, groupID uuid.UUID) error {
 	}
 	for _, share := range shareRows {
 		batch.Query(`DELETE FROM shares WHERE library_id = ? AND share_id = ?`, share.LibraryID, share.ShareID)
+		if share.ExpiresAt != nil {
+			db.AddDeleteShareExpiryQuery(batch, share.ShareID, *share.ExpiresAt, share.OrgID, share.LibraryID)
+		}
 		db.AddDeleteShareReadModelQuery(batch, share)
 	}
 	batch.Query(`DELETE FROM group_members WHERE group_id = ?`, groupID.String())

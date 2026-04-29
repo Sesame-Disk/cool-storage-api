@@ -1,6 +1,7 @@
 package db
 
 import (
+	"errors"
 	"time"
 
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
@@ -112,6 +113,28 @@ func AddDeleteShareReadModelQuery(batch *gocql.Batch, row ShareReadModelRow) {
 		DELETE FROM shares_by_recipient
 		WHERE org_id = ? AND shared_to_type = ? AND shared_to = ? AND created_at = ? AND library_id = ? AND share_id = ?
 	`, row.OrgID, row.SharedToType, row.SharedTo, row.CreatedAt, row.LibraryID, row.ShareID)
+}
+
+func HydrateShareReadModelRows(session *gocql.Session, rows []ShareReadModelRow) ([]ShareReadModelRow, error) {
+	if len(rows) == 0 {
+		return rows, nil
+	}
+
+	hydrated := make([]ShareReadModelRow, 0, len(rows))
+	for _, row := range rows {
+		canonical, err := ReadShareReadModelRow(session, row.LibraryID, row.ShareID)
+		if err == nil {
+			hydrated = append(hydrated, canonical)
+			continue
+		}
+		if errors.Is(err, gocql.ErrNotFound) {
+			hydrated = append(hydrated, row)
+			continue
+		}
+		return nil, err
+	}
+
+	return hydrated, nil
 }
 
 func SyncShareReadModel(session *gocql.Session, libraryID, shareID string) error {
