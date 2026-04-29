@@ -1178,9 +1178,6 @@ func (s *CassandraStore) ListExpiredShareLinks() ([]ExpiredShareLinkInfo, error)
 		}
 	}
 
-	if err := s.SaveGCStats(gcExpiredShareLinksCursorKey, db.GCProjectionDateString(cutoffDay)); err != nil {
-		return nil, err
-	}
 	return links, nil
 }
 
@@ -1188,7 +1185,7 @@ func (s *CassandraStore) loadExpiredShareLinksStartDay(cutoffDay time.Time) (tim
 	value, err := s.LoadGCStats(gcExpiredShareLinksCursorKey)
 	if err != nil {
 		if errors.Is(err, gocql.ErrNotFound) {
-			return cutoffDay, nil
+			return expiredShareLinksScanStartDay(time.Time{}, cutoffDay), nil
 		}
 		return time.Time{}, err
 	}
@@ -1196,7 +1193,14 @@ func (s *CassandraStore) loadExpiredShareLinksStartDay(cutoffDay time.Time) (tim
 	if err != nil {
 		return time.Time{}, err
 	}
-	return lastDay, nil
+	return expiredShareLinksScanStartDay(lastDay, cutoffDay), nil
+}
+
+func expiredShareLinksScanStartDay(lastProcessedDay, cutoffDay time.Time) time.Time {
+	if lastProcessedDay.IsZero() {
+		return cutoffDay
+	}
+	return lastProcessedDay
 }
 
 func (s *CassandraStore) ListDistinctCommitLibraries() ([]uuid.UUID, error) {
@@ -1624,9 +1628,6 @@ func (s *CassandraStore) ListExpiredShares() ([]ExpiredShareInfo, error) {
 		}
 	}
 
-	if err := s.SaveGCStats(gcExpiredSharesCursorKey, db.GCProjectionDateString(cutoffDay)); err != nil {
-		return nil, err
-	}
 	return results, nil
 }
 
@@ -1634,7 +1635,7 @@ func (s *CassandraStore) loadExpiredSharesStartDay(cutoffDay time.Time) (time.Ti
 	value, err := s.LoadGCStats(gcExpiredSharesCursorKey)
 	if err != nil {
 		if errors.Is(err, gocql.ErrNotFound) {
-			return cutoffDay, nil
+			return expiredSharesScanStartDay(time.Time{}, cutoffDay), nil
 		}
 		return time.Time{}, err
 	}
@@ -1642,7 +1643,14 @@ func (s *CassandraStore) loadExpiredSharesStartDay(cutoffDay time.Time) (time.Ti
 	if err != nil {
 		return time.Time{}, err
 	}
-	return lastDay, nil
+	return expiredSharesScanStartDay(lastDay, cutoffDay), nil
+}
+
+func expiredSharesScanStartDay(lastProcessedDay, cutoffDay time.Time) time.Time {
+	if lastProcessedDay.IsZero() {
+		return cutoffDay
+	}
+	return lastProcessedDay
 }
 
 func (s *CassandraStore) DeleteShare(libraryID, shareID uuid.UUID) error {
@@ -2225,10 +2233,6 @@ func (s *CassandraStore) ListDeletedUsersExpired(graceDays int) ([]DeletedUserIn
 				return nil, err
 			}
 		}
-	}
-
-	if err := s.SaveGCStats(gcDeletedUsersCursorKey, db.GCProjectionDateString(cutoffDay)); err != nil {
-		return nil, err
 	}
 
 	return result, nil

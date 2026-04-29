@@ -57,6 +57,15 @@ var (
 		[]string{"phase"},
 	)
 
+	// GCScannerActionsTotal counts direct cleanup/recovery actions performed by scanner phases.
+	GCScannerActionsTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "gc_scanner_actions_total",
+			Help: "Total number of direct actions performed by GC scanner phases.",
+		},
+		[]string{"phase", "action"},
+	)
+
 	// GCErrorsTotal counts item processing failures in the GC worker.
 	GCErrorsTotal = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
@@ -221,6 +230,7 @@ func Register() {
 		GCQueueSize,
 		GCItemsProcessedTotal,
 		GCItemsEnqueuedTotal,
+		GCScannerActionsTotal,
 		GCErrorsTotal,
 		GCItemsSkippedTotal,
 		GCLastWorkerRun,

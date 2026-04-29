@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/Sesame-Disk/sesamefs/internal/config"
+	"github.com/Sesame-Disk/sesamefs/internal/db"
 	"github.com/Sesame-Disk/sesamefs/internal/metrics"
 	"github.com/google/uuid"
 )
@@ -40,6 +41,26 @@ func NewScanner(store GCStore, queue *Queue, stats *Stats, cfg config.GCConfig) 
 // unset, the s3_orphan_recovery phase is a no-op (useful for mock-only tests).
 func (s *Scanner) SetOrphanRecoverer(r OrphanRecoverer) {
 	s.orphanRecoverer = r
+}
+
+func (s *Scanner) saveCursor(key string, day time.Time) error {
+	return s.store.SaveGCStats(key, db.GCProjectionDateString(day))
+}
+
+func expiredShareLinksCursorDay(now time.Time) time.Time {
+	return db.GCProjectionUTCDate(now)
+}
+
+func expiredSharesCursorDay(now time.Time) time.Time {
+	return db.GCProjectionUTCDate(now)
+}
+
+func deletedUsersCursorDay(now time.Time, graceDays int) time.Time {
+	return db.GCProjectionUTCDate(now.AddDate(0, 0, -graceDays))
+}
+
+func recordScannerAction(phase, action string, count int) {
+	metrics.GCScannerActionsTotal.WithLabelValues(phase, action).Add(float64(count))
 }
 
 // ScanOnce performs a full scan of all phases.
@@ -226,12 +247,14 @@ func (s *Scanner) scanOrphanedBlocks(ctx context.Context) (int, error) {
 func (s *Scanner) scanExpiredShareLinks(ctx context.Context) (int, error) {
 	log.Println("[GC Scanner] Phase 2: Scanning for expired share links...")
 
+	now := time.Now()
 	links, err := s.store.ListExpiredShareLinks()
 	if err != nil {
 		return 0, err
 	}
 
 	cleaned := 0
+	var phaseErr error
 	for _, link := range links {
 		select {
 		case <-ctx.Done():
@@ -239,15 +262,26 @@ func (s *Scanner) scanExpiredShareLinks(ctx context.Context) (int, error) {
 		default:
 		}
 
-		if err := s.store.DeleteExpiredShareLink(link); err == nil {
-			cleaned++
+		if err := s.store.DeleteExpiredShareLink(link); err != nil {
+			log.Printf("[GC Scanner] Phase 2: failed to delete expired share link %s: %v", link.ShareToken, err)
+			if phaseErr == nil {
+				phaseErr = err
+			}
+			continue
+		}
+		cleaned++
+	}
+
+	if phaseErr == nil {
+		if err := s.saveCursor(gcExpiredShareLinksCursorKey, expiredShareLinksCursorDay(now)); err != nil {
+			return cleaned, err
 		}
 	}
 
 	log.Printf("[GC Scanner] Phase 2 complete: cleaned %d expired share links", cleaned)
-	metrics.GCItemsEnqueuedTotal.WithLabelValues("expired_links").Add(float64(cleaned))
+	recordScannerAction("expired_links", "cleaned", cleaned)
 	metrics.GCScannerLastPhaseRun.WithLabelValues("expired_links").SetToCurrentTime()
-	return cleaned, nil
+	return cleaned, phaseErr
 }
 
 // scanOrphanedCommits finds commits whose library no longer exists.
@@ -548,12 +582,14 @@ func (s *Scanner) scanAutoDeleteExpiredObjects(ctx context.Context) (int, error)
 func (s *Scanner) scanExpiredShares(ctx context.Context) (int, error) {
 	log.Println("[GC Scanner] Phase 7: Scanning for expired user-to-user shares...")
 
+	now := time.Now()
 	shares, err := s.store.ListExpiredShares()
 	if err != nil {
 		return 0, err
 	}
 
 	enqueued := 0
+	var phaseErr error
 	for _, share := range shares {
 		select {
 		case <-ctx.Done():
@@ -562,15 +598,26 @@ func (s *Scanner) scanExpiredShares(ctx context.Context) (int, error) {
 		}
 
 		// Delete directly — shares are small metadata, no need for queue
-		if err := s.store.DeleteExpiredShare(share); err == nil {
-			enqueued++
+		if err := s.store.DeleteExpiredShare(share); err != nil {
+			log.Printf("[GC Scanner] Phase 7: failed to delete expired share %s for library %s: %v", share.ShareID, share.LibraryID, err)
+			if phaseErr == nil {
+				phaseErr = err
+			}
+			continue
+		}
+		enqueued++
+	}
+
+	if phaseErr == nil {
+		if err := s.saveCursor(gcExpiredSharesCursorKey, expiredSharesCursorDay(now)); err != nil {
+			return enqueued, err
 		}
 	}
 
 	log.Printf("[GC Scanner] Phase 7 complete: cleaned %d expired shares", enqueued)
-	metrics.GCItemsEnqueuedTotal.WithLabelValues("expired_shares").Add(float64(enqueued))
+	recordScannerAction("expired_shares", "cleaned", enqueued)
 	metrics.GCScannerLastPhaseRun.WithLabelValues("expired_shares").SetToCurrentTime()
-	return enqueued, nil
+	return enqueued, phaseErr
 }
 
 // scanExpiredRestoreJobs finds completed/expired Glacier restore jobs.
@@ -597,7 +644,7 @@ func (s *Scanner) scanExpiredRestoreJobs(ctx context.Context) (int, error) {
 	}
 
 	log.Printf("[GC Scanner] Phase 8 complete: cleaned %d expired restore jobs", enqueued)
-	metrics.GCItemsEnqueuedTotal.WithLabelValues("expired_restore_jobs").Add(float64(enqueued))
+	recordScannerAction("expired_restore_jobs", "cleaned", enqueued)
 	metrics.GCScannerLastPhaseRun.WithLabelValues("expired_restore_jobs").SetToCurrentTime()
 	return enqueued, nil
 }
@@ -644,7 +691,7 @@ func (s *Scanner) scanOrphanedGroupShares(ctx context.Context) (int, error) {
 	}
 
 	log.Printf("[GC Scanner] Phase 9 complete: cleaned %d orphaned group shares", cleaned)
-	metrics.GCItemsEnqueuedTotal.WithLabelValues("orphaned_group_shares").Add(float64(cleaned))
+	recordScannerAction("orphaned_group_shares", "cleaned", cleaned)
 	metrics.GCScannerLastPhaseRun.WithLabelValues("orphaned_group_shares").SetToCurrentTime()
 	return cleaned, nil
 }
@@ -654,6 +701,7 @@ func (s *Scanner) scanOrphanedGroupShares(ctx context.Context) (int, error) {
 func (s *Scanner) scanExpiredDeletedUsers(ctx context.Context) (int, error) {
 	log.Println("[GC Scanner] Phase 10: Scanning for expired deleted users...")
 
+	now := time.Now()
 	users, err := s.store.ListDeletedUsersExpired(s.config.UserGraceDays)
 	if err != nil {
 		return 0, err
@@ -661,10 +709,14 @@ func (s *Scanner) scanExpiredDeletedUsers(ctx context.Context) (int, error) {
 
 	enqueued := 0
 	var batch []QueueItem
+	var phaseErr error
 	for _, u := range users {
 		exists, err := s.store.QueueItemExists(u.OrgID, u.DeletedAt, ItemUserCascade, u.UserID.String())
 		if err != nil {
 			log.Printf("[GC Scanner] Phase 10: failed to dedupe expired deleted user %s: %v", u.UserID, err)
+			if phaseErr == nil {
+				phaseErr = err
+			}
 			continue
 		}
 		if exists {
@@ -680,15 +732,24 @@ func (s *Scanner) scanExpiredDeletedUsers(ctx context.Context) (int, error) {
 	if len(batch) > 0 {
 		if err := s.queue.EnqueueBatch(batch); err != nil {
 			log.Printf("[GC Scanner] Phase 10: failed to enqueue expired deleted users: %v", err)
+			if phaseErr == nil {
+				phaseErr = err
+			}
 		} else {
 			enqueued = len(batch)
+		}
+	}
+
+	if phaseErr == nil {
+		if err := s.saveCursor(gcDeletedUsersCursorKey, deletedUsersCursorDay(now, s.config.UserGraceDays)); err != nil {
+			return enqueued, err
 		}
 	}
 
 	log.Printf("[GC Scanner] Phase 10 complete: enqueued %d expired deleted users", enqueued)
 	metrics.GCItemsEnqueuedTotal.WithLabelValues("expired_deleted_users").Add(float64(enqueued))
 	metrics.GCScannerLastPhaseRun.WithLabelValues("expired_deleted_users").SetToCurrentTime()
-	return enqueued, nil
+	return enqueued, phaseErr
 }
 
 // scanExpiredDeletedLibraries finds soft-deleted libraries whose trash retention
@@ -790,7 +851,7 @@ func (s *Scanner) scanS3OrphanRecovery(ctx context.Context) (int, error) {
 		log.Printf("[GC Scanner] Phase 13: recovery error: %v", err)
 	}
 	log.Printf("[GC Scanner] Phase 13 complete: recovered %d S3 orphans", recovered)
-	metrics.GCItemsEnqueuedTotal.WithLabelValues("s3_orphan_recovery").Add(float64(recovered))
+	recordScannerAction("s3_orphan_recovery", "recovered", recovered)
 	metrics.GCScannerLastPhaseRun.WithLabelValues("s3_orphan_recovery").SetToCurrentTime()
 	return recovered, err
 }

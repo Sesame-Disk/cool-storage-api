@@ -61,6 +61,104 @@ type shareRecipientState struct {
 	Permission string
 }
 
+func TestShareLinkGCProjection_UpdateExpirationRekeysProjection(t *testing.T) {
+	repoName := fmt.Sprintf("inttest-share-link-gc-update-%d", time.Now().UnixNano())
+	repoID := createTestLibrary(t, adminClient, repoName)
+	oldExpiry := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Second)
+	newExpiry := time.Now().Add(48 * time.Hour).UTC().Truncate(time.Second)
+
+	resp := adminClient.PostJSON(t, "/api/v2.1/share-links/", map[string]interface{}{
+		"repo_id":         repoID,
+		"path":            "/",
+		"permissions":     "preview_download",
+		"expiration_time": oldExpiry.Format(time.RFC3339),
+	})
+	expectStatus(t, resp, http.StatusOK)
+	payload := responseJSON(t, resp)
+	token, _ := payload["token"].(string)
+	if token == "" {
+		t.Fatalf("expected share link token, got %v", payload)
+	}
+
+	t.Cleanup(func() {
+		cleanupResp := adminClient.Delete(t, "/api/v2.1/org/admin/links/"+token+"/")
+		if cleanupResp.StatusCode == http.StatusOK || cleanupResp.StatusCode == http.StatusNotFound {
+			cleanupResp.Body.Close()
+			return
+		}
+		body := responseBody(t, cleanupResp)
+		t.Errorf("cleanup delete share link %s failed: status=%d body=%s", token, cleanupResp.StatusCode, body)
+	})
+
+	waitForIntegrationCondition(t, "share link GC projection after create", func() bool {
+		return shareLinkGCProjectionExists(t, token, oldExpiry)
+	})
+
+	updateResp := adminClient.PutJSON(t, "/api/v2.1/share-links/"+token+"/", map[string]interface{}{
+		"expiration_time": newExpiry.Format(time.RFC3339),
+	})
+	expectStatus(t, updateResp, http.StatusOK)
+	updateResp.Body.Close()
+
+	waitForIntegrationCondition(t, "share link GC projection after expiration update", func() bool {
+		canonicalExpiry, ok := canonicalShareLinkExpiry(t, token)
+		if !ok || !canonicalExpiry.Equal(newExpiry) {
+			return false
+		}
+		if shareLinkGCProjectionExists(t, token, oldExpiry) {
+			return false
+		}
+		return shareLinkGCProjectionExists(t, token, newExpiry)
+	})
+
+	triggerGCScannerAndWait(t)
+
+	waitForIntegrationCondition(t, "scanner preserves updated share link and future GC projection", func() bool {
+		canonicalExpiry, ok := canonicalShareLinkExpiry(t, token)
+		if !ok || !canonicalExpiry.Equal(newExpiry) {
+			return false
+		}
+		if shareLinkGCProjectionExists(t, token, oldExpiry) {
+			return false
+		}
+		return shareLinkGCProjectionExists(t, token, newExpiry)
+	})
+}
+
+func TestShareLinkGCProjection_DeleteRemovesProjection(t *testing.T) {
+	repoName := fmt.Sprintf("inttest-share-link-gc-delete-%d", time.Now().UnixNano())
+	repoID := createTestLibrary(t, adminClient, repoName)
+	expiresAt := time.Now().Add(24 * time.Hour).UTC().Truncate(time.Second)
+
+	resp := adminClient.PostJSON(t, "/api/v2.1/share-links/", map[string]interface{}{
+		"repo_id":         repoID,
+		"path":            "/",
+		"permissions":     "preview_download",
+		"expiration_time": expiresAt.Format(time.RFC3339),
+	})
+	expectStatus(t, resp, http.StatusOK)
+	payload := responseJSON(t, resp)
+	token, _ := payload["token"].(string)
+	if token == "" {
+		t.Fatalf("expected share link token, got %v", payload)
+	}
+
+	waitForIntegrationCondition(t, "share link GC projection before delete", func() bool {
+		return shareLinkGCProjectionExists(t, token, expiresAt)
+	})
+
+	deleteResp := adminClient.Delete(t, "/api/v2.1/org/admin/links/"+token+"/")
+	expectStatus(t, deleteResp, http.StatusOK)
+	deleteResp.Body.Close()
+
+	waitForIntegrationCondition(t, "share link GC projection after delete", func() bool {
+		if _, ok := canonicalShareLinkExpiry(t, token); ok {
+			return false
+		}
+		return !shareLinkGCProjectionExists(t, token, expiresAt)
+	})
+}
+
 func TestShareProjectionConsistency_UserShareLifecycle(t *testing.T) {
 	repoName := fmt.Sprintf("inttest-share-user-%d", time.Now().UnixNano())
 	repoID := createTestLibrary(t, adminClient, repoName)
@@ -419,6 +517,44 @@ func scanFound(t *testing.T, err error, table string, keyParts ...string) bool {
 	}
 	t.Fatalf("query %s for %s failed: %v", table, strings.Join(keyParts, "/"), err)
 	return false
+}
+
+func shareLinkGCProjectionExists(t *testing.T, token string, expiresAt time.Time) bool {
+	t.Helper()
+
+	var stored time.Time
+	err := shareProjectionDBForTest(t).Session().Query(`
+		SELECT expires_at FROM gc_share_links_by_expiry
+		WHERE expiry_day = ? AND bucket = ? AND expires_at = ? AND link_token = ?
+	`, dbpkg.GCProjectionUTCDate(expiresAt), dbpkg.GCDiscoveryBucket(token), expiresAt.UTC(), token).Scan(&stored)
+	return scanFound(
+		t,
+		err,
+		"gc_share_links_by_expiry",
+		dbpkg.GCProjectionDateString(expiresAt),
+		fmt.Sprintf("%d", dbpkg.GCDiscoveryBucket(token)),
+		token,
+	)
+}
+
+func canonicalShareLinkExpiry(t *testing.T, token string) (time.Time, bool) {
+	t.Helper()
+
+	var expiresAt *time.Time
+	err := shareProjectionDBForTest(t).Session().Query(`
+		SELECT expires_at FROM share_links WHERE link_token = ?
+	`, token).Scan(&expiresAt)
+	if err == nil {
+		if expiresAt == nil || expiresAt.IsZero() {
+			return time.Time{}, false
+		}
+		return expiresAt.UTC().Truncate(time.Second), true
+	}
+	if errors.Is(err, gocql.ErrNotFound) {
+		return time.Time{}, false
+	}
+	t.Fatalf("query share_links for %s failed: %v", token, err)
+	return time.Time{}, false
 }
 
 func shareProjectionDBForTest(t *testing.T) *dbpkg.DB {

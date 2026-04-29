@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/Sesame-Disk/sesamefs/internal/config"
+	"github.com/Sesame-Disk/sesamefs/internal/db"
 	"github.com/Sesame-Disk/sesamefs/internal/traffic"
 	"github.com/google/uuid"
 )
@@ -204,6 +205,52 @@ func TestScanner_ScanExpiredShareLinks(t *testing.T) {
 	}
 	if _, ok := store.shareLinks["token-permanent"]; !ok {
 		t.Fatalf("expected permanent share link to remain")
+	}
+
+	gotCursor, err := store.LoadGCStats(gcExpiredShareLinksCursorKey)
+	if err != nil {
+		t.Fatalf("LoadGCStats() failed: %v", err)
+	}
+	wantCursor := db.GCProjectionDateString(expiredShareLinksCursorDay(time.Now()))
+	if gotCursor != wantCursor {
+		t.Fatalf("share links cursor = %q, want %q", gotCursor, wantCursor)
+	}
+}
+
+func TestScanner_ScanExpiredShareLinks_DeleteFailureKeepsCursorUnchanged(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	s := NewScanner(store, q, stats, config.GCConfig{})
+
+	orgID := uuid.New()
+	store.AddOrganization(orgID)
+	store.AddShareLink("token-expired", orgID, time.Now().Add(-24*time.Hour))
+	store.deleteExpiredShareLinkErr = fmt.Errorf("delete failed")
+	previousCursor := db.GCProjectionDateString(expiredShareLinksCursorDay(time.Now().AddDate(0, 0, -1)))
+	if err := store.SaveGCStats(gcExpiredShareLinksCursorKey, previousCursor); err != nil {
+		t.Fatalf("SaveGCStats() failed: %v", err)
+	}
+
+	cleaned, err := s.scanExpiredShareLinks(context.Background())
+	if err == nil {
+		t.Fatal("scanExpiredShareLinks() error = nil, want non-nil")
+	}
+	if cleaned != 0 {
+		t.Fatalf("scanExpiredShareLinks() cleaned = %d, want 0", cleaned)
+	}
+	if _, ok := store.shareLinks["token-expired"]; !ok {
+		t.Fatal("expired share link should remain after delete failure")
+	}
+	gotCursor, err := store.LoadGCStats(gcExpiredShareLinksCursorKey)
+	if err != nil {
+		t.Fatalf("LoadGCStats() failed: %v", err)
+	}
+	if gotCursor != previousCursor {
+		t.Fatalf("share links cursor = %q, want unchanged %q", gotCursor, previousCursor)
+	}
+	if store.QueueLen() != 0 {
+		t.Fatalf("delete failure should not enqueue GC items, got %d", store.QueueLen())
 	}
 }
 
@@ -825,6 +872,52 @@ func TestScanner_ScanExpiredShares(t *testing.T) {
 	if len(shares) != 0 {
 		t.Errorf("expected 0 expired shares after cleanup, got %d", len(shares))
 	}
+
+	gotCursor, err := store.LoadGCStats(gcExpiredSharesCursorKey)
+	if err != nil {
+		t.Fatalf("LoadGCStats() failed: %v", err)
+	}
+	wantCursor := db.GCProjectionDateString(expiredSharesCursorDay(time.Now()))
+	if gotCursor != wantCursor {
+		t.Fatalf("expired shares cursor = %q, want %q", gotCursor, wantCursor)
+	}
+}
+
+func TestScanner_ScanExpiredShares_DeleteFailureKeepsCursorUnchanged(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	s := NewScanner(store, q, stats, config.GCConfig{})
+
+	orgID := uuid.New()
+	libID := uuid.New()
+	shareID := uuid.New()
+	store.AddOrganization(orgID)
+	store.AddLibrary(orgID, libID, "hot")
+	store.AddShare(libID, shareID, uuid.New(), time.Now().Add(-24*time.Hour))
+	store.deleteExpiredShareErr = fmt.Errorf("delete failed")
+	previousCursor := db.GCProjectionDateString(expiredSharesCursorDay(time.Now().AddDate(0, 0, -1)))
+	if err := store.SaveGCStats(gcExpiredSharesCursorKey, previousCursor); err != nil {
+		t.Fatalf("SaveGCStats() failed: %v", err)
+	}
+
+	cleaned, err := s.scanExpiredShares(context.Background())
+	if err == nil {
+		t.Fatal("scanExpiredShares() error = nil, want non-nil")
+	}
+	if cleaned != 0 {
+		t.Fatalf("scanExpiredShares() cleaned = %d, want 0", cleaned)
+	}
+	if !store.HasShare(libID, shareID) {
+		t.Fatal("expired share should remain after delete failure")
+	}
+	gotCursor, err := store.LoadGCStats(gcExpiredSharesCursorKey)
+	if err != nil {
+		t.Fatalf("LoadGCStats() failed: %v", err)
+	}
+	if gotCursor != previousCursor {
+		t.Fatalf("expired shares cursor = %q, want unchanged %q", gotCursor, previousCursor)
+	}
 }
 
 func TestScanner_ScanExpiredRestoreJobs(t *testing.T) {
@@ -968,6 +1061,68 @@ func TestScanner_ScanExpiredDeletedUsers_DeduplicatesAcrossRuns(t *testing.T) {
 	}
 	if n, err := s.scanExpiredDeletedUsers(context.Background()); err != nil || n != 0 {
 		t.Fatalf("second scanExpiredDeletedUsers = (%d, %v), want (0, nil)", n, err)
+	}
+}
+
+func TestScanner_ScanExpiredDeletedUsers_AdvancesCursorOnSuccess(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	s := NewScanner(store, q, stats, config.GCConfig{UserGraceDays: 7})
+
+	orgID := uuid.New()
+	store.AddOrganization(orgID)
+	store.AddDeletedUser(orgID, uuid.New(), "expired@test.com", time.Now().AddDate(0, 0, -10))
+
+	enqueued, err := s.scanExpiredDeletedUsers(context.Background())
+	if err != nil {
+		t.Fatalf("scanExpiredDeletedUsers() failed: %v", err)
+	}
+	if enqueued != 1 {
+		t.Fatalf("scanExpiredDeletedUsers() enqueued = %d, want 1", enqueued)
+	}
+	gotCursor, err := store.LoadGCStats(gcDeletedUsersCursorKey)
+	if err != nil {
+		t.Fatalf("LoadGCStats() failed: %v", err)
+	}
+	wantCursor := db.GCProjectionDateString(deletedUsersCursorDay(time.Now(), 7))
+	if gotCursor != wantCursor {
+		t.Fatalf("deleted users cursor = %q, want %q", gotCursor, wantCursor)
+	}
+}
+
+func TestScanner_ScanExpiredDeletedUsers_EnqueueFailureKeepsCursorUnchanged(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	s := NewScanner(store, q, stats, config.GCConfig{UserGraceDays: 7})
+
+	orgID := uuid.New()
+	store.AddOrganization(orgID)
+	deletedAt := time.Now().AddDate(0, 0, -10)
+	store.AddDeletedUser(orgID, uuid.New(), "expired@test.com", deletedAt)
+	store.enqueueBatchErr = fmt.Errorf("enqueue failed")
+	previousCursor := db.GCProjectionDateString(deletedUsersCursorDay(time.Now().AddDate(0, 0, -1), 7))
+	if err := store.SaveGCStats(gcDeletedUsersCursorKey, previousCursor); err != nil {
+		t.Fatalf("SaveGCStats() failed: %v", err)
+	}
+
+	enqueued, err := s.scanExpiredDeletedUsers(context.Background())
+	if err == nil {
+		t.Fatal("scanExpiredDeletedUsers() error = nil, want non-nil")
+	}
+	if enqueued != 0 {
+		t.Fatalf("scanExpiredDeletedUsers() enqueued = %d, want 0", enqueued)
+	}
+	if store.QueueLen() != 0 {
+		t.Fatalf("queue should remain empty after enqueue failure, got %d items", store.QueueLen())
+	}
+	gotCursor, err := store.LoadGCStats(gcDeletedUsersCursorKey)
+	if err != nil {
+		t.Fatalf("LoadGCStats() failed: %v", err)
+	}
+	if gotCursor != previousCursor {
+		t.Fatalf("deleted users cursor = %q, want unchanged %q", gotCursor, previousCursor)
 	}
 }
 

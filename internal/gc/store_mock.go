@@ -111,6 +111,14 @@ type MockStore struct {
 	// gc_stats keyed by stat_key
 	gcStats map[string]string
 
+	// scanner-phase test hooks.
+	enqueueBatchErr            error
+	listExpiredShareLinksErr   error
+	deleteExpiredShareLinkErr  error
+	listExpiredSharesErr       error
+	deleteExpiredShareErr      error
+	listDeletedUsersExpiredErr error
+
 	// optional test hooks for reproducing concurrency windows deterministically.
 	getQueueSizeHook      func(orgID uuid.UUID, size int)
 	removeActiveOrgHook   func(orgID uuid.UUID, activeBefore time.Time)
@@ -744,6 +752,9 @@ func (m *MockStore) EnqueueItem(orgID uuid.UUID, queuedAt time.Time, itemType It
 func (m *MockStore) EnqueueBatch(items []QueueItem) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.enqueueBatchErr != nil {
+		return m.enqueueBatchErr
+	}
 	for _, item := range items {
 		m.queue[item.OrgID] = append(m.queue[item.OrgID], item)
 		m.activeQueueOrgs[item.OrgID] = time.Now().UTC()
@@ -1463,6 +1474,9 @@ func (m *MockStore) ListBlocksForOrg(orgID uuid.UUID) ([]BlockInfo, error) {
 func (m *MockStore) ListExpiredShareLinks() ([]ExpiredShareLinkInfo, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
+	if m.listExpiredShareLinksErr != nil {
+		return nil, m.listExpiredShareLinksErr
+	}
 
 	now := time.Now()
 	var links []ExpiredShareLinkInfo
@@ -1684,6 +1698,9 @@ func (m *MockStore) DeleteShareLink(shareToken string, orgID uuid.UUID, libraryI
 func (m *MockStore) DeleteExpiredShareLink(link ExpiredShareLinkInfo) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.deleteExpiredShareLinkErr != nil {
+		return m.deleteExpiredShareLinkErr
+	}
 	delete(m.shareLinks, link.ShareToken)
 	return nil
 }
@@ -1693,6 +1710,9 @@ func (m *MockStore) DeleteExpiredShareLink(link ExpiredShareLinkInfo) error {
 func (m *MockStore) ListExpiredShares() ([]ExpiredShareInfo, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
+	if m.listExpiredSharesErr != nil {
+		return nil, m.listExpiredSharesErr
+	}
 
 	now := time.Now()
 	var results []ExpiredShareInfo
@@ -1724,6 +1744,9 @@ func (m *MockStore) DeleteShare(libraryID, shareID uuid.UUID) error {
 func (m *MockStore) DeleteExpiredShare(share ExpiredShareInfo) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.deleteExpiredShareErr != nil {
+		return m.deleteExpiredShareErr
+	}
 	key := fmt.Sprintf("%s:%s", share.LibraryID, share.ShareID)
 	delete(m.shares, key)
 	return nil
@@ -1980,6 +2003,9 @@ func (m *MockStore) HardDeleteLibrary(orgID, libraryID uuid.UUID) error {
 func (m *MockStore) ListDeletedUsersExpired(graceDays int) ([]DeletedUserInfo, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
+	if m.listDeletedUsersExpiredErr != nil {
+		return nil, m.listDeletedUsersExpiredErr
+	}
 	cutoff := time.Now().AddDate(0, 0, -graceDays)
 	var result []DeletedUserInfo
 	for _, u := range m.users {
