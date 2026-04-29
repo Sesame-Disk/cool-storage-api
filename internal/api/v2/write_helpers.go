@@ -653,7 +653,8 @@ func setOrgShareLinksActive(db interface{ Session() *gocql.Session }, orgID stri
 // Keeps the DB clean — consumed single-use links are permanently gone.
 func deleteConsumedShareLink(db interface{ Session() *gocql.Session }, token, orgID, libraryID, createdBy string, createdAt time.Time) {
 	var linkType string
-	if err := db.Session().Query(`SELECT link_type FROM share_links WHERE link_token = ?`, token).Scan(&linkType); err != nil {
+	var expiresAt *time.Time
+	if err := db.Session().Query(`SELECT link_type, expires_at FROM share_links WHERE link_token = ?`, token).Scan(&linkType, &expiresAt); err != nil {
 		log.Printf("[deleteConsumedShareLink] lookup failed for token %s: %v", token, err)
 		return
 	}
@@ -664,6 +665,9 @@ func deleteConsumedShareLink(db interface{ Session() *gocql.Session }, token, or
 		orgID, createdBy, createdAt, token)
 	batch.Query(`DELETE FROM share_links_by_library WHERE org_id = ? AND library_id = ? AND link_token = ?`,
 		orgID, libraryID, token)
+	if expiresAt != nil && !expiresAt.IsZero() {
+		dbpkg.AddDeleteShareLinkExpiryQuery(batch, token, *expiresAt)
+	}
 	dbpkg.AddDeleteAdminLinkReadModelQuery(batch, linkType, createdAt, orgID, token)
 	if err := batch.Exec(); err != nil {
 		log.Printf("[deleteConsumedShareLink] failed for token %s: %v", token, err)

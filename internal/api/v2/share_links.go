@@ -257,6 +257,9 @@ func (h *ShareLinkHandler) insertShareLink(
 			) VALUES (?, ?, ?, ?, ?, ?)
 		`, orgID, libraryID, token, linkType, createdBy, createdAt)
 	}
+	if expiresAt != nil {
+		db.AddUpsertShareLinkExpiryQuery(batch, token, orgID, libraryID, createdBy, linkType, createdAt, *expiresAt)
+	}
 	repoName, objName, creatorEmail, creatorName := db.ResolveAdminLinkDisplayFields(h.db.Session(), orgID, libraryID, filePath, createdBy)
 	db.AddUpsertAdminLinkReadModelQuery(
 		batch,
@@ -291,7 +294,8 @@ func (h *ShareLinkHandler) insertShareLink(
 // Requires createdAt for the clustering key in _by_creator.
 func (h *ShareLinkHandler) deleteShareLink(token, orgID, createdBy, libraryID string, createdAt time.Time) error {
 	var linkType string
-	if err := h.db.Session().Query(`SELECT link_type FROM share_links WHERE link_token = ?`, token).Scan(&linkType); err != nil {
+	var expiresAt *time.Time
+	if err := h.db.Session().Query(`SELECT link_type, expires_at FROM share_links WHERE link_token = ?`, token).Scan(&linkType, &expiresAt); err != nil {
 		return err
 	}
 
@@ -301,6 +305,9 @@ func (h *ShareLinkHandler) deleteShareLink(token, orgID, createdBy, libraryID st
 		orgID, createdBy, createdAt, token)
 	batch.Query(`DELETE FROM share_links_by_library WHERE org_id = ? AND library_id = ? AND link_token = ?`,
 		orgID, libraryID, token)
+	if expiresAt != nil && !expiresAt.IsZero() {
+		db.AddDeleteShareLinkExpiryQuery(batch, token, *expiresAt)
+	}
 	db.AddDeleteAdminLinkReadModelQuery(batch, linkType, createdAt, orgID, token)
 	if err := batch.Exec(); err != nil {
 		return err

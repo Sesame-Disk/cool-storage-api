@@ -60,6 +60,8 @@ type CassandraStore struct {
 	db *db.DB
 }
 
+const gcDeletedUsersCursorKey = "gc.scan.expired_deleted_users.last_deleted_day"
+
 // NewCassandraStore creates a new CassandraStore.
 func NewCassandraStore(database *db.DB) *CassandraStore {
 	return &CassandraStore{db: database}
@@ -1423,9 +1425,10 @@ func (s *CassandraStore) DeleteShareLink(shareToken string, fallbackOrgID uuid.U
 	// Read clustering keys from primary table for canonical delete + projection cleanup
 	var orgID, createdBy, libraryID, linkType string
 	var createdAt time.Time
+	var expiresAt *time.Time
 	err := s.db.Session().Query(`
-		SELECT org_id, created_by, library_id, created_at, link_type FROM share_links WHERE link_token = ?
-	`, shareToken).Scan(&orgID, &createdBy, &libraryID, &createdAt, &linkType)
+		SELECT org_id, created_by, library_id, created_at, link_type, expires_at FROM share_links WHERE link_token = ?
+	`, shareToken).Scan(&orgID, &createdBy, &libraryID, &createdAt, &linkType, &expiresAt)
 	if err != nil {
 		// Primary record is gone. Attempt defensive cleanup of index tables
 		// using the fallback org/library IDs from the queue item. This prevents
@@ -1445,6 +1448,9 @@ func (s *CassandraStore) DeleteShareLink(shareToken string, fallbackOrgID uuid.U
 		orgID, createdBy, createdAt, shareToken)
 	batch.Query(`DELETE FROM share_links_by_library WHERE org_id = ? AND library_id = ? AND link_token = ?`,
 		orgID, libraryID, shareToken)
+	if expiresAt != nil && !expiresAt.IsZero() {
+		db.AddDeleteShareLinkExpiryQuery(batch, shareToken, *expiresAt)
+	}
 	db.AddDeleteAdminLinkReadModelQuery(batch, linkType, createdAt, orgID, shareToken)
 	if err := batch.Exec(); err != nil {
 		return err
@@ -1689,12 +1695,19 @@ func (s *CassandraStore) DeleteShareLinksByLibrary(orgID, libraryID uuid.UUID) (
 
 	var deletedTokens []string
 	for _, link := range links {
+		var expiresAt *time.Time
+		if err := s.db.Session().Query(`SELECT expires_at FROM share_links WHERE link_token = ?`, link.token).Scan(&expiresAt); err != nil && !errors.Is(err, gocql.ErrNotFound) {
+			continue
+		}
 		batch := s.db.Session().Batch(gocql.LoggedBatch)
 		batch.Query(`DELETE FROM share_links WHERE link_token = ?`, link.token)
 		batch.Query(`DELETE FROM share_links_by_creator WHERE org_id = ? AND created_by = ? AND created_at = ? AND link_token = ?`,
 			orgID.String(), link.createdBy, link.createdAt, link.token)
 		batch.Query(`DELETE FROM share_links_by_library WHERE org_id = ? AND library_id = ? AND link_token = ?`,
 			orgID.String(), libraryID.String(), link.token)
+		if expiresAt != nil && !expiresAt.IsZero() {
+			db.AddDeleteShareLinkExpiryQuery(batch, link.token, *expiresAt)
+		}
 		db.AddDeleteAdminLinkReadModelQuery(batch, link.linkType, link.createdAt, orgID.String(), link.token)
 		if err := batch.Exec(); err == nil {
 			db.BestEffortAdjustAdminOrgLinkCount(s.db.Session(), orgID.String(), link.linkType, db.AdminOrgLinkCountDelta(-1))
@@ -1950,46 +1963,97 @@ func (s *CassandraStore) LoadGCStats(key string) (string, error) {
 
 func (s *CassandraStore) ListDeletedUsersExpired(graceDays int) ([]DeletedUserInfo, error) {
 	cutoff := time.Now().AddDate(0, 0, -graceDays)
+	cutoffDay := db.GCProjectionUTCDate(cutoff)
+	startDay, err := s.loadDeletedUsersStartDay(cutoffDay)
+	if err != nil {
+		return nil, err
+	}
+	if startDay.After(cutoffDay) {
+		return nil, nil
+	}
 
-	// Scan all orgs for users with status='deleted' and deleted_at before cutoff
-	orgIter := s.db.Session().Query(`SELECT org_id FROM organizations`).Iter()
-	var orgIDStr string
 	var result []DeletedUserInfo
+	for day := startDay; !day.After(cutoffDay); day = day.AddDate(0, 0, 1) {
+		for bucket := 0; bucket < db.GCDiscoveryBucketCount; bucket++ {
+			iter := s.db.Session().Query(`
+				SELECT deleted_at, org_id, user_id
+				FROM gc_deleted_users_by_deleted_day
+				WHERE deleted_day = ? AND bucket = ?
+			`, day, bucket).Iter()
 
-	for orgIter.Scan(&orgIDStr) {
-		orgID, err := uuid.Parse(orgIDStr)
-		if err != nil {
-			continue
-		}
+			var deletedAt time.Time
+			var orgIDStr, userIDStr string
+			for iter.Scan(&deletedAt, &orgIDStr, &userIDStr) {
+				orgID, err := uuid.Parse(orgIDStr)
+				if err != nil {
+					continue
+				}
+				userID, err := uuid.Parse(userIDStr)
+				if err != nil {
+					continue
+				}
 
-		iter := s.db.Session().Query(`
-			SELECT user_id, email, status, deleted_at FROM users WHERE org_id = ?
-		`, orgIDStr).Iter()
+				var email, status string
+				var canonicalDeletedAt *time.Time
+				err = s.db.Session().Query(`
+					SELECT email, status, deleted_at FROM users WHERE org_id = ? AND user_id = ?
+				`, orgIDStr, userIDStr).Scan(&email, &status, &canonicalDeletedAt)
+				if errors.Is(err, gocql.ErrNotFound) {
+					continue
+				}
+				if err != nil {
+					iter.Close()
+					return nil, err
+				}
+				if status != "deleted" || canonicalDeletedAt == nil || canonicalDeletedAt.IsZero() {
+					continue
+				}
+				if !canonicalDeletedAt.UTC().Equal(deletedAt.UTC()) || canonicalDeletedAt.After(cutoff) {
+					continue
+				}
 
-		var userIDStr, email, status string
-		var deletedAt *time.Time
-		for iter.Scan(&userIDStr, &email, &status, &deletedAt) {
-			if status != "deleted" || deletedAt == nil || deletedAt.IsZero() {
-				continue
-			}
-			userID, err := uuid.Parse(userIDStr)
-			if err != nil {
-				continue
-			}
-			if deletedAt.Before(cutoff) {
 				result = append(result, DeletedUserInfo{
 					OrgID:     orgID,
 					UserID:    userID,
 					Email:     email,
-					DeletedAt: *deletedAt,
+					DeletedAt: canonicalDeletedAt.UTC(),
 				})
 			}
+			if err := iter.Close(); err != nil {
+				return nil, err
+			}
 		}
-		iter.Close()
 	}
-	orgIter.Close()
+
+	if err := s.SaveGCStats(gcDeletedUsersCursorKey, db.GCProjectionDateString(cutoffDay)); err != nil {
+		return nil, err
+	}
 
 	return result, nil
+}
+
+func (s *CassandraStore) loadDeletedUsersStartDay(cutoffDay time.Time) (time.Time, error) {
+	value, err := s.LoadGCStats(gcDeletedUsersCursorKey)
+	if err != nil {
+		if errors.Is(err, gocql.ErrNotFound) {
+			return cutoffDay, nil
+		}
+		return time.Time{}, err
+	}
+	lastDay, err := db.ParseGCProjectionDate(value)
+	if err != nil {
+		return time.Time{}, err
+	}
+	return deletedUsersScanStartDay(lastDay, cutoffDay), nil
+}
+
+func deletedUsersScanStartDay(lastProcessedDay, cutoffDay time.Time) time.Time {
+	// Re-scan the last processed day so same-day deletes remain visible even if
+	// another scanner/test already advanced the shared cursor in gc_stats.
+	if lastProcessedDay.IsZero() {
+		return cutoffDay
+	}
+	return lastProcessedDay
 }
 
 func (s *CassandraStore) ListLibrariesByOwner(orgID, ownerID uuid.UUID) ([]uuid.UUID, error) {
@@ -2244,6 +2308,13 @@ func (s *CassandraStore) buildAdminOrganizationProjectionRowAfterUserDelete(orgI
 
 func (s *CassandraStore) HardDeleteUser(orgID, userID uuid.UUID, email string) error {
 	session := s.db.Session()
+	var deletedAt *time.Time
+	deletedAtErr := session.Query(`
+		SELECT deleted_at FROM users WHERE org_id = ? AND user_id = ?
+	`, orgID.String(), userID.String()).Scan(&deletedAt)
+	if deletedAtErr != nil && !errors.Is(deletedAtErr, gocql.ErrNotFound) {
+		return deletedAtErr
+	}
 
 	userState, err := db.ReadAdminUserProjectionState(session, userID.String())
 	hasUserState := err == nil
@@ -2270,6 +2341,9 @@ func (s *CassandraStore) HardDeleteUser(orgID, userID uuid.UUID, email string) e
 	batch.Query(`
 		DELETE FROM users WHERE org_id = ? AND user_id = ?
 	`, orgID.String(), userID.String())
+	if deletedAtErr == nil && deletedAt != nil && !deletedAt.IsZero() {
+		db.AddDeleteDeletedUserDiscoveryQuery(batch, orgID.String(), userID.String(), *deletedAt)
+	}
 	if email != "" {
 		batch.Query(`
 			DELETE FROM users_by_email WHERE email = ?

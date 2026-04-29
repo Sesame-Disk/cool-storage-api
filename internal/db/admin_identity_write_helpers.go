@@ -7,7 +7,10 @@ import (
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
 )
 
-const adminIdentityStatusActive = "active"
+const (
+	adminIdentityStatusActive  = "active"
+	adminIdentityStatusDeleted = "deleted"
+)
 
 type AdminOrganizationWriteSpec struct {
 	OrgID                  string
@@ -181,6 +184,11 @@ func CreateUserWithLookupsAndReadModels(session *gocql.Session, user AdminUserWr
 }
 
 func UpdateUserAndAdminReadModels(session *gocql.Session, orgID, userID string, next AdminUserUpdateSpec) error {
+	canonicalState, err := readAdminCanonicalUserState(session, orgID, userID)
+	if err != nil {
+		return err
+	}
+
 	previousUserState, previousUserStateErr := ReadAdminUserProjectionState(session, userID)
 	if previousUserStateErr != nil && previousUserStateErr != gocql.ErrNotFound {
 		return previousUserStateErr
@@ -226,6 +234,14 @@ func UpdateUserAndAdminReadModels(session *gocql.Session, orgID, userID string, 
 	}
 	if previousUserStateErr == nil && (previousUserState.Status != userProjectionRow.Status || previousUserState.OrgID != userProjectionRow.OrgID || !previousUserState.CreatedAt.Equal(userProjectionRow.CreatedAt)) {
 		AddDeleteAdminUserStatusProjectionEntryQuery(batch, previousUserState)
+	}
+	if canonicalState.Status == adminIdentityStatusDeleted && canonicalState.DeletedAt != nil && !canonicalState.DeletedAt.IsZero() {
+		if userProjectionRow.Status != adminIdentityStatusDeleted || next.DeletedAt == nil || next.DeletedAt.IsZero() || !canonicalState.DeletedAt.UTC().Equal(next.DeletedAt.UTC()) {
+			AddDeleteDeletedUserDiscoveryQuery(batch, orgID, userID, *canonicalState.DeletedAt)
+		}
+	}
+	if userProjectionRow.Status == adminIdentityStatusDeleted && next.DeletedAt != nil && !next.DeletedAt.IsZero() {
+		AddUpsertDeletedUserDiscoveryQuery(batch, orgID, userID, *next.DeletedAt)
 	}
 	AddUpsertAdminUserReadModelQuery(batch, userProjectionRow)
 	AddUpsertAdminOrganizationReadModelQuery(batch, orgProjectionRow)

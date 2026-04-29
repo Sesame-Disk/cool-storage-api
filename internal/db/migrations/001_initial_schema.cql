@@ -72,6 +72,20 @@ CREATE TABLE IF NOT EXISTS users_by_oidc (
     PRIMARY KEY ((oidc_issuer), oidc_sub)
 );
 
+-- GC discovery index for soft-deleted users. `deleted_day` is derived from the
+-- canonical users.deleted_at UTC date and remains stable even if the runtime
+-- user_grace_days setting changes later. Phase 10 must still revalidate the
+-- canonical users row and the current grace-period config before enqueueing a
+-- destructive purge.
+CREATE TABLE IF NOT EXISTS gc_deleted_users_by_deleted_day (
+    deleted_day DATE,
+    bucket      INT,
+    deleted_at  TIMESTAMP,
+    org_id      UUID,
+    user_id     UUID,
+    PRIMARY KEY ((deleted_day, bucket), deleted_at, org_id, user_id)
+) WITH CLUSTERING ORDER BY (deleted_at ASC, org_id ASC, user_id ASC);
+
 -- ─── Libraries ───────────────────────────────────────────────────────────────
 
 CREATE TABLE IF NOT EXISTS libraries (
@@ -126,6 +140,23 @@ CREATE TABLE IF NOT EXISTS deleted_libraries (
     deleted_at    TIMESTAMP,
     storage_class TEXT
 ) WITH default_time_to_live = 7776000;
+
+-- GC discovery index for libraries with an active retention policy. This is a
+-- rebuildable projection only: the canonical libraries row remains the source
+-- of truth and the scanner must revalidate canonical state before deleting
+-- commits or fs_objects. `policy_type` is currently `version_ttl` or
+-- `auto_delete`; `bucket` is a fixed hash of library_id so long-lived policy
+-- rows do not accumulate in a single partition.
+CREATE TABLE IF NOT EXISTS gc_libraries_by_policy (
+    policy_type           TEXT,
+    bucket                INT,
+    org_id                UUID,
+    library_id            UUID,
+    days                  INT,
+    cached_head_commit_id TEXT,
+    policy_updated_at     TIMESTAMP,
+    PRIMARY KEY ((policy_type, bucket), org_id, library_id)
+) WITH CLUSTERING ORDER BY (org_id ASC, library_id ASC);
 
 -- Admin/org-admin library read models.
 CREATE TABLE IF NOT EXISTS libraries_by_owner (
@@ -316,6 +347,23 @@ CREATE TABLE IF NOT EXISTS share_links_by_library (
     PRIMARY KEY ((org_id, library_id), link_token)
 );
 
+-- GC discovery index for expired share/upload/internal links. This projection
+-- stores the cleanup keys needed to remove secondary tables even if the
+-- canonical share_links row is missing or stale during GC. `expiry_day` comes
+-- from expires_at in UTC; `bucket` is a fixed hash of link_token.
+CREATE TABLE IF NOT EXISTS gc_share_links_by_expiry (
+    expiry_day DATE,
+    bucket     INT,
+    expires_at TIMESTAMP,
+    link_token TEXT,
+    org_id     UUID,
+    library_id UUID,
+    created_by UUID,
+    created_at TIMESTAMP,
+    link_type  TEXT,
+    PRIMARY KEY ((expiry_day, bucket), expires_at, link_token)
+) WITH CLUSTERING ORDER BY (expires_at ASC, link_token ASC);
+
 -- Admin/global read models for share and upload links.
 CREATE TABLE IF NOT EXISTS admin_links_by_created (
     link_type      TEXT,
@@ -461,6 +509,24 @@ CREATE TABLE IF NOT EXISTS shares_by_recipient (
     expires_at     TIMESTAMP,
     PRIMARY KEY ((org_id, shared_to_type, shared_to), created_at, library_id, share_id)
 ) WITH CLUSTERING ORDER BY (created_at DESC, library_id ASC, share_id ASC);
+
+-- GC discovery index for expired shares. The projection carries enough context
+-- to clean up recipient/creator/group read models without depending on a fresh
+-- read from the canonical shares row at delete time. `expiry_day` comes from
+-- expires_at in UTC; `bucket` is a fixed hash of share_id.
+CREATE TABLE IF NOT EXISTS gc_shares_by_expiry (
+    expiry_day     DATE,
+    bucket         INT,
+    expires_at     TIMESTAMP,
+    org_id         UUID,
+    library_id     UUID,
+    share_id       UUID,
+    shared_to      UUID,
+    shared_to_type TEXT,
+    shared_by      UUID,
+    created_at     TIMESTAMP,
+    PRIMARY KEY ((expiry_day, bucket), expires_at, org_id, library_id, share_id)
+) WITH CLUSTERING ORDER BY (expires_at ASC, org_id ASC, library_id ASC, share_id ASC);
 
 -- Reusable per-user permission presets for share dialogs.
 CREATE TABLE IF NOT EXISTS custom_share_permissions (
@@ -907,6 +973,9 @@ CREATE TABLE IF NOT EXISTS gc_failed_items (
 ) WITH CLUSTERING ORDER BY (failed_at DESC, item_type ASC, item_id ASC)
   AND default_time_to_live = 2592000;
 
+-- Metadata/checkpoint table for GC snapshots, scanner cursors, and projection
+-- rebuild state. The runtime may persist last successful scan days and the
+-- currently applied projection/config versions here.
 CREATE TABLE IF NOT EXISTS gc_stats (
     stat_key   TEXT PRIMARY KEY,
     stat_value TEXT,

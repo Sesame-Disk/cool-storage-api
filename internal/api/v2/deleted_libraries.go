@@ -319,10 +319,18 @@ func cleanupLibraryLinks(db interface{ Session() *gocql.Session }, orgID, librar
 	var linkToken, linkType, createdBy string
 	var createdAt time.Time
 	for iter.Scan(&linkToken, &linkType, &createdBy, &createdAt) {
+		var expiresAt *time.Time
+		if err := db.Session().Query(`SELECT expires_at FROM share_links WHERE link_token = ?`, linkToken).Scan(&expiresAt); err != nil && err != gocql.ErrNotFound {
+			_ = iter.Close()
+			return err
+		}
 		batch := db.Session().Batch(gocql.LoggedBatch)
 		batch.Query(`DELETE FROM share_links WHERE link_token = ?`, linkToken)
 		batch.Query(`DELETE FROM share_links_by_creator WHERE org_id = ? AND created_by = ? AND created_at = ? AND link_token = ?`, orgID, createdBy, createdAt, linkToken)
 		batch.Query(`DELETE FROM share_links_by_library WHERE org_id = ? AND library_id = ? AND link_token = ?`, orgID, libraryID, linkToken)
+		if expiresAt != nil && !expiresAt.IsZero() {
+			dbpkg.AddDeleteShareLinkExpiryQuery(batch, linkToken, *expiresAt)
+		}
 		dbpkg.AddDeleteAdminLinkReadModelQuery(batch, linkType, createdAt, orgID, linkToken)
 		if err := batch.Exec(); err != nil {
 			_ = iter.Close()
