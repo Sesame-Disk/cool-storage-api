@@ -142,7 +142,7 @@ func (w *Worker) processOrg(ctx context.Context, orgID uuid.UUID) (int, error) {
 		processed++
 	}
 
-	if len(items) > 0 && len(items) < w.batchSize {
+	if len(items) < w.batchSize {
 		// A short batch strongly suggests this org drained for the current worker
 		// pass. Avoid a full-partition gc_queue read here; reconcile will correct
 		// the active set if a concurrent enqueue or a grace-blocked row still exists.

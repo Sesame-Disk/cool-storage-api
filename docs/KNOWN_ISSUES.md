@@ -2209,6 +2209,60 @@ Tracked in `docs/TECHNICAL-DEBT.md` § 9, Gap B.
 
 ---
 
+### ISSUE-GC-QUEUE-RECOUNT-01: Exact `gc_queue` Recounts Still Hit Cassandra Tombstone Paths
+
+**Status**: 🟡 Pending
+**Discovered**: 2026-04-28
+**Severity**: High operational risk — not a confirmed data-loss bug, but still a real source of Cassandra warnings and expensive partition reads in a GC-critical path
+
+**Affected code paths:**
+- `internal/gc/gc.go` — `reconcileDirtyQueueStats()`
+- `internal/gc/store_cassandra.go` — `RecountOrgQueueDepth()`, `GetQueueSize()`
+
+**Problem**:
+GC still performs exact live recounts of `gc_queue` rows per org using `COUNT(*)`.
+
+On Cassandra 5, that path is unsafe operationally on hot or tombstoned `gc_queue` partitions. In practice it produces repeated warnings that surface as internal read shapes like:
+
+- `SELECT * FROM sesamefs.gc_queue WHERE org_id = ... LIMIT ... ALLOW FILTERING`
+- `Aggregation query used without partition key`
+
+Even when the application query does not literally contain `ALLOW FILTERING`, Cassandra internally expands the aggregation/read path in a way that still traverses large tombstoned partitions and emits misleading warning text.
+
+**Confirmed root cause:**
+- Live schema for `gc_queue` was verified as partitioned by `org_id` with clustering on `queued_at, item_type, item_id`
+- Direct manual execution of `SELECT COUNT(*) FROM sesamefs.gc_queue WHERE org_id = ?` reproduced the Cassandra warnings
+- This isolated the remaining runtime warning source after test-helper cleanup and after the worker stale-active-org fix
+
+**Why this is not safe to "just fix" with another scan:**
+- Replacing `COUNT(*)` with another full-partition read or row iteration still traverses the same hot/tombstoned partition surface
+- Reintroducing old best-effort queue counters is also unsafe: that design was already removed because drift was structural, not incidental
+
+**Safe direction for a future fix:**
+1. Remove exact `gc_queue` recounts from the hot reconcile/status path
+2. Maintain `queue_depth` snapshots on the write path where queue rows are inserted/deleted/moved
+3. Keep a separate, infrequent scrub/reconciliation path to repair any snapshot drift explicitly
+
+**Related worker note:**
+The worker behavior in `internal/gc/worker.go` that removes an org from `gc_active_orgs` when `len(items) < batchSize` should remain in place.
+
+That change addresses a different problem: stale active-org entries causing repeated empty dequeues. It does **not** introduce the `COUNT(*)` issue and remains safe because removal is guarded by the `last_enqueued_at` timestamp semantics.
+
+**Current recommendation:**
+- Treat this as pending technical debt / operability work
+- Do not revert the current worker short-batch active-set removal
+- Do not add new hot-path exact recounts over `gc_queue`
+
+**Files likely involved in the eventual fix:**
+- `internal/gc/gc.go`
+- `internal/gc/store.go`
+- `internal/gc/store_cassandra.go`
+- `internal/gc/store_mock.go`
+- `internal/gc/gc_test.go`
+- `internal/integration/gc_integration_test.go`
+
+---
+
 ### ISSUE-S3-TRANSPORT-01: All S3 Operations Fail Until Container Restart — FIXED
 
 **Discovered**: 2026-03-04 (production)

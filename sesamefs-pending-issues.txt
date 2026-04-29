@@ -66,6 +66,16 @@ Referencias canónicas:
     - Sigue como gap de producto para v1.0 / fast-follow cercano
     - Ver: docs/V1-PRODUCTION-ROADMAP.md
 
+2.6 GC queue recounts on Cassandra hot/tombstoned partitions [P1]
+    Files: internal/gc/gc.go, internal/gc/store_cassandra.go
+    - Sigue habiendo warnings/runtime pressure en Cassandra por recounts exactos sobre gc_queue
+    - Raíz confirmada: RecountOrgQueueDepth() y GetQueueSize() usan COUNT(*) por org sobre particiones con tombstones
+    - Cassandra 5 termina logueando estos caminos como lecturas internas tipo SELECT * ... LIMIT ... ALLOW FILTERING, aunque la app no emita ALLOW FILTERING literal
+    - No conviene volver a contadores best-effort viejos: ya se retiraron por drift estructural
+    - Dirección segura pendiente: sacar el recount exacto del hot path de reconcile/status y mantener snapshot por write-path con scrub/repair infrecuente
+    - El cambio del worker que remueve orgs activos cuando len(items) < batchSize se mantiene: sigue siendo seguro y ataca un problema distinto (stale active orgs / empty dequeues repetidos)
+    - Ver: docs/KNOWN_ISSUES.md
+
 =======================================
 3. PRODUCT / FEATURE GAPS REALES
 =======================================
@@ -178,8 +188,9 @@ P1:
 5. Backup / DR
 6. Storage classes & multi-region completion
 7. Antivirus / malware scanning
+8. GC queue recounts on hot/tombstoned Cassandra partitions
 
 P2:
-8. Diff view
-9. Cold storage restore completion
-10. Code reorganization, coverage, CI
+9. Diff view
+10. Cold storage restore completion
+11. Code reorganization, coverage, CI

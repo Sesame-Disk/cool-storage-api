@@ -293,6 +293,34 @@ func TestWorker_ProcessOrg_PreservesActiveOrgOnConcurrentEnqueue(t *testing.T) {
 	}
 }
 
+func TestWorker_ProcessOrg_RemovesStaleActiveOrgWhenQueueEmpty(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	w := NewWorker(store, nil, q, 100, 0, false, stats)
+
+	orgID := uuid.New()
+	base := time.Now().UTC()
+	store.MarkOrgActive(orgID, base.Add(-2*time.Second))
+	w.clock = func() time.Time {
+		return base
+	}
+
+	processed, err := w.processOrg(context.Background(), orgID)
+	if err != nil {
+		t.Fatalf("processOrg failed: %v", err)
+	}
+	if processed != 0 {
+		t.Fatalf("processed = %d, want 0", processed)
+	}
+	if store.IsOrgActive(orgID) {
+		t.Fatal("expected stale active org to be removed after empty dequeue")
+	}
+	if len(store.QueueItems(orgID)) != 0 {
+		t.Fatalf("expected queue to stay empty, got %#v", store.QueueItems(orgID))
+	}
+}
+
 // TestWorker_StorageLeak_LWTSkipsLiveBlock is a regression test that ensures
 // the LWT guard prevents a block from being deleted from S3 when its ref_count
 // is still > 0 at the moment the GC tries to process it.

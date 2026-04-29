@@ -218,17 +218,6 @@ func getGCQueueSize(t *testing.T) int {
 	return getGCStatus(t).QueueSize
 }
 
-func readGCQueueLiveCount(t *testing.T) int {
-	t.Helper()
-
-	session := shareProjectionDBForTest(t).Session()
-	var count int64
-	if err := session.Query(`SELECT COUNT(*) FROM gc_queue`).Scan(&count); err != nil {
-		t.Fatalf("failed to count live gc_queue rows: %v", err)
-	}
-	return int(count)
-}
-
 func readGCStatsInt(t *testing.T, key string) int {
 	t.Helper()
 
@@ -258,22 +247,21 @@ func readGCFailedSnapshotTotal(t *testing.T) int {
 	return readGCStatsInt(t, "total_failed_items")
 }
 
-func readOrgQueueLiveCount(t *testing.T, orgID uuid.UUID) int {
-	t.Helper()
-
-	session := shareProjectionDBForTest(t).Session()
-	var count int64
-	if err := session.Query(`SELECT COUNT(*) FROM gc_queue WHERE org_id = ?`, orgID.String()).Scan(&count); err != nil {
-		t.Fatalf("failed to count org gc_queue rows for %s: %v", orgID, err)
-	}
-	return int(count)
+func gcQueueItemExists(t *testing.T, orgID string, itemType string, itemID string) bool {
+	return gcQueueItemExistsSince(t, orgID, itemType, itemID, time.Time{})
 }
 
-func gcQueueItemExists(t *testing.T, orgID string, itemType string, itemID string) bool {
+func gcQueueItemExistsSince(t *testing.T, orgID string, itemType string, itemID string, queuedAfter time.Time) bool {
 	t.Helper()
 
 	session := shareProjectionDBForTest(t).Session()
-	iter := session.Query(`SELECT item_type, item_id FROM gc_queue WHERE org_id = ?`, orgID).Iter()
+	query := `SELECT item_type, item_id FROM gc_queue WHERE org_id = ?`
+	args := []interface{}{orgID}
+	if !queuedAfter.IsZero() {
+		query += ` AND queued_at >= ?`
+		args = append(args, queuedAfter.UTC())
+	}
+	iter := session.Query(query, args...).Iter()
 	var queuedItemType string
 	var queuedItemID string
 	for iter.Scan(&queuedItemType, &queuedItemID) {
@@ -297,9 +285,19 @@ func gcOrgBucketForTest(orgID uuid.UUID) int {
 }
 
 func deleteGCQueueItemsByIdentity(t *testing.T, orgID string, itemType string, itemID string) {
+	deleteGCQueueItemsByIdentitySince(t, orgID, itemType, itemID, time.Time{})
+}
+
+func deleteGCQueueItemsByIdentitySince(t *testing.T, orgID string, itemType string, itemID string, queuedAfter time.Time) {
 	t.Helper()
 	session := shareProjectionDBForTest(t).Session()
-	iter := session.Query(`SELECT queued_at, item_type, item_id FROM gc_queue WHERE org_id = ?`, orgID).Iter()
+	query := `SELECT queued_at, item_type, item_id FROM gc_queue WHERE org_id = ?`
+	args := []interface{}{orgID}
+	if !queuedAfter.IsZero() {
+		query += ` AND queued_at >= ?`
+		args = append(args, queuedAfter.UTC())
+	}
+	iter := session.Query(query, args...).Iter()
 	var queuedAt time.Time
 	var queuedItemType string
 	var queuedItemID string
@@ -592,6 +590,7 @@ func TestGC_ScannerOrphanRecovery(t *testing.T) {
 
 	repoID := createTestLibrary(t, adminClient, fmt.Sprintf("inttest-gc-orphan-%d", time.Now().UnixNano()))
 	orgID := resolveOrgID(t, repoID)
+	queuedAfter := time.Now().UTC().Add(-5 * time.Second)
 
 	// Upload a file, then delete it to get a real block with ref_count=0
 	_, blockID := uploadUniqueFile(t, adminClient, repoID, "orphan.txt", "/")
@@ -610,7 +609,7 @@ func TestGC_ScannerOrphanRecovery(t *testing.T) {
 	if err := session.Query(`DELETE FROM gc_block_candidates WHERE org_id = ? AND block_id = ?`, orgID, blockID).Exec(); err != nil {
 		t.Logf("Warning: could not delete GC candidate (may not exist): %v", err)
 	}
-	deleteGCQueueItemsByIdentity(t, orgID, "block", blockID)
+	deleteGCQueueItemsByIdentitySince(t, orgID, "block", blockID, queuedAfter)
 
 	t.Log("Orphan block created (ref_count=0, no GC candidate). Running scanner...")
 
@@ -696,8 +695,8 @@ func TestGC_QueueSizeTracking(t *testing.T) {
 	requireCassandra(t)
 
 	statusBefore := getGCQueueSize(t)
-	liveBefore := readGCQueueLiveCount(t)
 	snapshotBefore := readGCQueueSnapshotTotal(t)
+	queuedAfter := time.Now().UTC().Add(-5 * time.Second)
 
 	// Create a library, upload, delete to generate GC work
 	repoID := createTestLibrary(t, adminClient, fmt.Sprintf("inttest-gc-qsize-%d", time.Now().UnixNano()))
@@ -708,7 +707,7 @@ func TestGC_QueueSizeTracking(t *testing.T) {
 	// Poll for the specific block queue item created by this test. Global queue
 	// totals are noisy because other GC work may be draining concurrently.
 	ok := pollUntil(t, 15*time.Second, 500*time.Millisecond, func() bool {
-		return gcQueueItemExists(t, orgID, "block", blockID)
+		return gcQueueItemExistsSince(t, orgID, "block", blockID, queuedAfter)
 	})
 	if !ok {
 		t.Fatalf("expected block %s to appear in gc_queue for org %s after enqueue (status_before=%d snapshot_before=%d status_now=%d snapshot_now=%d)",
@@ -716,10 +715,9 @@ func TestGC_QueueSizeTracking(t *testing.T) {
 	}
 
 	statusAfter := getGCQueueSize(t)
-	liveAfter := readGCQueueLiveCount(t)
 	snapshotAfter := readGCQueueSnapshotTotal(t)
-	t.Logf("GC queue state after enqueue: status=%d live=%d snapshot=%d (before status=%d live=%d snapshot=%d)",
-		statusAfter, liveAfter, snapshotAfter, statusBefore, liveBefore, snapshotBefore)
+	t.Logf("GC queue state after enqueue: status=%d snapshot=%d (before status=%d snapshot=%d)",
+		statusAfter, snapshotAfter, statusBefore, snapshotBefore)
 
 	if snapshotAfter == 0 {
 		t.Fatalf("expected total_queue_depth snapshot to be non-zero after enqueue")
@@ -776,13 +774,12 @@ func TestGC_StatusSnapshotReconcilesLiveQueueCount(t *testing.T) {
 		return queueDepth == 1
 	})
 	statusAfter := getGCStatus(t)
-	liveAfter := readGCQueueLiveCount(t)
 	snapshotAfter := readGCQueueSnapshotTotal(t)
 	orgQueueDepth, orgFailedDepth := readGCOrgQueueStats(t, orgID)
-	t.Logf("GC snapshot reconciliation: status=%d live=%d snapshot=%d snapshot_before=%d org_queue=%d org_failed=%d", statusAfter.QueueSize, liveAfter, snapshotAfter, snapshotBefore, orgQueueDepth, orgFailedDepth)
+	t.Logf("GC snapshot reconciliation: status=%d snapshot=%d snapshot_before=%d org_queue=%d org_failed=%d", statusAfter.QueueSize, snapshotAfter, snapshotBefore, orgQueueDepth, orgFailedDepth)
 
 	if !ok {
-		t.Fatalf("expected org-local queue stats to be reconciled for synthetic row, status=%d snapshot=%d live=%d org_queue=%d", statusAfter.QueueSize, snapshotAfter, liveAfter, orgQueueDepth)
+		t.Fatalf("expected org-local queue stats to be reconciled for synthetic row, status=%d snapshot=%d org_queue=%d", statusAfter.QueueSize, snapshotAfter, orgQueueDepth)
 	}
 	if orgQueueDepth != 1 {
 		t.Fatalf("expected reconciled org queue depth to equal 1, got %d", orgQueueDepth)
@@ -805,7 +802,6 @@ func TestGC_MaxRetryItemMovesToFailedQueue(t *testing.T) {
 	itemID := fmt.Sprintf("synthetic-max-retry-%d", time.Now().UnixNano())
 	libraryID := uuid.New()
 
-	orgLiveBefore := readOrgQueueLiveCount(t, orgID)
 	failedBefore := readGCFailedSnapshotTotal(t)
 
 	if err := session.Query(`
@@ -876,13 +872,11 @@ func TestGC_MaxRetryItemMovesToFailedQueue(t *testing.T) {
 	})
 
 	statusAfter := getGCStatus(t)
-	liveAfter := readGCQueueLiveCount(t)
-	orgLiveAfter := readOrgQueueLiveCount(t, orgID)
 	queueSnapshotAfter := readGCQueueSnapshotTotal(t)
 	failedAfter := readGCFailedSnapshotTotal(t)
 	orgQueueDepth, orgFailedDepth := readGCOrgQueueStats(t, orgID)
-	t.Logf("GC max-retry flow: status=%d live=%d queue_snapshot=%d failed_snapshot=%d retry_after=%d failed_at=%s last_error=%q org_queue=%d org_failed=%d",
-		statusAfter.QueueSize, liveAfter, queueSnapshotAfter, failedAfter, retryCountAfter, failedAt.Format(time.RFC3339Nano), lastError, orgQueueDepth, orgFailedDepth)
+	t.Logf("GC max-retry flow: status=%d queue_snapshot=%d failed_snapshot=%d retry_after=%d failed_at=%s last_error=%q org_queue=%d org_failed=%d",
+		statusAfter.QueueSize, queueSnapshotAfter, failedAfter, retryCountAfter, failedAt.Format(time.RFC3339Nano), lastError, orgQueueDepth, orgFailedDepth)
 
 	if failedAt.IsZero() {
 		t.Fatalf("expected gc_failed_items.failed_at to be populated")
@@ -892,9 +886,6 @@ func TestGC_MaxRetryItemMovesToFailedQueue(t *testing.T) {
 	}
 	if lastError == "" {
 		t.Fatalf("expected gc_failed_items.last_error to be populated")
-	}
-	if orgLiveAfter != orgLiveBefore {
-		t.Fatalf("expected the org-local live queue count to return to baseline after failing the max-retry item, before=%d after=%d", orgLiveBefore, orgLiveAfter)
 	}
 	if orgFailedDepth <= 0 {
 		t.Fatalf("expected reconciled org failed depth to be positive after max-retry flow, got %d", orgFailedDepth)
@@ -966,8 +957,9 @@ func TestGC_FailedItemsAdminEndpoints(t *testing.T) {
 	if requeueResp.StatusCode != http.StatusOK {
 		t.Fatalf("expected failed-item requeue HTTP 200, got %d", requeueResp.StatusCode)
 	}
+	requeueQueuedAfter := time.Now().UTC().Add(-2 * time.Second)
 	ok = pollUntil(t, 30*time.Second, 500*time.Millisecond, func() bool {
-		return gcQueueItemExists(t, orgID.String(), "unknown_type", itemIDA) && !failedQueueItemExists(t, orgID.String(), "unknown_type", itemIDA)
+		return gcQueueItemExistsSince(t, orgID.String(), "unknown_type", itemIDA, requeueQueuedAfter) && !failedQueueItemExists(t, orgID.String(), "unknown_type", itemIDA)
 	})
 	if !ok {
 		t.Fatalf("expected requeued failed item %s to leave gc_failed_items and reappear in gc_queue", itemIDA)
