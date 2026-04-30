@@ -1233,8 +1233,10 @@ func TestWorker_ProcessLibraryCascade_StorageCounterFailureDoesNotHardDeleteLibr
 	if _, err := store.GetLibraryStorageClass(orgID, libID); err != nil {
 		t.Fatalf("library should remain for retry when counter cleanup fails: %v", err)
 	}
-	if len(store.AuditLogEntries()) != 0 {
-		t.Fatal("library hard-delete audit should not be written before successful counter cleanup")
+	for _, entry := range store.AuditLogEntries() {
+		if entry.Action == "gc_library_cascade_deleted" {
+			t.Fatal("library hard-delete audit should not be written before successful counter cleanup")
+		}
 	}
 }
 
@@ -1505,6 +1507,88 @@ func TestWorker_ProcessOrgCascade_UserCleanupFailureDoesNotHardDeleteUserOrOrg(t
 	}
 	if len(store.AuditLogEntries()) != 0 {
 		t.Fatal("org cascade audit should not be written before successful hard delete")
+	}
+}
+
+func TestWorker_ProcessOrgCascade_RestoreBetweenChecksSkipsDelete(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	w := NewWorker(store, nil, q, 100, 0, false, stats)
+
+	orgID := uuid.New()
+	userID := uuid.New()
+	groupID := uuid.New()
+	libID := uuid.New()
+	deletedAt := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
+
+	store.AddDeletedOrg(orgID, "Restorable Corp", deletedAt)
+	store.AddUser(orgID, userID, "alice@restorable.com")
+	store.AddGroupForOrg(orgID, groupID)
+	store.AddLibrary(orgID, libID, "hot")
+	store.beginOrgPurgeHook = func(lockedOrgID uuid.UUID) {
+		store.mu.Lock()
+		defer store.mu.Unlock()
+		store.orgStatus[lockedOrgID] = "active"
+		delete(store.orgDeletedAt, lockedOrgID)
+	}
+
+	item := QueueItem{OrgID: orgID, QueuedAt: deletedAt, IdentityAt: deletedAt, ItemType: ItemOrgCascade, ItemID: orgID.String()}
+	err := w.processOrgCascade(context.Background(), item)
+	if err != nil {
+		t.Fatalf("expected stale skip after restore, got error: %v", err)
+	}
+	if !store.HasOrg(orgID) {
+		t.Fatal("org should remain after restore wins the race")
+	}
+	if !store.HasUser(orgID, userID) {
+		t.Fatal("user should remain after restore wins the race")
+	}
+	if !store.HasGroup(orgID, groupID) {
+		t.Fatal("group should remain after restore wins the race")
+	}
+	if _, err := store.GetLibraryStorageClass(orgID, libID); err != nil {
+		t.Fatalf("library should remain after restore wins the race: %v", err)
+	}
+	if len(store.AuditLogEntries()) != 0 {
+		t.Fatal("org cascade audit should not be written when restore wins the race")
+	}
+	acquired, err := store.AcquireOrgHardDeleteLock(orgID)
+	if err != nil {
+		t.Fatalf("reacquire org lock: %v", err)
+	}
+	if !acquired {
+		t.Fatal("org hard-delete lock should be released after stale skip")
+	}
+	if err := store.ReleaseOrgHardDeleteLock(orgID); err != nil {
+		t.Fatalf("release reacquired org lock: %v", err)
+	}
+}
+
+func TestWorker_ProcessOrgCascade_RetryWhilePurgingContinues(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	w := NewWorker(store, nil, q, 100, 0, false, stats)
+
+	orgID := uuid.New()
+	userID := uuid.New()
+	deletedAt := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
+
+	store.AddDeletedOrg(orgID, "Purging Corp", deletedAt)
+	store.AddUser(orgID, userID, "alice@purging.com")
+	store.orgStatus[orgID] = "purging"
+
+	item := QueueItem{OrgID: orgID, QueuedAt: deletedAt, IdentityAt: deletedAt, ItemType: ItemOrgCascade, ItemID: orgID.String()}
+	err := w.processOrgCascade(context.Background(), item)
+	if err != nil {
+		t.Fatalf("retry on purging org should continue: %v", err)
+	}
+	if store.HasOrg(orgID) {
+		t.Fatal("org should be hard-deleted when retry resumes a purging cascade")
+	}
+	if store.HasUser(orgID, userID) {
+		t.Fatal("user should be hard-deleted when retry resumes a purging cascade")
 	}
 }
 

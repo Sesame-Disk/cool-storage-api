@@ -597,7 +597,7 @@ class GC extends Component {
                                         {status.last_scan_error &&
                                             <div className="gc-admin-alert gc-admin-alert-danger mb-3">
                                                 <div className="gc-admin-alert-title">{gettext('Last scanner error')}</div>
-                                                <div className="gc-admin-alert-meta">{gettext('Last scan run')}: {this.formatTimestamp(status.last_scan_run)}</div>
+                                                <div className="gc-admin-alert-meta">{gettext('Last scan attempt')}: {this.formatTimestamp(status.last_scan_attempt || status.last_scan_run)}</div>
                                                 <div className="gc-admin-alert-body gc-admin-break-word">{status.last_scan_error}</div>
                                             </div>
                                         }
@@ -613,7 +613,8 @@ class GC extends Component {
                                         </div>
                                         <div className="gc-admin-status-grid mt-3">
                                             {this.renderStatusCard(gettext('Last worker run'), this.formatTimestamp(status.last_worker_run), null)}
-                                            {this.renderStatusCard(gettext('Last scanner run'), this.formatTimestamp(status.last_scan_run), null)}
+                                            {this.renderStatusCard(gettext('Last scan attempt'), this.formatTimestamp(status.last_scan_attempt || status.last_scan_run), gettext('Updated after every scanner attempt, even when the scan reports an error.'))}
+                                            {this.renderStatusCard(gettext('Last successful scan'), this.formatTimestamp(status.last_scan_success), gettext('Most recent scanner attempt that completed without an aggregated error.'))}
                                             {this.renderStatusCard(gettext('Scanner error state'), status.last_scan_error ? gettext('Error recorded') : gettext('Clear'), status.last_scan_error || gettext('No aggregated scanner error is currently recorded.'), status.last_scan_error ? 'is-negative' : 'is-positive')}
                                             {this.renderStatusCard(gettext('Last reconcile run'), this.formatTimestamp(status.last_reconcile_run), null)}
                                         </div>

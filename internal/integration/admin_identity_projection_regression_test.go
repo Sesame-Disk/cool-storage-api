@@ -351,6 +351,147 @@ func TestAdminIdentityProjectionRegression_HardDeleteOrganization(t *testing.T) 
 	})
 }
 
+func TestAdminIdentityProjectionRegression_RestoreOrganization(t *testing.T) {
+	orgName := fmt.Sprintf("inttest-admin-restore-org-%d", time.Now().UnixNano())
+	ownerEmail := fmt.Sprintf("inttest-admin-restore-org-owner-%d@sesamefs.local", time.Now().UnixNano())
+	orgID := createAdminIdentityTestOrganization(t, orgName, ownerEmail)
+
+	deleteResp := superadminClient.Delete(t, "/api/v2.1/admin/organizations/"+orgID+"/")
+	expectStatus(t, deleteResp, http.StatusOK)
+	deleteResp.Body.Close()
+
+	waitForIntegrationCondition(t, "soft-deleted organization to reach deleted canonical/admin state before restore", func() bool {
+		row, ok := adminOrganizationProjectionByID(t, orgID)
+		return ok && row.Status == "deleted" && row.DeletedAt != nil && canonicalOrganizationStatusIs(t, orgID, "deleted") && deletedOrganizationMarkerExists(t, orgID)
+	})
+
+	restoreResp := superadminClient.Do(t, http.MethodPost, "/api/v2.1/admin/organizations/"+orgID+"/restore/", nil)
+	expectStatus(t, restoreResp, http.StatusOK)
+	restoreResp.Body.Close()
+
+	waitForIntegrationCondition(t, "restored organization to return to active canonical/admin state", func() bool {
+		row, ok := adminOrganizationProjectionByID(t, orgID)
+		return ok && row.Status == "active" && row.DeletedAt == nil && canonicalOrganizationStatusIs(t, orgID, "active") && !deletedOrganizationMarkerExists(t, orgID) && adminOrganizationPresentInStatusList(t, "active", orgID, orgName, ownerEmail)
+	})
+}
+
+func TestAdminIdentityProjectionRegression_RestoreOrganizationRepairsPartialActivation(t *testing.T) {
+	orgName := fmt.Sprintf("inttest-admin-restore-repair-org-%d", time.Now().UnixNano())
+	ownerEmail := fmt.Sprintf("inttest-admin-restore-repair-owner-%d@sesamefs.local", time.Now().UnixNano())
+	orgID := createAdminIdentityTestOrganization(t, orgName, ownerEmail)
+
+	deleteResp := superadminClient.Delete(t, "/api/v2.1/admin/organizations/"+orgID+"/")
+	expectStatus(t, deleteResp, http.StatusOK)
+	deleteResp.Body.Close()
+
+	waitForIntegrationCondition(t, "soft-deleted organization to reach deleted canonical/admin state before repair test", func() bool {
+		row, ok := adminOrganizationProjectionByID(t, orgID)
+		return ok && row.Status == "deleted" && row.DeletedAt != nil && canonicalOrganizationStatusIs(t, orgID, "deleted") && deletedOrganizationMarkerExists(t, orgID)
+	})
+
+	session := shareProjectionDBForTest(t).Session()
+	if err := session.Query(`UPDATE organizations SET status = ?, deleted_at = ? WHERE org_id = ?`, "active", nil, orgID).Exec(); err != nil {
+		t.Fatalf("set org %s canonical state to active failed: %v", orgID, err)
+	}
+
+	restoreResp := superadminClient.Do(t, http.MethodPost, "/api/v2.1/admin/organizations/"+orgID+"/restore/", nil)
+	expectStatus(t, restoreResp, http.StatusOK)
+	restoreResp.Body.Close()
+
+	waitForIntegrationCondition(t, "restore retry to repair partial activation state", func() bool {
+		row, ok := adminOrganizationProjectionByID(t, orgID)
+		return ok && row.Status == "active" && row.DeletedAt == nil && canonicalOrganizationStatusIs(t, orgID, "active") && !deletedOrganizationMarkerExists(t, orgID) && adminOrganizationPresentInStatusList(t, "active", orgID, orgName, ownerEmail) && !adminOrganizationPresentInStatusList(t, "deleted", orgID, orgName, ownerEmail)
+	})
+}
+
+func TestAdminIdentityProjectionRegression_RestoreOrganizationRejectedWhilePurging(t *testing.T) {
+	orgName := fmt.Sprintf("inttest-admin-restore-purging-org-%d", time.Now().UnixNano())
+	ownerEmail := fmt.Sprintf("inttest-admin-restore-purging-owner-%d@sesamefs.local", time.Now().UnixNano())
+	orgID := createAdminIdentityTestOrganization(t, orgName, ownerEmail)
+
+	deleteResp := superadminClient.Delete(t, "/api/v2.1/admin/organizations/"+orgID+"/")
+	expectStatus(t, deleteResp, http.StatusOK)
+	deleteResp.Body.Close()
+
+	waitForIntegrationCondition(t, "soft-deleted organization to reach deleted canonical state before purge guard test", func() bool {
+		return canonicalOrganizationStatusIs(t, orgID, "deleted") && deletedOrganizationMarkerExists(t, orgID)
+	})
+
+	session := shareProjectionDBForTest(t).Session()
+	if err := session.Query(`UPDATE organizations SET status = ? WHERE org_id = ?`, "purging", orgID).Exec(); err != nil {
+		t.Fatalf("set org %s to purging failed: %v", orgID, err)
+	}
+	t.Cleanup(func() {
+		_ = session.Query(`UPDATE organizations SET status = ? WHERE org_id = ?`, "deleted", orgID).Exec()
+	})
+
+	restoreResp := superadminClient.Do(t, http.MethodPost, "/api/v2.1/admin/organizations/"+orgID+"/restore/", nil)
+	expectStatus(t, restoreResp, http.StatusBadRequest)
+	body := responseJSON(t, restoreResp)
+	if body["error"] != "organization is pending permanent deletion" {
+		t.Fatalf("restore purging org error = %v, want %q", body["error"], "organization is pending permanent deletion")
+	}
+	if !canonicalOrganizationStatusIs(t, orgID, "purging") {
+		t.Fatalf("expected canonical organization %s to remain purging after rejected restore", orgID)
+	}
+	if !deletedOrganizationMarkerExists(t, orgID) {
+		t.Fatalf("expected deleted_organizations marker to remain for purging org %s", orgID)
+	}
+}
+
+func TestAdminIdentityProjectionRegression_ReactivateOrganization(t *testing.T) {
+	orgName := fmt.Sprintf("inttest-admin-reactivate-org-%d", time.Now().UnixNano())
+	ownerEmail := fmt.Sprintf("inttest-admin-reactivate-org-owner-%d@sesamefs.local", time.Now().UnixNano())
+	orgID := createAdminIdentityTestOrganization(t, orgName, ownerEmail)
+
+	deactivateResp := superadminClient.Do(t, http.MethodPost, "/api/v2.1/admin/organizations/"+orgID+"/deactivate/", nil)
+	expectStatus(t, deactivateResp, http.StatusOK)
+	deactivateResp.Body.Close()
+
+	waitForIntegrationCondition(t, "deactivated organization to reach deactivated canonical/admin state", func() bool {
+		row, ok := adminOrganizationProjectionByID(t, orgID)
+		return ok && row.Status == "deactivated" && row.DeletedAt == nil && canonicalOrganizationStatusIs(t, orgID, "deactivated")
+	})
+
+	reactivateResp := superadminClient.Do(t, http.MethodPost, "/api/v2.1/admin/organizations/"+orgID+"/reactivate/", nil)
+	expectStatus(t, reactivateResp, http.StatusOK)
+	reactivateResp.Body.Close()
+
+	waitForIntegrationCondition(t, "reactivated organization to return to active canonical/admin state", func() bool {
+		row, ok := adminOrganizationProjectionByID(t, orgID)
+		return ok && row.Status == "active" && row.DeletedAt == nil && canonicalOrganizationStatusIs(t, orgID, "active") && adminOrganizationPresentInStatusList(t, "active", orgID, orgName, ownerEmail)
+	})
+}
+
+func TestAdminIdentityProjectionRegression_ReactivateOrganizationRepairsPartialActivation(t *testing.T) {
+	orgName := fmt.Sprintf("inttest-admin-reactivate-repair-org-%d", time.Now().UnixNano())
+	ownerEmail := fmt.Sprintf("inttest-admin-reactivate-repair-owner-%d@sesamefs.local", time.Now().UnixNano())
+	orgID := createAdminIdentityTestOrganization(t, orgName, ownerEmail)
+
+	deactivateResp := superadminClient.Do(t, http.MethodPost, "/api/v2.1/admin/organizations/"+orgID+"/deactivate/", nil)
+	expectStatus(t, deactivateResp, http.StatusOK)
+	deactivateResp.Body.Close()
+
+	waitForIntegrationCondition(t, "deactivated organization to reach deactivated canonical/admin state before repair test", func() bool {
+		row, ok := adminOrganizationProjectionByID(t, orgID)
+		return ok && row.Status == "deactivated" && row.DeletedAt == nil && canonicalOrganizationStatusIs(t, orgID, "deactivated")
+	})
+
+	session := shareProjectionDBForTest(t).Session()
+	if err := session.Query(`UPDATE organizations SET status = ?, deleted_at = ? WHERE org_id = ?`, "active", nil, orgID).Exec(); err != nil {
+		t.Fatalf("set org %s canonical state to active failed: %v", orgID, err)
+	}
+
+	reactivateResp := superadminClient.Do(t, http.MethodPost, "/api/v2.1/admin/organizations/"+orgID+"/reactivate/", nil)
+	expectStatus(t, reactivateResp, http.StatusOK)
+	reactivateResp.Body.Close()
+
+	waitForIntegrationCondition(t, "reactivate retry to repair partial activation state", func() bool {
+		row, ok := adminOrganizationProjectionByID(t, orgID)
+		return ok && row.Status == "active" && row.DeletedAt == nil && canonicalOrganizationStatusIs(t, orgID, "active") && adminOrganizationPresentInStatusList(t, "active", orgID, orgName, ownerEmail) && !adminOrganizationPresentInStatusList(t, "deactivated", orgID, orgName, ownerEmail)
+	})
+}
+
 func TestAdminIdentityProjectionRegression_UpdateUserByEmailBatch(t *testing.T) {
 	orgName := fmt.Sprintf("inttest-admin-update-email-org-%d", time.Now().UnixNano())
 	ownerEmail := fmt.Sprintf("inttest-admin-update-email-owner-%d@sesamefs.local", time.Now().UnixNano())
@@ -669,6 +810,20 @@ func canonicalOrganizationExists(t *testing.T, orgID string) bool {
 		t.Fatalf("read canonical organization %s failed: %v", orgID, err)
 	}
 	return false
+}
+
+func canonicalOrganizationStatusIs(t *testing.T, orgID, expectedStatus string) bool {
+	t.Helper()
+
+	session := shareProjectionDBForTest(t).Session()
+	var status string
+	if err := session.Query(`SELECT status FROM organizations WHERE org_id = ?`, orgID).Scan(&status); err != nil {
+		if err == gocql.ErrNotFound {
+			return false
+		}
+		t.Fatalf("read canonical organization status %s failed: %v", orgID, err)
+	}
+	return status == expectedStatus
 }
 
 func deletedOrganizationMarkerExists(t *testing.T, orgID string) bool {

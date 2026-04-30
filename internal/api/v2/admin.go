@@ -922,12 +922,20 @@ func (h *AdminHandler) RestoreOrganization(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "organization not found"})
 		return
 	}
-	if orgStatus != StatusDeleted {
+	if orgStatus == statusPurging {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "organization is pending permanent deletion"})
+		return
+	}
+	if orgStatus != StatusDeleted && orgStatus != StatusActive {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "organization is not deleted"})
 		return
 	}
 
 	if err := activateOrg(h.db, orgID); err != nil {
+		if err.Error() == "organization is pending permanent deletion" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to restore organization"})
 		return
 	}
@@ -952,12 +960,20 @@ func (h *AdminHandler) ReactivateOrganization(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "organization not found"})
 		return
 	}
-	if orgStatus != StatusDeactivated {
+	if orgStatus == statusPurging {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "organization is pending permanent deletion"})
+		return
+	}
+	if orgStatus != StatusDeactivated && orgStatus != StatusActive {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "organization is not deactivated"})
 		return
 	}
 
 	if err := activateOrg(h.db, orgID); err != nil {
+		if err.Error() == "organization is pending permanent deletion" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to reactivate organization"})
 		return
 	}

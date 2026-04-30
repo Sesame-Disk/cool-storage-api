@@ -197,6 +197,19 @@ type GCStore interface {
 	ListGroupsByOrg(orgID uuid.UUID) ([]uuid.UUID, error)
 	ListLibrariesForOrg(orgID uuid.UUID) ([]OrgLibraryInfo, error)
 	DeleteGroupFull(orgID, groupID uuid.UUID) error
+	// BeginOrgPurge atomically transitions a soft-deleted org into an internal
+	// purge-in-progress state for the given deleted_at identity. It returns
+	// false when the org was restored or deleted again under a different
+	// identity before the transition could be claimed.
+	BeginOrgPurge(orgID uuid.UUID, identityAt time.Time) (bool, error)
+	// AcquireOrgHardDeleteLock acquires a short-lived lock for an org cascade
+	// delete. Returns (true, nil) when the lock is successfully acquired.
+	// activateOrg checks this table to block concurrent restores.
+	AcquireOrgHardDeleteLock(orgID uuid.UUID) (bool, error)
+	ReleaseOrgHardDeleteLock(orgID uuid.UUID) error
+	// HardDeleteOrgLocked deletes the org record after child rows have been
+	// removed. Caller must already hold the org hard-delete lock.
+	HardDeleteOrgLocked(orgID uuid.UUID) error
 	HardDeleteOrg(orgID uuid.UUID) error
 	GetOrgName(orgID uuid.UUID) (string, error)
 

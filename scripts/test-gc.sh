@@ -155,7 +155,7 @@ else
     echo -e "${RED}[FAIL]${NC} Status has 'blocks_deleted_total' field (number) (.blocks_deleted_total: expected numeric, got '$blocks_deleted')"
 fi
 
-# Check last_worker_run and last_scan_run exist (may be "never" or a timestamp)
+# Check last_worker_run and scan timestamp fields exist (may be "never" or a timestamp)
 TOTAL=$((TOTAL + 1))
 last_worker=$(jq -r ".last_worker_run" /tmp/gc_test_response.json 2>/dev/null)
 if [ -n "$last_worker" ] && [ "$last_worker" != "null" ]; then
@@ -174,6 +174,26 @@ if [ -n "$last_scan" ] && [ "$last_scan" != "null" ]; then
 else
     FAILED=$((FAILED + 1))
     echo -e "${RED}[FAIL]${NC} Status missing 'last_scan_run' field"
+fi
+
+TOTAL=$((TOTAL + 1))
+last_scan_attempt=$(jq -r ".last_scan_attempt" /tmp/gc_test_response.json 2>/dev/null)
+if [ -n "$last_scan_attempt" ] && [ "$last_scan_attempt" != "null" ]; then
+    PASSED=$((PASSED + 1))
+    echo -e "${GREEN}[PASS]${NC} Status has 'last_scan_attempt' field ($last_scan_attempt)"
+else
+    FAILED=$((FAILED + 1))
+    echo -e "${RED}[FAIL]${NC} Status missing 'last_scan_attempt' field"
+fi
+
+TOTAL=$((TOTAL + 1))
+last_scan_success=$(jq -r ".last_scan_success" /tmp/gc_test_response.json 2>/dev/null)
+if [ -n "$last_scan_success" ] && [ "$last_scan_success" != "null" ]; then
+    PASSED=$((PASSED + 1))
+    echo -e "${GREEN}[PASS]${NC} Status has 'last_scan_success' field ($last_scan_success)"
+else
+    FAILED=$((FAILED + 1))
+    echo -e "${RED}[FAIL]${NC} Status missing 'last_scan_success' field"
 fi
 
 echo ""

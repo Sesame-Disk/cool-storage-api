@@ -138,6 +138,8 @@ type MockStore struct {
 	listLibrariesForOrgErr         error
 	deleteLibraryStorageCounterErr error
 	deleteGroupFullErr             error
+	acquireOrgHardDeleteLockHook   func(orgID uuid.UUID)
+	beginOrgPurgeHook              func(orgID uuid.UUID)
 
 	// optional test hooks for reproducing concurrency windows deterministically.
 	getQueueSizeHook      func(orgID uuid.UUID, size int)
@@ -1287,7 +1289,8 @@ func (m *MockStore) GetOrgDeletedAt(orgID uuid.UUID) (*time.Time, error) {
 	defer m.mu.RUnlock()
 
 	deletedAt, ok := m.orgDeletedAt[orgID]
-	if !ok || m.orgStatus[orgID] != "deleted" {
+	status := m.orgStatus[orgID]
+	if !ok || (status != "deleted" && status != "purging") {
 		return nil, nil
 	}
 	deletedAtCopy := deletedAt
@@ -2397,16 +2400,81 @@ func (m *MockStore) DeleteGroupFull(orgID, groupID uuid.UUID) error {
 	}
 	return nil
 }
-func (m *MockStore) HardDeleteOrg(orgID uuid.UUID) error {
+
+func (m *MockStore) AcquireOrgHardDeleteLock(orgID uuid.UUID) (bool, error) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	if _, locked := m.orgHardDeleteLocks[orgID]; locked {
-		return fmt.Errorf("org %s hard delete already in progress", orgID)
+		m.mu.Unlock()
+		return false, nil
 	}
 	m.orgHardDeleteLocks[orgID] = time.Now()
-	defer delete(m.orgHardDeleteLocks, orgID)
-	if m.orgStatus[orgID] != "deleted" {
+	hook := m.acquireOrgHardDeleteLockHook
+	m.mu.Unlock()
+	if hook != nil {
+		hook(orgID)
+	}
+	return true, nil
+}
+
+func (m *MockStore) ReleaseOrgHardDeleteLock(orgID uuid.UUID) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.orgHardDeleteLocks, orgID)
+	return nil
+}
+
+func (m *MockStore) BeginOrgPurge(orgID uuid.UUID, identityAt time.Time) (bool, error) {
+	if hook := m.beginOrgPurgeHook; hook != nil {
+		hook(orgID)
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	deletedAt, ok := m.orgDeletedAt[orgID]
+	if !ok || !deletedAt.Equal(identityAt) {
+		return false, nil
+	}
+	status := m.orgStatus[orgID]
+	if status == "purging" {
+		return true, nil
+	}
+	if status != "deleted" {
+		return false, nil
+	}
+	m.orgStatus[orgID] = "purging"
+	return true, nil
+}
+
+func (m *MockStore) HardDeleteOrg(orgID uuid.UUID) error {
+	acquired, err := m.AcquireOrgHardDeleteLock(orgID)
+	if err != nil {
+		return err
+	}
+	if !acquired {
+		return fmt.Errorf("org %s hard delete already in progress", orgID)
+	}
+	defer m.ReleaseOrgHardDeleteLock(orgID) //nolint:errcheck
+	deletedAt, err := m.GetOrgDeletedAt(orgID)
+	if err != nil {
+		return err
+	}
+	if deletedAt == nil {
 		return fmt.Errorf("org %s is not in deleted state", orgID)
+	}
+	purging, err := m.BeginOrgPurge(orgID, *deletedAt)
+	if err != nil {
+		return err
+	}
+	if !purging {
+		return fmt.Errorf("org %s is not in deleted state", orgID)
+	}
+	return m.HardDeleteOrgLocked(orgID)
+}
+
+func (m *MockStore) HardDeleteOrgLocked(orgID uuid.UUID) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.orgStatus[orgID] != "purging" {
+		return fmt.Errorf("org %s is not in purge state", orgID)
 	}
 	for _, lib := range m.libraries {
 		if lib.OrgID == orgID {

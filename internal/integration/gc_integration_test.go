@@ -195,6 +195,8 @@ type gcStatusPayload struct {
 	DryRun             bool   `json:"dry_run"`
 	LastWorkerRun      string `json:"last_worker_run"`
 	LastScanRun        string `json:"last_scan_run"`
+	LastScanAttempt    string `json:"last_scan_attempt"`
+	LastScanSuccess    string `json:"last_scan_success"`
 	QueueSize          int    `json:"queue_size"`
 	FailedItemsTotal   int    `json:"failed_items_total"`
 	BlocksDeletedTotal int64  `json:"blocks_deleted_total"`
@@ -216,6 +218,27 @@ func getGCStatus(t *testing.T) gcStatusPayload {
 func getGCQueueSize(t *testing.T) int {
 	t.Helper()
 	return getGCStatus(t).QueueSize
+}
+
+func TestGC_StatusPayloadIncludesScanAttemptAndSuccess(t *testing.T) {
+	requireGCEnabled(t)
+
+	resp := superadminClient.Get(t, "/api/v2.1/admin/gc/status")
+	expectStatus(t, resp, http.StatusOK)
+	payload := responseJSON(t, resp)
+
+	for _, field := range []string{"last_scan_run", "last_scan_attempt", "last_scan_success"} {
+		value, ok := payload[field]
+		if !ok {
+			t.Fatalf("expected gc status payload to include %s", field)
+		}
+		if _, ok := value.(string); !ok {
+			t.Fatalf("expected gc status field %s to be a string, got %T", field, value)
+		}
+	}
+	if payload["last_scan_run"] != payload["last_scan_attempt"] {
+		t.Fatalf("expected last_scan_run legacy alias to match last_scan_attempt, got run=%v attempt=%v", payload["last_scan_run"], payload["last_scan_attempt"])
+	}
 }
 
 func readGCStatsInt(t *testing.T, key string) int {

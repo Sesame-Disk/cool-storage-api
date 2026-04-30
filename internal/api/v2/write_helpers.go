@@ -21,6 +21,7 @@ const (
 	StatusActive      = "active"
 	StatusDeactivated = "deactivated"
 	StatusDeleted     = "deleted"
+	statusPurging     = "purging"
 )
 
 // IsUserUsable returns true if the user status allows normal access.
@@ -501,13 +502,46 @@ func deactivateOrg(db interface{ Session() *gocql.Session }, si SessionInvalidat
 // goroutine re-enables all org share links. Works for both reactivation
 // (deactivated → active) and restore (deleted → active).
 func activateOrg(db interface{ Session() *gocql.Session }, orgID string) error {
-	var lockedOrgID string
-	if err := db.Session().Query(`
-		SELECT org_id FROM gc_org_hard_delete_locks WHERE org_id = ?
-	`, orgID).Scan(&lockedOrgID); err == nil {
-		return fmt.Errorf("organization is pending permanent deletion")
-	} else if !errors.Is(err, gocql.ErrNotFound) {
+	session := db.Session()
+	transitionToActive := func(expectedStatus string) (bool, string, error) {
+		result := map[string]interface{}{}
+		applied, err := session.Query(`
+			UPDATE organizations SET status = ?, deleted_at = ? WHERE org_id = ?
+			IF status = ?
+		`, StatusActive, nil, orgID, expectedStatus).MapScanCAS(result)
+		if err != nil {
+			return false, "", err
+		}
+		currentStatus, _ := result["status"].(string)
+		return applied, currentStatus, nil
+	}
+
+	applied, currentStatus, err := transitionToActive(StatusDeleted)
+	if err != nil {
 		return err
+	}
+	if !applied {
+		switch currentStatus {
+		case StatusActive:
+		case StatusDeactivated:
+			applied, currentStatus, err = transitionToActive(StatusDeactivated)
+			if err != nil {
+				return err
+			}
+			if !applied {
+				switch currentStatus {
+				case StatusActive:
+				case statusPurging:
+					return fmt.Errorf("organization is pending permanent deletion")
+				default:
+					return fmt.Errorf("organization lifecycle changed while reactivating")
+				}
+			}
+		case statusPurging:
+			return fmt.Errorf("organization is pending permanent deletion")
+		default:
+			return fmt.Errorf("organization lifecycle changed while reactivating")
+		}
 	}
 
 	if err := updateOrganizationLifecycleAndReadModel(db, orgID, batchedOrganizationLifecycleUpdate{

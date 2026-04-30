@@ -792,7 +792,7 @@ func (s *CassandraStore) GetOrgDeletedAt(orgID uuid.UUID) (*time.Time, error) {
 		}
 		return nil, err
 	}
-	if status != "deleted" || deletedAt == nil {
+	if (status != "deleted" && status != "purging") || deletedAt == nil {
 		return nil, nil
 	}
 	deletedAtCopy := *deletedAt
@@ -2926,29 +2926,88 @@ func (s *CassandraStore) DeleteGroupFull(orgID, groupID uuid.UUID) error {
 	return batch.Exec()
 }
 
-func (s *CassandraStore) HardDeleteOrg(orgID uuid.UUID) error {
-	session := s.db.Session()
-	if applied, err := session.Query(`
+func (s *CassandraStore) AcquireOrgHardDeleteLock(orgID uuid.UUID) (bool, error) {
+	applied, err := s.db.Session().Query(`
 		INSERT INTO gc_org_hard_delete_locks (org_id, started_at)
 		VALUES (?, ?) IF NOT EXISTS
-	`, orgID.String(), time.Now()).MapScanCAS(map[string]interface{}{}); err != nil {
+	`, orgID.String(), time.Now()).MapScanCAS(map[string]interface{}{})
+	if err != nil {
+		return false, err
+	}
+	return applied, nil
+}
+
+func (s *CassandraStore) ReleaseOrgHardDeleteLock(orgID uuid.UUID) error {
+	return s.db.Session().Query(`DELETE FROM gc_org_hard_delete_locks WHERE org_id = ?`, orgID.String()).Exec()
+}
+
+func (s *CassandraStore) BeginOrgPurge(orgID uuid.UUID, identityAt time.Time) (bool, error) {
+	var status string
+	var deletedAt *time.Time
+	err := s.db.Session().Query(`
+		SELECT status, deleted_at FROM organizations WHERE org_id = ?
+	`, orgID.String()).Scan(&status, &deletedAt)
+	if err != nil {
+		if errors.Is(err, gocql.ErrNotFound) {
+			return false, nil
+		}
+		return false, err
+	}
+	if deletedAt == nil || !deletedAt.Equal(identityAt) {
+		return false, nil
+	}
+	if status == "purging" {
+		return true, nil
+	}
+	if status != "deleted" {
+		return false, nil
+	}
+	applied, err := s.db.Session().Query(`
+		UPDATE organizations SET status = ? WHERE org_id = ?
+		IF status = ? AND deleted_at = ?
+	`, "purging", orgID.String(), "deleted", identityAt).MapScanCAS(map[string]interface{}{})
+	if err != nil {
+		return false, err
+	}
+	return applied, nil
+}
+
+func (s *CassandraStore) HardDeleteOrg(orgID uuid.UUID) error {
+	applied, err := s.AcquireOrgHardDeleteLock(orgID)
+	if err != nil {
 		return err
-	} else if !applied {
+	}
+	if !applied {
 		return fmt.Errorf("org %s hard delete already in progress", orgID)
 	}
-	cleanupLock := true
-	defer func() {
-		if cleanupLock {
-			_ = session.Query(`DELETE FROM gc_org_hard_delete_locks WHERE org_id = ?`, orgID.String()).Exec()
-		}
-	}()
+	defer s.ReleaseOrgHardDeleteLock(orgID) //nolint:errcheck
+
+	deletedAt, err := s.GetOrgDeletedAt(orgID)
+	if err != nil {
+		return err
+	}
+	if deletedAt == nil {
+		return fmt.Errorf("org %s is not in deleted state", orgID)
+	}
+	purging, err := s.BeginOrgPurge(orgID, *deletedAt)
+	if err != nil {
+		return err
+	}
+	if !purging {
+		return fmt.Errorf("org %s is not in deleted state", orgID)
+	}
+	return s.HardDeleteOrgLocked(orgID)
+}
+
+func (s *CassandraStore) HardDeleteOrgLocked(orgID uuid.UUID) error {
+	session := s.db.Session()
 
 	var orgStatus string
 	if err := session.Query(`SELECT status FROM organizations WHERE org_id = ?`, orgID.String()).Scan(&orgStatus); err != nil {
 		return err
 	}
-	if orgStatus != "deleted" {
-		return fmt.Errorf("org %s is not in deleted state", orgID)
+	if orgStatus != "purging" {
+		return fmt.Errorf("org %s is not in purge state", orgID)
 	}
 
 	var childID string
@@ -2979,11 +3038,9 @@ func (s *CassandraStore) HardDeleteOrg(orgID uuid.UUID) error {
 	}
 	batch.Query(`DELETE FROM organizations WHERE org_id = ?`, orgID.String())
 	batch.Query(`DELETE FROM deleted_organizations WHERE org_id = ?`, orgID.String())
-	batch.Query(`DELETE FROM gc_org_hard_delete_locks WHERE org_id = ?`, orgID.String())
 	if err := batch.Exec(); err != nil {
 		return err
 	}
-	cleanupLock = false
 	return nil
 }
 

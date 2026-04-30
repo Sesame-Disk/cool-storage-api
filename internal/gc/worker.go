@@ -836,6 +836,35 @@ func (w *Worker) processOrgCascade(ctx context.Context, item QueueItem) error {
 		return nil
 	}
 
+	acquired, err := w.store.AcquireOrgHardDeleteLock(orgID)
+	if err != nil {
+		return fmt.Errorf("failed to acquire org hard-delete lock for %s: %w", item.ItemID, err)
+	}
+	if !acquired {
+		return fmt.Errorf("org %s hard delete already in progress", item.ItemID)
+	}
+	defer w.store.ReleaseOrgHardDeleteLock(orgID)
+
+	// Secondary stale-check after the lock: if the org was restored in the
+	// window between the first stale-check and the lock acquisition, skip.
+	deletedAt2, err := w.store.GetOrgDeletedAt(orgID)
+	if err != nil {
+		return fmt.Errorf("failed to re-read deleted org marker for %s: %w", item.ItemID, err)
+	}
+	if deletedAt2 == nil || !deletedAt2.Equal(identityAt) {
+		log.Printf("[GC Worker] Skipping org cascade for %s after lock: restored between checks (deleted_at=%v identity_at=%v)", item.ItemID, deletedAt2, identityAt)
+		return nil
+	}
+
+	purging, err := w.store.BeginOrgPurge(orgID, identityAt)
+	if err != nil {
+		return fmt.Errorf("failed to transition org %s into purge state: %w", item.ItemID, err)
+	}
+	if !purging {
+		log.Printf("[GC Worker] Skipping org cascade for %s after purge transition race (identity_at=%v)", item.ItemID, identityAt)
+		return nil
+	}
+
 	orgName, err := w.store.GetOrgName(orgID)
 	if err != nil {
 		return fmt.Errorf("failed to read org name for %s: %w", item.ItemID, err)
@@ -888,7 +917,7 @@ func (w *Worker) processOrgCascade(ctx context.Context, item QueueItem) error {
 		}
 	}
 
-	if err := w.store.HardDeleteOrg(orgID); err != nil {
+	if err := w.store.HardDeleteOrgLocked(orgID); err != nil {
 		return fmt.Errorf("failed to hard-delete org %s: %w", item.ItemID, err)
 	}
 
