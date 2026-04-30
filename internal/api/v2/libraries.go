@@ -517,32 +517,24 @@ func (h *LibraryHandler) CreateLibrary(c *gin.Context) {
 		}
 	}
 
-	// Check if a library with this name already exists for this user
-	// Query all libraries for org, then filter by owner in application code
-	// (acceptable for this rare operation, avoids ALLOW FILTERING performance hit)
-	var existingLibID, existingOwnerID string
-	var existingName string
-	var existingDeletedAt time.Time
-	iter := h.db.Session().Query(`
-		SELECT library_id, owner_id, name, deleted_at FROM libraries WHERE org_id = ?
-	`, orgID).Iter()
-	for iter.Scan(&existingLibID, &existingOwnerID, &existingName, &existingDeletedAt) {
-		// Skip soft-deleted libraries
-		if !existingDeletedAt.IsZero() {
+	// Check if a library with this name already exists for this user.
+	// Use the owner-scoped read model instead of scanning the canonical table.
+	ownerRows, err := db.ListAdminOwnerLibraryRows(h.db.Session(), orgID, userID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to check existing libraries"})
+		return
+	}
+	for _, row := range ownerRows {
+		if row.DeletedAt != nil && !row.DeletedAt.IsZero() {
 			continue
 		}
-		// Filter by owner_id in application code
-		if existingOwnerID == userID {
-			log.Printf("[CreateLibrary] Found existing library: %q (comparing with %q)", existingName, req.Name)
-			if existingName == req.Name {
-				iter.Close()
-				log.Printf("[CreateLibrary] Conflict: library with name %q already exists", req.Name)
-				c.JSON(http.StatusConflict, gin.H{"error": "a library with this name already exists"})
-				return
-			}
+		log.Printf("[CreateLibrary] Found existing library: %q (comparing with %q)", row.Name, req.Name)
+		if row.Name == req.Name {
+			log.Printf("[CreateLibrary] Conflict: library with name %q already exists", req.Name)
+			c.JSON(http.StatusConflict, gin.H{"error": "a library with this name already exists"})
+			return
 		}
 	}
-	iter.Close()
 
 	orgUUID, _ := uuid.Parse(orgID)
 	userUUID, _ := uuid.Parse(userID)

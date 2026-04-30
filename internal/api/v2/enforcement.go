@@ -1,8 +1,6 @@
 package v2
 
 import (
-	"time"
-
 	"github.com/Sesame-Disk/sesamefs/internal/config"
 	"github.com/Sesame-Disk/sesamefs/internal/db"
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
@@ -55,17 +53,15 @@ func CountUploadLinks(database *db.DB, orgID string) int {
 
 // CountActiveLibraries counts non-deleted libraries for an org.
 func CountActiveLibraries(database *db.DB, orgID string) int {
-	iter := database.Session().Query(
-		`SELECT deleted_at FROM libraries WHERE org_id = ?`, orgID,
-	).Iter()
-
-	var deletedAt time.Time
+	rows, err := db.ListAdminOrgLibraryRows(database.Session(), orgID)
+	if err != nil {
+		return 0
+	}
 	count := 0
-	for iter.Scan(&deletedAt) {
-		if deletedAt.IsZero() {
+	for _, row := range rows {
+		if row.DeletedAt == nil || row.DeletedAt.IsZero() {
 			count++
 		}
 	}
-	iter.Close()
 	return count
 }

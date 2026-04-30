@@ -406,6 +406,53 @@ func TestService_RunScannerOnce_RecordsScanErrorWithLeadership(t *testing.T) {
 	}
 }
 
+func TestService_RunScannerOnce_SkipsAutoRetryWithoutLeadership(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	lease := &fakeLeaderLease{allowed: false}
+	orgID := uuid.New()
+	libID := uuid.New()
+	identityAt := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
+	failedAt := time.Now().UTC().Truncate(time.Millisecond)
+	itemID := "heavy-root-child"
+
+	store.failedItems[orgID] = []GCFailedItemInfo{{
+		OrgID:                       orgID,
+		FailedAt:                    failedAt,
+		QueuedAt:                    identityAt,
+		IdentityAt:                  identityAt,
+		RequiresLibraryDeletedCheck: true,
+		ItemType:                    ItemFSObject,
+		ItemID:                      itemID,
+		LibraryID:                   libID,
+		LastError:                   "library " + libID.String() + " hard delete already in progress for child " + itemID,
+		ResolvedState:               "open",
+	}}
+
+	svc := &Service{
+		store:   store,
+		config:  config.GCConfig{Enabled: true},
+		queue:   q,
+		worker:  NewWorker(store, nil, q, 100, 0, false, stats),
+		scanner: NewScanner(store, q, stats, config.GCConfig{}),
+		stats:   stats,
+		lease:   lease,
+	}
+
+	svc.runScannerOnce(context.Background())
+
+	if got := len(store.FailedItems(orgID)); got != 1 {
+		t.Fatalf("expected failed item to remain in DLQ without leadership, got %d items", got)
+	}
+	if got := len(store.QueueItems(orgID)); got != 0 {
+		t.Fatalf("expected no queued items without leadership, got %d", got)
+	}
+	if !svc.stats.LastScanRun().IsZero() {
+		t.Fatal("scanner should not record a scan run without leadership")
+	}
+}
+
 func TestService_RunScannerOnce_ClearsLastScanErrorOnSuccess(t *testing.T) {
 	store := NewMockStore()
 	stats := &Stats{}
@@ -807,6 +854,65 @@ func TestService_RequeueFailedCascade_PreservesIdentityAt(t *testing.T) {
 	}
 }
 
+func TestService_RetryAutoRecoverableFailedItems_RequeuesMissingLibraryChildren(t *testing.T) {
+	store := NewMockStore()
+	orgID := uuid.New()
+	libID := uuid.New()
+	identityAt := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
+	failedAt := time.Now().UTC().Truncate(time.Millisecond)
+	itemID := "heavy-root-child"
+
+	store.failedItems[orgID] = []GCFailedItemInfo{{
+		OrgID:                       orgID,
+		FailedAt:                    failedAt,
+		QueuedAt:                    identityAt,
+		IdentityAt:                  identityAt,
+		RequiresLibraryDeletedCheck: true,
+		ItemType:                    ItemFSObject,
+		ItemID:                      itemID,
+		LibraryID:                   libID,
+		StorageClass:                "hot",
+		RetryCount:                  5,
+		LastError:                   "library " + libID.String() + " hard delete already in progress for child " + itemID,
+		ResolvedState:               "open",
+	}}
+
+	svc := &Service{
+		store:  store,
+		config: config.GCConfig{Enabled: true},
+		lease:  &fakeLeaderLease{allowed: true},
+	}
+
+	if retried := svc.retryAutoRecoverableFailedItems(); retried != 1 {
+		t.Fatalf("retryAutoRecoverableFailedItems retried %d items, want 1", retried)
+	}
+
+	failedItems, err := store.ListFailedItems(orgID, 10)
+	if err != nil {
+		t.Fatalf("ListFailedItems after auto-requeue: %v", err)
+	}
+	if len(failedItems) != 0 {
+		t.Fatalf("expected failed item to be removed from DLQ, got %d entries", len(failedItems))
+	}
+
+	items := store.QueueItems(orgID)
+	if len(items) != 1 {
+		t.Fatalf("expected 1 queue item after auto-requeue, got %d", len(items))
+	}
+	if items[0].ItemType != ItemFSObject || items[0].ItemID != itemID {
+		t.Fatalf("unexpected requeued item: type=%s id=%s", items[0].ItemType, items[0].ItemID)
+	}
+	if items[0].LibraryID != libID {
+		t.Fatalf("requeued item library_id = %s, want %s", items[0].LibraryID, libID)
+	}
+	if !items[0].IdentityAt.Equal(identityAt) {
+		t.Fatalf("requeued item IdentityAt = %v, want %v", items[0].IdentityAt, identityAt)
+	}
+	if !items[0].RequiresLibraryDeletedCheck {
+		t.Fatal("requeued item lost RequiresLibraryDeletedCheck flag")
+	}
+}
+
 func TestService_ReconcileDirtyQueueStats_CorrectsSnapshotDrift(t *testing.T) {
 	store := NewMockStore()
 	orgA := uuid.New()
@@ -1039,6 +1145,32 @@ func TestService_ManualTrigger(t *testing.T) {
 	svc.Stop()
 }
 
+func TestService_Start_RunsWorkerImmediately(t *testing.T) {
+	cfg := config.GCConfig{
+		Enabled:        true,
+		WorkerInterval: 10 * time.Minute,
+		ScanInterval:   10 * time.Minute,
+		BatchSize:      10,
+		GracePeriod:    1 * time.Hour,
+		DryRun:         true,
+	}
+
+	store := NewMockStore()
+	svc := NewService(store, nil, cfg, nil)
+	svc.Start()
+	defer svc.Stop()
+
+	deadline := time.Now().Add(200 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if !svc.stats.LastWorkerRun().IsZero() {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	t.Fatal("expected worker to run immediately on Start without waiting for the first ticker")
+}
+
 func TestService_DisabledDoesNotStart(t *testing.T) {
 	cfg := config.GCConfig{
 		Enabled: false,
@@ -1220,5 +1352,48 @@ func TestService_PersistStats_SkipsZeroTimes(t *testing.T) {
 	}
 	if val, _ := store.LoadGCStats("blocks_deleted_total"); val != "10" {
 		t.Errorf("blocks_deleted_total = %q, want %q", val, "10")
+	}
+}
+
+func TestService_Status_UsesPersistedSharedStats(t *testing.T) {
+	store := NewMockStore()
+	cfg := config.GCConfig{Enabled: true, GracePeriod: time.Minute}
+	workerTime := time.Date(2026, 4, 30, 22, 10, 0, 0, time.UTC)
+	scanAttempt := time.Date(2026, 4, 30, 22, 11, 0, 0, time.UTC)
+	scanSuccess := time.Date(2026, 4, 30, 22, 11, 30, 0, time.UTC)
+
+	if err := store.SaveGCStats(gcStatKeyLastWorkerRun, workerTime.Format(time.RFC3339)); err != nil {
+		t.Fatalf("SaveGCStats(last_worker_run): %v", err)
+	}
+	if err := store.SaveGCStats(gcStatKeyLastScanAttempt, scanAttempt.Format(time.RFC3339)); err != nil {
+		t.Fatalf("SaveGCStats(last_scan_attempt): %v", err)
+	}
+	if err := store.SaveGCStats(gcStatKeyLastScanSuccess, scanSuccess.Format(time.RFC3339)); err != nil {
+		t.Fatalf("SaveGCStats(last_scan_success): %v", err)
+	}
+	if err := store.SaveGCStats(gcStatKeyLastScanError, "leader scan failed"); err != nil {
+		t.Fatalf("SaveGCStats(last_scan_error): %v", err)
+	}
+	if err := store.SaveGCStats(gcStatKeyBlocksDeletedTotal, "42"); err != nil {
+		t.Fatalf("SaveGCStats(blocks_deleted_total): %v", err)
+	}
+
+	svc := NewService(store, nil, cfg, nil)
+	status := svc.Status()
+
+	if status.LastWorkerRun != workerTime.Format(time.RFC3339) {
+		t.Fatalf("Status().LastWorkerRun = %q, want %q", status.LastWorkerRun, workerTime.Format(time.RFC3339))
+	}
+	if status.LastScanAttempt != scanAttempt.Format(time.RFC3339) {
+		t.Fatalf("Status().LastScanAttempt = %q, want %q", status.LastScanAttempt, scanAttempt.Format(time.RFC3339))
+	}
+	if status.LastScanSuccess != scanSuccess.Format(time.RFC3339) {
+		t.Fatalf("Status().LastScanSuccess = %q, want %q", status.LastScanSuccess, scanSuccess.Format(time.RFC3339))
+	}
+	if status.LastScanError != "leader scan failed" {
+		t.Fatalf("Status().LastScanError = %q, want %q", status.LastScanError, "leader scan failed")
+	}
+	if status.BlocksDeletedTotal != 42 {
+		t.Fatalf("Status().BlocksDeletedTotal = %d, want 42", status.BlocksDeletedTotal)
 	}
 }

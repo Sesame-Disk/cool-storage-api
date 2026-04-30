@@ -7,6 +7,7 @@ import (
 	"log"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -105,8 +106,16 @@ const (
 	gcStatKeyTotalFailed         = "total_failed_items"
 	gcStatKeyTotalDirtyOrgs      = "dirty_orgs_total"
 	gcStatKeyLastReconcile       = "last_reconcile_run"
+	gcStatKeyLastWorkerRun       = "last_worker_run"
+	gcStatKeyLastScanRun         = "last_scan_run"
+	gcStatKeyLastScanAttempt     = "last_scan_attempt"
+	gcStatKeyLastScanSuccess     = "last_scan_success"
+	gcStatKeyLastScanError       = "last_scan_error"
+	gcStatKeyBlocksDeletedTotal  = "blocks_deleted_total"
 	gcDefaultFailedItemsPageSize = 100
 	gcDefaultFailedOrgPageSize   = 20
+	gcAutoRetryFailedOrgLimit    = 20
+	gcAutoRetryFailedItemLimit   = 100
 	gcSnapshotDriftCheckEvery    = 10
 )
 
@@ -300,11 +309,28 @@ func (s *Service) Status() GCStatus {
 	queueSize := s.loadStatInt(gcStatKeyTotalQueue)
 	failedItemsTotal := s.loadStatInt(gcStatKeyTotalFailed)
 
-	lastWorker := s.stats.LastWorkerRun()
-	lastScanAttempt := s.stats.LastScanAttempt()
-	lastScanSuccess := s.stats.LastScanSuccess()
+	lastWorker := s.loadStatTime(gcStatKeyLastWorkerRun)
+	if local := s.stats.LastWorkerRun(); lastWorker.IsZero() || (!local.IsZero() && local.After(lastWorker)) {
+		lastWorker = local
+	}
+	lastScanAttempt := s.loadStatTime(gcStatKeyLastScanAttempt)
+	if local := s.stats.LastScanAttempt(); lastScanAttempt.IsZero() || (!local.IsZero() && local.After(lastScanAttempt)) {
+		lastScanAttempt = local
+	}
+	lastScanSuccess := s.loadStatTime(gcStatKeyLastScanSuccess)
+	if local := s.stats.LastScanSuccess(); lastScanSuccess.IsZero() || (!local.IsZero() && local.After(lastScanSuccess)) {
+		lastScanSuccess = local
+	}
+	lastScanError := s.loadStatString(gcStatKeyLastScanError)
+	if lastScanError == "" {
+		lastScanError = s.stats.LastScanError()
+	}
 	lastReconcile := s.loadStatTime(gcStatKeyLastReconcile)
 	dirtyOrgs := s.loadStatInt(gcStatKeyTotalDirtyOrgs)
+	blocksDeletedTotal := int64(s.loadStatInt(gcStatKeyBlocksDeletedTotal))
+	if local := s.stats.BlocksDeleted(); local > blocksDeletedTotal {
+		blocksDeletedTotal = local
+	}
 	// -1 means "no reconciliation has run yet" — distinct from "0 seconds old".
 	// Dashboards/alerts can branch on this sentinel instead of reading a falsely
 	// fresh age right after deploy.
@@ -330,15 +356,23 @@ func (s *Service) Status() GCStatus {
 		LastScanRun:        formatTime(lastScanAttempt),
 		LastScanAttempt:    formatTime(lastScanAttempt),
 		LastScanSuccess:    formatTime(lastScanSuccess),
-		LastScanError:      s.stats.LastScanError(),
+		LastScanError:      lastScanError,
 		LastReconcileRun:   formatTime(lastReconcile),
 		QueueSize:          queueSize,
 		FailedItemsTotal:   failedItemsTotal,
 		DirtyOrgsTotal:     dirtyOrgs,
 		SnapshotAgeSeconds: snapshotAgeSeconds,
-		BlocksDeletedTotal: s.stats.BlocksDeleted(),
+		BlocksDeletedTotal: blocksDeletedTotal,
 		GracePeriodSeconds: int64(s.config.GracePeriod.Seconds()),
 	}
+}
+
+func (s *Service) loadStatString(key string) string {
+	val, err := s.store.LoadGCStats(key)
+	if err != nil {
+		return ""
+	}
+	return val
 }
 
 // RefreshFailedItemSnapshot repairs stale failed-item counters derived from
@@ -399,6 +433,10 @@ func (s *Service) EnqueueCommits(orgID, libraryID uuid.UUID, commitIDs []string)
 }
 
 func (s *Service) runWorkerLoop(ctx context.Context) {
+	// Run the worker immediately on startup so persisted queue work resumes
+	// without waiting for the first ticker interval after restart.
+	s.runWorkerOnce(ctx)
+
 	ticker := time.NewTicker(s.config.WorkerInterval)
 	defer ticker.Stop()
 
@@ -440,6 +478,7 @@ func (s *Service) runWorkerOnce(ctx context.Context) {
 			metrics.GCWorkerLastSuccessTimestamp.Set(float64(now.Unix()))
 		}
 	}
+	s.persistStats()
 
 	s.reconcileDirtyQueueStats(s.reconcileLimit())
 
@@ -478,15 +517,92 @@ func (s *Service) runScannerOnce(ctx context.Context) {
 
 	start := time.Now()
 	err := s.scanner.ScanOnce(ctx)
+	retried := s.retryAutoRecoverableFailedItems()
 	if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 		log.Printf("[GC Scanner] Error: %v", err)
 		s.stats.SetLastScanError(err.Error())
 	} else if err == nil {
 		s.stats.SetLastScanError("")
 	}
+	s.persistStats()
+	if retried > 0 {
+		log.Printf("[GC Scanner] Auto-requeued %d recoverable failed items", retried)
+		s.TriggerWorker()
+	}
 	s.reconcileDirtyQueueStats(s.reconcileLimit())
 	metrics.GCScannerDuration.Observe(time.Since(start).Seconds())
 	metrics.GCLastScannerRun.Set(float64(time.Now().Unix()))
+}
+
+func (s *Service) retryAutoRecoverableFailedItems() int {
+	orgs, err := s.store.ListOrgsWithFailedItems(gcAutoRetryFailedOrgLimit)
+	if err != nil {
+		log.Printf("[GC Scanner] Failed to list orgs with failed items for auto-retry: %v", err)
+		return 0
+	}
+
+	retried := 0
+	s.dlqOpsMu.Lock()
+	defer s.dlqOpsMu.Unlock()
+
+	for _, org := range orgs {
+		if retried >= gcAutoRetryFailedItemLimit {
+			break
+		}
+
+		items, err := s.store.ListFailedItems(org.OrgID, s.FailedItemsPageSize())
+		if err != nil {
+			log.Printf("[GC Scanner] Failed to list failed items for org %s: %v", org.OrgID, err)
+			continue
+		}
+
+		for _, item := range items {
+			if retried >= gcAutoRetryFailedItemLimit {
+				break
+			}
+
+			eligible, err := s.isAutoRecoverableFailedItem(item)
+			if err != nil {
+				log.Printf("[GC Scanner] Failed to classify DLQ item %s/%s: %v", item.OrgID, item.ItemID, err)
+				continue
+			}
+			if !eligible {
+				continue
+			}
+
+			if err := s.store.RequeueFailedItem(item.OrgID, item.FailedAt, item.ItemType, item.ItemID, time.Now().UTC()); err != nil {
+				log.Printf("[GC Scanner] Failed to auto-requeue DLQ item %s/%s: %v", item.OrgID, item.ItemID, err)
+				continue
+			}
+			retried++
+		}
+	}
+
+	return retried
+}
+
+func (s *Service) isAutoRecoverableFailedItem(item GCFailedItemInfo) (bool, error) {
+	if item.ResolvedState != "" && item.ResolvedState != "open" {
+		return false, nil
+	}
+	if !item.RequiresLibraryDeletedCheck {
+		return false, nil
+	}
+	if item.ItemType != ItemCommit && item.ItemType != ItemFSObject {
+		return false, nil
+	}
+	if item.LibraryID == uuid.Nil {
+		return false, nil
+	}
+	if !strings.Contains(item.LastError, "hard delete already in progress") {
+		return false, nil
+	}
+
+	exists, err := s.store.LibraryExists(item.LibraryID)
+	if err != nil {
+		return false, fmt.Errorf("confirm library existence for DLQ item %s/%s: %w", item.LibraryID, item.ItemID, err)
+	}
+	return !exists, nil
 }
 
 func (s *Service) loadStatTime(key string) time.Time {
@@ -886,46 +1002,46 @@ func (s *Service) runRolloverOnce() {
 // persistStats saves GC stats to the database for recovery after restart.
 func (s *Service) persistStats() {
 	if lastWorker := s.stats.LastWorkerRun(); !lastWorker.IsZero() {
-		s.store.SaveGCStats("last_worker_run", lastWorker.Format(time.RFC3339))
+		s.store.SaveGCStats(gcStatKeyLastWorkerRun, lastWorker.Format(time.RFC3339))
 	}
 	if lastScan := s.stats.LastScanRun(); !lastScan.IsZero() {
-		s.store.SaveGCStats("last_scan_run", lastScan.Format(time.RFC3339))
+		s.store.SaveGCStats(gcStatKeyLastScanRun, lastScan.Format(time.RFC3339))
 	}
 	if lastScanAttempt := s.stats.LastScanAttempt(); !lastScanAttempt.IsZero() {
-		s.store.SaveGCStats("last_scan_attempt", lastScanAttempt.Format(time.RFC3339))
+		s.store.SaveGCStats(gcStatKeyLastScanAttempt, lastScanAttempt.Format(time.RFC3339))
 	}
 	if lastScanSuccess := s.stats.LastScanSuccess(); !lastScanSuccess.IsZero() {
-		s.store.SaveGCStats("last_scan_success", lastScanSuccess.Format(time.RFC3339))
+		s.store.SaveGCStats(gcStatKeyLastScanSuccess, lastScanSuccess.Format(time.RFC3339))
 	}
-	s.store.SaveGCStats("last_scan_error", s.stats.LastScanError())
-	s.store.SaveGCStats("blocks_deleted_total", fmt.Sprintf("%d", s.stats.BlocksDeleted()))
+	s.store.SaveGCStats(gcStatKeyLastScanError, s.stats.LastScanError())
+	s.store.SaveGCStats(gcStatKeyBlocksDeletedTotal, fmt.Sprintf("%d", s.stats.BlocksDeleted()))
 }
 
 // restoreStats loads persisted GC stats from the database on startup.
 func (s *Service) restoreStats() {
-	if val, err := s.store.LoadGCStats("last_worker_run"); err == nil && val != "" {
+	if val, err := s.store.LoadGCStats(gcStatKeyLastWorkerRun); err == nil && val != "" {
 		if t, err := time.Parse(time.RFC3339, val); err == nil {
 			s.stats.SetLastWorkerRun(t)
 		}
 	}
-	if val, err := s.store.LoadGCStats("last_scan_attempt"); err == nil && val != "" {
+	if val, err := s.store.LoadGCStats(gcStatKeyLastScanAttempt); err == nil && val != "" {
 		if t, err := time.Parse(time.RFC3339, val); err == nil {
 			s.stats.SetLastScanAttempt(t)
 		}
-	} else if val, err := s.store.LoadGCStats("last_scan_run"); err == nil && val != "" {
+	} else if val, err := s.store.LoadGCStats(gcStatKeyLastScanRun); err == nil && val != "" {
 		if t, err := time.Parse(time.RFC3339, val); err == nil {
 			s.stats.SetLastScanAttempt(t)
 		}
 	}
-	if val, err := s.store.LoadGCStats("last_scan_success"); err == nil && val != "" {
+	if val, err := s.store.LoadGCStats(gcStatKeyLastScanSuccess); err == nil && val != "" {
 		if t, err := time.Parse(time.RFC3339, val); err == nil {
 			s.stats.SetLastScanSuccess(t)
 		}
 	}
-	if val, err := s.store.LoadGCStats("last_scan_error"); err == nil && val != "" {
+	if val, err := s.store.LoadGCStats(gcStatKeyLastScanError); err == nil && val != "" {
 		s.stats.SetLastScanError(val)
 	}
-	if val, err := s.store.LoadGCStats("blocks_deleted_total"); err == nil && val != "" {
+	if val, err := s.store.LoadGCStats(gcStatKeyBlocksDeletedTotal); err == nil && val != "" {
 		if n, err := strconv.ParseInt(val, 10, 64); err == nil {
 			s.stats.blocksDeleted.Store(n)
 		}

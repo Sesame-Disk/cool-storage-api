@@ -1301,6 +1301,72 @@ func TestWorker_ProcessLibraryCascade_ChildrenContinueAfterHardDelete(t *testing
 	}
 }
 
+func TestWorker_ProcessLibraryCascade_ChildrenContinueAfterHardDeleteWithStaleLock(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	w := NewWorker(store, nil, q, 100, 0, false, stats)
+
+	orgID := uuid.New()
+	libID := uuid.New()
+	deletedAt := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
+
+	store.AddOrganization(orgID)
+	store.AddDeletedLibrary(orgID, libID, "hot", deletedAt)
+	store.AddCommit(libID, "commit-1", "fs-root")
+	store.AddBlock(orgID, "blk-a", "hot", 1)
+	store.AddFSObject(libID, "fs-root", "file", []string{"blk-a"})
+
+	item := QueueItem{OrgID: orgID, QueuedAt: deletedAt, IdentityAt: deletedAt, ItemType: ItemLibraryCascade, ItemID: libID.String(), StorageClass: "hot"}
+	if err := w.processLibraryCascade(context.Background(), item); err != nil {
+		t.Fatalf("processLibraryCascade failed: %v", err)
+	}
+	if exists, err := store.LibraryExists(libID); err != nil {
+		t.Fatalf("LibraryExists failed: %v", err)
+	} else if exists {
+		t.Fatal("library should be hard-deleted after successful cascade")
+	}
+
+	acquired, err := store.AcquireLibraryHardDeleteLock(libID)
+	if err != nil {
+		t.Fatalf("AcquireLibraryHardDeleteLock after hard delete failed: %v", err)
+	}
+	if !acquired {
+		t.Fatal("expected to simulate a lingering library hard-delete lock")
+	}
+
+	var commitItem QueueItem
+	var fsObjectItem QueueItem
+	for _, queued := range store.QueueItems(orgID) {
+		switch {
+		case queued.ItemType == ItemCommit && queued.ItemID == "commit-1":
+			commitItem = queued
+		case queued.ItemType == ItemFSObject && queued.ItemID == "fs-root":
+			fsObjectItem = queued
+		}
+	}
+	if commitItem.ItemID == "" || fsObjectItem.ItemID == "" {
+		t.Fatalf("expected commit and fs_object children after cascade, got commit=%q fs_object=%q", commitItem.ItemID, fsObjectItem.ItemID)
+	}
+
+	if err := w.processCommit(commitItem); err != nil {
+		t.Fatalf("processCommit with stale lock after hard delete failed: %v", err)
+	}
+	if store.GetCommitRecord(libID, "commit-1") != nil {
+		t.Fatal("commit should be deleted after hard delete even if lock row lingers")
+	}
+
+	if err := w.processFSObject(context.Background(), fsObjectItem); err != nil {
+		t.Fatalf("processFSObject with stale lock after hard delete failed: %v", err)
+	}
+	if store.GetFSObj(libID, "fs-root") != nil {
+		t.Fatal("fs_object should be deleted after hard delete even if lock row lingers")
+	}
+	if got := store.GetBlock(orgID, "blk-a").RefCount; got != 0 {
+		t.Fatalf("block ref_count after stale-lock hard-delete child processing = %d, want 0", got)
+	}
+}
+
 func TestWorker_ProcessLibraryCascade_RetryableAuxCleanupDoesNotDuplicateChildren(t *testing.T) {
 	store := NewMockStore()
 	stats := &Stats{}

@@ -1068,14 +1068,17 @@ func (w *Worker) acquireLibraryDeleteGuard(item QueueItem) (func(), bool, error)
 		return func() {}, false, nil
 	}
 	identityAt := effectiveIdentityAt(item.QueuedAt, item.IdentityAt)
+	libraryMissing := false
 	isStale := func(deletedAt *time.Time) (bool, error) {
 		if deletedAt == nil {
 			exists, err := w.store.LibraryExists(item.LibraryID)
 			if err != nil {
 				return false, fmt.Errorf("failed to confirm library existence for child %s/%s: %w", item.LibraryID, item.ItemID, err)
 			}
+			libraryMissing = !exists
 			return exists, nil
 		}
+		libraryMissing = false
 		return !deletedAt.Equal(identityAt), nil
 	}
 
@@ -1090,6 +1093,11 @@ func (w *Worker) acquireLibraryDeleteGuard(item QueueItem) (func(), bool, error)
 	if stale {
 		log.Printf("[GC Worker] Skipping stale guarded item %s/%s (current deleted_at=%v identity_at=%v)", item.LibraryID, item.ItemID, deletedAt, identityAt)
 		return func() {}, true, nil
+	}
+	if libraryMissing {
+		// The library has already been hard-deleted, so any remaining child items
+		// should continue draining even if a short-lived lock row lingers until TTL.
+		return func() {}, false, nil
 	}
 
 	acquired, err := w.store.AcquireLibraryHardDeleteLock(item.LibraryID)
