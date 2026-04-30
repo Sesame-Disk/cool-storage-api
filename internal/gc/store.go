@@ -21,7 +21,7 @@ type GCStore interface {
 	PendingItemExists(orgID, libraryID uuid.UUID, identityAt time.Time, itemType ItemType, itemID string) (bool, error)
 	DequeueBatch(orgID uuid.UUID, batchSize int, cutoff time.Time) ([]QueueItem, error)
 	CompleteItem(orgID uuid.UUID, queuedAt time.Time, itemType ItemType, itemID string) error
-	RequeueItem(orgID uuid.UUID, oldQueuedAt, newQueuedAt time.Time, itemType ItemType, itemID string, libraryID uuid.UUID, storageClass string, newRetryCount int, identityAt time.Time) error
+	RequeueItem(orgID uuid.UUID, oldQueuedAt, newQueuedAt time.Time, itemType ItemType, itemID string, libraryID uuid.UUID, storageClass string, newRetryCount int, identityAt time.Time, requiresLibraryDeletedCheck bool) error
 	FailItem(item QueueItem, failedAt time.Time, lastError string) error
 	GetQueueSize(orgID uuid.UUID) (int, error)
 	GetTotalQueueSize() (int, error)
@@ -263,18 +263,19 @@ type GCFailedItemOrgInfo struct {
 
 // GCFailedItemInfo represents an item moved to the GC dead-letter queue.
 type GCFailedItemInfo struct {
-	OrgID         uuid.UUID
-	FailedAt      time.Time
-	QueuedAt      time.Time
-	IdentityAt    time.Time
-	ItemType      ItemType
-	ItemID        string
-	LibraryID     uuid.UUID
-	StorageClass  string
-	RetryCount    int
-	LastError     string
-	ResolvedAt    *time.Time
-	ResolvedState string
+	OrgID                       uuid.UUID
+	FailedAt                    time.Time
+	QueuedAt                    time.Time
+	IdentityAt                  time.Time
+	RequiresLibraryDeletedCheck bool
+	ItemType                    ItemType
+	ItemID                      string
+	LibraryID                   uuid.UUID
+	StorageClass                string
+	RetryCount                  int
+	LastError                   string
+	ResolvedAt                  *time.Time
+	ResolvedState               string
 }
 
 // GCDirtyOrg identifies an org whose queue snapshot needs reconciliation.

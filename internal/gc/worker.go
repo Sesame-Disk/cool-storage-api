@@ -355,6 +355,14 @@ func (w *Worker) RecoverS3Orphans(ctx context.Context, perOrgLimit int) (int, er
 
 func (w *Worker) processCommit(item QueueItem) error {
 	identityAt := effectiveIdentityAt(item.QueuedAt, item.IdentityAt)
+	releaseGuard, stale, err := w.acquireLibraryDeleteGuard(item)
+	if err != nil {
+		return err
+	}
+	if stale {
+		return nil
+	}
+	defer releaseGuard()
 
 	// Get the commit to find its root_fs_id for cascading deletion
 	commit, err := w.store.GetCommit(item.LibraryID, item.ItemID)
@@ -381,12 +389,13 @@ func (w *Worker) processCommit(item QueueItem) error {
 		}
 		if !exists {
 			child := QueueItem{
-				OrgID:      item.OrgID,
-				QueuedAt:   item.QueuedAt,
-				IdentityAt: identityAt,
-				ItemType:   ItemFSObject,
-				ItemID:     commit.RootFSID,
-				LibraryID:  item.LibraryID,
+				OrgID:                       item.OrgID,
+				QueuedAt:                    item.QueuedAt,
+				IdentityAt:                  identityAt,
+				RequiresLibraryDeletedCheck: item.RequiresLibraryDeletedCheck,
+				ItemType:                    ItemFSObject,
+				ItemID:                      commit.RootFSID,
+				LibraryID:                   item.LibraryID,
 			}
 			if err := w.queue.EnqueueBatch([]QueueItem{child}); err != nil {
 				return fmt.Errorf("failed to enqueue root fs_object %s for commit %s: %w", commit.RootFSID, item.ItemID, err)
@@ -404,6 +413,14 @@ func (w *Worker) processCommit(item QueueItem) error {
 
 func (w *Worker) processFSObject(ctx context.Context, item QueueItem) error {
 	identityAt := effectiveIdentityAt(item.QueuedAt, item.IdentityAt)
+	releaseGuard, stale, err := w.acquireLibraryDeleteGuard(item)
+	if err != nil {
+		return err
+	}
+	if stale {
+		return nil
+	}
+	defer releaseGuard()
 
 	// Get the fs_object to find its block_ids
 	fsObj, err := w.store.GetFSObject(item.LibraryID, item.ItemID)
@@ -426,14 +443,15 @@ func (w *Worker) processFSObject(ctx context.Context, item QueueItem) error {
 				continue
 			}
 			batch = append(batch, QueueItem{
-				OrgID:        item.OrgID,
-				QueuedAt:     item.QueuedAt,
-				IdentityAt:   identityAt,
-				ItemType:     ItemFSObject,
-				ItemID:       childID,
-				LibraryID:    item.LibraryID,
-				StorageClass: "",
-				RetryCount:   0,
+				OrgID:                       item.OrgID,
+				QueuedAt:                    item.QueuedAt,
+				IdentityAt:                  identityAt,
+				RequiresLibraryDeletedCheck: item.RequiresLibraryDeletedCheck,
+				ItemType:                    ItemFSObject,
+				ItemID:                      childID,
+				LibraryID:                   item.LibraryID,
+				StorageClass:                "",
+				RetryCount:                  0,
 			})
 		}
 		if err := w.queue.EnqueueBatch(batch); err != nil {
@@ -736,12 +754,12 @@ func (w *Worker) processLibraryCascade(ctx context.Context, item QueueItem) erro
 	return w.cascadeDeleteLibrary(item.OrgID, libraryID, item.StorageClass, identityAt)
 }
 
-func (w *Worker) cascadeDeleteLibrary(orgID, libraryID uuid.UUID, storageClass string, queuedAt time.Time) error {
+func (w *Worker) cascadeDeleteLibrary(orgID, libraryID uuid.UUID, storageClass string, libraryDeletedAt time.Time) error {
 	if storageClass == "" {
 		storageClass, _ = w.store.GetLibraryStorageClass(orgID, libraryID)
 	}
 
-	if err := w.enqueueLibraryContentsAt(orgID, libraryID, storageClass, queuedAt); err != nil {
+	if err := w.enqueueLibraryContentsAt(orgID, libraryID, storageClass, libraryDeletedAt, true); err != nil {
 		return fmt.Errorf("failed to enqueue library contents: %w", err)
 	}
 
@@ -799,12 +817,21 @@ func (w *Worker) processOrgCascade(ctx context.Context, item QueueItem) error {
 		log.Printf("[GC Worker] Failed to list libraries for org %s: %v", item.ItemID, err)
 	} else {
 		for _, lib := range libs {
+			libraryDeletedAt := lib.DeletedAt
 			if lib.DeletedAt.IsZero() {
 				if err := w.store.SoftDeleteLibrary(orgID, lib.LibraryID, uuid.Nil); err != nil {
 					return fmt.Errorf("failed to soft-delete library %s during org cascade: %w", lib.LibraryID, err)
 				}
+				deletedLibraryAt, err := w.store.GetLibraryDeletedAt(lib.LibraryID)
+				if err != nil {
+					return fmt.Errorf("failed to read deleted library marker for %s during org cascade: %w", lib.LibraryID, err)
+				}
+				if deletedLibraryAt == nil {
+					return fmt.Errorf("missing deleted library marker for %s during org cascade", lib.LibraryID)
+				}
+				libraryDeletedAt = *deletedLibraryAt
 			}
-			if err := w.cascadeDeleteLibrary(orgID, lib.LibraryID, lib.StorageClass, identityAt); err != nil {
+			if err := w.cascadeDeleteLibrary(orgID, lib.LibraryID, lib.StorageClass, libraryDeletedAt); err != nil {
 				return fmt.Errorf("failed to cascade-delete library %s during org delete: %w", lib.LibraryID, err)
 			}
 		}
@@ -911,10 +938,10 @@ func (w *Worker) enqueueZeroRefBlocks(orgID, libraryID uuid.UUID, blockIDs []str
 // Only enqueues commits and fs_objects — blocks are handled in cascade
 // when fs_objects are processed (via decrementAndFindZeroRef).
 func (w *Worker) EnqueueLibraryContents(orgID, libraryID uuid.UUID, storageClass string) error {
-	return w.enqueueLibraryContentsAt(orgID, libraryID, storageClass, w.clock())
+	return w.enqueueLibraryContentsAt(orgID, libraryID, storageClass, w.clock(), false)
 }
 
-func (w *Worker) enqueueLibraryContentsAt(orgID, libraryID uuid.UUID, storageClass string, identityAt time.Time) error {
+func (w *Worker) enqueueLibraryContentsAt(orgID, libraryID uuid.UUID, storageClass string, identityAt time.Time, requiresLibraryDeletedCheck bool) error {
 	if identityAt.IsZero() {
 		identityAt = w.clock()
 	}
@@ -935,7 +962,7 @@ func (w *Worker) enqueueLibraryContentsAt(orgID, libraryID uuid.UUID, storageCla
 				continue
 			}
 			batch = append(batch, QueueItem{
-				OrgID: orgID, QueuedAt: identityAt, IdentityAt: identityAt, ItemType: ItemCommit,
+				OrgID: orgID, QueuedAt: identityAt, IdentityAt: identityAt, RequiresLibraryDeletedCheck: requiresLibraryDeletedCheck, ItemType: ItemCommit,
 				ItemID: c.CommitID, LibraryID: libraryID,
 			})
 		}
@@ -962,7 +989,7 @@ func (w *Worker) enqueueLibraryContentsAt(orgID, libraryID uuid.UUID, storageCla
 				continue
 			}
 			batch = append(batch, QueueItem{
-				OrgID: orgID, QueuedAt: identityAt, IdentityAt: identityAt, ItemType: ItemFSObject,
+				OrgID: orgID, QueuedAt: identityAt, IdentityAt: identityAt, RequiresLibraryDeletedCheck: requiresLibraryDeletedCheck, ItemType: ItemFSObject,
 				ItemID: obj.FSID, LibraryID: libraryID,
 			})
 		}
@@ -981,6 +1008,66 @@ func (w *Worker) enqueueLibraryContentsAt(orgID, libraryID uuid.UUID, storageCla
 
 	log.Printf("[GC Worker] Enqueued library %s contents for deletion (%d commits, %d fs_objects, %d shares, %d share links)", libraryID, len(commits), len(fsObjects), shareCount, linkCount)
 	return nil
+}
+
+func (w *Worker) acquireLibraryDeleteGuard(item QueueItem) (func(), bool, error) {
+	if !item.RequiresLibraryDeletedCheck {
+		return func() {}, false, nil
+	}
+	identityAt := effectiveIdentityAt(item.QueuedAt, item.IdentityAt)
+	isStale := func(deletedAt *time.Time) (bool, error) {
+		if deletedAt == nil {
+			exists, err := w.store.LibraryExists(item.LibraryID)
+			if err != nil {
+				return false, fmt.Errorf("failed to confirm library existence for child %s/%s: %w", item.LibraryID, item.ItemID, err)
+			}
+			return exists, nil
+		}
+		return !deletedAt.Equal(identityAt), nil
+	}
+
+	deletedAt, err := w.store.GetLibraryDeletedAt(item.LibraryID)
+	if err != nil {
+		return nil, false, fmt.Errorf("failed to read deleted library marker for %s/%s: %w", item.LibraryID, item.ItemID, err)
+	}
+	stale, err := isStale(deletedAt)
+	if err != nil {
+		return nil, false, err
+	}
+	if stale {
+		log.Printf("[GC Worker] Skipping stale guarded item %s/%s (current deleted_at=%v identity_at=%v)", item.LibraryID, item.ItemID, deletedAt, identityAt)
+		return func() {}, true, nil
+	}
+
+	acquired, err := w.store.AcquireLibraryHardDeleteLock(item.LibraryID)
+	if err != nil {
+		return nil, false, fmt.Errorf("failed to acquire library hard-delete lock for child %s/%s: %w", item.LibraryID, item.ItemID, err)
+	}
+	if !acquired {
+		return nil, false, fmt.Errorf("library %s hard delete already in progress for child %s", item.LibraryID, item.ItemID)
+	}
+
+	release := func() {
+		_ = w.store.ReleaseLibraryHardDeleteLock(item.LibraryID)
+	}
+
+	deletedAt2, err := w.store.GetLibraryDeletedAt(item.LibraryID)
+	if err != nil {
+		release()
+		return nil, false, fmt.Errorf("failed to re-read deleted library marker for child %s/%s: %w", item.LibraryID, item.ItemID, err)
+	}
+	stale, err = isStale(deletedAt2)
+	if err != nil {
+		release()
+		return nil, false, err
+	}
+	if stale {
+		release()
+		log.Printf("[GC Worker] Skipping stale guarded item %s/%s after lock (current deleted_at=%v identity_at=%v)", item.LibraryID, item.ItemID, deletedAt2, identityAt)
+		return func() {}, true, nil
+	}
+
+	return release, false, nil
 }
 
 // enqueueLibraryArtifacts cleans up ALL auxiliary data tied to a deleted library:

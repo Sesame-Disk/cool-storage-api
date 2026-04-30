@@ -771,14 +771,15 @@ func (m *MockStore) EnqueueItem(orgID uuid.UUID, queuedAt time.Time, itemType It
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	item := QueueItem{
-		OrgID:        orgID,
-		QueuedAt:     queuedAt,
-		IdentityAt:   queuedAt,
-		ItemType:     itemType,
-		ItemID:       itemID,
-		LibraryID:    libraryID,
-		StorageClass: storageClass,
-		RetryCount:   retryCount,
+		OrgID:                       orgID,
+		QueuedAt:                    queuedAt,
+		IdentityAt:                  queuedAt,
+		RequiresLibraryDeletedCheck: false,
+		ItemType:                    itemType,
+		ItemID:                      itemID,
+		LibraryID:                   libraryID,
+		StorageClass:                storageClass,
+		RetryCount:                  retryCount,
 	}
 	m.queue[orgID] = append(m.queue[orgID], item)
 	m.upsertPendingItem(orgID, libraryID, itemType, itemID, queuedAt, nil)
@@ -876,7 +877,7 @@ func (m *MockStore) CompleteItem(orgID uuid.UUID, queuedAt time.Time, itemType I
 	return nil
 }
 
-func (m *MockStore) RequeueItem(orgID uuid.UUID, oldQueuedAt, newQueuedAt time.Time, itemType ItemType, itemID string, libraryID uuid.UUID, storageClass string, newRetryCount int, identityAt time.Time) error {
+func (m *MockStore) RequeueItem(orgID uuid.UUID, oldQueuedAt, newQueuedAt time.Time, itemType ItemType, itemID string, libraryID uuid.UUID, storageClass string, newRetryCount int, identityAt time.Time, requiresLibraryDeletedCheck bool) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -894,6 +895,7 @@ func (m *MockStore) RequeueItem(orgID uuid.UUID, oldQueuedAt, newQueuedAt time.T
 			newItem := item
 			newItem.QueuedAt = newQueuedAt
 			newItem.IdentityAt = effectiveIdentityAt(item.QueuedAt, identityAt)
+			newItem.RequiresLibraryDeletedCheck = item.RequiresLibraryDeletedCheck
 			newItem.RetryCount = newRetryCount
 			m.queue[orgID] = append(m.queue[orgID], newItem)
 			m.upsertPendingItem(orgID, libraryID, itemType, itemID, newItem.IdentityAt, nil)
@@ -921,16 +923,17 @@ func (m *MockStore) FailItem(item QueueItem, failedAt time.Time, lastError strin
 		}
 	}
 	m.failedItems[item.OrgID] = append(m.failedItems[item.OrgID], GCFailedItemInfo{
-		OrgID:        item.OrgID,
-		FailedAt:     failedAt,
-		QueuedAt:     item.QueuedAt,
-		IdentityAt:   effectiveIdentityAt(item.QueuedAt, item.IdentityAt),
-		ItemType:     item.ItemType,
-		ItemID:       item.ItemID,
-		LibraryID:    item.LibraryID,
-		StorageClass: item.StorageClass,
-		RetryCount:   item.RetryCount,
-		LastError:    lastError,
+		OrgID:                       item.OrgID,
+		FailedAt:                    failedAt,
+		QueuedAt:                    item.QueuedAt,
+		IdentityAt:                  effectiveIdentityAt(item.QueuedAt, item.IdentityAt),
+		RequiresLibraryDeletedCheck: item.RequiresLibraryDeletedCheck,
+		ItemType:                    item.ItemType,
+		ItemID:                      item.ItemID,
+		LibraryID:                   item.LibraryID,
+		StorageClass:                item.StorageClass,
+		RetryCount:                  item.RetryCount,
+		LastError:                   lastError,
 	})
 	expiresAt := failedAt.Add(gcFailedItemRetention)
 	m.upsertPendingItem(item.OrgID, item.LibraryID, item.ItemType, item.ItemID, effectiveIdentityAt(item.QueuedAt, item.IdentityAt), &expiresAt)
@@ -1073,14 +1076,15 @@ func (m *MockStore) RequeueFailedItem(orgID uuid.UUID, failedAt time.Time, itemT
 	for i, item := range items {
 		if item.FailedAt.Equal(failedAt) && item.ItemType == itemType && item.ItemID == itemID {
 			m.queue[orgID] = append(m.queue[orgID], QueueItem{
-				OrgID:        orgID,
-				QueuedAt:     queuedAt,
-				IdentityAt:   effectiveIdentityAt(item.QueuedAt, item.IdentityAt),
-				ItemType:     item.ItemType,
-				ItemID:       item.ItemID,
-				LibraryID:    item.LibraryID,
-				StorageClass: item.StorageClass,
-				RetryCount:   0,
+				OrgID:                       orgID,
+				QueuedAt:                    queuedAt,
+				IdentityAt:                  effectiveIdentityAt(item.QueuedAt, item.IdentityAt),
+				RequiresLibraryDeletedCheck: item.RequiresLibraryDeletedCheck,
+				ItemType:                    item.ItemType,
+				ItemID:                      item.ItemID,
+				LibraryID:                   item.LibraryID,
+				StorageClass:                item.StorageClass,
+				RetryCount:                  0,
 			})
 			m.upsertPendingItem(orgID, item.LibraryID, itemType, itemID, effectiveIdentityAt(item.QueuedAt, item.IdentityAt), nil)
 			m.failedItems[orgID] = append(items[:i], items[i+1:]...)

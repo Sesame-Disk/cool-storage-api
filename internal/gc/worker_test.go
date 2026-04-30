@@ -652,7 +652,7 @@ func TestWorker_EnqueueLibraryContents_DoesNotCrossSuppressAcrossLibraries(t *te
 		t.Fatalf("seed pending fs_object failed: %v", err)
 	}
 
-	err := w.enqueueLibraryContentsAt(orgID, libTarget, "hot", identityAt)
+	err := w.enqueueLibraryContentsAt(orgID, libTarget, "hot", identityAt, false)
 	if err != nil {
 		t.Fatalf("enqueueLibraryContentsAt failed: %v", err)
 	}
@@ -672,6 +672,163 @@ func TestWorker_EnqueueLibraryContents_DoesNotCrossSuppressAcrossLibraries(t *te
 	}
 	if targetCommits != 1 || targetFSObjects != 1 {
 		t.Fatalf("expected target library work to enqueue despite same ids pending elsewhere, got commits=%d fs_objects=%d", targetCommits, targetFSObjects)
+	}
+}
+
+func TestWorker_ProcessCommit_LibraryCascadeChildSkipsAfterRestore(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	w := NewWorker(store, nil, q, 100, 0, false, stats)
+
+	orgID := uuid.New()
+	libID := uuid.New()
+	deletedAt := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
+
+	store.AddOrganization(orgID)
+	store.AddDeletedLibrary(orgID, libID, "hot", deletedAt)
+	store.AddCommit(libID, "commit-1", "fs-root")
+	store.AddFSObject(libID, "fs-root", "file", []string{"blk-a"})
+	store.deleteRestoreJobsByLibraryErr = errors.New("restore jobs unavailable")
+
+	parent := QueueItem{OrgID: orgID, QueuedAt: deletedAt, IdentityAt: deletedAt, ItemType: ItemLibraryCascade, ItemID: libID.String(), StorageClass: "hot"}
+	if err := w.processLibraryCascade(context.Background(), parent); err == nil {
+		t.Fatal("expected first library cascade attempt to fail")
+	}
+
+	store.mu.Lock()
+	delete(store.deletedLibraries, libID)
+	store.mu.Unlock()
+
+	var child QueueItem
+	for _, item := range store.QueueItems(orgID) {
+		if item.ItemType == ItemCommit && item.ItemID == "commit-1" {
+			child = item
+			break
+		}
+	}
+	if child.ItemID == "" {
+		t.Fatal("expected commit child to be enqueued")
+	}
+	if !child.RequiresLibraryDeletedCheck {
+		t.Fatal("expected commit child to carry library delete guard")
+	}
+
+	if err := w.processCommit(child); err != nil {
+		t.Fatalf("processCommit after restore failed: %v", err)
+	}
+	if store.GetCommitRecord(libID, "commit-1") == nil {
+		t.Fatal("commit child should be stale after restore and must not be deleted")
+	}
+}
+
+func TestWorker_ProcessCommit_RootFSObjectChildSkipsAfterRestore(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	w := NewWorker(store, nil, q, 100, 0, false, stats)
+
+	orgID := uuid.New()
+	libID := uuid.New()
+	deletedAt := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
+
+	store.AddDeletedLibrary(orgID, libID, "hot", deletedAt)
+	store.AddCommit(libID, "commit-1", "fs-root")
+	store.AddBlock(orgID, "blk-a", "hot", 1)
+	store.AddFSObject(libID, "fs-root", "file", []string{"blk-a"})
+
+	guardedCommit := QueueItem{
+		OrgID:                       orgID,
+		QueuedAt:                    deletedAt,
+		IdentityAt:                  deletedAt,
+		RequiresLibraryDeletedCheck: true,
+		ItemType:                    ItemCommit,
+		ItemID:                      "commit-1",
+		LibraryID:                   libID,
+	}
+	if err := w.processCommit(guardedCommit); err != nil {
+		t.Fatalf("processCommit while library deleted failed: %v", err)
+	}
+	if store.GetCommitRecord(libID, "commit-1") != nil {
+		t.Fatal("commit should be deleted before restore")
+	}
+
+	var rootChild QueueItem
+	for _, item := range store.QueueItems(orgID) {
+		if item.ItemType == ItemFSObject && item.ItemID == "fs-root" {
+			rootChild = item
+			break
+		}
+	}
+	if rootChild.ItemID == "" {
+		t.Fatal("expected root fs_object child to be enqueued")
+	}
+	if !rootChild.RequiresLibraryDeletedCheck {
+		t.Fatal("expected root fs_object child to inherit library delete guard")
+	}
+
+	store.mu.Lock()
+	delete(store.deletedLibraries, libID)
+	store.mu.Unlock()
+
+	if err := w.processFSObject(context.Background(), rootChild); err != nil {
+		t.Fatalf("processFSObject after restore failed: %v", err)
+	}
+	if store.GetFSObj(libID, "fs-root") == nil {
+		t.Fatal("root fs_object child should be stale after restore and must not be deleted")
+	}
+	if got := store.GetBlock(orgID, "blk-a").RefCount; got != 1 {
+		t.Fatalf("block ref_count after restored root child = %d, want 1", got)
+	}
+}
+
+func TestWorker_ProcessFSObject_LibraryCascadeChildSkipsAfterRestore(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	w := NewWorker(store, nil, q, 100, 0, false, stats)
+
+	orgID := uuid.New()
+	libID := uuid.New()
+	deletedAt := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
+
+	store.AddOrganization(orgID)
+	store.AddDeletedLibrary(orgID, libID, "hot", deletedAt)
+	store.AddBlock(orgID, "blk-a", "hot", 1)
+	store.AddFSObject(libID, "fs-file", "file", []string{"blk-a"})
+	store.deleteRestoreJobsByLibraryErr = errors.New("restore jobs unavailable")
+
+	parent := QueueItem{OrgID: orgID, QueuedAt: deletedAt, IdentityAt: deletedAt, ItemType: ItemLibraryCascade, ItemID: libID.String(), StorageClass: "hot"}
+	if err := w.processLibraryCascade(context.Background(), parent); err == nil {
+		t.Fatal("expected first library cascade attempt to fail")
+	}
+
+	store.mu.Lock()
+	delete(store.deletedLibraries, libID)
+	store.mu.Unlock()
+
+	var child QueueItem
+	for _, item := range store.QueueItems(orgID) {
+		if item.ItemType == ItemFSObject && item.ItemID == "fs-file" {
+			child = item
+			break
+		}
+	}
+	if child.ItemID == "" {
+		t.Fatal("expected fs_object child to be enqueued")
+	}
+	if !child.RequiresLibraryDeletedCheck {
+		t.Fatal("expected fs_object child to carry library delete guard")
+	}
+
+	if err := w.processFSObject(context.Background(), child); err != nil {
+		t.Fatalf("processFSObject after restore failed: %v", err)
+	}
+	if store.GetFSObj(libID, "fs-file") == nil {
+		t.Fatal("fs_object child should be stale after restore and must not be deleted")
+	}
+	if got := store.GetBlock(orgID, "blk-a").RefCount; got != 1 {
+		t.Fatalf("block ref_count after stale fs_object child = %d, want 1", got)
 	}
 }
 
@@ -1018,6 +1175,67 @@ func TestWorker_ProcessLibraryCascade_FullCascade(t *testing.T) {
 	}
 	if !actions["gc_library_cascade_deleted"] {
 		t.Error("expected gc_library_cascade_deleted audit entry")
+	}
+}
+
+func TestWorker_ProcessLibraryCascade_ChildrenContinueAfterHardDelete(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	w := NewWorker(store, nil, q, 100, 0, false, stats)
+
+	orgID := uuid.New()
+	libID := uuid.New()
+	deletedAt := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
+
+	store.AddOrganization(orgID)
+	store.AddDeletedLibrary(orgID, libID, "hot", deletedAt)
+	store.AddCommit(libID, "commit-1", "fs-root")
+	store.AddBlock(orgID, "blk-a", "hot", 1)
+	store.AddFSObject(libID, "fs-root", "file", []string{"blk-a"})
+
+	item := QueueItem{OrgID: orgID, QueuedAt: deletedAt, IdentityAt: deletedAt, ItemType: ItemLibraryCascade, ItemID: libID.String(), StorageClass: "hot"}
+	if err := w.processLibraryCascade(context.Background(), item); err != nil {
+		t.Fatalf("processLibraryCascade failed: %v", err)
+	}
+	if exists, err := store.LibraryExists(libID); err != nil {
+		t.Fatalf("LibraryExists failed: %v", err)
+	} else if exists {
+		t.Fatal("library should be hard-deleted after successful cascade")
+	}
+
+	var commitItem QueueItem
+	var fsObjectItem QueueItem
+	for _, queued := range store.QueueItems(orgID) {
+		switch {
+		case queued.ItemType == ItemCommit && queued.ItemID == "commit-1":
+			commitItem = queued
+		case queued.ItemType == ItemFSObject && queued.ItemID == "fs-root":
+			fsObjectItem = queued
+		}
+	}
+	if commitItem.ItemID == "" || fsObjectItem.ItemID == "" {
+		t.Fatalf("expected commit and fs_object children after cascade, got commit=%q fs_object=%q", commitItem.ItemID, fsObjectItem.ItemID)
+	}
+	if !commitItem.RequiresLibraryDeletedCheck || !fsObjectItem.RequiresLibraryDeletedCheck {
+		t.Fatal("expected hard-delete children to keep the library delete guard")
+	}
+
+	if err := w.processCommit(commitItem); err != nil {
+		t.Fatalf("processCommit after hard delete failed: %v", err)
+	}
+	if store.GetCommitRecord(libID, "commit-1") != nil {
+		t.Fatal("commit should be deleted after successful hard delete")
+	}
+
+	if err := w.processFSObject(context.Background(), fsObjectItem); err != nil {
+		t.Fatalf("processFSObject after hard delete failed: %v", err)
+	}
+	if store.GetFSObj(libID, "fs-root") != nil {
+		t.Fatal("fs_object should be deleted after successful hard delete")
+	}
+	if got := store.GetBlock(orgID, "blk-a").RefCount; got != 0 {
+		t.Fatalf("block ref_count after hard-delete child processing = %d, want 0", got)
 	}
 }
 
