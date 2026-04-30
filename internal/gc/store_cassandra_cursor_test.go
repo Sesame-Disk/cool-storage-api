@@ -3,6 +3,8 @@ package gc
 import (
 	"testing"
 	"time"
+
+	gocql "github.com/apache/cassandra-gocql-driver/v2"
 )
 
 func TestExpiredShareLinksCursorDay_UsesCurrentUTCDay(t *testing.T) {
@@ -95,5 +97,18 @@ func TestDeletedUsersScanStartDay_UsesCutoffWhenCursorMissing(t *testing.T) {
 	want := cutoffDay.AddDate(0, 0, -gcInitialScanLookbackDays)
 	if !got.Equal(want) {
 		t.Fatalf("deletedUsersScanStartDay() = %s, want %s", got.Format("2006-01-02"), want.Format("2006-01-02"))
+	}
+}
+
+func TestDeletedUsersStartDayFromCursor_UsesLookbackWhenCursorMissing(t *testing.T) {
+	cutoffDay := time.Date(2026, 4, 29, 0, 0, 0, 0, time.UTC)
+
+	got, err := deletedUsersStartDayFromCursor("", gocql.ErrNotFound, cutoffDay)
+	if err != nil {
+		t.Fatalf("deletedUsersStartDayFromCursor() error = %v, want nil", err)
+	}
+	want := cutoffDay.AddDate(0, 0, -gcInitialScanLookbackDays)
+	if !got.Equal(want) {
+		t.Fatalf("deletedUsersStartDayFromCursor() = %s, want %s", got.Format("2006-01-02"), want.Format("2006-01-02"))
 	}
 }

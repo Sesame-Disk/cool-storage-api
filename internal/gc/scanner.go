@@ -2,6 +2,8 @@ package gc
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log"
 	"time"
 
@@ -63,12 +65,17 @@ func recordScannerAction(phase, action string, count int) {
 	metrics.GCScannerActionsTotal.WithLabelValues(phase, action).Add(float64(count))
 }
 
+func isScannerInterruptError(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+}
+
 // ScanOnce performs a full scan of all phases.
 func (s *Scanner) ScanOnce(ctx context.Context) error {
 	start := time.Now()
 	log.Println("[GC Scanner] Starting safety scan...")
 
 	enqueued := 0
+	var scanErr error
 
 	phases := []struct {
 		name string
@@ -94,13 +101,24 @@ func (s *Scanner) ScanOnce(ctx context.Context) error {
 		select {
 		case <-ctx.Done():
 			log.Printf("[GC Scanner] Scan interrupted after %d items in %v", enqueued, time.Since(start))
+			if scanErr != nil {
+				return scanErr
+			}
 			return ctx.Err()
 		default:
 		}
 
 		n, err := phase.fn(ctx)
 		if err != nil {
+			if isScannerInterruptError(err) {
+				if scanErr != nil {
+					return scanErr
+				}
+				return err
+			}
 			log.Printf("[GC Scanner] Error in phase %s: %v", phase.name, err)
+			recordScannerAction(phase.name, "phase_error", 1)
+			scanErr = errors.Join(scanErr, fmt.Errorf("%s: %w", phase.name, err))
 		}
 		enqueued += n
 	}
@@ -108,7 +126,7 @@ func (s *Scanner) ScanOnce(ctx context.Context) error {
 	elapsed := time.Since(start)
 	log.Printf("[GC Scanner] Safety scan complete: enqueued %d items in %v", enqueued, elapsed)
 	s.stats.SetLastScanRun(time.Now())
-	return nil
+	return scanErr
 }
 
 func (s *Scanner) scanPendingStorageCounterReconciliation(ctx context.Context) (int, error) {

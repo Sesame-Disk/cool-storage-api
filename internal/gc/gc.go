@@ -24,12 +24,14 @@ type Stats struct {
 	blocksDeleted atomic.Int64
 	lastWorkerRun atomic.Value // time.Time
 	lastScanRun   atomic.Value // time.Time
+	lastScanError atomic.Value // string
 }
 
 func (s *Stats) IncrBlocksDeleted()           { s.blocksDeleted.Add(1) }
 func (s *Stats) BlocksDeleted() int64         { return s.blocksDeleted.Load() }
 func (s *Stats) SetLastWorkerRun(t time.Time) { s.lastWorkerRun.Store(t) }
 func (s *Stats) SetLastScanRun(t time.Time)   { s.lastScanRun.Store(t) }
+func (s *Stats) SetLastScanError(v string)    { s.lastScanError.Store(v) }
 
 func (s *Stats) LastWorkerRun() time.Time {
 	v := s.lastWorkerRun.Load()
@@ -47,12 +49,21 @@ func (s *Stats) LastScanRun() time.Time {
 	return v.(time.Time)
 }
 
+func (s *Stats) LastScanError() string {
+	v := s.lastScanError.Load()
+	if v == nil {
+		return ""
+	}
+	return v.(string)
+}
+
 // GCStatus is the JSON response for the admin status endpoint.
 type GCStatus struct {
 	Enabled          bool   `json:"enabled"`
 	DryRun           bool   `json:"dry_run"`
 	LastWorkerRun    string `json:"last_worker_run"`
 	LastScanRun      string `json:"last_scan_run"`
+	LastScanError    string `json:"last_scan_error,omitempty"`
 	LastReconcileRun string `json:"last_reconcile_run"`
 	QueueSize        int    `json:"queue_size"`
 	FailedItemsTotal int    `json:"failed_items_total"`
@@ -291,6 +302,7 @@ func (s *Service) Status() GCStatus {
 		DryRun:             s.config.DryRun,
 		LastWorkerRun:      formatTime(lastWorker),
 		LastScanRun:        formatTime(lastScan),
+		LastScanError:      s.stats.LastScanError(),
 		LastReconcileRun:   formatTime(lastReconcile),
 		QueueSize:          queueSize,
 		FailedItemsTotal:   failedItemsTotal,
@@ -437,7 +449,13 @@ func (s *Service) runScannerOnce(ctx context.Context) {
 	}
 
 	start := time.Now()
-	s.scanner.ScanOnce(ctx)
+	err := s.scanner.ScanOnce(ctx)
+	if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+		log.Printf("[GC Scanner] Error: %v", err)
+		s.stats.SetLastScanError(err.Error())
+	} else if err == nil {
+		s.stats.SetLastScanError("")
+	}
 	s.reconcileDirtyQueueStats(s.reconcileLimit())
 	metrics.GCScannerDuration.Observe(time.Since(start).Seconds())
 	metrics.GCLastScannerRun.Set(float64(time.Now().Unix()))
@@ -845,6 +863,7 @@ func (s *Service) persistStats() {
 	if lastScan := s.stats.LastScanRun(); !lastScan.IsZero() {
 		s.store.SaveGCStats("last_scan_run", lastScan.Format(time.RFC3339))
 	}
+	s.store.SaveGCStats("last_scan_error", s.stats.LastScanError())
 	s.store.SaveGCStats("blocks_deleted_total", fmt.Sprintf("%d", s.stats.BlocksDeleted()))
 }
 
@@ -859,6 +878,9 @@ func (s *Service) restoreStats() {
 		if t, err := time.Parse(time.RFC3339, val); err == nil {
 			s.stats.SetLastScanRun(t)
 		}
+	}
+	if val, err := s.store.LoadGCStats("last_scan_error"); err == nil && val != "" {
+		s.stats.SetLastScanError(val)
 	}
 	if val, err := s.store.LoadGCStats("blocks_deleted_total"); err == nil && val != "" {
 		if n, err := strconv.ParseInt(val, 10, 64); err == nil {

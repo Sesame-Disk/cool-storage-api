@@ -26,6 +26,101 @@ func TestNewScanner(t *testing.T) {
 	}
 }
 
+func TestScanner_ScanOnce_ReturnsPhaseErrorsButContinues(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	s := NewScanner(store, q, stats, config.GCConfig{UserGraceDays: 7})
+
+	orgID := uuid.New()
+	store.AddOrganization(orgID)
+	store.AddShareLink("token-expired", orgID, time.Now().Add(-24*time.Hour))
+	store.deleteExpiredShareLinkErr = fmt.Errorf("delete failed")
+
+	expiredUser := uuid.New()
+	store.AddDeletedUser(orgID, expiredUser, "expired@test.com", time.Now().AddDate(0, 0, -10))
+
+	beforePhaseErr := testutil.ToFloat64(metrics.GCScannerActionsTotal.WithLabelValues("expired_links", "phase_error"))
+	err := s.ScanOnce(context.Background())
+	if err == nil {
+		t.Fatal("ScanOnce() error = nil, want non-nil")
+	}
+	if got := err.Error(); got == "delete failed" || got == "" {
+		t.Fatalf("ScanOnce() error = %q, want wrapped phase context", got)
+	}
+	if stats.LastScanRun().IsZero() {
+		t.Fatal("LastScanRun should be set after scan with phase errors")
+	}
+
+	items := store.QueueItems(orgID)
+	userCascadeCount := 0
+	for _, item := range items {
+		if item.ItemType == ItemUserCascade && item.ItemID == expiredUser.String() {
+			userCascadeCount++
+		}
+	}
+	if userCascadeCount != 1 {
+		t.Fatalf("expected later phases to continue and enqueue deleted user once, got %d", userCascadeCount)
+	}
+	afterPhaseErr := testutil.ToFloat64(metrics.GCScannerActionsTotal.WithLabelValues("expired_links", "phase_error"))
+	if afterPhaseErr-beforePhaseErr != 1 {
+		t.Fatalf("expired_links phase_error metric delta = %v, want 1", afterPhaseErr-beforePhaseErr)
+	}
+}
+
+func TestScanner_ScanOnce_ReturnsAccumulatedPhaseErrorWhenCanceledBetweenPhases(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	s := NewScanner(store, q, stats, config.GCConfig{})
+
+	orgID := uuid.New()
+	store.AddOrganization(orgID)
+	store.AddShareLink("token-expired", orgID, time.Now().Add(-24*time.Hour))
+	store.deleteExpiredShareLinkErr = fmt.Errorf("delete failed")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	store.recountQueueDepthHook = func(_ uuid.UUID, _ int) {
+		cancel()
+	}
+
+	err := s.ScanOnce(ctx)
+	if err == nil {
+		t.Fatal("ScanOnce() error = nil, want non-nil")
+	}
+	if got := err.Error(); got == context.Canceled.Error() {
+		t.Fatalf("ScanOnce() error = %q, want accumulated phase error", got)
+	}
+	if got := err.Error(); got == "" || !containsString(got, "expired_links") {
+		t.Fatalf("ScanOnce() error = %q, want expired_links context", got)
+	}
+}
+
+func containsString(haystack, needle string) bool {
+	return len(needle) > 0 && len(haystack) >= len(needle) && (haystack == needle || containsSubstring(haystack, needle))
+}
+
+func containsSubstring(haystack, needle string) bool {
+	for index := 0; index+len(needle) <= len(haystack); index++ {
+		if haystack[index:index+len(needle)] == needle {
+			return true
+		}
+	}
+	return false
+}
+
+func TestIsScannerInterruptError(t *testing.T) {
+	if !isScannerInterruptError(context.Canceled) {
+		t.Fatal("context.Canceled should be treated as scanner interrupt")
+	}
+	if !isScannerInterruptError(context.DeadlineExceeded) {
+		t.Fatal("context.DeadlineExceeded should be treated as scanner interrupt")
+	}
+	if isScannerInterruptError(fmt.Errorf("boom")) {
+		t.Fatal("ordinary errors should not be treated as scanner interrupt")
+	}
+}
+
 func TestScanner_ScanOrphanedBlocks(t *testing.T) {
 	store := NewMockStore()
 	stats := &Stats{}

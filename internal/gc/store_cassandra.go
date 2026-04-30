@@ -2245,11 +2245,15 @@ func (s *CassandraStore) ListDeletedUsersExpired(graceDays int) ([]DeletedUserIn
 
 func (s *CassandraStore) loadDeletedUsersStartDay(cutoffDay time.Time) (time.Time, error) {
 	value, err := s.LoadGCStats(gcDeletedUsersCursorKey)
-	if err != nil {
-		if errors.Is(err, gocql.ErrNotFound) {
-			return cutoffDay, nil
+	return deletedUsersStartDayFromCursor(value, err, cutoffDay)
+}
+
+func deletedUsersStartDayFromCursor(value string, loadErr error, cutoffDay time.Time) (time.Time, error) {
+	if loadErr != nil {
+		if errors.Is(loadErr, gocql.ErrNotFound) {
+			return deletedUsersScanStartDay(time.Time{}, cutoffDay), nil
 		}
-		return time.Time{}, err
+		return time.Time{}, loadErr
 	}
 	lastDay, err := db.ParseGCProjectionDate(value)
 	if err != nil {

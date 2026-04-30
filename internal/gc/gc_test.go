@@ -360,6 +360,67 @@ func TestService_RunWorkerOnce_ProcessesWithLeadership(t *testing.T) {
 	}
 }
 
+func TestService_RunScannerOnce_RecordsScanErrorWithLeadership(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	lease := &fakeLeaderLease{allowed: true}
+
+	orgID := uuid.New()
+	store.AddOrganization(orgID)
+	store.AddShareLink("token-expired", orgID, time.Now().Add(-24*time.Hour))
+	store.deleteExpiredShareLinkErr = errors.New("delete failed")
+
+	svc := &Service{
+		store:   store,
+		config:  config.GCConfig{Enabled: true},
+		queue:   q,
+		worker:  NewWorker(store, nil, q, 100, 0, false, stats),
+		scanner: NewScanner(store, q, stats, config.GCConfig{}),
+		stats:   stats,
+		lease:   lease,
+	}
+
+	svc.runScannerOnce(context.Background())
+
+	if got := svc.stats.LastScanError(); got == "" {
+		t.Fatal("expected scanner error to be recorded")
+	}
+	if status := svc.Status(); status.LastScanError == "" {
+		t.Fatal("expected status to expose last scanner error")
+	}
+	if svc.stats.LastScanRun().IsZero() {
+		t.Fatal("expected scan run timestamp to be recorded")
+	}
+}
+
+func TestService_RunScannerOnce_ClearsLastScanErrorOnSuccess(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	stats.SetLastScanError("previous failure")
+	q := NewQueue(store)
+	lease := &fakeLeaderLease{allowed: true}
+
+	svc := &Service{
+		store:   store,
+		config:  config.GCConfig{Enabled: true},
+		queue:   q,
+		worker:  NewWorker(store, nil, q, 100, 0, false, stats),
+		scanner: NewScanner(store, q, stats, config.GCConfig{}),
+		stats:   stats,
+		lease:   lease,
+	}
+
+	svc.runScannerOnce(context.Background())
+
+	if got := svc.stats.LastScanError(); got != "" {
+		t.Fatalf("LastScanError = %q, want empty", got)
+	}
+	if status := svc.Status(); status.LastScanError != "" {
+		t.Fatalf("Status().LastScanError = %q, want empty", status.LastScanError)
+	}
+}
+
 func TestService_DeleteFailedItem_RequiresLeadership(t *testing.T) {
 	store := NewMockStore()
 	orgID := uuid.New()
@@ -983,6 +1044,9 @@ func TestService_StatusWithMockStore(t *testing.T) {
 	if status.LastScanRun != "never" {
 		t.Errorf("LastScanRun = %q, want 'never'", status.LastScanRun)
 	}
+	if status.LastScanError != "" {
+		t.Errorf("LastScanError = %q, want empty", status.LastScanError)
+	}
 	if status.QueueSize != 0 {
 		t.Errorf("QueueSize = %d, want 0", status.QueueSize)
 	}
@@ -1012,6 +1076,7 @@ func TestService_PersistAndRestoreStats(t *testing.T) {
 	scanTime := time.Date(2026, 3, 15, 11, 0, 0, 0, time.UTC)
 	svc.stats.SetLastWorkerRun(workerTime)
 	svc.stats.SetLastScanRun(scanTime)
+	svc.stats.SetLastScanError("scanner failed")
 	svc.stats.blocksDeleted.Store(42)
 
 	// Persist
@@ -1027,8 +1092,41 @@ func TestService_PersistAndRestoreStats(t *testing.T) {
 	if got := svc2.stats.LastScanRun(); !got.Equal(scanTime) {
 		t.Errorf("restored LastScanRun = %v, want %v", got, scanTime)
 	}
+	if got := svc2.stats.LastScanError(); got != "scanner failed" {
+		t.Errorf("restored LastScanError = %q, want %q", got, "scanner failed")
+	}
 	if got := svc2.stats.BlocksDeleted(); got != 42 {
 		t.Errorf("restored BlocksDeleted = %d, want 42", got)
+	}
+}
+
+func TestService_PersistStats_ClearsPersistedLastScanError(t *testing.T) {
+	store := NewMockStore()
+	cfg := config.GCConfig{Enabled: true}
+
+	svc := NewService(store, nil, cfg, nil)
+	svc.stats.SetLastScanError("scanner failed")
+	svc.persistStats()
+
+	if got, err := store.LoadGCStats("last_scan_error"); err != nil || got != "scanner failed" {
+		t.Fatalf("persisted last_scan_error = (%q, %v), want (%q, nil)", got, err, "scanner failed")
+	}
+
+	svc.stats.SetLastScanError("")
+	svc.persistStats()
+
+	got, err := store.LoadGCStats("last_scan_error")
+	if err != nil {
+		t.Fatalf("LoadGCStats(last_scan_error) failed: %v", err)
+	}
+	if got != "" {
+		t.Fatalf("persisted last_scan_error = %q, want empty string", got)
+	}
+
+	svc2 := NewService(store, nil, cfg, nil)
+	svc2.restoreStats()
+	if got := svc2.stats.LastScanError(); got != "" {
+		t.Fatalf("restored LastScanError = %q, want empty", got)
 	}
 }
 
