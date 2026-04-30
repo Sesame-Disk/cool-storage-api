@@ -16,6 +16,8 @@ import (
 // Callers should map this to HTTP 404 rather than 500.
 var errFileTagNotFound = errors.New("file tag not found")
 
+var errOrganizationPurging = errors.New("organization is pending permanent deletion")
+
 // User/Org status constants — lifecycle state independent of role.
 const (
 	StatusActive      = "active"
@@ -498,11 +500,13 @@ func deactivateOrg(db interface{ Session() *gocql.Session }, si SessionInvalidat
 	return nil
 }
 
-// activateOrg marks an org as active, clears deleted_at, and in a background
-// goroutine re-enables all org share links. Works for both reactivation
-// (deactivated → active) and restore (deleted → active).
-func activateOrg(db interface{ Session() *gocql.Session }, orgID string) error {
+// activateOrg marks an org as active, clears deleted_at, and repairs lifecycle
+// read models. Already-active repair is accepted only when stale lifecycle
+// metadata proves a previous activation completed the CAS but not phase two.
+func activateOrg(db interface{ Session() *gocql.Session }, orgID, expectedStatus, repairFromStatus string) error {
 	session := db.Session()
+	reenableShareLinks := false
+	var deletedMarkerAt *time.Time
 	transitionToActive := func(expectedStatus string) (bool, string, error) {
 		result := map[string]interface{}{}
 		applied, err := session.Query(`
@@ -516,43 +520,105 @@ func activateOrg(db interface{ Session() *gocql.Session }, orgID string) error {
 		return applied, currentStatus, nil
 	}
 
-	applied, currentStatus, err := transitionToActive(StatusDeleted)
+	if expectedStatus == "" {
+		expectedStatus = StatusDeleted
+	}
+	if repairFromStatus == "" {
+		repairFromStatus = expectedStatus
+	}
+	if repairFromStatus == StatusDeleted {
+		markerAt, err := readDeletedOrganizationMarkerAt(session, orgID)
+		if err != nil {
+			return err
+		}
+		deletedMarkerAt = markerAt
+	}
+	applied, currentStatus, err := false, StatusActive, error(nil)
+	if expectedStatus != StatusActive {
+		applied, currentStatus, err = transitionToActive(expectedStatus)
+	} else {
+		if !hasInterruptedActivationRepairState(session, orgID, repairFromStatus, deletedMarkerAt) {
+			return fmt.Errorf("organization lifecycle changed while reactivating")
+		}
+		applied, currentStatus, err = transitionToActive(StatusActive)
+	}
 	if err != nil {
 		return err
 	}
 	if !applied {
 		switch currentStatus {
 		case StatusActive:
-		case StatusDeactivated:
-			applied, currentStatus, err = transitionToActive(StatusDeactivated)
-			if err != nil {
-				return err
-			}
-			if !applied {
-				switch currentStatus {
-				case StatusActive:
-				case statusPurging:
-					return fmt.Errorf("organization is pending permanent deletion")
-				default:
-					return fmt.Errorf("organization lifecycle changed while reactivating")
-				}
+			if !hasInterruptedActivationRepairState(session, orgID, repairFromStatus, deletedMarkerAt) {
+				return fmt.Errorf("organization lifecycle changed while reactivating")
 			}
 		case statusPurging:
-			return fmt.Errorf("organization is pending permanent deletion")
+			return errOrganizationPurging
 		default:
 			return fmt.Errorf("organization lifecycle changed while reactivating")
 		}
 	}
+	reenableShareLinks = repairFromStatus == StatusDeleted || repairFromStatus == StatusDeactivated
 
-	if err := updateOrganizationLifecycleAndReadModel(db, orgID, batchedOrganizationLifecycleUpdate{
-		Status:              StatusActive,
-		DeletedAt:           nil,
-		DeleteDeletedMarker: true,
-	}); err != nil {
+	if err := repairActiveOrganizationReadModels(session, orgID, deletedMarkerAt); err != nil {
 		return err
 	}
-	go setOrgShareLinksActive(db, orgID, true)
+	if reenableShareLinks {
+		go setOrgShareLinksActive(db, orgID, true)
+	}
 	return nil
+}
+
+func readDeletedOrganizationMarkerAt(session *gocql.Session, orgID string) (*time.Time, error) {
+	var deletedAt time.Time
+	if err := session.Query(`SELECT deleted_at FROM deleted_organizations WHERE org_id = ?`, orgID).Scan(&deletedAt); err != nil {
+		if errors.Is(err, gocql.ErrNotFound) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return &deletedAt, nil
+}
+
+func hasInterruptedActivationRepairState(session *gocql.Session, orgID, repairFromStatus string, deletedMarkerAt *time.Time) bool {
+	if repairFromStatus == StatusDeleted && deletedMarkerAt != nil {
+		return true
+	}
+	state, err := dbpkg.ReadAdminOrganizationProjectionState(session, orgID)
+	return err == nil && state.Status == repairFromStatus
+}
+
+func repairActiveOrganizationReadModels(session *gocql.Session, orgID string, deletedMarkerAt *time.Time) error {
+	if deletedMarkerAt != nil {
+		applied, err := session.Query(`
+			DELETE FROM deleted_organizations WHERE org_id = ? IF deleted_at = ?
+		`, orgID, *deletedMarkerAt).MapScanCAS(map[string]interface{}{})
+		if err != nil {
+			return err
+		}
+		if !applied {
+			return fmt.Errorf("organization lifecycle changed while reactivating")
+		}
+	}
+
+	previousOrgState, previousOrgStateErr := dbpkg.ReadAdminOrganizationProjectionState(session, orgID)
+	if previousOrgStateErr != nil && previousOrgStateErr != gocql.ErrNotFound {
+		return previousOrgStateErr
+	}
+	orgProjectionRow, err := dbpkg.ReadAdminOrganizationProjectionRow(session, orgID)
+	if err != nil {
+		return err
+	}
+	if orgProjectionRow.Status != StatusActive {
+		return fmt.Errorf("organization lifecycle changed while reactivating")
+	}
+	orgProjectionRow.DeletedAt = nil
+
+	batch := session.Batch(gocql.LoggedBatch)
+	if previousOrgStateErr == nil && (previousOrgState.Status != orgProjectionRow.Status || !previousOrgState.CreatedAt.Equal(orgProjectionRow.CreatedAt)) {
+		dbpkg.AddDeleteAdminOrganizationStatusProjectionEntryQuery(batch, previousOrgState)
+	}
+	dbpkg.AddUpsertAdminOrganizationReadModelQuery(batch, orgProjectionRow)
+	return batch.Exec()
 }
 
 // softDeleteOrg marks an org as deleted and, in a background goroutine,

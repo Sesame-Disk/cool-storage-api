@@ -2989,6 +2989,9 @@ func (s *CassandraStore) HardDeleteOrg(orgID uuid.UUID) error {
 	if deletedAt == nil {
 		return fmt.Errorf("org %s is not in deleted state", orgID)
 	}
+	if err := s.ensureOrgHasNoLiveChildren(orgID); err != nil {
+		return err
+	}
 	purging, err := s.BeginOrgPurge(orgID, *deletedAt)
 	if err != nil {
 		return err
@@ -2999,17 +3002,8 @@ func (s *CassandraStore) HardDeleteOrg(orgID uuid.UUID) error {
 	return s.HardDeleteOrgLocked(orgID)
 }
 
-func (s *CassandraStore) HardDeleteOrgLocked(orgID uuid.UUID) error {
+func (s *CassandraStore) ensureOrgHasNoLiveChildren(orgID uuid.UUID) error {
 	session := s.db.Session()
-
-	var orgStatus string
-	if err := session.Query(`SELECT status FROM organizations WHERE org_id = ?`, orgID.String()).Scan(&orgStatus); err != nil {
-		return err
-	}
-	if orgStatus != "purging" {
-		return fmt.Errorf("org %s is not in purge state", orgID)
-	}
-
 	var childID string
 	if err := session.Query(`SELECT library_id FROM libraries WHERE org_id = ? LIMIT 1`, orgID.String()).Scan(&childID); err == nil {
 		return fmt.Errorf("org %s still has live libraries", orgID)
@@ -3024,6 +3018,23 @@ func (s *CassandraStore) HardDeleteOrgLocked(orgID uuid.UUID) error {
 	if err := session.Query(`SELECT group_id FROM groups WHERE org_id = ? LIMIT 1`, orgID.String()).Scan(&childID); err == nil {
 		return fmt.Errorf("org %s still has live groups", orgID)
 	} else if !errors.Is(err, gocql.ErrNotFound) {
+		return err
+	}
+	return nil
+}
+
+func (s *CassandraStore) HardDeleteOrgLocked(orgID uuid.UUID) error {
+	session := s.db.Session()
+
+	var orgStatus string
+	if err := session.Query(`SELECT status FROM organizations WHERE org_id = ?`, orgID.String()).Scan(&orgStatus); err != nil {
+		return err
+	}
+	if orgStatus != "purging" {
+		return fmt.Errorf("org %s is not in purge state", orgID)
+	}
+
+	if err := s.ensureOrgHasNoLiveChildren(orgID); err != nil {
 		return err
 	}
 

@@ -2460,6 +2460,9 @@ func (m *MockStore) HardDeleteOrg(orgID uuid.UUID) error {
 	if deletedAt == nil {
 		return fmt.Errorf("org %s is not in deleted state", orgID)
 	}
+	if err := m.ensureOrgHasNoLiveChildren(orgID); err != nil {
+		return err
+	}
 	purging, err := m.BeginOrgPurge(orgID, *deletedAt)
 	if err != nil {
 		return err
@@ -2468,6 +2471,27 @@ func (m *MockStore) HardDeleteOrg(orgID uuid.UUID) error {
 		return fmt.Errorf("org %s is not in deleted state", orgID)
 	}
 	return m.HardDeleteOrgLocked(orgID)
+}
+
+func (m *MockStore) ensureOrgHasNoLiveChildren(orgID uuid.UUID) error {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for _, lib := range m.libraries {
+		if lib.OrgID == orgID {
+			return fmt.Errorf("org %s still has live libraries", orgID)
+		}
+	}
+	for _, user := range m.users {
+		if user.OrgID == orgID {
+			return fmt.Errorf("org %s still has live users", orgID)
+		}
+	}
+	for key := range m.groups {
+		if strings.HasPrefix(key, orgID.String()+":") {
+			return fmt.Errorf("org %s still has live groups", orgID)
+		}
+	}
+	return nil
 }
 
 func (m *MockStore) HardDeleteOrgLocked(orgID uuid.UUID) error {

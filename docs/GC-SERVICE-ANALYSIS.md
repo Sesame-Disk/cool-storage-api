@@ -67,6 +67,30 @@ flowchart TD
 
 ## Deletion Flow: The Critical Path
 
+## Operational Runbook: Organizations Stuck in `purging`
+
+Org hard delete uses a three-step lifecycle: `deleted -> purging -> hard deleted`.
+The `purging` state means GC has claimed the soft-delete identity and restore/reactivate
+must remain blocked while destructive cleanup is in progress or awaiting retry.
+
+If an org remains in `purging` longer than expected:
+
+1. Check the GC failed-items view/API for an `org_cascade` item with the org ID.
+2. Inspect the item error before taking action; common causes are live child rows,
+   library/user/group cleanup failures, or a failed dependency during cascade cleanup.
+3. Requeue the failed GC item after fixing the underlying cause. Retries are safe:
+   `GetOrgDeletedAt` accepts both `deleted` and `purging`, and the worker resumes the
+   purge rather than treating it as stale.
+4. If the worker process died after taking `gc_org_hard_delete_locks`, wait for the
+   lock TTL (`default_time_to_live = 3600`) or delete the lock row only after verifying
+   no GC worker is actively processing that org.
+5. Do not manually restore an org from `purging` unless you have first proven that no
+   destructive child cleanup ran. The supported recovery path is to fix/requeue the GC
+   cascade until it completes.
+
+`HardDeleteOrg` performs a child preflight before entering `purging`; worker-owned org
+cascades call `HardDeleteOrgLocked` only after child cleanup has already completed.
+
 ### Block deletion (the most dangerous operation)
 
 ```

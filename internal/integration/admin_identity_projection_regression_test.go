@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	dbpkg "github.com/Sesame-Disk/sesamefs/internal/db"
 	gcpkg "github.com/Sesame-Disk/sesamefs/internal/gc"
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
 	"github.com/google/uuid"
@@ -401,6 +402,68 @@ func TestAdminIdentityProjectionRegression_RestoreOrganizationRepairsPartialActi
 	waitForIntegrationCondition(t, "restore retry to repair partial activation state", func() bool {
 		row, ok := adminOrganizationProjectionByID(t, orgID)
 		return ok && row.Status == "active" && row.DeletedAt == nil && canonicalOrganizationStatusIs(t, orgID, "active") && !deletedOrganizationMarkerExists(t, orgID) && adminOrganizationPresentInStatusList(t, "active", orgID, orgName, ownerEmail) && !adminOrganizationPresentInStatusList(t, "deleted", orgID, orgName, ownerEmail)
+	})
+}
+
+func TestAdminIdentityProjectionRegression_RestoreRepairReenablesLifecycleDisabledLinks(t *testing.T) {
+	orgName := fmt.Sprintf("inttest-admin-restore-link-repair-org-%d", time.Now().UnixNano())
+	ownerEmail := fmt.Sprintf("inttest-admin-restore-link-repair-owner-%d@sesamefs.local", time.Now().UnixNano())
+	orgID := createAdminIdentityTestOrganization(t, orgName, ownerEmail)
+
+	deleteResp := superadminClient.Delete(t, "/api/v2.1/admin/organizations/"+orgID+"/")
+	expectStatus(t, deleteResp, http.StatusOK)
+	deleteResp.Body.Close()
+
+	waitForIntegrationCondition(t, "soft-deleted organization to reach deleted canonical/admin state before inactive-link repair test", func() bool {
+		row, ok := adminOrganizationProjectionByID(t, orgID)
+		return ok && row.Status == "deleted" && row.DeletedAt != nil && canonicalOrganizationStatusIs(t, orgID, "deleted") && deletedOrganizationMarkerExists(t, orgID)
+	})
+
+	session := shareProjectionDBForTest(t).Session()
+	createdAt := time.Now().UTC().Truncate(time.Millisecond)
+	linkType := "share"
+	token := fmt.Sprintf("inttest-inactive-link-%d", time.Now().UnixNano())
+	libraryID := uuid.New().String()
+	createdBy := uuid.New().String()
+	batch := session.Batch(gocql.LoggedBatch)
+	batch.Query(`
+		INSERT INTO share_links (
+			link_token, link_type, org_id, library_id, file_path, created_by,
+			permission, active, view_count, download_count, upload_count,
+			max_downloads, single_use, created_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, token, linkType, orgID, libraryID, "/", createdBy, "preview_download", false, 0, 0, 0, 0, false, createdAt)
+	batch.Query(`
+		INSERT INTO share_links_by_creator (
+			org_id, created_by, created_at, link_token, link_type, library_id,
+			file_path, permission, single_use, active, view_count,
+			download_count, upload_count, max_downloads, has_password
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, orgID, createdBy, createdAt, token, linkType, libraryID, "/", "preview_download", false, false, 0, 0, 0, 0, false)
+	dbpkg.AddUpsertAdminLinkReadModelQuery(batch, token, linkType, orgID, libraryID, "/", createdBy, "preview_download", "Inactive Link Repo", "Inactive Link Repo", ownerEmail, ownerEmail, nil, false, false, 0, 0, 0, createdAt)
+	if err := batch.Exec(); err != nil {
+		t.Fatalf("seed inactive share link rows: %v", err)
+	}
+	t.Cleanup(func() {
+		bucketDay := dbpkg.AdminLinkBucketDay(createdAt)
+		_ = session.Query(`DELETE FROM admin_links_by_created WHERE link_type = ? AND bucket_day = ? AND created_at = ? AND org_id = ? AND link_token = ?`, linkType, bucketDay, createdAt, orgID, token).Exec()
+		_ = session.Query(`DELETE FROM admin_links_by_org_created WHERE org_id = ? AND link_type = ? AND bucket_day = ? AND created_at = ? AND link_token = ?`, orgID, linkType, bucketDay, createdAt, token).Exec()
+		_ = session.Query(`DELETE FROM admin_link_buckets_by_org WHERE org_id = ? AND link_type = ? AND bucket_day = ?`, orgID, linkType, bucketDay).Exec()
+		_ = session.Query(`DELETE FROM share_links WHERE link_token = ?`, token).Exec()
+		_ = session.Query(`DELETE FROM share_links_by_creator WHERE org_id = ? AND created_by = ? AND created_at = ? AND link_token = ?`, orgID, createdBy, createdAt, token).Exec()
+	})
+
+	if err := session.Query(`UPDATE organizations SET status = ?, deleted_at = ? WHERE org_id = ?`, "active", nil, orgID).Exec(); err != nil {
+		t.Fatalf("set org %s canonical state to active failed: %v", orgID, err)
+	}
+
+	restoreResp := superadminClient.Do(t, http.MethodPost, "/api/v2.1/admin/organizations/"+orgID+"/restore/", nil)
+	expectStatus(t, restoreResp, http.StatusOK)
+	restoreResp.Body.Close()
+
+	waitForIntegrationCondition(t, "restore retry to repair partial activation state with link reactivation", func() bool {
+		row, ok := adminOrganizationProjectionByID(t, orgID)
+		return ok && row.Status == "active" && row.DeletedAt == nil && canonicalOrganizationStatusIs(t, orgID, "active") && !deletedOrganizationMarkerExists(t, orgID) && adminOrgLinkActive(t, orgID, linkType, token, createdAt) && canonicalShareLinkActive(t, token) && creatorShareLinkActive(t, orgID, createdBy, token, createdAt)
 	})
 }
 
@@ -837,6 +900,45 @@ func deletedOrganizationMarkerExists(t *testing.T, orgID string) bool {
 		t.Fatalf("read deleted_organizations %s failed: %v", orgID, err)
 	}
 	return false
+}
+
+func adminOrgLinkActive(t *testing.T, orgID, linkType, token string, createdAt time.Time) bool {
+	t.Helper()
+
+	session := shareProjectionDBForTest(t).Session()
+	var active bool
+	if err := session.Query(`
+		SELECT active FROM admin_links_by_org_created
+		WHERE org_id = ? AND link_type = ? AND bucket_day = ? AND created_at = ? AND link_token = ?
+	`, orgID, linkType, dbpkg.AdminLinkBucketDay(createdAt), createdAt, token).Scan(&active); err != nil {
+		t.Fatalf("read admin org link active flag for %s failed: %v", token, err)
+	}
+	return active
+}
+
+func canonicalShareLinkActive(t *testing.T, token string) bool {
+	t.Helper()
+
+	session := shareProjectionDBForTest(t).Session()
+	var active bool
+	if err := session.Query(`SELECT active FROM share_links WHERE link_token = ?`, token).Scan(&active); err != nil {
+		t.Fatalf("read canonical share link active flag for %s failed: %v", token, err)
+	}
+	return active
+}
+
+func creatorShareLinkActive(t *testing.T, orgID, createdBy, token string, createdAt time.Time) bool {
+	t.Helper()
+
+	session := shareProjectionDBForTest(t).Session()
+	var active bool
+	if err := session.Query(`
+		SELECT active FROM share_links_by_creator
+		WHERE org_id = ? AND created_by = ? AND created_at = ? AND link_token = ?
+	`, orgID, createdBy, createdAt, token).Scan(&active); err != nil {
+		t.Fatalf("read creator share link active flag for %s failed: %v", token, err)
+	}
+	return active
 }
 
 func deletedOrganizationMarkerDeletedAt(t *testing.T, orgID string) time.Time {

@@ -204,7 +204,8 @@ type GCStore interface {
 	BeginOrgPurge(orgID uuid.UUID, identityAt time.Time) (bool, error)
 	// AcquireOrgHardDeleteLock acquires a short-lived lock for an org cascade
 	// delete. Returns (true, nil) when the lock is successfully acquired.
-	// activateOrg checks this table to block concurrent restores.
+	// Restore/reactivation is blocked by the purging lifecycle state claimed
+	// with BeginOrgPurge; this lock only serializes concurrent hard-delete work.
 	AcquireOrgHardDeleteLock(orgID uuid.UUID) (bool, error)
 	ReleaseOrgHardDeleteLock(orgID uuid.UUID) error
 	// HardDeleteOrgLocked deletes the org record after child rows have been

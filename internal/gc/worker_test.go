@@ -1510,6 +1510,38 @@ func TestWorker_ProcessOrgCascade_UserCleanupFailureDoesNotHardDeleteUserOrOrg(t
 	}
 }
 
+func TestStore_HardDeleteOrg_DoesNotEnterPurgingWhenChildrenRemain(t *testing.T) {
+	store := NewMockStore()
+
+	orgID := uuid.New()
+	userID := uuid.New()
+	deletedAt := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
+
+	store.AddDeletedOrg(orgID, "Blocked Corp", deletedAt)
+	store.AddUser(orgID, userID, "alice@blocked.com")
+
+	err := store.HardDeleteOrg(orgID)
+	if err == nil {
+		t.Fatal("expected hard delete to fail while live users remain")
+	}
+	if store.orgStatus[orgID] != "deleted" {
+		t.Fatalf("org status after failed wrapper hard delete = %q, want deleted", store.orgStatus[orgID])
+	}
+	if !store.HasUser(orgID, userID) {
+		t.Fatal("live user should remain after failed wrapper hard delete")
+	}
+	acquired, err := store.AcquireOrgHardDeleteLock(orgID)
+	if err != nil {
+		t.Fatalf("reacquire org lock: %v", err)
+	}
+	if !acquired {
+		t.Fatal("org hard-delete lock should be released after failed wrapper hard delete")
+	}
+	if err := store.ReleaseOrgHardDeleteLock(orgID); err != nil {
+		t.Fatalf("release reacquired org lock: %v", err)
+	}
+}
+
 func TestWorker_ProcessOrgCascade_RestoreBetweenChecksSkipsDelete(t *testing.T) {
 	store := NewMockStore()
 	stats := &Stats{}

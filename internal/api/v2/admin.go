@@ -2,6 +2,7 @@ package v2
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -931,8 +932,8 @@ func (h *AdminHandler) RestoreOrganization(c *gin.Context) {
 		return
 	}
 
-	if err := activateOrg(h.db, orgID); err != nil {
-		if err.Error() == "organization is pending permanent deletion" {
+	if err := activateOrg(h.db, orgID, orgStatus, StatusDeleted); err != nil {
+		if errors.Is(err, errOrganizationPurging) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 			return
 		}
@@ -969,8 +970,8 @@ func (h *AdminHandler) ReactivateOrganization(c *gin.Context) {
 		return
 	}
 
-	if err := activateOrg(h.db, orgID); err != nil {
-		if err.Error() == "organization is pending permanent deletion" {
+	if err := activateOrg(h.db, orgID, orgStatus, StatusDeactivated); err != nil {
+		if errors.Is(err, errOrganizationPurging) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 			return
 		}
