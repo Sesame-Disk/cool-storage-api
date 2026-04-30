@@ -274,7 +274,7 @@ func ReconcileStorageScope(db DBSession, scope string, expected StorageSnapshot)
 
 // DeleteLibraryStorageCounter removes all rows for the lib-scope after permanent
 // deletion. Aggregate scopes were already adjusted by a prior soft-delete.
-func DeleteLibraryStorageCounter(db DBSession, orgID, libraryID string) {
+func DeleteLibraryStorageCounter(db DBSession, orgID, libraryID string) error {
 	scope := LibraryStorageScope(orgID, libraryID)
-	_ = db.Session().Query(`DELETE FROM storage_counters WHERE scope = ?`, scope).Exec()
+	return db.Session().Query(`DELETE FROM storage_counters WHERE scope = ?`, scope).Exec()
 }

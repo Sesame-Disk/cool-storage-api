@@ -113,14 +113,31 @@ type MockStore struct {
 	// gc_stats keyed by stat_key
 	gcStats map[string]string
 
-	// scanner-phase test hooks.
-	enqueueBatchErr               error
-	listExpiredShareLinksErr      error
-	deleteExpiredShareLinkErr     error
-	listExpiredSharesErr          error
-	deleteExpiredShareErr         error
-	listDeletedUsersExpiredErr    error
-	deleteRestoreJobsByLibraryErr error
+	// test hooks for scanner and worker failure paths.
+	enqueueBatchErr                error
+	listExpiredShareLinksErr       error
+	deleteExpiredShareLinkErr      error
+	listExpiredSharesErr           error
+	deleteExpiredShareErr          error
+	listDeletedUsersExpiredErr     error
+	deleteRestoreJobsByLibraryErr  error
+	listLibrariesByOwnerErr        error
+	softDeleteLibraryErr           error
+	listGroupMembershipsByUserErr  error
+	deleteGroupMemberErr           error
+	deleteGroupByMemberErr         error
+	listSharesByUserErr            error
+	listSharesCreatedByUserErr     error
+	deleteShareErr                 error
+	deleteStarredFilesByUserErr    error
+	deleteMonitoredReposByUserErr  error
+	deleteAPIKeysByUserErr         error
+	hardDeleteUserErr              error
+	listUsersByOrgErr              error
+	listGroupsByOrgErr             error
+	listLibrariesForOrgErr         error
+	deleteLibraryStorageCounterErr error
+	deleteGroupFullErr             error
 
 	// optional test hooks for reproducing concurrency windows deterministically.
 	getQueueSizeHook      func(orgID uuid.UUID, size int)
@@ -1815,6 +1832,9 @@ func (m *MockStore) ListExpiredShares() ([]ExpiredShareInfo, error) {
 }
 
 func (m *MockStore) DeleteShare(libraryID, shareID uuid.UUID) error {
+	if m.deleteShareErr != nil {
+		return m.deleteShareErr
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	key := fmt.Sprintf("%s:%s", libraryID, shareID)
@@ -2105,9 +2125,23 @@ func (m *MockStore) ListDeletedUsersExpired(graceDays int) ([]DeletedUserInfo, e
 	return result, nil
 }
 func (m *MockStore) ListLibrariesByOwner(orgID, ownerID uuid.UUID) ([]uuid.UUID, error) {
-	return nil, nil
+	if m.listLibrariesByOwnerErr != nil {
+		return nil, m.listLibrariesByOwnerErr
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	var result []uuid.UUID
+	for _, lib := range m.libraries {
+		if lib.OrgID == orgID && lib.OwnerID == ownerID {
+			result = append(result, lib.LibraryID)
+		}
+	}
+	return result, nil
 }
 func (m *MockStore) SoftDeleteLibrary(orgID, libraryID, deletedBy uuid.UUID) error {
+	if m.softDeleteLibraryErr != nil {
+		return m.softDeleteLibraryErr
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	lib, ok := m.libraries[libraryID]
@@ -2129,6 +2163,9 @@ func (m *MockStore) SoftDeleteLibrary(orgID, libraryID, deletedBy uuid.UUID) err
 	return nil
 }
 func (m *MockStore) ListGroupMembershipsByUser(orgID, userID uuid.UUID) ([]uuid.UUID, error) {
+	if m.listGroupMembershipsByUserErr != nil {
+		return nil, m.listGroupMembershipsByUserErr
+	}
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	prefix := fmt.Sprintf("%s:%s:", orgID, userID)
@@ -2144,18 +2181,27 @@ func (m *MockStore) ListGroupMembershipsByUser(orgID, userID uuid.UUID) ([]uuid.
 	return result, nil
 }
 func (m *MockStore) DeleteGroupMember(groupID, userID uuid.UUID) error {
+	if m.deleteGroupMemberErr != nil {
+		return m.deleteGroupMemberErr
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	delete(m.groupMembers, fmt.Sprintf("%s:%s", groupID, userID))
 	return nil
 }
 func (m *MockStore) DeleteGroupByMember(orgID, userID, groupID uuid.UUID) error {
+	if m.deleteGroupByMemberErr != nil {
+		return m.deleteGroupByMemberErr
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	delete(m.groupsByMember, fmt.Sprintf("%s:%s:%s", orgID, userID, groupID))
 	return nil
 }
 func (m *MockStore) ListSharesByUser(orgID, userID uuid.UUID) ([]ShareByUserInfo, error) {
+	if m.listSharesByUserErr != nil {
+		return nil, m.listSharesByUserErr
+	}
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	var result []ShareByUserInfo
@@ -2167,6 +2213,9 @@ func (m *MockStore) ListSharesByUser(orgID, userID uuid.UUID) ([]ShareByUserInfo
 	return result, nil
 }
 func (m *MockStore) ListSharesCreatedByUser(orgID, userID uuid.UUID) ([]ShareByCreatorInfo, error) {
+	if m.listSharesCreatedByUserErr != nil {
+		return nil, m.listSharesCreatedByUserErr
+	}
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	var result []ShareByCreatorInfo
@@ -2178,21 +2227,33 @@ func (m *MockStore) ListSharesCreatedByUser(orgID, userID uuid.UUID) ([]ShareByC
 	return result, nil
 }
 func (m *MockStore) DeleteStarredFilesByUser(userID uuid.UUID) error {
+	if m.deleteStarredFilesByUserErr != nil {
+		return m.deleteStarredFilesByUserErr
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	delete(m.starredFiles, userID)
 	return nil
 }
 func (m *MockStore) DeleteMonitoredReposByUser(userID uuid.UUID) error {
+	if m.deleteMonitoredReposByUserErr != nil {
+		return m.deleteMonitoredReposByUserErr
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	delete(m.monitoredRepos, userID)
 	return nil
 }
 func (m *MockStore) DeleteAPIKeysByUser(orgID, userID uuid.UUID) error {
+	if m.deleteAPIKeysByUserErr != nil {
+		return m.deleteAPIKeysByUserErr
+	}
 	return nil
 }
 func (m *MockStore) HardDeleteUser(orgID, userID uuid.UUID, email string) error {
+	if m.hardDeleteUserErr != nil {
+		return m.hardDeleteUserErr
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	delete(m.users, fmt.Sprintf("%s:%s", orgID, userID))
@@ -2262,6 +2323,9 @@ func (m *MockStore) ListExpiredDeletedOrgs(graceDays int) ([]DeletedOrgInfo, err
 	return result, nil
 }
 func (m *MockStore) ListUsersByOrg(orgID uuid.UUID) ([]OrgUserInfo, error) {
+	if m.listUsersByOrgErr != nil {
+		return nil, m.listUsersByOrgErr
+	}
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	prefix := fmt.Sprintf("%s:", orgID)
@@ -2274,6 +2338,9 @@ func (m *MockStore) ListUsersByOrg(orgID uuid.UUID) ([]OrgUserInfo, error) {
 	return result, nil
 }
 func (m *MockStore) ListGroupsByOrg(orgID uuid.UUID) ([]uuid.UUID, error) {
+	if m.listGroupsByOrgErr != nil {
+		return nil, m.listGroupsByOrgErr
+	}
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	prefix := fmt.Sprintf("%s:", orgID)
@@ -2289,6 +2356,9 @@ func (m *MockStore) ListGroupsByOrg(orgID uuid.UUID) ([]uuid.UUID, error) {
 	return result, nil
 }
 func (m *MockStore) ListLibrariesForOrg(orgID uuid.UUID) ([]OrgLibraryInfo, error) {
+	if m.listLibrariesForOrgErr != nil {
+		return nil, m.listLibrariesForOrgErr
+	}
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	var result []OrgLibraryInfo
@@ -2306,9 +2376,15 @@ func (m *MockStore) ListLibrariesForOrg(orgID uuid.UUID) ([]OrgLibraryInfo, erro
 }
 
 func (m *MockStore) DeleteLibraryStorageCounter(orgID, libraryID uuid.UUID) error {
+	if m.deleteLibraryStorageCounterErr != nil {
+		return m.deleteLibraryStorageCounterErr
+	}
 	return nil // no-op in mock — storage_counters not simulated
 }
 func (m *MockStore) DeleteGroupFull(orgID, groupID uuid.UUID) error {
+	if m.deleteGroupFullErr != nil {
+		return m.deleteGroupFullErr
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	delete(m.groups, fmt.Sprintf("%s:%s", orgID, groupID))

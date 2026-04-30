@@ -51,6 +51,12 @@ func TestScanner_ScanOnce_ReturnsPhaseErrorsButContinues(t *testing.T) {
 	if stats.LastScanRun().IsZero() {
 		t.Fatal("LastScanRun should be set after scan with phase errors")
 	}
+	if stats.LastScanAttempt().IsZero() {
+		t.Fatal("LastScanAttempt should be set after scan with phase errors")
+	}
+	if !stats.LastScanSuccess().IsZero() {
+		t.Fatal("LastScanSuccess should not be set after scan with phase errors")
+	}
 
 	items := store.QueueItems(orgID)
 	userCascadeCount := 0
@@ -162,6 +168,12 @@ func TestScanner_ScanOrphanedBlocks(t *testing.T) {
 	// Stats should be updated
 	if stats.LastScanRun().IsZero() {
 		t.Error("LastScanRun should be set after scan")
+	}
+	if stats.LastScanAttempt().IsZero() {
+		t.Error("LastScanAttempt should be set after scan")
+	}
+	if stats.LastScanSuccess().IsZero() {
+		t.Error("LastScanSuccess should be set after successful scan")
 	}
 }
 

@@ -129,7 +129,11 @@ func (s *Scanner) ScanOnce(ctx context.Context) error {
 
 	elapsed := time.Since(start)
 	log.Printf("[GC Scanner] Safety scan complete: enqueued %d items in %v", enqueued, elapsed)
-	s.stats.SetLastScanRun(time.Now())
+	completedAt := time.Now()
+	s.stats.SetLastScanAttempt(completedAt)
+	if scanErr == nil {
+		s.stats.SetLastScanSuccess(completedAt)
+	}
 	return scanErr
 }
 

@@ -2533,7 +2533,7 @@ func (s *CassandraStore) DeleteMonitoredReposByUser(userID uuid.UUID) error {
 func (s *CassandraStore) DeleteAPIKeysByUser(orgID, userID uuid.UUID) error {
 	iter := s.db.Session().Query(
 		`SELECT key_hash, created_at FROM api_keys_by_user WHERE org_id = ? AND user_id = ?`,
-		orgID, userID,
+		orgID.String(), userID.String(),
 	).Iter()
 
 	type keyRef struct {
@@ -2560,7 +2560,7 @@ func (s *CassandraStore) DeleteAPIKeysByUser(orgID, userID uuid.UUID) error {
 		batch := s.db.Session().Batch(gocql.UnloggedBatch)
 		for _, r := range refs[i:end] {
 			batch.Query(`DELETE FROM api_keys WHERE key_hash = ?`, r.hash)
-			batch.Query(`DELETE FROM api_keys_by_user WHERE org_id = ? AND user_id = ? AND created_at = ?`, orgID, userID, r.createdAt)
+			batch.Query(`DELETE FROM api_keys_by_user WHERE org_id = ? AND user_id = ? AND created_at = ?`, orgID.String(), userID.String(), r.createdAt)
 		}
 		if err := batch.Exec(); err != nil {
 			return err
@@ -2845,8 +2845,7 @@ func (s *CassandraStore) ListLibrariesForOrg(orgID uuid.UUID) ([]OrgLibraryInfo,
 }
 
 func (s *CassandraStore) DeleteLibraryStorageCounter(orgID, libraryID uuid.UUID) error {
-	traffic.DeleteLibraryStorageCounter(s.db, orgID.String(), libraryID.String())
-	return nil
+	return traffic.DeleteLibraryStorageCounter(s.db, orgID.String(), libraryID.String())
 }
 
 func (s *CassandraStore) DeleteGroupFull(orgID, groupID uuid.UUID) error {

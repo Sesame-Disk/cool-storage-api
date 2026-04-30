@@ -1062,11 +1062,13 @@ func TestWorker_ProcessUserCascade_FullCascade(t *testing.T) {
 	groupID := uuid.New()
 	receivedLibID := uuid.New()
 	createdLibID := uuid.New()
+	ownedLibID := uuid.New()
 	recipientID := uuid.New()
 	deletedAt := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
 
 	store.AddOrganization(orgID)
 	store.AddDeletedUser(orgID, userID, "alice@test.com", deletedAt)
+	store.AddLibraryWithOwner(orgID, ownedLibID, userID, "hot")
 	store.AddGroupMembership(orgID, userID, groupID)
 	receivedShareID := store.AddShareByUser(orgID, userID, receivedLibID)
 	createdShareID := store.AddShareCreatedByUser(orgID, userID, recipientID, createdLibID)
@@ -1096,6 +1098,9 @@ func TestWorker_ProcessUserCascade_FullCascade(t *testing.T) {
 	if store.HasMonitoredRepos(userID) {
 		t.Error("monitored repos should be deleted after user cascade")
 	}
+	if deletedAt, err := store.GetLibraryDeletedAt(ownedLibID); err != nil || deletedAt == nil {
+		t.Fatalf("owned library should be soft-deleted after user cascade, deletedAt=%v err=%v", deletedAt, err)
+	}
 	if store.HasShare(receivedLibID, receivedShareID) {
 		t.Error("received share should be deleted after user cascade")
 	}
@@ -1109,6 +1114,34 @@ func TestWorker_ProcessUserCascade_FullCascade(t *testing.T) {
 		t.Errorf("expected 1 audit log entry, got %d", len(entries))
 	} else if entries[0].Action != "gc_user_cascade_deleted" {
 		t.Errorf("expected action gc_user_cascade_deleted, got %s", entries[0].Action)
+	}
+}
+
+func TestWorker_ProcessUserCascade_AuxCleanupFailureDoesNotHardDeleteUser(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	w := NewWorker(store, nil, q, 100, 0, false, stats)
+
+	orgID := uuid.New()
+	userID := uuid.New()
+	deletedAt := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
+
+	store.AddOrganization(orgID)
+	store.AddDeletedUser(orgID, userID, "alice@test.com", deletedAt)
+	store.AddStarredFile(userID)
+	store.deleteStarredFilesByUserErr = errors.New("starred cleanup unavailable")
+
+	item := QueueItem{OrgID: orgID, QueuedAt: deletedAt, IdentityAt: deletedAt, ItemType: ItemUserCascade, ItemID: userID.String()}
+	err := w.processUserCascade(context.Background(), item)
+	if err == nil {
+		t.Fatal("expected cleanup failure")
+	}
+	if !store.HasUser(orgID, userID) {
+		t.Fatal("user should remain for retry when auxiliary cleanup fails")
+	}
+	if len(store.AuditLogEntries()) != 0 {
+		t.Fatal("user cascade audit should not be written before successful hard delete")
 	}
 }
 
@@ -1175,6 +1208,33 @@ func TestWorker_ProcessLibraryCascade_FullCascade(t *testing.T) {
 	}
 	if !actions["gc_library_cascade_deleted"] {
 		t.Error("expected gc_library_cascade_deleted audit entry")
+	}
+}
+
+func TestWorker_ProcessLibraryCascade_StorageCounterFailureDoesNotHardDeleteLibrary(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	w := NewWorker(store, nil, q, 100, 0, false, stats)
+
+	orgID := uuid.New()
+	libID := uuid.New()
+	deletedAt := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
+
+	store.AddOrganization(orgID)
+	store.AddDeletedLibrary(orgID, libID, "hot", deletedAt)
+	store.deleteLibraryStorageCounterErr = errors.New("counter delete unavailable")
+
+	item := QueueItem{OrgID: orgID, QueuedAt: deletedAt, IdentityAt: deletedAt, ItemType: ItemLibraryCascade, ItemID: libID.String(), StorageClass: "hot"}
+	err := w.processLibraryCascade(context.Background(), item)
+	if err == nil {
+		t.Fatal("expected storage counter cleanup failure")
+	}
+	if _, err := store.GetLibraryStorageClass(orgID, libID); err != nil {
+		t.Fatalf("library should remain for retry when counter cleanup fails: %v", err)
+	}
+	if len(store.AuditLogEntries()) != 0 {
+		t.Fatal("library hard-delete audit should not be written before successful counter cleanup")
 	}
 }
 
@@ -1415,6 +1475,36 @@ func TestWorker_ProcessOrgCascade_FullCascade(t *testing.T) {
 	}
 	if !actions["gc_org_cascade_deleted"] {
 		t.Error("expected gc_org_cascade_deleted audit entry")
+	}
+}
+
+func TestWorker_ProcessOrgCascade_UserCleanupFailureDoesNotHardDeleteUserOrOrg(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	w := NewWorker(store, nil, q, 100, 0, false, stats)
+
+	orgID := uuid.New()
+	userID := uuid.New()
+	deletedAt := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
+
+	store.AddDeletedOrg(orgID, "Doomed Corp", deletedAt)
+	store.AddUser(orgID, userID, "alice@doomed.com")
+	store.deleteAPIKeysByUserErr = errors.New("api key cleanup unavailable")
+
+	item := QueueItem{OrgID: orgID, QueuedAt: deletedAt, IdentityAt: deletedAt, ItemType: ItemOrgCascade, ItemID: orgID.String()}
+	err := w.processOrgCascade(context.Background(), item)
+	if err == nil {
+		t.Fatal("expected user cleanup failure")
+	}
+	if !store.HasUser(orgID, userID) {
+		t.Fatal("user should remain for retry when org cascade user cleanup fails")
+	}
+	if !store.HasOrg(orgID) {
+		t.Fatal("org should remain for retry when user cleanup fails")
+	}
+	if len(store.AuditLogEntries()) != 0 {
+		t.Fatal("org cascade audit should not be written before successful hard delete")
 	}
 }
 

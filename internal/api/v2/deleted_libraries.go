@@ -300,7 +300,9 @@ func (h *DeletedLibraryHandler) PermanentDeleteRepo(c *gin.Context) {
 
 	// Clean up the lib-scope storage counter row. Aggregate scopes (org, user,
 	// platform) were already adjusted when the library was soft-deleted.
-	traffic.DeleteLibraryStorageCounter(h.db, orgID, repoID)
+	if err := traffic.DeleteLibraryStorageCounter(h.db, orgID, repoID); err != nil {
+		log.Printf("failed to delete storage counter for permanently deleted library %s/%s: %v", orgID, repoID, err)
+	}
 
 	// Tag cleanup is secondary metadata and can remain asynchronous.
 	go CleanupAllLibraryTags(h.db, repoID)
