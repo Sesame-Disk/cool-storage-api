@@ -245,6 +245,111 @@ func TestWorker_IncrementRetryAmbiguousError_DoesNotDuplicate(t *testing.T) {
 	}
 }
 
+func TestWorker_IncrementRetryAmbiguousCascadeError_DoesNotFalseDLQ(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	w := NewWorker(store, nil, q, 100, 0, false, stats)
+
+	orgID := uuid.New()
+	libraryID := uuid.New()
+	deletedAt := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
+
+	store.AddOrganization(orgID)
+	store.AddDeletedLibrary(orgID, libraryID, "hot", deletedAt)
+	store.deleteRestoreJobsByLibraryErr = errors.New("restore jobs unavailable")
+	store.requeueItemErrAfterMutate = errors.New("simulated cassandra write timeout — batch may have applied")
+
+	if err := store.EnqueueItem(orgID, deletedAt, ItemLibraryCascade, libraryID.String(), uuid.Nil, "hot", 0); err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+
+	if _, err := w.ProcessOnce(context.Background()); err != nil {
+		t.Fatalf("ProcessOnce: %v", err)
+	}
+
+	if failed := store.FailedItems(orgID); len(failed) != 0 {
+		t.Fatalf("expected NO DLQ entries when ambiguous cascade requeue applied, got %d entries: %#v", len(failed), failed)
+	}
+
+	items := store.QueueItems(orgID)
+	if len(items) != 1 {
+		t.Fatalf("expected exactly 1 live cascade queue row after ambiguous requeue, got %d", len(items))
+	}
+	if items[0].ItemType != ItemLibraryCascade {
+		t.Fatalf("live queue item type = %q, want %q", items[0].ItemType, ItemLibraryCascade)
+	}
+	if items[0].RetryCount != 1 {
+		t.Fatalf("live queue item RetryCount = %d, want 1", items[0].RetryCount)
+	}
+	if items[0].QueuedAt.Equal(deletedAt) {
+		t.Fatal("ambiguous cascade requeue kept original queued_at; item was not moved to the back of the queue")
+	}
+	if !items[0].IdentityAt.Equal(deletedAt) {
+		t.Fatalf("live queue item IdentityAt = %v, want %v", items[0].IdentityAt, deletedAt)
+	}
+}
+
+func TestWorker_ProcessLibraryCascade_RetriedChildDoesNotDuplicateOnParentRetry(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	w := NewWorker(store, nil, q, 100, 0, false, stats)
+
+	orgID := uuid.New()
+	libID := uuid.New()
+	deletedAt := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
+
+	store.AddOrganization(orgID)
+	store.AddDeletedLibrary(orgID, libID, "hot", deletedAt)
+	store.AddCommit(libID, "commit-1", "fs-root-1")
+	store.AddCommit(libID, "commit-2", "fs-root-2")
+	store.AddFSObject(libID, "fs-root-1", "dir", nil)
+	store.AddFSObject(libID, "fs-root-2", "dir", nil)
+	store.deleteRestoreJobsByLibraryErr = errors.New("restore jobs unavailable")
+
+	parent := QueueItem{OrgID: orgID, QueuedAt: deletedAt, IdentityAt: deletedAt, ItemType: ItemLibraryCascade, ItemID: libID.String(), StorageClass: "hot"}
+	if err := w.processLibraryCascade(context.Background(), parent); err == nil {
+		t.Fatal("expected first library cascade attempt to fail")
+	}
+
+	var retriedChild QueueItem
+	for _, item := range store.QueueItems(orgID) {
+		if item.ItemType == ItemCommit {
+			retriedChild = item
+			break
+		}
+	}
+	if retriedChild.ItemID == "" {
+		t.Fatal("expected commit child to be enqueued")
+	}
+	if err := q.IncrementRetry(retriedChild); err != nil {
+		t.Fatalf("IncrementRetry(child) failed: %v", err)
+	}
+
+	if err := w.processLibraryCascade(context.Background(), parent); err == nil {
+		t.Fatal("expected second library cascade attempt to fail while auxiliary cleanup stays broken")
+	}
+
+	items := store.QueueItems(orgID)
+	commitCount := 0
+	fsCount := 0
+	for _, item := range items {
+		switch item.ItemType {
+		case ItemCommit:
+			commitCount++
+		case ItemFSObject:
+			fsCount++
+		}
+	}
+	if commitCount != 2 {
+		t.Fatalf("expected 2 commit children after parent retry, got %d", commitCount)
+	}
+	if fsCount != 2 {
+		t.Fatalf("expected 2 fs_object children after parent retry, got %d", fsCount)
+	}
+}
+
 func TestWorker_ProcessOrg_PreservesActiveOrgOnConcurrentEnqueue(t *testing.T) {
 	store := NewMockStore()
 	stats := &Stats{}

@@ -25,11 +25,19 @@ const (
 type QueueItem struct {
 	OrgID        uuid.UUID
 	QueuedAt     time.Time
+	IdentityAt   time.Time
 	ItemType     ItemType
 	ItemID       string
 	LibraryID    uuid.UUID
 	StorageClass string
 	RetryCount   int
+}
+
+func effectiveIdentityAt(queuedAt, identityAt time.Time) time.Time {
+	if identityAt.IsZero() {
+		return queuedAt
+	}
+	return identityAt
 }
 
 // Queue provides operations for the gc_queue.
@@ -78,7 +86,7 @@ func (q *Queue) Complete(orgID uuid.UUID, queuedAt time.Time, itemType ItemType,
 // IncrementRetry updates the retry count for a failed item and requeues it at the back of the queue.
 func (q *Queue) IncrementRetry(item QueueItem) error {
 	newQueuedAt := time.Now()
-	return q.store.RequeueItem(item.OrgID, item.QueuedAt, newQueuedAt, item.ItemType, item.ItemID, item.LibraryID, item.StorageClass, item.RetryCount+1)
+	return q.store.RequeueItem(item.OrgID, item.QueuedAt, newQueuedAt, item.ItemType, item.ItemID, item.LibraryID, item.StorageClass, item.RetryCount+1, effectiveIdentityAt(item.QueuedAt, item.IdentityAt))
 }
 
 // GetQueueSize returns the approximate number of items in the queue for an org.

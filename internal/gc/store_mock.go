@@ -18,6 +18,8 @@ type MockStore struct {
 
 	// gc_queue items keyed by orgID
 	queue map[uuid.UUID][]QueueItem
+	// gc_pending_items keyed by semantic item identity.
+	pendingItems map[mockPendingItemKey]*time.Time
 	// active queue orgs keyed by orgID
 	activeQueueOrgs map[uuid.UUID]time.Time
 	// dirty queue orgs keyed by orgID
@@ -112,12 +114,13 @@ type MockStore struct {
 	gcStats map[string]string
 
 	// scanner-phase test hooks.
-	enqueueBatchErr            error
-	listExpiredShareLinksErr   error
-	deleteExpiredShareLinkErr  error
-	listExpiredSharesErr       error
-	deleteExpiredShareErr      error
-	listDeletedUsersExpiredErr error
+	enqueueBatchErr               error
+	listExpiredShareLinksErr      error
+	deleteExpiredShareLinkErr     error
+	listExpiredSharesErr          error
+	deleteExpiredShareErr         error
+	listDeletedUsersExpiredErr    error
+	deleteRestoreJobsByLibraryErr error
 
 	// optional test hooks for reproducing concurrency windows deterministically.
 	getQueueSizeHook      func(orgID uuid.UUID, size int)
@@ -151,6 +154,14 @@ type mockBlock struct {
 	BlockID      string
 	StorageClass string
 	RefCount     int
+}
+
+type mockPendingItemKey struct {
+	OrgID      uuid.UUID
+	LibraryID  uuid.UUID
+	ItemType   ItemType
+	ItemID     string
+	IdentityAt time.Time
 }
 
 type mockBlockGCCandidate struct {
@@ -255,6 +266,7 @@ type mockStorageCounterReconciliation struct {
 func NewMockStore() *MockStore {
 	return &MockStore{
 		queue:                         make(map[uuid.UUID][]QueueItem),
+		pendingItems:                  make(map[mockPendingItemKey]*time.Time),
 		activeQueueOrgs:               make(map[uuid.UUID]time.Time),
 		dirtyQueueOrgs:                make(map[uuid.UUID]time.Time),
 		orgQueueStats:                 make(map[uuid.UUID]GCOrgStats),
@@ -291,6 +303,30 @@ func NewMockStore() *MockStore {
 		organizations:                 nil,
 		s3Orphans:                     make(map[string]*S3OrphanInfo),
 	}
+}
+
+func newMockPendingItemKey(orgID, libraryID uuid.UUID, itemType ItemType, itemID string, identityAt time.Time) mockPendingItemKey {
+	return mockPendingItemKey{
+		OrgID:      orgID,
+		LibraryID:  libraryID,
+		ItemType:   itemType,
+		ItemID:     itemID,
+		IdentityAt: identityAt,
+	}
+}
+
+func (m *MockStore) upsertPendingItem(orgID, libraryID uuid.UUID, itemType ItemType, itemID string, identityAt time.Time, expiresAt *time.Time) {
+	key := newMockPendingItemKey(orgID, libraryID, itemType, itemID, identityAt)
+	if expiresAt == nil {
+		m.pendingItems[key] = nil
+		return
+	}
+	expiry := *expiresAt
+	m.pendingItems[key] = &expiry
+}
+
+func (m *MockStore) deletePendingItem(orgID, libraryID uuid.UUID, itemType ItemType, itemID string, identityAt time.Time) {
+	delete(m.pendingItems, newMockPendingItemKey(orgID, libraryID, itemType, itemID, identityAt))
 }
 
 // --- Test helpers for seeding data ---
@@ -737,6 +773,7 @@ func (m *MockStore) EnqueueItem(orgID uuid.UUID, queuedAt time.Time, itemType It
 	item := QueueItem{
 		OrgID:        orgID,
 		QueuedAt:     queuedAt,
+		IdentityAt:   queuedAt,
 		ItemType:     itemType,
 		ItemID:       itemID,
 		LibraryID:    libraryID,
@@ -744,6 +781,7 @@ func (m *MockStore) EnqueueItem(orgID uuid.UUID, queuedAt time.Time, itemType It
 		RetryCount:   retryCount,
 	}
 	m.queue[orgID] = append(m.queue[orgID], item)
+	m.upsertPendingItem(orgID, libraryID, itemType, itemID, queuedAt, nil)
 	m.activeQueueOrgs[orgID] = time.Now().UTC()
 	m.dirtyQueueOrgs[orgID] = time.Now().UTC()
 	return nil
@@ -756,7 +794,9 @@ func (m *MockStore) EnqueueBatch(items []QueueItem) error {
 		return m.enqueueBatchErr
 	}
 	for _, item := range items {
+		item.IdentityAt = effectiveIdentityAt(item.QueuedAt, item.IdentityAt)
 		m.queue[item.OrgID] = append(m.queue[item.OrgID], item)
+		m.upsertPendingItem(item.OrgID, item.LibraryID, item.ItemType, item.ItemID, item.IdentityAt, nil)
 		m.activeQueueOrgs[item.OrgID] = time.Now().UTC()
 		m.dirtyQueueOrgs[item.OrgID] = time.Now().UTC()
 	}
@@ -768,6 +808,30 @@ func (m *MockStore) QueueItemExists(orgID uuid.UUID, queuedAt time.Time, itemTyp
 	defer m.mu.RUnlock()
 	for _, item := range m.queue[orgID] {
 		if item.QueuedAt.Equal(queuedAt) && item.ItemType == itemType && item.ItemID == itemID {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (m *MockStore) PendingItemExists(orgID, libraryID uuid.UUID, identityAt time.Time, itemType ItemType, itemID string) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	now := time.Now().UTC()
+	for key, expiresAt := range m.pendingItems {
+		if key.OrgID != orgID || key.LibraryID != libraryID || key.ItemType != itemType || key.ItemID != itemID {
+			continue
+		}
+		if expiresAt != nil && !expiresAt.After(now) {
+			delete(m.pendingItems, key)
+			continue
+		}
+		if identityAt.IsZero() || key.IdentityAt.Equal(identityAt) {
+			return true, nil
+		}
+	}
+	for _, item := range m.failedItems[orgID] {
+		if item.ItemType == itemType && item.ItemID == itemID && item.LibraryID == libraryID && (identityAt.IsZero() || effectiveIdentityAt(item.QueuedAt, item.IdentityAt).Equal(identityAt)) {
 			return true, nil
 		}
 	}
@@ -804,6 +868,7 @@ func (m *MockStore) CompleteItem(orgID uuid.UUID, queuedAt time.Time, itemType I
 	for i, item := range items {
 		if item.QueuedAt.Equal(queuedAt) && item.ItemType == itemType && item.ItemID == itemID {
 			m.queue[orgID] = append(items[:i], items[i+1:]...)
+			m.deletePendingItem(orgID, item.LibraryID, itemType, itemID, effectiveIdentityAt(item.QueuedAt, item.IdentityAt))
 			m.dirtyQueueOrgs[orgID] = time.Now().UTC()
 			return nil
 		}
@@ -811,7 +876,7 @@ func (m *MockStore) CompleteItem(orgID uuid.UUID, queuedAt time.Time, itemType I
 	return nil
 }
 
-func (m *MockStore) RequeueItem(orgID uuid.UUID, oldQueuedAt, newQueuedAt time.Time, itemType ItemType, itemID string, libraryID uuid.UUID, storageClass string, newRetryCount int) error {
+func (m *MockStore) RequeueItem(orgID uuid.UUID, oldQueuedAt, newQueuedAt time.Time, itemType ItemType, itemID string, libraryID uuid.UUID, storageClass string, newRetryCount int, identityAt time.Time) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -828,8 +893,10 @@ func (m *MockStore) RequeueItem(orgID uuid.UUID, oldQueuedAt, newQueuedAt time.T
 			// Append the new recreated item
 			newItem := item
 			newItem.QueuedAt = newQueuedAt
+			newItem.IdentityAt = effectiveIdentityAt(item.QueuedAt, identityAt)
 			newItem.RetryCount = newRetryCount
 			m.queue[orgID] = append(m.queue[orgID], newItem)
+			m.upsertPendingItem(orgID, libraryID, itemType, itemID, newItem.IdentityAt, nil)
 			m.activeQueueOrgs[orgID] = time.Now().UTC()
 			m.dirtyQueueOrgs[orgID] = time.Now().UTC()
 
@@ -857,6 +924,7 @@ func (m *MockStore) FailItem(item QueueItem, failedAt time.Time, lastError strin
 		OrgID:        item.OrgID,
 		FailedAt:     failedAt,
 		QueuedAt:     item.QueuedAt,
+		IdentityAt:   effectiveIdentityAt(item.QueuedAt, item.IdentityAt),
 		ItemType:     item.ItemType,
 		ItemID:       item.ItemID,
 		LibraryID:    item.LibraryID,
@@ -864,6 +932,8 @@ func (m *MockStore) FailItem(item QueueItem, failedAt time.Time, lastError strin
 		RetryCount:   item.RetryCount,
 		LastError:    lastError,
 	})
+	expiresAt := failedAt.Add(gcFailedItemRetention)
+	m.upsertPendingItem(item.OrgID, item.LibraryID, item.ItemType, item.ItemID, effectiveIdentityAt(item.QueuedAt, item.IdentityAt), &expiresAt)
 	m.dirtyQueueOrgs[item.OrgID] = time.Now().UTC()
 	return nil
 }
@@ -982,6 +1052,7 @@ func (m *MockStore) DeleteFailedItem(orgID uuid.UUID, failedAt time.Time, itemTy
 	for i, item := range items {
 		if item.FailedAt.Equal(failedAt) && item.ItemType == itemType && item.ItemID == itemID {
 			m.failedItems[orgID] = append(items[:i], items[i+1:]...)
+			m.deletePendingItem(orgID, item.LibraryID, itemType, itemID, effectiveIdentityAt(item.QueuedAt, item.IdentityAt))
 			m.dirtyQueueOrgs[orgID] = time.Now().UTC()
 			return nil
 		}
@@ -1004,12 +1075,14 @@ func (m *MockStore) RequeueFailedItem(orgID uuid.UUID, failedAt time.Time, itemT
 			m.queue[orgID] = append(m.queue[orgID], QueueItem{
 				OrgID:        orgID,
 				QueuedAt:     queuedAt,
+				IdentityAt:   effectiveIdentityAt(item.QueuedAt, item.IdentityAt),
 				ItemType:     item.ItemType,
 				ItemID:       item.ItemID,
 				LibraryID:    item.LibraryID,
 				StorageClass: item.StorageClass,
 				RetryCount:   0,
 			})
+			m.upsertPendingItem(orgID, item.LibraryID, itemType, itemID, effectiveIdentityAt(item.QueuedAt, item.IdentityAt), nil)
 			m.failedItems[orgID] = append(items[:i], items[i+1:]...)
 			m.activeQueueOrgs[orgID] = time.Now().UTC()
 			m.dirtyQueueOrgs[orgID] = time.Now().UTC()
@@ -1547,10 +1620,14 @@ func (m *MockStore) FindOrgForLibrary(libraryID uuid.UUID) (uuid.UUID, error) {
 	defer m.mu.RUnlock()
 
 	lib, ok := m.libraries[libraryID]
-	if !ok {
-		return uuid.Nil, fmt.Errorf("library not found: %s", libraryID)
+	if ok {
+		return lib.OrgID, nil
 	}
-	return lib.OrgID, nil
+	deleted, ok := m.deletedLibraries[libraryID]
+	if ok {
+		return deleted.OrgID, nil
+	}
+	return uuid.Nil, fmt.Errorf("library not found: %s", libraryID)
 }
 
 func (m *MockStore) ListCommitIDsForLibrary(libraryID uuid.UUID) ([]string, error) {
@@ -1910,6 +1987,9 @@ func (m *MockStore) DeleteShareLinksByLibrary(orgID, libraryID uuid.UUID) ([]str
 func (m *MockStore) DeleteStarredFilesByLibrary(libraryID uuid.UUID) error   { return nil }
 func (m *MockStore) DeleteMonitoredReposByLibrary(libraryID uuid.UUID) error { return nil }
 func (m *MockStore) DeleteRestoreJobsByLibrary(orgID, libraryID uuid.UUID) error {
+	if m.deleteRestoreJobsByLibraryErr != nil {
+		return m.deleteRestoreJobsByLibraryErr
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	prefix := fmt.Sprintf("%s:%s:", orgID, libraryID)

@@ -69,6 +69,10 @@ func isScannerInterruptError(err error) bool {
 	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }
 
+func (s *Scanner) pendingWorkExists(orgID, libraryID uuid.UUID, itemType ItemType, itemID string) (bool, error) {
+	return s.store.PendingItemExists(orgID, libraryID, time.Time{}, itemType, itemID)
+}
+
 // ScanOnce performs a full scan of all phases.
 func (s *Scanner) ScanOnce(ctx context.Context) error {
 	start := time.Now()
@@ -196,7 +200,7 @@ func (s *Scanner) scanOrphanedBlocks(ctx context.Context) (int, error) {
 		var batch []QueueItem
 		queuedBlocks := make(map[string]struct{}, len(candidates))
 		for _, candidate := range candidates {
-			exists, err := s.store.QueueItemExists(orgID, candidate.CandidateAt, ItemBlock, candidate.BlockID)
+			exists, err := s.store.PendingItemExists(orgID, uuid.Nil, candidate.CandidateAt, ItemBlock, candidate.BlockID)
 			if err != nil {
 				log.Printf("[GC Scanner] Phase 1: failed to inspect queue for block %s in org %s: %v", candidate.BlockID, orgID, err)
 				continue
@@ -227,7 +231,7 @@ func (s *Scanner) scanOrphanedBlocks(ctx context.Context) (int, error) {
 				log.Printf("[GC Scanner] Phase 1: failed to backfill GC candidate for block %s in org %s: %v", block.BlockID, orgID, err)
 				continue
 			}
-			exists, err := s.store.QueueItemExists(orgID, candidateAt, ItemBlock, block.BlockID)
+			exists, err := s.store.PendingItemExists(orgID, uuid.Nil, candidateAt, ItemBlock, block.BlockID)
 			if err != nil {
 				log.Printf("[GC Scanner] Phase 1: failed to inspect queue for reconciled block %s in org %s: %v", block.BlockID, orgID, err)
 				continue
@@ -344,12 +348,21 @@ func (s *Scanner) scanOrphanedCommits(ctx context.Context) (int, error) {
 			now := time.Now()
 			batch := make([]QueueItem, 0, len(commitIDs))
 			for _, commitID := range commitIDs {
+				exists, err := s.pendingWorkExists(orgID, libID, ItemCommit, commitID)
+				if err != nil {
+					log.Printf("[GC Scanner] Phase 3: failed to inspect pending commit %s for library %s: %v", commitID, libID, err)
+					continue
+				}
+				if exists {
+					continue
+				}
 				batch = append(batch, QueueItem{
-					OrgID:     orgID,
-					QueuedAt:  now,
-					ItemType:  ItemCommit,
-					ItemID:    commitID,
-					LibraryID: libID,
+					OrgID:      orgID,
+					QueuedAt:   now,
+					IdentityAt: now,
+					ItemType:   ItemCommit,
+					ItemID:     commitID,
+					LibraryID:  libID,
 				})
 			}
 			if err := s.queue.EnqueueBatch(batch); err != nil {
@@ -402,12 +415,21 @@ func (s *Scanner) scanOrphanedFSObjects(ctx context.Context) (int, error) {
 			now := time.Now()
 			batch := make([]QueueItem, 0, len(fsIDs))
 			for _, fsID := range fsIDs {
+				exists, err := s.pendingWorkExists(orgID, libID, ItemFSObject, fsID)
+				if err != nil {
+					log.Printf("[GC Scanner] Phase 4: failed to inspect pending fs_object %s for library %s: %v", fsID, libID, err)
+					continue
+				}
+				if exists {
+					continue
+				}
 				batch = append(batch, QueueItem{
-					OrgID:     orgID,
-					QueuedAt:  now,
-					ItemType:  ItemFSObject,
-					ItemID:    fsID,
-					LibraryID: libID,
+					OrgID:      orgID,
+					QueuedAt:   now,
+					IdentityAt: now,
+					ItemType:   ItemFSObject,
+					ItemID:     fsID,
+					LibraryID:  libID,
 				})
 			}
 			if err := s.queue.EnqueueBatch(batch); err != nil {
@@ -478,12 +500,21 @@ func (s *Scanner) scanExpiredVersions(ctx context.Context) (int, error) {
 				continue
 			}
 			if c.CreatedAt.Before(cutoff) {
+				exists, err := s.pendingWorkExists(lib.OrgID, lib.LibraryID, ItemCommit, c.CommitID)
+				if err != nil {
+					log.Printf("[GC Scanner] Phase 5: failed to inspect pending commit %s for library %s: %v", c.CommitID, lib.LibraryID, err)
+					continue
+				}
+				if exists {
+					continue
+				}
 				batch = append(batch, QueueItem{
-					OrgID:     lib.OrgID,
-					QueuedAt:  now,
-					ItemType:  ItemCommit,
-					ItemID:    c.CommitID,
-					LibraryID: lib.LibraryID,
+					OrgID:      lib.OrgID,
+					QueuedAt:   now,
+					IdentityAt: now,
+					ItemType:   ItemCommit,
+					ItemID:     c.CommitID,
+					LibraryID:  lib.LibraryID,
 				})
 			}
 		}
@@ -575,12 +606,21 @@ func (s *Scanner) scanAutoDeleteExpiredObjects(ctx context.Context) (int, error)
 		var batch []QueueItem
 		for _, fsID := range allFSIDs {
 			if !keepFSSet[fsID] {
+				exists, err := s.pendingWorkExists(lib.OrgID, lib.LibraryID, ItemFSObject, fsID)
+				if err != nil {
+					log.Printf("[GC Scanner] Phase 6: failed to inspect pending fs_object %s for library %s: %v", fsID, lib.LibraryID, err)
+					continue
+				}
+				if exists {
+					continue
+				}
 				batch = append(batch, QueueItem{
-					OrgID:     lib.OrgID,
-					QueuedAt:  now,
-					ItemType:  ItemFSObject,
-					ItemID:    fsID,
-					LibraryID: lib.LibraryID,
+					OrgID:      lib.OrgID,
+					QueuedAt:   now,
+					IdentityAt: now,
+					ItemType:   ItemFSObject,
+					ItemID:     fsID,
+					LibraryID:  lib.LibraryID,
 				})
 			}
 		}
@@ -753,7 +793,7 @@ func (s *Scanner) scanExpiredDeletedUsers(ctx context.Context) (int, error) {
 	var batch []QueueItem
 	var phaseErr error
 	for _, u := range users {
-		exists, err := s.store.QueueItemExists(u.OrgID, u.DeletedAt, ItemUserCascade, u.UserID.String())
+		exists, err := s.store.PendingItemExists(u.OrgID, uuid.Nil, u.DeletedAt, ItemUserCascade, u.UserID.String())
 		if err != nil {
 			log.Printf("[GC Scanner] Phase 10: failed to dedupe expired deleted user %s: %v", u.UserID, err)
 			if phaseErr == nil {
@@ -808,7 +848,7 @@ func (s *Scanner) scanExpiredDeletedLibraries(ctx context.Context) (int, error) 
 	enqueued := 0
 	var batch []QueueItem
 	for _, lib := range libs {
-		exists, err := s.store.QueueItemExists(lib.OrgID, lib.DeletedAt, ItemLibraryCascade, lib.LibraryID.String())
+		exists, err := s.store.PendingItemExists(lib.OrgID, uuid.Nil, lib.DeletedAt, ItemLibraryCascade, lib.LibraryID.String())
 		if err != nil {
 			log.Printf("[GC Scanner] Phase 11: failed to dedupe expired deleted library %s: %v", lib.LibraryID, err)
 			continue
@@ -851,7 +891,7 @@ func (s *Scanner) scanExpiredDeletedOrgs(ctx context.Context) (int, error) {
 	enqueued := 0
 	var batch []QueueItem
 	for _, org := range orgs {
-		exists, err := s.store.QueueItemExists(org.OrgID, org.DeletedAt, ItemOrgCascade, org.OrgID.String())
+		exists, err := s.store.PendingItemExists(org.OrgID, uuid.Nil, org.DeletedAt, ItemOrgCascade, org.OrgID.String())
 		if err != nil {
 			log.Printf("[GC Scanner] Phase 12: failed to dedupe expired deleted org %s: %v", org.OrgID, err)
 			continue

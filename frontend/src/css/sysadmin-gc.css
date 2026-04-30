@@ -113,6 +113,61 @@
   min-width: 140px;
 }
 
+.gc-admin-alert {
+  border-radius: 8px;
+  border: 1px solid transparent;
+  padding: 14px;
+}
+
+.gc-admin-alert-danger {
+  border-color: #f1c4c4;
+  background: #fdf4f4;
+}
+
+.gc-admin-alert-title,
+.gc-admin-hint-title {
+  font-size: 13px;
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+
+.gc-admin-alert-meta,
+.gc-admin-alert-body,
+.gc-admin-hint-description {
+  color: #555;
+  font-size: 13px;
+}
+
+.gc-admin-alert-body {
+  margin-top: 8px;
+}
+
+.gc-admin-hints-list {
+  display: grid;
+  gap: 12px;
+}
+
+.gc-admin-hint {
+  border-radius: 8px;
+  border: 1px solid #e6edf3;
+  padding: 12px 14px;
+}
+
+.gc-admin-hint-warning {
+  background: #fff8ec;
+  border-color: #f2d4a4;
+}
+
+.gc-admin-hint-danger {
+  background: #fdf4f4;
+  border-color: #f1c4c4;
+}
+
+.gc-admin-hint-info {
+  background: #f6fbff;
+  border-color: #cfe3f4;
+}
+
 .gc-admin-selected-org {
   border: 1px solid #e6edf3;
   border-radius: 8px;

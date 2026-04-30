@@ -277,12 +277,78 @@ class GC extends Component {
         return `${value}s`;
     };
 
+    getOperationalHints = (status) => {
+        if (!status) {
+            return [];
+        }
+
+        const hints = [];
+
+        if (status.last_scan_error) {
+            hints.push({
+                tone: 'danger',
+                title: gettext('Scanner needs attention'),
+                description: gettext('The last scanner run ended with an aggregated error. Review the message below before forcing more manual scans.'),
+            });
+        }
+
+        if (status.snapshot_age_seconds === -1) {
+            hints.push({
+                tone: 'warning',
+                title: gettext('No reconciled snapshot yet'),
+                description: gettext('Queue and failed-item totals are still waiting for the first reconciliation pass on this leader.'),
+            });
+        } else if (status.snapshot_age_seconds > 600) {
+            hints.push({
+                tone: 'warning',
+                title: gettext('Admin totals are stale'),
+                description: gettext('The reconciled snapshot is older than 10 minutes. If this persists, check reconcile activity and leadership health.'),
+            });
+        }
+
+        if ((status.failed_items_total || 0) > 0) {
+            hints.push({
+                tone: 'info',
+                title: gettext('Failed items pending review'),
+                description: gettext('Use the DLQ table below to inspect the last error, requeue, or delete stuck items explicitly.'),
+            });
+        }
+
+        if ((status.dirty_orgs_total || 0) > 0 && (status.queue_size || 0) === 0) {
+            hints.push({
+                tone: 'info',
+                title: gettext('Reconciliation backlog detected'),
+                description: gettext('Dirty organizations remain even though the live queue is empty. A reconcile run should refresh the admin snapshot.'),
+            });
+        }
+
+        return hints;
+    };
+
     renderStatusCard = (label, value, description, extraClassName) => {
         return (
             <div className={`gc-admin-stat-card ${extraClassName || ''}`}>
                 <div className="gc-admin-stat-label">{label}</div>
                 <div className="gc-admin-stat-value">{value}</div>
                 {description && <div className="gc-admin-stat-description">{description}</div>}
+            </div>
+        );
+    };
+
+    renderOperationalHints = (status) => {
+        const hints = this.getOperationalHints(status);
+        if (hints.length === 0) {
+            return null;
+        }
+
+        return (
+            <div className="gc-admin-hints-list mt-3">
+                {hints.map((hint, index) => (
+                    <div key={`${hint.tone}-${index}`} className={`gc-admin-hint gc-admin-hint-${hint.tone}`}>
+                        <div className="gc-admin-hint-title">{hint.title}</div>
+                        <div className="gc-admin-hint-description">{hint.description}</div>
+                    </div>
+                ))}
             </div>
         );
     };
@@ -528,6 +594,13 @@ class GC extends Component {
                                 {statusError && <p className="error text-center mt-4">{statusError}</p>}
                                 {(!loadingStatus && !statusError && status) &&
                                     <Fragment>
+                                        {status.last_scan_error &&
+                                            <div className="gc-admin-alert gc-admin-alert-danger mb-3">
+                                                <div className="gc-admin-alert-title">{gettext('Last scanner error')}</div>
+                                                <div className="gc-admin-alert-meta">{gettext('Last scan run')}: {this.formatTimestamp(status.last_scan_run)}</div>
+                                                <div className="gc-admin-alert-body gc-admin-break-word">{status.last_scan_error}</div>
+                                            </div>
+                                        }
                                         <div className="gc-admin-summary-grid">
                                             {this.renderStatusCard(gettext('Enabled'), status.enabled ? gettext('Yes') : gettext('No'), gettext('Service availability on this node'), status.enabled ? 'is-positive' : 'is-negative')}
                                             {this.renderStatusCard(gettext('Dry run'), status.dry_run ? gettext('Yes') : gettext('No'), gettext('Deletes are skipped when dry run is enabled'))}
@@ -541,8 +614,10 @@ class GC extends Component {
                                         <div className="gc-admin-status-grid mt-3">
                                             {this.renderStatusCard(gettext('Last worker run'), this.formatTimestamp(status.last_worker_run), null)}
                                             {this.renderStatusCard(gettext('Last scanner run'), this.formatTimestamp(status.last_scan_run), null)}
+                                            {this.renderStatusCard(gettext('Scanner error state'), status.last_scan_error ? gettext('Error recorded') : gettext('Clear'), status.last_scan_error || gettext('No aggregated scanner error is currently recorded.'), status.last_scan_error ? 'is-negative' : 'is-positive')}
                                             {this.renderStatusCard(gettext('Last reconcile run'), this.formatTimestamp(status.last_reconcile_run), null)}
                                         </div>
+                                        {this.renderOperationalHints(status)}
                                     </Fragment>
                                 }
                             </div>

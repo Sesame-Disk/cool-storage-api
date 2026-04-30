@@ -2,6 +2,7 @@ package gc
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"testing"
 	"time"
@@ -191,6 +192,79 @@ func TestWorker_ProcessCommit_CascadesFSObjects(t *testing.T) {
 	}
 }
 
+func TestWorker_ProcessCommit_SkipsAlreadyPendingRootFSObject(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	w := NewWorker(store, nil, q, 100, 0, false, stats)
+
+	orgID := uuid.New()
+	libID := uuid.New()
+	queuedAt := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
+
+	store.AddCommit(libID, "commit-abc", "fs-root")
+	if err := store.EnqueueItem(orgID, queuedAt, ItemFSObject, "fs-root", libID, "", 0); err != nil {
+		t.Fatalf("seed root fs_object failed: %v", err)
+	}
+
+	items, err := store.DequeueBatch(orgID, 1, time.Now())
+	if err != nil || len(items) != 1 {
+		t.Fatalf("DequeueBatch failed: %v / items=%d", err, len(items))
+	}
+	if err := q.IncrementRetry(items[0]); err != nil {
+		t.Fatalf("IncrementRetry failed: %v", err)
+	}
+
+	if err := w.processCommit(QueueItem{OrgID: orgID, QueuedAt: queuedAt, IdentityAt: queuedAt, ItemType: ItemCommit, ItemID: "commit-abc", LibraryID: libID}); err != nil {
+		t.Fatalf("processCommit failed: %v", err)
+	}
+
+	if store.GetCommitRecord(libID, "commit-abc") != nil {
+		t.Fatal("commit should be deleted even when root fs_object was already pending")
+	}
+
+	fsItems := 0
+	for _, item := range store.QueueItems(orgID) {
+		if item.ItemType == ItemFSObject && item.ItemID == "fs-root" {
+			fsItems++
+		}
+	}
+	if fsItems != 1 {
+		t.Fatalf("expected exactly 1 pending root fs_object after dedupe, got %d", fsItems)
+	}
+}
+
+func TestWorker_ProcessCommit_DoesNotCrossSuppressRootFSObjectAcrossLibraries(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	w := NewWorker(store, nil, q, 100, 0, false, stats)
+
+	orgID := uuid.New()
+	libPending := uuid.New()
+	libTarget := uuid.New()
+	queuedAt := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
+
+	store.AddCommit(libTarget, "commit-abc", "shared-root")
+	if err := store.EnqueueItem(orgID, queuedAt, ItemFSObject, "shared-root", libPending, "", 0); err != nil {
+		t.Fatalf("seed cross-library root fs_object failed: %v", err)
+	}
+
+	if err := w.processCommit(QueueItem{OrgID: orgID, QueuedAt: queuedAt, IdentityAt: queuedAt, ItemType: ItemCommit, ItemID: "commit-abc", LibraryID: libTarget}); err != nil {
+		t.Fatalf("processCommit failed: %v", err)
+	}
+
+	targetCount := 0
+	for _, item := range store.QueueItems(orgID) {
+		if item.ItemType == ItemFSObject && item.LibraryID == libTarget && item.ItemID == "shared-root" {
+			targetCount++
+		}
+	}
+	if targetCount != 1 {
+		t.Fatalf("expected target library root fs_object to enqueue once despite same id pending in another library, got %d", targetCount)
+	}
+}
+
 func TestWorker_ProcessCommit_AlreadyDeleted(t *testing.T) {
 	store := NewMockStore()
 	stats := &Stats{}
@@ -319,6 +393,151 @@ func TestWorker_ProcessFSObject_CascadesDirEntries(t *testing.T) {
 	}
 }
 
+func TestWorker_ProcessFSObject_SkipsAlreadyPendingChild(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	w := NewWorker(store, nil, q, 100, 0, false, stats)
+
+	orgID := uuid.New()
+	libID := uuid.New()
+	queuedAt := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
+
+	store.AddFSObjectWithEntries(libID, "fs-dir", "dir", nil, []string{"fs-child1", "fs-child2"})
+	store.AddLibrary(orgID, libID, "hot")
+	if err := store.EnqueueItem(orgID, queuedAt, ItemFSObject, "fs-child1", libID, "", 0); err != nil {
+		t.Fatalf("seed child fs_object failed: %v", err)
+	}
+
+	items, err := store.DequeueBatch(orgID, 1, time.Now())
+	if err != nil || len(items) != 1 {
+		t.Fatalf("DequeueBatch failed: %v / items=%d", err, len(items))
+	}
+	if err := q.IncrementRetry(items[0]); err != nil {
+		t.Fatalf("IncrementRetry failed: %v", err)
+	}
+
+	err = w.processFSObject(context.Background(), QueueItem{OrgID: orgID, QueuedAt: queuedAt, IdentityAt: queuedAt, ItemType: ItemFSObject, ItemID: "fs-dir", LibraryID: libID})
+	if err != nil {
+		t.Fatalf("processFSObject failed: %v", err)
+	}
+
+	child1Count := 0
+	child2Count := 0
+	for _, item := range store.QueueItems(orgID) {
+		if item.ItemType != ItemFSObject {
+			continue
+		}
+		switch item.ItemID {
+		case "fs-child1":
+			child1Count++
+		case "fs-child2":
+			child2Count++
+		}
+	}
+	if child1Count != 1 || child2Count != 1 {
+		t.Fatalf("expected one pending row per child after dedupe, got child1=%d child2=%d", child1Count, child2Count)
+	}
+}
+
+func TestWorker_ProcessFSObject_DoesNotCrossSuppressChildAcrossLibraries(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	w := NewWorker(store, nil, q, 100, 0, false, stats)
+
+	orgID := uuid.New()
+	libPending := uuid.New()
+	libTarget := uuid.New()
+	queuedAt := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
+
+	store.AddFSObjectWithEntries(libTarget, "fs-dir", "dir", nil, []string{"shared-child"})
+	store.AddLibrary(orgID, libTarget, "hot")
+	if err := store.EnqueueItem(orgID, queuedAt, ItemFSObject, "shared-child", libPending, "", 0); err != nil {
+		t.Fatalf("seed cross-library child fs_object failed: %v", err)
+	}
+
+	err := w.processFSObject(context.Background(), QueueItem{OrgID: orgID, QueuedAt: queuedAt, IdentityAt: queuedAt, ItemType: ItemFSObject, ItemID: "fs-dir", LibraryID: libTarget})
+	if err != nil {
+		t.Fatalf("processFSObject failed: %v", err)
+	}
+
+	targetCount := 0
+	for _, item := range store.QueueItems(orgID) {
+		if item.ItemType == ItemFSObject && item.LibraryID == libTarget && item.ItemID == "shared-child" {
+			targetCount++
+		}
+	}
+	if targetCount != 1 {
+		t.Fatalf("expected target library child fs_object to enqueue once despite same id pending in another library, got %d", targetCount)
+	}
+}
+
+func TestWorker_ProcessFSObject_RetryKeepsSingleBlockDecrement(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	w := NewWorker(store, nil, q, 100, 0, false, stats)
+
+	orgID := uuid.New()
+	libID := uuid.New()
+	identityAt := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
+
+	store.AddBlock(orgID, "blk-a", "hot", 2)
+	store.AddFSObject(libID, "fs-obj-1", "file", []string{"blk-a"})
+	store.AddLibrary(orgID, libID, "hot")
+
+	first := QueueItem{OrgID: orgID, QueuedAt: identityAt, IdentityAt: identityAt, ItemType: ItemFSObject, ItemID: "fs-obj-1", LibraryID: libID}
+	if err := w.processFSObject(context.Background(), first); err != nil {
+		t.Fatalf("first processFSObject failed: %v", err)
+	}
+	if got := store.GetBlock(orgID, "blk-a").RefCount; got != 1 {
+		t.Fatalf("block ref_count after first pass = %d, want 1", got)
+	}
+
+	store.AddFSObject(libID, "fs-obj-1", "file", []string{"blk-a"})
+	second := QueueItem{OrgID: orgID, QueuedAt: time.Now().UTC(), IdentityAt: identityAt, ItemType: ItemFSObject, ItemID: "fs-obj-1", LibraryID: libID}
+	if err := w.processFSObject(context.Background(), second); err != nil {
+		t.Fatalf("second processFSObject failed: %v", err)
+	}
+	if got := store.GetBlock(orgID, "blk-a").RefCount; got != 1 {
+		t.Fatalf("block ref_count after retry = %d, want 1", got)
+	}
+}
+
+func TestWorker_ProcessFSObject_IdempotencyScopedByLibrary(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	w := NewWorker(store, nil, q, 100, 0, false, stats)
+
+	orgID := uuid.New()
+	libA := uuid.New()
+	libB := uuid.New()
+	identityAt := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
+
+	store.AddBlock(orgID, "blk-a", "hot", 1)
+	store.AddBlock(orgID, "blk-b", "hot", 1)
+	store.AddFSObject(libA, "shared-fs", "file", []string{"blk-a"})
+	store.AddFSObject(libB, "shared-fs", "file", []string{"blk-b"})
+	store.AddLibrary(orgID, libA, "hot")
+	store.AddLibrary(orgID, libB, "hot")
+
+	if err := w.processFSObject(context.Background(), QueueItem{OrgID: orgID, QueuedAt: identityAt, IdentityAt: identityAt, ItemType: ItemFSObject, ItemID: "shared-fs", LibraryID: libA}); err != nil {
+		t.Fatalf("processFSObject libA failed: %v", err)
+	}
+	if err := w.processFSObject(context.Background(), QueueItem{OrgID: orgID, QueuedAt: identityAt, IdentityAt: identityAt, ItemType: ItemFSObject, ItemID: "shared-fs", LibraryID: libB}); err != nil {
+		t.Fatalf("processFSObject libB failed: %v", err)
+	}
+
+	if got := store.GetBlock(orgID, "blk-a").RefCount; got != 0 {
+		t.Fatalf("block ref_count for libA = %d, want 0", got)
+	}
+	if got := store.GetBlock(orgID, "blk-b").RefCount; got != 0 {
+		t.Fatalf("block ref_count for libB = %d, want 0", got)
+	}
+}
+
 func TestWorker_RetryOnFailure(t *testing.T) {
 	store := NewMockStore()
 	stats := &Stats{}
@@ -408,6 +627,51 @@ func TestWorker_EnqueueLibraryContents_NoDuplicateBlocks(t *testing.T) {
 	}
 	if blockCount != 0 {
 		t.Errorf("expected 0 blocks enqueued (cascade from fs_objects), got %d", blockCount)
+	}
+}
+
+func TestWorker_EnqueueLibraryContents_DoesNotCrossSuppressAcrossLibraries(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	w := NewWorker(store, nil, q, 100, 0, false, stats)
+
+	orgID := uuid.New()
+	libPending := uuid.New()
+	libTarget := uuid.New()
+	identityAt := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
+
+	store.AddCommit(libPending, "shared-commit", "fs-pending")
+	store.AddFSObject(libPending, "shared-fs", "file", []string{"blk-pending"})
+	store.AddCommit(libTarget, "shared-commit", "fs-target")
+	store.AddFSObject(libTarget, "shared-fs", "file", []string{"blk-target"})
+	if err := store.EnqueueItem(orgID, identityAt, ItemCommit, "shared-commit", libPending, "", 0); err != nil {
+		t.Fatalf("seed pending commit failed: %v", err)
+	}
+	if err := store.EnqueueItem(orgID, identityAt, ItemFSObject, "shared-fs", libPending, "", 0); err != nil {
+		t.Fatalf("seed pending fs_object failed: %v", err)
+	}
+
+	err := w.enqueueLibraryContentsAt(orgID, libTarget, "hot", identityAt)
+	if err != nil {
+		t.Fatalf("enqueueLibraryContentsAt failed: %v", err)
+	}
+
+	targetCommits := 0
+	targetFSObjects := 0
+	for _, item := range store.QueueItems(orgID) {
+		if item.LibraryID != libTarget {
+			continue
+		}
+		switch item.ItemType {
+		case ItemCommit:
+			targetCommits++
+		case ItemFSObject:
+			targetFSObjects++
+		}
+	}
+	if targetCommits != 1 || targetFSObjects != 1 {
+		t.Fatalf("expected target library work to enqueue despite same ids pending elsewhere, got commits=%d fs_objects=%d", targetCommits, targetFSObjects)
 	}
 }
 
@@ -754,6 +1018,91 @@ func TestWorker_ProcessLibraryCascade_FullCascade(t *testing.T) {
 	}
 	if !actions["gc_library_cascade_deleted"] {
 		t.Error("expected gc_library_cascade_deleted audit entry")
+	}
+}
+
+func TestWorker_ProcessLibraryCascade_RetryableAuxCleanupDoesNotDuplicateChildren(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	w := NewWorker(store, nil, q, 100, 0, false, stats)
+
+	orgID := uuid.New()
+	libID := uuid.New()
+	deletedAt := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
+
+	store.AddOrganization(orgID)
+	store.AddDeletedLibrary(orgID, libID, "hot", deletedAt)
+	store.AddCommit(libID, "commit-1", "fs-root-1")
+	store.AddCommit(libID, "commit-2", "fs-root-2")
+	store.AddFSObject(libID, "fs-root-1", "dir", nil)
+	store.AddFSObject(libID, "fs-root-2", "dir", nil)
+	store.deleteRestoreJobsByLibraryErr = errors.New("restore jobs unavailable")
+
+	item := QueueItem{
+		OrgID:        orgID,
+		QueuedAt:     deletedAt,
+		ItemType:     ItemLibraryCascade,
+		ItemID:       libID.String(),
+		StorageClass: "hot",
+	}
+
+	err := w.processLibraryCascade(context.Background(), item)
+	if err == nil {
+		t.Fatal("expected restore job cleanup failure")
+	}
+
+	items := store.QueueItems(orgID)
+	commitCount := 0
+	fsCount := 0
+	for _, queued := range items {
+		switch queued.ItemType {
+		case ItemCommit:
+			commitCount++
+			if !queued.QueuedAt.Equal(deletedAt) {
+				t.Fatalf("commit queued_at = %v, want %v", queued.QueuedAt, deletedAt)
+			}
+		case ItemFSObject:
+			fsCount++
+			if !queued.QueuedAt.Equal(deletedAt) {
+				t.Fatalf("fs_object queued_at = %v, want %v", queued.QueuedAt, deletedAt)
+			}
+		}
+	}
+	if commitCount != 2 {
+		t.Fatalf("expected 2 commits after failed cleanup, got %d", commitCount)
+	}
+	if fsCount != 2 {
+		t.Fatalf("expected 2 fs_objects after failed cleanup, got %d", fsCount)
+	}
+	if _, err := store.GetLibraryStorageClass(orgID, libID); err != nil {
+		t.Fatalf("library should not be hard-deleted on cleanup failure: %v", err)
+	}
+
+	store.deleteRestoreJobsByLibraryErr = nil
+	if err := w.processLibraryCascade(context.Background(), item); err != nil {
+		t.Fatalf("retry processLibraryCascade failed: %v", err)
+	}
+
+	items = store.QueueItems(orgID)
+	commitCount = 0
+	fsCount = 0
+	for _, queued := range items {
+		switch queued.ItemType {
+		case ItemCommit:
+			commitCount++
+		case ItemFSObject:
+			fsCount++
+		}
+	}
+	if commitCount != 2 {
+		t.Fatalf("expected 2 commits after retry, got %d", commitCount)
+	}
+	if fsCount != 2 {
+		t.Fatalf("expected 2 fs_objects after retry, got %d", fsCount)
+	}
+	if _, err := store.GetLibraryStorageClass(orgID, libID); err == nil {
+		t.Fatal("library should be hard-deleted after successful retry")
 	}
 }
 

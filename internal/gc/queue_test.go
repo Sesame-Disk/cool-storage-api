@@ -182,6 +182,38 @@ func TestQueue_IncrementRetry(t *testing.T) {
 	}
 }
 
+func TestQueue_IncrementRetry_PreservesIdentityAtForCascadeItems(t *testing.T) {
+	store := NewMockStore()
+	q := NewQueue(store)
+
+	orgID := uuid.New()
+	originalQueuedAt := time.Now().Add(-1 * time.Hour).UTC().Truncate(time.Millisecond)
+	store.EnqueueItem(orgID, originalQueuedAt, ItemLibraryCascade, uuid.New().String(), uuid.Nil, "hot", 2)
+
+	items, err := store.DequeueBatch(orgID, 1, time.Now())
+	if err != nil || len(items) != 1 {
+		t.Fatalf("DequeueBatch failed: %v / items=%d", err, len(items))
+	}
+
+	if err := q.IncrementRetry(items[0]); err != nil {
+		t.Fatalf("IncrementRetry failed: %v", err)
+	}
+
+	requeued := store.QueueItems(orgID)
+	if len(requeued) != 1 {
+		t.Fatalf("expected 1 item after requeue, got %d", len(requeued))
+	}
+	if requeued[0].RetryCount != 3 {
+		t.Errorf("RetryCount = %d, want 3", requeued[0].RetryCount)
+	}
+	if requeued[0].QueuedAt.Equal(originalQueuedAt) {
+		t.Fatalf("cascade retry QueuedAt = %v, want a newer back-of-queue timestamp", requeued[0].QueuedAt)
+	}
+	if !requeued[0].IdentityAt.Equal(originalQueuedAt) {
+		t.Errorf("cascade retry IdentityAt = %v, want %v", requeued[0].IdentityAt, originalQueuedAt)
+	}
+}
+
 func TestQueue_ListOrgsWithQueuedItems(t *testing.T) {
 	store := NewMockStore()
 	q := NewQueue(store)

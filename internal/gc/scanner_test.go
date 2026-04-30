@@ -187,6 +187,36 @@ func TestScanner_ScanOrphanedBlocks_SkipsAlreadyQueuedCandidate(t *testing.T) {
 	}
 }
 
+func TestScanner_ScanOrphanedBlocks_SkipsRetriedQueuedCandidate(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	s := NewScanner(store, q, stats, config.GCConfig{})
+
+	orgID := uuid.New()
+	candidateAt := time.Now().Add(-1 * time.Minute).UTC().Truncate(time.Millisecond)
+	store.AddBlockGCCandidate(orgID, "block-orphan", "hot", candidateAt)
+	if err := store.EnqueueItem(orgID, candidateAt, ItemBlock, "block-orphan", uuid.Nil, "hot", 0); err != nil {
+		t.Fatalf("failed to seed queue item: %v", err)
+	}
+
+	items, err := store.DequeueBatch(orgID, 1, time.Now())
+	if err != nil || len(items) != 1 {
+		t.Fatalf("DequeueBatch failed: %v / items=%d", err, len(items))
+	}
+	if err := q.IncrementRetry(items[0]); err != nil {
+		t.Fatalf("IncrementRetry failed: %v", err)
+	}
+
+	if err := s.ScanOnce(context.Background()); err != nil {
+		t.Fatalf("ScanOnce failed: %v", err)
+	}
+
+	if got := len(store.QueueItems(orgID)); got != 1 {
+		t.Fatalf("expected scanner to avoid duplicate retried block candidate, got %d items", got)
+	}
+}
+
 func TestScanner_ScanOrphanedBlocks_BackfillsMissingCandidateFromBlocksTable(t *testing.T) {
 	store := NewMockStore()
 	stats := &Stats{}
@@ -463,6 +493,75 @@ func TestScanner_ScanOrphanedCommits_WithOrgLookup(t *testing.T) {
 	}
 }
 
+func TestScanner_ScanOrphanedCommits_SkipsRetriedQueuedCommit(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	s := NewScanner(store, q, stats, config.GCConfig{})
+
+	orgID := uuid.New()
+	libID := uuid.New()
+	deletedAt := time.Now().Add(-24 * time.Hour).UTC().Truncate(time.Millisecond)
+	store.AddOrganization(orgID)
+	store.AddDeletedLibrary(orgID, libID, "hot", deletedAt)
+	store.AddCommit(libID, "commit-orphan-1", "fs-root")
+	if err := store.EnqueueItem(orgID, deletedAt, ItemCommit, "commit-orphan-1", libID, "", 0); err != nil {
+		t.Fatalf("failed to seed queue item: %v", err)
+	}
+
+	items, err := store.DequeueBatch(orgID, 1, time.Now())
+	if err != nil || len(items) != 1 {
+		t.Fatalf("DequeueBatch failed: %v / items=%d", err, len(items))
+	}
+	if err := q.IncrementRetry(items[0]); err != nil {
+		t.Fatalf("IncrementRetry failed: %v", err)
+	}
+
+	if n, err := s.scanOrphanedCommits(context.Background()); err != nil || n != 0 {
+		t.Fatalf("scanOrphanedCommits after retry = (%d, %v), want (0, nil)", n, err)
+	}
+	if got := len(store.QueueItems(orgID)); got != 1 {
+		t.Fatalf("expected 1 queued orphaned commit after dedupe, got %d", got)
+	}
+}
+
+func TestScanner_ScanOrphanedCommits_DoesNotCrossSuppressAcrossLibraries(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	s := NewScanner(store, q, stats, config.GCConfig{})
+
+	orgID := uuid.New()
+	libPending := uuid.New()
+	libOrphan := uuid.New()
+	deletedAt := time.Now().Add(-24 * time.Hour).UTC().Truncate(time.Millisecond)
+	store.AddOrganization(orgID)
+	store.AddLibrary(orgID, libPending, "hot")
+	store.AddDeletedLibrary(orgID, libOrphan, "hot", deletedAt)
+	store.mu.Lock()
+	delete(store.libraries, libOrphan)
+	store.mu.Unlock()
+	store.AddCommit(libPending, "shared-commit", "fs-pending")
+	store.AddCommit(libOrphan, "shared-commit", "fs-orphan")
+	if err := store.EnqueueItem(orgID, deletedAt, ItemCommit, "shared-commit", libPending, "", 0); err != nil {
+		t.Fatalf("failed to seed pending commit: %v", err)
+	}
+
+	if n, err := s.scanOrphanedCommits(context.Background()); err != nil || n != 1 {
+		t.Fatalf("scanOrphanedCommits = (%d, %v), want (1, nil)", n, err)
+	}
+
+	orphanCount := 0
+	for _, item := range store.QueueItems(orgID) {
+		if item.ItemType == ItemCommit && item.LibraryID == libOrphan && item.ItemID == "shared-commit" {
+			orphanCount++
+		}
+	}
+	if orphanCount != 1 {
+		t.Fatalf("expected orphaned library commit to enqueue once despite same commit id in another library, got %d", orphanCount)
+	}
+}
+
 func TestScanner_ScanOrphanedFSObjects(t *testing.T) {
 	store := NewMockStore()
 	stats := &Stats{}
@@ -493,6 +592,75 @@ func TestScanner_ScanOrphanedFSObjects(t *testing.T) {
 	}
 	if fsItems != 0 {
 		t.Errorf("expected 0 orphaned fs_objects (both libraries exist), got %d", fsItems)
+	}
+}
+
+func TestScanner_ScanOrphanedFSObjects_SkipsRetriedQueuedFSObject(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	s := NewScanner(store, q, stats, config.GCConfig{})
+
+	orgID := uuid.New()
+	libID := uuid.New()
+	deletedAt := time.Now().Add(-24 * time.Hour).UTC().Truncate(time.Millisecond)
+	store.AddOrganization(orgID)
+	store.AddDeletedLibrary(orgID, libID, "hot", deletedAt)
+	store.AddFSObject(libID, "fs-orphan-1", "file", []string{"blk-1"})
+	if err := store.EnqueueItem(orgID, deletedAt, ItemFSObject, "fs-orphan-1", libID, "", 0); err != nil {
+		t.Fatalf("failed to seed queue item: %v", err)
+	}
+
+	items, err := store.DequeueBatch(orgID, 1, time.Now())
+	if err != nil || len(items) != 1 {
+		t.Fatalf("DequeueBatch failed: %v / items=%d", err, len(items))
+	}
+	if err := q.IncrementRetry(items[0]); err != nil {
+		t.Fatalf("IncrementRetry failed: %v", err)
+	}
+
+	if n, err := s.scanOrphanedFSObjects(context.Background()); err != nil || n != 0 {
+		t.Fatalf("scanOrphanedFSObjects after retry = (%d, %v), want (0, nil)", n, err)
+	}
+	if got := len(store.QueueItems(orgID)); got != 1 {
+		t.Fatalf("expected 1 queued orphaned fs_object after dedupe, got %d", got)
+	}
+}
+
+func TestScanner_ScanOrphanedFSObjects_DoesNotCrossSuppressAcrossLibraries(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	s := NewScanner(store, q, stats, config.GCConfig{})
+
+	orgID := uuid.New()
+	libPending := uuid.New()
+	libOrphan := uuid.New()
+	deletedAt := time.Now().Add(-24 * time.Hour).UTC().Truncate(time.Millisecond)
+	store.AddOrganization(orgID)
+	store.AddLibrary(orgID, libPending, "hot")
+	store.AddDeletedLibrary(orgID, libOrphan, "hot", deletedAt)
+	store.mu.Lock()
+	delete(store.libraries, libOrphan)
+	store.mu.Unlock()
+	store.AddFSObject(libPending, "shared-fs", "file", []string{"blk-pending"})
+	store.AddFSObject(libOrphan, "shared-fs", "file", []string{"blk-orphan"})
+	if err := store.EnqueueItem(orgID, deletedAt, ItemFSObject, "shared-fs", libPending, "", 0); err != nil {
+		t.Fatalf("failed to seed pending fs_object: %v", err)
+	}
+
+	if n, err := s.scanOrphanedFSObjects(context.Background()); err != nil || n != 1 {
+		t.Fatalf("scanOrphanedFSObjects = (%d, %v), want (1, nil)", n, err)
+	}
+
+	orphanCount := 0
+	for _, item := range store.QueueItems(orgID) {
+		if item.ItemType == ItemFSObject && item.LibraryID == libOrphan && item.ItemID == "shared-fs" {
+			orphanCount++
+		}
+	}
+	if orphanCount != 1 {
+		t.Fatalf("expected orphaned library fs_object to enqueue once despite same fs id in another library, got %d", orphanCount)
 	}
 }
 
@@ -672,6 +840,77 @@ func TestScanner_ScanExpiredVersions_PreservesHEADChain(t *testing.T) {
 	}
 }
 
+func TestScanner_ScanExpiredVersions_SkipsRetriedQueuedCommit(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	s := NewScanner(store, q, stats, config.GCConfig{})
+
+	orgID := uuid.New()
+	libID := uuid.New()
+	store.AddOrganization(orgID)
+	store.AddLibraryWithTTL(orgID, libID, "hot", "head", 1)
+
+	old := time.Now().Add(-72 * time.Hour)
+	store.AddCommitWithDetails(libID, "head", "fs-head", "", old)
+	store.AddCommitWithDetails(libID, "old-commit", "fs-old", "", old)
+	if err := store.EnqueueItem(orgID, old.UTC().Truncate(time.Millisecond), ItemCommit, "old-commit", libID, "", 0); err != nil {
+		t.Fatalf("failed to seed queue item: %v", err)
+	}
+
+	items, err := store.DequeueBatch(orgID, 1, time.Now())
+	if err != nil || len(items) != 1 {
+		t.Fatalf("DequeueBatch failed: %v / items=%d", err, len(items))
+	}
+	if err := q.IncrementRetry(items[0]); err != nil {
+		t.Fatalf("IncrementRetry failed: %v", err)
+	}
+
+	if n, err := s.scanExpiredVersions(context.Background()); err != nil || n != 0 {
+		t.Fatalf("scanExpiredVersions after retry = (%d, %v), want (0, nil)", n, err)
+	}
+	if got := len(store.QueueItems(orgID)); got != 1 {
+		t.Fatalf("expected 1 queued expired commit after dedupe, got %d", got)
+	}
+}
+
+func TestScanner_ScanExpiredVersions_DoesNotCrossSuppressAcrossLibraries(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	s := NewScanner(store, q, stats, config.GCConfig{})
+
+	orgID := uuid.New()
+	libPending := uuid.New()
+	libExpired := uuid.New()
+	store.AddOrganization(orgID)
+	store.AddLibraryWithTTL(orgID, libPending, "hot", "head-pending", 1)
+	store.AddLibraryWithTTL(orgID, libExpired, "hot", "head-expired", 1)
+
+	old := time.Now().Add(-72 * time.Hour)
+	store.AddCommitWithDetails(libPending, "head-pending", "fs-head-pending", "", old)
+	store.AddCommitWithDetails(libPending, "shared-commit", "fs-pending", "", old)
+	store.AddCommitWithDetails(libExpired, "head-expired", "fs-head-expired", "", old)
+	store.AddCommitWithDetails(libExpired, "shared-commit", "fs-expired", "", old)
+	if err := store.EnqueueItem(orgID, old.UTC().Truncate(time.Millisecond), ItemCommit, "shared-commit", libPending, "", 0); err != nil {
+		t.Fatalf("failed to seed pending commit: %v", err)
+	}
+
+	if n, err := s.scanExpiredVersions(context.Background()); err != nil || n != 1 {
+		t.Fatalf("scanExpiredVersions = (%d, %v), want (1, nil)", n, err)
+	}
+
+	expiredCount := 0
+	for _, item := range store.QueueItems(orgID) {
+		if item.ItemType == ItemCommit && item.LibraryID == libExpired && item.ItemID == "shared-commit" {
+			expiredCount++
+		}
+	}
+	if expiredCount != 1 {
+		t.Fatalf("expected expired commit in second library to enqueue despite same id pending elsewhere, got %d", expiredCount)
+	}
+}
+
 func TestScanner_ScanExpiredVersions_SkipsNegativeTTL(t *testing.T) {
 	store := NewMockStore()
 	stats := &Stats{}
@@ -774,6 +1013,79 @@ func TestScanner_ScanAutoDeleteExpiredObjects_Basic(t *testing.T) {
 	}
 	if fsItems != 1 {
 		t.Errorf("expected 1 orphaned fs_object enqueued, got %d", fsItems)
+	}
+}
+
+func TestScanner_ScanAutoDeleteExpiredObjects_SkipsRetriedQueuedFSObject(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	s := NewScanner(store, q, stats, config.GCConfig{})
+
+	orgID := uuid.New()
+	libID := uuid.New()
+	store.AddOrganization(orgID)
+	store.AddLibraryWithAutoDelete(orgID, libID, "hot", "commit-head", 1)
+
+	now := time.Now()
+	store.AddCommitWithDetails(libID, "commit-head", "fs-root", "", now)
+	store.AddFSObjectWithEntries(libID, "fs-root", "dir", nil, []string{"fs-keep"})
+	store.AddFSObject(libID, "fs-keep", "file", []string{"blk-keep"})
+	store.AddFSObject(libID, "fs-orphan", "file", []string{"blk-orphan"})
+	if err := store.EnqueueItem(orgID, now.Add(-2*time.Hour).UTC().Truncate(time.Millisecond), ItemFSObject, "fs-orphan", libID, "", 0); err != nil {
+		t.Fatalf("failed to seed queue item: %v", err)
+	}
+
+	items, err := store.DequeueBatch(orgID, 1, time.Now())
+	if err != nil || len(items) != 1 {
+		t.Fatalf("DequeueBatch failed: %v / items=%d", err, len(items))
+	}
+	if err := q.IncrementRetry(items[0]); err != nil {
+		t.Fatalf("IncrementRetry failed: %v", err)
+	}
+
+	if n, err := s.scanAutoDeleteExpiredObjects(context.Background()); err != nil || n != 0 {
+		t.Fatalf("scanAutoDeleteExpiredObjects after retry = (%d, %v), want (0, nil)", n, err)
+	}
+	if got := len(store.QueueItems(orgID)); got != 1 {
+		t.Fatalf("expected 1 queued auto-delete fs_object after dedupe, got %d", got)
+	}
+}
+
+func TestScanner_ScanAutoDeleteExpiredObjects_DoesNotCrossSuppressAcrossLibraries(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	s := NewScanner(store, q, stats, config.GCConfig{})
+
+	orgID := uuid.New()
+	libPending := uuid.New()
+	libExpired := uuid.New()
+	store.AddOrganization(orgID)
+	store.AddLibraryWithAutoDelete(orgID, libPending, "hot", "head-pending", 1)
+	store.AddLibraryWithAutoDelete(orgID, libExpired, "hot", "head-expired", 1)
+
+	now := time.Now()
+	store.AddCommitWithDetails(libPending, "head-pending", "fs-root-pending", "", now)
+	store.AddFSObject(libPending, "shared-fs", "file", []string{"blk-pending"})
+	store.AddCommitWithDetails(libExpired, "head-expired", "fs-root-expired", "", now)
+	store.AddFSObject(libExpired, "shared-fs", "file", []string{"blk-expired"})
+	if err := store.EnqueueItem(orgID, now.Add(-2*time.Hour).UTC().Truncate(time.Millisecond), ItemFSObject, "shared-fs", libPending, "", 0); err != nil {
+		t.Fatalf("failed to seed pending fs_object: %v", err)
+	}
+
+	if n, err := s.scanAutoDeleteExpiredObjects(context.Background()); err != nil || n != 1 {
+		t.Fatalf("scanAutoDeleteExpiredObjects = (%d, %v), want (1, nil)", n, err)
+	}
+
+	expiredCount := 0
+	for _, item := range store.QueueItems(orgID) {
+		if item.ItemType == ItemFSObject && item.LibraryID == libExpired && item.ItemID == "shared-fs" {
+			expiredCount++
+		}
+	}
+	if expiredCount != 1 {
+		t.Fatalf("expected auto-delete fs_object in second library to enqueue despite same id pending elsewhere, got %d", expiredCount)
 	}
 }
 
@@ -1375,6 +1687,110 @@ func TestScanner_ScanExpiredDeletedLibraries_DeduplicatesAcrossRuns(t *testing.T
 	}
 	if n, err := s.scanExpiredDeletedLibraries(context.Background()); err != nil || n != 0 {
 		t.Fatalf("second scanExpiredDeletedLibraries = (%d, %v), want (0, nil)", n, err)
+	}
+}
+
+func TestScanner_ScanExpiredDeletedLibraries_SkipsOpenFailedCascade(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	s := NewScanner(store, q, stats, config.GCConfig{TrashRetentionDays: 30})
+
+	orgID := uuid.New()
+	libID := uuid.New()
+	deletedAt := time.Now().AddDate(0, 0, -45).UTC().Truncate(time.Millisecond)
+	failedAt := time.Now().Add(-time.Hour).UTC().Truncate(time.Millisecond)
+	store.AddOrganization(orgID)
+	store.AddDeletedLibrary(orgID, libID, "hot", deletedAt)
+	store.failedItems[orgID] = []GCFailedItemInfo{{
+		OrgID:        orgID,
+		FailedAt:     failedAt,
+		QueuedAt:     deletedAt.Add(2 * time.Minute),
+		IdentityAt:   deletedAt,
+		ItemType:     ItemLibraryCascade,
+		ItemID:       libID.String(),
+		StorageClass: "hot",
+		RetryCount:   5,
+		LastError:    "scanner should not recreate this while DLQ entry is open",
+	}}
+
+	if n, err := s.scanExpiredDeletedLibraries(context.Background()); err != nil || n != 0 {
+		t.Fatalf("scanExpiredDeletedLibraries with open failed cascade = (%d, %v), want (0, nil)", n, err)
+	}
+	if got := len(store.QueueItems(orgID)); got != 0 {
+		t.Fatalf("expected no live queue rows while failed cascade remains open, got %d", got)
+	}
+}
+
+func TestScanner_ScanExpiredDeletedLibraries_ExpiredFailedMarkerDoesNotSuppressFreshCascade(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	s := NewScanner(store, q, stats, config.GCConfig{TrashRetentionDays: 30})
+
+	orgID := uuid.New()
+	libID := uuid.New()
+	deletedAt := time.Now().AddDate(0, 0, -45).UTC().Truncate(time.Millisecond)
+	failedAt := time.Now().Add(-gcFailedItemRetention - time.Hour).UTC().Truncate(time.Millisecond)
+	store.AddOrganization(orgID)
+	store.AddDeletedLibrary(orgID, libID, "hot", deletedAt)
+
+	failedItem := QueueItem{
+		OrgID:        orgID,
+		QueuedAt:     deletedAt,
+		IdentityAt:   deletedAt,
+		ItemType:     ItemLibraryCascade,
+		ItemID:       libID.String(),
+		LibraryID:    uuid.Nil,
+		StorageClass: "hot",
+	}
+	if err := store.EnqueueBatch([]QueueItem{failedItem}); err != nil {
+		t.Fatalf("failed to seed queue item: %v", err)
+	}
+	if err := store.FailItem(failedItem, failedAt, "old failure"); err != nil {
+		t.Fatalf("FailItem failed: %v", err)
+	}
+
+	store.mu.Lock()
+	store.failedItems[orgID] = nil
+	store.mu.Unlock()
+
+	if n, err := s.scanExpiredDeletedLibraries(context.Background()); err != nil || n != 1 {
+		t.Fatalf("scanExpiredDeletedLibraries after failed-row expiry = (%d, %v), want (1, nil)", n, err)
+	}
+	if got := len(store.QueueItems(orgID)); got != 1 {
+		t.Fatalf("expected fresh library cascade after stale failed marker expiry, got %d queued items", got)
+	}
+}
+
+func TestScanner_ScanExpiredDeletedLibraries_SkipsRetriedQueuedCascade(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	s := NewScanner(store, q, stats, config.GCConfig{TrashRetentionDays: 30})
+
+	orgID := uuid.New()
+	libID := uuid.New()
+	deletedAt := time.Now().AddDate(0, 0, -45).UTC().Truncate(time.Millisecond)
+	store.AddOrganization(orgID)
+	store.AddDeletedLibrary(orgID, libID, "hot", deletedAt)
+	if err := store.EnqueueItem(orgID, deletedAt, ItemLibraryCascade, libID.String(), uuid.Nil, "hot", 0); err != nil {
+		t.Fatalf("failed to seed queue item: %v", err)
+	}
+
+	items, err := store.DequeueBatch(orgID, 1, time.Now())
+	if err != nil || len(items) != 1 {
+		t.Fatalf("DequeueBatch failed: %v / items=%d", err, len(items))
+	}
+	if err := q.IncrementRetry(items[0]); err != nil {
+		t.Fatalf("IncrementRetry failed: %v", err)
+	}
+
+	if n, err := s.scanExpiredDeletedLibraries(context.Background()); err != nil || n != 0 {
+		t.Fatalf("scanExpiredDeletedLibraries after retry = (%d, %v), want (0, nil)", n, err)
+	}
+	if got := len(store.QueueItems(orgID)); got != 1 {
+		t.Fatalf("expected 1 queued library cascade after scanner dedupe, got %d", got)
 	}
 }
 

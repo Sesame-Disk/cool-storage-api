@@ -2,6 +2,7 @@ package gc
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"time"
@@ -353,6 +354,8 @@ func (w *Worker) RecoverS3Orphans(ctx context.Context, perOrgLimit int) (int, er
 }
 
 func (w *Worker) processCommit(item QueueItem) error {
+	identityAt := effectiveIdentityAt(item.QueuedAt, item.IdentityAt)
+
 	// Get the commit to find its root_fs_id for cascading deletion
 	commit, err := w.store.GetCommit(item.LibraryID, item.ItemID)
 	if err != nil {
@@ -372,8 +375,22 @@ func (w *Worker) processCommit(item QueueItem) error {
 	// the root fs_object becomes an orphan with no GC entry. The next scanner
 	// sweep will re-discover and re-enqueue this commit.
 	if commit.RootFSID != "" {
-		if err := w.queue.EnqueueCascade(item.OrgID, item.QueuedAt, ItemFSObject, commit.RootFSID, item.LibraryID, ""); err != nil {
-			return fmt.Errorf("failed to enqueue root fs_object %s for commit %s: %w", commit.RootFSID, item.ItemID, err)
+		exists, err := w.store.PendingItemExists(item.OrgID, item.LibraryID, time.Time{}, ItemFSObject, commit.RootFSID)
+		if err != nil {
+			return fmt.Errorf("failed to inspect root fs_object %s for commit %s: %w", commit.RootFSID, item.ItemID, err)
+		}
+		if !exists {
+			child := QueueItem{
+				OrgID:      item.OrgID,
+				QueuedAt:   item.QueuedAt,
+				IdentityAt: identityAt,
+				ItemType:   ItemFSObject,
+				ItemID:     commit.RootFSID,
+				LibraryID:  item.LibraryID,
+			}
+			if err := w.queue.EnqueueBatch([]QueueItem{child}); err != nil {
+				return fmt.Errorf("failed to enqueue root fs_object %s for commit %s: %w", commit.RootFSID, item.ItemID, err)
+			}
 		}
 	}
 
@@ -386,6 +403,8 @@ func (w *Worker) processCommit(item QueueItem) error {
 }
 
 func (w *Worker) processFSObject(ctx context.Context, item QueueItem) error {
+	identityAt := effectiveIdentityAt(item.QueuedAt, item.IdentityAt)
+
 	// Get the fs_object to find its block_ids
 	fsObj, err := w.store.GetFSObject(item.LibraryID, item.ItemID)
 	if err != nil {
@@ -399,9 +418,17 @@ func (w *Worker) processFSObject(ctx context.Context, item QueueItem) error {
 	if len(fsObj.DirEntries) > 0 {
 		var batch []QueueItem
 		for _, childID := range fsObj.DirEntries {
+			exists, err := w.store.PendingItemExists(item.OrgID, item.LibraryID, time.Time{}, ItemFSObject, childID)
+			if err != nil {
+				return fmt.Errorf("failed to inspect child fs_object %s for parent %s: %w", childID, item.ItemID, err)
+			}
+			if exists {
+				continue
+			}
 			batch = append(batch, QueueItem{
 				OrgID:        item.OrgID,
 				QueuedAt:     item.QueuedAt,
+				IdentityAt:   identityAt,
 				ItemType:     ItemFSObject,
 				ItemID:       childID,
 				LibraryID:    item.LibraryID,
@@ -418,9 +445,9 @@ func (w *Worker) processFSObject(ctx context.Context, item QueueItem) error {
 	// If it's a file with blocks, decrement ref counts
 	if len(fsObj.BlockIDs) > 0 {
 		// Create a deterministic task ID for this specific decrement operation
-		// based on the fs_object and the specific queue item timestamp to ensure
-		// retries of this exact queue item don't double-decrement.
-		taskIDStr := fmt.Sprintf("%s-%d", item.ItemID, item.QueuedAt.UnixNano())
+		// based on the fs_object and its stable semantic identity so retries or
+		// duplicate queue rows for the same item do not double-decrement blocks.
+		taskIDStr := fmt.Sprintf("%s-%s-%d", item.LibraryID, item.ItemID, identityAt.UnixNano())
 		taskID := uuid.NewMD5(uuid.NameSpaceOID, []byte(taskIDStr))
 
 		applied, err := w.store.MarkItemProcessed(taskID)
@@ -543,8 +570,9 @@ func (w *Worker) processUserCascade(ctx context.Context, item QueueItem) error {
 	if err != nil {
 		return fmt.Errorf("failed to read deleted user marker for %s: %w", item.ItemID, err)
 	}
-	if deletedAt == nil || !deletedAt.Equal(item.QueuedAt) {
-		log.Printf("[GC Worker] Skipping stale user cascade for %s (current deleted_at=%v queued_at=%v)", item.ItemID, deletedAt, item.QueuedAt)
+	identityAt := effectiveIdentityAt(item.QueuedAt, item.IdentityAt)
+	if deletedAt == nil || !deletedAt.Equal(identityAt) {
+		log.Printf("[GC Worker] Skipping stale user cascade for %s (current deleted_at=%v identity_at=%v queued_at=%v)", item.ItemID, deletedAt, identityAt, item.QueuedAt)
 		return nil
 	}
 
@@ -565,8 +593,8 @@ func (w *Worker) processUserCascade(ctx context.Context, item QueueItem) error {
 	if err != nil {
 		return fmt.Errorf("failed to re-read deleted user marker for %s: %w", item.ItemID, err)
 	}
-	if deletedAt2 == nil || !deletedAt2.Equal(item.QueuedAt) {
-		log.Printf("[GC Worker] Skipping user cascade for %s after lock: restored between checks (deleted_at=%v)", item.ItemID, deletedAt2)
+	if deletedAt2 == nil || !deletedAt2.Equal(identityAt) {
+		log.Printf("[GC Worker] Skipping user cascade for %s after lock: restored between checks (deleted_at=%v identity_at=%v)", item.ItemID, deletedAt2, identityAt)
 		return nil
 	}
 
@@ -680,8 +708,9 @@ func (w *Worker) processLibraryCascade(ctx context.Context, item QueueItem) erro
 	if err != nil {
 		return fmt.Errorf("failed to read deleted library marker for %s: %w", item.ItemID, err)
 	}
-	if deletedAt == nil || !deletedAt.Equal(item.QueuedAt) {
-		log.Printf("[GC Worker] Skipping stale library cascade for %s (current deleted_at=%v queued_at=%v)", item.ItemID, deletedAt, item.QueuedAt)
+	identityAt := effectiveIdentityAt(item.QueuedAt, item.IdentityAt)
+	if deletedAt == nil || !deletedAt.Equal(identityAt) {
+		log.Printf("[GC Worker] Skipping stale library cascade for %s (current deleted_at=%v identity_at=%v queued_at=%v)", item.ItemID, deletedAt, identityAt, item.QueuedAt)
 		return nil
 	}
 
@@ -699,20 +728,20 @@ func (w *Worker) processLibraryCascade(ctx context.Context, item QueueItem) erro
 	if err != nil {
 		return fmt.Errorf("failed to re-read deleted library marker for %s: %w", item.ItemID, err)
 	}
-	if deletedAt2 == nil || !deletedAt2.Equal(item.QueuedAt) {
-		log.Printf("[GC Worker] Skipping stale library cascade for %s after lock (current deleted_at=%v queued_at=%v)", item.ItemID, deletedAt2, item.QueuedAt)
+	if deletedAt2 == nil || !deletedAt2.Equal(identityAt) {
+		log.Printf("[GC Worker] Skipping stale library cascade for %s after lock (current deleted_at=%v identity_at=%v queued_at=%v)", item.ItemID, deletedAt2, identityAt, item.QueuedAt)
 		return nil
 	}
 
-	return w.cascadeDeleteLibrary(item.OrgID, libraryID, item.StorageClass)
+	return w.cascadeDeleteLibrary(item.OrgID, libraryID, item.StorageClass, identityAt)
 }
 
-func (w *Worker) cascadeDeleteLibrary(orgID, libraryID uuid.UUID, storageClass string) error {
+func (w *Worker) cascadeDeleteLibrary(orgID, libraryID uuid.UUID, storageClass string, queuedAt time.Time) error {
 	if storageClass == "" {
 		storageClass, _ = w.store.GetLibraryStorageClass(orgID, libraryID)
 	}
 
-	if err := w.EnqueueLibraryContents(orgID, libraryID, storageClass); err != nil {
+	if err := w.enqueueLibraryContentsAt(orgID, libraryID, storageClass, queuedAt); err != nil {
 		return fmt.Errorf("failed to enqueue library contents: %w", err)
 	}
 
@@ -753,8 +782,9 @@ func (w *Worker) processOrgCascade(ctx context.Context, item QueueItem) error {
 	if err != nil {
 		return fmt.Errorf("failed to read deleted org marker for %s: %w", item.ItemID, err)
 	}
-	if deletedAt == nil || !deletedAt.Equal(item.QueuedAt) {
-		log.Printf("[GC Worker] Skipping stale org cascade for %s (current deleted_at=%v queued_at=%v)", item.ItemID, deletedAt, item.QueuedAt)
+	identityAt := effectiveIdentityAt(item.QueuedAt, item.IdentityAt)
+	if deletedAt == nil || !deletedAt.Equal(identityAt) {
+		log.Printf("[GC Worker] Skipping stale org cascade for %s (current deleted_at=%v identity_at=%v queued_at=%v)", item.ItemID, deletedAt, identityAt, item.QueuedAt)
 		return nil
 	}
 
@@ -774,7 +804,7 @@ func (w *Worker) processOrgCascade(ctx context.Context, item QueueItem) error {
 					return fmt.Errorf("failed to soft-delete library %s during org cascade: %w", lib.LibraryID, err)
 				}
 			}
-			if err := w.cascadeDeleteLibrary(orgID, lib.LibraryID, lib.StorageClass); err != nil {
+			if err := w.cascadeDeleteLibrary(orgID, lib.LibraryID, lib.StorageClass, identityAt); err != nil {
 				return fmt.Errorf("failed to cascade-delete library %s during org delete: %w", lib.LibraryID, err)
 			}
 		}
@@ -854,7 +884,7 @@ func (w *Worker) enqueueZeroRefBlocks(orgID, libraryID uuid.UUID, blockIDs []str
 		if err != nil {
 			return err
 		}
-		exists, err := w.store.QueueItemExists(orgID, candidateAt, ItemBlock, blockID)
+		exists, err := w.store.PendingItemExists(orgID, uuid.Nil, candidateAt, ItemBlock, blockID)
 		if err != nil {
 			return err
 		}
@@ -881,7 +911,13 @@ func (w *Worker) enqueueZeroRefBlocks(orgID, libraryID uuid.UUID, blockIDs []str
 // Only enqueues commits and fs_objects — blocks are handled in cascade
 // when fs_objects are processed (via decrementAndFindZeroRef).
 func (w *Worker) EnqueueLibraryContents(orgID, libraryID uuid.UUID, storageClass string) error {
-	now := time.Now()
+	return w.enqueueLibraryContentsAt(orgID, libraryID, storageClass, w.clock())
+}
+
+func (w *Worker) enqueueLibraryContentsAt(orgID, libraryID uuid.UUID, storageClass string, identityAt time.Time) error {
+	if identityAt.IsZero() {
+		identityAt = w.clock()
+	}
 
 	// Enqueue all commits for this library (batched)
 	commits, err := w.store.ListCommitsForLibrary(libraryID)
@@ -891,13 +927,22 @@ func (w *Worker) EnqueueLibraryContents(orgID, libraryID uuid.UUID, storageClass
 	if len(commits) > 0 {
 		batch := make([]QueueItem, 0, len(commits))
 		for _, c := range commits {
+			exists, err := w.store.PendingItemExists(orgID, libraryID, identityAt, ItemCommit, c.CommitID)
+			if err != nil {
+				return fmt.Errorf("failed to check commit queue state for library %s: %w", libraryID, err)
+			}
+			if exists {
+				continue
+			}
 			batch = append(batch, QueueItem{
-				OrgID: orgID, QueuedAt: now, ItemType: ItemCommit,
+				OrgID: orgID, QueuedAt: identityAt, IdentityAt: identityAt, ItemType: ItemCommit,
 				ItemID: c.CommitID, LibraryID: libraryID,
 			})
 		}
-		if err := w.queue.EnqueueBatch(batch); err != nil {
-			return fmt.Errorf("failed to batch enqueue commits for library %s: %w", libraryID, err)
+		if len(batch) > 0 {
+			if err := w.queue.EnqueueBatch(batch); err != nil {
+				return fmt.Errorf("failed to batch enqueue commits for library %s: %w", libraryID, err)
+			}
 		}
 	}
 
@@ -909,38 +954,59 @@ func (w *Worker) EnqueueLibraryContents(orgID, libraryID uuid.UUID, storageClass
 	if len(fsObjects) > 0 {
 		batch := make([]QueueItem, 0, len(fsObjects))
 		for _, obj := range fsObjects {
+			exists, err := w.store.PendingItemExists(orgID, libraryID, identityAt, ItemFSObject, obj.FSID)
+			if err != nil {
+				return fmt.Errorf("failed to check fs_object queue state for library %s: %w", libraryID, err)
+			}
+			if exists {
+				continue
+			}
 			batch = append(batch, QueueItem{
-				OrgID: orgID, QueuedAt: now, ItemType: ItemFSObject,
+				OrgID: orgID, QueuedAt: identityAt, IdentityAt: identityAt, ItemType: ItemFSObject,
 				ItemID: obj.FSID, LibraryID: libraryID,
 			})
 		}
-		if err := w.queue.EnqueueBatch(batch); err != nil {
-			return fmt.Errorf("failed to batch enqueue fs_objects for library %s: %w", libraryID, err)
+		if len(batch) > 0 {
+			if err := w.queue.EnqueueBatch(batch); err != nil {
+				return fmt.Errorf("failed to batch enqueue fs_objects for library %s: %w", libraryID, err)
+			}
 		}
 	}
 
 	// Clean up library-specific artifacts that don't cascade through fs_objects
-	w.enqueueLibraryArtifacts(orgID, libraryID)
+	shareCount, linkCount, err := w.enqueueLibraryArtifacts(orgID, libraryID)
+	if err != nil {
+		return err
+	}
 
-	log.Printf("[GC Worker] Enqueued library %s contents for deletion (%d commits, %d fs_objects)", libraryID, len(commits), len(fsObjects))
+	log.Printf("[GC Worker] Enqueued library %s contents for deletion (%d commits, %d fs_objects, %d shares, %d share links)", libraryID, len(commits), len(fsObjects), shareCount, linkCount)
 	return nil
 }
 
 // enqueueLibraryArtifacts cleans up ALL auxiliary data tied to a deleted library:
 // share links, shares, tags, tag counters, api tokens, locked files,
 // starred files, monitored repos, and restore jobs.
-func (w *Worker) enqueueLibraryArtifacts(orgID, libraryID uuid.UUID) {
+func (w *Worker) enqueueLibraryArtifacts(orgID, libraryID uuid.UUID) (int, int, error) {
+	var cleanupErr error
+	joinErr := func(label string, err error) {
+		if err != nil {
+			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("%s: %w", label, err))
+		}
+	}
+
 	// Delete share links via the by_library index (efficient)
 	tokens, err := w.store.DeleteShareLinksByLibrary(orgID, libraryID)
+	joinErr("delete share links", err)
 	if err == nil && len(tokens) > 0 {
 		log.Printf("[GC Worker] Cleaned up %d share links for deleted library %s", len(tokens), libraryID)
 	}
 
 	// Delete shares (user-to-user and group shares)
 	shares, err := w.store.ListSharesByLibrary(libraryID)
+	joinErr("list shares", err)
 	if err == nil {
 		for _, share := range shares {
-			w.store.DeleteShare(libraryID, share.ShareID)
+			joinErr("delete share", w.store.DeleteShare(libraryID, share.ShareID))
 		}
 		if len(shares) > 0 {
 			log.Printf("[GC Worker] Cleaned up %d shares for deleted library %s", len(shares), libraryID)
@@ -948,40 +1014,37 @@ func (w *Worker) enqueueLibraryArtifacts(orgID, libraryID uuid.UUID) {
 	}
 
 	// Delete repo tags and file tags
-	if err := w.cleanupLibraryTags(libraryID); err != nil {
-		log.Printf("[GC Worker] Error cleaning tags for library %s: %v", libraryID, err)
-	}
+	joinErr("cleanup tags", w.cleanupLibraryTags(libraryID))
 
 	// Delete tag counter tables (repo_tag_counters, file_tag_counters, repo_tag_file_counts)
-	w.store.DeleteRepoTagCounters(libraryID)
-	w.store.DeleteFileTagCounters(libraryID)
-	w.store.DeleteRepoTagFileCounts(libraryID)
+	joinErr("delete repo tag counters", w.store.DeleteRepoTagCounters(libraryID))
+	joinErr("delete file tag counters", w.store.DeleteFileTagCounters(libraryID))
+	joinErr("delete repo tag file counts", w.store.DeleteRepoTagFileCounts(libraryID))
 
 	// Delete API tokens
 	tokens2, err := w.store.ListRepoAPITokensByLibrary(libraryID)
+	joinErr("list repo api tokens", err)
 	if err == nil {
 		for _, t := range tokens2 {
-			w.store.DeleteRepoAPIToken(libraryID, t.AppName)
-			w.store.DeleteRepoAPITokenByToken(t.APIToken)
+			joinErr("delete repo api token", w.store.DeleteRepoAPIToken(libraryID, t.AppName))
+			joinErr("delete repo api token by token", w.store.DeleteRepoAPITokenByToken(t.APIToken))
 		}
 	}
 
 	// Delete locked files
-	w.store.DeleteLockedFilesByLibrary(libraryID)
+	joinErr("delete locked files", w.store.DeleteLockedFilesByLibrary(libraryID))
 
 	// Delete starred files referencing this library
-	if err := w.store.DeleteStarredFilesByLibrary(libraryID); err != nil {
-		log.Printf("[GC Worker] Error cleaning starred files for library %s: %v", libraryID, err)
-	}
+	joinErr("delete starred files", w.store.DeleteStarredFilesByLibrary(libraryID))
 
 	// Delete monitored repos referencing this library
-	if err := w.store.DeleteMonitoredReposByLibrary(libraryID); err != nil {
-		log.Printf("[GC Worker] Error cleaning monitored repos for library %s: %v", libraryID, err)
-	}
+	joinErr("delete monitored repos", w.store.DeleteMonitoredReposByLibrary(libraryID))
 
 	// Delete restore jobs for this library
-	if err := w.store.DeleteRestoreJobsByLibrary(orgID, libraryID); err != nil {
-		log.Printf("[GC Worker] Error cleaning restore jobs for library %s: %v", libraryID, err)
+	joinErr("delete restore jobs", w.store.DeleteRestoreJobsByLibrary(orgID, libraryID))
+
+	if cleanupErr != nil {
+		return len(shares), len(tokens), fmt.Errorf("failed to clean auxiliary artifacts for library %s: %w", libraryID, cleanupErr)
 	}
 
 	// Audit log
@@ -994,17 +1057,26 @@ func (w *Worker) enqueueLibraryArtifacts(orgID, libraryID uuid.UUID) {
 		Details:    fmt.Sprintf("shares=%d links=%d", len(shares), len(tokens)),
 		Timestamp:  time.Now(),
 	})
+
+	return len(shares), len(tokens), nil
 }
 
 func (w *Worker) cleanupLibraryTags(libraryID uuid.UUID) error {
+	var cleanupErr error
+	joinErr := func(label string, err error) {
+		if err != nil {
+			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("%s: %w", label, err))
+		}
+	}
+
 	// Delete file tags first (they reference repo tags)
 	fileTags, err := w.store.ListFileTagsByLibrary(libraryID)
 	if err != nil {
 		return err
 	}
 	for _, ft := range fileTags {
-		w.store.DeleteFileTag(libraryID, ft.FilePath, ft.TagID)
-		w.store.DeleteFileTagByID(libraryID, ft.FileTagID)
+		joinErr("delete file tag", w.store.DeleteFileTag(libraryID, ft.FilePath, ft.TagID))
+		joinErr("delete file tag by id", w.store.DeleteFileTagByID(libraryID, ft.FileTagID))
 	}
 
 	// Delete repo tag definitions
@@ -1015,9 +1087,9 @@ func (w *Worker) cleanupLibraryTags(libraryID uuid.UUID) error {
 	for _, tagIDStr := range tagIDs {
 		var tagID int
 		if _, err := fmt.Sscanf(tagIDStr, "%d", &tagID); err == nil {
-			w.store.DeleteRepoTag(libraryID, tagID)
+			joinErr("delete repo tag", w.store.DeleteRepoTag(libraryID, tagID))
 		}
 	}
 
-	return nil
+	return cleanupErr
 }

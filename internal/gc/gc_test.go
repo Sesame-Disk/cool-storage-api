@@ -2,7 +2,9 @@ package gc
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -145,6 +147,16 @@ func TestGCStatus_Formatting(t *testing.T) {
 	}
 	if status.LastWorkerRun != "never" {
 		t.Errorf("LastWorkerRun = %q, want %q", status.LastWorkerRun, "never")
+	}
+}
+
+func TestGCStatus_JSONAlwaysIncludesLastScanError(t *testing.T) {
+	raw, err := json.Marshal(GCStatus{})
+	if err != nil {
+		t.Fatalf("Marshal(GCStatus{}) failed: %v", err)
+	}
+	if !strings.Contains(string(raw), `"last_scan_error":""`) {
+		t.Fatalf("GCStatus JSON = %s, want last_scan_error to be present even when empty", raw)
 	}
 }
 
@@ -751,6 +763,47 @@ func TestService_DLQOps_SerializeUnderConcurrency(t *testing.T) {
 	}
 	if got := maxInFlight.Load(); got > 1 {
 		t.Fatalf("expected DLQ admin ops to be serialized by dlqOpsMu, max concurrent store ops = %d", got)
+	}
+}
+
+func TestService_RequeueFailedCascade_PreservesIdentityAt(t *testing.T) {
+	store := NewMockStore()
+	orgID := uuid.New()
+	deletedAt := time.Now().Add(-3 * time.Hour).UTC().Truncate(time.Millisecond)
+	failedAt := time.Now().UTC().Truncate(time.Millisecond)
+	itemID := uuid.New().String()
+
+	store.failedItems[orgID] = []GCFailedItemInfo{{
+		OrgID:        orgID,
+		FailedAt:     failedAt,
+		QueuedAt:     failedAt.Add(-time.Minute),
+		IdentityAt:   deletedAt,
+		ItemType:     ItemLibraryCascade,
+		ItemID:       itemID,
+		LibraryID:    uuid.Nil,
+		StorageClass: "hot",
+		RetryCount:   5,
+	}}
+
+	svc := &Service{
+		store:  store,
+		config: config.GCConfig{Enabled: true},
+		lease:  &fakeLeaderLease{allowed: true},
+	}
+
+	if err := svc.RequeueFailedItem(orgID, failedAt, ItemLibraryCascade, itemID); err != nil {
+		t.Fatalf("RequeueFailedItem failed: %v", err)
+	}
+
+	items := store.QueueItems(orgID)
+	if len(items) != 1 {
+		t.Fatalf("expected 1 queue item after requeue, got %d", len(items))
+	}
+	if items[0].QueuedAt.Equal(deletedAt) {
+		t.Fatalf("requeued cascade item kept deleted_at as queued_at; want a fresh queue position")
+	}
+	if !items[0].IdentityAt.Equal(deletedAt) {
+		t.Fatalf("requeued cascade item IdentityAt = %v, want %v", items[0].IdentityAt, deletedAt)
 	}
 }
 

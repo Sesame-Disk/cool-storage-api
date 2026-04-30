@@ -63,7 +63,7 @@ type GCStatus struct {
 	DryRun           bool   `json:"dry_run"`
 	LastWorkerRun    string `json:"last_worker_run"`
 	LastScanRun      string `json:"last_scan_run"`
-	LastScanError    string `json:"last_scan_error,omitempty"`
+	LastScanError    string `json:"last_scan_error"`
 	LastReconcileRun string `json:"last_reconcile_run"`
 	QueueSize        int    `json:"queue_size"`
 	FailedItemsTotal int    `json:"failed_items_total"`
@@ -336,7 +336,7 @@ func (s *Service) EnqueueBlock(orgID uuid.UUID, blockID string, libraryID uuid.U
 	if err != nil {
 		return err
 	}
-	exists, err := s.store.QueueItemExists(orgID, candidateAt, ItemBlock, blockID)
+	exists, err := s.store.PendingItemExists(orgID, uuid.Nil, candidateAt, ItemBlock, blockID)
 	if err != nil {
 		return err
 	}

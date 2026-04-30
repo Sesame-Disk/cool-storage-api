@@ -926,6 +926,7 @@ CREATE TABLE IF NOT EXISTS repo_tag_file_counts (
 CREATE TABLE IF NOT EXISTS gc_queue (
     org_id        UUID,
     queued_at     TIMESTAMP,
+    identity_at   TIMESTAMP,
     item_type     TEXT,
     item_id       TEXT,
     library_id    UUID,
@@ -961,6 +962,7 @@ CREATE TABLE IF NOT EXISTS gc_failed_items (
     org_id            UUID,
     failed_at         TIMESTAMP,
     queued_at         TIMESTAMP,
+    identity_at       TIMESTAMP,
     item_type         TEXT,
     item_id           TEXT,
     library_id        UUID,
@@ -972,6 +974,17 @@ CREATE TABLE IF NOT EXISTS gc_failed_items (
     PRIMARY KEY ((org_id), failed_at, item_type, item_id)
 ) WITH CLUSTERING ORDER BY (failed_at DESC, item_type ASC, item_id ASC)
   AND default_time_to_live = 2592000;
+
+-- Live queue markers persist until the queue row is resolved. Pending markers
+-- mirrored from gc_failed_items use a per-row TTL in code aligned with DLQ retention.
+CREATE TABLE IF NOT EXISTS gc_pending_items (
+    org_id      UUID,
+    item_type   TEXT,
+    library_id  UUID,
+    item_id     TEXT,
+    identity_at TIMESTAMP,
+    PRIMARY KEY ((org_id), item_type, library_id, item_id, identity_at)
+) WITH default_time_to_live = 0;
 
 -- Metadata/checkpoint table for GC snapshots, scanner cursors, and projection
 -- rebuild state. The runtime may persist last successful scan days and the
