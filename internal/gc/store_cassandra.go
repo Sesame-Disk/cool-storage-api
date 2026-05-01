@@ -28,6 +28,68 @@ func parseUUID(s string) uuid.UUID {
 	return id
 }
 
+func parseCASUUID(value interface{}) uuid.UUID {
+	switch v := value.(type) {
+	case uuid.UUID:
+		return v
+	case string:
+		return parseUUID(v)
+	case []byte:
+		id, err := uuid.FromBytes(v)
+		if err != nil {
+			return uuid.Nil
+		}
+		return id
+	case fmt.Stringer:
+		return parseUUID(v.String())
+	default:
+		return parseUUID(fmt.Sprint(v))
+	}
+}
+
+func parseCASTime(value interface{}) time.Time {
+	switch v := value.(type) {
+	case time.Time:
+		return v
+	case string:
+		if t, err := time.Parse(time.RFC3339Nano, v); err == nil {
+			return t
+		}
+		if t, err := time.Parse(time.RFC3339, v); err == nil {
+			return t
+		}
+	}
+	return time.Time{}
+}
+
+func (s *CassandraStore) acquireHardDeleteLock(tableName, keyColumn string, keyValue, leaseToken uuid.UUID) (bool, error) {
+	now := time.Now().UTC()
+	existing := map[string]interface{}{}
+	applied, err := s.db.Session().Query(fmt.Sprintf(`
+		INSERT INTO %s (%s, started_at, heartbeat, lease_token)
+		VALUES (?, ?, ?, ?) IF NOT EXISTS
+	`, tableName, keyColumn), keyValue.String(), now, now, leaseToken.String()).MapScanCAS(existing)
+	if err != nil || applied {
+		return applied, err
+	}
+
+	heartbeat := parseCASTime(existing["heartbeat"])
+	existingToken := parseCASUUID(existing["lease_token"])
+	if heartbeat.IsZero() || existingToken == uuid.Nil || now.Sub(heartbeat) < hardDeleteLockStaleAfter {
+		return false, nil
+	}
+
+	applied, err = s.db.Session().Query(fmt.Sprintf(`
+		UPDATE %s USING TTL 21600
+		SET started_at = ?, heartbeat = ?, lease_token = ?
+		WHERE %s = ? IF lease_token = ?
+	`, tableName, keyColumn), now, now, leaseToken.String(), keyValue.String(), existingToken.String()).MapScanCAS(map[string]interface{}{})
+	if err != nil {
+		return false, err
+	}
+	return applied, nil
+}
+
 // parseDirEntries extracts child fs_ids from a JSON dir_entries column.
 // Each entry has an "id" field that is the child fs_id.
 func parseDirEntries(jsonStr string) []string {
@@ -799,11 +861,11 @@ func (s *CassandraStore) SumOrgQueueStats() (int, int, error) {
 }
 
 // MarkItemProcessed attempts to insert the taskID into the gc_processed_items table.
-// The table has a default TTL of 48 hours so entries auto-expire.
+// The table has a default TTL of 35 days so entries outlive failed-item retention.
 // Returns applied=true if this is the first time (safe to proceed), false if already processed.
 func (s *CassandraStore) MarkItemProcessed(taskID uuid.UUID) (bool, error) {
 	// USING TTL must come before IF NOT EXISTS in CQL syntax.
-	// We omit USING TTL here because the table already has default_time_to_live = 172800.
+	// We omit USING TTL here because the table already has default_time_to_live = 3024000.
 	var existingTaskID string
 	applied, err := s.db.Session().Query(`
 		INSERT INTO gc_processed_items (task_id) VALUES (?) IF NOT EXISTS
@@ -2735,34 +2797,50 @@ func (s *CassandraStore) HardDeleteUser(orgID, userID uuid.UUID, email string) e
 	return nil
 }
 
-func (s *CassandraStore) AcquireUserHardDeleteLock(userID uuid.UUID) (bool, error) {
+func (s *CassandraStore) AcquireUserHardDeleteLock(userID, leaseToken uuid.UUID) (bool, error) {
+	return s.acquireHardDeleteLock("gc_user_hard_delete_locks", "user_id", userID, leaseToken)
+}
+
+func (s *CassandraStore) RenewUserHardDeleteLock(userID, leaseToken uuid.UUID) (bool, error) {
 	applied, err := s.db.Session().Query(`
-		INSERT INTO gc_user_hard_delete_locks (user_id, started_at)
-		VALUES (?, ?) IF NOT EXISTS
-	`, userID.String(), time.Now()).MapScanCAS(map[string]interface{}{})
+		UPDATE gc_user_hard_delete_locks USING TTL 21600
+		SET heartbeat = ?, lease_token = ?
+		WHERE user_id = ? IF lease_token = ?
+	`, time.Now().UTC(), leaseToken.String(), userID.String(), leaseToken.String()).MapScanCAS(map[string]interface{}{})
 	if err != nil {
 		return false, err
 	}
 	return applied, nil
 }
 
-func (s *CassandraStore) ReleaseUserHardDeleteLock(userID uuid.UUID) error {
-	return s.db.Session().Query(`DELETE FROM gc_user_hard_delete_locks WHERE user_id = ?`, userID.String()).Exec()
+func (s *CassandraStore) ReleaseUserHardDeleteLock(userID, leaseToken uuid.UUID) error {
+	_, err := s.db.Session().Query(`
+		DELETE FROM gc_user_hard_delete_locks WHERE user_id = ? IF lease_token = ?
+	`, userID.String(), leaseToken.String()).MapScanCAS(map[string]interface{}{})
+	return err
 }
 
-func (s *CassandraStore) AcquireLibraryHardDeleteLock(libraryID uuid.UUID) (bool, error) {
+func (s *CassandraStore) AcquireLibraryHardDeleteLock(libraryID, leaseToken uuid.UUID) (bool, error) {
+	return s.acquireHardDeleteLock("gc_library_hard_delete_locks", "library_id", libraryID, leaseToken)
+}
+
+func (s *CassandraStore) RenewLibraryHardDeleteLock(libraryID, leaseToken uuid.UUID) (bool, error) {
 	applied, err := s.db.Session().Query(`
-		INSERT INTO gc_library_hard_delete_locks (library_id, started_at)
-		VALUES (?, ?) IF NOT EXISTS
-	`, libraryID.String(), time.Now()).MapScanCAS(map[string]interface{}{})
+		UPDATE gc_library_hard_delete_locks USING TTL 21600
+		SET heartbeat = ?, lease_token = ?
+		WHERE library_id = ? IF lease_token = ?
+	`, time.Now().UTC(), leaseToken.String(), libraryID.String(), leaseToken.String()).MapScanCAS(map[string]interface{}{})
 	if err != nil {
 		return false, err
 	}
 	return applied, nil
 }
 
-func (s *CassandraStore) ReleaseLibraryHardDeleteLock(libraryID uuid.UUID) error {
-	return s.db.Session().Query(`DELETE FROM gc_library_hard_delete_locks WHERE library_id = ?`, libraryID.String()).Exec()
+func (s *CassandraStore) ReleaseLibraryHardDeleteLock(libraryID, leaseToken uuid.UUID) error {
+	_, err := s.db.Session().Query(`
+		DELETE FROM gc_library_hard_delete_locks WHERE library_id = ? IF lease_token = ?
+	`, libraryID.String(), leaseToken.String()).MapScanCAS(map[string]interface{}{})
+	return err
 }
 
 func (s *CassandraStore) GetUserEmail(orgID, userID uuid.UUID) (string, error) {
@@ -2991,19 +3069,27 @@ func (s *CassandraStore) DeleteGroupFull(orgID, groupID uuid.UUID) error {
 	return batch.Exec()
 }
 
-func (s *CassandraStore) AcquireOrgHardDeleteLock(orgID uuid.UUID) (bool, error) {
+func (s *CassandraStore) AcquireOrgHardDeleteLock(orgID, leaseToken uuid.UUID) (bool, error) {
+	return s.acquireHardDeleteLock("gc_org_hard_delete_locks", "org_id", orgID, leaseToken)
+}
+
+func (s *CassandraStore) RenewOrgHardDeleteLock(orgID, leaseToken uuid.UUID) (bool, error) {
 	applied, err := s.db.Session().Query(`
-		INSERT INTO gc_org_hard_delete_locks (org_id, started_at)
-		VALUES (?, ?) IF NOT EXISTS
-	`, orgID.String(), time.Now()).MapScanCAS(map[string]interface{}{})
+		UPDATE gc_org_hard_delete_locks USING TTL 21600
+		SET heartbeat = ?, lease_token = ?
+		WHERE org_id = ? IF lease_token = ?
+	`, time.Now().UTC(), leaseToken.String(), orgID.String(), leaseToken.String()).MapScanCAS(map[string]interface{}{})
 	if err != nil {
 		return false, err
 	}
 	return applied, nil
 }
 
-func (s *CassandraStore) ReleaseOrgHardDeleteLock(orgID uuid.UUID) error {
-	return s.db.Session().Query(`DELETE FROM gc_org_hard_delete_locks WHERE org_id = ?`, orgID.String()).Exec()
+func (s *CassandraStore) ReleaseOrgHardDeleteLock(orgID, leaseToken uuid.UUID) error {
+	_, err := s.db.Session().Query(`
+		DELETE FROM gc_org_hard_delete_locks WHERE org_id = ? IF lease_token = ?
+	`, orgID.String(), leaseToken.String()).MapScanCAS(map[string]interface{}{})
+	return err
 }
 
 func (s *CassandraStore) BeginOrgPurge(orgID uuid.UUID, identityAt time.Time) (bool, error) {
@@ -3038,14 +3124,15 @@ func (s *CassandraStore) BeginOrgPurge(orgID uuid.UUID, identityAt time.Time) (b
 }
 
 func (s *CassandraStore) HardDeleteOrg(orgID uuid.UUID) error {
-	applied, err := s.AcquireOrgHardDeleteLock(orgID)
+	leaseToken := uuid.New()
+	applied, err := s.AcquireOrgHardDeleteLock(orgID, leaseToken)
 	if err != nil {
 		return err
 	}
 	if !applied {
 		return fmt.Errorf("org %s hard delete already in progress", orgID)
 	}
-	defer s.ReleaseOrgHardDeleteLock(orgID) //nolint:errcheck
+	defer s.ReleaseOrgHardDeleteLock(orgID, leaseToken) //nolint:errcheck
 
 	deletedAt, err := s.GetOrgDeletedAt(orgID)
 	if err != nil {

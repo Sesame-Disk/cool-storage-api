@@ -45,6 +45,8 @@ type MockStore struct {
 
 	// fs_objects keyed by "libraryID:fsID"
 	fsObjects map[string]*mockFSObject
+	// injected fs_object read failures keyed by "libraryID:fsID"
+	getFSObjectErrors map[string]error
 
 	// libraries keyed by libraryID
 	libraries map[uuid.UUID]*mockLibrary
@@ -77,13 +79,13 @@ type MockStore struct {
 	storageCounterReconciliations map[string]*mockStorageCounterReconciliation
 
 	// in-progress org hard-delete locks keyed by orgID.
-	orgHardDeleteLocks map[uuid.UUID]time.Time
+	orgHardDeleteLocks map[uuid.UUID]mockHardDeleteLock
 
 	// in-progress user hard-delete locks keyed by userID.
-	userHardDeleteLocks map[uuid.UUID]time.Time
+	userHardDeleteLocks map[uuid.UUID]mockHardDeleteLock
 
 	// in-progress library hard-delete locks keyed by libraryID.
-	libraryHardDeleteLocks map[uuid.UUID]time.Time
+	libraryHardDeleteLocks map[uuid.UUID]mockHardDeleteLock
 
 	// share_links keyed by shareToken
 	shareLinks map[string]*mockShareLink
@@ -283,6 +285,22 @@ type mockStorageCounterReconciliation struct {
 	RequestedAt time.Time
 }
 
+type mockHardDeleteLock struct {
+	LeaseToken uuid.UUID
+	StartedAt  time.Time
+	Heartbeat  time.Time
+}
+
+func mockAcquireHardDeleteLock(locks map[uuid.UUID]mockHardDeleteLock, targetID, leaseToken uuid.UUID) bool {
+	now := time.Now().UTC()
+	lock, locked := locks[targetID]
+	if locked && now.Sub(lock.Heartbeat) < hardDeleteLockStaleAfter {
+		return false
+	}
+	locks[targetID] = mockHardDeleteLock{LeaseToken: leaseToken, StartedAt: now, Heartbeat: now}
+	return true
+}
+
 // NewMockStore creates a new in-memory mock store.
 func NewMockStore() *MockStore {
 	return &MockStore{
@@ -297,6 +315,7 @@ func NewMockStore() *MockStore {
 		mappings:                      make(map[string]string),
 		commits:                       make(map[string]*mockCommit),
 		fsObjects:                     make(map[string]*mockFSObject),
+		getFSObjectErrors:             make(map[string]error),
 		libraries:                     make(map[uuid.UUID]*mockLibrary),
 		orgNames:                      make(map[uuid.UUID]string),
 		orgStatus:                     make(map[uuid.UUID]string),
@@ -308,9 +327,9 @@ func NewMockStore() *MockStore {
 		deletedLibraries:              make(map[uuid.UUID]*mockDeletedLibrary),
 		storageSnapshots:              make(map[string]traffic.StorageSnapshot),
 		storageCounterReconciliations: make(map[string]*mockStorageCounterReconciliation),
-		orgHardDeleteLocks:            make(map[uuid.UUID]time.Time),
-		userHardDeleteLocks:           make(map[uuid.UUID]time.Time),
-		libraryHardDeleteLocks:        make(map[uuid.UUID]time.Time),
+		orgHardDeleteLocks:            make(map[uuid.UUID]mockHardDeleteLock),
+		userHardDeleteLocks:           make(map[uuid.UUID]mockHardDeleteLock),
+		libraryHardDeleteLocks:        make(map[uuid.UUID]mockHardDeleteLock),
 		shareLinks:                    make(map[string]*mockShareLink),
 		shares:                        make(map[string]*mockShare),
 		restoreJobs:                   make(map[string]*mockRestoreJob),
@@ -1506,6 +1525,9 @@ func (m *MockStore) GetFSObject(libraryID uuid.UUID, fsID string) (FSObjectInfo,
 	defer m.mu.RUnlock()
 
 	key := fmt.Sprintf("%s:%s", libraryID, fsID)
+	if err := m.getFSObjectErrors[key]; err != nil {
+		return FSObjectInfo{}, err
+	}
 	obj, ok := m.fsObjects[key]
 	if !ok {
 		return FSObjectInfo{}, fmt.Errorf("fs_object not found: %s", fsID)
@@ -1516,6 +1538,17 @@ func (m *MockStore) GetFSObject(libraryID uuid.UUID, fsID string) (FSObjectInfo,
 		BlockIDs:   obj.BlockIDs,
 		DirEntries: obj.DirEntries,
 	}, nil
+}
+
+func (m *MockStore) SetGetFSObjectError(libraryID uuid.UUID, fsID string, err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	key := fmt.Sprintf("%s:%s", libraryID, fsID)
+	if err == nil {
+		delete(m.getFSObjectErrors, key)
+		return
+	}
+	m.getFSObjectErrors[key] = err
 }
 
 func (m *MockStore) DeleteFSObject(libraryID uuid.UUID, fsID string) error {
@@ -2290,36 +2323,60 @@ func (m *MockStore) HardDeleteUser(orgID, userID uuid.UUID, email string) error 
 	return nil
 }
 
-func (m *MockStore) AcquireUserHardDeleteLock(userID uuid.UUID) (bool, error) {
+func (m *MockStore) AcquireUserHardDeleteLock(userID, leaseToken uuid.UUID) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if _, locked := m.userHardDeleteLocks[userID]; locked {
+	return mockAcquireHardDeleteLock(m.userHardDeleteLocks, userID, leaseToken), nil
+}
+
+func (m *MockStore) RenewUserHardDeleteLock(userID, leaseToken uuid.UUID) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	lock, locked := m.userHardDeleteLocks[userID]
+	if !locked || lock.LeaseToken != leaseToken {
 		return false, nil
 	}
-	m.userHardDeleteLocks[userID] = time.Now()
+	lock.Heartbeat = time.Now().UTC()
+	m.userHardDeleteLocks[userID] = lock
 	return true, nil
 }
 
-func (m *MockStore) ReleaseUserHardDeleteLock(userID uuid.UUID) error {
+func (m *MockStore) ReleaseUserHardDeleteLock(userID, leaseToken uuid.UUID) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	lock, locked := m.userHardDeleteLocks[userID]
+	if !locked || lock.LeaseToken != leaseToken {
+		return nil
+	}
 	delete(m.userHardDeleteLocks, userID)
 	return nil
 }
 
-func (m *MockStore) AcquireLibraryHardDeleteLock(libraryID uuid.UUID) (bool, error) {
+func (m *MockStore) AcquireLibraryHardDeleteLock(libraryID, leaseToken uuid.UUID) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if _, locked := m.libraryHardDeleteLocks[libraryID]; locked {
+	return mockAcquireHardDeleteLock(m.libraryHardDeleteLocks, libraryID, leaseToken), nil
+}
+
+func (m *MockStore) RenewLibraryHardDeleteLock(libraryID, leaseToken uuid.UUID) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	lock, locked := m.libraryHardDeleteLocks[libraryID]
+	if !locked || lock.LeaseToken != leaseToken {
 		return false, nil
 	}
-	m.libraryHardDeleteLocks[libraryID] = time.Now()
+	lock.Heartbeat = time.Now().UTC()
+	m.libraryHardDeleteLocks[libraryID] = lock
 	return true, nil
 }
 
-func (m *MockStore) ReleaseLibraryHardDeleteLock(libraryID uuid.UUID) error {
+func (m *MockStore) ReleaseLibraryHardDeleteLock(libraryID, leaseToken uuid.UUID) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	lock, locked := m.libraryHardDeleteLocks[libraryID]
+	if !locked || lock.LeaseToken != leaseToken {
+		return nil
+	}
 	delete(m.libraryHardDeleteLocks, libraryID)
 	return nil
 }
@@ -2428,13 +2485,12 @@ func (m *MockStore) DeleteGroupFull(orgID, groupID uuid.UUID) error {
 	return nil
 }
 
-func (m *MockStore) AcquireOrgHardDeleteLock(orgID uuid.UUID) (bool, error) {
+func (m *MockStore) AcquireOrgHardDeleteLock(orgID, leaseToken uuid.UUID) (bool, error) {
 	m.mu.Lock()
-	if _, locked := m.orgHardDeleteLocks[orgID]; locked {
+	if !mockAcquireHardDeleteLock(m.orgHardDeleteLocks, orgID, leaseToken) {
 		m.mu.Unlock()
 		return false, nil
 	}
-	m.orgHardDeleteLocks[orgID] = time.Now()
 	hook := m.acquireOrgHardDeleteLockHook
 	m.mu.Unlock()
 	if hook != nil {
@@ -2443,9 +2499,25 @@ func (m *MockStore) AcquireOrgHardDeleteLock(orgID uuid.UUID) (bool, error) {
 	return true, nil
 }
 
-func (m *MockStore) ReleaseOrgHardDeleteLock(orgID uuid.UUID) error {
+func (m *MockStore) RenewOrgHardDeleteLock(orgID, leaseToken uuid.UUID) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	lock, locked := m.orgHardDeleteLocks[orgID]
+	if !locked || lock.LeaseToken != leaseToken {
+		return false, nil
+	}
+	lock.Heartbeat = time.Now().UTC()
+	m.orgHardDeleteLocks[orgID] = lock
+	return true, nil
+}
+
+func (m *MockStore) ReleaseOrgHardDeleteLock(orgID, leaseToken uuid.UUID) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	lock, locked := m.orgHardDeleteLocks[orgID]
+	if !locked || lock.LeaseToken != leaseToken {
+		return nil
+	}
 	delete(m.orgHardDeleteLocks, orgID)
 	return nil
 }
@@ -2472,14 +2544,15 @@ func (m *MockStore) BeginOrgPurge(orgID uuid.UUID, identityAt time.Time) (bool, 
 }
 
 func (m *MockStore) HardDeleteOrg(orgID uuid.UUID) error {
-	acquired, err := m.AcquireOrgHardDeleteLock(orgID)
+	leaseToken := uuid.New()
+	acquired, err := m.AcquireOrgHardDeleteLock(orgID, leaseToken)
 	if err != nil {
 		return err
 	}
 	if !acquired {
 		return fmt.Errorf("org %s hard delete already in progress", orgID)
 	}
-	defer m.ReleaseOrgHardDeleteLock(orgID) //nolint:errcheck
+	defer m.ReleaseOrgHardDeleteLock(orgID, leaseToken) //nolint:errcheck
 	deletedAt, err := m.GetOrgDeletedAt(orgID)
 	if err != nil {
 		return err

@@ -14,6 +14,7 @@ var gcFailedItemRetention = time.Duration(gcFailedItemRetentionTTLSeconds) * tim
 const (
 	GCFailureCodeNone                        = ""
 	GCFailureCodeLibraryHardDeleteInProgress = "library_hard_delete_in_progress"
+	GCFailureCodeFSObjectDecrementAmbiguous  = "fs_object_decrement_ambiguous"
 )
 
 // GCStore abstracts all database operations used by the GC system.
@@ -176,17 +177,19 @@ type GCStore interface {
 	DeleteAPIKeysByUser(orgID, userID uuid.UUID) error
 	HardDeleteUser(orgID, userID uuid.UUID, email string) error
 	GetUserEmail(orgID, userID uuid.UUID) (string, error)
-	// AcquireUserHardDeleteLock acquires a short-lived lock for a user cascade
+	// AcquireUserHardDeleteLock acquires a renewable lease for a user cascade
 	// delete. Returns (true, nil) when the lock is successfully acquired.
 	// activateUser checks this table to block concurrent restores.
-	AcquireUserHardDeleteLock(userID uuid.UUID) (bool, error)
-	ReleaseUserHardDeleteLock(userID uuid.UUID) error
+	AcquireUserHardDeleteLock(userID, leaseToken uuid.UUID) (bool, error)
+	RenewUserHardDeleteLock(userID, leaseToken uuid.UUID) (bool, error)
+	ReleaseUserHardDeleteLock(userID, leaseToken uuid.UUID) error
 
-	// AcquireLibraryHardDeleteLock acquires a short-lived lock for a library
+	// AcquireLibraryHardDeleteLock acquires a renewable lease for a library
 	// cascade delete. Returns (true, nil) when the lock is successfully acquired.
 	// restoreDeletedLibrary checks this table to block concurrent restores.
-	AcquireLibraryHardDeleteLock(libraryID uuid.UUID) (bool, error)
-	ReleaseLibraryHardDeleteLock(libraryID uuid.UUID) error
+	AcquireLibraryHardDeleteLock(libraryID, leaseToken uuid.UUID) (bool, error)
+	RenewLibraryHardDeleteLock(libraryID, leaseToken uuid.UUID) (bool, error)
+	ReleaseLibraryHardDeleteLock(libraryID, leaseToken uuid.UUID) error
 
 	// Library trash auto-purge (soft-deleted libraries past retention period)
 	ListExpiredDeletedLibraries(retentionDays int) ([]DeletedLibraryInfo, error)
@@ -208,12 +211,13 @@ type GCStore interface {
 	// false when the org was restored or deleted again under a different
 	// identity before the transition could be claimed.
 	BeginOrgPurge(orgID uuid.UUID, identityAt time.Time) (bool, error)
-	// AcquireOrgHardDeleteLock acquires a short-lived lock for an org cascade
+	// AcquireOrgHardDeleteLock acquires a renewable lease for an org cascade
 	// delete. Returns (true, nil) when the lock is successfully acquired.
 	// Restore/reactivation is blocked by the purging lifecycle state claimed
 	// with BeginOrgPurge; this lock only serializes concurrent hard-delete work.
-	AcquireOrgHardDeleteLock(orgID uuid.UUID) (bool, error)
-	ReleaseOrgHardDeleteLock(orgID uuid.UUID) error
+	AcquireOrgHardDeleteLock(orgID, leaseToken uuid.UUID) (bool, error)
+	RenewOrgHardDeleteLock(orgID, leaseToken uuid.UUID) (bool, error)
+	ReleaseOrgHardDeleteLock(orgID, leaseToken uuid.UUID) error
 	// HardDeleteOrgLocked deletes the org record after child rows have been
 	// removed. Caller must already hold the org hard-delete lock.
 	HardDeleteOrgLocked(orgID uuid.UUID) error

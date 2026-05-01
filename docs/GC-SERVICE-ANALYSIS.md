@@ -37,7 +37,7 @@ flowchart TD
     subgraph Safety["Safety Mechanisms"]
         Grace["Grace Period<br/>Default: 1 hour"]
         LWT["LWT Guard<br/>IF ref_count <= 0"]
-        Idempotent["Idempotency<br/>MarkItemProcessed<br/>48h TTL"]
+            Idempotent["Idempotency<br/>MarkItemProcessed<br/>35d TTL"]
         Lock["Hard-Delete Locks<br/>Prevents restore race"]
         Retry["Retry Cap: 5<br/>Then move to DLQ"]
     end
@@ -124,7 +124,8 @@ processFSObject(item):
   3. If file with blocks:
      a. Create deterministic taskID (fs_id + timestamp)
      b. MarkItemProcessed(taskID) — IF NOT EXISTS
-        └─ Already processed: skip decrement (idempotent)
+        └─ Already processed: verify referenced block ref_counts are already non-positive;
+           if any are still positive, fail closed and keep the fs_object for recovery.
         └─ First time:
      c. For each block: DecrementRefCount, check if now 0
      d. Enqueue zero-ref blocks for deletion
@@ -132,8 +133,10 @@ processFSObject(item):
 ```
 
 **The idempotency mechanism at step 3b prevents double-decrement on retry.**
-If the worker crashes after decrementing but before completing the queue item,
-the retry will see the task is already processed and skip the decrement.
+If the worker sees an existing marker after a crash, it now deletes the
+`fs_object` only when the referenced blocks already reflect the decrement. When
+state is ambiguous, the item stays retryable instead of deleting the last
+reference and stranding positive-ref blocks.
 
 ---
 
@@ -146,13 +149,18 @@ These are deliberate safety mechanisms that are correctly implemented and tested
 2. **Grace period** (default 1h) — Recently enqueued items can't be processed. Gives
    time for concurrent operations to increment ref counts.
 3. **Idempotent decrement** — `MarkItemProcessed` with deterministic task IDs prevents
-   double-decrement on worker retry. 48h TTL auto-cleans the tracking table.
+   double-decrement across worker retries and delayed DLQ requeues inside the
+   30-day failed-item retention window. The tracking table now uses a 35-day TTL.
 4. **Cascade ordering** — Commit → root fs_object → children → blocks. If any step fails,
    the parent is not deleted, and the scanner will re-discover it.
-5. **Hard-delete locks** — User and library cascade deletes acquire a lock that blocks
-   concurrent `restore` operations.
+5. **Hard-delete locks** — User, library, and org cascades acquire a tokenized,
+   renewable lease plus a second stale-check that blocks the restore race at
+   cascade start and keeps the guard alive for long-running hard deletes. If a
+   worker crashes, a later worker can take over after the heartbeat becomes
+   stale; active lock contention is postponed without consuming retry budget.
 6. **Scanner as safety net** — 13 phases catch orphaned items that inline enqueue missed.
-   Runs on startup + every 24h.
+   Runs on startup + every 24h, and the auto-delete keep-tree walk now fails closed
+   for a library if any `GetFSObject` read needed to build the keep-set fails.
 7. **Retry with cap** — Failed items get retried up to 5 times with HOL-blocking prevention
    (requeued to back of queue). After 5 retries, TTL cleanup removes the item.
 8. **Audit logging** — Cascade deletes write to `gc_audit_log` for compliance traceability.
@@ -277,7 +285,7 @@ race conditions:
 
 - **Increment** (`IncrementBlockRefCounts`): on upload and copy. Uses `UPDATE ... IF ref_count = ? SET ref_count = ?` with CAS retry.
 - **Decrement** (`DecrementBlockRefCountsOnce`): on file delete. Same CAS pattern. Returns `true` if the decrement caused ref_count to hit 0.
-- **Idempotency**: Each decrement operation has a unique `operationKey` (commit ID). Processed operations are recorded in `gc_processed_items` (48h TTL) to prevent double-decrement on retry.
+- **Idempotency**: Each decrement operation has a stable key derived from `library_id`, `fs_object_id`, and GC `identity_at`. Processed operations are recorded in `gc_processed_items` (35d TTL) to prevent double-decrement on retry and delayed DLQ replay.
 
 Blocks are **never shared across orgs** — the `blocks` primary key is `(org_id, block_id)`.
 
@@ -415,7 +423,7 @@ removes the public access link.
 | Guarantee | Mechanism | Integration-tested? |
 |-----------|-----------|-------------------|
 | Block never deleted while ref_count > 0 | LWT: `IF ref_count <= 0` | **Yes** (`TestGC_ConcurrentUploadDuringGC`) |
-| Ref count never double-decremented | Idempotent operation key + `gc_processed_items` | **Yes** (unit + `TestBatchDeleteItems_DeduplicatedFilesDecrementSharedBlockTwice`) |
+| Ref count never double-decremented within the supported replay window | Stable idempotent operation key + `gc_processed_items` | **Yes** (unit + `TestBatchDeleteItems_DeduplicatedFilesDecrementSharedBlockTwice`) |
 | Re-uploaded content survives pending GC | Grace period + LWT re-check at deletion time | **Yes** (`TestGC_ConcurrentUploadDuringGC`) |
 | Shared block survives partial file delete | Ref count tracks all references | **Yes** (`TestGC_DeduplicationSafety`) |
 | Cascade respects restore from trash | Stale-check + hard-delete lock | Unit tests only (**pending integration**) |

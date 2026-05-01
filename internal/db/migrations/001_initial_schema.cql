@@ -1015,10 +1015,11 @@ INSERT INTO gc_stats (stat_key, stat_value, updated_at)
 VALUES ('last_reconcile_run', '', toTimestamp(now()))
 IF NOT EXISTS;
 
--- 48-hour TTL prevents double-decrement of ref_counts if the queue is slow.
+-- Keep this longer than gc_failed_items retention so delayed DLQ requeues
+-- cannot repeat the same decrement after the idempotency marker expires.
 CREATE TABLE IF NOT EXISTS gc_processed_items (
     task_id UUID PRIMARY KEY
-) WITH default_time_to_live = 172800;
+) WITH default_time_to_live = 3024000;
 
 -- When the GC worker deletes the canonical `blocks` row before the backing S3
 -- object, any S3 failure would otherwise leak storage forever. This recovery
@@ -1056,25 +1057,31 @@ CREATE TABLE IF NOT EXISTS gc_storage_counter_reconciliation (
 -- concurrent reactivation attempts while GC verifies child tables and removes
 -- the canonical org rows.
 CREATE TABLE IF NOT EXISTS gc_org_hard_delete_locks (
-    org_id     UUID PRIMARY KEY,
-    started_at TIMESTAMP
-) WITH default_time_to_live = 3600;
+    org_id      UUID PRIMARY KEY,
+    started_at  TIMESTAMP,
+    heartbeat   TIMESTAMP,
+    lease_token UUID
+) WITH default_time_to_live = 21600;
 
 -- Short-lived lock acquired while a user is being hard-deleted. This blocks
 -- a concurrent restore attempt from racing the cascade worker between the
 -- stale-check and the final HardDeleteUser write.
 CREATE TABLE IF NOT EXISTS gc_user_hard_delete_locks (
-    user_id    UUID PRIMARY KEY,
-    started_at TIMESTAMP
-) WITH default_time_to_live = 3600;
+    user_id     UUID PRIMARY KEY,
+    started_at  TIMESTAMP,
+    heartbeat   TIMESTAMP,
+    lease_token UUID
+) WITH default_time_to_live = 21600;
 
 -- Short-lived lock acquired while a library is being hard-deleted. This blocks
 -- a concurrent restore attempt from racing the cascade worker between the
 -- stale-check and the final HardDeleteLibrary write.
 CREATE TABLE IF NOT EXISTS gc_library_hard_delete_locks (
-    library_id UUID PRIMARY KEY,
-    started_at TIMESTAMP
-) WITH default_time_to_live = 3600;
+    library_id  UUID PRIMARY KEY,
+    started_at  TIMESTAMP,
+    heartbeat   TIMESTAMP,
+    lease_token UUID
+) WITH default_time_to_live = 21600;
 
 -- ─── Audit ───────────────────────────────────────────────────────────────────
 

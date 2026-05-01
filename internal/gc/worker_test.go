@@ -138,8 +138,8 @@ func TestWorker_ProcessBlock_DryRun(t *testing.T) {
 
 	ctx := context.Background()
 	n, _ := w.ProcessOnce(ctx)
-	if n != 1 {
-		t.Errorf("expected 1 processed, got %d", n)
+	if n != 0 {
+		t.Errorf("expected 0 completed in dry run, got %d", n)
 	}
 
 	// Block should still exist (dry run)
@@ -148,6 +148,50 @@ func TestWorker_ProcessBlock_DryRun(t *testing.T) {
 	}
 	if len(sp.DeletedBlocks()) != 0 {
 		t.Error("S3 should not be touched in dry run mode")
+	}
+	if got := len(store.QueueItems(orgID)); got != 1 {
+		t.Fatalf("dry run should leave block queued, got %d items", got)
+	}
+}
+
+func TestWorker_ProcessFSObject_DryRunLeavesQueueAndRefsUntouched(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	w := NewWorker(store, nil, q, 100, 0, true, stats)
+
+	orgID := uuid.New()
+	libID := uuid.New()
+	queuedAt := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
+	store.AddBlock(orgID, "blk-live", "hot", 2)
+	store.AddFSObjectWithEntries(libID, "fs-root", "dir", nil, []string{"fs-child"})
+	store.AddFSObject(libID, "fs-child", "file", []string{"blk-live"})
+	if err := store.EnqueueItem(orgID, queuedAt, ItemFSObject, "fs-root", libID, "", 0); err != nil {
+		t.Fatalf("failed to seed fs_object queue item: %v", err)
+	}
+
+	n, err := w.ProcessOnce(context.Background())
+	if err != nil {
+		t.Fatalf("ProcessOnce failed: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("expected 0 completed items in dry run, got %d", n)
+	}
+	if got := len(store.QueueItems(orgID)); got != 1 {
+		t.Fatalf("dry run should leave fs_object queued, got %d items", got)
+	}
+	if items := store.QueueItems(orgID); items[0].ItemID != "fs-root" || items[0].ItemType != ItemFSObject {
+		t.Fatalf("dry run should not enqueue children, got %#v", items)
+	}
+	if block := store.GetBlock(orgID, "blk-live"); block == nil || block.RefCount != 2 {
+		t.Fatalf("dry run should not decrement block ref_count, got %#v", block)
+	}
+	taskID := uuid.NewMD5(uuid.NameSpaceOID, []byte(fmt.Sprintf("%s-%s-%d", libID, "fs-root", queuedAt.UnixNano())))
+	if _, exists := store.gcStats[taskID.String()]; exists {
+		t.Fatal("dry run should not mark fs_object as processed")
+	}
+	if obj := store.GetFSObj(libID, "fs-root"); obj == nil {
+		t.Fatal("dry run should not delete fs_object")
 	}
 }
 
@@ -189,6 +233,38 @@ func TestWorker_ProcessCommit_CascadesFSObjects(t *testing.T) {
 	}
 	if fsItems != 1 {
 		t.Errorf("expected 1 fs_object enqueued for cascade, got %d", fsItems)
+	}
+}
+
+func TestWorker_ProcessCommit_DryRunDoesNotAcquireLibraryDeleteGuard(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	w := NewWorker(store, nil, q, 100, 0, true, stats)
+
+	orgID := uuid.New()
+	libID := uuid.New()
+	deletedAt := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
+	store.AddDeletedLibrary(orgID, libID, "hot", deletedAt)
+	store.AddCommit(libID, "commit-dry", "fs-root")
+
+	item := QueueItem{
+		OrgID:                       orgID,
+		QueuedAt:                    deletedAt,
+		IdentityAt:                  deletedAt,
+		RequiresLibraryDeletedCheck: true,
+		ItemType:                    ItemCommit,
+		ItemID:                      "commit-dry",
+		LibraryID:                   libID,
+	}
+	if err := w.processCommit(item); err != nil {
+		t.Fatalf("processCommit dry run failed: %v", err)
+	}
+	if len(store.libraryHardDeleteLocks) != 0 {
+		t.Fatal("dry run commit should not acquire library hard-delete locks")
+	}
+	if store.GetCommitRecord(libID, "commit-dry") == nil {
+		t.Fatal("dry run commit should not delete the commit")
 	}
 }
 
@@ -316,7 +392,7 @@ func TestWorker_ProcessFSObject_CascadeBlocks(t *testing.T) {
 		t.Fatalf("ProcessOnce failed: %v", err)
 	}
 	if n != 1 {
-		t.Errorf("expected 1 processed, got %d", n)
+		t.Errorf("expected 1 completed, got %d", n)
 	}
 
 	// FS object should be deleted
@@ -497,11 +573,91 @@ func TestWorker_ProcessFSObject_RetryKeepsSingleBlockDecrement(t *testing.T) {
 
 	store.AddFSObject(libID, "fs-obj-1", "file", []string{"blk-a"})
 	second := QueueItem{OrgID: orgID, QueuedAt: time.Now().UTC(), IdentityAt: identityAt, ItemType: ItemFSObject, ItemID: "fs-obj-1", LibraryID: libID}
-	if err := w.processFSObject(context.Background(), second); err != nil {
-		t.Fatalf("second processFSObject failed: %v", err)
+	if err := w.processFSObject(context.Background(), second); err == nil {
+		t.Fatal("expected ambiguous decrement marker to fail closed")
 	}
 	if got := store.GetBlock(orgID, "blk-a").RefCount; got != 1 {
 		t.Fatalf("block ref_count after retry = %d, want 1", got)
+	}
+	if store.GetFSObj(libID, "fs-obj-1") == nil {
+		t.Fatal("fs_object should remain when decrement state is ambiguous")
+	}
+}
+
+func TestWorker_ProcessUserCascade_LockBusyPostponesWithoutRetryOrDLQ(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	w := NewWorker(store, nil, q, 100, 0, false, stats)
+
+	orgID := uuid.New()
+	userID := uuid.New()
+	deletedAt := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
+	oldToken := uuid.New()
+
+	store.AddDeletedUser(orgID, userID, "alice@test.com", deletedAt)
+	if acquired, err := store.AcquireUserHardDeleteLock(userID, oldToken); err != nil || !acquired {
+		t.Fatalf("seed user hard-delete lock acquired=%v err=%v", acquired, err)
+	}
+	if err := store.EnqueueItem(orgID, deletedAt, ItemUserCascade, userID.String(), uuid.Nil, "", 4); err != nil {
+		t.Fatalf("enqueue user cascade failed: %v", err)
+	}
+
+	n, err := w.ProcessOnce(context.Background())
+	if err != nil {
+		t.Fatalf("ProcessOnce failed: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("lock-contended item should not complete, got %d", n)
+	}
+	if !store.HasUser(orgID, userID) {
+		t.Fatal("user should remain while another hard delete lock is active")
+	}
+	items := store.QueueItems(orgID)
+	if len(items) != 1 {
+		t.Fatalf("expected one postponed queue item, got %d", len(items))
+	}
+	if items[0].RetryCount != 4 {
+		t.Fatalf("retry count after lock contention = %d, want 4", items[0].RetryCount)
+	}
+	if failed := store.FailedItems(orgID); len(failed) != 0 {
+		t.Fatalf("lock contention should not move item to DLQ, got %d failed items", len(failed))
+	}
+}
+
+func TestWorker_ProcessUserCascade_StaleLockLeaseIsRecovered(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	w := NewWorker(store, nil, q, 100, 0, false, stats)
+
+	orgID := uuid.New()
+	userID := uuid.New()
+	deletedAt := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
+	oldToken := uuid.New()
+
+	store.AddDeletedUser(orgID, userID, "alice@test.com", deletedAt)
+	if acquired, err := store.AcquireUserHardDeleteLock(userID, oldToken); err != nil || !acquired {
+		t.Fatalf("seed user hard-delete lock acquired=%v err=%v", acquired, err)
+	}
+	store.mu.Lock()
+	lock := store.userHardDeleteLocks[userID]
+	lock.Heartbeat = time.Now().Add(-hardDeleteLockStaleAfter - time.Minute)
+	store.userHardDeleteLocks[userID] = lock
+	store.mu.Unlock()
+	if err := store.EnqueueItem(orgID, deletedAt, ItemUserCascade, userID.String(), uuid.Nil, "", 0); err != nil {
+		t.Fatalf("enqueue user cascade failed: %v", err)
+	}
+
+	n, err := w.ProcessOnce(context.Background())
+	if err != nil {
+		t.Fatalf("ProcessOnce failed: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("expected stale-lease cascade to complete, got %d", n)
+	}
+	if store.HasUser(orgID, userID) {
+		t.Fatal("user should be hard-deleted after stale lease recovery")
 	}
 }
 
@@ -946,13 +1102,16 @@ func TestWorker_ProcessUserCascade_DryRun(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ProcessOnce failed: %v", err)
 	}
-	if n != 1 {
-		t.Errorf("expected 1 processed, got %d", n)
+	if n != 0 {
+		t.Errorf("expected 0 processed in dry run, got %d", n)
 	}
 
 	// User should still exist (dry run)
 	if !store.HasUser(orgID, userID) {
 		t.Error("user should still exist in dry run mode")
+	}
+	if got := len(store.QueueItems(orgID)); got != 1 {
+		t.Fatalf("dry run should leave user cascade queued, got %d items", got)
 	}
 }
 
@@ -974,13 +1133,16 @@ func TestWorker_ProcessLibraryCascade_DryRun(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ProcessOnce failed: %v", err)
 	}
-	if n != 1 {
-		t.Errorf("expected 1 processed, got %d", n)
+	if n != 0 {
+		t.Errorf("expected 0 completed in dry run, got %d", n)
 	}
 
 	// Library should still exist (dry run)
 	if _, err := store.GetLibraryStorageClass(orgID, libID); err != nil {
 		t.Error("library should still exist in dry run mode")
+	}
+	if got := len(store.QueueItems(orgID)); got != 1 {
+		t.Fatalf("dry run should leave library cascade queued, got %d items", got)
 	}
 }
 
@@ -1000,13 +1162,16 @@ func TestWorker_ProcessOrgCascade_DryRun(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ProcessOnce failed: %v", err)
 	}
-	if n != 1 {
-		t.Errorf("expected 1 processed, got %d", n)
+	if n != 0 {
+		t.Errorf("expected 0 completed in dry run, got %d", n)
 	}
 
 	// Org should still exist (dry run)
 	if !store.HasOrg(orgID) {
 		t.Error("org should still exist in dry run mode")
+	}
+	if got := len(store.QueueItems(orgID)); got != 1 {
+		t.Fatalf("dry run should leave org cascade queued, got %d items", got)
 	}
 }
 
@@ -1327,7 +1492,8 @@ func TestWorker_ProcessLibraryCascade_ChildrenContinueAfterHardDeleteWithStaleLo
 		t.Fatal("library should be hard-deleted after successful cascade")
 	}
 
-	acquired, err := store.AcquireLibraryHardDeleteLock(libID)
+	leaseToken := uuid.New()
+	acquired, err := store.AcquireLibraryHardDeleteLock(libID, leaseToken)
 	if err != nil {
 		t.Fatalf("AcquireLibraryHardDeleteLock after hard delete failed: %v", err)
 	}
@@ -1596,14 +1762,15 @@ func TestStore_HardDeleteOrg_DoesNotEnterPurgingWhenChildrenRemain(t *testing.T)
 	if !store.HasUser(orgID, userID) {
 		t.Fatal("live user should remain after failed wrapper hard delete")
 	}
-	acquired, err := store.AcquireOrgHardDeleteLock(orgID)
+	leaseToken := uuid.New()
+	acquired, err := store.AcquireOrgHardDeleteLock(orgID, leaseToken)
 	if err != nil {
 		t.Fatalf("reacquire org lock: %v", err)
 	}
 	if !acquired {
 		t.Fatal("org hard-delete lock should be released after failed wrapper hard delete")
 	}
-	if err := store.ReleaseOrgHardDeleteLock(orgID); err != nil {
+	if err := store.ReleaseOrgHardDeleteLock(orgID, leaseToken); err != nil {
 		t.Fatalf("release reacquired org lock: %v", err)
 	}
 }
@@ -1651,14 +1818,15 @@ func TestWorker_ProcessOrgCascade_RestoreBetweenChecksSkipsDelete(t *testing.T) 
 	if len(store.AuditLogEntries()) != 0 {
 		t.Fatal("org cascade audit should not be written when restore wins the race")
 	}
-	acquired, err := store.AcquireOrgHardDeleteLock(orgID)
+	leaseToken := uuid.New()
+	acquired, err := store.AcquireOrgHardDeleteLock(orgID, leaseToken)
 	if err != nil {
 		t.Fatalf("reacquire org lock: %v", err)
 	}
 	if !acquired {
 		t.Fatal("org hard-delete lock should be released after stale skip")
 	}
-	if err := store.ReleaseOrgHardDeleteLock(orgID); err != nil {
+	if err := store.ReleaseOrgHardDeleteLock(orgID, leaseToken); err != nil {
 		t.Fatalf("release reacquired org lock: %v", err)
 	}
 }

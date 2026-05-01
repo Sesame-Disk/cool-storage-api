@@ -593,10 +593,18 @@ func (s *Scanner) scanAutoDeleteExpiredObjects(ctx context.Context) (int, error)
 
 		// Walk filesystem trees of all keepCommits to build keepFSSet (iterative)
 		keepFSSet := make(map[string]bool)
+		keepSetIncomplete := false
 		for commitID := range keepCommits {
 			if c, ok := commitMap[commitID]; ok && c.RootFSID != "" {
-				s.walkFSTree(lib.LibraryID, c.RootFSID, keepFSSet)
+				if err := s.walkFSTree(lib.LibraryID, c.RootFSID, keepFSSet); err != nil {
+					log.Printf("[GC Scanner] Phase 6: skipping auto-delete for library %s after keep-tree read failure at commit %s root %s: %v", lib.LibraryID, commitID, c.RootFSID, err)
+					keepSetIncomplete = true
+					break
+				}
 			}
+		}
+		if keepSetIncomplete {
+			continue
 		}
 
 		// List all fs_object IDs for this library and enqueue orphans
@@ -945,9 +953,9 @@ func (s *Scanner) scanS3OrphanRecovery(ctx context.Context) (int, error) {
 // walkFSTree iteratively walks a filesystem tree starting from fsID,
 // adding all visited fs_ids to the visited set. Uses an explicit stack
 // instead of recursion to avoid stack overflow on deep directory trees.
-func (s *Scanner) walkFSTree(libraryID uuid.UUID, fsID string, visited map[string]bool) {
+func (s *Scanner) walkFSTree(libraryID uuid.UUID, fsID string, visited map[string]bool) error {
 	if fsID == "" || visited[fsID] {
-		return
+		return nil
 	}
 
 	stack := []string{fsID}
@@ -963,7 +971,7 @@ func (s *Scanner) walkFSTree(libraryID uuid.UUID, fsID string, visited map[strin
 
 		obj, err := s.store.GetFSObject(libraryID, current)
 		if err != nil {
-			continue
+			return fmt.Errorf("load fs_object %s for library %s: %w", current, libraryID, err)
 		}
 
 		// Push children
@@ -973,4 +981,6 @@ func (s *Scanner) walkFSTree(libraryID uuid.UUID, fsID string, visited map[strin
 			}
 		}
 	}
+
+	return nil
 }

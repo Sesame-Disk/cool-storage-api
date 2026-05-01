@@ -2,6 +2,7 @@ package gc
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"testing"
 	"time"
@@ -1079,8 +1080,10 @@ func TestScanner_ScanAutoDeleteExpiredObjects_DoesNotCrossSuppressAcrossLibrarie
 
 	now := time.Now()
 	store.AddCommitWithDetails(libPending, "head-pending", "fs-root-pending", "", now)
+	store.AddFSObjectWithEntries(libPending, "fs-root-pending", "dir", nil, nil)
 	store.AddFSObject(libPending, "shared-fs", "file", []string{"blk-pending"})
 	store.AddCommitWithDetails(libExpired, "head-expired", "fs-root-expired", "", now)
+	store.AddFSObjectWithEntries(libExpired, "fs-root-expired", "dir", nil, nil)
 	store.AddFSObject(libExpired, "shared-fs", "file", []string{"blk-expired"})
 	if err := store.EnqueueItem(orgID, now.Add(-2*time.Hour).UTC().Truncate(time.Millisecond), ItemFSObject, "shared-fs", libPending, "", 0); err != nil {
 		t.Fatalf("failed to seed pending fs_object: %v", err)
@@ -1272,6 +1275,37 @@ func TestScanner_ScanAutoDeleteExpiredObjects_NestedDirs(t *testing.T) {
 		if enqueuedIDs[treeID] {
 			t.Errorf("tree object %s should not be enqueued", treeID)
 		}
+	}
+}
+
+func TestScanner_ScanAutoDeleteExpiredObjects_SkipsLibraryOnKeepTreeReadFailure(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	s := NewScanner(store, q, stats, config.GCConfig{})
+
+	orgID := uuid.New()
+	libID := uuid.New()
+	store.AddOrganization(orgID)
+	store.AddLibraryWithAutoDelete(orgID, libID, "hot", "commit-head", 1)
+
+	now := time.Now()
+	store.AddCommitWithDetails(libID, "commit-head", "fs-root", "", now)
+	store.AddFSObjectWithEntries(libID, "fs-root", "dir", nil, []string{"fs-live-subdir"})
+	store.AddFSObjectWithEntries(libID, "fs-live-subdir", "dir", nil, []string{"fs-live-file"})
+	store.AddFSObject(libID, "fs-live-file", "file", []string{"blk-live"})
+	store.AddFSObject(libID, "fs-orphan", "file", []string{"blk-orphan"})
+	store.SetGetFSObjectError(libID, "fs-live-subdir", errors.New("transient read failure"))
+
+	n, err := s.scanAutoDeleteExpiredObjects(context.Background())
+	if err != nil {
+		t.Fatalf("scanAutoDeleteExpiredObjects failed: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("expected 0 fs_objects enqueued after keep-tree read failure, got %d", n)
+	}
+	if got := len(store.QueueItems(orgID)); got != 0 {
+		t.Fatalf("expected library auto-delete to fail closed, got %d queued items", got)
 	}
 }
 

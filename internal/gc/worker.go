@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"sync"
 	"time"
 
 	"github.com/Sesame-Disk/sesamefs/internal/metrics"
@@ -21,12 +22,40 @@ type libraryHardDeleteInProgressError struct {
 	ItemID    string
 }
 
+type hardDeleteInProgressError struct {
+	Kind   string
+	Target string
+	ItemID string
+}
+
+type fsObjectDecrementAmbiguousError struct {
+	LibraryID uuid.UUID
+	ItemID    string
+	TaskID    uuid.UUID
+}
+
 func (e libraryHardDeleteInProgressError) Error() string {
 	return fmt.Sprintf("library %s hard delete already in progress for child %s", e.LibraryID, e.ItemID)
 }
 
 func (e libraryHardDeleteInProgressError) FailureCode() string {
 	return GCFailureCodeLibraryHardDeleteInProgress
+}
+
+func (e hardDeleteInProgressError) Error() string {
+	return fmt.Sprintf("%s %s hard delete already in progress for item %s", e.Kind, e.Target, e.ItemID)
+}
+
+func (e hardDeleteInProgressError) FailureCode() string {
+	return GCFailureCodeLibraryHardDeleteInProgress
+}
+
+func (e fsObjectDecrementAmbiguousError) Error() string {
+	return fmt.Sprintf("fs_object %s/%s decrement state already claimed by task %s; leaving object for recovery", e.LibraryID, e.ItemID, e.TaskID)
+}
+
+func (e fsObjectDecrementAmbiguousError) FailureCode() string {
+	return GCFailureCodeFSObjectDecrementAmbiguous
 }
 
 func failureCodeForError(err error) string {
@@ -37,6 +66,10 @@ func failureCodeForError(err error) string {
 	return GCFailureCodeNone
 }
 
+func isHardDeleteInProgressError(err error) bool {
+	return failureCodeForError(err) == GCFailureCodeLibraryHardDeleteInProgress
+}
+
 // s3DeleteRetryDelays is the backoff schedule used when S3 DeleteBlock fails.
 // Total in-worker wait budget: 100 + 500 + 2000 = 2.6s across 3 retries.
 // Exposed as a var so tests can shorten it.
@@ -44,6 +77,75 @@ var s3DeleteRetryDelays = []time.Duration{
 	100 * time.Millisecond,
 	500 * time.Millisecond,
 	2 * time.Second,
+}
+
+var hardDeleteLockHeartbeatInterval = 30 * time.Minute
+var hardDeleteLockStaleAfter = 3 * hardDeleteLockHeartbeatInterval
+
+type hardDeleteLease struct {
+	stopCh  chan struct{}
+	release func() error
+
+	mu         sync.Mutex
+	err        error
+	closeOnce  sync.Once
+	closedChan chan struct{}
+}
+
+func newHardDeleteLease(ctx context.Context, kind, target string, renew func() (bool, error), release func() error) *hardDeleteLease {
+	lease := &hardDeleteLease{
+		stopCh:     make(chan struct{}),
+		release:    release,
+		closedChan: make(chan struct{}),
+	}
+	go func() {
+		defer close(lease.closedChan)
+		ticker := time.NewTicker(hardDeleteLockHeartbeatInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-lease.stopCh:
+				return
+			case <-ticker.C:
+				applied, err := renew()
+				if err != nil {
+					lease.setErr(fmt.Errorf("renew %s hard-delete lock for %s: %w", kind, target, err))
+					return
+				}
+				if !applied {
+					lease.setErr(fmt.Errorf("%s hard-delete lock for %s lost during cascade", kind, target))
+					return
+				}
+			}
+		}
+	}()
+	return lease
+}
+
+func (l *hardDeleteLease) setErr(err error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.err == nil {
+		l.err = err
+	}
+}
+
+func (l *hardDeleteLease) Check() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.err
+}
+
+func (l *hardDeleteLease) Close() {
+	l.closeOnce.Do(func() {
+		close(l.stopCh)
+		<-l.closedChan
+		if err := l.release(); err != nil {
+			l.setErr(err)
+		}
+	})
 }
 
 // Worker drains the gc_queue and deletes items from S3 and the database.
@@ -119,6 +221,14 @@ func (w *Worker) processOrg(ctx context.Context, orgID uuid.UUID) (int, error) {
 				item.OrgID, item.ItemID, item.ItemType, err)
 			metrics.GCErrorsTotal.WithLabelValues(string(item.ItemType)).Inc()
 
+			if isHardDeleteInProgressError(err) {
+				if postponeErr := w.postponeItem(item); postponeErr != nil {
+					log.Printf("[GC Worker] Failed to postpone lock-contended item %s/%s without retry increment: %v",
+						item.OrgID, item.ItemID, postponeErr)
+				}
+				continue
+			}
+
 			// Requeue transient failures, but move retry-capped items into the DLQ
 			// so they stop polluting the live queue forever. If the requeue itself
 			// reports an error, do NOT blindly escalate to the DLQ: RequeueItem is
@@ -159,6 +269,10 @@ func (w *Worker) processOrg(ctx context.Context, orgID uuid.UUID) (int, error) {
 			continue
 		}
 
+		if w.dryRun {
+			continue
+		}
+
 		// Remove from queue
 		if err := w.queue.Complete(item.OrgID, item.QueuedAt, item.ItemType, item.ItemID); err != nil {
 			log.Printf("[GC Worker] Failed to complete item %s/%s: %v",
@@ -192,6 +306,21 @@ func (w *Worker) processOrg(ctx context.Context, orgID uuid.UUID) (int, error) {
 	}
 
 	return processed, nil
+}
+
+func (w *Worker) postponeItem(item QueueItem) error {
+	return w.store.RequeueItem(
+		item.OrgID,
+		item.QueuedAt,
+		w.clock(),
+		item.ItemType,
+		item.ItemID,
+		item.LibraryID,
+		item.StorageClass,
+		item.RetryCount,
+		effectiveIdentityAt(item.QueuedAt, item.IdentityAt),
+		item.RequiresLibraryDeletedCheck,
+	)
 }
 
 func (w *Worker) processItem(ctx context.Context, item QueueItem) error {
@@ -393,16 +522,6 @@ func (w *Worker) RecoverS3Orphans(ctx context.Context, perOrgLimit int) (int, er
 }
 
 func (w *Worker) processCommit(item QueueItem) error {
-	identityAt := effectiveIdentityAt(item.QueuedAt, item.IdentityAt)
-	releaseGuard, stale, err := w.acquireLibraryDeleteGuard(item)
-	if err != nil {
-		return err
-	}
-	if stale {
-		return nil
-	}
-	defer releaseGuard()
-
 	// Get the commit to find its root_fs_id for cascading deletion
 	commit, err := w.store.GetCommit(item.LibraryID, item.ItemID)
 	if err != nil {
@@ -415,6 +534,16 @@ func (w *Worker) processCommit(item QueueItem) error {
 		log.Printf("[GC Worker] DRY RUN: Would delete commit %s from library %s", item.ItemID, item.LibraryID)
 		return nil
 	}
+
+	identityAt := effectiveIdentityAt(item.QueuedAt, item.IdentityAt)
+	releaseGuard, stale, err := w.acquireLibraryDeleteGuard(item)
+	if err != nil {
+		return err
+	}
+	if stale {
+		return nil
+	}
+	defer releaseGuard()
 
 	// Enqueue the root fs_object for cascading deletion (fs_object → blocks).
 	// Use parent's QueuedAt so cascade children skip the grace period.
@@ -451,6 +580,19 @@ func (w *Worker) processCommit(item QueueItem) error {
 }
 
 func (w *Worker) processFSObject(ctx context.Context, item QueueItem) error {
+	// Get the fs_object to find its block_ids
+	fsObj, err := w.store.GetFSObject(item.LibraryID, item.ItemID)
+	if err != nil {
+		// Already deleted
+		log.Printf("[GC Worker] FS object %s not found (may already be deleted)", item.ItemID)
+		return nil
+	}
+
+	if w.dryRun {
+		log.Printf("[GC Worker] DRY RUN: Would delete fs_object %s from library %s", item.ItemID, item.LibraryID)
+		return nil
+	}
+
 	identityAt := effectiveIdentityAt(item.QueuedAt, item.IdentityAt)
 	releaseGuard, stale, err := w.acquireLibraryDeleteGuard(item)
 	if err != nil {
@@ -460,14 +602,6 @@ func (w *Worker) processFSObject(ctx context.Context, item QueueItem) error {
 		return nil
 	}
 	defer releaseGuard()
-
-	// Get the fs_object to find its block_ids
-	fsObj, err := w.store.GetFSObject(item.LibraryID, item.ItemID)
-	if err != nil {
-		// Already deleted
-		log.Printf("[GC Worker] FS object %s not found (may already be deleted)", item.ItemID)
-		return nil
-	}
 
 	// If it's a directory, enqueue child fs_objects for recursive deletion.
 	// Use parent's QueuedAt so cascade children skip the grace period.
@@ -522,13 +656,15 @@ func (w *Worker) processFSObject(ctx context.Context, item QueueItem) error {
 				}
 			}
 		} else {
-			log.Printf("[GC Worker] Skipping decrement for %s (already processed task %s)", item.ItemID, taskID)
+			complete, err := w.fsObjectDecrementAlreadyReflected(item.OrgID, fsObj.BlockIDs)
+			if err != nil {
+				return fmt.Errorf("failed to verify prior decrement for fs_object %s: %w", item.ItemID, err)
+			}
+			if !complete {
+				return fsObjectDecrementAmbiguousError{LibraryID: item.LibraryID, ItemID: item.ItemID, TaskID: taskID}
+			}
+			log.Printf("[GC Worker] Prior decrement for %s is already reflected in block refcounts", item.ItemID)
 		}
-	}
-
-	if w.dryRun {
-		log.Printf("[GC Worker] DRY RUN: Would delete fs_object %s from library %s", item.ItemID, item.LibraryID)
-		return nil
 	}
 
 	// Delete the fs_object
@@ -635,14 +771,20 @@ func (w *Worker) processUserCascade(ctx context.Context, item QueueItem) error {
 
 	// Acquire a short-lived lock so a concurrent activateUser (restore) cannot
 	// race between the stale-check above and the final HardDeleteUser write.
-	acquired, err := w.store.AcquireUserHardDeleteLock(userID)
+	leaseToken := uuid.New()
+	acquired, err := w.store.AcquireUserHardDeleteLock(userID, leaseToken)
 	if err != nil {
 		return fmt.Errorf("failed to acquire user hard-delete lock for %s: %w", item.ItemID, err)
 	}
 	if !acquired {
-		return fmt.Errorf("user %s hard delete already in progress", item.ItemID)
+		return hardDeleteInProgressError{Kind: "user", Target: userID.String(), ItemID: item.ItemID}
 	}
-	defer w.store.ReleaseUserHardDeleteLock(userID)
+	lease := newHardDeleteLease(ctx, "user", userID.String(), func() (bool, error) {
+		return w.store.RenewUserHardDeleteLock(userID, leaseToken)
+	}, func() error {
+		return w.store.ReleaseUserHardDeleteLock(userID, leaseToken)
+	})
+	defer lease.Close()
 
 	// Secondary stale-check after the lock: if the user was restored in the
 	// window between the first stale-check and the lock acquisition, skip.
@@ -653,6 +795,9 @@ func (w *Worker) processUserCascade(ctx context.Context, item QueueItem) error {
 	if deletedAt2 == nil || !deletedAt2.Equal(identityAt) {
 		log.Printf("[GC Worker] Skipping user cascade for %s after lock: restored between checks (deleted_at=%v identity_at=%v)", item.ItemID, deletedAt2, identityAt)
 		return nil
+	}
+	if err := lease.Check(); err != nil {
+		return err
 	}
 
 	// Get user email before deletion (needed for users_by_email cleanup)
@@ -665,10 +810,16 @@ func (w *Worker) processUserCascade(ctx context.Context, item QueueItem) error {
 	if err != nil {
 		return fmt.Errorf("failed to soft-delete libraries owned by user %s: %w", item.ItemID, err)
 	}
+	if err := lease.Check(); err != nil {
+		return err
+	}
 
 	groupCount, shareCount, err := w.cleanupUserArtifacts(item.OrgID, userID)
 	if err != nil {
 		return fmt.Errorf("failed to clean up artifacts for user %s: %w", item.ItemID, err)
+	}
+	if err := lease.Check(); err != nil {
+		return err
 	}
 
 	// 5. Hard-delete user record + email lookup
@@ -799,14 +950,20 @@ func (w *Worker) processLibraryCascade(ctx context.Context, item QueueItem) erro
 		return nil
 	}
 
-	acquired, err := w.store.AcquireLibraryHardDeleteLock(libraryID)
+	leaseToken := uuid.New()
+	acquired, err := w.store.AcquireLibraryHardDeleteLock(libraryID, leaseToken)
 	if err != nil {
 		return fmt.Errorf("failed to acquire library hard-delete lock for %s: %w", item.ItemID, err)
 	}
 	if !acquired {
-		return fmt.Errorf("library %s hard delete already in progress", item.ItemID)
+		return hardDeleteInProgressError{Kind: "library", Target: libraryID.String(), ItemID: item.ItemID}
 	}
-	defer w.store.ReleaseLibraryHardDeleteLock(libraryID) //nolint:errcheck
+	lease := newHardDeleteLease(ctx, "library", libraryID.String(), func() (bool, error) {
+		return w.store.RenewLibraryHardDeleteLock(libraryID, leaseToken)
+	}, func() error {
+		return w.store.ReleaseLibraryHardDeleteLock(libraryID, leaseToken)
+	})
+	defer lease.Close()
 
 	// Second stale-check after acquiring the lock.
 	deletedAt2, err := w.store.GetLibraryDeletedAt(libraryID)
@@ -817,8 +974,14 @@ func (w *Worker) processLibraryCascade(ctx context.Context, item QueueItem) erro
 		log.Printf("[GC Worker] Skipping stale library cascade for %s after lock (current deleted_at=%v identity_at=%v queued_at=%v)", item.ItemID, deletedAt2, identityAt, item.QueuedAt)
 		return nil
 	}
+	if err := lease.Check(); err != nil {
+		return err
+	}
 
-	return w.cascadeDeleteLibrary(item.OrgID, libraryID, item.StorageClass, identityAt)
+	if err := w.cascadeDeleteLibrary(item.OrgID, libraryID, item.StorageClass, identityAt); err != nil {
+		return err
+	}
+	return lease.Check()
 }
 
 func (w *Worker) cascadeDeleteLibrary(orgID, libraryID uuid.UUID, storageClass string, libraryDeletedAt time.Time) error {
@@ -875,14 +1038,20 @@ func (w *Worker) processOrgCascade(ctx context.Context, item QueueItem) error {
 		return nil
 	}
 
-	acquired, err := w.store.AcquireOrgHardDeleteLock(orgID)
+	leaseToken := uuid.New()
+	acquired, err := w.store.AcquireOrgHardDeleteLock(orgID, leaseToken)
 	if err != nil {
 		return fmt.Errorf("failed to acquire org hard-delete lock for %s: %w", item.ItemID, err)
 	}
 	if !acquired {
-		return fmt.Errorf("org %s hard delete already in progress", item.ItemID)
+		return hardDeleteInProgressError{Kind: "org", Target: orgID.String(), ItemID: item.ItemID}
 	}
-	defer w.store.ReleaseOrgHardDeleteLock(orgID)
+	lease := newHardDeleteLease(ctx, "org", orgID.String(), func() (bool, error) {
+		return w.store.RenewOrgHardDeleteLock(orgID, leaseToken)
+	}, func() error {
+		return w.store.ReleaseOrgHardDeleteLock(orgID, leaseToken)
+	})
+	defer lease.Close()
 
 	// Secondary stale-check after the lock: if the org was restored in the
 	// window between the first stale-check and the lock acquisition, skip.
@@ -893,6 +1062,9 @@ func (w *Worker) processOrgCascade(ctx context.Context, item QueueItem) error {
 	if deletedAt2 == nil || !deletedAt2.Equal(identityAt) {
 		log.Printf("[GC Worker] Skipping org cascade for %s after lock: restored between checks (deleted_at=%v identity_at=%v)", item.ItemID, deletedAt2, identityAt)
 		return nil
+	}
+	if err := lease.Check(); err != nil {
+		return err
 	}
 
 	purging, err := w.store.BeginOrgPurge(orgID, identityAt)
@@ -914,6 +1086,9 @@ func (w *Worker) processOrgCascade(ctx context.Context, item QueueItem) error {
 		return fmt.Errorf("failed to list libraries for org %s: %w", item.ItemID, err)
 	}
 	for _, lib := range libs {
+		if err := lease.Check(); err != nil {
+			return err
+		}
 		libraryDeletedAt := lib.DeletedAt
 		if lib.DeletedAt.IsZero() {
 			if err := w.store.SoftDeleteLibrary(orgID, lib.LibraryID, uuid.Nil); err != nil {
@@ -931,6 +1106,9 @@ func (w *Worker) processOrgCascade(ctx context.Context, item QueueItem) error {
 		if err := w.cascadeDeleteLibrary(orgID, lib.LibraryID, lib.StorageClass, libraryDeletedAt); err != nil {
 			return fmt.Errorf("failed to cascade-delete library %s during org delete: %w", lib.LibraryID, err)
 		}
+		if err := lease.Check(); err != nil {
+			return err
+		}
 	}
 
 	users, err := w.store.ListUsersByOrg(orgID)
@@ -938,11 +1116,17 @@ func (w *Worker) processOrgCascade(ctx context.Context, item QueueItem) error {
 		return fmt.Errorf("failed to list users for org %s: %w", item.ItemID, err)
 	}
 	for _, u := range users {
+		if err := lease.Check(); err != nil {
+			return err
+		}
 		if _, _, err := w.cleanupUserArtifacts(orgID, u.UserID); err != nil {
 			return fmt.Errorf("failed to clean up user %s during org cascade: %w", u.UserID, err)
 		}
 		if err := w.store.HardDeleteUser(orgID, u.UserID, u.Email); err != nil {
 			return fmt.Errorf("failed to hard-delete user %s during org cascade: %w", u.UserID, err)
+		}
+		if err := lease.Check(); err != nil {
+			return err
 		}
 	}
 
@@ -951,9 +1135,18 @@ func (w *Worker) processOrgCascade(ctx context.Context, item QueueItem) error {
 		return fmt.Errorf("failed to list groups for org %s: %w", item.ItemID, err)
 	}
 	for _, gid := range groupIDs {
+		if err := lease.Check(); err != nil {
+			return err
+		}
 		if err := w.store.DeleteGroupFull(orgID, gid); err != nil {
 			return fmt.Errorf("failed to delete group %s during org cascade: %w", gid, err)
 		}
+		if err := lease.Check(); err != nil {
+			return err
+		}
+	}
+	if err := lease.Check(); err != nil {
+		return err
 	}
 
 	if err := w.store.HardDeleteOrgLocked(orgID); err != nil {
@@ -994,6 +1187,23 @@ func (w *Worker) decrementAndFindZeroRef(orgID uuid.UUID, blockIDs []string) []s
 		}
 	}
 	return zeroRef
+}
+
+func (w *Worker) fsObjectDecrementAlreadyReflected(orgID uuid.UUID, blockIDs []string) (bool, error) {
+	resolvedBlockIDs, err := w.store.ResolveBlockIDs(orgID, blockIDs)
+	if err != nil {
+		return false, err
+	}
+	for _, blockID := range resolvedBlockIDs {
+		refCount, err := w.store.GetBlockRefCount(orgID, blockID)
+		if err != nil {
+			return false, err
+		}
+		if refCount > 0 {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 func (w *Worker) enqueueZeroRefBlocks(orgID, libraryID uuid.UUID, blockIDs []string, storageClass string) error {
@@ -1139,7 +1349,8 @@ func (w *Worker) acquireLibraryDeleteGuard(item QueueItem) (func(), bool, error)
 		return func() {}, false, nil
 	}
 
-	acquired, err := w.store.AcquireLibraryHardDeleteLock(item.LibraryID)
+	leaseToken := uuid.New()
+	acquired, err := w.store.AcquireLibraryHardDeleteLock(item.LibraryID, leaseToken)
 	if err != nil {
 		return nil, false, fmt.Errorf("failed to acquire library hard-delete lock for child %s/%s: %w", item.LibraryID, item.ItemID, err)
 	}
@@ -1148,7 +1359,7 @@ func (w *Worker) acquireLibraryDeleteGuard(item QueueItem) (func(), bool, error)
 	}
 
 	release := func() {
-		_ = w.store.ReleaseLibraryHardDeleteLock(item.LibraryID)
+		_ = w.store.ReleaseLibraryHardDeleteLock(item.LibraryID, leaseToken)
 	}
 
 	deletedAt2, err := w.store.GetLibraryDeletedAt(item.LibraryID)
