@@ -116,6 +116,7 @@ const (
 	gcAutoRetryFailedOrgLimit    = 20
 	gcAutoRetryFailedItemLimit   = 100
 	gcSnapshotDriftCheckEvery    = 10
+	gcActiveOrgRecoveryEvery     = 10
 )
 
 var ErrNotLeader = errors.New("gc leadership required")
@@ -158,6 +159,7 @@ type Service struct {
 	// consecutiveErrors is only accessed from the workerLoop goroutine
 	// (via runWorkerOnce). If this changes, protect with s.mu.
 	consecutiveErrors int
+	workerPasses      uint64
 
 	// Channels for manual triggers
 	triggerWorker  chan struct{}
@@ -457,9 +459,10 @@ func (s *Service) runWorkerOnce(ctx context.Context) {
 	}
 
 	queueBefore := s.loadStatInt(gcStatKeyTotalQueue)
-	if queueBefore > 0 {
+	if queueBefore > 0 && s.workerPasses%gcActiveOrgRecoveryEvery == 0 {
 		s.recoverMissingActiveQueueOrgs()
 	}
+	s.workerPasses++
 
 	start := time.Now()
 	n, err := s.worker.ProcessOnce(ctx)
