@@ -22,6 +22,8 @@ type MockStore struct {
 	pendingItems map[mockPendingItemKey]*time.Time
 	// active queue orgs keyed by orgID
 	activeQueueOrgs map[uuid.UUID]time.Time
+	// when true, ListOrgsWithQueuedItems simulates Cassandra's gc_active_orgs-backed listing.
+	useActiveQueueOrgsForListing bool
 	// dirty queue orgs keyed by orgID
 	dirtyQueueOrgs map[uuid.UUID]time.Time
 	// reconciled org-level queue stats keyed by orgID
@@ -1120,10 +1122,34 @@ func (m *MockStore) ListOrgsWithQueuedItems() ([]uuid.UUID, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
+	if m.useActiveQueueOrgsForListing {
+		orgs := make([]uuid.UUID, 0, len(m.activeQueueOrgs))
+		for orgID := range m.activeQueueOrgs {
+			orgs = append(orgs, orgID)
+		}
+		return orgs, nil
+	}
+
 	var orgs []uuid.UUID
 	for orgID, items := range m.queue {
 		if len(items) > 0 {
 			orgs = append(orgs, orgID)
+		}
+	}
+	return orgs, nil
+}
+
+func (m *MockStore) ListOrgsWithQueuedSnapshots(limit int) ([]uuid.UUID, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	orgs := make([]uuid.UUID, 0)
+	for orgID, stats := range m.orgQueueStats {
+		if stats.QueueDepth <= 0 {
+			continue
+		}
+		orgs = append(orgs, orgID)
+		if limit > 0 && len(orgs) >= limit {
+			break
 		}
 	}
 	return orgs, nil

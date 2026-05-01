@@ -604,6 +604,26 @@ func (s *CassandraStore) ListOrgsWithQueuedItems() ([]uuid.UUID, error) {
 	return orgs, nil
 }
 
+func (s *CassandraStore) ListOrgsWithQueuedSnapshots(limit int) ([]uuid.UUID, error) {
+	iter := s.db.Session().Query(`SELECT org_id, queue_depth FROM gc_org_stats`).Iter()
+	orgs := make([]uuid.UUID, 0)
+	var orgIDStr string
+	var queueDepth int
+	for iter.Scan(&orgIDStr, &queueDepth) {
+		if queueDepth <= 0 {
+			continue
+		}
+		orgs = append(orgs, parseUUID(orgIDStr))
+		if limit > 0 && len(orgs) >= limit {
+			break
+		}
+	}
+	if err := iter.Close(); err != nil {
+		return nil, fmt.Errorf("list orgs with queued snapshots: %w", err)
+	}
+	return orgs, nil
+}
+
 func (s *CassandraStore) MarkOrgActive(orgID uuid.UUID, activeAt time.Time) error {
 	return s.db.Session().Query(`
 		INSERT INTO gc_active_orgs (bucket, org_id, last_enqueued_at)

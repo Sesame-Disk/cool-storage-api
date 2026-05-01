@@ -582,6 +582,33 @@ func TestService_ReconcileDirtyQueueStats_SerializesRuns(t *testing.T) {
 	}
 }
 
+func TestService_RunWorkerOnce_RecoversQueuedOrgsFromSnapshotWhenActiveSetIsMissing(t *testing.T) {
+	store := NewMockStore()
+	store.useActiveQueueOrgsForListing = true
+	orgID := uuid.New()
+	queuedAt := time.Now().UTC().Add(-2 * time.Hour)
+	store.AddBlock(orgID, "stuck-block", "hot", 0)
+	if err := store.EnqueueItem(orgID, queuedAt, ItemBlock, "stuck-block", uuid.Nil, "hot", 0); err != nil {
+		t.Fatalf("enqueue stuck item: %v", err)
+	}
+	delete(store.activeQueueOrgs, orgID)
+	store.orgQueueStats[orgID] = GCOrgStats{OrgID: orgID, QueueDepth: 1, UpdatedAt: queuedAt}
+	store.gcStats[gcStatKeyTotalQueue] = "1"
+
+	svc := NewService(store, nil, config.GCConfig{Enabled: true, BatchSize: 100}, nil)
+	svc.runWorkerOnce(context.Background())
+
+	if got := len(store.QueueItems(orgID)); got != 0 {
+		t.Fatalf("remaining queue items = %d, want 0", got)
+	}
+	if store.GetBlock(orgID, "stuck-block") != nil {
+		t.Fatal("expected recovered worker pass to delete the queued block")
+	}
+	if status := svc.Status(); status.QueueSize != 0 {
+		t.Fatalf("status.QueueSize = %d, want 0 after recovery drained the queue", status.QueueSize)
+	}
+}
+
 // TestService_Status_SnapshotAgeSentinelWhenNeverReconciled verifies the
 // reporter distinguishes "no reconcile yet" (-1) from "reconciled 0s ago" (0).
 // Without the sentinel, dashboards would show fresh data on a cold deploy.

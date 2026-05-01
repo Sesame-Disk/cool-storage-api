@@ -457,6 +457,9 @@ func (s *Service) runWorkerOnce(ctx context.Context) {
 	}
 
 	queueBefore := s.loadStatInt(gcStatKeyTotalQueue)
+	if queueBefore > 0 {
+		s.recoverMissingActiveQueueOrgs()
+	}
 
 	start := time.Now()
 	n, err := s.worker.ProcessOnce(ctx)
@@ -487,6 +490,46 @@ func (s *Service) runWorkerOnce(ctx context.Context) {
 
 	if n > 0 {
 		log.Printf("[GC Worker] Processed %d items", n)
+	}
+}
+
+func (s *Service) recoverMissingActiveQueueOrgs() {
+	snapshotOrgs, err := s.store.ListOrgsWithQueuedSnapshots(0)
+	if err != nil {
+		log.Printf("[GC] Failed to list queued snapshots for active-set recovery: %v", err)
+		return
+	}
+	if len(snapshotOrgs) == 0 {
+		return
+	}
+
+	activeOrgs, err := s.store.ListOrgsWithQueuedItems()
+	if err != nil {
+		log.Printf("[GC] Failed to list active queued orgs for recovery: %v", err)
+		return
+	}
+	activeSet := make(map[uuid.UUID]struct{}, len(activeOrgs))
+	for _, orgID := range activeOrgs {
+		activeSet[orgID] = struct{}{}
+	}
+
+	now := time.Now().UTC()
+	recovered := 0
+	for _, orgID := range snapshotOrgs {
+		if _, ok := activeSet[orgID]; ok {
+			continue
+		}
+		if err := s.store.MarkOrgActive(orgID, now); err != nil {
+			log.Printf("[GC] Failed to re-mark org %s active from queued snapshot: %v", orgID, err)
+			continue
+		}
+		if err := s.store.MarkOrgDirty(orgID, now); err != nil {
+			log.Printf("[GC] Failed to mark org %s dirty during active-set recovery: %v", orgID, err)
+		}
+		recovered++
+	}
+	if recovered > 0 {
+		log.Printf("[GC] Recovered %d queued org(s) into active set from gc_org_stats", recovered)
 	}
 }
 

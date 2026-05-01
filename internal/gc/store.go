@@ -32,6 +32,7 @@ type GCStore interface {
 	GetTotalQueueSize() (int, error)
 	GetTotalFailedItems() (int, error)
 	ListOrgsWithQueuedItems() ([]uuid.UUID, error)
+	ListOrgsWithQueuedSnapshots(limit int) ([]uuid.UUID, error)
 	ListOrgsWithFailedItems(limit int) ([]GCFailedItemOrgInfo, error)
 	ListFailedItems(orgID uuid.UUID, limit int) ([]GCFailedItemInfo, error)
 	DeleteFailedItem(orgID uuid.UUID, failedAt time.Time, itemType ItemType, itemID string) error

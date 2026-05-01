@@ -170,11 +170,15 @@ func (w *Worker) processOrg(ctx context.Context, orgID uuid.UUID) (int, error) {
 	}
 
 	if len(items) < w.batchSize {
-		// A short batch strongly suggests this org drained for the current worker
-		// pass. Avoid a full-partition gc_queue read here; reconcile will correct
-		// the active set if a concurrent enqueue or a grace-blocked row still exists.
-		if activeErr := w.store.RemoveOrgFromActiveSet(orgID, activeBefore); activeErr != nil {
-			log.Printf("[GC Worker] Failed to remove org %s from active set: %v", orgID, activeErr)
+		oldestQueuedAt, oldestErr := w.store.GetOldestQueuedAt(orgID)
+		if oldestErr != nil {
+			log.Printf("[GC Worker] Failed to inspect remaining queue state for org %s: %v", orgID, oldestErr)
+			return processed, nil
+		}
+		if oldestQueuedAt == nil {
+			if activeErr := w.store.RemoveOrgFromActiveSet(orgID, activeBefore); activeErr != nil {
+				log.Printf("[GC Worker] Failed to remove org %s from active set: %v", orgID, activeErr)
+			}
 		}
 	}
 

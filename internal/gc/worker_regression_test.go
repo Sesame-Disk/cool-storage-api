@@ -426,6 +426,40 @@ func TestWorker_ProcessOrg_RemovesStaleActiveOrgWhenQueueEmpty(t *testing.T) {
 	}
 }
 
+func TestWorker_ProcessOrg_KeepsActiveOrgWhenOnlyGraceBlockedItemsRemain(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	w := NewWorker(store, nil, q, 100, time.Hour, false, stats)
+
+	orgID := uuid.New()
+	base := time.Now().UTC()
+	queuedAt := base.Add(-30 * time.Second)
+	store.MarkOrgActive(orgID, base.Add(-2*time.Second))
+	w.clock = func() time.Time {
+		return base
+	}
+
+	if err := store.EnqueueItem(orgID, queuedAt, ItemBlock, "grace-blocked", uuid.Nil, "hot", 0); err != nil {
+		t.Fatalf("enqueue grace-blocked item: %v", err)
+	}
+
+	processed, err := w.processOrg(context.Background(), orgID)
+	if err != nil {
+		t.Fatalf("processOrg failed: %v", err)
+	}
+	if processed != 0 {
+		t.Fatalf("processed = %d, want 0", processed)
+	}
+	if !store.IsOrgActive(orgID) {
+		t.Fatal("expected org to remain active while queued items are still within grace period")
+	}
+	items := store.QueueItems(orgID)
+	if len(items) != 1 || items[0].ItemID != "grace-blocked" {
+		t.Fatalf("expected grace-blocked item to remain queued, got %#v", items)
+	}
+}
+
 // TestWorker_StorageLeak_LWTSkipsLiveBlock is a regression test that ensures
 // the LWT guard prevents a block from being deleted from S3 when its ref_count
 // is still > 0 at the moment the GC tries to process it.
