@@ -11,6 +11,32 @@ import (
 	"github.com/google/uuid"
 )
 
+type gcFailureCoder interface {
+	error
+	FailureCode() string
+}
+
+type libraryHardDeleteInProgressError struct {
+	LibraryID uuid.UUID
+	ItemID    string
+}
+
+func (e libraryHardDeleteInProgressError) Error() string {
+	return fmt.Sprintf("library %s hard delete already in progress for child %s", e.LibraryID, e.ItemID)
+}
+
+func (e libraryHardDeleteInProgressError) FailureCode() string {
+	return GCFailureCodeLibraryHardDeleteInProgress
+}
+
+func failureCodeForError(err error) string {
+	var coded gcFailureCoder
+	if errors.As(err, &coded) {
+		return coded.FailureCode()
+	}
+	return GCFailureCodeNone
+}
+
 // s3DeleteRetryDelays is the backoff schedule used when S3 DeleteBlock fails.
 // Total in-worker wait budget: 100 + 500 + 2000 = 2.6s across 3 retries.
 // Exposed as a var so tests can shorten it.
@@ -121,12 +147,12 @@ func (w *Worker) processOrg(ctx context.Context, orgID uuid.UUID) (int, error) {
 						continue
 					}
 					escalation := fmt.Sprintf("requeue failed (%v) after processing error: %v", incErr, err)
-					if failErr := w.store.FailItem(item, w.clock(), escalation); failErr != nil {
+					if failErr := w.store.FailItem(item, w.clock(), escalation, failureCodeForError(err)); failErr != nil {
 						log.Printf("[GC Worker] Failed to escalate item %s/%s to DLQ after requeue failure: %v", item.OrgID, item.ItemID, failErr)
 					}
 				}
 			} else {
-				if failErr := w.store.FailItem(item, w.clock(), err.Error()); failErr != nil {
+				if failErr := w.store.FailItem(item, w.clock(), err.Error(), failureCodeForError(err)); failErr != nil {
 					log.Printf("[GC Worker] Failed to move retry-capped item %s/%s to DLQ: %v", item.OrgID, item.ItemID, failErr)
 				}
 			}
@@ -1105,7 +1131,7 @@ func (w *Worker) acquireLibraryDeleteGuard(item QueueItem) (func(), bool, error)
 		return nil, false, fmt.Errorf("failed to acquire library hard-delete lock for child %s/%s: %w", item.LibraryID, item.ItemID, err)
 	}
 	if !acquired {
-		return nil, false, fmt.Errorf("library %s hard delete already in progress for child %s", item.LibraryID, item.ItemID)
+		return nil, false, libraryHardDeleteInProgressError{LibraryID: item.LibraryID, ItemID: item.ItemID}
 	}
 
 	release := func() {

@@ -11,6 +11,11 @@ const gcFailedItemRetentionTTLSeconds = 30 * 24 * 60 * 60
 
 var gcFailedItemRetention = time.Duration(gcFailedItemRetentionTTLSeconds) * time.Second
 
+const (
+	GCFailureCodeNone                        = ""
+	GCFailureCodeLibraryHardDeleteInProgress = "library_hard_delete_in_progress"
+)
+
 // GCStore abstracts all database operations used by the GC system.
 // This allows unit tests to use an in-memory mock instead of Cassandra.
 type GCStore interface {
@@ -22,7 +27,7 @@ type GCStore interface {
 	DequeueBatch(orgID uuid.UUID, batchSize int, cutoff time.Time) ([]QueueItem, error)
 	CompleteItem(orgID uuid.UUID, queuedAt time.Time, itemType ItemType, itemID string) error
 	RequeueItem(orgID uuid.UUID, oldQueuedAt, newQueuedAt time.Time, itemType ItemType, itemID string, libraryID uuid.UUID, storageClass string, newRetryCount int, identityAt time.Time, requiresLibraryDeletedCheck bool) error
-	FailItem(item QueueItem, failedAt time.Time, lastError string) error
+	FailItem(item QueueItem, failedAt time.Time, lastError, failureCode string) error
 	GetQueueSize(orgID uuid.UUID) (int, error)
 	GetTotalQueueSize() (int, error)
 	GetTotalFailedItems() (int, error)
@@ -288,6 +293,7 @@ type GCFailedItemInfo struct {
 	StorageClass                string
 	RetryCount                  int
 	LastError                   string
+	FailureCode                 string
 	ResolvedAt                  *time.Time
 	ResolvedState               string
 }

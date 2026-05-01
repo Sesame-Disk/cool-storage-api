@@ -70,6 +70,32 @@ func (h *LibraryHandler) resolveOwnerEmail(orgID, userID string) string {
 	return email
 }
 
+func (h *LibraryHandler) ownerHasActiveLibraryNamed(orgID, ownerID, libraryName string) (bool, error) {
+	iter := h.db.Session().Query(`
+		SELECT owner_id, name, deleted_at FROM libraries WHERE org_id = ?
+	`, orgID).Iter()
+
+	var existingOwnerID, existingName string
+	var existingDeletedAt time.Time
+	for iter.Scan(&existingOwnerID, &existingName, &existingDeletedAt) {
+		if !existingDeletedAt.IsZero() {
+			existingDeletedAt = time.Time{}
+			continue
+		}
+		if existingOwnerID == ownerID && existingName == libraryName {
+			if err := iter.Close(); err != nil {
+				return false, err
+			}
+			return true, nil
+		}
+		existingDeletedAt = time.Time{}
+	}
+	if err := iter.Close(); err != nil {
+		return false, err
+	}
+	return false, nil
+}
+
 // RegisterLibraryRoutes registers library routes
 func RegisterLibraryRoutes(rg *gin.RouterGroup, database *db.DB, cfg *config.Config) {
 	RegisterLibraryRoutesWithToken(rg, database, cfg, nil)
@@ -505,7 +531,12 @@ func (h *LibraryHandler) CreateLibrary(c *gin.Context) {
 			return
 		}
 		if enforcement.Profile.Limits.MaxLibraries > 0 {
-			count := CountActiveLibraries(h.db, orgID)
+			count, err := CountActiveLibraries(h.db, orgID)
+			if err != nil {
+				log.Printf("[CreateLibrary] Failed to count active libraries for org %q: %v", orgID, err)
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to validate library limit"})
+				return
+			}
 			if count >= enforcement.Profile.Limits.MaxLibraries {
 				c.JSON(http.StatusForbidden, gin.H{
 					"error":   "Library limit reached",
@@ -517,23 +548,17 @@ func (h *LibraryHandler) CreateLibrary(c *gin.Context) {
 		}
 	}
 
-	// Check if a library with this name already exists for this user.
-	// Use the owner-scoped read model instead of scanning the canonical table.
-	ownerRows, err := db.ListAdminOwnerLibraryRows(h.db.Session(), orgID, userID)
+	// Check if a library with this name already exists for this user using the
+	// canonical libraries rows as the source of truth.
+	hasDuplicate, err := h.ownerHasActiveLibraryNamed(orgID, userID, req.Name)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to check existing libraries"})
 		return
 	}
-	for _, row := range ownerRows {
-		if row.DeletedAt != nil && !row.DeletedAt.IsZero() {
-			continue
-		}
-		log.Printf("[CreateLibrary] Found existing library: %q (comparing with %q)", row.Name, req.Name)
-		if row.Name == req.Name {
-			log.Printf("[CreateLibrary] Conflict: library with name %q already exists", req.Name)
-			c.JSON(http.StatusConflict, gin.H{"error": "a library with this name already exists"})
-			return
-		}
+	if hasDuplicate {
+		log.Printf("[CreateLibrary] Conflict: library with name %q already exists", req.Name)
+		c.JSON(http.StatusConflict, gin.H{"error": "a library with this name already exists"})
+		return
 	}
 
 	orgUUID, _ := uuid.Parse(orgID)

@@ -7,7 +7,6 @@ import (
 	"log"
 	"sort"
 	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -594,7 +593,7 @@ func (s *Service) isAutoRecoverableFailedItem(item GCFailedItemInfo) (bool, erro
 	if item.LibraryID == uuid.Nil {
 		return false, nil
 	}
-	if !strings.Contains(item.LastError, "hard delete already in progress") {
+	if item.FailureCode != GCFailureCodeLibraryHardDeleteInProgress {
 		return false, nil
 	}
 

@@ -1759,7 +1759,7 @@ func TestScanner_ScanExpiredDeletedLibraries_ExpiredFailedMarkerDoesNotSuppressF
 	if err := store.EnqueueBatch([]QueueItem{failedItem}); err != nil {
 		t.Fatalf("failed to seed queue item: %v", err)
 	}
-	if err := store.FailItem(failedItem, failedAt, "old failure"); err != nil {
+	if err := store.FailItem(failedItem, failedAt, "old failure", GCFailureCodeNone); err != nil {
 		t.Fatalf("FailItem failed: %v", err)
 	}
 

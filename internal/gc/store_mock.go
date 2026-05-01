@@ -930,7 +930,7 @@ func (m *MockStore) RequeueItem(orgID uuid.UUID, oldQueuedAt, newQueuedAt time.T
 	return nil
 }
 
-func (m *MockStore) FailItem(item QueueItem, failedAt time.Time, lastError string) error {
+func (m *MockStore) FailItem(item QueueItem, failedAt time.Time, lastError, failureCode string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -953,6 +953,7 @@ func (m *MockStore) FailItem(item QueueItem, failedAt time.Time, lastError strin
 		StorageClass:                item.StorageClass,
 		RetryCount:                  item.RetryCount,
 		LastError:                   lastError,
+		FailureCode:                 failureCode,
 	})
 	expiresAt := failedAt.Add(gcFailedItemRetention)
 	m.upsertPendingItem(item.OrgID, item.LibraryID, item.ItemType, item.ItemID, effectiveIdentityAt(item.QueuedAt, item.IdentityAt), &expiresAt)

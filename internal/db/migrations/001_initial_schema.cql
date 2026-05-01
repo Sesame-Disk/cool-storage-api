@@ -971,6 +971,7 @@ CREATE TABLE IF NOT EXISTS gc_failed_items (
     storage_class     TEXT,
     retry_count       INT,
     last_error        TEXT,
+    failure_code      TEXT,
     resolution_status TEXT,
     resolved_at       TIMESTAMP,
     PRIMARY KEY ((org_id), failed_at, item_type, item_id)

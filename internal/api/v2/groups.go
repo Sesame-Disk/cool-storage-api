@@ -902,7 +902,11 @@ func (h *GroupHandler) CreateGroupOwnedLibrary(c *gin.Context) {
 			return
 		}
 		if enforcement.Profile.Limits.MaxLibraries > 0 {
-			count := CountActiveLibraries(h.db, orgID)
+			count, err := CountActiveLibraries(h.db, orgID)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to validate library limit"})
+				return
+			}
 			if count >= enforcement.Profile.Limits.MaxLibraries {
 				c.JSON(http.StatusForbidden, gin.H{
 					"error":   "Library limit reached",

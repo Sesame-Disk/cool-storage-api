@@ -427,6 +427,7 @@ func TestService_RunScannerOnce_SkipsAutoRetryWithoutLeadership(t *testing.T) {
 		ItemID:                      itemID,
 		LibraryID:                   libID,
 		LastError:                   "library " + libID.String() + " hard delete already in progress for child " + itemID,
+		FailureCode:                 GCFailureCodeLibraryHardDeleteInProgress,
 		ResolvedState:               "open",
 	}}
 
@@ -874,6 +875,7 @@ func TestService_RetryAutoRecoverableFailedItems_RequeuesMissingLibraryChildren(
 		StorageClass:                "hot",
 		RetryCount:                  5,
 		LastError:                   "library " + libID.String() + " hard delete already in progress for child " + itemID,
+		FailureCode:                 GCFailureCodeLibraryHardDeleteInProgress,
 		ResolvedState:               "open",
 	}}
 
