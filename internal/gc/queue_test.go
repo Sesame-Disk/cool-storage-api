@@ -1,6 +1,7 @@
 package gc
 
 import (
+	"fmt"
 	"testing"
 	"time"
 
@@ -211,6 +212,26 @@ func TestQueue_IncrementRetry_PreservesIdentityAtForCascadeItems(t *testing.T) {
 	}
 	if !requeued[0].IdentityAt.Equal(originalQueuedAt) {
 		t.Errorf("cascade retry IdentityAt = %v, want %v", requeued[0].IdentityAt, originalQueuedAt)
+	}
+}
+
+func TestGCQueueBucket_DeterministicAndDistributedByIdentity(t *testing.T) {
+	orgID := uuid.New()
+	first := gcQueueBucket(orgID, ItemBlock, "block-1")
+	second := gcQueueBucket(orgID, ItemBlock, "block-1")
+	if first != second {
+		t.Fatalf("bucket changed for same queue identity: %d != %d", first, second)
+	}
+	if first < 0 || first >= gcDefaultQueueBucketCount {
+		t.Fatalf("bucket = %d, want [0,%d)", first, gcDefaultQueueBucketCount)
+	}
+
+	buckets := make(map[int]struct{})
+	for i := 0; i < 128; i++ {
+		buckets[gcQueueBucket(orgID, ItemBlock, fmt.Sprintf("block-%d", i))] = struct{}{}
+	}
+	if len(buckets) < gcDefaultQueueBucketCount/2 {
+		t.Fatalf("expected queue identities to spread across buckets, got %d distinct buckets", len(buckets))
 	}
 }
 

@@ -925,6 +925,7 @@ CREATE TABLE IF NOT EXISTS repo_tag_file_counts (
 -- DLQ transfer. Ordered ASC for worker FIFO processing.
 CREATE TABLE IF NOT EXISTS gc_queue (
     org_id        UUID,
+    bucket        INT,
     queued_at     TIMESTAMP,
     identity_at   TIMESTAMP,
     requires_library_deleted_check BOOLEAN,
@@ -933,7 +934,7 @@ CREATE TABLE IF NOT EXISTS gc_queue (
     library_id    UUID,
     storage_class TEXT,
     retry_count   INT,
-    PRIMARY KEY ((org_id), queued_at, item_type, item_id)
+    PRIMARY KEY ((org_id, bucket), queued_at, item_type, item_id)
 ) WITH default_time_to_live = 0
   AND CLUSTERING ORDER BY (queued_at ASC);
 

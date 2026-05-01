@@ -79,6 +79,7 @@ func NewCassandraStore(database *db.DB) *CassandraStore {
 const maxBatchSize = 50
 
 const gcDefaultOrgBucketCount = 32
+const gcDefaultQueueBucketCount = 32
 
 const (
 	gcStatsKeyTotalQueue  = "total_queue_depth"
@@ -89,6 +90,16 @@ func gcOrgBucket(orgID uuid.UUID) int {
 	h := fnv.New32a()
 	_, _ = h.Write(orgID[:])
 	return int(h.Sum32() % gcDefaultOrgBucketCount)
+}
+
+func gcQueueBucket(orgID uuid.UUID, itemType ItemType, itemID string) int {
+	h := fnv.New32a()
+	_, _ = h.Write(orgID[:])
+	_, _ = h.Write([]byte{0})
+	_, _ = h.Write([]byte(itemType))
+	_, _ = h.Write([]byte{0})
+	_, _ = h.Write([]byte(itemID))
+	return int(h.Sum32() % gcDefaultQueueBucketCount)
 }
 
 func (s *CassandraStore) loadGCStatInt(key string) (int, bool, error) {
@@ -116,11 +127,12 @@ func (s *CassandraStore) loadGCStatInt(key string) (int, bool, error) {
 
 func (s *CassandraStore) EnqueueItem(orgID uuid.UUID, queuedAt time.Time, itemType ItemType, itemID string, libraryID uuid.UUID, storageClass string, retryCount int) error {
 	now := time.Now().UTC()
+	queueBucket := gcQueueBucket(orgID, itemType, itemID)
 	batch := s.db.Session().Batch(gocql.LoggedBatch)
 	batch.Query(`
-		INSERT INTO gc_queue (org_id, queued_at, identity_at, requires_library_deleted_check, item_type, item_id, library_id, storage_class, retry_count)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, orgID.String(), queuedAt, queuedAt, false, string(itemType), itemID, libraryID.String(), storageClass, retryCount)
+		INSERT INTO gc_queue (org_id, bucket, queued_at, identity_at, requires_library_deleted_check, item_type, item_id, library_id, storage_class, retry_count)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, orgID.String(), queueBucket, queuedAt, queuedAt, false, string(itemType), itemID, libraryID.String(), storageClass, retryCount)
 	addPendingItemBatchQuery(batch, orgID, libraryID, itemType, itemID, queuedAt)
 	batch.Query(`
 		INSERT INTO gc_active_orgs (bucket, org_id, last_enqueued_at)
@@ -150,10 +162,11 @@ func (s *CassandraStore) EnqueueBatch(items []QueueItem) error {
 		activeAtByOrg := make(map[string]time.Time)
 		for _, item := range chunk {
 			identityAt := effectiveIdentityAt(item.QueuedAt, item.IdentityAt)
+			queueBucket := gcQueueBucket(item.OrgID, item.ItemType, item.ItemID)
 			batch.Query(`
-				INSERT INTO gc_queue (org_id, queued_at, identity_at, requires_library_deleted_check, item_type, item_id, library_id, storage_class, retry_count)
-				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-			`, item.OrgID.String(), item.QueuedAt, identityAt, item.RequiresLibraryDeletedCheck, string(item.ItemType), item.ItemID, item.LibraryID.String(), item.StorageClass, item.RetryCount)
+				INSERT INTO gc_queue (org_id, bucket, queued_at, identity_at, requires_library_deleted_check, item_type, item_id, library_id, storage_class, retry_count)
+				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			`, item.OrgID.String(), queueBucket, item.QueuedAt, identityAt, item.RequiresLibraryDeletedCheck, string(item.ItemType), item.ItemID, item.LibraryID.String(), item.StorageClass, item.RetryCount)
 			addPendingItemBatchQuery(batch, item.OrgID, item.LibraryID, item.ItemType, item.ItemID, identityAt)
 			activeAtByOrg[item.OrgID.String()] = time.Now().UTC()
 		}
@@ -179,8 +192,8 @@ func (s *CassandraStore) QueueItemExists(orgID uuid.UUID, queuedAt time.Time, it
 	var existingItemID string
 	err := s.db.Session().Query(`
 		SELECT item_id FROM gc_queue
-		WHERE org_id = ? AND queued_at = ? AND item_type = ? AND item_id = ?
-	`, orgID.String(), queuedAt, string(itemType), itemID).Scan(&existingItemID)
+		WHERE org_id = ? AND bucket = ? AND queued_at = ? AND item_type = ? AND item_id = ?
+	`, orgID.String(), gcQueueBucket(orgID, itemType, itemID), queuedAt, string(itemType), itemID).Scan(&existingItemID)
 	if err != nil {
 		if errors.Is(err, gocql.ErrNotFound) {
 			return false, nil
@@ -238,8 +251,8 @@ func (s *CassandraStore) queueItemPendingInfo(orgID uuid.UUID, queuedAt time.Tim
 	var libraryIDStr string
 	err := s.db.Session().Query(`
 		SELECT identity_at, library_id FROM gc_queue
-		WHERE org_id = ? AND queued_at = ? AND item_type = ? AND item_id = ?
-	`, orgID.String(), queuedAt, string(itemType), itemID).Scan(&identityAt, &libraryIDStr)
+		WHERE org_id = ? AND bucket = ? AND queued_at = ? AND item_type = ? AND item_id = ?
+	`, orgID.String(), gcQueueBucket(orgID, itemType, itemID), queuedAt, string(itemType), itemID).Scan(&identityAt, &libraryIDStr)
 	if err != nil {
 		return time.Time{}, uuid.Nil, err
 	}
@@ -260,36 +273,54 @@ func (s *CassandraStore) failedItemPendingInfo(orgID uuid.UUID, failedAt time.Ti
 }
 
 func (s *CassandraStore) DequeueBatch(orgID uuid.UUID, batchSize int, cutoff time.Time) ([]QueueItem, error) {
-	iter := s.db.Session().Query(`
-		SELECT org_id, queued_at, identity_at, requires_library_deleted_check, item_type, item_id, library_id, storage_class, retry_count
-		FROM gc_queue
-		WHERE org_id = ? AND queued_at < ?
-		LIMIT ?
-	`, orgID.String(), cutoff, batchSize).Iter()
-
-	var items []QueueItem
-	var orgIDStr, itemTypeStr, itemID, libIDStr, storageClass string
-	var queuedAt, identityAt time.Time
-	var requiresLibraryDeletedCheck bool
-	var retryCount int
-
-	for iter.Scan(&orgIDStr, &queuedAt, &identityAt, &requiresLibraryDeletedCheck, &itemTypeStr, &itemID,
-		&libIDStr, &storageClass, &retryCount) {
-		items = append(items, QueueItem{
-			OrgID:                       parseUUID(orgIDStr),
-			QueuedAt:                    queuedAt,
-			IdentityAt:                  effectiveIdentityAt(queuedAt, identityAt),
-			RequiresLibraryDeletedCheck: requiresLibraryDeletedCheck,
-			ItemType:                    ItemType(itemTypeStr),
-			ItemID:                      itemID,
-			LibraryID:                   parseUUID(libIDStr),
-			StorageClass:                storageClass,
-			RetryCount:                  retryCount,
-		})
+	if batchSize <= 0 {
+		return nil, nil
 	}
 
-	if err := iter.Close(); err != nil {
-		return nil, fmt.Errorf("failed to dequeue batch: %w", err)
+	var items []QueueItem
+	for bucket := 0; bucket < gcDefaultQueueBucketCount; bucket++ {
+		iter := s.db.Session().Query(`
+			SELECT org_id, queued_at, identity_at, requires_library_deleted_check, item_type, item_id, library_id, storage_class, retry_count
+			FROM gc_queue
+			WHERE org_id = ? AND bucket = ? AND queued_at < ?
+			LIMIT ?
+		`, orgID.String(), bucket, cutoff, batchSize).Iter()
+
+		var orgIDStr, itemTypeStr, itemID, libIDStr, storageClass string
+		var queuedAt, identityAt time.Time
+		var requiresLibraryDeletedCheck bool
+		var retryCount int
+
+		for iter.Scan(&orgIDStr, &queuedAt, &identityAt, &requiresLibraryDeletedCheck, &itemTypeStr, &itemID,
+			&libIDStr, &storageClass, &retryCount) {
+			items = append(items, QueueItem{
+				OrgID:                       parseUUID(orgIDStr),
+				QueuedAt:                    queuedAt,
+				IdentityAt:                  effectiveIdentityAt(queuedAt, identityAt),
+				RequiresLibraryDeletedCheck: requiresLibraryDeletedCheck,
+				ItemType:                    ItemType(itemTypeStr),
+				ItemID:                      itemID,
+				LibraryID:                   parseUUID(libIDStr),
+				StorageClass:                storageClass,
+				RetryCount:                  retryCount,
+			})
+		}
+
+		if err := iter.Close(); err != nil {
+			return nil, fmt.Errorf("failed to dequeue batch from bucket %d: %w", bucket, err)
+		}
+	}
+	sort.Slice(items, func(i, j int) bool {
+		if items[i].QueuedAt.Equal(items[j].QueuedAt) {
+			if items[i].ItemType == items[j].ItemType {
+				return items[i].ItemID < items[j].ItemID
+			}
+			return items[i].ItemType < items[j].ItemType
+		}
+		return items[i].QueuedAt.Before(items[j].QueuedAt)
+	})
+	if batchSize > 0 && len(items) > batchSize {
+		items = items[:batchSize]
 	}
 	return items, nil
 }
@@ -302,8 +333,8 @@ func (s *CassandraStore) CompleteItem(orgID uuid.UUID, queuedAt time.Time, itemT
 	batch := s.db.Session().Batch(gocql.LoggedBatch)
 	batch.Query(`
 		DELETE FROM gc_queue
-		WHERE org_id = ? AND queued_at = ? AND item_type = ? AND item_id = ?
-	`, orgID.String(), queuedAt, string(itemType), itemID)
+		WHERE org_id = ? AND bucket = ? AND queued_at = ? AND item_type = ? AND item_id = ?
+	`, orgID.String(), gcQueueBucket(orgID, itemType, itemID), queuedAt, string(itemType), itemID)
 	addPendingItemDeleteBatchQuery(batch, orgID, libraryID, itemType, itemID, effectiveIdentityAt(queuedAt, identityAt))
 	batch.Query(`
 		INSERT INTO gc_dirty_orgs (bucket, org_id, marked_at)
@@ -320,14 +351,14 @@ func (s *CassandraStore) RequeueItem(orgID uuid.UUID, oldQueuedAt, newQueuedAt t
 	// Delete old item
 	batch.Query(`
 		DELETE FROM gc_queue
-		WHERE org_id = ? AND queued_at = ? AND item_type = ? AND item_id = ?
-	`, orgID.String(), oldQueuedAt, string(itemType), itemID)
+		WHERE org_id = ? AND bucket = ? AND queued_at = ? AND item_type = ? AND item_id = ?
+	`, orgID.String(), gcQueueBucket(orgID, itemType, itemID), oldQueuedAt, string(itemType), itemID)
 
 	// Insert new item at the end of the queue
 	batch.Query(`
-		INSERT INTO gc_queue (org_id, queued_at, identity_at, requires_library_deleted_check, item_type, item_id, library_id, storage_class, retry_count)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, orgID.String(), newQueuedAt, effectiveIdentityAt(oldQueuedAt, identityAt), requiresLibraryDeletedCheck, string(itemType), itemID, libraryID.String(), storageClass, newRetryCount)
+		INSERT INTO gc_queue (org_id, bucket, queued_at, identity_at, requires_library_deleted_check, item_type, item_id, library_id, storage_class, retry_count)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, orgID.String(), gcQueueBucket(orgID, itemType, itemID), newQueuedAt, effectiveIdentityAt(oldQueuedAt, identityAt), requiresLibraryDeletedCheck, string(itemType), itemID, libraryID.String(), storageClass, newRetryCount)
 	addPendingItemBatchQuery(batch, orgID, libraryID, itemType, itemID, effectiveIdentityAt(oldQueuedAt, identityAt))
 	batch.Query(`
 		INSERT INTO gc_active_orgs (bucket, org_id, last_enqueued_at)
@@ -351,8 +382,8 @@ func (s *CassandraStore) FailItem(item QueueItem, failedAt time.Time, lastError,
 	addPendingItemBatchQueryWithTTL(batch, item.OrgID, item.LibraryID, item.ItemType, item.ItemID, effectiveIdentityAt(item.QueuedAt, item.IdentityAt), gcFailedItemRetentionTTLSeconds)
 	batch.Query(`
 		DELETE FROM gc_queue
-		WHERE org_id = ? AND queued_at = ? AND item_type = ? AND item_id = ?
-	`, item.OrgID.String(), item.QueuedAt, string(item.ItemType), item.ItemID)
+		WHERE org_id = ? AND bucket = ? AND queued_at = ? AND item_type = ? AND item_id = ?
+	`, item.OrgID.String(), gcQueueBucket(item.OrgID, item.ItemType, item.ItemID), item.QueuedAt, string(item.ItemType), item.ItemID)
 	batch.Query(`
 		INSERT INTO gc_dirty_orgs (bucket, org_id, marked_at)
 		VALUES (?, ?, ?)
@@ -361,20 +392,23 @@ func (s *CassandraStore) FailItem(item QueueItem, failedAt time.Time, lastError,
 }
 
 func (s *CassandraStore) GetQueueSize(orgID uuid.UUID) (int, error) {
-	var count int64
-	err := s.db.Session().Query(`
-		SELECT COUNT(*) FROM gc_queue WHERE org_id = ?
-	`, orgID.String()).Scan(&count)
-	if err != nil {
-		if err == gocql.ErrNotFound {
-			return 0, nil
+	total := int64(0)
+	for bucket := 0; bucket < gcDefaultQueueBucketCount; bucket++ {
+		var count int64
+		err := s.db.Session().Query(`
+			SELECT COUNT(*) FROM gc_queue WHERE org_id = ? AND bucket = ?
+		`, orgID.String(), bucket).Scan(&count)
+		if err != nil {
+			if err == gocql.ErrNotFound {
+				continue
+			}
+			return 0, fmt.Errorf("failed to get queue size for bucket %d: %w", bucket, err)
 		}
-		return 0, fmt.Errorf("failed to get queue size: %w", err)
+		if count > 0 {
+			total += count
+		}
 	}
-	if count < 0 {
-		count = 0
-	}
-	return int(count), nil
+	return int(total), nil
 }
 
 func (s *CassandraStore) GetTotalQueueSize() (int, error) {
@@ -530,9 +564,9 @@ func (s *CassandraStore) RequeueFailedItem(orgID uuid.UUID, failedAt time.Time, 
 	}
 	batch := s.db.Session().Batch(gocql.LoggedBatch)
 	batch.Query(`
-		INSERT INTO gc_queue (org_id, queued_at, identity_at, requires_library_deleted_check, item_type, item_id, library_id, storage_class, retry_count)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, orgID.String(), queuedAt, effectiveIdentityAt(failedQueuedAt, identityAt), requiresLibraryDeletedCheck, string(itemType), itemID, libraryIDStr, storageClass, 0)
+		INSERT INTO gc_queue (org_id, bucket, queued_at, identity_at, requires_library_deleted_check, item_type, item_id, library_id, storage_class, retry_count)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, orgID.String(), gcQueueBucket(orgID, itemType, itemID), queuedAt, effectiveIdentityAt(failedQueuedAt, identityAt), requiresLibraryDeletedCheck, string(itemType), itemID, libraryIDStr, storageClass, 0)
 	addPendingItemBatchQuery(batch, orgID, parseUUID(libraryIDStr), itemType, itemID, effectiveIdentityAt(failedQueuedAt, identityAt))
 	batch.Query(`
 		DELETE FROM gc_failed_items
@@ -667,18 +701,21 @@ func (s *CassandraStore) SaveOrgQueueStats(stats GCOrgStats) error {
 }
 
 func (s *CassandraStore) RecountOrgQueueDepth(orgID uuid.UUID) (int, error) {
-	var count int64
-	err := s.db.Session().Query(`SELECT COUNT(*) FROM gc_queue WHERE org_id = ?`, orgID.String()).Scan(&count)
-	if err != nil {
-		if err == gocql.ErrNotFound {
-			return 0, nil
+	total := int64(0)
+	for bucket := 0; bucket < gcDefaultQueueBucketCount; bucket++ {
+		var count int64
+		err := s.db.Session().Query(`SELECT COUNT(*) FROM gc_queue WHERE org_id = ? AND bucket = ?`, orgID.String(), bucket).Scan(&count)
+		if err != nil {
+			if err == gocql.ErrNotFound {
+				continue
+			}
+			return 0, fmt.Errorf("recount queue depth for %s bucket %d: %w", orgID, bucket, err)
 		}
-		return 0, fmt.Errorf("recount queue depth for %s: %w", orgID, err)
+		if count > 0 {
+			total += count
+		}
 	}
-	if count < 0 {
-		count = 0
-	}
-	return int(count), nil
+	return int(total), nil
 }
 
 func (s *CassandraStore) RecountOrgFailedDepth(orgID uuid.UUID) (int, error) {
@@ -697,18 +734,24 @@ func (s *CassandraStore) RecountOrgFailedDepth(orgID uuid.UUID) (int, error) {
 }
 
 func (s *CassandraStore) GetOldestQueuedAt(orgID uuid.UUID) (*time.Time, error) {
-	var queuedAt time.Time
-	err := s.db.Session().Query(`
-		SELECT queued_at FROM gc_queue WHERE org_id = ? LIMIT 1
-	`, orgID.String()).Scan(&queuedAt)
-	if err != nil {
-		if err == gocql.ErrNotFound {
-			return nil, nil
+	var oldest *time.Time
+	for bucket := 0; bucket < gcDefaultQueueBucketCount; bucket++ {
+		var queuedAt time.Time
+		err := s.db.Session().Query(`
+			SELECT queued_at FROM gc_queue WHERE org_id = ? AND bucket = ? LIMIT 1
+		`, orgID.String(), bucket).Scan(&queuedAt)
+		if err != nil {
+			if err == gocql.ErrNotFound {
+				continue
+			}
+			return nil, fmt.Errorf("get oldest queued_at for %s bucket %d: %w", orgID, bucket, err)
 		}
-		return nil, fmt.Errorf("get oldest queued_at for %s: %w", orgID, err)
+		queuedAtCopy := queuedAt
+		if oldest == nil || queuedAtCopy.Before(*oldest) {
+			oldest = &queuedAtCopy
+		}
 	}
-	queuedAtCopy := queuedAt
-	return &queuedAtCopy, nil
+	return oldest, nil
 }
 
 func (s *CassandraStore) SumOrgQueueStats() (int, int, error) {
