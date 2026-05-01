@@ -596,6 +596,7 @@ func TestService_RunWorkerOnce_RecoversQueuedOrgsFromSnapshotWhenActiveSetIsMiss
 	store.gcStats[gcStatKeyTotalQueue] = "1"
 
 	svc := NewService(store, nil, config.GCConfig{Enabled: true, BatchSize: 100}, nil)
+	svc.workerPasses = 1
 	svc.runWorkerOnce(context.Background())
 
 	if got := len(store.QueueItems(orgID)); got != 0 {

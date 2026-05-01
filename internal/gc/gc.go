@@ -459,8 +459,8 @@ func (s *Service) runWorkerOnce(ctx context.Context) {
 	}
 
 	queueBefore := s.loadStatInt(gcStatKeyTotalQueue)
-	if queueBefore > 0 && s.workerPasses%gcActiveOrgRecoveryEvery == 0 {
-		s.recoverMissingActiveQueueOrgs()
+	if reason, ok := s.shouldRecoverMissingActiveQueueOrgs(queueBefore); ok {
+		s.recoverMissingActiveQueueOrgs(reason)
 	}
 	s.workerPasses++
 
@@ -496,7 +496,28 @@ func (s *Service) runWorkerOnce(ctx context.Context) {
 	}
 }
 
-func (s *Service) recoverMissingActiveQueueOrgs() {
+func (s *Service) shouldRecoverMissingActiveQueueOrgs(queueBefore int) (string, bool) {
+	if queueBefore <= 0 {
+		return "", false
+	}
+
+	activeOrgs, err := s.store.ListOrgsWithQueuedItems()
+	if err != nil {
+		log.Printf("[GC] Failed to list active queued orgs for recovery trigger: %v", err)
+		return "", false
+	}
+	if len(activeOrgs) == 0 {
+		metrics.GCActiveOrgRecoveryTriggersTotal.WithLabelValues("no_active_orgs").Inc()
+		return "no_active_orgs", true
+	}
+	if s.workerPasses%gcActiveOrgRecoveryEvery == 0 {
+		metrics.GCActiveOrgRecoveryTriggersTotal.WithLabelValues("periodic").Inc()
+		return "periodic", true
+	}
+	return "", false
+}
+
+func (s *Service) recoverMissingActiveQueueOrgs(reason string) {
 	snapshotOrgs, err := s.store.ListOrgsWithQueuedSnapshots(0)
 	if err != nil {
 		log.Printf("[GC] Failed to list queued snapshots for active-set recovery: %v", err)
@@ -532,7 +553,8 @@ func (s *Service) recoverMissingActiveQueueOrgs() {
 		recovered++
 	}
 	if recovered > 0 {
-		log.Printf("[GC] Recovered %d queued org(s) into active set from gc_org_stats", recovered)
+		metrics.GCActiveOrgRecoveriesTotal.WithLabelValues(reason).Add(float64(recovered))
+		log.Printf("[GC] Recovered %d queued org(s) into active set from gc_org_stats (reason=%s)", recovered, reason)
 	}
 }
 

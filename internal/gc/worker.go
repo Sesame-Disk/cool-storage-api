@@ -170,11 +170,13 @@ func (w *Worker) processOrg(ctx context.Context, orgID uuid.UUID) (int, error) {
 	}
 
 	if len(items) < w.batchSize {
-		stats, statsErr := w.store.GetOrgQueueStats(orgID)
-		if statsErr != nil {
-			log.Printf("[GC Worker] Failed to read queue snapshot for org %s: %v", orgID, statsErr)
-		} else if stats.QueueDepth > 0 {
-			return processed, nil
+		if len(items) > 0 {
+			stats, statsErr := w.store.GetOrgQueueStats(orgID)
+			if statsErr != nil {
+				log.Printf("[GC Worker] Failed to read queue snapshot for org %s: %v", orgID, statsErr)
+			} else if stats.QueueDepth > 0 {
+				return processed, nil
+			}
 		}
 
 		oldestQueuedAt, oldestErr := w.store.GetOldestQueuedAt(orgID)

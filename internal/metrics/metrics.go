@@ -193,6 +193,26 @@ var (
 		},
 	)
 
+	// GCActiveOrgRecoveryTriggersTotal counts how often the worker attempts to
+	// rebuild gc_active_orgs from gc_org_stats. Labelled by trigger source.
+	GCActiveOrgRecoveryTriggersTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "gc_active_org_recovery_triggers_total",
+			Help: "Total number of GC active-org recovery attempts triggered by the worker.",
+		},
+		[]string{"reason"},
+	)
+
+	// GCActiveOrgRecoveriesTotal counts how many org rows were actually restored
+	// into gc_active_orgs from queued snapshots. Labelled by trigger source.
+	GCActiveOrgRecoveriesTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "gc_active_org_recoveries_total",
+			Help: "Total number of GC active-org rows restored from queue snapshots.",
+		},
+		[]string{"reason"},
+	)
+
 	// GCWorkerLastSuccessTimestamp records when the worker last successfully processed items.
 	GCWorkerLastSuccessTimestamp = prometheus.NewGauge(
 		prometheus.GaugeOpts{
@@ -246,6 +266,8 @@ func Register() {
 		GCSnapshotAgeSeconds,
 		GCReconcileDuration,
 		GCSnapshotDriftCorrectedTotal,
+		GCActiveOrgRecoveryTriggersTotal,
+		GCActiveOrgRecoveriesTotal,
 		GCWorkerLastSuccessTimestamp,
 		GCAuditEventsTotal,
 		ChunkUploadTempOrphansCleaned,
