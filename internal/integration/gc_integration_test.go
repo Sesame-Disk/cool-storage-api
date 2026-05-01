@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	gcpkg "github.com/Sesame-Disk/sesamefs/internal/gc"
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
 	"github.com/google/uuid"
 )
@@ -824,6 +825,86 @@ func TestGC_StatusSnapshotReconcilesLiveQueueCount(t *testing.T) {
 	}
 	if snapshotAfter <= 0 {
 		t.Fatalf("expected total queue snapshot to stay positive after reconciliation")
+	}
+}
+
+// TestGC_DequeueBatchOrdersAcrossQueueBuckets verifies that the real Cassandra
+// store returns the globally oldest items even when queue rows live in
+// different gc_queue buckets.
+func TestGC_DequeueBatchOrdersAcrossQueueBuckets(t *testing.T) {
+	requireCassandra(t)
+
+	database := shareProjectionDBForTest(t)
+	session := database.Session()
+	store := gcpkg.NewCassandraStore(database)
+	orgID := uuid.New()
+	libraryID := uuid.New()
+	base := time.Now().Add(-5 * time.Minute).UTC().Truncate(time.Millisecond)
+
+	type queuedFixture struct {
+		itemID   string
+		queuedAt time.Time
+		bucket   int
+		itemType string
+	}
+
+	fixtures := make([]queuedFixture, 0, 4)
+	buckets := make(map[int]struct{})
+	for candidate := 0; len(fixtures) < 4 && candidate < 256; candidate++ {
+		itemID := fmt.Sprintf("cross-bucket-%d", candidate)
+		bucket := gcQueueBucketForTest(orgID, "block", itemID)
+		if _, exists := buckets[bucket]; exists && len(buckets) < 3 {
+			continue
+		}
+		buckets[bucket] = struct{}{}
+		fixtures = append(fixtures, queuedFixture{
+			itemID:   itemID,
+			queuedAt: base.Add(time.Duration(len(fixtures)) * time.Second),
+			bucket:   bucket,
+			itemType: "block",
+		})
+	}
+	if len(fixtures) != 4 || len(buckets) < 3 {
+		t.Fatalf("failed to build cross-bucket fixtures: items=%d buckets=%d", len(fixtures), len(buckets))
+	}
+
+	for _, fixture := range fixtures {
+		if err := session.Query(`
+			INSERT INTO gc_queue (
+				org_id, bucket, queued_at, identity_at, requires_library_deleted_check,
+				item_type, item_id, library_id, storage_class, retry_count
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`, orgID.String(), fixture.bucket, fixture.queuedAt, fixture.queuedAt, false, fixture.itemType, fixture.itemID, libraryID.String(), "hot", 0).Exec(); err != nil {
+			t.Fatalf("failed to insert gc_queue fixture %s: %v", fixture.itemID, err)
+		}
+	}
+	t.Cleanup(func() {
+		for _, fixture := range fixtures {
+			_ = session.Query(`
+				DELETE FROM gc_queue
+				WHERE org_id = ? AND bucket = ? AND queued_at = ? AND item_type = ? AND item_id = ?
+			`, orgID.String(), fixture.bucket, fixture.queuedAt, fixture.itemType, fixture.itemID).Exec()
+		}
+	})
+
+	items, err := store.DequeueBatch(orgID, 2, base.Add(30*time.Second))
+	if err != nil {
+		t.Fatalf("DequeueBatch failed: %v", err)
+	}
+	if len(items) != 2 {
+		t.Fatalf("expected 2 dequeued items, got %d", len(items))
+	}
+	if items[0].ItemID != fixtures[0].itemID || items[1].ItemID != fixtures[1].itemID {
+		t.Fatalf("unexpected dequeue order: got [%s %s], want [%s %s]", items[0].ItemID, items[1].ItemID, fixtures[0].itemID, fixtures[1].itemID)
+	}
+	if items[0].QueuedAt.After(items[1].QueuedAt) {
+		t.Fatalf("dequeue order not globally sorted: first=%s second=%s", items[0].QueuedAt.Format(time.RFC3339Nano), items[1].QueuedAt.Format(time.RFC3339Nano))
+	}
+	if items[0].IdentityAt.IsZero() || items[1].IdentityAt.IsZero() {
+		t.Fatal("expected identity_at to round-trip for dequeued items")
+	}
+	if fixtures[0].bucket == fixtures[1].bucket {
+		t.Fatalf("test fixtures did not span distinct leading buckets: %d", fixtures[0].bucket)
 	}
 }
 
