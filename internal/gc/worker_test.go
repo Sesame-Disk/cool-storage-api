@@ -124,6 +124,67 @@ func TestWorker_ProcessBlock_RefCountPositive(t *testing.T) {
 	}
 }
 
+func TestWorker_ProcessBlock_RefCountZeroButLiveFSObjectReferenceSkipsDelete(t *testing.T) {
+	store := NewMockStore()
+	sp := &MockStorageProvider{}
+	stats := &Stats{}
+	q := NewQueue(store)
+	w := NewWorker(store, sp, q, 100, 0, false, stats)
+
+	orgID := uuid.New()
+	libraryID := uuid.New()
+	store.AddLibrary(orgID, libraryID, "hot")
+	store.AddBlock(orgID, "partial-zero", "hot", 0)
+	store.AddBlock(orgID, "not-yet-decremented", "hot", 1)
+	store.AddFSObject(libraryID, "fs-partial", "file", []string{"partial-zero", "not-yet-decremented"})
+	store.EnqueueItem(orgID, time.Now().Add(-2*time.Hour), ItemBlock, "partial-zero", uuid.Nil, "hot", 0)
+
+	n, err := w.ProcessOnce(context.Background())
+	if err != nil {
+		t.Fatalf("ProcessOnce failed: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("expected 1 processed skip, got %d", n)
+	}
+	if store.GetBlock(orgID, "partial-zero") == nil {
+		t.Fatal("zero-ref block should remain while a live fs_object references it")
+	}
+	if deleted := sp.DeletedBlocks(); len(deleted) != 0 {
+		t.Fatalf("S3 should not be touched for live fs_object reference, got %v", deleted)
+	}
+}
+
+func TestWorker_ProcessBlock_LiveFSObjectReferenceViaMappedIDSkipsDelete(t *testing.T) {
+	store := NewMockStore()
+	sp := &MockStorageProvider{}
+	stats := &Stats{}
+	q := NewQueue(store)
+	w := NewWorker(store, sp, q, 100, 0, false, stats)
+
+	orgID := uuid.New()
+	libraryID := uuid.New()
+	store.AddLibrary(orgID, libraryID, "hot")
+	store.AddBlock(orgID, "internal-block", "hot", 0)
+	externalBlockID := "0123456789abcdef0123456789abcdef01234567"
+	store.AddBlockMapping(orgID, externalBlockID, "internal-block")
+	store.AddFSObject(libraryID, "fs-mapped", "file", []string{externalBlockID})
+	store.EnqueueItem(orgID, time.Now().Add(-2*time.Hour), ItemBlock, "internal-block", uuid.Nil, "hot", 0)
+
+	n, err := w.ProcessOnce(context.Background())
+	if err != nil {
+		t.Fatalf("ProcessOnce failed: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("expected 1 processed skip, got %d", n)
+	}
+	if store.GetBlock(orgID, "internal-block") == nil {
+		t.Fatal("mapped zero-ref block should remain while a live fs_object references it")
+	}
+	if deleted := sp.DeletedBlocks(); len(deleted) != 0 {
+		t.Fatalf("S3 should not be touched for mapped live fs_object reference, got %v", deleted)
+	}
+}
+
 func TestWorker_ProcessBlock_DryRun(t *testing.T) {
 	store := NewMockStore()
 	sp := &MockStorageProvider{}
@@ -561,6 +622,7 @@ func TestWorker_ProcessFSObject_RetryKeepsSingleBlockDecrement(t *testing.T) {
 
 	store.AddBlock(orgID, "blk-a", "hot", 2)
 	store.AddFSObject(libID, "fs-obj-1", "file", []string{"blk-a"})
+	store.AddFSObject(libID, "fs-other", "file", []string{"blk-a"})
 	store.AddLibrary(orgID, libID, "hot")
 
 	first := QueueItem{OrgID: orgID, QueuedAt: identityAt, IdentityAt: identityAt, ItemType: ItemFSObject, ItemID: "fs-obj-1", LibraryID: libID}
@@ -573,14 +635,96 @@ func TestWorker_ProcessFSObject_RetryKeepsSingleBlockDecrement(t *testing.T) {
 
 	store.AddFSObject(libID, "fs-obj-1", "file", []string{"blk-a"})
 	second := QueueItem{OrgID: orgID, QueuedAt: time.Now().UTC(), IdentityAt: identityAt, ItemType: ItemFSObject, ItemID: "fs-obj-1", LibraryID: libID}
-	if err := w.processFSObject(context.Background(), second); err == nil {
-		t.Fatal("expected ambiguous decrement marker to fail closed")
+	if err := w.processFSObject(context.Background(), second); err != nil {
+		t.Fatalf("retry processFSObject failed: %v", err)
 	}
 	if got := store.GetBlock(orgID, "blk-a").RefCount; got != 1 {
 		t.Fatalf("block ref_count after retry = %d, want 1", got)
 	}
-	if store.GetFSObj(libID, "fs-obj-1") == nil {
-		t.Fatal("fs_object should remain when decrement state is ambiguous")
+	if store.GetFSObj(libID, "fs-obj-1") != nil {
+		t.Fatal("fs_object should be deleted after per-block progress is replayed")
+	}
+}
+
+func TestWorker_ProcessFSObject_RetryCompletesPartialBlockProgress(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	w := NewWorker(store, nil, q, 100, 0, false, stats)
+
+	orgID := uuid.New()
+	libID := uuid.New()
+	identityAt := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
+
+	store.AddBlock(orgID, "blk-shared", "hot", 1)
+	store.AddBlock(orgID, "blk-last", "hot", 1)
+	store.AddFSObject(libID, "fs-obj-partial", "file", []string{"blk-shared", "blk-last"})
+	store.AddLibrary(orgID, libID, "hot")
+
+	firstBlockTaskID := fsObjectBlockDecrementTaskID(libID, "fs-obj-partial", identityAt, 0, "blk-shared")
+	if applied, err := store.MarkItemProcessed(firstBlockTaskID); err != nil || !applied {
+		t.Fatalf("seed block progress applied=%v err=%v", applied, err)
+	}
+
+	item := QueueItem{OrgID: orgID, QueuedAt: identityAt, IdentityAt: identityAt, ItemType: ItemFSObject, ItemID: "fs-obj-partial", LibraryID: libID}
+	if err := w.processFSObject(context.Background(), item); err != nil {
+		t.Fatalf("processFSObject retry failed: %v", err)
+	}
+
+	if got := store.GetBlock(orgID, "blk-shared").RefCount; got != 0 {
+		t.Fatalf("repaired block ref_count = %d, want 0", got)
+	}
+	if got := store.GetBlock(orgID, "blk-last").RefCount; got != 0 {
+		t.Fatalf("remaining block ref_count = %d, want 0", got)
+	}
+	if store.GetFSObj(libID, "fs-obj-partial") != nil {
+		t.Fatal("fs_object should be deleted after remaining block progress completes")
+	}
+
+	blockItemCount := 0
+	for _, item := range store.QueueItems(orgID) {
+		if item.ItemType == ItemBlock && (item.ItemID == "blk-shared" || item.ItemID == "blk-last") {
+			blockItemCount++
+		}
+	}
+	if blockItemCount != 2 {
+		t.Fatalf("expected zero-ref block items for repaired and remaining blocks, got %d", blockItemCount)
+	}
+}
+
+func TestWorker_ProcessFSObject_RetryRepairsMarkedButMissingSharedDecrement(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	w := NewWorker(store, nil, q, 100, 0, false, stats)
+
+	orgID := uuid.New()
+	libID := uuid.New()
+	identityAt := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
+
+	store.AddBlock(orgID, "blk-shared", "hot", 2)
+	store.AddFSObject(libID, "fs-obj-retry", "file", []string{"blk-shared"})
+	store.AddFSObject(libID, "fs-other", "file", []string{"blk-shared"})
+	store.AddLibrary(orgID, libID, "hot")
+
+	taskID := fsObjectBlockDecrementTaskID(libID, "fs-obj-retry", identityAt, 0, "blk-shared")
+	if applied, err := store.MarkItemProcessed(taskID); err != nil || !applied {
+		t.Fatalf("seed block progress applied=%v err=%v", applied, err)
+	}
+
+	item := QueueItem{OrgID: orgID, QueuedAt: identityAt, IdentityAt: identityAt, ItemType: ItemFSObject, ItemID: "fs-obj-retry", LibraryID: libID}
+	if err := w.processFSObject(context.Background(), item); err != nil {
+		t.Fatalf("processFSObject retry failed: %v", err)
+	}
+
+	if got := store.GetBlock(orgID, "blk-shared").RefCount; got != 1 {
+		t.Fatalf("shared block ref_count after repair = %d, want 1", got)
+	}
+	if store.GetFSObj(libID, "fs-obj-retry") != nil {
+		t.Fatal("fs_object should be deleted after repairing the missing decrement")
+	}
+	if store.GetFSObj(libID, "fs-other") == nil {
+		t.Fatal("other fs_object sharing the block should remain")
 	}
 }
 
@@ -1997,17 +2141,21 @@ func TestWorker_ProcessOrgCascade_SkipsRestoredOrg(t *testing.T) {
 	}
 }
 
-func TestWorker_DecrementAndFindZeroRef_ReturnsOnlyZeroTransitions(t *testing.T) {
+func TestWorker_DecrementFSObjectBlocks_ReturnsOnlyZeroTransitions(t *testing.T) {
 	store := NewMockStore()
 	stats := &Stats{}
 	q := NewQueue(store)
 	w := NewWorker(store, nil, q, 100, 0, false, stats)
 
 	orgID := uuid.New()
+	libID := uuid.New()
 	store.AddBlock(orgID, "hits-zero", "hot", 1)
 	store.AddBlock(orgID, "stays-positive", "hot", 2)
 
-	zeroRef := w.decrementAndFindZeroRef(orgID, []string{"hits-zero", "stays-positive"})
+	zeroRef, err := w.decrementFSObjectBlocks(orgID, libID, "fs-obj", time.Now().UTC(), []string{"hits-zero", "stays-positive"})
+	if err != nil {
+		t.Fatalf("decrementFSObjectBlocks failed: %v", err)
+	}
 	if len(zeroRef) != 1 || zeroRef[0] != "hits-zero" {
 		t.Fatalf("zeroRef = %#v, want only hits-zero", zeroRef)
 	}

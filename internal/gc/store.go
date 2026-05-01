@@ -14,7 +14,6 @@ var gcFailedItemRetention = time.Duration(gcFailedItemRetentionTTLSeconds) * tim
 const (
 	GCFailureCodeNone                        = ""
 	GCFailureCodeLibraryHardDeleteInProgress = "library_hard_delete_in_progress"
-	GCFailureCodeFSObjectDecrementAmbiguous  = "fs_object_decrement_ambiguous"
 )
 
 // GCStore abstracts all database operations used by the GC system.

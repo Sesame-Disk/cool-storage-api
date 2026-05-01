@@ -122,21 +122,28 @@ processFSObject(item):
      └─ Not found: assume already deleted, done.
   2. If directory: enqueue all children (skip grace period)
   3. If file with blocks:
-     a. Create deterministic taskID (fs_id + timestamp)
-     b. MarkItemProcessed(taskID) — IF NOT EXISTS
-        └─ Already processed: verify referenced block ref_counts are already non-positive;
-           if any are still positive, fail closed and keep the fs_object for recovery.
-        └─ First time:
-     c. For each block: DecrementRefCount, check if now 0
+     a. Resolve block IDs once for the object
+     b. For each block occurrence, create deterministic taskID
+        (fs_id + identity_at + block position + resolved block ID)
+     c. MarkItemProcessed(taskID) — IF NOT EXISTS
+        └─ Already processed: verify whether this block occurrence's
+           decrement is reflected; repair only the missing recorded
+           decrement if the marker was written before the decrement landed
+        └─ First time: DecrementRefCount, check if now 0
      d. Enqueue zero-ref blocks for deletion
   4. Delete fs_object from DB
 ```
 
 **The idempotency mechanism at step 3b prevents double-decrement on retry.**
-If the worker sees an existing marker after a crash, it now deletes the
-`fs_object` only when the referenced blocks already reflect the decrement. When
-state is ambiguous, the item stays retryable instead of deleting the last
-reference and stranding positive-ref blocks.
+Each block occurrence in the `fs_object` has its own deterministic marker. After
+a crash, the worker continues unrecorded block decrements and checks recorded
+ones against live references. If a marker was written before its decrement
+landed, the worker repairs that missing decrement instead of deleting the
+`fs_object` with an inflated block refcount.
+
+Block deletion also re-checks live `fs_object` references before claiming a
+zero-ref block. The worker caches the org's live block-reference set during a
+batch, so deleting N block items does not rescan every `fs_object` N times.
 
 ---
 
@@ -145,12 +152,15 @@ reference and stranding positive-ref blocks.
 These are deliberate safety mechanisms that are correctly implemented and tested:
 
 1. **LWT-based block deletion** — Cassandra lightweight transactions ensure blocks with
-   `ref_count > 0` are never deleted from S3, even under concurrent upload.
+   `ref_count > 0` are never deleted from S3, even under concurrent upload. The
+   worker also scans live fs_object references before claiming a zero-ref block
+   so partial fs_object decrement recovery cannot remove referenced content.
 2. **Grace period** (default 1h) — Recently enqueued items can't be processed. Gives
    time for concurrent operations to increment ref counts.
-3. **Idempotent decrement** — `MarkItemProcessed` with deterministic task IDs prevents
-   double-decrement across worker retries and delayed DLQ requeues inside the
-   30-day failed-item retention window. The tracking table now uses a 35-day TTL.
+3. **Idempotent decrement** — `MarkItemProcessed` with deterministic per-block task IDs
+   prevents double-decrement across worker retries and delayed DLQ requeues inside the
+   30-day failed-item retention window, while retry repair handles markers that
+   were persisted immediately before a crash. The tracking table now uses a 35-day TTL.
 4. **Cascade ordering** — Commit → root fs_object → children → blocks. If any step fails,
    the parent is not deleted, and the scanner will re-discover it.
 5. **Hard-delete locks** — User, library, and org cascades acquire a tokenized,
@@ -285,7 +295,7 @@ race conditions:
 
 - **Increment** (`IncrementBlockRefCounts`): on upload and copy. Uses `UPDATE ... IF ref_count = ? SET ref_count = ?` with CAS retry.
 - **Decrement** (`DecrementBlockRefCountsOnce`): on file delete. Same CAS pattern. Returns `true` if the decrement caused ref_count to hit 0.
-- **Idempotency**: Each decrement operation has a stable key derived from `library_id`, `fs_object_id`, and GC `identity_at`. Processed operations are recorded in `gc_processed_items` (35d TTL) to prevent double-decrement on retry and delayed DLQ replay.
+- **Idempotency**: Each block decrement operation has a stable key derived from `library_id`, `fs_object_id`, block position, resolved block ID, and GC `identity_at`. Processed operations are recorded in `gc_processed_items` (35d TTL) to prevent double-decrement on retry and delayed DLQ replay while allowing partially completed fs_objects to resume. If a marker exists but the current refcount still includes that fs_object occurrence, retry repair applies the missing decrement before deleting the fs_object.
 
 Blocks are **never shared across orgs** — the `blocks` primary key is `(org_id, block_id)`.
 

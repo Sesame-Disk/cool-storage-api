@@ -28,12 +28,6 @@ type hardDeleteInProgressError struct {
 	ItemID string
 }
 
-type fsObjectDecrementAmbiguousError struct {
-	LibraryID uuid.UUID
-	ItemID    string
-	TaskID    uuid.UUID
-}
-
 func (e libraryHardDeleteInProgressError) Error() string {
 	return fmt.Sprintf("library %s hard delete already in progress for child %s", e.LibraryID, e.ItemID)
 }
@@ -48,14 +42,6 @@ func (e hardDeleteInProgressError) Error() string {
 
 func (e hardDeleteInProgressError) FailureCode() string {
 	return GCFailureCodeLibraryHardDeleteInProgress
-}
-
-func (e fsObjectDecrementAmbiguousError) Error() string {
-	return fmt.Sprintf("fs_object %s/%s decrement state already claimed by task %s; leaving object for recovery", e.LibraryID, e.ItemID, e.TaskID)
-}
-
-func (e fsObjectDecrementAmbiguousError) FailureCode() string {
-	return GCFailureCodeFSObjectDecrementAmbiguous
 }
 
 func failureCodeForError(err error) string {
@@ -90,6 +76,10 @@ type hardDeleteLease struct {
 	err        error
 	closeOnce  sync.Once
 	closedChan chan struct{}
+}
+
+type blockReferenceCache struct {
+	countsByOrg map[uuid.UUID]map[string]int
 }
 
 func newHardDeleteLease(ctx context.Context, kind, target string, renew func() (bool, error), release func() error) *hardDeleteLease {
@@ -209,6 +199,7 @@ func (w *Worker) processOrg(ctx context.Context, orgID uuid.UUID) (int, error) {
 	}
 
 	processed := 0
+	blockRefs := &blockReferenceCache{countsByOrg: make(map[uuid.UUID]map[string]int)}
 	for _, item := range items {
 		select {
 		case <-ctx.Done():
@@ -216,7 +207,7 @@ func (w *Worker) processOrg(ctx context.Context, orgID uuid.UUID) (int, error) {
 		default:
 		}
 
-		if err := w.processItem(ctx, item); err != nil {
+		if err := w.processItem(ctx, item, blockRefs); err != nil {
 			log.Printf("[GC Worker] Failed to process item %s/%s (type=%s): %v",
 				item.OrgID, item.ItemID, item.ItemType, err)
 			metrics.GCErrorsTotal.WithLabelValues(string(item.ItemType)).Inc()
@@ -281,6 +272,9 @@ func (w *Worker) processOrg(ctx context.Context, orgID uuid.UUID) (int, error) {
 
 		metrics.GCItemsProcessedTotal.WithLabelValues(string(item.ItemType)).Inc()
 		processed++
+		if item.ItemType == ItemFSObject {
+			delete(blockRefs.countsByOrg, item.OrgID)
+		}
 	}
 
 	if len(items) < w.batchSize {
@@ -323,10 +317,10 @@ func (w *Worker) postponeItem(item QueueItem) error {
 	)
 }
 
-func (w *Worker) processItem(ctx context.Context, item QueueItem) error {
+func (w *Worker) processItem(ctx context.Context, item QueueItem, blockRefs *blockReferenceCache) error {
 	switch item.ItemType {
 	case ItemBlock:
-		return w.processBlock(ctx, item)
+		return w.processBlock(ctx, item, blockRefs)
 	case ItemCommit:
 		return w.processCommit(item)
 	case ItemFSObject:
@@ -350,9 +344,19 @@ func (w *Worker) processItem(ctx context.Context, item QueueItem) error {
 	}
 }
 
-func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
+func (w *Worker) processBlock(ctx context.Context, item QueueItem, blockRefs *blockReferenceCache) error {
 	if w.dryRun {
 		log.Printf("[GC Worker] DRY RUN: Would conditionally delete block %s from DB and S3", item.ItemID)
+		return nil
+	}
+
+	referenced, err := w.blockReferencedByFSObject(item.OrgID, item.ItemID, blockRefs)
+	if err != nil {
+		return fmt.Errorf("failed to verify live fs_object references for block %s: %w", item.ItemID, err)
+	}
+	if referenced {
+		log.Printf("[GC Worker] Block %s still has a live fs_object reference, skipping deletion", item.ItemID)
+		metrics.GCItemsSkippedTotal.Inc()
 		return nil
 	}
 
@@ -635,35 +639,15 @@ func (w *Worker) processFSObject(ctx context.Context, item QueueItem) error {
 
 	// If it's a file with blocks, decrement ref counts
 	if len(fsObj.BlockIDs) > 0 {
-		// Create a deterministic task ID for this specific decrement operation
-		// based on the fs_object and its stable semantic identity so retries or
-		// duplicate queue rows for the same item do not double-decrement blocks.
-		taskIDStr := fmt.Sprintf("%s-%s-%d", item.LibraryID, item.ItemID, identityAt.UnixNano())
-		taskID := uuid.NewMD5(uuid.NameSpaceOID, []byte(taskIDStr))
-
-		applied, err := w.store.MarkItemProcessed(taskID)
+		zeroRefBlocks, err := w.decrementFSObjectBlocks(item.OrgID, item.LibraryID, item.ItemID, identityAt, fsObj.BlockIDs)
 		if err != nil {
-			return fmt.Errorf("failed to check idempotency for fs_object %s: %w", item.ItemID, err)
+			return err
 		}
-
-		if applied {
-			// First time processing this exact task, safe to decrement
-			zeroRefBlocks := w.decrementAndFindZeroRef(item.OrgID, fsObj.BlockIDs)
-			storageClass, _ := w.store.GetLibraryStorageClass(item.OrgID, item.LibraryID)
-			if len(zeroRefBlocks) > 0 {
-				if err := w.enqueueZeroRefBlocks(item.OrgID, item.LibraryID, zeroRefBlocks, storageClass); err != nil {
-					return fmt.Errorf("failed to enqueue zero-ref blocks for fs_object %s: %w", item.ItemID, err)
-				}
+		storageClass, _ := w.store.GetLibraryStorageClass(item.OrgID, item.LibraryID)
+		if len(zeroRefBlocks) > 0 {
+			if err := w.enqueueZeroRefBlocks(item.OrgID, item.LibraryID, zeroRefBlocks, storageClass); err != nil {
+				return fmt.Errorf("failed to enqueue zero-ref blocks for fs_object %s: %w", item.ItemID, err)
 			}
-		} else {
-			complete, err := w.fsObjectDecrementAlreadyReflected(item.OrgID, fsObj.BlockIDs)
-			if err != nil {
-				return fmt.Errorf("failed to verify prior decrement for fs_object %s: %w", item.ItemID, err)
-			}
-			if !complete {
-				return fsObjectDecrementAmbiguousError{LibraryID: item.LibraryID, ItemID: item.ItemID, TaskID: taskID}
-			}
-			log.Printf("[GC Worker] Prior decrement for %s is already reflected in block refcounts", item.ItemID)
 		}
 	}
 
@@ -1168,42 +1152,146 @@ func (w *Worker) processOrgCascade(ctx context.Context, item QueueItem) error {
 	return nil
 }
 
-// decrementAndFindZeroRef decrements ref_count for blocks and returns those that hit 0.
-func (w *Worker) decrementAndFindZeroRef(orgID uuid.UUID, blockIDs []string) []string {
+func fsObjectBlockDecrementTaskID(libraryID uuid.UUID, fsID string, identityAt time.Time, blockIndex int, blockID string) uuid.UUID {
+	taskIDStr := fmt.Sprintf("fs_object_block_decrement:%s:%s:%d:%d:%s", libraryID, fsID, identityAt.UnixNano(), blockIndex, blockID)
+	return uuid.NewMD5(uuid.NameSpaceOID, []byte(taskIDStr))
+}
+
+func (w *Worker) decrementFSObjectBlocks(orgID, libraryID uuid.UUID, fsID string, identityAt time.Time, blockIDs []string) ([]string, error) {
 	resolvedBlockIDs, err := w.store.ResolveBlockIDs(orgID, blockIDs)
 	if err != nil {
-		log.Printf("[GC Worker] Failed to resolve block IDs for org %s: %v", orgID, err)
-		return nil
+		return nil, fmt.Errorf("failed to resolve block IDs for fs_object %s/%s: %w", libraryID, fsID, err)
 	}
 
 	var zeroRef []string
-	for _, blockID := range resolvedBlockIDs {
+	currentOccurrences := make(map[string]int, len(resolvedBlockIDs))
+	skippedMarkers := make(map[string]int)
+	for blockIndex, blockID := range resolvedBlockIDs {
+		currentOccurrences[blockID]++
+		taskID := fsObjectBlockDecrementTaskID(libraryID, fsID, identityAt, blockIndex, blockID)
+		applied, err := w.store.MarkItemProcessed(taskID)
+		if err != nil {
+			return nil, fmt.Errorf("failed to mark block decrement progress for fs_object %s/%s block %s: %w", libraryID, fsID, blockID, err)
+		}
+		if !applied {
+			skippedMarkers[blockID]++
+			continue
+		}
+
 		hitZero, err := w.store.DecrementBlockRefCount(orgID, blockID)
 		if err != nil {
-			continue
+			return nil, fmt.Errorf("failed to decrement block ref_count for fs_object %s/%s block %s: %w", libraryID, fsID, blockID, err)
 		}
 		if hitZero {
 			zeroRef = append(zeroRef, blockID)
 		}
 	}
-	return zeroRef
+
+	if len(skippedMarkers) > 0 {
+		repairedZeroRef, err := w.repairSkippedFSObjectBlockDecrements(orgID, libraryID, fsID, currentOccurrences, skippedMarkers)
+		if err != nil {
+			return nil, err
+		}
+		zeroRef = append(zeroRef, repairedZeroRef...)
+	}
+	return zeroRef, nil
 }
 
-func (w *Worker) fsObjectDecrementAlreadyReflected(orgID uuid.UUID, blockIDs []string) (bool, error) {
-	resolvedBlockIDs, err := w.store.ResolveBlockIDs(orgID, blockIDs)
-	if err != nil {
-		return false, err
-	}
-	for _, blockID := range resolvedBlockIDs {
-		refCount, err := w.store.GetBlockRefCount(orgID, blockID)
+func (w *Worker) blockReferencedByFSObject(orgID uuid.UUID, blockID string, cache *blockReferenceCache) (bool, error) {
+	if cache != nil {
+		refs, err := w.liveFSObjectBlockReferenceCounts(orgID, cache)
 		if err != nil {
 			return false, err
 		}
-		if refCount > 0 {
-			return false, nil
+		return refs[blockID] > 0, nil
+	}
+
+	refs, err := w.collectLiveFSObjectBlockReferenceCounts(orgID)
+	if err != nil {
+		return false, err
+	}
+	return refs[blockID] > 0, nil
+}
+
+func (w *Worker) repairSkippedFSObjectBlockDecrements(orgID, libraryID uuid.UUID, fsID string, currentOccurrences, skippedMarkers map[string]int) ([]string, error) {
+	liveCounts, err := w.collectLiveFSObjectBlockReferenceCounts(orgID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to inspect live block references for fs_object %s/%s retry: %w", libraryID, fsID, err)
+	}
+
+	var zeroRef []string
+	for blockID, skipped := range skippedMarkers {
+		expectedMaxRefCount := liveCounts[blockID] - currentOccurrences[blockID]
+		if expectedMaxRefCount < 0 {
+			expectedMaxRefCount = 0
+		}
+
+		refCount, err := w.store.GetBlockRefCount(orgID, blockID)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read block ref_count while repairing fs_object %s/%s block %s: %w", libraryID, fsID, blockID, err)
+		}
+
+		missing := refCount - expectedMaxRefCount
+		if missing <= 0 {
+			continue
+		}
+		if missing > skipped {
+			missing = skipped
+		}
+
+		for i := 0; i < missing; i++ {
+			hitZero, err := w.store.DecrementBlockRefCount(orgID, blockID)
+			if err != nil {
+				return nil, fmt.Errorf("failed to repair missing block decrement for fs_object %s/%s block %s: %w", libraryID, fsID, blockID, err)
+			}
+			if hitZero {
+				zeroRef = append(zeroRef, blockID)
+			}
 		}
 	}
-	return true, nil
+
+	return zeroRef, nil
+}
+
+func (w *Worker) liveFSObjectBlockReferenceCounts(orgID uuid.UUID, cache *blockReferenceCache) (map[string]int, error) {
+	if refs, ok := cache.countsByOrg[orgID]; ok {
+		return refs, nil
+	}
+	refs, err := w.collectLiveFSObjectBlockReferenceCounts(orgID)
+	if err != nil {
+		return nil, err
+	}
+	cache.countsByOrg[orgID] = refs
+	return refs, nil
+}
+
+func (w *Worker) collectLiveFSObjectBlockReferenceCounts(orgID uuid.UUID) (map[string]int, error) {
+	libraries, err := w.store.ListLibrariesForOrg(orgID)
+	if err != nil {
+		return nil, err
+	}
+
+	refs := make(map[string]int)
+	for _, library := range libraries {
+		objects, err := w.store.ListFSObjectsForLibrary(library.LibraryID)
+		if err != nil {
+			return nil, fmt.Errorf("list fs_objects for library %s: %w", library.LibraryID, err)
+		}
+		for _, obj := range objects {
+			if len(obj.BlockIDs) == 0 {
+				continue
+			}
+			resolvedBlockIDs, err := w.store.ResolveBlockIDs(orgID, obj.BlockIDs)
+			if err != nil {
+				return nil, fmt.Errorf("resolve block IDs for fs_object %s/%s: %w", library.LibraryID, obj.FSID, err)
+			}
+			for _, resolvedBlockID := range resolvedBlockIDs {
+				refs[resolvedBlockID]++
+			}
+		}
+	}
+
+	return refs, nil
 }
 
 func (w *Worker) enqueueZeroRefBlocks(orgID, libraryID uuid.UUID, blockIDs []string, storageClass string) error {
@@ -1238,7 +1326,7 @@ func (w *Worker) enqueueZeroRefBlocks(orgID, libraryID uuid.UUID, blockIDs []str
 
 // EnqueueLibraryContents enqueues all contents of a deleted library for GC.
 // Only enqueues commits and fs_objects — blocks are handled in cascade
-// when fs_objects are processed (via decrementAndFindZeroRef).
+// when fs_objects are processed (via decrementFSObjectBlocks).
 func (w *Worker) EnqueueLibraryContents(orgID, libraryID uuid.UUID, storageClass string) error {
 	return w.enqueueLibraryContentsAt(orgID, libraryID, storageClass, w.clock(), false)
 }
