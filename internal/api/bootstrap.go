@@ -11,6 +11,7 @@ import (
 	"github.com/Sesame-Disk/sesamefs/internal/httputil"
 	"github.com/Sesame-Disk/sesamefs/internal/middleware"
 	"github.com/Sesame-Disk/sesamefs/internal/plans"
+	"github.com/Sesame-Disk/sesamefs/internal/storage"
 	"github.com/Sesame-Disk/sesamefs/internal/traffic"
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
 	"github.com/gin-gonic/gin"
@@ -161,29 +162,7 @@ func (s *Server) resolveBootstrapEndpointRegion(hostname string) string {
 		return "default"
 	}
 
-	hostname = strings.TrimSpace(hostname)
-	if region, ok := s.config.Storage.EndpointRegions[hostname]; ok {
-		return region
-	}
-
-	if region := strings.ToLower(strings.TrimSpace(s.config.Server.Region)); region != "" {
-		return region
-	}
-
-	for pattern, region := range s.config.Storage.EndpointRegions {
-		if len(pattern) > 1 && pattern[0] == '*' {
-			suffix := pattern[1:]
-			if strings.HasSuffix(hostname, suffix) && len(hostname) > len(suffix) {
-				return region
-			}
-		}
-	}
-
-	if region, ok := s.config.Storage.EndpointRegions["*"]; ok {
-		return region
-	}
-
-	return "default"
+	return storage.ResolveEndpointRegion(hostname, s.config.Storage.EndpointRegions, s.config.Server.Region)
 }
 
 func (s *Server) bootstrapStorageDisplayName(storageClass string) string {

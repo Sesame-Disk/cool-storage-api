@@ -66,6 +66,7 @@ func TestResolveCreateStorageClass(t *testing.T) {
 
 	t.Run("flexible falls back to server region for shared hostnames", func(t *testing.T) {
 		cfg.Server.Region = "eu"
+		cfg.Storage.EndpointRegions = map[string]string{}
 		resolved, err := resolveCreateStorageClass(cfg, orgStoragePolicy{
 			DataResidency: orgDataResidencyFlexible,
 		}, "files.example.com", "")
@@ -74,6 +75,23 @@ func TestResolveCreateStorageClass(t *testing.T) {
 		}
 		if resolved != "hot-s3-eu" {
 			t.Fatalf("resolved = %q, want %q", resolved, "hot-s3-eu")
+		}
+	})
+
+	t.Run("flexible honors wildcard endpoint routing before server region fallback", func(t *testing.T) {
+		cfg.Server.Region = "eu"
+		cfg.Storage.EndpointRegions = map[string]string{
+			"*.example.com": "usa",
+			"*":             "eu",
+		}
+		resolved, err := resolveCreateStorageClass(cfg, orgStoragePolicy{
+			DataResidency: orgDataResidencyFlexible,
+		}, "files.example.com", "")
+		if err != nil {
+			t.Fatalf("resolveCreateStorageClass returned error: %v", err)
+		}
+		if resolved != "hot-s3-usa" {
+			t.Fatalf("resolved = %q, want %q", resolved, "hot-s3-usa")
 		}
 	})
 

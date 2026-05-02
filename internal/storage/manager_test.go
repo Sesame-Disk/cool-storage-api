@@ -170,10 +170,38 @@ func TestManagerResolveStorageClass(t *testing.T) {
 	}
 
 	t.Run("local region overrides wildcard fallback", func(t *testing.T) {
+		m.SetLocalRegion("")
+		m.SetEndpointRegions(map[string]string{
+			"*": "usa",
+		})
 		m.SetLocalRegion("eu")
 		got := m.ResolveStorageClass("files.sesamefs.com", "", "hot")
 		if got != "hot-s3-eu" {
 			t.Fatalf("ResolveStorageClass local fallback = %q, want %q", got, "hot-s3-eu")
+		}
+	})
+
+	t.Run("wildcard endpoint overrides local region", func(t *testing.T) {
+		m.SetLocalRegion("eu")
+		m.SetEndpointRegions(map[string]string{
+			"*.sesamefs.com": "usa",
+			"*":              "usa",
+		})
+		got := m.ResolveStorageClass("files.sesamefs.com", "", "hot")
+		if got != "hot-s3-usa" {
+			t.Fatalf("ResolveStorageClass wildcard override = %q, want %q", got, "hot-s3-usa")
+		}
+	})
+
+	t.Run("exact endpoint overrides local region", func(t *testing.T) {
+		m.SetLocalRegion("eu")
+		m.SetEndpointRegions(map[string]string{
+			"us.sesamefs.com": "usa",
+			"*":               "usa",
+		})
+		got := m.ResolveStorageClass("us.sesamefs.com", "", "hot")
+		if got != "hot-s3-usa" {
+			t.Fatalf("ResolveStorageClass exact override = %q, want %q", got, "hot-s3-usa")
 		}
 	})
 }

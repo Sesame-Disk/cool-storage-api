@@ -7,6 +7,7 @@ import (
 
 	"github.com/Sesame-Disk/sesamefs/internal/config"
 	"github.com/Sesame-Disk/sesamefs/internal/db"
+	"github.com/Sesame-Disk/sesamefs/internal/storage"
 )
 
 const (
@@ -83,38 +84,7 @@ func resolveEndpointRegion(cfg *config.Config, hostname string) string {
 		return "default"
 	}
 
-	hostname = strings.TrimSpace(strings.ToLower(hostname))
-	if hostname == "" {
-		if region, ok := cfg.Storage.EndpointRegions["*"]; ok {
-			return strings.ToLower(strings.TrimSpace(region))
-		}
-		return "default"
-	}
-
-	for pattern, region := range cfg.Storage.EndpointRegions {
-		if strings.EqualFold(pattern, hostname) {
-			return strings.ToLower(strings.TrimSpace(region))
-		}
-	}
-
-	if region := strings.ToLower(strings.TrimSpace(cfg.Server.Region)); region != "" {
-		return region
-	}
-
-	for pattern, region := range cfg.Storage.EndpointRegions {
-		if len(pattern) > 1 && pattern[0] == '*' {
-			suffix := strings.ToLower(pattern[1:])
-			if strings.HasSuffix(hostname, suffix) && len(hostname) > len(suffix) {
-				return strings.ToLower(strings.TrimSpace(region))
-			}
-		}
-	}
-
-	if region, ok := cfg.Storage.EndpointRegions["*"]; ok {
-		return strings.ToLower(strings.TrimSpace(region))
-	}
-
-	return "default"
+	return storage.ResolveEndpointRegion(hostname, cfg.Storage.EndpointRegions, cfg.Server.Region)
 }
 
 func hotStorageClassForRegion(cfg *config.Config, region string) string {

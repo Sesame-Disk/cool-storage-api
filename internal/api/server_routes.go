@@ -68,7 +68,9 @@ func (s *Server) registerCoreRoutes() {
 		databaseChecker = s.db
 	}
 	var storageChecker health.StorageChecker
-	if s.storage != nil {
+	if s.config != nil && s.config.StorageMode() == "multi" && s.storageManager != nil {
+		storageChecker = &storageManagerHealthChecker{manager: s.storageManager}
+	} else if s.storage != nil {
 		storageChecker = s.storage
 	} else if s.storageManager != nil {
 		storageChecker = &storageManagerHealthChecker{manager: s.storageManager}

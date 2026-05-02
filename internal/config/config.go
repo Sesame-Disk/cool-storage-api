@@ -1090,6 +1090,11 @@ func normalizeStorageMode(mode string) string {
 	return strings.ToLower(strings.TrimSpace(mode))
 }
 
+// StorageMode returns the effective storage mode after applying inference.
+func (c *Config) StorageMode() string {
+	return c.storageMode()
+}
+
 func (c *Config) storageMode() string {
 	mode := normalizeStorageMode(c.Storage.Mode)
 	if mode == "single" || mode == "multi" {

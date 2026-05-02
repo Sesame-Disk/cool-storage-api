@@ -341,6 +341,7 @@ func TestRegisterCoreRoutes_InternalOnlyReadyAndMetrics(t *testing.T) {
 func TestRegisterCoreRoutes_ReadyUsesStorageManagerHealth(t *testing.T) {
 	t.Run("loopback ready fails when storage manager has no healthy backend", func(t *testing.T) {
 		s := createTestServer()
+		s.config.Storage.Mode = "multi"
 		s.storageManager = storage.NewManager()
 		s.storageManager.SetDefaultClass("hot-s3-eu")
 		s.authRateLimiter = middleware.NewRateLimiter(rate.Every(time.Minute), 1)
@@ -359,6 +360,28 @@ func TestRegisterCoreRoutes_ReadyUsesStorageManagerHealth(t *testing.T) {
 
 	t.Run("loopback ready succeeds when storage manager backend is healthy", func(t *testing.T) {
 		s := createTestServer()
+		s.config.Storage.Mode = "multi"
+		s.storageManager = storage.NewManager()
+		s.storageManager.SetDefaultClass("hot-s3-eu")
+		s.storageManager.RegisterBackend("hot-s3-eu", &readinessStore{}, "")
+		s.authRateLimiter = middleware.NewRateLimiter(rate.Every(time.Minute), 1)
+		defer s.authRateLimiter.Stop()
+		s.registerCoreRoutes()
+
+		req := httptest.NewRequest(http.MethodGet, "/ready", nil)
+		req.RemoteAddr = "127.0.0.1:12345"
+		w := httptest.NewRecorder()
+		s.router.ServeHTTP(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want %d", w.Code, http.StatusOK)
+		}
+	})
+
+	t.Run("multi mode prefers storage manager over legacy singleton", func(t *testing.T) {
+		s := createTestServer()
+		s.config.Storage.Mode = "multi"
+		s.storage = &storage.S3Store{}
 		s.storageManager = storage.NewManager()
 		s.storageManager.SetDefaultClass("hot-s3-eu")
 		s.storageManager.RegisterBackend("hot-s3-eu", &readinessStore{}, "")

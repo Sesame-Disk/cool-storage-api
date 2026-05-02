@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -289,37 +290,57 @@ func (m *Manager) ResolveStorageClass(hostname string, libraryClass string, tier
 	return ""
 }
 
-// resolveRegion maps a hostname to a region
-func (m *Manager) resolveRegion(hostname string) string {
+// ResolveEndpointRegion resolves a request hostname to a configured region.
+// Priority: exact hostname > wildcard hostname > local region fallback > global default.
+func ResolveEndpointRegion(hostname string, endpointRegions map[string]string, localRegion string) string {
 	hostname = strings.ToLower(strings.TrimSpace(hostname))
+	localRegion = strings.ToLower(strings.TrimSpace(localRegion))
 
-	// Exact match first
-	for pattern, region := range m.endpointRegions {
-		if strings.EqualFold(pattern, hostname) {
+	for pattern, region := range endpointRegions {
+		if strings.EqualFold(strings.TrimSpace(pattern), hostname) {
 			return strings.ToLower(strings.TrimSpace(region))
 		}
 	}
 
-	if m.localRegion != "" {
-		return m.localRegion
-	}
+	if hostname != "" {
+		wildcards := make([]string, 0, len(endpointRegions))
+		for pattern := range endpointRegions {
+			pattern = strings.TrimSpace(pattern)
+			if len(pattern) > 1 && pattern[0] == '*' {
+				wildcards = append(wildcards, pattern)
+			}
+		}
+		sort.Slice(wildcards, func(i, j int) bool {
+			if len(wildcards[i]) == len(wildcards[j]) {
+				return wildcards[i] < wildcards[j]
+			}
+			return len(wildcards[i]) > len(wildcards[j])
+		})
 
-	// Try wildcard match (e.g., "*.sesamefs.com" → "usa")
-	for pattern, region := range m.endpointRegions {
-		if len(pattern) > 1 && pattern[0] == '*' {
-			suffix := strings.ToLower(pattern[1:]) // e.g., ".sesamefs.com"
+		for _, pattern := range wildcards {
+			suffix := strings.ToLower(pattern[1:])
 			if len(hostname) > len(suffix) && strings.HasSuffix(hostname, suffix) {
-				return strings.ToLower(strings.TrimSpace(region))
+				return strings.ToLower(strings.TrimSpace(endpointRegions[pattern]))
 			}
 		}
 	}
 
-	// Default region
-	if region, ok := m.endpointRegions["*"]; ok {
-		return strings.ToLower(strings.TrimSpace(region))
+	if localRegion != "" {
+		return localRegion
+	}
+
+	for pattern, region := range endpointRegions {
+		if strings.TrimSpace(pattern) == "*" {
+			return strings.ToLower(strings.TrimSpace(region))
+		}
 	}
 
 	return "default"
+}
+
+// resolveRegion maps a hostname to a region
+func (m *Manager) resolveRegion(hostname string) string {
+	return ResolveEndpointRegion(hostname, m.endpointRegions, m.localRegion)
 }
 
 // UpdateHealth updates the health status of a backend
