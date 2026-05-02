@@ -85,7 +85,7 @@ func (s *Server) handleBootstrap(c *gin.Context) {
 	}
 	orgData := s.loadBootstrapOrgData(identity.OrgID)
 	appPageOptions := s.buildAppBootstrapPageOptions(identity, userData, orgData)
-	appPageOptions["storages"] = s.buildBootstrapStorageOptions(httputil.GetRoutingHostname(c))
+	appPageOptions["storages"] = s.buildBootstrapStorageOptions(httputil.GetRoutingHostname(c, s.config.Server.URL))
 	orgPageOptions := s.buildOrgBootstrapPageOptions(identity.OrgID, orgData)
 	canAccessOrgAdmin := middleware.IsOrgStaff(identity.Role)
 	canAccessSysAdmin := middleware.IsPlatformSuperAdmin(identity.OrgID, middleware.OrganizationRole(identity.Role))

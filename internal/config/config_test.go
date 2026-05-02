@@ -697,6 +697,78 @@ func TestEnvOverrideS3ForcesLegacyDefaultClass(t *testing.T) {
 	}
 }
 
+func TestEnvOverrideServerExternalURLsAndBranding(t *testing.T) {
+	cfg := DefaultConfig()
+
+	os.Setenv("SERVER_URL", "https://files.example.com/")
+	os.Setenv("DESKTOP_CUSTOM_BRAND", "Sesame Cloud")
+	os.Setenv("DESKTOP_CUSTOM_LOGO", "https://cdn.example.com/logo.svg")
+	defer func() {
+		os.Unsetenv("SERVER_URL")
+		os.Unsetenv("DESKTOP_CUSTOM_BRAND")
+		os.Unsetenv("DESKTOP_CUSTOM_LOGO")
+	}()
+
+	cfg.applyEnvOverrides()
+
+	if cfg.Server.URL != "https://files.example.com" {
+		t.Fatalf("Server.URL = %q, want %q", cfg.Server.URL, "https://files.example.com")
+	}
+	if cfg.Server.DesktopCustomBrand != "Sesame Cloud" {
+		t.Fatalf("Server.DesktopCustomBrand = %q, want %q", cfg.Server.DesktopCustomBrand, "Sesame Cloud")
+	}
+	if cfg.Server.DesktopCustomLogo != "https://cdn.example.com/logo.svg" {
+		t.Fatalf("Server.DesktopCustomLogo = %q, want %q", cfg.Server.DesktopCustomLogo, "https://cdn.example.com/logo.svg")
+	}
+}
+
+func TestEnvOverrideStorageClassS3(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Storage.Classes = map[string]StorageClassConfig{
+		"hot-s3-na": {
+			Type:   "s3",
+			Tier:   "hot",
+			Region: "us-east-1",
+		},
+	}
+
+	os.Setenv("S3_CLASS_HOT_S3_NA_BUCKET", "sesamefs-na-prod")
+	os.Setenv("S3_CLASS_HOT_S3_NA_ACCESS_KEY_ID", "class-key")
+	os.Setenv("S3_CLASS_HOT_S3_NA_SECRET_ACCESS_KEY", "class-secret")
+	os.Setenv("S3_CLASS_HOT_S3_NA_ENDPOINT", "https://s3.example.com")
+	os.Setenv("S3_CLASS_HOT_S3_NA_SERVER_SIDE_ENCRYPTION", "AES256")
+	os.Setenv("S3_ACCESS_KEY_ID", "default-key")
+	os.Setenv("S3_SECRET_ACCESS_KEY", "default-secret")
+	defer func() {
+		os.Unsetenv("S3_CLASS_HOT_S3_NA_BUCKET")
+		os.Unsetenv("S3_CLASS_HOT_S3_NA_ACCESS_KEY_ID")
+		os.Unsetenv("S3_CLASS_HOT_S3_NA_SECRET_ACCESS_KEY")
+		os.Unsetenv("S3_CLASS_HOT_S3_NA_ENDPOINT")
+		os.Unsetenv("S3_CLASS_HOT_S3_NA_SERVER_SIDE_ENCRYPTION")
+		os.Unsetenv("S3_ACCESS_KEY_ID")
+		os.Unsetenv("S3_SECRET_ACCESS_KEY")
+	}()
+
+	cfg.applyEnvOverrides()
+
+	classCfg := cfg.Storage.Classes["hot-s3-na"]
+	if classCfg.Bucket != "sesamefs-na-prod" {
+		t.Fatalf("Storage.Classes[hot-s3-na].Bucket = %q, want %q", classCfg.Bucket, "sesamefs-na-prod")
+	}
+	if classCfg.Endpoint != "https://s3.example.com" {
+		t.Fatalf("Storage.Classes[hot-s3-na].Endpoint = %q, want %q", classCfg.Endpoint, "https://s3.example.com")
+	}
+	if classCfg.AccessKey != "class-key" {
+		t.Fatalf("Storage.Classes[hot-s3-na].AccessKey = %q, want %q", classCfg.AccessKey, "class-key")
+	}
+	if classCfg.SecretKey != "class-secret" {
+		t.Fatalf("Storage.Classes[hot-s3-na].SecretKey = %q, want %q", classCfg.SecretKey, "class-secret")
+	}
+	if classCfg.ServerSideEncryption != "AES256" {
+		t.Fatalf("Storage.Classes[hot-s3-na].ServerSideEncryption = %q, want %q", classCfg.ServerSideEncryption, "AES256")
+	}
+}
+
 func TestEnvOverrideAccounts(t *testing.T) {
 	cfg := DefaultConfig()
 

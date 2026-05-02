@@ -145,7 +145,7 @@ func (h *FileHandler) lookupLibraryStorageClass(orgID, repoID string) string {
 func (h *FileHandler) resolveLibraryBlockStore(c *gin.Context, orgID, repoID string) (*storage.BlockStore, string, error) {
 	libraryClass := h.lookupLibraryStorageClass(orgID, repoID)
 	if h.storageManager != nil {
-		preferredClass := h.storageManager.ResolveStorageClass(httputil.GetRoutingHostname(c), libraryClass, "hot")
+		preferredClass := h.storageManager.ResolveStorageClass(routingHostname(c, h.config), libraryClass, "hot")
 		return h.storageManager.GetHealthyBlockStore(preferredClass)
 	}
 
@@ -3148,11 +3148,11 @@ func (h *FileHandler) GetDownloadInfo(c *gin.Context) {
 		}
 	}
 
-	relayHost := httputil.GetEffectiveHostname(c)
+	relayHost := effectiveHostname(c, h.config)
 	response := gin.H{
 		"relay_id":            relayHost,
 		"relay_addr":          relayHost,
-		"relay_port":          httputil.GetRelayPortFromRequest(c),
+		"relay_port":          relayPortFromRequest(c, h.config),
 		"email":               userID + "@sesamefs.local",
 		"token":               token,
 		"repo_id":             repoID,

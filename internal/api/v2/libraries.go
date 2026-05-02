@@ -12,7 +12,6 @@ import (
 	"github.com/Sesame-Disk/sesamefs/internal/config"
 	"github.com/Sesame-Disk/sesamefs/internal/crypto"
 	"github.com/Sesame-Disk/sesamefs/internal/db"
-	"github.com/Sesame-Disk/sesamefs/internal/httputil"
 	"github.com/Sesame-Disk/sesamefs/internal/middleware"
 	"github.com/Sesame-Disk/sesamefs/internal/models"
 	"github.com/Sesame-Disk/sesamefs/internal/storage"
@@ -568,7 +567,7 @@ func (h *LibraryHandler) CreateLibrary(c *gin.Context) {
 	if requestedStorageClass == "" {
 		requestedStorageClass = req.StorageClass
 	}
-	resolvedStorageClass, err := resolveCreateStorageClassForOrg(h.db, h.config, orgID, httputil.GetRoutingHostname(c), requestedStorageClass)
+	resolvedStorageClass, err := resolveCreateStorageClassForOrg(h.db, h.config, orgID, routingHostname(c, h.config), requestedStorageClass)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
@@ -715,14 +714,14 @@ func (h *LibraryHandler) CreateLibrary(c *gin.Context) {
 		}
 	}
 
-	relayHost := httputil.GetEffectiveHostname(c)
+	relayHost := effectiveHostname(c, h.config)
 
 	// Return Seafile-compatible response (HTTP 200, not 201)
 	// This format matches what Seafile returns and includes sync info
 	response := gin.H{
 		"relay_id":            relayHost,
 		"relay_addr":          relayHost,
-		"relay_port":          httputil.GetRelayPortFromRequest(c),
+		"relay_port":          relayPortFromRequest(c, h.config),
 		"email":               userEmail,
 		"token":               syncToken,
 		"repo_id":             newLibID.String(),

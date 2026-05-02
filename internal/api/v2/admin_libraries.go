@@ -549,7 +549,7 @@ func (h *AdminHandler) AdminCreateLibrary(c *gin.Context) {
 	if requestedStorageClass == "" {
 		requestedStorageClass = createLibReq.StorageClass
 	}
-	storageClass, err := resolveCreateStorageClassForOrg(h.db, h.config, ownerOrgID, httputil.GetRoutingHostname(c), requestedStorageClass)
+	storageClass, err := resolveCreateStorageClassForOrg(h.db, h.config, ownerOrgID, routingHostname(c, h.config), requestedStorageClass)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return

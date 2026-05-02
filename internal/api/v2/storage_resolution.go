@@ -10,6 +10,25 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+func configuredServerURL(cfg *config.Config) string {
+	if cfg == nil {
+		return ""
+	}
+	return cfg.Server.URL
+}
+
+func routingHostname(c *gin.Context, cfg *config.Config) string {
+	return httputil.GetRoutingHostname(c, configuredServerURL(cfg))
+}
+
+func effectiveHostname(c *gin.Context, cfg *config.Config) string {
+	return httputil.GetEffectiveHostname(c, configuredServerURL(cfg))
+}
+
+func relayPortFromRequest(c *gin.Context, cfg *config.Config) string {
+	return httputil.GetRelayPortFromRequest(c, configuredServerURL(cfg))
+}
+
 func lookupLibraryStorageClass(database *db.DB, orgID, repoID string) string {
 	if database == nil || orgID == "" || repoID == "" {
 		return ""
@@ -25,12 +44,9 @@ func lookupLibraryStorageClass(database *db.DB, orgID, repoID string) string {
 	return storageClass
 }
 
-func resolvePreferredLibraryStorageClassForRequest(c *gin.Context, storageManager *storage.Manager, libraryClass, defaultClass string) string {
+func resolvePreferredLibraryStorageClassForRequest(c *gin.Context, cfg *config.Config, storageManager *storage.Manager, libraryClass, defaultClass string) string {
 	if storageManager != nil {
-		hostname := ""
-		if c != nil {
-			hostname = httputil.GetRoutingHostname(c)
-		}
+		hostname := routingHostname(c, cfg)
 		return storageManager.ResolveStorageClass(hostname, libraryClass, "hot")
 	}
 
@@ -48,7 +64,7 @@ func resolveLibraryBlockStoreForRequest(c *gin.Context, database *db.DB, cfg *co
 		defaultClass = cfg.Storage.DefaultClass
 	}
 
-	preferredClass := resolvePreferredLibraryStorageClassForRequest(c, storageManager, libraryClass, defaultClass)
+	preferredClass := resolvePreferredLibraryStorageClassForRequest(c, cfg, storageManager, libraryClass, defaultClass)
 	if storageManager != nil {
 		return storageManager.GetHealthyBlockStore(preferredClass)
 	}

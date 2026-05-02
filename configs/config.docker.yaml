@@ -8,6 +8,9 @@ server:
   write_timeout: 0s        # No write timeout — large downloads/zips can take minutes
   max_upload_mb: 20480     # 20480 MB (~20 GiB) max upload size
   trusted_proxies: []      # Leave empty to ignore forwarded IP headers; set Docker/nginx proxy CIDRs only if you need real client IPs
+  url: ""                 # Optional explicit browser-facing base URL; default Docker dev flow auto-detects from request headers
+  desktop_custom_brand: "" # Optional desktop-client brand label override
+  desktop_custom_logo: "" # Optional desktop-client logo URL override
   mobile_frontend_path: "./mobile-frontend/dist" # Built mobile frontend directory
 
 database:

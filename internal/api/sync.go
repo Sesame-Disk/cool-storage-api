@@ -20,6 +20,7 @@ import (
 
 	v2 "github.com/Sesame-Disk/sesamefs/internal/api/v2"
 	"github.com/Sesame-Disk/sesamefs/internal/apikeys"
+	"github.com/Sesame-Disk/sesamefs/internal/config"
 	"github.com/Sesame-Disk/sesamefs/internal/db"
 	"github.com/Sesame-Disk/sesamefs/internal/httputil"
 	"github.com/Sesame-Disk/sesamefs/internal/middleware"
@@ -43,17 +44,19 @@ type SyncHandler struct {
 	storage        *storage.S3Store    // Legacy single store
 	blockStore     *storage.BlockStore // Legacy single block store
 	storageManager *storage.Manager    // Multi-backend storage manager
-	tokenCreator   SyncTokenCreator    // Token creator for download-info
+	config         *config.Config
+	tokenCreator   SyncTokenCreator // Token creator for download-info
 	permMiddleware *middleware.PermissionMiddleware
 }
 
 // NewSyncHandler creates a new sync protocol handler
-func NewSyncHandler(database *db.DB, s3Store *storage.S3Store, blockStore *storage.BlockStore, storageManager *storage.Manager, permMiddleware *middleware.PermissionMiddleware) *SyncHandler {
+func NewSyncHandler(database *db.DB, s3Store *storage.S3Store, blockStore *storage.BlockStore, storageManager *storage.Manager, cfg *config.Config, permMiddleware *middleware.PermissionMiddleware) *SyncHandler {
 	return &SyncHandler{
 		db:             database,
 		storage:        s3Store,
 		blockStore:     blockStore,
 		storageManager: storageManager,
+		config:         cfg,
 		permMiddleware: permMiddleware,
 	}
 }
@@ -114,7 +117,11 @@ func (h *SyncHandler) lookupLibraryStorageClass(orgID, repoID string) string {
 func (h *SyncHandler) resolvePreferredLibraryStorageClass(c *gin.Context, orgID, repoID string) string {
 	libraryClass := h.lookupLibraryStorageClass(orgID, repoID)
 	if h.storageManager != nil {
-		return h.storageManager.ResolveStorageClass(httputil.GetRoutingHostname(c), libraryClass, "hot")
+		configuredURL := ""
+		if h.config != nil {
+			configuredURL = h.config.Server.URL
+		}
+		return h.storageManager.ResolveStorageClass(httputil.GetRoutingHostname(c, configuredURL), libraryClass, "hot")
 	}
 	if libraryClass != "" {
 		return libraryClass
@@ -1932,11 +1939,15 @@ func (h *SyncHandler) GetDownloadInfo(c *gin.Context) {
 	if encrypted {
 		encryptedInt = 1
 	}
-	relayHost := getEffectiveHostname(c)
+	configuredURL := ""
+	if h.config != nil {
+		configuredURL = h.config.Server.URL
+	}
+	relayHost := getEffectiveHostname(c, configuredURL)
 	response := gin.H{
 		"relay_id":            relayHost,
 		"relay_addr":          relayHost,
-		"relay_port":          getRelayPortFromRequest(c),
+		"relay_port":          getRelayPortFromRequest(c, configuredURL),
 		"email":               userID + "@sesamefs.local",
 		"token":               token,
 		"repo_id":             repoID,

@@ -14,7 +14,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Sesame-Disk/sesamefs/internal/httputil"
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -659,7 +658,7 @@ func (h *AdminHandler) AdminAddGroupOwnedLibrary(c *gin.Context) {
 	if requestedStorageClass == "" {
 		requestedStorageClass = req.StorageClass
 	}
-	resolvedStorageClass, err := resolveCreateStorageClassForOrg(h.db, h.config, callerOrgID, httputil.GetRoutingHostname(c), requestedStorageClass)
+	resolvedStorageClass, err := resolveCreateStorageClassForOrg(h.db, h.config, callerOrgID, routingHostname(c, h.config), requestedStorageClass)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return

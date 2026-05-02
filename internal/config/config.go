@@ -408,6 +408,9 @@ type ServerConfig struct {
 	MaxUploadMB        int64         `yaml:"max_upload_mb"`
 	TrustedProxies     []string      `yaml:"trusted_proxies"`
 	Region             string        `yaml:"region"`
+	URL                string        `yaml:"url"`
+	DesktopCustomBrand string        `yaml:"desktop_custom_brand"`
+	DesktopCustomLogo  string        `yaml:"desktop_custom_logo"`
 	MobileFrontendPath string        `yaml:"mobile_frontend_path"` // Path to mobile frontend dist (default: ./mobile-frontend/dist)
 }
 
@@ -460,6 +463,8 @@ type BackendConfig struct {
 	Endpoint             string `yaml:"endpoint"`               // S3 endpoint
 	Bucket               string `yaml:"bucket"`                 // S3 bucket name
 	Region               string `yaml:"region"`                 // AWS region
+	AccessKey            string `yaml:"access_key"`             // S3 access key (optional, can use env)
+	SecretKey            string `yaml:"secret_key"`             // S3 secret key (optional, can use env)
 	ServerSideEncryption string `yaml:"server_side_encryption"` // Optional SSE mode: AES256 or aws:kms
 	SSEKMSKeyID          string `yaml:"sse_kms_key_id"`         // Optional KMS key ID/ARN when using aws:kms
 	StorageClass         string `yaml:"storage_class"`          // S3 storage class
@@ -774,6 +779,15 @@ func (c *Config) applyEnvOverrides() {
 	if v := os.Getenv("SERVER_REGION"); v != "" {
 		c.Server.Region = strings.ToLower(strings.TrimSpace(v))
 	}
+	if v := os.Getenv("SERVER_URL"); v != "" {
+		c.Server.URL = strings.TrimSuffix(strings.TrimSpace(v), "/")
+	}
+	if v := os.Getenv("DESKTOP_CUSTOM_BRAND"); v != "" {
+		c.Server.DesktopCustomBrand = strings.TrimSpace(v)
+	}
+	if v := os.Getenv("DESKTOP_CUSTOM_LOGO"); v != "" {
+		c.Server.DesktopCustomLogo = strings.TrimSpace(v)
+	}
 
 	// CORS
 	if v := os.Getenv("CORS_ALLOWED_ORIGINS"); v != "" {
@@ -831,6 +845,19 @@ func (c *Config) applyEnvOverrides() {
 			c.Storage.Backends["hot"] = hot
 		}
 	}
+	if v := os.Getenv("S3_ACCESS_KEY_ID"); v != "" {
+		if hot, ok := c.Storage.Backends["hot"]; ok {
+			hot.AccessKey = strings.TrimSpace(v)
+			c.Storage.Backends["hot"] = hot
+		}
+	}
+	if v := os.Getenv("S3_SECRET_ACCESS_KEY"); v != "" {
+		if hot, ok := c.Storage.Backends["hot"]; ok {
+			hot.SecretKey = strings.TrimSpace(v)
+			c.Storage.Backends["hot"] = hot
+		}
+	}
+	applyStorageClassEnvOverrides(c)
 	if c.storageMode() == "single" {
 		c.Storage.DefaultClass = "hot"
 	}
@@ -1334,6 +1361,72 @@ func hasConfiguredStrings(values []string) bool {
 		}
 	}
 	return false
+}
+
+func applyStorageClassEnvOverrides(c *Config) {
+	if c == nil {
+		return
+	}
+	defaultAccessKey := strings.TrimSpace(os.Getenv("S3_ACCESS_KEY_ID"))
+	defaultSecretKey := strings.TrimSpace(os.Getenv("S3_SECRET_ACCESS_KEY"))
+	for name, classCfg := range c.Storage.Classes {
+		if value := storageClassEnvValue(name, "BUCKET"); value != "" {
+			classCfg.Bucket = value
+		}
+		if value := storageClassEnvValue(name, "REGION"); value != "" {
+			classCfg.Region = value
+		}
+		if value := storageClassEnvValue(name, "ENDPOINT"); value != "" {
+			classCfg.Endpoint = value
+		}
+		if value := storageClassEnvValue(name, "ACCESS_KEY_ID"); value != "" {
+			classCfg.AccessKey = value
+		} else if strings.TrimSpace(classCfg.AccessKey) == "" {
+			classCfg.AccessKey = defaultAccessKey
+		}
+		if value := storageClassEnvValue(name, "SECRET_ACCESS_KEY"); value != "" {
+			classCfg.SecretKey = value
+		} else if strings.TrimSpace(classCfg.SecretKey) == "" {
+			classCfg.SecretKey = defaultSecretKey
+		}
+		if value := storageClassEnvValue(name, "SERVER_SIDE_ENCRYPTION"); value != "" {
+			classCfg.ServerSideEncryption = value
+		}
+		if value := storageClassEnvValue(name, "SSE_KMS_KEY_ID"); value != "" {
+			classCfg.SSEKMSKeyID = value
+		}
+		c.Storage.Classes[name] = classCfg
+	}
+}
+
+func storageClassEnvPrefix(name string) string {
+	var builder strings.Builder
+	builder.Grow(len(name))
+	lastUnderscore := false
+	for _, ch := range strings.ToUpper(strings.TrimSpace(name)) {
+		if (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') {
+			builder.WriteRune(ch)
+			lastUnderscore = false
+			continue
+		}
+		if !lastUnderscore {
+			builder.WriteByte('_')
+			lastUnderscore = true
+		}
+	}
+	return strings.Trim(builder.String(), "_")
+}
+
+func storageClassEnvVar(name, suffix string) string {
+	prefix := storageClassEnvPrefix(name)
+	if prefix == "" {
+		return suffix
+	}
+	return "S3_CLASS_" + prefix + "_" + suffix
+}
+
+func storageClassEnvValue(name, suffix string) string {
+	return strings.TrimSpace(os.Getenv(storageClassEnvVar(name, suffix)))
 }
 
 func getEnv(key, defaultValue string) string {

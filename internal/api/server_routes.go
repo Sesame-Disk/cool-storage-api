@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"net/http"
-	"os"
 	"strings"
 
 	v2 "github.com/Sesame-Disk/sesamefs/internal/api/v2"
@@ -106,15 +105,8 @@ func (s *Server) registerCoreRoutes() {
 }
 
 func (s *Server) resolveServerURL() string {
-	// FILE_SERVER_ROOT takes highest priority (like Seahub's FILE_SERVER_ROOT setting),
-	// SERVER_URL is second priority, and request-host auto-detection is the fallback.
-	serverURL := os.Getenv("FILE_SERVER_ROOT")
-	if serverURL != "" {
-		serverURL = strings.TrimSuffix(serverURL, "/seafhttp")
-		return strings.TrimSuffix(serverURL, "/")
-	}
-
-	if serverURL = os.Getenv("SERVER_URL"); serverURL != "" {
+	// SERVER_URL is the explicit override; otherwise callers fall back to request-host autodetection.
+	if serverURL := strings.TrimSpace(s.config.Server.URL); serverURL != "" {
 		return strings.TrimSuffix(serverURL, "/")
 	}
 
@@ -359,7 +351,7 @@ func (s *Server) registerPublicRoutes(serverURL string) {
 func (s *Server) registerCompatibilityRoutes(serverURL string) {
 	v2.RegisterFileViewRoutes(s.router, s.db, s.config, s.storage, s.storageManager, s.tokenStore, serverURL, s.authMiddleware(), s.permMiddleware)
 
-	seafHTTPHandler := NewSeafHTTPHandler(s.storage, s.storageManager, s.db, s.tokenStore, s.permMiddleware)
+	seafHTTPHandler := NewSeafHTTPHandler(s.storage, s.storageManager, s.db, s.tokenStore, s.config, s.permMiddleware)
 	seafHTTPHandler.SetZipLimits(s.config.SeafHTTP.ZipMaxEntries, s.config.SeafHTTP.ZipMaxDepth, s.config.SeafHTTP.ZipMaxBytes)
 	if s.zipRateLimiter != nil {
 		seafHTTPHandler.RegisterSeafHTTPRoutes(s.router, s.zipRateLimiter.Limit())
@@ -367,7 +359,7 @@ func (s *Server) registerCompatibilityRoutes(serverURL string) {
 		seafHTTPHandler.RegisterSeafHTTPRoutes(s.router)
 	}
 
-	syncHandler := NewSyncHandler(s.db, s.storage, s.blockStore, s.storageManager, s.permMiddleware)
+	syncHandler := NewSyncHandler(s.db, s.storage, s.blockStore, s.storageManager, s.config, s.permMiddleware)
 	syncHandler.SetTokenCreator(s.tokenStore)
 	syncHandler.RegisterSyncRoutes(s.router, s.syncAuthMiddleware())
 }

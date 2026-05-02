@@ -4,7 +4,6 @@ package httputil
 
 import (
 	"net/url"
-	"os"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -117,8 +116,8 @@ func GetBrowserURL(c *gin.Context, configuredURL string) string {
 // Precedence (highest to lowest):
 //  1. X-Forwarded-Host header — preserves the original public hostname through proxies
 //  2. c.Request.Host — direct client host when no forwarding proxy is present
-//  3. SERVER_URL env var — last-resort fallback only when the request carries no host context
-func GetRoutingHostname(c *gin.Context) string {
+//  3. configuredURL — last-resort fallback only when the request carries no host context
+func GetRoutingHostname(c *gin.Context, configuredURL string) string {
 	if c != nil {
 		if fwdHost := firstForwardedValue(c.GetHeader("X-Forwarded-Host")); fwdHost != "" {
 			return NormalizeHostname(fwdHost)
@@ -127,16 +126,16 @@ func GetRoutingHostname(c *gin.Context) string {
 			return host
 		}
 	}
-	return hostnameFromServerURL(os.Getenv("SERVER_URL"))
+	return hostnameFromServerURL(configuredURL)
 }
 
 // GetEffectiveHostname returns the real external hostname for relay_id / relay_addr.
 // Precedence (highest to lowest):
-//  1. SERVER_URL env var — explicitly configured by the admin
+//  1. configuredURL — explicitly configured by the admin
 //  2. X-Forwarded-Host header — set by nginx/traefik when proxying
 //  3. c.Request.Host — last resort (works for direct connections)
-func GetEffectiveHostname(c *gin.Context) string {
-	if host := hostnameFromServerURL(os.Getenv("SERVER_URL")); host != "" {
+func GetEffectiveHostname(c *gin.Context, configuredURL string) string {
+	if host := hostnameFromServerURL(configuredURL); host != "" {
 		return host
 	}
 	if fwdHost := firstForwardedValue(c.GetHeader("X-Forwarded-Host")); fwdHost != "" {
@@ -147,9 +146,8 @@ func GetEffectiveHostname(c *gin.Context) string {
 
 // GetRelayPortFromRequest extracts the port from the request context.
 // If no explicit port, returns the default for the detected scheme (443/80).
-func GetRelayPortFromRequest(c *gin.Context) string {
-	// If SERVER_URL is set, extract port from it
-	if serverURL := os.Getenv("SERVER_URL"); serverURL != "" {
+func GetRelayPortFromRequest(c *gin.Context, configuredURL string) string {
+	if serverURL := strings.TrimSpace(configuredURL); serverURL != "" {
 		serverURL = strings.TrimSuffix(strings.TrimSpace(serverURL), "/")
 		if parsed, err := url.Parse(serverURL); err == nil {
 			if port := parsed.Port(); port != "" {
@@ -189,9 +187,9 @@ func GetRelayPortFromRequest(c *gin.Context) string {
 }
 
 // GetBaseURLFromRequest derives the server base URL from the incoming request.
-// Respects SERVER_URL env var, X-Forwarded-Proto/Host headers, and TLS state.
-func GetBaseURLFromRequest(c *gin.Context) string {
-	return GetBrowserURL(c, os.Getenv("SERVER_URL"))
+// Respects configuredURL, X-Forwarded-Proto/Host headers, and TLS state.
+func GetBaseURLFromRequest(c *gin.Context, configuredURL string) string {
+	return GetBrowserURL(c, configuredURL)
 }
 
 // NormalizeHostname normalises a hostname for comparison: lowercase, strip port,

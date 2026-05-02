@@ -8,6 +8,59 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-05-02 — Config: centralize `SERVER_URL` / branding / S3 creds
+
+### Refactor
+
+Environment variables that were previously read at request time are now
+resolved once at config load via `applyEnvOverrides` and exposed through
+`Config`. Removes repeated `os.Getenv` calls from request handlers and
+makes the configuration surface introspectable.
+
+- `ServerConfig` gains `URL`, `DesktopCustomBrand`, `DesktopCustomLogo`
+  (env: `SERVER_URL`, `DESKTOP_CUSTOM_BRAND`, `DESKTOP_CUSTOM_LOGO`).
+- `BackendConfig` gains `AccessKey` / `SecretKey` (YAML-settable; env
+  cascade `S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY` still works).
+- `httputil.GetRoutingHostname` / `GetEffectiveHostname` /
+  `GetRelayPortFromRequest` / `GetBaseURLFromRequest` now take a
+  `configuredURL` parameter instead of reading `SERVER_URL` directly.
+  All callers in `internal/api` and `internal/api/v2` pass
+  `s.config.Server.URL` (a `routingHostname/effectiveHostname/...`
+  helper trio in `v2/storage_resolution.go` keeps v2 sites tidy).
+- `applyStorageClassEnvOverrides` consolidates the
+  `S3_CLASS_<NAME>_*` cascade into config load; `initStorageClass`
+  / `initS3Storage` are now pure config readers.
+
+### Breaking
+
+- **`FILE_SERVER_ROOT` is no longer honored.** Use `SERVER_URL`. The
+  legacy precedence in `resolveServerURL` (`FILE_SERVER_ROOT` >
+  `SERVER_URL` > request autodetect) is gone — only `SERVER_URL`
+  overrides request-host autodetection now.
+
+### Behavior change
+
+- `DESKTOP_CUSTOM_BRAND` / `DESKTOP_CUSTOM_LOGO` are read at process
+  start, not per request. Changing the env requires a restart to take
+  effect.
+
+### Files
+
+- `internal/config/config.go` — new server/backend fields + env
+  overrides + storage-class env helpers
+- `internal/httputil/relay.go` — hostname/relay helpers take
+  `configuredURL` parameter
+- `internal/api/server.go`, `server_routes.go`, `seafhttp.go`,
+  `sync.go`, `bootstrap.go` — pass `s.config.Server.URL` through
+- `internal/api/v2/storage_resolution.go` — local `routingHostname` /
+  `effectiveHostname` / `relayPortFromRequest(c, cfg)` wrappers
+- `internal/api/v2/{admin_extra,admin_libraries,blocks,files,groups,libraries,org_admin_groups}.go`
+  — switch to wrappers
+- `configs/config*.yaml` — new `url`, `desktop_custom_brand`,
+  `desktop_custom_logo` keys
+
+---
+
 ## 2026-04-28 — GC Queue Redesign: Honest Status, Durable Queue, DLQ
 
 ### Problem
@@ -2149,7 +2202,7 @@ Updated all `onSearchedClick()` handlers to include auth token:
 - Added nginx proxy rule for `/repo/[^/]+/(raw|history)/` paths
 
 ### Download URL Fix
-- Fixed `getBrowserURL()` in `files.go` to prefer configured `SERVER_URL`/`FILE_SERVER_ROOT` over request Host header
+- Fixed `getBrowserURL()` in `files.go` to prefer configured `SERVER_URL` over request Host header
 - Previously, nginx passed `$http_host` (browser port 3000) to backend, causing download URLs to point to wrong port
 - Fixed `fileview.go:ServeRawFile` to use `getBrowserURL()` consistently
 
@@ -2164,7 +2217,7 @@ Updated all `onSearchedClick()` handlers to include auth token:
 ### Files Changed
 - `internal/api/v2/fileview.go` — Added `storageManager` field, `DownloadHistoricFile` handler, history download route
 - `internal/api/v2/fileview_test.go` — 6 new unit tests for history download
-- `internal/api/server.go` — Pass `storageManager` to `RegisterFileViewRoutes`, `FILE_SERVER_ROOT` env var
+- `internal/api/server.go` — Pass `storageManager` to `RegisterFileViewRoutes`, `SERVER_URL` env var
 - `internal/api/v2/files.go` — Fixed `getBrowserURL()` to prefer configured URL
 - `internal/api/v2/departments_test.go` — Updated `TestGetBrowserURL` for new behavior
 - `internal/crypto/coverage_test.go` — NEW: 25 crypto unit tests

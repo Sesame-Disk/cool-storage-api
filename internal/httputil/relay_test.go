@@ -9,38 +9,32 @@ import (
 )
 
 func TestGetRoutingHostnamePrefersRequestHostOverServerURL(t *testing.T) {
-	t.Setenv("SERVER_URL", "https://files.example.com")
-
 	c, _ := gin.CreateTestContext(httptest.NewRecorder())
 	c.Request = httptest.NewRequest(http.MethodGet, "/api/v2.1/bootstrap/", nil)
 	c.Request.Host = "eu.example.com"
 
-	if got := GetRoutingHostname(c); got != "eu.example.com" {
+	if got := GetRoutingHostname(c, "https://files.example.com"); got != "eu.example.com" {
 		t.Fatalf("GetRoutingHostname = %q, want %q", got, "eu.example.com")
 	}
 }
 
 func TestGetRoutingHostnamePrefersForwardedHost(t *testing.T) {
-	t.Setenv("SERVER_URL", "https://files.example.com")
-
 	c, _ := gin.CreateTestContext(httptest.NewRecorder())
 	c.Request = httptest.NewRequest(http.MethodGet, "/api/v2.1/bootstrap/", nil)
 	c.Request.Host = "internal.example.local"
 	c.Request.Header.Set("X-Forwarded-Host", "us.example.com")
 
-	if got := GetRoutingHostname(c); got != "us.example.com" {
+	if got := GetRoutingHostname(c, "https://files.example.com"); got != "us.example.com" {
 		t.Fatalf("GetRoutingHostname = %q, want %q", got, "us.example.com")
 	}
 }
 
 func TestGetEffectiveHostnameStillPrefersServerURL(t *testing.T) {
-	t.Setenv("SERVER_URL", "https://files.example.com")
-
 	c, _ := gin.CreateTestContext(httptest.NewRecorder())
 	c.Request = httptest.NewRequest(http.MethodGet, "/api/v2.1/bootstrap/", nil)
 	c.Request.Host = "eu.example.com"
 
-	if got := GetEffectiveHostname(c); got != "files.example.com" {
+	if got := GetEffectiveHostname(c, "https://files.example.com"); got != "files.example.com" {
 		t.Fatalf("GetEffectiveHostname = %q, want %q", got, "files.example.com")
 	}
 }
@@ -163,12 +157,6 @@ func TestGetRelayPortFromRequest(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if tt.serverURL != "" {
-				t.Setenv("SERVER_URL", tt.serverURL)
-			} else {
-				t.Setenv("SERVER_URL", "")
-			}
-
 			w := httptest.NewRecorder()
 			c, _ := gin.CreateTestContext(w)
 			c.Request = httptest.NewRequest(http.MethodGet, "/test", nil)
@@ -180,7 +168,7 @@ func TestGetRelayPortFromRequest(t *testing.T) {
 				c.Request.Header.Set("X-Forwarded-Proto", tt.xProto)
 			}
 
-			if got := GetRelayPortFromRequest(c); got != tt.want {
+			if got := GetRelayPortFromRequest(c, tt.serverURL); got != tt.want {
 				t.Fatalf("GetRelayPortFromRequest() = %q, want %q", got, tt.want)
 			}
 		})

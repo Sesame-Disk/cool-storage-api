@@ -13,6 +13,9 @@ server:
   write_timeout: 0s        # No write timeout — large downloads/zips can take minutes
   max_upload_mb: 10240     # 10240 MB (~10 GiB) max upload size
   trusted_proxies: []      # Secure default: trust no forwarded client IP headers; set exact reverse-proxy IP/CIDRs in prod
+  url: ""                 # Optional explicit public base URL; usually override via SERVER_URL when proxy autodetection is insufficient
+  desktop_custom_brand: "" # Optional desktop-client brand label; can also be set via DESKTOP_CUSTOM_BRAND
+  desktop_custom_logo: "" # Optional desktop-client logo URL; can also be set via DESKTOP_CUSTOM_LOGO
   mobile_frontend_path: "./mobile-frontend/dist" # Built mobile frontend directory
 
 database:

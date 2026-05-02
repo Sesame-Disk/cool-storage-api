@@ -23,6 +23,7 @@ import (
 	"time"
 
 	v2 "github.com/Sesame-Disk/sesamefs/internal/api/v2"
+	"github.com/Sesame-Disk/sesamefs/internal/config"
 	"github.com/Sesame-Disk/sesamefs/internal/crypto"
 	"github.com/Sesame-Disk/sesamefs/internal/db"
 	"github.com/Sesame-Disk/sesamefs/internal/httputil"
@@ -606,6 +607,7 @@ type SeafHTTPHandler struct {
 	storageManager *storage.Manager
 	db             *db.DB
 	tokenStore     TokenStore
+	config         *config.Config
 	permMiddleware *middleware.PermissionMiddleware
 	zipMaxEntries  int
 	zipMaxDepth    int
@@ -662,12 +664,13 @@ func (b *zipTraversalBudget) noteFile(size int64) error {
 }
 
 // NewSeafHTTPHandler creates a new SeafHTTP handler
-func NewSeafHTTPHandler(s3Store *storage.S3Store, storageManager *storage.Manager, database *db.DB, tokenStore TokenStore, permMiddleware *middleware.PermissionMiddleware) *SeafHTTPHandler {
+func NewSeafHTTPHandler(s3Store *storage.S3Store, storageManager *storage.Manager, database *db.DB, tokenStore TokenStore, cfg *config.Config, permMiddleware *middleware.PermissionMiddleware) *SeafHTTPHandler {
 	return &SeafHTTPHandler{
 		storage:        s3Store,
 		storageManager: storageManager,
 		db:             database,
 		tokenStore:     tokenStore,
+		config:         cfg,
 		permMiddleware: permMiddleware,
 		zipMaxEntries:  defaultZipMaxEntries,
 		zipMaxDepth:    defaultZipMaxDepth,
@@ -685,6 +688,13 @@ func (h *SeafHTTPHandler) SetZipLimits(maxEntries, maxDepth int, maxBytes int64)
 	if maxBytes > 0 {
 		h.zipMaxBytes = maxBytes
 	}
+}
+
+func (h *SeafHTTPHandler) configuredServerURL() string {
+	if h == nil || h.config == nil {
+		return ""
+	}
+	return h.config.Server.URL
 }
 
 func (h *SeafHTTPHandler) newZipTraversalBudget() *zipTraversalBudget {
@@ -994,10 +1004,10 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 
 	// Store using PutAuto (automatically uses multipart for large files)
 	ctx := context.Background()
-	blockStore, actualStorageClass, err := h.resolveLibraryBlockStore(httputil.GetRoutingHostname(c), token.OrgID, token.RepoID)
+	blockStore, actualStorageClass, err := h.resolveLibraryBlockStore(httputil.GetRoutingHostname(c, h.configuredServerURL()), token.OrgID, token.RepoID)
 	if err != nil {
 		log.Printf("[HandleUpload] Failed to get block store: %v, falling back to S3", err)
-		objectStore, _, resolveErr := h.resolveLibraryObjectStore(httputil.GetRoutingHostname(c), token.OrgID, token.RepoID)
+		objectStore, _, resolveErr := h.resolveLibraryObjectStore(httputil.GetRoutingHostname(c, h.configuredServerURL()), token.OrgID, token.RepoID)
 		if resolveErr != nil {
 			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "block storage not available"})
 			return
@@ -1089,7 +1099,7 @@ func (h *SeafHTTPHandler) finalizeUploadStreaming(c *gin.Context, token *AccessT
 		}
 	}
 
-	blockStore, actualStorageClass, err := h.resolveLibraryBlockStore(httputil.GetRoutingHostname(c), token.OrgID, token.RepoID)
+	blockStore, actualStorageClass, err := h.resolveLibraryBlockStore(httputil.GetRoutingHostname(c, h.configuredServerURL()), token.OrgID, token.RepoID)
 	if err != nil {
 		return "", "", fmt.Errorf("block store not available: %w", err)
 	}
@@ -1672,7 +1682,7 @@ func (h *SeafHTTPHandler) HandleDownload(c *gin.Context) {
 	}
 
 	// Fallback: Stream directly from the resolved object store.
-	objectStore, _, err := h.resolveLibraryObjectStore(httputil.GetRoutingHostname(c), token.OrgID, token.RepoID)
+	objectStore, _, err := h.resolveLibraryObjectStore(httputil.GetRoutingHostname(c, h.configuredServerURL()), token.OrgID, token.RepoID)
 	if err != nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "storage not available"})
 		return
@@ -1807,7 +1817,7 @@ func (h *SeafHTTPHandler) lookupFileBlocks(hostname string, token *AccessToken) 
 // Uses prefetching (overlap S3 fetch with HTTP write) and 4MB io.CopyBuffer
 // for maximum throughput. Only O(2 × block_size) RAM.
 func (h *SeafHTTPHandler) streamFileFromBlocks(c *gin.Context, token *AccessToken, filename string, periodStartedAt time.Time) error {
-	blockIDs, fileSize, fileKey, blockStore, err := h.lookupFileBlocks(httputil.GetRoutingHostname(c), token)
+	blockIDs, fileSize, fileKey, blockStore, err := h.lookupFileBlocks(httputil.GetRoutingHostname(c, h.configuredServerURL()), token)
 	if err != nil {
 		return err
 	}
@@ -1849,7 +1859,7 @@ func (h *SeafHTTPHandler) streamFileFromBlocks(c *gin.Context, token *AccessToke
 // DEPRECATED: Use streamFileFromBlocks for downloads. This is kept only for
 // upload metadata (commitUploadedFile) where the full content is already in memory.
 func (h *SeafHTTPHandler) getFileFromBlocks(c *gin.Context, token *AccessToken) ([]byte, error) {
-	blockIDs, _, fileKey, blockStore, err := h.lookupFileBlocks(httputil.GetRoutingHostname(c), token)
+	blockIDs, _, fileKey, blockStore, err := h.lookupFileBlocks(httputil.GetRoutingHostname(c, h.configuredServerURL()), token)
 	if err != nil {
 		return nil, err
 	}
@@ -2121,7 +2131,7 @@ func (h *SeafHTTPHandler) HandleZipDownload(c *gin.Context) {
 
 	// Recursively add directory contents to the ZIP
 	runtimeBudget := h.newZipTraversalBudget()
-	if err := h.addDirToZip(c.Request.Context(), httputil.GetRoutingHostname(c), zipWriter, token.RepoID, token.OrgID, targetFSID, "", fileKey, 0, runtimeBudget); err != nil {
+	if err := h.addDirToZip(c.Request.Context(), httputil.GetRoutingHostname(c, h.configuredServerURL()), zipWriter, token.RepoID, token.OrgID, targetFSID, "", fileKey, 0, runtimeBudget); err != nil {
 		log.Printf("[HandleZipDownload] ZIP stream aborted: %v", err)
 		return
 	}

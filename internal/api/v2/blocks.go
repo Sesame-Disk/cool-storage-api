@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/Sesame-Disk/sesamefs/internal/config"
-	"github.com/Sesame-Disk/sesamefs/internal/httputil"
 	"github.com/Sesame-Disk/sesamefs/internal/middleware"
 	"github.com/Sesame-Disk/sesamefs/internal/storage"
 	"github.com/Sesame-Disk/sesamefs/internal/traffic"
@@ -63,7 +62,7 @@ func (h *BlockHandler) getBlockStore(c *gin.Context) (*storage.BlockStore, strin
 	}
 
 	// Resolve storage class based on hostname
-	hostname := httputil.GetRoutingHostname(c)
+	hostname := routingHostname(c, h.config)
 	storageClass := h.storageManager.ResolveStorageClass(hostname, "", "hot")
 
 	// Get healthy BlockStore with failover

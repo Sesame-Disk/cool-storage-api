@@ -224,7 +224,6 @@ func TestResolveBlockLookupFallbackClassUsesLibraryPreference(t *testing.T) {
 	c, _ := gin.CreateTestContext(httptest.NewRecorder())
 	c.Request = httptest.NewRequest(http.MethodGet, "/seafhttp/repo/repo-id/block/block-id", nil)
 	c.Request.Host = "eu.sesamefs.local"
-	t.Setenv("SERVER_URL", "https://files.example.com")
 
 	if got := h.resolveBlockLookupFallbackClass(c, "org-id", "repo-id", "missing-class"); got != "hot-s3-eu" {
 		t.Fatalf("resolveBlockLookupFallbackClass = %q, want %q", got, "hot-s3-eu")

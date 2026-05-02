@@ -10,6 +10,9 @@ server:
   write_timeout: 0s
   max_upload_mb: 10240
   trusted_proxies: []
+  url: ""
+  desktop_custom_brand: ""
+  desktop_custom_logo: ""
   mobile_frontend_path: "./mobile-frontend/dist"
 
 database:

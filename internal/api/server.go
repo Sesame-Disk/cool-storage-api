@@ -12,7 +12,6 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
-	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -381,10 +380,14 @@ func initStorageManager(cfg *config.Config) *storage.Manager {
 			continue
 		}
 		classCfg := config.StorageClassConfig{
-			Type:     backendCfg.Type,
-			Bucket:   backendCfg.Bucket,
-			Region:   backendCfg.Region,
-			Endpoint: backendCfg.Endpoint,
+			Type:                 backendCfg.Type,
+			Bucket:               backendCfg.Bucket,
+			Region:               backendCfg.Region,
+			Endpoint:             backendCfg.Endpoint,
+			AccessKey:            backendCfg.AccessKey,
+			SecretKey:            backendCfg.SecretKey,
+			ServerSideEncryption: backendCfg.ServerSideEncryption,
+			SSEKMSKeyID:          backendCfg.SSEKMSKeyID,
 		}
 		s3Store, err := initStorageClass(name, classCfg)
 		if err != nil {
@@ -402,87 +405,23 @@ func initStorageManager(cfg *config.Config) *storage.Manager {
 	return manager
 }
 
-func storageClassEnvPrefix(name string) string {
-	var builder strings.Builder
-	builder.Grow(len(name))
-	lastUnderscore := false
-	for _, ch := range strings.ToUpper(strings.TrimSpace(name)) {
-		if (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') {
-			builder.WriteRune(ch)
-			lastUnderscore = false
-			continue
-		}
-		if !lastUnderscore {
-			builder.WriteByte('_')
-			lastUnderscore = true
-		}
-	}
-	return strings.Trim(builder.String(), "_")
-}
-
-func storageClassEnvVar(name, suffix string) string {
-	prefix := storageClassEnvPrefix(name)
-	if prefix == "" {
-		return suffix
-	}
-	return "S3_CLASS_" + prefix + "_" + suffix
-}
-
-func storageClassEnvValue(name, suffix string) string {
-	return strings.TrimSpace(os.Getenv(storageClassEnvVar(name, suffix)))
-}
-
-func envValue(name string) string {
-	return strings.TrimSpace(os.Getenv(name))
-}
-
 // initStorageClass creates an S3Store for a storage class config
 func initStorageClass(name string, cfg config.StorageClassConfig) (*storage.S3Store, error) {
-	bucket := cfg.Bucket
-	if value := storageClassEnvValue(name, "BUCKET"); value != "" {
-		bucket = value
-	}
-	if strings.TrimSpace(bucket) == "" {
-		return nil, fmt.Errorf("storage class %s bucket is not configured; set %s", name, storageClassEnvVar(name, "BUCKET"))
+	bucket := strings.TrimSpace(cfg.Bucket)
+	if bucket == "" {
+		return nil, fmt.Errorf("storage class %s bucket is not configured", name)
 	}
 
-	region := cfg.Region
-	if value := storageClassEnvValue(name, "REGION"); value != "" {
-		region = value
-	}
+	region := strings.TrimSpace(cfg.Region)
 	if region == "" {
 		region = "us-east-1"
 	}
 
-	endpoint := cfg.Endpoint
-	if value := storageClassEnvValue(name, "ENDPOINT"); value != "" {
-		endpoint = value
-	}
-
-	// Get credentials from class-specific env or config, then fall back to the default env pair.
-	accessKey := storageClassEnvValue(name, "ACCESS_KEY_ID")
-	if accessKey == "" {
-		accessKey = cfg.AccessKey
-	}
-	secretKey := storageClassEnvValue(name, "SECRET_ACCESS_KEY")
-	if secretKey == "" {
-		secretKey = cfg.SecretKey
-	}
-	if accessKey == "" {
-		accessKey = envValue("S3_ACCESS_KEY_ID")
-	}
-	if secretKey == "" {
-		secretKey = envValue("S3_SECRET_ACCESS_KEY")
-	}
-
-	serverSideEncryption := cfg.ServerSideEncryption
-	if value := storageClassEnvValue(name, "SERVER_SIDE_ENCRYPTION"); value != "" {
-		serverSideEncryption = value
-	}
-	sseKMSKeyID := cfg.SSEKMSKeyID
-	if value := storageClassEnvValue(name, "SSE_KMS_KEY_ID"); value != "" {
-		sseKMSKeyID = value
-	}
+	endpoint := strings.TrimSpace(cfg.Endpoint)
+	accessKey := strings.TrimSpace(cfg.AccessKey)
+	secretKey := strings.TrimSpace(cfg.SecretKey)
+	serverSideEncryption := strings.TrimSpace(cfg.ServerSideEncryption)
+	sseKMSKeyID := strings.TrimSpace(cfg.SSEKMSKeyID)
 
 	// Determine access type from tier
 	accessType := storage.AccessImmediate
@@ -507,35 +446,27 @@ func initStorageClass(name string, cfg config.StorageClassConfig) (*storage.S3St
 
 // initS3Storage initializes the S3 storage backend (legacy, single backend)
 func initS3Storage(cfg *config.Config) (*storage.S3Store, error) {
-	// Get S3 configuration from environment or config
-	endpoint := os.Getenv("S3_ENDPOINT")
-	bucket := os.Getenv("S3_BUCKET")
-	region := envValue("S3_REGION")
-	accessKey := envValue("S3_ACCESS_KEY_ID")
-	secretKey := envValue("S3_SECRET_ACCESS_KEY")
-	sseMode := os.Getenv("S3_SERVER_SIDE_ENCRYPTION")
-	sseKMSKeyID := os.Getenv("S3_SSE_KMS_KEY_ID")
+	var (
+		endpoint    string
+		bucket      string
+		region      string
+		accessKey   string
+		secretKey   string
+		sseMode     string
+		sseKMSKeyID string
+	)
 
 	// Fall back only to the legacy single-backend config.
 	// Do not derive the singleton store from storage.classes; multi-region nodes
 	// must use storageManager-backed resolution instead of a process-wide default.
-	if bucket == "" {
-		if hotBackend, ok := cfg.Storage.Backends["hot"]; ok {
-			// Fall back to legacy backends
-			if endpoint == "" {
-				endpoint = hotBackend.Endpoint
-			}
-			bucket = hotBackend.Bucket
-			if region == "" {
-				region = hotBackend.Region
-			}
-			if sseMode == "" {
-				sseMode = hotBackend.ServerSideEncryption
-			}
-			if sseKMSKeyID == "" {
-				sseKMSKeyID = hotBackend.SSEKMSKeyID
-			}
-		}
+	if hotBackend, ok := cfg.Storage.Backends["hot"]; ok {
+		endpoint = strings.TrimSpace(hotBackend.Endpoint)
+		bucket = strings.TrimSpace(hotBackend.Bucket)
+		region = strings.TrimSpace(hotBackend.Region)
+		accessKey = strings.TrimSpace(hotBackend.AccessKey)
+		secretKey = strings.TrimSpace(hotBackend.SecretKey)
+		sseMode = strings.TrimSpace(hotBackend.ServerSideEncryption)
+		sseKMSKeyID = strings.TrimSpace(hotBackend.SSEKMSKeyID)
 	}
 
 	if bucket == "" {
@@ -1198,18 +1129,18 @@ func (s *Server) handleNotImplemented(c *gin.Context) {
 }
 
 // getEffectiveHostname delegates to httputil.GetEffectiveHostname.
-func getEffectiveHostname(c *gin.Context) string {
-	return httputil.GetEffectiveHostname(c)
+func getEffectiveHostname(c *gin.Context, configuredURL string) string {
+	return httputil.GetEffectiveHostname(c, configuredURL)
 }
 
 // getBaseURLFromRequest delegates to httputil.GetBaseURLFromRequest.
-func getBaseURLFromRequest(c *gin.Context) string {
-	return httputil.GetBaseURLFromRequest(c)
+func getBaseURLFromRequest(c *gin.Context, configuredURL string) string {
+	return httputil.GetBaseURLFromRequest(c, configuredURL)
 }
 
 // getRelayPortFromRequest delegates to httputil.GetRelayPortFromRequest.
-func getRelayPortFromRequest(c *gin.Context) string {
-	return httputil.GetRelayPortFromRequest(c)
+func getRelayPortFromRequest(c *gin.Context, configuredURL string) string {
+	return httputil.GetRelayPortFromRequest(c, configuredURL)
 }
 
 // handleAuthToken handles the Seafile CLI auth-token endpoint
@@ -1321,8 +1252,7 @@ func (s *Server) handleServerInfo(c *gin.Context) {
 		features = append(features, "client-sso-via-local-browser")
 	}
 
-	// Brand name — override with DESKTOP_CUSTOM_BRAND env var in production
-	brand := os.Getenv("DESKTOP_CUSTOM_BRAND")
+	brand := strings.TrimSpace(s.config.Server.DesktopCustomBrand)
 	if brand == "" {
 		brand = "Sesame Disk"
 	}
@@ -1339,10 +1269,9 @@ func (s *Server) handleServerInfo(c *gin.Context) {
 
 	// file_server_root tells the desktop client/SeaDrive where the fileserver (seafhttp)
 	// is located. Derived from the request host so it works in multi-tenant setups.
-	info["file_server_root"] = getBaseURLFromRequest(c) + "/seafhttp"
+	info["file_server_root"] = getBaseURLFromRequest(c, s.config.Server.URL) + "/seafhttp"
 
-	// Logo URL — optional, set via DESKTOP_CUSTOM_LOGO env var
-	if logo := os.Getenv("DESKTOP_CUSTOM_LOGO"); logo != "" {
+	if logo := strings.TrimSpace(s.config.Server.DesktopCustomLogo); logo != "" {
 		info["desktop-custom-logo"] = logo
 	}
 
@@ -1418,7 +1347,7 @@ func (s *Server) handleClientSSOLink(c *gin.Context) {
 		return
 	}
 
-	baseURL := httputil.GetBrowserURL(c, os.Getenv("SERVER_URL"))
+	baseURL := httputil.GetBrowserURL(c, s.config.Server.URL)
 
 	// Use /client-sso/TOKEN/ path — matches seahub's reverse('client_sso', args=[token]).
 	// Seafile desktop clients parse the pending token from the last path segment.
@@ -1633,7 +1562,7 @@ func (s *Server) handleAccountInfo(c *gin.Context) {
 		"usage":                       userUsedBytes,
 		"total":                       quotaBytes,
 		"space_usage":                 spaceUsage,
-		"avatar_url":                  getBaseURLFromRequest(c) + "/static/img/default-avatar.png",
+		"avatar_url":                  getBaseURLFromRequest(c, s.config.Server.URL) + "/static/img/default-avatar.png",
 		"enable_subscription":         true,
 		"file_updates_email_interval": 0,
 		"collaborate_email_interval":  0,
@@ -1909,7 +1838,7 @@ func (s *Server) handleSearchUser(c *gin.Context) {
 		users = append(users, gin.H{
 			"email":         email,
 			"name":          displayName,
-			"avatar_url":    getBaseURLFromRequest(c) + "/static/img/default-avatar.png",
+			"avatar_url":    getBaseURLFromRequest(c, s.config.Server.URL) + "/static/img/default-avatar.png",
 			"contact_email": email,
 			"login_id":      email,
 		})
@@ -2122,7 +2051,7 @@ func (s *Server) handleEmptyGroups(c *gin.Context) {
 // buildOAuthCallbackURI constructs the server-side OAuth callback URI, respecting
 // the SERVER_URL env var when running behind a reverse proxy.
 func (s *Server) buildOAuthCallbackURI(c *gin.Context) string {
-	if serverURL := os.Getenv("SERVER_URL"); serverURL != "" {
+	if serverURL := strings.TrimSpace(s.config.Server.URL); serverURL != "" {
 		return strings.TrimSuffix(serverURL, "/") + "/oauth/callback/"
 	}
 	scheme := "https"

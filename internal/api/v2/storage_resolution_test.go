@@ -23,7 +23,7 @@ func TestResolvePreferredLibraryStorageClassForRequestUsesLibraryOverride(t *tes
 	c.Request = httptest.NewRequest(http.MethodGet, "/repo/repo-id/raw/file.txt", nil)
 	c.Request.Host = "eu.sesamefs.local"
 
-	if got := resolvePreferredLibraryStorageClassForRequest(c, manager, "hot-s3-usa", ""); got != "hot-s3-usa" {
+	if got := resolvePreferredLibraryStorageClassForRequest(c, nil, manager, "hot-s3-usa", ""); got != "hot-s3-usa" {
 		t.Fatalf("resolvePreferredLibraryStorageClassForRequest = %q, want %q", got, "hot-s3-usa")
 	}
 }
@@ -41,14 +41,12 @@ func TestResolvePreferredLibraryStorageClassForRequestUsesEndpointRoutingFallbac
 	c.Request = httptest.NewRequest(http.MethodGet, "/repo/repo-id/raw/file.txt", nil)
 	c.Request.Host = "eu.sesamefs.local"
 
-	if got := resolvePreferredLibraryStorageClassForRequest(c, manager, "", ""); got != "hot-s3-eu" {
+	if got := resolvePreferredLibraryStorageClassForRequest(c, nil, manager, "", ""); got != "hot-s3-eu" {
 		t.Fatalf("resolvePreferredLibraryStorageClassForRequest = %q, want %q", got, "hot-s3-eu")
 	}
 }
 
 func TestResolvePreferredLibraryStorageClassForRequestIgnoresServerURLForRouting(t *testing.T) {
-	t.Setenv("SERVER_URL", "https://files.example.com")
-
 	manager := storage.NewManager()
 	manager.SetDefaultClass("hot-minio-local")
 	manager.SetEndpointRegions(map[string]string{"eu.sesamefs.local": "eu"})
@@ -61,13 +59,13 @@ func TestResolvePreferredLibraryStorageClassForRequestIgnoresServerURLForRouting
 	c.Request = httptest.NewRequest(http.MethodGet, "/repo/repo-id/raw/file.txt", nil)
 	c.Request.Host = "eu.sesamefs.local"
 
-	if got := resolvePreferredLibraryStorageClassForRequest(c, manager, "", ""); got != "hot-s3-eu" {
+	if got := resolvePreferredLibraryStorageClassForRequest(c, nil, manager, "", ""); got != "hot-s3-eu" {
 		t.Fatalf("resolvePreferredLibraryStorageClassForRequest = %q, want %q", got, "hot-s3-eu")
 	}
 }
 
 func TestResolvePreferredLibraryStorageClassForRequestUsesDefaultWithoutManager(t *testing.T) {
-	if got := resolvePreferredLibraryStorageClassForRequest(nil, nil, "", "hot-minio-local"); got != "hot-minio-local" {
+	if got := resolvePreferredLibraryStorageClassForRequest(nil, nil, nil, "", "hot-minio-local"); got != "hot-minio-local" {
 		t.Fatalf("resolvePreferredLibraryStorageClassForRequest = %q, want %q", got, "hot-minio-local")
 	}
 }

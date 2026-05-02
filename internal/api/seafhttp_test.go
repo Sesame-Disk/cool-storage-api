@@ -710,7 +710,7 @@ func (m *MockTokenStore) CreateLinkDownloadToken(orgID, repoID, path, userID str
 
 func TestNewSeafHTTPHandler(t *testing.T) {
 	tokenStore := NewMockTokenStore()
-	handler := NewSeafHTTPHandler(nil, nil, nil, tokenStore, nil)
+	handler := NewSeafHTTPHandler(nil, nil, nil, tokenStore, nil, nil)
 
 	if handler == nil {
 		t.Fatal("NewSeafHTTPHandler returned nil")
@@ -725,7 +725,7 @@ func TestSeafHTTPHandlerUploadNoStorage(t *testing.T) {
 	// Add a valid upload token
 	tokenStore.CreateUploadToken("org1", "repo1", "/", "user1")
 
-	handler := NewSeafHTTPHandler(nil, nil, nil, tokenStore, nil) // nil storage
+	handler := NewSeafHTTPHandler(nil, nil, nil, tokenStore, nil, nil) // nil storage
 
 	r := gin.New()
 	r.POST("/seafhttp/upload-api/:token", handler.HandleUpload)
@@ -751,7 +751,7 @@ func TestSeafHTTPHandlerUploadNoStorage(t *testing.T) {
 
 func TestSeafHTTPHandlerUploadInvalidToken(t *testing.T) {
 	tokenStore := NewMockTokenStore()
-	handler := NewSeafHTTPHandler(nil, nil, nil, tokenStore, nil)
+	handler := NewSeafHTTPHandler(nil, nil, nil, tokenStore, nil, nil)
 
 	r := gin.New()
 	r.POST("/seafhttp/upload-api/:token", handler.HandleUpload)
@@ -777,7 +777,7 @@ func TestSeafHTTPHandlerUploadInvalidToken(t *testing.T) {
 func TestSeafHTTPHandlerUploadNoFile(t *testing.T) {
 	tokenStore := NewMockTokenStore()
 	tokenStore.CreateUploadToken("org1", "repo1", "/", "user1")
-	handler := NewSeafHTTPHandler(nil, nil, nil, tokenStore, nil)
+	handler := NewSeafHTTPHandler(nil, nil, nil, tokenStore, nil, nil)
 
 	r := gin.New()
 	r.POST("/seafhttp/upload-api/:token", handler.HandleUpload)
@@ -798,7 +798,7 @@ func TestSeafHTTPHandlerUploadNoFile(t *testing.T) {
 func TestSeafHTTPHandlerUploadNoFileWithStorageManager(t *testing.T) {
 	tokenStore := NewMockTokenStore()
 	tokenStore.CreateUploadToken("org1", "repo1", "/", "user1")
-	handler := NewSeafHTTPHandler(nil, storage.NewManager(), nil, tokenStore, nil)
+	handler := NewSeafHTTPHandler(nil, storage.NewManager(), nil, tokenStore, nil, nil)
 
 	r := gin.New()
 	r.POST("/seafhttp/upload-api/:token", handler.HandleUpload)
@@ -814,7 +814,7 @@ func TestSeafHTTPHandlerUploadNoFileWithStorageManager(t *testing.T) {
 
 func TestSeafHTTPHandlerDownloadInvalidToken(t *testing.T) {
 	tokenStore := NewMockTokenStore()
-	handler := NewSeafHTTPHandler(nil, nil, nil, tokenStore, nil)
+	handler := NewSeafHTTPHandler(nil, nil, nil, tokenStore, nil, nil)
 
 	r := gin.New()
 	r.GET("/seafhttp/files/:token/*filepath", handler.HandleDownload)
@@ -832,7 +832,7 @@ func TestSeafHTTPHandlerDownloadInvalidToken(t *testing.T) {
 func TestSeafHTTPHandlerDownloadNoStorage(t *testing.T) {
 	tokenStore := NewMockTokenStore()
 	tokenStore.CreateDownloadToken("org1", "repo1", "/file.txt", "user1")
-	handler := NewSeafHTTPHandler(nil, nil, nil, tokenStore, nil) // nil storage
+	handler := NewSeafHTTPHandler(nil, nil, nil, tokenStore, nil, nil) // nil storage
 
 	r := gin.New()
 	r.GET("/seafhttp/files/:token/*filepath", handler.HandleDownload)
@@ -853,7 +853,7 @@ func TestSeafHTTPHandlerDownloadWithStorageManagerObjectFallback(t *testing.T) {
 	manager := storage.NewManager()
 	manager.SetDefaultClass("hot-s3-eu")
 	manager.RegisterBackend("hot-s3-eu", &mockObjectStore{data: []byte("hello")}, "")
-	handler := NewSeafHTTPHandler(nil, manager, nil, tokenStore, nil)
+	handler := NewSeafHTTPHandler(nil, manager, nil, tokenStore, nil, nil)
 
 	r := gin.New()
 	r.GET("/seafhttp/files/:token/*filepath", handler.HandleDownload)
@@ -1227,7 +1227,7 @@ func TestTokenManagerConcurrentAccess(t *testing.T) {
 
 func TestRegisterSeafHTTPRoutes(t *testing.T) {
 	tokenStore := NewMockTokenStore()
-	handler := NewSeafHTTPHandler(nil, nil, nil, tokenStore, nil)
+	handler := NewSeafHTTPHandler(nil, nil, nil, tokenStore, nil, nil)
 
 	r := gin.New()
 	handler.RegisterSeafHTTPRoutes(r)
@@ -1256,7 +1256,7 @@ func TestRegisterSeafHTTPRoutes(t *testing.T) {
 
 func TestRegisterSeafHTTPRoutesZipRateLimit(t *testing.T) {
 	tokenStore := NewMockTokenStore()
-	handler := NewSeafHTTPHandler(nil, nil, nil, tokenStore, nil)
+	handler := NewSeafHTTPHandler(nil, nil, nil, tokenStore, nil, nil)
 
 	r := gin.New()
 	rl := middleware.NewRateLimiter(rate.Every(time.Hour), 1)
