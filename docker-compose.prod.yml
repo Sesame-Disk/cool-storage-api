@@ -16,7 +16,7 @@ services:
   # SesameFS API backend
   # ---------------------------------------------------------------------------
   sesamefs:
-    image: ${SESAMEFS_IMAGE:-yoilier/sesamefs}:${IMAGE_TAG:?set IMAGE_TAG in .env}
+    image: ${SESAMEFS_IMAGE:?set SESAMEFS_IMAGE in .env}
     expose:
       - "8080"                      # Reachable as sesamefs:8080 on sfs-net
     networks:
@@ -175,7 +175,7 @@ services:
   # Desktop Frontend (React SPA — served by nginx:alpine)
   # ---------------------------------------------------------------------------
   frontend:
-    image: ${FRONTEND_IMAGE:-yoilier/sesamefs-frontend}:${IMAGE_TAG:?set IMAGE_TAG in .env}
+    image: ${FRONTEND_IMAGE:?set FRONTEND_IMAGE in .env}
     expose:
       - "80"                        # Reachable as frontend:80 on sfs-net
     networks:

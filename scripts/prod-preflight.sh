@@ -247,7 +247,8 @@ do_init_env() {
     fi
   }
 
-  needs_manual IMAGE_TAG                     "the published backend/frontend release tag"
+  needs_manual SESAMEFS_IMAGE               "full published backend image reference, including tag"
+  needs_manual FRONTEND_IMAGE               "full published frontend image reference, including tag"
   needs_manual BILLING_URL                   "accounts portal billing URL"
   needs_manual ACCOUNTS_DELETE_ACCOUNT_URL   "accounts portal delete-account URL"
   needs_manual OIDC_ISSUER                   "your IdP issuer URL"
@@ -275,22 +276,16 @@ do_init_env() {
 check_release_images() {
   section "Release images"
 
-  if ! is_set IMAGE_TAG; then
-    fail "IMAGE_TAG is unset. Production compose now consumes published images and requires a release tag."
+  if ! is_set SESAMEFS_IMAGE; then
+    fail "SESAMEFS_IMAGE is unset. Production compose requires a full backend image reference including tag."
   else
-    pass "IMAGE_TAG is set ($IMAGE_TAG)"
+    pass "SESAMEFS_IMAGE is set ($SESAMEFS_IMAGE)"
   fi
 
-  if is_set SESAMEFS_IMAGE; then
-    pass "SESAMEFS_IMAGE override is set"
+  if ! is_set FRONTEND_IMAGE; then
+    fail "FRONTEND_IMAGE is unset. Production compose requires a full frontend image reference including tag."
   else
-    pass "SESAMEFS_IMAGE override unset (using default yoilier/sesamefs)"
-  fi
-
-  if is_set FRONTEND_IMAGE; then
-    pass "FRONTEND_IMAGE override is set"
-  else
-    pass "FRONTEND_IMAGE override unset (using default yoilier/sesamefs-frontend)"
+    pass "FRONTEND_IMAGE is set ($FRONTEND_IMAGE)"
   fi
 }
 

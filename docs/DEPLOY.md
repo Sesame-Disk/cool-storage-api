@@ -1,7 +1,7 @@
 # Deploying SesameFS to Production
 
-This guide covers deploying SesameFS on a single VPS using Docker Compose, published container images, and Let's Encrypt SSL.
-The same `docker-compose.prod.yml` supports both single-region and multi-region deployments — the only difference is the `.env` file. See [Multi-Region Deployment](#multi-region-deployment) below.
+This guide is organized around the repository's default production path: multi-region SesameFS nodes deployed from published images, with the same `docker-compose.prod.yml` on every server and node-local differences carried only in `.env`.
+Single-region is still supported, but it is the legacy compatibility path and should be treated as a simplified fallback rather than the primary operating model.
 ---
 
 ## Architecture
@@ -9,25 +9,58 @@ The same `docker-compose.prod.yml` supports both single-region and multi-region 
 ```
 Internet
    │
-  ├── 443 (HTTPS) ──► Nginx (Docker) ──► frontend:80    (Desktop React SPA)
-  │                                  ├──► sesamefs:8080 (API backend)
-  │                                  └──► onlyoffice:80 (Document editor)
+   ├── 443 (HTTPS) ──► Central nginx (TLS termination)
+   │                        │
+   │                        └─► sfs-net (Docker network)
+   │                              │
+   │                              └─► frontend:80      (nginx:alpine — SPA + API proxy)
+   │                                    │
+   │                                    ├─► sesamefs:8080  (Go API backend, expose-only)
+   │                                    └─► onlyoffice:80  (Document editor, expose-only)
    │
-   └── 80  (HTTP)  ──► Nginx (Docker) ──► 301 redirect to HTTPS
+   └── 80 (HTTP) ──► Central nginx ──► 301 redirect to HTTPS
 
-Cassandra (Docker) ← sesamefs (internal Docker network, not exposed)
-AWS S3             ← sesamefs (outbound HTTPS)
-accounts.sesamedisk.com ← sesamefs (OIDC, outbound HTTPS)
+internal (Docker network, not routed):
+   sesamefs ──► cassandra:9042
+
+Outbound HTTPS:
+   sesamefs ──► S3 (per-region bucket)
+   sesamefs ──► accounts.sesamedisk.com (OIDC discovery + JWKS + token exchange)
 ```
+
+The central nginx is **external** to `docker-compose.prod.yml` (the bundled
+`nginx` service in the compose file is commented out as optional). In the
+supported topology the central nginx joins `sfs-net` and proxies to the
+`frontend` container, which in turn proxies API paths to `sesamefs`. None of
+the application containers expose ports to the host — only `expose:` on the
+internal Docker network. See [Config Resolution](#config-resolution) for how
+`SERVER_TRUSTED_PROXIES` interacts with this two-nginx chain.
 
 **Files involved:**
 
 | File | Purpose |
 |---|---|
-| `docker-compose.prod.yml` | Production stack (published images, no MinIO, no dev tools) |
+| `docker-compose.prod.yml` | Production stack (published images, no MinIO, no dev tools). Bundled nginx is commented-out and optional. |
 | `configs/config.prod.yaml` | Structural config — mounted over the baked image config |
-| `nginx/nginx.conf.template` | Nginx config — `${DOMAIN}` substituted at container start |
+| `frontend/nginx.conf` | nginx:alpine config baked into the frontend image (SPA routing + API proxy_pass) |
+| `nginx/nginx.conf.template` | Optional central-nginx template — `${DOMAIN}` substituted at container start when the bundled nginx service is used |
 | `.env.prod.example` | Template for the single `.env` file you create on the server |
+
+---
+
+## Read This First
+
+- Multi-region is the default production path for this repo. Read [Default Production Path (Multi-Region)](#default-production-path-multi-region) first, then come back to the shared preparation steps below.
+- `docker-compose.prod.yml` does **not** publish the app directly to the host. By default it expects an external reverse proxy that can reach the `frontend` container on the external Docker network `sfs-net`.
+- You must create `sfs-net` before the first `docker compose up`:
+
+```bash
+docker network inspect sfs-net >/dev/null 2>&1 || docker network create sfs-net
+```
+
+- Public health checks for operators and load balancers are `GET /ping` and the compatibility endpoint `GET /api2/ping`.
+- `GET /ready` and metrics are intentionally internal-only. Run them from the node itself, from a private network, or with `docker compose exec sesamefs ...`.
+- Published images are the deployment artifact. Production rollouts should update `SESAMEFS_IMAGE` and `FRONTEND_IMAGE` with full image references, pull the new images, and restart the services. `--build` is not part of the normal prod path.
 
 ---
 
@@ -93,6 +126,23 @@ GC is a good example:
 
 ## Step 0 — Before you touch the server
 
+### 0.0 Choose ingress mode and create `sfs-net`
+
+The supported default is:
+
+- external central nginx or load balancer outside `docker-compose.prod.yml`
+- that proxy attaches to `sfs-net`
+- it forwards web traffic to `frontend:80`
+- the frontend nginx proxies API routes to `sesamefs:8080`
+
+Before the first deploy on every host:
+
+```bash
+docker network inspect sfs-net >/dev/null 2>&1 || docker network create sfs-net
+```
+
+If you prefer to terminate TLS inside the SesameFS stack, uncomment the optional `nginx` service in `docker-compose.prod.yml` and treat that as the owner of host ports `80/443`. The rest of this guide assumes the default external-proxy model unless stated otherwise.
+
 ### 0.1 Create an S3 bucket
 
 1. Create a bucket in your S3-compatible provider (AWS S3, Cloudflare R2, MinIO, etc.)
@@ -105,7 +155,7 @@ In `accounts.sesamedisk.com`, create a new application/client:
 
 - **Grant type**: Authorization Code
 - **PKCE**: Required (optional but recommended)
-- **Redirect URIs** (register **both** — web login and desktop client SSO):
+- **Redirect URIs**: register **both** callback paths for **every** production login hostname:
   - `https://<your-domain>/sso/`
   - `https://<your-domain>/oauth/callback/`
 - **Scopes**: `openid profile email`
@@ -134,14 +184,26 @@ openssl rand -hex 32   # → SHARE_LINK_HMAC_KEY
 
 ### 0.4 Set up DNS
 
-Point two DNS A records to your server's public IP:
+Point every production hostname at the node or proxy that will actually serve it.
 
-```
-files.yourdomain.com   A   <server-ip>
-office.yourdomain.com  A   <server-ip>
+- Multi-region default: each region-specific hostname points to that region's public IP or regional load balancer.
+- Single-region fallback: `files.yourdomain.com` and `office.yourdomain.com` can both point to the same server.
+
+Examples:
+
+```text
+# Multi-region
+na.files.yourdomain.com      A   <na-public-ip>
+eu.files.yourdomain.com      A   <eu-public-ip>
+na.office.yourdomain.com     A   <na-public-ip>
+eu.office.yourdomain.com     A   <eu-public-ip>
+
+# Single-region legacy
+files.yourdomain.com         A   <server-ip>
+office.yourdomain.com        A   <server-ip>
 ```
 
-Wait for DNS to propagate before running certbot.
+Wait for DNS to propagate before requesting certificates.
 
 ---
 
@@ -153,8 +215,8 @@ curl -fsSL https://get.docker.com | sh
 sudo usermod -aG docker $USER
 newgrp docker
 
-# Certbot (for SSL)
-sudo apt install -y certbot
+# Certbot + tooling used later in pre-flight checks
+sudo apt install -y certbot jq dnsutils
 
 # Verify
 docker compose version
@@ -165,18 +227,23 @@ certbot --version
 
 ## Step 2 — Get SSL certificates
 
-Certbot needs port 80 free. Run this **before** starting Docker:
+Request certificates for the hostnames served by **this node**.
+
+- Single-region legacy: one SAN certificate covering `files.yourdomain.com` and `office.yourdomain.com` is typical.
+- Multi-region default: repeat this per node using that node's `files` and `office` hostnames.
+
+If you use Certbot standalone, port 80 must be free while Certbot runs:
 
 ```bash
 sudo certbot certonly --standalone \
-  -d files.yourdomain.com \
-  -d office.yourdomain.com
+  -d na.files.yourdomain.com \
+  -d na.office.yourdomain.com
 ```
 
-This creates a single certificate covering both domains, stored at:
-`/etc/letsencrypt/live/files.yourdomain.com/`
+Certbot stores the certificate under the first `-d` hostname, for example:
+`/etc/letsencrypt/live/na.files.yourdomain.com/`
 
-Both nginx server blocks reference this same cert path.
+Point the nginx server blocks for both hostnames on that node at the same certificate directory when they were issued together in one SAN cert.
 
 **Auto-renewal** (certbot installs a systemd timer automatically — verify it):
 ```bash
@@ -201,24 +268,25 @@ cp .env.prod.example .env
 nano .env
 ```
 
-Fill in these values (everything else can stay as the example default):
+Fill in these values. The examples below assume the default multi-region path; single-region notes follow immediately after the relevant settings.
 
 ```bash
-# Release images
-IMAGE_TAG=2026.05.01-abc1234
+# Release images (full refs, including tag)
+SESAMEFS_IMAGE=yoilier/sesamefs:2026.05.01-abc1234
+FRONTEND_IMAGE=yoilier/sesamefs-frontend:2026.05.01-abc1234
 
 # Public URLs
 # Leave SERVER_URL unset in the standard multi-domain deploy.
 # SesameFS will use the current request host / X-Forwarded-Host by default.
-# SERVER_URL=https://files.yourdomain.com
-ONLYOFFICE_API_JS_URL=https://office.yourdomain.com/web-apps/apps/api/documents/api.js
+# SERVER_URL=https://<files-hostname>
+ONLYOFFICE_API_JS_URL=https://<office-hostname>/web-apps/apps/api/documents/api.js
 
 # S3 credentials
 # Default credential pair used by any storage class without its own override.
 S3_ACCESS_KEY_ID=<from step 0.1>
 S3_SECRET_ACCESS_KEY=<from step 0.1>
 
-# Explicit storage mode
+# Explicit storage mode (default production mode)
 STORAGE_MODE=multi
 
 # Multi-region per-class bucket mapping. Real bucket names stay in .env, not in
@@ -233,7 +301,7 @@ S3_CLASS_HOT_S3_ASIA_BUCKET=<your-asia-bucket>
 # S3_CLASS_HOT_S3_NA_SECRET_ACCESS_KEY=<optional-class-secret>
 
 # OIDC callback allow-list. Add every production login domain registered in your IdP.
-OIDC_REDIRECT_URIS=https://files.yourdomain.com/sso/,https://files.yourdomain.com/oauth/callback/
+OIDC_REDIRECT_URIS=https://<files-hostname>/sso/,https://<files-hostname>/oauth/callback/
 
 # Single-region only: set STORAGE_MODE=single, leave SERVER_REGION empty, and
 # uncomment these to point the legacy hot backend at one bucket.
@@ -246,7 +314,7 @@ OIDC_REDIRECT_URIS=https://files.yourdomain.com/sso/,https://files.yourdomain.co
 
 # CORS (required in prod; wildcard "*" is rejected)
 # Include EVERY production browser origin that can call SesameFS.
-CORS_ALLOWED_ORIGINS=https://files.yourdomain.com,https://files-alt.yourdomain.com
+CORS_ALLOWED_ORIGINS=https://<files-hostname>,https://<additional-browser-origin>
 
 # OnlyOffice JWT token lifetime (seconds). Default 3600 (1h). Range: 300–28800.
 ONLYOFFICE_JWT_TTL_SECONDS=3600
@@ -293,11 +361,11 @@ GC_ENABLED=true
 ONLYOFFICE_JWT_SECRET=<from step 0.3 — second openssl output>
 ```
 
-> Production compose uses published images, not local `build:` steps. By default:
-> - backend → `yoilier/sesamefs:${IMAGE_TAG}`
-> - frontend → `yoilier/sesamefs-frontend:${IMAGE_TAG}`
+> Production compose uses published images, not local `build:` steps.
 >
-> Override `SESAMEFS_IMAGE` or `FRONTEND_IMAGE` in `.env` only if you need a different repo name.
+> Set `SESAMEFS_IMAGE` and `FRONTEND_IMAGE` in `.env` to the exact image references you want to run, including tag. Example:
+> - backend → `yoilier/sesamefs:2026.05.01-abc1234`
+> - frontend → `yoilier/sesamefs-frontend:2026.05.01-abc1234`
 
 > Single-region and multi-region share the same production compose and the same `configs/config.prod.yaml`.
 > The operational switch is `STORAGE_MODE`: use `multi` for the shared multi-region topology and `single` only for the legacy single-bucket path. In `multi`, set `SERVER_REGION` per node.
@@ -340,11 +408,123 @@ sudo ufw enable
 sudo ufw status
 ```
 
-Cassandra (9042), OnlyOffice (8088), and sesamefs (8080) are bound to
-`127.0.0.1` only — they are not reachable from the internet.
+Cassandra (9042), OnlyOffice (80), sesamefs (8080), and the frontend (80) are
+exposed only on internal Docker networks (`expose:`, not `ports:`) — they are
+unreachable from the internet. Public traffic enters exclusively through the
+nginx hop on 443. In multi-region, Cassandra additionally binds gossip/CQL
+(7000/7001/9042) to the private vRack IP via `CASSANDRA_BIND_IP`, never
+`0.0.0.0`.
 
 > **Multi-region:** You also need to allow Cassandra gossip and CQL on the
 > private network. See [Multi-Region Firewall](#step-m3--firewall-private-network).
+
+---
+
+## Step 5.5 — Pre-flight checks
+
+Run these on the server **before** `docker compose up`. They catch the most common
+silent misconfigurations (placeholder values left in `.env`, DNS not propagated,
+S3 unreachable, OIDC discovery blocked) before the stack starts and starts emitting
+real traffic. Multi-region nodes should ALSO run [Step M3.5](#step-m35--pre-flight-multi-region).
+
+```bash
+set -a; source .env; set +a
+```
+
+### 5.5.1 — Required env vars are filled in
+
+```bash
+# Fail loudly if any required var is empty or still a placeholder.
+for var in SESAMEFS_IMAGE FRONTEND_IMAGE OIDC_ISSUER OIDC_CLIENT_ID OIDC_CLIENT_SECRET \
+           OIDC_REDIRECT_URIS OIDC_JWT_SIGNING_KEY SHARE_LINK_HMAC_KEY \
+           ONLYOFFICE_JWT_SECRET ONLYOFFICE_API_JS_URL CORS_ALLOWED_ORIGINS \
+           S3_ACCESS_KEY_ID S3_SECRET_ACCESS_KEY FIRST_SUPERADMIN_EMAIL \
+           BILLING_URL ACCOUNTS_DELETE_ACCOUNT_URL; do
+  v="${!var}"
+  if [ -z "$v" ] || [[ "$v" == *"<"*">"* ]]; then
+    echo "  [FAIL] $var is unset or still a placeholder"
+  else
+    echo "  [OK]   $var"
+  fi
+done
+```
+
+> Re-run after editing `.env` until every line is `[OK]`.
+
+### 5.5.2 — DNS resolves to this server
+
+```bash
+PUBLIC_IP=$(curl -s https://api.ipify.org)
+for host in na.files.yourdomain.com na.office.yourdomain.com; do
+  resolved=$(dig +short "$host" | tail -n1)
+  if [ "$resolved" = "$PUBLIC_IP" ]; then
+    echo "  [OK]   $host → $resolved"
+  else
+    echo "  [FAIL] $host → $resolved (expected $PUBLIC_IP)"
+  fi
+done
+```
+
+### 5.5.3 — SSL certs exist
+
+```bash
+# Replace CERT_NAME with the first hostname passed to certbot on this node.
+CERT_NAME=na.files.yourdomain.com
+
+if sudo test -f "/etc/letsencrypt/live/$CERT_NAME/fullchain.pem"; then
+  echo "  [OK]   cert present at /etc/letsencrypt/live/$CERT_NAME/"
+  sudo openssl x509 -enddate -noout -in "/etc/letsencrypt/live/$CERT_NAME/fullchain.pem"
+else
+  echo "  [FAIL] no cert at /etc/letsencrypt/live/$CERT_NAME/ — run certbot (Step 2)"
+fi
+```
+
+### 5.5.4 — OIDC issuer is reachable
+
+```bash
+curl -fsS "$OIDC_ISSUER/.well-known/openid-configuration" | jq '{issuer, jwks_uri, authorization_endpoint, token_endpoint}'
+# Must echo a JSON document. A 404 / connection error here means OIDC will fail at runtime.
+```
+
+### 5.5.5 — S3 bucket is reachable and writable
+
+```bash
+# Single-region:
+docker run --rm -e AWS_ACCESS_KEY_ID="$S3_ACCESS_KEY_ID" \
+                -e AWS_SECRET_ACCESS_KEY="$S3_SECRET_ACCESS_KEY" \
+                amazon/aws-cli s3api head-bucket --bucket "$S3_BUCKET" --region "$S3_REGION" \
+  && echo "  [OK]   $S3_BUCKET reachable" \
+  || echo "  [FAIL] $S3_BUCKET not reachable"
+
+# Multi-region: repeat for every configured class bucket.
+for var in S3_CLASS_HOT_S3_NA_BUCKET S3_CLASS_HOT_S3_EU_BUCKET S3_CLASS_HOT_S3_ASIA_BUCKET; do
+  bucket="${!var}"
+  [ -z "$bucket" ] && continue
+  docker run --rm -e AWS_ACCESS_KEY_ID="$S3_ACCESS_KEY_ID" \
+                  -e AWS_SECRET_ACCESS_KEY="$S3_SECRET_ACCESS_KEY" \
+                  amazon/aws-cli s3api head-bucket --bucket "$bucket" \
+    && echo "  [OK]   $var=$bucket" \
+    || echo "  [FAIL] $var=$bucket not reachable"
+done
+```
+
+### 5.5.6 — Ports 80/443 are free
+
+```bash
+# Only required if you plan to run the bundled nginx service or Certbot in
+# standalone mode on this host. If an external host nginx already owns 80/443,
+# that is expected in the default topology.
+sudo ss -ltnp | grep -E ':(80|443) ' || echo "  [OK] ports 80/443 currently unused on this host"
+```
+
+### 5.5.7 — Release images resolve
+
+```bash
+docker manifest inspect "$SESAMEFS_IMAGE" >/dev/null && echo "  [OK]   backend image exists"  || echo "  [FAIL] backend image not found"
+docker manifest inspect "$FRONTEND_IMAGE" >/dev/null && echo "  [OK]   frontend image exists" || echo "  [FAIL] frontend image not found"
+```
+
+If every line is `[OK]`, proceed to Step 6.
 
 ---
 
@@ -353,9 +533,11 @@ Cassandra (9042), OnlyOffice (8088), and sesamefs (8080) are bound to
 ```bash
 cd /opt/sesamefs
 
-# Pull the release images referenced by IMAGE_TAG
-docker pull yoilier/sesamefs:$IMAGE_TAG
-docker pull yoilier/sesamefs-frontend:$IMAGE_TAG
+# Required once per host for the default external-proxy topology
+docker network inspect sfs-net >/dev/null 2>&1 || docker network create sfs-net
+
+# Pull the release images referenced in SESAMEFS_IMAGE / FRONTEND_IMAGE
+docker compose -f docker-compose.prod.yml pull
 
 # Start the production stack
 docker compose -f docker-compose.prod.yml up -d
@@ -412,26 +594,68 @@ Roles are synced from the OIDC token on every login.
 
 ## Step 8 — Verify
 
-```bash
-# Basic health (should return: pong)
-curl https://files.yourdomain.com/ping
+### 8.1 Liveness / readiness
 
-# Readiness — checks Cassandra and S3 connectivity
-curl https://files.yourdomain.com/ready
+```bash
+# Replace with the public app hostname served by this node or regional proxy.
+FILES_HOST=https://na.files.yourdomain.com
+OFFICE_HOST=https://na.office.yourdomain.com
+
+# Public liveness (should return: pong)
+curl "$FILES_HOST/ping"
+
+# Legacy compatibility liveness for older monitors/clients
+curl "$FILES_HOST/api2/ping"
+
+# Public process liveness
+curl "$FILES_HOST/health"
+
+# Internal readiness — run from the node or inside the container
+docker compose -f docker-compose.prod.yml exec sesamefs \
+  wget -qO- http://127.0.0.1:8080/ready
+
+# Expected readiness payload checks Cassandra and S3 connectivity
 # Expected: {"database":"ok","storage":"ok"}
 
 # OIDC is configured
-curl https://files.yourdomain.com/api/v2.1/auth/oidc/config
+curl "$FILES_HOST/api/v2.1/auth/oidc/config"
 # Expected: {"issuer":"https://accounts.sesamedisk.com", ...}
 
 # Auth is enforced (unauthenticated request must return 401)
-curl -s -o /dev/null -w "%{http_code}" https://files.yourdomain.com/api2/repos/
+curl -s -o /dev/null -w "%{http_code}\n" "$FILES_HOST/api2/repos/"
 # Expected: 401
 
 # OnlyOffice is up
-curl https://office.yourdomain.com/healthcheck
+curl "$OFFICE_HOST/healthcheck"
 # Expected: {"status":"ok"}
+
+# Frontend is being served
+curl -s -o /dev/null -w "%{http_code}\n" "$FILES_HOST/"
+# Expected: 200
 ```
+
+### 8.2 Trusted-proxy hardening
+
+If `SERVER_TRUSTED_PROXIES` is misconfigured, SesameFS will trust forged
+`X-Forwarded-For` headers and corrupt rate-limiting and audit logs. Confirm
+that an external attacker cannot spoof their client IP:
+
+```bash
+# Send a forged X-Forwarded-For from outside. The backend should ignore it.
+curl -H "X-Forwarded-For: 1.2.3.4" "$FILES_HOST/api/v2.1/auth/oidc/config" -v 2>&1 | head -1
+# Then check sesamefs logs for the request — the recorded client IP MUST be
+# the central nginx hop / your real source IP, NOT 1.2.3.4.
+docker compose -f docker-compose.prod.yml logs --tail=20 sesamefs | grep -i 'oidc/config'
+```
+
+### 8.3 OIDC end-to-end smoke
+
+Open your public SesameFS hostname in a browser (for example `https://na.files.yourdomain.com/`) and complete the OIDC login
+with the `FIRST_SUPERADMIN_EMAIL` account. After redirect:
+
+- you should land on the SPA logged in as superadmin
+- `/sys/organizations/` should be reachable
+- `/billing/` should redirect to `BILLING_URL`
 
 ---
 
@@ -456,15 +680,20 @@ docker compose -f docker-compose.prod.yml logs -f onlyoffice
 cd /opt/sesamefs
 git pull
 
-# Backend-only change (API, sync protocol, business logic)
-docker compose -f docker-compose.prod.yml up -d --build sesamefs
+# Update SESAMEFS_IMAGE and/or FRONTEND_IMAGE in .env first, then pull and restart.
 
-# Frontend-only change (React UI, styles, components)
-docker compose -f docker-compose.prod.yml up -d --build frontend
+# Pull the new published images
+docker compose -f docker-compose.prod.yml pull
 
-# Both changed (or when unsure)
-docker compose -f docker-compose.prod.yml up -d --build sesamefs frontend
+# Roll the stack to the new image refs
+docker compose -f docker-compose.prod.yml up -d
+
+# Service-scoped rollouts are also fine when only one image changed
+docker compose -f docker-compose.prod.yml up -d sesamefs
+docker compose -f docker-compose.prod.yml up -d frontend
 ```
+
+Do not use `--build` for the normal prod path. The production compose consumes published images, not local Docker builds.
 
 ### Restart a service
 
@@ -595,9 +824,9 @@ sesamefs can't reach S3. Check:
 
 ### OIDC login fails
 
-1. Verify **both** redirect URIs are registered in accounts.sesamedisk.com:
-   - `https://files.yourdomain.com/sso/`
-   - `https://files.yourdomain.com/oauth/callback/`
+1. Verify **both** redirect URIs are registered in accounts.sesamedisk.com for every production login hostname:
+  - `https://<files-hostname>/sso/`
+  - `https://<files-hostname>/oauth/callback/`
 2. Check `OIDC_CLIENT_ID` and `OIDC_CLIENT_SECRET` in `.env`
 3. Check that `OIDC_REDIRECT_URIS` is not empty and exactly matches every callback URL you registered for all production domains. SesameFS now rejects OIDC login in fail-closed mode when no redirect allowlist is configured.
 4. Check sesamefs logs for OIDC errors
@@ -610,7 +839,7 @@ sesamefs can't reach S3. Check:
 
 ### OnlyOffice not loading in documents
 
-1. Verify `https://office.yourdomain.com/healthcheck` returns `{"status":"ok"}`
+1. Verify `https://<office-hostname>/healthcheck` returns `{"status":"ok"}`
 2. OnlyOffice takes ~2 minutes to start — check logs:
    ```bash
    docker compose -f docker-compose.prod.yml logs -f onlyoffice
@@ -635,23 +864,25 @@ docker compose -f docker-compose.prod.yml up -d cassandra
 Run certbot before starting Docker:
 ```bash
 sudo certbot certonly --standalone \
-  -d files.yourdomain.com \
-  -d office.yourdomain.com
+  -d <files-hostname> \
+  -d <office-hostname>
 ```
 
 Verify the cert exists:
 ```bash
-ls /etc/letsencrypt/live/files.yourdomain.com/
+ls /etc/letsencrypt/live/<cert-name>/
 ```
 
 ---
 
 ---
 
-## Multi-Region Deployment
+## Default Production Path (Multi-Region)
 
 The same `docker-compose.prod.yml` supports multi-region. Each VPS runs the
 identical stack; the only difference is the `.env` file on each server.
+
+This is the default production model for the repo. Use single-region only when you intentionally want the legacy single-bucket path.
 
 ### Architecture
 
@@ -763,7 +994,7 @@ What the stock production deploy does **not** provide by itself yet:
 - there is no built-in migration workflow for existing non-empty libraries that need to move from one storage class to another
 - org policy only affects **new library creation** in this slice; it does not relocate existing libraries
 - create-time placement is intentionally limited to hot classes; cold-tier primary placement remains future design work
-- GC is still guarded operationally (`GC_ENABLED`) rather than by leader election, so multi-replica backend deployments need manual discipline
+- GC uses a Cassandra LWT lease (`gc_leader` row) so only one enabled replica runs worker/scanner/rollover at a time. `GC_ENABLED` is the per-replica safety belt: enable it on the replicas that are allowed to participate, and the lease guarantees mutual exclusion automatically. Lease takeover from a crashed leader is supported via the admin endpoint without waiting for TTL.
 
 For production multi-region, treat this feature as requiring operator-provided topology plus the shared config and `.env` values below.
 
@@ -771,10 +1002,10 @@ For production multi-region, treat this feature as requiring operator-provided t
 
 In production multi-region, `configs/config.prod.yaml` must define all of these:
 
-- `storage.classes`
-- `storage.default_class`
-- `storage.endpoint_regions`
-- `storage.region_classes`
+- `storage.classes` — one hot class per region
+- `storage.default_class` — fallback when no region context resolves
+- `storage.region_classes` — region → class mapping; this is what `SERVER_REGION` looks up
+- `storage.endpoint_regions` — **optional**. Only needed if a single deploy serves multiple public hostnames that map to different regions. In the standard global-domain topology with one public host per region, leave it empty (`{}`) and rely on `SERVER_REGION` set per node.
 
 Use `configs/config.example.yaml` as the canonical structure. At minimum, you need one hot class per region, for example:
 
@@ -794,7 +1025,7 @@ storage:
       region: eu-west-1
 
   endpoint_regions:
-    "us.files.yourdomain.com": "na"
+    "na.files.yourdomain.com": "na"
     "eu.files.yourdomain.com": "eu"
     "*": "na"
 
@@ -865,6 +1096,98 @@ sudo ufw allow in on ens1 to any port 9042 proto tcp    # CQL
 
 > Never open 7000/7001/9042 on the public interface.
 
+### Step M3.5 — Pre-flight (multi-region)
+
+Run [Step 5.5](#step-55--pre-flight-checks) on every node first. Then add these
+multi-region-specific checks:
+
+```bash
+set -a; source .env; set +a
+```
+
+#### M3.5.1 — `SERVER_REGION` matches the local node
+
+Every node must have a `SERVER_REGION` value that exists in
+`storage.region_classes` in `configs/config.prod.yaml`:
+
+```bash
+case "$SERVER_REGION" in
+  na|eu|asia) echo "  [OK]   SERVER_REGION=$SERVER_REGION" ;;
+  "")         echo "  [FAIL] SERVER_REGION is empty (required when STORAGE_MODE=multi)" ;;
+  *)          echo "  [FAIL] SERVER_REGION=$SERVER_REGION not in {na,eu,asia} — must match storage.region_classes" ;;
+esac
+```
+
+#### M3.5.2 — Cassandra DC vars are consistent
+
+```bash
+[ "$CASSANDRA_DC" = "$CASSANDRA_LOCAL_DC" ] \
+  && echo "  [OK]   CASSANDRA_DC=CASSANDRA_LOCAL_DC=$CASSANDRA_DC" \
+  || echo "  [FAIL] CASSANDRA_DC ($CASSANDRA_DC) and CASSANDRA_LOCAL_DC ($CASSANDRA_LOCAL_DC) MUST match"
+
+# Convention: dc-na ↔ na, dc-eu ↔ eu, dc-asia ↔ asia
+[ "$CASSANDRA_DC" = "dc-$SERVER_REGION" ] \
+  && echo "  [OK]   CASSANDRA_DC follows SERVER_REGION convention" \
+  || echo "  [WARN] CASSANDRA_DC=$CASSANDRA_DC vs SERVER_REGION=$SERVER_REGION (acceptable but unconventional)"
+```
+
+#### M3.5.3 — Broadcast IPs use the private interface
+
+```bash
+# All three must be the same private IP — and it must NOT be a public address.
+echo "  CASSANDRA_BIND_IP=$CASSANDRA_BIND_IP"
+echo "  CASSANDRA_BROADCAST_ADDRESS=$CASSANDRA_BROADCAST_ADDRESS"
+echo "  CASSANDRA_BROADCAST_RPC_ADDRESS=$CASSANDRA_BROADCAST_RPC_ADDRESS"
+[ "$CASSANDRA_BIND_IP" = "$CASSANDRA_BROADCAST_ADDRESS" ] \
+  && [ "$CASSANDRA_BIND_IP" = "$CASSANDRA_BROADCAST_RPC_ADDRESS" ] \
+  && echo "  [OK]   broadcast vars match" \
+  || echo "  [FAIL] BIND_IP / BROADCAST_ADDRESS / BROADCAST_RPC_ADDRESS must all equal the private IP"
+
+# Sanity: the private IP must actually be configured on this host
+ip -4 addr show | grep -q "inet $CASSANDRA_BIND_IP/" \
+  && echo "  [OK]   $CASSANDRA_BIND_IP is configured on this host" \
+  || echo "  [FAIL] $CASSANDRA_BIND_IP is NOT a local interface address"
+```
+
+#### M3.5.4 — Other DCs are reachable on the private network
+
+```bash
+# Comma-separated, includes every seed across all DCs.
+for ip in $(echo "$CASSANDRA_SEEDS" | tr ',' ' '); do
+  if [ "$ip" = "$CASSANDRA_BIND_IP" ]; then
+    continue   # don't probe ourselves
+  fi
+  for port in 7000 9042; do
+    if timeout 5 bash -c "</dev/tcp/$ip/$port" 2>/dev/null; then
+      echo "  [OK]   $ip:$port reachable"
+    else
+      echo "  [FAIL] $ip:$port NOT reachable from this node"
+    fi
+  done
+done
+```
+
+#### M3.5.5 — Per-class buckets exist for every region in `region_classes`
+
+Every node — not just the local one — must be able to talk to every regional
+bucket, because reads of foreign-region libraries are served from the
+originating bucket via the local backend.
+
+```bash
+for var in S3_CLASS_HOT_S3_NA_BUCKET S3_CLASS_HOT_S3_EU_BUCKET S3_CLASS_HOT_S3_ASIA_BUCKET; do
+  bucket="${!var}"
+  [ -z "$bucket" ] && { echo "  [WARN] $var unset — skipping"; continue; }
+  docker run --rm \
+    -e AWS_ACCESS_KEY_ID="$S3_ACCESS_KEY_ID" \
+    -e AWS_SECRET_ACCESS_KEY="$S3_SECRET_ACCESS_KEY" \
+    amazon/aws-cli s3api head-bucket --bucket "$bucket" \
+    && echo "  [OK]   $var=$bucket reachable from $SERVER_REGION" \
+    || echo "  [FAIL] $var=$bucket NOT reachable from $SERVER_REGION"
+done
+```
+
+If every line is `[OK]`, proceed to Step M4.
+
 ### Step M4 — Deploy order
 
 1. **Start the first seed node** (e.g., VPS NA):
@@ -888,6 +1211,7 @@ sudo ufw allow in on ens1 to any port 9042 proto tcp    # CQL
 
 4. **Switch the keyspace to NetworkTopologyStrategy** (from any node):
    ```bash
+   # 2-region (NA + EU)
    docker compose -f docker-compose.prod.yml exec cassandra cqlsh -e "
      ALTER KEYSPACE sesamefs
      WITH replication = {
@@ -896,11 +1220,27 @@ sudo ufw allow in on ens1 to any port 9042 proto tcp    # CQL
        'dc-eu': 1
      };
    "
+
+   # 3-region (NA + EU + ASIA)
+   docker compose -f docker-compose.prod.yml exec cassandra cqlsh -e "
+     ALTER KEYSPACE sesamefs
+     WITH replication = {
+       'class': 'NetworkTopologyStrategy',
+       'dc-na': 1,
+       'dc-eu': 1,
+       'dc-asia': 1
+     };
+   "
    ```
    > **This is required.** By default, the keyspace uses `SimpleStrategy`
    > (single DC). Without this change, data will NOT replicate across DCs.
    > Only list DCs that actually exist. When adding a new region later,
-   > run `ALTER KEYSPACE` again adding the new DC.
+   > run `ALTER KEYSPACE` again adding the new DC, then `nodetool repair sesamefs`
+   > on the new node to pull data into it.
+   >
+   > `RF=1` per DC means each DC has exactly one copy — no in-region HA. For
+   > intra-region high availability, deploy multiple Cassandra nodes per DC and
+   > raise the per-DC RF (e.g. `'dc-na': 3`).
 
 5. **Run repair to sync existing data** (on each node):
    ```bash
@@ -916,27 +1256,104 @@ sudo ufw allow in on ens1 to any port 9042 proto tcp    # CQL
 
 ### Step M5 — Verify
 
+In addition to [Step 8 — Verify](#step-8--verify) on every node, run these
+multi-region cluster checks:
+
+#### M5.1 — Per-region API health
+
 ```bash
-# From VPS USA
-curl https://us.files.sesamedisk.com/ping       # pong
-curl https://us.files.sesamedisk.com/ready       # {"database":"ok","storage":"ok"}
+for url in https://na.files.yourdomain.com \
+           https://eu.files.yourdomain.com \
+           https://asia.files.yourdomain.com; do
+  echo "── $url"
+  curl -fsS "$url/ping"   && echo
+  curl -fsS "$url/api2/ping" && echo
+done
 
-# From VPS EU
-curl https://eu.files.sesamedisk.com/ping        # pong
-curl https://eu.files.sesamedisk.com/ready       # {"database":"ok","storage":"ok"}
+# Readiness stays internal-only; run it from each node instead of over the
+# public internet:
+docker compose -f docker-compose.prod.yml exec sesamefs \
+  wget -qO- http://127.0.0.1:8080/ready
+```
 
-# Cassandra cluster health (from any node)
+#### M5.2 — Cassandra cluster shape
+
+```bash
 docker compose -f docker-compose.prod.yml exec cassandra nodetool status
+# Every node must appear as UN (Up/Normal) under its expected DC label
+# (dc-na / dc-eu / dc-asia). Any DN (Down/Normal) or UJ (Up/Joining) means
+# do NOT proceed with traffic until it resolves.
+```
+
+#### M5.3 — Replication is actually multi-DC
+
+A frequent silent failure: the cluster joined fine but the keyspace is still
+`SimpleStrategy` (single DC) because Step M4.4 was skipped or used the wrong
+DC names. Verify directly:
+
+```bash
+docker compose -f docker-compose.prod.yml exec cassandra cqlsh -e \
+  "SELECT keyspace_name, replication FROM system_schema.keyspaces WHERE keyspace_name='sesamefs';"
+# Expected: replication includes 'class': 'NetworkTopologyStrategy' AND
+# every DC name listed in nodetool status appears with an RF >= 1.
+```
+
+#### M5.4 — Cross-region write/read works
+
+Pick any node and write a sentinel row, then read it from a different DC at
+LOCAL_QUORUM. If replication is healthy the read succeeds without falling
+back to remote DCs.
+
+```bash
+# 1. Create a one-off sentinel table (idempotent, safe to run repeatedly):
+docker compose -f docker-compose.prod.yml exec cassandra cqlsh -e "
+  CREATE TABLE IF NOT EXISTS sesamefs.deploy_sentinel (
+    id uuid PRIMARY KEY,
+    region text,
+    written_at timestamp
+  );
+"
+
+# 2. On the NA node — insert a sentinel row with 1h TTL so it self-cleans:
+docker compose -f docker-compose.prod.yml exec cassandra cqlsh -e "
+  INSERT INTO sesamefs.deploy_sentinel (id, region, written_at)
+  VALUES (uuid(), 'na', toTimestamp(now())) USING TTL 3600;
+"
+
+# 3. On the EU node — read at LOCAL_QUORUM:
+docker compose -f docker-compose.prod.yml exec cassandra cqlsh -e "
+  CONSISTENCY LOCAL_QUORUM;
+  SELECT region, written_at FROM sesamefs.deploy_sentinel
+  WHERE region = 'na' ALLOW FILTERING;
+"
+# Expected: the row appears within seconds. If empty, replication is not
+# flowing — re-check Step M4.4 (ALTER KEYSPACE) and M4.5 (nodetool repair).
+```
+
+> The sentinel table is purely diagnostic; you can `DROP TABLE
+> sesamefs.deploy_sentinel;` after the cutover or just let the TTL'd rows
+> age out and leave it in place.
+
+#### M5.5 — GC lease is single-leader
+
+If you enabled `GC_ENABLED=true` on more than one replica (across regions or
+within the same region), confirm only one is actually running GC work:
+
+```bash
+docker compose -f docker-compose.prod.yml exec cassandra cqlsh -e \
+  "SELECT role, instance_id, heartbeat, ttl(instance_id) FROM sesamefs.gc_leases WHERE role='gc';"
+# Exactly one row, with a positive TTL and a recent heartbeat (< 90s old).
+# instance_id format is <hostname>-<pid>-<unix_nanos>. Re-run on every node —
+# the answer must be identical (it's the same Cassandra row, replicated to
+# every DC).
 ```
 
 ### Step M6 — Verify region-pinned library behavior
 
-After deploying the multi-region config, verify the behavior that matters for data integrity:
+After deploying the multi-region config, verify the behavior that matters for data integrity.
+These are post-deploy validation checks from a test-capable workspace or CI environment, not the primary rollout mechanism on the production node:
 
 ```bash
-# Rebuild the running backend after backend changes
-docker compose -f docker-compose.prod.yml up -d --build sesamefs
-
 # Focused integrity checks (run from a test-capable environment)
 docker compose run --build --rm -e SESAMEFS_URL=http://sesamefs:8080 \
   gotest go test -tags integration \
@@ -966,6 +1383,19 @@ These checks prove that `strict` and `flexible` policy modes are enforced consis
 - **Seeds:** Use 2 seeds per DC max. If every node is a seed, gossip degrades.
 - **Adding a region:** Deploy a new VPS with its `.env`, add its IP to
   `CASSANDRA_SEEDS` on existing nodes, restart Cassandra, run `nodetool status`.
+
+---
+
+## Single-Region Legacy Path
+
+Single-region is still supported with the same `docker-compose.prod.yml`, but it is no longer the primary production path for the repo.
+
+- set `STORAGE_MODE=single`
+- leave `SERVER_REGION` empty
+- populate `S3_BUCKET`, `S3_REGION`, and any optional single-bucket S3 overrides
+- keep the rest of the shared steps from this document the same
+
+Everything else in the shared preparation, OIDC setup, published-image rollout, and verification flow still applies.
 
 ---
 
@@ -1007,10 +1437,11 @@ username+password) **always returns 401** when `AUTH_DEV_MODE=false`.
 
 ### Other limitations
 
-- **OIDC JWT signature verification** is incomplete — the app validates issuer,
-  nonce, and expiry but not the cryptographic signature of the ID token.
-  Risk is low in authorization code flow (tokens come server-to-server),
-  but this should be patched before high-security deployments.
+- **OIDC ID token verification** is full RFC-compliant: cryptographic signature
+  via JWKS (RS256/384/512, ES256/384/512), `kid`-based key selection with
+  automatic key-rotation refresh, plus issuer, audience, nonce, expiry, and
+  configurable clock-skew validation. See `internal/auth/oidc.go` (`parseIDToken`,
+  `fetchJWKS`, `getSigningKey`).
 - **Rate limiting** is implemented via two nginx zones: API calls (100r/s, burst 200) and file transfers
   (`/seafhttp/`, `/d/`, `/u/d/`) at a separate 20r/s zone (burst 40) to prevent large uploads/downloads
   from starving API traffic. For stricter application-layer protection add a WAF or API gateway.
