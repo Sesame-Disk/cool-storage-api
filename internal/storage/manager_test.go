@@ -193,6 +193,18 @@ func TestManagerResolveStorageClass(t *testing.T) {
 		}
 	})
 
+	t.Run("wildcard endpoint tolerates surrounding spaces", func(t *testing.T) {
+		m.SetLocalRegion("eu")
+		m.SetEndpointRegions(map[string]string{
+			" *.sesamefs.com ": "usa",
+			"*":                "eu",
+		})
+		got := m.ResolveStorageClass("files.sesamefs.com", "", "hot")
+		if got != "hot-s3-usa" {
+			t.Fatalf("ResolveStorageClass spaced wildcard = %q, want %q", got, "hot-s3-usa")
+		}
+	})
+
 	t.Run("exact endpoint overrides local region", func(t *testing.T) {
 		m.SetLocalRegion("eu")
 		m.SetEndpointRegions(map[string]string{

@@ -303,24 +303,31 @@ func ResolveEndpointRegion(hostname string, endpointRegions map[string]string, l
 	}
 
 	if hostname != "" {
-		wildcards := make([]string, 0, len(endpointRegions))
-		for pattern := range endpointRegions {
-			pattern = strings.TrimSpace(pattern)
-			if len(pattern) > 1 && pattern[0] == '*' {
-				wildcards = append(wildcards, pattern)
+		type wildcardRegion struct {
+			pattern string
+			region  string
+		}
+		wildcards := make([]wildcardRegion, 0, len(endpointRegions))
+		for pattern, region := range endpointRegions {
+			trimmedPattern := strings.TrimSpace(pattern)
+			if len(trimmedPattern) > 1 && trimmedPattern[0] == '*' {
+				wildcards = append(wildcards, wildcardRegion{
+					pattern: trimmedPattern,
+					region:  strings.ToLower(strings.TrimSpace(region)),
+				})
 			}
 		}
 		sort.Slice(wildcards, func(i, j int) bool {
-			if len(wildcards[i]) == len(wildcards[j]) {
-				return wildcards[i] < wildcards[j]
+			if len(wildcards[i].pattern) == len(wildcards[j].pattern) {
+				return wildcards[i].pattern < wildcards[j].pattern
 			}
-			return len(wildcards[i]) > len(wildcards[j])
+			return len(wildcards[i].pattern) > len(wildcards[j].pattern)
 		})
 
-		for _, pattern := range wildcards {
-			suffix := strings.ToLower(pattern[1:])
+		for _, wildcard := range wildcards {
+			suffix := strings.ToLower(wildcard.pattern[1:])
 			if len(hostname) > len(suffix) && strings.HasSuffix(hostname, suffix) {
-				return strings.ToLower(strings.TrimSpace(endpointRegions[pattern]))
+				return wildcard.region
 			}
 		}
 	}
