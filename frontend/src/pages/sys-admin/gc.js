@@ -165,14 +165,24 @@ class GC extends Component {
             failedItemsOrgID: org.org_id,
             failedItemsError: '',
         }, () => {
-            this.scrollToFailedItemsSection();
             this.loadFailedItems();
+            window.requestAnimationFrame(this.scrollToFailedItemsSection);
         });
     };
 
     scrollToFailedItemsSection = () => {
-        if (this.failedItemsSectionRef.current) {
-            this.failedItemsSectionRef.current.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        const node = this.failedItemsSectionRef.current;
+        if (!node) return;
+        const scroller = node.closest('.cur-view-content');
+        if (!scroller) {
+            node.scrollIntoView({ block: 'nearest' });
+            return;
+        }
+        const nodeTop = node.offsetTop - scroller.offsetTop;
+        const visibleTop = scroller.scrollTop;
+        const visibleBottom = visibleTop + scroller.clientHeight;
+        if (nodeTop < visibleTop || nodeTop > visibleBottom - 80) {
+            scroller.scrollTo({ top: Math.max(0, nodeTop - 8) });
         }
     };
 

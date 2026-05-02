@@ -51,6 +51,13 @@ func (f *fakeLeaderLease) Release(ctx context.Context) {
 	f.released.Store(true)
 }
 
+func (f *fakeLeaderLease) TryTakeoverIfStale(ctx context.Context, staleness time.Duration) (bool, error) {
+	// The fake doesn't model heartbeats — admin-path stale takeover defers
+	// to the same allowed/err pair as TryAcquireOrRenew so existing tests
+	// that gate via `allowed` still observe the expected behavior.
+	return f.TryAcquireOrRenew(ctx)
+}
+
 func (f *fakeLeaderLease) IsLeader() bool {
 	// If TryAcquireOrRenew has never been called the leader atomic is still
 	// at its zero value (false). Fall back to the static field so tests that
@@ -847,12 +854,13 @@ func TestService_RequeueFailedCascade_PreservesIdentityAt(t *testing.T) {
 	orgID := uuid.New()
 	deletedAt := time.Now().Add(-3 * time.Hour).UTC().Truncate(time.Millisecond)
 	failedAt := time.Now().UTC().Truncate(time.Millisecond)
+	originalQueuedAt := failedAt.Add(-time.Minute)
 	itemID := uuid.New().String()
 
 	store.failedItems[orgID] = []GCFailedItemInfo{{
 		OrgID:        orgID,
 		FailedAt:     failedAt,
-		QueuedAt:     failedAt.Add(-time.Minute),
+		QueuedAt:     originalQueuedAt,
 		IdentityAt:   deletedAt,
 		ItemType:     ItemLibraryCascade,
 		ItemID:       itemID,
@@ -875,8 +883,8 @@ func TestService_RequeueFailedCascade_PreservesIdentityAt(t *testing.T) {
 	if len(items) != 1 {
 		t.Fatalf("expected 1 queue item after requeue, got %d", len(items))
 	}
-	if items[0].QueuedAt.Equal(deletedAt) {
-		t.Fatalf("requeued cascade item kept deleted_at as queued_at; want a fresh queue position")
+	if !items[0].QueuedAt.Equal(originalQueuedAt) {
+		t.Fatalf("requeued cascade item QueuedAt = %v, want original failed queued_at %v", items[0].QueuedAt, originalQueuedAt)
 	}
 	if !items[0].IdentityAt.Equal(deletedAt) {
 		t.Fatalf("requeued cascade item IdentityAt = %v, want %v", items[0].IdentityAt, deletedAt)

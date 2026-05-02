@@ -1,11 +1,17 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
 	"github.com/Sesame-Disk/sesamefs/internal/api"
 	"github.com/Sesame-Disk/sesamefs/internal/config"
@@ -90,10 +96,41 @@ func runServer() {
 	// Create and start the API server
 	server := api.NewServer(cfg, database, Version)
 
-	slog.Info("SesameFS starting", "version", Version, "port", cfg.Server.Port)
-	if err := server.Run(); err != nil {
-		slog.Error("Server failed", "error", err)
-		os.Exit(1)
+	// Trap SIGINT/SIGTERM so the GC leader lease is released cleanly on
+	// container restart. Without this, the next process can't acquire the
+	// lease until the prior TTL expires (≥90s), and admin DLQ operations
+	// like requeue/delete return "gc leadership required" in that window.
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
+
+	serverErr := make(chan error, 1)
+	go func() {
+		slog.Info("SesameFS starting", "version", Version, "port", cfg.Server.Port)
+		if err := server.Run(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			serverErr <- err
+			return
+		}
+		serverErr <- nil
+	}()
+
+	select {
+	case sig := <-stop:
+		slog.Info("Shutdown signal received, stopping gracefully", "signal", sig.String())
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if err := server.Shutdown(ctx); err != nil {
+			slog.Error("Graceful shutdown failed", "error", err)
+			os.Exit(1)
+		}
+		// Drain Run() now that Shutdown returned.
+		if err := <-serverErr; err != nil {
+			slog.Error("Server returned error after shutdown", "error", err)
+		}
+	case err := <-serverErr:
+		if err != nil {
+			slog.Error("Server failed", "error", err)
+			os.Exit(1)
+		}
 	}
 }
 

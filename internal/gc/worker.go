@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/Sesame-Disk/sesamefs/internal/metrics"
+	gocql "github.com/apache/cassandra-gocql-driver/v2"
 	"github.com/google/uuid"
 )
 
@@ -54,6 +55,10 @@ func failureCodeForError(err error) string {
 
 func isHardDeleteInProgressError(err error) bool {
 	return failureCodeForError(err) == GCFailureCodeLibraryHardDeleteInProgress
+}
+
+func isBlockNotFound(err error) bool {
+	return errors.Is(err, gocql.ErrNotFound)
 }
 
 // s3DeleteRetryDelays is the backoff schedule used when S3 DeleteBlock fails.
@@ -1228,6 +1233,12 @@ func (w *Worker) repairSkippedFSObjectBlockDecrements(orgID, libraryID uuid.UUID
 
 		refCount, err := w.store.GetBlockRefCount(orgID, blockID)
 		if err != nil {
+			if isBlockNotFound(err) {
+				// The original decrement already happened and the block row
+				// was later finalized by block GC. There is nothing left to
+				// repair for this fs_object retry.
+				continue
+			}
 			return nil, fmt.Errorf("failed to read block ref_count while repairing fs_object %s/%s block %s: %w", libraryID, fsID, blockID, err)
 		}
 

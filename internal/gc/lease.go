@@ -2,6 +2,7 @@ package gc
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -19,6 +20,13 @@ const (
 type leaderLease interface {
 	// TryAcquireOrRenew attempts to claim or extend the lease. Thread-safe.
 	TryAcquireOrRenew(ctx context.Context) (bool, error)
+
+	// TryTakeoverIfStale attempts to seize the lease from a previous owner
+	// whose heartbeat is older than the given staleness window. Use this
+	// only on admin-triggered paths (not the worker hot loop) to recover
+	// from a crashed leader without waiting for the lease TTL to expire.
+	// Returns (true, nil) only if this instance now holds the lease.
+	TryTakeoverIfStale(ctx context.Context, staleness time.Duration) (bool, error)
 
 	// Release explicitly deletes the lease row so another replica can take
 	// over immediately instead of waiting for TTL expiry. Best-effort.
@@ -91,6 +99,52 @@ func (l *cassandraLeaderLease) TryAcquireOrRenew(ctx context.Context) (bool, err
 	if err != nil {
 		l.isLeader.Store(false)
 		return false, fmt.Errorf("gc leader lease renew failed: %w", err)
+	}
+	l.isLeader.Store(applied)
+	return applied, nil
+}
+
+func (l *cassandraLeaderLease) TryTakeoverIfStale(ctx context.Context, staleness time.Duration) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	if staleness <= 0 {
+		return false, nil
+	}
+	var currentInstanceID string
+	var heartbeat time.Time
+	err := l.session.Query(`
+		SELECT instance_id, heartbeat FROM gc_leases WHERE role = ?
+	`, l.role).WithContext(ctx).Scan(&currentInstanceID, &heartbeat)
+	if err != nil {
+		if errors.Is(err, gocql.ErrNotFound) {
+			// Row already gone (TTL expired between checks) — fall back to
+			// the normal acquire path so the caller still ends up holding
+			// the lease without an extra round-trip from their side.
+			return l.TryAcquireOrRenew(ctx)
+		}
+		return false, fmt.Errorf("gc leader lease read for takeover failed: %w", err)
+	}
+	if currentInstanceID == l.instanceID {
+		// Already ours — refresh and report success.
+		return l.TryAcquireOrRenew(ctx)
+	}
+	if l.now().Sub(heartbeat) < staleness {
+		// Previous owner is still healthy — never steal a fresh lease.
+		return false, nil
+	}
+	now := l.now()
+	applied, err := l.session.Query(`
+		UPDATE gc_leases USING TTL ?
+		SET instance_id = ?, heartbeat = ?
+		WHERE role = ? IF instance_id = ? AND heartbeat = ?
+	`, l.ttlSeconds, l.instanceID, now, l.role, currentInstanceID, heartbeat).MapScanCAS(map[string]interface{}{})
+	if err != nil {
+		l.isLeader.Store(false)
+		return false, fmt.Errorf("gc leader lease takeover failed: %w", err)
+	}
+	if applied {
+		log.Printf("[GC] Took over stale lease from %q (heartbeat age %v)", currentInstanceID, l.now().Sub(heartbeat))
 	}
 	l.isLeader.Store(applied)
 	return applied, nil

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/Sesame-Disk/sesamefs/internal/traffic"
+	gocql "github.com/apache/cassandra-gocql-driver/v2"
 	"github.com/google/uuid"
 )
 
@@ -1118,7 +1119,7 @@ func (m *MockStore) RequeueFailedItem(orgID uuid.UUID, failedAt time.Time, itemT
 		if item.FailedAt.Equal(failedAt) && item.ItemType == itemType && item.ItemID == itemID {
 			m.queue[orgID] = append(m.queue[orgID], QueueItem{
 				OrgID:                       orgID,
-				QueuedAt:                    queuedAt,
+				QueuedAt:                    item.QueuedAt,
 				IdentityAt:                  effectiveIdentityAt(item.QueuedAt, item.IdentityAt),
 				RequiresLibraryDeletedCheck: item.RequiresLibraryDeletedCheck,
 				ItemType:                    item.ItemType,
@@ -1129,8 +1130,8 @@ func (m *MockStore) RequeueFailedItem(orgID uuid.UUID, failedAt time.Time, itemT
 			})
 			m.upsertPendingItem(orgID, item.LibraryID, itemType, itemID, effectiveIdentityAt(item.QueuedAt, item.IdentityAt), nil)
 			m.failedItems[orgID] = append(items[:i], items[i+1:]...)
-			m.activeQueueOrgs[orgID] = time.Now().UTC()
-			m.dirtyQueueOrgs[orgID] = time.Now().UTC()
+			m.activeQueueOrgs[orgID] = queuedAt
+			m.dirtyQueueOrgs[orgID] = queuedAt
 			return nil
 		}
 	}
@@ -1350,7 +1351,7 @@ func (m *MockStore) GetBlockRefCount(orgID uuid.UUID, blockID string) (int, erro
 	key := fmt.Sprintf("%s:%s", orgID, blockID)
 	b, ok := m.blocks[key]
 	if !ok {
-		return 0, fmt.Errorf("block not found: %s", blockID)
+		return 0, fmt.Errorf("%w: block %s", gocql.ErrNotFound, blockID)
 	}
 	return b.RefCount, nil
 }

@@ -947,7 +947,7 @@ func (s *Service) ListFailedItemOrgs(limit int) ([]GCFailedItemOrgInfo, error) {
 }
 
 func (s *Service) DeleteFailedItem(orgID uuid.UUID, failedAt time.Time, itemType ItemType, itemID string) error {
-	if !s.hasLeadership(context.Background(), "admin_failed_item_delete") {
+	if !s.tryClaimLeadershipForAdmin(context.Background(), "admin_failed_item_delete") {
 		return ErrNotLeader
 	}
 	s.dlqOpsMu.Lock()
@@ -961,7 +961,7 @@ func (s *Service) DeleteFailedItem(orgID uuid.UUID, failedAt time.Time, itemType
 }
 
 func (s *Service) RequeueFailedItem(orgID uuid.UUID, failedAt time.Time, itemType ItemType, itemID string) error {
-	if !s.hasLeadership(context.Background(), "admin_failed_item_requeue") {
+	if !s.tryClaimLeadershipForAdmin(context.Background(), "admin_failed_item_requeue") {
 		return ErrNotLeader
 	}
 	// Serialize DLQ admin mutations: RequeueFailedItem performs a non-atomic
@@ -986,6 +986,42 @@ func (s *Service) hasLeadership(ctx context.Context, component string) bool {
 	}
 	// Fast check against the cached atomic — the background renewal goroutine
 	// keeps this up to date every TTL/3 seconds.
+	return s.lease.IsLeader()
+}
+
+// tryClaimLeadershipForAdmin is hasLeadership plus a synchronous recovery
+// path for human-triggered admin operations (Requeue/Delete from the GC
+// admin panel). It tries, in order:
+//
+//  1. The cached IsLeader() check — fast no-op if we already lead.
+//  2. A normal TryAcquireOrRenew — succeeds if the lease row was deleted by
+//     TTL expiry between the renewal loop's last tick and this call.
+//  3. A stale-lease takeover via TryTakeoverIfStale — succeeds if a previous
+//     leader crashed without Release() and its heartbeat is older than
+//     2 × renewalInterval. This is what unsticks single-instance dev after
+//     `kill -9` / OOM where the row's TTL is still ticking but no live
+//     process is renewing it.
+//
+// Only used in the admin DLQ path, never in the worker hot loop.
+func (s *Service) tryClaimLeadershipForAdmin(ctx context.Context, component string) bool {
+	if s.hasLeadership(ctx, component) {
+		return true
+	}
+	if _, err := s.lease.TryAcquireOrRenew(ctx); err != nil {
+		log.Printf("[GC] Admin-triggered lease claim failed for %s: %v", component, err)
+	}
+	if s.lease.IsLeader() {
+		return true
+	}
+	// Stale-lease window: 2 × renewal interval. Two missed heartbeats means
+	// the previous leader is dead — a healthy leader would have refreshed
+	// twice by now. Smaller windows risk stealing from a momentarily-slow
+	// leader; larger windows make admin recovery feel as slow as TTL.
+	staleness := 2 * s.leaseRenewalInterval()
+	if _, err := s.lease.TryTakeoverIfStale(ctx, staleness); err != nil {
+		log.Printf("[GC] Admin-triggered stale-lease takeover failed for %s: %v", component, err)
+		return false
+	}
 	return s.lease.IsLeader()
 }
 

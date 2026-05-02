@@ -624,11 +624,12 @@ func (s *CassandraStore) RequeueFailedItem(orgID uuid.UUID, failedAt time.Time, 
 	if err != nil {
 		return fmt.Errorf("load failed item for requeue %s/%s: %w", orgID, itemID, err)
 	}
+	requeueAt := failedQueuedAt
 	batch := s.db.Session().Batch(gocql.LoggedBatch)
 	batch.Query(`
 		INSERT INTO gc_queue (org_id, bucket, queued_at, identity_at, requires_library_deleted_check, item_type, item_id, library_id, storage_class, retry_count)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, orgID.String(), gcQueueBucket(orgID, itemType, itemID), queuedAt, effectiveIdentityAt(failedQueuedAt, identityAt), requiresLibraryDeletedCheck, string(itemType), itemID, libraryIDStr, storageClass, 0)
+	`, orgID.String(), gcQueueBucket(orgID, itemType, itemID), requeueAt, effectiveIdentityAt(failedQueuedAt, identityAt), requiresLibraryDeletedCheck, string(itemType), itemID, libraryIDStr, storageClass, 0)
 	addPendingItemBatchQuery(batch, orgID, parseUUID(libraryIDStr), itemType, itemID, effectiveIdentityAt(failedQueuedAt, identityAt))
 	batch.Query(`
 		DELETE FROM gc_failed_items

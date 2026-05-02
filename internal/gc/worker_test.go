@@ -728,6 +728,37 @@ func TestWorker_ProcessFSObject_RetryRepairsMarkedButMissingSharedDecrement(t *t
 	}
 }
 
+func TestWorker_ProcessFSObject_RetrySkipsAlreadyDeletedBlockDuringRepair(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	w := NewWorker(store, nil, q, 100, 0, false, stats)
+
+	orgID := uuid.New()
+	libID := uuid.New()
+	identityAt := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
+
+	store.AddFSObject(libID, "fs-obj-retry", "file", []string{"blk-already-deleted"})
+	store.AddLibrary(orgID, libID, "hot")
+
+	taskID := fsObjectBlockDecrementTaskID(libID, "fs-obj-retry", identityAt, 0, "blk-already-deleted")
+	if applied, err := store.MarkItemProcessed(taskID); err != nil || !applied {
+		t.Fatalf("seed block progress applied=%v err=%v", applied, err)
+	}
+
+	item := QueueItem{OrgID: orgID, QueuedAt: identityAt, IdentityAt: identityAt, ItemType: ItemFSObject, ItemID: "fs-obj-retry", LibraryID: libID}
+	if err := w.processFSObject(context.Background(), item); err != nil {
+		t.Fatalf("processFSObject retry failed: %v", err)
+	}
+
+	if store.GetFSObj(libID, "fs-obj-retry") != nil {
+		t.Fatal("fs_object should be deleted when its already-processed block row is gone")
+	}
+	if got := len(store.QueueItems(orgID)); got != 0 {
+		t.Fatalf("already-deleted block should not be enqueued again, got %d queue items", got)
+	}
+}
+
 func TestWorker_ProcessUserCascade_LockBusyPostponesWithoutRetryOrDLQ(t *testing.T) {
 	store := NewMockStore()
 	stats := &Stats{}

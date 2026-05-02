@@ -286,20 +286,20 @@ type GCFailedItemOrgInfo struct {
 
 // GCFailedItemInfo represents an item moved to the GC dead-letter queue.
 type GCFailedItemInfo struct {
-	OrgID                       uuid.UUID
-	FailedAt                    time.Time
-	QueuedAt                    time.Time
-	IdentityAt                  time.Time
-	RequiresLibraryDeletedCheck bool
-	ItemType                    ItemType
-	ItemID                      string
-	LibraryID                   uuid.UUID
-	StorageClass                string
-	RetryCount                  int
-	LastError                   string
-	FailureCode                 string
-	ResolvedAt                  *time.Time
-	ResolvedState               string
+	OrgID                       uuid.UUID  `json:"org_id"`
+	FailedAt                    time.Time  `json:"failed_at"`
+	QueuedAt                    time.Time  `json:"queued_at"`
+	IdentityAt                  time.Time  `json:"identity_at"`
+	RequiresLibraryDeletedCheck bool       `json:"requires_library_deleted_check"`
+	ItemType                    ItemType   `json:"item_type"`
+	ItemID                      string     `json:"item_id"`
+	LibraryID                   uuid.UUID  `json:"library_id"`
+	StorageClass                string     `json:"storage_class"`
+	RetryCount                  int        `json:"retry_count"`
+	LastError                   string     `json:"last_error"`
+	FailureCode                 string     `json:"failure_code"`
+	ResolvedAt                  *time.Time `json:"resolved_at"`
+	ResolvedState               string     `json:"resolved_state"`
 }
 
 // GCDirtyOrg identifies an org whose queue snapshot needs reconciliation.
