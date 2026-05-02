@@ -402,21 +402,86 @@ func initStorageManager(cfg *config.Config) *storage.Manager {
 	return manager
 }
 
+func storageClassEnvPrefix(name string) string {
+	var builder strings.Builder
+	builder.Grow(len(name))
+	lastUnderscore := false
+	for _, ch := range strings.ToUpper(strings.TrimSpace(name)) {
+		if (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') {
+			builder.WriteRune(ch)
+			lastUnderscore = false
+			continue
+		}
+		if !lastUnderscore {
+			builder.WriteByte('_')
+			lastUnderscore = true
+		}
+	}
+	return strings.Trim(builder.String(), "_")
+}
+
+func storageClassEnvVar(name, suffix string) string {
+	prefix := storageClassEnvPrefix(name)
+	if prefix == "" {
+		return suffix
+	}
+	return "S3_CLASS_" + prefix + "_" + suffix
+}
+
+func storageClassEnvValue(name, suffix string) string {
+	return strings.TrimSpace(os.Getenv(storageClassEnvVar(name, suffix)))
+}
+
+func envValue(name string) string {
+	return strings.TrimSpace(os.Getenv(name))
+}
+
 // initStorageClass creates an S3Store for a storage class config
 func initStorageClass(name string, cfg config.StorageClassConfig) (*storage.S3Store, error) {
-	// Get credentials from config or environment
-	accessKey := cfg.AccessKey
-	secretKey := cfg.SecretKey
-	if accessKey == "" {
-		accessKey = os.Getenv("AWS_ACCESS_KEY_ID")
+	bucket := cfg.Bucket
+	if value := storageClassEnvValue(name, "BUCKET"); value != "" {
+		bucket = value
 	}
-	if secretKey == "" {
-		secretKey = os.Getenv("AWS_SECRET_ACCESS_KEY")
+	if strings.TrimSpace(bucket) == "" {
+		return nil, fmt.Errorf("storage class %s bucket is not configured; set %s", name, storageClassEnvVar(name, "BUCKET"))
 	}
 
 	region := cfg.Region
+	if value := storageClassEnvValue(name, "REGION"); value != "" {
+		region = value
+	}
 	if region == "" {
 		region = "us-east-1"
+	}
+
+	endpoint := cfg.Endpoint
+	if value := storageClassEnvValue(name, "ENDPOINT"); value != "" {
+		endpoint = value
+	}
+
+	// Get credentials from class-specific env or config, then fall back to the default env pair.
+	accessKey := storageClassEnvValue(name, "ACCESS_KEY_ID")
+	if accessKey == "" {
+		accessKey = cfg.AccessKey
+	}
+	secretKey := storageClassEnvValue(name, "SECRET_ACCESS_KEY")
+	if secretKey == "" {
+		secretKey = cfg.SecretKey
+	}
+	if accessKey == "" {
+		accessKey = envValue("S3_ACCESS_KEY_ID")
+	}
+	if secretKey == "" {
+		secretKey = envValue("S3_SECRET_ACCESS_KEY")
+	}
+
+	serverSideEncryption := cfg.ServerSideEncryption
+	if value := storageClassEnvValue(name, "SERVER_SIDE_ENCRYPTION"); value != "" {
+		serverSideEncryption = value
+	}
+	sseKMSKeyID := cfg.SSEKMSKeyID
+	if value := storageClassEnvValue(name, "SSE_KMS_KEY_ID"); value != "" {
+		sseKMSKeyID = value
 	}
 
 	// Determine access type from tier
@@ -426,14 +491,14 @@ func initStorageClass(name string, cfg config.StorageClassConfig) (*storage.S3St
 	}
 
 	s3Cfg := storage.S3Config{
-		Endpoint:             cfg.Endpoint,
-		Bucket:               cfg.Bucket,
+		Endpoint:             endpoint,
+		Bucket:               bucket,
 		Region:               region,
 		AccessKeyID:          accessKey,
 		SecretAccessKey:      secretKey,
-		ServerSideEncryption: cfg.ServerSideEncryption,
-		SSEKMSKeyID:          cfg.SSEKMSKeyID,
-		UsePathStyle:         cfg.UsePathStyle || cfg.Endpoint != "",
+		ServerSideEncryption: serverSideEncryption,
+		SSEKMSKeyID:          sseKMSKeyID,
+		UsePathStyle:         cfg.UsePathStyle || endpoint != "",
 		AccessType:           accessType,
 	}
 
@@ -445,9 +510,9 @@ func initS3Storage(cfg *config.Config) (*storage.S3Store, error) {
 	// Get S3 configuration from environment or config
 	endpoint := os.Getenv("S3_ENDPOINT")
 	bucket := os.Getenv("S3_BUCKET")
-	region := os.Getenv("AWS_REGION")
-	accessKey := os.Getenv("AWS_ACCESS_KEY_ID")
-	secretKey := os.Getenv("AWS_SECRET_ACCESS_KEY")
+	region := envValue("S3_REGION")
+	accessKey := envValue("S3_ACCESS_KEY_ID")
+	secretKey := envValue("S3_SECRET_ACCESS_KEY")
 	sseMode := os.Getenv("S3_SERVER_SIDE_ENCRYPTION")
 	sseKMSKeyID := os.Getenv("S3_SSE_KMS_KEY_ID")
 

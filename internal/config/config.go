@@ -1211,7 +1211,7 @@ func (c *Config) Validate() error {
 		}
 		hot, ok := c.Storage.Backends["hot"]
 		if ok && (strings.TrimSpace(hot.Bucket) != "" || strings.TrimSpace(hot.Region) != "" || strings.TrimSpace(hot.Endpoint) != "") {
-			return fmt.Errorf("storage.mode=multi does not allow legacy hot backend overrides; remove S3_BUCKET/AWS_REGION/S3_REGION/S3_ENDPOINT")
+			return fmt.Errorf("storage.mode=multi does not allow legacy hot backend overrides; remove S3_BUCKET/S3_REGION/S3_ENDPOINT")
 		}
 		regionConfig, ok := c.regionClassConfig(c.Server.Region)
 		if !ok {

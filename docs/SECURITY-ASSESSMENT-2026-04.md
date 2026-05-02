@@ -43,7 +43,7 @@ automatically.
 | `OIDC_REQUIRE_PKCE` | `true` | anything else (warning) |
 | `ONLYOFFICE_JWT_SECRET` | ≥32 random bytes | `change-me-to-a-random-string` |
 | `S3_BUCKET` / `S3_REGION` | set | empty |
-| `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | set | `minioadmin` |
+| `S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY` | set | `minioadmin` |
 | `CASSANDRA_HOSTS` | set | empty |
 | `CASSANDRA_USERNAME` / `CASSANDRA_PASSWORD` | set unless private subnet | empty (warning) |
 
@@ -68,7 +68,7 @@ inline:
 
 # Step 2: edit .env to fill in the values the script CANNOT generate —
 # OIDC_CLIENT_ID / OIDC_CLIENT_SECRET (from your IdP),
-# AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY (from AWS IAM),
+# S3_ACCESS_KEY_ID / S3_SECRET_ACCESS_KEY (from your S3 provider),
 # CASSANDRA_USERNAME / CASSANDRA_PASSWORD (from your Cassandra admin).
 $EDITOR .env
 
@@ -90,7 +90,7 @@ Auto-generated secrets:
 | `SHARE_LINK_HMAC_KEY` | `openssl rand -hex 32` (or `/dev/urandom`) | — |
 | `ONLYOFFICE_JWT_SECRET` | same | — |
 | `OIDC_JWT_SIGNING_KEY` | same | — |
-| `AWS_ACCESS_KEY_ID/SECRET` | **NOT generated** | must come from AWS IAM |
+| `S3_ACCESS_KEY_ID/SECRET` | **NOT generated** | must come from your S3 provider |
 | `OIDC_CLIENT_ID/SECRET` | **NOT generated** | must come from your IdP |
 | `CASSANDRA_USERNAME/PASSWORD` | **NOT generated** | must match the Cassandra side |
 

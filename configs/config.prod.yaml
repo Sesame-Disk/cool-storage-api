@@ -18,7 +18,7 @@
 # Env var overrides (applied after this file is loaded):
 #   AUTH_DEV_MODE, OIDC_*, ONLYOFFICE_*,
 #   CASSANDRA_*, S3_BUCKET, S3_REGION, S3_ENDPOINT,
-#   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, BILLING_URL,
+#   S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY, BILLING_URL,
 #   SERVER_TRUSTED_PROXIES, FIRST_SUPERADMIN_EMAIL,
 #   GC_ENABLED, GC_USER_GRACE_DAYS, GC_ORG_GRACE_DAYS,
 #   GC_TRASH_RETENTION_DAYS, GC_AUDIT_RETENTION_DAYS,
@@ -52,26 +52,29 @@ database:
 #
 # Single-region:
 #   - leave SERVER_REGION unset
-#   - fill S3_* / AWS_REGION env vars for the legacy "hot" backend below
+#   - fill S3_* env vars for the legacy "hot" backend below
 #   - runtime overrides switch the effective default_class back to "hot"
 #
 # Multi-region:
-#   - set SERVER_REGION per node (usa/eu/asia)
-#   - keep buckets/regions/failover chains in storage.classes below
+#   - set SERVER_REGION per node (na/eu/asia)
+#   - keep regions/failover chains in storage.classes below
+#   - set per-class buckets via S3_CLASS_<CLASS>_BUCKET env vars
 #   - region_classes take precedence over default_class for shared-domain routing
 #
-# Credentials always come from AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY.
+# Credentials can come from either:
+#   - class-specific env vars: S3_CLASS_<CLASS>_ACCESS_KEY_ID / SECRET_ACCESS_KEY
+#   - default env vars: S3_ACCESS_KEY_ID / S3_SECRET_ACCESS_KEY
 # =============================================================================
 storage:
   mode: "multi"
-  default_class: hot-s3-usa
+  default_class: hot-s3-na
 
   classes:
-    hot-s3-usa:
+    hot-s3-na:
       type: s3
       tier: hot
-      endpoint: ""                   # Leave empty for AWS S3; set only for S3-compatible APIs
-      bucket: sesamefs-usa
+      endpoint: ""                   # Leave empty for provider-native S3; set only for custom S3-compatible APIs
+      bucket: ""                     # Set via S3_CLASS_HOT_S3_NA_BUCKET
       region: us-east-1
       server_side_encryption: "AES256"
       sse_kms_key_id: ""
@@ -81,17 +84,17 @@ storage:
       type: s3
       tier: hot
       endpoint: ""
-      bucket: sesamefs-eu
+      bucket: ""                     # Set via S3_CLASS_HOT_S3_EU_BUCKET
       region: eu-west-1
       server_side_encryption: "AES256"
       sse_kms_key_id: ""
-      failover_class: hot-s3-usa
+      failover_class: hot-s3-na
 
     hot-s3-asia:
       type: s3
       tier: hot
       endpoint: ""
-      bucket: sesamefs-asia
+      bucket: ""                     # Set via S3_CLASS_HOT_S3_ASIA_BUCKET
       region: ap-southeast-1
       server_side_encryption: "AES256"
       sse_kms_key_id: ""
@@ -102,8 +105,8 @@ storage:
     # global-domain topology, SERVER_REGION decides the node-local default.
 
   region_classes:
-    usa:
-      hot: hot-s3-usa
+    na:
+      hot: hot-s3-na
       cold: ""
     eu:
       hot: hot-s3-eu

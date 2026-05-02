@@ -12,7 +12,7 @@
 # Intended to run either manually on the host:
 #
 #      ./scripts/prod-preflight.sh --init-env    # once, to seed .env
-#      $EDITOR .env                              # fill in IdP / AWS / DB
+#      $EDITOR .env                              # fill in IdP / S3 / DB
 #      set -a; source .env; set +a
 #      ./scripts/prod-preflight.sh               # validate
 #
@@ -256,8 +256,8 @@ do_init_env() {
   needs_manual OIDC_REDIRECT_URIS            "comma-separated OIDC callback allow-list covering every production login domain"
   needs_manual CORS_ALLOWED_ORIGINS          "comma-separated browser origins covering every production web domain"
   needs_manual ONLYOFFICE_API_JS_URL         "the public OnlyOffice API JS URL"
-  needs_manual AWS_ACCESS_KEY_ID             "from AWS IAM — cannot be generated"
-  needs_manual AWS_SECRET_ACCESS_KEY         "from AWS IAM — cannot be generated"
+  needs_manual S3_ACCESS_KEY_ID              "from your S3 provider or object-storage IAM/API user"
+  needs_manual S3_SECRET_ACCESS_KEY          "from your S3 provider or object-storage IAM/API user"
 
   echo >&2
   if [ "$missing" -gt 0 ]; then
@@ -305,6 +305,50 @@ storage_mode() {
       echo "invalid"
       ;;
   esac
+}
+
+storage_class_env_prefix() {
+  printf '%s' "$1" | tr '[:lower:]' '[:upper:]' | sed -E 's/[^A-Z0-9]+/_/g; s/^_+//; s/_+$//; s/_+/_/g'
+}
+
+list_multi_storage_classes() {
+  local cfg="${CONFIG_PATH:-configs/config.prod.yaml}"
+  if [ ! -r "$cfg" ]; then
+    return
+  fi
+
+  awk '
+    /^[[:space:]]*classes:[[:space:]]*$/ { in_classes=1; next }
+    in_classes && /^[[:space:]]{2}[A-Za-z0-9_]+:[[:space:]]*$/ { in_classes=0 }
+    in_classes && /^[[:space:]]{4}[A-Za-z0-9._-]+:[[:space:]]*$/ {
+      line=$0
+      sub(/^[[:space:]]{4}/, "", line)
+      sub(/:[[:space:]]*$/, "", line)
+      print line
+    }
+  ' "$cfg"
+}
+
+resolve_default_s3_credentials_source() {
+  if is_set S3_ACCESS_KEY_ID || is_set S3_SECRET_ACCESS_KEY; then
+    if ! is_set S3_ACCESS_KEY_ID || ! is_set S3_SECRET_ACCESS_KEY; then
+      fail "S3_ACCESS_KEY_ID and S3_SECRET_ACCESS_KEY must either both be set or both be unset."
+      echo "invalid"
+      return
+    fi
+    echo "s3"
+    return
+  fi
+
+  echo ""
+}
+
+resolve_single_region_var() {
+  if is_set S3_REGION; then
+    echo "S3_REGION"
+    return
+  fi
+  echo ""
 }
 
 # ========================================================================
@@ -455,43 +499,97 @@ check_object_storage() {
   fi
   pass "Detected storage mode: $mode"
 
-  local required=(AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY)
-  for v in "${required[@]}"; do
-    if ! is_set "$v"; then
-      fail "$v is unset. Required for S3-backed storage."
-    else
-      pass "$v is set"
-    fi
-  done
-
   if [ "$mode" = "single" ]; then
+    local default_creds_source
+    default_creds_source="$(resolve_default_s3_credentials_source)"
+    case "$default_creds_source" in
+      s3)
+        pass "S3_ACCESS_KEY_ID / S3_SECRET_ACCESS_KEY are set"
+        ;;
+      invalid)
+        ;;
+      *)
+        fail "S3_ACCESS_KEY_ID and S3_SECRET_ACCESS_KEY are unset. Required for single-region S3-backed storage."
+        ;;
+    esac
+
     if is_set SERVER_REGION; then
       fail "SERVER_REGION must be empty when STORAGE_MODE=single."
     fi
-    local single_required=(S3_BUCKET AWS_REGION S3_REGION)
-    for v in "${single_required[@]}"; do
-      if ! is_set "$v"; then
-        fail "$v is unset. Required for single-region mode with the legacy hot backend."
-      else
-        pass "$v is set"
-      fi
-    done
+    if ! is_set S3_BUCKET; then
+      fail "S3_BUCKET is unset. Required for single-region mode with the legacy hot backend."
+    else
+      pass "S3_BUCKET is set"
+    fi
+
+    local single_region_var
+    single_region_var="$(resolve_single_region_var)"
+    if [ -z "$single_region_var" ]; then
+      fail "S3_REGION is unset. Required for single-region mode with the legacy hot backend."
+    else
+      pass "$single_region_var is set"
+    fi
   else
     if ! is_set SERVER_REGION; then
       fail "SERVER_REGION is unset. Required when STORAGE_MODE=multi."
     else
       pass "SERVER_REGION is set"
     fi
-    if is_set S3_BUCKET || is_set S3_REGION || is_set AWS_REGION || is_set S3_ENDPOINT; then
-      fail "Legacy single-region S3_* / AWS_REGION overrides must be unset when STORAGE_MODE=multi."
+    if is_set S3_BUCKET || is_set S3_REGION || is_set S3_ENDPOINT; then
+      fail "Legacy single-region S3_BUCKET/S3_REGION/S3_ENDPOINT overrides must be unset when STORAGE_MODE=multi."
     else
-      pass "bucket/region topology is expected to come from configs/config.prod.yaml storage.classes"
+      pass "bucket names are expected to come from per-class S3_CLASS_*_BUCKET env vars"
     fi
+
+    local classes=()
+    while IFS= read -r class_name; do
+      if [ -n "$class_name" ]; then
+      classes+=("$class_name")
+      fi
+    done < <(list_multi_storage_classes)
+
+    local has_default_creds=false
+    local default_creds_source
+    default_creds_source="$(resolve_default_s3_credentials_source)"
+    case "$default_creds_source" in
+      s3)
+        pass "Default S3 credential pair is set"
+        has_default_creds=true
+        ;;
+      invalid)
+        ;;
+    esac
+
+    for class_name in "${classes[@]}"; do
+      local class_prefix
+      class_prefix="$(storage_class_env_prefix "$class_name")"
+      local bucket_var="S3_CLASS_${class_prefix}_BUCKET"
+      local access_var="S3_CLASS_${class_prefix}_ACCESS_KEY_ID"
+      local secret_var="S3_CLASS_${class_prefix}_SECRET_ACCESS_KEY"
+
+      if ! is_set "$bucket_var"; then
+      fail "$bucket_var is unset. Required for storage class $class_name in STORAGE_MODE=multi."
+      else
+      pass "$bucket_var is set"
+      fi
+
+      if is_set "$access_var" || is_set "$secret_var"; then
+      if ! is_set "$access_var" || ! is_set "$secret_var"; then
+        fail "$access_var and $secret_var must either both be set or both be unset for storage class $class_name."
+      else
+        pass "$class_name uses class-specific credentials"
+      fi
+      elif [ "$has_default_creds" = false ]; then
+      fail "$class_name has no class-specific credentials and no default S3_ACCESS_KEY_ID/S3_SECRET_ACCESS_KEY fallback is set."
+      fi
+    done
   fi
 
-  if [ "${AWS_ACCESS_KEY_ID:-}" = "$DEV_DEFAULT_MINIO_USER" ] \
-     || [ "${AWS_SECRET_ACCESS_KEY:-}" = "$DEV_DEFAULT_MINIO_PASS" ]; then
-    fail "AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY are the MinIO dev defaults ('minioadmin')."
+  local default_access_key="${S3_ACCESS_KEY_ID:-}"
+  local default_secret_key="${S3_SECRET_ACCESS_KEY:-}"
+  if [ "$default_access_key" = "$DEV_DEFAULT_MINIO_USER" ] \
+     || [ "$default_secret_key" = "$DEV_DEFAULT_MINIO_PASS" ]; then
+    fail "Default S3 credentials are the MinIO dev defaults ('minioadmin')."
   fi
 
   if is_set S3_ENDPOINT && [[ "$S3_ENDPOINT" == *"minio"* ]]; then

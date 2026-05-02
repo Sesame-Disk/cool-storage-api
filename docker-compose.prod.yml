@@ -40,7 +40,7 @@ services:
       - CASSANDRA_KEYSPACE=${CASSANDRA_KEYSPACE:-sesamefs}
       - CASSANDRA_LOCAL_DC=${CASSANDRA_LOCAL_DC:-datacenter1}
 
-      # Region — leave empty for single-region; set to usa/eu/asia in multi-region
+      # Region — leave empty for single-region; set to na/eu/asia in multi-region
       - SERVER_REGION=${SERVER_REGION:-}
 
       # Force production mode (overrides any accidental dev values in .env)

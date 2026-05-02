@@ -95,9 +95,9 @@ GC is a good example:
 
 ### 0.1 Create an S3 bucket
 
-1. Create a bucket in AWS S3 (or an S3-compatible service like Cloudflare R2)
-2. Create an IAM user with `s3:*` permission on that bucket
-3. Save the `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`
+1. Create a bucket in your S3-compatible provider (AWS S3, Cloudflare R2, MinIO, etc.)
+2. Create an API/IAM user with `s3:*` permission on that bucket
+3. Save the `S3_ACCESS_KEY_ID` and `S3_SECRET_ACCESS_KEY`
 
 ### 0.2 Register an OIDC client
 
@@ -213,21 +213,33 @@ IMAGE_TAG=2026.05.01-abc1234
 # SERVER_URL=https://files.yourdomain.com
 ONLYOFFICE_API_JS_URL=https://office.yourdomain.com/web-apps/apps/api/documents/api.js
 
-# AWS credentials
-AWS_ACCESS_KEY_ID=<from step 0.1>
-AWS_SECRET_ACCESS_KEY=<from step 0.1>
+# S3 credentials
+# Default credential pair used by any storage class without its own override.
+S3_ACCESS_KEY_ID=<from step 0.1>
+S3_SECRET_ACCESS_KEY=<from step 0.1>
 
 # Explicit storage mode
 STORAGE_MODE=multi
 
+# Multi-region per-class bucket mapping. Real bucket names stay in .env, not in
+# configs/config.prod.yaml.
+S3_CLASS_HOT_S3_NA_BUCKET=<your-na-bucket>
+S3_CLASS_HOT_S3_EU_BUCKET=<your-eu-bucket>
+S3_CLASS_HOT_S3_ASIA_BUCKET=<your-asia-bucket>
+
+# Optional per-class credential overrides. If omitted, SesameFS falls back to
+# S3_ACCESS_KEY_ID / S3_SECRET_ACCESS_KEY.
+# S3_CLASS_HOT_S3_NA_ACCESS_KEY_ID=<optional-class-key>
+# S3_CLASS_HOT_S3_NA_SECRET_ACCESS_KEY=<optional-class-secret>
+
 # OIDC callback allow-list. Add every production login domain registered in your IdP.
 OIDC_REDIRECT_URIS=https://files.yourdomain.com/sso/,https://files.yourdomain.com/oauth/callback/
 
-# Single-region only: leave SERVER_REGION empty and point the legacy hot backend
-# at one bucket. For multi-region, keep these unset and use storage.classes.
-S3_BUCKET=<your-bucket-name>
-AWS_REGION=us-east-1
-S3_REGION=us-east-1
+# Single-region only: set STORAGE_MODE=single, leave SERVER_REGION empty, and
+# uncomment these to point the legacy hot backend at one bucket.
+# In multi-region, keep these unset and use S3_CLASS_*_BUCKET above.
+# S3_BUCKET=<your-bucket-name>
+# S3_REGION=us-east-1
 # S3_ENDPOINT=
 # S3_SERVER_SIDE_ENCRYPTION=AES256
 # S3_SSE_KMS_KEY_ID=
@@ -294,9 +306,11 @@ ONLYOFFICE_JWT_SECRET=<from step 0.3 — second openssl output>
 
 > Set `SERVER_URL` only if you need an explicit fallback for unusual reverse-proxy paths or absolute-link generation when the request itself does not carry usable host context.
 
-> In single-region mode, the legacy `hot` backend consumes `S3_BUCKET`, `AWS_REGION`, `S3_REGION`, and optional `S3_ENDPOINT` / SSE overrides from `.env`.
+> In single-region mode, the legacy `hot` backend consumes `S3_BUCKET`, `S3_REGION`, and optional `S3_ENDPOINT` / SSE overrides from `.env`.
 
-> In multi-region mode, bucket names, AWS regions and failover chains live in `configs/config.prod.yaml` under `storage.classes` and `region_classes`.
+> In multi-region mode, `configs/config.prod.yaml` keeps the public topology: storage classes, provider regions, and failover chains. Real bucket names come from per-class `S3_CLASS_*_BUCKET` env vars.
+
+> Per-class credentials are optional. If `S3_CLASS_*_ACCESS_KEY_ID` / `SECRET_ACCESS_KEY` are unset for a class, SesameFS falls back to the default `S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY` pair.
 
 > `OIDC_REDIRECT_URIS` can contain callback URLs for multiple production domains in the same deploy, as long as the same list is allow-listed in your IdP.
 
@@ -519,7 +533,7 @@ Settings that **cannot** be set via env vars and must be in this file:
 | `OIDC_FULL_SYNC_GROUPS` | `auth.oidc.full_sync_groups` | Remove memberships absent from the claim instead of additive-only sync. |
 | `OIDC_FULL_SYNC_DEPARTMENTS` | `auth.oidc.full_sync_departments` | Remove department memberships absent from the claim instead of additive-only sync. |
 | `STORAGE_MODE` | `storage.mode` | `multi` or `single`. Standard production default is `multi`. |
-| `SERVER_REGION` | — (server metadata) | Region id: `usa`, `eu`, etc. Empty = single-region |
+| `SERVER_REGION` | — (server metadata) | Region id: `na`, `eu`, etc. Empty = single-region |
 | `SERVER_TRUSTED_PROXIES` | `server.trusted_proxies` | Comma-separated exact proxy IPs/CIDRs that are allowed to define client IP headers. |
 | `CASSANDRA_HOSTS` | `database.hosts` | Default: `cassandra:9042`. Multi-region: private IPs |
 | `CASSANDRA_KEYSPACE` | `database.keyspace` | |
@@ -527,13 +541,17 @@ Settings that **cannot** be set via env vars and must be in this file:
 | `CASSANDRA_USERNAME` | `database.username` | Optional |
 | `CASSANDRA_PASSWORD` | `database.password` | Optional |
 | `S3_BUCKET` | `storage.backends.hot.bucket` | Single-region legacy path only |
-| `AWS_REGION` | `storage.backends.hot.region` | Used by the legacy S3 init path in single-region mode |
 | `S3_REGION` | `storage.backends.hot.region` | Env override applied onto `storage.backends.hot` in single-region mode |
 | `S3_ENDPOINT` | `storage.backends.hot.endpoint` | Single-region legacy path; empty = real AWS |
 | `S3_SERVER_SIDE_ENCRYPTION` | `storage.backends.hot.server_side_encryption` | Single-region legacy path |
 | `S3_SSE_KMS_KEY_ID` | `storage.backends.hot.sse_kms_key_id` | Single-region legacy path |
-| `AWS_ACCESS_KEY_ID` | (AWS SDK) | Auto-picked by SDK |
-| `AWS_SECRET_ACCESS_KEY` | (AWS SDK) | Auto-picked by SDK |
+| `S3_CLASS_<CLASS>_BUCKET` | `storage.classes.<class>.bucket` | Multi-region only. Required per class. Example: `S3_CLASS_HOT_S3_NA_BUCKET`. |
+| `S3_CLASS_<CLASS>_REGION` | `storage.classes.<class>.region` | Optional per-class region override. |
+| `S3_CLASS_<CLASS>_ENDPOINT` | `storage.classes.<class>.endpoint` | Optional per-class endpoint override. |
+| `S3_CLASS_<CLASS>_ACCESS_KEY_ID` | — | Optional per-class credential override. Falls back to `S3_ACCESS_KEY_ID`. |
+| `S3_CLASS_<CLASS>_SECRET_ACCESS_KEY` | — | Optional per-class credential override. Falls back to `S3_SECRET_ACCESS_KEY`. |
+| `S3_ACCESS_KEY_ID` | — | Default credential pair for any storage class without a class-specific override. |
+| `S3_SECRET_ACCESS_KEY` | — | Default credential pair for any storage class without a class-specific override. |
 | `CORS_ALLOWED_ORIGINS` | `cors.allowed_origins` | Comma-separated browser origins. Must include every production web domain. Wildcard `"*"` is rejected in production. |
 | `ONLYOFFICE_JWT_TTL_SECONDS` | `onlyoffice.jwt_ttl_seconds` | OnlyOffice editor JWT lifetime in seconds. Default `3600` (1h). Range: 300–28800. |
 | `FIRST_SUPERADMIN_EMAIL` | `auth.first_superadmin_email` | Optional bootstrap email used only on the first successful seed. |
@@ -563,15 +581,15 @@ docker compose -f docker-compose.prod.yml logs sesamefs
 
 Common causes:
 - **Cassandra not ready yet** — wait 90s and retry, or check `docker compose ps`
-- **S3 connection failed** — in single-region verify `S3_BUCKET`/`AWS_REGION`/`S3_REGION`; in multi-region verify `storage.classes` in `configs/config.prod.yaml`; in both modes verify AWS credentials in `.env`
+- **S3 connection failed** — in single-region verify `S3_BUCKET`/`S3_REGION`; in multi-region verify `S3_CLASS_*_BUCKET` vars plus `storage.classes` topology in `configs/config.prod.yaml`; in both modes verify S3 credentials in `.env`
 - **Config parse error** — check `configs/config.prod.yaml` for YAML syntax errors
 
 ### `/ready` returns storage error
 
 sesamefs can't reach S3. Check:
-1. `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` in `.env`
-2. In single-region: `S3_BUCKET`, `AWS_REGION`, and `S3_REGION` target the correct bucket and region
-3. In multi-region: `configs/config.prod.yaml` defines valid `storage.classes` bucket names and AWS regions
+1. `S3_ACCESS_KEY_ID` and `S3_SECRET_ACCESS_KEY` in `.env`
+2. In single-region: `S3_BUCKET` and `S3_REGION` target the correct bucket and region
+3. In multi-region: `S3_CLASS_*_BUCKET` env vars are set and `configs/config.prod.yaml` defines the matching `storage.classes` regions/failover topology
 4. The IAM user has `s3:HeadBucket` and `s3:*` on the configured buckets
 5. Any custom `S3_ENDPOINT` or `storage.classes[*].endpoint` values are correct for your object store
 
@@ -667,23 +685,21 @@ other over the private network and replicate data automatically.
 ### Step M1 — Prepare `.env` for each server
 
 Start from `.env.prod.example` and uncomment the multi-region section.
-Example for a 2-region setup (USA + EU):
+Example for a 2-region setup (NA + EU):
 
-**VPS USA** (private IP: `10.0.1.10`):
+**VPS NA** (private IP: `10.0.1.10`):
 ```bash
 # --- Standard (same as single-region) ---
-DOMAIN=us.files.sesamedisk.com
-OFFICE_DOMAIN=us.office.sesamedisk.com
 CASSANDRA_CLUSTER_NAME=sesamefs-prod
 CASSANDRA_MAX_HEAP_SIZE=2G
 CASSANDRA_HEAP_NEWSIZE=400M
 # ... (S3, OIDC, OnlyOffice — same as single-region)
 
 # --- Multi-Region ---
-SERVER_REGION=usa
+SERVER_REGION=na
 # CASSANDRA_HOSTS not needed — SesameFS talks to local Cassandra via Docker (cassandra:9042)
-CASSANDRA_DC=dc-usa
-CASSANDRA_LOCAL_DC=dc-usa
+CASSANDRA_DC=dc-na
+CASSANDRA_LOCAL_DC=dc-na
 CASSANDRA_RACK=rack1
 CASSANDRA_SEEDS=10.0.1.10,10.0.2.20
 CASSANDRA_BIND_IP=10.0.1.10
@@ -702,8 +718,6 @@ CASSANDRA_BROADCAST_RPC_ADDRESS=10.0.1.10
 **VPS EU** (private IP: `10.0.2.20`):
 ```bash
 # --- Standard ---
-DOMAIN=eu.files.sesamedisk.com
-OFFICE_DOMAIN=eu.office.sesamedisk.com
 CASSANDRA_CLUSTER_NAME=sesamefs-prod          # MUST match all nodes
 CASSANDRA_MAX_HEAP_SIZE=2G
 CASSANDRA_HEAP_NEWSIZE=400M
@@ -730,7 +744,7 @@ CASSANDRA_BROADCAST_RPC_ADDRESS=10.0.2.20
 
 `configs/config.prod.yaml` is now the shared multi-region structural config.
 All nodes run the same file, and `SERVER_REGION` selects the node-local default
-region when requests arrive through the shared public `DOMAIN`.
+region when requests arrive through the shared public hostname.
 
 ### Current status of the region-aware library feature
 
@@ -766,9 +780,9 @@ Use `configs/config.example.yaml` as the canonical structure. At minimum, you ne
 
 ```yaml
 storage:
-  default_class: hot-s3-usa
+  default_class: hot-s3-na
   classes:
-    hot-s3-usa:
+    hot-s3-na:
       type: s3
       tier: hot
       bucket: sesamefs-usa
@@ -780,13 +794,13 @@ storage:
       region: eu-west-1
 
   endpoint_regions:
-    "us.files.yourdomain.com": "usa"
+    "us.files.yourdomain.com": "na"
     "eu.files.yourdomain.com": "eu"
-    "*": "usa"
+    "*": "na"
 
   region_classes:
-    usa:
-      hot: hot-s3-usa
+    na:
+      hot: hot-s3-na
     eu:
       hot: hot-s3-eu
 ```
@@ -815,7 +829,7 @@ curl -X PUT https://admin.yourdomain.com/api/v2.1/admin/organizations/<org_id>/ 
   -d '{
     "storage_policy": {
       "data_residency": "strict",
-      "default_region": "usa"
+      "default_region": "na"
     }
   }'
 ```
@@ -853,7 +867,7 @@ sudo ufw allow in on ens1 to any port 9042 proto tcp    # CQL
 
 ### Step M4 — Deploy order
 
-1. **Start the first seed node** (e.g., VPS USA):
+1. **Start the first seed node** (e.g., VPS NA):
    ```bash
    docker compose -f docker-compose.prod.yml up -d cassandra
    # Wait for it to be healthy (~90s)
@@ -878,7 +892,7 @@ sudo ufw allow in on ens1 to any port 9042 proto tcp    # CQL
      ALTER KEYSPACE sesamefs
      WITH replication = {
        'class': 'NetworkTopologyStrategy',
-       'dc-usa': 1,
+       'dc-na': 1,
        'dc-eu': 1
      };
    "

@@ -143,7 +143,6 @@ func TestInitS3StorageRequiresExplicitLegacyConfig(t *testing.T) {
 	}
 
 	t.Setenv("S3_BUCKET", "")
-	t.Setenv("AWS_REGION", "")
 	t.Setenv("S3_REGION", "")
 	t.Setenv("S3_ENDPOINT", "")
 
@@ -175,11 +174,10 @@ func TestInitS3StorageUsesLegacyHotBackend(t *testing.T) {
 	}
 
 	t.Setenv("S3_BUCKET", "")
-	t.Setenv("AWS_REGION", "")
 	t.Setenv("S3_REGION", "")
 	t.Setenv("S3_ENDPOINT", "")
-	t.Setenv("AWS_ACCESS_KEY_ID", "test-key")
-	t.Setenv("AWS_SECRET_ACCESS_KEY", "test-secret")
+	t.Setenv("S3_ACCESS_KEY_ID", "test-key")
+	t.Setenv("S3_SECRET_ACCESS_KEY", "test-secret")
 
 	store, err := initS3Storage(cfg)
 	if err != nil {
@@ -215,6 +213,61 @@ func TestInitStorageManagerSkipsEmptyLegacyHotBackend(t *testing.T) {
 	}
 	if _, ok := manager.GetBackend("hot-s3-usa"); !ok {
 		t.Fatal("configured storage class hot-s3-usa was not registered")
+	}
+}
+
+func TestInitStorageClassUsesClassSpecificEnvBucketAndDefaultCredentials(t *testing.T) {
+	t.Setenv("S3_CLASS_HOT_S3_NORTH_AMERICA_BUCKET", "sesamefs-na-prod")
+	t.Setenv("S3_ACCESS_KEY_ID", "default-key")
+	t.Setenv("S3_SECRET_ACCESS_KEY", "default-secret")
+
+	store, err := initStorageClass("hot-s3-north-america", config.StorageClassConfig{
+		Type:   "s3",
+		Region: "us-east-1",
+		Tier:   "hot",
+	})
+	if err != nil {
+		t.Fatalf("initStorageClass returned error: %v", err)
+	}
+	if store == nil {
+		t.Fatal("initStorageClass store = nil, want non-nil")
+	}
+	if got := store.Bucket(); got != "sesamefs-na-prod" {
+		t.Fatalf("store.Bucket() = %q, want %q", got, "sesamefs-na-prod")
+	}
+}
+
+func TestInitStorageClassUsesClassSpecificCredentials(t *testing.T) {
+	t.Setenv("S3_CLASS_HOT_S3_NORTH_AMERICA_BUCKET", "sesamefs-na-prod")
+	t.Setenv("S3_CLASS_HOT_S3_NORTH_AMERICA_ACCESS_KEY_ID", "class-key")
+	t.Setenv("S3_CLASS_HOT_S3_NORTH_AMERICA_SECRET_ACCESS_KEY", "class-secret")
+	t.Setenv("S3_ACCESS_KEY_ID", "default-key")
+	t.Setenv("S3_SECRET_ACCESS_KEY", "default-secret")
+
+	store, err := initStorageClass("hot-s3-north-america", config.StorageClassConfig{
+		Type:   "s3",
+		Region: "us-east-1",
+		Tier:   "hot",
+	})
+	if err != nil {
+		t.Fatalf("initStorageClass returned error: %v", err)
+	}
+	if store == nil {
+		t.Fatal("initStorageClass store = nil, want non-nil")
+	}
+}
+
+func TestInitStorageClassRequiresBucketFromConfigOrEnv(t *testing.T) {
+	_, err := initStorageClass("hot-s3-north-america", config.StorageClassConfig{
+		Type:   "s3",
+		Region: "us-east-1",
+		Tier:   "hot",
+	})
+	if err == nil {
+		t.Fatal("initStorageClass error = nil, want non-nil")
+	}
+	if !strings.Contains(err.Error(), "S3_CLASS_HOT_S3_NORTH_AMERICA_BUCKET") {
+		t.Fatalf("initStorageClass error = %q, want missing bucket env var hint", err.Error())
 	}
 }
 

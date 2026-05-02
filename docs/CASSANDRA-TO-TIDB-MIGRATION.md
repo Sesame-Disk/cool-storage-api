@@ -1337,8 +1337,8 @@ services:
       - DB_NAME=sesamefs
       - S3_ENDPOINT=http://minio:9000
       - S3_BUCKET=sesamefs-blocks
-      - AWS_ACCESS_KEY_ID=minioadmin
-      - AWS_SECRET_ACCESS_KEY=minioadmin
+      - S3_ACCESS_KEY_ID=minioadmin
+      - S3_SECRET_ACCESS_KEY=minioadmin
     depends_on:
       - tidb
       - minio

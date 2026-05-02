@@ -172,7 +172,7 @@ storage:
 
 **`backends:` - single-region compatibility**
 
-Used only when `SERVER_REGION` is empty and the legacy `hot` backend is explicitly configured through `S3_BUCKET`, `AWS_REGION` / `S3_REGION`, and optional `S3_ENDPOINT`. Runtime env overrides switch `default_class` back to `hot` for this mode. Empty legacy S3 backends are skipped so a multi-region node cannot accidentally route writes to an unconfigured `hot` bucket.
+Used only when `SERVER_REGION` is empty and the legacy `hot` backend is explicitly configured through `S3_BUCKET`, `S3_REGION`, and optional `S3_ENDPOINT`. Runtime env overrides switch `default_class` back to `hot` for this mode. Empty legacy S3 backends are skipped so a multi-region node cannot accidentally route writes to an unconfigured `hot` bucket.
 
 ```yaml
 storage:
@@ -181,7 +181,7 @@ storage:
     hot:
       type: s3
       # bucket -> S3_BUCKET, region -> S3_REGION, endpoint -> S3_ENDPOINT
-      # credentials -> AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
+      # credentials -> S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY
 ```
 
 **Production switch**: Set `SERVER_REGION` per node for multi-region (`usa`, `eu`, `asia`, etc.). Leave it empty only for the legacy single-bucket deployment.
