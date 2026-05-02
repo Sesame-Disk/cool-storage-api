@@ -1,7 +1,11 @@
 package api
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -12,6 +16,7 @@ import (
 	"github.com/Sesame-Disk/sesamefs/internal/config"
 	"github.com/Sesame-Disk/sesamefs/internal/health"
 	"github.com/Sesame-Disk/sesamefs/internal/middleware"
+	"github.com/Sesame-Disk/sesamefs/internal/storage"
 	"github.com/gin-gonic/gin"
 	"golang.org/x/time/rate"
 )
@@ -37,6 +42,47 @@ func createTestServer() *Server {
 		tokenStore: nil,
 		router:     gin.New(),
 	}
+}
+
+type readinessStore struct {
+	headBucketErr error
+}
+
+func (s *readinessStore) Put(ctx context.Context, storageKey string, data io.Reader, size int64) (string, error) {
+	_, _ = io.Copy(io.Discard, data)
+	return storageKey, nil
+}
+
+func (s *readinessStore) Get(ctx context.Context, storageKey string) (io.ReadCloser, error) {
+	return io.NopCloser(bytes.NewReader(nil)), nil
+}
+
+func (s *readinessStore) Delete(ctx context.Context, storageKey string) error {
+	return nil
+}
+
+func (s *readinessStore) Exists(ctx context.Context, storageKey string) (bool, error) {
+	return true, nil
+}
+
+func (s *readinessStore) GetAccessType() storage.AccessType {
+	return storage.AccessImmediate
+}
+
+func (s *readinessStore) InitiateRestore(ctx context.Context, storageKey string) (string, error) {
+	return "", nil
+}
+
+func (s *readinessStore) CheckRestoreStatus(ctx context.Context, storageKey string) (bool, error) {
+	return true, nil
+}
+
+func (s *readinessStore) GetRestoreExpiry(ctx context.Context, storageKey string) (*time.Time, error) {
+	return nil, nil
+}
+
+func (s *readinessStore) HeadBucket(ctx context.Context) error {
+	return s.headBucketErr
 }
 
 func TestExternalRedirectTarget(t *testing.T) {
@@ -75,6 +121,100 @@ func TestHandlePing(t *testing.T) {
 	}
 	if w.Body.String() != "pong" {
 		t.Errorf("body = %q, want %q", w.Body.String(), "pong")
+	}
+}
+
+func TestInitS3StorageRequiresExplicitLegacyConfig(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.Storage.DefaultClass = "hot-s3-usa"
+	cfg.Storage.Classes = map[string]config.StorageClassConfig{
+		"hot-s3-usa": {
+			Type:   "s3",
+			Bucket: "sesamefs-usa",
+			Region: "us-east-1",
+		},
+	}
+	cfg.Storage.Backends = map[string]config.BackendConfig{
+		"hot": {
+			Type:   "s3",
+			Bucket: "",
+			Region: "",
+		},
+	}
+
+	t.Setenv("S3_BUCKET", "")
+	t.Setenv("AWS_REGION", "")
+	t.Setenv("S3_REGION", "")
+	t.Setenv("S3_ENDPOINT", "")
+
+	store, err := initS3Storage(cfg)
+	if !errors.Is(err, errLegacyS3NotConfigured) {
+		t.Fatalf("initS3Storage error = %v, want %v", err, errLegacyS3NotConfigured)
+	}
+	if store != nil {
+		t.Fatalf("initS3Storage store = %#v, want nil", store)
+	}
+}
+
+func TestInitS3StorageUsesLegacyHotBackend(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.Storage.DefaultClass = "hot-s3-usa"
+	cfg.Storage.Classes = map[string]config.StorageClassConfig{
+		"hot-s3-usa": {
+			Type:   "s3",
+			Bucket: "sesamefs-usa",
+			Region: "us-east-1",
+		},
+	}
+	cfg.Storage.Backends = map[string]config.BackendConfig{
+		"hot": {
+			Type:   "s3",
+			Bucket: "sesamefs-single",
+			Region: "eu-west-1",
+		},
+	}
+
+	t.Setenv("S3_BUCKET", "")
+	t.Setenv("AWS_REGION", "")
+	t.Setenv("S3_REGION", "")
+	t.Setenv("S3_ENDPOINT", "")
+	t.Setenv("AWS_ACCESS_KEY_ID", "test-key")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "test-secret")
+
+	store, err := initS3Storage(cfg)
+	if err != nil {
+		t.Fatalf("initS3Storage returned error: %v", err)
+	}
+	if store == nil {
+		t.Fatal("initS3Storage store = nil, want non-nil")
+	}
+}
+
+func TestInitStorageManagerSkipsEmptyLegacyHotBackend(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.Server.Region = "eu"
+	cfg.Storage.DefaultClass = "hot-s3-usa"
+	cfg.Storage.Classes = map[string]config.StorageClassConfig{
+		"hot-s3-usa": {
+			Type:   "s3",
+			Bucket: "sesamefs-usa",
+			Region: "us-east-1",
+		},
+	}
+	cfg.Storage.Backends = map[string]config.BackendConfig{
+		"hot": {
+			Type:   "s3",
+			Bucket: "",
+			Region: "",
+		},
+	}
+
+	manager := initStorageManager(cfg)
+	if _, ok := manager.GetBackend("hot"); ok {
+		t.Fatal("legacy hot backend was registered with an empty bucket")
+	}
+	if _, ok := manager.GetBackend("hot-s3-usa"); !ok {
+		t.Fatal("configured storage class hot-s3-usa was not registered")
 	}
 }
 
@@ -192,6 +332,45 @@ func TestRegisterCoreRoutes_InternalOnlyReadyAndMetrics(t *testing.T) {
 		req.RemoteAddr = "10.1.2.3:12345"
 		w := httptest.NewRecorder()
 		s.router.ServeHTTP(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want %d", w.Code, http.StatusOK)
+		}
+	})
+}
+
+func TestRegisterCoreRoutes_ReadyUsesStorageManagerHealth(t *testing.T) {
+	t.Run("loopback ready fails when storage manager has no healthy backend", func(t *testing.T) {
+		s := createTestServer()
+		s.storageManager = storage.NewManager()
+		s.storageManager.SetDefaultClass("hot-s3-eu")
+		s.authRateLimiter = middleware.NewRateLimiter(rate.Every(time.Minute), 1)
+		defer s.authRateLimiter.Stop()
+		s.registerCoreRoutes()
+
+		req := httptest.NewRequest(http.MethodGet, "/ready", nil)
+		req.RemoteAddr = "127.0.0.1:12345"
+		w := httptest.NewRecorder()
+		s.router.ServeHTTP(w, req)
+
+		if w.Code != http.StatusServiceUnavailable {
+			t.Fatalf("status = %d, want %d", w.Code, http.StatusServiceUnavailable)
+		}
+	})
+
+	t.Run("loopback ready succeeds when storage manager backend is healthy", func(t *testing.T) {
+		s := createTestServer()
+		s.storageManager = storage.NewManager()
+		s.storageManager.SetDefaultClass("hot-s3-eu")
+		s.storageManager.RegisterBackend("hot-s3-eu", &readinessStore{}, "")
+		s.authRateLimiter = middleware.NewRateLimiter(rate.Every(time.Minute), 1)
+		defer s.authRateLimiter.Stop()
+		s.registerCoreRoutes()
+
+		req := httptest.NewRequest(http.MethodGet, "/ready", nil)
+		req.RemoteAddr = "127.0.0.1:12345"
+		w := httptest.NewRecorder()
+		s.router.ServeHTTP(w, req)
+
 		if w.Code != http.StatusOK {
 			t.Fatalf("status = %d, want %d", w.Code, http.StatusOK)
 		}

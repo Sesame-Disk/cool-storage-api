@@ -6,10 +6,10 @@ import (
 	"io"
 	"log"
 	"net/http"
-	"strings"
 	"time"
 
 	"github.com/Sesame-Disk/sesamefs/internal/config"
+	"github.com/Sesame-Disk/sesamefs/internal/httputil"
 	"github.com/Sesame-Disk/sesamefs/internal/middleware"
 	"github.com/Sesame-Disk/sesamefs/internal/storage"
 	"github.com/Sesame-Disk/sesamefs/internal/traffic"
@@ -54,27 +54,23 @@ func RegisterBlockRoutes(rg *gin.RouterGroup, blockStore *storage.BlockStore, st
 	}
 }
 
-// getBlockStore returns the appropriate BlockStore based on hostname routing
-// Uses StorageManager for multi-region support with fallback to legacy store
+// getBlockStore returns the appropriate BlockStore based on hostname routing.
+// When StorageManager is configured, failed manager resolution does not fall
+// back to the legacy singleton store.
 func (h *BlockHandler) getBlockStore(c *gin.Context) (*storage.BlockStore, string) {
 	if h.storageManager == nil {
 		return h.blockStore, "legacy"
 	}
 
-	// Extract hostname for region resolution
-	hostname := c.Request.Host
-	if colonIdx := strings.Index(hostname, ":"); colonIdx > 0 {
-		hostname = hostname[:colonIdx]
-	}
-
 	// Resolve storage class based on hostname
+	hostname := httputil.GetRoutingHostname(c)
 	storageClass := h.storageManager.ResolveStorageClass(hostname, "", "hot")
 
 	// Get healthy BlockStore with failover
 	blockStore, actualClass, err := h.storageManager.GetHealthyBlockStore(storageClass)
 	if err != nil {
-		log.Printf("v2/blocks: failed to get healthy backend for %s: %v, using legacy\n", storageClass, err)
-		return h.blockStore, "legacy"
+		log.Printf("v2/blocks: failed to get healthy backend for %s: %v\n", storageClass, err)
+		return nil, storageClass
 	}
 
 	return blockStore, actualClass

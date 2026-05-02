@@ -166,6 +166,10 @@ func (s *Server) resolveBootstrapEndpointRegion(hostname string) string {
 		return region
 	}
 
+	if region := strings.ToLower(strings.TrimSpace(s.config.Server.Region)); region != "" {
+		return region
+	}
+
 	for pattern, region := range s.config.Storage.EndpointRegions {
 		if len(pattern) > 1 && pattern[0] == '*' {
 			suffix := pattern[1:]

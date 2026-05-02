@@ -1,6 +1,6 @@
 # Deploying SesameFS to Production
 
-This guide covers deploying SesameFS on a single VPS using Docker Compose, Nginx, and Let's Encrypt SSL.
+This guide covers deploying SesameFS on a single VPS using Docker Compose, published container images, and Let's Encrypt SSL.
 The same `docker-compose.prod.yml` supports both single-region and multi-region deployments — the only difference is the `.env` file. See [Multi-Region Deployment](#multi-region-deployment) below.
 ---
 
@@ -24,10 +24,10 @@ accounts.sesamedisk.com ← sesamefs (OIDC, outbound HTTPS)
 
 | File | Purpose |
 |---|---|
-| `docker-compose.prod.yml` | Production stack (no MinIO, no dev tools) |
+| `docker-compose.prod.yml` | Production stack (published images, no MinIO, no dev tools) |
 | `configs/config.prod.yaml` | Structural config — mounted over the baked image config |
 | `nginx/nginx.conf.template` | Nginx config — `${DOMAIN}` substituted at container start |
-| `.env.example` | Template for the single `.env` file you create on the server |
+| `.env.prod.example` | Template for the single `.env` file you create on the server |
 
 ---
 
@@ -204,21 +204,37 @@ nano .env
 Fill in these values (everything else can stay as the example default):
 
 ```bash
-# Domains
-DOMAIN=files.yourdomain.com
-OFFICE_DOMAIN=office.yourdomain.com
+# Release images
+IMAGE_TAG=2026.05.01-abc1234
 
-# S3
+# Public URLs
+# Leave SERVER_URL unset in the standard multi-domain deploy.
+# SesameFS will use the current request host / X-Forwarded-Host by default.
+# SERVER_URL=https://files.yourdomain.com
+ONLYOFFICE_API_JS_URL=https://office.yourdomain.com/web-apps/apps/api/documents/api.js
+
+# AWS credentials
 AWS_ACCESS_KEY_ID=<from step 0.1>
 AWS_SECRET_ACCESS_KEY=<from step 0.1>
+
+# Explicit storage mode
+STORAGE_MODE=multi
+
+# OIDC callback allow-list. Add every production login domain registered in your IdP.
+OIDC_REDIRECT_URIS=https://files.yourdomain.com/sso/,https://files.yourdomain.com/oauth/callback/
+
+# Single-region only: leave SERVER_REGION empty and point the legacy hot backend
+# at one bucket. For multi-region, keep these unset and use storage.classes.
 S3_BUCKET=<your-bucket-name>
+AWS_REGION=us-east-1
 S3_REGION=us-east-1
-S3_ENDPOINT=                      # leave empty for real AWS S3
-S3_SERVER_SIDE_ENCRYPTION=AES256  # AES256 (recommended) or aws:kms; leave empty to rely on bucket default
-S3_SSE_KMS_KEY_ID=                # optional — KMS key ID/ARN when using aws:kms
+# S3_ENDPOINT=
+# S3_SERVER_SIDE_ENCRYPTION=AES256
+# S3_SSE_KMS_KEY_ID=
 
 # CORS (required in prod; wildcard "*" is rejected)
-CORS_ALLOWED_ORIGINS=https://files.yourdomain.com
+# Include EVERY production browser origin that can call SesameFS.
+CORS_ALLOWED_ORIGINS=https://files.yourdomain.com,https://files-alt.yourdomain.com
 
 # OnlyOffice JWT token lifetime (seconds). Default 3600 (1h). Range: 300–28800.
 ONLYOFFICE_JWT_TTL_SECONDS=3600
@@ -265,9 +281,26 @@ GC_ENABLED=true
 ONLYOFFICE_JWT_SECRET=<from step 0.3 — second openssl output>
 ```
 
-> **Note:** `docker-compose.prod.yml` automatically computes `SERVER_URL`,
-> `OIDC_REDIRECT_URIS`, and `ONLYOFFICE_API_JS_URL` from `${DOMAIN}` and
-> `${OFFICE_DOMAIN}`. You don't need to set those manually.
+> Production compose uses published images, not local `build:` steps. By default:
+> - backend → `yoilier/sesamefs:${IMAGE_TAG}`
+> - frontend → `yoilier/sesamefs-frontend:${IMAGE_TAG}`
+>
+> Override `SESAMEFS_IMAGE` or `FRONTEND_IMAGE` in `.env` only if you need a different repo name.
+
+> Single-region and multi-region share the same production compose and the same `configs/config.prod.yaml`.
+> The operational switch is `STORAGE_MODE`: use `multi` for the shared multi-region topology and `single` only for the legacy single-bucket path. In `multi`, set `SERVER_REGION` per node.
+
+> Leave `SERVER_URL` unset in the standard deploy. SesameFS will derive the public host from the current request / forwarded host headers, which is the right default when one deploy serves multiple domains.
+
+> Set `SERVER_URL` only if you need an explicit fallback for unusual reverse-proxy paths or absolute-link generation when the request itself does not carry usable host context.
+
+> In single-region mode, the legacy `hot` backend consumes `S3_BUCKET`, `AWS_REGION`, `S3_REGION`, and optional `S3_ENDPOINT` / SSE overrides from `.env`.
+
+> In multi-region mode, bucket names, AWS regions and failover chains live in `configs/config.prod.yaml` under `storage.classes` and `region_classes`.
+
+> `OIDC_REDIRECT_URIS` can contain callback URLs for multiple production domains in the same deploy, as long as the same list is allow-listed in your IdP.
+
+> `CORS_ALLOWED_ORIGINS` must include every production browser origin that will call SesameFS. If a public domain is missing here, browsers on that domain will fail with CORS errors even if nginx and OIDC are configured correctly.
 
 > `BILLING_URL` is different: it is the external billing portal destination. Users click SesameFS `/billing/`, and the backend redirects authenticated sessions to this external URL in a new tab.
 
@@ -306,9 +339,12 @@ Cassandra (9042), OnlyOffice (8088), and sesamefs (8080) are bound to
 ```bash
 cd /opt/sesamefs
 
-# First deploy: builds the backend image, desktop frontend image, and supporting services.
-# Takes ~5–10 minutes the first time.
-docker compose -f docker-compose.prod.yml up -d --build
+# Pull the release images referenced by IMAGE_TAG
+docker pull yoilier/sesamefs:$IMAGE_TAG
+docker pull yoilier/sesamefs-frontend:$IMAGE_TAG
+
+# Start the production stack
+docker compose -f docker-compose.prod.yml up -d
 
 # Watch logs during startup
 docker compose -f docker-compose.prod.yml logs -f
@@ -459,7 +495,7 @@ Settings that **cannot** be set via env vars and must be in this file:
 | `OIDC_ISSUER` | `auth.oidc.issuer` | Default in configs/config.prod.yaml |
 | `OIDC_CLIENT_ID` | `auth.oidc.client_id` | Secret |
 | `OIDC_CLIENT_SECRET` | `auth.oidc.client_secret` | Secret |
-| `OIDC_REDIRECT_URIS` | `auth.oidc.redirect_uris` | Required when OIDC is enabled. Computed by compose in the standard production setup. |
+| `OIDC_REDIRECT_URIS` | `auth.oidc.redirect_uris` | Required when OIDC is enabled. Can list callback URLs for multiple production domains. |
 | `OIDC_JWT_SIGNING_KEY` | `auth.oidc.jwt_signing_key` | Secret. When set, sessions are signed JWTs instead of opaque tokens. **NEVER change after deploy** — all active sessions are immediately invalidated. Revoked JWTs (logout/user deactivation) are verified against the DB so revocation is effective even in JWT mode. |
 | `OIDC_DEFAULT_ROLE` | `auth.oidc.default_role` | |
 | `OIDC_AUTO_PROVISION` | `auth.oidc.auto_provision` | |
@@ -482,6 +518,7 @@ Settings that **cannot** be set via env vars and must be in this file:
 | `OIDC_SYNC_DEPARTMENTS_ON_LOGIN` | `auth.oidc.sync_departments_on_login` | Sync department memberships at login. |
 | `OIDC_FULL_SYNC_GROUPS` | `auth.oidc.full_sync_groups` | Remove memberships absent from the claim instead of additive-only sync. |
 | `OIDC_FULL_SYNC_DEPARTMENTS` | `auth.oidc.full_sync_departments` | Remove department memberships absent from the claim instead of additive-only sync. |
+| `STORAGE_MODE` | `storage.mode` | `multi` or `single`. Standard production default is `multi`. |
 | `SERVER_REGION` | — (server metadata) | Region id: `usa`, `eu`, etc. Empty = single-region |
 | `SERVER_TRUSTED_PROXIES` | `server.trusted_proxies` | Comma-separated exact proxy IPs/CIDRs that are allowed to define client IP headers. |
 | `CASSANDRA_HOSTS` | `database.hosts` | Default: `cassandra:9042`. Multi-region: private IPs |
@@ -489,14 +526,15 @@ Settings that **cannot** be set via env vars and must be in this file:
 | `CASSANDRA_LOCAL_DC` | `database.local_dc` | |
 | `CASSANDRA_USERNAME` | `database.username` | Optional |
 | `CASSANDRA_PASSWORD` | `database.password` | Optional |
-| `S3_BUCKET` | `storage.backends.hot.bucket` | |
-| `S3_REGION` | `storage.backends.hot.region` | |
-| `S3_ENDPOINT` | `storage.backends.hot.endpoint` | Empty = real AWS |
-| `S3_SERVER_SIDE_ENCRYPTION` | `storage.backends.hot.server_side_encryption` | `AES256` or `aws:kms`. Empty falls back to bucket default. Recommended: `AES256`. |
-| `S3_SSE_KMS_KEY_ID` | `storage.backends.hot.sse_kms_key_id` | Optional KMS key ID/ARN. Requires `aws:kms` mode. |
+| `S3_BUCKET` | `storage.backends.hot.bucket` | Single-region legacy path only |
+| `AWS_REGION` | `storage.backends.hot.region` | Used by the legacy S3 init path in single-region mode |
+| `S3_REGION` | `storage.backends.hot.region` | Env override applied onto `storage.backends.hot` in single-region mode |
+| `S3_ENDPOINT` | `storage.backends.hot.endpoint` | Single-region legacy path; empty = real AWS |
+| `S3_SERVER_SIDE_ENCRYPTION` | `storage.backends.hot.server_side_encryption` | Single-region legacy path |
+| `S3_SSE_KMS_KEY_ID` | `storage.backends.hot.sse_kms_key_id` | Single-region legacy path |
 | `AWS_ACCESS_KEY_ID` | (AWS SDK) | Auto-picked by SDK |
 | `AWS_SECRET_ACCESS_KEY` | (AWS SDK) | Auto-picked by SDK |
-| `CORS_ALLOWED_ORIGINS` | `cors.allowed_origins` | Comma-separated origins. Wildcard `"*"` is rejected in production. |
+| `CORS_ALLOWED_ORIGINS` | `cors.allowed_origins` | Comma-separated browser origins. Must include every production web domain. Wildcard `"*"` is rejected in production. |
 | `ONLYOFFICE_JWT_TTL_SECONDS` | `onlyoffice.jwt_ttl_seconds` | OnlyOffice editor JWT lifetime in seconds. Default `3600` (1h). Range: 300–28800. |
 | `FIRST_SUPERADMIN_EMAIL` | `auth.first_superadmin_email` | Optional bootstrap email used only on the first successful seed. |
 | `ACCOUNTS_DELETE_ACCOUNT_URL` | `accounts.delete_account_url` | External Accounts account-deletion URL. |
@@ -505,7 +543,8 @@ Settings that **cannot** be set via env vars and must be in this file:
 | `SHARE_LINK_HMAC_KEY` | `auth.share_link_hmac_key` | **Required in prod** — signs password-unlock cookies for share/upload links. Generate with `openssl rand -hex 32`. sesamefs refuses to start without it. |
 | `ONLYOFFICE_ENABLED` | `onlyoffice.enabled` | |
 | `ONLYOFFICE_JWT_SECRET` | `onlyoffice.jwt_secret` | Secret |
-| `ONLYOFFICE_API_JS_URL` | `onlyoffice.api_js_url` | Computed by compose |
+| `SERVER_URL` | — (runtime env) | Optional explicit fallback for absolute links and relay metadata. Leave unset to use the current request host. |
+| `ONLYOFFICE_API_JS_URL` | `onlyoffice.api_js_url` | Public OnlyOffice JS loader URL. |
 | `METRICS_ENABLED` | `monitoring.metrics_enabled` | |
 | `DESKTOP_CUSTOM_BRAND` | — (server-info response) | Brand name shown in desktop client (default: `Sesame Disk`) |
 | `DESKTOP_CUSTOM_LOGO` | — (server-info response) | Full URL to logo image shown in desktop client (optional) |
@@ -524,16 +563,17 @@ docker compose -f docker-compose.prod.yml logs sesamefs
 
 Common causes:
 - **Cassandra not ready yet** — wait 90s and retry, or check `docker compose ps`
-- **S3 connection failed** — verify bucket name, region, and credentials in `.env`
+- **S3 connection failed** — in single-region verify `S3_BUCKET`/`AWS_REGION`/`S3_REGION`; in multi-region verify `storage.classes` in `configs/config.prod.yaml`; in both modes verify AWS credentials in `.env`
 - **Config parse error** — check `configs/config.prod.yaml` for YAML syntax errors
 
 ### `/ready` returns storage error
 
 sesamefs can't reach S3. Check:
-1. `S3_BUCKET`, `S3_REGION`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` in `.env`
-2. The bucket exists in the specified region
-3. The IAM user has `s3:HeadBucket` and `s3:*` on the bucket
-4. `S3_ENDPOINT` is empty for real AWS (not set to a MinIO URL)
+1. `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` in `.env`
+2. In single-region: `S3_BUCKET`, `AWS_REGION`, and `S3_REGION` target the correct bucket and region
+3. In multi-region: `configs/config.prod.yaml` defines valid `storage.classes` bucket names and AWS regions
+4. The IAM user has `s3:HeadBucket` and `s3:*` on the configured buckets
+5. Any custom `S3_ENDPOINT` or `storage.classes[*].endpoint` values are correct for your object store
 
 ### OIDC login fails
 
@@ -541,13 +581,13 @@ sesamefs can't reach S3. Check:
    - `https://files.yourdomain.com/sso/`
    - `https://files.yourdomain.com/oauth/callback/`
 2. Check `OIDC_CLIENT_ID` and `OIDC_CLIENT_SECRET` in `.env`
-3. Check that `OIDC_REDIRECT_URIS` is not empty and exactly matches the callback URLs you registered. SesameFS now rejects OIDC login in fail-closed mode when no redirect allowlist is configured.
+3. Check that `OIDC_REDIRECT_URIS` is not empty and exactly matches every callback URL you registered for all production domains. SesameFS now rejects OIDC login in fail-closed mode when no redirect allowlist is configured.
 4. Check sesamefs logs for OIDC errors
 
 ### Browser requests fail with CORS errors
 
 1. Check `cors.allowed_origins` in `config.yaml`
-2. In production, make sure the browser origin is listed explicitly, for example `https://files.yourdomain.com`
+2. In production, make sure every public browser origin is listed explicitly, for example `https://files.yourdomain.com,https://files-alt.yourdomain.com`
 3. If the allowlist is empty, SesameFS now fails closed instead of allowing all origins
 
 ### OnlyOffice not loading in documents
@@ -688,20 +728,16 @@ CASSANDRA_BROADCAST_RPC_ADDRESS=10.0.2.20
 
 ### Step M2 — Storage config
 
-The default `configs/config.prod.yaml` uses single-region storage (`backends:`).
-For multi-region you need the `classes:` + `region_classes:` format.
-
-Create a `configs/config.prod.yaml` per region (or a single one that uses
-`SERVER_REGION` to resolve the right storage class). See
-`configs/config-usa.yaml` and `configs/config-eu.yaml` for the structure —
-replace MinIO endpoints with real S3 buckets.
+`configs/config.prod.yaml` is now the shared multi-region structural config.
+All nodes run the same file, and `SERVER_REGION` selects the node-local default
+region when requests arrive through the shared public `DOMAIN`.
 
 ### Current status of the region-aware library feature
 
 What already works in the backend/frontend stack:
 
 - new libraries can persist an explicit `storage_id`
-- when no `storage_id` is provided, the backend can derive the default region from the request hostname
+- when no `storage_id` is provided, the backend can derive the default region from the request hostname or, for the shared global hostname, from `SERVER_REGION`
 - orgs can now persist `storage_policy` with `data_residency: strict|flexible`; `default_region` is an org fallback in `flexible` mode and is required in `strict` mode
 - new-library create flows honor org policy for personal libraries, group-owned libraries, org-admin group-owned libraries, and superadmin-created libraries
 - later writes and reads follow the persisted library `storage_class` instead of the request host default
@@ -709,19 +745,17 @@ What already works in the backend/frontend stack:
 
 What the stock production deploy does **not** provide by itself yet:
 
-- `configs/config.prod.yaml` still ships as a single-region example using legacy `backends:`
-- `docker-compose.prod.yml` does not spin up per-region SesameFS front doors or per-region storage configs automatically
 - sys-admin and org-admin info pages can now edit org storage policy; direct API writes remain available for automation
 - there is no built-in migration workflow for existing non-empty libraries that need to move from one storage class to another
 - org policy only affects **new library creation** in this slice; it does not relocate existing libraries
 - create-time placement is intentionally limited to hot classes; cold-tier primary placement remains future design work
 - GC is still guarded operationally (`GC_ENABLED`) rather than by leader election, so multi-replica backend deployments need manual discipline
 
-For production multi-region, treat this feature as requiring operator-provided topology plus the config changes below.
+For production multi-region, treat this feature as requiring operator-provided topology plus the shared config and `.env` values below.
 
 ### Step M2.1 — Required config for region-pinned libraries
 
-In production multi-region, `configs/config.prod.yaml` must stop using the single `backends:` example and define all of these:
+In production multi-region, `configs/config.prod.yaml` must define all of these:
 
 - `storage.classes`
 - `storage.default_class`

@@ -64,6 +64,19 @@ func TestResolveCreateStorageClass(t *testing.T) {
 		}
 	})
 
+	t.Run("flexible falls back to server region for shared hostnames", func(t *testing.T) {
+		cfg.Server.Region = "eu"
+		resolved, err := resolveCreateStorageClass(cfg, orgStoragePolicy{
+			DataResidency: orgDataResidencyFlexible,
+		}, "files.example.com", "")
+		if err != nil {
+			t.Fatalf("resolveCreateStorageClass returned error: %v", err)
+		}
+		if resolved != "hot-s3-eu" {
+			t.Fatalf("resolved = %q, want %q", resolved, "hot-s3-eu")
+		}
+	})
+
 	t.Run("strict pins to org default region", func(t *testing.T) {
 		resolved, err := resolveCreateStorageClass(cfg, orgStoragePolicy{
 			DataResidency: orgDataResidencyStrict,

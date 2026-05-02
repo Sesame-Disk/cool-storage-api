@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/Sesame-Disk/sesamefs/internal/config"
+	"github.com/Sesame-Disk/sesamefs/internal/storage"
 	"github.com/golang-jwt/jwt/v5"
 )
 
@@ -75,6 +76,39 @@ func TestGenerateDocKey(t *testing.T) {
 	}
 	if key1 == key4 {
 		t.Error("Different fileID should produce different keys")
+	}
+}
+
+func TestOnlyOfficeResolveLibraryBlockStoreUsesLocalRegion(t *testing.T) {
+	manager := storage.NewManager()
+	manager.SetDefaultClass("hot-s3-usa")
+	manager.SetLocalRegion("eu")
+	manager.SetRegionClasses(map[string]storage.RegionClassConfig{
+		"usa": {Hot: "hot-s3-usa"},
+		"eu":  {Hot: "hot-s3-eu"},
+	})
+	manager.RegisterBackend("hot-s3-usa", &storage.S3Store{}, "")
+	manager.RegisterBackend("hot-s3-eu", &storage.S3Store{}, "")
+
+	h := &OnlyOfficeHandler{
+		config: &config.Config{
+			Server: config.ServerConfig{Region: "eu"},
+			Storage: config.StorageConfig{
+				DefaultClass: "hot-s3-usa",
+			},
+		},
+		storageManager: manager,
+	}
+
+	blockStore, storageClass, err := h.resolveLibraryBlockStore("org-id", "repo-id")
+	if err != nil {
+		t.Fatalf("resolveLibraryBlockStore returned error: %v", err)
+	}
+	if blockStore == nil {
+		t.Fatal("expected blockStore, got nil")
+	}
+	if storageClass != "hot-s3-eu" {
+		t.Fatalf("storageClass = %q, want %q", storageClass, "hot-s3-eu")
 	}
 }
 

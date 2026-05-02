@@ -4,8 +4,8 @@
 # Usage:
 #   1. cp .env.prod.example .env
 #   2. Fill in all values in .env
-#   3. Get SSL cert: certbot certonly --standalone -d $DOMAIN -d $OFFICE_DOMAIN
-#   4. docker compose -f docker-compose.prod.yml up -d --build
+#   3. Get SSL certs for your public SesameFS and OnlyOffice hostnames
+#   4. docker compose -f docker-compose.prod.yml up -d
 #
 # All secrets come from .env — never hardcode values here.
 # =============================================================================
@@ -16,9 +16,7 @@ services:
   # SesameFS API backend
   # ---------------------------------------------------------------------------
   sesamefs:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    image: ${SESAMEFS_IMAGE:-yoilier/sesamefs}:${IMAGE_TAG:?set IMAGE_TAG in .env}
     expose:
       - "8080"                      # Reachable as sesamefs:8080 on sfs-net
     networks:
@@ -27,10 +25,9 @@ services:
     env_file:
       - .env                        # All secrets from .env
     environment:
-      # Computed from DOMAIN (docker-compose interpolates from .env)
-      # - SERVER_URL=https://${DOMAIN}
-      - OIDC_REDIRECT_URIS=https://${DOMAIN}/sso/,https://${DOMAIN}/oauth/callback/
-      - ONLYOFFICE_API_JS_URL=https://${OFFICE_DOMAIN}/web-apps/apps/api/documents/api.js
+      - STORAGE_MODE=${STORAGE_MODE:-multi}
+      - OIDC_REDIRECT_URIS=${OIDC_REDIRECT_URIS}
+      - ONLYOFFICE_API_JS_URL=${ONLYOFFICE_API_JS_URL}
       - ONLYOFFICE_JWT_SECRET=${ONLYOFFICE_JWT_SECRET}
       - FRONTEND_URL=${FRONTEND_URL:-http://frontend:80}
       - BILLING_URL=${BILLING_URL}
@@ -120,7 +117,7 @@ services:
   # OnlyOffice Document Server
   # ---------------------------------------------------------------------------
   onlyoffice:
-    image: onlyoffice/documentserver:latest
+    image: ${ONLYOFFICE_IMAGE:-onlyoffice/documentserver:latest}
     expose:
       - "80"                        # Reachable as onlyoffice:80 on sfs-net
     networks:
@@ -178,9 +175,7 @@ services:
   # Desktop Frontend (React SPA — served by nginx:alpine)
   # ---------------------------------------------------------------------------
   frontend:
-    build:
-      context: ./frontend
-      dockerfile: Dockerfile
+    image: ${FRONTEND_IMAGE:-yoilier/sesamefs-frontend}:${IMAGE_TAG:?set IMAGE_TAG in .env}
     expose:
       - "80"                        # Reachable as frontend:80 on sfs-net
     networks:
@@ -195,24 +190,24 @@ services:
   # ---------------------------------------------------------------------------
   # Mobile Frontend (Astro PWA)
   # ---------------------------------------------------------------------------
-  mobile-frontend:
-    build:
-      context: ./mobile-frontend
-      dockerfile: Dockerfile
-    expose:
-      - "80"
-    networks:
-      - sfs-net
-    environment:
-      - API_URL=https://${DOMAIN}
-    depends_on:
-      - sesamefs
-    restart: unless-stopped
-    logging:
-      driver: json-file
-      options:
-        max-size: "100m"
-        max-file: "3"
+  # mobile-frontend:
+  #   build:
+  #     context: ./mobile-frontend
+  #     dockerfile: Dockerfile
+  #   expose:
+  #     - "80"
+  #   networks:
+  #     - sfs-net
+  #   environment:
+  #     - API_URL=https://${DOMAIN}
+  #   depends_on:
+  #     - sesamefs
+  #   restart: unless-stopped
+  #   logging:
+  #     driver: json-file
+  #     options:
+  #       max-size: "100m"
+  #       max-file: "3"
 
 networks:
   sfs-net:

@@ -141,25 +141,11 @@ File → FastCDC Chunks → SHA-256 Hash → S3 (hot) → Glacier (cold)
 
 #### Storage Config Formats
 
-The storage manager (`internal/api/server.go` → `initStorageManager`) supports two config formats. Both register identical entries in the manager — all downstream code works the same regardless of which format is used.
+The storage manager (`internal/api/server.go` -> `initStorageManager`) supports two config formats. Multi-region is the production default shape, while `backends:` remains as an explicit single-region compatibility path.
 
-**`backends:` — single-region (current prod)**
+**`classes:` - multi-region production default**
 
-Used in `configs/config.prod.yaml`. One bucket, credentials from env vars. `initStorageManager` reads `cfg.Storage.Backends` and registers each entry under its name (e.g., `"hot"`).
-
-```yaml
-storage:
-  default_class: hot
-  backends:
-    hot:
-      type: s3
-      # bucket → S3_BUCKET, region → S3_REGION, endpoint → S3_ENDPOINT
-      # credentials → AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
-```
-
-**`classes:` — multi-region (future prod / current dev)**
-
-Used in `configs/config.docker.yaml`, `configs/config.example.yaml`, and the multiregion test configs under `configs/`. These files now carry the full structural topology in YAML (`bucket`, `region`, `endpoint`, `use_path_style`, `failover_class`, routing maps), while credentials still come from env vars. `initStorageManager` reads `cfg.Storage.Classes`.
+Used by `configs/config.prod.yaml`, `configs/config.docker.yaml`, `configs/config.example.yaml`, and the multiregion test configs under `configs/`. These files carry the structural topology in YAML (`bucket`, `region`, `endpoint`, `use_path_style`, `failover_class`, routing maps), while credentials still come from env vars. In shared-domain production, `SERVER_REGION` selects the node-local default region when a request does not arrive on a region-specific hostname.
 
 ```yaml
 storage:
@@ -184,7 +170,21 @@ storage:
     eu:  { hot: hot-s3-eu }
 ```
 
-**Migration path**: When moving to multi-region, replace the `backends:` block in `configs/config.prod.yaml` with `classes:` + `endpoint_regions:` + `region_classes:` following `configs/config.example.yaml`. No code changes needed.
+**`backends:` - single-region compatibility**
+
+Used only when `SERVER_REGION` is empty and the legacy `hot` backend is explicitly configured through `S3_BUCKET`, `AWS_REGION` / `S3_REGION`, and optional `S3_ENDPOINT`. Runtime env overrides switch `default_class` back to `hot` for this mode. Empty legacy S3 backends are skipped so a multi-region node cannot accidentally route writes to an unconfigured `hot` bucket.
+
+```yaml
+storage:
+  default_class: hot
+  backends:
+    hot:
+      type: s3
+      # bucket -> S3_BUCKET, region -> S3_REGION, endpoint -> S3_ENDPOINT
+      # credentials -> AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
+```
+
+**Production switch**: Set `SERVER_REGION` per node for multi-region (`usa`, `eu`, `asia`, etc.). Leave it empty only for the legacy single-bucket deployment.
 
 ---
 

@@ -26,8 +26,8 @@ func TestDirectoryOperation_Routing(t *testing.T) {
 	r.POST("/dir", handler.DirectoryOperation)
 
 	tests := []struct {
-		name      string
-		operation string
+		name       string
+		operation  string
 		wantCalled string
 	}{
 		{"default mkdir", "", "mkdir"},
@@ -194,6 +194,32 @@ func TestResolveLibraryBlockStoreFallsBackToLegacyBlockStore(t *testing.T) {
 	}
 	if storageClass != "hot-minio-local" {
 		t.Fatalf("storageClass = %q, want %q", storageClass, "hot-minio-local")
+	}
+}
+
+func TestResolveLibraryBlockStoreUsesStorageManager(t *testing.T) {
+	manager := storage.NewManager()
+	manager.SetDefaultClass("hot-s3-eu")
+	manager.RegisterBackend("hot-s3-eu", &storage.S3Store{}, "")
+
+	h := &FileHandler{
+		config:         &config.Config{Storage: config.StorageConfig{DefaultClass: "hot-s3-eu"}},
+		storageManager: manager,
+	}
+
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/api/v2.1/repos/repo-id/file/", nil)
+	c.Request.Host = "files.example.com"
+
+	blockStore, storageClass, err := h.resolveLibraryBlockStore(c, "org-id", "repo-id")
+	if err != nil {
+		t.Fatalf("resolveLibraryBlockStore returned error: %v", err)
+	}
+	if blockStore == nil {
+		t.Fatal("expected blockStore, got nil")
+	}
+	if storageClass != "hot-s3-eu" {
+		t.Fatalf("storageClass = %q, want %q", storageClass, "hot-s3-eu")
 	}
 }
 

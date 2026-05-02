@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Sesame-Disk/sesamefs/internal/storage"
 	"github.com/gin-gonic/gin"
 )
 
@@ -179,6 +180,52 @@ func TestBlockExists_NilBlockStore(t *testing.T) {
 
 	if w.Code != http.StatusServiceUnavailable {
 		t.Errorf("status = %d, want %d", w.Code, http.StatusServiceUnavailable)
+	}
+}
+
+func TestGetBlockStoreDoesNotFallBackToLegacyWhenStorageManagerFails(t *testing.T) {
+	manager := storage.NewManager()
+	manager.SetDefaultClass("hot-s3-eu")
+	h := &BlockHandler{blockStore: &storage.BlockStore{}, storageManager: manager, config: nil}
+
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodGet, "/api/v2/blocks/"+strings.Repeat("a", 64), nil)
+	c.Request.Host = "files.example.com"
+
+	blockStore, storageClass := h.getBlockStore(c)
+	if blockStore != nil {
+		t.Fatal("expected nil blockStore when storage manager cannot resolve a healthy backend")
+	}
+	if storageClass != "hot-s3-eu" {
+		t.Fatalf("storageClass = %q, want %q", storageClass, "hot-s3-eu")
+	}
+}
+
+func TestGetBlockStoreUsesForwardedHostForRegionRouting(t *testing.T) {
+	manager := storage.NewManager()
+	manager.SetDefaultClass("hot-s3-usa")
+	manager.SetEndpointRegions(map[string]string{
+		"eu.files.example.com": "eu",
+	})
+	manager.SetRegionClasses(map[string]storage.RegionClassConfig{
+		"usa": {Hot: "hot-s3-usa"},
+		"eu":  {Hot: "hot-s3-eu"},
+	})
+	manager.RegisterBackend("hot-s3-usa", &storage.S3Store{}, "")
+	manager.RegisterBackend("hot-s3-eu", &storage.S3Store{}, "")
+	h := &BlockHandler{storageManager: manager, config: nil}
+
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodGet, "/api/v2/blocks/"+strings.Repeat("a", 64), nil)
+	c.Request.Host = "sesamefs:8080"
+	c.Request.Header.Set("X-Forwarded-Host", "eu.files.example.com")
+
+	blockStore, storageClass := h.getBlockStore(c)
+	if blockStore == nil {
+		t.Fatal("expected blockStore, got nil")
+	}
+	if storageClass != "hot-s3-eu" {
+		t.Fatalf("storageClass = %q, want %q", storageClass, "hot-s3-eu")
 	}
 }
 

@@ -554,12 +554,6 @@ func (h *FileViewHandler) ServeRawFile(c *gin.Context) {
 	}
 
 	// Get block store
-	if h.storageManager == nil {
-		if h.storage == nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "storage not available"})
-			return
-		}
-	}
 	blockStore, _, err := resolveLibraryBlockStoreForRequest(c, h.db, h.config, h.storageManager, h.storage, orgID, repoID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "storage not available"})
@@ -952,14 +946,6 @@ func (h *FileViewHandler) DownloadHistoricFile(c *gin.Context) {
 		return
 	}
 
-	if h.storageManager == nil {
-		if h.storage == nil {
-			log.Printf("[DownloadHistoricFile] Storage manager not available")
-			redirectToFrontendErrorPage(c, http.StatusInternalServerError, "Internal Error", "Storage not available.")
-			return
-		}
-	}
-
 	blockStore, _, err := resolveLibraryBlockStoreForRequest(c, h.db, h.config, h.storageManager, h.storage, orgID, repoID)
 	if err != nil {
 		log.Printf("[DownloadHistoricFile] Block store not available: %v", err)
@@ -1123,12 +1109,6 @@ func (h *FileViewHandler) ServeHistoricFileRaw(c *gin.Context) {
 		return
 	}
 
-	if h.storageManager == nil {
-		if h.storage == nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "storage not available"})
-			return
-		}
-	}
 	blockStore, _, err := resolveLibraryBlockStoreForRequest(c, h.db, h.config, h.storageManager, h.storage, orgID, repoID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "storage not available"})

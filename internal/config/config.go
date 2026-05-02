@@ -407,6 +407,7 @@ type ServerConfig struct {
 	WriteTimeout       time.Duration `yaml:"write_timeout"`
 	MaxUploadMB        int64         `yaml:"max_upload_mb"`
 	TrustedProxies     []string      `yaml:"trusted_proxies"`
+	Region             string        `yaml:"region"`
 	MobileFrontendPath string        `yaml:"mobile_frontend_path"` // Path to mobile frontend dist (default: ./mobile-frontend/dist)
 }
 
@@ -422,6 +423,7 @@ type DatabaseConfig struct {
 
 // StorageConfig holds storage backend settings
 type StorageConfig struct {
+	Mode            string                        `yaml:"mode"`
 	DefaultClass    string                        `yaml:"default_class"`
 	Classes         map[string]StorageClassConfig `yaml:"classes"`
 	EndpointRegions map[string]string             `yaml:"endpoint_regions"` // hostname → region
@@ -623,11 +625,12 @@ func DefaultConfig() *Config {
 	return &Config{
 		Server: ServerConfig{
 			Port:               ":8080",
-			ReadTimeout:        0,                        // No full-body read timeout — large uploads can take minutes
-			ReadHeaderTimeout:  10 * time.Second,         // Timeout for reading request headers only (Slowloris protection)
-			WriteTimeout:       0,                        // No write timeout — large downloads/zips can take minutes
-			MaxUploadMB:        20480,                    // 20 GB
-			TrustedProxies:     nil,                      // Secure default: do not trust forwarded client IP headers unless explicitly configured
+			ReadTimeout:        0,                // No full-body read timeout — large uploads can take minutes
+			ReadHeaderTimeout:  10 * time.Second, // Timeout for reading request headers only (Slowloris protection)
+			WriteTimeout:       0,                // No write timeout — large downloads/zips can take minutes
+			MaxUploadMB:        20480,            // 20 GB
+			TrustedProxies:     nil,              // Secure default: do not trust forwarded client IP headers unless explicitly configured
+			Region:             "",
 			MobileFrontendPath: "./mobile-frontend/dist", // Mobile frontend build directory
 		},
 		Database: DatabaseConfig{
@@ -637,6 +640,7 @@ func DefaultConfig() *Config {
 			LocalDC:     "datacenter1",
 		},
 		Storage: StorageConfig{
+			Mode:         "",
 			DefaultClass: "hot",
 			Backends: map[string]BackendConfig{
 				"hot": {
@@ -767,6 +771,9 @@ func (c *Config) applyEnvOverrides() {
 	if v := os.Getenv("SERVER_TRUSTED_PROXIES"); v != "" {
 		c.Server.TrustedProxies = strings.Split(v, ",")
 	}
+	if v := os.Getenv("SERVER_REGION"); v != "" {
+		c.Server.Region = strings.ToLower(strings.TrimSpace(v))
+	}
 
 	// CORS
 	if v := os.Getenv("CORS_ALLOWED_ORIGINS"); v != "" {
@@ -791,6 +798,9 @@ func (c *Config) applyEnvOverrides() {
 	}
 
 	// Storage
+	if v := os.Getenv("STORAGE_MODE"); v != "" {
+		c.Storage.Mode = normalizeStorageMode(v)
+	}
 	if v := os.Getenv("S3_BUCKET"); v != "" {
 		if hot, ok := c.Storage.Backends["hot"]; ok {
 			hot.Bucket = v
@@ -820,6 +830,9 @@ func (c *Config) applyEnvOverrides() {
 			hot.SSEKMSKeyID = v
 			c.Storage.Backends["hot"] = hot
 		}
+	}
+	if c.storageMode() == "single" {
+		c.Storage.DefaultClass = "hot"
 	}
 
 	// Billing
@@ -1073,6 +1086,62 @@ func (c *Config) applyEnvOverrides() {
 	}
 }
 
+func normalizeStorageMode(mode string) string {
+	return strings.ToLower(strings.TrimSpace(mode))
+}
+
+func (c *Config) storageMode() string {
+	mode := normalizeStorageMode(c.Storage.Mode)
+	if mode == "single" || mode == "multi" {
+		return mode
+	}
+	if c.shouldUseLegacySingleRegionStorage() {
+		return "single"
+	}
+	return "multi"
+}
+
+func (c *Config) shouldUseLegacySingleRegionStorage() bool {
+	if c == nil || strings.TrimSpace(c.Server.Region) != "" {
+		return false
+	}
+	hot, ok := c.Storage.Backends["hot"]
+	if !ok {
+		return false
+	}
+	return strings.TrimSpace(hot.Bucket) != ""
+}
+
+func (c *Config) configuredStorageClass(name string) bool {
+	name = strings.TrimSpace(name)
+	if name == "" || c == nil {
+		return false
+	}
+	if _, ok := c.Storage.Classes[name]; ok {
+		return true
+	}
+	if backend, ok := c.Storage.Backends[name]; ok {
+		if strings.EqualFold(backend.Type, "s3") {
+			return strings.TrimSpace(backend.Bucket) != ""
+		}
+		return true
+	}
+	return false
+}
+
+func (c *Config) regionClassConfig(region string) (RegionClassConfig, bool) {
+	region = strings.ToLower(strings.TrimSpace(region))
+	if region == "" || c == nil {
+		return RegionClassConfig{}, false
+	}
+	for configuredRegion, regionConfig := range c.Storage.RegionClasses {
+		if strings.EqualFold(configuredRegion, region) {
+			return regionConfig, true
+		}
+	}
+	return RegionClassConfig{}, false
+}
+
 // Validate checks if the configuration is valid
 func (c *Config) Validate() error {
 	if c.Server.Port == "" {
@@ -1113,6 +1182,47 @@ func (c *Config) Validate() error {
 	for name, backendCfg := range c.Storage.Backends {
 		if err := validateStorageEncryptionConfig("storage.backends."+name, backendCfg.Type, backendCfg.ServerSideEncryption, backendCfg.SSEKMSKeyID); err != nil {
 			return err
+		}
+	}
+	explicitStorageMode := normalizeStorageMode(c.Storage.Mode)
+	if explicitStorageMode != "" && explicitStorageMode != "single" && explicitStorageMode != "multi" {
+		return fmt.Errorf("storage.mode must be one of: single, multi")
+	}
+	storageMode := c.storageMode()
+	for region, regionConfig := range c.Storage.RegionClasses {
+		if strings.TrimSpace(regionConfig.Hot) != "" && !c.configuredStorageClass(regionConfig.Hot) {
+			return fmt.Errorf("storage.region_classes.%s.hot references unknown or unconfigured storage class %q", region, regionConfig.Hot)
+		}
+		if strings.TrimSpace(regionConfig.Cold) != "" && !c.configuredStorageClass(regionConfig.Cold) {
+			return fmt.Errorf("storage.region_classes.%s.cold references unknown or unconfigured storage class %q", region, regionConfig.Cold)
+		}
+	}
+	if !c.Auth.DevMode && storageMode == "multi" {
+		if len(c.Storage.RegionClasses) == 0 {
+			return fmt.Errorf("storage.mode=multi requires storage.region_classes to be configured")
+		}
+		if strings.TrimSpace(c.Server.Region) == "" {
+			return fmt.Errorf("storage.mode=multi requires server.region to be set")
+		}
+		hot, ok := c.Storage.Backends["hot"]
+		if ok && (strings.TrimSpace(hot.Bucket) != "" || strings.TrimSpace(hot.Region) != "" || strings.TrimSpace(hot.Endpoint) != "") {
+			return fmt.Errorf("storage.mode=multi does not allow legacy hot backend overrides; remove S3_BUCKET/AWS_REGION/S3_REGION/S3_ENDPOINT")
+		}
+		regionConfig, ok := c.regionClassConfig(c.Server.Region)
+		if !ok {
+			return fmt.Errorf("server.region %q is not defined in storage.region_classes", c.Server.Region)
+		}
+		if strings.TrimSpace(regionConfig.Hot) == "" {
+			return fmt.Errorf("storage.region_classes.%s.hot must be set for multi-region mode", c.Server.Region)
+		}
+	}
+	if !c.Auth.DevMode && storageMode == "single" {
+		if strings.TrimSpace(c.Server.Region) != "" {
+			return fmt.Errorf("storage.mode=single requires server.region to be empty")
+		}
+		hot, ok := c.Storage.Backends["hot"]
+		if !ok || strings.TrimSpace(hot.Bucket) == "" {
+			return fmt.Errorf("storage.backends.hot.bucket must be set for storage.mode=single")
 		}
 	}
 	if c.OnlyOffice.Enabled && strings.TrimSpace(c.OnlyOffice.JWTSecret) == "" {

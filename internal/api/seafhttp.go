@@ -755,6 +755,19 @@ func (h *SeafHTTPHandler) resolveLibraryBlockStore(hostname, orgID, repoID strin
 	return nil, libraryClass, fmt.Errorf("block storage not available")
 }
 
+func (h *SeafHTTPHandler) resolveLibraryObjectStore(hostname, orgID, repoID string) (storage.Store, string, error) {
+	libraryClass := h.lookupLibraryStorageClass(orgID, repoID)
+	if h.storageManager != nil {
+		preferredClass := h.storageManager.ResolveStorageClass(hostname, libraryClass, "hot")
+		return h.storageManager.GetHealthyBackend(preferredClass)
+	}
+	if h.storage != nil {
+		return h.storage, libraryClass, nil
+	}
+
+	return nil, libraryClass, fmt.Errorf("storage not available")
+}
+
 // uploadBlockSize is the block size used when splitting large uploads into blocks.
 // 8 MB matches Seafile's default CDC block size for good deduplication compatibility.
 const uploadBlockSize = 8 * 1024 * 1024 // 8 MB
@@ -795,7 +808,7 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 		}
 	}
 
-	if h.storage == nil {
+	if h.storageManager == nil && h.storage == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "storage not available"})
 		return
 	}
@@ -984,7 +997,12 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 	blockStore, actualStorageClass, err := h.resolveLibraryBlockStore(httputil.GetRoutingHostname(c), token.OrgID, token.RepoID)
 	if err != nil {
 		log.Printf("[HandleUpload] Failed to get block store: %v, falling back to S3", err)
-		_, err = h.storage.PutAuto(c.Request.Context(), storageKey, newBytesReader(storedContent), int64(len(storedContent)))
+		objectStore, _, resolveErr := h.resolveLibraryObjectStore(httputil.GetRoutingHostname(c), token.OrgID, token.RepoID)
+		if resolveErr != nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "block storage not available"})
+			return
+		}
+		_, err = objectStore.Put(c.Request.Context(), storageKey, newBytesReader(storedContent), int64(len(storedContent)))
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to upload file"})
 			return
@@ -1653,15 +1671,16 @@ func (h *SeafHTTPHandler) HandleDownload(c *gin.Context) {
 		log.Printf("[HandleDownload] Block storage not available (db=%v, storageManager=%v)", h.db != nil, h.storageManager != nil)
 	}
 
-	// Fallback: Stream directly from S3 (legacy path)
-	if h.storage == nil {
+	// Fallback: Stream directly from the resolved object store.
+	objectStore, _, err := h.resolveLibraryObjectStore(httputil.GetRoutingHostname(c), token.OrgID, token.RepoID)
+	if err != nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "storage not available"})
 		return
 	}
 
 	storageKey := fmt.Sprintf("%s/%s%s", token.OrgID, token.RepoID, token.Path)
 
-	reader, err := h.storage.Get(c.Request.Context(), storageKey)
+	reader, err := objectStore.Get(c.Request.Context(), storageKey)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "file not found"})
 		return

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"strings"
 	"sync"
 	"time"
 )
@@ -22,15 +23,15 @@ const (
 
 // Backend represents a storage backend configuration
 type Backend struct {
-	Name        string            `yaml:"name"`
-	Type        string            `yaml:"type"`         // s3, glacier, filesystem
-	AccessType  AccessType        `yaml:"access_type"`  // hot or cold
-	Endpoint    string            `yaml:"endpoint"`     // For S3-compatible
-	Bucket      string            `yaml:"bucket"`       // S3 bucket
-	Vault       string            `yaml:"vault"`        // Glacier vault
-	Region      string            `yaml:"region"`       // AWS region
-	Path        string            `yaml:"path"`         // Filesystem path
-	Options     map[string]string `yaml:"options"`      // Additional options
+	Name       string            `yaml:"name"`
+	Type       string            `yaml:"type"`        // s3, glacier, filesystem
+	AccessType AccessType        `yaml:"access_type"` // hot or cold
+	Endpoint   string            `yaml:"endpoint"`    // For S3-compatible
+	Bucket     string            `yaml:"bucket"`      // S3 bucket
+	Vault      string            `yaml:"vault"`       // Glacier vault
+	Region     string            `yaml:"region"`      // AWS region
+	Path       string            `yaml:"path"`        // Filesystem path
+	Options    map[string]string `yaml:"options"`     // Additional options
 }
 
 // IsHot returns true if the backend provides immediate access
@@ -76,17 +77,17 @@ type Store interface {
 
 // StoragePolicy defines rules for selecting storage backends
 type StoragePolicy struct {
-	Name       string            `yaml:"name"`
-	Priority   int               `yaml:"priority"`   // Lower = higher priority
-	Conditions PolicyConditions  `yaml:"conditions"` // When this policy applies
-	Backend    string            `yaml:"backend"`    // Which backend to use
+	Name       string           `yaml:"name"`
+	Priority   int              `yaml:"priority"`   // Lower = higher priority
+	Conditions PolicyConditions `yaml:"conditions"` // When this policy applies
+	Backend    string           `yaml:"backend"`    // Which backend to use
 }
 
 // PolicyConditions defines when a storage policy applies
 type PolicyConditions struct {
 	// Current simple conditions
-	TenantIDs    []string `yaml:"tenant_ids,omitempty"`    // Specific tenants
-	FileTypes    []string `yaml:"file_types,omitempty"`    // File extensions
+	TenantIDs    []string `yaml:"tenant_ids,omitempty"`     // Specific tenants
+	FileTypes    []string `yaml:"file_types,omitempty"`     // File extensions
 	MinSizeBytes int64    `yaml:"min_size_bytes,omitempty"` // Minimum file size
 	MaxSizeBytes int64    `yaml:"max_size_bytes,omitempty"` // Maximum file size
 
@@ -108,12 +109,12 @@ type LifecycleRule struct {
 
 // RestoreNotification represents a notification that a cold storage restore is complete
 type RestoreNotification struct {
-	StorageKey    string    `json:"storage_key"`
-	Backend       string    `json:"backend"`
-	Status        string    `json:"status"` // completed, failed
-	CompletedAt   time.Time `json:"completed_at"`
-	ExpiresAt     time.Time `json:"expires_at"` // When the restored copy expires
-	Error         string    `json:"error,omitempty"`
+	StorageKey  string    `json:"storage_key"`
+	Backend     string    `json:"backend"`
+	Status      string    `json:"status"` // completed, failed
+	CompletedAt time.Time `json:"completed_at"`
+	ExpiresAt   time.Time `json:"expires_at"` // When the restored copy expires
+	Error       string    `json:"error,omitempty"`
 }
 
 // HealthStatus represents the health state of a storage backend
@@ -144,23 +145,24 @@ func (h HealthStatus) String() string {
 
 // BackendHealth tracks the health status of a storage backend
 type BackendHealth struct {
-	Status          HealthStatus
-	LastCheck       time.Time
-	LastError       error
+	Status           HealthStatus
+	LastCheck        time.Time
+	LastError        error
 	ConsecutiveFails int
-	FailoverClass   string // Fallback class if this one is down
+	FailoverClass    string // Fallback class if this one is down
 }
 
 // Manager manages multiple storage backends and policies
 type Manager struct {
-	backends      map[string]Store
-	blockStores   map[string]*BlockStore // Cached BlockStore per backend
-	blockStoresMu sync.RWMutex
-	health        map[string]*BackendHealth
-	healthMu      sync.RWMutex
-	policies      []StoragePolicy
-	lifecycle     []LifecycleRule
-	defaultClass  string
+	backends        map[string]Store
+	blockStores     map[string]*BlockStore // Cached BlockStore per backend
+	blockStoresMu   sync.RWMutex
+	health          map[string]*BackendHealth
+	healthMu        sync.RWMutex
+	policies        []StoragePolicy
+	lifecycle       []LifecycleRule
+	defaultClass    string
+	localRegion     string
 	endpointRegions map[string]string            // hostname → region
 	regionClasses   map[string]RegionClassConfig // region → {hot, cold}
 }
@@ -197,6 +199,11 @@ func (m *Manager) SetEndpointRegions(mapping map[string]string) {
 // SetRegionClasses sets the region to storage class mapping
 func (m *Manager) SetRegionClasses(mapping map[string]RegionClassConfig) {
 	m.regionClasses = mapping
+}
+
+// SetLocalRegion sets the node-local default region for shared hostnames.
+func (m *Manager) SetLocalRegion(region string) {
+	m.localRegion = strings.ToLower(strings.TrimSpace(region))
 }
 
 // RegisterBackend registers a storage backend with optional failover
@@ -284,24 +291,32 @@ func (m *Manager) ResolveStorageClass(hostname string, libraryClass string, tier
 
 // resolveRegion maps a hostname to a region
 func (m *Manager) resolveRegion(hostname string) string {
+	hostname = strings.ToLower(strings.TrimSpace(hostname))
+
 	// Exact match first
-	if region, ok := m.endpointRegions[hostname]; ok {
-		return region
+	for pattern, region := range m.endpointRegions {
+		if strings.EqualFold(pattern, hostname) {
+			return strings.ToLower(strings.TrimSpace(region))
+		}
+	}
+
+	if m.localRegion != "" {
+		return m.localRegion
 	}
 
 	// Try wildcard match (e.g., "*.sesamefs.com" → "usa")
 	for pattern, region := range m.endpointRegions {
 		if len(pattern) > 1 && pattern[0] == '*' {
-			suffix := pattern[1:] // e.g., ".sesamefs.com"
-			if len(hostname) > len(suffix) && hostname[len(hostname)-len(suffix):] == suffix {
-				return region
+			suffix := strings.ToLower(pattern[1:]) // e.g., ".sesamefs.com"
+			if len(hostname) > len(suffix) && strings.HasSuffix(hostname, suffix) {
+				return strings.ToLower(strings.TrimSpace(region))
 			}
 		}
 	}
 
 	// Default region
 	if region, ok := m.endpointRegions["*"]; ok {
-		return region
+		return strings.ToLower(strings.TrimSpace(region))
 	}
 
 	return "default"

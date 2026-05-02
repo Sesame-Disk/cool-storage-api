@@ -134,6 +134,43 @@ func (h *SyncHandler) resolveBlockLookupFallbackClass(c *gin.Context, orgID, rep
 	return "hot"
 }
 
+func (h *SyncHandler) resolveBlockStoreForLookup(c *gin.Context, orgID, repoID, storageClass string) (*storage.BlockStore, string, error) {
+	storageClass = strings.TrimSpace(storageClass)
+	if h.storageManager != nil {
+		if storageClass != "" {
+			blockStore, err := h.storageManager.GetBlockStore(storageClass)
+			if err == nil {
+				return blockStore, storageClass, nil
+			}
+			log.Printf("resolveBlockStoreForLookup: storage class %s unavailable: %v", storageClass, err)
+		}
+
+		fallbackClass := h.resolveBlockLookupFallbackClass(c, orgID, repoID, storageClass)
+		blockStore, actualClass, err := h.storageManager.GetHealthyBlockStore(fallbackClass)
+		if err != nil {
+			return nil, fallbackClass, err
+		}
+		return blockStore, actualClass, nil
+	}
+
+	if h.blockStore != nil {
+		return h.blockStore, storageClass, nil
+	}
+
+	return nil, storageClass, fmt.Errorf("block storage not available")
+}
+
+func (h *SyncHandler) resolvePreferredBlockStore(c *gin.Context, orgID, repoID string) (*storage.BlockStore, string, error) {
+	preferredClass := h.resolvePreferredLibraryStorageClass(c, orgID, repoID)
+	if h.storageManager != nil {
+		return h.storageManager.GetHealthyBlockStore(preferredClass)
+	}
+	if h.blockStore != nil {
+		return h.blockStore, preferredClass, nil
+	}
+	return nil, preferredClass, fmt.Errorf("block storage not available")
+}
+
 // formatSizeSeafile delegates to httputil.FormatSizeSeafile.
 var formatSizeSeafile = httputil.FormatSizeSeafile
 
@@ -761,25 +798,8 @@ func (h *SyncHandler) GetBlock(c *gin.Context) {
 		storageClass = h.resolveBlockLookupFallbackClass(c, orgID, repoID, storageClass)
 	}
 
-	// Get the appropriate BlockStore using StorageManager
-	var blockStore *storage.BlockStore
-	var err error
-
-	if h.storageManager != nil {
-		blockStore, err = h.storageManager.GetBlockStore(storageClass)
-		if err != nil {
-			fallbackClass := h.resolveBlockLookupFallbackClass(c, orgID, repoID, storageClass)
-			log.Printf("GetBlock: storage class %s not found: %v, trying %s\n", storageClass, err, fallbackClass)
-			blockStore, _, err = h.storageManager.GetHealthyBlockStore(fallbackClass)
-			if err != nil {
-				blockStore = h.blockStore
-			}
-		}
-	} else {
-		blockStore = h.blockStore
-	}
-
-	if blockStore == nil {
+	blockStore, actualStorageClass, err := h.resolveBlockStoreForLookup(c, orgID, repoID, storageClass)
+	if err != nil || blockStore == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "block storage not available"})
 		return
 	}
@@ -788,7 +808,7 @@ func (h *SyncHandler) GetBlock(c *gin.Context) {
 	data, err := blockStore.GetBlock(c.Request.Context(), internalID)
 	if err != nil {
 		log.Printf("GetBlock: block %s (internal: %s) not found in %s: %v\n",
-			externalID, internalID, storageClass, err)
+			externalID, internalID, actualStorageClass, err)
 		c.JSON(http.StatusNotFound, gin.H{"error": "block not found"})
 		return
 	}
@@ -883,24 +903,8 @@ func (h *SyncHandler) PutBlock(c *gin.Context) {
 		return
 	}
 
-	// Get the appropriate BlockStore using StorageManager with failover
-	var blockStore *storage.BlockStore
-	var storageClass string
-
-	if h.storageManager != nil {
-		preferredClass := h.resolvePreferredLibraryStorageClass(c, orgID, repoID)
-		blockStore, storageClass, err = h.storageManager.GetHealthyBlockStore(preferredClass)
-		if err != nil {
-			log.Printf("PutBlock: failed to get healthy backend: %v, falling back to legacy\n", err)
-			blockStore = h.blockStore
-			storageClass = preferredClass
-		}
-	} else {
-		blockStore = h.blockStore
-		storageClass = h.resolvePreferredLibraryStorageClass(c, orgID, repoID)
-	}
-
-	if blockStore == nil {
+	blockStore, storageClass, err := h.resolvePreferredBlockStore(c, orgID, repoID)
+	if err != nil || blockStore == nil {
 		log.Printf("PutBlock: block storage not available\n")
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "block storage not available"})
 		return
@@ -1024,21 +1028,8 @@ func (h *SyncHandler) CheckBlocks(c *gin.Context) {
 		internalIDs = append(internalIDs, internalID)
 	}
 
-	// Get the appropriate BlockStore using StorageManager with failover
-	var blockStore *storage.BlockStore
-
-	if h.storageManager != nil {
-		preferredClass := h.resolvePreferredLibraryStorageClass(c, orgID, repoID)
-		blockStore, _, err = h.storageManager.GetHealthyBlockStore(preferredClass)
-		if err != nil {
-			log.Printf("CheckBlocks: failed to get healthy backend: %v, falling back to legacy\n", err)
-			blockStore = h.blockStore
-		}
-	} else {
-		blockStore = h.blockStore
-	}
-
-	if blockStore == nil {
+	blockStore, _, err := h.resolvePreferredBlockStore(c, orgID, repoID)
+	if err != nil || blockStore == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "block storage not available"})
 		return
 	}

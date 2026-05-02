@@ -128,6 +128,8 @@ type Server struct {
 	server               *http.Server
 }
 
+var errLegacyS3NotConfigured = errors.New("legacy S3 storage not configured")
+
 // NewServer creates a new API server
 func NewServer(cfg *config.Config, database *db.DB, version string) *Server {
 	// Set Gin mode based on dev mode
@@ -176,8 +178,10 @@ func NewServer(cfg *config.Config, database *db.DB, version string) *Server {
 	// Initialize legacy S3 storage (for backward compatibility)
 	s3Store, err := initS3Storage(cfg)
 	if err != nil {
-		slog.Warn("Failed to initialize legacy S3 storage", "error", err)
-		// Continue without S3 - file operations will fail gracefully
+		if !errors.Is(err, errLegacyS3NotConfigured) {
+			slog.Warn("Failed to initialize legacy S3 storage", "error", err)
+		}
+		// Continue without the singleton S3 store; multi-backend flows use storageManager.
 	}
 
 	// Initialize token store for seafhttp
@@ -337,6 +341,7 @@ func initStorageManager(cfg *config.Config) *storage.Manager {
 	if cfg.Storage.EndpointRegions != nil {
 		manager.SetEndpointRegions(cfg.Storage.EndpointRegions)
 	}
+	manager.SetLocalRegion(cfg.Server.Region)
 
 	// Set region to class mapping
 	if cfg.Storage.RegionClasses != nil {
@@ -369,6 +374,10 @@ func initStorageManager(cfg *config.Config) *storage.Manager {
 	// config format was used.
 	for name, backendCfg := range cfg.Storage.Backends {
 		if _, alreadyRegistered := manager.GetBackend(name); alreadyRegistered {
+			continue
+		}
+		if strings.EqualFold(backendCfg.Type, "s3") && strings.TrimSpace(backendCfg.Bucket) == "" {
+			slog.Info("Skipping unconfigured legacy storage backend", "backend", name)
 			continue
 		}
 		classCfg := config.StorageClassConfig{
@@ -442,30 +451,11 @@ func initS3Storage(cfg *config.Config) (*storage.S3Store, error) {
 	sseMode := os.Getenv("S3_SERVER_SIDE_ENCRYPTION")
 	sseKMSKeyID := os.Getenv("S3_SSE_KMS_KEY_ID")
 
-	// Fall back to config if not in environment
+	// Fall back only to the legacy single-backend config.
+	// Do not derive the singleton store from storage.classes; multi-region nodes
+	// must use storageManager-backed resolution instead of a process-wide default.
 	if bucket == "" {
-		// Try new storage classes first
-		if defaultClass, ok := cfg.Storage.Classes[cfg.Storage.DefaultClass]; ok {
-			if endpoint == "" {
-				endpoint = defaultClass.Endpoint
-			}
-			bucket = defaultClass.Bucket
-			if region == "" {
-				region = defaultClass.Region
-			}
-			if accessKey == "" {
-				accessKey = defaultClass.AccessKey
-			}
-			if secretKey == "" {
-				secretKey = defaultClass.SecretKey
-			}
-			if sseMode == "" {
-				sseMode = defaultClass.ServerSideEncryption
-			}
-			if sseKMSKeyID == "" {
-				sseKMSKeyID = defaultClass.SSEKMSKeyID
-			}
-		} else if hotBackend, ok := cfg.Storage.Backends["hot"]; ok {
+		if hotBackend, ok := cfg.Storage.Backends["hot"]; ok {
 			// Fall back to legacy backends
 			if endpoint == "" {
 				endpoint = hotBackend.Endpoint
@@ -484,7 +474,7 @@ func initS3Storage(cfg *config.Config) (*storage.S3Store, error) {
 	}
 
 	if bucket == "" {
-		return nil, fmt.Errorf("S3 bucket not configured")
+		return nil, errLegacyS3NotConfigured
 	}
 
 	if region == "" {

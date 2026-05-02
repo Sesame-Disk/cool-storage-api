@@ -1079,7 +1079,14 @@ func (h *FileHandler) CreateFile(c *gin.Context) {
 	var fileSize int64
 	var blockIDs []string
 
-	if len(templateContent) > 0 && h.blockStore != nil {
+	if len(templateContent) > 0 {
+		blockStore, _, err := h.resolveLibraryBlockStore(c, orgID, repoID)
+		if err != nil || blockStore == nil {
+			log.Printf("[CreateFile] Block storage not available for template write: %v", err)
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "block storage not available"})
+			return
+		}
+
 		// Office file - store the template content as a block
 		fileSize = int64(len(templateContent))
 
@@ -1095,7 +1102,7 @@ func (h *FileHandler) CreateFile(c *gin.Context) {
 			Data: templateContent,
 			Size: fileSize,
 		}
-		if _, err := h.blockStore.PutBlockData(ctx, blockData); err != nil {
+		if _, err := blockStore.PutBlockData(ctx, blockData); err != nil {
 			log.Printf("[CreateFile] Failed to store block: %v", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to store file content"})
 			return
@@ -4556,7 +4563,7 @@ func (h *FileHandler) BatchDeleteItems(c *gin.Context) {
 
 		for _, entry := range deletedEntries {
 			deletedPath := path.Join(parentDir, entry.Name)
-			
+
 			// Clean up tags
 			if entry.Mode == ModeDir || entry.Mode&0170000 == 040000 {
 				h.cleanupFileTagsForPrefix(req.RepoID, deletedPath)

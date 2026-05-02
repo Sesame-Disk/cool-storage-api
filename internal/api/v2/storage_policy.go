@@ -97,6 +97,10 @@ func resolveEndpointRegion(cfg *config.Config, hostname string) string {
 		}
 	}
 
+	if region := strings.ToLower(strings.TrimSpace(cfg.Server.Region)); region != "" {
+		return region
+	}
+
 	for pattern, region := range cfg.Storage.EndpointRegions {
 		if len(pattern) > 1 && pattern[0] == '*' {
 			suffix := strings.ToLower(pattern[1:])

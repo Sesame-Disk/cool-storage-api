@@ -1,6 +1,8 @@
 package api
 
 import (
+	"context"
+	"fmt"
 	"net/http"
 	"os"
 	"strings"
@@ -9,10 +11,38 @@ import (
 	"github.com/Sesame-Disk/sesamefs/internal/apikeys"
 	"github.com/Sesame-Disk/sesamefs/internal/health"
 	"github.com/Sesame-Disk/sesamefs/internal/middleware"
+	"github.com/Sesame-Disk/sesamefs/internal/storage"
 	"github.com/Sesame-Disk/sesamefs/internal/traffic"
 	"github.com/gin-gonic/gin"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
+
+type storageManagerHealthChecker struct {
+	manager *storage.Manager
+}
+
+func (c *storageManagerHealthChecker) HeadBucket(ctx context.Context) error {
+	if c == nil || c.manager == nil {
+		return fmt.Errorf("storage manager not configured")
+	}
+
+	preferredClass := c.manager.ResolveStorageClass("", "", "hot")
+	backend, actualClass, err := c.manager.GetHealthyBackend(preferredClass)
+	if err != nil {
+		return err
+	}
+
+	type headBucketChecker interface {
+		HeadBucket(context.Context) error
+	}
+
+	checker, ok := backend.(headBucketChecker)
+	if !ok {
+		return fmt.Errorf("storage class %s does not support bucket readiness checks", actualClass)
+	}
+
+	return checker.HeadBucket(ctx)
+}
 
 func (s *Server) setupRuntimeHooks() {
 	// Set up GC hooks so that v2 handlers can enqueue blocks/libraries for garbage collection.
@@ -40,6 +70,8 @@ func (s *Server) registerCoreRoutes() {
 	var storageChecker health.StorageChecker
 	if s.storage != nil {
 		storageChecker = s.storage
+	} else if s.storageManager != nil {
+		storageChecker = &storageManagerHealthChecker{manager: s.storageManager}
 	}
 	healthChecker := health.NewChecker(databaseChecker, storageChecker, s.config.Monitoring.HealthTimeout, s.version)
 	internalOnly := middleware.InternalOnly()

@@ -3,7 +3,7 @@
 #
 # Two-in-one helper for preparing a production deployment:
 #
-#   1. --init-env      seed a .env from .env.example and fill in every
+#   1. --init-env      seed a .env from .env.prod.example and fill in every
 #                      auto-generatable secret with fresh random bytes
 #   2. (no flag)       validate the current environment and refuse to start
 #                      production if any required setting is missing or
@@ -27,7 +27,7 @@
 # Exit codes:
 #   0  validation passed, OR --init-env completed successfully
 #   1  validation failed (at least one hard-fail check tripped), OR
-#      --init-env could not find .env.example
+#      --init-env could not find .env.prod.example
 #   2  usage error
 #
 # You can skip validation checks you deliberately don't want with
@@ -210,7 +210,7 @@ maybe_generate_in_env_file() {
 
 do_init_env() {
   local env_file=".env"
-  local template=".env.example"
+  local template=".env.prod.example"
 
   section "sesamefs .env bootstrap"
 
@@ -247,20 +247,17 @@ do_init_env() {
     fi
   }
 
-  needs_manual SERVER_URL                    "your public base URL"
+  needs_manual IMAGE_TAG                     "the published backend/frontend release tag"
   needs_manual BILLING_URL                   "accounts portal billing URL"
   needs_manual ACCOUNTS_DELETE_ACCOUNT_URL   "accounts portal delete-account URL"
   needs_manual OIDC_ISSUER                   "your IdP issuer URL"
   needs_manual OIDC_CLIENT_ID                "issued by your IdP"
   needs_manual OIDC_CLIENT_SECRET            "issued by your IdP"
-  needs_manual OIDC_REDIRECT_URIS            "your https://<host>/sso callback"
-  needs_manual S3_BUCKET                     "your production S3 bucket"
-  needs_manual S3_REGION                     "your AWS region"
+  needs_manual OIDC_REDIRECT_URIS            "comma-separated OIDC callback allow-list covering every production login domain"
+  needs_manual CORS_ALLOWED_ORIGINS          "comma-separated browser origins covering every production web domain"
+  needs_manual ONLYOFFICE_API_JS_URL         "the public OnlyOffice API JS URL"
   needs_manual AWS_ACCESS_KEY_ID             "from AWS IAM — cannot be generated"
   needs_manual AWS_SECRET_ACCESS_KEY         "from AWS IAM — cannot be generated"
-  needs_manual CASSANDRA_HOSTS               "your Cassandra contact points"
-  needs_manual CASSANDRA_USERNAME            "Cassandra role with access to the keyspace"
-  needs_manual CASSANDRA_PASSWORD            "must match the Cassandra side"
 
   echo >&2
   if [ "$missing" -gt 0 ]; then
@@ -273,6 +270,41 @@ do_init_env() {
     printf "    set -a; source %s; set +a\n" "$env_file" >&2
     printf "    ./scripts/prod-preflight.sh\n" >&2
   fi
+}
+
+check_release_images() {
+  section "Release images"
+
+  if ! is_set IMAGE_TAG; then
+    fail "IMAGE_TAG is unset. Production compose now consumes published images and requires a release tag."
+  else
+    pass "IMAGE_TAG is set ($IMAGE_TAG)"
+  fi
+
+  if is_set SESAMEFS_IMAGE; then
+    pass "SESAMEFS_IMAGE override is set"
+  else
+    pass "SESAMEFS_IMAGE override unset (using default yoilier/sesamefs)"
+  fi
+
+  if is_set FRONTEND_IMAGE; then
+    pass "FRONTEND_IMAGE override is set"
+  else
+    pass "FRONTEND_IMAGE override unset (using default yoilier/sesamefs-frontend)"
+  fi
+}
+
+storage_mode() {
+  local mode
+  mode="$(printf '%s' "${STORAGE_MODE:-multi}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+  case "$mode" in
+    single|multi)
+      echo "$mode"
+      ;;
+    *)
+      echo "invalid"
+      ;;
+  esac
 }
 
 # ========================================================================
@@ -315,7 +347,7 @@ check_share_link_hmac_key() {
 check_external_urls() {
   section "External URLs"
 
-  local required=(SERVER_URL BILLING_URL ACCOUNTS_DELETE_ACCOUNT_URL)
+  local required=(BILLING_URL ACCOUNTS_DELETE_ACCOUNT_URL)
   for v in "${required[@]}"; do
     if ! is_set "$v"; then
       fail "$v is unset. Required for user-facing redirects."
@@ -325,6 +357,15 @@ check_external_urls() {
       pass "$v is set"
     fi
   done
+
+  if is_set SERVER_URL; then
+  pass "SERVER_URL is set (explicit absolute-link fallback enabled)"
+  if [[ "$SERVER_URL" != https://* ]] && [[ "$SERVER_URL" != http://* ]]; then
+    fail "SERVER_URL does not look like a URL: ${SERVER_URL}"
+  fi
+  else
+    pass "SERVER_URL unset (SesameFS will derive the public host from the current request)"
+  fi
 }
 
 check_oidc() {
@@ -388,6 +429,12 @@ check_onlyoffice() {
     pass "ONLYOFFICE_JWT_SECRET is set (${#ONLYOFFICE_JWT_SECRET} chars) and not a known default"
   fi
 
+  if ! is_set ONLYOFFICE_API_JS_URL; then
+	fail "ONLYOFFICE_API_JS_URL is unset. Required when OnlyOffice is enabled."
+	return
+  fi
+	pass "ONLYOFFICE_API_JS_URL is set"
+
   if is_set ONLYOFFICE_API_JS_URL && [[ "$ONLYOFFICE_API_JS_URL" == http://* ]]; then
     warn "ONLYOFFICE_API_JS_URL uses http:// — browsers will likely block mixed content on an HTTPS site."
   fi
@@ -400,7 +447,15 @@ check_object_storage() {
     return
   fi
 
-  local required=(S3_BUCKET S3_REGION AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY)
+  local mode
+  mode="$(storage_mode)"
+  if [ "$mode" = "invalid" ]; then
+    fail "STORAGE_MODE must be either 'single' or 'multi'."
+    return
+  fi
+  pass "Detected storage mode: $mode"
+
+  local required=(AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY)
   for v in "${required[@]}"; do
     if ! is_set "$v"; then
       fail "$v is unset. Required for S3-backed storage."
@@ -408,6 +463,31 @@ check_object_storage() {
       pass "$v is set"
     fi
   done
+
+  if [ "$mode" = "single" ]; then
+    if is_set SERVER_REGION; then
+      fail "SERVER_REGION must be empty when STORAGE_MODE=single."
+    fi
+    local single_required=(S3_BUCKET AWS_REGION S3_REGION)
+    for v in "${single_required[@]}"; do
+      if ! is_set "$v"; then
+        fail "$v is unset. Required for single-region mode with the legacy hot backend."
+      else
+        pass "$v is set"
+      fi
+    done
+  else
+    if ! is_set SERVER_REGION; then
+      fail "SERVER_REGION is unset. Required when STORAGE_MODE=multi."
+    else
+      pass "SERVER_REGION is set"
+    fi
+    if is_set S3_BUCKET || is_set S3_REGION || is_set AWS_REGION || is_set S3_ENDPOINT; then
+      fail "Legacy single-region S3_* / AWS_REGION overrides must be unset when STORAGE_MODE=multi."
+    else
+      pass "bucket/region topology is expected to come from configs/config.prod.yaml storage.classes"
+    fi
+  fi
 
   if [ "${AWS_ACCESS_KEY_ID:-}" = "$DEV_DEFAULT_MINIO_USER" ] \
      || [ "${AWS_SECRET_ACCESS_KEY:-}" = "$DEV_DEFAULT_MINIO_PASS" ]; then
@@ -427,10 +507,10 @@ check_database() {
   fi
 
   if ! is_set CASSANDRA_HOSTS; then
-    fail "CASSANDRA_HOSTS is unset."
-    return
+    pass "CASSANDRA_HOSTS is unset (compose default cassandra:9042 will be used)"
+  else
+    pass "CASSANDRA_HOSTS is set"
   fi
-  pass "CASSANDRA_HOSTS is set"
 
   if ! is_set CASSANDRA_USERNAME; then
     warn "CASSANDRA_USERNAME is unset. Only acceptable if Cassandra is on a trusted private network."
@@ -481,7 +561,7 @@ $PROG — production readiness tool
 
 Usage:
   $PROG                 validate the current environment (default)
-  $PROG --init-env      seed .env from .env.example and fill in every
+  $PROG --init-env      seed .env from .env.prod.example and fill in every
                         auto-generatable secret with fresh random bytes
   $PROG --help
 
@@ -494,7 +574,7 @@ Environment (validation mode):
 
 Exit codes:
   0   validation passed, OR --init-env completed successfully
-  1   validation failed, OR --init-env could not find .env.example
+  1   validation failed, OR --init-env could not find .env.prod.example
   2   usage error
 EOF
 }
@@ -511,6 +591,7 @@ printf "  time:   %s\n"  "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" >&2
 printf "  SKIP:   %s\n"  "${SKIP:-<none>}" >&2
 
 check_auth_flags
+check_release_images
 check_share_link_hmac_key
 check_external_urls
 check_oidc

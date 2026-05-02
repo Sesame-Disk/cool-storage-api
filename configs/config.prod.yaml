@@ -33,6 +33,7 @@ server:
   write_timeout: 0s             # No timeout — large downloads can take minutes
   max_upload_mb: 20480          # 20480 MB (~20 GiB) max upload
   trusted_proxies: []           # Configure exact nginx/load-balancer IP/CIDRs; empty disables X-Forwarded-For trust
+  region: ""                   # Set via SERVER_REGION in multi-region; used as node-local default for the shared global DOMAIN
   mobile_frontend_path: "./mobile-frontend/dist" # Built mobile frontend directory
 
 # =============================================================================
@@ -47,37 +48,80 @@ database:
   # username and password via: CASSANDRA_USERNAME, CASSANDRA_PASSWORD
 
 # =============================================================================
-# Storage — single-region production config (single AWS S3 bucket)
+# Storage — shared production config for both single-region and multi-region
 #
-# This uses the legacy "backends:" format intentionally — it maps to a single
-# named backend ("hot") resolved by the storage manager as the default class.
+# Single-region:
+#   - leave SERVER_REGION unset
+#   - fill S3_* / AWS_REGION env vars for the legacy "hot" backend below
+#   - runtime overrides switch the effective default_class back to "hot"
 #
-# When to migrate to "classes:":
-#   When deploying multi-region (e.g. hot-s3-usa, hot-s3-eu, cold-glacier-usa),
-#   replace this section with "classes:" + "endpoint_regions:" + "region_classes:"
-#   following the structure in configs/config.example.yaml.
+# Multi-region:
+#   - set SERVER_REGION per node (usa/eu/asia)
+#   - keep buckets/regions/failover chains in storage.classes below
+#   - region_classes take precedence over default_class for shared-domain routing
 #
-# Env vars that control this section:
-#   S3_BUCKET    → bucket name
-#   S3_REGION    → AWS region (e.g. us-east-1)
-#   S3_ENDPOINT  → leave empty for real AWS; set for S3-compatible APIs (R2, Cloudflare, etc.)
-#   S3_SERVER_SIDE_ENCRYPTION → AES256 or aws:kms
-#   S3_SSE_KMS_KEY_ID         → optional KMS key ID/ARN when using aws:kms
-#   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY → picked up by AWS SDK automatically
+# Credentials always come from AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY.
 # =============================================================================
 storage:
-  default_class: hot
+  mode: "multi"
+  default_class: hot-s3-usa
 
+  classes:
+    hot-s3-usa:
+      type: s3
+      tier: hot
+      endpoint: ""                   # Leave empty for AWS S3; set only for S3-compatible APIs
+      bucket: sesamefs-usa
+      region: us-east-1
+      server_side_encryption: "AES256"
+      sse_kms_key_id: ""
+      failover_class: hot-s3-eu
+
+    hot-s3-eu:
+      type: s3
+      tier: hot
+      endpoint: ""
+      bucket: sesamefs-eu
+      region: eu-west-1
+      server_side_encryption: "AES256"
+      sse_kms_key_id: ""
+      failover_class: hot-s3-usa
+
+    hot-s3-asia:
+      type: s3
+      tier: hot
+      endpoint: ""
+      bucket: sesamefs-asia
+      region: ap-southeast-1
+      server_side_encryption: "AES256"
+      sse_kms_key_id: ""
+      failover_class: hot-s3-eu
+
+  endpoint_regions: {}
+    # Keep explicit hostname rules only for special cases. In the standard
+    # global-domain topology, SERVER_REGION decides the node-local default.
+
+  region_classes:
+    usa:
+      hot: hot-s3-usa
+      cold: ""
+    eu:
+      hot: hot-s3-eu
+      cold: ""
+    asia:
+      hot: hot-s3-asia
+      cold: ""
+
+  # Legacy single-region backend, kept for compatibility with the env-driven
+  # production path used by existing single-bucket deployments.
   backends:
     hot:
       type: s3
-      bucket: ""                     # Set via S3_BUCKET env var
-      region: ""                     # Set via S3_REGION env var
-      endpoint: ""                   # Optional S3-compatible endpoint via S3_ENDPOINT env var
-      server_side_encryption: "AES256" # Override via S3_SERVER_SIDE_ENCRYPTION; recommended for AWS S3
-      sse_kms_key_id: ""               # Optional via S3_SSE_KMS_KEY_ID when using aws:kms
-      # bucket, region, endpoint → overridden by S3_BUCKET, S3_REGION, S3_ENDPOINT
-      # credentials → overridden by AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
+      endpoint: ""
+      bucket: ""
+      region: ""
+      server_side_encryption: "AES256"
+      sse_kms_key_id: ""
 
 # =============================================================================
 # Authentication

@@ -145,10 +145,7 @@ func (h *OnlyOfficeHandler) lookupLibraryStorageClass(orgID, repoID string) stri
 func (h *OnlyOfficeHandler) resolveLibraryBlockStore(orgID, repoID string) (*storage.BlockStore, string, error) {
 	libraryClass := h.lookupLibraryStorageClass(orgID, repoID)
 	if h.storageManager != nil {
-		preferredClass := libraryClass
-		if preferredClass == "" && h.config != nil {
-			preferredClass = h.config.Storage.DefaultClass
-		}
+		preferredClass := h.storageManager.ResolveStorageClass("", libraryClass, "hot")
 		return h.storageManager.GetHealthyBlockStore(preferredClass)
 	}
 	if libraryClass == "" && h.config != nil {

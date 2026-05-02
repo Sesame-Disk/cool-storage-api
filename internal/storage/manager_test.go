@@ -84,17 +84,17 @@ func TestManagerResolveStorageClass(t *testing.T) {
 
 	// Configure endpoint regions
 	m.SetEndpointRegions(map[string]string{
-		"us.sesamefs.com":    "usa",
-		"eu.sesamefs.com":    "eu",
-		"cn.sesamefs.com":    "china",
-		"*.sesamefs.com":     "usa", // Default
-		"localhost":          "usa",
+		"us.sesamefs.com": "usa",
+		"eu.sesamefs.com": "eu",
+		"cn.sesamefs.com": "china",
+		"*.sesamefs.com":  "usa", // Default
+		"localhost":       "usa",
 	})
 
 	// Configure region classes
 	m.SetRegionClasses(map[string]RegionClassConfig{
-		"usa": {Hot: "hot-s3-usa", Cold: "cold-glacier-usa"},
-		"eu":  {Hot: "hot-s3-eu", Cold: ""},
+		"usa":   {Hot: "hot-s3-usa", Cold: "cold-glacier-usa"},
+		"eu":    {Hot: "hot-s3-eu", Cold: ""},
 		"china": {Hot: "hot-s3-china", Cold: ""},
 	})
 
@@ -168,6 +168,14 @@ func TestManagerResolveStorageClass(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("local region overrides wildcard fallback", func(t *testing.T) {
+		m.SetLocalRegion("eu")
+		got := m.ResolveStorageClass("files.sesamefs.com", "", "hot")
+		if got != "hot-s3-eu" {
+			t.Fatalf("ResolveStorageClass local fallback = %q, want %q", got, "hot-s3-eu")
+		}
+	})
 }
 
 func TestManagerGetHealthyBackend(t *testing.T) {

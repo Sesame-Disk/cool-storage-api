@@ -117,6 +117,36 @@ func TestBuildBootstrapStorageOptionsUsesRegionLabelsAndDefault(t *testing.T) {
 	}
 }
 
+func TestBuildBootstrapStorageOptionsFallsBackToServerRegion(t *testing.T) {
+	s := createTestServer()
+	s.config.Server.Region = "eu"
+	s.config.Storage.DefaultClass = "hot-usa"
+	s.config.Storage.EndpointRegions = map[string]string{
+		"*": "usa",
+	}
+	s.config.Storage.RegionClasses = map[string]config.RegionClassConfig{
+		"usa": {Hot: "hot-usa"},
+		"eu":  {Hot: "hot-eu"},
+	}
+	s.config.Storage.Classes = map[string]config.StorageClassConfig{
+		"hot-usa": {},
+		"hot-eu":  {},
+	}
+	s.config.Storage.Backends = map[string]config.BackendConfig{}
+
+	options := s.buildBootstrapStorageOptions("files.example.com")
+	for _, option := range options {
+		if option["id"] == "hot-eu" {
+			if option["is_default"] != true {
+				t.Fatalf("eu option is_default = %v, want true", option["is_default"])
+			}
+			return
+		}
+	}
+
+	t.Fatalf("expected hot-eu option in %v", options)
+}
+
 func TestBuildOrgBootstrapPageOptionsIncludesAccountsOrgManagementURL(t *testing.T) {
 	s := createTestServer()
 	s.config.Accounts.OrgUserManagementURL = "https://accounts.example.com/orgs/{org_id}/users/"

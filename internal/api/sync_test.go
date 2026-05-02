@@ -231,6 +231,50 @@ func TestResolveBlockLookupFallbackClassUsesLibraryPreference(t *testing.T) {
 	}
 }
 
+func TestResolvePreferredBlockStoreUsesStorageManager(t *testing.T) {
+	manager := storage.NewManager()
+	manager.SetDefaultClass("hot-s3-eu")
+	manager.RegisterBackend("hot-s3-eu", &storage.S3Store{}, "")
+	h := &SyncHandler{storageManager: manager}
+
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodGet, "/seafhttp/repo/repo-id/block/block-id", nil)
+	c.Request.Host = "files.example.com"
+
+	blockStore, storageClass, err := h.resolvePreferredBlockStore(c, "org-id", "repo-id")
+	if err != nil {
+		t.Fatalf("resolvePreferredBlockStore returned error: %v", err)
+	}
+	if blockStore == nil {
+		t.Fatal("expected blockStore, got nil")
+	}
+	if storageClass != "hot-s3-eu" {
+		t.Fatalf("storageClass = %q, want %q", storageClass, "hot-s3-eu")
+	}
+}
+
+func TestResolveBlockStoreForLookupFallsBackThroughManager(t *testing.T) {
+	manager := storage.NewManager()
+	manager.SetDefaultClass("hot-s3-eu")
+	manager.RegisterBackend("hot-s3-eu", &storage.S3Store{}, "")
+	h := &SyncHandler{storageManager: manager}
+
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodGet, "/seafhttp/repo/repo-id/block/block-id", nil)
+	c.Request.Host = "files.example.com"
+
+	blockStore, storageClass, err := h.resolveBlockStoreForLookup(c, "org-id", "repo-id", "missing-class")
+	if err != nil {
+		t.Fatalf("resolveBlockStoreForLookup returned error: %v", err)
+	}
+	if blockStore == nil {
+		t.Fatal("expected blockStore, got nil")
+	}
+	if storageClass != "hot-s3-eu" {
+		t.Fatalf("storageClass = %q, want %q", storageClass, "hot-s3-eu")
+	}
+}
+
 // TestSyncHandlerWithoutDB tests sync handlers return appropriate errors without DB
 func TestSyncHandlerWithoutDB(t *testing.T) {
 	r := setupSyncTestRouter()

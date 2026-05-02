@@ -2,6 +2,7 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"io"
 	"mime/multipart"
 	"net/http"
@@ -18,6 +19,43 @@ import (
 
 func init() {
 	gin.SetMode(gin.TestMode)
+}
+
+type mockObjectStore struct {
+	data []byte
+}
+
+func (m *mockObjectStore) Put(ctx context.Context, blockID string, data io.Reader, size int64) (string, error) {
+	_, _ = io.Copy(io.Discard, data)
+	return blockID, nil
+}
+
+func (m *mockObjectStore) Get(ctx context.Context, storageKey string) (io.ReadCloser, error) {
+	return io.NopCloser(bytes.NewReader(m.data)), nil
+}
+
+func (m *mockObjectStore) Delete(ctx context.Context, storageKey string) error {
+	return nil
+}
+
+func (m *mockObjectStore) Exists(ctx context.Context, storageKey string) (bool, error) {
+	return true, nil
+}
+
+func (m *mockObjectStore) GetAccessType() storage.AccessType {
+	return storage.AccessImmediate
+}
+
+func (m *mockObjectStore) InitiateRestore(ctx context.Context, storageKey string) (string, error) {
+	return "", nil
+}
+
+func (m *mockObjectStore) CheckRestoreStatus(ctx context.Context, storageKey string) (bool, error) {
+	return true, nil
+}
+
+func (m *mockObjectStore) GetRestoreExpiry(ctx context.Context, storageKey string) (*time.Time, error) {
+	return nil, nil
 }
 
 // ============================================================================
@@ -757,6 +795,23 @@ func TestSeafHTTPHandlerUploadNoFile(t *testing.T) {
 	}
 }
 
+func TestSeafHTTPHandlerUploadNoFileWithStorageManager(t *testing.T) {
+	tokenStore := NewMockTokenStore()
+	tokenStore.CreateUploadToken("org1", "repo1", "/", "user1")
+	handler := NewSeafHTTPHandler(nil, storage.NewManager(), nil, tokenStore, nil)
+
+	r := gin.New()
+	r.POST("/seafhttp/upload-api/:token", handler.HandleUpload)
+
+	req, _ := http.NewRequest("POST", "/seafhttp/upload-api/mock-upload-token", nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusBadRequest)
+	}
+}
+
 func TestSeafHTTPHandlerDownloadInvalidToken(t *testing.T) {
 	tokenStore := NewMockTokenStore()
 	handler := NewSeafHTTPHandler(nil, nil, nil, tokenStore, nil)
@@ -789,6 +844,29 @@ func TestSeafHTTPHandlerDownloadNoStorage(t *testing.T) {
 
 	if w.Code != http.StatusServiceUnavailable {
 		t.Errorf("status = %d, want %d", w.Code, http.StatusServiceUnavailable)
+	}
+}
+
+func TestSeafHTTPHandlerDownloadWithStorageManagerObjectFallback(t *testing.T) {
+	tokenStore := NewMockTokenStore()
+	tokenStore.CreateDownloadToken("org1", "repo1", "/file.txt", "user1")
+	manager := storage.NewManager()
+	manager.SetDefaultClass("hot-s3-eu")
+	manager.RegisterBackend("hot-s3-eu", &mockObjectStore{data: []byte("hello")}, "")
+	handler := NewSeafHTTPHandler(nil, manager, nil, tokenStore, nil)
+
+	r := gin.New()
+	r.GET("/seafhttp/files/:token/*filepath", handler.HandleDownload)
+
+	req, _ := http.NewRequest("GET", "/seafhttp/files/mock-download-token/file.txt", nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusOK)
+	}
+	if w.Body.String() != "hello" {
+		t.Fatalf("body = %q, want %q", w.Body.String(), "hello")
 	}
 }
 

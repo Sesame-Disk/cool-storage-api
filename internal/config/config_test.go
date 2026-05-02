@@ -349,6 +349,135 @@ func TestConfigValidate(t *testing.T) {
 			},
 			wantErr: false,
 		},
+		{
+			name: "production multi-region requires server region when legacy hot backend is inactive",
+			modify: func(c *Config) {
+				c.Auth.DevMode = false
+				c.Auth.ShareLinkHMACKey = "very-secure-test-key"
+				c.CORS.AllowedOrigins = []string{"https://app.example.com"}
+				c.Storage.Mode = "multi"
+				c.Storage.DefaultClass = "hot-s3-usa"
+				c.Storage.Classes = map[string]StorageClassConfig{
+					"hot-s3-usa": {Type: "s3", Bucket: "sesamefs-usa", Region: "us-east-1"},
+				}
+				c.Storage.RegionClasses = map[string]RegionClassConfig{"usa": {Hot: "hot-s3-usa"}}
+				hot := c.Storage.Backends["hot"]
+				hot.Bucket = ""
+				c.Storage.Backends["hot"] = hot
+			},
+			wantErr:        true,
+			wantErrContain: "server.region",
+		},
+		{
+			name: "production multi-region rejects unknown server region",
+			modify: func(c *Config) {
+				c.Auth.DevMode = false
+				c.Auth.ShareLinkHMACKey = "very-secure-test-key"
+				c.CORS.AllowedOrigins = []string{"https://app.example.com"}
+				c.Storage.Mode = "multi"
+				c.Server.Region = "latam"
+				c.Storage.DefaultClass = "hot-s3-usa"
+				c.Storage.Classes = map[string]StorageClassConfig{
+					"hot-s3-usa": {Type: "s3", Bucket: "sesamefs-usa", Region: "us-east-1"},
+					"hot-s3-eu":  {Type: "s3", Bucket: "sesamefs-eu", Region: "eu-west-1"},
+				}
+				c.Storage.RegionClasses = map[string]RegionClassConfig{
+					"usa": {Hot: "hot-s3-usa"},
+					"eu":  {Hot: "hot-s3-eu"},
+				}
+				c.Storage.Backends = map[string]BackendConfig{"hot": {Type: "s3"}}
+			},
+			wantErr:        true,
+			wantErrContain: "server.region",
+		},
+		{
+			name: "production multi-region accepts configured server region",
+			modify: func(c *Config) {
+				c.Auth.DevMode = false
+				c.Auth.ShareLinkHMACKey = "very-secure-test-key"
+				c.CORS.AllowedOrigins = []string{"https://app.example.com"}
+				c.Storage.Mode = "multi"
+				c.Server.Region = "eu"
+				c.Storage.DefaultClass = "hot-s3-usa"
+				c.Storage.Classes = map[string]StorageClassConfig{
+					"hot-s3-usa": {Type: "s3", Bucket: "sesamefs-usa", Region: "us-east-1"},
+					"hot-s3-eu":  {Type: "s3", Bucket: "sesamefs-eu", Region: "eu-west-1"},
+				}
+				c.Storage.RegionClasses = map[string]RegionClassConfig{
+					"usa": {Hot: "hot-s3-usa"},
+					"eu":  {Hot: "hot-s3-eu"},
+				}
+				c.Storage.Backends = map[string]BackendConfig{"hot": {Type: "s3"}}
+			},
+			wantErr: false,
+		},
+		{
+			name: "production multi-region rejects unknown region class target",
+			modify: func(c *Config) {
+				c.Auth.DevMode = false
+				c.Auth.ShareLinkHMACKey = "very-secure-test-key"
+				c.CORS.AllowedOrigins = []string{"https://app.example.com"}
+				c.Storage.Mode = "multi"
+				c.Server.Region = "eu"
+				c.Storage.DefaultClass = "hot-s3-usa"
+				c.Storage.Classes = map[string]StorageClassConfig{
+					"hot-s3-usa": {Type: "s3", Bucket: "sesamefs-usa", Region: "us-east-1"},
+				}
+				c.Storage.RegionClasses = map[string]RegionClassConfig{
+					"eu": {Hot: "hot-s3-eu"},
+				}
+				c.Storage.Backends = map[string]BackendConfig{"hot": {Type: "s3"}}
+			},
+			wantErr:        true,
+			wantErrContain: "storage.region_classes.eu.hot",
+		},
+		{
+			name: "storage mode rejects unsupported value",
+			modify: func(c *Config) {
+				c.Storage.Mode = "hybrid"
+			},
+			wantErr:        true,
+			wantErrContain: "storage.mode must be one of",
+		},
+		{
+			name: "production multi-region rejects legacy hot backend overrides",
+			modify: func(c *Config) {
+				c.Auth.DevMode = false
+				c.Auth.ShareLinkHMACKey = "very-secure-test-key"
+				c.CORS.AllowedOrigins = []string{"https://app.example.com"}
+				c.Storage.Mode = "multi"
+				c.Server.Region = "eu"
+				c.Storage.DefaultClass = "hot-s3-usa"
+				c.Storage.Classes = map[string]StorageClassConfig{
+					"hot-s3-usa": {Type: "s3", Bucket: "sesamefs-usa", Region: "us-east-1"},
+					"hot-s3-eu":  {Type: "s3", Bucket: "sesamefs-eu", Region: "eu-west-1"},
+				}
+				c.Storage.RegionClasses = map[string]RegionClassConfig{
+					"usa": {Hot: "hot-s3-usa"},
+					"eu":  {Hot: "hot-s3-eu"},
+				}
+				hot := c.Storage.Backends["hot"]
+				hot.Bucket = "legacy-bucket"
+				c.Storage.Backends["hot"] = hot
+			},
+			wantErr:        true,
+			wantErrContain: "does not allow legacy hot backend overrides",
+		},
+		{
+			name: "production single-region rejects server region",
+			modify: func(c *Config) {
+				c.Auth.DevMode = false
+				c.Auth.ShareLinkHMACKey = "very-secure-test-key"
+				c.CORS.AllowedOrigins = []string{"https://app.example.com"}
+				c.Storage.Mode = "single"
+				c.Server.Region = "eu"
+				hot := c.Storage.Backends["hot"]
+				hot.Bucket = "legacy-bucket"
+				c.Storage.Backends["hot"] = hot
+			},
+			wantErr:        true,
+			wantErrContain: "storage.mode=single requires server.region to be empty",
+		},
 	}
 
 	for _, tt := range tests {
@@ -518,6 +647,53 @@ func TestEnvOverrideS3(t *testing.T) {
 	}
 	if hot.ServerSideEncryption != "AES256" {
 		t.Errorf("Storage.Backends[hot].ServerSideEncryption = %s, want AES256", hot.ServerSideEncryption)
+	}
+}
+
+func TestEnvOverrideServerRegion(t *testing.T) {
+	cfg := DefaultConfig()
+
+	os.Setenv("SERVER_REGION", "EU")
+	defer os.Unsetenv("SERVER_REGION")
+
+	cfg.applyEnvOverrides()
+
+	if cfg.Server.Region != "eu" {
+		t.Errorf("Server.Region = %q, want %q", cfg.Server.Region, "eu")
+	}
+}
+
+func TestEnvOverrideStorageMode(t *testing.T) {
+	cfg := DefaultConfig()
+
+	os.Setenv("STORAGE_MODE", "SINGLE")
+	defer os.Unsetenv("STORAGE_MODE")
+
+	cfg.applyEnvOverrides()
+
+	if cfg.Storage.Mode != "single" {
+		t.Fatalf("Storage.Mode = %q, want %q", cfg.Storage.Mode, "single")
+	}
+	if cfg.Storage.DefaultClass != "hot" {
+		t.Fatalf("Storage.DefaultClass = %q, want %q", cfg.Storage.DefaultClass, "hot")
+	}
+}
+
+func TestEnvOverrideS3ForcesLegacyDefaultClass(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Storage.DefaultClass = "hot-s3-usa"
+
+	os.Setenv("S3_BUCKET", "my-bucket")
+	os.Setenv("S3_REGION", "eu-west-1")
+	defer func() {
+		os.Unsetenv("S3_BUCKET")
+		os.Unsetenv("S3_REGION")
+	}()
+
+	cfg.applyEnvOverrides()
+
+	if cfg.Storage.DefaultClass != "hot" {
+		t.Fatalf("Storage.DefaultClass = %q, want %q", cfg.Storage.DefaultClass, "hot")
 	}
 }
 
