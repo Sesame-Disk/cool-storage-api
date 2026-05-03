@@ -268,6 +268,15 @@ cp .env.prod.example .env
 nano .env
 ```
 
+On a fresh host, the recommended flow is:
+
+```bash
+./scripts/prod-preflight.sh --init-env
+nano .env
+```
+
+`--init-env` creates `.env` from `.env.prod.example` when needed and fills only the auto-generatable secrets. It does **not** guess external values such as S3 credentials, OIDC settings, public URLs, or image refs.
+
 Fill in these values. The examples below assume the default multi-region path; single-region notes follow immediately after the relevant settings.
 
 ```bash
@@ -427,29 +436,32 @@ silent misconfigurations (placeholder values left in `.env`, DNS not propagated,
 S3 unreachable, OIDC discovery blocked) before the stack starts and starts emitting
 real traffic. Multi-region nodes should ALSO run [Step M3.5](#step-m35--pre-flight-multi-region).
 
+### 5.5.1 — Validate `.env` with `prod-preflight.sh`
+
 ```bash
+# Optional on a fresh host: seed .env and generate only the random secrets.
+./scripts/prod-preflight.sh --init-env
+
+# Edit the remaining external values by hand.
+nano .env
+
+# Load .env into the shell for validation mode.
 set -a; source .env; set +a
+
+# Validate the production env contract.
+./scripts/prod-preflight.sh
 ```
 
-### 5.5.1 — Required env vars are filled in
+The script already checks the parts that are purely environment/config driven, including:
 
-```bash
-# Fail loudly if any required var is empty or still a placeholder.
-for var in SESAMEFS_IMAGE FRONTEND_IMAGE OIDC_ISSUER OIDC_CLIENT_ID OIDC_CLIENT_SECRET \
-           OIDC_REDIRECT_URIS OIDC_JWT_SIGNING_KEY SHARE_LINK_HMAC_KEY \
-           ONLYOFFICE_JWT_SECRET ONLYOFFICE_API_JS_URL CORS_ALLOWED_ORIGINS \
-           S3_ACCESS_KEY_ID S3_SECRET_ACCESS_KEY FIRST_SUPERADMIN_EMAIL \
-           BILLING_URL ACCOUNTS_DELETE_ACCOUNT_URL; do
-  v="${!var}"
-  if [ -z "$v" ] || [[ "$v" == *"<"*">"* ]]; then
-    echo "  [FAIL] $var is unset or still a placeholder"
-  else
-    echo "  [OK]   $var"
-  fi
-done
-```
+- required image refs (`SESAMEFS_IMAGE`, `FRONTEND_IMAGE`)
+- auth and OIDC safety flags
+- share-link and OnlyOffice secrets
+- core external URLs (`BILLING_URL`, `ACCOUNTS_DELETE_ACCOUNT_URL`, optional `SERVER_URL`)
+- storage-mode consistency and required S3 env vars
+- browser-origin allowlist and related prod-only guards
 
-> Re-run after editing `.env` until every line is `[OK]`.
+Use the remaining checks below for host-level and network-level probes that the script intentionally does **not** perform.
 
 ### 5.5.2 — DNS resolves to this server
 
@@ -515,13 +527,6 @@ done
 # standalone mode on this host. If an external host nginx already owns 80/443,
 # that is expected in the default topology.
 sudo ss -ltnp | grep -E ':(80|443) ' || echo "  [OK] ports 80/443 currently unused on this host"
-```
-
-### 5.5.7 — Release images resolve
-
-```bash
-docker manifest inspect "$SESAMEFS_IMAGE" >/dev/null && echo "  [OK]   backend image exists"  || echo "  [FAIL] backend image not found"
-docker manifest inspect "$FRONTEND_IMAGE" >/dev/null && echo "  [OK]   frontend image exists" || echo "  [FAIL] frontend image not found"
 ```
 
 If every line is `[OK]`, proceed to Step 6.
