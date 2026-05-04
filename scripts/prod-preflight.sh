@@ -115,6 +115,23 @@ is_skipped() {
   return 1
 }
 
+is_placeholder_value() {
+  local val="$1"
+  case "$val" in
+    '<'*)
+      case "$val" in
+        *'>') return 0 ;;
+      esac
+      ;;
+  esac
+  return 1
+}
+
+is_valid_cassandra_identifier() {
+  local val="$1"
+  [[ "$val" =~ ^[A-Za-z][A-Za-z0-9_]*$ ]]
+}
+
 # ========================================================================
 # --init-env helpers (only used when --init-env is passed)
 # ========================================================================
@@ -199,6 +216,11 @@ maybe_generate_in_env_file() {
     printf "  %s[gen]%s   generated %s\n" "$C_GREEN" "$C_RESET" "$key" >&2
     return 0
   fi
+  if is_placeholder_value "$cur"; then
+    env_file_set "$file" "$key" "$(gen_secret)"
+    printf "  %s[gen]%s   replaced placeholder for %s\n" "$C_YELLOW" "$C_RESET" "$key" >&2
+    return 0
+  fi
   if is_known_default "$key" "$cur"; then
     env_file_set "$file" "$key" "$(gen_secret)"
     printf "  %s[gen]%s   replaced dev default for %s\n" "$C_YELLOW" "$C_RESET" "$key" >&2
@@ -231,6 +253,8 @@ do_init_env() {
   maybe_generate_in_env_file "$env_file" SHARE_LINK_HMAC_KEY
   maybe_generate_in_env_file "$env_file" ONLYOFFICE_JWT_SECRET
   maybe_generate_in_env_file "$env_file" OIDC_JWT_SIGNING_KEY
+  maybe_generate_in_env_file "$env_file" CASSANDRA_SUPERUSER_PASSWORD
+  maybe_generate_in_env_file "$env_file" CASSANDRA_PASSWORD
 
   echo >&2
   printf "%sStill required — these come from external systems, cannot be auto-generated:%s\n" "$C_BOLD" "$C_RESET" >&2
@@ -239,7 +263,7 @@ do_init_env() {
   needs_manual() {
     local key="$1" note="$2"
     local cur; cur="$(env_file_get "$env_file" "$key")"
-    if [ -z "$cur" ]; then
+    if [ -z "$cur" ] || is_placeholder_value "$cur"; then
       printf "  %s[MISSING]%s %s — %s\n" "$C_RED" "$C_RESET" "$key" "$note" >&2
       missing=$((missing+1))
     else
@@ -257,6 +281,9 @@ do_init_env() {
   needs_manual OIDC_REDIRECT_URIS            "comma-separated OIDC callback allow-list covering every production login domain"
   needs_manual CORS_ALLOWED_ORIGINS          "comma-separated browser origins covering every production web domain"
   needs_manual ONLYOFFICE_API_JS_URL         "the public OnlyOffice API JS URL"
+  needs_manual CASSANDRA_DATA_DIR            "host bind-mount path for Cassandra data"
+  needs_manual ONLYOFFICE_DATA_DIR           "host bind-mount path for OnlyOffice persistent data"
+  needs_manual ONLYOFFICE_LOGS_DIR           "host bind-mount path for OnlyOffice logs"
   needs_manual S3_ACCESS_KEY_ID              "from your S3 provider or object-storage IAM/API user"
   needs_manual S3_SECRET_ACCESS_KEY          "from your S3 provider or object-storage IAM/API user"
 
@@ -376,6 +403,10 @@ check_share_link_hmac_key() {
     fail "  Fix:  rotate to a fresh random value"
     return
   fi
+  if is_placeholder_value "$SHARE_LINK_HMAC_KEY"; then
+    fail "SHARE_LINK_HMAC_KEY is still a template placeholder."
+    return
+  fi
   if ! min_len SHARE_LINK_HMAC_KEY 32; then
     fail "SHARE_LINK_HMAC_KEY is shorter than 32 characters (got ${#SHARE_LINK_HMAC_KEY})."
     return
@@ -431,6 +462,9 @@ check_oidc() {
   if is_set OIDC_JWT_SIGNING_KEY && ! min_len OIDC_JWT_SIGNING_KEY 32; then
     fail "OIDC_JWT_SIGNING_KEY is shorter than 32 characters (got ${#OIDC_JWT_SIGNING_KEY})."
   fi
+  if is_set OIDC_JWT_SIGNING_KEY && is_placeholder_value "$OIDC_JWT_SIGNING_KEY"; then
+    fail "OIDC_JWT_SIGNING_KEY is still a template placeholder."
+  fi
 
   if is_false_or_unset OIDC_REQUIRE_PKCE; then
     warn "OIDC_REQUIRE_PKCE is not true. PKCE should be required for browser login flows."
@@ -462,6 +496,8 @@ check_onlyoffice() {
     fail "ONLYOFFICE_JWT_SECRET is still the documented dev default ('change-me-...')."
     fail "  Risk: the OnlyOffice editor callback can be forged by any attacker."
     fail "  Fix:  rotate to a fresh random value of at least 32 chars"
+  elif is_placeholder_value "$ONLYOFFICE_JWT_SECRET"; then
+    fail "ONLYOFFICE_JWT_SECRET is still a template placeholder."
   elif ! min_len ONLYOFFICE_JWT_SECRET 32; then
     fail "ONLYOFFICE_JWT_SECRET is shorter than 32 characters (got ${#ONLYOFFICE_JWT_SECRET})."
   else
@@ -473,6 +509,18 @@ check_onlyoffice() {
 	return
   fi
 	pass "ONLYOFFICE_API_JS_URL is set"
+
+  if ! is_set ONLYOFFICE_DATA_DIR; then
+	fail "ONLYOFFICE_DATA_DIR is unset. Production compose uses a bind mount for OnlyOffice persistent data."
+	return
+  fi
+	pass "ONLYOFFICE_DATA_DIR is set"
+
+  if ! is_set ONLYOFFICE_LOGS_DIR; then
+	fail "ONLYOFFICE_LOGS_DIR is unset. Production compose uses a bind mount for OnlyOffice logs."
+	return
+  fi
+	pass "ONLYOFFICE_LOGS_DIR is set"
 
   if is_set ONLYOFFICE_API_JS_URL && [[ "$ONLYOFFICE_API_JS_URL" == http://* ]]; then
     warn "ONLYOFFICE_API_JS_URL uses http:// — browsers will likely block mixed content on an HTTPS site."
@@ -605,16 +653,54 @@ check_database() {
     pass "CASSANDRA_HOSTS is set"
   fi
 
+  if ! is_set CASSANDRA_DATA_DIR; then
+    fail "CASSANDRA_DATA_DIR is unset. Production compose uses a bind mount for Cassandra data."
+  else
+    pass "CASSANDRA_DATA_DIR is set"
+  fi
+
+  if ! is_set CASSANDRA_SUPERUSER_PASSWORD; then
+    fail "CASSANDRA_SUPERUSER_PASSWORD is unset. Required to rotate the default Cassandra superuser password during bootstrap."
+  elif is_placeholder_value "$CASSANDRA_SUPERUSER_PASSWORD"; then
+    fail "CASSANDRA_SUPERUSER_PASSWORD is still a template placeholder."
+  elif [ "$CASSANDRA_SUPERUSER_PASSWORD" = "cassandra" ]; then
+    fail "CASSANDRA_SUPERUSER_PASSWORD must not be the default 'cassandra'."
+  else
+    pass "CASSANDRA_SUPERUSER_PASSWORD is set"
+  fi
+
+  if is_set CASSANDRA_SUPERUSER_USERNAME && [ "$CASSANDRA_SUPERUSER_USERNAME" != "cassandra" ]; then
+    fail "CASSANDRA_SUPERUSER_USERNAME must remain 'cassandra'. The bootstrap rotates the built-in Cassandra superuser rather than creating an alternate admin role."
+  fi
+
+  local cassandra_keyspace="${CASSANDRA_KEYSPACE:-sesamefs}"
+  if ! is_valid_cassandra_identifier "$cassandra_keyspace"; then
+    fail "CASSANDRA_KEYSPACE must be a valid unquoted Cassandra identifier (letters, digits, underscores; must start with a letter)."
+  fi
+
   if ! is_set CASSANDRA_USERNAME; then
-    warn "CASSANDRA_USERNAME is unset. Only acceptable if Cassandra is on a trusted private network."
+    fail "CASSANDRA_USERNAME is unset. Production compose bootstraps a dedicated SesameFS Cassandra role."
+  elif is_placeholder_value "$CASSANDRA_USERNAME"; then
+    fail "CASSANDRA_USERNAME is still a template placeholder."
+  elif ! is_valid_cassandra_identifier "$CASSANDRA_USERNAME"; then
+    fail "CASSANDRA_USERNAME must be a valid unquoted Cassandra role identifier (letters, digits, underscores; must start with a letter)."
   else
     pass "CASSANDRA_USERNAME is set"
   fi
 
   if ! is_set CASSANDRA_PASSWORD; then
-    warn "CASSANDRA_PASSWORD is unset. Only acceptable if Cassandra is on a trusted private network."
+    fail "CASSANDRA_PASSWORD is unset. Production compose bootstraps a dedicated SesameFS Cassandra role."
+  elif is_placeholder_value "$CASSANDRA_PASSWORD"; then
+    fail "CASSANDRA_PASSWORD is still a template placeholder."
+  elif [ "$CASSANDRA_PASSWORD" = "cassandra" ]; then
+    fail "CASSANDRA_PASSWORD must not be the default 'cassandra'."
   else
     pass "CASSANDRA_PASSWORD is set"
+  fi
+
+  if is_set CASSANDRA_SUPERUSER_USERNAME && is_set CASSANDRA_USERNAME \
+     && [ "$CASSANDRA_SUPERUSER_USERNAME" = "$CASSANDRA_USERNAME" ]; then
+    warn "CASSANDRA_USERNAME matches CASSANDRA_SUPERUSER_USERNAME. Prefer a dedicated non-superuser app role."
   fi
 }
 

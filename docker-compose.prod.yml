@@ -7,6 +7,9 @@
 #   3. Get SSL certs for your public SesameFS and OnlyOffice hostnames
 #   4. docker compose -f docker-compose.prod.yml up -d
 #
+# Optional alternate env file:
+#   ENV_FILE=.env.prod docker compose --env-file .env.prod -f docker-compose.prod.yml up -d
+#
 # All secrets come from .env — never hardcode values here.
 # =============================================================================
 
@@ -23,10 +26,12 @@ services:
       - sfs-net
       - internal
     env_file:
-      - .env                        # All secrets from .env
+      - ${ENV_FILE:-.env}           # All secrets from the selected env file
     environment:
       - STORAGE_MODE=${STORAGE_MODE:-multi}
+      - OIDC_ENABLED=${OIDC_ENABLED:-true}
       - OIDC_REDIRECT_URIS=${OIDC_REDIRECT_URIS}
+      - ONLYOFFICE_ENABLED=${ONLYOFFICE_ENABLED:-true}
       - ONLYOFFICE_API_JS_URL=${ONLYOFFICE_API_JS_URL}
       - ONLYOFFICE_JWT_SECRET=${ONLYOFFICE_JWT_SECRET}
       - FRONTEND_URL=${FRONTEND_URL:-http://frontend:80}
@@ -45,8 +50,6 @@ services:
 
       # Force production mode (overrides any accidental dev values in .env)
       - AUTH_DEV_MODE=false
-      - OIDC_ENABLED=true
-      - ONLYOFFICE_ENABLED=true
       - METRICS_ENABLED=true
       - SHARE_LINK_HMAC_KEY=${SHARE_LINK_HMAC_KEY}
     volumes:
@@ -56,6 +59,8 @@ services:
     depends_on:
       cassandra:
         condition: service_healthy
+      cassandra-bootstrap:
+        condition: service_completed_successfully
     restart: unless-stopped
     logging:
       driver: json-file
@@ -83,8 +88,11 @@ services:
       - "${CASSANDRA_BIND_IP:-127.0.0.1}:9042:9042"    # CQL native
     networks:
       - internal
+    entrypoint:
+      - /bin/bash
+      - -ec
     env_file:
-      - .env                        # Multi-region vars (CASSANDRA_SEEDS, etc.) come from here
+      - ${ENV_FILE:-.env}           # Multi-region vars (CASSANDRA_SEEDS, etc.) come from the selected env file
     environment:
       # Always-required settings (with sensible defaults)
       - CASSANDRA_CLUSTER_NAME=${CASSANDRA_CLUSTER_NAME}
@@ -98,10 +106,17 @@ services:
       # via env_file above. Do NOT set CASSANDRA_LISTEN_ADDRESS (auto-detect).
       # When commented out in .env → not set → Cassandra uses its defaults.
       # When uncommented in .env → passed to container → multi-region works.
+    command:
+      - |
+        sed -ri 's/^authenticator:.*/authenticator: PasswordAuthenticator/' /etc/cassandra/cassandra.yaml
+        sed -ri 's/^authorizer:.*/authorizer: CassandraAuthorizer/' /etc/cassandra/cassandra.yaml
+        exec docker-entrypoint.sh cassandra -f
     volumes:
-      - cassandra_data:/var/lib/cassandra
+      - ${CASSANDRA_DATA_DIR:?set CASSANDRA_DATA_DIR in .env}:/var/lib/cassandra
     healthcheck:
-      test: ["CMD", "cqlsh", "-e", "describe keyspaces"]
+      test:
+        - CMD-SHELL
+        - cqlsh -u cassandra -p "$${CASSANDRA_SUPERUSER_PASSWORD:-cassandra}" -e "describe keyspaces" || cqlsh -u cassandra -p cassandra -e "describe keyspaces"
       interval: 30s
       timeout: 10s
       retries: 10
@@ -112,6 +127,74 @@ services:
       options:
         max-size: "100m"
         max-file: "3"
+
+  # ---------------------------------------------------------------------------
+  # Cassandra bootstrap (auth + app role + keyspace)
+  # ---------------------------------------------------------------------------
+  cassandra-bootstrap:
+    image: cassandra:5.0
+    networks:
+      - internal
+    env_file:
+      - ${ENV_FILE:-.env}
+    depends_on:
+      cassandra:
+        condition: service_healthy
+    entrypoint:
+      - /bin/bash
+      - -ec
+    command:
+      - |
+        set -euo pipefail
+        admin_pass="$${CASSANDRA_SUPERUSER_PASSWORD:?set CASSANDRA_SUPERUSER_PASSWORD in .env}"
+        app_user="$${CASSANDRA_USERNAME:?set CASSANDRA_USERNAME in .env}"
+        app_pass="$${CASSANDRA_PASSWORD:?set CASSANDRA_PASSWORD in .env}"
+        keyspace="$${CASSANDRA_KEYSPACE:-sesamefs}"
+        admin_pass_escaped="$${admin_pass//\'/\'\'}"
+        app_pass_escaped="$${app_pass//\'/\'\'}"
+        attempts=0
+        admin_rotated=0
+
+        case "$${keyspace}" in
+          [A-Za-z][A-Za-z0-9_]*) ;;
+          *) echo "Invalid Cassandra keyspace identifier: $${keyspace}" >&2; exit 1 ;;
+        esac
+        case "$${app_user}" in
+          [A-Za-z][A-Za-z0-9_]*) ;;
+          *) echo "Invalid Cassandra role identifier: $${app_user}" >&2; exit 1 ;;
+        esac
+
+        until cqlsh cassandra -u cassandra -p "$${admin_pass}" -e "DESCRIBE KEYSPACES" >/dev/null 2>&1; do
+          if cqlsh cassandra -u cassandra -p cassandra -e "DESCRIBE KEYSPACES" >/dev/null 2>&1; then
+            if [ "$${admin_rotated}" -eq 0 ]; then
+              cqlsh cassandra -u cassandra -p cassandra -e "ALTER ROLE cassandra WITH PASSWORD = '$${admin_pass_escaped}' AND LOGIN = true;"
+              admin_rotated=1
+            fi
+
+            echo "Waiting for Cassandra superuser password rotation to settle..." >&2
+            sleep 5
+            continue
+          fi
+
+          attempts=$$((attempts + 1))
+          if [ "$${attempts}" -ge 30 ]; then
+            echo "Timed out waiting for Cassandra superuser bootstrap" >&2
+            exit 1
+          fi
+
+          echo "Waiting for Cassandra auth tables to finish initializing..." >&2
+          sleep 2
+        done
+
+        cqlsh cassandra -u cassandra -p "$${admin_pass}" <<EOF
+        CREATE KEYSPACE IF NOT EXISTS $${keyspace} WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1};
+        CREATE ROLE IF NOT EXISTS $${app_user} WITH PASSWORD = '$${app_pass_escaped}' AND LOGIN = true;
+        GRANT ALL PERMISSIONS ON KEYSPACE $${keyspace} TO $${app_user};
+        EOF
+
+        sleep 5
+        cqlsh cassandra -u cassandra -p "$${admin_pass}" -e "ALTER ROLE $${app_user} WITH PASSWORD = '$${app_pass_escaped}' AND LOGIN = true;"
+    restart: "no"
 
   # ---------------------------------------------------------------------------
   # OnlyOffice Document Server
@@ -129,8 +212,8 @@ services:
       - JWT_HEADER=Authorization
       - JWT_IN_BODY=true
     volumes:
-      - onlyoffice_data:/var/www/onlyoffice/Data
-      - onlyoffice_logs:/var/log/onlyoffice
+      - ${ONLYOFFICE_DATA_DIR:?set ONLYOFFICE_DATA_DIR in .env}:/var/www/onlyoffice/Data
+      - ${ONLYOFFICE_LOGS_DIR:?set ONLYOFFICE_LOGS_DIR in .env}:/var/log/onlyoffice
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost/healthcheck"]
       interval: 30s
@@ -143,33 +226,6 @@ services:
       options:
         max-size: "100m"
         max-file: "3"
-
-  # ---------------------------------------------------------------------------
-  # Nginx Reverse Proxy (SSL termination) — OPTIONAL
-  # ---------------------------------------------------------------------------
-  # Uncomment if you want nginx bundled in this stack (standalone deploy).
-  # If you have an existing nginx proxy (e.g. shared across multiple services),
-  # leave this commented and connect it to sfs-net instead.
-  # See nginx/nginx.conf.template for the proxy config.
-  #
-  # nginx:
-  #   image: nginx:stable-alpine
-  #   ports:
-  #     - "80:80"
-  #     - "443:443"
-  #   networks:
-  #     - sfs-net
-  #   environment:
-  #     - DOMAIN=${DOMAIN}
-  #     - OFFICE_DOMAIN=${OFFICE_DOMAIN}
-  #   volumes:
-  #     - ./nginx/nginx.conf.template:/etc/nginx/templates/default.conf.template:ro
-  #     - /etc/letsencrypt:/etc/letsencrypt:ro
-  #   depends_on:
-  #     - sesamefs
-  #     - frontend
-  #     - onlyoffice
-  #   restart: unless-stopped
 
   # ---------------------------------------------------------------------------
   # Desktop Frontend (React SPA — served by nginx:alpine)
@@ -198,8 +254,6 @@ services:
   #     - "80"
   #   networks:
   #     - sfs-net
-  #   environment:
-  #     - API_URL=https://${DOMAIN}
   #   depends_on:
   #     - sesamefs
   #   restart: unless-stopped
@@ -216,8 +270,3 @@ networks:
     # Not marked 'internal: true' — Cassandra needs outbound routing for
     # multi-region gossip. Security is enforced by binding ports only to
     # CASSANDRA_BIND_IP (private IP), never 0.0.0.0.
-
-volumes:
-  cassandra_data:
-  onlyoffice_data:
-  onlyoffice_logs:

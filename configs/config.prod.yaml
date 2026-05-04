@@ -38,7 +38,7 @@ server:
   url: ""                      # Optional explicit public base URL; usually leave empty and let SesameFS derive it from request/proxy headers
   desktop_custom_brand: ""     # Optional desktop-client brand label override
   desktop_custom_logo: ""      # Optional desktop-client logo URL override
-  region: ""                   # Set via SERVER_REGION in multi-region; used as node-local default for the shared global DOMAIN
+  region: ""                   # Set via SERVER_REGION in multi-region; used as the node-local default when host-based routing does not pick a region
   mobile_frontend_path: "./mobile-frontend/dist" # Built mobile frontend directory
 
 # =============================================================================
@@ -64,7 +64,7 @@ database:
 #   - set SERVER_REGION per node (na/eu/asia)
 #   - keep regions/failover chains in storage.classes below
 #   - set per-class buckets via S3_CLASS_<CLASS>_BUCKET env vars
-#   - region_classes take precedence over default_class for shared-domain routing
+#   - region_classes take precedence over default_class when a request hostname maps to a specific region
 #
 # Credentials can come from either:
 #   - class-specific env vars: S3_CLASS_<CLASS>_ACCESS_KEY_ID / SECRET_ACCESS_KEY
@@ -107,7 +107,7 @@ storage:
 
   endpoint_regions: {}
     # Keep explicit hostname rules only for special cases. In the standard
-    # global-domain topology, SERVER_REGION decides the node-local default.
+    # per-region hostname topology, SERVER_REGION decides the node-local default.
 
   region_classes:
     na:
@@ -284,7 +284,7 @@ gc:
 
 # =============================================================================
 # CORS
-# Set your production domain(s) via env var:
+# Set your production browser origin allow-list via env var:
 #   CORS_ALLOWED_ORIGINS=https://sfs.example.com,https://app.example.com
 # Wildcard "*" is rejected in production mode.
 # =============================================================================

@@ -677,7 +677,7 @@ libcurl failed to GET http://localhost:8082/protocol-version: Couldn't connect t
 **Root Causes** (4 bugs):
 
 1. **`docker-compose.yaml` — default `SERVER_URL=http://localhost:3000`** (deployment bug):
-   The dev docker-compose had `SERVER_URL=${SERVER_URL:-http://localhost:3000}`. When `SERVER_URL` was not set in `.env`, the container received `SERVER_URL=http://localhost:3000`. Since this env var is non-empty, `getEffectiveHostname()` processed it and extracted `relay_addr=localhost`. Fixed by changing to `SERVER_URL=${SERVER_URL}` (no fallback), so the container gets an empty var and auto-detection works via `c.Request.Host`. Production `docker-compose.prod.yml` was already correct (`SERVER_URL=https://${DOMAIN}`).
+   The dev docker-compose had `SERVER_URL=${SERVER_URL:-http://localhost:3000}`. When `SERVER_URL` was not set in `.env`, the container received `SERVER_URL=http://localhost:3000`. Since this env var is non-empty, `getEffectiveHostname()` processed it and extracted `relay_addr=localhost`. Fixed by changing to `SERVER_URL=${SERVER_URL}` (no fallback), so the container gets an empty var and auto-detection works via `c.Request.Host`. Production now follows the same host-derivation model unless you intentionally force a canonical public URL.
 
 2. **`v2/libraries.go` — hardcoded `"localhost"`** (most impactful):
    `CreateLibrary` (POST /api2/repos/) returned `"relay_addr": "localhost"` and `"relay_id": "localhost"` unconditionally. The Seafile client **caches** this value when a library is first added. All subsequent sync operations targeting that library use the cached address — which was `localhost`. Even after restarting or re-logging, the client retries `localhost` until the library is removed and re-added.

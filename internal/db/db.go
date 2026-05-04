@@ -25,9 +25,16 @@ func New(cfg config.DatabaseConfig) (*DB, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to Cassandra: %w", err)
 	}
-	if err := bootstrapSession.Query(createKeyspaceCQL(cfg.Keyspace)).Exec(); err != nil {
+	keyspaceExists, err := keyspaceExists(bootstrapSession, cfg.Keyspace)
+	if err != nil {
 		bootstrapSession.Close()
-		return nil, fmt.Errorf("failed to create keyspace: %w", err)
+		return nil, fmt.Errorf("failed to inspect Cassandra keyspace %s: %w", cfg.Keyspace, err)
+	}
+	if !keyspaceExists {
+		if err := bootstrapSession.Query(createKeyspaceCQL(cfg.Keyspace)).Exec(); err != nil {
+			bootstrapSession.Close()
+			return nil, fmt.Errorf("failed to create missing keyspace %s: %w", cfg.Keyspace, err)
+		}
 	}
 	bootstrapSession.Close()
 
@@ -40,6 +47,21 @@ func New(cfg config.DatabaseConfig) (*DB, error) {
 	}
 
 	return &DB{session: session, config: cfg}, nil
+}
+
+func keyspaceExists(session *gocql.Session, keyspace string) (bool, error) {
+	var existing string
+	err := session.Query(
+		`SELECT keyspace_name FROM system_schema.keyspaces WHERE keyspace_name = ? LIMIT 1`,
+		keyspace,
+	).Consistency(gocql.One).Scan(&existing)
+	if err == gocql.ErrNotFound {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return existing == keyspace, nil
 }
 
 // newCluster creates a gocql ClusterConfig from our config (without keyspace).

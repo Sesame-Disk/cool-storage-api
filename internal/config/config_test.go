@@ -7,7 +7,53 @@ import (
 	"testing"
 )
 
+// clearLoadEnvOverrides blanks out the env vars that Load()/applyEnvOverrides
+// consult, so a test running inside a container or shell with .env exported
+// (CASSANDRA_HOSTS, PORT, etc.) does not see those values override the YAML
+// fixture under test. applyEnvOverrides treats "" as unset because every
+// branch is gated on `v != ""`.
+func clearLoadEnvOverrides(t *testing.T) {
+	t.Helper()
+	for _, k := range []string{
+		"PORT", "SERVER_PORT", "SERVER_TRUSTED_PROXIES", "SERVER_REGION",
+		"SERVER_URL", "DESKTOP_CUSTOM_BRAND", "DESKTOP_CUSTOM_LOGO",
+		"CORS_ALLOWED_ORIGINS",
+		"CASSANDRA_HOSTS", "CASSANDRA_KEYSPACE", "CASSANDRA_USERNAME",
+		"CASSANDRA_PASSWORD", "CASSANDRA_LOCAL_DC",
+		"STORAGE_MODE", "S3_BUCKET", "S3_REGION", "S3_ENDPOINT",
+		"S3_SERVER_SIDE_ENCRYPTION", "S3_SSE_KMS_KEY_ID",
+		"S3_ACCESS_KEY_ID", "S3_SECRET_ACCESS_KEY",
+		"BILLING_URL", "ACCOUNTS_DELETE_ACCOUNT_URL",
+		"ACCOUNTS_ORG_USER_MANAGEMENT_URL", "ACCOUNTS_DISABLE_ORG_USER_WRITES",
+		"AUTH_DEV_MODE", "FIRST_SUPERADMIN_EMAIL", "SHARE_LINK_HMAC_KEY",
+		"SEAFHTTP_TOKEN_TTL", "SEAFHTTP_ZIP_MAX_ENTRIES",
+		"SEAFHTTP_ZIP_MAX_DEPTH", "SEAFHTTP_ZIP_MAX_BYTES",
+	} {
+		t.Setenv(k, "")
+	}
+
+	for _, prefix := range []string{
+		"OIDC_",
+		"ONLYOFFICE_",
+		"ELASTICSEARCH_",
+		"METRICS_",
+		"HEALTH_",
+		"FILEVIEW_",
+		"GC_",
+		"S3_CLASS_",
+	} {
+		for _, entry := range os.Environ() {
+			key, _, ok := strings.Cut(entry, "=")
+			if ok && strings.HasPrefix(key, prefix) {
+				t.Setenv(key, "")
+			}
+		}
+	}
+}
+
 func TestLoad(t *testing.T) {
+	clearLoadEnvOverrides(t)
+
 	// Create a temporary config file
 	tempDir := t.TempDir()
 	configPath := filepath.Join(tempDir, "config.yaml")
@@ -46,9 +92,7 @@ versioning:
 		t.Fatalf("Failed to write test config: %v", err)
 	}
 
-	// Set CONFIG_PATH environment variable
-	os.Setenv("CONFIG_PATH", configPath)
-	defer os.Unsetenv("CONFIG_PATH")
+	t.Setenv("CONFIG_PATH", configPath)
 
 	cfg, err := Load()
 	if err != nil {
@@ -97,6 +141,8 @@ versioning:
 }
 
 func TestLoadWithEnvOverrides(t *testing.T) {
+	clearLoadEnvOverrides(t)
+
 	// Create a minimal config file
 	tempDir := t.TempDir()
 	configPath := filepath.Join(tempDir, "config.yaml")
@@ -130,15 +176,9 @@ versioning:
 		t.Fatalf("Failed to write test config: %v", err)
 	}
 
-	// Set environment variables
-	os.Setenv("CONFIG_PATH", configPath)
-	os.Setenv("SERVER_PORT", ":9999")
-	os.Setenv("AUTH_DEV_MODE", "true")
-	defer func() {
-		os.Unsetenv("CONFIG_PATH")
-		os.Unsetenv("SERVER_PORT")
-		os.Unsetenv("AUTH_DEV_MODE")
-	}()
+	t.Setenv("CONFIG_PATH", configPath)
+	t.Setenv("SERVER_PORT", ":9999")
+	t.Setenv("AUTH_DEV_MODE", "true")
 
 	cfg, err := Load()
 	if err != nil {

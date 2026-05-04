@@ -58,9 +58,9 @@ run inside a minimal alpine image or on any CI runner.
 
 **Option A — manual run before `compose up`:**
 
-The repo ships [`.env.example`](../.env.example) as a template and the
-preflight can bootstrap `.env` for you, generating every random secret
-inline:
+The repo ships [`.env.prod.example`](../.env.prod.example) as the production
+template and the preflight can bootstrap `.env` for you, generating every
+auto-generatable secret inline:
 
 ```bash
 # Step 1: create .env and fill every auto-generatable secret
@@ -68,14 +68,13 @@ inline:
 
 # Step 2: edit .env to fill in the values the script CANNOT generate —
 # OIDC_CLIENT_ID / OIDC_CLIENT_SECRET (from your IdP),
-# S3_ACCESS_KEY_ID / S3_SECRET_ACCESS_KEY (from your S3 provider),
-# CASSANDRA_USERNAME / CASSANDRA_PASSWORD (from your Cassandra admin).
+# S3_ACCESS_KEY_ID / S3_SECRET_ACCESS_KEY (from your S3 provider).
 $EDITOR .env
 
 # Step 3: export into the current shell, validate, launch
 set -a; source .env; set +a
 ./scripts/prod-preflight.sh
-docker compose up -d
+docker compose -f docker-compose.prod.yml up -d
 ```
 
 `--init-env` is **idempotent and non-destructive**: it never overwrites a
@@ -90,28 +89,24 @@ Auto-generated secrets:
 | `SHARE_LINK_HMAC_KEY` | `openssl rand -hex 32` (or `/dev/urandom`) | — |
 | `ONLYOFFICE_JWT_SECRET` | same | — |
 | `OIDC_JWT_SIGNING_KEY` | same | — |
+| `CASSANDRA_SUPERUSER_PASSWORD` | same | — |
+| `CASSANDRA_PASSWORD` | same | `CASSANDRA_USERNAME` already defaults to `sesamefs_app` |
 | `S3_ACCESS_KEY_ID/SECRET` | **NOT generated** | must come from your S3 provider |
 | `OIDC_CLIENT_ID/SECRET` | **NOT generated** | must come from your IdP |
-| `CASSANDRA_USERNAME/PASSWORD` | **NOT generated** | must match the Cassandra side |
 
-**Option B — wired into docker-compose (recommended for prod):**
-The main `docker-compose.yaml` defines a `preflight` service under the
-`prod` compose profile, and `docker-compose.prod-gate.yaml` adds a
-`depends_on: preflight: service_completed_successfully` to sesamefs. To
-launch production:
+**Option B — alternate env file / CI wrapper:**
+The current prod path does not ship a compose-enforced `preflight` service.
+If you keep prod values in a non-default env file (for example `.env.prod`),
+run the same gate explicitly before launch:
+
 ```bash
-docker compose \
-  -f docker-compose.yaml \
-  -f docker-compose.prod-gate.yaml \
-  --profile prod \
-  up -d
+./scripts/prod-preflight.sh --init-env
+$EDITOR .env.prod
+set -a; source .env.prod; set +a
+./scripts/prod-preflight.sh
+ENV_FILE=.env.prod docker compose --env-file .env.prod -f docker-compose.prod.yml up -d
 ```
-Compose will block sesamefs from starting until the preflight exits 0. If the
-preflight fails, the whole `up` fails and the findings are printed in the
-compose log.
-
-Dev users doing `docker compose up` without the `prod` profile are
-unaffected — the preflight simply isn't part of the graph they run.
+In CI, the same script can run as a standalone gate before any deploy step.
 
 The preflight neutralizes these classes of problem so they do not appear in
 [Code vulnerabilities](#code-vulnerabilities) below:
@@ -860,7 +855,7 @@ Exploit-script filenames still use the prefix from an earlier numbering (`c1-oid
 
 ## Follow-up on the preflight gate
 
-The [preflight section at the top](#production-prerequisites--the-preflight-gate) covers the implementation that shipped with this assessment (bash script at `scripts/prod-preflight.sh`, `.env`-bootstrap via `--init-env`, wired into `docker-compose.yaml` under the `prod` profile, made mandatory via `docker-compose.prod-gate.yaml`). Two things are worth noting for the next iteration:
+The [preflight section at the top](#production-prerequisites--the-preflight-gate) covers the implementation that shipped with this assessment: a bash gate at `scripts/prod-preflight.sh` plus `.env` bootstrap via `--init-env`, run explicitly before `docker compose -f docker-compose.prod.yml up -d`. Two things are worth noting for the next iteration:
 
 1. **Port the preflight into the Go binary.** The bash implementation is a great first step and is enforced by compose, but a deployment that bypasses compose (systemd unit, bare `sesamefs serve`, k8s Deployment with the Go binary) can skip it. Add a `ValidateProductionReadiness()` pass in `internal/config/config.go` that runs when `SESAMEFS_ENV=production` or when the listener is bound to a non-loopback address. It can re-use the same rules as the bash script — the bash version becomes the portable CI check, the Go version becomes the runtime fail-closed gate.
 2. **Catch the `CORS allowed_origins: ["*"]` case.** The current script reads env vars only, so it cannot detect the CORS wildcard that lives inside `configs/config.prod.yaml`. The Go-side version naturally can. In the meantime, the `SKIP=config`-disabled check in the bash script already greps the mounted config file for `- "*"` under `allowed_origins` and warns — operators should leave `SKIP` unset (or at least not include `config`) when running in prod.
