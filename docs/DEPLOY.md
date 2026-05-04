@@ -385,16 +385,31 @@ Before the first launch, create the host directories used by the bind mounts:
 mkdir -p "$CASSANDRA_DATA_DIR" "$ONLYOFFICE_DATA_DIR" "$ONLYOFFICE_LOGS_DIR"
 ```
 
-`docker-compose.prod.yml` now brings Cassandra up with auth enabled, runs a
-one-shot `cassandra-bootstrap` helper, rotates the built-in `cassandra`
-superuser password to `CASSANDRA_SUPERUSER_PASSWORD` on first boot, creates or
-updates the `CASSANDRA_USERNAME` app role, and creates `CASSANDRA_KEYSPACE` if
-it is missing.
+`docker-compose.prod.yml` now brings Cassandra up with auth enabled, but the
+administrative bootstrap is explicit. A normal production app deploy does not
+run `cassandra-bootstrap` automatically and does not modify Cassandra auth,
+roles, keyspaces, or replication as a side effect.
 
-SesameFS still keeps a code-level `CREATE KEYSPACE IF NOT EXISTS` safety net,
-but it now checks whether the keyspace already exists first. That lets the app
-run with a non-superuser Cassandra role after bootstrap instead of needing
-global `CREATE KEYSPACE` permission on every restart.
+Run the phases in this order:
+
+```bash
+# Phase 1: bring up the local Cassandra node first.
+docker compose -f docker-compose.prod.yml up -d cassandra
+
+# Phase 2: once the multi-DC cluster is formed and healthy, run bootstrap once
+# from the designated admin node only.
+docker compose -f docker-compose.prod.yml --profile bootstrap up cassandra-bootstrap
+
+# Phase 3: start the application services normally.
+docker compose -f docker-compose.prod.yml up -d sesamefs frontend
+```
+
+The bootstrap step rotates the built-in `cassandra` superuser password to
+`CASSANDRA_SUPERUSER_PASSWORD` on first boot, creates or updates the
+`CASSANDRA_USERNAME` app role, and creates or converges `CASSANDRA_KEYSPACE`.
+
+If the keyspace is missing, the backend now fails fast with a clear error
+instead of attempting `CREATE KEYSPACE` through the restricted app role.
 
 > Production compose uses published images, not local `build:` steps.
 >
@@ -571,16 +586,23 @@ docker network inspect sfs-net >/dev/null 2>&1 || docker network create sfs-net
 # Pull the release images referenced in SESAMEFS_IMAGE / FRONTEND_IMAGE
 docker compose -f docker-compose.prod.yml pull
 
-# Start the production stack
-docker compose -f docker-compose.prod.yml up -d
+# Phase 1: start the local Cassandra node first
+docker compose -f docker-compose.prod.yml up -d cassandra
+
+# Phase 2: from the designated admin node only, run the one-shot Cassandra bootstrap
+docker compose -f docker-compose.prod.yml --profile bootstrap up cassandra-bootstrap
+
+# Phase 3: start the normal app services
+docker compose -f docker-compose.prod.yml up -d sesamefs frontend onlyoffice
 
 # Watch logs during startup
 docker compose -f docker-compose.prod.yml logs -f
 ```
 
 Cassandra takes ~60–90 seconds to become healthy on first boot.
-The one-shot `cassandra-bootstrap` helper runs after Cassandra is healthy, and
-sesamefs starts only after the Cassandra role/keyspace bootstrap completes.
+Do not start SesameFS before the explicit bootstrap step has completed at least
+once for the cluster, or the backend will fail fast because the keyspace does
+not exist yet.
 
 ---
 
@@ -1239,74 +1261,92 @@ If every line is `[OK]`, proceed to Step M4.
 
 ### Step M4 — Deploy order
 
-1. **Start the first seed node** (e.g., VPS NA):
-   ```bash
-   docker compose -f docker-compose.prod.yml up -d cassandra cassandra-bootstrap
-   # Wait for it to be healthy (~90s)
-   docker compose -f docker-compose.prod.yml logs -f cassandra
-   ```
+1. **Declare Cassandra replication in `.env` before first boot** on every node:
 
-2. **Start the second node** (e.g., VPS EU):
-   ```bash
-   docker compose -f docker-compose.prod.yml up -d cassandra cassandra-bootstrap
-   # Wait for it to join the cluster
-   ```
+  ```bash
+  # The project default is NetworkTopologyStrategy.
+  # Single-region remains compatible as a one-DC topology:
+  CASSANDRA_REPLICATION_CLASS=NetworkTopologyStrategy
+  CASSANDRA_REPLICATION_DCS=dc-na:1
 
-3. **Verify cluster status** (from any node):
-   ```bash
-   docker compose -f docker-compose.prod.yml exec cassandra nodetool status
-   # Should show both nodes as UN (Up/Normal) in their respective DCs
-   ```
+  # On every multi-region node, expand that topology before `docker compose up`:
+  CASSANDRA_REPLICATION_CLASS=NetworkTopologyStrategy
+  CASSANDRA_REPLICATION_DCS=dc-na:1,dc-eu:1
 
-4. **Declare Cassandra replication in `.env` before first boot** on every node:
-   ```bash
-   # The project default is NetworkTopologyStrategy.
-   # Single-region remains compatible as a one-DC topology:
-   CASSANDRA_REPLICATION_CLASS=NetworkTopologyStrategy
-   CASSANDRA_REPLICATION_DCS=dc-na:1
+  # Or for 3 regions:
+  CASSANDRA_REPLICATION_CLASS=NetworkTopologyStrategy
+  CASSANDRA_REPLICATION_DCS=dc-na:1,dc-eu:1,dc-asia:1
+  ```
 
-   # On every multi-region node, expand that topology before `docker compose up`:
-   CASSANDRA_REPLICATION_CLASS=NetworkTopologyStrategy
-   CASSANDRA_REPLICATION_DCS=dc-na:1,dc-eu:1
+  > **This is required in multi-region mode.** The bootstrap service applies
+  > the declared replication policy to both the SesameFS keyspace and
+  > `system_auth`, and it reapplies that policy on each explicit bootstrap run.
+  > Treat `.env` as the source of truth for Cassandra replication.
+  >
+  > `CASSANDRA_REPLICATION_FACTOR` is only used if you deliberately opt back
+  > into `CASSANDRA_REPLICATION_CLASS=SimpleStrategy` for legacy compatibility.
+  > In the default `NetworkTopologyStrategy` flow, it is ignored.
+  >
+  > `RF=1` per DC means each DC has exactly one copy — no in-region HA. For
+  > intra-region high availability, deploy multiple Cassandra nodes per DC and
+  > raise the per-DC RF (e.g. `'dc-na': 3`).
 
-   # Or for 3 regions:
-   CASSANDRA_REPLICATION_CLASS=NetworkTopologyStrategy
-   CASSANDRA_REPLICATION_DCS=dc-na:1,dc-eu:1,dc-asia:1
-   ```
-   > **This is required in multi-region mode.** The bootstrap service applies
-   > the declared replication policy to both the SesameFS keyspace and
-   > `system_auth`, and it reapplies that policy on every
-   > `docker compose up` / bootstrap run. Treat `.env` as the source of truth
-   > for Cassandra replication.
-   >
-   > `CASSANDRA_REPLICATION_FACTOR` is only used if you deliberately opt back
-   > into `CASSANDRA_REPLICATION_CLASS=SimpleStrategy` for legacy compatibility.
-   > In the default `NetworkTopologyStrategy` flow, it is ignored.
-   >
-   > `RF=1` per DC means each DC has exactly one copy — no in-region HA. For
-   > intra-region high availability, deploy multiple Cassandra nodes per DC and
-   > raise the per-DC RF (e.g. `'dc-na': 3`).
+2. **Start the first seed node's Cassandra service** (e.g., VPS NA):
 
-5. **Verify the applied replication policy** (from any node):
-   ```bash
-   docker compose -f docker-compose.prod.yml exec cassandra sh -lc 'cqlsh -u cassandra -p "$CASSANDRA_SUPERUSER_PASSWORD" -e "DESCRIBE KEYSPACE sesamefs"'
-   docker compose -f docker-compose.prod.yml exec cassandra sh -lc 'cqlsh -u cassandra -p "$CASSANDRA_SUPERUSER_PASSWORD" -e "DESCRIBE KEYSPACE system_auth"'
-   ```
+  ```bash
+  docker compose -f docker-compose.prod.yml up -d cassandra
+  # Wait for it to be healthy (~90s)
+  docker compose -f docker-compose.prod.yml logs -f cassandra
+  ```
 
-6. **Run repair to sync existing data when expanding an existing cluster** (on each new node):
-   ```bash
-   docker compose -f docker-compose.prod.yml exec cassandra nodetool repair sesamefs
-   docker compose -f docker-compose.prod.yml exec cassandra nodetool repair system_auth
-   ```
-   > This is required when you add a new DC after data already exists, including
-   > existing auth metadata in `system_auth`. For a fresh empty cluster where
-   > all DCs are bootstrapped before SesameFS starts serving traffic, this step
-   > can be skipped.
+3. **Start Cassandra on every additional node** (e.g., VPS EU, then Asia):
 
-7. **Start SesameFS + OnlyOffice** on all nodes:
-   ```bash
-   docker compose -f docker-compose.prod.yml up -d
-   ```
+  ```bash
+  docker compose -f docker-compose.prod.yml up -d cassandra
+  # Wait for it to join the cluster
+  ```
+
+4. **Verify cluster status** (from any node):
+
+  ```bash
+  docker compose -f docker-compose.prod.yml exec cassandra nodetool status
+  # Should show every node as UN (Up/Normal) in its respective DC
+  ```
+
+5. **Run Cassandra bootstrap once from the designated admin node only**:
+
+  ```bash
+  docker compose -f docker-compose.prod.yml --profile bootstrap up cassandra-bootstrap
+  ```
+
+  > Do **not** target `cassandra-bootstrap` on more than one node. In a
+  > multi-DC cluster that would reapply auth/keyspace/replication changes from
+  > multiple places and can leave Cassandra metadata inconsistent.
+
+6. **Verify the applied replication policy** (from any node):
+
+  ```bash
+  docker compose -f docker-compose.prod.yml exec cassandra sh -lc 'cqlsh -u cassandra -p "$CASSANDRA_SUPERUSER_PASSWORD" -e "DESCRIBE KEYSPACE sesamefs"'
+  docker compose -f docker-compose.prod.yml exec cassandra sh -lc 'cqlsh -u cassandra -p "$CASSANDRA_SUPERUSER_PASSWORD" -e "DESCRIBE KEYSPACE system_auth"'
+  ```
+
+7. **Run repair to sync existing data when expanding an existing cluster** (on each new node):
+
+  ```bash
+  docker compose -f docker-compose.prod.yml exec cassandra nodetool repair sesamefs
+  docker compose -f docker-compose.prod.yml exec cassandra nodetool repair system_auth
+  ```
+
+  > This is required when you add a new DC after data already exists, including
+  > existing auth metadata in `system_auth`. For a fresh empty cluster where
+  > all DCs are bootstrapped before SesameFS starts serving traffic, this step
+  > can be skipped.
+
+8. **Start SesameFS + frontend + OnlyOffice** on all nodes:
+
+  ```bash
+  docker compose -f docker-compose.prod.yml up -d sesamefs frontend onlyoffice
+  ```
 
 ### Step M5 — Verify
 
@@ -1380,7 +1420,7 @@ docker compose -f docker-compose.prod.yml exec cassandra sh -lc 'cqlsh -u cassan
   WHERE region = 'na' ALLOW FILTERING;
 "'
 # Expected: the row appears within seconds. If empty, replication is not
-# flowing — re-check Step M4.4 (ALTER KEYSPACE) and M4.5 (nodetool repair).
+# flowing — re-check Step M4.5 (bootstrap replication step) and Step M4.7 (nodetool repair).
 ```
 
 > The sentinel table is purely diagnostic; you can `DROP TABLE

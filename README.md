@@ -195,8 +195,8 @@ docker compose down
 ### Local Development (Run Go outside Docker)
 
 ```bash
-# 1. Start only the infrastructure (Cassandra + MinIO)
-docker compose up cassandra minio minio-init -d
+# 1. Start the infrastructure and run Cassandra bootstrap once
+docker compose up cassandra minio minio-init cassandra-bootstrap -d
 
 # 2. Run SesameFS locally against it
 go run ./cmd/sesamefs serve
@@ -209,8 +209,14 @@ go test ./...
 
 ```bash
 cp .env.prod.example .env
-# Fill in all values in .env, then:
-docker compose -f docker-compose.prod.yml up -d --build
+# Fill in all values in .env, then bring up Cassandra first:
+docker compose -f docker-compose.prod.yml up -d cassandra
+
+# Run the one-shot Cassandra bootstrap explicitly from the designated node:
+docker compose -f docker-compose.prod.yml --profile bootstrap up cassandra-bootstrap
+
+# Start the normal app services:
+docker compose -f docker-compose.prod.yml up -d sesamefs frontend onlyoffice
 ```
 
 If SesameFS runs behind nginx or another reverse proxy, set `server.trusted_proxies` in your YAML config or `SERVER_TRUSTED_PROXIES` in `.env` to the exact proxy IP/CIDR values that are allowed to supply `X-Forwarded-For` and `X-Real-IP`. In the supported production chain `client -> central nginx -> internal SesameFS nginx -> Go`, the internal nginx, typically the nginx inside the `frontend` container, preserves the real client IP already resolved by the central nginx, so Go only needs to trust the internal nginx hop. This assumes that internal nginx is private and only reachable from trusted internal paths. Leaving it empty is the secure default and makes SesameFS use the direct peer IP instead.

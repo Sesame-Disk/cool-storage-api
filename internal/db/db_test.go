@@ -59,3 +59,13 @@ func TestCreateKeyspaceCQLEmptyClassDefaultsToNetworkTopologyStrategy(t *testing
 		t.Fatalf("createKeyspaceCQL() = %s, want datacenter1:1", query)
 	}
 }
+
+func TestMissingKeyspaceError(t *testing.T) {
+	err := missingKeyspaceError("sesamefs")
+	if err == nil {
+		t.Fatal("missingKeyspaceError() = nil, want error")
+	}
+	if got := err.Error(); got != "keyspace sesamefs does not exist; run cassandra-bootstrap first" {
+		t.Fatalf("missingKeyspaceError() = %q, want clear bootstrap guidance", got)
+	}
+}

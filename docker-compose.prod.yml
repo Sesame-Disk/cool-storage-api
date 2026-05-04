@@ -59,8 +59,6 @@ services:
     depends_on:
       cassandra:
         condition: service_healthy
-      cassandra-bootstrap:
-        condition: service_completed_successfully
     restart: unless-stopped
     logging:
       driver: json-file
@@ -133,6 +131,8 @@ services:
   # ---------------------------------------------------------------------------
   cassandra-bootstrap:
     image: cassandra:5.0
+    profiles:
+      - bootstrap
     networks:
       - internal
     env_file:

@@ -18,10 +18,11 @@ type DB struct {
 }
 
 // New creates a new database connection.
-// It first connects without a keyspace to ensure the keyspace can be created,
-// then reconnects with the keyspace set.
+// It first connects without a keyspace to ensure the keyspace exists, then
+// reconnects with the keyspace set.
 func New(cfg config.DatabaseConfig) (*DB, error) {
-	// Bootstrap: connect without keyspace to create it if it does not exist.
+	// Bootstrap: connect without keyspace to inspect it before reconnecting with
+	// the configured keyspace selected.
 	bootstrapCluster := newCluster(cfg)
 	bootstrapSession, err := bootstrapCluster.CreateSession()
 	if err != nil {
@@ -33,15 +34,8 @@ func New(cfg config.DatabaseConfig) (*DB, error) {
 		return nil, fmt.Errorf("failed to inspect Cassandra keyspace %s: %w", cfg.Keyspace, err)
 	}
 	if !keyspaceExists {
-		createKeyspaceCQL, err := createKeyspaceCQL(cfg)
-		if err != nil {
-			bootstrapSession.Close()
-			return nil, fmt.Errorf("failed to build keyspace CQL for %s: %w", cfg.Keyspace, err)
-		}
-		if err := bootstrapSession.Query(createKeyspaceCQL).Exec(); err != nil {
-			bootstrapSession.Close()
-			return nil, fmt.Errorf("failed to create missing keyspace %s: %w", cfg.Keyspace, err)
-		}
+		bootstrapSession.Close()
+		return nil, missingKeyspaceError(cfg.Keyspace)
 	}
 	bootstrapSession.Close()
 
@@ -69,6 +63,10 @@ func keyspaceExists(session *gocql.Session, keyspace string) (bool, error) {
 		return false, err
 	}
 	return existing == keyspace, nil
+}
+
+func missingKeyspaceError(keyspace string) error {
+	return fmt.Errorf("keyspace %s does not exist; run cassandra-bootstrap first", keyspace)
 }
 
 // newCluster creates a gocql ClusterConfig from our config (without keyspace).
