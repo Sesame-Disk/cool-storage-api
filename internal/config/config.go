@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -30,7 +31,10 @@ type Config struct {
 	Monitoring          MonitoringConfig              `yaml:"monitoring"`
 	FileView            FileViewConfig                `yaml:"fileview"`
 	EnforcementProfiles map[string]EnforcementProfile `yaml:"enforcement_profiles"`
+	envOverrideErrors   []string
 }
+
+var cassandraDCNamePattern = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
 
 // EnforcementProfile defines feature flags and numeric limits for a quota_policy.
 // Keyed by quota_policy value ("hard", "soft") in the config map.
@@ -416,12 +420,15 @@ type ServerConfig struct {
 
 // DatabaseConfig holds Cassandra connection settings
 type DatabaseConfig struct {
-	Hosts       []string `yaml:"hosts"`
-	Keyspace    string   `yaml:"keyspace"`
-	Consistency string   `yaml:"consistency"`
-	LocalDC     string   `yaml:"local_dc"`
-	Username    string   `yaml:"username"`
-	Password    string   `yaml:"password"`
+	Hosts             []string       `yaml:"hosts"`
+	Keyspace          string         `yaml:"keyspace"`
+	Consistency       string         `yaml:"consistency"`
+	LocalDC           string         `yaml:"local_dc"`
+	Username          string         `yaml:"username"`
+	Password          string         `yaml:"password"`
+	ReplicationClass  string         `yaml:"replication_class"`
+	ReplicationFactor int            `yaml:"replication_factor"`
+	ReplicationDCs    map[string]int `yaml:"replication_dcs"`
 }
 
 // StorageConfig holds storage backend settings
@@ -639,10 +646,12 @@ func DefaultConfig() *Config {
 			MobileFrontendPath: "./mobile-frontend/dist", // Mobile frontend build directory
 		},
 		Database: DatabaseConfig{
-			Hosts:       []string{"localhost:9042"},
-			Keyspace:    "sesamefs",
-			Consistency: "LOCAL_QUORUM",
-			LocalDC:     "datacenter1",
+			Hosts:             []string{"localhost:9042"},
+			Keyspace:          "sesamefs",
+			Consistency:       "LOCAL_QUORUM",
+			LocalDC:           "datacenter1",
+			ReplicationClass:  "NetworkTopologyStrategy",
+			ReplicationFactor: 1,
 		},
 		Storage: StorageConfig{
 			Mode:         "",
@@ -766,6 +775,8 @@ func DefaultConfig() *Config {
 
 // applyEnvOverrides applies environment variable overrides
 func (c *Config) applyEnvOverrides() {
+	c.envOverrideErrors = nil
+
 	// Server
 	if v := os.Getenv("PORT"); v != "" {
 		c.Server.Port = ":" + v
@@ -809,6 +820,25 @@ func (c *Config) applyEnvOverrides() {
 	}
 	if v := os.Getenv("CASSANDRA_LOCAL_DC"); v != "" {
 		c.Database.LocalDC = v
+	}
+	if v := os.Getenv("CASSANDRA_REPLICATION_CLASS"); v != "" {
+		c.Database.ReplicationClass = strings.TrimSpace(v)
+	}
+	if v := os.Getenv("CASSANDRA_REPLICATION_FACTOR"); v != "" {
+		parsed, err := strconv.Atoi(strings.TrimSpace(v))
+		if err != nil {
+			c.addEnvOverrideError("CASSANDRA_REPLICATION_FACTOR must be an integer, got %q", v)
+		} else {
+			c.Database.ReplicationFactor = parsed
+		}
+	}
+	if v := os.Getenv("CASSANDRA_REPLICATION_DCS"); v != "" {
+		parsed, err := parseCassandraReplicationDCs(v)
+		if err != nil {
+			c.addEnvOverrideError("CASSANDRA_REPLICATION_DCS is invalid: %v", err)
+		} else {
+			c.Database.ReplicationDCs = parsed
+		}
 	}
 
 	// Storage
@@ -1176,6 +1206,9 @@ func (c *Config) regionClassConfig(region string) (RegionClassConfig, bool) {
 
 // Validate checks if the configuration is valid
 func (c *Config) Validate() error {
+	if len(c.envOverrideErrors) > 0 {
+		return fmt.Errorf("invalid environment override: %s", strings.Join(c.envOverrideErrors, "; "))
+	}
 	if c.Server.Port == "" {
 		return fmt.Errorf("server port is required")
 	}
@@ -1184,6 +1217,36 @@ func (c *Config) Validate() error {
 	}
 	if c.Database.Keyspace == "" {
 		return fmt.Errorf("database keyspace is required")
+	}
+	switch normalizedClass := normalizeCassandraReplicationClass(c.Database.ReplicationClass); normalizedClass {
+	case "SimpleStrategy":
+		c.Database.ReplicationClass = normalizedClass
+		if c.Database.ReplicationFactor <= 0 {
+			return fmt.Errorf("database replication_factor must be greater than zero when using SimpleStrategy")
+		}
+		c.Database.ReplicationDCs = nil
+	case "NetworkTopologyStrategy":
+		c.Database.ReplicationClass = normalizedClass
+		if len(c.Database.ReplicationDCs) == 0 {
+			localDC := strings.TrimSpace(c.Database.LocalDC)
+			if localDC == "" {
+				return fmt.Errorf("database local_dc is required when using NetworkTopologyStrategy")
+			}
+			c.Database.ReplicationDCs = map[string]int{localDC: 1}
+		}
+		for dc, rf := range c.Database.ReplicationDCs {
+			if strings.TrimSpace(dc) == "" {
+				return fmt.Errorf("database replication_dcs contains an empty datacenter name")
+			}
+			if !isValidCassandraDCName(dc) {
+				return fmt.Errorf("database replication_dcs.%s contains unsupported characters", dc)
+			}
+			if rf <= 0 {
+				return fmt.Errorf("database replication_dcs.%s must be greater than zero", dc)
+			}
+		}
+	default:
+		return fmt.Errorf("database replication_class must be SimpleStrategy or NetworkTopologyStrategy")
 	}
 	defaultTemplate := strings.TrimSpace(c.Organizations.DefaultTemplate)
 	if defaultTemplate == "" {
@@ -1247,6 +1310,9 @@ func (c *Config) Validate() error {
 		if strings.TrimSpace(regionConfig.Hot) == "" {
 			return fmt.Errorf("storage.region_classes.%s.hot must be set for multi-region mode", c.Server.Region)
 		}
+		if c.Database.ReplicationClass != "NetworkTopologyStrategy" {
+			return fmt.Errorf("storage.mode=multi requires database replication_class=NetworkTopologyStrategy")
+		}
 	}
 	if !c.Auth.DevMode && storageMode == "single" {
 		if strings.TrimSpace(c.Server.Region) != "" {
@@ -1301,6 +1367,52 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("auth.oidc.redirect_uris must contain at least one redirect URI when OIDC is enabled")
 	}
 	return nil
+}
+
+func normalizeCassandraReplicationClass(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "":
+		return "NetworkTopologyStrategy"
+	case "simplestrategy":
+		return "SimpleStrategy"
+	case "networktopologystrategy":
+		return "NetworkTopologyStrategy"
+	default:
+		return strings.TrimSpace(raw)
+	}
+}
+
+func (c *Config) addEnvOverrideError(format string, args ...any) {
+	if c == nil {
+		return
+	}
+	c.envOverrideErrors = append(c.envOverrideErrors, fmt.Sprintf(format, args...))
+}
+
+func parseCassandraReplicationDCs(raw string) (map[string]int, error) {
+	result := make(map[string]int)
+	for _, entry := range strings.Split(raw, ",") {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		dc, rfText, ok := strings.Cut(entry, ":")
+		if !ok {
+			return nil, fmt.Errorf("invalid replication dc entry %q", entry)
+		}
+		dc = strings.TrimSpace(dc)
+		rfText = strings.TrimSpace(rfText)
+		rf, err := strconv.Atoi(rfText)
+		if dc == "" || !isValidCassandraDCName(dc) || err != nil {
+			return nil, fmt.Errorf("invalid replication dc entry %q", entry)
+		}
+		result[dc] = rf
+	}
+	return result, nil
+}
+
+func isValidCassandraDCName(name string) bool {
+	return cassandraDCNamePattern.MatchString(strings.TrimSpace(name))
 }
 
 func validateStorageEncryptionConfig(scope, backendType, mode, kmsKeyID string) error {

@@ -24,8 +24,13 @@ database:
   keyspace: sesamefs
   consistency: LOCAL_QUORUM
   local_dc: datacenter1
+  replication_class: NetworkTopologyStrategy
+  replication_dcs:
+    datacenter1: 1
   # username: cassandra
   # password: cassandra
+  # replication env overrides: CASSANDRA_REPLICATION_CLASS, CASSANDRA_REPLICATION_DCS
+  # legacy-only fallback: CASSANDRA_REPLICATION_FACTOR when using SimpleStrategy
 
 storage:
   default_class: hot-s3-usa

@@ -132,6 +132,32 @@ is_valid_cassandra_identifier() {
   [[ "$val" =~ ^[A-Za-z][A-Za-z0-9_]*$ ]]
 }
 
+is_valid_cassandra_dc_name() {
+  local val="$1"
+  [[ "$val" =~ ^[A-Za-z0-9._-]+$ ]]
+}
+
+check_required_writable_dir() {
+  local var_name="$1"
+  local purpose="$2"
+  local dir_path="${!var_name:-}"
+
+  if [ -z "$dir_path" ]; then
+    fail "$var_name is unset. $purpose"
+    return 1
+  fi
+  if [ ! -d "$dir_path" ]; then
+    fail "$var_name points to $dir_path, but the directory does not exist. Create it before docker compose up."
+    return 1
+  fi
+  if [ ! -w "$dir_path" ]; then
+    fail "$var_name points to $dir_path, but it is not writable by the current user. Fix ownership/permissions before deploy."
+    return 1
+  fi
+  pass "$var_name exists and is writable"
+  return 0
+}
+
 # ========================================================================
 # --init-env helpers (only used when --init-env is passed)
 # ========================================================================
@@ -510,17 +536,8 @@ check_onlyoffice() {
   fi
 	pass "ONLYOFFICE_API_JS_URL is set"
 
-  if ! is_set ONLYOFFICE_DATA_DIR; then
-	fail "ONLYOFFICE_DATA_DIR is unset. Production compose uses a bind mount for OnlyOffice persistent data."
-	return
-  fi
-	pass "ONLYOFFICE_DATA_DIR is set"
-
-  if ! is_set ONLYOFFICE_LOGS_DIR; then
-	fail "ONLYOFFICE_LOGS_DIR is unset. Production compose uses a bind mount for OnlyOffice logs."
-	return
-  fi
-	pass "ONLYOFFICE_LOGS_DIR is set"
+  check_required_writable_dir ONLYOFFICE_DATA_DIR "Production compose uses a bind mount for OnlyOffice persistent data."
+  check_required_writable_dir ONLYOFFICE_LOGS_DIR "Production compose uses a bind mount for OnlyOffice logs."
 
   if is_set ONLYOFFICE_API_JS_URL && [[ "$ONLYOFFICE_API_JS_URL" == http://* ]]; then
     warn "ONLYOFFICE_API_JS_URL uses http:// — browsers will likely block mixed content on an HTTPS site."
@@ -653,11 +670,7 @@ check_database() {
     pass "CASSANDRA_HOSTS is set"
   fi
 
-  if ! is_set CASSANDRA_DATA_DIR; then
-    fail "CASSANDRA_DATA_DIR is unset. Production compose uses a bind mount for Cassandra data."
-  else
-    pass "CASSANDRA_DATA_DIR is set"
-  fi
+  check_required_writable_dir CASSANDRA_DATA_DIR "Production compose uses a bind mount for Cassandra data."
 
   if ! is_set CASSANDRA_SUPERUSER_PASSWORD; then
     fail "CASSANDRA_SUPERUSER_PASSWORD is unset. Required to rotate the default Cassandra superuser password during bootstrap."
@@ -702,6 +715,81 @@ check_database() {
      && [ "$CASSANDRA_SUPERUSER_USERNAME" = "$CASSANDRA_USERNAME" ]; then
     warn "CASSANDRA_USERNAME matches CASSANDRA_SUPERUSER_USERNAME. Prefer a dedicated non-superuser app role."
   fi
+
+  local replication_class normalized_replication_class replication_factor replication_dcs local_dc
+  local_dc="${CASSANDRA_DC:-${CASSANDRA_LOCAL_DC:-datacenter1}}"
+  replication_class="${CASSANDRA_REPLICATION_CLASS:-NetworkTopologyStrategy}"
+  normalized_replication_class="$(printf '%s' "$replication_class" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
+  replication_factor="${CASSANDRA_REPLICATION_FACTOR:-1}"
+  replication_dcs="${CASSANDRA_REPLICATION_DCS:-${local_dc}:1}"
+
+  case "$normalized_replication_class" in
+    simplestrategy)
+      pass "CASSANDRA_REPLICATION_CLASS=SimpleStrategy"
+      case "$replication_factor" in
+        ''|*[!0-9]*)
+          fail "CASSANDRA_REPLICATION_FACTOR must be a positive integer when using SimpleStrategy."
+          ;;
+        *)
+          if [ "$replication_factor" -lt 1 ]; then
+            fail "CASSANDRA_REPLICATION_FACTOR must be greater than zero when using SimpleStrategy."
+          else
+            pass "CASSANDRA_REPLICATION_FACTOR=$replication_factor"
+          fi
+          ;;
+      esac
+      warn "SimpleStrategy is kept only for backward compatibility; the project default is NetworkTopologyStrategy even for single-node deployments."
+      if [ "$(storage_mode)" = "multi" ]; then
+        fail "STORAGE_MODE=multi requires CASSANDRA_REPLICATION_CLASS=NetworkTopologyStrategy so SesameFS data and system_auth replicate across DCs."
+      fi
+      ;;
+    networktopologystrategy)
+      pass "CASSANDRA_REPLICATION_CLASS=NetworkTopologyStrategy"
+      if [ "$(storage_mode)" = "multi" ] && ! is_set CASSANDRA_REPLICATION_DCS; then
+        fail "STORAGE_MODE=multi requires CASSANDRA_REPLICATION_DCS to be set explicitly with every DC (example: dc-na:1,dc-eu:1)."
+      elif [ -z "${replication_dcs//[[:space:]]/}" ]; then
+        fail "CASSANDRA_REPLICATION_DCS is required when using NetworkTopologyStrategy (example: dc-na:1,dc-eu:1)."
+      else
+        local entry dc rf has_local_dc
+        has_local_dc=false
+        IFS=',' read -r -a replication_entries <<< "$replication_dcs"
+        for entry in "${replication_entries[@]}"; do
+          entry="${entry//[[:space:]]/}"
+          [ -n "$entry" ] || continue
+          if [[ "$entry" != *:* ]]; then
+            fail "CASSANDRA_REPLICATION_DCS entry '$entry' must use dc:rf format."
+            continue
+          fi
+          dc="${entry%%:*}"
+          rf="${entry#*:}"
+          if ! is_valid_cassandra_dc_name "$dc"; then
+            fail "CASSANDRA_REPLICATION_DCS datacenter '$dc' contains unsupported characters."
+            continue
+          fi
+          case "$rf" in
+            ''|*[!0-9]*)
+              fail "CASSANDRA_REPLICATION_DCS datacenter '$dc' must have a positive integer replication factor."
+              continue
+              ;;
+          esac
+          if [ "$rf" -lt 1 ]; then
+            fail "CASSANDRA_REPLICATION_DCS datacenter '$dc' must have replication factor greater than zero."
+            continue
+          fi
+          pass "CASSANDRA_REPLICATION_DCS includes $dc:$rf"
+          if [ -n "$local_dc" ] && [ "$dc" = "$local_dc" ]; then
+            has_local_dc=true
+          fi
+        done
+        if [ -n "$local_dc" ] && [ "$has_local_dc" = false ]; then
+          fail "CASSANDRA_REPLICATION_DCS does not include the local datacenter '$local_dc'."
+        fi
+      fi
+      ;;
+    *)
+      fail "CASSANDRA_REPLICATION_CLASS must be SimpleStrategy or NetworkTopologyStrategy."
+      ;;
+  esac
 }
 
 check_config_file() {

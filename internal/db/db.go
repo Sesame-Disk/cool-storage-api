@@ -3,6 +3,8 @@ package db
 import (
 	"context"
 	"fmt"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/Sesame-Disk/sesamefs/internal/config"
@@ -31,7 +33,12 @@ func New(cfg config.DatabaseConfig) (*DB, error) {
 		return nil, fmt.Errorf("failed to inspect Cassandra keyspace %s: %w", cfg.Keyspace, err)
 	}
 	if !keyspaceExists {
-		if err := bootstrapSession.Query(createKeyspaceCQL(cfg.Keyspace)).Exec(); err != nil {
+		createKeyspaceCQL, err := createKeyspaceCQL(cfg)
+		if err != nil {
+			bootstrapSession.Close()
+			return nil, fmt.Errorf("failed to build keyspace CQL for %s: %w", cfg.Keyspace, err)
+		}
+		if err := bootstrapSession.Query(createKeyspaceCQL).Exec(); err != nil {
 			bootstrapSession.Close()
 			return nil, fmt.Errorf("failed to create missing keyspace %s: %w", cfg.Keyspace, err)
 		}
@@ -128,13 +135,54 @@ func parseConsistency(s string) gocql.Consistency {
 	}
 }
 
-// createKeyspaceCQL returns the CQL to create the keyspace if it does not exist.
-// Replication factor is kept at 1 for the bootstrap query; production deployments
-// should set replication_factor = 3 via an out-of-band ALTER KEYSPACE after the
-// cluster is provisioned with multiple nodes.
-func createKeyspaceCQL(keyspace string) string {
-	return fmt.Sprintf(`CREATE KEYSPACE IF NOT EXISTS %s WITH replication = {
-		'class': 'SimpleStrategy',
-		'replication_factor': 1
-	}`, keyspace)
+// createKeyspaceCQL returns the CQL to create the keyspace if it does not exist,
+// using the configured replication strategy so single-node dev and multi-DC prod
+// converge on the same declarative settings.
+func createKeyspaceCQL(cfg config.DatabaseConfig) (string, error) {
+	replicationCQL, err := replicationConfigCQL(cfg)
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("CREATE KEYSPACE IF NOT EXISTS %s WITH replication = %s", cfg.Keyspace, replicationCQL), nil
+}
+
+func replicationConfigCQL(cfg config.DatabaseConfig) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(cfg.ReplicationClass)) {
+	case "":
+		if len(cfg.ReplicationDCs) == 0 {
+			localDC := strings.TrimSpace(cfg.LocalDC)
+			if localDC == "" {
+				return "", fmt.Errorf("NetworkTopologyStrategy requires local_dc when replication_dcs is empty")
+			}
+			cfg.ReplicationDCs = map[string]int{localDC: 1}
+		}
+		fallthrough
+	case "networktopologystrategy":
+		if len(cfg.ReplicationDCs) == 0 {
+			return "", fmt.Errorf("NetworkTopologyStrategy requires replication_dcs")
+		}
+		keys := make([]string, 0, len(cfg.ReplicationDCs))
+		for dc, rf := range cfg.ReplicationDCs {
+			if strings.TrimSpace(dc) == "" {
+				return "", fmt.Errorf("NetworkTopologyStrategy requires non-empty datacenter names")
+			}
+			if rf <= 0 {
+				return "", fmt.Errorf("NetworkTopologyStrategy requires replication factor > 0 for datacenter %s", dc)
+			}
+			keys = append(keys, dc)
+		}
+		sort.Strings(keys)
+		parts := []string{"'class': 'NetworkTopologyStrategy'"}
+		for _, dc := range keys {
+			parts = append(parts, fmt.Sprintf("'%s': %d", dc, cfg.ReplicationDCs[dc]))
+		}
+		return "{" + strings.Join(parts, ", ") + "}", nil
+	case "simplestrategy":
+		if cfg.ReplicationFactor <= 0 {
+			return "", fmt.Errorf("SimpleStrategy requires replication_factor > 0")
+		}
+		return fmt.Sprintf("{'class': 'SimpleStrategy', 'replication_factor': %d}", cfg.ReplicationFactor), nil
+	default:
+		return "", fmt.Errorf("unsupported replication class %q", cfg.ReplicationClass)
+	}
 }

@@ -20,6 +20,7 @@ func clearLoadEnvOverrides(t *testing.T) {
 		"CORS_ALLOWED_ORIGINS",
 		"CASSANDRA_HOSTS", "CASSANDRA_KEYSPACE", "CASSANDRA_USERNAME",
 		"CASSANDRA_PASSWORD", "CASSANDRA_LOCAL_DC",
+		"CASSANDRA_REPLICATION_CLASS", "CASSANDRA_REPLICATION_FACTOR", "CASSANDRA_REPLICATION_DCS",
 		"STORAGE_MODE", "S3_BUCKET", "S3_REGION", "S3_ENDPOINT",
 		"S3_SERVER_SIDE_ENCRYPTION", "S3_SSE_KMS_KEY_ID",
 		"S3_ACCESS_KEY_ID", "S3_SECRET_ACCESS_KEY",
@@ -202,6 +203,9 @@ func TestDefaultConfig(t *testing.T) {
 	}
 	if cfg.Database.Keyspace != "sesamefs" {
 		t.Errorf("Database.Keyspace = %s, want sesamefs", cfg.Database.Keyspace)
+	}
+	if cfg.Database.ReplicationClass != "NetworkTopologyStrategy" {
+		t.Errorf("Database.ReplicationClass = %s, want NetworkTopologyStrategy", cfg.Database.ReplicationClass)
 	}
 	if cfg.Storage.DefaultClass != "hot" {
 		t.Errorf("Storage.DefaultClass = %s, want hot", cfg.Storage.DefaultClass)
@@ -438,6 +442,8 @@ func TestConfigValidate(t *testing.T) {
 				c.CORS.AllowedOrigins = []string{"https://app.example.com"}
 				c.Storage.Mode = "multi"
 				c.Server.Region = "eu"
+				c.Database.ReplicationClass = "NetworkTopologyStrategy"
+				c.Database.ReplicationDCs = map[string]int{"dc-usa": 1, "dc-eu": 1}
 				c.Storage.DefaultClass = "hot-s3-usa"
 				c.Storage.Classes = map[string]StorageClassConfig{
 					"hot-s3-usa": {Type: "s3", Bucket: "sesamefs-usa", Region: "us-east-1"},
@@ -611,12 +617,16 @@ func TestEnvOverrideCassandra(t *testing.T) {
 	os.Setenv("CASSANDRA_USERNAME", "test_user")
 	os.Setenv("CASSANDRA_PASSWORD", "test_pass")
 	os.Setenv("CASSANDRA_LOCAL_DC", "dc2")
+	os.Setenv("CASSANDRA_REPLICATION_CLASS", "NetworkTopologyStrategy")
+	os.Setenv("CASSANDRA_REPLICATION_DCS", "dc1:1,dc2:2")
 	defer func() {
 		os.Unsetenv("CASSANDRA_HOSTS")
 		os.Unsetenv("CASSANDRA_KEYSPACE")
 		os.Unsetenv("CASSANDRA_USERNAME")
 		os.Unsetenv("CASSANDRA_PASSWORD")
 		os.Unsetenv("CASSANDRA_LOCAL_DC")
+		os.Unsetenv("CASSANDRA_REPLICATION_CLASS")
+		os.Unsetenv("CASSANDRA_REPLICATION_DCS")
 	}()
 
 	cfg.applyEnvOverrides()
@@ -635,6 +645,94 @@ func TestEnvOverrideCassandra(t *testing.T) {
 	}
 	if cfg.Database.LocalDC != "dc2" {
 		t.Errorf("Database.LocalDC = %s, want dc2", cfg.Database.LocalDC)
+	}
+	if cfg.Database.ReplicationClass != "NetworkTopologyStrategy" {
+		t.Errorf("Database.ReplicationClass = %s, want NetworkTopologyStrategy", cfg.Database.ReplicationClass)
+	}
+	if len(cfg.Database.ReplicationDCs) != 2 || cfg.Database.ReplicationDCs["dc1"] != 1 || cfg.Database.ReplicationDCs["dc2"] != 2 {
+		t.Errorf("Database.ReplicationDCs = %#v, want dc1:1,dc2:2", cfg.Database.ReplicationDCs)
+	}
+}
+
+func TestConfigValidateMultiRegionRequiresNetworkTopologyStrategy(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Auth.DevMode = false
+	cfg.Auth.ShareLinkHMACKey = "very-secure-test-key"
+	cfg.CORS.AllowedOrigins = []string{"https://app.example.com"}
+	cfg.Storage.Mode = "multi"
+	cfg.Server.Region = "na"
+	cfg.Storage.DefaultClass = "hot-s3-na"
+	cfg.Storage.Classes = map[string]StorageClassConfig{
+		"hot-s3-na": {Type: "s3", Bucket: "sesamefs-na", Region: "us-east-1"},
+	}
+	cfg.Storage.Backends = map[string]BackendConfig{"hot": {Type: "s3"}}
+	cfg.Storage.RegionClasses = map[string]RegionClassConfig{
+		"na": {Hot: "hot-s3-na"},
+	}
+	cfg.Database.ReplicationClass = "SimpleStrategy"
+	cfg.Database.ReplicationFactor = 1
+
+	err := cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "NetworkTopologyStrategy") {
+		t.Fatalf("Validate() error = %v, want NetworkTopologyStrategy requirement", err)
+	}
+
+	cfg.Database.ReplicationClass = "NetworkTopologyStrategy"
+	cfg.Database.ReplicationDCs = map[string]int{"dc-na": 1}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate() with NetworkTopologyStrategy error = %v", err)
+	}
+}
+
+func TestConfigValidateNetworkTopologyStrategyDefaultsToLocalDC(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Auth.DevMode = true
+	cfg.Database.ReplicationDCs = nil
+
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate() error = %v", err)
+	}
+	if len(cfg.Database.ReplicationDCs) != 1 || cfg.Database.ReplicationDCs["datacenter1"] != 1 {
+		t.Fatalf("Database.ReplicationDCs = %#v, want datacenter1:1", cfg.Database.ReplicationDCs)
+	}
+}
+
+func TestEnvOverrideCassandraRejectsInvalidReplicationFactor(t *testing.T) {
+	cfg := DefaultConfig()
+
+	os.Setenv("CASSANDRA_REPLICATION_FACTOR", "abc")
+	defer os.Unsetenv("CASSANDRA_REPLICATION_FACTOR")
+
+	cfg.applyEnvOverrides()
+	err := cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "CASSANDRA_REPLICATION_FACTOR") {
+		t.Fatalf("Validate() error = %v, want invalid CASSANDRA_REPLICATION_FACTOR", err)
+	}
+}
+
+func TestEnvOverrideCassandraRejectsInvalidReplicationDCs(t *testing.T) {
+	cfg := DefaultConfig()
+
+	os.Setenv("CASSANDRA_REPLICATION_DCS", "garbage")
+	defer os.Unsetenv("CASSANDRA_REPLICATION_DCS")
+
+	cfg.applyEnvOverrides()
+	err := cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "CASSANDRA_REPLICATION_DCS") {
+		t.Fatalf("Validate() error = %v, want invalid CASSANDRA_REPLICATION_DCS", err)
+	}
+}
+
+func TestEnvOverrideCassandraRejectsInvalidReplicationDCName(t *testing.T) {
+	cfg := DefaultConfig()
+
+	os.Setenv("CASSANDRA_REPLICATION_DCS", "dc'bad:1")
+	defer os.Unsetenv("CASSANDRA_REPLICATION_DCS")
+
+	cfg.applyEnvOverrides()
+	err := cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "CASSANDRA_REPLICATION_DCS") {
+		t.Fatalf("Validate() error = %v, want invalid CASSANDRA_REPLICATION_DCS", err)
 	}
 }
 

@@ -102,10 +102,89 @@ services:
         app_user="$${CASSANDRA_USERNAME:?set CASSANDRA_USERNAME in .env}"
         app_pass="$${CASSANDRA_PASSWORD:?set CASSANDRA_PASSWORD in .env}"
         keyspace="$${CASSANDRA_KEYSPACE:-sesamefs}"
+        storage_mode="$$(printf '%s' "$${STORAGE_MODE:-single}" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
+        local_dc="$${CASSANDRA_DC:-$${CASSANDRA_LOCAL_DC:-datacenter1}}"
+        replication_class="$${CASSANDRA_REPLICATION_CLASS:-NetworkTopologyStrategy}"
+        replication_factor="$${CASSANDRA_REPLICATION_FACTOR:-1}"
+        replication_dcs="$${CASSANDRA_REPLICATION_DCS:-$${local_dc}:1}"
         admin_pass_escaped="$${admin_pass//\'/\'\'}"
         app_pass_escaped="$${app_pass//\'/\'\'}"
         attempts=0
         admin_rotated=0
+
+        if [ "$${storage_mode}" = "multi" ] && [ -z "$${CASSANDRA_REPLICATION_DCS:-}" ]; then
+          echo "STORAGE_MODE=multi requires CASSANDRA_REPLICATION_DCS to be set explicitly with every datacenter." >&2
+          exit 1
+        fi
+
+        build_replication_cql() {
+          local normalized_class
+          normalized_class="$$(printf '%s' "$${replication_class}" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
+
+          case "$${normalized_class}" in
+            simplestrategy)
+              echo "Warning: SimpleStrategy is only kept for backward compatibility; prefer NetworkTopologyStrategy even for single-node deployments." >&2
+              case "$${replication_factor}" in
+                ''|*[!0-9]*) echo "Invalid CASSANDRA_REPLICATION_FACTOR: $${replication_factor}" >&2; exit 1 ;;
+              esac
+              if [ "$${replication_factor}" -lt 1 ]; then
+                echo "CASSANDRA_REPLICATION_FACTOR must be greater than zero" >&2
+                exit 1
+              fi
+              printf "{'class': 'SimpleStrategy', 'replication_factor': %s}" "$${replication_factor}"
+              ;;
+            networktopologystrategy)
+              if [ -z "$${replication_dcs//[[:space:]]/}" ]; then
+                echo "CASSANDRA_REPLICATION_DCS is required when CASSANDRA_REPLICATION_CLASS=NetworkTopologyStrategy" >&2
+                exit 1
+              fi
+              local map entry dc rf has_local_dc
+              has_local_dc=false
+              map="{'class': 'NetworkTopologyStrategy'"
+              IFS=',' read -r -a replication_entries <<< "$${replication_dcs}"
+              for entry in "$${replication_entries[@]}"; do
+                entry="$${entry//[[:space:]]/}"
+                [ -n "$${entry}" ] || continue
+                if [[ "$${entry}" != *:* ]]; then
+                  echo "Invalid CASSANDRA_REPLICATION_DCS entry: $${entry}" >&2
+                  exit 1
+                fi
+                dc="$${entry%%:*}"
+                rf="$${entry#*:}"
+                if [[ ! "$${dc}" =~ ^[A-Za-z0-9._-]+$ ]]; then
+                  echo "Invalid Cassandra datacenter name in CASSANDRA_REPLICATION_DCS: $${dc}" >&2
+                  exit 1
+                fi
+                case "$${rf}" in
+                  ''|*[!0-9]*) echo "Invalid replication factor for datacenter $${dc}: $${rf}" >&2; exit 1 ;;
+                esac
+                if [ "$${rf}" -lt 1 ]; then
+                  echo "Replication factor must be greater than zero for datacenter $${dc}" >&2
+                  exit 1
+                fi
+                map="$${map}, '$${dc}': $${rf}"
+                if [ -n "$${local_dc}" ] && [ "$${dc}" = "$${local_dc}" ]; then
+                  has_local_dc=true
+                fi
+              done
+              if [ "$${map}" = "{'class': 'NetworkTopologyStrategy'" ]; then
+                echo "CASSANDRA_REPLICATION_DCS must contain at least one dc:rf pair" >&2
+                exit 1
+              fi
+              if [ -n "$${local_dc}" ] && [ "$${has_local_dc}" = "false" ]; then
+                echo "CASSANDRA_REPLICATION_DCS does not include the local datacenter '$${local_dc}'. Add it to CASSANDRA_REPLICATION_DCS or fix CASSANDRA_DC/CASSANDRA_LOCAL_DC." >&2
+                exit 1
+              fi
+              printf "%s}" "$${map}"
+              ;;
+            *)
+              echo "Invalid CASSANDRA_REPLICATION_CLASS: $${replication_class}" >&2
+              exit 1
+              ;;
+          esac
+        }
+
+        replication_cql="$$(build_replication_cql)"
 
         case "$${keyspace}" in
           [A-Za-z][A-Za-z0-9_]*) ;;
@@ -139,7 +218,9 @@ services:
         done
 
         cqlsh cassandra -u cassandra -p "$${admin_pass}" <<EOF
-        CREATE KEYSPACE IF NOT EXISTS $${keyspace} WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1};
+        CREATE KEYSPACE IF NOT EXISTS $${keyspace} WITH replication = $${replication_cql};
+        ALTER KEYSPACE $${keyspace} WITH replication = $${replication_cql};
+        ALTER KEYSPACE system_auth WITH replication = $${replication_cql};
         CREATE ROLE IF NOT EXISTS $${app_user} WITH PASSWORD = '$${app_pass_escaped}' AND LOGIN = true;
         GRANT ALL PERMISSIONS ON KEYSPACE $${keyspace} TO $${app_user};
         EOF

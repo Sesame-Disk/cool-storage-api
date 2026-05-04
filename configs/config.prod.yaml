@@ -50,7 +50,12 @@ database:
   keyspace: sesamefs
   consistency: LOCAL_QUORUM
   local_dc: datacenter1
+  replication_class: NetworkTopologyStrategy
+  replication_dcs:
+    datacenter1: 1
   # username and password via: CASSANDRA_USERNAME, CASSANDRA_PASSWORD
+  # replication env overrides: CASSANDRA_REPLICATION_CLASS, CASSANDRA_REPLICATION_DCS
+  # legacy-only fallback: CASSANDRA_REPLICATION_FACTOR when using SimpleStrategy
 
 # =============================================================================
 # Storage — shared production config for both single-region and multi-region

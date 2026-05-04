@@ -728,6 +728,22 @@ docker compose -f docker-compose.prod.yml up -d frontend
 
 Do not use `--build` for the normal prod path. The production compose consumes published images, not local Docker builds.
 
+### Upgrading from a pre-NetworkTopologyStrategy build
+
+Older builds bootstrapped the `sesamefs` keyspace as
+`SimpleStrategy{replication_factor: 1}` and required a manual
+`ALTER KEYSPACE` to switch to NetworkTopologyStrategy. The current bootstrap
+applies the declared replication policy to both `sesamefs` and `system_auth`
+on every `docker compose up`, so the first deploy of this build will
+`ALTER KEYSPACE` the existing cluster.
+
+Before pulling, on each existing node:
+
+1. Confirm the cluster's actual DC name (`docker compose -f docker-compose.prod.yml exec cassandra nodetool status`) and make sure `CASSANDRA_DC` in `.env` matches it. The bootstrap will refuse to apply a policy that does not include the local DC.
+2. Set `CASSANDRA_REPLICATION_CLASS=NetworkTopologyStrategy` and `CASSANDRA_REPLICATION_DCS` to the full topology you want (single-region: `dc-name:1`; multi-region: `dc-na:1,dc-eu:1,...`).
+3. Pull and `docker compose up -d` as usual. The bootstrap container reapplies the policy idempotently.
+4. Single-region single-DC `SimpleStrategy{rf=1} → NetworkTopologyStrategy{dc:1}` places replicas identically; repair is a no-op but harmless. Multi-DC migrations or RF changes still require `nodetool repair sesamefs` and `nodetool repair system_auth` after the ALTER.
+
 ### Restart a service
 
 ```bash
@@ -1242,47 +1258,52 @@ If every line is `[OK]`, proceed to Step M4.
    # Should show both nodes as UN (Up/Normal) in their respective DCs
    ```
 
-4. **Switch the keyspace to NetworkTopologyStrategy** (from any node):
+4. **Declare Cassandra replication in `.env` before first boot** on every node:
    ```bash
-   # 2-region (NA + EU)
-   docker compose -f docker-compose.prod.yml exec cassandra sh -lc 'cqlsh -u cassandra -p "$CASSANDRA_SUPERUSER_PASSWORD" -e "
-     ALTER KEYSPACE sesamefs
-     WITH replication = {
-       'class': 'NetworkTopologyStrategy',
-       'dc-na': 1,
-       'dc-eu': 1
-     };
-   "'
+   # The project default is NetworkTopologyStrategy.
+   # Single-region remains compatible as a one-DC topology:
+   CASSANDRA_REPLICATION_CLASS=NetworkTopologyStrategy
+   CASSANDRA_REPLICATION_DCS=dc-na:1
 
-   # 3-region (NA + EU + ASIA)
-   docker compose -f docker-compose.prod.yml exec cassandra sh -lc 'cqlsh -u cassandra -p "$CASSANDRA_SUPERUSER_PASSWORD" -e "
-     ALTER KEYSPACE sesamefs
-     WITH replication = {
-       'class': 'NetworkTopologyStrategy',
-       'dc-na': 1,
-       'dc-eu': 1,
-       'dc-asia': 1
-     };
-   "'
+   # On every multi-region node, expand that topology before `docker compose up`:
+   CASSANDRA_REPLICATION_CLASS=NetworkTopologyStrategy
+   CASSANDRA_REPLICATION_DCS=dc-na:1,dc-eu:1
+
+   # Or for 3 regions:
+   CASSANDRA_REPLICATION_CLASS=NetworkTopologyStrategy
+   CASSANDRA_REPLICATION_DCS=dc-na:1,dc-eu:1,dc-asia:1
    ```
-   > **This is required.** By default, the keyspace uses `SimpleStrategy`
-   > (single DC). Without this change, data will NOT replicate across DCs.
-   > Only list DCs that actually exist. When adding a new region later,
-   > run `ALTER KEYSPACE` again adding the new DC, then `nodetool repair sesamefs`
-   > on the new node to pull data into it.
+   > **This is required in multi-region mode.** The bootstrap service applies
+   > the declared replication policy to both the SesameFS keyspace and
+   > `system_auth`, and it reapplies that policy on every
+   > `docker compose up` / bootstrap run. Treat `.env` as the source of truth
+   > for Cassandra replication.
+   >
+   > `CASSANDRA_REPLICATION_FACTOR` is only used if you deliberately opt back
+   > into `CASSANDRA_REPLICATION_CLASS=SimpleStrategy` for legacy compatibility.
+   > In the default `NetworkTopologyStrategy` flow, it is ignored.
    >
    > `RF=1` per DC means each DC has exactly one copy — no in-region HA. For
    > intra-region high availability, deploy multiple Cassandra nodes per DC and
    > raise the per-DC RF (e.g. `'dc-na': 3`).
 
-5. **Run repair to sync existing data** (on each node):
+5. **Verify the applied replication policy** (from any node):
+   ```bash
+   docker compose -f docker-compose.prod.yml exec cassandra sh -lc 'cqlsh -u cassandra -p "$CASSANDRA_SUPERUSER_PASSWORD" -e "DESCRIBE KEYSPACE sesamefs"'
+   docker compose -f docker-compose.prod.yml exec cassandra sh -lc 'cqlsh -u cassandra -p "$CASSANDRA_SUPERUSER_PASSWORD" -e "DESCRIBE KEYSPACE system_auth"'
+   ```
+
+6. **Run repair to sync existing data when expanding an existing cluster** (on each new node):
    ```bash
    docker compose -f docker-compose.prod.yml exec cassandra nodetool repair sesamefs
+   docker compose -f docker-compose.prod.yml exec cassandra nodetool repair system_auth
    ```
-   > This forces Cassandra to replicate all existing data to the new DC.
-   > Skip this only if both nodes started with empty data.
+   > This is required when you add a new DC after data already exists, including
+   > existing auth metadata in `system_auth`. For a fresh empty cluster where
+   > all DCs are bootstrapped before SesameFS starts serving traffic, this step
+   > can be skipped.
 
-6. **Start SesameFS + OnlyOffice** on all nodes:
+7. **Start SesameFS + OnlyOffice** on all nodes:
    ```bash
    docker compose -f docker-compose.prod.yml up -d
    ```
@@ -1320,9 +1341,9 @@ docker compose -f docker-compose.prod.yml exec cassandra nodetool status
 
 #### M5.3 — Replication is actually multi-DC
 
-A frequent silent failure: the cluster joined fine but the keyspace is still
-`SimpleStrategy` (single DC) because Step M4.4 was skipped or used the wrong
-DC names. Verify directly:
+A frequent silent failure: the cluster joined fine but the keyspace replication
+does not list every expected DC because the `.env` topology was incomplete or
+used the wrong DC names. Verify directly:
 
 ```bash
 docker compose -f docker-compose.prod.yml exec cassandra sh -lc 'cqlsh -u cassandra -p "$CASSANDRA_SUPERUSER_PASSWORD" -e "SELECT keyspace_name, replication FROM system_schema.keyspaces WHERE keyspace_name='sesamefs';"'

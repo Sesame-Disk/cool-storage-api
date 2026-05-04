@@ -148,8 +148,10 @@ init_cassandra_schema() {
 
     local container="cool-storage-api-cassandra-1"
 
-    # Create keyspace
-    docker exec $container cqlsh localhost -e "CREATE KEYSPACE IF NOT EXISTS sesamefs WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1};"
+    # Legacy test-stack bootstrap: hardcoded to a single 'datacenter1' DC.
+    # Real dev/prod use docker-compose*.yml, which honors CASSANDRA_REPLICATION_*
+    # env vars and applies NetworkTopologyStrategy declaratively.
+    docker exec $container cqlsh localhost -e "CREATE KEYSPACE IF NOT EXISTS sesamefs WITH replication = {'class': 'NetworkTopologyStrategy', 'datacenter1': 1};"
     log_success "Keyspace created"
 
     # Core tables
