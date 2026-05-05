@@ -21,9 +21,8 @@ services:
   sesamefs:
     image: ${SESAMEFS_IMAGE:?set SESAMEFS_IMAGE in .env}
     expose:
-      - "8080"                      # Reachable as sesamefs:8080 on sfs-net
+      - "8080"                      # Reachable as sesamefs:8080 on the private deploy network
     networks:
-      - sfs-net
       - internal
     env_file:
       - ${ENV_FILE:-.env}           # All secrets from the selected env file
@@ -283,10 +282,12 @@ services:
   onlyoffice:
     image: ${ONLYOFFICE_IMAGE:-onlyoffice/documentserver:latest}
     expose:
-      - "80"                        # Reachable as onlyoffice:80 on sfs-net
+      - "80"                        # Reachable internally as onlyoffice:80 and externally via the regional alias on sfs-net
     networks:
-      - sfs-net
-      - internal
+      internal: {}
+      sfs-net:
+        aliases:
+          - "sesamefs-onlyoffice-${DEPLOY_ID:?set DEPLOY_ID in .env}"
     environment:
       - JWT_ENABLED=true
       - JWT_SECRET=${ONLYOFFICE_JWT_SECRET}
@@ -314,9 +315,12 @@ services:
   frontend:
     image: ${FRONTEND_IMAGE:?set FRONTEND_IMAGE in .env}
     expose:
-      - "80"                        # Reachable as frontend:80 on sfs-net
+      - "80"                        # Reachable internally as frontend:80 and externally via the regional alias on sfs-net
     networks:
-      - sfs-net
+      internal: {}
+      sfs-net:
+        aliases:
+          - "sesamefs-frontend-${DEPLOY_ID:?set DEPLOY_ID in .env}"
     restart: unless-stopped
     logging:
       driver: json-file
@@ -348,6 +352,6 @@ networks:
   sfs-net:
     external: true        # Create once: docker network create sfs-net
   internal:
-    # Not marked 'internal: true' — Cassandra needs outbound routing for
-    # multi-region gossip. Security is enforced by binding ports only to
-    # CASSANDRA_BIND_IP (private IP), never 0.0.0.0.
+    # Private per-deploy network for frontend <-> sesamefs <-> onlyoffice and
+    # for the local Cassandra node. Not marked 'internal: true' because
+    # Cassandra still needs outbound routing for multi-region gossip.

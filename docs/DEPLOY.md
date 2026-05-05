@@ -13,7 +13,8 @@ Internet
    │                        │
    │                        └─► sfs-net (Docker network)
    │                              │
-   │                              └─► frontend:80      (nginx:alpine — SPA + API proxy)
+   │                              ├─► sesamefs-frontend-<DEPLOY_ID>:80   (nginx:alpine — SPA + API proxy)
+   │                              └─► sesamefs-onlyoffice-<DEPLOY_ID>:80 (Document editor, when exposed via the central nginx)
    │                                    │
    │                                    ├─► sesamefs:8080  (Go API backend, expose-only)
    │                                    └─► onlyoffice:80  (Document editor, expose-only)
@@ -31,10 +32,12 @@ Outbound HTTPS:
 The central nginx is **external** to `docker-compose.prod.yml` (the bundled
 `nginx` service in the compose file is commented out as optional). In the
 supported topology the central nginx joins `sfs-net` and proxies to the
-`frontend` container, which in turn proxies API paths to `sesamefs`. None of
-the application containers expose ports to the host — only `expose:` on the
-internal Docker network. See [Config Resolution](#config-resolution) for how
-`SERVER_TRUSTED_PROXIES` interacts with this two-nginx chain.
+per-deploy `sesamefs-frontend-<DEPLOY_ID>` container alias, which in turn proxies API
+paths to `sesamefs` on the private deploy network. If OnlyOffice is published
+through the central nginx, target the matching `sesamefs-onlyoffice-<DEPLOY_ID>`
+alias on `sfs-net`. None of the application containers expose ports to the host
+— only `expose:` on the Docker networks. See [Config Resolution](#config-resolution)
+for how `SERVER_TRUSTED_PROXIES` interacts with this two-nginx chain.
 
 **Files involved:**
 
@@ -50,7 +53,7 @@ internal Docker network. See [Config Resolution](#config-resolution) for how
 ## Read This First
 
 - Multi-region is the default production path for this repo. Read [Default Production Path (Multi-Region)](#default-production-path-multi-region) first, then come back to the shared preparation steps below.
-- `docker-compose.prod.yml` does **not** publish the app directly to the host. By default it expects an external reverse proxy that can reach the `frontend` container on the external Docker network `sfs-net`.
+- `docker-compose.prod.yml` does **not** publish the app directly to the host. By default it expects an external reverse proxy that can reach the per-deploy `sesamefs-frontend-$DEPLOY_ID` container alias on the external Docker network `sfs-net`.
 - You must create `sfs-net` before the first `docker compose up`:
 
 ```bash
@@ -131,8 +134,10 @@ The supported default is:
 
 - external central nginx or load balancer outside `docker-compose.prod.yml`
 - that proxy attaches to `sfs-net`
-- it forwards web traffic to `frontend:80`
-- the frontend nginx proxies API routes to `sesamefs:8080`
+- it forwards web traffic to `sesamefs-frontend-$DEPLOY_ID:80`
+- if it also fronts OnlyOffice, it forwards office traffic to `sesamefs-onlyoffice-$DEPLOY_ID:80`
+- the frontend nginx proxies API routes to `sesamefs:8080` on the private deploy network
+- `DEPLOY_ID` is required and must be unique per deploy that joins `sfs-net`. The short service names (`frontend`, `onlyoffice`) are also resolvable on `sfs-net` but collide between stacks — never target them from the central nginx, only the regional alias above.
 
 Before the first deploy on every host:
 
@@ -866,7 +871,8 @@ Settings that **cannot** be set via env vars and must be in this file:
 | `METRICS_ENABLED` | `monitoring.metrics_enabled` | |
 | `DESKTOP_CUSTOM_BRAND` | — (server-info response) | Brand name shown in desktop client (default: `Sesame Disk`) |
 | `DESKTOP_CUSTOM_LOGO` | — (server-info response) | Full URL to logo image shown in desktop client (optional) |
-| `FRONTEND_URL` | — | Internal URL of the frontend container used by share link pages to resolve hashed JS/CSS bundle names via `asset-manifest.json`. Default: `http://frontend:80`. Only change if the frontend container runs on a different host/port. |
+| `FRONTEND_URL` | — | Internal URL of the frontend container used by share link pages to resolve hashed JS/CSS bundle names via `asset-manifest.json`. Default: `http://frontend:80` on the private deploy network. Only change if the frontend container runs on a different host/port. |
+| `DEPLOY_ID` | — | **Required.** Suffix for this stack's public aliases on the shared `sfs-net` network: `sesamefs-frontend-$DEPLOY_ID` and `sesamefs-onlyoffice-$DEPLOY_ID`. Must be unique across every deploy that joins `sfs-net`. In multi-region this is typically the same value as `SERVER_REGION`; in single-region pick anything stable (e.g. `prod`). |
 
 ---
 
