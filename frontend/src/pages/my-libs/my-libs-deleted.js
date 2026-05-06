@@ -2,7 +2,8 @@ import React, { Component, Fragment } from 'react';
 import PropTypes from 'prop-types';
 import { Link } from '@gatsbyjs/reach-router';
 import moment from 'moment';
-import { gettext, siteRoot, lang, trashReposExpireDays } from '../../utils/constants';
+import { gettext, siteRoot, lang } from '../../utils/constants';
+import { getDeletedLibrariesCleanupTip, getDeletedLibrariesEmptyMessage } from '../../utils/trash-retention';
 import { seafileAPI } from '../../utils/seafile-api';
 import { Utils } from '../../utils/utils';
 import toaster from '../../components/toast';
@@ -38,10 +39,13 @@ class MyLibsDeleted extends Component {
     let deletedRepoList = this.state.deletedRepoList.filter(item => {
       return item.repo_id !== repoID;
     });
-    this.setState({deletedRepoList: deletedRepoList});
+    this.setState({ deletedRepoList: deletedRepoList });
   };
 
   render() {
+    const emptyMessage = getDeletedLibrariesEmptyMessage();
+    const cleanupTip = getDeletedLibrariesCleanupTip();
+
     return (
       <Fragment>
         <div className="main-panel-north">
@@ -51,7 +55,7 @@ class MyLibsDeleted extends Component {
           <div className="cur-view-container">
             <div className="cur-view-path">
               <div className="path-container">
-                <Link to={ siteRoot + 'my-libs/' }>{gettext('My Libraries')}</Link>
+                <Link to={siteRoot + 'my-libs/'}>{gettext('My Libraries')}</Link>
                 <span className="path-split">/</span>
                 <span>{gettext('Deleted Libraries')}</span>
               </div>
@@ -59,14 +63,14 @@ class MyLibsDeleted extends Component {
             <div className="cur-view-content">
               {this.state.isLoading && <Loading />}
               {(!this.state.isLoading && this.state.deletedRepoList.length === 0) &&
-              <EmptyTip>
-                <h2>{gettext('No deleted libraries')}</h2>
-                <p>{gettext('You have not deleted any libraries in the last {placeholder} days. A deleted library will be cleaned automatically after this period.').replace('{placeholder}', trashReposExpireDays)}</p>
-              </EmptyTip>
+                <EmptyTip>
+                  <h2>{gettext('No deleted libraries')}</h2>
+                  <p>{emptyMessage}</p>
+                </EmptyTip>
               }
               {this.state.deletedRepoList.length !== 0 &&
                 <div>
-                  <p className="tip mt-2">{gettext('Tip: libraries deleted {placeholder} days ago will be cleaned automatically.').replace('{placeholder}', trashReposExpireDays)}</p>
+                  <p className="tip mt-2">{cleanupTip}</p>
                   <DeletedRepoTable
                     deletedRepoList={this.state.deletedRepoList}
                     refreshDeletedRepoList={this.refreshDeletedRepoList}
@@ -89,10 +93,10 @@ class DeletedRepoTable extends Component {
       <table>
         <thead>
           <tr>
-            <th style={{width: '4%'}}>{/*img*/}</th>
-            <th style={{width: '52%'}}>{gettext('Name')}</th>
-            <th style={{width: '30%'}}>{gettext('Deleted Time')}</th>
-            <th style={{width: '14%'}}></th>
+            <th style={{ width: '4%' }}>{/*img*/}</th>
+            <th style={{ width: '52%' }}>{gettext('Name')}</th>
+            <th style={{ width: '30%' }}>{gettext('Deleted Time')}</th>
+            <th style={{ width: '14%' }}></th>
           </tr>
         </thead>
         <tbody>

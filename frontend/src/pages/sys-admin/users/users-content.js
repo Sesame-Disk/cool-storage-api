@@ -5,6 +5,7 @@ import { Link } from '@gatsbyjs/reach-router';
 import { Utils } from '../../../utils/utils';
 import { seafileAPI } from '../../../utils/seafile-api';
 import { isPro, username, gettext, multiInstitution, siteRoot } from '../../../utils/constants';
+import { appendRetentionNotice, getDeletedUsersRetentionMessage } from '../../../utils/trash-retention';
 import toaster from '../../../components/toast';
 import EmptyTip from '../../../components/empty-tip';
 import Loading from '../../../components/loading';
@@ -57,6 +58,7 @@ class Content extends Component {
       curPerPage, hasNextPage, currentPage,
       sortBy, sortOrder
     } = this.props;
+    const deletedUsersRetentionMessage = getDeletedUsersRetentionMessage('sys');
     if (loading) {
       return <Loading />;
     } else if (errorMsg) {
@@ -116,6 +118,7 @@ class Content extends Component {
 
       const table = (
         <Fragment>
+          <p className="mt-2 small text-secondary">{deletedUsersRetentionMessage}</p>
           <table>
             <thead>
               <tr>
@@ -407,11 +410,18 @@ class Item extends Component {
     } = this.state;
 
     const itemName = '<span class="op-target">' + Utils.HTMLescape(item.name) + '</span>';
-    const deleteDialogMsg = gettext('Are you sure you want to delete {placeholder} ?').replace('{placeholder}', itemName);
+    const deletedUsersRetentionMessage = getDeletedUsersRetentionMessage('sys');
+    const deleteDialogMsg = appendRetentionNotice(
+      gettext('Are you sure you want to delete {placeholder} ?').replace('{placeholder}', itemName),
+      deletedUsersRetentionMessage
+    );
     const resetPasswordDialogMsg = '';
     const revokeAdminDialogMsg = gettext('Are you sure you want to revoke the admin permission of {placeholder} ?').replace('{placeholder}', itemName);
     const confirmSetUserInactiveMsg = gettext('Are you sure you want to set {user_placeholder} inactive?').replace('{user_placeholder}', itemName);
-    const restoreUserDialogMsg = gettext('Are you sure you want to restore {placeholder} ?').replace('{placeholder}', itemName);
+    const restoreUserDialogMsg = appendRetentionNotice(
+      gettext('Are you sure you want to restore {placeholder} ?').replace('{placeholder}', itemName),
+      deletedUsersRetentionMessage
+    );
 
     const effectiveStatus = item.status || (item.is_active ? 'active' : 'inactive');
     const isDeleted = effectiveStatus === 'deleted';

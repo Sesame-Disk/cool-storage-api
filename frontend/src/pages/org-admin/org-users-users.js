@@ -15,6 +15,7 @@ import { seafileAPI } from '../../utils/seafile-api';
 import OrgUserInfo from '../../models/org-user';
 import { accountsOrgUserManagementURL, billingUrl, gettext, invitationLink, isOrgOwner, orgID, siteRoot, orgEnableAdminInviteUser, username } from '../../utils/constants';
 import { ACCOUNTS_ORG_USER_ACTIONS, ACCOUNTS_ORG_USER_VIEWS, buildAccountsOrgUserManagementURL } from '../../utils/accounts-org-user-management';
+import { getDeletedUsersRetentionMessage } from '../../utils/trash-retention';
 import { getUpgradeState } from '../../utils/upgrade-state';
 import { Utils } from '../../utils/utils';
 
@@ -485,6 +486,7 @@ class OrgUsers extends Component {
                 );
               })}
             </div>
+            <p className="small text-secondary">{getDeletedUsersRetentionMessage()}</p>
             <OrgUsersList
               canManageUsers={!this.state.userWritesDisabled}
               accountsOrgManagementURL={this.state.accountsOrgManagementURL}

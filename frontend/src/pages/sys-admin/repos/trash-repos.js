@@ -5,6 +5,7 @@ import moment from 'moment';
 import { Utils } from '../../../utils/utils';
 import { seafileAPI } from '../../../utils/seafile-api';
 import { gettext } from '../../../utils/constants';
+import { getDeletedLibrariesCleanupTip, getDeletedLibrariesEmptyMessage } from '../../../utils/trash-retention';
 import toaster from '../../../components/toast';
 import EmptyTip from '../../../components/empty-tip';
 import Loading from '../../../components/loading';
@@ -16,8 +17,6 @@ import MainPanelTopbar from '../main-panel-topbar';
 import Search from '../search';
 import UserLink from '../user-link';
 import ReposNav from './repos-nav';
-
-const { trashReposExpireDays } = window.sysadmin.pageOptions;
 
 class Content extends Component {
 
@@ -46,6 +45,8 @@ class Content extends Component {
 
   render() {
     const { loading, errorMsg, items, pageInfo, curPerPage } = this.props;
+    const emptyMessage = getDeletedLibrariesEmptyMessage('sys');
+    const cleanupTip = getDeletedLibrariesCleanupTip('sys');
     if (loading) {
       return <Loading />;
     } else if (errorMsg) {
@@ -54,11 +55,12 @@ class Content extends Component {
       const emptyTip = (
         <EmptyTip>
           <h2>{gettext('No deleted libraries')}</h2>
+          <p>{emptyMessage}</p>
         </EmptyTip>
       );
       const table = (
         <Fragment>
-          <p className="mt-4 small text-secondary">{gettext('Tip: libraries deleted {trashReposExpireDays} days ago will be cleaned automatically.').replace('{trashReposExpireDays}', trashReposExpireDays)}</p>
+          <p className="mt-4 small text-secondary">{cleanupTip}</p>
           <table className="table-hover">
             <thead>
               <tr>

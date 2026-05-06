@@ -439,6 +439,9 @@ func (s *Server) buildAppBootstrapPageOptions(identity bootstrapIdentity, userDa
 	if name == "" {
 		name = identity.UserID
 	}
+	userGraceDays := s.config.GC.UserGraceDays
+	orgGraceDays := s.config.GC.OrgGraceDays
+	trashRetentionDays := s.config.GC.TrashRetentionDays
 	authenticated := identity.UserID != "" && identity.OrgID != ""
 	hasDeleteAccount := strings.TrimSpace(s.config.Accounts.DeleteAccountURL) != ""
 
@@ -485,6 +488,9 @@ func (s *Server) buildAppBootstrapPageOptions(identity bootstrapIdentity, userDa
 		"billingCycle":            "",
 		"maxUsers":                0,
 		"currentUsers":            0,
+		"userGraceDays":           userGraceDays,
+		"orgGraceDays":            orgGraceDays,
+		"trashReposExpireDays":    trashRetentionDays,
 		"currentPeriodStartedAt":  nil,
 		"currentPeriodEndsAt":     nil,
 		"upgradeFeatures":         []string{},
@@ -657,7 +663,9 @@ func (s *Server) buildSysAdminBootstrapPageOptions(canAccessSysAdmin bool) gin.H
 		"haveLDAP":                       false,
 		"enable_share_link_report_abuse": false,
 		"twoFactorAuthEnabled":           false,
-		"trashReposExpireDays":           30,
+		"userGraceDays":                  s.config.GC.UserGraceDays,
+		"orgGraceDays":                   s.config.GC.OrgGraceDays,
+		"trashReposExpireDays":           s.config.GC.TrashRetentionDays,
 		"availableRoles":                 []string{"default", "user", "admin", "guest", "readonly"},
 		"availableAdminRoles":            []string{"superadmin"},
 		"institutions":                   []string{},

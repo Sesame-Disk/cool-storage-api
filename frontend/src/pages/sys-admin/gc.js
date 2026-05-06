@@ -1,6 +1,7 @@
 import React, { Component, Fragment } from 'react';
 import moment from 'moment';
 import { gettext } from '../../utils/constants';
+import { formatRetentionDaysValue, getDeletedLibrariesRetentionMessage, getDeletedOrganizationsRetentionMessage, getDeletedUsersRetentionMessage, getOrgGraceDays, getTrashReposExpireDays, getUserGraceDays } from '../../utils/trash-retention';
 import { seafileAPI } from '../../utils/seafile-api';
 import { Utils } from '../../utils/utils';
 import toaster from '../../components/toast';
@@ -604,6 +605,22 @@ class GC extends Component {
                                 {statusError && <p className="error text-center mt-4">{statusError}</p>}
                                 {(!loadingStatus && !statusError && status) &&
                                     <Fragment>
+                                        {(() => {
+                                            const userGraceDays = getUserGraceDays('sys');
+                                            const orgGraceDays = getOrgGraceDays('sys');
+                                            const trashReposExpireDays = getTrashReposExpireDays('sys');
+
+                                            return (
+                                                <div className="gc-admin-alert gc-admin-alert-info mb-3">
+                                                    <div className="gc-admin-alert-title">{gettext('Retention policy')}</div>
+                                                    <div className="gc-admin-alert-body">
+                                                        <div>{gettext('Deleted users')}: {formatRetentionDaysValue(userGraceDays)}. {getDeletedUsersRetentionMessage('sys')}</div>
+                                                        <div>{gettext('Deleted organizations')}: {formatRetentionDaysValue(orgGraceDays)}. {getDeletedOrganizationsRetentionMessage('sys')}</div>
+                                                        <div>{gettext('Deleted libraries')}: {formatRetentionDaysValue(trashReposExpireDays)}. {getDeletedLibrariesRetentionMessage('sys')}</div>
+                                                    </div>
+                                                </div>
+                                            );
+                                        })()}
                                         {status.last_scan_error &&
                                             <div className="gc-admin-alert gc-admin-alert-danger mb-3">
                                                 <div className="gc-admin-alert-title">{gettext('Last scanner error')}</div>
@@ -620,6 +637,9 @@ class GC extends Component {
                                             {this.renderStatusCard(gettext('Blocks deleted'), status.blocks_deleted_total || 0, gettext('Worker runtime counter'))}
                                             {this.renderStatusCard(gettext('Snapshot age'), this.formatSnapshotAge(status.snapshot_age_seconds), gettext('Age of the last reconciliation snapshot'))}
                                             {this.renderStatusCard(gettext('Grace period'), `${status.grace_period_seconds || 0}s`, gettext('Configured retention delay before delete'))}
+                                            {this.renderStatusCard(gettext('User grace window'), formatRetentionDaysValue(getUserGraceDays('sys')), getDeletedUsersRetentionMessage('sys'))}
+                                            {this.renderStatusCard(gettext('Org grace window'), formatRetentionDaysValue(getOrgGraceDays('sys')), getDeletedOrganizationsRetentionMessage('sys'))}
+                                            {this.renderStatusCard(gettext('Library trash retention'), formatRetentionDaysValue(getTrashReposExpireDays('sys')), getDeletedLibrariesRetentionMessage('sys'))}
                                         </div>
                                         <div className="gc-admin-status-grid mt-3">
                                             {this.renderStatusCard(gettext('Last worker run'), this.formatTimestamp(status.last_worker_run), null)}

@@ -4,6 +4,7 @@ import { Dropdown, DropdownToggle, DropdownMenu, DropdownItem } from 'reactstrap
 import { gettext, siteRoot, orgID, username } from '../../utils/constants';
 import { seafileAPI } from '../../utils/seafile-api';
 import { ACCOUNTS_ORG_USER_ACTIONS, ACCOUNTS_ORG_USER_VIEWS, buildAccountsOrgUserManagementURL } from '../../utils/accounts-org-user-management';
+import { appendRetentionNotice, getDeletedUsersRetentionMessage } from '../../utils/trash-retention';
 import { Utils } from '../../utils/utils';
 import toaster from '../../components/toast';
 import Selector from '../../components/single-selector';
@@ -271,7 +272,11 @@ class UserItem extends React.Component {
 
     const itemName = '<span class="op-target">' + Utils.HTMLescape(user.name) + '</span>';
     const confirmSetUserInactiveMsg = gettext('Are you sure you want to set {user_placeholder} inactive?').replace('{user_placeholder}', itemName);
-    const restoreUserDialogMsg = gettext('Are you sure you want to restore {placeholder} ?').replace('{placeholder}', itemName);
+    const deletedUsersRetentionMessage = getDeletedUsersRetentionMessage();
+    const restoreUserDialogMsg = appendRetentionNotice(
+      gettext('Are you sure you want to restore {placeholder} ?').replace('{placeholder}', itemName),
+      deletedUsersRetentionMessage
+    );
     const menuOperations = this.getMenuOperations();
 
     return (

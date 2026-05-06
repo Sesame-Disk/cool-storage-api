@@ -4,6 +4,7 @@ import { Link } from '@gatsbyjs/reach-router';
 import moment from 'moment';
 import { Utils } from '../../../utils/utils';
 import { siteRoot, gettext } from '../../../utils/constants';
+import { appendRetentionNotice, getDeletedOrganizationsRetentionMessage } from '../../../utils/trash-retention';
 import EmptyTip from '../../../components/empty-tip';
 import Loading from '../../../components/loading';
 import Paginator from '../../../components/paginator';
@@ -35,6 +36,7 @@ class Content extends Component {
 
   render() {
     const { loading, errorMsg, items } = this.props;
+    const deletedOrganizationsRetentionMessage = getDeletedOrganizationsRetentionMessage('sys');
     if (loading) {
       return <Loading />;
     } else if (errorMsg) {
@@ -47,6 +49,7 @@ class Content extends Component {
       );
       const table = (
         <Fragment>
+          <p className="mt-2 small text-secondary">{deletedOrganizationsRetentionMessage}</p>
           <table>
             <thead>
               <tr>
@@ -171,8 +174,10 @@ class Item extends Component {
         let orgName = '<span class="op-target">' + Utils.HTMLescape(res.data.org_name) + '</span>';
         let userCount = '<span class="op-target">' + Utils.HTMLescape(res.data.users_count) + '</span>';
         let repoCount = '<span class="op-target">' + Utils.HTMLescape(res.data.repos_count) + '</span>';
-        let operationDialogMsg = gettext('Are you sure you want to delete {placeholder} ?')
-          .replace('{placeholder}', orgName) + '<br/>' +
+        let operationDialogMsg = appendRetentionNotice(
+          gettext('Are you sure you want to delete {placeholder} ?').replace('{placeholder}', orgName),
+          getDeletedOrganizationsRetentionMessage('sys')
+        ) + '<br/>' +
           gettext('{userCount} user(s) and {repoCount} libraries of this organization will also be deleted.')
             .replace('{userCount}', userCount)
             .replace('{repoCount}', repoCount);
@@ -191,6 +196,7 @@ class Item extends Component {
     }
 
     const orgName = '<span class="op-target">' + Utils.HTMLescape(this.props.item.org_name) + '</span>';
+    const deletedOrganizationsRetentionMessage = getDeletedOrganizationsRetentionMessage('sys');
     if (operationType === 'deactivate') {
       this.setState({
         isOperationDialogOpen: true,
@@ -216,7 +222,10 @@ class Item extends Component {
     this.setState({
       isOperationDialogOpen: true,
       operationDialogTitle: gettext('Restore Organization'),
-      operationDialogMsg: gettext('Are you sure you want to restore {placeholder} ?').replace('{placeholder}', orgName),
+      operationDialogMsg: appendRetentionNotice(
+        gettext('Are you sure you want to restore {placeholder} ?').replace('{placeholder}', orgName),
+        deletedOrganizationsRetentionMessage
+      ),
       operationDialogConfirmText: gettext('Restore'),
       operationHandler: this.restoreOrg,
     });
