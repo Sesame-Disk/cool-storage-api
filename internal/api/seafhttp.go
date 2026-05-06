@@ -276,8 +276,11 @@ type ChunkUpload struct {
 	ReceivedEnd int64 // Highest byte received; informational only.
 	Ranges      []byteRange
 	Finalizing  bool
-	updatedAt   time.Time
-	mu          sync.Mutex
+
+	finalizationStarted    bool
+	accountedBlockPosition map[int]string
+	updatedAt              time.Time
+	mu                     sync.Mutex
 }
 
 type byteRange struct {
@@ -482,6 +485,13 @@ func (cu *ChunkUpload) WriteChunk(data []byte, start, end int64) error {
 	if err := validateChunkRange(start, end, cu.TotalSize, int64(len(data))); err != nil {
 		return err
 	}
+	if cu.finalizationStarted {
+		if cu.hasRangeLocked(start, end) {
+			cu.updatedAt = time.Now()
+			return nil
+		}
+		return fmt.Errorf("upload is finalizing")
+	}
 
 	// Seek to the start position
 	if _, err := cu.TempFile.Seek(start, io.SeekStart); err != nil {
@@ -517,6 +527,7 @@ func (cu *ChunkUpload) TryStartFinalization() bool {
 		return false
 	}
 	cu.Finalizing = true
+	cu.finalizationStarted = true
 	return true
 }
 
@@ -535,6 +546,13 @@ func (cu *ChunkUpload) WriteChunkFromReader(r io.Reader, start, end int64) error
 
 	if err := validateChunkRange(start, end, cu.TotalSize, -1); err != nil {
 		return err
+	}
+	if cu.finalizationStarted {
+		if cu.hasRangeLocked(start, end) {
+			cu.updatedAt = time.Now()
+			return nil
+		}
+		return fmt.Errorf("upload is finalizing")
 	}
 
 	if _, err := cu.TempFile.Seek(start, io.SeekStart); err != nil {
@@ -602,6 +620,59 @@ func (cu *ChunkUpload) isCompleteLocked() bool {
 		len(cu.Ranges) == 1 &&
 		cu.Ranges[0].Start == 0 &&
 		cu.Ranges[0].End >= cu.TotalSize-1
+}
+
+func (cu *ChunkUpload) hasRangeLocked(start, end int64) bool {
+	for _, r := range cu.Ranges {
+		if start >= r.Start && end <= r.End {
+			return true
+		}
+	}
+	return false
+}
+
+func (cu *ChunkUpload) AccountBlockOnce(index int, blockID string, account func() error) error {
+	cu.mu.Lock()
+	if existingBlockID, ok := cu.accountedBlockPosition[index]; ok {
+		cu.mu.Unlock()
+		if existingBlockID != blockID {
+			return fmt.Errorf("block at position %d changed after accounting", index)
+		}
+		return nil
+	}
+	cu.mu.Unlock()
+
+	if err := account(); err != nil {
+		return err
+	}
+
+	cu.mu.Lock()
+	defer cu.mu.Unlock()
+	if cu.accountedBlockPosition == nil {
+		cu.accountedBlockPosition = make(map[int]string)
+	}
+	if existingBlockID, ok := cu.accountedBlockPosition[index]; ok {
+		if existingBlockID != blockID {
+			return fmt.Errorf("block at position %d changed after accounting", index)
+		}
+		return nil
+	}
+	cu.accountedBlockPosition[index] = blockID
+	cu.updatedAt = time.Now()
+	return nil
+}
+
+func (cu *ChunkUpload) BlockAlreadyAccounted(index int, blockID string) (bool, error) {
+	cu.mu.Lock()
+	defer cu.mu.Unlock()
+	existingBlockID, ok := cu.accountedBlockPosition[index]
+	if !ok {
+		return false, nil
+	}
+	if existingBlockID != blockID {
+		return false, fmt.Errorf("block at position %d changed after accounting", index)
+	}
+	return true, nil
 }
 
 // GetContent reads the complete file content into memory.
@@ -1229,6 +1300,7 @@ readLoop:
 		sha1Hasher.Write(blockData)
 		blockSHA1Hash := sha1.Sum(blockData)
 		blockSHA1ID := hex.EncodeToString(blockSHA1Hash[:])
+		blockIndex := len(blockSHA1IDs)
 		blockSHA1IDs = append(blockSHA1IDs, blockSHA1ID)
 
 		// Bail early if a previous goroutine already failed.
@@ -1245,6 +1317,7 @@ readLoop:
 		}
 
 		blockSHA1IDLocal := blockSHA1ID
+		blockIndexLocal := blockIndex
 		blockDataLocal := blockData
 		eg.Go(func() error {
 			defer func() { <-sem }()
@@ -1260,6 +1333,15 @@ readLoop:
 
 			sha256Hash := sha256.Sum256(storedBlock)
 			sha256ID := hex.EncodeToString(sha256Hash[:])
+
+			accounted, accountErr := upload.BlockAlreadyAccounted(blockIndexLocal, sha256ID)
+			if accountErr != nil {
+				return accountErr
+			}
+			if accounted {
+				upload.Touch()
+				return nil
+			}
 
 			if _, putErr := blockStore.PutBlockAuto(egCtx, sha256ID, storedBlock); putErr != nil {
 				return fmt.Errorf("failed to store block: %w", putErr)
@@ -1281,7 +1363,9 @@ readLoop:
 				log.Printf("[finalizeUploadStreaming] WARNING: Failed to write reverse block_id_mapping org=%s int=%s ext=%s: %v", token.OrgID, sha256ID[:16], blockSHA1IDLocal[:16], revErr)
 			}
 
-			if blkErr := fsHelper.IncrementOrCreateBlock(token.OrgID, sha256ID, len(storedBlock), actualStorageClass, ""); blkErr != nil {
+			if blkErr := upload.AccountBlockOnce(blockIndexLocal, sha256ID, func() error {
+				return fsHelper.IncrementOrCreateBlock(token.OrgID, sha256ID, len(storedBlock), actualStorageClass, "")
+			}); blkErr != nil {
 				log.Printf("[finalizeUploadStreaming] WARNING: Failed to write block metadata org=%s block=%s: %v", token.OrgID, sha256ID[:16], blkErr)
 			}
 

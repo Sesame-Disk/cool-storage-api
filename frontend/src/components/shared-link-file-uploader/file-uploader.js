@@ -276,6 +276,23 @@ class FileUploader extends React.Component {
       uploadBitrate: uploadBitrate,
       uploadFileList: uploadFileList
     });
+    this.scheduleFinalizeStateRefresh(resumableFile);
+  };
+
+  scheduleFinalizeStateRefresh = (resumableFile) => {
+    window.setTimeout(() => {
+      const simultaneousUploads = getBaselineSimultaneousUploads(this.props.simultaneousUploads || resumableSimultaneousUploads);
+      let didMarkFinalizing = false;
+      let uploadFileList = this.state.uploadFileList.map(item => {
+        if (item.uniqueIdentifier === resumableFile.uniqueIdentifier) {
+          didMarkFinalizing = maybeMarkFileFinalizing(item, this.resumable, simultaneousUploads) || didMarkFinalizing;
+        }
+        return item;
+      });
+      if (didMarkFinalizing) {
+        this.setState({ uploadFileList });
+      }
+    }, 0);
   };
 
   restoreConcurrencyIfIdle = () => {

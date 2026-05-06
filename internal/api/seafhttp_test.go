@@ -1250,6 +1250,101 @@ func TestChunkUploadIsComplete_OutOfOrderLastChunk(t *testing.T) {
 	}
 }
 
+func TestChunkUploadWriteDuringFinalizationIsIdempotentOnly(t *testing.T) {
+	cm := NewChunkManager()
+
+	upload, err := cm.GetOrCreateUpload("token1", "test.bin", "/", 10)
+	if err != nil {
+		t.Fatalf("GetOrCreateUpload failed: %v", err)
+	}
+	defer func() {
+		upload.Cleanup()
+		cm.CleanupUpload("token1", "test.bin")
+	}()
+
+	if err := upload.WriteChunk([]byte("hello"), 0, 4); err != nil {
+		t.Fatalf("WriteChunk first chunk failed: %v", err)
+	}
+	if err := upload.WriteChunk([]byte("world"), 5, 9); err != nil {
+		t.Fatalf("WriteChunk second chunk failed: %v", err)
+	}
+	if !upload.TryStartFinalization() {
+		t.Fatal("upload should enter finalization")
+	}
+
+	if err := upload.WriteChunk([]byte("XXXXX"), 5, 9); err != nil {
+		t.Fatalf("duplicate range during finalization should be idempotent: %v", err)
+	}
+	content, err := upload.GetContent()
+	if err != nil {
+		t.Fatalf("GetContent failed: %v", err)
+	}
+	if string(content) != "helloworld" {
+		t.Fatalf("duplicate finalizing write mutated temp file: got %q", string(content))
+	}
+
+	if err := upload.WriteChunk([]byte("!"), 10, 10); err == nil {
+		t.Fatal("new range during finalization should be rejected")
+	}
+
+	upload.ResetFinalization()
+	if err := upload.WriteChunk([]byte("XXXXX"), 5, 9); err != nil {
+		t.Fatalf("duplicate range after failed finalization should stay idempotent: %v", err)
+	}
+	content, err = upload.GetContent()
+	if err != nil {
+		t.Fatalf("GetContent after reset failed: %v", err)
+	}
+	if string(content) != "helloworld" {
+		t.Fatalf("post-reset duplicate write mutated temp file: got %q", string(content))
+	}
+}
+
+func TestChunkUploadAccountBlockOnceSurvivesFinalizeRetry(t *testing.T) {
+	cm := NewChunkManager()
+
+	upload, err := cm.GetOrCreateUpload("token1", "test.bin", "/", 10)
+	if err != nil {
+		t.Fatalf("GetOrCreateUpload failed: %v", err)
+	}
+	defer func() {
+		upload.Cleanup()
+		cm.CleanupUpload("token1", "test.bin")
+	}()
+
+	calls := 0
+	account := func() error {
+		calls++
+		return nil
+	}
+	if err := upload.AccountBlockOnce(0, "block-a", account); err != nil {
+		t.Fatalf("first account failed: %v", err)
+	}
+	if err := upload.AccountBlockOnce(0, "block-a", account); err != nil {
+		t.Fatalf("retry account failed: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("account called %d times, want 1", calls)
+	}
+	if err := upload.AccountBlockOnce(0, "block-b", account); err == nil {
+		t.Fatal("same block position changing identity should be rejected")
+	}
+	accounted, err := upload.BlockAlreadyAccounted(0, "block-a")
+	if err != nil {
+		t.Fatalf("BlockAlreadyAccounted failed: %v", err)
+	}
+	if !accounted {
+		t.Fatal("block position should be marked accounted")
+	}
+	accounted, err = upload.BlockAlreadyAccounted(1, "block-a")
+	if err != nil {
+		t.Fatalf("BlockAlreadyAccounted for missing position failed: %v", err)
+	}
+	if accounted {
+		t.Fatal("missing block position should not be marked accounted")
+	}
+}
+
 // ============================================================================
 // TokenManager Concurrent Access Tests
 // ============================================================================

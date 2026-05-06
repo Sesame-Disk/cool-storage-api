@@ -23,6 +23,17 @@ const chunkBytesLoaded = (chunk) => {
     return loaded >= Math.max(0, endByte - startByte);
 };
 
+const chunkProgressLooksComplete = (chunk) => {
+    if (!chunk || typeof chunk.progress !== 'function') {
+        return false;
+    }
+
+    // ResumableJS caps an active XHR at 95% until the server response arrives.
+    // Seeing that cap means browser bytes are done and the request is waiting
+    // on server-side finalization.
+    return chunk.progress() >= 0.94;
+};
+
 const isAwaitingServerFinalize = (resumableFile) => {
     const chunks = getFileChunks(resumableFile);
     if (chunks.length === 0) {
@@ -38,7 +49,7 @@ const isAwaitingServerFinalize = (resumableFile) => {
         return false;
     }
 
-    return uploadingChunks.every(chunkBytesLoaded);
+    return uploadingChunks.every(chunk => chunkBytesLoaded(chunk) || chunkProgressLooksComplete(chunk));
 };
 
 const hasFinalizingFiles = (resumable) => {
@@ -92,7 +103,11 @@ export const getBaselineSimultaneousUploads = (configuredUploads) => {
 };
 
 export const isFileSaving = (resumableFile) => {
-    return !resumableFile.isSaved && Boolean(resumableFile.isFinalizing);
+    return !resumableFile.isSaved && (
+        Boolean(resumableFile.isFinalizing) ||
+        isAwaitingServerFinalize(resumableFile) ||
+        resumableFile.remainingTime === 0
+    );
 };
 
 export const maybeStartPendingUploadDuringFinalize = (resumable) => {

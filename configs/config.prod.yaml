@@ -33,7 +33,7 @@ server:
   read_timeout: 0s              # No timeout — large uploads can take minutes
   read_header_timeout: 10s      # Slowloris protection
   write_timeout: 0s             # No timeout — large downloads can take minutes
-  max_upload_mb: 20480          # 20480 MB (~20 GiB) max upload
+  max_upload_mb: 102400         # 102400 MB (~100 GiB) max upload
   trusted_proxies: []           # Configure exact nginx/load-balancer IP/CIDRs; empty disables X-Forwarded-For trust
   url: ""                      # Optional explicit public base URL; usually leave empty and let SesameFS derive it from request/proxy headers
   desktop_custom_brand: ""     # Optional desktop-client brand label override
