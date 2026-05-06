@@ -1,6 +1,7 @@
 import React, { Fragment } from 'react';
 import PropTypes from 'prop-types';
 import { gettext } from '../../utils/constants';
+import { isFileSaving } from '../../utils/upload-finalization';
 import { Utils } from '../../utils/utils';
 
 const propTypes = {
@@ -30,7 +31,11 @@ class UploadListItem extends React.Component {
     if (resumableFile.error) {
       uploadState = UPLOAD_ERROR;
     } else {
-      if (resumableFile.remainingTime === 0 && !resumableFile.isSaved) {
+      // isFinalizing: bytes fully transferred, waiting for the server to hash,
+      // store blocks to S3, and commit metadata. remainingTime alone is not a
+      // reliable signal because resumable.js keeps a non-zero ETA while the
+      // last chunk's XHR is still pending.
+      if (isFileSaving(resumableFile)) {
         uploadState = UPLOAD_ISSAVING;
       }
 
@@ -92,14 +97,17 @@ class UploadListItem extends React.Component {
                         <div className="progress-bar" role="progressbar" style={{ width: `${progress}%` }} aria-valuenow={progress} aria-valuemin="0" aria-valuemax="100"></div>
                       </div>
                       {(resumableFile.remainingTime === -1) && <div className="progress-text">{gettext('Preparing to upload...')}</div>}
-                      {(resumableFile.remainingTime > 0) && <div className="progress-text">{gettext('Remaining')}{' '}{Utils.formatTime(resumableFile.remainingTime)}</div>}
-                      {(resumableFile.remainingTime === 0) && <div className="progress-text">{gettext('Saving...')}</div>}
+                      {(!isFileSaving(resumableFile) && resumableFile.remainingTime > 0) && <div className="progress-text">{gettext('Remaining')}{' '}{Utils.formatTime(resumableFile.remainingTime)}</div>}
+                      {isFileSaving(resumableFile) && <div className="progress-text">{gettext('Saving...')}</div>}
                     </div>
                   )}
                   {!resumableFile.isUploading() && (
                     <div className="progress-container d-flex align-items-center">
                       <div className="progress">
                         <div className="progress-bar" role="progressbar" style={{ width: `${progress}%` }} aria-valuenow={progress} aria-valuemin="0" aria-valuemax="100"></div>
+                      </div>
+                      <div className="progress-text ml-2 mb-0">
+                        {isFileSaving(resumableFile) ? gettext('Saving...') : (progress === 0 ? gettext('Waiting...') : `${gettext('Uploading...')} ${progress}%`)}
                       </div>
                     </div>
                   )}

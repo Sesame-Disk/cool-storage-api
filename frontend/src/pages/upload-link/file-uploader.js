@@ -4,8 +4,9 @@ import React, { Fragment } from 'react';
 import PropTypes from 'prop-types';
 import Resumablejs from '@seafile/resumablejs';
 import MD5 from 'MD5';
-import { resumableUploadFileBlockSize, maxUploadFileSize, maxNumberOfFilesForFileupload } from '../../utils/constants';
+import { resumableUploadFileBlockSize, resumableSimultaneousUploads, maxUploadFileSize, maxNumberOfFilesForFileupload } from '../../utils/constants';
 import { seafileAPI } from '../../utils/seafile-api';
+import { clearFileUploadRuntimeState, getBaselineSimultaneousUploads, maybeMarkFileFinalizing, maybeStartPendingUploadDuringFinalize, restoreUploadConcurrencyIfIdle } from '../../utils/upload-finalization';
 import { Utils } from '../../utils/utils';
 import { gettext } from '../../utils/constants';
 import UploadProgressDialog from './upload-progress-dialog';
@@ -58,6 +59,7 @@ class FileUploader extends React.Component {
   }
 
   componentDidMount() {
+    const simultaneousUploads = getBaselineSimultaneousUploads(this.props.simultaneousUploads || resumableSimultaneousUploads);
     this.resumable = new Resumablejs({
       target: '',
       query: this.setQuery || {},
@@ -69,7 +71,7 @@ class FileUploader extends React.Component {
       headers: this.setHeaders || {},
       withCredentials: this.props.withCredentials || false,
       chunkSize: parseInt(resumableUploadFileBlockSize) * 1024 * 1024 || 1 * 1024 * 1024,
-      simultaneousUploads: this.props.simultaneousUploads || 1,
+      simultaneousUploads,
       fileParameterName: this.props.fileParameterName,
       generateUniqueIdentifier: this.generateUniqueIdentifier,
       forceChunkSize: true,
@@ -166,6 +168,8 @@ class FileUploader extends React.Component {
         relative_path: relative_path
       };
     }
+
+    maybeStartPendingUploadDuringFinalize(this.resumable);
   };
 
   onFileAdded = (resumableFile, files) => {
@@ -238,6 +242,7 @@ class FileUploader extends React.Component {
   };
 
   onFileProgress = (resumableFile) => {
+    const simultaneousUploads = getBaselineSimultaneousUploads(this.props.simultaneousUploads || resumableSimultaneousUploads);
     let uploadBitrate = this.getBitrate();
     let uploadFileList = this.state.uploadFileList.map(item => {
       if (item.uniqueIdentifier === resumableFile.uniqueIdentifier) {
@@ -246,6 +251,11 @@ class FileUploader extends React.Component {
           let time = Math.floor(lastSize / uploadBitrate);
           item.remainingTime = time;
         }
+        // All chunk bytes have been transferred but the server hasn't acked
+        // yet (it's hashing, storing blocks to S3, and committing metadata).
+        // Mark the file as finalizing so the UI shows "Saving..." instead of
+        // a stale "Remaining" countdown, and let the next queued file start.
+        maybeMarkFileFinalizing(item, this.resumable, simultaneousUploads);
       }
       return item;
     });
@@ -254,6 +264,10 @@ class FileUploader extends React.Component {
       uploadBitrate: uploadBitrate,
       uploadFileList: uploadFileList
     });
+  };
+
+  restoreConcurrencyIfIdle = () => {
+    restoreUploadConcurrencyIfIdle(this.resumable, getBaselineSimultaneousUploads(this.props.simultaneousUploads || resumableSimultaneousUploads));
   };
 
   getBitrate = () => {
@@ -324,12 +338,14 @@ class FileUploader extends React.Component {
       // update uploadFileList
       let uploadFileList = this.state.uploadFileList.map(item => {
         if (item.uniqueIdentifier === resumableFile.uniqueIdentifier) {
+          clearFileUploadRuntimeState(item);
           item.newFileName = relative_path + message.name;
           item.isSaved = true;
         }
         return item;
       });
       this.setState({ uploadFileList: uploadFileList });
+      this.restoreConcurrencyIfIdle();
 
       return;
     }
@@ -346,12 +362,14 @@ class FileUploader extends React.Component {
 
       let uploadFileList = this.state.uploadFileList.map(item => {
         if (item.uniqueIdentifier === resumableFile.uniqueIdentifier) {
+          clearFileUploadRuntimeState(item);
           item.newFileName = fileName;
           item.isSaved = true;
         }
         return item;
       });
       this.setState({ uploadFileList: uploadFileList });
+      this.restoreConcurrencyIfIdle();
 
       return;
     }
@@ -368,12 +386,14 @@ class FileUploader extends React.Component {
 
     let uploadFileList = this.state.uploadFileList.map(item => {
       if (item.uniqueIdentifier === resumableFile.uniqueIdentifier) {
+        clearFileUploadRuntimeState(item);
         item.newFileName = message.name;
         item.isSaved = true;
       }
       return item;
     });
     this.setState({ uploadFileList: uploadFileList });
+    this.restoreConcurrencyIfIdle();
   };
 
   onFileError = (resumableFile, message) => {
@@ -396,6 +416,7 @@ class FileUploader extends React.Component {
     let uploadFileList = this.state.uploadFileList.map(item => {
       if (item.uniqueIdentifier === resumableFile.uniqueIdentifier) {
         this.state.retryFileList.push(item);
+        clearFileUploadRuntimeState(item);
         item.error = error;
       }
       return item;
@@ -406,6 +427,7 @@ class FileUploader extends React.Component {
       retryFileList: this.state.retryFileList,
       uploadFileList: uploadFileList
     });
+    this.restoreConcurrencyIfIdle();
   };
 
   onComplete = () => {
@@ -489,6 +511,7 @@ class FileUploader extends React.Component {
   onCloseUploadDialog = () => {
     this.loaded = 0;
     this.resumable.files = [];
+    this.restoreConcurrencyIfIdle();
     // reset upload link loaded
     this.isUploadLinkLoaded = false;
     this.setState({ isUploadProgressDialogShow: false, uploadFileList: [], forbidUploadFileList: [] });
@@ -499,6 +522,7 @@ class FileUploader extends React.Component {
 
     let uploadFileList = this.state.uploadFileList.filter(item => {
       if (item.uniqueIdentifier === uploadingItem.uniqueIdentifier) {
+        clearFileUploadRuntimeState(item, { resetRemainingTime: true });
         item.cancel(); // execute cancel function will delete the file at the same time
         return false;
       }
@@ -513,11 +537,13 @@ class FileUploader extends React.Component {
     }
 
     this.setState({ uploadFileList: uploadFileList });
+    this.restoreConcurrencyIfIdle();
   };
 
   onCancelAllUploading = () => {
     let uploadFileList = this.state.uploadFileList.filter(item => {
       if (Math.round(item.progress() !== 1)) {
+        clearFileUploadRuntimeState(item, { resetRemainingTime: true });
         item.cancel();
         return false;
       }
@@ -530,6 +556,7 @@ class FileUploader extends React.Component {
       totalProgress: 100,
       uploadFileList: uploadFileList
     });
+    this.restoreConcurrencyIfIdle();
     // reset upload link loaded
     this.isUploadLinkLoaded = false;
   };
@@ -542,6 +569,7 @@ class FileUploader extends React.Component {
       });
       let uploadFileList = this.state.uploadFileList.map(item => {
         if (item.uniqueIdentifier === resumableFile.uniqueIdentifier) {
+          clearFileUploadRuntimeState(item, { resetRemainingTime: true });
           item.error = null;
           this.retryUploadFile(item);
         }
@@ -552,6 +580,7 @@ class FileUploader extends React.Component {
         retryFileList: retryFileList,
         uploadFileList: uploadFileList
       });
+      this.restoreConcurrencyIfIdle();
     }).catch(error => {
       let errMessage = Utils.getErrorMsg(error);
       toaster.danger(errMessage);

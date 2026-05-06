@@ -138,6 +138,49 @@ describe('seafile-api', () => {
 Add to `.github/workflows/test.yml`:
 ```yaml
 - name: Check coverage threshold
+
+---
+
+## 5. Web Upload Pipeline Follow-Ups (PENDING)
+
+### Current State
+The current web uploader now has two safe improvements in place:
+- UI switches to `Saving...` when the last chunk is waiting on server-side finalization.
+- The next queued file can start while the previous file is still finalizing its last chunk.
+
+Backend finalization is also partially improved: `finalizeUploadStreaming()` now parallelizes block PUTs and metadata writes instead of doing them fully serially.
+
+### Still Pending
+
+**1. Stream blocks to storage as chunks arrive**
+
+Current chunked uploads still land in a temp file first and only become blocks during finalization in [internal/api/seafhttp.go](internal/api/seafhttp.go). That means large uploads still pay a real finalization phase at the end, even though it is shorter than before.
+
+Pending improvement:
+- Convert each arriving 8 MB chunk directly into a stored block.
+- Persist per-upload block manifests incrementally.
+- Leave the last request to do only the final metadata commit.
+
+Main risks to design for:
+- Out-of-order chunk arrival.
+- Cleanup of orphaned blocks when commit fails or upload is abandoned.
+- Encrypted libraries must keep block encryption and block-ID mapping behavior identical.
+- Resume logic must know which blocks are already materialized.
+
+**2. Migrate the web frontend to the block API flow**
+
+The browser still uploads through `seafhttp` + ResumableJS. The repo already has block-oriented APIs in [internal/api/v2/blocks.go](internal/api/v2/blocks.go), but the web client does not use them yet.
+
+Pending improvement:
+- Hash blocks client-side.
+- Use `POST /api/v2/blocks/check` for dedup/resume.
+- Upload missing blocks individually.
+- Commit the file from the block manifest with a separate final step.
+
+Why this is deferred:
+- It is a protocol-level frontend migration, not a small UX patch.
+- It must preserve folder uploads, replace flows, shared links, upload links, retries, and progress UX.
+- It needs explicit browser-side hashing/performance validation on large files.
   run: |
     go test ./... -coverprofile=coverage.out
     COVERAGE=$(go tool cover -func=coverage.out | grep total | awk '{print $3}' | sed 's/%//')

@@ -17,6 +17,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -33,6 +34,7 @@ import (
 	"github.com/Sesame-Disk/sesamefs/internal/streaming"
 	"github.com/Sesame-Disk/sesamefs/internal/traffic"
 	"github.com/gin-gonic/gin"
+	"golang.org/x/sync/errgroup"
 )
 
 // TokenType represents the type of access token
@@ -271,9 +273,16 @@ type ChunkUpload struct {
 	TotalSize   int64
 	TempFile    *os.File
 	TempPath    string
-	ReceivedEnd int64 // Track the highest byte received
+	ReceivedEnd int64 // Highest byte received; informational only.
+	Ranges      []byteRange
+	Finalizing  bool
 	updatedAt   time.Time
 	mu          sync.Mutex
+}
+
+type byteRange struct {
+	Start int64
+	End   int64
 }
 
 // Chunked upload janitor tunables. The in-memory tracker TTL must be longer
@@ -464,10 +473,15 @@ func (cm *ChunkManager) sweepOnce() {
 	}
 }
 
-// WriteChunk writes a chunk to the correct position in the temp file
+// WriteChunk writes a chunk to the correct position in the temp file.
+// start/end are inclusive byte offsets from the Content-Range header.
 func (cu *ChunkUpload) WriteChunk(data []byte, start, end int64) error {
 	cu.mu.Lock()
 	defer cu.mu.Unlock()
+
+	if err := validateChunkRange(start, end, cu.TotalSize, int64(len(data))); err != nil {
+		return err
+	}
 
 	// Seek to the start position
 	if _, err := cu.TempFile.Seek(start, io.SeekStart); err != nil {
@@ -479,9 +493,8 @@ func (cu *ChunkUpload) WriteChunk(data []byte, start, end int64) error {
 		return fmt.Errorf("failed to write chunk: %w", err)
 	}
 
-	// Update received end marker
-	if end > cu.ReceivedEnd {
-		cu.ReceivedEnd = end
+	if err := cu.markRangeReceivedLocked(start, end); err != nil {
+		return err
 	}
 	cu.updatedAt = time.Now()
 
@@ -492,7 +505,26 @@ func (cu *ChunkUpload) WriteChunk(data []byte, start, end int64) error {
 
 // IsComplete checks if all chunks have been received
 func (cu *ChunkUpload) IsComplete() bool {
-	return cu.ReceivedEnd >= cu.TotalSize-1
+	cu.mu.Lock()
+	defer cu.mu.Unlock()
+	return cu.isCompleteLocked()
+}
+
+func (cu *ChunkUpload) TryStartFinalization() bool {
+	cu.mu.Lock()
+	defer cu.mu.Unlock()
+	if cu.Finalizing || !cu.isCompleteLocked() {
+		return false
+	}
+	cu.Finalizing = true
+	return true
+}
+
+func (cu *ChunkUpload) ResetFinalization() {
+	cu.mu.Lock()
+	defer cu.mu.Unlock()
+	cu.Finalizing = false
+	cu.updatedAt = time.Now()
 }
 
 // WriteChunkFromReader streams a chunk from a reader directly to the temp file
@@ -500,6 +532,10 @@ func (cu *ChunkUpload) IsComplete() bool {
 func (cu *ChunkUpload) WriteChunkFromReader(r io.Reader, start, end int64) error {
 	cu.mu.Lock()
 	defer cu.mu.Unlock()
+
+	if err := validateChunkRange(start, end, cu.TotalSize, -1); err != nil {
+		return err
+	}
 
 	if _, err := cu.TempFile.Seek(start, io.SeekStart); err != nil {
 		return fmt.Errorf("failed to seek: %w", err)
@@ -510,16 +546,62 @@ func (cu *ChunkUpload) WriteChunkFromReader(r io.Reader, start, end int64) error
 		return fmt.Errorf("failed to write chunk: %w", err)
 	}
 
-	// Update received end marker based on actual bytes written
-	actualEnd := start + written - 1
-	if actualEnd > cu.ReceivedEnd {
-		cu.ReceivedEnd = actualEnd
+	if err := validateChunkRange(start, end, cu.TotalSize, written); err != nil {
+		return err
+	}
+	if err := cu.markRangeReceivedLocked(start, end); err != nil {
+		return err
 	}
 	cu.updatedAt = time.Now()
 
 	log.Printf("[ChunkUpload] Streamed chunk: start=%d, written=%d, received_end=%d, total=%d",
 		start, written, cu.ReceivedEnd, cu.TotalSize)
 	return nil
+}
+
+func validateChunkRange(start, end, totalSize, written int64) error {
+	if start < 0 || end < start {
+		return fmt.Errorf("invalid chunk range: start=%d end=%d", start, end)
+	}
+	if totalSize > 0 && end >= totalSize {
+		return fmt.Errorf("chunk range exceeds total size: end=%d total=%d", end, totalSize)
+	}
+	expected := end - start + 1
+	if written >= 0 && written != expected {
+		return fmt.Errorf("chunk size mismatch: range=%d written=%d", expected, written)
+	}
+	return nil
+}
+
+func (cu *ChunkUpload) markRangeReceivedLocked(start, end int64) error {
+	cu.Ranges = append(cu.Ranges, byteRange{Start: start, End: end})
+	sort.Slice(cu.Ranges, func(i, j int) bool {
+		return cu.Ranges[i].Start < cu.Ranges[j].Start
+	})
+
+	merged := cu.Ranges[:0]
+	for _, r := range cu.Ranges {
+		if len(merged) == 0 || r.Start > merged[len(merged)-1].End+1 {
+			merged = append(merged, r)
+			continue
+		}
+		if r.End > merged[len(merged)-1].End {
+			merged[len(merged)-1].End = r.End
+		}
+	}
+	cu.Ranges = merged
+
+	if end > cu.ReceivedEnd {
+		cu.ReceivedEnd = end
+	}
+	return nil
+}
+
+func (cu *ChunkUpload) isCompleteLocked() bool {
+	return cu.TotalSize > 0 &&
+		len(cu.Ranges) == 1 &&
+		cu.Ranges[0].Start == 0 &&
+		cu.Ranges[0].End >= cu.TotalSize-1
 }
 
 // GetContent reads the complete file content into memory.
@@ -782,6 +864,14 @@ func (h *SeafHTTPHandler) resolveLibraryObjectStore(hostname, orgID, repoID stri
 // 8 MB matches Seafile's default CDC block size for good deduplication compatibility.
 const uploadBlockSize = 8 * 1024 * 1024 // 8 MB
 
+// finalizeUploadConcurrency caps the number of S3 PUTs running in parallel
+// during finalization of a chunked upload. The reader is sequential (one block
+// at a time from the temp file); only the per-block work (encrypt + S3 PUT +
+// Cassandra writes) runs concurrently. 8 keeps memory bounded
+// (≤ 8 × uploadBlockSize ≈ 64 MB extra) while cutting wall-clock by ~6–8× on
+// typical S3 latency.
+const finalizeUploadConcurrency = 8
+
 // HandleUpload handles file uploads via the upload token.
 // Supports both single-shot uploads and chunked/resumable uploads (via Content-Range header).
 // Large files are split into blocks and streamed to S3 — never fully loaded into RAM.
@@ -923,7 +1013,7 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 			return
 		}
 
-		if !upload.IsComplete() {
+		if !upload.TryStartFinalization() {
 			log.Printf("[HandleUpload] Chunk received, waiting for more: %d/%d", end+1, total)
 			c.JSON(http.StatusOK, gin.H{"success": true})
 			return
@@ -933,12 +1023,13 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 		log.Printf("[HandleUpload] All chunks received, finalizing upload (streaming)")
 		upload.Touch()
 		fileID, actualFilename, err := h.finalizeUploadStreaming(c, token, upload, parentDir, filename, storageKey, total, replaceFile)
-		chunkManager.CleanupUpload(tokenStr, filename)
 		if err != nil {
+			upload.ResetFinalization()
 			log.Printf("[HandleUpload] Finalization failed: %v", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to finalize upload"})
 			return
 		}
+		chunkManager.CleanupUpload(tokenStr, filename)
 
 		log.Printf("[HandleUpload] Upload complete: file=%s, size=%d, id=%s", actualFilename, total, fileID[:16])
 
@@ -1104,12 +1195,23 @@ func (h *SeafHTTPHandler) finalizeUploadStreaming(c *gin.Context, token *AccessT
 		return "", "", fmt.Errorf("block store not available: %w", err)
 	}
 
-	// Stream through the file in blocks, computing SHA-1 incrementally
+	// Stream the temp file sequentially (one block at a time) but submit per-block
+	// work (encrypt + S3 PUT + Cassandra writes) to a bounded worker pool. The reader
+	// stays single-threaded so we don't need to seek; what we parallelise is the
+	// network/IO-bound part that dominates wall-clock time.
 	sha1Hasher := sha1.New()
-	var blockSHA1IDs []string // SHA-1 block IDs for fs_object (Seafile compat)
-	buf := make([]byte, uploadBlockSize)
+	fsHelper := v2.NewFSHelper(h.db)
 
+	eg, egCtx := errgroup.WithContext(ctx)
+	sem := make(chan struct{}, finalizeUploadConcurrency)
+
+	var blockSHA1IDs []string // SHA-1 block IDs for fs_object (Seafile compat) — populated in order
+
+readLoop:
 	for {
+		// Allocate a fresh buffer per block so it can travel into a goroutine
+		// without aliasing. We don't reuse buffers across iterations.
+		buf := make([]byte, uploadBlockSize)
 		n, readErr := io.ReadFull(reader, buf)
 		if n == 0 {
 			if readErr == io.EOF {
@@ -1122,62 +1224,84 @@ func (h *SeafHTTPHandler) finalizeUploadStreaming(c *gin.Context, token *AccessT
 
 		blockData := buf[:n]
 
-		// Accumulate SHA-1 of plaintext for the overall file ID
+		// Sequential, in-order work: file-level SHA-1 accumulator and the
+		// block's own SHA-1 (which determines Seafile-compat block ordering).
 		sha1Hasher.Write(blockData)
-
-		// Block-level SHA-1 ID (for Seafile compatibility / fs_object block_ids)
 		blockSHA1Hash := sha1.Sum(blockData)
 		blockSHA1ID := hex.EncodeToString(blockSHA1Hash[:])
 		blockSHA1IDs = append(blockSHA1IDs, blockSHA1ID)
 
-		// Encrypt block if needed
-		storedBlock := blockData
-		if fileKey != nil {
-			storedBlock, err = crypto.EncryptBlockSeafile(blockData, fileKey, fileIV)
-			if err != nil {
-				return "", "", fmt.Errorf("failed to encrypt block: %w", err)
+		// Bail early if a previous goroutine already failed.
+		if err := egCtx.Err(); err != nil {
+			break
+		}
+
+		// Acquire a worker slot before spawning so we don't pile up goroutines
+		// or buffers when S3 is the bottleneck.
+		select {
+		case sem <- struct{}{}:
+		case <-egCtx.Done():
+			break readLoop
+		}
+
+		blockSHA1IDLocal := blockSHA1ID
+		blockDataLocal := blockData
+		eg.Go(func() error {
+			defer func() { <-sem }()
+
+			storedBlock := blockDataLocal
+			if fileKey != nil {
+				enc, encErr := crypto.EncryptBlockSeafile(blockDataLocal, fileKey, fileIV)
+				if encErr != nil {
+					return fmt.Errorf("failed to encrypt block: %w", encErr)
+				}
+				storedBlock = enc
 			}
-		}
 
-		// SHA-256 of stored content for block storage key
-		sha256Hash := sha256.Sum256(storedBlock)
-		sha256ID := hex.EncodeToString(sha256Hash[:])
+			sha256Hash := sha256.Sum256(storedBlock)
+			sha256ID := hex.EncodeToString(sha256Hash[:])
 
-		// Store block with PutBlockAuto (uses multipart for large blocks)
-		_, err = blockStore.PutBlockAuto(ctx, sha256ID, storedBlock)
-		if err != nil {
-			return "", "", fmt.Errorf("failed to store block: %w", err)
-		}
+			if _, putErr := blockStore.PutBlockAuto(egCtx, sha256ID, storedBlock); putErr != nil {
+				return fmt.Errorf("failed to store block: %w", putErr)
+			}
 
-		// Create SHA-1 → SHA-256 mapping (dual-write: forward + reverse lookup)
-		if err := h.db.Session().Query(`
-			INSERT INTO block_id_mappings (org_id, external_id, internal_id) VALUES (?, ?, ?)
-		`, token.OrgID, blockSHA1ID, sha256ID).Exec(); err != nil {
-			log.Printf("[finalizeUploadStreaming] CRITICAL: Failed to write block_id_mapping org=%s ext=%s int=%s: %v", token.OrgID, blockSHA1ID[:16], sha256ID[:16], err)
-			return "", "", fmt.Errorf("failed to create block mapping: %w", err)
-		}
-		if err := h.db.Session().Query(`
-			INSERT INTO block_id_mappings_by_internal (org_id, internal_id, external_id, created_at) VALUES (?, ?, ?, toTimestamp(now()))
-		`, token.OrgID, sha256ID, blockSHA1ID).Exec(); err != nil {
-			log.Printf("[finalizeUploadStreaming] WARNING: Failed to write reverse block_id_mapping org=%s int=%s ext=%s: %v", token.OrgID, sha256ID[:16], blockSHA1ID[:16], err)
-		}
+			// Forward mapping is on the critical read path — its failure aborts.
+			if mapErr := h.db.Session().Query(`
+				INSERT INTO block_id_mappings (org_id, external_id, internal_id) VALUES (?, ?, ?)
+			`, token.OrgID, blockSHA1IDLocal, sha256ID).Exec(); mapErr != nil {
+				log.Printf("[finalizeUploadStreaming] CRITICAL: Failed to write block_id_mapping org=%s ext=%s int=%s: %v", token.OrgID, blockSHA1IDLocal[:16], sha256ID[:16], mapErr)
+				return fmt.Errorf("failed to create block mapping: %w", mapErr)
+			}
 
-		// Register block metadata for size lookups (used by video/audio Range requests)
-		if err := v2.NewFSHelper(h.db).IncrementOrCreateBlock(token.OrgID, sha256ID, len(storedBlock), actualStorageClass, ""); err != nil {
-			log.Printf("[finalizeUploadStreaming] WARNING: Failed to write block metadata org=%s block=%s: %v", token.OrgID, sha256ID[:16], err)
-		}
+			// Reverse mapping and block metadata are best-effort (matches the
+			// previous serial behaviour: log on failure, don't abort).
+			if revErr := h.db.Session().Query(`
+				INSERT INTO block_id_mappings_by_internal (org_id, internal_id, external_id, created_at) VALUES (?, ?, ?, toTimestamp(now()))
+			`, token.OrgID, sha256ID, blockSHA1IDLocal).Exec(); revErr != nil {
+				log.Printf("[finalizeUploadStreaming] WARNING: Failed to write reverse block_id_mapping org=%s int=%s ext=%s: %v", token.OrgID, sha256ID[:16], blockSHA1IDLocal[:16], revErr)
+			}
 
-		upload.Touch()
+			if blkErr := fsHelper.IncrementOrCreateBlock(token.OrgID, sha256ID, len(storedBlock), actualStorageClass, ""); blkErr != nil {
+				log.Printf("[finalizeUploadStreaming] WARNING: Failed to write block metadata org=%s block=%s: %v", token.OrgID, sha256ID[:16], blkErr)
+			}
+
+			upload.Touch()
+			return nil
+		})
 
 		if readErr == io.EOF || readErr == io.ErrUnexpectedEOF {
 			break
 		}
 	}
 
+	if err := eg.Wait(); err != nil {
+		return "", "", err
+	}
+
 	// File ID = SHA-1 of the complete plaintext
 	fileID := hex.EncodeToString(sha1Hasher.Sum(nil))
 
-	log.Printf("[finalizeUploadStreaming] Stored %d blocks for file %s (size=%d)", len(blockSHA1IDs), fileID[:16], totalSize)
+	log.Printf("[finalizeUploadStreaming] Stored %d blocks for file %s (size=%d, parallelism=%d)", len(blockSHA1IDs), fileID[:16], totalSize, finalizeUploadConcurrency)
 
 	// Update filesystem metadata with multiple block IDs
 	commitID, actualFilename, err := h.commitUploadedFileMultiBlock(token.OrgID, token.RepoID, token.UserID, parentDir, filename, fileID, blockSHA1IDs, totalSize, replace)

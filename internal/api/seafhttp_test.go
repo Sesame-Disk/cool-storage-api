@@ -1154,13 +1154,13 @@ func TestChunkUploadWriteAndRead(t *testing.T) {
 	}()
 
 	// Write chunk
-	err = upload.WriteChunk([]byte("hello"), 0, 5)
+	err = upload.WriteChunk([]byte("hello"), 0, 4)
 	if err != nil {
 		t.Fatalf("WriteChunk failed: %v", err)
 	}
 
 	// Write second chunk
-	err = upload.WriteChunk([]byte("world"), 5, 10)
+	err = upload.WriteChunk([]byte("world"), 5, 9)
 	if err != nil {
 		t.Fatalf("WriteChunk (2nd) failed: %v", err)
 	}
@@ -1196,9 +1196,57 @@ func TestChunkUploadIsComplete_Incomplete(t *testing.T) {
 		t.Error("empty upload should not be complete")
 	}
 
-	upload.WriteChunk([]byte("partial"), 0, 7)
+	upload.WriteChunk([]byte("partial"), 0, 6)
 	if upload.IsComplete() {
 		t.Error("partially written upload should not be complete")
+	}
+}
+
+func TestChunkUploadIsComplete_OutOfOrderLastChunk(t *testing.T) {
+	cm := NewChunkManager()
+
+	upload, err := cm.GetOrCreateUpload("token1", "test.bin", "/", 12)
+	if err != nil {
+		t.Fatalf("GetOrCreateUpload failed: %v", err)
+	}
+	defer func() {
+		upload.Cleanup()
+		cm.CleanupUpload("token1", "test.bin")
+	}()
+
+	if err := upload.WriteChunk([]byte("world!"), 6, 11); err != nil {
+		t.Fatalf("WriteChunk last chunk failed: %v", err)
+	}
+	if upload.IsComplete() {
+		t.Fatal("upload should not be complete when only the final range was received")
+	}
+	if upload.TryStartFinalization() {
+		t.Fatal("upload should not start finalization with missing leading range")
+	}
+
+	if err := upload.WriteChunk([]byte("hello "), 0, 5); err != nil {
+		t.Fatalf("WriteChunk first chunk failed: %v", err)
+	}
+	if !upload.IsComplete() {
+		t.Fatal("upload should be complete after all ranges are received")
+	}
+	if !upload.TryStartFinalization() {
+		t.Fatal("first finalization attempt should win")
+	}
+	if upload.TryStartFinalization() {
+		t.Fatal("second finalization attempt should be rejected")
+	}
+	upload.ResetFinalization()
+	if !upload.TryStartFinalization() {
+		t.Fatal("retry should be able to restart finalization after a transient failure")
+	}
+
+	content, err := upload.GetContent()
+	if err != nil {
+		t.Fatalf("GetContent failed: %v", err)
+	}
+	if string(content) != "hello world!" {
+		t.Errorf("content = %q, want %q", string(content), "hello world!")
 	}
 }
 
