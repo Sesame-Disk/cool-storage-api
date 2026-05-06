@@ -385,12 +385,24 @@ gc:
 ```yaml
 onlyoffice:
   enabled: true
-  api_js_url: "http://localhost:8088/web-apps/apps/api/documents/api.js"  # Browser-accessible URL
+  api_js_url: "https://office.example.com/web-apps/apps/api/documents/api.js"  # Browser-accessible URL
   jwt_secret: "your-secret-key"
-  server_url: "http://sesamefs:8080"  # URL for OnlyOffice container to reach SesameFS
+  server_url: ""      # Optional explicit SesameFS URL for OnlyOffice fetches
+  internal_url: ""    # Optional explicit OnlyOffice URL for callback downloads
   view_extensions: [doc, docx, ppt, pptx, xls, xlsx, odt, odp, ods]
   edit_extensions: [docx, pptx, xlsx]
 ```
+
+In the standard external OnlyOffice deployment, SesameFS only needs these
+runtime values:
+- `ONLYOFFICE_ENABLED`
+- `ONLYOFFICE_API_JS_URL`
+- `ONLYOFFICE_JWT_SECRET`
+
+Leave `server_url` empty unless OnlyOffice must fetch documents through a
+different explicit SesameFS URL. Leave `internal_url` empty unless SesameFS
+must download callbacks through a different explicit OnlyOffice URL than the
+host implied by `api_js_url`.
 
 **API Response Structure (Minimal - Like Seahub):**
 
@@ -403,7 +415,7 @@ The configuration must be minimal for reliable editing. Complex customization fi
       "fileType": "docx",
       "key": "unique-doc-key-20chars",
       "title": "document.docx",
-      "url": "http://sesamefs:8080/seafhttp/files/{token}/document.docx",
+      "url": "https://files.example.com/seafhttp/files/{token}/document.docx",
       "permissions": {
         "edit": true,
         "download": true,
@@ -416,7 +428,7 @@ The configuration must be minimal for reliable editing. Complex customization fi
     },
     "documentType": "word",
     "editorConfig": {
-      "callbackUrl": "http://sesamefs:8080/onlyoffice/editor-callback/?doc_key=...",
+      "callbackUrl": "https://files.example.com/onlyoffice/editor-callback/?doc_key=...",
       "mode": "edit",
       "user": { "id": "user-uuid", "name": "username" },
       "customization": {
@@ -426,7 +438,7 @@ The configuration must be minimal for reliable editing. Complex customization fi
     },
     "token": "jwt-token-here"
   },
-  "api_js_url": "http://localhost:8088/web-apps/apps/api/documents/api.js"
+  "api_js_url": "https://office.example.com/web-apps/apps/api/documents/api.js"
 }
 ```
 
@@ -444,7 +456,7 @@ verifies the OnlyOffice JWT from either the callback body (`token`) or the
 | `customization` | Keep minimal - only `forcesave` and `submitForm` |
 | `mode: "edit"` | Must be "edit" for editable files |
 | `token` | JWT must contain exact same fields as the config (no extra fields) |
-| Document key | Include timestamp to avoid caching issues: `MD5(repo+path+fileId+timestamp)[:20]` |
+| Document key | Stable per file version: `MD5(repo+path+fileId)[:20]` |
 
 **Common Issues & Solutions:**
 
@@ -453,12 +465,15 @@ verifies the OnlyOffice JWT from either the callback body (`token`) or the
 | Toolbar grayed out despite "Editing" mode | Simplify customization to only `forcesave` and `submitForm` |
 | JWT validation errors | Ensure JWT payload matches config exactly |
 | Document opens read-only | Add `fillForms: true` to permissions |
-| Changes not saving (connection refused) | Callback URL uses `localhost:8088` which isn't reachable from Docker. Server translates to `onlyoffice:8088` |
-| Stale document state | Include timestamp in document key generation |
+| Changes not saving in Docker/dev | Configure `internal_url` so SesameFS translates the browser URL to the Docker-internal OnlyOffice host |
+| Stale document state | Document keys rotate automatically when the file version changes |
 
-**Docker Network Note:**
+**Docker/Local Note:**
 
-OnlyOffice sends callback URLs with `localhost:8088` for the document download. Inside Docker, this must be translated to the container hostname. Configure `internal_url` in config.yaml:
+When OnlyOffice runs inside the same Docker Compose stack, the browser sees
+`localhost:8088` but SesameFS must download callbacks from the Docker-internal
+service hostname. That is why docker/local config sets `internal_url`
+explicitly:
 ```yaml
 onlyoffice:
   api_js_url: "http://localhost:8088/web-apps/apps/api/documents/api.js"  # Browser URL

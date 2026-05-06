@@ -216,7 +216,7 @@ docker compose -f docker-compose.prod.yml up -d cassandra
 docker compose -f docker-compose.prod.yml --profile bootstrap up cassandra-bootstrap
 
 # Start the normal app services:
-docker compose -f docker-compose.prod.yml up -d sesamefs frontend onlyoffice
+docker compose -f docker-compose.prod.yml up -d sesamefs frontend
 ```
 
 If SesameFS runs behind nginx or another reverse proxy, set `server.trusted_proxies` in your YAML config or `SERVER_TRUSTED_PROXIES` in `.env` to the exact proxy IP/CIDR values that are allowed to supply `X-Forwarded-For` and `X-Real-IP`. In the supported production chain `client -> central nginx -> internal SesameFS nginx -> Go`, the internal nginx, typically the nginx inside the `frontend` container, preserves the real client IP already resolved by the central nginx, so Go only needs to trust the internal nginx hop. This assumes that internal nginx is private and only reachable from trusted internal paths. Leaving it empty is the secure default and makes SesameFS use the direct peer IP instead.
@@ -245,15 +245,10 @@ See [docs/MULTIREGION-TESTING.md](docs/MULTIREGION-TESTING.md) for detailed test
 SesameFS includes a web interface extracted from Seafile Pro (Seahub), modified to work as a standalone React SPA.
 
 ```bash
-# Start backend
-./scripts/bootstrap.sh dev
+# Start backend + frontend nginx
+docker compose up -d sesamefs frontend
 
-# In another terminal, start frontend
-cd frontend
-npm ci --legacy-peer-deps
-npm start
-
-# Open http://localhost:3001
+# Open http://localhost:3000
 # Login: admin@sesamefs.local / dev-token-123
 ```
 

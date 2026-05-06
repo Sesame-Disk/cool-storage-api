@@ -2,11 +2,14 @@ package v2
 
 import (
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
 	"github.com/Sesame-Disk/sesamefs/internal/config"
 	"github.com/Sesame-Disk/sesamefs/internal/storage"
+	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
 )
 
@@ -110,6 +113,37 @@ func TestOnlyOfficeResolveLibraryBlockStoreUsesLocalRegion(t *testing.T) {
 	if storageClass != "hot-s3-eu" {
 		t.Fatalf("storageClass = %q, want %q", storageClass, "hot-s3-eu")
 	}
+}
+
+func TestResolveOnlyOfficeServerURL(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	t.Run("uses explicit onlyoffice server url", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		req := httptest.NewRequest(http.MethodGet, "/api/v2.1/repos/repo-1/onlyoffice?p=/doc.docx", nil)
+		req.Host = "files.example.com"
+		c.Request = req
+
+		got := resolveOnlyOfficeServerURL(c, "https://office-facing.example.com/", "")
+		if got != "https://office-facing.example.com" {
+			t.Fatalf("resolveOnlyOfficeServerURL() = %q, want %q", got, "https://office-facing.example.com")
+		}
+	})
+
+	t.Run("falls back to current browser url", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		req := httptest.NewRequest(http.MethodGet, "/api/v2.1/repos/repo-1/onlyoffice?p=/doc.docx", nil)
+		req.Host = "files.example.com"
+		req.Header.Set("X-Forwarded-Proto", "https")
+		c.Request = req
+
+		got := resolveOnlyOfficeServerURL(c, "", "")
+		if got != "https://files.example.com" {
+			t.Fatalf("resolveOnlyOfficeServerURL() = %q, want %q", got, "https://files.example.com")
+		}
+	})
 }
 
 // TestGetDocumentType tests document type detection

@@ -292,7 +292,11 @@ onlyoffice:
   max_document_bytes: 524288000
   verify_certificate: false
   force_save: true
+  # Optional explicit SesameFS URL for OnlyOffice document fetches.
+  # Leave empty to derive it from the current request host.
   server_url: ""
+  # Optional explicit OnlyOffice URL for callback downloads.
+  # Leave empty to reuse the host from api_js_url.
   internal_url: ""
   view_extensions:
     - doc

@@ -5,13 +5,10 @@ React-based web interface for SesameFS, extracted from Seafile Pro (Seahub).
 ## Quick Start
 
 ```bash
-# Install dependencies
-npm ci --legacy-peer-deps
+# From the repository root, start backend + frontend nginx
+docker compose up -d sesamefs frontend
 
-# Start development server
-npm start
-
-# Make sure SesameFS backend is running on http://localhost:8080
+# Open http://localhost:3000
 ```
 
 ## Development Credentials
@@ -46,7 +43,7 @@ docker run -p 3000:80 sesamefs-frontend
 The desktop frontend now assumes same-origin routing:
 
 - **Production:** nginx routes `/`, `/sys/`, and `/org/` to the frontend container and proxies API/file routes to the Go backend on the same host.
-- **Development with `npm start`:** `src/setupProxy.js` proxies API/file routes to the backend, so same-origin requests still work.
+- **Docker-based local development:** the frontend nginx container proxies API/file routes to the backend, so same-origin requests still work.
 - **No desktop runtime API injection:** the old `SESAMEFS_API_URL` + `docker-entrypoint.sh` path is no longer used by the desktop frontend container.
 
 Production note:

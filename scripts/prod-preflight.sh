@@ -308,8 +308,6 @@ do_init_env() {
   needs_manual CORS_ALLOWED_ORIGINS          "comma-separated browser origins covering every production web domain"
   needs_manual ONLYOFFICE_API_JS_URL         "the public OnlyOffice API JS URL"
   needs_manual CASSANDRA_DATA_DIR            "host bind-mount path for Cassandra data"
-  needs_manual ONLYOFFICE_DATA_DIR           "host bind-mount path for OnlyOffice persistent data"
-  needs_manual ONLYOFFICE_LOGS_DIR           "host bind-mount path for OnlyOffice logs"
   needs_manual S3_ACCESS_KEY_ID              "from your S3 provider or object-storage IAM/API user"
   needs_manual S3_SECRET_ACCESS_KEY          "from your S3 provider or object-storage IAM/API user"
 
@@ -531,13 +529,10 @@ check_onlyoffice() {
   fi
 
   if ! is_set ONLYOFFICE_API_JS_URL; then
-	fail "ONLYOFFICE_API_JS_URL is unset. Required when OnlyOffice is enabled."
-	return
+    fail "ONLYOFFICE_API_JS_URL is unset. Required when OnlyOffice is enabled."
+    return
   fi
-	pass "ONLYOFFICE_API_JS_URL is set"
-
-  check_required_writable_dir ONLYOFFICE_DATA_DIR "Production compose uses a bind mount for OnlyOffice persistent data."
-  check_required_writable_dir ONLYOFFICE_LOGS_DIR "Production compose uses a bind mount for OnlyOffice logs."
+  pass "ONLYOFFICE_API_JS_URL is set"
 
   if is_set ONLYOFFICE_API_JS_URL && [[ "$ONLYOFFICE_API_JS_URL" == http://* ]]; then
     warn "ONLYOFFICE_API_JS_URL uses http:// — browsers will likely block mixed content on an HTTPS site."

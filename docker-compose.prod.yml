@@ -4,7 +4,7 @@
 # Usage:
 #   1. cp .env.prod.example .env
 #   2. Fill in all values in .env
-#   3. Get SSL certs for your public SesameFS and OnlyOffice hostnames
+#   3. Get SSL certs for your public SesameFS hostname
 #   4. docker compose -f docker-compose.prod.yml up -d
 #
 # Optional alternate env file:
@@ -277,39 +277,6 @@ services:
     restart: "no"
 
   # ---------------------------------------------------------------------------
-  # OnlyOffice Document Server
-  # ---------------------------------------------------------------------------
-  onlyoffice:
-    image: ${ONLYOFFICE_IMAGE:-onlyoffice/documentserver:latest}
-    expose:
-      - "80"                        # Reachable internally as onlyoffice:80 and externally via the regional alias on sfs-net
-    networks:
-      internal: {}
-      sfs-net:
-        aliases:
-          - "sesamefs-onlyoffice-${DEPLOY_ID:?set DEPLOY_ID in .env}"
-    environment:
-      - JWT_ENABLED=true
-      - JWT_SECRET=${ONLYOFFICE_JWT_SECRET}
-      - JWT_HEADER=Authorization
-      - JWT_IN_BODY=true
-    volumes:
-      - ${ONLYOFFICE_DATA_DIR:?set ONLYOFFICE_DATA_DIR in .env}:/var/www/onlyoffice/Data
-      - ${ONLYOFFICE_LOGS_DIR:?set ONLYOFFICE_LOGS_DIR in .env}:/var/log/onlyoffice
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost/healthcheck"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-      start_period: 120s
-    restart: unless-stopped
-    logging:
-      driver: json-file
-      options:
-        max-size: "100m"
-        max-file: "3"
-
-  # ---------------------------------------------------------------------------
   # Desktop Frontend (React SPA — served by nginx:alpine)
   # ---------------------------------------------------------------------------
   frontend:
@@ -352,6 +319,6 @@ networks:
   sfs-net:
     external: true        # Create once: docker network create sfs-net
   internal:
-    # Private per-deploy network for frontend <-> sesamefs <-> onlyoffice and
-    # for the local Cassandra node. Not marked 'internal: true' because
+    # Private per-deploy network for frontend <-> sesamefs and for the local
+    # Cassandra node. Not marked 'internal: true' because
     # Cassandra still needs outbound routing for multi-region gossip.

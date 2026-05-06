@@ -121,10 +121,6 @@ module.exports = function (proxy, allowedHost) {
         devServer.app.use(route, express.static(source));
       });
 
-      if (fs.existsSync(paths.proxySetup)) {
-        // This registers user provided middleware for proxy reasons
-        require(paths.proxySetup)(devServer.app);
-      }
     },
     onAfterSetupMiddleware(devServer) {
       // Redirect to `PUBLIC_URL` or `homepage` from `package.json` if url not match

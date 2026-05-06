@@ -413,7 +413,6 @@ services:
 
   # Desktop Frontend (React SPA — nginx:alpine)
   # Access at http://localhost:3000
-  # For hot-reload dev: run `npm start` in frontend/ instead (uses setupProxy.js).
   frontend:
     build:
       context: ./frontend

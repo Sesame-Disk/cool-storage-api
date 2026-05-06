@@ -442,8 +442,9 @@ enforcement_profiles:
 
 # =============================================================================
 # OnlyOffice Document Server
-# NOTE: enabled, jwt_secret, api_js_url → overridden by env vars in compose.
-# The internal Docker network URLs below CANNOT come from env vars.
+# NOTE: prod only needs ONLYOFFICE_ENABLED, ONLYOFFICE_API_JS_URL, and
+# ONLYOFFICE_JWT_SECRET from the environment. Leave the URLs below empty unless
+# you need an explicit override.
 # =============================================================================
 onlyoffice:
   enabled: true                 # Overridden by ONLYOFFICE_ENABLED=true in compose
@@ -452,11 +453,13 @@ onlyoffice:
   jwt_ttl_seconds: 3600         # Override via ONLYOFFICE_JWT_TTL_SECONDS (default 1 hour)
   max_document_bytes: 524288000 # Reject callback downloads larger than 500 MiB
 
-  # Internal Docker network — OnlyOffice fetches files from sesamefs
-  server_url: "http://sesamefs:8080"
+  # Optional explicit URL that OnlyOffice should use to reach SesameFS.
+  # Leave empty to derive the public SesameFS origin from the current request.
+  server_url: ""
 
-  # Internal Docker network — sesamefs contacts OnlyOffice for conversions
-  internal_url: "http://onlyoffice:80"
+  # Optional explicit URL that SesameFS should use to reach OnlyOffice.
+  # Leave empty to reuse the host from ONLYOFFICE_API_JS_URL.
+  internal_url: ""
 
   verify_certificate: false
   force_save: true

@@ -14,7 +14,6 @@ Run these tests after changes to any of the following:
 - `frontend/src/pages/sys-admin/bootstrap-entry.js`
 - `frontend/nginx.conf`
 - `nginx/nginx.conf.template`
-- `frontend/src/setupProxy.js`
 
 ## Environment
 

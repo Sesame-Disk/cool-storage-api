@@ -76,21 +76,9 @@ API Response → Dirent Model → React State → Component Render
 ### Local Development
 
 ```bash
-# Navigate to frontend directory
-cd frontend
-
-# Install dependencies
-npm ci --legacy-peer-deps
-
-# Start development server (hot reload)
-npm start
-# Opens http://localhost:3001
-
-# Make sure SesameFS backend is running
-# In another terminal:
-docker-compose up -d sesamefs
-# Or run locally:
-go run ./cmd/sesamefs serve
+# From the repository root, start backend + frontend nginx
+docker compose up -d sesamefs frontend
+# Opens http://localhost:3000
 ```
 
 ### Dev Credentials
@@ -187,9 +175,9 @@ The desktop frontend now uses same-origin routing:
   - nginx proxies SPA routes to the frontend container and `/api`, `/api2`, `/seafhttp`, etc. to the Go backend
   - the frontend sends requests to the current origin
 
-2. **Local development (`npm start`)**
-  - `src/setupProxy.js` proxies backend routes to the Go server
-  - the frontend still uses same-origin requests from the browser point of view
+2. **Docker-based local development**
+  - the frontend is served by the frontend nginx container
+  - that nginx proxies backend routes to the Go backend on the same origin
 
 3. **Build env**
   - `frontend/.env` is only for build tuning (`NODE_MAX_MEMORY`, sourcemaps, parallel build)

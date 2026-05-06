@@ -20,6 +20,7 @@ import (
 	"github.com/Sesame-Disk/sesamefs/internal/config"
 	"github.com/Sesame-Disk/sesamefs/internal/crypto"
 	"github.com/Sesame-Disk/sesamefs/internal/db"
+	"github.com/Sesame-Disk/sesamefs/internal/httputil"
 	"github.com/Sesame-Disk/sesamefs/internal/middleware"
 	"github.com/Sesame-Disk/sesamefs/internal/storage"
 	"github.com/gin-gonic/gin"
@@ -166,6 +167,14 @@ type OnlyOfficeResponse struct {
 	APIJSURL string           `json:"api_js_url"`
 }
 
+func resolveOnlyOfficeServerURL(c *gin.Context, onlyOfficeServerURL, serverURL string) string {
+	if trimmed := strings.TrimSuffix(strings.TrimSpace(onlyOfficeServerURL), "/"); trimmed != "" {
+		return trimmed
+	}
+
+	return httputil.GetBrowserURL(c, serverURL)
+}
+
 // generateDocKey generates a unique document key for OnlyOffice
 // Format: MD5(repo_id + file_path + file_id) truncated to 20 chars
 // The fileID changes whenever the file content changes (new commit), so it
@@ -299,12 +308,10 @@ func (h *OnlyOfficeHandler) GetEditorConfig(c *gin.Context) {
 		return
 	}
 
-	// Use OnlyOffice-specific server URL if configured, otherwise fall back to general server URL
-	// This allows configuring a public URL that OnlyOffice server can reach
-	ooServerURL := h.config.OnlyOffice.ServerURL
-	if ooServerURL == "" {
-		ooServerURL = h.serverURL
-	}
+	// When no OnlyOffice-specific override is configured, use the current
+	// browser-facing SesameFS origin so a separate OnlyOffice deployment only
+	// needs api_js_url + jwt_secret.
+	ooServerURL := resolveOnlyOfficeServerURL(c, h.config.OnlyOffice.ServerURL, h.serverURL)
 	downloadURL := fmt.Sprintf("%s/seafhttp/files/%s/%s", ooServerURL, downloadToken, filename)
 
 	// The callback only carries doc_key. The server resolves repo/file/user from the

@@ -352,10 +352,11 @@ onlyoffice:
   max_document_bytes: 524288000        # Reject callback downloads larger than 500 MiB
   verify_certificate: false
   force_save: true
-  # server_url: Public URL for OnlyOffice to fetch documents (required for remote OnlyOffice servers)
-  # If not set, uses SERVER_URL env var or defaults to localhost
+  # Optional explicit SesameFS URL for OnlyOffice to fetch documents.
+  # If not set, SesameFS derives the browser-facing origin from the current
+  # request and falls back to SERVER_URL only when needed.
   # server_url: "https://files.sesamedisk.com"
-  internal_url: ""                     # Optional internal URL for SesameFS to reach OnlyOffice directly
+  internal_url: ""                     # Optional explicit OnlyOffice URL for callback downloads
   view_extensions:
     - doc
     - docx

@@ -12,13 +12,12 @@ The frontend now uses `window.location.origin` by default for API calls, enablin
 ### What Was Done
 - `frontend/public/index.html`: `serviceURL` stays same-origin (`''`)
 - `frontend/src/utils/seafile-api.js`: Fallback `const server = serviceURL || window.location.origin` handles the empty case
-- `frontend/src/setupProxy.js`: npm-start development proxies API/file routes to backend while preserving same-origin requests from the browser
 - No hardcoded `localhost` references remain in `frontend/src/`
 
 ### Result
 - `https://us.sesamefs.com` → API calls go to `https://us.sesamefs.com/api/...`
 - `https://eu.sesamefs.com` → API calls go to `https://eu.sesamefs.com/api/...`
-- Dev mode: `npm start` uses `setupProxy.js` so `/api...` stays same-origin from the browser point of view
+- Docker-based local development keeps `/api...` same-origin through the frontend nginx container
 
 ---
 
