@@ -47,6 +47,13 @@ type pageBootstrapResponse struct {
 	PageOptions any    `json:"page_options,omitempty"`
 }
 
+func boolString(enabled bool) string {
+	if enabled {
+		return "True"
+	}
+	return "False"
+}
+
 // NewShareLinkViewHandler creates a new ShareLinkViewHandler for public share/upload link APIs.
 func NewShareLinkViewHandler(database *db.DB, cfg *config.Config, s3Store *storage.S3Store, storageManager *storage.Manager, tokenCreator TokenCreator, serverURL string) *ShareLinkViewHandler {
 	return &ShareLinkViewHandler{
@@ -189,6 +196,12 @@ func (h *ShareLinkViewHandler) buildSharedDirPageBootstrap(c *gin.Context, sl *s
 		"needPassword":         needPassword,
 		"noQuota":              false,
 		"trafficOverLimit":     false,
+		"enableUploadFolder":   boolString(h.config.WebUploads.EnableUploadFolder),
+		"enableResumableFileUpload": boolString(h.config.WebUploads.EnableResumableFileUpload),
+		"resumableUploadFileBlockSize": h.config.WebUploads.ResumableChunkSizeMB,
+		"maxUploadFileSize":    h.config.ResolvedMaxFileSizeMB(),
+		"maxNumberOfFilesForFileupload": h.config.WebUploads.MaxFilesPerBatch,
+		"resumableSimultaneousUploads": h.config.WebUploads.SimultaneousUploads,
 		"enableVideoThumbnail": false,
 		"permissions": map[string]bool{
 			"can_edit":     sl.canEdit,
@@ -398,7 +411,12 @@ func (h *ShareLinkViewHandler) buildUploadLinkPageBootstrap(token, libraryID, fi
 		"dirName":           dirName,
 		"sharedBy":          map[string]string{"name": creatorName, "avatar": ""},
 		"noQuota":           false,
-		"maxUploadFileSize": nil,
+		"enableUploadFolder": boolString(h.config.WebUploads.EnableUploadFolder),
+		"enableResumableFileUpload": boolString(h.config.WebUploads.EnableResumableFileUpload),
+		"resumableUploadFileBlockSize": h.config.WebUploads.ResumableChunkSizeMB,
+		"maxUploadFileSize": h.config.ResolvedMaxFileSizeMB(),
+		"maxNumberOfFilesForFileupload": h.config.WebUploads.MaxFilesPerBatch,
+		"resumableSimultaneousUploads": h.config.WebUploads.SimultaneousUploads,
 		"needPassword":      needPassword,
 	}
 

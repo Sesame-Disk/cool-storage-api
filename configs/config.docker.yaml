@@ -123,6 +123,14 @@ storage:
       server_side_encryption: ""
       sse_kms_key_id: ""
 
+web_uploads:
+  enable_upload_folder: true
+  enable_resumable_file_upload: true
+  resumable_chunk_size_mb: 8
+  max_file_size_mb: 0
+  max_files_per_batch: 1000
+  simultaneous_uploads: 1
+
 seafhttp:
   token_ttl: 24h  # Upload/download tokens valid for 24 hours (needed for large uploads and Seafile client syncs)
   zip_max_entries: 100000

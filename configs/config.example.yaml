@@ -117,6 +117,14 @@ storage:
   #     type: s3
   #     bucket: sesamefs-blocks-hot
 
+web_uploads:
+  enable_upload_folder: true           # Browser drag-and-drop folder uploads
+  enable_resumable_file_upload: true   # Browser chunked/resumable uploads
+  resumable_chunk_size_mb: 8           # Client chunk size in MiB for web uploads
+  max_file_size_mb: 0                  # 0 = use server.max_upload_mb for the browser limit
+  max_files_per_batch: 1000            # 0 = unlimited files selectable in one batch
+  simultaneous_uploads: 1              # Parallel browser upload slots before finalization overlap
+
 auth:
   dev_mode: false                     # Enable only for local development with explicit test tokens
   dev_tokens: []                      # Define local-only dev tokens in a private config, not in shared examples

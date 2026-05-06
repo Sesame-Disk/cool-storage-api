@@ -228,6 +228,14 @@ organizations:
       storage_config:
         default_backend: ""          # Optional; defaults to storage.default_class when empty
 
+web_uploads:
+  enable_upload_folder: true
+  enable_resumable_file_upload: true
+  resumable_chunk_size_mb: 8
+  max_file_size_mb: 0                # 0 = use server.max_upload_mb
+  max_files_per_batch: 1000
+  simultaneous_uploads: 1
+
 # =============================================================================
 # Seafile HTTP (sync protocol token TTL)
 # =============================================================================

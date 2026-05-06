@@ -189,6 +189,14 @@ gc:
   trash_retention_days: 30
   audit_retention_days: 365
 
+web_uploads:
+  enable_upload_folder: true
+  enable_resumable_file_upload: true
+  resumable_chunk_size_mb: 8
+  max_file_size_mb: 0
+  max_files_per_batch: 1000
+  simultaneous_uploads: 1
+
 seafhttp:
   token_ttl: 24h
   zip_max_entries: 100000

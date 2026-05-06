@@ -17,6 +17,7 @@ type Config struct {
 	Server              ServerConfig                  `yaml:"server"`
 	Database            DatabaseConfig                `yaml:"database"`
 	Storage             StorageConfig                 `yaml:"storage"`
+	WebUploads          WebUploadsConfig              `yaml:"web_uploads"`
 	Billing             BillingConfig                 `yaml:"billing"`
 	Accounts            AccountsConfig                `yaml:"accounts"`
 	Organizations       OrganizationsConfig           `yaml:"organizations"`
@@ -32,6 +33,32 @@ type Config struct {
 	FileView            FileViewConfig                `yaml:"fileview"`
 	EnforcementProfiles map[string]EnforcementProfile `yaml:"enforcement_profiles"`
 	envOverrideErrors   []string
+}
+
+// WebUploadsConfig holds browser upload behavior exposed to the web frontend.
+// Size values are expressed in MB to match the legacy frontend page-option contract.
+type WebUploadsConfig struct {
+	EnableUploadFolder        bool  `yaml:"enable_upload_folder"`
+	EnableResumableFileUpload bool  `yaml:"enable_resumable_file_upload"`
+	ResumableChunkSizeMB      int64 `yaml:"resumable_chunk_size_mb"`
+	MaxFileSizeMB             int64 `yaml:"max_file_size_mb"`
+	MaxFilesPerBatch          int   `yaml:"max_files_per_batch"`
+	SimultaneousUploads       int   `yaml:"simultaneous_uploads"`
+}
+
+// ResolvedMaxFileSizeMB returns the effective browser upload file-size cap.
+// A non-positive web_uploads.max_file_size_mb falls back to server.max_upload_mb.
+func (c *Config) ResolvedMaxFileSizeMB() int64 {
+	if c == nil {
+		return 0
+	}
+	if c.WebUploads.MaxFileSizeMB > 0 {
+		return c.WebUploads.MaxFileSizeMB
+	}
+	if c.Server.MaxUploadMB > 0 {
+		return c.Server.MaxUploadMB
+	}
+	return 0
 }
 
 var cassandraDCNamePattern = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
@@ -664,6 +691,14 @@ func DefaultConfig() *Config {
 				},
 			},
 		},
+		WebUploads: WebUploadsConfig{
+			EnableUploadFolder:        true,
+			EnableResumableFileUpload: true,
+			ResumableChunkSizeMB:      8,
+			MaxFileSizeMB:             0,
+			MaxFilesPerBatch:          1000,
+			SimultaneousUploads:       1,
+		},
 		Billing: BillingConfig{},
 		Accounts: AccountsConfig{
 			DisableOrgUserWrites: true,
@@ -915,6 +950,42 @@ func (c *Config) applyEnvOverrides() {
 	}
 	if v := os.Getenv("SHARE_LINK_HMAC_KEY"); v != "" {
 		c.Auth.ShareLinkHMACKey = v
+	}
+
+	// Web uploads
+	if v := os.Getenv("WEB_UPLOADS_ENABLE_UPLOAD_FOLDER"); v != "" {
+		c.WebUploads.EnableUploadFolder = v == "true" || v == "1"
+	}
+	if v := os.Getenv("WEB_UPLOADS_ENABLE_RESUMABLE_FILE_UPLOAD"); v != "" {
+		c.WebUploads.EnableResumableFileUpload = v == "true" || v == "1"
+	}
+	if v := os.Getenv("WEB_UPLOADS_RESUMABLE_CHUNK_SIZE_MB"); v != "" {
+		if i, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64); err != nil {
+			c.addEnvOverrideError("WEB_UPLOADS_RESUMABLE_CHUNK_SIZE_MB must be an integer, got %q", v)
+		} else {
+			c.WebUploads.ResumableChunkSizeMB = i
+		}
+	}
+	if v := os.Getenv("WEB_UPLOADS_MAX_FILE_SIZE_MB"); v != "" {
+		if i, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64); err != nil {
+			c.addEnvOverrideError("WEB_UPLOADS_MAX_FILE_SIZE_MB must be an integer, got %q", v)
+		} else {
+			c.WebUploads.MaxFileSizeMB = i
+		}
+	}
+	if v := os.Getenv("WEB_UPLOADS_MAX_FILES_PER_BATCH"); v != "" {
+		if i, err := strconv.Atoi(strings.TrimSpace(v)); err != nil {
+			c.addEnvOverrideError("WEB_UPLOADS_MAX_FILES_PER_BATCH must be an integer, got %q", v)
+		} else {
+			c.WebUploads.MaxFilesPerBatch = i
+		}
+	}
+	if v := os.Getenv("WEB_UPLOADS_SIMULTANEOUS_UPLOADS"); v != "" {
+		if i, err := strconv.Atoi(strings.TrimSpace(v)); err != nil {
+			c.addEnvOverrideError("WEB_UPLOADS_SIMULTANEOUS_UPLOADS must be an integer, got %q", v)
+		} else {
+			c.WebUploads.SimultaneousUploads = i
+		}
 	}
 
 	// SeafHTTP
@@ -1322,6 +1393,15 @@ func (c *Config) Validate() error {
 		if !ok || strings.TrimSpace(hot.Bucket) == "" {
 			return fmt.Errorf("storage.backends.hot.bucket must be set for storage.mode=single")
 		}
+	}
+	if c.WebUploads.ResumableChunkSizeMB <= 0 {
+		return fmt.Errorf("web_uploads.resumable_chunk_size_mb must be greater than zero")
+	}
+	if c.WebUploads.MaxFilesPerBatch < 0 {
+		return fmt.Errorf("web_uploads.max_files_per_batch must be zero or greater")
+	}
+	if c.WebUploads.SimultaneousUploads <= 0 {
+		return fmt.Errorf("web_uploads.simultaneous_uploads must be greater than zero")
 	}
 	if c.OnlyOffice.Enabled && strings.TrimSpace(c.OnlyOffice.JWTSecret) == "" {
 		return fmt.Errorf("onlyoffice.jwt_secret must be set when onlyoffice.enabled is true")

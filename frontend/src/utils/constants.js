@@ -62,6 +62,7 @@ export const isEmailConfigured = appPageOptions.isEmailConfigured === 'True';
 export const enableUploadFolder = appPageOptions.enableUploadFolder === 'True';
 export const enableResumableFileUpload = appPageOptions.enableResumableFileUpload === 'True';
 export const resumableUploadFileBlockSize = appPageOptions.resumableUploadFileBlockSize || 0;
+export const resumableSimultaneousUploads = Math.max(1, Number(appPageOptions.resumableSimultaneousUploads) || 1);
 export const storages = appPageOptions.storages || []; // storage backends
 export const libraryTemplates = appPageOptions.libraryTemplates || []; // library templates
 export const enableRepoSnapshotLabel = appPageOptions.enableRepoSnapshotLabel || false;

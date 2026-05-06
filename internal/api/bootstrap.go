@@ -457,6 +457,12 @@ func (s *Server) buildAppBootstrapPageOptions(identity bootstrapIdentity, userDa
 		"enableUserSetName":         authenticated,
 		"enableAPIKeys":             authenticated,
 		"enableDeleteAccount":       authenticated && hasDeleteAccount,
+		"enableUploadFolder":        boolString(s.config.WebUploads.EnableUploadFolder),
+		"enableResumableFileUpload": boolString(s.config.WebUploads.EnableResumableFileUpload),
+		"resumableUploadFileBlockSize": s.config.WebUploads.ResumableChunkSizeMB,
+		"maxUploadFileSize":         s.config.ResolvedMaxFileSizeMB(),
+		"maxNumberOfFilesForFileupload": s.config.WebUploads.MaxFilesPerBatch,
+		"resumableSimultaneousUploads": s.config.WebUploads.SimultaneousUploads,
 		"langCode":                  "en",
 		"currentLang": gin.H{
 			"langCode": "en",
