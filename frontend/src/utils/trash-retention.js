@@ -44,7 +44,7 @@ export function getTrashReposExpireDays(scope = 'app') {
 export function getDeletedUsersRetentionMessage(scope = 'app') {
     const userGraceDays = getUserGraceDays(scope);
     if (userGraceDays > 0) {
-        return gettext('Deleted users remain restorable for the next {placeholder} days before permanent deletion.').replace('{placeholder}', userGraceDays);
+        return gettext('Deleted users remain restorable for up to {placeholder} days after deletion before permanent cleanup.').replace('{placeholder}', userGraceDays);
     }
 
     return gettext('Deleted users are cleaned up according to the current system retention policy.');
@@ -53,7 +53,7 @@ export function getDeletedUsersRetentionMessage(scope = 'app') {
 export function getDeletedOrganizationsRetentionMessage(scope = 'app') {
     const orgGraceDays = getOrgGraceDays(scope);
     if (orgGraceDays > 0) {
-        return gettext('Deleted organizations remain restorable for the next {placeholder} days before permanent deletion.').replace('{placeholder}', orgGraceDays);
+        return gettext('Deleted organizations remain restorable for up to {placeholder} days after deletion before permanent cleanup.').replace('{placeholder}', orgGraceDays);
     }
 
     return gettext('Deleted organizations are cleaned up according to the current system retention policy.');
