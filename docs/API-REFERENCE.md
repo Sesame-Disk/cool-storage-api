@@ -465,19 +465,21 @@ verifies the OnlyOffice JWT from either the callback body (`token`) or the
 | Toolbar grayed out despite "Editing" mode | Simplify customization to only `forcesave` and `submitForm` |
 | JWT validation errors | Ensure JWT payload matches config exactly |
 | Document opens read-only | Add `fillForms: true` to permissions |
-| Changes not saving in Docker/dev | Configure `internal_url` so SesameFS translates the browser URL to the Docker-internal OnlyOffice host |
+| Changes not saving in Docker/dev | Keep `api_js_url` pointed at the browser URL; SesameFS auto-detects `frontend`/`onlyoffice` for the local Compose stack when that URL is loopback |
 | Stale document state | Document keys rotate automatically when the file version changes |
 
 **Docker/Local Note:**
 
-When OnlyOffice runs inside the same Docker Compose stack, the browser sees
-`localhost:8088` but SesameFS must download callbacks from the Docker-internal
-service hostname. That is why docker/local config sets `internal_url`
-explicitly:
+When OnlyOffice runs inside the same Docker Compose stack, the browser still
+loads `api.js` from `localhost:8088`, but SesameFS now auto-detects the
+internal Compose service URLs for callback/save traffic when `api_js_url`
+points at a loopback host. Docker/local can therefore use the same runtime
+inputs as production and leave `server_url` / `internal_url` empty:
 ```yaml
 onlyoffice:
   api_js_url: "http://localhost:8088/web-apps/apps/api/documents/api.js"  # Browser URL
-  internal_url: "http://onlyoffice:80"  # Docker internal URL (port 80, not 8088!)
+  server_url: ""      # Auto-detected as http://frontend for local Compose
+  internal_url: ""    # Auto-detected as http://onlyoffice for local Compose
 ```
 
 **Block Storage:**

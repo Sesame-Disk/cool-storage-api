@@ -167,12 +167,59 @@ type OnlyOfficeResponse struct {
 	APIJSURL string           `json:"api_js_url"`
 }
 
-func resolveOnlyOfficeServerURL(c *gin.Context, onlyOfficeServerURL, serverURL string) string {
+const (
+	dockerComposeFrontendURL   = "http://frontend"
+	dockerComposeOnlyOfficeURL = "http://onlyoffice"
+)
+
+func isLoopbackURL(rawURL string) bool {
+	parsed, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil {
+		return false
+	}
+	host := strings.ToLower(strings.TrimSpace(parsed.Hostname()))
+	return host == "localhost" || host == "127.0.0.1" || host == "::1"
+}
+
+func onlyOfficeAPIBaseURL(apiJSURL string) string {
+	trimmed := strings.TrimSpace(apiJSURL)
+	if trimmed == "" {
+		return ""
+	}
+	if idx := strings.Index(trimmed, "/web-apps"); idx > 0 {
+		return strings.TrimSuffix(trimmed[:idx], "/")
+	}
+	parsed, err := url.Parse(trimmed)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return ""
+	}
+	return strings.TrimSuffix(parsed.Scheme+"://"+parsed.Host, "/")
+}
+
+func resolveOnlyOfficeInternalURL(apiJSURL, internalURL string) string {
+	if trimmed := strings.TrimSuffix(strings.TrimSpace(internalURL), "/"); trimmed != "" {
+		return trimmed
+	}
+	if isLoopbackURL(apiJSURL) {
+		return dockerComposeOnlyOfficeURL
+	}
+	return ""
+}
+
+func resolveOnlyOfficeServerURL(c *gin.Context, onlyOfficeServerURL, serverURL, apiJSURL string) string {
 	if trimmed := strings.TrimSuffix(strings.TrimSpace(onlyOfficeServerURL), "/"); trimmed != "" {
 		return trimmed
 	}
+	browserURL := httputil.GetBrowserURL(c, serverURL)
+	if isLoopbackURL(browserURL) && isLoopbackURL(apiJSURL) {
+		return dockerComposeFrontendURL
+	}
 
-	return httputil.GetBrowserURL(c, serverURL)
+	return browserURL
+}
+
+func buildOnlyOfficeDownloadURL(serverURL, downloadToken, filename string) string {
+	return fmt.Sprintf("%s/seafhttp/files/%s/%s", serverURL, downloadToken, url.PathEscape(filename))
 }
 
 // generateDocKey generates a unique document key for OnlyOffice
@@ -311,8 +358,8 @@ func (h *OnlyOfficeHandler) GetEditorConfig(c *gin.Context) {
 	// When no OnlyOffice-specific override is configured, use the current
 	// browser-facing SesameFS origin so a separate OnlyOffice deployment only
 	// needs api_js_url + jwt_secret.
-	ooServerURL := resolveOnlyOfficeServerURL(c, h.config.OnlyOffice.ServerURL, h.serverURL)
-	downloadURL := fmt.Sprintf("%s/seafhttp/files/%s/%s", ooServerURL, downloadToken, filename)
+	ooServerURL := resolveOnlyOfficeServerURL(c, h.config.OnlyOffice.ServerURL, h.serverURL, h.config.OnlyOffice.APIJSURL)
+	downloadURL := buildOnlyOfficeDownloadURL(ooServerURL, downloadToken, filename)
 
 	// The callback only carries doc_key. The server resolves repo/file/user from the
 	// stored mapping so callback callers cannot override them with request params.
@@ -756,9 +803,10 @@ func (h *OnlyOfficeHandler) validateOnlyOfficeDownloadURL(downloadURL string) er
 		return fmt.Errorf("download URL scheme %q not allowed", parsed.Scheme)
 	}
 
-	// If InternalURL is configured, the download must be on that host
-	if h.config.OnlyOffice.InternalURL != "" {
-		allowed, err := url.Parse(h.config.OnlyOffice.InternalURL)
+	// If InternalURL is configured, or auto-detected for local Docker, the
+	// download must be on that host.
+	if resolvedInternalURL := resolveOnlyOfficeInternalURL(h.config.OnlyOffice.APIJSURL, h.config.OnlyOffice.InternalURL); resolvedInternalURL != "" {
+		allowed, err := url.Parse(resolvedInternalURL)
 		if err != nil {
 			return fmt.Errorf("invalid OnlyOffice internal_url config: %w", err)
 		}
@@ -785,12 +833,9 @@ func (h *OnlyOfficeHandler) saveEditedDocument(ctx context.Context, repoID, file
 	// We need to translate this to the internal Docker network URL (internal_url).
 	// Example: http://localhost:8088/... -> http://onlyoffice:80/...
 	internalURL := downloadURL
-	if h.config.OnlyOffice.InternalURL != "" && h.config.OnlyOffice.APIJSURL != "" {
-		// Extract the base URL from api_js_url (e.g., "http://localhost:8088" from "http://localhost:8088/web-apps/...")
-		apiJSURL := h.config.OnlyOffice.APIJSURL
-		if idx := strings.Index(apiJSURL, "/web-apps"); idx > 0 {
-			externalBase := apiJSURL[:idx]
-			internalURL = strings.Replace(internalURL, externalBase, h.config.OnlyOffice.InternalURL, 1)
+	if resolvedInternalURL := resolveOnlyOfficeInternalURL(h.config.OnlyOffice.APIJSURL, h.config.OnlyOffice.InternalURL); resolvedInternalURL != "" {
+		if externalBase := onlyOfficeAPIBaseURL(h.config.OnlyOffice.APIJSURL); externalBase != "" {
+			internalURL = strings.Replace(internalURL, externalBase, resolvedInternalURL, 1)
 		}
 	}
 

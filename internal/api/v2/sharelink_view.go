@@ -179,30 +179,30 @@ func (h *ShareLinkViewHandler) buildSharedDirPageBootstrap(c *gin.Context, sl *s
 	needPassword := sl.passwordHash != "" && !passwordVerified
 
 	pageOptions := map[string]any{
-		"token":                sl.token,
-		"repoID":               sl.libraryID,
-		"repoName":             sl.repoName,
-		"path":                 sl.filePath,
-		"dirName":              dirName,
-		"dirPath":              dirPath,
-		"relativePath":         relativePath,
-		"mode":                 mode,
-		"thumbnailSize":        thumbnailSize,
-		"zipped":               zipped,
-		"canDownload":          sl.canDownload,
-		"canUpload":            sl.canUpload,
-		"sharedBy":             sl.creatorName,
-		"noPassword":           noPassword,
-		"needPassword":         needPassword,
-		"noQuota":              false,
-		"trafficOverLimit":     false,
-		"enableUploadFolder":   boolString(h.config.WebUploads.EnableUploadFolder),
-		"enableResumableFileUpload": boolString(h.config.WebUploads.EnableResumableFileUpload),
-		"resumableUploadFileBlockSize": h.config.WebUploads.ResumableChunkSizeMB,
-		"maxUploadFileSize":    h.config.ResolvedMaxFileSizeMB(),
+		"token":                         sl.token,
+		"repoID":                        sl.libraryID,
+		"repoName":                      sl.repoName,
+		"path":                          sl.filePath,
+		"dirName":                       dirName,
+		"dirPath":                       dirPath,
+		"relativePath":                  relativePath,
+		"mode":                          mode,
+		"thumbnailSize":                 thumbnailSize,
+		"zipped":                        zipped,
+		"canDownload":                   sl.canDownload,
+		"canUpload":                     sl.canUpload,
+		"sharedBy":                      sl.creatorName,
+		"noPassword":                    noPassword,
+		"needPassword":                  needPassword,
+		"noQuota":                       false,
+		"trafficOverLimit":              false,
+		"enableUploadFolder":            boolString(h.config.WebUploads.EnableUploadFolder),
+		"enableResumableFileUpload":     boolString(h.config.WebUploads.EnableResumableFileUpload),
+		"resumableUploadFileBlockSize":  h.config.WebUploads.ResumableChunkSizeMB,
+		"maxUploadFileSize":             h.config.ResolvedMaxFileSizeMB(),
 		"maxNumberOfFilesForFileupload": h.config.WebUploads.MaxFilesPerBatch,
-		"resumableSimultaneousUploads": h.config.WebUploads.SimultaneousUploads,
-		"enableVideoThumbnail": false,
+		"resumableSimultaneousUploads":  h.config.WebUploads.SimultaneousUploads,
+		"enableVideoThumbnail":          false,
 		"permissions": map[string]bool{
 			"can_edit":     sl.canEdit,
 			"can_download": sl.canDownload,
@@ -330,17 +330,14 @@ func (h *ShareLinkViewHandler) buildSharedMarkdownSmartLinkMap(sl *shareLinkData
 	return result
 }
 
-func (h *ShareLinkViewHandler) buildOnlyOfficeShareBootstrap(sl *shareLinkData, filename, ext string, fileSize int64) (pageBootstrapResponse, error) {
+func (h *ShareLinkViewHandler) buildOnlyOfficeShareBootstrap(c *gin.Context, sl *shareLinkData, filename, ext string, fileSize int64) (pageBootstrapResponse, error) {
 	downloadToken, err := h.tokenCreator.CreateLinkDownloadToken(sl.orgID, sl.libraryID, sl.filePath, sl.createdBy)
 	if err != nil {
 		return pageBootstrapResponse{}, fmt.Errorf("failed to create download token: %w", err)
 	}
 
-	ooServerURL := h.config.OnlyOffice.ServerURL
-	if ooServerURL == "" {
-		ooServerURL = h.serverURL
-	}
-	downloadURL := ooServerURL + "/seafhttp/files/" + downloadToken + "/" + filename
+	ooServerURL := resolveOnlyOfficeServerURL(c, h.config.OnlyOffice.ServerURL, h.serverURL, h.config.OnlyOffice.APIJSURL)
+	downloadURL := buildOnlyOfficeDownloadURL(ooServerURL, downloadToken, filename)
 
 	fileID := ""
 	if sl.targetEntry != nil {
@@ -405,19 +402,19 @@ func (h *ShareLinkViewHandler) buildOnlyOfficeShareBootstrap(sl *shareLinkData, 
 
 func (h *ShareLinkViewHandler) buildUploadLinkPageBootstrap(token, libraryID, filePath, dirName, creatorName string, needPassword bool) pageBootstrapResponse {
 	pageOptions := map[string]any{
-		"token":             token,
-		"repoID":            libraryID,
-		"path":              filePath,
-		"dirName":           dirName,
-		"sharedBy":          map[string]string{"name": creatorName, "avatar": ""},
-		"noQuota":           false,
-		"enableUploadFolder": boolString(h.config.WebUploads.EnableUploadFolder),
-		"enableResumableFileUpload": boolString(h.config.WebUploads.EnableResumableFileUpload),
-		"resumableUploadFileBlockSize": h.config.WebUploads.ResumableChunkSizeMB,
-		"maxUploadFileSize": h.config.ResolvedMaxFileSizeMB(),
+		"token":                         token,
+		"repoID":                        libraryID,
+		"path":                          filePath,
+		"dirName":                       dirName,
+		"sharedBy":                      map[string]string{"name": creatorName, "avatar": ""},
+		"noQuota":                       false,
+		"enableUploadFolder":            boolString(h.config.WebUploads.EnableUploadFolder),
+		"enableResumableFileUpload":     boolString(h.config.WebUploads.EnableResumableFileUpload),
+		"resumableUploadFileBlockSize":  h.config.WebUploads.ResumableChunkSizeMB,
+		"maxUploadFileSize":             h.config.ResolvedMaxFileSizeMB(),
 		"maxNumberOfFilesForFileupload": h.config.WebUploads.MaxFilesPerBatch,
-		"resumableSimultaneousUploads": h.config.WebUploads.SimultaneousUploads,
-		"needPassword":      needPassword,
+		"resumableSimultaneousUploads":  h.config.WebUploads.SimultaneousUploads,
+		"needPassword":                  needPassword,
 	}
 
 	return pageBootstrapResponse{
@@ -822,7 +819,7 @@ func (h *ShareLinkViewHandler) handleShareLinkDownload(c *gin.Context, sl *share
 		}
 	}()
 
-	downloadURL := httputil.GetBrowserURL(c, h.serverURL) + "/seafhttp/files/" + downloadToken + "/" + filename
+	downloadURL := buildOnlyOfficeDownloadURL(httputil.GetBrowserURL(c, h.serverURL), downloadToken, filename)
 	c.Redirect(http.StatusFound, downloadURL)
 }
 
@@ -1042,7 +1039,7 @@ func (h *ShareLinkViewHandler) buildShareFileBootstrapResponse(c *gin.Context, s
 	}
 
 	if ext != "pdf" && h.config.OnlyOffice.Enabled && isOnlyOfficeViewable(ext) {
-		bootstrap, err := h.buildOnlyOfficeShareBootstrap(sl, filename, ext, fileSize)
+		bootstrap, err := h.buildOnlyOfficeShareBootstrap(c, sl, filename, ext, fileSize)
 		if err == nil {
 			return bootstrap, http.StatusOK, nil
 		}

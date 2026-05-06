@@ -125,7 +125,7 @@ func TestResolveOnlyOfficeServerURL(t *testing.T) {
 		req.Host = "files.example.com"
 		c.Request = req
 
-		got := resolveOnlyOfficeServerURL(c, "https://office-facing.example.com/", "")
+		got := resolveOnlyOfficeServerURL(c, "https://office-facing.example.com/", "", "https://office-facing.example.com/web-apps/apps/api/documents/api.js")
 		if got != "https://office-facing.example.com" {
 			t.Fatalf("resolveOnlyOfficeServerURL() = %q, want %q", got, "https://office-facing.example.com")
 		}
@@ -139,9 +139,46 @@ func TestResolveOnlyOfficeServerURL(t *testing.T) {
 		req.Header.Set("X-Forwarded-Proto", "https")
 		c.Request = req
 
-		got := resolveOnlyOfficeServerURL(c, "", "")
+		got := resolveOnlyOfficeServerURL(c, "", "", "https://office.example.com/web-apps/apps/api/documents/api.js")
 		if got != "https://files.example.com" {
 			t.Fatalf("resolveOnlyOfficeServerURL() = %q, want %q", got, "https://files.example.com")
+		}
+	})
+
+	t.Run("uses docker frontend host when browser and api urls are loopback", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		req := httptest.NewRequest(http.MethodGet, "/api/v2.1/repos/repo-1/onlyoffice?p=/doc.docx", nil)
+		req.Host = "localhost:3000"
+		c.Request = req
+
+		got := resolveOnlyOfficeServerURL(c, "", "", "http://localhost:8088/web-apps/apps/api/documents/api.js")
+		if got != dockerComposeFrontendURL {
+			t.Fatalf("resolveOnlyOfficeServerURL() = %q, want %q", got, dockerComposeFrontendURL)
+		}
+	})
+}
+
+func TestBuildOnlyOfficeDownloadURL(t *testing.T) {
+	got := buildOnlyOfficeDownloadURL("https://files.example.com", "token-123", "Westpark Terriories Aug 2018.docx")
+	want := "https://files.example.com/seafhttp/files/token-123/Westpark%20Terriories%20Aug%202018.docx"
+	if got != want {
+		t.Fatalf("buildOnlyOfficeDownloadURL() = %q, want %q", got, want)
+	}
+}
+
+func TestResolveOnlyOfficeInternalURL(t *testing.T) {
+	t.Run("uses explicit internal url", func(t *testing.T) {
+		got := resolveOnlyOfficeInternalURL("http://localhost:8088/web-apps/apps/api/documents/api.js", "http://onlyoffice:80")
+		if got != "http://onlyoffice:80" {
+			t.Fatalf("resolveOnlyOfficeInternalURL() = %q, want %q", got, "http://onlyoffice:80")
+		}
+	})
+
+	t.Run("auto-detects docker onlyoffice service for loopback api url", func(t *testing.T) {
+		got := resolveOnlyOfficeInternalURL("http://localhost:8088/web-apps/apps/api/documents/api.js", "")
+		if got != dockerComposeOnlyOfficeURL {
+			t.Fatalf("resolveOnlyOfficeInternalURL() = %q, want %q", got, dockerComposeOnlyOfficeURL)
 		}
 	})
 }

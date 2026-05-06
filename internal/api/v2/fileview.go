@@ -329,8 +329,8 @@ func (h *FileViewHandler) serveOnlyOfficeEditor(c *gin.Context, repoID, filePath
 
 	// Match the JSON endpoint behavior: fall back to the browser-facing request
 	// host when no OnlyOffice-specific override is configured.
-	ooServerURL := resolveOnlyOfficeServerURL(c, h.config.OnlyOffice.ServerURL, h.serverURL)
-	downloadURL := ooServerURL + "/seafhttp/files/" + downloadToken + "/" + filename
+	ooServerURL := resolveOnlyOfficeServerURL(c, h.config.OnlyOffice.ServerURL, h.serverURL, h.config.OnlyOffice.APIJSURL)
+	downloadURL := buildOnlyOfficeDownloadURL(ooServerURL, downloadToken, filename)
 	if strings.TrimSpace(h.config.OnlyOffice.JWTSecret) == "" {
 		redirectToFrontendErrorPage(c, http.StatusServiceUnavailable, "OnlyOffice Unavailable", "OnlyOffice JWT secret is not configured.")
 		return

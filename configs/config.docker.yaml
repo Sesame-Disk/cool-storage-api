@@ -377,19 +377,18 @@ fileview:
 
 onlyoffice:
   enabled: true
-  # Dev/docker keeps OnlyOffice in the same compose stack, so these defaults
-  # intentionally point at the bundled local services.
-  # URL to OnlyOffice api.js loaded by browser (external/host URL)
+  # Docker dev now matches production semantics: SesameFS only needs the
+  # browser-facing api_js_url plus the shared JWT secret. When api_js_url is a
+  # loopback address, the backend auto-detects the internal compose service
+  # URLs for callback and save traffic.
   api_js_url: "http://localhost:8088/web-apps/apps/api/documents/api.js"
   jwt_secret: ""                     # Set via ONLYOFFICE_JWT_SECRET env var (required when enabled)
   jwt_ttl_seconds: 3600              # Override via ONLYOFFICE_JWT_TTL_SECONDS (default 1 hour)
   max_document_bytes: 524288000      # Reject callback downloads larger than 500 MiB
   verify_certificate: false
   force_save: true
-  # URL for OnlyOffice container to reach SesameFS (docker network)
-  server_url: "http://sesamefs:8080"
-  # URL for SesameFS to reach OnlyOffice internally (docker network, port 80 not 8088)
-  internal_url: "http://onlyoffice:80"
+  server_url: ""                     # Optional explicit override; leave empty for auto-detection
+  internal_url: ""                   # Optional explicit override; leave empty for auto-detection
   # Extensions that can be viewed in OnlyOffice
   view_extensions:
     - doc
