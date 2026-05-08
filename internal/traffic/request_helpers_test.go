@@ -180,6 +180,23 @@ func TestCheckUploadQuotaWithChecker_PropagatesStorageError(t *testing.T) {
 	}
 }
 
+func TestCheckUploadQuotaWithChecker_NormalizesNegativeBytes(t *testing.T) {
+	fake := &fakeUploadChecker{
+		storageStatus:  QuotaStatus{Allowed: true},
+		trafficChecker: fakeTrafficChecker{status: QuotaStatus{Allowed: true}},
+	}
+
+	if _, err := CheckUploadQuotaWithChecker(fake, "org-1", "user-1", -1); err != nil {
+		t.Fatalf("CheckUploadQuotaWithChecker(-1) error = %v", err)
+	}
+	if fake.storageBytes != 0 {
+		t.Fatalf("storage bytes = %d, want 0 (negative input must be clamped)", fake.storageBytes)
+	}
+	if fake.trafficChecker.additionalBytes != 0 {
+		t.Fatalf("traffic bytes = %d, want 0 (negative input must be clamped)", fake.trafficChecker.additionalBytes)
+	}
+}
+
 func TestRecordCheckedTransfer_UsesResolvedPeriod(t *testing.T) {
 	wantPeriod := time.Date(2026, time.April, 1, 0, 0, 0, 0, time.UTC)
 	fake := &fakeTrafficRecorder{}
@@ -233,5 +250,46 @@ func TestTrafficQuotaExceededResponse(t *testing.T) {
 	response = TrafficQuotaExceededResponse(QuotaStatus{Reason: "traffic-download"}, "traffic quota exceeded", false)
 	if _, exists := response["reason"]; exists {
 		t.Fatal("did not expect reason when includeReason=false")
+	}
+}
+
+func TestStorageQuotaExceededResponse(t *testing.T) {
+	response := StorageQuotaExceededResponse(QuotaStatus{
+		UsedBytes:  2 * 1024 * 1024 * 1024,
+		LimitBytes: 2 * 1024 * 1024 * 1024,
+		Plan:       "hard",
+	}, "storage quota exceeded")
+
+	if response["error"] != "storage quota exceeded" {
+		t.Fatalf("response[error] = %v, want storage quota exceeded", response["error"])
+	}
+	if response["reason"] != "storage" {
+		t.Fatalf("response[reason] = %v, want storage", response["reason"])
+	}
+	if response["used_bytes"] != int64(2*1024*1024*1024) {
+		t.Fatalf("response[used_bytes] = %v, want %d", response["used_bytes"], int64(2*1024*1024*1024))
+	}
+	if response["limit_bytes"] != int64(2*1024*1024*1024) {
+		t.Fatalf("response[limit_bytes] = %v, want %d", response["limit_bytes"], int64(2*1024*1024*1024))
+	}
+	if response["plan"] != "hard" {
+		t.Fatalf("response[plan] = %v, want hard", response["plan"])
+	}
+}
+
+func TestStorageQuotaExceededResponse_OmitsZeroMetadata(t *testing.T) {
+	response := StorageQuotaExceededResponse(QuotaStatus{}, "storage quota exceeded")
+
+	if _, exists := response["used_bytes"]; exists {
+		t.Fatal("did not expect used_bytes when zero")
+	}
+	if _, exists := response["limit_bytes"]; exists {
+		t.Fatal("did not expect limit_bytes when zero")
+	}
+	if _, exists := response["plan"]; exists {
+		t.Fatal("did not expect plan when empty")
+	}
+	if response["reason"] != "storage" {
+		t.Fatalf("response[reason] = %v, want storage", response["reason"])
 	}
 }

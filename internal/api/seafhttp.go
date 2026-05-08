@@ -985,16 +985,12 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 	}
 
 	// Quota pre-check — evaluated before reading the body so we can fail fast.
-	// contentLength is an upper bound (includes multipart overhead); acceptable for quota checks.
+	// ContentLength is an upper bound (includes multipart overhead); acceptable for quota checks.
 	uploadTrafficStatus := traffic.QuotaStatus{Allowed: true}
 	if checker := traffic.GetChecker(); checker != nil {
-		contentLength := c.Request.ContentLength
-		if contentLength < 0 {
-			contentLength = 0
-		}
-		precheck, _ := traffic.CheckUploadQuotaWithChecker(checker, token.OrgID, token.UserID, contentLength)
+		precheck, _ := traffic.CheckUploadQuotaWithChecker(checker, token.OrgID, token.UserID, c.Request.ContentLength)
 		if !precheck.StorageStatus.Allowed {
-			c.JSON(http.StatusForbidden, gin.H{"error": "storage quota exceeded"})
+			c.JSON(http.StatusForbidden, traffic.StorageQuotaExceededResponse(precheck.StorageStatus, "storage quota exceeded"))
 			return
 		}
 		uploadTrafficStatus = precheck.TrafficStatus

@@ -27,7 +27,9 @@ type UploadQuotaCheckResult struct {
 
 // CheckUploadQuotaWithChecker evaluates storage quota first and traffic quota
 // second. A storage rejection short-circuits traffic evaluation because the
-// handler will fail before reading any bytes.
+// handler will fail before reading any bytes. Negative additionalBytes (e.g.
+// chunked uploads with no Content-Length) are treated as 0 so the projection
+// arithmetic in the underlying checker stays well-defined.
 func CheckUploadQuotaWithChecker(checker UploadQuotaPrechecker, orgID, userID string, additionalBytes int64) (UploadQuotaCheckResult, error) {
 	result := UploadQuotaCheckResult{
 		StorageStatus: QuotaStatus{Allowed: true},
@@ -35,6 +37,9 @@ func CheckUploadQuotaWithChecker(checker UploadQuotaPrechecker, orgID, userID st
 	}
 	if checker == nil {
 		return result, nil
+	}
+	if additionalBytes < 0 {
+		additionalBytes = 0
 	}
 
 	storageStatus, err := checker.CheckStorageQuota(orgID, additionalBytes)
@@ -94,6 +99,27 @@ func TrafficQuotaExceededResponse(quotaStatus QuotaStatus, message string, inclu
 	response := map[string]interface{}{"error": message}
 	if includeReason && quotaStatus.Reason != "" {
 		response["reason"] = quotaStatus.Reason
+	}
+	return response
+}
+
+// StorageQuotaExceededResponse builds the JSON payload for blocked uploads due
+// to storage quota. The shape mirrors TrafficQuotaExceededResponse so the
+// frontend can render storage and traffic rejections through the same path,
+// and includes usage/limit metadata so the UI can show "X of Y used".
+func StorageQuotaExceededResponse(quotaStatus QuotaStatus, message string) map[string]interface{} {
+	response := map[string]interface{}{
+		"error":  message,
+		"reason": "storage",
+	}
+	if quotaStatus.UsedBytes > 0 {
+		response["used_bytes"] = quotaStatus.UsedBytes
+	}
+	if quotaStatus.LimitBytes > 0 {
+		response["limit_bytes"] = quotaStatus.LimitBytes
+	}
+	if quotaStatus.Plan != "" {
+		response["plan"] = quotaStatus.Plan
 	}
 	return response
 }

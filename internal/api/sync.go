@@ -869,20 +869,20 @@ func (h *SyncHandler) PutBlock(c *gin.Context) {
 	log.Printf("PutBlock: externalID=%s, len=%d\n", externalID, len(externalID))
 
 	// Quota pre-check: reject early if storage or upload traffic quota exceeded.
+	// Skip when ContentLength is unknown/zero — the helper would also fast-path on
+	// 0 bytes, but skipping avoids two round-trips to the quota tables for a no-op.
 	uploadTrafficStatus := traffic.QuotaStatus{Allowed: true}
-	if checker := traffic.GetChecker(); checker != nil {
-		contentLen := c.Request.ContentLength
-		if contentLen > 0 {
-			precheck, _ := traffic.CheckUploadQuotaWithChecker(checker, orgID, userID, contentLen)
-			if !precheck.StorageStatus.Allowed {
-				c.JSON(http.StatusForbidden, gin.H{"error": "storage quota exceeded"})
-				return
-			}
-			uploadTrafficStatus = precheck.TrafficStatus
-			if !uploadTrafficStatus.Allowed {
-				c.JSON(http.StatusForbidden, gin.H{"error": "upload traffic quota exceeded"})
-				return
-			}
+	if checker := traffic.GetChecker(); checker != nil && c.Request.ContentLength > 0 {
+		precheck, _ := traffic.CheckUploadQuotaWithChecker(checker, orgID, userID, c.Request.ContentLength)
+		if !precheck.StorageStatus.Allowed {
+			c.JSON(http.StatusForbidden, traffic.StorageQuotaExceededResponse(precheck.StorageStatus, "storage quota exceeded"))
+			return
+		}
+		uploadTrafficStatus = precheck.TrafficStatus
+		if !uploadTrafficStatus.Allowed {
+			// Bare error (no reason field) is part of the seafile sync protocol contract.
+			c.JSON(http.StatusForbidden, gin.H{"error": "upload traffic quota exceeded"})
+			return
 		}
 	}
 
