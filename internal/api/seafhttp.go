@@ -15,6 +15,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -271,6 +272,7 @@ type ChunkUpload struct {
 	Filename    string
 	ParentDir   string
 	TotalSize   int64
+	CreatedAt   time.Time
 	TempFile    *os.File
 	TempPath    string
 	ReceivedEnd int64 // Highest byte received; informational only.
@@ -348,21 +350,22 @@ func (cm *ChunkManager) Stop() {
 // Global chunk manager instance
 var chunkManager = NewChunkManager()
 
-// GetOrCreateUpload gets or creates a chunk upload tracker
-func (cm *ChunkManager) GetOrCreateUpload(token, filename, parentDir string, totalSize int64) (*ChunkUpload, error) {
+// GetOrCreateUpload gets or creates a chunk upload tracker.
+// The boolean reports whether a new tracker was created.
+func (cm *ChunkManager) GetOrCreateUpload(token, filename, parentDir string, totalSize int64) (*ChunkUpload, bool, error) {
 	key := token + ":" + filename
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 
 	if upload, exists := cm.uploads[key]; exists {
-		return upload, nil
+		return upload, false, nil
 	}
 
 	// Create temp file
 	tempPath := filepath.Join(cm.tempDir, fmt.Sprintf("sesamefs_upload_%s_%s", token, sanitizeFilename(filename)))
 	tempFile, err := os.OpenFile(tempPath, os.O_CREATE|os.O_RDWR, 0600)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create temp file: %w", err)
+		return nil, false, fmt.Errorf("failed to create temp file: %w", err)
 	}
 
 	// Pre-allocate the file to total size (for seeking)
@@ -370,7 +373,7 @@ func (cm *ChunkManager) GetOrCreateUpload(token, filename, parentDir string, tot
 		if err := tempFile.Truncate(totalSize); err != nil {
 			tempFile.Close()
 			os.Remove(tempPath)
-			return nil, fmt.Errorf("failed to pre-allocate temp file: %w", err)
+			return nil, false, fmt.Errorf("failed to pre-allocate temp file: %w", err)
 		}
 	}
 
@@ -379,6 +382,7 @@ func (cm *ChunkManager) GetOrCreateUpload(token, filename, parentDir string, tot
 		Filename:    filename,
 		ParentDir:   parentDir,
 		TotalSize:   totalSize,
+		CreatedAt:   cm.now(),
 		TempFile:    tempFile,
 		TempPath:    tempPath,
 		ReceivedEnd: -1,
@@ -386,7 +390,7 @@ func (cm *ChunkManager) GetOrCreateUpload(token, filename, parentDir string, tot
 	}
 	cm.uploads[key] = upload
 	log.Printf("[ChunkManager] Created upload tracker: %s, totalSize=%d", key, totalSize)
-	return upload, nil
+	return upload, true, nil
 }
 
 // janitorLoop periodically reaps stale chunk uploads from memory and disk.
@@ -756,16 +760,26 @@ func parseContentRange(header string) (int64, int64, int64, bool) {
 
 // SeafHTTPHandler handles Seafile-compatible file operations
 type SeafHTTPHandler struct {
-	storage        *storage.S3Store
-	storageManager *storage.Manager
-	db             *db.DB
-	tokenStore     TokenStore
-	config         *config.Config
-	permMiddleware *middleware.PermissionMiddleware
-	zipMaxEntries  int
-	zipMaxDepth    int
-	zipMaxBytes    int64
+	storage         *storage.S3Store
+	storageManager  *storage.Manager
+	db              *db.DB
+	tokenStore      TokenStore
+	config          *config.Config
+	permMiddleware  *middleware.PermissionMiddleware
+	uploadStaging   UploadStagingStore
+	chunkedFinalize chunkedFinalizeFunc
+	zipMaxEntries   int
+	zipMaxDepth     int
+	zipMaxBytes     int64
 }
+
+type finalizeUploadResult struct {
+	FileID         string
+	ActualFilename string
+	CommitID       string
+}
+
+type chunkedFinalizeFunc func(c *gin.Context, token *AccessToken, upload *ChunkUpload, uploadID, parentDir, filename, storageKey string, totalSize int64, replace bool) (finalizeUploadResult, error)
 
 const (
 	defaultZipMaxEntries = 100000
@@ -818,16 +832,39 @@ func (b *zipTraversalBudget) noteFile(size int64) error {
 
 // NewSeafHTTPHandler creates a new SeafHTTP handler
 func NewSeafHTTPHandler(s3Store *storage.S3Store, storageManager *storage.Manager, database *db.DB, tokenStore TokenStore, cfg *config.Config, permMiddleware *middleware.PermissionMiddleware) *SeafHTTPHandler {
-	return &SeafHTTPHandler{
+	handler := &SeafHTTPHandler{
 		storage:        s3Store,
 		storageManager: storageManager,
 		db:             database,
 		tokenStore:     tokenStore,
 		config:         cfg,
 		permMiddleware: permMiddleware,
+		uploadStaging:  NewCassandraUploadStagingStore(database),
 		zipMaxEntries:  defaultZipMaxEntries,
 		zipMaxDepth:    defaultZipMaxDepth,
 		zipMaxBytes:    defaultZipMaxBytes,
+	}
+	handler.chunkedFinalize = handler.finalizeUploadStreaming
+	return handler
+}
+
+func (h *SeafHTTPHandler) SetUploadStagingStore(store UploadStagingStore) {
+	h.uploadStaging = store
+}
+
+func shortLogID(id string) string {
+	if len(id) <= 16 {
+		return id
+	}
+	return id[:16]
+}
+
+func (h *SeafHTTPHandler) persistUploadBlockState(record UploadSessionBlockRecord, stateLabel string) {
+	if h.uploadStaging == nil {
+		return
+	}
+	if err := h.uploadStaging.UpsertBlock(record); err != nil {
+		log.Printf("[finalizeUploadStreaming] WARNING: Failed to persist staging block state=%s upload=%s index=%d sha256=%s: %v", stateLabel, shortLogID(record.UploadID), record.BlockIndex, shortLogID(record.BlockSHA256), err)
 	}
 }
 
@@ -1023,9 +1060,10 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 
 	// Handle relative_path for folder uploads (e.g., "my-folder/subfolder/file.txt")
 	if relativePath != "" {
+		relativePath = strings.ReplaceAll(relativePath, "\\", "/")
 		if strings.HasSuffix(relativePath, "/") {
 			dirName := strings.TrimSuffix(relativePath, "/")
-			dirBaseName := filepath.Base(dirName)
+			dirBaseName := path.Base(dirName)
 
 			if filename == dirBaseName || filename == relativePath || filename == "" {
 				log.Printf("[HandleUpload] Skipping directory marker: %s (filename=%s)", relativePath, filename)
@@ -1038,24 +1076,21 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 			}
 
 			log.Printf("[HandleUpload] File in directory: relativePath=%s, filename=%s", relativePath, filename)
-			parentDir = filepath.Join(parentDir, dirName)
+			parentDir = path.Join(parentDir, dirName)
 		} else {
-			relDir := filepath.Dir(relativePath)
+			relDir := path.Dir(relativePath)
 			if relDir != "." && relDir != "" {
-				parentDir = filepath.Join(parentDir, relDir)
+				parentDir = path.Join(parentDir, relDir)
 			}
-			filename = filepath.Base(relativePath)
+			filename = path.Base(relativePath)
 		}
 	}
 
-	if !strings.HasPrefix(parentDir, "/") {
-		parentDir = "/" + parentDir
-	}
-	parentDir = filepath.Clean(parentDir)
+	parentDir = NormalizeUploadParentDir(parentDir)
 
 	log.Printf("[HandleUpload] relativePath=%s, parentDir=%s, filename=%s", relativePath, parentDir, filename)
 
-	filePath := filepath.Join(parentDir, filename)
+	filePath := path.Join(parentDir, filename)
 	storageKey := fmt.Sprintf("%s/%s%s", token.OrgID, token.RepoID, filePath)
 
 	// Check for Content-Range header (chunked upload)
@@ -1064,14 +1099,36 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 
 	log.Printf("[HandleUpload] Token=%s, File=%s, ContentRange=%s, isChunked=%v",
 		tokenStr, filename, contentRange, isChunked)
+	uploadID := BuildUploadSessionID(token.OrgID, token.RepoID, token.UserID, tokenStr, parentDir, filename)
 
 	if isChunked {
 		// Chunked upload: stream chunk data directly to temp file (no io.ReadAll)
-		upload, err := chunkManager.GetOrCreateUpload(tokenStr, filename, parentDir, total)
+		upload, created, err := chunkManager.GetOrCreateUpload(tokenStr, filename, parentDir, total)
 		if err != nil {
 			log.Printf("[HandleUpload] Failed to create upload tracker: %v", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to initialize upload"})
 			return
+		}
+		if created && h.uploadStaging != nil {
+			now := time.Now().UTC()
+			if err := h.uploadStaging.UpsertSession(UploadSessionRecord{
+				UploadID:  uploadID,
+				OrgID:     token.OrgID,
+				RepoID:    token.RepoID,
+				UserID:    token.UserID,
+				TokenID:   tokenStr,
+				ParentDir: parentDir,
+				Filename:  filename,
+				TotalSize: total,
+				State:     UploadSessionStateReceiving,
+				CreatedAt: upload.CreatedAt.UTC(),
+				UpdatedAt: now,
+				ExpiresAt: now.Add(chunkDiskTTL),
+			}); err != nil {
+				log.Printf("[HandleUpload] Failed to persist upload session: %v", err)
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to persist upload session"})
+				return
+			}
 		}
 
 		// Stream chunk directly to temp file at the correct offset
@@ -1090,16 +1147,74 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 		// All chunks received — finalize by streaming from temp file
 		log.Printf("[HandleUpload] All chunks received, finalizing upload (streaming)")
 		upload.Touch()
-		fileID, actualFilename, err := h.finalizeUploadStreaming(c, token, upload, parentDir, filename, storageKey, total, replaceFile)
+		if h.uploadStaging != nil {
+			now := time.Now().UTC()
+			if err := h.uploadStaging.UpsertSession(UploadSessionRecord{
+				UploadID:  uploadID,
+				OrgID:     token.OrgID,
+				RepoID:    token.RepoID,
+				UserID:    token.UserID,
+				TokenID:   tokenStr,
+				ParentDir: parentDir,
+				Filename:  filename,
+				TotalSize: total,
+				State:     UploadSessionStatePromoting,
+				CreatedAt: upload.CreatedAt.UTC(),
+				UpdatedAt: now,
+				ExpiresAt: now.Add(chunkDiskTTL),
+			}); err != nil {
+				log.Printf("[HandleUpload] Failed to persist upload state: %v", err)
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to persist upload state"})
+				return
+			}
+		}
+		result, err := h.chunkedFinalize(c, token, upload, uploadID, parentDir, filename, storageKey, total, replaceFile)
 		if err != nil {
 			upload.ResetFinalization()
+			if h.uploadStaging != nil {
+				now := time.Now().UTC()
+				_ = h.uploadStaging.UpsertSession(UploadSessionRecord{
+					UploadID:  uploadID,
+					OrgID:     token.OrgID,
+					RepoID:    token.RepoID,
+					UserID:    token.UserID,
+					TokenID:   tokenStr,
+					ParentDir: parentDir,
+					Filename:  filename,
+					TotalSize: total,
+					State:     UploadSessionStateCleanupPending,
+					CreatedAt: upload.CreatedAt.UTC(),
+					UpdatedAt: now,
+					ExpiresAt: now.Add(chunkDiskTTL),
+					LastError: err.Error(),
+				})
+			}
 			log.Printf("[HandleUpload] Finalization failed: %v", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to finalize upload"})
 			return
 		}
+		if h.uploadStaging != nil {
+			now := time.Now().UTC()
+			_ = h.uploadStaging.UpsertSession(UploadSessionRecord{
+				UploadID:       uploadID,
+				OrgID:          token.OrgID,
+				RepoID:         token.RepoID,
+				UserID:         token.UserID,
+				TokenID:        tokenStr,
+				ParentDir:      parentDir,
+				Filename:       filename,
+				ActualFilename: result.ActualFilename,
+				CommitID:       result.CommitID,
+				TotalSize:      total,
+				State:          UploadSessionStateClosed,
+				CreatedAt:      upload.CreatedAt.UTC(),
+				UpdatedAt:      now,
+				ExpiresAt:      now.Add(chunkDiskTTL),
+			})
+		}
 		chunkManager.CleanupUpload(tokenStr, filename)
 
-		log.Printf("[HandleUpload] Upload complete: file=%s, size=%d, id=%s", actualFilename, total, fileID[:16])
+		log.Printf("[HandleUpload] Upload complete: file=%s, size=%d, id=%s", result.ActualFilename, total, shortLogID(result.FileID))
 
 		// Record traffic and storage — fire-and-forget, never blocks the response.
 		if rec := traffic.Get(); rec != nil {
@@ -1114,9 +1229,9 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 		}
 
 		if retJSON {
-			c.JSON(http.StatusOK, []gin.H{{"name": actualFilename, "id": fileID, "size": strconv.FormatInt(total, 10)}})
+			c.JSON(http.StatusOK, []gin.H{{"name": result.ActualFilename, "id": result.FileID, "size": strconv.FormatInt(total, 10)}})
 		} else {
-			c.String(http.StatusOK, fileID)
+			c.String(http.StatusOK, result.FileID)
 		}
 		return
 	}
@@ -1129,6 +1244,48 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 		return
 	}
 	finalSize := int64(len(chunkData))
+	singleShotCreatedAt := time.Now().UTC()
+	markSingleShotCleanup := func(cause error) {
+		if h.uploadStaging == nil || cause == nil {
+			return
+		}
+		now := time.Now().UTC()
+		_ = h.uploadStaging.UpsertSession(UploadSessionRecord{
+			UploadID:  uploadID,
+			OrgID:     token.OrgID,
+			RepoID:    token.RepoID,
+			UserID:    token.UserID,
+			TokenID:   tokenStr,
+			ParentDir: parentDir,
+			Filename:  filename,
+			TotalSize: finalSize,
+			State:     UploadSessionStateCleanupPending,
+			CreatedAt: singleShotCreatedAt,
+			UpdatedAt: now,
+			ExpiresAt: now.Add(chunkDiskTTL),
+			LastError: cause.Error(),
+		})
+	}
+	if h.uploadStaging != nil {
+		if err := h.uploadStaging.UpsertSession(UploadSessionRecord{
+			UploadID:  uploadID,
+			OrgID:     token.OrgID,
+			RepoID:    token.RepoID,
+			UserID:    token.UserID,
+			TokenID:   tokenStr,
+			ParentDir: parentDir,
+			Filename:  filename,
+			TotalSize: finalSize,
+			State:     UploadSessionStateReceiving,
+			CreatedAt: singleShotCreatedAt,
+			UpdatedAt: singleShotCreatedAt,
+			ExpiresAt: singleShotCreatedAt.Add(chunkDiskTTL),
+		}); err != nil {
+			log.Printf("[HandleUpload] Failed to persist upload session: %v", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to persist upload session"})
+			return
+		}
+	}
 
 	// Generate file ID (SHA-1 of plaintext for Seafile compatibility)
 	sha1Hash := sha1.Sum(chunkData)
@@ -1147,11 +1304,13 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 	if encrypted {
 		fileKey, fileIV := v2.GetDecryptSessions().GetFileKeyAndIV(token.UserID, token.RepoID)
 		if fileKey == nil {
+			markSingleShotCleanup(fmt.Errorf("library is encrypted and not unlocked"))
 			c.JSON(http.StatusForbidden, gin.H{"error": "library is encrypted and not unlocked"})
 			return
 		}
 		encryptedContent, err := crypto.EncryptBlockSeafile(chunkData, fileKey, fileIV)
 		if err != nil {
+			markSingleShotCleanup(err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to encrypt content"})
 			return
 		}
@@ -1160,6 +1319,23 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 
 	sha256Hash := sha256.Sum256(storedContent)
 	sha256ID := hex.EncodeToString(sha256Hash[:])
+	if h.uploadStaging != nil {
+		registeredAt := time.Now().UTC()
+		h.persistUploadBlockState(UploadSessionBlockRecord{
+			UploadID:     uploadID,
+			BlockIndex:   0,
+			OrgID:        token.OrgID,
+			BlockSHA1:    fileID,
+			BlockSHA256:  sha256ID,
+			SizeBytes:    len(storedContent),
+			StorageClass: "",
+			StorageKey:   sha256ID,
+			Source:       UploadBlockSourceNewObject,
+			State:        UploadBlockStateRegistered,
+			CreatedAt:    singleShotCreatedAt,
+			UpdatedAt:    registeredAt,
+		}, string(UploadBlockStateRegistered))
+	}
 
 	// Store using PutAuto (automatically uses multipart for large files)
 	ctx := context.Background()
@@ -1168,21 +1344,42 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 		log.Printf("[HandleUpload] Failed to get block store: %v, falling back to S3", err)
 		objectStore, _, resolveErr := h.resolveLibraryObjectStore(httputil.GetRoutingHostname(c, h.configuredServerURL()), token.OrgID, token.RepoID)
 		if resolveErr != nil {
+			markSingleShotCleanup(resolveErr)
 			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "block storage not available"})
 			return
 		}
 		_, err = objectStore.Put(c.Request.Context(), storageKey, newBytesReader(storedContent), int64(len(storedContent)))
 		if err != nil {
+			markSingleShotCleanup(err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to upload file"})
 			return
 		}
 	} else {
 		_, err = blockStore.PutBlockAuto(ctx, sha256ID, storedContent)
 		if err != nil {
+			markSingleShotCleanup(err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to store block"})
 			return
 		}
 		log.Printf("[HandleUpload] Stored block %s (SHA-256: %s)", fileID[:16], sha256ID[:16])
+	}
+	if h.uploadStaging != nil {
+		uploadedAt := time.Now().UTC()
+		h.persistUploadBlockState(UploadSessionBlockRecord{
+			UploadID:     uploadID,
+			BlockIndex:   0,
+			OrgID:        token.OrgID,
+			BlockSHA1:    fileID,
+			BlockSHA256:  sha256ID,
+			SizeBytes:    len(storedContent),
+			StorageClass: actualStorageClass,
+			StorageKey:   sha256ID,
+			Source:       UploadBlockSourceNewObject,
+			State:        UploadBlockStateUploaded,
+			CreatedAt:    singleShotCreatedAt,
+			UpdatedAt:    uploadedAt,
+			UploadedAt:   &uploadedAt,
+		}, string(UploadBlockStateUploaded))
 	}
 
 	// Create SHA-1 → SHA-256 mapping (dual-write: forward + reverse lookup)
@@ -1190,6 +1387,7 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 		INSERT INTO block_id_mappings (org_id, external_id, internal_id) VALUES (?, ?, ?)
 	`, token.OrgID, fileID, sha256ID).Exec(); err != nil {
 		log.Printf("[HandleUpload] CRITICAL: Failed to write block_id_mapping org=%s ext=%s int=%s: %v", token.OrgID, fileID[:16], sha256ID[:16], err)
+		markSingleShotCleanup(err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create block mapping"})
 		return
 	}
@@ -1202,18 +1400,55 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 	// Register block metadata for size lookups (used by video/audio Range requests)
 	if err := v2.NewFSHelper(h.db).IncrementOrCreateBlock(token.OrgID, sha256ID, len(storedContent), actualStorageClass, ""); err != nil {
 		log.Printf("[HandleUpload] WARNING: Failed to write block metadata org=%s block=%s: %v", token.OrgID, sha256ID[:16], err)
+	} else if h.uploadStaging != nil {
+		promotedAt := time.Now().UTC()
+		h.persistUploadBlockState(UploadSessionBlockRecord{
+			UploadID:     uploadID,
+			BlockIndex:   0,
+			OrgID:        token.OrgID,
+			BlockSHA1:    fileID,
+			BlockSHA256:  sha256ID,
+			SizeBytes:    len(storedContent),
+			StorageClass: actualStorageClass,
+			StorageKey:   sha256ID,
+			Source:       UploadBlockSourceNewObject,
+			State:        UploadBlockStatePromoted,
+			CreatedAt:    singleShotCreatedAt,
+			UpdatedAt:    promotedAt,
+			PromotedAt:   &promotedAt,
+		}, string(UploadBlockStatePromoted))
 	}
 
 	// Update filesystem metadata
 	commitID, actualFilename, err := h.commitUploadedFile(token.OrgID, token.RepoID, token.UserID, parentDir, filename, fileID, chunkData, finalSize, replaceFile)
 	if err != nil {
 		log.Printf("[HandleUpload] Failed to update filesystem: %v", err)
+		markSingleShotCleanup(err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "file stored but metadata update failed"})
 		return
 	}
 	log.Printf("[HandleUpload] Filesystem updated, commit=%s", commitID)
+	if h.uploadStaging != nil {
+		now := time.Now().UTC()
+		_ = h.uploadStaging.UpsertSession(UploadSessionRecord{
+			UploadID:       uploadID,
+			OrgID:          token.OrgID,
+			RepoID:         token.RepoID,
+			UserID:         token.UserID,
+			TokenID:        tokenStr,
+			ParentDir:      parentDir,
+			Filename:       filename,
+			ActualFilename: actualFilename,
+			CommitID:       commitID,
+			TotalSize:      finalSize,
+			State:          UploadSessionStateClosed,
+			CreatedAt:      singleShotCreatedAt,
+			UpdatedAt:      now,
+			ExpiresAt:      now.Add(chunkDiskTTL),
+		})
+	}
 
-	log.Printf("[HandleUpload] Upload complete: file=%s, size=%d, id=%s", actualFilename, finalSize, fileID[:16])
+	log.Printf("[HandleUpload] Upload complete: file=%s, size=%d, id=%s", actualFilename, finalSize, shortLogID(fileID))
 
 	// Record traffic and storage — fire-and-forget, never blocks the response.
 	if rec := traffic.Get(); rec != nil {
@@ -1236,13 +1471,13 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 
 // finalizeUploadStreaming processes a completed chunked upload by streaming from the temp file.
 // It reads the file in blocks, hashes and stores each block individually — O(blockSize) RAM.
-func (h *SeafHTTPHandler) finalizeUploadStreaming(c *gin.Context, token *AccessToken, upload *ChunkUpload, parentDir, filename, storageKey string, totalSize int64, replace bool) (string, string, error) {
+func (h *SeafHTTPHandler) finalizeUploadStreaming(c *gin.Context, token *AccessToken, upload *ChunkUpload, uploadID, parentDir, filename, storageKey string, totalSize int64, replace bool) (finalizeUploadResult, error) {
 	ctx := context.Background()
 
 	// Get the temp file reader
 	reader, err := upload.GetReader()
 	if err != nil {
-		return "", "", fmt.Errorf("failed to get upload reader: %w", err)
+		return finalizeUploadResult{}, fmt.Errorf("failed to get upload reader: %w", err)
 	}
 
 	// Check encryption
@@ -1254,13 +1489,13 @@ func (h *SeafHTTPHandler) finalizeUploadStreaming(c *gin.Context, token *AccessT
 	if encrypted {
 		fileKey, fileIV = v2.GetDecryptSessions().GetFileKeyAndIV(token.UserID, token.RepoID)
 		if fileKey == nil {
-			return "", "", fmt.Errorf("library is encrypted but not unlocked")
+			return finalizeUploadResult{}, fmt.Errorf("library is encrypted but not unlocked")
 		}
 	}
 
 	blockStore, actualStorageClass, err := h.resolveLibraryBlockStore(httputil.GetRoutingHostname(c, h.configuredServerURL()), token.OrgID, token.RepoID)
 	if err != nil {
-		return "", "", fmt.Errorf("block store not available: %w", err)
+		return finalizeUploadResult{}, fmt.Errorf("block store not available: %w", err)
 	}
 
 	// Stream the temp file sequentially (one block at a time) but submit per-block
@@ -1286,7 +1521,7 @@ readLoop:
 				break
 			}
 			if readErr != nil {
-				return "", "", fmt.Errorf("read error: %w", readErr)
+				return finalizeUploadResult{}, fmt.Errorf("read error: %w", readErr)
 			}
 		}
 
@@ -1330,6 +1565,24 @@ readLoop:
 
 			sha256Hash := sha256.Sum256(storedBlock)
 			sha256ID := hex.EncodeToString(sha256Hash[:])
+			var uploadedAt *time.Time
+			if h.uploadStaging != nil {
+				registeredAt := time.Now().UTC()
+				h.persistUploadBlockState(UploadSessionBlockRecord{
+					UploadID:     uploadID,
+					BlockIndex:   blockIndexLocal,
+					OrgID:        token.OrgID,
+					BlockSHA1:    blockSHA1IDLocal,
+					BlockSHA256:  sha256ID,
+					SizeBytes:    len(storedBlock),
+					StorageClass: actualStorageClass,
+					StorageKey:   sha256ID,
+					Source:       UploadBlockSourceNewObject,
+					State:        UploadBlockStateRegistered,
+					CreatedAt:    upload.CreatedAt.UTC(),
+					UpdatedAt:    registeredAt,
+				}, string(UploadBlockStateRegistered))
+			}
 
 			accounted, accountErr := upload.BlockAlreadyAccounted(blockIndexLocal, sha256ID)
 			if accountErr != nil {
@@ -1342,6 +1595,25 @@ readLoop:
 
 			if _, putErr := blockStore.PutBlockAuto(egCtx, sha256ID, storedBlock); putErr != nil {
 				return fmt.Errorf("failed to store block: %w", putErr)
+			}
+			if h.uploadStaging != nil {
+				uploadedAtValue := time.Now().UTC()
+				uploadedAt = &uploadedAtValue
+				h.persistUploadBlockState(UploadSessionBlockRecord{
+					UploadID:     uploadID,
+					BlockIndex:   blockIndexLocal,
+					OrgID:        token.OrgID,
+					BlockSHA1:    blockSHA1IDLocal,
+					BlockSHA256:  sha256ID,
+					SizeBytes:    len(storedBlock),
+					StorageClass: actualStorageClass,
+					StorageKey:   sha256ID,
+					Source:       UploadBlockSourceNewObject,
+					State:        UploadBlockStateUploaded,
+					CreatedAt:    upload.CreatedAt.UTC(),
+					UpdatedAt:    uploadedAtValue,
+					UploadedAt:   uploadedAt,
+				}, string(UploadBlockStateUploaded))
 			}
 
 			// Forward mapping is on the critical read path — its failure aborts.
@@ -1364,6 +1636,24 @@ readLoop:
 				return fsHelper.IncrementOrCreateBlock(token.OrgID, sha256ID, len(storedBlock), actualStorageClass, "")
 			}); blkErr != nil {
 				log.Printf("[finalizeUploadStreaming] WARNING: Failed to write block metadata org=%s block=%s: %v", token.OrgID, sha256ID[:16], blkErr)
+			} else if h.uploadStaging != nil {
+				promotedAt := time.Now().UTC()
+				h.persistUploadBlockState(UploadSessionBlockRecord{
+					UploadID:     uploadID,
+					BlockIndex:   blockIndexLocal,
+					OrgID:        token.OrgID,
+					BlockSHA1:    blockSHA1IDLocal,
+					BlockSHA256:  sha256ID,
+					SizeBytes:    len(storedBlock),
+					StorageClass: actualStorageClass,
+					StorageKey:   sha256ID,
+					Source:       UploadBlockSourceNewObject,
+					State:        UploadBlockStatePromoted,
+					CreatedAt:    upload.CreatedAt.UTC(),
+					UpdatedAt:    promotedAt,
+					UploadedAt:   uploadedAt,
+					PromotedAt:   &promotedAt,
+				}, string(UploadBlockStatePromoted))
 			}
 
 			upload.Touch()
@@ -1376,7 +1666,7 @@ readLoop:
 	}
 
 	if err := eg.Wait(); err != nil {
-		return "", "", err
+		return finalizeUploadResult{}, err
 	}
 
 	// File ID = SHA-1 of the complete plaintext
@@ -1387,11 +1677,11 @@ readLoop:
 	// Update filesystem metadata with multiple block IDs
 	commitID, actualFilename, err := h.commitUploadedFileMultiBlock(token.OrgID, token.RepoID, token.UserID, parentDir, filename, fileID, blockSHA1IDs, totalSize, replace)
 	if err != nil {
-		return "", "", fmt.Errorf("failed to update filesystem metadata: %w", err)
+		return finalizeUploadResult{}, fmt.Errorf("failed to update filesystem metadata: %w", err)
 	}
 	log.Printf("[finalizeUploadStreaming] Filesystem updated, commit=%s", commitID)
 
-	return fileID, actualFilename, nil
+	return finalizeUploadResult{FileID: fileID, ActualFilename: actualFilename, CommitID: commitID}, nil
 }
 
 // commitUploadedFileMultiBlock is like commitUploadedFile but supports multiple block IDs.

@@ -152,3 +152,16 @@ func TestInitialSchemaContainsLookupNameAndStarredIndex(t *testing.T) {
 	assert.Contains(t, content, "storage_class TEXT")
 	assert.NotContains(t, content, "CREATE TABLE IF NOT EXISTS share_links_by_org")
 }
+
+func TestUploadStagingMigrationContainsSessionTables(t *testing.T) {
+	raw, err := migrationsFS.ReadFile("migrations/003_upload_staging.cql")
+	require.NoError(t, err)
+	content := string(raw)
+
+	assert.Contains(t, content, "CREATE TABLE IF NOT EXISTS upload_sessions")
+	assert.Contains(t, content, "CREATE TABLE IF NOT EXISTS upload_session_blocks")
+	assert.Contains(t, content, "CREATE TABLE IF NOT EXISTS upload_session_blocks_by_sha256")
+	assert.Contains(t, content, "state           TEXT")
+	assert.Contains(t, content, "block_sha256   TEXT")
+	assert.Contains(t, content, "cleanup_pending")
+}

@@ -3,11 +3,13 @@ package api
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -16,6 +18,41 @@ import (
 	"github.com/gin-gonic/gin"
 	"golang.org/x/time/rate"
 )
+
+type fakeUploadStagingStore struct {
+	mu         sync.Mutex
+	sessions   []UploadSessionRecord
+	blocks     []UploadSessionBlockRecord
+	err        error
+	sessionErr error
+	blockErr   error
+}
+
+func (f *fakeUploadStagingStore) UpsertSession(record UploadSessionRecord) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.sessionErr != nil {
+		return f.sessionErr
+	}
+	if f.err != nil {
+		return f.err
+	}
+	f.sessions = append(f.sessions, record)
+	return nil
+}
+
+func (f *fakeUploadStagingStore) UpsertBlock(record UploadSessionBlockRecord) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.blockErr != nil {
+		return f.blockErr
+	}
+	if f.err != nil {
+		return f.err
+	}
+	f.blocks = append(f.blocks, record)
+	return nil
+}
 
 func init() {
 	gin.SetMode(gin.TestMode)
@@ -812,6 +849,212 @@ func TestSeafHTTPHandlerUploadNoFileWithStorageManager(t *testing.T) {
 	}
 }
 
+func TestHandleUploadChunked_PartialChunkPersistsReceivingSession(t *testing.T) {
+	tm := NewTokenManager(time.Hour)
+	tokenStr, err := tm.CreateUploadToken("org-1", "repo-1", "/", "user-1")
+	if err != nil {
+		t.Fatalf("CreateUploadToken failed: %v", err)
+	}
+	staging := &fakeUploadStagingStore{}
+	handler := NewSeafHTTPHandler(nil, storage.NewManager(), nil, tm, nil, nil)
+	handler.SetUploadStagingStore(staging)
+
+	r := gin.New()
+	r.POST("/seafhttp/upload-api/:token", handler.HandleUpload)
+
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	part, _ := writer.CreateFormFile("file", "partial.txt")
+	_, _ = part.Write([]byte("hel"))
+	writer.Close()
+
+	req := httptest.NewRequest(http.MethodPost, "/seafhttp/upload-api/"+tokenStr, &body)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	req.Header.Set("Content-Range", "bytes 0-2/5")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusOK)
+	}
+	if len(staging.sessions) == 0 {
+		t.Fatal("expected staging session to be persisted")
+	}
+	got := staging.sessions[len(staging.sessions)-1]
+	if got.State != UploadSessionStateReceiving {
+		t.Fatalf("session state = %q, want %q", got.State, UploadSessionStateReceiving)
+	}
+	if got.Filename != "partial.txt" {
+		t.Fatalf("filename = %q, want partial.txt", got.Filename)
+	}
+	chunkManager.CleanupUpload(tokenStr, "partial.txt")
+}
+
+func TestHandleUploadChunked_FinalizeSuccessClosesSession(t *testing.T) {
+	tm := NewTokenManager(time.Hour)
+	tokenStr, err := tm.CreateUploadToken("org-1", "repo-1", "/", "user-1")
+	if err != nil {
+		t.Fatalf("CreateUploadToken failed: %v", err)
+	}
+	staging := &fakeUploadStagingStore{}
+	handler := NewSeafHTTPHandler(nil, storage.NewManager(), nil, tm, nil, nil)
+	handler.SetUploadStagingStore(staging)
+	handler.chunkedFinalize = func(c *gin.Context, token *AccessToken, upload *ChunkUpload, uploadID, parentDir, filename, storageKey string, totalSize int64, replace bool) (finalizeUploadResult, error) {
+		return finalizeUploadResult{FileID: "file-id", ActualFilename: filename, CommitID: "commit-id"}, nil
+	}
+
+	r := gin.New()
+	r.POST("/seafhttp/upload-api/:token", handler.HandleUpload)
+
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	part, _ := writer.CreateFormFile("file", "done.txt")
+	_, _ = part.Write([]byte("hello"))
+	writer.Close()
+
+	req := httptest.NewRequest(http.MethodPost, "/seafhttp/upload-api/"+tokenStr+"?ret-json=1", &body)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	req.Header.Set("Content-Range", "bytes 0-4/5")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusOK)
+	}
+	if len(staging.sessions) < 3 {
+		t.Fatalf("expected receiving/promoting/closed session writes, got %d", len(staging.sessions))
+	}
+	if staging.sessions[len(staging.sessions)-2].State != UploadSessionStatePromoting {
+		t.Fatalf("penultimate state = %q, want %q", staging.sessions[len(staging.sessions)-2].State, UploadSessionStatePromoting)
+	}
+	if staging.sessions[len(staging.sessions)-1].State != UploadSessionStateClosed {
+		t.Fatalf("final state = %q, want %q", staging.sessions[len(staging.sessions)-1].State, UploadSessionStateClosed)
+	}
+	if staging.sessions[len(staging.sessions)-1].CommitID != "commit-id" {
+		t.Fatalf("commit id = %q, want commit-id", staging.sessions[len(staging.sessions)-1].CommitID)
+	}
+	if body := w.Body.String(); body == "" {
+		t.Fatal("expected JSON response body")
+	}
+}
+
+func TestHandleUploadChunked_ReceivingSessionWrittenOnceAcrossChunks(t *testing.T) {
+	tm := NewTokenManager(time.Hour)
+	tokenStr, err := tm.CreateUploadToken("org-1", "repo-1", "/", "user-1")
+	if err != nil {
+		t.Fatalf("CreateUploadToken failed: %v", err)
+	}
+	staging := &fakeUploadStagingStore{}
+	handler := NewSeafHTTPHandler(nil, storage.NewManager(), nil, tm, nil, nil)
+	handler.SetUploadStagingStore(staging)
+	handler.chunkedFinalize = func(c *gin.Context, token *AccessToken, upload *ChunkUpload, uploadID, parentDir, filename, storageKey string, totalSize int64, replace bool) (finalizeUploadResult, error) {
+		return finalizeUploadResult{FileID: "short-id", ActualFilename: filename, CommitID: "commit-id"}, nil
+	}
+
+	r := gin.New()
+	r.POST("/seafhttp/upload-api/:token", handler.HandleUpload)
+
+	makeRequest := func(contentRange string, payload string) *httptest.ResponseRecorder {
+		var body bytes.Buffer
+		writer := multipart.NewWriter(&body)
+		part, _ := writer.CreateFormFile("file", "twostep.txt")
+		_, _ = part.Write([]byte(payload))
+		writer.Close()
+
+		req := httptest.NewRequest(http.MethodPost, "/seafhttp/upload-api/"+tokenStr, &body)
+		req.Header.Set("Content-Type", writer.FormDataContentType())
+		req.Header.Set("Content-Range", contentRange)
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+		return w
+	}
+
+	first := makeRequest("bytes 0-1/5", "he")
+	if first.Code != http.StatusOK {
+		t.Fatalf("first status = %d, want %d", first.Code, http.StatusOK)
+	}
+	second := makeRequest("bytes 2-4/5", "llo")
+	if second.Code != http.StatusOK {
+		t.Fatalf("second status = %d, want %d", second.Code, http.StatusOK)
+	}
+
+	receivingCount := 0
+	for _, session := range staging.sessions {
+		if session.State == UploadSessionStateReceiving {
+			receivingCount++
+		}
+	}
+	if receivingCount != 1 {
+		t.Fatalf("receiving session writes = %d, want 1", receivingCount)
+	}
+	if staging.sessions[len(staging.sessions)-1].State != UploadSessionStateClosed {
+		t.Fatalf("final state = %q, want %q", staging.sessions[len(staging.sessions)-1].State, UploadSessionStateClosed)
+	}
+}
+
+func TestPersistUploadBlockStateSwallowsErrors(t *testing.T) {
+	handler := NewSeafHTTPHandler(nil, storage.NewManager(), nil, NewMockTokenStore(), nil, nil)
+	staging := &fakeUploadStagingStore{blockErr: errors.New("staging down")}
+	handler.SetUploadStagingStore(staging)
+
+	handler.persistUploadBlockState(UploadSessionBlockRecord{
+		UploadID:    "upload-1",
+		BlockIndex:  0,
+		OrgID:       "org-1",
+		BlockSHA256: "abc123",
+		State:       UploadBlockStateRegistered,
+		CreatedAt:   time.Now().UTC(),
+		UpdatedAt:   time.Now().UTC(),
+	}, string(UploadBlockStateRegistered))
+
+	if len(staging.blocks) != 0 {
+		t.Fatalf("expected failed block staging writes to be swallowed, got %d recorded blocks", len(staging.blocks))
+	}
+}
+
+func TestHandleUploadChunked_FinalizeFailureMarksCleanupPending(t *testing.T) {
+	tm := NewTokenManager(time.Hour)
+	tokenStr, err := tm.CreateUploadToken("org-1", "repo-1", "/", "user-1")
+	if err != nil {
+		t.Fatalf("CreateUploadToken failed: %v", err)
+	}
+	staging := &fakeUploadStagingStore{}
+	handler := NewSeafHTTPHandler(nil, storage.NewManager(), nil, tm, nil, nil)
+	handler.SetUploadStagingStore(staging)
+	handler.chunkedFinalize = func(c *gin.Context, token *AccessToken, upload *ChunkUpload, uploadID, parentDir, filename, storageKey string, totalSize int64, replace bool) (finalizeUploadResult, error) {
+		return finalizeUploadResult{}, io.ErrUnexpectedEOF
+	}
+
+	r := gin.New()
+	r.POST("/seafhttp/upload-api/:token", handler.HandleUpload)
+
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	part, _ := writer.CreateFormFile("file", "broken.txt")
+	_, _ = part.Write([]byte("hello"))
+	writer.Close()
+
+	req := httptest.NewRequest(http.MethodPost, "/seafhttp/upload-api/"+tokenStr, &body)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	req.Header.Set("Content-Range", "bytes 0-4/5")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusInternalServerError)
+	}
+	if len(staging.sessions) < 3 {
+		t.Fatalf("expected receiving/promoting/cleanup_pending session writes, got %d", len(staging.sessions))
+	}
+	if staging.sessions[len(staging.sessions)-1].State != UploadSessionStateCleanupPending {
+		t.Fatalf("final state = %q, want %q", staging.sessions[len(staging.sessions)-1].State, UploadSessionStateCleanupPending)
+	}
+	if staging.sessions[len(staging.sessions)-1].LastError == "" {
+		t.Fatal("expected cleanup_pending state to capture last error")
+	}
+	chunkManager.CleanupUpload(tokenStr, "broken.txt")
+}
+
 func TestSeafHTTPHandlerDownloadInvalidToken(t *testing.T) {
 	tokenStore := NewMockTokenStore()
 	handler := NewSeafHTTPHandler(nil, nil, nil, tokenStore, nil, nil)
@@ -1099,9 +1342,12 @@ func TestNewChunkManager(t *testing.T) {
 func TestChunkManagerGetOrCreateUpload(t *testing.T) {
 	cm := NewChunkManager()
 
-	upload, err := cm.GetOrCreateUpload("token1", "file.txt", "/", 1024)
+	upload, created, err := cm.GetOrCreateUpload("token1", "file.txt", "/", 1024)
 	if err != nil {
 		t.Fatalf("GetOrCreateUpload failed: %v", err)
+	}
+	if !created {
+		t.Fatal("expected first call to create upload tracker")
 	}
 	if upload == nil {
 		t.Fatal("upload should not be nil")
@@ -1117,18 +1363,24 @@ func TestChunkManagerGetOrCreateUpload(t *testing.T) {
 	}
 
 	// Getting the same upload should return the existing one
-	upload2, err := cm.GetOrCreateUpload("token1", "file.txt", "/", 1024)
+	upload2, created, err := cm.GetOrCreateUpload("token1", "file.txt", "/", 1024)
 	if err != nil {
 		t.Fatalf("GetOrCreateUpload (2nd call) failed: %v", err)
+	}
+	if created {
+		t.Fatal("expected second call to reuse existing upload tracker")
 	}
 	if upload2 != upload {
 		t.Error("expected same upload instance for same key")
 	}
 
 	// Different key should create a new upload
-	upload3, err := cm.GetOrCreateUpload("token2", "file.txt", "/", 2048)
+	upload3, created, err := cm.GetOrCreateUpload("token2", "file.txt", "/", 2048)
 	if err != nil {
 		t.Fatalf("GetOrCreateUpload (different key) failed: %v", err)
+	}
+	if !created {
+		t.Fatal("expected different key to create new upload tracker")
 	}
 	if upload3 == upload {
 		t.Error("expected different upload instance for different key")
@@ -1144,7 +1396,7 @@ func TestChunkManagerGetOrCreateUpload(t *testing.T) {
 func TestChunkUploadWriteAndRead(t *testing.T) {
 	cm := NewChunkManager()
 
-	upload, err := cm.GetOrCreateUpload("token1", "test.bin", "/", 10)
+	upload, _, err := cm.GetOrCreateUpload("token1", "test.bin", "/", 10)
 	if err != nil {
 		t.Fatalf("GetOrCreateUpload failed: %v", err)
 	}
@@ -1183,7 +1435,7 @@ func TestChunkUploadWriteAndRead(t *testing.T) {
 func TestChunkUploadIsComplete_Incomplete(t *testing.T) {
 	cm := NewChunkManager()
 
-	upload, err := cm.GetOrCreateUpload("token1", "test.bin", "/", 100)
+	upload, _, err := cm.GetOrCreateUpload("token1", "test.bin", "/", 100)
 	if err != nil {
 		t.Fatalf("GetOrCreateUpload failed: %v", err)
 	}
@@ -1205,7 +1457,7 @@ func TestChunkUploadIsComplete_Incomplete(t *testing.T) {
 func TestChunkUploadIsComplete_OutOfOrderLastChunk(t *testing.T) {
 	cm := NewChunkManager()
 
-	upload, err := cm.GetOrCreateUpload("token1", "test.bin", "/", 12)
+	upload, _, err := cm.GetOrCreateUpload("token1", "test.bin", "/", 12)
 	if err != nil {
 		t.Fatalf("GetOrCreateUpload failed: %v", err)
 	}
@@ -1253,7 +1505,7 @@ func TestChunkUploadIsComplete_OutOfOrderLastChunk(t *testing.T) {
 func TestChunkUploadWriteDuringFinalizationIsIdempotentOnly(t *testing.T) {
 	cm := NewChunkManager()
 
-	upload, err := cm.GetOrCreateUpload("token1", "test.bin", "/", 10)
+	upload, _, err := cm.GetOrCreateUpload("token1", "test.bin", "/", 10)
 	if err != nil {
 		t.Fatalf("GetOrCreateUpload failed: %v", err)
 	}
@@ -1303,7 +1555,7 @@ func TestChunkUploadWriteDuringFinalizationIsIdempotentOnly(t *testing.T) {
 func TestChunkUploadAccountBlockOnceSurvivesFinalizeRetry(t *testing.T) {
 	cm := NewChunkManager()
 
-	upload, err := cm.GetOrCreateUpload("token1", "test.bin", "/", 10)
+	upload, _, err := cm.GetOrCreateUpload("token1", "test.bin", "/", 10)
 	if err != nil {
 		t.Fatalf("GetOrCreateUpload failed: %v", err)
 	}
