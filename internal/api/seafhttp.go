@@ -992,11 +992,12 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 		if contentLength < 0 {
 			contentLength = 0
 		}
-		if st, _ := checker.CheckStorageQuota(token.OrgID, contentLength); !st.Allowed {
+		precheck, _ := traffic.CheckUploadQuotaWithChecker(checker, token.OrgID, token.UserID, contentLength)
+		if !precheck.StorageStatus.Allowed {
 			c.JSON(http.StatusForbidden, gin.H{"error": "storage quota exceeded"})
 			return
 		}
-		uploadTrafficStatus, _ = traffic.CheckTrafficQuotaWithChecker(checker, token.OrgID, token.UserID, "upload", contentLength)
+		uploadTrafficStatus = precheck.TrafficStatus
 		if !uploadTrafficStatus.Allowed {
 			c.JSON(http.StatusForbidden, traffic.TrafficQuotaExceededResponse(uploadTrafficStatus, "traffic quota exceeded", true))
 			return

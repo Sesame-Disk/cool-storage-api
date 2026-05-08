@@ -2706,11 +2706,12 @@ func (h *FileHandler) UploadFile(c *gin.Context) {
 		if contentLength < 0 {
 			contentLength = 0
 		}
-		if st, _ := checker.CheckStorageQuota(orgID, contentLength); !st.Allowed {
+		precheck, _ := traffic.CheckUploadQuotaWithChecker(checker, orgID, userID, contentLength)
+		if !precheck.StorageStatus.Allowed {
 			c.JSON(http.StatusForbidden, gin.H{"error": "storage quota exceeded"})
 			return
 		}
-		uploadTrafficStatus, _ = traffic.CheckTrafficQuotaWithChecker(checker, orgID, userID, "upload", contentLength)
+		uploadTrafficStatus = precheck.TrafficStatus
 		if !uploadTrafficStatus.Allowed {
 			c.JSON(http.StatusForbidden, traffic.TrafficQuotaExceededResponse(uploadTrafficStatus, "traffic quota exceeded", true))
 			return

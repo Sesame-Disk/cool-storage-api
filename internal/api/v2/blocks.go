@@ -169,13 +169,17 @@ func (h *BlockHandler) UploadBlock(c *gin.Context) {
 
 	uploadTrafficStatus := traffic.QuotaStatus{Allowed: true}
 	if checker := traffic.GetChecker(); checker != nil {
-		uploadTrafficStatus, _ = traffic.CheckTrafficQuotaWithChecker(
+		precheck, _ := traffic.CheckUploadQuotaWithChecker(
 			checker,
 			c.GetString("org_id"),
 			c.GetString("user_id"),
-			"upload",
 			c.Request.ContentLength,
 		)
+		if !precheck.StorageStatus.Allowed {
+			c.JSON(http.StatusForbidden, gin.H{"error": "storage quota exceeded"})
+			return
+		}
+		uploadTrafficStatus = precheck.TrafficStatus
 		if !uploadTrafficStatus.Allowed {
 			c.JSON(http.StatusForbidden, traffic.TrafficQuotaExceededResponse(uploadTrafficStatus, "traffic quota exceeded", true))
 			return

@@ -873,11 +873,12 @@ func (h *SyncHandler) PutBlock(c *gin.Context) {
 	if checker := traffic.GetChecker(); checker != nil {
 		contentLen := c.Request.ContentLength
 		if contentLen > 0 {
-			if qs, _ := checker.CheckStorageQuota(orgID, contentLen); !qs.Allowed {
+			precheck, _ := traffic.CheckUploadQuotaWithChecker(checker, orgID, userID, contentLen)
+			if !precheck.StorageStatus.Allowed {
 				c.JSON(http.StatusForbidden, gin.H{"error": "storage quota exceeded"})
 				return
 			}
-			uploadTrafficStatus, _ = traffic.CheckTrafficQuotaWithChecker(checker, orgID, userID, "upload", contentLen)
+			uploadTrafficStatus = precheck.TrafficStatus
 			if !uploadTrafficStatus.Allowed {
 				c.JSON(http.StatusForbidden, gin.H{"error": "upload traffic quota exceeded"})
 				return

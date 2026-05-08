@@ -308,18 +308,25 @@ func mustParseUUID(s string) gocql.UUID {
 
 var globalChecker struct {
 	mu sync.RWMutex
-	c  *Checker
+	c  QuotaChecker
 }
 
-// SetChecker installs the global Checker. Called once from server.go.
-func SetChecker(c *Checker) {
+// QuotaChecker is the shared quota-checking surface exposed globally.
+type QuotaChecker interface {
+	CheckStorageQuota(orgID string, additionalBytes int64) (QuotaStatus, error)
+	CheckTrafficQuota(orgID, userID, direction string, additionalBytes int64) (QuotaStatus, error)
+	CheckMaxUsers(orgID string) (QuotaStatus, error)
+}
+
+// SetChecker installs the global quota checker. Called once from server.go.
+func SetChecker(c QuotaChecker) {
 	globalChecker.mu.Lock()
 	globalChecker.c = c
 	globalChecker.mu.Unlock()
 }
 
-// GetChecker returns the global Checker, or nil if not initialized.
-func GetChecker() *Checker {
+// GetChecker returns the global quota checker, or nil if not initialized.
+func GetChecker() QuotaChecker {
 	globalChecker.mu.RLock()
 	defer globalChecker.mu.RUnlock()
 	return globalChecker.c

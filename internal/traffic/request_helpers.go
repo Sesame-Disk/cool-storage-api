@@ -2,9 +2,56 @@ package traffic
 
 import "time"
 
+// StorageQuotaPrechecker is the subset of Checker used by upload handlers.
+type StorageQuotaPrechecker interface {
+	CheckStorageQuota(orgID string, additionalBytes int64) (QuotaStatus, error)
+}
+
 // TrafficQuotaPrechecker is the subset of Checker used by request handlers.
 type TrafficQuotaPrechecker interface {
 	CheckTrafficQuota(orgID, userID, direction string, additionalBytes int64) (QuotaStatus, error)
+}
+
+// UploadQuotaPrechecker is the subset of Checker required for upload preflight.
+type UploadQuotaPrechecker interface {
+	StorageQuotaPrechecker
+	TrafficQuotaPrechecker
+}
+
+// UploadQuotaCheckResult keeps the storage and traffic outcomes separate so
+// handlers can preserve existing response semantics while sharing the preflight.
+type UploadQuotaCheckResult struct {
+	StorageStatus QuotaStatus
+	TrafficStatus QuotaStatus
+}
+
+// CheckUploadQuotaWithChecker evaluates storage quota first and traffic quota
+// second. A storage rejection short-circuits traffic evaluation because the
+// handler will fail before reading any bytes.
+func CheckUploadQuotaWithChecker(checker UploadQuotaPrechecker, orgID, userID string, additionalBytes int64) (UploadQuotaCheckResult, error) {
+	result := UploadQuotaCheckResult{
+		StorageStatus: QuotaStatus{Allowed: true},
+		TrafficStatus: QuotaStatus{Allowed: true},
+	}
+	if checker == nil {
+		return result, nil
+	}
+
+	storageStatus, err := checker.CheckStorageQuota(orgID, additionalBytes)
+	if err != nil {
+		return result, err
+	}
+	result.StorageStatus = storageStatus
+	if !storageStatus.Allowed {
+		return result, nil
+	}
+
+	trafficStatus, err := checker.CheckTrafficQuota(orgID, userID, "upload", additionalBytes)
+	if err != nil {
+		return result, err
+	}
+	result.TrafficStatus = trafficStatus
+	return result, nil
 }
 
 // TrafficPeriodRecorder is the subset of Recorder used after quota pre-checks.

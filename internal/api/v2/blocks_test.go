@@ -8,9 +8,28 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Sesame-Disk/sesamefs/internal/config"
 	"github.com/Sesame-Disk/sesamefs/internal/storage"
+	"github.com/Sesame-Disk/sesamefs/internal/traffic"
 	"github.com/gin-gonic/gin"
 )
+
+type fakeGlobalQuotaChecker struct {
+	storageStatus traffic.QuotaStatus
+	trafficStatus traffic.QuotaStatus
+}
+
+func (f *fakeGlobalQuotaChecker) CheckStorageQuota(orgID string, additionalBytes int64) (traffic.QuotaStatus, error) {
+	return f.storageStatus, nil
+}
+
+func (f *fakeGlobalQuotaChecker) CheckTrafficQuota(orgID, userID, direction string, additionalBytes int64) (traffic.QuotaStatus, error) {
+	return f.trafficStatus, nil
+}
+
+func (f *fakeGlobalQuotaChecker) CheckMaxUsers(orgID string) (traffic.QuotaStatus, error) {
+	return traffic.QuotaStatus{Allowed: true}, nil
+}
 
 func init() {
 	gin.SetMode(gin.TestMode)
@@ -243,6 +262,47 @@ func TestUploadBlock_NoContentLength(t *testing.T) {
 
 	if w.Code != http.StatusBadRequest {
 		t.Errorf("status = %d, want %d", w.Code, http.StatusBadRequest)
+	}
+}
+
+func TestUploadBlock_StorageQuotaExceeded(t *testing.T) {
+	oldChecker := traffic.GetChecker()
+	traffic.SetChecker(&fakeGlobalQuotaChecker{
+		storageStatus: traffic.QuotaStatus{Allowed: false, Reason: "storage"},
+		trafficStatus: traffic.QuotaStatus{Allowed: true},
+	})
+	defer traffic.SetChecker(oldChecker)
+
+	r := gin.New()
+	r.Use(gin.Recovery())
+
+	h := &BlockHandler{
+		blockStore: nil,
+		config: &config.Config{
+			Chunking: config.ChunkingConfig{
+				Adaptive: config.AdaptiveConfig{AbsoluteMax: 1024},
+			},
+		},
+	}
+	r.POST("/api/v2/blocks/upload", func(c *gin.Context) {
+		c.Set("org_id", "org-1")
+		c.Set("user_id", "user-1")
+		h.UploadBlock(c)
+	})
+
+	req, _ := http.NewRequest("POST", "/api/v2/blocks/upload", bytes.NewBufferString("hello"))
+	req.ContentLength = int64(len("hello"))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusForbidden)
+	}
+
+	var resp map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp["error"] != "storage quota exceeded" {
+		t.Fatalf("error = %v, want storage quota exceeded", resp["error"])
 	}
 }
 

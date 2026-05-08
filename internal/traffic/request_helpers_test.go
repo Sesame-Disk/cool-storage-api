@@ -25,6 +25,27 @@ func (f *fakeTrafficChecker) CheckTrafficQuota(orgID, userID, direction string, 
 	return f.status, f.err
 }
 
+type fakeUploadChecker struct {
+	storageStatus QuotaStatus
+	storageErr    error
+	storageCalled bool
+	storageOrgID  string
+	storageBytes  int64
+
+	trafficChecker fakeTrafficChecker
+}
+
+func (f *fakeUploadChecker) CheckStorageQuota(orgID string, additionalBytes int64) (QuotaStatus, error) {
+	f.storageCalled = true
+	f.storageOrgID = orgID
+	f.storageBytes = additionalBytes
+	return f.storageStatus, f.storageErr
+}
+
+func (f *fakeUploadChecker) CheckTrafficQuota(orgID, userID, direction string, additionalBytes int64) (QuotaStatus, error) {
+	return f.trafficChecker.CheckTrafficQuota(orgID, userID, direction, additionalBytes)
+}
+
 type fakeTrafficRecorder struct {
 	called          bool
 	orgID           string
@@ -85,6 +106,75 @@ func TestCheckTrafficQuotaWithChecker_PropagatesError(t *testing.T) {
 	fake := &fakeTrafficChecker{err: wantErr}
 
 	_, err := CheckTrafficQuotaWithChecker(fake, "org-1", "user-1", "upload", 789)
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("error = %v, want %v", err, wantErr)
+	}
+}
+
+func TestCheckUploadQuotaWithChecker_AllowsWhenCheckerMissing(t *testing.T) {
+	result, err := CheckUploadQuotaWithChecker(nil, "org-1", "user-1", 123)
+	if err != nil {
+		t.Fatalf("CheckUploadQuotaWithChecker(nil) error = %v", err)
+	}
+	if !result.StorageStatus.Allowed {
+		t.Fatal("expected storage precheck to allow when checker is missing")
+	}
+	if !result.TrafficStatus.Allowed {
+		t.Fatal("expected traffic precheck to allow when checker is missing")
+	}
+}
+
+func TestCheckUploadQuotaWithChecker_DelegatesStorageThenTraffic(t *testing.T) {
+	fake := &fakeUploadChecker{
+		storageStatus: QuotaStatus{Allowed: true},
+		trafficChecker: fakeTrafficChecker{
+			status: QuotaStatus{Allowed: true, Warning: true, Reason: "traffic-upload"},
+		},
+	}
+
+	result, err := CheckUploadQuotaWithChecker(fake, "org-1", "user-1", 456)
+	if err != nil {
+		t.Fatalf("CheckUploadQuotaWithChecker(fake) error = %v", err)
+	}
+	if !fake.storageCalled {
+		t.Fatal("expected storage checker to be called")
+	}
+	if fake.storageOrgID != "org-1" || fake.storageBytes != 456 {
+		t.Fatalf("storage checker called with unexpected args: %+v", fake)
+	}
+	if !fake.trafficChecker.called {
+		t.Fatal("expected traffic checker to be called")
+	}
+	if fake.trafficChecker.direction != "upload" {
+		t.Fatalf("traffic checker direction = %q, want upload", fake.trafficChecker.direction)
+	}
+	if !result.TrafficStatus.Warning || result.TrafficStatus.Reason != "traffic-upload" {
+		t.Fatalf("unexpected traffic status: %+v", result.TrafficStatus)
+	}
+}
+
+func TestCheckUploadQuotaWithChecker_ShortCircuitsOnStorageBlock(t *testing.T) {
+	fake := &fakeUploadChecker{
+		storageStatus: QuotaStatus{Allowed: false, Reason: "storage"},
+	}
+
+	result, err := CheckUploadQuotaWithChecker(fake, "org-1", "user-1", 789)
+	if err != nil {
+		t.Fatalf("CheckUploadQuotaWithChecker(storage block) error = %v", err)
+	}
+	if result.StorageStatus.Allowed {
+		t.Fatal("expected storage precheck to reject upload")
+	}
+	if fake.trafficChecker.called {
+		t.Fatal("traffic checker should not run after a storage rejection")
+	}
+}
+
+func TestCheckUploadQuotaWithChecker_PropagatesStorageError(t *testing.T) {
+	wantErr := errors.New("storage boom")
+	fake := &fakeUploadChecker{storageErr: wantErr}
+
+	_, err := CheckUploadQuotaWithChecker(fake, "org-1", "user-1", 321)
 	if !errors.Is(err, wantErr) {
 		t.Fatalf("error = %v, want %v", err, wantErr)
 	}
