@@ -3,12 +3,14 @@ package api
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"path"
 	"strings"
 	"time"
 
 	"github.com/Sesame-Disk/sesamefs/internal/db"
+	gocql "github.com/apache/cassandra-gocql-driver/v2"
 )
 
 type UploadSessionState string
@@ -94,6 +96,9 @@ type UploadBlockPromotionAttempt struct {
 type UploadStagingStore interface {
 	UpsertSession(record UploadSessionRecord) error
 	UpsertBlock(record UploadSessionBlockRecord) error
+	GetSession(orgID, uploadID string) (*UploadSessionRecord, error)
+	ListSessionsByState(orgID string, state UploadSessionState, limit int) ([]UploadSessionRecord, error)
+	ListBlockPromotions(orgID, uploadID string) ([]UploadBlockPromotionRecord, error)
 	TryStartBlockPromotion(record UploadBlockPromotionRecord) (UploadBlockPromotionAttempt, error)
 	MarkBlockPromotionApplied(orgID, uploadID string, blockIndex int, appliedAt time.Time) error
 	DeleteBlockPromotion(orgID, uploadID string, blockIndex int) error
@@ -139,7 +144,7 @@ func (s *CassandraUploadStagingStore) UpsertSession(record UploadSessionRecord) 
 	if s == nil || s.db == nil {
 		return nil
 	}
-	return s.db.Session().Query(`
+	if err := s.db.Session().Query(`
 		INSERT INTO upload_sessions (
 			org_id, upload_id, repo_id, user_id, token_id, parent_dir, filename,
 			actual_filename, commit_id, total_size, state, created_at, updated_at,
@@ -148,7 +153,14 @@ func (s *CassandraUploadStagingStore) UpsertSession(record UploadSessionRecord) 
 	`, record.OrgID, record.UploadID, record.RepoID, record.UserID, record.TokenID,
 		record.ParentDir, record.Filename, record.ActualFilename, record.CommitID,
 		record.TotalSize, string(record.State), record.CreatedAt, record.UpdatedAt,
-		record.ExpiresAt, record.LastError).Exec()
+		record.ExpiresAt, record.LastError).Exec(); err != nil {
+		return err
+	}
+	return s.db.Session().Query(`
+		INSERT INTO upload_sessions_by_state (
+			state, org_id, updated_at, upload_id, repo_id, commit_id, expires_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?)
+	`, string(record.State), record.OrgID, record.UpdatedAt, record.UploadID, record.RepoID, record.CommitID, record.ExpiresAt).Exec()
 }
 
 func (s *CassandraUploadStagingStore) UpsertBlock(record UploadSessionBlockRecord) error {
@@ -179,6 +191,133 @@ func (s *CassandraUploadStagingStore) UpsertBlock(record UploadSessionBlockRecor
 		) VALUES (?, ?, ?, ?, ?, ?)
 	`, record.OrgID, record.BlockSHA256, record.UploadID, record.BlockIndex,
 		string(record.State), record.UpdatedAt).Exec()
+}
+
+func (s *CassandraUploadStagingStore) GetSession(orgID, uploadID string) (*UploadSessionRecord, error) {
+	if strings.TrimSpace(orgID) == "" {
+		return nil, fmt.Errorf("org id is required")
+	}
+	if strings.TrimSpace(uploadID) == "" {
+		return nil, fmt.Errorf("upload id is required")
+	}
+	if s == nil || s.db == nil {
+		return nil, nil
+	}
+
+	var record UploadSessionRecord
+	err := s.db.Session().Query(`
+		SELECT repo_id, user_id, token_id, parent_dir, filename, actual_filename,
+		       commit_id, total_size, state, created_at, updated_at, expires_at, last_error
+		FROM upload_sessions WHERE org_id = ? AND upload_id = ?
+	`, orgID, uploadID).Scan(
+		&record.RepoID,
+		&record.UserID,
+		&record.TokenID,
+		&record.ParentDir,
+		&record.Filename,
+		&record.ActualFilename,
+		&record.CommitID,
+		&record.TotalSize,
+		&record.State,
+		&record.CreatedAt,
+		&record.UpdatedAt,
+		&record.ExpiresAt,
+		&record.LastError,
+	)
+	if err != nil {
+		if errors.Is(err, gocql.ErrNotFound) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	record.OrgID = orgID
+	record.UploadID = uploadID
+	return &record, nil
+}
+
+func (s *CassandraUploadStagingStore) ListSessionsByState(orgID string, state UploadSessionState, limit int) ([]UploadSessionRecord, error) {
+	if strings.TrimSpace(orgID) == "" {
+		return nil, fmt.Errorf("org id is required")
+	}
+	if strings.TrimSpace(string(state)) == "" {
+		return nil, fmt.Errorf("state is required")
+	}
+	if limit <= 0 {
+		limit = 16
+	}
+	if s == nil || s.db == nil {
+		return nil, nil
+	}
+
+	iter := s.db.Session().Query(`
+		SELECT updated_at, upload_id, repo_id, commit_id, expires_at
+		FROM upload_sessions_by_state WHERE state = ? AND org_id = ? LIMIT ?
+	`, string(state), orgID, limit).Iter()
+
+	var records []UploadSessionRecord
+	var (
+		updatedAt time.Time
+		uploadID  string
+		repoID    string
+		commitID  string
+		expiresAt time.Time
+	)
+	for iter.Scan(&updatedAt, &uploadID, &repoID, &commitID, &expiresAt) {
+		records = append(records, UploadSessionRecord{
+			OrgID:     orgID,
+			UploadID:  uploadID,
+			RepoID:    repoID,
+			CommitID:  commitID,
+			State:     state,
+			UpdatedAt: updatedAt,
+			ExpiresAt: expiresAt,
+		})
+	}
+	if err := iter.Close(); err != nil {
+		return nil, err
+	}
+	return records, nil
+}
+
+func (s *CassandraUploadStagingStore) ListBlockPromotions(orgID, uploadID string) ([]UploadBlockPromotionRecord, error) {
+	if strings.TrimSpace(orgID) == "" {
+		return nil, fmt.Errorf("org id is required")
+	}
+	if strings.TrimSpace(uploadID) == "" {
+		return nil, fmt.Errorf("upload id is required")
+	}
+	if s == nil || s.db == nil {
+		return nil, nil
+	}
+
+	iter := s.db.Session().Query(`
+		SELECT block_index, block_sha256, commit_id, claimed_at, applied_at
+		FROM upload_block_promotions WHERE org_id = ? AND upload_id = ?
+	`, orgID, uploadID).Iter()
+
+	var records []UploadBlockPromotionRecord
+	var (
+		blockIndex  int
+		blockSHA256 string
+		commitID    string
+		claimedAt   time.Time
+		appliedAt   *time.Time
+	)
+	for iter.Scan(&blockIndex, &blockSHA256, &commitID, &claimedAt, &appliedAt) {
+		records = append(records, UploadBlockPromotionRecord{
+			OrgID:       orgID,
+			UploadID:    uploadID,
+			BlockIndex:  blockIndex,
+			BlockSHA256: blockSHA256,
+			CommitID:    commitID,
+			ClaimedAt:   claimedAt,
+			AppliedAt:   appliedAt,
+		})
+	}
+	if err := iter.Close(); err != nil {
+		return nil, err
+	}
+	return records, nil
 }
 
 func (s *CassandraUploadStagingStore) TryStartBlockPromotion(record UploadBlockPromotionRecord) (UploadBlockPromotionAttempt, error) {

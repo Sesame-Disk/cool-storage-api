@@ -783,6 +783,7 @@ type finalizeUploadResult struct {
 	FileID         string
 	ActualFilename string
 	CommitID       string
+	Recovered      bool
 }
 
 type preparedUploadCommit struct {
@@ -810,9 +811,10 @@ type uploadBlockRollbackFunc func(orgID, operationKey string, blockIDs []string)
 type uploadCommitPublisherFunc func(orgID, repoID, commitID string) error
 
 const (
-	defaultZipMaxEntries = 100000
-	defaultZipMaxDepth   = 64
-	defaultZipMaxBytes   = 10 * 1024 * 1024 * 1024 // 10 GiB of uncompressed file content
+	defaultZipMaxEntries     = 100000
+	defaultZipMaxDepth       = 64
+	defaultZipMaxBytes       = 10 * 1024 * 1024 * 1024 // 10 GiB of uncompressed file content
+	uploadRecoveryBatchLimit = 8
 )
 
 type zipLimitError struct {
@@ -1002,6 +1004,168 @@ func (h *SeafHTTPHandler) persistPromotedUploadBlock(uploadID, orgID string, blo
 		UploadedAt:   block.UploadedAt,
 		PromotedAt:   &promotedAtUTC,
 	}, string(UploadBlockStatePromoted))
+}
+
+func (h *SeafHTTPHandler) closeRecoveredUploadSession(session *UploadSessionRecord) error {
+	if h == nil || h.uploadStaging == nil || session == nil {
+		return nil
+	}
+	now := time.Now().UTC()
+	return h.uploadStaging.UpsertSession(UploadSessionRecord{
+		UploadID:       session.UploadID,
+		OrgID:          session.OrgID,
+		RepoID:         session.RepoID,
+		UserID:         session.UserID,
+		TokenID:        session.TokenID,
+		ParentDir:      session.ParentDir,
+		Filename:       session.Filename,
+		ActualFilename: session.ActualFilename,
+		CommitID:       session.CommitID,
+		TotalSize:      session.TotalSize,
+		State:          UploadSessionStateClosed,
+		CreatedAt:      session.CreatedAt,
+		UpdatedAt:      now,
+		ExpiresAt:      now.Add(chunkDiskTTL),
+	})
+}
+
+func (h *SeafHTTPHandler) markUploadSessionCleanupPending(session *UploadSessionRecord, errMsg string) error {
+	if h == nil || h.uploadStaging == nil || session == nil {
+		return nil
+	}
+	now := time.Now().UTC()
+	return h.uploadStaging.UpsertSession(UploadSessionRecord{
+		UploadID:       session.UploadID,
+		OrgID:          session.OrgID,
+		RepoID:         session.RepoID,
+		UserID:         session.UserID,
+		TokenID:        session.TokenID,
+		ParentDir:      session.ParentDir,
+		Filename:       session.Filename,
+		ActualFilename: session.ActualFilename,
+		CommitID:       session.CommitID,
+		TotalSize:      session.TotalSize,
+		State:          UploadSessionStateCleanupPending,
+		CreatedAt:      session.CreatedAt,
+		UpdatedAt:      now,
+		ExpiresAt:      now.Add(chunkDiskTTL),
+		LastError:      errMsg,
+	})
+}
+
+func (h *SeafHTTPHandler) recoverPromotingUploadSession(session *UploadSessionRecord) error {
+	if h == nil || h.uploadStaging == nil || session == nil {
+		return nil
+	}
+	current, err := h.uploadStaging.GetSession(session.OrgID, session.UploadID)
+	if err != nil {
+		return fmt.Errorf("reload upload session: %w", err)
+	}
+	if current == nil || current.State != UploadSessionStatePromoting || strings.TrimSpace(current.CommitID) == "" {
+		return nil
+	}
+	promotions, err := h.uploadStaging.ListBlockPromotions(current.OrgID, current.UploadID)
+	if err != nil {
+		return fmt.Errorf("list upload block promotions: %w", err)
+	}
+	if len(promotions) == 0 {
+		return nil
+	}
+	now := time.Now().UTC()
+	for _, promotion := range promotions {
+		if promotion.CommitID != current.CommitID {
+			return nil
+		}
+		if promotion.AppliedAt == nil {
+			if !current.ExpiresAt.IsZero() && now.After(current.ExpiresAt) {
+				return h.markUploadSessionCleanupPending(current, fmt.Sprintf("upload promotion marker still pending for block %d after expiry", promotion.BlockIndex))
+			}
+			return nil
+		}
+	}
+	if h.commitPublisher == nil {
+		return fmt.Errorf("commit publisher is not configured")
+	}
+	if err := h.commitPublisher(current.OrgID, current.RepoID, current.CommitID); err != nil {
+		return fmt.Errorf("publish recovered upload commit: %w", err)
+	}
+	return h.closeRecoveredUploadSession(current)
+}
+
+func (h *SeafHTTPHandler) recoverPromotingUploadsForOrg(orgID string, limit int) {
+	if h == nil || h.uploadStaging == nil || strings.TrimSpace(orgID) == "" {
+		return
+	}
+	sessions, err := h.uploadStaging.ListSessionsByState(orgID, UploadSessionStatePromoting, limit)
+	if err != nil {
+		log.Printf("[HandleUpload] WARNING: Failed to list promoting uploads for recovery org=%s: %v", orgID, err)
+		return
+	}
+	seen := make(map[string]struct{}, len(sessions))
+	for _, session := range sessions {
+		if _, ok := seen[session.UploadID]; ok {
+			continue
+		}
+		seen[session.UploadID] = struct{}{}
+		if err := h.recoverPromotingUploadSession(&session); err != nil {
+			log.Printf("[HandleUpload] WARNING: Failed to recover promoting upload org=%s upload=%s: %v", orgID, shortLogID(session.UploadID), err)
+		}
+	}
+}
+
+func (h *SeafHTTPHandler) recoverPreparedUploadIfPossible(orgID, repoID, uploadID string, blocks []uploadBlockPromotion) (preparedUploadCommit, bool, error) {
+	if h == nil || h.uploadStaging == nil || len(blocks) == 0 {
+		return preparedUploadCommit{}, false, nil
+	}
+	session, err := h.uploadStaging.GetSession(orgID, uploadID)
+	if err != nil {
+		return preparedUploadCommit{}, false, fmt.Errorf("read upload session: %w", err)
+	}
+	if session == nil || strings.TrimSpace(session.CommitID) == "" {
+		return preparedUploadCommit{}, false, nil
+	}
+	if session.State != UploadSessionStatePromoting && session.State != UploadSessionStateClosed {
+		return preparedUploadCommit{}, false, nil
+	}
+	promotions, err := h.uploadStaging.ListBlockPromotions(orgID, uploadID)
+	if err != nil {
+		return preparedUploadCommit{}, false, fmt.Errorf("list upload block promotions: %w", err)
+	}
+	if len(promotions) != len(blocks) {
+		return preparedUploadCommit{}, false, nil
+	}
+	promotionsByIndex := make(map[int]UploadBlockPromotionRecord, len(promotions))
+	for _, promotion := range promotions {
+		promotionsByIndex[promotion.BlockIndex] = promotion
+	}
+	for _, block := range blocks {
+		promotion, ok := promotionsByIndex[block.BlockIndex]
+		if !ok {
+			return preparedUploadCommit{}, false, nil
+		}
+		if promotion.CommitID != session.CommitID || promotion.BlockSHA256 != block.BlockSHA256 {
+			return preparedUploadCommit{}, false, nil
+		}
+		if promotion.AppliedAt == nil {
+			return preparedUploadCommit{}, false, fmt.Errorf("upload recovery pending for block %d", block.BlockIndex)
+		}
+	}
+	if session.State == UploadSessionStatePromoting {
+		if h.commitPublisher == nil {
+			return preparedUploadCommit{}, false, fmt.Errorf("commit publisher is not configured")
+		}
+		if err := h.commitPublisher(orgID, repoID, session.CommitID); err != nil {
+			return preparedUploadCommit{}, false, fmt.Errorf("publish recovered upload commit: %w", err)
+		}
+		if err := h.closeRecoveredUploadSession(session); err != nil {
+			return preparedUploadCommit{}, false, fmt.Errorf("close recovered upload session: %w", err)
+		}
+	}
+	actualFilename := session.ActualFilename
+	if strings.TrimSpace(actualFilename) == "" {
+		actualFilename = session.Filename
+	}
+	return preparedUploadCommit{CommitID: session.CommitID, ActualFilename: actualFilename}, true, nil
 }
 
 func (h *SeafHTTPHandler) publishPreparedUpload(orgID, repoID, uploadID string, prepared preparedUploadCommit, blocks []uploadBlockPromotion) error {
@@ -1239,6 +1403,11 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 		return
 	}
 
+	// Best-effort recovery for older promoting uploads in the same org. This is
+	// conservative: it only republishes HEAD when every block promotion marker is
+	// already applied, and otherwise leaves active sessions alone.
+	h.recoverPromotingUploadsForOrg(token.OrgID, uploadRecoveryBatchLimit)
+
 	// Quota pre-check — evaluated before reading the body so we can fail fast.
 	// ContentLength is an upper bound (includes multipart overhead); acceptable for quota checks.
 	uploadTrafficStatus := traffic.QuotaStatus{Allowed: true}
@@ -1434,16 +1603,18 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 
 		log.Printf("[HandleUpload] Upload complete: file=%s, size=%d, id=%s", result.ActualFilename, total, shortLogID(result.FileID))
 
-		// Record traffic and storage — fire-and-forget, never blocks the response.
-		if rec := traffic.Get(); rec != nil {
-			tt := traffic.WebUpload
-			if token.Source == "link" {
-				tt = traffic.LinkUpload
+		// Record traffic and storage only for fresh uploads, not for publish recovery.
+		if !result.Recovered {
+			if rec := traffic.Get(); rec != nil {
+				tt := traffic.WebUpload
+				if token.Source == "link" {
+					tt = traffic.LinkUpload
+				}
+				traffic.RecordCheckedTransfer(rec, uploadTrafficStatus, token.OrgID, token.UserID, tt, total)
 			}
-			traffic.RecordCheckedTransfer(rec, uploadTrafficStatus, token.OrgID, token.UserID, tt, total)
-		}
-		if h.db != nil {
-			traffic.IncrementStorageCounters(h.db, token.OrgID, token.UserID, token.RepoID, total, 1)
+			if h.db != nil {
+				traffic.IncrementStorageCounters(h.db, token.OrgID, token.UserID, token.RepoID, total, 1)
+			}
 		}
 
 		if retJSON {
@@ -1620,6 +1791,24 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 		INSERT INTO block_id_mappings_by_internal (org_id, internal_id, external_id, created_at) VALUES (?, ?, ?, toTimestamp(now()))
 	`, token.OrgID, sha256ID, fileID).Exec(); err != nil {
 		log.Printf("[HandleUpload] WARNING: Failed to write reverse block_id_mapping org=%s int=%s ext=%s: %v", token.OrgID, sha256ID[:16], fileID[:16], err)
+	}
+	if recovered, ok, err := h.recoverPreparedUploadIfPossible(token.OrgID, token.RepoID, uploadID, []uploadBlockPromotion{{
+		BlockIndex:  0,
+		BlockSHA1:   fileID,
+		BlockSHA256: sha256ID,
+	}}); err != nil {
+		log.Printf("[HandleUpload] Failed to recover prepared upload: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to recover upload state"})
+		return
+	} else if ok {
+		actualFilename := recovered.ActualFilename
+		log.Printf("[HandleUpload] Recovered prepared upload: file=%s, commit=%s, id=%s", actualFilename, recovered.CommitID, shortLogID(fileID))
+		if retJSON {
+			c.JSON(http.StatusOK, []gin.H{{"name": actualFilename, "id": fileID, "size": strconv.FormatInt(finalSize, 10)}})
+		} else {
+			c.String(http.StatusOK, fileID)
+		}
+		return
 	}
 
 	// Prepare filesystem metadata without publishing the new head yet.
@@ -1907,6 +2096,12 @@ readLoop:
 	fileID := hex.EncodeToString(sha1Hasher.Sum(nil))
 
 	log.Printf("[finalizeUploadStreaming] Stored %d blocks for file %s (size=%d, parallelism=%d)", len(blockSHA1IDs), fileID[:16], totalSize, finalizeUploadConcurrency)
+	if recovered, ok, err := h.recoverPreparedUploadIfPossible(token.OrgID, token.RepoID, uploadID, pendingPromotions); err != nil {
+		return finalizeUploadResult{}, fmt.Errorf("failed to recover prepared upload: %w", err)
+	} else if ok {
+		log.Printf("[finalizeUploadStreaming] Recovered prepared upload commit=%s for file %s", recovered.CommitID, shortLogID(fileID))
+		return finalizeUploadResult{FileID: fileID, ActualFilename: recovered.ActualFilename, CommitID: recovered.CommitID, Recovered: true}, nil
+	}
 
 	// Prepare filesystem metadata with multiple block IDs without publishing head yet.
 	commitID, actualFilename, err := h.prepareUploadedFileCommitMultiBlock(token.OrgID, token.RepoID, token.UserID, parentDir, filename, fileID, blockSHA1IDs, totalSize, replace)

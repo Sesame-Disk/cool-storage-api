@@ -159,9 +159,11 @@ func TestUploadStagingMigrationContainsSessionTables(t *testing.T) {
 	content := string(raw)
 
 	assert.Contains(t, content, "CREATE TABLE IF NOT EXISTS upload_sessions")
+	assert.Contains(t, content, "CREATE TABLE IF NOT EXISTS upload_sessions_by_state")
 	assert.Contains(t, content, "CREATE TABLE IF NOT EXISTS upload_session_blocks")
 	assert.Contains(t, content, "CREATE TABLE IF NOT EXISTS upload_session_blocks_by_sha256")
 	assert.Contains(t, content, "CREATE TABLE IF NOT EXISTS upload_block_promotions")
+	assert.Contains(t, content, "default_time_to_live = 86400")
 	assert.Contains(t, content, "state           TEXT")
 	assert.Contains(t, content, "block_sha256   TEXT")
 	assert.Contains(t, content, "cleanup_pending")

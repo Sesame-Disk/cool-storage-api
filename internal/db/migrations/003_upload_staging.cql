@@ -24,6 +24,18 @@ CREATE TABLE IF NOT EXISTS upload_sessions (
     PRIMARY KEY ((org_id), upload_id)
 );
 
+CREATE TABLE IF NOT EXISTS upload_sessions_by_state (
+    state           TEXT,
+    org_id          TEXT,
+    updated_at      TIMESTAMP,
+    upload_id       TEXT,
+    repo_id         TEXT,
+    commit_id       TEXT,
+    expires_at      TIMESTAMP,
+    PRIMARY KEY ((state, org_id), updated_at, upload_id)
+) WITH CLUSTERING ORDER BY (updated_at ASC, upload_id ASC)
+    AND default_time_to_live = 86400;
+
 CREATE TABLE IF NOT EXISTS upload_session_blocks (
     upload_id      TEXT,
     block_index    INT,

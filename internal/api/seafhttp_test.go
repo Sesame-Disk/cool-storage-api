@@ -60,6 +60,62 @@ func (f *fakeUploadStagingStore) UpsertBlock(record UploadSessionBlockRecord) er
 	return nil
 }
 
+func (f *fakeUploadStagingStore) GetSession(orgID, uploadID string) (*UploadSessionRecord, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.err != nil {
+		return nil, f.err
+	}
+	for idx := len(f.sessions) - 1; idx >= 0; idx-- {
+		record := f.sessions[idx]
+		if record.OrgID == orgID && record.UploadID == uploadID {
+			copyRecord := record
+			return &copyRecord, nil
+		}
+	}
+	return nil, nil
+}
+
+func (f *fakeUploadStagingStore) ListSessionsByState(orgID string, state UploadSessionState, limit int) ([]UploadSessionRecord, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.err != nil {
+		return nil, f.err
+	}
+	if limit <= 0 {
+		limit = len(f.sessions)
+	}
+	seen := make(map[string]struct{})
+	var records []UploadSessionRecord
+	for idx := len(f.sessions) - 1; idx >= 0 && len(records) < limit; idx-- {
+		record := f.sessions[idx]
+		if record.OrgID != orgID || record.State != state {
+			continue
+		}
+		if _, ok := seen[record.UploadID]; ok {
+			continue
+		}
+		seen[record.UploadID] = struct{}{}
+		records = append(records, record)
+	}
+	return records, nil
+}
+
+func (f *fakeUploadStagingStore) ListBlockPromotions(orgID, uploadID string) ([]UploadBlockPromotionRecord, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.err != nil {
+		return nil, f.err
+	}
+	var records []UploadBlockPromotionRecord
+	for _, record := range f.promotions {
+		if record.OrgID == orgID && record.UploadID == uploadID {
+			records = append(records, record)
+		}
+	}
+	return records, nil
+}
+
 func (f *fakeUploadStagingStore) TryStartBlockPromotion(record UploadBlockPromotionRecord) (UploadBlockPromotionAttempt, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -1414,6 +1470,273 @@ func TestPublishPreparedUploadPublishFailureDoesNotRollbackAlreadyAppliedBlocks(
 	}
 	if rollbackCalls != 0 {
 		t.Fatalf("rollback calls = %d, want 0", rollbackCalls)
+	}
+}
+
+func TestRecoverPreparedUploadIfPossiblePublishesPromotingSession(t *testing.T) {
+	handler := NewSeafHTTPHandler(nil, storage.NewManager(), nil, NewMockTokenStore(), nil, nil)
+	staging := &fakeUploadStagingStore{}
+	handler.SetUploadStagingStore(staging)
+	now := time.Now().UTC()
+	staging.sessions = append(staging.sessions, UploadSessionRecord{
+		UploadID:       "upload-1",
+		OrgID:          "org-1",
+		RepoID:         "repo-1",
+		UserID:         "user-1",
+		TokenID:        "token-1",
+		ParentDir:      "/",
+		Filename:       "file.txt",
+		ActualFilename: "file.txt",
+		CommitID:       "commit-1",
+		TotalSize:      10,
+		State:          UploadSessionStatePromoting,
+		CreatedAt:      now,
+		UpdatedAt:      now,
+		ExpiresAt:      now.Add(time.Hour),
+	})
+	appliedAt := now.Add(time.Minute)
+	staging.promotions = map[string]UploadBlockPromotionRecord{
+		fakeUploadPromotionKey("org-1", "upload-1", 0): {
+			OrgID:       "org-1",
+			UploadID:    "upload-1",
+			BlockIndex:  0,
+			BlockSHA256: "sha256-1",
+			CommitID:    "commit-1",
+			ClaimedAt:   now,
+			AppliedAt:   &appliedAt,
+		},
+	}
+
+	var publishCalls int
+	handler.commitPublisher = func(orgID, repoID, commitID string) error {
+		publishCalls++
+		return nil
+	}
+
+	recovered, ok, err := handler.recoverPreparedUploadIfPossible("org-1", "repo-1", "upload-1", []uploadBlockPromotion{{BlockIndex: 0, BlockSHA256: "sha256-1"}})
+	if err != nil {
+		t.Fatalf("recoverPreparedUploadIfPossible failed: %v", err)
+	}
+	if !ok {
+		t.Fatal("expected recovery to succeed")
+	}
+	if recovered.CommitID != "commit-1" || recovered.ActualFilename != "file.txt" {
+		t.Fatalf("recovered result = %+v, want commit-1/file.txt", recovered)
+	}
+	if publishCalls != 1 {
+		t.Fatalf("publish calls = %d, want 1", publishCalls)
+	}
+	latest := staging.sessions[len(staging.sessions)-1]
+	if latest.State != UploadSessionStateClosed {
+		t.Fatalf("latest session state = %q, want %q", latest.State, UploadSessionStateClosed)
+	}
+}
+
+func TestRecoverPreparedUploadIfPossibleReturnsClosedSessionWithoutRepublish(t *testing.T) {
+	handler := NewSeafHTTPHandler(nil, storage.NewManager(), nil, NewMockTokenStore(), nil, nil)
+	staging := &fakeUploadStagingStore{}
+	handler.SetUploadStagingStore(staging)
+	now := time.Now().UTC()
+	staging.sessions = append(staging.sessions, UploadSessionRecord{
+		UploadID:       "upload-1",
+		OrgID:          "org-1",
+		RepoID:         "repo-1",
+		Filename:       "file.txt",
+		ActualFilename: "renamed.txt",
+		CommitID:       "commit-1",
+		State:          UploadSessionStateClosed,
+		CreatedAt:      now,
+		UpdatedAt:      now,
+		ExpiresAt:      now.Add(time.Hour),
+	})
+	appliedAt := now.Add(time.Minute)
+	staging.promotions = map[string]UploadBlockPromotionRecord{
+		fakeUploadPromotionKey("org-1", "upload-1", 0): {
+			OrgID:       "org-1",
+			UploadID:    "upload-1",
+			BlockIndex:  0,
+			BlockSHA256: "sha256-1",
+			CommitID:    "commit-1",
+			ClaimedAt:   now,
+			AppliedAt:   &appliedAt,
+		},
+	}
+
+	var publishCalls int
+	handler.commitPublisher = func(orgID, repoID, commitID string) error {
+		publishCalls++
+		return nil
+	}
+
+	recovered, ok, err := handler.recoverPreparedUploadIfPossible("org-1", "repo-1", "upload-1", []uploadBlockPromotion{{BlockIndex: 0, BlockSHA256: "sha256-1"}})
+	if err != nil {
+		t.Fatalf("recoverPreparedUploadIfPossible failed: %v", err)
+	}
+	if !ok {
+		t.Fatal("expected recovery to return closed upload")
+	}
+	if recovered.ActualFilename != "renamed.txt" {
+		t.Fatalf("actual filename = %q, want renamed.txt", recovered.ActualFilename)
+	}
+	if publishCalls != 0 {
+		t.Fatalf("publish calls = %d, want 0", publishCalls)
+	}
+}
+
+func TestRecoverPreparedUploadIfPossibleFailsOnPendingPromotionMarker(t *testing.T) {
+	handler := NewSeafHTTPHandler(nil, storage.NewManager(), nil, NewMockTokenStore(), nil, nil)
+	staging := &fakeUploadStagingStore{}
+	handler.SetUploadStagingStore(staging)
+	now := time.Now().UTC()
+	staging.sessions = append(staging.sessions, UploadSessionRecord{
+		UploadID:       "upload-1",
+		OrgID:          "org-1",
+		RepoID:         "repo-1",
+		Filename:       "file.txt",
+		ActualFilename: "file.txt",
+		CommitID:       "commit-1",
+		State:          UploadSessionStatePromoting,
+		CreatedAt:      now,
+		UpdatedAt:      now,
+		ExpiresAt:      now.Add(time.Hour),
+	})
+	staging.promotions = map[string]UploadBlockPromotionRecord{
+		fakeUploadPromotionKey("org-1", "upload-1", 0): {
+			OrgID:       "org-1",
+			UploadID:    "upload-1",
+			BlockIndex:  0,
+			BlockSHA256: "sha256-1",
+			CommitID:    "commit-1",
+			ClaimedAt:   now,
+		},
+	}
+
+	_, ok, err := handler.recoverPreparedUploadIfPossible("org-1", "repo-1", "upload-1", []uploadBlockPromotion{{BlockIndex: 0, BlockSHA256: "sha256-1"}})
+	if err == nil {
+		t.Fatal("expected recoverPreparedUploadIfPossible to fail")
+	}
+	if ok {
+		t.Fatal("expected recovery to report not recovered on pending marker")
+	}
+	if !strings.Contains(err.Error(), "upload recovery pending") {
+		t.Fatalf("error = %v, want pending recovery error", err)
+	}
+}
+
+func TestRecoverPromotingUploadSessionPublishesWhenAllPromotionsApplied(t *testing.T) {
+	handler := NewSeafHTTPHandler(nil, storage.NewManager(), nil, NewMockTokenStore(), nil, nil)
+	staging := &fakeUploadStagingStore{}
+	handler.SetUploadStagingStore(staging)
+	now := time.Now().UTC()
+	staging.sessions = append(staging.sessions, UploadSessionRecord{
+		UploadID:       "upload-1",
+		OrgID:          "org-1",
+		RepoID:         "repo-1",
+		UserID:         "user-1",
+		Filename:       "file.txt",
+		ActualFilename: "file.txt",
+		CommitID:       "commit-1",
+		State:          UploadSessionStatePromoting,
+		CreatedAt:      now,
+		UpdatedAt:      now,
+		ExpiresAt:      now.Add(time.Hour),
+	})
+	appliedAt := now.Add(time.Minute)
+	staging.promotions = map[string]UploadBlockPromotionRecord{
+		fakeUploadPromotionKey("org-1", "upload-1", 0): {
+			OrgID:       "org-1",
+			UploadID:    "upload-1",
+			BlockIndex:  0,
+			BlockSHA256: "sha256-1",
+			CommitID:    "commit-1",
+			ClaimedAt:   now,
+			AppliedAt:   &appliedAt,
+		},
+	}
+
+	var publishCalls int
+	handler.commitPublisher = func(orgID, repoID, commitID string) error {
+		publishCalls++
+		return nil
+	}
+
+	if err := handler.recoverPromotingUploadSession(&UploadSessionRecord{OrgID: "org-1", UploadID: "upload-1"}); err != nil {
+		t.Fatalf("recoverPromotingUploadSession failed: %v", err)
+	}
+	if publishCalls != 1 {
+		t.Fatalf("publish calls = %d, want 1", publishCalls)
+	}
+	latest := staging.sessions[len(staging.sessions)-1]
+	if latest.State != UploadSessionStateClosed {
+		t.Fatalf("latest session state = %q, want %q", latest.State, UploadSessionStateClosed)
+	}
+}
+
+func TestRecoverPromotingUploadSessionMarksExpiredPendingPromotionCleanup(t *testing.T) {
+	handler := NewSeafHTTPHandler(nil, storage.NewManager(), nil, NewMockTokenStore(), nil, nil)
+	staging := &fakeUploadStagingStore{}
+	handler.SetUploadStagingStore(staging)
+	now := time.Now().UTC()
+	staging.sessions = append(staging.sessions, UploadSessionRecord{
+		UploadID:       "upload-1",
+		OrgID:          "org-1",
+		RepoID:         "repo-1",
+		Filename:       "file.txt",
+		ActualFilename: "file.txt",
+		CommitID:       "commit-1",
+		State:          UploadSessionStatePromoting,
+		CreatedAt:      now.Add(-3 * time.Hour),
+		UpdatedAt:      now.Add(-3 * time.Hour),
+		ExpiresAt:      now.Add(-time.Minute),
+	})
+	staging.promotions = map[string]UploadBlockPromotionRecord{
+		fakeUploadPromotionKey("org-1", "upload-1", 0): {
+			OrgID:       "org-1",
+			UploadID:    "upload-1",
+			BlockIndex:  0,
+			BlockSHA256: "sha256-1",
+			CommitID:    "commit-1",
+			ClaimedAt:   now.Add(-2 * time.Hour),
+		},
+	}
+
+	if err := handler.recoverPromotingUploadSession(&UploadSessionRecord{OrgID: "org-1", UploadID: "upload-1"}); err != nil {
+		t.Fatalf("recoverPromotingUploadSession failed: %v", err)
+	}
+	latest := staging.sessions[len(staging.sessions)-1]
+	if latest.State != UploadSessionStateCleanupPending {
+		t.Fatalf("latest session state = %q, want %q", latest.State, UploadSessionStateCleanupPending)
+	}
+	if !strings.Contains(latest.LastError, "still pending") {
+		t.Fatalf("last error = %q, want pending marker message", latest.LastError)
+	}
+}
+
+func TestRecoverPromotingUploadsForOrgRecoversLatestUniqueSessions(t *testing.T) {
+	handler := NewSeafHTTPHandler(nil, storage.NewManager(), nil, NewMockTokenStore(), nil, nil)
+	staging := &fakeUploadStagingStore{}
+	handler.SetUploadStagingStore(staging)
+	now := time.Now().UTC()
+	appliedAt := now.Add(time.Minute)
+	staging.sessions = append(staging.sessions,
+		UploadSessionRecord{UploadID: "upload-1", OrgID: "org-1", RepoID: "repo-1", CommitID: "commit-1", State: UploadSessionStatePromoting, UpdatedAt: now.Add(-2 * time.Minute), ExpiresAt: now.Add(time.Hour)},
+		UploadSessionRecord{UploadID: "upload-1", OrgID: "org-1", RepoID: "repo-1", CommitID: "commit-1", State: UploadSessionStatePromoting, UpdatedAt: now.Add(-time.Minute), ExpiresAt: now.Add(time.Hour)},
+		UploadSessionRecord{UploadID: "upload-2", OrgID: "org-1", RepoID: "repo-1", CommitID: "commit-2", State: UploadSessionStatePromoting, UpdatedAt: now, ExpiresAt: now.Add(time.Hour)},
+	)
+	staging.promotions = map[string]UploadBlockPromotionRecord{
+		fakeUploadPromotionKey("org-1", "upload-1", 0): {OrgID: "org-1", UploadID: "upload-1", BlockIndex: 0, BlockSHA256: "sha256-1", CommitID: "commit-1", ClaimedAt: now, AppliedAt: &appliedAt},
+		fakeUploadPromotionKey("org-1", "upload-2", 0): {OrgID: "org-1", UploadID: "upload-2", BlockIndex: 0, BlockSHA256: "sha256-2", CommitID: "commit-2", ClaimedAt: now, AppliedAt: &appliedAt},
+	}
+
+	var published []string
+	handler.commitPublisher = func(orgID, repoID, commitID string) error {
+		published = append(published, commitID)
+		return nil
+	}
+
+	handler.recoverPromotingUploadsForOrg("org-1", 10)
+	if len(published) != 2 {
+		t.Fatalf("published commits = %v, want 2 commits", published)
 	}
 }
 
