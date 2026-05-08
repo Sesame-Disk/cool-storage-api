@@ -1,6 +1,9 @@
 package api
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 func TestBuildUploadSessionIDStableAndDistinct(t *testing.T) {
 	first := BuildUploadSessionID("org-1", "repo-1", "user-1", "token-1", "/docs", "file.txt")
@@ -43,5 +46,17 @@ func TestCassandraUploadStagingStore_RejectsMissingKeys(t *testing.T) {
 
 	if err := store.UpsertBlock(UploadSessionBlockRecord{UploadID: "upload-1"}); err == nil {
 		t.Fatal("expected missing block sha256 to fail")
+	}
+
+	if _, err := store.TryStartBlockPromotion(UploadBlockPromotionRecord{}); err == nil {
+		t.Fatal("expected missing promotion keys to fail")
+	}
+
+	if err := store.MarkBlockPromotionApplied("", "upload-1", 0, time.Now().UTC()); err == nil {
+		t.Fatal("expected missing org id to fail")
+	}
+
+	if err := store.DeleteBlockPromotion("", "upload-1", 0); err == nil {
+		t.Fatal("expected missing org id to fail")
 	}
 }

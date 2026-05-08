@@ -74,9 +74,29 @@ type UploadSessionBlockRecord struct {
 	PromotedAt   *time.Time
 }
 
+type UploadBlockPromotionRecord struct {
+	OrgID       string
+	UploadID    string
+	BlockIndex  int
+	BlockSHA256 string
+	CommitID    string
+	ClaimedAt   time.Time
+	AppliedAt   *time.Time
+}
+
+type UploadBlockPromotionAttempt struct {
+	Inserted    bool
+	BlockSHA256 string
+	CommitID    string
+	AppliedAt   *time.Time
+}
+
 type UploadStagingStore interface {
 	UpsertSession(record UploadSessionRecord) error
 	UpsertBlock(record UploadSessionBlockRecord) error
+	TryStartBlockPromotion(record UploadBlockPromotionRecord) (UploadBlockPromotionAttempt, error)
+	MarkBlockPromotionApplied(orgID, uploadID string, blockIndex int, appliedAt time.Time) error
+	DeleteBlockPromotion(orgID, uploadID string, blockIndex int) error
 }
 
 type CassandraUploadStagingStore struct {
@@ -159,4 +179,116 @@ func (s *CassandraUploadStagingStore) UpsertBlock(record UploadSessionBlockRecor
 		) VALUES (?, ?, ?, ?, ?, ?)
 	`, record.OrgID, record.BlockSHA256, record.UploadID, record.BlockIndex,
 		string(record.State), record.UpdatedAt).Exec()
+}
+
+func (s *CassandraUploadStagingStore) TryStartBlockPromotion(record UploadBlockPromotionRecord) (UploadBlockPromotionAttempt, error) {
+	if strings.TrimSpace(record.OrgID) == "" {
+		return UploadBlockPromotionAttempt{}, fmt.Errorf("org id is required")
+	}
+	if strings.TrimSpace(record.UploadID) == "" {
+		return UploadBlockPromotionAttempt{}, fmt.Errorf("upload id is required")
+	}
+	if strings.TrimSpace(record.BlockSHA256) == "" {
+		return UploadBlockPromotionAttempt{}, fmt.Errorf("block sha256 is required")
+	}
+	if strings.TrimSpace(record.CommitID) == "" {
+		return UploadBlockPromotionAttempt{}, fmt.Errorf("commit id is required")
+	}
+	if s == nil || s.db == nil {
+		return UploadBlockPromotionAttempt{
+			Inserted:    true,
+			BlockSHA256: record.BlockSHA256,
+			CommitID:    record.CommitID,
+		}, nil
+	}
+
+	existing := map[string]interface{}{}
+	applied, err := s.db.Session().Query(`
+		INSERT INTO upload_block_promotions (
+			org_id, upload_id, block_index, block_sha256, commit_id, claimed_at, applied_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?) IF NOT EXISTS
+	`, record.OrgID, record.UploadID, record.BlockIndex, record.BlockSHA256, record.CommitID, record.ClaimedAt, record.AppliedAt).MapScanCAS(existing)
+	if err != nil {
+		return UploadBlockPromotionAttempt{}, err
+	}
+	if applied {
+		return UploadBlockPromotionAttempt{
+			Inserted:    true,
+			BlockSHA256: record.BlockSHA256,
+			CommitID:    record.CommitID,
+		}, nil
+	}
+
+	return UploadBlockPromotionAttempt{
+		Inserted:    false,
+		BlockSHA256: uploadPromotionStringValue(existing, "block_sha256"),
+		CommitID:    uploadPromotionStringValue(existing, "commit_id"),
+		AppliedAt:   uploadPromotionTimeValue(existing, "applied_at"),
+	}, nil
+}
+
+func (s *CassandraUploadStagingStore) MarkBlockPromotionApplied(orgID, uploadID string, blockIndex int, appliedAt time.Time) error {
+	if strings.TrimSpace(orgID) == "" {
+		return fmt.Errorf("org id is required")
+	}
+	if strings.TrimSpace(uploadID) == "" {
+		return fmt.Errorf("upload id is required")
+	}
+	if s == nil || s.db == nil {
+		return nil
+	}
+	return s.db.Session().Query(`
+		UPDATE upload_block_promotions SET applied_at = ?
+		WHERE org_id = ? AND upload_id = ? AND block_index = ?
+	`, appliedAt, orgID, uploadID, blockIndex).Exec()
+}
+
+func (s *CassandraUploadStagingStore) DeleteBlockPromotion(orgID, uploadID string, blockIndex int) error {
+	if strings.TrimSpace(orgID) == "" {
+		return fmt.Errorf("org id is required")
+	}
+	if strings.TrimSpace(uploadID) == "" {
+		return fmt.Errorf("upload id is required")
+	}
+	if s == nil || s.db == nil {
+		return nil
+	}
+	return s.db.Session().Query(`
+		DELETE FROM upload_block_promotions WHERE org_id = ? AND upload_id = ? AND block_index = ?
+	`, orgID, uploadID, blockIndex).Exec()
+}
+
+func uploadPromotionStringValue(row map[string]interface{}, key string) string {
+	value, ok := row[key]
+	if !ok || value == nil {
+		return ""
+	}
+	switch typed := value.(type) {
+	case string:
+		return typed
+	case []byte:
+		return string(typed)
+	default:
+		return fmt.Sprint(typed)
+	}
+}
+
+func uploadPromotionTimeValue(row map[string]interface{}, key string) *time.Time {
+	value, ok := row[key]
+	if !ok || value == nil {
+		return nil
+	}
+	switch typed := value.(type) {
+	case time.Time:
+		promotedAt := typed.UTC()
+		return &promotedAt
+	case *time.Time:
+		if typed == nil {
+			return nil
+		}
+		promotedAt := typed.UTC()
+		return &promotedAt
+	default:
+		return nil
+	}
 }

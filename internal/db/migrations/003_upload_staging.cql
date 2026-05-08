@@ -54,3 +54,19 @@ CREATE TABLE IF NOT EXISTS upload_session_blocks_by_sha256 (
 
 -- Phase-1 states include receiving, promoting, published, closed,
 -- cleanup_pending, registered, uploaded, promoted and cleaned.
+
+-- Durable per-upload block promotion markers used to make the transition from
+-- staged/uploaded block objects to live block refcounts retry-safe. A row is
+-- inserted before promotion begins and marked with applied_at only after the
+-- live refcount update succeeds.
+
+CREATE TABLE IF NOT EXISTS upload_block_promotions (
+    org_id        TEXT,
+    upload_id     TEXT,
+    block_index   INT,
+    block_sha256  TEXT,
+    commit_id     TEXT,
+    claimed_at    TIMESTAMP,
+    applied_at    TIMESTAMP,
+    PRIMARY KEY ((org_id, upload_id), block_index)
+);

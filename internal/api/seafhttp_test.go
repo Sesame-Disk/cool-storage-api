@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -21,12 +22,16 @@ import (
 )
 
 type fakeUploadStagingStore struct {
-	mu         sync.Mutex
-	sessions   []UploadSessionRecord
-	blocks     []UploadSessionBlockRecord
-	err        error
-	sessionErr error
-	blockErr   error
+	mu                 sync.Mutex
+	sessions           []UploadSessionRecord
+	blocks             []UploadSessionBlockRecord
+	promotions         map[string]UploadBlockPromotionRecord
+	err                error
+	sessionErr         error
+	blockErr           error
+	promotionErr       error
+	promotionApplyErr  error
+	promotionDeleteErr error
 }
 
 func (f *fakeUploadStagingStore) UpsertSession(record UploadSessionRecord) error {
@@ -53,6 +58,79 @@ func (f *fakeUploadStagingStore) UpsertBlock(record UploadSessionBlockRecord) er
 	}
 	f.blocks = append(f.blocks, record)
 	return nil
+}
+
+func (f *fakeUploadStagingStore) TryStartBlockPromotion(record UploadBlockPromotionRecord) (UploadBlockPromotionAttempt, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.promotionErr != nil {
+		return UploadBlockPromotionAttempt{}, f.promotionErr
+	}
+	if f.err != nil {
+		return UploadBlockPromotionAttempt{}, f.err
+	}
+	if f.promotions == nil {
+		f.promotions = make(map[string]UploadBlockPromotionRecord)
+	}
+	key := fakeUploadPromotionKey(record.OrgID, record.UploadID, record.BlockIndex)
+	existing, ok := f.promotions[key]
+	if ok {
+		return UploadBlockPromotionAttempt{
+			Inserted:    false,
+			BlockSHA256: existing.BlockSHA256,
+			CommitID:    existing.CommitID,
+			AppliedAt:   existing.AppliedAt,
+		}, nil
+	}
+	f.promotions[key] = record
+	return UploadBlockPromotionAttempt{
+		Inserted:    true,
+		BlockSHA256: record.BlockSHA256,
+		CommitID:    record.CommitID,
+	}, nil
+}
+
+func (f *fakeUploadStagingStore) MarkBlockPromotionApplied(orgID, uploadID string, blockIndex int, appliedAt time.Time) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.promotionApplyErr != nil {
+		return f.promotionApplyErr
+	}
+	if f.err != nil {
+		return f.err
+	}
+	if f.promotions == nil {
+		return nil
+	}
+	key := fakeUploadPromotionKey(orgID, uploadID, blockIndex)
+	record, ok := f.promotions[key]
+	if !ok {
+		return nil
+	}
+	appliedAtCopy := appliedAt.UTC()
+	record.AppliedAt = &appliedAtCopy
+	f.promotions[key] = record
+	return nil
+}
+
+func (f *fakeUploadStagingStore) DeleteBlockPromotion(orgID, uploadID string, blockIndex int) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.promotionDeleteErr != nil {
+		return f.promotionDeleteErr
+	}
+	if f.err != nil {
+		return f.err
+	}
+	if f.promotions == nil {
+		return nil
+	}
+	delete(f.promotions, fakeUploadPromotionKey(orgID, uploadID, blockIndex))
+	return nil
+}
+
+func fakeUploadPromotionKey(orgID, uploadID string, blockIndex int) string {
+	return orgID + "|" + uploadID + "|" + strconv.Itoa(blockIndex)
 }
 
 type orphanRecorderCall struct {
@@ -1122,6 +1200,8 @@ func TestPublishPreparedUploadPromotesBeforePublishingHead(t *testing.T) {
 
 func TestPublishPreparedUploadRollsBackWhenPublishFails(t *testing.T) {
 	handler := NewSeafHTTPHandler(nil, storage.NewManager(), nil, NewMockTokenStore(), nil, nil)
+	staging := &fakeUploadStagingStore{}
+	handler.SetUploadStagingStore(staging)
 
 	var rollbackOpKey string
 	var rollbackBlockIDs []string
@@ -1157,6 +1237,8 @@ func TestPublishPreparedUploadRollsBackWhenPublishFails(t *testing.T) {
 
 func TestPublishPreparedUploadRollsBackPartialPromotionFailures(t *testing.T) {
 	handler := NewSeafHTTPHandler(nil, storage.NewManager(), nil, NewMockTokenStore(), nil, nil)
+	staging := &fakeUploadStagingStore{}
+	handler.SetUploadStagingStore(staging)
 
 	var publishCalled bool
 	var rollbackBlockIDs []string
@@ -1190,6 +1272,148 @@ func TestPublishPreparedUploadRollsBackPartialPromotionFailures(t *testing.T) {
 	}
 	if len(rollbackBlockIDs) != 1 || rollbackBlockIDs[0] != "sha256-1" {
 		t.Fatalf("rollback block ids = %v, want [sha256-1]", rollbackBlockIDs)
+	}
+}
+
+func TestPublishPreparedUploadRetrySkipsAlreadyAppliedPromotion(t *testing.T) {
+	handler := NewSeafHTTPHandler(nil, storage.NewManager(), nil, NewMockTokenStore(), nil, nil)
+	staging := &fakeUploadStagingStore{}
+	handler.SetUploadStagingStore(staging)
+
+	var promoteCalls int
+	var publishCalls int
+	handler.blockPromoter = func(orgID, blockID string, sizeBytes int, storageClass, storageKey string) error {
+		promoteCalls++
+		return nil
+	}
+	handler.commitPublisher = func(orgID, repoID, commitID string) error {
+		publishCalls++
+		return nil
+	}
+
+	block := uploadBlockPromotion{BlockIndex: 0, BlockSHA256: "sha256-1", SizeBytes: 10, StorageClass: "hot", StorageKey: "sha256-1"}
+	if err := handler.publishPreparedUpload("org-1", "repo-1", "upload-1", preparedUploadCommit{CommitID: "commit-1"}, []uploadBlockPromotion{block}); err != nil {
+		t.Fatalf("first publishPreparedUpload failed: %v", err)
+	}
+	if err := handler.publishPreparedUpload("org-1", "repo-1", "upload-1", preparedUploadCommit{CommitID: "commit-1"}, []uploadBlockPromotion{block}); err != nil {
+		t.Fatalf("second publishPreparedUpload failed: %v", err)
+	}
+
+	if promoteCalls != 1 {
+		t.Fatalf("promote calls = %d, want 1", promoteCalls)
+	}
+	if publishCalls != 2 {
+		t.Fatalf("publish calls = %d, want 2", publishCalls)
+	}
+}
+
+func TestPublishPreparedUploadFailsOnPendingPromotionMarker(t *testing.T) {
+	handler := NewSeafHTTPHandler(nil, storage.NewManager(), nil, NewMockTokenStore(), nil, nil)
+	staging := &fakeUploadStagingStore{
+		promotions: map[string]UploadBlockPromotionRecord{
+			fakeUploadPromotionKey("org-1", "upload-1", 0): {
+				OrgID:       "org-1",
+				UploadID:    "upload-1",
+				BlockIndex:  0,
+				BlockSHA256: "sha256-1",
+				CommitID:    "commit-1",
+				ClaimedAt:   time.Now().UTC(),
+			},
+		},
+	}
+	handler.SetUploadStagingStore(staging)
+
+	var promoteCalled bool
+	var publishCalled bool
+	handler.blockPromoter = func(orgID, blockID string, sizeBytes int, storageClass, storageKey string) error {
+		promoteCalled = true
+		return nil
+	}
+	handler.commitPublisher = func(orgID, repoID, commitID string) error {
+		publishCalled = true
+		return nil
+	}
+
+	err := handler.publishPreparedUpload("org-1", "repo-1", "upload-1", preparedUploadCommit{CommitID: "commit-1"}, []uploadBlockPromotion{{BlockIndex: 0, BlockSHA256: "sha256-1", SizeBytes: 10, StorageClass: "hot", StorageKey: "sha256-1"}})
+	if err == nil {
+		t.Fatal("expected publishPreparedUpload to fail on pending marker")
+	}
+	if !strings.Contains(err.Error(), "pending promotion marker") {
+		t.Fatalf("error = %v, want pending marker failure", err)
+	}
+	if promoteCalled {
+		t.Fatal("promote should not be called when marker is pending")
+	}
+	if publishCalled {
+		t.Fatal("publish should not be called when marker is pending")
+	}
+}
+
+func TestPublishPreparedUploadReleasesClaimAfterPromotionFailure(t *testing.T) {
+	handler := NewSeafHTTPHandler(nil, storage.NewManager(), nil, NewMockTokenStore(), nil, nil)
+	staging := &fakeUploadStagingStore{}
+	handler.SetUploadStagingStore(staging)
+
+	var promoteCalls int
+	handler.blockPromoter = func(orgID, blockID string, sizeBytes int, storageClass, storageKey string) error {
+		promoteCalls++
+		if promoteCalls == 1 {
+			return errors.New("promote failed")
+		}
+		return nil
+	}
+	handler.commitPublisher = func(orgID, repoID, commitID string) error {
+		return nil
+	}
+
+	block := uploadBlockPromotion{BlockIndex: 0, BlockSHA256: "sha256-1", SizeBytes: 10, StorageClass: "hot", StorageKey: "sha256-1"}
+	err := handler.publishPreparedUpload("org-1", "repo-1", "upload-1", preparedUploadCommit{CommitID: "commit-1"}, []uploadBlockPromotion{block})
+	if err == nil {
+		t.Fatal("expected first publishPreparedUpload to fail")
+	}
+	if _, exists := staging.promotions[fakeUploadPromotionKey("org-1", "upload-1", 0)]; exists {
+		t.Fatal("expected failed promotion claim to be released")
+	}
+	if err := handler.publishPreparedUpload("org-1", "repo-1", "upload-1", preparedUploadCommit{CommitID: "commit-1"}, []uploadBlockPromotion{block}); err != nil {
+		t.Fatalf("second publishPreparedUpload failed: %v", err)
+	}
+	if promoteCalls != 2 {
+		t.Fatalf("promote calls = %d, want 2", promoteCalls)
+	}
+}
+
+func TestPublishPreparedUploadPublishFailureDoesNotRollbackAlreadyAppliedBlocks(t *testing.T) {
+	handler := NewSeafHTTPHandler(nil, storage.NewManager(), nil, NewMockTokenStore(), nil, nil)
+	staging := &fakeUploadStagingStore{}
+	handler.SetUploadStagingStore(staging)
+
+	handler.blockPromoter = func(orgID, blockID string, sizeBytes int, storageClass, storageKey string) error {
+		return nil
+	}
+	handler.commitPublisher = func(orgID, repoID, commitID string) error {
+		return nil
+	}
+
+	block := uploadBlockPromotion{BlockIndex: 0, BlockSHA256: "sha256-1", SizeBytes: 10, StorageClass: "hot", StorageKey: "sha256-1"}
+	if err := handler.publishPreparedUpload("org-1", "repo-1", "upload-1", preparedUploadCommit{CommitID: "commit-1"}, []uploadBlockPromotion{block}); err != nil {
+		t.Fatalf("initial publishPreparedUpload failed: %v", err)
+	}
+
+	var rollbackCalls int
+	handler.blockRollback = func(orgID, operationKey string, blockIDs []string) []string {
+		rollbackCalls++
+		return nil
+	}
+	handler.commitPublisher = func(orgID, repoID, commitID string) error {
+		return errors.New("publish failed")
+	}
+
+	err := handler.publishPreparedUpload("org-1", "repo-1", "upload-1", preparedUploadCommit{CommitID: "commit-1"}, []uploadBlockPromotion{block})
+	if err == nil {
+		t.Fatal("expected retry publishPreparedUpload to fail")
+	}
+	if rollbackCalls != 0 {
+		t.Fatalf("rollback calls = %d, want 0", rollbackCalls)
 	}
 }
 

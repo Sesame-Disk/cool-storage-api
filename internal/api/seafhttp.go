@@ -927,8 +927,8 @@ func (h *SeafHTTPHandler) recordUploadS3OrphanRow(orgID, blockID, storageClass, 
 	if err != nil {
 		return fmt.Errorf("parse org id for S3 orphan: %w", err)
 	}
-	if storageClass == "" {
-		storageClass = "hot"
+	if strings.TrimSpace(storageClass) == "" {
+		return fmt.Errorf("record S3 orphan: storage class is required")
 	}
 	now := time.Now().UTC()
 	initialRetryCount := 0
@@ -970,6 +970,40 @@ func (h *SeafHTTPHandler) rollbackPromotedUploadBlocks(orgID, uploadID, commitID
 	}
 }
 
+func (h *SeafHTTPHandler) releaseUploadPromotionClaims(orgID, uploadID string, blocks []uploadBlockPromotion) {
+	if h == nil || h.uploadStaging == nil || len(blocks) == 0 {
+		return
+	}
+	for _, block := range blocks {
+		if err := h.uploadStaging.DeleteBlockPromotion(orgID, uploadID, block.BlockIndex); err != nil {
+			log.Printf("[publishPreparedUpload] WARNING: Failed to release promotion claim upload=%s index=%d sha256=%s: %v", shortLogID(uploadID), block.BlockIndex, shortLogID(block.BlockSHA256), err)
+		}
+	}
+}
+
+func (h *SeafHTTPHandler) persistPromotedUploadBlock(uploadID, orgID string, block uploadBlockPromotion, promotedAt time.Time) {
+	if h.uploadStaging == nil {
+		return
+	}
+	promotedAtUTC := promotedAt.UTC()
+	h.persistUploadBlockState(UploadSessionBlockRecord{
+		UploadID:     uploadID,
+		BlockIndex:   block.BlockIndex,
+		OrgID:        orgID,
+		BlockSHA1:    block.BlockSHA1,
+		BlockSHA256:  block.BlockSHA256,
+		SizeBytes:    block.SizeBytes,
+		StorageClass: block.StorageClass,
+		StorageKey:   block.StorageKey,
+		Source:       block.Source,
+		State:        UploadBlockStatePromoted,
+		CreatedAt:    block.CreatedAt,
+		UpdatedAt:    promotedAtUTC,
+		UploadedAt:   block.UploadedAt,
+		PromotedAt:   &promotedAtUTC,
+	}, string(UploadBlockStatePromoted))
+}
+
 func (h *SeafHTTPHandler) publishPreparedUpload(orgID, repoID, uploadID string, prepared preparedUploadCommit, blocks []uploadBlockPromotion) error {
 	if h == nil {
 		return fmt.Errorf("upload handler is required")
@@ -984,36 +1018,68 @@ func (h *SeafHTTPHandler) publishPreparedUpload(orgID, repoID, uploadID string, 
 		return fmt.Errorf("commit publisher is not configured")
 	}
 
-	promotedBlockIDs := make([]string, 0, len(blocks))
+	newlyPromotedBlockIDs := make([]string, 0, len(blocks))
+	newlyClaimedBlocks := make([]uploadBlockPromotion, 0, len(blocks))
 	for _, block := range blocks {
+		claimInserted := false
+		if h.uploadStaging != nil {
+			attempt, err := h.uploadStaging.TryStartBlockPromotion(UploadBlockPromotionRecord{
+				OrgID:       orgID,
+				UploadID:    uploadID,
+				BlockIndex:  block.BlockIndex,
+				BlockSHA256: block.BlockSHA256,
+				CommitID:    prepared.CommitID,
+				ClaimedAt:   time.Now().UTC(),
+			})
+			if err != nil {
+				h.rollbackPromotedUploadBlocks(orgID, uploadID, prepared.CommitID, newlyPromotedBlockIDs)
+				h.releaseUploadPromotionClaims(orgID, uploadID, newlyClaimedBlocks)
+				return fmt.Errorf("failed to claim block promotion for block %d: %w", block.BlockIndex, err)
+			}
+			if !attempt.Inserted {
+				if attempt.BlockSHA256 != block.BlockSHA256 || attempt.CommitID != prepared.CommitID {
+					h.rollbackPromotedUploadBlocks(orgID, uploadID, prepared.CommitID, newlyPromotedBlockIDs)
+					h.releaseUploadPromotionClaims(orgID, uploadID, newlyClaimedBlocks)
+					return fmt.Errorf("block %d promotion marker mismatch", block.BlockIndex)
+				}
+				if attempt.AppliedAt == nil {
+					h.rollbackPromotedUploadBlocks(orgID, uploadID, prepared.CommitID, newlyPromotedBlockIDs)
+					h.releaseUploadPromotionClaims(orgID, uploadID, newlyClaimedBlocks)
+					return fmt.Errorf("block %d has pending promotion marker; recovery required", block.BlockIndex)
+				}
+				h.persistPromotedUploadBlock(uploadID, orgID, block, *attempt.AppliedAt)
+				continue
+			}
+			claimInserted = true
+		}
+
 		if err := h.blockPromoter(orgID, block.BlockSHA256, block.SizeBytes, block.StorageClass, block.StorageKey); err != nil {
-			h.rollbackPromotedUploadBlocks(orgID, uploadID, prepared.CommitID, promotedBlockIDs)
+			if claimInserted {
+				h.releaseUploadPromotionClaims(orgID, uploadID, []uploadBlockPromotion{block})
+			}
+			h.rollbackPromotedUploadBlocks(orgID, uploadID, prepared.CommitID, newlyPromotedBlockIDs)
+			h.releaseUploadPromotionClaims(orgID, uploadID, newlyClaimedBlocks)
 			return fmt.Errorf("failed to write block metadata for block %d: %w", block.BlockIndex, err)
 		}
-		promotedBlockIDs = append(promotedBlockIDs, block.BlockSHA256)
-		if h.uploadStaging != nil {
-			promotedAt := time.Now().UTC()
-			h.persistUploadBlockState(UploadSessionBlockRecord{
-				UploadID:     uploadID,
-				BlockIndex:   block.BlockIndex,
-				OrgID:        orgID,
-				BlockSHA1:    block.BlockSHA1,
-				BlockSHA256:  block.BlockSHA256,
-				SizeBytes:    block.SizeBytes,
-				StorageClass: block.StorageClass,
-				StorageKey:   block.StorageKey,
-				Source:       block.Source,
-				State:        UploadBlockStatePromoted,
-				CreatedAt:    block.CreatedAt,
-				UpdatedAt:    promotedAt,
-				UploadedAt:   block.UploadedAt,
-				PromotedAt:   &promotedAt,
-			}, string(UploadBlockStatePromoted))
+
+		promotedAt := time.Now().UTC()
+		if claimInserted {
+			if err := h.uploadStaging.MarkBlockPromotionApplied(orgID, uploadID, block.BlockIndex, promotedAt); err != nil {
+				currentPromotedBlockIDs := append(append([]string(nil), newlyPromotedBlockIDs...), block.BlockSHA256)
+				currentClaimedBlocks := append(append([]uploadBlockPromotion(nil), newlyClaimedBlocks...), block)
+				h.rollbackPromotedUploadBlocks(orgID, uploadID, prepared.CommitID, currentPromotedBlockIDs)
+				h.releaseUploadPromotionClaims(orgID, uploadID, currentClaimedBlocks)
+				return fmt.Errorf("failed to finalize block promotion marker for block %d: %w", block.BlockIndex, err)
+			}
+			newlyClaimedBlocks = append(newlyClaimedBlocks, block)
 		}
+		newlyPromotedBlockIDs = append(newlyPromotedBlockIDs, block.BlockSHA256)
+		h.persistPromotedUploadBlock(uploadID, orgID, block, promotedAt)
 	}
 
 	if err := h.commitPublisher(orgID, repoID, prepared.CommitID); err != nil {
-		h.rollbackPromotedUploadBlocks(orgID, uploadID, prepared.CommitID, promotedBlockIDs)
+		h.rollbackPromotedUploadBlocks(orgID, uploadID, prepared.CommitID, newlyPromotedBlockIDs)
+		h.releaseUploadPromotionClaims(orgID, uploadID, newlyClaimedBlocks)
 		return fmt.Errorf("failed to publish upload commit: %w", err)
 	}
 
@@ -1564,6 +1630,30 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "file stored but metadata update failed"})
 		return
 	}
+	if h.uploadStaging != nil {
+		now := time.Now().UTC()
+		if err := h.uploadStaging.UpsertSession(UploadSessionRecord{
+			UploadID:       uploadID,
+			OrgID:          token.OrgID,
+			RepoID:         token.RepoID,
+			UserID:         token.UserID,
+			TokenID:        tokenStr,
+			ParentDir:      parentDir,
+			Filename:       filename,
+			ActualFilename: actualFilename,
+			CommitID:       commitID,
+			TotalSize:      finalSize,
+			State:          UploadSessionStatePromoting,
+			CreatedAt:      singleShotCreatedAt,
+			UpdatedAt:      now,
+			ExpiresAt:      now.Add(chunkDiskTTL),
+		}); err != nil {
+			log.Printf("[HandleUpload] Failed to persist prepared upload state: %v", err)
+			markSingleShotCleanup(err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to persist upload state"})
+			return
+		}
+	}
 	if err := h.publishPreparedUpload(token.OrgID, token.RepoID, uploadID, preparedUploadCommit{
 		CommitID:       commitID,
 		ActualFilename: actualFilename,
@@ -1744,7 +1834,6 @@ readLoop:
 			if _, putErr := blockStore.PutBlockAuto(egCtx, sha256ID, storedBlock); putErr != nil {
 				return fmt.Errorf("failed to store block: %w", putErr)
 			}
-			storedInBlockStore := true
 			if h.uploadStaging != nil {
 				uploadedAtValue := time.Now().UTC()
 				uploadedAt = &uploadedAtValue
@@ -1770,9 +1859,7 @@ readLoop:
 				INSERT INTO block_id_mappings (org_id, external_id, internal_id) VALUES (?, ?, ?)
 			`, token.OrgID, blockSHA1IDLocal, sha256ID).Exec(); mapErr != nil {
 				log.Printf("[finalizeUploadStreaming] CRITICAL: Failed to write block_id_mapping org=%s ext=%s int=%s: %v", token.OrgID, blockSHA1IDLocal[:16], sha256ID[:16], mapErr)
-				if storedInBlockStore {
-					h.persistUploadS3Orphan(token.OrgID, sha256ID, actualStorageClass, mapErr.Error())
-				}
+				h.persistUploadS3Orphan(token.OrgID, sha256ID, actualStorageClass, mapErr.Error())
 				return fmt.Errorf("failed to create block mapping: %w", mapErr)
 			}
 
@@ -1810,9 +1897,11 @@ readLoop:
 	if err := eg.Wait(); err != nil {
 		return finalizeUploadResult{}, err
 	}
+	pendingPromotionsMu.Lock()
 	sort.Slice(pendingPromotions, func(i, j int) bool {
 		return pendingPromotions[i].BlockIndex < pendingPromotions[j].BlockIndex
 	})
+	pendingPromotionsMu.Unlock()
 
 	// File ID = SHA-1 of the complete plaintext
 	fileID := hex.EncodeToString(sha1Hasher.Sum(nil))
@@ -1823,6 +1912,27 @@ readLoop:
 	commitID, actualFilename, err := h.prepareUploadedFileCommitMultiBlock(token.OrgID, token.RepoID, token.UserID, parentDir, filename, fileID, blockSHA1IDs, totalSize, replace)
 	if err != nil {
 		return finalizeUploadResult{}, fmt.Errorf("failed to update filesystem metadata: %w", err)
+	}
+	if h.uploadStaging != nil {
+		now := time.Now().UTC()
+		if err := h.uploadStaging.UpsertSession(UploadSessionRecord{
+			UploadID:       uploadID,
+			OrgID:          token.OrgID,
+			RepoID:         token.RepoID,
+			UserID:         token.UserID,
+			TokenID:        token.Token,
+			ParentDir:      parentDir,
+			Filename:       filename,
+			ActualFilename: actualFilename,
+			CommitID:       commitID,
+			TotalSize:      totalSize,
+			State:          UploadSessionStatePromoting,
+			CreatedAt:      upload.CreatedAt.UTC(),
+			UpdatedAt:      now,
+			ExpiresAt:      now.Add(chunkDiskTTL),
+		}); err != nil {
+			return finalizeUploadResult{}, fmt.Errorf("failed to persist prepared upload state: %w", err)
+		}
 	}
 	if err := h.publishPreparedUpload(token.OrgID, token.RepoID, uploadID, preparedUploadCommit{
 		CommitID:       commitID,
