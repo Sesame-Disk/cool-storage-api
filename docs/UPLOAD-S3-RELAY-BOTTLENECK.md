@@ -118,7 +118,7 @@ For a 1 GB file on a typical deployment:
 
 ## Proposed solutions
 
-Three options. They are not mutually exclusive — Option B is the right long-term destination; Option A is a fast incremental win that is worth shipping anyway; Option C is a UX-only mitigation usable behind either.
+Two options. They are complementary: Option A is the structural fix; Option B is a UX mitigation that pairs with it.
 
 ### Option A — Pipelined finalize (incremental, in-place)
 
@@ -139,29 +139,7 @@ Resumable.js sends chunks in order most of the time. As soon as a contiguous pre
 - Out-of-order delivery (rare with Resumable.js but possible). The prefix watcher must handle gaps cleanly; in those cases the block stays unflushed until the gap fills.
 - An upload that aborts mid-flight may leave **flushed but uncommitted** blocks in S3. These are GC-reachable today via the existing block-GC path, but the test suite must verify it.
 
-### Option B — Direct-to-S3 with presigned PUTs (architectural)
-
-**Idea:** the browser uploads each 8 MB block **directly to S3** using a short-lived presigned URL. The API never sees the bytes. After all blocks PUT successfully, the FE calls a thin `register-blocks` endpoint and the API does only metadata (mappings + commit).
-
-**New endpoints:**
-- `POST /api/v2.1/repos/:id/upload/init` → returns `{upload_id, presigned_blocks: [{index, sha256, url, expires}], block_size}`. The FE has already hashed each block (or will hash on the fly) and submits desired SHA-256 IDs; server returns a presigned PUT to `s3://.../{org}/{block_sha256}` for each.
-- `POST /api/v2.1/repos/:id/upload/complete` → `{upload_id, parent_dir, filename, blocks: [{index, sha1, sha256, size}]}`. The server verifies each block exists in S3 (`HeadObject`), writes mappings + fs_object + commit.
-- (Optional) `POST /api/v2.1/repos/:id/upload/abort` for cleanup if the FE bails out.
-
-**Wall-clock effect:** total time = `max(client→S3 upload bandwidth, max-block-PUT)`. For a typical home/office connection where the user has more bandwidth to S3 than they do to the API pod, this is faster than today's path; for everyone it eliminates the post-100% hang because S3 latency is reflected in the progress bar itself.
-
-**Other benefits:**
-- API pods become near-stateless on the upload path (no temp-disk pressure).
-- Capacity scales with S3, not with how many API replicas you can run.
-- Encryption: client-side encryption is a clean fit here. Server-side encryption is still possible but requires either a worker that processes blocks asynchronously after PUT (re-uploads a transformed block; doubles bandwidth) or KMS/SSE-S3 (no transformation needed).
-
-**Risks / things to verify:**
-- Encrypted libraries: we need to decide between client-side encryption (fileKey leaves the server in the clear-text request) or SSE-KMS. Today the server holds the key and applies AES-CBC; that has to be redesigned, not just lifted-and-shifted.
-- Quota enforcement: the **pre-check** still works (we know the file size at `init`). The **post-write** counter increment moves to the `complete` step.
-- Block deduplication: today the server checks `Exists` before PUT and skips. With presigned URLs, the FE can be told `skip: true` for blocks the server already knows about, after a `HEAD` lookup at `init` time.
-- Permission model: presigned URLs leak S3 access for the lifetime of the URL; expiry must be tight (e.g. 15 min) and scoped to the exact block key.
-
-### Option C — Honest progress UI (cosmetic)
+### Option B — Honest progress UI (cosmetic)
 
 **Idea:** even without changing the data plane, give the FE a way to show what the server is doing during the hang.
 
@@ -175,9 +153,10 @@ This does **not** make uploads faster. It just stops users from thinking the app
 
 ## Recommendation
 
-1. **Ship Option A before prod.** It is local to `seafhttp.go` + `ChunkUpload`. Halves perceived wait. No FE changes. No new endpoints. Encrypted libraries unaffected.
-2. **Ship Option C alongside it.** Cheap UX win, makes the residual S3 wait honest.
-3. **Plan Option B for v1.1.** It changes the FE upload component and the encryption story. Don't gate launch on it, but commit to it; it's the only path that actually scales past one API pod's egress.
+1. **Ship Option A before prod.** It is local to `seafhttp.go` + `ChunkUpload`. Halves perceived wait. No FE changes. No new endpoints. Encrypted libraries unaffected. Works against any object-store backend (S3, GCS, Azure, MinIO, on-prem) — no backend lock-in.
+2. **Ship Option B alongside it.** Cheap UX win, makes the residual S3 wait honest while the structural fix is rolling out.
+
+The longer-term scaling concern — that every byte traverses the API pod twice — is real, but the answer to it should remain **backend-agnostic**. Anything that solves it (e.g. per-region API workers closer to storage, parallel egress connections, better block-store interfaces) must keep working across our pluggable `ObjectStore`/`BlockStore` implementations. Solutions that couple us to a single cloud provider are out of scope.
 
 ---
 
@@ -232,7 +211,7 @@ These do not change with the fix; they exist to guard against breaking correctne
 - `TestChunkUploadAccountBlockOnceSurvivesFinalizeRetry` (line 1303) — finalize retry idempotence.
 - `TestChunkJanitor_*` (lines 85–214) — temp-file cleanup.
 
-#### New — required for either Option A or Option B
+#### New — required for Option A
 
 1. **`TestUpload_BlockBoundary_Sizes`** (unit) — file sizes `{1, uploadBlockSize-1, uploadBlockSize, uploadBlockSize+1, 8*uploadBlockSize, 8*uploadBlockSize+1}`. Round-trip in encrypted and unencrypted libraries. Verify exact byte equality on download. Catches off-by-one when prefix flushing crosses boundaries.
 2. **`TestUpload_OutOfOrderChunks`** (unit, then integration) — issue chunks in order `[2,0,1,3]` with the integration HTTP client. Verify the resulting file matches the source. Today's code handles this; Option A's prefix-watcher must not regress it.
@@ -247,16 +226,15 @@ These do not change with the fix; they exist to guard against breaking correctne
 
 1. **`TestPipelinedFinalize_FlushesBeforeLastChunk`** (unit) — counting `mockObjectStore`. Send all chunks except the last. Assert `PutCount == numBlocks - 1` (the prefix has been flushed; only the trailing block waits for the final chunk and the metadata commit).
 2. **`TestPipelinedFinalize_OutOfOrderHoldsPrefix`** — send chunks `[2,3,0,1]`. After chunk 2 arrives, no flush is allowed (no contiguous prefix). After 0 arrives, blocks 0 may flush. After 1 arrives, blocks 1, 2, 3 all flush in order. Assert ordering.
-3. **`TestPipelinedFinalize_BenchmarkLatency`** (integration, optional `-bench`) — measures end-to-end latency for a 256 MB upload with a configurable artificial S3 delay. Property: `total ≤ 1.2 × max(ingress_time, egress_time)`. Acts as a regression guardrail against future code that sneaks sequential work back in.
+3. **`TestPipelinedFinalize_BenchmarkLatency`** (integration, optional `-bench`) — measures end-to-end latency for a 256 MB upload with a configurable artificial backend delay. Property: `total ≤ 1.2 × max(ingress_time, egress_time)`. Acts as a regression guardrail against future code that sneaks sequential work back in.
 
-#### Option B (direct-to-S3 presigned PUTs)
+#### Block splitter determinism (Phase 1; Phase 1.5 if it ships)
 
-1. **`TestPresignedUpload_InitReturnsValidURLs`** — `POST /upload/init`, parse JSON, do a literal `HEAD` against each presigned URL (expecting 403 for "object doesn't exist yet" but reachable). Validates URL format, expiry, scoping.
-2. **`TestPresignedUpload_CompleteRequiresAllBlocks`** — call `complete` with one block missing in S3. Must return 409 / 422, not 200.
-3. **`TestPresignedUpload_ConcurrentClientPUTs`** — actually drive S3 with 8 parallel block PUTs from the test client; call `complete`; download → byte-equal.
-4. **`TestPresignedUpload_AbortCleansUp`** — `init`, PUT some blocks, call `abort`. Assert the (orphaned) blocks are GC-eligible (the existing GC suite — `gc_flow_regression_test.go`, `gc_integration_test.go` — should pick them up; add an assertion that they do).
-5. **`TestPresignedUpload_QuotaPreCheck`** — `init` for a file that exceeds quota must 403 *before* any presigned URLs are issued.
-6. **`TestPresignedUpload_EncryptedLibrary`** — server returns SSE-KMS or client-encryption metadata in the `init` response (TBD in the design); test verifies the chosen path.
+These guard the dedup-preserving property the design depends on.
+
+1. **`TestBlockSplitter_FixedSize_Deterministic`** (unit, Phase 1) — `FixedSizeSplitter{8 MB}` on the same input bytes always produces the same boundaries and SHA-256 IDs. Trivial today but necessary to lock the invariant.
+2. **`TestBlockSplitter_FastCDC_DeterministicAcrossInputs`** (unit, Phase 1.5 only) — same content fed in two passes through a `FastCDCSplitter{2,8,32 MB}` produces **identical** SHA-256 ID lists. Exists to prevent any future variant (e.g. a revived `NewFastCDCFromSpeed`) from regressing the determinism property.
+3. **`TestUpload_DedupAcrossDifferentClients`** (integration, Phase 1+) — upload the same 64 MB file twice from two different clients (different IPs, different sessions). Assert `ref_count` on the resulting blocks is **2**. Catches any regression where transport details leak into storage block identity.
 
 ### D. How to run
 
@@ -282,24 +260,99 @@ The new tests follow the existing patterns:
 
 ## Decision matrix
 
-| | Option A (pipelined) | Option B (presigned) | Option C (UX) |
-|---|---|---|---|
-| **Eliminates the post-100% hang** | Mostly (down to a small tail) | Yes | No |
-| **Removes API pod as bandwidth bottleneck** | No | Yes | No |
-| **Removes temp-disk requirement** | No | Yes | No |
-| **FE changes required** | None | Yes (significant) | Small |
-| **Encryption design changes** | None | Yes (key handling) | None |
-| **Code surface** | `seafhttp.go` only | New endpoints + FE component | One small status endpoint |
-| **Time to ship (rough)** | days | weeks | hours |
-| **Recommended for v1.0 launch?** | **Yes** | No (v1.1) | Yes (alongside A) |
+| | Option A (pipelined) | Option B (UX) |
+|---|---|---|
+| **Eliminates the post-100% hang** | Mostly (down to a small tail) | No |
+| **Removes API pod as bandwidth bottleneck** | No | No |
+| **Removes temp-disk requirement** | No | No |
+| **FE changes required** | None | Small |
+| **Encryption design changes** | None | None |
+| **Backend lock-in (S3 / GCS / Azure / on-prem)** | None | None |
+| **Code surface** | `seafhttp.go` only | One small status endpoint |
+| **Time to ship (rough)** | days | hours |
+| **Recommended for v1.0 launch?** | **Yes** | Yes (alongside A) |
 
 ---
 
 ## Open questions
 
-- What is the deployed pod's measured egress bandwidth to S3? If it's already saturated by 8-way `PutBlockAuto`, Option A's gain is closer to ~30 % than 50 %. We should measure with `benchmark-upload-download.sh` (`docs/benchmarks/`) before/after to set realistic expectations.
+- What is the deployed pod's measured egress bandwidth to the object store? If it's already saturated by 8-way `PutBlockAuto`, Option A's gain is closer to ~30 % than 50 %. We should measure with `benchmark-upload-download.sh` (`docs/benchmarks/`) before/after to set realistic expectations.
 - Does the FE bootstrap actually set `appPageOptions.resumableSimultaneousUploads`? If not, the default is **1** (`frontend/src/utils/constants.js:65`), in which case ingress is fully serialized and the upload phase is itself slower than it needs to be — independent of Option A. Worth checking and bumping to 4–8.
-- For Option B, is client-side encryption acceptable to the security model? If not, the encryption story constrains the design: SSE-KMS in S3, or a server-side post-PUT transform worker.
+- The longer-term scaling concern (API pod as bandwidth funnel) is real but needs a backend-agnostic answer. Candidate directions worth exploring: per-region API workers co-located with their object store, more aggressive parallelism in `finalizeUploadConcurrency`, or making the `BlockStore` interface streaming-aware so it can multiplex more PUTs over a single connection. Concrete proposal pending benchmark numbers.
+
+---
+
+## Adaptive chunking — designed but not wired
+
+There is a complete adaptive-chunking implementation in `internal/chunker/adaptive.go` that **no production code path calls**. Before the roadmap, this needs to be made visible because it changes how Phase 1 (`blocksink.StreamFile`) should be designed.
+
+### What's there today
+
+`internal/chunker/adaptive.go` (281 lines) provides:
+
+- `SpeedProbe.Probe(ctx, w)` — writes a 1 MB probe payload (configurable, `cfg.ProbeSize`) and times it; stores `bytesPerSecond`. Honors `ProbeTimeout` (30s default).
+- `AdaptiveChunker` — converts measured speed to a target chunk size with `optimalSize = bytesPerSecond * targetSeconds`, clamped to `[AbsoluteMin=2 MB, AbsoluteMax=256 MB]` around an `InitialSize=16 MB`. Default target is **8 seconds per chunk**.
+- `AdjustOnTimeout(factor)` — halves chunk size on timeout (default factor 0.5), with floor enforcement.
+- `AdjustOnSuccess(actualDuration, factor)` — grows chunk size by 25 % (default) when the upload completed faster than the target.
+- `GetChunkSizes()` returns `min = avg/4, max = avg*4` for FastCDC's variable-boundary mode.
+- `NewFastCDCFromSpeed()` builds a FastCDC chunker from current speed.
+- `RecommendedChunkSize(bytesPerSecond, targetSeconds)` and `SpeedCategory(bps)` for diagnostics.
+
+Configuration scaffolding is in `internal/config/config.go:580-612`:
+
+```go
+type ChunkingConfig struct {
+    Algorithm     string         `yaml:"algorithm"`      // fastcdc
+    HashAlgorithm string         `yaml:"hash_algorithm"` // sha256
+    Adaptive      AdaptiveConfig `yaml:"adaptive"`
+    Probe         ProbeConfig    `yaml:"probe"`
+    Retry         RetryConfig    `yaml:"retry"`          // ChunkTimeout, MaxRetries, ReduceOnTimeout, ReduceOnFailure, BackoffBase, BackoffMaxJitter
+}
+
+type AdaptiveConfig struct {
+    Enabled       bool  `yaml:"enabled"`
+    AbsoluteMin   int64 `yaml:"absolute_min"`   // 2 MB floor
+    AbsoluteMax   int64 `yaml:"absolute_max"`   // 256 MB ceiling
+    InitialSize   int64 `yaml:"initial_size"`   // 16 MB starting point
+    TargetSeconds int   `yaml:"target_seconds"` // 8s default
+}
+```
+
+### What's actually used today
+
+A grep for `chunker.` outside the chunker package:
+
+```
+internal/storage/blocks.go:75   (uses chunker.Block as a struct type only)
+internal/storage/blocks.go:221  (uses chunker.Block as a struct type only)
+```
+
+That's it. No upload handler instantiates `AdaptiveChunker` or `SpeedProbe`. The current upload-path block size comes from two **fixed** constants in unrelated files:
+
+- Server: `seafhttp.go:936` — `const uploadBlockSize = 8 * 1024 * 1024` (used both for the temp-file read loop and as the storage block boundary).
+- FE: `bootstrap.go:462` and `sharelink_view.go:{201,413}` bootstrap `resumableUploadFileBlockSize: h.config.WebUploads.ResumableChunkSizeMB`, which defaults to **8** in `config.go:697`. Static, server-wide.
+
+So `Adaptive.Enabled` does nothing today regardless of how it's set in YAML. The `Retry` block (chunk timeouts, max retries, exponential backoff) is similarly inert.
+
+### Why adaptive wire-size doesn't earn its keep on its own
+
+It's tempting to plumb the speed probe into the FE so chunks shrink on slow links and grow on fast ones. But adaptive **wire** chunking only matters if it changes how bytes are *stored* — and we're committing to fixed-size storage blocks for v1. Re-cutting variable-size wire chunks back into fixed 8 MB blocks at the temp file is just bookkeeping; the user-perceived metrics (total upload time, retry surface, dedup) are governed almost entirely by the storage-block size and the egress pipelining (Option A), not by the wire chunk size.
+
+The two axes are coupled, not independent:
+
+| Storage block size | Sensible wire chunk size | Adaptive wire chunking pays off? |
+|---|---|---|
+| Fixed (today, and Phase 1) | **Same as the storage block** — one number, one concept. | **No.** A probe to pick a size that gets re-cut server-side is theatre. |
+| Variable (FastCDC, Phase 1.5) | Pure transport, decoupled from storage boundaries. Server runs FastCDC over the reassembled stream. | **Maybe.** This is the only configuration where wire size has independent meaning, and only here can the speed probe earn its complexity. |
+
+We're choosing fixed-size storage blocks for v1. So the right move is to **delete the wire/storage distinction from the v1 design** and align both at one number (8 MB today, configurable per deploy). The `AdaptiveChunker` and `SpeedProbe` code stays in `internal/chunker/` as reference for the FastCDC future, but is not wired in.
+
+### What this means for the roadmap
+
+- Phase 1 (`blocksink.StreamFile`) takes a single `BlockSize` (or, equivalently, a `BlockSplitter` whose only v1 implementation is `FixedSizeSplitter{8 MB}`). No probe, no adaptive policy.
+- Phase 1.5 (FastCDC, opt-in) is the **only** phase that re-introduces a wire-vs-storage distinction, and **if and only if** that phase actually ships does the adaptive-probe question come back on the table.
+- The "Phase 4.5: plumb adaptive wire-chunk into the FE" item is removed — it solves a problem we don't have.
+- `chunker.NewFastCDCFromSpeed` is dead by construction (it conflates the axes); when Phase 1.5 ships, it should be deleted along with it. The static-FastCDC implementation lives next to it instead.
 
 ---
 
@@ -344,7 +397,7 @@ Five copies of "compute hashes and store". Three copies of "compute hashes, encr
 
 ### Convergence roadmap
 
-The goal: every upload endpoint becomes a thin adapter over **one** internal pipeline. That pipeline has the chunked-finalize behaviour (Option A) for free, and is what Option B's presigned-PUT path also feeds into. We need to get there in stages because the four clients have different release cadences and we cannot break sync clients in the field.
+The goal: every upload endpoint becomes a thin adapter over **one** internal pipeline. That pipeline has the chunked-finalize behaviour (Option A) for free, and stays backend-agnostic — no S3-only features anywhere. We need to get there in stages because the four clients have different release cadences and we cannot break sync clients in the field.
 
 #### Phase 0 — Lock in current behaviour with characterization tests *(week of launch, parallel with Option A)*
 
@@ -361,7 +414,7 @@ Tests live next to `upload_download_test.go`, named `TestEndpoint{1..5}_*`. No p
 
 #### Phase 1 — Extract the block-storage primitive *(post-launch, ~1 sprint)*
 
-Add a single internal function:
+Add a single internal function. Critically, the primitive takes a **`BlockSplitter`** rather than a fixed `BlockSize` int — that's the one shape change we make so the wire-vs-storage distinction is structurally honoured from day one.
 
 ```go
 // internal/storage/blocksink/sink.go (new package)
@@ -372,20 +425,37 @@ type BlockResult struct {
     TotalBytes int64     // plaintext total
 }
 
+// BlockSplitter decides where a block ends. Implementations must be
+// content-deterministic: the same input bytes must always produce the
+// same boundaries (otherwise SHA-256 dedup breaks across uploads).
+type BlockSplitter interface {
+    NextBoundary(buf []byte, isFinal bool) int
+}
+
 type Options struct {
-    BlockSize        int                  // typically 8 MB
-    Concurrency      int                  // typically 8
-    EncryptKey, IV   []byte               // nil = no encryption
-    Store            storage.BlockStore   // backend
-    OnBlock          func(BlockResult, blockIdx int) error  // hook for mapping/metadata writes
+    Splitter       BlockSplitter        // FixedSize{8 MB} today; FastCDC{min,avg,max} later
+    Concurrency    int                  // typically 8
+    EncryptKey, IV []byte               // nil = no encryption
+    Store          storage.BlockStore   // backend
+    OnBlock        func(BlockResult, blockIdx int) error  // hook for mapping/metadata
 }
 
 func StreamFile(ctx context.Context, r io.Reader, opt Options) (BlockResult, error)
 ```
 
-Behaviour: read `r` in `BlockSize` chunks, hash → optional encrypt → hash → PUT, parallel up to `Concurrency`. The current `finalizeUploadStreaming` body becomes a 10-line caller.
+Phase 1 ships only the `FixedSizeSplitter{8 MB}` implementation (matching today's behaviour). The interface is in place so Phase 1.5 can swap it without touching call sites.
 
-**Exit criteria:** endpoint #1 (chunked branch) calls `blocksink.StreamFile`. Characterization tests still green. Code in `seafhttp.go:1242-1397` is replaced by the call.
+**Exit criteria:** endpoint #1 (chunked branch) calls `blocksink.StreamFile` with `FixedSizeSplitter`. Characterization tests still green. Code in `seafhttp.go:1242-1397` is replaced by the call. **No** speed-probe coupling at this layer.
+
+#### Phase 1.5 — FastCDC-at-fixed-parameters as the storage splitter *(optional, ~½ sprint)*
+
+Add `FastCDCSplitter{min, avg, max}` as a second `BlockSplitter` implementation. The parameters are **per-repository constants** — read once when the repo is created (or migrated) and stored in `libraries`, never varied by upload speed. Switching a repo from fixed-size to FastCDC is a one-way migration; existing blocks stay valid because they're keyed by SHA-256.
+
+This is the **only place** content-defined chunking is allowed to influence storage. It buys better dedup across small edits to large files (the canonical FastCDC win) without breaking dedup across uploads of the same file from different connections.
+
+**Exit criteria:** a feature-flagged repo can use FastCDC blocks; old repos continue using fixed-size; both go through the same primitive. `chunker.NewFastCDCFromSpeed` is **deleted** (it conflates the two axes). Adaptive-config defaults stay backward-compatible.
+
+> Phase 1.5 is optional for the convergence story — Phase 1 alone gives us the unified pipeline. We list it here to make sure the right `BlockSplitter` interface ships in Phase 1 so we don't have to refactor again to add it.
 
 #### Phase 2 — Extract the metadata-commit primitive *(~1 sprint)*
 
@@ -430,22 +500,12 @@ After this phase, all five paths read bytes through the same primitive and store
 
 **Exit criteria:** sync client integration tests (existing) still green. The dual-write SHA-1↔SHA-256 logic lives in a single file, called from one place per endpoint.
 
-#### Phase 5 — Direct-to-S3 (Option B) reuses the same pipeline *(~2 sprints)*
+#### Phase 5 — Sunset legacy paths *(when traffic on them is < 1 %)*
 
-The new `POST /api/v2.1/repos/:id/upload/init` and `POST /api/v2.1/repos/:id/upload/complete` endpoints (Option B above) are introduced.
+Once telemetry shows the bulk of upload bytes flowing through the chunked + pipelined path, the legacy endpoints can be deprecated:
 
-- `init` returns presigned PUT URLs scoped to `s3://blocks/{org}/{sha256}` keys. The FE PUTs blocks directly; the API never sees the bytes during the data plane.
-- `complete` calls `blocksink.VerifyAndRegister(...)` — a third entry point that **does not** read body bytes, but does the same `OnBlock` callback for mapping/metadata, then hands off to `uploadcommit.Commit`.
-- The web FE switches its uploader target from `/seafhttp/upload-api/...` to the new init/complete pair. Sync clients continue using path (4); REST clients have a choice between (5) and the new presigned flow.
-
-**Exit criteria:** web UI uses presigned PUTs by default. Old `/seafhttp/upload-api/:token` route remains, but is hit only by older clients and share links (which can migrate next).
-
-#### Phase 6 — Sunset legacy paths *(when traffic on them is < 1 %)*
-
-Once telemetry shows the bulk of upload bytes flowing through the presigned path, the legacy endpoints can be deprecated:
-
-- Endpoint **#2** (non-chunked branch of `HandleUpload`) is deleted outright; its code path is dead once the FE no longer falls back to it.
-- Endpoint **#3** (`UploadFile`) is kept only as an automation/legacy escape hatch behind a feature flag, with a `Deprecation` response header.
+- Endpoint **#2** (non-chunked branch of `HandleUpload`) is deleted outright; its code path is redundant once every client is sending `Content-Range`. A small Gin middleware can short-circuit any `Content-Range`-less request with a 400 and a clear error.
+- Endpoint **#3** (`UploadFile`) is kept only as an automation/legacy escape hatch behind a feature flag, with a `Deprecation` response header. Its body now goes through `blocksink.StreamFile` (from Phase 3), so it is no longer a performance liability — it is just an extra surface area to maintain.
 - Endpoints **#4** and **#5** stay — they are different by design (sync protocol contract; raw block REST), but they share implementation through `blocksink`.
 
 ### Roadmap-at-a-glance
@@ -454,11 +514,11 @@ Once telemetry shows the bulk of upload bytes flowing through the presigned path
 |---|---|---|---|---|
 | 0 | Add characterization tests | all 5 (tests only) | low | **yes** |
 |   | Ship Option A (pipelined finalize) | #1 | medium | **yes** |
-| 1 | Extract `blocksink.StreamFile` | #1 (refactor) | low | no |
+| 1 | Extract `blocksink.StreamFile` with `BlockSplitter` interface | #1 (refactor) | low | no |
+| 1.5 | Add `FastCDCSplitter` (fixed params, per-repo) — optional | #1 (opt-in feature flag) | low | no |
 | 2 | Extract `uploadcommit.Commit`; batch Cassandra | #1 (refactor) | low | no |
 | 3 | Migrate #2 and #3 onto the pipeline | #2, #3 | medium (dedup behaviour changes) | no |
 | 4 | Migrate #4 and #5 onto a single-block adapter | #4, #5 | medium (sync clients in field) | no |
-| 5 | Add presigned init/complete (Option B); FE migrates | new endpoint, FE | high | no |
-| 6 | Delete dead branches; deprecate `UploadFile` | #2, #3 | low | no |
+| 5 | Delete dead branches; deprecate `UploadFile` | #2, #3 | low | no |
 
-The end state: one `blocksink` primitive, one `uploadcommit` primitive, five thin handlers (or four — #2 disappears in Phase 6) that each do auth/quota/permission plumbing and then call into the shared pipeline. Performance characteristics of the chunked-finalize fix (Option A) become a property of every upload endpoint, not just the web UI's.
+The end state: one `blocksink` primitive (with a pluggable `BlockSplitter`), one `uploadcommit` primitive, four thin handlers (#2 disappears in Phase 5) that each do auth/quota/permission plumbing and then call into the shared pipeline. Wire chunk size and storage block size are aligned at one number — no probes, no adaptive resize, no extra endpoints. If Phase 1.5 (FastCDC) ever ships, the wire-vs-storage distinction returns and the dormant `AdaptiveChunker` code can be reconsidered. The pipeline stays backend-agnostic — it depends only on the `BlockStore` interface, which any object store (S3, GCS, Azure Blob, MinIO, on-prem) can implement. Performance characteristics of the chunked-finalize fix (Option A) become a property of every upload endpoint, not just the web UI's.
