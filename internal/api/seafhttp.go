@@ -34,7 +34,9 @@ import (
 	"github.com/Sesame-Disk/sesamefs/internal/storage"
 	"github.com/Sesame-Disk/sesamefs/internal/streaming"
 	"github.com/Sesame-Disk/sesamefs/internal/traffic"
+	gocql "github.com/apache/cassandra-gocql-driver/v2"
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -760,17 +762,21 @@ func parseContentRange(header string) (int64, int64, int64, bool) {
 
 // SeafHTTPHandler handles Seafile-compatible file operations
 type SeafHTTPHandler struct {
-	storage         *storage.S3Store
-	storageManager  *storage.Manager
-	db              *db.DB
-	tokenStore      TokenStore
-	config          *config.Config
-	permMiddleware  *middleware.PermissionMiddleware
-	uploadStaging   UploadStagingStore
-	chunkedFinalize chunkedFinalizeFunc
-	zipMaxEntries   int
-	zipMaxDepth     int
-	zipMaxBytes     int64
+	storage              *storage.S3Store
+	storageManager       *storage.Manager
+	db                   *db.DB
+	tokenStore           TokenStore
+	config               *config.Config
+	permMiddleware       *middleware.PermissionMiddleware
+	uploadStaging        UploadStagingStore
+	uploadOrphanRecorder uploadOrphanRecorderFunc
+	blockPromoter        uploadBlockPromoterFunc
+	blockRollback        uploadBlockRollbackFunc
+	commitPublisher      uploadCommitPublisherFunc
+	chunkedFinalize      chunkedFinalizeFunc
+	zipMaxEntries        int
+	zipMaxDepth          int
+	zipMaxBytes          int64
 }
 
 type finalizeUploadResult struct {
@@ -779,7 +785,29 @@ type finalizeUploadResult struct {
 	CommitID       string
 }
 
+type preparedUploadCommit struct {
+	CommitID       string
+	ActualFilename string
+}
+
+type uploadBlockPromotion struct {
+	BlockIndex   int
+	BlockSHA1    string
+	BlockSHA256  string
+	SizeBytes    int
+	StorageClass string
+	StorageKey   string
+	Source       UploadBlockSource
+	CreatedAt    time.Time
+	UploadedAt   *time.Time
+}
+
 type chunkedFinalizeFunc func(c *gin.Context, token *AccessToken, upload *ChunkUpload, uploadID, parentDir, filename, storageKey string, totalSize int64, replace bool) (finalizeUploadResult, error)
+
+type uploadOrphanRecorderFunc func(orgID, blockID, storageClass, errMsg string) error
+type uploadBlockPromoterFunc func(orgID, blockID string, sizeBytes int, storageClass, storageKey string) error
+type uploadBlockRollbackFunc func(orgID, operationKey string, blockIDs []string) []string
+type uploadCommitPublisherFunc func(orgID, repoID, commitID string) error
 
 const (
 	defaultZipMaxEntries = 100000
@@ -845,11 +873,25 @@ func NewSeafHTTPHandler(s3Store *storage.S3Store, storageManager *storage.Manage
 		zipMaxBytes:    defaultZipMaxBytes,
 	}
 	handler.chunkedFinalize = handler.finalizeUploadStreaming
+	handler.uploadOrphanRecorder = handler.recordUploadS3OrphanRow
+	handler.blockPromoter = func(orgID, blockID string, sizeBytes int, storageClass, storageKey string) error {
+		return v2.NewFSHelper(handler.db).IncrementOrCreateBlock(orgID, blockID, sizeBytes, storageClass, storageKey)
+	}
+	handler.blockRollback = func(orgID, operationKey string, blockIDs []string) []string {
+		return v2.NewFSHelper(handler.db).DecrementBlockRefCountsOnce(orgID, operationKey, blockIDs)
+	}
+	handler.commitPublisher = func(orgID, repoID, commitID string) error {
+		return v2.NewFSHelper(handler.db).UpdateLibraryHead(orgID, repoID, commitID)
+	}
 	return handler
 }
 
 func (h *SeafHTTPHandler) SetUploadStagingStore(store UploadStagingStore) {
 	h.uploadStaging = store
+}
+
+func (h *SeafHTTPHandler) SetUploadOrphanRecorder(recorder uploadOrphanRecorderFunc) {
+	h.uploadOrphanRecorder = recorder
 }
 
 func shortLogID(id string) string {
@@ -866,6 +908,116 @@ func (h *SeafHTTPHandler) persistUploadBlockState(record UploadSessionBlockRecor
 	if err := h.uploadStaging.UpsertBlock(record); err != nil {
 		log.Printf("[finalizeUploadStreaming] WARNING: Failed to persist staging block state=%s upload=%s index=%d sha256=%s: %v", stateLabel, shortLogID(record.UploadID), record.BlockIndex, shortLogID(record.BlockSHA256), err)
 	}
+}
+
+func (h *SeafHTTPHandler) persistUploadS3Orphan(orgID, blockID, storageClass, errMsg string) {
+	if h == nil || h.uploadOrphanRecorder == nil || strings.TrimSpace(blockID) == "" {
+		return
+	}
+	if err := h.uploadOrphanRecorder(orgID, blockID, storageClass, errMsg); err != nil {
+		log.Printf("[HandleUpload] WARNING: Failed to record pending S3 orphan org=%s block=%s: %v", orgID, shortLogID(blockID), err)
+	}
+}
+
+func (h *SeafHTTPHandler) recordUploadS3OrphanRow(orgID, blockID, storageClass, errMsg string) error {
+	if h == nil || h.db == nil {
+		return nil
+	}
+	parsedOrgID, err := uuid.Parse(strings.TrimSpace(orgID))
+	if err != nil {
+		return fmt.Errorf("parse org id for S3 orphan: %w", err)
+	}
+	if storageClass == "" {
+		storageClass = "hot"
+	}
+	now := time.Now().UTC()
+	initialRetryCount := 0
+	if errMsg != "" {
+		initialRetryCount = 1
+	}
+	applied, err := h.db.Session().Query(`
+		INSERT INTO gc_s3_orphans (org_id, block_id, storage_class, first_seen_at, last_attempt_at, retry_count, last_error)
+		VALUES (?, ?, ?, ?, ?, ?, ?) IF NOT EXISTS
+	`, parsedOrgID, blockID, storageClass, now, now, initialRetryCount, errMsg).ScanCAS(nil, nil, nil, nil, nil, nil, nil)
+	if err != nil {
+		return fmt.Errorf("record S3 orphan: %w", err)
+	}
+	if applied || errMsg == "" {
+		return nil
+	}
+	var prev int
+	err = h.db.Session().Query(`
+		SELECT retry_count FROM gc_s3_orphans WHERE org_id = ? AND block_id = ?
+	`, parsedOrgID, blockID).Scan(&prev)
+	if err != nil && !errors.Is(err, gocql.ErrNotFound) {
+		return fmt.Errorf("read prior S3 orphan retry count: %w", err)
+	}
+	return h.db.Session().Query(`
+		UPDATE gc_s3_orphans
+		SET last_attempt_at = ?, retry_count = ?, last_error = ?
+		WHERE org_id = ? AND block_id = ?
+	`, now, prev+1, errMsg, parsedOrgID, blockID).Exec()
+}
+
+func (h *SeafHTTPHandler) rollbackPromotedUploadBlocks(orgID, uploadID, commitID string, blockIDs []string) {
+	if h == nil || h.blockRollback == nil || len(blockIDs) == 0 {
+		return
+	}
+	operationKey := fmt.Sprintf("upload-rollback:%s:%s", uploadID, commitID)
+	zeroRefBlocks := h.blockRollback(orgID, operationKey, blockIDs)
+	if len(zeroRefBlocks) > 0 {
+		log.Printf("[publishPreparedUpload] Rolled back %d promoted blocks to zero refs for upload=%s commit=%s", len(zeroRefBlocks), shortLogID(uploadID), shortLogID(commitID))
+	}
+}
+
+func (h *SeafHTTPHandler) publishPreparedUpload(orgID, repoID, uploadID string, prepared preparedUploadCommit, blocks []uploadBlockPromotion) error {
+	if h == nil {
+		return fmt.Errorf("upload handler is required")
+	}
+	if prepared.CommitID == "" {
+		return fmt.Errorf("prepared commit id is required")
+	}
+	if h.blockPromoter == nil {
+		return fmt.Errorf("block promoter is not configured")
+	}
+	if h.commitPublisher == nil {
+		return fmt.Errorf("commit publisher is not configured")
+	}
+
+	promotedBlockIDs := make([]string, 0, len(blocks))
+	for _, block := range blocks {
+		if err := h.blockPromoter(orgID, block.BlockSHA256, block.SizeBytes, block.StorageClass, block.StorageKey); err != nil {
+			h.rollbackPromotedUploadBlocks(orgID, uploadID, prepared.CommitID, promotedBlockIDs)
+			return fmt.Errorf("failed to write block metadata for block %d: %w", block.BlockIndex, err)
+		}
+		promotedBlockIDs = append(promotedBlockIDs, block.BlockSHA256)
+		if h.uploadStaging != nil {
+			promotedAt := time.Now().UTC()
+			h.persistUploadBlockState(UploadSessionBlockRecord{
+				UploadID:     uploadID,
+				BlockIndex:   block.BlockIndex,
+				OrgID:        orgID,
+				BlockSHA1:    block.BlockSHA1,
+				BlockSHA256:  block.BlockSHA256,
+				SizeBytes:    block.SizeBytes,
+				StorageClass: block.StorageClass,
+				StorageKey:   block.StorageKey,
+				Source:       block.Source,
+				State:        UploadBlockStatePromoted,
+				CreatedAt:    block.CreatedAt,
+				UpdatedAt:    promotedAt,
+				UploadedAt:   block.UploadedAt,
+				PromotedAt:   &promotedAt,
+			}, string(UploadBlockStatePromoted))
+		}
+	}
+
+	if err := h.commitPublisher(orgID, repoID, prepared.CommitID); err != nil {
+		h.rollbackPromotedUploadBlocks(orgID, uploadID, prepared.CommitID, promotedBlockIDs)
+		return fmt.Errorf("failed to publish upload commit: %w", err)
+	}
+
+	return nil
 }
 
 func (h *SeafHTTPHandler) SetZipLimits(maxEntries, maxDepth int, maxBytes int64) {
@@ -1319,6 +1471,7 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 
 	sha256Hash := sha256.Sum256(storedContent)
 	sha256ID := hex.EncodeToString(sha256Hash[:])
+	storedInBlockStore := false
 	if h.uploadStaging != nil {
 		registeredAt := time.Now().UTC()
 		h.persistUploadBlockState(UploadSessionBlockRecord{
@@ -1361,10 +1514,13 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to store block"})
 			return
 		}
+		storedInBlockStore = true
 		log.Printf("[HandleUpload] Stored block %s (SHA-256: %s)", fileID[:16], sha256ID[:16])
 	}
+	var singleShotUploadedAt *time.Time
 	if h.uploadStaging != nil {
 		uploadedAt := time.Now().UTC()
+		singleShotUploadedAt = &uploadedAt
 		h.persistUploadBlockState(UploadSessionBlockRecord{
 			UploadID:     uploadID,
 			BlockIndex:   0,
@@ -1387,6 +1543,9 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 		INSERT INTO block_id_mappings (org_id, external_id, internal_id) VALUES (?, ?, ?)
 	`, token.OrgID, fileID, sha256ID).Exec(); err != nil {
 		log.Printf("[HandleUpload] CRITICAL: Failed to write block_id_mapping org=%s ext=%s int=%s: %v", token.OrgID, fileID[:16], sha256ID[:16], err)
+		if storedInBlockStore {
+			h.persistUploadS3Orphan(token.OrgID, sha256ID, actualStorageClass, err.Error())
+		}
 		markSingleShotCleanup(err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create block mapping"})
 		return
@@ -1397,32 +1556,29 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 		log.Printf("[HandleUpload] WARNING: Failed to write reverse block_id_mapping org=%s int=%s ext=%s: %v", token.OrgID, sha256ID[:16], fileID[:16], err)
 	}
 
-	// Register block metadata for size lookups (used by video/audio Range requests)
-	if err := v2.NewFSHelper(h.db).IncrementOrCreateBlock(token.OrgID, sha256ID, len(storedContent), actualStorageClass, ""); err != nil {
-		log.Printf("[HandleUpload] WARNING: Failed to write block metadata org=%s block=%s: %v", token.OrgID, sha256ID[:16], err)
-	} else if h.uploadStaging != nil {
-		promotedAt := time.Now().UTC()
-		h.persistUploadBlockState(UploadSessionBlockRecord{
-			UploadID:     uploadID,
-			BlockIndex:   0,
-			OrgID:        token.OrgID,
-			BlockSHA1:    fileID,
-			BlockSHA256:  sha256ID,
-			SizeBytes:    len(storedContent),
-			StorageClass: actualStorageClass,
-			StorageKey:   sha256ID,
-			Source:       UploadBlockSourceNewObject,
-			State:        UploadBlockStatePromoted,
-			CreatedAt:    singleShotCreatedAt,
-			UpdatedAt:    promotedAt,
-			PromotedAt:   &promotedAt,
-		}, string(UploadBlockStatePromoted))
-	}
-
-	// Update filesystem metadata
-	commitID, actualFilename, err := h.commitUploadedFile(token.OrgID, token.RepoID, token.UserID, parentDir, filename, fileID, chunkData, finalSize, replaceFile)
+	// Prepare filesystem metadata without publishing the new head yet.
+	commitID, actualFilename, err := h.prepareUploadedFileCommit(token.OrgID, token.RepoID, token.UserID, parentDir, filename, fileID, chunkData, finalSize, replaceFile)
 	if err != nil {
 		log.Printf("[HandleUpload] Failed to update filesystem: %v", err)
+		markSingleShotCleanup(err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "file stored but metadata update failed"})
+		return
+	}
+	if err := h.publishPreparedUpload(token.OrgID, token.RepoID, uploadID, preparedUploadCommit{
+		CommitID:       commitID,
+		ActualFilename: actualFilename,
+	}, []uploadBlockPromotion{{
+		BlockIndex:   0,
+		BlockSHA1:    fileID,
+		BlockSHA256:  sha256ID,
+		SizeBytes:    len(storedContent),
+		StorageClass: actualStorageClass,
+		StorageKey:   sha256ID,
+		Source:       UploadBlockSourceNewObject,
+		CreatedAt:    singleShotCreatedAt,
+		UploadedAt:   singleShotUploadedAt,
+	}}); err != nil {
+		log.Printf("[HandleUpload] Failed to publish filesystem update: %v", err)
 		markSingleShotCleanup(err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "file stored but metadata update failed"})
 		return
@@ -1503,12 +1659,13 @@ func (h *SeafHTTPHandler) finalizeUploadStreaming(c *gin.Context, token *AccessT
 	// stays single-threaded so we don't need to seek; what we parallelise is the
 	// network/IO-bound part that dominates wall-clock time.
 	sha1Hasher := sha1.New()
-	fsHelper := v2.NewFSHelper(h.db)
 
 	eg, egCtx := errgroup.WithContext(ctx)
 	sem := make(chan struct{}, finalizeUploadConcurrency)
 
 	var blockSHA1IDs []string // SHA-1 block IDs for fs_object (Seafile compat) — populated in order
+	var pendingPromotions []uploadBlockPromotion
+	var pendingPromotionsMu sync.Mutex
 
 readLoop:
 	for {
@@ -1584,18 +1741,10 @@ readLoop:
 				}, string(UploadBlockStateRegistered))
 			}
 
-			accounted, accountErr := upload.BlockAlreadyAccounted(blockIndexLocal, sha256ID)
-			if accountErr != nil {
-				return accountErr
-			}
-			if accounted {
-				upload.Touch()
-				return nil
-			}
-
 			if _, putErr := blockStore.PutBlockAuto(egCtx, sha256ID, storedBlock); putErr != nil {
 				return fmt.Errorf("failed to store block: %w", putErr)
 			}
+			storedInBlockStore := true
 			if h.uploadStaging != nil {
 				uploadedAtValue := time.Now().UTC()
 				uploadedAt = &uploadedAtValue
@@ -1621,6 +1770,9 @@ readLoop:
 				INSERT INTO block_id_mappings (org_id, external_id, internal_id) VALUES (?, ?, ?)
 			`, token.OrgID, blockSHA1IDLocal, sha256ID).Exec(); mapErr != nil {
 				log.Printf("[finalizeUploadStreaming] CRITICAL: Failed to write block_id_mapping org=%s ext=%s int=%s: %v", token.OrgID, blockSHA1IDLocal[:16], sha256ID[:16], mapErr)
+				if storedInBlockStore {
+					h.persistUploadS3Orphan(token.OrgID, sha256ID, actualStorageClass, mapErr.Error())
+				}
 				return fmt.Errorf("failed to create block mapping: %w", mapErr)
 			}
 
@@ -1632,29 +1784,19 @@ readLoop:
 				log.Printf("[finalizeUploadStreaming] WARNING: Failed to write reverse block_id_mapping org=%s int=%s ext=%s: %v", token.OrgID, sha256ID[:16], blockSHA1IDLocal[:16], revErr)
 			}
 
-			if blkErr := upload.AccountBlockOnce(blockIndexLocal, sha256ID, func() error {
-				return fsHelper.IncrementOrCreateBlock(token.OrgID, sha256ID, len(storedBlock), actualStorageClass, "")
-			}); blkErr != nil {
-				log.Printf("[finalizeUploadStreaming] WARNING: Failed to write block metadata org=%s block=%s: %v", token.OrgID, sha256ID[:16], blkErr)
-			} else if h.uploadStaging != nil {
-				promotedAt := time.Now().UTC()
-				h.persistUploadBlockState(UploadSessionBlockRecord{
-					UploadID:     uploadID,
-					BlockIndex:   blockIndexLocal,
-					OrgID:        token.OrgID,
-					BlockSHA1:    blockSHA1IDLocal,
-					BlockSHA256:  sha256ID,
-					SizeBytes:    len(storedBlock),
-					StorageClass: actualStorageClass,
-					StorageKey:   sha256ID,
-					Source:       UploadBlockSourceNewObject,
-					State:        UploadBlockStatePromoted,
-					CreatedAt:    upload.CreatedAt.UTC(),
-					UpdatedAt:    promotedAt,
-					UploadedAt:   uploadedAt,
-					PromotedAt:   &promotedAt,
-				}, string(UploadBlockStatePromoted))
-			}
+			pendingPromotionsMu.Lock()
+			pendingPromotions = append(pendingPromotions, uploadBlockPromotion{
+				BlockIndex:   blockIndexLocal,
+				BlockSHA1:    blockSHA1IDLocal,
+				BlockSHA256:  sha256ID,
+				SizeBytes:    len(storedBlock),
+				StorageClass: actualStorageClass,
+				StorageKey:   sha256ID,
+				Source:       UploadBlockSourceNewObject,
+				CreatedAt:    upload.CreatedAt.UTC(),
+				UploadedAt:   uploadedAt,
+			})
+			pendingPromotionsMu.Unlock()
 
 			upload.Touch()
 			return nil
@@ -1668,26 +1810,34 @@ readLoop:
 	if err := eg.Wait(); err != nil {
 		return finalizeUploadResult{}, err
 	}
+	sort.Slice(pendingPromotions, func(i, j int) bool {
+		return pendingPromotions[i].BlockIndex < pendingPromotions[j].BlockIndex
+	})
 
 	// File ID = SHA-1 of the complete plaintext
 	fileID := hex.EncodeToString(sha1Hasher.Sum(nil))
 
 	log.Printf("[finalizeUploadStreaming] Stored %d blocks for file %s (size=%d, parallelism=%d)", len(blockSHA1IDs), fileID[:16], totalSize, finalizeUploadConcurrency)
 
-	// Update filesystem metadata with multiple block IDs
-	commitID, actualFilename, err := h.commitUploadedFileMultiBlock(token.OrgID, token.RepoID, token.UserID, parentDir, filename, fileID, blockSHA1IDs, totalSize, replace)
+	// Prepare filesystem metadata with multiple block IDs without publishing head yet.
+	commitID, actualFilename, err := h.prepareUploadedFileCommitMultiBlock(token.OrgID, token.RepoID, token.UserID, parentDir, filename, fileID, blockSHA1IDs, totalSize, replace)
 	if err != nil {
 		return finalizeUploadResult{}, fmt.Errorf("failed to update filesystem metadata: %w", err)
+	}
+	if err := h.publishPreparedUpload(token.OrgID, token.RepoID, uploadID, preparedUploadCommit{
+		CommitID:       commitID,
+		ActualFilename: actualFilename,
+	}, pendingPromotions); err != nil {
+		return finalizeUploadResult{}, fmt.Errorf("failed to publish filesystem metadata: %w", err)
 	}
 	log.Printf("[finalizeUploadStreaming] Filesystem updated, commit=%s", commitID)
 
 	return finalizeUploadResult{FileID: fileID, ActualFilename: actualFilename, CommitID: commitID}, nil
 }
 
-// commitUploadedFileMultiBlock is like commitUploadedFile but supports multiple block IDs.
-// Used for large files that are split into multiple blocks during upload.
-// Returns the commit ID, the actual filename used (may differ if auto-renamed), and any error.
-func (h *SeafHTTPHandler) commitUploadedFileMultiBlock(orgID, repoID, userID, parentDir, filename, fileID string, blockIDs []string, fileSize int64, replace bool) (string, string, error) {
+// prepareUploadedFileCommitMultiBlock writes fs_objects and a new commit for a
+// multi-block upload but leaves HEAD publication to the caller.
+func (h *SeafHTTPHandler) prepareUploadedFileCommitMultiBlock(orgID, repoID, userID, parentDir, filename, fileID string, blockIDs []string, fileSize int64, replace bool) (string, string, error) {
 	var headCommitID string
 	err := h.db.Session().Query(`
 		SELECT head_commit_id FROM libraries WHERE org_id = ? AND library_id = ?
@@ -1756,19 +1906,13 @@ func (h *SeafHTTPHandler) commitUploadedFileMultiBlock(orgID, repoID, userID, pa
 		return "", "", fmt.Errorf("failed to create commit: %w", err)
 	}
 
-	fsHelper := v2.NewFSHelper(h.db)
-	if err := fsHelper.UpdateLibraryHead(orgID, repoID, newCommitID); err != nil {
-		log.Printf("[commitUploadedFileMultiBlock] Warning: failed to update library head: %v", err)
-	}
-
-	log.Printf("[commitUploadedFileMultiBlock] Created commit %s with root %s", newCommitID, newRootFSID)
+	log.Printf("[prepareUploadedFileCommitMultiBlock] Prepared commit %s with root %s", newCommitID, newRootFSID)
 	return newCommitID, actualFilename, nil
 }
 
-// commitUploadedFile updates the filesystem metadata after a file upload.
-// When replace is false and a file with the same name exists, it auto-renames to "name (1).ext".
-// Returns the commit ID, the actual filename used (may differ if auto-renamed), and any error.
-func (h *SeafHTTPHandler) commitUploadedFile(orgID, repoID, userID, parentDir, filename, fileID string, content []byte, fileSize int64, replace bool) (string, string, error) {
+// prepareUploadedFileCommit writes fs_objects and a new commit for an upload but
+// leaves HEAD publication to the caller.
+func (h *SeafHTTPHandler) prepareUploadedFileCommit(orgID, repoID, userID, parentDir, filename, fileID string, content []byte, fileSize int64, replace bool) (string, string, error) {
 	// Get current head commit
 	var headCommitID string
 	err := h.db.Session().Query(`
@@ -1850,15 +1994,7 @@ func (h *SeafHTTPHandler) commitUploadedFile(orgID, repoID, userID, parentDir, f
 		return "", "", fmt.Errorf("failed to create commit: %w", err)
 	}
 
-	// Update library head, size, and file count via FSHelper
-	// CRITICAL: Both tables must be updated for consistency
-	// GetRootFSID reads from libraries_by_id, so it must have the latest head_commit_id
-	fsHelper := v2.NewFSHelper(h.db)
-	if err := fsHelper.UpdateLibraryHead(orgID, repoID, newCommitID); err != nil {
-		return "", "", fmt.Errorf("failed to update library head: %w", err)
-	}
-
-	log.Printf("[commitUploadedFile] Created commit %s with root %s", newCommitID, newRootFSID)
+	log.Printf("[prepareUploadedFileCommit] Prepared commit %s with root %s", newCommitID, newRootFSID)
 	return newCommitID, actualFilename, nil
 }
 

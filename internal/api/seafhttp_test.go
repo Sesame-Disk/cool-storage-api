@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -52,6 +53,13 @@ func (f *fakeUploadStagingStore) UpsertBlock(record UploadSessionBlockRecord) er
 	}
 	f.blocks = append(f.blocks, record)
 	return nil
+}
+
+type orphanRecorderCall struct {
+	orgID        string
+	blockID      string
+	storageClass string
+	errMsg       string
 }
 
 func init() {
@@ -1009,6 +1017,179 @@ func TestPersistUploadBlockStateSwallowsErrors(t *testing.T) {
 
 	if len(staging.blocks) != 0 {
 		t.Fatalf("expected failed block staging writes to be swallowed, got %d recorded blocks", len(staging.blocks))
+	}
+}
+
+func TestPersistUploadS3OrphanUsesInjectedRecorder(t *testing.T) {
+	handler := NewSeafHTTPHandler(nil, storage.NewManager(), nil, NewMockTokenStore(), nil, nil)
+	var calls []orphanRecorderCall
+	handler.SetUploadOrphanRecorder(func(orgID, blockID, storageClass, errMsg string) error {
+		calls = append(calls, orphanRecorderCall{
+			orgID:        orgID,
+			blockID:      blockID,
+			storageClass: storageClass,
+			errMsg:       errMsg,
+		})
+		return nil
+	})
+
+	handler.persistUploadS3Orphan("org-1", "block-1", "hot", "mapping failed")
+
+	if len(calls) != 1 {
+		t.Fatalf("orphan recorder calls = %d, want 1", len(calls))
+	}
+	if calls[0].blockID != "block-1" {
+		t.Fatalf("block id = %q, want block-1", calls[0].blockID)
+	}
+	if calls[0].storageClass != "hot" {
+		t.Fatalf("storage class = %q, want hot", calls[0].storageClass)
+	}
+	if calls[0].errMsg != "mapping failed" {
+		t.Fatalf("error msg = %q, want mapping failed", calls[0].errMsg)
+	}
+}
+
+func TestPersistUploadS3OrphanSwallowsErrors(t *testing.T) {
+	handler := NewSeafHTTPHandler(nil, storage.NewManager(), nil, NewMockTokenStore(), nil, nil)
+	handler.SetUploadOrphanRecorder(func(orgID, blockID, storageClass, errMsg string) error {
+		return errors.New("gc_s3_orphans down")
+	})
+
+	handler.persistUploadS3Orphan("org-1", "block-1", "hot", "mapping failed")
+}
+
+func TestPublishPreparedUploadPromotesBeforePublishingHead(t *testing.T) {
+	handler := NewSeafHTTPHandler(nil, storage.NewManager(), nil, NewMockTokenStore(), nil, nil)
+	staging := &fakeUploadStagingStore{}
+	handler.SetUploadStagingStore(staging)
+
+	var calls []string
+	handler.blockPromoter = func(orgID, blockID string, sizeBytes int, storageClass, storageKey string) error {
+		calls = append(calls, "promote:"+blockID)
+		return nil
+	}
+	handler.blockRollback = func(orgID, operationKey string, blockIDs []string) []string {
+		calls = append(calls, "rollback")
+		return nil
+	}
+	handler.commitPublisher = func(orgID, repoID, commitID string) error {
+		calls = append(calls, "publish:"+commitID)
+		return nil
+	}
+
+	uploadedAt := time.Now().UTC()
+	err := handler.publishPreparedUpload("org-1", "repo-1", "upload-1", preparedUploadCommit{CommitID: "commit-1"}, []uploadBlockPromotion{
+		{
+			BlockIndex:   0,
+			BlockSHA1:    "sha1-1",
+			BlockSHA256:  "sha256-1",
+			SizeBytes:    10,
+			StorageClass: "hot",
+			StorageKey:   "sha256-1",
+			Source:       UploadBlockSourceNewObject,
+			CreatedAt:    uploadedAt,
+			UploadedAt:   &uploadedAt,
+		},
+		{
+			BlockIndex:   1,
+			BlockSHA1:    "sha1-2",
+			BlockSHA256:  "sha256-2",
+			SizeBytes:    20,
+			StorageClass: "hot",
+			StorageKey:   "sha256-2",
+			Source:       UploadBlockSourceNewObject,
+			CreatedAt:    uploadedAt,
+			UploadedAt:   &uploadedAt,
+		},
+	})
+	if err != nil {
+		t.Fatalf("publishPreparedUpload failed: %v", err)
+	}
+
+	if len(calls) != 3 {
+		t.Fatalf("call count = %d, want 3", len(calls))
+	}
+	if calls[0] != "promote:sha256-1" || calls[1] != "promote:sha256-2" || calls[2] != "publish:commit-1" {
+		t.Fatalf("call order = %v, want promote/promote/publish", calls)
+	}
+	if len(staging.blocks) != 2 {
+		t.Fatalf("promoted staging writes = %d, want 2", len(staging.blocks))
+	}
+	if staging.blocks[0].State != UploadBlockStatePromoted || staging.blocks[1].State != UploadBlockStatePromoted {
+		t.Fatalf("staging states = %q/%q, want promoted/promoted", staging.blocks[0].State, staging.blocks[1].State)
+	}
+}
+
+func TestPublishPreparedUploadRollsBackWhenPublishFails(t *testing.T) {
+	handler := NewSeafHTTPHandler(nil, storage.NewManager(), nil, NewMockTokenStore(), nil, nil)
+
+	var rollbackOpKey string
+	var rollbackBlockIDs []string
+	handler.blockPromoter = func(orgID, blockID string, sizeBytes int, storageClass, storageKey string) error {
+		return nil
+	}
+	handler.blockRollback = func(orgID, operationKey string, blockIDs []string) []string {
+		rollbackOpKey = operationKey
+		rollbackBlockIDs = append([]string(nil), blockIDs...)
+		return nil
+	}
+	handler.commitPublisher = func(orgID, repoID, commitID string) error {
+		return errors.New("publish failed")
+	}
+
+	err := handler.publishPreparedUpload("org-1", "repo-1", "upload-1", preparedUploadCommit{CommitID: "commit-1"}, []uploadBlockPromotion{
+		{BlockIndex: 0, BlockSHA256: "sha256-1", SizeBytes: 10, StorageClass: "hot", StorageKey: "sha256-1"},
+		{BlockIndex: 1, BlockSHA256: "sha256-2", SizeBytes: 20, StorageClass: "hot", StorageKey: "sha256-2"},
+	})
+	if err == nil {
+		t.Fatal("expected publishPreparedUpload to fail")
+	}
+	if !strings.Contains(err.Error(), "failed to publish upload commit") {
+		t.Fatalf("error = %v, want publish failure", err)
+	}
+	if rollbackOpKey != "upload-rollback:upload-1:commit-1" {
+		t.Fatalf("rollback op key = %q, want upload-rollback:upload-1:commit-1", rollbackOpKey)
+	}
+	if len(rollbackBlockIDs) != 2 || rollbackBlockIDs[0] != "sha256-1" || rollbackBlockIDs[1] != "sha256-2" {
+		t.Fatalf("rollback block ids = %v, want [sha256-1 sha256-2]", rollbackBlockIDs)
+	}
+}
+
+func TestPublishPreparedUploadRollsBackPartialPromotionFailures(t *testing.T) {
+	handler := NewSeafHTTPHandler(nil, storage.NewManager(), nil, NewMockTokenStore(), nil, nil)
+
+	var publishCalled bool
+	var rollbackBlockIDs []string
+	handler.blockPromoter = func(orgID, blockID string, sizeBytes int, storageClass, storageKey string) error {
+		if blockID == "sha256-2" {
+			return errors.New("promote failed")
+		}
+		return nil
+	}
+	handler.blockRollback = func(orgID, operationKey string, blockIDs []string) []string {
+		rollbackBlockIDs = append([]string(nil), blockIDs...)
+		return nil
+	}
+	handler.commitPublisher = func(orgID, repoID, commitID string) error {
+		publishCalled = true
+		return nil
+	}
+
+	err := handler.publishPreparedUpload("org-1", "repo-1", "upload-1", preparedUploadCommit{CommitID: "commit-1"}, []uploadBlockPromotion{
+		{BlockIndex: 0, BlockSHA256: "sha256-1", SizeBytes: 10, StorageClass: "hot", StorageKey: "sha256-1"},
+		{BlockIndex: 1, BlockSHA256: "sha256-2", SizeBytes: 20, StorageClass: "hot", StorageKey: "sha256-2"},
+	})
+	if err == nil {
+		t.Fatal("expected publishPreparedUpload to fail")
+	}
+	if !strings.Contains(err.Error(), "failed to write block metadata") {
+		t.Fatalf("error = %v, want promotion failure", err)
+	}
+	if publishCalled {
+		t.Fatal("publish should not be called after a promotion failure")
+	}
+	if len(rollbackBlockIDs) != 1 || rollbackBlockIDs[0] != "sha256-1" {
+		t.Fatalf("rollback block ids = %v, want [sha256-1]", rollbackBlockIDs)
 	}
 }
 
