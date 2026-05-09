@@ -63,4 +63,11 @@ func TestCassandraUploadStagingStore_RejectsMissingKeys(t *testing.T) {
 	if err := store.DeleteBlockPromotion("", "upload-1", 0); err == nil {
 		t.Fatal("expected missing org id to fail")
 	}
+
+	if err := store.DeleteAllBlockPromotions("", "upload-1"); err == nil {
+		t.Fatal("expected missing org id to fail")
+	}
+	if err := store.DeleteAllBlockPromotions("org-1", ""); err == nil {
+		t.Fatal("expected missing upload id to fail")
+	}
 }

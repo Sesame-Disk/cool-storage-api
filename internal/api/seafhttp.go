@@ -806,7 +806,7 @@ type uploadBlockPromotion struct {
 type chunkedFinalizeFunc func(c *gin.Context, token *AccessToken, upload *ChunkUpload, uploadID, parentDir, filename, storageKey string, totalSize int64, replace bool) (finalizeUploadResult, error)
 
 type uploadOrphanRecorderFunc func(orgID, blockID, storageClass, errMsg string) error
-type uploadBlockPromoterFunc func(orgID, blockID string, sizeBytes int, storageClass, storageKey string) error
+type uploadBlockPromoterFunc func(orgID, operationKey, blockID string, sizeBytes int, storageClass, storageKey string) error
 type uploadBlockRollbackFunc func(orgID, operationKey string, blockIDs []string) []string
 type uploadCommitPublisherFunc func(orgID, repoID, commitID string) error
 
@@ -876,8 +876,8 @@ func NewSeafHTTPHandler(s3Store *storage.S3Store, storageManager *storage.Manage
 	}
 	handler.chunkedFinalize = handler.finalizeUploadStreaming
 	handler.uploadOrphanRecorder = handler.recordUploadS3OrphanRow
-	handler.blockPromoter = func(orgID, blockID string, sizeBytes int, storageClass, storageKey string) error {
-		return v2.NewFSHelper(handler.db).IncrementOrCreateBlock(orgID, blockID, sizeBytes, storageClass, storageKey)
+	handler.blockPromoter = func(orgID, operationKey, blockID string, sizeBytes int, storageClass, storageKey string) error {
+		return v2.NewFSHelper(handler.db).IncrementOrCreateBlockOnce(orgID, operationKey, blockID, sizeBytes, storageClass, storageKey)
 	}
 	handler.blockRollback = func(orgID, operationKey string, blockIDs []string) []string {
 		return v2.NewFSHelper(handler.db).DecrementBlockRefCountsOnce(orgID, operationKey, blockIDs)
@@ -1029,6 +1029,28 @@ func (h *SeafHTTPHandler) closeRecoveredUploadSession(session *UploadSessionReco
 	})
 }
 
+// purgeStalePromotions drops promotion claims for an upload. Called lazily
+// from recoverPreparedUploadIfPossible when a closed session's claims belong
+// to an older revision and would otherwise block the new revision's
+// TryStartBlockPromotion with a marker mismatch. Errors are logged only —
+// the caller proceeds with the normal flow regardless, since a residual claim
+// only causes the next attempt to repeat the same recovery branch.
+//
+// We deliberately do NOT call this on every successful close. Promotion rows
+// are the only signal that lets recoverPreparedUploadIfPossible recognise a
+// closed session as "already succeeded" and short-circuit duplicate revisions
+// when the client retries after a successful response was lost in transit.
+// They live until a fresh upload with mismatching content/commit invalidates
+// them, at which point this helper purges them on the spot.
+func (h *SeafHTTPHandler) purgeStalePromotions(orgID, uploadID string) {
+	if h == nil || h.uploadStaging == nil {
+		return
+	}
+	if err := h.uploadStaging.DeleteAllBlockPromotions(orgID, uploadID); err != nil {
+		log.Printf("[HandleUpload] WARNING: Failed to purge stale promotion claims org=%s upload=%s: %v", orgID, shortLogID(uploadID), err)
+	}
+}
+
 func (h *SeafHTTPHandler) markUploadSessionCleanupPending(session *UploadSessionRecord, errMsg string) error {
 	if h == nil || h.uploadStaging == nil || session == nil {
 		return nil
@@ -1131,24 +1153,49 @@ func (h *SeafHTTPHandler) recoverPreparedUploadIfPossible(orgID, repoID, uploadI
 	if err != nil {
 		return preparedUploadCommit{}, false, fmt.Errorf("list upload block promotions: %w", err)
 	}
+	// Mismatched cardinality between live promotions and the new upload's
+	// blocks indicates a different revision (different chunking or content).
+	// Drop stale claims if the session already terminated so the new upload
+	// can register fresh markers.
 	if len(promotions) != len(blocks) {
+		if session.State == UploadSessionStateClosed {
+			h.purgeStalePromotions(orgID, uploadID)
+		}
 		return preparedUploadCommit{}, false, nil
 	}
+	actualFilename := session.ActualFilename
+	if strings.TrimSpace(actualFilename) == "" {
+		actualFilename = session.Filename
+	}
+	prepared := preparedUploadCommit{CommitID: session.CommitID, ActualFilename: actualFilename}
 	promotionsByIndex := make(map[int]UploadBlockPromotionRecord, len(promotions))
 	for _, promotion := range promotions {
 		promotionsByIndex[promotion.BlockIndex] = promotion
 	}
+	hasPendingPromotion := false
 	for _, block := range blocks {
 		promotion, ok := promotionsByIndex[block.BlockIndex]
 		if !ok {
+			if session.State == UploadSessionStateClosed {
+				h.purgeStalePromotions(orgID, uploadID)
+			}
 			return preparedUploadCommit{}, false, nil
 		}
 		if promotion.CommitID != session.CommitID || promotion.BlockSHA256 != block.BlockSHA256 {
+			if session.State == UploadSessionStateClosed {
+				h.purgeStalePromotions(orgID, uploadID)
+			}
 			return preparedUploadCommit{}, false, nil
 		}
 		if promotion.AppliedAt == nil {
-			return preparedUploadCommit{}, false, fmt.Errorf("upload recovery pending for block %d", block.BlockIndex)
+			hasPendingPromotion = true
 		}
+	}
+	if hasPendingPromotion {
+		if session.State == UploadSessionStateClosed {
+			return preparedUploadCommit{}, false, fmt.Errorf("closed upload session has pending promotion markers")
+		}
+		return prepared, false, nil
 	}
 	if session.State == UploadSessionStatePromoting {
 		if h.commitPublisher == nil {
@@ -1161,11 +1208,7 @@ func (h *SeafHTTPHandler) recoverPreparedUploadIfPossible(orgID, repoID, uploadI
 			return preparedUploadCommit{}, false, fmt.Errorf("close recovered upload session: %w", err)
 		}
 	}
-	actualFilename := session.ActualFilename
-	if strings.TrimSpace(actualFilename) == "" {
-		actualFilename = session.Filename
-	}
-	return preparedUploadCommit{CommitID: session.CommitID, ActualFilename: actualFilename}, true, nil
+	return prepared, true, nil
 }
 
 func (h *SeafHTTPHandler) publishPreparedUpload(orgID, repoID, uploadID string, prepared preparedUploadCommit, blocks []uploadBlockPromotion) error {
@@ -1186,6 +1229,7 @@ func (h *SeafHTTPHandler) publishPreparedUpload(orgID, repoID, uploadID string, 
 	newlyClaimedBlocks := make([]uploadBlockPromotion, 0, len(blocks))
 	for _, block := range blocks {
 		claimInserted := false
+		claimTime := time.Now().UTC()
 		if h.uploadStaging != nil {
 			attempt, err := h.uploadStaging.TryStartBlockPromotion(UploadBlockPromotionRecord{
 				OrgID:       orgID,
@@ -1193,7 +1237,7 @@ func (h *SeafHTTPHandler) publishPreparedUpload(orgID, repoID, uploadID string, 
 				BlockIndex:  block.BlockIndex,
 				BlockSHA256: block.BlockSHA256,
 				CommitID:    prepared.CommitID,
-				ClaimedAt:   time.Now().UTC(),
+				ClaimedAt:   claimTime,
 			})
 			if err != nil {
 				h.rollbackPromotedUploadBlocks(orgID, uploadID, prepared.CommitID, newlyPromotedBlockIDs)
@@ -1206,35 +1250,33 @@ func (h *SeafHTTPHandler) publishPreparedUpload(orgID, repoID, uploadID string, 
 					h.releaseUploadPromotionClaims(orgID, uploadID, newlyClaimedBlocks)
 					return fmt.Errorf("block %d promotion marker mismatch", block.BlockIndex)
 				}
-				if attempt.AppliedAt == nil {
-					h.rollbackPromotedUploadBlocks(orgID, uploadID, prepared.CommitID, newlyPromotedBlockIDs)
-					h.releaseUploadPromotionClaims(orgID, uploadID, newlyClaimedBlocks)
-					return fmt.Errorf("block %d has pending promotion marker; recovery required", block.BlockIndex)
+				if attempt.AppliedAt != nil {
+					h.persistPromotedUploadBlock(uploadID, orgID, block, *attempt.AppliedAt)
+					continue
 				}
-				h.persistPromotedUploadBlock(uploadID, orgID, block, *attempt.AppliedAt)
-				continue
+				if attempt.ClaimedAt != nil {
+					claimTime = attempt.ClaimedAt.UTC()
+				}
 			}
 			claimInserted = true
 		}
 
-		if err := h.blockPromoter(orgID, block.BlockSHA256, block.SizeBytes, block.StorageClass, block.StorageKey); err != nil {
+		promotedAt, livePromoted, err := h.applyUploadBlockPromotion(orgID, uploadID, prepared.CommitID, claimTime, block)
+		if err != nil {
 			if claimInserted {
 				h.releaseUploadPromotionClaims(orgID, uploadID, []uploadBlockPromotion{block})
 			}
-			h.rollbackPromotedUploadBlocks(orgID, uploadID, prepared.CommitID, newlyPromotedBlockIDs)
+			if livePromoted {
+				currentPromotedBlockIDs := append(append([]string(nil), newlyPromotedBlockIDs...), block.BlockSHA256)
+				h.rollbackPromotedUploadBlocks(orgID, uploadID, prepared.CommitID, currentPromotedBlockIDs)
+			} else {
+				h.rollbackPromotedUploadBlocks(orgID, uploadID, prepared.CommitID, newlyPromotedBlockIDs)
+			}
 			h.releaseUploadPromotionClaims(orgID, uploadID, newlyClaimedBlocks)
 			return fmt.Errorf("failed to write block metadata for block %d: %w", block.BlockIndex, err)
 		}
 
-		promotedAt := time.Now().UTC()
-		if claimInserted {
-			if err := h.uploadStaging.MarkBlockPromotionApplied(orgID, uploadID, block.BlockIndex, promotedAt); err != nil {
-				currentPromotedBlockIDs := append(append([]string(nil), newlyPromotedBlockIDs...), block.BlockSHA256)
-				currentClaimedBlocks := append(append([]uploadBlockPromotion(nil), newlyClaimedBlocks...), block)
-				h.rollbackPromotedUploadBlocks(orgID, uploadID, prepared.CommitID, currentPromotedBlockIDs)
-				h.releaseUploadPromotionClaims(orgID, uploadID, currentClaimedBlocks)
-				return fmt.Errorf("failed to finalize block promotion marker for block %d: %w", block.BlockIndex, err)
-			}
+		if h.uploadStaging != nil {
 			newlyClaimedBlocks = append(newlyClaimedBlocks, block)
 		}
 		newlyPromotedBlockIDs = append(newlyPromotedBlockIDs, block.BlockSHA256)
@@ -1248,6 +1290,33 @@ func (h *SeafHTTPHandler) publishPreparedUpload(orgID, repoID, uploadID string, 
 	}
 
 	return nil
+}
+
+func uploadPromotionOperationKey(orgID, uploadID, commitID string, blockIndex int, claimedAt time.Time) string {
+	return fmt.Sprintf("upload-promote:%s:%s:%s:%d:%d", orgID, uploadID, commitID, blockIndex, claimedAt.UTC().UnixNano())
+}
+
+func (h *SeafHTTPHandler) applyUploadBlockPromotion(orgID, uploadID, commitID string, claimedAt time.Time, block uploadBlockPromotion) (time.Time, bool, error) {
+	if h == nil {
+		return time.Time{}, false, fmt.Errorf("upload handler is required")
+	}
+	if h.blockPromoter == nil {
+		return time.Time{}, false, fmt.Errorf("block promoter is not configured")
+	}
+	if claimedAt.IsZero() {
+		claimedAt = time.Now().UTC()
+	}
+	operationKey := uploadPromotionOperationKey(orgID, uploadID, commitID, block.BlockIndex, claimedAt)
+	if err := h.blockPromoter(orgID, operationKey, block.BlockSHA256, block.SizeBytes, block.StorageClass, block.StorageKey); err != nil {
+		return time.Time{}, false, err
+	}
+	promotedAt := time.Now().UTC()
+	if h.uploadStaging != nil {
+		if err := h.uploadStaging.MarkBlockPromotionApplied(orgID, uploadID, block.BlockIndex, promotedAt); err != nil {
+			return promotedAt, true, err
+		}
+	}
+	return promotedAt, true, nil
 }
 
 func (h *SeafHTTPHandler) SetZipLimits(maxEntries, maxDepth int, maxBytes int64) {
@@ -1792,17 +1861,18 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 	`, token.OrgID, sha256ID, fileID).Exec(); err != nil {
 		log.Printf("[HandleUpload] WARNING: Failed to write reverse block_id_mapping org=%s int=%s ext=%s: %v", token.OrgID, sha256ID[:16], fileID[:16], err)
 	}
-	if recovered, ok, err := h.recoverPreparedUploadIfPossible(token.OrgID, token.RepoID, uploadID, []uploadBlockPromotion{{
+	preparedCommit, recovered, err := h.recoverPreparedUploadIfPossible(token.OrgID, token.RepoID, uploadID, []uploadBlockPromotion{{
 		BlockIndex:  0,
 		BlockSHA1:   fileID,
 		BlockSHA256: sha256ID,
-	}}); err != nil {
+	}})
+	if err != nil {
 		log.Printf("[HandleUpload] Failed to recover prepared upload: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to recover upload state"})
 		return
-	} else if ok {
-		actualFilename := recovered.ActualFilename
-		log.Printf("[HandleUpload] Recovered prepared upload: file=%s, commit=%s, id=%s", actualFilename, recovered.CommitID, shortLogID(fileID))
+	} else if recovered {
+		actualFilename := preparedCommit.ActualFilename
+		log.Printf("[HandleUpload] Recovered prepared upload: file=%s, commit=%s, id=%s", actualFilename, preparedCommit.CommitID, shortLogID(fileID))
 		if retJSON {
 			c.JSON(http.StatusOK, []gin.H{{"name": actualFilename, "id": fileID, "size": strconv.FormatInt(finalSize, 10)}})
 		} else {
@@ -1812,12 +1882,16 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 	}
 
 	// Prepare filesystem metadata without publishing the new head yet.
-	commitID, actualFilename, err := h.prepareUploadedFileCommit(token.OrgID, token.RepoID, token.UserID, parentDir, filename, fileID, chunkData, finalSize, replaceFile)
-	if err != nil {
-		log.Printf("[HandleUpload] Failed to update filesystem: %v", err)
-		markSingleShotCleanup(err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "file stored but metadata update failed"})
-		return
+	commitID := preparedCommit.CommitID
+	actualFilename := preparedCommit.ActualFilename
+	if strings.TrimSpace(commitID) == "" {
+		commitID, actualFilename, err = h.prepareUploadedFileCommit(token.OrgID, token.RepoID, token.UserID, parentDir, filename, fileID, chunkData, finalSize, replaceFile)
+		if err != nil {
+			log.Printf("[HandleUpload] Failed to update filesystem: %v", err)
+			markSingleShotCleanup(err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "file stored but metadata update failed"})
+			return
+		}
 	}
 	if h.uploadStaging != nil {
 		now := time.Now().UTC()
@@ -2096,17 +2170,22 @@ readLoop:
 	fileID := hex.EncodeToString(sha1Hasher.Sum(nil))
 
 	log.Printf("[finalizeUploadStreaming] Stored %d blocks for file %s (size=%d, parallelism=%d)", len(blockSHA1IDs), fileID[:16], totalSize, finalizeUploadConcurrency)
-	if recovered, ok, err := h.recoverPreparedUploadIfPossible(token.OrgID, token.RepoID, uploadID, pendingPromotions); err != nil {
+	preparedCommit, recovered, err := h.recoverPreparedUploadIfPossible(token.OrgID, token.RepoID, uploadID, pendingPromotions)
+	if err != nil {
 		return finalizeUploadResult{}, fmt.Errorf("failed to recover prepared upload: %w", err)
-	} else if ok {
-		log.Printf("[finalizeUploadStreaming] Recovered prepared upload commit=%s for file %s", recovered.CommitID, shortLogID(fileID))
-		return finalizeUploadResult{FileID: fileID, ActualFilename: recovered.ActualFilename, CommitID: recovered.CommitID, Recovered: true}, nil
+	} else if recovered {
+		log.Printf("[finalizeUploadStreaming] Recovered prepared upload commit=%s for file %s", preparedCommit.CommitID, shortLogID(fileID))
+		return finalizeUploadResult{FileID: fileID, ActualFilename: preparedCommit.ActualFilename, CommitID: preparedCommit.CommitID, Recovered: true}, nil
 	}
 
 	// Prepare filesystem metadata with multiple block IDs without publishing head yet.
-	commitID, actualFilename, err := h.prepareUploadedFileCommitMultiBlock(token.OrgID, token.RepoID, token.UserID, parentDir, filename, fileID, blockSHA1IDs, totalSize, replace)
-	if err != nil {
-		return finalizeUploadResult{}, fmt.Errorf("failed to update filesystem metadata: %w", err)
+	commitID := preparedCommit.CommitID
+	actualFilename := preparedCommit.ActualFilename
+	if strings.TrimSpace(commitID) == "" {
+		commitID, actualFilename, err = h.prepareUploadedFileCommitMultiBlock(token.OrgID, token.RepoID, token.UserID, parentDir, filename, fileID, blockSHA1IDs, totalSize, replace)
+		if err != nil {
+			return finalizeUploadResult{}, fmt.Errorf("failed to update filesystem metadata: %w", err)
+		}
 	}
 	if h.uploadStaging != nil {
 		now := time.Now().UTC()

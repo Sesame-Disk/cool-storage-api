@@ -624,6 +624,71 @@ func (h *FSHelper) IncrementOrCreateBlock(orgID, blockID string, sizeBytes int, 
 	return fmt.Errorf("failed to increment/create block %s after %d retries (persistent contention or GC stall)", blockID, maxRetries)
 }
 
+// IncrementOrCreateBlockOnce applies IncrementOrCreateBlock at most once for a
+// stable operationKey. Retries with the same key are safe and become no-ops.
+//
+// Ordering rationale: we increment first and mark the operation as processed
+// second. If the process crashes between the two writes, the next retry sees
+// no mark, performs the increment again, and the mark CAS catches the race
+// (the second mark fails CAS, and the redundant increment is rolled back via
+// decrementBlockRefCount). The opposite ordering (mark first, increment
+// second) would be exposed to a "lost increment" if the process crashed
+// between mark and increment: the next retry would skip the increment because
+// the mark exists, and the ref_count would be silently under-counted —
+// causing premature GC and data loss when the block is shared. An over-count
+// is preferable: it leaks an S3 object recoverable by GC reconciliation,
+// rather than losing user data.
+func (h *FSHelper) IncrementOrCreateBlockOnce(orgID, operationKey, blockID string, sizeBytes int, storageClass, storageKey string) error {
+	if alreadyProcessed, err := h.isBlockMutationProcessed(operationKey); err != nil {
+		return fmt.Errorf("probe block increment operation: %w", err)
+	} else if alreadyProcessed {
+		return nil
+	}
+
+	if err := h.IncrementOrCreateBlock(orgID, blockID, sizeBytes, storageClass, storageKey); err != nil {
+		return fmt.Errorf("increment or create block once: %w", err)
+	}
+
+	applied, err := h.markBlockMutationProcessed(operationKey)
+	if err != nil {
+		// Mark failed after a successful increment. Best-effort revert; if the
+		// revert also fails, we leak one ref_count (over-count) which the GC
+		// reconciliation can later clean up — strictly better than leaving the
+		// caller to issue a duplicate increment on retry.
+		h.decrementBlockRefCount(orgID, blockID)
+		return fmt.Errorf("mark block increment operation processed: %w", err)
+	}
+	if !applied {
+		// Race: another caller (typically a retry of the same operation) won
+		// the mark CAS and incremented its own ref. Roll back our increment to
+		// preserve the "exactly once" semantics for this operationKey.
+		h.decrementBlockRefCount(orgID, blockID)
+	}
+	return nil
+}
+
+// isBlockMutationProcessed is a non-LWT probe that checks whether an
+// operationKey was already processed. Returns (true, nil) when found,
+// (false, nil) when not found, or (false, err) on infrastructure failure.
+// Used to short-circuit retries before they attempt the increment.
+func (h *FSHelper) isBlockMutationProcessed(operationKey string) (bool, error) {
+	if strings.TrimSpace(operationKey) == "" {
+		return false, fmt.Errorf("operation key is required")
+	}
+	taskID := uuid.NewMD5(uuid.NameSpaceOID, []byte("block_ref_mutation:"+operationKey)).String()
+	var existingTaskID string
+	err := h.db.Session().Query(`
+		SELECT task_id FROM gc_processed_items WHERE task_id = ?
+	`, taskID).Scan(&existingTaskID)
+	if err == nil {
+		return true, nil
+	}
+	if err == gocql.ErrNotFound {
+		return false, nil
+	}
+	return false, err
+}
+
 // collectDirStats recursively collects block IDs, total size in bytes, and file count
 // for a directory tree rooted at the given fs_object.
 func (h *FSHelper) collectDirStats(repoID, fsID string) (blockIDs []string, totalSize int64, fileCount int64, err error) {

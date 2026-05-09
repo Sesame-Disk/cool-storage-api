@@ -135,6 +135,7 @@ func (f *fakeUploadStagingStore) TryStartBlockPromotion(record UploadBlockPromot
 			Inserted:    false,
 			BlockSHA256: existing.BlockSHA256,
 			CommitID:    existing.CommitID,
+			ClaimedAt:   &existing.ClaimedAt,
 			AppliedAt:   existing.AppliedAt,
 		}, nil
 	}
@@ -143,6 +144,7 @@ func (f *fakeUploadStagingStore) TryStartBlockPromotion(record UploadBlockPromot
 		Inserted:    true,
 		BlockSHA256: record.BlockSHA256,
 		CommitID:    record.CommitID,
+		ClaimedAt:   &record.ClaimedAt,
 	}, nil
 }
 
@@ -182,6 +184,26 @@ func (f *fakeUploadStagingStore) DeleteBlockPromotion(orgID, uploadID string, bl
 		return nil
 	}
 	delete(f.promotions, fakeUploadPromotionKey(orgID, uploadID, blockIndex))
+	return nil
+}
+
+func (f *fakeUploadStagingStore) DeleteAllBlockPromotions(orgID, uploadID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.promotionDeleteErr != nil {
+		return f.promotionDeleteErr
+	}
+	if f.err != nil {
+		return f.err
+	}
+	if f.promotions == nil {
+		return nil
+	}
+	for key, record := range f.promotions {
+		if record.OrgID == orgID && record.UploadID == uploadID {
+			delete(f.promotions, key)
+		}
+	}
 	return nil
 }
 
@@ -1198,7 +1220,7 @@ func TestPublishPreparedUploadPromotesBeforePublishingHead(t *testing.T) {
 	handler.SetUploadStagingStore(staging)
 
 	var calls []string
-	handler.blockPromoter = func(orgID, blockID string, sizeBytes int, storageClass, storageKey string) error {
+	handler.blockPromoter = func(orgID, operationKey, blockID string, sizeBytes int, storageClass, storageKey string) error {
 		calls = append(calls, "promote:"+blockID)
 		return nil
 	}
@@ -1261,7 +1283,7 @@ func TestPublishPreparedUploadRollsBackWhenPublishFails(t *testing.T) {
 
 	var rollbackOpKey string
 	var rollbackBlockIDs []string
-	handler.blockPromoter = func(orgID, blockID string, sizeBytes int, storageClass, storageKey string) error {
+	handler.blockPromoter = func(orgID, operationKey, blockID string, sizeBytes int, storageClass, storageKey string) error {
 		return nil
 	}
 	handler.blockRollback = func(orgID, operationKey string, blockIDs []string) []string {
@@ -1298,7 +1320,7 @@ func TestPublishPreparedUploadRollsBackPartialPromotionFailures(t *testing.T) {
 
 	var publishCalled bool
 	var rollbackBlockIDs []string
-	handler.blockPromoter = func(orgID, blockID string, sizeBytes int, storageClass, storageKey string) error {
+	handler.blockPromoter = func(orgID, operationKey, blockID string, sizeBytes int, storageClass, storageKey string) error {
 		if blockID == "sha256-2" {
 			return errors.New("promote failed")
 		}
@@ -1338,7 +1360,7 @@ func TestPublishPreparedUploadRetrySkipsAlreadyAppliedPromotion(t *testing.T) {
 
 	var promoteCalls int
 	var publishCalls int
-	handler.blockPromoter = func(orgID, blockID string, sizeBytes int, storageClass, storageKey string) error {
+	handler.blockPromoter = func(orgID, operationKey, blockID string, sizeBytes int, storageClass, storageKey string) error {
 		promoteCalls++
 		return nil
 	}
@@ -1363,55 +1385,13 @@ func TestPublishPreparedUploadRetrySkipsAlreadyAppliedPromotion(t *testing.T) {
 	}
 }
 
-func TestPublishPreparedUploadFailsOnPendingPromotionMarker(t *testing.T) {
-	handler := NewSeafHTTPHandler(nil, storage.NewManager(), nil, NewMockTokenStore(), nil, nil)
-	staging := &fakeUploadStagingStore{
-		promotions: map[string]UploadBlockPromotionRecord{
-			fakeUploadPromotionKey("org-1", "upload-1", 0): {
-				OrgID:       "org-1",
-				UploadID:    "upload-1",
-				BlockIndex:  0,
-				BlockSHA256: "sha256-1",
-				CommitID:    "commit-1",
-				ClaimedAt:   time.Now().UTC(),
-			},
-		},
-	}
-	handler.SetUploadStagingStore(staging)
-
-	var promoteCalled bool
-	var publishCalled bool
-	handler.blockPromoter = func(orgID, blockID string, sizeBytes int, storageClass, storageKey string) error {
-		promoteCalled = true
-		return nil
-	}
-	handler.commitPublisher = func(orgID, repoID, commitID string) error {
-		publishCalled = true
-		return nil
-	}
-
-	err := handler.publishPreparedUpload("org-1", "repo-1", "upload-1", preparedUploadCommit{CommitID: "commit-1"}, []uploadBlockPromotion{{BlockIndex: 0, BlockSHA256: "sha256-1", SizeBytes: 10, StorageClass: "hot", StorageKey: "sha256-1"}})
-	if err == nil {
-		t.Fatal("expected publishPreparedUpload to fail on pending marker")
-	}
-	if !strings.Contains(err.Error(), "pending promotion marker") {
-		t.Fatalf("error = %v, want pending marker failure", err)
-	}
-	if promoteCalled {
-		t.Fatal("promote should not be called when marker is pending")
-	}
-	if publishCalled {
-		t.Fatal("publish should not be called when marker is pending")
-	}
-}
-
 func TestPublishPreparedUploadReleasesClaimAfterPromotionFailure(t *testing.T) {
 	handler := NewSeafHTTPHandler(nil, storage.NewManager(), nil, NewMockTokenStore(), nil, nil)
 	staging := &fakeUploadStagingStore{}
 	handler.SetUploadStagingStore(staging)
 
 	var promoteCalls int
-	handler.blockPromoter = func(orgID, blockID string, sizeBytes int, storageClass, storageKey string) error {
+	handler.blockPromoter = func(orgID, operationKey, blockID string, sizeBytes int, storageClass, storageKey string) error {
 		promoteCalls++
 		if promoteCalls == 1 {
 			return errors.New("promote failed")
@@ -1443,7 +1423,7 @@ func TestPublishPreparedUploadPublishFailureDoesNotRollbackAlreadyAppliedBlocks(
 	staging := &fakeUploadStagingStore{}
 	handler.SetUploadStagingStore(staging)
 
-	handler.blockPromoter = func(orgID, blockID string, sizeBytes int, storageClass, storageKey string) error {
+	handler.blockPromoter = func(orgID, operationKey, blockID string, sizeBytes int, storageClass, storageKey string) error {
 		return nil
 	}
 	handler.commitPublisher = func(orgID, repoID, commitID string) error {
@@ -1583,7 +1563,7 @@ func TestRecoverPreparedUploadIfPossibleReturnsClosedSessionWithoutRepublish(t *
 	}
 }
 
-func TestRecoverPreparedUploadIfPossibleFailsOnPendingPromotionMarker(t *testing.T) {
+func TestRecoverPreparedUploadIfPossibleReturnsPreparedCommitOnPendingPromotionMarker(t *testing.T) {
 	handler := NewSeafHTTPHandler(nil, storage.NewManager(), nil, NewMockTokenStore(), nil, nil)
 	staging := &fakeUploadStagingStore{}
 	handler.SetUploadStagingStore(staging)
@@ -1611,15 +1591,278 @@ func TestRecoverPreparedUploadIfPossibleFailsOnPendingPromotionMarker(t *testing
 		},
 	}
 
-	_, ok, err := handler.recoverPreparedUploadIfPossible("org-1", "repo-1", "upload-1", []uploadBlockPromotion{{BlockIndex: 0, BlockSHA256: "sha256-1"}})
-	if err == nil {
-		t.Fatal("expected recoverPreparedUploadIfPossible to fail")
+	prepared, ok, err := handler.recoverPreparedUploadIfPossible("org-1", "repo-1", "upload-1", []uploadBlockPromotion{{BlockIndex: 0, BlockSHA256: "sha256-1"}})
+	if err != nil {
+		t.Fatalf("recoverPreparedUploadIfPossible failed: %v", err)
 	}
 	if ok {
-		t.Fatal("expected recovery to report not recovered on pending marker")
+		t.Fatal("expected pending marker to return a resumable prepared commit, not a recovered upload")
 	}
-	if !strings.Contains(err.Error(), "upload recovery pending") {
-		t.Fatalf("error = %v, want pending recovery error", err)
+	if prepared.CommitID != "commit-1" || prepared.ActualFilename != "file.txt" {
+		t.Fatalf("prepared commit = %+v, want commit-1/file.txt", prepared)
+	}
+}
+
+// TestRecoverPreparedUploadIfPossiblePurgesStalePromotionsOnSHAMismatch
+// guards the E2E bug where a new revision of the same path/filename (same
+// uploadID, different content) hit a closed session's promotion claims with
+// the old BlockSHA256 and TryStartBlockPromotion later rejected with
+// "promotion marker mismatch". The purge must happen lazily on detection so
+// the new upload can register fresh markers, while the matching-content
+// idempotent retry path still finds the live claims.
+func TestRecoverPreparedUploadIfPossiblePurgesStalePromotionsOnSHAMismatch(t *testing.T) {
+	handler := NewSeafHTTPHandler(nil, storage.NewManager(), nil, NewMockTokenStore(), nil, nil)
+	staging := &fakeUploadStagingStore{}
+	handler.SetUploadStagingStore(staging)
+	now := time.Now().UTC()
+	staging.sessions = append(staging.sessions, UploadSessionRecord{
+		UploadID: "upload-1", OrgID: "org-1", RepoID: "repo-1",
+		Filename: "file.txt", ActualFilename: "file.txt",
+		CommitID: "commit-rev1", State: UploadSessionStateClosed,
+		CreatedAt: now, UpdatedAt: now, ExpiresAt: now.Add(time.Hour),
+	})
+	staging.promotions = map[string]UploadBlockPromotionRecord{
+		fakeUploadPromotionKey("org-1", "upload-1", 0): {
+			OrgID: "org-1", UploadID: "upload-1", BlockIndex: 0,
+			BlockSHA256: "sha256-rev1", CommitID: "commit-rev1",
+			ClaimedAt: now, AppliedAt: &now,
+		},
+	}
+
+	// Rev 2 with different content — same BlockIndex but different SHA.
+	prepared, ok, err := handler.recoverPreparedUploadIfPossible("org-1", "repo-1", "upload-1",
+		[]uploadBlockPromotion{{BlockIndex: 0, BlockSHA256: "sha256-rev2"}})
+	if err != nil {
+		t.Fatalf("recoverPreparedUploadIfPossible: %v", err)
+	}
+	if ok {
+		t.Fatal("expected no recovery on SHA mismatch")
+	}
+	if prepared.CommitID != "" {
+		t.Fatalf("expected empty prepared on SHA mismatch, got %+v", prepared)
+	}
+	if _, exists := staging.promotions[fakeUploadPromotionKey("org-1", "upload-1", 0)]; exists {
+		t.Fatal("expected stale rev-1 promotion to be purged on mismatch with closed session")
+	}
+}
+
+// TestRecoverPreparedUploadIfPossiblePurgesStalePromotionsOnLengthMismatch
+// covers the cardinality variant: a different chunking on the new upload
+// (e.g. file size changed dramatically) leaves the stale claims unusable.
+func TestRecoverPreparedUploadIfPossiblePurgesStalePromotionsOnLengthMismatch(t *testing.T) {
+	handler := NewSeafHTTPHandler(nil, storage.NewManager(), nil, NewMockTokenStore(), nil, nil)
+	staging := &fakeUploadStagingStore{}
+	handler.SetUploadStagingStore(staging)
+	now := time.Now().UTC()
+	staging.sessions = append(staging.sessions, UploadSessionRecord{
+		UploadID: "upload-1", OrgID: "org-1", RepoID: "repo-1",
+		Filename: "file.txt", CommitID: "commit-rev1",
+		State: UploadSessionStateClosed,
+		CreatedAt: now, UpdatedAt: now, ExpiresAt: now.Add(time.Hour),
+	})
+	staging.promotions = map[string]UploadBlockPromotionRecord{
+		fakeUploadPromotionKey("org-1", "upload-1", 0): {
+			OrgID: "org-1", UploadID: "upload-1", BlockIndex: 0,
+			BlockSHA256: "sha256-rev1", CommitID: "commit-rev1",
+			ClaimedAt: now, AppliedAt: &now,
+		},
+	}
+
+	// Rev 2 splits into 3 blocks instead of 1.
+	_, _, err := handler.recoverPreparedUploadIfPossible("org-1", "repo-1", "upload-1",
+		[]uploadBlockPromotion{
+			{BlockIndex: 0, BlockSHA256: "a"},
+			{BlockIndex: 1, BlockSHA256: "b"},
+			{BlockIndex: 2, BlockSHA256: "c"},
+		})
+	if err != nil {
+		t.Fatalf("recoverPreparedUploadIfPossible: %v", err)
+	}
+	if _, exists := staging.promotions[fakeUploadPromotionKey("org-1", "upload-1", 0)]; exists {
+		t.Fatal("expected stale rev-1 promotion to be purged on cardinality mismatch")
+	}
+}
+
+// TestRecoverPreparedUploadIfPossiblePreservesPromotionsForIdempotentRetry
+// verifies that the lazy-purge does NOT trigger when the new upload matches
+// the closed session's content — that's a retry of an upload whose response
+// was lost in transit, and the claims are the only signal we have to return
+// success without recreating storage and accounting work.
+func TestRecoverPreparedUploadIfPossiblePreservesPromotionsForIdempotentRetry(t *testing.T) {
+	handler := NewSeafHTTPHandler(nil, storage.NewManager(), nil, NewMockTokenStore(), nil, nil)
+	staging := &fakeUploadStagingStore{}
+	handler.SetUploadStagingStore(staging)
+	now := time.Now().UTC()
+	staging.sessions = append(staging.sessions, UploadSessionRecord{
+		UploadID: "upload-1", OrgID: "org-1", RepoID: "repo-1",
+		Filename: "file.txt", ActualFilename: "file.txt",
+		CommitID: "commit-1", State: UploadSessionStateClosed,
+		CreatedAt: now, UpdatedAt: now, ExpiresAt: now.Add(time.Hour),
+	})
+	applied := now.Add(time.Minute)
+	staging.promotions = map[string]UploadBlockPromotionRecord{
+		fakeUploadPromotionKey("org-1", "upload-1", 0): {
+			OrgID: "org-1", UploadID: "upload-1", BlockIndex: 0,
+			BlockSHA256: "sha256-1", CommitID: "commit-1",
+			ClaimedAt: now, AppliedAt: &applied,
+		},
+	}
+
+	prepared, ok, err := handler.recoverPreparedUploadIfPossible("org-1", "repo-1", "upload-1",
+		[]uploadBlockPromotion{{BlockIndex: 0, BlockSHA256: "sha256-1"}})
+	if err != nil {
+		t.Fatalf("recoverPreparedUploadIfPossible: %v", err)
+	}
+	if !ok {
+		t.Fatal("expected idempotent recovery to return ok=true")
+	}
+	if prepared.CommitID != "commit-1" {
+		t.Fatalf("expected recovered commit-1, got %q", prepared.CommitID)
+	}
+	if _, exists := staging.promotions[fakeUploadPromotionKey("org-1", "upload-1", 0)]; !exists {
+		t.Fatal("expected matching promotion to be preserved for idempotent retry")
+	}
+}
+
+// TestCloseRecoveredUploadSessionDoesNotTouchPromotions documents that the
+// recovery close intentionally leaves promotion rows in place so a follow-up
+// retry can recognise the upload as already done. They are purged lazily on
+// the next conflicting upload.
+func TestCloseRecoveredUploadSessionDoesNotTouchPromotions(t *testing.T) {
+	handler := NewSeafHTTPHandler(nil, storage.NewManager(), nil, NewMockTokenStore(), nil, nil)
+	staging := &fakeUploadStagingStore{}
+	handler.SetUploadStagingStore(staging)
+	now := time.Now().UTC()
+	staging.promotions = map[string]UploadBlockPromotionRecord{
+		fakeUploadPromotionKey("org-1", "upload-1", 0): {
+			OrgID: "org-1", UploadID: "upload-1", BlockIndex: 0,
+			BlockSHA256: "sha256-1", CommitID: "commit-1",
+			ClaimedAt: now, AppliedAt: &now,
+		},
+	}
+
+	if err := handler.closeRecoveredUploadSession(&UploadSessionRecord{
+		OrgID: "org-1", UploadID: "upload-1", RepoID: "repo-1",
+		Filename: "file.txt", CommitID: "commit-1",
+	}); err != nil {
+		t.Fatalf("closeRecoveredUploadSession: %v", err)
+	}
+	if _, exists := staging.promotions[fakeUploadPromotionKey("org-1", "upload-1", 0)]; !exists {
+		t.Fatal("expected promotion claim to remain for idempotent-retry detection")
+	}
+}
+
+// TestCloseRecoveredUploadSessionDoesNotPropagateRecoveryFlowsErrors
+// verifies that a recovery flow does not return 500 to the user solely
+// because purging promotions is logged-only — the session was upserted, the
+// HEAD published, and no further write should be able to fail the request.
+// This is enforced by closeRecoveredUploadSession not calling purge at all.
+func TestCloseRecoveredUploadSessionDoesNotPropagateRecoveryFlowsErrors(t *testing.T) {
+	handler := NewSeafHTTPHandler(nil, storage.NewManager(), nil, NewMockTokenStore(), nil, nil)
+	// Use a staging store whose Delete* would fail. closeRecoveredUploadSession
+	// must not invoke it — so the fake's promotionDeleteErr should never surface.
+	staging := &fakeUploadStagingStore{promotionDeleteErr: errors.New("delete down")}
+	handler.SetUploadStagingStore(staging)
+
+	if err := handler.closeRecoveredUploadSession(&UploadSessionRecord{
+		OrgID: "org-1", UploadID: "upload-1", RepoID: "repo-1",
+		Filename: "file.txt", CommitID: "commit-1",
+	}); err != nil {
+		t.Fatalf("closeRecoveredUploadSession unexpectedly returned error: %v", err)
+	}
+}
+
+func TestPublishPreparedUploadResumesPendingPromotionMarker(t *testing.T) {
+	handler := NewSeafHTTPHandler(nil, storage.NewManager(), nil, NewMockTokenStore(), nil, nil)
+	staging := &fakeUploadStagingStore{}
+	handler.SetUploadStagingStore(staging)
+	now := time.Now().UTC()
+	staging.promotions = map[string]UploadBlockPromotionRecord{
+		fakeUploadPromotionKey("org-1", "upload-1", 0): {
+			OrgID:       "org-1",
+			UploadID:    "upload-1",
+			BlockIndex:  0,
+			BlockSHA256: "sha256-1",
+			CommitID:    "commit-1",
+			ClaimedAt:   now,
+		},
+	}
+
+	var promoted []string
+	handler.blockPromoter = func(orgID, operationKey, blockID string, sizeBytes int, storageClass, storageKey string) error {
+		promoted = append(promoted, blockID)
+		return nil
+	}
+	var publishCalls int
+	handler.commitPublisher = func(orgID, repoID, commitID string) error {
+		publishCalls++
+		return nil
+	}
+
+	err := handler.publishPreparedUpload("org-1", "repo-1", "upload-1", preparedUploadCommit{CommitID: "commit-1", ActualFilename: "file.txt"}, []uploadBlockPromotion{{
+		BlockIndex:  0,
+		BlockSHA256: "sha256-1",
+	}})
+	if err != nil {
+		t.Fatalf("publishPreparedUpload failed: %v", err)
+	}
+	if len(promoted) != 1 || promoted[0] != "sha256-1" {
+		t.Fatalf("promoted blocks = %v, want [sha256-1]", promoted)
+	}
+	if publishCalls != 1 {
+		t.Fatalf("publish calls = %d, want 1", publishCalls)
+	}
+	promotion := staging.promotions[fakeUploadPromotionKey("org-1", "upload-1", 0)]
+	if promotion.AppliedAt == nil {
+		t.Fatal("expected pending promotion marker to be marked applied")
+	}
+}
+
+func TestPublishPreparedUploadRollsBackResumedPendingPromotionOnPublishFailure(t *testing.T) {
+	handler := NewSeafHTTPHandler(nil, storage.NewManager(), nil, NewMockTokenStore(), nil, nil)
+	staging := &fakeUploadStagingStore{}
+	handler.SetUploadStagingStore(staging)
+	now := time.Now().UTC()
+	staging.promotions = map[string]UploadBlockPromotionRecord{
+		fakeUploadPromotionKey("org-1", "upload-1", 0): {
+			OrgID:       "org-1",
+			UploadID:    "upload-1",
+			BlockIndex:  0,
+			BlockSHA256: "sha256-1",
+			CommitID:    "commit-1",
+			ClaimedAt:   now,
+		},
+	}
+
+	handler.blockPromoter = func(orgID, operationKey, blockID string, sizeBytes int, storageClass, storageKey string) error {
+		return nil
+	}
+	var rolledBackOperationKey string
+	var rolledBackBlockIDs []string
+	handler.blockRollback = func(orgID, operationKey string, blockIDs []string) []string {
+		rolledBackOperationKey = operationKey
+		rolledBackBlockIDs = append([]string(nil), blockIDs...)
+		return nil
+	}
+	handler.commitPublisher = func(orgID, repoID, commitID string) error {
+		return errors.New("publish failed")
+	}
+
+	err := handler.publishPreparedUpload("org-1", "repo-1", "upload-1", preparedUploadCommit{CommitID: "commit-1", ActualFilename: "file.txt"}, []uploadBlockPromotion{{
+		BlockIndex:  0,
+		BlockSHA256: "sha256-1",
+	}})
+	if err == nil {
+		t.Fatal("expected publishPreparedUpload to fail")
+	}
+	if rolledBackOperationKey == "" {
+		t.Fatal("expected rollback operation key to be recorded")
+	}
+	if len(rolledBackBlockIDs) != 1 || rolledBackBlockIDs[0] != "sha256-1" {
+		t.Fatalf("rolled back block IDs = %v, want [sha256-1]", rolledBackBlockIDs)
+	}
+	if _, ok := staging.promotions[fakeUploadPromotionKey("org-1", "upload-1", 0)]; ok {
+		t.Fatal("expected resumed pending promotion claim to be released after publish failure")
 	}
 }
 

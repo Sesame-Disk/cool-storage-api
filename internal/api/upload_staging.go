@@ -90,6 +90,7 @@ type UploadBlockPromotionAttempt struct {
 	Inserted    bool
 	BlockSHA256 string
 	CommitID    string
+	ClaimedAt   *time.Time
 	AppliedAt   *time.Time
 }
 
@@ -102,6 +103,7 @@ type UploadStagingStore interface {
 	TryStartBlockPromotion(record UploadBlockPromotionRecord) (UploadBlockPromotionAttempt, error)
 	MarkBlockPromotionApplied(orgID, uploadID string, blockIndex int, appliedAt time.Time) error
 	DeleteBlockPromotion(orgID, uploadID string, blockIndex int) error
+	DeleteAllBlockPromotions(orgID, uploadID string) error
 }
 
 type CassandraUploadStagingStore struct {
@@ -338,6 +340,7 @@ func (s *CassandraUploadStagingStore) TryStartBlockPromotion(record UploadBlockP
 			Inserted:    true,
 			BlockSHA256: record.BlockSHA256,
 			CommitID:    record.CommitID,
+			ClaimedAt:   &record.ClaimedAt,
 		}, nil
 	}
 
@@ -355,6 +358,7 @@ func (s *CassandraUploadStagingStore) TryStartBlockPromotion(record UploadBlockP
 			Inserted:    true,
 			BlockSHA256: record.BlockSHA256,
 			CommitID:    record.CommitID,
+			ClaimedAt:   &record.ClaimedAt,
 		}, nil
 	}
 
@@ -362,6 +366,7 @@ func (s *CassandraUploadStagingStore) TryStartBlockPromotion(record UploadBlockP
 		Inserted:    false,
 		BlockSHA256: uploadPromotionStringValue(existing, "block_sha256"),
 		CommitID:    uploadPromotionStringValue(existing, "commit_id"),
+		ClaimedAt:   uploadPromotionTimeValue(existing, "claimed_at"),
 		AppliedAt:   uploadPromotionTimeValue(existing, "applied_at"),
 	}, nil
 }
@@ -395,6 +400,27 @@ func (s *CassandraUploadStagingStore) DeleteBlockPromotion(orgID, uploadID strin
 	return s.db.Session().Query(`
 		DELETE FROM upload_block_promotions WHERE org_id = ? AND upload_id = ? AND block_index = ?
 	`, orgID, uploadID, blockIndex).Exec()
+}
+
+// DeleteAllBlockPromotions removes every promotion claim for an upload. This is
+// invoked when a session reaches a terminal state (Closed/Aborted) so that a
+// subsequent upload reusing the same uploadID (e.g. a new revision of the same
+// path/filename) starts with a clean slate. Without this, TryStartBlockPromotion
+// in the new upload would see the previous claim and reject with
+// "promotion marker mismatch" because the BlockSHA256/CommitID differ.
+func (s *CassandraUploadStagingStore) DeleteAllBlockPromotions(orgID, uploadID string) error {
+	if strings.TrimSpace(orgID) == "" {
+		return fmt.Errorf("org id is required")
+	}
+	if strings.TrimSpace(uploadID) == "" {
+		return fmt.Errorf("upload id is required")
+	}
+	if s == nil || s.db == nil {
+		return nil
+	}
+	return s.db.Session().Query(`
+		DELETE FROM upload_block_promotions WHERE org_id = ? AND upload_id = ?
+	`, orgID, uploadID).Exec()
 }
 
 func uploadPromotionStringValue(row map[string]interface{}, key string) string {
