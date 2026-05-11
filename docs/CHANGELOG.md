@@ -8,6 +8,65 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-05-11 — Upload latency: preflush contiguous blocks during chunked upload
+
+### Problem
+
+Chunked uploads only started writing blocks to S3 once the last chunk arrived
+and `finalizeUploadStreaming` ran. For multi-block files (anything larger
+than 8 MB), the entire S3 fan-out and per-block accounting was serialized
+behind the wire-time of the last byte even though earlier 8 MB regions were
+already complete on disk and could have been promoted in the background.
+
+### Fix
+
+- `internal/api/seafhttp.go`
+  - opportunistically uploads any contiguous 8 MB region as soon as its
+    bytes are durable in the temp file, after each chunk write
+  - reserves the next preflush index atomically inside
+    `NextFlushableContiguousBlock` so concurrent chunk handlers never race
+    on the same block
+  - records preflushed block metadata on `ChunkUpload` so the finalize loop
+    skips re-encrypting / re-uploading what's already in S3 while still
+    emitting the normal block-id mappings and pending promotions
+  - bails out of the preflush path if the library `encrypted` flag cannot
+    be read (refuses to risk uploading plaintext blocks for an encrypted
+    library on a transient DB error)
+  - introduces injectable `uploadBlockResolver` / `uploadBlockWriter` /
+    `uploadOrphanCleaner` hooks so the preflush path is unit-testable
+    without a real block store
+  - clears the pending S3 orphan marker once a block promotion is applied,
+    keeping the rollback marker meaningful for sessions that never finalize
+
+- `internal/api/seafhttp_test.go`
+  - adds focused coverage for preflushing the first full 8 MB block before
+    finalize runs, including retransmission of the same chunk and orphan-
+    marker bookkeeping
+
+- `internal/integration/upload_download_test.go`
+  - adds chunked end-to-end coverage for retransmitting a chunk and then
+    reusing the same upload link for a later revision of the same file
+  - adds an 8 MB + tail end-to-end regression that actually exercises the
+    preflush path (block 0 promoted mid-upload, block 1 promoted at
+    finalize) across two upload-link revisions
+
+### Validation
+
+- Focused unit coverage for the preflush slice is green
+  (`go test ./internal/api -run HandleUploadChunked`)
+- Targeted integration regressions for upload-link reuse and chunked
+  upload-link reuse are green
+- Canonical backend validation is green via
+  `docker compose --profile test run --rm --build go-all-test`
+
+### Scope note
+
+This is a latency optimisation on the existing SeafHTTP/upload-link path;
+the on-disk-then-promote correctness contract is unchanged — preflushed
+blocks still go through the normal promotion/commit path at finalize.
+
+---
+
 ## 2026-05-02 — Config: centralize `SERVER_URL` / branding / S3 creds
 
 ### Refactor

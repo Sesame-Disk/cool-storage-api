@@ -283,6 +283,8 @@ type ChunkUpload struct {
 
 	finalizationStarted    bool
 	accountedBlockPosition map[int]string
+	preflushedBlocks       map[int]uploadBlockPromotion
+	nextPreflushBlockIndex int
 	updatedAt              time.Time
 	mu                     sync.Mutex
 }
@@ -681,6 +683,69 @@ func (cu *ChunkUpload) BlockAlreadyAccounted(index int, blockID string) (bool, e
 	return true, nil
 }
 
+// NextFlushableContiguousBlock atomically reserves the next contiguous block
+// available for preflush. On success the cursor is advanced before returning,
+// so concurrent callers never receive the same index. The reservation is not
+// rolled back on failure: a failed preflush simply leaves that block to be
+// re-read and uploaded by the finalize path.
+func (cu *ChunkUpload) NextFlushableContiguousBlock(blockSize int64) (int, int64, int64, bool) {
+	cu.mu.Lock()
+	defer cu.mu.Unlock()
+	if blockSize <= 0 || cu.TotalSize <= blockSize {
+		return 0, 0, 0, false
+	}
+	start := int64(cu.nextPreflushBlockIndex) * blockSize
+	if start+blockSize > cu.TotalSize {
+		return 0, 0, 0, false
+	}
+	end := start + blockSize - 1
+	if !cu.hasRangeLocked(start, end) {
+		return 0, 0, 0, false
+	}
+	reserved := cu.nextPreflushBlockIndex
+	cu.nextPreflushBlockIndex++
+	return reserved, start, end, true
+}
+
+func (cu *ChunkUpload) ReadRange(start, end int64) ([]byte, error) {
+	cu.mu.Lock()
+	defer cu.mu.Unlock()
+	if start < 0 || end < start {
+		return nil, fmt.Errorf("invalid range: start=%d end=%d", start, end)
+	}
+	if _, err := cu.TempFile.Seek(start, io.SeekStart); err != nil {
+		return nil, err
+	}
+	buf := make([]byte, end-start+1)
+	if _, err := io.ReadFull(cu.TempFile, buf); err != nil {
+		return nil, err
+	}
+	return buf, nil
+}
+
+// RecordPreflushedBlock stores the metadata for a block that was successfully
+// preflushed. The preflush cursor is advanced by NextFlushableContiguousBlock
+// when the block was reserved, so this method only records the result.
+func (cu *ChunkUpload) RecordPreflushedBlock(index int, block uploadBlockPromotion) {
+	cu.mu.Lock()
+	defer cu.mu.Unlock()
+	if cu.preflushedBlocks == nil {
+		cu.preflushedBlocks = make(map[int]uploadBlockPromotion)
+	}
+	cu.preflushedBlocks[index] = block
+	cu.updatedAt = time.Now()
+}
+
+func (cu *ChunkUpload) PreflushedBlock(index int) (uploadBlockPromotion, bool) {
+	cu.mu.Lock()
+	defer cu.mu.Unlock()
+	if cu.preflushedBlocks == nil {
+		return uploadBlockPromotion{}, false
+	}
+	block, ok := cu.preflushedBlocks[index]
+	return block, ok
+}
+
 // GetContent reads the complete file content into memory.
 // DEPRECATED for large files: use GetReader instead.
 func (cu *ChunkUpload) GetContent() ([]byte, error) {
@@ -770,9 +835,12 @@ type SeafHTTPHandler struct {
 	permMiddleware       *middleware.PermissionMiddleware
 	uploadStaging        UploadStagingStore
 	uploadOrphanRecorder uploadOrphanRecorderFunc
+	uploadOrphanCleaner  uploadOrphanCleanerFunc
 	blockPromoter        uploadBlockPromoterFunc
 	blockRollback        uploadBlockRollbackFunc
 	commitPublisher      uploadCommitPublisherFunc
+	uploadBlockResolver  uploadBlockStoreResolverFunc
+	uploadBlockWriter    uploadBlockWriterFunc
 	chunkedFinalize      chunkedFinalizeFunc
 	zipMaxEntries        int
 	zipMaxDepth          int
@@ -806,9 +874,12 @@ type uploadBlockPromotion struct {
 type chunkedFinalizeFunc func(c *gin.Context, token *AccessToken, upload *ChunkUpload, uploadID, parentDir, filename, storageKey string, totalSize int64, replace bool) (finalizeUploadResult, error)
 
 type uploadOrphanRecorderFunc func(orgID, blockID, storageClass, errMsg string) error
+type uploadOrphanCleanerFunc func(orgID, blockID string) error
 type uploadBlockPromoterFunc func(orgID, operationKey, blockID string, sizeBytes int, storageClass, storageKey string) error
 type uploadBlockRollbackFunc func(orgID, operationKey string, blockIDs []string) []string
 type uploadCommitPublisherFunc func(orgID, repoID, commitID string) error
+type uploadBlockStoreResolverFunc func(c *gin.Context, token *AccessToken) (*storage.BlockStore, string, error)
+type uploadBlockWriterFunc func(ctx context.Context, blockStore *storage.BlockStore, hash string, data []byte) (string, error)
 
 const (
 	defaultZipMaxEntries     = 100000
@@ -876,6 +947,16 @@ func NewSeafHTTPHandler(s3Store *storage.S3Store, storageManager *storage.Manage
 	}
 	handler.chunkedFinalize = handler.finalizeUploadStreaming
 	handler.uploadOrphanRecorder = handler.recordUploadS3OrphanRow
+	handler.uploadOrphanCleaner = handler.deleteUploadS3OrphanRow
+	handler.uploadBlockResolver = func(c *gin.Context, token *AccessToken) (*storage.BlockStore, string, error) {
+		return handler.resolveLibraryBlockStore(httputil.GetRoutingHostname(c, handler.configuredServerURL()), token.OrgID, token.RepoID)
+	}
+	handler.uploadBlockWriter = func(ctx context.Context, blockStore *storage.BlockStore, hash string, data []byte) (string, error) {
+		if blockStore == nil {
+			return "", fmt.Errorf("block store is not available")
+		}
+		return blockStore.PutBlockAuto(ctx, hash, data)
+	}
 	handler.blockPromoter = func(orgID, operationKey, blockID string, sizeBytes int, storageClass, storageKey string) error {
 		return v2.NewFSHelper(handler.db).IncrementOrCreateBlockOnce(orgID, operationKey, blockID, sizeBytes, storageClass, storageKey)
 	}
@@ -894,6 +975,15 @@ func (h *SeafHTTPHandler) SetUploadStagingStore(store UploadStagingStore) {
 
 func (h *SeafHTTPHandler) SetUploadOrphanRecorder(recorder uploadOrphanRecorderFunc) {
 	h.uploadOrphanRecorder = recorder
+}
+
+func (h *SeafHTTPHandler) clearUploadS3Orphan(orgID, blockID string) {
+	if h == nil || h.uploadOrphanCleaner == nil || strings.TrimSpace(blockID) == "" {
+		return
+	}
+	if err := h.uploadOrphanCleaner(orgID, blockID); err != nil {
+		log.Printf("[HandleUpload] WARNING: Failed to clear pending S3 orphan org=%s block=%s: %v", orgID, shortLogID(blockID), err)
+	}
 }
 
 func shortLogID(id string) string {
@@ -959,6 +1049,19 @@ func (h *SeafHTTPHandler) recordUploadS3OrphanRow(orgID, blockID, storageClass, 
 		SET last_attempt_at = ?, retry_count = ?, last_error = ?
 		WHERE org_id = ? AND block_id = ?
 	`, now, prev+1, errMsg, parsedOrgID, blockID).Exec()
+}
+
+func (h *SeafHTTPHandler) deleteUploadS3OrphanRow(orgID, blockID string) error {
+	if h == nil || h.db == nil || strings.TrimSpace(blockID) == "" {
+		return nil
+	}
+	parsedOrgID, err := uuid.Parse(strings.TrimSpace(orgID))
+	if err != nil {
+		return fmt.Errorf("parse org id for S3 orphan delete: %w", err)
+	}
+	return h.db.Session().Query(`
+		DELETE FROM gc_s3_orphans WHERE org_id = ? AND block_id = ?
+	`, parsedOrgID, blockID).Exec()
 }
 
 func (h *SeafHTTPHandler) rollbackPromotedUploadBlocks(orgID, uploadID, commitID string, blockIDs []string) {
@@ -1349,10 +1452,130 @@ func (h *SeafHTTPHandler) applyUploadBlockPromotion(orgID, uploadID, commitID st
 	promotedAt := time.Now().UTC()
 	if h.uploadStaging != nil {
 		if err := h.uploadStaging.MarkBlockPromotionApplied(orgID, uploadID, block.BlockIndex, promotedAt); err != nil {
+			h.clearUploadS3Orphan(orgID, block.BlockSHA256)
 			return promotedAt, true, err
 		}
 	}
+	h.clearUploadS3Orphan(orgID, block.BlockSHA256)
 	return promotedAt, true, nil
+}
+
+func (h *SeafHTTPHandler) preflushChunkUploadBlocks(c *gin.Context, token *AccessToken, upload *ChunkUpload, uploadID string) {
+	if h == nil || upload == nil || token == nil || upload.TotalSize <= uploadBlockSize || h.uploadBlockResolver == nil || h.uploadBlockWriter == nil {
+		return
+	}
+
+	var encrypted bool
+	var fileKey, fileIV []byte
+	if h.db != nil {
+		if err := h.db.Session().Query(`
+			SELECT encrypted FROM libraries WHERE org_id = ? AND library_id = ?
+		`, token.OrgID, token.RepoID).Scan(&encrypted); err != nil {
+			// Don't risk uploading plaintext for an encrypted library — bail out
+			// and let finalize handle the blocks once we can read the flag.
+			log.Printf("[HandleUpload] WARNING: Skipping preflush; failed to read library encryption flag org=%s repo=%s: %v", token.OrgID, token.RepoID, err)
+			return
+		}
+	}
+	if encrypted {
+		fileKey, fileIV = v2.GetDecryptSessions().GetFileKeyAndIV(token.UserID, token.RepoID)
+		if fileKey == nil {
+			return
+		}
+	}
+
+	blockStore, actualStorageClass, err := h.uploadBlockResolver(c, token)
+	if err != nil {
+		log.Printf("[HandleUpload] WARNING: Failed to resolve block store for chunk preflush: %v", err)
+		return
+	}
+
+	for {
+		blockIndex, start, end, ok := upload.NextFlushableContiguousBlock(uploadBlockSize)
+		if !ok {
+			return
+		}
+
+		plaintextBlock, err := upload.ReadRange(start, end)
+		if err != nil {
+			log.Printf("[HandleUpload] WARNING: Failed to read contiguous chunk block %d for preflush: %v", blockIndex, err)
+			return
+		}
+
+		blockSHA1Hash := sha1.Sum(plaintextBlock)
+		blockSHA1ID := hex.EncodeToString(blockSHA1Hash[:])
+		storedBlock := plaintextBlock
+		if fileKey != nil {
+			encryptedBlock, encErr := crypto.EncryptBlockSeafile(plaintextBlock, fileKey, fileIV)
+			if encErr != nil {
+				log.Printf("[HandleUpload] WARNING: Failed to encrypt preflush block %d: %v", blockIndex, encErr)
+				return
+			}
+			storedBlock = encryptedBlock
+		}
+
+		sha256Hash := sha256.Sum256(storedBlock)
+		sha256ID := hex.EncodeToString(sha256Hash[:])
+		uploadedAt := time.Now().UTC()
+		promotion := uploadBlockPromotion{
+			BlockIndex:   blockIndex,
+			BlockSHA1:    blockSHA1ID,
+			BlockSHA256:  sha256ID,
+			SizeBytes:    len(storedBlock),
+			StorageClass: actualStorageClass,
+			StorageKey:   sha256ID,
+			Source:       UploadBlockSourceNewObject,
+			CreatedAt:    upload.CreatedAt.UTC(),
+			UploadedAt:   &uploadedAt,
+		}
+
+		if err := upload.AccountBlockOnce(blockIndex, sha256ID, func() error {
+			registeredAt := time.Now().UTC()
+			if h.uploadStaging != nil {
+				h.persistUploadBlockState(UploadSessionBlockRecord{
+					UploadID:     uploadID,
+					BlockIndex:   blockIndex,
+					OrgID:        token.OrgID,
+					BlockSHA1:    blockSHA1ID,
+					BlockSHA256:  sha256ID,
+					SizeBytes:    len(storedBlock),
+					StorageClass: actualStorageClass,
+					StorageKey:   sha256ID,
+					Source:       UploadBlockSourceNewObject,
+					State:        UploadBlockStateRegistered,
+					CreatedAt:    upload.CreatedAt.UTC(),
+					UpdatedAt:    registeredAt,
+				}, string(UploadBlockStateRegistered))
+			}
+			if _, err := h.uploadBlockWriter(c.Request.Context(), blockStore, sha256ID, storedBlock); err != nil {
+				return err
+			}
+			h.persistUploadS3Orphan(token.OrgID, sha256ID, actualStorageClass, "")
+			if h.uploadStaging != nil {
+				h.persistUploadBlockState(UploadSessionBlockRecord{
+					UploadID:     uploadID,
+					BlockIndex:   blockIndex,
+					OrgID:        token.OrgID,
+					BlockSHA1:    blockSHA1ID,
+					BlockSHA256:  sha256ID,
+					SizeBytes:    len(storedBlock),
+					StorageClass: actualStorageClass,
+					StorageKey:   sha256ID,
+					Source:       UploadBlockSourceNewObject,
+					State:        UploadBlockStateUploaded,
+					CreatedAt:    upload.CreatedAt.UTC(),
+					UpdatedAt:    uploadedAt,
+					UploadedAt:   &uploadedAt,
+				}, string(UploadBlockStateUploaded))
+			}
+			return nil
+		}); err != nil {
+			log.Printf("[HandleUpload] WARNING: Failed to preflush chunk block %d: %v", blockIndex, err)
+			return
+		}
+
+		upload.RecordPreflushedBlock(blockIndex, promotion)
+	}
 }
 
 func (h *SeafHTTPHandler) SetZipLimits(maxEntries, maxDepth int, maxBytes int64) {
@@ -1637,6 +1860,7 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to write chunk"})
 			return
 		}
+		h.preflushChunkUploadBlocks(c, token, upload, uploadID)
 
 		if !upload.TryStartFinalization() {
 			log.Printf("[HandleUpload] Chunk received, waiting for more: %d/%d", end+1, total)
@@ -2111,6 +2335,7 @@ readLoop:
 			defer func() { <-sem }()
 
 			storedBlock := blockDataLocal
+			blockStorageClass := actualStorageClass
 			if fileKey != nil {
 				enc, encErr := crypto.EncryptBlockSeafile(blockDataLocal, fileKey, fileIV)
 				if encErr != nil {
@@ -2122,7 +2347,23 @@ readLoop:
 			sha256Hash := sha256.Sum256(storedBlock)
 			sha256ID := hex.EncodeToString(sha256Hash[:])
 			var uploadedAt *time.Time
-			if h.uploadStaging != nil {
+			preflushedBlock, preflushed := upload.PreflushedBlock(blockIndexLocal)
+			alreadyAccounted, accountErr := upload.BlockAlreadyAccounted(blockIndexLocal, sha256ID)
+			if accountErr != nil {
+				return fmt.Errorf("preflushed block %d mismatch: %w", blockIndexLocal, accountErr)
+			}
+			if alreadyAccounted {
+				if !preflushed {
+					return fmt.Errorf("block %d was marked preflushed but metadata is missing", blockIndexLocal)
+				}
+				if preflushedBlock.BlockSHA1 != "" && preflushedBlock.BlockSHA1 != blockSHA1IDLocal {
+					return fmt.Errorf("preflushed block %d SHA-1 mismatch", blockIndexLocal)
+				}
+				uploadedAt = preflushedBlock.UploadedAt
+				if preflushedBlock.StorageClass != "" {
+					blockStorageClass = preflushedBlock.StorageClass
+				}
+			} else if h.uploadStaging != nil {
 				registeredAt := time.Now().UTC()
 				h.persistUploadBlockState(UploadSessionBlockRecord{
 					UploadID:     uploadID,
@@ -2131,7 +2372,7 @@ readLoop:
 					BlockSHA1:    blockSHA1IDLocal,
 					BlockSHA256:  sha256ID,
 					SizeBytes:    len(storedBlock),
-					StorageClass: actualStorageClass,
+					StorageClass: blockStorageClass,
 					StorageKey:   sha256ID,
 					Source:       UploadBlockSourceNewObject,
 					State:        UploadBlockStateRegistered,
@@ -2140,10 +2381,12 @@ readLoop:
 				}, string(UploadBlockStateRegistered))
 			}
 
-			if _, putErr := blockStore.PutBlockAuto(egCtx, sha256ID, storedBlock); putErr != nil {
-				return fmt.Errorf("failed to store block: %w", putErr)
+			if !alreadyAccounted {
+				if _, putErr := h.uploadBlockWriter(egCtx, blockStore, sha256ID, storedBlock); putErr != nil {
+					return fmt.Errorf("failed to store block: %w", putErr)
+				}
 			}
-			if h.uploadStaging != nil {
+			if h.uploadStaging != nil && !alreadyAccounted {
 				uploadedAtValue := time.Now().UTC()
 				uploadedAt = &uploadedAtValue
 				h.persistUploadBlockState(UploadSessionBlockRecord{
@@ -2153,7 +2396,7 @@ readLoop:
 					BlockSHA1:    blockSHA1IDLocal,
 					BlockSHA256:  sha256ID,
 					SizeBytes:    len(storedBlock),
-					StorageClass: actualStorageClass,
+					StorageClass: blockStorageClass,
 					StorageKey:   sha256ID,
 					Source:       UploadBlockSourceNewObject,
 					State:        UploadBlockStateUploaded,
@@ -2168,7 +2411,7 @@ readLoop:
 				INSERT INTO block_id_mappings (org_id, external_id, internal_id) VALUES (?, ?, ?)
 			`, token.OrgID, blockSHA1IDLocal, sha256ID).Exec(); mapErr != nil {
 				log.Printf("[finalizeUploadStreaming] CRITICAL: Failed to write block_id_mapping org=%s ext=%s int=%s: %v", token.OrgID, blockSHA1IDLocal[:16], sha256ID[:16], mapErr)
-				h.persistUploadS3Orphan(token.OrgID, sha256ID, actualStorageClass, mapErr.Error())
+				h.persistUploadS3Orphan(token.OrgID, sha256ID, blockStorageClass, mapErr.Error())
 				return fmt.Errorf("failed to create block mapping: %w", mapErr)
 			}
 
@@ -2180,18 +2423,25 @@ readLoop:
 				log.Printf("[finalizeUploadStreaming] WARNING: Failed to write reverse block_id_mapping org=%s int=%s ext=%s: %v", token.OrgID, sha256ID[:16], blockSHA1IDLocal[:16], revErr)
 			}
 
-			pendingPromotionsMu.Lock()
-			pendingPromotions = append(pendingPromotions, uploadBlockPromotion{
+			pendingPromotion := uploadBlockPromotion{
 				BlockIndex:   blockIndexLocal,
 				BlockSHA1:    blockSHA1IDLocal,
 				BlockSHA256:  sha256ID,
 				SizeBytes:    len(storedBlock),
-				StorageClass: actualStorageClass,
+				StorageClass: blockStorageClass,
 				StorageKey:   sha256ID,
 				Source:       UploadBlockSourceNewObject,
 				CreatedAt:    upload.CreatedAt.UTC(),
 				UploadedAt:   uploadedAt,
-			})
+			}
+			if preflushed {
+				pendingPromotion.Source = preflushedBlock.Source
+				if preflushedBlock.StorageKey != "" {
+					pendingPromotion.StorageKey = preflushedBlock.StorageKey
+				}
+			}
+			pendingPromotionsMu.Lock()
+			pendingPromotions = append(pendingPromotions, pendingPromotion)
 			pendingPromotionsMu.Unlock()
 
 			upload.Touch()

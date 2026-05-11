@@ -15,6 +15,8 @@ import (
 	"time"
 )
 
+const chunkedPreflushIntegrationBlockSize = 8 * 1024 * 1024
+
 func uploadFileThroughLink(t *testing.T, c *testClient, uploadURL, fileName, parentDir, content string) {
 	t.Helper()
 
@@ -50,6 +52,77 @@ func uploadFileThroughLink(t *testing.T, c *testClient, uploadURL, fileName, par
 		body, _ := io.ReadAll(resp.Body)
 		t.Fatalf("upload failed with status %d: %s", resp.StatusCode, string(body))
 	}
+}
+
+func uploadChunkThroughLink(t *testing.T, c *testClient, uploadURL, fileName, parentDir string, chunk []byte, start, end, total int) {
+	t.Helper()
+
+	var buf bytes.Buffer
+	writer := multipart.NewWriter(&buf)
+	part, err := writer.CreateFormFile("file", fileName)
+	if err != nil {
+		t.Fatalf("CreateFormFile failed: %v", err)
+	}
+	if _, err := part.Write(chunk); err != nil {
+		t.Fatalf("writing chunk content failed: %v", err)
+	}
+	if err := writer.WriteField("parent_dir", parentDir); err != nil {
+		t.Fatalf("WriteField failed: %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("closing multipart writer failed: %v", err)
+	}
+
+	req, err := http.NewRequest(http.MethodPost, uploadURL, &buf)
+	if err != nil {
+		t.Fatalf("creating chunk upload request failed: %v", err)
+	}
+	req.Header.Set("Authorization", "Token "+c.token)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	req.Header.Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, total))
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		t.Fatalf("chunk upload request failed: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("chunk upload failed with status %d: %s", resp.StatusCode, string(body))
+	}
+}
+
+func uploadChunkedBytesThroughLink(t *testing.T, c *testClient, uploadURL, fileName, parentDir string, content []byte, firstChunkSize int, repeatFirstChunk bool) {
+	t.Helper()
+
+	if len(content) < 2 {
+		t.Fatalf("chunked upload content must be at least 2 bytes, got %d", len(content))
+	}
+	if firstChunkSize <= 0 || firstChunkSize >= len(content) {
+		t.Fatalf("first chunk size must be between 1 and %d, got %d", len(content)-1, firstChunkSize)
+	}
+	first := content[:firstChunkSize]
+	second := content[firstChunkSize:]
+
+	uploadChunkThroughLink(t, c, uploadURL, fileName, parentDir, first, 0, firstChunkSize-1, len(content))
+	if repeatFirstChunk {
+		uploadChunkThroughLink(t, c, uploadURL, fileName, parentDir, first, 0, firstChunkSize-1, len(content))
+	}
+	uploadChunkThroughLink(t, c, uploadURL, fileName, parentDir, second, firstChunkSize, len(content)-1, len(content))
+}
+
+func uploadChunkedFileThroughLink(t *testing.T, c *testClient, uploadURL, fileName, parentDir string, content string, repeatFirstChunk bool) {
+	t.Helper()
+
+	data := []byte(content)
+	if len(data) < 2 {
+		t.Fatalf("chunked upload content must be at least 2 bytes, got %d", len(data))
+	}
+	middle := len(data) / 2
+	if middle == 0 {
+		middle = 1
+	}
+	uploadChunkedBytesThroughLink(t, c, uploadURL, fileName, parentDir, data, middle, repeatFirstChunk)
 }
 
 // TestUploadAndDownloadRoundTrip simulates the full frontend upload/download flow:
@@ -469,6 +542,125 @@ func TestUploadLinkReuseCreatesMultipleRevisions(t *testing.T) {
 		}
 		if len(items) < 3 {
 			t.Fatalf("revision count = %d, want at least 3 after reusing the same upload URL", len(items))
+		}
+	})
+}
+
+func TestChunkedUploadLinkReuseCreatesMultipleRevisions(t *testing.T) {
+	name := fmt.Sprintf("inttest-chunked-link-reuse-%d", time.Now().UnixNano())
+	repoID := createTestLibrary(t, adminClient, name)
+	fileName := "chunked-link-reuse.txt"
+
+	resp := adminClient.Get(t, fmt.Sprintf("/api2/repos/%s/upload-link/?p=/", repoID))
+	expectStatus(t, resp, http.StatusOK)
+	uploadURL := strings.Trim(responseBody(t, resp), "\" \n\r")
+	if uploadURL == "" {
+		t.Fatal("upload URL is empty")
+	}
+
+	uploadChunkedFileThroughLink(t, adminClient, uploadURL, fileName, "/", "chunked retry version 1", true)
+	uploadChunkedFileThroughLink(t, adminClient, uploadURL, fileName, "/", "chunked retry version 2", false)
+
+	t.Run("current content is latest chunked revision", func(t *testing.T) {
+		resp := adminClient.Get(t, fmt.Sprintf("/api2/repos/%s/file/?p=/%s", repoID, fileName))
+		expectStatus(t, resp, http.StatusOK)
+		downloadURL := strings.Trim(responseBody(t, resp), "\" \n\r")
+
+		req, err := http.NewRequest(http.MethodGet, downloadURL, nil)
+		if err != nil {
+			t.Fatalf("creating download request failed: %v", err)
+		}
+		dlResp, err := adminClient.http.Do(req)
+		if err != nil {
+			t.Fatalf("download request failed: %v", err)
+		}
+		defer dlResp.Body.Close()
+		if dlResp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(dlResp.Body)
+			t.Fatalf("download failed with status %d: %s", dlResp.StatusCode, string(body))
+		}
+		content, err := io.ReadAll(dlResp.Body)
+		if err != nil {
+			t.Fatalf("reading download body failed: %v", err)
+		}
+		if got := string(content); got != "chunked retry version 2" {
+			t.Fatalf("downloaded content = %q, want %q", got, "chunked retry version 2")
+		}
+	})
+
+	t.Run("history contains both chunked revisions", func(t *testing.T) {
+		revisionsResp := adminClient.Get(t, fmt.Sprintf("/api2/repo/file_revisions/%s/?p=/%s", repoID, fileName))
+		expectStatus(t, revisionsResp, http.StatusOK)
+
+		payload := responseJSON(t, revisionsResp)
+		items, ok := payload["data"].([]interface{})
+		if !ok {
+			t.Fatalf("expected data array in revisions response, got %v", payload)
+		}
+		if len(items) < 2 {
+			t.Fatalf("revision count = %d, want at least 2 after chunked upload-link reuse", len(items))
+		}
+	})
+}
+
+func TestChunkedUploadLinkReusePreflushesLargeRevisions(t *testing.T) {
+	name := fmt.Sprintf("inttest-chunked-preflush-link-reuse-%d", time.Now().UnixNano())
+	repoID := createTestLibrary(t, adminClient, name)
+	fileName := "chunked-preflush-link-reuse.bin"
+
+	resp := adminClient.Get(t, fmt.Sprintf("/api2/repos/%s/upload-link/?p=/", repoID))
+	expectStatus(t, resp, http.StatusOK)
+	uploadURL := strings.Trim(responseBody(t, resp), "\" \n\r")
+	if uploadURL == "" {
+		t.Fatal("upload URL is empty")
+	}
+
+	version1 := append(bytes.Repeat([]byte("a"), chunkedPreflushIntegrationBlockSize), []byte("-version-1-tail")...)
+	version2 := append(bytes.Repeat([]byte("b"), chunkedPreflushIntegrationBlockSize), []byte("-version-2-tail")...)
+
+	uploadChunkedBytesThroughLink(t, adminClient, uploadURL, fileName, "/", version1, chunkedPreflushIntegrationBlockSize, true)
+	uploadChunkedBytesThroughLink(t, adminClient, uploadURL, fileName, "/", version2, chunkedPreflushIntegrationBlockSize, false)
+
+	t.Run("current content is latest large chunked revision", func(t *testing.T) {
+		resp := adminClient.Get(t, fmt.Sprintf("/api2/repos/%s/file/?p=/%s", repoID, fileName))
+		expectStatus(t, resp, http.StatusOK)
+		downloadURL := strings.Trim(responseBody(t, resp), "\" \n\r")
+
+		req, err := http.NewRequest(http.MethodGet, downloadURL, nil)
+		if err != nil {
+			t.Fatalf("creating download request failed: %v", err)
+		}
+		dlResp, err := adminClient.http.Do(req)
+		if err != nil {
+			t.Fatalf("download request failed: %v", err)
+		}
+		defer dlResp.Body.Close()
+		if dlResp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(dlResp.Body)
+			t.Fatalf("download failed with status %d: %s", dlResp.StatusCode, string(body))
+		}
+		content, err := io.ReadAll(dlResp.Body)
+		if err != nil {
+			t.Fatalf("reading download body failed: %v", err)
+		}
+		if !bytes.Equal(content, version2) {
+			expectedHash := sha256.Sum256(version2)
+			actualHash := sha256.Sum256(content)
+			t.Fatalf("downloaded large content hash = %s, want %s", hex.EncodeToString(actualHash[:]), hex.EncodeToString(expectedHash[:]))
+		}
+	})
+
+	t.Run("history contains both large chunked revisions", func(t *testing.T) {
+		revisionsResp := adminClient.Get(t, fmt.Sprintf("/api2/repo/file_revisions/%s/?p=/%s", repoID, fileName))
+		expectStatus(t, revisionsResp, http.StatusOK)
+
+		payload := responseJSON(t, revisionsResp)
+		items, ok := payload["data"].([]interface{})
+		if !ok {
+			t.Fatalf("expected data array in revisions response, got %v", payload)
+		}
+		if len(items) < 2 {
+			t.Fatalf("revision count = %d, want at least 2 after large chunked upload-link reuse", len(items))
 		}
 	})
 }

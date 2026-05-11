@@ -3,6 +3,8 @@ package api
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"io"
 	"mime/multipart"
@@ -1229,6 +1231,97 @@ func TestHandleUploadChunked_PreservesClosedSessionUntilFinalize(t *testing.T) {
 		t.Fatalf("final commit id = %q, want commit-next", staging.sessions[len(staging.sessions)-1].CommitID)
 	}
 	chunkManager.CleanupUpload(tokenStr, "retry.txt")
+}
+
+func TestHandleUploadChunked_PreflushesContiguousBlockBeforeFinalize(t *testing.T) {
+	tm := NewTokenManager(time.Hour)
+	tokenStr, err := tm.CreateUploadToken("org-1", "repo-1", "/", "user-1")
+	if err != nil {
+		t.Fatalf("CreateUploadToken failed: %v", err)
+	}
+	staging := &fakeUploadStagingStore{}
+	handler := NewSeafHTTPHandler(nil, storage.NewManager(), nil, tm, nil, nil)
+	handler.SetUploadStagingStore(staging)
+	handler.uploadBlockResolver = func(c *gin.Context, token *AccessToken) (*storage.BlockStore, string, error) {
+		return nil, "hot", nil
+	}
+	var uploadedHashes []string
+	handler.uploadBlockWriter = func(ctx context.Context, blockStore *storage.BlockStore, hash string, data []byte) (string, error) {
+		uploadedHashes = append(uploadedHashes, hash)
+		return hash, nil
+	}
+	var orphanBlocks []string
+	handler.SetUploadOrphanRecorder(func(orgID, blockID, storageClass, errMsg string) error {
+		orphanBlocks = append(orphanBlocks, blockID)
+		return nil
+	})
+
+	fullBlock := bytes.Repeat([]byte("a"), uploadBlockSize)
+	tail := []byte("xyz")
+	expectedSHA256 := sha256.Sum256(fullBlock)
+	expectedSHA256Hex := hex.EncodeToString(expectedSHA256[:])
+	handler.chunkedFinalize = func(c *gin.Context, token *AccessToken, upload *ChunkUpload, uploadID, parentDir, filename, storageKey string, totalSize int64, replace bool) (finalizeUploadResult, error) {
+		if len(uploadedHashes) != 1 {
+			t.Fatalf("preflush upload calls = %d, want 1", len(uploadedHashes))
+		}
+		if uploadedHashes[0] != expectedSHA256Hex {
+			t.Fatalf("preflushed hash = %q, want %q", uploadedHashes[0], expectedSHA256Hex)
+		}
+		alreadyAccounted, err := upload.BlockAlreadyAccounted(0, expectedSHA256Hex)
+		if err != nil {
+			t.Fatalf("BlockAlreadyAccounted failed: %v", err)
+		}
+		if !alreadyAccounted {
+			t.Fatal("expected first full block to be accounted before finalize")
+		}
+		preflushed, ok := upload.PreflushedBlock(0)
+		if !ok {
+			t.Fatal("expected first full block to be available as preflushed metadata")
+		}
+		if preflushed.BlockSHA256 != expectedSHA256Hex {
+			t.Fatalf("preflushed sha256 = %q, want %q", preflushed.BlockSHA256, expectedSHA256Hex)
+		}
+		if preflushed.UploadedAt == nil {
+			t.Fatal("expected preflushed block to carry uploaded timestamp")
+		}
+		return finalizeUploadResult{FileID: "file-id", ActualFilename: filename, CommitID: "commit-id"}, nil
+	}
+
+	r := gin.New()
+	r.POST("/seafhttp/upload-api/:token", handler.HandleUpload)
+
+	makeRequest := func(contentRange string, payload []byte) *httptest.ResponseRecorder {
+		var body bytes.Buffer
+		writer := multipart.NewWriter(&body)
+		part, _ := writer.CreateFormFile("file", "preflush.txt")
+		_, _ = part.Write(payload)
+		writer.Close()
+
+		req := httptest.NewRequest(http.MethodPost, "/seafhttp/upload-api/"+tokenStr+"?ret-json=1", &body)
+		req.Header.Set("Content-Type", writer.FormDataContentType())
+		req.Header.Set("Content-Range", contentRange)
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+		return w
+	}
+
+	totalSize := uploadBlockSize + len(tail)
+	first := makeRequest("bytes 0-"+strconv.Itoa(uploadBlockSize-1)+"/"+strconv.Itoa(totalSize), fullBlock)
+	if first.Code != http.StatusOK {
+		t.Fatalf("first status = %d, want %d", first.Code, http.StatusOK)
+	}
+	retransmit := makeRequest("bytes 0-"+strconv.Itoa(uploadBlockSize-1)+"/"+strconv.Itoa(totalSize), fullBlock)
+	if retransmit.Code != http.StatusOK {
+		t.Fatalf("retransmit status = %d, want %d", retransmit.Code, http.StatusOK)
+	}
+	final := makeRequest("bytes "+strconv.Itoa(uploadBlockSize)+"-"+strconv.Itoa(totalSize-1)+"/"+strconv.Itoa(totalSize), tail)
+	if final.Code != http.StatusOK {
+		t.Fatalf("final status = %d, want %d", final.Code, http.StatusOK)
+	}
+	if len(orphanBlocks) != 1 || orphanBlocks[0] != expectedSHA256Hex {
+		t.Fatalf("recorded orphan blocks = %v, want [%s]", orphanBlocks, expectedSHA256Hex)
+	}
+	chunkManager.CleanupUpload(tokenStr, "preflush.txt")
 }
 
 func TestPersistUploadBlockStateSwallowsErrors(t *testing.T) {
