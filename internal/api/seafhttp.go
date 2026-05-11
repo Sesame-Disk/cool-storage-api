@@ -1029,6 +1029,24 @@ func (h *SeafHTTPHandler) closeRecoveredUploadSession(session *UploadSessionReco
 	})
 }
 
+func shouldPreserveUploadSession(existing *UploadSessionRecord) bool {
+	if existing == nil {
+		return false
+	}
+	switch existing.State {
+	case UploadSessionStateClosed, UploadSessionStatePromoting:
+		return strings.TrimSpace(existing.CommitID) != ""
+	case UploadSessionStateCleanupPending:
+		return true
+	default:
+		return false
+	}
+}
+
+func canPurgeStalePromotions(state UploadSessionState) bool {
+	return state == UploadSessionStateClosed || state == UploadSessionStateCleanupPending
+}
+
 // purgeStalePromotions drops promotion claims for an upload. Called lazily
 // from recoverPreparedUploadIfPossible when a closed session's claims belong
 // to an older revision and would otherwise block the new revision's
@@ -1143,10 +1161,22 @@ func (h *SeafHTTPHandler) recoverPreparedUploadIfPossible(orgID, repoID, uploadI
 	if err != nil {
 		return preparedUploadCommit{}, false, fmt.Errorf("read upload session: %w", err)
 	}
-	if session == nil || strings.TrimSpace(session.CommitID) == "" {
+	if session == nil {
 		return preparedUploadCommit{}, false, nil
 	}
-	if session.State != UploadSessionStatePromoting && session.State != UploadSessionStateClosed {
+	if strings.TrimSpace(session.CommitID) == "" {
+		if canPurgeStalePromotions(session.State) {
+			promotions, err := h.uploadStaging.ListBlockPromotions(orgID, uploadID)
+			if err != nil {
+				return preparedUploadCommit{}, false, fmt.Errorf("list upload block promotions: %w", err)
+			}
+			if len(promotions) > 0 {
+				h.purgeStalePromotions(orgID, uploadID)
+			}
+		}
+		return preparedUploadCommit{}, false, nil
+	}
+	if session.State != UploadSessionStatePromoting && session.State != UploadSessionStateClosed && session.State != UploadSessionStateCleanupPending {
 		return preparedUploadCommit{}, false, nil
 	}
 	promotions, err := h.uploadStaging.ListBlockPromotions(orgID, uploadID)
@@ -1158,7 +1188,7 @@ func (h *SeafHTTPHandler) recoverPreparedUploadIfPossible(orgID, repoID, uploadI
 	// Drop stale claims if the session already terminated so the new upload
 	// can register fresh markers.
 	if len(promotions) != len(blocks) {
-		if session.State == UploadSessionStateClosed {
+		if canPurgeStalePromotions(session.State) {
 			h.purgeStalePromotions(orgID, uploadID)
 		}
 		return preparedUploadCommit{}, false, nil
@@ -1176,13 +1206,13 @@ func (h *SeafHTTPHandler) recoverPreparedUploadIfPossible(orgID, repoID, uploadI
 	for _, block := range blocks {
 		promotion, ok := promotionsByIndex[block.BlockIndex]
 		if !ok {
-			if session.State == UploadSessionStateClosed {
+			if canPurgeStalePromotions(session.State) {
 				h.purgeStalePromotions(orgID, uploadID)
 			}
 			return preparedUploadCommit{}, false, nil
 		}
 		if promotion.CommitID != session.CommitID || promotion.BlockSHA256 != block.BlockSHA256 {
-			if session.State == UploadSessionStateClosed {
+			if canPurgeStalePromotions(session.State) {
 				h.purgeStalePromotions(orgID, uploadID)
 			}
 			return preparedUploadCommit{}, false, nil
@@ -1194,6 +1224,9 @@ func (h *SeafHTTPHandler) recoverPreparedUploadIfPossible(orgID, repoID, uploadI
 	if hasPendingPromotion {
 		if session.State == UploadSessionStateClosed {
 			return preparedUploadCommit{}, false, fmt.Errorf("closed upload session has pending promotion markers")
+		}
+		if session.State == UploadSessionStateCleanupPending {
+			return preparedUploadCommit{}, false, nil
 		}
 		return prepared, false, nil
 	}
@@ -1207,6 +1240,9 @@ func (h *SeafHTTPHandler) recoverPreparedUploadIfPossible(orgID, repoID, uploadI
 		if err := h.closeRecoveredUploadSession(session); err != nil {
 			return preparedUploadCommit{}, false, fmt.Errorf("close recovered upload session: %w", err)
 		}
+	}
+	if session.State == UploadSessionStateCleanupPending {
+		return preparedUploadCommit{}, false, nil
 	}
 	return prepared, true, nil
 }
@@ -1556,6 +1592,14 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 	log.Printf("[HandleUpload] Token=%s, File=%s, ContentRange=%s, isChunked=%v",
 		tokenStr, filename, contentRange, isChunked)
 	uploadID := BuildUploadSessionID(token.OrgID, token.RepoID, token.UserID, tokenStr, parentDir, filename)
+	var existingUploadSession *UploadSessionRecord
+	if h.uploadStaging != nil {
+		existingUploadSession, err = h.uploadStaging.GetSession(token.OrgID, uploadID)
+		if err != nil {
+			log.Printf("[HandleUpload] WARNING: Failed to read existing upload session before overwrite: %v", err)
+			existingUploadSession = nil
+		}
+	}
 
 	if isChunked {
 		// Chunked upload: stream chunk data directly to temp file (no io.ReadAll)
@@ -1565,7 +1609,7 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to initialize upload"})
 			return
 		}
-		if created && h.uploadStaging != nil {
+		if created && h.uploadStaging != nil && !shouldPreserveUploadSession(existingUploadSession) {
 			now := time.Now().UTC()
 			if err := h.uploadStaging.UpsertSession(UploadSessionRecord{
 				UploadID:  uploadID,
@@ -1603,7 +1647,7 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 		// All chunks received — finalize by streaming from temp file
 		log.Printf("[HandleUpload] All chunks received, finalizing upload (streaming)")
 		upload.Touch()
-		if h.uploadStaging != nil {
+		if h.uploadStaging != nil && !shouldPreserveUploadSession(existingUploadSession) {
 			now := time.Now().UTC()
 			if err := h.uploadStaging.UpsertSession(UploadSessionRecord{
 				UploadID:  uploadID,
@@ -1725,23 +1769,25 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 		})
 	}
 	if h.uploadStaging != nil {
-		if err := h.uploadStaging.UpsertSession(UploadSessionRecord{
-			UploadID:  uploadID,
-			OrgID:     token.OrgID,
-			RepoID:    token.RepoID,
-			UserID:    token.UserID,
-			TokenID:   tokenStr,
-			ParentDir: parentDir,
-			Filename:  filename,
-			TotalSize: finalSize,
-			State:     UploadSessionStateReceiving,
-			CreatedAt: singleShotCreatedAt,
-			UpdatedAt: singleShotCreatedAt,
-			ExpiresAt: singleShotCreatedAt.Add(chunkDiskTTL),
-		}); err != nil {
-			log.Printf("[HandleUpload] Failed to persist upload session: %v", err)
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to persist upload session"})
-			return
+		if !shouldPreserveUploadSession(existingUploadSession) {
+			if err := h.uploadStaging.UpsertSession(UploadSessionRecord{
+				UploadID:  uploadID,
+				OrgID:     token.OrgID,
+				RepoID:    token.RepoID,
+				UserID:    token.UserID,
+				TokenID:   tokenStr,
+				ParentDir: parentDir,
+				Filename:  filename,
+				TotalSize: finalSize,
+				State:     UploadSessionStateReceiving,
+				CreatedAt: singleShotCreatedAt,
+				UpdatedAt: singleShotCreatedAt,
+				ExpiresAt: singleShotCreatedAt.Add(chunkDiskTTL),
+			}); err != nil {
+				log.Printf("[HandleUpload] Failed to persist upload session: %v", err)
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to persist upload session"})
+				return
+			}
 		}
 	}
 

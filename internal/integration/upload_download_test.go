@@ -415,6 +415,64 @@ func TestUploadOverwrite(t *testing.T) {
 	}
 }
 
+func TestUploadLinkReuseCreatesMultipleRevisions(t *testing.T) {
+	name := fmt.Sprintf("inttest-link-reuse-%d", time.Now().UnixNano())
+	repoID := createTestLibrary(t, adminClient, name)
+	fileName := "link-reuse-history.txt"
+
+	resp := adminClient.Get(t, fmt.Sprintf("/api2/repos/%s/upload-link/?p=/", repoID))
+	expectStatus(t, resp, http.StatusOK)
+	uploadURL := strings.Trim(responseBody(t, resp), "\" \n\r")
+	if uploadURL == "" {
+		t.Fatal("upload URL is empty")
+	}
+
+	uploadFileThroughLink(t, adminClient, uploadURL, fileName, "/", "link reuse version 1")
+	uploadFileThroughLink(t, adminClient, uploadURL, fileName, "/", "link reuse version 2")
+	uploadFileThroughLink(t, adminClient, uploadURL, fileName, "/", "link reuse version 3")
+
+	t.Run("current content is latest revision", func(t *testing.T) {
+		resp := adminClient.Get(t, fmt.Sprintf("/api2/repos/%s/file/?p=/%s", repoID, fileName))
+		expectStatus(t, resp, http.StatusOK)
+		downloadURL := strings.Trim(responseBody(t, resp), "\" \n\r")
+
+		req, err := http.NewRequest(http.MethodGet, downloadURL, nil)
+		if err != nil {
+			t.Fatalf("creating download request failed: %v", err)
+		}
+		dlResp, err := adminClient.http.Do(req)
+		if err != nil {
+			t.Fatalf("download request failed: %v", err)
+		}
+		defer dlResp.Body.Close()
+		if dlResp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(dlResp.Body)
+			t.Fatalf("download failed with status %d: %s", dlResp.StatusCode, string(body))
+		}
+		content, err := io.ReadAll(dlResp.Body)
+		if err != nil {
+			t.Fatalf("reading download body failed: %v", err)
+		}
+		if got := string(content); got != "link reuse version 3" {
+			t.Fatalf("downloaded content = %q, want %q", got, "link reuse version 3")
+		}
+	})
+
+	t.Run("history contains multiple revisions", func(t *testing.T) {
+		revisionsResp := adminClient.Get(t, fmt.Sprintf("/api2/repo/file_revisions/%s/?p=/%s", repoID, fileName))
+		expectStatus(t, revisionsResp, http.StatusOK)
+
+		payload := responseJSON(t, revisionsResp)
+		items, ok := payload["data"].([]interface{})
+		if !ok {
+			t.Fatalf("expected data array in revisions response, got %v", payload)
+		}
+		if len(items) < 3 {
+			t.Fatalf("revision count = %d, want at least 3 after reusing the same upload URL", len(items))
+		}
+	})
+}
+
 // TestReadonlyCannotUpload verifies that readonly users cannot successfully upload files.
 // Note: The upload-link endpoint currently returns 200 even for non-owners (the link is
 // generated but the actual upload would be subject to permission checks). This test

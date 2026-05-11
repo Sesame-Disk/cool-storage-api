@@ -1156,6 +1156,81 @@ func TestHandleUploadChunked_ReceivingSessionWrittenOnceAcrossChunks(t *testing.
 	}
 }
 
+func TestHandleUploadChunked_PreservesClosedSessionUntilFinalize(t *testing.T) {
+	tm := NewTokenManager(time.Hour)
+	tokenStr, err := tm.CreateUploadToken("org-1", "repo-1", "/", "user-1")
+	if err != nil {
+		t.Fatalf("CreateUploadToken failed: %v", err)
+	}
+	staging := &fakeUploadStagingStore{}
+	uploadID := BuildUploadSessionID("org-1", "repo-1", "user-1", tokenStr, "/", "retry.txt")
+	now := time.Now().UTC()
+	staging.sessions = append(staging.sessions, UploadSessionRecord{
+		UploadID:       uploadID,
+		OrgID:          "org-1",
+		RepoID:         "repo-1",
+		UserID:         "user-1",
+		TokenID:        tokenStr,
+		ParentDir:      "/",
+		Filename:       "retry.txt",
+		ActualFilename: "retry.txt",
+		CommitID:       "commit-prev",
+		TotalSize:      5,
+		State:          UploadSessionStateClosed,
+		CreatedAt:      now,
+		UpdatedAt:      now,
+		ExpiresAt:      now.Add(time.Hour),
+	})
+
+	handler := NewSeafHTTPHandler(nil, storage.NewManager(), nil, tm, nil, nil)
+	handler.SetUploadStagingStore(staging)
+	handler.chunkedFinalize = func(c *gin.Context, token *AccessToken, upload *ChunkUpload, uploadID, parentDir, filename, storageKey string, totalSize int64, replace bool) (finalizeUploadResult, error) {
+		session, err := staging.GetSession("org-1", uploadID)
+		if err != nil {
+			t.Fatalf("GetSession failed: %v", err)
+		}
+		if session == nil {
+			t.Fatal("expected preserved closed session before finalize")
+		}
+		if session.State != UploadSessionStateClosed {
+			t.Fatalf("session state before finalize = %q, want %q", session.State, UploadSessionStateClosed)
+		}
+		if session.CommitID != "commit-prev" {
+			t.Fatalf("commit id before finalize = %q, want commit-prev", session.CommitID)
+		}
+		return finalizeUploadResult{FileID: "file-id", ActualFilename: filename, CommitID: "commit-next"}, nil
+	}
+
+	r := gin.New()
+	r.POST("/seafhttp/upload-api/:token", handler.HandleUpload)
+
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	part, _ := writer.CreateFormFile("file", "retry.txt")
+	_, _ = part.Write([]byte("hello"))
+	writer.Close()
+
+	req := httptest.NewRequest(http.MethodPost, "/seafhttp/upload-api/"+tokenStr+"?ret-json=1", &body)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	req.Header.Set("Content-Range", "bytes 0-4/5")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusOK)
+	}
+	if len(staging.sessions) != 2 {
+		t.Fatalf("session writes = %d, want 2 (original closed + final closed)", len(staging.sessions))
+	}
+	if staging.sessions[len(staging.sessions)-1].State != UploadSessionStateClosed {
+		t.Fatalf("final state = %q, want %q", staging.sessions[len(staging.sessions)-1].State, UploadSessionStateClosed)
+	}
+	if staging.sessions[len(staging.sessions)-1].CommitID != "commit-next" {
+		t.Fatalf("final commit id = %q, want commit-next", staging.sessions[len(staging.sessions)-1].CommitID)
+	}
+	chunkManager.CleanupUpload(tokenStr, "retry.txt")
+}
+
 func TestPersistUploadBlockStateSwallowsErrors(t *testing.T) {
 	handler := NewSeafHTTPHandler(nil, storage.NewManager(), nil, NewMockTokenStore(), nil, nil)
 	staging := &fakeUploadStagingStore{blockErr: errors.New("staging down")}
@@ -1657,7 +1732,7 @@ func TestRecoverPreparedUploadIfPossiblePurgesStalePromotionsOnLengthMismatch(t 
 	staging.sessions = append(staging.sessions, UploadSessionRecord{
 		UploadID: "upload-1", OrgID: "org-1", RepoID: "repo-1",
 		Filename: "file.txt", CommitID: "commit-rev1",
-		State: UploadSessionStateClosed,
+		State:     UploadSessionStateClosed,
 		CreatedAt: now, UpdatedAt: now, ExpiresAt: now.Add(time.Hour),
 	})
 	staging.promotions = map[string]UploadBlockPromotionRecord{
@@ -1680,6 +1755,41 @@ func TestRecoverPreparedUploadIfPossiblePurgesStalePromotionsOnLengthMismatch(t 
 	}
 	if _, exists := staging.promotions[fakeUploadPromotionKey("org-1", "upload-1", 0)]; exists {
 		t.Fatal("expected stale rev-1 promotion to be purged on cardinality mismatch")
+	}
+}
+
+func TestRecoverPreparedUploadIfPossiblePurgesStalePromotionsForCleanupPendingWithoutCommit(t *testing.T) {
+	handler := NewSeafHTTPHandler(nil, storage.NewManager(), nil, NewMockTokenStore(), nil, nil)
+	staging := &fakeUploadStagingStore{}
+	handler.SetUploadStagingStore(staging)
+	now := time.Now().UTC()
+	staging.sessions = append(staging.sessions, UploadSessionRecord{
+		UploadID: "upload-1", OrgID: "org-1", RepoID: "repo-1",
+		Filename: "file.txt", State: UploadSessionStateCleanupPending,
+		CreatedAt: now, UpdatedAt: now, ExpiresAt: now.Add(time.Hour),
+		LastError: "block 0 promotion marker mismatch",
+	})
+	staging.promotions = map[string]UploadBlockPromotionRecord{
+		fakeUploadPromotionKey("org-1", "upload-1", 0): {
+			OrgID: "org-1", UploadID: "upload-1", BlockIndex: 0,
+			BlockSHA256: "sha256-rev1", CommitID: "commit-rev1",
+			ClaimedAt: now, AppliedAt: &now,
+		},
+	}
+
+	prepared, ok, err := handler.recoverPreparedUploadIfPossible("org-1", "repo-1", "upload-1",
+		[]uploadBlockPromotion{{BlockIndex: 0, BlockSHA256: "sha256-rev2"}})
+	if err != nil {
+		t.Fatalf("recoverPreparedUploadIfPossible: %v", err)
+	}
+	if ok {
+		t.Fatal("expected cleanup_pending session with blank commit to return no recovery")
+	}
+	if prepared.CommitID != "" {
+		t.Fatalf("expected empty prepared result, got %+v", prepared)
+	}
+	if _, exists := staging.promotions[fakeUploadPromotionKey("org-1", "upload-1", 0)]; exists {
+		t.Fatal("expected stale promotion to be purged for cleanup_pending session without commit")
 	}
 }
 
@@ -1749,6 +1859,53 @@ func TestCloseRecoveredUploadSessionDoesNotTouchPromotions(t *testing.T) {
 	}
 	if _, exists := staging.promotions[fakeUploadPromotionKey("org-1", "upload-1", 0)]; !exists {
 		t.Fatal("expected promotion claim to remain for idempotent-retry detection")
+	}
+}
+
+func TestShouldPreserveUploadSession(t *testing.T) {
+	tests := []struct {
+		name     string
+		session  *UploadSessionRecord
+		wantKeep bool
+	}{
+		{
+			name:     "closed commit preserved",
+			session:  &UploadSessionRecord{State: UploadSessionStateClosed, CommitID: "commit-1"},
+			wantKeep: true,
+		},
+		{
+			name:     "promoting commit preserved",
+			session:  &UploadSessionRecord{State: UploadSessionStatePromoting, CommitID: "commit-1"},
+			wantKeep: true,
+		},
+		{
+			name:     "cleanup pending with commit preserved",
+			session:  &UploadSessionRecord{State: UploadSessionStateCleanupPending, CommitID: "commit-1"},
+			wantKeep: true,
+		},
+		{
+			name:     "cleanup pending without commit not preserved",
+			session:  &UploadSessionRecord{State: UploadSessionStateCleanupPending},
+			wantKeep: true,
+		},
+		{
+			name:     "receiving not preserved",
+			session:  &UploadSessionRecord{State: UploadSessionStateReceiving, CommitID: "commit-1"},
+			wantKeep: false,
+		},
+		{
+			name:     "nil session not preserved",
+			session:  nil,
+			wantKeep: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := shouldPreserveUploadSession(tt.session); got != tt.wantKeep {
+				t.Fatalf("shouldPreserveUploadSession() = %v, want %v", got, tt.wantKeep)
+			}
+		})
 	}
 }
 

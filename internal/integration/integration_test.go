@@ -21,10 +21,41 @@ var (
 	superadminClient *testClient
 )
 
+// ephemeralLibraryPrefixes identifies libraries that the integration suite is
+// allowed to delete when the per-org library limit is hit. The list MUST track
+// every prefix used by ad-hoc bash scripts under /scripts that create libraries
+// against the same dev environment (test-file-history.sh, test-file-ops.sh,
+// etc.). Keep this explicit: broad prefixes like "test-" are too aggressive
+// for shared dev environments and can delete manually created libraries.
 var ephemeralLibraryPrefixes = []string{
 	"inttest-",
 	"smoke-",
 	"sesamefs-public-smoke",
+	// Bash test scripts under /scripts. Keep in sync with cleanup-test-repos.sh.
+	"batch-ops-test-",
+	"encrypted-test-",
+	"HistoryTest-",
+	"HistoryRetest-",
+	"HistoryStateCheck-",
+	"FileOpsTest-",
+	"history-test-library-",
+	"nested-move-copy-test",
+	"cross-lib-src-",
+	"cross-lib-dst-",
+	"search-test-",
+	"with-parents-test",
+	"api-token-test-",
+	"tag-test-library-",
+	"sa-test-lib-",
+	"test-encrypted",
+	"test-libsettings-",
+	"test-write-ops",
+	"failover-test-",
+	"multiregion-test-",
+	"sync-test-encrypted-",
+	"sync-test-unencrypted-",
+	"usa-routing-test-",
+	"eu-routing-test-",
 }
 
 func TestMain(m *testing.M) {
