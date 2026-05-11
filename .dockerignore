@@ -10,3 +10,5 @@ tmp/
 frontend/build/
 mobile-frontend/dist/
 mobile-frontend/.astro/
+.gocache/
+.gotmp/

@@ -665,6 +665,52 @@ func TestChunkedUploadLinkReusePreflushesLargeRevisions(t *testing.T) {
 	})
 }
 
+func TestChunkedUploadOutOfOrderCompletesWhenGapFills(t *testing.T) {
+	name := fmt.Sprintf("inttest-chunked-out-of-order-%d", time.Now().UnixNano())
+	repoID := createTestLibrary(t, adminClient, name)
+	fileName := "chunked-out-of-order.bin"
+
+	resp := adminClient.Get(t, fmt.Sprintf("/api2/repos/%s/upload-link/?p=/", repoID))
+	expectStatus(t, resp, http.StatusOK)
+	uploadURL := strings.Trim(responseBody(t, resp), "\" \n\r")
+	if uploadURL == "" {
+		t.Fatal("upload URL is empty")
+	}
+
+	content := append(bytes.Repeat([]byte("c"), chunkedPreflushIntegrationBlockSize), []byte("-out-of-order-tail")...)
+	half := chunkedPreflushIntegrationBlockSize / 2
+
+	uploadChunkThroughLink(t, adminClient, uploadURL, fileName, "/", content[half:], half, len(content)-1, len(content))
+	uploadChunkThroughLink(t, adminClient, uploadURL, fileName, "/", content[:half], 0, half-1, len(content))
+
+	resp = adminClient.Get(t, fmt.Sprintf("/api2/repos/%s/file/?p=/%s", repoID, fileName))
+	expectStatus(t, resp, http.StatusOK)
+	downloadURL := strings.Trim(responseBody(t, resp), "\" \n\r")
+
+	req, err := http.NewRequest(http.MethodGet, downloadURL, nil)
+	if err != nil {
+		t.Fatalf("creating download request failed: %v", err)
+	}
+	dlResp, err := adminClient.http.Do(req)
+	if err != nil {
+		t.Fatalf("download request failed: %v", err)
+	}
+	defer dlResp.Body.Close()
+	if dlResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(dlResp.Body)
+		t.Fatalf("download failed with status %d: %s", dlResp.StatusCode, string(body))
+	}
+	downloaded, err := io.ReadAll(dlResp.Body)
+	if err != nil {
+		t.Fatalf("reading download body failed: %v", err)
+	}
+	if !bytes.Equal(downloaded, content) {
+		expectedHash := sha256.Sum256(content)
+		actualHash := sha256.Sum256(downloaded)
+		t.Fatalf("downloaded out-of-order content hash = %s, want %s", hex.EncodeToString(actualHash[:]), hex.EncodeToString(expectedHash[:]))
+	}
+}
+
 // TestReadonlyCannotUpload verifies that readonly users cannot successfully upload files.
 // Note: The upload-link endpoint currently returns 200 even for non-owners (the link is
 // generated but the actual upload would be subject to permission checks). This test

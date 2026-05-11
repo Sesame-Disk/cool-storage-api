@@ -284,6 +284,7 @@ type ChunkUpload struct {
 	finalizationStarted    bool
 	accountedBlockPosition map[int]string
 	preflushedBlocks       map[int]uploadBlockPromotion
+	preflushInFlight       map[int]chan struct{}
 	nextPreflushBlockIndex int
 	updatedAt              time.Time
 	mu                     sync.Mutex
@@ -703,8 +704,39 @@ func (cu *ChunkUpload) NextFlushableContiguousBlock(blockSize int64) (int, int64
 		return 0, 0, 0, false
 	}
 	reserved := cu.nextPreflushBlockIndex
+	if cu.preflushInFlight == nil {
+		cu.preflushInFlight = make(map[int]chan struct{})
+	}
+	cu.preflushInFlight[reserved] = make(chan struct{})
 	cu.nextPreflushBlockIndex++
 	return reserved, start, end, true
+}
+
+func (cu *ChunkUpload) finishPreflush(index int) {
+	cu.mu.Lock()
+	defer cu.mu.Unlock()
+	if cu.preflushInFlight == nil {
+		return
+	}
+	if done, ok := cu.preflushInFlight[index]; ok {
+		delete(cu.preflushInFlight, index)
+		close(done)
+	}
+	cu.updatedAt = time.Now()
+}
+
+// waitForPreflush blocks until any in-flight preflush for the given block
+// index has finished (or returns immediately if none is running). Indices are
+// monotonically assigned by NextFlushableContiguousBlock, so a closed channel
+// is terminal — no re-check loop is needed.
+func (cu *ChunkUpload) waitForPreflush(index int) {
+	cu.mu.Lock()
+	done, ok := cu.preflushInFlight[index]
+	cu.mu.Unlock()
+	if !ok {
+		return
+	}
+	<-done
 }
 
 func (cu *ChunkUpload) ReadRange(start, end int64) ([]byte, error) {
@@ -744,6 +776,24 @@ func (cu *ChunkUpload) PreflushedBlock(index int) (uploadBlockPromotion, bool) {
 	}
 	block, ok := cu.preflushedBlocks[index]
 	return block, ok
+}
+
+func (cu *ChunkUpload) ResolvePreflushedBlock(index int, blockSHA256, blockSHA1 string) (uploadBlockPromotion, bool, error) {
+	cu.waitForPreflush(index)
+	preflushedBlock, preflushed := cu.PreflushedBlock(index)
+	alreadyAccounted, accountErr := cu.BlockAlreadyAccounted(index, blockSHA256)
+	if accountErr != nil {
+		return uploadBlockPromotion{}, false, fmt.Errorf("preflushed block %d mismatch: %w", index, accountErr)
+	}
+	if alreadyAccounted {
+		if !preflushed {
+			return uploadBlockPromotion{}, false, fmt.Errorf("block %d was marked preflushed but metadata is missing", index)
+		}
+		if preflushedBlock.BlockSHA1 != "" && preflushedBlock.BlockSHA1 != blockSHA1 {
+			return uploadBlockPromotion{}, false, fmt.Errorf("preflushed block %d SHA-1 mismatch", index)
+		}
+	}
+	return preflushedBlock, alreadyAccounted, nil
 }
 
 // GetContent reads the complete file content into memory.
@@ -1496,85 +1546,91 @@ func (h *SeafHTTPHandler) preflushChunkUploadBlocks(c *gin.Context, token *Acces
 			return
 		}
 
-		plaintextBlock, err := upload.ReadRange(start, end)
-		if err != nil {
-			log.Printf("[HandleUpload] WARNING: Failed to read contiguous chunk block %d for preflush: %v", blockIndex, err)
-			return
-		}
+		err := func() error {
+			defer upload.finishPreflush(blockIndex)
 
-		blockSHA1Hash := sha1.Sum(plaintextBlock)
-		blockSHA1ID := hex.EncodeToString(blockSHA1Hash[:])
-		storedBlock := plaintextBlock
-		if fileKey != nil {
-			encryptedBlock, encErr := crypto.EncryptBlockSeafile(plaintextBlock, fileKey, fileIV)
-			if encErr != nil {
-				log.Printf("[HandleUpload] WARNING: Failed to encrypt preflush block %d: %v", blockIndex, encErr)
-				return
+			plaintextBlock, err := upload.ReadRange(start, end)
+			if err != nil {
+				return fmt.Errorf("read contiguous chunk block %d for preflush: %w", blockIndex, err)
 			}
-			storedBlock = encryptedBlock
-		}
 
-		sha256Hash := sha256.Sum256(storedBlock)
-		sha256ID := hex.EncodeToString(sha256Hash[:])
-		uploadedAt := time.Now().UTC()
-		promotion := uploadBlockPromotion{
-			BlockIndex:   blockIndex,
-			BlockSHA1:    blockSHA1ID,
-			BlockSHA256:  sha256ID,
-			SizeBytes:    len(storedBlock),
-			StorageClass: actualStorageClass,
-			StorageKey:   sha256ID,
-			Source:       UploadBlockSourceNewObject,
-			CreatedAt:    upload.CreatedAt.UTC(),
-			UploadedAt:   &uploadedAt,
-		}
-
-		if err := upload.AccountBlockOnce(blockIndex, sha256ID, func() error {
-			registeredAt := time.Now().UTC()
-			if h.uploadStaging != nil {
-				h.persistUploadBlockState(UploadSessionBlockRecord{
-					UploadID:     uploadID,
-					BlockIndex:   blockIndex,
-					OrgID:        token.OrgID,
-					BlockSHA1:    blockSHA1ID,
-					BlockSHA256:  sha256ID,
-					SizeBytes:    len(storedBlock),
-					StorageClass: actualStorageClass,
-					StorageKey:   sha256ID,
-					Source:       UploadBlockSourceNewObject,
-					State:        UploadBlockStateRegistered,
-					CreatedAt:    upload.CreatedAt.UTC(),
-					UpdatedAt:    registeredAt,
-				}, string(UploadBlockStateRegistered))
+			blockSHA1Hash := sha1.Sum(plaintextBlock)
+			blockSHA1ID := hex.EncodeToString(blockSHA1Hash[:])
+			storedBlock := plaintextBlock
+			if fileKey != nil {
+				encryptedBlock, encErr := crypto.EncryptBlockSeafile(plaintextBlock, fileKey, fileIV)
+				if encErr != nil {
+					return fmt.Errorf("encrypt preflush block %d: %w", blockIndex, encErr)
+				}
+				storedBlock = encryptedBlock
 			}
-			if _, err := h.uploadBlockWriter(c.Request.Context(), blockStore, sha256ID, storedBlock); err != nil {
+
+			sha256Hash := sha256.Sum256(storedBlock)
+			sha256ID := hex.EncodeToString(sha256Hash[:])
+			uploadedAt := time.Now().UTC()
+			promotion := uploadBlockPromotion{
+				BlockIndex:   blockIndex,
+				BlockSHA1:    blockSHA1ID,
+				BlockSHA256:  sha256ID,
+				SizeBytes:    len(storedBlock),
+				StorageClass: actualStorageClass,
+				StorageKey:   sha256ID,
+				Source:       UploadBlockSourceNewObject,
+				CreatedAt:    upload.CreatedAt.UTC(),
+				UploadedAt:   &uploadedAt,
+			}
+
+			if err := upload.AccountBlockOnce(blockIndex, sha256ID, func() error {
+				registeredAt := time.Now().UTC()
+				if h.uploadStaging != nil {
+					h.persistUploadBlockState(UploadSessionBlockRecord{
+						UploadID:     uploadID,
+						BlockIndex:   blockIndex,
+						OrgID:        token.OrgID,
+						BlockSHA1:    blockSHA1ID,
+						BlockSHA256:  sha256ID,
+						SizeBytes:    len(storedBlock),
+						StorageClass: actualStorageClass,
+						StorageKey:   sha256ID,
+						Source:       UploadBlockSourceNewObject,
+						State:        UploadBlockStateRegistered,
+						CreatedAt:    upload.CreatedAt.UTC(),
+						UpdatedAt:    registeredAt,
+					}, string(UploadBlockStateRegistered))
+				}
+				if _, err := h.uploadBlockWriter(c.Request.Context(), blockStore, sha256ID, storedBlock); err != nil {
+					return err
+				}
+				h.persistUploadS3Orphan(token.OrgID, sha256ID, actualStorageClass, "")
+				if h.uploadStaging != nil {
+					h.persistUploadBlockState(UploadSessionBlockRecord{
+						UploadID:     uploadID,
+						BlockIndex:   blockIndex,
+						OrgID:        token.OrgID,
+						BlockSHA1:    blockSHA1ID,
+						BlockSHA256:  sha256ID,
+						SizeBytes:    len(storedBlock),
+						StorageClass: actualStorageClass,
+						StorageKey:   sha256ID,
+						Source:       UploadBlockSourceNewObject,
+						State:        UploadBlockStateUploaded,
+						CreatedAt:    upload.CreatedAt.UTC(),
+						UpdatedAt:    uploadedAt,
+						UploadedAt:   &uploadedAt,
+					}, string(UploadBlockStateUploaded))
+				}
+				return nil
+			}); err != nil {
 				return err
 			}
-			h.persistUploadS3Orphan(token.OrgID, sha256ID, actualStorageClass, "")
-			if h.uploadStaging != nil {
-				h.persistUploadBlockState(UploadSessionBlockRecord{
-					UploadID:     uploadID,
-					BlockIndex:   blockIndex,
-					OrgID:        token.OrgID,
-					BlockSHA1:    blockSHA1ID,
-					BlockSHA256:  sha256ID,
-					SizeBytes:    len(storedBlock),
-					StorageClass: actualStorageClass,
-					StorageKey:   sha256ID,
-					Source:       UploadBlockSourceNewObject,
-					State:        UploadBlockStateUploaded,
-					CreatedAt:    upload.CreatedAt.UTC(),
-					UpdatedAt:    uploadedAt,
-					UploadedAt:   &uploadedAt,
-				}, string(UploadBlockStateUploaded))
-			}
+
+			upload.RecordPreflushedBlock(blockIndex, promotion)
 			return nil
-		}); err != nil {
+		}()
+		if err != nil {
 			log.Printf("[HandleUpload] WARNING: Failed to preflush chunk block %d: %v", blockIndex, err)
 			return
 		}
-
-		upload.RecordPreflushedBlock(blockIndex, promotion)
 	}
 }
 
@@ -2347,18 +2403,11 @@ readLoop:
 			sha256Hash := sha256.Sum256(storedBlock)
 			sha256ID := hex.EncodeToString(sha256Hash[:])
 			var uploadedAt *time.Time
-			preflushedBlock, preflushed := upload.PreflushedBlock(blockIndexLocal)
-			alreadyAccounted, accountErr := upload.BlockAlreadyAccounted(blockIndexLocal, sha256ID)
-			if accountErr != nil {
-				return fmt.Errorf("preflushed block %d mismatch: %w", blockIndexLocal, accountErr)
+			preflushedBlock, alreadyAccounted, resolveErr := upload.ResolvePreflushedBlock(blockIndexLocal, sha256ID, blockSHA1IDLocal)
+			if resolveErr != nil {
+				return resolveErr
 			}
 			if alreadyAccounted {
-				if !preflushed {
-					return fmt.Errorf("block %d was marked preflushed but metadata is missing", blockIndexLocal)
-				}
-				if preflushedBlock.BlockSHA1 != "" && preflushedBlock.BlockSHA1 != blockSHA1IDLocal {
-					return fmt.Errorf("preflushed block %d SHA-1 mismatch", blockIndexLocal)
-				}
 				uploadedAt = preflushedBlock.UploadedAt
 				if preflushedBlock.StorageClass != "" {
 					blockStorageClass = preflushedBlock.StorageClass
@@ -2434,7 +2483,7 @@ readLoop:
 				CreatedAt:    upload.CreatedAt.UTC(),
 				UploadedAt:   uploadedAt,
 			}
-			if preflushed {
+			if alreadyAccounted {
 				pendingPromotion.Source = preflushedBlock.Source
 				if preflushedBlock.StorageKey != "" {
 					pendingPromotion.StorageKey = preflushedBlock.StorageKey

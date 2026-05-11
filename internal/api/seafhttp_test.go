@@ -3,6 +3,7 @@ package api
 import (
 	"bytes"
 	"context"
+	"crypto/sha1"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -1324,6 +1325,240 @@ func TestHandleUploadChunked_PreflushesContiguousBlockBeforeFinalize(t *testing.
 	chunkManager.CleanupUpload(tokenStr, "preflush.txt")
 }
 
+func TestHandleUploadChunked_DoesNotPreflushUntilMissingPrefixArrives(t *testing.T) {
+	tm := NewTokenManager(time.Hour)
+	tokenStr, err := tm.CreateUploadToken("org-1", "repo-1", "/", "user-1")
+	if err != nil {
+		t.Fatalf("CreateUploadToken failed: %v", err)
+	}
+	staging := &fakeUploadStagingStore{}
+	handler := NewSeafHTTPHandler(nil, storage.NewManager(), nil, tm, nil, nil)
+	handler.SetUploadStagingStore(staging)
+	handler.uploadBlockResolver = func(c *gin.Context, token *AccessToken) (*storage.BlockStore, string, error) {
+		return nil, "hot", nil
+	}
+	var uploadedHashes []string
+	handler.uploadBlockWriter = func(ctx context.Context, blockStore *storage.BlockStore, hash string, data []byte) (string, error) {
+		uploadedHashes = append(uploadedHashes, hash)
+		return hash, nil
+	}
+
+	fullBlock := bytes.Repeat([]byte("b"), uploadBlockSize)
+	tail := []byte("xyz")
+	expectedSHA256 := sha256.Sum256(fullBlock)
+	expectedSHA256Hex := hex.EncodeToString(expectedSHA256[:])
+	half := uploadBlockSize / 2
+	totalSize := uploadBlockSize + len(tail)
+	handler.chunkedFinalize = func(c *gin.Context, token *AccessToken, upload *ChunkUpload, uploadID, parentDir, filename, storageKey string, totalSize int64, replace bool) (finalizeUploadResult, error) {
+		if len(uploadedHashes) != 1 {
+			t.Fatalf("preflush upload calls = %d, want 1", len(uploadedHashes))
+		}
+		if uploadedHashes[0] != expectedSHA256Hex {
+			t.Fatalf("preflushed hash = %q, want %q", uploadedHashes[0], expectedSHA256Hex)
+		}
+		preflushed, ok := upload.PreflushedBlock(0)
+		if !ok {
+			t.Fatal("expected first block to be preflushed once the prefix becomes contiguous")
+		}
+		if preflushed.BlockSHA256 != expectedSHA256Hex {
+			t.Fatalf("preflushed sha256 = %q, want %q", preflushed.BlockSHA256, expectedSHA256Hex)
+		}
+		return finalizeUploadResult{FileID: "file-id", ActualFilename: filename, CommitID: "commit-id"}, nil
+	}
+
+	r := gin.New()
+	r.POST("/seafhttp/upload-api/:token", handler.HandleUpload)
+
+	makeRequest := func(contentRange string, payload []byte) *httptest.ResponseRecorder {
+		var body bytes.Buffer
+		writer := multipart.NewWriter(&body)
+		part, _ := writer.CreateFormFile("file", "out-of-order-preflush.txt")
+		_, _ = part.Write(payload)
+		writer.Close()
+
+		req := httptest.NewRequest(http.MethodPost, "/seafhttp/upload-api/"+tokenStr+"?ret-json=1", &body)
+		req.Header.Set("Content-Type", writer.FormDataContentType())
+		req.Header.Set("Content-Range", contentRange)
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+		return w
+	}
+
+	secondHalfPlusTail := append(append([]byte(nil), fullBlock[half:]...), tail...)
+	first := makeRequest(
+		"bytes "+strconv.Itoa(half)+"-"+strconv.Itoa(totalSize-1)+"/"+strconv.Itoa(totalSize),
+		secondHalfPlusTail,
+	)
+	if first.Code != http.StatusOK {
+		t.Fatalf("first status = %d, want %d", first.Code, http.StatusOK)
+	}
+	if len(uploadedHashes) != 0 {
+		t.Fatalf("preflush should not run before the missing prefix arrives, got uploads %v", uploadedHashes)
+	}
+
+	second := makeRequest("bytes 0-"+strconv.Itoa(half-1)+"/"+strconv.Itoa(totalSize), fullBlock[:half])
+	if second.Code != http.StatusOK {
+		t.Fatalf("second status = %d, want %d", second.Code, http.StatusOK)
+	}
+	if len(uploadedHashes) != 1 || uploadedHashes[0] != expectedSHA256Hex {
+		t.Fatalf("preflush uploads after completing prefix = %v, want [%s]", uploadedHashes, expectedSHA256Hex)
+	}
+	chunkManager.CleanupUpload(tokenStr, "out-of-order-preflush.txt")
+}
+
+func TestHandleUploadChunked_FinalizeWaitsForInFlightPreflush(t *testing.T) {
+	tm := NewTokenManager(time.Hour)
+	tokenStr, err := tm.CreateUploadToken("org-1", "repo-1", "/", "user-1")
+	if err != nil {
+		t.Fatalf("CreateUploadToken failed: %v", err)
+	}
+	handler := NewSeafHTTPHandler(nil, storage.NewManager(), nil, tm, nil, nil)
+	handler.uploadBlockResolver = func(c *gin.Context, token *AccessToken) (*storage.BlockStore, string, error) {
+		return nil, "hot", nil
+	}
+	preflushStarted := make(chan struct{})
+	releasePreflush := make(chan struct{})
+	var preflushOnce sync.Once
+	var uploadedHashes []string
+	handler.uploadBlockWriter = func(ctx context.Context, blockStore *storage.BlockStore, hash string, data []byte) (string, error) {
+		preflushOnce.Do(func() {
+			close(preflushStarted)
+			<-releasePreflush
+		})
+		uploadedHashes = append(uploadedHashes, hash)
+		return hash, nil
+	}
+
+	fullBlock := bytes.Repeat([]byte("c"), uploadBlockSize)
+	tail := []byte("xyz")
+	expectedSHA1 := sha1.Sum(fullBlock)
+	expectedSHA1Hex := hex.EncodeToString(expectedSHA1[:])
+	expectedSHA256 := sha256.Sum256(fullBlock)
+	expectedSHA256Hex := hex.EncodeToString(expectedSHA256[:])
+	finalizeEntered := make(chan struct{}, 1)
+	handler.chunkedFinalize = func(c *gin.Context, token *AccessToken, upload *ChunkUpload, uploadID, parentDir, filename, storageKey string, totalSize int64, replace bool) (finalizeUploadResult, error) {
+		finalizeEntered <- struct{}{}
+		preflushed, alreadyAccounted, err := upload.ResolvePreflushedBlock(0, expectedSHA256Hex, expectedSHA1Hex)
+		if err != nil {
+			t.Fatalf("ResolvePreflushedBlock failed: %v", err)
+		}
+		if !alreadyAccounted {
+			t.Fatal("expected finalize to observe the block as accounted after waiting for preflush")
+		}
+		if preflushed.BlockSHA256 != expectedSHA256Hex {
+			t.Fatalf("preflushed sha256 = %q, want %q", preflushed.BlockSHA256, expectedSHA256Hex)
+		}
+		return finalizeUploadResult{FileID: "file-id", ActualFilename: filename, CommitID: "commit-id"}, nil
+	}
+
+	r := gin.New()
+	r.POST("/seafhttp/upload-api/:token", handler.HandleUpload)
+
+	makeRequest := func(contentRange string, payload []byte) *httptest.ResponseRecorder {
+		var body bytes.Buffer
+		writer := multipart.NewWriter(&body)
+		part, _ := writer.CreateFormFile("file", "concurrent-preflush.txt")
+		_, _ = part.Write(payload)
+		writer.Close()
+
+		req := httptest.NewRequest(http.MethodPost, "/seafhttp/upload-api/"+tokenStr+"?ret-json=1", &body)
+		req.Header.Set("Content-Type", writer.FormDataContentType())
+		req.Header.Set("Content-Range", contentRange)
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+		return w
+	}
+
+	totalSize := uploadBlockSize + len(tail)
+	firstDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		firstDone <- makeRequest("bytes 0-"+strconv.Itoa(uploadBlockSize-1)+"/"+strconv.Itoa(totalSize), fullBlock)
+	}()
+
+	select {
+	case <-preflushStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for preflush to start")
+	}
+
+	finalDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		finalDone <- makeRequest("bytes "+strconv.Itoa(uploadBlockSize)+"-"+strconv.Itoa(totalSize-1)+"/"+strconv.Itoa(totalSize), tail)
+	}()
+
+	select {
+	case <-finalizeEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for finalize to enter")
+	}
+
+	select {
+	case resp := <-finalDone:
+		t.Fatalf("final request completed before preflush finished: status=%d", resp.Code)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(releasePreflush)
+
+	first := <-firstDone
+	if first.Code != http.StatusOK {
+		t.Fatalf("first status = %d, want %d", first.Code, http.StatusOK)
+	}
+	final := <-finalDone
+	if final.Code != http.StatusOK {
+		t.Fatalf("final status = %d, want %d", final.Code, http.StatusOK)
+	}
+	if len(uploadedHashes) != 1 || uploadedHashes[0] != expectedSHA256Hex {
+		t.Fatalf("uploaded hashes = %v, want [%s]", uploadedHashes, expectedSHA256Hex)
+	}
+	chunkManager.CleanupUpload(tokenStr, "concurrent-preflush.txt")
+}
+
+func TestChunkUploadResolvePreflushedBlockFallsBackAfterFailedPreflush(t *testing.T) {
+	upload := &ChunkUpload{
+		TotalSize: uploadBlockSize + 1,
+		Ranges: []byteRange{{
+			Start: 0,
+			End:   uploadBlockSize - 1,
+		}},
+	}
+	blockIndex, _, _, ok := upload.NextFlushableContiguousBlock(uploadBlockSize)
+	if !ok {
+		t.Fatal("expected contiguous block reservation to succeed")
+	}
+	resolved := make(chan struct {
+		alreadyAccounted bool
+		err              error
+	}, 1)
+	go func() {
+		_, alreadyAccounted, err := upload.ResolvePreflushedBlock(blockIndex, "sha256-a", "sha1-a")
+		resolved <- struct {
+			alreadyAccounted bool
+			err              error
+		}{alreadyAccounted: alreadyAccounted, err: err}
+	}()
+
+	select {
+	case result := <-resolved:
+		t.Fatalf("resolve returned before failed preflush finished: accounted=%v err=%v", result.alreadyAccounted, result.err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	upload.finishPreflush(blockIndex)
+
+	select {
+	case result := <-resolved:
+		if result.err != nil {
+			t.Fatalf("ResolvePreflushedBlock failed: %v", result.err)
+		}
+		if result.alreadyAccounted {
+			t.Fatal("expected unresolved preflush to fall back to finalize upload path")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for ResolvePreflushedBlock to return")
+	}
+}
+
 func TestPersistUploadBlockStateSwallowsErrors(t *testing.T) {
 	handler := NewSeafHTTPHandler(nil, storage.NewManager(), nil, NewMockTokenStore(), nil, nil)
 	staging := &fakeUploadStagingStore{blockErr: errors.New("staging down")}
@@ -1441,6 +1676,112 @@ func TestPublishPreparedUploadPromotesBeforePublishingHead(t *testing.T) {
 	}
 	if staging.blocks[0].State != UploadBlockStatePromoted || staging.blocks[1].State != UploadBlockStatePromoted {
 		t.Fatalf("staging states = %q/%q, want promoted/promoted", staging.blocks[0].State, staging.blocks[1].State)
+	}
+}
+
+func TestApplyUploadBlockPromotionClearsPendingOrphanOnSuccess(t *testing.T) {
+	handler := NewSeafHTTPHandler(nil, storage.NewManager(), nil, NewMockTokenStore(), nil, nil)
+	claimedAt := time.Now().UTC()
+	staging := &fakeUploadStagingStore{
+		promotions: map[string]UploadBlockPromotionRecord{
+			fakeUploadPromotionKey("org-1", "upload-1", 0): {
+				OrgID:       "org-1",
+				UploadID:    "upload-1",
+				BlockIndex:  0,
+				BlockSHA256: "sha256-1",
+				CommitID:    "commit-1",
+				ClaimedAt:   claimedAt,
+			},
+		},
+	}
+	handler.SetUploadStagingStore(staging)
+
+	var promoted []string
+	handler.blockPromoter = func(orgID, operationKey, blockID string, sizeBytes int, storageClass, storageKey string) error {
+		promoted = append(promoted, blockID)
+		return nil
+	}
+	var cleared []string
+	handler.uploadOrphanCleaner = func(orgID, blockID string) error {
+		cleared = append(cleared, orgID+"|"+blockID)
+		return nil
+	}
+
+	promotedAt, livePromoted, err := handler.applyUploadBlockPromotion("org-1", "upload-1", "commit-1", claimedAt, uploadBlockPromotion{
+		BlockIndex:   0,
+		BlockSHA256:  "sha256-1",
+		SizeBytes:    10,
+		StorageClass: "hot",
+		StorageKey:   "sha256-1",
+	})
+	if err != nil {
+		t.Fatalf("applyUploadBlockPromotion failed: %v", err)
+	}
+	if !livePromoted {
+		t.Fatal("expected block to be treated as live-promoted")
+	}
+	if promotedAt.IsZero() {
+		t.Fatal("expected promotedAt to be populated")
+	}
+	if len(promoted) != 1 || promoted[0] != "sha256-1" {
+		t.Fatalf("promoted blocks = %v, want [sha256-1]", promoted)
+	}
+	if len(cleared) != 1 || cleared[0] != "org-1|sha256-1" {
+		t.Fatalf("cleared orphans = %v, want [org-1|sha256-1]", cleared)
+	}
+	promotion := staging.promotions[fakeUploadPromotionKey("org-1", "upload-1", 0)]
+	if promotion.AppliedAt == nil {
+		t.Fatal("expected promotion marker to be marked applied")
+	}
+}
+
+func TestApplyUploadBlockPromotionClearsPendingOrphanWhenMarkAppliedFails(t *testing.T) {
+	handler := NewSeafHTTPHandler(nil, storage.NewManager(), nil, NewMockTokenStore(), nil, nil)
+	claimedAt := time.Now().UTC()
+	staging := &fakeUploadStagingStore{
+		promotionApplyErr: errors.New("staging down"),
+		promotions: map[string]UploadBlockPromotionRecord{
+			fakeUploadPromotionKey("org-1", "upload-1", 0): {
+				OrgID:       "org-1",
+				UploadID:    "upload-1",
+				BlockIndex:  0,
+				BlockSHA256: "sha256-1",
+				CommitID:    "commit-1",
+				ClaimedAt:   claimedAt,
+			},
+		},
+	}
+	handler.SetUploadStagingStore(staging)
+	handler.blockPromoter = func(orgID, operationKey, blockID string, sizeBytes int, storageClass, storageKey string) error {
+		return nil
+	}
+	var cleared []string
+	handler.uploadOrphanCleaner = func(orgID, blockID string) error {
+		cleared = append(cleared, orgID+"|"+blockID)
+		return nil
+	}
+
+	promotedAt, livePromoted, err := handler.applyUploadBlockPromotion("org-1", "upload-1", "commit-1", claimedAt, uploadBlockPromotion{
+		BlockIndex:   0,
+		BlockSHA256:  "sha256-1",
+		SizeBytes:    10,
+		StorageClass: "hot",
+		StorageKey:   "sha256-1",
+	})
+	if err == nil {
+		t.Fatal("expected applyUploadBlockPromotion to fail")
+	}
+	if !strings.Contains(err.Error(), "staging down") {
+		t.Fatalf("error = %v, want staging failure", err)
+	}
+	if !livePromoted {
+		t.Fatal("expected livePromoted to remain true after block promotion succeeded")
+	}
+	if promotedAt.IsZero() {
+		t.Fatal("expected promotedAt to be populated even when staging mark fails")
+	}
+	if len(cleared) != 1 || cleared[0] != "org-1|sha256-1" {
+		t.Fatalf("cleared orphans = %v, want [org-1|sha256-1]", cleared)
 	}
 }
 

@@ -17,6 +17,9 @@ coverage.html
 # Go workspace file
 go.work
 
+.gocache/
+.gotmp/
+
 # IDE
 .vscode/
 .idea/
