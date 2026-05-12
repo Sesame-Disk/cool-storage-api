@@ -28,6 +28,7 @@ type UploadBlockState string
 
 const (
 	UploadBlockStateRegistered     UploadBlockState = "registered"
+	UploadBlockStatePreflushed     UploadBlockState = "preflushed"
 	UploadBlockStateUploaded       UploadBlockState = "uploaded"
 	UploadBlockStatePromoted       UploadBlockState = "promoted"
 	UploadBlockStateCleanupPending UploadBlockState = "cleanup_pending"
@@ -99,6 +100,8 @@ type UploadStagingStore interface {
 	UpsertBlock(record UploadSessionBlockRecord) error
 	GetSession(orgID, uploadID string) (*UploadSessionRecord, error)
 	ListSessionsByState(orgID string, state UploadSessionState, limit int) ([]UploadSessionRecord, error)
+	ListBlocks(uploadID string) ([]UploadSessionBlockRecord, error)
+	ListBlocksBySHA256(orgID, blockSHA256 string) ([]UploadSessionBlockRecord, error)
 	ListBlockPromotions(orgID, uploadID string) ([]UploadBlockPromotionRecord, error)
 	TryStartBlockPromotion(record UploadBlockPromotionRecord) (UploadBlockPromotionAttempt, error)
 	MarkBlockPromotionApplied(orgID, uploadID string, blockIndex int, appliedAt time.Time) error
@@ -133,9 +136,18 @@ func NormalizeUploadParentDir(parentDir string) string {
 	return normalizedParent
 }
 
-func BuildUploadSessionID(orgID, repoID, userID, tokenID, parentDir, filename string) string {
+func UploadParentDirWithinScope(scopeParentDir, candidateParentDir string) bool {
+	normalizedScope := NormalizeUploadParentDir(scopeParentDir)
+	normalizedCandidate := NormalizeUploadParentDir(candidateParentDir)
+	if normalizedScope == "/" {
+		return strings.HasPrefix(normalizedCandidate, "/")
+	}
+	return normalizedCandidate == normalizedScope || strings.HasPrefix(normalizedCandidate, normalizedScope+"/")
+}
+
+func BuildUploadSessionID(orgID, repoID, userID, tokenID, attemptID, parentDir, filename string) string {
 	normalizedParent := NormalizeUploadParentDir(parentDir)
-	sum := sha256.Sum256([]byte(strings.Join([]string{orgID, repoID, userID, tokenID, normalizedParent, filename}, "\x00")))
+	sum := sha256.Sum256([]byte(strings.Join([]string{orgID, repoID, userID, tokenID, attemptID, normalizedParent, filename}, "\x00")))
 	return hex.EncodeToString(sum[:])
 }
 
@@ -273,6 +285,100 @@ func (s *CassandraUploadStagingStore) ListSessionsByState(orgID string, state Up
 			State:     state,
 			UpdatedAt: updatedAt,
 			ExpiresAt: expiresAt,
+		})
+	}
+	if err := iter.Close(); err != nil {
+		return nil, err
+	}
+	return records, nil
+}
+
+func (s *CassandraUploadStagingStore) ListBlocks(uploadID string) ([]UploadSessionBlockRecord, error) {
+	if strings.TrimSpace(uploadID) == "" {
+		return nil, fmt.Errorf("upload id is required")
+	}
+	if s == nil || s.db == nil {
+		return nil, nil
+	}
+
+	iter := s.db.Session().Query(`
+		SELECT block_index, org_id, block_sha1, block_sha256, size_bytes,
+		       storage_class, storage_key, source, state, created_at, updated_at,
+		       uploaded_at, promoted_at
+		FROM upload_session_blocks WHERE upload_id = ?
+	`, uploadID).Iter()
+
+	var records []UploadSessionBlockRecord
+	var (
+		blockIndex   int
+		orgID        string
+		blockSHA1    string
+		blockSHA256  string
+		sizeBytes    int
+		storageClass string
+		storageKey   string
+		source       string
+		state        string
+		createdAt    time.Time
+		updatedAt    time.Time
+		uploadedAt   *time.Time
+		promotedAt   *time.Time
+	)
+	for iter.Scan(&blockIndex, &orgID, &blockSHA1, &blockSHA256, &sizeBytes, &storageClass, &storageKey, &source, &state, &createdAt, &updatedAt, &uploadedAt, &promotedAt) {
+		records = append(records, UploadSessionBlockRecord{
+			UploadID:     uploadID,
+			BlockIndex:   blockIndex,
+			OrgID:        orgID,
+			BlockSHA1:    blockSHA1,
+			BlockSHA256:  blockSHA256,
+			SizeBytes:    sizeBytes,
+			StorageClass: storageClass,
+			StorageKey:   storageKey,
+			Source:       UploadBlockSource(source),
+			State:        UploadBlockState(state),
+			CreatedAt:    createdAt,
+			UpdatedAt:    updatedAt,
+			UploadedAt:   uploadedAt,
+			PromotedAt:   promotedAt,
+		})
+	}
+	if err := iter.Close(); err != nil {
+		return nil, err
+	}
+	return records, nil
+}
+
+func (s *CassandraUploadStagingStore) ListBlocksBySHA256(orgID, blockSHA256 string) ([]UploadSessionBlockRecord, error) {
+	if strings.TrimSpace(orgID) == "" {
+		return nil, fmt.Errorf("org id is required")
+	}
+	if strings.TrimSpace(blockSHA256) == "" {
+		return nil, fmt.Errorf("block sha256 is required")
+	}
+	if s == nil || s.db == nil {
+		return nil, nil
+	}
+
+	iter := s.db.Session().Query(`
+		SELECT upload_id, block_index, state, updated_at
+		FROM upload_session_blocks_by_sha256 WHERE org_id = ? AND block_sha256 = ?
+	`, orgID, blockSHA256).Iter()
+
+	var records []UploadSessionBlockRecord
+	var (
+		uploadID   string
+		blockIndex int
+		state      string
+		updatedAt  time.Time
+	)
+	for iter.Scan(&uploadID, &blockIndex, &state, &updatedAt) {
+		records = append(records, UploadSessionBlockRecord{
+			UploadID:    uploadID,
+			BlockIndex:  blockIndex,
+			OrgID:       orgID,
+			BlockSHA256: blockSHA256,
+			State:       UploadBlockState(state),
+			UpdatedAt:   updatedAt,
 		})
 	}
 	if err := iter.Close(); err != nil {

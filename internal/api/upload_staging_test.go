@@ -6,18 +6,23 @@ import (
 )
 
 func TestBuildUploadSessionIDStableAndDistinct(t *testing.T) {
-	first := BuildUploadSessionID("org-1", "repo-1", "user-1", "token-1", "/docs", "file.txt")
-	second := BuildUploadSessionID("org-1", "repo-1", "user-1", "token-1", "/docs", "file.txt")
+	first := BuildUploadSessionID("org-1", "repo-1", "user-1", "token-1", "attempt-1", "/docs", "file.txt")
+	second := BuildUploadSessionID("org-1", "repo-1", "user-1", "token-1", "attempt-1", "/docs", "file.txt")
 	if first != second {
 		t.Fatalf("BuildUploadSessionID() unstable: %q != %q", first, second)
 	}
 
-	differentFile := BuildUploadSessionID("org-1", "repo-1", "user-1", "token-1", "/docs", "other.txt")
+	differentAttempt := BuildUploadSessionID("org-1", "repo-1", "user-1", "token-1", "attempt-2", "/docs", "file.txt")
+	if first == differentAttempt {
+		t.Fatal("expected different upload attempts to produce different upload IDs")
+	}
+
+	differentFile := BuildUploadSessionID("org-1", "repo-1", "user-1", "token-1", "attempt-1", "/docs", "other.txt")
 	if first == differentFile {
 		t.Fatal("expected different filenames to produce different upload IDs")
 	}
 
-	differentPath := BuildUploadSessionID("org-1", "repo-1", "user-1", "token-1", "/other", "file.txt")
+	differentPath := BuildUploadSessionID("org-1", "repo-1", "user-1", "token-1", "attempt-1", "/other", "file.txt")
 	if first == differentPath {
 		t.Fatal("expected different parent directories to produce different upload IDs")
 	}
@@ -26,12 +31,12 @@ func TestBuildUploadSessionIDStableAndDistinct(t *testing.T) {
 		t.Fatalf("BuildUploadSessionID() length = %d, want 64", len(first))
 	}
 
-	trailingSlash := BuildUploadSessionID("org-1", "repo-1", "user-1", "token-1", "/docs/", "file.txt")
+	trailingSlash := BuildUploadSessionID("org-1", "repo-1", "user-1", "token-1", "attempt-1", "/docs/", "file.txt")
 	if first != trailingSlash {
 		t.Fatal("expected parent dir normalization to ignore trailing slash differences")
 	}
 
-	backslashes := BuildUploadSessionID("org-1", "repo-1", "user-1", "token-1", "\\docs\\", "file.txt")
+	backslashes := BuildUploadSessionID("org-1", "repo-1", "user-1", "token-1", "attempt-1", "\\docs\\", "file.txt")
 	if first != backslashes {
 		t.Fatal("expected parent dir normalization to ignore path separator differences")
 	}
@@ -58,6 +63,10 @@ func TestCassandraUploadStagingStore_RejectsMissingKeys(t *testing.T) {
 
 	if _, err := store.ListSessionsByState("", UploadSessionStatePromoting, 10); err == nil {
 		t.Fatal("expected missing org id to fail")
+	}
+
+	if _, err := store.ListBlocks(""); err == nil {
+		t.Fatal("expected missing upload id to fail")
 	}
 
 	if err := store.DeleteBlockPromotion("", "upload-1", 0); err == nil {

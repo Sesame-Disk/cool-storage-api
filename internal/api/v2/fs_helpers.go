@@ -4,6 +4,7 @@ import (
 	"crypto/sha1"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"path"
@@ -19,6 +20,65 @@ import (
 // FSHelper provides helper functions for file system operations
 type FSHelper struct {
 	db *db.DB
+}
+
+type LibraryHeadConflictError struct {
+	RepoID       string
+	ExpectedHead string
+	ActualHead   string
+}
+
+type LibraryHeadPublishedProjectionError struct {
+	RepoID   string
+	CommitID string
+	Cause    error
+}
+
+type BlockMetadata struct {
+	Exists       bool
+	RefCount     int
+	StorageClass string
+	StorageKey   string
+}
+
+func (e *LibraryHeadConflictError) Error() string {
+	return fmt.Sprintf("library head conflict for repo %s: expected %s, found %s", e.RepoID, e.ExpectedHead, e.ActualHead)
+}
+
+func (e *LibraryHeadPublishedProjectionError) Error() string {
+	return fmt.Sprintf("library head already published for repo %s commit %s, but secondary projections failed: %v", e.RepoID, e.CommitID, e.Cause)
+}
+
+func (e *LibraryHeadPublishedProjectionError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Cause
+}
+
+func (h *FSHelper) GetBlockMetadata(orgID, blockID string) (BlockMetadata, error) {
+	if strings.TrimSpace(orgID) == "" {
+		return BlockMetadata{}, fmt.Errorf("org id is required")
+	}
+	if strings.TrimSpace(blockID) == "" {
+		return BlockMetadata{}, fmt.Errorf("block id is required")
+	}
+	if h == nil || h.db == nil {
+		return BlockMetadata{}, nil
+	}
+
+	var refCount int
+	var storageClass, storageKey string
+	err := h.db.Session().Query(`
+		SELECT ref_count, storage_class, storage_key FROM blocks WHERE org_id = ? AND block_id = ?
+	`, orgID, blockID).Scan(&refCount, &storageClass, &storageKey)
+	if err == gocql.ErrNotFound {
+		return BlockMetadata{}, nil
+	}
+	if err != nil {
+		return BlockMetadata{}, err
+	}
+	return BlockMetadata{Exists: true, RefCount: refCount, StorageClass: storageClass, StorageKey: storageKey}, nil
 }
 
 // NewFSHelper creates a new FSHelper instance
@@ -378,6 +438,30 @@ func (h *FSHelper) calculateDirStats(repoID, dirFSID string) (totalSize int64, f
 // UpdateLibraryHead updates the library's head_commit_id, size_bytes, and file_count
 // Uses batched dual-write to maintain consistency with libraries_by_id
 func (h *FSHelper) UpdateLibraryHead(orgID, repoID, commitID string) error {
+	return h.UpdateLibraryHeadWithExpected(orgID, repoID, commitID, "")
+}
+
+func (h *FSHelper) updateLibraryHeadSecondaryProjections(repoID, commitID string, projectionRow db.AdminLibraryProjectionRow, previousRow *db.AdminLibraryProjectionRow) error {
+	batch := h.db.Session().Batch(gocql.LoggedBatch)
+	batch.Query(`
+		UPDATE libraries_by_id SET head_commit_id = ?
+		WHERE library_id = ?
+	`, commitID, repoID)
+	addAdminLibraryReadModelRefreshQueries(batch, projectionRow, previousRow)
+	return batch.Exec()
+}
+
+func (h *FSHelper) repairLibraryHeadSecondaryProjections(repoID, commitID string, projectionRow db.AdminLibraryProjectionRow, previousRow *db.AdminLibraryProjectionRow) error {
+	err := h.updateLibraryHeadSecondaryProjections(repoID, commitID, projectionRow, previousRow)
+	if err == nil {
+		return nil
+	}
+	log.Printf("[UpdateLibraryHead] WARNING: secondary projection update failed for library %s commit %s; retrying once: %v", repoID, commitID, err)
+	time.Sleep(100 * time.Millisecond)
+	return h.updateLibraryHeadSecondaryProjections(repoID, commitID, projectionRow, previousRow)
+}
+
+func (h *FSHelper) UpdateLibraryHeadWithExpected(orgID, repoID, commitID, expectedHeadCommitID string) error {
 	// Get root_fs_id from the new commit to recalculate stats
 	var rootFSID string
 	err := h.db.Session().Query(`
@@ -403,6 +487,44 @@ func (h *FSHelper) UpdateLibraryHead(orgID, repoID, commitID string) error {
 	projectionRow.SizeBytes = totalSize
 	projectionRow.FileCount = fileCount
 	projectionRow.UpdatedAt = now
+	if strings.TrimSpace(expectedHeadCommitID) != "" {
+		existing := map[string]interface{}{}
+		applied, err := h.db.Session().Query(`
+			UPDATE libraries SET head_commit_id = ?, size_bytes = ?, file_count = ?, updated_at = ?
+			WHERE org_id = ? AND library_id = ? IF head_commit_id = ?
+		`, commitID, totalSize, fileCount, now, orgID, repoID, expectedHeadCommitID).MapScanCAS(existing)
+		if err != nil {
+			return fmt.Errorf("failed to compare-and-swap library head: %w", err)
+		}
+		if !applied {
+			actualHead := ""
+			if value, ok := existing["head_commit_id"]; ok && value != nil {
+				switch typed := value.(type) {
+				case string:
+					actualHead = typed
+				case []byte:
+					actualHead = string(typed)
+				default:
+					actualHead = fmt.Sprint(typed)
+				}
+			}
+			if strings.TrimSpace(actualHead) == strings.TrimSpace(commitID) {
+				if err := h.repairLibraryHeadSecondaryProjections(repoID, commitID, projectionRow, &previousRow); err != nil {
+					return &LibraryHeadPublishedProjectionError{RepoID: repoID, CommitID: commitID, Cause: err}
+				}
+				log.Printf("[UpdateLibraryHead] Library %s already points at commit %s; refreshed secondary projections", repoID, commitID)
+				return nil
+			}
+			return &LibraryHeadConflictError{RepoID: repoID, ExpectedHead: expectedHeadCommitID, ActualHead: actualHead}
+		}
+
+		if err := h.repairLibraryHeadSecondaryProjections(repoID, commitID, projectionRow, &previousRow); err != nil {
+			return &LibraryHeadPublishedProjectionError{RepoID: repoID, CommitID: commitID, Cause: err}
+		}
+
+		log.Printf("[UpdateLibraryHead] Updated library %s with expected head %s: size=%d bytes, files=%d", repoID, expectedHeadCommitID, totalSize, fileCount)
+		return nil
+	}
 	batch := h.db.Session().Batch(gocql.LoggedBatch)
 
 	// Update main table with stats
@@ -424,6 +546,24 @@ func (h *FSHelper) UpdateLibraryHead(orgID, repoID, commitID string) error {
 
 	log.Printf("[UpdateLibraryHead] Updated library %s: size=%d bytes, files=%d", repoID, totalSize, fileCount)
 	return nil
+}
+
+func IsLibraryHeadConflict(err error) bool {
+	var target *LibraryHeadConflictError
+	return errors.As(err, &target)
+}
+
+func IsLibraryHeadPublished(err error) bool {
+	var target *LibraryHeadPublishedProjectionError
+	return errors.As(err, &target)
+}
+
+func IsLibraryHeadAlreadyPublished(err error, commitID string) bool {
+	var target *LibraryHeadConflictError
+	if !errors.As(err, &target) {
+		return false
+	}
+	return strings.TrimSpace(target.ActualHead) == strings.TrimSpace(commitID)
 }
 
 // InitializeLibraryFS creates the empty root directory, initial commit, and sets
@@ -571,6 +711,7 @@ func (h *FSHelper) markBlockMutationProcessed(operationKey string) (bool, error)
 
 func (h *FSHelper) IncrementOrCreateBlock(orgID, blockID string, sizeBytes int, storageClass, storageKey string) error {
 	const maxRetries = 10
+	loggedGCClaim := false
 
 	for attempt := 0; attempt < maxRetries; attempt++ {
 		now := time.Now()
@@ -583,6 +724,10 @@ func (h *FSHelper) IncrementOrCreateBlock(orgID, blockID string, sizeBytes int, 
 
 		if err == nil {
 			if currentRefCount < 0 {
+				if !loggedGCClaim {
+					log.Printf("[IncrementOrCreateBlock] block %s/%s is claimed by GC with ref_count=%d; waiting before promotion", orgID, blockID, currentRefCount)
+					loggedGCClaim = true
+				}
 				// GC sentinel (-999): the GC worker has claimed this row and will
 				// DELETE it momentarily (Phase 2). We must NOT touch it — any
 				// UPDATE would be clobbered by the unconditional DELETE.

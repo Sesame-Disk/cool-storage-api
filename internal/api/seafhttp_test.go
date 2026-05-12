@@ -12,12 +12,14 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	v2 "github.com/Sesame-Disk/sesamefs/internal/api/v2"
 	"github.com/Sesame-Disk/sesamefs/internal/middleware"
 	"github.com/Sesame-Disk/sesamefs/internal/storage"
 	"github.com/gin-gonic/gin"
@@ -101,6 +103,58 @@ func (f *fakeUploadStagingStore) ListSessionsByState(orgID string, state UploadS
 		seen[record.UploadID] = struct{}{}
 		records = append(records, record)
 	}
+	return records, nil
+}
+
+func (f *fakeUploadStagingStore) ListBlocks(uploadID string) ([]UploadSessionBlockRecord, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.err != nil {
+		return nil, f.err
+	}
+	latestByIndex := make(map[int]UploadSessionBlockRecord)
+	for _, record := range f.blocks {
+		if record.UploadID != uploadID {
+			continue
+		}
+		latestByIndex[record.BlockIndex] = record
+	}
+	indices := make([]int, 0, len(latestByIndex))
+	for blockIndex := range latestByIndex {
+		indices = append(indices, blockIndex)
+	}
+	sort.Ints(indices)
+	records := make([]UploadSessionBlockRecord, 0, len(indices))
+	for _, blockIndex := range indices {
+		records = append(records, latestByIndex[blockIndex])
+	}
+	return records, nil
+}
+
+func (f *fakeUploadStagingStore) ListBlocksBySHA256(orgID, blockSHA256 string) ([]UploadSessionBlockRecord, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.err != nil {
+		return nil, f.err
+	}
+	latest := make(map[string]UploadSessionBlockRecord)
+	for _, record := range f.blocks {
+		if record.OrgID != orgID || record.BlockSHA256 != blockSHA256 {
+			continue
+		}
+		key := record.UploadID + ":" + strconv.Itoa(record.BlockIndex)
+		latest[key] = record
+	}
+	records := make([]UploadSessionBlockRecord, 0, len(latest))
+	for _, record := range latest {
+		records = append(records, record)
+	}
+	sort.Slice(records, func(i, j int) bool {
+		if records[i].UploadID == records[j].UploadID {
+			return records[i].BlockIndex < records[j].BlockIndex
+		}
+		return records[i].UploadID < records[j].UploadID
+	})
 	return records, nil
 }
 
@@ -1057,6 +1111,161 @@ func TestHandleUploadChunked_PartialChunkPersistsReceivingSession(t *testing.T) 
 	chunkManager.CleanupUpload(tokenStr, "partial.txt")
 }
 
+func TestHandleUploadChunked_RejectsParentDirOutsideTokenPath(t *testing.T) {
+	tm := NewTokenManager(time.Hour)
+	tokenStr, err := tm.CreateUploadToken("org-1", "repo-1", "/allowed", "user-1")
+	if err != nil {
+		t.Fatalf("CreateUploadToken failed: %v", err)
+	}
+	staging := &fakeUploadStagingStore{}
+	handler := NewSeafHTTPHandler(nil, storage.NewManager(), nil, tm, nil, nil)
+	handler.SetUploadStagingStore(staging)
+
+	r := gin.New()
+	r.POST("/seafhttp/upload-api/:token", handler.HandleUpload)
+
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	_ = writer.WriteField("parent_dir", "/")
+	part, _ := writer.CreateFormFile("file", "escape.txt")
+	_, _ = part.Write([]byte("hel"))
+	writer.Close()
+
+	req := httptest.NewRequest(http.MethodPost, "/seafhttp/upload-api/"+tokenStr, &body)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	req.Header.Set("Content-Range", "bytes 0-2/5")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusForbidden)
+	}
+	if len(staging.sessions) != 0 {
+		t.Fatalf("staging sessions = %d, want 0", len(staging.sessions))
+	}
+	chunkManager.CleanupUpload(tokenStr, "escape.txt")
+}
+
+func TestHandleUploadChunked_SanitizesMultipartFilenamePath(t *testing.T) {
+	tm := NewTokenManager(time.Hour)
+	tokenStr, err := tm.CreateUploadToken("org-1", "repo-1", "/allowed", "user-1")
+	if err != nil {
+		t.Fatalf("CreateUploadToken failed: %v", err)
+	}
+	staging := &fakeUploadStagingStore{}
+	handler := NewSeafHTTPHandler(nil, storage.NewManager(), nil, tm, nil, nil)
+	handler.SetUploadStagingStore(staging)
+
+	r := gin.New()
+	r.POST("/seafhttp/upload-api/:token", handler.HandleUpload)
+
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	part, _ := writer.CreateFormFile("file", "../escape.txt")
+	_, _ = part.Write([]byte("hel"))
+	writer.Close()
+
+	req := httptest.NewRequest(http.MethodPost, "/seafhttp/upload-api/"+tokenStr, &body)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	req.Header.Set("Content-Range", "bytes 0-2/5")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusOK)
+	}
+	if len(staging.sessions) == 0 {
+		t.Fatal("expected staging session to be persisted")
+	}
+	got := staging.sessions[len(staging.sessions)-1]
+	if got.ParentDir != "/allowed" {
+		t.Fatalf("parent dir = %q, want /allowed", got.ParentDir)
+	}
+	if got.Filename != "escape.txt" {
+		t.Fatalf("filename = %q, want escape.txt", got.Filename)
+	}
+	chunkManager.CleanupUpload(tokenStr, "escape.txt")
+}
+
+func TestHandleUploadChunked_RelativePathStaysWithinTokenPath(t *testing.T) {
+	tm := NewTokenManager(time.Hour)
+	tokenStr, err := tm.CreateUploadToken("org-1", "repo-1", "/allowed", "user-1")
+	if err != nil {
+		t.Fatalf("CreateUploadToken failed: %v", err)
+	}
+	staging := &fakeUploadStagingStore{}
+	handler := NewSeafHTTPHandler(nil, storage.NewManager(), nil, tm, nil, nil)
+	handler.SetUploadStagingStore(staging)
+
+	r := gin.New()
+	r.POST("/seafhttp/upload-api/:token", handler.HandleUpload)
+
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	_ = writer.WriteField("relative_path", "nested/file.txt")
+	part, _ := writer.CreateFormFile("file", "ignored-name.txt")
+	_, _ = part.Write([]byte("hel"))
+	writer.Close()
+
+	req := httptest.NewRequest(http.MethodPost, "/seafhttp/upload-api/"+tokenStr, &body)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	req.Header.Set("Content-Range", "bytes 0-2/5")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusOK)
+	}
+	if len(staging.sessions) == 0 {
+		t.Fatal("expected staging session to be persisted")
+	}
+	got := staging.sessions[len(staging.sessions)-1]
+	if got.ParentDir != "/allowed/nested" {
+		t.Fatalf("parent dir = %q, want /allowed/nested", got.ParentDir)
+	}
+	if got.Filename != "file.txt" {
+		t.Fatalf("filename = %q, want file.txt", got.Filename)
+	}
+	chunkManager.CleanupUpload(tokenStr, "file.txt")
+}
+
+func TestHandleUploadChunked_RejectsTotalSizeMismatchAcrossChunks(t *testing.T) {
+	tm := NewTokenManager(time.Hour)
+	tokenStr, err := tm.CreateUploadToken("org-1", "repo-1", "/", "user-1")
+	if err != nil {
+		t.Fatalf("CreateUploadToken failed: %v", err)
+	}
+	handler := NewSeafHTTPHandler(nil, storage.NewManager(), nil, tm, nil, nil)
+
+	r := gin.New()
+	r.POST("/seafhttp/upload-api/:token", handler.HandleUpload)
+
+	makeRequest := func(contentRange string, payload string) *httptest.ResponseRecorder {
+		var body bytes.Buffer
+		writer := multipart.NewWriter(&body)
+		part, _ := writer.CreateFormFile("file", "mismatch.txt")
+		_, _ = part.Write([]byte(payload))
+		writer.Close()
+
+		req := httptest.NewRequest(http.MethodPost, "/seafhttp/upload-api/"+tokenStr, &body)
+		req.Header.Set("Content-Type", writer.FormDataContentType())
+		req.Header.Set("Content-Range", contentRange)
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+		return w
+	}
+
+	first := makeRequest("bytes 0-1/5", "he")
+	if first.Code != http.StatusOK {
+		t.Fatalf("first status = %d, want %d", first.Code, http.StatusOK)
+	}
+	second := makeRequest("bytes 2-4/6", "llo")
+	if second.Code != http.StatusBadRequest {
+		t.Fatalf("second status = %d, want %d", second.Code, http.StatusBadRequest)
+	}
+	chunkManager.CleanupUpload(tokenStr, "mismatch.txt")
+}
+
 func TestHandleUploadChunked_FinalizeSuccessClosesSession(t *testing.T) {
 	tm := NewTokenManager(time.Hour)
 	tokenStr, err := tm.CreateUploadToken("org-1", "repo-1", "/", "user-1")
@@ -1159,17 +1368,16 @@ func TestHandleUploadChunked_ReceivingSessionWrittenOnceAcrossChunks(t *testing.
 	}
 }
 
-func TestHandleUploadChunked_PreservesClosedSessionUntilFinalize(t *testing.T) {
+func TestHandleUploadChunked_NewAttemptDoesNotReuseClosedSession(t *testing.T) {
 	tm := NewTokenManager(time.Hour)
 	tokenStr, err := tm.CreateUploadToken("org-1", "repo-1", "/", "user-1")
 	if err != nil {
 		t.Fatalf("CreateUploadToken failed: %v", err)
 	}
 	staging := &fakeUploadStagingStore{}
-	uploadID := BuildUploadSessionID("org-1", "repo-1", "user-1", tokenStr, "/", "retry.txt")
 	now := time.Now().UTC()
 	staging.sessions = append(staging.sessions, UploadSessionRecord{
-		UploadID:       uploadID,
+		UploadID:       BuildUploadSessionID("org-1", "repo-1", "user-1", tokenStr, "old-attempt", "/", "retry.txt"),
 		OrgID:          "org-1",
 		RepoID:         "repo-1",
 		UserID:         "user-1",
@@ -1178,7 +1386,7 @@ func TestHandleUploadChunked_PreservesClosedSessionUntilFinalize(t *testing.T) {
 		Filename:       "retry.txt",
 		ActualFilename: "retry.txt",
 		CommitID:       "commit-prev",
-		TotalSize:      5,
+		TotalSize:      9,
 		State:          UploadSessionStateClosed,
 		CreatedAt:      now,
 		UpdatedAt:      now,
@@ -1187,19 +1395,21 @@ func TestHandleUploadChunked_PreservesClosedSessionUntilFinalize(t *testing.T) {
 
 	handler := NewSeafHTTPHandler(nil, storage.NewManager(), nil, tm, nil, nil)
 	handler.SetUploadStagingStore(staging)
+	var currentAttemptUploadID string
 	handler.chunkedFinalize = func(c *gin.Context, token *AccessToken, upload *ChunkUpload, uploadID, parentDir, filename, storageKey string, totalSize int64, replace bool) (finalizeUploadResult, error) {
+		currentAttemptUploadID = uploadID
 		session, err := staging.GetSession("org-1", uploadID)
 		if err != nil {
 			t.Fatalf("GetSession failed: %v", err)
 		}
 		if session == nil {
-			t.Fatal("expected preserved closed session before finalize")
+			t.Fatal("expected current attempt session before finalize")
 		}
-		if session.State != UploadSessionStateClosed {
-			t.Fatalf("session state before finalize = %q, want %q", session.State, UploadSessionStateClosed)
+		if session.State != UploadSessionStatePromoting {
+			t.Fatalf("session state before finalize = %q, want %q", session.State, UploadSessionStatePromoting)
 		}
-		if session.CommitID != "commit-prev" {
-			t.Fatalf("commit id before finalize = %q, want commit-prev", session.CommitID)
+		if session.CommitID != "" {
+			t.Fatalf("commit id before finalize = %q, want empty current attempt", session.CommitID)
 		}
 		return finalizeUploadResult{FileID: "file-id", ActualFilename: filename, CommitID: "commit-next"}, nil
 	}
@@ -1222,14 +1432,24 @@ func TestHandleUploadChunked_PreservesClosedSessionUntilFinalize(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d", w.Code, http.StatusOK)
 	}
-	if len(staging.sessions) != 2 {
-		t.Fatalf("session writes = %d, want 2 (original closed + final closed)", len(staging.sessions))
+	if currentAttemptUploadID == "" {
+		t.Fatal("expected current attempt upload ID to be captured")
 	}
-	if staging.sessions[len(staging.sessions)-1].State != UploadSessionStateClosed {
-		t.Fatalf("final state = %q, want %q", staging.sessions[len(staging.sessions)-1].State, UploadSessionStateClosed)
+	if currentAttemptUploadID == staging.sessions[0].UploadID {
+		t.Fatal("expected current attempt to use a different upload ID from the prior closed attempt")
 	}
-	if staging.sessions[len(staging.sessions)-1].CommitID != "commit-next" {
-		t.Fatalf("final commit id = %q, want commit-next", staging.sessions[len(staging.sessions)-1].CommitID)
+	latestCurrent, err := staging.GetSession("org-1", currentAttemptUploadID)
+	if err != nil {
+		t.Fatalf("GetSession(current attempt) failed: %v", err)
+	}
+	if latestCurrent == nil || latestCurrent.State != UploadSessionStateClosed {
+		t.Fatalf("current attempt state = %+v, want closed", latestCurrent)
+	}
+	if latestCurrent.CommitID != "commit-next" {
+		t.Fatalf("final commit id = %q, want commit-next", latestCurrent.CommitID)
+	}
+	if staging.sessions[0].CommitID != "commit-prev" {
+		t.Fatalf("old attempt commit id = %q, want commit-prev", staging.sessions[0].CommitID)
 	}
 	chunkManager.CleanupUpload(tokenStr, "retry.txt")
 }
@@ -1251,11 +1471,6 @@ func TestHandleUploadChunked_PreflushesContiguousBlockBeforeFinalize(t *testing.
 		uploadedHashes = append(uploadedHashes, hash)
 		return hash, nil
 	}
-	var orphanBlocks []string
-	handler.SetUploadOrphanRecorder(func(orgID, blockID, storageClass, errMsg string) error {
-		orphanBlocks = append(orphanBlocks, blockID)
-		return nil
-	})
 
 	fullBlock := bytes.Repeat([]byte("a"), uploadBlockSize)
 	tail := []byte("xyz")
@@ -1319,8 +1534,15 @@ func TestHandleUploadChunked_PreflushesContiguousBlockBeforeFinalize(t *testing.
 	if final.Code != http.StatusOK {
 		t.Fatalf("final status = %d, want %d", final.Code, http.StatusOK)
 	}
-	if len(orphanBlocks) != 1 || orphanBlocks[0] != expectedSHA256Hex {
-		t.Fatalf("recorded orphan blocks = %v, want [%s]", orphanBlocks, expectedSHA256Hex)
+	if len(staging.blocks) < 2 {
+		t.Fatalf("staging block writes = %d, want at least 2", len(staging.blocks))
+	}
+	last := staging.blocks[len(staging.blocks)-1]
+	if last.State != UploadBlockStatePreflushed {
+		t.Fatalf("last staging state = %q, want %q", last.State, UploadBlockStatePreflushed)
+	}
+	if last.BlockSHA256 != expectedSHA256Hex {
+		t.Fatalf("last staging sha256 = %q, want %q", last.BlockSHA256, expectedSHA256Hex)
 	}
 	chunkManager.CleanupUpload(tokenStr, "preflush.txt")
 }
@@ -1403,7 +1625,46 @@ func TestHandleUploadChunked_DoesNotPreflushUntilMissingPrefixArrives(t *testing
 	if len(uploadedHashes) != 1 || uploadedHashes[0] != expectedSHA256Hex {
 		t.Fatalf("preflush uploads after completing prefix = %v, want [%s]", uploadedHashes, expectedSHA256Hex)
 	}
+	if len(staging.blocks) < 2 {
+		t.Fatalf("staging block writes = %d, want at least 2", len(staging.blocks))
+	}
+	last := staging.blocks[len(staging.blocks)-1]
+	if last.State != UploadBlockStatePreflushed {
+		t.Fatalf("last staging state = %q, want %q", last.State, UploadBlockStatePreflushed)
+	}
+	if last.BlockSHA256 != expectedSHA256Hex {
+		t.Fatalf("last staging sha256 = %q, want %q", last.BlockSHA256, expectedSHA256Hex)
+	}
 	chunkManager.CleanupUpload(tokenStr, "out-of-order-preflush.txt")
+}
+
+func TestMaterializeUploadBlockReusesLiveBlockMetadata(t *testing.T) {
+	handler := NewSeafHTTPHandler(nil, storage.NewManager(), nil, NewMockTokenStore(), nil, nil)
+	writerCalled := false
+	handler.uploadBlockWriter = func(ctx context.Context, blockStore *storage.BlockStore, hash string, data []byte) (string, error) {
+		writerCalled = true
+		return hash, nil
+	}
+	handler.uploadBlockMetadata = func(orgID, blockID string) (uploadBlockMetadata, error) {
+		return uploadBlockMetadata{Exists: true, RefCount: 2, StorageClass: "hot", StorageKey: "existing-key"}, nil
+	}
+
+	source, storageClass, storageKey, uploadedAt, err := handler.materializeUploadBlock(context.Background(), nil, "org-1", "sha256-1", []byte("hello"), "cold")
+	if err != nil {
+		t.Fatalf("materializeUploadBlock failed: %v", err)
+	}
+	if writerCalled {
+		t.Fatal("expected live block reuse to skip block writes")
+	}
+	if source != UploadBlockSourceExistingLive {
+		t.Fatalf("source = %q, want %q", source, UploadBlockSourceExistingLive)
+	}
+	if storageClass != "hot" || storageKey != "existing-key" {
+		t.Fatalf("storage location = %s/%s, want hot/existing-key", storageClass, storageKey)
+	}
+	if uploadedAt != nil {
+		t.Fatal("expected reused live block to have nil uploadedAt")
+	}
 }
 
 func TestHandleUploadChunked_FinalizeWaitsForInFlightPreflush(t *testing.T) {
@@ -1631,7 +1892,7 @@ func TestPublishPreparedUploadPromotesBeforePublishingHead(t *testing.T) {
 		calls = append(calls, "rollback")
 		return nil
 	}
-	handler.commitPublisher = func(orgID, repoID, commitID string) error {
+	handler.commitPublisher = func(orgID, repoID, commitID, expectedHead string) error {
 		calls = append(calls, "publish:"+commitID)
 		return nil
 	}
@@ -1800,7 +2061,7 @@ func TestPublishPreparedUploadRollsBackWhenPublishFails(t *testing.T) {
 		rollbackBlockIDs = append([]string(nil), blockIDs...)
 		return nil
 	}
-	handler.commitPublisher = func(orgID, repoID, commitID string) error {
+	handler.commitPublisher = func(orgID, repoID, commitID, expectedHead string) error {
 		return errors.New("publish failed")
 	}
 
@@ -1839,7 +2100,7 @@ func TestPublishPreparedUploadRollsBackPartialPromotionFailures(t *testing.T) {
 		rollbackBlockIDs = append([]string(nil), blockIDs...)
 		return nil
 	}
-	handler.commitPublisher = func(orgID, repoID, commitID string) error {
+	handler.commitPublisher = func(orgID, repoID, commitID, expectedHead string) error {
 		publishCalled = true
 		return nil
 	}
@@ -1873,7 +2134,7 @@ func TestPublishPreparedUploadRetrySkipsAlreadyAppliedPromotion(t *testing.T) {
 		promoteCalls++
 		return nil
 	}
-	handler.commitPublisher = func(orgID, repoID, commitID string) error {
+	handler.commitPublisher = func(orgID, repoID, commitID, expectedHead string) error {
 		publishCalls++
 		return nil
 	}
@@ -1907,7 +2168,7 @@ func TestPublishPreparedUploadReleasesClaimAfterPromotionFailure(t *testing.T) {
 		}
 		return nil
 	}
-	handler.commitPublisher = func(orgID, repoID, commitID string) error {
+	handler.commitPublisher = func(orgID, repoID, commitID, expectedHead string) error {
 		return nil
 	}
 
@@ -1935,7 +2196,7 @@ func TestPublishPreparedUploadPublishFailureDoesNotRollbackAlreadyAppliedBlocks(
 	handler.blockPromoter = func(orgID, operationKey, blockID string, sizeBytes int, storageClass, storageKey string) error {
 		return nil
 	}
-	handler.commitPublisher = func(orgID, repoID, commitID string) error {
+	handler.commitPublisher = func(orgID, repoID, commitID, expectedHead string) error {
 		return nil
 	}
 
@@ -1949,7 +2210,7 @@ func TestPublishPreparedUploadPublishFailureDoesNotRollbackAlreadyAppliedBlocks(
 		rollbackCalls++
 		return nil
 	}
-	handler.commitPublisher = func(orgID, repoID, commitID string) error {
+	handler.commitPublisher = func(orgID, repoID, commitID, expectedHead string) error {
 		return errors.New("publish failed")
 	}
 
@@ -1997,7 +2258,7 @@ func TestRecoverPreparedUploadIfPossiblePublishesPromotingSession(t *testing.T) 
 	}
 
 	var publishCalls int
-	handler.commitPublisher = func(orgID, repoID, commitID string) error {
+	handler.commitPublisher = func(orgID, repoID, commitID, expectedHead string) error {
 		publishCalls++
 		return nil
 	}
@@ -2052,7 +2313,7 @@ func TestRecoverPreparedUploadIfPossibleReturnsClosedSessionWithoutRepublish(t *
 	}
 
 	var publishCalls int
-	handler.commitPublisher = func(orgID, repoID, commitID string) error {
+	handler.commitPublisher = func(orgID, repoID, commitID, expectedHead string) error {
 		publishCalls++
 		return nil
 	}
@@ -2268,6 +2529,39 @@ func TestRecoverPreparedUploadIfPossiblePreservesPromotionsForIdempotentRetry(t 
 	}
 }
 
+func TestRecoverPreparedUploadIfPossibleDoesNotRecoverExpiredClosedSession(t *testing.T) {
+	handler := NewSeafHTTPHandler(nil, storage.NewManager(), nil, NewMockTokenStore(), nil, nil)
+	staging := &fakeUploadStagingStore{}
+	handler.SetUploadStagingStore(staging)
+	now := time.Now().UTC()
+	staging.sessions = append(staging.sessions, UploadSessionRecord{
+		UploadID: "upload-1", OrgID: "org-1", RepoID: "repo-1",
+		Filename: "file.txt", ActualFilename: "file.txt",
+		CommitID: "commit-1", State: UploadSessionStateClosed,
+		CreatedAt: now.Add(-time.Hour), UpdatedAt: now.Add(-time.Hour), ExpiresAt: now.Add(-time.Minute),
+	})
+	applied := now.Add(-30 * time.Minute)
+	staging.promotions = map[string]UploadBlockPromotionRecord{
+		fakeUploadPromotionKey("org-1", "upload-1", 0): {
+			OrgID: "org-1", UploadID: "upload-1", BlockIndex: 0,
+			BlockSHA256: "sha256-1", CommitID: "commit-1",
+			ClaimedAt: now.Add(-time.Hour), AppliedAt: &applied,
+		},
+	}
+
+	prepared, ok, err := handler.recoverPreparedUploadIfPossible("org-1", "repo-1", "upload-1",
+		[]uploadBlockPromotion{{BlockIndex: 0, BlockSHA256: "sha256-1"}})
+	if err != nil {
+		t.Fatalf("recoverPreparedUploadIfPossible: %v", err)
+	}
+	if ok {
+		t.Fatalf("expected expired closed session to stop idempotent recovery, got %+v", prepared)
+	}
+	if _, exists := staging.promotions[fakeUploadPromotionKey("org-1", "upload-1", 0)]; exists {
+		t.Fatal("expected expired closed session promotions to be purged")
+	}
+}
+
 // TestCloseRecoveredUploadSessionDoesNotTouchPromotions documents that the
 // recovery close intentionally leaves promotion rows in place so a follow-up
 // retry can recognise the upload as already done. They are purged lazily on
@@ -2385,7 +2679,7 @@ func TestPublishPreparedUploadResumesPendingPromotionMarker(t *testing.T) {
 		return nil
 	}
 	var publishCalls int
-	handler.commitPublisher = func(orgID, repoID, commitID string) error {
+	handler.commitPublisher = func(orgID, repoID, commitID, expectedHead string) error {
 		publishCalls++
 		return nil
 	}
@@ -2435,7 +2729,7 @@ func TestPublishPreparedUploadRollsBackResumedPendingPromotionOnPublishFailure(t
 		rolledBackBlockIDs = append([]string(nil), blockIDs...)
 		return nil
 	}
-	handler.commitPublisher = func(orgID, repoID, commitID string) error {
+	handler.commitPublisher = func(orgID, repoID, commitID, expectedHead string) error {
 		return errors.New("publish failed")
 	}
 
@@ -2489,7 +2783,7 @@ func TestRecoverPromotingUploadSessionPublishesWhenAllPromotionsApplied(t *testi
 	}
 
 	var publishCalls int
-	handler.commitPublisher = func(orgID, repoID, commitID string) error {
+	handler.commitPublisher = func(orgID, repoID, commitID, expectedHead string) error {
 		publishCalls++
 		return nil
 	}
@@ -2563,7 +2857,7 @@ func TestRecoverPromotingUploadsForOrgRecoversLatestUniqueSessions(t *testing.T)
 	}
 
 	var published []string
-	handler.commitPublisher = func(orgID, repoID, commitID string) error {
+	handler.commitPublisher = func(orgID, repoID, commitID, expectedHead string) error {
 		published = append(published, commitID)
 		return nil
 	}
@@ -2572,6 +2866,599 @@ func TestRecoverPromotingUploadsForOrgRecoversLatestUniqueSessions(t *testing.T)
 	if len(published) != 2 {
 		t.Fatalf("published commits = %v, want 2 commits", published)
 	}
+}
+
+func TestCleanupPendingUploadSessionDeletesUnpromotedStagedBlocks(t *testing.T) {
+	handler := NewSeafHTTPHandler(nil, storage.NewManager(), nil, NewMockTokenStore(), nil, nil)
+	staging := &fakeUploadStagingStore{}
+	handler.SetUploadStagingStore(staging)
+	now := time.Now().UTC()
+	staging.sessions = append(staging.sessions, UploadSessionRecord{
+		UploadID:  "upload-1",
+		OrgID:     "org-1",
+		RepoID:    "repo-1",
+		UserID:    "user-1",
+		Filename:  "file.txt",
+		TotalSize: 10,
+		State:     UploadSessionStateCleanupPending,
+		CreatedAt: now.Add(-time.Hour),
+		UpdatedAt: now.Add(-time.Minute),
+		ExpiresAt: now.Add(time.Hour),
+		LastError: "failed to finalize upload",
+	})
+	uploadedAt := now.Add(-2 * time.Minute)
+	staging.blocks = append(staging.blocks,
+		UploadSessionBlockRecord{UploadID: "upload-1", BlockIndex: 0, OrgID: "org-1", BlockSHA1: "sha1-1", BlockSHA256: "sha256-1", StorageClass: "", StorageKey: "sha256-1", Source: UploadBlockSourceNewObject, State: UploadBlockStatePreflushed, CreatedAt: now.Add(-time.Hour), UpdatedAt: now.Add(-2 * time.Minute), UploadedAt: &uploadedAt},
+		UploadSessionBlockRecord{UploadID: "upload-1", BlockIndex: 1, OrgID: "org-1", BlockSHA1: "sha1-2", BlockSHA256: "sha256-2", StorageClass: "", StorageKey: "sha256-2", Source: UploadBlockSourceExistingLive, State: UploadBlockStateRegistered, CreatedAt: now.Add(-time.Hour), UpdatedAt: now.Add(-2 * time.Minute)},
+	)
+	var deleted []string
+	handler.uploadBlockDeleter = func(ctx context.Context, blockStore *storage.BlockStore, hash string) error {
+		deleted = append(deleted, hash)
+		return nil
+	}
+	handler.storage = &storage.S3Store{}
+
+	cleaned, err := handler.cleanupPendingUploadSession(&UploadSessionRecord{OrgID: "org-1", UploadID: "upload-1"})
+	if err != nil {
+		t.Fatalf("cleanupPendingUploadSession failed: %v", err)
+	}
+	if !cleaned {
+		t.Fatal("expected cleanupPendingUploadSession to clean the session")
+	}
+	if len(deleted) != 1 || deleted[0] != "sha256-1" {
+		t.Fatalf("deleted blocks = %v, want [sha256-1]", deleted)
+	}
+	latest := staging.sessions[len(staging.sessions)-1]
+	if latest.State != UploadSessionStateAborted {
+		t.Fatalf("latest session state = %q, want %q", latest.State, UploadSessionStateAborted)
+	}
+	blocks, err := staging.ListBlocks("upload-1")
+	if err != nil {
+		t.Fatalf("ListBlocks failed: %v", err)
+	}
+	if len(blocks) != 2 {
+		t.Fatalf("block count = %d, want 2", len(blocks))
+	}
+	if blocks[0].State != UploadBlockStateCleaned || blocks[1].State != UploadBlockStateCleaned {
+		t.Fatalf("block states = %q/%q, want cleaned/cleaned", blocks[0].State, blocks[1].State)
+	}
+}
+
+func TestCleanupPendingUploadSessionRollsBackAppliedPromotionSessions(t *testing.T) {
+	handler := NewSeafHTTPHandler(nil, storage.NewManager(), nil, NewMockTokenStore(), nil, nil)
+	staging := &fakeUploadStagingStore{}
+	handler.SetUploadStagingStore(staging)
+	now := time.Now().UTC()
+	staging.sessions = append(staging.sessions, UploadSessionRecord{
+		UploadID:  "upload-1",
+		OrgID:     "org-1",
+		RepoID:    "repo-1",
+		Filename:  "file.txt",
+		CommitID:  "commit-1",
+		State:     UploadSessionStateCleanupPending,
+		CreatedAt: now.Add(-time.Hour),
+		UpdatedAt: now.Add(-time.Minute),
+		ExpiresAt: now.Add(time.Hour),
+	})
+	appliedAt := now.Add(-30 * time.Second)
+	staging.promotions = map[string]UploadBlockPromotionRecord{
+		fakeUploadPromotionKey("org-1", "upload-1", 0): {
+			OrgID: "org-1", UploadID: "upload-1", BlockIndex: 0,
+			BlockSHA256: "sha256-1", CommitID: "commit-1", ClaimedAt: now.Add(-time.Minute), AppliedAt: &appliedAt,
+		},
+	}
+	calledDelete := false
+	handler.uploadBlockDeleter = func(ctx context.Context, blockStore *storage.BlockStore, hash string) error {
+		calledDelete = true
+		return nil
+	}
+	var rolledBack []string
+	handler.blockRollback = func(orgID, operationKey string, blockIDs []string) []string {
+		rolledBack = append([]string(nil), blockIDs...)
+		return nil
+	}
+
+	cleaned, err := handler.cleanupPendingUploadSession(&UploadSessionRecord{OrgID: "org-1", UploadID: "upload-1"})
+	if err != nil {
+		t.Fatalf("cleanupPendingUploadSession failed: %v", err)
+	}
+	if !cleaned {
+		t.Fatal("expected cleanupPendingUploadSession to rollback and clean applied-promotion session")
+	}
+	if calledDelete {
+		t.Fatal("expected no staged block deletion for applied promotion session")
+	}
+	if len(rolledBack) != 1 || rolledBack[0] != "sha256-1" {
+		t.Fatalf("rolled back blocks = %v, want [sha256-1]", rolledBack)
+	}
+	latest := staging.sessions[len(staging.sessions)-1]
+	if latest.State != UploadSessionStateAborted {
+		t.Fatalf("latest session state = %q, want %q", latest.State, UploadSessionStateAborted)
+	}
+	if _, exists := staging.promotions[fakeUploadPromotionKey("org-1", "upload-1", 0)]; exists {
+		t.Fatal("expected applied promotion marker to be removed after cleanup")
+	}
+}
+
+func TestCleanupPendingUploadSessionSkipsDeleteWhenOtherActiveUploadOwnsBlock(t *testing.T) {
+	handler := NewSeafHTTPHandler(nil, storage.NewManager(), nil, NewMockTokenStore(), nil, nil)
+	staging := &fakeUploadStagingStore{}
+	handler.SetUploadStagingStore(staging)
+	now := time.Now().UTC()
+	uploadedAt := now.Add(-2 * time.Minute)
+	staging.sessions = append(staging.sessions, UploadSessionRecord{
+		UploadID:  "upload-1",
+		OrgID:     "org-1",
+		RepoID:    "repo-1",
+		State:     UploadSessionStateCleanupPending,
+		CreatedAt: now.Add(-time.Hour),
+		UpdatedAt: now.Add(-time.Minute),
+		ExpiresAt: now.Add(time.Hour),
+	}, UploadSessionRecord{
+		UploadID:  "upload-2",
+		OrgID:     "org-1",
+		RepoID:    "repo-1",
+		State:     UploadSessionStateReceiving,
+		CreatedAt: now.Add(-30 * time.Minute),
+		UpdatedAt: now.Add(-30 * time.Second),
+		ExpiresAt: now.Add(time.Hour),
+	})
+	staging.blocks = append(staging.blocks,
+		UploadSessionBlockRecord{
+			UploadID:     "upload-1",
+			BlockIndex:   0,
+			OrgID:        "org-1",
+			BlockSHA256:  "sha256-1",
+			StorageClass: "hot",
+			StorageKey:   "sha256-1",
+			Source:       UploadBlockSourceNewObject,
+			State:        UploadBlockStateUploaded,
+			CreatedAt:    now.Add(-time.Hour),
+			UpdatedAt:    now.Add(-time.Minute),
+			UploadedAt:   &uploadedAt,
+		},
+		UploadSessionBlockRecord{
+			UploadID:     "upload-2",
+			BlockIndex:   0,
+			OrgID:        "org-1",
+			BlockSHA256:  "sha256-1",
+			StorageClass: "hot",
+			StorageKey:   "sha256-1",
+			Source:       UploadBlockSourceNewObject,
+			State:        UploadBlockStateRegistered,
+			CreatedAt:    now.Add(-30 * time.Minute),
+			UpdatedAt:    now.Add(-30 * time.Second),
+		},
+	)
+	deleteCalled := false
+	handler.uploadBlockDeleter = func(ctx context.Context, blockStore *storage.BlockStore, hash string) error {
+		deleteCalled = true
+		return nil
+	}
+
+	cleaned, err := handler.cleanupPendingUploadSession(&UploadSessionRecord{OrgID: "org-1", UploadID: "upload-1"})
+	if err != nil {
+		t.Fatalf("cleanupPendingUploadSession failed: %v", err)
+	}
+	if !cleaned {
+		t.Fatal("expected cleanupPendingUploadSession to complete when another upload still owns the staged block")
+	}
+	if deleteCalled {
+		t.Fatal("expected no delete while another active upload still references the staged block")
+	}
+}
+
+func TestCleanupPendingUploadSessionLeavesPendingWhenExplicitStorageClassUnavailable(t *testing.T) {
+	handler := NewSeafHTTPHandler(&storage.S3Store{}, nil, nil, NewMockTokenStore(), nil, nil)
+	staging := &fakeUploadStagingStore{}
+	handler.SetUploadStagingStore(staging)
+	now := time.Now().UTC()
+	uploadedAt := now.Add(-2 * time.Minute)
+	staging.sessions = append(staging.sessions, UploadSessionRecord{
+		UploadID:  "upload-1",
+		OrgID:     "org-1",
+		RepoID:    "repo-1",
+		State:     UploadSessionStateCleanupPending,
+		CreatedAt: now.Add(-time.Hour),
+		UpdatedAt: now.Add(-time.Minute),
+		ExpiresAt: now.Add(time.Hour),
+	})
+	staging.blocks = append(staging.blocks, UploadSessionBlockRecord{
+		UploadID:     "upload-1",
+		BlockIndex:   0,
+		OrgID:        "org-1",
+		BlockSHA256:  "sha256-1",
+		StorageClass: "hot",
+		StorageKey:   "sha256-1",
+		Source:       UploadBlockSourceNewObject,
+		State:        UploadBlockStateUploaded,
+		CreatedAt:    now.Add(-time.Hour),
+		UpdatedAt:    now.Add(-time.Minute),
+		UploadedAt:   &uploadedAt,
+	})
+	cleaned, err := handler.cleanupPendingUploadSession(&UploadSessionRecord{OrgID: "org-1", UploadID: "upload-1"})
+	if err == nil {
+		t.Fatal("expected cleanupPendingUploadSession to fail when explicit storage class cannot be resolved")
+	}
+	if cleaned {
+		t.Fatal("expected cleanupPendingUploadSession to leave the session pending")
+	}
+}
+
+func TestPublishPreparedUploadPassesExpectedHeadToPublisher(t *testing.T) {
+	handler := NewSeafHTTPHandler(nil, storage.NewManager(), nil, NewMockTokenStore(), nil, nil)
+	staging := &fakeUploadStagingStore{}
+	handler.SetUploadStagingStore(staging)
+	handler.blockPromoter = func(orgID, operationKey, blockID string, sizeBytes int, storageClass, storageKey string) error {
+		return nil
+	}
+	var gotExpectedHead string
+	handler.commitPublisher = func(orgID, repoID, commitID, expectedHead string) error {
+		gotExpectedHead = expectedHead
+		return nil
+	}
+
+	err := handler.publishPreparedUpload("org-1", "repo-1", "upload-1", preparedUploadCommit{CommitID: "commit-1", ExpectedHead: "head-1"}, []uploadBlockPromotion{{
+		BlockIndex: 0, BlockSHA256: "sha256-1", SizeBytes: 10, StorageClass: "hot", StorageKey: "sha256-1",
+	}})
+	if err != nil {
+		t.Fatalf("publishPreparedUpload failed: %v", err)
+	}
+	if gotExpectedHead != "head-1" {
+		t.Fatalf("expected head = %q, want head-1", gotExpectedHead)
+	}
+}
+
+func TestPublishPreparedUploadRollsBackWhenHeadConflicts(t *testing.T) {
+	handler := NewSeafHTTPHandler(nil, storage.NewManager(), nil, NewMockTokenStore(), nil, nil)
+	staging := &fakeUploadStagingStore{}
+	handler.SetUploadStagingStore(staging)
+	handler.blockPromoter = func(orgID, operationKey, blockID string, sizeBytes int, storageClass, storageKey string) error {
+		return nil
+	}
+	var rollbackBlockIDs []string
+	handler.blockRollback = func(orgID, operationKey string, blockIDs []string) []string {
+		rollbackBlockIDs = append([]string(nil), blockIDs...)
+		return nil
+	}
+	handler.commitPublisher = func(orgID, repoID, commitID, expectedHead string) error {
+		return &v2.LibraryHeadConflictError{RepoID: repoID, ExpectedHead: expectedHead, ActualHead: "other-head"}
+	}
+
+	err := handler.publishPreparedUpload("org-1", "repo-1", "upload-1", preparedUploadCommit{CommitID: "commit-1", ExpectedHead: "head-1"}, []uploadBlockPromotion{{
+		BlockIndex: 0, BlockSHA256: "sha256-1", SizeBytes: 10, StorageClass: "hot", StorageKey: "sha256-1",
+	}})
+	if err == nil {
+		t.Fatal("expected publishPreparedUpload to fail on head conflict")
+	}
+	if !v2.IsLibraryHeadConflict(err) {
+		t.Fatalf("error = %v, want library head conflict", err)
+	}
+	if len(rollbackBlockIDs) != 1 || rollbackBlockIDs[0] != "sha256-1" {
+		t.Fatalf("rollback block ids = %v, want [sha256-1]", rollbackBlockIDs)
+	}
+}
+
+func TestPublishPreparedUploadDoesNotRollbackWhenCanonicalHeadAlreadyPublished(t *testing.T) {
+	handler := NewSeafHTTPHandler(nil, storage.NewManager(), nil, NewMockTokenStore(), nil, nil)
+	staging := &fakeUploadStagingStore{}
+	handler.SetUploadStagingStore(staging)
+	handler.blockPromoter = func(orgID, operationKey, blockID string, sizeBytes int, storageClass, storageKey string) error {
+		return nil
+	}
+	rollbackCalled := false
+	handler.blockRollback = func(orgID, operationKey string, blockIDs []string) []string {
+		rollbackCalled = true
+		return nil
+	}
+	handler.commitPublisher = func(orgID, repoID, commitID, expectedHead string) error {
+		return &v2.LibraryHeadPublishedProjectionError{RepoID: repoID, CommitID: commitID, Cause: errors.New("projection timeout")}
+	}
+
+	err := handler.publishPreparedUpload("org-1", "repo-1", "upload-1", preparedUploadCommit{CommitID: "commit-1", ExpectedHead: "head-1"}, []uploadBlockPromotion{{
+		BlockIndex: 0, BlockSHA256: "sha256-1", SizeBytes: 10, StorageClass: "hot", StorageKey: "sha256-1",
+	}})
+	if err != nil {
+		t.Fatalf("publishPreparedUpload failed: %v", err)
+	}
+	if rollbackCalled {
+		t.Fatal("expected no rollback when canonical head CAS already published")
+	}
+}
+
+func TestPublishPreparedUploadDoesNotRollbackWhenCanonicalHeadAlreadyPointsAtCommit(t *testing.T) {
+	handler := NewSeafHTTPHandler(nil, storage.NewManager(), nil, NewMockTokenStore(), nil, nil)
+	staging := &fakeUploadStagingStore{}
+	handler.SetUploadStagingStore(staging)
+	handler.blockPromoter = func(orgID, operationKey, blockID string, sizeBytes int, storageClass, storageKey string) error {
+		return nil
+	}
+	rollbackCalled := false
+	handler.blockRollback = func(orgID, operationKey string, blockIDs []string) []string {
+		rollbackCalled = true
+		return nil
+	}
+	handler.commitPublisher = func(orgID, repoID, commitID, expectedHead string) error {
+		return &v2.LibraryHeadConflictError{RepoID: repoID, ExpectedHead: expectedHead, ActualHead: commitID}
+	}
+
+	err := handler.publishPreparedUpload("org-1", "repo-1", "upload-1", preparedUploadCommit{CommitID: "commit-1", ExpectedHead: "head-1"}, []uploadBlockPromotion{{
+		BlockIndex: 0, BlockSHA256: "sha256-1", SizeBytes: 10, StorageClass: "hot", StorageKey: "sha256-1",
+	}})
+	if err != nil {
+		t.Fatalf("publishPreparedUpload failed: %v", err)
+	}
+	if rollbackCalled {
+		t.Fatal("expected no rollback when canonical head already points at the upload commit")
+	}
+}
+
+func TestRecoverPromotingUploadSessionMarksCleanupPendingOnHeadConflict(t *testing.T) {
+	handler := NewSeafHTTPHandler(nil, storage.NewManager(), nil, NewMockTokenStore(), nil, nil)
+	staging := &fakeUploadStagingStore{}
+	handler.SetUploadStagingStore(staging)
+	now := time.Now().UTC()
+	appliedAt := now.Add(-time.Minute)
+	staging.sessions = append(staging.sessions, UploadSessionRecord{
+		UploadID:  "upload-1",
+		OrgID:     "org-1",
+		RepoID:    "repo-1",
+		CommitID:  "commit-1",
+		State:     UploadSessionStatePromoting,
+		CreatedAt: now.Add(-time.Hour),
+		UpdatedAt: now.Add(-time.Minute),
+		ExpiresAt: now.Add(time.Hour),
+	})
+	staging.promotions = map[string]UploadBlockPromotionRecord{
+		fakeUploadPromotionKey("org-1", "upload-1", 0): {
+			OrgID: "org-1", UploadID: "upload-1", BlockIndex: 0,
+			BlockSHA256: "sha256-1", CommitID: "commit-1", ClaimedAt: now.Add(-2 * time.Minute), AppliedAt: &appliedAt,
+		},
+	}
+	handler.commitPublisher = func(orgID, repoID, commitID, expectedHead string) error {
+		return &v2.LibraryHeadConflictError{RepoID: repoID, ExpectedHead: expectedHead, ActualHead: "other-head"}
+	}
+
+	err := handler.recoverPromotingUploadSession(&UploadSessionRecord{OrgID: "org-1", UploadID: "upload-1"})
+	if err != nil {
+		t.Fatalf("recoverPromotingUploadSession failed: %v", err)
+	}
+	latest := staging.sessions[len(staging.sessions)-1]
+	if latest.State != UploadSessionStateCleanupPending {
+		t.Fatalf("latest session state = %q, want %q", latest.State, UploadSessionStateCleanupPending)
+	}
+}
+
+func TestRecoverPromotingUploadSessionClosesWhenCanonicalHeadAlreadyPointsAtCommit(t *testing.T) {
+	handler := NewSeafHTTPHandler(nil, storage.NewManager(), nil, NewMockTokenStore(), nil, nil)
+	staging := &fakeUploadStagingStore{}
+	handler.SetUploadStagingStore(staging)
+	now := time.Now().UTC()
+	appliedAt := now.Add(-time.Minute)
+	staging.sessions = append(staging.sessions, UploadSessionRecord{
+		UploadID:  "upload-1",
+		OrgID:     "org-1",
+		RepoID:    "repo-1",
+		CommitID:  "commit-1",
+		State:     UploadSessionStatePromoting,
+		CreatedAt: now.Add(-time.Hour),
+		UpdatedAt: now.Add(-time.Minute),
+		ExpiresAt: now.Add(time.Hour),
+	})
+	staging.promotions = map[string]UploadBlockPromotionRecord{
+		fakeUploadPromotionKey("org-1", "upload-1", 0): {
+			OrgID: "org-1", UploadID: "upload-1", BlockIndex: 0,
+			BlockSHA256: "sha256-1", CommitID: "commit-1", ClaimedAt: now.Add(-2 * time.Minute), AppliedAt: &appliedAt,
+		},
+	}
+	handler.commitPublisher = func(orgID, repoID, commitID, expectedHead string) error {
+		return &v2.LibraryHeadConflictError{RepoID: repoID, ExpectedHead: expectedHead, ActualHead: commitID}
+	}
+
+	err := handler.recoverPromotingUploadSession(&UploadSessionRecord{OrgID: "org-1", UploadID: "upload-1"})
+	if err != nil {
+		t.Fatalf("recoverPromotingUploadSession failed: %v", err)
+	}
+	latest := staging.sessions[len(staging.sessions)-1]
+	if latest.State != UploadSessionStateClosed {
+		t.Fatalf("latest session state = %q, want %q", latest.State, UploadSessionStateClosed)
+	}
+}
+
+func TestCleanupAndRecoveryPreserveSharedStagedBlockAcrossConcurrentUploads(t *testing.T) {
+	handler := NewSeafHTTPHandler(nil, storage.NewManager(), nil, NewMockTokenStore(), nil, nil)
+	staging := &fakeUploadStagingStore{}
+	handler.SetUploadStagingStore(staging)
+	now := time.Now().UTC()
+	uploadedAt := now.Add(-2 * time.Minute)
+	appliedAt := now.Add(-time.Minute)
+	staging.sessions = append(staging.sessions,
+		UploadSessionRecord{
+			UploadID:  "upload-cleanup",
+			OrgID:     "org-1",
+			RepoID:    "repo-1",
+			UserID:    "user-1",
+			Filename:  "cleanup.bin",
+			State:     UploadSessionStateCleanupPending,
+			CreatedAt: now.Add(-time.Hour),
+			UpdatedAt: now.Add(-time.Minute),
+			ExpiresAt: now.Add(time.Hour),
+		},
+		UploadSessionRecord{
+			UploadID:       "upload-promoting",
+			OrgID:          "org-1",
+			RepoID:         "repo-1",
+			UserID:         "user-2",
+			Filename:       "shared.bin",
+			ActualFilename: "shared.bin",
+			CommitID:       "commit-1",
+			State:          UploadSessionStatePromoting,
+			CreatedAt:      now.Add(-30 * time.Minute),
+			UpdatedAt:      now.Add(-30 * time.Second),
+			ExpiresAt:      now.Add(time.Hour),
+		},
+	)
+	staging.blocks = append(staging.blocks,
+		UploadSessionBlockRecord{
+			UploadID:     "upload-cleanup",
+			BlockIndex:   0,
+			OrgID:        "org-1",
+			BlockSHA256:  "sha256-shared",
+			StorageClass: "hot",
+			StorageKey:   "sha256-shared",
+			Source:       UploadBlockSourceNewObject,
+			State:        UploadBlockStateUploaded,
+			CreatedAt:    now.Add(-time.Hour),
+			UpdatedAt:    now.Add(-time.Minute),
+			UploadedAt:   &uploadedAt,
+		},
+		UploadSessionBlockRecord{
+			UploadID:     "upload-promoting",
+			BlockIndex:   0,
+			OrgID:        "org-1",
+			BlockSHA256:  "sha256-shared",
+			StorageClass: "hot",
+			StorageKey:   "sha256-shared",
+			Source:       UploadBlockSourceNewObject,
+			State:        UploadBlockStateRegistered,
+			CreatedAt:    now.Add(-30 * time.Minute),
+			UpdatedAt:    now.Add(-30 * time.Second),
+		},
+	)
+	staging.promotions = map[string]UploadBlockPromotionRecord{
+		fakeUploadPromotionKey("org-1", "upload-promoting", 0): {
+			OrgID:       "org-1",
+			UploadID:    "upload-promoting",
+			BlockIndex:  0,
+			BlockSHA256: "sha256-shared",
+			CommitID:    "commit-1",
+			ClaimedAt:   now.Add(-90 * time.Second),
+			AppliedAt:   &appliedAt,
+		},
+	}
+	var deleted []string
+	handler.uploadBlockDeleter = func(ctx context.Context, blockStore *storage.BlockStore, hash string) error {
+		deleted = append(deleted, hash)
+		return nil
+	}
+	publishCalls := 0
+	handler.commitPublisher = func(orgID, repoID, commitID, expectedHead string) error {
+		publishCalls++
+		return nil
+	}
+
+	handler.cleanupPendingUploadsForOrg("org-1", 10)
+	if len(deleted) != 0 {
+		t.Fatalf("deleted staged blocks = %v, want none while another upload is still promoting the same sha", deleted)
+	}
+	cleanupSession, err := staging.GetSession("org-1", "upload-cleanup")
+	if err != nil {
+		t.Fatalf("GetSession(upload-cleanup) failed: %v", err)
+	}
+	if cleanupSession == nil || cleanupSession.State != UploadSessionStateAborted {
+		t.Fatalf("cleanup session state = %v, want %q", cleanupSession, UploadSessionStateAborted)
+	}
+
+	handler.recoverPromotingUploadsForOrg("org-1", 10)
+	if publishCalls != 1 {
+		t.Fatalf("publish calls = %d, want 1", publishCalls)
+	}
+	promotingSession, err := staging.GetSession("org-1", "upload-promoting")
+	if err != nil {
+		t.Fatalf("GetSession(upload-promoting) failed: %v", err)
+	}
+	if promotingSession == nil || promotingSession.State != UploadSessionStateClosed {
+		t.Fatalf("promoting session state = %v, want %q", promotingSession, UploadSessionStateClosed)
+	}
+	if len(deleted) != 0 {
+		t.Fatalf("deleted staged blocks after recovery = %v, want none", deleted)
+	}
+}
+
+func TestCleanupPendingUploadsForOrgCleansLatestUniqueSessions(t *testing.T) {
+	handler := NewSeafHTTPHandler(nil, storage.NewManager(), nil, NewMockTokenStore(), nil, nil)
+	staging := &fakeUploadStagingStore{}
+	handler.SetUploadStagingStore(staging)
+	now := time.Now().UTC()
+	uploadedAt := now.Add(-2 * time.Minute)
+	staging.sessions = append(staging.sessions,
+		UploadSessionRecord{UploadID: "upload-1", OrgID: "org-1", RepoID: "repo-1", State: UploadSessionStateCleanupPending, UpdatedAt: now.Add(-2 * time.Minute), ExpiresAt: now.Add(time.Hour)},
+		UploadSessionRecord{UploadID: "upload-1", OrgID: "org-1", RepoID: "repo-1", State: UploadSessionStateCleanupPending, UpdatedAt: now.Add(-time.Minute), ExpiresAt: now.Add(time.Hour)},
+		UploadSessionRecord{UploadID: "upload-2", OrgID: "org-1", RepoID: "repo-1", State: UploadSessionStateCleanupPending, UpdatedAt: now, ExpiresAt: now.Add(time.Hour)},
+	)
+	staging.blocks = append(staging.blocks,
+		UploadSessionBlockRecord{UploadID: "upload-1", BlockIndex: 0, OrgID: "org-1", BlockSHA256: "sha256-1", StorageClass: "", StorageKey: "sha256-1", Source: UploadBlockSourceNewObject, State: UploadBlockStateUploaded, CreatedAt: now.Add(-time.Hour), UpdatedAt: now.Add(-time.Minute), UploadedAt: &uploadedAt},
+		UploadSessionBlockRecord{UploadID: "upload-2", BlockIndex: 0, OrgID: "org-1", BlockSHA256: "sha256-2", StorageClass: "", StorageKey: "sha256-2", Source: UploadBlockSourceNewObject, State: UploadBlockStatePreflushed, CreatedAt: now.Add(-time.Hour), UpdatedAt: now, UploadedAt: &uploadedAt},
+	)
+	var deleted []string
+	handler.uploadBlockDeleter = func(ctx context.Context, blockStore *storage.BlockStore, hash string) error {
+		deleted = append(deleted, hash)
+		return nil
+	}
+	handler.storage = &storage.S3Store{}
+
+	handler.cleanupPendingUploadsForOrg("org-1", 10)
+
+	if len(deleted) != 2 {
+		t.Fatalf("deleted block count = %d, want 2", len(deleted))
+	}
+	blocks1, err := staging.ListBlocks("upload-1")
+	if err != nil {
+		t.Fatalf("ListBlocks(upload-1) failed: %v", err)
+	}
+	if blocks1[0].State != UploadBlockStateCleaned {
+		t.Fatalf("upload-1 block state = %q, want %q", blocks1[0].State, UploadBlockStateCleaned)
+	}
+	blocks2, err := staging.ListBlocks("upload-2")
+	if err != nil {
+		t.Fatalf("ListBlocks(upload-2) failed: %v", err)
+	}
+	if blocks2[0].State != UploadBlockStateCleaned {
+		t.Fatalf("upload-2 block state = %q, want %q", blocks2[0].State, UploadBlockStateCleaned)
+	}
+}
+
+func TestHandleUploadSchedulesCleanupPendingSweepBeforeNewChunk(t *testing.T) {
+	tm := NewTokenManager(time.Hour)
+	tokenStr, err := tm.CreateUploadToken("org-1", "repo-1", "/", "user-1")
+	if err != nil {
+		t.Fatalf("CreateUploadToken failed: %v", err)
+	}
+	staging := &fakeUploadStagingStore{}
+	handler := NewSeafHTTPHandler(nil, storage.NewManager(), nil, tm, nil, nil)
+	handler.SetUploadStagingStore(staging)
+	scheduledOrgID := ""
+	scheduledLimit := 0
+	handler.cleanupPendingSweep = func(orgID string, limit int) {
+		scheduledOrgID = orgID
+		scheduledLimit = limit
+	}
+
+	r := gin.New()
+	r.POST("/seafhttp/upload-api/:token", handler.HandleUpload)
+
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	part, _ := writer.CreateFormFile("file", "fresh.txt")
+	_, _ = part.Write([]byte("hel"))
+	writer.Close()
+
+	req := httptest.NewRequest(http.MethodPost, "/seafhttp/upload-api/"+tokenStr, &body)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	req.Header.Set("Content-Range", "bytes 0-2/5")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusOK)
+	}
+	if scheduledOrgID != "org-1" {
+		t.Fatalf("scheduled org = %q, want org-1", scheduledOrgID)
+	}
+	if scheduledLimit != uploadRecoveryBatchLimit {
+		t.Fatalf("scheduled limit = %d, want %d", scheduledLimit, uploadRecoveryBatchLimit)
+	}
+	chunkManager.CleanupUpload(tokenStr, "fresh.txt")
 }
 
 func TestHandleUploadChunked_FinalizeFailureMarksCleanupPending(t *testing.T) {

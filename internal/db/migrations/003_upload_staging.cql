@@ -65,7 +65,7 @@ CREATE TABLE IF NOT EXISTS upload_session_blocks_by_sha256 (
 );
 
 -- Phase-1 states include receiving, promoting, published, closed,
--- cleanup_pending, registered, uploaded, promoted and cleaned.
+-- cleanup_pending, registered, preflushed, uploaded, promoted and cleaned.
 
 -- Durable per-upload block promotion markers used to make the transition from
 -- staged/uploaded block objects to live block refcounts retry-safe. A row is

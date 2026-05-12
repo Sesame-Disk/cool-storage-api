@@ -8,6 +8,40 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-05-12 - Upload reliability hardening after preflush audit
+
+### Fix
+
+- `internal/api/seafhttp.go`
+  - adds per-attempt upload session IDs so a later upload of the same path is
+    not mistaken for a retry of an older closed session
+  - validates upload token path scope after `parent_dir` and `relative_path`
+    normalization, and sanitizes multipart filenames with path separators
+  - uses declared `Content-Range` total for chunked quota checks
+  - keeps staged/preflushed blocks out of canonical `blocks` metadata until
+    promotion, avoiding GC races on `ref_count = 0`
+  - cleans failed upload-owned staged blocks asynchronously and preserves
+    staged objects still referenced by another active upload
+  - handles HEAD publish conflicts with CAS and treats retry/recovery of an
+    already-published commit as success instead of rolling back live refs
+
+- `internal/api/v2/fs_helpers.go`
+  - adds expected-head CAS publishing for upload commits
+  - retries secondary projection repair immediately, including the retry case
+    where the canonical library head already points at the target commit
+  - logs when block promotion waits on a GC deletion sentinel
+
+- `internal/api/*_test.go`
+  - adds regression coverage for chunked quota, scoped upload paths,
+    path-like multipart filenames, staged cleanup ownership, publish retries,
+    and recovery conflict handling
+
+### Validation
+
+- `go test ./internal/api ./internal/api/v2 ./internal/traffic ./internal/db ./internal/gc -count=1`
+
+---
+
 ## 2026-05-11 — Upload latency: preflush contiguous blocks during chunked upload
 
 ### Problem

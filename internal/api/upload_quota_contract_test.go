@@ -16,13 +16,17 @@ import (
 type fakeAPIQuotaChecker struct {
 	storageStatus traffic.QuotaStatus
 	trafficStatus traffic.QuotaStatus
+	storageBytes  []int64
+	trafficBytes  []int64
 }
 
 func (f *fakeAPIQuotaChecker) CheckStorageQuota(orgID string, additionalBytes int64) (traffic.QuotaStatus, error) {
+	f.storageBytes = append(f.storageBytes, additionalBytes)
 	return f.storageStatus, nil
 }
 
 func (f *fakeAPIQuotaChecker) CheckTrafficQuota(orgID, userID, direction string, additionalBytes int64) (traffic.QuotaStatus, error) {
+	f.trafficBytes = append(f.trafficBytes, additionalBytes)
 	return f.trafficStatus, nil
 }
 
@@ -127,6 +131,50 @@ func TestHandleUploadQuotaContract_ChunkedTrafficExceeded(t *testing.T) {
 	if payload["reason"] != "traffic-upload" {
 		t.Fatalf("reason = %v, want traffic-upload", payload["reason"])
 	}
+}
+
+func TestHandleUploadQuotaContract_ChunkedPrecheckUsesDeclaredTotal(t *testing.T) {
+	checker := &fakeAPIQuotaChecker{
+		storageStatus: traffic.QuotaStatus{Allowed: true},
+		trafficStatus: traffic.QuotaStatus{Allowed: true},
+	}
+	setAPIQuotaChecker(t, checker)
+
+	tokenStore := NewMockTokenStore()
+	tokenStore.CreateUploadToken("org1", "repo1", "/", "user1")
+	handler := NewSeafHTTPHandler(nil, storage.NewManager(), nil, tokenStore, nil, nil)
+
+	r := gin.New()
+	r.POST("/seafhttp/upload-api/:token", handler.HandleUpload)
+
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	part, err := writer.CreateFormFile("file", "test.txt")
+	if err != nil {
+		t.Fatalf("CreateFormFile() error = %v", err)
+	}
+	if _, err := part.Write([]byte("hel")); err != nil {
+		t.Fatalf("part.Write() error = %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("writer.Close() error = %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/seafhttp/upload-api/mock-upload-token", &body)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	req.Header.Set("Content-Range", "bytes 0-2/5")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusOK)
+	}
+	if len(checker.storageBytes) != 1 || checker.storageBytes[0] != 5 {
+		t.Fatalf("storage precheck bytes = %v, want [5]", checker.storageBytes)
+	}
+	if len(checker.trafficBytes) != 1 || checker.trafficBytes[0] != 5 {
+		t.Fatalf("traffic precheck bytes = %v, want [5]", checker.trafficBytes)
+	}
+	chunkManager.CleanupUpload("mock-upload-token", "test.txt")
 }
 
 func TestPutBlockQuotaContract_TrafficExceeded(t *testing.T) {
