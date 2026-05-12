@@ -1873,7 +1873,7 @@ func TestHandleUploadChunked_FirstChunkReturnsBeforeBlockedPreflush(t *testing.T
 	chunkManager.CleanupUpload(tokenStr, "async-preflush.txt")
 }
 
-func TestPreflushChunkUploadBlocksBoundsConcurrentUploads(t *testing.T) {
+func TestPreflushChunkUploadBlocksBoundsConcurrentUploadsPerUpload(t *testing.T) {
 	handler := NewSeafHTTPHandler(nil, storage.NewManager(), nil, NewMockTokenStore(), nil, nil)
 	handler.uploadStaging = nil
 	handler.uploadBlockMetadata = nil
@@ -1881,7 +1881,7 @@ func TestPreflushChunkUploadBlocksBoundsConcurrentUploads(t *testing.T) {
 		return nil, "hot", nil
 	}
 
-	totalBlocks := preflushUploadConcurrency*2 + 1
+	totalBlocks := preflushPerUploadConcurrency*2 + 1
 	started := make(chan struct{}, totalBlocks)
 	releaseUploads := make(chan struct{})
 	var inFlight int64
@@ -1921,9 +1921,12 @@ func TestPreflushChunkUploadBlocksBoundsConcurrentUploads(t *testing.T) {
 		}},
 	}
 
-	handler.preflushChunkUploadBlocks(nil, &AccessToken{OrgID: "org-1", RepoID: "repo-1", UserID: "user-1"}, upload, "bounded-preflush")
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodPost, "/seafhttp/upload-api/test-token", nil)
+	handler.preflushChunkUploadBlocks(c, &AccessToken{OrgID: "org-1", RepoID: "repo-1", UserID: "user-1"}, upload, "bounded-preflush")
 
-	for i := 0; i < preflushUploadConcurrency; i++ {
+	for i := 0; i < preflushPerUploadConcurrency; i++ {
 		select {
 		case <-started:
 		case <-time.After(2 * time.Second):
@@ -1932,24 +1935,96 @@ func TestPreflushChunkUploadBlocksBoundsConcurrentUploads(t *testing.T) {
 	}
 	select {
 	case <-started:
-		t.Fatalf("preflush exceeded concurrency cap %d", preflushUploadConcurrency)
+		t.Fatalf("preflush exceeded per-upload concurrency cap %d", preflushPerUploadConcurrency)
 	case <-time.After(100 * time.Millisecond):
 	}
-	if got := atomic.LoadInt64(&maxInFlight); got > int64(preflushUploadConcurrency) {
-		t.Fatalf("max concurrent preflush uploads = %d, want <= %d", got, preflushUploadConcurrency)
+	if got := atomic.LoadInt64(&maxInFlight); got > int64(preflushPerUploadConcurrency) {
+		t.Fatalf("max concurrent preflush uploads = %d, want <= %d", got, preflushPerUploadConcurrency)
 	}
 
 	close(releaseUploads)
-	for i := preflushUploadConcurrency; i < totalBlocks; i++ {
+	for i := preflushPerUploadConcurrency; i < totalBlocks; i++ {
 		select {
 		case <-started:
 		case <-time.After(2 * time.Second):
 			t.Fatalf("timed out waiting for preflush block %d to drain", i+1)
 		}
 	}
-	if got := atomic.LoadInt64(&maxInFlight); got > int64(preflushUploadConcurrency) {
-		t.Fatalf("max concurrent preflush uploads after drain = %d, want <= %d", got, preflushUploadConcurrency)
+	if got := atomic.LoadInt64(&maxInFlight); got > int64(preflushPerUploadConcurrency) {
+		t.Fatalf("max concurrent preflush uploads after drain = %d, want <= %d", got, preflushPerUploadConcurrency)
 	}
+}
+
+func TestPreflushChunkUploadBlocksBoundsConcurrentUploadsGlobally(t *testing.T) {
+	handler := NewSeafHTTPHandler(nil, storage.NewManager(), nil, NewMockTokenStore(), nil, nil)
+	handler.uploadStaging = nil
+	handler.uploadBlockMetadata = nil
+	handler.uploadBlockResolver = func(c *gin.Context, token *AccessToken) (*storage.BlockStore, string, error) {
+		return nil, "hot", nil
+	}
+
+	totalUploads := preflushGlobalConcurrency + 2
+	started := make(chan struct{}, totalUploads)
+	releaseUploads := make(chan struct{})
+	var inFlight int64
+	var maxInFlight int64
+	handler.uploadBlockWriter = func(ctx context.Context, blockStore *storage.BlockStore, hash string, data []byte) (string, error) {
+		current := atomic.AddInt64(&inFlight, 1)
+		for {
+			observed := atomic.LoadInt64(&maxInFlight)
+			if current <= observed || atomic.CompareAndSwapInt64(&maxInFlight, observed, current) {
+				break
+			}
+		}
+		started <- struct{}{}
+		<-releaseUploads
+		atomic.AddInt64(&inFlight, -1)
+		return hash, nil
+	}
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodPost, "/seafhttp/upload-api/test-token", nil)
+	for i := 0; i < totalUploads; i++ {
+		tempFile, err := os.CreateTemp(t.TempDir(), "global-bounded-preflush-*")
+		if err != nil {
+			t.Fatalf("CreateTemp failed: %v", err)
+		}
+		t.Cleanup(func() {
+			tempFile.Close()
+		})
+		totalSize := int64(uploadBlockSize + 1)
+		if err := tempFile.Truncate(totalSize); err != nil {
+			t.Fatalf("Truncate failed: %v", err)
+		}
+		upload := &ChunkUpload{
+			TotalSize: totalSize,
+			CreatedAt: time.Now(),
+			TempFile:  tempFile,
+			Ranges: []byteRange{{
+				Start: 0,
+				End:   uploadBlockSize - 1,
+			}},
+		}
+		handler.preflushChunkUploadBlocks(c, &AccessToken{OrgID: "org-1", RepoID: "repo-1", UserID: "user-1"}, upload, "global-bounded-preflush")
+	}
+
+	for i := 0; i < preflushGlobalConcurrency; i++ {
+		select {
+		case <-started:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("timed out waiting for global preflush worker %d to start", i+1)
+		}
+	}
+	select {
+	case <-started:
+		t.Fatalf("preflush exceeded global concurrency cap %d", preflushGlobalConcurrency)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if got := atomic.LoadInt64(&maxInFlight); got > int64(preflushGlobalConcurrency) {
+		t.Fatalf("max global preflush uploads = %d, want <= %d", got, preflushGlobalConcurrency)
+	}
+	close(releaseUploads)
 }
 
 func TestChunkUploadResolvePreflushedBlockFallsBackAfterFailedPreflush(t *testing.T) {
@@ -1994,6 +2069,45 @@ func TestChunkUploadResolvePreflushedBlockFallsBackAfterFailedPreflush(t *testin
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for ResolvePreflushedBlock to return")
+	}
+}
+
+func TestChunkUploadCleanupWaitsForInFlightPreflush(t *testing.T) {
+	tempFile, err := os.CreateTemp(t.TempDir(), "cleanup-preflush-*")
+	if err != nil {
+		t.Fatalf("CreateTemp failed: %v", err)
+	}
+	upload := &ChunkUpload{
+		TempFile: tempFile,
+		TempPath: tempFile.Name(),
+		preflushInFlight: map[int]chan struct{}{
+			0: make(chan struct{}),
+		},
+	}
+
+	cleanupDone := make(chan error, 1)
+	go func() {
+		cleanupDone <- upload.Cleanup()
+	}()
+
+	select {
+	case err := <-cleanupDone:
+		t.Fatalf("Cleanup returned before preflush finished: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	upload.finishPreflush(0)
+
+	select {
+	case err := <-cleanupDone:
+		if err != nil {
+			t.Fatalf("Cleanup failed: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Cleanup did not finish after preflush completed")
+	}
+	if _, err := os.Stat(upload.TempPath); !os.IsNotExist(err) {
+		t.Fatalf("temp file still exists after cleanup: %v", err)
 	}
 }
 
@@ -4017,6 +4131,73 @@ func TestChunkManagerGetOrCreateUpload(t *testing.T) {
 	upload3.Cleanup()
 	cm.CleanupUpload("token1", "file.txt")
 	cm.CleanupUpload("token2", "file.txt")
+}
+
+func TestChunkManagerCleanupDoesNotRemoveRecreatedUploadTempFile(t *testing.T) {
+	cm := NewChunkManager()
+
+	upload, created, err := cm.GetOrCreateUpload("token1", "same.txt", "/", uploadBlockSize+1)
+	if err != nil {
+		t.Fatalf("GetOrCreateUpload failed: %v", err)
+	}
+	if !created {
+		t.Fatal("expected first upload to be created")
+	}
+	oldPath := upload.TempPath
+	if err := os.WriteFile(oldPath, []byte("old"), 0600); err != nil {
+		t.Fatalf("WriteFile old temp failed: %v", err)
+	}
+	upload.mu.Lock()
+	upload.Ranges = []byteRange{{Start: 0, End: uploadBlockSize - 1}}
+	upload.mu.Unlock()
+	blockIndex, _, _, ok := upload.NextFlushableContiguousBlock(uploadBlockSize)
+	if !ok {
+		t.Fatal("expected preflush reservation to succeed")
+	}
+
+	cleanupDone := make(chan struct{})
+	go func() {
+		cm.CleanupUpload("token1", "same.txt")
+		close(cleanupDone)
+	}()
+
+	select {
+	case <-cleanupDone:
+		t.Fatal("cleanup returned before in-flight preflush finished")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	recreated, created, err := cm.GetOrCreateUpload("token1", "same.txt", "/", uploadBlockSize+1)
+	if err != nil {
+		t.Fatalf("GetOrCreateUpload recreated failed: %v", err)
+	}
+	if !created {
+		t.Fatal("expected recreated upload to get a fresh tracker")
+	}
+	if recreated.TempPath == oldPath {
+		t.Fatal("recreated upload reused old temp path")
+	}
+	if err := os.WriteFile(recreated.TempPath, []byte("new"), 0600); err != nil {
+		t.Fatalf("WriteFile recreated temp failed: %v", err)
+	}
+
+	upload.finishPreflush(blockIndex)
+
+	select {
+	case <-cleanupDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("cleanup did not finish after preflush completed")
+	}
+	if _, err := os.Stat(oldPath); !os.IsNotExist(err) {
+		t.Fatalf("old temp file still exists after cleanup: %v", err)
+	}
+	if data, err := os.ReadFile(recreated.TempPath); err != nil {
+		t.Fatalf("recreated temp file was removed by old cleanup: %v", err)
+	} else if string(data) != "new" {
+		t.Fatalf("recreated temp file content = %q, want new", string(data))
+	}
+
+	cm.CleanupUpload("token1", "same.txt")
 }
 
 func TestChunkUploadWriteAndRead(t *testing.T) {
