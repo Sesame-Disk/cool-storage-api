@@ -2639,6 +2639,9 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 	`, token.OrgID, token.RepoID).Scan(&encrypted)
 	if err != nil {
 		log.Printf("[HandleUpload] Failed to check encryption status: %v", err)
+		markSingleShotCleanup(err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to check encryption status"})
+		return
 	}
 
 	if encrypted {
@@ -2879,9 +2882,11 @@ func (h *SeafHTTPHandler) finalizeUploadStreaming(c *gin.Context, token *AccessT
 	// Check encryption
 	var encrypted bool
 	var fileKey, fileIV []byte
-	h.db.Session().Query(`
+	if err := h.db.Session().Query(`
 		SELECT encrypted FROM libraries WHERE org_id = ? AND library_id = ?
-	`, token.OrgID, token.RepoID).Scan(&encrypted)
+	`, token.OrgID, token.RepoID).Scan(&encrypted); err != nil {
+		return finalizeUploadResult{}, fmt.Errorf("failed to check encryption status: %w", err)
+	}
 	if encrypted {
 		fileKey, fileIV = v2.GetDecryptSessions().GetFileKeyAndIV(token.UserID, token.RepoID)
 		if fileKey == nil {
