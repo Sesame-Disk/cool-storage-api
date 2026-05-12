@@ -108,23 +108,24 @@ func (s *clientSSOStore) cleanupLoop() {
 
 // Server represents the HTTP API server
 type Server struct {
-	config               *config.Config
-	db                   *db.DB
-	storage              *storage.S3Store    // Legacy single S3 store
-	storageManager       *storage.Manager    // Multi-backend storage manager
-	blockStore           *storage.BlockStore // Legacy single block store
-	tokenStore           TokenStore
-	permMiddleware       *middleware.PermissionMiddleware
-	authHandler          *v2.AuthHandler         // OIDC authentication handler
-	gcService            *gc.Service             // Garbage collection service
-	ssoStore             *clientSSOStore         // Pending desktop-client SSO tokens
-	authRateLimiter      *middleware.RateLimiter // Per-IP rate limiter for auth endpoints
-	shareLinkRateLimiter *middleware.RateLimiter // Per-IP rate limiter for public share-link endpoints
-	zipRateLimiter       *middleware.RateLimiter // Per-IP rate limiter for streamed ZIP downloads
-	apiKeyManager        *apikeys.Manager        // API key manager for programmatic auth
-	version              string                  // Build version string
-	router               *gin.Engine
-	server               *http.Server
+	config                 *config.Config
+	db                     *db.DB
+	storage                *storage.S3Store    // Legacy single S3 store
+	storageManager         *storage.Manager    // Multi-backend storage manager
+	blockStore             *storage.BlockStore // Legacy single block store
+	tokenStore             TokenStore
+	permMiddleware         *middleware.PermissionMiddleware
+	authHandler            *v2.AuthHandler                       // OIDC authentication handler
+	gcService              *gc.Service                           // Garbage collection service
+	ssoStore               *clientSSOStore                       // Pending desktop-client SSO tokens
+	authRateLimiter        *middleware.RateLimiter               // Per-IP rate limiter for auth endpoints
+	shareLinkRateLimiter   *middleware.RateLimiter               // Per-IP rate limiter for public share-link endpoints
+	zipRateLimiter         *middleware.RateLimiter               // Per-IP rate limiter for streamed ZIP downloads
+	apiKeyManager          *apikeys.Manager                      // API key manager for programmatic auth
+	projectionRepairWorker *v2.LibraryHeadProjectionRepairWorker // Durable library head projection repair worker
+	version                string                                // Build version string
+	router                 *gin.Engine
+	server                 *http.Server
 }
 
 var errLegacyS3NotConfigured = errors.New("legacy S3 storage not configured")
@@ -239,22 +240,23 @@ func NewServer(cfg *config.Config, database *db.DB, version string) *Server {
 	}
 
 	s := &Server{
-		config:               cfg,
-		db:                   database,
-		storage:              s3Store,
-		storageManager:       storageManager,
-		blockStore:           blockStore,
-		tokenStore:           tokenStore,
-		permMiddleware:       permMiddleware,
-		authHandler:          authHandler,
-		gcService:            gcService,
-		ssoStore:             newClientSSOStore(),
-		authRateLimiter:      authRL,
-		shareLinkRateLimiter: shareLinkRL,
-		zipRateLimiter:       zipRL,
-		apiKeyManager:        apiKeyManager,
-		version:              version,
-		router:               router,
+		config:                 cfg,
+		db:                     database,
+		storage:                s3Store,
+		storageManager:         storageManager,
+		blockStore:             blockStore,
+		tokenStore:             tokenStore,
+		permMiddleware:         permMiddleware,
+		authHandler:            authHandler,
+		gcService:              gcService,
+		ssoStore:               newClientSSOStore(),
+		authRateLimiter:        authRL,
+		shareLinkRateLimiter:   shareLinkRL,
+		zipRateLimiter:         zipRL,
+		apiKeyManager:          apiKeyManager,
+		projectionRepairWorker: v2.NewLibraryHeadProjectionRepairWorker(database, 0),
+		version:                version,
+		router:                 router,
 	}
 
 	s.setupRoutes()
@@ -1967,6 +1969,9 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	}
 	if s.apiKeyManager != nil {
 		s.apiKeyManager.Stop()
+	}
+	if s.projectionRepairWorker != nil {
+		s.projectionRepairWorker.Stop()
 	}
 	if s.authHandler != nil && s.authHandler.GetOIDCClient() != nil {
 		s.authHandler.GetOIDCClient().StopStateSweeper()

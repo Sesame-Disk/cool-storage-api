@@ -30,18 +30,32 @@ Session-by-session development history for SesameFS.
   - retries secondary projection repair immediately, including the retry case
     where the canonical library head already points at the target commit
   - persists failed secondary projection repairs in a durable queue and
-    opportunistically replays them from canonical library state without
-    rebuilding partial `libraries_by_id` rows
+    replays them from canonical library state without rebuilding partial
+    `libraries_by_id` rows
+  - tracks orgs with pending projection repairs so periodic replay can drain
+    the durable queue without scanning the full repair table
   - logs when block promotion waits on a GC deletion sentinel
+
+- `internal/api/server.go`
+  - starts and stops a dedicated library head projection repair worker with
+    the HTTP server lifecycle so queued repairs continue replaying even when
+    no new write lands in the same org
+
+- `internal/integration/library_projection_regression_test.go`
+  - adds a regression that seeds a durable repair after corrupting
+    `libraries_by_id` and admin projection rows, then waits for automatic
+    rebuild from canonical state
 
 - `internal/api/*_test.go`
   - adds regression coverage for chunked quota, scoped upload paths,
     path-like multipart filenames, staged cleanup ownership, publish retries,
-    and recovery conflict handling
+    recovery conflict handling, and the periodic repair worker loop
 
 ### Validation
 
 - `go test ./internal/api ./internal/api/v2 ./internal/traffic ./internal/db ./internal/gc -count=1`
+- `go test ./internal/api/v2 ./internal/api -count=1`
+- `go test -tags integration ./internal/integration -run '^$' -count=1`
 
 ---
 

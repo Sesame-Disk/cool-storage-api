@@ -489,6 +489,67 @@ func TestSyncHeadStaleAsyncStatsDoNotOverwriteCurrentHead(t *testing.T) {
 	}
 }
 
+func TestLibraryHeadProjectionRepairWorkerRebuildsLookupAndAdminProjection(t *testing.T) {
+	name := fmt.Sprintf("inttest-lib-projection-repair-%d", time.Now().UnixNano())
+	repoID := createTestLibrary(t, adminClient, name)
+	database := shareProjectionDBForTest(t)
+	session := database.Session()
+
+	state := readLibraryLookupProjectionState(t, session, repoID)
+	if !state.Exists {
+		t.Fatalf("expected libraries_by_id row for repo %s", repoID)
+	}
+
+	removeAdminLibraryProjectionRowsForSoftDeleteFallbackTest(t, session, defaultOrgID, repoID, state.OwnerID)
+	if err := session.Query(`DELETE FROM libraries_by_id WHERE library_id = ?`, repoID).Exec(); err != nil {
+		t.Fatalf("failed to remove lookup row for repo %s: %v", repoID, err)
+	}
+	if err := session.Query(`UPDATE libraries_by_id SET head_commit_id = ? WHERE library_id = ?`, state.HeadCommitID, repoID).Exec(); err != nil {
+		t.Fatalf("failed to seed partial lookup row for repo %s: %v", repoID, err)
+	}
+	now := time.Now().UTC()
+	if err := session.Query(`
+		INSERT INTO library_head_projection_repairs (
+			org_id, library_id, commit_id, queued_at, last_attempt_at, retry_count, last_error
+		) VALUES (?, ?, ?, ?, ?, ?, ?)
+	`, defaultOrgID, repoID, state.HeadCommitID, now, now, 1, "integration seeded repair").Exec(); err != nil {
+		t.Fatalf("failed to seed durable projection repair for repo %s: %v", repoID, err)
+	}
+	if err := session.Query(`
+		INSERT INTO library_head_projection_repair_orgs (org_id, updated_at) VALUES (?, ?)
+	`, defaultOrgID, now).Exec(); err != nil {
+		t.Fatalf("failed to seed repair org marker for repo %s: %v", repoID, err)
+	}
+	t.Cleanup(func() {
+		_ = session.Query(`DELETE FROM library_head_projection_repairs WHERE org_id = ? AND library_id = ?`, defaultOrgID, repoID).Exec()
+	})
+
+	waitForIntegrationCondition(t, "library head projection repair worker to rebuild lookup and admin projections", func() bool {
+		current := readLibraryLookupProjectionState(t, session, repoID)
+		if !current.Exists {
+			return false
+		}
+		if current.OrgID != defaultOrgID || current.OwnerID != state.OwnerID || current.Name != state.Name {
+			return false
+		}
+		if current.HeadCommitID != state.HeadCommitID || current.Encrypted != state.Encrypted || current.EncVersion != state.EncVersion {
+			return false
+		}
+		if current.Magic != state.Magic || current.RandomKey != state.RandomKey || current.Salt != state.Salt {
+			return false
+		}
+		if current.MagicStrong != state.MagicStrong || current.RandomKeyStrong != state.RandomKeyStrong {
+			return false
+		}
+		row, ok := adminLibraryProjectionRowForTest(t, session, defaultOrgID, repoID)
+		return ok && row.Name == state.Name && row.OwnerID == state.OwnerID
+	})
+
+	if projectionRepairExistsForTest(t, session, defaultOrgID, repoID) {
+		t.Fatalf("expected durable projection repair row for repo %s to be cleared after repair", repoID)
+	}
+}
+
 func TestAdminCreateLibraryProjectionVisibleImmediately(t *testing.T) {
 	name := fmt.Sprintf("inttest-admin-lib-projection-%d", time.Now().UnixNano())
 	createResp := superadminClient.PostJSON(t, "/api/v2.1/admin/libraries/", map[string]string{
@@ -632,6 +693,21 @@ type librarySyncHeadState struct {
 	ProjectionFileCount int64
 }
 
+type libraryLookupProjectionState struct {
+	Exists          bool
+	OrgID           string
+	OwnerID         string
+	Name            string
+	HeadCommitID    string
+	Encrypted       bool
+	EncVersion      int
+	Magic           string
+	RandomKey       string
+	Salt            string
+	MagicStrong     string
+	RandomKeyStrong string
+}
+
 func readLibrarySyncHeadState(t *testing.T, session interface {
 	Query(stmt string, values ...interface{}) *gocql.Query
 }, repoID string) librarySyncHeadState {
@@ -660,6 +736,56 @@ func readLibrarySyncHeadState(t *testing.T, session interface {
 	}
 
 	return state
+}
+
+func readLibraryLookupProjectionState(t *testing.T, session interface {
+	Query(stmt string, values ...interface{}) *gocql.Query
+}, repoID string) libraryLookupProjectionState {
+	t.Helper()
+
+	var state libraryLookupProjectionState
+	err := session.Query(`
+		SELECT org_id, owner_id, name, head_commit_id, encrypted, enc_version,
+		       magic, random_key, salt, magic_strong, random_key_strong
+		FROM libraries_by_id WHERE library_id = ?
+	`, repoID).Scan(
+		&state.OrgID,
+		&state.OwnerID,
+		&state.Name,
+		&state.HeadCommitID,
+		&state.Encrypted,
+		&state.EncVersion,
+		&state.Magic,
+		&state.RandomKey,
+		&state.Salt,
+		&state.MagicStrong,
+		&state.RandomKeyStrong,
+	)
+	if err == gocql.ErrNotFound {
+		return libraryLookupProjectionState{}
+	}
+	if err != nil {
+		t.Fatalf("failed to read libraries_by_id row for %s: %v", repoID, err)
+	}
+	state.Exists = true
+	return state
+}
+
+func projectionRepairExistsForTest(t *testing.T, session interface {
+	Query(stmt string, values ...interface{}) *gocql.Query
+}, orgID, repoID string) bool {
+	t.Helper()
+	var libraryID string
+	err := session.Query(`
+		SELECT library_id FROM library_head_projection_repairs WHERE org_id = ? AND library_id = ?
+	`, orgID, repoID).Scan(&libraryID)
+	if err == gocql.ErrNotFound {
+		return false
+	}
+	if err != nil {
+		t.Fatalf("failed to read projection repair row for repo %s: %v", repoID, err)
+	}
+	return libraryID == repoID
 }
 
 func insertSyntheticCommitForTest(t *testing.T, session interface {
