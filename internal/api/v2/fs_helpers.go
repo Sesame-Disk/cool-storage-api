@@ -9,6 +9,7 @@ import (
 	"log"
 	"path"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Sesame-Disk/sesamefs/internal/db"
@@ -21,6 +22,35 @@ import (
 type FSHelper struct {
 	db *db.DB
 }
+
+type libraryByIDProjectionRow struct {
+	LibraryID       string
+	OrgID           string
+	OwnerID         string
+	Name            string
+	HeadCommitID    string
+	Encrypted       bool
+	EncVersion      int
+	Magic           string
+	RandomKey       string
+	Salt            string
+	MagicStrong     string
+	RandomKeyStrong string
+}
+
+type libraryHeadProjectionRepairRecord struct {
+	OrgID         string
+	LibraryID     string
+	CommitID      string
+	QueuedAt      time.Time
+	LastAttemptAt time.Time
+	RetryCount    int
+	LastError     string
+}
+
+const libraryHeadProjectionRepairSweepLimit = 8
+
+var libraryHeadProjectionRepairSweeps sync.Map
 
 type LibraryHeadConflictError struct {
 	RepoID       string
@@ -79,6 +109,203 @@ func (h *FSHelper) GetBlockMetadata(orgID, blockID string) (BlockMetadata, error
 		return BlockMetadata{}, err
 	}
 	return BlockMetadata{Exists: true, RefCount: refCount, StorageClass: storageClass, StorageKey: storageKey}, nil
+}
+
+func (h *FSHelper) readLibraryByIDProjectionRow(orgID, repoID string) (libraryByIDProjectionRow, error) {
+	if strings.TrimSpace(orgID) == "" {
+		return libraryByIDProjectionRow{}, fmt.Errorf("org id is required")
+	}
+	if strings.TrimSpace(repoID) == "" {
+		return libraryByIDProjectionRow{}, fmt.Errorf("repo id is required")
+	}
+	if h == nil || h.db == nil {
+		return libraryByIDProjectionRow{}, nil
+	}
+
+	row := libraryByIDProjectionRow{LibraryID: repoID, OrgID: orgID}
+	err := h.db.Session().Query(`
+		SELECT owner_id, name, head_commit_id, encrypted, enc_version,
+		       magic, random_key, salt, magic_strong, random_key_strong
+		FROM libraries WHERE org_id = ? AND library_id = ?
+	`, orgID, repoID).Scan(
+		&row.OwnerID,
+		&row.Name,
+		&row.HeadCommitID,
+		&row.Encrypted,
+		&row.EncVersion,
+		&row.Magic,
+		&row.RandomKey,
+		&row.Salt,
+		&row.MagicStrong,
+		&row.RandomKeyStrong,
+	)
+	if err != nil {
+		return libraryByIDProjectionRow{}, err
+	}
+	return row, nil
+}
+
+func addUpsertLibraryByIDProjectionQuery(batch *gocql.Batch, row libraryByIDProjectionRow) {
+	batch.Query(`
+		INSERT INTO libraries_by_id (
+			library_id, org_id, owner_id, name, head_commit_id, encrypted,
+			enc_version, magic, random_key, salt, magic_strong, random_key_strong
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, row.LibraryID, row.OrgID, row.OwnerID, row.Name, row.HeadCommitID, row.Encrypted,
+		row.EncVersion, row.Magic, row.RandomKey, row.Salt, row.MagicStrong, row.RandomKeyStrong)
+}
+
+func (h *FSHelper) upsertLibraryHeadSecondaryProjections(orgID, repoID, commitID string, projectionRow db.AdminLibraryProjectionRow, previousRow *db.AdminLibraryProjectionRow) error {
+	libraryByIDRow, err := h.readLibraryByIDProjectionRow(orgID, repoID)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(commitID) != "" {
+		libraryByIDRow.HeadCommitID = commitID
+	}
+
+	batch := h.db.Session().Batch(gocql.LoggedBatch)
+	addUpsertLibraryByIDProjectionQuery(batch, libraryByIDRow)
+	addAdminLibraryReadModelRefreshQueries(batch, projectionRow, previousRow)
+	return batch.Exec()
+}
+
+func (h *FSHelper) enqueueLibraryHeadProjectionRepair(orgID, repoID, commitID string, cause error) error {
+	if strings.TrimSpace(orgID) == "" {
+		return fmt.Errorf("org id is required")
+	}
+	if strings.TrimSpace(repoID) == "" {
+		return fmt.Errorf("repo id is required")
+	}
+	if h == nil || h.db == nil {
+		return nil
+	}
+
+	now := time.Now().UTC()
+	message := ""
+	if cause != nil {
+		message = cause.Error()
+	}
+	var retryCount int
+	_ = h.db.Session().Query(`
+		SELECT retry_count FROM library_head_projection_repairs WHERE org_id = ? AND library_id = ?
+	`, orgID, repoID).Scan(&retryCount)
+
+	return h.db.Session().Query(`
+		INSERT INTO library_head_projection_repairs (
+			org_id, library_id, commit_id, queued_at, last_attempt_at, retry_count, last_error
+		) VALUES (?, ?, ?, ?, ?, ?, ?)
+	`, orgID, repoID, commitID, now, now, retryCount+1, message).Exec()
+}
+
+func (h *FSHelper) listLibraryHeadProjectionRepairs(orgID string, limit int) ([]libraryHeadProjectionRepairRecord, error) {
+	if strings.TrimSpace(orgID) == "" {
+		return nil, fmt.Errorf("org id is required")
+	}
+	if limit <= 0 {
+		limit = libraryHeadProjectionRepairSweepLimit
+	}
+	if h == nil || h.db == nil {
+		return nil, nil
+	}
+
+	iter := h.db.Session().Query(`
+		SELECT library_id, commit_id, queued_at, last_attempt_at, retry_count, last_error
+		FROM library_head_projection_repairs WHERE org_id = ? LIMIT ?
+	`, orgID, limit).Iter()
+
+	var records []libraryHeadProjectionRepairRecord
+	var record libraryHeadProjectionRepairRecord
+	for iter.Scan(&record.LibraryID, &record.CommitID, &record.QueuedAt, &record.LastAttemptAt, &record.RetryCount, &record.LastError) {
+		record.OrgID = orgID
+		records = append(records, record)
+		record = libraryHeadProjectionRepairRecord{}
+	}
+	if err := iter.Close(); err != nil {
+		return nil, err
+	}
+	return records, nil
+}
+
+func (h *FSHelper) deleteLibraryHeadProjectionRepair(orgID, repoID string) error {
+	if strings.TrimSpace(orgID) == "" {
+		return fmt.Errorf("org id is required")
+	}
+	if strings.TrimSpace(repoID) == "" {
+		return fmt.Errorf("repo id is required")
+	}
+	if h == nil || h.db == nil {
+		return nil
+	}
+	return h.db.Session().Query(`
+		DELETE FROM library_head_projection_repairs WHERE org_id = ? AND library_id = ?
+	`, orgID, repoID).Exec()
+}
+
+func (h *FSHelper) repairLibraryHeadSecondaryProjectionsFromCanonical(orgID, repoID string) error {
+	if strings.TrimSpace(orgID) == "" {
+		return fmt.Errorf("org id is required")
+	}
+	if strings.TrimSpace(repoID) == "" {
+		return fmt.Errorf("repo id is required")
+	}
+	if h == nil || h.db == nil {
+		return nil
+	}
+
+	projectionRow, err := db.ReadAdminLibraryProjectionRow(h.db.Session(), orgID, repoID)
+	if err != nil {
+		return err
+	}
+	lookupRow, err := h.readLibraryByIDProjectionRow(orgID, repoID)
+	if err != nil {
+		return err
+	}
+	return h.upsertLibraryHeadSecondaryProjections(orgID, repoID, lookupRow.HeadCommitID, projectionRow, nil)
+}
+
+func (h *FSHelper) processPendingLibraryHeadProjectionRepairs(orgID string, limit int) {
+	if strings.TrimSpace(orgID) == "" || h == nil || h.db == nil {
+		return
+	}
+	repairs, err := h.listLibraryHeadProjectionRepairs(orgID, limit)
+	if err != nil {
+		log.Printf("[UpdateLibraryHead] WARNING: failed to list pending projection repairs for org %s: %v", orgID, err)
+		return
+	}
+	for _, repair := range repairs {
+		if err := h.repairLibraryHeadSecondaryProjectionsFromCanonical(orgID, repair.LibraryID); err != nil {
+			if errors.Is(err, gocql.ErrNotFound) {
+				if deleteErr := h.deleteLibraryHeadProjectionRepair(orgID, repair.LibraryID); deleteErr != nil {
+					log.Printf("[UpdateLibraryHead] WARNING: failed to delete orphaned projection repair for org=%s repo=%s: %v", orgID, repair.LibraryID, deleteErr)
+				}
+				continue
+			}
+			if enqueueErr := h.enqueueLibraryHeadProjectionRepair(orgID, repair.LibraryID, repair.CommitID, err); enqueueErr != nil {
+				log.Printf("[UpdateLibraryHead] WARNING: failed to refresh pending projection repair for org=%s repo=%s: %v", orgID, repair.LibraryID, enqueueErr)
+			}
+			continue
+		}
+		if err := h.deleteLibraryHeadProjectionRepair(orgID, repair.LibraryID); err != nil {
+			log.Printf("[UpdateLibraryHead] WARNING: failed to delete completed projection repair for org=%s repo=%s: %v", orgID, repair.LibraryID, err)
+		}
+	}
+}
+
+func (h *FSHelper) scheduleLibraryHeadProjectionRepairSweep(orgID string, limit int) {
+	if strings.TrimSpace(orgID) == "" || h == nil || h.db == nil {
+		return
+	}
+	if limit <= 0 {
+		limit = libraryHeadProjectionRepairSweepLimit
+	}
+	if _, loaded := libraryHeadProjectionRepairSweeps.LoadOrStore(orgID, struct{}{}); loaded {
+		return
+	}
+	go func() {
+		defer libraryHeadProjectionRepairSweeps.Delete(orgID)
+		h.processPendingLibraryHeadProjectionRepairs(orgID, limit)
+	}()
 }
 
 // NewFSHelper creates a new FSHelper instance
@@ -441,24 +668,26 @@ func (h *FSHelper) UpdateLibraryHead(orgID, repoID, commitID string) error {
 	return h.UpdateLibraryHeadWithExpected(orgID, repoID, commitID, "")
 }
 
-func (h *FSHelper) updateLibraryHeadSecondaryProjections(repoID, commitID string, projectionRow db.AdminLibraryProjectionRow, previousRow *db.AdminLibraryProjectionRow) error {
-	batch := h.db.Session().Batch(gocql.LoggedBatch)
-	batch.Query(`
-		UPDATE libraries_by_id SET head_commit_id = ?
-		WHERE library_id = ?
-	`, commitID, repoID)
-	addAdminLibraryReadModelRefreshQueries(batch, projectionRow, previousRow)
-	return batch.Exec()
+func (h *FSHelper) updateLibraryHeadSecondaryProjections(orgID, repoID, commitID string, projectionRow db.AdminLibraryProjectionRow, previousRow *db.AdminLibraryProjectionRow) error {
+	return h.upsertLibraryHeadSecondaryProjections(orgID, repoID, commitID, projectionRow, previousRow)
 }
 
-func (h *FSHelper) repairLibraryHeadSecondaryProjections(repoID, commitID string, projectionRow db.AdminLibraryProjectionRow, previousRow *db.AdminLibraryProjectionRow) error {
-	err := h.updateLibraryHeadSecondaryProjections(repoID, commitID, projectionRow, previousRow)
+func (h *FSHelper) repairLibraryHeadSecondaryProjections(orgID, repoID, commitID string, projectionRow db.AdminLibraryProjectionRow, previousRow *db.AdminLibraryProjectionRow) error {
+	err := h.updateLibraryHeadSecondaryProjections(orgID, repoID, commitID, projectionRow, previousRow)
 	if err == nil {
 		return nil
 	}
 	log.Printf("[UpdateLibraryHead] WARNING: secondary projection update failed for library %s commit %s; retrying once: %v", repoID, commitID, err)
 	time.Sleep(100 * time.Millisecond)
-	return h.updateLibraryHeadSecondaryProjections(repoID, commitID, projectionRow, previousRow)
+	return h.updateLibraryHeadSecondaryProjections(orgID, repoID, commitID, projectionRow, previousRow)
+}
+
+func (h *FSHelper) libraryHeadPublishedProjectionError(orgID, repoID, commitID string, cause error) error {
+	if enqueueErr := h.enqueueLibraryHeadProjectionRepair(orgID, repoID, commitID, cause); enqueueErr != nil {
+		log.Printf("[UpdateLibraryHead] WARNING: failed to enqueue durable projection repair for library %s commit %s: %v", repoID, commitID, enqueueErr)
+	}
+	h.scheduleLibraryHeadProjectionRepairSweep(orgID, libraryHeadProjectionRepairSweepLimit)
+	return &LibraryHeadPublishedProjectionError{RepoID: repoID, CommitID: commitID, Cause: cause}
 }
 
 func (h *FSHelper) UpdateLibraryHeadWithExpected(orgID, repoID, commitID, expectedHeadCommitID string) error {
@@ -487,6 +716,7 @@ func (h *FSHelper) UpdateLibraryHeadWithExpected(orgID, repoID, commitID, expect
 	projectionRow.SizeBytes = totalSize
 	projectionRow.FileCount = fileCount
 	projectionRow.UpdatedAt = now
+	defer h.scheduleLibraryHeadProjectionRepairSweep(orgID, libraryHeadProjectionRepairSweepLimit)
 	if strings.TrimSpace(expectedHeadCommitID) != "" {
 		existing := map[string]interface{}{}
 		applied, err := h.db.Session().Query(`
@@ -509,8 +739,8 @@ func (h *FSHelper) UpdateLibraryHeadWithExpected(orgID, repoID, commitID, expect
 				}
 			}
 			if strings.TrimSpace(actualHead) == strings.TrimSpace(commitID) {
-				if err := h.repairLibraryHeadSecondaryProjections(repoID, commitID, projectionRow, &previousRow); err != nil {
-					return &LibraryHeadPublishedProjectionError{RepoID: repoID, CommitID: commitID, Cause: err}
+				if err := h.repairLibraryHeadSecondaryProjections(orgID, repoID, commitID, projectionRow, &previousRow); err != nil {
+					return h.libraryHeadPublishedProjectionError(orgID, repoID, commitID, err)
 				}
 				log.Printf("[UpdateLibraryHead] Library %s already points at commit %s; refreshed secondary projections", repoID, commitID)
 				return nil
@@ -518,8 +748,8 @@ func (h *FSHelper) UpdateLibraryHeadWithExpected(orgID, repoID, commitID, expect
 			return &LibraryHeadConflictError{RepoID: repoID, ExpectedHead: expectedHeadCommitID, ActualHead: actualHead}
 		}
 
-		if err := h.repairLibraryHeadSecondaryProjections(repoID, commitID, projectionRow, &previousRow); err != nil {
-			return &LibraryHeadPublishedProjectionError{RepoID: repoID, CommitID: commitID, Cause: err}
+		if err := h.repairLibraryHeadSecondaryProjections(orgID, repoID, commitID, projectionRow, &previousRow); err != nil {
+			return h.libraryHeadPublishedProjectionError(orgID, repoID, commitID, err)
 		}
 
 		log.Printf("[UpdateLibraryHead] Updated library %s with expected head %s: size=%d bytes, files=%d", repoID, expectedHeadCommitID, totalSize, fileCount)
@@ -533,11 +763,12 @@ func (h *FSHelper) UpdateLibraryHeadWithExpected(orgID, repoID, commitID, expect
 		WHERE org_id = ? AND library_id = ?
 	`, commitID, totalSize, fileCount, now, orgID, repoID)
 
-	// Update lookup table
-	batch.Query(`
-		UPDATE libraries_by_id SET head_commit_id = ?
-		WHERE library_id = ?
-	`, commitID, repoID)
+	libraryByIDRow, err := h.readLibraryByIDProjectionRow(orgID, repoID)
+	if err != nil {
+		return fmt.Errorf("failed to read library lookup projection row: %w", err)
+	}
+	libraryByIDRow.HeadCommitID = commitID
+	addUpsertLibraryByIDProjectionQuery(batch, libraryByIDRow)
 	addAdminLibraryReadModelRefreshQueries(batch, projectionRow, &previousRow)
 
 	if err := batch.Exec(); err != nil {

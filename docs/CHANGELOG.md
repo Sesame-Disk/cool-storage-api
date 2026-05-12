@@ -29,6 +29,9 @@ Session-by-session development history for SesameFS.
   - adds expected-head CAS publishing for upload commits
   - retries secondary projection repair immediately, including the retry case
     where the canonical library head already points at the target commit
+  - persists failed secondary projection repairs in a durable queue and
+    opportunistically replays them from canonical library state without
+    rebuilding partial `libraries_by_id` rows
   - logs when block promotion waits on a GC deletion sentinel
 
 - `internal/api/*_test.go`
