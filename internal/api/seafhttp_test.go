@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1476,29 +1477,27 @@ func TestHandleUploadChunked_PreflushesContiguousBlockBeforeFinalize(t *testing.
 	tail := []byte("xyz")
 	expectedSHA256 := sha256.Sum256(fullBlock)
 	expectedSHA256Hex := hex.EncodeToString(expectedSHA256[:])
+	expectedSHA1 := sha1.Sum(fullBlock)
+	expectedSHA1Hex := hex.EncodeToString(expectedSHA1[:])
 	handler.chunkedFinalize = func(c *gin.Context, token *AccessToken, upload *ChunkUpload, uploadID, parentDir, filename, storageKey string, totalSize int64, replace bool) (finalizeUploadResult, error) {
-		if len(uploadedHashes) != 1 {
-			t.Fatalf("preflush upload calls = %d, want 1", len(uploadedHashes))
-		}
-		if uploadedHashes[0] != expectedSHA256Hex {
-			t.Fatalf("preflushed hash = %q, want %q", uploadedHashes[0], expectedSHA256Hex)
-		}
-		alreadyAccounted, err := upload.BlockAlreadyAccounted(0, expectedSHA256Hex)
+		preflushed, alreadyAccounted, err := upload.ResolvePreflushedBlock(0, expectedSHA256Hex, expectedSHA1Hex)
 		if err != nil {
-			t.Fatalf("BlockAlreadyAccounted failed: %v", err)
+			t.Fatalf("ResolvePreflushedBlock failed: %v", err)
 		}
 		if !alreadyAccounted {
 			t.Fatal("expected first full block to be accounted before finalize")
-		}
-		preflushed, ok := upload.PreflushedBlock(0)
-		if !ok {
-			t.Fatal("expected first full block to be available as preflushed metadata")
 		}
 		if preflushed.BlockSHA256 != expectedSHA256Hex {
 			t.Fatalf("preflushed sha256 = %q, want %q", preflushed.BlockSHA256, expectedSHA256Hex)
 		}
 		if preflushed.UploadedAt == nil {
 			t.Fatal("expected preflushed block to carry uploaded timestamp")
+		}
+		if len(uploadedHashes) != 1 {
+			t.Fatalf("preflush upload calls = %d, want 1", len(uploadedHashes))
+		}
+		if uploadedHashes[0] != expectedSHA256Hex {
+			t.Fatalf("preflushed hash = %q, want %q", uploadedHashes[0], expectedSHA256Hex)
 		}
 		return finalizeUploadResult{FileID: "file-id", ActualFilename: filename, CommitID: "commit-id"}, nil
 	}
@@ -1569,21 +1568,26 @@ func TestHandleUploadChunked_DoesNotPreflushUntilMissingPrefixArrives(t *testing
 	tail := []byte("xyz")
 	expectedSHA256 := sha256.Sum256(fullBlock)
 	expectedSHA256Hex := hex.EncodeToString(expectedSHA256[:])
+	expectedSHA1 := sha1.Sum(fullBlock)
+	expectedSHA1Hex := hex.EncodeToString(expectedSHA1[:])
 	half := uploadBlockSize / 2
 	totalSize := uploadBlockSize + len(tail)
 	handler.chunkedFinalize = func(c *gin.Context, token *AccessToken, upload *ChunkUpload, uploadID, parentDir, filename, storageKey string, totalSize int64, replace bool) (finalizeUploadResult, error) {
+		preflushed, alreadyAccounted, err := upload.ResolvePreflushedBlock(0, expectedSHA256Hex, expectedSHA1Hex)
+		if err != nil {
+			t.Fatalf("ResolvePreflushedBlock failed: %v", err)
+		}
+		if !alreadyAccounted {
+			t.Fatal("expected first block to be accounted once the prefix becomes contiguous")
+		}
+		if preflushed.BlockSHA256 != expectedSHA256Hex {
+			t.Fatalf("preflushed sha256 = %q, want %q", preflushed.BlockSHA256, expectedSHA256Hex)
+		}
 		if len(uploadedHashes) != 1 {
 			t.Fatalf("preflush upload calls = %d, want 1", len(uploadedHashes))
 		}
 		if uploadedHashes[0] != expectedSHA256Hex {
 			t.Fatalf("preflushed hash = %q, want %q", uploadedHashes[0], expectedSHA256Hex)
-		}
-		preflushed, ok := upload.PreflushedBlock(0)
-		if !ok {
-			t.Fatal("expected first block to be preflushed once the prefix becomes contiguous")
-		}
-		if preflushed.BlockSHA256 != expectedSHA256Hex {
-			t.Fatalf("preflushed sha256 = %q, want %q", preflushed.BlockSHA256, expectedSHA256Hex)
 		}
 		return finalizeUploadResult{FileID: "file-id", ActualFilename: filename, CommitID: "commit-id"}, nil
 	}
@@ -1773,6 +1777,179 @@ func TestHandleUploadChunked_FinalizeWaitsForInFlightPreflush(t *testing.T) {
 		t.Fatalf("uploaded hashes = %v, want [%s]", uploadedHashes, expectedSHA256Hex)
 	}
 	chunkManager.CleanupUpload(tokenStr, "concurrent-preflush.txt")
+}
+
+func TestHandleUploadChunked_FirstChunkReturnsBeforeBlockedPreflush(t *testing.T) {
+	tm := NewTokenManager(time.Hour)
+	tokenStr, err := tm.CreateUploadToken("org-1", "repo-1", "/", "user-1")
+	if err != nil {
+		t.Fatalf("CreateUploadToken failed: %v", err)
+	}
+	handler := NewSeafHTTPHandler(nil, storage.NewManager(), nil, tm, nil, nil)
+	handler.uploadBlockResolver = func(c *gin.Context, token *AccessToken) (*storage.BlockStore, string, error) {
+		return nil, "hot", nil
+	}
+	preflushStarted := make(chan struct{})
+	releasePreflush := make(chan struct{})
+	var preflushOnce sync.Once
+	var uploadedHashes []string
+	handler.uploadBlockWriter = func(ctx context.Context, blockStore *storage.BlockStore, hash string, data []byte) (string, error) {
+		preflushOnce.Do(func() {
+			close(preflushStarted)
+			<-releasePreflush
+		})
+		uploadedHashes = append(uploadedHashes, hash)
+		return hash, nil
+	}
+
+	fullBlock := bytes.Repeat([]byte("d"), uploadBlockSize)
+	tail := []byte("xyz")
+	expectedSHA1 := sha1.Sum(fullBlock)
+	expectedSHA1Hex := hex.EncodeToString(expectedSHA1[:])
+	expectedSHA256 := sha256.Sum256(fullBlock)
+	expectedSHA256Hex := hex.EncodeToString(expectedSHA256[:])
+	handler.chunkedFinalize = func(c *gin.Context, token *AccessToken, upload *ChunkUpload, uploadID, parentDir, filename, storageKey string, totalSize int64, replace bool) (finalizeUploadResult, error) {
+		preflushed, alreadyAccounted, err := upload.ResolvePreflushedBlock(0, expectedSHA256Hex, expectedSHA1Hex)
+		if err != nil {
+			t.Fatalf("ResolvePreflushedBlock failed: %v", err)
+		}
+		if !alreadyAccounted {
+			t.Fatal("expected finalize to observe the first block as accounted")
+		}
+		if preflushed.BlockSHA256 != expectedSHA256Hex {
+			t.Fatalf("preflushed sha256 = %q, want %q", preflushed.BlockSHA256, expectedSHA256Hex)
+		}
+		return finalizeUploadResult{FileID: "file-id", ActualFilename: filename, CommitID: "commit-id"}, nil
+	}
+
+	r := gin.New()
+	r.POST("/seafhttp/upload-api/:token", handler.HandleUpload)
+
+	makeRequest := func(contentRange string, payload []byte) *httptest.ResponseRecorder {
+		var body bytes.Buffer
+		writer := multipart.NewWriter(&body)
+		part, _ := writer.CreateFormFile("file", "async-preflush.txt")
+		_, _ = part.Write(payload)
+		writer.Close()
+
+		req := httptest.NewRequest(http.MethodPost, "/seafhttp/upload-api/"+tokenStr+"?ret-json=1", &body)
+		req.Header.Set("Content-Type", writer.FormDataContentType())
+		req.Header.Set("Content-Range", contentRange)
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+		return w
+	}
+
+	totalSize := uploadBlockSize + len(tail)
+	firstDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		firstDone <- makeRequest("bytes 0-"+strconv.Itoa(uploadBlockSize-1)+"/"+strconv.Itoa(totalSize), fullBlock)
+	}()
+
+	select {
+	case <-preflushStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for preflush to start")
+	}
+
+	select {
+	case first := <-firstDone:
+		if first.Code != http.StatusOK {
+			t.Fatalf("first status = %d, want %d", first.Code, http.StatusOK)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("first request did not return while preflush was blocked")
+	}
+
+	close(releasePreflush)
+
+	final := makeRequest("bytes "+strconv.Itoa(uploadBlockSize)+"-"+strconv.Itoa(totalSize-1)+"/"+strconv.Itoa(totalSize), tail)
+	if final.Code != http.StatusOK {
+		t.Fatalf("final status = %d, want %d", final.Code, http.StatusOK)
+	}
+	if len(uploadedHashes) != 1 || uploadedHashes[0] != expectedSHA256Hex {
+		t.Fatalf("uploaded hashes = %v, want [%s]", uploadedHashes, expectedSHA256Hex)
+	}
+	chunkManager.CleanupUpload(tokenStr, "async-preflush.txt")
+}
+
+func TestPreflushChunkUploadBlocksBoundsConcurrentUploads(t *testing.T) {
+	handler := NewSeafHTTPHandler(nil, storage.NewManager(), nil, NewMockTokenStore(), nil, nil)
+	handler.uploadStaging = nil
+	handler.uploadBlockMetadata = nil
+	handler.uploadBlockResolver = func(c *gin.Context, token *AccessToken) (*storage.BlockStore, string, error) {
+		return nil, "hot", nil
+	}
+
+	totalBlocks := preflushUploadConcurrency*2 + 1
+	started := make(chan struct{}, totalBlocks)
+	releaseUploads := make(chan struct{})
+	var inFlight int64
+	var maxInFlight int64
+	handler.uploadBlockWriter = func(ctx context.Context, blockStore *storage.BlockStore, hash string, data []byte) (string, error) {
+		current := atomic.AddInt64(&inFlight, 1)
+		for {
+			observed := atomic.LoadInt64(&maxInFlight)
+			if current <= observed || atomic.CompareAndSwapInt64(&maxInFlight, observed, current) {
+				break
+			}
+		}
+		started <- struct{}{}
+		<-releaseUploads
+		atomic.AddInt64(&inFlight, -1)
+		return hash, nil
+	}
+
+	tempFile, err := os.CreateTemp(t.TempDir(), "bounded-preflush-*")
+	if err != nil {
+		t.Fatalf("CreateTemp failed: %v", err)
+	}
+	t.Cleanup(func() {
+		tempFile.Close()
+	})
+	totalSize := int64(totalBlocks) * uploadBlockSize
+	if err := tempFile.Truncate(totalSize); err != nil {
+		t.Fatalf("Truncate failed: %v", err)
+	}
+	upload := &ChunkUpload{
+		TotalSize: totalSize,
+		CreatedAt: time.Now(),
+		TempFile:  tempFile,
+		Ranges: []byteRange{{
+			Start: 0,
+			End:   totalSize - 1,
+		}},
+	}
+
+	handler.preflushChunkUploadBlocks(nil, &AccessToken{OrgID: "org-1", RepoID: "repo-1", UserID: "user-1"}, upload, "bounded-preflush")
+
+	for i := 0; i < preflushUploadConcurrency; i++ {
+		select {
+		case <-started:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("timed out waiting for preflush worker %d to start", i+1)
+		}
+	}
+	select {
+	case <-started:
+		t.Fatalf("preflush exceeded concurrency cap %d", preflushUploadConcurrency)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if got := atomic.LoadInt64(&maxInFlight); got > int64(preflushUploadConcurrency) {
+		t.Fatalf("max concurrent preflush uploads = %d, want <= %d", got, preflushUploadConcurrency)
+	}
+
+	close(releaseUploads)
+	for i := preflushUploadConcurrency; i < totalBlocks; i++ {
+		select {
+		case <-started:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("timed out waiting for preflush block %d to drain", i+1)
+		}
+	}
+	if got := atomic.LoadInt64(&maxInFlight); got > int64(preflushUploadConcurrency) {
+		t.Fatalf("max concurrent preflush uploads after drain = %d, want <= %d", got, preflushUploadConcurrency)
+	}
 }
 
 func TestChunkUploadResolvePreflushedBlockFallsBackAfterFailedPreflush(t *testing.T) {

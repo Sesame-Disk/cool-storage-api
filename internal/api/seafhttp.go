@@ -916,6 +916,8 @@ type SeafHTTPHandler struct {
 	uploadBlockMetadata  uploadBlockMetadataLoaderFunc
 	cleanupPendingSweep  uploadCleanupSweepFunc
 	chunkedFinalize      chunkedFinalizeFunc
+	preflushSem          chan struct{}
+	preflushSemOnce      sync.Once
 	zipMaxEntries        int
 	zipMaxDepth          int
 	zipMaxBytes          int64
@@ -1875,6 +1877,23 @@ func (h *SeafHTTPHandler) applyUploadBlockPromotion(orgID, uploadID, commitID st
 	return promotedAt, true, nil
 }
 
+func (h *SeafHTTPHandler) tryAcquirePreflushSlot() func() {
+	if h == nil {
+		return nil
+	}
+	h.preflushSemOnce.Do(func() {
+		h.preflushSem = make(chan struct{}, preflushUploadConcurrency)
+	})
+	select {
+	case h.preflushSem <- struct{}{}:
+		return func() { <-h.preflushSem }
+	default:
+		return nil
+	}
+}
+
+const preflushBlockTimeout = 2 * time.Minute
+
 func (h *SeafHTTPHandler) preflushChunkUploadBlocks(c *gin.Context, token *AccessToken, upload *ChunkUpload, uploadID string) {
 	if h == nil || upload == nil || token == nil || upload.TotalSize <= uploadBlockSize || h.uploadBlockResolver == nil || h.uploadBlockWriter == nil {
 		return
@@ -1905,102 +1924,129 @@ func (h *SeafHTTPHandler) preflushChunkUploadBlocks(c *gin.Context, token *Acces
 		return
 	}
 
-	for {
-		blockIndex, start, end, ok := upload.NextFlushableContiguousBlock(uploadBlockSize)
-		if !ok {
+	type reservedChunkBlock struct {
+		index int
+		start int64
+		end   int64
+	}
+
+	processReservedBlock := func(reservedBlock reservedChunkBlock) {
+		blockIndex, start, end := reservedBlock.index, reservedBlock.start, reservedBlock.end
+		ctx, cancel := context.WithTimeout(context.Background(), preflushBlockTimeout)
+		defer cancel()
+		defer upload.finishPreflush(blockIndex)
+
+		plaintextBlock, err := upload.ReadRange(start, end)
+		if err != nil {
+			log.Printf("[HandleUpload] WARNING: Failed to read contiguous chunk block %d for preflush: %v", blockIndex, err)
 			return
 		}
 
-		err := func() error {
-			defer upload.finishPreflush(blockIndex)
+		blockSHA1Hash := sha1.Sum(plaintextBlock)
+		blockSHA1ID := hex.EncodeToString(blockSHA1Hash[:])
+		storedBlock := plaintextBlock
+		if fileKey != nil {
+			encryptedBlock, encErr := crypto.EncryptBlockSeafile(plaintextBlock, fileKey, fileIV)
+			if encErr != nil {
+				log.Printf("[HandleUpload] WARNING: Failed to encrypt preflush block %d: %v", blockIndex, encErr)
+				return
+			}
+			storedBlock = encryptedBlock
+		}
 
-			plaintextBlock, err := upload.ReadRange(start, end)
+		sha256Hash := sha256.Sum256(storedBlock)
+		sha256ID := hex.EncodeToString(sha256Hash[:])
+		promotion := uploadBlockPromotion{
+			BlockIndex:   blockIndex,
+			BlockSHA1:    blockSHA1ID,
+			BlockSHA256:  sha256ID,
+			SizeBytes:    len(storedBlock),
+			StorageClass: actualStorageClass,
+			StorageKey:   sha256ID,
+			Source:       UploadBlockSourceNewObject,
+			CreatedAt:    upload.CreatedAt.UTC(),
+		}
+
+		if err := upload.AccountBlockOnce(blockIndex, sha256ID, func() error {
+			source, blockStorageClass, blockStorageKey, uploadedAt, err := h.materializeUploadBlock(ctx, blockStore, token.OrgID, sha256ID, storedBlock, actualStorageClass)
 			if err != nil {
-				return fmt.Errorf("read contiguous chunk block %d for preflush: %w", blockIndex, err)
-			}
-
-			blockSHA1Hash := sha1.Sum(plaintextBlock)
-			blockSHA1ID := hex.EncodeToString(blockSHA1Hash[:])
-			storedBlock := plaintextBlock
-			if fileKey != nil {
-				encryptedBlock, encErr := crypto.EncryptBlockSeafile(plaintextBlock, fileKey, fileIV)
-				if encErr != nil {
-					return fmt.Errorf("encrypt preflush block %d: %w", blockIndex, encErr)
-				}
-				storedBlock = encryptedBlock
-			}
-
-			sha256Hash := sha256.Sum256(storedBlock)
-			sha256ID := hex.EncodeToString(sha256Hash[:])
-			promotion := uploadBlockPromotion{
-				BlockIndex:   blockIndex,
-				BlockSHA1:    blockSHA1ID,
-				BlockSHA256:  sha256ID,
-				SizeBytes:    len(storedBlock),
-				StorageClass: actualStorageClass,
-				StorageKey:   sha256ID,
-				Source:       UploadBlockSourceNewObject,
-				CreatedAt:    upload.CreatedAt.UTC(),
-			}
-
-			if err := upload.AccountBlockOnce(blockIndex, sha256ID, func() error {
-				source, blockStorageClass, blockStorageKey, uploadedAt, err := h.materializeUploadBlock(c.Request.Context(), blockStore, token.OrgID, sha256ID, storedBlock, actualStorageClass)
-				if err != nil {
-					return err
-				}
-				promotion.Source = source
-				promotion.StorageClass = blockStorageClass
-				promotion.StorageKey = blockStorageKey
-				promotion.UploadedAt = uploadedAt
-				registeredAt := time.Now().UTC()
-				if h.uploadStaging != nil {
-					h.persistUploadBlockState(UploadSessionBlockRecord{
-						UploadID:     uploadID,
-						BlockIndex:   blockIndex,
-						OrgID:        token.OrgID,
-						BlockSHA1:    blockSHA1ID,
-						BlockSHA256:  sha256ID,
-						SizeBytes:    len(storedBlock),
-						StorageClass: blockStorageClass,
-						StorageKey:   blockStorageKey,
-						Source:       source,
-						State:        UploadBlockStateRegistered,
-						CreatedAt:    upload.CreatedAt.UTC(),
-						UpdatedAt:    registeredAt,
-					}, string(UploadBlockStateRegistered))
-				}
-				if h.uploadStaging != nil && uploadedAt != nil {
-					h.persistUploadBlockState(UploadSessionBlockRecord{
-						UploadID:     uploadID,
-						BlockIndex:   blockIndex,
-						OrgID:        token.OrgID,
-						BlockSHA1:    blockSHA1ID,
-						BlockSHA256:  sha256ID,
-						SizeBytes:    len(storedBlock),
-						StorageClass: blockStorageClass,
-						StorageKey:   blockStorageKey,
-						Source:       source,
-						State:        UploadBlockStatePreflushed,
-						CreatedAt:    upload.CreatedAt.UTC(),
-						UpdatedAt:    uploadedAt.UTC(),
-						UploadedAt:   uploadedAt,
-					}, string(UploadBlockStatePreflushed))
-				}
-				// Record metadata before returning so AccountBlockOnce can't mark
-				// the block as accounted without finalize being able to see the
-				// matching promotion. If anything panics between this call and
-				// AccountBlockOnce's commit, finalize will simply re-materialize.
-				upload.RecordPreflushedBlock(blockIndex, promotion)
-				return nil
-			}); err != nil {
 				return err
 			}
+			promotion.Source = source
+			promotion.StorageClass = blockStorageClass
+			promotion.StorageKey = blockStorageKey
+			promotion.UploadedAt = uploadedAt
+			registeredAt := time.Now().UTC()
+			if h.uploadStaging != nil {
+				h.persistUploadBlockState(UploadSessionBlockRecord{
+					UploadID:     uploadID,
+					BlockIndex:   blockIndex,
+					OrgID:        token.OrgID,
+					BlockSHA1:    blockSHA1ID,
+					BlockSHA256:  sha256ID,
+					SizeBytes:    len(storedBlock),
+					StorageClass: blockStorageClass,
+					StorageKey:   blockStorageKey,
+					Source:       source,
+					State:        UploadBlockStateRegistered,
+					CreatedAt:    upload.CreatedAt.UTC(),
+					UpdatedAt:    registeredAt,
+				}, string(UploadBlockStateRegistered))
+			}
+			if h.uploadStaging != nil && uploadedAt != nil {
+				h.persistUploadBlockState(UploadSessionBlockRecord{
+					UploadID:     uploadID,
+					BlockIndex:   blockIndex,
+					OrgID:        token.OrgID,
+					BlockSHA1:    blockSHA1ID,
+					BlockSHA256:  sha256ID,
+					SizeBytes:    len(storedBlock),
+					StorageClass: blockStorageClass,
+					StorageKey:   blockStorageKey,
+					Source:       source,
+					State:        UploadBlockStatePreflushed,
+					CreatedAt:    upload.CreatedAt.UTC(),
+					UpdatedAt:    uploadedAt.UTC(),
+					UploadedAt:   uploadedAt,
+				}, string(UploadBlockStatePreflushed))
+			}
+			// Record metadata before returning so AccountBlockOnce can't mark
+			// the block as accounted without finalize being able to see the
+			// matching promotion. If anything panics between this call and
+			// AccountBlockOnce's commit, finalize will simply re-materialize.
+			upload.RecordPreflushedBlock(blockIndex, promotion)
 			return nil
-		}()
-		if err != nil {
+		}); err != nil {
 			log.Printf("[HandleUpload] WARNING: Failed to preflush chunk block %d: %v", blockIndex, err)
 			return
 		}
+	}
+
+	startWorker := func(firstBlock reservedChunkBlock, releaseSlot func()) {
+		go func() {
+			defer releaseSlot()
+			for reservedBlock := firstBlock; ; {
+				processReservedBlock(reservedBlock)
+				blockIndex, start, end, ok := upload.NextFlushableContiguousBlock(uploadBlockSize)
+				if !ok {
+					return
+				}
+				reservedBlock = reservedChunkBlock{index: blockIndex, start: start, end: end}
+			}
+		}()
+	}
+
+	for {
+		releaseSlot := h.tryAcquirePreflushSlot()
+		if releaseSlot == nil {
+			return
+		}
+		blockIndex, start, end, ok := upload.NextFlushableContiguousBlock(uploadBlockSize)
+		if !ok {
+			releaseSlot()
+			return
+		}
+		startWorker(reservedChunkBlock{index: blockIndex, start: start, end: end}, releaseSlot)
 	}
 }
 
@@ -2118,6 +2164,11 @@ const UploadBlockSize = uploadBlockSize
 // (≤ 8 × uploadBlockSize ≈ 64 MB extra) while cutting wall-clock by ~6–8× on
 // typical S3 latency.
 const finalizeUploadConcurrency = 8
+
+// preflushUploadConcurrency caps detached chunk preflush work across one
+// handler. Preflush runs outside the request path, so this is deliberately
+// lower than finalization to protect memory, S3, and foreground uploads.
+const preflushUploadConcurrency = 4
 
 // HandleUpload handles file uploads via the upload token.
 // Supports both single-shot uploads and chunked/resumable uploads (via Content-Range header).
