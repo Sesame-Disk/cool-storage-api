@@ -1986,12 +1986,15 @@ func (h *SeafHTTPHandler) preflushChunkUploadBlocks(c *gin.Context, token *Acces
 						UploadedAt:   uploadedAt,
 					}, string(UploadBlockStatePreflushed))
 				}
+				// Record metadata before returning so AccountBlockOnce can't mark
+				// the block as accounted without finalize being able to see the
+				// matching promotion. If anything panics between this call and
+				// AccountBlockOnce's commit, finalize will simply re-materialize.
+				upload.RecordPreflushedBlock(blockIndex, promotion)
 				return nil
 			}); err != nil {
 				return err
 			}
-
-			upload.RecordPreflushedBlock(blockIndex, promotion)
 			return nil
 		}()
 		if err != nil {
