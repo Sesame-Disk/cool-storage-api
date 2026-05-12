@@ -432,17 +432,18 @@ type SeafHTTPConfig struct {
 
 // ServerConfig holds HTTP server settings
 type ServerConfig struct {
-	Port               string        `yaml:"port"`
-	ReadTimeout        time.Duration `yaml:"read_timeout"`
-	ReadHeaderTimeout  time.Duration `yaml:"read_header_timeout"`
-	WriteTimeout       time.Duration `yaml:"write_timeout"`
-	MaxUploadMB        int64         `yaml:"max_upload_mb"`
-	TrustedProxies     []string      `yaml:"trusted_proxies"`
-	Region             string        `yaml:"region"`
-	URL                string        `yaml:"url"`
-	DesktopCustomBrand string        `yaml:"desktop_custom_brand"`
-	DesktopCustomLogo  string        `yaml:"desktop_custom_logo"`
-	MobileFrontendPath string        `yaml:"mobile_frontend_path"` // Path to mobile frontend dist (default: ./mobile-frontend/dist)
+	Port                                string        `yaml:"port"`
+	ReadTimeout                         time.Duration `yaml:"read_timeout"`
+	ReadHeaderTimeout                   time.Duration `yaml:"read_header_timeout"`
+	WriteTimeout                        time.Duration `yaml:"write_timeout"`
+	LibraryHeadProjectionRepairInterval time.Duration `yaml:"library_head_projection_repair_interval"`
+	MaxUploadMB                         int64         `yaml:"max_upload_mb"`
+	TrustedProxies                      []string      `yaml:"trusted_proxies"`
+	Region                              string        `yaml:"region"`
+	URL                                 string        `yaml:"url"`
+	DesktopCustomBrand                  string        `yaml:"desktop_custom_brand"`
+	DesktopCustomLogo                   string        `yaml:"desktop_custom_logo"`
+	MobileFrontendPath                  string        `yaml:"mobile_frontend_path"` // Path to mobile frontend dist (default: ./mobile-frontend/dist)
 }
 
 // DatabaseConfig holds Cassandra connection settings
@@ -663,14 +664,15 @@ func Load() (*Config, error) {
 func DefaultConfig() *Config {
 	return &Config{
 		Server: ServerConfig{
-			Port:               ":8080",
-			ReadTimeout:        0,                // No full-body read timeout — large uploads can take minutes
-			ReadHeaderTimeout:  10 * time.Second, // Timeout for reading request headers only (Slowloris protection)
-			WriteTimeout:       0,                // No write timeout — large downloads/zips can take minutes
-			MaxUploadMB:        20480,            // 20 GB
-			TrustedProxies:     nil,              // Secure default: do not trust forwarded client IP headers unless explicitly configured
-			Region:             "",
-			MobileFrontendPath: "./mobile-frontend/dist", // Mobile frontend build directory
+			Port:                                ":8080",
+			ReadTimeout:                         0,                // No full-body read timeout — large uploads can take minutes
+			ReadHeaderTimeout:                   10 * time.Second, // Timeout for reading request headers only (Slowloris protection)
+			WriteTimeout:                        0,                // No write timeout — large downloads/zips can take minutes
+			LibraryHeadProjectionRepairInterval: 30 * time.Second,
+			MaxUploadMB:                         20480, // 20 GB
+			TrustedProxies:                      nil,   // Secure default: do not trust forwarded client IP headers unless explicitly configured
+			Region:                              "",
+			MobileFrontendPath:                  "./mobile-frontend/dist", // Mobile frontend build directory
 		},
 		Database: DatabaseConfig{
 			Hosts:             []string{"localhost:9042"},
@@ -827,6 +829,13 @@ func (c *Config) applyEnvOverrides() {
 	}
 	if v := os.Getenv("SERVER_URL"); v != "" {
 		c.Server.URL = strings.TrimSuffix(strings.TrimSpace(v), "/")
+	}
+	if v := os.Getenv("SERVER_LIBRARY_HEAD_PROJECTION_REPAIR_INTERVAL"); v != "" {
+		if d, err := time.ParseDuration(v); err != nil {
+			c.addEnvOverrideError("SERVER_LIBRARY_HEAD_PROJECTION_REPAIR_INTERVAL must be a duration, got %q", v)
+		} else {
+			c.Server.LibraryHeadProjectionRepairInterval = d
+		}
 	}
 	if v := os.Getenv("DESKTOP_CUSTOM_BRAND"); v != "" {
 		c.Server.DesktopCustomBrand = strings.TrimSpace(v)
@@ -1282,6 +1291,9 @@ func (c *Config) Validate() error {
 	}
 	if c.Server.Port == "" {
 		return fmt.Errorf("server port is required")
+	}
+	if c.Server.LibraryHeadProjectionRepairInterval <= 0 {
+		return fmt.Errorf("server.library_head_projection_repair_interval must be greater than zero")
 	}
 	if len(c.Database.Hosts) == 0 {
 		return fmt.Errorf("at least one database host is required")

@@ -48,9 +48,15 @@ type libraryHeadProjectionRepairRecord struct {
 	LastError     string
 }
 
+type libraryHeadProjectionRepairOrgRecord struct {
+	OrgID     string
+	UpdatedAt time.Time
+}
+
 const (
 	libraryHeadProjectionRepairSweepLimit    = 8
 	libraryHeadProjectionRepairOrgSweepLimit = 16
+	libraryHeadProjectionRepairOrgBucket     = "pending"
 )
 
 var libraryHeadProjectionRepairSweeps sync.Map
@@ -201,13 +207,13 @@ func (h *FSHelper) enqueueLibraryHeadProjectionRepair(orgID, repoID, commitID st
 		) VALUES (?, ?, ?, ?, ?, ?, ?)
 	`, orgID, repoID, commitID, now, now, retryCount+1, message)
 	batch.Query(`
-		INSERT INTO library_head_projection_repair_orgs (org_id, updated_at)
-		VALUES (?, ?)
-	`, orgID, now)
+		INSERT INTO library_head_projection_repair_orgs_by_bucket (bucket, org_id, updated_at)
+		VALUES (?, ?, ?)
+	`, libraryHeadProjectionRepairOrgBucket, orgID, now)
 	return batch.Exec()
 }
 
-func (h *FSHelper) listLibraryHeadProjectionRepairOrgs(limit int) ([]string, error) {
+func (h *FSHelper) listLibraryHeadProjectionRepairOrgs(limit int) ([]libraryHeadProjectionRepairOrgRecord, error) {
 	if limit <= 0 {
 		limit = libraryHeadProjectionRepairOrgSweepLimit
 	}
@@ -216,18 +222,40 @@ func (h *FSHelper) listLibraryHeadProjectionRepairOrgs(limit int) ([]string, err
 	}
 
 	iter := h.db.Session().Query(`
-		SELECT org_id FROM library_head_projection_repair_orgs LIMIT ?
-	`, limit).Iter()
+		SELECT org_id, updated_at FROM library_head_projection_repair_orgs_by_bucket WHERE bucket = ? LIMIT ?
+	`, libraryHeadProjectionRepairOrgBucket, limit).Iter()
 
-	var orgIDs []string
-	var orgID string
-	for iter.Scan(&orgID) {
-		orgIDs = append(orgIDs, orgID)
+	var orgs []libraryHeadProjectionRepairOrgRecord
+	var org libraryHeadProjectionRepairOrgRecord
+	for iter.Scan(&org.OrgID, &org.UpdatedAt) {
+		orgs = append(orgs, org)
+		org = libraryHeadProjectionRepairOrgRecord{}
 	}
 	if err := iter.Close(); err != nil {
 		return nil, err
 	}
-	return orgIDs, nil
+	return orgs, nil
+}
+
+func (h *FSHelper) readLibraryHeadProjectionRepairOrgRecord(orgID string) (libraryHeadProjectionRepairOrgRecord, bool, error) {
+	if strings.TrimSpace(orgID) == "" {
+		return libraryHeadProjectionRepairOrgRecord{}, false, fmt.Errorf("org id is required")
+	}
+	if h == nil || h.db == nil {
+		return libraryHeadProjectionRepairOrgRecord{}, false, nil
+	}
+
+	var updatedAt time.Time
+	err := h.db.Session().Query(`
+		SELECT updated_at FROM library_head_projection_repair_orgs_by_bucket WHERE bucket = ? AND org_id = ?
+	`, libraryHeadProjectionRepairOrgBucket, orgID).Scan(&updatedAt)
+	if errors.Is(err, gocql.ErrNotFound) {
+		return libraryHeadProjectionRepairOrgRecord{}, false, nil
+	}
+	if err != nil {
+		return libraryHeadProjectionRepairOrgRecord{}, false, err
+	}
+	return libraryHeadProjectionRepairOrgRecord{OrgID: orgID, UpdatedAt: updatedAt}, true, nil
 }
 
 func (h *FSHelper) listLibraryHeadProjectionRepairs(orgID string, limit int) ([]libraryHeadProjectionRepairRecord, error) {
@@ -294,23 +322,30 @@ func (h *FSHelper) hasPendingLibraryHeadProjectionRepairs(orgID string) (bool, e
 	return strings.TrimSpace(libraryID) != "", nil
 }
 
-func (h *FSHelper) deleteLibraryHeadProjectionRepairOrgIfEmpty(orgID string) error {
-	if strings.TrimSpace(orgID) == "" {
-		return fmt.Errorf("org id is required")
+func (h *FSHelper) deleteLibraryHeadProjectionRepairOrgIfEmpty(marker libraryHeadProjectionRepairOrgRecord) error {
+	if strings.TrimSpace(marker.OrgID) == "" || marker.UpdatedAt.IsZero() {
+		return nil
 	}
 	if h == nil || h.db == nil {
 		return nil
 	}
-	hasPending, err := h.hasPendingLibraryHeadProjectionRepairs(orgID)
+	hasPending, err := h.hasPendingLibraryHeadProjectionRepairs(marker.OrgID)
 	if err != nil {
 		return err
 	}
 	if hasPending {
 		return nil
 	}
-	return h.db.Session().Query(`
-		DELETE FROM library_head_projection_repair_orgs WHERE org_id = ?
-	`, orgID).Exec()
+	applied, err := h.db.Session().Query(`
+		DELETE FROM library_head_projection_repair_orgs_by_bucket WHERE bucket = ? AND org_id = ? IF updated_at = ?
+	`, libraryHeadProjectionRepairOrgBucket, marker.OrgID, marker.UpdatedAt).MapScanCAS(map[string]interface{}{})
+	if err != nil {
+		return err
+	}
+	if !applied {
+		return nil
+	}
+	return nil
 }
 
 func (h *FSHelper) repairLibraryHeadSecondaryProjectionsFromCanonical(orgID, repoID string) error {
@@ -335,41 +370,56 @@ func (h *FSHelper) repairLibraryHeadSecondaryProjectionsFromCanonical(orgID, rep
 	return h.upsertLibraryHeadSecondaryProjections(orgID, repoID, lookupRow.HeadCommitID, projectionRow, nil)
 }
 
-func (h *FSHelper) processPendingLibraryHeadProjectionRepairs(orgID string, limit int) {
-	if strings.TrimSpace(orgID) == "" || h == nil || h.db == nil {
+func (h *FSHelper) processPendingLibraryHeadProjectionRepairsWithMarker(marker libraryHeadProjectionRepairOrgRecord, limit int) {
+	if strings.TrimSpace(marker.OrgID) == "" || h == nil || h.db == nil {
 		return
 	}
-	repairs, err := h.listLibraryHeadProjectionRepairs(orgID, limit)
+	repairs, err := h.listLibraryHeadProjectionRepairs(marker.OrgID, limit)
 	if err != nil {
-		log.Printf("[UpdateLibraryHead] WARNING: failed to list pending projection repairs for org %s: %v", orgID, err)
+		log.Printf("[UpdateLibraryHead] WARNING: failed to list pending projection repairs for org %s: %v", marker.OrgID, err)
 		return
 	}
 	if len(repairs) == 0 {
-		if err := h.deleteLibraryHeadProjectionRepairOrgIfEmpty(orgID); err != nil {
-			log.Printf("[UpdateLibraryHead] WARNING: failed to delete empty projection repair org marker for org=%s: %v", orgID, err)
+		if err := h.deleteLibraryHeadProjectionRepairOrgIfEmpty(marker); err != nil {
+			log.Printf("[UpdateLibraryHead] WARNING: failed to delete empty projection repair org marker for org=%s: %v", marker.OrgID, err)
 		}
 		return
 	}
 	for _, repair := range repairs {
-		if err := h.repairLibraryHeadSecondaryProjectionsFromCanonical(orgID, repair.LibraryID); err != nil {
+		if err := h.repairLibraryHeadSecondaryProjectionsFromCanonical(marker.OrgID, repair.LibraryID); err != nil {
 			if errors.Is(err, gocql.ErrNotFound) {
-				if deleteErr := h.deleteLibraryHeadProjectionRepair(orgID, repair.LibraryID); deleteErr != nil {
-					log.Printf("[UpdateLibraryHead] WARNING: failed to delete orphaned projection repair for org=%s repo=%s: %v", orgID, repair.LibraryID, deleteErr)
+				if deleteErr := h.deleteLibraryHeadProjectionRepair(marker.OrgID, repair.LibraryID); deleteErr != nil {
+					log.Printf("[UpdateLibraryHead] WARNING: failed to delete orphaned projection repair for org=%s repo=%s: %v", marker.OrgID, repair.LibraryID, deleteErr)
 				}
 				continue
 			}
-			if enqueueErr := h.enqueueLibraryHeadProjectionRepair(orgID, repair.LibraryID, repair.CommitID, err); enqueueErr != nil {
-				log.Printf("[UpdateLibraryHead] WARNING: failed to refresh pending projection repair for org=%s repo=%s: %v", orgID, repair.LibraryID, enqueueErr)
+			if enqueueErr := h.enqueueLibraryHeadProjectionRepair(marker.OrgID, repair.LibraryID, repair.CommitID, err); enqueueErr != nil {
+				log.Printf("[UpdateLibraryHead] WARNING: failed to refresh pending projection repair for org=%s repo=%s: %v", marker.OrgID, repair.LibraryID, enqueueErr)
 			}
 			continue
 		}
-		if err := h.deleteLibraryHeadProjectionRepair(orgID, repair.LibraryID); err != nil {
-			log.Printf("[UpdateLibraryHead] WARNING: failed to delete completed projection repair for org=%s repo=%s: %v", orgID, repair.LibraryID, err)
+		if err := h.deleteLibraryHeadProjectionRepair(marker.OrgID, repair.LibraryID); err != nil {
+			log.Printf("[UpdateLibraryHead] WARNING: failed to delete completed projection repair for org=%s repo=%s: %v", marker.OrgID, repair.LibraryID, err)
 		}
 	}
-	if err := h.deleteLibraryHeadProjectionRepairOrgIfEmpty(orgID); err != nil {
-		log.Printf("[UpdateLibraryHead] WARNING: failed to prune completed projection repair org marker for org=%s: %v", orgID, err)
+	if err := h.deleteLibraryHeadProjectionRepairOrgIfEmpty(marker); err != nil {
+		log.Printf("[UpdateLibraryHead] WARNING: failed to prune completed projection repair org marker for org=%s: %v", marker.OrgID, err)
 	}
+}
+
+func (h *FSHelper) processPendingLibraryHeadProjectionRepairs(orgID string, limit int) {
+	if strings.TrimSpace(orgID) == "" || h == nil || h.db == nil {
+		return
+	}
+	marker, ok, err := h.readLibraryHeadProjectionRepairOrgRecord(orgID)
+	if err != nil {
+		log.Printf("[UpdateLibraryHead] WARNING: failed to read projection repair org marker for org %s: %v", orgID, err)
+		return
+	}
+	if !ok {
+		marker = libraryHeadProjectionRepairOrgRecord{OrgID: orgID}
+	}
+	h.processPendingLibraryHeadProjectionRepairsWithMarker(marker, limit)
 }
 
 func (h *FSHelper) ProcessPendingLibraryHeadProjectionRepairs(orgLimit, perOrgLimit int) {
@@ -382,13 +432,13 @@ func (h *FSHelper) ProcessPendingLibraryHeadProjectionRepairs(orgLimit, perOrgLi
 	if perOrgLimit <= 0 {
 		perOrgLimit = libraryHeadProjectionRepairSweepLimit
 	}
-	orgIDs, err := h.listLibraryHeadProjectionRepairOrgs(orgLimit)
+	orgs, err := h.listLibraryHeadProjectionRepairOrgs(orgLimit)
 	if err != nil {
 		log.Printf("[UpdateLibraryHead] WARNING: failed to list projection repair orgs: %v", err)
 		return
 	}
-	for _, orgID := range orgIDs {
-		h.processPendingLibraryHeadProjectionRepairs(orgID, perOrgLimit)
+	for _, org := range orgs {
+		h.processPendingLibraryHeadProjectionRepairsWithMarker(org, perOrgLimit)
 	}
 }
 

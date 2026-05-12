@@ -6,6 +6,7 @@ server:
   read_timeout: 0s         # No full-body read timeout — large uploads can take minutes
   read_header_timeout: 10s # Timeout for reading request headers only (Slowloris protection)
   write_timeout: 0s        # No write timeout — large downloads/zips can take minutes
+  library_head_projection_repair_interval: 30s # Background replay cadence for durable library-head projection repairs
   max_upload_mb: 20480     # 20480 MB (~20 GiB) max upload size
   trusted_proxies: []      # Leave empty to ignore forwarded IP headers; set Docker/nginx proxy CIDRs only if you need real client IPs
   url: ""                 # Optional explicit browser-facing base URL; default Docker dev flow auto-detects from request headers

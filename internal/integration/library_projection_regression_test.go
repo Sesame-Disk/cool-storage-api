@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	v2 "github.com/Sesame-Disk/sesamefs/internal/api/v2"
 	dbpkg "github.com/Sesame-Disk/sesamefs/internal/db"
 	gcpkg "github.com/Sesame-Disk/sesamefs/internal/gc"
 	"github.com/Sesame-Disk/sesamefs/internal/traffic"
@@ -516,10 +517,12 @@ func TestLibraryHeadProjectionRepairWorkerRebuildsLookupAndAdminProjection(t *te
 		t.Fatalf("failed to seed durable projection repair for repo %s: %v", repoID, err)
 	}
 	if err := session.Query(`
-		INSERT INTO library_head_projection_repair_orgs (org_id, updated_at) VALUES (?, ?)
-	`, defaultOrgID, now).Exec(); err != nil {
+		INSERT INTO library_head_projection_repair_orgs_by_bucket (bucket, org_id, updated_at) VALUES (?, ?, ?)
+	`, "pending", defaultOrgID, now).Exec(); err != nil {
 		t.Fatalf("failed to seed repair org marker for repo %s: %v", repoID, err)
 	}
+	repairWorker := v2.NewLibraryHeadProjectionRepairWorker(database, 50*time.Millisecond)
+	t.Cleanup(repairWorker.Stop)
 	t.Cleanup(func() {
 		_ = session.Query(`DELETE FROM library_head_projection_repairs WHERE org_id = ? AND library_id = ?`, defaultOrgID, repoID).Exec()
 	})

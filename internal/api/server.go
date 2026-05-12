@@ -254,7 +254,7 @@ func NewServer(cfg *config.Config, database *db.DB, version string) *Server {
 		shareLinkRateLimiter:   shareLinkRL,
 		zipRateLimiter:         zipRL,
 		apiKeyManager:          apiKeyManager,
-		projectionRepairWorker: v2.NewLibraryHeadProjectionRepairWorker(database, 0),
+		projectionRepairWorker: v2.NewLibraryHeadProjectionRepairWorker(database, cfg.Server.LibraryHeadProjectionRepairInterval),
 		version:                version,
 		router:                 router,
 	}

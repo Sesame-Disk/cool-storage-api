@@ -27,7 +27,7 @@ func TestLibraryHeadProjectionRepairWorkerRunsImmediatelyAndPeriodically(t *test
 	select {
 	case <-callCh:
 	case <-time.After(200 * time.Millisecond):
-		t.Fatal("expected worker to run again on ticker")
+		t.Fatal("expected worker to run again after the configured interval")
 	}
 
 	if got := atomic.LoadInt32(&calls); got < 2 {

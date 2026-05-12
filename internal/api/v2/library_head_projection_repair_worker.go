@@ -8,7 +8,7 @@ import (
 )
 
 const (
-	defaultLibraryHeadProjectionRepairWorkerInterval    = time.Second
+	defaultLibraryHeadProjectionRepairWorkerInterval    = 30 * time.Second
 	defaultLibraryHeadProjectionRepairWorkerOrgLimit    = 16
 	defaultLibraryHeadProjectionRepairWorkerPerOrgLimit = 8
 )
@@ -50,19 +50,21 @@ func newLibraryHeadProjectionRepairWorker(interval time.Duration, process func()
 
 func (w *LibraryHeadProjectionRepairWorker) loop() {
 	defer close(w.doneCh)
-	if w.process != nil {
-		w.process()
-	}
-	ticker := time.NewTicker(w.interval)
-	defer ticker.Stop()
 	for {
+		if w.process != nil {
+			w.process()
+		}
+		timer := time.NewTimer(w.interval)
 		select {
 		case <-w.stopCh:
-			return
-		case <-ticker.C:
-			if w.process != nil {
-				w.process()
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
 			}
+			return
+		case <-timer.C:
 		}
 	}
 }

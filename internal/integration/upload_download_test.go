@@ -13,9 +13,11 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	api "github.com/Sesame-Disk/sesamefs/internal/api"
 )
 
-const chunkedPreflushIntegrationBlockSize = 8 * 1024 * 1024
+const chunkedPreflushIntegrationBlockSize = api.UploadBlockSize
 
 func uploadFileThroughLink(t *testing.T, c *testClient, uploadURL, fileName, parentDir, content string) {
 	t.Helper()

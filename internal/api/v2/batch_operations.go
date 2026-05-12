@@ -326,6 +326,9 @@ func (h *BatchOperationHandler) processSingleItem(orgID, userID, srcRepoID, dstR
 	if len(conflictPolicy) > 0 {
 		policy = conflictPolicy[0]
 	}
+	if opType == "move" && srcRepoID == dstRepoID {
+		return h.moveSingleItemWithinRepo(orgID, userID, srcRepoID, srcPath, dstDir, fsHelper, policy)
+	}
 	log.Printf("[processSingleItem] %s: src_repo=%s src_path=%s dst_repo=%s dst_dir=%s",
 		opType, srcRepoID, srcPath, dstRepoID, dstDir)
 
@@ -587,6 +590,117 @@ func (h *BatchOperationHandler) processSingleItem(orgID, userID, srcRepoID, dstR
 		go CleanupFileTagsByPath(h.db, srcRepoID, srcPath)
 	}
 
+	return nil
+}
+
+func (h *BatchOperationHandler) moveSingleItemWithinRepo(orgID, userID, repoID, srcPath, dstDir string, fsHelper *FSHelper, policy string) error {
+	log.Printf("[processSingleItem] move: repo=%s src_path=%s dst_dir=%s", repoID, srcPath, dstDir)
+
+	headCommitID, err := fsHelper.GetHeadCommitID(repoID)
+	if err != nil {
+		return fmt.Errorf("source library not found: %w", err)
+	}
+
+	srcResult, err := fsHelper.TraverseToPath(repoID, srcPath)
+	if err != nil {
+		return fmt.Errorf("source path not found: %w", err)
+	}
+	if srcResult.TargetEntry == nil {
+		return fmt.Errorf("source item not found")
+	}
+
+	itemName := path.Base(srcPath)
+	srcParentPath := path.Dir(srcPath)
+	if srcParentPath == "." {
+		srcParentPath = "/"
+	}
+	if srcParentPath == dstDir {
+		return nil
+	}
+
+	newSrcParentFSID, err := fsHelper.CreateDirectoryFSObject(repoID, RemoveEntryFromList(srcResult.Entries, itemName))
+	if err != nil {
+		return fmt.Errorf("failed to update source directory: %w", err)
+	}
+
+	intermediateRootFSID := newSrcParentFSID
+	if srcParentPath != "/" {
+		intermediateRootFSID, err = fsHelper.RebuildPathToRoot(repoID, srcResult, newSrcParentFSID)
+		if err != nil {
+			return fmt.Errorf("failed to rebuild source path: %w", err)
+		}
+	}
+
+	dstResult, err := fsHelper.TraverseToPathFromRoot(repoID, intermediateRootFSID, dstDir)
+	if err != nil {
+		return fmt.Errorf("destination path not found: %w", err)
+	}
+
+	var dstEntries []FSEntry
+	if dstDir == "/" {
+		dstEntries = dstResult.Entries
+	} else {
+		if dstResult.TargetFSID == "" {
+			return fmt.Errorf("destination directory not found")
+		}
+		dstEntries, err = fsHelper.GetDirectoryEntries(repoID, dstResult.TargetFSID)
+		if err != nil {
+			return fmt.Errorf("failed to read destination directory: %w", err)
+		}
+	}
+
+	if FindEntryInList(dstEntries, itemName) != nil {
+		switch policy {
+		case "replace":
+			dstEntries = RemoveEntryFromList(dstEntries, itemName)
+		case "autorename":
+			itemName = GenerateUniqueName(dstEntries, itemName)
+		case "skip":
+			return nil
+		default:
+			return &ConflictError{ItemName: itemName}
+		}
+	}
+
+	movedEntry := *srcResult.TargetEntry
+	movedEntry.Name = itemName
+	movedEntry.MTime = time.Now().Unix()
+	newDstDirFSID, err := fsHelper.CreateDirectoryFSObject(repoID, AddEntryToList(dstEntries, movedEntry))
+	if err != nil {
+		return fmt.Errorf("failed to update destination directory: %w", err)
+	}
+
+	finalRootFSID := newDstDirFSID
+	if dstDir != "/" {
+		dstDirName := path.Base(dstDir)
+		updatedParentEntries := make([]FSEntry, len(dstResult.Entries))
+		copy(updatedParentEntries, dstResult.Entries)
+		for i := range updatedParentEntries {
+			if updatedParentEntries[i].Name == dstDirName {
+				updatedParentEntries[i].ID = newDstDirFSID
+				break
+			}
+		}
+
+		newParentFSID, err := fsHelper.CreateDirectoryFSObject(repoID, updatedParentEntries)
+		if err != nil {
+			return fmt.Errorf("failed to update destination parent: %w", err)
+		}
+
+		finalRootFSID, err = fsHelper.RebuildPathToRoot(repoID, dstResult, newParentFSID)
+		if err != nil {
+			return fmt.Errorf("failed to rebuild destination path: %w", err)
+		}
+	}
+
+	newCommitID, err := fsHelper.CreateCommit(repoID, userID, finalRootFSID, headCommitID, fmt.Sprintf("Moved \"%s\"", itemName))
+	if err != nil {
+		return fmt.Errorf("failed to create destination commit: %w", err)
+	}
+	if err := fsHelper.UpdateLibraryHead(orgID, repoID, newCommitID); err != nil {
+		return fmt.Errorf("failed to update destination library: %w", err)
+	}
+	go CleanupFileTagsByPath(h.db, repoID, srcPath)
 	return nil
 }
 

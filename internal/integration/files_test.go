@@ -170,6 +170,57 @@ func TestFileMoveAndCopy(t *testing.T) {
 	})
 }
 
+func TestSyncBatchMoveAutorenameWithinRepo(t *testing.T) {
+	name := fmt.Sprintf("inttest-batch-move-autorename-%d", time.Now().UnixNano())
+	repoID := createTestLibrary(t, adminClient, name)
+
+	resp := adminClient.PostJSON(t, fmt.Sprintf("/api/v2.1/repos/%s/dir/?p=/a", repoID), map[string]string{})
+	expectStatus(t, resp, http.StatusCreated)
+	resp.Body.Close()
+
+	createResp := adminClient.PostForm(t, fmt.Sprintf("/api2/repos/%s/file/?p=/mv-rename-src.md&operation=create", repoID), url.Values{})
+	if createResp.StatusCode != http.StatusCreated && createResp.StatusCode != http.StatusOK {
+		t.Fatalf("failed to create root source file, got %d", createResp.StatusCode)
+	}
+	createResp.Body.Close()
+
+	createResp = adminClient.PostForm(t, fmt.Sprintf("/api2/repos/%s/file/?p=/a/mv-rename-src.md&operation=create", repoID), url.Values{})
+	if createResp.StatusCode != http.StatusCreated && createResp.StatusCode != http.StatusOK {
+		t.Fatalf("failed to create destination conflict file, got %d", createResp.StatusCode)
+	}
+	createResp.Body.Close()
+
+	moveResp := adminClient.PostJSON(t, "/api/v2.1/repos/sync-batch-move-item/", map[string]interface{}{
+		"src_repo_id":     repoID,
+		"src_parent_dir":  "/",
+		"dst_repo_id":     repoID,
+		"dst_parent_dir":  "/a",
+		"src_dirents":     []string{"mv-rename-src.md"},
+		"conflict_policy": "autorename",
+	})
+	expectStatus(t, moveResp, http.StatusOK)
+	moveResp.Body.Close()
+
+	rootResp := adminClient.Get(t, fmt.Sprintf("/api/v2.1/repos/%s/dir/?p=/", repoID))
+	expectStatus(t, rootResp, http.StatusOK)
+	rootList := responseJSON(t, rootResp)
+	rootEntries, _ := rootList["dirent_list"].([]interface{})
+	if containsEntry(rootEntries, "name", "mv-rename-src.md") {
+		t.Fatal("source file still present at root after autorename move")
+	}
+
+	dstResp := adminClient.Get(t, fmt.Sprintf("/api/v2.1/repos/%s/dir/?p=/a", repoID))
+	expectStatus(t, dstResp, http.StatusOK)
+	dstList := responseJSON(t, dstResp)
+	dstEntries, _ := dstList["dirent_list"].([]interface{})
+	if !containsEntry(dstEntries, "name", "mv-rename-src.md") {
+		t.Fatal("original destination file missing after autorename move")
+	}
+	if !containsEntry(dstEntries, "name", "mv-rename-src (1).md") {
+		t.Fatal("renamed destination file missing after autorename move")
+	}
+}
+
 func TestFileDelete(t *testing.T) {
 	name := fmt.Sprintf("inttest-filedelete-%d", time.Now().UnixNano())
 	repoID := createTestLibrary(t, adminClient, name)
@@ -439,4 +490,3 @@ func TestBatchDeleteItems_DecrementsBlockRefCount(t *testing.T) {
 		t.Fatalf("ref_count after batch deletion = %d, want 0 (so GC can collect it) - possible storage leak", refCount)
 	}
 }
-

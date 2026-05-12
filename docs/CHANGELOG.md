@@ -32,19 +32,30 @@ Session-by-session development history for SesameFS.
   - persists failed secondary projection repairs in a durable queue and
     replays them from canonical library state without rebuilding partial
     `libraries_by_id` rows
-  - tracks orgs with pending projection repairs so periodic replay can drain
-    the durable queue without scanning the full repair table
+  - tracks orgs with pending projection repairs through a bucketed queue index
+    and prunes markers with a CAS check so concurrent enqueues are not hidden
   - logs when block promotion waits on a GC deletion sentinel
 
 - `internal/api/server.go`
   - starts and stops a dedicated library head projection repair worker with
     the HTTP server lifecycle so queued repairs continue replaying even when
     no new write lands in the same org
+  - reads the repair worker cadence from YAML/config instead of hardcoding a
+    1-second interval
+
+- `internal/api/v2/batch_operations.go`
+  - handles same-repo batch moves in one tree rewrite so `conflict_policy=
+    autorename` no longer leaves the source removed while clobbering the
+    destination state
 
 - `internal/integration/library_projection_regression_test.go`
   - adds a regression that seeds a durable repair after corrupting
     `libraries_by_id` and admin projection rows, then waits for automatic
     rebuild from canonical state
+
+- `internal/integration/files_test.go`
+  - adds a regression for same-repo `sync-batch-move-item` with
+    `conflict_policy=autorename`
 
 - `internal/api/*_test.go`
   - adds regression coverage for chunked quota, scoped upload paths,
@@ -56,6 +67,7 @@ Session-by-session development history for SesameFS.
 - `go test ./internal/api ./internal/api/v2 ./internal/traffic ./internal/db ./internal/gc -count=1`
 - `go test ./internal/api/v2 ./internal/api -count=1`
 - `go test -tags integration ./internal/integration -run '^$' -count=1`
+- `go test -tags integration ./internal/integration -run '^TestSyncBatchMoveAutorenameWithinRepo$' -count=1`
 
 ---
 

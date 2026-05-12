@@ -8,6 +8,7 @@ server:
   read_timeout: 0s
   read_header_timeout: 10s
   write_timeout: 0s
+  library_head_projection_repair_interval: 30s
   max_upload_mb: 10240
   trusted_proxies: []
   url: ""

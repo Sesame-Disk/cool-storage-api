@@ -11,6 +11,7 @@ server:
   read_timeout: 0s         # No full-body read timeout — large uploads can take minutes
   read_header_timeout: 10s # Timeout for reading request headers only (Slowloris protection)
   write_timeout: 0s        # No write timeout — large downloads/zips can take minutes
+  library_head_projection_repair_interval: 30s # Background replay cadence for durable library-head projection repairs
   max_upload_mb: 10240     # 10240 MB (~10 GiB) max upload size
   trusted_proxies: []      # Secure default: trust no forwarded client IP headers; set exact reverse-proxy IP/CIDRs in prod
   url: ""                 # Optional explicit public base URL; usually override via SERVER_URL when proxy autodetection is insufficient

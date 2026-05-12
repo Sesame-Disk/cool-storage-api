@@ -171,3 +171,14 @@ func TestUploadStagingMigrationContainsSessionTables(t *testing.T) {
 	assert.Contains(t, content, "claimed_at    TIMESTAMP")
 	assert.Contains(t, content, "applied_at    TIMESTAMP")
 }
+
+func TestLibraryHeadProjectionRepairMigrationContainsBucketedOrgIndex(t *testing.T) {
+	raw, err := migrationsFS.ReadFile("migrations/004_library_head_projection_repairs.cql")
+	require.NoError(t, err)
+	content := string(raw)
+
+	assert.Contains(t, content, "CREATE TABLE IF NOT EXISTS library_head_projection_repairs")
+	assert.Contains(t, content, "CREATE TABLE IF NOT EXISTS library_head_projection_repair_orgs_by_bucket")
+	assert.Contains(t, content, "PRIMARY KEY ((bucket), org_id)")
+	assert.NotContains(t, content, "CREATE TABLE IF NOT EXISTS library_head_projection_repair_orgs (")
+}

@@ -2105,6 +2105,9 @@ func (h *SeafHTTPHandler) resolveLibraryObjectStore(hostname, orgID, repoID stri
 // 8 MB matches Seafile's default CDC block size for good deduplication compatibility.
 const uploadBlockSize = 8 * 1024 * 1024 // 8 MB
 
+// UploadBlockSize exposes the live upload/promotion block size for integration tests.
+const UploadBlockSize = uploadBlockSize
+
 // finalizeUploadConcurrency caps the number of S3 PUTs running in parallel
 // during finalization of a chunked upload. The reader is sequential (one block
 // at a time from the temp file); only the per-block work (encrypt + S3 PUT +
