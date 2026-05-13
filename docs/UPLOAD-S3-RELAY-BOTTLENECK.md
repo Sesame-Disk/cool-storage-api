@@ -3,7 +3,7 @@
 **Status:** Pre-production blocker
 **Scope:** Web UI uploads (`@seafile/resumablejs` → `/seafhttp/upload-api/{token}`)
 **Author:** Architecture review, 2026-05-08
-**Related docs:** [UPLOAD-DOWNLOAD-ANALYSIS.md](./UPLOAD-DOWNLOAD-ANALYSIS.md), [diagrams/upload-download-flow.md](./diagrams/upload-download-flow.md)
+**Related docs:** [UPLOAD-DOWNLOAD-ANALYSIS.md](./UPLOAD-DOWNLOAD-ANALYSIS.md), [diagrams/upload-download-flow.md](./diagrams/upload-download-flow.md), [UPLOAD-PERFORMANCE-PR58-AUDIT.md](./UPLOAD-PERFORMANCE-PR58-AUDIT.md)
 
 ---
 

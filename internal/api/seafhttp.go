@@ -1017,10 +1017,11 @@ type uploadBlockMetadataLoaderFunc func(orgID, blockID string) (uploadBlockMetad
 type uploadCleanupSweepFunc func(orgID string, limit int)
 
 const (
-	defaultZipMaxEntries     = 100000
-	defaultZipMaxDepth       = 64
-	defaultZipMaxBytes       = 10 * 1024 * 1024 * 1024 // 10 GiB of uncompressed file content
-	uploadRecoveryBatchLimit = 8
+	defaultZipMaxEntries      = 100000
+	defaultZipMaxDepth        = 64
+	defaultZipMaxBytes        = 10 * 1024 * 1024 * 1024 // 10 GiB of uncompressed file content
+	uploadRecoveryBatchLimit  = 8
+	uploadHeadConflictRetries = 3
 )
 
 type zipLimitError struct {
@@ -1894,6 +1895,35 @@ func (h *SeafHTTPHandler) publishPreparedUpload(orgID, repoID, uploadID string, 
 	}
 
 	return nil
+}
+
+func (h *SeafHTTPHandler) publishPreparedUploadWithHeadRetry(orgID, repoID, uploadID string, prepared preparedUploadCommit, blocks []uploadBlockPromotion, persistPrepared func(preparedUploadCommit) error, reprepare func() (preparedUploadCommit, error)) (preparedUploadCommit, error) {
+	current := prepared
+	for attempt := 0; ; attempt++ {
+		if persistPrepared != nil {
+			if err := persistPrepared(current); err != nil {
+				return preparedUploadCommit{}, err
+			}
+		}
+
+		err := h.publishPreparedUpload(orgID, repoID, uploadID, current, blocks)
+		if err == nil {
+			return current, nil
+		}
+		if !v2.IsLibraryHeadConflict(err) || reprepare == nil || attempt >= uploadHeadConflictRetries {
+			return preparedUploadCommit{}, err
+		}
+
+		next, prepErr := reprepare()
+		if prepErr != nil {
+			return preparedUploadCommit{}, fmt.Errorf("reprepare upload after head conflict: %w", prepErr)
+		}
+		if strings.TrimSpace(next.CommitID) == "" {
+			return preparedUploadCommit{}, fmt.Errorf("reprepare upload after head conflict returned empty commit")
+		}
+		log.Printf("[HandleUpload] Retrying upload publish after head conflict org=%s repo=%s upload=%s old_commit=%s new_commit=%s", orgID, repoID, shortLogID(uploadID), shortLogID(current.CommitID), shortLogID(next.CommitID))
+		current = next
+	}
 }
 
 func uploadPromotionOperationKey(orgID, uploadID, commitID string, blockIndex int, claimedAt time.Time) string {
@@ -2782,31 +2812,7 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 			return
 		}
 	}
-	if h.uploadStaging != nil {
-		now := time.Now().UTC()
-		if err := h.uploadStaging.UpsertSession(UploadSessionRecord{
-			UploadID:       uploadID,
-			OrgID:          token.OrgID,
-			RepoID:         token.RepoID,
-			UserID:         token.UserID,
-			TokenID:        tokenStr,
-			ParentDir:      parentDir,
-			Filename:       filename,
-			ActualFilename: actualFilename,
-			CommitID:       commitID,
-			TotalSize:      finalSize,
-			State:          UploadSessionStatePromoting,
-			CreatedAt:      singleShotCreatedAt,
-			UpdatedAt:      now,
-			ExpiresAt:      now.Add(chunkDiskTTL),
-		}); err != nil {
-			log.Printf("[HandleUpload] Failed to persist prepared upload state: %v", err)
-			markSingleShotCleanup(err)
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to persist upload state"})
-			return
-		}
-	}
-	if err := h.publishPreparedUpload(token.OrgID, token.RepoID, uploadID, preparedUploadCommit{
+	publishedPrepared, err := h.publishPreparedUploadWithHeadRetry(token.OrgID, token.RepoID, uploadID, preparedUploadCommit{
 		CommitID:       commitID,
 		ActualFilename: actualFilename,
 		ExpectedHead:   expectedHead,
@@ -2820,12 +2826,42 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 		Source:       blockSource,
 		CreatedAt:    singleShotCreatedAt,
 		UploadedAt:   singleShotUploadedAt,
-	}}); err != nil {
+	}}, func(current preparedUploadCommit) error {
+		if h.uploadStaging == nil {
+			return nil
+		}
+		now := time.Now().UTC()
+		return h.uploadStaging.UpsertSession(UploadSessionRecord{
+			UploadID:       uploadID,
+			OrgID:          token.OrgID,
+			RepoID:         token.RepoID,
+			UserID:         token.UserID,
+			TokenID:        tokenStr,
+			ParentDir:      parentDir,
+			Filename:       filename,
+			ActualFilename: current.ActualFilename,
+			CommitID:       current.CommitID,
+			TotalSize:      finalSize,
+			State:          UploadSessionStatePromoting,
+			CreatedAt:      singleShotCreatedAt,
+			UpdatedAt:      now,
+			ExpiresAt:      now.Add(chunkDiskTTL),
+		})
+	}, func() (preparedUploadCommit, error) {
+		nextCommitID, nextActualFilename, nextExpectedHead, prepErr := h.prepareUploadedFileCommit(token.OrgID, token.RepoID, token.UserID, parentDir, filename, fileID, chunkData, finalSize, replaceFile)
+		if prepErr != nil {
+			return preparedUploadCommit{}, prepErr
+		}
+		return preparedUploadCommit{CommitID: nextCommitID, ActualFilename: nextActualFilename, ExpectedHead: nextExpectedHead}, nil
+	})
+	if err != nil {
 		log.Printf("[HandleUpload] Failed to publish filesystem update: %v", err)
 		markSingleShotCleanup(err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "file stored but metadata update failed"})
 		return
 	}
+	commitID = publishedPrepared.CommitID
+	actualFilename = publishedPrepared.ActualFilename
 	log.Printf("[HandleUpload] Filesystem updated, commit=%s", commitID)
 	if h.uploadStaging != nil {
 		now := time.Now().UTC()
@@ -3104,9 +3140,16 @@ readLoop:
 			return finalizeUploadResult{}, fmt.Errorf("failed to update filesystem metadata: %w", err)
 		}
 	}
-	if h.uploadStaging != nil {
+	publishedPrepared, err := h.publishPreparedUploadWithHeadRetry(token.OrgID, token.RepoID, uploadID, preparedUploadCommit{
+		CommitID:       commitID,
+		ActualFilename: actualFilename,
+		ExpectedHead:   expectedHead,
+	}, pendingPromotions, func(current preparedUploadCommit) error {
+		if h.uploadStaging == nil {
+			return nil
+		}
 		now := time.Now().UTC()
-		if err := h.uploadStaging.UpsertSession(UploadSessionRecord{
+		return h.uploadStaging.UpsertSession(UploadSessionRecord{
 			UploadID:       uploadID,
 			OrgID:          token.OrgID,
 			RepoID:         token.RepoID,
@@ -3114,24 +3157,26 @@ readLoop:
 			TokenID:        token.Token,
 			ParentDir:      parentDir,
 			Filename:       filename,
-			ActualFilename: actualFilename,
-			CommitID:       commitID,
+			ActualFilename: current.ActualFilename,
+			CommitID:       current.CommitID,
 			TotalSize:      totalSize,
 			State:          UploadSessionStatePromoting,
 			CreatedAt:      upload.CreatedAt.UTC(),
 			UpdatedAt:      now,
 			ExpiresAt:      now.Add(chunkDiskTTL),
-		}); err != nil {
-			return finalizeUploadResult{}, fmt.Errorf("failed to persist prepared upload state: %w", err)
+		})
+	}, func() (preparedUploadCommit, error) {
+		nextCommitID, nextActualFilename, nextExpectedHead, prepErr := h.prepareUploadedFileCommitMultiBlock(token.OrgID, token.RepoID, token.UserID, parentDir, filename, fileID, blockSHA1IDs, totalSize, replace)
+		if prepErr != nil {
+			return preparedUploadCommit{}, prepErr
 		}
-	}
-	if err := h.publishPreparedUpload(token.OrgID, token.RepoID, uploadID, preparedUploadCommit{
-		CommitID:       commitID,
-		ActualFilename: actualFilename,
-		ExpectedHead:   expectedHead,
-	}, pendingPromotions); err != nil {
+		return preparedUploadCommit{CommitID: nextCommitID, ActualFilename: nextActualFilename, ExpectedHead: nextExpectedHead}, nil
+	})
+	if err != nil {
 		return finalizeUploadResult{}, fmt.Errorf("failed to publish filesystem metadata: %w", err)
 	}
+	commitID = publishedPrepared.CommitID
+	actualFilename = publishedPrepared.ActualFilename
 	log.Printf("[finalizeUploadStreaming] Filesystem updated, commit=%s", commitID)
 
 	return finalizeUploadResult{FileID: fileID, ActualFilename: actualFilename, CommitID: commitID}, nil

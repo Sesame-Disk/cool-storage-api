@@ -13,11 +13,146 @@ TOKEN=""
 REPO=""
 SIZES="1 10 100"      # MB
 CONCURRENCY="1 4 8"
+CONCURRENT_SIZE_MB=""
+CONCURRENT_MAX_TIME="300"
 INSECURE=""
+STATS_INTERVAL=""
+STATS_FILTER='(^|-)sesamefs(-[0-9]+)?$|(^|-)minio(-[0-9]+)?$|(^|-)cassandra(-[0-9]+)?$'
+STATS_LOG=""
+STATS_PID=""
 
 usage() {
   echo "benchmark-upload-download.sh"
-  echo "Usage: $0 --host URL --token TOKEN --repo REPO [--sizes '1 10 100'] [--concurrency '1 4 8'] [-k]"
+  echo "Usage: $0 --host URL --token TOKEN --repo REPO [--sizes '1 10 100'] [--concurrency '1 4 8'] [--concurrent-size 32] [--concurrent-max-time 300] [--stats-interval 2] [--stats-filter 'sesamefs|minio|cassandra'] [--stats-log path.csv] [-k]"
+}
+
+docker_stats_available() {
+  command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1
+}
+
+capture_stats_sample() {
+  timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+  docker stats --no-stream --format '{{.Name}},{{.CPUPerc}},{{.MemUsage}},{{.MemPerc}},{{.NetIO}}' 2>/dev/null |
+    awk -F',' -v ts="$timestamp" -v filter="$STATS_FILTER" '
+      filter == "" || $1 ~ filter {
+        print ts "," $0
+      }
+    ' >> "$STATS_LOG"
+}
+
+start_stats_sampler() {
+  [ -n "$STATS_INTERVAL" ] || return 0
+
+  if ! docker_stats_available; then
+    echo
+    echo "--- Resource Sampling ---"
+    echo "  docker stats not available; skipping periodic CPU/RAM sampling"
+    return 0
+  fi
+
+  cat > "$STATS_LOG" <<'EOF'
+timestamp,name,cpu_perc,mem_usage,mem_perc,net_io
+EOF
+
+  capture_stats_sample
+
+  (
+    while :; do
+      sleep "$STATS_INTERVAL"
+      capture_stats_sample
+    done
+  ) &
+  STATS_PID=$!
+
+  echo
+  echo "--- Resource Sampling ---"
+  echo "  interval: ${STATS_INTERVAL}s"
+  if [ -n "$STATS_FILTER" ]; then
+    echo "  filter:   $STATS_FILTER"
+  else
+    echo "  filter:   <all containers>"
+  fi
+  echo "  log:      $STATS_LOG"
+}
+
+stop_stats_sampler() {
+  [ -n "$STATS_PID" ] || return 0
+  kill "$STATS_PID" 2>/dev/null || true
+  wait "$STATS_PID" 2>/dev/null || true
+  STATS_PID=""
+}
+
+print_stats_summary() {
+  [ -s "$STATS_LOG" ] || return 0
+
+  echo
+  echo "--- Peak Container Resource Usage ---"
+  awk -F',' '
+    function trim(value) {
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+      return value
+    }
+
+    function parse_percent(value) {
+      value = trim(value)
+      sub(/%$/, "", value)
+      return value + 0
+    }
+
+    function parse_bytes(value, normalized, number, unit) {
+      normalized = trim(value)
+      gsub(/ /, "", normalized)
+      if (normalized == "" || normalized == "--") {
+        return 0
+      }
+      if (match(normalized, /^([0-9.]+)([A-Za-z]+)$/, parts) == 0) {
+        return normalized + 0
+      }
+      number = parts[1] + 0
+      unit = parts[2]
+      if (unit == "B") return number
+      if (unit == "kB") return number * 1000
+      if (unit == "MB") return number * 1000 * 1000
+      if (unit == "GB") return number * 1000 * 1000 * 1000
+      if (unit == "TB") return number * 1000 * 1000 * 1000 * 1000
+      if (unit == "KiB") return number * 1024
+      if (unit == "MiB") return number * 1024 * 1024
+      if (unit == "GiB") return number * 1024 * 1024 * 1024
+      if (unit == "TiB") return number * 1024 * 1024 * 1024 * 1024
+      return number
+    }
+
+    function format_bytes(value) {
+      if (value >= 1024 * 1024 * 1024) return sprintf("%.1f GiB", value / (1024 * 1024 * 1024))
+      if (value >= 1024 * 1024) return sprintf("%.1f MiB", value / (1024 * 1024))
+      if (value >= 1024) return sprintf("%.1f KiB", value / 1024)
+      return sprintf("%.0f B", value)
+    }
+
+    NR == 1 { next }
+
+    {
+      name = trim($2)
+      cpu = parse_percent($3)
+      split($4, mem_parts, "/")
+      mem_bytes = parse_bytes(mem_parts[1])
+      mem_perc = parse_percent($5)
+      net_io = trim($6)
+
+      seen[name] = 1
+      if (!(name in peak_cpu) || cpu > peak_cpu[name]) peak_cpu[name] = cpu
+      if (!(name in peak_mem) || mem_bytes > peak_mem[name]) peak_mem[name] = mem_bytes
+      if (!(name in peak_mem_perc) || mem_perc > peak_mem_perc[name]) peak_mem_perc[name] = mem_perc
+      last_net[name] = net_io
+    }
+
+    END {
+      printf "  %-30s %10s %14s %10s %20s\n", "container", "peak cpu", "peak mem", "peak mem%", "last net io"
+      for (name in seen) {
+        printf "  %-30s %9.2f%% %14s %9.2f%% %20s\n", name, peak_cpu[name], format_bytes(peak_mem[name]), peak_mem_perc[name], last_net[name]
+      }
+    }
+  ' "$STATS_LOG"
 }
 
 while [ $# -gt 0 ]; do
@@ -27,6 +162,11 @@ while [ $# -gt 0 ]; do
     --repo)        REPO="${2:-}"; shift 2 ;;
     --sizes)       SIZES="${2:-}"; shift 2 ;;
     --concurrency) CONCURRENCY="${2:-}"; shift 2 ;;
+    --concurrent-size) CONCURRENT_SIZE_MB="${2:-}"; shift 2 ;;
+    --concurrent-max-time) CONCURRENT_MAX_TIME="${2:-}"; shift 2 ;;
+    --stats-interval) STATS_INTERVAL="${2:-}"; shift 2 ;;
+    --stats-filter) STATS_FILTER="${2:-}"; shift 2 ;;
+    --stats-log)   STATS_LOG="${2:-}"; shift 2 ;;
     -k)            INSECURE="-k"; shift ;;
     -h)            usage; exit 0 ;;
     *)             echo "Unknown: $1"; usage; exit 2 ;;
@@ -48,12 +188,44 @@ echo " Repo: $REPO"
 echo "=========================================="
 
 TMPDIR=$(mktemp -d)
-trap "rm -rf $TMPDIR" EXIT
+STATS_LOG="${STATS_LOG:-$TMPDIR/docker-stats.csv}"
+trap 'stop_stats_sampler; rm -rf "$TMPDIR"' EXIT
+
+if [ -n "$STATS_INTERVAL" ]; then
+  case "$STATS_INTERVAL" in
+    ''|*[!0-9.]*)
+      echo "Invalid --stats-interval: $STATS_INTERVAL" >&2
+      exit 2
+      ;;
+  esac
+fi
+
+if [ -z "$CONCURRENT_SIZE_MB" ]; then
+  set -- $SIZES
+  CONCURRENT_SIZE_MB="${1:-1}"
+fi
+
+case "$CONCURRENT_SIZE_MB" in
+  ''|*[!0-9]*)
+    echo "Invalid --concurrent-size: $CONCURRENT_SIZE_MB" >&2
+    exit 2
+    ;;
+esac
+
+case "$CONCURRENT_MAX_TIME" in
+  ''|*[!0-9]*)
+    echo "Invalid --concurrent-max-time: $CONCURRENT_MAX_TIME" >&2
+    exit 2
+    ;;
+esac
 
 # Generate test files
 for size in $SIZES; do
   dd if=/dev/urandom of="$TMPDIR/test_${size}mb.bin" bs=1M count="$size" 2>/dev/null
 done
+[ -f "$TMPDIR/test_${CONCURRENT_SIZE_MB}mb.bin" ] || dd if=/dev/urandom of="$TMPDIR/test_${CONCURRENT_SIZE_MB}mb.bin" bs=1M count="$CONCURRENT_SIZE_MB" 2>/dev/null
+
+start_stats_sampler
 
 # --- Single-file upload ---
 echo
@@ -119,10 +291,9 @@ done
 
 # --- Concurrent uploads ---
 echo
-echo "--- Concurrent 1MB Uploads ---"
+echo "--- Concurrent ${CONCURRENT_SIZE_MB}MB Uploads ---"
 for conc in $CONCURRENCY; do
-  file="$TMPDIR/test_1mb.bin"
-  [ -f "$file" ] || dd if=/dev/urandom of="$file" bs=1M count=1 2>/dev/null
+  file="$TMPDIR/test_${CONCURRENT_SIZE_MB}mb.bin"
 
   start=$(date +%s%N)
   pids=()
@@ -133,10 +304,10 @@ for conc in $CONCURRENCY; do
       curl -sS $INSECURE -o /dev/null \
         -X POST "$link" \
         "${AUTH[@]}" \
-        -F "file=@$file;filename=conc_${i}.bin" \
+        -F "file=@$file;filename=conc_${CONCURRENT_SIZE_MB}mb_${i}.bin" \
         -F "parent_dir=/" \
         -F "replace=1" \
-        --max-time 60 2>/dev/null
+        --max-time "$CONCURRENT_MAX_TIME" 2>/dev/null
     ) &
     pids+=($!)
   done
@@ -145,7 +316,7 @@ for conc in $CONCURRENCY; do
 
   ms=$(( (end - start) / 1000000 ))
   if [ "$ms" -gt 0 ]; then
-    mbps=$(calc "$conc * 8000 / $ms")
+    mbps=$(calc "$conc * $CONCURRENT_SIZE_MB * 8000 / $ms")
   else
     mbps="inf"
   fi
@@ -155,20 +326,20 @@ done
 
 # --- Concurrent downloads ---
 echo
-echo "--- Concurrent 1MB Downloads ---"
+echo "--- Concurrent ${CONCURRENT_SIZE_MB}MB Downloads ---"
 for conc in $CONCURRENCY; do
   link=$(curl -sS $INSECURE "${AUTH[@]}" \
-    "$HOST/api2/repos/$REPO/file/?p=/bench_1mb.bin&reuse=1" 2>/dev/null | tr -d '"')
+    "$HOST/api2/repos/$REPO/file/?p=/bench_${CONCURRENT_SIZE_MB}mb.bin&reuse=1" 2>/dev/null | tr -d '"')
 
   if [ -z "$link" ] || echo "$link" | grep -q error; then
-    echo "  SKIP: bench_1mb.bin not found"
+    echo "  SKIP: bench_${CONCURRENT_SIZE_MB}mb.bin not found"
     break
   fi
 
   start=$(date +%s%N)
   pids=()
   for i in $(seq 1 "$conc"); do
-    curl -sS $INSECURE -o /dev/null "$link" --max-time 60 2>/dev/null &
+    curl -sS $INSECURE -o /dev/null "$link" --max-time "$CONCURRENT_MAX_TIME" 2>/dev/null &
     pids+=($!)
   done
   for pid in "${pids[@]}"; do wait "$pid" 2>/dev/null || true; done
@@ -176,7 +347,7 @@ for conc in $CONCURRENCY; do
 
   ms=$(( (end - start) / 1000000 ))
   if [ "$ms" -gt 0 ]; then
-    mbps=$(calc "$conc * 8000 / $ms")
+    mbps=$(calc "$conc * $CONCURRENT_SIZE_MB * 8000 / $ms")
   else
     mbps="inf"
   fi
@@ -188,3 +359,10 @@ echo
 echo "=========================================="
 echo " Benchmark Complete"
 echo "=========================================="
+
+print_stats_summary
+
+if [ -s "$STATS_LOG" ]; then
+  echo
+  echo "docker stats log saved to: $STATS_LOG"
+fi

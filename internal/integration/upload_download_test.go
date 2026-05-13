@@ -11,6 +11,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -92,6 +93,66 @@ func uploadChunkThroughLink(t *testing.T, c *testClient, uploadURL, fileName, pa
 		body, _ := io.ReadAll(resp.Body)
 		t.Fatalf("chunk upload failed with status %d: %s", resp.StatusCode, string(body))
 	}
+}
+
+type uploadChunkHTTPResult struct {
+	status int
+	body   string
+}
+
+func uploadChunkWithResultThroughLink(c *testClient, uploadURL, fileName, parentDir string, chunk []byte, start, end, total int) (uploadChunkHTTPResult, error) {
+	var buf bytes.Buffer
+	writer := multipart.NewWriter(&buf)
+	part, err := writer.CreateFormFile("file", fileName)
+	if err != nil {
+		return uploadChunkHTTPResult{}, fmt.Errorf("CreateFormFile failed: %w", err)
+	}
+	if _, err := part.Write(chunk); err != nil {
+		return uploadChunkHTTPResult{}, fmt.Errorf("writing chunk content failed: %w", err)
+	}
+	if err := writer.WriteField("parent_dir", parentDir); err != nil {
+		return uploadChunkHTTPResult{}, fmt.Errorf("WriteField failed: %w", err)
+	}
+	if err := writer.Close(); err != nil {
+		return uploadChunkHTTPResult{}, fmt.Errorf("closing multipart writer failed: %w", err)
+	}
+
+	req, err := http.NewRequest(http.MethodPost, uploadURL, &buf)
+	if err != nil {
+		return uploadChunkHTTPResult{}, fmt.Errorf("creating chunk upload request failed: %w", err)
+	}
+	req.Header.Set("Authorization", "Token "+c.token)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	req.Header.Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, total))
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return uploadChunkHTTPResult{}, fmt.Errorf("chunk upload request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	return uploadChunkHTTPResult{status: resp.StatusCode, body: string(body)}, nil
+}
+
+func uploadChunkedBytesWithResultThroughLink(c *testClient, uploadURL, fileName, parentDir string, content []byte, firstChunkSize int) (uploadChunkHTTPResult, error) {
+	if len(content) < 2 {
+		return uploadChunkHTTPResult{}, fmt.Errorf("chunked upload content must be at least 2 bytes, got %d", len(content))
+	}
+	if firstChunkSize <= 0 || firstChunkSize >= len(content) {
+		firstChunkSize = len(content) / 2
+		if firstChunkSize == 0 {
+			firstChunkSize = 1
+		}
+	}
+
+	firstResult, err := uploadChunkWithResultThroughLink(c, uploadURL, fileName, parentDir, content[:firstChunkSize], 0, firstChunkSize-1, len(content))
+	if err != nil {
+		return uploadChunkHTTPResult{}, err
+	}
+	if firstResult.status != http.StatusOK && firstResult.status != http.StatusCreated {
+		return firstResult, fmt.Errorf("first chunk upload failed with status %d: %s", firstResult.status, firstResult.body)
+	}
+	return uploadChunkWithResultThroughLink(c, uploadURL, fileName, parentDir, content[firstChunkSize:], firstChunkSize, len(content)-1, len(content))
 }
 
 func uploadChunkedBytesThroughLink(t *testing.T, c *testClient, uploadURL, fileName, parentDir string, content []byte, firstChunkSize int, repeatFirstChunk bool) {
@@ -487,6 +548,205 @@ func TestUploadOverwrite(t *testing.T) {
 	got := download()
 	if got != "version 2 content" {
 		t.Errorf("expected 'version 2 content', got %q", got)
+	}
+}
+
+func TestConcurrentChunkedUploadsToSamePathKeepWholeRevision(t *testing.T) {
+	name := fmt.Sprintf("inttest-concurrent-same-path-%d", time.Now().UnixNano())
+	repoID := createTestLibrary(t, adminClient, name)
+	fileName := "concurrent-same-path.bin"
+
+	getUploadURL := func() string {
+		t.Helper()
+		resp := adminClient.Get(t, fmt.Sprintf("/api2/repos/%s/upload-link/?p=/", repoID))
+		expectStatus(t, resp, http.StatusOK)
+		uploadURL := strings.Trim(responseBody(t, resp), "\" \n\r")
+		if uploadURL == "" {
+			t.Fatal("upload URL is empty")
+		}
+		return uploadURL
+	}
+
+	type uploadResult struct {
+		status int
+		body   string
+		err    error
+	}
+
+	uploadWhole := func(uploadURL string, content []byte) uploadResult {
+		finalResult, err := uploadChunkedBytesWithResultThroughLink(adminClient, uploadURL, fileName, "/", content, chunkedPreflushIntegrationBlockSize)
+		if err != nil {
+			return uploadResult{err: err}
+		}
+		return uploadResult{status: finalResult.status, body: finalResult.body}
+	}
+
+	versionA := append(bytes.Repeat([]byte("a"), chunkedPreflushIntegrationBlockSize), []byte("-concurrent-version-a-tail")...)
+	versionB := append(bytes.Repeat([]byte("b"), chunkedPreflushIntegrationBlockSize), []byte("-concurrent-version-b-tail")...)
+	uploadURLA := getUploadURL()
+	uploadURLB := getUploadURL()
+
+	start := make(chan struct{})
+	results := make(chan uploadResult, 2)
+	var wg sync.WaitGroup
+
+	for _, tc := range []struct {
+		uploadURL string
+		content   []byte
+	}{
+		{uploadURL: uploadURLA, content: versionA},
+		{uploadURL: uploadURLB, content: versionB},
+	} {
+		wg.Add(1)
+		go func(uploadURL string, content []byte) {
+			defer wg.Done()
+			<-start
+			results <- uploadWhole(uploadURL, content)
+		}(tc.uploadURL, tc.content)
+	}
+
+	close(start)
+	wg.Wait()
+	close(results)
+	for result := range results {
+		if result.err != nil {
+			t.Fatalf("concurrent upload failed: %v", result.err)
+		}
+		if result.status != http.StatusOK && result.status != http.StatusCreated {
+			t.Fatalf("unexpected concurrent upload status %d: %s", result.status, result.body)
+		}
+	}
+
+	resp := adminClient.Get(t, fmt.Sprintf("/api2/repos/%s/file/?p=/%s", repoID, fileName))
+	expectStatus(t, resp, http.StatusOK)
+	downloadURL := strings.Trim(responseBody(t, resp), "\" \n\r")
+
+	req, err := http.NewRequest(http.MethodGet, downloadURL, nil)
+	if err != nil {
+		t.Fatalf("creating download request failed: %v", err)
+	}
+	dlResp, err := adminClient.http.Do(req)
+	if err != nil {
+		t.Fatalf("download request failed: %v", err)
+	}
+	defer dlResp.Body.Close()
+	if dlResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(dlResp.Body)
+		t.Fatalf("download failed with status %d: %s", dlResp.StatusCode, string(body))
+	}
+	downloaded, err := io.ReadAll(dlResp.Body)
+	if err != nil {
+		t.Fatalf("reading download body failed: %v", err)
+	}
+
+	if !bytes.Equal(downloaded, versionA) && !bytes.Equal(downloaded, versionB) {
+		hashA := sha256.Sum256(versionA)
+		hashB := sha256.Sum256(versionB)
+		actualHash := sha256.Sum256(downloaded)
+		t.Fatalf("downloaded concurrent content hash = %s, want one of [%s, %s]", hex.EncodeToString(actualHash[:]), hex.EncodeToString(hashA[:]), hex.EncodeToString(hashB[:]))
+	}
+}
+
+func TestConcurrentChunkedUploadsInSameDirectoryPublishAllFiles(t *testing.T) {
+	name := fmt.Sprintf("inttest-concurrent-dir-%d", time.Now().UnixNano())
+	repoID := createTestLibrary(t, adminClient, name)
+
+	getUploadURL := func() string {
+		t.Helper()
+		resp := adminClient.Get(t, fmt.Sprintf("/api2/repos/%s/upload-link/?p=/", repoID))
+		expectStatus(t, resp, http.StatusOK)
+		uploadURL := strings.Trim(responseBody(t, resp), "\" \n\r")
+		if uploadURL == "" {
+			t.Fatal("upload URL is empty")
+		}
+		return uploadURL
+	}
+
+	type uploadResult struct {
+		fileName string
+		content  []byte
+		status   int
+		body     string
+		err      error
+	}
+
+	files := []uploadResult{
+		{fileName: "archive-Xbig.zip", content: append(bytes.Repeat([]byte("x"), chunkedPreflushIntegrationBlockSize), []byte("-archive-xbig-tail")...)},
+		{fileName: "archive-XXX-big.zip", content: append(bytes.Repeat([]byte("y"), chunkedPreflushIntegrationBlockSize), []byte("-archive-xxx-big-tail")...)},
+		{fileName: "baby.zip", content: append(bytes.Repeat([]byte("z"), chunkedPreflushIntegrationBlockSize), []byte("-baby-tail")...)},
+	}
+
+	start := make(chan struct{})
+	results := make(chan uploadResult, len(files))
+	var wg sync.WaitGroup
+	for _, file := range files {
+		wg.Add(1)
+		go func(file uploadResult) {
+			defer wg.Done()
+			<-start
+			finalResult, err := uploadChunkedBytesWithResultThroughLink(adminClient, getUploadURL(), file.fileName, "/", file.content, chunkedPreflushIntegrationBlockSize)
+			file.status = finalResult.status
+			file.body = finalResult.body
+			file.err = err
+			results <- file
+		}(file)
+	}
+
+	close(start)
+	wg.Wait()
+	close(results)
+
+	verified := make([]uploadResult, 0, len(files))
+	for result := range results {
+		if result.err != nil {
+			t.Fatalf("concurrent directory upload failed for %s: %v", result.fileName, result.err)
+		}
+		if result.status != http.StatusOK && result.status != http.StatusCreated {
+			t.Fatalf("unexpected status for %s: %d %s", result.fileName, result.status, result.body)
+		}
+		verified = append(verified, result)
+	}
+
+	listResp := adminClient.Get(t, fmt.Sprintf("/api/v2.1/repos/%s/dir/?p=/", repoID))
+	expectStatus(t, listResp, http.StatusOK)
+	var dirList map[string]interface{}
+	decodeJSON(t, listResp, &dirList)
+	entries, ok := dirList["dirent_list"].([]interface{})
+	if !ok {
+		t.Fatal("expected dirent_list in response")
+	}
+
+	for _, result := range verified {
+		if !containsEntry(entries, "name", result.fileName) {
+			t.Fatalf("uploaded file %q not found in directory listing", result.fileName)
+		}
+
+		resp := adminClient.Get(t, fmt.Sprintf("/api2/repos/%s/file/?p=/%s", repoID, result.fileName))
+		expectStatus(t, resp, http.StatusOK)
+		downloadURL := strings.Trim(responseBody(t, resp), "\" \n\r")
+
+		req, err := http.NewRequest(http.MethodGet, downloadURL, nil)
+		if err != nil {
+			t.Fatalf("creating download request for %s failed: %v", result.fileName, err)
+		}
+		dlResp, err := adminClient.http.Do(req)
+		if err != nil {
+			t.Fatalf("download request for %s failed: %v", result.fileName, err)
+		}
+		defer dlResp.Body.Close()
+		if dlResp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(dlResp.Body)
+			t.Fatalf("download failed for %s with status %d: %s", result.fileName, dlResp.StatusCode, string(body))
+		}
+		downloaded, err := io.ReadAll(dlResp.Body)
+		if err != nil {
+			t.Fatalf("reading download body for %s failed: %v", result.fileName, err)
+		}
+		if !bytes.Equal(downloaded, result.content) {
+			expectedHash := sha256.Sum256(result.content)
+			actualHash := sha256.Sum256(downloaded)
+			t.Fatalf("downloaded content hash for %s = %s, want %s", result.fileName, hex.EncodeToString(actualHash[:]), hex.EncodeToString(expectedHash[:]))
+		}
 	}
 }
 
