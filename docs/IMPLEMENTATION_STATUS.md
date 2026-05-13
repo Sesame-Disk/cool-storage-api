@@ -1,6 +1,6 @@
 # Implementation Status - SesameFS
 
-**Last Updated**: 2026-04-09
+**Last Updated**: 2026-05-12
 
 ---
 
@@ -54,7 +54,7 @@
 | **File Block Encryption (AES-256-CBC)** | ✅ COMPLETE | Mostly stable | ⚠️ Partial | 2026-01-09 | Works with desktop client |
 | **Block Storage (S3)** | ✅ COMPLETE | Mostly stable | ⚠️ Partial | 2026-02-16 | SHA-1→SHA-256 mapping working. Custom HTTP transport (64 conn/host, 128KB buffers). |
 | **Block ID Mapping (SHA-1→SHA-256)** | ✅ COMPLETE | Mostly stable | ✅ Yes | 2026-02-16 | Batch IN queries (100/batch) for downloads. Per-block fallback still works. |
-| **File Upload (REST API)** | ✅ COMPLETE | Mostly stable | ❌ No | 2026-04-06 | Replace/autorename fix: `replace=0` triggers auto-rename (`file (1).ext`), default is overwrite for desktop client compat. Region-pinned libraries now propagate `storage_class` through `upload-link` and `seafhttp/upload-api`. |
+| **File Upload (REST API)** | ✅ COMPLETE | Mostly stable | ❌ No | 2026-05-12 | Upload Performance Phase 1 is closed on the existing SeafHTTP path: chunked uploads now preflush contiguous blocks asynchronously with bounded concurrency, finalize reuses/waits on preflushed blocks, encryption-state lookup is fail-closed for both single-shot and chunked finalize, and temp-file cleanup no longer risks deleting a recreated upload attempt. Focused chunked/preflush/finalize regressions now verify byte-equal download outcomes for large preflushed and out-of-order uploads, and broader green merge-gate evidence is recorded in TESTING.md. Region-pinned libraries still propagate `storage_class` through `upload-link` and `seafhttp/upload-api`. Full cross-endpoint pipeline convergence remains future work. |
 | **File Download (REST API)** | ✅ COMPLETE | Mostly stable | ❌ No | 2026-04-06 | Optimized: shared `streaming` package — prefetch pipeline, 4MB buffers, batch block resolve, ZIP Store. Region-pinned libraries now resolve reads by persisted library storage instead of host default. |
 | **Directory Listing** | ✅ COMPLETE | Mostly stable | ❌ No | 2026-01-08 | Frontend integration works |
 | **Library CRUD** | ✅ COMPLETE | Mostly stable | ⚠️ Partial | 2026-04-09 | Create/delete/list working. Library create flows now support explicit `storage_id`, hostname-derived default region selection, and org-level `storage_policy` (`strict` / `flexible`) for new libraries. Migration/change-region for non-empty libraries is still not implemented. |

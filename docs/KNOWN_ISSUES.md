@@ -2335,6 +2335,43 @@ The client also sends `replace=1` in both cases, so the form parameter doesn't h
 
 ---
 
+### ISSUE-UPLOAD-PHASE1-FOLLOWUPS-01: Upload Performance Phase 1 Post-Merge Follow-Ups
+
+**Status**: Accepted post-merge debt
+**Updated**: 2026-05-12
+**Severity**: Medium — follow-up reliability/operability work, not a PR-closeout blocker
+
+**Shipped scope to treat as closed for this branch:**
+- async preflush of contiguous chunked blocks on the existing SeafHTTP path
+- bounded preflush concurrency plus finalize wait/reuse semantics
+- fail-closed encryption-state lookup for single-shot upload and chunked finalize
+- temp-file cleanup hardening so old cleanup cannot delete a recreated upload attempt
+- focused chunked/preflush/finalize regressions with byte-equal download verification
+
+**Closeout validation evidence:**
+- focused unit regressions for async preflush / cleanup are green
+- focused upload integrations are green for
+   `TestChunkedUploadLinkReusePreflushesLargeRevisions` and
+   `TestChunkedUploadOutOfOrderCompletesWhenGapFills`
+- `docker compose --profile test run --rm --build go-integration-test` is green
+- `docker compose --profile test run --rm --build go-all-test` is green
+
+**Accepted post-merge follow-ups:**
+- formal expiry-driven cleanup for stale upload staging
+- idempotent storage and traffic accounting across retries/recovery
+- deeper crash recovery around promotion/refcount exact cutover points
+- HEAD/CAS hardening for write paths outside upload
+- preflush metrics and observability
+- real performance measurement
+- worker lifecycle/shutdown cleanup with context-aware cancellation where appropriate
+
+**Tracking:**
+- `docs/CHANGELOG.md` — Upload Performance Phase 1 closeout scope and validation
+- `docs/TESTING.md` — focused regressions and recorded green suite evidence
+- `docs/TECHNICAL-DEBT.md` § 5 — detailed post-merge follow-up list
+
+---
+
 ## ~~ISSUE-FRONTEND-ORG-DELETE-01~~: Superadmin Org Soft-Delete/Restore UI — ✅ RESOLVED
 
 **Status**: ✅ Complete (2026-03-25)

@@ -144,51 +144,74 @@ Add to `.github/workflows/test.yml`:
 ## 5. Web Upload Pipeline Follow-Ups (PENDING)
 
 ### Current State
-The current web uploader now has two safe improvements in place:
-- UI switches to `Saving...` when the last chunk is waiting on server-side finalization.
-- The next queued file can start while the previous file is still finalizing its last chunk.
+The current upload branch is closed with a deliberately narrow safe slice on the
+existing SeafHTTP/upload-link path:
 
-Backend finalization is also partially improved: `finalizeUploadStreaming()` now parallelizes block PUTs and metadata writes instead of doing them fully serially.
+- chunked uploads still land in a temp file first, but any contiguous full
+  block can now be preflushed asynchronously before the final chunk arrives
+- preflush work is bounded by per-upload and global concurrency caps instead of
+  fan-out-on-every-chunk
+- finalize explicitly waits for and reuses any reserved preflushed block rather
+  than racing it or re-uploading blindly
+- single-shot upload and chunked finalize now fail closed if the library
+  `encrypted` flag cannot be read, preventing plaintext writes into encrypted
+  libraries on transient DB failure
+- cleanup of a finished/abandoned upload now waits for in-flight preflush work,
+  and temp files are unique per upload attempt so a late cleanup cannot delete
+  the temp file of a recreated upload with the same token/filename key
+- focused unit and integration coverage now exists for chunked/preflush/finalize
+  behavior, including byte-equal download verification for large preflush and
+  out-of-order chunked uploads
 
 ### Still Pending
 
-**1. Stream blocks to storage as chunks arrive**
+**1. Formal expiry-driven cleanup for upload staging**
 
-Current chunked uploads still land in a temp file first and only become blocks during finalization in [internal/api/seafhttp.go](internal/api/seafhttp.go). That means large uploads still pay a real finalization phase at the end, even though it is shorter than before.
+Upload-owned staging state is much safer than it was at branch start, but the
+project still needs a formal expiry-oriented cleanup path for stale upload
+sessions and upload-owned staged blocks. The operational gap is no longer about
+correctness during the active request; it is about keeping abandoned state from
+accumulating without relying on manual cleanup or best-effort recovery only.
 
-Pending improvement:
-- Convert each arriving 8 MB chunk directly into a stored block.
-- Persist per-upload block manifests incrementally.
-- Leave the last request to do only the final metadata commit.
+**2. Storage and traffic accounting idempotence**
 
-Main risks to design for:
-- Out-of-order chunk arrival.
-- Cleanup of orphaned blocks when commit fails or upload is abandoned.
-- Encrypted libraries must keep block encryption and block-ID mapping behavior identical.
-- Resume logic must know which blocks are already materialized.
+Retry/recovery semantics are safer, but storage and traffic accounting still
+need an explicit idempotence model that survives retries, reconnects, and
+crash-recovery boundaries without overcharging or undercharging.
 
-**2. Migrate the web frontend to the block API flow**
+**3. Deeper promotion/refcount crash recovery**
 
-The browser still uploads through `seafhttp` + ResumableJS. The repo already has block-oriented APIs in [internal/api/v2/blocks.go](internal/api/v2/blocks.go), but the web client does not use them yet.
+The upload path now has better durable markers and safer rollback than before,
+but exact crash points around promotion/refcount handoff still deserve deeper
+recovery guarantees and dedicated regression coverage.
 
-Pending improvement:
-- Hash blocks client-side.
-- Use `POST /api/v2/blocks/check` for dedup/resume.
-- Upload missing blocks individually.
-- Commit the file from the block manifest with a separate final step.
+**4. CAS hardening beyond upload**
 
-Why this is deferred:
-- It is a protocol-level frontend migration, not a small UX patch.
-- It must preserve folder uploads, replace flows, shared links, upload links, retries, and progress UX.
-- It needs explicit browser-side hashing/performance validation on large files.
-  run: |
-    go test ./... -coverprofile=coverage.out
-    COVERAGE=$(go tool cover -func=coverage.out | grep total | awk '{print $3}' | sed 's/%//')
-    if (( $(echo "$COVERAGE < 25" | bc -l) )); then
-      echo "Coverage $COVERAGE% is below threshold 25%"
-      exit 1
-    fi
-```
+Upload publication now has stronger expected-head handling, but the same style
+of optimistic concurrency protection should still be extended to other write
+paths that publish new HEAD state outside the upload flow.
+
+**5. Preflush observability**
+
+The current async preflush path is intentionally conservative, but it lacks the
+metrics needed to answer operational questions such as:
+
+- how often preflush is skipped or times out
+- how many blocks finalize had to re-materialize
+- whether concurrency caps are too low or too high in production
+
+**6. Real performance measurement**
+
+Upload Performance Phase 1 improved the shape of the latency path, but this is
+not yet backed by formal before/after benchmarking or production-like
+measurement. The project still needs controlled numbers for wall-clock upload
+latency, throughput, and finalization tail time.
+
+**7. Worker lifecycle and shutdown semantics**
+
+Detached background work is now used more carefully, but lifecycle behavior
+should still be revisited so background upload work follows explicit shutdown
+semantics and cancellation policies where appropriate.
 
 ---
 

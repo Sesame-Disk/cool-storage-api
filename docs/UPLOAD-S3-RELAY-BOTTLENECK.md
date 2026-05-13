@@ -399,6 +399,20 @@ Five copies of "compute hashes and store". Three copies of "compute hashes, encr
 
 The goal: every upload endpoint becomes a thin adapter over **one** internal pipeline. That pipeline has the chunked-finalize behaviour (Option A) for free, and stays backend-agnostic — no S3-only features anywhere. We need to get there in stages because the four clients have different release cadences and we cannot break sync clients in the field.
 
+### Status after 2026-05-12 closeout
+
+The current branch did **not** ship the Phase 1 `blocksink` extraction described
+below. The safe slice that actually shipped is narrower:
+
+- async preflush for contiguous chunked blocks on the existing SeafHTTP path
+- finalize waiting/reuse semantics for preflushed blocks
+- reliability/security hardening around encrypted-library detection and upload
+    temp-file cleanup
+- focused unit and integration coverage for byte-equal chunked upload behavior
+
+The roadmap below remains the forward-looking convergence plan after that safe
+slice. Read it as future work, not as a description of what already landed.
+
 #### Phase 0 — Lock in current behaviour with characterization tests *(week of launch, parallel with Option A)*
 
 We cannot refactor what we cannot regression-test. Before any consolidation, every endpoint above gets a black-box test in `internal/integration/` that asserts:

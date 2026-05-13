@@ -2,7 +2,7 @@
 
 This document describes how to run tests, test coverage, and testing infrastructure.
 
-**Last updated: 2026-03-30**
+**Last updated: 2026-05-12**
 
 ---
 
@@ -243,6 +243,56 @@ docker compose --profile test run --rm --build go-integration-test
 These tests make HTTP requests to the running backend (same model as bash scripts) and exercise the full stack: API handlers → middleware → database → storage. They don't contribute to `go test -cover` numbers since they're in a separate package making external HTTP calls.
 
 **Docker-first default**: `test.sh` prefers the `go-integration-test` compose service, which waits for `sesamefs` and runs against the compose network.
+
+### Upload Phase 1 Closeout Checks
+
+For upload work touching chunked preflush, finalize behavior, cleanup, or
+encrypted-library handling, use these focused checks before trusting a wider
+suite result:
+
+```bash
+# Focused async preflush / cleanup unit slice
+go test ./internal/api -run '^(TestHandleUploadChunked_(PreflushesContiguousBlockBeforeFinalize|DoesNotPreflushUntilMissingPrefixArrives|FinalizeWaitsForInFlightPreflush|FirstChunkReturnsBeforeBlockedPreflush)|TestPreflushChunkUploadBlocksBoundsConcurrentUploadsPerUpload|TestPreflushChunkUploadBlocksBoundsConcurrentUploadsGlobally|TestChunkUploadCleanupWaitsForInFlightPreflush|TestChunkUploadResolvePreflushedBlockFallsBackAfterFailedPreflush|TestChunkManagerCleanupDoesNotRemoveRecreatedUploadTempFile)$' -count=1
+
+# Focused byte-equal chunked upload integrations
+docker compose --profile test run --rm --build go-integration-test \
+  go test -tags integration ./internal/integration \
+  -run '^(TestChunkedUploadLinkReusePreflushesLargeRevisions|TestChunkedUploadOutOfOrderCompletesWhenGapFills)$' -count=1
+```
+
+The integration pair above is the current regression proof for byte-equal
+chunked upload behavior after async preflush:
+
+- `TestChunkedUploadLinkReusePreflushesLargeRevisions` verifies that a large
+  preflushed chunked upload can be rewritten through the same upload-link path
+  and still downloads byte-equal to the latest revision.
+- `TestChunkedUploadOutOfOrderCompletesWhenGapFills` verifies that out-of-order
+  chunk arrival still assembles and downloads byte-equal content once the
+  missing prefix arrives.
+
+`go-all-test` and the full `go-integration-test` service remain broader
+merge-candidate gates, but they should be treated as suite-level validation,
+not as a substitute for the focused upload regressions above.
+
+### Recorded Closeout Evidence (2026-05-12)
+
+For the PR closeout of Upload Performance Phase 1, the broader containerized
+merge-gate runs were also green:
+
+```bash
+docker compose --profile test run --rm --build go-integration-test
+docker compose --profile test run --rm --build go-all-test
+```
+
+Recorded outcomes from the closeout session:
+
+- `go-integration-test` passed for the full integration package with
+  `PASS ok github.com/Sesame-Disk/sesamefs/internal/integration`
+- `go-all-test` completed with `All tests passed!`
+
+Treat those results as branch-closeout evidence for the full backend test gate.
+The focused upload regressions above remain the authoritative discriminator for
+chunked/preflush/finalize correctness.
 
 **Integration-test-first rule for backend refactors:**
 - If a change touches dual-write behavior, denormalized projections, counters, sync `HEAD` semantics, cleanup cascades, or cursor pagination boundaries, start with an integration regression before trusting the refactor.

@@ -3,6 +3,24 @@
 **Date:** 2026-04-14
 **Diagrams:** [Upload/Download Flow Diagrams](./diagrams/upload-download-flow.md)
 
+## Status update (2026-05-12)
+
+This assessment predates the current upload hardening work. The following items
+from the original audit are no longer accurate as written:
+
+- chunked uploads now have focused end-to-end integration coverage, including
+    byte-equal verification for large preflushed revisions and out-of-order chunk
+    completion
+- chunked upload cleanup now waits for in-flight preflush work, and upload temp
+    files are unique per attempt so late cleanup cannot delete a recreated upload
+    with the same token/filename key
+- single-shot upload and chunked finalize now fail closed if the library
+    encryption flag cannot be read, preventing plaintext writes into encrypted
+    libraries on transient DB failures
+
+Use this document as historical assessment context plus remaining open risks,
+not as the current source of truth for the already-fixed chunked-upload gaps.
+
 ---
 
 ## Issues found

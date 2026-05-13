@@ -8,6 +8,58 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-05-12 - Upload Performance Phase 1 closeout
+
+### Scope
+
+This closes the safe slice for the current upload branch on the existing
+SeafHTTP/upload-link path. The shipped work is intentionally narrower than a
+full pipeline rewrite:
+
+- async preflush of contiguous chunked blocks while keeping the existing
+  temp-file-then-promote correctness model
+- bounded preflush concurrency plus finalize waiting/reuse semantics for any
+  in-flight preflush work
+- fail-closed encryption-state checks for both single-shot upload and chunked
+  finalize so transient Cassandra failures cannot cause plaintext writes into
+  encrypted libraries
+- upload-temp cleanup hardening so a late cleanup from an older attempt cannot
+  remove the temp file for a recreated upload with the same token/filename key
+
+### Validation
+
+- Focused unit coverage is green for the async preflush / cleanup slice,
+  including:
+  - first contiguous block preflush before finalize
+  - out-of-order chunk completion
+  - finalize waiting on in-flight preflush
+  - first chunk request returning before blocked preflush finishes
+  - per-upload and global preflush concurrency bounds
+  - cleanup waiting for in-flight preflush
+  - cleanup preserving a recreated upload's temp file
+- Focused upload integration coverage is green for byte-equal
+  chunked/preflush/finalize flows:
+  - `TestChunkedUploadLinkReusePreflushesLargeRevisions`
+  - `TestChunkedUploadOutOfOrderCompletesWhenGapFills`
+- Broad merge-gate evidence is green:
+  - `docker compose --profile test run --rm --build go-integration-test`
+    passed, including full `internal/integration`
+  - `docker compose --profile test run --rm --build go-all-test`
+    passed with `All tests passed!`
+
+### Deferred Work
+
+The following are now explicit post-merge follow-ups, not hidden branch scope:
+
+- formal expiry-driven cleanup for upload staging
+- idempotent storage/traffic accounting across retries and recovery
+- deeper crash recovery around promotion/refcount exact cutover points
+- expected-head/CAS hardening for non-upload write paths
+- preflush metrics and real performance measurement
+- worker lifecycle/shutdown cleanup where detached background work is used
+
+---
+
 ## 2026-05-12 - Upload reliability hardening after preflush audit
 
 ### Fix
