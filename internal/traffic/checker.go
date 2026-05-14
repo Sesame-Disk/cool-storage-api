@@ -38,8 +38,13 @@ func isHardEnforcement(quotaPolicy string) bool {
 }
 
 // CheckStorageQuota evaluates whether uploading additionalBytes would exceed the
-// org's storage quota.
-func (c *Checker) CheckStorageQuota(orgID string, additionalBytes int64) (QuotaStatus, error) {
+// org or per-user storage quota. Both limits use the org's quota_policy; the
+// most restrictive result wins.
+func (c *Checker) CheckStorageQuota(orgID, userID string, additionalBytes int64) (QuotaStatus, error) {
+	if additionalBytes < 0 {
+		additionalBytes = 0
+	}
+
 	var storageQuota int64
 	var quotaPolicy string
 
@@ -53,37 +58,57 @@ func (c *Checker) CheckStorageQuota(orgID string, additionalBytes int64) (QuotaS
 		return QuotaStatus{Allowed: true}, fmt.Errorf("CheckStorageQuota: %w", err)
 	}
 
-	// Always read live usage from the counter table.
-	storageUsed, _ := c.readStorageCounter(fmt.Sprintf("org:%s", orgID))
+	orgUsed, _ := c.readStorageCounter(OrganizationStorageScope(orgID))
+	worst := QuotaStatus{Allowed: true, LimitBytes: -1, UsedBytes: orgUsed, Plan: quotaPolicy}
 
-	if storageQuota <= 0 {
-		// Any value <= 0 means unlimited.
-		return QuotaStatus{Allowed: true, LimitBytes: -1, UsedBytes: storageUsed, Plan: quotaPolicy}, nil
+	if storageQuota > 0 {
+		worst = moreRestrictive(worst, evaluateStorageQuota(orgUsed, storageQuota, additionalBytes, quotaPolicy))
 	}
 
-	projected := storageUsed + additionalBytes
-	if projected > storageQuota {
+	if userID != "" && userID != "00000000-0000-0000-0000-000000000000" {
+		var userQuota int64
+		userErr := c.session.Query(`
+			SELECT quota_bytes
+			FROM users WHERE org_id = ? AND user_id = ?`,
+			mustParseUUID(orgID), mustParseUUID(userID),
+		).Scan(&userQuota)
+		if userErr == nil && userQuota > 0 {
+			userUsed, _ := c.readStorageCounter(UserStorageScope(orgID, userID))
+			worst = moreRestrictive(worst, evaluateStorageQuota(userUsed, userQuota, additionalBytes, quotaPolicy))
+		}
+	}
+
+	return worst, nil
+}
+
+func evaluateStorageQuota(used, limit, additionalBytes int64, quotaPolicy string) QuotaStatus {
+	projected := used + additionalBytes
+	if projected > limit {
 		allowed := !isHardEnforcement(quotaPolicy) // paid plans: soft warning, free: hard block
 		warning := !isHardEnforcement(quotaPolicy)
 		return QuotaStatus{
 			Allowed:    allowed,
 			Warning:    warning,
-			UsedBytes:  storageUsed,
-			LimitBytes: storageQuota,
+			UsedBytes:  used,
+			LimitBytes: limit,
 			Reason:     "storage",
 			Plan:       quotaPolicy,
-		}, nil
+		}
 	}
 
-	// Warn at 80% for paid plans
-	warning := !isHardEnforcement(quotaPolicy) && float64(projected)/float64(storageQuota) >= 0.80
+	warning := !isHardEnforcement(quotaPolicy) && float64(projected)/float64(limit) >= 0.80
+	reason := ""
+	if warning {
+		reason = "storage"
+	}
 	return QuotaStatus{
 		Allowed:    true,
 		Warning:    warning,
-		UsedBytes:  storageUsed,
-		LimitBytes: storageQuota,
+		UsedBytes:  used,
+		LimitBytes: limit,
 		Plan:       quotaPolicy,
-	}, nil
+		Reason:     reason,
+	}
 }
 
 // CheckTrafficQuota evaluates upload or download traffic quotas.
@@ -282,17 +307,32 @@ func (c *Checker) readStorageCounter(scope string) (int64, error) {
 // A blocked status always beats a warning. A warning beats an allow.
 func moreRestrictive(a, b QuotaStatus) QuotaStatus {
 	if !b.Allowed && a.Allowed {
-		return b
+		return inheritQuotaPeriod(a, b)
+	}
+	if !b.Allowed && !a.Allowed && lowerPositiveLimit(b.LimitBytes, a.LimitBytes) {
+		return inheritQuotaPeriod(a, b)
 	}
 	if b.Warning && !a.Warning {
-		// Both allowed but b has a warning
-		a.Warning = true
-		if b.Reason != "" {
-			a.Reason = b.Reason
-		}
-		return a
+		return inheritQuotaPeriod(a, b)
+	}
+	if b.Warning && a.Warning && lowerPositiveLimit(b.LimitBytes, a.LimitBytes) {
+		return inheritQuotaPeriod(a, b)
 	}
 	return a
+}
+
+func lowerPositiveLimit(candidate, current int64) bool {
+	if candidate <= 0 {
+		return false
+	}
+	return current <= 0 || candidate < current
+}
+
+func inheritQuotaPeriod(base, selected QuotaStatus) QuotaStatus {
+	if selected.PeriodStartedAt.IsZero() {
+		selected.PeriodStartedAt = base.PeriodStartedAt
+	}
+	return selected
 }
 
 // mustParseUUID converts a UUID string to gocql.UUID, returning zero on error.

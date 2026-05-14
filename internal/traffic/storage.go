@@ -77,8 +77,12 @@ func IncrementStorageCounters(db DBSession, orgID, userID, libraryID string, del
 		scopes := []string{
 			PlatformStorageScope(),
 			OrganizationStorageScope(orgID),
-			UserStorageScope(orgID, userID),
-			LibraryStorageScope(orgID, libraryID),
+		}
+		if userID != "" {
+			scopes = append(scopes, UserStorageScope(orgID, userID))
+		}
+		if libraryID != "" {
+			scopes = append(scopes, LibraryStorageScope(orgID, libraryID))
 		}
 		for _, scope := range scopes {
 			storageUpdate(session, scope, storageTotalDay, deltaBytes, deltaFiles)
@@ -100,8 +104,12 @@ func DecrementStorageCounters(db DBSession, orgID, userID, libraryID string, del
 		scopes := []string{
 			PlatformStorageScope(),
 			OrganizationStorageScope(orgID),
-			UserStorageScope(orgID, userID),
-			LibraryStorageScope(orgID, libraryID),
+		}
+		if userID != "" {
+			scopes = append(scopes, UserStorageScope(orgID, userID))
+		}
+		if libraryID != "" {
+			scopes = append(scopes, LibraryStorageScope(orgID, libraryID))
 		}
 		for _, scope := range scopes {
 			var curBytes, curFiles int64
@@ -120,6 +128,57 @@ func DecrementStorageCounters(db DBSession, orgID, userID, libraryID string, del
 			storageUpdate(session, scope, today, -actBytes, -actFiles)
 		}
 	}()
+}
+
+// AdjustStorageCountersByDelta applies an arbitrary signed delta to platform,
+// org, user, and library storage counters. It is used when a commit publishes a
+// new tree and the exact change is known only after comparing aggregate stats.
+func AdjustStorageCountersByDelta(db DBSession, orgID, userID, libraryID string, deltaBytes, deltaFiles int64) {
+	if deltaBytes == 0 && deltaFiles == 0 {
+		return
+	}
+	today := time.Now().UTC().Truncate(24 * time.Hour)
+	go func() {
+		session := db.Session()
+		scopes := []string{
+			PlatformStorageScope(),
+			OrganizationStorageScope(orgID),
+		}
+		if userID != "" {
+			scopes = append(scopes, UserStorageScope(orgID, userID))
+		}
+		if libraryID != "" {
+			scopes = append(scopes, LibraryStorageScope(orgID, libraryID))
+		}
+		for _, scope := range scopes {
+			bytesDelta, filesDelta := clampNegativeStorageDelta(session, scope, deltaBytes, deltaFiles)
+			if bytesDelta == 0 && filesDelta == 0 {
+				continue
+			}
+			storageUpdate(session, scope, storageTotalDay, bytesDelta, filesDelta)
+			storageUpdate(session, scope, today, bytesDelta, filesDelta)
+		}
+	}()
+}
+
+func clampNegativeStorageDelta(session *gocql.Session, scope string, deltaBytes, deltaFiles int64) (int64, int64) {
+	if deltaBytes >= 0 && deltaFiles >= 0 {
+		return deltaBytes, deltaFiles
+	}
+
+	var curBytes, curFiles int64
+	_ = session.Query(
+		`SELECT bytes_used, file_count FROM storage_counters WHERE scope = ? AND day = ?`,
+		scope, storageTotalDay,
+	).Scan(&curBytes, &curFiles)
+
+	if deltaBytes < 0 {
+		deltaBytes = -min(-deltaBytes, max(curBytes, 0))
+	}
+	if deltaFiles < 0 {
+		deltaFiles = -min(-deltaFiles, max(curFiles, 0))
+	}
+	return deltaBytes, deltaFiles
 }
 
 // ReadStorageUsed returns the live bytes_used from the running-total row

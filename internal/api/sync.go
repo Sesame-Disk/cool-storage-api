@@ -657,11 +657,13 @@ func (h *SyncHandler) PutCommit(c *gin.Context) {
 			return
 		}
 
-		// Read the commit's parent_id to validate parent chain
+		// Read the commit's parent_id/root_fs_id to validate parent chain and
+		// evaluate storage quota against the published tree delta.
 		var parentID *string
+		var rootFSID string
 		err = h.db.Session().Query(`
-			SELECT parent_id FROM commits WHERE library_id = ? AND commit_id = ?
-		`, repoID, headCommitID).Scan(&parentID)
+			SELECT parent_id, root_fs_id FROM commits WHERE library_id = ? AND commit_id = ?
+		`, repoID, headCommitID).Scan(&parentID, &rootFSID)
 		if err != nil {
 			log.Printf("PutCommit HEAD: commit %s not found for repo %s: %v", headCommitID, repoID, err)
 			c.JSON(http.StatusNotFound, gin.H{"error": "commit not found"})
@@ -687,8 +689,12 @@ func (h *SyncHandler) PutCommit(c *gin.Context) {
 		log.Printf("PutCommit HEAD: updating repo %s head to %s (parent=%s, currentHead=%s)",
 			repoID, headCommitID, commitParent, currentHead)
 
+		if !h.checkSyncCommitStorageQuota(c, orgID, userID, repoID, currentHead, rootFSID) {
+			return
+		}
+
 		// CAS update: pass current HEAD as expected value to prevent concurrent overwrites
-		if err := h.updateLibraryHeadWithStats(orgID, repoID, headCommitID, currentHead); err != nil {
+		if err := h.updateLibraryHeadWithStats(orgID, repoID, headCommitID, userID, currentHead); err != nil {
 			if errors.Is(err, ErrHeadConflict) {
 				log.Printf("PutCommit HEAD: CAS conflict for repo %s, HEAD changed between read and write", repoID)
 				c.Status(http.StatusOK) // Client compat
@@ -698,12 +704,6 @@ func (h *SyncHandler) PutCommit(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update head"})
 			return
 		}
-
-		// Get root_fs_id from the commit for path updates
-		var rootFSID string
-		h.db.Session().Query(`
-			SELECT root_fs_id FROM commits WHERE library_id = ? AND commit_id = ?
-		`, repoID, headCommitID).Scan(&rootFSID)
 
 		// Update full_path for search indexing (async)
 		if rootFSID != "" {
@@ -868,15 +868,12 @@ func (h *SyncHandler) PutBlock(c *gin.Context) {
 
 	log.Printf("PutBlock: externalID=%s, len=%d\n", externalID, len(externalID))
 
-	// Quota pre-check: reject early if storage or upload traffic quota exceeded.
+	// Quota pre-check: reject early on upload traffic; storage quota is enforced
+	// only if this block is new after deduplication lookup.
 	uploadTrafficStatus := traffic.QuotaStatus{Allowed: true}
 	if checker := traffic.GetChecker(); checker != nil {
 		contentLen := c.Request.ContentLength
 		if contentLen > 0 {
-			if qs, _ := checker.CheckStorageQuota(orgID, contentLen); !qs.Allowed {
-				c.JSON(http.StatusForbidden, gin.H{"error": "storage quota exceeded"})
-				return
-			}
 			uploadTrafficStatus, _ = traffic.CheckTrafficQuotaWithChecker(checker, orgID, userID, "upload", contentLen)
 			if !uploadTrafficStatus.Allowed {
 				c.JSON(http.StatusForbidden, gin.H{"error": "upload traffic quota exceeded"})
@@ -920,17 +917,34 @@ func (h *SyncHandler) PutBlock(c *gin.Context) {
 	log.Printf("PutBlock: storing block external=%s internal=%s in storage class %s\n",
 		externalID, internalID, storageClass)
 
+	exists, err := blockStore.BlockExists(c.Request.Context(), internalID)
+	if err != nil {
+		log.Printf("PutBlock: failed to check block existence: %v\n", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to check block existence"})
+		return
+	}
+	if !exists {
+		if checker := traffic.GetChecker(); checker != nil {
+			if qs, _ := checker.CheckStorageQuota(orgID, userID, int64(len(data))); !qs.Allowed {
+				c.JSON(http.StatusForbidden, gin.H{"error": "storage quota exceeded"})
+				return
+			}
+		}
+	}
+
 	// Store block using internal SHA-256 ID
 	blockData := &storage.BlockData{
 		Data: data,
 		Hash: internalID, // Always use SHA-256 for storage
 	}
 
-	_, err = blockStore.PutBlockData(c.Request.Context(), blockData)
-	if err != nil {
-		log.Printf("PutBlock: failed to store in backend: %v\n", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to store block"})
-		return
+	if !exists {
+		_, err = blockStore.PutBlockData(c.Request.Context(), blockData)
+		if err != nil {
+			log.Printf("PutBlock: failed to store in backend: %v\n", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to store block"})
+			return
+		}
 	}
 
 	// Store block metadata and mapping (if DB available)
@@ -1725,7 +1739,8 @@ func (h *SyncHandler) QuotaCheck(c *gin.Context) {
 	}
 
 	// Check storage quota with 0 additional bytes to see if the org is already over limit.
-	st, _ := checker.CheckStorageQuota(orgID, 0)
+	userID := c.GetString("user_id")
+	st, _ := checker.CheckStorageQuota(orgID, userID, 0)
 	c.JSON(http.StatusOK, gin.H{"has_quota": st.Allowed})
 }
 
@@ -1807,6 +1822,7 @@ func (h *SyncHandler) GetHeadCommitsMulti(c *gin.Context) {
 func (h *SyncHandler) UpdateBranch(c *gin.Context) {
 	repoID := c.Param("repo_id")
 	orgID := c.GetString("org_id")
+	userID := c.GetString("user_id")
 
 	if !h.checkSyncPermission(c, repoID, middleware.PermissionRW) {
 		return
@@ -1853,8 +1869,12 @@ func (h *SyncHandler) UpdateBranch(c *gin.Context) {
 	log.Printf("UpdateBranch: updating repo %s head to %s (parent=%s, currentHead=%s)",
 		repoID, newHead, commitParent, currentHead)
 
+	if !h.checkSyncCommitStorageQuota(c, orgID, userID, repoID, currentHead, rootFSID) {
+		return
+	}
+
 	// CAS update with expected HEAD
-	if err := h.updateLibraryHeadWithStats(orgID, repoID, newHead, currentHead); err != nil {
+	if err := h.updateLibraryHeadWithStats(orgID, repoID, newHead, userID, currentHead); err != nil {
 		if errors.Is(err, ErrHeadConflict) {
 			log.Printf("UpdateBranch: CAS conflict for repo %s, HEAD changed concurrently", repoID)
 			c.Status(http.StatusOK) // Client compat
@@ -2057,10 +2077,14 @@ func (h *SyncHandler) updateFullPaths(libraryID, rootFSID string) {
 // and asynchronously recalculates size_bytes and file_count from the directory tree.
 // If expectedHead is provided and non-empty, uses Cassandra LWT (compare-and-swap)
 // to prevent overwriting a HEAD that was modified concurrently.
-func (h *SyncHandler) updateLibraryHeadWithStats(orgID, repoID, commitID string, expectedHead ...string) error {
+func (h *SyncHandler) updateLibraryHeadWithStats(orgID, repoID, commitID, userID string, expectedHead ...string) error {
 	now := time.Now()
 
 	wantCAS := len(expectedHead) > 0 && expectedHead[0] != ""
+	previousCommitID := ""
+	if len(expectedHead) > 0 {
+		previousCommitID = expectedHead[0]
+	}
 
 	if wantCAS {
 		// Cassandra does not allow conditional batches across multiple tables, so
@@ -2115,9 +2139,50 @@ func (h *SyncHandler) updateLibraryHeadWithStats(orgID, repoID, commitID string,
 	}
 
 	// Async: recalculate stats from directory tree
-	go h.recalculateLibraryStats(orgID, repoID, commitID)
+	go h.recalculateLibraryStats(orgID, repoID, commitID, userID, previousCommitID)
 
 	return nil
+}
+
+func (h *SyncHandler) checkSyncCommitStorageQuota(c *gin.Context, orgID, userID, repoID, currentHead, rootFSID string) bool {
+	checker := traffic.GetChecker()
+	if checker == nil {
+		return true
+	}
+
+	newSize := int64(0)
+	if rootFSID != "" && rootFSID != strings.Repeat("0", 40) {
+		newSize, _ = h.calculateDirStats(repoID, rootFSID)
+	}
+
+	currentSize, _ := h.commitTreeStats(repoID, currentHead)
+
+	additionalBytes := newSize - currentSize
+	if additionalBytes <= 0 {
+		return true
+	}
+
+	st, _ := checker.CheckStorageQuota(orgID, userID, additionalBytes)
+	if !st.Allowed {
+		c.JSON(http.StatusForbidden, gin.H{"error": "storage quota exceeded"})
+		return false
+	}
+	return true
+}
+
+func (h *SyncHandler) commitTreeStats(repoID, commitID string) (int64, int64) {
+	if commitID == "" {
+		return 0, 0
+	}
+
+	var rootFSID string
+	err := h.db.Session().Query(`
+		SELECT root_fs_id FROM commits WHERE library_id = ? AND commit_id = ?
+	`, repoID, commitID).Scan(&rootFSID)
+	if err != nil || rootFSID == "" || rootFSID == strings.Repeat("0", 40) {
+		return 0, 0
+	}
+	return h.calculateDirStats(repoID, rootFSID)
 }
 
 func (h *SyncHandler) syncLibraryHeadDerivedState(orgID, repoID string) error {
@@ -2148,7 +2213,9 @@ func (h *SyncHandler) syncLibraryHeadDerivedState(orgID, repoID string) error {
 
 // recalculateLibraryStats recalculates size_bytes and file_count for a library
 // by traversing its directory tree from the commit's root_fs_id.
-func (h *SyncHandler) recalculateLibraryStats(orgID, repoID, commitID string) {
+func (h *SyncHandler) recalculateLibraryStats(orgID, repoID, commitID, userID, previousCommitID string) {
+	previousSize, previousFileCount := h.commitTreeStats(repoID, previousCommitID)
+
 	var rootFSID string
 	err := h.db.Session().Query(`
 		SELECT root_fs_id FROM commits WHERE library_id = ? AND commit_id = ?
@@ -2159,14 +2226,14 @@ func (h *SyncHandler) recalculateLibraryStats(orgID, repoID, commitID string) {
 	}
 
 	if rootFSID == "" || rootFSID == strings.Repeat("0", 40) {
-		if h.persistLibraryStatsIfCurrentHead(orgID, repoID, commitID, 0, 0) {
+		if h.persistLibraryStatsIfCurrentHead(orgID, repoID, commitID, userID, previousSize, previousFileCount, 0, 0) {
 			log.Printf("[updateLibraryStats] Library %s is empty, stats set to 0", repoID)
 		}
 		return
 	}
 
 	totalSize, fileCount := h.calculateDirStats(repoID, rootFSID)
-	if !h.persistLibraryStatsIfCurrentHead(orgID, repoID, commitID, totalSize, fileCount) {
+	if !h.persistLibraryStatsIfCurrentHead(orgID, repoID, commitID, userID, previousSize, previousFileCount, totalSize, fileCount) {
 		return
 	}
 
@@ -2178,7 +2245,7 @@ const (
 	libraryStatsProjectionRetryDelay    = 50 * time.Millisecond
 )
 
-func (h *SyncHandler) persistLibraryStatsIfCurrentHead(orgID, repoID, commitID string, totalSize, fileCount int64) bool {
+func (h *SyncHandler) persistLibraryStatsIfCurrentHead(orgID, repoID, commitID, userID string, previousSize, previousFileCount, totalSize, fileCount int64) bool {
 	casState := map[string]interface{}{}
 	applied, err := h.db.Session().Query(`
 		UPDATE libraries SET size_bytes = ?, file_count = ?
@@ -2194,6 +2261,8 @@ func (h *SyncHandler) persistLibraryStatsIfCurrentHead(orgID, repoID, commitID s
 		log.Printf("[updateLibraryStats] Skipping stale stats update for %s: commit=%s current_head=%s", repoID, commitID, currentHead)
 		return false
 	}
+
+	traffic.AdjustStorageCountersByDelta(h.db, orgID, userID, repoID, totalSize-previousSize, fileCount-previousFileCount)
 
 	err = retryLibraryStatsProjectionSync(func() error {
 		projectionRow, err := db.ReadAdminLibraryProjectionRow(h.db.Session(), orgID, repoID)

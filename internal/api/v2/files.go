@@ -2706,7 +2706,7 @@ func (h *FileHandler) UploadFile(c *gin.Context) {
 		if contentLength < 0 {
 			contentLength = 0
 		}
-		if st, _ := checker.CheckStorageQuota(orgID, contentLength); !st.Allowed {
+		if st, _ := checker.CheckStorageQuota(orgID, userID, contentLength); !st.Allowed {
 			c.JSON(http.StatusForbidden, gin.H{"error": "storage quota exceeded"})
 			return
 		}

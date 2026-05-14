@@ -992,7 +992,7 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 		if contentLength < 0 {
 			contentLength = 0
 		}
-		if st, _ := checker.CheckStorageQuota(token.OrgID, contentLength); !st.Allowed {
+		if st, _ := checker.CheckStorageQuota(token.OrgID, token.UserID, contentLength); !st.Allowed {
 			c.JSON(http.StatusForbidden, gin.H{"error": "storage quota exceeded"})
 			return
 		}
@@ -2030,6 +2030,18 @@ func (h *SeafHTTPHandler) streamFileFromBlocks(c *gin.Context, token *AccessToke
 		return err
 	}
 
+	downloadTrafficStatus := traffic.QuotaStatus{Allowed: true, PeriodStartedAt: periodStartedAt}
+	if checker := traffic.GetChecker(); checker != nil {
+		downloadTrafficStatus, _ = traffic.CheckTrafficQuotaWithChecker(checker, token.OrgID, token.UserID, "download", fileSize)
+		if !downloadTrafficStatus.Allowed {
+			c.JSON(http.StatusForbidden, traffic.TrafficQuotaExceededResponse(downloadTrafficStatus, "traffic quota exceeded", true))
+			return nil
+		}
+		if warning, ok := traffic.TrafficQuotaWarningHeader(downloadTrafficStatus); ok {
+			c.Header("X-Quota-Warning", warning)
+		}
+	}
+
 	log.Printf("[streamFileFromBlocks] Streaming %d blocks, size=%d, encrypted=%v", len(blockIDs), fileSize, fileKey != nil)
 
 	// Set headers before streaming — Content-Length lets clients show progress
@@ -2057,7 +2069,7 @@ func (h *SeafHTTPHandler) streamFileFromBlocks(c *gin.Context, token *AccessToke
 		if token.Source == "link" {
 			tt = traffic.LinkDownload
 		}
-		rec.RecordWithPeriod(token.OrgID, token.UserID, tt, fileSize, periodStartedAt)
+		traffic.RecordCheckedTransfer(rec, downloadTrafficStatus, token.OrgID, token.UserID, tt, fileSize)
 	}
 
 	return nil

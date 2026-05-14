@@ -31,7 +31,72 @@ Lo pendiente ya no es el modelo base de quotas. Lo pendiente es cerrar la integr
 
 ## PENDIENTE — ALTA PRIORIDAD
 
-### 1. BUG: Per-user storage quota no se enforza en uploads (ISSUE-USER-STORAGE-ENFORCE-01)
+### 0. BUG: Mutaciones V2 que crecen bytes bypasean quota y dejan counters stale (ISSUE-QUOTA-COVERAGE-01)
+
+Después de cerrar ISSUE-USER-STORAGE-ENFORCE-01 quedaron 5 handlers que también
+publican commits que crecen storage pero no están enchufados al sistema de quotas.
+Los uploads y el path de sync (PutCommit / UpdateBranch) sí quedaron correctos.
+
+Handlers afectados (todos llaman a `FSHelper.UpdateLibraryHead` pero ninguno
+pre-checkea storage ni ajusta `storage_counters` con el delta del árbol):
+
+1. CopyFile / copyBatchFiles / batch_operations copy
+   `internal/api/v2/files.go:2326`, `:2917`
+   `internal/api/v2/batch_operations.go:494`
+   - copia añade bytes al destino
+   - no hay CheckStorageQuota
+   - no hay IncrementStorageCounters
+   - Impacto: un usuario puede duplicar files grandes y superar su cap sin que
+     el counter lo registre
+
+2. MoveFile inter-repo
+   `internal/api/v2/files.go:1965`
+   - el counter per-library del destino no se incrementa
+   - org/user totales solo quedan correctos si source y dest son del mismo owner
+   - no hay CheckStorageQuota
+
+3. RevertFile / RevertDirectory
+   `internal/api/v2/files.go:3553`, `:3698`
+   - revertir puede restaurar una versión más grande
+   - no hay CheckStorageQuota
+   - no hay ajuste de counter para el delta
+
+4. RestoreTrashItem / RevertDirents
+   `internal/api/v2/trash.go:329`, `:656`
+   - counters SÍ se incrementan (líneas 452, 787)
+   - pero NO hay CheckStorageQuota: si la cap bajó mientras los items estaban
+     en trash, el restore empuja al tenant por encima del límite sin warning
+
+5. OnlyOffice saveEditedDocument
+   `internal/api/v2/onlyoffice.go:1014`
+   - editar un doc cambia el tamaño del archivo
+   - no hay CheckStorageQuota
+   - no hay ajuste de counter por el delta
+   - counters van quedando stale en cada save
+
+Plantilla para el fix (ya existe en sync):
+- `internal/api/sync.go:2133` — `checkSyncCommitStorageQuota` calcula delta del árbol
+  con `commitTreeStats` + `calculateDirStats` y pre-checkea
+- `internal/traffic/storage.go:136` — `AdjustStorageCountersByDelta` con clamp
+  contra valores negativos
+
+Decisión abierta: centralizar la lógica delta-y-counter dentro de
+`FSHelper.UpdateLibraryHead` para que sea imposible olvidarse, o exigir que cada
+handler la llame explícitamente. La opción centralizada es más robusta pero rompe
+el contrato actual de los uploads que ya llaman `IncrementStorageCounters` directo.
+
+Regresiones a cubrir cuando se haga el fix:
+- copy de 10MB en org con `quota_total=1MB` → 403
+- restore desde trash de 5GB con org al 95% de un cap de 5GB → 403 / warning
+- OnlyOffice save que crece doc de 1MB a 100MB → counter +99MB
+- revert a versión histórica grande → counter refleja el delta y user con
+  hard-cap se bloquea
+- move cross-repo → counters per-library de source y destino reflejan el delta
+
+Ver `docs/KNOWN_ISSUES.md` → ISSUE-QUOTA-COVERAGE-01.
+
+
+### 1. ~~BUG: Per-user storage quota no se enforza en uploads~~ ✅ COMPLETADO (2026-05-14)
 
 `CheckStorageQuota` en `internal/traffic/checker.go:42-87` solo lee `organizations.storage_quota`.
 No consulta `users.quota_bytes`. El campo `quota_total` (API) / `quota_bytes` (DB) se persiste
@@ -43,13 +108,14 @@ los 500GB de la org, no hasta su límite personal de 1GB.
 Per-user traffic (`traffic_upload_quota`, `traffic_download_quota`) SÍ está enforzado.
 Solo el storage per-user está roto.
 
-Fix requerido (ver docs/KNOWN_ISSUES.md ISSUE-USER-STORAGE-ENFORCE-01):
-- Agregar `userID` a `CheckStorageQuota`
-- Leer `users.quota_bytes` cuando `userID != ""`
-- Leer counter `user:<orgID>:<userID>` de `storage_counters`
-- Aplicar misma lógica hard/soft que el check de org
-- Actualizar callers en `HandleUpload`, `UploadFile`, `UploadBlock`
-- Test de regresión: user con 1GB cap inside 500GB org debe bloquearse a 1GB
+Implementado:
+- `CheckStorageQuota` ahora recibe `userID`
+- lee `users.quota_bytes` cuando aplica
+- lee counter `user:<orgID>:<userID>` de `storage_counters`
+- aplica la misma logica hard/soft que el check de org
+- devuelve el resultado mas restrictivo entre org y usuario
+- callers actualizados en `HandleUpload`, `UploadFile`, `UploadBlock`, `PutBlock` y `QuotaCheck`
+- sync valida el delta real del arbol antes de publicar HEAD en `PutCommit HEAD` / `UpdateBranch`
 
 
 ### 2. Formalizar el path M2M interno de Accounts -> SesameFS
@@ -161,7 +227,7 @@ Hace falta devolver y mostrar errores más accionables.
 Falta una UI clara para el panel admin que muestre:
 - si el usuario tiene override explícito de quota_total o hereda de la org
 - distinguir override explícito vs sin límite propio
-- nota: per-user storage enforcement no está implementado aún (ver item 1 / ISSUE-USER-STORAGE-ENFORCE-01)
+- nota: per-user storage enforcement ya esta implementado; la UI debe distinguir override explicito vs sin limite propio
 
 
 ### 10. UI/admin story para traffic quotas
@@ -208,8 +274,8 @@ Esto es útil, pero no forma parte del núcleo ya implementado de enforcement.
 
 ## ORDEN PRACTICO RECOMENDADO
 
-1. Corregir bug per-user storage enforcement (ISSUE-USER-STORAGE-ENFORCE-01) — blocker UX si Accounts ya configura limits per-user
+1. Cerrar boquetes de cobertura de quota en mutaciones V2 (ISSUE-QUOTA-COVERAGE-01)
 2. Formalizar path M2M interno de Accounts
-3. Cerrar el flujo de invite/create users vía Accounts
+3. Cerrar el flujo de invite/create users via Accounts
 4. Resolver identificadores externos y snapshot pre-downgrade
-5. Completar auditoría, UX fina y observabilidad
+5. Completar auditoria, UX fina y observabilidad

@@ -79,7 +79,7 @@ Persisted per-user quota fields on `users`:
 
 | Field | Type | Meaning |
 |---|---|---|
-| `quota_total` | int64 bytes | Per-user storage cap. Validated against the org's `storage_quota` on write ([internal/api/v2/write_helpers.go:901-912](internal/api/v2/write_helpers.go#L901-L912)): a per-user value cannot exceed the org cap. |
+| `quota_total` | int64 bytes | Per-user storage cap. Validated against the org's `storage_quota` on write ([internal/api/v2/write_helpers.go:901-912](internal/api/v2/write_helpers.go#L901-L912)) and enforced during upload storage pre-checks. |
 | `traffic_upload_quota` | int64 bytes | Per-user upload cap for the active period. Enforced ([internal/traffic/checker.go:164-197](internal/traffic/checker.go#L164-L197)). |
 | `traffic_download_quota` | int64 bytes | Per-user download cap for the active period. Enforced. |
 

@@ -169,10 +169,12 @@ func (h *BlockHandler) UploadBlock(c *gin.Context) {
 
 	uploadTrafficStatus := traffic.QuotaStatus{Allowed: true}
 	if checker := traffic.GetChecker(); checker != nil {
+		orgID := c.GetString("org_id")
+		userID := c.GetString("user_id")
 		uploadTrafficStatus, _ = traffic.CheckTrafficQuotaWithChecker(
 			checker,
-			c.GetString("org_id"),
-			c.GetString("user_id"),
+			orgID,
+			userID,
 			"upload",
 			c.Request.ContentLength,
 		)
@@ -242,6 +244,13 @@ func (h *BlockHandler) UploadBlock(c *gin.Context) {
 			New:  false,
 		})
 		return
+	}
+
+	if checker := traffic.GetChecker(); checker != nil {
+		if st, _ := checker.CheckStorageQuota(c.GetString("org_id"), c.GetString("user_id"), int64(len(data))); !st.Allowed {
+			c.JSON(http.StatusForbidden, gin.H{"error": "storage quota exceeded"})
+			return
+		}
 	}
 
 	// Store the block

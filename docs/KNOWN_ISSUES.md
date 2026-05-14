@@ -39,7 +39,8 @@ This document tracks all known bugs, limitations, and issues in SesameFS.
 | **Login Analytics History** | 🟡 Partial | `last_login` is now real and persisted in `users.last_login_at`, but there is still no historical login event dataset for trend analysis, login audit timelines, or period-based "users who logged in" charts. See ISSUE-LOGIN-ANALYTICS-01 below. |
 | **File Statistics Pages Are Still Stubbed** | 🟡 Pending | `/sys/statistics/file/` currently returns all-zero series and `/org/statistics-admin/file/` is still unimplemented. Real data depends on new `file_update_logs` and `file_access_logs` tables, not on `login_logs`. See ISSUE-FILE-STATS-01 below. |
 | **Org Admin Statistics Can Leak Platform Scope** | 🔴 Confirmed bug | When org-admin pages are mounted with platform-org context, traffic-based org-admin metrics can resolve to the global aggregate instead of a tenant scope. Affects at least org-admin traffic, org-admin per-user traffic, and org-admin active-users. See ISSUE-ORG-STATS-SCOPE-01 below. |
-| **Per-User Storage Quota Not Enforced at Upload Time** | 🔴 Confirmed bug | `quota_total` is persisted and validated on write but never consulted by `CheckStorageQuota` at upload time. Only the org-level `storage_quota` gates uploads. Per-user storage caps set via the admin API have no effect on actual upload blocking. See ISSUE-USER-STORAGE-ENFORCE-01 below. |
+| **Per-User Storage Quota Enforcement** | ✅ Fixed (2026-05-14) | `CheckStorageQuota` now evaluates org and per-user storage caps; upload callers pass `userID`; sync validates the published tree delta before advancing HEAD. See ISSUE-USER-STORAGE-ENFORCE-01 below. |
+| **Quota Enforcement Coverage Gaps in V2 Mutations** | 🔴 Confirmed bug (2026-05-14) | Copy, RevertFile/RevertDirectory, RestoreTrashItem, OnlyOffice save, and inter-repo MoveFile bypass storage quota pre-check and/or leave `storage_counters` stale. Uploads and sync commits are correct; the gap is on non-upload mutations that still grow bytes. See ISSUE-QUOTA-COVERAGE-01 below. |
 
 ### 🟡 SeaDrive 3.x Missing Endpoints (Non-fatal, but degrade UX)
 | Issue | Status | Notes |
@@ -245,38 +246,107 @@ This is a scope-boundary bug, not a traffic math bug.
 
 ---
 
-### ISSUE-USER-STORAGE-ENFORCE-01: Per-User Storage Quota Not Enforced at Upload Time
+### ISSUE-USER-STORAGE-ENFORCE-01: Per-User Storage Quota Enforcement
 
-**Status**: 🔴 Confirmed bug (2026-04-21)
-**Severity**: High — per-user storage caps set via the admin API have no effect on actual upload blocking
-**Affected**: `PUT /api/v2.1/admin/organizations/:org_id/users/:email/` (`quota_total` field); all upload handlers
+**Status**: ✅ Fixed (2026-05-14)
+**Severity before fix**: High — per-user storage caps set via the admin API had no effect on actual upload blocking
+**Affected before fix**: `PUT /api/v2.1/admin/organizations/:org_id/users/:email/` (`quota_total` field); upload handlers
 
-#### Problem
+#### Resolution
 
-`quota_total` is correctly persisted to the `users` table and validated on write against the org's `storage_quota` ([internal/api/v2/write_helpers.go:901-912](internal/api/v2/write_helpers.go#L901-L912)). However, `CheckStorageQuota` in [internal/traffic/checker.go:42-87](internal/traffic/checker.go#L42-L87) only reads `organizations.storage_quota` and the live counter for `org:<orgID>`. It never queries `users.quota_bytes`.
+`quota_total` is persisted to the `users` table and validated on write against the org's `storage_quota` ([internal/api/v2/write_helpers.go:901-912](internal/api/v2/write_helpers.go#L901-L912)). `CheckStorageQuota` now receives `userID`, reads `users.quota_bytes`, reads the live per-user counter `user:<orgID>:<userID>`, and returns the more restrictive result between org-level storage and per-user storage.
 
-As a result, a user whose `quota_total` is set to (for example) 1 GB within a 500 GB org can upload freely until the org-level 500 GB cap is hit, not until their personal 1 GB cap is hit.
+Updated upload paths pass `userID` into the storage pre-check. Sync also validates the real committed tree delta before publishing a new HEAD, so multi-block desktop uploads are checked against the final storage increase rather than only against each individual block.
 
-#### Root Cause
+#### Previous Root Cause
 
 - `CheckStorageQuota(orgID, additionalBytes)` receives only `orgID` — no `userID` parameter.
 - The function queries `organizations WHERE org_id = ?` for `storage_quota` and `quota_policy`. `users.quota_bytes` is never read here.
 - The `storage_counters` table stores per-user counters (`user:<orgID>:<userID>`) which are correctly maintained by `IncrementStorageCounters` / `DecrementStorageCounters`, but those counters are also never consulted during upload pre-checks.
 
-#### Remaining Work
+#### Implemented
 
-1. Add `userID` parameter to `CheckStorageQuota` (or create a new `CheckUserStorageQuota`).
-2. Read `users.quota_bytes` when `userID != ""`.
-3. If `userQuota > 0`: read `storage_counters` for `user:<orgID>:<userID>` and enforce the cap against `quota_policy` (same hard/soft logic as the org check).
-4. Return the more restrictive of org-level and user-level results.
-5. Update all callers in upload handlers (`HandleUpload`, `UploadFile`, `UploadBlock`) to pass `userID`.
-6. Add regression test: user with 1 GB cap inside a 500 GB org must be blocked at 1 GB.
+1. `CheckStorageQuota(orgID, userID, additionalBytes)`.
+2. Per-user `users.quota_bytes` lookup.
+3. Per-user `storage_counters` lookup using `user:<orgID>:<userID>`.
+4. Same hard/soft enforcement logic as org storage quota.
+5. Most-restrictive result selection between org and user caps.
+6. Callers updated in web, v2 block/file upload, sync block upload, sync quota-check, and sync commit HEAD/update-branch.
 
 #### Related
 
 - `internal/traffic/checker.go` — `CheckStorageQuota` function
 - `internal/api/seafhttp.go` — `HandleUpload`, upload callers
 - `docs/ACCOUNTS-DASHBOARD-INTEGRATION.md` — §5.2 documents `quota_total` as enforced; fix here must make that description accurate
+
+---
+
+### ISSUE-QUOTA-COVERAGE-01: Quota Enforcement Coverage Gaps in V2 FS Mutations
+
+**Status**: 🔴 Confirmed bug (2026-05-14)
+**Severity**: High — multiple non-upload paths grow storage without pre-check, and `storage_counters` drifts from real disk usage on those paths
+**Affected**: V2 file mutation endpoints that go through `FSHelper.UpdateLibraryHead` but are not file uploads
+
+#### Problem
+
+ISSUE-USER-STORAGE-ENFORCE-01 fixed quota enforcement on upload paths (`HandleUpload`, `UploadFile`, `UploadBlock`, sync `PutBlock`) and on the sync commit publish (`PutCommit HEAD`, `UpdateBranch`). Those are now correct: they pre-check storage and they update `storage_counters` either via `IncrementStorageCounters` or via `AdjustStorageCountersByDelta`.
+
+However, several other V2 mutation handlers can also grow the on-disk byte count for an org/user/library, and they are not wired into either side of the enforcement:
+
+1. **CopyFile / copyBatchFiles** ([internal/api/v2/files.go:2326](internal/api/v2/files.go#L2326), [internal/api/v2/files.go:2917](internal/api/v2/files.go#L2917)) and **batch copy** ([internal/api/v2/batch_operations.go:494](internal/api/v2/batch_operations.go#L494))
+   - Adds new entries to the destination tree, increasing library/org/user storage.
+   - No `CheckStorageQuota` pre-check.
+   - No `IncrementStorageCounters` call after `UpdateLibraryHead`.
+   - Net effect: an admin-configured cap can be exceeded purely through copies, and the counters under-report.
+
+2. **MoveFile inter-repo** ([internal/api/v2/files.go:1965](internal/api/v2/files.go#L1965))
+   - Same library counter is not updated for the destination repo.
+   - The org/user totals only stay correct when source and destination belong to the same owner, because the delete-and-recreate steps net out at the aggregate scopes. Cross-owner moves drift the per-user counter.
+   - No `CheckStorageQuota` pre-check.
+
+3. **RevertFile / RevertDirectory** ([internal/api/v2/files.go:3553](internal/api/v2/files.go#L3553), [internal/api/v2/files.go:3698](internal/api/v2/files.go#L3698))
+   - Reverting can restore a larger historical version and grow storage.
+   - No `CheckStorageQuota` pre-check.
+   - No counter adjustment for the delta between the current tree and the reverted tree.
+
+4. **RestoreTrashItem / RevertDirents** ([internal/api/v2/trash.go:329](internal/api/v2/trash.go#L329), [internal/api/v2/trash.go:656](internal/api/v2/trash.go#L656))
+   - Counters *are* incremented at [trash.go:452](internal/api/v2/trash.go#L452) and [trash.go:787](internal/api/v2/trash.go#L787), so the bytes side is right.
+   - But there is no `CheckStorageQuota` pre-check, so if the org/user quota was lowered (or filled by other activity) while items were in trash, restoring pushes the tenant over the cap silently.
+
+5. **OnlyOffice `saveEditedDocument`** ([internal/api/v2/onlyoffice.go:1014](internal/api/v2/onlyoffice.go#L1014))
+   - Saving the edited document publishes a new commit whose file size can be larger or smaller than the previous version.
+   - No `CheckStorageQuota` pre-check before accepting the save.
+   - No counter adjustment after `UpdateLibraryHead`. Counters drift on every OnlyOffice save.
+
+#### Why It Slipped Through
+
+`FSHelper.UpdateLibraryHead` is the convergence point for all V2 FS mutations, but it intentionally only updates `libraries.size_bytes` / `file_count` from a tree recomputation. It is deliberately decoupled from counters because the original design counted counters at the handler level. Each handler that *adds* bytes is expected to also call `IncrementStorageCounters` (uploads do this) and pre-check via `CheckStorageQuota` (uploads do this). The handlers above were never wired in.
+
+Desktop sync hits a different code path (`updateLibraryHeadWithStats` → `AdjustStorageCountersByDelta`) and does compute and apply the tree delta correctly, which is why sync is not in this list.
+
+#### Remaining Work
+
+For each affected handler:
+
+1. Compute the byte delta (`newTreeSize - currentTreeSize`) using the same helpers that sync now uses (`commitTreeStats` + `calculateDirStats`).
+2. If the delta is positive, pre-check via `CheckStorageQuota(orgID, userID, delta)` before calling `UpdateLibraryHead`.
+3. After `UpdateLibraryHead`, call `traffic.AdjustStorageCountersByDelta(db, orgID, userID, repoID, deltaBytes, deltaFiles)`.
+
+Open design question: should `FSHelper.UpdateLibraryHead` itself centralize the delta calculation and counter adjustment (single point of correctness, matching the sync model) or should each handler keep doing it explicitly? Centralizing is more robust but changes the contract for current upload handlers that already call `IncrementStorageCounters` directly.
+
+#### Regression Tests Needed
+
+- Copy a 10MB file inside an org with `quota_total = 1MB` → expect 403.
+- Restore a 5GB file from trash when the org used 95% of a 5GB cap → expect 403 (or soft warning on paid plan).
+- OnlyOffice save that grows a 1MB doc to 100MB → counter must reflect +99MB.
+- RevertFile that restores a 200MB historical version of a current 1MB file → counter must reflect +199MB, and a hard-cap user must be blocked.
+- Cross-repo move of a 1GB file → per-library counters of source and destination must each reflect the delta.
+
+#### Related
+
+- ISSUE-USER-STORAGE-ENFORCE-01 (fixed) — same enforcement model, narrower coverage.
+- [internal/api/sync.go:2133](internal/api/sync.go#L2133) — `checkSyncCommitStorageQuota` is the template for handlers to follow.
+- [internal/traffic/storage.go:136](internal/traffic/storage.go#L136) — `AdjustStorageCountersByDelta` with negative-clamp protection.
 
 ---
 

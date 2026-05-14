@@ -115,7 +115,7 @@ Within an org, the admin can assign individual limits per user:
 - Most restrictive check wins: if the org is blocked, the user cannot upload even if they have individual quota remaining
 - No `traffic_quota` (combined) at user level — only at org level
 
-> **⚠️ Known issue (ISSUE-USER-STORAGE-ENFORCE-01):** Per-user storage enforcement (`quota_total`/`quota_bytes`) is NOT currently enforced at upload time. `CheckStorageQuota` only reads the org-level `storage_quota`; it does not consult `users.quota_bytes`. Per-user traffic (`traffic_upload_quota`, `traffic_download_quota`) IS enforced. See `docs/KNOWN_ISSUES.md` for the full description and fix plan.
+> **Resolved (2026-05-14):** Per-user storage enforcement (`quota_total`/`quota_bytes`) is enforced at upload time. `CheckStorageQuota` evaluates both org-level `storage_quota` and `users.quota_bytes`, reads the matching `storage_counters` scopes, and returns the most restrictive result.
 
 ---
 
@@ -462,7 +462,7 @@ type Checker struct {
     session *gocql.Session
 }
 
-func (c *Checker) CheckStorageQuota(orgID string, additionalBytes int64) (QuotaStatus, error)
+func (c *Checker) CheckStorageQuota(orgID, userID string, additionalBytes int64) (QuotaStatus, error)
 func (c *Checker) CheckTrafficQuota(orgID, userID, direction string, additionalBytes int64) (QuotaStatus, error)
 func (c *Checker) CheckMaxUsers(orgID string) (QuotaStatus, error)
 ```
@@ -518,7 +518,7 @@ CheckTrafficQuota(orgID, userID, direction, additionalBytes):
 func (h *SyncHandler) QuotaCheck(c *gin.Context) {
     orgID := c.GetString("org_id")
     userID := c.GetString("user_id")
-    status, _ := checker.CheckStorageQuota(orgID, 0)
+    status, _ := checker.CheckStorageQuota(orgID, userID, 0)
     c.JSON(200, gin.H{
         "has_quota":  status.Allowed,
         "remaining":  status.LimitBytes - status.UsedBytes,
@@ -528,7 +528,7 @@ func (h *SyncHandler) QuotaCheck(c *gin.Context) {
 
 **Upload pre-check** (before reading request data):
 ```go
-storageStatus, _ := checker.CheckStorageQuota(orgID, contentLength)
+storageStatus, _ := checker.CheckStorageQuota(orgID, userID, contentLength)
 if !storageStatus.Allowed {
     c.JSON(403, gin.H{"error": "storage quota exceeded"})
     return
