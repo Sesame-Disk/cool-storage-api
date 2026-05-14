@@ -71,24 +71,28 @@ func storageUpdate(session *gocql.Session, scope string, day time.Time, deltaByt
 // and library. Updates both the running total and today's daily delta.
 // Runs fire-and-forget — never blocks the caller.
 func IncrementStorageCounters(db DBSession, orgID, userID, libraryID string, deltaBytes int64, deltaFiles int64) {
-	today := time.Now().UTC().Truncate(24 * time.Hour)
 	go func() {
-		session := db.Session()
-		scopes := []string{
-			PlatformStorageScope(),
-			OrganizationStorageScope(orgID),
-		}
-		if userID != "" {
-			scopes = append(scopes, UserStorageScope(orgID, userID))
-		}
-		if libraryID != "" {
-			scopes = append(scopes, LibraryStorageScope(orgID, libraryID))
-		}
-		for _, scope := range scopes {
-			storageUpdate(session, scope, storageTotalDay, deltaBytes, deltaFiles)
-			storageUpdate(session, scope, today, deltaBytes, deltaFiles)
+		if err := IncrementStorageCountersSync(db, orgID, userID, libraryID, deltaBytes, deltaFiles); err != nil {
+			log.Printf("[storage] increment counters error org=%s user=%s lib=%s: %v", orgID, userID, libraryID, err)
 		}
 	}()
+}
+
+// IncrementStorageCountersSync increments storage usage and returns only after
+// all scope rows have been updated.
+func IncrementStorageCountersSync(db DBSession, orgID, userID, libraryID string, deltaBytes int64, deltaFiles int64) error {
+	today := time.Now().UTC().Truncate(24 * time.Hour)
+	session := db.Session()
+	scopes := storageScopes(orgID, userID, libraryID)
+	for _, scope := range scopes {
+		if err := storageUpdateErr(session, scope, storageTotalDay, deltaBytes, deltaFiles); err != nil {
+			return err
+		}
+		if err := storageUpdateErr(session, scope, today, deltaBytes, deltaFiles); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // DecrementStorageCounters atomically decrements storage usage for org, user,
@@ -98,36 +102,42 @@ func DecrementStorageCounters(db DBSession, orgID, userID, libraryID string, del
 	if deltaBytes <= 0 && deltaFiles <= 0 {
 		return
 	}
-	today := time.Now().UTC().Truncate(24 * time.Hour)
 	go func() {
-		session := db.Session()
-		scopes := []string{
-			PlatformStorageScope(),
-			OrganizationStorageScope(orgID),
-		}
-		if userID != "" {
-			scopes = append(scopes, UserStorageScope(orgID, userID))
-		}
-		if libraryID != "" {
-			scopes = append(scopes, LibraryStorageScope(orgID, libraryID))
-		}
-		for _, scope := range scopes {
-			var curBytes, curFiles int64
-			_ = session.Query(
-				`SELECT bytes_used, file_count FROM storage_counters WHERE scope = ? AND day = ?`,
-				scope, storageTotalDay,
-			).Scan(&curBytes, &curFiles)
-
-			actBytes := min(deltaBytes, max(curBytes, 0))
-			actFiles := min(deltaFiles, max(curFiles, 0))
-			if actBytes <= 0 && actFiles <= 0 {
-				continue
-			}
-
-			storageUpdate(session, scope, storageTotalDay, -actBytes, -actFiles)
-			storageUpdate(session, scope, today, -actBytes, -actFiles)
+		if err := DecrementStorageCountersSync(db, orgID, userID, libraryID, deltaBytes, deltaFiles); err != nil {
+			log.Printf("[storage] decrement counters error org=%s user=%s lib=%s: %v", orgID, userID, libraryID, err)
 		}
 	}()
+}
+
+// DecrementStorageCountersSync decrements storage usage and caps negative
+// deltas at the current running total for each scope.
+func DecrementStorageCountersSync(db DBSession, orgID, userID, libraryID string, deltaBytes int64, deltaFiles int64) error {
+	if deltaBytes <= 0 && deltaFiles <= 0 {
+		return nil
+	}
+	today := time.Now().UTC().Truncate(24 * time.Hour)
+	session := db.Session()
+	for _, scope := range storageScopes(orgID, userID, libraryID) {
+		var curBytes, curFiles int64
+		_ = session.Query(
+			`SELECT bytes_used, file_count FROM storage_counters WHERE scope = ? AND day = ?`,
+			scope, storageTotalDay,
+		).Scan(&curBytes, &curFiles)
+
+		actBytes := min(deltaBytes, max(curBytes, 0))
+		actFiles := min(deltaFiles, max(curFiles, 0))
+		if actBytes <= 0 && actFiles <= 0 {
+			continue
+		}
+
+		if err := storageUpdateErr(session, scope, storageTotalDay, -actBytes, -actFiles); err != nil {
+			return err
+		}
+		if err := storageUpdateErr(session, scope, today, -actBytes, -actFiles); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // AdjustStorageCountersByDelta applies an arbitrary signed delta to platform,
@@ -137,28 +147,48 @@ func AdjustStorageCountersByDelta(db DBSession, orgID, userID, libraryID string,
 	if deltaBytes == 0 && deltaFiles == 0 {
 		return
 	}
-	today := time.Now().UTC().Truncate(24 * time.Hour)
 	go func() {
-		session := db.Session()
-		scopes := []string{
-			PlatformStorageScope(),
-			OrganizationStorageScope(orgID),
-		}
-		if userID != "" {
-			scopes = append(scopes, UserStorageScope(orgID, userID))
-		}
-		if libraryID != "" {
-			scopes = append(scopes, LibraryStorageScope(orgID, libraryID))
-		}
-		for _, scope := range scopes {
-			bytesDelta, filesDelta := clampNegativeStorageDelta(session, scope, deltaBytes, deltaFiles)
-			if bytesDelta == 0 && filesDelta == 0 {
-				continue
-			}
-			storageUpdate(session, scope, storageTotalDay, bytesDelta, filesDelta)
-			storageUpdate(session, scope, today, bytesDelta, filesDelta)
+		if err := AdjustStorageCountersByDeltaSync(db, orgID, userID, libraryID, deltaBytes, deltaFiles); err != nil {
+			log.Printf("[storage] adjust counters error org=%s user=%s lib=%s: %v", orgID, userID, libraryID, err)
 		}
 	}()
+}
+
+// AdjustStorageCountersByDeltaSync applies an arbitrary signed delta and returns
+// after all affected scope rows have been updated.
+func AdjustStorageCountersByDeltaSync(db DBSession, orgID, userID, libraryID string, deltaBytes, deltaFiles int64) error {
+	if deltaBytes == 0 && deltaFiles == 0 {
+		return nil
+	}
+	today := time.Now().UTC().Truncate(24 * time.Hour)
+	session := db.Session()
+	for _, scope := range storageScopes(orgID, userID, libraryID) {
+		bytesDelta, filesDelta := clampNegativeStorageDelta(session, scope, deltaBytes, deltaFiles)
+		if bytesDelta == 0 && filesDelta == 0 {
+			continue
+		}
+		if err := storageUpdateErr(session, scope, storageTotalDay, bytesDelta, filesDelta); err != nil {
+			return err
+		}
+		if err := storageUpdateErr(session, scope, today, bytesDelta, filesDelta); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func storageScopes(orgID, userID, libraryID string) []string {
+	scopes := []string{
+		PlatformStorageScope(),
+		OrganizationStorageScope(orgID),
+	}
+	if userID != "" {
+		scopes = append(scopes, UserStorageScope(orgID, userID))
+	}
+	if libraryID != "" {
+		scopes = append(scopes, LibraryStorageScope(orgID, libraryID))
+	}
+	return scopes
 }
 
 func clampNegativeStorageDelta(session *gocql.Session, scope string, deltaBytes, deltaFiles int64) (int64, int64) {

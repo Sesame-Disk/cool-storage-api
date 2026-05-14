@@ -1,6 +1,6 @@
 ================================================================================
   QUOTAS — PENDIENTES VIGENTES
-    Última actualización: 2026-04-21
+    Última actualización: 2026-05-14
 ================================================================================
 
 Este archivo fue limpiado para dejar solo trabajo pendiente real.
@@ -35,7 +35,10 @@ Lo pendiente ya no es el modelo base de quotas. Lo pendiente es cerrar la integr
 
 Después de cerrar ISSUE-USER-STORAGE-ENFORCE-01 quedaron 5 handlers que también
 publican commits que crecen storage pero no están enchufados al sistema de quotas.
-Los uploads y el path de sync (PutCommit / UpdateBranch) sí quedaron correctos.
+Los uploads y el path de sync (PutCommit / UpdateBranch) sí quedaron cubiertos:
+uploads validan el delta visible del path (incluyendo chunked total y replace),
+y sync valida el delta del árbol publicado y espera el ajuste de
+`storage_counters` antes de responder.
 
 Handlers afectados (todos llaman a `FSHelper.UpdateLibraryHead` pero ninguno
 pre-checkea storage ni ajusta `storage_counters` con el delta del árbol):
@@ -74,16 +77,16 @@ pre-checkea storage ni ajusta `storage_counters` con el delta del árbol):
    - no hay ajuste de counter por el delta
    - counters van quedando stale en cada save
 
-Plantilla para el fix (ya existe en sync):
+Plantilla para el fix (ya existe en sync/uploads):
 - `internal/api/sync.go:2133` — `checkSyncCommitStorageQuota` calcula delta del árbol
   con `commitTreeStats` + `calculateDirStats` y pre-checkea
-- `internal/traffic/storage.go:136` — `AdjustStorageCountersByDelta` con clamp
+- `internal/traffic/storage.go:136` — `AdjustStorageCountersByDelta` / `AdjustStorageCountersByDeltaSync` con clamp
   contra valores negativos
 
 Decisión abierta: centralizar la lógica delta-y-counter dentro de
 `FSHelper.UpdateLibraryHead` para que sea imposible olvidarse, o exigir que cada
 handler la llame explícitamente. La opción centralizada es más robusta pero rompe
-el contrato actual de los uploads que ya llaman `IncrementStorageCounters` directo.
+el contrato actual de los uploads que aplican counters con delta visible.
 
 Regresiones a cubrir cuando se haga el fix:
 - copy de 10MB en org con `quota_total=1MB` → 403
@@ -94,6 +97,16 @@ Regresiones a cubrir cuando se haga el fix:
 - move cross-repo → counters per-library de source y destino reflejan el delta
 
 Ver `docs/KNOWN_ISSUES.md` → ISSUE-QUOTA-COVERAGE-01.
+
+Deuda técnica remanente de este frente:
+- el flujo `pre-check -> publish -> adjust counters` sigue siendo split-phase
+  bajo concurrencia; no es una transacción única (ver `docs/TECHNICAL-DEBT.md` §12d)
+- si falla el ajuste de counters después de publicar, el commit puede quedar
+  visible aunque la request falle
+- el pre-check de upload chunked se re-ejecuta en cada chunk + en finalize,
+  con tree-walk por nivel de directorio en `directoryEntriesAtPath`; correcto
+  pero costoso para uploads de muchos chunks (ver `docs/TECHNICAL-DEBT.md` §12e)
+- nada de esto es el gap funcional principal de este issue
 
 
 ### 1. ~~BUG: Per-user storage quota no se enforza en uploads~~ ✅ COMPLETADO (2026-05-14)

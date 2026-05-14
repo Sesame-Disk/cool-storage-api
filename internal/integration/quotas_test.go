@@ -286,6 +286,73 @@ func TestDeduplicatedSyncBlockUploadSkipsStorageQuota(t *testing.T) {
 	}
 }
 
+func TestChunkedWebUploadChecksTotalStorageQuota(t *testing.T) {
+	originalOrg := getAdminOrganizationInfo(t, defaultOrgID)
+	originalUser := getAdminUserByEmail(t, defaultUserEmail)
+	restoreDefaultOrgAndUserQuotasOnCleanup(t, originalOrg, originalUser)
+
+	updateAdminOrganizationQuotas(t, defaultOrgID, map[string]interface{}{
+		"storage_quota": int64(1 << 50),
+		"quota_policy":  "hard",
+	})
+
+	currentUsage := jsonInt64(getAdminUserByEmail(t, defaultUserEmail), "quota_usage")
+	setDefaultUserQuota(t, currentUsage+10)
+
+	repoID := createTestLibrary(t, userClient, fmt.Sprintf("inttest-chunked-quota-%d", time.Now().UnixNano()))
+	uploadURL := getUploadURL(t, userClient, repoID)
+
+	status, body := uploadChunkThroughLinkStatus(t, userClient, uploadURL, "chunked-quota.txt", "/", []byte("0123456789"), "bytes 0-9/30")
+	if status != http.StatusForbidden {
+		t.Fatalf("chunked upload status = %d, want %d; body=%s", status, http.StatusForbidden, body)
+	}
+	if !strings.Contains(body, "storage quota exceeded") {
+		t.Fatalf("chunked upload body = %q, want storage quota exceeded", body)
+	}
+}
+
+func TestWebUploadReplaceUsesStorageDelta(t *testing.T) {
+	originalOrg := getAdminOrganizationInfo(t, defaultOrgID)
+	originalUser := getAdminUserByEmail(t, defaultUserEmail)
+	restoreDefaultOrgAndUserQuotasOnCleanup(t, originalOrg, originalUser)
+
+	updateAdminOrganizationQuotas(t, defaultOrgID, map[string]interface{}{
+		"storage_quota": int64(1 << 50),
+		"quota_policy":  "hard",
+	})
+
+	baselineUsage := jsonInt64(getAdminUserByEmail(t, defaultUserEmail), "quota_usage")
+	setDefaultUserQuota(t, baselineUsage+1000)
+
+	repoID := createTestLibrary(t, userClient, fmt.Sprintf("inttest-replace-delta-%d", time.Now().UnixNano()))
+	uploadURL := getUploadURL(t, userClient, repoID)
+	fileName := "replace-delta.txt"
+
+	status, body := uploadFileThroughLinkStatus(t, userClient, uploadURL, fileName, "/", strings.Repeat("a", 100))
+	if status != http.StatusOK {
+		t.Fatalf("initial upload status = %d, want %d; body=%s", status, http.StatusOK, body)
+	}
+
+	afterInitialUsage := waitForUserQuotaUsage(t, baselineUsage+100)
+	setDefaultUserQuota(t, afterInitialUsage)
+
+	status, body = uploadFileThroughLinkStatus(t, userClient, uploadURL, fileName, "/", strings.Repeat("b", 100))
+	if status != http.StatusOK {
+		t.Fatalf("same-size replace status = %d, want %d; body=%s", status, http.StatusOK, body)
+	}
+	afterSameSizeReplace := waitForUserQuotaUsage(t, afterInitialUsage)
+	if afterSameSizeReplace != afterInitialUsage {
+		t.Fatalf("same-size replace usage = %d, want %d", afterSameSizeReplace, afterInitialUsage)
+	}
+
+	setDefaultUserQuota(t, afterInitialUsage+20)
+	status, body = uploadFileThroughLinkStatus(t, userClient, uploadURL, fileName, "/", strings.Repeat("c", 120))
+	if status != http.StatusOK {
+		t.Fatalf("larger replace status = %d, want %d; body=%s", status, http.StatusOK, body)
+	}
+	waitForUserQuotaUsage(t, afterInitialUsage+20)
+}
+
 func getAdminOrganizationInfo(t *testing.T, orgID string) map[string]interface{} {
 	t.Helper()
 	resp := superadminClient.Get(t, "/api/v2.1/admin/organizations/"+orgID+"/")
@@ -298,6 +365,50 @@ func updateAdminOrganizationQuotas(t *testing.T, orgID string, body map[string]i
 	resp := superadminClient.PutJSON(t, "/api/v2.1/admin/organizations/"+orgID+"/", body)
 	expectStatus(t, resp, http.StatusOK)
 	resp.Body.Close()
+}
+
+func restoreDefaultOrgAndUserQuotasOnCleanup(t *testing.T, originalOrg, originalUser map[string]interface{}) {
+	t.Helper()
+	t.Cleanup(func() {
+		restoreResp := superadminClient.PutJSON(t, "/api/v2.1/admin/users/"+url.PathEscape(defaultUserEmail)+"/", map[string]interface{}{
+			"quota_total": jsonInt64(originalUser, "quota_total"),
+		})
+		if restoreResp.StatusCode != http.StatusOK {
+			t.Logf("restore default user quota returned status %d body=%s", restoreResp.StatusCode, responseBody(t, restoreResp))
+		} else {
+			restoreResp.Body.Close()
+		}
+
+		restoreOrgBody := map[string]interface{}{
+			"storage_quota":          jsonInt64(originalOrg, "storage_quota"),
+			"traffic_quota":          jsonInt64(originalOrg, "traffic_quota"),
+			"traffic_upload_quota":   jsonInt64(originalOrg, "traffic_upload_quota"),
+			"traffic_download_quota": jsonInt64(originalOrg, "traffic_download_quota"),
+		}
+		if quotaPolicy := jsonString(originalOrg, "quota_policy"); quotaPolicy != "" {
+			restoreOrgBody["quota_policy"] = quotaPolicy
+		}
+		updateAdminOrganizationQuotas(t, defaultOrgID, restoreOrgBody)
+	})
+}
+
+func setDefaultUserQuota(t *testing.T, quota int64) {
+	t.Helper()
+	resp := superadminClient.PutJSON(t, "/api/v2.1/admin/users/"+url.PathEscape(defaultUserEmail)+"/", map[string]interface{}{
+		"quota_total": quota,
+	})
+	expectStatus(t, resp, http.StatusOK)
+	resp.Body.Close()
+}
+
+func waitForUserQuotaUsage(t *testing.T, want int64) int64 {
+	t.Helper()
+	var got int64
+	waitForCondition(t, fmt.Sprintf("default user quota_usage=%d", want), func() bool {
+		got = jsonInt64(getAdminUserByEmail(t, defaultUserEmail), "quota_usage")
+		return got == want
+	})
+	return got
 }
 
 func restoreOrgQuotasOnCleanup(t *testing.T, original map[string]interface{}) {
@@ -382,6 +493,53 @@ func uploadFileThroughLinkStatus(t *testing.T, c *testClient, uploadURL, fileNam
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		t.Fatalf("reading upload response failed: %v", err)
+	}
+	return resp.StatusCode, string(body)
+}
+
+func getUploadURL(t *testing.T, c *testClient, repoID string) string {
+	t.Helper()
+	resp := c.Get(t, fmt.Sprintf("/api2/repos/%s/upload-link/?p=/", repoID))
+	expectStatus(t, resp, http.StatusOK)
+	return strings.Trim(responseBody(t, resp), "\" \n\r")
+}
+
+func uploadChunkThroughLinkStatus(t *testing.T, c *testClient, uploadURL, fileName, parentDir string, content []byte, contentRange string) (int, string) {
+	t.Helper()
+
+	var buf bytes.Buffer
+	writer := multipart.NewWriter(&buf)
+	part, err := writer.CreateFormFile("file", fileName)
+	if err != nil {
+		t.Fatalf("CreateFormFile failed: %v", err)
+	}
+	if _, err := part.Write(content); err != nil {
+		t.Fatalf("writing chunk content failed: %v", err)
+	}
+	if err := writer.WriteField("parent_dir", parentDir); err != nil {
+		t.Fatalf("WriteField failed: %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("closing multipart writer failed: %v", err)
+	}
+
+	req, err := http.NewRequest(http.MethodPost, uploadURL, &buf)
+	if err != nil {
+		t.Fatalf("creating chunk upload request failed: %v", err)
+	}
+	req.Header.Set("Authorization", "Token "+c.token)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	req.Header.Set("Content-Range", contentRange)
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		t.Fatalf("chunk upload request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("reading chunk upload response failed: %v", err)
 	}
 	return resp.StatusCode, string(body)
 }

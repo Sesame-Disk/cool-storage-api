@@ -39,8 +39,8 @@ This document tracks all known bugs, limitations, and issues in SesameFS.
 | **Login Analytics History** | 🟡 Partial | `last_login` is now real and persisted in `users.last_login_at`, but there is still no historical login event dataset for trend analysis, login audit timelines, or period-based "users who logged in" charts. See ISSUE-LOGIN-ANALYTICS-01 below. |
 | **File Statistics Pages Are Still Stubbed** | 🟡 Pending | `/sys/statistics/file/` currently returns all-zero series and `/org/statistics-admin/file/` is still unimplemented. Real data depends on new `file_update_logs` and `file_access_logs` tables, not on `login_logs`. See ISSUE-FILE-STATS-01 below. |
 | **Org Admin Statistics Can Leak Platform Scope** | 🔴 Confirmed bug | When org-admin pages are mounted with platform-org context, traffic-based org-admin metrics can resolve to the global aggregate instead of a tenant scope. Affects at least org-admin traffic, org-admin per-user traffic, and org-admin active-users. See ISSUE-ORG-STATS-SCOPE-01 below. |
-| **Per-User Storage Quota Enforcement** | ✅ Fixed (2026-05-14) | `CheckStorageQuota` now evaluates org and per-user storage caps; upload callers pass `userID`; sync validates the published tree delta before advancing HEAD. See ISSUE-USER-STORAGE-ENFORCE-01 below. |
-| **Quota Enforcement Coverage Gaps in V2 Mutations** | 🔴 Confirmed bug (2026-05-14) | Copy, RevertFile/RevertDirectory, RestoreTrashItem, OnlyOffice save, and inter-repo MoveFile bypass storage quota pre-check and/or leave `storage_counters` stale. Uploads and sync commits are correct; the gap is on non-upload mutations that still grow bytes. See ISSUE-QUOTA-COVERAGE-01 below. |
+| **Per-User Storage Quota Enforcement** | ✅ Fixed (2026-05-14) | `CheckStorageQuota` now evaluates org and per-user storage caps; upload callers pass `userID`; sync validates the published tree delta before advancing HEAD and waits for the matching storage-counter adjust before returning. See ISSUE-USER-STORAGE-ENFORCE-01 below. |
+| **Quota Enforcement Coverage Gaps in V2 Mutations** | 🔴 Confirmed bug (2026-05-14) | Copy, RevertFile/RevertDirectory, RestoreTrashItem, OnlyOffice save, and inter-repo MoveFile bypass storage quota pre-check and/or leave `storage_counters` stale. Uploads now check the visible storage delta (including chunked upload totals and replace), and sync commits check the published tree delta and apply their counter delta before returning; the remaining functional gap is on non-upload mutations that still grow bytes. Split-phase publish/counter atomicity remains tracked as technical debt. See ISSUE-QUOTA-COVERAGE-01 below. |
 
 ### 🟡 SeaDrive 3.x Missing Endpoints (Non-fatal, but degrade UX)
 | Issue | Status | Notes |
@@ -256,7 +256,7 @@ This is a scope-boundary bug, not a traffic math bug.
 
 `quota_total` is persisted to the `users` table and validated on write against the org's `storage_quota` ([internal/api/v2/write_helpers.go:901-912](internal/api/v2/write_helpers.go#L901-L912)). `CheckStorageQuota` now receives `userID`, reads `users.quota_bytes`, reads the live per-user counter `user:<orgID>:<userID>`, and returns the more restrictive result between org-level storage and per-user storage.
 
-Updated upload paths pass `userID` into the storage pre-check. Sync also validates the real committed tree delta before publishing a new HEAD, so multi-block desktop uploads are checked against the final storage increase rather than only against each individual block.
+Updated upload paths pass `userID` into the storage pre-check. Web/direct uploads validate the visible storage delta, including chunked upload totals and replace-over-existing cases. Sync also validates the real committed tree delta before publishing a new HEAD, so multi-block desktop uploads are checked against the final storage increase rather than only against each individual block.
 
 #### Previous Root Cause
 
@@ -289,7 +289,7 @@ Updated upload paths pass `userID` into the storage pre-check. Sync also validat
 
 #### Problem
 
-ISSUE-USER-STORAGE-ENFORCE-01 fixed quota enforcement on upload paths (`HandleUpload`, `UploadFile`, `UploadBlock`, sync `PutBlock`) and on the sync commit publish (`PutCommit HEAD`, `UpdateBranch`). Those are now correct: they pre-check storage and they update `storage_counters` either via `IncrementStorageCounters` or via `AdjustStorageCountersByDelta`.
+ISSUE-USER-STORAGE-ENFORCE-01 fixed quota enforcement on upload paths (`HandleUpload`, `UploadFile`, `UploadBlock`, sync `PutBlock`) and on the sync commit publish (`PutCommit HEAD`, `UpdateBranch`). Those paths now pre-check storage against the right visible/published delta, and the sync commit publish also waits for its `storage_counters` adjustment before returning. The remaining debt is not missing enforcement on those upload paths; it is the split-phase publish/counter model under concurrency, tracked separately in `docs/TECHNICAL-DEBT.md`.
 
 However, several other V2 mutation handlers can also grow the on-disk byte count for an org/user/library, and they are not wired into either side of the enforcement:
 

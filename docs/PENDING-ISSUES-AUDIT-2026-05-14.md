@@ -42,14 +42,16 @@ Fixed after this audit. `CheckStorageQuota` now accepts `orgID`, `userID`, and `
 Evidence:
 - `internal/traffic/checker.go:43` defines `CheckStorageQuota(orgID, userID string, additionalBytes int64)`.
 - `internal/traffic/checker.go:58-78` reads org quota/counter plus user quota/counter when `userID` is present.
-- Upload callers pass `userID`: `internal/api/seafhttp.go:995`, `internal/api/v2/files.go:2709`, `internal/api/sync.go:876`, `internal/api/v2/blocks.go:174`.
+- Upload callers pass `userID` and now check the visible storage delta where needed: web/direct uploads cover chunked totals and replace deltas, block uploads skip storage checks for deduplicated blocks, and sync HEAD publishing validates the final tree delta.
 - Per-user storage counters are present elsewhere (`traffic.ReadStorageUsed(... "user:<org>:<user>")`) and are now used by the upload storage pre-check.
 
-Sync commit publishing now also checks the committed tree delta before advancing HEAD.
+Sync commit publishing now also checks the committed tree delta before advancing HEAD and waits for the matching storage-counter delta before the request returns.
+
+Residual debt remains: the publish/counter flow is still split-phase under concurrency, so this audit now treats that as technical debt rather than as an open coverage gap on upload/sync paths.
 
 ### 1b. Quota enforcement coverage gaps in V2 mutations
 
-Confirmed during post-fix review of ISSUE-USER-STORAGE-ENFORCE-01. The fix landed for uploads and for the sync commit publish, but five V2 mutation paths still grow on-disk bytes without participating in either side of the quota system (no `CheckStorageQuota` pre-check, and/or no `storage_counters` adjustment).
+Confirmed during post-fix review of ISSUE-USER-STORAGE-ENFORCE-01. The fix landed for uploads and for the sync commit publish, including chunked upload totals, replace deltas, deduplicated block uploads, and a blocking storage-counter adjust on sync HEAD publication. Five V2 mutation paths still grow on-disk bytes without participating in either side of the quota system (no `CheckStorageQuota` pre-check, and/or no `storage_counters` adjustment).
 
 Affected paths:
 

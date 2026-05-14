@@ -2074,7 +2074,8 @@ func (h *SyncHandler) updateFullPaths(libraryID, rootFSID string) {
 }
 
 // updateLibraryHeadWithStats updates head_commit_id in both libraries and libraries_by_id,
-// and asynchronously recalculates size_bytes and file_count from the directory tree.
+// then recalculates size_bytes/file_count and applies the matching storage-counter
+// delta before returning.
 // If expectedHead is provided and non-empty, uses Cassandra LWT (compare-and-swap)
 // to prevent overwriting a HEAD that was modified concurrently.
 func (h *SyncHandler) updateLibraryHeadWithStats(orgID, repoID, commitID, userID string, expectedHead ...string) error {
@@ -2138,8 +2139,9 @@ func (h *SyncHandler) updateLibraryHeadWithStats(orgID, repoID, commitID, userID
 		}
 	}
 
-	// Async: recalculate stats from directory tree
-	go h.recalculateLibraryStats(orgID, repoID, commitID, userID, previousCommitID)
+	if err := h.recalculateLibraryStats(orgID, repoID, commitID, userID, previousCommitID); err != nil {
+		return err
+	}
 
 	return nil
 }
@@ -2213,7 +2215,7 @@ func (h *SyncHandler) syncLibraryHeadDerivedState(orgID, repoID string) error {
 
 // recalculateLibraryStats recalculates size_bytes and file_count for a library
 // by traversing its directory tree from the commit's root_fs_id.
-func (h *SyncHandler) recalculateLibraryStats(orgID, repoID, commitID, userID, previousCommitID string) {
+func (h *SyncHandler) recalculateLibraryStats(orgID, repoID, commitID, userID, previousCommitID string) error {
 	previousSize, previousFileCount := h.commitTreeStats(repoID, previousCommitID)
 
 	var rootFSID string
@@ -2221,23 +2223,31 @@ func (h *SyncHandler) recalculateLibraryStats(orgID, repoID, commitID, userID, p
 		SELECT root_fs_id FROM commits WHERE library_id = ? AND commit_id = ?
 	`, repoID, commitID).Scan(&rootFSID)
 	if err != nil {
-		log.Printf("[updateLibraryStats] Failed to get root_fs_id for %s: %v", repoID, err)
-		return
+		return fmt.Errorf("get root_fs_id for %s: %w", repoID, err)
 	}
 
 	if rootFSID == "" || rootFSID == strings.Repeat("0", 40) {
-		if h.persistLibraryStatsIfCurrentHead(orgID, repoID, commitID, userID, previousSize, previousFileCount, 0, 0) {
+		applied, err := h.persistLibraryStatsIfCurrentHead(orgID, repoID, commitID, userID, previousSize, previousFileCount, 0, 0)
+		if err != nil {
+			return err
+		}
+		if applied {
 			log.Printf("[updateLibraryStats] Library %s is empty, stats set to 0", repoID)
 		}
-		return
+		return nil
 	}
 
 	totalSize, fileCount := h.calculateDirStats(repoID, rootFSID)
-	if !h.persistLibraryStatsIfCurrentHead(orgID, repoID, commitID, userID, previousSize, previousFileCount, totalSize, fileCount) {
-		return
+	applied, err := h.persistLibraryStatsIfCurrentHead(orgID, repoID, commitID, userID, previousSize, previousFileCount, totalSize, fileCount)
+	if err != nil {
+		return err
+	}
+	if !applied {
+		return nil
 	}
 
 	log.Printf("[updateLibraryStats] Updated library %s: size=%d bytes, files=%d", repoID, totalSize, fileCount)
+	return nil
 }
 
 const (
@@ -2245,7 +2255,7 @@ const (
 	libraryStatsProjectionRetryDelay    = 50 * time.Millisecond
 )
 
-func (h *SyncHandler) persistLibraryStatsIfCurrentHead(orgID, repoID, commitID, userID string, previousSize, previousFileCount, totalSize, fileCount int64) bool {
+func (h *SyncHandler) persistLibraryStatsIfCurrentHead(orgID, repoID, commitID, userID string, previousSize, previousFileCount, totalSize, fileCount int64) (bool, error) {
 	casState := map[string]interface{}{}
 	applied, err := h.db.Session().Query(`
 		UPDATE libraries SET size_bytes = ?, file_count = ?
@@ -2253,16 +2263,17 @@ func (h *SyncHandler) persistLibraryStatsIfCurrentHead(orgID, repoID, commitID, 
 		IF head_commit_id = ?
 	`, totalSize, fileCount, orgID, repoID, commitID).MapScanCAS(casState)
 	if err != nil {
-		log.Printf("[updateLibraryStats] Failed conditional stats update for %s: %v", repoID, err)
-		return false
+		return false, fmt.Errorf("conditional stats update for %s: %w", repoID, err)
 	}
 	if !applied {
 		currentHead, _ := casState["head_commit_id"].(string)
 		log.Printf("[updateLibraryStats] Skipping stale stats update for %s: commit=%s current_head=%s", repoID, commitID, currentHead)
-		return false
+		return false, nil
 	}
 
-	traffic.AdjustStorageCountersByDelta(h.db, orgID, userID, repoID, totalSize-previousSize, fileCount-previousFileCount)
+	if err := traffic.AdjustStorageCountersByDeltaSync(h.db, orgID, userID, repoID, totalSize-previousSize, fileCount-previousFileCount); err != nil {
+		return false, fmt.Errorf("sync storage counters for %s: %w", repoID, err)
+	}
 
 	err = retryLibraryStatsProjectionSync(func() error {
 		projectionRow, err := db.ReadAdminLibraryProjectionRow(h.db.Session(), orgID, repoID)
@@ -2277,11 +2288,10 @@ func (h *SyncHandler) persistLibraryStatsIfCurrentHead(orgID, repoID, commitID, 
 		return nil
 	}, time.Sleep)
 	if err != nil {
-		log.Printf("[updateLibraryStats] Failed to sync projection stats for %s after %d attempts: %v", repoID, libraryStatsProjectionRetryAttempts, err)
-		return false
+		return false, fmt.Errorf("sync projection stats for %s after %d attempts: %w", repoID, libraryStatsProjectionRetryAttempts, err)
 	}
 
-	return true
+	return true, nil
 }
 
 func retryLibraryStatsProjectionSync(sync func() error, sleep func(time.Duration)) error {

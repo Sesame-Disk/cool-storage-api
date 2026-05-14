@@ -416,7 +416,7 @@ Each performs 4 counter updates: `platform`, `org:<orgID>`, `user:<orgID>:<userI
 
 ### 5.2 Instrumentation
 
-- **Upload**: after successful commit, `IncrementStorageCounters(db, orgID, userID, libID, fileSize, 1)`
+- **Upload**: after successful commit, apply the visible path delta with `AdjustStorageCountersByDeltaSync(db, orgID, userID, libID, deltaBytes, deltaFiles)`. Replaces use `newSize-oldSize`; autorename/new files use `newSize,+1`.
 - **Delete file**: in `DeleteFile`, `DecrementStorageCounters(db, orgID, userID, libID, fileSize, 1)`
 - **Delete library**: on soft-delete (trash), decrement aggregates but preserve lib counter. On hard-delete (GC cascade), clean up lib counter row.
 
@@ -827,7 +827,7 @@ Phase 2 (TrafficRecorder core)
 | **Phase 3** | Upload instrumentation | ✅ COMPLETE | HandleUpload, PutBlock, UploadBlock, UploadFile. Token.Source distinguishes link vs web |
 | **Phase 4** | Download instrumentation | ✅ COMPLETE | HandleDownload, HandleZipDownload, GetBlock, DownloadBlock, DownloadHistoricFile, handleShareLinkDownload |
 | **Phase 5** | Storage tracking | ✅ COMPLETE | Increment/DecrementStorageCounters in `traffic/storage.go` (4 scopes), negative delta guard, library soft-delete/restore adjusts aggregates |
-| **Phase 6** | Quota enforcement | ✅ COMPLETE | CheckStorageQuota, CheckTrafficQuota, CheckMaxUsers. Free=hard block, paid=soft warning. Pre-checks in all upload/download paths |
+| **Phase 6** | Quota enforcement | ✅ COMPLETE for upload/download | CheckStorageQuota, CheckTrafficQuota, CheckMaxUsers. Free=hard block, paid=soft warning. Uploads check visible storage deltas, sync HEAD publication checks the committed tree delta and applies the counter delta before returning, downloads check traffic. Non-upload storage-growing mutations are tracked separately in ISSUE-QUOTA-COVERAGE-01, and split-phase publish/counter atomicity remains technical debt. |
 | **Phase 7** | Statistics API | ✅ COMPLETE | AdminStatisticTraffic, AdminStatisticStorage, OrgStatisticTraffic, OrgStatisticUserTraffic, AdminListOrgTraffic, AdminListUserTraffic — all real data |
 | **Phase 8** | Plan/Quota API | ✅ COMPLETE | PUT org accepts all plan fields, PUT user accepts traffic quotas, GET subscription/account info expose current-period traffic state and resolved plan capabilities |
 

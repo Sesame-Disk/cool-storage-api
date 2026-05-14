@@ -984,17 +984,14 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 		return
 	}
 
-	// Quota pre-check — evaluated before reading the body so we can fail fast.
-	// contentLength is an upper bound (includes multipart overhead); acceptable for quota checks.
+	// Traffic quota pre-check — evaluated before reading the body so we can
+	// fail fast. Storage quota is checked later with the visible tree delta,
+	// after filename/replace/chunk-total are known.
 	uploadTrafficStatus := traffic.QuotaStatus{Allowed: true}
 	if checker := traffic.GetChecker(); checker != nil {
 		contentLength := c.Request.ContentLength
 		if contentLength < 0 {
 			contentLength = 0
-		}
-		if st, _ := checker.CheckStorageQuota(token.OrgID, token.UserID, contentLength); !st.Allowed {
-			c.JSON(http.StatusForbidden, gin.H{"error": "storage quota exceeded"})
-			return
 		}
 		uploadTrafficStatus, _ = traffic.CheckTrafficQuotaWithChecker(checker, token.OrgID, token.UserID, "upload", contentLength)
 		if !uploadTrafficStatus.Allowed {
@@ -1069,6 +1066,16 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 		tokenStr, filename, contentRange, isChunked)
 
 	if isChunked {
+		if _, _, err := h.checkUploadStorageQuotaForCurrentHead(token.OrgID, token.RepoID, token.UserID, parentDir, filename, total, replaceFile); err != nil {
+			log.Printf("[HandleUpload] Chunked upload storage quota check failed: %v", err)
+			if errors.Is(err, errStorageQuotaExceeded) {
+				c.JSON(http.StatusForbidden, gin.H{"error": "storage quota exceeded"})
+			} else {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to check storage quota"})
+			}
+			return
+		}
+
 		// Chunked upload: stream chunk data directly to temp file (no io.ReadAll)
 		upload, err := chunkManager.GetOrCreateUpload(tokenStr, filename, parentDir, total)
 		if err != nil {
@@ -1093,11 +1100,17 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 		// All chunks received — finalize by streaming from temp file
 		log.Printf("[HandleUpload] All chunks received, finalizing upload (streaming)")
 		upload.Touch()
-		fileID, actualFilename, err := h.finalizeUploadStreaming(c, token, upload, parentDir, filename, storageKey, total, replaceFile)
+		fileID, actualFilename, storageDeltaBytes, storageDeltaFiles, err := h.finalizeUploadStreaming(c, token, upload, parentDir, filename, storageKey, total, replaceFile)
 		if err != nil {
 			upload.ResetFinalization()
 			log.Printf("[HandleUpload] Finalization failed: %v", err)
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to finalize upload"})
+			status := http.StatusInternalServerError
+			msg := "failed to finalize upload"
+			if errors.Is(err, errStorageQuotaExceeded) {
+				status = http.StatusForbidden
+				msg = "storage quota exceeded"
+			}
+			c.JSON(status, gin.H{"error": msg})
 			return
 		}
 		chunkManager.CleanupUpload(tokenStr, filename)
@@ -1113,7 +1126,11 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 			traffic.RecordCheckedTransfer(rec, uploadTrafficStatus, token.OrgID, token.UserID, tt, total)
 		}
 		if h.db != nil {
-			traffic.IncrementStorageCounters(h.db, token.OrgID, token.UserID, token.RepoID, total, 1)
+			if err := traffic.AdjustStorageCountersByDeltaSync(h.db, token.OrgID, token.UserID, token.RepoID, storageDeltaBytes, storageDeltaFiles); err != nil {
+				log.Printf("[HandleUpload] Failed to update storage counters: %v", err)
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update storage counters"})
+				return
+			}
 		}
 
 		if retJSON {
@@ -1132,6 +1149,17 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 		return
 	}
 	finalSize := int64(len(chunkData))
+
+	storageDeltaBytes, storageDeltaFiles, err := h.checkUploadStorageQuotaForCurrentHead(token.OrgID, token.RepoID, token.UserID, parentDir, filename, finalSize, replaceFile)
+	if err != nil {
+		log.Printf("[HandleUpload] Storage quota check failed: %v", err)
+		if errors.Is(err, errStorageQuotaExceeded) {
+			c.JSON(http.StatusForbidden, gin.H{"error": "storage quota exceeded"})
+		} else {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to check storage quota"})
+		}
+		return
+	}
 
 	// Generate file ID (SHA-1 of plaintext for Seafile compatibility)
 	sha1Hash := sha1.Sum(chunkData)
@@ -1227,7 +1255,11 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 		traffic.RecordCheckedTransfer(rec, uploadTrafficStatus, token.OrgID, token.UserID, tt, finalSize)
 	}
 	if h.db != nil {
-		traffic.IncrementStorageCounters(h.db, token.OrgID, token.UserID, token.RepoID, finalSize, 1)
+		if err := traffic.AdjustStorageCountersByDeltaSync(h.db, token.OrgID, token.UserID, token.RepoID, storageDeltaBytes, storageDeltaFiles); err != nil {
+			log.Printf("[HandleUpload] Failed to update storage counters: %v", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update storage counters"})
+			return
+		}
 	}
 
 	if retJSON {
@@ -1237,15 +1269,146 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 	}
 }
 
+var errStorageQuotaExceeded = errors.New("storage quota exceeded")
+
+func (h *SeafHTTPHandler) checkUploadStorageQuotaForCurrentHead(orgID, repoID, userID, parentDir, filename string, fileSize int64, replace bool) (int64, int64, error) {
+	deltaBytes, deltaFiles, err := h.uploadStorageDeltaForCurrentHead(orgID, repoID, parentDir, filename, fileSize, replace)
+	if err != nil {
+		return 0, 0, err
+	}
+	if deltaBytes <= 0 {
+		return deltaBytes, deltaFiles, nil
+	}
+	checker := traffic.GetChecker()
+	if checker == nil {
+		return deltaBytes, deltaFiles, nil
+	}
+	st, _ := checker.CheckStorageQuota(orgID, userID, deltaBytes)
+	if !st.Allowed {
+		return 0, 0, errStorageQuotaExceeded
+	}
+	return deltaBytes, deltaFiles, nil
+}
+
+func (h *SeafHTTPHandler) uploadStorageDeltaForCurrentHead(orgID, repoID, parentDir, filename string, fileSize int64, replace bool) (int64, int64, error) {
+	var headCommitID string
+	if err := h.db.Session().Query(`
+		SELECT head_commit_id FROM libraries WHERE org_id = ? AND library_id = ?
+	`, orgID, repoID).Scan(&headCommitID); err != nil {
+		return 0, 0, fmt.Errorf("failed to get head commit: %w", err)
+	}
+
+	var rootFSID string
+	if err := h.db.Session().Query(`
+		SELECT root_fs_id FROM commits WHERE library_id = ? AND commit_id = ?
+	`, repoID, headCommitID).Scan(&rootFSID); err != nil {
+		return 0, 0, fmt.Errorf("failed to get root fs_id: %w", err)
+	}
+
+	return h.uploadStorageDeltaForRoot(repoID, rootFSID, parentDir, filename, fileSize, replace)
+}
+
+func (h *SeafHTTPHandler) uploadStorageDeltaForRoot(repoID, rootFSID, parentDir, filename string, fileSize int64, replace bool) (int64, int64, error) {
+	entries, err := h.directoryEntriesAtPath(repoID, rootFSID, parentDir)
+	if err != nil {
+		return 0, 0, err
+	}
+	if !replace {
+		return fileSize, 1, nil
+	}
+	for _, entry := range entries {
+		if entry["name"] == filename {
+			return fileSize - entrySize(entry), 0, nil
+		}
+	}
+	return fileSize, 1, nil
+}
+
+func (h *SeafHTTPHandler) directoryEntriesAtPath(repoID, rootFSID, dirPath string) ([]map[string]interface{}, error) {
+	entries, err := h.readDirectoryEntries(repoID, rootFSID)
+	if err != nil {
+		return nil, err
+	}
+
+	dirPath = filepath.Clean("/" + strings.TrimPrefix(dirPath, "/"))
+	if dirPath == "/" || dirPath == "." {
+		return entries, nil
+	}
+
+	for _, part := range strings.Split(strings.Trim(dirPath, "/"), "/") {
+		if part == "" {
+			continue
+		}
+		var childID string
+		for _, entry := range entries {
+			if entry["name"] == part {
+				if id, ok := entry["id"].(string); ok {
+					childID = id
+				}
+				break
+			}
+		}
+		if childID == "" {
+			return []map[string]interface{}{}, nil
+		}
+		entries, err = h.readDirectoryEntries(repoID, childID)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return entries, nil
+}
+
+func (h *SeafHTTPHandler) readDirectoryEntries(repoID, fsID string) ([]map[string]interface{}, error) {
+	if fsID == "" {
+		return []map[string]interface{}{}, nil
+	}
+	var entriesJSON string
+	if err := h.db.Session().Query(`
+		SELECT dir_entries FROM fs_objects WHERE library_id = ? AND fs_id = ?
+	`, repoID, fsID).Scan(&entriesJSON); err != nil {
+		return nil, fmt.Errorf("failed to get directory entries: %w", err)
+	}
+	if entriesJSON == "" || entriesJSON == "[]" {
+		return []map[string]interface{}{}, nil
+	}
+	var entries []map[string]interface{}
+	if err := json.Unmarshal([]byte(entriesJSON), &entries); err != nil {
+		return nil, fmt.Errorf("failed to parse directory entries: %w", err)
+	}
+	return entries, nil
+}
+
+func entrySize(entry map[string]interface{}) int64 {
+	switch v := entry["size"].(type) {
+	case int64:
+		return v
+	case int:
+		return int64(v)
+	case float64:
+		return int64(v)
+	case json.Number:
+		n, _ := v.Int64()
+		return n
+	default:
+		return 0
+	}
+}
+
 // finalizeUploadStreaming processes a completed chunked upload by streaming from the temp file.
 // It reads the file in blocks, hashes and stores each block individually — O(blockSize) RAM.
-func (h *SeafHTTPHandler) finalizeUploadStreaming(c *gin.Context, token *AccessToken, upload *ChunkUpload, parentDir, filename, storageKey string, totalSize int64, replace bool) (string, string, error) {
+func (h *SeafHTTPHandler) finalizeUploadStreaming(c *gin.Context, token *AccessToken, upload *ChunkUpload, parentDir, filename, storageKey string, totalSize int64, replace bool) (string, string, int64, int64, error) {
 	ctx := context.Background()
+
+	storageDeltaBytes, storageDeltaFiles, err := h.checkUploadStorageQuotaForCurrentHead(token.OrgID, token.RepoID, token.UserID, parentDir, filename, totalSize, replace)
+	if err != nil {
+		return "", "", 0, 0, err
+	}
 
 	// Get the temp file reader
 	reader, err := upload.GetReader()
 	if err != nil {
-		return "", "", fmt.Errorf("failed to get upload reader: %w", err)
+		return "", "", 0, 0, fmt.Errorf("failed to get upload reader: %w", err)
 	}
 
 	// Check encryption
@@ -1257,13 +1420,13 @@ func (h *SeafHTTPHandler) finalizeUploadStreaming(c *gin.Context, token *AccessT
 	if encrypted {
 		fileKey, fileIV = v2.GetDecryptSessions().GetFileKeyAndIV(token.UserID, token.RepoID)
 		if fileKey == nil {
-			return "", "", fmt.Errorf("library is encrypted but not unlocked")
+			return "", "", 0, 0, fmt.Errorf("library is encrypted but not unlocked")
 		}
 	}
 
 	blockStore, actualStorageClass, err := h.resolveLibraryBlockStore(httputil.GetRoutingHostname(c, h.configuredServerURL()), token.OrgID, token.RepoID)
 	if err != nil {
-		return "", "", fmt.Errorf("block store not available: %w", err)
+		return "", "", 0, 0, fmt.Errorf("block store not available: %w", err)
 	}
 
 	// Stream the temp file sequentially (one block at a time) but submit per-block
@@ -1289,7 +1452,7 @@ readLoop:
 				break
 			}
 			if readErr != nil {
-				return "", "", fmt.Errorf("read error: %w", readErr)
+				return "", "", 0, 0, fmt.Errorf("read error: %w", readErr)
 			}
 		}
 
@@ -1379,7 +1542,7 @@ readLoop:
 	}
 
 	if err := eg.Wait(); err != nil {
-		return "", "", err
+		return "", "", 0, 0, err
 	}
 
 	// File ID = SHA-1 of the complete plaintext
@@ -1390,11 +1553,11 @@ readLoop:
 	// Update filesystem metadata with multiple block IDs
 	commitID, actualFilename, err := h.commitUploadedFileMultiBlock(token.OrgID, token.RepoID, token.UserID, parentDir, filename, fileID, blockSHA1IDs, totalSize, replace)
 	if err != nil {
-		return "", "", fmt.Errorf("failed to update filesystem metadata: %w", err)
+		return "", "", 0, 0, fmt.Errorf("failed to update filesystem metadata: %w", err)
 	}
 	log.Printf("[finalizeUploadStreaming] Filesystem updated, commit=%s", commitID)
 
-	return fileID, actualFilename, nil
+	return fileID, actualFilename, storageDeltaBytes, storageDeltaFiles, nil
 }
 
 // commitUploadedFileMultiBlock is like commitUploadedFile but supports multiple block IDs.

@@ -2699,16 +2699,13 @@ func (h *FileHandler) UploadFile(c *gin.Context) {
 		return
 	}
 
-	// Quota pre-check (storage + traffic) — before reading the body to fail fast
+	// Traffic quota pre-check — before reading the body to fail fast. Storage
+	// quota is checked below using the visible tree delta for this path.
 	uploadTrafficStatus := traffic.QuotaStatus{Allowed: true}
 	if checker := traffic.GetChecker(); checker != nil {
 		contentLength := c.Request.ContentLength
 		if contentLength < 0 {
 			contentLength = 0
-		}
-		if st, _ := checker.CheckStorageQuota(orgID, userID, contentLength); !st.Allowed {
-			c.JSON(http.StatusForbidden, gin.H{"error": "storage quota exceeded"})
-			return
 		}
 		uploadTrafficStatus, _ = traffic.CheckTrafficQuotaWithChecker(checker, orgID, userID, "upload", contentLength)
 		if !uploadTrafficStatus.Allowed {
@@ -2735,6 +2732,59 @@ func (h *FileHandler) UploadFile(c *gin.Context) {
 	}
 	fileSize := int64(len(content))
 	filename := header.Filename
+
+	fsHelper := NewFSHelper(h.db)
+
+	// Get head and target directory before storing the block so storage quota
+	// can be enforced against the actual visible delta (replace vs autorename).
+	headCommitID, err := fsHelper.GetHeadCommitID(repoID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "library not found"})
+		return
+	}
+
+	parentResult, err := fsHelper.TraverseToPath(repoID, parentDir)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "parent directory not found: " + err.Error()})
+		return
+	}
+
+	var dirEntries []FSEntry
+	if parentDir == "/" {
+		dirEntries = parentResult.Entries
+	} else {
+		if parentResult.TargetEntry == nil {
+			c.JSON(http.StatusNotFound, gin.H{"error": "parent directory not found"})
+			return
+		}
+		dirEntries, err = fsHelper.GetDirectoryEntries(repoID, parentResult.TargetFSID)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read parent directory"})
+			return
+		}
+	}
+
+	actualFilename := filename
+	storageDeltaBytes := fileSize
+	storageDeltaFiles := int64(1)
+	if existing := FindEntryInList(dirEntries, filename); existing != nil {
+		if replace {
+			storageDeltaBytes = fileSize - existing.Size
+			storageDeltaFiles = 0
+			dirEntries = RemoveEntryFromList(dirEntries, filename)
+		} else {
+			actualFilename = GenerateUniqueName(dirEntries, filename)
+		}
+	}
+
+	if storageDeltaBytes > 0 {
+		if checker := traffic.GetChecker(); checker != nil {
+			if st, _ := checker.CheckStorageQuota(orgID, userID, storageDeltaBytes); !st.Allowed {
+				c.JSON(http.StatusForbidden, gin.H{"error": "storage quota exceeded"})
+				return
+			}
+		}
+	}
 
 	// SHA-1 of plaintext → fileID (Seafile protocol: block ID used in fs_object's block_ids)
 	sha1Hash := sha1.Sum(content)
@@ -2793,7 +2843,6 @@ func (h *FileHandler) UploadFile(c *gin.Context) {
 	}
 
 	// Increment/create block ref_count in blocks table
-	fsHelper := NewFSHelper(h.db)
 	if err := fsHelper.IncrementOrCreateBlock(orgID, sha256ID, len(storedContent), storageClass, ""); err != nil {
 		log.Printf("[UploadFile] WARNING: failed to register block metadata: %v", err)
 	}
@@ -2803,46 +2852,6 @@ func (h *FileHandler) UploadFile(c *gin.Context) {
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create file metadata"})
 		return
-	}
-
-	// Get head commit ID (used as parent for the new commit)
-	headCommitID, err := fsHelper.GetHeadCommitID(repoID)
-	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "library not found"})
-		return
-	}
-
-	// Traverse to parent directory
-	parentResult, err := fsHelper.TraverseToPath(repoID, parentDir)
-	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "parent directory not found: " + err.Error()})
-		return
-	}
-
-	// Get the entries currently in parentDir
-	var dirEntries []FSEntry
-	if parentDir == "/" {
-		dirEntries = parentResult.Entries
-	} else {
-		if parentResult.TargetEntry == nil {
-			c.JSON(http.StatusNotFound, gin.H{"error": "parent directory not found"})
-			return
-		}
-		dirEntries, err = fsHelper.GetDirectoryEntries(repoID, parentResult.TargetFSID)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read parent directory"})
-			return
-		}
-	}
-
-	// Handle filename conflict
-	actualFilename := filename
-	if FindEntryInList(dirEntries, filename) != nil {
-		if replace {
-			dirEntries = RemoveEntryFromList(dirEntries, filename)
-		} else {
-			actualFilename = GenerateUniqueName(dirEntries, filename)
-		}
 	}
 
 	// Add new file entry to the directory
@@ -2906,7 +2915,11 @@ func (h *FileHandler) UploadFile(c *gin.Context) {
 	if rec := traffic.Get(); rec != nil {
 		traffic.RecordCheckedTransfer(rec, uploadTrafficStatus, orgID, userID, traffic.WebUpload, fileSize)
 	}
-	traffic.IncrementStorageCounters(h.db, orgID, userID, repoID, fileSize, 1)
+	if err := traffic.AdjustStorageCountersByDeltaSync(h.db, orgID, userID, repoID, storageDeltaBytes, storageDeltaFiles); err != nil {
+		log.Printf("[UploadFile] failed to update storage counters: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update storage counters"})
+		return
+	}
 
 	// Return Seafile-compatible response
 	c.JSON(http.StatusOK, []gin.H{{"name": actualFilename, "id": fileID, "size": strconv.FormatInt(fileSize, 10)}})

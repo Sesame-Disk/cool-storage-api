@@ -686,6 +686,59 @@ All traffic across all orgs updates a single partition: `org_id = 00000000-0000-
 
 The GC path now reuses the shared implementation via `traffic.AdjustAggregateStorageCounters(...)`, so the old duplication in `internal/gc/store_cassandra.go` has been removed.
 
+### 12d. Storage Quota Publish/Counter Atomicity
+
+**Status:** Open technical debt.
+
+Upload and sync publish paths now do the right quota math for the visible or committed delta, and sync HEAD publication now waits for the storage-counter adjustment before returning. That closes the earlier fire-and-forget drift on sync commit publish.
+
+What is still not atomic:
+- quota enforcement is still `pre-check -> publish commit/head -> adjust storage_counters`
+- concurrent publishes can both pass the same pre-check against stale usage and only exceed the cap once both are visible
+- if the post-publish counter adjustment fails, the request can return an error after the new visible state already exists
+
+This is a Cassandra consistency/transaction-shaping debt, not a remaining missing-hook bug like ISSUE-QUOTA-COVERAGE-01.
+
+**Future fix (v2):** Centralize tree-delta publish through one quota-aware primitive. Options include a reservation step before publish, or a narrower CAS-backed workflow that couples quota usage and HEAD publication closely enough that concurrent writers cannot both spend the same remaining bytes.
+
+### 12e. Upload Storage Pre-check Cost
+
+**Status:** Open technical debt. Non-blocking. Performance/efficiency only — correctness is already right.
+
+The visible-delta storage pre-check landed for upload paths in 2026-05-14 and closed the previous over/under-counting bug (replace no longer sobre-cuenta `+fileSize`). The pre-check is correct but its current shape pays repeated cost on a few hot paths.
+
+#### Hot spots
+
+**1. Chunked uploads re-run the full pre-check on every chunk**
+([internal/api/seafhttp.go:1069](internal/api/seafhttp.go#L1069))
+
+`HandleUpload` chunked path calls `checkUploadStorageQuotaForCurrentHead` for every incoming chunk request and once more inside `finalizeUploadStreaming` ([internal/api/seafhttp.go:1403](internal/api/seafhttp.go#L1403)). For an upload of N chunks the server performs N+1 HEAD reads, N+1 commit/root_fs_id reads, and N+1 directory traversals of `parentDir`. The delta itself does not change between chunks — only concurrent third-party writers could move it — so most of those tree walks compute the same answer.
+
+This is intentional defense-in-depth right now: it catches the TOCTOU window between the first chunk and finalize when another writer publishes. But the cost scales linearly with chunk count, and large resumable uploads can hit hundreds of chunks.
+
+Possible mitigations (in order of preference):
+- Cache the resolved `(headCommitID, rootFSID, parentResult)` for the lifetime of one chunked-upload session and only re-resolve at finalize. Pre-check the delta against the cached state for intermediate chunks.
+- Pre-check only on first chunk and on finalize; skip intermediate chunks entirely.
+- Push the entire visible-delta resolution down to the chunk session creation, store it on the upload session, and refresh it only when the HEAD changes (detected by a CAS on session resume).
+
+**2. `directoryEntriesAtPath` does one Cassandra query per path segment**
+([internal/api/seafhttp.go:1327](internal/api/seafhttp.go#L1327))
+
+The traversal does `SELECT dir_entries FROM fs_objects` once per directory level. A target path of `/a/b/c/d/file.txt` is 5 queries (root + 4 nested dirs). On every chunk in a chunked upload, the same path is re-walked. This compounds with the per-chunk pre-check above.
+
+Possible mitigations:
+- Reuse `FSHelper.TraverseToPath` (which `v2/files.go:UploadFile` already uses) instead of carrying a separate traversal implementation in `seafhttp.go`. That centralizes path-traversal performance work for everyone.
+- Add a path-resolution cache scoped to one upload session.
+
+**3. Repeated `traffic.GetChecker()` calls inside one handler**
+([internal/api/seafhttp.go:991](internal/api/seafhttp.go#L991) + [seafhttp.go:1282](internal/api/seafhttp.go#L1282) inside the helper, [internal/api/sync.go:874](internal/api/sync.go#L874) + [sync.go:927](internal/api/sync.go#L927))
+
+`GetChecker()` returns the process-wide singleton, so this is cheap. It is mostly a cosmetic concern: handlers that already resolved a non-nil checker for the traffic pre-check call `GetChecker()` again for the post-dedup or visible-delta storage pre-check. Trivial inline cleanup; bundle with the work above when it happens.
+
+#### Why this is not blocking
+
+The work above is purely about cost. The pre-check answers and the counter adjustments are already correct, the regressions are already covered by tests, and the failure modes degrade to "extra Cassandra reads on the upload hot path," not to incorrect quota decisions. The TOCTOU concern itself stays in §12d above; this section is only about how often we pay the cost of *being* correct.
+
 ---
 
 ## 14. API Key Scope Hardening Follow-up (2026-04-04)
