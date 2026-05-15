@@ -1049,6 +1049,12 @@ func TestGC_FailedItemsAdminEndpoints(t *testing.T) {
 
 	insertFailed(failedAtA, itemIDA)
 	insertFailed(failedAtB, itemIDB)
+	if err := session.Query(`
+		INSERT INTO gc_org_stats (org_id, queue_depth, failed_depth, updated_at)
+		VALUES (?, ?, ?, ?)
+	`, orgID.String(), 0, 2, failedAtB).Exec(); err != nil {
+		t.Fatalf("failed to insert gc_org_stats row: %v", err)
+	}
 	t.Cleanup(func() {
 		_ = session.Query(`DELETE FROM gc_failed_items WHERE org_id = ? AND failed_at = ? AND item_type = ? AND item_id = ?`, orgID.String(), failedAtA, "unknown_type", itemIDA).Exec()
 		_ = session.Query(`DELETE FROM gc_failed_items WHERE org_id = ? AND failed_at = ? AND item_type = ? AND item_id = ?`, orgID.String(), failedAtB, "unknown_type", itemIDB).Exec()
@@ -1056,7 +1062,40 @@ func TestGC_FailedItemsAdminEndpoints(t *testing.T) {
 		deleteGCQueueItemsByIdentity(t, orgID.String(), "unknown_type", itemIDB)
 		_ = session.Query(`DELETE FROM gc_active_orgs WHERE bucket = ? AND org_id = ?`, bucket, orgID.String()).Exec()
 		_ = session.Query(`DELETE FROM gc_dirty_orgs WHERE bucket = ? AND org_id = ?`, bucket, orgID.String()).Exec()
+		_ = session.Query(`DELETE FROM gc_org_stats WHERE org_id = ?`, orgID.String()).Exec()
 	})
+
+	orgsResp := superadminClient.Get(t, "/api/v2.1/admin/gc/failed-items/orgs?limit=10")
+	if orgsResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected failed-item orgs HTTP 200, got %d", orgsResp.StatusCode)
+	}
+	orgsBody := responseJSON(t, orgsResp)
+	organizations, ok := orgsBody["organizations"].([]interface{})
+	if !ok {
+		t.Fatalf("expected organizations array in failed-item orgs response, got %#v", orgsBody["organizations"])
+	}
+	foundOrg := false
+	for _, entry := range organizations {
+		orgEntry, ok := entry.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		entryOrgID, _ := orgEntry["org_id"].(string)
+		if entryOrgID != orgID.String() {
+			continue
+		}
+		foundOrg = true
+		if orgName, _ := orgEntry["org_name"].(string); orgName != "" {
+			t.Fatalf("failed-item org_name = %q, want empty for orphan org", orgName)
+		}
+		if failedItemsTotal, _ := orgEntry["failed_items_total"].(float64); int(failedItemsTotal) != 2 {
+			t.Fatalf("failed-item org failed_items_total = %v, want 2", orgEntry["failed_items_total"])
+		}
+		break
+	}
+	if !foundOrg {
+		t.Fatalf("expected orphan org %s in failed-item orgs response: %#v", orgID, organizations)
+	}
 
 	listResp := superadminClient.Get(t, "/api/v2.1/admin/gc/failed-items?org_id="+orgID.String()+"&limit=10")
 	if listResp.StatusCode != http.StatusOK {

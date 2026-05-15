@@ -1142,10 +1142,13 @@ func (h *AdminHandler) AdminListTrashLibraries(c *gin.Context) {
 
 	var trashed []dbpkg.AdminDeletedLibraryProjectionRow
 	for _, orgID := range orgIDs {
-		rows, err := dbpkg.ListDeletedAdminLibraryRowsByOrg(h.db.Session(), orgID)
+		rows, cleanedStale, err := dbpkg.ReconcileDeletedAdminLibraryRowsByOrg(h.db.Session(), orgID)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list trash libraries"})
 			return
+		}
+		if cleanedStale > 0 {
+			log.Printf("[AdminListTrashLibraries] pruned %d stale trash projection row(s) for org %s", cleanedStale, orgID)
 		}
 		for _, row := range rows {
 			if ownerFilter != "" && row.OwnerEmail != ownerFilter {
@@ -1225,6 +1228,16 @@ func (h *AdminHandler) AdminCleanTrashLibraries(c *gin.Context) {
 	cleaned := 0
 
 	for _, orgID := range orgIDs {
+		_, cleanedStale, err := dbpkg.ReconcileDeletedAdminLibraryRowsByOrg(h.db.Session(), orgID)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to clean stale trash libraries"})
+			return
+		}
+		if cleanedStale > 0 {
+			log.Printf("[AdminCleanTrashLibraries] pruned %d stale trash projection row(s) for org %s", cleanedStale, orgID)
+			cleaned += cleanedStale
+		}
+
 		// Collect all soft-deleted libraries for this org in one pass.
 		type trashedLib struct {
 			libID        string

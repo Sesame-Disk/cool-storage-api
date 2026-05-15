@@ -320,6 +320,47 @@ func TestLibraryProjectionRegression_GCHardDeleteCleansCanonicalTrashProjectionW
 	})
 }
 
+func TestAdminCleanTrashLibraries_PrunesStaleProjectionRows(t *testing.T) {
+	name := fmt.Sprintf("inttest-admin-trash-stale-%d", time.Now().UnixNano())
+	repoID := createDisposableTestLibrary(t, adminClient, name)
+	database := shareProjectionDBForTest(t)
+	session := database.Session()
+
+	deleteResp := adminClient.Delete(t, fmt.Sprintf("/api/v2.1/repos/%s/", repoID))
+	expectStatus(t, deleteResp, http.StatusOK)
+	deleteResp.Body.Close()
+
+	waitForIntegrationCondition(t, "stale trash fixture to appear in admin trash projection", func() bool {
+		return adminTrashContainsRepo(t, superadminClient, repoID, defaultAdminEmail)
+	})
+
+	removeLibraryBaseRowsForFallbackTest(t, session, repoID)
+
+	cleanResp := superadminClient.Do(t, http.MethodDelete, "/api/v2.1/admin/trash-libraries/", nil)
+	expectStatus(t, cleanResp, http.StatusOK)
+	body := responseJSON(t, cleanResp)
+	cleaned, _ := body["cleaned"].(float64)
+	if cleaned < 1 {
+		t.Fatalf("admin clean trash cleaned=%v, want at least 1 stale projection pruned", body["cleaned"])
+	}
+
+	waitForIntegrationCondition(t, "stale trash projection to be removed by admin clean", func() bool {
+		_, ok := deletedAdminLibraryProjectionRowForTest(t, session, defaultOrgID, repoID)
+		return !ok
+	})
+
+	resp := superadminClient.Get(t, "/api/v2.1/admin/trash-libraries/?page=1&per_page=100")
+	expectStatus(t, resp, http.StatusOK)
+	payload := responseJSON(t, resp)
+	entries, ok := payload["repos"].([]interface{})
+	if !ok {
+		t.Fatalf("admin trash payload missing repos: %v", payload)
+	}
+	if containsEntry(entries, "id", repoID) {
+		t.Fatalf("stale trash repo %s still visible after admin clean", repoID)
+	}
+}
+
 func TestSyncHeadUpdateKeepsLookupAndAdminProjectionAligned(t *testing.T) {
 	name := fmt.Sprintf("inttest-sync-head-%d", time.Now().UnixNano())
 	repoID := createTestLibrary(t, adminClient, name)

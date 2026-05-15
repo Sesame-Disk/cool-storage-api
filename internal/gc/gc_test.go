@@ -775,6 +775,41 @@ func TestService_ListFailedItemOrgs_FiltersStaleSnapshotAndIncludesDirtyActualFa
 	}
 }
 
+func TestService_ListFailedItemOrgs_IncludesOrgMissingFromOrganizationDirectory(t *testing.T) {
+	store := NewMockStore()
+	orphanOrg := uuid.New()
+	now := time.Now().UTC().Truncate(time.Second)
+
+	if err := store.SaveOrgQueueStats(GCOrgStats{OrgID: orphanOrg, FailedDepth: 1, UpdatedAt: now}); err != nil {
+		t.Fatalf("SaveOrgQueueStats(orphanOrg): %v", err)
+	}
+	store.failedItems[orphanOrg] = []GCFailedItemInfo{{
+		OrgID:    orphanOrg,
+		FailedAt: now.Add(-time.Minute),
+		ItemType: ItemBlock,
+		ItemID:   "orphan-item",
+	}}
+
+	svc := NewService(store, nil, config.GCConfig{Enabled: true}, nil)
+
+	orgs, err := svc.ListFailedItemOrgs(10)
+	if err != nil {
+		t.Fatalf("ListFailedItemOrgs: %v", err)
+	}
+	if len(orgs) != 1 {
+		t.Fatalf("len(orgs) = %d, want 1", len(orgs))
+	}
+	if orgs[0].OrgID != orphanOrg {
+		t.Fatalf("orgs[0].OrgID = %s, want %s", orgs[0].OrgID, orphanOrg)
+	}
+	if orgs[0].OrgName != "" {
+		t.Fatalf("orgs[0].OrgName = %q, want empty for missing org directory row", orgs[0].OrgName)
+	}
+	if orgs[0].FailedItemsTotal != 1 {
+		t.Fatalf("orgs[0].FailedItemsTotal = %d, want 1", orgs[0].FailedItemsTotal)
+	}
+}
+
 // TestService_DLQOps_SerializeUnderConcurrency exercises the dlqOpsMu guard
 // directly. The hook is wired to the store-level DLQ mutations so the test
 // observes overlap of the actual non-atomic SELECT+INSERT+DELETE in

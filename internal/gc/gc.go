@@ -895,13 +895,25 @@ func (s *Service) ListFailedItemOrgs(limit int) ([]GCFailedItemOrgInfo, error) {
 	if limit <= 0 {
 		limit = gcDefaultFailedOrgPageSize
 	}
-	orgIDs, err := s.store.ListOrganizations()
+	snapshotOrgs, err := s.store.ListOrgsWithFailedItems(0)
+	if err != nil {
+		return nil, err
+	}
+	dirtyOrgs, err := s.store.ListDirtyOrgs(0)
 	if err != nil {
 		return nil, err
 	}
 
-	orgs := make([]GCFailedItemOrgInfo, 0)
-	for _, orgID := range orgIDs {
+	candidateOrgIDs := make(map[uuid.UUID]struct{}, len(snapshotOrgs)+len(dirtyOrgs))
+	for _, org := range snapshotOrgs {
+		candidateOrgIDs[org.OrgID] = struct{}{}
+	}
+	for _, org := range dirtyOrgs {
+		candidateOrgIDs[org.OrgID] = struct{}{}
+	}
+
+	orgs := make([]GCFailedItemOrgInfo, 0, len(candidateOrgIDs))
+	for orgID := range candidateOrgIDs {
 		failedDepth, err := s.store.RecountOrgFailedDepth(orgID)
 		if err != nil {
 			return nil, err

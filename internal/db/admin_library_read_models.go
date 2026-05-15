@@ -36,6 +36,8 @@ type AdminDeletedLibraryProjectionRow struct {
 	DeletedAt  time.Time
 }
 
+const staleDeletedAdminLibraryCleanupBatchSize = 50
+
 func adminLibraryProjectionDeletedAtEqual(left, right *time.Time) bool {
 	if left == nil || right == nil {
 		return left == nil && right == nil
@@ -411,6 +413,60 @@ func ListDeletedAdminLibraryRowsByOrg(session *gocql.Session, orgID string) ([]A
 		return nil, err
 	}
 	return rows, nil
+}
+
+func ReconcileDeletedAdminLibraryRowsByOrg(session *gocql.Session, orgID string) ([]AdminDeletedLibraryProjectionRow, int, error) {
+	rows, err := ListDeletedAdminLibraryRowsByOrg(session, orgID)
+	if err != nil {
+		return nil, 0, err
+	}
+	if len(rows) == 0 {
+		return rows, 0, nil
+	}
+
+	kept := make([]AdminDeletedLibraryProjectionRow, 0, len(rows))
+	batch := session.Batch(gocql.LoggedBatch)
+	pendingDeletes := 0
+	cleaned := 0
+
+	flush := func() error {
+		if pendingDeletes == 0 {
+			return nil
+		}
+		if err := batch.Exec(); err != nil {
+			return err
+		}
+		batch = session.Batch(gocql.LoggedBatch)
+		pendingDeletes = 0
+		return nil
+	}
+
+	for _, row := range rows {
+		liveRow, err := ReadAdminLibraryProjectionRow(session, row.OrgID, row.LibraryID)
+		if err == nil && liveRow.DeletedAt != nil && !liveRow.DeletedAt.IsZero() {
+			kept = append(kept, row)
+			continue
+		}
+		if err != nil && err != gocql.ErrNotFound {
+			return nil, cleaned, err
+		}
+
+		AddDeleteDeletedAdminLibraryReadModelQuery(batch, row)
+		pendingDeletes++
+		cleaned++
+
+		if pendingDeletes >= staleDeletedAdminLibraryCleanupBatchSize {
+			if err := flush(); err != nil {
+				return nil, cleaned, err
+			}
+		}
+	}
+
+	if err := flush(); err != nil {
+		return nil, cleaned, err
+	}
+
+	return kept, cleaned, nil
 }
 
 func ReadDeletedAdminLibraryProjectionRow(session *gocql.Session, orgID, libraryID string) (AdminDeletedLibraryProjectionRow, error) {
