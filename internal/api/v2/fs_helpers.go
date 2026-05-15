@@ -803,6 +803,21 @@ func (h *FSHelper) IncrementBlockRefCounts(orgID string, blockIDs []string) erro
 	return nil
 }
 
+// IncrementBlockRefCountsTracked increments ref_count for blocks (for copy)
+// and returns the exact resolved block IDs that were incremented before any
+// error occurred so callers can roll the mutation back safely.
+func (h *FSHelper) IncrementBlockRefCountsTracked(orgID string, blockIDs []string) ([]string, error) {
+	resolvedBlockIDs := h.resolveStoredBlockIDs(orgID, blockIDs)
+	incrementedBlockIDs := make([]string, 0, len(resolvedBlockIDs))
+	for _, blockID := range resolvedBlockIDs {
+		if err := h.IncrementOrCreateBlock(orgID, blockID, 0, "", ""); err != nil {
+			return incrementedBlockIDs, fmt.Errorf("increment block %s: %w", blockID, err)
+		}
+		incrementedBlockIDs = append(incrementedBlockIDs, blockID)
+	}
+	return incrementedBlockIDs, nil
+}
+
 // CreateFileFSObject creates a new fs_object for a file
 func (h *FSHelper) CreateFileFSObject(repoID, name string, size int64, blockIDs []string) (string, error) {
 	// Calculate fs_id as SHA-1 of the EXACT JSON that will be returned by pack-fs

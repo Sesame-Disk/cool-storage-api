@@ -199,6 +199,52 @@ func TestFileDelete(t *testing.T) {
 	}
 }
 
+// TestSameLibraryCopyIncrementsBlockRefCountBeforeReturning verifies both the
+// single-file and legacy batch forms of CopyFile increment shared block refs
+// before the handler returns success.
+func TestSameLibraryCopyIncrementsBlockRefCountBeforeReturning(t *testing.T) {
+	name := fmt.Sprintf("inttest-copy-refcount-%d", time.Now().UnixNano())
+	repoID := createTestLibrary(t, adminClient, name)
+
+	fileName := "copy-refcount.txt"
+	fileContent := fmt.Sprintf("same-library-copy-refcount-%d\n", time.Now().UnixNano())
+
+	uploadLinkResp := adminClient.Get(t, fmt.Sprintf("/api2/repos/%s/upload-link/?p=/", repoID))
+	expectStatus(t, uploadLinkResp, http.StatusOK)
+	uploadURL := strings.Trim(responseBody(t, uploadLinkResp), "\" \n\r")
+	uploadFileThroughLink(t, adminClient, uploadURL, fileName, "/", fileContent)
+
+	orgID := resolveOrgID(t, repoID)
+	hash := sha256.Sum256([]byte(fileContent))
+	blockID := hex.EncodeToString(hash[:])
+	if refCount := readBlockRefCount(t, orgID, blockID); refCount != 1 {
+		t.Fatalf("ref_count after seed upload = %d, want 1", refCount)
+	}
+
+	copyResp := adminClient.PostJSON(t, "/api/v2.1/repos/"+repoID+"/file/copy/", map[string]interface{}{
+		"src_path":        "/" + fileName,
+		"dst_dir":         "/",
+		"conflict_policy": "autorename",
+	})
+	expectStatus(t, copyResp, http.StatusOK)
+	copyResp.Body.Close()
+	if refCount := readBlockRefCount(t, orgID, blockID); refCount != 2 {
+		t.Fatalf("ref_count after single copy = %d, want 2", refCount)
+	}
+
+	batchCopyResp := adminClient.PostJSON(t, "/api/v2.1/repos/"+repoID+"/file/copy/", map[string]interface{}{
+		"src_dir":         "/",
+		"filename":        []string{fileName},
+		"dst_dir":         "/",
+		"conflict_policy": "autorename",
+	})
+	expectStatus(t, batchCopyResp, http.StatusOK)
+	batchCopyResp.Body.Close()
+	if refCount := readBlockRefCount(t, orgID, blockID); refCount != 3 {
+		t.Fatalf("ref_count after batch copy = %d, want 3", refCount)
+	}
+}
+
 // TestCrossLibraryBatchCopyIncrementsBlockRefCount verifies that copying a file
 // across libraries via the async-batch-copy-item endpoint correctly increments the
 // shared block's ref_count to 2 (once for the original upload, once for the copy).

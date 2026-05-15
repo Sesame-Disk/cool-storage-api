@@ -14,7 +14,7 @@ Legend:
 | Rank | Issue | Severity | Effort | Status |
 |---:|---|---|---|---|
 | 1 | Per-user storage quota enforcement | P0 | M | Fixed 2026-05-14 |
-| 1b | Quota enforcement coverage gaps in V2 mutations (copy / revert / restore-from-trash / OnlyOffice save / inter-repo move) | P1 | M | Confirmed 2026-05-14 |
+| 1b | Quota enforcement coverage gaps in V2 mutations (copy / revert / restore-from-trash / OnlyOffice save / cross-repo batch) | P1 | M | Fixed 2026-05-14 |
 | 2 | Backup / disaster recovery is not production-ready | P0 | L | Confirmed |
 | 3 | Persistent audit trail / activity feed / Accounts audit provenance is missing | P1 | L | Confirmed |
 | 4 | Batch file move can report success without moving files | P1 | M | Confirmed, broader than docs |
@@ -51,7 +51,13 @@ Residual debt remains: the publish/counter flow is still split-phase under concu
 
 ### 1b. Quota enforcement coverage gaps in V2 mutations
 
-Confirmed during post-fix review of ISSUE-USER-STORAGE-ENFORCE-01. The fix landed for uploads and for the sync commit publish, including chunked upload totals, replace deltas, deduplicated block uploads, and a blocking storage-counter adjust on sync HEAD publication. Five V2 mutation paths still grow on-disk bytes without participating in either side of the quota system (no `CheckStorageQuota` pre-check, and/or no `storage_counters` adjustment).
+Fixed 2026-05-14. The handler-by-handler approach was applied: a small shared module `internal/api/v2/quota_helpers.go` exposes `fsEntryStats`, `fsEntryDelta`, `preCheckStorageQuotaForDelta`, and `applyStorageCounterDelta`, and the following handlers were wired in: `CopyFile`, `copyBatchFiles`, `RevertFile`, `RevertDirectory`, `RestoreTrashItem`, `RevertDirents`, `OnlyOffice saveEditedDocument`, and `batch_operations.processSingleItem` (covers cross-repo `AsyncBatchCopy` / `AsyncBatchMove`).
+
+Move cross-repo also decrements the source library counter so per-library views stay consistent. OnlyOffice does the pre-check *before* the S3 `PutBlockData` so a quota-exceeded save never persists bytes.
+
+Three new integration tests cover the regressions (`TestCopyFileEnforcesPerUserStorageQuota`, `TestRestoreTrashItemEnforcesPerUserStorageQuota`, `TestRevertFileEnforcesPerUserStorageQuota`); the full `docker compose run --rm go-integration-test` suite is green.
+
+Original confirmed scope of the bug (kept for context):
 
 Affected paths:
 
@@ -287,12 +293,11 @@ These entries should be removed or rewritten in the root pending files:
 
 ## Recommended Practical Order
 
-1. Close V2 quota coverage gaps (ISSUE-QUOTA-COVERAGE-01): copy / revert / restore-from-trash / OnlyOffice save / inter-repo move.
-2. Disable or fix false-success batch move.
-3. Create backup/DR runbook plus first restore drill.
-4. Add persistent audit/activity foundation and Accounts provenance.
-5. Remove GC queue exact recounts from hot paths.
-6. Decide upload token replace/resume contracts.
-7. Finish storage migration lifecycle only if multi-region/cold storage is in V1.
-8. Triage stubs by product need: file stats, default repo, devices, activities, notifications, wikis.
-9. Add CI baseline and only then expand E2E/coverage gates.
+1. Disable or fix false-success batch move.
+2. Create backup/DR runbook plus first restore drill.
+3. Add persistent audit/activity foundation and Accounts provenance.
+4. Remove GC queue exact recounts from hot paths.
+5. Decide upload token replace/resume contracts.
+6. Finish storage migration lifecycle only if multi-region/cold storage is in V1.
+7. Triage stubs by product need: file stats, default repo, devices, activities, notifications, wikis.
+8. Add CI baseline and only then expand E2E/coverage gates.

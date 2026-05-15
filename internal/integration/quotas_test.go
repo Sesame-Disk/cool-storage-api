@@ -607,6 +607,390 @@ func uploadSyncBlockStatus(t *testing.T, c *testClient, repoID string, content [
 	return resp.StatusCode, string(body)
 }
 
+// TestCopyFileEnforcesPerUserStorageQuota verifies that CopyFile blocks copies
+// that would exceed the per-user storage quota.
+//
+// Regression for ISSUE-QUOTA-COVERAGE-01: CopyFile previously bypassed
+// CheckStorageQuota entirely and never adjusted storage_counters, so users could
+// duplicate files beyond their cap.
+func TestCopyFileEnforcesPerUserStorageQuota(t *testing.T) {
+	originalOrg := getAdminOrganizationInfo(t, defaultOrgID)
+	originalUser := getAdminUserByEmail(t, defaultUserEmail)
+	restoreDefaultOrgAndUserQuotasOnCleanup(t, originalOrg, originalUser)
+
+	updateAdminOrganizationQuotas(t, defaultOrgID, map[string]interface{}{
+		"storage_quota": int64(1 << 50),
+		"quota_policy":  "hard",
+	})
+
+	repoID := createTestLibrary(t, userClient, fmt.Sprintf("inttest-copy-quota-%d", time.Now().UnixNano()))
+
+	const seedContent = "this is a 50-byte payload for the copy quota test ok"
+	seedSize := int64(len(seedContent))
+
+	baselineUsage := jsonInt64(getAdminUserByEmail(t, defaultUserEmail), "quota_usage")
+	setDefaultUserQuota(t, baselineUsage+seedSize+100)
+
+	uploadURL := getUploadURL(t, userClient, repoID)
+	status, body := uploadFileThroughLinkStatus(t, userClient, uploadURL, "seed.txt", "/", seedContent)
+	if status != http.StatusOK {
+		t.Fatalf("seed upload status = %d, want %d; body=%s", status, http.StatusOK, body)
+	}
+	afterUpload := waitForUserQuotaUsage(t, baselineUsage+seedSize)
+
+	// Leave half a seed-size of headroom — not enough to absorb a full copy.
+	setDefaultUserQuota(t, afterUpload+seedSize/2)
+
+	copyResp := userClient.PostJSON(t, "/api/v2.1/repos/"+repoID+"/file/copy/", map[string]interface{}{
+		"src_path":        "/seed.txt",
+		"dst_dir":         "/",
+		"conflict_policy": "autorename",
+	})
+	defer copyResp.Body.Close()
+	copyBody := responseBody(t, copyResp)
+	if copyResp.StatusCode != http.StatusForbidden {
+		t.Fatalf("copy status = %d, want %d; body=%s", copyResp.StatusCode, http.StatusForbidden, copyBody)
+	}
+	if !strings.Contains(copyBody, "storage quota exceeded") {
+		t.Fatalf("copy body = %q, want storage quota exceeded", copyBody)
+	}
+
+	// Counter must not have advanced.
+	if got := jsonInt64(getAdminUserByEmail(t, defaultUserEmail), "quota_usage"); got != afterUpload {
+		t.Fatalf("quota_usage after blocked copy = %d, want %d", got, afterUpload)
+	}
+
+	// Restore enough headroom and verify the copy succeeds and the counter
+	// reflects the new tree size.
+	setDefaultUserQuota(t, afterUpload+seedSize+100)
+	copyResp2 := userClient.PostJSON(t, "/api/v2.1/repos/"+repoID+"/file/copy/", map[string]interface{}{
+		"src_path":        "/seed.txt",
+		"dst_dir":         "/",
+		"conflict_policy": "autorename",
+	})
+	defer copyResp2.Body.Close()
+	if copyResp2.StatusCode != http.StatusOK {
+		t.Fatalf("retry copy status = %d, want %d; body=%s", copyResp2.StatusCode, http.StatusOK, responseBody(t, copyResp2))
+	}
+	waitForUserQuotaUsage(t, afterUpload+seedSize)
+}
+
+// TestRestoreTrashItemEnforcesPerUserStorageQuota verifies that restoring a
+// deleted file from trash pre-checks the per-user storage quota.
+//
+// Regression for ISSUE-QUOTA-COVERAGE-01.
+func TestRestoreTrashItemEnforcesPerUserStorageQuota(t *testing.T) {
+	originalOrg := getAdminOrganizationInfo(t, defaultOrgID)
+	originalUser := getAdminUserByEmail(t, defaultUserEmail)
+	restoreDefaultOrgAndUserQuotasOnCleanup(t, originalOrg, originalUser)
+
+	updateAdminOrganizationQuotas(t, defaultOrgID, map[string]interface{}{
+		"storage_quota": int64(1 << 50),
+		"quota_policy":  "hard",
+	})
+
+	repoID := createTestLibrary(t, userClient, fmt.Sprintf("inttest-restore-quota-%d", time.Now().UnixNano()))
+
+	const seedContent = "deleted file body that will be restored and tested"
+	seedSize := int64(len(seedContent))
+
+	baselineUsage := jsonInt64(getAdminUserByEmail(t, defaultUserEmail), "quota_usage")
+	setDefaultUserQuota(t, baselineUsage+seedSize+100)
+
+	uploadURL := getUploadURL(t, userClient, repoID)
+	status, body := uploadFileThroughLinkStatus(t, userClient, uploadURL, "del.txt", "/", seedContent)
+	if status != http.StatusOK {
+		t.Fatalf("seed upload status = %d, want %d; body=%s", status, http.StatusOK, body)
+	}
+	waitForUserQuotaUsage(t, baselineUsage+seedSize)
+
+	batchDeleteFiles(t, userClient, repoID, "/", []string{"del.txt"})
+	afterDelete := waitForUserQuotaUsage(t, baselineUsage)
+
+	commitID, parentDir := findTrashItemFor(t, userClient, repoID, "del.txt")
+	if commitID == "" {
+		t.Fatalf("trash listing did not surface the deleted file")
+	}
+
+	// Headroom too small for the seed file to come back.
+	setDefaultUserQuota(t, afterDelete+seedSize/2)
+
+	restoreResp := userClient.PostJSON(t, "/api/v2.1/repos/"+repoID+"/file/restore/", map[string]interface{}{
+		"commit_id": commitID,
+		"p":         parentDir + "del.txt",
+	})
+	defer restoreResp.Body.Close()
+	restoreBody := responseBody(t, restoreResp)
+	if restoreResp.StatusCode != http.StatusForbidden {
+		t.Fatalf("restore status = %d, want %d; body=%s", restoreResp.StatusCode, http.StatusForbidden, restoreBody)
+	}
+	if !strings.Contains(restoreBody, "storage quota exceeded") {
+		t.Fatalf("restore body = %q, want storage quota exceeded", restoreBody)
+	}
+	var restorePayload map[string]interface{}
+	if err := json.Unmarshal([]byte(restoreBody), &restorePayload); err != nil {
+		t.Fatalf("restore body is not valid JSON: %v; body=%s", err, restoreBody)
+	}
+	if got, _ := restorePayload["error_msg"].(string); got != "storage quota exceeded" {
+		t.Fatalf("restore error_msg = %v, want %q; payload=%v", restorePayload["error_msg"], "storage quota exceeded", restorePayload)
+	}
+	if _, ok := restorePayload["error"]; ok {
+		t.Fatalf("restore payload unexpectedly exposed error key: %v", restorePayload)
+	}
+
+	if got := jsonInt64(getAdminUserByEmail(t, defaultUserEmail), "quota_usage"); got != afterDelete {
+		t.Fatalf("quota_usage after blocked restore = %d, want %d", got, afterDelete)
+	}
+
+	// Give it enough room and verify it succeeds.
+	setDefaultUserQuota(t, afterDelete+seedSize+100)
+	restoreResp2 := userClient.PostJSON(t, "/api/v2.1/repos/"+repoID+"/file/restore/", map[string]interface{}{
+		"commit_id": commitID,
+		"p":         parentDir + "del.txt",
+	})
+	defer restoreResp2.Body.Close()
+	if restoreResp2.StatusCode != http.StatusOK {
+		t.Fatalf("retry restore status = %d, want %d; body=%s", restoreResp2.StatusCode, http.StatusOK, responseBody(t, restoreResp2))
+	}
+	waitForUserQuotaUsage(t, afterDelete+seedSize)
+}
+
+// TestRevertFileEnforcesPerUserStorageQuota verifies that reverting a file to
+// an older version pre-checks the per-user storage quota for the byte delta.
+//
+// Regression for ISSUE-QUOTA-COVERAGE-01.
+func TestRevertFileEnforcesPerUserStorageQuota(t *testing.T) {
+	originalOrg := getAdminOrganizationInfo(t, defaultOrgID)
+	originalUser := getAdminUserByEmail(t, defaultUserEmail)
+	restoreDefaultOrgAndUserQuotasOnCleanup(t, originalOrg, originalUser)
+
+	updateAdminOrganizationQuotas(t, defaultOrgID, map[string]interface{}{
+		"storage_quota": int64(1 << 50),
+		"quota_policy":  "hard",
+	})
+
+	repoID := createTestLibrary(t, userClient, fmt.Sprintf("inttest-revert-quota-%d", time.Now().UnixNano()))
+
+	largeBody := strings.Repeat("L", 200)
+	smallBody := strings.Repeat("s", 30)
+
+	baselineUsage := jsonInt64(getAdminUserByEmail(t, defaultUserEmail), "quota_usage")
+	setDefaultUserQuota(t, baselineUsage+int64(len(largeBody))+100)
+
+	uploadURL := getUploadURL(t, userClient, repoID)
+
+	// Upload large version, capture HEAD = C1 (contains 200-byte rev.txt).
+	status, body := uploadFileThroughLinkStatus(t, userClient, uploadURL, "rev.txt", "/", largeBody)
+	if status != http.StatusOK {
+		t.Fatalf("upload large status = %d; body=%s", status, body)
+	}
+	afterLarge := waitForUserQuotaUsage(t, baselineUsage+int64(len(largeBody)))
+
+	c1 := getRepoHeadCommit(t, userClient, repoID)
+	if c1 == "" {
+		t.Fatalf("could not resolve C1 head commit")
+	}
+
+	// Replace with small version. HEAD advances to C2, counter shrinks.
+	status, body = uploadFileThroughLinkStatus(t, userClient, uploadURL, "rev.txt", "/", smallBody)
+	if status != http.StatusOK {
+		t.Fatalf("upload small status = %d; body=%s", status, body)
+	}
+	afterSmall := waitForUserQuotaUsage(t, afterLarge-int64(len(largeBody))+int64(len(smallBody)))
+
+	// Headroom too small for the (large - small) delta the revert would bring back.
+	delta := int64(len(largeBody) - len(smallBody))
+	setDefaultUserQuota(t, afterSmall+delta-10)
+
+	revertResp := userClient.PostForm(t, "/api/v2.1/repos/"+repoID+"/file/?p=/rev.txt&operation=revert", url.Values{
+		"commit_id":       {c1},
+		"conflict_policy": {"replace"},
+	})
+	defer revertResp.Body.Close()
+	revertBody := responseBody(t, revertResp)
+	if revertResp.StatusCode != http.StatusForbidden {
+		t.Fatalf("revert status = %d, want %d; body=%s", revertResp.StatusCode, http.StatusForbidden, revertBody)
+	}
+	if !strings.Contains(revertBody, "storage quota exceeded") {
+		t.Fatalf("revert body = %q, want storage quota exceeded", revertBody)
+	}
+
+	if got := jsonInt64(getAdminUserByEmail(t, defaultUserEmail), "quota_usage"); got != afterSmall {
+		t.Fatalf("quota_usage after blocked revert = %d, want %d", got, afterSmall)
+	}
+
+	// Give enough headroom and verify the revert applies the byte delta.
+	setDefaultUserQuota(t, afterSmall+delta+100)
+	revertResp2 := userClient.PostForm(t, "/api/v2.1/repos/"+repoID+"/file/?p=/rev.txt&operation=revert", url.Values{
+		"commit_id":       {c1},
+		"conflict_policy": {"replace"},
+	})
+	defer revertResp2.Body.Close()
+	if revertResp2.StatusCode != http.StatusOK {
+		t.Fatalf("retry revert status = %d, want %d; body=%s", revertResp2.StatusCode, http.StatusOK, responseBody(t, revertResp2))
+	}
+	waitForUserQuotaUsage(t, afterSmall+delta)
+}
+
+func TestAsyncBatchMoveDoesNotRequireExtraQuotaForNetZeroMove(t *testing.T) {
+	originalOrg := getAdminOrganizationInfo(t, defaultOrgID)
+	originalUser := getAdminUserByEmail(t, defaultUserEmail)
+	restoreDefaultOrgAndUserQuotasOnCleanup(t, originalOrg, originalUser)
+
+	updateAdminOrganizationQuotas(t, defaultOrgID, map[string]interface{}{
+		"storage_quota": int64(1 << 50),
+		"quota_policy":  "hard",
+	})
+
+	srcRepoID := createTestLibrary(t, userClient, fmt.Sprintf("inttest-async-move-src-%d", time.Now().UnixNano()))
+	dstRepoID := createTestLibrary(t, userClient, fmt.Sprintf("inttest-async-move-dst-%d", time.Now().UnixNano()))
+
+	const seedContent = "cross repo move should be net zero for quota enforcement"
+	seedSize := int64(len(seedContent))
+	baselineUsage := jsonInt64(getAdminUserByEmail(t, defaultUserEmail), "quota_usage")
+	setDefaultUserQuota(t, baselineUsage+seedSize+100)
+
+	uploadURL := getUploadURL(t, userClient, srcRepoID)
+	status, body := uploadFileThroughLinkStatus(t, userClient, uploadURL, "move-me.txt", "/", seedContent)
+	if status != http.StatusOK {
+		t.Fatalf("seed upload status = %d, want %d; body=%s", status, http.StatusOK, body)
+	}
+	afterUpload := waitForUserQuotaUsage(t, baselineUsage+seedSize)
+
+	setDefaultUserQuota(t, afterUpload)
+
+	taskID := startAsyncBatchMoveTask(t, userClient, srcRepoID, dstRepoID, "/", "/", []string{"move-me.txt"})
+	progress := waitForCopyMoveTaskCompletion(t, userClient, taskID)
+	if failed := jsonInt64(progress, "failed"); failed != 0 {
+		t.Fatalf("async batch move reported failed=%d progress=%v", failed, progress)
+	}
+
+	if got := jsonInt64(getAdminUserByEmail(t, defaultUserEmail), "quota_usage"); got != afterUpload {
+		t.Fatalf("quota_usage after net-zero move = %d, want %d", got, afterUpload)
+	}
+
+	assertRepoHasEntry(t, userClient, dstRepoID, "move-me.txt")
+	assertRepoMissingEntry(t, userClient, srcRepoID, "move-me.txt")
+}
+
+func startAsyncBatchMoveTask(t *testing.T, c *testClient, srcRepoID, dstRepoID, srcParentDir, dstParentDir string, srcDirents []string) string {
+	t.Helper()
+	resp := c.PostJSON(t, "/api/v2.1/repos/async-batch-move-item/", map[string]interface{}{
+		"src_repo_id":    srcRepoID,
+		"dst_repo_id":    dstRepoID,
+		"src_parent_dir": srcParentDir,
+		"dst_parent_dir": dstParentDir,
+		"src_dirents":    srcDirents,
+	})
+	expectStatus(t, resp, http.StatusOK)
+	payload := responseJSON(t, resp)
+	taskID, _ := payload["task_id"].(string)
+	if taskID == "" {
+		t.Fatalf("async batch move response missing task_id: %v", payload)
+	}
+	return taskID
+}
+
+func waitForCopyMoveTaskCompletion(t *testing.T, c *testClient, taskID string) map[string]interface{} {
+	t.Helper()
+	var payload map[string]interface{}
+	waitForCondition(t, fmt.Sprintf("copy/move task %s completion", taskID), func() bool {
+		resp := c.Get(t, "/api/v2.1/query-copy-move-progress/?task_id="+url.QueryEscape(taskID))
+		expectStatus(t, resp, http.StatusOK)
+		payload = responseJSON(t, resp)
+		if done, _ := payload["done"].(bool); done {
+			return true
+		}
+		failed := jsonInt64(payload, "failed")
+		successful := jsonInt64(payload, "successful")
+		total := jsonInt64(payload, "total")
+		return failed > 0 && successful == 0 && total > 0
+	})
+	return payload
+}
+
+func assertRepoHasEntry(t *testing.T, c *testClient, repoID, name string) {
+	t.Helper()
+	resp := c.Get(t, fmt.Sprintf("/api/v2.1/repos/%s/dir/?p=/", repoID))
+	expectStatus(t, resp, http.StatusOK)
+	payload := responseJSON(t, resp)
+	entries, _ := payload["dirent_list"].([]interface{})
+	for _, raw := range entries {
+		entry, _ := raw.(map[string]interface{})
+		if got, _ := entry["name"].(string); got == name {
+			return
+		}
+	}
+	t.Fatalf("repo %s missing entry %q; payload=%v", repoID, name, payload)
+}
+
+func assertRepoMissingEntry(t *testing.T, c *testClient, repoID, name string) {
+	t.Helper()
+	resp := c.Get(t, fmt.Sprintf("/api/v2.1/repos/%s/dir/?p=/", repoID))
+	expectStatus(t, resp, http.StatusOK)
+	payload := responseJSON(t, resp)
+	entries, _ := payload["dirent_list"].([]interface{})
+	for _, raw := range entries {
+		entry, _ := raw.(map[string]interface{})
+		if got, _ := entry["name"].(string); got == name {
+			t.Fatalf("repo %s still contains entry %q; payload=%v", repoID, name, payload)
+		}
+	}
+}
+
+func findTrashItemFor(t *testing.T, c *testClient, repoID, fileName string) (string, string) {
+	t.Helper()
+	resp := c.Get(t, "/api/v2.1/repos/"+repoID+"/trash/?parent_dir=/")
+	expectStatus(t, resp, http.StatusOK)
+	body := responseBody(t, resp)
+
+	var payload struct {
+		Data []struct {
+			ObjName   string `json:"obj_name"`
+			ParentDir string `json:"parent_dir"`
+			CommitID  string `json:"commit_id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal([]byte(body), &payload); err != nil {
+		// Some variants return the array at the top level.
+		var direct []struct {
+			ObjName   string `json:"obj_name"`
+			ParentDir string `json:"parent_dir"`
+			CommitID  string `json:"commit_id"`
+		}
+		if err2 := json.Unmarshal([]byte(body), &direct); err2 != nil {
+			t.Fatalf("could not parse trash listing %q: %v / %v", body, err, err2)
+		}
+		for _, it := range direct {
+			if it.ObjName == fileName {
+				return it.CommitID, it.ParentDir
+			}
+		}
+		return "", ""
+	}
+	for _, it := range payload.Data {
+		if it.ObjName == fileName {
+			return it.CommitID, it.ParentDir
+		}
+	}
+	return "", ""
+}
+
+func getRepoHeadCommit(t *testing.T, c *testClient, repoID string) string {
+	t.Helper()
+	resp := c.Get(t, "/api2/repos/"+repoID+"/")
+	expectStatus(t, resp, http.StatusOK)
+	body := responseBody(t, resp)
+	var payload map[string]interface{}
+	if err := json.Unmarshal([]byte(body), &payload); err != nil {
+		t.Fatalf("could not parse repo info %q: %v", body, err)
+	}
+	if v, ok := payload["head_commit_id"].(string); ok && v != "" {
+		return v
+	}
+	return ""
+}
+
 func assertQuotaFields(t *testing.T, payload map[string]interface{}) {
 	t.Helper()
 	if got := jsonInt64(payload, "org_storage_quota"); got != testStorageQuota {

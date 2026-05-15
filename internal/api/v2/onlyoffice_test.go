@@ -491,6 +491,26 @@ func TestDefaultOnlyOfficeMaxDocumentBytes(t *testing.T) {
 	}
 }
 
+func TestOnlyOfficeStorageDeltaTreatsExistingEmptyFileAsReplacement(t *testing.T) {
+	existing := &FSEntry{Name: "empty.docx", Size: 0}
+
+	bytesDelta, filesDelta := onlyOfficeStorageDelta(existing, 128)
+	if bytesDelta != 128 {
+		t.Fatalf("bytesDelta = %d, want 128", bytesDelta)
+	}
+	if filesDelta != 0 {
+		t.Fatalf("filesDelta = %d, want 0 for replacement of existing empty file", filesDelta)
+	}
+
+	bytesDelta, filesDelta = onlyOfficeStorageDelta(nil, 128)
+	if bytesDelta != 128 {
+		t.Fatalf("bytesDelta for new file = %d, want 128", bytesDelta)
+	}
+	if filesDelta != 1 {
+		t.Fatalf("filesDelta for new file = %d, want 1", filesDelta)
+	}
+}
+
 // TestGenerateFSID tests FS object ID generation
 func TestGenerateFSID(t *testing.T) {
 	tests := []struct {

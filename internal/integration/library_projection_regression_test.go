@@ -489,6 +489,88 @@ func TestSyncHeadStaleAsyncStatsDoNotOverwriteCurrentHead(t *testing.T) {
 	}
 }
 
+func TestSyncHeadUpdateAppliesStorageCountersBeforeReturning(t *testing.T) {
+	name := fmt.Sprintf("inttest-sync-storage-counters-%d", time.Now().UnixNano())
+	repoID := createTestLibrary(t, adminClient, name)
+	database := shareProjectionDBForTest(t)
+	session := database.Session()
+
+	var ownerID string
+	if err := session.Query(`SELECT owner_id FROM libraries WHERE org_id = ? AND library_id = ?`, defaultOrgID, repoID).Scan(&ownerID); err != nil {
+		t.Fatalf("failed to read owner_id for repo %s: %v", repoID, err)
+	}
+
+	platformScope := traffic.PlatformStorageScope()
+	orgScope := traffic.OrganizationStorageScope(defaultOrgID)
+	userScope := traffic.UserStorageScope(defaultOrgID, ownerID)
+	libScope := traffic.LibraryStorageScope(defaultOrgID, repoID)
+
+	baselinePlatform := traffic.ReadStorageSnapshot(database, platformScope)
+	baselineOrg := traffic.ReadStorageSnapshot(database, orgScope)
+	baselineUser := traffic.ReadStorageSnapshot(database, userScope)
+	baselineLib := traffic.ReadStorageSnapshot(database, libScope)
+
+	initial := readLibrarySyncHeadState(t, session, repoID)
+	nextHead := fmt.Sprintf("%040x", time.Now().UnixNano())
+	nextRootFSID := fmt.Sprintf("sync-storage-root-%d", time.Now().UnixNano())
+
+	const childDirCount = 3
+	const filesPerChild = 2
+	const fileSize = int64(1234)
+	expectedDelta := traffic.StorageSnapshot{
+		BytesUsed: childDirCount * filesPerChild * fileSize,
+		FileCount: childDirCount * filesPerChild,
+	}
+
+	insertSyntheticDirectoryTreeForTest(t, session, repoID, nextRootFSID, childDirCount, filesPerChild, fileSize)
+	insertSyntheticCommitForTest(t, session, repoID, nextHead, initial.HeadCommitID, nextRootFSID, "integration sync storage counters")
+	t.Cleanup(func() {
+		if err := session.Query(`DELETE FROM commits WHERE library_id = ? AND commit_id = ?`, repoID, nextHead).Exec(); err != nil {
+			t.Errorf("cleanup synthetic commit %s failed: %v", nextHead, err)
+		}
+		fsIDs := []string{nextRootFSID}
+		for dirIndex := 0; dirIndex < childDirCount; dirIndex++ {
+			fsIDs = append(fsIDs, fmt.Sprintf("%s-dir-%03d", nextRootFSID, dirIndex))
+		}
+		for _, fsID := range fsIDs {
+			if err := session.Query(`DELETE FROM fs_objects WHERE library_id = ? AND fs_id = ?`, repoID, fsID).Exec(); err != nil {
+				t.Errorf("cleanup synthetic fs_object %s failed: %v", fsID, err)
+			}
+		}
+	})
+
+	resp := adminClient.Do(t, http.MethodPut, fmt.Sprintf("/seafhttp/repo/%s/commit/HEAD?head=%s", repoID, url.QueryEscape(nextHead)), nil)
+	if resp.StatusCode != http.StatusOK {
+		body := responseBody(t, resp)
+		t.Fatalf("sync HEAD update failed: status=%d body=%s", resp.StatusCode, body)
+	}
+	resp.Body.Close()
+
+	current := readLibrarySyncHeadState(t, session, repoID)
+	if current.HeadCommitID != nextHead || current.LookupHeadCommitID != nextHead {
+		t.Fatalf("sync HEAD not fully visible after success response: canonical=%q lookup=%q want=%q", current.HeadCommitID, current.LookupHeadCommitID, nextHead)
+	}
+	if current.SizeBytes != expectedDelta.BytesUsed || current.FileCount != expectedDelta.FileCount {
+		t.Fatalf("sync HEAD stats after success response = {%d %d}, want {%d %d}", current.SizeBytes, current.FileCount, expectedDelta.BytesUsed, expectedDelta.FileCount)
+	}
+	if current.ProjectionSizeBytes != expectedDelta.BytesUsed || current.ProjectionFileCount != expectedDelta.FileCount {
+		t.Fatalf("sync HEAD projection stats after success response = {%d %d}, want {%d %d}", current.ProjectionSizeBytes, current.ProjectionFileCount, expectedDelta.BytesUsed, expectedDelta.FileCount)
+	}
+
+	if got := traffic.ReadStorageSnapshot(database, libScope); got != addStorageSnapshots(baselineLib, expectedDelta) {
+		t.Fatalf("library storage snapshot after sync HEAD = %+v, want %+v", got, addStorageSnapshots(baselineLib, expectedDelta))
+	}
+	if got := traffic.ReadStorageSnapshot(database, platformScope); got != addStorageSnapshots(baselinePlatform, expectedDelta) {
+		t.Fatalf("platform storage snapshot after sync HEAD = %+v, want %+v", got, addStorageSnapshots(baselinePlatform, expectedDelta))
+	}
+	if got := traffic.ReadStorageSnapshot(database, orgScope); got != addStorageSnapshots(baselineOrg, expectedDelta) {
+		t.Fatalf("org storage snapshot after sync HEAD = %+v, want %+v", got, addStorageSnapshots(baselineOrg, expectedDelta))
+	}
+	if got := traffic.ReadStorageSnapshot(database, userScope); got != addStorageSnapshots(baselineUser, expectedDelta) {
+		t.Fatalf("user storage snapshot after sync HEAD = %+v, want %+v", got, addStorageSnapshots(baselineUser, expectedDelta))
+	}
+}
+
 func TestAdminCreateLibraryProjectionVisibleImmediately(t *testing.T) {
 	name := fmt.Sprintf("inttest-admin-lib-projection-%d", time.Now().UnixNano())
 	createResp := superadminClient.PostJSON(t, "/api/v2.1/admin/libraries/", map[string]string{
@@ -660,6 +742,13 @@ func readLibrarySyncHeadState(t *testing.T, session interface {
 	}
 
 	return state
+}
+
+func addStorageSnapshots(left, right traffic.StorageSnapshot) traffic.StorageSnapshot {
+	return traffic.StorageSnapshot{
+		BytesUsed: left.BytesUsed + right.BytesUsed,
+		FileCount: left.FileCount + right.FileCount,
+	}
 }
 
 func insertSyntheticCommitForTest(t *testing.T, session interface {

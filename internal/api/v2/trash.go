@@ -2,6 +2,7 @@ package v2
 
 import (
 	"fmt"
+	"log"
 	"net/http"
 	"path"
 	"sort"
@@ -411,10 +412,24 @@ func (h *TrashHandler) RestoreTrashItem(c *gin.Context) {
 
 	// Add the restored item to the parent directory
 	fileName := path.Base(filePath)
+	var replacedEntry *FSEntry
+	if existing := FindEntryInList(result.Entries, fileName); existing != nil {
+		ent := *existing
+		replacedEntry = &ent
+	}
 	newEntries := RemoveEntryFromList(result.Entries, fileName) // remove if somehow exists
 	oldEntry.Name = fileName
 	oldEntry.MTime = time.Now().Unix()
 	newEntries = AddEntryToList(newEntries, oldEntry)
+
+	deltaBytes, deltaFiles, err := fsEntryDelta(fsHelper, repoID, oldEntry, replacedEntry)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error_msg": "failed to compute storage delta: " + err.Error()})
+		return
+	}
+	if !preCheckStorageQuotaForDeltaWithKey(c, orgID, userID, deltaBytes, "error_msg") {
+		return
+	}
 
 	// Create new fs_object for modified parent
 	newParentFSID, err := fsHelper.CreateDirectoryFSObject(repoID, newEntries)
@@ -444,17 +459,9 @@ func (h *TrashHandler) RestoreTrashItem(c *gin.Context) {
 		return
 	}
 
-	// Increment storage counters for the restored item — fire-and-forget.
-	go func() {
-		if oldEntry.Mode == ModeDir || oldEntry.Mode&0170000 == 040000 {
-			_, totalSize, fileCount, err := fsHelper.collectDirStats(repoID, oldEntry.ID)
-			if err == nil && totalSize > 0 {
-				traffic.IncrementStorageCounters(h.db, orgID, userID, repoID, totalSize, fileCount)
-			}
-		} else if oldEntry.Size > 0 {
-			traffic.IncrementStorageCounters(h.db, orgID, userID, repoID, oldEntry.Size, 1)
-		}
-	}()
+	if !applyStorageCounterDeltaWithKey(c, h.db, orgID, userID, repoID, deltaBytes, deltaFiles, "error_msg") {
+		return
+	}
 
 	c.JSON(http.StatusOK, gin.H{"success": true})
 }
@@ -743,10 +750,32 @@ func (h *TrashHandler) RevertDirents(c *gin.Context) {
 
 		// Add the restored item to the parent directory
 		fileName := path.Base(filePath)
+		var replacedEntry *FSEntry
+		if existing := FindEntryInList(result.Entries, fileName); existing != nil {
+			ent := *existing
+			replacedEntry = &ent
+		}
 		newEntries := RemoveEntryFromList(result.Entries, fileName)
 		oldEntry.Name = fileName
 		oldEntry.MTime = time.Now().Unix()
 		newEntries = AddEntryToList(newEntries, oldEntry)
+
+		// Storage quota pre-check using the visible delta the restore introduces.
+		// Failures fall into failedItems so partial batches succeed; the user
+		// can re-issue with a smaller selection if some items exceed the cap.
+		deltaBytes, deltaFiles, err := fsEntryDelta(fsHelper, repoID, oldEntry, replacedEntry)
+		if err != nil {
+			failedItems = append(failedItems, revertResult{Path: filePath, IsDir: isDir})
+			continue
+		}
+		if deltaBytes > 0 {
+			if checker := traffic.GetChecker(); checker != nil {
+				if st, _ := checker.CheckStorageQuota(orgID, userID, deltaBytes); !st.Allowed {
+					failedItems = append(failedItems, revertResult{Path: filePath, IsDir: isDir})
+					continue
+				}
+			}
+		}
 
 		// Create new fs_object for modified parent
 		newParentFSID, err := fsHelper.CreateDirectoryFSObject(repoID, newEntries)
@@ -777,19 +806,12 @@ func (h *TrashHandler) RevertDirents(c *gin.Context) {
 		}
 
 		currentHeadCommitID = newCommitID
-		successItems = append(successItems, revertResult{Path: filePath, IsDir: isDir})
 
-		// Increment storage counters for the restored item — fire-and-forget.
-		go func(entry FSEntry, isDir bool) {
-			if isDir {
-				_, totalSize, fileCount, err := fsHelper.collectDirStats(repoID, entry.ID)
-				if err == nil && totalSize > 0 {
-					traffic.IncrementStorageCounters(h.db, orgID, userID, repoID, totalSize, fileCount)
-				}
-			} else if entry.Size > 0 {
-				traffic.IncrementStorageCounters(h.db, orgID, userID, repoID, entry.Size, 1)
-			}
-		}(oldEntry, isDir)
+		if err := traffic.AdjustStorageCountersByDeltaSync(h.db, orgID, userID, repoID, deltaBytes, deltaFiles); err != nil {
+			log.Printf("[RevertDirents] failed to apply storage counter delta for %s: %v", filePath, err)
+		}
+
+		successItems = append(successItems, revertResult{Path: filePath, IsDir: isDir})
 	}
 
 	if successItems == nil {

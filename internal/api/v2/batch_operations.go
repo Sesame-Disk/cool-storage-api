@@ -11,6 +11,7 @@ import (
 	"github.com/Sesame-Disk/sesamefs/internal/config"
 	"github.com/Sesame-Disk/sesamefs/internal/db"
 	"github.com/Sesame-Disk/sesamefs/internal/middleware"
+	"github.com/Sesame-Disk/sesamefs/internal/traffic"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 )
@@ -390,10 +391,18 @@ func (h *BatchOperationHandler) processSingleItem(orgID, userID, srcRepoID, dstR
 		}
 	}
 
+	var replacedEntry *FSEntry
 	if hasConflict {
 		switch policy {
 		case "replace":
 			// Remove existing entry before adding
+			for i := range dstEntries {
+				if dstEntries[i].Name == itemName {
+					ent := dstEntries[i]
+					replacedEntry = &ent
+					break
+				}
+			}
 			dstEntries = RemoveEntryFromList(dstEntries, itemName)
 		case "autorename":
 			// Generate unique name
@@ -406,6 +415,35 @@ func (h *BatchOperationHandler) processSingleItem(orgID, userID, srcRepoID, dstR
 		}
 	}
 
+	// Storage quota pre-check for the destination side. Copy is additive; move is
+	// checked against the net org/user growth after the source tree is removed.
+	// Cross-repo move within the same org/user is therefore usually 0 or
+	// negative, while per-library counters still apply both halves below.
+	srcSize, srcFiles, err := fsEntryStats(fsHelper, srcRepoID, *srcResult.TargetEntry)
+	if err != nil {
+		return fmt.Errorf("failed to compute source size: %w", err)
+	}
+	var oldDstSize, oldDstFiles int64
+	if replacedEntry != nil {
+		oldDstSize, oldDstFiles, err = fsEntryStats(fsHelper, dstRepoID, *replacedEntry)
+		if err != nil {
+			return fmt.Errorf("failed to compute replaced entry size: %w", err)
+		}
+	}
+	dstDeltaBytes := srcSize - oldDstSize
+	dstDeltaFiles := srcFiles - oldDstFiles
+	quotaDeltaBytes := dstDeltaBytes
+	if opType == "move" {
+		quotaDeltaBytes -= srcSize
+	}
+	if quotaDeltaBytes > 0 {
+		if checker := traffic.GetChecker(); checker != nil {
+			if st, _ := checker.CheckStorageQuota(orgID, userID, quotaDeltaBytes); !st.Allowed {
+				return fmt.Errorf("storage quota exceeded")
+			}
+		}
+	}
+
 	// For cross-library operations, we need to copy fs_objects to the destination library
 	// because fs_objects are keyed by (library_id, fs_id)
 	entryFSID := srcResult.TargetEntry.ID
@@ -415,20 +453,6 @@ func (h *BatchOperationHandler) processSingleItem(orgID, userID, srcRepoID, dstR
 			return fmt.Errorf("failed to copy fs_objects to destination library: %w", err)
 		}
 		entryFSID = newFSID
-
-		// Increment ref_count for every block referenced by the copied fs tree.
-		// Without this, if the source library is later GC'd, ref_count reaches 0
-		// and the GC deletes the blocks from S3 — corrupting the destination copy.
-		// Synchronous: this task already runs in a background job (TaskStore).
-		blockIDs, err := fsHelper.CollectBlockIDsRecursive(dstRepoID, newFSID)
-		if err != nil {
-			return fmt.Errorf("failed to collect block IDs for cross-library %s: %w", opType, err)
-		}
-		if len(blockIDs) > 0 {
-			if err := fsHelper.IncrementBlockRefCounts(orgID, blockIDs); err != nil {
-				return fmt.Errorf("failed to increment block ref counts for cross-library %s: %w", opType, err)
-			}
-		}
 	}
 
 	// Add source entry to destination
@@ -490,9 +514,19 @@ func (h *BatchOperationHandler) processSingleItem(orgID, userID, srcRepoID, dstR
 		return fmt.Errorf("failed to create destination commit: %w", err)
 	}
 
+	pinnedBlockIDs, err := pinCopiedTreeBlockRefs(fsHelper, orgID, dstRepoID, entryFSID)
+	if err != nil {
+		return fmt.Errorf("failed to increment block ref counts for cross-library %s: %w", opType, err)
+	}
+
 	// Update destination library head
 	if err := fsHelper.UpdateLibraryHead(orgID, dstRepoID, newDstCommitID); err != nil {
+		rollbackCopiedTreeBlockRefs(fsHelper, orgID, opType+"-rollback:"+newDstCommitID, pinnedBlockIDs)
 		return fmt.Errorf("failed to update destination library: %w", err)
+	}
+
+	if err := traffic.AdjustStorageCountersByDeltaSync(h.db, orgID, userID, dstRepoID, dstDeltaBytes, dstDeltaFiles); err != nil {
+		log.Printf("[processSingleItem] failed to apply destination storage counter delta for %s -> %s/%s: %v", srcPath, dstRepoID, dstDir, err)
 	}
 
 	// For move operation, remove from source
@@ -580,6 +614,14 @@ func (h *BatchOperationHandler) processSingleItem(orgID, userID, srcRepoID, dstR
 		// Update source library head
 		if err := fsHelper.UpdateLibraryHead(orgID, srcRepoID, newSrcCommitID); err != nil {
 			return fmt.Errorf("failed to update source library: %w", err)
+		}
+
+		// Decrement the source library's storage counter by the moved tree.
+		// For move cross-repo same-owner this nets out against the destination
+		// increment at the org/user/platform scopes; per-library counters still
+		// need both halves so per-lib views stay consistent.
+		if err := traffic.AdjustStorageCountersByDeltaSync(h.db, orgID, userID, srcRepoID, -srcSize, -srcFiles); err != nil {
+			log.Printf("[processSingleItem] failed to apply source storage counter delta for %s: %v", srcPath, err)
 		}
 
 		// Clean up file tags for the moved item (async, non-blocking)

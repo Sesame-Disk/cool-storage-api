@@ -2321,6 +2321,26 @@ type CopyFileRequest struct {
 	Filename interface{} `json:"filename" form:"filename"` // Can be string or []string for batch operations
 }
 
+func pinCopiedTreeBlockRefs(fsHelper *FSHelper, orgID, repoID, srcFSID string) ([]string, error) {
+	blockIDs, err := fsHelper.CollectBlockIDsRecursive(repoID, srcFSID)
+	if err != nil {
+		return nil, err
+	}
+	if len(blockIDs) == 0 {
+		return nil, nil
+	}
+	return fsHelper.IncrementBlockRefCountsTracked(orgID, blockIDs)
+}
+
+func rollbackCopiedTreeBlockRefs(fsHelper *FSHelper, orgID, operationKey string, blockIDs []string) {
+	if len(blockIDs) == 0 {
+		return
+	}
+	if zeroRefBlocks := fsHelper.DecrementBlockRefCountsOnce(orgID, operationKey, blockIDs); len(zeroRefBlocks) > 0 {
+		log.Printf("[copyRefRollback] WARNING: rollback %q drove %d blocks to zero refs", operationKey, len(zeroRefBlocks))
+	}
+}
+
 // CopyFile copies a file to a new location
 // Supports both same-repo and cross-repo copies, single and batch operations
 func (h *FileHandler) CopyFile(c *gin.Context) {
@@ -2483,10 +2503,15 @@ func (h *FileHandler) CopyFile(c *gin.Context) {
 	fileName := path.Base(srcPath)
 
 	// Check if name already exists at destination
+	var replacedEntry *FSEntry
 	hasConflict := FindEntryInList(dstDirEntries, fileName) != nil
 	if hasConflict {
 		switch req.ConflictPolicy {
 		case "replace":
+			if existing := FindEntryInList(dstDirEntries, fileName); existing != nil {
+				ent := *existing
+				replacedEntry = &ent
+			}
 			dstDirEntries = RemoveEntryFromList(dstDirEntries, fileName)
 		case "autorename":
 			fileName = GenerateUniqueName(dstDirEntries, fileName)
@@ -2510,6 +2535,16 @@ func (h *FileHandler) CopyFile(c *gin.Context) {
 	copiedEntry := *srcResult.TargetEntry
 	copiedEntry.Name = fileName // may be renamed by autorename
 	copiedEntry.MTime = time.Now().Unix()
+
+	// Compute storage delta and pre-check the user's quota before mutating the tree.
+	deltaBytes, deltaFiles, err := fsEntryDelta(fsHelper, repoID, copiedEntry, replacedEntry)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to compute storage delta: " + err.Error()})
+		return
+	}
+	if !preCheckStorageQuotaForDelta(c, orgID, userID, deltaBytes) {
+		return
+	}
 
 	// Add to destination directory
 	dstNewEntries := AddEntryToList(dstDirEntries, copiedEntry)
@@ -2550,19 +2585,23 @@ func (h *FileHandler) CopyFile(c *gin.Context) {
 		return
 	}
 
+	pinnedBlockIDs, err := pinCopiedTreeBlockRefs(fsHelper, orgID, repoID, srcResult.TargetFSID)
+	if err != nil {
+		log.Printf("[CopyFile] Failed to pin copied tree block refs for %q: %v", srcPath, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to increment block ref counts for copy"})
+		return
+	}
+
 	// Update library head
 	if err := fsHelper.UpdateLibraryHead(orgID, repoID, newCommitID); err != nil {
+		rollbackCopiedTreeBlockRefs(fsHelper, orgID, "copy-rollback:"+newCommitID, pinnedBlockIDs)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update library"})
 		return
 	}
 
-	// Increment block ref counts in background (for proper dedup)
-	go func() {
-		blockIDs, _ := fsHelper.CollectBlockIDsRecursive(repoID, srcResult.TargetFSID)
-		if len(blockIDs) > 0 {
-			fsHelper.IncrementBlockRefCounts(orgID, blockIDs)
-		}
-	}()
+	if !applyStorageCounterDelta(c, h.db, orgID, userID, repoID, deltaBytes, deltaFiles) {
+		return
+	}
 
 	// Return Seafile-compatible response
 	c.JSON(http.StatusOK, gin.H{
@@ -2993,9 +3032,14 @@ func (h *FileHandler) copyBatchFiles(c *gin.Context, srcPaths []string, srcRepoI
 		fileName := path.Base(srcPath)
 
 		// Handle conflict
+		var replacedEntry *FSEntry
 		if FindEntryInList(dstDirEntries, fileName) != nil {
 			switch conflictPolicy {
 			case "replace":
+				if existing := FindEntryInList(dstDirEntries, fileName); existing != nil {
+					ent := *existing
+					replacedEntry = &ent
+				}
 				dstDirEntries = RemoveEntryFromList(dstDirEntries, fileName)
 			case "autorename":
 				fileName = GenerateUniqueName(dstDirEntries, fileName)
@@ -3013,6 +3057,16 @@ func (h *FileHandler) copyBatchFiles(c *gin.Context, srcPaths []string, srcRepoI
 		copiedEntry := *srcResult.TargetEntry
 		copiedEntry.Name = fileName
 		copiedEntry.MTime = time.Now().Unix()
+
+		// Storage quota pre-check using the visible tree delta for this copy.
+		deltaBytes, deltaFiles, err := fsEntryDelta(fsHelper, repoID, copiedEntry, replacedEntry)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to compute storage delta: " + err.Error()})
+			return
+		}
+		if !preCheckStorageQuotaForDelta(c, orgID, userID, deltaBytes) {
+			return
+		}
 
 		// Add to destination directory
 		dstNewEntries := AddEntryToList(dstDirEntries, copiedEntry)
@@ -3056,19 +3110,23 @@ func (h *FileHandler) copyBatchFiles(c *gin.Context, srcPaths []string, srcRepoI
 			return
 		}
 
+		pinnedBlockIDs, err := pinCopiedTreeBlockRefs(fsHelper, orgID, repoID, srcResult.TargetFSID)
+		if err != nil {
+			log.Printf("[copyBatchFiles] Failed to pin copied tree block refs for %q: %v", srcPath, err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to increment block ref counts for copy"})
+			return
+		}
+
 		// Update library head
 		if err := fsHelper.UpdateLibraryHead(orgID, repoID, newCommitID); err != nil {
+			rollbackCopiedTreeBlockRefs(fsHelper, orgID, "copy-rollback:"+newCommitID, pinnedBlockIDs)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update library"})
 			return
 		}
 
-		// Increment block ref counts in background
-		go func(srcFSID string) {
-			blockIDs, _ := fsHelper.CollectBlockIDsRecursive(repoID, srcFSID)
-			if len(blockIDs) > 0 {
-				fsHelper.IncrementBlockRefCounts(orgID, blockIDs)
-			}
-		}(srcResult.TargetFSID)
+		if !applyStorageCounterDelta(c, h.db, orgID, userID, repoID, deltaBytes, deltaFiles) {
+			return
+		}
 
 		results = append(results, copyResult{Name: fileName, Path: path.Join(dstDir, fileName)})
 	}
@@ -3668,11 +3726,30 @@ func (h *FileHandler) RevertFile(c *gin.Context) {
 		}
 	}
 
+	// Compute the storage delta for this revert: net change relative to the
+	// file currently at fileName (if any). For replace policy, existingEntry is
+	// the entry being overwritten; for keep_both/autorename, the new entry is
+	// additive.
+	var replacedEntry *FSEntry
+	if conflictPolicy == "replace" && existingEntry != nil {
+		ent := *existingEntry
+		replacedEntry = &ent
+	}
+	revertedEntry := oldEntry
+	revertedEntry.Name = fileName
+	revertedEntry.MTime = time.Now().Unix()
+	deltaBytes, deltaFiles, err := fsEntryDelta(fsHelper, repoID, revertedEntry, replacedEntry)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to compute storage delta: " + err.Error()})
+		return
+	}
+	if !preCheckStorageQuotaForDelta(c, orgID, userID, deltaBytes) {
+		return
+	}
+
 	// Replace or add the file entry in the parent directory
 	newEntries := RemoveEntryFromList(result.Entries, fileName)
-	oldEntry.Name = fileName // Use potentially renamed fileName
-	oldEntry.MTime = time.Now().Unix()
-	newEntries = AddEntryToList(newEntries, oldEntry)
+	newEntries = AddEntryToList(newEntries, revertedEntry)
 
 	// Create new fs_object for modified parent
 	newParentFSID, err := fsHelper.CreateDirectoryFSObject(repoID, newEntries)
@@ -3699,6 +3776,10 @@ func (h *FileHandler) RevertFile(c *gin.Context) {
 	// Update library head
 	if err := fsHelper.UpdateLibraryHead(orgID, repoID, newCommitID); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update library"})
+		return
+	}
+
+	if !applyStorageCounterDelta(c, h.db, orgID, userID, repoID, deltaBytes, deltaFiles) {
 		return
 	}
 
@@ -3815,11 +3896,28 @@ func (h *FileHandler) RevertDirectory(c *gin.Context) {
 		}
 	}
 
+	// Storage delta: directory tree size at the reverted version, minus the
+	// current directory's tree size if we are replacing an existing one.
+	var replacedDir *FSEntry
+	if conflictPolicy == "replace" && existingEntry != nil {
+		ent := *existingEntry
+		replacedDir = &ent
+	}
+	revertedDir := oldEntry
+	revertedDir.Name = dirName
+	revertedDir.MTime = time.Now().Unix()
+	deltaBytes, deltaFiles, err := fsEntryDelta(fsHelper, repoID, revertedDir, replacedDir)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to compute storage delta: " + err.Error()})
+		return
+	}
+	if !preCheckStorageQuotaForDelta(c, orgID, userID, deltaBytes) {
+		return
+	}
+
 	// Replace or add the directory entry in the parent directory
 	newEntries := RemoveEntryFromList(result.Entries, dirName)
-	oldEntry.Name = dirName // Ensure name matches
-	oldEntry.MTime = time.Now().Unix()
-	newEntries = AddEntryToList(newEntries, oldEntry)
+	newEntries = AddEntryToList(newEntries, revertedDir)
 
 	// Create new fs_object for modified parent
 	newParentFSID, err := fsHelper.CreateDirectoryFSObject(repoID, newEntries)
@@ -3846,6 +3944,10 @@ func (h *FileHandler) RevertDirectory(c *gin.Context) {
 	// Update library head
 	if err := fsHelper.UpdateLibraryHead(orgID, repoID, newCommitID); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update library"})
+		return
+	}
+
+	if !applyStorageCounterDelta(c, h.db, orgID, userID, repoID, deltaBytes, deltaFiles) {
 		return
 	}
 

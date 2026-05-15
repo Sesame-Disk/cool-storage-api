@@ -23,6 +23,7 @@ import (
 	"github.com/Sesame-Disk/sesamefs/internal/httputil"
 	"github.com/Sesame-Disk/sesamefs/internal/middleware"
 	"github.com/Sesame-Disk/sesamefs/internal/storage"
+	"github.com/Sesame-Disk/sesamefs/internal/traffic"
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
 )
@@ -827,6 +828,13 @@ func (h *OnlyOfficeHandler) validateOnlyOfficeDownloadURL(downloadURL string) er
 	return fmt.Errorf("download URL host %q does not match any configured OnlyOffice host", parsed.Host)
 }
 
+func onlyOfficeStorageDelta(existing *FSEntry, newFileSize int64) (int64, int64) {
+	if existing == nil {
+		return newFileSize, 1
+	}
+	return newFileSize - existing.Size, 0
+}
+
 // saveEditedDocument downloads the edited document and saves it to storage
 func (h *OnlyOfficeHandler) saveEditedDocument(ctx context.Context, repoID, filePath, downloadURL, userID string) error {
 	// OnlyOffice sends URLs with the browser-accessible URL (api_js_url host).
@@ -880,6 +888,27 @@ func (h *OnlyOfficeHandler) saveEditedDocument(ctx context.Context, repoID, file
 	`, repoID).Scan(&orgID, &encrypted)
 	if err != nil {
 		return fmt.Errorf("library not found: %w", err)
+	}
+
+	// Resolve existing entry (if any) before storing bytes, so we can pre-check
+	// the per-user storage quota against the visible delta of this save.
+	fsHelper := NewFSHelper(h.db)
+	preResult, preErr := fsHelper.TraverseToPath(repoID, filePath)
+	filename := path.Base(filePath)
+	var existingEntry *FSEntry
+	if preErr == nil {
+		if existing := FindEntryInList(preResult.Entries, filename); existing != nil {
+			ent := *existing
+			existingEntry = &ent
+		}
+	}
+	storageDeltaBytes, storageDeltaFiles := onlyOfficeStorageDelta(existingEntry, originalFileSize)
+	if storageDeltaBytes > 0 {
+		if checker := traffic.GetChecker(); checker != nil {
+			if st, _ := checker.CheckStorageQuota(orgID, userID, storageDeltaBytes); !st.Allowed {
+				return fmt.Errorf("storage quota exceeded")
+			}
+		}
 	}
 
 	// If library is encrypted, encrypt the content before storage
@@ -941,21 +970,23 @@ func (h *OnlyOfficeHandler) saveEditedDocument(ctx context.Context, repoID, file
 		log.Printf("Failed to store block metadata: %v", err)
 	}
 
-	// Use FSHelper to properly update the file tree and create a commit
-	fsHelper := NewFSHelper(h.db)
+	// Reuse the FSHelper and traversal already prepared for the storage
+	// pre-check above. Re-traversing here would be redundant work.
 	now := time.Now()
-	filename := path.Base(filePath)
+	result := preResult
+	if preErr != nil {
+		// Pre-check traversal failed earlier — retry now to keep the historical
+		// error path intact (returns 404 on path mismatch via the original error).
+		result, err = fsHelper.TraverseToPath(repoID, filePath)
+		if err != nil {
+			return fmt.Errorf("failed to traverse to path: %w", err)
+		}
+	}
 
 	// Create new FS object for the file (use external SHA-1 block ID for Seafile client compatibility)
 	newFileFSID, err := fsHelper.CreateFileFSObject(repoID, filename, originalFileSize, []string{externalBlockID})
 	if err != nil {
 		return fmt.Errorf("failed to create file fs_object: %w", err)
-	}
-
-	// Traverse to the file's location
-	result, err := fsHelper.TraverseToPath(repoID, filePath)
-	if err != nil {
-		return fmt.Errorf("failed to traverse to path: %w", err)
 	}
 
 	// Update the entry in parent directory
@@ -1013,6 +1044,10 @@ func (h *OnlyOfficeHandler) saveEditedDocument(ctx context.Context, repoID, file
 	// Update library head
 	if err := fsHelper.UpdateLibraryHead(orgID, repoID, newCommitID); err != nil {
 		return fmt.Errorf("failed to update library head: %w", err)
+	}
+
+	if err := traffic.AdjustStorageCountersByDeltaSync(h.db, orgID, userID, repoID, storageDeltaBytes, storageDeltaFiles); err != nil {
+		log.Printf("OnlyOffice: failed to apply storage counter delta for %s: %v", filePath, err)
 	}
 
 	log.Printf("OnlyOffice: saved document %s with block %s (internal: %s), new commit %s", filePath, externalBlockID[:16], internalBlockID[:16], newCommitID)

@@ -31,14 +31,16 @@ Lo pendiente ya no es el modelo base de quotas. Lo pendiente es cerrar la integr
 
 ## PENDIENTE — ALTA PRIORIDAD
 
-### 0. BUG: Mutaciones V2 que crecen bytes bypasean quota y dejan counters stale (ISSUE-QUOTA-COVERAGE-01)
+### 0. ~~BUG: Mutaciones V2 que crecen bytes bypasean quota y dejan counters stale~~ ✅ COMPLETADO (2026-05-14)
 
-Después de cerrar ISSUE-USER-STORAGE-ENFORCE-01 quedaron 5 handlers que también
-publican commits que crecen storage pero no están enchufados al sistema de quotas.
-Los uploads y el path de sync (PutCommit / UpdateBranch) sí quedaron cubiertos:
-uploads validan el delta visible del path (incluyendo chunked total y replace),
-y sync valida el delta del árbol publicado y espera el ajuste de
-`storage_counters` antes de responder.
+ISSUE-QUOTA-COVERAGE-01 cerrado. Los 5 frentes (CopyFile + copyBatchFiles,
+RevertFile + RevertDirectory, RestoreTrashItem + RevertDirents, OnlyOffice save,
+batch_operations cross-repo) ahora computan delta visible del árbol, pre-checkean
+quota antes de publicar el commit, y aplican `AdjustStorageCountersByDeltaSync`
+después de `UpdateLibraryHead`. Move cross-repo decrementa también el counter
+del source. Ver `docs/KNOWN_ISSUES.md` → ISSUE-QUOTA-COVERAGE-01 para el detalle.
+
+Mantenido (más abajo) el contexto histórico del bug:
 
 Handlers afectados (todos llaman a `FSHelper.UpdateLibraryHead` pero ninguno
 pre-checkea storage ni ajusta `storage_counters` con el delta del árbol):
@@ -287,8 +289,7 @@ Esto es útil, pero no forma parte del núcleo ya implementado de enforcement.
 
 ## ORDEN PRACTICO RECOMENDADO
 
-1. Cerrar boquetes de cobertura de quota en mutaciones V2 (ISSUE-QUOTA-COVERAGE-01)
-2. Formalizar path M2M interno de Accounts
-3. Cerrar el flujo de invite/create users via Accounts
-4. Resolver identificadores externos y snapshot pre-downgrade
-5. Completar auditoria, UX fina y observabilidad
+1. Formalizar path M2M interno de Accounts
+2. Cerrar el flujo de invite/create users via Accounts
+3. Resolver identificadores externos y snapshot pre-downgrade
+4. Completar auditoria, UX fina y observabilidad
