@@ -152,6 +152,36 @@ func TestListConfiguredStorageRegions(t *testing.T) {
 	}
 }
 
+func TestListConfiguredStorageRegionLabelsUsesClassLabels(t *testing.T) {
+	cfg := testStoragePolicyConfig()
+	cfg.Storage.Classes = map[string]config.StorageClassConfig{
+		"hot-s3-usa": {Tier: "hot", Label: "North America"},
+		"hot-s3-eu":  {Tier: "hot", Label: "Europe"},
+		"cold-s3-eu": {Tier: "cold"},
+	}
+
+	labels := listConfiguredStorageRegionLabels(cfg)
+	if labels["usa"] != "North America" {
+		t.Fatalf("labels[usa] = %q, want %q", labels["usa"], "North America")
+	}
+	if labels["eu"] != "Europe" {
+		t.Fatalf("labels[eu] = %q, want %q", labels["eu"], "Europe")
+	}
+}
+
+func TestDisplayStorageNameForConfigUsesClassLabel(t *testing.T) {
+	cfg := testStoragePolicyConfig()
+	cfg.Storage.Classes = map[string]config.StorageClassConfig{
+		"hot-s3-usa": {Tier: "hot", Label: "North America"},
+		"hot-s3-eu":  {Tier: "hot"},
+		"cold-s3-eu": {Tier: "cold"},
+	}
+
+	if got := displayStorageNameForConfig(cfg, "hot-s3-usa"); got != "North America" {
+		t.Fatalf("displayStorageNameForConfig = %q, want %q", got, "North America")
+	}
+}
+
 func TestResolveStrictCreateStorageClassRequiresConfiguredRegion(t *testing.T) {
 	_, err := resolveCreateStorageClass(testStoragePolicyConfig(), orgStoragePolicy{DataResidency: orgDataResidencyStrict}, "eu.example.com", "")
 	if err == nil {

@@ -268,31 +268,13 @@ func resolveCreateStorageClassForOrg(database *db.DB, cfg *config.Config, orgID,
 }
 
 func listConfiguredStorageRegions(cfg *config.Config) []string {
-	if cfg == nil {
-		return []string{}
-	}
+	return storage.ListConfiguredStorageRegions(cfg)
+}
 
-	regions := make([]string, 0, len(cfg.Storage.RegionClasses))
-	for region := range cfg.Storage.RegionClasses {
-		if hotStorageClassForRegion(cfg, region) != "" {
-			regions = append(regions, strings.ToLower(strings.TrimSpace(region)))
-		}
-	}
-	sort.Strings(regions)
-	return regions
+func listConfiguredStorageRegionLabels(cfg *config.Config) map[string]string {
+	return storage.ListConfiguredStorageRegionLabels(cfg)
 }
 
 func displayStorageNameForConfig(cfg *config.Config, storageClass string) string {
-	storageClass = strings.TrimSpace(storageClass)
-	if storageClass == "" || cfg == nil {
-		return storageClass
-	}
-
-	for region, regionConfig := range cfg.Storage.RegionClasses {
-		if regionConfig.Hot == storageClass || regionConfig.Cold == storageClass {
-			return formatRegionLabel(region)
-		}
-	}
-
-	return storageClass
+	return storage.DisplayStorageName(cfg, storageClass)
 }

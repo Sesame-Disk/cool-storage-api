@@ -417,35 +417,6 @@ func (h *LibraryHandler) resolveEndpointRegion(hostname string) string {
 	return resolveEndpointRegion(h.config, hostname)
 }
 
-func formatRegionLabel(region string) string {
-	region = strings.TrimSpace(region)
-	if region == "" {
-		return ""
-	}
-
-	parts := strings.FieldsFunc(region, func(r rune) bool {
-		return r == '-' || r == '_' || r == ' '
-	})
-	for i, part := range parts {
-		lower := strings.ToLower(part)
-		switch lower {
-		case "us", "usa", "eu", "uk", "uae":
-			parts[i] = strings.ToUpper(lower)
-		default:
-			parts[i] = strings.ToUpper(lower[:1]) + lower[1:]
-		}
-	}
-
-	return strings.Join(parts, " ")
-}
-
-func (h *LibraryHandler) resolveDefaultStorageClass(hostname string) string {
-	if h == nil {
-		return ""
-	}
-	return resolveDefaultHotStorageClass(h.config, hostname)
-}
-
 func (h *LibraryHandler) resolveRequestedStorageClass(hostname, requestedClass string) (string, error) {
 	if h == nil {
 		return "", fmt.Errorf("no valid storage class configured")

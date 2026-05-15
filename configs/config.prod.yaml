@@ -81,6 +81,7 @@ storage:
 
   classes:
     hot-s3-na:
+      label: North America
       type: s3
       tier: hot
       endpoint: ""                   # Leave empty for provider-native S3; set only for custom S3-compatible APIs
@@ -91,6 +92,7 @@ storage:
       failover_class: hot-s3-eu
 
     hot-s3-eu:
+      label: Europe
       type: s3
       tier: hot
       endpoint: ""
@@ -101,6 +103,7 @@ storage:
       failover_class: hot-s3-na
 
     hot-s3-asia:
+      label: Asia Pacific
       type: s3
       tier: hot
       endpoint: ""

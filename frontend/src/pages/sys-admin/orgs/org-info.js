@@ -13,16 +13,7 @@ import SetOrgStoragePolicyDialog from '../../../components/dialog/set-org-storag
 import TransferOrgOwnershipDialog from '../../../components/dialog/transfer-org-ownership-dialog';
 import MainPanelTopbar from '../main-panel-topbar';
 import OrgNav from './org-nav';
-
-const formatStoragePolicyLabel = (policy) => {
-  const effectivePolicy = policy || {};
-  const dataResidency = effectivePolicy.data_residency || 'flexible';
-  const defaultRegion = effectivePolicy.default_region || '';
-  if (dataResidency === 'strict') {
-    return defaultRegion ? gettext('Strict') + ' (' + defaultRegion + ')' : gettext('Strict');
-  }
-  return defaultRegion ? gettext('Flexible') + ' (' + defaultRegion + ')' : gettext('Flexible');
-};
+import { formatStoragePolicyLabel } from '../../../utils/storage-policy';
 
 class Content extends Component {
 
@@ -79,7 +70,7 @@ class Content extends Component {
         quota, quota_usage, traffic_quota, traffic_upload_quota, traffic_download_quota,
         traffic_combined_used, traffic_upload_used, traffic_download_used,
         plan, billing_cycle, owner_email, owner_name, enable_saml_login, metadata_url, domain,
-        storage_policy, available_storage_regions,
+        storage_policy, available_storage_regions, available_storage_region_labels,
       } = this.props.orgInfo;
       const { isSetQuotaDialogOpen, isSetNameDialogOpen, isSetMaxUserNumberDialogOpen, isSetStoragePolicyDialogOpen, isTransferOwnershipDialogOpen } = this.state;
       const formatTrafficQuota = (used, limit) => {
@@ -126,7 +117,7 @@ class Content extends Component {
 
             <dt className="info-item-heading">{gettext('Storage Policy')}</dt>
             <dd className="info-item-content">
-              {formatStoragePolicyLabel(storage_policy)}
+              {formatStoragePolicyLabel(storage_policy, available_storage_region_labels, gettext)}
               {this.showEditIcon(this.toggleSetStoragePolicyDialog)}
             </dd>
 
@@ -202,6 +193,7 @@ class Content extends Component {
             <SetOrgStoragePolicyDialog
               policy={storage_policy}
               availableRegions={available_storage_regions || []}
+              availableRegionLabels={available_storage_region_labels || {}}
               updatePolicy={this.props.updateStoragePolicy}
               toggleDialog={this.toggleSetStoragePolicyDialog}
             />

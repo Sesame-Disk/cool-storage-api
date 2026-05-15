@@ -40,6 +40,7 @@ storage:
   classes:
     # Hot storage (immediate access) - Multi-region
     hot-s3-usa:
+      label: USA
       type: s3
       tier: hot
       endpoint: ""                    # Leave empty for AWS
@@ -50,6 +51,7 @@ storage:
       failover_class: hot-s3-eu       # Failover if this backend is down
 
     hot-s3-eu:
+      label: EU
       type: s3
       tier: hot
       endpoint: ""
@@ -60,6 +62,7 @@ storage:
       failover_class: hot-s3-usa
 
     hot-s3-china:
+      label: China
       type: s3
       tier: hot
       endpoint: ""
@@ -70,6 +73,7 @@ storage:
 
     # Cold storage (delayed access)
     cold-glacier-usa:
+      label: USA Archive
       type: glacier
       tier: cold
       bucket: sesamefs-archive-usa
@@ -77,6 +81,7 @@ storage:
 
     # Local development (MinIO)
     hot-minio-local:
+      label: Local
       type: s3
       tier: hot
       endpoint: "http://localhost:9000"

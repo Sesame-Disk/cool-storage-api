@@ -472,6 +472,7 @@ type StorageConfig struct {
 
 // StorageClassConfig holds configuration for a storage class (e.g., hot-s3-usa)
 type StorageClassConfig struct {
+	Label                string `yaml:"label"`                  // Optional user-facing display label
 	Type                 string `yaml:"type"`                   // s3, glacier, disk
 	Tier                 string `yaml:"tier"`                   // hot, cold
 	Endpoint             string `yaml:"endpoint"`               // Primary endpoint
@@ -493,6 +494,7 @@ type RegionClassConfig struct {
 
 // BackendConfig holds configuration for a storage backend (legacy, deprecated)
 type BackendConfig struct {
+	Label                string `yaml:"label"`                  // Optional user-facing display label
 	Type                 string `yaml:"type"`                   // s3, glacier, filesystem
 	Endpoint             string `yaml:"endpoint"`               // S3 endpoint
 	Bucket               string `yaml:"bucket"`                 // S3 bucket name

@@ -105,28 +105,6 @@ func (s *Server) handleBootstrap(c *gin.Context) {
 	})
 }
 
-func formatBootstrapRegionLabel(region string) string {
-	region = strings.TrimSpace(region)
-	if region == "" {
-		return ""
-	}
-
-	parts := strings.FieldsFunc(region, func(r rune) bool {
-		return r == '-' || r == '_' || r == ' '
-	})
-	for i, part := range parts {
-		lower := strings.ToLower(part)
-		switch lower {
-		case "us", "usa", "eu", "uk", "uae":
-			parts[i] = strings.ToUpper(lower)
-		default:
-			parts[i] = strings.ToUpper(lower[:1]) + lower[1:]
-		}
-	}
-
-	return strings.Join(parts, " ")
-}
-
 func normalizeBootstrapOrgStoragePolicy(raw map[string]string) map[string]string {
 	policy := map[string]string{"data_residency": "flexible"}
 	if len(raw) == 0 {
@@ -142,42 +120,12 @@ func normalizeBootstrapOrgStoragePolicy(raw map[string]string) map[string]string
 	return policy
 }
 
-func (s *Server) bootstrapStorageOptionRegion(storageClass string) string {
-	storageClass = strings.TrimSpace(storageClass)
-	if storageClass == "" || s == nil || s.config == nil {
-		return ""
-	}
-
-	for region, regionConfig := range s.config.Storage.RegionClasses {
-		if regionConfig.Hot == storageClass || regionConfig.Cold == storageClass {
-			return strings.ToLower(strings.TrimSpace(region))
-		}
-	}
-
-	return ""
-}
-
 func (s *Server) resolveBootstrapEndpointRegion(hostname string) string {
 	if s == nil || s.config == nil {
 		return "default"
 	}
 
 	return storage.ResolveEndpointRegion(hostname, s.config.Storage.EndpointRegions, s.config.Server.Region)
-}
-
-func (s *Server) bootstrapStorageDisplayName(storageClass string) string {
-	storageClass = strings.TrimSpace(storageClass)
-	if storageClass == "" || s == nil || s.config == nil {
-		return storageClass
-	}
-
-	for region, regionConfig := range s.config.Storage.RegionClasses {
-		if regionConfig.Hot == storageClass || regionConfig.Cold == storageClass {
-			return formatBootstrapRegionLabel(region)
-		}
-	}
-
-	return storageClass
 }
 
 func (s *Server) resolveBootstrapDefaultStorageClass(hostname string) string {
@@ -246,7 +194,7 @@ func (s *Server) buildBootstrapStorageOptions(hostname string) []gin.H {
 			return
 		}
 		option := gin.H{"id": id, "name": name}
-		if region := s.bootstrapStorageOptionRegion(id); region != "" {
+		if region := storage.StorageClassRegion(s.config, id); region != "" {
 			option["region"] = region
 		}
 		if id == defaultClass {
@@ -265,7 +213,7 @@ func (s *Server) buildBootstrapStorageOptions(hostname string) []gin.H {
 	}
 	sort.Strings(regions)
 	for _, region := range regions {
-		appendOption(s.config.Storage.RegionClasses[region].Hot, formatBootstrapRegionLabel(region))
+		appendOption(s.config.Storage.RegionClasses[region].Hot, storage.DisplayStorageName(s.config, s.config.Storage.RegionClasses[region].Hot))
 	}
 
 	if len(options) == 0 {
@@ -275,7 +223,7 @@ func (s *Server) buildBootstrapStorageOptions(hostname string) []gin.H {
 		}
 		sort.Strings(classNames)
 		for _, className := range classNames {
-			appendOption(className, className)
+			appendOption(className, storage.DisplayStorageName(s.config, className))
 		}
 
 		backendNames := make([]string, 0, len(s.config.Storage.Backends))
@@ -284,12 +232,12 @@ func (s *Server) buildBootstrapStorageOptions(hostname string) []gin.H {
 		}
 		sort.Strings(backendNames)
 		for _, backendName := range backendNames {
-			appendOption(backendName, backendName)
+			appendOption(backendName, storage.DisplayStorageName(s.config, backendName))
 		}
 	}
 
 	if defaultClass != "" {
-		appendOption(defaultClass, s.bootstrapStorageDisplayName(defaultClass))
+		appendOption(defaultClass, storage.DisplayStorageName(s.config, defaultClass))
 	}
 
 	return options
@@ -446,24 +394,24 @@ func (s *Server) buildAppBootstrapPageOptions(identity bootstrapIdentity, userDa
 	hasDeleteAccount := strings.TrimSpace(s.config.Accounts.DeleteAccountURL) != ""
 
 	pageOptions := gin.H{
-		"name":                      name,
-		"username":                  email,
-		"contactEmail":              email,
-		"loginID":                   email,
-		"avatarURL":                 "/static/img/default-avatar.png",
-		"nameLabel":                 "Name:",
-		"enableUpdateUserInfo":      authenticated,
-		"enableUserSetContactEmail": false,
-		"enableUserSetName":         authenticated,
-		"enableAPIKeys":             authenticated,
-		"enableDeleteAccount":       authenticated && hasDeleteAccount,
-		"enableUploadFolder":        boolString(s.config.WebUploads.EnableUploadFolder),
-		"enableResumableFileUpload": boolString(s.config.WebUploads.EnableResumableFileUpload),
-		"resumableUploadFileBlockSize": s.config.WebUploads.ResumableChunkSizeMB,
-		"maxUploadFileSize":         s.config.ResolvedMaxFileSizeMB(),
+		"name":                          name,
+		"username":                      email,
+		"contactEmail":                  email,
+		"loginID":                       email,
+		"avatarURL":                     "/static/img/default-avatar.png",
+		"nameLabel":                     "Name:",
+		"enableUpdateUserInfo":          authenticated,
+		"enableUserSetContactEmail":     false,
+		"enableUserSetName":             authenticated,
+		"enableAPIKeys":                 authenticated,
+		"enableDeleteAccount":           authenticated && hasDeleteAccount,
+		"enableUploadFolder":            boolString(s.config.WebUploads.EnableUploadFolder),
+		"enableResumableFileUpload":     boolString(s.config.WebUploads.EnableResumableFileUpload),
+		"resumableUploadFileBlockSize":  s.config.WebUploads.ResumableChunkSizeMB,
+		"maxUploadFileSize":             s.config.ResolvedMaxFileSizeMB(),
 		"maxNumberOfFilesForFileupload": s.config.WebUploads.MaxFilesPerBatch,
-		"resumableSimultaneousUploads": s.config.WebUploads.SimultaneousUploads,
-		"langCode":                  "en",
+		"resumableSimultaneousUploads":  s.config.WebUploads.SimultaneousUploads,
+		"langCode":                      "en",
 		"currentLang": gin.H{
 			"langCode": "en",
 			"langName": "en",

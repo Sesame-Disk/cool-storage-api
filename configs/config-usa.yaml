@@ -32,6 +32,7 @@ storage:
 
   classes:
     hot-s3-usa:
+      label: USA
       type: s3
       tier: hot
       endpoint: "http://minio:9000"
@@ -44,6 +45,7 @@ storage:
       # credentials → provide via S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY env vars
 
     hot-s3-eu:
+      label: EU
       type: s3
       tier: hot
       endpoint: "http://minio:9000"
@@ -56,6 +58,7 @@ storage:
       # credentials → provide via S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY env vars
 
     cold-glacier-usa:
+      label: USA Archive
       type: s3
       tier: cold
       endpoint: "http://minio:9000"

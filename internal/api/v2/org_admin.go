@@ -333,6 +333,7 @@ func (h *OrgAdminHandler) GetOrgInfo(c *gin.Context) {
 		"quota_policy":                     quotaPolicy,
 		"storage_policy":                   storagePolicy.storageConfig(),
 		"available_storage_regions":        listConfiguredStorageRegions(h.config),
+		"available_storage_region_labels":  listConfiguredStorageRegionLabels(h.config),
 		"billing_cycle":                    billingCycle,
 		"current_period_started_at":        currentPeriodStartedAt,
 		"current_period_ends_at":           currentPeriodEndsAt,

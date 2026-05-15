@@ -117,6 +117,62 @@ func TestBuildBootstrapStorageOptionsUsesRegionLabelsAndDefault(t *testing.T) {
 	}
 }
 
+func TestBuildBootstrapStorageOptionsUsesConfiguredClassLabels(t *testing.T) {
+	s := createTestServer()
+	s.config.Storage.DefaultClass = "hot-na"
+	s.config.Storage.EndpointRegions = map[string]string{
+		"na.example.com": "na",
+	}
+	s.config.Storage.RegionClasses = map[string]config.RegionClassConfig{
+		"na": {Hot: "hot-na"},
+		"eu": {Hot: "hot-eu"},
+	}
+	s.config.Storage.Classes = map[string]config.StorageClassConfig{
+		"hot-na": {Label: "North America"},
+		"hot-eu": {Label: "Europe"},
+	}
+	s.config.Storage.Backends = map[string]config.BackendConfig{}
+
+	options := s.buildBootstrapStorageOptions("na.example.com")
+	for _, option := range options {
+		if option["id"] == "hot-na" {
+			if option["name"] != "North America" {
+				t.Fatalf("na option name = %v, want %q", option["name"], "North America")
+			}
+			if option["is_default"] != true {
+				t.Fatalf("na option is_default = %v, want true", option["is_default"])
+			}
+			return
+		}
+	}
+
+	t.Fatalf("expected hot-na option in %v", options)
+}
+
+func TestBuildBootstrapStorageOptionsUsesConfiguredClassLabelsWithoutRegionClasses(t *testing.T) {
+	s := createTestServer()
+	s.config.Storage.DefaultClass = "archive-hot"
+	s.config.Storage.EndpointRegions = map[string]string{}
+	s.config.Storage.RegionClasses = map[string]config.RegionClassConfig{}
+	s.config.Storage.Classes = map[string]config.StorageClassConfig{
+		"archive-hot": {Label: "Archive Storage"},
+		"hot-zeta":    {},
+	}
+	s.config.Storage.Backends = map[string]config.BackendConfig{}
+
+	options := s.buildBootstrapStorageOptions("unknown.example.com")
+	for _, option := range options {
+		if option["id"] == "archive-hot" {
+			if option["name"] != "Archive Storage" {
+				t.Fatalf("archive-hot option name = %v, want %q", option["name"], "Archive Storage")
+			}
+			return
+		}
+	}
+
+	t.Fatalf("expected archive-hot option in %v", options)
+}
+
 func TestBuildBootstrapStorageOptionsFallsBackToServerRegion(t *testing.T) {
 	s := createTestServer()
 	s.config.Server.Region = "eu"

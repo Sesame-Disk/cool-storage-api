@@ -2,10 +2,12 @@ import React from 'react';
 import PropTypes from 'prop-types';
 import { Button, Form, FormGroup, Input, Label } from 'reactstrap';
 import { gettext } from '../../utils/constants';
+import { buildStorageRegionOptions } from '../../utils/storage-policy';
 
 const propTypes = {
     policy: PropTypes.object,
     availableRegions: PropTypes.array,
+    availableRegionLabels: PropTypes.object,
     toggleDialog: PropTypes.func.isRequired,
     updatePolicy: PropTypes.func.isRequired,
 };
@@ -73,14 +75,15 @@ class SetOrgStoragePolicyDialog extends React.Component {
     };
 
     renderRegionField = () => {
-        const { availableRegions = [] } = this.props;
+        const { availableRegions = [], availableRegionLabels = {} } = this.props;
         const { defaultRegion } = this.state;
-        if (availableRegions.length > 0) {
+        const regionOptions = buildStorageRegionOptions(availableRegions, availableRegionLabels);
+        if (regionOptions.length > 0) {
             return (
                 <Input type="select" value={defaultRegion} onChange={this.handleRegionChange}>
                     <option value="">{gettext('Automatic')}</option>
-                    {availableRegions.map((region) => (
-                        <option key={region} value={region}>{region}</option>
+                    {regionOptions.map((region) => (
+                        <option key={region.value} value={region.value}>{region.label}</option>
                     ))}
                 </Input>
             );

@@ -8,16 +8,7 @@ import MainPanelTopbar from './main-panel-topbar';
 import TransferOrgOwnershipDialog from '../../components/dialog/transfer-org-ownership-dialog';
 import SetOrgStoragePolicyDialog from '../../components/dialog/set-org-storage-policy-dialog';
 import toaster from '../../components/toast';
-
-const formatStoragePolicyLabel = (policy) => {
-  const effectivePolicy = policy || {};
-  const dataResidency = effectivePolicy.data_residency || 'flexible';
-  const defaultRegion = effectivePolicy.default_region || '';
-  if (dataResidency === 'strict') {
-    return defaultRegion ? gettext('Strict') + ' (' + defaultRegion + ')' : gettext('Strict');
-  }
-  return defaultRegion ? gettext('Flexible') + ' (' + defaultRegion + ')' : gettext('Flexible');
-};
+import { formatStoragePolicyLabel } from '../../utils/storage-policy';
 
 class OrgInfo extends Component {
 
@@ -49,6 +40,7 @@ class OrgInfo extends Component {
       active_members: 0,
       storage_policy: { data_residency: 'flexible', default_region: '' },
       available_storage_regions: [],
+      available_storage_region_labels: {},
       isTransferOwnershipDialogOpen: false,
       isSetStoragePolicyDialogOpen: false,
       canTransferOwnership: isOrgOwner,
@@ -114,6 +106,7 @@ class OrgInfo extends Component {
         active_members: res.data.active_members,
         storage_policy: res.data.storage_policy || { data_residency: 'flexible', default_region: '' },
         available_storage_regions: res.data.available_storage_regions || [],
+        available_storage_region_labels: res.data.available_storage_region_labels || {},
         userWritesDisabled: !!res.data.org_user_writes_disabled,
         accountsOrgManagementURL: res.data.accounts_org_user_management_url || accountsOrgUserManagementURL,
       });
@@ -218,7 +211,7 @@ class OrgInfo extends Component {
 
                 <dt>{gettext('Storage Policy')}</dt>
                 <dd>
-                  {formatStoragePolicyLabel(this.state.storage_policy)}
+                  {formatStoragePolicyLabel(this.state.storage_policy, this.state.available_storage_region_labels, gettext)}
                   <span
                     title={gettext('Edit')}
                     className="fa fa-pencil-alt attr-action-icon"
@@ -277,6 +270,7 @@ class OrgInfo extends Component {
           <SetOrgStoragePolicyDialog
             policy={this.state.storage_policy}
             availableRegions={this.state.available_storage_regions}
+            availableRegionLabels={this.state.available_storage_region_labels}
             updatePolicy={this.updateStoragePolicy}
             toggleDialog={this.toggleSetStoragePolicyDialog}
           />
