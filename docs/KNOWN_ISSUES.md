@@ -1,6 +1,6 @@
 # Known Issues - SesameFS
 
-**Last Updated**: 2026-04-03
+**Last Updated**: 2026-05-15
 
 This document tracks all known bugs, limitations, and issues in SesameFS.
 
@@ -28,11 +28,11 @@ This document tracks all known bugs, limitations, and issues in SesameFS.
 | Departments Support | ✅ Complete | Full CRUD, hierarchy, 29 integration tests |
 | API Token Library Access | ✅ Complete | 37 integration tests, full RW/RO enforcement |
 | Move/Copy Dialog Tree | ✅ Fixed | `with_parents` param missing in ListDirectoryV21 |
-| GC TTL Enforcement | ✅ 3/3 Done | `version_ttl_days` ✅, share link deletion ✅, `auto_delete_days` ✅ |
+| GC TTL Enforcement | Partial | `version_ttl_days` and `auto_delete_days` have storage, API, and scanner wiring, but their current behavior does not fully match the library settings UI. See ISSUE-LIB-RETENTION-01. |
 | Admin Panel | ✅ Working in Docker | `/sys/` route serves sysadmin.html via nginx + Go catch-all |
 | Frontend Permission UI | 🟡 ~85% Done | API layer returns real permissions on all directory/file endpoints. **Fixed**: `"owner"` permission now mapped to `"rw"` in API responses (was breaking upload button). **Enhanced (2026-03-11)**: Granular `PermissionFlags` (8 flags) now enforced backend-side via `RequirePermFlag()`. Upload/share link uploaders updated. Remaining: some UI components that conditionally render controls based on flags. |
 | Modal Dialogs | ✅ All 122 Fixed | All dialog files use Bootstrap classes |
-| Library Settings Backend | ✅ Complete | History, API tokens, auto-delete, transfer |
+| Library Settings Backend | Partial | API tokens and transfer are complete. History and auto-delete settings persist, but retention/delete semantics are incomplete. See ISSUE-LIB-RETENTION-01. |
 | **Desktop SSO Browser UX** | ✅ Fixed (2026-03-04) | After browser SSO login for desktop client, now shows confirmation page with auto-close. See ISSUE-SSO-01 below. |
 | **Upload "Don't Replace" (Desktop Client)** | 🟡 Pending | Desktop client file browser "No" button (auto-rename) doesn't work. Client uses `update-link` vs `upload-link` to distinguish replace vs no-replace, but both map to same token/handler. Backend autorename infrastructure ready (`autoRenameIfExists`), needs token-level `Replace` flag to distinguish endpoints. Web "Don't replace" also broken (same root cause). See ISSUE-UPLOAD-REPLACE-01 below. |
 | **Org Logo Upload** | 🟡 Stub | `UpdateOrgLogo` in org_admin.go accepts the file but does not persist it to storage. Returns a static path from settings. Functional as a route placeholder until an asset storage backend is available. |
@@ -941,6 +941,8 @@ Added `getEffectiveHostname(c *gin.Context) string` helper in `server.go` for th
 **Fix**: Added `expires_at` field to directory listing API response. Computed from `mtime + auto_delete_days * 86400`.
 **File**: `internal/api/v2/files.go`
 
+**2026-05-15 audit correction**: `expires_at` is emitted, but it should not be treated as a guaranteed deletion countdown until auto-delete semantics are aligned with GC behavior. See ISSUE-LIB-RETENTION-01.
+
 ---
 
 ## ✅ RECENTLY FIXED (2026-02-04)
@@ -1195,6 +1197,8 @@ Web browser logins are unaffected — they still redirect to `/`.
 
 **3. Expired share links deletion** — ✅ DONE (2026-02-02)
 - `processShareLink()` now calls `DeleteShareLink()` instead of just logging
+
+**2026-05-15 audit correction**: The rows above describe implemented plumbing, not complete product semantics. `version_ttl_days` and `auto_delete_days` persist and feed GC discovery, but History Setting and Auto deletion do not yet behave exactly as the UI text promises. See ISSUE-LIB-RETENTION-01.
 
 ### Admin Panel — WORKING ✅
 **Status**: ✅ Working in Docker (2026-02-12)
@@ -1982,6 +1986,8 @@ If a name existed at the grandparent level, it would incorrectly return 409.
 
 **File**: `internal/api/v2/library_settings.go`
 
+**2026-05-15 audit correction**: Treat this section as API wiring status, not full product-complete semantics. History Setting and Auto Deletion are partial: `keep_days=0` does not round-trip, history APIs do not enforce the retention window, and auto-delete does not delete current stale files by `mtime`. Details are tracked in ISSUE-LIB-RETENTION-01.
+
 ### Library Settings Frontend Errors — FIXED ✅ (2026-01-30)
 
 | Error | Root Cause | Fix |
@@ -2246,6 +2252,43 @@ All library artifacts are now cleaned on permanent delete via `enqueueLibraryArt
 Additionally, GC scanner **Phase 7** now catches expired user-to-user shares (`expires_at < now`) independently of library deletion.
 
 Historical orphans from before this change will be caught by scanner Phase 3/4 (orphaned commits/fs_objects) on the next 24h scan cycle.
+
+---
+
+### ISSUE-LIB-RETENTION-01: Library History and Auto-Delete Semantics Do Not Match UI
+
+**Status**: Open
+**Discovered**: 2026-05-15
+**Priority**: Medium-high - destructive/retention settings are visible to users and admins, but current behavior can preserve more history/files than the UI implies.
+
+**Affected UI:**
+- `frontend/src/components/dialog/lib-history-setting-dialog.js`
+- `frontend/src/components/dialog/lib-old-files-auto-del-dialog.js`
+- `frontend/src/components/dialog/sysadmin-dialog/sysadmin-lib-history-setting-dialog.js`
+
+**What is implemented today:**
+- History Setting calls `GET/PUT /api2/repos/:repo_id/history-limit/`.
+- Auto deletion calls `GET/PUT /api/v2.1/repos/:repo_id/auto-delete/`.
+- Settings are persisted on `libraries.version_ttl_days` and `libraries.auto_delete_days`.
+- Active policies are projected into `gc_libraries_by_policy`.
+- GC scanner phases exist for `expired_versions` and `auto_delete`.
+- Focused tests pass for the current API and GC behavior: `go test ./internal/gc ./internal/api/v2 -count=1`.
+
+**Confirmed gaps:**
+- `keep_days=0` ("Don't keep history") is stored, but `GetHistoryLimit` maps database value `0` back to `-1`, which makes the UI reopen as "Keep full history".
+- `version_ttl_days > 0` does not limit normal linear history. GC Phase 5 preserves the full HEAD parent chain, and the file/repo history APIs do not filter by `version_ttl_days`.
+- `auto_delete_days` does not delete current files that have not been modified within N days. GC Phase 6 preserves the HEAD tree and only enqueues fs_objects no longer referenced by HEAD or recent commit trees.
+- Directory-listing `expires_at` is computed from file `mtime`, but GC's keep/delete decision is based on commit age and reachability. This can show an expiry countdown that does not correspond to actual deletion.
+- The UI wording says "Automatically delete files that are not modified within certain days", which over-promises relative to the current orphan/history-object purge behavior.
+- Bootstrap scripts still have older ad hoc `libraries` DDL snippets that omit `auto_delete_days` and the GC policy projection table; migrations are authoritative, but scripts can mislead or create drift in manual environments.
+
+**Fix direction:**
+1. Product decision: choose whether these controls mean visible/restorable history retention, physical storage reclamation, automatic deletion of current stale files, or only purging old orphaned history objects.
+2. If History Setting is a user-visible retention window, filter `GetFileHistoryV21`, `GetFileRevisions`, and `GetRepoHistory` by `version_ttl_days`, and preserve `0` as "no history" in GET responses.
+3. If History Setting must physically prune normal history, design safe commit-chain pruning/compaction instead of only deleting non-HEAD orphan commits.
+4. If Auto deletion must delete current stale files, add a job that identifies HEAD-visible files by `mtime`, publishes a new delete commit safely, and respects permissions/locks/encryption/conflicts.
+5. If Auto deletion is only old-history-object cleanup, rename UI text and reconsider exposing `expires_at` as a hard deletion countdown.
+6. Add end-to-end tests for `keep_days=0`, bounded history visibility, stale current file behavior, and directory-listing expiry accuracy.
 
 ---
 

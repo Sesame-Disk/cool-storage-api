@@ -87,7 +87,7 @@
 | **Audit Logs** | 🟡 PARTIAL | Mostly stable | ❌ No | 2026-03-26 | `audit_log` table with 365-day TTL exists for deletion events (GC, groups, departments), and `users.last_login_at` now covers latest successful login. Historical login logs and file-operation/file-access event tables are still missing, so login audit pages and file statistics pages remain pending. See [ADMIN-FEATURES.md](ADMIN-FEATURES.md) § 3 |
 | **File/Folder Trash** | ✅ COMPLETE | Mostly stable | ❌ No | 2026-03-11 | List, restore, clean trash + browse deleted folders. Enhanced: filters out children of deleted directories (2026-03-11) |
 | **Library Recycle Bin** | ✅ COMPLETE | Mostly stable | ❌ No | 2026-03-25 | Soft-delete, restore, permanent delete. User + admin endpoints. Storage counters adjusted on delete/restore (2026-03-25) |
-| **File Expiry Countdown** | ✅ COMPLETE | Mostly stable | ❌ No | 2026-02-05 | `expires_at` in directory listing for auto-delete libraries |
+| **File Expiry Countdown** | Partial | Needs semantic alignment | ❌ No | 2026-05-15 | `expires_at` is emitted for auto-delete libraries, but current GC behavior does not delete HEAD-visible files by `mtime`. See `docs/TECHNICAL-DEBT.md` section 18. |
 | **Admin Library Management** | ✅ COMPLETE | Mostly stable | ❌ No | 2026-02-12 | 12 endpoints in admin.go + seafile-api.js methods + trash libraries |
 | **Admin Link Management** | ✅ COMPLETE | Mostly stable | ❌ No | 2026-02-12 | 13 endpoints: share link admin (list/delete), upload links (user CRUD + admin), per-user links. See [ADMIN-FEATURES.md](ADMIN-FEATURES.md) § 2 |
 | **Audit Logs** | 🟡 PARTIAL | Mostly stable | ❌ No | 2026-03-26 | `audit_log` table with 365-day TTL exists for deletion events (GC, groups, departments), and `users.last_login_at` now covers latest successful login. Historical login logs and file-operation/file-access event tables are still missing, so login audit pages and file statistics pages remain pending. See [ADMIN-FEATURES.md](ADMIN-FEATURES.md) § 3 |
@@ -311,8 +311,8 @@ Pending compatibility cleanup:
 
 | Endpoint | Status | Stability | Notes |
 |----------|--------|-----------|-------|
-| `GET/PUT /api2/repos/:id/history-limit/` | ✅ COMPLETE | Mostly stable | History retention settings (2026-01-29) |
-| `GET/PUT /api/v2.1/repos/:id/auto-delete/` | ✅ COMPLETE | Mostly stable | Auto-delete old files (2026-01-29) |
+| `GET/PUT /api2/repos/:id/history-limit/` | Partial | Needs semantic alignment | Persists settings, but `keep_days=0` does not round-trip and history APIs do not enforce the window. See `docs/TECHNICAL-DEBT.md` section 18. |
+| `GET/PUT /api/v2.1/repos/:id/auto-delete/` | Partial | Needs semantic alignment | Persists settings, but current GC purges orphan/history fs_objects rather than deleting current stale files. See `docs/TECHNICAL-DEBT.md` section 18. |
 | `GET/POST/PUT/DELETE /api/v2.1/repos/:id/repo-api-tokens/` | ✅ COMPLETE | Mostly stable | Library API tokens (2026-01-29) |
 | `PUT /api2/repos/:id/owner/` | ✅ COMPLETE | Mostly stable | Library transfer (2026-01-29) |
 | `POST/DELETE /api/v2.1/monitored-repos/` | ❌ TODO | N/A | Watch/unwatch (needs notification system) |
@@ -529,10 +529,12 @@ These MUST be completed before production deployment:
    - Upload link and share link uploaders updated for permission-aware behavior
    - Status: 🟡 PARTIAL
 
-### Priority 3: Library Settings Backend ✅ COMPLETE
+### Priority 3: Library Settings Backend - PARTIAL
 
-3. **Library settings endpoints** — All implemented (2026-01-29)
-   - History limit, auto-delete, API tokens, transfer — all working
+3. **Library settings endpoints** — Partially implemented (updated 2026-05-15)
+   - API tokens and transfer are working
+   - History limit and auto-delete persist settings, but their runtime semantics are not fully aligned with the UI labels
+   - See `docs/TECHNICAL-DEBT.md` section 18 and ISSUE-LIB-RETENTION-01
    - File: `internal/api/v2/library_settings.go`
 
 ### Priority 4: Documentation

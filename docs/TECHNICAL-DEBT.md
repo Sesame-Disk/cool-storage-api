@@ -996,4 +996,87 @@ When resuming this line of work, the recommended order is:
 
 ---
 
-*Last updated: 2026-04-09*
+## 18. Library History Retention And Auto-Delete Semantics (2026-05-15)
+
+### Status
+
+Open technical debt. The visible controls are wired and persisted, but they currently describe stronger behavior than the backend actually performs.
+
+### What Works Today
+
+- `GET/PUT /api2/repos/:repo_id/history-limit/` persists `keep_days` in `libraries.version_ttl_days`.
+- `GET/PUT /api/v2.1/repos/:repo_id/auto-delete/` persists `auto_delete_days` in `libraries.auto_delete_days`.
+- Both positive settings are projected into `gc_libraries_by_policy`.
+- GC scanner phases are wired:
+  - Phase 5 `expired_versions` reads libraries with `version_ttl_days`.
+  - Phase 6 `auto_delete` reads libraries with `auto_delete_days`.
+- The frontend exposes the owner dialogs and the sysadmin history dialog.
+- Focused verification passed on 2026-05-15: `go test ./internal/gc ./internal/api/v2 -count=1`.
+
+### Why This Is Debt
+
+The implementation is internally consistent for the current tests, but the product contract is not aligned:
+
+- **History Setting: "Don't keep history"**
+  - PUT accepts `keep_days=0`.
+  - GET maps database value `0` to `-1`, so the dialog reopens as "Keep full history".
+  - That makes the no-history setting effectively non-round-trippable through the UI.
+
+- **History Setting: "Only keep N days"**
+  - GC Phase 5 preserves the full HEAD parent chain.
+  - `GetFileHistoryV21`, `GetFileRevisions`, and `GetRepoHistory` list commits without applying `version_ttl_days`.
+  - Result: normal linear history can remain visible/restorable beyond the configured window.
+
+- **Auto deletion: "delete files not modified within N days"**
+  - GC Phase 6 preserves the full HEAD tree.
+  - It enqueues fs_objects only when they are not referenced by HEAD or recent commit trees.
+  - Result: current files that are old by `mtime` are not automatically deleted, despite the UI wording.
+
+- **Expiry countdown mismatch**
+  - Directory listings expose `expires_at = entry.MTime + auto_delete_days`.
+  - GC auto-delete decisions are based on commit age and reachability, not directly on file `mtime`.
+  - Result: UI can show a file expiry timestamp that does not correspond to actual deletion behavior.
+
+- **Bootstrap script drift**
+  - `scripts/bootstrap.sh` and `scripts/bootstrap-multiregion.sh` still contain older ad hoc `libraries` DDL without `auto_delete_days` or the GC policy projection table.
+  - Migrations are authoritative, but manual/bootstrap environments can be misleading if these snippets are used as schema reference.
+
+### Decision Needed
+
+Before changing code, decide what each control promises:
+
+1. Visible/restorable history window only.
+2. Physical storage reclamation of old history.
+3. Automatic deletion of current files that have not been modified recently.
+4. Old-history-object cleanup only, with UI text adjusted to match.
+
+These are different products. Treating them as one setting is how the current ambiguity happened.
+
+### Recommended Fix Path
+
+1. Fix `GetHistoryLimit` so `0` round-trips as `0`, not `-1`.
+2. Add API tests for `keep_days=0` and positive `keep_days` round trips.
+3. If product wants visible retention, filter history APIs by `version_ttl_days`.
+4. If product wants physical pruning, design safe commit-chain pruning/compaction before deleting linear history commits.
+5. If product wants stale current-file auto-deletion, implement a dedicated job that:
+   - scans HEAD-visible files by `mtime`
+   - publishes a normal delete commit instead of deleting fs_objects behind HEAD
+   - handles locks, encryption, concurrent HEAD changes, permissions, audit logs, and quota/storage counter updates
+6. If product wants only old-history-object cleanup, rename the UI away from "Automatically delete files..." and remove or relabel `expires_at`.
+7. Update bootstrap scripts or remove schema-like DDL snippets so they cannot drift from migrations.
+
+### Tests To Add
+
+- `keep_days=0` remains `0` after GET.
+- `keep_days=N` hides or rejects history older than N days if visible retention is selected.
+- A current HEAD-visible file with old `mtime` is either deleted by a stale-file job or explicitly not shown as expiring.
+- `expires_at` is not emitted as a hard countdown unless deletion behavior actually honors it.
+- GC scanner tests continue to prove it never deletes objects still required by HEAD.
+
+### Linked Issue
+
+Tracked in `docs/KNOWN_ISSUES.md` as ISSUE-LIB-RETENTION-01.
+
+---
+
+*Last updated: 2026-05-15*
