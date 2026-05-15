@@ -1,19 +1,8 @@
 import React from 'react';
-import { css } from 'glamor';
 import PropTypes from 'prop-types';
 
 import Toast from './toast';
-
-const wrapperClass = css({
-  maxWidth: 560,
-  margin: '0 auto',
-  top: 0,
-  left: 0,
-  right: 0,
-  position: 'fixed',
-  zIndex: 999999,
-});
-
+import './toast.css';
 
 const hasCustomId = settings => Object.hasOwnProperty.call(settings, 'id');
 
@@ -124,7 +113,7 @@ export default class ToastManager extends React.PureComponent {
 
   render() {
     return (
-      <span className={wrapperClass}>
+      <span className="toast-wrapper">
         {this.state.toasts.map(({ id, description, ...props }) => {
           return (
             <Toast key={id} onRemove={() => this.removeToast(id)} {...props}>

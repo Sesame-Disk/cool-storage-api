@@ -1,6 +1,6 @@
 import React, { Fragment } from 'react';
 import PropTypes from 'prop-types';
-import MD5 from 'MD5';
+import MD5 from 'md5';
 import ReactDom from 'react-dom';
 import { Button, Dropdown, DropdownToggle, DropdownItem, UncontrolledTooltip } from 'reactstrap';
 import moment from 'moment';

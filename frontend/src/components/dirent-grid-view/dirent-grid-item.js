@@ -1,6 +1,6 @@
 import React, { Fragment } from 'react';
 import PropTypes from 'prop-types';
-import MD5 from 'MD5';
+import MD5 from 'md5';
 import { UncontrolledTooltip } from 'reactstrap';
 import { gettext, siteRoot, mediaUrl } from '../../utils/constants';
 import { Utils } from '../../utils/utils';

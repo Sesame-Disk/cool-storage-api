@@ -1,51 +1,10 @@
 import React from 'react';
-import { css } from 'glamor';
 import PropTypes from 'prop-types';
 import Transition from 'react-transition-group/Transition';
 import Alert from './alert';
-
-const animationEasing = {
-  deceleration: 'cubic-bezier(0.0, 0.0, 0.2, 1)',
-  acceleration: 'cubic-bezier(0.4, 0.0, 1, 1)',
-  spring: 'cubic-bezier(0.175, 0.885, 0.320, 1.175)'
-};
+import './toast.css';
 
 const ANIMATION_DURATION = 240;
-
-const openAnimation = css.keyframes('openAnimation', {
-  from: {
-    opacity: 0,
-    transform: 'translateY(-120%)'
-  },
-  to: {
-    transform: 'translateY(0)'
-  }
-});
-
-const closeAnimation = css.keyframes('closeAnimation', {
-  from: {
-    transform: 'scale(1)',
-    opacity: 1
-  },
-  to: {
-    transform: 'scale(0.9)',
-    opacity: 0
-  }
-});
-
-const animationStyles = css({
-  display: 'flex',
-  flexDirection: 'column',
-  alignItems: 'center',
-  height: 0,
-  transition: `all ${ANIMATION_DURATION}ms ${animationEasing.deceleration}`,
-  '&[data-state="entering"], &[data-state="entered"]': {
-    animation: `${openAnimation} ${ANIMATION_DURATION}ms ${animationEasing.spring} both`
-  },
-  '&[data-state="exiting"]': {
-    animation: `${closeAnimation} 120ms ${animationEasing.acceleration} both`
-  }
-});
 
 export default class Toast extends React.PureComponent {
   static propTypes = {
@@ -168,7 +127,7 @@ export default class Toast extends React.PureComponent {
         {state => (
           <div
             data-state={state}
-            className={animationStyles}
+            className="toast-animation"
             onMouseEnter={this.handleMouseEnter}
             onMouseLeave={this.handleMouseLeave}
             style={{

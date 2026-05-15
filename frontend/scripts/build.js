@@ -3,9 +3,9 @@ process.env.BABEL_ENV = 'production';
 process.env.NODE_ENV = 'production';
 // Keep production builds focused on compilation. The legacy frontend still has
 // many lint warnings; run `npm run lint` when working through those separately.
-// if (process.env.DISABLE_ESLINT_PLUGIN === undefined) {
-//   process.env.DISABLE_ESLINT_PLUGIN = 'true';
-// }
+if (process.env.DISABLE_ESLINT_PLUGIN === undefined) {
+  process.env.DISABLE_ESLINT_PLUGIN = 'true';
+}
 
 // Makes the script crash on unhandled rejections instead of silently
 // ignoring them. In the future, promise rejections that are not handled will

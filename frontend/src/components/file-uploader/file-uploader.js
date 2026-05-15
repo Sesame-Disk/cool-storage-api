@@ -1,7 +1,7 @@
 import React, { Fragment } from 'react';
 import PropTypes from 'prop-types';
 import Resumablejs from '@seafile/resumablejs';
-import MD5 from 'MD5';
+import MD5 from 'md5';
 import { resumableUploadFileBlockSize, resumableSimultaneousUploads, maxUploadFileSize, maxNumberOfFilesForFileupload } from '../../utils/constants';
 import { seafileAPI } from '../../utils/seafile-api';
 import { clearFileUploadRuntimeState, getBaselineSimultaneousUploads, maybeMarkFileFinalizing, maybeStartPendingUploadDuringFinalize, restoreUploadConcurrencyIfIdle } from '../../utils/upload-finalization';
