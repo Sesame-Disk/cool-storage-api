@@ -984,16 +984,23 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 		return
 	}
 
+	contentRange := c.GetHeader("Content-Range")
+	start, end, total, isChunked := parseContentRange(contentRange)
+
 	// Traffic quota pre-check — evaluated before reading the body so we can
-	// fail fast. Storage quota is checked later with the visible tree delta,
-	// after filename/replace/chunk-total are known.
+	// fail fast. For chunked uploads, use the declared total from Content-Range
+	// so the pre-check matches the eventual upload size. Storage quota is checked
+	// later with the visible tree delta, after filename/replace/chunk-total are known.
 	uploadTrafficStatus := traffic.QuotaStatus{Allowed: true}
-	if checker := traffic.GetChecker(); checker != nil {
-		contentLength := c.Request.ContentLength
-		if contentLength < 0 {
-			contentLength = 0
+	if checker := getAPIQuotaChecker(); checker != nil {
+		trafficBytes := c.Request.ContentLength
+		if isChunked && total > 0 {
+			trafficBytes = total
 		}
-		uploadTrafficStatus, _ = traffic.CheckTrafficQuotaWithChecker(checker, token.OrgID, token.UserID, "upload", contentLength)
+		if trafficBytes < 0 {
+			trafficBytes = 0
+		}
+		uploadTrafficStatus, _ = traffic.CheckTrafficQuotaWithChecker(checker, token.OrgID, token.UserID, "upload", trafficBytes)
 		if !uploadTrafficStatus.Allowed {
 			c.JSON(http.StatusForbidden, traffic.TrafficQuotaExceededResponse(uploadTrafficStatus, "traffic quota exceeded", true))
 			return
@@ -1057,10 +1064,6 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 
 	filePath := filepath.Join(parentDir, filename)
 	storageKey := fmt.Sprintf("%s/%s%s", token.OrgID, token.RepoID, filePath)
-
-	// Check for Content-Range header (chunked upload)
-	contentRange := c.GetHeader("Content-Range")
-	start, end, total, isChunked := parseContentRange(contentRange)
 
 	log.Printf("[HandleUpload] Token=%s, File=%s, ContentRange=%s, isChunked=%v",
 		tokenStr, filename, contentRange, isChunked)
@@ -1279,7 +1282,7 @@ func (h *SeafHTTPHandler) checkUploadStorageQuotaForCurrentHead(orgID, repoID, u
 	if deltaBytes <= 0 {
 		return deltaBytes, deltaFiles, nil
 	}
-	checker := traffic.GetChecker()
+	checker := getAPIQuotaChecker()
 	if checker == nil {
 		return deltaBytes, deltaFiles, nil
 	}

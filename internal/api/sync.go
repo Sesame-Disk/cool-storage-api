@@ -871,7 +871,7 @@ func (h *SyncHandler) PutBlock(c *gin.Context) {
 	// Quota pre-check: reject early on upload traffic; storage quota is enforced
 	// only if this block is new after deduplication lookup.
 	uploadTrafficStatus := traffic.QuotaStatus{Allowed: true}
-	if checker := traffic.GetChecker(); checker != nil {
+	if checker := getAPIQuotaChecker(); checker != nil {
 		contentLen := c.Request.ContentLength
 		if contentLen > 0 {
 			uploadTrafficStatus, _ = traffic.CheckTrafficQuotaWithChecker(checker, orgID, userID, "upload", contentLen)
@@ -924,7 +924,7 @@ func (h *SyncHandler) PutBlock(c *gin.Context) {
 		return
 	}
 	if !exists {
-		if checker := traffic.GetChecker(); checker != nil {
+		if checker := getAPIQuotaChecker(); checker != nil {
 			if qs, _ := checker.CheckStorageQuota(orgID, userID, int64(len(data))); !qs.Allowed {
 				c.JSON(http.StatusForbidden, gin.H{"error": "storage quota exceeded"})
 				return

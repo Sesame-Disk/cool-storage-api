@@ -353,6 +353,124 @@ func TestWebUploadReplaceUsesStorageDelta(t *testing.T) {
 	waitForUserQuotaUsage(t, afterInitialUsage+20)
 }
 
+func TestV2DirectUploadEnforcesPerUserStorageQuota(t *testing.T) {
+	originalOrg := getAdminOrganizationInfo(t, defaultOrgID)
+	originalUser := getAdminUserByEmail(t, defaultUserEmail)
+	restoreDefaultOrgAndUserQuotasOnCleanup(t, originalOrg, originalUser)
+
+	updateAdminOrganizationQuotas(t, defaultOrgID, map[string]interface{}{
+		"storage_quota": int64(1 << 50),
+		"quota_policy":  "hard",
+	})
+	setDefaultUserQuota(t, int64(1))
+
+	repoID := createTestLibrary(t, userClient, fmt.Sprintf("inttest-v2-upload-user-storage-%d", time.Now().UnixNano()))
+
+	status, body := uploadV2DirectFileStatus(t, userClient, repoID, "blocked-v2.txt", "/", "this v2 direct upload should exceed the one byte per-user storage cap", false)
+	if status != http.StatusForbidden {
+		t.Fatalf("v2 direct upload status = %d, want %d; body=%s", status, http.StatusForbidden, body)
+	}
+	if !strings.Contains(body, "storage quota exceeded") {
+		t.Fatalf("v2 direct upload body = %q, want storage quota exceeded", body)
+	}
+}
+
+func TestV2DirectUploadTrafficQuotaExceeded(t *testing.T) {
+	originalOrg := getAdminOrganizationInfo(t, defaultOrgID)
+	restoreOrgQuotasOnCleanup(t, originalOrg)
+
+	updateAdminOrganizationQuotas(t, defaultOrgID, map[string]interface{}{
+		"storage_quota":          int64(1 << 50),
+		"traffic_quota":          int64(1 << 50),
+		"traffic_upload_quota":   int64(1),
+		"traffic_download_quota": int64(1 << 50),
+		"quota_policy":           "hard",
+	})
+
+	repoID := createTestLibrary(t, userClient, fmt.Sprintf("inttest-v2-upload-traffic-%d", time.Now().UnixNano()))
+
+	status, body := uploadV2DirectFileStatus(t, userClient, repoID, "traffic-v2.txt", "/", "hello", false)
+	if status != http.StatusForbidden {
+		t.Fatalf("v2 direct upload traffic status = %d, want %d; body=%s", status, http.StatusForbidden, body)
+	}
+
+	var payload map[string]interface{}
+	if err := json.Unmarshal([]byte(body), &payload); err != nil {
+		t.Fatalf("failed to decode v2 direct upload traffic response: %v body=%q", err, body)
+	}
+	if payload["error"] != "traffic quota exceeded" {
+		t.Fatalf("v2 direct upload error = %v, want traffic quota exceeded", payload["error"])
+	}
+	if payload["reason"] != "traffic-upload" {
+		t.Fatalf("v2 direct upload reason = %v, want traffic-upload", payload["reason"])
+	}
+}
+
+func TestV2DirectUploadReplaceUsesStorageDelta(t *testing.T) {
+	originalOrg := getAdminOrganizationInfo(t, defaultOrgID)
+	originalUser := getAdminUserByEmail(t, defaultUserEmail)
+	restoreDefaultOrgAndUserQuotasOnCleanup(t, originalOrg, originalUser)
+
+	updateAdminOrganizationQuotas(t, defaultOrgID, map[string]interface{}{
+		"storage_quota": int64(1 << 50),
+		"quota_policy":  "hard",
+	})
+
+	baselineUsage := jsonInt64(getAdminUserByEmail(t, defaultUserEmail), "quota_usage")
+	setDefaultUserQuota(t, baselineUsage+1000)
+
+	repoID := createTestLibrary(t, userClient, fmt.Sprintf("inttest-v2-replace-delta-%d", time.Now().UnixNano()))
+	fileName := "replace-v2-delta.txt"
+
+	status, body := uploadV2DirectFileStatus(t, userClient, repoID, fileName, "/", strings.Repeat("a", 100), false)
+	if status != http.StatusOK && status != http.StatusCreated {
+		t.Fatalf("initial v2 direct upload status = %d, want 200/201; body=%s", status, body)
+	}
+
+	afterInitialUsage := waitForUserQuotaUsage(t, baselineUsage+100)
+	setDefaultUserQuota(t, afterInitialUsage)
+
+	status, body = uploadV2DirectFileStatus(t, userClient, repoID, fileName, "/", strings.Repeat("b", 100), true)
+	if status != http.StatusOK && status != http.StatusCreated {
+		t.Fatalf("same-size v2 direct replace status = %d, want 200/201; body=%s", status, body)
+	}
+	afterSameSizeReplace := waitForUserQuotaUsage(t, afterInitialUsage)
+	if afterSameSizeReplace != afterInitialUsage {
+		t.Fatalf("same-size v2 direct replace usage = %d, want %d", afterSameSizeReplace, afterInitialUsage)
+	}
+
+	setDefaultUserQuota(t, afterInitialUsage+20)
+	status, body = uploadV2DirectFileStatus(t, userClient, repoID, fileName, "/", strings.Repeat("c", 120), true)
+	if status != http.StatusOK && status != http.StatusCreated {
+		t.Fatalf("larger v2 direct replace status = %d, want 200/201; body=%s", status, body)
+	}
+	waitForUserQuotaUsage(t, afterInitialUsage+20)
+}
+
+func TestV2BlockUploadTrafficQuotaExceeded(t *testing.T) {
+	originalOrg := getAdminOrganizationInfo(t, defaultOrgID)
+	restoreOrgQuotasOnCleanup(t, originalOrg)
+
+	updateAdminOrganizationQuotas(t, defaultOrgID, map[string]interface{}{
+		"storage_quota":          int64(1 << 50),
+		"traffic_quota":          int64(1 << 50),
+		"traffic_upload_quota":   int64(1),
+		"traffic_download_quota": int64(1 << 50),
+		"quota_policy":           "hard",
+	})
+
+	status, payload := uploadRawBlockStatus(t, userClient, []byte("hello"))
+	if status != http.StatusForbidden {
+		t.Fatalf("v2 block upload traffic status = %d, want %d; body=%v", status, http.StatusForbidden, payload)
+	}
+	if payload["error"] != "traffic quota exceeded" {
+		t.Fatalf("v2 block upload error = %v, want traffic quota exceeded", payload["error"])
+	}
+	if payload["reason"] != "traffic-upload" {
+		t.Fatalf("v2 block upload reason = %v, want traffic-upload", payload["reason"])
+	}
+}
+
 func getAdminOrganizationInfo(t *testing.T, orgID string) map[string]interface{} {
 	t.Helper()
 	resp := superadminClient.Get(t, "/api/v2.1/admin/organizations/"+orgID+"/")
@@ -493,6 +611,50 @@ func uploadFileThroughLinkStatus(t *testing.T, c *testClient, uploadURL, fileNam
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		t.Fatalf("reading upload response failed: %v", err)
+	}
+	return resp.StatusCode, string(body)
+}
+
+func uploadV2DirectFileStatus(t *testing.T, c *testClient, repoID, fileName, parentDir, content string, replace bool) (int, string) {
+	t.Helper()
+
+	var buf bytes.Buffer
+	writer := multipart.NewWriter(&buf)
+	part, err := writer.CreateFormFile("file", fileName)
+	if err != nil {
+		t.Fatalf("CreateFormFile failed: %v", err)
+	}
+	if _, err := part.Write([]byte(content)); err != nil {
+		t.Fatalf("writing v2 direct upload content failed: %v", err)
+	}
+	if err := writer.WriteField("parent_dir", parentDir); err != nil {
+		t.Fatalf("WriteField failed: %v", err)
+	}
+	if replace {
+		if err := writer.WriteField("replace", "1"); err != nil {
+			t.Fatalf("WriteField replace failed: %v", err)
+		}
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("closing multipart writer failed: %v", err)
+	}
+
+	req, err := http.NewRequest(http.MethodPost, c.baseURL+"/api/v2.1/repos/"+repoID+"/upload", &buf)
+	if err != nil {
+		t.Fatalf("creating v2 direct upload request failed: %v", err)
+	}
+	req.Header.Set("Authorization", "Token "+c.token)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		t.Fatalf("v2 direct upload request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("reading v2 direct upload response failed: %v", err)
 	}
 	return resp.StatusCode, string(body)
 }
