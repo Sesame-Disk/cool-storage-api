@@ -205,8 +205,9 @@ All user creation paths now write to BOTH `users` AND `users_by_email`:
 - **Transfer**: Dual-write to `libraries` + `libraries_by_id` tables
 - **Search**: Application-level case-insensitive substring match + ID prefix match
 - **Delete**: Soft-delete via `deleted_at` / `deleted_by` columns (same pattern as user delete)
+- **History retention**: `/admin/libraries/:library_id/history-setting/` controls `version_ttl_days` for non-HEAD commits in a live library. Deleted file/folder restore inside that live library is therefore bounded by the configured history window, not by an indefinite trash guarantee.
 - **JSON + FormData**: Create and transfer endpoints accept both content types
-- **Clean trash**: `AdminCleanTrashLibraries` calls the same cleanup chain as `PermanentDeleteRepo` — GC enqueue (blocks/commits/fs_objects), tag cleanup, hard-delete of library rows. Returns `{"success": true, "cleaned": N}`.
+- **Clean trash**: `AdminCleanTrashLibraries` calls the same cleanup chain as `PermanentDeleteRepo` — GC enqueue (blocks/commits/fs_objects), tag cleanup, hard-delete of library rows. Returns `{"success": true, "cleaned": N}`. Deleted-library restore is bounded by `trash_retention_days`; once that window expires, GC may enqueue `library_cascade` and the library is no longer recoverable.
 - **Known gap**: `shares` for deleted libraries are not cleaned up yet. Share/upload links are now cleaned via `share_links_by_library` (2026-03-13). See `docs/TECHNICAL-DEBT.md` § 9 and `KNOWN_ISSUES.md` ISSUE-GC-ORPHANS-01.
 
 ---
@@ -683,7 +684,7 @@ Default operational safeguard:
 | GET | `/org/:org_id/admin/trash-libraries/` | `ListOrgTrashLibraries` | |
 | DELETE | `/org/:org_id/admin/trash-libraries/` | `CleanOrgTrashLibraries` | Permanent delete all |
 | DELETE | `/org/:org_id/admin/trash-libraries/:rid/` | `DeleteOrgTrashLibrary` | Delete single |
-| PUT | `/org/:org_id/admin/trash-libraries/:rid/` | `RestoreOrgTrashLibrary` | Restore |
+| PUT | `/org/:org_id/admin/trash-libraries/:rid/` | `RestoreOrgTrashLibrary` | Restore within `trash_retention_days` |
 
 #### Departments (1 endpoint)
 | Method | Endpoint | Handler |

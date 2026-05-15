@@ -14,7 +14,7 @@ Legend:
 | Rank | Issue | Severity | Effort | Status |
 |---:|---|---|---|---|
 | 1 | Per-user storage quota enforcement | P0 | M | Fixed 2026-05-14 |
-| 1b | Quota enforcement coverage gaps in V2 mutations (copy / revert / restore-from-trash / OnlyOffice save / cross-repo batch) | P1 | M | Fixed 2026-05-14 |
+| 1b | Quota enforcement coverage gaps in V2 mutations (copy / revert / restore-from-trash / OnlyOffice save / cross-repo batch) | P1 | M | Fixed 2026-05-14; retention/move debt remains documented |
 | 2 | Backup / disaster recovery is not production-ready | P0 | L | Confirmed |
 | 3 | Persistent audit trail / activity feed / Accounts audit provenance is missing | P1 | L | Confirmed |
 | 4 | Batch file move can report success without moving files | P1 | M | Confirmed, broader than docs |
@@ -56,6 +56,12 @@ Fixed 2026-05-14. The handler-by-handler approach was applied: a small shared mo
 Move cross-repo also decrements the source library counter so per-library views stay consistent. OnlyOffice does the pre-check *before* the S3 `PutBlockData` so a quota-exceeded save never persists bytes.
 
 Three new integration tests cover the regressions (`TestCopyFileEnforcesPerUserStorageQuota`, `TestRestoreTrashItemEnforcesPerUserStorageQuota`, `TestRevertFileEnforcesPerUserStorageQuota`); the full `docker compose run --rm go-integration-test` suite is green.
+
+Residual contract note:
+- This fix closes the missing quota wiring only. It does not change deleted-item retention semantics.
+- Deleted file/folder restore inside a live library remains bounded by the library's historical commit retention (`version_ttl_days`), plus the normal `gc_queue` grace once a commit is enqueued.
+- Deleted-library restore remains bounded by `trash_retention_days`.
+- Cross-repo move still publishes destination before removing source. Rare partial-success behavior is accepted for now as technical debt and is a better future target for reconciliation or compensating jobs than for a rushed handler-level patch.
 
 Original confirmed scope of the bug (kept for context):
 

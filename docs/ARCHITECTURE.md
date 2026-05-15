@@ -473,7 +473,7 @@ Drains the `gc_queue` table. Each item has a type; the worker dispatches accordi
 
 **Two-phase deletion**: items sit in `gc_queue` for a grace period (default 1h) before the worker processes them. The `gc_queue` table is durable (no TTL); items are removed only by explicit `Complete` (success), `RequeueItem` (transient failure → back of the queue), or `FailItem` (retry-cap reached → moved to `gc_failed_items` DLQ).
 
-**Cascading**: Commit → fs_object → blocks. The worker only enqueues commits and fs_objects when a library is deleted; blocks are discovered and enqueued during fs_object processing. Cascade items use the parent's `queued_at` timestamp (`EnqueueCascade`) so they skip the grace period — the parent already waited.
+**Cascading**: Commit → fs_object → blocks. Library deletion enqueues commit/fs_object cascades directly, and the scanner can also enqueue old commits or fs_objects for retention-based cleanup; blocks are discovered and enqueued during fs_object processing. Cascade items use the parent's `queued_at` timestamp (`EnqueueCascade`) so they skip the grace period — the parent already waited.
 
 **Error tolerance**: All cascade enqueue operations propagate errors. If enqueueing a child item fails, the parent is NOT deleted — the worker returns an error, the item stays in the queue, and the next worker sweep retries it. Principle: **better to leave garbage and retry than to delete and lose a reference chain**.
 
@@ -500,6 +500,12 @@ Drains the `gc_queue` table. Each item has a type; the worker dispatches accordi
 - `user_grace_days`: 7 days (user → user_cascade)
 - `trash_retention_days`: 30 days (library → library_cascade)
 - `org_grace_days`: 30 days (org → org_cascade)
+
+**Retention contract**:
+- Version history in a live library is retained by `version_ttl_days`. Once a commit falls out of the HEAD chain and ages past that setting, GC Phase 5 may enqueue it for deletion.
+- Deleted file/folder restore inside a live library depends on those retained historical commits, so restoreability is bounded by the same `version_ttl_days` window rather than by an indefinite trash guarantee.
+- Deleted library restore is bounded by `trash_retention_days`; once that window expires, GC Phase 11 may enqueue `library_cascade`.
+- After any item is enqueued, the `gc_queue` grace period is the final delay before destructive processing begins.
 
 **Stats persistence**: Worker/scanner timestamps and `blocks_deleted_total` are saved to `gc_stats` table on shutdown and restored on startup, surviving container restarts.
 

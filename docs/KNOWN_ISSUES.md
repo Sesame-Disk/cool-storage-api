@@ -40,7 +40,7 @@ This document tracks all known bugs, limitations, and issues in SesameFS.
 | **File Statistics Pages Are Still Stubbed** | 🟡 Pending | `/sys/statistics/file/` currently returns all-zero series and `/org/statistics-admin/file/` is still unimplemented. Real data depends on new `file_update_logs` and `file_access_logs` tables, not on `login_logs`. See ISSUE-FILE-STATS-01 below. |
 | **Org Admin Statistics Can Leak Platform Scope** | 🔴 Confirmed bug | When org-admin pages are mounted with platform-org context, traffic-based org-admin metrics can resolve to the global aggregate instead of a tenant scope. Affects at least org-admin traffic, org-admin per-user traffic, and org-admin active-users. See ISSUE-ORG-STATS-SCOPE-01 below. |
 | **Per-User Storage Quota Enforcement** | ✅ Fixed (2026-05-14) | `CheckStorageQuota` now evaluates org and per-user storage caps; upload callers pass `userID`; sync validates the published tree delta before advancing HEAD and waits for the matching storage-counter adjust before returning. See ISSUE-USER-STORAGE-ENFORCE-01 below. |
-| **Quota Enforcement Coverage Gaps in V2 Mutations** | ✅ Fixed (2026-05-14) | CopyFile, copyBatchFiles, RevertFile, RevertDirectory, RestoreTrashItem, RevertDirents, OnlyOffice save, and the cross-repo `processSingleItem` path now pre-check `CheckStorageQuota` against the visible tree delta and apply `AdjustStorageCountersByDeltaSync` after the publish. Move cross-repo also decrements the source library counter. Split-phase publish/counter atomicity remains documented as technical debt (§12d/§12e). See ISSUE-QUOTA-COVERAGE-01 below. |
+| **Quota Enforcement Coverage Gaps in V2 Mutations** | ✅ Fixed (2026-05-14) | The affected non-upload mutation handlers now have visible-delta quota wiring. Deleted file/folder restore remains bounded by configured history retention, deleted-library restore remains bounded by trash retention, and cross-repo move still relies on split-phase destination publish plus source removal. Split-phase publish/counter atomicity remains documented as technical debt (§12d/§12e). See ISSUE-QUOTA-COVERAGE-01 below. |
 
 ### 🟡 SeaDrive 3.x Missing Endpoints (Non-fatal, but degrade UX)
 | Issue | Status | Notes |
@@ -309,6 +309,14 @@ Wiring per handler:
 
 Sync (`PutCommit HEAD`, `UpdateBranch`) and the upload paths (`HandleUpload`, `UploadFile`, `UploadBlock`, `PutBlock`) keep their existing wiring; this fix only adds coverage to the non-upload mutation paths.
 
+#### Scope Boundary / Retention Contract
+
+- This fix closes the missing quota pre-check and storage-counter wiring for the listed non-upload mutation handlers.
+- It does **not** create an indefinite deleted-item durability guarantee. Deleted file/folder restore in a live library remains available only while the backing historical commits stay inside the configured `version_ttl_days` window, plus the normal `gc_queue` grace once those commits are enqueued.
+- Deleted-library restore remains bounded by `trash_retention_days`, after which GC may enqueue `library_cascade` and remove the remaining commits, fs_objects, and blocks.
+- It does **not** make cross-repo move atomic. `processSingleItem` still publishes the destination before removing the source; rare partial-success cases remain accepted technical debt for future reconciliation or reservation-style work.
+- It does **not** normalize post-publish counter-failure handling yet. Some handlers still return 500 while others log and continue; if product keeps the success-after-publish paths, durable repair/reconciliation is still future work.
+
 #### Tests
 
 `internal/integration/quotas_test.go`:
@@ -318,6 +326,12 @@ Sync (`PutCommit HEAD`, `UpdateBranch`) and the upload paths (`HandleUpload`, `U
 - `TestRevertFileEnforcesPerUserStorageQuota` — replace a large file with a small one, revert to the older commit is blocked when the delta would exceed the cap; with headroom the revert succeeds and the counter reflects the byte delta.
 
 All three previously failed with status 200 (silent over-quota) before the fix. Now PASS. Full integration suite (`docker compose run --rm go-integration-test`) is green.
+
+Coverage still remains narrower than the handler list above:
+- there is no dedicated integration coverage yet for `OnlyOffice saveEditedDocument`
+- `RevertDirectory` currently only has basic request-validation unit coverage, not the same end-to-end quota/counter coverage as `RevertFile`
+- `RevertDirents` still lacks dedicated integration coverage for its partial-success and counter behavior
+- async cross-repo copy/move has focused refcount and net-move quota coverage, but not full post-publish counter-failure coverage
 
 #### Why this shape
 

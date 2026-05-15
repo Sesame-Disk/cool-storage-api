@@ -696,10 +696,12 @@ What is still not atomic:
 - quota enforcement is still `pre-check -> publish commit/head -> adjust storage_counters`
 - concurrent publishes can both pass the same pre-check against stale usage and only exceed the cap once both are visible
 - if the post-publish counter adjustment fails, the request can return an error after the new visible state already exists
+- post-publish counter failure policy is still mixed across handlers: some paths return 500 immediately, while others log and continue after the publish succeeds
+- cross-repo move still publishes the destination before removing the source; if the source half fails afterward, the operation can temporarily behave like a copy even though quota was pre-checked as a net move
 
 This is a Cassandra consistency/transaction-shaping debt, not a remaining missing-hook bug like ISSUE-QUOTA-COVERAGE-01.
 
-**Future fix (v2):** Centralize tree-delta publish through one quota-aware primitive. Options include a reservation step before publish, or a narrower CAS-backed workflow that couples quota usage and HEAD publication closely enough that concurrent writers cannot both spend the same remaining bytes.
+**Future fix (v2):** Centralize tree-delta publish through one quota-aware primitive. Options include a reservation step before publish, a narrower CAS-backed workflow that couples quota usage and HEAD publication closely enough that concurrent writers cannot both spend the same remaining bytes, or a reconciliation/compensating-job path that can finish the source-removal half of a cross-repo move after the destination publish succeeds. If product keeps success-after-publish for some handlers, add durable repair/reconciliation for missed counter updates instead of relying on log-only drift.
 
 ### 12e. Upload Storage Pre-check Cost
 

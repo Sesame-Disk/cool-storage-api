@@ -110,6 +110,8 @@ GC is a good example:
 
 - If `user_grace_days`, `org_grace_days`, `trash_retention_days`, or `audit_retention_days` are omitted from YAML, SesameFS keeps the built-in defaults from `DefaultConfig()`.
 - If you set `GC_USER_GRACE_DAYS`, `GC_ORG_GRACE_DAYS`, `GC_TRASH_RETENTION_DAYS`, or `GC_AUDIT_RETENTION_DAYS` in `.env`, those override both the YAML and the code defaults.
+- `trash_retention_days` controls how long a soft-deleted library remains restorable before GC Phase 11 may enqueue `library_cascade`.
+- Historical restore inside a live library is separate: it depends on each library's history setting (`keep_days` / `version_ttl_days`), not on the global GC env overrides above.
 
 ---
 
