@@ -75,7 +75,7 @@ The three v2-only findings identified during reassessment are also fixed in curr
 | M-7 | Session invalidation node-local | Medium | **OPEN** | No distributed revocation |
 | M-8 | PBKDF2 at 1000 iterations | Medium | **OPEN** | Compat mode still uses 1000 iterations (required for Seafile clients) |
 | M-9 | OnlyOffice JWT TTL 8 hours | Medium | **FIXED** | Configurable via `onlyoffice.jwt_ttl_seconds` (default 3600s = 1h, range 300–28800); env var `ONLYOFFICE_JWT_TTL_SECONDS` |
-| M-10 | Frontend dependency CVEs | Medium | **OPEN** | moment.js, socket.io-client@2, url-parse; React 17 EOL |
+| M-10 | Frontend dependency CVEs | Medium | **PARTIALLY REMEDIATED 2026-05-15** | moment -> 2.29.4, socket.io-client -> 2.5.0, url-parse -> 1.5.10; direct deprecated `MD5`, `i18next-xhr-backend`, `glamor`, `babel-eslint`, and unused `workbox-webpack-plugin` removed; React 17 EOL and transitive deprecations still pending |
 
 ### New findings in v2
 

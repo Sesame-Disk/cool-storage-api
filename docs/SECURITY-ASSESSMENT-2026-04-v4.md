@@ -9,6 +9,8 @@
 
 ## Executive Summary
 
+**Frontend update (2026-05-15):** M-10 is now partially remediated. Direct deprecated frontend packages were removed or replaced, local `npm.cmd run build` and Docker `docker compose build frontend` pass, and remaining deprecations/audit findings are major/transitive migrations rather than simple dead-package cleanup. Avoid blind `npm audit fix --force`; continue with targeted frontend upgrades.
+
 **All critical and high-severity security findings from v1-v3 have been resolved.** The remaining open items are limited to medium-severity compatibility constraints (PBKDF2 iterations for Seafile compatibility), architectural improvements needed for multi-node deployments (distributed session revocation), and frontend dependency updates.
 
 **NEW in v4:** Comprehensive multiregion storage analysis with code audit and testing. Key findings:
@@ -55,7 +57,7 @@
 | **H-7** (residual) | No per-account auth throttling | High | Per-IP limit exists (22% get through on prod), but no per-account throttling keyed on submitted email | Distributed credential stuffing from multiple IPs not meaningfully blocked |
 | **M-7** | Session invalidation node-local | Medium | No distributed revocation list; relies on in-memory cache TTL (5 min) | In multi-node deployment, deactivated user remains accessible on peer nodes until cache expires |
 | **M-8** | PBKDF2 at 1000 iterations | Medium | **Required for Seafile desktop/mobile client compatibility**; cannot change without breaking clients | Offline brute-force of encrypted library passwords feasible for weak passwords if Cassandra compromised |
-| **M-10** | Frontend dependency CVEs | Medium | Not retested; known from v1: moment 2.22.2 (ReDoS), socket.io-client 2.2.0, crypto-js 4.2.0, url-parse, React 17 (EOL) | Client-side DoS via malicious timestamps; React EOL means no security patches |
+| **M-10** | Frontend dependency CVEs | Medium | **Partially remediated 2026-05-15:** moment -> 2.29.4, socket.io-client -> 2.5.0, url-parse -> 1.5.10; direct deprecated `MD5`, `i18next-xhr-backend`, `glamor`, `babel-eslint`, and unused `workbox-webpack-plugin` removed; local and Docker frontend builds pass | Still open: React 17 EOL, crypto-js usage audit, Bootstrap 4/Popper 1, SVGO/@svgr, svg-sprite-loader source-map chain, `core-js@2` via `@seafile/seafile-calendar`; Docker `npm ci` reports 77 vulnerabilities |
 
 **Recommendation priority:**
 1. **H-7** — Add per-account throttling (keyed on email) to auth endpoints

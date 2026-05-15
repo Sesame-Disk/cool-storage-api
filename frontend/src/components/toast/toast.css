@@ -126,7 +126,7 @@
   color: rgb(16, 112, 202);
 }
 
-.toast-alert-icon-loading {
+.toast-alert i.toast-alert-icon-loading {
   width: 15px;
   height: 15px;
   margin: 3px;

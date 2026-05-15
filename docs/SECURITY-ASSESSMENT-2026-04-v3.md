@@ -132,12 +132,17 @@ Deprecate PBKDF2 compat path when Seafile client support is dropped.
 
 ---
 
-### M-10 Frontend dependency CVEs (STILL OPEN)
+### M-10 Frontend dependency CVEs (PARTIALLY REMEDIATED, STILL OPEN)
 
-Not retested. Known from v1: moment 2.22.2 (ReDoS), socket.io-client 2.2.0,
-crypto-js 4.2.0, url-parse ^1.4.3, React 17.0.0 (EOL). None are direct RCE.
+Retested and partially cleaned on 2026-05-15. Direct frontend cleanup:
+- `moment` updated to 2.29.4.
+- `socket.io-client` updated to 2.5.0.
+- `url-parse` updated to 1.5.10.
+- Deprecated direct packages `MD5`, `i18next-xhr-backend`, `glamor`, `babel-eslint`, and unused `workbox-webpack-plugin` removed.
+- Code now uses `md5` and `i18next-http-backend`; toast styles moved from `glamor` runtime CSS to static CSS.
+- `npm.cmd run build` and `docker compose build frontend` both compile successfully.
 
-**Fix:** `cd frontend && npm audit fix` and plan React 17 -> 18 migration.
+Still open: `crypto-js` usage audit, React 17 -> 18 migration, Bootstrap 4/Popper 1 -> supported stack, `@svgr/webpack`/SVGO modernization, `svg-sprite-loader` source-map chain cleanup, and `@seafile/seafile-calendar`/`core-js@2` vendor dependency. Docker `npm ci` currently reports 77 vulnerabilities, so broad `npm audit fix --force` should be treated as a migration project, not a safe patch.
 
 ---
 

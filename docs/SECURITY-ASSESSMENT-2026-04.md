@@ -700,15 +700,17 @@ Compat mode uses PBKDF2 with 1000 iterations, far below OWASP 2024 guidance (≥
 
 #### M-10 Frontend dependency CVEs
 
+**Status update (2026-05-15): PARTIALLY REMEDIATED.** Frontend dependency and build cleanup removed direct deprecated packages `MD5`, `i18next-xhr-backend`, `glamor`, `babel-eslint`, and unused `workbox-webpack-plugin`; updated direct usage to `md5` and `i18next-http-backend`; and set production `npm run build` to skip the legacy ESLint webpack pass while keeping `npm run lint` available separately. Local `npm.cmd run build` and `docker compose build frontend` both compile successfully.
+
 | Package | Version | CVE(s) | Notes |
 |---|---|---|---|
-| moment | 2.22.2 | CVE-2022-24785 (path traversal in locale), CVE-2022-31129 (ReDoS) | ReDoS weaponizable via file history timestamps |
-| socket.io-client | 2.2.0 | CVE-2022-25867 (NPE DoS) | |
+| moment | 2.29.4 | Historical: CVE-2022-24785, CVE-2022-31129 affected older versions | Updated from 2.22.2; replacement with dayjs/date-fns remains optional tech debt |
+| socket.io-client | 2.5.0 | Historical: CVE-2022-25867 affected older versions | Updated from 2.2.0; major v4 migration remains open |
 | crypto-js | 4.2.0 | CVE-2023-46233 (PBKDF2 weakness) | Audit actual usage in `frontend/src/pages/markdown-editor/` |
-| url-parse | ^1.4.3 | CVE-2018-3774 (host confusion) | |
+| url-parse | 1.5.10 | Historical: CVE-2018-3774 affected older versions | Updated from ^1.4.3 |
 | React | 17.0.0 | EOL — no security updates | Plan migration to 18 |
 
-None are direct RCE, but the ReDoS in client-side date parsing is reachable via user-controlled timestamps returned by the API.
+Remaining npm deprecations are mostly transitive/major-migration work: Bootstrap 4/Popper 1 via Reactstrap 8, SVGO 1 via `@svgr/webpack@5`, old `svg-sprite-loader` source-map chain, `core-js@2` via `@seafile/seafile-calendar`, and Babel proposal plugins pulled by CRA/Babel preset compatibility. Current `npm ci` in Docker reports 77 vulnerabilities, so M-10 remains open but narrower.
 
 ---
 
