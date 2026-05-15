@@ -84,19 +84,19 @@
   display: grid;
   grid-template-columns: minmax(260px, 2fr) minmax(90px, 120px) auto;
   gap: 12px;
-  align-items: end;
+  align-items: flex-end;
 }
 
 .gc-admin-org-search-row {
   display: grid;
   grid-template-columns: minmax(260px, 2fr) auto;
   gap: 12px;
-  align-items: end;
+  align-items: flex-end;
 }
 
 .gc-admin-filter-submit {
   display: flex;
-  align-items: end;
+  align-items: flex-end;
 }
 
 .gc-admin-table-wrap {
