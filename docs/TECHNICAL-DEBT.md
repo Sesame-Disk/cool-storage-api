@@ -181,6 +181,27 @@ Why this is deferred:
 - It is a protocol-level frontend migration, not a small UX patch.
 - It must preserve folder uploads, replace flows, shared links, upload links, retries, and progress UX.
 - It needs explicit browser-side hashing/performance validation on large files.
+
+**3. Decide and formalize chunked upload traffic semantics**
+
+The recent upload fix made `HandleUpload` use the declared `Content-Range` total for chunked traffic pre-checks, but traffic is still recorded only after successful `finalizeUploadStreaming()`.
+
+Current consequences:
+- clearly over-quota chunked uploads are blocked early against the full declared upload size
+- abandoned chunk sessions, janitor-reaped temp files, and finalize failures can still consume real bandwidth without incrementing `traffic_period_usage`
+- retried chunks are idempotent at the temp-file layer, but traffic accounting is not yet defined per chunk because there is no per-chunk recorder path
+- invalid or missing `Content-Range` currently falls back to the non-chunked upload path instead of enforcing a strict resumable-upload protocol
+
+Why this is acceptable for now:
+- standard paid tiers include very generous upload headroom (50 TB/month), so the commercial pressure on upload-side overages is low
+- paid-plan overage billing happens outside SesameFS; SesameFS mainly enforces hard limits and warning thresholds
+- the recent fix still closed the more important bypass where a large chunked upload could under-state the pre-check size using request `Content-Length`
+
+Future fix options:
+- keep the current model but document it explicitly as `completed logical upload bytes`, not exact wire bytes
+- or move to per-chunk traffic recording / reservation with reconciliation on completion, retry, or abandonment
+- if per-chunk recording lands, replace the current `declared total on every request` pre-check with chunk-bytes or session-reservation logic to avoid false rejections after partial accounting
+- add tests for aborted uploads, finalize failures, duplicate chunk retries, and malformed `Content-Range`
   run: |
     go test ./... -coverprofile=coverage.out
     COVERAGE=$(go tool cover -func=coverage.out | grep total | awk '{print $3}' | sed 's/%//')
@@ -740,6 +761,29 @@ Possible mitigations:
 #### Why this is not blocking
 
 The work above is purely about cost. The pre-check answers and the counter adjustments are already correct, the regressions are already covered by tests, and the failure modes degrade to "extra Cassandra reads on the upload hot path," not to incorrect quota decisions. The TOCTOU concern itself stays in §12d above; this section is only about how often we pay the cost of *being* correct.
+
+### 12f. Chunked Upload Traffic Semantics and Abort Accounting
+
+**Status:** Open technical debt. Product contract documented, not yet unified with raw-bandwidth accounting.
+
+The recent upload change made `HandleUpload` use the declared `Content-Range` total for chunked traffic pre-checks, but the recorder still runs only after successful `finalizeUploadStreaming()`. Today the web chunked path behaves like a coarse whole-upload reservation for blocking and a completed-upload model for recording.
+
+What that means today:
+- uploads that exceed the declared total quota are still blocked early
+- uploads abandoned mid-session, janitor-reaped temp files, and finalize failures can consume network bytes without incrementing `traffic_period_usage`
+- retried chunks are idempotent at the temp-file layer, but traffic accounting is not yet idempotent per chunk because there is no per-chunk recording path
+- invalid or missing `Content-Range` falls back to the non-chunked upload path instead of enforcing a strict resumable-upload contract
+
+Why this is currently acceptable:
+- standard paid tiers include 50 TB/month of upload traffic, so the commercial pressure on upload-side overages is low
+- paid-plan overage billing lives outside SesameFS; SesameFS mainly enforces hard caps and warning thresholds
+- the current fix still closes the more important bypass where a large chunked upload could under-state the pre-check size via per-request `Content-Length`
+
+Future fix options:
+- keep current semantics but document them as `completed logical upload bytes`, not exact wire bytes
+- or move to per-chunk recording / session reservation with reconciliation on completion, retry, or abandonment
+- if per-chunk recording lands, replace the current `declared total on every request` pre-check with chunk-bytes or reservation-token logic to avoid false rejections after partial accounting
+- add tests for aborted uploads, finalize failures, duplicate chunk retries, and malformed `Content-Range`
 
 ---
 

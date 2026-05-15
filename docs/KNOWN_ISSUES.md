@@ -41,6 +41,7 @@ This document tracks all known bugs, limitations, and issues in SesameFS.
 | **Org Admin Statistics Can Leak Platform Scope** | 🔴 Confirmed bug | When org-admin pages are mounted with platform-org context, traffic-based org-admin metrics can resolve to the global aggregate instead of a tenant scope. Affects at least org-admin traffic, org-admin per-user traffic, and org-admin active-users. See ISSUE-ORG-STATS-SCOPE-01 below. |
 | **Per-User Storage Quota Enforcement** | ✅ Fixed (2026-05-14) | `CheckStorageQuota` now evaluates org and per-user storage caps; upload callers pass `userID`; sync validates the published tree delta before advancing HEAD and waits for the matching storage-counter adjust before returning. See ISSUE-USER-STORAGE-ENFORCE-01 below. |
 | **Quota Enforcement Coverage Gaps in V2 Mutations** | ✅ Fixed (2026-05-14) | The affected non-upload mutation handlers now have visible-delta quota wiring. Deleted file/folder restore remains bounded by configured history retention, deleted-library restore remains bounded by trash retention, and cross-repo move still relies on split-phase destination publish plus source removal. Split-phase publish/counter atomicity remains documented as technical debt (§12d/§12e). See ISSUE-QUOTA-COVERAGE-01 below. |
+| **Chunked Upload Traffic Accounting Semantics** | 🟡 Accepted debt | Web chunked uploads now pre-check traffic against the declared `Content-Range` total, but traffic is still recorded only after successful finalize. Abandoned chunk sessions can consume bandwidth without advancing counters. Operationally acceptable for current generous paid upload allowances, but documented for future billing/accounting work. See ISSUE-CHUNKED-UPLOAD-TRAFFIC-01 below. |
 
 ### 🟡 SeaDrive 3.x Missing Endpoints (Non-fatal, but degrade UX)
 | Issue | Status | Notes |
@@ -344,6 +345,58 @@ Split-phase atomicity (pre-check → publish → counter adjust) remains documen
 - ISSUE-USER-STORAGE-ENFORCE-01 (fixed) — same enforcement model, narrower coverage.
 - [internal/api/v2/quota_helpers.go](internal/api/v2/quota_helpers.go) — shared primitives.
 - [internal/traffic/storage.go:136](internal/traffic/storage.go#L136) — `AdjustStorageCountersByDeltaSync` with negative-clamp protection.
+
+---
+
+### ISSUE-CHUNKED-UPLOAD-TRAFFIC-01: Chunked Upload Traffic Is Recorded At Finalize, Not Per Received Chunk
+
+**Status**: 🟡 Accepted debt / documented contract (2026-05-15)
+**Severity**: Low-Medium — declared-total pre-check now blocks obvious over-quota chunked uploads, but abandoned chunk sessions can still consume real bandwidth without moving traffic counters
+**Affected**: `HandleUpload` chunked path, web/link upload traffic quotas, future traffic/billing semantics
+
+#### Current Contract
+
+The web chunked upload path now parses `Content-Range` and uses the declared total for the traffic pre-check before reading the multipart body. That closes the earlier fail-open where a large resumable upload could slip through using only per-request `Content-Length`.
+
+Traffic recording is still tied to successful logical upload completion:
+
+- each chunk is written to the temp upload session immediately
+- `RecordCheckedTransfer(...)` is only called after `finalizeUploadStreaming()` succeeds
+- abandoned uploads, janitor-reaped chunk sessions, and finalize failures do not increment `traffic_period_usage` today
+- invalid or missing `Content-Range` falls back to the non-chunked upload path instead of returning a strict protocol error
+
+#### Why This Is Acceptable For Now
+
+- paid plans currently include very generous monthly upload allowance (50 TB/month on the standard paid tiers)
+- paid-plan overage is commercial/billing logic outside SesameFS; SesameFS mainly gates free/hard-limit abuse and surfaces warnings
+- the declared-total pre-check still blocks clearly over-quota chunked uploads before the body is processed
+
+This means the current web chunked traffic counters represent completed logical uploads, not exact wire bytes received in every failure/abort case.
+
+#### Remaining Debt
+
+If product later decides that upload traffic quota must equal raw network usage rather than successful logical uploads, the current model is not enough. Future work would need to:
+
+- record received bytes per chunk, or introduce a session reservation/reconciliation model
+- make duplicate/retried chunk writes idempotent for traffic accounting, not just for temp-file writes
+- decide whether malformed `Content-Range` should be rejected with `400` instead of falling back
+- add handler/integration coverage for aborted uploads, finalize failures, duplicate chunk retries, and malformed headers
+
+#### Existing Coverage
+
+Current tests already cover part of the contract:
+
+- `TestParseContentRange`
+- `TestHandleUploadQuotaContract_ChunkedPrecheckUsesDeclaredTotal`
+- `TestChunkUploadWriteDuringFinalizationIsIdempotentOnly`
+- `TestChunkedWebUploadChecksTotalStorageQuota`
+
+What is still missing is traffic-accounting coverage for abandoned or failed chunked uploads.
+
+#### Related Docs
+
+- `docs/TECHNICAL-DEBT.md`
+- `docs/QUOTAS-AND-TRAFFIC-PLAN.md`
 
 ---
 

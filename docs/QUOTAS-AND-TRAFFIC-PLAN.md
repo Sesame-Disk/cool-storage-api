@@ -137,6 +137,16 @@ For quota enforcement, 3 checks are evaluated (most restrictive wins):
 2. **Upload** (`traffic_upload_quota`): sync+web+link upload vs upload limit
 3. **Download** (`traffic_download_quota`): sync+web+link download vs download limit
 
+### Current web chunked upload contract (2026-05-15)
+
+- `HandleUpload` now pre-checks chunked upload traffic using the declared `Content-Range` total, not just the multipart request size.
+- Traffic for chunked web/link uploads is still recorded only after successful finalization of the logical upload.
+- Abandoned chunk sessions, janitor cleanup of stale temp files, and finalize failures can consume real bandwidth without incrementing `traffic_period_usage` today.
+- This is currently acceptable operationally because the standard paid tiers include generous upload headroom (50 TB/month on Starter, StarterPlus, and Business) and overage charging lives in external billing.
+- As a result, today's upload traffic counters should be interpreted as `completed logical upload bytes`, not exact wire bytes received in every abort/failure case.
+- If SesameFS later switches to per-chunk traffic accounting, the pre-check model must change from `declared total on every request` to chunk-bytes or a reservation/reconciliation model.
+- Invalid or missing `Content-Range` currently falls back to the non-chunked upload path rather than returning a strict resumable-upload protocol error.
+
 ---
 
 ## Phase 1: Schema — New Tables and Columns
