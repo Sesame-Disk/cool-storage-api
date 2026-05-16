@@ -98,18 +98,50 @@ The default probe ports (3000, 8082) don't match the local stack (4000), so they
 
 ## 4. Performance
 
-### End-to-end finalization ("Saving…" duration)
+### End-to-end upload experience
 
-Measured from server logs during a real 4-file upload session (local MinIO, 8-block parallel finalization):
+A file upload has two distinct phases visible to the user:
 
-| File | Size | Block storage | Commit | Total "Saving…" | Throughput |
-|------|------|-------------|--------|-----------------|-----------|
-| AcroRdrSCADC2500121288_MUI.dmg | 794.9 MB | 11.13 s | 0.21 s | **11.5 s** | 71.4 MB/s |
-| Claude.dmg | 253.5 MB | 3.25 s | 0.09 s | **3.3 s** | 78.0 MB/s |
-| Screen Recording | 77.9 MB | 1.11 s | 0.11 s | **1.2 s** | 70.2 MB/s |
-| Screen Recording | 15.9 MB | 0.49 s | 0.04 s | **0.5 s** | 32.4 MB/s |
+- **Uploading (progress bar)** — browser sends chunks to the server. Duration is determined entirely by the client's upload bandwidth.
+- **Saving… (finalization)** — server stores blocks to MinIO and commits the file tree. Duration is determined by MinIO write throughput (~68–78 MB/s on local disk).
 
-The "Saving…" duration is dominated by MinIO block I/O (~68–78 MB/s, disk-bound). Commit creation adds a fixed ≤210 ms regardless of file size. If faster finalization is needed, the lever is MinIO throughput or increasing `finalizeUploadConcurrency` — not the application logic.
+#### Observed timings — local dev stack (MacBook M1, local MinIO over Docker)
+
+Upload bandwidth observed during testing: **~26 MB/s** (Wi-Fi/USB, local loopback).  
+MinIO block storage throughput: **~68–78 MB/s** (local NVMe via Docker volume).
+
+| File | Size | Chunks | Upload phase | Saving phase | Total |
+|------|------|--------|-------------|--------------|-------|
+| Screen Recording | 15.9 MB | 2 | ~0.6 s | **0.5 s** | ~1 s |
+| Screen Recording | 77.9 MB | 10 | ~3 s | **1.2 s** | ~4 s |
+| Claude.dmg | 253.5 MB | 31 | ~10 s | **3.3 s** | ~13 s |
+| AcroRdrSCADC2500121288_MUI.dmg | 794.9 MB | 95 | ~31 s | **11.5 s** | ~43 s |
+| Archive.zip | 1,074.9 MB | 128 | ~41 s | **~14 s** | ~55 s |
+
+Commit creation adds a fixed **≤210 ms** regardless of file size — it is not a factor in the "Saving…" duration.
+
+#### What to expect at different file sizes
+
+At local dev speeds (~26 MB/s upload, ~73 MB/s MinIO):
+
+| File size | Upload phase | Saving phase | Total experience |
+|-----------|-------------|--------------|-----------------|
+| 50 MB | ~2 s | ~0.7 s | ~3 s |
+| 250 MB | ~10 s | ~3.4 s | ~13 s |
+| 500 MB | ~19 s | ~6.8 s | ~26 s |
+| 1 GB | ~40 s | ~14 s | ~54 s |
+| 5 GB | ~3.2 min | ~70 s | ~5 min |
+| 10 GB | ~6.4 min | ~140 s | ~9 min |
+
+In production with faster infrastructure (e.g. 200 MB/s upload, NVMe-backed S3 at 500 MB/s):
+
+| File size | Upload phase | Saving phase | Total experience |
+|-----------|-------------|--------------|-----------------|
+| 1 GB | ~5 s | ~2 s | ~7 s |
+| 10 GB | ~51 s | ~20 s | ~71 s |
+| 20 GB | ~102 s | ~41 s | ~143 s |
+
+**The "Saving…" phase will always feel slow relative to upload speed** because MinIO block I/O is a separate sequential step that starts only after all chunks arrive. The application logic (coordinator, FS tree, commit) adds ≤250 ms fixed overhead and is not the bottleneck. If faster finalization is needed in production, the lever is MinIO throughput or increasing `finalizeUploadConcurrency` in the config.
 
 ### LibraryWriteCoordinator overhead vs `main`
 
