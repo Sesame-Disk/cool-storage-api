@@ -18,7 +18,103 @@ When two or more file uploads to the same library finalized at the same time, ea
 
 ---
 
-## 2. What Changed
+## 2. Upload Flow — Before vs. After
+
+### What an upload looks like (single file, always true)
+
+Every upload — before and after this fix — follows the same streaming pipeline. The server never buffers the full file in memory:
+
+```
+chunk arrives (HTTP)
+        │
+        ▼
+WriteChunkFromReader ──► temp file on disk (written at correct byte offset)
+                                  │
+                    (repeated for every chunk, in any order)
+                                  │
+                                  ▼
+                     TryStartFinalization() == true
+                     (all byte ranges coalesced → [0, TotalSize-1])
+                                  │
+                                  ▼
+                     finalizeUploadStreaming ──► S3 / MinIO
+                     (reads temp file sequentially,            (8 goroutines in parallel)
+                      pushes 8 MB blocks to object store)
+                                  │
+                                  ▼
+                     coordinator.Acquire()
+                     read HEAD → build FS tree → write commit → update HEAD
+                     coordinator.Release()
+```
+
+S3 block storage runs fully in parallel and is not affected by the fix. Only the final metadata step (read HEAD → update HEAD) is serialized.
+
+---
+
+### Before the fix — concurrent commits to the same library
+
+When two files finished `finalizeUploadStreaming` at the same time, both goroutines entered the commit step simultaneously with no coordination:
+
+```
+Goroutine A (file-a.txt)                    Goroutine B (file-b.txt)
+        │                                           │
+finalizeUploadStreaming → S3 ◄── PARALLEL ──► finalizeUploadStreaming → S3
+        │                                           │
+read HEAD from Cassandra                    read HEAD from Cassandra
+  → "commit #5"  ◄──── both read the same stale HEAD ────►  → "commit #5"
+        │                                           │
+build tree from #5                          build tree from #5
+write commit → "commit #6"                  write commit → "commit #6"
+  (contains file-a only)                      (contains file-b only)
+        │                                           │
+update HEAD → commit #6                     update HEAD → commit #6
+        │                                           │
+        └─────────── last writer wins ──────────────┘
+                             │
+                    ⚠ one commit is silently orphaned
+                    ⚠ the losing file is missing from directory listings
+                    ⚠ HTTP 200 was returned — no error visible to the user
+```
+
+The bug: both goroutines read HEAD before either had written a new one. The second `update HEAD` overwrote the first. The orphaned commit and its file were unreachable but not deleted.
+
+---
+
+### After the fix — `LibraryWriteCoordinator` serializes the commit step
+
+S3 storage is still fully parallel. Only the ~10–100 ms metadata phase is serialized, per library:
+
+```
+Goroutine A (file-a.txt)                    Goroutine B (file-b.txt)
+        │                                           │
+finalizeUploadStreaming → S3 ◄── PARALLEL ──► finalizeUploadStreaming → S3
+        │                                           │
+coordinator.Acquire("lib-X") ◄── acquires    coordinator.Acquire("lib-X") ◄── WAITS
+        │                                           │ (blocked here)
+read HEAD → "commit #5"                             │
+build tree → add file-a                             │
+write commit → "commit #6"                          │
+update HEAD → commit #6                             │
+coordinator.Release() ──────────────────────────────┘
+                                                    │ unblocked
+                                            read HEAD → "commit #6"  ← sees A's file
+                                            build tree → add file-b
+                                            write commit → "commit #7"
+                                            update HEAD → commit #7
+                                            coordinator.Release()
+
+✓ commit #7 contains both file-a and file-b — no commits orphaned
+```
+
+The coordinator is a two-level lock:
+- **Outer `sync.Mutex`** — held for ~50 ns, only to look up or insert the per-library entry in a map.
+- **Per-library `sync.Mutex`** — held for the entire read→commit→update sequence (~10–100 ms). Released immediately after `update HEAD` completes.
+
+Libraries that are not the same (`lib-X` vs `lib-Y`) acquire different per-library locks and run fully in parallel — no cross-library contention.
+
+---
+
+## 3. What Changed
 
 ### New files
 
@@ -48,7 +144,7 @@ These are merged to `main`, correct, and required. No action needed.
 
 ---
 
-## 3. Tests
+## 4. Tests
 
 ### Unit tests — all pass
 
@@ -96,7 +192,7 @@ The default probe ports (3000, 8082) don't match the local stack (4000), so they
 
 ---
 
-## 4. Performance
+## 5. Performance
 
 ### End-to-end upload experience
 
@@ -170,7 +266,7 @@ Benchmarked on Apple M1 Pro (`go test -bench -benchmem -benchtime=3s`):
 
 ---
 
-## 5. Prod-Readiness
+## 6. Prod-Readiness
 
 | Item | Status | Notes |
 |------|--------|-------|
@@ -186,7 +282,7 @@ Benchmarked on Apple M1 Pro (`go test -bench -benchmem -benchtime=3s`):
 
 ---
 
-## 6. Pre-Merge Checklist
+## 7. Pre-Merge Checklist
 
 - [x] `LibraryWriteCoordinator` implemented and wired into both commit paths
 - [x] Debug logging removed from `TryStartFinalization`
