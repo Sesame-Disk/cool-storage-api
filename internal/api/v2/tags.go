@@ -663,12 +663,12 @@ func MoveFileTagsByPath(database *db.DB, repoID, oldPath, newPath string) {
 			continue
 		}
 
-		// Delete old entries
+		// Delete old path row. file_tags_by_id is keyed by file_tag_id, so the
+		// INSERT above updates that lookup in place; deleting it here would erase
+		// the moved tag's remove-by-id path.
 		batch := database.Session().Batch(gocql.LoggedBatch)
 		batch.Query(`DELETE FROM file_tags WHERE repo_id = ? AND file_path = ? AND tag_id = ?`,
 			repoUUID, oldPath, tagID)
-		batch.Query(`DELETE FROM file_tags_by_id WHERE repo_id = ? AND file_tag_id = ?`,
-			repoUUID, fileTagID)
 		if err := batch.Exec(); err != nil {
 			log.Printf("[MoveFileTagsByPath] failed to delete old tag rows for repo %s old_path %q tag %d: %v", repoID, oldPath, tagID, err)
 		}

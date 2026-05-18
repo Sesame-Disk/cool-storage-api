@@ -470,11 +470,15 @@ func (h *BatchOperationHandler) processSingleItem(orgID, userID, srcRepoID, dstR
 	sourceRemovalPublished := false
 	replacedTagCleanupPath := ""
 	replacedTagCleanupByPrefix := false
+	replacedBlockIDs := []string(nil)
+	destinationCommitID := ""
 
 	err := retryLibraryHeadMutation("BatchOperationDestination", func() error {
 		currentItemName := path.Base(srcPath)
 		replacedTagCleanupPath = ""
 		replacedTagCleanupByPrefix = false
+		replacedBlockIDs = nil
+		destinationCommitID = ""
 
 		srcSnapshot, err := fsHelper.GetLibraryHeadSnapshot(srcRepoID)
 		if err != nil {
@@ -539,6 +543,10 @@ func (h *BatchOperationHandler) processSingleItem(orgID, userID, srcRepoID, dstR
 			oldDstSize, oldDstFiles, err = fsEntryStats(fsHelper, dstRepoID, *replacedEntry)
 			if err != nil {
 				return fmt.Errorf("failed to compute replaced entry size: %w", err)
+			}
+			replacedBlockIDs, err = fsHelper.CollectBlockIDsRecursive(dstRepoID, replacedEntry.ID)
+			if err != nil {
+				return fmt.Errorf("failed to collect replaced entry blocks: %w", err)
 			}
 		}
 
@@ -634,6 +642,7 @@ func (h *BatchOperationHandler) processSingleItem(orgID, userID, srcRepoID, dstR
 		itemName = currentItemName
 		srcSize = currentSrcSize
 		srcFiles = currentSrcFiles
+		destinationCommitID = newDstCommitID
 		return nil
 	})
 	if err != nil {
@@ -648,6 +657,12 @@ func (h *BatchOperationHandler) processSingleItem(orgID, userID, srcRepoID, dstR
 		} else {
 			go CleanupFileTagsByPath(h.db, dstRepoID, replacedTagCleanupPath)
 		}
+	}
+	if len(replacedBlockIDs) > 0 && destinationCommitID != "" {
+		go func(operationKey string, blockIDs []string) {
+			zeroRefBlocks := fsHelper.DecrementBlockRefCountsOnce(orgID, operationKey, blockIDs)
+			enqueueZeroRefBlocks(h.db, orgID, dstRepoID, zeroRefBlocks)
+		}(opType+"-replace:"+destinationCommitID, append([]string(nil), replacedBlockIDs...))
 	}
 
 	// For move operation, remove from source
