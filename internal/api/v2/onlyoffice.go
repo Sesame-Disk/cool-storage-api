@@ -29,6 +29,7 @@ import (
 )
 
 // OnlyOfficeHandler handles OnlyOffice integration
+
 type OnlyOfficeHandler struct {
 	db             *db.DB
 	config         *config.Config
@@ -900,26 +901,8 @@ func (h *OnlyOfficeHandler) saveEditedDocument(ctx context.Context, repoID, file
 		return fmt.Errorf("library not found: %w", err)
 	}
 
-	// Resolve existing entry (if any) before storing bytes, so we can pre-check
-	// the per-user storage quota against the visible delta of this save.
 	fsHelper := NewFSHelper(h.db)
-	preResult, preErr := fsHelper.TraverseToPath(repoID, filePath)
 	filename := path.Base(filePath)
-	var existingEntry *FSEntry
-	if preErr == nil {
-		if existing := FindEntryInList(preResult.Entries, filename); existing != nil {
-			ent := *existing
-			existingEntry = &ent
-		}
-	}
-	storageDeltaBytes, storageDeltaFiles := onlyOfficeStorageDelta(existingEntry, originalFileSize)
-	if storageDeltaBytes > 0 {
-		if checker := traffic.GetChecker(); checker != nil {
-			if st, _ := checker.CheckStorageQuota(orgID, userID, storageDeltaBytes); !st.Allowed {
-				return fmt.Errorf("storage quota exceeded")
-			}
-		}
-	}
 
 	// If library is encrypted, encrypt the content before storage
 	if encrypted {
@@ -980,80 +963,9 @@ func (h *OnlyOfficeHandler) saveEditedDocument(ctx context.Context, repoID, file
 		log.Printf("Failed to store block metadata: %v", err)
 	}
 
-	// Reuse the FSHelper and traversal already prepared for the storage
-	// pre-check above. Re-traversing here would be redundant work.
-	now := time.Now()
-	result := preResult
-	if preErr != nil {
-		// Pre-check traversal failed earlier — retry now to keep the historical
-		// error path intact (returns 404 on path mismatch via the original error).
-		result, err = fsHelper.TraverseToPath(repoID, filePath)
-		if err != nil {
-			return fmt.Errorf("failed to traverse to path: %w", err)
-		}
-	}
-
-	// Create new FS object for the file (use external SHA-1 block ID for Seafile client compatibility)
-	newFileFSID, err := fsHelper.CreateFileFSObject(repoID, filename, originalFileSize, []string{externalBlockID})
+	storageDeltaBytes, storageDeltaFiles, newCommitID, err := h.publishEditedDocumentMetadata(fsHelper, orgID, repoID, filePath, filename, userID, originalFileSize, externalBlockID)
 	if err != nil {
-		return fmt.Errorf("failed to create file fs_object: %w", err)
-	}
-
-	// Update the entry in parent directory
-	updatedEntries := make([]FSEntry, 0, len(result.Entries))
-	fileUpdated := false
-	for _, entry := range result.Entries {
-		if entry.Name == filename {
-			// Update the file entry with new fs_id (use original size, not encrypted size)
-			entry.ID = newFileFSID
-			entry.Size = originalFileSize
-			entry.MTime = now.Unix()
-			entry.Modifier = userID + "@sesamefs.local" // CRITICAL: Required for correct fs_id hash
-			fileUpdated = true
-		}
-		updatedEntries = append(updatedEntries, entry)
-	}
-
-	// If file wasn't found in entries, add it (shouldn't happen for edit, but handle it)
-	if !fileUpdated {
-		updatedEntries = append(updatedEntries, FSEntry{
-			ID:       newFileFSID,
-			Name:     filename,
-			Mode:     ModeFile,
-			MTime:    now.Unix(),
-			Size:     originalFileSize,
-			Modifier: userID + "@sesamefs.local", // CRITICAL: Required for correct fs_id hash
-		})
-	}
-
-	// Create new parent directory fs_object
-	newParentFSID, err := fsHelper.CreateDirectoryFSObject(repoID, updatedEntries)
-	if err != nil {
-		return fmt.Errorf("failed to create parent fs_object: %w", err)
-	}
-
-	// Rebuild path to root
-	newRootFSID, err := fsHelper.RebuildPathToRoot(repoID, result, newParentFSID)
-	if err != nil {
-		return fmt.Errorf("failed to rebuild path: %w", err)
-	}
-
-	// Get current head commit
-	headCommitID, err := fsHelper.GetHeadCommitID(repoID)
-	if err != nil {
-		return fmt.Errorf("failed to get head commit: %w", err)
-	}
-
-	// Create new commit
-	commitDesc := fmt.Sprintf("Modified \"%s\" via OnlyOffice", filename)
-	newCommitID, err := fsHelper.CreateCommit(repoID, userID, newRootFSID, headCommitID, commitDesc)
-	if err != nil {
-		return fmt.Errorf("failed to create commit: %w", err)
-	}
-
-	// Update library head
-	if err := fsHelper.UpdateLibraryHead(orgID, repoID, newCommitID, headCommitID); err != nil {
-		return fmt.Errorf("failed to update library head: %w", err)
+		return err
 	}
 
 	if err := traffic.AdjustStorageCountersByDeltaSync(h.db, orgID, userID, repoID, storageDeltaBytes, storageDeltaFiles); err != nil {
@@ -1062,6 +974,95 @@ func (h *OnlyOfficeHandler) saveEditedDocument(ctx context.Context, repoID, file
 
 	log.Printf("OnlyOffice: saved document %s with block %s (internal: %s), new commit %s", filePath, externalBlockID[:16], internalBlockID[:16], newCommitID)
 	return nil
+}
+
+func (h *OnlyOfficeHandler) publishEditedDocumentMetadata(fsHelper *FSHelper, orgID, repoID, filePath, filename, userID string, originalFileSize int64, externalBlockID string) (int64, int64, string, error) {
+	var storageDeltaBytes int64
+	var storageDeltaFiles int64
+	var newCommitID string
+
+	err := retryLibraryHeadMutation("OnlyOffice", func() error {
+		result, snapshot, err := fsHelper.TraverseToPathAtHead(repoID, filePath)
+		if err != nil {
+			return fmt.Errorf("failed to traverse to path: %w", err)
+		}
+
+		var existingEntry *FSEntry
+		if existing := FindEntryInList(result.Entries, filename); existing != nil {
+			ent := *existing
+			existingEntry = &ent
+		}
+
+		currentDeltaBytes, currentDeltaFiles := onlyOfficeStorageDelta(existingEntry, originalFileSize)
+		if currentDeltaBytes > 0 {
+			if checker := traffic.GetChecker(); checker != nil {
+				if st, _ := checker.CheckStorageQuota(orgID, userID, currentDeltaBytes); !st.Allowed {
+					return ErrStorageQuotaExceeded
+				}
+			}
+		}
+
+		now := time.Now()
+		newFileFSID, err := fsHelper.CreateFileFSObject(repoID, filename, originalFileSize, []string{externalBlockID})
+		if err != nil {
+			return fmt.Errorf("failed to create file fs_object: %w", err)
+		}
+
+		updatedEntries := make([]FSEntry, 0, len(result.Entries))
+		fileUpdated := false
+		for _, entry := range result.Entries {
+			if entry.Name == filename {
+				entry.ID = newFileFSID
+				entry.Size = originalFileSize
+				entry.MTime = now.Unix()
+				entry.Modifier = userID + "@sesamefs.local"
+				fileUpdated = true
+			}
+			updatedEntries = append(updatedEntries, entry)
+		}
+
+		if !fileUpdated {
+			updatedEntries = append(updatedEntries, FSEntry{
+				ID:       newFileFSID,
+				Name:     filename,
+				Mode:     ModeFile,
+				MTime:    now.Unix(),
+				Size:     originalFileSize,
+				Modifier: userID + "@sesamefs.local",
+			})
+		}
+
+		newParentFSID, err := fsHelper.CreateDirectoryFSObject(repoID, updatedEntries)
+		if err != nil {
+			return fmt.Errorf("failed to create parent fs_object: %w", err)
+		}
+
+		newRootFSID, err := fsHelper.RebuildPathToRoot(repoID, result, newParentFSID)
+		if err != nil {
+			return fmt.Errorf("failed to rebuild path: %w", err)
+		}
+
+		commitDesc := fmt.Sprintf("Modified \"%s\" via OnlyOffice", filename)
+		commitID, err := fsHelper.CreateCommit(repoID, userID, newRootFSID, snapshot.HeadCommitID, commitDesc)
+		if err != nil {
+			return fmt.Errorf("failed to create commit: %w", err)
+		}
+
+		if err := fsHelper.UpdateLibraryHeadFromSnapshot(snapshot, repoID, commitID, snapshot.HeadCommitID); err != nil {
+			return fmt.Errorf("failed to update library head: %w", err)
+		}
+
+		storageDeltaBytes = currentDeltaBytes
+		storageDeltaFiles = currentDeltaFiles
+		newCommitID = commitID
+		log.Printf("OnlyOffice: published edited document %s via snapshot head %s", filePath, snapshot.HeadCommitID)
+		return nil
+	})
+	if err != nil {
+		return 0, 0, "", err
+	}
+
+	return storageDeltaBytes, storageDeltaFiles, newCommitID, nil
 }
 
 // generateFSID creates a unique FS object ID (SHA-1 hash of content)

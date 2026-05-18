@@ -711,64 +711,68 @@ func (h *FileHandler) RenameDirectory(c *gin.Context) {
 	}
 
 	fsHelper := NewFSHelper(h.db)
-
-	// Get current head commit
-	headCommitID, err := fsHelper.GetHeadCommitID(repoID)
-	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "library not found"})
-		return
-	}
-
-	// Traverse to the directory
-	result, err := fsHelper.TraverseToPath(repoID, dirPath)
-	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
-		return
-	}
-
-	if result.TargetEntry == nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "directory not found"})
-		return
-	}
-
 	oldName := path.Base(dirPath)
+	errDirectoryNotFound := errors.New("directory not found")
+	errNameExists := errors.New("name already exists")
+	var result *PathTraverseResult
+	var mtime int64
 
-	// Check if new name already exists
-	for _, entry := range result.Entries {
-		if entry.Name == newName {
-			c.JSON(http.StatusConflict, gin.H{"error": "name already exists"})
-			return
+	err := retryLibraryHeadMutation("RenameDirectory", func() error {
+		currentResult, snapshot, err := fsHelper.TraverseToPathAtHead(repoID, dirPath)
+		if err != nil {
+			return err
 		}
-	}
+		if currentResult.TargetEntry == nil {
+			return errDirectoryNotFound
+		}
 
-	// Update entry name
-	newEntries := UpdateEntryInList(result.Entries, oldName, newName)
+		for _, entry := range currentResult.Entries {
+			if entry.Name == newName {
+				return errNameExists
+			}
+		}
 
-	// Create new fs_object for modified parent
-	newParentFSID, err := fsHelper.CreateDirectoryFSObject(repoID, newEntries)
+		newEntries := UpdateEntryInList(currentResult.Entries, oldName, newName)
+		newParentFSID, err := fsHelper.CreateDirectoryFSObject(repoID, newEntries)
+		if err != nil {
+			return fmt.Errorf("failed to update directory: %w", err)
+		}
+
+		newRootFSID, err := fsHelper.RebuildPathToRoot(repoID, currentResult, newParentFSID)
+		if err != nil {
+			return fmt.Errorf("failed to rebuild path: %w", err)
+		}
+
+		description := fmt.Sprintf("Renamed \"%s\" to \"%s\"", oldName, newName)
+		commitID, err := fsHelper.CreateCommit(repoID, userID, newRootFSID, snapshot.HeadCommitID, description)
+		if err != nil {
+			return fmt.Errorf("failed to create commit: %w", err)
+		}
+
+		if err := fsHelper.UpdateLibraryHeadFromSnapshot(snapshot, repoID, commitID, snapshot.HeadCommitID); err != nil {
+			return err
+		}
+
+		for _, entry := range currentResult.Entries {
+			if entry.Name == oldName {
+				mtime = entry.MTime
+				break
+			}
+		}
+		result = currentResult
+		return nil
+	})
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update directory"})
-		return
-	}
-
-	// Rebuild path to root
-	newRootFSID, err := fsHelper.RebuildPathToRoot(repoID, result, newParentFSID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to rebuild path"})
-		return
-	}
-
-	// Create new commit
-	description := fmt.Sprintf("Renamed \"%s\" to \"%s\"", oldName, newName)
-	newCommitID, err := fsHelper.CreateCommit(repoID, userID, newRootFSID, headCommitID, description)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create commit"})
-		return
-	}
-
-	// Update library head
-	if err := fsHelper.UpdateLibraryHead(orgID, repoID, newCommitID, headCommitID); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update library"})
+		switch {
+		case errors.Is(err, errDirectoryNotFound):
+			c.JSON(http.StatusNotFound, gin.H{"error": "directory not found"})
+		case errors.Is(err, errNameExists):
+			c.JSON(http.StatusConflict, gin.H{"error": "name already exists"})
+		case errors.Is(err, ErrLibraryHeadConflict):
+			c.JSON(http.StatusConflict, gin.H{"error": "library was modified concurrently; retry the rename"})
+		default:
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to rename directory"})
+		}
 		return
 	}
 
@@ -780,15 +784,6 @@ func (h *FileHandler) RenameDirectory(c *gin.Context) {
 	parentDir := path.Dir(dirPath)
 	if parentDir == "" || parentDir == "." {
 		parentDir = "/"
-	}
-
-	// Get the renamed entry info
-	var mtime int64
-	for _, entry := range result.Entries {
-		if entry.Name == oldName {
-			mtime = entry.MTime
-			break
-		}
 	}
 
 	// Return Seafile-compatible response
@@ -902,64 +897,70 @@ func (h *FileHandler) RenameFile(c *gin.Context) {
 	}
 
 	fsHelper := NewFSHelper(h.db)
-
-	// Get current head commit
-	headCommitID, err := fsHelper.GetHeadCommitID(repoID)
-	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "library not found"})
-		return
-	}
-
-	// Traverse to the file
-	result, err := fsHelper.TraverseToPath(repoID, filePath)
-	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
-		return
-	}
-
-	if result.TargetEntry == nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "file not found"})
-		return
-	}
-
 	oldName := path.Base(filePath)
+	errFileNotFound := errors.New("file not found")
+	errNameExists := errors.New("name already exists")
+	var result *PathTraverseResult
+	var fileSize int64
+	var mtime int64
 
-	// Check if new name already exists
-	for _, entry := range result.Entries {
-		if entry.Name == newName {
-			c.JSON(http.StatusConflict, gin.H{"error": "name already exists"})
-			return
+	err := retryLibraryHeadMutation("RenameFile", func() error {
+		currentResult, snapshot, err := fsHelper.TraverseToPathAtHead(repoID, filePath)
+		if err != nil {
+			return err
 		}
-	}
+		if currentResult.TargetEntry == nil {
+			return errFileNotFound
+		}
 
-	// Update entry name
-	newEntries := UpdateEntryInList(result.Entries, oldName, newName)
+		for _, entry := range currentResult.Entries {
+			if entry.Name == newName {
+				return errNameExists
+			}
+		}
 
-	// Create new fs_object for modified parent
-	newParentFSID, err := fsHelper.CreateDirectoryFSObject(repoID, newEntries)
+		newEntries := UpdateEntryInList(currentResult.Entries, oldName, newName)
+		newParentFSID, err := fsHelper.CreateDirectoryFSObject(repoID, newEntries)
+		if err != nil {
+			return fmt.Errorf("failed to update directory: %w", err)
+		}
+
+		newRootFSID, err := fsHelper.RebuildPathToRoot(repoID, currentResult, newParentFSID)
+		if err != nil {
+			return fmt.Errorf("failed to rebuild path: %w", err)
+		}
+
+		description := fmt.Sprintf("Renamed \"%s\" to \"%s\"", oldName, newName)
+		commitID, err := fsHelper.CreateCommit(repoID, userID, newRootFSID, snapshot.HeadCommitID, description)
+		if err != nil {
+			return fmt.Errorf("failed to create commit: %w", err)
+		}
+
+		if err := fsHelper.UpdateLibraryHeadFromSnapshot(snapshot, repoID, commitID, snapshot.HeadCommitID); err != nil {
+			return err
+		}
+
+		for _, entry := range currentResult.Entries {
+			if entry.Name == oldName {
+				fileSize = entry.Size
+				mtime = entry.MTime
+				break
+			}
+		}
+		result = currentResult
+		return nil
+	})
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update directory"})
-		return
-	}
-
-	// Rebuild path to root
-	newRootFSID, err := fsHelper.RebuildPathToRoot(repoID, result, newParentFSID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to rebuild path"})
-		return
-	}
-
-	// Create new commit
-	description := fmt.Sprintf("Renamed \"%s\" to \"%s\"", oldName, newName)
-	newCommitID, err := fsHelper.CreateCommit(repoID, userID, newRootFSID, headCommitID, description)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create commit"})
-		return
-	}
-
-	// Update library head
-	if err := fsHelper.UpdateLibraryHead(orgID, repoID, newCommitID, headCommitID); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update library"})
+		switch {
+		case errors.Is(err, errFileNotFound):
+			c.JSON(http.StatusNotFound, gin.H{"error": "file not found"})
+		case errors.Is(err, errNameExists):
+			c.JSON(http.StatusConflict, gin.H{"error": "name already exists"})
+		case errors.Is(err, ErrLibraryHeadConflict):
+			c.JSON(http.StatusConflict, gin.H{"error": "library was modified concurrently; retry the rename"})
+		default:
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to rename file"})
+		}
 		return
 	}
 
@@ -971,17 +972,6 @@ func (h *FileHandler) RenameFile(c *gin.Context) {
 	parentDir := path.Dir(filePath)
 	if parentDir == "" || parentDir == "." {
 		parentDir = "/"
-	}
-
-	// Get the renamed entry info
-	var fileSize int64
-	var mtime int64
-	for _, entry := range result.Entries {
-		if entry.Name == oldName {
-			fileSize = entry.Size
-			mtime = entry.MTime
-			break
-		}
 	}
 
 	// Return Seafile-compatible response
@@ -1239,65 +1229,65 @@ func (h *FileHandler) DeleteDirectory(c *gin.Context) {
 	}
 
 	fsHelper := NewFSHelper(h.db)
-
-	// Get current head commit
-	headCommitID, err := fsHelper.GetHeadCommitID(repoID)
-	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "library not found"})
-		return
-	}
-
-	// Traverse to the directory
-	result, err := fsHelper.TraverseToPath(repoID, dirPath)
-	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
-		return
-	}
-
-	if result.TargetEntry == nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "directory not found"})
-		return
-	}
-
-	// Verify it's a directory
-	if result.TargetEntry.Mode != ModeDir && result.TargetEntry.Mode&0170000 != 040000 {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "path is not a directory"})
-		return
-	}
-
 	dirName := path.Base(dirPath)
+	errDirectoryNotFound := errors.New("directory not found")
+	errPathNotDirectory := errors.New("path is not a directory")
+	var blockIDs []string
+	var totalSize int64
+	var fileCount int64
+	var newCommitID string
 
-	// Collect all block IDs and total size in the directory tree (for ref count decrement + storage counters)
-	blockIDs, totalSize, fileCount, _ := fsHelper.collectDirStats(repoID, result.TargetFSID)
+	err := retryLibraryHeadMutation("DeleteDirectory", func() error {
+		result, snapshot, err := fsHelper.TraverseToPathAtHead(repoID, dirPath)
+		if err != nil {
+			return err
+		}
+		if result.TargetEntry == nil {
+			return errDirectoryNotFound
+		}
+		if result.TargetEntry.Mode != ModeDir && result.TargetEntry.Mode&0170000 != 040000 {
+			return errPathNotDirectory
+		}
 
-	// Remove entry from parent directory
-	newEntries := RemoveEntryFromList(result.Entries, dirName)
+		currentBlockIDs, currentTotalSize, currentFileCount, _ := fsHelper.collectDirStats(repoID, result.TargetFSID)
+		newEntries := RemoveEntryFromList(result.Entries, dirName)
+		newParentFSID, err := fsHelper.CreateDirectoryFSObject(repoID, newEntries)
+		if err != nil {
+			return fmt.Errorf("failed to update directory: %w", err)
+		}
 
-	// Create new fs_object for modified parent
-	newParentFSID, err := fsHelper.CreateDirectoryFSObject(repoID, newEntries)
+		newRootFSID, err := fsHelper.RebuildPathToRoot(repoID, result, newParentFSID)
+		if err != nil {
+			return fmt.Errorf("failed to rebuild path: %w", err)
+		}
+
+		description := fmt.Sprintf("Removed directory \"%s\"", dirName)
+		commitID, err := fsHelper.CreateCommit(repoID, userID, newRootFSID, snapshot.HeadCommitID, description)
+		if err != nil {
+			return fmt.Errorf("failed to create commit: %w", err)
+		}
+
+		if err := fsHelper.UpdateLibraryHeadFromSnapshot(snapshot, repoID, commitID, snapshot.HeadCommitID); err != nil {
+			return err
+		}
+
+		blockIDs = currentBlockIDs
+		totalSize = currentTotalSize
+		fileCount = currentFileCount
+		newCommitID = commitID
+		return nil
+	})
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update directory"})
-		return
-	}
-
-	// Rebuild path to root
-	newRootFSID, err := fsHelper.RebuildPathToRoot(repoID, result, newParentFSID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to rebuild path"})
-		return
-	}
-
-	// Create new commit
-	description := fmt.Sprintf("Removed directory \"%s\"", dirName)
-	newCommitID, err := fsHelper.CreateCommit(repoID, userID, newRootFSID, headCommitID, description)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create commit"})
-		return
-	}
-
-	// Update library head
-	if err := fsHelper.UpdateLibraryHead(orgID, repoID, newCommitID, headCommitID); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update library"})
+		switch {
+		case errors.Is(err, errDirectoryNotFound):
+			c.JSON(http.StatusNotFound, gin.H{"error": "directory not found"})
+		case errors.Is(err, errPathNotDirectory):
+			c.JSON(http.StatusBadRequest, gin.H{"error": "path is not a directory"})
+		case errors.Is(err, ErrLibraryHeadConflict):
+			c.JSON(http.StatusConflict, gin.H{"error": "library was modified concurrently; retry the delete"})
+		default:
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete directory"})
+		}
 		return
 	}
 
@@ -1868,62 +1858,60 @@ func (h *FileHandler) DeleteFile(c *gin.Context) {
 	}
 
 	fsHelper := NewFSHelper(h.db)
-
-	// Get current head commit
-	headCommitID, err := fsHelper.GetHeadCommitID(repoID)
-	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "library not found"})
-		return
-	}
-
-	// Traverse to the file's parent
-	result, err := fsHelper.TraverseToPath(repoID, filePath)
-	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
-		return
-	}
-
-	if result.TargetEntry == nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "file not found"})
-		return
-	}
-
-	// Verify it's a file, not a directory
-	if result.TargetEntry.Mode == ModeDir || result.TargetEntry.Mode&0170000 == 040000 {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "path is a directory, use DELETE /dir/ instead"})
-		return
-	}
-
 	fileName := path.Base(filePath)
+	errFileNotFound := errors.New("file not found")
+	errPathIsDirectory := errors.New("path is a directory")
+	var result *PathTraverseResult
+	var newCommitID string
 
-	// Remove entry from parent directory
-	newEntries := RemoveEntryFromList(result.Entries, fileName)
+	err := retryLibraryHeadMutation("DeleteFile", func() error {
+		currentResult, snapshot, err := fsHelper.TraverseToPathAtHead(repoID, filePath)
+		if err != nil {
+			return err
+		}
+		if currentResult.TargetEntry == nil {
+			return errFileNotFound
+		}
+		if currentResult.TargetEntry.Mode == ModeDir || currentResult.TargetEntry.Mode&0170000 == 040000 {
+			return errPathIsDirectory
+		}
 
-	// Create new fs_object for modified parent
-	newParentFSID, err := fsHelper.CreateDirectoryFSObject(repoID, newEntries)
+		newEntries := RemoveEntryFromList(currentResult.Entries, fileName)
+		newParentFSID, err := fsHelper.CreateDirectoryFSObject(repoID, newEntries)
+		if err != nil {
+			return fmt.Errorf("failed to update directory: %w", err)
+		}
+
+		newRootFSID, err := fsHelper.RebuildPathToRoot(repoID, currentResult, newParentFSID)
+		if err != nil {
+			return fmt.Errorf("failed to rebuild path: %w", err)
+		}
+
+		description := fmt.Sprintf("Deleted \"%s\"", fileName)
+		commitID, err := fsHelper.CreateCommit(repoID, userID, newRootFSID, snapshot.HeadCommitID, description)
+		if err != nil {
+			return fmt.Errorf("failed to create commit: %w", err)
+		}
+
+		if err := fsHelper.UpdateLibraryHeadFromSnapshot(snapshot, repoID, commitID, snapshot.HeadCommitID); err != nil {
+			return err
+		}
+
+		result = currentResult
+		newCommitID = commitID
+		return nil
+	})
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update directory"})
-		return
-	}
-
-	// Rebuild path to root
-	newRootFSID, err := fsHelper.RebuildPathToRoot(repoID, result, newParentFSID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to rebuild path"})
-		return
-	}
-
-	// Create new commit
-	description := fmt.Sprintf("Deleted \"%s\"", fileName)
-	newCommitID, err := fsHelper.CreateCommit(repoID, userID, newRootFSID, headCommitID, description)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create commit"})
-		return
-	}
-
-	// Update library head
-	if err := fsHelper.UpdateLibraryHead(orgID, repoID, newCommitID, headCommitID); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update library"})
+		switch {
+		case errors.Is(err, errFileNotFound):
+			c.JSON(http.StatusNotFound, gin.H{"error": "file not found"})
+		case errors.Is(err, errPathIsDirectory):
+			c.JSON(http.StatusBadRequest, gin.H{"error": "path is a directory, use DELETE /dir/ instead"})
+		case errors.Is(err, ErrLibraryHeadConflict):
+			c.JSON(http.StatusConflict, gin.H{"error": "library was modified concurrently; retry the delete"})
+		default:
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete file"})
+		}
 		return
 	}
 
@@ -2096,190 +2084,42 @@ func (h *FileHandler) MoveFile(c *gin.Context) {
 	}
 
 	fsHelper := NewFSHelper(h.db)
-
-	// Get current head commit
-	headCommitID, err := fsHelper.GetHeadCommitID(repoID)
-	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "library not found"})
-		return
-	}
-
-	// Traverse to source file
-	srcResult, err := fsHelper.TraverseToPath(repoID, srcPath)
+	fileName := path.Base(srcPath)
+	sourceResult, err := fsHelper.TraverseToPath(repoID, srcPath)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "source not found: " + err.Error()})
 		return
 	}
-	if srcResult.TargetEntry == nil {
+	if sourceResult == nil || sourceResult.TargetEntry == nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "source file not found"})
 		return
 	}
+	sourceEntryID := sourceResult.TargetEntry.ID
 
-	// Get destination directory
-	dstResult, err := fsHelper.TraverseToPath(repoID, dstDir)
-	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "destination not found: " + err.Error()})
+	batchHandler := NewBatchOperationHandler(h.db, h.config)
+	if err := batchHandler.processSingleItem(orgID, userID, srcRepoID, dstRepoID, srcPath, dstDir, "move", fsHelper, req.ConflictPolicy); err != nil {
+		writeMoveFileError(c, err, srcPath)
 		return
 	}
 
-	// Get entries OF the destination directory (not its parent)
-	dstDirEntries, err := fsHelper.GetDirectoryEntries(repoID, dstResult.TargetFSID)
-	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "destination directory not found: " + err.Error()})
-		return
-	}
-
-	fileName := path.Base(srcPath)
-
-	// Check if name already exists at destination
-	hasConflict := FindEntryInList(dstDirEntries, fileName) != nil
-	if hasConflict {
-		switch req.ConflictPolicy {
-		case "replace":
-			dstDirEntries = RemoveEntryFromList(dstDirEntries, fileName)
-		case "autorename":
-			fileName = GenerateUniqueName(dstDirEntries, fileName)
-		case "skip":
-			c.JSON(http.StatusOK, gin.H{
-				"repo_id":    dstRepoID,
-				"parent_dir": dstDir,
-				"obj_name":   fileName,
-			})
-			return
-		default:
-			c.JSON(http.StatusConflict, gin.H{
-				"error":             "conflict",
-				"conflicting_items": []string{path.Base(srcPath)},
-			})
-			return
-		}
-	}
-
-	// Step 1: Remove from source parent
-	srcParentEntries := RemoveEntryFromList(srcResult.Entries, path.Base(srcPath))
-	newSrcParentFSID, err := fsHelper.CreateDirectoryFSObject(repoID, srcParentEntries)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update source directory"})
-		return
-	}
-
-	// Step 2: Add to destination directory
-	movedEntry := *srcResult.TargetEntry
-	movedEntry.Name = fileName // may be renamed by autorename
-	movedEntry.MTime = time.Now().Unix()
-	dstNewEntries := AddEntryToList(dstDirEntries, movedEntry)
-
-	// Step 3: Create the new destination fs_object
-	newDstFSID, err := fsHelper.CreateDirectoryFSObject(repoID, dstNewEntries)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update destination directory"})
-		return
-	}
-
-	// Step 4: Apply both changes and rebuild paths to root
-	// We have two changes:
-	// 1. Source parent: file removed (newSrcParentFSID)
-	// 2. Destination directory: file added (newDstFSID)
-
-	// For simplicity, apply source change first, then destination change
-	var newRootFSID string
-
-	if srcResult.ParentPath == "/" && dstDir == "/" {
-		// Both source and destination are root - shouldn't happen in move
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid move within root"})
-		return
-	} else if srcResult.ParentPath == "/" {
-		// Source is root, destination is subdirectory
-		// Start with source change (root = newSrcParentFSID)
-		// Then update destination path
-		// Find dstDir in the new root and update it
-		srcRootEntries, err := fsHelper.GetDirectoryEntries(repoID, newSrcParentFSID)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to get source root entries"})
-			return
-		}
-		// Update the destination directory reference in root
-		dstDirName := strings.TrimPrefix(dstDir, "/")
-		dstDirParts := strings.Split(dstDirName, "/")
-		dstTopLevelName := dstDirParts[0]
-		for i := range srcRootEntries {
-			if srcRootEntries[i].Name == dstTopLevelName {
-				if len(dstDirParts) == 1 {
-					// dstDir is a top-level directory
-					srcRootEntries[i].ID = newDstFSID
-				}
-				// TODO: Handle nested destination directories
-				break
+	if snapshot, err := fsHelper.GetLibraryHeadSnapshot(repoID); err == nil {
+		if dstResult, err := fsHelper.TraverseToPathFromSnapshot(repoID, snapshot, dstDir); err == nil {
+			var dstEntries []FSEntry
+			if dstDir == "/" {
+				dstEntries = dstResult.Entries
+			} else if dstResult.TargetFSID != "" {
+				dstEntries, err = fsHelper.GetDirectoryEntries(repoID, dstResult.TargetFSID)
 			}
-		}
-		newRootFSID, err = fsHelper.CreateDirectoryFSObject(repoID, srcRootEntries)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update root"})
-			return
-		}
-	} else if dstDir == "/" {
-		// Destination is root - add moved entry to root after applying source change
-		newRootFSID, err = fsHelper.RebuildPathToRoot(repoID, srcResult, newSrcParentFSID)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to rebuild source path"})
-			return
-		}
-		rootEntries, err := fsHelper.GetDirectoryEntries(repoID, newRootFSID)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to get root entries"})
-			return
-		}
-		rootEntries = AddEntryToList(rootEntries, movedEntry)
-		newRootFSID, err = fsHelper.CreateDirectoryFSObject(repoID, rootEntries)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update root"})
-			return
-		}
-	} else {
-		// Both are subdirectories - apply source change first
-		newRootFSID, err = fsHelper.RebuildPathToRoot(repoID, srcResult, newSrcParentFSID)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to rebuild source path"})
-			return
-		}
-		// Re-traverse to destination and update it with the new fs_id
-		// Note: This is a simplified approach - for deeply nested paths we would need
-		// a more sophisticated tree update algorithm
-		dstResult2, err := fsHelper.TraverseToPath(repoID, dstDir)
-		if err == nil {
-			// Update the parent's reference to point to new destination
-			dstDirName := path.Base(dstDir)
-			parentEntries := make([]FSEntry, len(dstResult2.Entries))
-			copy(parentEntries, dstResult2.Entries)
-			for i := range parentEntries {
-				if parentEntries[i].Name == dstDirName {
-					parentEntries[i].ID = newDstFSID
-					break
-				}
-			}
-			newParentFSID, err := fsHelper.CreateDirectoryFSObject(repoID, parentEntries)
 			if err == nil {
-				newRootFSID, _ = fsHelper.RebuildPathToRoot(repoID, dstResult2, newParentFSID)
+				for _, entry := range dstEntries {
+					if entry.ID == sourceEntryID {
+						fileName = entry.Name
+						break
+					}
+				}
 			}
 		}
 	}
-
-	// Create new commit
-	description := fmt.Sprintf("Moved \"%s\" to \"%s\"", fileName, dstDir)
-	newCommitID, err := fsHelper.CreateCommit(repoID, userID, newRootFSID, headCommitID, description)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create commit"})
-		return
-	}
-
-	// Update library head
-	if err := fsHelper.UpdateLibraryHead(orgID, repoID, newCommitID, headCommitID); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update library"})
-		return
-	}
-
-	// Clean up file tags for the moved file at its old path (async, non-blocking)
-	go h.cleanupFileTagsForPath(repoID, srcPath)
 
 	// Return Seafile-compatible response
 	// Seafile returns HTTP 301 for moves but we use 200 for API compatibility
@@ -2288,6 +2128,29 @@ func (h *FileHandler) MoveFile(c *gin.Context) {
 		"parent_dir": dstDir,
 		"obj_name":   fileName,
 	})
+}
+
+func writeMoveFileError(c *gin.Context, err error, srcPath string) {
+	switch {
+	case errors.Is(err, ErrLibraryHeadConflict):
+		c.JSON(http.StatusConflict, gin.H{"error": "library was modified concurrently; retry the move"})
+	case errors.Is(err, ErrBatchSourceNotFound):
+		c.JSON(http.StatusNotFound, gin.H{"error": "source file not found"})
+	case errors.Is(err, ErrBatchDestinationNotFound):
+		c.JSON(http.StatusNotFound, gin.H{"error": "destination directory not found"})
+	case errors.Is(err, ErrStorageQuotaExceeded):
+		c.JSON(http.StatusForbidden, gin.H{"error": "storage quota exceeded"})
+	default:
+		var conflictErr *ConflictError
+		if errors.As(err, &conflictErr) {
+			c.JSON(http.StatusConflict, gin.H{
+				"error":             "conflict",
+				"conflicting_items": []string{path.Base(srcPath)},
+			})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to move file"})
+	}
 }
 
 // moveBatchFiles handles moving multiple files in a single operation

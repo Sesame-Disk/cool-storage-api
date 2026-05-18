@@ -1,9 +1,76 @@
 package v2
 
 import (
+	"errors"
 	"path"
 	"testing"
 )
+
+func TestLibraryHeadSnapshotValidateExpectedHeadRejectsMismatch(t *testing.T) {
+	snapshot := &LibraryHeadSnapshot{HeadCommitID: "head-a"}
+
+	if err := snapshot.ValidateExpectedHead("head-a"); err != nil {
+		t.Fatalf("ValidateExpectedHead(same) error = %v, want nil", err)
+	}
+
+	if err := snapshot.ValidateExpectedHead("head-b"); err == nil {
+		t.Fatal("ValidateExpectedHead(mismatch) error = nil, want mismatch error")
+	}
+}
+
+func TestUpdateLibraryHeadFromSnapshotRejectsMismatchedExpectedHead(t *testing.T) {
+	helper := &FSHelper{}
+	snapshot := &LibraryHeadSnapshot{OrgID: "org-a", HeadCommitID: "head-a"}
+
+	err := helper.UpdateLibraryHeadFromSnapshot(snapshot, "repo-a", "commit-a", "head-b")
+	if err == nil {
+		t.Fatal("UpdateLibraryHeadFromSnapshot(mismatch) error = nil, want mismatch error")
+	}
+}
+
+func TestRetryLibraryHeadMutationRetriesConflicts(t *testing.T) {
+	previousDelay := libraryHeadMutationRetryDelay
+	libraryHeadMutationRetryDelay = 0
+	defer func() {
+		libraryHeadMutationRetryDelay = previousDelay
+	}()
+
+	attempts := 0
+	err := retryLibraryHeadMutation("test", func() error {
+		attempts++
+		if attempts < 3 {
+			return ErrLibraryHeadConflict
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("retryLibraryHeadMutation() error = %v, want nil", err)
+	}
+	if attempts != 3 {
+		t.Fatalf("retryLibraryHeadMutation() attempts = %d, want 3", attempts)
+	}
+}
+
+func TestRetryLibraryHeadMutationStopsOnNonConflict(t *testing.T) {
+	previousDelay := libraryHeadMutationRetryDelay
+	libraryHeadMutationRetryDelay = 0
+	defer func() {
+		libraryHeadMutationRetryDelay = previousDelay
+	}()
+
+	wantErr := errors.New("boom")
+	attempts := 0
+	err := retryLibraryHeadMutation("test", func() error {
+		attempts++
+		return wantErr
+	})
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("retryLibraryHeadMutation() error = %v, want %v", err, wantErr)
+	}
+	if attempts != 1 {
+		t.Fatalf("retryLibraryHeadMutation() attempts = %d, want 1", attempts)
+	}
+}
 
 // Test normalizePath function (additional cases)
 func TestNormalizePath_Additional(t *testing.T) {
@@ -466,9 +533,9 @@ func TestRebuildPathToRoot_AlgorithmLogic_FiveAncestors(t *testing.T) {
 		ancestorFSID string
 		currentName  string
 	}{
-		{"d3_fsid", "d4"}, // In d3's entries, update "d4" to new_d4
-		{"d2_fsid", "d3"}, // In d2's entries, update "d3" to new_d3
-		{"d1_fsid", "d2"}, // In d1's entries, update "d2" to new_d2
+		{"d3_fsid", "d4"},   // In d3's entries, update "d4" to new_d4
+		{"d2_fsid", "d3"},   // In d2's entries, update "d3" to new_d3
+		{"d1_fsid", "d2"},   // In d1's entries, update "d2" to new_d2
 		{"root_fsid", "d1"}, // In root's entries, update "d1" to new_d1
 	}
 
@@ -492,11 +559,11 @@ func TestRebuildPathToRoot_AlgorithmLogic_FiveAncestors(t *testing.T) {
 // using the original result with RebuildPathToRoot.
 func TestRebuildPathToRoot_CreateDirectory_Pattern(t *testing.T) {
 	tests := []struct {
-		name            string
-		parentPath      string // Path of directory being created's parent
-		ancestorCount   int    // Expected number of ancestors from TraverseToPath(parentPath)
-		loopIterations  int    // Expected RebuildPathToRoot loop iterations
-		description     string
+		name           string
+		parentPath     string // Path of directory being created's parent
+		ancestorCount  int    // Expected number of ancestors from TraverseToPath(parentPath)
+		loopIterations int    // Expected RebuildPathToRoot loop iterations
+		description    string
 	}{
 		{
 			name:           "depth 1: create /newdir",

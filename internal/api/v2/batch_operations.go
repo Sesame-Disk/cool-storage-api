@@ -1,6 +1,7 @@
 package v2
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -50,6 +51,10 @@ type ConflictError struct {
 func (e *ConflictError) Error() string {
 	return fmt.Sprintf("item with name '%s' already exists in destination", e.ItemName)
 }
+
+var ErrBatchSourceNotFound = errors.New("batch source item not found")
+
+var ErrBatchDestinationNotFound = errors.New("batch destination not found")
 
 // Global task store
 var globalTaskStore = &TaskStore{
@@ -330,203 +335,182 @@ func (h *BatchOperationHandler) processSingleItem(orgID, userID, srcRepoID, dstR
 	log.Printf("[processSingleItem] %s: src_repo=%s src_path=%s dst_repo=%s dst_dir=%s",
 		opType, srcRepoID, srcPath, dstRepoID, dstDir)
 
-	// Get source head commit
-	srcHeadCommitID, err := fsHelper.GetHeadCommitID(srcRepoID)
-	if err != nil {
-		return fmt.Errorf("source library not found: %w", err)
-	}
-
-	// Traverse to source item
-	srcResult, err := fsHelper.TraverseToPath(srcRepoID, srcPath)
-	if err != nil {
-		return fmt.Errorf("source path not found: %w", err)
-	}
-
-	if srcResult.TargetEntry == nil {
-		return fmt.Errorf("source item not found")
-	}
-
 	itemName := path.Base(srcPath)
 	originalItemName := itemName // Preserve for source removal in move+autorename
 	srcParentPath := path.Dir(srcPath)
 	if srcParentPath == "." {
 		srcParentPath = "/"
 	}
+	var srcSize int64
+	var srcFiles int64
+	skipped := false
 
-	// Get destination head commit
-	dstHeadCommitID, err := fsHelper.GetHeadCommitID(dstRepoID)
-	if err != nil {
-		return fmt.Errorf("destination library not found: %w", err)
-	}
+	err := retryLibraryHeadMutation("BatchOperationDestination", func() error {
+		currentItemName := path.Base(srcPath)
 
-	// Traverse to destination directory
-	dstResult, err := fsHelper.TraverseToPath(dstRepoID, dstDir)
-	if err != nil {
-		return fmt.Errorf("destination path not found: %w", err)
-	}
-
-	// Get the actual entries inside the destination directory
-	// Note: dstResult.Entries contains the PARENT's entries, not the destination folder's contents
-	var dstEntries []FSEntry
-	if dstDir == "/" {
-		// If destination is root, dstResult.Entries is already the root's contents
-		dstEntries = dstResult.Entries
-	} else {
-		// Otherwise, get the contents of the destination directory
-		if dstResult.TargetFSID == "" {
-			return fmt.Errorf("destination directory not found")
-		}
-		dstEntries, err = fsHelper.GetDirectoryEntries(dstRepoID, dstResult.TargetFSID)
+		srcSnapshot, err := fsHelper.GetLibraryHeadSnapshot(srcRepoID)
 		if err != nil {
-			return fmt.Errorf("failed to read destination directory: %w", err)
+			return fmt.Errorf("source library not found: %w", err)
 		}
-	}
 
-	// Check if item with same name exists in destination
-	hasConflict := false
-	for _, entry := range dstEntries {
-		if entry.Name == itemName {
-			hasConflict = true
-			break
+		srcResult, err := fsHelper.TraverseToPathFromSnapshot(srcRepoID, srcSnapshot, srcPath)
+		if err != nil {
+			return fmt.Errorf("%w: %v", ErrBatchSourceNotFound, err)
 		}
-	}
+		if srcResult.TargetEntry == nil {
+			return ErrBatchSourceNotFound
+		}
 
-	var replacedEntry *FSEntry
-	if hasConflict {
-		switch policy {
-		case "replace":
-			// Remove existing entry before adding
-			for i := range dstEntries {
-				if dstEntries[i].Name == itemName {
-					ent := dstEntries[i]
-					replacedEntry = &ent
-					break
+		dstSnapshot, err := fsHelper.GetLibraryHeadSnapshot(dstRepoID)
+		if err != nil {
+			return fmt.Errorf("destination library not found: %w", err)
+		}
+
+		dstResult, err := fsHelper.TraverseToPathFromSnapshot(dstRepoID, dstSnapshot, dstDir)
+		if err != nil {
+			return fmt.Errorf("%w: %v", ErrBatchDestinationNotFound, err)
+		}
+
+		var dstEntries []FSEntry
+		if dstDir == "/" {
+			dstEntries = dstResult.Entries
+		} else {
+			if dstResult.TargetFSID == "" {
+				return ErrBatchDestinationNotFound
+			}
+			dstEntries, err = fsHelper.GetDirectoryEntries(dstRepoID, dstResult.TargetFSID)
+			if err != nil {
+				return fmt.Errorf("failed to read destination directory: %w", err)
+			}
+		}
+
+		var replacedEntry *FSEntry
+		if existing := FindEntryInList(dstEntries, currentItemName); existing != nil {
+			switch policy {
+			case "replace":
+				ent := *existing
+				replacedEntry = &ent
+				dstEntries = RemoveEntryFromList(dstEntries, currentItemName)
+			case "autorename":
+				currentItemName = GenerateUniqueName(dstEntries, currentItemName)
+			case "skip":
+				skipped = true
+				return nil
+			default:
+				return &ConflictError{ItemName: currentItemName}
+			}
+		}
+
+		currentSrcSize, currentSrcFiles, err := fsEntryStats(fsHelper, srcRepoID, *srcResult.TargetEntry)
+		if err != nil {
+			return fmt.Errorf("failed to compute source size: %w", err)
+		}
+
+		var oldDstSize, oldDstFiles int64
+		if replacedEntry != nil {
+			oldDstSize, oldDstFiles, err = fsEntryStats(fsHelper, dstRepoID, *replacedEntry)
+			if err != nil {
+				return fmt.Errorf("failed to compute replaced entry size: %w", err)
+			}
+		}
+
+		dstDeltaBytes := currentSrcSize - oldDstSize
+		dstDeltaFiles := currentSrcFiles - oldDstFiles
+		quotaDeltaBytes := dstDeltaBytes
+		if opType == "move" {
+			quotaDeltaBytes -= currentSrcSize
+		}
+		if quotaDeltaBytes > 0 {
+			if checker := traffic.GetChecker(); checker != nil {
+				if st, _ := checker.CheckStorageQuota(orgID, userID, quotaDeltaBytes); !st.Allowed {
+					return ErrStorageQuotaExceeded
 				}
 			}
-			dstEntries = RemoveEntryFromList(dstEntries, itemName)
-		case "autorename":
-			// Generate unique name
-			itemName = GenerateUniqueName(dstEntries, itemName)
-		case "skip":
-			// Silently skip this item
-			return nil
-		default:
-			return &ConflictError{ItemName: itemName}
 		}
-	}
 
-	// Storage quota pre-check for the destination side. Copy is additive; move is
-	// checked against the net org/user growth after the source tree is removed.
-	// Cross-repo move within the same org/user is therefore usually 0 or
-	// negative, while per-library counters still apply both halves below.
-	srcSize, srcFiles, err := fsEntryStats(fsHelper, srcRepoID, *srcResult.TargetEntry)
-	if err != nil {
-		return fmt.Errorf("failed to compute source size: %w", err)
-	}
-	var oldDstSize, oldDstFiles int64
-	if replacedEntry != nil {
-		oldDstSize, oldDstFiles, err = fsEntryStats(fsHelper, dstRepoID, *replacedEntry)
-		if err != nil {
-			return fmt.Errorf("failed to compute replaced entry size: %w", err)
+		entryFSID := srcResult.TargetEntry.ID
+		if srcRepoID != dstRepoID {
+			newFSID, err := fsHelper.CopyFSObjectToLibrary(srcRepoID, dstRepoID, srcResult.TargetEntry.ID)
+			if err != nil {
+				return fmt.Errorf("failed to copy fs_objects to destination library: %w", err)
+			}
+			entryFSID = newFSID
 		}
-	}
-	dstDeltaBytes := srcSize - oldDstSize
-	dstDeltaFiles := srcFiles - oldDstFiles
-	quotaDeltaBytes := dstDeltaBytes
-	if opType == "move" {
-		quotaDeltaBytes -= srcSize
-	}
-	if quotaDeltaBytes > 0 {
-		if checker := traffic.GetChecker(); checker != nil {
-			if st, _ := checker.CheckStorageQuota(orgID, userID, quotaDeltaBytes); !st.Allowed {
-				return fmt.Errorf("storage quota exceeded")
+
+		newEntry := FSEntry{
+			Name:  currentItemName,
+			ID:    entryFSID,
+			Mode:  srcResult.TargetEntry.Mode,
+			MTime: time.Now().Unix(),
+			Size:  srcResult.TargetEntry.Size,
+		}
+		newDstEntries := AddEntryToList(dstEntries, newEntry)
+
+		newDstDirFSID, err := fsHelper.CreateDirectoryFSObject(dstRepoID, newDstEntries)
+		if err != nil {
+			return fmt.Errorf("failed to update destination directory: %w", err)
+		}
+
+		var newDstRootFSID string
+		if dstDir == "/" {
+			newDstRootFSID = newDstDirFSID
+		} else {
+			dstDirName := path.Base(dstDir)
+			updatedParentEntries := make([]FSEntry, len(dstResult.Entries))
+			for i, entry := range dstResult.Entries {
+				if entry.Name == dstDirName {
+					entry.ID = newDstDirFSID
+				}
+				updatedParentEntries[i] = entry
+			}
+
+			newParentFSID, err := fsHelper.CreateDirectoryFSObject(dstRepoID, updatedParentEntries)
+			if err != nil {
+				return fmt.Errorf("failed to update destination parent: %w", err)
+			}
+
+			newDstRootFSID, err = fsHelper.RebuildPathToRoot(dstRepoID, dstResult, newParentFSID)
+			if err != nil {
+				return fmt.Errorf("failed to rebuild destination path: %w", err)
 			}
 		}
-	}
 
-	// For cross-library operations, we need to copy fs_objects to the destination library
-	// because fs_objects are keyed by (library_id, fs_id)
-	entryFSID := srcResult.TargetEntry.ID
-	if srcRepoID != dstRepoID {
-		newFSID, err := fsHelper.CopyFSObjectToLibrary(srcRepoID, dstRepoID, srcResult.TargetEntry.ID)
+		var dstDescription string
+		if opType == "copy" {
+			dstDescription = fmt.Sprintf("Copied \"%s\"", currentItemName)
+		} else {
+			dstDescription = fmt.Sprintf("Moved \"%s\"", currentItemName)
+		}
+
+		newDstCommitID, err := fsHelper.CreateCommit(dstRepoID, userID, newDstRootFSID, dstSnapshot.HeadCommitID, dstDescription)
 		if err != nil {
-			return fmt.Errorf("failed to copy fs_objects to destination library: %w", err)
-		}
-		entryFSID = newFSID
-	}
-
-	// Add source entry to destination
-	newEntry := FSEntry{
-		Name:  itemName,
-		ID:    entryFSID,
-		Mode:  srcResult.TargetEntry.Mode,
-		MTime: time.Now().Unix(),
-		Size:  srcResult.TargetEntry.Size,
-	}
-	newDstEntries := AddEntryToList(dstEntries, newEntry)
-
-	// Create new fs_object for the destination directory with new contents
-	newDstDirFSID, err := fsHelper.CreateDirectoryFSObject(dstRepoID, newDstEntries)
-	if err != nil {
-		return fmt.Errorf("failed to update destination directory: %w", err)
-	}
-
-	// Rebuild path to root for destination
-	var newDstRootFSID string
-	if dstDir == "/" {
-		// Destination is root - the new fs_id IS the new root
-		newDstRootFSID = newDstDirFSID
-	} else {
-		// Destination is a subdirectory - need to update parent to point to new destination fs_id
-		// dstResult.Entries contains the parent's entries (which includes the dest folder)
-		dstDirName := path.Base(dstDir)
-		updatedParentEntries := make([]FSEntry, len(dstResult.Entries))
-		for i, entry := range dstResult.Entries {
-			if entry.Name == dstDirName {
-				entry.ID = newDstDirFSID // Update to point to new destination directory
-			}
-			updatedParentEntries[i] = entry
+			return fmt.Errorf("failed to create destination commit: %w", err)
 		}
 
-		// Create new fs_object for the parent directory
-		newParentFSID, err := fsHelper.CreateDirectoryFSObject(dstRepoID, updatedParentEntries)
+		pinnedBlockIDs, err := pinCopiedTreeBlockRefs(fsHelper, orgID, dstRepoID, entryFSID)
 		if err != nil {
-			return fmt.Errorf("failed to update destination parent: %w", err)
+			return fmt.Errorf("failed to increment block ref counts for cross-library %s: %w", opType, err)
 		}
 
-		// Rebuild from parent to root using the original traversal result
-		newDstRootFSID, err = fsHelper.RebuildPathToRoot(dstRepoID, dstResult, newParentFSID)
-		if err != nil {
-			return fmt.Errorf("failed to rebuild destination path: %w", err)
+		if err := fsHelper.UpdateLibraryHeadFromSnapshot(dstSnapshot, dstRepoID, newDstCommitID, dstSnapshot.HeadCommitID); err != nil {
+			rollbackCopiedTreeBlockRefs(fsHelper, orgID, opType+"-rollback:"+newDstCommitID, pinnedBlockIDs)
+			return fmt.Errorf("failed to update destination library: %w", err)
 		}
-	}
 
-	// Create commit for destination
-	var dstDescription string
-	if opType == "copy" {
-		dstDescription = fmt.Sprintf("Copied \"%s\"", itemName)
-	} else {
-		dstDescription = fmt.Sprintf("Moved \"%s\"", itemName)
-	}
+		if err := traffic.AdjustStorageCountersByDeltaSync(h.db, orgID, userID, dstRepoID, dstDeltaBytes, dstDeltaFiles); err != nil {
+			log.Printf("[processSingleItem] failed to apply destination storage counter delta for %s -> %s/%s: %v", srcPath, dstRepoID, dstDir, err)
+		}
 
-	newDstCommitID, err := fsHelper.CreateCommit(dstRepoID, userID, newDstRootFSID, dstHeadCommitID, dstDescription)
+		itemName = currentItemName
+		srcSize = currentSrcSize
+		srcFiles = currentSrcFiles
+		return nil
+	})
 	if err != nil {
-		return fmt.Errorf("failed to create destination commit: %w", err)
+		return err
 	}
-
-	pinnedBlockIDs, err := pinCopiedTreeBlockRefs(fsHelper, orgID, dstRepoID, entryFSID)
-	if err != nil {
-		return fmt.Errorf("failed to increment block ref counts for cross-library %s: %w", opType, err)
-	}
-
-	// Update destination library head
-	if err := fsHelper.UpdateLibraryHead(orgID, dstRepoID, newDstCommitID, dstHeadCommitID); err != nil {
-		rollbackCopiedTreeBlockRefs(fsHelper, orgID, opType+"-rollback:"+newDstCommitID, pinnedBlockIDs)
-		return fmt.Errorf("failed to update destination library: %w", err)
-	}
-
-	if err := traffic.AdjustStorageCountersByDeltaSync(h.db, orgID, userID, dstRepoID, dstDeltaBytes, dstDeltaFiles); err != nil {
-		log.Printf("[processSingleItem] failed to apply destination storage counter delta for %s -> %s/%s: %v", srcPath, dstRepoID, dstDir, err)
+	if skipped {
+		return nil
 	}
 
 	// For move operation, remove from source
@@ -536,84 +520,78 @@ func (h *BatchOperationHandler) processSingleItem(orgID, userID, srcRepoID, dstR
 			return nil
 		}
 
-		// Get fresh source state (might have changed)
-		srcResult, err = fsHelper.TraverseToPath(srcRepoID, srcPath)
-		if err != nil {
-			// Already moved, that's fine
-			return nil
-		}
-
-		// Re-traverse to get parent path result
-		srcParentResult, err := fsHelper.TraverseToPath(srcRepoID, srcParentPath)
-		if err != nil {
-			return fmt.Errorf("failed to traverse source parent: %w", err)
-		}
-
-		// Get the actual entries inside the source parent directory
-		var srcParentEntries []FSEntry
-		if srcParentPath == "/" {
-			srcParentEntries = srcParentResult.Entries
-		} else {
-			if srcParentResult.TargetFSID == "" {
-				return fmt.Errorf("source parent directory not found")
-			}
-			srcParentEntries, err = fsHelper.GetDirectoryEntries(srcRepoID, srcParentResult.TargetFSID)
+		err = retryLibraryHeadMutation("BatchOperationSourceMove", func() error {
+			srcSnapshot, err := fsHelper.GetLibraryHeadSnapshot(srcRepoID)
 			if err != nil {
-				return fmt.Errorf("failed to read source parent directory: %w", err)
+				return fmt.Errorf("failed to get source head: %w", err)
 			}
-		}
 
-		// Remove the entry from parent (use original name, not the potentially-renamed one)
-		newSrcEntries := RemoveEntryFromList(srcParentEntries, originalItemName)
+			_, err = fsHelper.TraverseToPathFromSnapshot(srcRepoID, srcSnapshot, srcPath)
+			if err != nil {
+				return nil
+			}
 
-		// Create new fs_object for source parent
-		newSrcParentFSID, err := fsHelper.CreateDirectoryFSObject(srcRepoID, newSrcEntries)
-		if err != nil {
-			return fmt.Errorf("failed to update source directory: %w", err)
-		}
+			srcParentResult, err := fsHelper.TraverseToPathFromSnapshot(srcRepoID, srcSnapshot, srcParentPath)
+			if err != nil {
+				return fmt.Errorf("failed to traverse source parent: %w", err)
+			}
 
-		// Get fresh head commit for source (destination update might have changed it if same repo)
-		srcHeadCommitID, err = fsHelper.GetHeadCommitID(srcRepoID)
-		if err != nil {
-			return fmt.Errorf("failed to get source head: %w", err)
-		}
-
-		// Rebuild path to root for source
-		var newSrcRootFSID string
-		if srcParentPath == "/" {
-			newSrcRootFSID = newSrcParentFSID
-		} else {
-			// Need to update grandparent to point to new parent
-			srcParentDirName := path.Base(srcParentPath)
-			updatedGrandparentEntries := make([]FSEntry, len(srcParentResult.Entries))
-			for i, entry := range srcParentResult.Entries {
-				if entry.Name == srcParentDirName {
-					entry.ID = newSrcParentFSID
+			var srcParentEntries []FSEntry
+			if srcParentPath == "/" {
+				srcParentEntries = srcParentResult.Entries
+			} else {
+				if srcParentResult.TargetFSID == "" {
+					return fmt.Errorf("source parent directory not found")
 				}
-				updatedGrandparentEntries[i] = entry
+				srcParentEntries, err = fsHelper.GetDirectoryEntries(srcRepoID, srcParentResult.TargetFSID)
+				if err != nil {
+					return fmt.Errorf("failed to read source parent directory: %w", err)
+				}
 			}
 
-			newGrandparentFSID, err := fsHelper.CreateDirectoryFSObject(srcRepoID, updatedGrandparentEntries)
+			newSrcEntries := RemoveEntryFromList(srcParentEntries, originalItemName)
+			newSrcParentFSID, err := fsHelper.CreateDirectoryFSObject(srcRepoID, newSrcEntries)
 			if err != nil {
-				return fmt.Errorf("failed to update source grandparent: %w", err)
+				return fmt.Errorf("failed to update source directory: %w", err)
 			}
 
-			newSrcRootFSID, err = fsHelper.RebuildPathToRoot(srcRepoID, srcParentResult, newGrandparentFSID)
+			var newSrcRootFSID string
+			if srcParentPath == "/" {
+				newSrcRootFSID = newSrcParentFSID
+			} else {
+				srcParentDirName := path.Base(srcParentPath)
+				updatedGrandparentEntries := make([]FSEntry, len(srcParentResult.Entries))
+				for i, entry := range srcParentResult.Entries {
+					if entry.Name == srcParentDirName {
+						entry.ID = newSrcParentFSID
+					}
+					updatedGrandparentEntries[i] = entry
+				}
+
+				newGrandparentFSID, err := fsHelper.CreateDirectoryFSObject(srcRepoID, updatedGrandparentEntries)
+				if err != nil {
+					return fmt.Errorf("failed to update source grandparent: %w", err)
+				}
+
+				newSrcRootFSID, err = fsHelper.RebuildPathToRoot(srcRepoID, srcParentResult, newGrandparentFSID)
+				if err != nil {
+					return fmt.Errorf("failed to rebuild source path: %w", err)
+				}
+			}
+
+			srcDescription := fmt.Sprintf("Removed \"%s\"", originalItemName)
+			newSrcCommitID, err := fsHelper.CreateCommit(srcRepoID, userID, newSrcRootFSID, srcSnapshot.HeadCommitID, srcDescription)
 			if err != nil {
-				return fmt.Errorf("failed to rebuild source path: %w", err)
+				return fmt.Errorf("failed to create source commit: %w", err)
 			}
-		}
 
-		// Create commit for source
-		srcDescription := fmt.Sprintf("Removed \"%s\"", originalItemName)
-		newSrcCommitID, err := fsHelper.CreateCommit(srcRepoID, userID, newSrcRootFSID, srcHeadCommitID, srcDescription)
+			if err := fsHelper.UpdateLibraryHeadFromSnapshot(srcSnapshot, srcRepoID, newSrcCommitID, srcSnapshot.HeadCommitID); err != nil {
+				return fmt.Errorf("failed to update source library: %w", err)
+			}
+			return nil
+		})
 		if err != nil {
-			return fmt.Errorf("failed to create source commit: %w", err)
-		}
-
-		// Update source library head
-		if err := fsHelper.UpdateLibraryHead(orgID, srcRepoID, newSrcCommitID, srcHeadCommitID); err != nil {
-			return fmt.Errorf("failed to update source library: %w", err)
+			return err
 		}
 
 		// Decrement the source library's storage counter by the moved tree.

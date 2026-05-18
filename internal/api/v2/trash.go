@@ -1,6 +1,7 @@
 package v2
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -385,77 +386,74 @@ func (h *TrashHandler) RestoreTrashItem(c *gin.Context) {
 
 	oldEntry := *oldResult.TargetEntry
 
-	// Get current HEAD commit
-	headCommitID, err := fsHelper.GetHeadCommitID(repoID)
-	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error_msg": "library not found"})
-		return
-	}
-
 	// Determine parent directory path
 	parentPath := path.Dir(filePath)
 	if parentPath == "." {
 		parentPath = "/"
 	}
-
-	// Traverse current HEAD to the parent directory
-	result, err := fsHelper.TraverseToPath(repoID, parentPath)
-	if err != nil {
-		// Parent directory doesn't exist in HEAD — we need to recreate the path
-		// For simplicity, restore to root if parent doesn't exist
-		result, err = fsHelper.TraverseToPath(repoID, "/")
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error_msg": "failed to traverse library"})
-			return
-		}
-	}
-
-	// Add the restored item to the parent directory
 	fileName := path.Base(filePath)
-	var replacedEntry *FSEntry
-	if existing := FindEntryInList(result.Entries, fileName); existing != nil {
-		ent := *existing
-		replacedEntry = &ent
-	}
-	newEntries := RemoveEntryFromList(result.Entries, fileName) // remove if somehow exists
-	oldEntry.Name = fileName
-	oldEntry.MTime = time.Now().Unix()
-	newEntries = AddEntryToList(newEntries, oldEntry)
+	var deltaBytes int64
+	var deltaFiles int64
 
-	deltaBytes, deltaFiles, err := fsEntryDelta(fsHelper, repoID, oldEntry, replacedEntry)
+	err = retryLibraryHeadMutation("RestoreTrashItem", func() error {
+		result, snapshot, err := fsHelper.TraverseToPathAtHead(repoID, parentPath)
+		if err != nil {
+			result, snapshot, err = fsHelper.TraverseToPathAtHead(repoID, "/")
+			if err != nil {
+				return fmt.Errorf("failed to traverse library: %w", err)
+			}
+		}
+
+		var replacedEntry *FSEntry
+		if existing := FindEntryInList(result.Entries, fileName); existing != nil {
+			ent := *existing
+			replacedEntry = &ent
+		}
+
+		candidateEntry := oldEntry
+		candidateEntry.Name = fileName
+		candidateEntry.MTime = time.Now().Unix()
+
+		currentDeltaBytes, currentDeltaFiles, err := fsEntryDelta(fsHelper, repoID, candidateEntry, replacedEntry)
+		if err != nil {
+			return fmt.Errorf("failed to compute storage delta: %w", err)
+		}
+		if currentDeltaBytes > 0 {
+			if checker := traffic.GetChecker(); checker != nil {
+				if st, _ := checker.CheckStorageQuota(orgID, userID, currentDeltaBytes); !st.Allowed {
+					return ErrStorageQuotaExceeded
+				}
+			}
+		}
+
+		newEntries := RemoveEntryFromList(result.Entries, fileName)
+		newEntries = AddEntryToList(newEntries, candidateEntry)
+		newParentFSID, err := fsHelper.CreateDirectoryFSObject(repoID, newEntries)
+		if err != nil {
+			return fmt.Errorf("failed to update directory: %w", err)
+		}
+
+		newRootFSID, err := fsHelper.RebuildPathToRoot(repoID, result, newParentFSID)
+		if err != nil {
+			return fmt.Errorf("failed to rebuild path: %w", err)
+		}
+
+		description := fmt.Sprintf("Restored \"%s\" from trash", fileName)
+		newCommitID, err := fsHelper.CreateCommit(repoID, userID, newRootFSID, snapshot.HeadCommitID, description)
+		if err != nil {
+			return fmt.Errorf("failed to create commit: %w", err)
+		}
+
+		if err := fsHelper.UpdateLibraryHeadFromSnapshot(snapshot, repoID, newCommitID, snapshot.HeadCommitID); err != nil {
+			return err
+		}
+
+		deltaBytes = currentDeltaBytes
+		deltaFiles = currentDeltaFiles
+		return nil
+	})
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error_msg": "failed to compute storage delta: " + err.Error()})
-		return
-	}
-	if !preCheckStorageQuotaForDeltaWithKey(c, orgID, userID, deltaBytes, "error_msg") {
-		return
-	}
-
-	// Create new fs_object for modified parent
-	newParentFSID, err := fsHelper.CreateDirectoryFSObject(repoID, newEntries)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error_msg": "failed to update directory"})
-		return
-	}
-
-	// Rebuild path to root
-	newRootFSID, err := fsHelper.RebuildPathToRoot(repoID, result, newParentFSID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error_msg": "failed to rebuild path"})
-		return
-	}
-
-	// Create new commit
-	description := fmt.Sprintf("Restored \"%s\" from trash", fileName)
-	newCommitID, err := fsHelper.CreateCommit(repoID, userID, newRootFSID, headCommitID, description)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error_msg": "failed to create commit"})
-		return
-	}
-
-	// Update library head
-	if err := fsHelper.UpdateLibraryHead(orgID, repoID, newCommitID, headCommitID); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error_msg": "failed to update library"})
+		writeRestoreTrashItemError(c, err)
 		return
 	}
 
@@ -464,6 +462,17 @@ func (h *TrashHandler) RestoreTrashItem(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"success": true})
+}
+
+func writeRestoreTrashItemError(c *gin.Context, err error) {
+	switch {
+	case errors.Is(err, ErrLibraryHeadConflict):
+		c.JSON(http.StatusConflict, gin.H{"error_msg": "library was modified concurrently; retry the restore"})
+	case errors.Is(err, ErrStorageQuotaExceeded):
+		c.JSON(http.StatusForbidden, gin.H{"error_msg": "storage quota exceeded"})
+	default:
+		c.JSON(http.StatusInternalServerError, gin.H{"error_msg": "failed to restore item"})
+	}
 }
 
 // CleanRepoTrash permanently cleans deleted items from trash by enqueuing
@@ -712,16 +721,6 @@ func (h *TrashHandler) RevertDirents(c *gin.Context) {
 		return
 	}
 
-	// Get current HEAD commit
-	headCommitID, err := fsHelper.GetHeadCommitID(repoID)
-	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error_msg": "library not found"})
-		return
-	}
-
-	// Restore each path one by one, updating HEAD each time
-	currentHeadCommitID := headCommitID
-
 	type revertResult struct {
 		Path  string `json:"path"`
 		IsDir bool   `json:"is_dir"`
@@ -748,74 +747,70 @@ func (h *TrashHandler) RevertDirents(c *gin.Context) {
 			parentPath = "/"
 		}
 
-		// Traverse current HEAD to the parent directory
-		result, err := fsHelper.TraverseToPath(repoID, parentPath)
-		if err != nil {
-			result, err = fsHelper.TraverseToPath(repoID, "/")
-			if err != nil {
-				failedItems = append(failedItems, revertResult{Path: filePath, IsDir: isDir})
-				continue
-			}
-		}
-
-		// Add the restored item to the parent directory
 		fileName := path.Base(filePath)
-		var replacedEntry *FSEntry
-		if existing := FindEntryInList(result.Entries, fileName); existing != nil {
-			ent := *existing
-			replacedEntry = &ent
-		}
-		newEntries := RemoveEntryFromList(result.Entries, fileName)
-		oldEntry.Name = fileName
-		oldEntry.MTime = time.Now().Unix()
-		newEntries = AddEntryToList(newEntries, oldEntry)
-
-		// Storage quota pre-check using the visible delta the restore introduces.
-		// Failures fall into failedItems so partial batches succeed; the user
-		// can re-issue with a smaller selection if some items exceed the cap.
-		deltaBytes, deltaFiles, err := fsEntryDelta(fsHelper, repoID, oldEntry, replacedEntry)
-		if err != nil {
-			failedItems = append(failedItems, revertResult{Path: filePath, IsDir: isDir})
-			continue
-		}
-		if deltaBytes > 0 {
-			if checker := traffic.GetChecker(); checker != nil {
-				if st, _ := checker.CheckStorageQuota(orgID, userID, deltaBytes); !st.Allowed {
-					failedItems = append(failedItems, revertResult{Path: filePath, IsDir: isDir})
-					continue
+		var deltaBytes int64
+		var deltaFiles int64
+		err = retryLibraryHeadMutation("RevertDirents", func() error {
+			result, snapshot, err := fsHelper.TraverseToPathAtHead(repoID, parentPath)
+			if err != nil {
+				result, snapshot, err = fsHelper.TraverseToPathAtHead(repoID, "/")
+				if err != nil {
+					return err
 				}
 			}
-		}
 
-		// Create new fs_object for modified parent
-		newParentFSID, err := fsHelper.CreateDirectoryFSObject(repoID, newEntries)
+			var replacedEntry *FSEntry
+			if existing := FindEntryInList(result.Entries, fileName); existing != nil {
+				ent := *existing
+				replacedEntry = &ent
+			}
+
+			candidateEntry := oldEntry
+			candidateEntry.Name = fileName
+			candidateEntry.MTime = time.Now().Unix()
+
+			currentDeltaBytes, currentDeltaFiles, err := fsEntryDelta(fsHelper, repoID, candidateEntry, replacedEntry)
+			if err != nil {
+				return err
+			}
+			if currentDeltaBytes > 0 {
+				if checker := traffic.GetChecker(); checker != nil {
+					if st, _ := checker.CheckStorageQuota(orgID, userID, currentDeltaBytes); !st.Allowed {
+						return ErrStorageQuotaExceeded
+					}
+				}
+			}
+
+			newEntries := RemoveEntryFromList(result.Entries, fileName)
+			newEntries = AddEntryToList(newEntries, candidateEntry)
+			newParentFSID, err := fsHelper.CreateDirectoryFSObject(repoID, newEntries)
+			if err != nil {
+				return err
+			}
+
+			newRootFSID, err := fsHelper.RebuildPathToRoot(repoID, result, newParentFSID)
+			if err != nil {
+				return err
+			}
+
+			description := fmt.Sprintf("Restored \"%s\" from trash", fileName)
+			newCommitID, err := fsHelper.CreateCommit(repoID, userID, newRootFSID, snapshot.HeadCommitID, description)
+			if err != nil {
+				return err
+			}
+
+			if err := fsHelper.UpdateLibraryHeadFromSnapshot(snapshot, repoID, newCommitID, snapshot.HeadCommitID); err != nil {
+				return err
+			}
+
+			deltaBytes = currentDeltaBytes
+			deltaFiles = currentDeltaFiles
+			return nil
+		})
 		if err != nil {
 			failedItems = append(failedItems, revertResult{Path: filePath, IsDir: isDir})
 			continue
 		}
-
-		// Rebuild path to root
-		newRootFSID, err := fsHelper.RebuildPathToRoot(repoID, result, newParentFSID)
-		if err != nil {
-			failedItems = append(failedItems, revertResult{Path: filePath, IsDir: isDir})
-			continue
-		}
-
-		// Create new commit
-		description := fmt.Sprintf("Restored \"%s\" from trash", fileName)
-		newCommitID, err := fsHelper.CreateCommit(repoID, userID, newRootFSID, currentHeadCommitID, description)
-		if err != nil {
-			failedItems = append(failedItems, revertResult{Path: filePath, IsDir: isDir})
-			continue
-		}
-
-		// Update library head
-		if err := fsHelper.UpdateLibraryHead(orgID, repoID, newCommitID, currentHeadCommitID); err != nil {
-			failedItems = append(failedItems, revertResult{Path: filePath, IsDir: isDir})
-			continue
-		}
-
-		currentHeadCommitID = newCommitID
 
 		if err := traffic.AdjustStorageCountersByDeltaSync(h.db, orgID, userID, repoID, deltaBytes, deltaFiles); err != nil {
 			log.Printf("[RevertDirents] failed to apply storage counter delta for %s: %v", filePath, err)
