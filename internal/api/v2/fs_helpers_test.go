@@ -4,6 +4,7 @@ import (
 	"errors"
 	"path"
 	"testing"
+	"time"
 )
 
 func TestLibraryHeadSnapshotValidateExpectedHeadRejectsMismatch(t *testing.T) {
@@ -69,6 +70,37 @@ func TestRetryLibraryHeadMutationStopsOnNonConflict(t *testing.T) {
 	}
 	if attempts != 1 {
 		t.Fatalf("retryLibraryHeadMutation() attempts = %d, want 1", attempts)
+	}
+}
+
+func TestLibraryHeadMutationRetryBackoffCaps(t *testing.T) {
+	previousDelay := libraryHeadMutationRetryDelay
+	previousMaxDelay := libraryHeadMutationRetryMaxDelay
+	previousJitter := libraryHeadMutationRetryJitter
+	libraryHeadMutationRetryDelay = 50 * time.Millisecond
+	libraryHeadMutationRetryMaxDelay = 125 * time.Millisecond
+	libraryHeadMutationRetryJitter = 0
+	defer func() {
+		libraryHeadMutationRetryDelay = previousDelay
+		libraryHeadMutationRetryMaxDelay = previousMaxDelay
+		libraryHeadMutationRetryJitter = previousJitter
+	}()
+
+	tests := []struct {
+		attempt int
+		want    time.Duration
+	}{
+		{attempt: 0, want: 0},
+		{attempt: 1, want: 50 * time.Millisecond},
+		{attempt: 2, want: 100 * time.Millisecond},
+		{attempt: 3, want: 125 * time.Millisecond},
+		{attempt: 4, want: 125 * time.Millisecond},
+	}
+
+	for _, tt := range tests {
+		if got := libraryHeadMutationRetryBackoff(tt.attempt); got != tt.want {
+			t.Fatalf("libraryHeadMutationRetryBackoff(%d) = %s, want %s", tt.attempt, got, tt.want)
+		}
 	}
 }
 

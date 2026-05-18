@@ -84,6 +84,28 @@ func TestShouldSkipSourceRemovalAfterMove(t *testing.T) {
 	}
 }
 
+func TestReplacedDestinationTagPath(t *testing.T) {
+	tests := []struct {
+		name     string
+		dstDir   string
+		itemName string
+		entry    *FSEntry
+		want     string
+	}{
+		{name: "no replaced entry", dstDir: "/dst", itemName: "file.txt", want: ""},
+		{name: "root destination", dstDir: "/", itemName: "file.txt", entry: &FSEntry{Name: "file.txt"}, want: "/file.txt"},
+		{name: "nested destination", dstDir: "/dst/", itemName: "file.txt", entry: &FSEntry{Name: "file.txt"}, want: "/dst/file.txt"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := replacedDestinationTagPath(tt.dstDir, tt.itemName, tt.entry); got != tt.want {
+				t.Fatalf("replacedDestinationTagPath() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestBatchOperationErrorResponse_MapsKnownErrors(t *testing.T) {
 	tests := []struct {
 		name         string

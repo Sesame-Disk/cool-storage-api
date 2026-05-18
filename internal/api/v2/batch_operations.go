@@ -64,6 +64,13 @@ func shouldSkipSourceRemovalAfterMove(result *PathTraverseResult, err error) boo
 	return err != nil || result == nil || result.TargetEntry == nil
 }
 
+func replacedDestinationTagPath(dstDir, itemName string, replacedEntry *FSEntry) string {
+	if replacedEntry == nil || itemName == "" {
+		return ""
+	}
+	return normalizePath(path.Join(dstDir, itemName))
+}
+
 func batchOperationErrorResponse(err error, opType, itemName string) (int, gin.H, string) {
 	switch {
 	case errors.Is(err, ErrLibraryHeadConflict):
@@ -397,6 +404,7 @@ func (h *BatchOperationHandler) processSingleItem(orgID, userID, srcRepoID, dstR
 	var srcFiles int64
 	skipped := false
 	sourceRemovalPublished := false
+	replacedTagCleanupPath := ""
 
 	err := retryLibraryHeadMutation("BatchOperationDestination", func() error {
 		currentItemName := path.Base(srcPath)
@@ -550,6 +558,8 @@ func (h *BatchOperationHandler) processSingleItem(orgID, userID, srcRepoID, dstR
 			return fmt.Errorf("failed to update destination library: %w", err)
 		}
 
+		replacedTagCleanupPath = replacedDestinationTagPath(dstDir, currentItemName, replacedEntry)
+
 		if err := traffic.AdjustStorageCountersByDeltaSync(h.db, orgID, userID, dstRepoID, dstDeltaBytes, dstDeltaFiles); err != nil {
 			log.Printf("[processSingleItem] failed to apply destination storage counter delta for %s -> %s/%s: %v", srcPath, dstRepoID, dstDir, err)
 		}
@@ -564,6 +574,9 @@ func (h *BatchOperationHandler) processSingleItem(orgID, userID, srcRepoID, dstR
 	}
 	if skipped {
 		return nil
+	}
+	if replacedTagCleanupPath != "" {
+		go CleanupFileTagsByPath(h.db, dstRepoID, replacedTagCleanupPath)
 	}
 
 	// For move operation, remove from source

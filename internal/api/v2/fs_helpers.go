@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math/rand"
 	"path"
 	"strings"
 	"time"
@@ -528,6 +529,35 @@ const libraryHeadMutationRetryAttempts = 5
 
 var libraryHeadMutationRetryDelay = 50 * time.Millisecond
 
+var libraryHeadMutationRetryMaxDelay = 400 * time.Millisecond
+
+var libraryHeadMutationRetryJitter = 25 * time.Millisecond
+
+var libraryHeadMutationRetryJitterInt63n = rand.Int63n
+
+func libraryHeadMutationRetryBackoff(attempt int) time.Duration {
+	if attempt < 1 || libraryHeadMutationRetryDelay <= 0 {
+		return 0
+	}
+
+	delay := libraryHeadMutationRetryDelay
+	for step := 1; step < attempt; step++ {
+		delay *= 2
+		if libraryHeadMutationRetryMaxDelay > 0 && delay >= libraryHeadMutationRetryMaxDelay {
+			delay = libraryHeadMutationRetryMaxDelay
+			break
+		}
+	}
+
+	if libraryHeadMutationRetryMaxDelay > 0 && delay > libraryHeadMutationRetryMaxDelay {
+		delay = libraryHeadMutationRetryMaxDelay
+	}
+	if libraryHeadMutationRetryJitter > 0 && libraryHeadMutationRetryJitterInt63n != nil {
+		delay += time.Duration(libraryHeadMutationRetryJitterInt63n(int64(libraryHeadMutationRetryJitter)))
+	}
+	return delay
+}
+
 func retryLibraryHeadMutation(label string, mutate func() error) error {
 	var lastConflict error
 
@@ -543,8 +573,11 @@ func retryLibraryHeadMutation(label string, mutate func() error) error {
 		if attempt == libraryHeadMutationRetryAttempts {
 			break
 		}
-		log.Printf("[%s] Retrying metadata publish after head conflict (%d/%d)", label, attempt, libraryHeadMutationRetryAttempts)
-		time.Sleep(libraryHeadMutationRetryDelay)
+		sleepFor := libraryHeadMutationRetryBackoff(attempt)
+		log.Printf("[%s] Retrying metadata publish after head conflict (%d/%d), sleeping %s", label, attempt, libraryHeadMutationRetryAttempts, sleepFor)
+		if sleepFor > 0 {
+			time.Sleep(sleepFor)
+		}
 	}
 
 	if lastConflict != nil {
