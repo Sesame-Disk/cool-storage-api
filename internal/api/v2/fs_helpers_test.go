@@ -104,6 +104,35 @@ func TestLibraryHeadMutationRetryBackoffCaps(t *testing.T) {
 	}
 }
 
+func TestLibraryHeadMutationRetryBackoffAddsDeterministicJitter(t *testing.T) {
+	previousDelay := libraryHeadMutationRetryDelay
+	previousMaxDelay := libraryHeadMutationRetryMaxDelay
+	previousJitter := libraryHeadMutationRetryJitter
+	previousInt63n := libraryHeadMutationRetryJitterInt63n
+	libraryHeadMutationRetryDelay = 50 * time.Millisecond
+	libraryHeadMutationRetryMaxDelay = 0
+	libraryHeadMutationRetryJitter = 25 * time.Millisecond
+	libraryHeadMutationRetryJitterInt63n = func(limit int64) int64 {
+		wantLimit := int64(25 * time.Millisecond)
+		if limit != wantLimit {
+			t.Fatalf("jitter limit = %d, want %d", limit, wantLimit)
+		}
+		return int64(7 * time.Millisecond)
+	}
+	defer func() {
+		libraryHeadMutationRetryDelay = previousDelay
+		libraryHeadMutationRetryMaxDelay = previousMaxDelay
+		libraryHeadMutationRetryJitter = previousJitter
+		libraryHeadMutationRetryJitterInt63n = previousInt63n
+	}()
+
+	got := libraryHeadMutationRetryBackoff(2)
+	want := 107 * time.Millisecond
+	if got != want {
+		t.Fatalf("libraryHeadMutationRetryBackoff(2) = %s, want %s", got, want)
+	}
+}
+
 // Test normalizePath function (additional cases)
 func TestNormalizePath_Additional(t *testing.T) {
 	tests := []struct {

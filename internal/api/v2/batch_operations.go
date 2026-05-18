@@ -6,6 +6,7 @@ import (
 	"log"
 	"net/http"
 	"path"
+	"strings"
 	"sync"
 	"time"
 
@@ -64,11 +65,71 @@ func shouldSkipSourceRemovalAfterMove(result *PathTraverseResult, err error) boo
 	return err != nil || result == nil || result.TargetEntry == nil
 }
 
-func replacedDestinationTagPath(dstDir, itemName string, replacedEntry *FSEntry) string {
-	if replacedEntry == nil || itemName == "" {
-		return ""
+func isPathWithin(candidatePath, parentPath string) bool {
+	candidatePath = normalizePath(candidatePath)
+	parentPath = normalizePath(parentPath)
+	if parentPath == "/" {
+		return candidatePath != "/"
 	}
-	return normalizePath(path.Join(dstDir, itemName))
+	return candidatePath == parentPath || strings.HasPrefix(candidatePath, parentPath+"/")
+}
+
+func isDirectoryEntry(entry *FSEntry) bool {
+	if entry == nil {
+		return false
+	}
+	return entry.Mode == ModeDir || entry.Mode&0170000 == 040000
+}
+
+func replacedDestinationTagCleanup(dstDir, itemName string, replacedEntry *FSEntry) (string, bool) {
+	if replacedEntry == nil || itemName == "" {
+		return "", false
+	}
+	return normalizePath(path.Join(dstDir, itemName)), isDirectoryEntry(replacedEntry)
+}
+
+func movedItemTagMutation(srcPath, dstDir, itemName string, movedEntry *FSEntry) (string, string, bool) {
+	if movedEntry == nil || itemName == "" {
+		return "", "", false
+	}
+	return normalizePath(srcPath), normalizePath(path.Join(dstDir, itemName)), isDirectoryEntry(movedEntry)
+}
+
+func runSameRepoMoveTagMutation(database *db.DB, repoID, oldPath, newPath string, moveByPrefix bool, replacedCleanupPath string, replacedCleanupByPrefix bool) {
+	if replacedCleanupPath != "" {
+		if replacedCleanupByPrefix {
+			CleanupFileTagsByPrefix(database, repoID, replacedCleanupPath)
+		} else {
+			CleanupFileTagsByPath(database, repoID, replacedCleanupPath)
+		}
+	}
+	if oldPath == "" || newPath == "" {
+		return
+	}
+	if moveByPrefix {
+		MoveFileTagsByPrefix(database, repoID, oldPath, newPath)
+	} else {
+		MoveFileTagsByPath(database, repoID, oldPath, newPath)
+	}
+}
+
+func enqueueZeroRefBlocks(database *db.DB, orgID, repoID string, blockIDs []string) {
+	if database == nil || len(blockIDs) == 0 {
+		return
+	}
+	blockEnqueuer := getBlockEnqueuer()
+	if blockEnqueuer == nil {
+		return
+	}
+
+	var storageClass string
+	if err := database.Session().Query(`
+		SELECT storage_class FROM libraries WHERE org_id = ? AND library_id = ?
+	`, orgID, repoID).Scan(&storageClass); err != nil {
+		log.Printf("[enqueueZeroRefBlocks] failed to load storage class for repo %s: %v", repoID, err)
+		return
+	}
+	blockEnqueuer.EnqueueBlocks(orgID, blockIDs, storageClass)
 }
 
 func batchOperationErrorResponse(err error, opType, itemName string) (int, gin.H, string) {
@@ -400,14 +461,20 @@ func (h *BatchOperationHandler) processSingleItem(orgID, userID, srcRepoID, dstR
 		log.Printf("[processSingleItem] no-op same-location move: %s", srcPath)
 		return nil
 	}
+	if opType == "move" && srcRepoID == dstRepoID {
+		return h.processSameRepoMove(orgID, userID, srcRepoID, srcPath, dstDir, fsHelper, policy)
+	}
 	var srcSize int64
 	var srcFiles int64
 	skipped := false
 	sourceRemovalPublished := false
 	replacedTagCleanupPath := ""
+	replacedTagCleanupByPrefix := false
 
 	err := retryLibraryHeadMutation("BatchOperationDestination", func() error {
 		currentItemName := path.Base(srcPath)
+		replacedTagCleanupPath = ""
+		replacedTagCleanupByPrefix = false
 
 		srcSnapshot, err := fsHelper.GetLibraryHeadSnapshot(srcRepoID)
 		if err != nil {
@@ -558,7 +625,7 @@ func (h *BatchOperationHandler) processSingleItem(orgID, userID, srcRepoID, dstR
 			return fmt.Errorf("failed to update destination library: %w", err)
 		}
 
-		replacedTagCleanupPath = replacedDestinationTagPath(dstDir, currentItemName, replacedEntry)
+		replacedTagCleanupPath, replacedTagCleanupByPrefix = replacedDestinationTagCleanup(dstDir, currentItemName, replacedEntry)
 
 		if err := traffic.AdjustStorageCountersByDeltaSync(h.db, orgID, userID, dstRepoID, dstDeltaBytes, dstDeltaFiles); err != nil {
 			log.Printf("[processSingleItem] failed to apply destination storage counter delta for %s -> %s/%s: %v", srcPath, dstRepoID, dstDir, err)
@@ -576,7 +643,11 @@ func (h *BatchOperationHandler) processSingleItem(orgID, userID, srcRepoID, dstR
 		return nil
 	}
 	if replacedTagCleanupPath != "" {
-		go CleanupFileTagsByPath(h.db, dstRepoID, replacedTagCleanupPath)
+		if replacedTagCleanupByPrefix {
+			go CleanupFileTagsByPrefix(h.db, dstRepoID, replacedTagCleanupPath)
+		} else {
+			go CleanupFileTagsByPath(h.db, dstRepoID, replacedTagCleanupPath)
+		}
 	}
 
 	// For move operation, remove from source
@@ -673,6 +744,197 @@ func (h *BatchOperationHandler) processSingleItem(orgID, userID, srcRepoID, dstR
 	}
 
 	return nil
+}
+
+func (h *BatchOperationHandler) processSameRepoMove(orgID, userID, repoID, srcPath, dstDir string, fsHelper *FSHelper, policy string) error {
+	originalItemName := path.Base(srcPath)
+	srcParentPath := path.Dir(srcPath)
+	if srcParentPath == "." {
+		srcParentPath = "/"
+	}
+
+	var itemName string
+	var moveCommitID string
+	var replacedTagCleanupPath string
+	var replacedTagCleanupByPrefix bool
+	var movedTagOldPath string
+	var movedTagNewPath string
+	var movedTagByPrefix bool
+	var replacedBlockIDs []string
+	var replacedSize int64
+	var replacedFiles int64
+	skipped := false
+
+	err := retryLibraryHeadMutation("BatchOperationSameRepoMove", func() error {
+		currentItemName := originalItemName
+		moveCommitID = ""
+		replacedTagCleanupPath = ""
+		replacedTagCleanupByPrefix = false
+		movedTagOldPath = ""
+		movedTagNewPath = ""
+		movedTagByPrefix = false
+		replacedBlockIDs = nil
+		replacedSize = 0
+		replacedFiles = 0
+		skipped = false
+
+		snapshot, err := fsHelper.GetLibraryHeadSnapshot(repoID)
+		if err != nil {
+			return fmt.Errorf("source library not found: %w", err)
+		}
+
+		srcResult, err := fsHelper.TraverseToPathFromSnapshot(repoID, snapshot, srcPath)
+		if err != nil {
+			return fmt.Errorf("%w: %v", ErrBatchSourceNotFound, err)
+		}
+		if srcResult.TargetEntry == nil {
+			return ErrBatchSourceNotFound
+		}
+		if srcResult.TargetEntry.Mode == ModeDir || srcResult.TargetEntry.Mode&0170000 == 040000 {
+			if isPathWithin(dstDir, srcPath) {
+				return fmt.Errorf("cannot move directory into itself")
+			}
+		}
+
+		movedEntry := *srcResult.TargetEntry
+		movedEntry.MTime = time.Now().Unix()
+
+		rootAfterRemoval, err := updateDirectoryAtPathFromRoot(fsHelper, repoID, snapshot.RootFSID, srcParentPath, func(entries []FSEntry) ([]FSEntry, error) {
+			if FindEntryInList(entries, originalItemName) == nil {
+				return nil, ErrBatchSourceNotFound
+			}
+			return RemoveEntryFromList(entries, originalItemName), nil
+		})
+		if err != nil {
+			return err
+		}
+
+		newRootFSID, err := updateDirectoryAtPathFromRoot(fsHelper, repoID, rootAfterRemoval, dstDir, func(entries []FSEntry) ([]FSEntry, error) {
+			var replacedEntry *FSEntry
+			if existing := FindEntryInList(entries, currentItemName); existing != nil {
+				switch policy {
+				case "replace":
+					ent := *existing
+					replacedEntry = &ent
+					entries = RemoveEntryFromList(entries, currentItemName)
+				case "autorename":
+					currentItemName = GenerateUniqueName(entries, currentItemName)
+				case "skip":
+					skipped = true
+					return entries, nil
+				default:
+					return nil, &ConflictError{ItemName: currentItemName}
+				}
+			}
+
+			if replacedEntry != nil {
+				var err error
+				replacedSize, replacedFiles, err = fsEntryStats(fsHelper, repoID, *replacedEntry)
+				if err != nil {
+					return nil, fmt.Errorf("failed to compute replaced entry size: %w", err)
+				}
+				replacedBlockIDs, err = fsHelper.CollectBlockIDsRecursive(repoID, replacedEntry.ID)
+				if err != nil {
+					return nil, fmt.Errorf("failed to collect replaced entry blocks: %w", err)
+				}
+				replacedTagCleanupPath, replacedTagCleanupByPrefix = replacedDestinationTagCleanup(dstDir, currentItemName, replacedEntry)
+			}
+
+			movedEntry.Name = currentItemName
+			movedTagOldPath, movedTagNewPath, movedTagByPrefix = movedItemTagMutation(srcPath, dstDir, currentItemName, &movedEntry)
+			return AddEntryToList(entries, movedEntry), nil
+		})
+		if err != nil {
+			return err
+		}
+		if skipped {
+			return nil
+		}
+
+		description := fmt.Sprintf("Moved \"%s\"", currentItemName)
+		newCommitID, err := fsHelper.CreateCommit(repoID, userID, newRootFSID, snapshot.HeadCommitID, description)
+		if err != nil {
+			return fmt.Errorf("failed to create move commit: %w", err)
+		}
+
+		if err := fsHelper.UpdateLibraryHeadFromSnapshot(snapshot, repoID, newCommitID, snapshot.HeadCommitID); err != nil {
+			return fmt.Errorf("failed to update library: %w", err)
+		}
+
+		itemName = currentItemName
+		moveCommitID = newCommitID
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	if skipped {
+		return nil
+	}
+	go runSameRepoMoveTagMutation(h.db, repoID, movedTagOldPath, movedTagNewPath, movedTagByPrefix, replacedTagCleanupPath, replacedTagCleanupByPrefix)
+	if replacedSize != 0 || replacedFiles != 0 {
+		if err := traffic.AdjustStorageCountersByDeltaSync(h.db, orgID, userID, repoID, -replacedSize, -replacedFiles); err != nil {
+			log.Printf("[processSameRepoMove] failed to apply replaced destination storage counter delta for %s -> %s/%s: %v", srcPath, repoID, dstDir, err)
+		}
+	}
+	if len(replacedBlockIDs) > 0 && moveCommitID != "" {
+		go func(operationKey string, blockIDs []string) {
+			zeroRefBlocks := fsHelper.DecrementBlockRefCountsOnce(orgID, operationKey, blockIDs)
+			enqueueZeroRefBlocks(h.db, orgID, repoID, zeroRefBlocks)
+		}("same-repo-move-replace:"+moveCommitID, append([]string(nil), replacedBlockIDs...))
+	}
+	log.Printf("[processSameRepoMove] moved %s to %s as %s", srcPath, dstDir, itemName)
+	return nil
+}
+
+func updateDirectoryAtPathFromRoot(fsHelper *FSHelper, repoID, rootFSID, dirPath string, update func([]FSEntry) ([]FSEntry, error)) (string, error) {
+	dirPath = normalizePath(dirPath)
+	if dirPath == "/" {
+		entries, err := fsHelper.GetDirectoryEntries(repoID, rootFSID)
+		if err != nil {
+			return "", err
+		}
+		updatedEntries, err := update(entries)
+		if err != nil {
+			return "", err
+		}
+		return fsHelper.CreateDirectoryFSObject(repoID, updatedEntries)
+	}
+
+	parts := strings.Split(strings.Trim(dirPath, "/"), "/")
+	var rebuild func(string, int) (string, error)
+	rebuild = func(currentFSID string, depth int) (string, error) {
+		entries, err := fsHelper.GetDirectoryEntries(repoID, currentFSID)
+		if err != nil {
+			return "", err
+		}
+		if depth == len(parts) {
+			updatedEntries, err := update(entries)
+			if err != nil {
+				return "", err
+			}
+			return fsHelper.CreateDirectoryFSObject(repoID, updatedEntries)
+		}
+
+		part := parts[depth]
+		for i, entry := range entries {
+			if entry.Name != part {
+				continue
+			}
+			if entry.Mode != ModeDir && entry.Mode&0170000 != 040000 {
+				return "", ErrBatchDestinationNotFound
+			}
+			newChildFSID, err := rebuild(entry.ID, depth+1)
+			if err != nil {
+				return "", err
+			}
+			entries[i].ID = newChildFSID
+			return fsHelper.CreateDirectoryFSObject(repoID, entries)
+		}
+		return "", ErrBatchDestinationNotFound
+	}
+
+	return rebuild(rootFSID, 0)
 }
 
 // GetTaskProgress returns the progress of an async task

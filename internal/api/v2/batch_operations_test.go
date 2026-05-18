@@ -84,23 +84,85 @@ func TestShouldSkipSourceRemovalAfterMove(t *testing.T) {
 	}
 }
 
-func TestReplacedDestinationTagPath(t *testing.T) {
+func TestIsPathWithin(t *testing.T) {
 	tests := []struct {
-		name     string
-		dstDir   string
-		itemName string
-		entry    *FSEntry
-		want     string
+		name      string
+		candidate string
+		parent    string
+		want      bool
 	}{
-		{name: "no replaced entry", dstDir: "/dst", itemName: "file.txt", want: ""},
-		{name: "root destination", dstDir: "/", itemName: "file.txt", entry: &FSEntry{Name: "file.txt"}, want: "/file.txt"},
-		{name: "nested destination", dstDir: "/dst/", itemName: "file.txt", entry: &FSEntry{Name: "file.txt"}, want: "/dst/file.txt"},
+		{name: "same path", candidate: "/src", parent: "/src", want: true},
+		{name: "child path", candidate: "/src/child", parent: "/src", want: true},
+		{name: "sibling prefix is not child", candidate: "/src2/child", parent: "/src", want: false},
+		{name: "root contains child", candidate: "/src", parent: "/", want: true},
+		{name: "root does not contain itself", candidate: "/", parent: "/", want: false},
+		{name: "normalizes paths", candidate: "src/child/", parent: "/src", want: true},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := replacedDestinationTagPath(tt.dstDir, tt.itemName, tt.entry); got != tt.want {
-				t.Fatalf("replacedDestinationTagPath() = %q, want %q", got, tt.want)
+			if got := isPathWithin(tt.candidate, tt.parent); got != tt.want {
+				t.Fatalf("isPathWithin(%q, %q) = %v, want %v", tt.candidate, tt.parent, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestReplacedDestinationTagCleanup(t *testing.T) {
+	tests := []struct {
+		name         string
+		dstDir       string
+		itemName     string
+		entry        *FSEntry
+		wantPath     string
+		wantByPrefix bool
+	}{
+		{name: "no replaced entry", dstDir: "/dst", itemName: "file.txt", wantPath: "", wantByPrefix: false},
+		{name: "root destination file", dstDir: "/", itemName: "file.txt", entry: &FSEntry{Name: "file.txt", Mode: ModeFile}, wantPath: "/file.txt", wantByPrefix: false},
+		{name: "nested destination file", dstDir: "/dst/", itemName: "file.txt", entry: &FSEntry{Name: "file.txt", Mode: ModeFile}, wantPath: "/dst/file.txt", wantByPrefix: false},
+		{name: "directory cleanup uses prefix", dstDir: "/dst", itemName: "dir", entry: &FSEntry{Name: "dir", Mode: ModeDir}, wantPath: "/dst/dir", wantByPrefix: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotPath, gotByPrefix := replacedDestinationTagCleanup(tt.dstDir, tt.itemName, tt.entry)
+			if gotPath != tt.wantPath {
+				t.Fatalf("replacedDestinationTagCleanup() path = %q, want %q", gotPath, tt.wantPath)
+			}
+			if gotByPrefix != tt.wantByPrefix {
+				t.Fatalf("replacedDestinationTagCleanup() byPrefix = %v, want %v", gotByPrefix, tt.wantByPrefix)
+			}
+		})
+	}
+}
+
+func TestMovedItemTagMutation(t *testing.T) {
+	tests := []struct {
+		name         string
+		srcPath      string
+		dstDir       string
+		itemName     string
+		entry        *FSEntry
+		wantOldPath  string
+		wantNewPath  string
+		wantByPrefix bool
+	}{
+		{name: "missing entry", srcPath: "/src/file.txt", dstDir: "/dst", itemName: "file.txt"},
+		{name: "file move", srcPath: "/src/file.txt", dstDir: "/dst", itemName: "file.txt", entry: &FSEntry{Name: "file.txt", Mode: ModeFile}, wantOldPath: "/src/file.txt", wantNewPath: "/dst/file.txt", wantByPrefix: false},
+		{name: "directory move", srcPath: "/src/dir", dstDir: "/dst", itemName: "dir", entry: &FSEntry{Name: "dir", Mode: ModeDir}, wantOldPath: "/src/dir", wantNewPath: "/dst/dir", wantByPrefix: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotOldPath, gotNewPath, gotByPrefix := movedItemTagMutation(tt.srcPath, tt.dstDir, tt.itemName, tt.entry)
+			if gotOldPath != tt.wantOldPath {
+				t.Fatalf("movedItemTagMutation() oldPath = %q, want %q", gotOldPath, tt.wantOldPath)
+			}
+			if gotNewPath != tt.wantNewPath {
+				t.Fatalf("movedItemTagMutation() newPath = %q, want %q", gotNewPath, tt.wantNewPath)
+			}
+			if gotByPrefix != tt.wantByPrefix {
+				t.Fatalf("movedItemTagMutation() byPrefix = %v, want %v", gotByPrefix, tt.wantByPrefix)
 			}
 		})
 	}
