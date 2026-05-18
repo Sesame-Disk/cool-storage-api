@@ -1007,13 +1007,6 @@ func (h *SeafHTTPHandler) resolveLibraryObjectStore(hostname, orgID, repoID stri
 // 8 MB matches Seafile's default CDC block size for good deduplication compatibility.
 const uploadBlockSize = 8 * 1024 * 1024 // 8 MB
 
-// finalizeUploadConcurrency caps the number of S3 PUTs running in parallel
-// during finalization of a chunked upload. The reader is sequential (one block
-// at a time from the temp file); only the per-block work (encrypt + S3 PUT +
-// Cassandra writes) runs concurrently. 8 keeps memory bounded
-// (≤ 8 × uploadBlockSize ≈ 64 MB extra) while cutting wall-clock by ~6–8× on
-// typical S3 latency.
-const finalizeUploadConcurrency = 8
 
 // HandleUpload handles file uploads via the upload token.
 // Supports both single-shot uploads and chunked/resumable uploads (via Content-Range header).
@@ -1182,7 +1175,7 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 		// All chunks received — finalize by streaming from temp file
 		log.Printf("[HandleUpload] All chunks received, finalizing upload (streaming)")
 		upload.Touch()
-		fileID, actualFilename, storageDeltaBytes, storageDeltaFiles, err := h.finalizeUploadStreaming(c, token, upload, parentDir, filename, storageKey, total, replaceFile)
+		fileID, actualFilename, storageDeltaBytes, storageDeltaFiles, err := h.finalizeUploadStreaming(token, upload, parentDir, filename, total, replaceFile)
 		if err != nil {
 			upload.ResetFinalization()
 			log.Printf("[HandleUpload] Finalization failed: %v", err)
@@ -1575,7 +1568,7 @@ func (h *SeafHTTPHandler) uploadBlockPipelined(ctx context.Context, upload *Chun
 
 // finalizeUploadStreaming processes a completed chunked upload by streaming from the temp file.
 // It reads the file in blocks, hashes and stores each block individually — O(blockSize) RAM.
-func (h *SeafHTTPHandler) finalizeUploadStreaming(c *gin.Context, token *AccessToken, upload *ChunkUpload, parentDir, filename, storageKey string, totalSize int64, replace bool) (string, string, int64, int64, error) {
+func (h *SeafHTTPHandler) finalizeUploadStreaming(token *AccessToken, upload *ChunkUpload, parentDir, filename string, totalSize int64, replace bool) (string, string, int64, int64, error) {
 	ctx := context.Background()
 
 	storageDeltaBytes, storageDeltaFiles, err := h.checkUploadStorageQuotaForCurrentHead(token.OrgID, token.RepoID, token.UserID, parentDir, filename, totalSize, replace)
