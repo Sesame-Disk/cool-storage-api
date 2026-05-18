@@ -83,7 +83,7 @@ func batchOperationErrorResponse(err error, opType, itemName string) (int, gin.H
 		if errors.As(err, &conflictErr) {
 			return http.StatusConflict, gin.H{
 				"error":             "conflict",
-				"conflicting_items": []string{itemName},
+				"conflicting_items": []string{conflictErr.ItemName},
 			}, "conflict"
 		}
 		msg := fmt.Sprintf("failed to %s %s", opType, itemName)
@@ -377,11 +377,26 @@ func (h *BatchOperationHandler) processSingleItem(orgID, userID, srcRepoID, dstR
 		srcParentPath = "/"
 	}
 	if isSameLocationMove(opType, srcRepoID, dstRepoID, srcParentPath, dstDir) {
+		srcSnapshot, err := fsHelper.GetLibraryHeadSnapshot(srcRepoID)
+		if err != nil {
+			return fmt.Errorf("source library not found: %w", err)
+		}
+
+		srcResult, err := fsHelper.TraverseToPathFromSnapshot(srcRepoID, srcSnapshot, srcPath)
+		if err != nil {
+			return fmt.Errorf("%w: %v", ErrBatchSourceNotFound, err)
+		}
+		if srcResult.TargetEntry == nil {
+			return ErrBatchSourceNotFound
+		}
+
+		log.Printf("[processSingleItem] no-op same-location move: %s", srcPath)
 		return nil
 	}
 	var srcSize int64
 	var srcFiles int64
 	skipped := false
+	sourceRemovalPublished := false
 
 	err := retryLibraryHeadMutation("BatchOperationDestination", func() error {
 		currentItemName := path.Base(srcPath)
@@ -621,10 +636,14 @@ func (h *BatchOperationHandler) processSingleItem(orgID, userID, srcRepoID, dstR
 			if err := fsHelper.UpdateLibraryHeadFromSnapshot(srcSnapshot, srcRepoID, newSrcCommitID, srcSnapshot.HeadCommitID); err != nil {
 				return fmt.Errorf("failed to update source library: %w", err)
 			}
+			sourceRemovalPublished = true
 			return nil
 		})
 		if err != nil {
 			return err
+		}
+		if !sourceRemovalPublished {
+			return nil
 		}
 
 		// Decrement the source library's storage counter by the moved tree.
