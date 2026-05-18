@@ -1123,4 +1123,106 @@ Tracked in `docs/KNOWN_ISSUES.md` as ISSUE-LIB-RETENTION-01.
 
 ---
 
-*Last updated: 2026-05-15*
+## 19. Multiregion HEAD Safety Follow-ups (2026-05-18)
+
+### Context
+
+Branch `feat/multiregion-head-safety` landed the canonical HEAD CAS pattern, server-side conflict retries for uploads and v2 mutations, atomic same-repo move in a single commit, and rollback of materialized blocks on publish failure. A walkthrough of the resulting code surfaced the following debt items. None of them block the merge; they document liabilities that future iterations should address.
+
+### 19.a. Three Separate Retry-Loop Implementations
+
+The repo now has three implementations of the same "retry on `ErrLibraryHeadConflict` / `ErrHeadConflict`" pattern with divergent semantics:
+
+| Caller | File | Backoff | Jitter | Max delay |
+|---|---|---|---|---|
+| v2 mutations (rename/move/delete/etc.) | `internal/api/v2/fs_helpers.go` (`retryLibraryHeadMutation`) | exponential (50→100→200→400) | ~25ms | 400ms |
+| Chunked + single-shot upload | `internal/api/seafhttp.go` (`commitUploadedFileMultiBlock`, `commitUploadedFile`) | fixed 50ms | none | n/a |
+| Web `UploadFile` | `internal/api/v2/files.go` (`UploadFile` metadata publish loop) | fixed 50ms | none | n/a |
+
+Under sustained contention the uploads give up at ~250ms while v2 mutations keep retrying to ~800ms. Migrating both upload loops to `retryLibraryHeadMutation` removes ~30 lines of duplication and unifies behavior; the upload-specific `*_Once` extraction is already in place.
+
+### 19.b. `CleanupFileTagsByPrefix` Performance
+
+`internal/api/v2/tags.go:586-625` scans the full `file_tags` partition for the repo (`SELECT file_path FROM file_tags WHERE repo_id = ?`), filters in-memory by prefix, then fires N+1 individual deletes (one per descendant). For repositories with high tag cardinality, replacing a directory becomes O(total_tags) work, executed asynchronously but still loading Cassandra.
+
+Acceptable today (replace-directory is rare and the goroutine does not block the response), but worth revisiting if tag volume per repo grows or if directory replace becomes more frequent.
+
+Mitigation paths:
+- Secondary index by path prefix.
+- Move tag storage to a partition that allows range scans by file_path.
+- Push the delete loop into a `LoggedBatch` to halve round-trips.
+
+### 19.c. `CollectBlockIDsRecursive` Repeats on Every Retry Attempt
+
+`internal/api/v2/batch_operations.go:547-551` (cross-repo) and `:851` (same-repo) re-collect the replaced entry's block IDs at the top of every retry attempt. If a CAS conflict triggers retry and `replacedEntry.ID` did not change, the recursive read is redundant work.
+
+Hard to avoid safely (the replaced entry can legitimately change between attempts), so the current behavior is the correct conservative choice — but the retry cost is amortized poorly when a directory replace has many descendants.
+
+### 19.d. `UpdateLibraryHeadFromSnapshot` Validates an Argument Every Caller Passes Mechanically
+
+`internal/api/v2/fs_helpers.go` requires `expectedHead` as a parameter and validates `expectedHead == snapshot.HeadCommitID`. Current production call sites in `batch_operations.go`, `files.go`, `onlyoffice.go`, and `trash.go` all pass `snapshot.HeadCommitID` literally.
+
+The validation only triggers if someone passes a non-snapshot value — which no current caller does. The unit test (`TestUpdateLibraryHeadFromSnapshotRejectsMismatchedExpectedHead`) covers a path that production never takes.
+
+Either:
+- Drop the parameter and rely on the docstring contract.
+- Or rename to make the gate explicit (`UpdateLibraryHeadFromSnapshotIfExpected(snapshot, repoID, commitID, expectedHead)`) and force callers to pick a value.
+
+### 19.e. Initial-Commit Paths Bypass CAS Without an Inline Comment
+
+Two paths perform unconditional `UPDATE libraries SET head_commit_id = ...`:
+- `internal/api/sync.go` — initial commit during sync repo creation.
+- `internal/api/v2/fs_helpers.go` — `InitializeLibraryFS` for v2 library bootstrap.
+
+Both are correct (the library has no concurrent writers at first-touch), but they look identical to the legacy non-CAS behavior the rest of the file has been migrated away from. A future contributor reviewing for "missing CAS" could "fix" these and break the bootstrap throughput.
+
+Add a single-line comment at both sites explaining `bootstrap-only path; no concurrent writers possible`.
+
+### 19.f. Crash Window Between CAS Commit and `syncLibraryHeadDerivedState`
+
+`internal/api/v2/fs_helpers.go` advances `libraries` via CAS in `UpdateLibraryHead`, then in a separate non-conditional batch refreshes `libraries_by_id` plus the admin projection rows via `syncLibraryHeadDerivedState`. A process crash between the two operations leaves canonical `head_commit_id` advanced while derived rows lag.
+
+This is documented as accepted debt in section 12 (Read-Model And Sync Hardening). Functional reads are unaffected — `GetHeadCommitID`, `GetRootFSID`, `OnlyOffice getFileID`, `TrashHandler.CleanRepoTrash`, `SyncHandler.GetHeadCommitsMulti` all resolve via canonical (`libraries`). But admin projections (`libraries_by_org_updated`, `libraries_admin_global_by_updated`) can show stale `size_bytes`/`file_count`/`updated_at` until the next write to that library writes through.
+
+Mitigations described in section 12 (background projection repair job, repair marker) still apply.
+
+### 19.g. No Unit Tests for `processSameRepoMove` and `updateDirectoryAtPathFromRoot`
+
+`internal/api/v2/batch_operations.go:764-903` and `:905-954` contain recursive tree-rebuild logic. Coverage today:
+- Pure helpers (`isPathWithin`, `isDirectoryEntry`, `replacedDestinationTagCleanup`, `shouldSkipSourceRemovalAfterMove`) → unit tested in `batch_operations_test.go`.
+- End-to-end behavior → integration-tested in `internal/integration/same_repo_move_test.go` (5 scenarios: atomicity, nested tree, cycle prevention, descendant cycle, replace).
+
+Missing: unit tests with mocked `FSHelper` that exercise `updateDirectoryAtPathFromRoot` recursion across depth ≥ 2 without spinning up Cassandra. A regression in the recursive tree rebuild (e.g., forgetting to update a grandparent's pointer) would silently corrupt repo metadata; integration tests catch it only if the test setup happens to use a deep-enough tree.
+
+Path to add: introduce an `fsTreeStore` interface that `FSHelper` satisfies, and unit-test with an in-memory implementation.
+
+### 19.h. Cross-Repo Move Leaks Source Block References Until GC
+
+In `internal/api/v2/batch_operations.go:626`, `pinCopiedTreeBlockRefs` increments source block refs for the destination's future reference. The source-removal step (`internal/api/v2/batch_operations.go:702-758`) commits the source-side tree update but does **not** explicitly decrement source's reference to those blocks.
+
+Net effect: every cross-repo move leaves `+1` per moved block on `blocks.ref_count`. The leak is reclaimed when GC eventually walks the source's older commit chain and decrements the references encoded there. Functionally correct (eventually consistent), but the counter is briefly inflated. Affects:
+- Storage GC threshold timing (a block at `ref_count=2` instead of `ref_count=1` may keep an extra block alive past its lifecycle).
+- Counter-based observability (any tool that reads `blocks.ref_count` to estimate storage will be wrong during the lag).
+
+Same-repo move via `processSameRepoMove` does not have this problem (no pin/unpin needed; references stay).
+
+### 19.i. Async Cleanup Goroutines Are Fire-and-Forget With No Observability
+
+Multiple sites schedule cleanup as `go ...` with only `log.Printf` on failure:
+- tag cleanup after move/delete/replace (`CleanupFileTagsByPath`, `CleanupFileTagsByPrefix`, `MoveFileTagsByPath`, `MoveFileTagsByPrefix`);
+- block ref cleanup after replace/delete (`DecrementBlockRefCountsOnce` followed by `enqueueZeroRefBlocks` or GC enqueue);
+- storage-counter cleanup after async delete paths.
+
+A transient DB failure on any of these is logged and forgotten. No retry, no metric, no surface for ops to know cleanup is lagging. Idempotency (via `DecrementBlockRefCountsOnce`'s LWT, and `INSERT IF NOT EXISTS` patterns) means re-running is safe, but there is no mechanism that triggers a re-run on transient failure.
+
+Mitigation: pipe these through a small `cleanupQueue` (durable or in-memory bounded) with retry. Out of scope for this branch; track separately.
+
+### 19.j. Upload Saving-Phase Performance Speedup Deferred
+
+The work in `feat/library-write-coordinator` (block pipeline + local mutex coordinator, 17-55× speedup on the "Saving..." phase) was intentionally left out of `feat/multiregion-head-safety` per the [PR58 audit](UPLOAD-PERFORMANCE-PR58-AUDIT.md). The performance baseline of the current branch is the same as `main`; the speedup work lives in branches `feat/library-write-coordinator` and `feat/uploadperformance` and must be re-evaluated separately under contention before merge.
+
+This is intentional debt, tracked here for completeness with section 5 (Web Upload Pipeline Follow-Ups).
+
+---
+
+*Last updated: 2026-05-18*
