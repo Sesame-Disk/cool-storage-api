@@ -34,7 +34,6 @@ import (
 	"github.com/Sesame-Disk/sesamefs/internal/streaming"
 	"github.com/Sesame-Disk/sesamefs/internal/traffic"
 	"github.com/gin-gonic/gin"
-	"golang.org/x/sync/errgroup"
 )
 
 // TokenType represents the type of access token
@@ -265,6 +264,18 @@ func (tm *TokenManager) cleanup() {
 // Ensure TokenManager implements TokenStore
 var _ TokenStore = (*TokenManager)(nil)
 
+// blockPipelineSlot holds the outcome of a single block's background S3 upload.
+// Done is closed when the result is available, allowing WaitPipeline to select
+// on individual slots without polling. once ensures SetPipelineResult is safe
+// to call more than once (resumable uploads may retry a chunk before finalization).
+type blockPipelineSlot struct {
+	sha1ID   string
+	sha256ID string
+	err      error
+	done     chan struct{}
+	once     sync.Once
+}
+
 // ChunkUpload tracks an ongoing chunked upload
 type ChunkUpload struct {
 	Token       string
@@ -281,6 +292,64 @@ type ChunkUpload struct {
 	accountedBlockPosition map[int]string
 	updatedAt              time.Time
 	mu                     sync.Mutex
+
+	// pipeline holds one slot per block, allocated by InitPipeline.
+	// Nil until InitPipeline is called (single-shot and small uploads skip it).
+	pipeline []*blockPipelineSlot
+}
+
+// InitPipeline pre-allocates one pipeline slot per block. Must be called once
+// after GetOrCreateUpload and before the first WriteChunkFromReader.
+func (cu *ChunkUpload) InitPipeline() {
+	n := cu.BlockCount()
+	slots := make([]*blockPipelineSlot, n)
+	for i := range slots {
+		slots[i] = &blockPipelineSlot{done: make(chan struct{})}
+	}
+	cu.pipeline = slots
+}
+
+// BlockCount returns the number of blocks this file will be split into.
+func (cu *ChunkUpload) BlockCount() int {
+	if cu.TotalSize <= 0 {
+		return 0
+	}
+	return int((cu.TotalSize + int64(uploadBlockSize) - 1) / int64(uploadBlockSize))
+}
+
+// SetPipelineResult records the outcome of a background block upload and
+// signals WaitPipeline that this slot is ready. Safe to call from any goroutine,
+// including duplicate calls for the same slot (only the first call takes effect).
+func (cu *ChunkUpload) SetPipelineResult(blockIndex int, sha1ID, sha256ID string, err error) {
+	if blockIndex < 0 || blockIndex >= len(cu.pipeline) {
+		return
+	}
+	slot := cu.pipeline[blockIndex]
+	slot.once.Do(func() {
+		slot.sha1ID = sha1ID
+		slot.sha256ID = sha256ID
+		slot.err = err
+		close(slot.done)
+	})
+}
+
+// WaitPipeline waits for every pipeline slot to complete and returns sha1IDs
+// in block-index order. Returns the first error encountered, or ctx.Err() if
+// the context is cancelled before all slots finish.
+func (cu *ChunkUpload) WaitPipeline(ctx context.Context) ([]string, error) {
+	sha1IDs := make([]string, len(cu.pipeline))
+	for i, slot := range cu.pipeline {
+		select {
+		case <-slot.done:
+			if slot.err != nil {
+				return nil, slot.err
+			}
+			sha1IDs[i] = slot.sha1ID
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	return sha1IDs, nil
 }
 
 type byteRange struct {
@@ -384,6 +453,7 @@ func (cm *ChunkManager) GetOrCreateUpload(token, filename, parentDir string, tot
 		ReceivedEnd: -1,
 		updatedAt:   cm.now(),
 	}
+	upload.InitPipeline()
 	cm.uploads[key] = upload
 	log.Printf("[ChunkManager] Created upload tracker: %s, totalSize=%d", key, totalSize)
 	return upload, nil
@@ -1096,8 +1166,15 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 			return
 		}
 
+		// Pipeline: immediately upload this block to S3 in the background while
+		// remaining chunks are still in transit. The block index is the chunk's
+		// position within the file (0-based, chunk-size-aligned).
+		blockIndex := int(start / int64(uploadBlockSize))
+		hostname := httputil.GetRoutingHostname(c, h.configuredServerURL())
+		go h.uploadBlockPipelined(context.Background(), upload, blockIndex, start, end, token, hostname)
+
 		if !upload.TryStartFinalization() {
-			log.Printf("[HandleUpload] Chunk received, waiting for more: %d/%d", end+1, total)
+			log.Printf("[HandleUpload] Chunk received, pipeline block %d fired: %d/%d", blockIndex, end+1, total)
 			c.JSON(http.StatusOK, gin.H{"success": true})
 			return
 		}
@@ -1400,6 +1477,102 @@ func entrySize(entry map[string]interface{}) int64 {
 	}
 }
 
+// uploadBlockPipelined is called concurrently for each chunk as it arrives.
+// It reads the block from the temp file (using ReadAt so it doesn't disturb the
+// file offset used by other goroutines), computes SHA1/SHA256, encrypts if needed,
+// pushes the block to S3, writes Cassandra mappings, and signals the pipeline slot.
+// This is the core of the pipelined upload: S3 writes overlap with chunk arrivals
+// so that finalizeUploadStreaming only needs to drain the tail, not do all the work.
+func (h *SeafHTTPHandler) uploadBlockPipelined(ctx context.Context, upload *ChunkUpload, blockIndex int, start, end int64, token *AccessToken, hostname string) {
+	fail := func(err error) { upload.SetPipelineResult(blockIndex, "", "", err) }
+
+	blockSize := end - start + 1
+	blockData := make([]byte, blockSize)
+	if _, err := upload.TempFile.ReadAt(blockData, start); err != nil {
+		fail(fmt.Errorf("read block %d from temp file: %w", blockIndex, err))
+		return
+	}
+
+	// Seafile-compat block SHA1 (external block ID)
+	sha1Hash := sha1.Sum(blockData)
+	sha1ID := hex.EncodeToString(sha1Hash[:])
+
+	// Encrypt block if the library uses at-rest encryption
+	storedBlock := blockData
+	var encrypted bool
+	if h.db != nil {
+		h.db.Session().Query(`SELECT encrypted FROM libraries WHERE org_id = ? AND library_id = ?`,
+			token.OrgID, token.RepoID).Scan(&encrypted)
+	}
+	if encrypted {
+		fileKey, fileIV := v2.GetDecryptSessions().GetFileKeyAndIV(token.UserID, token.RepoID)
+		if fileKey == nil {
+			fail(fmt.Errorf("library encrypted but not unlocked"))
+			return
+		}
+		enc, encErr := crypto.EncryptBlockSeafile(blockData, fileKey, fileIV)
+		if encErr != nil {
+			fail(fmt.Errorf("encrypt block %d: %w", blockIndex, encErr))
+			return
+		}
+		storedBlock = enc
+	}
+
+	sha256Hash := sha256.Sum256(storedBlock)
+	sha256ID := hex.EncodeToString(sha256Hash[:])
+
+	// Idempotency: if a previous (e.g. retry) request already uploaded this block, skip.
+	accounted, accountErr := upload.BlockAlreadyAccounted(blockIndex, sha256ID)
+	if accountErr != nil {
+		fail(accountErr)
+		return
+	}
+	if accounted {
+		upload.Touch()
+		upload.SetPipelineResult(blockIndex, sha1ID, sha256ID, nil)
+		return
+	}
+
+	blockStore, actualStorageClass, err := h.resolveLibraryBlockStore(hostname, token.OrgID, token.RepoID)
+	if err != nil {
+		fail(fmt.Errorf("block store not available: %w", err))
+		return
+	}
+
+	if _, putErr := blockStore.PutBlockAuto(ctx, sha256ID, storedBlock); putErr != nil {
+		fail(fmt.Errorf("S3 put block %d: %w", blockIndex, putErr))
+		return
+	}
+
+	// Forward mapping: critical — failure aborts the upload.
+	if h.db != nil {
+		if mapErr := h.db.Session().Query(`
+			INSERT INTO block_id_mappings (org_id, external_id, internal_id) VALUES (?, ?, ?)
+		`, token.OrgID, sha1ID, sha256ID).Exec(); mapErr != nil {
+			log.Printf("[pipeline] CRITICAL: block_id_mapping failed org=%s ext=%s int=%s: %v", token.OrgID, sha1ID[:16], sha256ID[:16], mapErr)
+			fail(fmt.Errorf("block mapping write failed: %w", mapErr))
+			return
+		}
+
+		// Reverse mapping and block metadata: best-effort, never abort.
+		if revErr := h.db.Session().Query(`
+			INSERT INTO block_id_mappings_by_internal (org_id, internal_id, external_id, created_at) VALUES (?, ?, ?, toTimestamp(now()))
+		`, token.OrgID, sha256ID, sha1ID).Exec(); revErr != nil {
+			log.Printf("[pipeline] WARNING: reverse block_id_mapping failed org=%s: %v", token.OrgID, revErr)
+		}
+
+		fsHelper := v2.NewFSHelper(h.db)
+		if blkErr := upload.AccountBlockOnce(blockIndex, sha256ID, func() error {
+			return fsHelper.IncrementOrCreateBlock(token.OrgID, sha256ID, len(storedBlock), actualStorageClass, "")
+		}); blkErr != nil {
+			log.Printf("[pipeline] WARNING: block metadata failed org=%s block=%s: %v", token.OrgID, sha256ID[:16], blkErr)
+		}
+	}
+
+	upload.Touch()
+	upload.SetPipelineResult(blockIndex, sha1ID, sha256ID, nil)
+}
+
 // finalizeUploadStreaming processes a completed chunked upload by streaming from the temp file.
 // It reads the file in blocks, hashes and stores each block individually — O(blockSize) RAM.
 func (h *SeafHTTPHandler) finalizeUploadStreaming(c *gin.Context, token *AccessToken, upload *ChunkUpload, parentDir, filename, storageKey string, totalSize int64, replace bool) (string, string, int64, int64, error) {
@@ -1410,152 +1583,29 @@ func (h *SeafHTTPHandler) finalizeUploadStreaming(c *gin.Context, token *AccessT
 		return "", "", 0, 0, err
 	}
 
-	// Get the temp file reader
+	// Drain the block pipeline: wait for every background S3 upload (fired per
+	// chunk as it arrived) to complete. In the happy path this returns in
+	// milliseconds — the blocks have been uploading concurrently while the
+	// remaining chunks were still in transit.
+	blockSHA1IDs, err := upload.WaitPipeline(ctx)
+	if err != nil {
+		return "", "", 0, 0, fmt.Errorf("pipeline block upload failed: %w", err)
+	}
+
+	// Compute file-level SHA1 by streaming the temp file (plaintext). This is a
+	// pure CPU + local disk read — no network I/O. ~0.3 s for 1 GB at NVMe speeds.
 	reader, err := upload.GetReader()
 	if err != nil {
 		return "", "", 0, 0, fmt.Errorf("failed to get upload reader: %w", err)
 	}
-
-	// Check encryption
-	var encrypted bool
-	var fileKey, fileIV []byte
-	h.db.Session().Query(`
-		SELECT encrypted FROM libraries WHERE org_id = ? AND library_id = ?
-	`, token.OrgID, token.RepoID).Scan(&encrypted)
-	if encrypted {
-		fileKey, fileIV = v2.GetDecryptSessions().GetFileKeyAndIV(token.UserID, token.RepoID)
-		if fileKey == nil {
-			return "", "", 0, 0, fmt.Errorf("library is encrypted but not unlocked")
-		}
-	}
-
-	blockStore, actualStorageClass, err := h.resolveLibraryBlockStore(httputil.GetRoutingHostname(c, h.configuredServerURL()), token.OrgID, token.RepoID)
-	if err != nil {
-		return "", "", 0, 0, fmt.Errorf("block store not available: %w", err)
-	}
-
-	// Stream the temp file sequentially (one block at a time) but submit per-block
-	// work (encrypt + S3 PUT + Cassandra writes) to a bounded worker pool. The reader
-	// stays single-threaded so we don't need to seek; what we parallelise is the
-	// network/IO-bound part that dominates wall-clock time.
 	sha1Hasher := sha1.New()
-	fsHelper := v2.NewFSHelper(h.db)
-
-	eg, egCtx := errgroup.WithContext(ctx)
-	sem := make(chan struct{}, finalizeUploadConcurrency)
-
-	var blockSHA1IDs []string // SHA-1 block IDs for fs_object (Seafile compat) — populated in order
-
-readLoop:
-	for {
-		// Allocate a fresh buffer per block so it can travel into a goroutine
-		// without aliasing. We don't reuse buffers across iterations.
-		buf := make([]byte, uploadBlockSize)
-		n, readErr := io.ReadFull(reader, buf)
-		if n == 0 {
-			if readErr == io.EOF {
-				break
-			}
-			if readErr != nil {
-				return "", "", 0, 0, fmt.Errorf("read error: %w", readErr)
-			}
-		}
-
-		blockData := buf[:n]
-
-		// Sequential, in-order work: file-level SHA-1 accumulator and the
-		// block's own SHA-1 (which determines Seafile-compat block ordering).
-		sha1Hasher.Write(blockData)
-		blockSHA1Hash := sha1.Sum(blockData)
-		blockSHA1ID := hex.EncodeToString(blockSHA1Hash[:])
-		blockIndex := len(blockSHA1IDs)
-		blockSHA1IDs = append(blockSHA1IDs, blockSHA1ID)
-
-		// Bail early if a previous goroutine already failed.
-		if err := egCtx.Err(); err != nil {
-			break
-		}
-
-		// Acquire a worker slot before spawning so we don't pile up goroutines
-		// or buffers when S3 is the bottleneck.
-		select {
-		case sem <- struct{}{}:
-		case <-egCtx.Done():
-			break readLoop
-		}
-
-		blockSHA1IDLocal := blockSHA1ID
-		blockIndexLocal := blockIndex
-		blockDataLocal := blockData
-		eg.Go(func() error {
-			defer func() { <-sem }()
-
-			storedBlock := blockDataLocal
-			if fileKey != nil {
-				enc, encErr := crypto.EncryptBlockSeafile(blockDataLocal, fileKey, fileIV)
-				if encErr != nil {
-					return fmt.Errorf("failed to encrypt block: %w", encErr)
-				}
-				storedBlock = enc
-			}
-
-			sha256Hash := sha256.Sum256(storedBlock)
-			sha256ID := hex.EncodeToString(sha256Hash[:])
-
-			accounted, accountErr := upload.BlockAlreadyAccounted(blockIndexLocal, sha256ID)
-			if accountErr != nil {
-				return accountErr
-			}
-			if accounted {
-				upload.Touch()
-				return nil
-			}
-
-			if _, putErr := blockStore.PutBlockAuto(egCtx, sha256ID, storedBlock); putErr != nil {
-				return fmt.Errorf("failed to store block: %w", putErr)
-			}
-
-			// Forward mapping is on the critical read path — its failure aborts.
-			if mapErr := h.db.Session().Query(`
-				INSERT INTO block_id_mappings (org_id, external_id, internal_id) VALUES (?, ?, ?)
-			`, token.OrgID, blockSHA1IDLocal, sha256ID).Exec(); mapErr != nil {
-				log.Printf("[finalizeUploadStreaming] CRITICAL: Failed to write block_id_mapping org=%s ext=%s int=%s: %v", token.OrgID, blockSHA1IDLocal[:16], sha256ID[:16], mapErr)
-				return fmt.Errorf("failed to create block mapping: %w", mapErr)
-			}
-
-			// Reverse mapping and block metadata are best-effort (matches the
-			// previous serial behaviour: log on failure, don't abort).
-			if revErr := h.db.Session().Query(`
-				INSERT INTO block_id_mappings_by_internal (org_id, internal_id, external_id, created_at) VALUES (?, ?, ?, toTimestamp(now()))
-			`, token.OrgID, sha256ID, blockSHA1IDLocal).Exec(); revErr != nil {
-				log.Printf("[finalizeUploadStreaming] WARNING: Failed to write reverse block_id_mapping org=%s int=%s ext=%s: %v", token.OrgID, sha256ID[:16], blockSHA1IDLocal[:16], revErr)
-			}
-
-			if blkErr := upload.AccountBlockOnce(blockIndexLocal, sha256ID, func() error {
-				return fsHelper.IncrementOrCreateBlock(token.OrgID, sha256ID, len(storedBlock), actualStorageClass, "")
-			}); blkErr != nil {
-				log.Printf("[finalizeUploadStreaming] WARNING: Failed to write block metadata org=%s block=%s: %v", token.OrgID, sha256ID[:16], blkErr)
-			}
-
-			upload.Touch()
-			return nil
-		})
-
-		if readErr == io.EOF || readErr == io.ErrUnexpectedEOF {
-			break
-		}
+	if _, err := io.Copy(sha1Hasher, reader); err != nil {
+		return "", "", 0, 0, fmt.Errorf("failed to compute file SHA1: %w", err)
 	}
-
-	if err := eg.Wait(); err != nil {
-		return "", "", 0, 0, err
-	}
-
-	// File ID = SHA-1 of the complete plaintext
 	fileID := hex.EncodeToString(sha1Hasher.Sum(nil))
 
-	log.Printf("[finalizeUploadStreaming] Stored %d blocks for file %s (size=%d, parallelism=%d)", len(blockSHA1IDs), fileID[:16], totalSize, finalizeUploadConcurrency)
+	log.Printf("[finalizeUploadStreaming] Pipeline drained: %d blocks in S3, fileID=%s", len(blockSHA1IDs), fileID[:16])
 
-	// Update filesystem metadata with multiple block IDs
 	commitID, actualFilename, err := h.commitUploadedFileMultiBlock(token.OrgID, token.RepoID, token.UserID, parentDir, filename, fileID, blockSHA1IDs, totalSize, replace)
 	if err != nil {
 		return "", "", 0, 0, fmt.Errorf("failed to update filesystem metadata: %w", err)

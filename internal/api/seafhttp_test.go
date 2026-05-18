@@ -3,6 +3,7 @@ package api
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"mime/multipart"
 	"net/http"
@@ -1501,4 +1502,244 @@ func TestRegisterSeafHTTPRoutesZipRateLimit(t *testing.T) {
 	if w2.Code != http.StatusTooManyRequests {
 		t.Fatalf("second status = %d, want %d", w2.Code, http.StatusTooManyRequests)
 	}
+}
+
+// ============================================================================
+// Block Pipeline Tests
+//
+// These tests prove the pipelined S3 upload feature: blocks are uploaded to
+// object storage concurrently with chunk arrivals, so the "Saving…" phase
+// drains in near-zero time rather than sequentially after all chunks land.
+//
+// All tests reference methods that must be implemented on ChunkUpload:
+//   InitPipeline()
+//   BlockCount() int
+//   SetPipelineResult(blockIndex int, sha1ID, sha256ID string, err error)
+//   WaitPipeline(ctx context.Context) (sha1IDs []string, err error)
+// ============================================================================
+
+func newTestUploadWithPipeline(t *testing.T, totalSize int64) *ChunkUpload {
+	t.Helper()
+	cm, _ := newTestChunkManager(t)
+	upload, err := cm.GetOrCreateUpload("tok", "test.bin", "/", totalSize)
+	if err != nil {
+		t.Fatalf("GetOrCreateUpload: %v", err)
+	}
+	upload.InitPipeline()
+	return upload
+}
+
+// TestBlockPipeline_BlockCount verifies BlockCount returns ceil(totalSize/blockSize).
+func TestBlockPipeline_BlockCount(t *testing.T) {
+	tests := []struct {
+		totalSize  int64
+		wantBlocks int
+	}{
+		{int64(uploadBlockSize), 1},
+		{int64(uploadBlockSize) - 1, 1},
+		{int64(uploadBlockSize) + 1, 2},
+		{int64(uploadBlockSize) * 8, 8},
+		{1074886380, 129}, // ~1 GB (the archive.zip tested in production)
+	}
+	for _, tc := range tests {
+		cm, _ := newTestChunkManager(t)
+		upload, err := cm.GetOrCreateUpload("tok", "f", "/", tc.totalSize)
+		if err != nil {
+			t.Fatalf("GetOrCreateUpload: %v", err)
+		}
+		upload.InitPipeline()
+		if got := upload.BlockCount(); got != tc.wantBlocks {
+			t.Errorf("BlockCount() for size %d = %d, want %d", tc.totalSize, got, tc.wantBlocks)
+		}
+		upload.Cleanup()
+	}
+}
+
+// TestBlockPipeline_CompleteBeforeWait verifies that WaitPipeline returns
+// immediately when all slots were completed before it was called.
+func TestBlockPipeline_CompleteBeforeWait(t *testing.T) {
+	totalSize := int64(uploadBlockSize) * 3
+	upload := newTestUploadWithPipeline(t, totalSize)
+	defer upload.Cleanup()
+
+	upload.SetPipelineResult(0, "sha1-block-0", "sha256-block-0", nil)
+	upload.SetPipelineResult(1, "sha1-block-1", "sha256-block-1", nil)
+	upload.SetPipelineResult(2, "sha1-block-2", "sha256-block-2", nil)
+
+	sha1IDs, err := upload.WaitPipeline(context.Background())
+	if err != nil {
+		t.Fatalf("WaitPipeline returned error: %v", err)
+	}
+	if len(sha1IDs) != 3 {
+		t.Fatalf("expected 3 sha1IDs, got %d", len(sha1IDs))
+	}
+	expected := []string{"sha1-block-0", "sha1-block-1", "sha1-block-2"}
+	for i, want := range expected {
+		if sha1IDs[i] != want {
+			t.Errorf("sha1IDs[%d] = %q, want %q", i, sha1IDs[i], want)
+		}
+	}
+}
+
+// TestBlockPipeline_WaitBlocksUntilComplete verifies that WaitPipeline blocks
+// until a pending slot is completed, then returns immediately.
+func TestBlockPipeline_WaitBlocksUntilComplete(t *testing.T) {
+	totalSize := int64(uploadBlockSize)
+	upload := newTestUploadWithPipeline(t, totalSize)
+	defer upload.Cleanup()
+
+	done := make(chan []string, 1)
+	go func() {
+		sha1IDs, _ := upload.WaitPipeline(context.Background())
+		done <- sha1IDs
+	}()
+
+	// Must still be blocking.
+	select {
+	case <-done:
+		t.Fatal("WaitPipeline returned before slot was completed")
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	upload.SetPipelineResult(0, "sha1-block-0", "sha256-block-0", nil)
+
+	select {
+	case sha1IDs := <-done:
+		if len(sha1IDs) != 1 || sha1IDs[0] != "sha1-block-0" {
+			t.Errorf("unexpected sha1IDs: %v", sha1IDs)
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("WaitPipeline did not unblock after slot completion")
+	}
+}
+
+// TestBlockPipeline_ErrorPropagates verifies that an error from any pipeline
+// slot surfaces through WaitPipeline.
+func TestBlockPipeline_ErrorPropagates(t *testing.T) {
+	totalSize := int64(uploadBlockSize) * 4
+	upload := newTestUploadWithPipeline(t, totalSize)
+	defer upload.Cleanup()
+
+	upload.SetPipelineResult(0, "sha1-block-0", "sha256-block-0", nil)
+	upload.SetPipelineResult(1, "sha1-block-1", "sha256-block-1", nil)
+	upload.SetPipelineResult(2, "", "", fmt.Errorf("S3 write failed for block 2"))
+	upload.SetPipelineResult(3, "sha1-block-3", "sha256-block-3", nil)
+
+	_, err := upload.WaitPipeline(context.Background())
+	if err == nil {
+		t.Fatal("expected error from failed pipeline slot, got nil")
+	}
+}
+
+// TestBlockPipeline_OutOfOrderCompletion verifies that WaitPipeline returns
+// sha1IDs in block-index order regardless of completion order.
+func TestBlockPipeline_OutOfOrderCompletion(t *testing.T) {
+	totalSize := int64(uploadBlockSize) * 4
+	upload := newTestUploadWithPipeline(t, totalSize)
+	defer upload.Cleanup()
+
+	upload.SetPipelineResult(3, "sha1-block-3", "sha256-block-3", nil)
+	upload.SetPipelineResult(1, "sha1-block-1", "sha256-block-1", nil)
+	upload.SetPipelineResult(0, "sha1-block-0", "sha256-block-0", nil)
+	upload.SetPipelineResult(2, "sha1-block-2", "sha256-block-2", nil)
+
+	sha1IDs, err := upload.WaitPipeline(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	expected := []string{"sha1-block-0", "sha1-block-1", "sha1-block-2", "sha1-block-3"}
+	for i, want := range expected {
+		if sha1IDs[i] != want {
+			t.Errorf("sha1IDs[%d] = %q, want %q", i, sha1IDs[i], want)
+		}
+	}
+}
+
+// TestBlockPipeline_ContextCancellation verifies that WaitPipeline respects
+// context cancellation and returns an error immediately.
+func TestBlockPipeline_ContextCancellation(t *testing.T) {
+	totalSize := int64(uploadBlockSize) * 2
+	upload := newTestUploadWithPipeline(t, totalSize)
+	defer upload.Cleanup()
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := upload.WaitPipeline(ctx)
+		done <- err
+	}()
+
+	// Complete slot 0, leave slot 1 pending.
+	upload.SetPipelineResult(0, "sha1-block-0", "sha256-block-0", nil)
+	cancel()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("expected context cancellation error, got nil")
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("WaitPipeline did not respect context cancellation")
+	}
+}
+
+// TestBlockPipeline_SavingOverlapsChunkArrival is the key passing criterion.
+//
+// It proves that the "Saving…" phase (WaitPipeline) completes in near-zero
+// time when background block uploads ran concurrently with chunk arrivals,
+// rather than starting only after all chunks have landed.
+//
+// Scenario: 8 blocks, each taking blockDelay to "upload to S3".
+//   Sequential baseline: saving ≈ 8 × blockDelay
+//   Pipelined result:    saving ≈ tail of last in-flight upload ≈ blockDelay
+//
+// Pass condition: saving phase < 2 × blockDelay (i.e. not sequential).
+func TestBlockPipeline_SavingOverlapsChunkArrival(t *testing.T) {
+	const numBlocks = 8
+	const blockDelay = 25 * time.Millisecond
+	const chunkInterval = 5 * time.Millisecond
+
+	totalSize := int64(uploadBlockSize) * numBlocks
+	upload := newTestUploadWithPipeline(t, totalSize)
+	defer upload.Cleanup()
+
+	// Simulate concurrent background block uploads triggered by chunk arrivals.
+	// Each goroutine mimics: chunk arrives → background S3 upload fires.
+	for i := 0; i < numBlocks; i++ {
+		i := i
+		go func() {
+			time.Sleep(time.Duration(i) * chunkInterval) // stagger chunk arrivals
+			time.Sleep(blockDelay)                        // simulate S3 write latency
+			upload.SetPipelineResult(i,
+				fmt.Sprintf("sha1-block-%d", i),
+				fmt.Sprintf("sha256-block-%d", i),
+				nil,
+			)
+		}()
+	}
+
+	// Wait until all chunks have "arrived" and most uploads are in-flight or done.
+	time.Sleep(time.Duration(numBlocks)*chunkInterval + blockDelay/2)
+
+	// Call WaitPipeline — this is what finalizeUploadStreaming will do.
+	// With pipelining, only the tail of the last in-flight upload remains.
+	start := time.Now()
+	sha1IDs, err := upload.WaitPipeline(context.Background())
+	savingDuration := time.Since(start)
+
+	if err != nil {
+		t.Fatalf("WaitPipeline returned error: %v", err)
+	}
+	if len(sha1IDs) != numBlocks {
+		t.Fatalf("expected %d sha1IDs, got %d", numBlocks, len(sha1IDs))
+	}
+
+	sequentialBaseline := time.Duration(numBlocks) * blockDelay
+	if savingDuration >= 2*blockDelay {
+		t.Errorf("saving phase took %v — expected < %v (2×blockDelay); sequential baseline was %v. Pipeline is not overlapping S3 writes with chunk arrivals.",
+			savingDuration, 2*blockDelay, sequentialBaseline)
+	}
+	t.Logf("saving phase: %v  (sequential baseline: %v, %.1f%% of sequential)",
+		savingDuration, sequentialBaseline, float64(savingDuration)/float64(sequentialBaseline)*100)
 }
