@@ -56,6 +56,41 @@ var ErrBatchSourceNotFound = errors.New("batch source item not found")
 
 var ErrBatchDestinationNotFound = errors.New("batch destination not found")
 
+func isSameLocationMove(opType, srcRepoID, dstRepoID, srcParentPath, dstDir string) bool {
+	return opType == "move" && srcRepoID == dstRepoID && normalizePath(srcParentPath) == normalizePath(dstDir)
+}
+
+func shouldSkipSourceRemovalAfterMove(result *PathTraverseResult, err error) bool {
+	return err != nil || result == nil || result.TargetEntry == nil
+}
+
+func batchOperationErrorResponse(err error, opType, itemName string) (int, gin.H, string) {
+	switch {
+	case errors.Is(err, ErrLibraryHeadConflict):
+		msg := fmt.Sprintf("library was modified concurrently; retry the %s", opType)
+		return http.StatusConflict, gin.H{"error": msg}, msg
+	case errors.Is(err, ErrBatchSourceNotFound):
+		msg := "source item not found"
+		return http.StatusNotFound, gin.H{"error": msg}, msg
+	case errors.Is(err, ErrBatchDestinationNotFound):
+		msg := "destination directory not found"
+		return http.StatusNotFound, gin.H{"error": msg}, msg
+	case errors.Is(err, ErrStorageQuotaExceeded):
+		msg := "storage quota exceeded"
+		return http.StatusForbidden, gin.H{"error": msg}, msg
+	default:
+		var conflictErr *ConflictError
+		if errors.As(err, &conflictErr) {
+			return http.StatusConflict, gin.H{
+				"error":             "conflict",
+				"conflicting_items": []string{itemName},
+			}, "conflict"
+		}
+		msg := fmt.Sprintf("failed to %s %s", opType, itemName)
+		return http.StatusInternalServerError, gin.H{"error": msg}, msg
+	}
+}
+
 // Global task store
 var globalTaskStore = &TaskStore{
 	tasks: make(map[string]*AsyncTask),
@@ -207,7 +242,7 @@ func (h *BatchOperationHandler) handleBatchOperation(c *gin.Context, opType stri
 	// Pre-flight conflict check: if no conflict_policy set, scan for conflicts first
 	// This applies to BOTH sync and async paths — return 409 before starting any work
 	if req.ConflictPolicy == "" {
-		conflicting := h.checkConflicts(req, fsHelper)
+		conflicting := h.checkConflicts(req, fsHelper, opType)
 		if len(conflicting) > 0 {
 			c.JSON(http.StatusConflict, gin.H{
 				"error":             "conflict",
@@ -245,15 +280,9 @@ func (h *BatchOperationHandler) handleBatchOperation(c *gin.Context, opType stri
 		srcPath := path.Join(req.SrcParentDir, direntName)
 		err := h.processSingleItem(orgID, userID, req.SrcRepoID, req.DstRepoID, srcPath, req.DstParentDir, opType, fsHelper, req.ConflictPolicy)
 		if err != nil {
-			if _, ok := err.(*ConflictError); ok {
-				c.JSON(http.StatusConflict, gin.H{
-					"error":             "conflict",
-					"conflicting_items": []string{direntName},
-				})
-				return
-			}
 			log.Printf("[BatchOperation] Failed to %s %s: %v", opType, srcPath, err)
-			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to %s %s: %v", opType, direntName, err)})
+			status, payload, _ := batchOperationErrorResponse(err, opType, direntName)
+			c.JSON(status, payload)
 			return
 		}
 	}
@@ -262,7 +291,11 @@ func (h *BatchOperationHandler) handleBatchOperation(c *gin.Context, opType stri
 }
 
 // checkConflicts checks for name conflicts without modifying any data
-func (h *BatchOperationHandler) checkConflicts(req BatchRequest, fsHelper *FSHelper) []string {
+func (h *BatchOperationHandler) checkConflicts(req BatchRequest, fsHelper *FSHelper, opType string) []string {
+	if isSameLocationMove(opType, req.SrcRepoID, req.DstRepoID, req.SrcParentDir, req.DstParentDir) {
+		return nil
+	}
+
 	// Get destination directory entries
 	var dstEntries []FSEntry
 	if req.DstParentDir == "/" {
@@ -308,7 +341,7 @@ func (h *BatchOperationHandler) processAsyncBatch(orgID, userID string, req Batc
 		h.tasks.mu.Lock()
 		if err != nil {
 			task.Failed++
-			task.FailedReason = err.Error()
+			_, _, task.FailedReason = batchOperationErrorResponse(err, opType, direntName)
 			log.Printf("[AsyncBatch] Failed to %s %s: %v", opType, srcPath, err)
 		} else {
 			task.Done++
@@ -332,6 +365,8 @@ func (h *BatchOperationHandler) processSingleItem(orgID, userID, srcRepoID, dstR
 	if len(conflictPolicy) > 0 {
 		policy = conflictPolicy[0]
 	}
+	srcPath = normalizePath(srcPath)
+	dstDir = normalizePath(dstDir)
 	log.Printf("[processSingleItem] %s: src_repo=%s src_path=%s dst_repo=%s dst_dir=%s",
 		opType, srcRepoID, srcPath, dstRepoID, dstDir)
 
@@ -340,6 +375,9 @@ func (h *BatchOperationHandler) processSingleItem(orgID, userID, srcRepoID, dstR
 	srcParentPath := path.Dir(srcPath)
 	if srcParentPath == "." {
 		srcParentPath = "/"
+	}
+	if isSameLocationMove(opType, srcRepoID, dstRepoID, srcParentPath, dstDir) {
+		return nil
 	}
 	var srcSize int64
 	var srcFiles int64
@@ -515,19 +553,14 @@ func (h *BatchOperationHandler) processSingleItem(orgID, userID, srcRepoID, dstR
 
 	// For move operation, remove from source
 	if opType == "move" {
-		// Don't remove from source if same location
-		if srcRepoID == dstRepoID && srcParentPath == dstDir {
-			return nil
-		}
-
 		err = retryLibraryHeadMutation("BatchOperationSourceMove", func() error {
 			srcSnapshot, err := fsHelper.GetLibraryHeadSnapshot(srcRepoID)
 			if err != nil {
 				return fmt.Errorf("failed to get source head: %w", err)
 			}
 
-			_, err = fsHelper.TraverseToPathFromSnapshot(srcRepoID, srcSnapshot, srcPath)
-			if err != nil {
+			srcResult, err := fsHelper.TraverseToPathFromSnapshot(srcRepoID, srcSnapshot, srcPath)
+			if shouldSkipSourceRemovalAfterMove(srcResult, err) {
 				return nil
 			}
 

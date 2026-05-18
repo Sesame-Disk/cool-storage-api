@@ -3,6 +3,7 @@ package v2
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -33,6 +34,101 @@ func setupBatchRouter() (*gin.Engine, *BatchOperationHandler) {
 	}
 
 	return r, h
+}
+
+func TestIsSameLocationMove(t *testing.T) {
+	tests := []struct {
+		name          string
+		opType        string
+		srcRepoID     string
+		dstRepoID     string
+		srcParentPath string
+		dstDir        string
+		want          bool
+	}{
+		{name: "same repo and dir move", opType: "move", srcRepoID: "repo", dstRepoID: "repo", srcParentPath: "/dir", dstDir: "/dir", want: true},
+		{name: "normalized paths", opType: "move", srcRepoID: "repo", dstRepoID: "repo", srcParentPath: "dir", dstDir: "/dir/", want: true},
+		{name: "copy is not same-location move", opType: "copy", srcRepoID: "repo", dstRepoID: "repo", srcParentPath: "/dir", dstDir: "/dir", want: false},
+		{name: "different dir", opType: "move", srcRepoID: "repo", dstRepoID: "repo", srcParentPath: "/src", dstDir: "/dst", want: false},
+		{name: "different repo", opType: "move", srcRepoID: "src", dstRepoID: "dst", srcParentPath: "/dir", dstDir: "/dir", want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isSameLocationMove(tt.opType, tt.srcRepoID, tt.dstRepoID, tt.srcParentPath, tt.dstDir); got != tt.want {
+				t.Fatalf("isSameLocationMove() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestShouldSkipSourceRemovalAfterMove(t *testing.T) {
+	tests := []struct {
+		name   string
+		result *PathTraverseResult
+		err    error
+		want   bool
+	}{
+		{name: "traverse error", err: errors.New("boom"), want: true},
+		{name: "nil result", want: true},
+		{name: "missing target entry", result: &PathTraverseResult{}, want: true},
+		{name: "existing target entry", result: &PathTraverseResult{TargetEntry: &FSEntry{Name: "file.txt"}}, want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := shouldSkipSourceRemovalAfterMove(tt.result, tt.err); got != tt.want {
+				t.Fatalf("shouldSkipSourceRemovalAfterMove() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestBatchOperationErrorResponse_MapsKnownErrors(t *testing.T) {
+	tests := []struct {
+		name         string
+		err          error
+		wantStatus   int
+		wantError    string
+		wantReason   string
+		wantConflict []string
+	}{
+		{name: "head conflict", err: ErrLibraryHeadConflict, wantStatus: http.StatusConflict, wantError: "library was modified concurrently; retry the move", wantReason: "library was modified concurrently; retry the move"},
+		{name: "source missing", err: ErrBatchSourceNotFound, wantStatus: http.StatusNotFound, wantError: "source item not found", wantReason: "source item not found"},
+		{name: "destination missing", err: ErrBatchDestinationNotFound, wantStatus: http.StatusNotFound, wantError: "destination directory not found", wantReason: "destination directory not found"},
+		{name: "quota exceeded", err: ErrStorageQuotaExceeded, wantStatus: http.StatusForbidden, wantError: "storage quota exceeded", wantReason: "storage quota exceeded"},
+		{name: "conflict", err: &ConflictError{ItemName: "file.txt"}, wantStatus: http.StatusConflict, wantError: "conflict", wantReason: "conflict", wantConflict: []string{"file.txt"}},
+		{name: "generic", err: errors.New("boom"), wantStatus: http.StatusInternalServerError, wantError: "failed to move file.txt", wantReason: "failed to move file.txt"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			status, payload, reason := batchOperationErrorResponse(tt.err, "move", "file.txt")
+			if status != tt.wantStatus {
+				t.Fatalf("status = %d, want %d", status, tt.wantStatus)
+			}
+			if got := payload["error"]; got != tt.wantError {
+				t.Fatalf("error = %v, want %q", got, tt.wantError)
+			}
+			if reason != tt.wantReason {
+				t.Fatalf("reason = %q, want %q", reason, tt.wantReason)
+			}
+			if tt.wantConflict != nil {
+				items, ok := payload["conflicting_items"].([]string)
+				if !ok {
+					t.Fatalf("conflicting_items type = %T, want []string", payload["conflicting_items"])
+				}
+				if len(items) != len(tt.wantConflict) {
+					t.Fatalf("conflicting_items len = %d, want %d", len(items), len(tt.wantConflict))
+				}
+				for i, want := range tt.wantConflict {
+					if items[i] != want {
+						t.Fatalf("conflicting_items[%d] = %q, want %q", i, items[i], want)
+					}
+				}
+			}
+		})
+	}
 }
 
 func TestSyncBatchMove_InvalidJSON(t *testing.T) {
