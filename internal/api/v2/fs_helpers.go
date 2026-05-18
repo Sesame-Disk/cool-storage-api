@@ -4,6 +4,7 @@ import (
 	"crypto/sha1"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"path"
@@ -20,6 +21,10 @@ import (
 type FSHelper struct {
 	db *db.DB
 }
+
+// ErrLibraryHeadConflict indicates that the library HEAD changed between the
+// caller's read and publish steps.
+var ErrLibraryHeadConflict = errors.New("library HEAD was modified concurrently")
 
 // NewFSHelper creates a new FSHelper instance
 func NewFSHelper(database *db.DB) *FSHelper {
@@ -39,13 +44,9 @@ type PathTraverseResult struct {
 
 // GetRootFSID gets the root fs_id from a library's head commit
 func (h *FSHelper) GetRootFSID(repoID string) (string, string, error) {
-	// Get head_commit_id from library lookup table (no ALLOW FILTERING needed)
-	var headCommitID string
-	err := h.db.Session().Query(`
-		SELECT head_commit_id FROM libraries_by_id WHERE library_id = ?
-	`, repoID).Scan(&headCommitID)
+	_, headCommitID, err := h.getCanonicalHeadCommit(repoID)
 	if err != nil {
-		return "", "", fmt.Errorf("library not found: %w", err)
+		return "", "", err
 	}
 
 	if headCommitID == "" {
@@ -62,6 +63,24 @@ func (h *FSHelper) GetRootFSID(repoID string) (string, string, error) {
 	}
 
 	return rootFSID, headCommitID, nil
+}
+
+func (h *FSHelper) getCanonicalHeadCommit(repoID string) (string, string, error) {
+	var orgID string
+	if err := h.db.Session().Query(`
+		SELECT org_id FROM libraries_by_id WHERE library_id = ?
+	`, repoID).Scan(&orgID); err != nil {
+		return "", "", fmt.Errorf("library not found: %w", err)
+	}
+
+	var headCommitID string
+	if err := h.db.Session().Query(`
+		SELECT head_commit_id FROM libraries WHERE org_id = ? AND library_id = ?
+	`, orgID, repoID).Scan(&headCommitID); err != nil {
+		return "", "", fmt.Errorf("library not found: %w", err)
+	}
+
+	return orgID, headCommitID, nil
 }
 
 // GetDirectoryEntries gets the entries from a directory fs_object
@@ -375,9 +394,11 @@ func (h *FSHelper) calculateDirStats(repoID, dirFSID string) (totalSize int64, f
 	return totalSize, fileCount, nil
 }
 
-// UpdateLibraryHead updates the library's head_commit_id, size_bytes, and file_count
-// Uses batched dual-write to maintain consistency with libraries_by_id
-func (h *FSHelper) UpdateLibraryHead(orgID, repoID, commitID string) error {
+// UpdateLibraryHead updates the library's head_commit_id, size_bytes, and file_count.
+// The canonical libraries row advances via CAS; derived lookup/admin rows are
+// immediately resynced from the canonical state so lagging projections cannot
+// drive future mutations off a stale HEAD.
+func (h *FSHelper) UpdateLibraryHead(orgID, repoID, commitID, expectedHead string) error {
 	// Get root_fs_id from the new commit to recalculate stats
 	var rootFSID string
 	err := h.db.Session().Query(`
@@ -395,34 +416,50 @@ func (h *FSHelper) UpdateLibraryHead(orgID, repoID, commitID string) error {
 	}
 
 	now := time.Now()
-	previousRow, err := db.ReadAdminLibraryProjectionRow(h.db.Session(), orgID, repoID)
-	if err != nil {
-		return fmt.Errorf("failed to read library projection row: %w", err)
-	}
-	projectionRow := previousRow
-	projectionRow.SizeBytes = totalSize
-	projectionRow.FileCount = fileCount
-	projectionRow.UpdatedAt = now
-	batch := h.db.Session().Batch(gocql.LoggedBatch)
-
-	// Update main table with stats
-	batch.Query(`
+	casState := map[string]interface{}{}
+	applied, err := h.db.Session().Query(`
 		UPDATE libraries SET head_commit_id = ?, size_bytes = ?, file_count = ?, updated_at = ?
 		WHERE org_id = ? AND library_id = ?
-	`, commitID, totalSize, fileCount, now, orgID, repoID)
-
-	// Update lookup table
-	batch.Query(`
-		UPDATE libraries_by_id SET head_commit_id = ?
-		WHERE library_id = ?
-	`, commitID, repoID)
-	addAdminLibraryReadModelRefreshQueries(batch, projectionRow, &previousRow)
-
-	if err := batch.Exec(); err != nil {
-		return fmt.Errorf("failed to update library head: %w", err)
+		IF head_commit_id = ?
+	`, commitID, totalSize, fileCount, now, orgID, repoID, expectedHead).MapScanCAS(casState)
+	if err != nil {
+		return fmt.Errorf("conditional library head update failed: %w", err)
+	}
+	if !applied {
+		currentHead, _ := casState["head_commit_id"].(string)
+		return fmt.Errorf("%w: expected %s but found %s", ErrLibraryHeadConflict, expectedHead, currentHead)
+	}
+	if err := h.syncLibraryHeadDerivedState(orgID, repoID); err != nil {
+		return err
 	}
 
 	log.Printf("[UpdateLibraryHead] Updated library %s: size=%d bytes, files=%d", repoID, totalSize, fileCount)
+	return nil
+}
+
+func (h *FSHelper) syncLibraryHeadDerivedState(orgID, repoID string) error {
+	var headCommitID string
+	if err := h.db.Session().Query(`
+		SELECT head_commit_id FROM libraries WHERE org_id = ? AND library_id = ?
+	`, orgID, repoID).Scan(&headCommitID); err != nil {
+		return fmt.Errorf("failed to read canonical head after library update: %w", err)
+	}
+
+	projectionRow, err := db.ReadAdminLibraryProjectionRow(h.db.Session(), orgID, repoID)
+	if err != nil {
+		return fmt.Errorf("failed to read library projection row: %w", err)
+	}
+
+	batch := h.db.Session().Batch(gocql.LoggedBatch)
+	batch.Query(`
+		UPDATE libraries_by_id SET head_commit_id = ?
+		WHERE library_id = ?
+	`, headCommitID, repoID)
+	db.AddUpsertAdminLibraryReadModelQuery(batch, projectionRow)
+	if err := batch.Exec(); err != nil {
+		return fmt.Errorf("failed to sync library head derived state: %w", err)
+	}
+
 	return nil
 }
 
@@ -535,12 +572,9 @@ func GenerateUniqueName(entries []FSEntry, baseName string) string {
 
 // GetHeadCommitID gets the current head commit ID for a library
 func (h *FSHelper) GetHeadCommitID(repoID string) (string, error) {
-	var headCommitID string
-	err := h.db.Session().Query(`
-		SELECT head_commit_id FROM libraries_by_id WHERE library_id = ?
-	`, repoID).Scan(&headCommitID)
+	_, headCommitID, err := h.getCanonicalHeadCommit(repoID)
 	if err != nil {
-		return "", fmt.Errorf("library not found: %w", err)
+		return "", err
 	}
 	return headCommitID, nil
 }

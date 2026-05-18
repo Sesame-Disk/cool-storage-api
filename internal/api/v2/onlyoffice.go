@@ -440,13 +440,23 @@ func (h *OnlyOfficeHandler) getFileID(repoID, orgID, filePath string) (string, e
 		return "", fmt.Errorf("database not available")
 	}
 
-	// Get library's head_commit_id using libraries_by_id (no org_id dependency)
-	// This avoids failures when org_id doesn't match the library's partition key
-	var headCommitID string
+	// Resolve the org partition through libraries_by_id, then read the canonical
+	// head_commit_id from libraries so transient lag in libraries_by_id never
+	// drives OnlyOffice off a stale HEAD.
+	var resolvedOrgID string
 	err := h.db.Session().Query(`
-		SELECT head_commit_id FROM libraries_by_id
+		SELECT org_id FROM libraries_by_id
 		WHERE library_id = ?
-	`, repoID).Scan(&headCommitID)
+	`, repoID).Scan(&resolvedOrgID)
+	if err != nil {
+		return "", fmt.Errorf("library not found: %w", err)
+	}
+
+	var headCommitID string
+	err = h.db.Session().Query(`
+		SELECT head_commit_id FROM libraries
+		WHERE org_id = ? AND library_id = ?
+	`, resolvedOrgID, repoID).Scan(&headCommitID)
 	if err != nil {
 		return "", fmt.Errorf("library not found: %w", err)
 	}
@@ -1042,7 +1052,7 @@ func (h *OnlyOfficeHandler) saveEditedDocument(ctx context.Context, repoID, file
 	}
 
 	// Update library head
-	if err := fsHelper.UpdateLibraryHead(orgID, repoID, newCommitID); err != nil {
+	if err := fsHelper.UpdateLibraryHead(orgID, repoID, newCommitID, headCommitID); err != nil {
 		return fmt.Errorf("failed to update library head: %w", err)
 	}
 

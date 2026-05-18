@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -42,6 +43,15 @@ var formatSizeSeafile = httputil.FormatSizeSeafile
 
 // formatRelativeTimeHTML delegates to httputil.FormatRelativeTimeHTML.
 var formatRelativeTimeHTML = httputil.FormatRelativeTimeHTML
+
+var errUploadStorageQuotaExceeded = errors.New("storage quota exceeded")
+var errUploadLibraryNotFound = errors.New("library not found")
+var errUploadParentDirNotFound = errors.New("parent directory not found")
+
+const (
+	uploadMetadataRetryAttempts = 5
+	uploadMetadataRetryDelay    = 50 * time.Millisecond
+)
 
 // Dirent represents a directory entry in Seafile API format
 // This matches the exact format expected by Seafile clients
@@ -646,7 +656,7 @@ func (h *FileHandler) CreateDirectory(c *gin.Context) {
 	}
 
 	// Update library head
-	if err := fsHelper.UpdateLibraryHead(orgID, repoID, newCommitID); err != nil {
+	if err := fsHelper.UpdateLibraryHead(orgID, repoID, newCommitID, headCommitID); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update library"})
 		return
 	}
@@ -757,7 +767,7 @@ func (h *FileHandler) RenameDirectory(c *gin.Context) {
 	}
 
 	// Update library head
-	if err := fsHelper.UpdateLibraryHead(orgID, repoID, newCommitID); err != nil {
+	if err := fsHelper.UpdateLibraryHead(orgID, repoID, newCommitID, headCommitID); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update library"})
 		return
 	}
@@ -948,7 +958,7 @@ func (h *FileHandler) RenameFile(c *gin.Context) {
 	}
 
 	// Update library head
-	if err := fsHelper.UpdateLibraryHead(orgID, repoID, newCommitID); err != nil {
+	if err := fsHelper.UpdateLibraryHead(orgID, repoID, newCommitID, headCommitID); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update library"})
 		return
 	}
@@ -1181,7 +1191,7 @@ func (h *FileHandler) CreateFile(c *gin.Context) {
 	}
 
 	// Update library head
-	if err := fsHelper.UpdateLibraryHead(orgID, repoID, newCommitID); err != nil {
+	if err := fsHelper.UpdateLibraryHead(orgID, repoID, newCommitID, headCommitID); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update library"})
 		return
 	}
@@ -1286,7 +1296,7 @@ func (h *FileHandler) DeleteDirectory(c *gin.Context) {
 	}
 
 	// Update library head
-	if err := fsHelper.UpdateLibraryHead(orgID, repoID, newCommitID); err != nil {
+	if err := fsHelper.UpdateLibraryHead(orgID, repoID, newCommitID, headCommitID); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update library"})
 		return
 	}
@@ -1912,7 +1922,7 @@ func (h *FileHandler) DeleteFile(c *gin.Context) {
 	}
 
 	// Update library head
-	if err := fsHelper.UpdateLibraryHead(orgID, repoID, newCommitID); err != nil {
+	if err := fsHelper.UpdateLibraryHead(orgID, repoID, newCommitID, headCommitID); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update library"})
 		return
 	}
@@ -2263,7 +2273,7 @@ func (h *FileHandler) MoveFile(c *gin.Context) {
 	}
 
 	// Update library head
-	if err := fsHelper.UpdateLibraryHead(orgID, repoID, newCommitID); err != nil {
+	if err := fsHelper.UpdateLibraryHead(orgID, repoID, newCommitID, headCommitID); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update library"})
 		return
 	}
@@ -2593,7 +2603,7 @@ func (h *FileHandler) CopyFile(c *gin.Context) {
 	}
 
 	// Update library head
-	if err := fsHelper.UpdateLibraryHead(orgID, repoID, newCommitID); err != nil {
+	if err := fsHelper.UpdateLibraryHead(orgID, repoID, newCommitID, headCommitID); err != nil {
 		rollbackCopiedTreeBlockRefs(fsHelper, orgID, "copy-rollback:"+newCommitID, pinnedBlockIDs)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update library"})
 		return
@@ -2774,46 +2784,18 @@ func (h *FileHandler) UploadFile(c *gin.Context) {
 
 	fsHelper := NewFSHelper(h.db)
 
-	// Get head and target directory before storing the block so storage quota
-	// can be enforced against the actual visible delta (replace vs autorename).
-	headCommitID, err := fsHelper.GetHeadCommitID(repoID)
+	// Get the current visible storage delta before storing the block so quota is
+	// enforced against the live directory state (replace vs autorename).
+	storageDeltaBytes, storageDeltaFiles, err := currentUploadStorageDelta(fsHelper, repoID, parentDir, filename, fileSize, replace)
 	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "library not found"})
-		return
-	}
-
-	parentResult, err := fsHelper.TraverseToPath(repoID, parentDir)
-	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "parent directory not found: " + err.Error()})
-		return
-	}
-
-	var dirEntries []FSEntry
-	if parentDir == "/" {
-		dirEntries = parentResult.Entries
-	} else {
-		if parentResult.TargetEntry == nil {
+		if errors.Is(err, errUploadLibraryNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "library not found"})
+		} else if errors.Is(err, errUploadParentDirNotFound) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "parent directory not found"})
-			return
-		}
-		dirEntries, err = fsHelper.GetDirectoryEntries(repoID, parentResult.TargetFSID)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read parent directory"})
-			return
-		}
-	}
-
-	actualFilename := filename
-	storageDeltaBytes := fileSize
-	storageDeltaFiles := int64(1)
-	if existing := FindEntryInList(dirEntries, filename); existing != nil {
-		if replace {
-			storageDeltaBytes = fileSize - existing.Size
-			storageDeltaFiles = 0
-			dirEntries = RemoveEntryFromList(dirEntries, filename)
 		} else {
-			actualFilename = GenerateUniqueName(dirEntries, filename)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to inspect upload target"})
 		}
+		return
 	}
 
 	if storageDeltaBytes > 0 {
@@ -2886,67 +2868,15 @@ func (h *FileHandler) UploadFile(c *gin.Context) {
 		log.Printf("[UploadFile] WARNING: failed to register block metadata: %v", err)
 	}
 
-	// Create file fs_object (block_ids uses SHA-1 fileID for Seafile protocol compatibility)
-	fileFSID, err := fsHelper.CreateFileFSObject(repoID, filename, fileSize, []string{fileID})
+	actualFilename, storageDeltaBytes, storageDeltaFiles, err := h.finalizeStoredUploadMetadata(orgID, userID, repoID, parentDir, filename, fileID, fileSize, replace)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create file metadata"})
-		return
-	}
-
-	// Add new file entry to the directory
-	newEntry := FSEntry{
-		ID:    fileFSID,
-		Name:  actualFilename,
-		Mode:  ModeFile,
-		MTime: time.Now().Unix(),
-		Size:  fileSize,
-	}
-	newDirEntries := AddEntryToList(dirEntries, newEntry)
-	newDirFSID, err := fsHelper.CreateDirectoryFSObject(repoID, newDirEntries)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update directory"})
-		return
-	}
-
-	// Rebuild file tree back to root
-	var newRootFSID string
-	if parentDir == "/" {
-		// The updated directory IS the root
-		newRootFSID = newDirFSID
-	} else {
-		// Update the parent-of-parentDir to point to the new parentDir fs_object
-		parentDirName := path.Base(parentDir)
-		grandParentEntries := make([]FSEntry, len(parentResult.Entries))
-		copy(grandParentEntries, parentResult.Entries)
-		for i := range grandParentEntries {
-			if grandParentEntries[i].Name == parentDirName {
-				grandParentEntries[i].ID = newDirFSID
-				break
-			}
+		status := http.StatusInternalServerError
+		msg := "failed to update library"
+		if errors.Is(err, errUploadStorageQuotaExceeded) {
+			status = http.StatusForbidden
+			msg = "storage quota exceeded"
 		}
-		newGrandParentFSID, err := fsHelper.CreateDirectoryFSObject(repoID, grandParentEntries)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update parent directory"})
-			return
-		}
-		newRootFSID, err = fsHelper.RebuildPathToRoot(repoID, parentResult, newGrandParentFSID)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to rebuild path"})
-			return
-		}
-	}
-
-	// Create commit
-	description := fmt.Sprintf("Added or modified \"%s\".\n", actualFilename)
-	newCommitID, err := fsHelper.CreateCommit(repoID, userID, newRootFSID, headCommitID, description)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create commit"})
-		return
-	}
-
-	// Update library head
-	if err := fsHelper.UpdateLibraryHead(orgID, repoID, newCommitID); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update library"})
+		c.JSON(status, gin.H{"error": msg})
 		return
 	}
 
@@ -2962,6 +2892,162 @@ func (h *FileHandler) UploadFile(c *gin.Context) {
 
 	// Return Seafile-compatible response
 	c.JSON(http.StatusOK, []gin.H{{"name": actualFilename, "id": fileID, "size": strconv.FormatInt(fileSize, 10)}})
+}
+
+func currentUploadStorageDelta(fsHelper *FSHelper, repoID, parentDir, filename string, fileSize int64, replace bool) (int64, int64, error) {
+	if _, err := fsHelper.GetHeadCommitID(repoID); err != nil {
+		return 0, 0, fmt.Errorf("%w: %v", errUploadLibraryNotFound, err)
+	}
+
+	parentResult, err := fsHelper.TraverseToPath(repoID, parentDir)
+	if err != nil {
+		return 0, 0, fmt.Errorf("%w: %v", errUploadParentDirNotFound, err)
+	}
+
+	var dirEntries []FSEntry
+	if parentDir == "/" {
+		dirEntries = parentResult.Entries
+	} else {
+		if parentResult.TargetEntry == nil {
+			return 0, 0, errUploadParentDirNotFound
+		}
+		dirEntries, err = fsHelper.GetDirectoryEntries(repoID, parentResult.TargetFSID)
+		if err != nil {
+			return 0, 0, fmt.Errorf("failed to read parent directory: %w", err)
+		}
+	}
+
+	storageDeltaBytes := fileSize
+	storageDeltaFiles := int64(1)
+	if existing := FindEntryInList(dirEntries, filename); existing != nil && replace {
+		storageDeltaBytes = fileSize - existing.Size
+		storageDeltaFiles = 0
+	}
+
+	return storageDeltaBytes, storageDeltaFiles, nil
+}
+
+func (h *FileHandler) finalizeStoredUploadMetadata(orgID, userID, repoID, parentDir, filename, fileID string, fileSize int64, replace bool) (string, int64, int64, error) {
+	fsHelper := NewFSHelper(h.db)
+	var lastConflict error
+
+	for attempt := 1; attempt <= uploadMetadataRetryAttempts; attempt++ {
+		actualFilename, storageDeltaBytes, storageDeltaFiles, err := h.finalizeStoredUploadMetadataOnce(fsHelper, orgID, userID, repoID, parentDir, filename, fileID, fileSize, replace)
+		if err == nil {
+			return actualFilename, storageDeltaBytes, storageDeltaFiles, nil
+		}
+		if !errors.Is(err, ErrLibraryHeadConflict) {
+			return "", 0, 0, err
+		}
+		lastConflict = err
+		if attempt == uploadMetadataRetryAttempts {
+			break
+		}
+		log.Printf("[UploadFile] Retrying metadata publish for repo=%s after head conflict (%d/%d)", repoID, attempt, uploadMetadataRetryAttempts)
+		time.Sleep(uploadMetadataRetryDelay)
+	}
+
+	log.Printf("[UploadFile] Exhausted metadata retries for repo=%s: %v", repoID, lastConflict)
+	return "", 0, 0, fmt.Errorf("failed to finalize upload metadata after %d attempts", uploadMetadataRetryAttempts)
+}
+
+func (h *FileHandler) finalizeStoredUploadMetadataOnce(fsHelper *FSHelper, orgID, userID, repoID, parentDir, filename, fileID string, fileSize int64, replace bool) (string, int64, int64, error) {
+	headCommitID, err := fsHelper.GetHeadCommitID(repoID)
+	if err != nil {
+		return "", 0, 0, fmt.Errorf("%w: %v", errUploadLibraryNotFound, err)
+	}
+
+	parentResult, err := fsHelper.TraverseToPath(repoID, parentDir)
+	if err != nil {
+		return "", 0, 0, fmt.Errorf("%w: %v", errUploadParentDirNotFound, err)
+	}
+
+	var dirEntries []FSEntry
+	if parentDir == "/" {
+		dirEntries = parentResult.Entries
+	} else {
+		if parentResult.TargetEntry == nil {
+			return "", 0, 0, errUploadParentDirNotFound
+		}
+		dirEntries, err = fsHelper.GetDirectoryEntries(repoID, parentResult.TargetFSID)
+		if err != nil {
+			return "", 0, 0, fmt.Errorf("failed to read parent directory: %w", err)
+		}
+	}
+
+	actualFilename := filename
+	storageDeltaBytes := fileSize
+	storageDeltaFiles := int64(1)
+	if existing := FindEntryInList(dirEntries, filename); existing != nil {
+		if replace {
+			storageDeltaBytes = fileSize - existing.Size
+			storageDeltaFiles = 0
+			dirEntries = RemoveEntryFromList(dirEntries, filename)
+		} else {
+			actualFilename = GenerateUniqueName(dirEntries, filename)
+		}
+	}
+
+	if storageDeltaBytes > 0 {
+		if checker := traffic.GetChecker(); checker != nil {
+			if st, _ := checker.CheckStorageQuota(orgID, userID, storageDeltaBytes); !st.Allowed {
+				return "", 0, 0, errUploadStorageQuotaExceeded
+			}
+		}
+	}
+
+	fileFSID, err := fsHelper.CreateFileFSObject(repoID, actualFilename, fileSize, []string{fileID})
+	if err != nil {
+		return "", 0, 0, fmt.Errorf("failed to create file metadata: %w", err)
+	}
+
+	newEntry := FSEntry{
+		ID:    fileFSID,
+		Name:  actualFilename,
+		Mode:  ModeFile,
+		MTime: time.Now().Unix(),
+		Size:  fileSize,
+	}
+	newDirEntries := AddEntryToList(dirEntries, newEntry)
+	newDirFSID, err := fsHelper.CreateDirectoryFSObject(repoID, newDirEntries)
+	if err != nil {
+		return "", 0, 0, fmt.Errorf("failed to update directory: %w", err)
+	}
+
+	var newRootFSID string
+	if parentDir == "/" {
+		newRootFSID = newDirFSID
+	} else {
+		parentDirName := path.Base(parentDir)
+		grandParentEntries := make([]FSEntry, len(parentResult.Entries))
+		copy(grandParentEntries, parentResult.Entries)
+		for i := range grandParentEntries {
+			if grandParentEntries[i].Name == parentDirName {
+				grandParentEntries[i].ID = newDirFSID
+				break
+			}
+		}
+		newGrandParentFSID, err := fsHelper.CreateDirectoryFSObject(repoID, grandParentEntries)
+		if err != nil {
+			return "", 0, 0, fmt.Errorf("failed to update parent directory: %w", err)
+		}
+		newRootFSID, err = fsHelper.RebuildPathToRoot(repoID, parentResult, newGrandParentFSID)
+		if err != nil {
+			return "", 0, 0, fmt.Errorf("failed to rebuild path: %w", err)
+		}
+	}
+
+	description := fmt.Sprintf("Added or modified \"%s\".\n", actualFilename)
+	newCommitID, err := fsHelper.CreateCommit(repoID, userID, newRootFSID, headCommitID, description)
+	if err != nil {
+		return "", 0, 0, fmt.Errorf("failed to create commit: %w", err)
+	}
+
+	if err := fsHelper.UpdateLibraryHead(orgID, repoID, newCommitID, headCommitID); err != nil {
+		return "", 0, 0, fmt.Errorf("failed to update library: %w", err)
+	}
+
+	return actualFilename, storageDeltaBytes, storageDeltaFiles, nil
 }
 
 // copyBatchFiles handles copying multiple files in a single operation.
@@ -3118,7 +3204,7 @@ func (h *FileHandler) copyBatchFiles(c *gin.Context, srcPaths []string, srcRepoI
 		}
 
 		// Update library head
-		if err := fsHelper.UpdateLibraryHead(orgID, repoID, newCommitID); err != nil {
+		if err := fsHelper.UpdateLibraryHead(orgID, repoID, newCommitID, headCommitID); err != nil {
 			rollbackCopiedTreeBlockRefs(fsHelper, orgID, "copy-rollback:"+newCommitID, pinnedBlockIDs)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update library"})
 			return
@@ -3774,7 +3860,7 @@ func (h *FileHandler) RevertFile(c *gin.Context) {
 	}
 
 	// Update library head
-	if err := fsHelper.UpdateLibraryHead(orgID, repoID, newCommitID); err != nil {
+	if err := fsHelper.UpdateLibraryHead(orgID, repoID, newCommitID, headCommitID); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update library"})
 		return
 	}
@@ -3942,7 +4028,7 @@ func (h *FileHandler) RevertDirectory(c *gin.Context) {
 	}
 
 	// Update library head
-	if err := fsHelper.UpdateLibraryHead(orgID, repoID, newCommitID); err != nil {
+	if err := fsHelper.UpdateLibraryHead(orgID, repoID, newCommitID, headCommitID); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update library"})
 		return
 	}
@@ -4667,7 +4753,7 @@ func (h *FileHandler) BatchDeleteItems(c *gin.Context) {
 	}
 
 	// Update library head
-	if err := fsHelper.UpdateLibraryHead(orgID, req.RepoID, newCommitID); err != nil {
+	if err := fsHelper.UpdateLibraryHead(orgID, req.RepoID, newCommitID, headCommitID); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update library"})
 		return
 	}

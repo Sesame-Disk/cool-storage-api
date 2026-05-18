@@ -454,7 +454,7 @@ func (h *TrashHandler) RestoreTrashItem(c *gin.Context) {
 	}
 
 	// Update library head
-	if err := fsHelper.UpdateLibraryHead(orgID, repoID, newCommitID); err != nil {
+	if err := fsHelper.UpdateLibraryHead(orgID, repoID, newCommitID, headCommitID); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error_msg": "failed to update library"})
 		return
 	}
@@ -501,11 +501,21 @@ func (h *TrashHandler) CleanRepoTrash(c *gin.Context) {
 		}
 	}
 
-	// Get HEAD commit for this library
+	// Resolve the org partition through libraries_by_id, then read the canonical
+	// head_commit_id from libraries so transient lookup-table lag does not affect
+	// commit retention decisions.
+	var resolvedOrgID string
+	if err := h.db.Session().Query(`
+		SELECT org_id FROM libraries_by_id WHERE library_id = ?
+	`, repoID).Scan(&resolvedOrgID); err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error_msg": "library not found"})
+		return
+	}
+
 	var headCommitID string
 	if err := h.db.Session().Query(`
-		SELECT head_commit_id FROM libraries_by_id WHERE library_id = ?
-	`, repoID).Scan(&headCommitID); err != nil {
+		SELECT head_commit_id FROM libraries WHERE org_id = ? AND library_id = ?
+	`, resolvedOrgID, repoID).Scan(&headCommitID); err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error_msg": "library not found"})
 		return
 	}
@@ -800,7 +810,7 @@ func (h *TrashHandler) RevertDirents(c *gin.Context) {
 		}
 
 		// Update library head
-		if err := fsHelper.UpdateLibraryHead(orgID, repoID, newCommitID); err != nil {
+		if err := fsHelper.UpdateLibraryHead(orgID, repoID, newCommitID, currentHeadCommitID); err != nil {
 			failedItems = append(failedItems, revertResult{Path: filePath, IsDir: isDir})
 			continue
 		}

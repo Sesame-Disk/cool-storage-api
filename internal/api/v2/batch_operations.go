@@ -520,7 +520,7 @@ func (h *BatchOperationHandler) processSingleItem(orgID, userID, srcRepoID, dstR
 	}
 
 	// Update destination library head
-	if err := fsHelper.UpdateLibraryHead(orgID, dstRepoID, newDstCommitID); err != nil {
+	if err := fsHelper.UpdateLibraryHead(orgID, dstRepoID, newDstCommitID, dstHeadCommitID); err != nil {
 		rollbackCopiedTreeBlockRefs(fsHelper, orgID, opType+"-rollback:"+newDstCommitID, pinnedBlockIDs)
 		return fmt.Errorf("failed to update destination library: %w", err)
 	}
@@ -612,7 +612,7 @@ func (h *BatchOperationHandler) processSingleItem(orgID, userID, srcRepoID, dstR
 		}
 
 		// Update source library head
-		if err := fsHelper.UpdateLibraryHead(orgID, srcRepoID, newSrcCommitID); err != nil {
+		if err := fsHelper.UpdateLibraryHead(orgID, srcRepoID, newSrcCommitID, srcHeadCommitID); err != nil {
 			return fmt.Errorf("failed to update source library: %w", err)
 		}
 
