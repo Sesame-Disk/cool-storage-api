@@ -1345,6 +1345,86 @@ func TestChunkUploadAccountBlockOnceSurvivesFinalizeRetry(t *testing.T) {
 	}
 }
 
+// TestChunkUploadManyConsecutiveChunks verifies that isCompleteLocked returns
+// true after receiving all N sequential chunks for a large file. This is a
+// regression guard for the 1 GB / 129-chunk upload finalization bug.
+func TestChunkUploadManyConsecutiveChunks(t *testing.T) {
+	const chunkSize = 8 * 1024 * 1024 // 8 MB
+	const fileSize = int64(1074886380) // ~1 GB (matches the real-world failing case)
+	numChunks := int((fileSize + chunkSize - 1) / chunkSize)
+
+	cm := NewChunkManager()
+	upload, err := cm.GetOrCreateUpload("tok", "archive.zip", "/", fileSize)
+	if err != nil {
+		t.Fatalf("GetOrCreateUpload failed: %v", err)
+	}
+	defer func() {
+		upload.Cleanup()
+		cm.CleanupUpload("tok", "archive.zip")
+	}()
+
+	// Write all chunks in order using WriteChunk (avoids actual I/O but exercises
+	// the range-tracking code path identically to WriteChunkFromReader).
+	for i := 0; i < numChunks; i++ {
+		start := int64(i) * chunkSize
+		end := start + chunkSize - 1
+		if end >= fileSize {
+			end = fileSize - 1
+		}
+		data := make([]byte, end-start+1)
+		if err := upload.WriteChunk(data, start, end); err != nil {
+			t.Fatalf("WriteChunk chunk %d [%d-%d] failed: %v", i, start, end, err)
+		}
+	}
+
+	if !upload.IsComplete() {
+		t.Fatalf("IsComplete() = false after writing all %d chunks; Ranges=%v TotalSize=%d",
+			numChunks, upload.Ranges, upload.TotalSize)
+	}
+	if !upload.TryStartFinalization() {
+		t.Fatalf("TryStartFinalization() = false after all chunks; Ranges=%v TotalSize=%d Finalizing=%v",
+			upload.Ranges, upload.TotalSize, upload.Finalizing)
+	}
+}
+
+// TestChunkUploadManyOutOfOrderChunks verifies the same for reverse-order delivery.
+func TestChunkUploadManyOutOfOrderChunks(t *testing.T) {
+	const chunkSize = 8 * 1024 * 1024
+	const fileSize = int64(1074886380)
+	numChunks := int((fileSize + chunkSize - 1) / chunkSize)
+
+	cm := NewChunkManager()
+	upload, err := cm.GetOrCreateUpload("tok", "archive.zip", "/", fileSize)
+	if err != nil {
+		t.Fatalf("GetOrCreateUpload failed: %v", err)
+	}
+	defer func() {
+		upload.Cleanup()
+		cm.CleanupUpload("tok", "archive.zip")
+	}()
+
+	for i := numChunks - 1; i >= 0; i-- {
+		start := int64(i) * chunkSize
+		end := start + chunkSize - 1
+		if end >= fileSize {
+			end = fileSize - 1
+		}
+		data := make([]byte, end-start+1)
+		if err := upload.WriteChunk(data, start, end); err != nil {
+			t.Fatalf("WriteChunk chunk %d [%d-%d] failed: %v", i, start, end, err)
+		}
+	}
+
+	if !upload.IsComplete() {
+		t.Fatalf("IsComplete() = false after writing all %d chunks (reverse order); Ranges=%v TotalSize=%d",
+			numChunks, upload.Ranges, upload.TotalSize)
+	}
+	if !upload.TryStartFinalization() {
+		t.Fatalf("TryStartFinalization() = false; Ranges=%v TotalSize=%d",
+			upload.Ranges, upload.TotalSize)
+	}
+}
+
 // ============================================================================
 // TokenManager Concurrent Access Tests
 // ============================================================================

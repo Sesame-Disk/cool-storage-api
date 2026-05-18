@@ -756,15 +756,16 @@ func parseContentRange(header string) (int64, int64, int64, bool) {
 
 // SeafHTTPHandler handles Seafile-compatible file operations
 type SeafHTTPHandler struct {
-	storage        *storage.S3Store
-	storageManager *storage.Manager
-	db             *db.DB
-	tokenStore     TokenStore
-	config         *config.Config
-	permMiddleware *middleware.PermissionMiddleware
-	zipMaxEntries  int
-	zipMaxDepth    int
-	zipMaxBytes    int64
+	storage           *storage.S3Store
+	storageManager    *storage.Manager
+	db                *db.DB
+	tokenStore        TokenStore
+	config            *config.Config
+	permMiddleware    *middleware.PermissionMiddleware
+	zipMaxEntries     int
+	zipMaxDepth       int
+	zipMaxBytes       int64
+	writeCoordinator  *LibraryWriteCoordinator
 }
 
 const (
@@ -819,15 +820,16 @@ func (b *zipTraversalBudget) noteFile(size int64) error {
 // NewSeafHTTPHandler creates a new SeafHTTP handler
 func NewSeafHTTPHandler(s3Store *storage.S3Store, storageManager *storage.Manager, database *db.DB, tokenStore TokenStore, cfg *config.Config, permMiddleware *middleware.PermissionMiddleware) *SeafHTTPHandler {
 	return &SeafHTTPHandler{
-		storage:        s3Store,
-		storageManager: storageManager,
-		db:             database,
-		tokenStore:     tokenStore,
-		config:         cfg,
-		permMiddleware: permMiddleware,
-		zipMaxEntries:  defaultZipMaxEntries,
-		zipMaxDepth:    defaultZipMaxDepth,
-		zipMaxBytes:    defaultZipMaxBytes,
+		storage:          s3Store,
+		storageManager:   storageManager,
+		db:               database,
+		tokenStore:       tokenStore,
+		config:           cfg,
+		permMiddleware:   permMiddleware,
+		zipMaxEntries:    defaultZipMaxEntries,
+		zipMaxDepth:      defaultZipMaxDepth,
+		zipMaxBytes:      defaultZipMaxBytes,
+		writeCoordinator: newLibraryWriteCoordinator(),
 	}
 }
 
@@ -1567,6 +1569,9 @@ readLoop:
 // Used for large files that are split into multiple blocks during upload.
 // Returns the commit ID, the actual filename used (may differ if auto-renamed), and any error.
 func (h *SeafHTTPHandler) commitUploadedFileMultiBlock(orgID, repoID, userID, parentDir, filename, fileID string, blockIDs []string, fileSize int64, replace bool) (string, string, error) {
+	release := h.writeCoordinator.Acquire(orgID, repoID)
+	defer release()
+
 	var headCommitID string
 	err := h.db.Session().Query(`
 		SELECT head_commit_id FROM libraries WHERE org_id = ? AND library_id = ?
@@ -1637,7 +1642,7 @@ func (h *SeafHTTPHandler) commitUploadedFileMultiBlock(orgID, repoID, userID, pa
 
 	fsHelper := v2.NewFSHelper(h.db)
 	if err := fsHelper.UpdateLibraryHead(orgID, repoID, newCommitID); err != nil {
-		log.Printf("[commitUploadedFileMultiBlock] Warning: failed to update library head: %v", err)
+		return "", "", fmt.Errorf("failed to update library head: %w", err)
 	}
 
 	log.Printf("[commitUploadedFileMultiBlock] Created commit %s with root %s", newCommitID, newRootFSID)
@@ -1648,6 +1653,9 @@ func (h *SeafHTTPHandler) commitUploadedFileMultiBlock(orgID, repoID, userID, pa
 // When replace is false and a file with the same name exists, it auto-renames to "name (1).ext".
 // Returns the commit ID, the actual filename used (may differ if auto-renamed), and any error.
 func (h *SeafHTTPHandler) commitUploadedFile(orgID, repoID, userID, parentDir, filename, fileID string, content []byte, fileSize int64, replace bool) (string, string, error) {
+	release := h.writeCoordinator.Acquire(orgID, repoID)
+	defer release()
+
 	// Get current head commit
 	var headCommitID string
 	err := h.db.Session().Query(`
