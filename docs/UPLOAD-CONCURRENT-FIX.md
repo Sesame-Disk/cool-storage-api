@@ -153,6 +153,5 @@ ok  internal/traffic
 - [x] Pipeline implemented and tested (7 unit tests)
 - [x] All existing tests pass with race detector
 - [x] Verified end-to-end with 6 concurrent real-file uploads
-- [ ] Add inline comment to `handleDevLogin` explaining `Secure: false` is intentional
 - [ ] Run integration tests: `SESAMEFS_URL=http://localhost:4000 go test -tags integration ./internal/integration/ -v`
 - [ ] Open PR and request review
