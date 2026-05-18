@@ -26,6 +26,7 @@ import (
 	"github.com/Sesame-Disk/sesamefs/internal/traffic"
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/google/uuid"
 )
 
 // OnlyOfficeHandler handles OnlyOffice integration
@@ -161,6 +162,14 @@ func (h *OnlyOfficeHandler) resolveLibraryBlockStore(orgID, repoID string) (*sto
 		return storage.NewBlockStore(h.storage, "blocks/"), libraryClass, nil
 	}
 	return nil, libraryClass, fmt.Errorf("block storage not available")
+}
+
+func shouldRollbackOnlyOfficeMaterializedBlock(blockMetadataRegistered bool, publishErr error) bool {
+	return blockMetadataRegistered && publishErr != nil
+}
+
+func onlyOfficeRollbackOperationKey(rollbackID string) string {
+	return "onlyoffice-publish-failed:" + strings.TrimSpace(rollbackID)
 }
 
 // OnlyOfficeResponse represents the API response
@@ -929,6 +938,8 @@ func (h *OnlyOfficeHandler) saveEditedDocument(ctx context.Context, repoID, file
 	// Calculate SHA-256 hash for internal storage (hash of stored content, encrypted or not)
 	sha256Hash := sha256.Sum256(content)
 	internalBlockID := hex.EncodeToString(sha256Hash[:])
+	rollbackID := uuid.NewString()
+	blockMetadataRegistered := false
 
 	blockStore, storageClass, err := h.resolveLibraryBlockStore(orgID, repoID)
 	if err != nil || blockStore == nil {
@@ -961,10 +972,18 @@ func (h *OnlyOfficeHandler) saveEditedDocument(ctx context.Context, repoID, file
 	// Store block metadata using internal (SHA-256) ID
 	if err := NewFSHelper(h.db).IncrementOrCreateBlock(orgID, internalBlockID, len(content), storageClass, storageKey); err != nil {
 		log.Printf("Failed to store block metadata: %v", err)
+	} else {
+		blockMetadataRegistered = true
 	}
 
 	storageDeltaBytes, storageDeltaFiles, newCommitID, err := h.publishEditedDocumentMetadata(fsHelper, orgID, repoID, filePath, filename, userID, originalFileSize, externalBlockID)
 	if err != nil {
+		if shouldRollbackOnlyOfficeMaterializedBlock(blockMetadataRegistered, err) {
+			operationKey := onlyOfficeRollbackOperationKey(rollbackID)
+			zeroRefBlocks := fsHelper.DecrementBlockRefCountsOnce(orgID, operationKey, []string{internalBlockID})
+			enqueueZeroRefBlocks(h.db, orgID, repoID, zeroRefBlocks)
+			log.Printf("OnlyOffice: rolled back materialized block %s after metadata publish failure: %v", internalBlockID[:16], err)
+		}
 		return err
 	}
 

@@ -2,6 +2,7 @@ package v2
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -508,6 +509,35 @@ func TestOnlyOfficeStorageDeltaTreatsExistingEmptyFileAsReplacement(t *testing.T
 	}
 	if filesDelta != 1 {
 		t.Fatalf("filesDelta for new file = %d, want 1", filesDelta)
+	}
+}
+
+func TestShouldRollbackOnlyOfficeMaterializedBlock(t *testing.T) {
+	tests := []struct {
+		name                    string
+		blockMetadataRegistered bool
+		publishErr              error
+		want                    bool
+	}{
+		{name: "registered block and publish failure", blockMetadataRegistered: true, publishErr: errors.New("boom"), want: true},
+		{name: "registered block and no error", blockMetadataRegistered: true, want: false},
+		{name: "unregistered block and publish failure", blockMetadataRegistered: false, publishErr: errors.New("boom"), want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := shouldRollbackOnlyOfficeMaterializedBlock(tt.blockMetadataRegistered, tt.publishErr); got != tt.want {
+				t.Fatalf("shouldRollbackOnlyOfficeMaterializedBlock() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestOnlyOfficeRollbackOperationKey(t *testing.T) {
+	got := onlyOfficeRollbackOperationKey("  rollback-123  ")
+	want := "onlyoffice-publish-failed:rollback-123"
+	if got != want {
+		t.Fatalf("onlyOfficeRollbackOperationKey() = %q, want %q", got, want)
 	}
 }
 
