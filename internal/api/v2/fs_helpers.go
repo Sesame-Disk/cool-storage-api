@@ -533,7 +533,10 @@ func (h *FSHelper) UpdateLibraryHead(orgID, repoID, commitID, expectedHead strin
 		return fmt.Errorf("%w: expected %s but found %s", ErrLibraryHeadConflict, expectedHead, currentHead)
 	}
 	if err := h.syncLibraryHeadDerivedState(orgID, repoID); err != nil {
-		return err
+		// The canonical HEAD is already published at this point. Returning an
+		// error would make callers treat the mutation as failed and can trigger
+		// unsafe rollback of block refs that are now reachable from HEAD.
+		log.Printf("[UpdateLibraryHead] WARNING: canonical head updated for library %s but derived state sync failed: %v", repoID, err)
 	}
 
 	log.Printf("[UpdateLibraryHead] Updated library %s: size=%d bytes, files=%d", repoID, totalSize, fileCount)

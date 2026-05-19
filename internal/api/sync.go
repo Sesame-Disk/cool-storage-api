@@ -2101,7 +2101,10 @@ func (h *SyncHandler) updateLibraryHeadWithStats(orgID, repoID, commitID, userID
 		return fmt.Errorf("%w: expected %s but found %s", ErrHeadConflict, expectedHead, currentHead)
 	}
 	if err := h.syncLibraryHeadDerivedState(orgID, repoID); err != nil {
-		return err
+		// The canonical HEAD has already advanced. Do not fail this path solely
+		// because the derived-state sync missed; projection repair or later writes
+		// can catch read models up. Other post-CAS steps below may still fail.
+		log.Printf("[updateLibraryHeadWithStats] WARNING: canonical head updated for repo=%s but derived state sync failed: %v", repoID, err)
 	}
 
 	if err := h.recalculateLibraryStats(orgID, repoID, commitID, userID, previousCommitID); err != nil {
