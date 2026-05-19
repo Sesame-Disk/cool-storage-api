@@ -107,6 +107,16 @@ func multiInstanceFileNames(prefix string, count int) []string {
 	return names
 }
 
+func multiInstanceUploadLinks(t *testing.T, clients []*testClient, repoID, parentDir string) []string {
+	t.Helper()
+
+	links := make([]string, len(clients))
+	for idx, client := range clients {
+		links[idx] = rewriteUploadURLHost(getUploadLink(t, client, repoID, parentDir), client.baseURL)
+	}
+	return links
+}
+
 func TestMultiInstanceCreateFilePreservesAllEntries(t *testing.T) {
 	clients := multiInstanceRequireAdminClients(t, 3)
 	repoID := createTestLibrary(t, adminClient, fmt.Sprintf("inttest-multi-create-file-%d", time.Now().UnixNano()))
@@ -119,6 +129,205 @@ func TestMultiInstanceCreateFilePreservesAllEntries(t *testing.T) {
 	})
 	expectConcurrentStatuses(t, results, http.StatusCreated, http.StatusOK)
 	expectEntriesPresent(t, repoID, "/", fileNames)
+}
+
+func TestMultiInstanceSeafHTTPUploadWhileRenamingNoLostFiles(t *testing.T) {
+	clients := multiInstanceRequireAdminClients(t, 3)
+	repoID := createTestLibrary(t, adminClient, fmt.Sprintf("inttest-multi-upload-rename-%d", time.Now().UnixNano()))
+	uploadURLs := multiInstanceUploadLinks(t, clients, repoID, "/")
+	uploadFileThroughLink(t, adminClient, uploadURLs[0], "anchor.txt", "/", "anchor content\n")
+
+	uploadNames := multiInstanceFileNames("multi-upload-rename", 9)
+	start := make(chan struct{})
+	results := make(chan concurrentMutationResult, len(uploadNames)+1)
+	var wg sync.WaitGroup
+
+	for idx, name := range uploadNames {
+		idx := idx
+		name := name
+		client := clients[idx%len(clients)]
+		uploadURL := uploadURLs[idx%len(uploadURLs)]
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			result := uploadViaLinkConcurrent(client, uploadURL, name, "/", fmt.Sprintf("multi upload %s at %d\n", name, time.Now().UnixNano()))
+			result.name = name
+			results <- result
+		}()
+	}
+
+	renameClient := clients[len(clients)-1]
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-start
+		result := postJSONStatus(renameClient, fmt.Sprintf("/api2/repos/%s/file/?p=/anchor.txt&operation=rename", repoID), map[string]string{
+			"newname": "anchor-renamed.txt",
+		})
+		result.name = "rename-anchor"
+		results <- result
+	}()
+
+	close(start)
+	wg.Wait()
+	close(results)
+
+	uploadResults := make([]concurrentMutationResult, 0, len(uploadNames))
+	for result := range results {
+		if result.name == "rename-anchor" {
+			if result.err != nil {
+				t.Fatalf("rename failed: %v", result.err)
+			}
+			if result.status != http.StatusOK {
+				t.Fatalf("rename status = %d body=%s", result.status, result.body)
+			}
+			continue
+		}
+		uploadResults = append(uploadResults, result)
+	}
+
+	expectConcurrentStatuses(t, uploadResults, http.StatusOK, http.StatusCreated)
+	expectEntriesPresent(t, repoID, "/", uploadNames)
+	expectEntriesPresent(t, repoID, "/", []string{"anchor-renamed.txt"})
+	expectEntriesAbsent(t, repoID, "/", []string{"anchor.txt"})
+}
+
+func TestMultiInstanceV2UploadWhileDeletingNoLostFiles(t *testing.T) {
+	clients := multiInstanceRequireAdminClients(t, 3)
+	repoID := createTestLibrary(t, adminClient, fmt.Sprintf("inttest-multi-v2-upload-delete-%d", time.Now().UnixNano()))
+	uploadURL := rewriteUploadURLHost(getUploadLink(t, adminClient, repoID, "/"), adminClient.baseURL)
+
+	deleteNames := []string{"multi-delete-a.txt", "multi-delete-b.txt", "multi-delete-c.txt"}
+	for _, name := range deleteNames {
+		uploadFileThroughLink(t, adminClient, uploadURL, name, "/", fmt.Sprintf("delete me: %s\n", name))
+	}
+
+	uploadNames := multiInstanceFileNames("multi-v2-upload", 9)
+	start := make(chan struct{})
+	results := make(chan concurrentMutationResult, len(uploadNames)+1)
+	var wg sync.WaitGroup
+
+	for idx, name := range uploadNames {
+		idx := idx
+		name := name
+		client := clients[idx%len(clients)]
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			result := uploadViaV2DirectConcurrent(client, repoID, name, "/", fmt.Sprintf("multi v2 upload %s at %d\n", name, time.Now().UnixNano()))
+			result.name = name
+			results <- result
+		}()
+	}
+
+	deleteClient := clients[len(clients)-1]
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-start
+		result := multiInstanceDeleteJSONStatus(deleteClient, "/api/v2.1/repos/batch-delete-item/", map[string]interface{}{
+			"repo_id":    repoID,
+			"parent_dir": "/",
+			"dirents":    deleteNames,
+		})
+		result.name = "batch-delete"
+		results <- result
+	}()
+
+	close(start)
+	wg.Wait()
+	close(results)
+
+	uploadResults := make([]concurrentMutationResult, 0, len(uploadNames))
+	for result := range results {
+		if result.name == "batch-delete" {
+			if result.err != nil {
+				t.Fatalf("batch delete failed: %v", result.err)
+			}
+			if result.status != http.StatusOK {
+				t.Fatalf("batch delete status = %d body=%s", result.status, result.body)
+			}
+			continue
+		}
+		uploadResults = append(uploadResults, result)
+	}
+
+	expectConcurrentStatuses(t, uploadResults, http.StatusOK, http.StatusCreated)
+	expectEntriesPresent(t, repoID, "/", uploadNames)
+	expectEntriesAbsent(t, repoID, "/", deleteNames)
+}
+
+func TestMultiInstanceSeafHTTPUploadWhileMovingNoLostFiles(t *testing.T) {
+	clients := multiInstanceRequireAdminClients(t, 3)
+	repoID := createTestLibrary(t, adminClient, fmt.Sprintf("inttest-multi-upload-move-%d", time.Now().UnixNano()))
+	for _, dirPath := range []string{"/src", "/dst"} {
+		resp := adminClient.PostJSON(t, fmt.Sprintf("/api/v2.1/repos/%s/dir/?p=%s", repoID, dirPath), map[string]string{})
+		expectStatus(t, resp, http.StatusCreated)
+		resp.Body.Close()
+	}
+	uploadURLs := multiInstanceUploadLinks(t, clients, repoID, "/")
+	uploadFileThroughLink(t, adminClient, uploadURLs[0], "anchor-move.txt", "/src", "anchor move content\n")
+
+	uploadNames := multiInstanceFileNames("multi-upload-move", 9)
+	start := make(chan struct{})
+	results := make(chan concurrentMutationResult, len(uploadNames)+1)
+	var wg sync.WaitGroup
+
+	for idx, name := range uploadNames {
+		idx := idx
+		name := name
+		client := clients[idx%len(clients)]
+		uploadURL := uploadURLs[idx%len(uploadURLs)]
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			result := uploadViaLinkConcurrent(client, uploadURL, name, "/", fmt.Sprintf("multi upload move %s at %d\n", name, time.Now().UnixNano()))
+			result.name = name
+			results <- result
+		}()
+	}
+
+	moveClient := clients[len(clients)-1]
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-start
+		result := postJSONStatus(moveClient, "/api/v2.1/repos/sync-batch-move-item/", map[string]interface{}{
+			"src_repo_id":    repoID,
+			"src_parent_dir": "/src",
+			"dst_repo_id":    repoID,
+			"dst_parent_dir": "/dst",
+			"src_dirents":    []string{"anchor-move.txt"},
+		})
+		result.name = "move-anchor"
+		results <- result
+	}()
+
+	close(start)
+	wg.Wait()
+	close(results)
+
+	uploadResults := make([]concurrentMutationResult, 0, len(uploadNames))
+	for result := range results {
+		if result.name == "move-anchor" {
+			if result.err != nil {
+				t.Fatalf("move failed: %v", result.err)
+			}
+			if result.status != http.StatusOK {
+				t.Fatalf("move status = %d body=%s", result.status, result.body)
+			}
+			continue
+		}
+		uploadResults = append(uploadResults, result)
+	}
+
+	expectConcurrentStatuses(t, uploadResults, http.StatusOK, http.StatusCreated)
+	expectEntriesPresent(t, repoID, "/", uploadNames)
+	expectEntriesPresent(t, repoID, "/dst", []string{"anchor-move.txt"})
+	expectEntriesAbsent(t, repoID, "/src", []string{"anchor-move.txt"})
 }
 
 func TestMultiInstanceCreateDirectoryPreservesAllEntries(t *testing.T) {

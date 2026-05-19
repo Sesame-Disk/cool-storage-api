@@ -1131,15 +1131,17 @@ Branch `feat/multiregion-head-safety` landed the canonical HEAD CAS pattern, ser
 
 ### 19.a. Three Separate Retry-Loop Implementations
 
-The repo now has three implementations of the same "retry on `ErrLibraryHeadConflict` / `ErrHeadConflict`" pattern with divergent semantics:
+The repo still has three implementations of the same "retry on `ErrLibraryHeadConflict` / `ErrHeadConflict`" pattern. They now share the same backoff schedule, but the retry orchestration is still duplicated across files:
 
 | Caller | File | Backoff | Jitter | Max delay |
 |---|---|---|---|---|
 | v2 mutations (rename/move/delete/etc.) | `internal/api/v2/fs_helpers.go` (`retryLibraryHeadMutation`) | exponential (50→100→200→400) | ~25ms | 400ms |
-| Chunked + single-shot upload | `internal/api/seafhttp.go` (`commitUploadedFileMultiBlock`, `commitUploadedFile`) | fixed 50ms | none | n/a |
-| Web `UploadFile` | `internal/api/v2/files.go` (`UploadFile` metadata publish loop) | fixed 50ms | none | n/a |
+| Chunked + single-shot upload | `internal/api/seafhttp.go` (`commitUploadedFileMultiBlock`, `commitUploadedFile`) | exponential (50→100→200→400) | ~25ms | 400ms |
+| Web `UploadFile` | `internal/api/v2/files.go` (`finalizeStoredUploadMetadata`) | exponential (50→100→200→400) | ~25ms | 400ms |
 
-Under sustained contention the uploads give up at ~250ms while v2 mutations keep retrying to ~800ms. Migrating both upload loops to `retryLibraryHeadMutation` removes ~30 lines of duplication and unifies behavior; the upload-specific `*_Once` extraction is already in place.
+Update 2026-05-19: both upload seams now also fail closed if `IncrementOrCreateBlock` cannot confirm the `blocks` row, so uploads no longer continue to library metadata publish after a block-metadata registration failure.
+
+The remaining debt here is maintainability rather than correctness: the upload-specific `*_Once` extraction is already in place, and migrating both upload loops to `retryLibraryHeadMutation` would still remove duplicated retry bookkeeping and keep future contention tuning in one place.
 
 ### 19.b. `CleanupFileTagsByPrefix` Performance
 
@@ -1248,6 +1250,22 @@ If this ever needs to be tightened, the safe options are:
 - record/refcount template blobs before publish so failed creates can roll back via metadata rather than raw deletes;
 - or track whether `PutBlockData` created a new object vs reused an existing one, then delete only newly-created unreferenced blobs on final failure.
 
+### 19.l. Legacy Multiregion Shell Harness Lags the Canonical Active-Active Proofs
+
+The dedicated multiregion shell harnesses (`scripts/test-multiregion.sh` and
+`scripts/test-failover.sh`) still focus on connectivity, routing, and manual
+failover drills. They do not carry the full same-library concurrent-write
+coverage that now lives in Go integration tests under `internal/integration/`.
+
+This is accepted for the current branch because the correctness-critical proofs
+now run through:
+- the main compose `test` profile with `sesamefs`, `sesamefs-node-2`, and `sesamefs-node-3` for broad multi-container HEAD races;
+- dedicated two-region Go tests for upload finalization against `docker-compose-multiregion.yaml` when region-pinned behavior matters.
+
+The remaining debt is operational ergonomics: the shell harnesses are still the
+easiest place to script smoke checks for routing/failover, but they are no
+longer the canonical regression surface for active-active write correctness.
+
 ---
 
-*Last updated: 2026-05-18*
+*Last updated: 2026-05-19*

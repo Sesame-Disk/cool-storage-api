@@ -181,6 +181,13 @@ purposes:
   for region-sensitive scenarios: hostname routing through nginx, persisted
   region/storage-class behavior, and failover between region-pinned backends.
 
+The legacy shell harnesses in `scripts/test-multiregion.sh` and
+`scripts/test-failover.sh` are still useful for connectivity, routing, and
+manual failover drills, but the canonical active-active correctness proofs now
+live in Go integration tests. Treat the shell harness as operational smoke
+coverage, not as the primary regression signal for same-library concurrent
+writes.
+
 For deterministic local validation, only the primary backend in the main
 compose-based multi-instance path should run GC. Secondary test nodes must keep
 `GC_ENABLED=false` so background GC workers do not race queue-reconciliation or

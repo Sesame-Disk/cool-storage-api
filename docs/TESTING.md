@@ -262,6 +262,12 @@ contention. Use the dedicated multi-region stack only when the behavior under
 test depends on hostname routing, region-specific storage classes, or failover
 between region-pinned backends.
 
+Current high-value coordinator-hardening coverage in that default path includes:
+- mutation-only races across distinct nodes in `internal/integration/multi_instance_mutations_test.go`
+- mixed races with uploads against other HEAD writers, including multi-container `seafhttp upload` vs rename, multi-container `seafhttp upload` vs same-repo move, and multi-container direct v2 upload vs delete
+- upload finalization stress for both upload seams in `internal/integration/upload_finalization_race_test.go`
+- dedicated two-region proofs for both upload seams when the test specifically needs the regional stack
+
 **Integration-test-first rule for backend refactors:**
 - If a change touches dual-write behavior, denormalized projections, counters, sync `HEAD` semantics, cleanup cascades, or cursor pagination boundaries, start with an integration regression before trusting the refactor.
 - Prefer HTTP-level tests in `internal/integration/` and add direct Cassandra assertions when the invariant spans multiple tables.

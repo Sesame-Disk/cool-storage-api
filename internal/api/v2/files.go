@@ -2814,7 +2814,9 @@ func (h *FileHandler) UploadFile(c *gin.Context) {
 
 	// Increment/create block ref_count in blocks table
 	if err := fsHelper.IncrementOrCreateBlock(orgID, sha256ID, len(storedContent), storageClass, ""); err != nil {
-		log.Printf("[UploadFile] WARNING: failed to register block metadata: %v", err)
+		log.Printf("[UploadFile] CRITICAL: failed to register block metadata org=%s block=%s: %v", orgID, sha256ID[:16], err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to store block metadata"})
+		return
 	}
 
 	actualFilename, storageDeltaBytes, storageDeltaFiles, err := h.finalizeStoredUploadMetadata(orgID, userID, repoID, parentDir, filename, fileID, fileSize, replace)

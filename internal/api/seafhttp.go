@@ -1235,7 +1235,9 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 
 	// Register block metadata for size lookups (used by video/audio Range requests)
 	if err := v2.NewFSHelper(h.db).IncrementOrCreateBlock(token.OrgID, sha256ID, len(storedContent), actualStorageClass, ""); err != nil {
-		log.Printf("[HandleUpload] WARNING: Failed to write block metadata org=%s block=%s: %v", token.OrgID, sha256ID[:16], err)
+		log.Printf("[HandleUpload] CRITICAL: Failed to write block metadata org=%s block=%s: %v", token.OrgID, sha256ID[:16], err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to store block metadata"})
+		return
 	}
 
 	// Update filesystem metadata
@@ -1541,7 +1543,8 @@ readLoop:
 			if blkErr := upload.AccountBlockOnce(blockIndexLocal, sha256ID, func() error {
 				return fsHelper.IncrementOrCreateBlock(token.OrgID, sha256ID, len(storedBlock), actualStorageClass, "")
 			}); blkErr != nil {
-				log.Printf("[finalizeUploadStreaming] WARNING: Failed to write block metadata org=%s block=%s: %v", token.OrgID, sha256ID[:16], blkErr)
+				log.Printf("[finalizeUploadStreaming] CRITICAL: Failed to write block metadata org=%s block=%s: %v", token.OrgID, sha256ID[:16], blkErr)
+				return fmt.Errorf("failed to store block metadata: %w", blkErr)
 			}
 
 			upload.Touch()
