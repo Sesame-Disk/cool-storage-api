@@ -264,12 +264,19 @@ func (db *DB) seedDefault(orgID uuid.UUID, template config.OrganizationTemplate,
 		})
 	}
 
+	storageQuota := template.StorageQuota
+	trafficQuota := template.TrafficQuota
+	if devMode {
+		storageQuota = int64(-1)
+		trafficQuota = int64(-1)
+	}
+
 	if err := CreateOrganizationWithUsersAndReadModels(db.Session(), AdminOrganizationWriteSpec{
 		OrgID:                  orgID.String(),
 		Name:                   orgName,
 		Status:                 adminIdentityStatusActive,
 		Settings:               template.Settings,
-		StorageQuota:           template.StorageQuota,
+		StorageQuota:           storageQuota,
 		StorageUsed:            int64(0),
 		ChunkingPolynomial:     template.ChunkingPolynomial,
 		StorageConfig:          template.StorageConfig,
@@ -277,9 +284,9 @@ func (db *DB) seedDefault(orgID uuid.UUID, template config.OrganizationTemplate,
 		Plan:                   template.Plan,
 		QuotaPolicy:            template.QuotaPolicy,
 		BillingCycle:           template.BillingCycle,
-		TrafficQuota:           template.TrafficQuota,
-		TrafficUploadQuota:     template.TrafficUploadQuota,
-		TrafficDownloadQuota:   template.TrafficDownloadQuota,
+		TrafficQuota:           trafficQuota,
+		TrafficUploadQuota:     int64(-1),
+		TrafficDownloadQuota:   int64(-1),
 		MaxUsers:               template.MaxUsers,
 		CurrentPeriodStartedAt: now,
 		CurrentPeriodEndsAt:    periodEnd,

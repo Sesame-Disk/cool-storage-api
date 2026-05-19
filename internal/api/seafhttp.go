@@ -1281,7 +1281,7 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 var errStorageQuotaExceeded = errors.New("storage quota exceeded")
 
 const (
-	uploadMetadataRetryAttempts = 5
+	uploadMetadataRetryAttempts = 20
 	uploadMetadataRetryDelay    = 50 * time.Millisecond
 )
 
@@ -1599,28 +1599,28 @@ func (h *SeafHTTPHandler) commitUploadedFileMultiBlock(orgID, repoID, userID, pa
 }
 
 func (h *SeafHTTPHandler) commitUploadedFileMultiBlockOnce(orgID, repoID, userID, parentDir, filename, fileID string, blockIDs []string, fileSize int64, replace bool) (string, string, int64, int64, error) {
-	storageDeltaBytes, storageDeltaFiles, err := h.checkUploadStorageQuotaForCurrentHead(orgID, repoID, userID, parentDir, filename, fileSize, replace)
+	// Single consistent snapshot: head_commit_id + root_fs_id read together so
+	// the quota delta, tree traversal, and CAS compare all use the same HEAD.
+	fsHelper := v2.NewFSHelper(h.db)
+	snapshot, err := fsHelper.GetLibraryHeadSnapshot(repoID)
 	if err != nil {
-		return "", "", 0, 0, err
-	}
-	var headCommitID string
-	err = h.db.Session().Query(`
-		SELECT head_commit_id FROM libraries WHERE org_id = ? AND library_id = ?
-	`, orgID, repoID).Scan(&headCommitID)
-	if err != nil {
-		return "", "", 0, 0, fmt.Errorf("failed to get head commit: %w", err)
+		return "", "", 0, 0, fmt.Errorf("failed to get library head: %w", err)
 	}
 
-	var rootFSID string
-	err = h.db.Session().Query(`
-		SELECT root_fs_id FROM commits WHERE library_id = ? AND commit_id = ?
-	`, repoID, headCommitID).Scan(&rootFSID)
+	storageDeltaBytes, storageDeltaFiles, err := h.uploadStorageDeltaForRoot(repoID, snapshot.RootFSID, parentDir, filename, fileSize, replace)
 	if err != nil {
-		return "", "", 0, 0, fmt.Errorf("failed to get root fs_id: %w", err)
+		return "", "", 0, 0, fmt.Errorf("failed to compute storage delta: %w", err)
+	}
+	if storageDeltaBytes > 0 {
+		if checker := getAPIQuotaChecker(); checker != nil {
+			if st, _ := checker.CheckStorageQuota(orgID, userID, storageDeltaBytes); !st.Allowed {
+				return "", "", 0, 0, errStorageQuotaExceeded
+			}
+		}
 	}
 
 	log.Printf("[commitUploadedFileMultiBlock] headCommit=%s, rootFSID=%s, parentDir=%s, filename=%s, blocks=%d",
-		headCommitID, rootFSID, parentDir, filename, len(blockIDs))
+		snapshot.HeadCommitID, snapshot.RootFSID, parentDir, filename, len(blockIDs))
 
 	fsContent := map[string]interface{}{
 		"version":   1,
@@ -1635,7 +1635,7 @@ func (h *SeafHTTPHandler) commitUploadedFileMultiBlockOnce(orgID, repoID, userID
 	fsHash := sha1.Sum(fsContentJSON)
 	fileFSID := hex.EncodeToString(fsHash[:])
 
-	newRootFSID, actualFilename, err := h.addFileToDirectory(repoID, rootFSID, parentDir, filename, fileFSID, fileSize, userID, replace)
+	newRootFSID, actualFilename, err := h.addFileToDirectory(repoID, snapshot.RootFSID, parentDir, filename, fileFSID, fileSize, userID, replace)
 	if err != nil {
 		return "", "", 0, 0, fmt.Errorf("failed to add file to directory: %w", err)
 	}
@@ -1663,13 +1663,12 @@ func (h *SeafHTTPHandler) commitUploadedFileMultiBlockOnce(orgID, repoID, userID
 	err = h.db.Session().Query(`
 		INSERT INTO commits (library_id, commit_id, parent_id, root_fs_id, creator_id, description, created_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?)
-	`, repoID, newCommitID, headCommitID, newRootFSID, userID, description, time.Now()).Exec()
+	`, repoID, newCommitID, snapshot.HeadCommitID, newRootFSID, userID, description, time.Now()).Exec()
 	if err != nil {
 		return "", "", 0, 0, fmt.Errorf("failed to create commit: %w", err)
 	}
 
-	fsHelper := v2.NewFSHelper(h.db)
-	if err := fsHelper.UpdateLibraryHead(orgID, repoID, newCommitID, headCommitID); err != nil {
+	if err := fsHelper.UpdateLibraryHead(orgID, repoID, newCommitID, snapshot.HeadCommitID); err != nil {
 		return "", "", 0, 0, fmt.Errorf("failed to update library head: %w", err)
 	}
 
@@ -1704,28 +1703,28 @@ func (h *SeafHTTPHandler) commitUploadedFile(orgID, repoID, userID, parentDir, f
 }
 
 func (h *SeafHTTPHandler) commitUploadedFileOnce(orgID, repoID, userID, parentDir, filename, fileID string, content []byte, fileSize int64, replace bool) (string, string, int64, int64, error) {
-	storageDeltaBytes, storageDeltaFiles, err := h.checkUploadStorageQuotaForCurrentHead(orgID, repoID, userID, parentDir, filename, fileSize, replace)
+	// Single consistent snapshot: head_commit_id + root_fs_id read together so
+	// the quota delta, tree traversal, and CAS compare all use the same HEAD.
+	fsHelper := v2.NewFSHelper(h.db)
+	snapshot, err := fsHelper.GetLibraryHeadSnapshot(repoID)
 	if err != nil {
-		return "", "", 0, 0, err
-	}
-	var headCommitID string
-	err = h.db.Session().Query(`
-		SELECT head_commit_id FROM libraries WHERE org_id = ? AND library_id = ?
-	`, orgID, repoID).Scan(&headCommitID)
-	if err != nil {
-		return "", "", 0, 0, fmt.Errorf("failed to get head commit: %w", err)
+		return "", "", 0, 0, fmt.Errorf("failed to get library head: %w", err)
 	}
 
-	var rootFSID string
-	err = h.db.Session().Query(`
-		SELECT root_fs_id FROM commits WHERE library_id = ? AND commit_id = ?
-	`, repoID, headCommitID).Scan(&rootFSID)
+	storageDeltaBytes, storageDeltaFiles, err := h.uploadStorageDeltaForRoot(repoID, snapshot.RootFSID, parentDir, filename, fileSize, replace)
 	if err != nil {
-		return "", "", 0, 0, fmt.Errorf("failed to get root fs_id: %w", err)
+		return "", "", 0, 0, fmt.Errorf("failed to compute storage delta: %w", err)
+	}
+	if storageDeltaBytes > 0 {
+		if checker := getAPIQuotaChecker(); checker != nil {
+			if st, _ := checker.CheckStorageQuota(orgID, userID, storageDeltaBytes); !st.Allowed {
+				return "", "", 0, 0, errStorageQuotaExceeded
+			}
+		}
 	}
 
 	log.Printf("[commitUploadedFile] headCommit=%s, rootFSID=%s, parentDir=%s, filename=%s",
-		headCommitID, rootFSID, parentDir, filename)
+		snapshot.HeadCommitID, snapshot.RootFSID, parentDir, filename)
 
 	blockID := fileID
 	fsContent := map[string]interface{}{
@@ -1743,7 +1742,7 @@ func (h *SeafHTTPHandler) commitUploadedFileOnce(orgID, repoID, userID, parentDi
 
 	log.Printf("[commitUploadedFile] File fs_id computed: %s (from JSON: %s)", fileFSID, string(fsContentJSON))
 
-	newRootFSID, actualFilename, err := h.addFileToDirectory(repoID, rootFSID, parentDir, filename, fileFSID, fileSize, userID, replace)
+	newRootFSID, actualFilename, err := h.addFileToDirectory(repoID, snapshot.RootFSID, parentDir, filename, fileFSID, fileSize, userID, replace)
 	if err != nil {
 		return "", "", 0, 0, fmt.Errorf("failed to add file to directory: %w", err)
 	}
@@ -1772,13 +1771,12 @@ func (h *SeafHTTPHandler) commitUploadedFileOnce(orgID, repoID, userID, parentDi
 	err = h.db.Session().Query(`
 		INSERT INTO commits (library_id, commit_id, parent_id, root_fs_id, creator_id, description, created_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?)
-	`, repoID, newCommitID, headCommitID, newRootFSID, userID, description, time.Now()).Exec()
+	`, repoID, newCommitID, snapshot.HeadCommitID, newRootFSID, userID, description, time.Now()).Exec()
 	if err != nil {
 		return "", "", 0, 0, fmt.Errorf("failed to create commit: %w", err)
 	}
 
-	fsHelper := v2.NewFSHelper(h.db)
-	if err := fsHelper.UpdateLibraryHead(orgID, repoID, newCommitID, headCommitID); err != nil {
+	if err := fsHelper.UpdateLibraryHead(orgID, repoID, newCommitID, snapshot.HeadCommitID); err != nil {
 		return "", "", 0, 0, fmt.Errorf("failed to update library head: %w", err)
 	}
 

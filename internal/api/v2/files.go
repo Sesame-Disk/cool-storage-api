@@ -88,7 +88,7 @@ func rebuildTraversedDirectoryToRoot(fsHelper *FSHelper, repoID string, result *
 }
 
 const (
-	uploadMetadataRetryAttempts = 5
+	uploadMetadataRetryAttempts = 20
 	uploadMetadataRetryDelay    = 50 * time.Millisecond
 )
 
@@ -2902,12 +2902,9 @@ func (h *FileHandler) finalizeStoredUploadMetadata(orgID, userID, repoID, parent
 }
 
 func (h *FileHandler) finalizeStoredUploadMetadataOnce(fsHelper *FSHelper, orgID, userID, repoID, parentDir, filename, fileID string, fileSize int64, replace bool) (string, int64, int64, error) {
-	headCommitID, err := fsHelper.GetHeadCommitID(repoID)
-	if err != nil {
-		return "", 0, 0, fmt.Errorf("%w: %v", errLibraryNotFound, err)
-	}
-
-	parentResult, err := fsHelper.TraverseToPath(repoID, parentDir)
+	// Capture HEAD and root FS ID in one consistent snapshot so the CAS
+	// compare at publish time uses the exact same HEAD the tree was built from.
+	parentResult, snapshot, err := fsHelper.TraverseToPathAtHead(repoID, parentDir)
 	if err != nil {
 		return "", 0, 0, fmt.Errorf("%w: %v", errParentDirectoryNotFound, err)
 	}
@@ -2988,12 +2985,12 @@ func (h *FileHandler) finalizeStoredUploadMetadataOnce(fsHelper *FSHelper, orgID
 	}
 
 	description := fmt.Sprintf("Added or modified \"%s\".\n", actualFilename)
-	newCommitID, err := fsHelper.CreateCommit(repoID, userID, newRootFSID, headCommitID, description)
+	newCommitID, err := fsHelper.CreateCommit(repoID, userID, newRootFSID, snapshot.HeadCommitID, description)
 	if err != nil {
 		return "", 0, 0, fmt.Errorf("failed to create commit: %w", err)
 	}
 
-	if err := fsHelper.UpdateLibraryHead(orgID, repoID, newCommitID, headCommitID); err != nil {
+	if err := fsHelper.UpdateLibraryHeadFromSnapshot(snapshot, repoID, newCommitID, snapshot.HeadCommitID); err != nil {
 		return "", 0, 0, fmt.Errorf("failed to update library: %w", err)
 	}
 
