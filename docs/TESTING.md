@@ -63,6 +63,18 @@ Do not attach tests to `docker compose up -d --build` itself. That command shoul
 | `frontend-test` | Frontend lint + Jest |
 | `mobile-test` | Mobile typecheck + lint + Vitest + desktop split smoke |
 
+The default Go integration path is now multi-instance inside the compose `test`
+profile: `go-integration-test` and `go-all-test` wait for `sesamefs`,
+`sesamefs-node-2`, and `sesamefs-node-3`, then export `SESAMEFS_URL`,
+`SESAMEFS_URL_2`, and `SESAMEFS_URL_3` so integration tests can exercise real
+cross-process races by default.
+
+Keep background GC isolated to the primary `sesamefs` service in that profile.
+`sesamefs-node-2` and `sesamefs-node-3` must keep `GC_ENABLED=false`, or GC-
+sensitive integration tests become nondeterministic because secondary nodes can
+reconcile queue counters, requeue failed items, or purge expired share links in
+parallel.
+
 ### Test Categories
 
 | Category | Description | Requirements |
@@ -243,6 +255,12 @@ docker compose --profile test run --rm --build go-integration-test
 These tests make HTTP requests to the running backend (same model as bash scripts) and exercise the full stack: API handlers → middleware → database → storage. They don't contribute to `go test -cover` numbers since they're in a separate package making external HTTP calls.
 
 **Docker-first default**: `test.sh` prefers the `go-integration-test` compose service, which waits for `sesamefs` and runs against the compose network.
+
+That service now waits for all three compose-backed backend nodes and is the
+default place to validate coordinator correctness under independent-process
+contention. Use the dedicated multi-region stack only when the behavior under
+test depends on hostname routing, region-specific storage classes, or failover
+between region-pinned backends.
 
 **Integration-test-first rule for backend refactors:**
 - If a change touches dual-write behavior, denormalized projections, counters, sync `HEAD` semantics, cleanup cascades, or cursor pagination boundaries, start with an integration regression before trusting the refactor.

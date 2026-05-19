@@ -220,11 +220,8 @@ start_infrastructure() {
     log_info "Starting infrastructure (Cassandra, MinIO)..."
     $DOCKER_COMPOSE -f "$COMPOSE_FILE" up -d cassandra minio
 
-    # Wait for Cassandra
-    wait_for_cassandra
-
-    # Initialize schema
-    init_cassandra_schema
+    log_info "Bootstrapping Cassandra keyspace..."
+    $DOCKER_COMPOSE -f "$COMPOSE_FILE" up -d cassandra-bootstrap
 
     log_info "Starting MinIO initialization..."
     $DOCKER_COMPOSE -f "$COMPOSE_FILE" up -d minio-init

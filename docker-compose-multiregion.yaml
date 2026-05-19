@@ -66,6 +66,8 @@ services:
     depends_on:
       cassandra:
         condition: service_healthy
+      cassandra-bootstrap:
+        condition: service_completed_successfully
       minio-init:
         condition: service_completed_successfully
     volumes:
@@ -97,6 +99,8 @@ services:
     depends_on:
       cassandra:
         condition: service_healthy
+      cassandra-bootstrap:
+        condition: service_completed_successfully
       minio-init:
         condition: service_completed_successfully
     volumes:
@@ -201,6 +205,36 @@ services:
       retries: 10
       start_period: 60s
     restart: unless-stopped
+
+  # Initialize the shared keyspace before either region server boots. The app
+  # runs migrations on startup, but it still requires the keyspace to exist.
+  cassandra-bootstrap:
+    image: cassandra:5.0
+    depends_on:
+      cassandra:
+        condition: service_healthy
+    entrypoint:
+      - /bin/bash
+      - -ec
+    command:
+      - |
+        set -euo pipefail
+        keyspace="$${CASSANDRA_KEYSPACE:-sesamefs}"
+        local_dc="$${CASSANDRA_DC:-$${CASSANDRA_LOCAL_DC:-datacenter1}}"
+
+        case "$${keyspace}" in
+          [A-Za-z][A-Za-z0-9_]*) ;;
+          *) echo "Invalid Cassandra keyspace identifier: $${keyspace}" >&2; exit 1 ;;
+        esac
+
+        replication="{'class': 'NetworkTopologyStrategy', '$${local_dc}': 1}"
+        cqlsh cassandra -e "CREATE KEYSPACE IF NOT EXISTS $${keyspace} WITH replication = $${replication};"
+        cqlsh cassandra -e "ALTER KEYSPACE $${keyspace} WITH replication = $${replication};"
+    environment:
+      - CASSANDRA_KEYSPACE=${CASSANDRA_KEYSPACE:-sesamefs}
+      - CASSANDRA_DC=${CASSANDRA_DC:-datacenter1}
+      - CASSANDRA_LOCAL_DC=${CASSANDRA_LOCAL_DC:-datacenter1}
+    restart: "no"
 
 volumes:
   cassandra_multiregion_data:

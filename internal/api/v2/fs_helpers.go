@@ -525,7 +525,9 @@ func (h *FSHelper) UpdateLibraryHeadFromSnapshot(snapshot *LibraryHeadSnapshot, 
 	return h.UpdateLibraryHead(snapshot.OrgID, repoID, commitID, snapshot.HeadCommitID)
 }
 
-const libraryHeadMutationRetryAttempts = 5
+// Independent SesameFS nodes can transiently stack more CAS conflicts than the
+// single-process retry budget originally assumed.
+const libraryHeadMutationRetryAttempts = 8
 
 var libraryHeadMutationRetryDelay = 50 * time.Millisecond
 

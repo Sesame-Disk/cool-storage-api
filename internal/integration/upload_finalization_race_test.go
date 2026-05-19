@@ -356,18 +356,24 @@ func TestConcurrentSeafhttpUploadsToSubdirNoLostCommits(t *testing.T) {
 //   SESAMEFS_URL=http://localhost:3000 SESAMEFS_URL_2=http://localhost:4001 \
 //     go test -tags integration ./internal/integration/ -run TestConcurrentTwoRegionUploadsNoLostCommits -v
 
-func TestConcurrentTwoRegionUploadsNoLostCommits(t *testing.T) {
+func requireSecondRegionUploadRaceClient(t *testing.T) (*testClient, string) {
+	t.Helper()
+
 	url2 := os.Getenv("SESAMEFS_URL_2")
 	if url2 == "" {
 		t.Skip("SESAMEFS_URL_2 not set — start the EU region with docker-compose-multiregion.yaml and set the env var")
 	}
 
 	region2Client := newTestClient(url2, "dev-token-admin")
-
-	// Verify the second region is reachable and authenticated
 	if err := verifyIntegrationAuth(url2, "dev-token-admin"); err != nil {
 		t.Skipf("second region %s not reachable or not authenticated: %v", url2, err)
 	}
+
+	return region2Client, url2
+}
+
+func TestConcurrentTwoRegionUploadsNoLostCommits(t *testing.T) {
+	region2Client, url2 := requireSecondRegionUploadRaceClient(t)
 
 	const perRegion = 8
 	repoID := createTestLibrary(t, adminClient, fmt.Sprintf("inttest-tworegion-%d", time.Now().UnixNano()))
@@ -431,6 +437,69 @@ func TestConcurrentTwoRegionUploadsNoLostCommits(t *testing.T) {
 	}
 
 	// Use region1 client for listing (both regions share Cassandra)
+	expectEntriesPresent(t, repoID, "/", allNames)
+}
+
+// The direct v2 upload endpoint has its own metadata-finalization path in
+// files.go. This test makes both regions race through that path against the
+// same library HEAD so the multi-process proof covers both upload seams.
+func TestConcurrentTwoRegionV2UploadsNoLostCommits(t *testing.T) {
+	region2Client, _ := requireSecondRegionUploadRaceClient(t)
+
+	const perRegion = 6
+	repoID := createTestLibrary(t, adminClient, fmt.Sprintf("inttest-tworegion-v2-%d", time.Now().UnixNano()))
+
+	allNames := make([]string, 0, perRegion*2)
+	region1Names := make([]string, perRegion)
+	region2Names := make([]string, perRegion)
+	for i := 0; i < perRegion; i++ {
+		region1Names[i] = fmt.Sprintf("v2-usa-%02d.txt", i)
+		region2Names[i] = fmt.Sprintf("v2-eu-%02d.txt", i)
+		allNames = append(allNames, region1Names[i], region2Names[i])
+	}
+
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	errs := make(chan error, perRegion*2)
+
+	for _, name := range region1Names {
+		name := name
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			r := uploadViaV2DirectConcurrent(adminClient, repoID, name, "/", fmt.Sprintf("region1 %s at %d\n", name, time.Now().UnixNano()))
+			if r.err != nil {
+				errs <- fmt.Errorf("region1 %s: %w", name, r.err)
+			} else if r.status != http.StatusOK && r.status != http.StatusCreated {
+				errs <- fmt.Errorf("region1 %s: status %d body %s", name, r.status, r.body)
+			}
+		}()
+	}
+
+	for _, name := range region2Names {
+		name := name
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			r := uploadViaV2DirectConcurrent(region2Client, repoID, name, "/", fmt.Sprintf("region2 %s at %d\n", name, time.Now().UnixNano()))
+			if r.err != nil {
+				errs <- fmt.Errorf("region2 %s: %w", name, r.err)
+			} else if r.status != http.StatusOK && r.status != http.StatusCreated {
+				errs <- fmt.Errorf("region2 %s: status %d body %s", name, r.status, r.body)
+			}
+		}()
+	}
+
+	close(start)
+	wg.Wait()
+	close(errs)
+
+	for err := range errs {
+		t.Errorf("upload error: %v", err)
+	}
+
 	expectEntriesPresent(t, repoID, "/", allNames)
 }
 
