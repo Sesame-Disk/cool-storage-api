@@ -342,9 +342,25 @@ func (h *FSHelper) CreateDirectoryFSObject(repoID string, entries []FSEntry) (st
 // RebuildPathToRoot rebuilds the path from a modified directory back to root
 // Returns the new root fs_id
 func (h *FSHelper) RebuildPathToRoot(repoID string, result *PathTraverseResult, newParentFSID string) (string, error) {
+	return rebuildPathToRootWithHooks(repoID, result, newParentFSID, h.GetDirectoryEntries, h.CreateDirectoryFSObject)
+}
+
+func rebuildPathToRootWithHooks(repoID string, result *PathTraverseResult, newParentFSID string, getDirectoryEntries func(string, string) ([]FSEntry, error), createDirectoryFSObject func(string, []FSEntry) (string, error)) (string, error) {
+	if result == nil {
+		return "", fmt.Errorf("path traverse result is required")
+	}
+	if getDirectoryEntries == nil || createDirectoryFSObject == nil {
+		return "", fmt.Errorf("rebuild path helpers are required")
+	}
+	if len(result.Ancestors) != len(result.AncestorPath) {
+		return "", fmt.Errorf("path traverse result has %d ancestors but %d ancestor paths", len(result.Ancestors), len(result.AncestorPath))
+	}
 	if len(result.Ancestors) == 0 {
 		// Parent was root, new parent FS ID is the new root
 		return newParentFSID, nil
+	}
+	if strings.TrimSpace(result.AncestorPath[len(result.AncestorPath)-1]) == "" {
+		return "", fmt.Errorf("path traverse result has empty ancestor path for rebuild")
 	}
 
 	currentFSID := newParentFSID
@@ -361,23 +377,31 @@ func (h *FSHelper) RebuildPathToRoot(repoID string, result *PathTraverseResult, 
 	for i := len(result.Ancestors) - 2; i >= 0; i-- {
 		ancestorFSID := result.Ancestors[i]
 		ancestorPath := result.AncestorPath[i]
+		if strings.TrimSpace(ancestorPath) == "" {
+			return "", fmt.Errorf("path traverse result has empty ancestor path at index %d", i)
+		}
 
 		// Get ancestor's entries
-		entries, err := h.GetDirectoryEntries(repoID, ancestorFSID)
+		entries, err := getDirectoryEntries(repoID, ancestorFSID)
 		if err != nil {
 			return "", fmt.Errorf("failed to get ancestor %s: %w", ancestorPath, err)
 		}
 
 		// Update the child reference in ancestor
+		found := false
 		for j := range entries {
 			if entries[j].Name == currentName {
 				entries[j].ID = currentFSID
+				found = true
 				break
 			}
 		}
+		if !found {
+			return "", fmt.Errorf("failed to rebuild path at %s: child %q not found", ancestorPath, currentName)
+		}
 
 		// Create new fs_object for modified ancestor
-		newAncestorFSID, err := h.CreateDirectoryFSObject(repoID, entries)
+		newAncestorFSID, err := createDirectoryFSObject(repoID, entries)
 		if err != nil {
 			return "", fmt.Errorf("failed to create ancestor fs_object: %w", err)
 		}

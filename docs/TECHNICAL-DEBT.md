@@ -1229,6 +1229,7 @@ Remaining OnlyOffice-specific follow-ups after that hardening:
 - Commit reachability still walks `parent_id` without a hop bound. Deep histories or malformed ancestry can make reconciliation expensive even though cycle detection is present.
 - `blockMetadataRegistered` is now effectively a readability guard only: any pre-registration failure returns early, so the later rollback branch only sees the `true` case. Safe, but low-priority cleanup remains.
 - `IncrementOrCreateBlock` failure is now intentionally fatal. This is a deliberate behavior change from the earlier buggy path that could continue to metadata publish after failing to confirm the block row.
+- There is still no fault-injection test that forces failure around `updateOnlyOfficePendingBlockCommitID` / stale-row reconciliation. The current write order is safer than before because `publish_commit_id` is persisted before the library-head CAS, but the reconciler still deserves direct regression coverage for partial-write scenarios.
 
 Mitigation: pipe these through a small `cleanupQueue` (durable or in-memory bounded) with retry. Out of scope for this branch; track separately.
 
@@ -1265,6 +1266,26 @@ now run through:
 The remaining debt is operational ergonomics: the shell harnesses are still the
 easiest place to script smoke checks for routing/failover, but they are no
 longer the canonical regression surface for active-active write correctness.
+
+### 19.m. Directory Read Paths Still Resolve HEAD and Root in Separate Queries
+
+`ListDirectory` and `ListDirectoryV21` still read `head_commit_id` from
+`libraries`, then do a second `SELECT` on `commits` for `root_fs_id`. This is
+the same split-read shape used inside `GetLibraryHeadSnapshot`; there is still
+no truly atomic cross-table snapshot for read paths.
+
+That means a transient replication or visibility gap can still surface as
+`failed to load library data` even though the state is converging correctly.
+This is currently treated as read-availability debt rather than write
+correctness debt:
+- the canonical HEAD source of truth is still `libraries.head_commit_id`;
+- write paths rebuild from a fixed HEAD/root pair before publishing;
+- the remaining issue is that some read paths can return a transient 500 rather
+  than retrying or surfacing a more explicit transient-read failure.
+
+If we tighten this later, the safe follow-up is a bounded read retry/backoff or
+explicit transient error mapping around the `libraries -> commits` lookup pair,
+not merely swapping `ListDirectory` over to `GetLibraryHeadSnapshot`.
 
 ---
 

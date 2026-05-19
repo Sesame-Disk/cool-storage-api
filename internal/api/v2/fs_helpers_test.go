@@ -681,6 +681,110 @@ func TestRebuildPathToRoot_CreateDirectory_Pattern(t *testing.T) {
 	}
 }
 
+func TestRebuildPathToRootRejectsNilResult(t *testing.T) {
+	_, err := rebuildPathToRootWithHooks("repo", nil, "new-root",
+		func(string, string) ([]FSEntry, error) { return nil, nil },
+		func(string, []FSEntry) (string, error) { return "", nil },
+	)
+	if err == nil {
+		t.Fatal("rebuildPathToRootWithHooks(nil) error = nil, want error")
+	}
+}
+
+func TestRebuildPathToRootRejectsMismatchedAncestorLengths(t *testing.T) {
+	result := &PathTraverseResult{
+		Ancestors:    []string{"root", "folder"},
+		AncestorPath: []string{"/"},
+	}
+
+	_, err := rebuildPathToRootWithHooks("repo", result, "new-root",
+		func(string, string) ([]FSEntry, error) { return nil, nil },
+		func(string, []FSEntry) (string, error) { return "", nil },
+	)
+	if err == nil {
+		t.Fatal("rebuildPathToRootWithHooks(mismatched lengths) error = nil, want error")
+	}
+}
+
+func TestRebuildPathToRootRejectsMissingChildInAncestor(t *testing.T) {
+	result := &PathTraverseResult{
+		Ancestors:    []string{"root_fsid", "a_fsid", "b_fsid"},
+		AncestorPath: []string{"/", "/a", "/a/b"},
+	}
+
+	createCalls := 0
+	_, err := rebuildPathToRootWithHooks("repo", result, "new-b",
+		func(_ string, fsID string) ([]FSEntry, error) {
+			switch fsID {
+			case "a_fsid":
+				return []FSEntry{{Name: "other-child", ID: "old"}}, nil
+			case "root_fsid":
+				return []FSEntry{{Name: "a", ID: "old-a"}}, nil
+			default:
+				return nil, nil
+			}
+		},
+		func(string, []FSEntry) (string, error) {
+			createCalls++
+			return "should-not-happen", nil
+		},
+	)
+	if err == nil {
+		t.Fatal("rebuildPathToRootWithHooks(missing child) error = nil, want error")
+	}
+	if createCalls != 0 {
+		t.Fatalf("createDirectoryFSObject called %d times, want 0", createCalls)
+	}
+}
+
+func TestRebuildPathToRootRebuildsAncestorsWithHooks(t *testing.T) {
+	result := &PathTraverseResult{
+		Ancestors:    []string{"root_fsid", "a_fsid", "b_fsid"},
+		AncestorPath: []string{"/", "/a", "/a/b"},
+	}
+
+	var created [][]FSEntry
+	newRootFSID, err := rebuildPathToRootWithHooks("repo", result, "new-b",
+		func(_ string, fsID string) ([]FSEntry, error) {
+			switch fsID {
+			case "a_fsid":
+				return []FSEntry{{Name: "b", ID: "old-b"}, {Name: "peer", ID: "peer-id"}}, nil
+			case "root_fsid":
+				return []FSEntry{{Name: "a", ID: "old-a"}, {Name: "top", ID: "top-id"}}, nil
+			default:
+				return nil, nil
+			}
+		},
+		func(_ string, entries []FSEntry) (string, error) {
+			copied := append([]FSEntry(nil), entries...)
+			created = append(created, copied)
+			switch len(created) {
+			case 1:
+				return "new-a", nil
+			case 2:
+				return "new-root", nil
+			default:
+				return "unexpected", nil
+			}
+		},
+	)
+	if err != nil {
+		t.Fatalf("rebuildPathToRootWithHooks() error = %v, want nil", err)
+	}
+	if newRootFSID != "new-root" {
+		t.Fatalf("new root fsid = %q, want %q", newRootFSID, "new-root")
+	}
+	if len(created) != 2 {
+		t.Fatalf("created ancestors = %d, want 2", len(created))
+	}
+	if created[0][0].Name != "b" || created[0][0].ID != "new-b" {
+		t.Fatalf("first rebuild updated child = %#v, want name=b id=new-b", created[0][0])
+	}
+	if created[1][0].Name != "a" || created[1][0].ID != "new-a" {
+		t.Fatalf("second rebuild updated child = %#v, want name=a id=new-a", created[1][0])
+	}
+}
+
 // TestTraverseToPath_AncestorStructure verifies the expected ancestor structure
 // for various path depths. This is critical for RebuildPathToRoot to work.
 func TestTraverseToPath_AncestorStructure(t *testing.T) {
