@@ -56,6 +56,50 @@ func TestBatchDeleteItemsMissingNestedParentReturnsNotFound(t *testing.T) {
 	expectErrorResponseContains(t, resp, http.StatusNotFound, "parent directory not found", "directory not found", missingRoot)
 }
 
+func TestCreateFileOfficeTemplateMissingParentReturnsNotFoundWithoutAdvancingHead(t *testing.T) {
+	repoID := createTestLibrary(t, adminClient, fmt.Sprintf("inttest-docx-parent-missing-%d", time.Now().UnixNano()))
+	initialHead := getRepoHeadCommit(t, adminClient, repoID)
+	if initialHead == "" {
+		t.Fatal("could not resolve initial head commit")
+	}
+
+	missingRoot := fmt.Sprintf("missing-docx-%d", time.Now().UnixNano())
+	missingPath := "/" + missingRoot + "/child/report.docx"
+
+	resp := adminClient.PostForm(t, fmt.Sprintf("/api2/repos/%s/file/?operation=create&p=%s", repoID, url.QueryEscape(missingPath)), url.Values{})
+	expectErrorResponseContains(t, resp, http.StatusNotFound, "parent directory not found", "directory not found", missingRoot)
+
+	if head := getRepoHeadCommit(t, adminClient, repoID); head != initialHead {
+		t.Fatalf("head commit after failed docx create = %q, want %q", head, initialHead)
+	}
+	expectEntriesAbsent(t, repoID, "/", []string{missingRoot})
+}
+
+func TestCreateFileOfficeTemplateExistingFileReturnsConflictWithoutAdvancingHead(t *testing.T) {
+	repoID := createTestLibrary(t, adminClient, fmt.Sprintf("inttest-docx-conflict-%d", time.Now().UnixNano()))
+	filePath := "/report.docx"
+
+	resp := adminClient.PostForm(t, fmt.Sprintf("/api2/repos/%s/file/?operation=create&p=%s", repoID, url.QueryEscape(filePath)), url.Values{})
+	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
+		body := responseBody(t, resp)
+		t.Fatalf("initial docx create status = %d, want 200 or 201; body=%s", resp.StatusCode, body)
+	}
+	resp.Body.Close()
+
+	headBeforeConflict := getRepoHeadCommit(t, adminClient, repoID)
+	if headBeforeConflict == "" {
+		t.Fatal("could not resolve head commit before docx conflict")
+	}
+
+	resp = adminClient.PostForm(t, fmt.Sprintf("/api2/repos/%s/file/?operation=create&p=%s", repoID, url.QueryEscape(filePath)), url.Values{})
+	expectErrorResponseContains(t, resp, http.StatusConflict, "file already exists")
+
+	if head := getRepoHeadCommit(t, adminClient, repoID); head != headBeforeConflict {
+		t.Fatalf("head commit after conflicting docx create = %q, want %q", head, headBeforeConflict)
+	}
+	expectEntriesPresent(t, repoID, "/", []string{"report.docx"})
+}
+
 func TestRevertFileMissingNestedParentReturnsNotFound(t *testing.T) {
 	repoID := createTestLibrary(t, adminClient, fmt.Sprintf("inttest-parent-missing-revertfile-%d", time.Now().UnixNano()))
 	rootDir := fmt.Sprintf("missing-revert-file-%d", time.Now().UnixNano())

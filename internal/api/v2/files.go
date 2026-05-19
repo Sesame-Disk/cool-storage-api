@@ -1066,6 +1066,9 @@ func (h *FileHandler) CreateFile(c *gin.Context) {
 	var fileSize int64
 	var blockIDs []string
 	var templateBlockData *storage.BlockData
+	// These survive across retry attempts. Office templates are content-addressed
+	// by SHA-256, so reusing the first successful upload avoids rewriting the
+	// same bytes on later CAS retries.
 	var templateBlockStore *storage.BlockStore
 	var templateBlockStored bool
 

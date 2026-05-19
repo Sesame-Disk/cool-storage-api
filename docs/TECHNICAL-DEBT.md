@@ -1227,6 +1227,18 @@ The work in `feat/library-write-coordinator` (block pipeline + local mutex coord
 
 This is intentional debt, tracked here for completeness with section 5 (Web Upload Pipeline Follow-Ups).
 
+### 19.k. Office-Template `CreateFile` Can Leave an Unpublished Physical Block After Exhausted CAS Retries
+
+`internal/api/v2/files.go:1068-1141` now delays Office template upload until after parent-path validation and duplicate-name checks, which fixes the larger regression where `.docx/.xlsx/.pptx` creates could materialize data before a guaranteed `404` or `409`.
+
+However, once a retry attempt successfully uploads the template blob and later loses the HEAD CAS, `templateBlockStored` remains true across retries. If the retry loop eventually exhausts without publishing any commit, the physical blob can remain in block storage even though no library HEAD references it.
+
+This is acceptable for now because the template block ID is deterministic and content-addressed (SHA-256 of the template bytes), so repeated retries do not spray distinct blobs and future creates may reuse the same object. A naive rollback delete would be unsafe without tracking whether the blob pre-existed or is concurrently referenced by another successful create.
+
+If this ever needs to be tightened, the safe options are:
+- record/refcount template blobs before publish so failed creates can roll back via metadata rather than raw deletes;
+- or track whether `PutBlockData` created a new object vs reused an existing one, then delete only newly-created unreferenced blobs on final failure.
+
 ---
 
 *Last updated: 2026-05-18*
