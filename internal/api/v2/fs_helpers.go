@@ -535,6 +535,13 @@ var libraryHeadMutationRetryJitter = 25 * time.Millisecond
 
 var libraryHeadMutationRetryJitterInt63n = rand.Int63n
 
+// RetryBackoff returns the exponential-with-jitter delay between
+// upload-metadata-publish or library-head-mutation retry attempts. Both retry
+// paths share the same CAS conflict semantics, so they share one schedule.
+func RetryBackoff(attempt int) time.Duration {
+	return libraryHeadMutationRetryBackoff(attempt)
+}
+
 func libraryHeadMutationRetryBackoff(attempt int) time.Duration {
 	if attempt < 1 || libraryHeadMutationRetryDelay <= 0 {
 		return 0

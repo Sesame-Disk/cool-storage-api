@@ -1280,10 +1280,9 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 
 var errStorageQuotaExceeded = errors.New("storage quota exceeded")
 
-const (
-	uploadMetadataRetryAttempts = 20
-	uploadMetadataRetryDelay    = 50 * time.Millisecond
-)
+// Upload-finalize retries share v2.RetryBackoff for the per-attempt delay
+// (exponential with jitter, capped). Only the attempt count is local.
+const uploadMetadataRetryAttempts = 20
 
 func (h *SeafHTTPHandler) checkUploadStorageQuotaForCurrentHead(orgID, repoID, userID, parentDir, filename string, fileSize int64, replace bool) (int64, int64, error) {
 	deltaBytes, deltaFiles, err := h.uploadStorageDeltaForCurrentHead(orgID, repoID, parentDir, filename, fileSize, replace)
@@ -1590,8 +1589,9 @@ func (h *SeafHTTPHandler) commitUploadedFileMultiBlock(orgID, repoID, userID, pa
 		if attempt == uploadMetadataRetryAttempts {
 			break
 		}
-		log.Printf("[commitUploadedFileMultiBlock] Retrying metadata publish for repo=%s after head conflict (%d/%d)", repoID, attempt, uploadMetadataRetryAttempts)
-		time.Sleep(uploadMetadataRetryDelay)
+		sleepFor := v2.RetryBackoff(attempt)
+		log.Printf("[commitUploadedFileMultiBlock] Retrying metadata publish for repo=%s after head conflict (%d/%d), sleeping %s", repoID, attempt, uploadMetadataRetryAttempts, sleepFor)
+		time.Sleep(sleepFor)
 	}
 
 	log.Printf("[commitUploadedFileMultiBlock] Exhausted metadata retries for repo=%s: %v", repoID, lastConflict)
@@ -1668,7 +1668,7 @@ func (h *SeafHTTPHandler) commitUploadedFileMultiBlockOnce(orgID, repoID, userID
 		return "", "", 0, 0, fmt.Errorf("failed to create commit: %w", err)
 	}
 
-	if err := fsHelper.UpdateLibraryHead(orgID, repoID, newCommitID, snapshot.HeadCommitID); err != nil {
+	if err := fsHelper.UpdateLibraryHeadFromSnapshot(snapshot, repoID, newCommitID, snapshot.HeadCommitID); err != nil {
 		return "", "", 0, 0, fmt.Errorf("failed to update library head: %w", err)
 	}
 
@@ -1694,8 +1694,9 @@ func (h *SeafHTTPHandler) commitUploadedFile(orgID, repoID, userID, parentDir, f
 		if attempt == uploadMetadataRetryAttempts {
 			break
 		}
-		log.Printf("[commitUploadedFile] Retrying metadata publish for repo=%s after head conflict (%d/%d)", repoID, attempt, uploadMetadataRetryAttempts)
-		time.Sleep(uploadMetadataRetryDelay)
+		sleepFor := v2.RetryBackoff(attempt)
+		log.Printf("[commitUploadedFile] Retrying metadata publish for repo=%s after head conflict (%d/%d), sleeping %s", repoID, attempt, uploadMetadataRetryAttempts, sleepFor)
+		time.Sleep(sleepFor)
 	}
 
 	log.Printf("[commitUploadedFile] Exhausted metadata retries for repo=%s: %v", repoID, lastConflict)
@@ -1776,7 +1777,7 @@ func (h *SeafHTTPHandler) commitUploadedFileOnce(orgID, repoID, userID, parentDi
 		return "", "", 0, 0, fmt.Errorf("failed to create commit: %w", err)
 	}
 
-	if err := fsHelper.UpdateLibraryHead(orgID, repoID, newCommitID, snapshot.HeadCommitID); err != nil {
+	if err := fsHelper.UpdateLibraryHeadFromSnapshot(snapshot, repoID, newCommitID, snapshot.HeadCommitID); err != nil {
 		return "", "", 0, 0, fmt.Errorf("failed to update library head: %w", err)
 	}
 

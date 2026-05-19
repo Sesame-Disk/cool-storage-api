@@ -87,10 +87,9 @@ func rebuildTraversedDirectoryToRoot(fsHelper *FSHelper, repoID string, result *
 	return fsHelper.RebuildPathToRoot(repoID, result, newParentFSID)
 }
 
-const (
-	uploadMetadataRetryAttempts = 20
-	uploadMetadataRetryDelay    = 50 * time.Millisecond
-)
+// Upload-finalize retry shares libraryHeadMutationRetryBackoff for per-attempt
+// delay (exponential with jitter, capped). Only the attempt count is local.
+const uploadMetadataRetryAttempts = 20
 
 // Dirent represents a directory entry in Seafile API format
 // This matches the exact format expected by Seafile clients
@@ -2893,8 +2892,9 @@ func (h *FileHandler) finalizeStoredUploadMetadata(orgID, userID, repoID, parent
 		if attempt == uploadMetadataRetryAttempts {
 			break
 		}
-		log.Printf("[UploadFile] Retrying metadata publish for repo=%s after head conflict (%d/%d)", repoID, attempt, uploadMetadataRetryAttempts)
-		time.Sleep(uploadMetadataRetryDelay)
+		sleepFor := libraryHeadMutationRetryBackoff(attempt)
+		log.Printf("[UploadFile] Retrying metadata publish for repo=%s after head conflict (%d/%d), sleeping %s", repoID, attempt, uploadMetadataRetryAttempts, sleepFor)
+		time.Sleep(sleepFor)
 	}
 
 	log.Printf("[UploadFile] Exhausted metadata retries for repo=%s: %v", repoID, lastConflict)

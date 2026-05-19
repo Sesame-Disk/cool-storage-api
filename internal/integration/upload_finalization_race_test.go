@@ -78,6 +78,40 @@ func uploadViaLinkConcurrent(c *testClient, uploadURL, filename, parentDir, cont
 	return concurrentMutationResult{status: resp.StatusCode, body: string(body)}
 }
 
+// uploadViaV2DirectConcurrent posts a multipart file to the direct v2 upload
+// endpoint so the request exercises files.go UploadFile and
+// finalizeStoredUploadMetadataOnce instead of seafhttp.
+func uploadViaV2DirectConcurrent(c *testClient, repoID, filename, parentDir, content string) concurrentMutationResult {
+	var buf bytes.Buffer
+	w := multipart.NewWriter(&buf)
+	if part, err := w.CreateFormFile("file", filename); err != nil {
+		return concurrentMutationResult{err: err}
+	} else if _, err := part.Write([]byte(content)); err != nil {
+		return concurrentMutationResult{err: err}
+	}
+	if err := w.WriteField("parent_dir", parentDir); err != nil {
+		return concurrentMutationResult{err: err}
+	}
+	if err := w.Close(); err != nil {
+		return concurrentMutationResult{err: err}
+	}
+
+	req, err := http.NewRequest(http.MethodPost, c.baseURL+"/api/v2.1/repos/"+repoID+"/upload", &buf)
+	if err != nil {
+		return concurrentMutationResult{err: err}
+	}
+	req.Header.Set("Authorization", "Token "+c.token)
+	req.Header.Set("Content-Type", w.FormDataContentType())
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return concurrentMutationResult{err: err}
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	return concurrentMutationResult{status: resp.StatusCode, body: string(body)}
+}
+
 // ── 1. High-concurrency seafhttp upload (commitUploadedFile path) ─────────────
 //
 // 16 goroutines race to finalise their upload metadata against the same library
@@ -248,16 +282,15 @@ func TestConcurrentSeafhttpUploadWhileDeletingNoLostFiles(t *testing.T) {
 
 // ── 4. Concurrent v2 uploads (finalizeStoredUploadMetadataOnce) ──────────────
 //
-// The v2 API upload path (POST /api/v2.1/repos/:id/upload-link/ then POST to
-// the returned URL) calls finalizeStoredUploadMetadata which has the same
-// snapshot inconsistency as the seafhttp paths. This test fires 10 concurrent
-// v2 uploads to confirm the retry logic converges with no lost commits.
+// The direct v2 API upload path (POST /api/v2.1/repos/:id/upload) calls
+// finalizeStoredUploadMetadata, which had the same snapshot inconsistency as
+// the seafhttp paths. This test fires 10 concurrent direct uploads to confirm
+// the retry logic converges with no lost commits.
 
 func TestConcurrentV2UploadsNoLostCommits(t *testing.T) {
 	const concurrency = 10
 
 	repoID := createTestLibrary(t, adminClient, fmt.Sprintf("inttest-v2upload-race-%d", time.Now().UnixNano()))
-	uploadURL := getUploadLink(t, adminClient, repoID, "/")
 
 	names := make([]string, concurrency)
 	for i := range names {
@@ -266,7 +299,7 @@ func TestConcurrentV2UploadsNoLostCommits(t *testing.T) {
 
 	results := runConcurrentMutations(t, names, func(name string) concurrentMutationResult {
 		content := fmt.Sprintf("v2 upload %s at %d\n", name, time.Now().UnixNano())
-		r := uploadViaLinkConcurrent(adminClient, uploadURL, name, "/", content)
+		r := uploadViaV2DirectConcurrent(adminClient, repoID, name, "/", content)
 		r.name = name
 		return r
 	})
@@ -316,17 +349,17 @@ func TestConcurrentSeafhttpUploadsToSubdirNoLostCommits(t *testing.T) {
 // CAS correctness: two independent Go processes both trying to advance HEAD of
 // the same library at the same time, with no in-process coordination.
 //
-// Run the EU region instance with:
-//   docker compose -f docker-compose.yaml -f docker-compose.multiregion.yaml up -d
+// Bring up both regions with:
+//   docker compose -f docker-compose-multiregion.yaml up -d
 //
-// Then run this test with:
+// Then run this test with (3000 = USA, 4001 = EU; see compose port mappings):
 //   SESAMEFS_URL=http://localhost:3000 SESAMEFS_URL_2=http://localhost:4001 \
 //     go test -tags integration ./internal/integration/ -run TestConcurrentTwoRegionUploadsNoLostCommits -v
 
 func TestConcurrentTwoRegionUploadsNoLostCommits(t *testing.T) {
 	url2 := os.Getenv("SESAMEFS_URL_2")
 	if url2 == "" {
-		t.Skip("SESAMEFS_URL_2 not set — start the EU region with docker-compose.multiregion.yaml and set the env var")
+		t.Skip("SESAMEFS_URL_2 not set — start the EU region with docker-compose-multiregion.yaml and set the env var")
 	}
 
 	region2Client := newTestClient(url2, "dev-token-admin")

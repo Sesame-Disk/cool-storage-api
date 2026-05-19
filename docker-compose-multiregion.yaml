@@ -50,6 +50,10 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+    # Direct host port so integration tests can hit each region without going
+    # through the LB. Override the host port with SESAMEFS_USA_HOST_PORT.
+    ports:
+      - "${SESAMEFS_USA_HOST_PORT:-3000}:8080"
     environment:
       - PORT=${PORT:-8080}
       - SERVER_REGION=usa
@@ -79,6 +83,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+    ports:
+      - "${SESAMEFS_EU_HOST_PORT:-4001}:8080"
     environment:
       - PORT=${PORT:-8080}
       - SERVER_REGION=eu
