@@ -1158,6 +1158,10 @@ Mitigation paths:
 
 Hard to avoid safely (the replaced entry can legitimately change between attempts), so the current behavior is the correct conservative choice — but the retry cost is amortized poorly when a directory replace has many descendants.
 
+The same retry-amplification pattern applies to copy block reference accounting: same-repo copy pins copied block refs inside the retry attempt, rolls them back if the HEAD CAS loses, and pins again on the next attempt. This is functionally correct and keeps refcounts balanced, but a contended copy of N blocks can issue multiple rounds of LWT refcount writes before one publish wins.
+
+Retried metadata mutations can also leave unpublished rows behind. Each failed attempt may have created new `fs_objects` and a `commits` row whose commit never becomes a library HEAD. This is not a functional regression, but CAS retries multiply the amount of unreachable metadata compared with a single failed publish. A future maintenance pass should add observability or cleanup for unpublished commit/fs-object rows.
+
 ### 19.d. `UpdateLibraryHeadFromSnapshot` Validates an Argument Every Caller Passes Mechanically
 
 `internal/api/v2/fs_helpers.go` requires `expectedHead` as a parameter and validates `expectedHead == snapshot.HeadCommitID`. Current production call sites in `batch_operations.go`, `files.go`, `onlyoffice.go`, and `trash.go` all pass `snapshot.HeadCommitID` literally.

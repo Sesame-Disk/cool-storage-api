@@ -55,6 +55,14 @@ func preCheckStorageQuotaForDelta(c *gin.Context, orgID, userID string, deltaByt
 }
 
 func preCheckStorageQuotaForDeltaWithKey(c *gin.Context, orgID, userID string, deltaBytes int64, errorKey string) bool {
+	if !storageQuotaAllowsDelta(orgID, userID, deltaBytes) {
+		c.JSON(http.StatusForbidden, gin.H{quotaErrorPayloadKey(errorKey): "storage quota exceeded"})
+		return false
+	}
+	return true
+}
+
+func storageQuotaAllowsDelta(orgID, userID string, deltaBytes int64) bool {
 	if deltaBytes <= 0 {
 		return true
 	}
@@ -63,11 +71,7 @@ func preCheckStorageQuotaForDeltaWithKey(c *gin.Context, orgID, userID string, d
 		return true
 	}
 	st, _ := checker.CheckStorageQuota(orgID, userID, deltaBytes)
-	if !st.Allowed {
-		c.JSON(http.StatusForbidden, gin.H{quotaErrorPayloadKey(errorKey): "storage quota exceeded"})
-		return false
-	}
-	return true
+	return st.Allowed
 }
 
 // applyStorageCounterDelta calls AdjustStorageCountersByDeltaSync and, on error,

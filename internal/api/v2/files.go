@@ -45,8 +45,47 @@ var formatSizeSeafile = httputil.FormatSizeSeafile
 var formatRelativeTimeHTML = httputil.FormatRelativeTimeHTML
 
 var errUploadStorageQuotaExceeded = errors.New("storage quota exceeded")
-var errUploadLibraryNotFound = errors.New("library not found")
-var errUploadParentDirNotFound = errors.New("parent directory not found")
+var errLibraryNotFound = errors.New("library not found")
+var errParentDirectoryNotFound = errors.New("parent directory not found")
+var errFileExists = errors.New("file already exists")
+var errDirectoryExists = errors.New("directory already exists")
+var errBlockStorageUnavailable = errors.New("block storage not available")
+
+func errorMessageOrFallback(err error, fallback string) string {
+	if err == nil || err.Error() == "" {
+		return fallback
+	}
+	if err.Error() == errLibraryNotFound.Error() || err.Error() == errParentDirectoryNotFound.Error() {
+		return fallback
+	}
+	return err.Error()
+}
+
+func rebuildTraversedDirectoryToRoot(fsHelper *FSHelper, repoID string, result *PathTraverseResult, dirPath, newDirFSID string) (string, error) {
+	if dirPath == "/" {
+		return newDirFSID, nil
+	}
+
+	dirName := path.Base(dirPath)
+	updatedParentEntries := make([]FSEntry, len(result.Entries))
+	found := false
+	for i, entry := range result.Entries {
+		if entry.Name == dirName {
+			entry.ID = newDirFSID
+			found = true
+		}
+		updatedParentEntries[i] = entry
+	}
+	if !found {
+		return "", fmt.Errorf("directory %q not found in parent", dirName)
+	}
+
+	newParentFSID, err := fsHelper.CreateDirectoryFSObject(repoID, updatedParentEntries)
+	if err != nil {
+		return "", fmt.Errorf("failed to update parent directory: %w", err)
+	}
+	return fsHelper.RebuildPathToRoot(repoID, result, newParentFSID)
+}
 
 const (
 	uploadMetadataRetryAttempts = 5
@@ -549,20 +588,17 @@ func (h *FileHandler) CreateDirectory(c *gin.Context) {
 		parentPath = "/"
 	}
 	dirName := path.Base(dirPath)
-	errLibraryNotFound := errors.New("library not found")
-	errParentDirectoryNotFound := errors.New("parent directory not found")
-	errDirectoryExists := errors.New("directory already exists")
 	var newCommitID string
 
 	err := retryLibraryHeadMutation("CreateDirectory", func() error {
 		snapshot, err := fsHelper.GetLibraryHeadSnapshot(repoID)
 		if err != nil {
-			return errLibraryNotFound
+			return fmt.Errorf("%w: %v", errLibraryNotFound, err)
 		}
 
 		result, err := fsHelper.TraverseToPathFromSnapshot(repoID, snapshot, parentPath)
 		if err != nil {
-			return errParentDirectoryNotFound
+			return fmt.Errorf("%w: %v", errParentDirectoryNotFound, err)
 		}
 
 		var parentEntries []FSEntry
@@ -644,7 +680,7 @@ func (h *FileHandler) CreateDirectory(c *gin.Context) {
 		case errors.Is(err, errLibraryNotFound):
 			c.JSON(http.StatusNotFound, gin.H{"error": "library not found"})
 		case errors.Is(err, errParentDirectoryNotFound):
-			c.JSON(http.StatusNotFound, gin.H{"error": "parent directory not found"})
+			c.JSON(http.StatusNotFound, gin.H{"error": errorMessageOrFallback(err, "parent directory not found")})
 		case errors.Is(err, errDirectoryExists):
 			c.JSON(http.StatusConflict, gin.H{"error": "directory already exists"})
 		case errors.Is(err, ErrLibraryHeadConflict):
@@ -1029,58 +1065,39 @@ func (h *FileHandler) CreateFile(c *gin.Context) {
 
 	var fileSize int64
 	var blockIDs []string
+	var templateBlockData *storage.BlockData
+	var templateBlockStore *storage.BlockStore
+	var templateBlockStored bool
 
 	if len(templateContent) > 0 {
-		blockStore, _, err := h.resolveLibraryBlockStore(c, orgID, repoID)
-		if err != nil || blockStore == nil {
-			log.Printf("[CreateFile] Block storage not available for template write: %v", err)
-			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "block storage not available"})
-			return
-		}
-
-		// Office file - store the template content as a block
 		fileSize = int64(len(templateContent))
 
 		// Calculate block hash (SHA256)
 		hash := sha256.Sum256(templateContent)
 		blockID := hex.EncodeToString(hash[:])
 		blockIDs = []string{blockID}
-
-		// Store block using BlockStore (proper key format: blocks/XX/YY/hash)
-		ctx := c.Request.Context()
-		blockData := &storage.BlockData{
+		templateBlockData = &storage.BlockData{
 			Hash: blockID,
 			Data: templateContent,
 			Size: fileSize,
 		}
-		if _, err := blockStore.PutBlockData(ctx, blockData); err != nil {
-			log.Printf("[CreateFile] Failed to store block: %v", err)
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to store file content"})
-			return
-		}
-
-		// Create file fs_object with block
-		log.Printf("[CreateFile] Created Office file %s with template size %d bytes", fileName, fileSize)
 	} else {
 		// Empty file for non-Office types
 		fileSize = 0
 		blockIDs = []string{}
 	}
-	errLibraryNotFound := errors.New("library not found")
-	errParentDirectoryNotFound := errors.New("parent directory not found")
-	errFileExists := errors.New("file already exists")
 	var newFileFSID string
 	var newCommitID string
 
 	err = retryLibraryHeadMutation("CreateFile", func() error {
 		snapshot, err := fsHelper.GetLibraryHeadSnapshot(repoID)
 		if err != nil {
-			return errLibraryNotFound
+			return fmt.Errorf("%w: %v", errLibraryNotFound, err)
 		}
 
 		result, err := fsHelper.TraverseToPathFromSnapshot(repoID, snapshot, parentPath)
 		if err != nil {
-			return errParentDirectoryNotFound
+			return fmt.Errorf("%w: %v", errParentDirectoryNotFound, err)
 		}
 
 		var parentEntries []FSEntry
@@ -1100,6 +1117,24 @@ func (h *FileHandler) CreateFile(c *gin.Context) {
 			if entry.Name == fileName {
 				return errFileExists
 			}
+		}
+
+		if templateBlockData != nil && !templateBlockStored {
+			if templateBlockStore == nil {
+				blockStore, _, err := h.resolveLibraryBlockStore(c, orgID, repoID)
+				if err != nil {
+					return fmt.Errorf("%w: %v", errBlockStorageUnavailable, err)
+				}
+				if blockStore == nil {
+					return errBlockStorageUnavailable
+				}
+				templateBlockStore = blockStore
+			}
+			if _, err := templateBlockStore.PutBlockData(c.Request.Context(), templateBlockData); err != nil {
+				return fmt.Errorf("failed to store file content: %w", err)
+			}
+			templateBlockStored = true
+			log.Printf("[CreateFile] Created Office file %s with template size %d bytes", fileName, fileSize)
 		}
 
 		fileFSID, err := fsHelper.CreateFileFSObject(repoID, fileName, fileSize, blockIDs)
@@ -1164,9 +1199,11 @@ func (h *FileHandler) CreateFile(c *gin.Context) {
 		case errors.Is(err, errLibraryNotFound):
 			c.JSON(http.StatusNotFound, gin.H{"error": "library not found"})
 		case errors.Is(err, errParentDirectoryNotFound):
-			c.JSON(http.StatusNotFound, gin.H{"error": "parent directory not found"})
+			c.JSON(http.StatusNotFound, gin.H{"error": errorMessageOrFallback(err, "parent directory not found")})
 		case errors.Is(err, errFileExists):
 			c.JSON(http.StatusConflict, gin.H{"error": "file already exists"})
+		case errors.Is(err, errBlockStorageUnavailable):
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "block storage not available"})
 		case errors.Is(err, ErrLibraryHeadConflict):
 			c.JSON(http.StatusConflict, gin.H{"error": "library was modified concurrently; retry the create"})
 		default:
@@ -2221,7 +2258,7 @@ func copyItemWithinRepoWithRetry(label string, fsHelper *FSHelper, orgID, userID
 	err := retryLibraryHeadMutation(label, func() error {
 		snapshot, err := fsHelper.GetLibraryHeadSnapshot(repoID)
 		if err != nil {
-			return errUploadLibraryNotFound
+			return fmt.Errorf("%w: %v", errLibraryNotFound, err)
 		}
 
 		srcResult, err := fsHelper.TraverseToPathFromSnapshot(repoID, snapshot, srcPath)
@@ -2277,10 +2314,8 @@ func copyItemWithinRepoWithRetry(label string, fsHelper *FSHelper, orgID, userID
 			return fmt.Errorf("failed to compute storage delta: %w", err)
 		}
 		if deltaBytes > 0 {
-			if checker := traffic.GetChecker(); checker != nil {
-				if st, _ := checker.CheckStorageQuota(orgID, userID, deltaBytes); !st.Allowed {
-					return ErrStorageQuotaExceeded
-				}
+			if !storageQuotaAllowsDelta(orgID, userID, deltaBytes) {
+				return ErrStorageQuotaExceeded
 			}
 		}
 
@@ -2494,7 +2529,7 @@ func (h *FileHandler) CopyFile(c *gin.Context) {
 	copyResult, err := copyItemWithinRepoWithRetry("CopyFile", fsHelper, orgID, userID, repoID, srcPath, dstDir, req.ConflictPolicy)
 	if err != nil {
 		switch {
-		case errors.Is(err, errUploadLibraryNotFound):
+		case errors.Is(err, errLibraryNotFound):
 			c.JSON(http.StatusNotFound, gin.H{"error": "library not found"})
 		case errors.Is(err, ErrBatchSourceNotFound):
 			c.JSON(http.StatusNotFound, gin.H{"error": "source file not found"})
@@ -2700,9 +2735,9 @@ func (h *FileHandler) UploadFile(c *gin.Context) {
 	// enforced against the live directory state (replace vs autorename).
 	storageDeltaBytes, storageDeltaFiles, err := currentUploadStorageDelta(fsHelper, repoID, parentDir, filename, fileSize, replace)
 	if err != nil {
-		if errors.Is(err, errUploadLibraryNotFound) {
+		if errors.Is(err, errLibraryNotFound) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "library not found"})
-		} else if errors.Is(err, errUploadParentDirNotFound) {
+		} else if errors.Is(err, errParentDirectoryNotFound) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "parent directory not found"})
 		} else {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to inspect upload target"})
@@ -2808,12 +2843,12 @@ func (h *FileHandler) UploadFile(c *gin.Context) {
 
 func currentUploadStorageDelta(fsHelper *FSHelper, repoID, parentDir, filename string, fileSize int64, replace bool) (int64, int64, error) {
 	if _, err := fsHelper.GetHeadCommitID(repoID); err != nil {
-		return 0, 0, fmt.Errorf("%w: %v", errUploadLibraryNotFound, err)
+		return 0, 0, fmt.Errorf("%w: %v", errLibraryNotFound, err)
 	}
 
 	parentResult, err := fsHelper.TraverseToPath(repoID, parentDir)
 	if err != nil {
-		return 0, 0, fmt.Errorf("%w: %v", errUploadParentDirNotFound, err)
+		return 0, 0, fmt.Errorf("%w: %v", errParentDirectoryNotFound, err)
 	}
 
 	var dirEntries []FSEntry
@@ -2821,7 +2856,7 @@ func currentUploadStorageDelta(fsHelper *FSHelper, repoID, parentDir, filename s
 		dirEntries = parentResult.Entries
 	} else {
 		if parentResult.TargetEntry == nil {
-			return 0, 0, errUploadParentDirNotFound
+			return 0, 0, errParentDirectoryNotFound
 		}
 		dirEntries, err = fsHelper.GetDirectoryEntries(repoID, parentResult.TargetFSID)
 		if err != nil {
@@ -2866,12 +2901,12 @@ func (h *FileHandler) finalizeStoredUploadMetadata(orgID, userID, repoID, parent
 func (h *FileHandler) finalizeStoredUploadMetadataOnce(fsHelper *FSHelper, orgID, userID, repoID, parentDir, filename, fileID string, fileSize int64, replace bool) (string, int64, int64, error) {
 	headCommitID, err := fsHelper.GetHeadCommitID(repoID)
 	if err != nil {
-		return "", 0, 0, fmt.Errorf("%w: %v", errUploadLibraryNotFound, err)
+		return "", 0, 0, fmt.Errorf("%w: %v", errLibraryNotFound, err)
 	}
 
 	parentResult, err := fsHelper.TraverseToPath(repoID, parentDir)
 	if err != nil {
-		return "", 0, 0, fmt.Errorf("%w: %v", errUploadParentDirNotFound, err)
+		return "", 0, 0, fmt.Errorf("%w: %v", errParentDirectoryNotFound, err)
 	}
 
 	var dirEntries []FSEntry
@@ -2879,7 +2914,7 @@ func (h *FileHandler) finalizeStoredUploadMetadataOnce(fsHelper *FSHelper, orgID
 		dirEntries = parentResult.Entries
 	} else {
 		if parentResult.TargetEntry == nil {
-			return "", 0, 0, errUploadParentDirNotFound
+			return "", 0, 0, errParentDirectoryNotFound
 		}
 		dirEntries, err = fsHelper.GetDirectoryEntries(repoID, parentResult.TargetFSID)
 		if err != nil {
@@ -2995,7 +3030,7 @@ func (h *FileHandler) copyBatchFiles(c *gin.Context, srcPaths []string, srcRepoI
 			case errors.Is(err, ErrBatchSourceNotFound):
 				log.Printf("[copyBatchFiles] source not found, skipping: %s", srcPath)
 				continue
-			case errors.Is(err, errUploadLibraryNotFound):
+			case errors.Is(err, errLibraryNotFound):
 				c.JSON(http.StatusNotFound, gin.H{"error": "library not found"})
 				return
 			case errors.Is(err, ErrBatchDestinationNotFound):
@@ -3575,8 +3610,6 @@ func (h *FileHandler) RevertFile(c *gin.Context) {
 	if parentDir == "." {
 		parentDir = "/"
 	}
-	errLibraryNotFound := errors.New("library not found")
-	errParentDirectoryNotFound := errors.New("parent directory does not exist, restore the folder first")
 	var deltaBytes int64
 	var deltaFiles int64
 	var alreadySameContent bool
@@ -3585,16 +3618,29 @@ func (h *FileHandler) RevertFile(c *gin.Context) {
 	err = retryLibraryHeadMutation("RevertFile", func() error {
 		snapshot, err := fsHelper.GetLibraryHeadSnapshot(repoID)
 		if err != nil {
-			return errLibraryNotFound
+			return fmt.Errorf("%w: %v", errLibraryNotFound, err)
 		}
 
 		result, err := fsHelper.TraverseToPathFromSnapshot(repoID, snapshot, parentDir)
 		if err != nil {
-			return errParentDirectoryNotFound
+			return fmt.Errorf("%w: %v", errParentDirectoryNotFound, err)
+		}
+
+		var parentEntries []FSEntry
+		if parentDir == "/" {
+			parentEntries = result.Entries
+		} else {
+			if result.TargetFSID == "" || result.TargetEntry == nil {
+				return errParentDirectoryNotFound
+			}
+			parentEntries, err = fsHelper.GetDirectoryEntries(repoID, result.TargetFSID)
+			if err != nil {
+				return fmt.Errorf("failed to read parent directory: %w", err)
+			}
 		}
 
 		currentFileName := fileName
-		existingEntry := FindEntryInList(result.Entries, currentFileName)
+		existingEntry := FindEntryInList(parentEntries, currentFileName)
 		if existingEntry != nil {
 			if existingEntry.ID == oldEntry.ID {
 				alreadySameContent = true
@@ -3604,7 +3650,7 @@ func (h *FileHandler) RevertFile(c *gin.Context) {
 			switch conflictPolicy {
 			case "replace":
 			case "keep_both", "autorename":
-				currentFileName = GenerateUniqueName(result.Entries, currentFileName)
+				currentFileName = GenerateUniqueName(parentEntries, currentFileName)
 			case "skip":
 				skipped = true
 				return nil
@@ -3628,14 +3674,12 @@ func (h *FileHandler) RevertFile(c *gin.Context) {
 			return fmt.Errorf("failed to compute storage delta: %w", err)
 		}
 		if currentDeltaBytes > 0 {
-			if checker := traffic.GetChecker(); checker != nil {
-				if st, _ := checker.CheckStorageQuota(orgID, userID, currentDeltaBytes); !st.Allowed {
-					return ErrStorageQuotaExceeded
-				}
+			if !storageQuotaAllowsDelta(orgID, userID, currentDeltaBytes) {
+				return ErrStorageQuotaExceeded
 			}
 		}
 
-		newEntries := RemoveEntryFromList(result.Entries, currentFileName)
+		newEntries := RemoveEntryFromList(parentEntries, currentFileName)
 		newEntries = AddEntryToList(newEntries, revertedEntry)
 
 		newParentFSID, err := fsHelper.CreateDirectoryFSObject(repoID, newEntries)
@@ -3643,7 +3687,7 @@ func (h *FileHandler) RevertFile(c *gin.Context) {
 			return fmt.Errorf("failed to update directory: %w", err)
 		}
 
-		newRootFSID, err := fsHelper.RebuildPathToRoot(repoID, result, newParentFSID)
+		newRootFSID, err := rebuildTraversedDirectoryToRoot(fsHelper, repoID, result, parentDir, newParentFSID)
 		if err != nil {
 			return fmt.Errorf("failed to rebuild path: %w", err)
 		}
@@ -3667,7 +3711,7 @@ func (h *FileHandler) RevertFile(c *gin.Context) {
 		case errors.Is(err, errLibraryNotFound):
 			c.JSON(http.StatusNotFound, gin.H{"error": "library not found"})
 		case errors.Is(err, errParentDirectoryNotFound):
-			c.JSON(http.StatusNotFound, gin.H{"error": "parent directory does not exist, restore the folder first"})
+			c.JSON(http.StatusNotFound, gin.H{"error": errorMessageOrFallback(err, "parent directory does not exist, restore the folder first")})
 		case errors.Is(err, ErrStorageQuotaExceeded):
 			c.JSON(http.StatusForbidden, gin.H{"error": "storage quota exceeded"})
 		case errors.Is(err, ErrLibraryHeadConflict):
@@ -3767,8 +3811,6 @@ func (h *FileHandler) RevertDirectory(c *gin.Context) {
 	if parentDir == "." {
 		parentDir = "/"
 	}
-	errLibraryNotFound := errors.New("library not found")
-	errParentDirectoryNotFound := errors.New("parent directory does not exist, restore the parent folder first")
 	var deltaBytes int64
 	var deltaFiles int64
 	var alreadySameContent bool
@@ -3777,16 +3819,29 @@ func (h *FileHandler) RevertDirectory(c *gin.Context) {
 	err = retryLibraryHeadMutation("RevertDirectory", func() error {
 		snapshot, err := fsHelper.GetLibraryHeadSnapshot(repoID)
 		if err != nil {
-			return errLibraryNotFound
+			return fmt.Errorf("%w: %v", errLibraryNotFound, err)
 		}
 
 		result, err := fsHelper.TraverseToPathFromSnapshot(repoID, snapshot, parentDir)
 		if err != nil {
-			return errParentDirectoryNotFound
+			return fmt.Errorf("%w: %v", errParentDirectoryNotFound, err)
+		}
+
+		var parentEntries []FSEntry
+		if parentDir == "/" {
+			parentEntries = result.Entries
+		} else {
+			if result.TargetFSID == "" || result.TargetEntry == nil {
+				return errParentDirectoryNotFound
+			}
+			parentEntries, err = fsHelper.GetDirectoryEntries(repoID, result.TargetFSID)
+			if err != nil {
+				return fmt.Errorf("failed to read parent directory: %w", err)
+			}
 		}
 
 		currentDirName := dirName
-		existingEntry := FindEntryInList(result.Entries, currentDirName)
+		existingEntry := FindEntryInList(parentEntries, currentDirName)
 		if existingEntry != nil {
 			if existingEntry.ID == oldEntry.ID {
 				alreadySameContent = true
@@ -3796,7 +3851,7 @@ func (h *FileHandler) RevertDirectory(c *gin.Context) {
 			switch conflictPolicy {
 			case "replace":
 			case "keep_both", "autorename":
-				currentDirName = GenerateUniqueName(result.Entries, currentDirName)
+				currentDirName = GenerateUniqueName(parentEntries, currentDirName)
 			case "skip":
 				skipped = true
 				return nil
@@ -3820,14 +3875,12 @@ func (h *FileHandler) RevertDirectory(c *gin.Context) {
 			return fmt.Errorf("failed to compute storage delta: %w", err)
 		}
 		if currentDeltaBytes > 0 {
-			if checker := traffic.GetChecker(); checker != nil {
-				if st, _ := checker.CheckStorageQuota(orgID, userID, currentDeltaBytes); !st.Allowed {
-					return ErrStorageQuotaExceeded
-				}
+			if !storageQuotaAllowsDelta(orgID, userID, currentDeltaBytes) {
+				return ErrStorageQuotaExceeded
 			}
 		}
 
-		newEntries := RemoveEntryFromList(result.Entries, currentDirName)
+		newEntries := RemoveEntryFromList(parentEntries, currentDirName)
 		newEntries = AddEntryToList(newEntries, revertedDir)
 
 		newParentFSID, err := fsHelper.CreateDirectoryFSObject(repoID, newEntries)
@@ -3835,7 +3888,7 @@ func (h *FileHandler) RevertDirectory(c *gin.Context) {
 			return fmt.Errorf("failed to update directory: %w", err)
 		}
 
-		newRootFSID, err := fsHelper.RebuildPathToRoot(repoID, result, newParentFSID)
+		newRootFSID, err := rebuildTraversedDirectoryToRoot(fsHelper, repoID, result, parentDir, newParentFSID)
 		if err != nil {
 			return fmt.Errorf("failed to rebuild path: %w", err)
 		}
@@ -3859,7 +3912,7 @@ func (h *FileHandler) RevertDirectory(c *gin.Context) {
 		case errors.Is(err, errLibraryNotFound):
 			c.JSON(http.StatusNotFound, gin.H{"error": "library not found"})
 		case errors.Is(err, errParentDirectoryNotFound):
-			c.JSON(http.StatusNotFound, gin.H{"error": "parent directory does not exist, restore the parent folder first"})
+			c.JSON(http.StatusNotFound, gin.H{"error": errorMessageOrFallback(err, "parent directory does not exist, restore the parent folder first")})
 		case errors.Is(err, ErrStorageQuotaExceeded):
 			c.JSON(http.StatusForbidden, gin.H{"error": "storage quota exceeded"})
 		case errors.Is(err, ErrLibraryHeadConflict):
@@ -4502,8 +4555,6 @@ func (h *FileHandler) BatchDeleteItems(c *gin.Context) {
 
 	// Lookup library storage class before the async operation
 	libraryClass := h.lookupLibraryStorageClass(orgID, req.RepoID)
-	errLibraryNotFound := errors.New("library not found")
-	errParentDirectoryNotFound := errors.New("parent directory not found")
 	var deletedEntries []FSEntry
 	var newCommitID string
 	var responseCommitID string
@@ -4511,12 +4562,12 @@ func (h *FileHandler) BatchDeleteItems(c *gin.Context) {
 	err := retryLibraryHeadMutation("BatchDeleteItems", func() error {
 		snapshot, err := fsHelper.GetLibraryHeadSnapshot(req.RepoID)
 		if err != nil {
-			return errLibraryNotFound
+			return fmt.Errorf("%w: %v", errLibraryNotFound, err)
 		}
 
 		result, err := fsHelper.TraverseToPathFromSnapshot(req.RepoID, snapshot, parentDir)
 		if err != nil {
-			return errParentDirectoryNotFound
+			return fmt.Errorf("%w: %v", errParentDirectoryNotFound, err)
 		}
 
 		var currentEntries []FSEntry
@@ -4559,14 +4610,9 @@ func (h *FileHandler) BatchDeleteItems(c *gin.Context) {
 			return fmt.Errorf("failed to update directory: %w", err)
 		}
 
-		var newRootFSID string
-		if parentDir == "/" {
-			newRootFSID = newParentFSID
-		} else {
-			newRootFSID, err = fsHelper.RebuildPathToRoot(req.RepoID, result, newParentFSID)
-			if err != nil {
-				return fmt.Errorf("failed to rebuild path: %w", err)
-			}
+		newRootFSID, err := rebuildTraversedDirectoryToRoot(fsHelper, req.RepoID, result, parentDir, newParentFSID)
+		if err != nil {
+			return fmt.Errorf("failed to rebuild path: %w", err)
 		}
 
 		var description string
@@ -4595,7 +4641,7 @@ func (h *FileHandler) BatchDeleteItems(c *gin.Context) {
 		case errors.Is(err, errLibraryNotFound):
 			c.JSON(http.StatusNotFound, gin.H{"error": "library not found"})
 		case errors.Is(err, errParentDirectoryNotFound):
-			c.JSON(http.StatusNotFound, gin.H{"error": "parent directory not found"})
+			c.JSON(http.StatusNotFound, gin.H{"error": errorMessageOrFallback(err, "parent directory not found")})
 		case errors.Is(err, ErrLibraryHeadConflict):
 			c.JSON(http.StatusConflict, gin.H{"error": "library was modified concurrently; retry the delete"})
 		default:
