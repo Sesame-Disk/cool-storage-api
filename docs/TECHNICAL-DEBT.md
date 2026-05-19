@@ -1219,6 +1219,15 @@ Multiple sites schedule cleanup as `go ...` with only `log.Printf` on failure:
 
 A transient DB failure on any of these is logged and forgotten. No retry, no metric, no surface for ops to know cleanup is lagging. Idempotency (via `DecrementBlockRefCountsOnce`'s LWT, and `INSERT IF NOT EXISTS` patterns) means re-running is safe, but there is no mechanism that triggers a re-run on transient failure.
 
+Update 2026-05-18: the OnlyOffice save path is now partially hardened. `saveEditedDocument` persists `onlyoffice_pending_blocks` after block ref registration, stores the candidate `publish_commit_id` before the library-head CAS, and reconciles stale pending rows conservatively on later saves by checking reachability from the current head. That narrows the crash window for OnlyOffice materialized blocks, but the broader debt still applies to the other async cleanup goroutines listed above.
+
+Remaining OnlyOffice-specific follow-ups after that hardening:
+- The 5-minute stale cutoff is heuristic. A save that remains in-flight for more than that window after the pending row is inserted but before `publish_commit_id` is persisted can still be misclassified as abandoned by a later save in the same org. There is no heartbeat or LWT guard on the row yet.
+- Reconciliation still runs inline at the start of `saveEditedDocument`, scanning the org partition in `onlyoffice_pending_blocks` on every save. There is no cooldown or background worker yet.
+- Commit reachability still walks `parent_id` without a hop bound. Deep histories or malformed ancestry can make reconciliation expensive even though cycle detection is present.
+- `blockMetadataRegistered` is now effectively a readability guard only: any pre-registration failure returns early, so the later rollback branch only sees the `true` case. Safe, but low-priority cleanup remains.
+- `IncrementOrCreateBlock` failure is now intentionally fatal. This is a deliberate behavior change from the earlier buggy path that could continue to metadata publish after failing to confirm the block row.
+
 Mitigation: pipe these through a small `cleanupQueue` (durable or in-memory bounded) with retry. Out of scope for this branch; track separately.
 
 ### 19.j. Upload Saving-Phase Performance Speedup Deferred

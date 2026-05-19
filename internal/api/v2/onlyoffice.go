@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -24,6 +25,7 @@ import (
 	"github.com/Sesame-Disk/sesamefs/internal/middleware"
 	"github.com/Sesame-Disk/sesamefs/internal/storage"
 	"github.com/Sesame-Disk/sesamefs/internal/traffic"
+	gocql "github.com/apache/cassandra-gocql-driver/v2"
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
@@ -170,6 +172,195 @@ func shouldRollbackOnlyOfficeMaterializedBlock(blockMetadataRegistered bool, pub
 
 func onlyOfficeRollbackOperationKey(rollbackID string) string {
 	return "onlyoffice-publish-failed:" + strings.TrimSpace(rollbackID)
+}
+
+const onlyOfficePendingBlockStaleAfter = 5 * time.Minute
+
+type onlyOfficePendingBlock struct {
+	OperationID     string
+	RepoID          string
+	FilePath        string
+	InternalBlockID string
+	ExternalBlockID string
+	StorageClass    string
+	PublishCommitID string
+	CreatedAt       time.Time
+}
+
+func onlyOfficeCommitReachable(targetCommitID, headCommitID string, parentLookup func(string) (string, error)) (bool, error) {
+	targetCommitID = strings.TrimSpace(targetCommitID)
+	headCommitID = strings.TrimSpace(headCommitID)
+	if targetCommitID == "" || headCommitID == "" {
+		return false, nil
+	}
+
+	visited := make(map[string]struct{})
+	currentCommitID := headCommitID
+	for currentCommitID != "" {
+		if currentCommitID == targetCommitID {
+			return true, nil
+		}
+		if _, seen := visited[currentCommitID]; seen {
+			return false, fmt.Errorf("detected commit ancestry cycle at %s", currentCommitID)
+		}
+		visited[currentCommitID] = struct{}{}
+
+		parentCommitID, err := parentLookup(currentCommitID)
+		if err != nil {
+			return false, err
+		}
+		currentCommitID = strings.TrimSpace(parentCommitID)
+	}
+
+	return false, nil
+}
+
+func shouldTreatOnlyOfficeHeadLookupAsMissing(err error) bool {
+	return errors.Is(err, gocql.ErrNotFound)
+}
+
+func (h *OnlyOfficeHandler) saveOnlyOfficePendingBlock(orgID string, pending onlyOfficePendingBlock) error {
+	if h == nil || h.db == nil {
+		return fmt.Errorf("database not available")
+	}
+	now := time.Now()
+	if pending.CreatedAt.IsZero() {
+		pending.CreatedAt = now
+	}
+
+	return h.db.Session().Query(`
+		INSERT INTO onlyoffice_pending_blocks (
+			org_id, operation_id, repo_id, file_path, internal_block_id,
+			external_block_id, storage_class, publish_commit_id, created_at, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, orgID, pending.OperationID, pending.RepoID, pending.FilePath, pending.InternalBlockID,
+		pending.ExternalBlockID, pending.StorageClass, pending.PublishCommitID, pending.CreatedAt, now).Exec()
+}
+
+func (h *OnlyOfficeHandler) updateOnlyOfficePendingBlockCommitID(orgID, operationID, commitID string) error {
+	if h == nil || h.db == nil {
+		return fmt.Errorf("database not available")
+	}
+	return h.db.Session().Query(`
+		UPDATE onlyoffice_pending_blocks
+		SET publish_commit_id = ?, updated_at = ?
+		WHERE org_id = ? AND operation_id = ?
+	`, commitID, time.Now(), orgID, operationID).Exec()
+}
+
+func (h *OnlyOfficeHandler) deleteOnlyOfficePendingBlock(orgID, operationID string) error {
+	if h == nil || h.db == nil {
+		return fmt.Errorf("database not available")
+	}
+	return h.db.Session().Query(`
+		DELETE FROM onlyoffice_pending_blocks WHERE org_id = ? AND operation_id = ?
+	`, orgID, operationID).Exec()
+}
+
+func (h *OnlyOfficeHandler) listOnlyOfficePendingBlocks(orgID string) ([]onlyOfficePendingBlock, error) {
+	if h == nil || h.db == nil {
+		return nil, fmt.Errorf("database not available")
+	}
+
+	iter := h.db.Session().Query(`
+		SELECT operation_id, repo_id, file_path, internal_block_id, external_block_id,
+		       storage_class, publish_commit_id, created_at
+		FROM onlyoffice_pending_blocks WHERE org_id = ?
+	`, orgID).Iter()
+
+	var pending []onlyOfficePendingBlock
+	var row onlyOfficePendingBlock
+	for iter.Scan(
+		&row.OperationID,
+		&row.RepoID,
+		&row.FilePath,
+		&row.InternalBlockID,
+		&row.ExternalBlockID,
+		&row.StorageClass,
+		&row.PublishCommitID,
+		&row.CreatedAt,
+	) {
+		pending = append(pending, row)
+		row = onlyOfficePendingBlock{}
+	}
+	if err := iter.Close(); err != nil {
+		return nil, err
+	}
+	return pending, nil
+}
+
+func (h *OnlyOfficeHandler) isOnlyOfficeCommitReachableFromHead(repoID, targetCommitID string) (bool, error) {
+	if h == nil || h.db == nil {
+		return false, fmt.Errorf("database not available")
+	}
+
+	fsHelper := NewFSHelper(h.db)
+	headCommitID, err := fsHelper.GetHeadCommitID(repoID)
+	if err != nil {
+		if shouldTreatOnlyOfficeHeadLookupAsMissing(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("lookup current head for repo %s: %w", repoID, err)
+	}
+
+	return onlyOfficeCommitReachable(targetCommitID, headCommitID, func(commitID string) (string, error) {
+		var parentCommitID string
+		err := h.db.Session().Query(`
+			SELECT parent_id FROM commits WHERE library_id = ? AND commit_id = ?
+		`, repoID, commitID).Scan(&parentCommitID)
+		if err != nil {
+			if errors.Is(err, gocql.ErrNotFound) {
+				return "", nil
+			}
+			return "", fmt.Errorf("lookup parent for commit %s: %w", commitID, err)
+		}
+		return parentCommitID, nil
+	})
+}
+
+func (h *OnlyOfficeHandler) reconcileStaleOnlyOfficePendingBlocks(orgID string) {
+	if h == nil || h.db == nil || strings.TrimSpace(orgID) == "" {
+		return
+	}
+
+	pendingBlocks, err := h.listOnlyOfficePendingBlocks(orgID)
+	if err != nil {
+		log.Printf("OnlyOffice: failed to list pending block cleanups for org %s: %v", orgID, err)
+		return
+	}
+	if len(pendingBlocks) == 0 {
+		return
+	}
+
+	cutoff := time.Now().Add(-onlyOfficePendingBlockStaleAfter)
+	fsHelper := NewFSHelper(h.db)
+	for _, pending := range pendingBlocks {
+		if !pending.CreatedAt.IsZero() && pending.CreatedAt.After(cutoff) {
+			continue
+		}
+
+		reachable := false
+		if strings.TrimSpace(pending.PublishCommitID) != "" {
+			reachable, err = h.isOnlyOfficeCommitReachableFromHead(pending.RepoID, pending.PublishCommitID)
+			if err != nil {
+				log.Printf("OnlyOffice: failed to reconcile pending block %s reachability: %v", pending.OperationID, err)
+				continue
+			}
+		}
+
+		if reachable {
+			if err := h.deleteOnlyOfficePendingBlock(orgID, pending.OperationID); err != nil {
+				log.Printf("OnlyOffice: failed to clear reachable pending block %s: %v", pending.OperationID, err)
+			}
+			continue
+		}
+
+		zeroRefBlocks := fsHelper.DecrementBlockRefCountsOnce(orgID, onlyOfficeRollbackOperationKey(pending.OperationID), []string{pending.InternalBlockID})
+		enqueueZeroRefBlocks(h.db, orgID, pending.RepoID, zeroRefBlocks)
+		if err := h.deleteOnlyOfficePendingBlock(orgID, pending.OperationID); err != nil {
+			log.Printf("OnlyOffice: failed to delete rolled back pending block %s: %v", pending.OperationID, err)
+		}
+	}
 }
 
 // OnlyOfficeResponse represents the API response
@@ -912,6 +1103,7 @@ func (h *OnlyOfficeHandler) saveEditedDocument(ctx context.Context, repoID, file
 
 	fsHelper := NewFSHelper(h.db)
 	filename := path.Base(filePath)
+	h.reconcileStaleOnlyOfficePendingBlocks(orgID)
 
 	// If library is encrypted, encrypt the content before storage
 	if encrypted {
@@ -971,20 +1163,39 @@ func (h *OnlyOfficeHandler) saveEditedDocument(ctx context.Context, repoID, file
 
 	// Store block metadata using internal (SHA-256) ID
 	if err := NewFSHelper(h.db).IncrementOrCreateBlock(orgID, internalBlockID, len(content), storageClass, storageKey); err != nil {
-		log.Printf("Failed to store block metadata: %v", err)
+		return fmt.Errorf("failed to store block metadata: %w", err)
 	} else {
 		blockMetadataRegistered = true
+		if err := h.saveOnlyOfficePendingBlock(orgID, onlyOfficePendingBlock{
+			OperationID:     rollbackID,
+			RepoID:          repoID,
+			FilePath:        filePath,
+			InternalBlockID: internalBlockID,
+			ExternalBlockID: externalBlockID,
+			StorageClass:    storageClass,
+		}); err != nil {
+			zeroRefBlocks := fsHelper.DecrementBlockRefCountsOnce(orgID, onlyOfficeRollbackOperationKey(rollbackID), []string{internalBlockID})
+			enqueueZeroRefBlocks(h.db, orgID, repoID, zeroRefBlocks)
+			return fmt.Errorf("failed to persist pending OnlyOffice block cleanup: %w", err)
+		}
 	}
 
-	storageDeltaBytes, storageDeltaFiles, newCommitID, err := h.publishEditedDocumentMetadata(fsHelper, orgID, repoID, filePath, filename, userID, originalFileSize, externalBlockID)
+	storageDeltaBytes, storageDeltaFiles, newCommitID, err := h.publishEditedDocumentMetadata(fsHelper, orgID, repoID, filePath, filename, userID, originalFileSize, externalBlockID, rollbackID)
 	if err != nil {
 		if shouldRollbackOnlyOfficeMaterializedBlock(blockMetadataRegistered, err) {
 			operationKey := onlyOfficeRollbackOperationKey(rollbackID)
 			zeroRefBlocks := fsHelper.DecrementBlockRefCountsOnce(orgID, operationKey, []string{internalBlockID})
 			enqueueZeroRefBlocks(h.db, orgID, repoID, zeroRefBlocks)
+			if deleteErr := h.deleteOnlyOfficePendingBlock(orgID, rollbackID); deleteErr != nil {
+				log.Printf("OnlyOffice: failed to clear pending block cleanup %s after rollback: %v", rollbackID, deleteErr)
+			}
 			log.Printf("OnlyOffice: rolled back materialized block %s after metadata publish failure: %v", internalBlockID[:16], err)
 		}
 		return err
+	}
+
+	if err := h.deleteOnlyOfficePendingBlock(orgID, rollbackID); err != nil {
+		log.Printf("OnlyOffice: failed to clear pending block cleanup %s after publish success: %v", rollbackID, err)
 	}
 
 	if err := traffic.AdjustStorageCountersByDeltaSync(h.db, orgID, userID, repoID, storageDeltaBytes, storageDeltaFiles); err != nil {
@@ -995,7 +1206,7 @@ func (h *OnlyOfficeHandler) saveEditedDocument(ctx context.Context, repoID, file
 	return nil
 }
 
-func (h *OnlyOfficeHandler) publishEditedDocumentMetadata(fsHelper *FSHelper, orgID, repoID, filePath, filename, userID string, originalFileSize int64, externalBlockID string) (int64, int64, string, error) {
+func (h *OnlyOfficeHandler) publishEditedDocumentMetadata(fsHelper *FSHelper, orgID, repoID, filePath, filename, userID string, originalFileSize int64, externalBlockID, pendingOperationID string) (int64, int64, string, error) {
 	var storageDeltaBytes int64
 	var storageDeltaFiles int64
 	var newCommitID string
@@ -1065,6 +1276,10 @@ func (h *OnlyOfficeHandler) publishEditedDocumentMetadata(fsHelper *FSHelper, or
 		commitID, err := fsHelper.CreateCommit(repoID, userID, newRootFSID, snapshot.HeadCommitID, commitDesc)
 		if err != nil {
 			return fmt.Errorf("failed to create commit: %w", err)
+		}
+
+		if err := h.updateOnlyOfficePendingBlockCommitID(orgID, pendingOperationID, commitID); err != nil {
+			return fmt.Errorf("failed to persist OnlyOffice pending commit id: %w", err)
 		}
 
 		if err := fsHelper.UpdateLibraryHeadFromSnapshot(snapshot, repoID, commitID, snapshot.HeadCommitID); err != nil {

@@ -755,6 +755,28 @@ POST /api/v2.1/onlyoffice/callback/
 # 2. Download new content, save to library
 ```
 
+### 15.b. `onlyoffice_pending_blocks`
+**Purpose:** Durable pending cleanup for OnlyOffice save callbacks between block materialization and successful library-head publication
+
+**Schema:**
+```sql
+PRIMARY KEY ((org_id), operation_id)
+```
+
+**API Usage:**
+```bash
+# OnlyOffice callback save path materializes a block and confirms its ref_count
+POST /onlyoffice/editor-callback/
+# 1. Insert onlyoffice_pending_blocks row after IncrementOrCreateBlock succeeds
+# 2. Create commit candidate and persist publish_commit_id before CAS on libraries.head_commit_id
+# 3. Clear the row after publish success or immediate rollback
+
+# Later OnlyOffice saves in the same org reconcile stale rows conservatively
+# 1. Read onlyoffice_pending_blocks older than the staleness window
+# 2. If publish_commit_id is reachable from the current library head, drop the row
+# 3. Otherwise decrement the materialized block ref and enqueue zero-ref cleanup
+```
+
 ---
 
 ### 16. `starred_files`
