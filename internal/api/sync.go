@@ -2049,11 +2049,17 @@ func (h *SyncHandler) handleSyncHeadPromotion(c *gin.Context, orgID, userID, rep
 			return
 		}
 
-		if currentHead != "" && commitParent != currentHead {
-			log.Printf("%s: CONFLICT repo %s - commit %s has parent %s but current HEAD is %s. Rejecting.",
-				operation, repoID, targetHead, commitParent, currentHead)
-			c.Status(http.StatusOK)
-			return
+		if commitParent != currentHead {
+			log.Printf("%s: parent mismatch for repo %s on attempt %d/%d - commit %s expects parent %s but current HEAD is %s",
+				operation, repoID, attempt+1, maxAttempts, targetHead, commitParent, currentHead)
+			if attempt == maxAttempts-1 {
+				log.Printf("%s: parent mismatch retry budget exhausted for repo %s targeting %s after %d attempts; returning 200 for client compatibility",
+					operation, repoID, targetHead, maxAttempts)
+				c.Status(http.StatusOK)
+				return
+			}
+			time.Sleep(v2.RetryBackoff(attempt))
+			continue
 		}
 
 		log.Printf("%s: updating repo %s head to %s (parent=%s, currentHead=%s, attempt=%d/%d)",
@@ -2095,10 +2101,6 @@ func (h *SyncHandler) syncCommitPublishedSize(repoID, rootFSID string) int64 {
 	}
 	newSize, _ := h.calculateDirStats(repoID, rootFSID)
 	return newSize
-}
-
-func (h *SyncHandler) checkSyncCommitStorageQuota(c *gin.Context, orgID, userID, repoID, currentHead, rootFSID string) bool {
-	return h.checkSyncCommitStorageQuotaWithNewSize(c, orgID, userID, repoID, currentHead, h.syncCommitPublishedSize(repoID, rootFSID))
 }
 
 func (h *SyncHandler) checkSyncCommitStorageQuotaWithNewSize(c *gin.Context, orgID, userID, repoID, currentHead string, newSize int64) bool {

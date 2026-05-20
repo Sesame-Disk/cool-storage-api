@@ -127,6 +127,24 @@ func multiInstanceFileNames(prefix string, count int) []string {
 	return names
 }
 
+func multiInstanceUpdateBranchStatus(c *testClient, repoID, head string) concurrentMutationResult {
+	req, err := http.NewRequest(http.MethodPost, c.baseURL+fmt.Sprintf("/seafhttp/repo/%s/update-branch?head=%s", repoID, url.QueryEscape(head)), nil)
+	if err != nil {
+		return concurrentMutationResult{status: -1, body: err.Error()}
+	}
+	req.Header.Set("Authorization", "Token "+c.token)
+	return doStatus(c, req)
+}
+
+func multiInstancePutCommitHeadStatus(c *testClient, repoID, head string) concurrentMutationResult {
+	req, err := http.NewRequest(http.MethodPut, c.baseURL+fmt.Sprintf("/seafhttp/repo/%s/commit/HEAD?head=%s", repoID, url.QueryEscape(head)), nil)
+	if err != nil {
+		return concurrentMutationResult{status: -1, body: err.Error()}
+	}
+	req.Header.Set("Authorization", "Token "+c.token)
+	return doStatus(c, req)
+}
+
 func multiInstanceUploadLinks(t *testing.T, clients []*testClient, repoID, parentDir string) []string {
 	t.Helper()
 
@@ -149,6 +167,118 @@ func TestMultiInstanceCreateFilePreservesAllEntries(t *testing.T) {
 	})
 	expectConcurrentStatuses(t, results, http.StatusCreated, http.StatusOK)
 	expectEntriesPresent(t, repoID, "/", fileNames)
+}
+
+func TestMultiInstanceUpdateBranchConvergesWhenParentPromotionWinsDuringRetry(t *testing.T) {
+	clients := multiInstanceRequireAdminClients(t, 2)
+	repoID := createTestLibrary(t, adminClient, fmt.Sprintf("inttest-multi-update-branch-%d", time.Now().UnixNano()))
+	session := shareProjectionDBForTest(t).Session()
+
+	initial := readLibrarySyncHeadState(t, session, repoID)
+	intermediateHead := fmt.Sprintf("%040x", time.Now().UnixNano())
+	finalHead := fmt.Sprintf("%040x", time.Now().UnixNano()+1)
+	insertSyntheticCommitForTest(t, session, repoID, intermediateHead, initial.HeadCommitID, initial.RootFSID, "integration multi-instance update-branch intermediate")
+	insertSyntheticCommitForTest(t, session, repoID, finalHead, intermediateHead, initial.RootFSID, "integration multi-instance update-branch final")
+	t.Cleanup(func() {
+		for _, commitID := range []string{intermediateHead, finalHead} {
+			if err := session.Query(`DELETE FROM commits WHERE library_id = ? AND commit_id = ?`, repoID, commitID).Exec(); err != nil {
+				t.Errorf("cleanup synthetic commit %s failed: %v", commitID, err)
+			}
+		}
+	})
+
+	results := make(chan concurrentMutationResult, 2)
+	var wg sync.WaitGroup
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		result := multiInstanceUpdateBranchStatus(clients[1], repoID, finalHead)
+		result.name = "promote-final"
+		results <- result
+	}()
+
+	time.Sleep(10 * time.Millisecond)
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		result := multiInstanceUpdateBranchStatus(clients[0], repoID, intermediateHead)
+		result.name = "promote-intermediate"
+		results <- result
+	}()
+
+	wg.Wait()
+	close(results)
+
+	collected := make([]concurrentMutationResult, 0, 2)
+	for result := range results {
+		collected = append(collected, result)
+	}
+	expectConcurrentStatuses(t, collected, http.StatusOK)
+
+	waitForIntegrationCondition(t, "multi-instance update-branch to converge to the final chained head", func() bool {
+		current := readLibrarySyncHeadState(t, session, repoID)
+		return current.HeadCommitID == finalHead &&
+			current.LookupHeadCommitID == finalHead &&
+			current.ProjectionUpdatedAt.Equal(current.UpdatedAt)
+	})
+}
+
+func TestMultiInstancePutCommitHeadConvergesWhenParentPromotionWinsDuringRetry(t *testing.T) {
+	clients := multiInstanceRequireAdminClients(t, 2)
+	repoID := createTestLibrary(t, adminClient, fmt.Sprintf("inttest-multi-put-head-%d", time.Now().UnixNano()))
+	session := shareProjectionDBForTest(t).Session()
+
+	initial := readLibrarySyncHeadState(t, session, repoID)
+	intermediateHead := fmt.Sprintf("%040x", time.Now().UnixNano())
+	finalHead := fmt.Sprintf("%040x", time.Now().UnixNano()+1)
+	insertSyntheticCommitForTest(t, session, repoID, intermediateHead, initial.HeadCommitID, initial.RootFSID, "integration multi-instance put head intermediate")
+	insertSyntheticCommitForTest(t, session, repoID, finalHead, intermediateHead, initial.RootFSID, "integration multi-instance put head final")
+	t.Cleanup(func() {
+		for _, commitID := range []string{intermediateHead, finalHead} {
+			if err := session.Query(`DELETE FROM commits WHERE library_id = ? AND commit_id = ?`, repoID, commitID).Exec(); err != nil {
+				t.Errorf("cleanup synthetic commit %s failed: %v", commitID, err)
+			}
+		}
+	})
+
+	results := make(chan concurrentMutationResult, 2)
+	var wg sync.WaitGroup
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		result := multiInstancePutCommitHeadStatus(clients[1], repoID, finalHead)
+		result.name = "promote-final"
+		results <- result
+	}()
+
+	time.Sleep(10 * time.Millisecond)
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		result := multiInstancePutCommitHeadStatus(clients[0], repoID, intermediateHead)
+		result.name = "promote-intermediate"
+		results <- result
+	}()
+
+	wg.Wait()
+	close(results)
+
+	collected := make([]concurrentMutationResult, 0, 2)
+	for result := range results {
+		collected = append(collected, result)
+	}
+	expectConcurrentStatuses(t, collected, http.StatusOK)
+
+	waitForIntegrationCondition(t, "multi-instance put commit HEAD to converge to the final chained head", func() bool {
+		current := readLibrarySyncHeadState(t, session, repoID)
+		return current.HeadCommitID == finalHead &&
+			current.LookupHeadCommitID == finalHead &&
+			current.ProjectionUpdatedAt.Equal(current.UpdatedAt)
+	})
 }
 
 func TestMultiInstanceSeafHTTPUploadWhileRenamingNoLostFiles(t *testing.T) {

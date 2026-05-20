@@ -1129,20 +1129,20 @@ Tracked in `docs/KNOWN_ISSUES.md` as ISSUE-LIB-RETENTION-01.
 
 Branch `feat/multiregion-head-safety` landed the canonical HEAD CAS pattern, server-side conflict retries for uploads and v2 mutations, atomic same-repo move in a single commit, and rollback of materialized blocks on publish failure. A walkthrough of the resulting code surfaced the following debt items. None of them block the merge; they document liabilities that future iterations should address.
 
-### 19.a. Three Separate Retry-Loop Implementations Plus Sync HEAD Handlers That Do Not Retry
+### 19.a. Four Separate Retry-Loop Implementations
 
-The repo still has three implementations of the same "retry on `ErrLibraryHeadConflict` / `ErrHeadConflict`" pattern, plus one sync-specific path that does not retry at all. They now share the same backoff schedule where retries exist, but the orchestration is still duplicated and sync HEAD publish still relies on client-driven recovery:
+The repo now has four implementations of the same "retry on `ErrLibraryHeadConflict` / `ErrHeadConflict`" pattern. They share the same backoff schedule, but the orchestration is still duplicated across sync, upload, and v2 mutation paths:
 
 | Caller | File | Backoff | Jitter | Max delay |
 |---|---|---|---|---|
 | v2 mutations (rename/move/delete/etc.) | `internal/api/v2/fs_helpers.go` (`retryLibraryHeadMutation`) | exponential (50→100→200→400) | ~25ms | 400ms |
 | Chunked + single-shot upload | `internal/api/seafhttp.go` (`commitUploadedFileMultiBlock`, `commitUploadedFile`) | exponential (50→100→200→400) | ~25ms | 400ms |
 | Web `UploadFile` | `internal/api/v2/files.go` (`finalizeStoredUploadMetadata`) | exponential (50→100→200→400) | ~25ms | 400ms |
-| Sync HEAD publish (`PutCommit HEAD`, `UpdateBranch`) | `internal/api/sync.go` | none | n/a | n/a |
+| Sync HEAD publish (`PutCommit HEAD`, `UpdateBranch`) | `internal/api/sync.go` | exponential (50→100→200→400) | ~25ms | 400ms |
 
 Update 2026-05-19: both upload seams now also fail closed if `IncrementOrCreateBlock` cannot confirm the `blocks` row, so uploads no longer continue to library metadata publish after a block-metadata registration failure.
 
-The remaining debt here is not the old blind-overwrite bug. `PUT /commit/HEAD` and `POST /update-branch` already use parent-chain validation plus CAS. The remaining debt is asymmetry and proof: stale conflicts still return client-compatible `200 OK` without server-side retry, `PUT /commit/HEAD` has no-rollback integration coverage, `POST /update-branch` does not, and the current sync test surface still does not prove that a real desktop client converges under active-active multi-node contention.
+The remaining debt here is not the old blind-overwrite bug. `PUT /commit/HEAD` and `POST /update-branch` already use parent-chain validation, CAS, and bounded retry, with regression and multi-node convergence coverage on both routes. The remaining debt is duplicated retry orchestration plus proof: exhausted sync retry budgets still preserve client-compatible `200 OK`, and the current sync test surface still does not prove that a real desktop client converges under active-active multi-node contention.
 
 For the three retrying paths, the debt remains maintainability rather than correctness: the upload-specific `*_Once` extraction is already in place, and migrating both upload loops to `retryLibraryHeadMutation` would still remove duplicated retry bookkeeping and keep future contention tuning in one place.
 
