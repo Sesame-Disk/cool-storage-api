@@ -1,7 +1,7 @@
 # Seafile Desktop Client Sync Protocol
 
 **Version**: 2
-**Last Verified**: 2026-01-17
+**Last Verified**: 2026-05-20
 **Method**: Automated comparison against production Seafile (app.nihaoconsult.com) + comprehensive sync testing
 
 This document describes the Seafile sync protocol as verified through direct protocol comparison and real desktop client testing.
@@ -25,6 +25,11 @@ cd docker/seafile-cli-debug
 
 **All tests must pass for desktop client compatibility.**
 
+From the repository root, run `bash ./scripts/test-sync-active-active.sh` to
+exercise two real `seaf-cli` clients against different backend nodes and prove
+active-active convergence for concurrent `PUT /seafhttp/repo/{id}/commit/HEAD`
+contention.
+
 **What gets tested:**
 - ✅ Single file sync
 - ✅ Multiple files sync (10 files)
@@ -34,9 +39,9 @@ cd docker/seafile-cli-debug
 - ✅ Many tiny files (50 files, performance)
 - ✅ Mixed content (various file sizes and folder depths)
 
-These are functional single-client compatibility checks. They do not currently
-prove active-active conflict recovery for `PUT /seafhttp/repo/{id}/commit/HEAD`
-or `POST /seafhttp/repo/{id}/update-branch` under multi-node contention.
+The comprehensive proxy suite above is focused on single-client compatibility.
+Active-active conflict recovery under multi-node contention is now covered by
+the real desktop proof in `scripts/test-sync-active-active.sh`.
 
 See `COMPREHENSIVE_TESTING.md` for detailed usage.
 

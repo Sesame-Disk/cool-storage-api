@@ -392,76 +392,24 @@ func TestSyncHeadUpdateKeepsLookupAndAdminProjectionAligned(t *testing.T) {
 	})
 }
 
-func TestSyncHeadConflictReturnsOKWithoutRollback(t *testing.T) {
-	name := fmt.Sprintf("inttest-sync-conflict-%d", time.Now().UnixNano())
-	repoID := createTestLibrary(t, adminClient, name)
-	session := shareProjectionDBForTest(t).Session()
-
-	initial := readLibrarySyncHeadState(t, session, repoID)
-	acceptedHead := fmt.Sprintf("%040x", time.Now().UnixNano())
-	staleHead := fmt.Sprintf("%040x", time.Now().UnixNano()+1)
-	insertSyntheticCommitForTest(t, session, repoID, acceptedHead, initial.HeadCommitID, initial.RootFSID, "integration accepted head")
-	insertSyntheticCommitForTest(t, session, repoID, staleHead, initial.HeadCommitID, initial.RootFSID, "integration stale head")
-	t.Cleanup(func() {
-		for _, commitID := range []string{acceptedHead, staleHead} {
-			if err := session.Query(`DELETE FROM commits WHERE library_id = ? AND commit_id = ?`, repoID, commitID).Exec(); err != nil {
-				t.Errorf("cleanup synthetic commit %s failed: %v", commitID, err)
-			}
-		}
-	})
-
-	resp := adminClient.Do(t, http.MethodPut, fmt.Sprintf("/seafhttp/repo/%s/commit/HEAD?head=%s", repoID, url.QueryEscape(acceptedHead)), nil)
-	if resp.StatusCode != http.StatusOK {
-		body := responseBody(t, resp)
-		t.Fatalf("initial sync HEAD update failed: status=%d body=%s", resp.StatusCode, body)
-	}
-	resp.Body.Close()
-
-	var advanced librarySyncHeadState
-	waitForIntegrationCondition(t, "accepted sync head to become authoritative", func() bool {
-		current := readLibrarySyncHeadState(t, session, repoID)
-		if current.HeadCommitID != acceptedHead || current.LookupHeadCommitID != acceptedHead {
-			return false
-		}
-		if !current.UpdatedAt.After(initial.UpdatedAt) || !current.ProjectionUpdatedAt.Equal(current.UpdatedAt) {
-			return false
-		}
-		advanced = current
-		return true
-	})
-
-	conflictResp := adminClient.Do(t, http.MethodPut, fmt.Sprintf("/seafhttp/repo/%s/commit/HEAD?head=%s", repoID, url.QueryEscape(staleHead)), nil)
-	if conflictResp.StatusCode != http.StatusOK {
-		body := responseBody(t, conflictResp)
-		t.Fatalf("conflicting sync HEAD update returned status=%d body=%s", conflictResp.StatusCode, body)
-	}
-	conflictResp.Body.Close()
-
-	stabilized := readLibrarySyncHeadState(t, session, repoID)
-	if stabilized.HeadCommitID != acceptedHead {
-		t.Fatalf("canonical head rolled back to %q, want %q", stabilized.HeadCommitID, acceptedHead)
-	}
-	if stabilized.LookupHeadCommitID != acceptedHead {
-		t.Fatalf("lookup head rolled back to %q, want %q", stabilized.LookupHeadCommitID, acceptedHead)
-	}
-	if !stabilized.UpdatedAt.Equal(advanced.UpdatedAt) {
-		t.Fatalf("canonical updated_at changed on stale conflict: got %s want %s", stabilized.UpdatedAt.Format(time.RFC3339Nano), advanced.UpdatedAt.Format(time.RFC3339Nano))
-	}
-	if !stabilized.ProjectionUpdatedAt.Equal(advanced.ProjectionUpdatedAt) {
-		t.Fatalf("projection updated_at changed on stale conflict: got %s want %s", stabilized.ProjectionUpdatedAt.Format(time.RFC3339Nano), advanced.ProjectionUpdatedAt.Format(time.RFC3339Nano))
-	}
+func TestSyncHeadConflictSameTreeReturnsOKWithoutHeadRollback(t *testing.T) {
+	testSyncHeadConflictSameTreeReturnsOKWithoutHeadRollback(t, http.MethodPut, "/seafhttp/repo/%s/commit/HEAD?head=%s")
 }
 
-func TestUpdateBranchConflictReturnsOKWithoutRollback(t *testing.T) {
-	name := fmt.Sprintf("inttest-update-branch-conflict-%d", time.Now().UnixNano())
+func TestUpdateBranchConflictSameTreeReturnsOKWithoutHeadRollback(t *testing.T) {
+	testSyncHeadConflictSameTreeReturnsOKWithoutHeadRollback(t, http.MethodPost, "/seafhttp/repo/%s/update-branch?head=%s")
+}
+
+func testSyncHeadConflictSameTreeReturnsOKWithoutHeadRollback(t *testing.T, method, routeFormat string) {
+	name := fmt.Sprintf("inttest-sync-same-tree-conflict-%d", time.Now().UnixNano())
 	repoID := createTestLibrary(t, adminClient, name)
 	session := shareProjectionDBForTest(t).Session()
 
 	initial := readLibrarySyncHeadState(t, session, repoID)
 	acceptedHead := fmt.Sprintf("%040x", time.Now().UnixNano())
 	staleHead := fmt.Sprintf("%040x", time.Now().UnixNano()+1)
-	insertSyntheticCommitForTest(t, session, repoID, acceptedHead, initial.HeadCommitID, initial.RootFSID, "integration accepted update-branch head")
-	insertSyntheticCommitForTest(t, session, repoID, staleHead, initial.HeadCommitID, initial.RootFSID, "integration stale update-branch head")
+	insertSyntheticCommitForTest(t, session, repoID, acceptedHead, initial.HeadCommitID, initial.RootFSID, "integration accepted same-tree head")
+	insertSyntheticCommitForTest(t, session, repoID, staleHead, initial.HeadCommitID, initial.RootFSID, "integration stale same-tree head")
 	t.Cleanup(func() {
 		for _, commitID := range []string{acceptedHead, staleHead} {
 			if err := session.Query(`DELETE FROM commits WHERE library_id = ? AND commit_id = ?`, repoID, commitID).Exec(); err != nil {
@@ -470,15 +418,15 @@ func TestUpdateBranchConflictReturnsOKWithoutRollback(t *testing.T) {
 		}
 	})
 
-	resp := adminClient.Do(t, http.MethodPost, fmt.Sprintf("/seafhttp/repo/%s/update-branch?head=%s", repoID, url.QueryEscape(acceptedHead)), nil)
+	resp := adminClient.Do(t, method, fmt.Sprintf(routeFormat, repoID, url.QueryEscape(acceptedHead)), nil)
 	if resp.StatusCode != http.StatusOK {
 		body := responseBody(t, resp)
-		t.Fatalf("initial update-branch failed: status=%d body=%s", resp.StatusCode, body)
+		t.Fatalf("initial publish failed: status=%d body=%s", resp.StatusCode, body)
 	}
 	resp.Body.Close()
 
 	var advanced librarySyncHeadState
-	waitForIntegrationCondition(t, "accepted update-branch head to become authoritative", func() bool {
+	waitForIntegrationCondition(t, "accepted same-tree head to become authoritative", func() bool {
 		current := readLibrarySyncHeadState(t, session, repoID)
 		if current.HeadCommitID != acceptedHead || current.LookupHeadCommitID != acceptedHead {
 			return false
@@ -490,26 +438,231 @@ func TestUpdateBranchConflictReturnsOKWithoutRollback(t *testing.T) {
 		return true
 	})
 
-	conflictResp := adminClient.Do(t, http.MethodPost, fmt.Sprintf("/seafhttp/repo/%s/update-branch?head=%s", repoID, url.QueryEscape(staleHead)), nil)
+	conflictResp := adminClient.Do(t, method, fmt.Sprintf(routeFormat, repoID, url.QueryEscape(staleHead)), nil)
 	if conflictResp.StatusCode != http.StatusOK {
 		body := responseBody(t, conflictResp)
-		t.Fatalf("conflicting update-branch returned status=%d body=%s", conflictResp.StatusCode, body)
+		t.Fatalf("same-tree stale publish returned status=%d body=%s", conflictResp.StatusCode, body)
 	}
 	conflictResp.Body.Close()
 
-	stabilized := readLibrarySyncHeadState(t, session, repoID)
-	if stabilized.HeadCommitID != acceptedHead {
-		t.Fatalf("canonical head rolled back to %q, want %q", stabilized.HeadCommitID, acceptedHead)
+	waitForIntegrationCondition(t, "same-tree stale publish to leave accepted head authoritative", func() bool {
+		current := readLibrarySyncHeadState(t, session, repoID)
+		return current.HeadCommitID == acceptedHead &&
+			current.LookupHeadCommitID == acceptedHead &&
+			current.UpdatedAt.Equal(advanced.UpdatedAt) &&
+			current.ProjectionUpdatedAt.Equal(advanced.ProjectionUpdatedAt)
+	})
+}
+
+func TestSyncHeadConflictUnmergeableReturnsRetryable503(t *testing.T) {
+	testSyncHeadConflictUnmergeableReturnsRetryable503(t, http.MethodPut, "/seafhttp/repo/%s/commit/HEAD?head=%s")
+}
+
+func TestUpdateBranchConflictUnmergeableReturnsRetryable503(t *testing.T) {
+	testSyncHeadConflictUnmergeableReturnsRetryable503(t, http.MethodPost, "/seafhttp/repo/%s/update-branch?head=%s")
+}
+
+func testSyncHeadConflictUnmergeableReturnsRetryable503(t *testing.T, method, routeFormat string) {
+	name := fmt.Sprintf("inttest-sync-conflict-503-%d", time.Now().UnixNano())
+	repoID := createTestLibrary(t, adminClient, name)
+	session := shareProjectionDBForTest(t).Session()
+
+	initial := readLibrarySyncHeadState(t, session, repoID)
+	seed := time.Now().UnixNano()
+	currentFileFSID := fmt.Sprintf("%040x", seed+1)
+	targetFileFSID := fmt.Sprintf("%040x", seed+2)
+	currentRootFSID := fmt.Sprintf("%040x", seed+3)
+	targetRootFSID := fmt.Sprintf("%040x", seed+4)
+	currentHead := fmt.Sprintf("%040x", seed+5)
+	staleHead := fmt.Sprintf("%040x", seed+6)
+
+	insertSyntheticFileObjectForTest(t, session, repoID, currentFileFSID, 61)
+	insertSyntheticFileObjectForTest(t, session, repoID, targetFileFSID, 62)
+	insertSyntheticDirObjectForTest(t, session, repoID, currentRootFSID, []syntheticDirEntry{{
+		ID:   currentFileFSID,
+		Name: "collision.txt",
+		Mode: 33188,
+		Size: 61,
+	}})
+	insertSyntheticDirObjectForTest(t, session, repoID, targetRootFSID, []syntheticDirEntry{{
+		ID:   targetFileFSID,
+		Name: "collision.txt",
+		Mode: 33188,
+		Size: 62,
+	}})
+	insertSyntheticCommitForTest(t, session, repoID, currentHead, initial.HeadCommitID, currentRootFSID, "integration current unmergeable head")
+	insertSyntheticCommitForTest(t, session, repoID, staleHead, initial.HeadCommitID, targetRootFSID, "integration stale unmergeable head")
+	t.Cleanup(func() {
+		for _, commitID := range []string{currentHead, staleHead} {
+			if err := session.Query(`DELETE FROM commits WHERE library_id = ? AND commit_id = ?`, repoID, commitID).Exec(); err != nil {
+				t.Errorf("cleanup synthetic commit %s failed: %v", commitID, err)
+			}
+		}
+		for _, fsID := range []string{currentRootFSID, targetRootFSID, currentFileFSID, targetFileFSID} {
+			if err := session.Query(`DELETE FROM fs_objects WHERE library_id = ? AND fs_id = ?`, repoID, fsID).Exec(); err != nil {
+				t.Errorf("cleanup synthetic fs_object %s failed: %v", fsID, err)
+			}
+		}
+	})
+
+	acceptedResp := adminClient.Do(t, method, fmt.Sprintf(routeFormat, repoID, url.QueryEscape(currentHead)), nil)
+	if acceptedResp.StatusCode != http.StatusOK {
+		body := responseBody(t, acceptedResp)
+		t.Fatalf("accepted publish returned status=%d body=%s", acceptedResp.StatusCode, body)
 	}
-	if stabilized.LookupHeadCommitID != acceptedHead {
-		t.Fatalf("lookup head rolled back to %q, want %q", stabilized.LookupHeadCommitID, acceptedHead)
+	acceptedResp.Body.Close()
+
+	var advanced librarySyncHeadState
+	waitForIntegrationCondition(t, "accepted unmergeable head to become authoritative", func() bool {
+		current := readLibrarySyncHeadState(t, session, repoID)
+		if current.HeadCommitID != currentHead || current.LookupHeadCommitID != currentHead {
+			return false
+		}
+		if !current.ProjectionUpdatedAt.Equal(current.UpdatedAt) {
+			return false
+		}
+		advanced = current
+		return true
+	})
+
+	conflictResp := adminClient.Do(t, method, fmt.Sprintf(routeFormat, repoID, url.QueryEscape(staleHead)), nil)
+	body := responseBody(t, conflictResp)
+	if conflictResp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("unmergeable stale publish returned status=%d body=%s", conflictResp.StatusCode, body)
 	}
-	if !stabilized.UpdatedAt.Equal(advanced.UpdatedAt) {
-		t.Fatalf("canonical updated_at changed on stale conflict: got %s want %s", stabilized.UpdatedAt.Format(time.RFC3339Nano), advanced.UpdatedAt.Format(time.RFC3339Nano))
+	if got := conflictResp.Header.Get("Retry-After"); got != "1" {
+		t.Fatalf("Retry-After header = %q, want %q", got, "1")
 	}
-	if !stabilized.ProjectionUpdatedAt.Equal(advanced.ProjectionUpdatedAt) {
-		t.Fatalf("projection updated_at changed on stale conflict: got %s want %s", stabilized.ProjectionUpdatedAt.Format(time.RFC3339Nano), advanced.ProjectionUpdatedAt.Format(time.RFC3339Nano))
+	if !strings.Contains(body, "sync head publish conflicted; retry") {
+		t.Fatalf("unmergeable stale publish body = %q, want retry hint", body)
 	}
+
+	waitForIntegrationCondition(t, "unmergeable stale publish to leave accepted head authoritative", func() bool {
+		current := readLibrarySyncHeadState(t, session, repoID)
+		return current.HeadCommitID == currentHead &&
+			current.LookupHeadCommitID == currentHead &&
+			current.UpdatedAt.Equal(advanced.UpdatedAt) &&
+			current.ProjectionUpdatedAt.Equal(advanced.ProjectionUpdatedAt)
+	})
+}
+
+func TestSyncHeadConflictAutoMergesNonOverlappingEntries(t *testing.T) {
+	testSyncHeadConflictAutoMergeNonOverlappingEntries(t, http.MethodPut, "/seafhttp/repo/%s/commit/HEAD?head=%s")
+}
+
+func TestUpdateBranchConflictAutoMergesNonOverlappingEntries(t *testing.T) {
+	testSyncHeadConflictAutoMergeNonOverlappingEntries(t, http.MethodPost, "/seafhttp/repo/%s/update-branch?head=%s")
+}
+
+func testSyncHeadConflictAutoMergeNonOverlappingEntries(t *testing.T, method, routeFormat string) {
+	name := fmt.Sprintf("inttest-sync-auto-merge-%d", time.Now().UnixNano())
+	repoID := createTestLibrary(t, adminClient, name)
+	session := shareProjectionDBForTest(t).Session()
+	t.Cleanup(func() {
+		resp := adminClient.Delete(t, fmt.Sprintf("/api/v2.1/repos/%s/", repoID))
+		if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusNotFound {
+			resp.Body.Close()
+			return
+		}
+		body := responseBody(t, resp)
+		t.Errorf("cleanup delete library %s failed: status=%d body=%s", repoID, resp.StatusCode, body)
+	})
+
+	initial := readLibrarySyncHeadState(t, session, repoID)
+	seed := time.Now().UnixNano()
+	currentFileFSID := fmt.Sprintf("%040x", seed+1)
+	targetFileFSID := fmt.Sprintf("%040x", seed+2)
+	currentRootFSID := fmt.Sprintf("%040x", seed+3)
+	targetRootFSID := fmt.Sprintf("%040x", seed+4)
+	currentHead := fmt.Sprintf("%040x", seed+5)
+	staleHead := fmt.Sprintf("%040x", seed+6)
+
+	insertSyntheticFileObjectForTest(t, session, repoID, currentFileFSID, 61)
+	insertSyntheticFileObjectForTest(t, session, repoID, targetFileFSID, 60)
+	insertSyntheticDirObjectForTest(t, session, repoID, currentRootFSID, []syntheticDirEntry{{
+		ID:   currentFileFSID,
+		Name: "client-1.txt",
+		Mode: 33188,
+		Size: 61,
+	}})
+	insertSyntheticDirObjectForTest(t, session, repoID, targetRootFSID, []syntheticDirEntry{{
+		ID:   targetFileFSID,
+		Name: "client-2.txt",
+		Mode: 33188,
+		Size: 60,
+	}})
+	insertSyntheticCommitForTest(t, session, repoID, currentHead, initial.HeadCommitID, currentRootFSID, "integration current sync head")
+	insertSyntheticCommitForTest(t, session, repoID, staleHead, initial.HeadCommitID, targetRootFSID, "integration stale sync head")
+	t.Cleanup(func() {
+		for _, commitID := range []string{currentHead, staleHead} {
+			if err := session.Query(`DELETE FROM commits WHERE library_id = ? AND commit_id = ?`, repoID, commitID).Exec(); err != nil {
+				t.Errorf("cleanup synthetic commit %s failed: %v", commitID, err)
+			}
+		}
+		for _, fsID := range []string{currentRootFSID, targetRootFSID, currentFileFSID, targetFileFSID} {
+			if err := session.Query(`DELETE FROM fs_objects WHERE library_id = ? AND fs_id = ?`, repoID, fsID).Exec(); err != nil {
+				t.Errorf("cleanup synthetic fs_object %s failed: %v", fsID, err)
+			}
+		}
+	})
+
+	acceptedResp := adminClient.Do(t, method, fmt.Sprintf(routeFormat, repoID, url.QueryEscape(currentHead)), nil)
+	if acceptedResp.StatusCode != http.StatusOK {
+		body := responseBody(t, acceptedResp)
+		t.Fatalf("accepted publish returned status=%d body=%s", acceptedResp.StatusCode, body)
+	}
+	acceptedResp.Body.Close()
+
+	waitForIntegrationCondition(t, "current sync head to become authoritative before auto-merge", func() bool {
+		current := readLibrarySyncHeadState(t, session, repoID)
+		return current.HeadCommitID == currentHead && current.LookupHeadCommitID == currentHead
+	})
+
+	mergeResp := adminClient.Do(t, method, fmt.Sprintf(routeFormat, repoID, url.QueryEscape(staleHead)), nil)
+	if mergeResp.StatusCode != http.StatusOK {
+		body := responseBody(t, mergeResp)
+		t.Fatalf("stale publish returned status=%d body=%s", mergeResp.StatusCode, body)
+	}
+	mergeResp.Body.Close()
+
+	waitForIntegrationCondition(t, "non-overlapping stale sync publish to auto-merge into a new HEAD", func() bool {
+		current := readLibrarySyncHeadState(t, session, repoID)
+		if current.HeadCommitID == currentHead || current.HeadCommitID == staleHead {
+			return false
+		}
+		if current.LookupHeadCommitID != current.HeadCommitID {
+			return false
+		}
+		if !current.ProjectionUpdatedAt.Equal(current.UpdatedAt) {
+			return false
+		}
+		if current.FileCount < 2 || current.SizeBytes < 121 {
+			return false
+		}
+
+		var entriesJSON string
+		if err := session.Query(`
+			SELECT dir_entries FROM fs_objects WHERE library_id = ? AND fs_id = ?
+		`, repoID, current.RootFSID).Scan(&entriesJSON); err != nil {
+			return false
+		}
+		var entries []syntheticDirEntry
+		if err := json.Unmarshal([]byte(entriesJSON), &entries); err != nil {
+			return false
+		}
+
+		haveClient1 := false
+		haveClient2 := false
+		for _, entry := range entries {
+			switch entry.Name {
+			case "client-1.txt":
+				haveClient1 = true
+			case "client-2.txt":
+				haveClient2 = true
+			}
+		}
+		return haveClient1 && haveClient2
+	})
 }
 
 func TestUpdateBranchSameHeadReturnsOKWithoutProjectionChange(t *testing.T) {
@@ -1157,5 +1310,17 @@ func insertSyntheticDirObjectForTest(t *testing.T, session interface {
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 	`, repoID, fsID, "dir", fsID, "/", string(entriesJSON), int64(0), time.Now().Unix()).Exec(); err != nil {
 		t.Fatalf("failed to insert synthetic fs object %s for %s: %v", fsID, repoID, err)
+	}
+}
+
+func insertSyntheticFileObjectForTest(t *testing.T, session interface {
+	Query(stmt string, values ...interface{}) *gocql.Query
+}, repoID, fsID string, size int64) {
+	t.Helper()
+	if err := session.Query(`
+		INSERT INTO fs_objects (library_id, fs_id, obj_type, obj_name, full_path, size_bytes, mtime, block_ids)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+	`, repoID, fsID, "file", fsID, "/", size, time.Now().Unix(), []string{}).Exec(); err != nil {
+		t.Fatalf("failed to insert synthetic file object %s for %s: %v", fsID, repoID, err)
 	}
 }

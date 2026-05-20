@@ -129,10 +129,10 @@ func multiInstanceFileNames(prefix string, count int) []string {
 
 const syncHeadRetryProbeDelay = 90 * time.Millisecond
 
-func expectSyncHeadRetryObserved(t *testing.T, result concurrentMutationResult) {
+func expectSyncHeadRetryDelayObserved(t *testing.T, result concurrentMutationResult) {
 	t.Helper()
 	if result.took < syncHeadRetryProbeDelay {
-		t.Fatalf("%s completed in %s, shorter than retry probe delay %s; test did not prove parent-mismatch retry", result.name, result.took, syncHeadRetryProbeDelay)
+		t.Fatalf("%s completed in %s, shorter than retry probe delay %s; test did not prove a retry delay", result.name, result.took, syncHeadRetryProbeDelay)
 	}
 }
 
@@ -215,7 +215,7 @@ func TestMultiInstanceUpdateBranchConvergesWhenParentPromotionWinsDuringRetry(t 
 	finalResult := <-finalResults
 	collected := []concurrentMutationResult{finalResult, intermediateResult}
 	expectConcurrentStatuses(t, collected, http.StatusOK)
-	expectSyncHeadRetryObserved(t, finalResult)
+	expectSyncHeadRetryDelayObserved(t, finalResult)
 
 	waitForIntegrationCondition(t, "multi-instance update-branch to converge to the final chained head", func() bool {
 		current := readLibrarySyncHeadState(t, session, repoID)
@@ -262,7 +262,7 @@ func TestMultiInstancePutCommitHeadConvergesWhenParentPromotionWinsDuringRetry(t
 	finalResult := <-finalResults
 	collected := []concurrentMutationResult{finalResult, intermediateResult}
 	expectConcurrentStatuses(t, collected, http.StatusOK)
-	expectSyncHeadRetryObserved(t, finalResult)
+	expectSyncHeadRetryDelayObserved(t, finalResult)
 
 	waitForIntegrationCondition(t, "multi-instance put commit HEAD to converge to the final chained head", func() bool {
 		current := readLibrarySyncHeadState(t, session, repoID)

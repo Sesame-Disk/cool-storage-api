@@ -23,7 +23,7 @@
 3. ~~Monitoring/Health Checks~~ - ✅ COMPLETE (slog logging, `/health`, `/ready`, `/metrics`)
 4. ~~Frontend/Backend Separation~~ - ✅ COMPLETE (2026-03-30/31) — separate React/nginx container, bootstrap API, nginx production hardening
 5. ~~Programmatic Auth (PATs)~~ - ✅ COMPLETE — user API keys ship via `/api/v2.1/api-keys/`, and `/api2/auth-token/` now exchanges `email + API key` for desktop/CLI tokens. Device Flow remains optional future work.
-6. Desktop sync active-active conflict recovery - OPEN for desktop GA. `PUT /seafhttp/repo/:repo_id/commit/HEAD` and `POST /seafhttp/repo/:repo_id/update-branch` now use parent-chain validation, CAS, and bounded server-side retry for transient parent-mismatch/CAS races, with handler-level multi-node convergence coverage on both routes. The remaining gap is end-to-end proof with a real desktop client under active-active contention; retry-budget exhaustion still preserves client-compatible `200 OK`. This is not a web-only launch blocker.
+6. ~~Desktop sync active-active conflict recovery~~ - ✅ BASELINE VERIFIED for non-overlapping concurrent desktop writes. `PUT /seafhttp/repo/:repo_id/commit/HEAD` and `POST /seafhttp/repo/:repo_id/update-branch` now use parent-chain validation, CAS, bounded retry, ancestry-gated server-side auto-merge for safe stale siblings, and `503 + Retry-After` fail-closed responses for unsafe conflicts. Real desktop-client proof now exists via `scripts/test-sync-active-active.sh`; broader scenario coverage remains follow-up test debt rather than a current launch blocker.
 7. **GC Multi-Instance Safety** - ✅ BASELINE HARDENED — GC now defaults off in YAML, activates explicitly via `GC_ENABLED=true`, and enabled replicas coordinate through a Cassandra LWT lease. Multi-region guidance still remains: enable GC in exactly one DC.
 8. ~~Quota Period Rollover~~ - ✅ COMPLETE — Period rollover job advances expired org quota periods and keeps monthly traffic enforcement moving
 9. **Production Multi-Region Topology** - ⚠️ PARTIAL — region-aware library selection/read/write routing is implemented and covered by focused integration tests, and org-level create-time residency policy now exists in the backend. The stock production config/compose files still ship as single-region examples, and per-region `classes`, `endpoint_regions`, ingress host preservation, rollout, migration, and frontend policy controls remain operator work.
@@ -50,7 +50,7 @@
 
 | Component | Status | Stability | Protocol Tested | Last Verified | Notes |
 |-----------|--------|-----------|-----------------|---------------|-------|
-| **Sync Protocol (Desktop Client)** | ✅ COMPLETE | Mostly stable | ✅ Yes | 2026-05-20 | Functional and comparison tests pass, but active-active HEAD-conflict recovery is still not proven end-to-end for desktop sync |
+| **Sync Protocol (Desktop Client)** | ✅ COMPLETE | Mostly stable | ✅ Yes | 2026-05-20 | Functional, comparison, and active-active real-client proof pass for non-overlapping concurrent writes; broader conflict-matrix coverage remains follow-up test debt |
 | **Encrypted Libraries (PBKDF2)** | 🔒 FROZEN | **STABLE** | ✅ Yes | 2026-02-04 | 90.8% unit coverage, 39 tests. Test vectors verified. |
 | **File Block Encryption (AES-256-CBC)** | ✅ COMPLETE | Mostly stable | ⚠️ Partial | 2026-01-09 | Works with desktop client |
 | **Block Storage (S3)** | ✅ COMPLETE | Mostly stable | ⚠️ Partial | 2026-02-16 | SHA-1→SHA-256 mapping working. Custom HTTP transport (64 conn/host, 128KB buffers). |
@@ -475,6 +475,9 @@ cd docker/seafile-cli-debug && ./run-sync-comparison.sh
 
 # Real desktop client test (for sync endpoints)
 cd docker/seafile-cli-debug && ./run-real-client-sync.sh
+
+# Real desktop client active-active proof (two clients, two backend nodes)
+bash ./scripts/test-sync-active-active.sh
 
 # Unit tests (for all components)
 go test ./...

@@ -1142,7 +1142,7 @@ The repo now has four implementations of the same "retry on `ErrLibraryHeadConfl
 
 Update 2026-05-19: both upload seams now also fail closed if `IncrementOrCreateBlock` cannot confirm the `blocks` row, so uploads no longer continue to library metadata publish after a block-metadata registration failure.
 
-The remaining debt here is not the old blind-overwrite bug. `PUT /commit/HEAD` and `POST /update-branch` already use parent-chain validation, CAS, and bounded retry, with regression and multi-node convergence coverage on both routes. The remaining debt is duplicated retry orchestration plus proof: exhausted sync retry budgets still preserve client-compatible `200 OK`, and the current sync test surface still does not prove that a real desktop client converges under active-active multi-node contention.
+The remaining debt here is not the old blind-overwrite bug. `PUT /commit/HEAD` and `POST /update-branch` now use parent-chain validation, CAS, bounded retry, and server-side auto-merge for non-overlapping stale commits, with regression and multi-node convergence coverage on both routes. The real desktop-client active-active proof now lives in `scripts/test-sync-active-active.sh`, so the remaining debt is duplicated retry orchestration rather than missing proof or false-success fallback semantics.
 
 For the retrying paths, the debt remains maintainability rather than correctness: the upload-specific `*_Once` extraction is already in place, and migrating both upload loops to `retryLibraryHeadMutation` would still remove duplicated retry bookkeeping and keep future contention tuning in one place.
 
@@ -1166,6 +1166,8 @@ Hard to avoid safely (the replaced entry can legitimately change between attempt
 The same retry-amplification pattern applies to copy block reference accounting: same-repo copy pins copied block refs inside the retry attempt, rolls them back if the HEAD CAS loses, and pins again on the next attempt. This is functionally correct and keeps refcounts balanced, but a contended copy of N blocks can issue multiple rounds of LWT refcount writes before one publish wins.
 
 Retried metadata mutations can also leave unpublished rows behind. Each failed attempt may have created new `fs_objects` and a `commits` row whose commit never becomes a library HEAD. This is not a functional regression, but CAS retries multiply the amount of unreachable metadata compared with a single failed publish. A future maintenance pass should add observability or cleanup for unpublished commit/fs-object rows.
+
+The same pattern now applies to sync auto-merge snapshotting: `internal/api/sync.go` reads base/current/target `root_fs_id` in separate queries before attempting the merge. The final HEAD CAS still rejects stale work correctly, but concurrent head movement can waste merge computation and temporary fs-object materialization before the publish loses.
 
 ### 19.d. `UpdateLibraryHeadFromSnapshot` Validates an Argument Every Caller Passes Mechanically
 

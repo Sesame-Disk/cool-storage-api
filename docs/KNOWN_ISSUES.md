@@ -34,7 +34,7 @@ This document tracks all known bugs, limitations, and issues in SesameFS.
 | Modal Dialogs | ✅ All 122 Fixed | All dialog files use Bootstrap classes |
 | Library Settings Backend | Partial | API tokens and transfer are complete. History and auto-delete settings persist, but retention/delete semantics are incomplete. See ISSUE-LIB-RETENTION-01. |
 | **Desktop SSO Browser UX** | ✅ Fixed (2026-03-04) | After browser SSO login for desktop client, now shows confirmation page with auto-close. See ISSUE-SSO-01 below. |
-| **Desktop Sync Active-Active Conflict Recovery** | 🔴 Desktop-sync GA blocker | `PUT /commit/HEAD` and `POST /update-branch` now use parent-chain validation, CAS, and bounded server-side retry for transient stale races, with handler-level regression and multi-node convergence coverage on both routes. The remaining gap is real desktop-client recovery proof under active-active contention, and retry-budget exhaustion still preserves client-compatible `200 OK`. See ISSUE-SYNC-HEAD-RECOVERY-01 below. |
+| **Desktop Sync Active-Active Conflict Recovery** | 🟡 Follow-up coverage debt | `PUT /commit/HEAD` and `POST /update-branch` now use parent-chain validation, CAS, ancestry-gated auto-merge for safe stale siblings, and `503 + Retry-After` fail-closed responses for unsafe conflicts. Real desktop-client active-active proof now exists for concurrent non-overlapping writes via `scripts/test-sync-active-active.sh`; the remaining gap is broader end-to-end scenario coverage. See ISSUE-SYNC-HEAD-RECOVERY-01 below. |
 | **Upload "Don't Replace" (Desktop Client)** | 🟡 Pending | Desktop client file browser "No" button (auto-rename) doesn't work. Client uses `update-link` vs `upload-link` to distinguish replace vs no-replace, but both map to same token/handler. Backend autorename infrastructure ready (`autoRenameIfExists`), needs token-level `Replace` flag to distinguish endpoints. Web "Don't replace" also broken (same root cause). See ISSUE-UPLOAD-REPLACE-01 below. |
 | **Org Logo Upload** | 🟡 Stub | `UpdateOrgLogo` in org_admin.go accepts the file but does not persist it to storage. Returns a static path from settings. Functional as a route placeholder until an asset storage backend is available. |
 | **Login Analytics History** | 🟡 Partial | `last_login` is now real and persisted in `users.last_login_at`, but there is still no historical login event dataset for trend analysis, login audit timelines, or period-based "users who logged in" charts. See ISSUE-LOGIN-ANALYTICS-01 below. |
@@ -401,10 +401,10 @@ What is still missing is traffic-accounting coverage for abandoned or failed chu
 
 ---
 
-### ISSUE-SYNC-HEAD-RECOVERY-01: Desktop Sync HEAD Conflict Recovery Is Still Unproven Under Active-Active Contention
+### ISSUE-SYNC-HEAD-RECOVERY-01: Desktop Sync HEAD Conflict Recovery Follow-up Coverage
 
-**Status**: 🔴 Open / confirmed gap (2026-05-20)
-**Severity**: High for desktop sync active-active deployments; not a web-only blocker
+**Status**: 🟡 Narrowed follow-up coverage debt (2026-05-20)
+**Severity**: Medium - baseline active-active proof exists, but the real-client scenario matrix is still incomplete
 **Affected**: `PUT /seafhttp/repo/:repo_id/commit/HEAD`, `POST /seafhttp/repo/:repo_id/update-branch`, desktop sync launch criteria
 
 #### What Is True Today
@@ -419,32 +419,33 @@ Both endpoints now perform bounded server-side retry when a stale race is likely
 
 - parent-chain mismatch retries with the shared exponential+jitter backoff budget;
 - CAS conflict retries with the same bounded backoff budget;
-- if the retry budget is exhausted, the handlers still return client-compatible `200 OK` without advancing HEAD.
+- non-overlapping stale siblings can be resolved by ancestry-gated server-side auto-merge;
+- unsafe conflicts now fail closed with `503` plus `Retry-After: 1`, so desktop clients keep local state instead of receiving a false-success `200 OK`.
 
-That means the remaining gap is no longer missing CAS or missing server-side retry. The remaining gap is whether desktop clients reliably recover in the residual exhausted-budget cases, and whether the overall desktop flow is proven end-to-end under active-active contention.
+That means the remaining gap is no longer missing CAS, missing server-side retry, or the lack of any real desktop active-active proof. The remaining gap is broader end-to-end scenario coverage beyond the verified non-overlapping-write case.
 
 #### Current Evidence
 
-- Code path: `internal/api/sync.go` uses parent-chain validation, CAS, and bounded retry for both `PUT /commit/HEAD` and `POST /update-branch`.
-- Handler-level stale-conflict/no-rollback regression proof exists for both routes: `TestSyncHeadConflictReturnsOKWithoutRollback` and `TestUpdateBranchConflictReturnsOKWithoutRollback` in `internal/integration/library_projection_regression_test.go`.
-- Handler-level multi-node convergence proof exists for both routes: `TestMultiInstancePutCommitHeadConvergesWhenParentPromotionWinsDuringRetry` and `TestMultiInstanceUpdateBranchConvergesWhenParentPromotionWinsDuringRetry` in `internal/integration/multi_instance_mutations_test.go`.
-- The functional sync protocol test surfaces (`docs/SEAFILE-SYNC-PROTOCOL.md`, `docs/SYNC-TESTING.md`) still cover handler/protocol behavior rather than a real desktop-client conflict/recovery flow under multi-node active-active contention.
+- Code path: `internal/api/sync.go` uses parent-chain validation, CAS, bounded retry, ancestry-gated auto-merge, and `503 + Retry-After` fail-closed fallback for both `PUT /commit/HEAD` and `POST /update-branch`.
+- Same-tree stale idempotence and unmergeable `503` regressions exist for both routes in `internal/integration/library_projection_regression_test.go`.
+- Handler-level multi-node convergence proof exists for both routes in `internal/integration/multi_instance_mutations_test.go`.
+- Real desktop-client active-active proof exists for concurrent non-overlapping writes in `scripts/test-sync-active-active.sh` and is documented in `docs/SEAFILE-SYNC-PROTOCOL.md`.
 
-#### Why This Stays Open
+#### Why This Still Exists As Follow-up Debt
 
-The code no longer relies only on the client for the first recovery attempt, but exhausted-budget behavior still falls back to the client-compatible `200 OK` contract. That recovery behavior is still not proven end-to-end in this repo for active-active desktop sync contention.
+The code no longer relies on synthetic `200 OK` for exhausted retry budgets, and the repo now has one real active-active desktop proof. The remaining gap is breadth rather than absence of proof: this repo still lacks real-client end-to-end exercises for scenarios such as same-path unmergeable conflicts, quota rejection during auto-merge, and other non-happy-path branches.
 
-Until that proof exists, desktop sync should not be described as fully production-safe for multi-node active-active deployments even though web upload and mutation correctness are substantially improved.
+Those scenarios are already handler-covered, but they are not yet exercised by a real desktop-client harness in this repo.
 
 #### Exit Criteria
 
-- Add a real desktop-client conflict/recovery proof under multi-node contention; or
-- tighten exhausted-budget behavior/telemetry enough that desktop GA no longer depends on unproven client-side follow-up.
+- Expand the real desktop-client harness to cover unmergeable same-path conflicts and other `503` branches; and/or
+- add stronger telemetry/assertions around residual fail-closed sync publish outcomes.
 
 #### Related
 
 - `docs/TECHNICAL-DEBT.md` §19.a — duplicated retry orchestration across sync, upload, and v2 mutation helpers.
-- `docs/IMPLEMENTATION_STATUS.md` — desktop sync status now reflects this remaining launch gap.
+- `docs/IMPLEMENTATION_STATUS.md` — desktop sync status now reflects verified baseline proof plus remaining follow-up coverage debt.
 
 ---
 

@@ -591,6 +591,42 @@ services:
     # Manual mode: docker compose --profile debug up -d --build seafile-cli
     # Then: docker exec -it sesamefs-seafile-cli-1 seaf-test.sh help
 
+  seafile-cli-aa-1:
+    build:
+      context: ./docker/seafile-cli
+      dockerfile: Dockerfile
+    environment:
+      - SEAF_SERVER_URL=http://sesamefs:8080
+      - SEAF_USERNAME=${SEAF_CLI_USERNAME:-00000000-0000-0000-0000-000000000001}
+      - SEAF_PASSWORD=${SEAF_CLI_PASSWORD:-dev-token-123}
+    volumes:
+      - seafile_cli_aa_1_data:/seafile-data
+      - seafile_cli_aa_1_config:/home/seafuser/.ccnet
+    depends_on:
+      - sesamefs
+    restart: "no"
+    profiles:
+      - debug
+    # Active-active desktop proof client pinned to node 1.
+
+  seafile-cli-aa-2:
+    build:
+      context: ./docker/seafile-cli
+      dockerfile: Dockerfile
+    environment:
+      - SEAF_SERVER_URL=http://sesamefs-node-2:8080
+      - SEAF_USERNAME=${SEAF_CLI_USERNAME:-00000000-0000-0000-0000-000000000001}
+      - SEAF_PASSWORD=${SEAF_CLI_PASSWORD:-dev-token-123}
+    volumes:
+      - seafile_cli_aa_2_data:/seafile-data
+      - seafile_cli_aa_2_config:/home/seafuser/.ccnet
+    depends_on:
+      - sesamefs-node-2
+    restart: "no"
+    profiles:
+      - debug
+    # Active-active desktop proof client pinned to node 2.
+
   # Seafile CLI DEBUG container for protocol reverse engineering
   # Points to REAL Seafile server for protocol capture
   # IMPORTANT: Set SEAF_DEBUG_* variables in .env — never hardcode credentials here
@@ -620,6 +656,10 @@ volumes:
   onlyoffice_logs:
   seafile_cli_data:
   seafile_cli_config:
+  seafile_cli_aa_1_data:
+  seafile_cli_aa_1_config:
+  seafile_cli_aa_2_data:
+  seafile_cli_aa_2_config:
   seafile_sync_test_data:
   seafile_sync_test_config:
   seafile_debug_data:

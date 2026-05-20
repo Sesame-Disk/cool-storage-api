@@ -13,6 +13,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -31,6 +32,8 @@ import (
 
 // ErrHeadConflict indicates that the HEAD was modified concurrently (CAS failure)
 var ErrHeadConflict = fmt.Errorf("HEAD was modified concurrently")
+
+var errSyncHeadAutoMergeConflict = errors.New("sync head auto-merge conflict")
 
 // SyncTokenCreator interface for creating sync tokens
 type SyncTokenCreator interface {
@@ -2020,6 +2023,372 @@ func (h *SyncHandler) readSyncTargetCommit(repoID, commitID string) (string, str
 	return commitParent, rootFSID, nil
 }
 
+func (h *SyncHandler) readCommitRootFSID(repoID, commitID string) (string, error) {
+	if commitID == "" {
+		return "", nil
+	}
+
+	var rootFSID string
+	if err := h.db.Session().Query(`
+		SELECT root_fs_id FROM commits WHERE library_id = ? AND commit_id = ?
+	`, repoID, commitID).Scan(&rootFSID); err != nil {
+		return "", err
+	}
+	return rootFSID, nil
+}
+
+func (h *SyncHandler) syncCommitHasAncestor(repoID, commitID, ancestorID string) (bool, error) {
+	if commitID == "" || ancestorID == "" {
+		return false, nil
+	}
+
+	current := commitID
+	for depth := 0; depth < 1024; depth++ {
+		if current == ancestorID {
+			return true, nil
+		}
+
+		var parentID *string
+		if err := h.db.Session().Query(`
+			SELECT parent_id FROM commits WHERE library_id = ? AND commit_id = ?
+		`, repoID, current).Scan(&parentID); err != nil {
+			return false, err
+		}
+		if parentID == nil || *parentID == "" {
+			return false, nil
+		}
+		current = *parentID
+	}
+
+	return false, fmt.Errorf("commit ancestry walk exceeded limit for repo %s from %s toward %s", repoID, commitID, ancestorID)
+}
+
+func (h *SyncHandler) readSyncDirectoryEntries(repoID, fsID string) ([]FSEntry, error) {
+	if fsID == "" || fsID == strings.Repeat("0", 40) {
+		return []FSEntry{}, nil
+	}
+
+	var objType string
+	var entriesJSON string
+	err := h.db.Session().Query(`
+		SELECT obj_type, dir_entries FROM fs_objects WHERE library_id = ? AND fs_id = ?
+	`, repoID, fsID).Scan(&objType, &entriesJSON)
+	if err != nil {
+		return nil, err
+	}
+	if objType != "dir" {
+		return nil, fmt.Errorf("fs_object %s is %s, want dir", fsID, objType)
+	}
+	if entriesJSON == "" || entriesJSON == "[]" {
+		return []FSEntry{}, nil
+	}
+
+	var entries []FSEntry
+	if err := json.Unmarshal([]byte(entriesJSON), &entries); err != nil {
+		return nil, fmt.Errorf("failed to parse dir entries for %s: %w", fsID, err)
+	}
+	return entries, nil
+}
+
+func (h *SyncHandler) createSyncDirectoryFSObject(repoID string, entries []FSEntry) (string, error) {
+	ordered := append([]FSEntry(nil), entries...)
+	sort.SliceStable(ordered, func(i, j int) bool {
+		return ordered[i].Name < ordered[j].Name
+	})
+
+	entriesJSON, err := json.Marshal(ordered)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal merged directory entries: %w", err)
+	}
+
+	fsContent := map[string]interface{}{
+		"version": 1,
+		"type":    3,
+		"dirents": json.RawMessage(entriesJSON),
+	}
+	fsContentJSON, err := json.Marshal(fsContent)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal merged directory object: %w", err)
+	}
+
+	hash := sha1.Sum(fsContentJSON)
+	fsID := hex.EncodeToString(hash[:])
+	if err := h.db.Session().Query(`
+		INSERT INTO fs_objects (library_id, fs_id, obj_type, dir_entries, mtime)
+		VALUES (?, ?, ?, ?, ?)
+	`, repoID, fsID, "dir", string(entriesJSON), time.Now().Unix()).Exec(); err != nil {
+		return "", fmt.Errorf("failed to store merged directory %s: %w", fsID, err)
+	}
+
+	return fsID, nil
+}
+
+func (h *SyncHandler) createSyncAutoMergeCommit(repoID, userID, parentCommitID, rootFSID, description string) (string, error) {
+	commitData := fmt.Sprintf("%s:%s:%s:%d", repoID, rootFSID, description, time.Now().UnixNano())
+	hash := sha1.Sum([]byte(commitData))
+	commitID := hex.EncodeToString(hash[:])
+
+	if err := h.db.Session().Query(`
+		INSERT INTO commits (library_id, commit_id, parent_id, root_fs_id, creator_id, description, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+	`, repoID, commitID, parentCommitID, rootFSID, userID, description, time.Now()).Exec(); err != nil {
+		return "", fmt.Errorf("failed to create auto-merge commit: %w", err)
+	}
+
+	return commitID, nil
+}
+
+func syncEntryEquivalent(a, b *FSEntry) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return a.ID == b.ID && a.Mode == b.Mode
+}
+
+func syncEntrySlicesEquivalent(left, right []FSEntry) bool {
+	if len(left) != len(right) {
+		return false
+	}
+
+	leftOrdered := append([]FSEntry(nil), left...)
+	rightOrdered := append([]FSEntry(nil), right...)
+	sort.SliceStable(leftOrdered, func(i, j int) bool {
+		return leftOrdered[i].Name < leftOrdered[j].Name
+	})
+	sort.SliceStable(rightOrdered, func(i, j int) bool {
+		return rightOrdered[i].Name < rightOrdered[j].Name
+	})
+
+	for idx := range leftOrdered {
+		if leftOrdered[idx].Name != rightOrdered[idx].Name {
+			return false
+		}
+		if !syncEntryEquivalent(&leftOrdered[idx], &rightOrdered[idx]) {
+			return false
+		}
+	}
+
+	return true
+}
+
+func syncEntryIsDir(entry *FSEntry) bool {
+	if entry == nil {
+		return false
+	}
+	return (entry.Mode & 0040000) != 0
+}
+
+func preferredSyncMergeEntry(current, target, base *FSEntry, mergedID string) FSEntry {
+	chosen := current
+	if chosen == nil {
+		chosen = target
+	}
+	if chosen == nil {
+		chosen = base
+	}
+	entry := *chosen
+	if target != nil && (current == nil || target.Mtime > current.Mtime) {
+		entry = *target
+	}
+	if mergedID != "" {
+		entry.ID = mergedID
+	}
+	return entry
+}
+
+func (h *SyncHandler) mergeSyncDirectoryEntry(repoID string, base, current, target *FSEntry) (FSEntry, bool, error) {
+	switch {
+	case base == nil && current == nil && target == nil:
+		return FSEntry{}, false, nil
+	case base == nil && current != nil && target == nil:
+		return *current, true, nil
+	case base == nil && current == nil && target != nil:
+		return *target, true, nil
+	case base == nil && current != nil && target != nil:
+		if syncEntryEquivalent(current, target) {
+			return preferredSyncMergeEntry(current, target, nil, current.ID), true, nil
+		}
+		if syncEntryIsDir(current) && syncEntryIsDir(target) {
+			mergedChildFSID, err := h.mergeSyncDirectoryTrees(repoID, "", current.ID, target.ID)
+			if err != nil {
+				return FSEntry{}, false, err
+			}
+			return preferredSyncMergeEntry(current, target, nil, mergedChildFSID), true, nil
+		}
+		return FSEntry{}, false, errSyncHeadAutoMergeConflict
+	case base != nil && current == nil && target == nil:
+		return FSEntry{}, false, nil
+	case base != nil && current != nil && target == nil:
+		if syncEntryEquivalent(current, base) {
+			return FSEntry{}, false, nil
+		}
+		return FSEntry{}, false, errSyncHeadAutoMergeConflict
+	case base != nil && current == nil && target != nil:
+		if syncEntryEquivalent(target, base) {
+			return FSEntry{}, false, nil
+		}
+		return FSEntry{}, false, errSyncHeadAutoMergeConflict
+	default:
+		if syncEntryEquivalent(current, base) && syncEntryEquivalent(target, base) {
+			return *base, true, nil
+		}
+		if syncEntryEquivalent(current, base) {
+			return *target, true, nil
+		}
+		if syncEntryEquivalent(target, base) {
+			return *current, true, nil
+		}
+		if syncEntryEquivalent(current, target) {
+			return preferredSyncMergeEntry(current, target, base, current.ID), true, nil
+		}
+		if syncEntryIsDir(base) && syncEntryIsDir(current) && syncEntryIsDir(target) {
+			mergedChildFSID, err := h.mergeSyncDirectoryTrees(repoID, base.ID, current.ID, target.ID)
+			if err != nil {
+				return FSEntry{}, false, err
+			}
+			return preferredSyncMergeEntry(current, target, base, mergedChildFSID), true, nil
+		}
+		return FSEntry{}, false, errSyncHeadAutoMergeConflict
+	}
+}
+
+func (h *SyncHandler) mergeSyncDirectoryTrees(repoID, baseFSID, currentFSID, targetFSID string) (string, error) {
+	baseEntries, err := h.readSyncDirectoryEntries(repoID, baseFSID)
+	if err != nil {
+		return "", fmt.Errorf("failed to read base dir %s: %w", baseFSID, err)
+	}
+	currentEntries, err := h.readSyncDirectoryEntries(repoID, currentFSID)
+	if err != nil {
+		return "", fmt.Errorf("failed to read current dir %s: %w", currentFSID, err)
+	}
+	targetEntries, err := h.readSyncDirectoryEntries(repoID, targetFSID)
+	if err != nil {
+		return "", fmt.Errorf("failed to read target dir %s: %w", targetFSID, err)
+	}
+
+	baseByName := make(map[string]FSEntry, len(baseEntries))
+	for _, entry := range baseEntries {
+		baseByName[entry.Name] = entry
+	}
+	currentByName := make(map[string]FSEntry, len(currentEntries))
+	for _, entry := range currentEntries {
+		currentByName[entry.Name] = entry
+	}
+	targetByName := make(map[string]FSEntry, len(targetEntries))
+	for _, entry := range targetEntries {
+		targetByName[entry.Name] = entry
+	}
+
+	nameSet := make(map[string]struct{}, len(baseByName)+len(currentByName)+len(targetByName))
+	for name := range baseByName {
+		nameSet[name] = struct{}{}
+	}
+	for name := range currentByName {
+		nameSet[name] = struct{}{}
+	}
+	for name := range targetByName {
+		nameSet[name] = struct{}{}
+	}
+
+	names := make([]string, 0, len(nameSet))
+	for name := range nameSet {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	mergedEntries := make([]FSEntry, 0, len(names))
+	for _, name := range names {
+		var baseEntry, currentEntry, targetEntry *FSEntry
+		if entry, ok := baseByName[name]; ok {
+			entryCopy := entry
+			baseEntry = &entryCopy
+		}
+		if entry, ok := currentByName[name]; ok {
+			entryCopy := entry
+			currentEntry = &entryCopy
+		}
+		if entry, ok := targetByName[name]; ok {
+			entryCopy := entry
+			targetEntry = &entryCopy
+		}
+
+		mergedEntry, keep, err := h.mergeSyncDirectoryEntry(repoID, baseEntry, currentEntry, targetEntry)
+		if err != nil {
+			return "", err
+		}
+		if keep {
+			mergedEntries = append(mergedEntries, mergedEntry)
+		}
+	}
+
+	if syncEntrySlicesEquivalent(mergedEntries, currentEntries) {
+		return currentFSID, nil
+	}
+	if syncEntrySlicesEquivalent(mergedEntries, targetEntries) {
+		return targetFSID, nil
+	}
+
+	return h.createSyncDirectoryFSObject(repoID, mergedEntries)
+}
+
+func shortSyncCommitID(commitID string) string {
+	if len(commitID) <= 8 {
+		return commitID
+	}
+	return commitID[:8]
+}
+
+func (h *SyncHandler) tryAutoMergeSyncHeadPromotion(c *gin.Context, orgID, userID, repoID, currentHead, targetHead, baseHead, operation string) (bool, error) {
+	baseRootFSID, err := h.readCommitRootFSID(repoID, baseHead)
+	if err != nil {
+		return false, fmt.Errorf("read base root fs_id: %w", err)
+	}
+	currentRootFSID, err := h.readCommitRootFSID(repoID, currentHead)
+	if err != nil {
+		return false, fmt.Errorf("read current root fs_id: %w", err)
+	}
+	targetRootFSID, err := h.readCommitRootFSID(repoID, targetHead)
+	if err != nil {
+		return false, fmt.Errorf("read target root fs_id: %w", err)
+	}
+
+	mergedRootFSID, err := h.mergeSyncDirectoryTrees(repoID, baseRootFSID, currentRootFSID, targetRootFSID)
+	if err != nil {
+		return false, err
+	}
+
+	if mergedRootFSID == currentRootFSID {
+		log.Printf("%s: auto-merge found repo %s already converged (current=%s target=%s mergedRoot=%s)",
+			operation, repoID, shortSyncCommitID(currentHead), shortSyncCommitID(targetHead), shortSyncCommitID(mergedRootFSID))
+		c.Status(http.StatusOK)
+		return true, nil
+	}
+
+	mergedSize := int64(-1)
+	if traffic.GetChecker() != nil {
+		mergedSize = h.syncCommitPublishedSize(repoID, mergedRootFSID)
+	}
+	if !h.checkSyncCommitStorageQuotaWithNewSize(c, orgID, userID, repoID, currentHead, mergedSize) {
+		return true, nil
+	}
+
+	description := fmt.Sprintf("Auto merged concurrent sync update (%s + %s)", shortSyncCommitID(currentHead), shortSyncCommitID(targetHead))
+	mergedCommitID, err := h.createSyncAutoMergeCommit(repoID, userID, currentHead, mergedRootFSID, description)
+	if err != nil {
+		return false, err
+	}
+
+	if err := h.updateLibraryHeadWithStats(orgID, repoID, mergedCommitID, userID, currentHead); err != nil {
+		return false, err
+	}
+
+	go h.updateFullPaths(repoID, mergedRootFSID)
+	log.Printf("%s: auto-merged repo %s current=%s target=%s into merged=%s",
+		operation, repoID, shortSyncCommitID(currentHead), shortSyncCommitID(targetHead), shortSyncCommitID(mergedCommitID))
+	c.Status(http.StatusOK)
+	return true, nil
+}
+
 func (h *SyncHandler) handleSyncHeadPromotion(c *gin.Context, orgID, userID, repoID, targetHead, operation string) {
 	maxAttempts := v2.RetryAttempts()
 
@@ -2049,13 +2418,46 @@ func (h *SyncHandler) handleSyncHeadPromotion(c *gin.Context, orgID, userID, rep
 			return
 		}
 
-		if commitParent != currentHead {
+		if currentHead != "" && commitParent != currentHead {
 			log.Printf("%s: parent mismatch for repo %s on attempt %d/%d - commit %s expects parent %s but current HEAD is %s",
 				operation, repoID, attempt+1, maxAttempts, targetHead, commitParent, currentHead)
+
+			canAutoMerge := false
+			if commitParent != "" {
+				canAutoMerge, err = h.syncCommitHasAncestor(repoID, currentHead, commitParent)
+				if err != nil {
+					log.Printf("%s: failed to evaluate ancestry for repo %s current=%s parent=%s: %v",
+						operation, repoID, currentHead, commitParent, err)
+					c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to inspect sync commit ancestry"})
+					return
+				}
+			}
+
+			if canAutoMerge {
+				resolved, mergeErr := h.tryAutoMergeSyncHeadPromotion(c, orgID, userID, repoID, currentHead, targetHead, commitParent, operation)
+				switch {
+				case mergeErr == nil && resolved:
+					return
+				case errors.Is(mergeErr, ErrHeadConflict):
+					log.Printf("%s: auto-merge CAS conflict for repo %s on attempt %d/%d", operation, repoID, attempt+1, maxAttempts)
+				case errors.Is(mergeErr, errSyncHeadAutoMergeConflict):
+					log.Printf("%s: auto-merge could not safely resolve repo %s on attempt %d/%d; retrying direct promotion fallback",
+						operation, repoID, attempt+1, maxAttempts)
+				case mergeErr != nil:
+					log.Printf("%s: auto-merge failed for repo %s: %v", operation, repoID, mergeErr)
+					c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to auto-merge sync head"})
+					return
+				}
+			} else {
+				log.Printf("%s: current HEAD %s is not a descendant of target parent %s for repo %s on attempt %d/%d; waiting for direct promotion fallback",
+					operation, currentHead, commitParent, repoID, attempt+1, maxAttempts)
+			}
+
 			if attempt == maxAttempts-1 {
-				log.Printf("%s: parent mismatch retry budget exhausted for repo %s targeting %s after %d attempts; returning 200 for client compatibility",
+				log.Printf("%s: parent mismatch retry budget exhausted for repo %s targeting %s after %d attempts; returning 503 so clients preserve local state and retry",
 					operation, repoID, targetHead, maxAttempts)
-				c.Status(http.StatusOK)
+				c.Header("Retry-After", "1")
+				c.JSON(http.StatusServiceUnavailable, gin.H{"error": "sync head publish conflicted; retry"})
 				return
 			}
 			time.Sleep(v2.RetryBackoff(attempt + 1))
@@ -2078,9 +2480,10 @@ func (h *SyncHandler) handleSyncHeadPromotion(c *gin.Context, orgID, userID, rep
 
 			log.Printf("%s: CAS conflict for repo %s on attempt %d/%d", operation, repoID, attempt+1, maxAttempts)
 			if attempt == maxAttempts-1 {
-				log.Printf("%s: CAS conflict budget exhausted for repo %s targeting %s after %d attempts; returning 200 for client compatibility",
+				log.Printf("%s: CAS conflict budget exhausted for repo %s targeting %s after %d attempts; returning 503 so clients preserve local state and retry",
 					operation, repoID, targetHead, maxAttempts)
-				c.Status(http.StatusOK)
+				c.Header("Retry-After", "1")
+				c.JSON(http.StatusServiceUnavailable, gin.H{"error": "sync head publish conflicted; retry"})
 				return
 			}
 			time.Sleep(v2.RetryBackoff(attempt + 1))
