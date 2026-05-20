@@ -531,6 +531,33 @@ services:
     profiles:
       - test
 
+  sync-test:
+    build:
+      context: ./docker/seafile-cli
+      dockerfile: Dockerfile
+    command:
+      - /bin/bash
+      - -lc
+      - /workspace/scripts/wait-for-http.sh http://sesamefs:8080/health sesamefs && /workspace/scripts/test-sync.sh $${SYNC_TEST_ARGS:-}
+    environment:
+      - SESAMEFS_URL=http://sesamefs:8080
+      - SESAMEFS_URL_LOCAL=http://sesamefs:8080
+      - DEV_API_TOKEN=dev-token-admin
+      - DEV_PASSWORD=dev-token-123
+      - DEV_USER=00000000-0000-0000-0000-000000000001
+      - ENCRYPTED_PASSWORD=testpass123
+      - SYNC_TEST_IN_CONTAINER=1
+      - SYNC_DATA_DIR=/seafile-data
+      - SESAMEFS_TEST_IN_CONTAINER=1
+    volumes:
+      - .:/workspace
+      - seafile_sync_test_data:/seafile-data
+      - seafile_sync_test_config:/home/seafuser/.ccnet
+    depends_on:
+      - sesamefs
+    profiles:
+      - test
+
   # Desktop Frontend (React SPA — nginx:alpine)
   # Access at http://localhost:3000
   frontend:
@@ -560,9 +587,9 @@ services:
     restart: unless-stopped
     profiles:
       - debug
-    # Keep container running for interactive testing
-    # Usage: docker compose --profile debug up seafile-cli
-    # Then:  docker exec -it cool-storage-api-seafile-cli-1 seaf-test.sh help
+    # Preferred one-liner: ./scripts/test.sh sync
+    # Manual mode: docker compose --profile debug up -d --build seafile-cli
+    # Then: docker exec -it sesamefs-seafile-cli-1 seaf-test.sh help
 
   # Seafile CLI DEBUG container for protocol reverse engineering
   # Points to REAL Seafile server for protocol capture
@@ -584,7 +611,7 @@ services:
     profiles:
       - debug
     # Usage: docker compose --profile debug up seafile-cli-debug
-    # Then:  docker exec -it cool-storage-api-seafile-cli-debug-1 seaf-debug.sh capture-all
+    # Then:  docker exec -it sesamefs-seafile-cli-debug-1 seaf-debug.sh capture-all
 
 volumes:
   cassandra_data:
@@ -593,6 +620,8 @@ volumes:
   onlyoffice_logs:
   seafile_cli_data:
   seafile_cli_config:
+  seafile_sync_test_data:
+  seafile_sync_test_config:
   seafile_debug_data:
   seafile_debug_config:
   seafile_debug_captures:

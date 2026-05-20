@@ -11,7 +11,7 @@
 # Categories:
 #   api           Run API integration tests (permissions, file-ops, batch, etc.)
 #   oidc          Run OIDC authentication tests (config, login, logout, sessions)
-#   sync          Run Seafile sync protocol tests (requires seafile-cli)
+#   sync          Run Seafile sync protocol tests (auto-starts seafile-cli when possible)
 #   multiregion   Run multi-region tests (requires multi-region setup)
 #   failover      Run failover tests (requires multi-region setup)
 #   go            Run Go unit tests
@@ -37,7 +37,7 @@
 #
 # Requirements by category:
 #   api         - Backend running (docker compose up -d)
-#   sync        - Backend + seafile-cli container
+#   sync        - Backend on localhost:8080 + seafile-cli container
 #   multiregion - Multi-region stack (./scripts/bootstrap.sh multiregion)
 #   failover    - Multi-region stack + host docker access
 #   go          - Docker compose test profile
@@ -183,11 +183,83 @@ check_backend() {
     return 1
 }
 
-check_seafile_cli() {
-    local container="${CLI_CONTAINER:-cool-storage-api-seafile-cli-1}"
-    if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "$container"; then
+check_sync_backend() {
+    local url="${SESAMEFS_URL_LOCAL:-http://localhost:8080}"
+    if curl -s -f "$url/health" > /dev/null 2>&1; then
         return 0
     fi
+    return 1
+}
+
+resolve_seafile_cli_container() {
+    local container_name="${CLI_CONTAINER:-}"
+    local container_id=""
+
+    if [ -n "$container_name" ] && docker ps --format '{{.Names}}' 2>/dev/null | grep -Fxq "$container_name"; then
+        echo "$container_name"
+        return 0
+    fi
+
+    if check_docker_compose; then
+        container_id=$(docker compose ps -q seafile-cli 2>/dev/null | head -n1)
+        if [ -n "$container_id" ]; then
+            container_name=$(docker inspect --format '{{.Name}}' "$container_id" 2>/dev/null | sed 's#^/##')
+            if [ -n "$container_name" ]; then
+                echo "$container_name"
+                return 0
+            fi
+        fi
+    fi
+
+    container_name=$(docker ps --filter 'label=com.docker.compose.service=seafile-cli' --format '{{.Names}}' 2>/dev/null | head -n1)
+    if [ -n "$container_name" ]; then
+        echo "$container_name"
+        return 0
+    fi
+
+    container_name=$(docker ps --format '{{.Names}}' 2>/dev/null | grep -E '(^|-)seafile-cli-[0-9]+$' | head -n1 || true)
+    if [ -n "$container_name" ]; then
+        echo "$container_name"
+        return 0
+    fi
+
+    return 1
+}
+
+check_seafile_cli() {
+    local container_name=""
+    container_name=$(resolve_seafile_cli_container || true)
+    [ -n "$container_name" ]
+}
+
+ensure_seafile_cli() {
+    # --no-deps: backend readiness is already validated by check_sync_backend
+    # before this is called, so we skip recursive `depends_on` startup to keep
+    # the host fallback path fast. If seafile-cli ever gains real dependencies,
+    # drop --no-deps here.
+    local compose_args="--profile debug up -d --no-deps"
+
+    if check_seafile_cli; then
+        return 0
+    fi
+
+    if ! check_docker_compose; then
+        return 1
+    fi
+
+    if [ "$COMPOSE_BUILD" = true ]; then
+        compose_args="$compose_args --build"
+    fi
+
+    log_info "Auto-starting Seafile CLI container"
+    if ! docker compose $compose_args seafile-cli; then
+        return 1
+    fi
+
+    if check_seafile_cli; then
+        return 0
+    fi
+
     return 1
 }
 
@@ -408,27 +480,76 @@ run_admin_tests() {
 run_sync_tests() {
     log_section "Sync Protocol Tests"
 
-    if ! check_backend; then
-        log_error "Backend not available"
+    if [ "${SESAMEFS_TEST_IN_CONTAINER:-0}" != "1" ] && check_docker_compose; then
+        local compose_args="--profile test run --rm"
+
+        TOTAL_SUITES=$((TOTAL_SUITES + 1))
+
+        if [ "$LIST_ONLY" = true ]; then
+            echo "  - Sync Protocol Tests (sync-test)"
+            return 0
+        fi
+
+        log_section "Running: Sync Protocol Tests"
+
+        if [ "$COMPOSE_BUILD" = true ]; then
+            compose_args="$compose_args --build"
+        fi
+
+        if [ "$VERBOSE" = true ]; then
+            log_info "docker compose $compose_args -e SYNC_TEST_ARGS=--verbose sync-test"
+            if docker compose $compose_args -e SYNC_TEST_ARGS=--verbose sync-test; then
+                PASSED_SUITES=$((PASSED_SUITES + 1))
+                log_success "Sync Protocol Tests completed"
+                return 0
+            fi
+        else
+            log_info "docker compose $compose_args sync-test"
+            if docker compose $compose_args sync-test; then
+                PASSED_SUITES=$((PASSED_SUITES + 1))
+                log_success "Sync Protocol Tests completed"
+                return 0
+            fi
+        fi
+
+        FAILED_SUITES=$((FAILED_SUITES + 1))
+        log_error "Sync Protocol Tests failed"
         return 1
     fi
 
-    if ! check_seafile_cli; then
+    local sync_backend_url="${SESAMEFS_URL_LOCAL:-http://localhost:8080}"
+    local cli_container=""
+
+    if ! check_sync_backend; then
+        log_error "Backend not available at ${sync_backend_url}"
+        echo ""
+        echo "Start the backend with:"
+        echo "  docker compose up -d sesamefs"
+        return 1
+    fi
+
+    if ! ensure_seafile_cli; then
         log_warning "Seafile CLI container not running"
         echo ""
         echo "Start seafile-cli with:"
-        echo "  docker compose up -d seafile-cli"
+        echo "  docker compose --profile debug up -d --build seafile-cli"
         echo ""
         echo "Or skip sync tests with: ./scripts/test.sh api"
         return 1
     fi
 
-    log_success "Seafile CLI container is available"
+    cli_container=$(resolve_seafile_cli_container || true)
+    if [ -z "$cli_container" ]; then
+        log_error "Unable to resolve the Seafile CLI container name after startup"
+        return 1
+    fi
+
+    log_success "Seafile CLI container is available: ${cli_container}"
 
     local args=""
     [ "$VERBOSE" = true ] && args="--verbose"
 
-    run_suite "Sync Protocol" "test-sync.sh" $args || true
+    CLI_CONTAINER="$cli_container" SESAMEFS_URL_LOCAL="$sync_backend_url" run_suite "Sync Protocol" "test-sync.sh" $args || true
 }
 
 # ==========================================================================

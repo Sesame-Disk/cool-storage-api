@@ -57,7 +57,7 @@ cmd_stop() {
 
 # Get auth token from server
 cmd_get_token() {
-    log_info "Getting auth token from $SEAF_SERVER..."
+    log_info "Getting auth token from $SEAF_SERVER..." >&2
 
     response=$(curl -s -X POST "$SEAF_SERVER/api2/auth-token/" \
         -d "username=$SEAF_USER" \
@@ -66,11 +66,11 @@ cmd_get_token() {
     token=$(echo "$response" | jq -r '.token // empty')
 
     if [ -z "$token" ]; then
-        log_error "Failed to get token: $response"
+        log_error "Failed to get token: $response" >&2
         return 1
     fi
 
-    log_info "Got token: ${token:0:20}..."
+    log_info "Got token: ${token:0:20}..." >&2
     echo "$token"
 }
 
@@ -110,18 +110,17 @@ cmd_sync() {
     local_dir="${local_dir:-$DATA_DIR/$library_id}"
     mkdir -p "$local_dir"
 
-    # Get token if not set
-    token="${SEAF_TOKEN:-$(cmd_get_token)}"
-
     log_info "Syncing library $library_id to $local_dir..."
     log_info "Server: $SEAF_SERVER"
 
-    # Use token authentication (-T flag)
+    # Use non-interactive username/password auth. Token-only invocation can still
+    # prompt for username with current seaf-cli builds.
     seaf-cli sync -c "$CONFIG_DIR" \
         -l "$library_id" \
         -s "$SEAF_SERVER" \
         -d "$local_dir" \
-        -T "$token"
+        -u "$SEAF_USER" \
+        -p "$SEAF_PASS"
 
     log_info "Sync initiated. Use 'seaf-test.sh status' to check progress."
 }
@@ -138,18 +137,17 @@ cmd_download() {
 
     local_dir="${local_dir:-$DATA_DIR/$library_id}"
 
-    # Get token if not set
-    token="${SEAF_TOKEN:-$(cmd_get_token)}"
-
     log_info "Downloading library $library_id to $local_dir..."
     log_info "Server: $SEAF_SERVER"
 
-    # Use token authentication (-T flag)
+    # Use non-interactive username/password auth. Token-only invocation can still
+    # prompt for username with current seaf-cli builds.
     seaf-cli download -c "$CONFIG_DIR" \
         -l "$library_id" \
         -s "$SEAF_SERVER" \
         -d "$local_dir" \
-        -T "$token"
+        -u "$SEAF_USER" \
+        -p "$SEAF_PASS"
 
     log_info "Download initiated. Use 'seaf-test.sh status' to check progress."
 }

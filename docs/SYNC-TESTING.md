@@ -9,6 +9,15 @@ This guide explains how to test the Seafile desktop sync protocol using the cont
 Run the full sync protocol test suite with a single command:
 
 ```bash
+# Preferred docker-native one-liner
+docker compose --profile test run --rm --build sync-test
+
+# Verbose docker-native run
+docker compose --profile test run --rm --build -e SYNC_TEST_ARGS=--verbose sync-test
+
+# Unified wrapper: prefers sync-test, falls back to the debug container path
+./scripts/test.sh sync
+
 # Run all tests (creates libraries, syncs, verifies, cleans up)
 ./scripts/test-sync.sh
 
@@ -23,8 +32,8 @@ Run the full sync protocol test suite with a single command:
 ```
 
 The test suite covers:
-- **Unencrypted sync**: Remote→Local file sync
-- **Encrypted sync**: Remote→Local with password-protected libraries
+- **Unencrypted sync**: Remote→Local and Local→Remote file sync
+- **Encrypted sync**: Remote→Local plus Local→Remote remote-presence verification for password-protected libraries
 - **Multiple files**: Batch file sync verification
 - **Large files**: 64KB+ files (multi-block)
 - **Binary files**: Non-text content integrity
@@ -35,17 +44,27 @@ These checks are functional single-client sync scenarios. They do not currently
 prove active-active conflict recovery for `PUT /seafhttp/repo/:repo_id/commit/HEAD`
 or `POST /seafhttp/repo/:repo_id/update-branch` under multi-node contention.
 
+`docker compose --profile test run --rm --build sync-test` is the preferred
+Docker-native entry point. It runs the real `scripts/test-sync.sh` suite inside
+the `docker/seafile-cli` image with fresh dedicated client config/data volumes
+on each run. `./scripts/test.sh sync` is the convenience wrapper for that same
+flow; it prefers `sync-test` automatically and only falls back to the long-
+lived debug `seafile-cli` container when needed.
+
 ### Manual Testing
 
 ```bash
-# Start all services including seafile-cli
-docker-compose up -d
+# Start the backend
+docker compose up -d sesamefs
+
+# Start seafile-cli only when you want manual control
+docker compose --profile debug up -d --build seafile-cli
 
 # Enter the seafile-cli container
-docker exec -it cool-storage-api-seafile-cli-1 bash
+docker exec -it sesamefs-seafile-cli-1 bash
 
 # Or run commands directly
-docker exec -it cool-storage-api-seafile-cli-1 seaf-test.sh help
+docker exec -it sesamefs-seafile-cli-1 seaf-test.sh help
 ```
 
 ## Available Commands
@@ -77,14 +96,14 @@ docker-compose up -d
 ### 2. Initialize and Start Seafile Client
 
 ```bash
-docker exec -it cool-storage-api-seafile-cli-1 seaf-test.sh init
-docker exec -it cool-storage-api-seafile-cli-1 seaf-test.sh start
+docker exec -it sesamefs-seafile-cli-1 seaf-test.sh init
+docker exec -it sesamefs-seafile-cli-1 seaf-test.sh start
 ```
 
 ### 3. List Remote Libraries
 
 ```bash
-docker exec -it cool-storage-api-seafile-cli-1 seaf-test.sh list-remote
+docker exec -it sesamefs-seafile-cli-1 seaf-test.sh list-remote
 ```
 
 Example output:
@@ -102,19 +121,19 @@ Example output:
 
 ```bash
 # Using library ID from the list
-docker exec -it cool-storage-api-seafile-cli-1 seaf-test.sh sync abc12345-1234-5678-abcd-1234567890ab
+docker exec -it sesamefs-seafile-cli-1 seaf-test.sh sync abc12345-1234-5678-abcd-1234567890ab
 ```
 
 ### 5. Check Sync Status
 
 ```bash
-docker exec -it cool-storage-api-seafile-cli-1 seaf-test.sh status
+docker exec -it sesamefs-seafile-cli-1 seaf-test.sh status
 ```
 
 ### 6. View Logs
 
 ```bash
-docker exec -it cool-storage-api-seafile-cli-1 seaf-test.sh logs
+docker exec -it sesamefs-seafile-cli-1 seaf-test.sh logs
 ```
 
 ## Testing Encrypted Libraries
@@ -123,11 +142,12 @@ To sync an encrypted library, you need to provide the library password. The seaf
 
 ```bash
 # Direct seaf-cli command for encrypted library
-docker exec -it cool-storage-api-seafile-cli-1 seaf-cli sync \
+docker exec -it sesamefs-seafile-cli-1 seaf-cli sync \
   -l <library-id> \
   -s http://sesamefs:8080 \
   -d /seafile-data/<library-id> \
-  -T <token> \
+  -u 00000000-0000-0000-0000-000000000001 \
+  -p dev-token-123 \
   -e <library-password>
 ```
 
@@ -136,7 +156,7 @@ docker exec -it cool-storage-api-seafile-cli-1 seaf-cli sync \
 ### Check Client Logs
 
 ```bash
-docker exec -it cool-storage-api-seafile-cli-1 cat /home/seafuser/.ccnet/logs/seafile.log
+docker exec -it sesamefs-seafile-cli-1 cat /home/seafuser/.ccnet/logs/seafile.log
 ```
 
 ### Check Server Logs
@@ -157,7 +177,7 @@ docker-compose logs sesamefs
 
 ```bash
 # Get token
-TOKEN=$(docker exec -it cool-storage-api-seafile-cli-1 seaf-test.sh get-token)
+TOKEN=$(docker exec -it sesamefs-seafile-cli-1 seaf-test.sh get-token)
 
 # Test HEAD commit
 curl -H "Authorization: Token $TOKEN" http://localhost:8080/seafhttp/repo/<repo_id>/commit/HEAD
@@ -247,7 +267,7 @@ docker-compose logs seafile-cli
 
 ```bash
 # Test network connectivity
-docker exec -it cool-storage-api-seafile-cli-1 curl http://sesamefs:8080/ping
+docker exec -it sesamefs-seafile-cli-1 curl http://sesamefs:8080/ping
 
 # Should return: {"message":"pong"}
 ```
@@ -256,7 +276,7 @@ docker exec -it cool-storage-api-seafile-cli-1 curl http://sesamefs:8080/ping
 
 ```bash
 # Test auth endpoint directly
-docker exec -it cool-storage-api-seafile-cli-1 curl -X POST \
+docker exec -it sesamefs-seafile-cli-1 curl -X POST \
   http://sesamefs:8080/api2/auth-token/ \
   -d "username=00000000-0000-0000-0000-000000000001" \
   -d "password=dev-token-123"
