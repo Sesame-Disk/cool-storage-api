@@ -353,6 +353,63 @@ func TestWebUploadReplaceUsesStorageDelta(t *testing.T) {
 	waitForUserQuotaUsage(t, afterInitialUsage+20)
 }
 
+func TestMultiInstancePerUserStorageQuotaBlocksConcurrentUploads(t *testing.T) {
+	originalOrg := getAdminOrganizationInfo(t, defaultOrgID)
+	originalUser := getAdminUserByEmail(t, defaultUserEmail)
+	restoreDefaultOrgAndUserQuotasOnCleanup(t, originalOrg, originalUser)
+
+	clients := multiInstanceRequireUserClients(t, 2)
+
+	updateAdminOrganizationQuotas(t, defaultOrgID, map[string]interface{}{
+		"storage_quota": int64(1 << 50),
+		"quota_policy":  "hard",
+	})
+
+	baselineUsage := jsonInt64(getAdminUserByEmail(t, defaultUserEmail), "quota_usage")
+	setDefaultUserQuota(t, baselineUsage+150)
+
+	repoID := createTestLibrary(t, userClient, fmt.Sprintf("inttest-multi-instance-user-quota-%d", time.Now().UnixNano()))
+	uploadURLs := multiInstanceUploadLinks(t, clients, repoID, "/")
+	names := multiInstanceFileNames("quota-race", len(clients))
+	const contentSize = 100
+
+	results := multiInstanceRunConcurrentMutations(t, clients, names, func(client *testClient, name string, idx int) concurrentMutationResult {
+		content := fmt.Sprintf("%02d%s", idx, strings.Repeat(string(rune('a'+idx)), contentSize-2))
+		return uploadViaLinkConcurrent(client, uploadURLs[idx], name, "/", content)
+	})
+
+	successCount := 0
+	forbiddenCount := 0
+	for _, result := range results {
+		if result.err != nil {
+			t.Fatalf("%s failed: %v", result.name, result.err)
+		}
+		switch result.status {
+		case http.StatusOK, http.StatusCreated:
+			successCount++
+		case http.StatusForbidden:
+			if !strings.Contains(result.body, "storage quota exceeded") {
+				t.Fatalf("%s forbidden body = %q, want storage quota exceeded", result.name, result.body)
+			}
+			forbiddenCount++
+		default:
+			t.Fatalf("%s status = %d, want success or 403; body=%s", result.name, result.status, result.body)
+		}
+	}
+
+	if successCount != 1 {
+		t.Fatalf("concurrent multi-node uploads succeeded %d times, want exactly 1; results=%+v", successCount, results)
+	}
+	if forbiddenCount != len(clients)-1 {
+		t.Fatalf("concurrent multi-node uploads were forbidden %d times, want %d; results=%+v", forbiddenCount, len(clients)-1, results)
+	}
+
+	finalUsage := waitForUserQuotaUsage(t, baselineUsage+contentSize)
+	if finalUsage != baselineUsage+contentSize {
+		t.Fatalf("final quota_usage = %d, want %d", finalUsage, baselineUsage+contentSize)
+	}
+}
+
 func TestV2DirectUploadEnforcesPerUserStorageQuota(t *testing.T) {
 	originalOrg := getAdminOrganizationInfo(t, defaultOrgID)
 	originalUser := getAdminUserByEmail(t, defaultUserEmail)

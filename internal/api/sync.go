@@ -646,71 +646,7 @@ func (h *SyncHandler) PutCommit(c *gin.Context) {
 			return
 		}
 
-		// Read current HEAD for conflict detection
-		var currentHead string
-		err := h.db.Session().Query(`
-			SELECT head_commit_id FROM libraries WHERE org_id = ? AND library_id = ?
-		`, orgID, repoID).Scan(&currentHead)
-		if err != nil {
-			log.Printf("PutCommit HEAD: failed to read current head for repo %s: %v", repoID, err)
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read current head"})
-			return
-		}
-
-		// Read the commit's parent_id/root_fs_id to validate parent chain and
-		// evaluate storage quota against the published tree delta.
-		var parentID *string
-		var rootFSID string
-		err = h.db.Session().Query(`
-			SELECT parent_id, root_fs_id FROM commits WHERE library_id = ? AND commit_id = ?
-		`, repoID, headCommitID).Scan(&parentID, &rootFSID)
-		if err != nil {
-			log.Printf("PutCommit HEAD: commit %s not found for repo %s: %v", headCommitID, repoID, err)
-			c.JSON(http.StatusNotFound, gin.H{"error": "commit not found"})
-			return
-		}
-
-		// Validate parent chain: the commit being promoted must have its parent_id
-		// equal to the current HEAD. This prevents a stale/retried desktop client
-		// commit from overwriting a HEAD that was advanced by web uploads.
-		commitParent := ""
-		if parentID != nil {
-			commitParent = *parentID
-		}
-		if currentHead != "" && commitParent != currentHead {
-			log.Printf("PutCommit HEAD: CONFLICT repo %s - commit %s has parent %s but current HEAD is %s. Rejecting HEAD update.",
-				repoID, headCommitID, commitParent, currentHead)
-			// Return 200 OK for Seafile desktop client compatibility.
-			// The client will detect HEAD did not advance on next sync check.
-			c.Status(http.StatusOK)
-			return
-		}
-
-		log.Printf("PutCommit HEAD: updating repo %s head to %s (parent=%s, currentHead=%s)",
-			repoID, headCommitID, commitParent, currentHead)
-
-		if !h.checkSyncCommitStorageQuota(c, orgID, userID, repoID, currentHead, rootFSID) {
-			return
-		}
-
-		// CAS update: pass current HEAD as expected value to prevent concurrent overwrites
-		if err := h.updateLibraryHeadWithStats(orgID, repoID, headCommitID, userID, currentHead); err != nil {
-			if errors.Is(err, ErrHeadConflict) {
-				log.Printf("PutCommit HEAD: CAS conflict for repo %s, HEAD changed between read and write", repoID)
-				c.Status(http.StatusOK) // Client compat
-				return
-			}
-			log.Printf("PutCommit HEAD: failed to update head: %v", err)
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update head"})
-			return
-		}
-
-		// Update full_path for search indexing (async)
-		if rootFSID != "" {
-			go h.updateFullPaths(repoID, rootFSID)
-		}
-
-		c.Status(http.StatusOK)
+		h.handleSyncHeadPromotion(c, orgID, userID, repoID, headCommitID, "PutCommit HEAD")
 		return
 	}
 
@@ -1843,62 +1779,7 @@ func (h *SyncHandler) UpdateBranch(c *gin.Context) {
 		return
 	}
 
-	// Verify the commit exists and get root_fs_id + parent_id
-	var commitID, rootFSID string
-	var parentID *string
-	err := h.db.Session().Query(`
-		SELECT commit_id, root_fs_id, parent_id FROM commits WHERE library_id = ? AND commit_id = ?
-	`, repoID, newHead).Scan(&commitID, &rootFSID, &parentID)
-
-	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "commit not found"})
-		return
-	}
-
-	// Read current HEAD for conflict detection
-	var currentHead string
-	h.db.Session().Query(`
-		SELECT head_commit_id FROM libraries WHERE org_id = ? AND library_id = ?
-	`, orgID, repoID).Scan(&currentHead)
-
-	// Validate parent chain
-	commitParent := ""
-	if parentID != nil {
-		commitParent = *parentID
-	}
-	if currentHead != "" && commitParent != currentHead {
-		log.Printf("UpdateBranch: CONFLICT repo %s - commit %s has parent %s but current HEAD is %s. Rejecting.",
-			repoID, newHead, commitParent, currentHead)
-		// Return 200 OK for Seafile desktop client compatibility
-		c.Status(http.StatusOK)
-		return
-	}
-
-	log.Printf("UpdateBranch: updating repo %s head to %s (parent=%s, currentHead=%s)",
-		repoID, newHead, commitParent, currentHead)
-
-	if !h.checkSyncCommitStorageQuota(c, orgID, userID, repoID, currentHead, rootFSID) {
-		return
-	}
-
-	// CAS update with expected HEAD
-	if err := h.updateLibraryHeadWithStats(orgID, repoID, newHead, userID, currentHead); err != nil {
-		if errors.Is(err, ErrHeadConflict) {
-			log.Printf("UpdateBranch: CAS conflict for repo %s, HEAD changed concurrently", repoID)
-			c.Status(http.StatusOK) // Client compat
-			return
-		}
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update branch"})
-		return
-	}
-
-	// Update full_path for search indexing (async)
-	if rootFSID != "" {
-		go h.updateFullPaths(repoID, rootFSID)
-	}
-
-	// Return empty body with 200 OK (Seafile format)
-	c.Status(http.StatusOK)
+	h.handleSyncHeadPromotion(c, orgID, userID, repoID, newHead, "UpdateBranch")
 }
 
 // GetDownloadInfo returns repository sync information for desktop client
@@ -2114,15 +1995,116 @@ func (h *SyncHandler) updateLibraryHeadWithStats(orgID, repoID, commitID, userID
 	return nil
 }
 
+func (h *SyncHandler) readLibraryHead(orgID, repoID string) (string, error) {
+	var currentHead string
+	if err := h.db.Session().Query(`
+		SELECT head_commit_id FROM libraries WHERE org_id = ? AND library_id = ?
+	`, orgID, repoID).Scan(&currentHead); err != nil {
+		return "", err
+	}
+	return currentHead, nil
+}
+
+func (h *SyncHandler) readSyncTargetCommit(repoID, commitID string) (string, string, error) {
+	var parentID *string
+	var rootFSID string
+	if err := h.db.Session().Query(`
+		SELECT parent_id, root_fs_id FROM commits WHERE library_id = ? AND commit_id = ?
+	`, repoID, commitID).Scan(&parentID, &rootFSID); err != nil {
+		return "", "", err
+	}
+	commitParent := ""
+	if parentID != nil {
+		commitParent = *parentID
+	}
+	return commitParent, rootFSID, nil
+}
+
+func (h *SyncHandler) handleSyncHeadPromotion(c *gin.Context, orgID, userID, repoID, targetHead, operation string) {
+	const maxAttempts = 5
+
+	commitParent, rootFSID, err := h.readSyncTargetCommit(repoID, targetHead)
+	if err != nil {
+		log.Printf("%s: commit %s not found for repo %s: %v", operation, targetHead, repoID, err)
+		c.JSON(http.StatusNotFound, gin.H{"error": "commit not found"})
+		return
+	}
+
+	cachedNewSize := int64(-1)
+	if traffic.GetChecker() != nil {
+		cachedNewSize = h.syncCommitPublishedSize(repoID, rootFSID)
+	}
+
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		currentHead, err := h.readLibraryHead(orgID, repoID)
+		if err != nil {
+			log.Printf("%s: failed to read current head for repo %s: %v", operation, repoID, err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read current head"})
+			return
+		}
+
+		if currentHead == targetHead {
+			log.Printf("%s: repo %s head already at %s; treating as idempotent success", operation, repoID, targetHead)
+			c.Status(http.StatusOK)
+			return
+		}
+
+		if currentHead != "" && commitParent != currentHead {
+			log.Printf("%s: CONFLICT repo %s - commit %s has parent %s but current HEAD is %s. Rejecting.",
+				operation, repoID, targetHead, commitParent, currentHead)
+			c.Status(http.StatusOK)
+			return
+		}
+
+		log.Printf("%s: updating repo %s head to %s (parent=%s, currentHead=%s, attempt=%d/%d)",
+			operation, repoID, targetHead, commitParent, currentHead, attempt+1, maxAttempts)
+
+		if !h.checkSyncCommitStorageQuotaWithNewSize(c, orgID, userID, repoID, currentHead, cachedNewSize) {
+			return
+		}
+
+		if err := h.updateLibraryHeadWithStats(orgID, repoID, targetHead, userID, currentHead); err != nil {
+			if !errors.Is(err, ErrHeadConflict) {
+				log.Printf("%s: failed to update head for repo %s: %v", operation, repoID, err)
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update head"})
+				return
+			}
+
+			log.Printf("%s: CAS conflict for repo %s on attempt %d/%d", operation, repoID, attempt+1, maxAttempts)
+			if attempt == maxAttempts-1 {
+				log.Printf("%s: CAS conflict budget exhausted for repo %s targeting %s after %d attempts; returning 200 for client compatibility",
+					operation, repoID, targetHead, maxAttempts)
+				c.Status(http.StatusOK)
+				return
+			}
+			time.Sleep(v2.RetryBackoff(attempt))
+			continue
+		}
+
+		if rootFSID != "" {
+			go h.updateFullPaths(repoID, rootFSID)
+		}
+		c.Status(http.StatusOK)
+		return
+	}
+}
+
+func (h *SyncHandler) syncCommitPublishedSize(repoID, rootFSID string) int64 {
+	if rootFSID == "" || rootFSID == strings.Repeat("0", 40) {
+		return 0
+	}
+	newSize, _ := h.calculateDirStats(repoID, rootFSID)
+	return newSize
+}
+
 func (h *SyncHandler) checkSyncCommitStorageQuota(c *gin.Context, orgID, userID, repoID, currentHead, rootFSID string) bool {
+	return h.checkSyncCommitStorageQuotaWithNewSize(c, orgID, userID, repoID, currentHead, h.syncCommitPublishedSize(repoID, rootFSID))
+}
+
+func (h *SyncHandler) checkSyncCommitStorageQuotaWithNewSize(c *gin.Context, orgID, userID, repoID, currentHead string, newSize int64) bool {
 	checker := traffic.GetChecker()
 	if checker == nil {
 		return true
-	}
-
-	newSize := int64(0)
-	if rootFSID != "" && rootFSID != strings.Repeat("0", 40) {
-		newSize, _ = h.calculateDirStats(repoID, rootFSID)
 	}
 
 	currentSize, _ := h.commitTreeStats(repoID, currentHead)

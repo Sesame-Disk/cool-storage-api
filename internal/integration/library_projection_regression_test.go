@@ -452,6 +452,122 @@ func TestSyncHeadConflictReturnsOKWithoutRollback(t *testing.T) {
 	}
 }
 
+func TestUpdateBranchConflictReturnsOKWithoutRollback(t *testing.T) {
+	name := fmt.Sprintf("inttest-update-branch-conflict-%d", time.Now().UnixNano())
+	repoID := createTestLibrary(t, adminClient, name)
+	session := shareProjectionDBForTest(t).Session()
+
+	initial := readLibrarySyncHeadState(t, session, repoID)
+	acceptedHead := fmt.Sprintf("%040x", time.Now().UnixNano())
+	staleHead := fmt.Sprintf("%040x", time.Now().UnixNano()+1)
+	insertSyntheticCommitForTest(t, session, repoID, acceptedHead, initial.HeadCommitID, initial.RootFSID, "integration accepted update-branch head")
+	insertSyntheticCommitForTest(t, session, repoID, staleHead, initial.HeadCommitID, initial.RootFSID, "integration stale update-branch head")
+	t.Cleanup(func() {
+		for _, commitID := range []string{acceptedHead, staleHead} {
+			if err := session.Query(`DELETE FROM commits WHERE library_id = ? AND commit_id = ?`, repoID, commitID).Exec(); err != nil {
+				t.Errorf("cleanup synthetic commit %s failed: %v", commitID, err)
+			}
+		}
+	})
+
+	resp := adminClient.Do(t, http.MethodPost, fmt.Sprintf("/seafhttp/repo/%s/update-branch?head=%s", repoID, url.QueryEscape(acceptedHead)), nil)
+	if resp.StatusCode != http.StatusOK {
+		body := responseBody(t, resp)
+		t.Fatalf("initial update-branch failed: status=%d body=%s", resp.StatusCode, body)
+	}
+	resp.Body.Close()
+
+	var advanced librarySyncHeadState
+	waitForIntegrationCondition(t, "accepted update-branch head to become authoritative", func() bool {
+		current := readLibrarySyncHeadState(t, session, repoID)
+		if current.HeadCommitID != acceptedHead || current.LookupHeadCommitID != acceptedHead {
+			return false
+		}
+		if !current.UpdatedAt.After(initial.UpdatedAt) || !current.ProjectionUpdatedAt.Equal(current.UpdatedAt) {
+			return false
+		}
+		advanced = current
+		return true
+	})
+
+	conflictResp := adminClient.Do(t, http.MethodPost, fmt.Sprintf("/seafhttp/repo/%s/update-branch?head=%s", repoID, url.QueryEscape(staleHead)), nil)
+	if conflictResp.StatusCode != http.StatusOK {
+		body := responseBody(t, conflictResp)
+		t.Fatalf("conflicting update-branch returned status=%d body=%s", conflictResp.StatusCode, body)
+	}
+	conflictResp.Body.Close()
+
+	stabilized := readLibrarySyncHeadState(t, session, repoID)
+	if stabilized.HeadCommitID != acceptedHead {
+		t.Fatalf("canonical head rolled back to %q, want %q", stabilized.HeadCommitID, acceptedHead)
+	}
+	if stabilized.LookupHeadCommitID != acceptedHead {
+		t.Fatalf("lookup head rolled back to %q, want %q", stabilized.LookupHeadCommitID, acceptedHead)
+	}
+	if !stabilized.UpdatedAt.Equal(advanced.UpdatedAt) {
+		t.Fatalf("canonical updated_at changed on stale conflict: got %s want %s", stabilized.UpdatedAt.Format(time.RFC3339Nano), advanced.UpdatedAt.Format(time.RFC3339Nano))
+	}
+	if !stabilized.ProjectionUpdatedAt.Equal(advanced.ProjectionUpdatedAt) {
+		t.Fatalf("projection updated_at changed on stale conflict: got %s want %s", stabilized.ProjectionUpdatedAt.Format(time.RFC3339Nano), advanced.ProjectionUpdatedAt.Format(time.RFC3339Nano))
+	}
+}
+
+func TestUpdateBranchSameHeadReturnsOKWithoutProjectionChange(t *testing.T) {
+	name := fmt.Sprintf("inttest-update-branch-idempotent-%d", time.Now().UnixNano())
+	repoID := createTestLibrary(t, adminClient, name)
+	session := shareProjectionDBForTest(t).Session()
+
+	initial := readLibrarySyncHeadState(t, session, repoID)
+	nextHead := fmt.Sprintf("%040x", time.Now().UnixNano())
+	insertSyntheticCommitForTest(t, session, repoID, nextHead, initial.HeadCommitID, initial.RootFSID, "integration idempotent update-branch head")
+	t.Cleanup(func() {
+		if err := session.Query(`DELETE FROM commits WHERE library_id = ? AND commit_id = ?`, repoID, nextHead).Exec(); err != nil {
+			t.Errorf("cleanup synthetic commit %s failed: %v", nextHead, err)
+		}
+	})
+
+	resp := adminClient.Do(t, http.MethodPost, fmt.Sprintf("/seafhttp/repo/%s/update-branch?head=%s", repoID, url.QueryEscape(nextHead)), nil)
+	if resp.StatusCode != http.StatusOK {
+		body := responseBody(t, resp)
+		t.Fatalf("initial update-branch failed: status=%d body=%s", resp.StatusCode, body)
+	}
+	resp.Body.Close()
+
+	var advanced librarySyncHeadState
+	waitForIntegrationCondition(t, "accepted update-branch idempotent head to become authoritative", func() bool {
+		current := readLibrarySyncHeadState(t, session, repoID)
+		if current.HeadCommitID != nextHead || current.LookupHeadCommitID != nextHead {
+			return false
+		}
+		if !current.UpdatedAt.After(initial.UpdatedAt) || !current.ProjectionUpdatedAt.Equal(current.UpdatedAt) {
+			return false
+		}
+		advanced = current
+		return true
+	})
+
+	idempotentResp := adminClient.Do(t, http.MethodPost, fmt.Sprintf("/seafhttp/repo/%s/update-branch?head=%s", repoID, url.QueryEscape(nextHead)), nil)
+	if idempotentResp.StatusCode != http.StatusOK {
+		body := responseBody(t, idempotentResp)
+		t.Fatalf("idempotent update-branch returned status=%d body=%s", idempotentResp.StatusCode, body)
+	}
+	idempotentResp.Body.Close()
+
+	stabilized := readLibrarySyncHeadState(t, session, repoID)
+	if stabilized.HeadCommitID != nextHead {
+		t.Fatalf("canonical head changed to %q, want %q", stabilized.HeadCommitID, nextHead)
+	}
+	if stabilized.LookupHeadCommitID != nextHead {
+		t.Fatalf("lookup head changed to %q, want %q", stabilized.LookupHeadCommitID, nextHead)
+	}
+	if !stabilized.UpdatedAt.Equal(advanced.UpdatedAt) {
+		t.Fatalf("canonical updated_at changed on idempotent success: got %s want %s", stabilized.UpdatedAt.Format(time.RFC3339Nano), advanced.UpdatedAt.Format(time.RFC3339Nano))
+	}
+	if !stabilized.ProjectionUpdatedAt.Equal(advanced.ProjectionUpdatedAt) {
+		t.Fatalf("projection updated_at changed on idempotent success: got %s want %s", stabilized.ProjectionUpdatedAt.Format(time.RFC3339Nano), advanced.ProjectionUpdatedAt.Format(time.RFC3339Nano))
+	}
+}
+
 func TestSyncHeadStaleAsyncStatsDoNotOverwriteCurrentHead(t *testing.T) {
 	name := fmt.Sprintf("inttest-sync-stats-race-%d", time.Now().UnixNano())
 	repoID := createTestLibrary(t, adminClient, name)

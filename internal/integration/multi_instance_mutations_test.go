@@ -37,6 +37,26 @@ func multiInstanceRequireAdminClients(t *testing.T, minCount int) []*testClient 
 	return clients
 }
 
+func multiInstanceRequireUserClients(t *testing.T, minCount int) []*testClient {
+	t.Helper()
+
+	clients := []*testClient{userClient}
+	for _, envKey := range []string{"SESAMEFS_URL_2", "SESAMEFS_URL_3"} {
+		baseURL := strings.TrimSpace(os.Getenv(envKey))
+		if baseURL == "" {
+			continue
+		}
+		if err := verifyIntegrationAuth(baseURL, "dev-token-user"); err != nil {
+			t.Fatalf("%s auth probe failed: %v", envKey, err)
+		}
+		clients = append(clients, newTestClient(baseURL, "dev-token-user"))
+	}
+	if len(clients) < minCount {
+		t.Skipf("multi-instance suite requires at least %d reachable SesameFS nodes, got %d", minCount, len(clients))
+	}
+	return clients
+}
+
 func multiInstanceRunConcurrentMutations(t *testing.T, clients []*testClient, names []string, mutate func(*testClient, string, int) concurrentMutationResult) []concurrentMutationResult {
 	t.Helper()
 
