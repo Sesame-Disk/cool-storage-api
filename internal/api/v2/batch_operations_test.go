@@ -3,6 +3,7 @@ package v2
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -33,6 +34,185 @@ func setupBatchRouter() (*gin.Engine, *BatchOperationHandler) {
 	}
 
 	return r, h
+}
+
+func TestIsSameLocationMove(t *testing.T) {
+	tests := []struct {
+		name          string
+		opType        string
+		srcRepoID     string
+		dstRepoID     string
+		srcParentPath string
+		dstDir        string
+		want          bool
+	}{
+		{name: "same repo and dir move", opType: "move", srcRepoID: "repo", dstRepoID: "repo", srcParentPath: "/dir", dstDir: "/dir", want: true},
+		{name: "normalized paths", opType: "move", srcRepoID: "repo", dstRepoID: "repo", srcParentPath: "dir", dstDir: "/dir/", want: true},
+		{name: "copy is not same-location move", opType: "copy", srcRepoID: "repo", dstRepoID: "repo", srcParentPath: "/dir", dstDir: "/dir", want: false},
+		{name: "different dir", opType: "move", srcRepoID: "repo", dstRepoID: "repo", srcParentPath: "/src", dstDir: "/dst", want: false},
+		{name: "different repo", opType: "move", srcRepoID: "src", dstRepoID: "dst", srcParentPath: "/dir", dstDir: "/dir", want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isSameLocationMove(tt.opType, tt.srcRepoID, tt.dstRepoID, tt.srcParentPath, tt.dstDir); got != tt.want {
+				t.Fatalf("isSameLocationMove() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestShouldSkipSourceRemovalAfterMove(t *testing.T) {
+	tests := []struct {
+		name   string
+		result *PathTraverseResult
+		err    error
+		want   bool
+	}{
+		{name: "traverse error", err: errors.New("boom"), want: true},
+		{name: "nil result", want: true},
+		{name: "missing target entry", result: &PathTraverseResult{}, want: true},
+		{name: "existing target entry", result: &PathTraverseResult{TargetEntry: &FSEntry{Name: "file.txt"}}, want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := shouldSkipSourceRemovalAfterMove(tt.result, tt.err); got != tt.want {
+				t.Fatalf("shouldSkipSourceRemovalAfterMove() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestIsPathWithin(t *testing.T) {
+	tests := []struct {
+		name      string
+		candidate string
+		parent    string
+		want      bool
+	}{
+		{name: "same path", candidate: "/src", parent: "/src", want: true},
+		{name: "child path", candidate: "/src/child", parent: "/src", want: true},
+		{name: "sibling prefix is not child", candidate: "/src2/child", parent: "/src", want: false},
+		{name: "root contains child", candidate: "/src", parent: "/", want: true},
+		{name: "root does not contain itself", candidate: "/", parent: "/", want: false},
+		{name: "normalizes paths", candidate: "src/child/", parent: "/src", want: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isPathWithin(tt.candidate, tt.parent); got != tt.want {
+				t.Fatalf("isPathWithin(%q, %q) = %v, want %v", tt.candidate, tt.parent, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestReplacedDestinationTagCleanup(t *testing.T) {
+	tests := []struct {
+		name         string
+		dstDir       string
+		itemName     string
+		entry        *FSEntry
+		wantPath     string
+		wantByPrefix bool
+	}{
+		{name: "no replaced entry", dstDir: "/dst", itemName: "file.txt", wantPath: "", wantByPrefix: false},
+		{name: "root destination file", dstDir: "/", itemName: "file.txt", entry: &FSEntry{Name: "file.txt", Mode: ModeFile}, wantPath: "/file.txt", wantByPrefix: false},
+		{name: "nested destination file", dstDir: "/dst/", itemName: "file.txt", entry: &FSEntry{Name: "file.txt", Mode: ModeFile}, wantPath: "/dst/file.txt", wantByPrefix: false},
+		{name: "directory cleanup uses prefix", dstDir: "/dst", itemName: "dir", entry: &FSEntry{Name: "dir", Mode: ModeDir}, wantPath: "/dst/dir", wantByPrefix: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotPath, gotByPrefix := replacedDestinationTagCleanup(tt.dstDir, tt.itemName, tt.entry)
+			if gotPath != tt.wantPath {
+				t.Fatalf("replacedDestinationTagCleanup() path = %q, want %q", gotPath, tt.wantPath)
+			}
+			if gotByPrefix != tt.wantByPrefix {
+				t.Fatalf("replacedDestinationTagCleanup() byPrefix = %v, want %v", gotByPrefix, tt.wantByPrefix)
+			}
+		})
+	}
+}
+
+func TestMovedItemTagMutation(t *testing.T) {
+	tests := []struct {
+		name         string
+		srcPath      string
+		dstDir       string
+		itemName     string
+		entry        *FSEntry
+		wantOldPath  string
+		wantNewPath  string
+		wantByPrefix bool
+	}{
+		{name: "missing entry", srcPath: "/src/file.txt", dstDir: "/dst", itemName: "file.txt"},
+		{name: "file move", srcPath: "/src/file.txt", dstDir: "/dst", itemName: "file.txt", entry: &FSEntry{Name: "file.txt", Mode: ModeFile}, wantOldPath: "/src/file.txt", wantNewPath: "/dst/file.txt", wantByPrefix: false},
+		{name: "directory move", srcPath: "/src/dir", dstDir: "/dst", itemName: "dir", entry: &FSEntry{Name: "dir", Mode: ModeDir}, wantOldPath: "/src/dir", wantNewPath: "/dst/dir", wantByPrefix: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotOldPath, gotNewPath, gotByPrefix := movedItemTagMutation(tt.srcPath, tt.dstDir, tt.itemName, tt.entry)
+			if gotOldPath != tt.wantOldPath {
+				t.Fatalf("movedItemTagMutation() oldPath = %q, want %q", gotOldPath, tt.wantOldPath)
+			}
+			if gotNewPath != tt.wantNewPath {
+				t.Fatalf("movedItemTagMutation() newPath = %q, want %q", gotNewPath, tt.wantNewPath)
+			}
+			if gotByPrefix != tt.wantByPrefix {
+				t.Fatalf("movedItemTagMutation() byPrefix = %v, want %v", gotByPrefix, tt.wantByPrefix)
+			}
+		})
+	}
+}
+
+func TestBatchOperationErrorResponse_MapsKnownErrors(t *testing.T) {
+	tests := []struct {
+		name         string
+		err          error
+		wantStatus   int
+		wantError    string
+		wantReason   string
+		wantConflict []string
+	}{
+		{name: "head conflict", err: ErrLibraryHeadConflict, wantStatus: http.StatusConflict, wantError: "library was modified concurrently; retry the move", wantReason: "library was modified concurrently; retry the move"},
+		{name: "source missing", err: ErrBatchSourceNotFound, wantStatus: http.StatusNotFound, wantError: "source item not found", wantReason: "source item not found"},
+		{name: "destination missing", err: ErrBatchDestinationNotFound, wantStatus: http.StatusNotFound, wantError: "destination directory not found", wantReason: "destination directory not found"},
+		{name: "quota exceeded", err: ErrStorageQuotaExceeded, wantStatus: http.StatusForbidden, wantError: "storage quota exceeded", wantReason: "storage quota exceeded"},
+		{name: "conflict", err: &ConflictError{ItemName: "renamed.txt"}, wantStatus: http.StatusConflict, wantError: "conflict", wantReason: "conflict", wantConflict: []string{"renamed.txt"}},
+		{name: "generic", err: errors.New("boom"), wantStatus: http.StatusInternalServerError, wantError: "failed to move file.txt", wantReason: "failed to move file.txt"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			status, payload, reason := batchOperationErrorResponse(tt.err, "move", "file.txt")
+			if status != tt.wantStatus {
+				t.Fatalf("status = %d, want %d", status, tt.wantStatus)
+			}
+			if got := payload["error"]; got != tt.wantError {
+				t.Fatalf("error = %v, want %q", got, tt.wantError)
+			}
+			if reason != tt.wantReason {
+				t.Fatalf("reason = %q, want %q", reason, tt.wantReason)
+			}
+			if tt.wantConflict != nil {
+				items, ok := payload["conflicting_items"].([]string)
+				if !ok {
+					t.Fatalf("conflicting_items type = %T, want []string", payload["conflicting_items"])
+				}
+				if len(items) != len(tt.wantConflict) {
+					t.Fatalf("conflicting_items len = %d, want %d", len(items), len(tt.wantConflict))
+				}
+				for i, want := range tt.wantConflict {
+					if items[i] != want {
+						t.Fatalf("conflicting_items[%d] = %q, want %q", i, items[i], want)
+					}
+				}
+			}
+		})
+	}
 }
 
 func TestSyncBatchMove_InvalidJSON(t *testing.T) {

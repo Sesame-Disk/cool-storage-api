@@ -4,8 +4,10 @@ import (
 	"crypto/sha1"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
+	"math/rand"
 	"path"
 	"strings"
 	"time"
@@ -20,6 +22,13 @@ import (
 type FSHelper struct {
 	db *db.DB
 }
+
+// ErrLibraryHeadConflict indicates that the library HEAD changed between the
+// caller's read and publish steps.
+var ErrLibraryHeadConflict = errors.New("library HEAD was modified concurrently")
+
+// ErrStorageQuotaExceeded indicates the caller's storage quota would be exceeded.
+var ErrStorageQuotaExceeded = errors.New("storage quota exceeded")
 
 // NewFSHelper creates a new FSHelper instance
 func NewFSHelper(database *db.DB) *FSHelper {
@@ -37,15 +46,32 @@ type PathTraverseResult struct {
 	Entries      []FSEntry // Entries in parent directory
 }
 
+// LibraryHeadSnapshot captures the canonical HEAD and root tree that a caller
+// used to build a mutation. expectedHead at publish time must come from this
+// same snapshot, not from a later fresh read.
+type LibraryHeadSnapshot struct {
+	OrgID        string
+	HeadCommitID string
+	RootFSID     string
+}
+
+// ValidateExpectedHead rejects attempts to publish a tree built from one HEAD
+// while comparing against another.
+func (s *LibraryHeadSnapshot) ValidateExpectedHead(expectedHead string) error {
+	if s == nil {
+		return fmt.Errorf("library head snapshot is required")
+	}
+	if expectedHead != s.HeadCommitID {
+		return fmt.Errorf("expectedHead %s does not match snapshot head %s", expectedHead, s.HeadCommitID)
+	}
+	return nil
+}
+
 // GetRootFSID gets the root fs_id from a library's head commit
 func (h *FSHelper) GetRootFSID(repoID string) (string, string, error) {
-	// Get head_commit_id from library lookup table (no ALLOW FILTERING needed)
-	var headCommitID string
-	err := h.db.Session().Query(`
-		SELECT head_commit_id FROM libraries_by_id WHERE library_id = ?
-	`, repoID).Scan(&headCommitID)
+	_, headCommitID, err := h.getCanonicalHeadCommit(repoID)
 	if err != nil {
-		return "", "", fmt.Errorf("library not found: %w", err)
+		return "", "", err
 	}
 
 	if headCommitID == "" {
@@ -62,6 +88,75 @@ func (h *FSHelper) GetRootFSID(repoID string) (string, string, error) {
 	}
 
 	return rootFSID, headCommitID, nil
+}
+
+func (h *FSHelper) getCanonicalHeadCommit(repoID string) (string, string, error) {
+	var orgID string
+	if err := h.db.Session().Query(`
+		SELECT org_id FROM libraries_by_id WHERE library_id = ?
+	`, repoID).Scan(&orgID); err != nil {
+		return "", "", fmt.Errorf("library not found: %w", err)
+	}
+
+	var headCommitID string
+	if err := h.db.Session().Query(`
+		SELECT head_commit_id FROM libraries WHERE org_id = ? AND library_id = ?
+	`, orgID, repoID).Scan(&headCommitID); err != nil {
+		return "", "", fmt.Errorf("library not found: %w", err)
+	}
+
+	return orgID, headCommitID, nil
+}
+
+// GetLibraryHeadSnapshot resolves the canonical HEAD once and returns the root
+// tree that callers should use for stale-sensitive metadata mutations.
+func (h *FSHelper) GetLibraryHeadSnapshot(repoID string) (*LibraryHeadSnapshot, error) {
+	orgID, headCommitID, err := h.getCanonicalHeadCommit(repoID)
+	if err != nil {
+		return nil, err
+	}
+	if headCommitID == "" {
+		return nil, fmt.Errorf("library has no head commit")
+	}
+
+	var rootFSID string
+	err = h.db.Session().Query(`
+		SELECT root_fs_id FROM commits WHERE library_id = ? AND commit_id = ?
+	`, repoID, headCommitID).Scan(&rootFSID)
+	if err != nil {
+		return nil, fmt.Errorf("commit not found: %w", err)
+	}
+
+	return &LibraryHeadSnapshot{
+		OrgID:        orgID,
+		HeadCommitID: headCommitID,
+		RootFSID:     rootFSID,
+	}, nil
+}
+
+// TraverseToPathAtHead resolves the current canonical HEAD once and traverses
+// the requested path from that fixed root tree.
+func (h *FSHelper) TraverseToPathAtHead(repoID, targetPath string) (*PathTraverseResult, *LibraryHeadSnapshot, error) {
+	snapshot, err := h.GetLibraryHeadSnapshot(repoID)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	result, err := h.TraverseToPathFromRoot(repoID, snapshot.RootFSID, targetPath)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return result, snapshot, nil
+}
+
+// TraverseToPathFromSnapshot traverses a path from an already-fixed HEAD
+// snapshot so callers can resolve multiple paths against the same tree.
+func (h *FSHelper) TraverseToPathFromSnapshot(repoID string, snapshot *LibraryHeadSnapshot, targetPath string) (*PathTraverseResult, error) {
+	if snapshot == nil {
+		return nil, fmt.Errorf("library head snapshot is required")
+	}
+	return h.TraverseToPathFromRoot(repoID, snapshot.RootFSID, targetPath)
 }
 
 // GetDirectoryEntries gets the entries from a directory fs_object
@@ -247,9 +342,25 @@ func (h *FSHelper) CreateDirectoryFSObject(repoID string, entries []FSEntry) (st
 // RebuildPathToRoot rebuilds the path from a modified directory back to root
 // Returns the new root fs_id
 func (h *FSHelper) RebuildPathToRoot(repoID string, result *PathTraverseResult, newParentFSID string) (string, error) {
+	return rebuildPathToRootWithHooks(repoID, result, newParentFSID, h.GetDirectoryEntries, h.CreateDirectoryFSObject)
+}
+
+func rebuildPathToRootWithHooks(repoID string, result *PathTraverseResult, newParentFSID string, getDirectoryEntries func(string, string) ([]FSEntry, error), createDirectoryFSObject func(string, []FSEntry) (string, error)) (string, error) {
+	if result == nil {
+		return "", fmt.Errorf("path traverse result is required")
+	}
+	if getDirectoryEntries == nil || createDirectoryFSObject == nil {
+		return "", fmt.Errorf("rebuild path helpers are required")
+	}
+	if len(result.Ancestors) != len(result.AncestorPath) {
+		return "", fmt.Errorf("path traverse result has %d ancestors but %d ancestor paths", len(result.Ancestors), len(result.AncestorPath))
+	}
 	if len(result.Ancestors) == 0 {
 		// Parent was root, new parent FS ID is the new root
 		return newParentFSID, nil
+	}
+	if strings.TrimSpace(result.AncestorPath[len(result.AncestorPath)-1]) == "" {
+		return "", fmt.Errorf("path traverse result has empty ancestor path for rebuild")
 	}
 
 	currentFSID := newParentFSID
@@ -266,23 +377,31 @@ func (h *FSHelper) RebuildPathToRoot(repoID string, result *PathTraverseResult, 
 	for i := len(result.Ancestors) - 2; i >= 0; i-- {
 		ancestorFSID := result.Ancestors[i]
 		ancestorPath := result.AncestorPath[i]
+		if strings.TrimSpace(ancestorPath) == "" {
+			return "", fmt.Errorf("path traverse result has empty ancestor path at index %d", i)
+		}
 
 		// Get ancestor's entries
-		entries, err := h.GetDirectoryEntries(repoID, ancestorFSID)
+		entries, err := getDirectoryEntries(repoID, ancestorFSID)
 		if err != nil {
 			return "", fmt.Errorf("failed to get ancestor %s: %w", ancestorPath, err)
 		}
 
 		// Update the child reference in ancestor
+		found := false
 		for j := range entries {
 			if entries[j].Name == currentName {
 				entries[j].ID = currentFSID
+				found = true
 				break
 			}
 		}
+		if !found {
+			return "", fmt.Errorf("failed to rebuild path at %s: child %q not found", ancestorPath, currentName)
+		}
 
 		// Create new fs_object for modified ancestor
-		newAncestorFSID, err := h.CreateDirectoryFSObject(repoID, entries)
+		newAncestorFSID, err := createDirectoryFSObject(repoID, entries)
 		if err != nil {
 			return "", fmt.Errorf("failed to create ancestor fs_object: %w", err)
 		}
@@ -375,9 +494,14 @@ func (h *FSHelper) calculateDirStats(repoID, dirFSID string) (totalSize int64, f
 	return totalSize, fileCount, nil
 }
 
-// UpdateLibraryHead updates the library's head_commit_id, size_bytes, and file_count
-// Uses batched dual-write to maintain consistency with libraries_by_id
-func (h *FSHelper) UpdateLibraryHead(orgID, repoID, commitID string) error {
+// UpdateLibraryHead updates the library's head_commit_id, size_bytes, and file_count.
+// The canonical libraries row advances via CAS; derived lookup/admin rows are
+// immediately resynced from the canonical state so lagging projections cannot
+// drive future mutations off a stale HEAD. expectedHead must be the same HEAD
+// commit that the caller used to build the new tree and commit parent; reading
+// a fresher HEAD immediately before publish is invalid because it can let a tree
+// built from an older snapshot overwrite newer metadata.
+func (h *FSHelper) UpdateLibraryHead(orgID, repoID, commitID, expectedHead string) error {
 	// Get root_fs_id from the new commit to recalculate stats
 	var rootFSID string
 	err := h.db.Session().Query(`
@@ -395,34 +519,132 @@ func (h *FSHelper) UpdateLibraryHead(orgID, repoID, commitID string) error {
 	}
 
 	now := time.Now()
-	previousRow, err := db.ReadAdminLibraryProjectionRow(h.db.Session(), orgID, repoID)
-	if err != nil {
-		return fmt.Errorf("failed to read library projection row: %w", err)
-	}
-	projectionRow := previousRow
-	projectionRow.SizeBytes = totalSize
-	projectionRow.FileCount = fileCount
-	projectionRow.UpdatedAt = now
-	batch := h.db.Session().Batch(gocql.LoggedBatch)
-
-	// Update main table with stats
-	batch.Query(`
+	casState := map[string]interface{}{}
+	applied, err := h.db.Session().Query(`
 		UPDATE libraries SET head_commit_id = ?, size_bytes = ?, file_count = ?, updated_at = ?
 		WHERE org_id = ? AND library_id = ?
-	`, commitID, totalSize, fileCount, now, orgID, repoID)
-
-	// Update lookup table
-	batch.Query(`
-		UPDATE libraries_by_id SET head_commit_id = ?
-		WHERE library_id = ?
-	`, commitID, repoID)
-	addAdminLibraryReadModelRefreshQueries(batch, projectionRow, &previousRow)
-
-	if err := batch.Exec(); err != nil {
-		return fmt.Errorf("failed to update library head: %w", err)
+		IF head_commit_id = ?
+	`, commitID, totalSize, fileCount, now, orgID, repoID, expectedHead).MapScanCAS(casState)
+	if err != nil {
+		return fmt.Errorf("conditional library head update failed: %w", err)
+	}
+	if !applied {
+		currentHead, _ := casState["head_commit_id"].(string)
+		return fmt.Errorf("%w: expected %s but found %s", ErrLibraryHeadConflict, expectedHead, currentHead)
+	}
+	if err := h.syncLibraryHeadDerivedState(orgID, repoID); err != nil {
+		// The canonical HEAD is already published at this point. Returning an
+		// error would make callers treat the mutation as failed and can trigger
+		// unsafe rollback of block refs that are now reachable from HEAD.
+		log.Printf("[UpdateLibraryHead] WARNING: canonical head updated for library %s but derived state sync failed: %v", repoID, err)
 	}
 
 	log.Printf("[UpdateLibraryHead] Updated library %s: size=%d bytes, files=%d", repoID, totalSize, fileCount)
+	return nil
+}
+
+// UpdateLibraryHeadFromSnapshot is the safe publish entrypoint for mutations
+// that were built from a fixed HEAD snapshot.
+func (h *FSHelper) UpdateLibraryHeadFromSnapshot(snapshot *LibraryHeadSnapshot, repoID, commitID, expectedHead string) error {
+	if err := snapshot.ValidateExpectedHead(expectedHead); err != nil {
+		return err
+	}
+	return h.UpdateLibraryHead(snapshot.OrgID, repoID, commitID, snapshot.HeadCommitID)
+}
+
+// Independent SesameFS nodes can transiently stack more CAS conflicts than the
+// single-process retry budget originally assumed.
+const libraryHeadMutationRetryAttempts = 8
+
+var libraryHeadMutationRetryDelay = 50 * time.Millisecond
+
+var libraryHeadMutationRetryMaxDelay = 400 * time.Millisecond
+
+var libraryHeadMutationRetryJitter = 25 * time.Millisecond
+
+var libraryHeadMutationRetryJitterInt63n = rand.Int63n
+
+// RetryBackoff returns the exponential-with-jitter delay between
+// upload-metadata-publish or library-head-mutation retry attempts. Both retry
+// paths share the same CAS conflict semantics, so they share one schedule.
+func RetryBackoff(attempt int) time.Duration {
+	return libraryHeadMutationRetryBackoff(attempt)
+}
+
+func libraryHeadMutationRetryBackoff(attempt int) time.Duration {
+	if attempt < 1 || libraryHeadMutationRetryDelay <= 0 {
+		return 0
+	}
+
+	delay := libraryHeadMutationRetryDelay
+	for step := 1; step < attempt; step++ {
+		delay *= 2
+		if libraryHeadMutationRetryMaxDelay > 0 && delay >= libraryHeadMutationRetryMaxDelay {
+			delay = libraryHeadMutationRetryMaxDelay
+			break
+		}
+	}
+
+	if libraryHeadMutationRetryMaxDelay > 0 && delay > libraryHeadMutationRetryMaxDelay {
+		delay = libraryHeadMutationRetryMaxDelay
+	}
+	if libraryHeadMutationRetryJitter > 0 && libraryHeadMutationRetryJitterInt63n != nil {
+		delay += time.Duration(libraryHeadMutationRetryJitterInt63n(int64(libraryHeadMutationRetryJitter)))
+	}
+	return delay
+}
+
+func retryLibraryHeadMutation(label string, mutate func() error) error {
+	var lastConflict error
+
+	for attempt := 1; attempt <= libraryHeadMutationRetryAttempts; attempt++ {
+		err := mutate()
+		if err == nil {
+			return nil
+		}
+		if !errors.Is(err, ErrLibraryHeadConflict) {
+			return err
+		}
+		lastConflict = err
+		if attempt == libraryHeadMutationRetryAttempts {
+			break
+		}
+		sleepFor := libraryHeadMutationRetryBackoff(attempt)
+		log.Printf("[%s] Retrying metadata publish after head conflict (%d/%d), sleeping %s", label, attempt, libraryHeadMutationRetryAttempts, sleepFor)
+		if sleepFor > 0 {
+			time.Sleep(sleepFor)
+		}
+	}
+
+	if lastConflict != nil {
+		return lastConflict
+	}
+	return fmt.Errorf("%s mutation failed", label)
+}
+
+func (h *FSHelper) syncLibraryHeadDerivedState(orgID, repoID string) error {
+	var headCommitID string
+	if err := h.db.Session().Query(`
+		SELECT head_commit_id FROM libraries WHERE org_id = ? AND library_id = ?
+	`, orgID, repoID).Scan(&headCommitID); err != nil {
+		return fmt.Errorf("failed to read canonical head after library update: %w", err)
+	}
+
+	projectionRow, err := db.ReadAdminLibraryProjectionRow(h.db.Session(), orgID, repoID)
+	if err != nil {
+		return fmt.Errorf("failed to read library projection row: %w", err)
+	}
+
+	batch := h.db.Session().Batch(gocql.LoggedBatch)
+	batch.Query(`
+		UPDATE libraries_by_id SET head_commit_id = ?
+		WHERE library_id = ?
+	`, headCommitID, repoID)
+	db.AddUpsertAdminLibraryReadModelQuery(batch, projectionRow)
+	if err := batch.Exec(); err != nil {
+		return fmt.Errorf("failed to sync library head derived state: %w", err)
+	}
+
 	return nil
 }
 
@@ -535,12 +757,9 @@ func GenerateUniqueName(entries []FSEntry, baseName string) string {
 
 // GetHeadCommitID gets the current head commit ID for a library
 func (h *FSHelper) GetHeadCommitID(repoID string) (string, error) {
-	var headCommitID string
-	err := h.db.Session().Query(`
-		SELECT head_commit_id FROM libraries_by_id WHERE library_id = ?
-	`, repoID).Scan(&headCommitID)
+	_, headCommitID, err := h.getCanonicalHeadCommit(repoID)
 	if err != nil {
-		return "", fmt.Errorf("library not found: %w", err)
+		return "", err
 	}
 	return headCommitID, nil
 }

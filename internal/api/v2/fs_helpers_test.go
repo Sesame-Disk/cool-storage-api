@@ -1,9 +1,137 @@
 package v2
 
 import (
+	"errors"
 	"path"
 	"testing"
+	"time"
 )
+
+func TestLibraryHeadSnapshotValidateExpectedHeadRejectsMismatch(t *testing.T) {
+	snapshot := &LibraryHeadSnapshot{HeadCommitID: "head-a"}
+
+	if err := snapshot.ValidateExpectedHead("head-a"); err != nil {
+		t.Fatalf("ValidateExpectedHead(same) error = %v, want nil", err)
+	}
+
+	if err := snapshot.ValidateExpectedHead("head-b"); err == nil {
+		t.Fatal("ValidateExpectedHead(mismatch) error = nil, want mismatch error")
+	}
+}
+
+func TestUpdateLibraryHeadFromSnapshotRejectsMismatchedExpectedHead(t *testing.T) {
+	helper := &FSHelper{}
+	snapshot := &LibraryHeadSnapshot{OrgID: "org-a", HeadCommitID: "head-a"}
+
+	err := helper.UpdateLibraryHeadFromSnapshot(snapshot, "repo-a", "commit-a", "head-b")
+	if err == nil {
+		t.Fatal("UpdateLibraryHeadFromSnapshot(mismatch) error = nil, want mismatch error")
+	}
+}
+
+func TestRetryLibraryHeadMutationRetriesConflicts(t *testing.T) {
+	previousDelay := libraryHeadMutationRetryDelay
+	libraryHeadMutationRetryDelay = 0
+	defer func() {
+		libraryHeadMutationRetryDelay = previousDelay
+	}()
+
+	attempts := 0
+	err := retryLibraryHeadMutation("test", func() error {
+		attempts++
+		if attempts < 3 {
+			return ErrLibraryHeadConflict
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("retryLibraryHeadMutation() error = %v, want nil", err)
+	}
+	if attempts != 3 {
+		t.Fatalf("retryLibraryHeadMutation() attempts = %d, want 3", attempts)
+	}
+}
+
+func TestRetryLibraryHeadMutationStopsOnNonConflict(t *testing.T) {
+	previousDelay := libraryHeadMutationRetryDelay
+	libraryHeadMutationRetryDelay = 0
+	defer func() {
+		libraryHeadMutationRetryDelay = previousDelay
+	}()
+
+	wantErr := errors.New("boom")
+	attempts := 0
+	err := retryLibraryHeadMutation("test", func() error {
+		attempts++
+		return wantErr
+	})
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("retryLibraryHeadMutation() error = %v, want %v", err, wantErr)
+	}
+	if attempts != 1 {
+		t.Fatalf("retryLibraryHeadMutation() attempts = %d, want 1", attempts)
+	}
+}
+
+func TestLibraryHeadMutationRetryBackoffCaps(t *testing.T) {
+	previousDelay := libraryHeadMutationRetryDelay
+	previousMaxDelay := libraryHeadMutationRetryMaxDelay
+	previousJitter := libraryHeadMutationRetryJitter
+	libraryHeadMutationRetryDelay = 50 * time.Millisecond
+	libraryHeadMutationRetryMaxDelay = 125 * time.Millisecond
+	libraryHeadMutationRetryJitter = 0
+	defer func() {
+		libraryHeadMutationRetryDelay = previousDelay
+		libraryHeadMutationRetryMaxDelay = previousMaxDelay
+		libraryHeadMutationRetryJitter = previousJitter
+	}()
+
+	tests := []struct {
+		attempt int
+		want    time.Duration
+	}{
+		{attempt: 0, want: 0},
+		{attempt: 1, want: 50 * time.Millisecond},
+		{attempt: 2, want: 100 * time.Millisecond},
+		{attempt: 3, want: 125 * time.Millisecond},
+		{attempt: 4, want: 125 * time.Millisecond},
+	}
+
+	for _, tt := range tests {
+		if got := libraryHeadMutationRetryBackoff(tt.attempt); got != tt.want {
+			t.Fatalf("libraryHeadMutationRetryBackoff(%d) = %s, want %s", tt.attempt, got, tt.want)
+		}
+	}
+}
+
+func TestLibraryHeadMutationRetryBackoffAddsDeterministicJitter(t *testing.T) {
+	previousDelay := libraryHeadMutationRetryDelay
+	previousMaxDelay := libraryHeadMutationRetryMaxDelay
+	previousJitter := libraryHeadMutationRetryJitter
+	previousInt63n := libraryHeadMutationRetryJitterInt63n
+	libraryHeadMutationRetryDelay = 50 * time.Millisecond
+	libraryHeadMutationRetryMaxDelay = 0
+	libraryHeadMutationRetryJitter = 25 * time.Millisecond
+	libraryHeadMutationRetryJitterInt63n = func(limit int64) int64 {
+		wantLimit := int64(25 * time.Millisecond)
+		if limit != wantLimit {
+			t.Fatalf("jitter limit = %d, want %d", limit, wantLimit)
+		}
+		return int64(7 * time.Millisecond)
+	}
+	defer func() {
+		libraryHeadMutationRetryDelay = previousDelay
+		libraryHeadMutationRetryMaxDelay = previousMaxDelay
+		libraryHeadMutationRetryJitter = previousJitter
+		libraryHeadMutationRetryJitterInt63n = previousInt63n
+	}()
+
+	got := libraryHeadMutationRetryBackoff(2)
+	want := 107 * time.Millisecond
+	if got != want {
+		t.Fatalf("libraryHeadMutationRetryBackoff(2) = %s, want %s", got, want)
+	}
+}
 
 // Test normalizePath function (additional cases)
 func TestNormalizePath_Additional(t *testing.T) {
@@ -466,9 +594,9 @@ func TestRebuildPathToRoot_AlgorithmLogic_FiveAncestors(t *testing.T) {
 		ancestorFSID string
 		currentName  string
 	}{
-		{"d3_fsid", "d4"}, // In d3's entries, update "d4" to new_d4
-		{"d2_fsid", "d3"}, // In d2's entries, update "d3" to new_d3
-		{"d1_fsid", "d2"}, // In d1's entries, update "d2" to new_d2
+		{"d3_fsid", "d4"},   // In d3's entries, update "d4" to new_d4
+		{"d2_fsid", "d3"},   // In d2's entries, update "d3" to new_d3
+		{"d1_fsid", "d2"},   // In d1's entries, update "d2" to new_d2
 		{"root_fsid", "d1"}, // In root's entries, update "d1" to new_d1
 	}
 
@@ -492,11 +620,11 @@ func TestRebuildPathToRoot_AlgorithmLogic_FiveAncestors(t *testing.T) {
 // using the original result with RebuildPathToRoot.
 func TestRebuildPathToRoot_CreateDirectory_Pattern(t *testing.T) {
 	tests := []struct {
-		name            string
-		parentPath      string // Path of directory being created's parent
-		ancestorCount   int    // Expected number of ancestors from TraverseToPath(parentPath)
-		loopIterations  int    // Expected RebuildPathToRoot loop iterations
-		description     string
+		name           string
+		parentPath     string // Path of directory being created's parent
+		ancestorCount  int    // Expected number of ancestors from TraverseToPath(parentPath)
+		loopIterations int    // Expected RebuildPathToRoot loop iterations
+		description    string
 	}{
 		{
 			name:           "depth 1: create /newdir",
@@ -550,6 +678,110 @@ func TestRebuildPathToRoot_CreateDirectory_Pattern(t *testing.T) {
 					tt.ancestorCount, loopCount, tt.loopIterations, tt.description)
 			}
 		})
+	}
+}
+
+func TestRebuildPathToRootRejectsNilResult(t *testing.T) {
+	_, err := rebuildPathToRootWithHooks("repo", nil, "new-root",
+		func(string, string) ([]FSEntry, error) { return nil, nil },
+		func(string, []FSEntry) (string, error) { return "", nil },
+	)
+	if err == nil {
+		t.Fatal("rebuildPathToRootWithHooks(nil) error = nil, want error")
+	}
+}
+
+func TestRebuildPathToRootRejectsMismatchedAncestorLengths(t *testing.T) {
+	result := &PathTraverseResult{
+		Ancestors:    []string{"root", "folder"},
+		AncestorPath: []string{"/"},
+	}
+
+	_, err := rebuildPathToRootWithHooks("repo", result, "new-root",
+		func(string, string) ([]FSEntry, error) { return nil, nil },
+		func(string, []FSEntry) (string, error) { return "", nil },
+	)
+	if err == nil {
+		t.Fatal("rebuildPathToRootWithHooks(mismatched lengths) error = nil, want error")
+	}
+}
+
+func TestRebuildPathToRootRejectsMissingChildInAncestor(t *testing.T) {
+	result := &PathTraverseResult{
+		Ancestors:    []string{"root_fsid", "a_fsid", "b_fsid"},
+		AncestorPath: []string{"/", "/a", "/a/b"},
+	}
+
+	createCalls := 0
+	_, err := rebuildPathToRootWithHooks("repo", result, "new-b",
+		func(_ string, fsID string) ([]FSEntry, error) {
+			switch fsID {
+			case "a_fsid":
+				return []FSEntry{{Name: "other-child", ID: "old"}}, nil
+			case "root_fsid":
+				return []FSEntry{{Name: "a", ID: "old-a"}}, nil
+			default:
+				return nil, nil
+			}
+		},
+		func(string, []FSEntry) (string, error) {
+			createCalls++
+			return "should-not-happen", nil
+		},
+	)
+	if err == nil {
+		t.Fatal("rebuildPathToRootWithHooks(missing child) error = nil, want error")
+	}
+	if createCalls != 0 {
+		t.Fatalf("createDirectoryFSObject called %d times, want 0", createCalls)
+	}
+}
+
+func TestRebuildPathToRootRebuildsAncestorsWithHooks(t *testing.T) {
+	result := &PathTraverseResult{
+		Ancestors:    []string{"root_fsid", "a_fsid", "b_fsid"},
+		AncestorPath: []string{"/", "/a", "/a/b"},
+	}
+
+	var created [][]FSEntry
+	newRootFSID, err := rebuildPathToRootWithHooks("repo", result, "new-b",
+		func(_ string, fsID string) ([]FSEntry, error) {
+			switch fsID {
+			case "a_fsid":
+				return []FSEntry{{Name: "b", ID: "old-b"}, {Name: "peer", ID: "peer-id"}}, nil
+			case "root_fsid":
+				return []FSEntry{{Name: "a", ID: "old-a"}, {Name: "top", ID: "top-id"}}, nil
+			default:
+				return nil, nil
+			}
+		},
+		func(_ string, entries []FSEntry) (string, error) {
+			copied := append([]FSEntry(nil), entries...)
+			created = append(created, copied)
+			switch len(created) {
+			case 1:
+				return "new-a", nil
+			case 2:
+				return "new-root", nil
+			default:
+				return "unexpected", nil
+			}
+		},
+	)
+	if err != nil {
+		t.Fatalf("rebuildPathToRootWithHooks() error = %v, want nil", err)
+	}
+	if newRootFSID != "new-root" {
+		t.Fatalf("new root fsid = %q, want %q", newRootFSID, "new-root")
+	}
+	if len(created) != 2 {
+		t.Fatalf("created ancestors = %d, want 2", len(created))
+	}
+	if created[0][0].Name != "b" || created[0][0].ID != "new-b" {
+		t.Fatalf("first rebuild updated child = %#v, want name=b id=new-b", created[0][0])
+	}
+	if created[1][0].Name != "a" || created[1][0].ID != "new-a" {
+		t.Fatalf("second rebuild updated child = %#v, want name=a id=new-a", created[1][0])
 	}
 }
 

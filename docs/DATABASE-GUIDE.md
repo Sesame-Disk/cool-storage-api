@@ -755,6 +755,32 @@ POST /api/v2.1/onlyoffice/callback/
 # 2. Download new content, save to library
 ```
 
+### 15.b. `onlyoffice_pending_blocks`
+**Purpose:** Durable pending cleanup for OnlyOffice save callbacks from the pre-upload stage through successful library-head publication
+
+**Schema:**
+```sql
+PRIMARY KEY ((org_id), operation_id)
+```
+
+Rows also carry a 7-day Cassandra TTL as a safety net. Normal cleanup is expected within minutes via inline reconciliation on later saves and the GC scanner's OnlyOffice reconciliation phase.
+
+**API Usage:**
+```bash
+# OnlyOffice callback save path records intent before the upload starts
+POST /onlyoffice/editor-callback/
+# 1. Insert onlyoffice_pending_blocks row before PutBlockData
+# 2. Upload the block to storage, then call IncrementOrCreateBlock
+# 3. Create commit candidate and persist publish_commit_id before CAS on libraries.head_commit_id
+# 4. Clear the row after publish success or immediate rollback
+
+# Later OnlyOffice saves and the GC scanner reconcile stale rows conservatively
+# 1. Read onlyoffice_pending_blocks older than the staleness window
+# 2. If publish_commit_id is reachable from the current library head, drop the row
+# 3. Otherwise decrement the materialized block ref and enqueue zero-ref cleanup
+# 4. Limitation: a crash after PutBlockData but before IncrementOrCreateBlock can still leave a physical storage object orphaned because this reconciler does not delete storage objects directly
+```
+
 ---
 
 ### 16. `starred_files`

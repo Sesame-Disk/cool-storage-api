@@ -63,6 +63,18 @@ Do not attach tests to `docker compose up -d --build` itself. That command shoul
 | `frontend-test` | Frontend lint + Jest |
 | `mobile-test` | Mobile typecheck + lint + Vitest + desktop split smoke |
 
+The default Go integration path is now multi-instance inside the compose `test`
+profile: `go-integration-test` and `go-all-test` wait for `sesamefs`,
+`sesamefs-node-2`, and `sesamefs-node-3`, then export `SESAMEFS_URL`,
+`SESAMEFS_URL_2`, and `SESAMEFS_URL_3` so integration tests can exercise real
+cross-process races by default.
+
+Keep background GC isolated to the primary `sesamefs` service in that profile.
+`sesamefs-node-2` and `sesamefs-node-3` must keep `GC_ENABLED=false`, or GC-
+sensitive integration tests become nondeterministic because secondary nodes can
+reconcile queue counters, requeue failed items, or purge expired share links in
+parallel.
+
 ### Test Categories
 
 | Category | Description | Requirements |
@@ -243,6 +255,18 @@ docker compose --profile test run --rm --build go-integration-test
 These tests make HTTP requests to the running backend (same model as bash scripts) and exercise the full stack: API handlers → middleware → database → storage. They don't contribute to `go test -cover` numbers since they're in a separate package making external HTTP calls.
 
 **Docker-first default**: `test.sh` prefers the `go-integration-test` compose service, which waits for `sesamefs` and runs against the compose network.
+
+That service now waits for all three compose-backed backend nodes and is the
+default place to validate coordinator correctness under independent-process
+contention. Use the dedicated multi-region stack only when the behavior under
+test depends on hostname routing, region-specific storage classes, or failover
+between region-pinned backends.
+
+Current high-value coordinator-hardening coverage in that default path includes:
+- mutation-only races across distinct nodes in `internal/integration/multi_instance_mutations_test.go`
+- mixed races with uploads against other HEAD writers, including multi-container `seafhttp upload` vs rename, multi-container `seafhttp upload` vs same-repo move, and multi-container direct v2 upload vs delete
+- upload finalization stress for both upload seams in `internal/integration/upload_finalization_race_test.go`
+- dedicated two-region proofs for both upload seams when the test specifically needs the regional stack
 
 **Integration-test-first rule for backend refactors:**
 - If a change touches dual-write behavior, denormalized projections, counters, sync `HEAD` semantics, cleanup cascades, or cursor pagination boundaries, start with an integration regression before trusting the refactor.
@@ -555,6 +579,11 @@ A `MockStorageProvider` and `mockBlockDeleter` simulate S3 and track deleted blo
 | `internal/gc/scanner_test.go` | 30 | Integration (mock) | Orphaned blocks (ref_count<=0), expired share links, orphaned commits (with org lookup), orphaned fs_objects, empty DB scan, full pipeline (all 12 phases), context cancellation, idempotent enqueue, expired shares (Phase 7), expired restore jobs (Phase 8), **Phase 10**: expired deleted users (enqueue/skip), **Phase 11**: expired deleted libraries (enqueue/skip/multiple), **Phase 12**: expired deleted orgs (enqueue/skip/multiple), **Phases 10-12 via ScanOnce integration** |
 | `internal/api/gc_adapter_test.go` | 7 | Unit | Invalid UUIDs, empty inputs, interface compliance, nil service, config defaults |
 | `internal/api/v2/gc_hooks_test.go` | 8 | Unit | Set/get hooks, nil defaults, concurrent access, interface compile-time check, mock call recording |
+
+Known coverage gaps from the PR 60 merge audit:
+- `onlyoffice_pending_blocks` has no direct end-to-end test that seeds stale pending rows and verifies both reconciliation outcomes: reachable publish commits are cleared without rollback, and abandoned materialized blocks are decremented/enqueued through the scanner path.
+- `scanOnlyOfficePendingBlocks` and the API-to-GC `OnlyOfficeReconciler` adapter are covered by compilation and Docker integration startup, but not by a focused mock scanner test that asserts org iteration, error accumulation, and phase metrics.
+- `ScanOnce` still aggregates the OnlyOffice phase's "organizations reconciled" count into its generic `enqueued` total. When that observability debt is fixed, add a regression test that locks the intended counter semantics.
 
 ### Key Test Scenarios
 

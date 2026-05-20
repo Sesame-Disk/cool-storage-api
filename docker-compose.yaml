@@ -55,6 +55,118 @@ services:
     # Config is baked into the image - no volume mount needed
     restart: unless-stopped
 
+  sesamefs-node-2:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - ${ENV_FILE:-.env}
+    environment:
+      - PORT=${PORT:-8080}
+      - SERVER_URL=${SERVER_URL}
+      - BILLING_URL=${BILLING_URL:-https://t-accounts.sesamedisk.com/billing/}
+      - ACCOUNTS_DELETE_ACCOUNT_URL=${ACCOUNTS_DELETE_ACCOUNT_URL:-https://t-accounts.sesamedisk.com/accounts/delete/}
+      - ACCOUNTS_ORG_USER_MANAGEMENT_URL=${ACCOUNTS_ORG_USER_MANAGEMENT_URL:-https://t-accounts.sesamedisk.com/accounts/sesamefs/dashboard/}
+      - ACCOUNTS_DISABLE_ORG_USER_WRITES=${ACCOUNTS_DISABLE_ORG_USER_WRITES:-false}
+      - CASSANDRA_HOSTS=${CASSANDRA_HOSTS:-cassandra:9042}
+      - CASSANDRA_KEYSPACE=${CASSANDRA_KEYSPACE:-sesamefs}
+      - CASSANDRA_LOCAL_DC=${CASSANDRA_LOCAL_DC:-datacenter1}
+      - AUTH_DEV_MODE=${AUTH_DEV_MODE:-true}
+      - OIDC_ENABLED=${OIDC_ENABLED:-false}
+      - OIDC_ISSUER=${OIDC_ISSUER}
+      - OIDC_CLIENT_ID=${OIDC_CLIENT_ID}
+      - OIDC_CLIENT_SECRET=${OIDC_CLIENT_SECRET}
+      - OIDC_REDIRECT_URIS=${OIDC_REDIRECT_URIS}
+      - OIDC_SESSION_TTL=${OIDC_SESSION_TTL:-24h}
+      - OIDC_API_TOKEN_TTL=${OIDC_API_TOKEN_TTL:-4320h}
+      - OIDC_AUTO_PROVISION=${OIDC_AUTO_PROVISION:-false}
+      - OIDC_DEFAULT_ROLE=${OIDC_DEFAULT_ROLE:-user}
+      - OIDC_REQUIRE_PKCE=${OIDC_REQUIRE_PKCE:-true}
+      - OIDC_JWT_SIGNING_KEY=${OIDC_JWT_SIGNING_KEY}
+      - OIDC_ROLES_CLAIM=${OIDC_ROLES_CLAIM}
+      - OIDC_ORG_CLAIM=${OIDC_ORG_CLAIM}
+      - OIDC_DEFAULT_ORG_ID=${OIDC_DEFAULT_ORG_ID}
+      - OIDC_PLATFORM_ORG_ID=${OIDC_PLATFORM_ORG_ID}
+      - OIDC_PLATFORM_ORG_CLAIM_VALUE=${OIDC_PLATFORM_ORG_CLAIM_VALUE}
+      - S3_REGION=${S3_REGION:-us-east-1}
+      - S3_ENDPOINT=${S3_ENDPOINT:-http://minio:9000}
+      - S3_BUCKET=${S3_BUCKET:-sesamefs-blocks}
+      - S3_ACCESS_KEY_ID=${S3_ACCESS_KEY_ID:-minioadmin}
+      - S3_SECRET_ACCESS_KEY=${S3_SECRET_ACCESS_KEY:-minioadmin}
+      - SHARE_LINK_HMAC_KEY=${SHARE_LINK_HMAC_KEY:-dev-share-link-hmac-key}
+      - FIRST_SUPERADMIN_EMAIL=${FIRST_SUPERADMIN_EMAIL}
+      - ONLYOFFICE_ENABLED=${ONLYOFFICE_ENABLED:-true}
+      - ONLYOFFICE_API_JS_URL=${ONLYOFFICE_API_JS_URL:-http://localhost:8088/web-apps/apps/api/documents/api.js}
+      - ONLYOFFICE_JWT_SECRET=${ONLYOFFICE_JWT_SECRET:-change-me-to-a-random-string}
+      - FRONTEND_URL=${FRONTEND_URL:-http://frontend:80}
+      - GC_ENABLED=false
+    depends_on:
+      cassandra:
+        condition: service_healthy
+      cassandra-bootstrap:
+        condition: service_completed_successfully
+      minio-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    profiles:
+      - test
+
+  sesamefs-node-3:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - ${ENV_FILE:-.env}
+    environment:
+      - PORT=${PORT:-8080}
+      - SERVER_URL=${SERVER_URL}
+      - BILLING_URL=${BILLING_URL:-https://t-accounts.sesamedisk.com/billing/}
+      - ACCOUNTS_DELETE_ACCOUNT_URL=${ACCOUNTS_DELETE_ACCOUNT_URL:-https://t-accounts.sesamedisk.com/accounts/delete/}
+      - ACCOUNTS_ORG_USER_MANAGEMENT_URL=${ACCOUNTS_ORG_USER_MANAGEMENT_URL:-https://t-accounts.sesamedisk.com/accounts/sesamefs/dashboard/}
+      - ACCOUNTS_DISABLE_ORG_USER_WRITES=${ACCOUNTS_DISABLE_ORG_USER_WRITES:-false}
+      - CASSANDRA_HOSTS=${CASSANDRA_HOSTS:-cassandra:9042}
+      - CASSANDRA_KEYSPACE=${CASSANDRA_KEYSPACE:-sesamefs}
+      - CASSANDRA_LOCAL_DC=${CASSANDRA_LOCAL_DC:-datacenter1}
+      - AUTH_DEV_MODE=${AUTH_DEV_MODE:-true}
+      - OIDC_ENABLED=${OIDC_ENABLED:-false}
+      - OIDC_ISSUER=${OIDC_ISSUER}
+      - OIDC_CLIENT_ID=${OIDC_CLIENT_ID}
+      - OIDC_CLIENT_SECRET=${OIDC_CLIENT_SECRET}
+      - OIDC_REDIRECT_URIS=${OIDC_REDIRECT_URIS}
+      - OIDC_SESSION_TTL=${OIDC_SESSION_TTL:-24h}
+      - OIDC_API_TOKEN_TTL=${OIDC_API_TOKEN_TTL:-4320h}
+      - OIDC_AUTO_PROVISION=${OIDC_AUTO_PROVISION:-false}
+      - OIDC_DEFAULT_ROLE=${OIDC_DEFAULT_ROLE:-user}
+      - OIDC_REQUIRE_PKCE=${OIDC_REQUIRE_PKCE:-true}
+      - OIDC_JWT_SIGNING_KEY=${OIDC_JWT_SIGNING_KEY}
+      - OIDC_ROLES_CLAIM=${OIDC_ROLES_CLAIM}
+      - OIDC_ORG_CLAIM=${OIDC_ORG_CLAIM}
+      - OIDC_DEFAULT_ORG_ID=${OIDC_DEFAULT_ORG_ID}
+      - OIDC_PLATFORM_ORG_ID=${OIDC_PLATFORM_ORG_ID}
+      - OIDC_PLATFORM_ORG_CLAIM_VALUE=${OIDC_PLATFORM_ORG_CLAIM_VALUE}
+      - S3_REGION=${S3_REGION:-us-east-1}
+      - S3_ENDPOINT=${S3_ENDPOINT:-http://minio:9000}
+      - S3_BUCKET=${S3_BUCKET:-sesamefs-blocks}
+      - S3_ACCESS_KEY_ID=${S3_ACCESS_KEY_ID:-minioadmin}
+      - S3_SECRET_ACCESS_KEY=${S3_SECRET_ACCESS_KEY:-minioadmin}
+      - SHARE_LINK_HMAC_KEY=${SHARE_LINK_HMAC_KEY:-dev-share-link-hmac-key}
+      - FIRST_SUPERADMIN_EMAIL=${FIRST_SUPERADMIN_EMAIL}
+      - ONLYOFFICE_ENABLED=${ONLYOFFICE_ENABLED:-true}
+      - ONLYOFFICE_API_JS_URL=${ONLYOFFICE_API_JS_URL:-http://localhost:8088/web-apps/apps/api/documents/api.js}
+      - ONLYOFFICE_JWT_SECRET=${ONLYOFFICE_JWT_SECRET:-change-me-to-a-random-string}
+      - FRONTEND_URL=${FRONTEND_URL:-http://frontend:80}
+      - GC_ENABLED=false
+    depends_on:
+      cassandra:
+        condition: service_healthy
+      cassandra-bootstrap:
+        condition: service_completed_successfully
+      minio-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    profiles:
+      - test
+
   cassandra:
     image: cassandra:5.0
     ports:
@@ -330,11 +442,15 @@ services:
     command:
       - /bin/sh
       - -c
-      - ./scripts/wait-for-http.sh http://sesamefs:8080/health sesamefs; go test -tags integration -v -count=1 -timeout 5m ./internal/integration/...
+      - ./scripts/wait-for-http.sh http://sesamefs:8080/health sesamefs; ./scripts/wait-for-http.sh http://sesamefs-node-2:8080/health sesamefs-node-2; ./scripts/wait-for-http.sh http://sesamefs-node-3:8080/health sesamefs-node-3; go test -tags integration -v -count=1 -timeout 10m ./internal/integration/...
     environment:
       - SESAMEFS_URL=http://sesamefs:8080
+      - SESAMEFS_URL_2=http://sesamefs-node-2:8080
+      - SESAMEFS_URL_3=http://sesamefs-node-3:8080
     depends_on:
       - sesamefs
+      - sesamefs-node-2
+      - sesamefs-node-3
     profiles:
       - test
 
@@ -347,14 +463,18 @@ services:
     command:
       - /bin/sh
       - -c
-      - go test ./... -short -cover && ./scripts/wait-for-http.sh http://sesamefs:8080/health sesamefs && go test -tags integration -v -count=1 -timeout 5m ./internal/integration/... && ./scripts/test.sh api && ./scripts/test.sh oidc
+      - go test ./... -short -cover && ./scripts/wait-for-http.sh http://sesamefs:8080/health sesamefs && ./scripts/wait-for-http.sh http://sesamefs-node-2:8080/health sesamefs-node-2 && ./scripts/wait-for-http.sh http://sesamefs-node-3:8080/health sesamefs-node-3 && go test -tags integration -v -count=1 -timeout 10m ./internal/integration/... && ./scripts/test.sh api && ./scripts/test.sh oidc
     environment:
       - SESAMEFS_URL=http://sesamefs:8080
+      - SESAMEFS_URL_2=http://sesamefs-node-2:8080
+      - SESAMEFS_URL_3=http://sesamefs-node-3:8080
       - SESAMEFS_TEST_IN_CONTAINER=1
       - SESAMEFS_CLEAN_TEST_REPOS=1
       - SESAMEFS_FAIL_FAST=1
     depends_on:
       - sesamefs
+      - sesamefs-node-2
+      - sesamefs-node-3
     profiles:
       - test
 

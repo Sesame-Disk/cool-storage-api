@@ -3,6 +3,7 @@ package v2
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -12,6 +13,55 @@ import (
 
 func init() {
 	gin.SetMode(gin.TestMode)
+}
+
+func TestWriteMoveFileError_MapsSentinelErrors(t *testing.T) {
+	tests := []struct {
+		name         string
+		err          error
+		wantStatus   int
+		wantError    string
+		wantConflict []string
+	}{
+		{name: "head conflict", err: ErrLibraryHeadConflict, wantStatus: http.StatusConflict, wantError: "library was modified concurrently; retry the move"},
+		{name: "source missing", err: ErrBatchSourceNotFound, wantStatus: http.StatusNotFound, wantError: "source file not found"},
+		{name: "destination missing", err: ErrBatchDestinationNotFound, wantStatus: http.StatusNotFound, wantError: "destination directory not found"},
+		{name: "quota exceeded", err: ErrStorageQuotaExceeded, wantStatus: http.StatusForbidden, wantError: "storage quota exceeded"},
+		{name: "conflict", err: &ConflictError{ItemName: "file.txt"}, wantStatus: http.StatusConflict, wantError: "conflict", wantConflict: []string{"file.txt"}},
+		{name: "generic", err: errors.New("boom"), wantStatus: http.StatusInternalServerError, wantError: "failed to move file"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+
+			writeMoveFileError(c, tt.err, "/dir/file.txt")
+
+			if w.Code != tt.wantStatus {
+				t.Fatalf("status = %d, want %d", w.Code, tt.wantStatus)
+			}
+
+			var resp map[string]interface{}
+			if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+				t.Fatalf("json.Unmarshal() error = %v", err)
+			}
+			if got := resp["error"]; got != tt.wantError {
+				t.Fatalf("error = %v, want %q", got, tt.wantError)
+			}
+			if tt.wantConflict != nil {
+				items, ok := resp["conflicting_items"].([]interface{})
+				if !ok || len(items) != len(tt.wantConflict) {
+					t.Fatalf("conflicting_items = %v, want %v", resp["conflicting_items"], tt.wantConflict)
+				}
+				for i, want := range tt.wantConflict {
+					if items[i] != want {
+						t.Fatalf("conflicting_items[%d] = %v, want %q", i, items[i], want)
+					}
+				}
+			}
+		})
+	}
 }
 
 // TestBatchDeleteItems_Validation tests input validation for BatchDeleteItems
@@ -214,21 +264,21 @@ func TestDirentStruct_JSONMarshal(t *testing.T) {
 // TestDirentStruct_AllFields tests all Dirent fields serialize correctly
 func TestDirentStruct_AllFields(t *testing.T) {
 	d := Dirent{
-		ID:              "abc123",
-		Name:            "document.pdf",
-		Type:            "file",
-		Size:            2048,
-		MTime:           1234567890,
-		Permission:      "rw",
-		ParentDir:       "/documents",
-		Starred:         true,
-		IsLocked:        true,
-		LockOwner:       "admin@example.com",
-		LockOwnerName:   "Admin User",
-		LockTime:        1234567800,
-		LockedByMe:      false,
-		ModifierEmail:   "user@example.com",
-		ModifierName:    "Test User",
+		ID:            "abc123",
+		Name:          "document.pdf",
+		Type:          "file",
+		Size:          2048,
+		MTime:         1234567890,
+		Permission:    "rw",
+		ParentDir:     "/documents",
+		Starred:       true,
+		IsLocked:      true,
+		LockOwner:     "admin@example.com",
+		LockOwnerName: "Admin User",
+		LockTime:      1234567800,
+		LockedByMe:    false,
+		ModifierEmail: "user@example.com",
+		ModifierName:  "Test User",
 	}
 
 	data, err := json.Marshal(d)
@@ -506,27 +556,27 @@ func TestBatchCopyFiles_FilenameArray(t *testing.T) {
 // TestMoveFileRequest_FilenameTypes tests that filename can be string or array
 func TestMoveFileRequest_FilenameTypes(t *testing.T) {
 	tests := []struct {
-		name         string
-		json         string
-		wantSingle   bool // true if single file, false if batch
+		name          string
+		json          string
+		wantSingle    bool // true if single file, false if batch
 		wantFileCount int
 	}{
 		{
-			name:         "single filename as string",
-			json:         `{"src_dir":"/","dst_dir":"/dest","filename":"file.txt"}`,
-			wantSingle:   true,
+			name:          "single filename as string",
+			json:          `{"src_dir":"/","dst_dir":"/dest","filename":"file.txt"}`,
+			wantSingle:    true,
 			wantFileCount: 1,
 		},
 		{
-			name:         "multiple filenames as array",
-			json:         `{"src_dir":"/","dst_dir":"/dest","filename":["file1.txt","file2.txt","file3.txt"]}`,
-			wantSingle:   false,
+			name:          "multiple filenames as array",
+			json:          `{"src_dir":"/","dst_dir":"/dest","filename":["file1.txt","file2.txt","file3.txt"]}`,
+			wantSingle:    false,
 			wantFileCount: 3,
 		},
 		{
-			name:         "single filename in array",
-			json:         `{"src_dir":"/","dst_dir":"/dest","filename":["file.txt"]}`,
-			wantSingle:   true,
+			name:          "single filename in array",
+			json:          `{"src_dir":"/","dst_dir":"/dest","filename":["file.txt"]}`,
+			wantSingle:    true,
 			wantFileCount: 1,
 		},
 	}
@@ -571,18 +621,18 @@ func TestMoveFileRequest_FilenameTypes(t *testing.T) {
 // TestCopyFileRequest_FilenameTypes tests that filename can be string or array for copy
 func TestCopyFileRequest_FilenameTypes(t *testing.T) {
 	tests := []struct {
-		name         string
-		json         string
+		name          string
+		json          string
 		wantFileCount int
 	}{
 		{
-			name:         "single filename as string",
-			json:         `{"src_dir":"/","dst_dir":"/dest","filename":"file.txt"}`,
+			name:          "single filename as string",
+			json:          `{"src_dir":"/","dst_dir":"/dest","filename":"file.txt"}`,
 			wantFileCount: 1,
 		},
 		{
-			name:         "multiple filenames as array",
-			json:         `{"src_dir":"/","dst_dir":"/dest","filename":["file1.txt","file2.txt","file3.txt","file4.txt"]}`,
+			name:          "multiple filenames as array",
+			json:          `{"src_dir":"/","dst_dir":"/dest","filename":["file1.txt","file2.txt","file3.txt","file4.txt"]}`,
 			wantFileCount: 4,
 		},
 	}

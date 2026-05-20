@@ -2,6 +2,12 @@
 
 This document describes how to set up and test the multi-region storage capabilities of SesameFS.
 
+Use this stack for true region-aware validation: hostname routing, storage-class
+selection, and failover behavior between region-pinned backends. Default
+multi-instance coordinator tests now live in the main `docker compose --profile
+test` flow, which brings up three SesameFS processes against shared Cassandra /
+MinIO state without nginx-based regional routing.
+
 ## Architecture
 
 ```
@@ -161,6 +167,31 @@ Then run:
 ```
 
 ## Focused Integrity Tests
+
+## Default Multi-Instance vs Dedicated Multi-Region
+
+There are now two different multi-node test surfaces, and they serve different
+purposes:
+
+- The main compose `test` profile is the default coordinator-hardening path. It
+  runs `sesamefs`, `sesamefs-node-2`, and `sesamefs-node-3`, exports
+  `SESAMEFS_URL`, `SESAMEFS_URL_2`, and `SESAMEFS_URL_3`, and is where broad
+  multi-instance mutation races should live.
+- The dedicated `docker-compose-multiregion.yaml` stack remains the right place
+  for region-sensitive scenarios: hostname routing through nginx, persisted
+  region/storage-class behavior, and failover between region-pinned backends.
+
+The legacy shell harnesses in `scripts/test-multiregion.sh` and
+`scripts/test-failover.sh` are still useful for connectivity, routing, and
+manual failover drills, but the canonical active-active correctness proofs now
+live in Go integration tests. Treat the shell harness as operational smoke
+coverage, not as the primary regression signal for same-library concurrent
+writes.
+
+For deterministic local validation, only the primary backend in the main
+compose-based multi-instance path should run GC. Secondary test nodes must keep
+`GC_ENABLED=false` so background GC workers do not race queue-reconciliation or
+share-link-expiration tests.
 
 For the current safe slice, the most important backend checks are the Go integration tests
 that verify region-pinned libraries keep reading and writing from the persisted storage

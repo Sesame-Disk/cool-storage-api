@@ -152,3 +152,16 @@ func TestInitialSchemaContainsLookupNameAndStarredIndex(t *testing.T) {
 	assert.Contains(t, content, "storage_class TEXT")
 	assert.NotContains(t, content, "CREATE TABLE IF NOT EXISTS share_links_by_org")
 }
+
+func TestOnlyOfficePendingBlocksMigrationExists(t *testing.T) {
+	raw, err := migrationsFS.ReadFile("migrations/003_onlyoffice_pending_blocks.cql")
+	require.NoError(t, err)
+	content := string(raw)
+
+	assert.Contains(t, content, "CREATE TABLE IF NOT EXISTS onlyoffice_pending_blocks")
+	assert.Contains(t, content, "org_id            UUID")
+	assert.Contains(t, content, "repo_id           UUID")
+	assert.Contains(t, content, "publish_commit_id TEXT")
+	assert.Contains(t, content, "PRIMARY KEY ((org_id), operation_id)")
+	assert.Contains(t, content, "WITH default_time_to_live = 604800")
+}

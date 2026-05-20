@@ -299,10 +299,10 @@ The handler-by-handler approach was chosen over centralizing the logic in `FSHel
 
 Wiring per handler:
 
-1. **CopyFile** ([files.go:2326](internal/api/v2/files.go#L2326)) — captures the replaced entry when `conflict_policy = replace`, computes delta against the source `TargetEntry`, pre-checks before mutating the tree, applies counter delta after `UpdateLibraryHead`.
-2. **copyBatchFiles** ([files.go:2917](internal/api/v2/files.go#L2917)) — same wiring per item in the loop.
-3. **RevertFile** ([files.go:3566](internal/api/v2/files.go#L3566)) — delta uses `oldEntry` from the target commit, subtracts the size of `existingEntry` when replacing.
-4. **RevertDirectory** ([files.go:3711](internal/api/v2/files.go#L3711)) — delta walks both trees (old and replaced) recursively via `fsEntryStats`.
+1. **CopyFile** (`internal/api/v2/files.go`, `CopyFile`) — captures the replaced entry when `conflict_policy = replace`, computes delta against the source `TargetEntry`, pre-checks before mutating the tree, applies counter delta after `UpdateLibraryHead`.
+2. **copyBatchFiles** (`internal/api/v2/files.go`, `copyBatchFiles`) — same wiring per item in the loop.
+3. **RevertFile** (`internal/api/v2/files.go`, `RevertFile`) — delta uses `oldEntry` from the target commit, subtracts the size of `existingEntry` when replacing.
+4. **RevertDirectory** (`internal/api/v2/files.go`, `RevertDirectory`) — delta walks both trees (old and replaced) recursively via `fsEntryStats`.
 5. **RestoreTrashItem** ([trash.go:329](internal/api/v2/trash.go#L329)) — pre-checks the visible delta; counter delta replaces the previous fire-and-forget `IncrementStorageCounters`.
 6. **RevertDirents** ([trash.go:656](internal/api/v2/trash.go#L656)) — per-item pre-check; items exceeding quota fall into `failedItems` so the batch returns partial success instead of a hard error.
 7. **OnlyOffice `saveEditedDocument`** ([onlyoffice.go:831](internal/api/v2/onlyoffice.go#L831)) — pre-check moved before the S3 `PutBlockData` so we never store bytes that would be rejected. The traversal previously done late in the function is reused.
@@ -1019,7 +1019,7 @@ Added `getEffectiveHostname(c *gin.Context) string` helper in `server.go` for th
 **Was**: File history page showed duplicate records (e.g., 18 identical entries for a file modified only twice). Same timestamp, same size, same modifier for most entries.
 **Root Cause**: `GetFileHistoryV21` iterated all commits for the library and included a history entry for every commit where the file existed — even if the file content was unchanged (e.g., another file in the library was modified).
 **Fix**: After collecting all commits containing the file, deduplicate by `RevFileID` (fs_id). Only include an entry when the file's fs_id changes compared to the previous commit, indicating the file was actually modified.
-**File**: `internal/api/v2/files.go:3244-3305`
+**File**: `internal/api/v2/files.go` (`GetFileHistoryV21`)
 
 ---
 
@@ -2508,6 +2508,93 @@ Fully implemented in `frontend/src/pages/sys-admin/orgs/orgs-content.js`, `orgs.
 - Separate Deactivate, Delete, Reactivate, and Restore actions with confirmation dialogs
 - Status filter support in org listing
 - Search results also support all lifecycle actions
+
+---
+
+## Multiregion HEAD Safety — Confirmed Issues (2026-05-18)
+
+The following items were surfaced during the `feat/multiregion-head-safety` audit cycle and verified against current code. The first three are real but bounded issues; none is reachable through the standard happy-path flows. The OnlyOffice entry is retained as an audit correction so the same concern does not get re-filed as a confirmed leak.
+
+### ISSUE-MOVE-CYCLE-STATUS-01: Cycle-prevention error surfaces as HTTP 500
+
+**Status**: 🟡 Confirmed bug — wrong status code, correct behavior otherwise
+**Date identified**: 2026-05-18
+
+`internal/api/v2/batch_operations.go:810` rejects moving a directory into itself or into a descendant by returning `fmt.Errorf("cannot move directory into itself")`. This error is constructed inline and is not bound to any sentinel, so `batchOperationErrorResponse` falls through to its default branch and returns HTTP 500 with message `"failed to move <name>"`.
+
+A client cannot distinguish a logic error (their request was invalid) from a server-side problem (database down, etc.).
+
+**Evidence**:
+- Sentinel error definitions (`ErrBatchSourceNotFound`, `ErrBatchDestinationNotFound`, `ErrStorageQuotaExceeded`, `ErrLibraryHeadConflict`, `ConflictError`) at `internal/api/v2/batch_operations.go:48-58`, `fs_helpers.go:26-31` — none of them covers cycle prevention.
+- Error mapping in `batchOperationErrorResponse` (`batch_operations.go:135-160`) and `writeMoveFileError` (`files.go:2122-2143`) — both fall through to 500.
+
+**Fix**:
+- Add `var ErrBatchInvalidMove = errors.New("invalid move")` (or similar) at `batch_operations.go`.
+- Replace the inline `fmt.Errorf` at line 810 with `fmt.Errorf("%w: cannot move directory into itself", ErrBatchInvalidMove)`.
+- Add a case in `batchOperationErrorResponse` and `writeMoveFileError` that maps it to `http.StatusBadRequest`.
+
+Integration tests in `internal/integration/same_repo_move_test.go` only assert `status != 200` for the cycle and descendant-cycle cases, so they will continue to pass after the fix but should be tightened to assert `status == 400`.
+
+---
+
+### ISSUE-LIB-NOT-FOUND-STATUS-01: "source library not found" returns HTTP 500 instead of 404
+
+**Status**: 🟡 Confirmed bug — wrong status code
+**Date identified**: 2026-05-18
+
+`internal/api/v2/batch_operations.go:450, 485, 798` all wrap library-lookup failures as `fmt.Errorf("source library not found: %w", err)` without a sentinel. `batchOperationErrorResponse` cannot match it and falls through to HTTP 500.
+
+A client passing an invalid `src_repo_id` (typo, deleted library) receives 500 instead of the appropriate 404.
+
+**Fix**:
+- Add `var ErrBatchLibraryNotFound = errors.New("library not found")` at `batch_operations.go`.
+- Wrap the three call sites with the sentinel.
+- Add a case in `batchOperationErrorResponse` that maps it to `http.StatusNotFound`.
+
+---
+
+### ISSUE-CLEANUP-TAGS-PREFIX-DANGER-01: `CleanupFileTagsByPrefix("/")` would wipe all repo tags
+
+**Status**: 🟡 Latent bug — not reachable today, but unguarded
+**Date identified**: 2026-05-18
+
+`internal/api/v2/tags.go:601-604`:
+```go
+prefixSlash := prefix + "/"
+if prefix == "/" {
+    prefixSlash = "/"
+}
+```
+
+With `prefix == "/"` (after `normalizePath`), `prefixSlash` becomes `"/"`. The scan loop at `:612-616` then matches every absolute path in the repo with `strings.HasPrefix(filePath, "/")` and queues every tag for deletion.
+
+Current call sites (`batch_operations.go:101, 656, 901`) always derive the prefix from `path.Join(dstDir, itemName)` where `itemName != ""`, so the prefix is never `"/"`. The bug is one careless future caller away.
+
+**Fix**:
+```go
+prefix = normalizePath(prefix)
+if prefix == "" || prefix == "/" {
+    return  // refuse to nuke the whole repo
+}
+CleanupFileTagsByPath(database, repoID, prefix)
+// ...
+```
+
+---
+
+### AUDIT-CORRECTION-ONLYOFFICE-MAPPING-01: OnlyOffice rollback mappings are cleaned by GC
+
+**Status**: ✅ Audit correction — no confirmed mapping leak
+**Date identified**: 2026-05-18
+
+When `saveEditedDocument` rolls back a materialized block after a publish failure, it calls `DecrementBlockRefCountsOnce` + `enqueueZeroRefBlocks`. The mapping rows are inserted before rollback, but the GC worker cascades mapping cleanup when it processes the zero-ref internal block.
+
+There is still ordinary async-cleanup risk if the enqueue or GC worker path is unavailable, but that is covered by the fire-and-forget cleanup debt in `TECHNICAL-DEBT.md`; it is not a separate confirmed OnlyOffice mapping leak.
+
+**Evidence**:
+- OnlyOffice rollback path: `internal/api/v2/onlyoffice.go` calls `DecrementBlockRefCountsOnce` and `enqueueZeroRefBlocks` after metadata publish failure.
+- GC worker block deletion: `internal/gc/worker.go` calls `ListBlockMappingsByInternalID` for the deleted internal block and then `DeleteBlockMapping` for each external mapping.
+- Cassandra store cleanup: `DeleteBlockMapping` deletes both `block_id_mappings` and `block_id_mappings_by_internal`.
 
 ---
 

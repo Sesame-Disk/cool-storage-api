@@ -83,3 +83,5 @@ mobile-frontend/yarn-error.log*
 devspace.yaml
 .claude-task
 .claude/
+
+.gocache/

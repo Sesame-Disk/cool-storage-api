@@ -50,6 +50,10 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+    # Direct host port so integration tests can hit each region without going
+    # through the LB. Override the host port with SESAMEFS_USA_HOST_PORT.
+    ports:
+      - "${SESAMEFS_USA_HOST_PORT:-3000}:8080"
     environment:
       - PORT=${PORT:-8080}
       - SERVER_REGION=usa
@@ -62,6 +66,8 @@ services:
     depends_on:
       cassandra:
         condition: service_healthy
+      cassandra-bootstrap:
+        condition: service_completed_successfully
       minio-init:
         condition: service_completed_successfully
     volumes:
@@ -79,6 +85,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+    ports:
+      - "${SESAMEFS_EU_HOST_PORT:-4001}:8080"
     environment:
       - PORT=${PORT:-8080}
       - SERVER_REGION=eu
@@ -91,6 +99,8 @@ services:
     depends_on:
       cassandra:
         condition: service_healthy
+      cassandra-bootstrap:
+        condition: service_completed_successfully
       minio-init:
         condition: service_completed_successfully
     volumes:
@@ -195,6 +205,36 @@ services:
       retries: 10
       start_period: 60s
     restart: unless-stopped
+
+  # Initialize the shared keyspace before either region server boots. The app
+  # runs migrations on startup, but it still requires the keyspace to exist.
+  cassandra-bootstrap:
+    image: cassandra:5.0
+    depends_on:
+      cassandra:
+        condition: service_healthy
+    entrypoint:
+      - /bin/bash
+      - -ec
+    command:
+      - |
+        set -euo pipefail
+        keyspace="$${CASSANDRA_KEYSPACE:-sesamefs}"
+        local_dc="$${CASSANDRA_DC:-$${CASSANDRA_LOCAL_DC:-datacenter1}}"
+
+        case "$${keyspace}" in
+          [A-Za-z][A-Za-z0-9_]*) ;;
+          *) echo "Invalid Cassandra keyspace identifier: $${keyspace}" >&2; exit 1 ;;
+        esac
+
+        replication="{'class': 'NetworkTopologyStrategy', '$${local_dc}': 1}"
+        cqlsh cassandra -e "CREATE KEYSPACE IF NOT EXISTS $${keyspace} WITH replication = $${replication};"
+        cqlsh cassandra -e "ALTER KEYSPACE $${keyspace} WITH replication = $${replication};"
+    environment:
+      - CASSANDRA_KEYSPACE=${CASSANDRA_KEYSPACE:-sesamefs}
+      - CASSANDRA_DC=${CASSANDRA_DC:-datacenter1}
+      - CASSANDRA_LOCAL_DC=${CASSANDRA_LOCAL_DC:-datacenter1}
+    restart: "no"
 
 volumes:
   cassandra_multiregion_data:

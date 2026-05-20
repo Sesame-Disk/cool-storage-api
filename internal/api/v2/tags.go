@@ -583,6 +583,48 @@ func CleanupFileTagsByPath(database *db.DB, repoID, filePath string) {
 	iter.Close()
 }
 
+// CleanupFileTagsByPrefix removes tag associations for a directory path and all
+// descendant file paths under that prefix.
+func CleanupFileTagsByPrefix(database *db.DB, repoID, prefix string) {
+	if database == nil {
+		return
+	}
+
+	repoUUID, err := gocql.ParseUUID(repoID)
+	if err != nil {
+		return
+	}
+
+	prefix = normalizePath(prefix)
+	CleanupFileTagsByPath(database, repoID, prefix)
+
+	prefixSlash := prefix + "/"
+	if prefix == "/" {
+		prefixSlash = "/"
+	}
+
+	iter := database.Session().Query(`
+		SELECT file_path FROM file_tags WHERE repo_id = ?
+	`, repoUUID).Iter()
+
+	var filePath string
+	var pathsToCleanup []string
+	for iter.Scan(&filePath) {
+		if strings.HasPrefix(filePath, prefixSlash) {
+			pathsToCleanup = append(pathsToCleanup, filePath)
+		}
+	}
+	iter.Close()
+
+	for _, pathToCleanup := range pathsToCleanup {
+		CleanupFileTagsByPath(database, repoID, pathToCleanup)
+	}
+
+	if len(pathsToCleanup) > 0 {
+		log.Printf("[CleanupFileTagsByPrefix] Cleaned tags for %d descendants under %q in repo %s", len(pathsToCleanup), prefix, repoID)
+	}
+}
+
 // MoveFileTagsByPath moves all tag associations from oldPath to newPath.
 // Used when a file is renamed — tags are preserved under the new path.
 func MoveFileTagsByPath(database *db.DB, repoID, oldPath, newPath string) {
@@ -621,12 +663,12 @@ func MoveFileTagsByPath(database *db.DB, repoID, oldPath, newPath string) {
 			continue
 		}
 
-		// Delete old entries
+		// Delete old path row. file_tags_by_id is keyed by file_tag_id, so the
+		// INSERT above updates that lookup in place; deleting it here would erase
+		// the moved tag's remove-by-id path.
 		batch := database.Session().Batch(gocql.LoggedBatch)
 		batch.Query(`DELETE FROM file_tags WHERE repo_id = ? AND file_path = ? AND tag_id = ?`,
 			repoUUID, oldPath, tagID)
-		batch.Query(`DELETE FROM file_tags_by_id WHERE repo_id = ? AND file_tag_id = ?`,
-			repoUUID, fileTagID)
 		if err := batch.Exec(); err != nil {
 			log.Printf("[MoveFileTagsByPath] failed to delete old tag rows for repo %s old_path %q tag %d: %v", repoID, oldPath, tagID, err)
 		}

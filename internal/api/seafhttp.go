@@ -1235,14 +1235,22 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 
 	// Register block metadata for size lookups (used by video/audio Range requests)
 	if err := v2.NewFSHelper(h.db).IncrementOrCreateBlock(token.OrgID, sha256ID, len(storedContent), actualStorageClass, ""); err != nil {
-		log.Printf("[HandleUpload] WARNING: Failed to write block metadata org=%s block=%s: %v", token.OrgID, sha256ID[:16], err)
+		log.Printf("[HandleUpload] CRITICAL: Failed to write block metadata org=%s block=%s: %v", token.OrgID, sha256ID[:16], err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to store block metadata"})
+		return
 	}
 
 	// Update filesystem metadata
-	commitID, actualFilename, err := h.commitUploadedFile(token.OrgID, token.RepoID, token.UserID, parentDir, filename, fileID, chunkData, finalSize, replaceFile)
+	commitID, actualFilename, storageDeltaBytes, storageDeltaFiles, err := h.commitUploadedFile(token.OrgID, token.RepoID, token.UserID, parentDir, filename, fileID, chunkData, finalSize, replaceFile)
 	if err != nil {
 		log.Printf("[HandleUpload] Failed to update filesystem: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "file stored but metadata update failed"})
+		status := http.StatusInternalServerError
+		msg := "file stored but metadata update failed"
+		if errors.Is(err, errStorageQuotaExceeded) {
+			status = http.StatusForbidden
+			msg = "storage quota exceeded"
+		}
+		c.JSON(status, gin.H{"error": msg})
 		return
 	}
 	log.Printf("[HandleUpload] Filesystem updated, commit=%s", commitID)
@@ -1273,6 +1281,10 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 }
 
 var errStorageQuotaExceeded = errors.New("storage quota exceeded")
+
+// Upload-finalize retries share v2.RetryBackoff for the per-attempt delay
+// (exponential with jitter, capped). Only the attempt count is local.
+const uploadMetadataRetryAttempts = 20
 
 func (h *SeafHTTPHandler) checkUploadStorageQuotaForCurrentHead(orgID, repoID, userID, parentDir, filename string, fileSize int64, replace bool) (int64, int64, error) {
 	deltaBytes, deltaFiles, err := h.uploadStorageDeltaForCurrentHead(orgID, repoID, parentDir, filename, fileSize, replace)
@@ -1403,8 +1415,7 @@ func entrySize(entry map[string]interface{}) int64 {
 func (h *SeafHTTPHandler) finalizeUploadStreaming(c *gin.Context, token *AccessToken, upload *ChunkUpload, parentDir, filename, storageKey string, totalSize int64, replace bool) (string, string, int64, int64, error) {
 	ctx := context.Background()
 
-	storageDeltaBytes, storageDeltaFiles, err := h.checkUploadStorageQuotaForCurrentHead(token.OrgID, token.RepoID, token.UserID, parentDir, filename, totalSize, replace)
-	if err != nil {
+	if _, _, err := h.checkUploadStorageQuotaForCurrentHead(token.OrgID, token.RepoID, token.UserID, parentDir, filename, totalSize, replace); err != nil {
 		return "", "", 0, 0, err
 	}
 
@@ -1532,7 +1543,8 @@ readLoop:
 			if blkErr := upload.AccountBlockOnce(blockIndexLocal, sha256ID, func() error {
 				return fsHelper.IncrementOrCreateBlock(token.OrgID, sha256ID, len(storedBlock), actualStorageClass, "")
 			}); blkErr != nil {
-				log.Printf("[finalizeUploadStreaming] WARNING: Failed to write block metadata org=%s block=%s: %v", token.OrgID, sha256ID[:16], blkErr)
+				log.Printf("[finalizeUploadStreaming] CRITICAL: Failed to write block metadata org=%s block=%s: %v", token.OrgID, sha256ID[:16], blkErr)
+				return fmt.Errorf("failed to store block metadata: %w", blkErr)
 			}
 
 			upload.Touch()
@@ -1553,8 +1565,7 @@ readLoop:
 
 	log.Printf("[finalizeUploadStreaming] Stored %d blocks for file %s (size=%d, parallelism=%d)", len(blockSHA1IDs), fileID[:16], totalSize, finalizeUploadConcurrency)
 
-	// Update filesystem metadata with multiple block IDs
-	commitID, actualFilename, err := h.commitUploadedFileMultiBlock(token.OrgID, token.RepoID, token.UserID, parentDir, filename, fileID, blockSHA1IDs, totalSize, replace)
+	commitID, actualFilename, storageDeltaBytes, storageDeltaFiles, err := h.commitUploadedFileMultiBlock(token.OrgID, token.RepoID, token.UserID, parentDir, filename, fileID, blockSHA1IDs, totalSize, replace)
 	if err != nil {
 		return "", "", 0, 0, fmt.Errorf("failed to update filesystem metadata: %w", err)
 	}
@@ -1565,28 +1576,55 @@ readLoop:
 
 // commitUploadedFileMultiBlock is like commitUploadedFile but supports multiple block IDs.
 // Used for large files that are split into multiple blocks during upload.
-// Returns the commit ID, the actual filename used (may differ if auto-renamed), and any error.
-func (h *SeafHTTPHandler) commitUploadedFileMultiBlock(orgID, repoID, userID, parentDir, filename, fileID string, blockIDs []string, fileSize int64, replace bool) (string, string, error) {
-	var headCommitID string
-	err := h.db.Session().Query(`
-		SELECT head_commit_id FROM libraries WHERE org_id = ? AND library_id = ?
-	`, orgID, repoID).Scan(&headCommitID)
-	if err != nil {
-		return "", "", fmt.Errorf("failed to get head commit: %w", err)
+// Returns the commit ID, the actual filename used (may differ if auto-renamed),
+// and the storage delta from the winning publish attempt.
+func (h *SeafHTTPHandler) commitUploadedFileMultiBlock(orgID, repoID, userID, parentDir, filename, fileID string, blockIDs []string, fileSize int64, replace bool) (string, string, int64, int64, error) {
+	var lastConflict error
+	for attempt := 1; attempt <= uploadMetadataRetryAttempts; attempt++ {
+		commitID, actualFilename, storageDeltaBytes, storageDeltaFiles, err := h.commitUploadedFileMultiBlockOnce(orgID, repoID, userID, parentDir, filename, fileID, blockIDs, fileSize, replace)
+		if err == nil {
+			return commitID, actualFilename, storageDeltaBytes, storageDeltaFiles, nil
+		}
+		if !errors.Is(err, v2.ErrLibraryHeadConflict) {
+			return "", "", 0, 0, err
+		}
+		lastConflict = err
+		if attempt == uploadMetadataRetryAttempts {
+			break
+		}
+		sleepFor := v2.RetryBackoff(attempt)
+		log.Printf("[commitUploadedFileMultiBlock] Retrying metadata publish for repo=%s after head conflict (%d/%d), sleeping %s", repoID, attempt, uploadMetadataRetryAttempts, sleepFor)
+		time.Sleep(sleepFor)
 	}
 
-	var rootFSID string
-	err = h.db.Session().Query(`
-		SELECT root_fs_id FROM commits WHERE library_id = ? AND commit_id = ?
-	`, repoID, headCommitID).Scan(&rootFSID)
+	log.Printf("[commitUploadedFileMultiBlock] Exhausted metadata retries for repo=%s: %v", repoID, lastConflict)
+	return "", "", 0, 0, fmt.Errorf("failed to finalize upload metadata after %d attempts", uploadMetadataRetryAttempts)
+}
+
+func (h *SeafHTTPHandler) commitUploadedFileMultiBlockOnce(orgID, repoID, userID, parentDir, filename, fileID string, blockIDs []string, fileSize int64, replace bool) (string, string, int64, int64, error) {
+	// Single consistent snapshot: head_commit_id + root_fs_id read together so
+	// the quota delta, tree traversal, and CAS compare all use the same HEAD.
+	fsHelper := v2.NewFSHelper(h.db)
+	snapshot, err := fsHelper.GetLibraryHeadSnapshot(repoID)
 	if err != nil {
-		return "", "", fmt.Errorf("failed to get root fs_id: %w", err)
+		return "", "", 0, 0, fmt.Errorf("failed to get library head: %w", err)
+	}
+
+	storageDeltaBytes, storageDeltaFiles, err := h.uploadStorageDeltaForRoot(repoID, snapshot.RootFSID, parentDir, filename, fileSize, replace)
+	if err != nil {
+		return "", "", 0, 0, fmt.Errorf("failed to compute storage delta: %w", err)
+	}
+	if storageDeltaBytes > 0 {
+		if checker := getAPIQuotaChecker(); checker != nil {
+			if st, _ := checker.CheckStorageQuota(orgID, userID, storageDeltaBytes); !st.Allowed {
+				return "", "", 0, 0, errStorageQuotaExceeded
+			}
+		}
 	}
 
 	log.Printf("[commitUploadedFileMultiBlock] headCommit=%s, rootFSID=%s, parentDir=%s, filename=%s, blocks=%d",
-		headCommitID, rootFSID, parentDir, filename, len(blockIDs))
+		snapshot.HeadCommitID, snapshot.RootFSID, parentDir, filename, len(blockIDs))
 
-	// Seafile format: {"block_ids":[...],"size":N,"type":1,"version":1}
 	fsContent := map[string]interface{}{
 		"version":   1,
 		"type":      1,
@@ -1595,18 +1633,16 @@ func (h *SeafHTTPHandler) commitUploadedFileMultiBlock(orgID, repoID, userID, pa
 	}
 	fsContentJSON, err := json.Marshal(fsContent)
 	if err != nil {
-		return "", "", fmt.Errorf("failed to marshal fs content: %w", err)
+		return "", "", 0, 0, fmt.Errorf("failed to marshal fs content: %w", err)
 	}
 	fsHash := sha1.Sum(fsContentJSON)
 	fileFSID := hex.EncodeToString(fsHash[:])
 
-	// Add file to directory (may auto-rename if replace=false and file exists)
-	newRootFSID, actualFilename, err := h.addFileToDirectory(repoID, rootFSID, parentDir, filename, fileFSID, fileSize, userID, replace)
+	newRootFSID, actualFilename, err := h.addFileToDirectory(repoID, snapshot.RootFSID, parentDir, filename, fileFSID, fileSize, userID, replace)
 	if err != nil {
-		return "", "", fmt.Errorf("failed to add file to directory: %w", err)
+		return "", "", 0, 0, fmt.Errorf("failed to add file to directory: %w", err)
 	}
 
-	// Compute full path using actual filename (may have been auto-renamed)
 	var fullPath string
 	if parentDir == "/" {
 		fullPath = "/" + actualFilename
@@ -1619,7 +1655,7 @@ func (h *SeafHTTPHandler) commitUploadedFileMultiBlock(orgID, repoID, userID, pa
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 	`, repoID, fileFSID, "file", actualFilename, fullPath, fileSize, time.Now().Unix(), blockIDs).Exec()
 	if err != nil {
-		return "", "", fmt.Errorf("failed to create file fs_object: %w", err)
+		return "", "", 0, 0, fmt.Errorf("failed to create file fs_object: %w", err)
 	}
 
 	description := fmt.Sprintf("Added or modified \"%s\".\n", actualFilename)
@@ -1630,74 +1666,91 @@ func (h *SeafHTTPHandler) commitUploadedFileMultiBlock(orgID, repoID, userID, pa
 	err = h.db.Session().Query(`
 		INSERT INTO commits (library_id, commit_id, parent_id, root_fs_id, creator_id, description, created_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?)
-	`, repoID, newCommitID, headCommitID, newRootFSID, userID, description, time.Now()).Exec()
+	`, repoID, newCommitID, snapshot.HeadCommitID, newRootFSID, userID, description, time.Now()).Exec()
 	if err != nil {
-		return "", "", fmt.Errorf("failed to create commit: %w", err)
+		return "", "", 0, 0, fmt.Errorf("failed to create commit: %w", err)
 	}
 
-	fsHelper := v2.NewFSHelper(h.db)
-	if err := fsHelper.UpdateLibraryHead(orgID, repoID, newCommitID); err != nil {
-		log.Printf("[commitUploadedFileMultiBlock] Warning: failed to update library head: %v", err)
+	if err := fsHelper.UpdateLibraryHeadFromSnapshot(snapshot, repoID, newCommitID, snapshot.HeadCommitID); err != nil {
+		return "", "", 0, 0, fmt.Errorf("failed to update library head: %w", err)
 	}
 
 	log.Printf("[commitUploadedFileMultiBlock] Created commit %s with root %s", newCommitID, newRootFSID)
-	return newCommitID, actualFilename, nil
+	return newCommitID, actualFilename, storageDeltaBytes, storageDeltaFiles, nil
 }
 
 // commitUploadedFile updates the filesystem metadata after a file upload.
 // When replace is false and a file with the same name exists, it auto-renames to "name (1).ext".
-// Returns the commit ID, the actual filename used (may differ if auto-renamed), and any error.
-func (h *SeafHTTPHandler) commitUploadedFile(orgID, repoID, userID, parentDir, filename, fileID string, content []byte, fileSize int64, replace bool) (string, string, error) {
-	// Get current head commit
-	var headCommitID string
-	err := h.db.Session().Query(`
-		SELECT head_commit_id FROM libraries WHERE org_id = ? AND library_id = ?
-	`, orgID, repoID).Scan(&headCommitID)
-	if err != nil {
-		return "", "", fmt.Errorf("failed to get head commit: %w", err)
+// Returns the commit ID, the actual filename used (may differ if auto-renamed),
+// and the storage delta from the winning publish attempt.
+func (h *SeafHTTPHandler) commitUploadedFile(orgID, repoID, userID, parentDir, filename, fileID string, content []byte, fileSize int64, replace bool) (string, string, int64, int64, error) {
+	var lastConflict error
+	for attempt := 1; attempt <= uploadMetadataRetryAttempts; attempt++ {
+		commitID, actualFilename, storageDeltaBytes, storageDeltaFiles, err := h.commitUploadedFileOnce(orgID, repoID, userID, parentDir, filename, fileID, content, fileSize, replace)
+		if err == nil {
+			return commitID, actualFilename, storageDeltaBytes, storageDeltaFiles, nil
+		}
+		if !errors.Is(err, v2.ErrLibraryHeadConflict) {
+			return "", "", 0, 0, err
+		}
+		lastConflict = err
+		if attempt == uploadMetadataRetryAttempts {
+			break
+		}
+		sleepFor := v2.RetryBackoff(attempt)
+		log.Printf("[commitUploadedFile] Retrying metadata publish for repo=%s after head conflict (%d/%d), sleeping %s", repoID, attempt, uploadMetadataRetryAttempts, sleepFor)
+		time.Sleep(sleepFor)
 	}
 
-	// Get root fs_id from head commit
-	var rootFSID string
-	err = h.db.Session().Query(`
-		SELECT root_fs_id FROM commits WHERE library_id = ? AND commit_id = ?
-	`, repoID, headCommitID).Scan(&rootFSID)
+	log.Printf("[commitUploadedFile] Exhausted metadata retries for repo=%s: %v", repoID, lastConflict)
+	return "", "", 0, 0, fmt.Errorf("failed to finalize upload metadata after %d attempts", uploadMetadataRetryAttempts)
+}
+
+func (h *SeafHTTPHandler) commitUploadedFileOnce(orgID, repoID, userID, parentDir, filename, fileID string, content []byte, fileSize int64, replace bool) (string, string, int64, int64, error) {
+	// Single consistent snapshot: head_commit_id + root_fs_id read together so
+	// the quota delta, tree traversal, and CAS compare all use the same HEAD.
+	fsHelper := v2.NewFSHelper(h.db)
+	snapshot, err := fsHelper.GetLibraryHeadSnapshot(repoID)
 	if err != nil {
-		return "", "", fmt.Errorf("failed to get root fs_id: %w", err)
+		return "", "", 0, 0, fmt.Errorf("failed to get library head: %w", err)
+	}
+
+	storageDeltaBytes, storageDeltaFiles, err := h.uploadStorageDeltaForRoot(repoID, snapshot.RootFSID, parentDir, filename, fileSize, replace)
+	if err != nil {
+		return "", "", 0, 0, fmt.Errorf("failed to compute storage delta: %w", err)
+	}
+	if storageDeltaBytes > 0 {
+		if checker := getAPIQuotaChecker(); checker != nil {
+			if st, _ := checker.CheckStorageQuota(orgID, userID, storageDeltaBytes); !st.Allowed {
+				return "", "", 0, 0, errStorageQuotaExceeded
+			}
+		}
 	}
 
 	log.Printf("[commitUploadedFile] headCommit=%s, rootFSID=%s, parentDir=%s, filename=%s",
-		headCommitID, rootFSID, parentDir, filename)
+		snapshot.HeadCommitID, snapshot.RootFSID, parentDir, filename)
 
-	// Create fs_object for the file (single block for now)
-	// The block_id is the SHA-1 of the PLAINTEXT content (for Seafile client compatibility)
-	blockID := fileID // Use the file content hash as block ID
-
-	// CRITICAL: fs_id must be SHA-1 of the fs_object JSON content (not file content)
-	// This is how Seafile verifies fs_object integrity in pack-fs
-	// Seafile format: {"block_ids":["..."],"size":N,"type":1,"version":1} (alphabetical keys)
+	blockID := fileID
 	fsContent := map[string]interface{}{
 		"version":   1,
-		"type":      1, // SEAF_METADATA_TYPE_FILE
+		"type":      1,
 		"block_ids": []string{blockID},
 		"size":      fileSize,
 	}
 	fsContentJSON, err := json.Marshal(fsContent)
 	if err != nil {
-		return "", "", fmt.Errorf("failed to marshal fs content: %w", err)
+		return "", "", 0, 0, fmt.Errorf("failed to marshal fs content: %w", err)
 	}
 	fsHash := sha1.Sum(fsContentJSON)
 	fileFSID := hex.EncodeToString(fsHash[:])
 
 	log.Printf("[commitUploadedFile] File fs_id computed: %s (from JSON: %s)", fileFSID, string(fsContentJSON))
 
-	// Navigate to parent directory and add file (may auto-rename if replace=false)
-	newRootFSID, actualFilename, err := h.addFileToDirectory(repoID, rootFSID, parentDir, filename, fileFSID, fileSize, userID, replace)
+	newRootFSID, actualFilename, err := h.addFileToDirectory(repoID, snapshot.RootFSID, parentDir, filename, fileFSID, fileSize, userID, replace)
 	if err != nil {
-		return "", "", fmt.Errorf("failed to add file to directory: %w", err)
+		return "", "", 0, 0, fmt.Errorf("failed to add file to directory: %w", err)
 	}
 
-	// Compute full path for search indexing (use actual filename which may have been auto-renamed)
 	var fullPath string
 	if parentDir == "/" {
 		fullPath = "/" + actualFilename
@@ -1705,17 +1758,15 @@ func (h *SeafHTTPHandler) commitUploadedFile(orgID, repoID, userID, parentDir, f
 		fullPath = parentDir + "/" + actualFilename
 	}
 
-	// Store file fs_object with correct fs_id and full_path
 	err = h.db.Session().Query(`
 		INSERT INTO fs_objects (library_id, fs_id, obj_type, obj_name, full_path, size_bytes, mtime, block_ids)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 	`, repoID, fileFSID, "file", actualFilename, fullPath, fileSize, time.Now().Unix(), []string{blockID}).Exec()
 	if err != nil {
-		return "", "", fmt.Errorf("failed to create file fs_object: %w", err)
+		return "", "", 0, 0, fmt.Errorf("failed to create file fs_object: %w", err)
 	}
 	log.Printf("[commitUploadedFile] Created file fs_object: %s at %s", fileFSID, fullPath)
 
-	// Create new commit
 	description := fmt.Sprintf("Added or modified \"%s\".\n", actualFilename)
 	commitData := fmt.Sprintf("%s:%s:%s:%d", repoID, newRootFSID, description, time.Now().UnixNano())
 	commitHash := sha1.Sum([]byte(commitData))
@@ -1724,21 +1775,17 @@ func (h *SeafHTTPHandler) commitUploadedFile(orgID, repoID, userID, parentDir, f
 	err = h.db.Session().Query(`
 		INSERT INTO commits (library_id, commit_id, parent_id, root_fs_id, creator_id, description, created_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?)
-	`, repoID, newCommitID, headCommitID, newRootFSID, userID, description, time.Now()).Exec()
+	`, repoID, newCommitID, snapshot.HeadCommitID, newRootFSID, userID, description, time.Now()).Exec()
 	if err != nil {
-		return "", "", fmt.Errorf("failed to create commit: %w", err)
+		return "", "", 0, 0, fmt.Errorf("failed to create commit: %w", err)
 	}
 
-	// Update library head, size, and file count via FSHelper
-	// CRITICAL: Both tables must be updated for consistency
-	// GetRootFSID reads from libraries_by_id, so it must have the latest head_commit_id
-	fsHelper := v2.NewFSHelper(h.db)
-	if err := fsHelper.UpdateLibraryHead(orgID, repoID, newCommitID); err != nil {
-		return "", "", fmt.Errorf("failed to update library head: %w", err)
+	if err := fsHelper.UpdateLibraryHeadFromSnapshot(snapshot, repoID, newCommitID, snapshot.HeadCommitID); err != nil {
+		return "", "", 0, 0, fmt.Errorf("failed to update library head: %w", err)
 	}
 
 	log.Printf("[commitUploadedFile] Created commit %s with root %s", newCommitID, newRootFSID)
-	return newCommitID, actualFilename, nil
+	return newCommitID, actualFilename, storageDeltaBytes, storageDeltaFiles, nil
 }
 
 // addFileToDirectory adds a file entry to a directory, creating parent directories as needed.

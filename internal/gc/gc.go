@@ -305,6 +305,15 @@ func (s *Service) TriggerScanner() {
 	}
 }
 
+// SetOnlyOfficeReconciler wires the OnlyOffice pending-blocks reconciler into
+// the scanner. Called from the API layer after the OnlyOffice handler exists.
+func (s *Service) SetOnlyOfficeReconciler(r OnlyOfficeReconciler) {
+	if s == nil || s.scanner == nil {
+		return
+	}
+	s.scanner.SetOnlyOfficeReconciler(r)
+}
+
 // Status returns the current GC status for the admin API.
 func (s *Service) Status() GCStatus {
 	queueSize := s.loadStatInt(gcStatKeyTotalQueue)

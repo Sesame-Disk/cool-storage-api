@@ -2,6 +2,8 @@ package v2
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -9,6 +11,7 @@ import (
 
 	"github.com/Sesame-Disk/sesamefs/internal/config"
 	"github.com/Sesame-Disk/sesamefs/internal/storage"
+	gocql "github.com/apache/cassandra-gocql-driver/v2"
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
 )
@@ -508,6 +511,126 @@ func TestOnlyOfficeStorageDeltaTreatsExistingEmptyFileAsReplacement(t *testing.T
 	}
 	if filesDelta != 1 {
 		t.Fatalf("filesDelta for new file = %d, want 1", filesDelta)
+	}
+}
+
+func TestShouldRollbackOnlyOfficeMaterializedBlock(t *testing.T) {
+	tests := []struct {
+		name                    string
+		blockMetadataRegistered bool
+		publishErr              error
+		want                    bool
+	}{
+		{name: "registered block and publish failure", blockMetadataRegistered: true, publishErr: errors.New("boom"), want: true},
+		{name: "registered block and no error", blockMetadataRegistered: true, want: false},
+		{name: "unregistered block and publish failure", blockMetadataRegistered: false, publishErr: errors.New("boom"), want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := shouldRollbackOnlyOfficeMaterializedBlock(tt.blockMetadataRegistered, tt.publishErr); got != tt.want {
+				t.Fatalf("shouldRollbackOnlyOfficeMaterializedBlock() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestOnlyOfficeRollbackOperationKey(t *testing.T) {
+	got := onlyOfficeRollbackOperationKey("  rollback-123  ")
+	want := "onlyoffice-publish-failed:rollback-123"
+	if got != want {
+		t.Fatalf("onlyOfficeRollbackOperationKey() = %q, want %q", got, want)
+	}
+}
+
+func TestOnlyOfficeCommitReachable(t *testing.T) {
+	tests := []struct {
+		name    string
+		target  string
+		head    string
+		parents map[string]string
+		want    bool
+		wantErr bool
+	}{
+		{
+			name:   "head commit is reachable",
+			target: "c3",
+			head:   "c3",
+			want:   true,
+		},
+		{
+			name:   "ancestor commit is reachable",
+			target: "c1",
+			head:   "c3",
+			parents: map[string]string{
+				"c3": "c2",
+				"c2": "c1",
+				"c1": "",
+			},
+			want: true,
+		},
+		{
+			name:   "missing commit is not reachable",
+			target: "missing",
+			head:   "c3",
+			parents: map[string]string{
+				"c3": "c2",
+				"c2": "c1",
+				"c1": "",
+			},
+			want: false,
+		},
+		{
+			name:   "cycle returns error",
+			target: "c1",
+			head:   "c3",
+			parents: map[string]string{
+				"c3": "c2",
+				"c2": "c3",
+			},
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := onlyOfficeCommitReachable(tt.target, tt.head, func(commitID string) (string, error) {
+				return tt.parents[commitID], nil
+			})
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("onlyOfficeCommitReachable() error = nil, want non-nil")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("onlyOfficeCommitReachable() error = %v", err)
+			}
+			if got != tt.want {
+				t.Fatalf("onlyOfficeCommitReachable() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestShouldTreatOnlyOfficeHeadLookupAsMissing(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "direct not found", err: gocql.ErrNotFound, want: true},
+		{name: "wrapped not found", err: fmt.Errorf("head lookup: %w", gocql.ErrNotFound), want: true},
+		{name: "transient error", err: errors.New("cassandra timeout"), want: false},
+		{name: "nil error", err: nil, want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := shouldTreatOnlyOfficeHeadLookupAsMissing(tt.err); got != tt.want {
+				t.Fatalf("shouldTreatOnlyOfficeHeadLookupAsMissing() = %v, want %v", got, tt.want)
+			}
+		})
 	}
 }
 

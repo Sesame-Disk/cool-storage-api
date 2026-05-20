@@ -1123,4 +1123,172 @@ Tracked in `docs/KNOWN_ISSUES.md` as ISSUE-LIB-RETENTION-01.
 
 ---
 
-*Last updated: 2026-05-15*
+## 19. Multiregion HEAD Safety Follow-ups (2026-05-18)
+
+### Context
+
+Branch `feat/multiregion-head-safety` landed the canonical HEAD CAS pattern, server-side conflict retries for uploads and v2 mutations, atomic same-repo move in a single commit, and rollback of materialized blocks on publish failure. A walkthrough of the resulting code surfaced the following debt items. None of them block the merge; they document liabilities that future iterations should address.
+
+### 19.a. Three Separate Retry-Loop Implementations
+
+The repo still has three implementations of the same "retry on `ErrLibraryHeadConflict` / `ErrHeadConflict`" pattern. They now share the same backoff schedule, but the retry orchestration is still duplicated across files:
+
+| Caller | File | Backoff | Jitter | Max delay |
+|---|---|---|---|---|
+| v2 mutations (rename/move/delete/etc.) | `internal/api/v2/fs_helpers.go` (`retryLibraryHeadMutation`) | exponential (50→100→200→400) | ~25ms | 400ms |
+| Chunked + single-shot upload | `internal/api/seafhttp.go` (`commitUploadedFileMultiBlock`, `commitUploadedFile`) | exponential (50→100→200→400) | ~25ms | 400ms |
+| Web `UploadFile` | `internal/api/v2/files.go` (`finalizeStoredUploadMetadata`) | exponential (50→100→200→400) | ~25ms | 400ms |
+
+Update 2026-05-19: both upload seams now also fail closed if `IncrementOrCreateBlock` cannot confirm the `blocks` row, so uploads no longer continue to library metadata publish after a block-metadata registration failure.
+
+The remaining debt here is maintainability rather than correctness: the upload-specific `*_Once` extraction is already in place, and migrating both upload loops to `retryLibraryHeadMutation` would still remove duplicated retry bookkeeping and keep future contention tuning in one place.
+
+### 19.b. `CleanupFileTagsByPrefix` Performance
+
+`internal/api/v2/tags.go:586-625` scans the full `file_tags` partition for the repo (`SELECT file_path FROM file_tags WHERE repo_id = ?`), filters in-memory by prefix, then fires N+1 individual deletes (one per descendant). For repositories with high tag cardinality, replacing a directory becomes O(total_tags) work, executed asynchronously but still loading Cassandra.
+
+Acceptable today (replace-directory is rare and the goroutine does not block the response), but worth revisiting if tag volume per repo grows or if directory replace becomes more frequent.
+
+Mitigation paths:
+- Secondary index by path prefix.
+- Move tag storage to a partition that allows range scans by file_path.
+- Push the delete loop into a `LoggedBatch` to halve round-trips.
+
+### 19.c. `CollectBlockIDsRecursive` Repeats on Every Retry Attempt
+
+`internal/api/v2/batch_operations.go:547-551` (cross-repo) and `:851` (same-repo) re-collect the replaced entry's block IDs at the top of every retry attempt. If a CAS conflict triggers retry and `replacedEntry.ID` did not change, the recursive read is redundant work.
+
+Hard to avoid safely (the replaced entry can legitimately change between attempts), so the current behavior is the correct conservative choice — but the retry cost is amortized poorly when a directory replace has many descendants.
+
+The same retry-amplification pattern applies to copy block reference accounting: same-repo copy pins copied block refs inside the retry attempt, rolls them back if the HEAD CAS loses, and pins again on the next attempt. This is functionally correct and keeps refcounts balanced, but a contended copy of N blocks can issue multiple rounds of LWT refcount writes before one publish wins.
+
+Retried metadata mutations can also leave unpublished rows behind. Each failed attempt may have created new `fs_objects` and a `commits` row whose commit never becomes a library HEAD. This is not a functional regression, but CAS retries multiply the amount of unreachable metadata compared with a single failed publish. A future maintenance pass should add observability or cleanup for unpublished commit/fs-object rows.
+
+### 19.d. `UpdateLibraryHeadFromSnapshot` Validates an Argument Every Caller Passes Mechanically
+
+`internal/api/v2/fs_helpers.go` requires `expectedHead` as a parameter and validates `expectedHead == snapshot.HeadCommitID`. Current production call sites in `batch_operations.go`, `files.go`, `onlyoffice.go`, and `trash.go` all pass `snapshot.HeadCommitID` literally.
+
+The validation only triggers if someone passes a non-snapshot value — which no current caller does. The unit test (`TestUpdateLibraryHeadFromSnapshotRejectsMismatchedExpectedHead`) covers a path that production never takes.
+
+Either:
+- Drop the parameter and rely on the docstring contract.
+- Or rename to make the gate explicit (`UpdateLibraryHeadFromSnapshotIfExpected(snapshot, repoID, commitID, expectedHead)`) and force callers to pick a value.
+
+### 19.e. Initial-Commit Paths Bypass CAS Without an Inline Comment
+
+Two paths perform unconditional `UPDATE libraries SET head_commit_id = ...`:
+- `internal/api/sync.go` — initial commit during sync repo creation.
+- `internal/api/v2/fs_helpers.go` — `InitializeLibraryFS` for v2 library bootstrap.
+
+Both are correct (the library has no concurrent writers at first-touch), but they look identical to the legacy non-CAS behavior the rest of the file has been migrated away from. A future contributor reviewing for "missing CAS" could "fix" these and break the bootstrap throughput.
+
+Add a single-line comment at both sites explaining `bootstrap-only path; no concurrent writers possible`.
+
+### 19.f. Crash Window Between CAS Commit and `syncLibraryHeadDerivedState`
+
+`internal/api/v2/fs_helpers.go` advances `libraries` via CAS in `UpdateLibraryHead`, then in a separate non-conditional batch refreshes `libraries_by_id` plus the admin projection rows via `syncLibraryHeadDerivedState`. A process crash between the two operations leaves canonical `head_commit_id` advanced while derived rows lag.
+
+This is documented as accepted debt in section 12 (Read-Model And Sync Hardening). Functional reads are unaffected — `GetHeadCommitID`, `GetRootFSID`, `OnlyOffice getFileID`, `TrashHandler.CleanRepoTrash`, `SyncHandler.GetHeadCommitsMulti` all resolve via canonical (`libraries`). But admin projections (`libraries_by_org_updated`, `libraries_admin_global_by_updated`) can show stale `size_bytes`/`file_count`/`updated_at` until the next write to that library writes through.
+
+Mitigations described in section 12 (background projection repair job, repair marker) still apply.
+
+### 19.g. No Unit Tests for `processSameRepoMove` and `updateDirectoryAtPathFromRoot`
+
+`internal/api/v2/batch_operations.go:764-903` and `:905-954` contain recursive tree-rebuild logic. Coverage today:
+- Pure helpers (`isPathWithin`, `isDirectoryEntry`, `replacedDestinationTagCleanup`, `shouldSkipSourceRemovalAfterMove`) → unit tested in `batch_operations_test.go`.
+- End-to-end behavior → integration-tested in `internal/integration/same_repo_move_test.go` (5 scenarios: atomicity, nested tree, cycle prevention, descendant cycle, replace).
+
+Missing: unit tests with mocked `FSHelper` that exercise `updateDirectoryAtPathFromRoot` recursion across depth ≥ 2 without spinning up Cassandra. A regression in the recursive tree rebuild (e.g., forgetting to update a grandparent's pointer) would silently corrupt repo metadata; integration tests catch it only if the test setup happens to use a deep-enough tree.
+
+Path to add: introduce an `fsTreeStore` interface that `FSHelper` satisfies, and unit-test with an in-memory implementation.
+
+### 19.h. Cross-Repo Move Leaks Source Block References Until GC
+
+In `internal/api/v2/batch_operations.go:626`, `pinCopiedTreeBlockRefs` increments source block refs for the destination's future reference. The source-removal step (`internal/api/v2/batch_operations.go:702-758`) commits the source-side tree update but does **not** explicitly decrement source's reference to those blocks.
+
+Net effect: every cross-repo move leaves `+1` per moved block on `blocks.ref_count`. The leak is reclaimed when GC eventually walks the source's older commit chain and decrements the references encoded there. Functionally correct (eventually consistent), but the counter is briefly inflated. Affects:
+- Storage GC threshold timing (a block at `ref_count=2` instead of `ref_count=1` may keep an extra block alive past its lifecycle).
+- Counter-based observability (any tool that reads `blocks.ref_count` to estimate storage will be wrong during the lag).
+
+Same-repo move via `processSameRepoMove` does not have this problem (no pin/unpin needed; references stay).
+
+### 19.i. Async Cleanup Goroutines Are Fire-and-Forget With No Observability
+
+Multiple sites schedule cleanup as `go ...` with only `log.Printf` on failure:
+- tag cleanup after move/delete/replace (`CleanupFileTagsByPath`, `CleanupFileTagsByPrefix`, `MoveFileTagsByPath`, `MoveFileTagsByPrefix`);
+- block ref cleanup after replace/delete (`DecrementBlockRefCountsOnce` followed by `enqueueZeroRefBlocks` or GC enqueue);
+- storage-counter cleanup after async delete paths.
+
+A transient DB failure on any of these is logged and forgotten. No retry, no metric, no surface for ops to know cleanup is lagging. Idempotency (via `DecrementBlockRefCountsOnce`'s LWT, and `INSERT IF NOT EXISTS` patterns) means re-running is safe, but there is no mechanism that triggers a re-run on transient failure.
+
+Update 2026-05-19: the OnlyOffice save path is now partially hardened. `saveEditedDocument` persists `onlyoffice_pending_blocks` before the S3 PUT, stores the candidate `publish_commit_id` before the library-head CAS, and reconciles stale pending rows conservatively by checking reachability from the current head. Reconciliation now runs both inline on later saves and from the GC scanner, so quiet libraries no longer depend on another OnlyOffice save to revisit stale rows. That narrows the crash window for OnlyOffice materialized blocks, but the broader debt still applies to the other async cleanup goroutines listed above.
+
+Remaining OnlyOffice-specific follow-ups after that hardening:
+- The 5-minute stale cutoff is heuristic. A save that remains in-flight for more than that window after the pending row is inserted but before `publish_commit_id` is persisted can still be misclassified as abandoned by a later save in the same org. There is no heartbeat or LWT guard on the row yet.
+- Reconciliation still scans the org partition in `onlyoffice_pending_blocks`. The inline save-path trigger remains hot on every OnlyOffice save, and the GC scanner phase is broad org-wide recovery rather than a targeted per-library worker with cooldowns or lease coordination.
+- `scanOnlyOfficePendingBlocks` returns the number of organizations reconciled, and `ScanOnce` currently folds that value into its generic `enqueued` total. This is observability debt only: the phase does not enqueue GC queue rows, so the completion log can overstate "enqueued" work after a successful OnlyOffice reconciliation pass. Future cleanup should either return `0` from non-enqueue phases and rely on phase-specific metrics, or split the scanner result type into `enqueued`, `reconciled`, and `recovered` counters.
+- If the process dies after `PutBlockData` succeeds but before `IncrementOrCreateBlock` writes the `blocks` row, the stale pending row can now be discovered later, but the reconciler still only knows how to decrement refcounts and delete the pending row. Because no `blocks` row exists in that window, the physical storage object can remain orphaned; this diff improves observability and bounded row cleanup, but it does not fully close that storage-leak path yet.
+- Commit reachability still walks `parent_id` without a hop bound. Deep histories or malformed ancestry can make reconciliation expensive even though cycle detection is present.
+- `blockMetadataRegistered` is now effectively a readability guard only: any pre-registration failure returns early, so the later rollback branch only sees the `true` case. Safe, but low-priority cleanup remains.
+- `IncrementOrCreateBlock` failure is now intentionally fatal. This is a deliberate behavior change from the earlier buggy path that could continue to metadata publish after failing to confirm the block row.
+- There is still no direct end-to-end test for durable `onlyoffice_pending_blocks` write/reconcile behavior. The current suite covers commit reachability and the broader integration environment, but it does not create pending rows and assert both outcomes: reachable `publish_commit_id` rows are dropped without rollback, and abandoned rows decrement refs/enqueue zero-ref blocks via the scanner path. Fault-injection around `updateOnlyOfficePendingBlockCommitID`, `PutBlockData`, and stale-row reconciliation should be added before the next major OnlyOffice cleanup refactor.
+
+Mitigation: pipe these through a small `cleanupQueue` (durable or in-memory bounded) with retry. Out of scope for this branch; track separately.
+
+### 19.j. Upload Saving-Phase Performance Speedup Deferred
+
+The work in `feat/library-write-coordinator` (block pipeline + local mutex coordinator, 17-55× speedup on the "Saving..." phase) was intentionally left out of `feat/multiregion-head-safety` per the [PR58 audit](UPLOAD-PERFORMANCE-PR58-AUDIT.md). The performance baseline of the current branch is the same as `main`; the speedup work lives in branches `feat/library-write-coordinator` and `feat/uploadperformance` and must be re-evaluated separately under contention before merge.
+
+This is intentional debt, tracked here for completeness with section 5 (Web Upload Pipeline Follow-Ups).
+
+### 19.k. Office-Template `CreateFile` Can Leave an Unpublished Physical Block After Exhausted CAS Retries
+
+`internal/api/v2/files.go:1068-1141` now delays Office template upload until after parent-path validation and duplicate-name checks, which fixes the larger regression where `.docx/.xlsx/.pptx` creates could materialize data before a guaranteed `404` or `409`.
+
+However, once a retry attempt successfully uploads the template blob and later loses the HEAD CAS, `templateBlockStored` remains true across retries. If the retry loop eventually exhausts without publishing any commit, the physical blob can remain in block storage even though no library HEAD references it.
+
+This is acceptable for now because the template block ID is deterministic and content-addressed (SHA-256 of the template bytes), so repeated retries do not spray distinct blobs and future creates may reuse the same object. A naive rollback delete would be unsafe without tracking whether the blob pre-existed or is concurrently referenced by another successful create.
+
+If this ever needs to be tightened, the safe options are:
+- record/refcount template blobs before publish so failed creates can roll back via metadata rather than raw deletes;
+- or track whether `PutBlockData` created a new object vs reused an existing one, then delete only newly-created unreferenced blobs on final failure.
+
+### 19.l. Legacy Multiregion Shell Harness Lags the Canonical Active-Active Proofs
+
+The dedicated multiregion shell harnesses (`scripts/test-multiregion.sh` and
+`scripts/test-failover.sh`) still focus on connectivity, routing, and manual
+failover drills. They do not carry the full same-library concurrent-write
+coverage that now lives in Go integration tests under `internal/integration/`.
+
+This is accepted for the current branch because the correctness-critical proofs
+now run through:
+- the main compose `test` profile with `sesamefs`, `sesamefs-node-2`, and `sesamefs-node-3` for broad multi-container HEAD races;
+- dedicated two-region Go tests for upload finalization against `docker-compose-multiregion.yaml` when region-pinned behavior matters.
+
+The remaining debt is operational ergonomics: the shell harnesses are still the
+easiest place to script smoke checks for routing/failover, but they are no
+longer the canonical regression surface for active-active write correctness.
+
+### 19.m. Directory Read Paths Still Resolve HEAD and Root in Separate Queries
+
+`ListDirectory` and `ListDirectoryV21` still read `head_commit_id` from
+`libraries`, then do a second `SELECT` on `commits` for `root_fs_id`. This is
+the same split-read shape used inside `GetLibraryHeadSnapshot`; there is still
+no truly atomic cross-table snapshot for read paths.
+
+That means a transient replication or visibility gap can still surface as
+`failed to load library data` even though the state is converging correctly.
+This is currently treated as read-availability debt rather than write
+correctness debt:
+- the canonical HEAD source of truth is still `libraries.head_commit_id`;
+- write paths rebuild from a fixed HEAD/root pair before publishing;
+- the remaining issue is that some read paths can return a transient 500 rather
+  than retrying or surfacing a more explicit transient-read failure.
+
+If we tighten this later, the safe follow-up is a bounded read retry/backoff or
+explicit transient error mapping around the `libraries -> commits` lookup pair,
+not merely swapping `ListDirectory` over to `GetLibraryHeadSnapshot`.
+
+---
+
+*Last updated: 2026-05-19*

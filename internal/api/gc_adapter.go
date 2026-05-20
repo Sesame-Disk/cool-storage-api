@@ -3,6 +3,8 @@ package api
 import (
 	"log"
 
+	v2 "github.com/Sesame-Disk/sesamefs/internal/api/v2"
+	"github.com/Sesame-Disk/sesamefs/internal/db"
 	"github.com/Sesame-Disk/sesamefs/internal/gc"
 	"github.com/google/uuid"
 )
@@ -68,4 +70,24 @@ func (e *gcCommitEnqueuer) EnqueueCommits(orgID, libraryID string, commitIDs []s
 	if err := e.service.EnqueueCommits(orgUUID, libUUID, commitIDs); err != nil {
 		log.Printf("[GC Adapter] Failed to enqueue %d commits for library %s: %v", len(commitIDs), libraryID, err)
 	}
+}
+
+// onlyOfficeReconcilerAdapter bridges the GC scanner to the OnlyOffice
+// pending-blocks reconciler that lives in the v2 package.
+type onlyOfficeReconcilerAdapter struct {
+	database *db.DB
+}
+
+func newOnlyOfficeReconcilerAdapter(database *db.DB) gc.OnlyOfficeReconciler {
+	if database == nil {
+		return nil
+	}
+	return &onlyOfficeReconcilerAdapter{database: database}
+}
+
+func (a *onlyOfficeReconcilerAdapter) ReconcileOnlyOfficePendingBlocks(orgID uuid.UUID) error {
+	if a == nil || a.database == nil {
+		return nil
+	}
+	return v2.ReconcileOnlyOfficePendingBlocksForOrg(a.database, orgID.String())
 }

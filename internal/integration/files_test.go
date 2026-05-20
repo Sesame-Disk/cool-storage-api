@@ -245,6 +245,96 @@ func TestSameLibraryCopyIncrementsBlockRefCountBeforeReturning(t *testing.T) {
 	}
 }
 
+func assertSameLibraryCopyReplaceCleansUpReplacedBlocks(t *testing.T, useBatch bool) {
+	t.Helper()
+
+	name := fmt.Sprintf("inttest-copy-replace-refcount-%d", time.Now().UnixNano())
+	repoID := createTestLibrary(t, adminClient, name)
+
+	for _, dirPath := range []string{"/src", "/dst"} {
+		resp := adminClient.PostJSON(t, fmt.Sprintf("/api/v2.1/repos/%s/dir/?p=%s", repoID, dirPath), map[string]string{})
+		expectStatus(t, resp, http.StatusCreated)
+		resp.Body.Close()
+	}
+
+	fileName := "replace-me.txt"
+	sourceContent := fmt.Sprintf("same-library-copy-replace-source-%d\n", time.Now().UnixNano())
+	replacedContent := fmt.Sprintf("same-library-copy-replace-dest-%d\n", time.Now().UnixNano())
+
+	uploadLinkResp := adminClient.Get(t, fmt.Sprintf("/api2/repos/%s/upload-link/?p=/", repoID))
+	expectStatus(t, uploadLinkResp, http.StatusOK)
+	uploadURL := strings.Trim(responseBody(t, uploadLinkResp), "\" \n\r")
+	uploadFileThroughLink(t, adminClient, uploadURL, fileName, "/src", sourceContent)
+	uploadFileThroughLink(t, adminClient, uploadURL, fileName, "/dst", replacedContent)
+
+	orgID := resolveOrgID(t, repoID)
+	sourceHash := sha256.Sum256([]byte(sourceContent))
+	sourceBlockID := hex.EncodeToString(sourceHash[:])
+	replacedHash := sha256.Sum256([]byte(replacedContent))
+	replacedBlockID := hex.EncodeToString(replacedHash[:])
+
+	if refCount := readBlockRefCount(t, orgID, sourceBlockID); refCount != 1 {
+		t.Fatalf("source ref_count after seed upload = %d, want 1", refCount)
+	}
+	if refCount := readBlockRefCount(t, orgID, replacedBlockID); refCount != 1 {
+		t.Fatalf("replaced ref_count after seed upload = %d, want 1", refCount)
+	}
+
+	var copyResp *http.Response
+	if useBatch {
+		copyResp = adminClient.PostJSON(t, "/api/v2.1/repos/"+repoID+"/file/copy/", map[string]interface{}{
+			"src_dir":         "/src",
+			"filename":        []string{fileName},
+			"dst_dir":         "/dst",
+			"conflict_policy": "replace",
+		})
+	} else {
+		copyResp = adminClient.PostJSON(t, "/api/v2.1/repos/"+repoID+"/file/copy/", map[string]interface{}{
+			"src_path":        "/src/" + fileName,
+			"dst_dir":         "/dst",
+			"conflict_policy": "replace",
+		})
+	}
+	expectStatus(t, copyResp, http.StatusOK)
+	copyResp.Body.Close()
+
+	if refCount := readBlockRefCount(t, orgID, sourceBlockID); refCount != 2 {
+		t.Fatalf("source ref_count after copy replace = %d, want 2", refCount)
+	}
+
+	if !pollUntil(t, 10*time.Second, 200*time.Millisecond, func() bool {
+		return readBlockRefCount(t, orgID, replacedBlockID) <= 0
+	}) {
+		t.Fatalf("replaced ref_count after copy replace = %d, want <= 0", readBlockRefCount(t, orgID, replacedBlockID))
+	}
+
+	dstResp := adminClient.Get(t, fmt.Sprintf("/api/v2.1/repos/%s/dir/?p=/dst", repoID))
+	expectStatus(t, dstResp, http.StatusOK)
+	var dstList map[string]interface{}
+	decodeJSON(t, dstResp, &dstList)
+	entries, _ := dstList["dirent_list"].([]interface{})
+	if !containsEntry(entries, "name", fileName) {
+		t.Fatalf("copied file %q not found in /dst after replace", fileName)
+	}
+	if refCount := readBlockRefCount(t, orgID, sourceBlockID); refCount != 2 {
+		t.Fatalf("source ref_count after cleanup = %d, want 2", refCount)
+	}
+	if refCount := readBlockRefCount(t, orgID, replacedBlockID); refCount > 0 {
+		t.Fatalf("replaced ref_count after cleanup = %d, want <= 0", refCount)
+	}
+	if dstResp.Body != nil {
+		dstResp.Body.Close()
+	}
+}
+
+func TestSameLibraryCopyReplaceCleansUpReplacedBlocks(t *testing.T) {
+	assertSameLibraryCopyReplaceCleansUpReplacedBlocks(t, false)
+}
+
+func TestSameLibraryBatchCopyReplaceCleansUpReplacedBlocks(t *testing.T) {
+	assertSameLibraryCopyReplaceCleansUpReplacedBlocks(t, true)
+}
+
 // TestCrossLibraryBatchCopyIncrementsBlockRefCount verifies that copying a file
 // across libraries via the async-batch-copy-item endpoint correctly increments the
 // shared block's ref_count to 2 (once for the original upload, once for the copy).
@@ -485,4 +575,3 @@ func TestBatchDeleteItems_DecrementsBlockRefCount(t *testing.T) {
 		t.Fatalf("ref_count after batch deletion = %d, want 0 (so GC can collect it) - possible storage leak", refCount)
 	}
 }
-
