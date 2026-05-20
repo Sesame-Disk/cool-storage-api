@@ -34,7 +34,7 @@ This document tracks all known bugs, limitations, and issues in SesameFS.
 | Modal Dialogs | ✅ All 122 Fixed | All dialog files use Bootstrap classes |
 | Library Settings Backend | Partial | API tokens and transfer are complete. History and auto-delete settings persist, but retention/delete semantics are incomplete. See ISSUE-LIB-RETENTION-01. |
 | **Desktop SSO Browser UX** | ✅ Fixed (2026-03-04) | After browser SSO login for desktop client, now shows confirmation page with auto-close. See ISSUE-SSO-01 below. |
-| **Desktop Sync Active-Active Conflict Recovery** | 🟡 Follow-up coverage debt | `PUT /commit/HEAD` and `POST /update-branch` now use parent-chain validation, CAS, ancestry-gated auto-merge for safe stale siblings, and `503 + Retry-After` fail-closed responses for unsafe conflicts. Real desktop-client active-active proof now exists for concurrent non-overlapping writes via `scripts/test-sync-active-active.sh`; the remaining gap is broader end-to-end scenario coverage. See ISSUE-SYNC-HEAD-RECOVERY-01 below. |
+| **Desktop Sync Active-Active Conflict Recovery** | 🟡 Follow-up coverage debt | `PUT /commit/HEAD` and `POST /update-branch` now use parent-chain validation, CAS, ancestry-gated auto-merge for safe stale siblings, and `503 + Retry-After` fail-closed responses for unsafe conflicts. The real desktop-client harness now proves the non-overlapping race path with observed `parent mismatch` plus `auto-merge`, but the unsafe-conflict `503` path is still not proven end-to-end. See ISSUE-SYNC-HEAD-RECOVERY-01 below. |
 | **Upload "Don't Replace" (Desktop Client)** | 🟡 Pending | Desktop client file browser "No" button (auto-rename) doesn't work. Client uses `update-link` vs `upload-link` to distinguish replace vs no-replace, but both map to same token/handler. Backend autorename infrastructure ready (`autoRenameIfExists`), needs token-level `Replace` flag to distinguish endpoints. Web "Don't replace" also broken (same root cause). See ISSUE-UPLOAD-REPLACE-01 below. |
 | **Org Logo Upload** | 🟡 Stub | `UpdateOrgLogo` in org_admin.go accepts the file but does not persist it to storage. Returns a static path from settings. Functional as a route placeholder until an asset storage backend is available. |
 | **Login Analytics History** | 🟡 Partial | `last_login` is now real and persisted in `users.last_login_at`, but there is still no historical login event dataset for trend analysis, login audit timelines, or period-based "users who logged in" charts. See ISSUE-LOGIN-ANALYTICS-01 below. |
@@ -404,7 +404,7 @@ What is still missing is traffic-accounting coverage for abandoned or failed chu
 ### ISSUE-SYNC-HEAD-RECOVERY-01: Desktop Sync HEAD Conflict Recovery Follow-up Coverage
 
 **Status**: 🟡 Narrowed follow-up coverage debt (2026-05-20)
-**Severity**: Medium - baseline active-active proof exists, but the real-client scenario matrix is still incomplete
+**Severity**: Medium - the non-overlapping active-active path is now proved end-to-end, but the real-client scenario matrix is still incomplete
 **Affected**: `PUT /seafhttp/repo/:repo_id/commit/HEAD`, `POST /seafhttp/repo/:repo_id/update-branch`, desktop sync launch criteria
 
 #### What Is True Today
@@ -429,11 +429,11 @@ That means the remaining gap is no longer missing CAS, missing server-side retry
 - Code path: `internal/api/sync.go` uses parent-chain validation, CAS, bounded retry, ancestry-gated auto-merge, and `503 + Retry-After` fail-closed fallback for both `PUT /commit/HEAD` and `POST /update-branch`.
 - Same-tree stale idempotence and unmergeable `503` regressions exist for both routes in `internal/integration/library_projection_regression_test.go`.
 - Handler-level multi-node convergence proof exists for both routes in `internal/integration/multi_instance_mutations_test.go`.
-- Real desktop-client active-active proof exists for concurrent non-overlapping writes in `scripts/test-sync-active-active.sh` and is documented in `docs/SEAFILE-SYNC-PROTOCOL.md`.
+- Real desktop-client active-active proof exists for concurrent non-overlapping writes in `scripts/test-sync-active-active.sh`, and that harness now asserts that a backend `parent mismatch` and `auto-merge` were actually observed for the proof repo.
 
 #### Why This Still Exists As Follow-up Debt
 
-The code no longer relies on synthetic `200 OK` for exhausted retry budgets, and the repo now has one real active-active desktop proof. The remaining gap is breadth rather than absence of proof: this repo still lacks real-client end-to-end exercises for scenarios such as same-path unmergeable conflicts, quota rejection during auto-merge, and other non-happy-path branches.
+The code no longer relies on synthetic `200 OK` for exhausted retry budgets, and the repo now has one real active-active desktop proof that demonstrates an actual conflict/merge path for non-overlapping writes. The remaining gap is breadth rather than absence of proof: this repo still lacks real-client end-to-end exercises for scenarios such as same-path unmergeable conflicts, quota rejection during auto-merge, and other non-happy-path branches.
 
 Those scenarios are already handler-covered, but they are not yet exercised by a real desktop-client harness in this repo.
 

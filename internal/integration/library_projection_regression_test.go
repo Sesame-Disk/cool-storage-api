@@ -462,6 +462,76 @@ func TestUpdateBranchConflictUnmergeableReturnsRetryable503(t *testing.T) {
 	testSyncHeadConflictUnmergeableReturnsRetryable503(t, http.MethodPost, "/seafhttp/repo/%s/update-branch?head=%s")
 }
 
+func TestSyncHeadRejectsNonEmptyParentWhenCurrentHeadMissing(t *testing.T) {
+	testSyncHeadRejectsNonEmptyParentWhenCurrentHeadMissing(t, http.MethodPut, "/seafhttp/repo/%s/commit/HEAD?head=%s")
+}
+
+func TestUpdateBranchRejectsNonEmptyParentWhenCurrentHeadMissing(t *testing.T) {
+	testSyncHeadRejectsNonEmptyParentWhenCurrentHeadMissing(t, http.MethodPost, "/seafhttp/repo/%s/update-branch?head=%s")
+}
+
+func testSyncHeadRejectsNonEmptyParentWhenCurrentHeadMissing(t *testing.T, method, routeFormat string) {
+	name := fmt.Sprintf("inttest-sync-empty-head-guard-%d", time.Now().UnixNano())
+	repoID := createTestLibrary(t, adminClient, name)
+	session := shareProjectionDBForTest(t).Session()
+
+	initial := readLibrarySyncHeadState(t, session, repoID)
+	targetHead := fmt.Sprintf("%040x", time.Now().UnixNano())
+	insertSyntheticCommitForTest(t, session, repoID, targetHead, initial.HeadCommitID, initial.RootFSID, "integration publish with non-empty parent against missing current head")
+	t.Cleanup(func() {
+		if err := session.Query(`DELETE FROM commits WHERE library_id = ? AND commit_id = ?`, repoID, targetHead).Exec(); err != nil {
+			t.Errorf("cleanup synthetic commit %s failed: %v", targetHead, err)
+		}
+	})
+	t.Cleanup(func() {
+		restoreTime := time.Now().UTC()
+		if err := session.Query(`
+			UPDATE libraries SET head_commit_id = ?, updated_at = ? WHERE org_id = ? AND library_id = ?
+		`, initial.HeadCommitID, restoreTime, defaultOrgID, repoID).Exec(); err != nil {
+			t.Errorf("restore canonical head for %s failed: %v", repoID, err)
+		}
+		if err := session.Query(`
+			UPDATE libraries_by_id SET head_commit_id = ? WHERE library_id = ?
+		`, initial.HeadCommitID, repoID).Exec(); err != nil {
+			t.Errorf("restore lookup head for %s failed: %v", repoID, err)
+		}
+	})
+
+	brokenTime := time.Now().UTC()
+	if err := session.Query(`
+		UPDATE libraries SET head_commit_id = ?, updated_at = ? WHERE org_id = ? AND library_id = ?
+	`, "", brokenTime, defaultOrgID, repoID).Exec(); err != nil {
+		t.Fatalf("failed to blank canonical head for %s: %v", repoID, err)
+	}
+	if err := session.Query(`
+		UPDATE libraries_by_id SET head_commit_id = ? WHERE library_id = ?
+	`, "", repoID).Exec(); err != nil {
+		t.Fatalf("failed to blank lookup head for %s: %v", repoID, err)
+	}
+
+	resp := adminClient.Do(t, method, fmt.Sprintf(routeFormat, repoID, url.QueryEscape(targetHead)), nil)
+	body := responseBody(t, resp)
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("publish against missing current head returned status=%d body=%s", resp.StatusCode, body)
+	}
+	if got := resp.Header.Get("Retry-After"); got != "1" {
+		t.Fatalf("Retry-After header = %q, want %q", got, "1")
+	}
+	if !strings.Contains(body, "sync head publish conflicted; retry") {
+		t.Fatalf("publish against missing current head body = %q, want retry hint", body)
+	}
+
+	var canonicalHead string
+	if err := session.Query(`
+		SELECT head_commit_id FROM libraries WHERE org_id = ? AND library_id = ?
+	`, defaultOrgID, repoID).Scan(&canonicalHead); err != nil {
+		t.Fatalf("failed to read canonical head after empty-head guard test: %v", err)
+	}
+	if canonicalHead != "" {
+		t.Fatalf("canonical head advanced to %q, want empty head to remain unchanged", canonicalHead)
+	}
+}
+
 func testSyncHeadConflictUnmergeableReturnsRetryable503(t *testing.T, method, routeFormat string) {
 	name := fmt.Sprintf("inttest-sync-conflict-503-%d", time.Now().UnixNano())
 	repoID := createTestLibrary(t, adminClient, name)

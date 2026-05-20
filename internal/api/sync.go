@@ -2418,7 +2418,7 @@ func (h *SyncHandler) handleSyncHeadPromotion(c *gin.Context, orgID, userID, rep
 			return
 		}
 
-		if currentHead != "" && commitParent != currentHead {
+		if commitParent != currentHead {
 			log.Printf("%s: parent mismatch for repo %s on attempt %d/%d - commit %s expects parent %s but current HEAD is %s",
 				operation, repoID, attempt+1, maxAttempts, targetHead, commitParent, currentHead)
 

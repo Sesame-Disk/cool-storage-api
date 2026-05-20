@@ -40,6 +40,31 @@ log_verbose() {
   fi
 }
 
+backend_logs() {
+  compose logs --no-color sesamefs sesamefs-node-2 2>/dev/null || true
+}
+
+wait_for_backend_log_pattern() {
+  local pattern="$1"
+  local description="$2"
+  local max_wait="${3:-30}"
+  local waited=0
+
+  while [ $waited -lt $max_wait ]; do
+    if backend_logs | grep -F "$pattern" > /dev/null 2>&1; then
+      return 0
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+
+  log_error "Backend logs never showed ${description}"
+  if [ "$VERBOSE" = true ]; then
+    backend_logs | tail -n 120 || true
+  fi
+  exit 1
+}
+
 compose() {
   (
     cd "$PROJECT_DIR"
@@ -469,6 +494,8 @@ main() {
   log_info "Starting both clients concurrently from the same synced base state"
   start_clients
   wait_for_remote_entries "$first_name" "$second_name"
+  wait_for_backend_log_pattern "parent mismatch for repo ${REPO_ID}" "a sync parent mismatch for ${REPO_ID}"
+  wait_for_backend_log_pattern "auto-merged repo ${REPO_ID}" "an auto-merge publish for ${REPO_ID}"
 
   log_info "Triggering a pull round so both clients absorb the winning head"
   trigger_concurrent_sync
