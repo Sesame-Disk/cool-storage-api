@@ -217,6 +217,7 @@ func NewServer(cfg *config.Config, database *db.DB, version string) *Server {
 			storageProvider = gc.NewStorageManagerAdapter(storageManager)
 		}
 		gcService = gc.NewService(store, storageProvider, cfg.GC, database.Session())
+		gcService.SetOnlyOfficeReconciler(newOnlyOfficeReconcilerAdapter(database))
 	}
 
 	// Initialize rate limiter for auth endpoints (~10 req/min per IP)

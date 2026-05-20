@@ -319,21 +319,44 @@ func (h *OnlyOfficeHandler) isOnlyOfficeCommitReachableFromHead(repoID, targetCo
 }
 
 func (h *OnlyOfficeHandler) reconcileStaleOnlyOfficePendingBlocks(orgID string) {
-	if h == nil || h.db == nil || strings.TrimSpace(orgID) == "" {
-		return
+	if err := h.ReconcileOnlyOfficePendingBlocks(orgID); err != nil {
+		log.Printf("OnlyOffice: reconcile pending blocks for org %s: %v", orgID, err)
+	}
+}
+
+// ReconcileOnlyOfficePendingBlocksForOrg is the entry point used by the GC
+// scanner. It instantiates a minimal handler bound to the database and
+// delegates to ReconcileOnlyOfficePendingBlocks, so other packages can drive
+// reconciliation without depending on the full request-scoped handler.
+func ReconcileOnlyOfficePendingBlocksForOrg(database *db.DB, orgID string) error {
+	h := &OnlyOfficeHandler{db: database}
+	return h.ReconcileOnlyOfficePendingBlocks(orgID)
+}
+
+// ReconcileOnlyOfficePendingBlocks scans the org's onlyoffice_pending_blocks
+// rows and either drops rows whose publish commit is reachable from the
+// current library head or rolls back materialized blocks for stale rows that
+// were never published. Safe to call repeatedly; per-block decrement guards
+// against double-decrement via DecrementBlockRefCountsOnce.
+func (h *OnlyOfficeHandler) ReconcileOnlyOfficePendingBlocks(orgID string) error {
+	if h == nil || h.db == nil {
+		return fmt.Errorf("database not available")
+	}
+	if strings.TrimSpace(orgID) == "" {
+		return nil
 	}
 
 	pendingBlocks, err := h.listOnlyOfficePendingBlocks(orgID)
 	if err != nil {
-		log.Printf("OnlyOffice: failed to list pending block cleanups for org %s: %v", orgID, err)
-		return
+		return fmt.Errorf("list pending block cleanups for org %s: %w", orgID, err)
 	}
 	if len(pendingBlocks) == 0 {
-		return
+		return nil
 	}
 
 	cutoff := time.Now().Add(-onlyOfficePendingBlockStaleAfter)
 	fsHelper := NewFSHelper(h.db)
+	var firstErr error
 	for _, pending := range pendingBlocks {
 		if !pending.CreatedAt.IsZero() && pending.CreatedAt.After(cutoff) {
 			continue
@@ -344,6 +367,9 @@ func (h *OnlyOfficeHandler) reconcileStaleOnlyOfficePendingBlocks(orgID string) 
 			reachable, err = h.isOnlyOfficeCommitReachableFromHead(pending.RepoID, pending.PublishCommitID)
 			if err != nil {
 				log.Printf("OnlyOffice: failed to reconcile pending block %s reachability: %v", pending.OperationID, err)
+				if firstErr == nil {
+					firstErr = err
+				}
 				continue
 			}
 		}
@@ -351,16 +377,25 @@ func (h *OnlyOfficeHandler) reconcileStaleOnlyOfficePendingBlocks(orgID string) 
 		if reachable {
 			if err := h.deleteOnlyOfficePendingBlock(orgID, pending.OperationID); err != nil {
 				log.Printf("OnlyOffice: failed to clear reachable pending block %s: %v", pending.OperationID, err)
+				if firstErr == nil {
+					firstErr = err
+				}
 			}
 			continue
 		}
 
-		zeroRefBlocks := fsHelper.DecrementBlockRefCountsOnce(orgID, onlyOfficeRollbackOperationKey(pending.OperationID), []string{pending.InternalBlockID})
-		enqueueZeroRefBlocks(h.db, orgID, pending.RepoID, zeroRefBlocks)
+		if strings.TrimSpace(pending.InternalBlockID) != "" {
+			zeroRefBlocks := fsHelper.DecrementBlockRefCountsOnce(orgID, onlyOfficeRollbackOperationKey(pending.OperationID), []string{pending.InternalBlockID})
+			enqueueZeroRefBlocks(h.db, orgID, pending.RepoID, zeroRefBlocks)
+		}
 		if err := h.deleteOnlyOfficePendingBlock(orgID, pending.OperationID); err != nil {
 			log.Printf("OnlyOffice: failed to delete rolled back pending block %s: %v", pending.OperationID, err)
+			if firstErr == nil {
+				firstErr = err
+			}
 		}
 	}
+	return firstErr
 }
 
 // OnlyOfficeResponse represents the API response
@@ -1138,12 +1173,33 @@ func (h *OnlyOfficeHandler) saveEditedDocument(ctx context.Context, repoID, file
 		return fmt.Errorf("failed to resolve block storage: %w", err)
 	}
 
+	// Insert the pending-cleanup row BEFORE the S3 PUT. If the server crashes
+	// at any point between here and a successful publish, the reconciler can
+	// find this row by org and either roll back the materialized block (after
+	// onlyOfficePendingBlockStaleAfter) or detect that the publish commit is
+	// reachable from HEAD and drop the row. Recording the block id ahead of
+	// time means the reconciler always has the data it needs to decrement
+	// refcounts, even on a crash before IncrementOrCreateBlock.
+	if err := h.saveOnlyOfficePendingBlock(orgID, onlyOfficePendingBlock{
+		OperationID:     rollbackID,
+		RepoID:          repoID,
+		FilePath:        filePath,
+		InternalBlockID: internalBlockID,
+		ExternalBlockID: externalBlockID,
+		StorageClass:    storageClass,
+	}); err != nil {
+		return fmt.Errorf("failed to persist pending OnlyOffice block cleanup: %w", err)
+	}
+
 	storageKey, err := blockStore.PutBlockData(ctx, &storage.BlockData{
 		Hash: internalBlockID,
 		Data: content,
 		Size: int64(len(content)),
 	})
 	if err != nil {
+		if deleteErr := h.deleteOnlyOfficePendingBlock(orgID, rollbackID); deleteErr != nil {
+			log.Printf("OnlyOffice: failed to clear pending block cleanup %s after PUT failure: %v", rollbackID, deleteErr)
+		}
 		return fmt.Errorf("failed to store block: %w", err)
 	}
 
@@ -1161,24 +1217,16 @@ func (h *OnlyOfficeHandler) saveEditedDocument(ctx context.Context, repoID, file
 		log.Printf("OnlyOffice: Warning - failed to create reverse block mapping: %v", err)
 	}
 
-	// Store block metadata using internal (SHA-256) ID
+	// Store block metadata using internal (SHA-256) ID. The pending-cleanup
+	// row above is what guarantees this refcount increment can be reversed
+	// even if the process dies before publish.
 	if err := NewFSHelper(h.db).IncrementOrCreateBlock(orgID, internalBlockID, len(content), storageClass, storageKey); err != nil {
-		return fmt.Errorf("failed to store block metadata: %w", err)
-	} else {
-		blockMetadataRegistered = true
-		if err := h.saveOnlyOfficePendingBlock(orgID, onlyOfficePendingBlock{
-			OperationID:     rollbackID,
-			RepoID:          repoID,
-			FilePath:        filePath,
-			InternalBlockID: internalBlockID,
-			ExternalBlockID: externalBlockID,
-			StorageClass:    storageClass,
-		}); err != nil {
-			zeroRefBlocks := fsHelper.DecrementBlockRefCountsOnce(orgID, onlyOfficeRollbackOperationKey(rollbackID), []string{internalBlockID})
-			enqueueZeroRefBlocks(h.db, orgID, repoID, zeroRefBlocks)
-			return fmt.Errorf("failed to persist pending OnlyOffice block cleanup: %w", err)
+		if deleteErr := h.deleteOnlyOfficePendingBlock(orgID, rollbackID); deleteErr != nil {
+			log.Printf("OnlyOffice: failed to clear pending block cleanup %s after block-metadata failure: %v", rollbackID, deleteErr)
 		}
+		return fmt.Errorf("failed to store block metadata: %w", err)
 	}
+	blockMetadataRegistered = true
 
 	storageDeltaBytes, storageDeltaFiles, newCommitID, err := h.publishEditedDocumentMetadata(fsHelper, orgID, repoID, filePath, filename, userID, originalFileSize, externalBlockID, rollbackID)
 	if err != nil {

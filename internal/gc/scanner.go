@@ -19,14 +19,24 @@ type OrphanRecoverer interface {
 	RecoverS3Orphans(ctx context.Context, perOrgLimit int) (int, error)
 }
 
+// OnlyOfficeReconciler reconciles stale onlyoffice_pending_blocks rows for an
+// org: it either drops rows whose publish commit is reachable from the
+// current library head or rolls back materialized blocks for rows that were
+// never published. Wired in from the API layer because the implementation
+// lives there alongside the OnlyOffice handler.
+type OnlyOfficeReconciler interface {
+	ReconcileOnlyOfficePendingBlocks(orgID uuid.UUID) error
+}
+
 // Scanner periodically finds orphaned items that were missed by inline enqueue
 // and adds them to the gc_queue for processing.
 type Scanner struct {
-	store           GCStore
-	queue           *Queue
-	stats           *Stats
-	config          config.GCConfig
-	orphanRecoverer OrphanRecoverer
+	store                GCStore
+	queue                *Queue
+	stats                *Stats
+	config               config.GCConfig
+	orphanRecoverer      OrphanRecoverer
+	onlyOfficeReconciler OnlyOfficeReconciler
 }
 
 // NewScanner creates a new safety scanner.
@@ -43,6 +53,14 @@ func NewScanner(store GCStore, queue *Queue, stats *Stats, cfg config.GCConfig) 
 // unset, the s3_orphan_recovery phase is a no-op (useful for mock-only tests).
 func (s *Scanner) SetOrphanRecoverer(r OrphanRecoverer) {
 	s.orphanRecoverer = r
+}
+
+// SetOnlyOfficeReconciler wires the OnlyOffice pending-blocks reconciler.
+// Optional; if unset, the onlyoffice_pending_blocks phase is a no-op (the
+// inline reconcile in saveEditedDocument is still the primary cleanup
+// trigger).
+func (s *Scanner) SetOnlyOfficeReconciler(r OnlyOfficeReconciler) {
+	s.onlyOfficeReconciler = r
 }
 
 func (s *Scanner) saveCursor(key string, day time.Time) error {
@@ -98,6 +116,7 @@ func (s *Scanner) ScanOnce(ctx context.Context) error {
 		{"storage_counter_reconciliation", s.scanPendingStorageCounterReconciliation},
 		{"expired_deleted_libraries", s.scanExpiredDeletedLibraries},
 		{"expired_deleted_orgs", s.scanExpiredDeletedOrgs},
+		{"onlyoffice_pending_blocks", s.scanOnlyOfficePendingBlocks},
 		{"s3_orphan_recovery", s.scanS3OrphanRecovery},
 	}
 
@@ -930,6 +949,49 @@ func (s *Scanner) scanExpiredDeletedOrgs(ctx context.Context) (int, error) {
 	metrics.GCItemsEnqueuedTotal.WithLabelValues("expired_deleted_orgs").Add(float64(enqueued))
 	metrics.GCScannerLastPhaseRun.WithLabelValues("expired_deleted_orgs").SetToCurrentTime()
 	return enqueued, nil
+}
+
+// scanOnlyOfficePendingBlocks reconciles stale onlyoffice_pending_blocks
+// rows org-by-org. The inline trigger in saveEditedDocument only fires when
+// someone saves a new revision in that library, so without this scanner
+// phase a library that loses OnlyOffice traffic could retain pending rows
+// (and their materialized blocks) indefinitely. Reconciliation itself is
+// idempotent — DecrementBlockRefCountsOnce protects against double-decrement
+// across the inline and scanner trigger paths.
+func (s *Scanner) scanOnlyOfficePendingBlocks(ctx context.Context) (int, error) {
+	log.Println("[GC Scanner] Phase 14: Reconciling OnlyOffice pending blocks...")
+	if s.onlyOfficeReconciler == nil {
+		return 0, nil
+	}
+
+	orgs, err := s.store.ListOrganizations()
+	if err != nil {
+		return 0, fmt.Errorf("list organizations: %w", err)
+	}
+
+	reconciled := 0
+	var firstErr error
+	for _, orgID := range orgs {
+		select {
+		case <-ctx.Done():
+			return reconciled, ctx.Err()
+		default:
+		}
+
+		if err := s.onlyOfficeReconciler.ReconcileOnlyOfficePendingBlocks(orgID); err != nil {
+			log.Printf("[GC Scanner] Phase 14: reconcile org %s: %v", orgID, err)
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		reconciled++
+	}
+
+	log.Printf("[GC Scanner] Phase 14 complete: reconciled %d organizations", reconciled)
+	recordScannerAction("onlyoffice_pending_blocks", "reconciled", reconciled)
+	metrics.GCScannerLastPhaseRun.WithLabelValues("onlyoffice_pending_blocks").SetToCurrentTime()
+	return reconciled, firstErr
 }
 
 // scanS3OrphanRecovery retries S3 deletes for blocks whose DB rows were

@@ -159,6 +159,9 @@ func TestOnlyOfficePendingBlocksMigrationExists(t *testing.T) {
 	content := string(raw)
 
 	assert.Contains(t, content, "CREATE TABLE IF NOT EXISTS onlyoffice_pending_blocks")
+	assert.Contains(t, content, "org_id            UUID")
+	assert.Contains(t, content, "repo_id           UUID")
 	assert.Contains(t, content, "publish_commit_id TEXT")
 	assert.Contains(t, content, "PRIMARY KEY ((org_id), operation_id)")
+	assert.Contains(t, content, "WITH default_time_to_live = 604800")
 }
