@@ -580,6 +580,11 @@ A `MockStorageProvider` and `mockBlockDeleter` simulate S3 and track deleted blo
 | `internal/api/gc_adapter_test.go` | 7 | Unit | Invalid UUIDs, empty inputs, interface compliance, nil service, config defaults |
 | `internal/api/v2/gc_hooks_test.go` | 8 | Unit | Set/get hooks, nil defaults, concurrent access, interface compile-time check, mock call recording |
 
+Known coverage gaps from the PR 60 merge audit:
+- `onlyoffice_pending_blocks` has no direct end-to-end test that seeds stale pending rows and verifies both reconciliation outcomes: reachable publish commits are cleared without rollback, and abandoned materialized blocks are decremented/enqueued through the scanner path.
+- `scanOnlyOfficePendingBlocks` and the API-to-GC `OnlyOfficeReconciler` adapter are covered by compilation and Docker integration startup, but not by a focused mock scanner test that asserts org iteration, error accumulation, and phase metrics.
+- `ScanOnce` still aggregates the OnlyOffice phase's "organizations reconciled" count into its generic `enqueued` total. When that observability debt is fixed, add a regression test that locks the intended counter semantics.
+
 ### Key Test Scenarios
 
 All of these run without any external dependencies:
