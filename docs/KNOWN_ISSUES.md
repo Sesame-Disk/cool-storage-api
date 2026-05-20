@@ -1,6 +1,6 @@
 # Known Issues - SesameFS
 
-**Last Updated**: 2026-05-15
+**Last Updated**: 2026-05-20
 
 This document tracks all known bugs, limitations, and issues in SesameFS.
 
@@ -34,6 +34,7 @@ This document tracks all known bugs, limitations, and issues in SesameFS.
 | Modal Dialogs | ✅ All 122 Fixed | All dialog files use Bootstrap classes |
 | Library Settings Backend | Partial | API tokens and transfer are complete. History and auto-delete settings persist, but retention/delete semantics are incomplete. See ISSUE-LIB-RETENTION-01. |
 | **Desktop SSO Browser UX** | ✅ Fixed (2026-03-04) | After browser SSO login for desktop client, now shows confirmation page with auto-close. See ISSUE-SSO-01 below. |
+| **Desktop Sync Active-Active Conflict Recovery** | 🔴 Desktop-sync GA blocker | `PUT /commit/HEAD` and `POST /update-branch` now use parent-chain validation plus CAS, but both still return `200 OK` on stale conflicts without server-side retry. `PUT /commit/HEAD` has no-rollback handler coverage; `UpdateBranch` parity and real desktop-client recovery under multi-node contention remain unproven. See ISSUE-SYNC-HEAD-RECOVERY-01 below. |
 | **Upload "Don't Replace" (Desktop Client)** | 🟡 Pending | Desktop client file browser "No" button (auto-rename) doesn't work. Client uses `update-link` vs `upload-link` to distinguish replace vs no-replace, but both map to same token/handler. Backend autorename infrastructure ready (`autoRenameIfExists`), needs token-level `Replace` flag to distinguish endpoints. Web "Don't replace" also broken (same root cause). See ISSUE-UPLOAD-REPLACE-01 below. |
 | **Org Logo Upload** | 🟡 Stub | `UpdateOrgLogo` in org_admin.go accepts the file but does not persist it to storage. Returns a static path from settings. Functional as a route placeholder until an asset storage backend is available. |
 | **Login Analytics History** | 🟡 Partial | `last_login` is now real and persisted in `users.last_login_at`, but there is still no historical login event dataset for trend analysis, login audit timelines, or period-based "users who logged in" charts. See ISSUE-LOGIN-ANALYTICS-01 below. |
@@ -397,6 +398,52 @@ What is still missing is traffic-accounting coverage for abandoned or failed chu
 
 - `docs/TECHNICAL-DEBT.md`
 - `docs/QUOTAS-AND-TRAFFIC-PLAN.md`
+
+---
+
+### ISSUE-SYNC-HEAD-RECOVERY-01: Desktop Sync HEAD Conflict Recovery Is Still Unproven Under Active-Active Contention
+
+**Status**: 🔴 Open / confirmed gap (2026-05-20)
+**Severity**: High for desktop sync active-active deployments; not a web-only blocker
+**Affected**: `PUT /seafhttp/repo/:repo_id/commit/HEAD`, `POST /seafhttp/repo/:repo_id/update-branch`, desktop sync launch criteria
+
+#### What Is True Today
+
+The original blind-overwrite bug from February is fixed. Both sync HEAD-publish endpoints now:
+
+- validate the parent chain against the current HEAD;
+- advance `libraries.head_commit_id` via CAS in `updateLibraryHeadWithStats()`;
+- keep canonical, lookup, and admin projection rows aligned on the successful path.
+
+However, both endpoints still treat stale conflicts as client-compatible `200 OK` responses:
+
+- parent-chain mismatch returns `200 OK` without advancing HEAD;
+- CAS conflict also returns `200 OK` without server-side retry.
+
+That means the remaining gap is not missing CAS. The remaining gap is whether desktop clients reliably recover when the server relies on the client to notice that HEAD did not advance and retry later.
+
+#### Current Evidence
+
+- Code path: `internal/api/sync.go` uses parent-chain validation plus CAS for both `PUT /commit/HEAD` and `POST /update-branch`.
+- Handler-level regression proof exists for `PUT /commit/HEAD`: `TestSyncHeadConflictReturnsOKWithoutRollback` in `internal/integration/library_projection_regression_test.go` proves stale conflicts return `200 OK` without rolling canonical or lookup/admin state backward.
+- There is no equivalent regression today for `POST /update-branch`.
+- The functional sync protocol test surfaces (`docs/SEAFILE-SYNC-PROTOCOL.md`, `docs/SYNC-TESTING.md`) cover single-client and non-contention scenarios, not a real desktop-client conflict/recovery flow under multi-node active-active contention.
+
+#### Why This Stays Open
+
+The code comments currently assume "the client will detect HEAD did not advance on next sync check", but that recovery behavior is not proven end-to-end in this repo for active-active desktop sync contention.
+
+Until that proof exists, desktop sync should not be described as fully production-safe for multi-node active-active deployments even though web upload and mutation correctness are substantially improved.
+
+#### Exit Criteria
+
+- Add equivalent no-rollback/conflict regression coverage for `POST /update-branch`; and
+- either implement bounded server-side retry for sync HEAD publish, or add a real desktop-client conflict/recovery proof under multi-node contention.
+
+#### Related
+
+- `docs/TECHNICAL-DEBT.md` §19.a — retry asymmetry between sync HEAD publish and the v2/upload retry helpers.
+- `docs/IMPLEMENTATION_STATUS.md` — desktop sync status now reflects this remaining launch gap.
 
 ---
 
@@ -895,6 +942,8 @@ Added `getEffectiveHostname(c *gin.Context) string` helper in `server.go` for th
 - `internal/api/sync.go` — Bugs 1A-1D, 4, 5, 7: PutCommit HEAD separation, parent-chain validation, CAS updates, CheckFS EMPTY_SHA1 skip, GetHeadCommitsMulti fallback, createInitialCommit SHA-1 alignment
 - `internal/api/seafhttp.go` — Bug 2A/2B: HandleUpload and finalizeUploadStreaming error propagation
 - `internal/api/v2/files.go` — Bugs 3, 6: ListDirectory/ListDirectoryV21 error handling and empty-root handling
+
+This closed the missing-CAS and missing-parent-validation bug class. The remaining active-active desktop-sync recovery/validation gap is tracked separately in `ISSUE-SYNC-HEAD-RECOVERY-01`.
 
 ---
 

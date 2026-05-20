@@ -2,7 +2,7 @@
 
 This document describes how to run tests, test coverage, and testing infrastructure.
 
-**Last updated: 2026-03-30**
+**Last updated: 2026-05-20**
 
 ---
 
@@ -74,6 +74,17 @@ Keep background GC isolated to the primary `sesamefs` service in that profile.
 sensitive integration tests become nondeterministic because secondary nodes can
 reconcile queue counters, requeue failed items, or purge expired share links in
 parallel.
+
+### Current Multi-Instance Coverage Gaps
+
+- There is still no true concurrent quota-exhaustion race test that drives the
+  same org/user against a hard storage cap from 2-3 nodes at once.
+- There is still no real desktop-client active-active conflict/recovery test for
+  `PUT /seafhttp/repo/:repo_id/commit/HEAD` or
+  `POST /seafhttp/repo/:repo_id/update-branch`.
+- Handler-level integration proof currently covers `PUT /commit/HEAD`
+  no-rollback-on-conflict semantics, but there is no equivalent regression yet
+  for `UpdateBranch`.
 
 ### Test Categories
 

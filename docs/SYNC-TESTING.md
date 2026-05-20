@@ -31,6 +31,10 @@ The test suite covers:
 - **File modifications**: Update existing files
 - **Subdirectory sync**: Nested folder structures
 
+These checks are functional single-client sync scenarios. They do not currently
+prove active-active conflict recovery for `PUT /seafhttp/repo/:repo_id/commit/HEAD`
+or `POST /seafhttp/repo/:repo_id/update-branch` under multi-node contention.
+
 ### Manual Testing
 
 ```bash

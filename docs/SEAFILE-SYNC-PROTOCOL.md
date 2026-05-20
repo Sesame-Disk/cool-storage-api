@@ -34,6 +34,10 @@ cd docker/seafile-cli-debug
 - ✅ Many tiny files (50 files, performance)
 - ✅ Mixed content (various file sizes and folder depths)
 
+These are functional single-client compatibility checks. They do not currently
+prove active-active conflict recovery for `PUT /seafhttp/repo/{id}/commit/HEAD`
+or `POST /seafhttp/repo/{id}/update-branch` under multi-node contention.
+
 See `COMPREHENSIVE_TESTING.md` for detailed usage.
 
 ---

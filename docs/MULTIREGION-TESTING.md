@@ -188,6 +188,13 @@ live in Go integration tests. Treat the shell harness as operational smoke
 coverage, not as the primary regression signal for same-library concurrent
 writes.
 
+What still sits outside both the default multi-instance path and the dedicated
+multiregion stack today:
+
+- a true same-org/same-user concurrent quota-exhaustion race across nodes;
+- a real desktop-client conflict/recovery scenario for `PUT /commit/HEAD` and
+  `POST /update-branch` under active-active contention.
+
 For deterministic local validation, only the primary backend in the main
 compose-based multi-instance path should run GC. Secondary test nodes must keep
 `GC_ENABLED=false` so background GC workers do not race queue-reconciliation or
