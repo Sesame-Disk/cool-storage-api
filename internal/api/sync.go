@@ -2021,7 +2021,7 @@ func (h *SyncHandler) readSyncTargetCommit(repoID, commitID string) (string, str
 }
 
 func (h *SyncHandler) handleSyncHeadPromotion(c *gin.Context, orgID, userID, repoID, targetHead, operation string) {
-	const maxAttempts = 5
+	maxAttempts := v2.RetryAttempts()
 
 	commitParent, rootFSID, err := h.readSyncTargetCommit(repoID, targetHead)
 	if err != nil {
@@ -2058,7 +2058,7 @@ func (h *SyncHandler) handleSyncHeadPromotion(c *gin.Context, orgID, userID, rep
 				c.Status(http.StatusOK)
 				return
 			}
-			time.Sleep(v2.RetryBackoff(attempt))
+			time.Sleep(v2.RetryBackoff(attempt + 1))
 			continue
 		}
 
@@ -2083,7 +2083,7 @@ func (h *SyncHandler) handleSyncHeadPromotion(c *gin.Context, orgID, userID, rep
 				c.Status(http.StatusOK)
 				return
 			}
-			time.Sleep(v2.RetryBackoff(attempt))
+			time.Sleep(v2.RetryBackoff(attempt + 1))
 			continue
 		}
 

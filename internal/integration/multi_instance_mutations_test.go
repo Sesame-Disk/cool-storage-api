@@ -127,6 +127,15 @@ func multiInstanceFileNames(prefix string, count int) []string {
 	return names
 }
 
+const syncHeadRetryProbeDelay = 90 * time.Millisecond
+
+func expectSyncHeadRetryObserved(t *testing.T, result concurrentMutationResult) {
+	t.Helper()
+	if result.took < syncHeadRetryProbeDelay {
+		t.Fatalf("%s completed in %s, shorter than retry probe delay %s; test did not prove parent-mismatch retry", result.name, result.took, syncHeadRetryProbeDelay)
+	}
+}
+
 func multiInstanceUpdateBranchStatus(c *testClient, repoID, head string) concurrentMutationResult {
 	req, err := http.NewRequest(http.MethodPost, c.baseURL+fmt.Sprintf("/seafhttp/repo/%s/update-branch?head=%s", repoID, url.QueryEscape(head)), nil)
 	if err != nil {
@@ -187,35 +196,26 @@ func TestMultiInstanceUpdateBranchConvergesWhenParentPromotionWinsDuringRetry(t 
 		}
 	})
 
-	results := make(chan concurrentMutationResult, 2)
-	var wg sync.WaitGroup
-
-	wg.Add(1)
+	finalResults := make(chan concurrentMutationResult, 1)
 	go func() {
-		defer wg.Done()
 		result := multiInstanceUpdateBranchStatus(clients[1], repoID, finalHead)
 		result.name = "promote-final"
-		results <- result
+		finalResults <- result
 	}()
 
-	time.Sleep(10 * time.Millisecond)
-
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		result := multiInstanceUpdateBranchStatus(clients[0], repoID, intermediateHead)
-		result.name = "promote-intermediate"
-		results <- result
-	}()
-
-	wg.Wait()
-	close(results)
-
-	collected := make([]concurrentMutationResult, 0, 2)
-	for result := range results {
-		collected = append(collected, result)
+	select {
+	case result := <-finalResults:
+		t.Fatalf("final update-branch completed before parent promotion; result=%+v", result)
+	case <-time.After(syncHeadRetryProbeDelay):
 	}
+
+	intermediateResult := multiInstanceUpdateBranchStatus(clients[0], repoID, intermediateHead)
+	intermediateResult.name = "promote-intermediate"
+
+	finalResult := <-finalResults
+	collected := []concurrentMutationResult{finalResult, intermediateResult}
 	expectConcurrentStatuses(t, collected, http.StatusOK)
+	expectSyncHeadRetryObserved(t, finalResult)
 
 	waitForIntegrationCondition(t, "multi-instance update-branch to converge to the final chained head", func() bool {
 		current := readLibrarySyncHeadState(t, session, repoID)
@@ -243,35 +243,26 @@ func TestMultiInstancePutCommitHeadConvergesWhenParentPromotionWinsDuringRetry(t
 		}
 	})
 
-	results := make(chan concurrentMutationResult, 2)
-	var wg sync.WaitGroup
-
-	wg.Add(1)
+	finalResults := make(chan concurrentMutationResult, 1)
 	go func() {
-		defer wg.Done()
 		result := multiInstancePutCommitHeadStatus(clients[1], repoID, finalHead)
 		result.name = "promote-final"
-		results <- result
+		finalResults <- result
 	}()
 
-	time.Sleep(10 * time.Millisecond)
-
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		result := multiInstancePutCommitHeadStatus(clients[0], repoID, intermediateHead)
-		result.name = "promote-intermediate"
-		results <- result
-	}()
-
-	wg.Wait()
-	close(results)
-
-	collected := make([]concurrentMutationResult, 0, 2)
-	for result := range results {
-		collected = append(collected, result)
+	select {
+	case result := <-finalResults:
+		t.Fatalf("final put commit HEAD completed before parent promotion; result=%+v", result)
+	case <-time.After(syncHeadRetryProbeDelay):
 	}
+
+	intermediateResult := multiInstancePutCommitHeadStatus(clients[0], repoID, intermediateHead)
+	intermediateResult.name = "promote-intermediate"
+
+	finalResult := <-finalResults
+	collected := []concurrentMutationResult{finalResult, intermediateResult}
 	expectConcurrentStatuses(t, collected, http.StatusOK)
+	expectSyncHeadRetryObserved(t, finalResult)
 
 	waitForIntegrationCondition(t, "multi-instance put commit HEAD to converge to the final chained head", func() bool {
 		current := readLibrarySyncHeadState(t, session, repoID)

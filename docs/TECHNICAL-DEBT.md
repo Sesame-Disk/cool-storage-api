@@ -1144,7 +1144,7 @@ Update 2026-05-19: both upload seams now also fail closed if `IncrementOrCreateB
 
 The remaining debt here is not the old blind-overwrite bug. `PUT /commit/HEAD` and `POST /update-branch` already use parent-chain validation, CAS, and bounded retry, with regression and multi-node convergence coverage on both routes. The remaining debt is duplicated retry orchestration plus proof: exhausted sync retry budgets still preserve client-compatible `200 OK`, and the current sync test surface still does not prove that a real desktop client converges under active-active multi-node contention.
 
-For the three retrying paths, the debt remains maintainability rather than correctness: the upload-specific `*_Once` extraction is already in place, and migrating both upload loops to `retryLibraryHeadMutation` would still remove duplicated retry bookkeeping and keep future contention tuning in one place.
+For the retrying paths, the debt remains maintainability rather than correctness: the upload-specific `*_Once` extraction is already in place, and migrating both upload loops to `retryLibraryHeadMutation` would still remove duplicated retry bookkeeping and keep future contention tuning in one place.
 
 ### 19.b. `CleanupFileTagsByPrefix` Performance
 

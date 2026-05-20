@@ -571,6 +571,13 @@ func RetryBackoff(attempt int) time.Duration {
 	return libraryHeadMutationRetryBackoff(attempt)
 }
 
+// RetryAttempts returns the bounded retry budget shared by every CAS-based
+// HEAD-mutation path (uploads, v2 mutations, and sync HEAD publish). Keeping a
+// single source of truth prevents the per-caller budgets from drifting again.
+func RetryAttempts() int {
+	return libraryHeadMutationRetryAttempts
+}
+
 func libraryHeadMutationRetryBackoff(attempt int) time.Duration {
 	if attempt < 1 || libraryHeadMutationRetryDelay <= 0 {
 		return 0

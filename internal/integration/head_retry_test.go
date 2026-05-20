@@ -20,6 +20,7 @@ type concurrentMutationResult struct {
 	status int
 	body   string
 	err    error
+	took   time.Duration
 }
 
 func runConcurrentMutations(t *testing.T, names []string, mutate func(name string) concurrentMutationResult) []concurrentMutationResult {
@@ -91,16 +92,17 @@ func postFormStatus(c *testClient, path string, values url.Values) concurrentMut
 }
 
 func doStatus(c *testClient, req *http.Request) concurrentMutationResult {
+	started := time.Now()
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return concurrentMutationResult{err: err}
+		return concurrentMutationResult{err: err, took: time.Since(started)}
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return concurrentMutationResult{status: resp.StatusCode, err: err}
+		return concurrentMutationResult{status: resp.StatusCode, err: err, took: time.Since(started)}
 	}
-	return concurrentMutationResult{status: resp.StatusCode, body: string(body)}
+	return concurrentMutationResult{status: resp.StatusCode, body: string(body), took: time.Since(started)}
 }
 
 func listDirEntries(t *testing.T, repoID, dirPath string) []interface{} {
