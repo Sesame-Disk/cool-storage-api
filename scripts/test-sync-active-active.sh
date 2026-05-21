@@ -24,6 +24,7 @@ SYNC_DATA_DIR="/seafile-data"
 KEEP_STATE=false
 VERBOSE=false
 COMPOSE_BUILD=true
+SCENARIO="all"
 
 REPO_ID=""
 REPO_NAME=""
@@ -38,6 +39,31 @@ log_verbose() {
   if [ "$VERBOSE" = true ]; then
     echo "[DEBUG] $1"
   fi
+}
+
+client_status_output() {
+  local service="$1"
+  docker_exec_service "$service" seaf-cli status -c "$SYNC_CONFIG_DIR" 2>/dev/null || true
+}
+
+client_repo_status_line() {
+  local service="$1"
+  local output=""
+
+  output=$(client_status_output "$service")
+  printf '%s\n' "$output" | awk -v repo_name="$REPO_NAME" 'index($0, repo_name) == 1 { print; exit }'
+}
+
+status_line_is_synchronized() {
+  local status_line="$1"
+  case "$status_line" in
+    *" synchronized"*)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
 }
 
 backend_logs() {
@@ -237,6 +263,21 @@ create_library() {
   log_success "Created library ${REPO_ID}"
 }
 
+prepare_synced_library() {
+  create_library
+  start_sync_on_client "$PRIMARY_SERVICE"
+  start_sync_on_client "$SECONDARY_SERVICE"
+  wait_for_client_sync "$PRIMARY_SERVICE"
+  wait_for_client_sync "$SECONDARY_SERVICE"
+}
+
+reset_current_repo_state() {
+  cleanup_repo_state
+  REPO_ID=""
+  REPO_NAME=""
+  SYNC_DIR=""
+}
+
 delete_library() {
   if [ -z "$REPO_ID" ]; then
     return 0
@@ -390,6 +431,127 @@ wait_for_client_content() {
   exit 1
 }
 
+wait_for_any_client_non_synchronized() {
+  local max_wait="${1:-60}"
+  local waited=0
+
+  while [ $waited -lt $max_wait ]; do
+    local primary_status_line=""
+    local secondary_status_line=""
+
+    primary_status_line=$(client_repo_status_line "$PRIMARY_SERVICE")
+    secondary_status_line=$(client_repo_status_line "$SECONDARY_SERVICE")
+
+    if [ -n "$primary_status_line" ] && [ -n "$secondary_status_line" ]; then
+      if ! status_line_is_synchronized "$primary_status_line" || ! status_line_is_synchronized "$secondary_status_line"; then
+        log_verbose "Primary status: ${primary_status_line}"
+        log_verbose "Secondary status: ${secondary_status_line}"
+        return 0
+      fi
+    fi
+
+    sleep 1
+    waited=$((waited + 1))
+  done
+
+  log_error "Both clients still report synchronized after the unsafe conflict window"
+  echo "Primary status: $(client_repo_status_line "$PRIMARY_SERVICE")" >&2
+  echo "Secondary status: $(client_repo_status_line "$SECONDARY_SERVICE")" >&2
+  exit 1
+}
+
+assert_client_content() {
+  local service="$1"
+  local file_name="$2"
+  local expected="$3"
+  local actual=""
+
+  actual=$(client_file_content "$service" "$file_name")
+  if [ "$actual" != "$expected" ]; then
+    log_error "${service} content mismatch for ${file_name}"
+    echo "Expected: ${expected}" >&2
+    echo "Actual:   ${actual}" >&2
+    exit 1
+  fi
+}
+
+finalize_successful_scenario_state() {
+  local preserve_state="$1"
+
+  if [ "$KEEP_STATE" = true ] && [ "$preserve_state" = true ]; then
+    return 0
+  fi
+
+  reset_current_repo_state
+}
+
+run_non_overlapping_auto_merge_scenario() {
+  local preserve_state="${1:-false}"
+  local first_name="client-1.txt"
+  local second_name="client-2.txt"
+  local first_content="client-1 active-active proof $(date -Iseconds) $RANDOM"
+  local second_content="client-2 active-active proof $(date -Iseconds) $RANDOM"
+
+  log_info "Scenario: non-overlapping concurrent writes should auto-merge"
+  prepare_synced_library
+
+  log_info "Stopping both clients so local changes stay offline until the race starts"
+  stop_clients
+
+  log_info "Staging divergent local changes from the same synced base state"
+  write_client_file "$PRIMARY_SERVICE" "$first_name" "$first_content"
+  write_client_file "$SECONDARY_SERVICE" "$second_name" "$second_content"
+
+  log_info "Starting both clients concurrently from the same synced base state"
+  start_clients
+  wait_for_remote_entries "$first_name" "$second_name"
+  wait_for_backend_log_pattern "parent mismatch for repo ${REPO_ID}" "a sync parent mismatch for ${REPO_ID}"
+  wait_for_backend_log_pattern "auto-merged repo ${REPO_ID}" "an auto-merge publish for ${REPO_ID}"
+
+  log_info "Triggering a pull round so both clients absorb the winning head"
+  trigger_concurrent_sync
+  wait_for_client_sync "$PRIMARY_SERVICE"
+  wait_for_client_sync "$SECONDARY_SERVICE"
+
+  wait_for_client_content "$PRIMARY_SERVICE" "$first_name" "$first_content"
+  wait_for_client_content "$PRIMARY_SERVICE" "$second_name" "$second_content"
+  wait_for_client_content "$SECONDARY_SERVICE" "$first_name" "$first_content"
+  wait_for_client_content "$SECONDARY_SERVICE" "$second_name" "$second_content"
+
+  log_success "Non-overlapping concurrent writes converged via observed auto-merge"
+  finalize_successful_scenario_state "$preserve_state"
+}
+
+run_same_path_unsafe_conflict_scenario() {
+  local preserve_state="${1:-false}"
+  local shared_name="collision.txt"
+  local first_content="client-1 unsafe-conflict proof $(date -Iseconds) $RANDOM"
+  local second_content="client-2 unsafe-conflict proof $(date -Iseconds) $RANDOM"
+
+  log_info "Scenario: same-path concurrent writes should fail closed with 503 and preserve local state"
+  prepare_synced_library
+
+  log_info "Stopping both clients so conflicting local edits remain offline until publish"
+  stop_clients
+
+  log_info "Staging conflicting local writes to the same path"
+  write_client_file "$PRIMARY_SERVICE" "$shared_name" "$first_content"
+  write_client_file "$SECONDARY_SERVICE" "$shared_name" "$second_content"
+
+  log_info "Starting both clients concurrently to trigger an unsafe sync conflict"
+  start_clients
+  wait_for_remote_entry "$shared_name" 60
+  wait_for_backend_log_pattern "auto-merge could not safely resolve repo ${REPO_ID}" "an unmergeable auto-merge decision for ${REPO_ID}"
+  wait_for_backend_log_pattern "parent mismatch retry budget exhausted for repo ${REPO_ID}" "a fail-closed 503 outcome for ${REPO_ID}"
+  wait_for_any_client_non_synchronized 60
+
+  assert_client_content "$PRIMARY_SERVICE" "$shared_name" "$first_content"
+  assert_client_content "$SECONDARY_SERVICE" "$shared_name" "$second_content"
+
+  log_success "Unsafe same-path conflict preserved both local edits after observed 503 exhaustion"
+  finalize_successful_scenario_state "$preserve_state"
+}
+
 cleanup_repo_state() {
   if [ -n "$SYNC_DIR" ]; then
     docker_exec_service_shell "$PRIMARY_SERVICE" "seaf-cli desync -c '$SYNC_CONFIG_DIR' -d '$SYNC_DIR' > /dev/null 2>&1 || true; rm -rf '$SYNC_DIR'" || true
@@ -432,6 +594,14 @@ parse_args() {
       --no-build)
         COMPOSE_BUILD=false
         ;;
+      --scenario)
+        if [ $# -lt 2 ]; then
+          log_error "--scenario requires one of: all, safe-auto-merge, unsafe-503"
+          exit 1
+        fi
+        SCENARIO="$2"
+        shift
+        ;;
       --help|-h)
         cat <<'EOF'
 SesameFS Active-Active Desktop Proof
@@ -442,6 +612,7 @@ Options:
   --keep       Keep the proof library and running client services for inspection
   --verbose    Show additional debug logging
   --no-build   Reuse existing compose images without rebuilding
+  --scenario   all | safe-auto-merge | unsafe-503 (default: all)
   --help       Show this help message
 EOF
         exit 0
@@ -472,42 +643,23 @@ main() {
   initialize_client "$PRIMARY_SERVICE"
   initialize_client "$SECONDARY_SERVICE"
 
-  create_library
-
-  start_sync_on_client "$PRIMARY_SERVICE"
-  start_sync_on_client "$SECONDARY_SERVICE"
-  wait_for_client_sync "$PRIMARY_SERVICE"
-  wait_for_client_sync "$SECONDARY_SERVICE"
-
-  local first_name="client-1.txt"
-  local second_name="client-2.txt"
-  local first_content="client-1 active-active proof $(date -Iseconds) $RANDOM"
-  local second_content="client-2 active-active proof $(date -Iseconds) $RANDOM"
-
-  log_info "Stopping both clients so local changes stay offline until the race starts"
-  stop_clients
-
-  log_info "Staging divergent local changes from the same synced base state"
-  write_client_file "$PRIMARY_SERVICE" "$first_name" "$first_content"
-  write_client_file "$SECONDARY_SERVICE" "$second_name" "$second_content"
-
-  log_info "Starting both clients concurrently from the same synced base state"
-  start_clients
-  wait_for_remote_entries "$first_name" "$second_name"
-  wait_for_backend_log_pattern "parent mismatch for repo ${REPO_ID}" "a sync parent mismatch for ${REPO_ID}"
-  wait_for_backend_log_pattern "auto-merged repo ${REPO_ID}" "an auto-merge publish for ${REPO_ID}"
-
-  log_info "Triggering a pull round so both clients absorb the winning head"
-  trigger_concurrent_sync
-  wait_for_client_sync "$PRIMARY_SERVICE"
-  wait_for_client_sync "$SECONDARY_SERVICE"
-
-  wait_for_client_content "$PRIMARY_SERVICE" "$first_name" "$first_content"
-  wait_for_client_content "$PRIMARY_SERVICE" "$second_name" "$second_content"
-  wait_for_client_content "$SECONDARY_SERVICE" "$first_name" "$first_content"
-  wait_for_client_content "$SECONDARY_SERVICE" "$second_name" "$second_content"
-
-  log_success "Both clients converged to the same remote tree after concurrent local writes"
+  case "$SCENARIO" in
+    all)
+      run_non_overlapping_auto_merge_scenario false
+      run_same_path_unsafe_conflict_scenario true
+      log_success "All active-active desktop conflict scenarios passed"
+      ;;
+    safe-auto-merge)
+      run_non_overlapping_auto_merge_scenario true
+      ;;
+    unsafe-503)
+      run_same_path_unsafe_conflict_scenario true
+      ;;
+    *)
+      log_error "Unknown scenario: ${SCENARIO}"
+      exit 1
+      ;;
+  esac
 }
 
 main "$@"

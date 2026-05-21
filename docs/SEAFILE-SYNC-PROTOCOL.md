@@ -27,10 +27,14 @@ cd docker/seafile-cli-debug
 
 From the repository root, run `bash ./scripts/test-sync-active-active.sh` to
 exercise two real `seaf-cli` clients against different backend nodes and prove
-the non-overlapping active-active auto-merge path for concurrent
-`PUT /seafhttp/repo/{id}/commit/HEAD` contention. The harness also asserts that
-backend logs recorded both a `parent mismatch` and an `auto-merge` for the
-proof repository.
+both core active-active desktop outcomes for concurrent
+`PUT /seafhttp/repo/{id}/commit/HEAD` contention:
+- non-overlapping writes that auto-merge after an observed `parent mismatch`
+- same-path conflicts that fail closed with an observed retry-budget `503`
+
+The harness also asserts that backend logs recorded the expected conflict path
+for each proof repository. Use `--scenario safe-auto-merge` or
+`--scenario unsafe-503` when you want to isolate one branch.
 
 **What gets tested:**
 - ✅ Single file sync
@@ -42,9 +46,10 @@ proof repository.
 - ✅ Mixed content (various file sizes and folder depths)
 
 The comprehensive proxy suite above is focused on single-client compatibility.
-The real desktop proof in `scripts/test-sync-active-active.sh` covers the
-non-overlapping active-active auto-merge path only; unsafe-conflict `503`
-handling still remains a separate real-client follow-up.
+The real desktop proof in `scripts/test-sync-active-active.sh` now covers both
+the non-overlapping auto-merge path and the same-path fail-closed `503`
+preservation path. Broader active-active scenario coverage still remains a
+separate follow-up.
 
 See `COMPREHENSIVE_TESTING.md` for detailed usage.
 

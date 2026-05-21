@@ -27,7 +27,7 @@ docker compose --profile test run --rm --build go-all-test
 # API integration tests against the running stack
 docker compose --profile test run --rm --build api-test
 
-# Real seaf-cli sync protocol suite (docker-native)
+# Real seaf-cli single-client sync protocol suite (docker-native)
 docker compose --profile test run --rm --build sync-test
 
 # Frontend checks and mobile checks plus smoke
@@ -74,11 +74,21 @@ Do not attach tests to `docker compose up -d --build` itself. That command shoul
 | `frontend-test` | Frontend lint + Jest |
 | `mobile-test` | Mobile typecheck + lint + Vitest + desktop split smoke |
 
-`sync-test` is now the preferred Docker-native entry point for the real
-Seafile harness. It runs `scripts/test-sync.sh` inside the `docker/seafile-cli`
-image with fresh dedicated data/config volumes. `./scripts/test.sh sync` now
-delegates to `sync-test` when Docker Compose is available and falls back to the
-long-lived `seafile-cli` debug container only when needed.
+`sync-test` is now the preferred Docker-native entry point for the single-
+client real Seafile harness. It runs `scripts/test-sync.sh` inside the
+`docker/seafile-cli` image with fresh dedicated data/config volumes.
+`./scripts/test.sh sync` now runs that service first and then executes
+`scripts/test-sync-active-active.sh` as the second half of the unified
+Docker-first sync path. When Docker Compose is not available, the wrapper still
+falls back to the long-lived `seafile-cli` debug container path.
+
+For the active-active desktop conflict harness specifically, run
+`bash ./scripts/test-sync-active-active.sh`. That script is also included in
+`./scripts/test.sh sync` on the Docker-first path, and it exercises both the
+non-overlapping auto-merge path and the same-path fail-closed `503`
+preservation path with two real `seaf-cli` clients against different backend
+nodes. Use `--scenario safe-auto-merge` or `--scenario unsafe-503` to isolate a
+single branch.
 
 The default Go integration path is now multi-instance inside the compose `test`
 profile: `go-integration-test` and `go-all-test` wait for `sesamefs`,
@@ -96,12 +106,11 @@ parallel.
 
 - There is still no true concurrent quota-exhaustion race test that drives the
   same org/user against a hard storage cap from 2-3 nodes at once.
-- There is still no real desktop-client active-active conflict/recovery test for
-  `PUT /seafhttp/repo/:repo_id/commit/HEAD` or
-  `POST /seafhttp/repo/:repo_id/update-branch`.
-- Handler-level integration proof currently covers `PUT /commit/HEAD`
-  no-rollback-on-conflict semantics, but there is no equivalent regression yet
-  for `UpdateBranch`.
+- The real desktop-client harness still does not cover quota rejection during
+  auto-merge or deeper-tree active-active conflict branches.
+- Handler-level integration proof now covers both `PUT /commit/HEAD` and
+  `POST /update-branch` for same-tree idempotence, non-overlapping auto-merge,
+  unmergeable `503`, and missing-current-head guards.
 
 ### Test Categories
 
@@ -125,6 +134,7 @@ parallel.
 |--------|-------------|
 | `--quick` | Skip long-running tests (encrypted library, failover) |
 | `--verbose` | Show detailed output |
+| `--keep-going` | Continue running remaining categories/suites after a failure. Default behavior is fail-fast. |
 | `--list` | List available tests without running |
 | `--help` | Show help message |
 
@@ -346,9 +356,10 @@ reachable on `http://localhost:8080` plus the debug `seafile-cli` container.
 docker compose --profile test run --rm --build sync-test
 docker compose --profile test run --rm --build -e SYNC_TEST_ARGS=--verbose sync-test
 
-# Unified wrapper (prefers sync-test automatically)
+# Unified wrapper (stops on the first failing suite by default)
 ./scripts/test.sh sync
 ./scripts/test.sh sync --verbose
+./scripts/test.sh sync --keep-going
 
 # Manual container management, if you want direct control
 docker compose --profile debug up -d --build seafile-cli

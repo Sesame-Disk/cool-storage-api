@@ -9,14 +9,18 @@ This guide explains how to test the Seafile desktop sync protocol using the cont
 Run the full sync protocol test suite with a single command:
 
 ```bash
-# Preferred docker-native one-liner
+# Docker-native single-client sync suite
 docker compose --profile test run --rm --build sync-test
 
-# Verbose docker-native run
+# Verbose docker-native single-client run
 docker compose --profile test run --rm --build -e SYNC_TEST_ARGS=--verbose sync-test
 
-# Unified wrapper: prefers sync-test, falls back to the debug container path
+# Unified wrapper: runs sync-test first, then the active-active desktop conflict harness
+# and stops on the first failing suite by default
 ./scripts/test.sh sync
+
+# Keep going after a failing suite if you want the full sync matrix
+./scripts/test.sh sync --keep-going
 
 # Run all tests (creates libraries, syncs, verifies, cleans up)
 ./scripts/test-sync.sh
@@ -44,12 +48,31 @@ These checks are functional single-client sync scenarios. They do not currently
 prove active-active conflict recovery for `PUT /seafhttp/repo/:repo_id/commit/HEAD`
 or `POST /seafhttp/repo/:repo_id/update-branch` under multi-node contention.
 
+For real desktop-client active-active coverage, run:
+
+```bash
+# Both real-client active-active scenarios (default)
+bash ./scripts/test-sync-active-active.sh
+
+# Only the safe non-overlapping auto-merge path
+bash ./scripts/test-sync-active-active.sh --scenario safe-auto-merge
+
+# Only the unsafe same-path 503 preservation path
+bash ./scripts/test-sync-active-active.sh --scenario unsafe-503
+```
+
+That harness now proves both:
+- non-overlapping concurrent writes that auto-merge after an observed `parent mismatch`
+- same-path concurrent writes that fail closed with retry-budget `503` while both local edits remain preserved on the clients
+
 `docker compose --profile test run --rm --build sync-test` is the preferred
 Docker-native entry point. It runs the real `scripts/test-sync.sh` suite inside
 the `docker/seafile-cli` image with fresh dedicated client config/data volumes
 on each run. `./scripts/test.sh sync` is the convenience wrapper for that same
-flow; it prefers `sync-test` automatically and only falls back to the long-
-lived debug `seafile-cli` container when needed.
+flow; it prefers `sync-test` automatically, then runs the active-active desktop
+conflict harness, and only falls back to the long-lived debug `seafile-cli`
+container path when needed. By default it stops at the first failing suite;
+use `--keep-going` if you want it to continue after a failure.
 
 ### Manual Testing
 
@@ -275,12 +298,24 @@ docker exec -it sesamefs-seafile-cli-1 curl http://sesamefs:8080/ping
 ### Auth Token Failed
 
 ```bash
-# Test auth endpoint directly
-docker exec -it sesamefs-seafile-cli-1 curl -X POST \
-  http://sesamefs:8080/api2/auth-token/ \
+# Get a fresh token from the test helper
+docker exec -it sesamefs-seafile-cli-1 seaf-test.sh get-token
+
+# Or request one directly
+curl -X POST http://localhost:8080/api2/auth-token/ \
   -d "username=00000000-0000-0000-0000-000000000001" \
   -d "password=dev-token-123"
 ```
+
+### Current Multi-Instance Coverage Gaps
+
+- There is still no true concurrent quota-exhaustion race test that drives the
+  same org/user against a hard storage cap from 2-3 nodes at once.
+- The real desktop-client harness still does not cover quota rejection during
+  auto-merge or deeper-tree active-active conflict branches.
+- Handler-level integration proof now covers both `PUT /commit/HEAD` and
+  `POST /update-branch` for same-tree idempotence, non-overlapping auto-merge,
+  unmergeable `503`, and missing-current-head guards.
 
 ## Comparing Local vs Reference Server
 
