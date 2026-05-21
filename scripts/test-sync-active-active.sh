@@ -263,6 +263,20 @@ create_library() {
   log_success "Created library ${REPO_ID}"
 }
 
+cleanup_stale_client_sync_dirs() {
+  local service=""
+
+  for service in "$PRIMARY_SERVICE" "$SECONDARY_SERVICE"; do
+    docker_exec_service_shell "$service" "
+      for dir in '${SYNC_DATA_DIR}'/active-active-*; do
+        [ -e \"\$dir\" ] || continue
+        seaf-cli desync -c '${SYNC_CONFIG_DIR}' -d \"\$dir\" > /dev/null 2>&1 || true
+        rm -rf \"\$dir\"
+      done
+    " || true
+  done
+}
+
 prepare_synced_library() {
   create_library
   start_sync_on_client "$PRIMARY_SERVICE"
@@ -642,6 +656,7 @@ main() {
 
   initialize_client "$PRIMARY_SERVICE"
   initialize_client "$SECONDARY_SERVICE"
+  cleanup_stale_client_sync_dirs
 
   case "$SCENARIO" in
     all)

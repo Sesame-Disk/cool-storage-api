@@ -72,7 +72,7 @@ while [[ $# -gt 0 ]]; do
       echo "Options:"
       echo "  --keep       Keep test libraries after completion"
       echo "  --verbose    Show detailed output"
-      echo "  --cleanup    Only cleanup previous test libraries"
+      echo "  --cleanup    Only cleanup previous sync/integration test libraries and active-active leftovers"
       echo "  --help       Show this help message"
       echo ""
       echo "Environment Variables:"
@@ -307,6 +307,42 @@ cleanup_repo_state() {
   desync_library "$repo_id"
   delete_library "$repo_id"
   sync_exec rm -rf "${SYNC_DATA_DIR}/sync-test-${repo_id}" 2>/dev/null || true
+}
+
+cleanup_active_active_client_state() {
+  if [ "$SYNC_TEST_IN_CONTAINER" = "1" ] || ! command -v docker > /dev/null 2>&1; then
+    return 0
+  fi
+
+  for service in seafile-cli-aa-1 seafile-cli-aa-2; do
+    local container_id
+    container_id=$( (cd "$PROJECT_DIR" && docker compose ps -q "$service") 2>/dev/null | head -n1 || true )
+    [ -n "$container_id" ] || continue
+
+    local running
+    running=$(docker inspect --format '{{.State.Running}}' "$container_id" 2>/dev/null || echo "false")
+    [ "$running" = "true" ] || continue
+
+    docker exec "$container_id" /bin/bash -lc "
+      for dir in '${SYNC_DATA_DIR}'/active-active-*; do
+        [ -e \"\$dir\" ] || continue
+        seaf-cli desync -c '${SYNC_CONFIG_DIR}' -d \"\$dir\" > /dev/null 2>&1 || true
+        rm -rf \"\$dir\"
+      done
+    " > /dev/null 2>&1 || true
+  done
+}
+
+release_shared_test_libraries() {
+  if [ -n "$UNENCRYPTED_REPO_ID" ]; then
+    cleanup_repo_state "$UNENCRYPTED_REPO_ID"
+    UNENCRYPTED_REPO_ID=""
+  fi
+
+  if [ -n "$ENCRYPTED_REPO_ID" ]; then
+    cleanup_repo_state "$ENCRYPTED_REPO_ID"
+    ENCRYPTED_REPO_ID=""
+  fi
 }
 
 # Wait for sync to complete
@@ -855,25 +891,31 @@ test_encrypted_file_modification() {
 #
 
 cleanup_test_libraries() {
-  log "Cleaning up test libraries..."
+  log "Cleaning up sync/integration test libraries and active-active leftovers..."
 
-  # List all libraries and find sync-test ones
+  cleanup_active_active_client_state
+
+  # List all libraries and find test-owned leftovers.
   local repos
   repos=$(curl -s "${SESAMEFS_URL_LOCAL}/api/v2.1/repos/" \
-    -H "Authorization: Token ${DEV_API_TOKEN}" | json_query -r '.repos[] | select(.repo_name | startswith("sync-test-")) | .repo_id')
+    -H "Authorization: Token ${DEV_API_TOKEN}" | json_query -r '.repos[] | select((.repo_name | startswith("sync-test-")) or (.repo_name | startswith("sync-aa-")) or (.repo_name | startswith("inttest-")) or (.repo_name | startswith("smoke-")) or (.repo_name == "sesamefs-public-smoke")) | [.repo_id, .repo_name] | @tsv')
 
-  for repo_id in $repos; do
-    log_verbose "Deleting library: ${repo_id}"
+  while IFS=$'\t' read -r repo_id repo_name; do
+    [ -n "$repo_id" ] || continue
 
-    # Desync first
-    desync_library "$repo_id"
+    log_verbose "Deleting library: ${repo_name} (${repo_id})"
+
+    if [[ "$repo_name" == sync-test-* ]]; then
+      # Desync and remove local state only for sync-test repos managed by this harness.
+      desync_library "$repo_id"
+      sync_exec rm -rf "${SYNC_DATA_DIR}/sync-test-${repo_id}" 2>/dev/null || true
+    fi
 
     # Delete from server
     delete_library "$repo_id"
-
-    # Remove local data
-    sync_exec rm -rf "${SYNC_DATA_DIR}/sync-test-${repo_id}" 2>/dev/null || true
-  done
+  done <<EOF
+${repos}
+EOF
 
   log_success "Cleanup complete"
 }
@@ -931,6 +973,10 @@ main() {
   check_services
   init_seafile_daemon
 
+  if [ "$KEEP_LIBRARIES" = false ]; then
+    cleanup_test_libraries
+  fi
+
   # Create test libraries
   echo ""
   log "Setting up test libraries..."
@@ -980,6 +1026,10 @@ main() {
   run_test "Encrypted: Local → Remote sync" test_encrypted_local_to_remote
   run_test "Encrypted: Large file (64KB) sync" test_encrypted_large_file
   run_test "Encrypted: Binary file sync" test_encrypted_binary_file
+  # The final scenario owns a fresh repo. Keep shared-repo tests above this line.
+  if [ "$KEEP_LIBRARIES" = false ]; then
+    release_shared_test_libraries
+  fi
   run_test "Encrypted: File modification sync" test_encrypted_file_modification
 
   # Print summary

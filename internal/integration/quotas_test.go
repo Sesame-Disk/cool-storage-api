@@ -108,29 +108,7 @@ func TestInvalidUserQuotaUpdatesAreRejected(t *testing.T) {
 func TestPerUserStorageQuotaBlocksUploadBeforeOrgQuota(t *testing.T) {
 	originalOrg := getAdminOrganizationInfo(t, defaultOrgID)
 	originalUser := getAdminUserByEmail(t, defaultUserEmail)
-
-	t.Cleanup(func() {
-		// Restore the user first while the org cap is still high; older seeded
-		// dev data may have a per-user quota above the original org cap.
-		restoreResp := superadminClient.PutJSON(t, "/api/v2.1/admin/users/"+url.PathEscape(defaultUserEmail)+"/", map[string]interface{}{
-			"quota_total": jsonInt64(originalUser, "quota_total"),
-		})
-		if restoreResp.StatusCode != http.StatusOK {
-			t.Logf("restore default user quota returned status %d body=%s", restoreResp.StatusCode, responseBody(t, restoreResp))
-		} else {
-			restoreResp.Body.Close()
-		}
-		restoreOrgBody := map[string]interface{}{
-			"storage_quota":          jsonInt64(originalOrg, "storage_quota"),
-			"traffic_quota":          jsonInt64(originalOrg, "traffic_quota"),
-			"traffic_upload_quota":   jsonInt64(originalOrg, "traffic_upload_quota"),
-			"traffic_download_quota": jsonInt64(originalOrg, "traffic_download_quota"),
-		}
-		if quotaPolicy := jsonString(originalOrg, "quota_policy"); quotaPolicy != "" {
-			restoreOrgBody["quota_policy"] = quotaPolicy
-		}
-		updateAdminOrganizationQuotas(t, defaultOrgID, restoreOrgBody)
-	})
+	restoreDefaultOrgAndUserQuotasOnCleanup(t, originalOrg, originalUser)
 
 	updateAdminOrganizationQuotas(t, defaultOrgID, map[string]interface{}{
 		"storage_quota": int64(1 << 50),
@@ -162,27 +140,7 @@ func TestPerUserStorageQuotaBlocksUploadBeforeOrgQuota(t *testing.T) {
 func TestDeduplicatedBlockUploadSkipsStorageQuota(t *testing.T) {
 	originalOrg := getAdminOrganizationInfo(t, defaultOrgID)
 	originalUser := getAdminUserByEmail(t, defaultUserEmail)
-
-	t.Cleanup(func() {
-		restoreResp := superadminClient.PutJSON(t, "/api/v2.1/admin/users/"+url.PathEscape(defaultUserEmail)+"/", map[string]interface{}{
-			"quota_total": jsonInt64(originalUser, "quota_total"),
-		})
-		if restoreResp.StatusCode != http.StatusOK {
-			t.Logf("restore default user quota returned status %d body=%s", restoreResp.StatusCode, responseBody(t, restoreResp))
-		} else {
-			restoreResp.Body.Close()
-		}
-		restoreOrgBody := map[string]interface{}{
-			"storage_quota":          jsonInt64(originalOrg, "storage_quota"),
-			"traffic_quota":          jsonInt64(originalOrg, "traffic_quota"),
-			"traffic_upload_quota":   jsonInt64(originalOrg, "traffic_upload_quota"),
-			"traffic_download_quota": jsonInt64(originalOrg, "traffic_download_quota"),
-		}
-		if quotaPolicy := jsonString(originalOrg, "quota_policy"); quotaPolicy != "" {
-			restoreOrgBody["quota_policy"] = quotaPolicy
-		}
-		updateAdminOrganizationQuotas(t, defaultOrgID, restoreOrgBody)
-	})
+	restoreDefaultOrgAndUserQuotasOnCleanup(t, originalOrg, originalUser)
 
 	blockContent := []byte(fmt.Sprintf("deduplicated block uploads should not consume additional storage quota %d", time.Now().UnixNano()))
 
@@ -229,27 +187,7 @@ func TestDeduplicatedBlockUploadSkipsStorageQuota(t *testing.T) {
 func TestDeduplicatedSyncBlockUploadSkipsStorageQuota(t *testing.T) {
 	originalOrg := getAdminOrganizationInfo(t, defaultOrgID)
 	originalUser := getAdminUserByEmail(t, defaultUserEmail)
-
-	t.Cleanup(func() {
-		restoreResp := superadminClient.PutJSON(t, "/api/v2.1/admin/users/"+url.PathEscape(defaultUserEmail)+"/", map[string]interface{}{
-			"quota_total": jsonInt64(originalUser, "quota_total"),
-		})
-		if restoreResp.StatusCode != http.StatusOK {
-			t.Logf("restore default user quota returned status %d body=%s", restoreResp.StatusCode, responseBody(t, restoreResp))
-		} else {
-			restoreResp.Body.Close()
-		}
-		restoreOrgBody := map[string]interface{}{
-			"storage_quota":          jsonInt64(originalOrg, "storage_quota"),
-			"traffic_quota":          jsonInt64(originalOrg, "traffic_quota"),
-			"traffic_upload_quota":   jsonInt64(originalOrg, "traffic_upload_quota"),
-			"traffic_download_quota": jsonInt64(originalOrg, "traffic_download_quota"),
-		}
-		if quotaPolicy := jsonString(originalOrg, "quota_policy"); quotaPolicy != "" {
-			restoreOrgBody["quota_policy"] = quotaPolicy
-		}
-		updateAdminOrganizationQuotas(t, defaultOrgID, restoreOrgBody)
-	})
+	restoreDefaultOrgAndUserQuotasOnCleanup(t, originalOrg, originalUser)
 
 	blockContent := []byte(fmt.Sprintf("deduplicated sync block uploads should not consume additional storage quota %d", time.Now().UnixNano()))
 
@@ -545,8 +483,22 @@ func updateAdminOrganizationQuotas(t *testing.T, orgID string, body map[string]i
 func restoreDefaultOrgAndUserQuotasOnCleanup(t *testing.T, originalOrg, originalUser map[string]interface{}) {
 	t.Helper()
 	t.Cleanup(func() {
+		originalUserQuota := jsonInt64(originalUser, "quota_total")
+		originalOrgStorageQuota := jsonInt64(originalOrg, "storage_quota")
+		restoreStorageQuota := originalOrgStorageQuota
+		if originalUserQuota > restoreStorageQuota {
+			restoreStorageQuota = originalUserQuota
+		}
+		if restoreStorageQuota > 0 {
+			// These tests mutate the shared default org/user quota and must run
+			// serially for defaultOrgID; do not add t.Parallel() around them.
+			updateAdminOrganizationQuotas(t, defaultOrgID, map[string]interface{}{
+				"storage_quota": restoreStorageQuota,
+			})
+		}
+
 		restoreResp := superadminClient.PutJSON(t, "/api/v2.1/admin/users/"+url.PathEscape(defaultUserEmail)+"/", map[string]interface{}{
-			"quota_total": jsonInt64(originalUser, "quota_total"),
+			"quota_total": originalUserQuota,
 		})
 		if restoreResp.StatusCode != http.StatusOK {
 			t.Logf("restore default user quota returned status %d body=%s", restoreResp.StatusCode, responseBody(t, restoreResp))

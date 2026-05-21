@@ -329,6 +329,7 @@ run_compose_service() {
     local service="$1"
     local name="$2"
     local compose_args="--profile test run --rm"
+    local suite_status=0
 
     TOTAL_SUITES=$((TOTAL_SUITES + 1))
 
@@ -345,15 +346,19 @@ run_compose_service() {
 
     log_info "docker compose $compose_args $service"
 
+    cleanup_backend_test_state
+
     if docker compose $compose_args "$service"; then
         PASSED_SUITES=$((PASSED_SUITES + 1))
         log_success "$name completed"
-        return 0
+    else
+        FAILED_SUITES=$((FAILED_SUITES + 1))
+        log_error "$name failed"
+        suite_status=1
     fi
 
-    FAILED_SUITES=$((FAILED_SUITES + 1))
-    log_error "$name failed"
-    return 1
+    cleanup_backend_test_state
+    return $suite_status
 }
 
 # Run a test suite
