@@ -39,7 +39,9 @@
 - The hardening baseline is now verified for same-tree idempotence, safe non-overlapping auto-merge, and fail-closed retryable `503` behavior for unsafe conflicts.
 - Real active-active desktop proof now exists via two `seaf-cli` clients in Docker hitting separate backend nodes.
 - `./scripts/test.sh sync` now chains the single-client sync suite and the active-active harness; it stops on the first failing suite by default, with `--keep-going` available when you need aggregate failure reporting.
+- `./scripts/test.sh` now also prints failure excerpts for compose-backed and script-backed suites, so Docker/test-runner failures are immediately visible without digging through full logs.
 - Sync cleanup was tightened to release/delete stale `sync-test-*` and `sync-aa-*` libraries so the suite no longer drifts into `Library limit reached` failures.
+- A broader canonical quota-reservation prototype was audited and explicitly split out of this branch; the confirmed defects are documented in `docs/KNOWN_ISSUES.md`, and PR61 should keep only the test-runner improvement from that line of work.
 - Remaining sync follow-up debt is narrower: deeper-tree active-active branches, quota rejection during auto-merge, and broader 3-node/org-level quota contention races.
 
 ### Step 2: Before Making ANY Code Changes
@@ -192,6 +194,7 @@ Routes registered in `internal/api/v2/admin.go`.
 1. Audit-log expansion.
 2. Broad frontend cleanup unrelated to desktop sync.
 3. New role/ownership behavior changes without a separate branch discussion.
+4. Canonical quota reservation/resync experiments; keep that work in a dedicated follow-up branch.
 
 ### ✅ ~~PRIORITY 1: Admin Library Management~~ — DONE (2026-02-12)
 

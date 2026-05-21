@@ -1,6 +1,6 @@
 # Known Issues - SesameFS
 
-**Last Updated**: 2026-05-20
+**Last Updated**: 2026-05-21
 
 This document tracks all known bugs, limitations, and issues in SesameFS.
 
@@ -42,6 +42,7 @@ This document tracks all known bugs, limitations, and issues in SesameFS.
 | **Org Admin Statistics Can Leak Platform Scope** | 🔴 Confirmed bug | When org-admin pages are mounted with platform-org context, traffic-based org-admin metrics can resolve to the global aggregate instead of a tenant scope. Affects at least org-admin traffic, org-admin per-user traffic, and org-admin active-users. See ISSUE-ORG-STATS-SCOPE-01 below. |
 | **Per-User Storage Quota Enforcement** | ✅ Fixed (2026-05-14) | `CheckStorageQuota` now evaluates org and per-user storage caps; upload callers pass `userID`; sync validates the published tree delta before advancing HEAD and waits for the matching storage-counter adjust before returning. See ISSUE-USER-STORAGE-ENFORCE-01 below. |
 | **Quota Enforcement Coverage Gaps in V2 Mutations** | ✅ Fixed (2026-05-14) | The affected non-upload mutation handlers now have visible-delta quota wiring. Deleted file/folder restore remains bounded by configured history retention, deleted-library restore remains bounded by trash retention, and cross-repo move still relies on split-phase destination publish plus source removal. Split-phase publish/counter atomicity remains documented as technical debt (§12d/§12e). See ISSUE-QUOTA-COVERAGE-01 below. |
+| **Concurrent Hard-Quota Reservation Hardening** | 🟡 Deferred to separate branch | The existing split pre-check → publish → counter-adjust window is still open. A canonical-row reservation prototype was audited and is not merge-ready for PR61 because it leaks reservations on finalize failure, regresses soft-policy evaluation, races with admin resync, and only hardens `seafhttp`. See ISSUE-QUOTA-RESERVATION-01 below. |
 | **Chunked Upload Traffic Accounting Semantics** | 🟡 Accepted debt | Web chunked uploads now pre-check traffic against the declared `Content-Range` total, but traffic is still recorded only after successful finalize. Abandoned chunk sessions can consume bandwidth without advancing counters. Operationally acceptable for current generous paid upload allowances, but documented for future billing/accounting work. See ISSUE-CHUNKED-UPLOAD-TRAFFIC-01 below. |
 
 ### 🟡 SeaDrive 3.x Missing Endpoints (Non-fatal, but degrade UX)
@@ -346,6 +347,41 @@ Split-phase atomicity (pre-check → publish → counter adjust) remains documen
 - ISSUE-USER-STORAGE-ENFORCE-01 (fixed) — same enforcement model, narrower coverage.
 - [internal/api/v2/quota_helpers.go](internal/api/v2/quota_helpers.go) — shared primitives.
 - [internal/traffic/storage.go:136](internal/traffic/storage.go#L136) — `AdjustStorageCountersByDeltaSync` with negative-clamp protection.
+
+---
+
+### ISSUE-QUOTA-RESERVATION-01: Canonical Storage Reservation Prototype Is Not Merge-Ready
+
+**Status**: 🟡 Confirmed follow-up / intentionally excluded from PR61 (2026-05-21)
+**Severity**: Medium-High — the existing concurrent hard-quota window remains open, and the investigated fix candidate adds correctness regressions of its own
+**Affected candidate patch**: `internal/api/seafhttp.go`, `internal/traffic/checker.go`, `internal/traffic/storage.go`, `internal/api/v2/admin.go`, `internal/api/v2/admin_users.go`, `internal/api/v2/files.go`
+
+#### What Was Confirmed
+
+- `commitUploadedFileOnce` and `commitUploadedFileMultiBlockOnce` disabled the deferred release before calling `FinalizeReservedUploadStorageDeltaSync`, so any finalize error leaked the canonical reservation instead of releasing it.
+- `ReserveStorageQuota` returned immediately for non-hard policies, so the soft-plan `CheckStorageQuota` path stopped evaluating usage and warning state on those uploads.
+- The admin org/user quota resync writes overwrote `organizations.storage_used` / `users.used_bytes` directly from live `storage_counters` without CAS, so they could erase in-flight reservations.
+- `FinalizeReservedUploadStorageDeltaSync` performed several independent counter writes with no batch, rollback, or repair path, so partial failure could leave org/user/library/platform scopes diverged.
+- The canonical CAS retry loop used a deterministic linear sleep without jitter, increasing herd behavior under contention.
+- The reservation flow was only wired into `seafhttp` uploads; v2 direct upload/finalize paths still used the older split pre-check and post-commit counter adjust flow.
+- The same patch also regressed `DeleteDirectory` by dropping `cleanupFileTagsForPrefix`, which would have left stale `file_tags`, `file_tags_by_id`, and `repo_tag_file_counts` rows behind.
+
+#### What Was Not Confirmed
+
+- `mustParseUUID` in `internal/traffic/checker.go` does not panic on invalid input in the current code; it returns the zero UUID. Invalid IDs are still undesirable, but this report was not a panic bug.
+
+#### Branch Decision
+
+- Keep the `scripts/test.sh` failure-excerpt improvement in PR61.
+- Move any canonical reservation / finalize / release quota work to a dedicated follow-up branch with its own tests and review.
+
+#### Follow-up Branch Requirements
+
+- Preserve soft quota evaluation and warning behavior.
+- Release reservations only after successful finalize, or make finalize idempotent and repairable.
+- Address partial-finalize repair and admin resync races under CAS semantics.
+- Reuse the existing jittered backoff helper instead of adding a new linear retry loop.
+- Decide whether to harden only `seafhttp` or all upload/finalize paths together.
 
 ---
 
