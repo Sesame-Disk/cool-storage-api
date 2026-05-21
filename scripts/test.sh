@@ -131,6 +131,28 @@ log_error() { echo -e "${RED}[FAIL]${NC} $1"; }
 log_warning() { echo -e "${YELLOW}[WARN]${NC} $1"; }
 log_section() { echo -e "\n${CYAN}=== $1 ===${NC}\n"; }
 
+create_temp_log() {
+    mktemp 2>/dev/null || mktemp -t sesamefs-test
+}
+
+print_failure_excerpt() {
+    local name="$1"
+    local log_file="$2"
+    local excerpt
+
+    [ -f "$log_file" ] || return 0
+
+    excerpt=$(grep -n -E -C 2 -- '--- FAIL:|^FAIL[[:space:]]|^\[FAIL\]|panic:|fatal error:' "$log_file" | tail -n 40 || true)
+    if [ -n "$excerpt" ]; then
+        log_error "$name failure excerpt:"
+        echo "$excerpt"
+        return 0
+    fi
+
+    log_error "$name output tail:"
+    tail -n 40 "$log_file" || true
+}
+
 cleanup_backend_test_repos() {
     if [ "${SESAMEFS_CLEAN_TEST_REPOS:-0}" != "1" ]; then
         return 0
@@ -330,6 +352,7 @@ run_compose_service() {
     local name="$2"
     local compose_args="--profile test run --rm"
     local suite_status=0
+    local log_file=""
 
     TOTAL_SUITES=$((TOTAL_SUITES + 1))
 
@@ -348,14 +371,19 @@ run_compose_service() {
 
     cleanup_backend_test_state
 
-    if docker compose $compose_args "$service"; then
+    log_file=$(create_temp_log)
+
+    if (set -o pipefail; docker compose $compose_args "$service" 2>&1 | tee "$log_file"); then
         PASSED_SUITES=$((PASSED_SUITES + 1))
         log_success "$name completed"
     else
         FAILED_SUITES=$((FAILED_SUITES + 1))
         log_error "$name failed"
+        print_failure_excerpt "$name" "$log_file"
         suite_status=1
     fi
+
+    [ -n "$log_file" ] && rm -f "$log_file"
 
     cleanup_backend_test_state
     return $suite_status
@@ -368,6 +396,7 @@ run_suite() {
     shift 2
     local args="$@"
     local suite_status=0
+    local log_file=""
 
     TOTAL_SUITES=$((TOTAL_SUITES + 1))
 
@@ -381,14 +410,18 @@ run_suite() {
     cleanup_backend_test_state
 
     if [ -f "$SCRIPT_DIR/$script" ]; then
-        if BASE_URL="${SESAMEFS_URL:-http://localhost:3000}" API_URL="${SESAMEFS_URL:-http://localhost:3000}" bash "$SCRIPT_DIR/$script" $args; then
+        log_file=$(create_temp_log)
+        if (set -o pipefail; BASE_URL="${SESAMEFS_URL:-http://localhost:3000}" API_URL="${SESAMEFS_URL:-http://localhost:3000}" bash "$SCRIPT_DIR/$script" $args 2>&1 | tee "$log_file"); then
             PASSED_SUITES=$((PASSED_SUITES + 1))
             log_success "$name completed"
         else
             FAILED_SUITES=$((FAILED_SUITES + 1))
             log_error "$name failed"
+            print_failure_excerpt "$name" "$log_file"
             suite_status=1
         fi
+
+        [ -n "$log_file" ] && rm -f "$log_file"
     else
         log_error "Script not found: $script"
         FAILED_SUITES=$((FAILED_SUITES + 1))
