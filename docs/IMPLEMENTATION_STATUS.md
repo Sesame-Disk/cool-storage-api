@@ -10,7 +10,7 @@
 
 | Area | Completeness | Notes |
 |------|--------------|-------|
-| Sync Protocol (Desktop) | ~90% | Functional sync scenarios pass, but active-active HEAD-conflict recovery is not yet proven end-to-end for desktop sync. |
+| Sync Protocol (Desktop) | ~90% | Functional sync scenarios pass, and the current hardening scope is baseline-verified for active-active HEAD-conflict recovery. Broader scenario coverage remains follow-up test debt. |
 | Core Backend API | ~98% | GC ✅, OIDC ✅, Library Settings ✅, Monitoring ✅, Quotas ✅, Plans/Permissions Phase 1+2 ✅, org storage policy backend base ✅ |
 | Admin Panels | ~95% | Superadmin ✅, Org Admin ✅, both at parity. Audit logs pending |
 | Frontend UI | ~85% | All 122 modals migrated ✅, File History UI ✅, permission UI (~75% with granular flags), ~51 ModalPortal wrappers to clean up, Phase 3 quota/plan UI in progress |

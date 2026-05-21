@@ -1318,23 +1318,23 @@ or a recovery path that can reconcile object-store keys against missing block
 rows. A raw delete-on-failure path would be unsafe without proving the object
 was newly created and still unreferenced.
 
-### 19.o. Concurrent Quota Exhaustion Across Nodes Is Still Untested
+### 19.o. Concurrent Quota Exhaustion Across Nodes Still Has Coverage Gaps
 
-Current concurrency coverage proves no-lost-commit and no-lost-file behavior
-for upload and mutation races across multi-instance and multiregion deployments,
-but there is still no targeted test that forces the same org/user to hit a hard
-storage quota concurrently from 2-3 nodes.
+Current concurrency coverage now includes a targeted multi-instance per-user
+storage-quota race in `internal/integration/quotas_test.go`
+(`TestMultiInstancePerUserStorageQuotaBlocksConcurrentUploads`), so the repo is
+no longer relying only on single-instance quota tests.
 
-`internal/integration/quotas_test.go` covers per-user/org storage semantics,
-deduplicated uploads, chunked declared-total checks, and replace-delta behavior,
-but those scenarios are still single-instance from a quota-race perspective.
+The remaining gap is narrower: there is still no targeted test that forces
+3-node contention, org-level hard storage quota contention, or quota rejection
+during sync auto-merge/publish paths under concurrent head movement.
 
-That leaves an active-active question unproven: whether simultaneous finalize
-and publish attempts that each pass their own pre-check can still over-admit
-bytes under a tight cap. Treat this as test debt first, not as a confirmed
-production bug.
+That leaves an active-active question partially unproven: whether simultaneous
+finalize and publish attempts that each pass their own pre-check can still
+over-admit bytes under tighter caps outside the currently covered per-user
+upload race. Treat this as test debt first, not as a confirmed production bug.
 
-The right follow-up is a true multi-instance quota-race integration test in the
+The right follow-up is to extend the multi-instance quota-race coverage in the
 default compose `test` profile using `SESAMEFS_URL`, `SESAMEFS_URL_2`, and
 `SESAMEFS_URL_3`, before any launch claim depends on strict active-active quota
 enforcement.

@@ -309,8 +309,9 @@ curl -X POST http://localhost:8080/api2/auth-token/ \
 
 ### Current Multi-Instance Coverage Gaps
 
-- There is still no true concurrent quota-exhaustion race test that drives the
-  same org/user against a hard storage cap from 2-3 nodes at once.
+- Multi-instance quota-race coverage now exists for concurrent per-user storage
+  quota enforcement, but broader coverage is still missing for 3-node races,
+  org-level quota contention, and quota rejection during auto-merge.
 - The real desktop-client harness still does not cover quota rejection during
   auto-merge or deeper-tree active-active conflict branches.
 - Handler-level integration proof now covers both `PUT /commit/HEAD` and

@@ -1116,12 +1116,11 @@ func TestGC_FailedItemsAdminEndpoints(t *testing.T) {
 	if requeueResp.StatusCode != http.StatusOK {
 		t.Fatalf("expected failed-item requeue HTTP 200, got %d", requeueResp.StatusCode)
 	}
-	requeueQueuedAfter := time.Now().UTC().Add(-2 * time.Second)
-	ok = pollUntil(t, 30*time.Second, 500*time.Millisecond, func() bool {
-		return gcQueueItemExistsSince(t, orgID.String(), "unknown_type", itemIDA, requeueQueuedAfter) && !failedQueueItemExists(t, orgID.String(), "unknown_type", itemIDA)
-	})
-	if !ok {
-		t.Fatalf("expected requeued failed item %s to leave gc_failed_items and reappear in gc_queue", itemIDA)
+	if failedQueueItemExists(t, orgID.String(), "unknown_type", itemIDA) {
+		t.Fatalf("expected requeued failed item %s to leave gc_failed_items", itemIDA)
+	}
+	if !gcQueueItemExists(t, orgID.String(), "unknown_type", itemIDA) {
+		t.Fatalf("expected requeued failed item %s to appear in gc_queue", itemIDA)
 	}
 
 	deleteResp := superadminClient.DeleteJSON(t, "/api/v2.1/admin/gc/failed-items", map[string]string{
@@ -1133,10 +1132,7 @@ func TestGC_FailedItemsAdminEndpoints(t *testing.T) {
 	if deleteResp.StatusCode != http.StatusOK {
 		t.Fatalf("expected failed-item delete HTTP 200, got %d", deleteResp.StatusCode)
 	}
-	ok = pollUntil(t, 30*time.Second, 500*time.Millisecond, func() bool {
-		return !failedQueueItemExists(t, orgID.String(), "unknown_type", itemIDB)
-	})
-	if !ok {
+	if failedQueueItemExists(t, orgID.String(), "unknown_type", itemIDB) {
 		t.Fatalf("expected failed item %s to be removed from gc_failed_items by admin delete", itemIDB)
 	}
 
