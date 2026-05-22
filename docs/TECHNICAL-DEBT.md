@@ -148,6 +148,12 @@ The current web uploader now has two safe improvements in place:
 - UI switches to `Saving...` when the last chunk is waiting on server-side finalization.
 - The next queued file can start while the previous file is still finalizing its last chunk.
 
+The backend upload hot path also now avoids one repeated cost: successful chunked
+storage pre-checks are cached on the in-memory upload tracker, so later chunk requests
+for the same upload stop re-walking the current HEAD just to reach the same answer.
+`finalizeUploadStreaming()` still revalidates against the current HEAD before publish,
+so this optimization does not change the canonical HEAD / CAS safety model.
+
 Backend finalization is also partially improved: `finalizeUploadStreaming()` now parallelizes block PUTs and metadata writes instead of doing them fully serially.
 
 ### Still Pending
@@ -188,6 +194,7 @@ The recent upload fix made `HandleUpload` use the declared `Content-Range` total
 
 Current consequences:
 - clearly over-quota chunked uploads are blocked early against the full declared upload size
+- repeated chunk requests no longer repeat the same visible-tree storage pre-check once a tracker has already passed it for the same path/size/replace tuple
 - abandoned chunk sessions, janitor-reaped temp files, and finalize failures can still consume real bandwidth without incrementing `traffic_period_usage`
 - retried chunks are idempotent at the temp-file layer, but traffic accounting is not yet defined per chunk because there is no per-chunk recorder path
 - invalid or missing `Content-Range` currently falls back to the non-chunked upload path instead of enforcing a strict resumable-upload protocol

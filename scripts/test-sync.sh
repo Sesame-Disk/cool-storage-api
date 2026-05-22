@@ -244,16 +244,29 @@ get_upload_link() {
     -H "Authorization: Token ${DEV_API_TOKEN}" | tr -d '"'
 }
 
+# Get update link for a library (overwrite existing file by default)
+get_update_link() {
+  local repo_id="$1"
+
+  curl -s "${SESAMEFS_URL_LOCAL}/api2/repos/${repo_id}/update-link/?p=/" \
+    -H "Authorization: Token ${DEV_API_TOKEN}" | tr -d '"'
+}
+
 # Upload a file to library via API
 upload_file_remote() {
   local repo_id="$1"
   local local_path="$2"
   local remote_name="$3"
+  local replace_existing="${4:-false}"
 
   log_verbose "Uploading file: ${remote_name} to ${repo_id}"
 
   local upload_link
-  upload_link=$(get_upload_link "$repo_id")
+  if [ "$replace_existing" = "true" ]; then
+    upload_link=$(get_update_link "$repo_id")
+  else
+    upload_link=$(get_upload_link "$repo_id")
+  fi
 
   if [ -z "$upload_link" ]; then
     log_error "Failed to get upload link"
@@ -785,7 +798,7 @@ test_unencrypted_file_modification() {
   # Modify and re-upload
   echo "Modified content - version 2 - $(date -Iseconds)" > "$test_file"
   echo "Additional line with more data: $(head -c 100 /dev/urandom | base64)" >> "$test_file"
-  upload_file_remote "$repo_id" "$test_file" "modifiable-file.txt"
+  upload_file_remote "$repo_id" "$test_file" "modifiable-file.txt" "true"
 
   # Verify modified file with retry
   verify_file_integrity "$test_file" "${sync_dir}/modifiable-file.txt" "true" 5 3
@@ -877,7 +890,7 @@ test_encrypted_file_modification() {
   # Modify and re-upload
   echo "Encrypted modified - version 2 - $(date -Iseconds)" > "$test_file"
   echo "Additional encrypted data: $(head -c 100 /dev/urandom | base64)" >> "$test_file"
-  upload_file_remote "$repo_id" "$test_file" "enc-modifiable-file.txt"
+  upload_file_remote "$repo_id" "$test_file" "enc-modifiable-file.txt" "true"
 
   # Verify modified encrypted file with retry
   verify_file_integrity "$test_file" "${sync_dir}/enc-modifiable-file.txt" "true" 5 3 || result=$?

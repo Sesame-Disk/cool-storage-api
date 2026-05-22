@@ -563,8 +563,9 @@ func (h *FileViewHandler) ServeRawFile(c *gin.Context) {
 		orgID, repoID).Scan(&encrypted)
 
 	var fileKey []byte
+	var fileIV []byte
 	if encrypted {
-		fileKey = GetDecryptSessions().GetFileKey(userID, repoID)
+		fileKey, fileIV = GetDecryptSessions().GetFileKeyAndIV(userID, repoID)
 		if fileKey == nil {
 			c.JSON(http.StatusForbidden, gin.H{"error": "library is encrypted but not unlocked"})
 			return
@@ -594,7 +595,7 @@ func (h *FileViewHandler) ServeRawFile(c *gin.Context) {
 					c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read file"})
 					return
 				}
-				blockData, err = crypto.DecryptBlock(blockData, fileKey)
+				blockData, err = crypto.DecryptLibraryBlock(blockData, fileKey, fileIV)
 				if err != nil {
 					c.JSON(http.StatusInternalServerError, gin.H{"error": "decryption failed"})
 					return
@@ -638,8 +639,10 @@ func (h *FileViewHandler) ServeRawFile(c *gin.Context) {
 	resolvedIDs := streaming.BatchResolveBlockIDs(h.db, orgID, blockIDs)
 
 	var fileKeyParam []byte
+	var fileIVParam []byte
 	if encrypted {
 		fileKeyParam = fileKey
+		fileIVParam = fileIV
 	}
 
 	// For video/audio files, use BlockReadSeeker so http.ServeContent can handle
@@ -652,7 +655,7 @@ func (h *FileViewHandler) ServeRawFile(c *gin.Context) {
 			return
 		}
 
-		rs := streaming.NewBlockReadSeeker(ctx, blockStore, resolvedIDs, blockSizes, fileSize, fileKeyParam)
+		rs := streaming.NewBlockReadSeeker(ctx, blockStore, resolvedIDs, blockSizes, fileSize, fileKeyParam, fileIVParam)
 		c.Header("Content-Disposition", resolveContentDisposition(ext, filename))
 		c.Header("Content-Type", mimeType)
 		http.ServeContent(c.Writer, c.Request, filename, time.Time{}, rs)
@@ -667,7 +670,7 @@ func (h *FileViewHandler) ServeRawFile(c *gin.Context) {
 	}
 	c.Status(http.StatusOK)
 
-	streaming.StreamBlocks(c, ctx, blockStore, resolvedIDs, fileKeyParam, "ServeRawFile")
+	streaming.StreamBlocks(c, ctx, blockStore, resolvedIDs, fileKeyParam, fileIVParam, "ServeRawFile")
 }
 
 // sanitizeFilename removes characters that could cause header injection in Content-Disposition.
@@ -915,6 +918,7 @@ func (h *FileViewHandler) DownloadHistoricFile(c *gin.Context) {
 	// Check if library is encrypted and get file key
 	var encrypted bool
 	var fileKey []byte
+	var fileIV []byte
 	err := h.db.Session().Query(`
 		SELECT encrypted FROM libraries WHERE org_id = ? AND library_id = ?
 	`, orgID, repoID).Scan(&encrypted)
@@ -925,7 +929,7 @@ func (h *FileViewHandler) DownloadHistoricFile(c *gin.Context) {
 	}
 
 	if encrypted {
-		fileKey = GetDecryptSessions().GetFileKey(userID, repoID)
+		fileKey, fileIV = GetDecryptSessions().GetFileKeyAndIV(userID, repoID)
 		if fileKey == nil {
 			redirectToFrontendErrorPage(c, http.StatusForbidden, "Library Locked", "This library is encrypted. Please unlock it first.")
 			return
@@ -957,7 +961,7 @@ func (h *FileViewHandler) DownloadHistoricFile(c *gin.Context) {
 
 	resolvedIDs := streaming.BatchResolveBlockIDs(h.db, orgID, blockIDs)
 	bytesBefore := int64(c.Writer.Size())
-	streaming.StreamBlocks(c, c.Request.Context(), blockStore, resolvedIDs, fileKey, "DownloadHistoricFile")
+	streaming.StreamBlocks(c, c.Request.Context(), blockStore, resolvedIDs, fileKey, fileIV, "DownloadHistoricFile")
 
 	// Record download traffic using actual bytes written.
 	if rec := traffic.Get(); rec != nil {
@@ -1063,6 +1067,7 @@ func (h *FileViewHandler) ServeHistoricFileRaw(c *gin.Context) {
 	// Check if library is encrypted and get file key
 	var encrypted bool
 	var fileKey []byte
+	var fileIV []byte
 	err := h.db.Session().Query(`
 		SELECT encrypted FROM libraries WHERE org_id = ? AND library_id = ?
 	`, orgID, repoID).Scan(&encrypted)
@@ -1073,7 +1078,7 @@ func (h *FileViewHandler) ServeHistoricFileRaw(c *gin.Context) {
 	}
 
 	if encrypted {
-		fileKey = GetDecryptSessions().GetFileKey(userID, repoID)
+		fileKey, fileIV = GetDecryptSessions().GetFileKeyAndIV(userID, repoID)
 		if fileKey == nil {
 			c.JSON(http.StatusForbidden, gin.H{"error": "library is encrypted but not unlocked"})
 			return
@@ -1123,5 +1128,5 @@ func (h *FileViewHandler) ServeHistoricFileRaw(c *gin.Context) {
 	c.Status(http.StatusOK)
 
 	resolvedIDs := streaming.BatchResolveBlockIDs(h.db, orgID, blockIDs)
-	streaming.StreamBlocks(c, c.Request.Context(), blockStore, resolvedIDs, fileKey, "ServeHistoricFileRaw")
+	streaming.StreamBlocks(c, c.Request.Context(), blockStore, resolvedIDs, fileKey, fileIV, "ServeHistoricFileRaw")
 }

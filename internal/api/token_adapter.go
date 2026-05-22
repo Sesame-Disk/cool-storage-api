@@ -21,6 +21,11 @@ func (a *CassandraTokenAdapter) CreateUploadToken(orgID, repoID, path, userID st
 	return a.store.CreateUploadToken(orgID, repoID, path, userID)
 }
 
+// CreateUpdateToken creates an upload token that overwrites by default.
+func (a *CassandraTokenAdapter) CreateUpdateToken(orgID, repoID, path, userID string) (string, error) {
+	return a.store.CreateUpdateToken(orgID, repoID, path, userID)
+}
+
 // CreateLinkUploadToken creates an upload token tagged as a share/upload link.
 func (a *CassandraTokenAdapter) CreateLinkUploadToken(orgID, repoID, path, userID string) (string, error) {
 	return a.store.CreateLinkUploadToken(orgID, repoID, path, userID)
@@ -53,6 +58,7 @@ func (a *CassandraTokenAdapter) GetToken(tokenStr string, expectedType TokenType
 		OrgID:     dbToken.OrgID,
 		RepoID:    dbToken.RepoID,
 		Path:      dbToken.Path,
+		Replace:   dbToken.Replace,
 		UserID:    dbToken.UserID,
 		Source:    dbToken.Source,
 		CreatedAt: dbToken.CreatedAt,

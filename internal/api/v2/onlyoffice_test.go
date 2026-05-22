@@ -1,6 +1,7 @@
 package v2
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/Sesame-Disk/sesamefs/internal/config"
+	"github.com/Sesame-Disk/sesamefs/internal/crypto"
 	"github.com/Sesame-Disk/sesamefs/internal/storage"
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
 	"github.com/gin-gonic/gin"
@@ -532,6 +534,64 @@ func TestShouldRollbackOnlyOfficeMaterializedBlock(t *testing.T) {
 				t.Fatalf("shouldRollbackOnlyOfficeMaterializedBlock() = %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestEncryptOnlyOfficeContentUsesSeafileFormatWhenIVPresent(t *testing.T) {
+	userID := "user-onlyoffice-seafile"
+	repoID := "repo-onlyoffice-seafile"
+	fileKey := make([]byte, crypto.FileKeySize)
+	fileIV := make([]byte, crypto.IVSize)
+	for i := range fileKey {
+		fileKey[i] = byte(i + 1)
+	}
+	for i := range fileIV {
+		fileIV[i] = byte(i + 2)
+	}
+
+	GetDecryptSessions().Unlock(userID, repoID, fileKey, fileIV)
+	t.Cleanup(func() {
+		GetDecryptSessions().Lock(userID, repoID)
+	})
+
+	encrypted, err := encryptOnlyOfficeContent(userID, repoID, []byte("onlyoffice content"))
+	if err != nil {
+		t.Fatalf("encryptOnlyOfficeContent returned error: %v", err)
+	}
+
+	decrypted, err := crypto.DecryptBlockSeafile(encrypted, fileKey, fileIV)
+	if err != nil {
+		t.Fatalf("DecryptBlockSeafile returned error: %v", err)
+	}
+	if !bytes.Equal(decrypted, []byte("onlyoffice content")) {
+		t.Fatalf("decrypted = %q, want %q", decrypted, "onlyoffice content")
+	}
+}
+
+func TestEncryptOnlyOfficeContentFallsBackWhenIVMissing(t *testing.T) {
+	userID := "user-onlyoffice-legacy"
+	repoID := "repo-onlyoffice-legacy"
+	fileKey := make([]byte, crypto.FileKeySize)
+	for i := range fileKey {
+		fileKey[i] = byte(i + 3)
+	}
+
+	GetDecryptSessions().Unlock(userID, repoID, fileKey, nil)
+	t.Cleanup(func() {
+		GetDecryptSessions().Lock(userID, repoID)
+	})
+
+	encrypted, err := encryptOnlyOfficeContent(userID, repoID, []byte("legacy onlyoffice content"))
+	if err != nil {
+		t.Fatalf("encryptOnlyOfficeContent returned error: %v", err)
+	}
+
+	decrypted, err := crypto.DecryptBlock(encrypted, fileKey)
+	if err != nil {
+		t.Fatalf("DecryptBlock returned error: %v", err)
+	}
+	if !bytes.Equal(decrypted, []byte("legacy onlyoffice content")) {
+		t.Fatalf("decrypted = %q, want %q", decrypted, "legacy onlyoffice content")
 	}
 }
 

@@ -24,6 +24,7 @@ type BlockReadSeeker struct {
 	totalSize  int64    // total file size
 
 	fileKey []byte // encryption key (nil = not encrypted)
+	fileIV  []byte // library IV for Seafile-compatible encrypted blocks
 
 	pos int64 // current read position in the virtual file
 
@@ -41,6 +42,7 @@ func NewBlockReadSeeker(
 	blockSizes []int64,
 	totalSize int64,
 	fileKey []byte,
+	fileIV []byte,
 ) *BlockReadSeeker {
 	// Build cumulative offset table
 	offsets := make([]int64, len(blockSizes))
@@ -58,6 +60,7 @@ func NewBlockReadSeeker(
 		offsets:    offsets,
 		totalSize:  totalSize,
 		fileKey:    fileKey,
+		fileIV:     fileIV,
 		cachedIdx:  -1,
 	}
 }
@@ -165,7 +168,7 @@ func (r *BlockReadSeeker) ensureBlock(idx int) error {
 		if err != nil {
 			return fmt.Errorf("failed to get block %d (%s): %w", idx, blockID[:16], err)
 		}
-		decrypted, err := crypto.DecryptBlock(data, r.fileKey)
+		decrypted, err := crypto.DecryptLibraryBlock(data, r.fileKey, r.fileIV)
 		if err != nil {
 			return fmt.Errorf("failed to decrypt block %d: %w", idx, err)
 		}

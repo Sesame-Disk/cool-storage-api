@@ -28,10 +28,10 @@ func TestHistoryDownloadRoundTrip(t *testing.T) {
 	v1Content := "version 1 content for history download test"
 	v2Content := "version 2 content — updated for history download test"
 
-	// Helper: upload content to the library
-	upload := func(content string) {
+	// Helper: upload content to the library using the requested link contract.
+	upload := func(linkPath, content string) {
 		t.Helper()
-		resp := adminClient.Get(t, fmt.Sprintf("/api2/repos/%s/upload-link/?p=/", repoID))
+		resp := adminClient.Get(t, fmt.Sprintf("/api2/repos/%s/%s/?p=/", repoID, linkPath))
 		expectStatus(t, resp, http.StatusOK)
 		uploadURL := strings.Trim(responseBody(t, resp), "\" \n\r")
 
@@ -53,10 +53,10 @@ func TestHistoryDownloadRoundTrip(t *testing.T) {
 	}
 
 	// Upload v1
-	upload(v1Content)
+	upload("upload-link", v1Content)
 
 	// Upload v2 (overwrite)
-	upload(v2Content)
+	upload("update-link", v2Content)
 
 	// Get file revisions
 	t.Run("get revisions", func(t *testing.T) {
@@ -210,9 +210,9 @@ func TestRegionPinnedHistoricReadPaths(t *testing.T) {
 	v1Content := "historic region version 1\n"
 	v2Content := "historic region version 2\n"
 
-	upload := func(content string) {
+	upload := func(linkPath, content string) {
 		t.Helper()
-		resp := adminClient.Get(t, fmt.Sprintf("/api2/repos/%s/upload-link/?p=/", repoID))
+		resp := adminClient.Get(t, fmt.Sprintf("/api2/repos/%s/%s/?p=/", repoID, linkPath))
 		expectStatus(t, resp, http.StatusOK)
 		uploadURL := strings.Trim(responseBody(t, resp), "\" \n\r")
 
@@ -250,8 +250,8 @@ func TestRegionPinnedHistoricReadPaths(t *testing.T) {
 		uploadResp.Body.Close()
 	}
 
-	upload(v1Content)
-	upload(v2Content)
+	upload("upload-link", v1Content)
+	upload("update-link", v2Content)
 
 	revisionsResp := adminClient.Get(t, fmt.Sprintf("/api2/repo/file_revisions/%s/?p=/%s", repoID, fileName))
 	expectStatus(t, revisionsResp, http.StatusOK)

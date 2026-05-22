@@ -33,6 +33,7 @@ import (
 // TokenCreator is an interface for creating access tokens
 type TokenCreator interface {
 	CreateUploadToken(orgID, repoID, path, userID string) (string, error)
+	CreateUpdateToken(orgID, repoID, path, userID string) (string, error)
 	CreateDownloadToken(orgID, repoID, path, userID string) (string, error)
 	CreateLinkUploadToken(orgID, repoID, path, userID string) (string, error)
 	CreateLinkDownloadToken(orgID, repoID, path, userID string) (string, error)
@@ -2625,6 +2626,23 @@ func (h *FileHandler) GetDownloadLink(c *gin.Context) {
 // GetUploadLink returns a URL for uploading a file (Seafile compatible)
 // The URL points to the server's seafhttp endpoint, not directly to S3
 func (h *FileHandler) GetUploadLink(c *gin.Context) {
+	if h.tokenCreator == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "service not available"})
+		return
+	}
+	h.getUploadLinkWithCreator(c, h.tokenCreator.CreateUploadToken)
+}
+
+// GetUpdateLink returns an upload URL whose token overwrites the target path by default.
+func (h *FileHandler) GetUpdateLink(c *gin.Context) {
+	if h.tokenCreator == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "service not available"})
+		return
+	}
+	h.getUploadLinkWithCreator(c, h.tokenCreator.CreateUpdateToken)
+}
+
+func (h *FileHandler) getUploadLinkWithCreator(c *gin.Context, createToken func(orgID, repoID, path, userID string) (string, error)) {
 	repoID := c.Param("repo_id")
 	parentDir := c.DefaultQuery("p", "/")
 	orgID := c.GetString("org_id")
@@ -2641,17 +2659,11 @@ func (h *FileHandler) GetUploadLink(c *gin.Context) {
 		return
 	}
 
-	// Check if token creator is available
-	if h.tokenCreator == nil {
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "service not available"})
-		return
-	}
-
 	// Normalize path
 	parentDir = normalizePath(parentDir)
 
 	// Create an upload token
-	token, err := h.tokenCreator.CreateUploadToken(orgID, repoID, parentDir, userID)
+	token, err := createToken(orgID, repoID, parentDir, userID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate upload link"})
 		return

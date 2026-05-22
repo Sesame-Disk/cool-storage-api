@@ -1,6 +1,6 @@
 # Known Issues - SesameFS
 
-**Last Updated**: 2026-05-21
+**Last Updated**: 2026-05-22
 
 This document tracks all known bugs, limitations, and issues in SesameFS.
 
@@ -35,15 +35,15 @@ This document tracks all known bugs, limitations, and issues in SesameFS.
 | Library Settings Backend | Partial | API tokens and transfer are complete. History and auto-delete settings persist, but retention/delete semantics are incomplete. See ISSUE-LIB-RETENTION-01. |
 | **Desktop SSO Browser UX** | ✅ Fixed (2026-03-04) | After browser SSO login for desktop client, now shows confirmation page with auto-close. See ISSUE-SSO-01 below. |
 | **Desktop Sync Active-Active Conflict Recovery** | 🟡 Follow-up coverage debt | `PUT /commit/HEAD` and `POST /update-branch` now use parent-chain validation, CAS, ancestry-gated auto-merge for safe stale siblings, and `503 + Retry-After` fail-closed responses for unsafe conflicts. The real desktop-client harness now proves both the non-overlapping auto-merge race and the same-path unsafe-conflict `503` preservation path. The remaining gap is broader end-to-end scenario coverage. See ISSUE-SYNC-HEAD-RECOVERY-01 below. |
-| **Upload "Don't Replace" (Desktop Client)** | 🟡 Pending | Desktop client file browser "No" button (auto-rename) doesn't work. Client uses `update-link` vs `upload-link` to distinguish replace vs no-replace, but both map to same token/handler. Backend autorename infrastructure ready (`autoRenameIfExists`), needs token-level `Replace` flag to distinguish endpoints. Web "Don't replace" also broken (same root cause). See ISSUE-UPLOAD-REPLACE-01 below. |
+| **Upload "Don't Replace" (Desktop Client)** | ✅ Fixed (2026-05-22) | `upload-link` now defaults to autorename/no-replace, `update-link` defaults to overwrite, and the token policy is persisted in Cassandra for multi-node safety. See ISSUE-UPLOAD-REPLACE-01 below. |
 | **Org Logo Upload** | 🟡 Stub | `UpdateOrgLogo` in org_admin.go accepts the file but does not persist it to storage. Returns a static path from settings. Functional as a route placeholder until an asset storage backend is available. |
 | **Login Analytics History** | 🟡 Partial | `last_login` is now real and persisted in `users.last_login_at`, but there is still no historical login event dataset for trend analysis, login audit timelines, or period-based "users who logged in" charts. See ISSUE-LOGIN-ANALYTICS-01 below. |
 | **File Statistics Pages Are Still Stubbed** | 🟡 Pending | `/sys/statistics/file/` currently returns all-zero series and `/org/statistics-admin/file/` is still unimplemented. Real data depends on new `file_update_logs` and `file_access_logs` tables, not on `login_logs`. See ISSUE-FILE-STATS-01 below. |
 | **Org Admin Statistics Can Leak Platform Scope** | 🔴 Confirmed bug | When org-admin pages are mounted with platform-org context, traffic-based org-admin metrics can resolve to the global aggregate instead of a tenant scope. Affects at least org-admin traffic, org-admin per-user traffic, and org-admin active-users. See ISSUE-ORG-STATS-SCOPE-01 below. |
 | **Per-User Storage Quota Enforcement** | ✅ Fixed (2026-05-14) | `CheckStorageQuota` now evaluates org and per-user storage caps; upload callers pass `userID`; sync validates the published tree delta before advancing HEAD and waits for the matching storage-counter adjust before returning. See ISSUE-USER-STORAGE-ENFORCE-01 below. |
 | **Quota Enforcement Coverage Gaps in V2 Mutations** | ✅ Fixed (2026-05-14) | The affected non-upload mutation handlers now have visible-delta quota wiring. Deleted file/folder restore remains bounded by configured history retention, deleted-library restore remains bounded by trash retention, and cross-repo move still relies on split-phase destination publish plus source removal. Split-phase publish/counter atomicity remains documented as technical debt (§12d/§12e). See ISSUE-QUOTA-COVERAGE-01 below. |
-| **Concurrent Hard-Quota Reservation Hardening** | 🟡 Deferred to separate branch | The existing split pre-check → publish → counter-adjust window is still open. A canonical-row reservation prototype was audited and is not merge-ready for PR61 because it leaks reservations on finalize failure, regresses soft-policy evaluation, races with admin resync, and only hardens `seafhttp`. See ISSUE-QUOTA-RESERVATION-01 below. |
-| **Chunked Upload Traffic Accounting Semantics** | 🟡 Accepted debt | Web chunked uploads now pre-check traffic against the declared `Content-Range` total, but traffic is still recorded only after successful finalize. Abandoned chunk sessions can consume bandwidth without advancing counters. Operationally acceptable for current generous paid upload allowances, but documented for future billing/accounting work. See ISSUE-CHUNKED-UPLOAD-TRAFFIC-01 below. |
+| **Concurrent Hard-Quota Reservation Hardening** | 🟡 Deferred to separate branch | The existing split pre-check → publish → counter-adjust window is still open. A canonical-row reservation prototype was audited and is not merge-ready for PR61 because it leaks reservations on finalize failure, regresses soft-policy evaluation, races with admin resync, and only hardens `seafhttp`. A smaller safe fix now caches repeated chunk prechecks per upload tracker, but that is not reservation hardening. See ISSUE-QUOTA-RESERVATION-01 below. |
+| **Chunked Upload Traffic Accounting Semantics** | 🟡 Accepted debt | Web chunked uploads now pre-check traffic against the declared `Content-Range` total, and repeated storage prechecks no longer walk HEAD on every chunk, but traffic is still recorded only after successful finalize. Abandoned chunk sessions can consume bandwidth without advancing counters. See ISSUE-CHUNKED-UPLOAD-TRAFFIC-01 below. |
 
 ### 🟡 SeaDrive 3.x Missing Endpoints (Non-fatal, but degrade UX)
 | Issue | Status | Notes |
@@ -374,6 +374,7 @@ Split-phase atomicity (pre-check → publish → counter adjust) remains documen
 
 - Keep the `scripts/test.sh` failure-excerpt improvement in PR61.
 - Move any canonical reservation / finalize / release quota work to a dedicated follow-up branch with its own tests and review.
+- Keep the smaller tracker-scoped chunk precheck cache separate from reservation work; it reduces hot-path read cost without changing publish/counter atomicity.
 
 #### Follow-up Branch Requirements
 
@@ -394,6 +395,8 @@ Split-phase atomicity (pre-check → publish → counter adjust) remains documen
 #### Current Contract
 
 The web chunked upload path now parses `Content-Range` and uses the declared total for the traffic pre-check before reading the multipart body. That closes the earlier fail-open where a large resumable upload could slip through using only per-request `Content-Length`.
+
+The handler also now caches a successful storage pre-check on the in-memory upload tracker so repeated chunk requests stop re-walking the visible HEAD on every request. Finalization still performs its own authoritative re-check against the current HEAD before publish.
 
 Traffic recording is still tied to successful logical upload completion:
 
@@ -2543,11 +2546,12 @@ Changed `internal/storage/s3.go` HTTP transport settings:
 
 ---
 
-### ISSUE-UPLOAD-REPLACE-01: Upload "Don't Replace" Doesn't Work (Desktop Client + Web)
+### ~~ISSUE-UPLOAD-REPLACE-01~~: Upload "Don't Replace" Didn't Work (Desktop Client + Web) — ✅ RESOLVED
 
-**Status**: 🟡 Pending
+**Status**: ✅ Fixed (2026-05-22)
 **Discovered**: 2026-03-04
-**Severity**: Medium — files get silently overwritten when user explicitly chooses not to replace
+**Reconfirmed by upload audit**: 2026-05-22
+**Severity**: Medium — previously caused silent overwrites when user explicitly chose not to replace
 
 **Problem**: When uploading a file that already exists:
 - **Desktop client file browser**: Shows dialog "¿Desea reemplazarlo? (Elija No para subirlo con un nombre alternativo)". Clicking "No" should auto-rename but still overwrites.
@@ -2557,32 +2561,33 @@ Changed `internal/storage/s3.go` HTTP transport settings:
 - "Sí" (replace) → `GET /api2/repos/{id}/update-link` → upload
 - "No" (don't replace) → `GET /api2/repos/{id}/upload-link` → upload
 
-Both endpoints (`update-link` and `upload-link`) map to the same handler `GetUploadLink` and create identical tokens. The server has no way to know which endpoint was used when the upload arrives.
+Before the fix, both endpoints (`update-link` and `upload-link`) mapped to the same handler `GetUploadLink` and created identical tokens. The server had no way to know which endpoint was used when the upload arrived.
 
 The client also sends `replace=1` in both cases, so the form parameter doesn't help.
 
-**Backend Infrastructure Ready**:
+**Fixed**:
+- `AccessToken` now carries a persisted `Replace` default
+- `CreateUpdateToken()` now produces overwrite-by-default tokens for `update-link`
+- `CreateUploadToken()` remains no-replace/autorename by default for `upload-link`
+- `GetUpdateLink` now has its own handler and route
+- `HandleUpload` now defaults from `token.Replace`, while still allowing explicit multipart override
+- Cassandra `access_tokens` now stores `replace_existing`, so the behavior survives multi-node routing
+- Integration coverage now proves both overwrite and autorename paths
+
+**Previously added infrastructure**:
 - `autoRenameIfExists()` function generates unique names: `file (1).txt`, `file (2).txt`, etc.
 - `replace` parameter propagated through entire chain: `HandleUpload` → `finalizeUploadStreaming` → `commitUploadedFileMultiBlock` → `addFileToDirectory` → `traverseAndAddFile`
 - All commit/directory functions return `actualFilename` (may differ if auto-renamed)
-- Currently defaults to `replace=1` (overwrite) for backward compatibility
 
-**Fix Required**:
-1. Add `Replace bool` field to `AccessToken` struct
-2. Create `CreateUpdateToken()` that sets `Replace=true` (for `update-link` endpoint)
-3. Keep `CreateUploadToken()` with `Replace=false` (for `upload-link` endpoint)
-4. Add `GetUpdateLink` handler that uses `CreateUpdateToken`
-5. In `HandleUpload`: use `token.Replace` as default, allow form param to override
-6. Frontend: "Don't replace" button should send `replace=0` in formData
-7. Update `TokenStore` interface, `CassandraTokenAdapter`, `db.TokenStore`, and test mocks
-
-**Files to Modify**:
-- `internal/api/seafhttp.go` — AccessToken, TokenStore interface, TokenManager, HandleUpload
-- `internal/api/token_adapter.go` — CassandraTokenAdapter (track update tokens in-memory)
-- `internal/api/v2/files.go` — Add GetUpdateLink handler, route update-link to it
-- `internal/db/tokens.go` — Add CreateUpdateToken, update TokenCreator interface
-- `frontend/src/components/file-uploader/file-uploader.js` — Send `replace=0` in uploadFile()
-- Test files: `seafhttp_test.go`, `fileview_test.go` — Update mocks
+**Files Changed**:
+- `internal/api/seafhttp.go`
+- `internal/api/token_adapter.go`
+- `internal/api/v2/files.go`
+- `internal/api/v2/file_routes.go`
+- `internal/db/tokens.go`
+- `internal/db/migrations/004_access_tokens_replace_existing.cql`
+- `internal/integration/upload_download_test.go`
+- `internal/integration/quotas_test.go`
 
 ---
 

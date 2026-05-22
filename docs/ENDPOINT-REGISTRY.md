@@ -257,7 +257,14 @@
 **Handler**: `FileHandler.GetUploadLink`
 **File**: `internal/api/v2/files.go:1698`
 **Registration**: `internal/api/v2/files.go`
-**Purpose**: Get upload link for file
+**Purpose**: Get upload link for file (defaults to autorename/no-replace)
+**Added**: 2024-12-01
+
+### GET /api/v2.1/repos/:repo_id/update-link/?p=/path
+**Handler**: `FileHandler.GetUpdateLink`
+**File**: `internal/api/v2/files.go`
+**Registration**: `internal/api/v2/files.go`
+**Purpose**: Get upload link for file overwrite
 **Added**: 2024-12-01
 
 ### GET /api/v2.1/repos/:repo_id/file-uploaded-bytes/

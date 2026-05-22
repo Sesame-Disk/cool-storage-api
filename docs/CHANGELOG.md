@@ -8,6 +8,96 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-05-22 - Upload-link vs update-link semantics fixed
+
+### Fixed
+
+The Seafile-compatible upload contract now matches the client intent again:
+
+- `GET /api2/repos/:id/upload-link/` creates upload tokens that default to
+  no-replace behavior, so repeated uploads auto-rename (`file (1).txt`, etc.)
+- `GET /api2/repos/:id/update-link/` creates upload tokens that default to
+  overwrite behavior
+- `HandleUpload` now derives its default replace policy from the token and still
+  honors an explicit multipart `replace` override when present
+
+To keep this safe in the real multi-node deployment, the token's default
+overwrite policy is now persisted in Cassandra `access_tokens` via a new schema
+migration instead of relying on in-memory state.
+
+### Tests / Docs
+
+- Added `TestUploadLinkAutoRenamesWithoutReplaceOverride`
+- Updated overwrite/quota integration coverage to use `update-link` for replace
+  semantics
+- Marked the long-standing `ISSUE-UPLOAD-REPLACE-01` docs as resolved
+
+### Files
+
+- `internal/api/seafhttp.go`
+- `internal/api/token_adapter.go`
+- `internal/api/v2/files.go`
+- `internal/api/v2/file_routes.go`
+- `internal/db/tokens.go`
+- `internal/db/migrations/004_access_tokens_replace_existing.cql`
+- `internal/integration/upload_download_test.go`
+- `internal/integration/quotas_test.go`
+- `docs/KNOWN_ISSUES.md`
+- `docs/API-REFERENCE.md`
+
+---
+
+## 2026-05-22 — Upload/download audit hardening: encrypted round-trip fix + chunked precheck cache
+
+### Fixed
+
+Encrypted-library uploads now round-trip correctly through the live HTTP download
+paths. A new integration test exposed that uploads were written with
+`EncryptBlockSeafile` while several readers still decrypted with the legacy
+`DecryptBlock` format.
+
+The backend now propagates the library IV through the shared streaming helpers and
+uses a common `DecryptLibraryBlock` helper across:
+
+- `seafhttp` download and ZIP streaming
+- `internal/streaming.StreamBlocks`
+- `internal/streaming.BlockReadSeeker`
+- raw / historic / share-link readers that use those shared paths
+
+### Performance / Safety
+
+Chunked uploads no longer re-run the same visible-tree storage quota pre-check on
+every chunk request. `HandleUpload` now caches a successful pre-check on the upload
+tracker for the same path / total-size / replace tuple.
+
+This is intentionally narrow: finalization still re-runs the authoritative storage
+quota and tree check against the current HEAD before publishing, so HEAD/CAS safety
+does not change.
+
+### Tests / Docs
+
+- Added `TestChunkedUploadAndDownloadRoundTrip`
+- Added `TestEncryptedUploadAndDownloadRoundTrip`
+- Added `TestChunkUploadQuotaPrecheckCacheMatchesMetadata`
+- Refreshed upload/download docs to mark janitor cleanup as already fixed, document the
+  remaining upload issues, and capture the accepted traffic-accounting debt
+
+### Files
+
+- `internal/api/seafhttp.go`
+- `internal/api/seafhttp_test.go`
+- `internal/api/v2/fileview.go`
+- `internal/api/v2/sharelink_view.go`
+- `internal/streaming/streaming.go`
+- `internal/streaming/block_read_seeker.go`
+- `internal/crypto/crypto.go`
+- `internal/integration/upload_download_test.go`
+- `docs/UPLOAD-DOWNLOAD-ANALYSIS.md`
+- `docs/KNOWN_ISSUES.md`
+- `docs/TECHNICAL-DEBT.md`
+
+---
+
 ## 2026-05-02 — Config: centralize `SERVER_URL` / branding / S3 creds
 
 ### Refactor
@@ -827,7 +917,7 @@ Migrated all inline HTML from Go code to Go `html/template` files with base temp
 
 **Partial fix: Backend autorename infrastructure ready, but "Don't replace" not yet functional**
 
-The `replace` form parameter was extracted from upload requests but completely ignored (`_ = replace // TODO`). The server always overwrote files with the same name. This session added the backend plumbing for auto-rename support, but the full fix requires distinguishing `update-link` vs `upload-link` tokens (see ISSUE-UPLOAD-REPLACE-01 in KNOWN_ISSUES.md).
+The `replace` form parameter was extracted from upload requests but completely ignored (`_ = replace // TODO`). The server always overwrote files with the same name. This session added the backend plumbing for auto-rename support; at that time, the remaining step was to distinguish `update-link` vs `upload-link` tokens (completed later under ISSUE-UPLOAD-REPLACE-01).
 
 Backend changes:
 - `autoRenameIfExists()` function generates unique names (`file (1).txt`, `file (2).txt`, etc.)
@@ -835,7 +925,9 @@ Backend changes:
 - All commit/directory functions now return `actualFilename` (may differ from original if auto-renamed)
 - Default `replace=1` (overwrite) — preserves current behavior until token-level fix is implemented
 
-**Still pending**: Token-level `Replace` flag to distinguish `update-link` (replace) vs `upload-link` (auto-rename). See `docs/KNOWN_ISSUES.md` ISSUE-UPLOAD-REPLACE-01 for full plan.
+**Completed later**: The token-level `Replace` flag and the `upload-link` vs
+`update-link` split were completed on 2026-05-22. This entry remains the earlier
+partial infrastructure step.
 
 ### Files Changed
 

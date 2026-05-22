@@ -73,11 +73,11 @@ const (
 
 // EncryptionParams holds the encryption metadata for a library
 type EncryptionParams struct {
-	EncVersion int    `json:"enc_version"`
-	Salt       string `json:"salt"`        // Hex-encoded 32-byte random salt
-	Magic      string `json:"magic"`       // PBKDF2-derived (Seafile compat)
-	MagicStrong string `json:"magic_strong,omitempty"` // Argon2id-derived (SesameFS)
-	RandomKey  string `json:"random_key"`  // Encrypted file key (PBKDF2)
+	EncVersion      int    `json:"enc_version"`
+	Salt            string `json:"salt"`                        // Hex-encoded 32-byte random salt
+	Magic           string `json:"magic"`                       // PBKDF2-derived (Seafile compat)
+	MagicStrong     string `json:"magic_strong,omitempty"`      // Argon2id-derived (SesameFS)
+	RandomKey       string `json:"random_key"`                  // Encrypted file key (PBKDF2)
 	RandomKeyStrong string `json:"random_key_strong,omitempty"` // Encrypted file key (Argon2id)
 }
 
@@ -103,8 +103,8 @@ func GenerateFileKey() ([]byte, error) {
 // This is used for MAGIC generation (password verification).
 // CRITICAL: Magic uses repo_id + password as input.
 // Uses TWO separate PBKDF2 calls:
-//   1. Key = PBKDF2(repo_id + password, salt, 1000 iterations, 32 bytes)
-//   2. IV = PBKDF2(key, salt, 10 iterations, 16 bytes)
+//  1. Key = PBKDF2(repo_id + password, salt, 1000 iterations, 32 bytes)
+//  2. IV = PBKDF2(key, salt, 10 iterations, 16 bytes)
 func DeriveKeyPBKDF2(password string, repoID string, salt []byte, version int) (key []byte, iv []byte) {
 	// Seafile uses repo_id + password for MAGIC (from seafile-crypt.c: seafile_generate_magic)
 	input := []byte(repoID + password)
@@ -146,8 +146,8 @@ func DeriveEncryptionKeyPBKDF2(password string, salt []byte, version int) (key [
 // key and IV used for file encryption. This function implements that second derivation.
 // secretKey is the 32-byte key obtained by decrypting random_key.
 // CRITICAL: Uses the same two-step derivation as DeriveKeyPBKDF2:
-//   1. Key = PBKDF2(secretKey, salt, 1000 iterations, 32 bytes)
-//   2. IV = PBKDF2(key, salt, 10 iterations, 16 bytes)
+//  1. Key = PBKDF2(secretKey, salt, 1000 iterations, 32 bytes)
+//  2. IV = PBKDF2(key, salt, 10 iterations, 16 bytes)
 func DeriveFileEncryptionKey(secretKey []byte, version int) (key []byte, iv []byte) {
 	// Get the appropriate salt for this version
 	deriveSalt := deriveSeafileSalt("", version, nil)
@@ -306,7 +306,7 @@ func CreateEncryptedLibrary(password string, repoID string) (*EncryptionParams, 
 		Salt:            hex.EncodeToString(randomSalt), // Store random salt for Argon2id
 		Magic:           magicSeafile,                   // Uses repo_id + password
 		MagicStrong:     magicStrong,
-		RandomKey:       randomKey,                      // Uses password only
+		RandomKey:       randomKey, // Uses password only
 		RandomKeyStrong: randomKeyStrong,
 	}, nil
 }
@@ -391,7 +391,7 @@ func ChangePassword(oldPassword, newPassword, repoID string, params *EncryptionP
 		Salt:            hex.EncodeToString(newRandomSalt), // Random salt for Argon2id
 		Magic:           newMagicSeafile,                   // Uses repo_id + password
 		MagicStrong:     newMagicStrong,
-		RandomKey:       newRandomKey,                      // Uses password only
+		RandomKey:       newRandomKey, // Uses password only
 		RandomKeyStrong: newRandomKeyStrong,
 	}, nil
 }
@@ -484,6 +484,19 @@ func DecryptBlockSeafile(ciphertext []byte, fileKey []byte, fileIV []byte) ([]by
 	}
 
 	return unpadded, nil
+}
+
+// DecryptLibraryBlock decrypts an encrypted library block.
+//
+// When the library IV is available, the block must be in the current
+// Seafile-compatible derived-IV format. Callers without a library IV fall back
+// to the legacy/random-IV reader for older or unencrypted blocks.
+func DecryptLibraryBlock(encrypted []byte, fileKey []byte, fileIV []byte) ([]byte, error) {
+	if len(fileIV) == IVSize {
+		return DecryptBlockSeafile(encrypted, fileKey, fileIV)
+	}
+
+	return DecryptBlock(encrypted, fileKey)
 }
 
 // EncryptBlock encrypts a block of file content using AES-256-CBC.

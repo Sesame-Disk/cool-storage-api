@@ -53,6 +53,7 @@ type AccessToken struct {
 	OrgID     string
 	RepoID    string
 	Path      string // File path for downloads, parent dir for uploads
+	Replace   bool   // Default overwrite behavior for upload tokens
 	UserID    string
 	Source    string // "" or "web" = regular user; "link" = share/upload link
 	AuthToken string // User's auth token (for one-time login tokens)
@@ -63,6 +64,7 @@ type AccessToken struct {
 // TokenStore is the interface for token operations (can be in-memory or Cassandra-backed)
 type TokenStore interface {
 	CreateUploadToken(orgID, repoID, path, userID string) (string, error)
+	CreateUpdateToken(orgID, repoID, path, userID string) (string, error)
 	CreateDownloadToken(orgID, repoID, path, userID string) (string, error)
 	CreateLinkUploadToken(orgID, repoID, path, userID string) (string, error)
 	CreateLinkDownloadToken(orgID, repoID, path, userID string) (string, error)
@@ -98,6 +100,10 @@ const DefaultTokenTTL = 1 * time.Hour
 
 // CreateToken creates a new access token
 func (tm *TokenManager) CreateToken(tokenType TokenType, orgID, repoID, path, userID, source string, ttl time.Duration) (*AccessToken, error) {
+	return tm.createToken(tokenType, orgID, repoID, path, userID, source, false, ttl)
+}
+
+func (tm *TokenManager) createToken(tokenType TokenType, orgID, repoID, path, userID, source string, replace bool, ttl time.Duration) (*AccessToken, error) {
 	// Generate random token
 	bytes := make([]byte, 16)
 	if _, err := rand.Read(bytes); err != nil {
@@ -111,6 +117,7 @@ func (tm *TokenManager) CreateToken(tokenType TokenType, orgID, repoID, path, us
 		OrgID:     orgID,
 		RepoID:    repoID,
 		Path:      path,
+		Replace:   replace,
 		UserID:    userID,
 		Source:    source,
 		ExpiresAt: time.Now().Add(ttl),
@@ -126,7 +133,16 @@ func (tm *TokenManager) CreateToken(tokenType TokenType, orgID, repoID, path, us
 
 // CreateUploadToken creates an upload token (implements TokenCreator interface)
 func (tm *TokenManager) CreateUploadToken(orgID, repoID, path, userID string) (string, error) {
-	token, err := tm.CreateToken(TokenTypeUpload, orgID, repoID, path, userID, "", tm.tokenTTL)
+	token, err := tm.createToken(TokenTypeUpload, orgID, repoID, path, userID, "", false, tm.tokenTTL)
+	if err != nil {
+		return "", err
+	}
+	return token.Token, nil
+}
+
+// CreateUpdateToken creates an upload token that overwrites the target path by default.
+func (tm *TokenManager) CreateUpdateToken(orgID, repoID, path, userID string) (string, error) {
+	token, err := tm.createToken(TokenTypeUpload, orgID, repoID, path, userID, "", true, tm.tokenTTL)
 	if err != nil {
 		return "", err
 	}
@@ -144,7 +160,7 @@ func (tm *TokenManager) CreateDownloadToken(orgID, repoID, path, userID string) 
 
 // CreateLinkUploadToken creates an upload token tagged as a share/upload link.
 func (tm *TokenManager) CreateLinkUploadToken(orgID, repoID, path, userID string) (string, error) {
-	token, err := tm.CreateToken(TokenTypeUpload, orgID, repoID, path, userID, "link", tm.tokenTTL)
+	token, err := tm.createToken(TokenTypeUpload, orgID, repoID, path, userID, "link", false, tm.tokenTTL)
 	if err != nil {
 		return "", err
 	}
@@ -279,6 +295,7 @@ type ChunkUpload struct {
 
 	finalizationStarted    bool
 	accountedBlockPosition map[int]string
+	quotaPrecheck          chunkQuotaPrecheck
 	updatedAt              time.Time
 	mu                     sync.Mutex
 }
@@ -286,6 +303,13 @@ type ChunkUpload struct {
 type byteRange struct {
 	Start int64
 	End   int64
+}
+
+type chunkQuotaPrecheck struct {
+	ready     bool
+	parentDir string
+	totalSize int64
+	replace   bool
 }
 
 // Chunked upload janitor tunables. The in-memory tracker TTL must be longer
@@ -387,6 +411,13 @@ func (cm *ChunkManager) GetOrCreateUpload(token, filename, parentDir string, tot
 	cm.uploads[key] = upload
 	log.Printf("[ChunkManager] Created upload tracker: %s, totalSize=%d", key, totalSize)
 	return upload, nil
+}
+
+func (cm *ChunkManager) GetUpload(token, filename string) *ChunkUpload {
+	key := token + ":" + filename
+	cm.mu.RLock()
+	defer cm.mu.RUnlock()
+	return cm.uploads[key]
 }
 
 // janitorLoop periodically reaps stale chunk uploads from memory and disk.
@@ -673,6 +704,27 @@ func (cu *ChunkUpload) BlockAlreadyAccounted(index int, blockID string) (bool, e
 		return false, fmt.Errorf("block at position %d changed after accounting", index)
 	}
 	return true, nil
+}
+
+func (cu *ChunkUpload) HasQuotaPrecheck(parentDir string, totalSize int64, replace bool) bool {
+	cu.mu.Lock()
+	defer cu.mu.Unlock()
+	return cu.quotaPrecheck.ready &&
+		cu.quotaPrecheck.parentDir == parentDir &&
+		cu.quotaPrecheck.totalSize == totalSize &&
+		cu.quotaPrecheck.replace == replace
+}
+
+func (cu *ChunkUpload) MarkQuotaPrecheck(parentDir string, totalSize int64, replace bool) {
+	cu.mu.Lock()
+	defer cu.mu.Unlock()
+	cu.quotaPrecheck = chunkQuotaPrecheck{
+		ready:     true,
+		parentDir: parentDir,
+		totalSize: totalSize,
+		replace:   replace,
+	}
+	cu.updatedAt = time.Now()
 }
 
 // GetContent reads the complete file content into memory.
@@ -1022,8 +1074,16 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 	// Get optional parameters
 	parentDir := c.DefaultPostForm("parent_dir", token.Path)
 	relativePath := c.PostForm("relative_path")
-	replaceStr := c.DefaultPostForm("replace", "1")
-	replaceFile := replaceStr != "0"
+	replaceFile := token.Replace
+	if token.Replace {
+		// The token defines whether this upload is allowed to overwrite.
+		// `replace=0` may downgrade an update-link to autorename, but an
+		// upload-link must not be elevated to overwrite via multipart fields.
+		replaceStr, ok := c.GetPostForm("replace")
+		if ok {
+			replaceFile = replaceStr != "0"
+		}
+	}
 	retJSON := c.Query("ret-json") == "1" || c.PostForm("ret-json") == "1"
 
 	filename := header.Filename
@@ -1069,14 +1129,17 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 		tokenStr, filename, contentRange, isChunked)
 
 	if isChunked {
-		if _, _, err := h.checkUploadStorageQuotaForCurrentHead(token.OrgID, token.RepoID, token.UserID, parentDir, filename, total, replaceFile); err != nil {
-			log.Printf("[HandleUpload] Chunked upload storage quota check failed: %v", err)
-			if errors.Is(err, errStorageQuotaExceeded) {
-				c.JSON(http.StatusForbidden, gin.H{"error": "storage quota exceeded"})
-			} else {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to check storage quota"})
+		existingUpload := chunkManager.GetUpload(tokenStr, filename)
+		if existingUpload == nil || !existingUpload.HasQuotaPrecheck(parentDir, total, replaceFile) {
+			if _, _, err := h.checkUploadStorageQuotaForCurrentHead(token.OrgID, token.RepoID, token.UserID, parentDir, filename, total, replaceFile); err != nil {
+				log.Printf("[HandleUpload] Chunked upload storage quota check failed: %v", err)
+				if errors.Is(err, errStorageQuotaExceeded) {
+					c.JSON(http.StatusForbidden, gin.H{"error": "storage quota exceeded"})
+				} else {
+					c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to check storage quota"})
+				}
+				return
 			}
-			return
 		}
 
 		// Chunked upload: stream chunk data directly to temp file (no io.ReadAll)
@@ -1086,6 +1149,7 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to initialize upload"})
 			return
 		}
+		upload.MarkQuotaPrecheck(parentDir, total, replaceFile)
 
 		// Stream chunk directly to temp file at the correct offset
 		if err := upload.WriteChunkFromReader(file, start, end); err != nil {
@@ -2159,20 +2223,20 @@ func (h *SeafHTTPHandler) resolveBlockID(orgID, blockID string) string {
 
 // lookupFileBlocks resolves a token's path to its block IDs, file size, encryption key, and block store.
 // This is the common metadata lookup used by both download and streaming paths.
-func (h *SeafHTTPHandler) lookupFileBlocks(hostname string, token *AccessToken) (blockIDs []string, fileSize int64, fileKey []byte, blockStore *storage.BlockStore, err error) {
+func (h *SeafHTTPHandler) lookupFileBlocks(hostname string, token *AccessToken) (blockIDs []string, fileSize int64, fileKey []byte, fileIV []byte, blockStore *storage.BlockStore, err error) {
 	// Check encryption
 	var encrypted bool
 	err = h.db.Session().Query(`
 		SELECT encrypted FROM libraries WHERE org_id = ? AND library_id = ?
 	`, token.OrgID, token.RepoID).Scan(&encrypted)
 	if err != nil {
-		return nil, 0, nil, nil, fmt.Errorf("failed to check library encryption: %w", err)
+		return nil, 0, nil, nil, nil, fmt.Errorf("failed to check library encryption: %w", err)
 	}
 
 	if encrypted {
-		fileKey = v2.GetDecryptSessions().GetFileKey(token.UserID, token.RepoID)
+		fileKey, fileIV = v2.GetDecryptSessions().GetFileKeyAndIV(token.UserID, token.RepoID)
 		if fileKey == nil {
-			return nil, 0, nil, nil, fmt.Errorf("library is encrypted but not unlocked")
+			return nil, 0, nil, nil, nil, fmt.Errorf("library is encrypted but not unlocked")
 		}
 	}
 
@@ -2182,7 +2246,7 @@ func (h *SeafHTTPHandler) lookupFileBlocks(hostname string, token *AccessToken) 
 		SELECT head_commit_id FROM libraries WHERE org_id = ? AND library_id = ?
 	`, token.OrgID, token.RepoID).Scan(&headCommit)
 	if err != nil {
-		return nil, 0, nil, nil, fmt.Errorf("library not found: %w", err)
+		return nil, 0, nil, nil, nil, fmt.Errorf("library not found: %w", err)
 	}
 
 	var rootFSID string
@@ -2190,7 +2254,7 @@ func (h *SeafHTTPHandler) lookupFileBlocks(hostname string, token *AccessToken) 
 		SELECT root_fs_id FROM commits WHERE library_id = ? AND commit_id = ?
 	`, token.RepoID, headCommit).Scan(&rootFSID)
 	if err != nil {
-		return nil, 0, nil, nil, fmt.Errorf("commit not found: %w", err)
+		return nil, 0, nil, nil, nil, fmt.Errorf("commit not found: %w", err)
 	}
 
 	// Navigate directory tree to the target file
@@ -2200,14 +2264,14 @@ func (h *SeafHTTPHandler) lookupFileBlocks(hostname string, token *AccessToken) 
 	}
 	pathParts := strings.Split(strings.Trim(filePath, "/"), "/")
 	if len(pathParts) == 0 || (len(pathParts) == 1 && pathParts[0] == "") {
-		return nil, 0, nil, nil, fmt.Errorf("invalid file path")
+		return nil, 0, nil, nil, nil, fmt.Errorf("invalid file path")
 	}
 
 	currentFSID := rootFSID
 	for i := 0; i < len(pathParts)-1; i++ {
 		nextFSID, err := h.findEntryInDir(token.RepoID, currentFSID, pathParts[i])
 		if err != nil {
-			return nil, 0, nil, nil, fmt.Errorf("directory not found: %s: %w", pathParts[i], err)
+			return nil, 0, nil, nil, nil, fmt.Errorf("directory not found: %s: %w", pathParts[i], err)
 		}
 		currentFSID = nextFSID
 	}
@@ -2215,7 +2279,7 @@ func (h *SeafHTTPHandler) lookupFileBlocks(hostname string, token *AccessToken) 
 	targetName := pathParts[len(pathParts)-1]
 	fileFSID, err := h.findEntryInDir(token.RepoID, currentFSID, targetName)
 	if err != nil {
-		return nil, 0, nil, nil, fmt.Errorf("file not found: %s: %w", targetName, err)
+		return nil, 0, nil, nil, nil, fmt.Errorf("file not found: %s: %w", targetName, err)
 	}
 
 	// Get block IDs and file size from fs_object
@@ -2223,22 +2287,22 @@ func (h *SeafHTTPHandler) lookupFileBlocks(hostname string, token *AccessToken) 
 		SELECT block_ids, size_bytes FROM fs_objects WHERE library_id = ? AND fs_id = ?
 	`, token.RepoID, fileFSID).Scan(&blockIDs, &fileSize)
 	if err != nil {
-		return nil, 0, nil, nil, fmt.Errorf("file metadata not found: %w", err)
+		return nil, 0, nil, nil, nil, fmt.Errorf("file metadata not found: %w", err)
 	}
 
 	blockStore, _, err = h.resolveLibraryBlockStore(hostname, token.OrgID, token.RepoID)
 	if err != nil {
-		return nil, 0, nil, nil, fmt.Errorf("block store not available: %w", err)
+		return nil, 0, nil, nil, nil, fmt.Errorf("block store not available: %w", err)
 	}
 
-	return blockIDs, fileSize, fileKey, blockStore, nil
+	return blockIDs, fileSize, fileKey, fileIV, blockStore, nil
 }
 
 // streamFileFromBlocks streams a file's blocks directly to the HTTP response.
 // Uses prefetching (overlap S3 fetch with HTTP write) and 4MB io.CopyBuffer
 // for maximum throughput. Only O(2 × block_size) RAM.
 func (h *SeafHTTPHandler) streamFileFromBlocks(c *gin.Context, token *AccessToken, filename string, periodStartedAt time.Time) error {
-	blockIDs, fileSize, fileKey, blockStore, err := h.lookupFileBlocks(httputil.GetRoutingHostname(c, h.configuredServerURL()), token)
+	blockIDs, fileSize, fileKey, fileIV, blockStore, err := h.lookupFileBlocks(httputil.GetRoutingHostname(c, h.configuredServerURL()), token)
 	if err != nil {
 		return err
 	}
@@ -2272,7 +2336,7 @@ func (h *SeafHTTPHandler) streamFileFromBlocks(c *gin.Context, token *AccessToke
 	resolvedIDs := streaming.BatchResolveBlockIDs(h.db, token.OrgID, blockIDs)
 
 	// Stream with prefetching pipeline
-	streaming.StreamBlocks(c, c.Request.Context(), blockStore, resolvedIDs, fileKey, "streamFileFromBlocks")
+	streaming.StreamBlocks(c, c.Request.Context(), blockStore, resolvedIDs, fileKey, fileIV, "streamFileFromBlocks")
 
 	log.Printf("[streamFileFromBlocks] Streaming complete: %d blocks", len(blockIDs))
 
@@ -2292,7 +2356,7 @@ func (h *SeafHTTPHandler) streamFileFromBlocks(c *gin.Context, token *AccessToke
 // DEPRECATED: Use streamFileFromBlocks for downloads. This is kept only for
 // upload metadata (commitUploadedFile) where the full content is already in memory.
 func (h *SeafHTTPHandler) getFileFromBlocks(c *gin.Context, token *AccessToken) ([]byte, error) {
-	blockIDs, _, fileKey, blockStore, err := h.lookupFileBlocks(httputil.GetRoutingHostname(c, h.configuredServerURL()), token)
+	blockIDs, _, fileKey, fileIV, blockStore, err := h.lookupFileBlocks(httputil.GetRoutingHostname(c, h.configuredServerURL()), token)
 	if err != nil {
 		return nil, err
 	}
@@ -2308,7 +2372,7 @@ func (h *SeafHTTPHandler) getFileFromBlocks(c *gin.Context, token *AccessToken) 
 		}
 
 		if fileKey != nil {
-			blockData, err = crypto.DecryptBlock(blockData, fileKey)
+			blockData, err = crypto.DecryptLibraryBlock(blockData, fileKey, fileIV)
 			if err != nil {
 				return nil, fmt.Errorf("failed to decrypt block %s: %w", blockID, err)
 			}
@@ -2528,11 +2592,12 @@ func (h *SeafHTTPHandler) HandleZipDownload(c *gin.Context) {
 	// Check encryption
 	var encrypted bool
 	var fileKey []byte
+	var fileIV []byte
 	h.db.Session().Query(`
 		SELECT encrypted FROM libraries WHERE org_id = ? AND library_id = ?
 	`, token.OrgID, token.RepoID).Scan(&encrypted)
 	if encrypted {
-		fileKey = v2.GetDecryptSessions().GetFileKey(token.UserID, token.RepoID)
+		fileKey, fileIV = v2.GetDecryptSessions().GetFileKeyAndIV(token.UserID, token.RepoID)
 		if fileKey == nil {
 			c.JSON(http.StatusForbidden, gin.H{"error": "library is encrypted but not unlocked"})
 			return
@@ -2564,7 +2629,7 @@ func (h *SeafHTTPHandler) HandleZipDownload(c *gin.Context) {
 
 	// Recursively add directory contents to the ZIP
 	runtimeBudget := h.newZipTraversalBudget()
-	if err := h.addDirToZip(c.Request.Context(), httputil.GetRoutingHostname(c, h.configuredServerURL()), zipWriter, token.RepoID, token.OrgID, targetFSID, "", fileKey, 0, runtimeBudget); err != nil {
+	if err := h.addDirToZip(c.Request.Context(), httputil.GetRoutingHostname(c, h.configuredServerURL()), zipWriter, token.RepoID, token.OrgID, targetFSID, "", fileKey, fileIV, 0, runtimeBudget); err != nil {
 		log.Printf("[HandleZipDownload] ZIP stream aborted: %v", err)
 		return
 	}
@@ -2639,7 +2704,7 @@ func (h *SeafHTTPHandler) validateZipDirectory(repoID, dirFSID string, depth int
 }
 
 // addDirToZip recursively adds directory contents to a ZIP archive
-func (h *SeafHTTPHandler) addDirToZip(ctx context.Context, hostname string, zw *zip.Writer, repoID, orgID, dirFSID, prefix string, fileKey []byte, depth int, budget *zipTraversalBudget) error {
+func (h *SeafHTTPHandler) addDirToZip(ctx context.Context, hostname string, zw *zip.Writer, repoID, orgID, dirFSID, prefix string, fileKey []byte, fileIV []byte, depth int, budget *zipTraversalBudget) error {
 	if budget != nil {
 		if err := budget.noteDirectory(depth); err != nil {
 			return err
@@ -2675,11 +2740,11 @@ func (h *SeafHTTPHandler) addDirToZip(ctx context.Context, hostname string, zw *
 		mode := int(modeFloat)
 
 		if mode == 16384 || mode&0170000 == 040000 { // Directory
-			if err := h.addDirToZip(ctx, hostname, zw, repoID, orgID, id, entryPath, fileKey, depth+1, budget); err != nil {
+			if err := h.addDirToZip(ctx, hostname, zw, repoID, orgID, id, entryPath, fileKey, fileIV, depth+1, budget); err != nil {
 				return err
 			}
 		} else { // File
-			if err := h.addFileToZip(ctx, hostname, zw, repoID, orgID, id, entryPath, fileKey, budget); err != nil {
+			if err := h.addFileToZip(ctx, hostname, zw, repoID, orgID, id, entryPath, fileKey, fileIV, budget); err != nil {
 				return err
 			}
 		}
@@ -2692,7 +2757,7 @@ func (h *SeafHTTPHandler) addDirToZip(ctx context.Context, hostname string, zw *
 // Uses zip.Store (no compression) for maximum throughput — the data is already
 // compressed by S3/MinIO or is binary data where deflate adds CPU cost for minimal gain.
 // For encrypted files, one block at a time is loaded, decrypted, and written.
-func (h *SeafHTTPHandler) addFileToZip(ctx context.Context, hostname string, zw *zip.Writer, repoID, orgID, fileFSID, zipPath string, fileKey []byte, budget *zipTraversalBudget) error {
+func (h *SeafHTTPHandler) addFileToZip(ctx context.Context, hostname string, zw *zip.Writer, repoID, orgID, fileFSID, zipPath string, fileKey []byte, fileIV []byte, budget *zipTraversalBudget) error {
 	var blockIDs []string
 	var fileSize int64
 	err := h.db.Session().Query(`
@@ -2743,7 +2808,7 @@ func (h *SeafHTTPHandler) addFileToZip(ctx context.Context, hostname string, zw 
 			if err != nil {
 				return fmt.Errorf("get block %s for %s: %w", blockIDs[i], zipPath, err)
 			}
-			decrypted, err := crypto.DecryptBlock(blockData, fileKey)
+			decrypted, err := crypto.DecryptLibraryBlock(blockData, fileKey, fileIV)
 			if err != nil {
 				return fmt.Errorf("decrypt block for %s: %w", zipPath, err)
 			}

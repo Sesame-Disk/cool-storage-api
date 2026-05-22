@@ -10,12 +10,18 @@ import (
 	"io"
 	"mime/multipart"
 	"net/http"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
 )
 
 func uploadFileThroughLink(t *testing.T, c *testClient, uploadURL, fileName, parentDir, content string) {
+	t.Helper()
+	uploadFileThroughLinkWithReplaceField(t, c, uploadURL, fileName, parentDir, content, nil)
+}
+
+func uploadFileThroughLinkWithReplaceField(t *testing.T, c *testClient, uploadURL, fileName, parentDir, content string, replace *string) {
 	t.Helper()
 
 	var buf bytes.Buffer
@@ -29,6 +35,11 @@ func uploadFileThroughLink(t *testing.T, c *testClient, uploadURL, fileName, par
 	}
 	if err := writer.WriteField("parent_dir", parentDir); err != nil {
 		t.Fatalf("WriteField failed: %v", err)
+	}
+	if replace != nil {
+		if err := writer.WriteField("replace", *replace); err != nil {
+			t.Fatalf("WriteField replace failed: %v", err)
+		}
 	}
 	if err := writer.Close(); err != nil {
 		t.Fatalf("closing multipart writer failed: %v", err)
@@ -185,6 +196,117 @@ func TestUploadAndDownloadRoundTrip(t *testing.T) {
 			t.Log("content matches — full round-trip verified")
 		}
 	})
+}
+
+func TestChunkedUploadAndDownloadRoundTrip(t *testing.T) {
+	name := fmt.Sprintf("inttest-chunked-updown-%d", time.Now().UnixNano())
+	repoID := createTestLibrary(t, adminClient, name)
+	uploadURL := getUploadURL(t, adminClient, repoID)
+
+	fileName := "chunked-roundtrip.txt"
+	fileContent := []byte(strings.Repeat("chunked roundtrip content ", 32) + "done\n")
+	chunkStarts := []int{0, 173, 347, 521}
+
+	for index, start := range chunkStarts {
+		end := len(fileContent) - 1
+		if index+1 < len(chunkStarts) {
+			end = chunkStarts[index+1] - 1
+		}
+
+		status, body := uploadChunkThroughLinkStatus(
+			t,
+			adminClient,
+			uploadURL,
+			fileName,
+			"/",
+			fileContent[start:end+1],
+			fmt.Sprintf("bytes %d-%d/%d", start, end, len(fileContent)),
+		)
+		if status != http.StatusOK && status != http.StatusCreated {
+			t.Fatalf("chunk %d upload status = %d, want 200/201; body=%s", index, status, body)
+		}
+	}
+
+	listResp := adminClient.Get(t, fmt.Sprintf("/api/v2.1/repos/%s/dir/?p=/", repoID))
+	expectStatus(t, listResp, http.StatusOK)
+
+	var dirList map[string]interface{}
+	decodeJSON(t, listResp, &dirList)
+	entries, _ := dirList["dirent_list"].([]interface{})
+	if !containsEntry(entries, "name", fileName) {
+		t.Fatalf("chunked uploaded file %q not found in directory listing", fileName)
+	}
+
+	dlResp := adminClient.Get(t, fmt.Sprintf("/api2/repos/%s/file/?p=/%s", repoID, fileName))
+	expectStatus(t, dlResp, http.StatusOK)
+	downloadURL := strings.Trim(responseBody(t, dlResp), "\" \n\r")
+
+	req, err := http.NewRequest(http.MethodGet, downloadURL, nil)
+	if err != nil {
+		t.Fatalf("creating chunked roundtrip download request failed: %v", err)
+	}
+	downloadResp, err := adminClient.http.Do(req)
+	if err != nil {
+		t.Fatalf("chunked roundtrip download request failed: %v", err)
+	}
+	defer downloadResp.Body.Close()
+	if downloadResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(downloadResp.Body)
+		t.Fatalf("chunked roundtrip download status = %d: %s", downloadResp.StatusCode, string(body))
+	}
+
+	downloadedContent, err := io.ReadAll(downloadResp.Body)
+	if err != nil {
+		t.Fatalf("reading chunked roundtrip download failed: %v", err)
+	}
+	if !bytes.Equal(downloadedContent, fileContent) {
+		t.Fatalf("chunked downloaded content mismatch: got %d bytes, want %d", len(downloadedContent), len(fileContent))
+	}
+}
+
+func TestEncryptedUploadAndDownloadRoundTrip(t *testing.T) {
+	name := fmt.Sprintf("inttest-encrypted-updown-%d", time.Now().UnixNano())
+	password := "test-password-123"
+	repoID := createLibraryWithBody(t, adminClient, name, map[string]interface{}{
+		"repo_name": name,
+		"encrypted": true,
+		"passwd":    password,
+	}, true)
+
+	setPassResp := adminClient.PostForm(t, fmt.Sprintf("/api/v2.1/repos/%s/set-password/", repoID), url.Values{"password": {password}})
+	expectStatus(t, setPassResp, http.StatusOK)
+	setPassResp.Body.Close()
+
+	fileName := "encrypted-roundtrip.txt"
+	fileContent := "Encrypted roundtrip integration content. This must survive upload and download intact.\n"
+	uploadURL := getUploadURL(t, adminClient, repoID)
+	uploadFileThroughLink(t, adminClient, uploadURL, fileName, "/", fileContent)
+
+	dlResp := adminClient.Get(t, fmt.Sprintf("/api2/repos/%s/file/?p=/%s", repoID, fileName))
+	expectStatus(t, dlResp, http.StatusOK)
+	downloadURL := strings.Trim(responseBody(t, dlResp), "\" \n\r")
+
+	req, err := http.NewRequest(http.MethodGet, downloadURL, nil)
+	if err != nil {
+		t.Fatalf("creating encrypted roundtrip download request failed: %v", err)
+	}
+	downloadResp, err := adminClient.http.Do(req)
+	if err != nil {
+		t.Fatalf("encrypted roundtrip download request failed: %v", err)
+	}
+	defer downloadResp.Body.Close()
+	if downloadResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(downloadResp.Body)
+		t.Fatalf("encrypted roundtrip download status = %d: %s", downloadResp.StatusCode, string(body))
+	}
+
+	downloadedContent, err := io.ReadAll(downloadResp.Body)
+	if err != nil {
+		t.Fatalf("reading encrypted roundtrip download failed: %v", err)
+	}
+	if string(downloadedContent) != fileContent {
+		t.Fatalf("encrypted downloaded content mismatch:\n  got:  %q\n  want: %q", string(downloadedContent), fileContent)
+	}
 }
 
 // TestUploadLinkURL verifies the upload link URL points to the correct server.
@@ -356,16 +478,15 @@ func TestRegionPinnedLibraryReadPaths(t *testing.T) {
 	})
 }
 
-// TestUploadOverwrite verifies that uploading to the same path overwrites the file.
+// TestUploadOverwrite verifies that update-link uploads overwrite the file by default.
 func TestUploadOverwrite(t *testing.T) {
 	name := fmt.Sprintf("inttest-overwrite-%d", time.Now().UnixNano())
 	repoID := createTestLibrary(t, adminClient, name)
 	fileName := "overwrite-test.txt"
 
-	upload := func(content string) {
+	upload := func(linkPath, content string) {
 		t.Helper()
-		// Get upload link
-		resp := adminClient.Get(t, fmt.Sprintf("/api2/repos/%s/upload-link/?p=/", repoID))
+		resp := adminClient.Get(t, fmt.Sprintf("/api2/repos/%s/%s/?p=/", repoID, linkPath))
 		expectStatus(t, resp, http.StatusOK)
 		uploadURL := strings.Trim(responseBody(t, resp), "\" \n\r")
 
@@ -403,15 +524,162 @@ func TestUploadOverwrite(t *testing.T) {
 	}
 
 	// Upload v1
-	upload("version 1 content")
+	upload("upload-link", "version 1 content")
 
-	// Upload v2 (overwrite)
-	upload("version 2 content")
+	// Upload v2 (overwrite via update-link)
+	upload("update-link", "version 2 content")
 
 	// Download and verify it's v2
 	got := download()
 	if got != "version 2 content" {
 		t.Errorf("expected 'version 2 content', got %q", got)
+	}
+}
+
+func TestUploadLinkAutoRenamesWithoutReplaceOverride(t *testing.T) {
+	name := fmt.Sprintf("inttest-upload-autorename-%d", time.Now().UnixNano())
+	repoID := createTestLibrary(t, adminClient, name)
+	fileName := "autorename-test.txt"
+	autoRenamed := "autorename-test (1).txt"
+
+	resp := adminClient.Get(t, fmt.Sprintf("/api2/repos/%s/upload-link/?p=/", repoID))
+	expectStatus(t, resp, http.StatusOK)
+	uploadURL := strings.Trim(responseBody(t, resp), "\" \n\r")
+
+	uploadFileThroughLink(t, adminClient, uploadURL, fileName, "/", "first version")
+	uploadFileThroughLink(t, adminClient, uploadURL, fileName, "/", "second version")
+
+	listResp := adminClient.Get(t, fmt.Sprintf("/api/v2.1/repos/%s/dir/?p=/", repoID))
+	expectStatus(t, listResp, http.StatusOK)
+
+	var dirList map[string]interface{}
+	decodeJSON(t, listResp, &dirList)
+	entries, _ := dirList["dirent_list"].([]interface{})
+	if !containsEntry(entries, "name", fileName) {
+		t.Fatalf("original file %q not found after repeated upload-link upload", fileName)
+	}
+	if !containsEntry(entries, "name", autoRenamed) {
+		t.Fatalf("autorename target %q not found after repeated upload-link upload", autoRenamed)
+	}
+
+	download := func(name string) string {
+		t.Helper()
+		resp := adminClient.Get(t, fmt.Sprintf("/api2/repos/%s/file/?p=/%s", repoID, url.PathEscape(name)))
+		expectStatus(t, resp, http.StatusOK)
+		downloadURL := strings.Trim(responseBody(t, resp), "\" \n\r")
+
+		req, err := http.NewRequest(http.MethodGet, downloadURL, nil)
+		if err != nil {
+			t.Fatalf("creating download request failed: %v", err)
+		}
+		downloadResp, err := adminClient.http.Do(req)
+		if err != nil {
+			t.Fatalf("download request failed: %v", err)
+		}
+		defer downloadResp.Body.Close()
+
+		content, err := io.ReadAll(downloadResp.Body)
+		if err != nil {
+			t.Fatalf("reading download failed: %v", err)
+		}
+		return string(content)
+	}
+
+	if got := download(fileName); got != "first version" {
+		t.Fatalf("original file content = %q, want %q", got, "first version")
+	}
+	if got := download(autoRenamed); got != "second version" {
+		t.Fatalf("autorename file content = %q, want %q", got, "second version")
+	}
+}
+
+func TestUploadLinkIgnoresForcedReplaceOverride(t *testing.T) {
+	name := fmt.Sprintf("inttest-upload-ignore-replace-%d", time.Now().UnixNano())
+	repoID := createTestLibrary(t, adminClient, name)
+	fileName := "text.txt"
+	autoRenamed := "text (1).txt"
+	replace := "1"
+
+	resp := adminClient.Get(t, fmt.Sprintf("/api2/repos/%s/upload-link/?p=/", repoID))
+	expectStatus(t, resp, http.StatusOK)
+	uploadURL := strings.Trim(responseBody(t, resp), "\" \n\r")
+
+	uploadFileThroughLink(t, adminClient, uploadURL, fileName, "/", "original")
+	uploadFileThroughLinkWithReplaceField(t, adminClient, uploadURL, fileName, "/", "new", &replace)
+
+	listResp := adminClient.Get(t, fmt.Sprintf("/api/v2.1/repos/%s/dir/?p=/", repoID))
+	expectStatus(t, listResp, http.StatusOK)
+
+	var dirList map[string]interface{}
+	decodeJSON(t, listResp, &dirList)
+	entries, _ := dirList["dirent_list"].([]interface{})
+	if !containsEntry(entries, "name", fileName) {
+		t.Fatalf("original file %q not found after forced replace upload-link upload", fileName)
+	}
+	if !containsEntry(entries, "name", autoRenamed) {
+		t.Fatalf("autorename target %q not found after forced replace upload-link upload", autoRenamed)
+	}
+
+	download := func(name string) string {
+		t.Helper()
+		resp := adminClient.Get(t, fmt.Sprintf("/api2/repos/%s/file/?p=/%s", repoID, url.PathEscape(name)))
+		expectStatus(t, resp, http.StatusOK)
+		downloadURL := strings.Trim(responseBody(t, resp), "\" \n\r")
+
+		req, err := http.NewRequest(http.MethodGet, downloadURL, nil)
+		if err != nil {
+			t.Fatalf("creating download request failed: %v", err)
+		}
+		downloadResp, err := adminClient.http.Do(req)
+		if err != nil {
+			t.Fatalf("download request failed: %v", err)
+		}
+		defer downloadResp.Body.Close()
+
+		content, err := io.ReadAll(downloadResp.Body)
+		if err != nil {
+			t.Fatalf("reading download failed: %v", err)
+		}
+		return string(content)
+	}
+
+	if got := download(fileName); got != "original" {
+		t.Fatalf("original file content = %q, want %q", got, "original")
+	}
+	if got := download(autoRenamed); got != "new" {
+		t.Fatalf("autorename file content = %q, want %q", got, "new")
+	}
+}
+
+func TestUpdateLinkAllowsExplicitAutorenameOverride(t *testing.T) {
+	name := fmt.Sprintf("inttest-update-link-autorename-%d", time.Now().UnixNano())
+	repoID := createTestLibrary(t, adminClient, name)
+	fileName := "text.txt"
+	autoRenamed := "text (1).txt"
+	replace := "0"
+
+	uploadResp := adminClient.Get(t, fmt.Sprintf("/api2/repos/%s/upload-link/?p=/", repoID))
+	expectStatus(t, uploadResp, http.StatusOK)
+	uploadURL := strings.Trim(responseBody(t, uploadResp), "\" \n\r")
+
+	updateResp := adminClient.Get(t, fmt.Sprintf("/api2/repos/%s/update-link/?p=/", repoID))
+	expectStatus(t, updateResp, http.StatusOK)
+	updateURL := strings.Trim(responseBody(t, updateResp), "\" \n\r")
+
+	uploadFileThroughLink(t, adminClient, uploadURL, fileName, "/", "original")
+	uploadFileThroughLinkWithReplaceField(t, adminClient, updateURL, fileName, "/", "new", &replace)
+
+	listResp := adminClient.Get(t, fmt.Sprintf("/api/v2.1/repos/%s/dir/?p=/", repoID))
+	expectStatus(t, listResp, http.StatusOK)
+
+	var dirList map[string]interface{}
+	decodeJSON(t, listResp, &dirList)
+	entries, _ := dirList["dirent_list"].([]interface{})
+	if !containsEntry(entries, "name", fileName) {
+		t.Fatalf("original file %q not found after update-link autorename override", fileName)
+	}
+	if !containsEntry(entries, "name", autoRenamed) {
+		t.Fatalf("autorename target %q not found after update-link autorename override", autoRenamed)
 	}
 }
 
