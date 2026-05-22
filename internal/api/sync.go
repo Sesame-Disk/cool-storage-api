@@ -13,6 +13,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -32,6 +33,9 @@ import (
 // ErrHeadConflict indicates that the HEAD was modified concurrently (CAS failure)
 var ErrHeadConflict = fmt.Errorf("HEAD was modified concurrently")
 
+var errSyncHeadAutoMergeConflict = errors.New("sync head auto-merge conflict")
+var errSyncHeadRepairPending = errors.New("sync head publish pending background repair")
+
 // SyncTokenCreator interface for creating sync tokens
 type SyncTokenCreator interface {
 	CreateDownloadToken(orgID, repoID, path, userID string) (string, error)
@@ -47,6 +51,12 @@ type SyncHandler struct {
 	config         *config.Config
 	tokenCreator   SyncTokenCreator // Token creator for download-info
 	permMiddleware *middleware.PermissionMiddleware
+
+	// repairSyncHeadDerivedStateIfDriftedFn is an optional test seam used by
+	// unit tests to inject a canary repair failure without spinning up a
+	// real DB. Production code leaves it nil; the idempotent fast-path then
+	// falls back to repairSyncHeadDerivedStateIfDrifted.
+	repairSyncHeadDerivedStateIfDriftedFn func(orgID, repoID, targetHead string) error
 }
 
 // NewSyncHandler creates a new sync protocol handler
@@ -646,71 +656,7 @@ func (h *SyncHandler) PutCommit(c *gin.Context) {
 			return
 		}
 
-		// Read current HEAD for conflict detection
-		var currentHead string
-		err := h.db.Session().Query(`
-			SELECT head_commit_id FROM libraries WHERE org_id = ? AND library_id = ?
-		`, orgID, repoID).Scan(&currentHead)
-		if err != nil {
-			log.Printf("PutCommit HEAD: failed to read current head for repo %s: %v", repoID, err)
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read current head"})
-			return
-		}
-
-		// Read the commit's parent_id/root_fs_id to validate parent chain and
-		// evaluate storage quota against the published tree delta.
-		var parentID *string
-		var rootFSID string
-		err = h.db.Session().Query(`
-			SELECT parent_id, root_fs_id FROM commits WHERE library_id = ? AND commit_id = ?
-		`, repoID, headCommitID).Scan(&parentID, &rootFSID)
-		if err != nil {
-			log.Printf("PutCommit HEAD: commit %s not found for repo %s: %v", headCommitID, repoID, err)
-			c.JSON(http.StatusNotFound, gin.H{"error": "commit not found"})
-			return
-		}
-
-		// Validate parent chain: the commit being promoted must have its parent_id
-		// equal to the current HEAD. This prevents a stale/retried desktop client
-		// commit from overwriting a HEAD that was advanced by web uploads.
-		commitParent := ""
-		if parentID != nil {
-			commitParent = *parentID
-		}
-		if currentHead != "" && commitParent != currentHead {
-			log.Printf("PutCommit HEAD: CONFLICT repo %s - commit %s has parent %s but current HEAD is %s. Rejecting HEAD update.",
-				repoID, headCommitID, commitParent, currentHead)
-			// Return 200 OK for Seafile desktop client compatibility.
-			// The client will detect HEAD did not advance on next sync check.
-			c.Status(http.StatusOK)
-			return
-		}
-
-		log.Printf("PutCommit HEAD: updating repo %s head to %s (parent=%s, currentHead=%s)",
-			repoID, headCommitID, commitParent, currentHead)
-
-		if !h.checkSyncCommitStorageQuota(c, orgID, userID, repoID, currentHead, rootFSID) {
-			return
-		}
-
-		// CAS update: pass current HEAD as expected value to prevent concurrent overwrites
-		if err := h.updateLibraryHeadWithStats(orgID, repoID, headCommitID, userID, currentHead); err != nil {
-			if errors.Is(err, ErrHeadConflict) {
-				log.Printf("PutCommit HEAD: CAS conflict for repo %s, HEAD changed between read and write", repoID)
-				c.Status(http.StatusOK) // Client compat
-				return
-			}
-			log.Printf("PutCommit HEAD: failed to update head: %v", err)
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update head"})
-			return
-		}
-
-		// Update full_path for search indexing (async)
-		if rootFSID != "" {
-			go h.updateFullPaths(repoID, rootFSID)
-		}
-
-		c.Status(http.StatusOK)
+		h.handleSyncHeadPromotion(c, orgID, userID, repoID, headCommitID, "PutCommit HEAD")
 		return
 	}
 
@@ -1843,62 +1789,7 @@ func (h *SyncHandler) UpdateBranch(c *gin.Context) {
 		return
 	}
 
-	// Verify the commit exists and get root_fs_id + parent_id
-	var commitID, rootFSID string
-	var parentID *string
-	err := h.db.Session().Query(`
-		SELECT commit_id, root_fs_id, parent_id FROM commits WHERE library_id = ? AND commit_id = ?
-	`, repoID, newHead).Scan(&commitID, &rootFSID, &parentID)
-
-	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "commit not found"})
-		return
-	}
-
-	// Read current HEAD for conflict detection
-	var currentHead string
-	h.db.Session().Query(`
-		SELECT head_commit_id FROM libraries WHERE org_id = ? AND library_id = ?
-	`, orgID, repoID).Scan(&currentHead)
-
-	// Validate parent chain
-	commitParent := ""
-	if parentID != nil {
-		commitParent = *parentID
-	}
-	if currentHead != "" && commitParent != currentHead {
-		log.Printf("UpdateBranch: CONFLICT repo %s - commit %s has parent %s but current HEAD is %s. Rejecting.",
-			repoID, newHead, commitParent, currentHead)
-		// Return 200 OK for Seafile desktop client compatibility
-		c.Status(http.StatusOK)
-		return
-	}
-
-	log.Printf("UpdateBranch: updating repo %s head to %s (parent=%s, currentHead=%s)",
-		repoID, newHead, commitParent, currentHead)
-
-	if !h.checkSyncCommitStorageQuota(c, orgID, userID, repoID, currentHead, rootFSID) {
-		return
-	}
-
-	// CAS update with expected HEAD
-	if err := h.updateLibraryHeadWithStats(orgID, repoID, newHead, userID, currentHead); err != nil {
-		if errors.Is(err, ErrHeadConflict) {
-			log.Printf("UpdateBranch: CAS conflict for repo %s, HEAD changed concurrently", repoID)
-			c.Status(http.StatusOK) // Client compat
-			return
-		}
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update branch"})
-		return
-	}
-
-	// Update full_path for search indexing (async)
-	if rootFSID != "" {
-		go h.updateFullPaths(repoID, rootFSID)
-	}
-
-	// Return empty body with 200 OK (Seafile format)
-	c.Status(http.StatusOK)
+	h.handleSyncHeadPromotion(c, orgID, userID, repoID, newHead, "UpdateBranch")
 }
 
 // GetDownloadInfo returns repository sync information for desktop client
@@ -2081,18 +1972,31 @@ func (h *SyncHandler) updateFullPaths(libraryID, rootFSID string) {
 	}
 }
 
-// updateLibraryHeadWithStats advances the canonical head and the lookup/admin
-// derived rows in one conditional batch, then recalculates size_bytes/file_count
-// and applies the matching storage-counter delta before returning.
+// updateLibraryHeadWithStats advances the canonical head plus canonical stats in
+// one conditional update, applies the matching storage-counter delta, then
+// synchronizes the derived projection rows. The baseline for the counter delta
+// is derived from the previous commit's immutable tree rather than from
+// libraries.size_bytes / file_count: a stale-read of those mutable columns
+// (the same lag this function's notBefore retry guards against on the read
+// side) would otherwise produce an incorrect delta. Counters run before the
+// projection because counters are accumulative and cannot be safely re-applied
+// from a fresh caller after the ErrHeadConflict the retry would now hit; the
+// projection sync is fail-hard so the integration contract that "after 200,
+// libraries_by_id and the admin projection are visible" is preserved.
 func (h *SyncHandler) updateLibraryHeadWithStats(orgID, repoID, commitID, userID, expectedHead string) error {
-	now := time.Now()
+	now := time.Now().Truncate(time.Millisecond)
 	previousCommitID := expectedHead
+	previousSize, previousFileCount := h.commitTreeStats(repoID, previousCommitID)
+	totalSize, fileCount, err := h.commitTreeStatsStrict(repoID, commitID)
+	if err != nil {
+		return err
+	}
 	casState := map[string]interface{}{}
 	applied, err := h.db.Session().Query(`
-		UPDATE libraries SET head_commit_id = ?, updated_at = ?
+		UPDATE libraries SET head_commit_id = ?, updated_at = ?, size_bytes = ?, file_count = ?
 		WHERE org_id = ? AND library_id = ?
 		IF head_commit_id = ?
-	`, commitID, now, orgID, repoID, expectedHead).MapScanCAS(casState)
+	`, commitID, now, totalSize, fileCount, orgID, repoID, expectedHead).MapScanCAS(casState)
 	if err != nil {
 		return fmt.Errorf("conditional head update failed: %w", err)
 	}
@@ -2100,29 +2004,557 @@ func (h *SyncHandler) updateLibraryHeadWithStats(orgID, repoID, commitID, userID
 		currentHead, _ := casState["head_commit_id"].(string)
 		return fmt.Errorf("%w: expected %s but found %s", ErrHeadConflict, expectedHead, currentHead)
 	}
-	if err := h.syncLibraryHeadDerivedState(orgID, repoID); err != nil {
-		// The canonical HEAD has already advanced. Do not fail this path solely
-		// because the derived-state sync missed; projection repair or later writes
-		// can catch read models up. Other post-CAS steps below may still fail.
-		log.Printf("[updateLibraryHeadWithStats] WARNING: canonical head updated for repo=%s but derived state sync failed: %v", repoID, err)
-	}
 
-	if err := h.recalculateLibraryStats(orgID, repoID, commitID, userID, previousCommitID); err != nil {
+	if err := h.applySyncHeadPostCASMutations(orgID, repoID, userID, commitID, now, totalSize, fileCount, totalSize-previousSize, fileCount-previousFileCount); err != nil {
 		return err
 	}
 
+	log.Printf("[updateLibraryStats] Updated library %s: size=%d bytes, files=%d", repoID, totalSize, fileCount)
 	return nil
 }
 
-func (h *SyncHandler) checkSyncCommitStorageQuota(c *gin.Context, orgID, userID, repoID, currentHead, rootFSID string) bool {
+func (h *SyncHandler) applySyncHeadPostCASMutations(orgID, repoID, userID, commitID string, notBefore time.Time, totalSize, fileCount, deltaBytes, deltaFiles int64) error {
+	if err := traffic.AdjustStorageCountersByDeltaSync(h.db, orgID, userID, repoID, deltaBytes, deltaFiles); err != nil {
+		if repairErr := h.repairPublishedSyncHeadAfterCounterFailure(orgID, repoID, commitID, notBefore, totalSize, fileCount); repairErr != nil {
+			return errors.Join(
+				fmt.Errorf("sync storage counters for %s: %w", repoID, err),
+				repairErr,
+			)
+		}
+		return errors.Join(
+			errSyncHeadRepairPending,
+			fmt.Errorf("sync storage counters for %s: %w", repoID, err),
+		)
+	}
+
+	if err := h.syncLibraryHeadDerivedState(orgID, repoID, commitID, notBefore, totalSize, fileCount); err != nil {
+		if retryErr := h.syncLibraryHeadDerivedState(orgID, repoID, commitID, notBefore, totalSize, fileCount); retryErr != nil {
+			return errors.Join(
+				fmt.Errorf("sync derived state for %s: %w", repoID, err),
+				retryErr,
+			)
+		}
+	}
+	return nil
+}
+
+func (h *SyncHandler) readLibraryHead(orgID, repoID string) (string, error) {
+	var currentHead string
+	if err := h.db.Session().Query(`
+		SELECT head_commit_id FROM libraries WHERE org_id = ? AND library_id = ?
+	`, orgID, repoID).Scan(&currentHead); err != nil {
+		return "", err
+	}
+	return currentHead, nil
+}
+
+func (h *SyncHandler) readSyncTargetCommit(repoID, commitID string) (string, string, error) {
+	var parentID *string
+	var rootFSID string
+	if err := h.db.Session().Query(`
+		SELECT parent_id, root_fs_id FROM commits WHERE library_id = ? AND commit_id = ?
+	`, repoID, commitID).Scan(&parentID, &rootFSID); err != nil {
+		return "", "", err
+	}
+	commitParent := ""
+	if parentID != nil {
+		commitParent = *parentID
+	}
+	return commitParent, rootFSID, nil
+}
+
+func (h *SyncHandler) readCommitRootFSID(repoID, commitID string) (string, error) {
+	if commitID == "" {
+		return "", nil
+	}
+
+	var rootFSID string
+	if err := h.db.Session().Query(`
+		SELECT root_fs_id FROM commits WHERE library_id = ? AND commit_id = ?
+	`, repoID, commitID).Scan(&rootFSID); err != nil {
+		return "", err
+	}
+	return rootFSID, nil
+}
+
+func (h *SyncHandler) syncCommitHasAncestor(repoID, commitID, ancestorID string) (bool, error) {
+	if commitID == "" || ancestorID == "" {
+		return false, nil
+	}
+
+	current := commitID
+	for depth := 0; depth < 1024; depth++ {
+		if current == ancestorID {
+			return true, nil
+		}
+
+		var parentID *string
+		if err := h.db.Session().Query(`
+			SELECT parent_id FROM commits WHERE library_id = ? AND commit_id = ?
+		`, repoID, current).Scan(&parentID); err != nil {
+			return false, err
+		}
+		if parentID == nil || *parentID == "" {
+			return false, nil
+		}
+		current = *parentID
+	}
+
+	return false, fmt.Errorf("commit ancestry walk exceeded limit for repo %s from %s toward %s", repoID, commitID, ancestorID)
+}
+
+func (h *SyncHandler) readSyncDirectoryEntries(repoID, fsID string) ([]FSEntry, error) {
+	if fsID == "" || fsID == strings.Repeat("0", 40) {
+		return []FSEntry{}, nil
+	}
+
+	var objType string
+	var entriesJSON string
+	err := h.db.Session().Query(`
+		SELECT obj_type, dir_entries FROM fs_objects WHERE library_id = ? AND fs_id = ?
+	`, repoID, fsID).Scan(&objType, &entriesJSON)
+	if err != nil {
+		return nil, err
+	}
+	if objType != "dir" {
+		return nil, fmt.Errorf("fs_object %s is %s, want dir", fsID, objType)
+	}
+	if entriesJSON == "" || entriesJSON == "[]" {
+		return []FSEntry{}, nil
+	}
+
+	var entries []FSEntry
+	if err := json.Unmarshal([]byte(entriesJSON), &entries); err != nil {
+		return nil, fmt.Errorf("failed to parse dir entries for %s: %w", fsID, err)
+	}
+	return entries, nil
+}
+
+func (h *SyncHandler) createSyncDirectoryFSObject(repoID string, entries []FSEntry) (string, error) {
+	ordered := append([]FSEntry(nil), entries...)
+	sort.SliceStable(ordered, func(i, j int) bool {
+		return ordered[i].Name < ordered[j].Name
+	})
+
+	entriesJSON, err := json.Marshal(ordered)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal merged directory entries: %w", err)
+	}
+
+	fsContent := map[string]interface{}{
+		"version": 1,
+		"type":    3,
+		"dirents": json.RawMessage(entriesJSON),
+	}
+	fsContentJSON, err := json.Marshal(fsContent)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal merged directory object: %w", err)
+	}
+
+	hash := sha1.Sum(fsContentJSON)
+	fsID := hex.EncodeToString(hash[:])
+	if err := h.db.Session().Query(`
+		INSERT INTO fs_objects (library_id, fs_id, obj_type, dir_entries, mtime)
+		VALUES (?, ?, ?, ?, ?)
+	`, repoID, fsID, "dir", string(entriesJSON), time.Now().Unix()).Exec(); err != nil {
+		return "", fmt.Errorf("failed to store merged directory %s: %w", fsID, err)
+	}
+
+	return fsID, nil
+}
+
+func (h *SyncHandler) createSyncAutoMergeCommit(repoID, userID, parentCommitID, rootFSID, description string) (string, error) {
+	commitData := fmt.Sprintf("%s:%s:%s:%d", repoID, rootFSID, description, time.Now().UnixNano())
+	hash := sha1.Sum([]byte(commitData))
+	commitID := hex.EncodeToString(hash[:])
+
+	if err := h.db.Session().Query(`
+		INSERT INTO commits (library_id, commit_id, parent_id, root_fs_id, creator_id, description, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+	`, repoID, commitID, parentCommitID, rootFSID, userID, description, time.Now()).Exec(); err != nil {
+		return "", fmt.Errorf("failed to create auto-merge commit: %w", err)
+	}
+
+	return commitID, nil
+}
+
+func syncEntryEquivalent(a, b *FSEntry) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return a.ID == b.ID && a.Mode == b.Mode
+}
+
+func syncEntrySlicesEquivalent(left, right []FSEntry) bool {
+	if len(left) != len(right) {
+		return false
+	}
+
+	leftOrdered := append([]FSEntry(nil), left...)
+	rightOrdered := append([]FSEntry(nil), right...)
+	sort.SliceStable(leftOrdered, func(i, j int) bool {
+		return leftOrdered[i].Name < leftOrdered[j].Name
+	})
+	sort.SliceStable(rightOrdered, func(i, j int) bool {
+		return rightOrdered[i].Name < rightOrdered[j].Name
+	})
+
+	for idx := range leftOrdered {
+		if leftOrdered[idx].Name != rightOrdered[idx].Name {
+			return false
+		}
+		if !syncEntryEquivalent(&leftOrdered[idx], &rightOrdered[idx]) {
+			return false
+		}
+	}
+
+	return true
+}
+
+func syncEntryIsDir(entry *FSEntry) bool {
+	if entry == nil {
+		return false
+	}
+	return (entry.Mode & 0040000) != 0
+}
+
+func preferredSyncMergeEntry(current, target, base *FSEntry, mergedID string) FSEntry {
+	chosen := current
+	if chosen == nil {
+		chosen = target
+	}
+	if chosen == nil {
+		chosen = base
+	}
+	entry := *chosen
+	if target != nil && (current == nil || target.Mtime > current.Mtime) {
+		entry = *target
+	}
+	if mergedID != "" {
+		entry.ID = mergedID
+	}
+	return entry
+}
+
+func (h *SyncHandler) mergeSyncDirectoryEntry(repoID string, base, current, target *FSEntry) (FSEntry, bool, error) {
+	switch {
+	case base == nil && current == nil && target == nil:
+		return FSEntry{}, false, nil
+	case base == nil && current != nil && target == nil:
+		return *current, true, nil
+	case base == nil && current == nil && target != nil:
+		return *target, true, nil
+	case base == nil && current != nil && target != nil:
+		if syncEntryEquivalent(current, target) {
+			return preferredSyncMergeEntry(current, target, nil, current.ID), true, nil
+		}
+		if syncEntryIsDir(current) && syncEntryIsDir(target) {
+			mergedChildFSID, err := h.mergeSyncDirectoryTrees(repoID, "", current.ID, target.ID)
+			if err != nil {
+				return FSEntry{}, false, err
+			}
+			return preferredSyncMergeEntry(current, target, nil, mergedChildFSID), true, nil
+		}
+		return FSEntry{}, false, errSyncHeadAutoMergeConflict
+	case base != nil && current == nil && target == nil:
+		return FSEntry{}, false, nil
+	case base != nil && current != nil && target == nil:
+		if syncEntryEquivalent(current, base) {
+			return FSEntry{}, false, nil
+		}
+		return FSEntry{}, false, errSyncHeadAutoMergeConflict
+	case base != nil && current == nil && target != nil:
+		if syncEntryEquivalent(target, base) {
+			return FSEntry{}, false, nil
+		}
+		return FSEntry{}, false, errSyncHeadAutoMergeConflict
+	default:
+		if syncEntryEquivalent(current, base) && syncEntryEquivalent(target, base) {
+			return *base, true, nil
+		}
+		if syncEntryEquivalent(current, base) {
+			return *target, true, nil
+		}
+		if syncEntryEquivalent(target, base) {
+			return *current, true, nil
+		}
+		if syncEntryEquivalent(current, target) {
+			return preferredSyncMergeEntry(current, target, base, current.ID), true, nil
+		}
+		if syncEntryIsDir(base) && syncEntryIsDir(current) && syncEntryIsDir(target) {
+			mergedChildFSID, err := h.mergeSyncDirectoryTrees(repoID, base.ID, current.ID, target.ID)
+			if err != nil {
+				return FSEntry{}, false, err
+			}
+			return preferredSyncMergeEntry(current, target, base, mergedChildFSID), true, nil
+		}
+		return FSEntry{}, false, errSyncHeadAutoMergeConflict
+	}
+}
+
+func (h *SyncHandler) mergeSyncDirectoryTrees(repoID, baseFSID, currentFSID, targetFSID string) (string, error) {
+	baseEntries, err := h.readSyncDirectoryEntries(repoID, baseFSID)
+	if err != nil {
+		return "", fmt.Errorf("failed to read base dir %s: %w", baseFSID, err)
+	}
+	currentEntries, err := h.readSyncDirectoryEntries(repoID, currentFSID)
+	if err != nil {
+		return "", fmt.Errorf("failed to read current dir %s: %w", currentFSID, err)
+	}
+	targetEntries, err := h.readSyncDirectoryEntries(repoID, targetFSID)
+	if err != nil {
+		return "", fmt.Errorf("failed to read target dir %s: %w", targetFSID, err)
+	}
+
+	baseByName := make(map[string]FSEntry, len(baseEntries))
+	for _, entry := range baseEntries {
+		baseByName[entry.Name] = entry
+	}
+	currentByName := make(map[string]FSEntry, len(currentEntries))
+	for _, entry := range currentEntries {
+		currentByName[entry.Name] = entry
+	}
+	targetByName := make(map[string]FSEntry, len(targetEntries))
+	for _, entry := range targetEntries {
+		targetByName[entry.Name] = entry
+	}
+
+	nameSet := make(map[string]struct{}, len(baseByName)+len(currentByName)+len(targetByName))
+	for name := range baseByName {
+		nameSet[name] = struct{}{}
+	}
+	for name := range currentByName {
+		nameSet[name] = struct{}{}
+	}
+	for name := range targetByName {
+		nameSet[name] = struct{}{}
+	}
+
+	names := make([]string, 0, len(nameSet))
+	for name := range nameSet {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	mergedEntries := make([]FSEntry, 0, len(names))
+	for _, name := range names {
+		var baseEntry, currentEntry, targetEntry *FSEntry
+		if entry, ok := baseByName[name]; ok {
+			entryCopy := entry
+			baseEntry = &entryCopy
+		}
+		if entry, ok := currentByName[name]; ok {
+			entryCopy := entry
+			currentEntry = &entryCopy
+		}
+		if entry, ok := targetByName[name]; ok {
+			entryCopy := entry
+			targetEntry = &entryCopy
+		}
+
+		mergedEntry, keep, err := h.mergeSyncDirectoryEntry(repoID, baseEntry, currentEntry, targetEntry)
+		if err != nil {
+			return "", err
+		}
+		if keep {
+			mergedEntries = append(mergedEntries, mergedEntry)
+		}
+	}
+
+	if syncEntrySlicesEquivalent(mergedEntries, currentEntries) {
+		return currentFSID, nil
+	}
+	if syncEntrySlicesEquivalent(mergedEntries, targetEntries) {
+		return targetFSID, nil
+	}
+
+	return h.createSyncDirectoryFSObject(repoID, mergedEntries)
+}
+
+func shortSyncCommitID(commitID string) string {
+	if len(commitID) <= 8 {
+		return commitID
+	}
+	return commitID[:8]
+}
+
+func (h *SyncHandler) tryAutoMergeSyncHeadPromotion(c *gin.Context, orgID, userID, repoID, currentHead, targetHead, baseHead, operation string) (bool, error) {
+	baseRootFSID, err := h.readCommitRootFSID(repoID, baseHead)
+	if err != nil {
+		return false, fmt.Errorf("read base root fs_id: %w", err)
+	}
+	currentRootFSID, err := h.readCommitRootFSID(repoID, currentHead)
+	if err != nil {
+		return false, fmt.Errorf("read current root fs_id: %w", err)
+	}
+	targetRootFSID, err := h.readCommitRootFSID(repoID, targetHead)
+	if err != nil {
+		return false, fmt.Errorf("read target root fs_id: %w", err)
+	}
+
+	mergedRootFSID, err := h.mergeSyncDirectoryTrees(repoID, baseRootFSID, currentRootFSID, targetRootFSID)
+	if err != nil {
+		return false, err
+	}
+
+	if mergedRootFSID == currentRootFSID {
+		log.Printf("%s: auto-merge found repo %s already converged (current=%s target=%s mergedRoot=%s)",
+			operation, repoID, shortSyncCommitID(currentHead), shortSyncCommitID(targetHead), shortSyncCommitID(mergedRootFSID))
+		c.Status(http.StatusOK)
+		return true, nil
+	}
+
+	mergedSize := int64(-1)
+	if traffic.GetChecker() != nil {
+		mergedSize = h.syncCommitPublishedSize(repoID, mergedRootFSID)
+	}
+	if !h.checkSyncCommitStorageQuotaWithNewSize(c, orgID, userID, repoID, currentHead, mergedSize) {
+		return true, nil
+	}
+
+	description := fmt.Sprintf("Auto merged concurrent sync update (%s + %s)", shortSyncCommitID(currentHead), shortSyncCommitID(targetHead))
+	mergedCommitID, err := h.createSyncAutoMergeCommit(repoID, userID, currentHead, mergedRootFSID, description)
+	if err != nil {
+		return false, err
+	}
+
+	if err := h.updateLibraryHeadWithStats(orgID, repoID, mergedCommitID, userID, currentHead); err != nil {
+		return false, err
+	}
+
+	go h.updateFullPaths(repoID, mergedRootFSID)
+	log.Printf("%s: auto-merged repo %s current=%s target=%s into merged=%s",
+		operation, repoID, shortSyncCommitID(currentHead), shortSyncCommitID(targetHead), shortSyncCommitID(mergedCommitID))
+	c.Status(http.StatusOK)
+	return true, nil
+}
+
+func (h *SyncHandler) handleSyncHeadPromotion(c *gin.Context, orgID, userID, repoID, targetHead, operation string) {
+	maxAttempts := v2.RetryAttempts()
+
+	commitParent, rootFSID, err := h.readSyncTargetCommit(repoID, targetHead)
+	if err != nil {
+		log.Printf("%s: commit %s not found for repo %s: %v", operation, targetHead, repoID, err)
+		c.JSON(http.StatusNotFound, gin.H{"error": "commit not found"})
+		return
+	}
+
+	cachedNewSize := int64(-1)
+	if traffic.GetChecker() != nil {
+		cachedNewSize = h.syncCommitPublishedSize(repoID, rootFSID)
+	}
+
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		currentHead, err := h.readLibraryHead(orgID, repoID)
+		if err != nil {
+			log.Printf("%s: failed to read current head for repo %s: %v", operation, repoID, err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read current head"})
+			return
+		}
+
+		if currentHead == targetHead {
+			h.handleSyncHeadIdempotentSuccess(c, orgID, repoID, targetHead, operation)
+			return
+		}
+
+		if commitParent != currentHead {
+			log.Printf("%s: parent mismatch for repo %s on attempt %d/%d - commit %s expects parent %s but current HEAD is %s",
+				operation, repoID, attempt+1, maxAttempts, targetHead, commitParent, currentHead)
+
+			canAutoMerge := false
+			if commitParent != "" {
+				canAutoMerge, err = h.syncCommitHasAncestor(repoID, currentHead, commitParent)
+				if err != nil {
+					log.Printf("%s: failed to evaluate ancestry for repo %s current=%s parent=%s: %v",
+						operation, repoID, currentHead, commitParent, err)
+					c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to inspect sync commit ancestry"})
+					return
+				}
+			}
+
+			if canAutoMerge {
+				resolved, mergeErr := h.tryAutoMergeSyncHeadPromotion(c, orgID, userID, repoID, currentHead, targetHead, commitParent, operation)
+				switch {
+				case mergeErr == nil && resolved:
+					return
+				case errors.Is(mergeErr, ErrHeadConflict):
+					log.Printf("%s: auto-merge CAS conflict for repo %s on attempt %d/%d", operation, repoID, attempt+1, maxAttempts)
+				case errors.Is(mergeErr, errSyncHeadAutoMergeConflict):
+					log.Printf("%s: auto-merge could not safely resolve repo %s on attempt %d/%d; retrying direct promotion fallback",
+						operation, repoID, attempt+1, maxAttempts)
+				case mergeErr != nil:
+					log.Printf("%s: auto-merge failed for repo %s: %v", operation, repoID, mergeErr)
+					c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to auto-merge sync head"})
+					return
+				}
+			} else {
+				log.Printf("%s: current HEAD %s is not a descendant of target parent %s for repo %s on attempt %d/%d; waiting for direct promotion fallback",
+					operation, currentHead, commitParent, repoID, attempt+1, maxAttempts)
+			}
+
+			if attempt == maxAttempts-1 {
+				log.Printf("%s: parent mismatch retry budget exhausted for repo %s targeting %s after %d attempts; returning 503 so clients preserve local state and retry",
+					operation, repoID, targetHead, maxAttempts)
+				c.Header("Retry-After", "1")
+				c.JSON(http.StatusServiceUnavailable, gin.H{"error": "sync head publish conflicted; retry"})
+				return
+			}
+			time.Sleep(v2.RetryBackoff(attempt + 1))
+			continue
+		}
+
+		log.Printf("%s: updating repo %s head to %s (parent=%s, currentHead=%s, attempt=%d/%d)",
+			operation, repoID, targetHead, commitParent, currentHead, attempt+1, maxAttempts)
+
+		if !h.checkSyncCommitStorageQuotaWithNewSize(c, orgID, userID, repoID, currentHead, cachedNewSize) {
+			return
+		}
+
+		if err := h.updateLibraryHeadWithStats(orgID, repoID, targetHead, userID, currentHead); err != nil {
+			if !errors.Is(err, ErrHeadConflict) {
+				if errors.Is(err, errSyncHeadRepairPending) {
+					log.Printf("%s: published repo %s head to %s but aggregate storage reconciliation is still pending: %v", operation, repoID, targetHead, err)
+					c.Header("Retry-After", "1")
+					c.JSON(http.StatusServiceUnavailable, gin.H{"error": "sync head publish pending storage reconciliation; retry"})
+					return
+				}
+				log.Printf("%s: failed to update head for repo %s: %v", operation, repoID, err)
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update head"})
+				return
+			}
+
+			log.Printf("%s: CAS conflict for repo %s on attempt %d/%d", operation, repoID, attempt+1, maxAttempts)
+			if attempt == maxAttempts-1 {
+				log.Printf("%s: CAS conflict budget exhausted for repo %s targeting %s after %d attempts; returning 503 so clients preserve local state and retry",
+					operation, repoID, targetHead, maxAttempts)
+				c.Header("Retry-After", "1")
+				c.JSON(http.StatusServiceUnavailable, gin.H{"error": "sync head publish conflicted; retry"})
+				return
+			}
+			time.Sleep(v2.RetryBackoff(attempt + 1))
+			continue
+		}
+
+		if rootFSID != "" {
+			go h.updateFullPaths(repoID, rootFSID)
+		}
+		c.Status(http.StatusOK)
+		return
+	}
+}
+
+func (h *SyncHandler) syncCommitPublishedSize(repoID, rootFSID string) int64 {
+	if rootFSID == "" || rootFSID == strings.Repeat("0", 40) {
+		return 0
+	}
+	newSize, _ := h.calculateDirStats(repoID, rootFSID)
+	return newSize
+}
+
+func (h *SyncHandler) checkSyncCommitStorageQuotaWithNewSize(c *gin.Context, orgID, userID, repoID, currentHead string, newSize int64) bool {
 	checker := traffic.GetChecker()
 	if checker == nil {
 		return true
-	}
-
-	newSize := int64(0)
-	if rootFSID != "" && rootFSID != strings.Repeat("0", 40) {
-		newSize, _ = h.calculateDirStats(repoID, rootFSID)
 	}
 
 	currentSize, _ := h.commitTreeStats(repoID, currentHead)
@@ -2155,112 +2587,456 @@ func (h *SyncHandler) commitTreeStats(repoID, commitID string) (int64, int64) {
 	return h.calculateDirStats(repoID, rootFSID)
 }
 
-func (h *SyncHandler) syncLibraryHeadDerivedState(orgID, repoID string) error {
-	var headCommitID string
-	if err := h.db.Session().Query(`
-		SELECT head_commit_id FROM libraries WHERE org_id = ? AND library_id = ?
-	`, orgID, repoID).Scan(&headCommitID); err != nil {
-		return fmt.Errorf("failed to read canonical head after sync update: %w", err)
-	}
-
-	projectionRow, err := db.ReadAdminLibraryProjectionRow(h.db.Session(), orgID, repoID)
+func (h *SyncHandler) commitTreeStatsStrict(repoID, commitID string) (int64, int64, error) {
+	rootFSID, err := h.readCommitRootFSID(repoID, commitID)
 	if err != nil {
-		return fmt.Errorf("failed to read library projection row: %w", err)
+		return 0, 0, fmt.Errorf("get root_fs_id for %s: %w", repoID, err)
 	}
+	if rootFSID == "" || rootFSID == strings.Repeat("0", 40) {
+		return 0, 0, nil
+	}
+	totalSize, fileCount := h.calculateDirStats(repoID, rootFSID)
+	return totalSize, fileCount, nil
+}
 
+type syncLibraryDerivedState struct {
+	HeadCommitID  string
+	ProjectionRow db.AdminLibraryProjectionRow
+}
+
+type syncAdminProjectionCanary struct {
+	Present   bool
+	OwnerID   string
+	UpdatedAt time.Time
+	SizeBytes int64
+	FileCount int64
+}
+
+func (c syncAdminProjectionCanary) matches(ownerID string, updatedAt time.Time, sizeBytes, fileCount int64) bool {
+	if !c.Present {
+		return false
+	}
+	return c.OwnerID == ownerID &&
+		c.UpdatedAt.Equal(updatedAt) &&
+		c.SizeBytes == sizeBytes &&
+		c.FileCount == fileCount
+}
+
+type syncDerivedStateCanary struct {
+	Canonical        syncLibraryDerivedState
+	LookupHead       string
+	OrgProjection    syncAdminProjectionCanary
+	OwnerProjection  syncAdminProjectionCanary
+	GlobalProjection syncAdminProjectionCanary
+}
+
+func (c syncDerivedStateCanary) alignedWith(targetHead string) bool {
+	row := c.Canonical.ProjectionRow
+	return c.Canonical.HeadCommitID == targetHead &&
+		c.LookupHead == targetHead &&
+		c.OrgProjection.matches(row.OwnerID, row.UpdatedAt, row.SizeBytes, row.FileCount) &&
+		c.OwnerProjection.matches(row.OwnerID, row.UpdatedAt, row.SizeBytes, row.FileCount) &&
+		c.GlobalProjection.matches(row.OwnerID, row.UpdatedAt, row.SizeBytes, row.FileCount)
+}
+
+func retrySyncDerivedStateCanaryRead(targetHead string, readCanary func() (syncDerivedStateCanary, error), sleep func(time.Duration)) (syncDerivedStateCanary, error) {
+	var lastErr error
+	for attempt := 1; attempt <= libraryStatsProjectionRetryAttempts; attempt++ {
+		canary, err := readCanary()
+		if err != nil {
+			lastErr = err
+		} else if canary.Canonical.HeadCommitID != targetHead {
+			lastErr = fmt.Errorf("stale canonical sync state: head_commit_id=%s want=%s", canary.Canonical.HeadCommitID, targetHead)
+		} else {
+			return canary, nil
+		}
+		if attempt < libraryStatsProjectionRetryAttempts && sleep != nil {
+			sleep(libraryStatsProjectionRetryDelay)
+		}
+	}
+	return syncDerivedStateCanary{}, lastErr
+}
+
+func (h *SyncHandler) fetchSyncLibraryDerivedState(orgID, repoID string) (syncLibraryDerivedState, error) {
+	var state syncLibraryDerivedState
+	row := db.AdminLibraryProjectionRow{OrgID: orgID, LibraryID: repoID}
+	var deletedAt time.Time
+	if err := h.db.Session().Query(`
+		SELECT head_commit_id, owner_id, name, encrypted, storage_class, size_bytes, file_count, created_at, updated_at, deleted_at
+		FROM libraries
+		WHERE org_id = ? AND library_id = ?
+	`, orgID, repoID).Scan(
+		&state.HeadCommitID,
+		&row.OwnerID,
+		&row.Name,
+		&row.Encrypted,
+		&row.StorageClass,
+		&row.SizeBytes,
+		&row.FileCount,
+		&row.CreatedAt,
+		&row.UpdatedAt,
+		&deletedAt,
+	); err != nil {
+		return syncLibraryDerivedState{}, fmt.Errorf("read canonical sync state: %w", err)
+	}
+	if !deletedAt.IsZero() {
+		deletedCopy := deletedAt
+		row.DeletedAt = &deletedCopy
+	}
+	row.OwnerEmail, row.OwnerName = db.ResolveAdminLibraryOwnerFields(h.db.Session(), orgID, row.OwnerID)
+	state.ProjectionRow = row
+	return state, nil
+}
+
+// retrySyncDerivedStateRead invokes fetch up to libraryStatsProjectionRetryAttempts
+// times, accepting the first state whose UpdatedAt is not before notBefore. This
+// absorbs the stale-read window that can follow a successful LWT commit when the
+// subsequent SELECT is served by a replica that has not yet applied the commit.
+func retrySyncDerivedStateReadUntil(repoID string, fetch func() (syncLibraryDerivedState, error), validate func(syncLibraryDerivedState) error, sleep func(time.Duration)) (syncLibraryDerivedState, error) {
+	var lastErr error
+	for attempt := 1; attempt <= libraryStatsProjectionRetryAttempts; attempt++ {
+		state, err := fetch()
+		switch {
+		case err != nil:
+			lastErr = err
+		case validate != nil:
+			lastErr = validate(state)
+			if lastErr == nil {
+				return state, nil
+			}
+		default:
+			return state, nil
+		}
+		if attempt < libraryStatsProjectionRetryAttempts && sleep != nil {
+			sleep(libraryStatsProjectionRetryDelay)
+		}
+	}
+	return syncLibraryDerivedState{}, lastErr
+}
+
+func retrySyncDerivedStateRead(repoID string, notBefore time.Time, fetch func() (syncLibraryDerivedState, error), sleep func(time.Duration)) (syncLibraryDerivedState, error) {
+	return retrySyncDerivedStateReadUntil(
+		repoID,
+		fetch,
+		func(state syncLibraryDerivedState) error {
+			if state.ProjectionRow.UpdatedAt.Before(notBefore) {
+				return fmt.Errorf("stale canonical sync state for %s: updated_at=%s want>=%s",
+					repoID,
+					state.ProjectionRow.UpdatedAt.Format(time.RFC3339Nano),
+					notBefore.Format(time.RFC3339Nano))
+			}
+			return nil
+		},
+		sleep,
+	)
+}
+
+// syncLibraryHeadDerivedState reconciles libraries_by_id and the admin projection
+// against the canonical libraries row. The CAS-controlled fields (head_commit_id,
+// size_bytes, file_count, updated_at) are taken directly from the values the CAS
+// just wrote rather than from the read-back: depending on read-after-write
+// convergence is unnecessary when the writer already holds the authoritative
+// values. The read+stale-guard is still required to pick up admin-controlled
+// fields (owner, name, encrypted, storage_class, deleted_at) at a snapshot that
+// is at least as fresh as the CAS commit moment.
+func (h *SyncHandler) syncLibraryHeadDerivedState(orgID, repoID, commitID string, notBefore time.Time, totalSize, fileCount int64) error {
+	return syncLibraryHeadDerivedStateUsing(
+		repoID,
+		notBefore,
+		func() (syncLibraryDerivedState, error) {
+			return h.fetchSyncLibraryDerivedState(orgID, repoID)
+		},
+		func(repoID string, state syncLibraryDerivedState) error {
+			overrideSyncLibraryCASFields(&state, commitID, notBefore, totalSize, fileCount)
+			return h.writeSyncLibraryDerivedState(repoID, state)
+		},
+		time.Sleep,
+	)
+}
+
+// overrideSyncLibraryCASFields applies the post-CAS authoritative values to a
+// state derived from a read of libraries. It is invoked at write time, after
+// retrySyncDerivedStateRead has accepted a row whose UpdatedAt is at least as
+// fresh as notBefore; the override then ensures the projection write reflects
+// exactly what the CAS committed instead of relying on the read carrying it.
+func overrideSyncLibraryCASFields(state *syncLibraryDerivedState, commitID string, updatedAt time.Time, sizeBytes, fileCount int64) {
+	state.HeadCommitID = commitID
+	state.ProjectionRow.SizeBytes = sizeBytes
+	state.ProjectionRow.FileCount = fileCount
+	state.ProjectionRow.UpdatedAt = updatedAt
+}
+
+// syncLibraryHeadDerivedStateUsing wires the read-with-stale-guard and the
+// batch-write into a single sequence. It is exported via lowercase package
+// linkage so tests can inject deterministic read/write closures and assert
+// the read-side stale loop and the write-side error propagation in isolation.
+func syncLibraryHeadDerivedStateUsing(
+	repoID string,
+	notBefore time.Time,
+	read func() (syncLibraryDerivedState, error),
+	write func(repoID string, state syncLibraryDerivedState) error,
+	sleep func(time.Duration),
+) error {
+	state, err := retrySyncDerivedStateRead(repoID, notBefore, read, sleep)
+	if err != nil {
+		return fmt.Errorf("failed to read library state after sync update: %w", err)
+	}
+	if err := write(repoID, state); err != nil {
+		return fmt.Errorf("failed to sync head lookup/admin projection: %w", err)
+	}
+	return nil
+}
+
+func repairPublishedSyncHeadAfterCounterFailureUsing(
+	repoID string,
+	notBefore time.Time,
+	read func() (syncLibraryDerivedState, error),
+	reconcileLibraryStorage func(syncLibraryDerivedState) error,
+	queueAggregateReconciliation func(syncLibraryDerivedState) error,
+	write func(syncLibraryDerivedState) error,
+	sleep func(time.Duration),
+) error {
+	state, err := retrySyncDerivedStateRead(repoID, notBefore, read, sleep)
+	if err != nil {
+		return fmt.Errorf("failed to read canonical library state for sync head repair: %w", err)
+	}
+	if err := reconcileLibraryStorage(state); err != nil {
+		return fmt.Errorf("failed to reconcile sync library storage state: %w", err)
+	}
+	if err := queueAggregateReconciliation(state); err != nil {
+		return fmt.Errorf("failed to queue aggregate storage reconciliation: %w", err)
+	}
+	if err := write(state); err != nil {
+		return fmt.Errorf("failed to sync head lookup/admin projection: %w", err)
+	}
+	return nil
+}
+
+// repairPublishedSyncHeadAfterCounterFailure runs when the post-CAS storage
+// counter delta failed. The CAS-controlled fields (commitID, updatedAt,
+// totalSize, fileCount) are propagated authoritatively from the publisher's
+// scope to (1) seed the lib-scope counter reconciliation with the truth that
+// the CAS just committed and (2) keep the projection row consistent with the
+// canonical row without relying on read-after-write convergence. The override
+// happens at consume-time (not read-time) so the read-side stale-guard still
+// rejects pre-CAS replica snapshots for the admin-controlled fields.
+func (h *SyncHandler) repairPublishedSyncHeadAfterCounterFailure(orgID, repoID, commitID string, notBefore time.Time, totalSize, fileCount int64) error {
+	return repairPublishedSyncHeadAfterCounterFailureUsing(
+		repoID,
+		notBefore,
+		func() (syncLibraryDerivedState, error) {
+			return h.fetchSyncLibraryDerivedState(orgID, repoID)
+		},
+		func(state syncLibraryDerivedState) error {
+			overrideSyncLibraryCASFields(&state, commitID, notBefore, totalSize, fileCount)
+			return h.reconcilePublishedSyncLibraryStorage(orgID, repoID, state)
+		},
+		func(state syncLibraryDerivedState) error {
+			return h.queueAggregateStorageReconciliation(orgID, state.ProjectionRow.OwnerID)
+		},
+		func(state syncLibraryDerivedState) error {
+			overrideSyncLibraryCASFields(&state, commitID, notBefore, totalSize, fileCount)
+			return h.writeSyncLibraryDerivedState(repoID, state)
+		},
+		time.Sleep,
+	)
+}
+
+// handleSyncHeadIdempotentSuccess runs the canary-then-repair flow when the
+// caller's targetHead already equals canonical libraries.head_commit_id. A
+// previous attempt may have failed AFTER the CAS while running post-CAS side
+// effects (storage counters, aggregate reconciliation queue, libraries_by_id
+// or admin projection writes). If any of those left derived state behind,
+// returning 200 here would silently bless that drift and the client would
+// never trigger another publish. The canary check uses libraries_by_id plus
+// the active admin projection tables: if they all still reflect canonical,
+// derived state is in sync and the caller short-circuits with 200; otherwise
+// it re-runs the full post-CAS repair flow before reporting success, and
+// returns 503 + Retry-After if the repair itself fails so the client retries
+// instead of silently moving on. The repair function is dispatched through
+// repairSyncHeadDerivedStateIfDriftedFn when set so unit tests can inject a
+// failing canary without needing a real DB session.
+func (h *SyncHandler) handleSyncHeadIdempotentSuccess(c *gin.Context, orgID, repoID, targetHead, operation string) {
+	repair := h.repairSyncHeadDerivedStateIfDriftedFn
+	if repair == nil {
+		repair = h.repairSyncHeadDerivedStateIfDrifted
+	}
+	if err := repair(orgID, repoID, targetHead); err != nil {
+		log.Printf("%s: idempotent path detected derived-state drift for repo %s but repair failed: %v", operation, repoID, err)
+		c.Header("Retry-After", "1")
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "sync head publish derived state repair pending; retry"})
+		return
+	}
+	log.Printf("%s: repo %s head already at %s; treating as idempotent success", operation, repoID, targetHead)
+	c.Status(http.StatusOK)
+}
+
+// repairSyncHeadDerivedStateIfDrifted is invoked from the idempotent fast-path
+// in handleSyncHeadPromotion. It uses an O(1) canary over libraries_by_id plus
+// the active admin projection tables against the canonical libraries row. When
+// they all still reflect the published head/stats, derived state is consistent
+// and the caller can short-circuit. When any surface drifted, a prior publish
+// attempt left derived state behind (counter delta failure with failed repair,
+// aggregate-reconcile queue insert failure, or a partial lookup/admin
+// projection write). In that case it re-runs the full post-CAS repair flow
+// against the canonical row, guaranteeing that an otherwise-200-returning
+// idempotent retry actually converges derived state.
+func (h *SyncHandler) repairSyncHeadDerivedStateIfDrifted(orgID, repoID, targetHead string) error {
+	return repairSyncHeadDerivedStateIfDriftedUsing(
+		targetHead,
+		func() (syncDerivedStateCanary, error) { return h.readSyncDerivedStateCanary(orgID, repoID) },
+		func(updatedAt time.Time, totalSize, fileCount int64) error {
+			return h.repairPublishedSyncHeadAfterCounterFailure(orgID, repoID, targetHead, updatedAt, totalSize, fileCount)
+		},
+		time.Sleep,
+	)
+}
+
+// repairSyncHeadDerivedStateIfDriftedUsing is the testable seam: it composes
+// the canary read and the repair invocation so unit tests can drive each
+// branch with deterministic closures.
+func repairSyncHeadDerivedStateIfDriftedUsing(
+	targetHead string,
+	readCanary func() (syncDerivedStateCanary, error),
+	repair func(updatedAt time.Time, totalSize, fileCount int64) error,
+	sleep func(time.Duration),
+) error {
+	canary, err := retrySyncDerivedStateCanaryRead(targetHead, readCanary, sleep)
+	if err != nil {
+		return fmt.Errorf("read sync derived-state canary: %w", err)
+	}
+	if canary.alignedWith(targetHead) {
+		return nil
+	}
+	if err := repair(
+		canary.Canonical.ProjectionRow.UpdatedAt,
+		canary.Canonical.ProjectionRow.SizeBytes,
+		canary.Canonical.ProjectionRow.FileCount,
+	); err != nil {
+		return fmt.Errorf("repair drifted sync derived state: %w", err)
+	}
+	return nil
+}
+
+func (h *SyncHandler) readSyncDerivedStateCanary(orgID, repoID string) (syncDerivedStateCanary, error) {
+	state, err := h.fetchSyncLibraryDerivedState(orgID, repoID)
+	if err != nil {
+		return syncDerivedStateCanary{}, err
+	}
+	lookupHead, err := h.readLookupHead(repoID)
+	if err != nil {
+		return syncDerivedStateCanary{}, err
+	}
+	orgProjection, err := h.readOrgProjectionCanary(orgID, repoID)
+	if err != nil {
+		return syncDerivedStateCanary{}, err
+	}
+	ownerProjection, err := h.readOwnerProjectionCanary(orgID, state.ProjectionRow.OwnerID, repoID)
+	if err != nil {
+		return syncDerivedStateCanary{}, err
+	}
+	globalProjection, err := h.readGlobalProjectionCanary(db.AdminLibraryBucketDay(state.ProjectionRow.CreatedAt), orgID, repoID)
+	if err != nil {
+		return syncDerivedStateCanary{}, err
+	}
+	return syncDerivedStateCanary{
+		Canonical:        state,
+		LookupHead:       lookupHead,
+		OrgProjection:    orgProjection,
+		OwnerProjection:  ownerProjection,
+		GlobalProjection: globalProjection,
+	}, nil
+}
+
+func (h *SyncHandler) readLookupHead(repoID string) (string, error) {
+	var lookupHead string
+	if err := h.db.Session().Query(`
+		SELECT head_commit_id FROM libraries_by_id WHERE library_id = ?
+	`, repoID).Scan(&lookupHead); err != nil {
+		if errors.Is(err, gocql.ErrNotFound) {
+			return "", nil
+		}
+		return "", fmt.Errorf("read libraries_by_id head: %w", err)
+	}
+	return lookupHead, nil
+}
+
+func (h *SyncHandler) readOrgProjectionCanary(orgID, repoID string) (syncAdminProjectionCanary, error) {
+	var canary syncAdminProjectionCanary
+	if err := h.db.Session().Query(`
+		SELECT owner_id, updated_at, size_bytes, file_count FROM libraries_by_org_updated WHERE org_id = ? AND library_id = ?
+	`, orgID, repoID).Scan(&canary.OwnerID, &canary.UpdatedAt, &canary.SizeBytes, &canary.FileCount); err != nil {
+		if errors.Is(err, gocql.ErrNotFound) {
+			return syncAdminProjectionCanary{}, nil
+		}
+		return syncAdminProjectionCanary{}, fmt.Errorf("read org admin projection canary: %w", err)
+	}
+	canary.Present = true
+	return canary, nil
+}
+
+func (h *SyncHandler) readOwnerProjectionCanary(orgID, ownerID, repoID string) (syncAdminProjectionCanary, error) {
+	var canary syncAdminProjectionCanary
+	if err := h.db.Session().Query(`
+		SELECT updated_at, size_bytes, file_count FROM libraries_by_owner WHERE org_id = ? AND owner_id = ? AND library_id = ?
+	`, orgID, ownerID, repoID).Scan(&canary.UpdatedAt, &canary.SizeBytes, &canary.FileCount); err != nil {
+		if errors.Is(err, gocql.ErrNotFound) {
+			return syncAdminProjectionCanary{}, nil
+		}
+		return syncAdminProjectionCanary{}, fmt.Errorf("read owner admin projection canary: %w", err)
+	}
+	canary.Present = true
+	canary.OwnerID = ownerID
+	return canary, nil
+}
+
+func (h *SyncHandler) readGlobalProjectionCanary(bucketDay, orgID, repoID string) (syncAdminProjectionCanary, error) {
+	var canary syncAdminProjectionCanary
+	if err := h.db.Session().Query(`
+		SELECT owner_id, updated_at, size_bytes, file_count FROM libraries_admin_global_by_updated WHERE bucket_day = ? AND org_id = ? AND library_id = ?
+	`, bucketDay, orgID, repoID).Scan(&canary.OwnerID, &canary.UpdatedAt, &canary.SizeBytes, &canary.FileCount); err != nil {
+		if errors.Is(err, gocql.ErrNotFound) {
+			return syncAdminProjectionCanary{}, nil
+		}
+		return syncAdminProjectionCanary{}, fmt.Errorf("read global admin projection canary: %w", err)
+	}
+	canary.Present = true
+	return canary, nil
+}
+
+func (h *SyncHandler) reconcilePublishedSyncLibraryStorage(orgID, repoID string, state syncLibraryDerivedState) error {
+	if err := traffic.ReconcileStorageScope(h.db, traffic.LibraryStorageScope(orgID, repoID), traffic.StorageSnapshot{
+		BytesUsed: state.ProjectionRow.SizeBytes,
+		FileCount: state.ProjectionRow.FileCount,
+	}); err != nil {
+		return fmt.Errorf("reconcile library scope: %w", err)
+	}
+	return nil
+}
+
+func (h *SyncHandler) queueAggregateStorageReconciliation(orgID, ownerID string) error {
+	batch := h.db.Session().Batch(gocql.LoggedBatch)
+	traffic.AddAggregateStorageReconciliationQueries(batch, orgID, ownerID, time.Now().UTC())
+	if err := batch.Exec(); err != nil {
+		return fmt.Errorf("queue aggregate storage reconciliation: %w", err)
+	}
+	return nil
+}
+
+func (h *SyncHandler) writeSyncLibraryDerivedState(repoID string, state syncLibraryDerivedState) error {
 	batch := h.db.Session().Batch(gocql.LoggedBatch)
 	batch.Query(`
 		UPDATE libraries_by_id SET head_commit_id = ?
 		WHERE library_id = ?
-	`, headCommitID, repoID)
-	db.AddUpsertAdminLibraryReadModelQuery(batch, projectionRow)
-	if err := batch.Exec(); err != nil {
-		return fmt.Errorf("failed to sync head lookup/admin projection: %w", err)
-	}
-
-	return nil
-}
-
-// recalculateLibraryStats recalculates size_bytes and file_count for a library
-// by traversing its directory tree from the commit's root_fs_id.
-func (h *SyncHandler) recalculateLibraryStats(orgID, repoID, commitID, userID, previousCommitID string) error {
-	previousSize, previousFileCount := h.commitTreeStats(repoID, previousCommitID)
-
-	var rootFSID string
-	err := h.db.Session().Query(`
-		SELECT root_fs_id FROM commits WHERE library_id = ? AND commit_id = ?
-	`, repoID, commitID).Scan(&rootFSID)
-	if err != nil {
-		return fmt.Errorf("get root_fs_id for %s: %w", repoID, err)
-	}
-
-	if rootFSID == "" || rootFSID == strings.Repeat("0", 40) {
-		applied, err := h.persistLibraryStatsIfCurrentHead(orgID, repoID, commitID, userID, previousSize, previousFileCount, 0, 0)
-		if err != nil {
-			return err
-		}
-		if applied {
-			log.Printf("[updateLibraryStats] Library %s is empty, stats set to 0", repoID)
-		}
-		return nil
-	}
-
-	totalSize, fileCount := h.calculateDirStats(repoID, rootFSID)
-	applied, err := h.persistLibraryStatsIfCurrentHead(orgID, repoID, commitID, userID, previousSize, previousFileCount, totalSize, fileCount)
-	if err != nil {
-		return err
-	}
-	if !applied {
-		return nil
-	}
-
-	log.Printf("[updateLibraryStats] Updated library %s: size=%d bytes, files=%d", repoID, totalSize, fileCount)
-	return nil
+	`, state.HeadCommitID, repoID)
+	db.AddUpsertAdminLibraryReadModelQuery(batch, state.ProjectionRow)
+	return batch.Exec()
 }
 
 const (
 	libraryStatsProjectionRetryAttempts = 3
 	libraryStatsProjectionRetryDelay    = 50 * time.Millisecond
 )
-
-func (h *SyncHandler) persistLibraryStatsIfCurrentHead(orgID, repoID, commitID, userID string, previousSize, previousFileCount, totalSize, fileCount int64) (bool, error) {
-	casState := map[string]interface{}{}
-	applied, err := h.db.Session().Query(`
-			UPDATE libraries SET size_bytes = ?, file_count = ?
-			WHERE org_id = ? AND library_id = ?
-			IF head_commit_id = ?
-		`, totalSize, fileCount, orgID, repoID, commitID).MapScanCAS(casState)
-	if err != nil {
-		return false, fmt.Errorf("conditional stats update for %s: %w", repoID, err)
-	}
-	if !applied {
-		currentHead, _ := casState["head_commit_id"].(string)
-		log.Printf("[updateLibraryStats] Skipping stale stats update for %s: commit=%s current_head=%s", repoID, commitID, currentHead)
-		return false, nil
-	}
-
-	if err := traffic.AdjustStorageCountersByDeltaSync(h.db, orgID, userID, repoID, totalSize-previousSize, fileCount-previousFileCount); err != nil {
-		return false, fmt.Errorf("sync storage counters for %s: %w", repoID, err)
-	}
-
-	err = retryLibraryStatsProjectionSync(func() error {
-		projectionRow, err := db.ReadAdminLibraryProjectionRow(h.db.Session(), orgID, repoID)
-		if err != nil {
-			return fmt.Errorf("read projection row: %w", err)
-		}
-		batch := h.db.Session().Batch(gocql.LoggedBatch)
-		db.AddUpsertAdminLibraryReadModelQuery(batch, projectionRow)
-		if err := batch.Exec(); err != nil {
-			return fmt.Errorf("sync projection stats: %w", err)
-		}
-		return nil
-	}, time.Sleep)
-	if err != nil {
-		return false, fmt.Errorf("sync projection stats for %s after %d attempts: %w", repoID, libraryStatsProjectionRetryAttempts, err)
-	}
-
-	return true, nil
-}
 
 func retryLibraryStatsProjectionSync(sync func() error, sleep func(time.Duration)) error {
 	var lastErr error

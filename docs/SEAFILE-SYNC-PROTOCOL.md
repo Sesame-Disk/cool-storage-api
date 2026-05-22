@@ -1,7 +1,7 @@
 # Seafile Desktop Client Sync Protocol
 
 **Version**: 2
-**Last Verified**: 2026-01-17
+**Last Verified**: 2026-05-20
 **Method**: Automated comparison against production Seafile (app.nihaoconsult.com) + comprehensive sync testing
 
 This document describes the Seafile sync protocol as verified through direct protocol comparison and real desktop client testing.
@@ -25,6 +25,17 @@ cd docker/seafile-cli-debug
 
 **All tests must pass for desktop client compatibility.**
 
+From the repository root, run `bash ./scripts/test-sync-active-active.sh` to
+exercise two real `seaf-cli` clients against different backend nodes and prove
+both core active-active desktop outcomes for concurrent
+`PUT /seafhttp/repo/{id}/commit/HEAD` contention:
+- non-overlapping writes that auto-merge after an observed `parent mismatch`
+- same-path conflicts that fail closed with an observed retry-budget `503`
+
+The harness also asserts that backend logs recorded the expected conflict path
+for each proof repository. Use `--scenario safe-auto-merge` or
+`--scenario unsafe-503` when you want to isolate one branch.
+
 **What gets tested:**
 - ✅ Single file sync
 - ✅ Multiple files sync (10 files)
@@ -33,6 +44,12 @@ cd docker/seafile-cli-debug
 - ✅ Large files (50 MB, block verification)
 - ✅ Many tiny files (50 files, performance)
 - ✅ Mixed content (various file sizes and folder depths)
+
+The comprehensive proxy suite above is focused on single-client compatibility.
+The real desktop proof in `scripts/test-sync-active-active.sh` now covers both
+the non-overlapping auto-merge path and the same-path fail-closed `503`
+preservation path. Broader active-active scenario coverage still remains a
+separate follow-up.
 
 See `COMPREHENSIVE_TESTING.md` for detailed usage.
 

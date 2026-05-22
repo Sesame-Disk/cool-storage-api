@@ -3,10 +3,10 @@
 
 FROM debian:bullseye-slim
 
+ARG SEAFILE_CLI_VERSION=v9.0.18
+
 # Install dependencies including mitmproxy and Python for analysis
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    wget \
-    gnupg \
     curl \
     jq \
     sqlite3 \
@@ -26,12 +26,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Install mitmproxy for HTTP capture
 RUN pip3 install mitmproxy
 
-# Add Seafile repository and install client
-RUN wget -q https://linux-clients.seafile.com/seafile.asc -O /usr/share/keyrings/seafile-keyring.asc \
-    && echo "deb [arch=amd64 signed-by=/usr/share/keyrings/seafile-keyring.asc] https://linux-clients.seafile.com/seafile-deb/bullseye/ stable main" > /etc/apt/sources.list.d/seafile.list \
-    && apt-get update \
-    && apt-get install -y --no-install-recommends seafile-cli \
-    && rm -rf /var/lib/apt/lists/*
+# Install the upstream Seafile CLI AppImage from GitHub releases.
+RUN curl -fsSL -o /usr/local/bin/seaf-cli \
+            "https://github.com/haiwen/seafile-client/releases/download/${SEAFILE_CLI_VERSION}/Seafile-cli-x86_64.AppImage" \
+        && chmod +x /usr/local/bin/seaf-cli \
+        && APPIMAGE_EXTRACT_AND_RUN=1 /usr/local/bin/seaf-cli --help >/tmp/seaf-cli-help.txt 2>&1 \
+        && rm -f /tmp/seaf-cli-help.txt
 
 # Create seafile user and directories
 RUN useradd -m -u 1000 seafuser \
@@ -42,7 +42,8 @@ RUN useradd -m -u 1000 seafuser \
 COPY --chown=seafuser:seafuser scripts/ /usr/local/bin/
 
 # Make scripts executable
-RUN chmod +x /usr/local/bin/*.sh 2>/dev/null || true \
+RUN sed -i 's/\r$//' /usr/local/bin/*.sh 2>/dev/null || true \
+    && chmod +x /usr/local/bin/*.sh 2>/dev/null || true \
     && chmod +x /usr/local/bin/*.py 2>/dev/null || true
 
 WORKDIR /seafile-client
@@ -52,6 +53,7 @@ USER seafuser
 ENV CCNET_CONF_DIR=/home/seafuser/.ccnet
 ENV SEAFILE_DATA_DIR=/seafile-data
 ENV CAPTURE_DIR=/captures
+ENV APPIMAGE_EXTRACT_AND_RUN=1
 
 # mitmproxy will use this CA
 ENV SSL_CERT_FILE=/mitmproxy/mitmproxy-ca-cert.pem

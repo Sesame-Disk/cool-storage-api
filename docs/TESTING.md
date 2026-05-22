@@ -2,7 +2,7 @@
 
 This document describes how to run tests, test coverage, and testing infrastructure.
 
-**Last updated: 2026-03-30**
+**Last updated: 2026-05-20**
 
 ---
 
@@ -18,18 +18,28 @@ docker compose up -d --build
 # Go unit tests
 docker compose --profile test run --rm --build gotest
 
+# Go integration tests against the running multi-node backend
+docker compose --profile test run --rm --build go-integration-test
+
 # All Go tests (unit + integration)
 docker compose --profile test run --rm --build go-all-test
 
 # API integration tests against the running stack
 docker compose --profile test run --rm --build api-test
 
+# Real seaf-cli single-client sync protocol suite (docker-native)
+docker compose --profile test run --rm --build sync-test
+
 # Frontend checks and mobile checks plus smoke
 docker compose --profile test run --rm --build frontend-test
 docker compose --profile test run --rm --build mobile-test
 
+# Unified wrapper for the same sync suite
+./scripts/test.sh sync
+
 # Or use the unified runner, which now prefers docker compose services
 ./scripts/test.sh go
+./scripts/test.sh go-integration
 ./scripts/test.sh go-all
 ./scripts/test.sh api
 ./scripts/test.sh frontend
@@ -60,8 +70,25 @@ Do not attach tests to `docker compose up -d --build` itself. That command shoul
 | `go-integration-test` | Go integration tests against running `sesamefs` |
 | `api-test` | Bash API integration suites via `scripts/test.sh api` |
 | `oidc-test` | OIDC shell tests via `scripts/test.sh oidc` |
+| `sync-test` | Real Seafile CLI sync suite in a one-shot container |
 | `frontend-test` | Frontend lint + Jest |
 | `mobile-test` | Mobile typecheck + lint + Vitest + desktop split smoke |
+
+`sync-test` is now the preferred Docker-native entry point for the single-
+client real Seafile harness. It runs `scripts/test-sync.sh` inside the
+`docker/seafile-cli` image with fresh dedicated data/config volumes.
+`./scripts/test.sh sync` now runs that service first and then executes
+`scripts/test-sync-active-active.sh` as the second half of the unified
+Docker-first sync path. When Docker Compose is not available, the wrapper still
+falls back to the long-lived `seafile-cli` debug container path.
+
+For the active-active desktop conflict harness specifically, run
+`bash ./scripts/test-sync-active-active.sh`. That script is also included in
+`./scripts/test.sh sync` on the Docker-first path, and it exercises both the
+non-overlapping auto-merge path and the same-path fail-closed `503`
+preservation path with two real `seaf-cli` clients against different backend
+nodes. Use `--scenario safe-auto-merge` or `--scenario unsafe-503` to isolate a
+single branch.
 
 The default Go integration path is now multi-instance inside the compose `test`
 profile: `go-integration-test` and `go-all-test` wait for `sesamefs`,
@@ -74,6 +101,17 @@ Keep background GC isolated to the primary `sesamefs` service in that profile.
 sensitive integration tests become nondeterministic because secondary nodes can
 reconcile queue counters, requeue failed items, or purge expired share links in
 parallel.
+
+### Current Multi-Instance Coverage Gaps
+
+- Multi-instance quota-race coverage now exists for concurrent per-user storage
+  quota enforcement, but broader coverage is still missing for 3-node races,
+  org-level quota contention, and quota rejection during auto-merge.
+- The real desktop-client harness still does not cover quota rejection during
+  auto-merge or deeper-tree active-active conflict branches.
+- Handler-level integration proof now covers both `PUT /commit/HEAD` and
+  `POST /update-branch` for same-tree idempotence, non-overlapping auto-merge,
+  unmergeable `503`, and missing-current-head guards.
 
 ### Test Categories
 
@@ -97,6 +135,7 @@ parallel.
 |--------|-------------|
 | `--quick` | Skip long-running tests (encrypted library, failover) |
 | `--verbose` | Show detailed output |
+| `--keep-going` | Continue running remaining categories/suites after a failure. Default behavior is fail-fast. |
 | `--list` | List available tests without running |
 | `--help` | Show help message |
 
@@ -217,7 +256,8 @@ docker compose --profile test run --rm --build gotest
 
 ### 3b. All Go Tests (`go-all`)
 
-Requires: Backend running (`docker compose up -d`) + Docker compose test profile
+Requires: Docker Compose test profile. The direct compose command starts and
+waits for the backend nodes automatically.
 
 ```bash
 ./scripts/test.sh go-all
@@ -226,13 +266,19 @@ Requires: Backend running (`docker compose up -d`) + Docker compose test profile
 docker compose --profile test run --rm --build go-all-test
 ```
 
-This aggregate run executes both:
+This aggregate compose run executes, in order:
 - `go test ./... -short -cover`
-- `go test -tags integration -v -count=1 -timeout 5m ./internal/integration/...`
+- `go test -tags integration -v -count=1 -timeout 10m ./internal/integration/...`
+- `./scripts/test.sh api`
+- `./scripts/test.sh oidc`
+
+It does not include the real `seaf-cli` sync suite, frontend/mobile checks,
+multi-region, or failover tests.
 
 ### 4. Go Integration Tests (`go-integration`)
 
-Requires: Backend running (`docker compose up -d`) + Docker compose test profile
+Requires: Docker Compose test profile. The direct compose command starts and
+waits for `sesamefs`, `sesamefs-node-2`, and `sesamefs-node-3` automatically.
 
 ```bash
 ./scripts/test.sh go-integration
@@ -255,6 +301,10 @@ docker compose --profile test run --rm --build go-integration-test
 These tests make HTTP requests to the running backend (same model as bash scripts) and exercise the full stack: API handlers → middleware → database → storage. They don't contribute to `go test -cover` numbers since they're in a separate package making external HTTP calls.
 
 **Docker-first default**: `test.sh` prefers the `go-integration-test` compose service, which waits for `sesamefs` and runs against the compose network.
+
+What it covers in practice: only the Go HTTP-level backend regressions in
+`internal/integration/...`. It does not run the bash API suites, OIDC shell
+tests, frontend/mobile suites, or the real Seafile desktop/CLI sync harness.
 
 That service now waits for all three compose-backed backend nodes and is the
 default place to validate coordinator correctness under independent-process
@@ -298,14 +348,23 @@ docker compose --profile test run --rm --build mobile-test
 
 ### 5. Sync Protocol Tests (`sync`)
 
-Requires: Backend + seafile-cli container
+Requires: Docker Compose for the preferred path. The direct compose command
+starts and waits for `sesamefs` automatically. Host fallback needs the backend
+reachable on `http://localhost:8080` plus the debug `seafile-cli` container.
 
 ```bash
-# Start seafile-cli container
-docker compose up -d seafile-cli
+# Preferred docker-native path
+docker compose --profile test run --rm --build sync-test
+docker compose --profile test run --rm --build -e SYNC_TEST_ARGS=--verbose sync-test
 
-# Run sync tests
+# Unified wrapper (stops on the first failing suite by default)
 ./scripts/test.sh sync
+./scripts/test.sh sync --verbose
+./scripts/test.sh sync --keep-going
+
+# Manual container management, if you want direct control
+docker compose --profile debug up -d --build seafile-cli
+./scripts/test-sync.sh
 
 # Or run directly with options
 ./scripts/test-sync.sh
@@ -316,14 +375,21 @@ docker compose up -d seafile-cli
 
 **Tests Included:**
 - Unencrypted: Remote → Local sync
+- Unencrypted: Local → Remote sync
 - Unencrypted: Multiple files sync
 - Unencrypted: File modification sync
 - Unencrypted: Subdirectory sync
 - Unencrypted: Large file (1.5MB) sync
 - Encrypted: Remote → Local sync
+- Encrypted: Local → Remote sync (remote presence verification)
 - Encrypted: Large file (64KB) sync
 - Encrypted: Binary file sync
-- Encrypted: File modification sync
+- Encrypted: File modification sync (isolated fresh encrypted repo)
+
+These are real single-client `seaf-cli` end-to-end checks. They validate the
+desktop-compatible happy path and file integrity behavior, but they still do
+not prove active-active multi-node conflict recovery under a real desktop
+client.
 
 ### 6. Multi-Region Tests (`multiregion`)
 
@@ -501,9 +567,11 @@ go test -bench=. -benchmem ./internal/chunker/
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `SESAMEFS_URL` | `http://localhost:8082` | Backend URL (host-mapped port) |
-| `DEV_TOKEN` | dev-token-123 | Auth token |
-| `CLI_CONTAINER` | cool-storage-api-seafile-cli-1 | Seafile CLI container |
+| `SESAMEFS_URL_LOCAL` | `http://localhost:8080` | Host-side API URL used by the sync shell runner |
+| `SESAMEFS_URL` | `http://sesamefs:8080` | In-container SesameFS URL used by `seaf-cli` |
+| `DEV_API_TOKEN` | dev-token-admin | API bearer token for host-side setup/verification |
+| `DEV_PASSWORD` | dev-token-123 | `seaf-cli` password for auth-token exchange |
+| `CLI_CONTAINER` | sesamefs-seafile-cli-1 | Seafile CLI container |
 | `ENCRYPTED_PASSWORD` | testpass123 | Encrypted library password |
 
 ---

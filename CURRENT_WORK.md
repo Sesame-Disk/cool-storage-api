@@ -1,7 +1,7 @@
 # Current Work - SesameFS
 
-**Last Updated**: 2026-03-31
-**Session**: Session 59 — Frontend/Backend Split Hardening + Nginx Production Fixes + Logout Fix
+**Last Updated**: 2026-05-21
+**Session**: Session 60 — Desktop Sync Conflict Hardening + Sync Test Runner/cleanup + PR61 Closeout
 
 **📏 File Size Rule**: Keep this file under **500 lines** unless unavoidable. Move detailed content to:
 - `docs/KNOWN_ISSUES.md` - Detailed bug tracking
@@ -13,7 +13,7 @@
 
 ## 🚀 NEW SESSION? START HERE
 
-**PROJECT STATUS**: ~80% production ready (see `docs/IMPLEMENTATION_STATUS.md`)
+**PROJECT STATUS**: ~85-90% production ready (see `docs/IMPLEMENTATION_STATUS.md`)
 
 **🔴 PRODUCTION BLOCKERS** (Must complete before deploy):
 1. ~~**OIDC Authentication**~~ - ✅ **COMPLETE** (Phase 1 - Basic Login)
@@ -26,26 +26,23 @@
 3. **"Critical Context"** → Essential facts to remember
 
 ### Quick Context
-1. **Sync Protocol**: 100% complete, 🔒 FROZEN
+1. **Sync Protocol**: Baseline-verified for the current desktop sync hardening scope. Do not treat it as frozen; compatibility-sensitive follow-up coverage still exists.
 2. **Backend API**: ~98% complete - OIDC ✅, GC ✅, Library Settings ✅, Monitoring ✅, Departments ✅, Admin Panel (groups/users) ✅, OIDC Group/Dept Sync ✅, Tag cascade ✅, Admin Link Management ✅, Upload Links ✅, Org Admin Panel ✅, Superadmin Departments ✅, Custom Share Permissions ✅
 3. **Frontend UI**: ~85% complete (all modals migrated, About modal rebranded, File History UI ✅, History Download ✅, Snapshot View ✅, Restore from History ✅, Share Dialog all 8 tabs ✅, permission UI ~75% with granular flags, ~51 ModalPortal wrappers to clean up, folder icons ✅). Plans/permissions Phase 3 is in progress, not closed.
-4. **All tests passing**: 18 test suites (all green), 345+ bash integration + 26 Go integration + 138 frontend + 88 GC unit + 267 api/v2+middleware tests + 29 admin panel + 17 file history + 28 file preview + 10 search tests
-5. **Active Bugs**: 0 open (all 5 resolved in Session 32)
+4. **Test flow**: Prefer Docker-first validation. `./scripts/test.sh sync` now runs the single-client sync suite plus the real active-active desktop harness; default behavior is fail-fast and `--keep-going` is opt-in.
+5. **Current risk shape**: No confirmed production bug remains in the current sync hardening slice; the open items are narrower follow-up coverage and cleanup debt, not known correctness regressions.
 
-### Inter-session Update (2026-03-30)
+### Inter-session Update (2026-05-21)
 
-- Organization creation defaults are now config/template-driven across superadmin create, OIDC auto-provision, and seed paths.
-- Sysadmin organization UI now uses `owner` / `plan` semantics instead of legacy `creator` / `role`.
-- Ownership transfer is now reachable from:
-	- superadmin org-member role change (`owner`)
-	- sysadmin org info/users flows
-	- org-admin users page
-- Sysadmin and org-admin member-management screens now gate user creation with live `max_users` data from real APIs instead of trusting static shell defaults.
-- Remaining Plans/Permissions Phase 3 gaps:
-	- org-admin shell still injects placeholder `window.org.pageOptions` values for some non-user screens/flags
-	- frontend still needs final cleanup of legacy plan-role code paths
-	- quota UI still needs unit standardization; some screens appear to treat `GB` as decimal (`1000^3`) while backend/utilities are binary-byte based (`1024^3`)
-- Frontend/backend separation **COMPLETE** (2026-03-30/31) — see `docs/V1-PRODUCTION-ROADMAP.md` P0 #3 and session 59 notes. Nginx production bugs fixed, bundle coupling fixed, logout fixed.
+- PR61 focus is desktop sync conflict hardening and closeout, not audit-log expansion.
+- Sync HEAD promotion now has branch-parity coverage for both `PUT /seafhttp/repo/:repo_id/commit/HEAD` and `POST /seafhttp/repo/:repo_id/update-branch`.
+- The hardening baseline is now verified for same-tree idempotence, safe non-overlapping auto-merge, and fail-closed retryable `503` behavior for unsafe conflicts.
+- Real active-active desktop proof now exists via two `seaf-cli` clients in Docker hitting separate backend nodes.
+- `./scripts/test.sh sync` now chains the single-client sync suite and the active-active harness; it stops on the first failing suite by default, with `--keep-going` available when you need aggregate failure reporting.
+- `./scripts/test.sh` now also prints failure excerpts for compose-backed and script-backed suites, so Docker/test-runner failures are immediately visible without digging through full logs.
+- Sync cleanup was tightened to release/delete stale `sync-test-*` and `sync-aa-*` libraries so the suite no longer drifts into `Library limit reached` failures.
+- A broader canonical quota-reservation prototype was audited and explicitly split out of this branch; the confirmed defects are documented in `docs/KNOWN_ISSUES.md`, and PR61 should keep only the test-runner improvement from that line of work.
+- Remaining sync follow-up debt is narrower: deeper-tree active-active branches, quota rejection during auto-merge, and broader 3-node/org-level quota contention races.
 
 ### Step 2: Before Making ANY Code Changes
 - ✅ Check `docs/IMPLEMENTATION_STATUS.md` - Is component 🔒 FROZEN?
@@ -58,7 +55,28 @@
 
 ---
 
-## Last Session Summary ✅
+## Current Branch Summary ✅
+
+**Date**: 2026-05-21
+**Focus**: Desktop Sync Conflict Hardening + Docker-first Validation + PR61 Closeout
+
+### Completed In This Branch Slice
+
+- Hardened sync HEAD publish behavior to distinguish safe same-tree retries from unsafe divergent conflicts.
+- Added integration proof for both handler entry points: `PUT /seafhttp/repo/:repo_id/commit/HEAD` and `POST /seafhttp/repo/:repo_id/update-branch`.
+- Added multi-instance convergence coverage for parent-promotion races during retry.
+- Added a real-client active-active harness with safe auto-merge and unsafe `503` scenarios.
+- Folded the active-active harness into `./scripts/test.sh sync` and made the wrapper fail-fast by default.
+- Fixed `--keep-going`, active-active `--keep`, and sync test cleanup/capacity drift.
+- Realigned the docs so status and testing guidance no longer contradict the code and current validation surface.
+
+### Remaining Follow-up Debt
+
+- Extend desktop sync coverage into deeper-tree active-active branches and quota rejection during auto-merge.
+- Add broader multi-node quota-race coverage beyond the current per-user concurrent upload test.
+- Keep `CURRENT_WORK.md` and related status docs synced whenever the branch focus shifts; this file had drifted badly enough to become misleading.
+
+## Historical Session Summary ✅
 
 **Date**: 2026-03-31
 **Focus**: Frontend/Backend Split Audit + Nginx Production Hardening + Bug Fixes
@@ -159,6 +177,24 @@ Routes registered in `internal/api/v2/admin.go`.
 ---
 
 ## What's Next (Priority Order) 🎯
+
+### 🔴 PRIORITY 1: PR61 Desktop Sync Hardening Closeout
+
+**Status**: 🟡 Baseline verification is complete; the remaining work is merge hygiene and narrower follow-up coverage, not core sync correctness.
+**Details**: `internal/api/sync.go`, `internal/integration/library_projection_regression_test.go`, `internal/integration/multi_instance_mutations_test.go`, `scripts/test-sync-active-active.sh`, `scripts/test.sh`
+
+**Use this branch for:**
+
+1. Running Docker-first closeout validation before merge (`./scripts/test.sh sync` first).
+2. Extending the active-active sync matrix into deeper-tree conflicts or quota-rejection branches.
+3. Keeping branch-status docs aligned with the validated behavior actually present in code.
+
+**Do not let this branch drift into:**
+
+1. Audit-log expansion.
+2. Broad frontend cleanup unrelated to desktop sync.
+3. New role/ownership behavior changes without a separate branch discussion.
+4. Canonical quota reservation/resync experiments; keep that work in a dedicated follow-up branch.
 
 ### ✅ ~~PRIORITY 1: Admin Library Management~~ — DONE (2026-02-12)
 

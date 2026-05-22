@@ -24,6 +24,9 @@ var (
 var ephemeralLibraryPrefixes = []string{
 	"inttest-",
 	"smoke-",
+}
+
+var ephemeralLibraryExactNames = []string{
 	"sesamefs-public-smoke",
 }
 
@@ -58,7 +61,18 @@ func TestMain(m *testing.M) {
 	readonlyClient = newTestClient(baseURL, "dev-token-readonly")
 	guestClient = newTestClient(baseURL, "dev-token-guest")
 
-	os.Exit(m.Run())
+	cleanupIntegrationEphemeralLibraries("before")
+	afterCleanupDone := false
+	defer func() {
+		if !afterCleanupDone {
+			cleanupIntegrationEphemeralLibraries("after")
+		}
+	}()
+
+	code := m.Run()
+	afterCleanupDone = true
+	cleanupIntegrationEphemeralLibraries("after")
+	os.Exit(code)
 }
 
 func resolveIntegrationBaseURL(baseURL string) (string, error) {
@@ -224,6 +238,103 @@ func cleanupTestLibrariesAcrossKnownUsers(t *testing.T) int {
 	return total
 }
 
+func cleanupIntegrationEphemeralLibraries(phase string) {
+	clients := []*testClient{adminClient, userClient, superadminClient}
+	seen := map[string]struct{}{}
+	total := 0
+	for _, client := range clients {
+		if client == nil {
+			continue
+		}
+		if _, ok := seen[client.token]; ok {
+			continue
+		}
+		seen[client.token] = struct{}{}
+		total += cleanupOwnedEphemeralLibrariesWithoutTesting(client)
+	}
+	if total > 0 {
+		fmt.Printf("cleaned up %d stale integration test libraries %s test run\n", total, phase)
+	}
+}
+
+func cleanupOwnedEphemeralLibrariesWithoutTesting(c *testClient) int {
+	req, err := http.NewRequest(http.MethodGet, c.baseURL+"/api/v2.1/repos/?type=mine", nil)
+	if err != nil {
+		fmt.Printf("skipping stale library cleanup for %s: create list request: %v\n", c.token, err)
+		return 0
+	}
+	req.Header.Set("Authorization", "Token "+c.token)
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		fmt.Printf("skipping stale library cleanup for %s: list request failed: %v\n", c.token, err)
+		return 0
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		fmt.Printf("skipping stale library cleanup for %s: list status=%d\n", c.token, resp.StatusCode)
+		return 0
+	}
+
+	var result map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		fmt.Printf("skipping stale library cleanup for %s: decode list response: %v\n", c.token, err)
+		return 0
+	}
+
+	repos, ok := result["repos"].([]interface{})
+	if !ok {
+		return 0
+	}
+
+	deleted := 0
+	for _, entry := range repos {
+		repo, ok := entry.(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		repoID, _ := repo["repo_id"].(string)
+		if repoID == "" {
+			repoID, _ = repo["id"].(string)
+		}
+		repoName, _ := repo["repo_name"].(string)
+		if repoName == "" {
+			repoName, _ = repo["name"].(string)
+		}
+		if repoID == "" || !isEphemeralLibraryName(repoName) {
+			continue
+		}
+
+		if deleteEphemeralLibrary(c, repoID, repoName) {
+			deleted++
+		}
+	}
+
+	return deleted
+}
+
+func deleteEphemeralLibrary(c *testClient, repoID, repoName string) bool {
+	req, err := http.NewRequest(http.MethodDelete, c.baseURL+"/api/v2.1/repos/"+repoID+"/", nil)
+	if err != nil {
+		fmt.Printf("failed to create delete request for stale test library %q (%s): %v\n", repoName, repoID, err)
+		return false
+	}
+	req.Header.Set("Authorization", "Token "+c.token)
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		fmt.Printf("failed to delete stale test library %q (%s): %v\n", repoName, repoID, err)
+		return false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusNotFound {
+		return true
+	}
+	fmt.Printf("failed to delete stale test library %q (%s): status=%d\n", repoName, repoID, resp.StatusCode)
+	return false
+}
+
 func cleanupOwnedEphemeralLibraries(t *testing.T, c *testClient) int {
 	t.Helper()
 
@@ -276,6 +387,11 @@ func cleanupOwnedEphemeralLibraries(t *testing.T, c *testClient) int {
 }
 
 func isEphemeralLibraryName(name string) bool {
+	for _, exactName := range ephemeralLibraryExactNames {
+		if name == exactName {
+			return true
+		}
+	}
 	for _, prefix := range ephemeralLibraryPrefixes {
 		if strings.HasPrefix(name, prefix) {
 			return true

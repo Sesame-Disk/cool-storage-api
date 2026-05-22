@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Sesame-Disk/sesamefs/internal/db"
 	"github.com/Sesame-Disk/sesamefs/internal/storage"
 	"github.com/gin-gonic/gin"
 )
@@ -884,6 +885,1034 @@ func TestRetryLibraryStatsProjectionSync(t *testing.T) {
 		}
 		if sleeps != libraryStatsProjectionRetryAttempts-1 {
 			t.Fatalf("sleeps = %d, want %d", sleeps, libraryStatsProjectionRetryAttempts-1)
+		}
+	})
+}
+
+// TestRetrySyncDerivedStateRead exercises the stale-read-after-CAS retry path
+// that absorbs the window between an LWT commit and replicas applying it.
+func TestRetrySyncDerivedStateRead(t *testing.T) {
+	notBefore := time.Date(2026, 5, 21, 12, 0, 0, 0, time.UTC)
+	fresh := syncLibraryDerivedState{
+		HeadCommitID: "new-head",
+		ProjectionRow: db.AdminLibraryProjectionRow{
+			OrgID:     "org-1",
+			LibraryID: "lib-1",
+			UpdatedAt: notBefore,
+		},
+	}
+	stale := syncLibraryDerivedState{
+		HeadCommitID: "old-head",
+		ProjectionRow: db.AdminLibraryProjectionRow{
+			OrgID:     "org-1",
+			LibraryID: "lib-1",
+			UpdatedAt: notBefore.Add(-time.Millisecond),
+		},
+	}
+
+	t.Run("accepts fresh row on first attempt", func(t *testing.T) {
+		attempts := 0
+		sleeps := 0
+		got, err := retrySyncDerivedStateRead("lib-1", notBefore, func() (syncLibraryDerivedState, error) {
+			attempts++
+			return fresh, nil
+		}, func(time.Duration) { sleeps++ })
+		if err != nil {
+			t.Fatalf("err = %v, want nil", err)
+		}
+		if got.HeadCommitID != "new-head" {
+			t.Fatalf("HeadCommitID = %q, want new-head", got.HeadCommitID)
+		}
+		if attempts != 1 || sleeps != 0 {
+			t.Fatalf("attempts=%d sleeps=%d, want 1/0", attempts, sleeps)
+		}
+	})
+
+	t.Run("retries past a stale read, accepts the fresh row", func(t *testing.T) {
+		attempts := 0
+		sleeps := 0
+		responses := []syncLibraryDerivedState{stale, fresh}
+		got, err := retrySyncDerivedStateRead("lib-1", notBefore, func() (syncLibraryDerivedState, error) {
+			r := responses[attempts]
+			attempts++
+			return r, nil
+		}, func(time.Duration) { sleeps++ })
+		if err != nil {
+			t.Fatalf("err = %v, want nil", err)
+		}
+		if got.HeadCommitID != "new-head" {
+			t.Fatalf("HeadCommitID = %q, want new-head", got.HeadCommitID)
+		}
+		if attempts != 2 || sleeps != 1 {
+			t.Fatalf("attempts=%d sleeps=%d, want 2/1", attempts, sleeps)
+		}
+	})
+
+	t.Run("returns stale error after exhausting retries", func(t *testing.T) {
+		attempts := 0
+		sleeps := 0
+		_, err := retrySyncDerivedStateRead("lib-1", notBefore, func() (syncLibraryDerivedState, error) {
+			attempts++
+			return stale, nil
+		}, func(time.Duration) { sleeps++ })
+		if err == nil {
+			t.Fatal("err = nil, want stale error")
+		}
+		if !strings.Contains(err.Error(), "stale canonical sync state for lib-1") {
+			t.Fatalf("err = %v, want to contain stale-canonical message", err)
+		}
+		if attempts != libraryStatsProjectionRetryAttempts {
+			t.Fatalf("attempts = %d, want %d", attempts, libraryStatsProjectionRetryAttempts)
+		}
+		if sleeps != libraryStatsProjectionRetryAttempts-1 {
+			t.Fatalf("sleeps = %d, want %d", sleeps, libraryStatsProjectionRetryAttempts-1)
+		}
+	})
+
+	t.Run("retries through a transient fetch error", func(t *testing.T) {
+		attempts := 0
+		_, err := retrySyncDerivedStateRead("lib-1", notBefore, func() (syncLibraryDerivedState, error) {
+			attempts++
+			if attempts == 1 {
+				return syncLibraryDerivedState{}, errors.New("transient cassandra error")
+			}
+			return fresh, nil
+		}, func(time.Duration) {})
+		if err != nil {
+			t.Fatalf("err = %v, want nil", err)
+		}
+		if attempts != 2 {
+			t.Fatalf("attempts = %d, want 2", attempts)
+		}
+	})
+
+	t.Run("returns last fetch error after exhausting retries", func(t *testing.T) {
+		wantErr := errors.New("persistent cassandra error")
+		attempts := 0
+		_, err := retrySyncDerivedStateRead("lib-1", notBefore, func() (syncLibraryDerivedState, error) {
+			attempts++
+			return syncLibraryDerivedState{}, wantErr
+		}, func(time.Duration) {})
+		if !errors.Is(err, wantErr) {
+			t.Fatalf("err = %v, want %v", err, wantErr)
+		}
+		if attempts != libraryStatsProjectionRetryAttempts {
+			t.Fatalf("attempts = %d, want %d", attempts, libraryStatsProjectionRetryAttempts)
+		}
+	})
+
+	t.Run("treats equal updated_at as fresh (boundary)", func(t *testing.T) {
+		boundary := syncLibraryDerivedState{
+			HeadCommitID: "boundary-head",
+			ProjectionRow: db.AdminLibraryProjectionRow{
+				OrgID:     "org-1",
+				LibraryID: "lib-1",
+				UpdatedAt: notBefore, // exactly equal — must not be considered stale
+			},
+		}
+		got, err := retrySyncDerivedStateRead("lib-1", notBefore, func() (syncLibraryDerivedState, error) {
+			return boundary, nil
+		}, func(time.Duration) {})
+		if err != nil {
+			t.Fatalf("err = %v, want nil", err)
+		}
+		if got.HeadCommitID != "boundary-head" {
+			t.Fatalf("HeadCommitID = %q, want boundary-head", got.HeadCommitID)
+		}
+	})
+}
+
+// TestSyncLibraryHeadDerivedStateUsing covers the full read+write composition
+// so the batch-write failure path (which the production code talks to
+// gocql.Session for) has a deterministic regression test alongside the
+// read-side stale-guard.
+func TestSyncLibraryHeadDerivedStateUsing(t *testing.T) {
+	notBefore := time.Date(2026, 5, 21, 12, 0, 0, 0, time.UTC)
+	fresh := syncLibraryDerivedState{
+		HeadCommitID: "new-head",
+		ProjectionRow: db.AdminLibraryProjectionRow{
+			OrgID:     "org-1",
+			LibraryID: "lib-1",
+			UpdatedAt: notBefore,
+		},
+	}
+	stale := syncLibraryDerivedState{
+		HeadCommitID: "old-head",
+		ProjectionRow: db.AdminLibraryProjectionRow{
+			OrgID:     "org-1",
+			LibraryID: "lib-1",
+			UpdatedAt: notBefore.Add(-time.Millisecond),
+		},
+	}
+
+	t.Run("writes projection once read returns fresh state", func(t *testing.T) {
+		writes := 0
+		var written syncLibraryDerivedState
+		err := syncLibraryHeadDerivedStateUsing("lib-1", notBefore,
+			func() (syncLibraryDerivedState, error) { return fresh, nil },
+			func(_ string, state syncLibraryDerivedState) error {
+				writes++
+				written = state
+				return nil
+			},
+			func(time.Duration) {})
+		if err != nil {
+			t.Fatalf("err = %v, want nil", err)
+		}
+		if writes != 1 {
+			t.Fatalf("writes = %d, want 1", writes)
+		}
+		if written.HeadCommitID != "new-head" {
+			t.Fatalf("written.HeadCommitID = %q, want new-head", written.HeadCommitID)
+		}
+	})
+
+	t.Run("propagates read-side stale exhaustion without writing", func(t *testing.T) {
+		writes := 0
+		err := syncLibraryHeadDerivedStateUsing("lib-1", notBefore,
+			func() (syncLibraryDerivedState, error) { return stale, nil },
+			func(string, syncLibraryDerivedState) error {
+				writes++
+				return nil
+			},
+			func(time.Duration) {})
+		if err == nil {
+			t.Fatal("err = nil, want stale error")
+		}
+		if !strings.Contains(err.Error(), "failed to read library state after sync update") {
+			t.Fatalf("err = %v, want to wrap the read-side failure", err)
+		}
+		if !strings.Contains(err.Error(), "stale canonical sync state for lib-1") {
+			t.Fatalf("err = %v, want to surface the stale message", err)
+		}
+		if writes != 0 {
+			t.Fatalf("writes = %d, want 0 (must not attempt write when read fails)", writes)
+		}
+	})
+
+	t.Run("propagates batch write failure after fresh read", func(t *testing.T) {
+		wantErr := errors.New("batch exec failed")
+		writes := 0
+		err := syncLibraryHeadDerivedStateUsing("lib-1", notBefore,
+			func() (syncLibraryDerivedState, error) { return fresh, nil },
+			func(string, syncLibraryDerivedState) error {
+				writes++
+				return wantErr
+			},
+			func(time.Duration) {})
+		if !errors.Is(err, wantErr) {
+			t.Fatalf("err = %v, want to wrap %v", err, wantErr)
+		}
+		if !strings.Contains(err.Error(), "failed to sync head lookup/admin projection") {
+			t.Fatalf("err = %v, want the batch-side error prefix", err)
+		}
+		if writes != 1 {
+			t.Fatalf("writes = %d, want 1 (no retry on write side)", writes)
+		}
+	})
+
+	t.Run("write is called with the fresh state observed by the read loop", func(t *testing.T) {
+		responses := []syncLibraryDerivedState{stale, fresh}
+		reads := 0
+		var observed syncLibraryDerivedState
+		err := syncLibraryHeadDerivedStateUsing("lib-1", notBefore,
+			func() (syncLibraryDerivedState, error) {
+				r := responses[reads]
+				reads++
+				return r, nil
+			},
+			func(_ string, state syncLibraryDerivedState) error {
+				observed = state
+				return nil
+			},
+			func(time.Duration) {})
+		if err != nil {
+			t.Fatalf("err = %v, want nil", err)
+		}
+		if observed.HeadCommitID != "new-head" {
+			t.Fatalf("observed.HeadCommitID = %q, want new-head (write must receive post-retry fresh state)", observed.HeadCommitID)
+		}
+	})
+}
+
+// TestOverrideSyncLibraryCASFields locks in the contract that the publisher's
+// CAS-authoritative values override anything the post-CAS read returned. This
+// is the defense against read-after-write convergence affecting the projection
+// write — even if a hypothetical future regression weakens the stale-guard,
+// the override guarantees the projection reflects the CAS commit.
+func TestOverrideSyncLibraryCASFields(t *testing.T) {
+	postCASUpdatedAt := time.Date(2026, 5, 21, 16, 31, 5, 0, time.UTC)
+	staleRead := syncLibraryDerivedState{
+		HeadCommitID: "stale-head", // a replica that hadn't seen the CAS yet
+		ProjectionRow: db.AdminLibraryProjectionRow{
+			OrgID:        "org-1",
+			LibraryID:    "lib-1",
+			OwnerID:      "admin-controlled",
+			Name:         "admin-controlled",
+			Encrypted:    true,
+			StorageClass: "admin-controlled",
+			SizeBytes:    0,                                // CAS-controlled, stale
+			FileCount:    0,                                // CAS-controlled, stale
+			UpdatedAt:    postCASUpdatedAt.Add(-time.Hour), // CAS-controlled, stale
+		},
+	}
+
+	overrideSyncLibraryCASFields(&staleRead, "new-head", postCASUpdatedAt, 4096, 3)
+
+	if staleRead.HeadCommitID != "new-head" {
+		t.Fatalf("HeadCommitID = %q, want new-head", staleRead.HeadCommitID)
+	}
+	if staleRead.ProjectionRow.SizeBytes != 4096 {
+		t.Fatalf("SizeBytes = %d, want 4096", staleRead.ProjectionRow.SizeBytes)
+	}
+	if staleRead.ProjectionRow.FileCount != 3 {
+		t.Fatalf("FileCount = %d, want 3", staleRead.ProjectionRow.FileCount)
+	}
+	if !staleRead.ProjectionRow.UpdatedAt.Equal(postCASUpdatedAt) {
+		t.Fatalf("UpdatedAt = %s, want %s", staleRead.ProjectionRow.UpdatedAt, postCASUpdatedAt)
+	}
+	// Admin-controlled fields must not be touched by the override — they came
+	// from the read at a snapshot the caller already accepted as fresh-enough.
+	if staleRead.ProjectionRow.OwnerID != "admin-controlled" ||
+		staleRead.ProjectionRow.Name != "admin-controlled" ||
+		!staleRead.ProjectionRow.Encrypted ||
+		staleRead.ProjectionRow.StorageClass != "admin-controlled" {
+		t.Fatalf("override leaked into admin-controlled fields: %+v", staleRead.ProjectionRow)
+	}
+}
+
+func TestRepairPublishedSyncHeadAfterCounterFailureUsing(t *testing.T) {
+	notBefore := time.Date(2026, 5, 21, 16, 31, 5, 0, time.UTC)
+	fresh := syncLibraryDerivedState{
+		HeadCommitID: "new-head",
+		ProjectionRow: db.AdminLibraryProjectionRow{
+			OrgID:     "org-1",
+			LibraryID: "lib-1",
+			UpdatedAt: notBefore,
+		},
+	}
+	staleState := syncLibraryDerivedState{
+		HeadCommitID: "new-head",
+		ProjectionRow: db.AdminLibraryProjectionRow{
+			OrgID:     "org-1",
+			LibraryID: "lib-1",
+			UpdatedAt: notBefore.Add(-time.Second),
+		},
+	}
+
+	t.Run("retries until canonical state reaches notBefore then reconciles queues and writes", func(t *testing.T) {
+		responses := []syncLibraryDerivedState{staleState, fresh}
+		reads := 0
+		sleeps := 0
+		reconciles := 0
+		queues := 0
+		writes := 0
+		var reconciled syncLibraryDerivedState
+		var queued syncLibraryDerivedState
+		var written syncLibraryDerivedState
+		err := repairPublishedSyncHeadAfterCounterFailureUsing(
+			"lib-1",
+			notBefore,
+			func() (syncLibraryDerivedState, error) {
+				response := responses[reads]
+				reads++
+				return response, nil
+			},
+			func(state syncLibraryDerivedState) error {
+				reconciles++
+				reconciled = state
+				return nil
+			},
+			func(state syncLibraryDerivedState) error {
+				queues++
+				queued = state
+				return nil
+			},
+			func(state syncLibraryDerivedState) error {
+				writes++
+				written = state
+				return nil
+			},
+			func(time.Duration) { sleeps++ },
+		)
+		if err != nil {
+			t.Fatalf("err = %v, want nil", err)
+		}
+		if reads != 2 || sleeps != 1 {
+			t.Fatalf("reads=%d sleeps=%d, want 2/1", reads, sleeps)
+		}
+		if reconciles != 1 || queues != 1 || writes != 1 {
+			t.Fatalf("reconciles=%d queues=%d writes=%d, want 1/1/1", reconciles, queues, writes)
+		}
+		if reconciled.HeadCommitID != fresh.HeadCommitID || queued.HeadCommitID != fresh.HeadCommitID || written.HeadCommitID != fresh.HeadCommitID {
+			t.Fatalf("reconciled=%q queued=%q written=%q, want all %q", reconciled.HeadCommitID, queued.HeadCommitID, written.HeadCommitID, fresh.HeadCommitID)
+		}
+	})
+
+	t.Run("propagates stale-state exhaustion without reconciling queueing or writing", func(t *testing.T) {
+		reconciles := 0
+		queues := 0
+		writes := 0
+		err := repairPublishedSyncHeadAfterCounterFailureUsing(
+			"lib-1",
+			notBefore,
+			func() (syncLibraryDerivedState, error) { return staleState, nil },
+			func(syncLibraryDerivedState) error {
+				reconciles++
+				return nil
+			},
+			func(syncLibraryDerivedState) error {
+				queues++
+				return nil
+			},
+			func(syncLibraryDerivedState) error {
+				writes++
+				return nil
+			},
+			func(time.Duration) {},
+		)
+		if err == nil {
+			t.Fatal("err = nil, want stale-state error")
+		}
+		if !strings.Contains(err.Error(), "failed to read canonical library state for sync head repair") {
+			t.Fatalf("err = %v, want read-side repair prefix", err)
+		}
+		if !strings.Contains(err.Error(), "stale canonical sync state for lib-1") {
+			t.Fatalf("err = %v, want stale-state message", err)
+		}
+		if reconciles != 0 || queues != 0 || writes != 0 {
+			t.Fatalf("reconciles=%d queues=%d writes=%d, want 0/0/0", reconciles, queues, writes)
+		}
+	})
+
+	t.Run("propagates reconcile failure and skips queue and write", func(t *testing.T) {
+		wantErr := errors.New("reconcile failed")
+		queues := 0
+		writes := 0
+		err := repairPublishedSyncHeadAfterCounterFailureUsing(
+			"lib-1",
+			notBefore,
+			func() (syncLibraryDerivedState, error) { return fresh, nil },
+			func(syncLibraryDerivedState) error { return wantErr },
+			func(syncLibraryDerivedState) error {
+				queues++
+				return nil
+			},
+			func(syncLibraryDerivedState) error {
+				writes++
+				return nil
+			},
+			func(time.Duration) {},
+		)
+		if !errors.Is(err, wantErr) {
+			t.Fatalf("err = %v, want %v", err, wantErr)
+		}
+		if !strings.Contains(err.Error(), "failed to reconcile sync library storage state") {
+			t.Fatalf("err = %v, want reconcile prefix", err)
+		}
+		if queues != 0 || writes != 0 {
+			t.Fatalf("queues = %d writes = %d, want 0/0", queues, writes)
+		}
+	})
+
+	t.Run("propagates queue failure and skips write", func(t *testing.T) {
+		wantErr := errors.New("queue failed")
+		writes := 0
+		err := repairPublishedSyncHeadAfterCounterFailureUsing(
+			"lib-1",
+			notBefore,
+			func() (syncLibraryDerivedState, error) { return fresh, nil },
+			func(syncLibraryDerivedState) error { return nil },
+			func(syncLibraryDerivedState) error { return wantErr },
+			func(syncLibraryDerivedState) error {
+				writes++
+				return nil
+			},
+			func(time.Duration) {},
+		)
+		if !errors.Is(err, wantErr) {
+			t.Fatalf("err = %v, want %v", err, wantErr)
+		}
+		if !strings.Contains(err.Error(), "failed to queue aggregate storage reconciliation") {
+			t.Fatalf("err = %v, want queue prefix", err)
+		}
+		if writes != 0 {
+			t.Fatalf("writes = %d, want 0", writes)
+		}
+	})
+
+	t.Run("propagates write failure after successful reconcile and queue", func(t *testing.T) {
+		wantErr := errors.New("write failed")
+		reconciles := 0
+		queues := 0
+		err := repairPublishedSyncHeadAfterCounterFailureUsing(
+			"lib-1",
+			notBefore,
+			func() (syncLibraryDerivedState, error) { return fresh, nil },
+			func(syncLibraryDerivedState) error {
+				reconciles++
+				return nil
+			},
+			func(syncLibraryDerivedState) error {
+				queues++
+				return nil
+			},
+			func(syncLibraryDerivedState) error { return wantErr },
+			func(time.Duration) {},
+		)
+		if !errors.Is(err, wantErr) {
+			t.Fatalf("err = %v, want %v", err, wantErr)
+		}
+		if !strings.Contains(err.Error(), "failed to sync head lookup/admin projection") {
+			t.Fatalf("err = %v, want write prefix", err)
+		}
+		if reconciles != 1 || queues != 1 {
+			t.Fatalf("reconciles = %d queues = %d, want 1/1", reconciles, queues)
+		}
+	})
+}
+
+func makeAlignedSyncDerivedStateCanary(targetHead string) syncDerivedStateCanary {
+	canonicalUpdatedAt := time.Date(2026, 5, 21, 16, 31, 5, 0, time.UTC)
+	projectionRow := db.AdminLibraryProjectionRow{
+		OrgID:     "org-1",
+		LibraryID: "lib-1",
+		OwnerID:   "user-1",
+		CreatedAt: time.Date(2026, 5, 20, 9, 15, 0, 0, time.UTC),
+		UpdatedAt: canonicalUpdatedAt,
+		SizeBytes: 4096,
+		FileCount: 3,
+	}
+	projectionCanary := syncAdminProjectionCanary{
+		Present:   true,
+		OwnerID:   projectionRow.OwnerID,
+		UpdatedAt: projectionRow.UpdatedAt,
+		SizeBytes: projectionRow.SizeBytes,
+		FileCount: projectionRow.FileCount,
+	}
+	return syncDerivedStateCanary{
+		Canonical: syncLibraryDerivedState{
+			HeadCommitID:  targetHead,
+			ProjectionRow: projectionRow,
+		},
+		LookupHead:       targetHead,
+		OrgProjection:    projectionCanary,
+		OwnerProjection:  projectionCanary,
+		GlobalProjection: projectionCanary,
+	}
+}
+
+// TestRepairSyncHeadDerivedStateIfDriftedUsing locks in the contract that
+// keeps the idempotent fast-path from blessing post-CAS drift. The fast-path
+// returns 200 when canonical libraries.head_commit_id already equals the
+// caller's targetHead, which means a prior attempt published the head but
+// could still have failed any of: storage counter delta, aggregate queue
+// insert, or a partial lookup/admin projection write. Without this canary the
+// stale state would be permanent. With it, the canary validates the lookup and
+// all active admin projection surfaces against canonical state before deciding
+// whether the retry can short-circuit.
+func TestRepairSyncHeadDerivedStateIfDriftedUsing(t *testing.T) {
+	t.Run("returns nil immediately when lookup and admin projections match canonical state", func(t *testing.T) {
+		canaryReads := 0
+		repairs := 0
+		aligned := makeAlignedSyncDerivedStateCanary("target-head")
+		err := repairSyncHeadDerivedStateIfDriftedUsing(
+			"target-head",
+			func() (syncDerivedStateCanary, error) {
+				canaryReads++
+				return aligned, nil
+			},
+			func(time.Time, int64, int64) error {
+				repairs++
+				return nil
+			},
+			func(time.Duration) {},
+		)
+		if err != nil {
+			t.Fatalf("err = %v, want nil", err)
+		}
+		if canaryReads != 1 {
+			t.Fatalf("canaryReads = %d, want 1", canaryReads)
+		}
+		if repairs != 0 {
+			t.Fatalf("repairs = %d, want 0 when canary already agrees", repairs)
+		}
+	})
+
+	t.Run("retries stale canonical canary before accepting aligned derived state", func(t *testing.T) {
+		stale := makeAlignedSyncDerivedStateCanary("target-head")
+		stale.Canonical.HeadCommitID = "old-head"
+		aligned := makeAlignedSyncDerivedStateCanary("target-head")
+		canaryReads := 0
+		repairs := 0
+		sleeps := 0
+		err := repairSyncHeadDerivedStateIfDriftedUsing(
+			"target-head",
+			func() (syncDerivedStateCanary, error) {
+				canaryReads++
+				if canaryReads == 1 {
+					return stale, nil
+				}
+				return aligned, nil
+			},
+			func(time.Time, int64, int64) error {
+				repairs++
+				return nil
+			},
+			func(time.Duration) { sleeps++ },
+		)
+		if err != nil {
+			t.Fatalf("err = %v, want nil", err)
+		}
+		if canaryReads != 2 || sleeps != 1 {
+			t.Fatalf("canaryReads = %d sleeps = %d, want 2/1", canaryReads, sleeps)
+		}
+		if repairs != 0 {
+			t.Fatalf("repairs = %d, want 0 after stale read converges to aligned state", repairs)
+		}
+	})
+
+	t.Run("does not repair from a stale canonical canary", func(t *testing.T) {
+		stale := makeAlignedSyncDerivedStateCanary("target-head")
+		stale.Canonical.HeadCommitID = "old-head"
+		canaryReads := 0
+		repairs := 0
+		sleeps := 0
+		err := repairSyncHeadDerivedStateIfDriftedUsing(
+			"target-head",
+			func() (syncDerivedStateCanary, error) {
+				canaryReads++
+				return stale, nil
+			},
+			func(time.Time, int64, int64) error {
+				repairs++
+				return nil
+			},
+			func(time.Duration) { sleeps++ },
+		)
+		if err == nil {
+			t.Fatal("err = nil, want stale canonical canary error")
+		}
+		if !strings.Contains(err.Error(), "stale canonical sync state") {
+			t.Fatalf("err = %v, want stale canonical sync state prefix", err)
+		}
+		if canaryReads != libraryStatsProjectionRetryAttempts || sleeps != libraryStatsProjectionRetryAttempts-1 {
+			t.Fatalf("canaryReads = %d sleeps = %d, want %d/%d", canaryReads, sleeps, libraryStatsProjectionRetryAttempts, libraryStatsProjectionRetryAttempts-1)
+		}
+		if repairs != 0 {
+			t.Fatalf("repairs = %d, want 0 while canonical canary is stale", repairs)
+		}
+	})
+
+	t.Run("runs repair with canonical stats when lookup is stale", func(t *testing.T) {
+		stale := makeAlignedSyncDerivedStateCanary("target-head")
+		canonicalUpdatedAt := stale.Canonical.ProjectionRow.UpdatedAt
+		var repairCalled struct {
+			updatedAt time.Time
+			totalSize int64
+			fileCount int64
+			count     int
+		}
+		stale.LookupHead = "stale-head"
+		err := repairSyncHeadDerivedStateIfDriftedUsing(
+			"target-head",
+			func() (syncDerivedStateCanary, error) { return stale, nil },
+			func(updatedAt time.Time, totalSize, fileCount int64) error {
+				repairCalled.updatedAt = updatedAt
+				repairCalled.totalSize = totalSize
+				repairCalled.fileCount = fileCount
+				repairCalled.count++
+				return nil
+			},
+			func(time.Duration) {},
+		)
+		if err != nil {
+			t.Fatalf("err = %v, want nil", err)
+		}
+		if repairCalled.count != 1 {
+			t.Fatalf("repair invocations = %d, want 1", repairCalled.count)
+		}
+		if !repairCalled.updatedAt.Equal(canonicalUpdatedAt) || repairCalled.totalSize != stale.Canonical.ProjectionRow.SizeBytes || repairCalled.fileCount != stale.Canonical.ProjectionRow.FileCount {
+			t.Fatalf("repair received updatedAt=%s totalSize=%d fileCount=%d, want %s/4096/3",
+				repairCalled.updatedAt, repairCalled.totalSize, repairCalled.fileCount, canonicalUpdatedAt)
+		}
+	})
+
+	t.Run("runs repair when org projection is missing even though lookup matches", func(t *testing.T) {
+		stale := makeAlignedSyncDerivedStateCanary("target-head")
+		stale.OrgProjection = syncAdminProjectionCanary{}
+		repairs := 0
+		err := repairSyncHeadDerivedStateIfDriftedUsing(
+			"target-head",
+			func() (syncDerivedStateCanary, error) { return stale, nil },
+			func(time.Time, int64, int64) error {
+				repairs++
+				return nil
+			},
+			func(time.Duration) {},
+		)
+		if err != nil {
+			t.Fatalf("err = %v, want nil", err)
+		}
+		if repairs != 1 {
+			t.Fatalf("repairs = %d, want 1", repairs)
+		}
+	})
+
+	t.Run("runs repair when owner projection is missing even though lookup matches", func(t *testing.T) {
+		stale := makeAlignedSyncDerivedStateCanary("target-head")
+		stale.OwnerProjection = syncAdminProjectionCanary{}
+		repairs := 0
+		err := repairSyncHeadDerivedStateIfDriftedUsing(
+			"target-head",
+			func() (syncDerivedStateCanary, error) { return stale, nil },
+			func(time.Time, int64, int64) error {
+				repairs++
+				return nil
+			},
+			func(time.Duration) {},
+		)
+		if err != nil {
+			t.Fatalf("err = %v, want nil", err)
+		}
+		if repairs != 1 {
+			t.Fatalf("repairs = %d, want 1", repairs)
+		}
+	})
+
+	t.Run("runs repair when global projection drifts even though lookup matches", func(t *testing.T) {
+		stale := makeAlignedSyncDerivedStateCanary("target-head")
+		stale.GlobalProjection.SizeBytes++
+		repairs := 0
+		err := repairSyncHeadDerivedStateIfDriftedUsing(
+			"target-head",
+			func() (syncDerivedStateCanary, error) { return stale, nil },
+			func(time.Time, int64, int64) error {
+				repairs++
+				return nil
+			},
+			func(time.Duration) {},
+		)
+		if err != nil {
+			t.Fatalf("err = %v, want nil", err)
+		}
+		if repairs != 1 {
+			t.Fatalf("repairs = %d, want 1", repairs)
+		}
+	})
+
+	t.Run("wraps and propagates canary-read failure without invoking repair", func(t *testing.T) {
+		wantErr := errors.New("canary read failed")
+		repairs := 0
+		err := repairSyncHeadDerivedStateIfDriftedUsing(
+			"target-head",
+			func() (syncDerivedStateCanary, error) { return syncDerivedStateCanary{}, wantErr },
+			func(time.Time, int64, int64) error {
+				repairs++
+				return nil
+			},
+			func(time.Duration) {},
+		)
+		if !errors.Is(err, wantErr) {
+			t.Fatalf("err = %v, want to wrap %v", err, wantErr)
+		}
+		if !strings.Contains(err.Error(), "read sync derived-state canary") {
+			t.Fatalf("err = %v, want canary-read prefix", err)
+		}
+		if repairs != 0 {
+			t.Fatalf("repairs = %d, want 0 on canary-read failure", repairs)
+		}
+	})
+
+	t.Run("wraps and propagates repair failure", func(t *testing.T) {
+		wantErr := errors.New("repair failed")
+		stale := makeAlignedSyncDerivedStateCanary("target-head")
+		stale.LookupHead = "stale-head"
+		err := repairSyncHeadDerivedStateIfDriftedUsing(
+			"target-head",
+			func() (syncDerivedStateCanary, error) { return stale, nil },
+			func(time.Time, int64, int64) error { return wantErr },
+			func(time.Duration) {},
+		)
+		if !errors.Is(err, wantErr) {
+			t.Fatalf("err = %v, want to wrap %v", err, wantErr)
+		}
+		if !strings.Contains(err.Error(), "repair drifted sync derived state") {
+			t.Fatalf("err = %v, want repair prefix", err)
+		}
+	})
+}
+
+// TestSyncAdminProjectionCanaryMatches locks down the pure predicate used by
+// the canary to decide whether each admin projection surface still reflects
+// canonical state. A projection is in sync only when Present is true and ALL
+// four fields agree; any disagreement (or an absent row) must produce false
+// so the surrounding alignedWith returns drift and the handler reruns repair.
+func TestSyncAdminProjectionCanaryMatches(t *testing.T) {
+	updatedAt := time.Date(2026, 5, 21, 16, 31, 5, 0, time.UTC)
+	base := syncAdminProjectionCanary{
+		Present:   true,
+		OwnerID:   "user-1",
+		UpdatedAt: updatedAt,
+		SizeBytes: 4096,
+		FileCount: 3,
+	}
+
+	tests := []struct {
+		name      string
+		mutate    func(c *syncAdminProjectionCanary)
+		ownerID   string
+		updatedAt time.Time
+		sizeBytes int64
+		fileCount int64
+		want      bool
+	}{
+		{
+			name:      "matches exactly",
+			ownerID:   base.OwnerID,
+			updatedAt: base.UpdatedAt,
+			sizeBytes: base.SizeBytes,
+			fileCount: base.FileCount,
+			want:      true,
+		},
+		{
+			name:      "absent projection never matches",
+			mutate:    func(c *syncAdminProjectionCanary) { c.Present = false },
+			ownerID:   base.OwnerID,
+			updatedAt: base.UpdatedAt,
+			sizeBytes: base.SizeBytes,
+			fileCount: base.FileCount,
+			want:      false,
+		},
+		{
+			name:      "owner mismatch",
+			ownerID:   "user-2",
+			updatedAt: base.UpdatedAt,
+			sizeBytes: base.SizeBytes,
+			fileCount: base.FileCount,
+			want:      false,
+		},
+		{
+			name:      "updated_at mismatch",
+			ownerID:   base.OwnerID,
+			updatedAt: base.UpdatedAt.Add(time.Millisecond),
+			sizeBytes: base.SizeBytes,
+			fileCount: base.FileCount,
+			want:      false,
+		},
+		{
+			name:      "size_bytes mismatch",
+			ownerID:   base.OwnerID,
+			updatedAt: base.UpdatedAt,
+			sizeBytes: base.SizeBytes + 1,
+			fileCount: base.FileCount,
+			want:      false,
+		},
+		{
+			name:      "file_count mismatch",
+			ownerID:   base.OwnerID,
+			updatedAt: base.UpdatedAt,
+			sizeBytes: base.SizeBytes,
+			fileCount: base.FileCount + 1,
+			want:      false,
+		},
+		{
+			name:      "equivalent updated_at across timezone is matched by Equal",
+			ownerID:   base.OwnerID,
+			updatedAt: base.UpdatedAt.In(time.FixedZone("test", 3600)),
+			sizeBytes: base.SizeBytes,
+			fileCount: base.FileCount,
+			want:      true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := base
+			if tt.mutate != nil {
+				tt.mutate(&c)
+			}
+			got := c.matches(tt.ownerID, tt.updatedAt, tt.sizeBytes, tt.fileCount)
+			if got != tt.want {
+				t.Fatalf("matches = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestSyncDerivedStateCanaryAlignedWith locks down the composition predicate
+// that decides whether the idempotent fast-path can short-circuit. The
+// invariant is that EVERY surface (lookup head plus the three admin
+// projections) must align with canonical state; any single surface drifting
+// or missing must surface as drift so the handler reruns repair instead of
+// silently returning 200.
+func TestSyncDerivedStateCanaryAlignedWith(t *testing.T) {
+	makeAligned := func() syncDerivedStateCanary {
+		return makeAlignedSyncDerivedStateCanary("target-head")
+	}
+
+	t.Run("aligned canary returns true for matching target head", func(t *testing.T) {
+		if !makeAligned().alignedWith("target-head") {
+			t.Fatal("alignedWith = false, want true for aligned canary")
+		}
+	})
+
+	t.Run("mismatched target head fails even when all surfaces agree", func(t *testing.T) {
+		if makeAligned().alignedWith("other-head") {
+			t.Fatal("alignedWith = true, want false when target differs from canonical")
+		}
+	})
+
+	t.Run("stale lookup head trips drift", func(t *testing.T) {
+		c := makeAligned()
+		c.LookupHead = "stale-head"
+		if c.alignedWith("target-head") {
+			t.Fatal("alignedWith = true, want false when libraries_by_id is stale")
+		}
+	})
+
+	t.Run("missing org projection trips drift", func(t *testing.T) {
+		c := makeAligned()
+		c.OrgProjection = syncAdminProjectionCanary{}
+		if c.alignedWith("target-head") {
+			t.Fatal("alignedWith = true, want false when org projection is missing")
+		}
+	})
+
+	t.Run("missing owner projection trips drift", func(t *testing.T) {
+		c := makeAligned()
+		c.OwnerProjection = syncAdminProjectionCanary{}
+		if c.alignedWith("target-head") {
+			t.Fatal("alignedWith = true, want false when owner projection is missing")
+		}
+	})
+
+	t.Run("missing global projection trips drift", func(t *testing.T) {
+		c := makeAligned()
+		c.GlobalProjection = syncAdminProjectionCanary{}
+		if c.alignedWith("target-head") {
+			t.Fatal("alignedWith = true, want false when global projection is missing")
+		}
+	})
+
+	t.Run("drifted org projection size trips drift", func(t *testing.T) {
+		c := makeAligned()
+		c.OrgProjection.SizeBytes++
+		if c.alignedWith("target-head") {
+			t.Fatal("alignedWith = true, want false when org projection size drifted")
+		}
+	})
+
+	t.Run("drifted owner projection file_count trips drift", func(t *testing.T) {
+		c := makeAligned()
+		c.OwnerProjection.FileCount++
+		if c.alignedWith("target-head") {
+			t.Fatal("alignedWith = true, want false when owner projection file count drifted")
+		}
+	})
+
+	t.Run("drifted global projection updated_at trips drift", func(t *testing.T) {
+		c := makeAligned()
+		c.GlobalProjection.UpdatedAt = c.GlobalProjection.UpdatedAt.Add(time.Millisecond)
+		if c.alignedWith("target-head") {
+			t.Fatal("alignedWith = true, want false when global projection updated_at drifted")
+		}
+	})
+
+	t.Run("drifted owner_id on global projection trips drift", func(t *testing.T) {
+		c := makeAligned()
+		c.GlobalProjection.OwnerID = "other-owner"
+		if c.alignedWith("target-head") {
+			t.Fatal("alignedWith = true, want false when global projection owner_id drifted")
+		}
+	})
+}
+
+// TestHandleSyncHeadIdempotentSuccess verifies the response contract for the
+// idempotent fast-path: 200 when the canary repair confirms no drift (or
+// successfully repairs it), and 503 + Retry-After when the repair itself
+// fails so the client retries instead of silently treating the partially-
+// converged state as a final success. The handler dispatches the repair
+// function via repairSyncHeadDerivedStateIfDriftedFn, which the test injects
+// directly so this contract can be exercised without a real DB session.
+func TestHandleSyncHeadIdempotentSuccess(t *testing.T) {
+	makeHandler := func(repair func(orgID, repoID, targetHead string) error) *SyncHandler {
+		return &SyncHandler{
+			repairSyncHeadDerivedStateIfDriftedFn: repair,
+		}
+	}
+
+	mountTestRoute := func(h *SyncHandler) *gin.Engine {
+		r := setupSyncTestRouter()
+		r.GET("/test/:repo_id/idempotent/:head", func(c *gin.Context) {
+			h.handleSyncHeadIdempotentSuccess(c, c.GetString("org_id"), c.Param("repo_id"), c.Param("head"), "test")
+		})
+		return r
+	}
+
+	t.Run("returns 200 without Retry-After when canary repair succeeds", func(t *testing.T) {
+		calls := 0
+		var capturedArgs struct {
+			orgID, repoID, targetHead string
+		}
+		h := makeHandler(func(orgID, repoID, targetHead string) error {
+			calls++
+			capturedArgs.orgID = orgID
+			capturedArgs.repoID = repoID
+			capturedArgs.targetHead = targetHead
+			return nil
+		})
+		r := mountTestRoute(h)
+
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/test/lib-1/idempotent/target-head", nil)
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200; body=%s", w.Code, w.Body.String())
+		}
+		if got := w.Header().Get("Retry-After"); got != "" {
+			t.Fatalf("Retry-After = %q, want empty on success", got)
+		}
+		if calls != 1 {
+			t.Fatalf("repair calls = %d, want 1", calls)
+		}
+		if capturedArgs.orgID != "00000000-0000-0000-0000-000000000001" || capturedArgs.repoID != "lib-1" || capturedArgs.targetHead != "target-head" {
+			t.Fatalf("repair received org=%q repo=%q head=%q, want propagation from handler context", capturedArgs.orgID, capturedArgs.repoID, capturedArgs.targetHead)
+		}
+	})
+
+	t.Run("returns 503 with Retry-After when canary repair fails", func(t *testing.T) {
+		h := makeHandler(func(string, string, string) error {
+			return errors.New("repair failed")
+		})
+		r := mountTestRoute(h)
+
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/test/lib-1/idempotent/target-head", nil)
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusServiceUnavailable {
+			t.Fatalf("status = %d, want 503; body=%s", w.Code, w.Body.String())
+		}
+		if got := w.Header().Get("Retry-After"); got != "1" {
+			t.Fatalf("Retry-After = %q, want 1", got)
+		}
+		if !strings.Contains(w.Body.String(), "sync head publish derived state repair pending") {
+			t.Fatalf("body = %q, want canary-repair-pending error", w.Body.String())
+		}
+	})
+
+	t.Run("falls back to method dispatch when no test hook is set", func(t *testing.T) {
+		// When repairSyncHeadDerivedStateIfDriftedFn is nil the dispatcher
+		// falls back to h.repairSyncHeadDerivedStateIfDrifted, which calls
+		// h.db. A nil-db handler produces a panic. We don't want the test
+		// to panic; instead this assertion documents the dispatch path:
+		// any production deployment must arrive with a non-nil DB, so the
+		// nil-hook case is the production path and reaches the real method.
+		h := &SyncHandler{}
+		if h.repairSyncHeadDerivedStateIfDriftedFn != nil {
+			t.Fatal("default handler must have nil repair hook so production dispatch hits the method")
 		}
 	})
 }

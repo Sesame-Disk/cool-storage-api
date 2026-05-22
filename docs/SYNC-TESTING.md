@@ -9,6 +9,19 @@ This guide explains how to test the Seafile desktop sync protocol using the cont
 Run the full sync protocol test suite with a single command:
 
 ```bash
+# Docker-native single-client sync suite
+docker compose --profile test run --rm --build sync-test
+
+# Verbose docker-native single-client run
+docker compose --profile test run --rm --build -e SYNC_TEST_ARGS=--verbose sync-test
+
+# Unified wrapper: runs sync-test first, then the active-active desktop conflict harness
+# and stops on the first failing suite by default
+./scripts/test.sh sync
+
+# Keep going after a failing suite if you want the full sync matrix
+./scripts/test.sh sync --keep-going
+
 # Run all tests (creates libraries, syncs, verifies, cleans up)
 ./scripts/test-sync.sh
 
@@ -23,25 +36,58 @@ Run the full sync protocol test suite with a single command:
 ```
 
 The test suite covers:
-- **Unencrypted sync**: Remote→Local file sync
-- **Encrypted sync**: Remote→Local with password-protected libraries
+- **Unencrypted sync**: Remote→Local and Local→Remote file sync
+- **Encrypted sync**: Remote→Local plus Local→Remote remote-presence verification for password-protected libraries
 - **Multiple files**: Batch file sync verification
 - **Large files**: 64KB+ files (multi-block)
 - **Binary files**: Non-text content integrity
 - **File modifications**: Update existing files
 - **Subdirectory sync**: Nested folder structures
 
+These checks are functional single-client sync scenarios. They do not currently
+prove active-active conflict recovery for `PUT /seafhttp/repo/:repo_id/commit/HEAD`
+or `POST /seafhttp/repo/:repo_id/update-branch` under multi-node contention.
+
+For real desktop-client active-active coverage, run:
+
+```bash
+# Both real-client active-active scenarios (default)
+bash ./scripts/test-sync-active-active.sh
+
+# Only the safe non-overlapping auto-merge path
+bash ./scripts/test-sync-active-active.sh --scenario safe-auto-merge
+
+# Only the unsafe same-path 503 preservation path
+bash ./scripts/test-sync-active-active.sh --scenario unsafe-503
+```
+
+That harness now proves both:
+- non-overlapping concurrent writes that auto-merge after an observed `parent mismatch`
+- same-path concurrent writes that fail closed with retry-budget `503` while both local edits remain preserved on the clients
+
+`docker compose --profile test run --rm --build sync-test` is the preferred
+Docker-native entry point. It runs the real `scripts/test-sync.sh` suite inside
+the `docker/seafile-cli` image with fresh dedicated client config/data volumes
+on each run. `./scripts/test.sh sync` is the convenience wrapper for that same
+flow; it prefers `sync-test` automatically, then runs the active-active desktop
+conflict harness, and only falls back to the long-lived debug `seafile-cli`
+container path when needed. By default it stops at the first failing suite;
+use `--keep-going` if you want it to continue after a failure.
+
 ### Manual Testing
 
 ```bash
-# Start all services including seafile-cli
-docker-compose up -d
+# Start the backend
+docker compose up -d sesamefs
+
+# Start seafile-cli only when you want manual control
+docker compose --profile debug up -d --build seafile-cli
 
 # Enter the seafile-cli container
-docker exec -it cool-storage-api-seafile-cli-1 bash
+docker exec -it sesamefs-seafile-cli-1 bash
 
 # Or run commands directly
-docker exec -it cool-storage-api-seafile-cli-1 seaf-test.sh help
+docker exec -it sesamefs-seafile-cli-1 seaf-test.sh help
 ```
 
 ## Available Commands
@@ -73,14 +119,14 @@ docker-compose up -d
 ### 2. Initialize and Start Seafile Client
 
 ```bash
-docker exec -it cool-storage-api-seafile-cli-1 seaf-test.sh init
-docker exec -it cool-storage-api-seafile-cli-1 seaf-test.sh start
+docker exec -it sesamefs-seafile-cli-1 seaf-test.sh init
+docker exec -it sesamefs-seafile-cli-1 seaf-test.sh start
 ```
 
 ### 3. List Remote Libraries
 
 ```bash
-docker exec -it cool-storage-api-seafile-cli-1 seaf-test.sh list-remote
+docker exec -it sesamefs-seafile-cli-1 seaf-test.sh list-remote
 ```
 
 Example output:
@@ -98,19 +144,19 @@ Example output:
 
 ```bash
 # Using library ID from the list
-docker exec -it cool-storage-api-seafile-cli-1 seaf-test.sh sync abc12345-1234-5678-abcd-1234567890ab
+docker exec -it sesamefs-seafile-cli-1 seaf-test.sh sync abc12345-1234-5678-abcd-1234567890ab
 ```
 
 ### 5. Check Sync Status
 
 ```bash
-docker exec -it cool-storage-api-seafile-cli-1 seaf-test.sh status
+docker exec -it sesamefs-seafile-cli-1 seaf-test.sh status
 ```
 
 ### 6. View Logs
 
 ```bash
-docker exec -it cool-storage-api-seafile-cli-1 seaf-test.sh logs
+docker exec -it sesamefs-seafile-cli-1 seaf-test.sh logs
 ```
 
 ## Testing Encrypted Libraries
@@ -119,11 +165,12 @@ To sync an encrypted library, you need to provide the library password. The seaf
 
 ```bash
 # Direct seaf-cli command for encrypted library
-docker exec -it cool-storage-api-seafile-cli-1 seaf-cli sync \
+docker exec -it sesamefs-seafile-cli-1 seaf-cli sync \
   -l <library-id> \
   -s http://sesamefs:8080 \
   -d /seafile-data/<library-id> \
-  -T <token> \
+  -u 00000000-0000-0000-0000-000000000001 \
+  -p dev-token-123 \
   -e <library-password>
 ```
 
@@ -132,7 +179,7 @@ docker exec -it cool-storage-api-seafile-cli-1 seaf-cli sync \
 ### Check Client Logs
 
 ```bash
-docker exec -it cool-storage-api-seafile-cli-1 cat /home/seafuser/.ccnet/logs/seafile.log
+docker exec -it sesamefs-seafile-cli-1 cat /home/seafuser/.ccnet/logs/seafile.log
 ```
 
 ### Check Server Logs
@@ -153,7 +200,7 @@ docker-compose logs sesamefs
 
 ```bash
 # Get token
-TOKEN=$(docker exec -it cool-storage-api-seafile-cli-1 seaf-test.sh get-token)
+TOKEN=$(docker exec -it sesamefs-seafile-cli-1 seaf-test.sh get-token)
 
 # Test HEAD commit
 curl -H "Authorization: Token $TOKEN" http://localhost:8080/seafhttp/repo/<repo_id>/commit/HEAD
@@ -243,7 +290,7 @@ docker-compose logs seafile-cli
 
 ```bash
 # Test network connectivity
-docker exec -it cool-storage-api-seafile-cli-1 curl http://sesamefs:8080/ping
+docker exec -it sesamefs-seafile-cli-1 curl http://sesamefs:8080/ping
 
 # Should return: {"message":"pong"}
 ```
@@ -251,12 +298,25 @@ docker exec -it cool-storage-api-seafile-cli-1 curl http://sesamefs:8080/ping
 ### Auth Token Failed
 
 ```bash
-# Test auth endpoint directly
-docker exec -it cool-storage-api-seafile-cli-1 curl -X POST \
-  http://sesamefs:8080/api2/auth-token/ \
+# Get a fresh token from the test helper
+docker exec -it sesamefs-seafile-cli-1 seaf-test.sh get-token
+
+# Or request one directly
+curl -X POST http://localhost:8080/api2/auth-token/ \
   -d "username=00000000-0000-0000-0000-000000000001" \
   -d "password=dev-token-123"
 ```
+
+### Current Multi-Instance Coverage Gaps
+
+- Multi-instance quota-race coverage now exists for concurrent per-user storage
+  quota enforcement, but broader coverage is still missing for 3-node races,
+  org-level quota contention, and quota rejection during auto-merge.
+- The real desktop-client harness still does not cover quota rejection during
+  auto-merge or deeper-tree active-active conflict branches.
+- Handler-level integration proof now covers both `PUT /commit/HEAD` and
+  `POST /update-branch` for same-tree idempotence, non-overlapping auto-merge,
+  unmergeable `503`, and missing-current-head guards.
 
 ## Comparing Local vs Reference Server
 

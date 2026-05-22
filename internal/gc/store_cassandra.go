@@ -1561,18 +1561,18 @@ func (s *CassandraStore) ReconcilePendingStorageCounters() (int, error) {
 
 	expected := make(map[string]traffic.StorageSnapshot, len(requests))
 	libIter := s.db.Session().Query(`
-		SELECT org_id, library_id, owner_id, deleted_at FROM libraries
+		SELECT org_id, owner_id, size_bytes, file_count, deleted_at FROM libraries
 	`).Iter()
 
-	var libOrgIDStr, libraryIDStr, libraryOwnerIDStr string
+	var libOrgIDStr, libraryOwnerIDStr string
+	var sizeBytes, fileCount int64
 	var deletedAt time.Time
-	for libIter.Scan(&libOrgIDStr, &libraryIDStr, &libraryOwnerIDStr, &deletedAt) {
+	for libIter.Scan(&libOrgIDStr, &libraryOwnerIDStr, &sizeBytes, &fileCount, &deletedAt) {
 		if !deletedAt.IsZero() {
 			continue
 		}
 
-		libScope := traffic.LibraryStorageScope(libOrgIDStr, libraryIDStr)
-		libSnapshot := traffic.ReadStorageSnapshot(s.db, libScope)
+		libSnapshot := traffic.StorageSnapshot{BytesUsed: sizeBytes, FileCount: fileCount}
 		if libSnapshot.BytesUsed == 0 && libSnapshot.FileCount == 0 {
 			continue
 		}

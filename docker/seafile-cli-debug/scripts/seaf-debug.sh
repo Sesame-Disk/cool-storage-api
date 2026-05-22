@@ -108,7 +108,7 @@ cmd_stop() {
 
 # Get auth token (capture auth flow)
 cmd_get_token() {
-    log_capture "Capturing auth-token request..."
+    log_capture "Capturing auth-token request..." >&2
 
     response=$(pcurl -s -X POST "$SEAF_SERVER/api2/auth-token/" \
         --data-urlencode "username=$SEAF_USER" \
@@ -117,11 +117,11 @@ cmd_get_token() {
     token=$(echo "$response" | jq -r '.token // empty')
 
     if [ -z "$token" ]; then
-        log_error "Failed to get token: $response"
+        log_error "Failed to get token: $response" >&2
         return 1
     fi
 
-    log_info "Got token: ${token:0:20}..."
+    log_info "Got token: ${token:0:20}..." >&2
     echo "$token"
 }
 
@@ -525,12 +525,6 @@ cmd_capture_all() {
 # Run seaf-cli through proxy (for sync testing)
 cmd_sync_with_capture() {
     repo_id="${1:-$KNOWN_LIBRARY}"
-    token="${2:-$SEAF_TOKEN}"
-
-    if [ -z "$token" ]; then
-        token=$(cmd_get_token)
-    fi
-
     log_section "SYNC WITH CAPTURE"
 
     # Initialize
@@ -557,7 +551,8 @@ cmd_sync_with_capture() {
         -l "$repo_id" \
         -s "$SEAF_SERVER" \
         -d "$local_dir" \
-        -T "$token"
+        -u "$SEAF_USER" \
+        -p "$SEAF_PASS"
 
     log_info "Sync initiated. Waiting for completion..."
     sleep 10

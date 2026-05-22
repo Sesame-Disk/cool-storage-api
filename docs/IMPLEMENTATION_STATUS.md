@@ -1,31 +1,32 @@
 # Implementation Status - SesameFS
 
-**Last Updated**: 2026-04-09
+**Last Updated**: 2026-05-20
 
 ---
 
 ## Project Completeness Summary
 
-**Overall Production Readiness**: ~87%
+**Overall Production Readiness**: ~86%
 
 | Area | Completeness | Notes |
 |------|--------------|-------|
-| Sync Protocol (Desktop) | 100% ✅ | 🔒 FROZEN - Working perfectly |
+| Sync Protocol (Desktop) | ~90% | Functional sync scenarios pass, and the current hardening scope is baseline-verified for active-active HEAD-conflict recovery. Broader scenario coverage remains follow-up test debt. |
 | Core Backend API | ~98% | GC ✅, OIDC ✅, Library Settings ✅, Monitoring ✅, Quotas ✅, Plans/Permissions Phase 1+2 ✅, org storage policy backend base ✅ |
 | Admin Panels | ~95% | Superadmin ✅, Org Admin ✅, both at parity. Audit logs pending |
 | Frontend UI | ~85% | All 122 modals migrated ✅, File History UI ✅, permission UI (~75% with granular flags), ~51 ModalPortal wrappers to clean up, Phase 3 quota/plan UI in progress |
 | Authentication | ~90% | OIDC Phase 1 complete, JWT revocation hardened (2026-03-31), and user API keys now cover desktop/CLI/automation auth in OIDC-only deployments. Device Flow and service-account flows remain future enhancements. |
 | Production Infrastructure | ✅ ~97% | GC ✅, Monitoring ✅, Health checks ✅, Structured logging ✅, Frontend/Backend separation ✅, Nginx production hardening ✅ |
 
-**Production Blockers (verified against code 2026-04-09)**:
+**Production Blockers (verified against code 2026-05-20)**:
 1. ~~OIDC Authentication~~ - ✅ COMPLETE (Phase 1 - Basic Login)
 2. ~~Garbage Collection~~ - ✅ COMPLETE (Queue worker + scanner + admin API)
 3. ~~Monitoring/Health Checks~~ - ✅ COMPLETE (slog logging, `/health`, `/ready`, `/metrics`)
 4. ~~Frontend/Backend Separation~~ - ✅ COMPLETE (2026-03-30/31) — separate React/nginx container, bootstrap API, nginx production hardening
 5. ~~Programmatic Auth (PATs)~~ - ✅ COMPLETE — user API keys ship via `/api/v2.1/api-keys/`, and `/api2/auth-token/` now exchanges `email + API key` for desktop/CLI tokens. Device Flow remains optional future work.
-6. **GC Multi-Instance Safety** - ✅ BASELINE HARDENED — GC now defaults off in YAML, activates explicitly via `GC_ENABLED=true`, and enabled replicas coordinate through a Cassandra LWT lease. Multi-region guidance still remains: enable GC in exactly one DC.
-7. ~~Quota Period Rollover~~ - ✅ COMPLETE — Period rollover job advances expired org quota periods and keeps monthly traffic enforcement moving
-8. **Production Multi-Region Topology** - ⚠️ PARTIAL — region-aware library selection/read/write routing is implemented and covered by focused integration tests, and org-level create-time residency policy now exists in the backend. The stock production config/compose files still ship as single-region examples, and per-region `classes`, `endpoint_regions`, ingress host preservation, rollout, migration, and frontend policy controls remain operator work.
+6. ~~Desktop sync active-active conflict recovery~~ - ✅ BASELINE VERIFIED for the current hardening scope. `PUT /seafhttp/repo/:repo_id/commit/HEAD` and `POST /seafhttp/repo/:repo_id/update-branch` now use parent-chain validation, CAS, bounded retry, ancestry-gated server-side auto-merge for safe stale siblings, and `503 + Retry-After` fail-closed responses for unsafe conflicts. `scripts/test-sync-active-active.sh` now proves both the non-overlapping concurrent-write race with observed `parent mismatch` plus `auto-merge`, and the same-path unsafe-conflict path with observed retry-budget `503` while both desktop clients preserve their divergent local edits. Broader scenario coverage remains follow-up test debt rather than a current blocker.
+7. **GC Multi-Instance Safety** - ✅ BASELINE HARDENED — GC now defaults off in YAML, activates explicitly via `GC_ENABLED=true`, and enabled replicas coordinate through a Cassandra LWT lease. Multi-region guidance still remains: enable GC in exactly one DC.
+8. ~~Quota Period Rollover~~ - ✅ COMPLETE — Period rollover job advances expired org quota periods and keeps monthly traffic enforcement moving
+9. **Production Multi-Region Topology** - ⚠️ PARTIAL — region-aware library selection/read/write routing is implemented and covered by focused integration tests, and org-level create-time residency policy now exists in the backend. The stock production config/compose files still ship as single-region examples, and per-region `classes`, `endpoint_regions`, ingress host preservation, rollout, migration, and frontend policy controls remain operator work.
 
 ---
 
@@ -49,7 +50,7 @@
 
 | Component | Status | Stability | Protocol Tested | Last Verified | Notes |
 |-----------|--------|-----------|-----------------|---------------|-------|
-| **Sync Protocol (Desktop Client)** | 🔒 FROZEN | **STABLE** | ✅ Yes | 2026-01-16 | Both comparison + real client tests pass |
+| **Sync Protocol (Desktop Client)** | ✅ COMPLETE | Mostly stable | ✅ Yes | 2026-05-20 | Functional and comparison tests pass; the real-client active-active harness now proves both the non-overlapping auto-merge race and the same-path fail-closed `503` preservation path, with broader scenario coverage remaining as follow-up debt |
 | **Encrypted Libraries (PBKDF2)** | 🔒 FROZEN | **STABLE** | ✅ Yes | 2026-02-04 | 90.8% unit coverage, 39 tests. Test vectors verified. |
 | **File Block Encryption (AES-256-CBC)** | ✅ COMPLETE | Mostly stable | ⚠️ Partial | 2026-01-09 | Works with desktop client |
 | **Block Storage (S3)** | ✅ COMPLETE | Mostly stable | ⚠️ Partial | 2026-02-16 | SHA-1→SHA-256 mapping working. Custom HTTP transport (64 conn/host, 128KB buffers). |
@@ -101,9 +102,9 @@
 
 ## Protocol Endpoints (Seafile Compatibility)
 
-### Sync Protocol (`/seafhttp/`) - 🔒 FROZEN
+### Sync Protocol (`/seafhttp/`) - Compatibility-Sensitive
 
-**DO NOT MODIFY** these endpoints without explicit user request or desktop client breakage.
+Functional coverage exists, but active-active desktop conflict recovery is still an open validation gap. Changes here should preserve Seafile client compatibility and carry focused regression coverage.
 
 | Endpoint | Status | Stability | Last Verified | Critical Details |
 |----------|--------|-----------|---------------|------------------|
@@ -475,6 +476,9 @@ cd docker/seafile-cli-debug && ./run-sync-comparison.sh
 # Real desktop client test (for sync endpoints)
 cd docker/seafile-cli-debug && ./run-real-client-sync.sh
 
+# Real desktop client active-active proof (two clients, two backend nodes)
+bash ./scripts/test-sync-active-active.sh
+
 # Unit tests (for all components)
 go test ./...
 ```
@@ -511,9 +515,10 @@ These MUST be completed before production deployment:
 
 ## Next Priorities (Post-Blockers)
 
-### Priority 1: Desktop Client Compatibility ✅ COMPLETE
+### Priority 1: Desktop Client Compatibility - Functional, But Not Yet Desktop-GA-Safe
 
-- Sync protocol working perfectly (7 test scenarios, 100% success)
+- Sync protocol functional scenarios pass (7 core test scenarios)
+- Active-active desktop HEAD-conflict recovery still needs explicit proof before calling desktop sync production-safe
 - "View on Cloud" feature implemented (2026-01-18)
 
 ### Priority 2: Frontend Polish
@@ -579,29 +584,30 @@ These MUST be completed before production deployment:
 
 ## Metrics
 
-**Last Updated**: 2026-04-06
+**Last Updated**: 2026-05-20
 
 | Metric | Value | Notes |
 |--------|-------|-------|
-| Sync Protocol Endpoints | 13/13 (100%) | All frozen ✅ |
+| Sync Protocol Endpoints | 13/13 (100%) | Endpoint surface implemented; active-active desktop conflict recovery still open |
 | REST API Endpoints (Core) | ~60/62 (97%) | Missing: monitored-repos, audit logs. New: 5 custom share permission endpoints |
 | Superadmin Endpoints | ~90+ | Libraries, links, users, groups, orgs, departments, address book, group-owned libs |
 | Org Admin Endpoints | ~50+ | Full panel: users, groups, repos, trash, departments, links, address book |
 | Frontend Components | ~85% complete | All modals migrated, permission-aware uploaders, ~51 ModalPortal wrappers to clean up |
-| Desktop Client Compatibility | ✅ Working | Both tests passing |
+| Desktop Client Compatibility | ⚠️ Functional coverage only | Core sync scenarios pass, but active-active HEAD-conflict recovery for desktop sync is still unproven end-to-end |
 | Test Coverage (Go) | ~30% overall | chunker 79%, crypto 90.8%, config 73%, auth 56%, health 100% |
 | Integration Tests | 335+ tests | All passing (incl. OIDC, GC, file preview) |
 | Frontend Tests | 165+ tests | 7 test files (incl. OIDC API) |
 | Documentation Coverage | ~85% | Core API, deploy, migration, testing, architecture, and admin feature docs exist. Missing: end-user guides and deeper operational runbooks. |
 
 **Stability Breakdown**:
-- 🔒 FROZEN: ~22 components (sync protocol, encryption, OnlyOffice, monitoring/health)
+- 🔒 FROZEN: ~21 components (encryption, OnlyOffice, monitoring/health)
 - ✅ COMPLETE: ~45 components (CRUD, sharing, groups, tags, batch ops, OIDC, GC, monitoring, admin panels, org admin, custom share permissions)
 - 🟡 PARTIAL: ~15 components (frontend UI, permission UI, org admin stubs)
 - ❌ TODO: ~2 components (audit logs, monitored-repos)
 
 **Production Readiness**:
-- Backend: ~98% (core auth blocker complete, both admin panels implemented; GC multi-instance safety still needs a real distributed lease beyond the temporary `GC_ENABLED` guard)
+- Backend: ~98% for web/API surfaces (core auth blocker complete, both admin panels implemented; GC multi-instance safety still needs a real distributed lease beyond the temporary `GC_ENABLED` guard)
+- Desktop sync: not yet ready to call fully production-safe for active-active multi-node deployments until HEAD-conflict recovery is explicitly proven or hardened
 - Frontend: ~85% (modals done, granular permission flags enforced, missing: some permission UI edge cases, ~51 ModalPortal wrapper cleanup)
 - Infrastructure: ~95% (monitoring ✅, health checks ✅, GC ✅)
 - Documentation: ~85% (deployment, migration, testing, API, architecture, and feature docs exist; missing: end-user guides and operational admin runbooks)

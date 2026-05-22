@@ -11,7 +11,7 @@
 # Categories:
 #   api           Run API integration tests (permissions, file-ops, batch, etc.)
 #   oidc          Run OIDC authentication tests (config, login, logout, sessions)
-#   sync          Run Seafile sync protocol tests (requires seafile-cli)
+#   sync          Run Seafile sync protocol tests plus the active-active desktop conflict proof
 #   multiregion   Run multi-region tests (requires multi-region setup)
 #   failover      Run failover tests (requires multi-region setup)
 #   go            Run Go unit tests
@@ -24,6 +24,7 @@
 # Options:
 #   --quick       Run quick tests only (skip long-running tests)
 #   --verbose     Show detailed output
+#   --keep-going  Continue running remaining categories/suites after a failure
 #   --list        List available tests without running
 #   --help        Show this help message
 #
@@ -31,13 +32,13 @@
 #   ./scripts/test.sh                    # Run API tests (default)
 #   ./scripts/test.sh api                # Run API integration tests
 #   ./scripts/test.sh api --quick        # Run quick API tests only
-#   ./scripts/test.sh sync               # Run sync protocol tests
+#   ./scripts/test.sh sync               # Run sync protocol tests + active-active proof
 #   ./scripts/test.sh go                 # Run Go unit tests
 #   ./scripts/test.sh all                # Run all tests
 #
 # Requirements by category:
 #   api         - Backend running (docker compose up -d)
-#   sync        - Backend + seafile-cli container
+#   sync        - Backend on localhost:8080 + seafile-cli container
 #   multiregion - Multi-region stack (./scripts/bootstrap.sh multiregion)
 #   failover    - Multi-region stack + host docker access
 #   go          - Docker compose test profile
@@ -69,7 +70,7 @@ QUICK_MODE=false
 VERBOSE=false
 LIST_ONLY=false
 COMPOSE_BUILD=true
-FAIL_FAST=false
+FAIL_FAST=true
 
 # Parse arguments
 CATEGORY=""
@@ -80,6 +81,9 @@ for arg in "$@"; do
             ;;
         --verbose|-v)
             VERBOSE=true
+            ;;
+        --keep-going|--no-fail-fast)
+            FAIL_FAST=false
             ;;
         --list)
             LIST_ONLY=true
@@ -109,8 +113,15 @@ done
 # Default category
 CATEGORY="${CATEGORY:-api}"
 
-if [ "${SESAMEFS_FAIL_FAST:-0}" = "1" ]; then
-    FAIL_FAST=true
+if [ -n "${SESAMEFS_FAIL_FAST:-}" ]; then
+    case "${SESAMEFS_FAIL_FAST}" in
+        1|true|TRUE|yes|YES)
+            FAIL_FAST=true
+            ;;
+        0|false|FALSE|no|NO)
+            FAIL_FAST=false
+            ;;
+    esac
 fi
 
 # Helper functions
@@ -119,6 +130,28 @@ log_success() { echo -e "${GREEN}[PASS]${NC} $1"; }
 log_error() { echo -e "${RED}[FAIL]${NC} $1"; }
 log_warning() { echo -e "${YELLOW}[WARN]${NC} $1"; }
 log_section() { echo -e "\n${CYAN}=== $1 ===${NC}\n"; }
+
+create_temp_log() {
+    mktemp 2>/dev/null || mktemp -t sesamefs-test
+}
+
+print_failure_excerpt() {
+    local name="$1"
+    local log_file="$2"
+    local excerpt
+
+    [ -f "$log_file" ] || return 0
+
+    excerpt=$(grep -n -E -C 2 -- '--- FAIL:|^FAIL[[:space:]]|^\[FAIL\]|panic:|fatal error:' "$log_file" | tail -n 40 || true)
+    if [ -n "$excerpt" ]; then
+        log_error "$name failure excerpt:"
+        echo "$excerpt"
+        return 0
+    fi
+
+    log_error "$name output tail:"
+    tail -n 40 "$log_file" || true
+}
 
 cleanup_backend_test_repos() {
     if [ "${SESAMEFS_CLEAN_TEST_REPOS:-0}" != "1" ]; then
@@ -183,11 +216,83 @@ check_backend() {
     return 1
 }
 
-check_seafile_cli() {
-    local container="${CLI_CONTAINER:-cool-storage-api-seafile-cli-1}"
-    if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "$container"; then
+check_sync_backend() {
+    local url="${SESAMEFS_URL_LOCAL:-http://localhost:8080}"
+    if curl -s -f "$url/health" > /dev/null 2>&1; then
         return 0
     fi
+    return 1
+}
+
+resolve_seafile_cli_container() {
+    local container_name="${CLI_CONTAINER:-}"
+    local container_id=""
+
+    if [ -n "$container_name" ] && docker ps --format '{{.Names}}' 2>/dev/null | grep -Fxq "$container_name"; then
+        echo "$container_name"
+        return 0
+    fi
+
+    if check_docker_compose; then
+        container_id=$(docker compose ps -q seafile-cli 2>/dev/null | head -n1)
+        if [ -n "$container_id" ]; then
+            container_name=$(docker inspect --format '{{.Name}}' "$container_id" 2>/dev/null | sed 's#^/##')
+            if [ -n "$container_name" ]; then
+                echo "$container_name"
+                return 0
+            fi
+        fi
+    fi
+
+    container_name=$(docker ps --filter 'label=com.docker.compose.service=seafile-cli' --format '{{.Names}}' 2>/dev/null | head -n1)
+    if [ -n "$container_name" ]; then
+        echo "$container_name"
+        return 0
+    fi
+
+    container_name=$(docker ps --format '{{.Names}}' 2>/dev/null | grep -E '(^|-)seafile-cli-[0-9]+$' | head -n1 || true)
+    if [ -n "$container_name" ]; then
+        echo "$container_name"
+        return 0
+    fi
+
+    return 1
+}
+
+check_seafile_cli() {
+    local container_name=""
+    container_name=$(resolve_seafile_cli_container || true)
+    [ -n "$container_name" ]
+}
+
+ensure_seafile_cli() {
+    # --no-deps: backend readiness is already validated by check_sync_backend
+    # before this is called, so we skip recursive `depends_on` startup to keep
+    # the host fallback path fast. If seafile-cli ever gains real dependencies,
+    # drop --no-deps here.
+    local compose_args="--profile debug up -d --no-deps"
+
+    if check_seafile_cli; then
+        return 0
+    fi
+
+    if ! check_docker_compose; then
+        return 1
+    fi
+
+    if [ "$COMPOSE_BUILD" = true ]; then
+        compose_args="$compose_args --build"
+    fi
+
+    log_info "Auto-starting Seafile CLI container"
+    if ! docker compose $compose_args seafile-cli; then
+        return 1
+    fi
+
+    if check_seafile_cli; then
+        return 0
+    fi
+
     return 1
 }
 
@@ -246,6 +351,8 @@ run_compose_service() {
     local service="$1"
     local name="$2"
     local compose_args="--profile test run --rm"
+    local suite_status=0
+    local log_file=""
 
     TOTAL_SUITES=$((TOTAL_SUITES + 1))
 
@@ -262,15 +369,24 @@ run_compose_service() {
 
     log_info "docker compose $compose_args $service"
 
-    if docker compose $compose_args "$service"; then
+    cleanup_backend_test_state
+
+    log_file=$(create_temp_log)
+
+    if (set -o pipefail; docker compose $compose_args "$service" 2>&1 | tee "$log_file"); then
         PASSED_SUITES=$((PASSED_SUITES + 1))
         log_success "$name completed"
-        return 0
+    else
+        FAILED_SUITES=$((FAILED_SUITES + 1))
+        log_error "$name failed"
+        print_failure_excerpt "$name" "$log_file"
+        suite_status=1
     fi
 
-    FAILED_SUITES=$((FAILED_SUITES + 1))
-    log_error "$name failed"
-    return 1
+    [ -n "$log_file" ] && rm -f "$log_file"
+
+    cleanup_backend_test_state
+    return $suite_status
 }
 
 # Run a test suite
@@ -280,6 +396,7 @@ run_suite() {
     shift 2
     local args="$@"
     local suite_status=0
+    local log_file=""
 
     TOTAL_SUITES=$((TOTAL_SUITES + 1))
 
@@ -293,14 +410,18 @@ run_suite() {
     cleanup_backend_test_state
 
     if [ -f "$SCRIPT_DIR/$script" ]; then
-        if BASE_URL="${SESAMEFS_URL:-http://localhost:3000}" API_URL="${SESAMEFS_URL:-http://localhost:3000}" bash "$SCRIPT_DIR/$script" $args; then
+        log_file=$(create_temp_log)
+        if (set -o pipefail; BASE_URL="${SESAMEFS_URL:-http://localhost:3000}" API_URL="${SESAMEFS_URL:-http://localhost:3000}" bash "$SCRIPT_DIR/$script" $args 2>&1 | tee "$log_file"); then
             PASSED_SUITES=$((PASSED_SUITES + 1))
             log_success "$name completed"
         else
             FAILED_SUITES=$((FAILED_SUITES + 1))
             log_error "$name failed"
+            print_failure_excerpt "$name" "$log_file"
             suite_status=1
         fi
+
+        [ -n "$log_file" ] && rm -f "$log_file"
     else
         log_error "Script not found: $script"
         FAILED_SUITES=$((FAILED_SUITES + 1))
@@ -321,11 +442,22 @@ run_suite_with_policy() {
     return 0
 }
 
+run_category_with_policy() {
+    if ! "$@"; then
+        if [ "$FAIL_FAST" = true ]; then
+            log_error "Fail-fast enabled; stopping after first failing category"
+            return 1
+        fi
+    fi
+    return 0
+}
+
 # ==========================================================================
 # API Tests - Basic integration tests requiring only backend
 # ==========================================================================
 run_api_tests() {
     log_section "API Integration Tests"
+    local failed_before=$FAILED_SUITES
 
     if [ "${SESAMEFS_TEST_IN_CONTAINER:-0}" != "1" ] && check_docker_compose; then
         run_compose_service "api-test" "API Integration Tests"
@@ -375,7 +507,7 @@ run_api_tests() {
         log_info "Skipping encrypted library tests (--quick mode)"
     fi
 
-    [ "$FAILED_SUITES" -eq 0 ]
+    [ "$FAILED_SUITES" -eq "$failed_before" ]
 }
 
 # ==========================================================================
@@ -399,36 +531,108 @@ run_admin_tests() {
     [ "$QUICK_MODE" = true ] && args="--quick"
     [ "$VERBOSE" = true ] && args="$args --verbose"
 
-    run_suite "Admin API + Multi-Tenant" "test-admin-api.sh" $args || true
+    run_suite "Admin API + Multi-Tenant" "test-admin-api.sh" $args
 }
 
 # ==========================================================================
-# Sync Tests - Seafile CLI sync protocol tests
+# Sync Tests - Seafile CLI sync protocol tests and active-active proof
 # ==========================================================================
 run_sync_tests() {
     log_section "Sync Protocol Tests"
 
-    if ! check_backend; then
-        log_error "Backend not available"
+    if [ "${SESAMEFS_TEST_IN_CONTAINER:-0}" != "1" ] && check_docker_compose; then
+        local compose_args="--profile test run --rm"
+        local aa_args=""
+        local failed_before=$FAILED_SUITES
+
+        TOTAL_SUITES=$((TOTAL_SUITES + 1))
+
+        if [ "$LIST_ONLY" = true ]; then
+            echo "  - Sync Protocol Tests (sync-test)"
+            echo "  - Active-Active Desktop Conflicts (test-sync-active-active.sh)"
+            return 0
+        fi
+
+        log_section "Running: Sync Protocol Tests"
+
+        if [ "$COMPOSE_BUILD" = true ]; then
+            compose_args="$compose_args --build"
+        fi
+
+        if [ "$VERBOSE" = true ]; then
+            log_info "docker compose $compose_args -e SYNC_TEST_ARGS=--verbose sync-test"
+            if docker compose $compose_args -e SYNC_TEST_ARGS=--verbose sync-test; then
+                PASSED_SUITES=$((PASSED_SUITES + 1))
+                log_success "Sync Protocol Tests completed"
+            else
+                FAILED_SUITES=$((FAILED_SUITES + 1))
+                log_error "Sync Protocol Tests failed"
+                if [ "$FAIL_FAST" = true ]; then
+                    log_error "Fail-fast enabled; stopping after first failing suite"
+                    return 1
+                fi
+                log_warning "Continuing to Active-Active Desktop Conflicts (--keep-going)"
+            fi
+        else
+            log_info "docker compose $compose_args sync-test"
+            if docker compose $compose_args sync-test; then
+                PASSED_SUITES=$((PASSED_SUITES + 1))
+                log_success "Sync Protocol Tests completed"
+            else
+                FAILED_SUITES=$((FAILED_SUITES + 1))
+                log_error "Sync Protocol Tests failed"
+                if [ "$FAIL_FAST" = true ]; then
+                    log_error "Fail-fast enabled; stopping after first failing suite"
+                    return 1
+                fi
+                log_warning "Continuing to Active-Active Desktop Conflicts (--keep-going)"
+            fi
+        fi
+
+        [ "$VERBOSE" = true ] && aa_args="$aa_args --verbose"
+        [ "$COMPOSE_BUILD" = false ] && aa_args="$aa_args --no-build"
+
+        if ! run_suite_with_policy "Active-Active Desktop Conflicts" "test-sync-active-active.sh" $aa_args; then
+            return 1
+        fi
+
+        [ "$FAILED_SUITES" -eq "$failed_before" ]
+        return $?
+    fi
+
+    local sync_backend_url="${SESAMEFS_URL_LOCAL:-http://localhost:8080}"
+    local cli_container=""
+
+    if ! check_sync_backend; then
+        log_error "Backend not available at ${sync_backend_url}"
+        echo ""
+        echo "Start the backend with:"
+        echo "  docker compose up -d sesamefs"
         return 1
     fi
 
-    if ! check_seafile_cli; then
+    if ! ensure_seafile_cli; then
         log_warning "Seafile CLI container not running"
         echo ""
         echo "Start seafile-cli with:"
-        echo "  docker compose up -d seafile-cli"
+        echo "  docker compose --profile debug up -d --build seafile-cli"
         echo ""
         echo "Or skip sync tests with: ./scripts/test.sh api"
         return 1
     fi
 
-    log_success "Seafile CLI container is available"
+    cli_container=$(resolve_seafile_cli_container || true)
+    if [ -z "$cli_container" ]; then
+        log_error "Unable to resolve the Seafile CLI container name after startup"
+        return 1
+    fi
+
+    log_success "Seafile CLI container is available: ${cli_container}"
 
     local args=""
     [ "$VERBOSE" = true ] && args="--verbose"
 
-    run_suite "Sync Protocol" "test-sync.sh" $args || true
+    CLI_CONTAINER="$cli_container" SESAMEFS_URL_LOCAL="$sync_backend_url" run_suite "Sync Protocol" "test-sync.sh" $args
 }
 
 # ==========================================================================
@@ -436,6 +640,7 @@ run_sync_tests() {
 # ==========================================================================
 run_multiregion_tests() {
     log_section "Multi-Region Tests"
+    local failed_before=$FAILED_SUITES
 
     if ! check_multiregion; then
         log_warning "Multi-region stack not running"
@@ -448,9 +653,11 @@ run_multiregion_tests() {
 
     log_success "Multi-region stack is available"
 
-    run_suite "Multi-Region Connectivity" "test-multiregion.sh" "connectivity" || true
-    run_suite "Multi-Region Upload" "test-multiregion.sh" "upload" || true
-    run_suite "Multi-Region Routing" "test-multiregion.sh" "routing" || true
+    run_suite_with_policy "Multi-Region Connectivity" "test-multiregion.sh" "connectivity" || return 1
+    run_suite_with_policy "Multi-Region Upload" "test-multiregion.sh" "upload" || return 1
+    run_suite_with_policy "Multi-Region Routing" "test-multiregion.sh" "routing" || return 1
+
+    [ "$FAILED_SUITES" -eq "$failed_before" ]
 }
 
 # ==========================================================================
@@ -458,6 +665,7 @@ run_multiregion_tests() {
 # ==========================================================================
 run_failover_tests() {
     log_section "Failover Tests"
+    local failed_before=$FAILED_SUITES
 
     if ! check_multiregion; then
         log_warning "Multi-region stack not running"
@@ -473,16 +681,18 @@ run_failover_tests() {
         return 0
     fi
 
-    run_suite "Failover Setup" "test-failover.sh" "setup" || true
-    run_suite "Failover Upload" "test-failover.sh" "upload" || true
+    run_suite_with_policy "Failover Setup" "test-failover.sh" "setup" || return 1
+    run_suite_with_policy "Failover Upload" "test-failover.sh" "upload" || return 1
 
     if [ "$QUICK_MODE" = false ]; then
-        run_suite "Download Failover" "test-failover.sh" "download" || true
-        run_suite "Upload Failover" "test-failover.sh" "upload-fail" || true
-        run_suite "Recovery" "test-failover.sh" "recovery" || true
+        run_suite_with_policy "Download Failover" "test-failover.sh" "download" || return 1
+        run_suite_with_policy "Upload Failover" "test-failover.sh" "upload-fail" || return 1
+        run_suite_with_policy "Recovery" "test-failover.sh" "recovery" || return 1
     fi
 
-    run_suite "Failover Cleanup" "test-failover.sh" "cleanup" || true
+    run_suite_with_policy "Failover Cleanup" "test-failover.sh" "cleanup" || return 1
+
+    [ "$FAILED_SUITES" -eq "$failed_before" ]
 }
 
 # ==========================================================================
@@ -507,7 +717,7 @@ run_oidc_tests() {
     [ "$QUICK_MODE" = true ] && args="--quick"
     [ "$VERBOSE" = true ] && args="$args --verbose"
 
-    run_suite "OIDC Authentication" "test-oidc.sh" $args || true
+    run_suite "OIDC Authentication" "test-oidc.sh" $args
 }
 
 # ==========================================================================
@@ -530,6 +740,7 @@ run_go_tests() {
         else
             FAILED_SUITES=$((FAILED_SUITES + 1))
             log_error "Go tests failed"
+            return 1
         fi
         TOTAL_SUITES=$((TOTAL_SUITES + 1))
     else
@@ -553,8 +764,11 @@ EOF
         else
             FAILED_SUITES=$((FAILED_SUITES + 1))
             log_error "Go tests failed (Docker)"
+            return 1
         fi
     fi
+
+    return 0
 }
 
 # ==========================================================================
@@ -592,6 +806,7 @@ run_go_integration_tests() {
         else
             FAILED_SUITES=$((FAILED_SUITES + 1))
             log_error "Go integration tests failed"
+            return 1
         fi
     else
         log_info "Go not installed locally, using Docker..."
@@ -615,8 +830,11 @@ EOF
         else
             FAILED_SUITES=$((FAILED_SUITES + 1))
             log_error "Go integration tests failed (Docker)"
+            return 1
         fi
     fi
+
+    return 0
 }
 
 run_go_all_tests() {
@@ -664,7 +882,10 @@ run_frontend_tests() {
     else
         FAILED_SUITES=$((FAILED_SUITES + 1))
         log_error "Frontend tests failed"
+        return 1
     fi
+
+    return 0
 }
 
 run_mobile_tests() {
@@ -719,8 +940,9 @@ list_tests() {
     echo "  - Session Management"
     echo ""
 
-    echo "sync - Sync Protocol Tests (requires: backend + seafile-cli)"
+    echo "sync - Sync Protocol Tests + active-active desktop proof (requires: docker compose for the full path)"
     echo "  - Sync Protocol (test-sync.sh)"
+    echo "  - Active-Active Desktop Conflicts (test-sync-active-active.sh)"
     echo ""
 
     echo "multiregion - Multi-Region Tests (requires: multi-region stack)"
@@ -813,30 +1035,30 @@ main() {
             run_mobile_tests
             ;;
         all)
-            run_api_tests
-            run_oidc_tests
-            run_go_tests
+            run_category_with_policy run_api_tests || return 1
+            run_category_with_policy run_oidc_tests || return 1
+            run_category_with_policy run_go_tests || return 1
             if check_backend; then
-                run_go_all_tests
+                run_category_with_policy run_go_all_tests || return 1
             else
                 log_info "Skipping aggregated Go run (backend not available)"
             fi
-            run_frontend_tests
-            run_mobile_tests
+            run_category_with_policy run_frontend_tests || return 1
+            run_category_with_policy run_mobile_tests || return 1
             # Run Go integration tests if backend is available
             if check_backend; then
-                run_go_integration_tests
+                run_category_with_policy run_go_integration_tests || return 1
             else
                 log_info "Skipping Go integration tests (backend not available)"
             fi
             # Only run these if their prerequisites are met
-            if check_seafile_cli; then
-                run_sync_tests
+            if check_docker_compose || check_seafile_cli; then
+                run_category_with_policy run_sync_tests || return 1
             else
-                log_info "Skipping sync tests (seafile-cli not available)"
+                log_info "Skipping sync tests (docker compose and seafile-cli are not available)"
             fi
             if check_multiregion; then
-                run_multiregion_tests
+                run_category_with_policy run_multiregion_tests || return 1
             else
                 log_info "Skipping multiregion tests (stack not running)"
             fi

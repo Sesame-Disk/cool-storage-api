@@ -3,7 +3,7 @@
 # SesameFS Sync Protocol Test Script
 #
 # Tests Seafile CLI sync for both encrypted and unencrypted libraries.
-# Verifies bidirectional sync: local→remote and remote→local.
+# Verifies bidirectional sync: local->remote and remote->local.
 #
 # Usage:
 #   ./scripts/test-sync.sh              # Run all tests
@@ -20,12 +20,15 @@ set -e
 
 # Configuration
 SESAMEFS_URL="${SESAMEFS_URL:-http://sesamefs:8080}"
-SESAMEFS_URL_LOCAL="${SESAMEFS_URL_LOCAL:-http://localhost:8082}"
-DEV_TOKEN="${DEV_TOKEN:-dev-token-123}"
+SESAMEFS_URL_LOCAL="${SESAMEFS_URL_LOCAL:-http://localhost:8080}"
+DEV_API_TOKEN="${DEV_API_TOKEN:-dev-token-admin}"
+DEV_PASSWORD="${DEV_PASSWORD:-dev-token-123}"
 DEV_USER="${DEV_USER:-00000000-0000-0000-0000-000000000001}"
 ENCRYPTED_PASSWORD="${ENCRYPTED_PASSWORD:-testpass123}"
-CLI_CONTAINER="${CLI_CONTAINER:-cool-storage-api-seafile-cli-1}"
+CLI_CONTAINER="${CLI_CONTAINER:-sesamefs-seafile-cli-1}"
 SYNC_DATA_DIR="${SYNC_DATA_DIR:-/seafile-data}"
+SYNC_CONFIG_DIR="${SYNC_CONFIG_DIR:-/home/seafuser/.ccnet}"
+SYNC_TEST_IN_CONTAINER="${SYNC_TEST_IN_CONTAINER:-0}"
 
 # Colors for output
 RED='\033[0;31m'
@@ -69,14 +72,15 @@ while [[ $# -gt 0 ]]; do
       echo "Options:"
       echo "  --keep       Keep test libraries after completion"
       echo "  --verbose    Show detailed output"
-      echo "  --cleanup    Only cleanup previous test libraries"
+      echo "  --cleanup    Only cleanup previous sync/integration test libraries and active-active leftovers"
       echo "  --help       Show this help message"
       echo ""
       echo "Environment Variables:"
-      echo "  SESAMEFS_URL_LOCAL  API URL for local requests (default: http://localhost:8082)"
-      echo "  DEV_TOKEN           Auth token (default: dev-token-123)"
+      echo "  SESAMEFS_URL_LOCAL  API URL for local requests (default: http://localhost:8080)"
+      echo "  DEV_API_TOKEN       API bearer token (default: dev-token-admin)"
+      echo "  DEV_PASSWORD        seaf-cli password for auth-token exchange (default: dev-token-123)"
       echo "  ENCRYPTED_PASSWORD  Password for encrypted library (default: testpass123)"
-      echo "  CLI_CONTAINER       Docker container name (default: cool-storage-api-seafile-cli-1)"
+      echo "  CLI_CONTAINER       Docker container name (default: sesamefs-seafile-cli-1)"
       exit 0
       ;;
     *)
@@ -112,24 +116,48 @@ log_verbose() {
   fi
 }
 
+json_query() {
+  if command -v jq > /dev/null 2>&1; then
+    jq "$@"
+  else
+    docker exec -i "${CLI_CONTAINER}" jq "$@"
+  fi
+}
+
+sync_exec() {
+  if [ "$SYNC_TEST_IN_CONTAINER" = "1" ]; then
+    "$@"
+  else
+    docker exec "${CLI_CONTAINER}" "$@"
+  fi
+}
+
 # Check if required services are running
 check_services() {
   log "Checking required services..."
 
   # Check sesamefs API
-  if ! curl -s "${SESAMEFS_URL_LOCAL}/api/v2.1/repos/" -H "Authorization: Token ${DEV_TOKEN}" > /dev/null 2>&1; then
+  if ! curl -s "${SESAMEFS_URL_LOCAL}/api/v2.1/repos/" -H "Authorization: Token ${DEV_API_TOKEN}" > /dev/null 2>&1; then
     log_error "SesameFS API not responding at ${SESAMEFS_URL_LOCAL}"
     exit 1
   fi
   log_verbose "SesameFS API: OK"
 
-  # Check seafile-cli container
-  if ! docker ps --format '{{.Names}}' | grep -q "${CLI_CONTAINER}"; then
-    log_error "Seafile CLI container not running: ${CLI_CONTAINER}"
-    log "Start it with: docker-compose up -d seafile-cli"
-    exit 1
+  if [ "$SYNC_TEST_IN_CONTAINER" = "1" ]; then
+    if ! command -v seaf-cli > /dev/null 2>&1; then
+      log_error "seaf-cli binary not available inside the sync test container"
+      exit 1
+    fi
+    log_verbose "Seafile CLI tools: OK"
+  else
+    # Check seafile-cli container
+    if ! docker ps --format '{{.Names}}' | grep -q "${CLI_CONTAINER}"; then
+      log_error "Seafile CLI container not running: ${CLI_CONTAINER}"
+      log "Start it with: docker-compose up -d seafile-cli"
+      exit 1
+    fi
+    log_verbose "Seafile CLI container: OK"
   fi
-  log_verbose "Seafile CLI container: OK"
 
   log_success "All services running"
 }
@@ -138,12 +166,12 @@ check_services() {
 init_seafile_daemon() {
   log "Initializing Seafile daemon..."
 
-  docker exec "${CLI_CONTAINER}" seaf-cli init -d "${SYNC_DATA_DIR}" 2>/dev/null || true
-  docker exec "${CLI_CONTAINER}" seaf-cli start 2>/dev/null || true
+  sync_exec seaf-test.sh init > /dev/null 2>&1 || true
+  sync_exec seaf-test.sh start > /dev/null 2>&1 || true
   sleep 2
 
   # Verify daemon is running
-  if ! docker exec "${CLI_CONTAINER}" seaf-cli status > /dev/null 2>&1; then
+  if ! sync_exec seaf-test.sh status > /dev/null 2>&1; then
     log_error "Failed to start Seafile daemon"
     exit 1
   fi
@@ -164,12 +192,12 @@ create_library() {
 
   local response
   response=$(curl -s -X POST "${SESAMEFS_URL_LOCAL}/api2/repos/" \
-    -H "Authorization: Token ${DEV_TOKEN}" \
+    -H "Authorization: Token ${DEV_API_TOKEN}" \
     -H "Content-Type: application/x-www-form-urlencoded" \
     -d "${params}")
 
   local repo_id
-  repo_id=$(echo "$response" | jq -r '.repo_id // empty')
+  repo_id=$(echo "$response" | json_query -r '.repo_id // empty')
 
   if [ -z "$repo_id" ]; then
     echo "" >&2
@@ -188,7 +216,7 @@ delete_library() {
   log_verbose "Deleting library: ${repo_id}"
 
   curl -s -X DELETE "${SESAMEFS_URL_LOCAL}/api/v2.1/repos/${repo_id}/" \
-    -H "Authorization: Token ${DEV_TOKEN}" > /dev/null 2>&1 || true
+    -H "Authorization: Token ${DEV_API_TOKEN}" > /dev/null 2>&1 || true
 }
 
 # Unlock encrypted library
@@ -198,11 +226,11 @@ unlock_library() {
 
   local response
   response=$(curl -s -X POST "${SESAMEFS_URL_LOCAL}/api/v2.1/repos/${repo_id}/set-password/" \
-    -H "Authorization: Token ${DEV_TOKEN}" \
+    -H "Authorization: Token ${DEV_API_TOKEN}" \
     -H "Content-Type: application/x-www-form-urlencoded" \
     -d "password=${password}")
 
-  if ! echo "$response" | jq -e '.success' > /dev/null 2>&1; then
+  if ! echo "$response" | json_query -e '.success' > /dev/null 2>&1; then
     log_error "Failed to unlock library: $response"
     return 1
   fi
@@ -213,7 +241,7 @@ get_upload_link() {
   local repo_id="$1"
 
   curl -s "${SESAMEFS_URL_LOCAL}/api2/repos/${repo_id}/upload-link/?p=/" \
-    -H "Authorization: Token ${DEV_TOKEN}" | tr -d '"'
+    -H "Authorization: Token ${DEV_API_TOKEN}" | tr -d '"'
 }
 
 # Upload a file to library via API
@@ -236,7 +264,7 @@ upload_file_remote() {
     -F "file=@${local_path};filename=${remote_name}" \
     -F "parent_dir=/" \
     -F "relative_path=" \
-    -H "Authorization: Token ${DEV_TOKEN}" > /dev/null
+    -H "Authorization: Token ${DEV_API_TOKEN}" > /dev/null
 }
 
 # Sync library with seafile CLI
@@ -249,16 +277,15 @@ sync_library() {
   log_verbose "Syncing library: ${repo_id} to ${sync_dir}"
 
   # Create sync directory
-  docker exec "${CLI_CONTAINER}" mkdir -p "${sync_dir}"
+  sync_exec mkdir -p "${sync_dir}"
 
-  # Build sync command
-  local sync_cmd="seaf-cli sync -l ${repo_id} -s ${SESAMEFS_URL} -d ${sync_dir} -u ${DEV_USER} -p ${DEV_TOKEN}"
+  local sync_args=(seaf-cli sync -c "${SYNC_CONFIG_DIR}" -l "${repo_id}" -s "${SESAMEFS_URL}" -d "${sync_dir}" -u "${DEV_USER}" -p "${DEV_PASSWORD}")
   if [ "$encrypted" = "true" ]; then
-    sync_cmd="${sync_cmd} -e ${password}"
+    sync_args+=(-e "${password}")
   fi
 
   # Start sync
-  docker exec "${CLI_CONTAINER}" ${sync_cmd} 2>&1 || true
+  sync_exec "${sync_args[@]}" 2>&1 || true
 
   echo "${sync_dir}"
 }
@@ -267,7 +294,55 @@ sync_library() {
 desync_library() {
   local repo_id="$1"
 
-  docker exec "${CLI_CONTAINER}" seaf-cli desync -d "${SYNC_DATA_DIR}/sync-test-${repo_id}" 2>/dev/null || true
+  sync_exec seaf-cli desync -c "${SYNC_CONFIG_DIR}" -d "${SYNC_DATA_DIR}/sync-test-${repo_id}" 2>/dev/null || true
+}
+
+cleanup_repo_state() {
+  local repo_id="$1"
+
+  if [ -z "$repo_id" ]; then
+    return 0
+  fi
+
+  desync_library "$repo_id"
+  delete_library "$repo_id"
+  sync_exec rm -rf "${SYNC_DATA_DIR}/sync-test-${repo_id}" 2>/dev/null || true
+}
+
+cleanup_active_active_client_state() {
+  if [ "$SYNC_TEST_IN_CONTAINER" = "1" ] || ! command -v docker > /dev/null 2>&1; then
+    return 0
+  fi
+
+  for service in seafile-cli-aa-1 seafile-cli-aa-2; do
+    local container_id
+    container_id=$( (cd "$PROJECT_DIR" && docker compose ps -q "$service") 2>/dev/null | head -n1 || true )
+    [ -n "$container_id" ] || continue
+
+    local running
+    running=$(docker inspect --format '{{.State.Running}}' "$container_id" 2>/dev/null || echo "false")
+    [ "$running" = "true" ] || continue
+
+    docker exec "$container_id" /bin/bash -lc "
+      for dir in '${SYNC_DATA_DIR}'/active-active-*; do
+        [ -e \"\$dir\" ] || continue
+        seaf-cli desync -c '${SYNC_CONFIG_DIR}' -d \"\$dir\" > /dev/null 2>&1 || true
+        rm -rf \"\$dir\"
+      done
+    " > /dev/null 2>&1 || true
+  done
+}
+
+release_shared_test_libraries() {
+  if [ -n "$UNENCRYPTED_REPO_ID" ]; then
+    cleanup_repo_state "$UNENCRYPTED_REPO_ID"
+    UNENCRYPTED_REPO_ID=""
+  fi
+
+  if [ -n "$ENCRYPTED_REPO_ID" ]; then
+    cleanup_repo_state "$ENCRYPTED_REPO_ID"
+    ENCRYPTED_REPO_ID=""
+  fi
 }
 
 # Wait for sync to complete
@@ -280,7 +355,7 @@ wait_for_sync() {
   local waited=0
   while [ $waited -lt $max_wait ]; do
     local status
-    status=$(docker exec "${CLI_CONTAINER}" seaf-cli status 2>/dev/null | grep -E "^sync-test-" | head -1 | awk '{print $2}')
+    status=$(sync_exec seaf-cli status -c "${SYNC_CONFIG_DIR}" 2>/dev/null | grep -E "^sync-test-" | head -1 | awk '{print $2}')
 
     if [ "$status" = "synchronized" ]; then
       log_verbose "Sync completed"
@@ -298,7 +373,14 @@ wait_for_sync() {
 # Get file hash
 get_local_hash() {
   local file_path="$1"
-  shasum -a 256 "$file_path" 2>/dev/null | cut -d' ' -f1
+
+  if command -v shasum > /dev/null 2>&1; then
+    shasum -a 256 "$file_path" 2>/dev/null | cut -d' ' -f1
+  elif command -v sha256sum > /dev/null 2>&1; then
+    sha256sum "$file_path" 2>/dev/null | awk '{print $1}'
+  else
+    openssl dgst -sha256 "$file_path" 2>/dev/null | awk -F'= ' '{print $2}'
+  fi
 }
 
 get_remote_hash() {
@@ -308,7 +390,7 @@ get_remote_hash() {
 
   while [ $retry -lt $max_retries ]; do
     # Check if file exists first
-    if ! docker exec "${CLI_CONTAINER}" test -f "${file_path}" 2>/dev/null; then
+    if ! sync_exec test -f "${file_path}" 2>/dev/null; then
       retry=$((retry + 1))
       sleep 1
       continue
@@ -316,11 +398,11 @@ get_remote_hash() {
 
     # Get hash - try sha256sum first, fall back to openssl
     local hash
-    hash=$(docker exec "${CLI_CONTAINER}" sha256sum "${file_path}" 2>/dev/null | awk '{print $1}')
+    hash=$(sync_exec sha256sum "${file_path}" 2>/dev/null | awk '{print $1}')
 
     # If sha256sum failed, try openssl
     if [ -z "$hash" ]; then
-      hash=$(docker exec "${CLI_CONTAINER}" openssl dgst -sha256 "${file_path}" 2>/dev/null | awk -F'= ' '{print $2}')
+      hash=$(sync_exec openssl dgst -sha256 "${file_path}" 2>/dev/null | awk -F'= ' '{print $2}')
     fi
 
     if [ -n "$hash" ] && [ ${#hash} -eq 64 ]; then
@@ -344,7 +426,7 @@ get_local_size() {
 
 get_remote_size() {
   local file_path="$1"
-  docker exec "${CLI_CONTAINER}" wc -c "$file_path" 2>/dev/null | awk '{print $1}'
+  sync_exec wc -c "$file_path" 2>/dev/null | awk '{print $1}'
 }
 
 # Create test file with deterministic content (for verification)
@@ -370,9 +452,9 @@ create_test_file() {
 
 # Trigger a sync by restarting the daemon
 trigger_sync() {
-  docker exec "${CLI_CONTAINER}" seaf-cli stop 2>/dev/null || true
+  sync_exec seaf-cli stop -c "${SYNC_CONFIG_DIR}" 2>/dev/null || true
   sleep 1
-  docker exec "${CLI_CONTAINER}" seaf-cli start 2>/dev/null || true
+  sync_exec seaf-cli start -c "${SYNC_CONFIG_DIR}" 2>/dev/null || true
   sleep 3
 }
 
@@ -431,7 +513,6 @@ verify_file_integrity() {
     retry=$((retry + 1))
     log_verbose "Waiting for sync (attempt ${retry}/${max_retries})..."
     sleep "$retry_delay"
-    trigger_sync
   done
 
   log_verbose "File not synced after ${max_retries} attempts"
@@ -454,11 +535,11 @@ verify_api_download_integrity() {
     # Get download link
     local download_link
     download_link=$(curl -s "${SESAMEFS_URL_LOCAL}/api2/repos/${repo_id}/file/?p=${remote_path}" \
-      -H "Authorization: Token ${DEV_TOKEN}" | tr -d '"')
+      -H "Authorization: Token ${DEV_API_TOKEN}" | tr -d '"')
 
     if [ -n "$download_link" ] && [ "$download_link" != "null" ] && [[ "$download_link" == http* ]]; then
       # Download to temp file
-      if curl -s "$download_link" -H "Authorization: Token ${DEV_TOKEN}" -o "$temp_download" 2>/dev/null; then
+      if curl -s "$download_link" -H "Authorization: Token ${DEV_API_TOKEN}" -o "$temp_download" 2>/dev/null; then
         if [ -f "$temp_download" ] && [ -s "$temp_download" ]; then
           break
         fi
@@ -494,6 +575,47 @@ verify_api_download_integrity() {
   else
     log_verbose "API DOWNLOAD INTEGRITY FAILED"
     return 1
+  fi
+}
+
+verify_remote_entry_present() {
+  local repo_id="$1"
+  local remote_name="$2"
+  local max_retries="${3:-5}"
+  local retry_delay="${4:-3}"
+
+  local retry=0
+  while [ $retry -lt $max_retries ]; do
+    local listing
+    listing=$(curl -s "${SESAMEFS_URL_LOCAL}/api2/repos/${repo_id}/dir/?p=/" \
+      -H "Authorization: Token ${DEV_API_TOKEN}")
+
+    if echo "$listing" | json_query -e --arg name "$remote_name" '.[] | select(.name == $name)' > /dev/null 2>&1; then
+      log_verbose "REMOTE ENTRY PRESENT: ${remote_name}"
+      return 0
+    fi
+
+    retry=$((retry + 1))
+    log_verbose "Remote entry not yet visible, retry ${retry}/${max_retries}..."
+    sleep "$retry_delay"
+  done
+
+  log_verbose "Remote entry ${remote_name} not visible after ${max_retries} retries"
+  return 1
+}
+
+stage_file_into_sync_dir() {
+  local source_path="$1"
+  local destination_path="$2"
+
+  if [ "$SYNC_TEST_IN_CONTAINER" = "1" ]; then
+    mkdir -p "$(dirname "$destination_path")"
+    cp "$source_path" "$destination_path"
+  else
+    docker cp "$source_path" "${CLI_CONTAINER}:${destination_path}" > /dev/null
+    # docker cp lands the file as root; reassign to seafuser via a root exec so
+    # the running daemon (which executes as seafuser) can read and re-stage it.
+    docker exec --user root "${CLI_CONTAINER}" chown seafuser:seafuser "$destination_path" > /dev/null
   fi
 }
 
@@ -543,11 +665,17 @@ test_unencrypted_remote_to_local() {
 }
 
 # Test: Create file in CLI, sync to remote (unencrypted)
-# NOTE: This test requires Seafile client upload protocol which is not yet implemented
 test_unencrypted_local_to_remote() {
-  log_verbose "SKIPPED: Client-to-server upload sync not yet implemented"
-  log_verbose "This test requires the Seafile upload protocol endpoints"
-  return 0  # Skip test (pass)
+  local repo_id="$UNENCRYPTED_REPO_ID"
+  local sync_dir="${SYNC_DATA_DIR}/sync-test-${repo_id}"
+  local test_file="/tmp/sync-test-unenc-local.txt"
+  local remote_name="local-file.txt"
+
+  create_test_file "$test_file" 2048 "unencrypted-local"
+  stage_file_into_sync_dir "$test_file" "${sync_dir}/${remote_name}"
+
+  trigger_sync
+  verify_api_download_integrity "$repo_id" "/${remote_name}" "$test_file" 8 3
 }
 
 # Test: Upload from local, sync to CLI (encrypted)
@@ -565,11 +693,17 @@ test_encrypted_remote_to_local() {
 }
 
 # Test: Create file in CLI, sync to remote (encrypted)
-# NOTE: This test requires Seafile client upload protocol which is not yet implemented
 test_encrypted_local_to_remote() {
-  log_verbose "SKIPPED: Client-to-server upload sync not yet implemented"
-  log_verbose "This test requires the Seafile upload protocol endpoints"
-  return 0  # Skip test (pass)
+  local repo_id="$ENCRYPTED_REPO_ID"
+  local sync_dir="${SYNC_DATA_DIR}/sync-test-${repo_id}"
+  local test_file="/tmp/sync-test-enc-local.txt"
+  local remote_name="local-encrypted-file.txt"
+
+  create_test_file "$test_file" 2048 "encrypted-local"
+  stage_file_into_sync_dir "$test_file" "${sync_dir}/${remote_name}"
+
+  trigger_sync
+  verify_remote_entry_present "$repo_id" "$remote_name" 8 3
 }
 
 # Test: Large file sync (encrypted) - tests multi-block encryption
@@ -666,7 +800,7 @@ test_unencrypted_subdirectory() {
   # Create subdirectory via API
   log_verbose "Creating subdirectory..."
   curl -s -X POST "${SESAMEFS_URL_LOCAL}/api2/repos/${repo_id}/dir/?p=/test-subdir" \
-    -H "Authorization: Token ${DEV_TOKEN}" \
+    -H "Authorization: Token ${DEV_API_TOKEN}" \
     -d "operation=mkdir" > /dev/null
 
   # Create file in subdirectory
@@ -675,7 +809,7 @@ test_unencrypted_subdirectory() {
   # Get upload link for subdirectory
   local upload_link
   upload_link=$(curl -s "${SESAMEFS_URL_LOCAL}/api2/repos/${repo_id}/upload-link/?p=/test-subdir" \
-    -H "Authorization: Token ${DEV_TOKEN}" | tr -d '"')
+    -H "Authorization: Token ${DEV_API_TOKEN}" | tr -d '"')
 
   if [ -z "$upload_link" ]; then
     log_verbose "Failed to get upload link for subdirectory"
@@ -687,7 +821,7 @@ test_unencrypted_subdirectory() {
     -F "file=@${test_file};filename=nested-file.txt" \
     -F "parent_dir=/test-subdir" \
     -F "relative_path=" \
-    -H "Authorization: Token ${DEV_TOKEN}" > /dev/null
+    -H "Authorization: Token ${DEV_API_TOKEN}" > /dev/null
 
   # Verify file in subdirectory with retry
   verify_file_integrity "$test_file" "${sync_dir}/test-subdir/nested-file.txt" "true" 5 3
@@ -712,9 +846,21 @@ test_unencrypted_very_large_file() {
 
 # Test: Encrypted file modification - update existing encrypted file
 test_encrypted_file_modification() {
-  local repo_id="$ENCRYPTED_REPO_ID"
-  local sync_dir="${SYNC_DATA_DIR}/sync-test-${repo_id}"
+  local repo_id=""
+  local sync_dir=""
   local test_file="/tmp/sync-test-enc-modify.txt"
+  local result=0
+
+  repo_id=$(create_library "sync-test-encrypted-modify-$(date +%s)" "true" "${ENCRYPTED_PASSWORD}") || return 1
+  sync_dir="${SYNC_DATA_DIR}/sync-test-${repo_id}"
+
+  if ! unlock_library "$repo_id" "$ENCRYPTED_PASSWORD"; then
+    cleanup_repo_state "$repo_id"
+    return 1
+  fi
+
+  sync_library "$repo_id" "true" "$ENCRYPTED_PASSWORD" > /dev/null
+  sleep 5
 
   # Create and upload initial file
   echo "Encrypted original - version 1 - $(date -Iseconds)" > "$test_file"
@@ -723,6 +869,7 @@ test_encrypted_file_modification() {
   # Verify initial sync with retry
   if ! verify_file_integrity "$test_file" "${sync_dir}/enc-modifiable-file.txt" "true" 5 3; then
     log_verbose "Initial encrypted file sync failed"
+    cleanup_repo_state "$repo_id"
     return 1
   fi
   log_verbose "Initial encrypted file synced successfully"
@@ -733,7 +880,10 @@ test_encrypted_file_modification() {
   upload_file_remote "$repo_id" "$test_file" "enc-modifiable-file.txt"
 
   # Verify modified encrypted file with retry
-  verify_file_integrity "$test_file" "${sync_dir}/enc-modifiable-file.txt" "true" 5 3
+  verify_file_integrity "$test_file" "${sync_dir}/enc-modifiable-file.txt" "true" 5 3 || result=$?
+
+  cleanup_repo_state "$repo_id"
+  return $result
 }
 
 #
@@ -741,25 +891,31 @@ test_encrypted_file_modification() {
 #
 
 cleanup_test_libraries() {
-  log "Cleaning up test libraries..."
+  log "Cleaning up sync/integration test libraries and active-active leftovers..."
 
-  # List all libraries and find sync-test ones
+  cleanup_active_active_client_state
+
+  # List all libraries and find test-owned leftovers.
   local repos
   repos=$(curl -s "${SESAMEFS_URL_LOCAL}/api/v2.1/repos/" \
-    -H "Authorization: Token ${DEV_TOKEN}" | jq -r '.repos[] | select(.repo_name | startswith("sync-test-")) | .repo_id')
+    -H "Authorization: Token ${DEV_API_TOKEN}" | json_query -r '.repos[] | select((.repo_name | startswith("sync-test-")) or (.repo_name | startswith("sync-aa-")) or (.repo_name | startswith("inttest-")) or (.repo_name | startswith("smoke-")) or (.repo_name == "sesamefs-public-smoke")) | [.repo_id, .repo_name] | @tsv')
 
-  for repo_id in $repos; do
-    log_verbose "Deleting library: ${repo_id}"
+  while IFS=$'\t' read -r repo_id repo_name; do
+    [ -n "$repo_id" ] || continue
 
-    # Desync first
-    desync_library "$repo_id"
+    log_verbose "Deleting library: ${repo_name} (${repo_id})"
+
+    if [[ "$repo_name" == sync-test-* ]]; then
+      # Desync and remove local state only for sync-test repos managed by this harness.
+      desync_library "$repo_id"
+      sync_exec rm -rf "${SYNC_DATA_DIR}/sync-test-${repo_id}" 2>/dev/null || true
+    fi
 
     # Delete from server
     delete_library "$repo_id"
-
-    # Remove local data
-    docker exec "${CLI_CONTAINER}" rm -rf "${SYNC_DATA_DIR}/sync-test-${repo_id}" 2>/dev/null || true
-  done
+  done <<EOF
+${repos}
+EOF
 
   log_success "Cleanup complete"
 }
@@ -770,15 +926,11 @@ cleanup() {
 
     # Desync libraries
     if [ -n "$UNENCRYPTED_REPO_ID" ]; then
-      desync_library "$UNENCRYPTED_REPO_ID"
-      delete_library "$UNENCRYPTED_REPO_ID"
-      docker exec "${CLI_CONTAINER}" rm -rf "${SYNC_DATA_DIR}/sync-test-${UNENCRYPTED_REPO_ID}" 2>/dev/null || true
+      cleanup_repo_state "$UNENCRYPTED_REPO_ID"
     fi
 
     if [ -n "$ENCRYPTED_REPO_ID" ]; then
-      desync_library "$ENCRYPTED_REPO_ID"
-      delete_library "$ENCRYPTED_REPO_ID"
-      docker exec "${CLI_CONTAINER}" rm -rf "${SYNC_DATA_DIR}/sync-test-${ENCRYPTED_REPO_ID}" 2>/dev/null || true
+      cleanup_repo_state "$ENCRYPTED_REPO_ID"
     fi
 
     # Clean temp files
@@ -821,6 +973,10 @@ main() {
   check_services
   init_seafile_daemon
 
+  if [ "$KEEP_LIBRARIES" = false ]; then
+    cleanup_test_libraries
+  fi
+
   # Create test libraries
   echo ""
   log "Setting up test libraries..."
@@ -861,15 +1017,19 @@ main() {
   echo "=========================================="
 
   run_test "Unencrypted: Remote → Local sync" test_unencrypted_remote_to_local
-  run_test "Unencrypted: Local → Remote sync (SKIPPED)" test_unencrypted_local_to_remote
+  run_test "Unencrypted: Local → Remote sync" test_unencrypted_local_to_remote
   run_test "Unencrypted: Multiple files sync" test_unencrypted_multiple_files
   run_test "Unencrypted: File modification sync" test_unencrypted_file_modification
   run_test "Unencrypted: Subdirectory sync" test_unencrypted_subdirectory
   run_test "Unencrypted: Very large file (1.5MB) sync" test_unencrypted_very_large_file
   run_test "Encrypted: Remote → Local sync" test_encrypted_remote_to_local
-  run_test "Encrypted: Local → Remote sync (SKIPPED)" test_encrypted_local_to_remote
+  run_test "Encrypted: Local → Remote sync" test_encrypted_local_to_remote
   run_test "Encrypted: Large file (64KB) sync" test_encrypted_large_file
   run_test "Encrypted: Binary file sync" test_encrypted_binary_file
+  # The final scenario owns a fresh repo. Keep shared-repo tests above this line.
+  if [ "$KEEP_LIBRARIES" = false ]; then
+    release_shared_test_libraries
+  fi
   run_test "Encrypted: File modification sync" test_encrypted_file_modification
 
   # Print summary

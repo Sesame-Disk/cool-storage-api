@@ -1,6 +1,6 @@
 # Known Issues - SesameFS
 
-**Last Updated**: 2026-05-15
+**Last Updated**: 2026-05-21
 
 This document tracks all known bugs, limitations, and issues in SesameFS.
 
@@ -34,6 +34,7 @@ This document tracks all known bugs, limitations, and issues in SesameFS.
 | Modal Dialogs | ✅ All 122 Fixed | All dialog files use Bootstrap classes |
 | Library Settings Backend | Partial | API tokens and transfer are complete. History and auto-delete settings persist, but retention/delete semantics are incomplete. See ISSUE-LIB-RETENTION-01. |
 | **Desktop SSO Browser UX** | ✅ Fixed (2026-03-04) | After browser SSO login for desktop client, now shows confirmation page with auto-close. See ISSUE-SSO-01 below. |
+| **Desktop Sync Active-Active Conflict Recovery** | 🟡 Follow-up coverage debt | `PUT /commit/HEAD` and `POST /update-branch` now use parent-chain validation, CAS, ancestry-gated auto-merge for safe stale siblings, and `503 + Retry-After` fail-closed responses for unsafe conflicts. The real desktop-client harness now proves both the non-overlapping auto-merge race and the same-path unsafe-conflict `503` preservation path. The remaining gap is broader end-to-end scenario coverage. See ISSUE-SYNC-HEAD-RECOVERY-01 below. |
 | **Upload "Don't Replace" (Desktop Client)** | 🟡 Pending | Desktop client file browser "No" button (auto-rename) doesn't work. Client uses `update-link` vs `upload-link` to distinguish replace vs no-replace, but both map to same token/handler. Backend autorename infrastructure ready (`autoRenameIfExists`), needs token-level `Replace` flag to distinguish endpoints. Web "Don't replace" also broken (same root cause). See ISSUE-UPLOAD-REPLACE-01 below. |
 | **Org Logo Upload** | 🟡 Stub | `UpdateOrgLogo` in org_admin.go accepts the file but does not persist it to storage. Returns a static path from settings. Functional as a route placeholder until an asset storage backend is available. |
 | **Login Analytics History** | 🟡 Partial | `last_login` is now real and persisted in `users.last_login_at`, but there is still no historical login event dataset for trend analysis, login audit timelines, or period-based "users who logged in" charts. See ISSUE-LOGIN-ANALYTICS-01 below. |
@@ -41,6 +42,7 @@ This document tracks all known bugs, limitations, and issues in SesameFS.
 | **Org Admin Statistics Can Leak Platform Scope** | 🔴 Confirmed bug | When org-admin pages are mounted with platform-org context, traffic-based org-admin metrics can resolve to the global aggregate instead of a tenant scope. Affects at least org-admin traffic, org-admin per-user traffic, and org-admin active-users. See ISSUE-ORG-STATS-SCOPE-01 below. |
 | **Per-User Storage Quota Enforcement** | ✅ Fixed (2026-05-14) | `CheckStorageQuota` now evaluates org and per-user storage caps; upload callers pass `userID`; sync validates the published tree delta before advancing HEAD and waits for the matching storage-counter adjust before returning. See ISSUE-USER-STORAGE-ENFORCE-01 below. |
 | **Quota Enforcement Coverage Gaps in V2 Mutations** | ✅ Fixed (2026-05-14) | The affected non-upload mutation handlers now have visible-delta quota wiring. Deleted file/folder restore remains bounded by configured history retention, deleted-library restore remains bounded by trash retention, and cross-repo move still relies on split-phase destination publish plus source removal. Split-phase publish/counter atomicity remains documented as technical debt (§12d/§12e). See ISSUE-QUOTA-COVERAGE-01 below. |
+| **Concurrent Hard-Quota Reservation Hardening** | 🟡 Deferred to separate branch | The existing split pre-check → publish → counter-adjust window is still open. A canonical-row reservation prototype was audited and is not merge-ready for PR61 because it leaks reservations on finalize failure, regresses soft-policy evaluation, races with admin resync, and only hardens `seafhttp`. See ISSUE-QUOTA-RESERVATION-01 below. |
 | **Chunked Upload Traffic Accounting Semantics** | 🟡 Accepted debt | Web chunked uploads now pre-check traffic against the declared `Content-Range` total, but traffic is still recorded only after successful finalize. Abandoned chunk sessions can consume bandwidth without advancing counters. Operationally acceptable for current generous paid upload allowances, but documented for future billing/accounting work. See ISSUE-CHUNKED-UPLOAD-TRAFFIC-01 below. |
 
 ### 🟡 SeaDrive 3.x Missing Endpoints (Non-fatal, but degrade UX)
@@ -348,6 +350,41 @@ Split-phase atomicity (pre-check → publish → counter adjust) remains documen
 
 ---
 
+### ISSUE-QUOTA-RESERVATION-01: Canonical Storage Reservation Prototype Is Not Merge-Ready
+
+**Status**: 🟡 Confirmed follow-up / intentionally excluded from PR61 (2026-05-21)
+**Severity**: Medium-High — the existing concurrent hard-quota window remains open, and the investigated fix candidate adds correctness regressions of its own
+**Affected candidate patch**: `internal/api/seafhttp.go`, `internal/traffic/checker.go`, `internal/traffic/storage.go`, `internal/api/v2/admin.go`, `internal/api/v2/admin_users.go`, `internal/api/v2/files.go`
+
+#### What Was Confirmed
+
+- `commitUploadedFileOnce` and `commitUploadedFileMultiBlockOnce` disabled the deferred release before calling `FinalizeReservedUploadStorageDeltaSync`, so any finalize error leaked the canonical reservation instead of releasing it.
+- `ReserveStorageQuota` returned immediately for non-hard policies, so the soft-plan `CheckStorageQuota` path stopped evaluating usage and warning state on those uploads.
+- The admin org/user quota resync writes overwrote `organizations.storage_used` / `users.used_bytes` directly from live `storage_counters` without CAS, so they could erase in-flight reservations.
+- `FinalizeReservedUploadStorageDeltaSync` performed several independent counter writes with no batch, rollback, or repair path, so partial failure could leave org/user/library/platform scopes diverged.
+- The canonical CAS retry loop used a deterministic linear sleep without jitter, increasing herd behavior under contention.
+- The reservation flow was only wired into `seafhttp` uploads; v2 direct upload/finalize paths still used the older split pre-check and post-commit counter adjust flow.
+- The same patch also regressed `DeleteDirectory` by dropping `cleanupFileTagsForPrefix`, which would have left stale `file_tags`, `file_tags_by_id`, and `repo_tag_file_counts` rows behind.
+
+#### What Was Not Confirmed
+
+- `mustParseUUID` in `internal/traffic/checker.go` does not panic on invalid input in the current code; it returns the zero UUID. Invalid IDs are still undesirable, but this report was not a panic bug.
+
+#### Branch Decision
+
+- Keep the `scripts/test.sh` failure-excerpt improvement in PR61.
+- Move any canonical reservation / finalize / release quota work to a dedicated follow-up branch with its own tests and review.
+
+#### Follow-up Branch Requirements
+
+- Preserve soft quota evaluation and warning behavior.
+- Release reservations only after successful finalize, or make finalize idempotent and repairable.
+- Address partial-finalize repair and admin resync races under CAS semantics.
+- Reuse the existing jittered backoff helper instead of adding a new linear retry loop.
+- Decide whether to harden only `seafhttp` or all upload/finalize paths together.
+
+---
+
 ### ISSUE-CHUNKED-UPLOAD-TRAFFIC-01: Chunked Upload Traffic Is Recorded At Finalize, Not Per Received Chunk
 
 **Status**: 🟡 Accepted debt / documented contract (2026-05-15)
@@ -397,6 +434,55 @@ What is still missing is traffic-accounting coverage for abandoned or failed chu
 
 - `docs/TECHNICAL-DEBT.md`
 - `docs/QUOTAS-AND-TRAFFIC-PLAN.md`
+
+---
+
+### ISSUE-SYNC-HEAD-RECOVERY-01: Desktop Sync HEAD Conflict Recovery Follow-up Coverage
+
+**Status**: 🟡 Narrowed follow-up coverage debt (2026-05-20)
+**Severity**: Medium - the core safe and fail-closed active-active paths are now proved end-to-end, but the real-client scenario matrix is still incomplete
+**Affected**: `PUT /seafhttp/repo/:repo_id/commit/HEAD`, `POST /seafhttp/repo/:repo_id/update-branch`, desktop sync launch criteria
+
+#### What Is True Today
+
+The original blind-overwrite bug from February is fixed. Both sync HEAD-publish endpoints now:
+
+- validate the parent chain against the current HEAD;
+- advance `libraries.head_commit_id` via CAS in `updateLibraryHeadWithStats()`;
+- keep canonical, lookup, and admin projection rows aligned on the successful path.
+
+Both endpoints now perform bounded server-side retry when a stale race is likely recoverable:
+
+- parent-chain mismatch retries with the shared exponential+jitter backoff budget;
+- CAS conflict retries with the same bounded backoff budget;
+- non-overlapping stale siblings can be resolved by ancestry-gated server-side auto-merge;
+- unsafe conflicts now fail closed with `503` plus `Retry-After: 1`, so desktop clients keep local state instead of receiving a false-success `200 OK`.
+
+That means the remaining gap is no longer missing CAS, missing server-side retry, or the lack of any real desktop active-active proof for the two core publish outcomes. The remaining gap is broader end-to-end scenario coverage beyond the verified non-overlapping auto-merge and same-path fail-closed cases.
+
+#### Current Evidence
+
+- Code path: `internal/api/sync.go` uses parent-chain validation, CAS, bounded retry, ancestry-gated auto-merge, and `503 + Retry-After` fail-closed fallback for both `PUT /commit/HEAD` and `POST /update-branch`.
+- Same-tree stale idempotence and unmergeable `503` regressions exist for both routes in `internal/integration/library_projection_regression_test.go`.
+- Handler-level multi-node convergence proof exists for both routes in `internal/integration/multi_instance_mutations_test.go`.
+- Real desktop-client active-active proof exists for concurrent non-overlapping writes in `scripts/test-sync-active-active.sh`, and that harness now asserts that a backend `parent mismatch` and `auto-merge` were actually observed for the proof repo.
+- The same harness now also proves the same-path unsafe-conflict branch by observing retry-budget `503` exhaustion while both clients keep their divergent local edits instead of silently converging.
+
+#### Why This Still Exists As Follow-up Debt
+
+The code no longer relies on synthetic `200 OK` for exhausted retry budgets, and the repo now has real active-active desktop proof for both the auto-merge and fail-closed branches that matter most to this change. The remaining gap is breadth rather than absence of proof: this repo still lacks real-client end-to-end exercises for scenarios such as quota rejection during auto-merge, deeper-tree conflicts, and other non-happy-path branches.
+
+Some of those scenarios are already handler-covered, but they are not yet exercised by a real desktop-client harness in this repo.
+
+#### Exit Criteria
+
+- Expand the real desktop-client harness to cover quota rejection, deeper-tree conflicts, and other residual `503` branches; and/or
+- add stronger telemetry/assertions around residual fail-closed sync publish outcomes.
+
+#### Related
+
+- `docs/TECHNICAL-DEBT.md` §19.a — duplicated retry orchestration across sync, upload, and v2 mutation helpers.
+- `docs/IMPLEMENTATION_STATUS.md` — desktop sync status now reflects verified baseline proof plus remaining follow-up coverage debt.
 
 ---
 
@@ -895,6 +981,8 @@ Added `getEffectiveHostname(c *gin.Context) string` helper in `server.go` for th
 - `internal/api/sync.go` — Bugs 1A-1D, 4, 5, 7: PutCommit HEAD separation, parent-chain validation, CAS updates, CheckFS EMPTY_SHA1 skip, GetHeadCommitsMulti fallback, createInitialCommit SHA-1 alignment
 - `internal/api/seafhttp.go` — Bug 2A/2B: HandleUpload and finalizeUploadStreaming error propagation
 - `internal/api/v2/files.go` — Bugs 3, 6: ListDirectory/ListDirectoryV21 error handling and empty-root handling
+
+This closed the missing-CAS and missing-parent-validation bug class. The remaining active-active desktop-sync recovery/validation gap is tracked separately in `ISSUE-SYNC-HEAD-RECOVERY-01`.
 
 ---
 

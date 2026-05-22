@@ -280,7 +280,15 @@ func TestScanner_ScanOnce_ReconcilesPendingStorageCounters(t *testing.T) {
 	store.libraries[deletedLibID].DeletedAt = time.Now().Add(-time.Hour)
 	store.mu.Unlock()
 
-	store.AddStorageSnapshot(traffic.LibraryStorageScope(orgID.String(), activeLibID.String()), 100, 2)
+	// Production reads from canonical libraries.size_bytes / file_count
+	// during aggregate reconciliation; seed those for both libs.
+	store.SetLibraryCanonicalStats(activeLibID, 100, 2)
+	store.SetLibraryCanonicalStats(deletedLibID, 50, 1)
+	// Seed the lib-scope storage_counters snapshots with DRIFTED values so
+	// the test proves reconciliation reads canonical, not the snapshot. If
+	// reconciliation regressed back to summing lib-scope snapshots, platform
+	// would converge to 200 (the active lib's snapshot) instead of 100.
+	store.AddStorageSnapshot(traffic.LibraryStorageScope(orgID.String(), activeLibID.String()), 200, 5)
 	store.AddStorageSnapshot(traffic.LibraryStorageScope(orgID.String(), deletedLibID.String()), 50, 1)
 	store.AddStorageSnapshot(traffic.PlatformStorageScope(), 999, 9)
 	store.AddStorageSnapshot(traffic.OrganizationStorageScope(orgID.String()), 999, 9)

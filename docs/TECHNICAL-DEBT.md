@@ -720,6 +720,8 @@ What is still not atomic:
 - post-publish counter failure policy is still mixed across handlers: some paths return 500 immediately, while others log and continue after the publish succeeds
 - cross-repo move still publishes the destination before removing the source; if the source half fails afterward, the operation can temporarily behave like a copy even though quota was pre-checked as a net move
 
+Update 2026-05-21: sync HEAD publish no longer tries to reconcile aggregate storage counters inline on idempotent retries. The request path now keeps post-CAS repair O(1): it repairs the current library-scope counter and derived projection synchronously, queues platform/org/user reconciliation requests into `gc_storage_counter_reconciliation`, and returns a retryable error instead of scanning all libraries from the sync handler. Aggregate repair is deferred to GC scanner phase 11, which now recomputes requested scopes from canonical `libraries.size_bytes` / `file_count` rather than from possibly drifted library counter rows.
+
 This is a Cassandra consistency/transaction-shaping debt, not a remaining missing-hook bug like ISSUE-QUOTA-COVERAGE-01.
 
 **Future fix (v2):** Centralize tree-delta publish through one quota-aware primitive. Options include a reservation step before publish, a narrower CAS-backed workflow that couples quota usage and HEAD publication closely enough that concurrent writers cannot both spend the same remaining bytes, or a reconciliation/compensating-job path that can finish the source-removal half of a cross-repo move after the destination publish succeeds. If product keeps success-after-publish for some handlers, add durable repair/reconciliation for missed counter updates instead of relying on log-only drift.
@@ -1129,19 +1131,22 @@ Tracked in `docs/KNOWN_ISSUES.md` as ISSUE-LIB-RETENTION-01.
 
 Branch `feat/multiregion-head-safety` landed the canonical HEAD CAS pattern, server-side conflict retries for uploads and v2 mutations, atomic same-repo move in a single commit, and rollback of materialized blocks on publish failure. A walkthrough of the resulting code surfaced the following debt items. None of them block the merge; they document liabilities that future iterations should address.
 
-### 19.a. Three Separate Retry-Loop Implementations
+### 19.a. Four Separate Retry-Loop Implementations
 
-The repo still has three implementations of the same "retry on `ErrLibraryHeadConflict` / `ErrHeadConflict`" pattern. They now share the same backoff schedule, but the retry orchestration is still duplicated across files:
+The repo now has four implementations of the same "retry on `ErrLibraryHeadConflict` / `ErrHeadConflict`" pattern. They share the same backoff schedule, but the orchestration is still duplicated across sync, upload, and v2 mutation paths:
 
 | Caller | File | Backoff | Jitter | Max delay |
 |---|---|---|---|---|
 | v2 mutations (rename/move/delete/etc.) | `internal/api/v2/fs_helpers.go` (`retryLibraryHeadMutation`) | exponential (50→100→200→400) | ~25ms | 400ms |
 | Chunked + single-shot upload | `internal/api/seafhttp.go` (`commitUploadedFileMultiBlock`, `commitUploadedFile`) | exponential (50→100→200→400) | ~25ms | 400ms |
 | Web `UploadFile` | `internal/api/v2/files.go` (`finalizeStoredUploadMetadata`) | exponential (50→100→200→400) | ~25ms | 400ms |
+| Sync HEAD publish (`PutCommit HEAD`, `UpdateBranch`) | `internal/api/sync.go` | exponential (50→100→200→400) | ~25ms | 400ms |
 
 Update 2026-05-19: both upload seams now also fail closed if `IncrementOrCreateBlock` cannot confirm the `blocks` row, so uploads no longer continue to library metadata publish after a block-metadata registration failure.
 
-The remaining debt here is maintainability rather than correctness: the upload-specific `*_Once` extraction is already in place, and migrating both upload loops to `retryLibraryHeadMutation` would still remove duplicated retry bookkeeping and keep future contention tuning in one place.
+The remaining debt here is not the old blind-overwrite bug. `PUT /commit/HEAD` and `POST /update-branch` now use parent-chain validation, CAS, bounded retry, and server-side auto-merge for non-overlapping stale commits, with regression and multi-node convergence coverage on both routes. The real desktop-client active-active proof now lives in `scripts/test-sync-active-active.sh`, so the remaining debt is duplicated retry orchestration rather than missing proof or false-success fallback semantics.
+
+For the retrying paths, the debt remains maintainability rather than correctness: the upload-specific `*_Once` extraction is already in place, and migrating both upload loops to `retryLibraryHeadMutation` would still remove duplicated retry bookkeeping and keep future contention tuning in one place.
 
 ### 19.b. `CleanupFileTagsByPrefix` Performance
 
@@ -1163,6 +1168,8 @@ Hard to avoid safely (the replaced entry can legitimately change between attempt
 The same retry-amplification pattern applies to copy block reference accounting: same-repo copy pins copied block refs inside the retry attempt, rolls them back if the HEAD CAS loses, and pins again on the next attempt. This is functionally correct and keeps refcounts balanced, but a contended copy of N blocks can issue multiple rounds of LWT refcount writes before one publish wins.
 
 Retried metadata mutations can also leave unpublished rows behind. Each failed attempt may have created new `fs_objects` and a `commits` row whose commit never becomes a library HEAD. This is not a functional regression, but CAS retries multiply the amount of unreachable metadata compared with a single failed publish. A future maintenance pass should add observability or cleanup for unpublished commit/fs-object rows.
+
+The same pattern now applies to sync auto-merge snapshotting: `internal/api/sync.go` reads base/current/target `root_fs_id` in separate queries before attempting the merge. The final HEAD CAS still rejects stale work correctly, but concurrent head movement can waste merge computation and temporary fs-object materialization before the publish loses.
 
 ### 19.d. `UpdateLibraryHeadFromSnapshot` Validates an Argument Every Caller Passes Mechanically
 
@@ -1289,6 +1296,51 @@ If we tighten this later, the safe follow-up is a bounded read retry/backoff or
 explicit transient error mapping around the `libraries -> commits` lookup pair,
 not merely swapping `ListDirectory` over to `GetLibraryHeadSnapshot`.
 
+### 19.n. Generic Upload Paths Still Have a `PutBlockData` -> `IncrementOrCreateBlock` Leak Window
+
+The normal upload seams still materialize the physical block before the `blocks`
+row is confirmed:
+
+- `internal/api/seafhttp.go` single-shot and chunked finalize paths write the
+  block to storage, then write the SHA-1/SHA-256 mapping rows, then call
+  `IncrementOrCreateBlock`.
+- `internal/api/v2/files.go` direct upload does the same three-step order.
+
+If the process dies or `IncrementOrCreateBlock` fails after the physical object
+is written but before the `blocks` row exists, the request now fails closed, but
+the physical object can remain orphaned because existing S3-orphan recovery only
+covers the opposite order (DB row already deleted, later S3 delete failed).
+
+This is storage-leak debt, not a data-loss regression and not a "distinct blob
+per retry" problem: the object key is content-addressed (SHA-256 of the stored
+bytes), so repeated retries hit the same object key.
+
+If we tighten this later, the safe follow-up is a durable pending-upload marker
+or a recovery path that can reconcile object-store keys against missing block
+rows. A raw delete-on-failure path would be unsafe without proving the object
+was newly created and still unreferenced.
+
+### 19.o. Concurrent Quota Exhaustion Across Nodes Still Has Coverage Gaps
+
+Current concurrency coverage now includes a targeted multi-instance per-user
+storage-quota race in `internal/integration/quotas_test.go`
+(`TestMultiInstancePerUserStorageQuotaBlocksConcurrentUploads`), so the repo is
+no longer relying only on single-instance quota tests.
+
+The remaining gap is narrower: there is still no targeted test that forces
+3-node contention, org-level hard storage quota contention, or quota rejection
+during sync auto-merge/publish paths under concurrent head movement.
+
+That leaves an active-active question partially unproven: whether simultaneous
+finalize and publish attempts that each pass their own pre-check can still
+over-admit bytes under tighter caps outside the currently covered per-user
+upload race. Treat this as test debt first, not as a confirmed production bug.
+
+The right follow-up is to extend the multi-instance quota-race coverage in the
+default compose `test` profile using `SESAMEFS_URL`, `SESAMEFS_URL_2`, and
+`SESAMEFS_URL_3`, before any launch claim depends on strict active-active quota
+enforcement.
+
 ---
 
-*Last updated: 2026-05-19*
+*Last updated: 2026-05-20*
