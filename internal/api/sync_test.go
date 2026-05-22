@@ -1151,8 +1151,8 @@ func TestOverrideSyncLibraryCASFields(t *testing.T) {
 			Name:         "admin-controlled",
 			Encrypted:    true,
 			StorageClass: "admin-controlled",
-			SizeBytes:    0,                              // CAS-controlled, stale
-			FileCount:    0,                              // CAS-controlled, stale
+			SizeBytes:    0,                                // CAS-controlled, stale
+			FileCount:    0,                                // CAS-controlled, stale
 			UpdatedAt:    postCASUpdatedAt.Add(-time.Hour), // CAS-controlled, stale
 		},
 	}
@@ -1368,6 +1368,145 @@ func TestRepairPublishedSyncHeadAfterCounterFailureUsing(t *testing.T) {
 		}
 		if reconciles != 1 || queues != 1 {
 			t.Fatalf("reconciles = %d queues = %d, want 1/1", reconciles, queues)
+		}
+	})
+}
+
+// TestRepairSyncHeadDerivedStateIfDriftedUsing locks in the contract that
+// keeps the idempotent fast-path from blessing post-CAS drift. The fast-path
+// returns 200 when canonical libraries.head_commit_id already equals the
+// caller's targetHead, which means a prior attempt published the head but
+// could still have failed any of: storage counter delta, aggregate queue
+// insert, or libraries_by_id/admin projection write. Without this canary the
+// stale state would be permanent. With it, the canary diffs canonical head
+// vs libraries_by_id and falls through to the full repair flow only when
+// they actually disagree.
+func TestRepairSyncHeadDerivedStateIfDriftedUsing(t *testing.T) {
+	t.Run("returns nil immediately when lookup matches target", func(t *testing.T) {
+		lookupReads := 0
+		canonicalReads := 0
+		repairs := 0
+		err := repairSyncHeadDerivedStateIfDriftedUsing(
+			"target-head",
+			func() (string, error) {
+				lookupReads++
+				return "target-head", nil
+			},
+			func() (int64, int64, time.Time, error) {
+				canonicalReads++
+				return 0, 0, time.Time{}, nil
+			},
+			func(time.Time, int64, int64) error {
+				repairs++
+				return nil
+			},
+		)
+		if err != nil {
+			t.Fatalf("err = %v, want nil", err)
+		}
+		if lookupReads != 1 {
+			t.Fatalf("lookupReads = %d, want 1", lookupReads)
+		}
+		if canonicalReads != 0 || repairs != 0 {
+			t.Fatalf("canonicalReads = %d repairs = %d, want both 0 when canary already agrees", canonicalReads, repairs)
+		}
+	})
+
+	t.Run("runs repair with canonical stats when lookup is stale", func(t *testing.T) {
+		canonicalUpdatedAt := time.Date(2026, 5, 21, 16, 31, 5, 0, time.UTC)
+		var repairCalled struct {
+			updatedAt time.Time
+			totalSize int64
+			fileCount int64
+			count     int
+		}
+		err := repairSyncHeadDerivedStateIfDriftedUsing(
+			"target-head",
+			func() (string, error) { return "stale-head", nil },
+			func() (int64, int64, time.Time, error) { return 4096, 3, canonicalUpdatedAt, nil },
+			func(updatedAt time.Time, totalSize, fileCount int64) error {
+				repairCalled.updatedAt = updatedAt
+				repairCalled.totalSize = totalSize
+				repairCalled.fileCount = fileCount
+				repairCalled.count++
+				return nil
+			},
+		)
+		if err != nil {
+			t.Fatalf("err = %v, want nil", err)
+		}
+		if repairCalled.count != 1 {
+			t.Fatalf("repair invocations = %d, want 1", repairCalled.count)
+		}
+		if !repairCalled.updatedAt.Equal(canonicalUpdatedAt) || repairCalled.totalSize != 4096 || repairCalled.fileCount != 3 {
+			t.Fatalf("repair received updatedAt=%s totalSize=%d fileCount=%d, want %s/4096/3",
+				repairCalled.updatedAt, repairCalled.totalSize, repairCalled.fileCount, canonicalUpdatedAt)
+		}
+	})
+
+	t.Run("wraps and propagates lookup-read failure without touching canonical or repair", func(t *testing.T) {
+		wantErr := errors.New("lookup read failed")
+		canonicalReads := 0
+		repairs := 0
+		err := repairSyncHeadDerivedStateIfDriftedUsing(
+			"target-head",
+			func() (string, error) { return "", wantErr },
+			func() (int64, int64, time.Time, error) {
+				canonicalReads++
+				return 0, 0, time.Time{}, nil
+			},
+			func(time.Time, int64, int64) error {
+				repairs++
+				return nil
+			},
+		)
+		if !errors.Is(err, wantErr) {
+			t.Fatalf("err = %v, want to wrap %v", err, wantErr)
+		}
+		if !strings.Contains(err.Error(), "read libraries_by_id head for derived-state canary") {
+			t.Fatalf("err = %v, want canary-read prefix", err)
+		}
+		if canonicalReads != 0 || repairs != 0 {
+			t.Fatalf("canonicalReads = %d repairs = %d, want 0/0 on lookup failure", canonicalReads, repairs)
+		}
+	})
+
+	t.Run("wraps and propagates canonical-read failure without invoking repair", func(t *testing.T) {
+		wantErr := errors.New("canonical read failed")
+		repairs := 0
+		err := repairSyncHeadDerivedStateIfDriftedUsing(
+			"target-head",
+			func() (string, error) { return "stale-head", nil },
+			func() (int64, int64, time.Time, error) { return 0, 0, time.Time{}, wantErr },
+			func(time.Time, int64, int64) error {
+				repairs++
+				return nil
+			},
+		)
+		if !errors.Is(err, wantErr) {
+			t.Fatalf("err = %v, want to wrap %v", err, wantErr)
+		}
+		if !strings.Contains(err.Error(), "read canonical library stats for derived-state repair") {
+			t.Fatalf("err = %v, want canonical-read prefix", err)
+		}
+		if repairs != 0 {
+			t.Fatalf("repairs = %d, want 0 on canonical-read failure", repairs)
+		}
+	})
+
+	t.Run("wraps and propagates repair failure", func(t *testing.T) {
+		wantErr := errors.New("repair failed")
+		err := repairSyncHeadDerivedStateIfDriftedUsing(
+			"target-head",
+			func() (string, error) { return "stale-head", nil },
+			func() (int64, int64, time.Time, error) { return 1, 1, time.Now(), nil },
+			func(time.Time, int64, int64) error { return wantErr },
+		)
+		if !errors.Is(err, wantErr) {
+			t.Fatalf("err = %v, want to wrap %v", err, wantErr)
+		}
+		if !strings.Contains(err.Error(), "repair drifted sync derived state") {
+			t.Fatalf("err = %v, want repair prefix", err)
 		}
 	})
 }

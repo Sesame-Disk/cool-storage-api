@@ -220,6 +220,13 @@ type mockLibrary struct {
 	VersionTTLDays int
 	AutoDeleteDays int
 	DeletedAt      time.Time
+	// SizeBytes and FileCount mirror the canonical libraries.size_bytes and
+	// libraries.file_count columns used by ReconcilePendingStorageCounters
+	// in production. Storage-counter rows (m.storageSnapshots) are derived
+	// caches that can drift; aggregate reconciliation must read from these
+	// canonical fields to match store_cassandra.go semantics.
+	SizeBytes int64
+	FileCount int64
 }
 
 type mockShareLink struct {
@@ -530,6 +537,23 @@ func (m *MockStore) AddLibraryWithOwner(orgID, libraryID, ownerID uuid.UUID, sto
 		OwnerID:      ownerID,
 		StorageClass: storageClass,
 	}
+}
+
+// SetLibraryCanonicalStats sets the canonical size_bytes / file_count columns
+// on a mock library row. Tests must use this instead of (or in addition to)
+// AddStorageSnapshot for lib-scope when exercising the aggregate
+// reconciliation path: production reads from these canonical columns, and a
+// test that only seeds the lib-scope storage_counters row will not exercise
+// the same code path.
+func (m *MockStore) SetLibraryCanonicalStats(libraryID uuid.UUID, sizeBytes, fileCount int64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	lib, ok := m.libraries[libraryID]
+	if !ok {
+		return
+	}
+	lib.SizeBytes = sizeBytes
+	lib.FileCount = fileCount
 }
 
 func (m *MockStore) AddShareLink(shareToken string, orgID uuid.UUID, expiresAt time.Time) {
@@ -1756,8 +1780,10 @@ func (m *MockStore) ReconcilePendingStorageCounters() (int, error) {
 		if !lib.DeletedAt.IsZero() {
 			continue
 		}
-		libScope := traffic.LibraryStorageScope(lib.OrgID.String(), lib.LibraryID.String())
-		libSnapshot := m.storageSnapshots[libScope]
+		// Match store_cassandra.go semantics: aggregate reconciliation reads
+		// from canonical libraries.size_bytes / libraries.file_count, not from
+		// the (possibly drifted) lib-scope storage_counters snapshot.
+		libSnapshot := traffic.StorageSnapshot{BytesUsed: lib.SizeBytes, FileCount: lib.FileCount}
 		if libSnapshot.BytesUsed == 0 && libSnapshot.FileCount == 0 {
 			continue
 		}

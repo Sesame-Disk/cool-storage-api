@@ -2447,6 +2447,21 @@ func (h *SyncHandler) handleSyncHeadPromotion(c *gin.Context, orgID, userID, rep
 		}
 
 		if currentHead == targetHead {
+			// Canonical libraries already advanced to targetHead. A previous
+			// attempt may have failed AFTER the CAS while running post-CAS
+			// side effects (storage counters, aggregate reconciliation queue,
+			// libraries_by_id/admin projection write). If any of those left
+			// derived state behind, returning 200 here would silently bless
+			// that drift and the client would never trigger another publish.
+			// Use libraries_by_id.head_commit_id as a cheap canary: if it
+			// matches the canonical head, derived state is in sync; otherwise
+			// re-run the full post-CAS repair flow before reporting success.
+			if err := h.repairSyncHeadDerivedStateIfDrifted(orgID, repoID, targetHead); err != nil {
+				log.Printf("%s: idempotent path detected derived-state drift for repo %s but repair failed: %v", operation, repoID, err)
+				c.Header("Retry-After", "1")
+				c.JSON(http.StatusServiceUnavailable, gin.H{"error": "sync head publish derived state repair pending; retry"})
+				return
+			}
 			log.Printf("%s: repo %s head already at %s; treating as idempotent success", operation, repoID, targetHead)
 			c.Status(http.StatusOK)
 			return
@@ -2784,6 +2799,74 @@ func (h *SyncHandler) repairPublishedSyncHeadAfterCounterFailure(orgID, repoID, 
 	)
 }
 
+// repairSyncHeadDerivedStateIfDrifted is invoked from the idempotent fast-path
+// in handleSyncHeadPromotion. It uses libraries_by_id.head_commit_id as a
+// cheap canary against canonical libraries.head_commit_id: when they agree,
+// derived state is consistent and the caller can short-circuit. When they
+// disagree, a prior publish attempt left derived state behind (counter delta
+// failure with failed repair, aggregate-reconcile queue insert failure, or
+// libraries_by_id/admin projection write failure on both attempts). In that
+// case it re-runs the full post-CAS repair flow against the canonical row
+// (which already holds the published head + stats), guaranteeing that an
+// otherwise-200-returning idempotent retry actually converges derived state.
+func (h *SyncHandler) repairSyncHeadDerivedStateIfDrifted(orgID, repoID, targetHead string) error {
+	return repairSyncHeadDerivedStateIfDriftedUsing(
+		targetHead,
+		func() (string, error) { return h.readLookupHead(repoID) },
+		func() (int64, int64, time.Time, error) { return h.readCanonicalLibraryStats(orgID, repoID) },
+		func(updatedAt time.Time, totalSize, fileCount int64) error {
+			return h.repairPublishedSyncHeadAfterCounterFailure(orgID, repoID, targetHead, updatedAt, totalSize, fileCount)
+		},
+	)
+}
+
+// repairSyncHeadDerivedStateIfDriftedUsing is the testable seam: it composes
+// the canary read, the canonical stats read, and the repair invocation so
+// unit tests can drive each branch with deterministic closures.
+func repairSyncHeadDerivedStateIfDriftedUsing(
+	targetHead string,
+	readLookupHead func() (string, error),
+	readCanonicalStats func() (int64, int64, time.Time, error),
+	repair func(updatedAt time.Time, totalSize, fileCount int64) error,
+) error {
+	lookupHead, err := readLookupHead()
+	if err != nil {
+		return fmt.Errorf("read libraries_by_id head for derived-state canary: %w", err)
+	}
+	if lookupHead == targetHead {
+		return nil
+	}
+	totalSize, fileCount, updatedAt, err := readCanonicalStats()
+	if err != nil {
+		return fmt.Errorf("read canonical library stats for derived-state repair: %w", err)
+	}
+	if err := repair(updatedAt, totalSize, fileCount); err != nil {
+		return fmt.Errorf("repair drifted sync derived state: %w", err)
+	}
+	return nil
+}
+
+func (h *SyncHandler) readLookupHead(repoID string) (string, error) {
+	var lookupHead string
+	if err := h.db.Session().Query(`
+		SELECT head_commit_id FROM libraries_by_id WHERE library_id = ?
+	`, repoID).Scan(&lookupHead); err != nil {
+		return "", err
+	}
+	return lookupHead, nil
+}
+
+func (h *SyncHandler) readCanonicalLibraryStats(orgID, repoID string) (int64, int64, time.Time, error) {
+	var sizeBytes, fileCount int64
+	var updatedAt time.Time
+	if err := h.db.Session().Query(`
+		SELECT size_bytes, file_count, updated_at FROM libraries WHERE org_id = ? AND library_id = ?
+	`, orgID, repoID).Scan(&sizeBytes, &fileCount, &updatedAt); err != nil {
+		return 0, 0, time.Time{}, err
+	}
+	return sizeBytes, fileCount, updatedAt, nil
+}
+
 func (h *SyncHandler) reconcilePublishedSyncLibraryStorage(orgID, repoID string, state syncLibraryDerivedState) error {
 	if err := traffic.ReconcileStorageScope(h.db, traffic.LibraryStorageScope(orgID, repoID), traffic.StorageSnapshot{
 		BytesUsed: state.ProjectionRow.SizeBytes,
@@ -2795,9 +2878,9 @@ func (h *SyncHandler) reconcilePublishedSyncLibraryStorage(orgID, repoID string,
 }
 
 func (h *SyncHandler) queueAggregateStorageReconciliation(orgID, ownerID string) error {
-	batch := h.db.Session().NewBatch(gocql.LoggedBatch)
+	batch := h.db.Session().Batch(gocql.LoggedBatch)
 	traffic.AddAggregateStorageReconciliationQueries(batch, orgID, ownerID, time.Now().UTC())
-	if err := h.db.Session().ExecuteBatch(batch); err != nil {
+	if err := batch.Exec(); err != nil {
 		return fmt.Errorf("queue aggregate storage reconciliation: %w", err)
 	}
 	return nil
