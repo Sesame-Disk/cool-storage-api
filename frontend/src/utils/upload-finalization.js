@@ -1,4 +1,31 @@
 const DEFAULT_PREPARING_TIME = -1;
+const RETRYABLE_UPLOAD_CONFLICT_ERROR = 'library was modified concurrently; retry the upload';
+
+const normalizeUploadResponseStatus = (status) => {
+    const numericStatus = Number(status);
+    return Number.isInteger(numericStatus) && numericStatus > 0 ? numericStatus : 0;
+};
+
+const parseUploadErrorPayload = (message) => {
+    if (!message) {
+        return null;
+    }
+
+    if (typeof message === 'object') {
+        return message;
+    }
+
+    if (typeof message !== 'string') {
+        return null;
+    }
+
+    try {
+        return JSON.parse(message.replace(/\n/g, ''));
+    } catch (error) {
+        void error;
+        return null;
+    }
+};
 
 const getFileChunks = (resumableFile) => {
     if (!resumableFile || !Array.isArray(resumableFile.chunks)) {
@@ -124,9 +151,63 @@ export const clearFileUploadRuntimeState = (resumableFile, options = {}) => {
     }
 
     resumableFile.isFinalizing = false;
+    resumableFile.lastUploadResponseStatus = null;
     if (options.resetRemainingTime) {
         resumableFile.remainingTime = DEFAULT_PREPARING_TIME;
     }
+};
+
+export const trackUploadResponseStatus = (resumableFile, resumableChunk) => {
+    if (!resumableFile || !resumableChunk || !resumableChunk.xhr || resumableChunk._sesamefsResponseTrackerAttached) {
+        return;
+    }
+
+    const xhr = resumableChunk.xhr;
+    resumableChunk._sesamefsResponseTrackerAttached = true;
+    xhr.addEventListener('readystatechange', () => {
+        if (xhr.readyState !== 4) {
+            return;
+        }
+
+        resumableFile.lastUploadResponseStatus = normalizeUploadResponseStatus(xhr.status);
+    });
+};
+
+export const shouldAutoRetryUploadConflict = (resumableFile, message) => {
+    if (!resumableFile || resumableFile.finalizeConflictAutoRetried) {
+        return false;
+    }
+
+    if (normalizeUploadResponseStatus(resumableFile.lastUploadResponseStatus) === 409) {
+        return true;
+    }
+
+    const payload = parseUploadErrorPayload(message);
+    if (normalizeUploadResponseStatus(payload && payload.status) === 409) {
+        return true;
+    }
+
+    if (payload && payload.error === RETRYABLE_UPLOAD_CONFLICT_ERROR) {
+        return true;
+    }
+
+    return typeof message === 'string' && message.includes(RETRYABLE_UPLOAD_CONFLICT_ERROR);
+};
+
+export const markUploadConflictAutoRetry = (resumableFile) => {
+    if (!resumableFile) {
+        return;
+    }
+
+    resumableFile.finalizeConflictAutoRetried = true;
+};
+
+export const resetUploadConflictAutoRetry = (resumableFile) => {
+    if (!resumableFile) {
+        return;
+    }
+
+    resumableFile.finalizeConflictAutoRetried = false;
 };
 
 export const maybeMarkFileFinalizing = (resumableFile, resumable, baseline) => {

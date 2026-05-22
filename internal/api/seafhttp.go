@@ -554,8 +554,12 @@ func (cu *ChunkUpload) IsComplete() bool {
 func (cu *ChunkUpload) TryStartFinalization() bool {
 	cu.mu.Lock()
 	defer cu.mu.Unlock()
-	if cu.Finalizing || !cu.isCompleteLocked() {
-		metrics.ChunkUploadFinalizationAttemptsTotal.WithLabelValues("deferred").Inc()
+	if cu.Finalizing {
+		metrics.ChunkUploadFinalizationAttemptsTotal.WithLabelValues("already_finalizing").Inc()
+		return false
+	}
+	if !cu.isCompleteLocked() {
+		metrics.ChunkUploadFinalizationAttemptsTotal.WithLabelValues("not_complete").Inc()
 		return false
 	}
 	cu.Finalizing = true
@@ -1173,13 +1177,7 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 		if err != nil {
 			upload.ResetFinalization()
 			log.Printf("[HandleUpload] Finalization failed: %v", err)
-			status := http.StatusInternalServerError
-			msg := "failed to finalize upload"
-			if errors.Is(err, errStorageQuotaExceeded) {
-				status = http.StatusForbidden
-				msg = "storage quota exceeded"
-			}
-			c.JSON(status, gin.H{"error": msg})
+			writeSeafHTTPUploadError(c, err, "failed to finalize upload")
 			return
 		}
 		chunkManager.CleanupUpload(tokenStr, filename)
@@ -1310,13 +1308,7 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 	commitID, actualFilename, storageDeltaBytes, storageDeltaFiles, err := h.commitUploadedFile(token.OrgID, token.RepoID, token.UserID, parentDir, filename, fileID, chunkData, finalSize, replaceFile)
 	if err != nil {
 		log.Printf("[HandleUpload] Failed to update filesystem: %v", err)
-		status := http.StatusInternalServerError
-		msg := "file stored but metadata update failed"
-		if errors.Is(err, errStorageQuotaExceeded) {
-			status = http.StatusForbidden
-			msg = "storage quota exceeded"
-		}
-		c.JSON(status, gin.H{"error": msg})
+		writeSeafHTTPUploadError(c, err, "file stored but metadata update failed")
 		return
 	}
 	log.Printf("[HandleUpload] Filesystem updated, commit=%s", commitID)
@@ -1347,6 +1339,22 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 }
 
 var errStorageQuotaExceeded = errors.New("storage quota exceeded")
+
+func writeSeafHTTPUploadError(c *gin.Context, err error, genericMsg string) {
+	switch {
+	case errors.Is(err, v2.ErrLibraryHeadConflict):
+		// CLIENT_CONTRACT: the 409 status is the authoritative signal, but
+		// frontend uploaders also match this exact string as a fallback when
+		// status code is not observable (see RETRYABLE_UPLOAD_CONFLICT_ERROR
+		// in frontend/src/utils/upload-finalization.js). Keep the wording in
+		// sync across both places.
+		c.JSON(http.StatusConflict, gin.H{"error": "library was modified concurrently; retry the upload"})
+	case errors.Is(err, errStorageQuotaExceeded):
+		c.JSON(http.StatusForbidden, gin.H{"error": "storage quota exceeded"})
+	default:
+		c.JSON(http.StatusInternalServerError, gin.H{"error": genericMsg})
+	}
+}
 
 // Upload-finalize retries share v2.RetryBackoff for the per-attempt delay
 // (exponential with jitter, capped). Only the attempt count is local.
@@ -1680,7 +1688,7 @@ func (h *SeafHTTPHandler) commitUploadedFileMultiBlock(orgID, repoID, userID, pa
 	log.Printf("[commitUploadedFileMultiBlock] Exhausted metadata retries for repo=%s: %v", repoID, lastConflict)
 	result = "retry_exhausted"
 	metrics.UploadFinalizeRetryExhaustedTotal.WithLabelValues("seafhttp_multiblock").Inc()
-	return "", "", 0, 0, fmt.Errorf("failed to finalize upload metadata after %d attempts", uploadMetadataRetryAttempts)
+	return "", "", 0, 0, fmt.Errorf("%w: failed to finalize upload metadata after %d attempts", v2.ErrLibraryHeadConflict, uploadMetadataRetryAttempts)
 }
 
 func (h *SeafHTTPHandler) commitUploadedFileMultiBlockOnce(orgID, repoID, userID, parentDir, filename, fileID string, blockIDs []string, fileSize int64, replace bool) (string, string, int64, int64, error) {
@@ -1801,7 +1809,7 @@ func (h *SeafHTTPHandler) commitUploadedFile(orgID, repoID, userID, parentDir, f
 	log.Printf("[commitUploadedFile] Exhausted metadata retries for repo=%s: %v", repoID, lastConflict)
 	result = "retry_exhausted"
 	metrics.UploadFinalizeRetryExhaustedTotal.WithLabelValues("seafhttp_single").Inc()
-	return "", "", 0, 0, fmt.Errorf("failed to finalize upload metadata after %d attempts", uploadMetadataRetryAttempts)
+	return "", "", 0, 0, fmt.Errorf("%w: failed to finalize upload metadata after %d attempts", v2.ErrLibraryHeadConflict, uploadMetadataRetryAttempts)
 }
 
 func (h *SeafHTTPHandler) commitUploadedFileOnce(orgID, repoID, userID, parentDir, filename, fileID string, content []byte, fileSize int64, replace bool) (string, string, int64, int64, error) {

@@ -6,7 +6,7 @@ import Resumablejs from '@seafile/resumablejs';
 import MD5 from 'md5';
 import { resumableUploadFileBlockSize, resumableSimultaneousUploads, maxUploadFileSize, maxNumberOfFilesForFileupload } from '../../utils/constants';
 import { seafileAPI } from '../../utils/seafile-api';
-import { clearFileUploadRuntimeState, getBaselineSimultaneousUploads, maybeMarkFileFinalizing, maybeStartPendingUploadDuringFinalize, restoreUploadConcurrencyIfIdle } from '../../utils/upload-finalization';
+import { clearFileUploadRuntimeState, getBaselineSimultaneousUploads, markUploadConflictAutoRetry, maybeMarkFileFinalizing, maybeStartPendingUploadDuringFinalize, resetUploadConflictAutoRetry, restoreUploadConcurrencyIfIdle, shouldAutoRetryUploadConflict, trackUploadResponseStatus } from '../../utils/upload-finalization';
 import { Utils } from '../../utils/utils';
 import { gettext } from '../../utils/constants';
 import UploadProgressDialog from './upload-progress-dialog';
@@ -420,6 +420,12 @@ class FileUploader extends React.Component {
   };
 
   onFileError = (resumableFile, message) => {
+    if (shouldAutoRetryUploadConflict(resumableFile, message)) {
+      markUploadConflictAutoRetry(resumableFile);
+      this.retryUploadWithFreshLink(resumableFile, { resetAutoRetry: false });
+      return;
+    }
+
     let error = '';
     if (!message) {
       error = gettext('Network error');
@@ -453,6 +459,39 @@ class FileUploader extends React.Component {
     this.restoreConcurrencyIfIdle();
   };
 
+  retryUploadWithFreshLink = (resumableFile, options = {}) => {
+    const { resetAutoRetry = true } = options;
+    let { token, relativePath } = this.props;
+
+    seafileAPI.sharedLinkGetFileUploadUrl(token, relativePath).then(res => {
+      this.resumable.opts.target = res.data.upload_link + '?ret-json=1';
+
+      let retryFileList = this.state.retryFileList.filter(item => {
+        return item.uniqueIdentifier !== resumableFile.uniqueIdentifier;
+      });
+      let uploadFileList = this.state.uploadFileList.map(item => {
+        if (item.uniqueIdentifier === resumableFile.uniqueIdentifier) {
+          clearFileUploadRuntimeState(item, { resetRemainingTime: true });
+          item.error = null;
+          if (resetAutoRetry) {
+            resetUploadConflictAutoRetry(item);
+          }
+          this.retryUploadFile(item);
+        }
+        return item;
+      });
+
+      this.setState({
+        retryFileList: retryFileList,
+        uploadFileList: uploadFileList
+      });
+      this.restoreConcurrencyIfIdle();
+    }).catch(error => {
+      let errMessage = Utils.getErrorMsg(error);
+      toaster.danger(errMessage);
+    });
+  };
+
   onComplete = () => {
     this.notifiedFolders = [];
     // reset upload link loaded
@@ -483,6 +522,8 @@ class FileUploader extends React.Component {
   };
 
   setHeaders = (resumableFile, resumable) => {
+    trackUploadResponseStatus(resumableFile, resumable);
+
     let offset = resumable.offset;
     let chunkSize = resumable.getOpt('chunkSize');
     let fileSize = resumableFile.size === 0 ? 1 : resumableFile.size;
@@ -586,32 +627,7 @@ class FileUploader extends React.Component {
   };
 
   onUploadRetry = (resumableFile) => {
-
-    let { token, relativePath } = this.props;
-    seafileAPI.sharedLinkGetFileUploadUrl(token, relativePath).then(res => {
-      this.resumable.opts.target = res.data.upload_link + '?ret-json=1';
-
-      let retryFileList = this.state.retryFileList.filter(item => {
-        return item.uniqueIdentifier !== resumableFile.uniqueIdentifier;
-      });
-      let uploadFileList = this.state.uploadFileList.map(item => {
-        if (item.uniqueIdentifier === resumableFile.uniqueIdentifier) {
-          clearFileUploadRuntimeState(item, { resetRemainingTime: true });
-          item.error = null;
-          this.retryUploadFile(item);
-        }
-        return item;
-      });
-
-      this.setState({
-        retryFileList: retryFileList,
-        uploadFileList: uploadFileList
-      });
-      this.restoreConcurrencyIfIdle();
-    }).catch(error => {
-      let errMessage = Utils.getErrorMsg(error);
-      toaster.danger(errMessage);
-    });
+    this.retryUploadWithFreshLink(resumableFile);
   };
 
   onUploadRetryAll = () => {
@@ -621,6 +637,7 @@ class FileUploader extends React.Component {
       this.resumable.opts.target = res.data.upload_link + '?ret-json=1';
       this.state.retryFileList.forEach(item => {
         clearFileUploadRuntimeState(item, { resetRemainingTime: true });
+        resetUploadConflictAutoRetry(item);
         item.error = false;
         this.retryUploadFile(item);
       });

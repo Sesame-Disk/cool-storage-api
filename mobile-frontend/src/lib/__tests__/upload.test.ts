@@ -17,6 +17,12 @@ function createMockFile(name: string, size = 1024): File {
   return new File([content], name, { type: 'application/octet-stream' });
 }
 
+async function flushUploadWork() {
+  await new Promise(resolve => setTimeout(resolve, 0));
+  await new Promise(resolve => setTimeout(resolve, 0));
+  await new Promise(resolve => setTimeout(resolve, 0));
+}
+
 describe('UploadManager', () => {
   beforeEach(() => {
     // Clear the queue
@@ -154,6 +160,61 @@ describe('UploadManager', () => {
 
     expect(upload.relativePath).toBe('folder/test.txt');
 
+    vi.restoreAllMocks();
+  });
+
+  it('retries a 409 upload conflict and completes on the next attempt', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: () => Promise.resolve('http://localhost:8080/upload'),
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const responses = [409, 200];
+
+    class MockXMLHttpRequest {
+      upload = { addEventListener: vi.fn() };
+      status = 0;
+      private listeners: Record<string, Array<() => void>> = {};
+
+      open = vi.fn();
+      setRequestHeader = vi.fn();
+
+      addEventListener = (type: string, listener: () => void) => {
+        this.listeners[type] = this.listeners[type] || [];
+        this.listeners[type].push(listener);
+      };
+
+      send = vi.fn(() => {
+        this.status = responses.shift() ?? 200;
+        queueMicrotask(() => {
+          for (const listener of this.listeners.load || []) {
+            listener();
+          }
+        });
+      });
+
+      abort = vi.fn(() => {
+        for (const listener of this.listeners.abort || []) {
+          listener();
+        }
+      });
+    }
+
+    vi.stubGlobal('XMLHttpRequest', MockXMLHttpRequest as unknown as typeof XMLHttpRequest);
+
+    const events: UploadEvent[] = [];
+    const unsub = uploadManager.subscribe((event) => events.push(event));
+
+    const [upload] = uploadManager.addFiles([createMockFile('conflict.txt')], 'repo-1', '/');
+    await flushUploadWork();
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(uploadManager.getQueue().find(file => file.id === upload.id)?.status).toBe('completed');
+    expect(events.some(event => event.type === 'completed' && event.fileId === upload.id)).toBe(true);
+    expect(events.some(event => event.type === 'failed' && event.fileId === upload.id)).toBe(false);
+
+    unsub();
     vi.restoreAllMocks();
   });
 });

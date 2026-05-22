@@ -241,13 +241,14 @@ var (
 	)
 
 	// ChunkUploadFinalizationAttemptsTotal counts how often a chunked upload
-	// tracker wins or loses the finalization gate.
+	// tracker reaches the finalization gate, is still incomplete, or finds
+	// another goroutine already finalizing it.
 	ChunkUploadFinalizationAttemptsTotal = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "chunk_upload_finalization_attempts_total",
-			Help: "Total number of chunked upload finalization gate outcomes.",
+			Help: "Total number of chunked upload finalization gate outcomes, split by started, not_complete, and already_finalizing.",
 		},
-		[]string{"result"}, // "started" or "deferred"
+		[]string{"result"}, // "started", "not_complete", or "already_finalizing"
 	)
 
 	// UploadFinalizeHeadConflictsTotal counts metadata publish conflicts that
@@ -282,12 +283,14 @@ var (
 	)
 
 	// UploadFinalizeDuration observes metadata finalize latency, including any
-	// retries and backoff.
+	// retries and backoff. Buckets extend past prometheus.DefBuckets so that
+	// retry_exhausted finalize calls (up to 20 attempts with exponential
+	// backoff and jitter) still fall into bounded buckets instead of +Inf.
 	UploadFinalizeDuration = prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
 			Name:    "upload_finalize_duration_seconds",
 			Help:    "Duration of upload metadata finalize calls, including retries.",
-			Buckets: prometheus.DefBuckets,
+			Buckets: []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 15, 30, 60},
 		},
 		[]string{"surface", "result"},
 	)

@@ -2834,13 +2834,7 @@ func (h *FileHandler) UploadFile(c *gin.Context) {
 
 	actualFilename, storageDeltaBytes, storageDeltaFiles, err := h.finalizeStoredUploadMetadata(orgID, userID, repoID, parentDir, filename, fileID, fileSize, replace)
 	if err != nil {
-		status := http.StatusInternalServerError
-		msg := "failed to update library"
-		if errors.Is(err, errUploadStorageQuotaExceeded) {
-			status = http.StatusForbidden
-			msg = "storage quota exceeded"
-		}
-		c.JSON(status, gin.H{"error": msg})
+		writeUploadFileError(c, err)
 		return
 	}
 
@@ -2856,6 +2850,22 @@ func (h *FileHandler) UploadFile(c *gin.Context) {
 
 	// Return Seafile-compatible response
 	c.JSON(http.StatusOK, []gin.H{{"name": actualFilename, "id": fileID, "size": strconv.FormatInt(fileSize, 10)}})
+}
+
+func writeUploadFileError(c *gin.Context, err error) {
+	switch {
+	case errors.Is(err, ErrLibraryHeadConflict):
+		// CLIENT_CONTRACT: the 409 status is the authoritative signal, but
+		// frontend uploaders also match this exact string as a fallback when
+		// status code is not observable (see RETRYABLE_UPLOAD_CONFLICT_ERROR
+		// in frontend/src/utils/upload-finalization.js). Keep the wording in
+		// sync across both places.
+		c.JSON(http.StatusConflict, gin.H{"error": "library was modified concurrently; retry the upload"})
+	case errors.Is(err, errUploadStorageQuotaExceeded):
+		c.JSON(http.StatusForbidden, gin.H{"error": "storage quota exceeded"})
+	default:
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update library"})
+	}
 }
 
 func currentUploadStorageDelta(fsHelper *FSHelper, repoID, parentDir, filename string, fileSize int64, replace bool) (int64, int64, error) {
@@ -2929,7 +2939,7 @@ func (h *FileHandler) finalizeStoredUploadMetadata(orgID, userID, repoID, parent
 	log.Printf("[UploadFile] Exhausted metadata retries for repo=%s: %v", repoID, lastConflict)
 	result = "retry_exhausted"
 	metrics.UploadFinalizeRetryExhaustedTotal.WithLabelValues("v2_direct").Inc()
-	return "", 0, 0, fmt.Errorf("failed to finalize upload metadata after %d attempts", uploadMetadataRetryAttempts)
+	return "", 0, 0, fmt.Errorf("%w: failed to finalize upload metadata after %d attempts", ErrLibraryHeadConflict, uploadMetadataRetryAttempts)
 }
 
 func (h *FileHandler) finalizeStoredUploadMetadataOnce(fsHelper *FSHelper, orgID, userID, repoID, parentDir, filename, fileID string, fileSize int64, replace bool) (string, int64, int64, error) {

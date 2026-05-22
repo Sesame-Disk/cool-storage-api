@@ -24,6 +24,7 @@ package integration
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
 	"mime/multipart"
@@ -339,6 +340,54 @@ func TestConcurrentSeafhttpUploadsToSubdirNoLostCommits(t *testing.T) {
 	})
 	expectConcurrentStatuses(t, results, http.StatusOK, http.StatusCreated)
 	expectEntriesPresent(t, repoID, "/subdir", names)
+}
+
+// When a resumable upload starts first but another writer creates the original
+// target name before finalize, the chunked upload should autorename and return
+// the winning name back to the client in the final ret-json response.
+func TestChunkedUploadRaceReturnsAutorenameInResponse(t *testing.T) {
+	repoID := createTestLibrary(t, adminClient, fmt.Sprintf("inttest-chunked-autorename-race-%d", time.Now().UnixNano()))
+	uploadURL := getUploadLink(t, adminClient, repoID, "/")
+	retJSONUploadURL := uploadURL + "?ret-json=1"
+
+	fileName := "chunked-race.txt"
+	autoRenamed := "chunked-race (1).txt"
+	fileContent := []byte("abcdefghij")
+
+	status, body := uploadChunkThroughLinkStatus(t, adminClient, retJSONUploadURL, fileName, "/", fileContent[:5], "bytes 0-4/10")
+	if status != http.StatusOK {
+		t.Fatalf("first chunk status = %d, want %d; body=%s", status, http.StatusOK, body)
+	}
+
+	uploadFileThroughLink(t, adminClient, uploadURL, fileName, "/", "competing writer\n")
+
+	status, body = uploadChunkThroughLinkStatus(t, adminClient, retJSONUploadURL, fileName, "/", fileContent[5:], "bytes 5-9/10")
+	if status != http.StatusOK {
+		t.Fatalf("final chunk status = %d, want %d; body=%s", status, http.StatusOK, body)
+	}
+
+	var payload []map[string]interface{}
+	if err := json.Unmarshal([]byte(body), &payload); err != nil {
+		t.Fatalf("failed to decode finalize payload: %v body=%s", err, body)
+	}
+	if len(payload) != 1 {
+		t.Fatalf("finalize payload length = %d, want 1; body=%s", len(payload), body)
+	}
+	if got, _ := payload[0]["name"].(string); got != autoRenamed {
+		t.Fatalf("finalize payload name = %q, want %q; body=%s", got, autoRenamed, body)
+	}
+
+	listResp := adminClient.Get(t, fmt.Sprintf("/api/v2.1/repos/%s/dir/?p=/", repoID))
+	expectStatus(t, listResp, http.StatusOK)
+	var dirList map[string]interface{}
+	decodeJSON(t, listResp, &dirList)
+	entries, _ := dirList["dirent_list"].([]interface{})
+	if !containsEntry(entries, "name", fileName) {
+		t.Fatalf("original file %q not found after chunked autorename race", fileName)
+	}
+	if !containsEntry(entries, "name", autoRenamed) {
+		t.Fatalf("autorename target %q not found after chunked autorename race", autoRenamed)
+	}
 }
 
 // ── 6. Two-region concurrent uploads ─────────────────────────────────────────

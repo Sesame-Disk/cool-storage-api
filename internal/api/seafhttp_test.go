@@ -3,6 +3,9 @@ package api
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"mime/multipart"
 	"net/http"
@@ -11,9 +14,12 @@ import (
 	"testing"
 	"time"
 
+	v2 "github.com/Sesame-Disk/sesamefs/internal/api/v2"
+	"github.com/Sesame-Disk/sesamefs/internal/metrics"
 	"github.com/Sesame-Disk/sesamefs/internal/middleware"
 	"github.com/Sesame-Disk/sesamefs/internal/storage"
 	"github.com/gin-gonic/gin"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"golang.org/x/time/rate"
 )
 
@@ -169,6 +175,42 @@ func TestChunkJanitor_DiskOrphanCleaned(t *testing.T) {
 
 	if _, err := os.Stat(f.Name()); !os.IsNotExist(err) {
 		t.Errorf("orphaned disk file should be removed, stat err=%v", err)
+	}
+}
+
+func TestWriteSeafHTTPUploadError_MapsSentinelErrors(t *testing.T) {
+	tests := []struct {
+		name       string
+		err        error
+		genericMsg string
+		wantStatus int
+		wantError  string
+	}{
+		{name: "head conflict", err: v2.ErrLibraryHeadConflict, genericMsg: "failed to finalize upload", wantStatus: http.StatusConflict, wantError: "library was modified concurrently; retry the upload"},
+		{name: "wrapped head conflict (mirrors retry_exhausted production path)", err: fmt.Errorf("%w: failed to finalize upload metadata after 20 attempts", v2.ErrLibraryHeadConflict), genericMsg: "failed to finalize upload", wantStatus: http.StatusConflict, wantError: "library was modified concurrently; retry the upload"},
+		{name: "quota exceeded", err: errStorageQuotaExceeded, genericMsg: "failed to finalize upload", wantStatus: http.StatusForbidden, wantError: "storage quota exceeded"},
+		{name: "generic", err: errors.New("boom"), genericMsg: "failed to finalize upload", wantStatus: http.StatusInternalServerError, wantError: "failed to finalize upload"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+
+			writeSeafHTTPUploadError(c, tt.err, tt.genericMsg)
+
+			if w.Code != tt.wantStatus {
+				t.Fatalf("status = %d, want %d", w.Code, tt.wantStatus)
+			}
+
+			var resp map[string]interface{}
+			if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+				t.Fatalf("json.Unmarshal() error = %v", err)
+			}
+			if got := resp["error"]; got != tt.wantError {
+				t.Fatalf("error = %v, want %q", got, tt.wantError)
+			}
+		})
 	}
 }
 
@@ -1285,6 +1327,51 @@ func TestChunkUploadIsComplete_OutOfOrderLastChunk(t *testing.T) {
 	}
 	if string(content) != "hello world!" {
 		t.Errorf("content = %q, want %q", string(content), "hello world!")
+	}
+}
+
+func TestChunkUploadTryStartFinalizationMetricsDifferentiateStates(t *testing.T) {
+	cm := NewChunkManager()
+
+	upload, err := cm.GetOrCreateUpload("token-metrics", "metric-test.bin", "/", 10)
+	if err != nil {
+		t.Fatalf("GetOrCreateUpload failed: %v", err)
+	}
+	defer func() {
+		upload.Cleanup()
+		cm.CleanupUpload("token-metrics", "metric-test.bin")
+	}()
+
+	beforeNotComplete := testutil.ToFloat64(metrics.ChunkUploadFinalizationAttemptsTotal.WithLabelValues("not_complete"))
+	beforeAlreadyFinalizing := testutil.ToFloat64(metrics.ChunkUploadFinalizationAttemptsTotal.WithLabelValues("already_finalizing"))
+	beforeStarted := testutil.ToFloat64(metrics.ChunkUploadFinalizationAttemptsTotal.WithLabelValues("started"))
+
+	if upload.TryStartFinalization() {
+		t.Fatal("upload should not start finalization before all ranges are received")
+	}
+	if got := testutil.ToFloat64(metrics.ChunkUploadFinalizationAttemptsTotal.WithLabelValues("not_complete")); got != beforeNotComplete+1 {
+		t.Fatalf("not_complete metric = %v, want %v", got, beforeNotComplete+1)
+	}
+
+	if err := upload.WriteChunk([]byte("hello"), 0, 4); err != nil {
+		t.Fatalf("WriteChunk first chunk failed: %v", err)
+	}
+	if err := upload.WriteChunk([]byte("world"), 5, 9); err != nil {
+		t.Fatalf("WriteChunk second chunk failed: %v", err)
+	}
+
+	if !upload.TryStartFinalization() {
+		t.Fatal("first finalization attempt should win once upload is complete")
+	}
+	if got := testutil.ToFloat64(metrics.ChunkUploadFinalizationAttemptsTotal.WithLabelValues("started")); got != beforeStarted+1 {
+		t.Fatalf("started metric = %v, want %v", got, beforeStarted+1)
+	}
+
+	if upload.TryStartFinalization() {
+		t.Fatal("second finalization attempt should be rejected while finalizing")
+	}
+	if got := testutil.ToFloat64(metrics.ChunkUploadFinalizationAttemptsTotal.WithLabelValues("already_finalizing")); got != beforeAlreadyFinalizing+1 {
+		t.Fatalf("already_finalizing metric = %v, want %v", got, beforeAlreadyFinalizing+1)
 	}
 }
 
