@@ -152,6 +152,7 @@ export const clearFileUploadRuntimeState = (resumableFile, options = {}) => {
 
     resumableFile.isFinalizing = false;
     resumableFile.lastUploadResponseStatus = null;
+    resumableFile.suppressNextUploadErrorToast = false;
     if (options.resetRemainingTime) {
         resumableFile.remainingTime = DEFAULT_PREPARING_TIME;
     }
@@ -200,6 +201,7 @@ export const markUploadConflictAutoRetry = (resumableFile) => {
     }
 
     resumableFile.finalizeConflictAutoRetried = true;
+    resumableFile.suppressNextUploadErrorToast = true;
 };
 
 export const resetUploadConflictAutoRetry = (resumableFile) => {
@@ -208,6 +210,41 @@ export const resetUploadConflictAutoRetry = (resumableFile) => {
     }
 
     resumableFile.finalizeConflictAutoRetried = false;
+    resumableFile.suppressNextUploadErrorToast = false;
+};
+
+export const consumeSuppressedUploadErrorToast = (resumableFile) => {
+    if (!resumableFile || !resumableFile.suppressNextUploadErrorToast) {
+        return false;
+    }
+
+    resumableFile.suppressNextUploadErrorToast = false;
+    return true;
+};
+
+export const moveUploadToRetryState = (uploadFileList, retryFileList, resumableFile, error, options = {}) => {
+    const { resetAutoRetry = false } = options;
+    const nextRetryFileList = Array.isArray(retryFileList) ? retryFileList.slice() : [];
+    const nextUploadFileList = Array.isArray(uploadFileList) ? uploadFileList.map(item => {
+        if (!resumableFile || item.uniqueIdentifier !== resumableFile.uniqueIdentifier) {
+            return item;
+        }
+
+        if (!nextRetryFileList.some(retryItem => retryItem.uniqueIdentifier === item.uniqueIdentifier)) {
+            nextRetryFileList.push(item);
+        }
+        clearFileUploadRuntimeState(item);
+        if (resetAutoRetry) {
+            resetUploadConflictAutoRetry(item);
+        }
+        item.error = error;
+        return item;
+    }) : [];
+
+    return {
+        retryFileList: nextRetryFileList,
+        uploadFileList: nextUploadFileList,
+    };
 };
 
 export const maybeMarkFileFinalizing = (resumableFile, resumable, baseline) => {

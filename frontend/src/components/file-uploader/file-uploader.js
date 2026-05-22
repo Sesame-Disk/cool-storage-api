@@ -4,7 +4,7 @@ import Resumablejs from '@seafile/resumablejs';
 import MD5 from 'md5';
 import { resumableUploadFileBlockSize, resumableSimultaneousUploads, maxUploadFileSize, maxNumberOfFilesForFileupload } from '../../utils/constants';
 import { seafileAPI } from '../../utils/seafile-api';
-import { clearFileUploadRuntimeState, getBaselineSimultaneousUploads, markUploadConflictAutoRetry, maybeMarkFileFinalizing, maybeStartPendingUploadDuringFinalize, resetUploadConflictAutoRetry, restoreUploadConcurrencyIfIdle, shouldAutoRetryUploadConflict, trackUploadResponseStatus } from '../../utils/upload-finalization';
+import { clearFileUploadRuntimeState, getBaselineSimultaneousUploads, markUploadConflictAutoRetry, maybeMarkFileFinalizing, maybeStartPendingUploadDuringFinalize, moveUploadToRetryState, resetUploadConflictAutoRetry, restoreUploadConcurrencyIfIdle, shouldAutoRetryUploadConflict, trackUploadResponseStatus } from '../../utils/upload-finalization';
 import { Utils } from '../../utils/utils';
 import { gettext } from '../../utils/constants';
 import UploadProgressDialog from './upload-progress-dialog';
@@ -488,18 +488,11 @@ class FileUploader extends React.Component {
       }
     }
 
-    let uploadFileList = this.state.uploadFileList.map(item => {
-      if (item.uniqueIdentifier === resumableFile.uniqueIdentifier) {
-        this.state.retryFileList.push(item);
-        clearFileUploadRuntimeState(item);
-        item.error = error;
-      }
-      return item;
-    });
+    const { retryFileList, uploadFileList } = moveUploadToRetryState(this.state.uploadFileList, this.state.retryFileList, resumableFile, error);
 
     this.loaded = 0;  // reset loaded data;
     this.setState({
-      retryFileList: this.state.retryFileList,
+      retryFileList: retryFileList,
       uploadFileList: uploadFileList
     });
     this.restoreConcurrencyIfIdle();
@@ -533,6 +526,15 @@ class FileUploader extends React.Component {
       this.restoreConcurrencyIfIdle();
     }).catch(error => {
       let errMessage = Utils.getErrorMsg(error);
+      if (!resetAutoRetry) {
+        const { retryFileList, uploadFileList } = moveUploadToRetryState(this.state.uploadFileList, this.state.retryFileList, resumableFile, errMessage, { resetAutoRetry: true });
+        this.loaded = 0;
+        this.setState({
+          retryFileList: retryFileList,
+          uploadFileList: uploadFileList
+        });
+        this.restoreConcurrencyIfIdle();
+      }
       toaster.danger(errMessage);
     });
   };
