@@ -1075,8 +1075,14 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 	parentDir := c.DefaultPostForm("parent_dir", token.Path)
 	relativePath := c.PostForm("relative_path")
 	replaceFile := token.Replace
-	if replaceStr, ok := c.GetPostForm("replace"); ok {
-		replaceFile = replaceStr != "0"
+	if token.Replace {
+		// The token defines whether this upload is allowed to overwrite.
+		// `replace=0` may downgrade an update-link to autorename, but an
+		// upload-link must not be elevated to overwrite via multipart fields.
+		replaceStr, ok := c.GetPostForm("replace")
+		if ok {
+			replaceFile = replaceStr != "0"
+		}
 	}
 	retJSON := c.Query("ret-json") == "1" || c.PostForm("ret-json") == "1"
 

@@ -148,9 +148,9 @@ Authorization: Token {api_token}
 http://server:8080/seafhttp/upload-api/{upload_token}
 ```
 
-`upload-link` tokens default to no-replace behavior. Re-uploading the same
-filename through this URL auto-renames the new file unless the multipart form
-explicitly sends `replace=1`.
+`upload-link` tokens enforce no-replace behavior. Re-uploading the same
+filename through this URL auto-renames the new file even if the multipart form
+tries to force `replace=1`.
 
 For overwrite-by-default behavior, first request:
 
