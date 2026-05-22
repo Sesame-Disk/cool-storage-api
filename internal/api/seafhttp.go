@@ -555,10 +555,12 @@ func (cu *ChunkUpload) TryStartFinalization() bool {
 	cu.mu.Lock()
 	defer cu.mu.Unlock()
 	if cu.Finalizing || !cu.isCompleteLocked() {
+		metrics.ChunkUploadFinalizationAttemptsTotal.WithLabelValues("deferred").Inc()
 		return false
 	}
 	cu.Finalizing = true
 	cu.finalizationStarted = true
+	metrics.ChunkUploadFinalizationAttemptsTotal.WithLabelValues("started").Inc()
 	return true
 }
 
@@ -1643,16 +1645,30 @@ readLoop:
 // Returns the commit ID, the actual filename used (may differ if auto-renamed),
 // and the storage delta from the winning publish attempt.
 func (h *SeafHTTPHandler) commitUploadedFileMultiBlock(orgID, repoID, userID, parentDir, filename, fileID string, blockIDs []string, fileSize int64, replace bool) (string, string, int64, int64, error) {
+	startedAt := time.Now()
+	attemptsUsed := 0
+	result := "error"
+	defer func() {
+		metrics.UploadFinalizeAttempts.WithLabelValues("seafhttp_multiblock", result).Observe(float64(attemptsUsed))
+		metrics.UploadFinalizeDuration.WithLabelValues("seafhttp_multiblock", result).Observe(time.Since(startedAt).Seconds())
+	}()
+
 	var lastConflict error
 	for attempt := 1; attempt <= uploadMetadataRetryAttempts; attempt++ {
+		attemptsUsed = attempt
 		commitID, actualFilename, storageDeltaBytes, storageDeltaFiles, err := h.commitUploadedFileMultiBlockOnce(orgID, repoID, userID, parentDir, filename, fileID, blockIDs, fileSize, replace)
 		if err == nil {
+			result = "success"
 			return commitID, actualFilename, storageDeltaBytes, storageDeltaFiles, nil
 		}
 		if !errors.Is(err, v2.ErrLibraryHeadConflict) {
+			if errors.Is(err, errStorageQuotaExceeded) {
+				result = "quota_exceeded"
+			}
 			return "", "", 0, 0, err
 		}
 		lastConflict = err
+		metrics.UploadFinalizeHeadConflictsTotal.WithLabelValues("seafhttp_multiblock").Inc()
 		if attempt == uploadMetadataRetryAttempts {
 			break
 		}
@@ -1662,6 +1678,8 @@ func (h *SeafHTTPHandler) commitUploadedFileMultiBlock(orgID, repoID, userID, pa
 	}
 
 	log.Printf("[commitUploadedFileMultiBlock] Exhausted metadata retries for repo=%s: %v", repoID, lastConflict)
+	result = "retry_exhausted"
+	metrics.UploadFinalizeRetryExhaustedTotal.WithLabelValues("seafhttp_multiblock").Inc()
 	return "", "", 0, 0, fmt.Errorf("failed to finalize upload metadata after %d attempts", uploadMetadataRetryAttempts)
 }
 
@@ -1748,16 +1766,30 @@ func (h *SeafHTTPHandler) commitUploadedFileMultiBlockOnce(orgID, repoID, userID
 // Returns the commit ID, the actual filename used (may differ if auto-renamed),
 // and the storage delta from the winning publish attempt.
 func (h *SeafHTTPHandler) commitUploadedFile(orgID, repoID, userID, parentDir, filename, fileID string, content []byte, fileSize int64, replace bool) (string, string, int64, int64, error) {
+	startedAt := time.Now()
+	attemptsUsed := 0
+	result := "error"
+	defer func() {
+		metrics.UploadFinalizeAttempts.WithLabelValues("seafhttp_single", result).Observe(float64(attemptsUsed))
+		metrics.UploadFinalizeDuration.WithLabelValues("seafhttp_single", result).Observe(time.Since(startedAt).Seconds())
+	}()
+
 	var lastConflict error
 	for attempt := 1; attempt <= uploadMetadataRetryAttempts; attempt++ {
+		attemptsUsed = attempt
 		commitID, actualFilename, storageDeltaBytes, storageDeltaFiles, err := h.commitUploadedFileOnce(orgID, repoID, userID, parentDir, filename, fileID, content, fileSize, replace)
 		if err == nil {
+			result = "success"
 			return commitID, actualFilename, storageDeltaBytes, storageDeltaFiles, nil
 		}
 		if !errors.Is(err, v2.ErrLibraryHeadConflict) {
+			if errors.Is(err, errStorageQuotaExceeded) {
+				result = "quota_exceeded"
+			}
 			return "", "", 0, 0, err
 		}
 		lastConflict = err
+		metrics.UploadFinalizeHeadConflictsTotal.WithLabelValues("seafhttp_single").Inc()
 		if attempt == uploadMetadataRetryAttempts {
 			break
 		}
@@ -1767,6 +1799,8 @@ func (h *SeafHTTPHandler) commitUploadedFile(orgID, repoID, userID, parentDir, f
 	}
 
 	log.Printf("[commitUploadedFile] Exhausted metadata retries for repo=%s: %v", repoID, lastConflict)
+	result = "retry_exhausted"
+	metrics.UploadFinalizeRetryExhaustedTotal.WithLabelValues("seafhttp_single").Inc()
 	return "", "", 0, 0, fmt.Errorf("failed to finalize upload metadata after %d attempts", uploadMetadataRetryAttempts)
 }
 

@@ -741,22 +741,22 @@ The visible-delta storage pre-check landed for upload paths in 2026-05-14 and cl
 
 #### Hot spots
 
-**1. Chunked uploads re-run the full pre-check on every chunk**
+**1. Chunked uploads still pay the full visible-delta traversal on first check and finalize**
 ([internal/api/seafhttp.go:1069](internal/api/seafhttp.go#L1069))
 
-`HandleUpload` chunked path calls `checkUploadStorageQuotaForCurrentHead` for every incoming chunk request and once more inside `finalizeUploadStreaming` ([internal/api/seafhttp.go:1403](internal/api/seafhttp.go#L1403)). For an upload of N chunks the server performs N+1 HEAD reads, N+1 commit/root_fs_id reads, and N+1 directory traversals of `parentDir`. The delta itself does not change between chunks — only concurrent third-party writers could move it — so most of those tree walks compute the same answer.
+`HandleUpload` now caches a successful chunked storage pre-check on the in-memory upload tracker (`HasQuotaPrecheck` / `MarkQuotaPrecheck`), so later chunk requests with the same `(parentDir, totalSize, replace)` tuple no longer re-run `checkUploadStorageQuotaForCurrentHead` on every request. Finalization still calls `checkUploadStorageQuotaForCurrentHead` again inside `finalizeUploadStreaming` ([internal/api/seafhttp.go:1403](internal/api/seafhttp.go#L1403)) so publish is revalidated against the current HEAD.
 
-This is intentional defense-in-depth right now: it catches the TOCTOU window between the first chunk and finalize when another writer publishes. But the cost scales linearly with chunk count, and large resumable uploads can hit hundreds of chunks.
+That means the hot path cost is no longer O(N chunks); the remaining cost is the full visible-delta traversal on the first accepted chunk plus the authoritative re-check at finalize. This is still worth optimizing for large/deep directory trees, but it is no longer the per-chunk storm described in earlier audits.
 
 Possible mitigations (in order of preference):
-- Cache the resolved `(headCommitID, rootFSID, parentResult)` for the lifetime of one chunked-upload session and only re-resolve at finalize. Pre-check the delta against the cached state for intermediate chunks.
-- Pre-check only on first chunk and on finalize; skip intermediate chunks entirely.
-- Push the entire visible-delta resolution down to the chunk session creation, store it on the upload session, and refresh it only when the HEAD changes (detected by a CAS on session resume).
+- Cache the resolved `(headCommitID, rootFSID, parentResult)` or a higher-level delta context for the lifetime of one chunked-upload session and only re-resolve when finalize detects a changed HEAD.
+- Reuse the same traversal helper family as `v2/files.go` so path-resolution and future caching improvements are shared across upload surfaces.
+- If we later need tighter client/server resumable reconciliation, expand the tracker cache to retain the resolved target-state hash rather than only the boolean fact that a pre-check succeeded.
 
 **2. `directoryEntriesAtPath` does one Cassandra query per path segment**
 ([internal/api/seafhttp.go:1327](internal/api/seafhttp.go#L1327))
 
-The traversal does `SELECT dir_entries FROM fs_objects` once per directory level. A target path of `/a/b/c/d/file.txt` is 5 queries (root + 4 nested dirs). On every chunk in a chunked upload, the same path is re-walked. This compounds with the per-chunk pre-check above.
+The traversal does `SELECT dir_entries FROM fs_objects` once per directory level. A target path of `/a/b/c/d/file.txt` is 5 queries (root + 4 nested dirs). Even with the per-tracker pre-check cache, the first chunk and finalize still re-walk the same path, so deep/nested uploads keep paying that traversal cost twice.
 
 Possible mitigations:
 - Reuse `FSHelper.TraverseToPath` (which `v2/files.go:UploadFile` already uses) instead of carrying a separate traversal implementation in `seafhttp.go`. That centralizes path-traversal performance work for everyone.

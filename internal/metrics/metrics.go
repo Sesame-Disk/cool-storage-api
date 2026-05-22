@@ -239,6 +239,58 @@ var (
 		},
 		[]string{"source"}, // "tracker" (in-memory map) or "disk" (tempDir sweep)
 	)
+
+	// ChunkUploadFinalizationAttemptsTotal counts how often a chunked upload
+	// tracker wins or loses the finalization gate.
+	ChunkUploadFinalizationAttemptsTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "chunk_upload_finalization_attempts_total",
+			Help: "Total number of chunked upload finalization gate outcomes.",
+		},
+		[]string{"result"}, // "started" or "deferred"
+	)
+
+	// UploadFinalizeHeadConflictsTotal counts metadata publish conflicts that
+	// force an upload finalize retry.
+	UploadFinalizeHeadConflictsTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "upload_finalize_head_conflicts_total",
+			Help: "Total number of upload finalize head conflicts by surface.",
+		},
+		[]string{"surface"},
+	)
+
+	// UploadFinalizeRetryExhaustedTotal counts finalize operations that hit the
+	// retry budget before publishing metadata.
+	UploadFinalizeRetryExhaustedTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "upload_finalize_retry_exhausted_total",
+			Help: "Total number of upload finalize operations that exhausted the retry budget.",
+		},
+		[]string{"surface"},
+	)
+
+	// UploadFinalizeAttempts observes how many publish attempts were needed for
+	// each upload finalize call.
+	UploadFinalizeAttempts = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "upload_finalize_attempts",
+			Help:    "Number of publish attempts required by each upload finalize call.",
+			Buckets: []float64{1, 2, 3, 5, 8, 13, 21},
+		},
+		[]string{"surface", "result"},
+	)
+
+	// UploadFinalizeDuration observes metadata finalize latency, including any
+	// retries and backoff.
+	UploadFinalizeDuration = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "upload_finalize_duration_seconds",
+			Help:    "Duration of upload metadata finalize calls, including retries.",
+			Buckets: prometheus.DefBuckets,
+		},
+		[]string{"surface", "result"},
+	)
 )
 
 // Register registers all custom metrics with the default Prometheus registry.
@@ -271,5 +323,10 @@ func Register() {
 		GCWorkerLastSuccessTimestamp,
 		GCAuditEventsTotal,
 		ChunkUploadTempOrphansCleaned,
+		ChunkUploadFinalizationAttemptsTotal,
+		UploadFinalizeHeadConflictsTotal,
+		UploadFinalizeRetryExhaustedTotal,
+		UploadFinalizeAttempts,
+		UploadFinalizeDuration,
 	)
 }
