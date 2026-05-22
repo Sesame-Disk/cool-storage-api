@@ -264,6 +264,7 @@ func TestWebUploadReplaceUsesStorageDelta(t *testing.T) {
 
 	repoID := createTestLibrary(t, userClient, fmt.Sprintf("inttest-replace-delta-%d", time.Now().UnixNano()))
 	uploadURL := getUploadURL(t, userClient, repoID)
+	updateURL := getUpdateURL(t, userClient, repoID)
 	fileName := "replace-delta.txt"
 
 	status, body := uploadFileThroughLinkStatus(t, userClient, uploadURL, fileName, "/", strings.Repeat("a", 100))
@@ -274,7 +275,7 @@ func TestWebUploadReplaceUsesStorageDelta(t *testing.T) {
 	afterInitialUsage := waitForUserQuotaUsage(t, baselineUsage+100)
 	setDefaultUserQuota(t, afterInitialUsage)
 
-	status, body = uploadFileThroughLinkStatus(t, userClient, uploadURL, fileName, "/", strings.Repeat("b", 100))
+	status, body = uploadFileThroughLinkStatus(t, userClient, updateURL, fileName, "/", strings.Repeat("b", 100))
 	if status != http.StatusOK {
 		t.Fatalf("same-size replace status = %d, want %d; body=%s", status, http.StatusOK, body)
 	}
@@ -284,7 +285,7 @@ func TestWebUploadReplaceUsesStorageDelta(t *testing.T) {
 	}
 
 	setDefaultUserQuota(t, afterInitialUsage+20)
-	status, body = uploadFileThroughLinkStatus(t, userClient, uploadURL, fileName, "/", strings.Repeat("c", 120))
+	status, body = uploadFileThroughLinkStatus(t, userClient, updateURL, fileName, "/", strings.Repeat("c", 120))
 	if status != http.StatusOK {
 		t.Fatalf("larger replace status = %d, want %d; body=%s", status, http.StatusOK, body)
 	}
@@ -675,6 +676,13 @@ func getUploadURL(t *testing.T, c *testClient, repoID string) string {
 	return strings.Trim(responseBody(t, resp), "\" \n\r")
 }
 
+func getUpdateURL(t *testing.T, c *testClient, repoID string) string {
+	t.Helper()
+	resp := c.Get(t, fmt.Sprintf("/api2/repos/%s/update-link/?p=/", repoID))
+	expectStatus(t, resp, http.StatusOK)
+	return strings.Trim(responseBody(t, resp), "\" \n\r")
+}
+
 func uploadChunkThroughLinkStatus(t *testing.T, c *testClient, uploadURL, fileName, parentDir string, content []byte, contentRange string) (int, string) {
 	t.Helper()
 
@@ -949,6 +957,7 @@ func TestRevertFileEnforcesPerUserStorageQuota(t *testing.T) {
 	setDefaultUserQuota(t, baselineUsage+int64(len(largeBody))+100)
 
 	uploadURL := getUploadURL(t, userClient, repoID)
+	updateURL := getUpdateURL(t, userClient, repoID)
 
 	// Upload large version, capture HEAD = C1 (contains 200-byte rev.txt).
 	status, body := uploadFileThroughLinkStatus(t, userClient, uploadURL, "rev.txt", "/", largeBody)
@@ -963,7 +972,7 @@ func TestRevertFileEnforcesPerUserStorageQuota(t *testing.T) {
 	}
 
 	// Replace with small version. HEAD advances to C2, counter shrinks.
-	status, body = uploadFileThroughLinkStatus(t, userClient, uploadURL, "rev.txt", "/", smallBody)
+	status, body = uploadFileThroughLinkStatus(t, userClient, updateURL, "rev.txt", "/", smallBody)
 	if status != http.StatusOK {
 		t.Fatalf("upload small status = %d; body=%s", status, body)
 	}

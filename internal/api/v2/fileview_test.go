@@ -23,6 +23,10 @@ func (m *mockTokenCreator) CreateUploadToken(orgID, repoID, path, userID string)
 	return "mock-upload-token-" + repoID, nil
 }
 
+func (m *mockTokenCreator) CreateUpdateToken(orgID, repoID, path, userID string) (string, error) {
+	return "mock-update-token-" + repoID, nil
+}
+
 func (m *mockTokenCreator) CreateDownloadToken(orgID, repoID, path, userID string) (string, error) {
 	return "mock-download-token-" + repoID, nil
 }

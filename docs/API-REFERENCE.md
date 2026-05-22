@@ -148,6 +148,17 @@ Authorization: Token {api_token}
 http://server:8080/seafhttp/upload-api/{upload_token}
 ```
 
+`upload-link` tokens default to no-replace behavior. Re-uploading the same
+filename through this URL auto-renames the new file unless the multipart form
+explicitly sends `replace=1`.
+
+For overwrite-by-default behavior, first request:
+
+```
+GET /api2/repos/{repo_id}/update-link/?p={parent_dir}
+Authorization: Token {api_token}
+```
+
 **Step 2: Upload File**
 ```
 POST /seafhttp/upload-api/{upload_token}
@@ -273,7 +284,7 @@ Authorization: Token {api_token}
 
 | Endpoint | Method | Status | Description |
 |----------|--------|--------|-------------|
-| `/api2/repos/:id/update-link/` | GET | ❌ | Get URL to overwrite existing file |
+| `/api2/repos/:id/update-link/` | GET | ✅ | Get URL to overwrite existing file by default |
 
 ---
 

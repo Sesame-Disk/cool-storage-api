@@ -53,6 +53,7 @@ type AccessToken struct {
 	OrgID     string
 	RepoID    string
 	Path      string // File path for downloads, parent dir for uploads
+	Replace   bool   // Default overwrite behavior for upload tokens
 	UserID    string
 	Source    string // "" or "web" = regular user; "link" = share/upload link
 	AuthToken string // User's auth token (for one-time login tokens)
@@ -63,6 +64,7 @@ type AccessToken struct {
 // TokenStore is the interface for token operations (can be in-memory or Cassandra-backed)
 type TokenStore interface {
 	CreateUploadToken(orgID, repoID, path, userID string) (string, error)
+	CreateUpdateToken(orgID, repoID, path, userID string) (string, error)
 	CreateDownloadToken(orgID, repoID, path, userID string) (string, error)
 	CreateLinkUploadToken(orgID, repoID, path, userID string) (string, error)
 	CreateLinkDownloadToken(orgID, repoID, path, userID string) (string, error)
@@ -98,6 +100,10 @@ const DefaultTokenTTL = 1 * time.Hour
 
 // CreateToken creates a new access token
 func (tm *TokenManager) CreateToken(tokenType TokenType, orgID, repoID, path, userID, source string, ttl time.Duration) (*AccessToken, error) {
+	return tm.createToken(tokenType, orgID, repoID, path, userID, source, false, ttl)
+}
+
+func (tm *TokenManager) createToken(tokenType TokenType, orgID, repoID, path, userID, source string, replace bool, ttl time.Duration) (*AccessToken, error) {
 	// Generate random token
 	bytes := make([]byte, 16)
 	if _, err := rand.Read(bytes); err != nil {
@@ -111,6 +117,7 @@ func (tm *TokenManager) CreateToken(tokenType TokenType, orgID, repoID, path, us
 		OrgID:     orgID,
 		RepoID:    repoID,
 		Path:      path,
+		Replace:   replace,
 		UserID:    userID,
 		Source:    source,
 		ExpiresAt: time.Now().Add(ttl),
@@ -126,7 +133,16 @@ func (tm *TokenManager) CreateToken(tokenType TokenType, orgID, repoID, path, us
 
 // CreateUploadToken creates an upload token (implements TokenCreator interface)
 func (tm *TokenManager) CreateUploadToken(orgID, repoID, path, userID string) (string, error) {
-	token, err := tm.CreateToken(TokenTypeUpload, orgID, repoID, path, userID, "", tm.tokenTTL)
+	token, err := tm.createToken(TokenTypeUpload, orgID, repoID, path, userID, "", false, tm.tokenTTL)
+	if err != nil {
+		return "", err
+	}
+	return token.Token, nil
+}
+
+// CreateUpdateToken creates an upload token that overwrites the target path by default.
+func (tm *TokenManager) CreateUpdateToken(orgID, repoID, path, userID string) (string, error) {
+	token, err := tm.createToken(TokenTypeUpload, orgID, repoID, path, userID, "", true, tm.tokenTTL)
 	if err != nil {
 		return "", err
 	}
@@ -144,7 +160,7 @@ func (tm *TokenManager) CreateDownloadToken(orgID, repoID, path, userID string) 
 
 // CreateLinkUploadToken creates an upload token tagged as a share/upload link.
 func (tm *TokenManager) CreateLinkUploadToken(orgID, repoID, path, userID string) (string, error) {
-	token, err := tm.CreateToken(TokenTypeUpload, orgID, repoID, path, userID, "link", tm.tokenTTL)
+	token, err := tm.createToken(TokenTypeUpload, orgID, repoID, path, userID, "link", false, tm.tokenTTL)
 	if err != nil {
 		return "", err
 	}
@@ -1058,8 +1074,10 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 	// Get optional parameters
 	parentDir := c.DefaultPostForm("parent_dir", token.Path)
 	relativePath := c.PostForm("relative_path")
-	replaceStr := c.DefaultPostForm("replace", "1")
-	replaceFile := replaceStr != "0"
+	replaceFile := token.Replace
+	if replaceStr, ok := c.GetPostForm("replace"); ok {
+		replaceFile = replaceStr != "0"
+	}
 	retJSON := c.Query("ret-json") == "1" || c.PostForm("ret-json") == "1"
 
 	filename := header.Filename

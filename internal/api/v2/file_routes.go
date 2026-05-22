@@ -38,7 +38,7 @@ func registerRepoFileRoutes(repos *gin.RouterGroup, h *FileHandler) {
 
 	registerGetWithSlashVariants(repos, "/file/download-link", h.GetDownloadLink)
 	registerGetWithSlashVariants(repos, "/upload-link", h.GetUploadLink)
-	registerGetWithSlashVariants(repos, "/update-link", h.GetUploadLink)
+	registerGetWithSlashVariants(repos, "/update-link", h.GetUpdateLink)
 
 	registerPostWithSlashVariants(repos, "/upload", h.UploadFile)
 	registerGetWithSlashVariants(repos, "/download-info", h.GetDownloadInfo)

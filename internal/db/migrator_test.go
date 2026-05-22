@@ -165,3 +165,11 @@ func TestOnlyOfficePendingBlocksMigrationExists(t *testing.T) {
 	assert.Contains(t, content, "PRIMARY KEY ((org_id), operation_id)")
 	assert.Contains(t, content, "WITH default_time_to_live = 604800")
 }
+
+func TestAccessTokensReplaceExistingMigrationExists(t *testing.T) {
+	raw, err := migrationsFS.ReadFile("migrations/004_access_tokens_replace_existing.cql")
+	require.NoError(t, err)
+	content := string(raw)
+
+	assert.Contains(t, content, "ALTER TABLE access_tokens ADD replace_existing BOOLEAN")
+}

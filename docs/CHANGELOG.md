@@ -8,6 +8,45 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-05-22 - Upload-link vs update-link semantics fixed
+
+### Fixed
+
+The Seafile-compatible upload contract now matches the client intent again:
+
+- `GET /api2/repos/:id/upload-link/` creates upload tokens that default to
+  no-replace behavior, so repeated uploads auto-rename (`file (1).txt`, etc.)
+- `GET /api2/repos/:id/update-link/` creates upload tokens that default to
+  overwrite behavior
+- `HandleUpload` now derives its default replace policy from the token and still
+  honors an explicit multipart `replace` override when present
+
+To keep this safe in the real multi-node deployment, the token's default
+overwrite policy is now persisted in Cassandra `access_tokens` via a new schema
+migration instead of relying on in-memory state.
+
+### Tests / Docs
+
+- Added `TestUploadLinkAutoRenamesWithoutReplaceOverride`
+- Updated overwrite/quota integration coverage to use `update-link` for replace
+  semantics
+- Marked the long-standing `ISSUE-UPLOAD-REPLACE-01` docs as resolved
+
+### Files
+
+- `internal/api/seafhttp.go`
+- `internal/api/token_adapter.go`
+- `internal/api/v2/files.go`
+- `internal/api/v2/file_routes.go`
+- `internal/db/tokens.go`
+- `internal/db/migrations/004_access_tokens_replace_existing.cql`
+- `internal/integration/upload_download_test.go`
+- `internal/integration/quotas_test.go`
+- `docs/KNOWN_ISSUES.md`
+- `docs/API-REFERENCE.md`
+
+---
+
 ## 2026-05-22 — Upload/download audit hardening: encrypted round-trip fix + chunked precheck cache
 
 ### Fixed
@@ -878,7 +917,7 @@ Migrated all inline HTML from Go code to Go `html/template` files with base temp
 
 **Partial fix: Backend autorename infrastructure ready, but "Don't replace" not yet functional**
 
-The `replace` form parameter was extracted from upload requests but completely ignored (`_ = replace // TODO`). The server always overwrote files with the same name. This session added the backend plumbing for auto-rename support, but the full fix requires distinguishing `update-link` vs `upload-link` tokens (see ISSUE-UPLOAD-REPLACE-01 in KNOWN_ISSUES.md).
+The `replace` form parameter was extracted from upload requests but completely ignored (`_ = replace // TODO`). The server always overwrote files with the same name. This session added the backend plumbing for auto-rename support; at that time, the remaining step was to distinguish `update-link` vs `upload-link` tokens (completed later under ISSUE-UPLOAD-REPLACE-01).
 
 Backend changes:
 - `autoRenameIfExists()` function generates unique names (`file (1).txt`, `file (2).txt`, etc.)
@@ -886,7 +925,9 @@ Backend changes:
 - All commit/directory functions now return `actualFilename` (may differ from original if auto-renamed)
 - Default `replace=1` (overwrite) — preserves current behavior until token-level fix is implemented
 
-**Still pending**: Token-level `Replace` flag to distinguish `update-link` (replace) vs `upload-link` (auto-rename). See `docs/KNOWN_ISSUES.md` ISSUE-UPLOAD-REPLACE-01 for full plan.
+**Completed later**: The token-level `Replace` flag and the `upload-link` vs
+`update-link` split were completed on 2026-05-22. This entry remains the earlier
+partial infrastructure step.
 
 ### Files Changed
 

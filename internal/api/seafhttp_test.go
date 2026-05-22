@@ -324,6 +324,26 @@ func TestTokenManagerCreateUploadToken(t *testing.T) {
 	if token.Type != TokenTypeUpload {
 		t.Errorf("Type = %s, want %s", token.Type, TokenTypeUpload)
 	}
+	if token.Replace {
+		t.Error("CreateUploadToken should default Replace to false")
+	}
+}
+
+func TestTokenManagerCreateUpdateToken(t *testing.T) {
+	tm := NewTokenManager(1 * time.Hour)
+
+	tokenStr, err := tm.CreateUpdateToken("org1", "repo1", "/upload/path", "user1")
+	if err != nil {
+		t.Fatalf("CreateUpdateToken failed: %v", err)
+	}
+
+	token, ok := tm.GetToken(tokenStr, TokenTypeUpload)
+	if !ok {
+		t.Fatal("update token should be retrievable as an upload token")
+	}
+	if !token.Replace {
+		t.Error("CreateUpdateToken should default Replace to true")
+	}
 }
 
 func TestTokenManagerCreateDownloadToken(t *testing.T) {
@@ -632,6 +652,23 @@ func (m *MockTokenStore) CreateUploadToken(orgID, repoID, path, userID string) (
 		OrgID:     orgID,
 		RepoID:    repoID,
 		Path:      path,
+		Replace:   false,
+		UserID:    userID,
+		ExpiresAt: time.Now().Add(1 * time.Hour),
+		CreatedAt: time.Now(),
+	}
+	m.tokens[token.Token] = token
+	return token.Token, nil
+}
+
+func (m *MockTokenStore) CreateUpdateToken(orgID, repoID, path, userID string) (string, error) {
+	token := &AccessToken{
+		Token:     "mock-update-token",
+		Type:      TokenTypeUpload,
+		OrgID:     orgID,
+		RepoID:    repoID,
+		Path:      path,
+		Replace:   true,
 		UserID:    userID,
 		ExpiresAt: time.Now().Add(1 * time.Hour),
 		CreatedAt: time.Now(),
@@ -684,6 +721,7 @@ func (m *MockTokenStore) CreateLinkUploadToken(orgID, repoID, path, userID strin
 		OrgID:     orgID,
 		RepoID:    repoID,
 		Path:      path,
+		Replace:   false,
 		UserID:    userID,
 		ExpiresAt: time.Now().Add(1 * time.Hour),
 		CreatedAt: time.Now(),

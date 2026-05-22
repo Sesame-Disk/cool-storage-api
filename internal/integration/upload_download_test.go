@@ -468,16 +468,15 @@ func TestRegionPinnedLibraryReadPaths(t *testing.T) {
 	})
 }
 
-// TestUploadOverwrite verifies that uploading to the same path overwrites the file.
+// TestUploadOverwrite verifies that update-link uploads overwrite the file by default.
 func TestUploadOverwrite(t *testing.T) {
 	name := fmt.Sprintf("inttest-overwrite-%d", time.Now().UnixNano())
 	repoID := createTestLibrary(t, adminClient, name)
 	fileName := "overwrite-test.txt"
 
-	upload := func(content string) {
+	upload := func(linkPath, content string) {
 		t.Helper()
-		// Get upload link
-		resp := adminClient.Get(t, fmt.Sprintf("/api2/repos/%s/upload-link/?p=/", repoID))
+		resp := adminClient.Get(t, fmt.Sprintf("/api2/repos/%s/%s/?p=/", repoID, linkPath))
 		expectStatus(t, resp, http.StatusOK)
 		uploadURL := strings.Trim(responseBody(t, resp), "\" \n\r")
 
@@ -515,15 +514,72 @@ func TestUploadOverwrite(t *testing.T) {
 	}
 
 	// Upload v1
-	upload("version 1 content")
+	upload("upload-link", "version 1 content")
 
-	// Upload v2 (overwrite)
-	upload("version 2 content")
+	// Upload v2 (overwrite via update-link)
+	upload("update-link", "version 2 content")
 
 	// Download and verify it's v2
 	got := download()
 	if got != "version 2 content" {
 		t.Errorf("expected 'version 2 content', got %q", got)
+	}
+}
+
+func TestUploadLinkAutoRenamesWithoutReplaceOverride(t *testing.T) {
+	name := fmt.Sprintf("inttest-upload-autorename-%d", time.Now().UnixNano())
+	repoID := createTestLibrary(t, adminClient, name)
+	fileName := "autorename-test.txt"
+	autoRenamed := "autorename-test (1).txt"
+
+	resp := adminClient.Get(t, fmt.Sprintf("/api2/repos/%s/upload-link/?p=/", repoID))
+	expectStatus(t, resp, http.StatusOK)
+	uploadURL := strings.Trim(responseBody(t, resp), "\" \n\r")
+
+	uploadFileThroughLink(t, adminClient, uploadURL, fileName, "/", "first version")
+	uploadFileThroughLink(t, adminClient, uploadURL, fileName, "/", "second version")
+
+	listResp := adminClient.Get(t, fmt.Sprintf("/api/v2.1/repos/%s/dir/?p=/", repoID))
+	expectStatus(t, listResp, http.StatusOK)
+
+	var dirList map[string]interface{}
+	decodeJSON(t, listResp, &dirList)
+	entries, _ := dirList["dirent_list"].([]interface{})
+	if !containsEntry(entries, "name", fileName) {
+		t.Fatalf("original file %q not found after repeated upload-link upload", fileName)
+	}
+	if !containsEntry(entries, "name", autoRenamed) {
+		t.Fatalf("autorename target %q not found after repeated upload-link upload", autoRenamed)
+	}
+
+	download := func(name string) string {
+		t.Helper()
+		resp := adminClient.Get(t, fmt.Sprintf("/api2/repos/%s/file/?p=/%s", repoID, url.PathEscape(name)))
+		expectStatus(t, resp, http.StatusOK)
+		downloadURL := strings.Trim(responseBody(t, resp), "\" \n\r")
+
+		req, err := http.NewRequest(http.MethodGet, downloadURL, nil)
+		if err != nil {
+			t.Fatalf("creating download request failed: %v", err)
+		}
+		downloadResp, err := adminClient.http.Do(req)
+		if err != nil {
+			t.Fatalf("download request failed: %v", err)
+		}
+		defer downloadResp.Body.Close()
+
+		content, err := io.ReadAll(downloadResp.Body)
+		if err != nil {
+			t.Fatalf("reading download failed: %v", err)
+		}
+		return string(content)
+	}
+
+	if got := download(fileName); got != "first version" {
+		t.Fatalf("original file content = %q, want %q", got, "first version")
+	}
+	if got := download(autoRenamed); got != "second version" {
+		t.Fatalf("autorename file content = %q, want %q", got, "second version")
 	}
 }
 
