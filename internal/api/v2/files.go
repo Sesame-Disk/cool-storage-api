@@ -2626,11 +2626,19 @@ func (h *FileHandler) GetDownloadLink(c *gin.Context) {
 // GetUploadLink returns a URL for uploading a file (Seafile compatible)
 // The URL points to the server's seafhttp endpoint, not directly to S3
 func (h *FileHandler) GetUploadLink(c *gin.Context) {
+	if h.tokenCreator == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "service not available"})
+		return
+	}
 	h.getUploadLinkWithCreator(c, h.tokenCreator.CreateUploadToken)
 }
 
 // GetUpdateLink returns an upload URL whose token overwrites the target path by default.
 func (h *FileHandler) GetUpdateLink(c *gin.Context) {
+	if h.tokenCreator == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "service not available"})
+		return
+	}
 	h.getUploadLinkWithCreator(c, h.tokenCreator.CreateUpdateToken)
 }
 
@@ -2648,12 +2656,6 @@ func (h *FileHandler) getUploadLinkWithCreator(c *gin.Context, createToken func(
 	// CUSTOM PERMISSION CHECK: upload flag
 	if h.permMiddleware != nil && !h.permMiddleware.RequirePermFlag(c, "upload") {
 		c.JSON(http.StatusForbidden, gin.H{"error": "upload is not allowed by your permission"})
-		return
-	}
-
-	// Check if token creator is available
-	if h.tokenCreator == nil {
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "service not available"})
 		return
 	}
 

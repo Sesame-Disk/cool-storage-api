@@ -1,6 +1,7 @@
 package v2
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -266,6 +267,44 @@ func TestGetDownloadLink_ParameterValidation(t *testing.T) {
 
 			if w.Code == http.StatusNotFound {
 				t.Errorf("Route not found")
+			}
+		})
+	}
+}
+
+func TestGetUploadLinkWithoutTokenCreatorReturnsServiceUnavailable(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	handler := &FileHandler{}
+
+	r.GET("/repos/:repo_id/upload-link", handler.GetUploadLink)
+	r.GET("/repos/:repo_id/update-link", handler.GetUpdateLink)
+
+	tests := []struct {
+		name string
+		path string
+	}{
+		{name: "upload-link", path: "/repos/test-repo/upload-link?p=/"},
+		{name: "update-link", path: "/repos/test-repo/update-link?p=/"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, tt.path, nil)
+			w := httptest.NewRecorder()
+
+			r.ServeHTTP(w, req)
+
+			if w.Code != http.StatusServiceUnavailable {
+				t.Fatalf("status = %d, want %d", w.Code, http.StatusServiceUnavailable)
+			}
+
+			var payload map[string]string
+			if err := json.Unmarshal(w.Body.Bytes(), &payload); err != nil {
+				t.Fatalf("failed to decode response: %v body=%s", err, w.Body.String())
+			}
+			if payload["error"] != "service not available" {
+				t.Fatalf("error = %q, want %q", payload["error"], "service not available")
 			}
 		})
 	}

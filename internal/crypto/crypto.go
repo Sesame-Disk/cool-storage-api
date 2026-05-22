@@ -486,15 +486,14 @@ func DecryptBlockSeafile(ciphertext []byte, fileKey []byte, fileIV []byte) ([]by
 	return unpadded, nil
 }
 
-// DecryptLibraryBlock decrypts an encrypted library block using the current
-// Seafile-compatible derived-IV format when the library IV is available, and
-// falls back to the legacy/random-IV reader for older or unencrypted blocks.
+// DecryptLibraryBlock decrypts an encrypted library block.
+//
+// When the library IV is available, the block must be in the current
+// Seafile-compatible derived-IV format. Callers without a library IV fall back
+// to the legacy/random-IV reader for older or unencrypted blocks.
 func DecryptLibraryBlock(encrypted []byte, fileKey []byte, fileIV []byte) ([]byte, error) {
 	if len(fileIV) == IVSize {
-		decrypted, err := DecryptBlockSeafile(encrypted, fileKey, fileIV)
-		if err == nil {
-			return decrypted, nil
-		}
+		return DecryptBlockSeafile(encrypted, fileKey, fileIV)
 	}
 
 	return DecryptBlock(encrypted, fileKey)

@@ -219,6 +219,17 @@ func shouldTreatOnlyOfficeHeadLookupAsMissing(err error) bool {
 	return errors.Is(err, gocql.ErrNotFound)
 }
 
+func encryptOnlyOfficeContent(userID, repoID string, content []byte) ([]byte, error) {
+	fileKey, fileIV := GetDecryptSessions().GetFileKeyAndIV(userID, repoID)
+	if fileKey == nil {
+		return nil, fmt.Errorf("library is encrypted but not unlocked - cannot save")
+	}
+	if len(fileIV) == crypto.IVSize {
+		return crypto.EncryptBlockSeafile(content, fileKey, fileIV)
+	}
+	return crypto.EncryptBlock(content, fileKey)
+}
+
 func (h *OnlyOfficeHandler) saveOnlyOfficePendingBlock(orgID string, pending onlyOfficePendingBlock) error {
 	if h == nil || h.db == nil {
 		return fmt.Errorf("database not available")
@@ -1142,15 +1153,9 @@ func (h *OnlyOfficeHandler) saveEditedDocument(ctx context.Context, repoID, file
 
 	// If library is encrypted, encrypt the content before storage
 	if encrypted {
-		// Get file key from decrypt session (user must have unlocked the library)
-		fileKey := GetDecryptSessions().GetFileKey(userID, repoID)
-		if fileKey == nil {
-			return fmt.Errorf("library is encrypted but not unlocked - cannot save")
-		}
-
 		// Encrypt the content using Seafile block encryption format
 		originalSize := len(content)
-		encryptedContent, err := crypto.EncryptBlock(content, fileKey)
+		encryptedContent, err := encryptOnlyOfficeContent(userID, repoID, content)
 		if err != nil {
 			return fmt.Errorf("failed to encrypt content: %w", err)
 		}

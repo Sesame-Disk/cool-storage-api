@@ -121,6 +121,52 @@ func TestDecryptBlockSeafile_BadPadding(t *testing.T) {
 	}
 }
 
+func TestDecryptLibraryBlock_CorruptedSeafileCiphertextReturnsError(t *testing.T) {
+	fileKey := make([]byte, FileKeySize)
+	fileIV := make([]byte, IVSize)
+	for i := range fileKey {
+		fileKey[i] = byte(i + 1)
+	}
+	for i := range fileIV {
+		fileIV[i] = byte(i + 2)
+	}
+
+	encrypted, err := EncryptBlockSeafile([]byte("library block payload"), fileKey, fileIV)
+	if err != nil {
+		t.Fatalf("EncryptBlockSeafile failed: %v", err)
+	}
+	corrupted := append([]byte(nil), encrypted...)
+	corrupted[len(corrupted)-1] ^= 0xff
+
+	decrypted, err := DecryptLibraryBlock(corrupted, fileKey, fileIV)
+	if err == nil {
+		t.Fatalf("expected error, got plaintext=%x", decrypted)
+	}
+	if bytes.Equal(decrypted, corrupted) {
+		t.Fatal("DecryptLibraryBlock should not silently return ciphertext on decrypt failure")
+	}
+}
+
+func TestDecryptLibraryBlock_WithoutIVFallsBackToLegacyFormat(t *testing.T) {
+	fileKey := make([]byte, FileKeySize)
+	for i := range fileKey {
+		fileKey[i] = byte(i + 7)
+	}
+
+	encrypted, err := EncryptBlock([]byte("legacy library block payload"), fileKey)
+	if err != nil {
+		t.Fatalf("EncryptBlock failed: %v", err)
+	}
+
+	decrypted, err := DecryptLibraryBlock(encrypted, fileKey, nil)
+	if err != nil {
+		t.Fatalf("DecryptLibraryBlock failed: %v", err)
+	}
+	if !bytes.Equal(decrypted, []byte("legacy library block payload")) {
+		t.Fatalf("decrypted = %q, want %q", decrypted, "legacy library block payload")
+	}
+}
+
 // --- pkcs7Unpad error paths ---
 
 func TestPKCS7Unpad_EmptyData(t *testing.T) {
