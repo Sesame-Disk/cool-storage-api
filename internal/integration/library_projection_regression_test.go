@@ -850,6 +850,390 @@ func TestUpdateBranchSameHeadReturnsOKWithoutProjectionChange(t *testing.T) {
 	}
 }
 
+func TestSyncHeadSameHeadRepairsMissingOwnerProjection(t *testing.T) {
+	testSyncHeadSameHeadRepairsMissingOwnerProjection(t, http.MethodPut, "/seafhttp/repo/%s/commit/HEAD?head=%s")
+}
+
+func TestUpdateBranchSameHeadRepairsMissingOwnerProjection(t *testing.T) {
+	testSyncHeadSameHeadRepairsMissingOwnerProjection(t, http.MethodPost, "/seafhttp/repo/%s/update-branch?head=%s")
+}
+
+func testSyncHeadSameHeadRepairsMissingOwnerProjection(t *testing.T, method, routeFormat string) {
+	name := fmt.Sprintf("inttest-sync-idempotent-owner-repair-%d", time.Now().UnixNano())
+	repoID := createTestLibrary(t, adminClient, name)
+	session := shareProjectionDBForTest(t).Session()
+
+	var ownerID string
+	if err := session.Query(`SELECT owner_id FROM libraries WHERE org_id = ? AND library_id = ?`, defaultOrgID, repoID).Scan(&ownerID); err != nil {
+		t.Fatalf("failed to read owner_id for repo %s: %v", repoID, err)
+	}
+
+	initial := readLibrarySyncHeadState(t, session, repoID)
+	nextHead := fmt.Sprintf("%040x", time.Now().UnixNano())
+	insertSyntheticCommitForTest(t, session, repoID, nextHead, initial.HeadCommitID, initial.RootFSID, "integration idempotent owner-projection repair")
+	t.Cleanup(func() {
+		if err := session.Query(`DELETE FROM commits WHERE library_id = ? AND commit_id = ?`, repoID, nextHead).Exec(); err != nil {
+			t.Errorf("cleanup synthetic commit %s failed: %v", nextHead, err)
+		}
+	})
+
+	resp := adminClient.Do(t, method, fmt.Sprintf(routeFormat, repoID, url.QueryEscape(nextHead)), nil)
+	if resp.StatusCode != http.StatusOK {
+		body := responseBody(t, resp)
+		t.Fatalf("initial same-head repair setup failed: status=%d body=%s", resp.StatusCode, body)
+	}
+	resp.Body.Close()
+
+	var advanced librarySyncHeadState
+	waitForIntegrationCondition(t, "accepted head for owner-projection repair test to become authoritative", func() bool {
+		current := readLibrarySyncHeadState(t, session, repoID)
+		if current.HeadCommitID != nextHead || current.LookupHeadCommitID != nextHead {
+			return false
+		}
+		if !current.UpdatedAt.After(initial.UpdatedAt) || !current.ProjectionUpdatedAt.Equal(current.UpdatedAt) {
+			return false
+		}
+		advanced = current
+		return true
+	})
+
+	if err := session.Query(`DELETE FROM libraries_by_owner WHERE org_id = ? AND owner_id = ? AND library_id = ?`, defaultOrgID, ownerID, repoID).Exec(); err != nil {
+		t.Fatalf("failed to remove owner projection row for repo %s: %v", repoID, err)
+	}
+	if _, ok := adminLibraryProjectionRowForTest(t, session, defaultOrgID, repoID); !ok {
+		t.Fatalf("org projection row unexpectedly missing for repo %s after deleting owner projection", repoID)
+	}
+
+	idempotentResp := adminClient.Do(t, method, fmt.Sprintf(routeFormat, repoID, url.QueryEscape(nextHead)), nil)
+	if idempotentResp.StatusCode != http.StatusOK {
+		body := responseBody(t, idempotentResp)
+		t.Fatalf("idempotent retry after owner projection loss returned status=%d body=%s", idempotentResp.StatusCode, body)
+	}
+	idempotentResp.Body.Close()
+
+	waitForIntegrationCondition(t, "idempotent same-head retry to rebuild missing owner projection", func() bool {
+		current := readLibrarySyncHeadState(t, session, repoID)
+		if current.HeadCommitID != nextHead || current.LookupHeadCommitID != nextHead {
+			return false
+		}
+		ownerRow, ok := adminOwnerLibraryProjectionRowForTest(t, session, defaultOrgID, ownerID, repoID)
+		if !ok {
+			return false
+		}
+		return ownerRow.UpdatedAt.Equal(advanced.ProjectionUpdatedAt) && ownerRow.SizeBytes == advanced.ProjectionSizeBytes && ownerRow.FileCount == advanced.ProjectionFileCount
+	})
+
+	stabilized := readLibrarySyncHeadState(t, session, repoID)
+	if !stabilized.UpdatedAt.Equal(advanced.UpdatedAt) {
+		t.Fatalf("canonical updated_at changed after owner projection repair: got %s want %s", stabilized.UpdatedAt.Format(time.RFC3339Nano), advanced.UpdatedAt.Format(time.RFC3339Nano))
+	}
+	if !stabilized.ProjectionUpdatedAt.Equal(advanced.ProjectionUpdatedAt) {
+		t.Fatalf("org projection updated_at changed after owner projection repair: got %s want %s", stabilized.ProjectionUpdatedAt.Format(time.RFC3339Nano), advanced.ProjectionUpdatedAt.Format(time.RFC3339Nano))
+	}
+	ownerRow, ok := adminOwnerLibraryProjectionRowForTest(t, session, defaultOrgID, ownerID, repoID)
+	if !ok {
+		t.Fatalf("owner projection row was not recreated for repo %s", repoID)
+	}
+	if !ownerRow.UpdatedAt.Equal(advanced.ProjectionUpdatedAt) || ownerRow.SizeBytes != advanced.ProjectionSizeBytes || ownerRow.FileCount != advanced.ProjectionFileCount {
+		t.Fatalf("owner projection after repair = {updated_at=%s size=%d files=%d}, want {%s %d %d}", ownerRow.UpdatedAt.Format(time.RFC3339Nano), ownerRow.SizeBytes, ownerRow.FileCount, advanced.ProjectionUpdatedAt.Format(time.RFC3339Nano), advanced.ProjectionSizeBytes, advanced.ProjectionFileCount)
+	}
+}
+
+func TestSyncHeadSameHeadRepairsMissingOrgProjection(t *testing.T) {
+	testSyncHeadSameHeadRepairsMissingOrgProjection(t, http.MethodPut, "/seafhttp/repo/%s/commit/HEAD?head=%s")
+}
+
+func TestUpdateBranchSameHeadRepairsMissingOrgProjection(t *testing.T) {
+	testSyncHeadSameHeadRepairsMissingOrgProjection(t, http.MethodPost, "/seafhttp/repo/%s/update-branch?head=%s")
+}
+
+// testSyncHeadSameHeadRepairsMissingOrgProjection is the org-projection mirror
+// of testSyncHeadSameHeadRepairsMissingOwnerProjection. It validates that the
+// idempotent fast-path's canary catches a missing libraries_by_org_updated row
+// and reruns the full repair to recreate it from the canonical state. The owner
+// and global projection rows must remain present so the test isolates the
+// org-projection surface and proves repair targets it specifically.
+func testSyncHeadSameHeadRepairsMissingOrgProjection(t *testing.T, method, routeFormat string) {
+	name := fmt.Sprintf("inttest-sync-idempotent-org-repair-%d", time.Now().UnixNano())
+	repoID := createTestLibrary(t, adminClient, name)
+	session := shareProjectionDBForTest(t).Session()
+
+	var ownerID string
+	if err := session.Query(`SELECT owner_id FROM libraries WHERE org_id = ? AND library_id = ?`, defaultOrgID, repoID).Scan(&ownerID); err != nil {
+		t.Fatalf("failed to read owner_id for repo %s: %v", repoID, err)
+	}
+
+	initial := readLibrarySyncHeadState(t, session, repoID)
+	nextHead := fmt.Sprintf("%040x", time.Now().UnixNano())
+	insertSyntheticCommitForTest(t, session, repoID, nextHead, initial.HeadCommitID, initial.RootFSID, "integration idempotent org-projection repair")
+	t.Cleanup(func() {
+		if err := session.Query(`DELETE FROM commits WHERE library_id = ? AND commit_id = ?`, repoID, nextHead).Exec(); err != nil {
+			t.Errorf("cleanup synthetic commit %s failed: %v", nextHead, err)
+		}
+	})
+
+	resp := adminClient.Do(t, method, fmt.Sprintf(routeFormat, repoID, url.QueryEscape(nextHead)), nil)
+	if resp.StatusCode != http.StatusOK {
+		body := responseBody(t, resp)
+		t.Fatalf("initial same-head repair setup failed: status=%d body=%s", resp.StatusCode, body)
+	}
+	resp.Body.Close()
+
+	var advanced librarySyncHeadState
+	waitForIntegrationCondition(t, "accepted head for org-projection repair test to become authoritative", func() bool {
+		current := readLibrarySyncHeadState(t, session, repoID)
+		if current.HeadCommitID != nextHead || current.LookupHeadCommitID != nextHead {
+			return false
+		}
+		if !current.UpdatedAt.After(initial.UpdatedAt) || !current.ProjectionUpdatedAt.Equal(current.UpdatedAt) {
+			return false
+		}
+		advanced = current
+		return true
+	})
+
+	if err := session.Query(`DELETE FROM libraries_by_org_updated WHERE org_id = ? AND library_id = ?`, defaultOrgID, repoID).Exec(); err != nil {
+		t.Fatalf("failed to remove org projection row for repo %s: %v", repoID, err)
+	}
+	if _, ok := adminOwnerLibraryProjectionRowForTest(t, session, defaultOrgID, ownerID, repoID); !ok {
+		t.Fatalf("owner projection row unexpectedly missing for repo %s after deleting org projection", repoID)
+	}
+
+	idempotentResp := adminClient.Do(t, method, fmt.Sprintf(routeFormat, repoID, url.QueryEscape(nextHead)), nil)
+	if idempotentResp.StatusCode != http.StatusOK {
+		body := responseBody(t, idempotentResp)
+		t.Fatalf("idempotent retry after org projection loss returned status=%d body=%s", idempotentResp.StatusCode, body)
+	}
+	idempotentResp.Body.Close()
+
+	waitForIntegrationCondition(t, "idempotent same-head retry to rebuild missing org projection", func() bool {
+		current := readLibrarySyncHeadState(t, session, repoID)
+		if current.HeadCommitID != nextHead || current.LookupHeadCommitID != nextHead {
+			return false
+		}
+		orgRow, ok := adminLibraryProjectionRowForTest(t, session, defaultOrgID, repoID)
+		if !ok {
+			return false
+		}
+		return orgRow.UpdatedAt.Equal(advanced.ProjectionUpdatedAt) && orgRow.SizeBytes == advanced.ProjectionSizeBytes && orgRow.FileCount == advanced.ProjectionFileCount
+	})
+
+	stabilized := readLibrarySyncHeadState(t, session, repoID)
+	if !stabilized.UpdatedAt.Equal(advanced.UpdatedAt) {
+		t.Fatalf("canonical updated_at changed after org projection repair: got %s want %s", stabilized.UpdatedAt.Format(time.RFC3339Nano), advanced.UpdatedAt.Format(time.RFC3339Nano))
+	}
+	orgRow, ok := adminLibraryProjectionRowForTest(t, session, defaultOrgID, repoID)
+	if !ok {
+		t.Fatalf("org projection row was not recreated for repo %s", repoID)
+	}
+	if !orgRow.UpdatedAt.Equal(advanced.ProjectionUpdatedAt) || orgRow.SizeBytes != advanced.ProjectionSizeBytes || orgRow.FileCount != advanced.ProjectionFileCount {
+		t.Fatalf("org projection after repair = {updated_at=%s size=%d files=%d}, want {%s %d %d}", orgRow.UpdatedAt.Format(time.RFC3339Nano), orgRow.SizeBytes, orgRow.FileCount, advanced.ProjectionUpdatedAt.Format(time.RFC3339Nano), advanced.ProjectionSizeBytes, advanced.ProjectionFileCount)
+	}
+}
+
+func TestSyncHeadSameHeadRepairsMissingGlobalProjection(t *testing.T) {
+	testSyncHeadSameHeadRepairsMissingGlobalProjection(t, http.MethodPut, "/seafhttp/repo/%s/commit/HEAD?head=%s")
+}
+
+func TestUpdateBranchSameHeadRepairsMissingGlobalProjection(t *testing.T) {
+	testSyncHeadSameHeadRepairsMissingGlobalProjection(t, http.MethodPost, "/seafhttp/repo/%s/update-branch?head=%s")
+}
+
+// testSyncHeadSameHeadRepairsMissingGlobalProjection is the global-projection
+// mirror of the owner and org variants. The canary read of
+// libraries_admin_global_by_updated is bucketed by created_at day, so the
+// fixture sets up the deletion against every active bucket day to avoid
+// depending on the test clock. The owner and org projections remain present
+// to isolate the global-projection surface.
+func testSyncHeadSameHeadRepairsMissingGlobalProjection(t *testing.T, method, routeFormat string) {
+	name := fmt.Sprintf("inttest-sync-idempotent-global-repair-%d", time.Now().UnixNano())
+	repoID := createTestLibrary(t, adminClient, name)
+	session := shareProjectionDBForTest(t).Session()
+
+	var ownerID string
+	if err := session.Query(`SELECT owner_id FROM libraries WHERE org_id = ? AND library_id = ?`, defaultOrgID, repoID).Scan(&ownerID); err != nil {
+		t.Fatalf("failed to read owner_id for repo %s: %v", repoID, err)
+	}
+
+	initial := readLibrarySyncHeadState(t, session, repoID)
+	nextHead := fmt.Sprintf("%040x", time.Now().UnixNano())
+	insertSyntheticCommitForTest(t, session, repoID, nextHead, initial.HeadCommitID, initial.RootFSID, "integration idempotent global-projection repair")
+	t.Cleanup(func() {
+		if err := session.Query(`DELETE FROM commits WHERE library_id = ? AND commit_id = ?`, repoID, nextHead).Exec(); err != nil {
+			t.Errorf("cleanup synthetic commit %s failed: %v", nextHead, err)
+		}
+	})
+
+	resp := adminClient.Do(t, method, fmt.Sprintf(routeFormat, repoID, url.QueryEscape(nextHead)), nil)
+	if resp.StatusCode != http.StatusOK {
+		body := responseBody(t, resp)
+		t.Fatalf("initial same-head repair setup failed: status=%d body=%s", resp.StatusCode, body)
+	}
+	resp.Body.Close()
+
+	var advanced librarySyncHeadState
+	waitForIntegrationCondition(t, "accepted head for global-projection repair test to become authoritative", func() bool {
+		current := readLibrarySyncHeadState(t, session, repoID)
+		if current.HeadCommitID != nextHead || current.LookupHeadCommitID != nextHead {
+			return false
+		}
+		if !current.UpdatedAt.After(initial.UpdatedAt) || !current.ProjectionUpdatedAt.Equal(current.UpdatedAt) {
+			return false
+		}
+		advanced = current
+		return true
+	})
+
+	// Delete the global projection row from every active bucket day; the
+	// canary reads via the canonical created_at-derived bucket, but the
+	// fixture stays robust against clock skew during test setup.
+	buckets, err := dbpkg.ListAdminLibraryBucketDays(session)
+	if err != nil {
+		t.Fatalf("failed to list admin library bucket days for repo %s: %v", repoID, err)
+	}
+	for _, bucketDay := range buckets {
+		if err := session.Query(`DELETE FROM libraries_admin_global_by_updated WHERE bucket_day = ? AND org_id = ? AND library_id = ?`, bucketDay, defaultOrgID, repoID).Exec(); err != nil {
+			t.Fatalf("failed to remove global projection row for repo %s bucket %s: %v", repoID, bucketDay, err)
+		}
+	}
+
+	if _, ok := adminOwnerLibraryProjectionRowForTest(t, session, defaultOrgID, ownerID, repoID); !ok {
+		t.Fatalf("owner projection row unexpectedly missing for repo %s after deleting global projection", repoID)
+	}
+	if _, ok := adminLibraryProjectionRowForTest(t, session, defaultOrgID, repoID); !ok {
+		t.Fatalf("org projection row unexpectedly missing for repo %s after deleting global projection", repoID)
+	}
+
+	idempotentResp := adminClient.Do(t, method, fmt.Sprintf(routeFormat, repoID, url.QueryEscape(nextHead)), nil)
+	if idempotentResp.StatusCode != http.StatusOK {
+		body := responseBody(t, idempotentResp)
+		t.Fatalf("idempotent retry after global projection loss returned status=%d body=%s", idempotentResp.StatusCode, body)
+	}
+	idempotentResp.Body.Close()
+
+	waitForIntegrationCondition(t, "idempotent same-head retry to rebuild missing global projection", func() bool {
+		globalRow, ok := globalAdminLibraryProjectionRowForTest(t, session, defaultOrgID, repoID)
+		if !ok {
+			return false
+		}
+		return globalRow.UpdatedAt.Equal(advanced.ProjectionUpdatedAt) && globalRow.SizeBytes == advanced.ProjectionSizeBytes && globalRow.FileCount == advanced.ProjectionFileCount
+	})
+
+	stabilized := readLibrarySyncHeadState(t, session, repoID)
+	if !stabilized.UpdatedAt.Equal(advanced.UpdatedAt) {
+		t.Fatalf("canonical updated_at changed after global projection repair: got %s want %s", stabilized.UpdatedAt.Format(time.RFC3339Nano), advanced.UpdatedAt.Format(time.RFC3339Nano))
+	}
+}
+
+func TestSyncHeadSameHeadRepairsDriftedProjectionStats(t *testing.T) {
+	testSyncHeadSameHeadRepairsDriftedProjectionStats(t, http.MethodPut, "/seafhttp/repo/%s/commit/HEAD?head=%s")
+}
+
+func TestUpdateBranchSameHeadRepairsDriftedProjectionStats(t *testing.T) {
+	testSyncHeadSameHeadRepairsDriftedProjectionStats(t, http.MethodPost, "/seafhttp/repo/%s/update-branch?head=%s")
+}
+
+// testSyncHeadSameHeadRepairsDriftedProjectionStats exercises the case where
+// every projection row is PRESENT but disagrees with canonical state on one
+// of the CAS-controlled fields (size_bytes/file_count/updated_at). The canary
+// still has to flag drift and the repair must overwrite the drifted values
+// with the canonical truth. This is the post-CAS counter-delta-OK + projection
+// drift case that motivated extending the canary beyond just head_commit_id.
+func testSyncHeadSameHeadRepairsDriftedProjectionStats(t *testing.T, method, routeFormat string) {
+	name := fmt.Sprintf("inttest-sync-idempotent-stats-drift-%d", time.Now().UnixNano())
+	repoID := createTestLibrary(t, adminClient, name)
+	session := shareProjectionDBForTest(t).Session()
+
+	var ownerID string
+	if err := session.Query(`SELECT owner_id FROM libraries WHERE org_id = ? AND library_id = ?`, defaultOrgID, repoID).Scan(&ownerID); err != nil {
+		t.Fatalf("failed to read owner_id for repo %s: %v", repoID, err)
+	}
+
+	initial := readLibrarySyncHeadState(t, session, repoID)
+	nextHead := fmt.Sprintf("%040x", time.Now().UnixNano())
+	insertSyntheticCommitForTest(t, session, repoID, nextHead, initial.HeadCommitID, initial.RootFSID, "integration idempotent drifted-stats repair")
+	t.Cleanup(func() {
+		if err := session.Query(`DELETE FROM commits WHERE library_id = ? AND commit_id = ?`, repoID, nextHead).Exec(); err != nil {
+			t.Errorf("cleanup synthetic commit %s failed: %v", nextHead, err)
+		}
+	})
+
+	resp := adminClient.Do(t, method, fmt.Sprintf(routeFormat, repoID, url.QueryEscape(nextHead)), nil)
+	if resp.StatusCode != http.StatusOK {
+		body := responseBody(t, resp)
+		t.Fatalf("initial same-head repair setup failed: status=%d body=%s", resp.StatusCode, body)
+	}
+	resp.Body.Close()
+
+	var advanced librarySyncHeadState
+	waitForIntegrationCondition(t, "accepted head for stats-drift repair test to become authoritative", func() bool {
+		current := readLibrarySyncHeadState(t, session, repoID)
+		if current.HeadCommitID != nextHead || current.LookupHeadCommitID != nextHead {
+			return false
+		}
+		if !current.UpdatedAt.After(initial.UpdatedAt) || !current.ProjectionUpdatedAt.Equal(current.UpdatedAt) {
+			return false
+		}
+		advanced = current
+		return true
+	})
+
+	const driftBytes int64 = 7777777
+	const driftFiles int64 = 99
+	if err := session.Query(`UPDATE libraries_by_org_updated SET size_bytes = ?, file_count = ? WHERE org_id = ? AND library_id = ?`, driftBytes, driftFiles, defaultOrgID, repoID).Exec(); err != nil {
+		t.Fatalf("failed to drift org projection size/file count for repo %s: %v", repoID, err)
+	}
+	if err := session.Query(`UPDATE libraries_by_owner SET size_bytes = ?, file_count = ? WHERE org_id = ? AND owner_id = ? AND library_id = ?`, driftBytes, driftFiles, defaultOrgID, ownerID, repoID).Exec(); err != nil {
+		t.Fatalf("failed to drift owner projection size/file count for repo %s: %v", repoID, err)
+	}
+	buckets, err := dbpkg.ListAdminLibraryBucketDays(session)
+	if err != nil {
+		t.Fatalf("failed to list admin library bucket days for repo %s: %v", repoID, err)
+	}
+	for _, bucketDay := range buckets {
+		if err := session.Query(`UPDATE libraries_admin_global_by_updated SET size_bytes = ?, file_count = ? WHERE bucket_day = ? AND org_id = ? AND library_id = ?`, driftBytes, driftFiles, bucketDay, defaultOrgID, repoID).Exec(); err != nil {
+			t.Fatalf("failed to drift global projection size/file count for repo %s bucket %s: %v", repoID, bucketDay, err)
+		}
+	}
+
+	idempotentResp := adminClient.Do(t, method, fmt.Sprintf(routeFormat, repoID, url.QueryEscape(nextHead)), nil)
+	if idempotentResp.StatusCode != http.StatusOK {
+		body := responseBody(t, idempotentResp)
+		t.Fatalf("idempotent retry against drifted stats returned status=%d body=%s", idempotentResp.StatusCode, body)
+	}
+	idempotentResp.Body.Close()
+
+	waitForIntegrationCondition(t, "idempotent same-head retry to overwrite drifted projection stats with canonical", func() bool {
+		orgRow, ok := adminLibraryProjectionRowForTest(t, session, defaultOrgID, repoID)
+		if !ok {
+			return false
+		}
+		if orgRow.SizeBytes != advanced.ProjectionSizeBytes || orgRow.FileCount != advanced.ProjectionFileCount {
+			return false
+		}
+		ownerRow, ok := adminOwnerLibraryProjectionRowForTest(t, session, defaultOrgID, ownerID, repoID)
+		if !ok {
+			return false
+		}
+		if ownerRow.SizeBytes != advanced.ProjectionSizeBytes || ownerRow.FileCount != advanced.ProjectionFileCount {
+			return false
+		}
+		globalRow, ok := globalAdminLibraryProjectionRowForTest(t, session, defaultOrgID, repoID)
+		if !ok {
+			return false
+		}
+		return globalRow.SizeBytes == advanced.ProjectionSizeBytes && globalRow.FileCount == advanced.ProjectionFileCount
+	})
+
+	stabilized := readLibrarySyncHeadState(t, session, repoID)
+	if !stabilized.UpdatedAt.Equal(advanced.UpdatedAt) {
+		t.Fatalf("canonical updated_at changed after drifted-stats repair: got %s want %s", stabilized.UpdatedAt.Format(time.RFC3339Nano), advanced.UpdatedAt.Format(time.RFC3339Nano))
+	}
+	if stabilized.SizeBytes != advanced.SizeBytes || stabilized.FileCount != advanced.FileCount {
+		t.Fatalf("canonical size/file_count changed after drifted-stats repair: got {size=%d files=%d} want {size=%d files=%d}", stabilized.SizeBytes, stabilized.FileCount, advanced.SizeBytes, advanced.FileCount)
+	}
+}
+
 func TestSyncHeadStaleAsyncStatsDoNotOverwriteCurrentHead(t *testing.T) {
 	name := fmt.Sprintf("inttest-sync-stats-race-%d", time.Now().UnixNano())
 	repoID := createTestLibrary(t, adminClient, name)
@@ -1334,6 +1718,34 @@ func adminLibraryProjectionRowForTest(t *testing.T, session *gocql.Session, orgI
 	}
 	for _, row := range rows {
 		if row.LibraryID == repoID {
+			return row, true
+		}
+	}
+	return dbpkg.AdminLibraryProjectionRow{}, false
+}
+
+func adminOwnerLibraryProjectionRowForTest(t *testing.T, session *gocql.Session, orgID, ownerID, repoID string) (dbpkg.AdminLibraryProjectionRow, bool) {
+	t.Helper()
+	rows, err := dbpkg.ListAdminOwnerLibraryRows(session, orgID, ownerID)
+	if err != nil {
+		t.Fatalf("failed to list owner admin library projection rows for org %s owner %s: %v", orgID, ownerID, err)
+	}
+	for _, row := range rows {
+		if row.LibraryID == repoID {
+			return row, true
+		}
+	}
+	return dbpkg.AdminLibraryProjectionRow{}, false
+}
+
+func globalAdminLibraryProjectionRowForTest(t *testing.T, session *gocql.Session, orgID, repoID string) (dbpkg.AdminLibraryProjectionRow, bool) {
+	t.Helper()
+	rows, err := dbpkg.ListAdminGlobalLibraryRows(session)
+	if err != nil {
+		t.Fatalf("failed to list global admin library projection rows: %v", err)
+	}
+	for _, row := range rows {
+		if row.OrgID == orgID && row.LibraryID == repoID {
 			return row, true
 		}
 	}

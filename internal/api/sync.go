@@ -51,6 +51,12 @@ type SyncHandler struct {
 	config         *config.Config
 	tokenCreator   SyncTokenCreator // Token creator for download-info
 	permMiddleware *middleware.PermissionMiddleware
+
+	// repairSyncHeadDerivedStateIfDriftedFn is an optional test seam used by
+	// unit tests to inject a canary repair failure without spinning up a
+	// real DB. Production code leaves it nil; the idempotent fast-path then
+	// falls back to repairSyncHeadDerivedStateIfDrifted.
+	repairSyncHeadDerivedStateIfDriftedFn func(orgID, repoID, targetHead string) error
 }
 
 // NewSyncHandler creates a new sync protocol handler
@@ -2447,23 +2453,7 @@ func (h *SyncHandler) handleSyncHeadPromotion(c *gin.Context, orgID, userID, rep
 		}
 
 		if currentHead == targetHead {
-			// Canonical libraries already advanced to targetHead. A previous
-			// attempt may have failed AFTER the CAS while running post-CAS
-			// side effects (storage counters, aggregate reconciliation queue,
-			// libraries_by_id/admin projection write). If any of those left
-			// derived state behind, returning 200 here would silently bless
-			// that drift and the client would never trigger another publish.
-			// Use libraries_by_id.head_commit_id as a cheap canary: if it
-			// matches the canonical head, derived state is in sync; otherwise
-			// re-run the full post-CAS repair flow before reporting success.
-			if err := h.repairSyncHeadDerivedStateIfDrifted(orgID, repoID, targetHead); err != nil {
-				log.Printf("%s: idempotent path detected derived-state drift for repo %s but repair failed: %v", operation, repoID, err)
-				c.Header("Retry-After", "1")
-				c.JSON(http.StatusServiceUnavailable, gin.H{"error": "sync head publish derived state repair pending; retry"})
-				return
-			}
-			log.Printf("%s: repo %s head already at %s; treating as idempotent success", operation, repoID, targetHead)
-			c.Status(http.StatusOK)
+			h.handleSyncHeadIdempotentSuccess(c, orgID, repoID, targetHead, operation)
 			return
 		}
 
@@ -2612,6 +2602,59 @@ func (h *SyncHandler) commitTreeStatsStrict(repoID, commitID string) (int64, int
 type syncLibraryDerivedState struct {
 	HeadCommitID  string
 	ProjectionRow db.AdminLibraryProjectionRow
+}
+
+type syncAdminProjectionCanary struct {
+	Present   bool
+	OwnerID   string
+	UpdatedAt time.Time
+	SizeBytes int64
+	FileCount int64
+}
+
+func (c syncAdminProjectionCanary) matches(ownerID string, updatedAt time.Time, sizeBytes, fileCount int64) bool {
+	if !c.Present {
+		return false
+	}
+	return c.OwnerID == ownerID &&
+		c.UpdatedAt.Equal(updatedAt) &&
+		c.SizeBytes == sizeBytes &&
+		c.FileCount == fileCount
+}
+
+type syncDerivedStateCanary struct {
+	Canonical        syncLibraryDerivedState
+	LookupHead       string
+	OrgProjection    syncAdminProjectionCanary
+	OwnerProjection  syncAdminProjectionCanary
+	GlobalProjection syncAdminProjectionCanary
+}
+
+func (c syncDerivedStateCanary) alignedWith(targetHead string) bool {
+	row := c.Canonical.ProjectionRow
+	return c.Canonical.HeadCommitID == targetHead &&
+		c.LookupHead == targetHead &&
+		c.OrgProjection.matches(row.OwnerID, row.UpdatedAt, row.SizeBytes, row.FileCount) &&
+		c.OwnerProjection.matches(row.OwnerID, row.UpdatedAt, row.SizeBytes, row.FileCount) &&
+		c.GlobalProjection.matches(row.OwnerID, row.UpdatedAt, row.SizeBytes, row.FileCount)
+}
+
+func retrySyncDerivedStateCanaryRead(targetHead string, readCanary func() (syncDerivedStateCanary, error), sleep func(time.Duration)) (syncDerivedStateCanary, error) {
+	var lastErr error
+	for attempt := 1; attempt <= libraryStatsProjectionRetryAttempts; attempt++ {
+		canary, err := readCanary()
+		if err != nil {
+			lastErr = err
+		} else if canary.Canonical.HeadCommitID != targetHead {
+			lastErr = fmt.Errorf("stale canonical sync state: head_commit_id=%s want=%s", canary.Canonical.HeadCommitID, targetHead)
+		} else {
+			return canary, nil
+		}
+		if attempt < libraryStatsProjectionRetryAttempts && sleep != nil {
+			sleep(libraryStatsProjectionRetryDelay)
+		}
+	}
+	return syncDerivedStateCanary{}, lastErr
 }
 
 func (h *SyncHandler) fetchSyncLibraryDerivedState(orgID, repoID string) (syncLibraryDerivedState, error) {
@@ -2799,51 +2842,110 @@ func (h *SyncHandler) repairPublishedSyncHeadAfterCounterFailure(orgID, repoID, 
 	)
 }
 
+// handleSyncHeadIdempotentSuccess runs the canary-then-repair flow when the
+// caller's targetHead already equals canonical libraries.head_commit_id. A
+// previous attempt may have failed AFTER the CAS while running post-CAS side
+// effects (storage counters, aggregate reconciliation queue, libraries_by_id
+// or admin projection writes). If any of those left derived state behind,
+// returning 200 here would silently bless that drift and the client would
+// never trigger another publish. The canary check uses libraries_by_id plus
+// the active admin projection tables: if they all still reflect canonical,
+// derived state is in sync and the caller short-circuits with 200; otherwise
+// it re-runs the full post-CAS repair flow before reporting success, and
+// returns 503 + Retry-After if the repair itself fails so the client retries
+// instead of silently moving on. The repair function is dispatched through
+// repairSyncHeadDerivedStateIfDriftedFn when set so unit tests can inject a
+// failing canary without needing a real DB session.
+func (h *SyncHandler) handleSyncHeadIdempotentSuccess(c *gin.Context, orgID, repoID, targetHead, operation string) {
+	repair := h.repairSyncHeadDerivedStateIfDriftedFn
+	if repair == nil {
+		repair = h.repairSyncHeadDerivedStateIfDrifted
+	}
+	if err := repair(orgID, repoID, targetHead); err != nil {
+		log.Printf("%s: idempotent path detected derived-state drift for repo %s but repair failed: %v", operation, repoID, err)
+		c.Header("Retry-After", "1")
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "sync head publish derived state repair pending; retry"})
+		return
+	}
+	log.Printf("%s: repo %s head already at %s; treating as idempotent success", operation, repoID, targetHead)
+	c.Status(http.StatusOK)
+}
+
 // repairSyncHeadDerivedStateIfDrifted is invoked from the idempotent fast-path
-// in handleSyncHeadPromotion. It uses libraries_by_id.head_commit_id as a
-// cheap canary against canonical libraries.head_commit_id: when they agree,
-// derived state is consistent and the caller can short-circuit. When they
-// disagree, a prior publish attempt left derived state behind (counter delta
-// failure with failed repair, aggregate-reconcile queue insert failure, or
-// libraries_by_id/admin projection write failure on both attempts). In that
-// case it re-runs the full post-CAS repair flow against the canonical row
-// (which already holds the published head + stats), guaranteeing that an
-// otherwise-200-returning idempotent retry actually converges derived state.
+// in handleSyncHeadPromotion. It uses an O(1) canary over libraries_by_id plus
+// the active admin projection tables against the canonical libraries row. When
+// they all still reflect the published head/stats, derived state is consistent
+// and the caller can short-circuit. When any surface drifted, a prior publish
+// attempt left derived state behind (counter delta failure with failed repair,
+// aggregate-reconcile queue insert failure, or a partial lookup/admin
+// projection write). In that case it re-runs the full post-CAS repair flow
+// against the canonical row, guaranteeing that an otherwise-200-returning
+// idempotent retry actually converges derived state.
 func (h *SyncHandler) repairSyncHeadDerivedStateIfDrifted(orgID, repoID, targetHead string) error {
 	return repairSyncHeadDerivedStateIfDriftedUsing(
 		targetHead,
-		func() (string, error) { return h.readLookupHead(repoID) },
-		func() (int64, int64, time.Time, error) { return h.readCanonicalLibraryStats(orgID, repoID) },
+		func() (syncDerivedStateCanary, error) { return h.readSyncDerivedStateCanary(orgID, repoID) },
 		func(updatedAt time.Time, totalSize, fileCount int64) error {
 			return h.repairPublishedSyncHeadAfterCounterFailure(orgID, repoID, targetHead, updatedAt, totalSize, fileCount)
 		},
+		time.Sleep,
 	)
 }
 
 // repairSyncHeadDerivedStateIfDriftedUsing is the testable seam: it composes
-// the canary read, the canonical stats read, and the repair invocation so
-// unit tests can drive each branch with deterministic closures.
+// the canary read and the repair invocation so unit tests can drive each
+// branch with deterministic closures.
 func repairSyncHeadDerivedStateIfDriftedUsing(
 	targetHead string,
-	readLookupHead func() (string, error),
-	readCanonicalStats func() (int64, int64, time.Time, error),
+	readCanary func() (syncDerivedStateCanary, error),
 	repair func(updatedAt time.Time, totalSize, fileCount int64) error,
+	sleep func(time.Duration),
 ) error {
-	lookupHead, err := readLookupHead()
+	canary, err := retrySyncDerivedStateCanaryRead(targetHead, readCanary, sleep)
 	if err != nil {
-		return fmt.Errorf("read libraries_by_id head for derived-state canary: %w", err)
+		return fmt.Errorf("read sync derived-state canary: %w", err)
 	}
-	if lookupHead == targetHead {
+	if canary.alignedWith(targetHead) {
 		return nil
 	}
-	totalSize, fileCount, updatedAt, err := readCanonicalStats()
-	if err != nil {
-		return fmt.Errorf("read canonical library stats for derived-state repair: %w", err)
-	}
-	if err := repair(updatedAt, totalSize, fileCount); err != nil {
+	if err := repair(
+		canary.Canonical.ProjectionRow.UpdatedAt,
+		canary.Canonical.ProjectionRow.SizeBytes,
+		canary.Canonical.ProjectionRow.FileCount,
+	); err != nil {
 		return fmt.Errorf("repair drifted sync derived state: %w", err)
 	}
 	return nil
+}
+
+func (h *SyncHandler) readSyncDerivedStateCanary(orgID, repoID string) (syncDerivedStateCanary, error) {
+	state, err := h.fetchSyncLibraryDerivedState(orgID, repoID)
+	if err != nil {
+		return syncDerivedStateCanary{}, err
+	}
+	lookupHead, err := h.readLookupHead(repoID)
+	if err != nil {
+		return syncDerivedStateCanary{}, err
+	}
+	orgProjection, err := h.readOrgProjectionCanary(orgID, repoID)
+	if err != nil {
+		return syncDerivedStateCanary{}, err
+	}
+	ownerProjection, err := h.readOwnerProjectionCanary(orgID, state.ProjectionRow.OwnerID, repoID)
+	if err != nil {
+		return syncDerivedStateCanary{}, err
+	}
+	globalProjection, err := h.readGlobalProjectionCanary(db.AdminLibraryBucketDay(state.ProjectionRow.CreatedAt), orgID, repoID)
+	if err != nil {
+		return syncDerivedStateCanary{}, err
+	}
+	return syncDerivedStateCanary{
+		Canonical:        state,
+		LookupHead:       lookupHead,
+		OrgProjection:    orgProjection,
+		OwnerProjection:  ownerProjection,
+		GlobalProjection: globalProjection,
+	}, nil
 }
 
 func (h *SyncHandler) readLookupHead(repoID string) (string, error) {
@@ -2851,20 +2953,55 @@ func (h *SyncHandler) readLookupHead(repoID string) (string, error) {
 	if err := h.db.Session().Query(`
 		SELECT head_commit_id FROM libraries_by_id WHERE library_id = ?
 	`, repoID).Scan(&lookupHead); err != nil {
-		return "", err
+		if errors.Is(err, gocql.ErrNotFound) {
+			return "", nil
+		}
+		return "", fmt.Errorf("read libraries_by_id head: %w", err)
 	}
 	return lookupHead, nil
 }
 
-func (h *SyncHandler) readCanonicalLibraryStats(orgID, repoID string) (int64, int64, time.Time, error) {
-	var sizeBytes, fileCount int64
-	var updatedAt time.Time
+func (h *SyncHandler) readOrgProjectionCanary(orgID, repoID string) (syncAdminProjectionCanary, error) {
+	var canary syncAdminProjectionCanary
 	if err := h.db.Session().Query(`
-		SELECT size_bytes, file_count, updated_at FROM libraries WHERE org_id = ? AND library_id = ?
-	`, orgID, repoID).Scan(&sizeBytes, &fileCount, &updatedAt); err != nil {
-		return 0, 0, time.Time{}, err
+		SELECT owner_id, updated_at, size_bytes, file_count FROM libraries_by_org_updated WHERE org_id = ? AND library_id = ?
+	`, orgID, repoID).Scan(&canary.OwnerID, &canary.UpdatedAt, &canary.SizeBytes, &canary.FileCount); err != nil {
+		if errors.Is(err, gocql.ErrNotFound) {
+			return syncAdminProjectionCanary{}, nil
+		}
+		return syncAdminProjectionCanary{}, fmt.Errorf("read org admin projection canary: %w", err)
 	}
-	return sizeBytes, fileCount, updatedAt, nil
+	canary.Present = true
+	return canary, nil
+}
+
+func (h *SyncHandler) readOwnerProjectionCanary(orgID, ownerID, repoID string) (syncAdminProjectionCanary, error) {
+	var canary syncAdminProjectionCanary
+	if err := h.db.Session().Query(`
+		SELECT updated_at, size_bytes, file_count FROM libraries_by_owner WHERE org_id = ? AND owner_id = ? AND library_id = ?
+	`, orgID, ownerID, repoID).Scan(&canary.UpdatedAt, &canary.SizeBytes, &canary.FileCount); err != nil {
+		if errors.Is(err, gocql.ErrNotFound) {
+			return syncAdminProjectionCanary{}, nil
+		}
+		return syncAdminProjectionCanary{}, fmt.Errorf("read owner admin projection canary: %w", err)
+	}
+	canary.Present = true
+	canary.OwnerID = ownerID
+	return canary, nil
+}
+
+func (h *SyncHandler) readGlobalProjectionCanary(bucketDay, orgID, repoID string) (syncAdminProjectionCanary, error) {
+	var canary syncAdminProjectionCanary
+	if err := h.db.Session().Query(`
+		SELECT owner_id, updated_at, size_bytes, file_count FROM libraries_admin_global_by_updated WHERE bucket_day = ? AND org_id = ? AND library_id = ?
+	`, bucketDay, orgID, repoID).Scan(&canary.OwnerID, &canary.UpdatedAt, &canary.SizeBytes, &canary.FileCount); err != nil {
+		if errors.Is(err, gocql.ErrNotFound) {
+			return syncAdminProjectionCanary{}, nil
+		}
+		return syncAdminProjectionCanary{}, fmt.Errorf("read global admin projection canary: %w", err)
+	}
+	canary.Present = true
+	return canary, nil
 }
 
 func (h *SyncHandler) reconcilePublishedSyncLibraryStorage(orgID, repoID string, state syncLibraryDerivedState) error {
