@@ -189,6 +189,65 @@ func TestLibraryProjectionRegression_ReconcilePendingStorageCountersAfterSoftDel
 	}
 }
 
+func TestLibraryProjectionRegression_ReconcilePendingStorageCountersUsesCanonicalLibraryStats(t *testing.T) {
+	name := fmt.Sprintf("inttest-lib-storage-canonical-%d", time.Now().UnixNano())
+	repoID := createTestLibrary(t, adminClient, name)
+	database := shareProjectionDBForTest(t)
+	session := database.Session()
+	store := gcpkg.NewCassandraStore(database)
+
+	var ownerID string
+	if err := session.Query(`SELECT owner_id FROM libraries WHERE org_id = ? AND library_id = ?`, defaultOrgID, repoID).Scan(&ownerID); err != nil {
+		t.Fatalf("failed to read owner_id for repo %s: %v", repoID, err)
+	}
+
+	platformScope := traffic.PlatformStorageScope()
+	orgScope := traffic.OrganizationStorageScope(defaultOrgID)
+	userScope := traffic.UserStorageScope(defaultOrgID, ownerID)
+	libScope := traffic.LibraryStorageScope(defaultOrgID, repoID)
+
+	uploadResp := adminClient.Get(t, fmt.Sprintf("/api2/repos/%s/upload-link/?p=/", repoID))
+	expectStatus(t, uploadResp, http.StatusOK)
+	uploadURL := strings.Trim(responseBody(t, uploadResp), "\" \n\r")
+	uploadFileThroughLink(t, adminClient, uploadURL, "canonical.txt", "/", "canonical-reconciliation-content\n")
+
+	var libBeforeDrift traffic.StorageSnapshot
+	waitForIntegrationCondition(t, "library upload to update storage counters for canonical reconciliation", func() bool {
+		libBeforeDrift = traffic.ReadStorageSnapshot(database, libScope)
+		return libBeforeDrift.BytesUsed > 0 && libBeforeDrift.FileCount > 0
+	})
+
+	expected := expectedAggregateStorageSnapshotsForScopes(t, database, platformScope, orgScope, userScope)
+
+	const driftBytes int64 = 999
+	const driftFiles int64 = 7
+	addStorageCounterDriftForTest(t, session, libScope, driftBytes, driftFiles)
+	insertStorageReconciliationRequestForTest(t, session, platformScope, "", "")
+	insertStorageReconciliationRequestForTest(t, session, orgScope, defaultOrgID, "")
+	insertStorageReconciliationRequestForTest(t, session, userScope, defaultOrgID, ownerID)
+
+	reconciled, err := store.ReconcilePendingStorageCounters()
+	if err != nil {
+		t.Fatalf("ReconcilePendingStorageCounters failed: %v", err)
+	}
+	if reconciled < 3 {
+		t.Fatalf("reconciled scopes = %d, want at least 3 target scopes", reconciled)
+	}
+
+	if got := traffic.ReadStorageSnapshot(database, platformScope); got != expected[platformScope] {
+		t.Fatalf("platform snapshot after canonical reconciliation = %+v, want %+v", got, expected[platformScope])
+	}
+	if got := traffic.ReadStorageSnapshot(database, orgScope); got != expected[orgScope] {
+		t.Fatalf("org snapshot after canonical reconciliation = %+v, want %+v", got, expected[orgScope])
+	}
+	if got := traffic.ReadStorageSnapshot(database, userScope); got != expected[userScope] {
+		t.Fatalf("user snapshot after canonical reconciliation = %+v, want %+v", got, expected[userScope])
+	}
+	if got := traffic.ReadStorageSnapshot(database, libScope); got != addStorageSnapshots(libBeforeDrift, traffic.StorageSnapshot{BytesUsed: driftBytes, FileCount: driftFiles}) {
+		t.Fatalf("library snapshot after aggregate reconciliation = %+v, want %+v", got, addStorageSnapshots(libBeforeDrift, traffic.StorageSnapshot{BytesUsed: driftBytes, FileCount: driftFiles}))
+	}
+}
+
 func TestLibraryProjectionRegression_GCSoftDeleteUsesCanonicalReadModelHelper(t *testing.T) {
 	name := fmt.Sprintf("inttest-gc-soft-delete-%d", time.Now().UnixNano())
 	repoID := createTestLibrary(t, adminClient, name)
@@ -1155,17 +1214,18 @@ func expectedAggregateStorageSnapshotsForScopes(t *testing.T, database *dbpkg.DB
 	}
 
 	iter := database.Session().Query(`
-		SELECT org_id, library_id, owner_id, deleted_at FROM libraries
+		SELECT org_id, owner_id, size_bytes, file_count, deleted_at FROM libraries
 	`).Iter()
 
-	var orgID, libraryID, ownerID string
+	var orgID, ownerID string
+	var sizeBytes, fileCount int64
 	var deletedAt *time.Time
-	for iter.Scan(&orgID, &libraryID, &ownerID, &deletedAt) {
+	for iter.Scan(&orgID, &ownerID, &sizeBytes, &fileCount, &deletedAt) {
 		if deletedAt != nil && !deletedAt.IsZero() {
 			continue
 		}
 
-		libSnapshot := traffic.ReadStorageSnapshot(database, traffic.LibraryStorageScope(orgID, libraryID))
+		libSnapshot := traffic.StorageSnapshot{BytesUsed: sizeBytes, FileCount: fileCount}
 		if libSnapshot.BytesUsed == 0 && libSnapshot.FileCount == 0 {
 			continue
 		}

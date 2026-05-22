@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Sesame-Disk/sesamefs/internal/db"
 	"github.com/Sesame-Disk/sesamefs/internal/storage"
 	"github.com/gin-gonic/gin"
 )
@@ -884,6 +885,489 @@ func TestRetryLibraryStatsProjectionSync(t *testing.T) {
 		}
 		if sleeps != libraryStatsProjectionRetryAttempts-1 {
 			t.Fatalf("sleeps = %d, want %d", sleeps, libraryStatsProjectionRetryAttempts-1)
+		}
+	})
+}
+
+// TestRetrySyncDerivedStateRead exercises the stale-read-after-CAS retry path
+// that absorbs the window between an LWT commit and replicas applying it.
+func TestRetrySyncDerivedStateRead(t *testing.T) {
+	notBefore := time.Date(2026, 5, 21, 12, 0, 0, 0, time.UTC)
+	fresh := syncLibraryDerivedState{
+		HeadCommitID: "new-head",
+		ProjectionRow: db.AdminLibraryProjectionRow{
+			OrgID:     "org-1",
+			LibraryID: "lib-1",
+			UpdatedAt: notBefore,
+		},
+	}
+	stale := syncLibraryDerivedState{
+		HeadCommitID: "old-head",
+		ProjectionRow: db.AdminLibraryProjectionRow{
+			OrgID:     "org-1",
+			LibraryID: "lib-1",
+			UpdatedAt: notBefore.Add(-time.Millisecond),
+		},
+	}
+
+	t.Run("accepts fresh row on first attempt", func(t *testing.T) {
+		attempts := 0
+		sleeps := 0
+		got, err := retrySyncDerivedStateRead("lib-1", notBefore, func() (syncLibraryDerivedState, error) {
+			attempts++
+			return fresh, nil
+		}, func(time.Duration) { sleeps++ })
+		if err != nil {
+			t.Fatalf("err = %v, want nil", err)
+		}
+		if got.HeadCommitID != "new-head" {
+			t.Fatalf("HeadCommitID = %q, want new-head", got.HeadCommitID)
+		}
+		if attempts != 1 || sleeps != 0 {
+			t.Fatalf("attempts=%d sleeps=%d, want 1/0", attempts, sleeps)
+		}
+	})
+
+	t.Run("retries past a stale read, accepts the fresh row", func(t *testing.T) {
+		attempts := 0
+		sleeps := 0
+		responses := []syncLibraryDerivedState{stale, fresh}
+		got, err := retrySyncDerivedStateRead("lib-1", notBefore, func() (syncLibraryDerivedState, error) {
+			r := responses[attempts]
+			attempts++
+			return r, nil
+		}, func(time.Duration) { sleeps++ })
+		if err != nil {
+			t.Fatalf("err = %v, want nil", err)
+		}
+		if got.HeadCommitID != "new-head" {
+			t.Fatalf("HeadCommitID = %q, want new-head", got.HeadCommitID)
+		}
+		if attempts != 2 || sleeps != 1 {
+			t.Fatalf("attempts=%d sleeps=%d, want 2/1", attempts, sleeps)
+		}
+	})
+
+	t.Run("returns stale error after exhausting retries", func(t *testing.T) {
+		attempts := 0
+		sleeps := 0
+		_, err := retrySyncDerivedStateRead("lib-1", notBefore, func() (syncLibraryDerivedState, error) {
+			attempts++
+			return stale, nil
+		}, func(time.Duration) { sleeps++ })
+		if err == nil {
+			t.Fatal("err = nil, want stale error")
+		}
+		if !strings.Contains(err.Error(), "stale canonical sync state for lib-1") {
+			t.Fatalf("err = %v, want to contain stale-canonical message", err)
+		}
+		if attempts != libraryStatsProjectionRetryAttempts {
+			t.Fatalf("attempts = %d, want %d", attempts, libraryStatsProjectionRetryAttempts)
+		}
+		if sleeps != libraryStatsProjectionRetryAttempts-1 {
+			t.Fatalf("sleeps = %d, want %d", sleeps, libraryStatsProjectionRetryAttempts-1)
+		}
+	})
+
+	t.Run("retries through a transient fetch error", func(t *testing.T) {
+		attempts := 0
+		_, err := retrySyncDerivedStateRead("lib-1", notBefore, func() (syncLibraryDerivedState, error) {
+			attempts++
+			if attempts == 1 {
+				return syncLibraryDerivedState{}, errors.New("transient cassandra error")
+			}
+			return fresh, nil
+		}, func(time.Duration) {})
+		if err != nil {
+			t.Fatalf("err = %v, want nil", err)
+		}
+		if attempts != 2 {
+			t.Fatalf("attempts = %d, want 2", attempts)
+		}
+	})
+
+	t.Run("returns last fetch error after exhausting retries", func(t *testing.T) {
+		wantErr := errors.New("persistent cassandra error")
+		attempts := 0
+		_, err := retrySyncDerivedStateRead("lib-1", notBefore, func() (syncLibraryDerivedState, error) {
+			attempts++
+			return syncLibraryDerivedState{}, wantErr
+		}, func(time.Duration) {})
+		if !errors.Is(err, wantErr) {
+			t.Fatalf("err = %v, want %v", err, wantErr)
+		}
+		if attempts != libraryStatsProjectionRetryAttempts {
+			t.Fatalf("attempts = %d, want %d", attempts, libraryStatsProjectionRetryAttempts)
+		}
+	})
+
+	t.Run("treats equal updated_at as fresh (boundary)", func(t *testing.T) {
+		boundary := syncLibraryDerivedState{
+			HeadCommitID: "boundary-head",
+			ProjectionRow: db.AdminLibraryProjectionRow{
+				OrgID:     "org-1",
+				LibraryID: "lib-1",
+				UpdatedAt: notBefore, // exactly equal — must not be considered stale
+			},
+		}
+		got, err := retrySyncDerivedStateRead("lib-1", notBefore, func() (syncLibraryDerivedState, error) {
+			return boundary, nil
+		}, func(time.Duration) {})
+		if err != nil {
+			t.Fatalf("err = %v, want nil", err)
+		}
+		if got.HeadCommitID != "boundary-head" {
+			t.Fatalf("HeadCommitID = %q, want boundary-head", got.HeadCommitID)
+		}
+	})
+}
+
+// TestSyncLibraryHeadDerivedStateUsing covers the full read+write composition
+// so the batch-write failure path (which the production code talks to
+// gocql.Session for) has a deterministic regression test alongside the
+// read-side stale-guard.
+func TestSyncLibraryHeadDerivedStateUsing(t *testing.T) {
+	notBefore := time.Date(2026, 5, 21, 12, 0, 0, 0, time.UTC)
+	fresh := syncLibraryDerivedState{
+		HeadCommitID: "new-head",
+		ProjectionRow: db.AdminLibraryProjectionRow{
+			OrgID:     "org-1",
+			LibraryID: "lib-1",
+			UpdatedAt: notBefore,
+		},
+	}
+	stale := syncLibraryDerivedState{
+		HeadCommitID: "old-head",
+		ProjectionRow: db.AdminLibraryProjectionRow{
+			OrgID:     "org-1",
+			LibraryID: "lib-1",
+			UpdatedAt: notBefore.Add(-time.Millisecond),
+		},
+	}
+
+	t.Run("writes projection once read returns fresh state", func(t *testing.T) {
+		writes := 0
+		var written syncLibraryDerivedState
+		err := syncLibraryHeadDerivedStateUsing("lib-1", notBefore,
+			func() (syncLibraryDerivedState, error) { return fresh, nil },
+			func(_ string, state syncLibraryDerivedState) error {
+				writes++
+				written = state
+				return nil
+			},
+			func(time.Duration) {})
+		if err != nil {
+			t.Fatalf("err = %v, want nil", err)
+		}
+		if writes != 1 {
+			t.Fatalf("writes = %d, want 1", writes)
+		}
+		if written.HeadCommitID != "new-head" {
+			t.Fatalf("written.HeadCommitID = %q, want new-head", written.HeadCommitID)
+		}
+	})
+
+	t.Run("propagates read-side stale exhaustion without writing", func(t *testing.T) {
+		writes := 0
+		err := syncLibraryHeadDerivedStateUsing("lib-1", notBefore,
+			func() (syncLibraryDerivedState, error) { return stale, nil },
+			func(string, syncLibraryDerivedState) error {
+				writes++
+				return nil
+			},
+			func(time.Duration) {})
+		if err == nil {
+			t.Fatal("err = nil, want stale error")
+		}
+		if !strings.Contains(err.Error(), "failed to read library state after sync update") {
+			t.Fatalf("err = %v, want to wrap the read-side failure", err)
+		}
+		if !strings.Contains(err.Error(), "stale canonical sync state for lib-1") {
+			t.Fatalf("err = %v, want to surface the stale message", err)
+		}
+		if writes != 0 {
+			t.Fatalf("writes = %d, want 0 (must not attempt write when read fails)", writes)
+		}
+	})
+
+	t.Run("propagates batch write failure after fresh read", func(t *testing.T) {
+		wantErr := errors.New("batch exec failed")
+		writes := 0
+		err := syncLibraryHeadDerivedStateUsing("lib-1", notBefore,
+			func() (syncLibraryDerivedState, error) { return fresh, nil },
+			func(string, syncLibraryDerivedState) error {
+				writes++
+				return wantErr
+			},
+			func(time.Duration) {})
+		if !errors.Is(err, wantErr) {
+			t.Fatalf("err = %v, want to wrap %v", err, wantErr)
+		}
+		if !strings.Contains(err.Error(), "failed to sync head lookup/admin projection") {
+			t.Fatalf("err = %v, want the batch-side error prefix", err)
+		}
+		if writes != 1 {
+			t.Fatalf("writes = %d, want 1 (no retry on write side)", writes)
+		}
+	})
+
+	t.Run("write is called with the fresh state observed by the read loop", func(t *testing.T) {
+		responses := []syncLibraryDerivedState{stale, fresh}
+		reads := 0
+		var observed syncLibraryDerivedState
+		err := syncLibraryHeadDerivedStateUsing("lib-1", notBefore,
+			func() (syncLibraryDerivedState, error) {
+				r := responses[reads]
+				reads++
+				return r, nil
+			},
+			func(_ string, state syncLibraryDerivedState) error {
+				observed = state
+				return nil
+			},
+			func(time.Duration) {})
+		if err != nil {
+			t.Fatalf("err = %v, want nil", err)
+		}
+		if observed.HeadCommitID != "new-head" {
+			t.Fatalf("observed.HeadCommitID = %q, want new-head (write must receive post-retry fresh state)", observed.HeadCommitID)
+		}
+	})
+}
+
+// TestOverrideSyncLibraryCASFields locks in the contract that the publisher's
+// CAS-authoritative values override anything the post-CAS read returned. This
+// is the defense against read-after-write convergence affecting the projection
+// write — even if a hypothetical future regression weakens the stale-guard,
+// the override guarantees the projection reflects the CAS commit.
+func TestOverrideSyncLibraryCASFields(t *testing.T) {
+	postCASUpdatedAt := time.Date(2026, 5, 21, 16, 31, 5, 0, time.UTC)
+	staleRead := syncLibraryDerivedState{
+		HeadCommitID: "stale-head", // a replica that hadn't seen the CAS yet
+		ProjectionRow: db.AdminLibraryProjectionRow{
+			OrgID:        "org-1",
+			LibraryID:    "lib-1",
+			OwnerID:      "admin-controlled",
+			Name:         "admin-controlled",
+			Encrypted:    true,
+			StorageClass: "admin-controlled",
+			SizeBytes:    0,                              // CAS-controlled, stale
+			FileCount:    0,                              // CAS-controlled, stale
+			UpdatedAt:    postCASUpdatedAt.Add(-time.Hour), // CAS-controlled, stale
+		},
+	}
+
+	overrideSyncLibraryCASFields(&staleRead, "new-head", postCASUpdatedAt, 4096, 3)
+
+	if staleRead.HeadCommitID != "new-head" {
+		t.Fatalf("HeadCommitID = %q, want new-head", staleRead.HeadCommitID)
+	}
+	if staleRead.ProjectionRow.SizeBytes != 4096 {
+		t.Fatalf("SizeBytes = %d, want 4096", staleRead.ProjectionRow.SizeBytes)
+	}
+	if staleRead.ProjectionRow.FileCount != 3 {
+		t.Fatalf("FileCount = %d, want 3", staleRead.ProjectionRow.FileCount)
+	}
+	if !staleRead.ProjectionRow.UpdatedAt.Equal(postCASUpdatedAt) {
+		t.Fatalf("UpdatedAt = %s, want %s", staleRead.ProjectionRow.UpdatedAt, postCASUpdatedAt)
+	}
+	// Admin-controlled fields must not be touched by the override — they came
+	// from the read at a snapshot the caller already accepted as fresh-enough.
+	if staleRead.ProjectionRow.OwnerID != "admin-controlled" ||
+		staleRead.ProjectionRow.Name != "admin-controlled" ||
+		!staleRead.ProjectionRow.Encrypted ||
+		staleRead.ProjectionRow.StorageClass != "admin-controlled" {
+		t.Fatalf("override leaked into admin-controlled fields: %+v", staleRead.ProjectionRow)
+	}
+}
+
+func TestRepairPublishedSyncHeadAfterCounterFailureUsing(t *testing.T) {
+	notBefore := time.Date(2026, 5, 21, 16, 31, 5, 0, time.UTC)
+	fresh := syncLibraryDerivedState{
+		HeadCommitID: "new-head",
+		ProjectionRow: db.AdminLibraryProjectionRow{
+			OrgID:     "org-1",
+			LibraryID: "lib-1",
+			UpdatedAt: notBefore,
+		},
+	}
+	staleState := syncLibraryDerivedState{
+		HeadCommitID: "new-head",
+		ProjectionRow: db.AdminLibraryProjectionRow{
+			OrgID:     "org-1",
+			LibraryID: "lib-1",
+			UpdatedAt: notBefore.Add(-time.Second),
+		},
+	}
+
+	t.Run("retries until canonical state reaches notBefore then reconciles queues and writes", func(t *testing.T) {
+		responses := []syncLibraryDerivedState{staleState, fresh}
+		reads := 0
+		sleeps := 0
+		reconciles := 0
+		queues := 0
+		writes := 0
+		var reconciled syncLibraryDerivedState
+		var queued syncLibraryDerivedState
+		var written syncLibraryDerivedState
+		err := repairPublishedSyncHeadAfterCounterFailureUsing(
+			"lib-1",
+			notBefore,
+			func() (syncLibraryDerivedState, error) {
+				response := responses[reads]
+				reads++
+				return response, nil
+			},
+			func(state syncLibraryDerivedState) error {
+				reconciles++
+				reconciled = state
+				return nil
+			},
+			func(state syncLibraryDerivedState) error {
+				queues++
+				queued = state
+				return nil
+			},
+			func(state syncLibraryDerivedState) error {
+				writes++
+				written = state
+				return nil
+			},
+			func(time.Duration) { sleeps++ },
+		)
+		if err != nil {
+			t.Fatalf("err = %v, want nil", err)
+		}
+		if reads != 2 || sleeps != 1 {
+			t.Fatalf("reads=%d sleeps=%d, want 2/1", reads, sleeps)
+		}
+		if reconciles != 1 || queues != 1 || writes != 1 {
+			t.Fatalf("reconciles=%d queues=%d writes=%d, want 1/1/1", reconciles, queues, writes)
+		}
+		if reconciled.HeadCommitID != fresh.HeadCommitID || queued.HeadCommitID != fresh.HeadCommitID || written.HeadCommitID != fresh.HeadCommitID {
+			t.Fatalf("reconciled=%q queued=%q written=%q, want all %q", reconciled.HeadCommitID, queued.HeadCommitID, written.HeadCommitID, fresh.HeadCommitID)
+		}
+	})
+
+	t.Run("propagates stale-state exhaustion without reconciling queueing or writing", func(t *testing.T) {
+		reconciles := 0
+		queues := 0
+		writes := 0
+		err := repairPublishedSyncHeadAfterCounterFailureUsing(
+			"lib-1",
+			notBefore,
+			func() (syncLibraryDerivedState, error) { return staleState, nil },
+			func(syncLibraryDerivedState) error {
+				reconciles++
+				return nil
+			},
+			func(syncLibraryDerivedState) error {
+				queues++
+				return nil
+			},
+			func(syncLibraryDerivedState) error {
+				writes++
+				return nil
+			},
+			func(time.Duration) {},
+		)
+		if err == nil {
+			t.Fatal("err = nil, want stale-state error")
+		}
+		if !strings.Contains(err.Error(), "failed to read canonical library state for sync head repair") {
+			t.Fatalf("err = %v, want read-side repair prefix", err)
+		}
+		if !strings.Contains(err.Error(), "stale canonical sync state for lib-1") {
+			t.Fatalf("err = %v, want stale-state message", err)
+		}
+		if reconciles != 0 || queues != 0 || writes != 0 {
+			t.Fatalf("reconciles=%d queues=%d writes=%d, want 0/0/0", reconciles, queues, writes)
+		}
+	})
+
+	t.Run("propagates reconcile failure and skips queue and write", func(t *testing.T) {
+		wantErr := errors.New("reconcile failed")
+		queues := 0
+		writes := 0
+		err := repairPublishedSyncHeadAfterCounterFailureUsing(
+			"lib-1",
+			notBefore,
+			func() (syncLibraryDerivedState, error) { return fresh, nil },
+			func(syncLibraryDerivedState) error { return wantErr },
+			func(syncLibraryDerivedState) error {
+				queues++
+				return nil
+			},
+			func(syncLibraryDerivedState) error {
+				writes++
+				return nil
+			},
+			func(time.Duration) {},
+		)
+		if !errors.Is(err, wantErr) {
+			t.Fatalf("err = %v, want %v", err, wantErr)
+		}
+		if !strings.Contains(err.Error(), "failed to reconcile sync library storage state") {
+			t.Fatalf("err = %v, want reconcile prefix", err)
+		}
+		if queues != 0 || writes != 0 {
+			t.Fatalf("queues = %d writes = %d, want 0/0", queues, writes)
+		}
+	})
+
+	t.Run("propagates queue failure and skips write", func(t *testing.T) {
+		wantErr := errors.New("queue failed")
+		writes := 0
+		err := repairPublishedSyncHeadAfterCounterFailureUsing(
+			"lib-1",
+			notBefore,
+			func() (syncLibraryDerivedState, error) { return fresh, nil },
+			func(syncLibraryDerivedState) error { return nil },
+			func(syncLibraryDerivedState) error { return wantErr },
+			func(syncLibraryDerivedState) error {
+				writes++
+				return nil
+			},
+			func(time.Duration) {},
+		)
+		if !errors.Is(err, wantErr) {
+			t.Fatalf("err = %v, want %v", err, wantErr)
+		}
+		if !strings.Contains(err.Error(), "failed to queue aggregate storage reconciliation") {
+			t.Fatalf("err = %v, want queue prefix", err)
+		}
+		if writes != 0 {
+			t.Fatalf("writes = %d, want 0", writes)
+		}
+	})
+
+	t.Run("propagates write failure after successful reconcile and queue", func(t *testing.T) {
+		wantErr := errors.New("write failed")
+		reconciles := 0
+		queues := 0
+		err := repairPublishedSyncHeadAfterCounterFailureUsing(
+			"lib-1",
+			notBefore,
+			func() (syncLibraryDerivedState, error) { return fresh, nil },
+			func(syncLibraryDerivedState) error {
+				reconciles++
+				return nil
+			},
+			func(syncLibraryDerivedState) error {
+				queues++
+				return nil
+			},
+			func(syncLibraryDerivedState) error { return wantErr },
+			func(time.Duration) {},
+		)
+		if !errors.Is(err, wantErr) {
+			t.Fatalf("err = %v, want %v", err, wantErr)
+		}
+		if !strings.Contains(err.Error(), "failed to sync head lookup/admin projection") {
+			t.Fatalf("err = %v, want write prefix", err)
+		}
+		if reconciles != 1 || queues != 1 {
+			t.Fatalf("reconciles = %d queues = %d, want 1/1", reconciles, queues)
 		}
 	})
 }
