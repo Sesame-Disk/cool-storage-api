@@ -1,123 +1,152 @@
 # Upload & Download — Preproduction Assessment
 
-**Date:** 2026-04-14
+**Date:** 2026-05-22
 **Diagrams:** [Upload/Download Flow Diagrams](./diagrams/upload-download-flow.md)
 
 ---
 
-## Issues found
+## Current findings
 
-### HIGH: Zombie temp files from abandoned chunked uploads
+### HIGH: `upload-link` vs `update-link` still collapses replace semantics
 
-**File:** `internal/api/seafhttp.go` (HandleUpload, chunked path)
+**Files:** `internal/api/v2/files.go`, `internal/api/seafhttp.go`
 
-When a client starts a chunked upload (Content-Range) and disconnects, the temp file
-(`/tmp/sesamefs_upload_{token}_{filename}`) is left on disk. There is no cleanup job.
-The upload token expires in 1 hour, but the temp file persists indefinitely.
+The desktop client and the web UI both distinguish “replace” vs “don't replace” at
+the UX layer, but both flows still collapse into the same upload-token semantics on
+the backend. `upload-link` and `update-link` still produce equivalent tokens, and the
+upload handler defaults to overwrite behavior.
 
-**Impact:** Disk exhaustion on servers with high upload traffic. A malicious client could
-intentionally start many chunked uploads without completing them.
+**Impact:** A user can explicitly choose not to replace an existing file and still end up
+overwriting it. This is a correctness bug, not just missing UX polish.
 
-**Fix:** Add a periodic sweeper that deletes temp files older than the token TTL (1h).
-Alternatively, use `os.CreateTemp` with a prefix and sweep by `mtime`.
-
-**Tested:** No. No test verifies temp file cleanup on failure or abandonment.
-
----
-
-### HIGH: No integration test for encrypted upload/download
-
-There is no test that uploads a file to an encrypted library and downloads it back with
-content verification. The encryption path (`EncryptBlockSeafile` on upload,
-`DecryptBlock` on download) is only tested in unit tests with mock data.
-
-**Risk:** A regression in the encrypt→store→fetch→decrypt pipeline would not be caught
-until a customer reports corrupted files.
-
-**Fix:** Add integration test: create encrypted library → set password → upload file →
-download → verify SHA-256 matches original content.
+**Fix:** Split token semantics so `update-link` carries `Replace=true` and `upload-link`
+defaults to auto-rename / no-replace, then plumb that flag through `HandleUpload`.
 
 ---
 
 ### MEDIUM: Permission not rechecked during chunked upload streaming
 
-**File:** `internal/api/seafhttp.go:626`
+**File:** `internal/api/seafhttp.go` (`HandleUpload`)
 
-The upload token is validated once at the start. If a user's permission is revoked
-while a large chunked upload is in progress (which can take minutes for multi-GB files),
-the upload completes successfully. The token has a 1-hour TTL.
+The upload token and current permission are validated before the upload starts, but a
+long-running chunked upload is not rechecked chunk-by-chunk. If a user's write access is
+revoked mid-upload, the in-flight upload can still finish within the token TTL window.
 
-**Risk:** Low in practice (permission revocation during active upload is rare), but
-violates the principle that access checks happen at the time of action.
+**Risk:** Low in practice, but the action is effectively authorized at chunk-session start
+instead of at every write/finalize boundary.
 
-**Tested:** No.
-
----
-
-### MEDIUM: No test for resumable/chunked upload
-
-No integration test sends Content-Range headers to simulate a multi-chunk upload.
-The entire chunked upload path (temp file creation, chunk assembly, finalization)
-has zero end-to-end coverage.
-
-**Fix:** Add integration test: upload a 1MB file in 4 chunks with Content-Range headers,
-verify the assembled file matches.
+**Tested:** No focused revoke-during-upload integration test exists yet.
 
 ---
 
-### MEDIUM: Dedup doesn't save network bandwidth (web UI)
+### MEDIUM: Dedup still does not save upload bandwidth in the web UI
 
-**File:** `internal/api/seafhttp.go` (HandleUpload, single-shot path)
+**File:** `internal/api/seafhttp.go` (web upload path)
 
-When a user uploads a file via the web UI, the full file content is transferred over
-the network even if every block already exists in S3. The dedup check only happens
-at the S3 storage level (skip write if exists). The Seafile sync protocol avoids this
-with `check-blocks`, but the web UI doesn't.
+The web uploader still sends the full file bytes even when every block already exists in
+storage. Dedup saves storage writes, but it does not avoid network transfer the way the
+desktop sync protocol can.
 
-**Impact:** Wasted bandwidth for re-uploads of existing files. Not a bug, but a
-performance gap that affects users with large files.
+**Impact:** Re-uploads of large files waste user bandwidth and time.
 
-**Fix:** Consider a client-side hash check before upload, or a server-side
-`check-blocks` step in the web upload flow.
+**Fix:** A future browser-side block API flow (`check-blocks` + upload missing blocks +
+commit manifest) is the real solution. This is larger than a small backend patch.
 
 ---
 
-### MEDIUM: Encrypted files don't send Content-Length
+### MEDIUM: Encrypted downloads still omit `Content-Length`
 
-**File:** `internal/api/seafhttp.go:1648` (streamFileFromBlocks)
+**Files:** `internal/api/seafhttp.go`, `internal/api/v2/fileview.go`, `internal/api/v2/sharelink_view.go`
 
-For encrypted files, `Content-Length` is omitted because the decrypted size may
-differ from the stored (encrypted) size. Clients cannot show download progress bars.
+Encrypted download paths stream the decrypted payload correctly now, but they still omit
+`Content-Length` to avoid lying about ciphertext size.
 
-**Impact:** Poor UX for large encrypted file downloads.
+**Impact:** Browsers and clients cannot show accurate progress bars for large encrypted
+downloads.
 
-**Fix:** Pre-compute decrypted size by summing original file sizes from `fs_objects`
-(which stores plaintext size) and set Content-Length from that.
+**Fix:** Use the plaintext size already stored in `fs_objects.size_bytes` where the route
+can safely set a decrypted content length.
 
 ---
 
-### LOW: Block integrity not verified on download
+### MEDIUM: Chunked upload traffic accounting is completion-based
 
-**File:** `internal/storage/blocks.go` (GetBlock)
+**File:** `internal/api/seafhttp.go` (`HandleUpload`)
 
-Blocks are hashed (SHA-256) on upload but the hash is not re-verified on download.
-If S3 returns corrupted data, it is streamed to the client as-is.
+Chunked uploads now pre-check traffic against the declared `Content-Range` total, but
+traffic is still recorded only after `finalizeUploadStreaming()` succeeds.
 
-**Impact:** Silent data corruption. Mitigated by S3's own integrity guarantees,
-but no defense-in-depth at the application layer.
+**Impact:** Abandoned uploads and finalize failures can consume real bandwidth without
+advancing `traffic_period_usage`.
 
-**Fix:** Optional hash verification on download, or add an `X-Block-Hash` response
-header so clients can verify.
+**Status:** Accepted debt for now; paid upload headroom is generous and the earlier
+fail-open pre-check bug is already closed.
+
+---
+
+### LOW: Block integrity is still not re-verified on download
+
+**File:** `internal/storage/blocks.go` (`GetBlock`)
+
+Blocks are hashed on upload, but downloads still trust the backing store and stream the
+returned bytes without re-hashing.
+
+**Impact:** Silent corruption is unlikely because S3/MinIO already provide their own
+integrity guarantees, but the application layer has no defense-in-depth check.
+
+**Fix:** Optional hash verification on read, or an explicit integrity mode for high-value
+download paths.
+
+---
+
+## Recently closed findings
+
+### CLOSED: Abandoned chunk temp files are already cleaned by the janitor
+
+The original “zombie temp files” finding was stale. The current chunk manager already has
+both an in-memory tracker sweep and an orphaned-temp-file disk sweep, and that behavior is
+covered by janitor tests in `internal/api/seafhttp_test.go`.
+
+**Outcome:** This is no longer a live backend issue and should not be treated as an open
+upload risk.
+
+---
+
+### CLOSED: Encrypted upload/download round-trip now has end-to-end coverage, and it caught a real bug
+
+A new integration test now creates an encrypted library, unlocks it, uploads a file, and
+downloads it back with content verification.
+
+That test immediately exposed a real mismatch: encrypted uploads used
+`EncryptBlockSeafile`, while several read paths still used the legacy `DecryptBlock`
+format. The fix now propagates the file IV through the shared readers and decrypts via the
+Seafile-compatible path.
+
+**Covered surfaces fixed together:**
+- `seafhttp` download and ZIP streaming
+- shared streaming helpers (`StreamBlocks`, `BlockReadSeeker`)
+- raw file / historic file / share-link readers that reuse those helpers
+
+---
+
+### CLOSED: Chunked/resumable upload now has end-to-end coverage
+
+There is now an integration test that sends a file in multiple `Content-Range` requests,
+verifies assembly, and downloads the result back.
+
+The handler was also tightened so repeated chunk requests stop re-running the same visible
+tree storage-quota precheck on every chunk. The initial precheck is cached per upload
+tracker, while finalization still revalidates against the current HEAD before publish.
 
 ---
 
 ## Test coverage
 
-### Existing tests: 32
+### Existing tests: 35
 
 | What's tested | Count | Type |
 |---------------|-------|------|
-| Upload/download round-trip (content verified) | 1 | Integration |
+| Upload/download round-trip (content verified) | 3 | Integration |
 | Upload overwrite, URL format, region pinning | 4 | Integration |
 | Permission enforcement (readonly, guest blocked) | 2 | Integration |
 | v2 direct upload | 1 | Integration |
@@ -125,26 +154,24 @@ header so clients can verify.
 | History download (round-trip + errors) | 5 | Integration |
 | ZIP download (region-pinned) | 1 | Integration |
 | ZIP traversal limits (depth/count/bytes) | 3 | Unit |
+| Chunked upload tracker regression coverage | 1 | Unit |
 | Token lifecycle (create/get/expire/delete) | 8 | Unit |
 
-### Critical gaps: 8
+### Critical gaps: 5
 
 | Gap | Risk | What to add |
 |-----|------|-------------|
-| Encrypted file upload/download | High | Create encrypted lib → upload → download → verify content |
-| Chunked/resumable upload | High | Upload 1MB in 4 chunks via Content-Range → verify |
 | Large file (>100 MB) | Medium | Upload 100MB+ file, verify block count and download |
 | Concurrent upload to same path | Medium | Two clients upload simultaneously → verify no corruption |
 | Quota exhaustion behavior | Medium | Fill quota → verify upload rejected with correct error |
 | Expired token during download | Medium | Start download, expire token, verify behavior |
 | Range request (video seek) | Medium | Upload video → Range request → verify partial content |
-| Temp file cleanup on failure | Low | Start chunked upload, abandon, verify temp file cleaned |
 
 ### How to run
 
 ```bash
 # All upload/download integration tests
-go test -tags integration -v -run "TestUpload\|TestDownload\|TestFile\|TestHistory\|TestZip" \
+go test -count=1 -tags integration -v -run "TestUpload\|TestDownload\|TestFile\|TestHistory\|TestZip" \
     -timeout 5m ./internal/integration/...
 
 # Unit tests only
@@ -158,12 +185,13 @@ go test -v -run "TestToken\|TestZipTraversal" ./internal/api/...
 | Practice | Status |
 |----------|--------|
 | Auth checked before any I/O | Yes (token validated first) |
-| Quota checked before reading body | Yes (fail-fast) |
+| Quota checked before reading body | Yes (traffic fail-fast; chunked storage precheck cached per upload tracker, then revalidated at finalize) |
 | File size limited | Only by quota (no hard max) |
 | Temp files in secure location | Yes (/tmp, 0600 perms) |
 | Temp files cleaned on success | Yes |
-| Temp files cleaned on failure | **No** |
+| Temp files cleaned on failure | Yes (tracker janitor + orphan disk sweep) |
 | Traffic recorded accurately | Yes (fire-and-forget) |
 | Streaming uses bounded memory | Yes (4MB buffer pool) |
 | Encrypted blocks never written to disk | Yes (memory only) |
+| Final publish revalidates current HEAD | Yes |
 | Download tokens are single-use | No (reusable within TTL — acceptable) |

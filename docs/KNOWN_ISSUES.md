@@ -1,6 +1,6 @@
 # Known Issues - SesameFS
 
-**Last Updated**: 2026-05-21
+**Last Updated**: 2026-05-22
 
 This document tracks all known bugs, limitations, and issues in SesameFS.
 
@@ -35,15 +35,15 @@ This document tracks all known bugs, limitations, and issues in SesameFS.
 | Library Settings Backend | Partial | API tokens and transfer are complete. History and auto-delete settings persist, but retention/delete semantics are incomplete. See ISSUE-LIB-RETENTION-01. |
 | **Desktop SSO Browser UX** | ✅ Fixed (2026-03-04) | After browser SSO login for desktop client, now shows confirmation page with auto-close. See ISSUE-SSO-01 below. |
 | **Desktop Sync Active-Active Conflict Recovery** | 🟡 Follow-up coverage debt | `PUT /commit/HEAD` and `POST /update-branch` now use parent-chain validation, CAS, ancestry-gated auto-merge for safe stale siblings, and `503 + Retry-After` fail-closed responses for unsafe conflicts. The real desktop-client harness now proves both the non-overlapping auto-merge race and the same-path unsafe-conflict `503` preservation path. The remaining gap is broader end-to-end scenario coverage. See ISSUE-SYNC-HEAD-RECOVERY-01 below. |
-| **Upload "Don't Replace" (Desktop Client)** | 🟡 Pending | Desktop client file browser "No" button (auto-rename) doesn't work. Client uses `update-link` vs `upload-link` to distinguish replace vs no-replace, but both map to same token/handler. Backend autorename infrastructure ready (`autoRenameIfExists`), needs token-level `Replace` flag to distinguish endpoints. Web "Don't replace" also broken (same root cause). See ISSUE-UPLOAD-REPLACE-01 below. |
+| **Upload "Don't Replace" (Desktop Client)** | 🟡 Pending | Upload audit reconfirmed that desktop and web still collapse `update-link` and `upload-link` into the same backend token semantics. Autorename code exists, but the upload token still cannot distinguish overwrite vs no-replace. See ISSUE-UPLOAD-REPLACE-01 below. |
 | **Org Logo Upload** | 🟡 Stub | `UpdateOrgLogo` in org_admin.go accepts the file but does not persist it to storage. Returns a static path from settings. Functional as a route placeholder until an asset storage backend is available. |
 | **Login Analytics History** | 🟡 Partial | `last_login` is now real and persisted in `users.last_login_at`, but there is still no historical login event dataset for trend analysis, login audit timelines, or period-based "users who logged in" charts. See ISSUE-LOGIN-ANALYTICS-01 below. |
 | **File Statistics Pages Are Still Stubbed** | 🟡 Pending | `/sys/statistics/file/` currently returns all-zero series and `/org/statistics-admin/file/` is still unimplemented. Real data depends on new `file_update_logs` and `file_access_logs` tables, not on `login_logs`. See ISSUE-FILE-STATS-01 below. |
 | **Org Admin Statistics Can Leak Platform Scope** | 🔴 Confirmed bug | When org-admin pages are mounted with platform-org context, traffic-based org-admin metrics can resolve to the global aggregate instead of a tenant scope. Affects at least org-admin traffic, org-admin per-user traffic, and org-admin active-users. See ISSUE-ORG-STATS-SCOPE-01 below. |
 | **Per-User Storage Quota Enforcement** | ✅ Fixed (2026-05-14) | `CheckStorageQuota` now evaluates org and per-user storage caps; upload callers pass `userID`; sync validates the published tree delta before advancing HEAD and waits for the matching storage-counter adjust before returning. See ISSUE-USER-STORAGE-ENFORCE-01 below. |
 | **Quota Enforcement Coverage Gaps in V2 Mutations** | ✅ Fixed (2026-05-14) | The affected non-upload mutation handlers now have visible-delta quota wiring. Deleted file/folder restore remains bounded by configured history retention, deleted-library restore remains bounded by trash retention, and cross-repo move still relies on split-phase destination publish plus source removal. Split-phase publish/counter atomicity remains documented as technical debt (§12d/§12e). See ISSUE-QUOTA-COVERAGE-01 below. |
-| **Concurrent Hard-Quota Reservation Hardening** | 🟡 Deferred to separate branch | The existing split pre-check → publish → counter-adjust window is still open. A canonical-row reservation prototype was audited and is not merge-ready for PR61 because it leaks reservations on finalize failure, regresses soft-policy evaluation, races with admin resync, and only hardens `seafhttp`. See ISSUE-QUOTA-RESERVATION-01 below. |
-| **Chunked Upload Traffic Accounting Semantics** | 🟡 Accepted debt | Web chunked uploads now pre-check traffic against the declared `Content-Range` total, but traffic is still recorded only after successful finalize. Abandoned chunk sessions can consume bandwidth without advancing counters. Operationally acceptable for current generous paid upload allowances, but documented for future billing/accounting work. See ISSUE-CHUNKED-UPLOAD-TRAFFIC-01 below. |
+| **Concurrent Hard-Quota Reservation Hardening** | 🟡 Deferred to separate branch | The existing split pre-check → publish → counter-adjust window is still open. A canonical-row reservation prototype was audited and is not merge-ready for PR61 because it leaks reservations on finalize failure, regresses soft-policy evaluation, races with admin resync, and only hardens `seafhttp`. A smaller safe fix now caches repeated chunk prechecks per upload tracker, but that is not reservation hardening. See ISSUE-QUOTA-RESERVATION-01 below. |
+| **Chunked Upload Traffic Accounting Semantics** | 🟡 Accepted debt | Web chunked uploads now pre-check traffic against the declared `Content-Range` total, and repeated storage prechecks no longer walk HEAD on every chunk, but traffic is still recorded only after successful finalize. Abandoned chunk sessions can consume bandwidth without advancing counters. See ISSUE-CHUNKED-UPLOAD-TRAFFIC-01 below. |
 
 ### 🟡 SeaDrive 3.x Missing Endpoints (Non-fatal, but degrade UX)
 | Issue | Status | Notes |
@@ -374,6 +374,7 @@ Split-phase atomicity (pre-check → publish → counter adjust) remains documen
 
 - Keep the `scripts/test.sh` failure-excerpt improvement in PR61.
 - Move any canonical reservation / finalize / release quota work to a dedicated follow-up branch with its own tests and review.
+- Keep the smaller tracker-scoped chunk precheck cache separate from reservation work; it reduces hot-path read cost without changing publish/counter atomicity.
 
 #### Follow-up Branch Requirements
 
@@ -394,6 +395,8 @@ Split-phase atomicity (pre-check → publish → counter adjust) remains documen
 #### Current Contract
 
 The web chunked upload path now parses `Content-Range` and uses the declared total for the traffic pre-check before reading the multipart body. That closes the earlier fail-open where a large resumable upload could slip through using only per-request `Content-Length`.
+
+The handler also now caches a successful storage pre-check on the in-memory upload tracker so repeated chunk requests stop re-walking the visible HEAD on every request. Finalization still performs its own authoritative re-check against the current HEAD before publish.
 
 Traffic recording is still tied to successful logical upload completion:
 
@@ -2547,6 +2550,7 @@ Changed `internal/storage/s3.go` HTTP transport settings:
 
 **Status**: 🟡 Pending
 **Discovered**: 2026-03-04
+**Reconfirmed by upload audit**: 2026-05-22
 **Severity**: Medium — files get silently overwritten when user explicitly chooses not to replace
 
 **Problem**: When uploading a file that already exists:

@@ -1345,6 +1345,44 @@ func TestChunkUploadAccountBlockOnceSurvivesFinalizeRetry(t *testing.T) {
 	}
 }
 
+func TestChunkUploadQuotaPrecheckCacheMatchesMetadata(t *testing.T) {
+	cm, _ := newTestChunkManager(t)
+
+	upload, err := cm.GetOrCreateUpload("token1", "test.bin", "/docs", 10)
+	if err != nil {
+		t.Fatalf("GetOrCreateUpload failed: %v", err)
+	}
+	defer func() {
+		upload.Cleanup()
+		cm.CleanupUpload("token1", "test.bin")
+	}()
+
+	if upload.HasQuotaPrecheck("/docs", 10, true) {
+		t.Fatal("new upload should not start with a cached quota precheck")
+	}
+
+	upload.MarkQuotaPrecheck("/docs", 10, true)
+
+	if !upload.HasQuotaPrecheck("/docs", 10, true) {
+		t.Fatal("matching chunk metadata should hit the cached quota precheck")
+	}
+	if upload.HasQuotaPrecheck("/other", 10, true) {
+		t.Fatal("different parent dir must not reuse cached quota precheck")
+	}
+	if upload.HasQuotaPrecheck("/docs", 11, true) {
+		t.Fatal("different total size must not reuse cached quota precheck")
+	}
+	if upload.HasQuotaPrecheck("/docs", 10, false) {
+		t.Fatal("different replace mode must not reuse cached quota precheck")
+	}
+	if got := cm.GetUpload("token1", "test.bin"); got != upload {
+		t.Fatal("GetUpload should return the tracked upload instance")
+	}
+	if got := cm.GetUpload("token1", "missing.bin"); got != nil {
+		t.Fatal("GetUpload should return nil for unknown uploads")
+	}
+}
+
 // ============================================================================
 // TokenManager Concurrent Access Tests
 // ============================================================================

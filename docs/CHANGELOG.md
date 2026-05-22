@@ -8,6 +8,57 @@ Session-by-session development history for SesameFS.
 
 ---
 
+## 2026-05-22 — Upload/download audit hardening: encrypted round-trip fix + chunked precheck cache
+
+### Fixed
+
+Encrypted-library uploads now round-trip correctly through the live HTTP download
+paths. A new integration test exposed that uploads were written with
+`EncryptBlockSeafile` while several readers still decrypted with the legacy
+`DecryptBlock` format.
+
+The backend now propagates the library IV through the shared streaming helpers and
+uses a common `DecryptLibraryBlock` helper across:
+
+- `seafhttp` download and ZIP streaming
+- `internal/streaming.StreamBlocks`
+- `internal/streaming.BlockReadSeeker`
+- raw / historic / share-link readers that use those shared paths
+
+### Performance / Safety
+
+Chunked uploads no longer re-run the same visible-tree storage quota pre-check on
+every chunk request. `HandleUpload` now caches a successful pre-check on the upload
+tracker for the same path / total-size / replace tuple.
+
+This is intentionally narrow: finalization still re-runs the authoritative storage
+quota and tree check against the current HEAD before publishing, so HEAD/CAS safety
+does not change.
+
+### Tests / Docs
+
+- Added `TestChunkedUploadAndDownloadRoundTrip`
+- Added `TestEncryptedUploadAndDownloadRoundTrip`
+- Added `TestChunkUploadQuotaPrecheckCacheMatchesMetadata`
+- Refreshed upload/download docs to mark janitor cleanup as already fixed, document the
+  remaining upload issues, and capture the accepted traffic-accounting debt
+
+### Files
+
+- `internal/api/seafhttp.go`
+- `internal/api/seafhttp_test.go`
+- `internal/api/v2/fileview.go`
+- `internal/api/v2/sharelink_view.go`
+- `internal/streaming/streaming.go`
+- `internal/streaming/block_read_seeker.go`
+- `internal/crypto/crypto.go`
+- `internal/integration/upload_download_test.go`
+- `docs/UPLOAD-DOWNLOAD-ANALYSIS.md`
+- `docs/KNOWN_ISSUES.md`
+- `docs/TECHNICAL-DEBT.md`
+
+---
+
 ## 2026-05-02 — Config: centralize `SERVER_URL` / branding / S3 creds
 
 ### Refactor

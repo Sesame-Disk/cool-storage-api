@@ -10,6 +10,7 @@ import (
 	"io"
 	"mime/multipart"
 	"net/http"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -185,6 +186,117 @@ func TestUploadAndDownloadRoundTrip(t *testing.T) {
 			t.Log("content matches — full round-trip verified")
 		}
 	})
+}
+
+func TestChunkedUploadAndDownloadRoundTrip(t *testing.T) {
+	name := fmt.Sprintf("inttest-chunked-updown-%d", time.Now().UnixNano())
+	repoID := createTestLibrary(t, adminClient, name)
+	uploadURL := getUploadURL(t, adminClient, repoID)
+
+	fileName := "chunked-roundtrip.txt"
+	fileContent := []byte(strings.Repeat("chunked roundtrip content ", 32) + "done\n")
+	chunkStarts := []int{0, 173, 347, 521}
+
+	for index, start := range chunkStarts {
+		end := len(fileContent) - 1
+		if index+1 < len(chunkStarts) {
+			end = chunkStarts[index+1] - 1
+		}
+
+		status, body := uploadChunkThroughLinkStatus(
+			t,
+			adminClient,
+			uploadURL,
+			fileName,
+			"/",
+			fileContent[start:end+1],
+			fmt.Sprintf("bytes %d-%d/%d", start, end, len(fileContent)),
+		)
+		if status != http.StatusOK && status != http.StatusCreated {
+			t.Fatalf("chunk %d upload status = %d, want 200/201; body=%s", index, status, body)
+		}
+	}
+
+	listResp := adminClient.Get(t, fmt.Sprintf("/api/v2.1/repos/%s/dir/?p=/", repoID))
+	expectStatus(t, listResp, http.StatusOK)
+
+	var dirList map[string]interface{}
+	decodeJSON(t, listResp, &dirList)
+	entries, _ := dirList["dirent_list"].([]interface{})
+	if !containsEntry(entries, "name", fileName) {
+		t.Fatalf("chunked uploaded file %q not found in directory listing", fileName)
+	}
+
+	dlResp := adminClient.Get(t, fmt.Sprintf("/api2/repos/%s/file/?p=/%s", repoID, fileName))
+	expectStatus(t, dlResp, http.StatusOK)
+	downloadURL := strings.Trim(responseBody(t, dlResp), "\" \n\r")
+
+	req, err := http.NewRequest(http.MethodGet, downloadURL, nil)
+	if err != nil {
+		t.Fatalf("creating chunked roundtrip download request failed: %v", err)
+	}
+	downloadResp, err := adminClient.http.Do(req)
+	if err != nil {
+		t.Fatalf("chunked roundtrip download request failed: %v", err)
+	}
+	defer downloadResp.Body.Close()
+	if downloadResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(downloadResp.Body)
+		t.Fatalf("chunked roundtrip download status = %d: %s", downloadResp.StatusCode, string(body))
+	}
+
+	downloadedContent, err := io.ReadAll(downloadResp.Body)
+	if err != nil {
+		t.Fatalf("reading chunked roundtrip download failed: %v", err)
+	}
+	if !bytes.Equal(downloadedContent, fileContent) {
+		t.Fatalf("chunked downloaded content mismatch: got %d bytes, want %d", len(downloadedContent), len(fileContent))
+	}
+}
+
+func TestEncryptedUploadAndDownloadRoundTrip(t *testing.T) {
+	name := fmt.Sprintf("inttest-encrypted-updown-%d", time.Now().UnixNano())
+	password := "test-password-123"
+	repoID := createLibraryWithBody(t, adminClient, name, map[string]interface{}{
+		"repo_name": name,
+		"encrypted": true,
+		"passwd":    password,
+	}, true)
+
+	setPassResp := adminClient.PostForm(t, fmt.Sprintf("/api/v2.1/repos/%s/set-password/", repoID), url.Values{"password": {password}})
+	expectStatus(t, setPassResp, http.StatusOK)
+	setPassResp.Body.Close()
+
+	fileName := "encrypted-roundtrip.txt"
+	fileContent := "Encrypted roundtrip integration content. This must survive upload and download intact.\n"
+	uploadURL := getUploadURL(t, adminClient, repoID)
+	uploadFileThroughLink(t, adminClient, uploadURL, fileName, "/", fileContent)
+
+	dlResp := adminClient.Get(t, fmt.Sprintf("/api2/repos/%s/file/?p=/%s", repoID, fileName))
+	expectStatus(t, dlResp, http.StatusOK)
+	downloadURL := strings.Trim(responseBody(t, dlResp), "\" \n\r")
+
+	req, err := http.NewRequest(http.MethodGet, downloadURL, nil)
+	if err != nil {
+		t.Fatalf("creating encrypted roundtrip download request failed: %v", err)
+	}
+	downloadResp, err := adminClient.http.Do(req)
+	if err != nil {
+		t.Fatalf("encrypted roundtrip download request failed: %v", err)
+	}
+	defer downloadResp.Body.Close()
+	if downloadResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(downloadResp.Body)
+		t.Fatalf("encrypted roundtrip download status = %d: %s", downloadResp.StatusCode, string(body))
+	}
+
+	downloadedContent, err := io.ReadAll(downloadResp.Body)
+	if err != nil {
+		t.Fatalf("reading encrypted roundtrip download failed: %v", err)
+	}
+	if string(downloadedContent) != fileContent {
+		t.Fatalf("encrypted downloaded content mismatch:\n  got:  %q\n  want: %q", string(downloadedContent), fileContent)
+	}
 }
 
 // TestUploadLinkURL verifies the upload link URL points to the correct server.

@@ -109,7 +109,7 @@ type PrefetchResult struct {
 }
 
 // PrefetchBlock starts fetching a block in a goroutine and returns a channel with the result.
-func PrefetchBlock(ctx context.Context, blockStore BlockReader, blockID string, fileKey []byte) chan PrefetchResult {
+func PrefetchBlock(ctx context.Context, blockStore BlockReader, blockID string, fileKey []byte, fileIV []byte) chan PrefetchResult {
 	ch := make(chan PrefetchResult, 1)
 	go func() {
 		if fileKey != nil {
@@ -118,7 +118,7 @@ func PrefetchBlock(ctx context.Context, blockStore BlockReader, blockID string, 
 				ch <- PrefetchResult{Err: err}
 				return
 			}
-			decrypted, err := crypto.DecryptBlock(blockData, fileKey)
+			decrypted, err := crypto.DecryptLibraryBlock(blockData, fileKey, fileIV)
 			ch <- PrefetchResult{Data: decrypted, Err: err}
 		} else {
 			reader, err := blockStore.GetBlockReader(ctx, blockID)
@@ -131,7 +131,7 @@ func PrefetchBlock(ctx context.Context, blockStore BlockReader, blockID string, 
 // StreamBlocks streams resolved blocks to an HTTP response with prefetching.
 // Uses prefetch (overlap S3 fetch with HTTP write) and 4MB io.CopyBuffer
 // for maximum throughput. Only O(2 x block_size) RAM.
-func StreamBlocks(c *gin.Context, ctx context.Context, blockStore BlockReader, resolvedIDs []string, fileKey []byte, logPrefix string) {
+func StreamBlocks(c *gin.Context, ctx context.Context, blockStore BlockReader, resolvedIDs []string, fileKey []byte, fileIV []byte, logPrefix string) {
 	if len(resolvedIDs) == 0 {
 		return
 	}
@@ -140,7 +140,7 @@ func StreamBlocks(c *gin.Context, ctx context.Context, blockStore BlockReader, r
 	defer PutCopyBuf(buf)
 
 	// Start prefetching block 0
-	nextResult := PrefetchBlock(ctx, blockStore, resolvedIDs[0], fileKey)
+	nextResult := PrefetchBlock(ctx, blockStore, resolvedIDs[0], fileKey, fileIV)
 
 	for i := range resolvedIDs {
 		// Wait for the prefetched block
@@ -148,7 +148,7 @@ func StreamBlocks(c *gin.Context, ctx context.Context, blockStore BlockReader, r
 
 		// Start prefetching the NEXT block immediately
 		if i+1 < len(resolvedIDs) {
-			nextResult = PrefetchBlock(ctx, blockStore, resolvedIDs[i+1], fileKey)
+			nextResult = PrefetchBlock(ctx, blockStore, resolvedIDs[i+1], fileKey, fileIV)
 		}
 
 		if result.Err != nil {

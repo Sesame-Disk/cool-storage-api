@@ -884,8 +884,9 @@ func (h *ShareLinkViewHandler) handleShareLinkRaw(c *gin.Context, sl *shareLinkD
 		sl.orgID, sl.libraryID).Scan(&encrypted)
 
 	var fileKey []byte
+	var fileIV []byte
 	if encrypted {
-		fileKey = GetDecryptSessions().GetFileKey(sl.createdBy, sl.libraryID)
+		fileKey, fileIV = GetDecryptSessions().GetFileKeyAndIV(sl.createdBy, sl.libraryID)
 		if fileKey == nil {
 			c.JSON(http.StatusForbidden, gin.H{"error": "library is encrypted but not unlocked"})
 			return
@@ -904,8 +905,10 @@ func (h *ShareLinkViewHandler) handleShareLinkRaw(c *gin.Context, sl *shareLinkD
 	resolvedIDs := streaming.BatchResolveBlockIDs(h.db, sl.orgID, blockIDs)
 
 	var fileKeyParam []byte
+	var fileIVParam []byte
 	if encrypted {
 		fileKeyParam = fileKey
+		fileIVParam = fileIV
 	}
 
 	ctx := c.Request.Context()
@@ -920,7 +923,7 @@ func (h *ShareLinkViewHandler) handleShareLinkRaw(c *gin.Context, sl *shareLinkD
 			return
 		}
 
-		rs := streaming.NewBlockReadSeeker(ctx, blockStore, resolvedIDs, blockSizes, fileSize, fileKeyParam)
+		rs := streaming.NewBlockReadSeeker(ctx, blockStore, resolvedIDs, blockSizes, fileSize, fileKeyParam, fileIVParam)
 		c.Header("Content-Disposition", resolveContentDisposition(ext, filename))
 		c.Header("Content-Type", mimeType)
 		http.ServeContent(c.Writer, c.Request, filename, time.Time{}, rs)
@@ -935,7 +938,7 @@ func (h *ShareLinkViewHandler) handleShareLinkRaw(c *gin.Context, sl *shareLinkD
 	}
 	c.Status(http.StatusOK)
 
-	streaming.StreamBlocks(c, ctx, blockStore, resolvedIDs, fileKeyParam, "ShareLinkRaw")
+	streaming.StreamBlocks(c, ctx, blockStore, resolvedIDs, fileKeyParam, fileIVParam, "ShareLinkRaw")
 }
 
 // serveSharedDirPage renders the shared directory view
@@ -988,8 +991,9 @@ func (h *ShareLinkViewHandler) readFileContentAsText(sl *shareLinkData) string {
 		sl.orgID, sl.libraryID).Scan(&encrypted)
 
 	var fileKey []byte
+	var fileIV []byte
 	if encrypted {
-		fileKey = GetDecryptSessions().GetFileKey(sl.createdBy, sl.libraryID)
+		fileKey, fileIV = GetDecryptSessions().GetFileKeyAndIV(sl.createdBy, sl.libraryID)
 		if fileKey == nil {
 			return ""
 		}
@@ -1006,7 +1010,7 @@ func (h *ShareLinkViewHandler) readFileContentAsText(sl *shareLinkData) string {
 			if err != nil {
 				return ""
 			}
-			blockData, err = crypto.DecryptBlock(blockData, fileKey)
+			blockData, err = crypto.DecryptLibraryBlock(blockData, fileKey, fileIV)
 			if err != nil {
 				return ""
 			}
