@@ -712,6 +712,24 @@ func (cu *ChunkUpload) BlockAlreadyAccounted(index int, blockID string) (bool, e
 	return true, nil
 }
 
+func (cu *ChunkUpload) AccountedBlockIDs() []string {
+	cu.mu.Lock()
+	defer cu.mu.Unlock()
+	if len(cu.accountedBlockPosition) == 0 {
+		return nil
+	}
+	positions := make([]int, 0, len(cu.accountedBlockPosition))
+	for position := range cu.accountedBlockPosition {
+		positions = append(positions, position)
+	}
+	sort.Ints(positions)
+	blockIDs := make([]string, 0, len(positions))
+	for _, position := range positions {
+		blockIDs = append(blockIDs, cu.accountedBlockPosition[position])
+	}
+	return blockIDs
+}
+
 func (cu *ChunkUpload) HasQuotaPrecheck(parentDir string, totalSize int64, replace bool) bool {
 	cu.mu.Lock()
 	defer cu.mu.Unlock()
@@ -1175,7 +1193,7 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 		upload.Touch()
 		fileID, actualFilename, storageDeltaBytes, storageDeltaFiles, err := h.finalizeUploadStreaming(c, token, upload, parentDir, filename, storageKey, total, replaceFile)
 		if err != nil {
-			upload.ResetFinalization()
+			h.handleChunkedFinalizeError(token, tokenStr, filename, upload, err)
 			log.Printf("[HandleUpload] Finalization failed: %v", err)
 			writeSeafHTTPUploadError(c, err, "failed to finalize upload")
 			return
@@ -1307,6 +1325,7 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 	// Update filesystem metadata
 	commitID, actualFilename, storageDeltaBytes, storageDeltaFiles, err := h.commitUploadedFile(token.OrgID, token.RepoID, token.UserID, parentDir, filename, fileID, chunkData, finalSize, replaceFile)
 	if err != nil {
+		h.handleSingleShotMetadataError(token, fileID, sha256ID, err)
 		log.Printf("[HandleUpload] Failed to update filesystem: %v", err)
 		writeSeafHTTPUploadError(c, err, "file stored but metadata update failed")
 		return
@@ -1339,6 +1358,47 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 }
 
 var errStorageQuotaExceeded = errors.New("storage quota exceeded")
+
+var rollbackUploadedBlockRefsFn = v2.RollbackUploadedBlockRefs
+
+var cleanupChunkUploadFn = func(token, filename string) {
+	chunkManager.CleanupUpload(token, filename)
+}
+
+func uploadRollbackOperationKey(scope, repoID, identifier string) string {
+	return fmt.Sprintf("%s:%s:%s:%d", scope, repoID, identifier, time.Now().UnixNano())
+}
+
+func (h *SeafHTTPHandler) handleChunkedFinalizeError(token *AccessToken, tokenStr, filename string, upload *ChunkUpload, err error) {
+	if errors.Is(err, v2.ErrLibraryHeadConflict) {
+		accountedBlockIDs := upload.AccountedBlockIDs()
+		if len(accountedBlockIDs) > 0 {
+			rollbackUploadedBlockRefsFn(
+				h.db,
+				token.OrgID,
+				token.RepoID,
+				uploadRollbackOperationKey("seafhttp_chunk_conflict", token.RepoID, tokenStr+":"+filename),
+				accountedBlockIDs,
+			)
+		}
+		cleanupChunkUploadFn(tokenStr, filename)
+		return
+	}
+	upload.ResetFinalization()
+}
+
+func (h *SeafHTTPHandler) handleSingleShotMetadataError(token *AccessToken, fileID, internalBlockID string, err error) {
+	if err == nil || strings.TrimSpace(internalBlockID) == "" {
+		return
+	}
+	rollbackUploadedBlockRefsFn(
+		h.db,
+		token.OrgID,
+		token.RepoID,
+		uploadRollbackOperationKey("seafhttp_single_metadata", token.RepoID, fileID),
+		[]string{internalBlockID},
+	)
+}
 
 func writeSeafHTTPUploadError(c *gin.Context, err error, genericMsg string) {
 	switch {

@@ -11,10 +11,12 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"reflect"
 	"testing"
 	"time"
 
 	v2 "github.com/Sesame-Disk/sesamefs/internal/api/v2"
+	"github.com/Sesame-Disk/sesamefs/internal/db"
 	"github.com/Sesame-Disk/sesamefs/internal/metrics"
 	"github.com/Sesame-Disk/sesamefs/internal/middleware"
 	"github.com/Sesame-Disk/sesamefs/internal/storage"
@@ -211,6 +213,97 @@ func TestWriteSeafHTTPUploadError_MapsSentinelErrors(t *testing.T) {
 				t.Fatalf("error = %v, want %q", got, tt.wantError)
 			}
 		})
+	}
+}
+
+func TestHandleChunkedFinalizeError_RollsBackConflictAndCleansUp(t *testing.T) {
+	oldRollback := rollbackUploadedBlockRefsFn
+	oldCleanup := cleanupChunkUploadFn
+	defer func() {
+		rollbackUploadedBlockRefsFn = oldRollback
+		cleanupChunkUploadFn = oldCleanup
+	}()
+
+	var rollbackCalled bool
+	var gotOrgID, gotRepoID, gotOperationKey string
+	var gotBlockIDs []string
+	var cleanedToken, cleanedFilename string
+	rollbackUploadedBlockRefsFn = func(database *db.DB, orgID, repoID, operationKey string, blockIDs []string) {
+		rollbackCalled = true
+		gotOrgID = orgID
+		gotRepoID = repoID
+		gotOperationKey = operationKey
+		gotBlockIDs = append([]string(nil), blockIDs...)
+	}
+	cleanupChunkUploadFn = func(token, filename string) {
+		cleanedToken = token
+		cleanedFilename = filename
+	}
+
+	h := &SeafHTTPHandler{}
+	token := &AccessToken{OrgID: "org-1", RepoID: "repo-1"}
+	upload := &ChunkUpload{
+		Finalizing: true,
+		accountedBlockPosition: map[int]string{
+			2: "block-a",
+			0: "block-a",
+			1: "block-b",
+		},
+	}
+
+	h.handleChunkedFinalizeError(token, "upload-token", "file.bin", upload, fmt.Errorf("%w: failed to finalize upload metadata after 20 attempts", v2.ErrLibraryHeadConflict))
+
+	if !rollbackCalled {
+		t.Fatal("expected conflict finalize error to roll back accounted blocks")
+	}
+	if gotOrgID != "org-1" || gotRepoID != "repo-1" {
+		t.Fatalf("rollback org/repo = %s/%s, want org-1/repo-1", gotOrgID, gotRepoID)
+	}
+	if gotOperationKey == "" {
+		t.Fatal("expected rollback operation key to be set")
+	}
+	if !reflect.DeepEqual(gotBlockIDs, []string{"block-a", "block-b", "block-a"}) {
+		t.Fatalf("rollback block IDs = %#v, want %#v", gotBlockIDs, []string{"block-a", "block-b", "block-a"})
+	}
+	if cleanedToken != "upload-token" || cleanedFilename != "file.bin" {
+		t.Fatalf("cleanup target = %s/%s, want upload-token/file.bin", cleanedToken, cleanedFilename)
+	}
+	if !upload.Finalizing {
+		t.Fatal("conflict cleanup should not reset tracker state before cleanup")
+	}
+}
+
+func TestHandleChunkedFinalizeError_ResetsNonConflictState(t *testing.T) {
+	oldRollback := rollbackUploadedBlockRefsFn
+	oldCleanup := cleanupChunkUploadFn
+	defer func() {
+		rollbackUploadedBlockRefsFn = oldRollback
+		cleanupChunkUploadFn = oldCleanup
+	}()
+
+	rollbackCalled := false
+	cleanupCalled := false
+	rollbackUploadedBlockRefsFn = func(database *db.DB, orgID, repoID, operationKey string, blockIDs []string) {
+		rollbackCalled = true
+	}
+	cleanupChunkUploadFn = func(token, filename string) {
+		cleanupCalled = true
+	}
+
+	h := &SeafHTTPHandler{}
+	token := &AccessToken{OrgID: "org-1", RepoID: "repo-1"}
+	upload := &ChunkUpload{Finalizing: true}
+
+	h.handleChunkedFinalizeError(token, "upload-token", "file.bin", upload, errors.New("boom"))
+
+	if rollbackCalled {
+		t.Fatal("non-conflict finalize error should not roll back accounted blocks here")
+	}
+	if cleanupCalled {
+		t.Fatal("non-conflict finalize error should keep the tracker for retry")
+	}
+	if upload.Finalizing {
+		t.Fatal("non-conflict finalize error should reset finalization state")
 	}
 }
 

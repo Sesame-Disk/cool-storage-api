@@ -24,6 +24,8 @@ package integration
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -31,6 +33,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -111,6 +114,14 @@ func uploadViaV2DirectConcurrent(c *testClient, repoID, filename, parentDir, con
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
 	return concurrentMutationResult{status: resp.StatusCode, body: string(body)}
+}
+
+func uploadTokenFromURL(uploadURL string) string {
+	idx := strings.LastIndex(uploadURL, "/")
+	if idx == -1 || idx+1 >= len(uploadURL) {
+		return ""
+	}
+	return uploadURL[idx+1:]
 }
 
 // ── 1. High-concurrency seafhttp upload (commitUploadedFile path) ─────────────
@@ -387,6 +398,149 @@ func TestChunkedUploadRaceReturnsAutorenameInResponse(t *testing.T) {
 	}
 	if !containsEntry(entries, "name", autoRenamed) {
 		t.Fatalf("autorename target %q not found after chunked autorename race", autoRenamed)
+	}
+}
+
+func TestChunkedUploadConflictRollbackCleansStateBeforeFreshReupload(t *testing.T) {
+	t.Skip("TODO: add a deterministic finalize-conflict exhaustion harness for chunked uploads; current canonical-head churn attempts still converge to 200 in the containerized integration env")
+
+	requireGCEnabled(t)
+	requireCassandra(t)
+
+	repoID := createTestLibrary(t, adminClient, fmt.Sprintf("inttest-chunked-conflict-reupload-%d", time.Now().UnixNano()))
+	orgID := resolveOrgID(t, repoID)
+	session := shareProjectionDBForTest(t).Session()
+	setHeadCommit := func(head string) error {
+		if err := session.Query(`UPDATE libraries SET head_commit_id = ? WHERE org_id = ? AND library_id = ?`, head, orgID, repoID).Exec(); err != nil {
+			return err
+		}
+		return session.Query(`UPDATE libraries_by_id SET head_commit_id = ? WHERE library_id = ?`, head, repoID).Exec()
+	}
+	readHeadCommit := func() string {
+		var head string
+		if err := session.Query(`SELECT head_commit_id FROM libraries WHERE org_id = ? AND library_id = ?`, orgID, repoID).Scan(&head); err != nil {
+			t.Fatalf("failed to read canonical head for %s: %v", repoID, err)
+		}
+		return head
+	}
+	currentHead := readHeadCommit()
+	var rootFSID string
+	if err := session.Query(`SELECT root_fs_id FROM commits WHERE library_id = ? AND commit_id = ?`, repoID, currentHead).Scan(&rootFSID); err != nil {
+		t.Fatalf("failed to resolve root_fs_id for repo %s head %s: %v", repoID, currentHead, err)
+	}
+	churnHeads := make([]string, 0, 512)
+	parentHead := currentHead
+	seedBase := time.Now().UnixNano()
+	for index := 0; index < cap(churnHeads); index++ {
+		head := fmt.Sprintf("%040x", seedBase+int64(index+1))
+		if err := session.Query(`
+			INSERT INTO commits (library_id, commit_id, parent_id, root_fs_id, creator_id, description, created_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?)
+		`, repoID, head, parentHead, rootFSID, "integration-churn", fmt.Sprintf("synthetic churn %03d", index), time.Now()).Exec(); err != nil {
+			t.Fatalf("failed to insert synthetic churn commit %s: %v", head, err)
+		}
+		churnHeads = append(churnHeads, head)
+		parentHead = head
+	}
+
+	uploadURL := getUploadLink(t, adminClient, repoID, "/")
+	uploadToken := uploadTokenFromURL(uploadURL)
+	if uploadToken == "" {
+		t.Fatalf("could not extract upload token from %q", uploadURL)
+	}
+
+	fileName := "chunked-conflict-reupload.txt"
+	fileContent := []byte(strings.Repeat("chunked-conflict-reupload-", 8) + "done")
+	hash := sha256.Sum256(fileContent)
+	blockID := hex.EncodeToString(hash[:])
+	tempPath := filepath.Join(os.TempDir(), fmt.Sprintf("sesamefs_upload_%s_%s", uploadToken, fileName))
+
+	status, body := uploadChunkThroughLinkStatus(t, adminClient, uploadURL, fileName, "/", fileContent[:len(fileContent)/2], fmt.Sprintf("bytes %d-%d/%d", 0, len(fileContent)/2-1, len(fileContent)))
+	if status != http.StatusOK && status != http.StatusCreated {
+		t.Fatalf("first chunk status = %d, want 200/201; body=%s", status, body)
+	}
+
+	if err := setHeadCommit(currentHead); err != nil {
+		t.Fatalf("failed to restore canonical head to current head %s before churn: %v", currentHead, err)
+	}
+	stop := make(chan struct{})
+	errCh := make(chan error, 1)
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for _, head := range churnHeads {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			if err := setHeadCommit(head); err != nil {
+				select {
+				case errCh <- fmt.Errorf("advance head %s: %w", head, err):
+				default:
+				}
+				return
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	}()
+	if !pollUntil(t, 10*time.Second, 200*time.Millisecond, func() bool {
+		return readHeadCommit() == churnHeads[3]
+	}) {
+		close(stop)
+		wg.Wait()
+		t.Fatalf("head churn did not advance far enough before finalize; current head=%s target=%s", readHeadCommit(), churnHeads[3])
+	}
+
+	queuedAfter := time.Now().UTC().Add(-time.Second)
+	status, body = uploadChunkThroughLinkStatus(t, adminClient, uploadURL, fileName, "/", fileContent[len(fileContent)/2:], fmt.Sprintf("bytes %d-%d/%d", len(fileContent)/2, len(fileContent)-1, len(fileContent)))
+	close(stop)
+	wg.Wait()
+	if err := setHeadCommit(currentHead); err != nil {
+		t.Fatalf("failed to restore stable head %s after churn: %v", currentHead, err)
+	}
+	select {
+	case err := <-errCh:
+		t.Fatalf("head churn failed: %v", err)
+	default:
+	}
+
+	if status != http.StatusConflict {
+		t.Fatalf("final chunk status = %d, want %d; body=%s", status, http.StatusConflict, body)
+	}
+	if !strings.Contains(body, "retry the upload") {
+		t.Fatalf("final chunk body = %q, want retryable upload conflict", body)
+	}
+	if _, err := os.Stat(tempPath); !os.IsNotExist(err) {
+		t.Fatalf("expected old chunk temp file %s to be removed after conflict cleanup, stat err=%v", tempPath, err)
+	}
+
+	if !pollUntil(t, 10*time.Second, 200*time.Millisecond, func() bool {
+		return readBlockRefCount(t, orgID, blockID) <= 0 && gcQueueItemExistsSince(t, orgID, "block", blockID, queuedAfter)
+	}) {
+		t.Fatalf("rollback state not observed after conflict: ref_count=%d queue_present=%v", readBlockRefCount(t, orgID, blockID), gcQueueItemExistsSince(t, orgID, "block", blockID, queuedAfter))
+	}
+
+	freshUploadURL := getUploadLink(t, adminClient, repoID, "/")
+	if freshUploadURL == uploadURL {
+		t.Fatalf("expected a fresh upload link after conflict, got same URL %q", freshUploadURL)
+	}
+
+	status, body = uploadChunkThroughLinkStatus(t, adminClient, freshUploadURL, fileName, "/", fileContent[:len(fileContent)/2], fmt.Sprintf("bytes %d-%d/%d", 0, len(fileContent)/2-1, len(fileContent)))
+	if status != http.StatusOK && status != http.StatusCreated {
+		t.Fatalf("fresh first chunk status = %d, want 200/201; body=%s", status, body)
+	}
+	status, body = uploadChunkThroughLinkStatus(t, adminClient, freshUploadURL, fileName, "/", fileContent[len(fileContent)/2:], fmt.Sprintf("bytes %d-%d/%d", len(fileContent)/2, len(fileContent)-1, len(fileContent)))
+	if status != http.StatusOK && status != http.StatusCreated {
+		t.Fatalf("fresh final chunk status = %d, want 200/201; body=%s", status, body)
+	}
+
+	expectEntriesPresent(t, repoID, "/", []string{fileName})
+	if !pollUntil(t, 10*time.Second, 200*time.Millisecond, func() bool {
+		return readBlockRefCount(t, orgID, blockID) == 1
+	}) {
+		t.Fatalf("ref_count after fresh reupload = %d, want 1", readBlockRefCount(t, orgID, blockID))
 	}
 }
 

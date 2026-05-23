@@ -2834,6 +2834,7 @@ func (h *FileHandler) UploadFile(c *gin.Context) {
 
 	actualFilename, storageDeltaBytes, storageDeltaFiles, err := h.finalizeStoredUploadMetadata(orgID, userID, repoID, parentDir, filename, fileID, fileSize, replace)
 	if err != nil {
+		handleStoredUploadMetadataError(h.db, orgID, repoID, fileID, []string{sha256ID}, err)
 		writeUploadFileError(c, err)
 		return
 	}
