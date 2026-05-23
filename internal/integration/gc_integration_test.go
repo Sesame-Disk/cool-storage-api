@@ -366,6 +366,123 @@ func readGCOrgQueueStats(t *testing.T, orgID uuid.UUID) (int, int) {
 	return queueDepth, failedDepth
 }
 
+func deleteGCFailedItemsByIdentity(t *testing.T, orgID string, itemType string, itemID string) {
+	t.Helper()
+	session := shareProjectionDBForTest(t).Session()
+	iter := session.Query(`SELECT failed_at, item_type, item_id FROM gc_failed_items WHERE org_id = ?`, orgID).Iter()
+	var failedAt time.Time
+	var failedItemType string
+	var failedItemID string
+	for iter.Scan(&failedAt, &failedItemType, &failedItemID) {
+		if failedItemType != itemType || failedItemID != itemID {
+			continue
+		}
+		if err := session.Query(`DELETE FROM gc_failed_items WHERE org_id = ? AND failed_at = ? AND item_type = ? AND item_id = ?`, orgID, failedAt, failedItemType, failedItemID).Exec(); err != nil {
+			t.Fatalf("failed to delete gc_failed_items row for %s/%s: %v", orgID, itemID, err)
+		}
+	}
+	if err := iter.Close(); err != nil {
+		t.Fatalf("failed to scan gc_failed_items for %s/%s: %v", orgID, itemID, err)
+	}
+}
+
+func deleteGCPendingBlockItems(t *testing.T, orgID uuid.UUID, blockID string) {
+	t.Helper()
+	session := shareProjectionDBForTest(t).Session()
+	iter := session.Query(`
+		SELECT identity_at FROM gc_pending_items
+		WHERE org_id = ? AND item_type = ? AND library_id = ? AND item_id = ?
+	`, orgID.String(), "block", uuid.Nil.String(), blockID).Iter()
+	var identityAt time.Time
+	for iter.Scan(&identityAt) {
+		if err := session.Query(`
+			DELETE FROM gc_pending_items
+			WHERE org_id = ? AND item_type = ? AND library_id = ? AND item_id = ? AND identity_at = ?
+		`, orgID.String(), "block", uuid.Nil.String(), blockID, identityAt).Exec(); err != nil {
+			t.Fatalf("failed to delete gc_pending_items row for %s/%s: %v", orgID, blockID, err)
+		}
+	}
+	if err := iter.Close(); err != nil {
+		t.Fatalf("failed to scan gc_pending_items for %s/%s: %v", orgID, blockID, err)
+	}
+}
+
+func repairGCSnapshotsForTest(t *testing.T, orgID uuid.UUID) {
+	t.Helper()
+	database := shareProjectionDBForTest(t)
+	session := database.Session()
+	store := gcpkg.NewCassandraStore(database)
+
+	queueDepth, err := store.RecountOrgQueueDepth(orgID)
+	if err != nil {
+		t.Fatalf("failed to recount GC queue depth for %s: %v", orgID, err)
+	}
+	failedDepth, err := store.RecountOrgFailedDepth(orgID)
+	if err != nil {
+		t.Fatalf("failed to recount GC failed depth for %s: %v", orgID, err)
+	}
+
+	if queueDepth == 0 && failedDepth == 0 {
+		if err := session.Query(`DELETE FROM gc_org_stats WHERE org_id = ?`, orgID.String()).Exec(); err != nil {
+			t.Fatalf("failed to delete gc_org_stats for %s: %v", orgID, err)
+		}
+		if err := session.Query(`DELETE FROM gc_active_orgs WHERE bucket = ? AND org_id = ?`, gcOrgBucketForTest(orgID), orgID.String()).Exec(); err != nil {
+			t.Fatalf("failed to delete gc_active_orgs for %s: %v", orgID, err)
+		}
+		if err := session.Query(`DELETE FROM gc_dirty_orgs WHERE bucket = ? AND org_id = ?`, gcOrgBucketForTest(orgID), orgID.String()).Exec(); err != nil {
+			t.Fatalf("failed to delete gc_dirty_orgs for %s: %v", orgID, err)
+		}
+	} else {
+		oldestQueuedAt, err := store.GetOldestQueuedAt(orgID)
+		if err != nil {
+			t.Fatalf("failed to read oldest queued item for %s: %v", orgID, err)
+		}
+		if err := store.SaveOrgQueueStats(gcpkg.GCOrgStats{
+			OrgID:          orgID,
+			QueueDepth:     queueDepth,
+			FailedDepth:    failedDepth,
+			OldestQueuedAt: oldestQueuedAt,
+			UpdatedAt:      time.Now().UTC(),
+		}); err != nil {
+			t.Fatalf("failed to save gc_org_stats for %s: %v", orgID, err)
+		}
+	}
+
+	totalQueue, err := store.GetTotalQueueSize()
+	if err != nil {
+		t.Fatalf("failed to recount total GC queue size: %v", err)
+	}
+	totalFailed, err := store.GetTotalFailedItems()
+	if err != nil {
+		t.Fatalf("failed to recount total GC failed size: %v", err)
+	}
+	dirtyOrgs, err := store.ListDirtyOrgs(0)
+	if err != nil {
+		t.Fatalf("failed to list dirty GC orgs: %v", err)
+	}
+	if err := store.SaveGCStats("total_queue_depth", fmt.Sprintf("%d", totalQueue)); err != nil {
+		t.Fatalf("failed to persist total_queue_depth snapshot: %v", err)
+	}
+	if err := store.SaveGCStats("total_failed_items", fmt.Sprintf("%d", totalFailed)); err != nil {
+		t.Fatalf("failed to persist total_failed_items snapshot: %v", err)
+	}
+	if err := store.SaveGCStats("dirty_orgs_total", fmt.Sprintf("%d", len(dirtyOrgs))); err != nil {
+		t.Fatalf("failed to persist dirty_orgs_total snapshot: %v", err)
+	}
+}
+
+func cleanupGCBlockFixturesForTest(t *testing.T, orgID uuid.UUID, blockID string) {
+	t.Helper()
+	deleteGCQueueItemsByIdentity(t, orgID.String(), "block", blockID)
+	deleteGCFailedItemsByIdentity(t, orgID.String(), "block", blockID)
+	deleteGCPendingBlockItems(t, orgID, blockID)
+	store := gcpkg.NewCassandraStore(shareProjectionDBForTest(t))
+	if err := store.DeleteBlockGCCandidate(orgID, blockID); err != nil {
+		t.Fatalf("failed to delete gc_block_candidate for %s/%s: %v", orgID, blockID, err)
+	}
+	repairGCSnapshotsForTest(t, orgID)
+}
+
 func failedQueueItemExists(t *testing.T, orgID string, itemType string, itemID string) bool {
 	t.Helper()
 	session := shareProjectionDBForTest(t).Session()
@@ -775,7 +892,7 @@ func TestGC_StatusSnapshotReconcilesLiveQueueCount(t *testing.T) {
 	session := shareProjectionDBForTest(t).Session()
 	orgID := uuid.New()
 	bucket := gcOrgBucketForTest(orgID)
-	queuedAt := time.Now().Add(-time.Minute).UTC()
+	queuedAt := time.Now().UTC()
 	itemID := fmt.Sprintf("synthetic-drift-%d", time.Now().UnixNano())
 	queueBucket := gcQueueBucketForTest(orgID, "block", itemID)
 	libraryID := uuid.New()
@@ -804,6 +921,7 @@ func TestGC_StatusSnapshotReconcilesLiveQueueCount(t *testing.T) {
 		`, orgID.String(), queueBucket, queuedAt, "block", itemID).Exec()
 		_ = session.Query(`DELETE FROM gc_active_orgs WHERE bucket = ? AND org_id = ?`, bucket, orgID.String()).Exec()
 		_ = session.Query(`DELETE FROM gc_dirty_orgs WHERE bucket = ? AND org_id = ?`, bucket, orgID.String()).Exec()
+		repairGCSnapshotsForTest(t, orgID)
 	})
 	snapshotBefore := readGCQueueSnapshotTotal(t)
 	triggerGCScannerAndWait(t)

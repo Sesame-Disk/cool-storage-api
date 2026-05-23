@@ -22,6 +22,7 @@ import (
 	"github.com/Sesame-Disk/sesamefs/internal/crypto"
 	"github.com/Sesame-Disk/sesamefs/internal/db"
 	"github.com/Sesame-Disk/sesamefs/internal/httputil"
+	"github.com/Sesame-Disk/sesamefs/internal/metrics"
 	"github.com/Sesame-Disk/sesamefs/internal/middleware"
 	"github.com/Sesame-Disk/sesamefs/internal/storage"
 	"github.com/Sesame-Disk/sesamefs/internal/templates"
@@ -2833,13 +2834,8 @@ func (h *FileHandler) UploadFile(c *gin.Context) {
 
 	actualFilename, storageDeltaBytes, storageDeltaFiles, err := h.finalizeStoredUploadMetadata(orgID, userID, repoID, parentDir, filename, fileID, fileSize, replace)
 	if err != nil {
-		status := http.StatusInternalServerError
-		msg := "failed to update library"
-		if errors.Is(err, errUploadStorageQuotaExceeded) {
-			status = http.StatusForbidden
-			msg = "storage quota exceeded"
-		}
-		c.JSON(status, gin.H{"error": msg})
+		handleStoredUploadMetadataError(h.db, orgID, repoID, fileID, []string{sha256ID}, err)
+		writeUploadFileError(c, err)
 		return
 	}
 
@@ -2855,6 +2851,22 @@ func (h *FileHandler) UploadFile(c *gin.Context) {
 
 	// Return Seafile-compatible response
 	c.JSON(http.StatusOK, []gin.H{{"name": actualFilename, "id": fileID, "size": strconv.FormatInt(fileSize, 10)}})
+}
+
+func writeUploadFileError(c *gin.Context, err error) {
+	switch {
+	case errors.Is(err, ErrLibraryHeadConflict):
+		// CLIENT_CONTRACT: the 409 status is the authoritative signal, but
+		// frontend uploaders also match this exact string as a fallback when
+		// status code is not observable (see RETRYABLE_UPLOAD_CONFLICT_ERROR
+		// in frontend/src/utils/upload-finalization.js). Keep the wording in
+		// sync across both places.
+		c.JSON(http.StatusConflict, gin.H{"error": "library was modified concurrently; retry the upload"})
+	case errors.Is(err, errUploadStorageQuotaExceeded):
+		c.JSON(http.StatusForbidden, gin.H{"error": "storage quota exceeded"})
+	default:
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update library"})
+	}
 }
 
 func currentUploadStorageDelta(fsHelper *FSHelper, repoID, parentDir, filename string, fileSize int64, replace bool) (int64, int64, error) {
@@ -2892,17 +2904,31 @@ func currentUploadStorageDelta(fsHelper *FSHelper, repoID, parentDir, filename s
 
 func (h *FileHandler) finalizeStoredUploadMetadata(orgID, userID, repoID, parentDir, filename, fileID string, fileSize int64, replace bool) (string, int64, int64, error) {
 	fsHelper := NewFSHelper(h.db)
+	startedAt := time.Now()
+	attemptsUsed := 0
+	result := "error"
+	defer func() {
+		metrics.UploadFinalizeAttempts.WithLabelValues("v2_direct", result).Observe(float64(attemptsUsed))
+		metrics.UploadFinalizeDuration.WithLabelValues("v2_direct", result).Observe(time.Since(startedAt).Seconds())
+	}()
+
 	var lastConflict error
 
 	for attempt := 1; attempt <= uploadMetadataRetryAttempts; attempt++ {
+		attemptsUsed = attempt
 		actualFilename, storageDeltaBytes, storageDeltaFiles, err := h.finalizeStoredUploadMetadataOnce(fsHelper, orgID, userID, repoID, parentDir, filename, fileID, fileSize, replace)
 		if err == nil {
+			result = "success"
 			return actualFilename, storageDeltaBytes, storageDeltaFiles, nil
 		}
 		if !errors.Is(err, ErrLibraryHeadConflict) {
+			if errors.Is(err, errUploadStorageQuotaExceeded) {
+				result = "quota_exceeded"
+			}
 			return "", 0, 0, err
 		}
 		lastConflict = err
+		metrics.UploadFinalizeHeadConflictsTotal.WithLabelValues("v2_direct").Inc()
 		if attempt == uploadMetadataRetryAttempts {
 			break
 		}
@@ -2912,7 +2938,9 @@ func (h *FileHandler) finalizeStoredUploadMetadata(orgID, userID, repoID, parent
 	}
 
 	log.Printf("[UploadFile] Exhausted metadata retries for repo=%s: %v", repoID, lastConflict)
-	return "", 0, 0, fmt.Errorf("failed to finalize upload metadata after %d attempts", uploadMetadataRetryAttempts)
+	result = "retry_exhausted"
+	metrics.UploadFinalizeRetryExhaustedTotal.WithLabelValues("v2_direct").Inc()
+	return "", 0, 0, fmt.Errorf("%w: failed to finalize upload metadata after %d attempts", ErrLibraryHeadConflict, uploadMetadataRetryAttempts)
 }
 
 func (h *FileHandler) finalizeStoredUploadMetadataOnce(fsHelper *FSHelper, orgID, userID, repoID, parentDir, filename, fileID string, fileSize int64, replace bool) (string, int64, int64, error) {

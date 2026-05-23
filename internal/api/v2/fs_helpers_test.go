@@ -2,9 +2,12 @@ package v2
 
 import (
 	"errors"
+	"fmt"
 	"path"
 	"testing"
 	"time"
+
+	gocql "github.com/apache/cassandra-gocql-driver/v2"
 )
 
 func TestLibraryHeadSnapshotValidateExpectedHeadRejectsMismatch(t *testing.T) {
@@ -26,6 +29,72 @@ func TestUpdateLibraryHeadFromSnapshotRejectsMismatchedExpectedHead(t *testing.T
 	err := helper.UpdateLibraryHeadFromSnapshot(snapshot, "repo-a", "commit-a", "head-b")
 	if err == nil {
 		t.Fatal("UpdateLibraryHeadFromSnapshot(mismatch) error = nil, want mismatch error")
+	}
+}
+
+func TestIsAmbiguousLibraryHeadUpdateError(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "cas write unknown", err: gocql.RequestErrCASWriteUnknown{}, want: true},
+		{name: "wrapped cas write unknown", err: fmt.Errorf("wrapped: %w", gocql.RequestErrCASWriteUnknown{}), want: true},
+		{name: "no response timeout", err: gocql.ErrTimeoutNoResponse, want: true},
+		{name: "connection closed", err: gocql.ErrConnectionClosed, want: true},
+		{name: "generic", err: errors.New("boom"), want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isAmbiguousLibraryHeadUpdateError(tt.err); got != tt.want {
+				t.Fatalf("isAmbiguousLibraryHeadUpdateError(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestResolveLibraryHeadUpdateErrorTreatsConfirmedVisibleAmbiguousCASAsSuccess(t *testing.T) {
+	err := resolveLibraryHeadUpdateError("repo-1", "commit-1", gocql.RequestErrCASWriteUnknown{}, func() (string, bool, error) {
+		return "commit-1", true, nil
+	})
+	if err != nil {
+		t.Fatalf("resolveLibraryHeadUpdateError() error = %v, want nil", err)
+	}
+}
+
+func TestResolveLibraryHeadUpdateErrorReturnsFailureWhenConfirmedNotVisible(t *testing.T) {
+	err := resolveLibraryHeadUpdateError("repo-1", "commit-1", gocql.RequestErrCASWriteUnknown{}, func() (string, bool, error) {
+		return "head-old", false, nil
+	})
+	if err == nil {
+		t.Fatal("resolveLibraryHeadUpdateError() error = nil, want failure")
+	}
+	if errors.Is(err, ErrLibraryHeadPublicationUnknown) {
+		t.Fatalf("resolveLibraryHeadUpdateError() error = %v, did not want unknown-publication sentinel", err)
+	}
+	var casUnknown gocql.RequestErrCASWriteUnknown
+	if !errors.As(err, &casUnknown) {
+		t.Fatalf("resolveLibraryHeadUpdateError() error = %v, want wrapped CAS error", err)
+	}
+}
+
+func TestResolveLibraryHeadUpdateErrorReturnsUnknownWhenConfirmationFails(t *testing.T) {
+	confirmErr := errors.New("confirm boom")
+	err := resolveLibraryHeadUpdateError("repo-1", "commit-1", gocql.ErrTimeoutNoResponse, func() (string, bool, error) {
+		return "", false, confirmErr
+	})
+	if err == nil {
+		t.Fatal("resolveLibraryHeadUpdateError() error = nil, want unknown outcome error")
+	}
+	if !errors.Is(err, ErrLibraryHeadPublicationUnknown) {
+		t.Fatalf("resolveLibraryHeadUpdateError() error = %v, want ErrLibraryHeadPublicationUnknown", err)
+	}
+	if !errors.Is(err, gocql.ErrTimeoutNoResponse) {
+		t.Fatalf("resolveLibraryHeadUpdateError() error = %v, want wrapped timeout error", err)
+	}
+	if !errors.Is(err, confirmErr) {
+		t.Fatalf("resolveLibraryHeadUpdateError() error = %v, want wrapped confirmation error", err)
 	}
 }
 

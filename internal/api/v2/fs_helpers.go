@@ -27,6 +27,11 @@ type FSHelper struct {
 // caller's read and publish steps.
 var ErrLibraryHeadConflict = errors.New("library HEAD was modified concurrently")
 
+// ErrLibraryHeadPublicationUnknown indicates that a conditional HEAD publish may
+// already be visible, but we could not confirm the outcome after an ambiguous
+// CAS error. Callers must not roll back promoted blocks on this error.
+var ErrLibraryHeadPublicationUnknown = errors.New("library HEAD publication outcome is unknown")
+
 // ErrStorageQuotaExceeded indicates the caller's storage quota would be exceeded.
 var ErrStorageQuotaExceeded = errors.New("storage quota exceeded")
 
@@ -501,6 +506,46 @@ func (h *FSHelper) calculateDirStats(repoID, dirFSID string) (totalSize int64, f
 // commit that the caller used to build the new tree and commit parent; reading
 // a fresher HEAD immediately before publish is invalid because it can let a tree
 // built from an older snapshot overwrite newer metadata.
+func isAmbiguousLibraryHeadUpdateError(err error) bool {
+	var casUnknown gocql.RequestErrCASWriteUnknown
+	return errors.As(err, &casUnknown) || errors.Is(err, gocql.ErrTimeoutNoResponse) || errors.Is(err, gocql.ErrConnectionClosed)
+}
+
+func (h *FSHelper) confirmLibraryHeadCommitVisible(orgID, repoID, commitID string) (string, bool, error) {
+	var currentHead string
+	err := h.db.Session().Query(`
+		SELECT head_commit_id FROM libraries WHERE org_id = ? AND library_id = ?
+	`, orgID, repoID).Consistency(gocql.Serial).Scan(&currentHead)
+	if err != nil {
+		return "", false, err
+	}
+	return currentHead, currentHead == commitID, nil
+}
+
+func resolveLibraryHeadUpdateError(repoID, commitID string, updateErr error, confirmVisible func() (string, bool, error)) error {
+	wrapped := fmt.Errorf("conditional library head update failed: %w", updateErr)
+	if !isAmbiguousLibraryHeadUpdateError(updateErr) {
+		return wrapped
+	}
+
+	currentHead, visible, confirmErr := confirmVisible()
+	if confirmErr == nil {
+		if visible {
+			log.Printf("[UpdateLibraryHead] WARNING: ambiguous CAS error for library %s commit %s but confirmation read shows the canonical head is already published", repoID, commitID)
+			return nil
+		}
+		log.Printf("[UpdateLibraryHead] INFO: ambiguous CAS error for library %s commit %s confirmed canonical head remains at %s", repoID, commitID, currentHead)
+		return wrapped
+	}
+
+	log.Printf("[UpdateLibraryHead] WARNING: ambiguous CAS error for library %s commit %s could not be confirmed: %v", repoID, commitID, confirmErr)
+	return errors.Join(
+		ErrLibraryHeadPublicationUnknown,
+		wrapped,
+		fmt.Errorf("confirmation read failed: %w", confirmErr),
+	)
+}
+
 func (h *FSHelper) UpdateLibraryHead(orgID, repoID, commitID, expectedHead string) error {
 	// Get root_fs_id from the new commit to recalculate stats
 	var rootFSID string
@@ -526,7 +571,9 @@ func (h *FSHelper) UpdateLibraryHead(orgID, repoID, commitID, expectedHead strin
 		IF head_commit_id = ?
 	`, commitID, totalSize, fileCount, now, orgID, repoID, expectedHead).MapScanCAS(casState)
 	if err != nil {
-		return fmt.Errorf("conditional library head update failed: %w", err)
+		return resolveLibraryHeadUpdateError(repoID, commitID, err, func() (string, bool, error) {
+			return h.confirmLibraryHeadCommitVisible(orgID, repoID, commitID)
+		})
 	}
 	if !applied {
 		currentHead, _ := casState["head_commit_id"].(string)

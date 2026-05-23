@@ -62,6 +62,7 @@ docker network inspect sfs-net >/dev/null 2>&1 || docker network create sfs-net
 
 - Public health checks for operators and load balancers are `GET /ping` and the compatibility endpoint `GET /api2/ping`.
 - `GET /ready` and metrics are intentionally internal-only. Run them from the node itself, from a private network, or with `docker compose exec sesamefs ...`.
+- For upload finalize monitoring, alerting, and dashboard queries, see [Upload Concurrency Observability](./UPLOAD-CONCURRENCY-OBSERVABILITY.md).
 - Published images are the deployment artifact. Production rollouts should update `SESAMEFS_IMAGE` and `FRONTEND_IMAGE` with full image references, pull the new images, and restart the services. `--build` is not part of the normal prod path.
 
 ---

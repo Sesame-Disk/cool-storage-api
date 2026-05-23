@@ -239,6 +239,61 @@ var (
 		},
 		[]string{"source"}, // "tracker" (in-memory map) or "disk" (tempDir sweep)
 	)
+
+	// ChunkUploadFinalizationAttemptsTotal counts how often a chunked upload
+	// tracker reaches the finalization gate, is still incomplete, or finds
+	// another goroutine already finalizing it.
+	ChunkUploadFinalizationAttemptsTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "chunk_upload_finalization_attempts_total",
+			Help: "Total number of chunked upload finalization gate outcomes, split by started, not_complete, and already_finalizing.",
+		},
+		[]string{"result"}, // "started", "not_complete", or "already_finalizing"
+	)
+
+	// UploadFinalizeHeadConflictsTotal counts metadata publish conflicts that
+	// force an upload finalize retry.
+	UploadFinalizeHeadConflictsTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "upload_finalize_head_conflicts_total",
+			Help: "Total number of upload finalize head conflicts by surface.",
+		},
+		[]string{"surface"},
+	)
+
+	// UploadFinalizeRetryExhaustedTotal counts finalize operations that hit the
+	// retry budget before publishing metadata.
+	UploadFinalizeRetryExhaustedTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "upload_finalize_retry_exhausted_total",
+			Help: "Total number of upload finalize operations that exhausted the retry budget.",
+		},
+		[]string{"surface"},
+	)
+
+	// UploadFinalizeAttempts observes how many publish attempts were needed for
+	// each upload finalize call.
+	UploadFinalizeAttempts = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "upload_finalize_attempts",
+			Help:    "Number of publish attempts required by each upload finalize call.",
+			Buckets: []float64{1, 2, 3, 5, 8, 13, 21},
+		},
+		[]string{"surface", "result"},
+	)
+
+	// UploadFinalizeDuration observes metadata finalize latency, including any
+	// retries and backoff. Buckets extend past prometheus.DefBuckets so that
+	// retry_exhausted finalize calls (up to 20 attempts with exponential
+	// backoff and jitter) still fall into bounded buckets instead of +Inf.
+	UploadFinalizeDuration = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "upload_finalize_duration_seconds",
+			Help:    "Duration of upload metadata finalize calls, including retries.",
+			Buckets: []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 15, 30, 60},
+		},
+		[]string{"surface", "result"},
+	)
 )
 
 // Register registers all custom metrics with the default Prometheus registry.
@@ -271,5 +326,10 @@ func Register() {
 		GCWorkerLastSuccessTimestamp,
 		GCAuditEventsTotal,
 		ChunkUploadTempOrphansCleaned,
+		ChunkUploadFinalizationAttemptsTotal,
+		UploadFinalizeHeadConflictsTotal,
+		UploadFinalizeRetryExhaustedTotal,
+		UploadFinalizeAttempts,
+		UploadFinalizeDuration,
 	)
 }
