@@ -1370,14 +1370,28 @@ func uploadRollbackOperationKey(scope, repoID, identifier string) string {
 }
 
 func (h *SeafHTTPHandler) handleChunkedFinalizeError(token *AccessToken, tokenStr, filename string, upload *ChunkUpload, err error) {
-	if errors.Is(err, v2.ErrLibraryHeadConflict) {
+	// HeadConflict and quota_exceeded are both unrecoverable on the same
+	// tracker: the client cannot finalize this session again (head moved past
+	// the retry budget, or quota check will keep rejecting). Drop the tracker
+	// and roll back the block refs we promoted. Other errors (transient DB /
+	// block-store failures) leave the tracker alive so a retried finalize on
+	// the same temp file can reuse the per-tracker accounting and avoid a
+	// double increment.
+	scope := ""
+	switch {
+	case errors.Is(err, v2.ErrLibraryHeadConflict):
+		scope = "seafhttp_chunk_conflict"
+	case errors.Is(err, errStorageQuotaExceeded):
+		scope = "seafhttp_chunk_quota"
+	}
+	if scope != "" {
 		accountedBlockIDs := upload.AccountedBlockIDs()
 		if len(accountedBlockIDs) > 0 {
 			rollbackUploadedBlockRefsFn(
 				h.db,
 				token.OrgID,
 				token.RepoID,
-				uploadRollbackOperationKey("seafhttp_chunk_conflict", token.RepoID, tokenStr+":"+filename),
+				uploadRollbackOperationKey(scope, token.RepoID, tokenStr+":"+filename),
 				accountedBlockIDs,
 			)
 		}

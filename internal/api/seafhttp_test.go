@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -273,6 +274,58 @@ func TestHandleChunkedFinalizeError_RollsBackConflictAndCleansUp(t *testing.T) {
 	}
 }
 
+func TestHandleChunkedFinalizeError_RollsBackQuotaExceededAndCleansUp(t *testing.T) {
+	oldRollback := rollbackUploadedBlockRefsFn
+	oldCleanup := cleanupChunkUploadFn
+	defer func() {
+		rollbackUploadedBlockRefsFn = oldRollback
+		cleanupChunkUploadFn = oldCleanup
+	}()
+
+	var rollbackCalled bool
+	var gotOrgID, gotRepoID, gotOperationKey string
+	var gotBlockIDs []string
+	var cleanupCalled bool
+	rollbackUploadedBlockRefsFn = func(database *db.DB, orgID, repoID, operationKey string, blockIDs []string) {
+		rollbackCalled = true
+		gotOrgID = orgID
+		gotRepoID = repoID
+		gotOperationKey = operationKey
+		gotBlockIDs = append([]string(nil), blockIDs...)
+	}
+	cleanupChunkUploadFn = func(token, filename string) {
+		cleanupCalled = true
+	}
+
+	h := &SeafHTTPHandler{}
+	token := &AccessToken{OrgID: "org-2", RepoID: "repo-2"}
+	upload := &ChunkUpload{
+		Finalizing: true,
+		accountedBlockPosition: map[int]string{
+			0: "block-x",
+			1: "block-y",
+		},
+	}
+
+	h.handleChunkedFinalizeError(token, "upload-token", "file.bin", upload, fmt.Errorf("inner finalize failure: %w", errStorageQuotaExceeded))
+
+	if !rollbackCalled {
+		t.Fatal("expected quota_exceeded finalize error to roll back accounted blocks")
+	}
+	if !cleanupCalled {
+		t.Fatal("expected quota_exceeded finalize error to clean up the tracker")
+	}
+	if gotOrgID != "org-2" || gotRepoID != "repo-2" {
+		t.Fatalf("rollback org/repo = %s/%s, want org-2/repo-2", gotOrgID, gotRepoID)
+	}
+	if !strings.HasPrefix(gotOperationKey, "seafhttp_chunk_quota:") {
+		t.Fatalf("operation key = %q, want seafhttp_chunk_quota:* scope", gotOperationKey)
+	}
+	if !reflect.DeepEqual(gotBlockIDs, []string{"block-x", "block-y"}) {
+		t.Fatalf("rollback block IDs = %#v, want %#v", gotBlockIDs, []string{"block-x", "block-y"})
+	}
+}
+
 func TestHandleChunkedFinalizeError_ResetsNonConflictState(t *testing.T) {
 	oldRollback := rollbackUploadedBlockRefsFn
 	oldCleanup := cleanupChunkUploadFn
@@ -304,6 +357,67 @@ func TestHandleChunkedFinalizeError_ResetsNonConflictState(t *testing.T) {
 	}
 	if upload.Finalizing {
 		t.Fatal("non-conflict finalize error should reset finalization state")
+	}
+}
+
+func TestHandleSingleShotMetadataError_RollsBackOnError(t *testing.T) {
+	oldRollback := rollbackUploadedBlockRefsFn
+	defer func() {
+		rollbackUploadedBlockRefsFn = oldRollback
+	}()
+
+	var rollbackCalled bool
+	var gotOrgID, gotRepoID, gotOperationKey string
+	var gotBlockIDs []string
+	rollbackUploadedBlockRefsFn = func(database *db.DB, orgID, repoID, operationKey string, blockIDs []string) {
+		rollbackCalled = true
+		gotOrgID = orgID
+		gotRepoID = repoID
+		gotOperationKey = operationKey
+		gotBlockIDs = append([]string(nil), blockIDs...)
+	}
+
+	h := &SeafHTTPHandler{}
+	token := &AccessToken{OrgID: "org-1", RepoID: "repo-1"}
+
+	h.handleSingleShotMetadataError(token, "file-1", "block-internal", errors.New("boom"))
+
+	if !rollbackCalled {
+		t.Fatal("expected single-shot metadata error to roll back the promoted block")
+	}
+	if gotOrgID != "org-1" || gotRepoID != "repo-1" {
+		t.Fatalf("rollback org/repo = %s/%s, want org-1/repo-1", gotOrgID, gotRepoID)
+	}
+	if !strings.HasPrefix(gotOperationKey, "seafhttp_single_metadata:") {
+		t.Fatalf("operation key = %q, want seafhttp_single_metadata:* scope", gotOperationKey)
+	}
+	if !reflect.DeepEqual(gotBlockIDs, []string{"block-internal"}) {
+		t.Fatalf("rollback block IDs = %#v, want %#v", gotBlockIDs, []string{"block-internal"})
+	}
+}
+
+func TestHandleSingleShotMetadataError_SkipsSuccessAndEmptyBlockID(t *testing.T) {
+	oldRollback := rollbackUploadedBlockRefsFn
+	defer func() {
+		rollbackUploadedBlockRefsFn = oldRollback
+	}()
+
+	rollbackCalled := false
+	rollbackUploadedBlockRefsFn = func(database *db.DB, orgID, repoID, operationKey string, blockIDs []string) {
+		rollbackCalled = true
+	}
+
+	h := &SeafHTTPHandler{}
+	token := &AccessToken{OrgID: "org-1", RepoID: "repo-1"}
+
+	h.handleSingleShotMetadataError(token, "file-1", "block-internal", nil)
+	if rollbackCalled {
+		t.Fatal("successful finalize should not roll back the promoted block")
+	}
+
+	h.handleSingleShotMetadataError(token, "file-1", "   ", errors.New("boom"))
+	if rollbackCalled {
+		t.Fatal("missing internal block ID should not roll back anything")
 	}
 }
 
