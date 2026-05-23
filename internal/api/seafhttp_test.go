@@ -421,6 +421,26 @@ func TestHandleSingleShotMetadataError_SkipsSuccessAndEmptyBlockID(t *testing.T)
 	}
 }
 
+func TestHandleSingleShotMetadataError_SkipsUnknownPublicationOutcome(t *testing.T) {
+	oldRollback := rollbackUploadedBlockRefsFn
+	defer func() {
+		rollbackUploadedBlockRefsFn = oldRollback
+	}()
+
+	rollbackCalled := false
+	rollbackUploadedBlockRefsFn = func(database *db.DB, orgID, repoID, operationKey string, blockIDs []string) {
+		rollbackCalled = true
+	}
+
+	h := &SeafHTTPHandler{}
+	token := &AccessToken{OrgID: "org-1", RepoID: "repo-1"}
+
+	h.handleSingleShotMetadataError(token, "file-1", "block-internal", v2.ErrLibraryHeadPublicationUnknown)
+	if rollbackCalled {
+		t.Fatal("unknown publication outcome should not roll back the promoted block")
+	}
+}
+
 // TestChunkJanitor_DiskFileNotYetStale verifies that a newer orphan file is
 // left alone (still within diskTTL).
 func TestChunkJanitor_DiskFileNotYetStale(t *testing.T) {

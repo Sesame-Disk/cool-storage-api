@@ -1405,6 +1405,9 @@ func (h *SeafHTTPHandler) handleSingleShotMetadataError(token *AccessToken, file
 	if err == nil || strings.TrimSpace(internalBlockID) == "" {
 		return
 	}
+	if errors.Is(err, v2.ErrLibraryHeadPublicationUnknown) {
+		return
+	}
 	rollbackUploadedBlockRefsFn(
 		h.db,
 		token.OrgID,

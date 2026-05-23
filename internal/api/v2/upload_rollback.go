@@ -1,6 +1,7 @@
 package v2
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"strings"
@@ -29,6 +30,9 @@ func RollbackUploadedBlockRefs(database *db.DB, orgID, repoID, operationKey stri
 
 func handleStoredUploadMetadataError(database *db.DB, orgID, repoID, fileID string, internalBlockIDs []string, err error) {
 	if err == nil || len(internalBlockIDs) == 0 {
+		return
+	}
+	if errors.Is(err, ErrLibraryHeadPublicationUnknown) {
 		return
 	}
 	rollbackUploadedBlockRefsFn(

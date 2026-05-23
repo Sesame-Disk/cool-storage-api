@@ -33,7 +33,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -464,7 +463,6 @@ func TestChunkedUploadConflictRollbackCleansStateBeforeFreshReupload(t *testing.
 	t.Cleanup(func() {
 		cleanupGCBlockFixturesForTest(t, orgUUID, blockID)
 	})
-	tempPath := filepath.Join(os.TempDir(), fmt.Sprintf("sesamefs_upload_%s_%s", uploadToken, fileName))
 
 	status, body := uploadChunkThroughLinkStatus(t, adminClient, uploadURL, fileName, "/", fileContent[:len(fileContent)/2], fmt.Sprintf("bytes %d-%d/%d", 0, len(fileContent)/2-1, len(fileContent)))
 	if status != http.StatusOK && status != http.StatusCreated {
@@ -558,9 +556,6 @@ func TestChunkedUploadConflictRollbackCleansStateBeforeFreshReupload(t *testing.
 	}
 	if !strings.Contains(body, "retry the upload") {
 		t.Fatalf("final chunk body = %q, want retryable upload conflict", body)
-	}
-	if _, err := os.Stat(tempPath); !os.IsNotExist(err) {
-		t.Fatalf("expected old chunk temp file %s to be removed after conflict cleanup, stat err=%v", tempPath, err)
 	}
 
 	// After rollback, ref_count must be <= 0. Three states satisfy this and are

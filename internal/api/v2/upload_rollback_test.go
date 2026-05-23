@@ -57,3 +57,21 @@ func TestHandleStoredUploadMetadataError_SkipsSuccessfulFinalize(t *testing.T) {
 		t.Fatal("successful metadata finalize should not roll back promoted blocks")
 	}
 }
+
+func TestHandleStoredUploadMetadataError_SkipsUnknownPublicationOutcome(t *testing.T) {
+	oldRollback := rollbackUploadedBlockRefsFn
+	defer func() {
+		rollbackUploadedBlockRefsFn = oldRollback
+	}()
+
+	rollbackCalled := false
+	rollbackUploadedBlockRefsFn = func(database *db.DB, orgID, repoID, operationKey string, blockIDs []string) {
+		rollbackCalled = true
+	}
+
+	handleStoredUploadMetadataError(nil, "org-1", "repo-1", "file-1", []string{"block-1"}, ErrLibraryHeadPublicationUnknown)
+
+	if rollbackCalled {
+		t.Fatal("unknown publication outcome should not roll back promoted blocks")
+	}
+}
