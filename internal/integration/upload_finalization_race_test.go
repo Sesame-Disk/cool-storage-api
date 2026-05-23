@@ -563,10 +563,19 @@ func TestChunkedUploadConflictRollbackCleansStateBeforeFreshReupload(t *testing.
 		t.Fatalf("expected old chunk temp file %s to be removed after conflict cleanup, stat err=%v", tempPath, err)
 	}
 
+	// After rollback, ref_count must be <= 0. Three states satisfy this and are
+	// all valid depending on GC scanner timing:
+	//   - 0:    rollback decremented; GC has not yet touched the row.
+	//   - -999: GC's ClaimBlockDelete won the LWT and stamped the sentinel, or
+	//           the row has already been physically deleted (readBlockRefCount
+	//           returns -999 in both cases).
+	// A ref_count == 1 here is the bug this test exists to catch (rollback
+	// failed to decrement). Checking gc_queue presence would race against the
+	// scanner consuming the entry, so we rely solely on ref_count.
 	if !pollUntil(t, 10*time.Second, 200*time.Millisecond, func() bool {
-		return readBlockRefCount(t, orgID, blockID) <= 1
+		return readBlockRefCount(t, orgID, blockID) <= 0
 	}) {
-		t.Fatalf("rollback left leaked block refs after conflict: ref_count=%d", readBlockRefCount(t, orgID, blockID))
+		t.Fatalf("rollback did not decrement block refs after conflict: ref_count=%d", readBlockRefCount(t, orgID, blockID))
 	}
 
 	freshUploadURL := getUploadLink(t, adminClient, repoID, "/")
