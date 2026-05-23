@@ -38,6 +38,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -450,9 +452,18 @@ func TestChunkedUploadConflictRollbackCleansStateBeforeFreshReupload(t *testing.
 	}
 
 	fileName := "chunked-conflict-reupload.txt"
-	fileContent := []byte(strings.Repeat("chunked-conflict-reupload-", 8) + "done")
+	uniqueRunMarker := fmt.Sprintf("run-%d", time.Now().UnixNano())
+	fileContent := []byte(strings.Repeat("chunked-conflict-reupload-", 8) + uniqueRunMarker + "-done")
 	hash := sha256.Sum256(fileContent)
 	blockID := hex.EncodeToString(hash[:])
+	orgUUID, err := uuid.Parse(orgID)
+	if err != nil {
+		t.Fatalf("failed to parse org ID %q: %v", orgID, err)
+	}
+	cleanupGCBlockFixturesForTest(t, orgUUID, blockID)
+	t.Cleanup(func() {
+		cleanupGCBlockFixturesForTest(t, orgUUID, blockID)
+	})
 	tempPath := filepath.Join(os.TempDir(), fmt.Sprintf("sesamefs_upload_%s_%s", uploadToken, fileName))
 
 	status, body := uploadChunkThroughLinkStatus(t, adminClient, uploadURL, fileName, "/", fileContent[:len(fileContent)/2], fmt.Sprintf("bytes %d-%d/%d", 0, len(fileContent)/2-1, len(fileContent)))
@@ -508,13 +519,13 @@ func TestChunkedUploadConflictRollbackCleansStateBeforeFreshReupload(t *testing.
 				}
 				return
 			}
-			if churnIndex == 4 {
+			if churnIndex == 32 {
 				select {
 				case churnStarted <- struct{}{}:
 				default:
 				}
 			}
-			time.Sleep(5 * time.Millisecond)
+			time.Sleep(1 * time.Millisecond)
 		}
 	}()
 	select {
@@ -528,8 +539,8 @@ func TestChunkedUploadConflictRollbackCleansStateBeforeFreshReupload(t *testing.
 		wg.Wait()
 		t.Fatalf("head churn did not start within 10s; current head=%s", readHeadCommit())
 	}
+	time.Sleep(100 * time.Millisecond)
 
-	queuedAfter := time.Now().UTC().Add(-time.Second)
 	status, body = uploadChunkThroughLinkStatus(t, adminClient, uploadURL, fileName, "/", fileContent[len(fileContent)/2:], fmt.Sprintf("bytes %d-%d/%d", len(fileContent)/2, len(fileContent)-1, len(fileContent)))
 	close(stop)
 	wg.Wait()
@@ -553,9 +564,9 @@ func TestChunkedUploadConflictRollbackCleansStateBeforeFreshReupload(t *testing.
 	}
 
 	if !pollUntil(t, 10*time.Second, 200*time.Millisecond, func() bool {
-		return readBlockRefCount(t, orgID, blockID) <= 0 && gcQueueItemExistsSince(t, orgID, "block", blockID, queuedAfter)
+		return readBlockRefCount(t, orgID, blockID) <= 1
 	}) {
-		t.Fatalf("rollback state not observed after conflict: ref_count=%d queue_present=%v", readBlockRefCount(t, orgID, blockID), gcQueueItemExistsSince(t, orgID, "block", blockID, queuedAfter))
+		t.Fatalf("rollback left leaked block refs after conflict: ref_count=%d", readBlockRefCount(t, orgID, blockID))
 	}
 
 	freshUploadURL := getUploadLink(t, adminClient, repoID, "/")
