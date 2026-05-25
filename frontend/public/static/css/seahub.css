@@ -861,6 +861,19 @@ textarea:-moz-placeholder {/* for FF */
     font-size:1.5rem;
     color:#999;
     margin-right:15px;
+    cursor:pointer;
+}
+@media (max-width: 767px) {
+    .side-nav-toggle {
+        display:inline-flex;
+        align-items:center;
+        justify-content:center;
+        min-width:44px;
+        min-height:44px;
+        font-size:1.75rem;
+        margin-right:8px;
+        padding:0 4px;
+    }
 }
 #group-nav .sharp,
 #share-admin-nav .sharp {

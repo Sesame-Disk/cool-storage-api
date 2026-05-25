@@ -26,7 +26,20 @@
   cursor: default;
   overflow: hidden;
   width: 600px;
+  max-width: calc(100vw - 24px);
   padding: 1rem 0rem 0rem 1rem;
+}
+
+@media (max-width: 767px) {
+  .search-container.show {
+    position: fixed;
+    top: 8px;
+    left: 8px;
+    right: 8px;
+    width: auto;
+    max-width: none;
+    padding: 0.75rem 0.5rem 0;
+  }
 }
 
 .search-container .input-icon svg.input-icon-addon {

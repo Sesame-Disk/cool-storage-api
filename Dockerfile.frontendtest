@@ -8,4 +8,4 @@ RUN npm ci --legacy-peer-deps
 
 COPY frontend/ ./
 
-CMD ["bash", "-lc", "npm run lint && npm test -- --watchAll=false"]
+CMD ["bash", "-lc", "npm run lint && npm test -- --watchAll=false && npm run test:vitest"]

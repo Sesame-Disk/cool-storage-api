@@ -15,12 +15,33 @@
   right: 1px;
   bottom: 1px;
   width: 35rem;
+  max-width: 100%;
   height: 20rem;
+  max-height: 80vh;
+  min-width: 0;
   border: 1px solid #ddd;
   border-radius: 3px;
   box-shadow: 0 0 6px #ddd;
   background-color: #fff;
   z-index: 1050;
+}
+
+@media (max-width: 767px) {
+  .uploader-list-view {
+    right: 8px;
+    left: 8px;
+    bottom: 8px;
+    width: auto;
+    max-width: none;
+    height: auto;
+    max-height: 60vh;
+  }
+
+  .uploader-list-header .progress {
+    width: auto;
+    flex: 1;
+    margin: 8px 12px 0;
+  }
 }
 
 .uploader-list-header {

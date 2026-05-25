@@ -125,4 +125,34 @@
   .border-left-show:before {
     width: 0;
   }
+
+  /* Boost interactive controls to ≥44x44 touch target. */
+  .cur-view-toolbar {
+    height: auto;
+    flex-wrap: wrap;
+    gap: 4px;
+  }
+
+  .operation-item,
+  .group-operations .group-op-item,
+  .detail-btn button,
+  .sf-view-mode-btn {
+    min-height: 44px;
+    min-width: 44px;
+    line-height: 1.2;
+    padding: 0 0.75rem;
+  }
+
+  .common-toolbar .logout-icon {
+    width: 44px;
+    height: 44px;
+  }
+
+  .path-toolbar .toolbar-item a {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 44px;
+    min-height: 44px;
+  }
 }

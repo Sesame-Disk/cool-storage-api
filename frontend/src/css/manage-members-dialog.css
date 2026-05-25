@@ -22,6 +22,18 @@
 
 .add-members .add-members-select {
   width: 385px;
+  max-width: 100%;
+}
+
+@media (max-width: 767px) {
+  .add-members {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 8px;
+  }
+  .add-members .add-members-select {
+    width: 100%;
+  }
 }
 
 .add-members .btn {

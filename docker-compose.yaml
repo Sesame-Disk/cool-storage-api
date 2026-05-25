@@ -531,6 +531,19 @@ services:
     profiles:
       - test
 
+  # Desktop frontend Playwright e2e (mobile + tablet + desktop viewports)
+  frontend-e2e:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.playwright
+    environment:
+      - DESKTOP_BASE_URL=http://frontend
+      - CI=true
+    depends_on:
+      - frontend
+    profiles:
+      - test
+
   # Desktop Frontend (React SPA — nginx:alpine)
   # Access at http://localhost:3000
   frontend:

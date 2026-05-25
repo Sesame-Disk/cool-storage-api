@@ -1,0 +1,17 @@
+FROM mcr.microsoft.com/playwright:v1.49.0-noble
+
+WORKDIR /app
+ENV CI=true
+
+COPY package*.json ./
+RUN npm ci --legacy-peer-deps
+
+COPY . .
+
+# Wait for the frontend nginx, then run the suite. Pulls baseURL from env.
+CMD ["bash", "-lc", "url=\"${DESKTOP_BASE_URL:-http://frontend}\"; \
+for i in $(seq 1 60); do \
+  if curl -fsS -o /dev/null --max-time 2 \"$url/\"; then echo \"frontend ready\"; break; fi; \
+  echo \"waiting for $url ($i/60)\"; sleep 1; \
+done; \
+npx playwright test"]

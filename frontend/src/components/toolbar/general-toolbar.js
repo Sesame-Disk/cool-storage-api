@@ -19,6 +19,9 @@ class GeneralToolbar extends React.Component {
           <span
             className="sf2-icon-menu side-nav-toggle hidden-md-up d-md-none"
             title="Side Nav Menu"
+            aria-label="Open menu"
+            role="button"
+            tabIndex={0}
             onClick={onShowSidePanel}>
           </span>
         </div>

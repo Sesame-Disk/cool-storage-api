@@ -113,7 +113,15 @@
   
   .subscription-container {
     width: 480px;
+    max-width: 100%;
     margin: 0.5rem auto;
+  }
+
+  @media (max-width: 767px) {
+    .subscription-container {
+      width: auto;
+      margin: 0.5rem 8px;
+    }
   }
   
   .price-version-container-header .user-quota-plan-name {

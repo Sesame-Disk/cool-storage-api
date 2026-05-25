@@ -30,6 +30,21 @@
   color: #888;
 }
 
+@media (max-width: 767px) {
+  /* Inflate close + control icons so they meet the 44px touch target. */
+  .detail-header {
+    height: 48px;
+  }
+  .detail-header .detail-control {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 44px;
+    min-height: 44px;
+    font-size: 20px;
+  }
+}
+
 .detail-header .detail-title {
   margin-left: 0.25rem;
   display: flex;

@@ -178,13 +178,26 @@
   margin-right: .2rem;
 }
 
-.accounts-manage .accounts-list-body tr:hover .account-operation-btn {
+.accounts-manage .accounts-list-body tr:hover .account-operation-btn,
+.accounts-manage .accounts-list-body tr:focus-within .account-operation-btn {
   display: inline-flex;
   width: 24px;
   height: 24px;
   align-items: center;
   justify-content: center;
   cursor: pointer;
+}
+
+/* Touch devices can't hover — always show row action buttons. */
+@media (hover: none) {
+  .accounts-manage .accounts-list-body .account-operation-btn {
+    display: inline-flex;
+    width: 44px;
+    height: 44px;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+  }
 }
 
 .accounts-manage .account-operation-btn .dtable-font {

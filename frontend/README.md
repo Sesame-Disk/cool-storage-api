@@ -106,8 +106,56 @@ The frontend expects these SesameFS API endpoints:
 
 ## Responsiveness
 
-The current UI has limited mobile responsiveness (inherited from Seahub).
-Mobile support uses `react-responsive` MediaQuery for different layouts.
+Currently being modernized — see `src/css/MOBILE-FIXES.md` for the active
+audit. The app is being made fully responsive in place; the experimental
+`mobile-frontend/` Astro project is being retired.
+
+Breakpoints in use:
+
+| Breakpoint | Width   | Used for |
+|-----------:|--------:|----------|
+| sm         | 640px   | (Tailwind, future) |
+| md         | 768px   | desktop ↔ mobile cutover for sidebar, dialogs, tables |
+| lg         | 1024px  | side-by-side layouts |
+| xl         | 1280px  | (Tailwind, future) |
+
+## Testing
+
+| Suite | Runner | What it covers |
+|-------|--------|----------------|
+| `npm test` | Jest 27 | legacy unit tests under `src/**/*.test.{js,jsx}` |
+| `npm run test:vitest` | Vitest 2 | new tests under `src/**/*.vitest.{js,jsx,ts,tsx}` |
+| `npm run test:e2e` | Playwright | full e2e at mobile + tablet + desktop viewports |
+| `npm run test:all` | all of the above | the CI gate |
+
+### Test policy
+
+- **New tests** go under Vitest (use `.vitest.js` extension). Vitest is a
+  drop-in for Jest's API (`describe/it/expect`) but is faster and aligns
+  with the future Vite build.
+- **Existing Jest tests** stay where they are until the file they cover
+  is touched for another reason — then convert them.
+- **Every CSS/component change** that affects layout adds at least one
+  Playwright assertion (typically: no horizontal scroll at iPhone 13).
+
+### Running e2e tests
+
+```bash
+# Local: requires Playwright browsers installed
+npx playwright install --with-deps chromium
+docker compose up -d sesamefs frontend
+npm run test:e2e
+
+# Via docker compose (matches CI):
+./scripts/ci-frontend.sh e2e
+
+# Full gate (unit + e2e):
+./scripts/ci-frontend.sh
+```
+
+Auth-required specs use the `loggedInPage` fixture in
+`e2e/auth.fixture.ts`. They **skip** rather than fail if the backend
+isn't reachable — so the suite stays green on UI-only environments.
 
 ## Documentation
 

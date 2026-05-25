@@ -14,18 +14,31 @@ const propTypes = {
 class SidePanel extends React.Component {
 
   render() {
+    const isOpen = !this.props.isSidePanelClosed;
     return (
-      <div className={`side-panel ${this.props.isSidePanelClosed ? '' : 'left-zero'}`}>
-        <div className="side-panel-north">
-          <Logo onCloseSidePanel={this.props.onCloseSidePanel}/>
+      <React.Fragment>
+        <div
+          className={`side-panel-backdrop ${isOpen ? 'show' : ''}`}
+          onClick={this.props.onCloseSidePanel}
+          aria-hidden="true"
+        />
+        <div
+          className={`side-panel ${isOpen ? 'left-zero' : ''}`}
+          role="navigation"
+          aria-label="Main"
+          aria-hidden={!isOpen ? 'true' : 'false'}
+        >
+          <div className="side-panel-north">
+            <Logo onCloseSidePanel={this.props.onCloseSidePanel}/>
+          </div>
+          <div className="side-panel-center">
+            <MainSideNav tabItemClick={this.props.tabItemClick} currentTab={this.props.currentTab} />
+          </div>
+          <div className="side-panel-footer">
+            <SideNavFooter />
+          </div>
         </div>
-        <div className="side-panel-center">
-          <MainSideNav tabItemClick={this.props.tabItemClick} currentTab={this.props.currentTab} />
-        </div>
-        <div className="side-panel-footer">
-          <SideNavFooter />
-        </div>
-      </div>
+      </React.Fragment>
     );
   }
 }

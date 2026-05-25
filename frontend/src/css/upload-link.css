@@ -17,6 +17,16 @@ body {
   border: 1px solid #ddd;
   margin: 2em auto;
 }
+
+@media (max-width: 767px) {
+  #upload-link-panel {
+    width: auto;
+    max-width: 100%;
+    margin: 0.5em 8px;
+    border-left: 0;
+    border-right: 0;
+  }
+}
 .shared-by .avatar {
   width: 20px;
   height: 20px;

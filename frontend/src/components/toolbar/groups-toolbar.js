@@ -23,7 +23,7 @@ class GroupsToolbar extends React.Component {
     return (
       <div className="main-panel-north border-left-show">
         <div className="cur-view-toolbar">
-          <span title="Side Nav Menu" onClick={onShowSidePanel} className="sf2-icon-menu side-nav-toggle hidden-md-up d-md-none"></span>
+          <span title="Side Nav Menu" aria-label="Open menu" role="button" tabIndex={0} onClick={onShowSidePanel} className="sf2-icon-menu side-nav-toggle hidden-md-up d-md-none"></span>
           {userCanAddGroup && (
             <div className="operation">
               <MediaQuery query="(min-width: 768px)">

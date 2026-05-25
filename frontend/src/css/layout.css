@@ -34,6 +34,7 @@
 @media (max-width: 767px) {
   .side-panel {
     position:fixed;
+    top: 0;
     left:-300px;
     z-index: 1031;
     width: 300px;
@@ -43,6 +44,77 @@
     -webkit-transition: all 0.3s ease;
     -moz-transition: all 0.3s ease;
     transition: all 0.3s ease;
+  }
+
+  /* side-panel.js toggles .left-zero when the drawer should be open. */
+  .side-panel.left-zero {
+    left: 0;
+    box-shadow: 0 0 12px rgba(0, 0, 0, 0.25);
+  }
+
+  /* Dim/click-trap behind the drawer. Sibling of .side-panel; .show toggles it. */
+  .side-panel-backdrop {
+    display: none;
+  }
+  .side-panel-backdrop.show {
+    display: block;
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background: rgba(0, 0, 0, 0.4);
+    z-index: 1030;
+  }
+}
+
+/* Backdrop never shown on desktop. */
+@media (min-width: 768px) {
+  .side-panel-backdrop {
+    display: none !important;
+  }
+}
+
+/* Phase 1: global mobile touch target + spacing boosts. */
+@media (max-width: 767px) {
+  /* Reactstrap/Bootstrap pagination buttons */
+  .pagination .page-link {
+    min-width: 44px;
+    min-height: 44px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0 0.75rem;
+  }
+
+  /* Reactstrap modal close ('×') button */
+  .modal-header .close,
+  .modal-header button.close {
+    min-width: 44px;
+    min-height: 44px;
+    font-size: 1.75rem;
+    padding: 0 0.5rem;
+  }
+
+  /* Tree-view nav items */
+  .tree-node .tree-node-inner,
+  .nav-item .nav-link {
+    min-height: 44px;
+    display: flex;
+    align-items: center;
+  }
+
+  /* Form controls — Bootstrap defaults are ~38px, bump to 44px */
+  .form-control,
+  .input-group .form-control,
+  .input-group .input-group-text {
+    min-height: 44px;
+  }
+
+  /* Dirent (file/folder) row: make the whole row tappable */
+  tr.tr-highlight,
+  .table-hover > tbody > tr {
+    min-height: 48px;
   }
 }
 
@@ -159,6 +231,27 @@
   box-shadow: -1px 0 3px 0 #ccc;
   animation: move .5s ease-in-out 1;
   z-index: 50;
+}
+
+@media (max-width: 767px) {
+  .cur-view-detail {
+    position: fixed;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    left: 0;
+    width: 100%;
+    max-width: 100vw;
+    height: 100%;
+    z-index: 1045;
+    overflow-y: auto;
+  }
+
+  /* On mobile the detail panel is a full-screen overlay; the slide-in
+     animation from the right edge looks broken at 100vw width. */
+  .cur-view-detail {
+    animation: none;
+  }
 }
 
 @keyframes move {

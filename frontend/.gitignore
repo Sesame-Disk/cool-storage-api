@@ -1,0 +1,21 @@
+node_modules/
+build/
+dist/
+dist-vite/
+coverage/
+.eslintcache
+
+# Playwright
+playwright-report/
+test-results/
+.playwright/
+e2e/screenshots/
+
+# Vitest
+.vitest/
+
+# OS / editor
+.DS_Store
+*.log
+.idea/
+.vscode/
