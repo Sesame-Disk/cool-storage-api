@@ -967,17 +967,18 @@ func (s *CassandraStore) EnsureBlockGCCandidate(orgID uuid.UUID, blockID, storag
 }
 
 // DeleteBlockGCCandidate removes both the canonical row and the matching
-// discovery row. We read the canonical row first to recover (candidate_at,
-// storage_class) so the discovery DELETE can target the exact clustering.
-// If the canonical row is already gone, the discovery row has either been
-// deleted alongside it on a previous call or will TTL out naturally.
-func (s *CassandraStore) DeleteBlockGCCandidate(orgID uuid.UUID, blockID string) error {
-	var candidateAt time.Time
-	err := s.db.Session().Query(`
-		SELECT candidate_at FROM gc_block_candidates WHERE org_id = ? AND block_id = ?
-	`, orgID.String(), blockID).Scan(&candidateAt)
-	if err != nil && !errors.Is(err, gocql.ErrNotFound) {
-		return fmt.Errorf("failed to read gc_block_candidates row for delete: %w", err)
+// discovery row. Callers should pass candidateAt when they already know it
+// (for example from QueueItem.QueuedAt or BlockGCCandidateInfo.CandidateAt) so
+// the discovery row can still be removed even if the canonical row is already
+// gone. A zero candidateAt falls back to reading the canonical row first.
+func (s *CassandraStore) DeleteBlockGCCandidate(orgID uuid.UUID, blockID string, candidateAt time.Time) error {
+	if candidateAt.IsZero() {
+		err := s.db.Session().Query(`
+			SELECT candidate_at FROM gc_block_candidates WHERE org_id = ? AND block_id = ?
+		`, orgID.String(), blockID).Scan(&candidateAt)
+		if err != nil && !errors.Is(err, gocql.ErrNotFound) {
+			return fmt.Errorf("failed to read gc_block_candidates row for delete: %w", err)
+		}
 	}
 
 	if err := s.db.Session().Query(`
@@ -1085,16 +1086,17 @@ func (s *CassandraStore) UpdateS3OrphanAttempt(orgID uuid.UUID, blockID, errMsg 
 }
 
 // DeleteS3Orphan removes both the canonical row and the matching discovery
-// projection row. We read first_seen_at from the canonical row to target the
-// exact discovery clustering; if the canonical row is already absent the
-// discovery row (if any) will TTL out at the same horizon.
-func (s *CassandraStore) DeleteS3Orphan(orgID uuid.UUID, blockID string) error {
-	var firstSeenAt time.Time
-	err := s.db.Session().Query(`
-		SELECT first_seen_at FROM gc_s3_orphans WHERE org_id = ? AND block_id = ?
-	`, orgID.String(), blockID).Scan(&firstSeenAt)
-	if err != nil && !errors.Is(err, gocql.ErrNotFound) {
-		return fmt.Errorf("failed to read gc_s3_orphans row for delete: %w", err)
+// projection row. Callers should pass firstSeenAt when they already know it so
+// the discovery row can still be removed if the canonical row has already been
+// deleted. A zero firstSeenAt falls back to reading the canonical row first.
+func (s *CassandraStore) DeleteS3Orphan(orgID uuid.UUID, blockID string, firstSeenAt time.Time) error {
+	if firstSeenAt.IsZero() {
+		err := s.db.Session().Query(`
+			SELECT first_seen_at FROM gc_s3_orphans WHERE org_id = ? AND block_id = ?
+		`, orgID.String(), blockID).Scan(&firstSeenAt)
+		if err != nil && !errors.Is(err, gocql.ErrNotFound) {
+			return fmt.Errorf("failed to read gc_s3_orphans row for delete: %w", err)
+		}
 	}
 
 	if err := s.db.Session().Query(`
@@ -1409,7 +1411,6 @@ func (s *CassandraStore) ListOrganizations() ([]uuid.UUID, error) {
 	}
 	return orgs, nil
 }
-
 
 func (s *CassandraStore) ListExpiredShareLinks() ([]ExpiredShareLinkInfo, error) {
 	now := time.Now()

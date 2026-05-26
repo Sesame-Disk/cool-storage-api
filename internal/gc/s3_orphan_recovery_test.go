@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/Sesame-Disk/sesamefs/internal/config"
+	"github.com/Sesame-Disk/sesamefs/internal/db"
 	"github.com/google/uuid"
 )
 
@@ -234,6 +235,45 @@ func TestWorker_RecoverS3Orphans_SkipsClaimedRows(t *testing.T) {
 	}
 	if got := sp.DeletedBlocks(); len(got) != 0 {
 		t.Errorf("S3 should not be touched while claimed block row still exists, got %v", got)
+	}
+}
+
+// TestWorker_RecoverS3Orphans_ColdStartSeesOldRows verifies that the first
+// recovery pass scans the full TTL horizon instead of only a recent 14-day
+// window, so old orphan rows do not get stranded forever on a cold start.
+func TestWorker_RecoverS3Orphans_ColdStartSeesOldRows(t *testing.T) {
+	store := NewMockStore()
+	sp := &MockStorageProvider{}
+	stats := &Stats{}
+	q := NewQueue(store)
+	w := NewWorker(store, sp, q, 100, 0, false, stats)
+
+	now := time.Date(2026, 5, 26, 12, 0, 0, 0, time.UTC)
+	w.clock = func() time.Time { return now }
+
+	orgID := uuid.New()
+	firstSeenAt := now.AddDate(0, 0, -30)
+	if err := store.RecordS3Orphan(orgID, "orph-old", "hot", "old failure", firstSeenAt); err != nil {
+		t.Fatalf("seed orphan: %v", err)
+	}
+
+	recovered, err := w.RecoverS3Orphans(context.Background(), 100)
+	if err != nil {
+		t.Fatalf("RecoverS3Orphans: %v", err)
+	}
+	if recovered != 1 {
+		t.Fatalf("recovered=%d, want 1", recovered)
+	}
+	if got := store.S3OrphanCount(); got != 0 {
+		t.Fatalf("expected old orphan to be cleared, got %d rows", got)
+	}
+	cursorValue, err := store.LoadGCStats(gcS3OrphansCursorKey)
+	if err != nil {
+		t.Fatalf("expected S3 orphan cursor to be persisted, got err=%v", err)
+	}
+	wantCursor := db.GCProjectionDateString(now.AddDate(0, 0, -1))
+	if cursorValue != wantCursor {
+		t.Fatalf("cursor=%q, want %q", cursorValue, wantCursor)
 	}
 }
 

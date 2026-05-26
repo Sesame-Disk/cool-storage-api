@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Sesame-Disk/sesamefs/internal/db"
 	gcpkg "github.com/Sesame-Disk/sesamefs/internal/gc"
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
 	"github.com/google/uuid"
@@ -149,6 +150,17 @@ func gcCandidateExists(t *testing.T, orgID, blockID string) bool {
 	var ts time.Time
 	err := session.Query(`SELECT candidate_at FROM gc_block_candidates WHERE org_id = ? AND block_id = ?`, orgID, blockID).Scan(&ts)
 	return err == nil
+}
+
+func gcCandidateProjectionExists(t *testing.T, orgID, blockID string, candidateAt time.Time) bool {
+	t.Helper()
+	session := shareProjectionDBForTest(t).Session()
+	var storedBlockID string
+	err := session.Query(`
+		SELECT block_id FROM gc_block_candidates_by_day
+		WHERE candidate_day = ? AND bucket = ? AND candidate_at = ? AND org_id = ? AND block_id = ?
+	`, db.GCProjectionUTCDate(candidateAt), db.GCDiscoveryBucket(orgID, blockID), candidateAt.UTC(), orgID, blockID).Scan(&storedBlockID)
+	return err == nil && storedBlockID == blockID
 }
 
 // uploadUniqueFile uploads a file with unique content and returns the block ID (SHA-256 of content).
@@ -477,7 +489,7 @@ func cleanupGCBlockFixturesForTest(t *testing.T, orgID uuid.UUID, blockID string
 	deleteGCFailedItemsByIdentity(t, orgID.String(), "block", blockID)
 	deleteGCPendingBlockItems(t, orgID, blockID)
 	store := gcpkg.NewCassandraStore(shareProjectionDBForTest(t))
-	if err := store.DeleteBlockGCCandidate(orgID, blockID); err != nil {
+	if err := store.DeleteBlockGCCandidate(orgID, blockID, time.Time{}); err != nil {
 		t.Fatalf("failed to delete gc_block_candidate for %s/%s: %v", orgID, blockID, err)
 	}
 	repairGCSnapshotsForTest(t, orgID)
@@ -801,6 +813,45 @@ func TestGC_ScannerRequeuesCandidatesMissingFromQueue(t *testing.T) {
 		return
 	}
 	t.Log("scanner discovery: candidate row preserved for next worker pass — correct")
+}
+
+// TestGC_DeleteBlockGCCandidate_RemovesDiscoveryRowWithoutCanonical verifies
+// the store can still clear gc_block_candidates_by_day when the canonical
+// gc_block_candidates row is already gone, as long as the caller provides the
+// original candidate_at from the queue item / scanner row.
+func TestGC_DeleteBlockGCCandidate_RemovesDiscoveryRowWithoutCanonical(t *testing.T) {
+	requireCassandra(t)
+
+	database := shareProjectionDBForTest(t)
+	store := gcpkg.NewCassandraStore(database)
+	orgID := uuid.New()
+	blockID := fmt.Sprintf("cand-cleanup-%d", time.Now().UnixNano())
+	candidateAt := time.Now().UTC().Truncate(time.Millisecond)
+
+	if _, err := store.EnsureBlockGCCandidate(orgID, blockID, "hot", candidateAt); err != nil {
+		t.Fatalf("EnsureBlockGCCandidate: %v", err)
+	}
+	if !gcCandidateExists(t, orgID.String(), blockID) {
+		t.Fatal("expected canonical gc_block_candidates row to exist")
+	}
+	if !gcCandidateProjectionExists(t, orgID.String(), blockID, candidateAt) {
+		t.Fatal("expected gc_block_candidates_by_day projection row to exist")
+	}
+
+	if err := database.Session().Query(fmt.Sprintf(
+		"DELETE FROM gc_block_candidates WHERE org_id = %s AND block_id = '%s'",
+		orgID.String(),
+		blockID,
+	)).Exec(); err != nil {
+		t.Fatalf("delete canonical gc_block_candidates row: %v", err)
+	}
+
+	if err := store.DeleteBlockGCCandidate(orgID, blockID, candidateAt); err != nil {
+		t.Fatalf("DeleteBlockGCCandidate: %v", err)
+	}
+	if gcCandidateProjectionExists(t, orgID.String(), blockID, candidateAt) {
+		t.Fatal("expected gc_block_candidates_by_day projection row to be removed")
+	}
 }
 
 // getGCGracePeriod reads the configured grace period from the admin status API.

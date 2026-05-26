@@ -17,7 +17,7 @@ import (
 // OrphanRecoverer retries S3 deletes for blocks whose DB rows are gone but
 // whose S3 objects linger. Implemented by *Worker.
 type OrphanRecoverer interface {
-	RecoverS3Orphans(ctx context.Context, perOrgLimit int) (int, error)
+	RecoverS3Orphans(ctx context.Context, perBucketLimit int) (int, error)
 }
 
 // OnlyOfficeReconciler reconciles stale onlyoffice_pending_blocks rows for an

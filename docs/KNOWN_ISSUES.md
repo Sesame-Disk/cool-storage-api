@@ -528,7 +528,7 @@ Each block now lives in its own Cassandra partition, so concurrent LWTs from one
 Two paths previously relied on `WHERE org_id = ?` partition scans over `blocks`, `gc_block_candidates`, and `gc_s3_orphans`. Per-block partitioning makes those scans inefficient, so they are replaced by per-day discovery projections:
 
 - `gc_block_candidates_by_day (PRIMARY KEY ((candidate_day, bucket), candidate_at, org_id, block_id))` — the GC scanner walks this by `(day, bucket)` from a persisted cursor (`gc.scan.block_candidates.last_candidate_day`) so it never needs to enumerate all candidate orgs.
-- `gc_s3_orphans_by_day (PRIMARY KEY ((first_seen_day, bucket), first_seen_at, org_id, block_id))` — the worker's `RecoverS3Orphans` walks this over a 14-day window across all discovery buckets.
+- `gc_s3_orphans_by_day (PRIMARY KEY ((first_seen_day, bucket), first_seen_at, org_id, block_id))` — the worker's `RecoverS3Orphans` walks this from a persisted UTC-day cursor across all discovery buckets; on cold start it scans the full 90-day TTL horizon so old orphan rows are still recoverable.
 
 Both projections inherit the same TTL as their canonical table. The bucket count (`db.GCDiscoveryBucketCount = 32`) mirrors the pattern used by `gc_share_links_by_expiry`.
 

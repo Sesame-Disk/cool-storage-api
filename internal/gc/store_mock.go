@@ -1414,7 +1414,7 @@ func (m *MockStore) EnsureBlockGCCandidate(orgID uuid.UUID, blockID, storageClas
 	return candidateAt, nil
 }
 
-func (m *MockStore) DeleteBlockGCCandidate(orgID uuid.UUID, blockID string) error {
+func (m *MockStore) DeleteBlockGCCandidate(orgID uuid.UUID, blockID string, candidateAt time.Time) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	delete(m.blockGCCandidates, fmt.Sprintf("%s:%s", orgID, blockID))
@@ -1627,7 +1627,6 @@ func (m *MockStore) ListOrganizations() ([]uuid.UUID, error) {
 	defer m.mu.RUnlock()
 	return append([]uuid.UUID{}, m.organizations...), nil
 }
-
 
 func (m *MockStore) ListExpiredShareLinks() ([]ExpiredShareLinkInfo, error) {
 	m.mu.RLock()
@@ -2773,7 +2772,7 @@ func (m *MockStore) UpdateS3OrphanAttempt(orgID uuid.UUID, blockID, errMsg strin
 	return nil
 }
 
-func (m *MockStore) DeleteS3Orphan(orgID uuid.UUID, blockID string) error {
+func (m *MockStore) DeleteS3Orphan(orgID uuid.UUID, blockID string, firstSeenAt time.Time) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	delete(m.s3Orphans, fmt.Sprintf("%s:%s", orgID, blockID))

@@ -68,7 +68,7 @@ type GCStore interface {
 	DecrementBlockRefCount(orgID uuid.UUID, blockID string) (bool, error)
 	DeleteBlockMapping(orgID uuid.UUID, externalID string) error
 	EnsureBlockGCCandidate(orgID uuid.UUID, blockID, storageClass string, candidateAt time.Time) (time.Time, error)
-	DeleteBlockGCCandidate(orgID uuid.UUID, blockID string) error
+	DeleteBlockGCCandidate(orgID uuid.UUID, blockID string, candidateAt time.Time) error
 	// ListBlockGCCandidatesByDay enumerates candidates whose `candidate_at`
 	// falls on the given UTC day for one discovery bucket. Bucket indices
 	// range over [0, db.GCDiscoveryBucketCount). Replaces the old per-org
@@ -82,7 +82,7 @@ type GCStore interface {
 	// number of rows returned for a single (day, bucket) pair.
 	ListS3OrphansByDay(day time.Time, bucket int, limit int) ([]S3OrphanInfo, error)
 	UpdateS3OrphanAttempt(orgID uuid.UUID, blockID, errMsg string, now time.Time) error
-	DeleteS3Orphan(orgID uuid.UUID, blockID string) error
+	DeleteS3Orphan(orgID uuid.UUID, blockID string, firstSeenAt time.Time) error
 
 	// Reverse lookup: find block mappings by internal_id (avoids full scan)
 	ListBlockMappingsByInternalID(orgID uuid.UUID, internalID string) ([]BlockMapping, error)

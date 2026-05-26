@@ -1467,8 +1467,9 @@ The two paths that relied on partition-scanning by org were rewritten:
 - `gc.Scanner.scanOrphanedBlocks` walks `gc_block_candidates_by_day` by
   `(day, bucket)` from a persisted cursor instead of enumerating candidate orgs
   and partition-scanning the canonical table.
-- `gc.Worker.RecoverS3Orphans` walks `gc_s3_orphans_by_day` over a 14-day
-  recovery window across all discovery buckets.
+- `gc.Worker.RecoverS3Orphans` walks `gc_s3_orphans_by_day` from a persisted cursor
+  across all discovery buckets, and cold start now scans the full 90-day TTL
+  horizon instead of a fixed 14-day recovery window.
 
 The old `ListBlocksForOrg` partition scan that served as a backfill safety net
 is gone; the new contract is that `DecrementBlockRefCountsOnce` →

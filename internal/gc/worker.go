@@ -376,7 +376,7 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem, blockRefs *bl
 	// 2. If it didn't apply, it means ref_count > 0 or it was already deleted.
 	// We skip deleting from S3 to avoid data loss.
 	if !applied {
-		if err := w.store.DeleteBlockGCCandidate(item.OrgID, item.ItemID); err != nil {
+		if err := w.store.DeleteBlockGCCandidate(item.OrgID, item.ItemID, item.QueuedAt); err != nil {
 			return fmt.Errorf("failed to clear stale block GC candidate: %w", err)
 		}
 		log.Printf("[GC Worker] Block %s LWT delete not applied (ref_count > 0 or already deleted), skipping S3 deletion", item.ItemID)
@@ -391,7 +391,8 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem, blockRefs *bl
 	if storageClass == "" {
 		storageClass = "hot"
 	}
-	if err := w.store.RecordS3Orphan(item.OrgID, item.ItemID, storageClass, "", w.clock()); err != nil {
+	orphanFirstSeenAt := w.clock().UTC()
+	if err := w.store.RecordS3Orphan(item.OrgID, item.ItemID, storageClass, "", orphanFirstSeenAt); err != nil {
 		return fmt.Errorf("failed to record pending S3 delete for block %s: %w", item.ItemID, err)
 	}
 
@@ -415,7 +416,7 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem, blockRefs *bl
 			metrics.GCAuditEventsTotal.WithLabelValues("gc_block_s3_orphaned").Inc()
 			// Do NOT return error — the block is recorded for recovery.
 			// Continue to mapping/candidate cleanup so the queue item completes.
-		} else if err := w.store.DeleteS3Orphan(item.OrgID, item.ItemID); err != nil {
+		} else if err := w.store.DeleteS3Orphan(item.OrgID, item.ItemID, orphanFirstSeenAt); err != nil {
 			log.Printf("[GC Worker] WARNING: S3 delete for block %s succeeded but failed to clear recovery row: %v", item.ItemID, err)
 		}
 	}
@@ -428,7 +429,7 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem, blockRefs *bl
 		}
 	}
 
-	if err := w.store.DeleteBlockGCCandidate(item.OrgID, item.ItemID); err != nil {
+	if err := w.store.DeleteBlockGCCandidate(item.OrgID, item.ItemID, item.QueuedAt); err != nil {
 		return fmt.Errorf("failed to clear block GC candidate: %w", err)
 	}
 
@@ -469,9 +470,11 @@ func (w *Worker) deleteS3WithRetry(ctx context.Context, blockStore BlockStoreDel
 // Called by the scanner; exposed on the worker because it needs access to
 // w.storage. Returns the number of orphans successfully recovered.
 //
-// Walks the gc_s3_orphans_by_day discovery projection across the last
-// gcS3OrphanRecoveryLookbackDays. `perBucketLimit` caps the rows pulled per
-// (day, bucket) so a single misbehaving day cannot starve the worker.
+// Walks the gc_s3_orphans_by_day discovery projection from a persisted UTC-day
+// cursor up to today. On cold start (no cursor) it scans the full 90-day TTL
+// horizon so old orphan rows cannot get stranded forever. `perBucketLimit`
+// caps the rows pulled per (day, bucket) so a single misbehaving bucket cannot
+// starve the worker.
 func (w *Worker) RecoverS3Orphans(ctx context.Context, perBucketLimit int) (int, error) {
 	if w.storage == nil {
 		return 0, nil
@@ -485,9 +488,16 @@ func (w *Worker) RecoverS3Orphans(ctx context.Context, perBucketLimit int) (int,
 	}
 
 	cutoffDay := db.GCProjectionUTCDate(w.clock())
-	startDay := cutoffDay.AddDate(0, 0, -gcS3OrphanRecoveryLookbackDays)
+	startDay, err := w.loadS3OrphansStartDay(cutoffDay)
+	if err != nil {
+		return 0, err
+	}
+	if startDay.After(cutoffDay) {
+		return 0, nil
+	}
 
 	recovered := 0
+	var phaseErr error
 	for day := startDay; !day.After(cutoffDay); day = day.AddDate(0, 0, 1) {
 		for bucket := 0; bucket < db.GCDiscoveryBucketCount; bucket++ {
 			select {
@@ -499,6 +509,9 @@ func (w *Worker) RecoverS3Orphans(ctx context.Context, perBucketLimit int) (int,
 			orphans, err := w.store.ListS3OrphansByDay(day, bucket, perBucketLimit)
 			if err != nil {
 				log.Printf("[GC Worker] S3 orphan recovery: list failed for day=%s bucket=%d: %v", db.GCProjectionDateString(day), bucket, err)
+				if phaseErr == nil {
+					phaseErr = fmt.Errorf("list S3 orphan recovery partition day=%s bucket=%d: %w", db.GCProjectionDateString(day), bucket, err)
+				}
 				continue
 			}
 			for _, orph := range orphans {
@@ -528,7 +541,7 @@ func (w *Worker) RecoverS3Orphans(ctx context.Context, perBucketLimit int) (int,
 					}
 					continue
 				}
-				if err := w.store.DeleteS3Orphan(orph.OrgID, orph.BlockID); err != nil {
+				if err := w.store.DeleteS3Orphan(orph.OrgID, orph.BlockID, orph.FirstSeenAt); err != nil {
 					log.Printf("[GC Worker] S3 orphan recovery: failed to clear orphan row %s: %v", orph.BlockID, err)
 					continue
 				}
@@ -538,13 +551,49 @@ func (w *Worker) RecoverS3Orphans(ctx context.Context, perBucketLimit int) (int,
 			}
 		}
 	}
-	return recovered, nil
+
+	if phaseErr == nil {
+		newCursor := cutoffDay.AddDate(0, 0, -1)
+		if !newCursor.Before(startDay) {
+			if err := w.store.SaveGCStats(gcS3OrphansCursorKey, db.GCProjectionDateString(newCursor)); err != nil {
+				phaseErr = fmt.Errorf("persist S3 orphan recovery cursor: %w", err)
+			}
+		}
+	}
+
+	return recovered, phaseErr
 }
 
-// gcS3OrphanRecoveryLookbackDays bounds how many past days the worker walks
-// when retrying S3 deletes. The schema TTLs gc_s3_orphans at 90 days; a 14-day
-// window matches the GC retry budget while keeping per-pass work bounded.
-const gcS3OrphanRecoveryLookbackDays = 14
+func (w *Worker) loadS3OrphansStartDay(cutoffDay time.Time) (time.Time, error) {
+	value, err := w.store.LoadGCStats(gcS3OrphansCursorKey)
+	return s3OrphansRecoveryStartDayFromCursor(value, err, cutoffDay)
+}
+
+func s3OrphansRecoveryStartDayFromCursor(value string, loadErr error, cutoffDay time.Time) (time.Time, error) {
+	if loadErr != nil {
+		if errors.Is(loadErr, gocql.ErrNotFound) {
+			return s3OrphansRecoveryScanStartDay(time.Time{}, cutoffDay), nil
+		}
+		return time.Time{}, loadErr
+	}
+	lastDay, err := db.ParseGCProjectionDate(value)
+	if err != nil {
+		return time.Time{}, err
+	}
+	return s3OrphansRecoveryScanStartDay(lastDay, cutoffDay), nil
+}
+
+func s3OrphansRecoveryScanStartDay(lastProcessedDay, cutoffDay time.Time) time.Time {
+	if lastProcessedDay.IsZero() {
+		return cutoffDay.AddDate(0, 0, -gcS3OrphanInitialScanLookbackDays)
+	}
+	return lastProcessedDay.AddDate(0, 0, -gcScanOverlapDays)
+}
+
+// gcS3OrphanInitialScanLookbackDays bounds the cold-start recovery sweep when
+// no cursor exists yet. Match the gc_s3_orphans / gc_s3_orphans_by_day TTL so
+// the first pass can still see every live orphan row.
+const gcS3OrphanInitialScanLookbackDays = 90
 
 func (w *Worker) processCommit(item QueueItem) error {
 	// Get the commit to find its root_fs_id for cascading deletion
