@@ -898,7 +898,11 @@ func (h *SyncHandler) PutBlock(c *gin.Context) {
 		now := time.Now()
 
 		// Store block metadata using internal ID
-		_ = v2.NewFSHelper(h.db).IncrementOrCreateBlock(orgID, internalID, len(data), storageClass, "")
+		if err := v2.NewFSHelper(h.db).IncrementOrCreateBlock(orgID, internalID, len(data), storageClass, ""); err != nil {
+			log.Printf("PutBlock: failed to store block metadata org=%s block=%s: %v\n", orgID, internalID, err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to store block metadata"})
+			return
+		}
 
 		// If legacy SHA-1 client, store mapping external→internal (dual-write: forward + reverse)
 		if isLegacySHA1 {

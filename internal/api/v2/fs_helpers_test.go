@@ -253,15 +253,22 @@ func TestIsAmbiguousBlockMutationError(t *testing.T) {
 	}
 }
 
-func TestResolveIncrementBlockMutationErrorTreatsConfirmedExpectedRefCountAsSuccess(t *testing.T) {
+func TestResolveIncrementBlockMutationErrorReturnsUnknownWhenExpectedRefCountIsVisible(t *testing.T) {
 	retry, err := resolveIncrementBlockMutationError("block-1", 3, gocql.RequestErrWriteTimeout{WriteType: "CAS"}, func() (blockMutationState, error) {
 		return blockMutationState{exists: true, refCount: 3}, nil
 	})
-	if err != nil {
-		t.Fatalf("resolveIncrementBlockMutationError() error = %v, want nil", err)
-	}
 	if retry {
 		t.Fatal("resolveIncrementBlockMutationError() retry = true, want false")
+	}
+	if err == nil {
+		t.Fatal("resolveIncrementBlockMutationError() error = nil, want unknown outcome error")
+	}
+	if !errors.Is(err, ErrBlockMutationOutcomeUnknown) {
+		t.Fatalf("resolveIncrementBlockMutationError() error = %v, want ErrBlockMutationOutcomeUnknown", err)
+	}
+	var writeTimeout gocql.RequestErrWriteTimeout
+	if !errors.As(err, &writeTimeout) {
+		t.Fatalf("resolveIncrementBlockMutationError() error = %v, want wrapped write timeout", err)
 	}
 }
 
@@ -330,15 +337,22 @@ func TestResolveInsertBlockMutationErrorRetriesWhenRowStillMissing(t *testing.T)
 	}
 }
 
-func TestResolveInsertBlockMutationErrorTreatsConfirmedExpectedRowAsSuccess(t *testing.T) {
+func TestResolveInsertBlockMutationErrorReturnsUnknownWhenExpectedRowExists(t *testing.T) {
 	retry, err := resolveInsertBlockMutationError("block-1", 42, "hot", "", gocql.RequestErrCASWriteUnknown{}, func() (blockMutationState, error) {
 		return blockMutationState{exists: true, refCount: 1, sizeBytes: 42, storageClass: "hot", storageKey: ""}, nil
 	})
-	if err != nil {
-		t.Fatalf("resolveInsertBlockMutationError() error = %v, want nil", err)
-	}
 	if retry {
 		t.Fatal("resolveInsertBlockMutationError() retry = true, want false")
+	}
+	if err == nil {
+		t.Fatal("resolveInsertBlockMutationError() error = nil, want unknown outcome error")
+	}
+	if !errors.Is(err, ErrBlockMutationOutcomeUnknown) {
+		t.Fatalf("resolveInsertBlockMutationError() error = %v, want ErrBlockMutationOutcomeUnknown", err)
+	}
+	var casUnknown gocql.RequestErrCASWriteUnknown
+	if !errors.As(err, &casUnknown) {
+		t.Fatalf("resolveInsertBlockMutationError() error = %v, want wrapped CAS error", err)
 	}
 }
 

@@ -37,7 +37,7 @@ var ErrStorageQuotaExceeded = errors.New("storage quota exceeded")
 
 // ErrBlockMutationOutcomeUnknown indicates a conditional block ref-count
 // mutation may have applied, but the post-error confirmation read could not
-// determine the final canonical state.
+// attribute the visible state to this operation.
 var ErrBlockMutationOutcomeUnknown = errors.New("block ref-count mutation outcome is unknown")
 
 // NewFSHelper creates a new FSHelper instance
@@ -879,19 +879,6 @@ func (h *FSHelper) confirmBlockMutationState(orgID, blockID string) (blockMutati
 	return state, err
 }
 
-func blockMutationStateMatchesInsert(state blockMutationState, sizeBytes int, storageClass, storageKey string) bool {
-	if !state.exists {
-		return false
-	}
-	if state.sizeBytes != sizeBytes {
-		return false
-	}
-	if state.storageClass != storageClass {
-		return false
-	}
-	return state.storageKey == storageKey
-}
-
 func resolveIncrementBlockMutationError(blockID string, expectedRefCount int, updateErr error, confirmVisible func() (blockMutationState, error)) (bool, error) {
 	wrapped := fmt.Errorf("conditional block ref-count increment failed for %s: %w", blockID, updateErr)
 	if !isAmbiguousBlockMutationError(updateErr) {
@@ -901,9 +888,6 @@ func resolveIncrementBlockMutationError(blockID string, expectedRefCount int, up
 	state, confirmErr := confirmVisible()
 	if confirmErr == nil {
 		switch {
-		case state.exists && state.refCount == expectedRefCount:
-			log.Printf("[IncrementOrCreateBlock] WARNING: ambiguous CAS error for block %s but confirmation read shows ref_count=%d", blockID, state.refCount)
-			return false, nil
 		case !state.exists:
 			log.Printf("[IncrementOrCreateBlock] INFO: ambiguous CAS error for block %s confirmed the row is still missing; retrying", blockID)
 			return true, nil
@@ -911,11 +895,11 @@ func resolveIncrementBlockMutationError(blockID string, expectedRefCount int, up
 			log.Printf("[IncrementOrCreateBlock] INFO: ambiguous CAS error for block %s confirmed ref_count remains at %d; retrying", blockID, state.refCount)
 			return true, nil
 		default:
-			log.Printf("[IncrementOrCreateBlock] WARNING: ambiguous CAS error for block %s confirmed unexpected ref_count=%d", blockID, state.refCount)
+			log.Printf("[IncrementOrCreateBlock] WARNING: ambiguous CAS error for block %s confirmed ref_count=%d, which cannot be attributed to this operation", blockID, state.refCount)
 			return false, errors.Join(
 				ErrBlockMutationOutcomeUnknown,
 				wrapped,
-				fmt.Errorf("confirmation read found unexpected ref_count=%d", state.refCount),
+				fmt.Errorf("confirmation read found ref_count=%d; cannot attribute the ambiguous increment", state.refCount),
 			)
 		}
 	}
@@ -940,15 +924,11 @@ func resolveInsertBlockMutationError(blockID string, sizeBytes int, storageClass
 			log.Printf("[IncrementOrCreateBlock] INFO: ambiguous CAS error while inserting block %s confirmed the row is still missing; retrying", blockID)
 			return true, nil
 		}
-		if state.refCount == 1 && blockMutationStateMatchesInsert(state, sizeBytes, storageClass, storageKey) {
-			log.Printf("[IncrementOrCreateBlock] WARNING: ambiguous CAS error while inserting block %s but confirmation read shows the expected row already exists", blockID)
-			return false, nil
-		}
-		log.Printf("[IncrementOrCreateBlock] WARNING: ambiguous CAS error while inserting block %s confirmed unexpected existing state ref_count=%d size=%d storage_class=%q storage_key=%q", blockID, state.refCount, state.sizeBytes, state.storageClass, state.storageKey)
+		log.Printf("[IncrementOrCreateBlock] WARNING: ambiguous CAS error while inserting block %s confirmed an existing row ref_count=%d size=%d storage_class=%q storage_key=%q, which cannot be attributed to this operation", blockID, state.refCount, state.sizeBytes, state.storageClass, state.storageKey)
 		return false, errors.Join(
 			ErrBlockMutationOutcomeUnknown,
 			wrapped,
-			fmt.Errorf("confirmation read found unexpected existing state ref_count=%d size=%d storage_class=%q storage_key=%q", state.refCount, state.sizeBytes, state.storageClass, state.storageKey),
+			fmt.Errorf("confirmation read found existing row ref_count=%d size=%d storage_class=%q storage_key=%q; cannot attribute the ambiguous insert", state.refCount, state.sizeBytes, state.storageClass, state.storageKey),
 		)
 	}
 
@@ -1210,7 +1190,7 @@ func (h *FSHelper) CopyFSObjectToLibrary(srcRepoID, dstRepoID, fsID string) (str
 func (h *FSHelper) IncrementBlockRefCounts(orgID string, blockIDs []string) error {
 	for _, blockID := range h.resolveStoredBlockIDs(orgID, blockIDs) {
 		if err := h.IncrementOrCreateBlock(orgID, blockID, 0, "", ""); err != nil {
-			continue
+			return fmt.Errorf("increment block %s: %w", blockID, err)
 		}
 	}
 	return nil
