@@ -20,6 +20,8 @@ database:
     - cassandra:9042
   keyspace: sesamefs
   consistency: LOCAL_QUORUM
+  serial_consistency: SERIAL
+  timeout: 10s
   local_dc: datacenter1
   replication_class: NetworkTopologyStrategy
   replication_dcs:

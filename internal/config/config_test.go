@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // clearLoadEnvOverrides blanks out the env vars that Load()/applyEnvOverrides
@@ -18,8 +19,8 @@ func clearLoadEnvOverrides(t *testing.T) {
 		"PORT", "SERVER_PORT", "SERVER_TRUSTED_PROXIES", "SERVER_REGION",
 		"SERVER_URL", "DESKTOP_CUSTOM_BRAND", "DESKTOP_CUSTOM_LOGO",
 		"CORS_ALLOWED_ORIGINS",
-		"CASSANDRA_HOSTS", "CASSANDRA_KEYSPACE", "CASSANDRA_USERNAME",
-		"CASSANDRA_PASSWORD", "CASSANDRA_LOCAL_DC",
+		"CASSANDRA_HOSTS", "CASSANDRA_KEYSPACE", "CASSANDRA_CONSISTENCY", "CASSANDRA_USERNAME",
+		"CASSANDRA_PASSWORD", "CASSANDRA_LOCAL_DC", "CASSANDRA_SERIAL_CONSISTENCY", "CASSANDRA_TIMEOUT",
 		"CASSANDRA_REPLICATION_CLASS", "CASSANDRA_REPLICATION_FACTOR", "CASSANDRA_REPLICATION_DCS",
 		"STORAGE_MODE", "S3_BUCKET", "S3_REGION", "S3_ENDPOINT",
 		"S3_SERVER_SIDE_ENCRYPTION", "S3_SSE_KMS_KEY_ID",
@@ -59,35 +60,31 @@ func TestLoad(t *testing.T) {
 	tempDir := t.TempDir()
 	configPath := filepath.Join(tempDir, "config.yaml")
 
-	configContent := `
-server:
-  port: ":9090"
-
-database:
-  hosts:
-    - "localhost"
-  keyspace: "test_keyspace"
-  consistency: "ONE"
-
-storage:
-  default_class: "hot"
-  backends:
-    hot:
-      type: "s3"
-      bucket: "test-bucket"
-      region: "us-east-1"
-
-auth:
-  dev_mode: true
-  dev_tokens:
-    - token: "test-token"
-      user_id: "00000000-0000-0000-0000-000000000001"
-      org_id: "00000000-0000-0000-0000-000000000001"
-
-versioning:
-  default_ttl_days: 30
-  min_ttl_days: 7
-`
+	configContent := "server:\n" +
+		"  port: \":9090\"\n\n" +
+		"database:\n" +
+		"  hosts:\n" +
+		"    - \"localhost\"\n" +
+		"  keyspace: \"test_keyspace\"\n" +
+		"  consistency: \"ONE\"\n" +
+		"  serial_consistency: \"LOCAL_SERIAL\"\n" +
+		"  timeout: \"25s\"\n\n" +
+		"storage:\n" +
+		"  default_class: \"hot\"\n" +
+		"  backends:\n" +
+		"    hot:\n" +
+		"      type: \"s3\"\n" +
+		"      bucket: \"test-bucket\"\n" +
+		"      region: \"us-east-1\"\n\n" +
+		"auth:\n" +
+		"  dev_mode: true\n" +
+		"  dev_tokens:\n" +
+		"    - token: \"test-token\"\n" +
+		"      user_id: \"00000000-0000-0000-0000-000000000001\"\n" +
+		"      org_id: \"00000000-0000-0000-0000-000000000001\"\n\n" +
+		"versioning:\n" +
+		"  default_ttl_days: 30\n" +
+		"  min_ttl_days: 7\n"
 
 	if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
 		t.Fatalf("Failed to write test config: %v", err)
@@ -111,6 +108,12 @@ versioning:
 	}
 	if cfg.Database.Keyspace != "test_keyspace" {
 		t.Errorf("Database.Keyspace = %s, want test_keyspace", cfg.Database.Keyspace)
+	}
+	if cfg.Database.Timeout != 25*time.Second {
+		t.Errorf("Database.Timeout = %s, want 25s", cfg.Database.Timeout)
+	}
+	if cfg.Database.SerialConsistency != "LOCAL_SERIAL" {
+		t.Errorf("Database.SerialConsistency = %s, want LOCAL_SERIAL", cfg.Database.SerialConsistency)
 	}
 
 	// Verify storage config
@@ -180,6 +183,9 @@ versioning:
 	t.Setenv("CONFIG_PATH", configPath)
 	t.Setenv("SERVER_PORT", ":9999")
 	t.Setenv("AUTH_DEV_MODE", "true")
+	t.Setenv("CASSANDRA_CONSISTENCY", "QUORUM")
+	t.Setenv("CASSANDRA_SERIAL_CONSISTENCY", "LOCAL_SERIAL")
+	t.Setenv("CASSANDRA_TIMEOUT", "42s")
 
 	cfg, err := Load()
 	if err != nil {
@@ -193,6 +199,15 @@ versioning:
 	if !cfg.Auth.DevMode {
 		t.Error("Auth.DevMode should be true (from env)")
 	}
+	if cfg.Database.Consistency != "QUORUM" {
+		t.Errorf("Database.Consistency = %s, want QUORUM (from env)", cfg.Database.Consistency)
+	}
+	if cfg.Database.Timeout != 42*time.Second {
+		t.Errorf("Database.Timeout = %s, want 42s (from env)", cfg.Database.Timeout)
+	}
+	if cfg.Database.SerialConsistency != "LOCAL_SERIAL" {
+		t.Errorf("Database.SerialConsistency = %s, want LOCAL_SERIAL (from env)", cfg.Database.SerialConsistency)
+	}
 }
 
 func TestDefaultConfig(t *testing.T) {
@@ -203,6 +218,12 @@ func TestDefaultConfig(t *testing.T) {
 	}
 	if cfg.Database.Keyspace != "sesamefs" {
 		t.Errorf("Database.Keyspace = %s, want sesamefs", cfg.Database.Keyspace)
+	}
+	if cfg.Database.Timeout != 10*time.Second {
+		t.Errorf("Database.Timeout = %s, want 10s", cfg.Database.Timeout)
+	}
+	if cfg.Database.SerialConsistency != "SERIAL" {
+		t.Errorf("Database.SerialConsistency = %s, want SERIAL", cfg.Database.SerialConsistency)
 	}
 	if cfg.Database.ReplicationClass != "NetworkTopologyStrategy" {
 		t.Errorf("Database.ReplicationClass = %s, want NetworkTopologyStrategy", cfg.Database.ReplicationClass)
@@ -271,6 +292,22 @@ func TestConfigValidate(t *testing.T) {
 				c.Database.Keyspace = ""
 			},
 			wantErr: true,
+		},
+		{
+			name: "invalid database serial consistency",
+			modify: func(c *Config) {
+				c.Database.SerialConsistency = "bad"
+			},
+			wantErr:        true,
+			wantErrContain: "database serial_consistency",
+		},
+		{
+			name: "invalid database consistency",
+			modify: func(c *Config) {
+				c.Database.Consistency = "bad"
+			},
+			wantErr:        true,
+			wantErrContain: "database consistency",
 		},
 		{
 			name: "production requires cors allowlist",
@@ -614,17 +651,21 @@ func TestEnvOverrideCassandra(t *testing.T) {
 
 	os.Setenv("CASSANDRA_HOSTS", "cassandra1.example.com")
 	os.Setenv("CASSANDRA_KEYSPACE", "test_ks")
+	os.Setenv("CASSANDRA_CONSISTENCY", "EACH_QUORUM")
 	os.Setenv("CASSANDRA_USERNAME", "test_user")
 	os.Setenv("CASSANDRA_PASSWORD", "test_pass")
 	os.Setenv("CASSANDRA_LOCAL_DC", "dc2")
+	os.Setenv("CASSANDRA_SERIAL_CONSISTENCY", "LOCAL_SERIAL")
 	os.Setenv("CASSANDRA_REPLICATION_CLASS", "NetworkTopologyStrategy")
 	os.Setenv("CASSANDRA_REPLICATION_DCS", "dc1:1,dc2:2")
 	defer func() {
 		os.Unsetenv("CASSANDRA_HOSTS")
 		os.Unsetenv("CASSANDRA_KEYSPACE")
+		os.Unsetenv("CASSANDRA_CONSISTENCY")
 		os.Unsetenv("CASSANDRA_USERNAME")
 		os.Unsetenv("CASSANDRA_PASSWORD")
 		os.Unsetenv("CASSANDRA_LOCAL_DC")
+		os.Unsetenv("CASSANDRA_SERIAL_CONSISTENCY")
 		os.Unsetenv("CASSANDRA_REPLICATION_CLASS")
 		os.Unsetenv("CASSANDRA_REPLICATION_DCS")
 	}()
@@ -637,6 +678,9 @@ func TestEnvOverrideCassandra(t *testing.T) {
 	if cfg.Database.Keyspace != "test_ks" {
 		t.Errorf("Database.Keyspace = %s, want test_ks", cfg.Database.Keyspace)
 	}
+	if cfg.Database.Consistency != "EACH_QUORUM" {
+		t.Errorf("Database.Consistency = %s, want EACH_QUORUM", cfg.Database.Consistency)
+	}
 	if cfg.Database.Username != "test_user" {
 		t.Errorf("Database.Username = %s, want test_user", cfg.Database.Username)
 	}
@@ -645,6 +689,9 @@ func TestEnvOverrideCassandra(t *testing.T) {
 	}
 	if cfg.Database.LocalDC != "dc2" {
 		t.Errorf("Database.LocalDC = %s, want dc2", cfg.Database.LocalDC)
+	}
+	if cfg.Database.SerialConsistency != "LOCAL_SERIAL" {
+		t.Errorf("Database.SerialConsistency = %s, want LOCAL_SERIAL", cfg.Database.SerialConsistency)
 	}
 	if cfg.Database.ReplicationClass != "NetworkTopologyStrategy" {
 		t.Errorf("Database.ReplicationClass = %s, want NetworkTopologyStrategy", cfg.Database.ReplicationClass)
@@ -707,6 +754,32 @@ func TestEnvOverrideCassandraRejectsInvalidReplicationFactor(t *testing.T) {
 	err := cfg.Validate()
 	if err == nil || !strings.Contains(err.Error(), "CASSANDRA_REPLICATION_FACTOR") {
 		t.Fatalf("Validate() error = %v, want invalid CASSANDRA_REPLICATION_FACTOR", err)
+	}
+}
+
+func TestEnvOverrideCassandraRejectsInvalidSerialConsistency(t *testing.T) {
+	cfg := DefaultConfig()
+
+	os.Setenv("CASSANDRA_SERIAL_CONSISTENCY", "bad")
+	defer os.Unsetenv("CASSANDRA_SERIAL_CONSISTENCY")
+
+	cfg.applyEnvOverrides()
+	err := cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "database serial_consistency") {
+		t.Fatalf("Validate() error = %v, want invalid database serial_consistency", err)
+	}
+}
+
+func TestEnvOverrideCassandraRejectsInvalidConsistency(t *testing.T) {
+	cfg := DefaultConfig()
+
+	os.Setenv("CASSANDRA_CONSISTENCY", "bad")
+	defer os.Unsetenv("CASSANDRA_CONSISTENCY")
+
+	cfg.applyEnvOverrides()
+	err := cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "database consistency") {
+		t.Fatalf("Validate() error = %v, want invalid database consistency", err)
 	}
 }
 

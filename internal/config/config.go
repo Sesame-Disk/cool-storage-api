@@ -450,6 +450,8 @@ type DatabaseConfig struct {
 	Hosts             []string       `yaml:"hosts"`
 	Keyspace          string         `yaml:"keyspace"`
 	Consistency       string         `yaml:"consistency"`
+	SerialConsistency string         `yaml:"serial_consistency"`
+	Timeout           time.Duration  `yaml:"timeout"`
 	LocalDC           string         `yaml:"local_dc"`
 	Username          string         `yaml:"username"`
 	Password          string         `yaml:"password"`
@@ -678,6 +680,8 @@ func DefaultConfig() *Config {
 			Hosts:             []string{"localhost:9042"},
 			Keyspace:          "sesamefs",
 			Consistency:       "LOCAL_QUORUM",
+			SerialConsistency: "SERIAL",
+			Timeout:           10 * time.Second,
 			LocalDC:           "datacenter1",
 			ReplicationClass:  "NetworkTopologyStrategy",
 			ReplicationFactor: 1,
@@ -848,6 +852,20 @@ func (c *Config) applyEnvOverrides() {
 	}
 	if v := os.Getenv("CASSANDRA_KEYSPACE"); v != "" {
 		c.Database.Keyspace = v
+	}
+	if v := os.Getenv("CASSANDRA_CONSISTENCY"); v != "" {
+		c.Database.Consistency = strings.TrimSpace(v)
+	}
+	if v := os.Getenv("CASSANDRA_SERIAL_CONSISTENCY"); v != "" {
+		c.Database.SerialConsistency = strings.TrimSpace(v)
+	}
+	if v := os.Getenv("CASSANDRA_TIMEOUT"); v != "" {
+		parsed, err := time.ParseDuration(strings.TrimSpace(v))
+		if err != nil {
+			c.addEnvOverrideError("CASSANDRA_TIMEOUT must be a duration, got %q", v)
+		} else {
+			c.Database.Timeout = parsed
+		}
 	}
 	if v := os.Getenv("CASSANDRA_USERNAME"); v != "" {
 		c.Database.Username = v
@@ -1291,6 +1309,21 @@ func (c *Config) Validate() error {
 	if c.Database.Keyspace == "" {
 		return fmt.Errorf("database keyspace is required")
 	}
+	switch normalizedConsistency := normalizeCassandraConsistency(c.Database.Consistency); normalizedConsistency {
+	case "ONE", "QUORUM", "LOCAL_QUORUM", "EACH_QUORUM", "ALL":
+		c.Database.Consistency = normalizedConsistency
+	default:
+		return fmt.Errorf("database consistency must be ONE, QUORUM, LOCAL_QUORUM, EACH_QUORUM, or ALL")
+	}
+	switch normalizedSerialConsistency := normalizeCassandraSerialConsistency(c.Database.SerialConsistency); normalizedSerialConsistency {
+	case "SERIAL", "LOCAL_SERIAL":
+		c.Database.SerialConsistency = normalizedSerialConsistency
+	default:
+		return fmt.Errorf("database serial_consistency must be SERIAL or LOCAL_SERIAL")
+	}
+	if c.Database.Timeout <= 0 {
+		return fmt.Errorf("database timeout must be greater than zero")
+	}
 	switch normalizedClass := normalizeCassandraReplicationClass(c.Database.ReplicationClass); normalizedClass {
 	case "SimpleStrategy":
 		c.Database.ReplicationClass = normalizedClass
@@ -1459,6 +1492,34 @@ func normalizeCassandraReplicationClass(raw string) string {
 		return "SimpleStrategy"
 	case "networktopologystrategy":
 		return "NetworkTopologyStrategy"
+	default:
+		return strings.TrimSpace(raw)
+	}
+}
+
+func normalizeCassandraConsistency(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "", "local_quorum", "localquorum":
+		return "LOCAL_QUORUM"
+	case "one":
+		return "ONE"
+	case "quorum":
+		return "QUORUM"
+	case "each_quorum", "eachquorum":
+		return "EACH_QUORUM"
+	case "all":
+		return "ALL"
+	default:
+		return strings.TrimSpace(raw)
+	}
+}
+
+func normalizeCassandraSerialConsistency(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "", "serial":
+		return "SERIAL"
+	case "local_serial", "localserial":
+		return "LOCAL_SERIAL"
 	default:
 		return strings.TrimSpace(raw)
 	}

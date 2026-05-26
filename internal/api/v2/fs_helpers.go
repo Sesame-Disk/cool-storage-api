@@ -35,6 +35,11 @@ var ErrLibraryHeadPublicationUnknown = errors.New("library HEAD publication outc
 // ErrStorageQuotaExceeded indicates the caller's storage quota would be exceeded.
 var ErrStorageQuotaExceeded = errors.New("storage quota exceeded")
 
+// ErrBlockMutationOutcomeUnknown indicates a conditional block ref-count
+// mutation may have applied, but the post-error confirmation read could not
+// attribute the visible state to this operation.
+var ErrBlockMutationOutcomeUnknown = errors.New("block ref-count mutation outcome is unknown")
+
 // NewFSHelper creates a new FSHelper instance
 func NewFSHelper(database *db.DB) *FSHelper {
 	return &FSHelper{db: database}
@@ -842,6 +847,99 @@ func (h *FSHelper) markBlockMutationProcessed(operationKey string) (bool, error)
 	`, taskID.String()).ScanCAS(&existingTaskID)
 }
 
+type blockMutationState struct {
+	exists       bool
+	refCount     int
+	sizeBytes    int
+	storageClass string
+	storageKey   string
+}
+
+func isAmbiguousBlockMutationError(err error) bool {
+	var casUnknown gocql.RequestErrCASWriteUnknown
+	var writeTimeout gocql.RequestErrWriteTimeout
+	return errors.As(err, &casUnknown) ||
+		(errors.As(err, &writeTimeout) && strings.EqualFold(strings.TrimSpace(writeTimeout.WriteType), "CAS")) ||
+		errors.Is(err, gocql.ErrTimeoutNoResponse) ||
+		errors.Is(err, gocql.ErrConnectionClosed)
+}
+
+func (h *FSHelper) confirmBlockMutationState(orgID, blockID string) (blockMutationState, error) {
+	state := blockMutationState{}
+	err := h.db.Session().Query(`
+		SELECT ref_count, size_bytes, storage_class, storage_key FROM blocks WHERE org_id = ? AND block_id = ?
+	`, orgID, blockID).Consistency(gocql.Serial).Scan(&state.refCount, &state.sizeBytes, &state.storageClass, &state.storageKey)
+	if err == nil {
+		state.exists = true
+		return state, nil
+	}
+	if errors.Is(err, gocql.ErrNotFound) {
+		return state, nil
+	}
+	return state, err
+}
+
+func resolveIncrementBlockMutationError(blockID string, expectedRefCount int, updateErr error, confirmVisible func() (blockMutationState, error)) (bool, error) {
+	wrapped := fmt.Errorf("conditional block ref-count increment failed for %s: %w", blockID, updateErr)
+	if !isAmbiguousBlockMutationError(updateErr) {
+		return false, wrapped
+	}
+
+	state, confirmErr := confirmVisible()
+	if confirmErr == nil {
+		switch {
+		case !state.exists:
+			log.Printf("[IncrementOrCreateBlock] INFO: ambiguous CAS error for block %s confirmed the row is still missing; retrying", blockID)
+			return true, nil
+		case state.refCount == expectedRefCount-1:
+			log.Printf("[IncrementOrCreateBlock] INFO: ambiguous CAS error for block %s confirmed ref_count remains at %d; retrying", blockID, state.refCount)
+			return true, nil
+		default:
+			log.Printf("[IncrementOrCreateBlock] WARNING: ambiguous CAS error for block %s confirmed ref_count=%d, which cannot be attributed to this operation", blockID, state.refCount)
+			return false, errors.Join(
+				ErrBlockMutationOutcomeUnknown,
+				wrapped,
+				fmt.Errorf("confirmation read found ref_count=%d; cannot attribute the ambiguous increment", state.refCount),
+			)
+		}
+	}
+
+	log.Printf("[IncrementOrCreateBlock] WARNING: ambiguous CAS error for block %s could not be confirmed: %v", blockID, confirmErr)
+	return false, errors.Join(
+		ErrBlockMutationOutcomeUnknown,
+		wrapped,
+		fmt.Errorf("confirmation read failed: %w", confirmErr),
+	)
+}
+
+func resolveInsertBlockMutationError(blockID string, sizeBytes int, storageClass, storageKey string, insertErr error, confirmVisible func() (blockMutationState, error)) (bool, error) {
+	wrapped := fmt.Errorf("conditional block insert failed for %s: %w", blockID, insertErr)
+	if !isAmbiguousBlockMutationError(insertErr) {
+		return false, wrapped
+	}
+
+	state, confirmErr := confirmVisible()
+	if confirmErr == nil {
+		if !state.exists {
+			log.Printf("[IncrementOrCreateBlock] INFO: ambiguous CAS error while inserting block %s confirmed the row is still missing; retrying", blockID)
+			return true, nil
+		}
+		log.Printf("[IncrementOrCreateBlock] WARNING: ambiguous CAS error while inserting block %s confirmed an existing row ref_count=%d size=%d storage_class=%q storage_key=%q, which cannot be attributed to this operation", blockID, state.refCount, state.sizeBytes, state.storageClass, state.storageKey)
+		return false, errors.Join(
+			ErrBlockMutationOutcomeUnknown,
+			wrapped,
+			fmt.Errorf("confirmation read found existing row ref_count=%d size=%d storage_class=%q storage_key=%q; cannot attribute the ambiguous insert", state.refCount, state.sizeBytes, state.storageClass, state.storageKey),
+		)
+	}
+
+	log.Printf("[IncrementOrCreateBlock] WARNING: ambiguous CAS error while inserting block %s could not be confirmed: %v", blockID, confirmErr)
+	return false, errors.Join(
+		ErrBlockMutationOutcomeUnknown,
+		wrapped,
+		fmt.Errorf("confirmation read failed: %w", confirmErr),
+	)
+}
+
 func (h *FSHelper) IncrementOrCreateBlock(orgID, blockID string, sizeBytes int, storageClass, storageKey string) error {
 	const maxRetries = 10
 
@@ -870,7 +968,13 @@ func (h *FSHelper) IncrementOrCreateBlock(orgID, blockID string, sizeBytes int, 
 				WHERE org_id = ? AND block_id = ? IF ref_count = ?
 			`, currentRefCount+1, now, orgID, blockID, currentRefCount).MapScanCAS(map[string]interface{}{})
 			if err != nil {
-				return err
+				retry, resolveErr := resolveIncrementBlockMutationError(blockID, currentRefCount+1, err, func() (blockMutationState, error) {
+					return h.confirmBlockMutationState(orgID, blockID)
+				})
+				if retry {
+					continue
+				}
+				return resolveErr
 			}
 			if applied {
 				return nil
@@ -879,13 +983,23 @@ func (h *FSHelper) IncrementOrCreateBlock(orgID, blockID string, sizeBytes int, 
 			continue
 		}
 
+		if !errors.Is(err, gocql.ErrNotFound) {
+			return fmt.Errorf("failed to read block metadata for %s: %w", blockID, err)
+		}
+
 		// 2. Block doesn't exist — insert fresh
 		applied, err := h.db.Session().Query(`
 			INSERT INTO blocks (org_id, block_id, size_bytes, storage_class, storage_key, ref_count, created_at, last_accessed)
 			VALUES (?, ?, ?, ?, ?, ?, ?, ?) IF NOT EXISTS
 		`, orgID, blockID, sizeBytes, storageClass, storageKey, 1, now, now).MapScanCAS(map[string]interface{}{})
 		if err != nil {
-			return err
+			retry, resolveErr := resolveInsertBlockMutationError(blockID, sizeBytes, storageClass, storageKey, err, func() (blockMutationState, error) {
+				return h.confirmBlockMutationState(orgID, blockID)
+			})
+			if retry {
+				continue
+			}
+			return resolveErr
 		}
 		if applied {
 			return nil
@@ -1066,14 +1180,33 @@ func (h *FSHelper) CopyFSObjectToLibrary(srcRepoID, dstRepoID, fsID string) (str
 	return newDirFSID, nil
 }
 
-// IncrementBlockRefCounts increments ref_count for blocks (for copy)
-func (h *FSHelper) IncrementBlockRefCounts(orgID string, blockIDs []string) error {
-	for _, blockID := range h.resolveStoredBlockIDs(orgID, blockIDs) {
-		if err := h.IncrementOrCreateBlock(orgID, blockID, 0, "", ""); err != nil {
-			continue
+func incrementBlockRefCountsResolved(resolvedBlockIDs []string, increment func(string) error, rollback func([]string)) error {
+	incrementedBlockIDs := make([]string, 0, len(resolvedBlockIDs))
+	for _, blockID := range resolvedBlockIDs {
+		if err := increment(blockID); err != nil {
+			if len(incrementedBlockIDs) > 0 && rollback != nil {
+				rollback(incrementedBlockIDs)
+			}
+			return fmt.Errorf("increment block %s: %w", blockID, err)
 		}
+		incrementedBlockIDs = append(incrementedBlockIDs, blockID)
 	}
 	return nil
+}
+
+// IncrementBlockRefCounts increments ref_count for blocks (for copy)
+func (h *FSHelper) IncrementBlockRefCounts(orgID string, blockIDs []string) error {
+	resolvedBlockIDs := h.resolveStoredBlockIDs(orgID, blockIDs)
+	return incrementBlockRefCountsResolved(
+		resolvedBlockIDs,
+		func(blockID string) error {
+			return h.IncrementOrCreateBlock(orgID, blockID, 0, "", "")
+		},
+		func(incrementedBlockIDs []string) {
+			operationKey := fmt.Sprintf("increment_block_refs_rollback:%s:%d", orgID, time.Now().UnixNano())
+			h.DecrementBlockRefCountsOnce(orgID, operationKey, incrementedBlockIDs)
+		},
+	)
 }
 
 // IncrementBlockRefCountsTracked increments ref_count for blocks (for copy)

@@ -43,6 +43,7 @@ services:
       - CASSANDRA_HOSTS=${CASSANDRA_HOSTS:-cassandra:9042}
       - CASSANDRA_KEYSPACE=${CASSANDRA_KEYSPACE:-sesamefs}
       - CASSANDRA_LOCAL_DC=${CASSANDRA_LOCAL_DC:-datacenter1}
+      # Optional: set CASSANDRA_TIMEOUT in .env to override configs/config.prod.yaml (defaults there to 25s for safer upload/LWT testing)
 
       # Region — leave empty for single-region; set to na/eu/asia in multi-region
       - SERVER_REGION=${SERVER_REGION:-}

@@ -360,6 +360,45 @@ func TestHandleChunkedFinalizeError_ResetsNonConflictState(t *testing.T) {
 	}
 }
 
+func TestHandleChunkedFinalizeError_CleansUpUnknownBlockMutationOutcome(t *testing.T) {
+	oldRollback := rollbackUploadedBlockRefsFn
+	oldCleanup := cleanupChunkUploadFn
+	defer func() {
+		rollbackUploadedBlockRefsFn = oldRollback
+		cleanupChunkUploadFn = oldCleanup
+	}()
+
+	rollbackCalled := false
+	var gotBlockIDs []string
+	cleanupCalled := false
+	rollbackUploadedBlockRefsFn = func(database *db.DB, orgID, repoID, operationKey string, blockIDs []string) {
+		rollbackCalled = true
+		gotBlockIDs = append([]string(nil), blockIDs...)
+	}
+	cleanupChunkUploadFn = func(token, filename string) {
+		cleanupCalled = true
+	}
+
+	h := &SeafHTTPHandler{}
+	token := &AccessToken{OrgID: "org-1", RepoID: "repo-1"}
+	upload := &ChunkUpload{Finalizing: true, accountedBlockPosition: map[int]string{0: "block-a", 1: "block-b"}}
+
+	h.handleChunkedFinalizeError(token, "upload-token", "file.bin", upload, fmt.Errorf("block mutation ambiguous: %w", v2.ErrBlockMutationOutcomeUnknown))
+
+	if !rollbackCalled {
+		t.Fatal("unknown block mutation outcome should roll back previously accounted blocks")
+	}
+	if !reflect.DeepEqual(gotBlockIDs, []string{"block-a", "block-b"}) {
+		t.Fatalf("rollback block IDs = %#v, want %#v", gotBlockIDs, []string{"block-a", "block-b"})
+	}
+	if !cleanupCalled {
+		t.Fatal("unknown block mutation outcome should clean up the tracker")
+	}
+	if !upload.Finalizing {
+		t.Fatal("unknown block mutation outcome should not reset tracker state before cleanup")
+	}
+}
+
 func TestHandleSingleShotMetadataError_RollsBackOnError(t *testing.T) {
 	oldRollback := rollbackUploadedBlockRefsFn
 	defer func() {
@@ -1695,6 +1734,39 @@ func TestChunkUploadAccountBlockOnceSurvivesFinalizeRetry(t *testing.T) {
 	if accounted {
 		t.Fatal("missing block position should not be marked accounted")
 	}
+}
+
+func TestAcquireFinalizeUploadBlockMetadataPermitSerializesCallers(t *testing.T) {
+	releaseFirst, err := acquireFinalizeUploadBlockMetadataPermit(context.Background())
+	if err != nil {
+		t.Fatalf("first acquire failed: %v", err)
+	}
+	releasedFirst := false
+	defer func() {
+		if !releasedFirst {
+			releaseFirst()
+		}
+	}()
+
+	blockedCtx, cancelBlocked := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancelBlocked()
+	releaseSecond, err := acquireFinalizeUploadBlockMetadataPermit(blockedCtx)
+	if releaseSecond != nil {
+		releaseSecond()
+		t.Fatal("second acquire should not succeed while first permit is held")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("second acquire error = %v, want context deadline exceeded while blocked", err)
+	}
+
+	releaseFirst()
+	releasedFirst = true
+
+	releaseSecond, err = acquireFinalizeUploadBlockMetadataPermit(context.Background())
+	if err != nil {
+		t.Fatalf("second acquire failed after release: %v", err)
+	}
+	releaseSecond()
 }
 
 func TestChunkUploadQuotaPrecheckCacheMatchesMetadata(t *testing.T) {

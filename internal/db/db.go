@@ -3,7 +3,9 @@ package db
 import (
 	"context"
 	"fmt"
+	"log"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -11,10 +13,22 @@ import (
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
 )
 
+const defaultCassandraTimeout = 10 * time.Second
+
 // DB wraps the Cassandra session.
 type DB struct {
 	session *gocql.Session
 	config  config.DatabaseConfig
+}
+
+type cassandraKeyspaceMetadata struct {
+	Exists      bool
+	Replication cassandraReplicationSettings
+}
+
+type cassandraReplicationSettings struct {
+	Class   string
+	Options map[string]string
 }
 
 // New creates a new database connection.
@@ -28,12 +42,12 @@ func New(cfg config.DatabaseConfig) (*DB, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to Cassandra: %w", err)
 	}
-	keyspaceExists, err := keyspaceExists(bootstrapSession, cfg.Keyspace)
+	keyspaceMeta, err := loadKeyspaceMetadata(bootstrapSession, cfg.Keyspace)
 	if err != nil {
 		bootstrapSession.Close()
 		return nil, fmt.Errorf("failed to inspect Cassandra keyspace %s: %w", cfg.Keyspace, err)
 	}
-	if !keyspaceExists {
+	if !keyspaceMeta.Exists {
 		bootstrapSession.Close()
 		return nil, missingKeyspaceError(cfg.Keyspace)
 	}
@@ -42,6 +56,7 @@ func New(cfg config.DatabaseConfig) (*DB, error) {
 	// Reconnect with the keyspace set.
 	cluster := newCluster(cfg)
 	cluster.Keyspace = cfg.Keyspace
+	logCassandraRuntimeConfig(cfg, cluster, keyspaceMeta)
 	session, err := cluster.CreateSession()
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to Cassandra keyspace %s: %w", cfg.Keyspace, err)
@@ -50,19 +65,23 @@ func New(cfg config.DatabaseConfig) (*DB, error) {
 	return &DB{session: session, config: cfg}, nil
 }
 
-func keyspaceExists(session *gocql.Session, keyspace string) (bool, error) {
+func loadKeyspaceMetadata(session *gocql.Session, keyspace string) (cassandraKeyspaceMetadata, error) {
 	var existing string
+	replication := map[string]string{}
 	err := session.Query(
-		`SELECT keyspace_name FROM system_schema.keyspaces WHERE keyspace_name = ? LIMIT 1`,
+		`SELECT keyspace_name, replication FROM system_schema.keyspaces WHERE keyspace_name = ? LIMIT 1`,
 		keyspace,
-	).Consistency(gocql.One).Scan(&existing)
+	).Consistency(gocql.One).Scan(&existing, &replication)
 	if err == gocql.ErrNotFound {
-		return false, nil
+		return cassandraKeyspaceMetadata{}, nil
 	}
 	if err != nil {
-		return false, err
+		return cassandraKeyspaceMetadata{}, err
 	}
-	return existing == keyspace, nil
+	return cassandraKeyspaceMetadata{
+		Exists:      existing == keyspace,
+		Replication: parseSystemKeyspaceReplication(replication),
+	}, nil
 }
 
 func missingKeyspaceError(keyspace string) error {
@@ -73,8 +92,13 @@ func missingKeyspaceError(keyspace string) error {
 func newCluster(cfg config.DatabaseConfig) *gocql.ClusterConfig {
 	cluster := gocql.NewCluster(cfg.Hosts...)
 	cluster.Consistency = parseConsistency(cfg.Consistency)
-	cluster.Timeout = 10 * time.Second
-	cluster.ConnectTimeout = 10 * time.Second
+	cluster.SerialConsistency = parseSerialConsistency(cfg.SerialConsistency)
+	queryTimeout := cfg.Timeout
+	if queryTimeout <= 0 {
+		queryTimeout = defaultCassandraTimeout
+	}
+	cluster.Timeout = queryTimeout
+	cluster.ConnectTimeout = defaultCassandraTimeout
 
 	if cfg.LocalDC != "" {
 		cluster.PoolConfig.HostSelectionPolicy = gocql.DCAwareRoundRobinPolicy(cfg.LocalDC)
@@ -87,6 +111,156 @@ func newCluster(cfg config.DatabaseConfig) *gocql.ClusterConfig {
 	}
 
 	return cluster
+}
+
+func logCassandraRuntimeConfig(cfg config.DatabaseConfig, cluster *gocql.ClusterConfig, keyspaceMeta cassandraKeyspaceMetadata) {
+	configuredReplication := configuredReplicationSettings(cfg)
+	actualReplication := configuredReplication
+	actualReplicationSource := "configured"
+	if keyspaceMeta.Exists {
+		actualReplication = keyspaceMeta.Replication
+		actualReplicationSource = "keyspace"
+	}
+
+	hostSelection := "token-aware round robin"
+	if strings.TrimSpace(cfg.LocalDC) != "" {
+		hostSelection = fmt.Sprintf("dc-aware round robin (local_dc=%s)", strings.TrimSpace(cfg.LocalDC))
+	}
+
+	log.Printf(
+		"[db] Cassandra runtime config: hosts=%s keyspace=%s consistency=%s serial_consistency=%s timeout=%s connect_timeout=%s local_dc=%q configured_replication_class=%s configured_replication=%s actual_replication_source=%s actual_replication_class=%s actual_replication=%s host_selection=%s",
+		strings.Join(cfg.Hosts, ","),
+		cfg.Keyspace,
+		cluster.Consistency.String(),
+		cluster.SerialConsistency.String(),
+		cluster.Timeout,
+		cluster.ConnectTimeout,
+		cfg.LocalDC,
+		configuredReplication.Class,
+		formatReplicationOptions(configuredReplication.Options),
+		actualReplicationSource,
+		actualReplication.Class,
+		formatReplicationOptions(actualReplication.Options),
+		hostSelection,
+	)
+
+	if keyspaceMeta.Exists && !sameReplicationSettings(configuredReplication, actualReplication) {
+		log.Printf(
+			"[db] WARNING: Cassandra keyspace replication differs from configured replication: configured_class=%s configured_replication=%s actual_class=%s actual_replication=%s",
+			configuredReplication.Class,
+			formatReplicationOptions(configuredReplication.Options),
+			actualReplication.Class,
+			formatReplicationOptions(actualReplication.Options),
+		)
+	}
+
+	if cluster.SerialConsistency == gocql.LocalSerial && isMultiRegionNetworkTopology(actualReplication) {
+		log.Printf(
+			"[db] WARNING: serial_consistency=LOCAL_SERIAL with multi-region %s replication (%s %s); LWT/CAS will only serialize within the local DC",
+			actualReplicationSource,
+			actualReplication.Class,
+			formatReplicationOptions(actualReplication.Options),
+		)
+	}
+}
+
+func configuredReplicationSettings(cfg config.DatabaseConfig) cassandraReplicationSettings {
+	class := normalizeReplicationClass(cfg.ReplicationClass)
+	options := map[string]string{}
+
+	switch class {
+	case "", "NetworkTopologyStrategy":
+		class = "NetworkTopologyStrategy"
+		if len(cfg.ReplicationDCs) == 0 {
+			if localDC := strings.TrimSpace(cfg.LocalDC); localDC != "" {
+				options[localDC] = "1"
+			}
+		} else {
+			for dc, rf := range cfg.ReplicationDCs {
+				options[dc] = strconv.Itoa(rf)
+			}
+		}
+	case "SimpleStrategy":
+		if cfg.ReplicationFactor > 0 {
+			options["replication_factor"] = strconv.Itoa(cfg.ReplicationFactor)
+		}
+	default:
+		class = strings.TrimSpace(cfg.ReplicationClass)
+		for dc, rf := range cfg.ReplicationDCs {
+			options[dc] = strconv.Itoa(rf)
+		}
+		if cfg.ReplicationFactor > 0 {
+			options["replication_factor"] = strconv.Itoa(cfg.ReplicationFactor)
+		}
+	}
+
+	return cassandraReplicationSettings{
+		Class:   class,
+		Options: options,
+	}
+}
+
+func parseSystemKeyspaceReplication(replication map[string]string) cassandraReplicationSettings {
+	options := make(map[string]string, len(replication))
+	for key, value := range replication {
+		normalizedKey := strings.TrimSpace(key)
+		if normalizedKey == "" || strings.EqualFold(normalizedKey, "class") {
+			continue
+		}
+		options[normalizedKey] = strings.TrimSpace(value)
+	}
+	return cassandraReplicationSettings{
+		Class:   normalizeReplicationClass(replication["class"]),
+		Options: options,
+	}
+}
+
+func normalizeReplicationClass(raw string) string {
+	normalized := strings.ToLower(strings.TrimSpace(raw))
+	switch {
+	case normalized == "":
+		return ""
+	case normalized == "networktopologystrategy", strings.HasSuffix(normalized, ".networktopologystrategy"):
+		return "NetworkTopologyStrategy"
+	case normalized == "simplestrategy", strings.HasSuffix(normalized, ".simplestrategy"):
+		return "SimpleStrategy"
+	default:
+		return strings.TrimSpace(raw)
+	}
+}
+
+func formatReplicationOptions(options map[string]string) string {
+	if len(options) == 0 {
+		return ""
+	}
+	keys := make([]string, 0, len(options))
+	for key := range options {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, key := range keys {
+		parts = append(parts, fmt.Sprintf("%s:%s", key, options[key]))
+	}
+	return strings.Join(parts, ",")
+}
+
+func sameReplicationSettings(a, b cassandraReplicationSettings) bool {
+	return a.Class == b.Class && formatReplicationOptions(a.Options) == formatReplicationOptions(b.Options)
+}
+
+func isMultiRegionNetworkTopology(replication cassandraReplicationSettings) bool {
+	if normalizeReplicationClass(replication.Class) != "NetworkTopologyStrategy" {
+		return false
+	}
+	dcs := 0
+	for key := range replication.Options {
+		if strings.EqualFold(strings.TrimSpace(key), "replication_factor") {
+			continue
+		}
+		dcs++
+	}
+	return dcs > 1
 }
 
 // Close closes the database connection.
@@ -117,7 +291,7 @@ func (db *DB) Migrate() error {
 
 // parseConsistency converts a string to a gocql.Consistency level.
 func parseConsistency(s string) gocql.Consistency {
-	switch s {
+	switch strings.ToUpper(strings.TrimSpace(s)) {
 	case "ONE":
 		return gocql.One
 	case "QUORUM":
@@ -130,6 +304,17 @@ func parseConsistency(s string) gocql.Consistency {
 		return gocql.All
 	default:
 		return gocql.LocalQuorum
+	}
+}
+
+func parseSerialConsistency(s string) gocql.Consistency {
+	switch strings.ToUpper(strings.TrimSpace(s)) {
+	case "LOCAL_SERIAL":
+		return gocql.LocalSerial
+	case "", "SERIAL":
+		return gocql.Serial
+	default:
+		return gocql.Serial
 	}
 }
 

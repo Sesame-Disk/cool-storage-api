@@ -1,6 +1,6 @@
 # Known Issues - SesameFS
 
-**Last Updated**: 2026-05-22
+**Last Updated**: 2026-05-26
 
 This document tracks all known bugs, limitations, and issues in SesameFS.
 
@@ -44,6 +44,8 @@ This document tracks all known bugs, limitations, and issues in SesameFS.
 | **Quota Enforcement Coverage Gaps in V2 Mutations** | ✅ Fixed (2026-05-14) | The affected non-upload mutation handlers now have visible-delta quota wiring. Deleted file/folder restore remains bounded by configured history retention, deleted-library restore remains bounded by trash retention, and cross-repo move still relies on split-phase destination publish plus source removal. Split-phase publish/counter atomicity remains documented as technical debt (§12d/§12e). See ISSUE-QUOTA-COVERAGE-01 below. |
 | **Concurrent Hard-Quota Reservation Hardening** | 🟡 Deferred to separate branch | The existing split pre-check → publish → counter-adjust window is still open. A canonical-row reservation prototype was audited and is not merge-ready for PR61 because it leaks reservations on finalize failure, regresses soft-policy evaluation, races with admin resync, and only hardens `seafhttp`. A smaller safe fix now caches repeated chunk prechecks per upload tracker, but that is not reservation hardening. See ISSUE-QUOTA-RESERVATION-01 below. |
 | **Chunked Upload Traffic Accounting Semantics** | 🟡 Accepted debt | Web chunked uploads now pre-check traffic against the declared `Content-Range` total, and repeated storage prechecks no longer walk HEAD on every chunk, but traffic is still recorded only after successful finalize. Abandoned chunk sessions can consume bandwidth without advancing counters. See ISSUE-CHUNKED-UPLOAD-TRAFFIC-01 below. |
+| **Block Refcount Idempotence After Ambiguous CAS** | 🟡 Accepted hotfix debt | Upload/sync block registration now fails closed when Cassandra cannot attribute an LWT outcome, but client retries can still inflate `blocks.ref_count` because block registration has no durable idempotency key yet. See ISSUE-BLOCK-REFCOUNT-IDEMPOTENCE-01 below. |
+| **`blocks` Hot Partition by `org_id`** | 🟡 Accepted schema debt | `PRIMARY KEY ((org_id), block_id)` concentrates all block refcount LWTs for one tenant into one Cassandra partition. In multiregion, that turns Paxos contention into a schema bottleneck, not just a retry-policy problem. See ISSUE-BLOCKS-HOT-PARTITION-01 below. |
 
 ### 🟡 SeaDrive 3.x Missing Endpoints (Non-fatal, but degrade UX)
 | Issue | Status | Notes |
@@ -437,6 +439,112 @@ What is still missing is traffic-accounting coverage for abandoned or failed chu
 
 - `docs/TECHNICAL-DEBT.md`
 - `docs/QUOTAS-AND-TRAFFIC-PLAN.md`
+
+---
+
+### ISSUE-BLOCK-REFCOUNT-IDEMPOTENCE-01: Ambiguous `blocks` LWT Outcomes Can Still Leak Refcounts Across Retries
+
+**Status**: 🟡 Accepted hotfix debt / pending hardening (2026-05-26)
+**Severity**: Medium-High operational risk — current behavior prefers fail-closed and no unsafe rollback, but some retry paths can still inflate `blocks.ref_count`
+**Affected**: `IncrementOrCreateBlock`, sync `PUT /seafhttp/repo/:repo_id/block/:block_id`, seafhttp upload finalize paths, future block-ref accounting callers
+
+#### Current Behavior
+
+`resolveIncrementBlockMutationError()` and `resolveInsertBlockMutationError()` now treat a confirmation read that sees the "expected" post-LWT state as **unknown outcome**, not success, unless the mutation can be attributed unambiguously.
+
+This is deliberate. It avoids two unsafe behaviors:
+
+- returning false-success after Cassandra may have rejected the write and another writer happened to produce the same visible state;
+- rolling back a block refcount mutation that may already be visible and legitimately referenced.
+
+The hotfix also reduces the main production trigger by serializing chunked `blocks`-table metadata LWTs per process (`finalizeUploadBlockMetadataConcurrency = 1`) and by documenting the required multiregion runtime contract (`SERIAL`, higher Cassandra timeout, slow-query monitoring).
+
+#### Remaining Risk
+
+The flow is still not fully idempotent across client retries.
+
+- **Sync `PutBlock`** now returns `500` when `IncrementOrCreateBlock` cannot prove the outcome. If the first LWT actually applied but the client lost the ACK, a client retry can re-run the same block registration and increment the refcount again.
+- **Chunked upload finalize** now cleans up the tracker on `ErrBlockMutationOutcomeUnknown` and only rolls back the blocks that were already accounted before the ambiguous block. That is the safe choice against data loss, but a full re-upload can still increment the ambiguous block again.
+- **Single-shot/direct upload paths** also fail closed on ambiguous block registration, so they share the same leak-vs-false-success tradeoff.
+
+The current branch therefore fixes the production outage class better than `main`, but it does **not** yet provide a fully idempotent block-registration contract under ambiguous Paxos outcomes.
+
+#### What Is Already Narrowed
+
+- Copy/move code paths that need rollback already use `IncrementBlockRefCountsTracked()` so they receive the exact list of confirmed increments to unwind on publish failure.
+- The older `IncrementBlockRefCounts()` helper now attempts rollback of previously confirmed increments before returning an error. That narrows the partial-progress footgun, but rollback is still best-effort because `DecrementBlockRefCountsOnce()` does not surface a rollback error back to the caller.
+- The new chunked-upload permit is intentionally only a **process-local** pressure valve. It lowers the chance of `blocks`-table Paxos storms from one finalize wave, but it is not cluster-wide serialization.
+- The current audit did **not** confirm a same-finalize self-deadlock from that permit: each block acquires/releases it inside its own block goroutine. The remaining gap is coverage, not a confirmed blocker — the suite still lacks a chunked upload test that forces `finalizeUploadStreaming()` through a file larger than `uploadBlockSize` while `finalizeUploadBlockMetadataConcurrency = 1`.
+
+#### What Would Fully Close It
+
+A complete fix needs durable idempotency or reconciliation around block registration itself, for example:
+
+- a per-operation idempotency key stored with the block mutation so client retries can be deduplicated;
+- a durable pending-upload/block-promotion row that can reconcile ambiguous mutations after the fact;
+- or a reconciler that recomputes/refines `blocks.ref_count` from published commit reachability rather than trusting every upload-time increment as final truth.
+
+Until then, treat this as accepted hotfix debt: safer than false-success/data loss, but still capable of temporary or permanent refcount inflation under lost-ACK retry scenarios.
+
+#### Design Directions To Keep Explicit
+
+- **Option B: keep a mutable `ref_count`, but mutate it only with CAS/LWT**. This is the classical optimistic-concurrency pattern already used here: read the current value, compute the next value, and `UPDATE ... IF ref_count = <value_read>`. It is correct and safe, but expensive in multiregion because every conflict resolution rides cross-DC Paxos on a shared row.
+- **Option C: stop storing a mutable counter and model references as rows**. Instead of one `blocks.ref_count` integer, store one row per `(block_id, referrer)` and make reference add/remove be `INSERT`/`DELETE` on distinct rows. That removes most writer-vs-writer collisions at the modeling level and makes the GC ask "do any reference rows still exist?" instead of trusting a hot mutable integer.
+- **Recommended direction for a future branch**: use row-per-reference where it is practical, and keep expensive LWT only for the irreversible moment when GC is about to delete from S3. In other words: design the steady state so concurrent writers stop colliding, and spend Paxos only at the final safety gate where a mistake would destroy data.
+
+#### Related Docs
+
+- `docs/TECHNICAL-DEBT.md`
+- `docs/DEPLOY.md`
+
+---
+
+### ISSUE-BLOCKS-HOT-PARTITION-01: `blocks` Uses `org_id` As the Sole Partition Key
+
+**Status**: 🟡 Accepted schema debt / future schema branch (2026-05-26)
+**Severity**: High operational risk under load — this amplifies Paxos contention, slow queries, and tail latency well before the logical refcount algorithm itself becomes the only problem
+**Affected**: `blocks`, block-refcount LWTs, upload finalize, sync `PutBlock`, GC delete guard, multiregion deployments
+
+#### Current Schema
+
+The current `blocks` table is keyed as `PRIMARY KEY ((org_id), block_id)` in `internal/db/migrations/001_initial_schema.cql`.
+
+That means all block-refcount LWT activity for one organization lands in the same Cassandra partition. In a multiregion deployment, every upload/copy/delete/GC refcount mutation for that org is contending on the same partition-local Paxos hotspot.
+
+This is especially important for the reserved platform org (`00000000-0000-0000-0000-000000000000`): it turns the problem from a rare tenant-specific outlier into a central hot partition for shared/system traffic.
+
+#### Why This Matters
+
+- the current CAS/LWT logic can be locally correct and still suffer operationally because the shared row family is partition-hot;
+- retry tuning and per-process throttling can reduce symptoms, but they do not change the fact that the partition key has low cardinality for this workload;
+- cross-region Paxos cost becomes more visible when many unrelated blocks for the same org are forced through one partition boundary.
+
+#### Direction For A Future Schema Branch
+
+The long-term fix is to choose a higher-cardinality partition key that matches bounded query shapes instead of partitioning all block traffic by org.
+
+Examples worth evaluating against the real access patterns:
+
+- partition by `file_id` if the common read shape is "load the blocks for one file";
+- use a composite key such as `(org_id, file_id)` so the org remains part of the logical key while the physical data fans out across many partitions;
+- use `(org_id, bucket)` or another sharded key if block lookup patterns need org scoping but require more even write distribution.
+
+The rule of thumb is simple: the partition key should have thousands or millions of distinct values and each query should touch one bounded slice at a time. `org_id` alone fails that rule for `blocks`.
+
+#### Connection To Refcount Redesign
+
+This schema debt and the refcount-model debt reinforce each other.
+
+- If the system keeps a mutable per-block counter on a row keyed by org, multiregion Paxos remains concentrated on a hot shared partition.
+- If a future branch moves to row-per-reference modeling, it should also revisit the partitioning strategy so those reference rows distribute naturally instead of recreating the same hotspot with a different payload.
+
+Treat this as part of a broader Cassandra schema-shaping backlog. There are likely other hot partitions and query-path bottlenecks to audit, but this one is already tied directly to the current production upload incident class.
+
+#### Related Docs
+
+- `docs/TECHNICAL-DEBT.md`
+- `docs/DATABASE-GUIDE.md`
+- `docs/ARCHITECTURE.md`
 
 ---
 

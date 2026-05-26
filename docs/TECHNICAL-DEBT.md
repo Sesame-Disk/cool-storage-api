@@ -1348,6 +1348,145 @@ default compose `test` profile using `SESAMEFS_URL`, `SESAMEFS_URL_2`, and
 `SESAMEFS_URL_3`, before any launch claim depends on strict active-active quota
 enforcement.
 
+### 19.p. Ambiguous `blocks` LWT Outcomes Still Lack Durable Idempotence
+
+The upload/sync hotfix intentionally changed `resolveIncrementBlockMutationError`
+and `resolveInsertBlockMutationError` to return
+`ErrBlockMutationOutcomeUnknown` when Cassandra shows a visible post-LWT state
+but the request cannot prove that **this** operation produced it.
+
+That is the safer correctness stance for this branch:
+
+- do not claim success when another writer may have produced the same visible
+  state;
+- do not roll back a refcount mutation that may already be visible and
+  referenced by a later successful publish.
+
+The cost is idempotence debt across client retries:
+
+- `internal/api/sync.go` now returns `500` from `PutBlock` when
+  `IncrementOrCreateBlock` cannot attribute the LWT outcome. If the first LWT
+  actually applied but the ACK was lost, a client retry can increment the same
+  block again.
+- chunked `seafhttp` finalize now drops the tracker and rolls back only the
+  blocks that were already accounted before the ambiguous block. That avoids
+  unsafe rollback of the ambiguous current block, but a full re-upload can
+  still increment it again.
+- single-shot/direct upload seams share the same fail-closed tradeoff.
+
+This is accepted hotfix debt, not a reason to keep the old behavior. The old
+behavior could continue to publish metadata after failing to confirm the block
+row. The current branch instead chooses "fail closed, no unsafe rollback" over
+false success. The residual failure mode is refcount inflation / delayed GC,
+not immediate data loss.
+
+The copy/move surface is narrower than the generic upload surface:
+
+- active publish paths already use `IncrementBlockRefCountsTracked()` and roll
+  back the exact confirmed subset on failure;
+- the older `IncrementBlockRefCounts()` wrapper now attempts rollback of the
+  previously confirmed subset before returning an error. That narrows the old
+  partial-progress footgun, but rollback is still best-effort because the
+  `DecrementBlockRefCountsOnce()` path does not propagate a rollback failure
+  back to the caller. A later hardening branch should either remove this
+  generic wrapper or make rollback failures visible/retryable.
+
+What would fully close this debt is durable idempotency or reconciliation at
+the block-registration layer itself: an operation key persisted with the block
+mutation, a pending-upload/block-promotion table that can reconcile ambiguous
+outcomes, or a later refcount repair pass derived from published commit
+reachability.
+
+This should stay framed against the two viable design directions:
+
+- **Option B: mutable refcount with CAS/LWT**. Read the current `ref_count`,
+  compute the new value, and `UPDATE ... IF ref_count = <value_read>`. This is
+  the classic optimistic-concurrency approach. It is correct and safe, and it
+  is acceptable when the business cost of a mistake is data loss. The downside
+  is that in multiregion it pays full cross-DC Paxos on every contended write.
+- **Option C: references as rows rather than a mutable integer**. Store one row
+  per `(block_id, referrer)` and make add/remove be `INSERT`/`DELETE` of those
+  rows. That removes most writer collisions at the modeling layer instead of
+  trying to resolve them later on one hot counter row.
+
+The strongest future direction is likely a hybrid: use row-per-reference where
+the steady-state workload can tolerate it, and keep expensive LWT only at the
+irreversible GC moment when the system is about to delete from S3 and must prove
+that no live references remain.
+
+### 19.q. Chunked Block-Metadata LWT Throttling Is Process-Local, Not Cluster-Wide
+
+`internal/api/seafhttp.go` now gates chunked finalize block-metadata writes with
+`finalizeUploadBlockMetadataConcurrency = 1`. This directly targets the prod
+incident class where one finalize wave fans out many concurrent
+`IncrementOrCreateBlock` Paxos rounds and triggers Cassandra slow-query / CAS
+timeout logs.
+
+That gate is intentionally narrow:
+
+- it only serializes block-metadata LWTs inside one SesameFS process;
+- it does not coordinate across replicas, regions, sync `PutBlock`, direct v2
+  uploads, or copy/move block-pin paths;
+- real cross-process serialization still relies on Cassandra `SERIAL`,
+  appropriate `CASSANDRA_TIMEOUT`, and deployment topology choices.
+
+This is still worth shipping because it reduces the hottest self-inflicted
+pressure source without changing protocol semantics. It should just stay
+documented as an operational mitigation, not as a full correctness guarantee.
+
+The current audit did **not** confirm the feared same-finalize self-deadlock.
+`finalizeUploadStreaming()` spawns one goroutine per block, and each block
+goroutine acquires the metadata permit once, runs `AccountBlockOnce(...)`, and
+releases the permit when that goroutine returns. There is no current code path
+where one block goroutine acquires a second permit before releasing the first.
+
+The remaining debt here is coverage rather than a confirmed correctness bug.
+Current tests prove:
+
+- the permit primitive blocks a second caller while the first holds it;
+- chunked HTTP upload flows still round-trip and recover from known finalize
+  conflicts.
+
+What is still missing is the integration test that forces
+`finalizeUploadStreaming()` down the true multi-block path with a file larger
+than `uploadBlockSize` while `finalizeUploadBlockMetadataConcurrency = 1`.
+That test should exist before future refactors rely on the throttle as a stable
+invariant.
+
+### 19.r. `blocks` Is Hot-Partitioned By `org_id`
+
+`internal/db/migrations/001_initial_schema.cql` defines `blocks` as
+`PRIMARY KEY ((org_id), block_id)`. That means all block refcount writes for one
+organization land in the same Cassandra partition.
+
+For this workload, that is a classic schema anti-pattern:
+
+- the partition key has low cardinality relative to traffic volume;
+- each org can accumulate a very large block working set;
+- multiregion CAS/LWT then concentrates cross-DC Paxos on one partition rather
+  than distributing it across many independent keys.
+
+The platform/system org makes this more serious than a theoretical tenant edge
+case. Shared/system flows can end up hammering one central partition
+(`00000000-0000-0000-0000-000000000000`) even before the per-row refcount logic
+itself is the limiting factor.
+
+The future schema branch should evaluate higher-cardinality partitioning that
+matches the real bounded query shape, for example:
+
+- `file_id` if the natural read pattern is one file at a time;
+- `(org_id, file_id)` if org scoping matters but physical fan-out is needed;
+- `(org_id, bucket)` or another sharded key if org-local lookup must remain but
+  write distribution is the first concern.
+
+The rule is to partition by something with many distinct values where each query
+touches one bounded slice. `org_id` alone does not satisfy that rule for
+block-heavy traffic.
+
+This should be treated as part of a broader DB-schema bottleneck audit in future
+branches, not as an isolated tuning ticket. The current upload incident just
+made this particular hotspot visible first.
+
 ---
 
-*Last updated: 2026-05-20*
+*Last updated: 2026-05-26*
