@@ -83,6 +83,19 @@ var (
 		},
 	)
 
+	// GCZeroRefEnqueueFailuresTotal counts decrement-to-zero events whose
+	// EnsureBlockGCCandidate or follow-up queue insert failed. The blocks
+	// schema refactor removed the per-org partition scan backfill, so a
+	// non-zero value here is the only signal that a block hit ref_count=0
+	// without being enqueued. Alert on sustained increase.
+	GCZeroRefEnqueueFailuresTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "gc_zero_ref_enqueue_failures_total",
+			Help: "Number of zero-refcount blocks that failed to enqueue into gc_block_candidates. Sustained values indicate lost-to-GC blocks.",
+		},
+		[]string{"stage"},
+	)
+
 	// GCLastWorkerRun records the Unix timestamp of the last worker pass.
 	GCLastWorkerRun = prometheus.NewGauge(
 		prometheus.GaugeOpts{
@@ -308,6 +321,7 @@ func Register() {
 		GCScannerActionsTotal,
 		GCErrorsTotal,
 		GCItemsSkippedTotal,
+		GCZeroRefEnqueueFailuresTotal,
 		GCLastWorkerRun,
 		GCLastScannerRun,
 		GCScannerLastPhaseRun,

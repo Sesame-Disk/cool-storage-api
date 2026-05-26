@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Sesame-Disk/sesamefs/internal/db"
 	"github.com/Sesame-Disk/sesamefs/internal/metrics"
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
 	"github.com/google/uuid"
@@ -467,7 +468,11 @@ func (w *Worker) deleteS3WithRetry(ctx context.Context, blockStore BlockStoreDel
 // RecoverS3Orphans retries S3 deletes for orphan rows in gc_s3_orphans.
 // Called by the scanner; exposed on the worker because it needs access to
 // w.storage. Returns the number of orphans successfully recovered.
-func (w *Worker) RecoverS3Orphans(ctx context.Context, perOrgLimit int) (int, error) {
+//
+// Walks the gc_s3_orphans_by_day discovery projection across the last
+// gcS3OrphanRecoveryLookbackDays. `perBucketLimit` caps the rows pulled per
+// (day, bucket) so a single misbehaving day cannot starve the worker.
+func (w *Worker) RecoverS3Orphans(ctx context.Context, perBucketLimit int) (int, error) {
 	if w.storage == nil {
 		return 0, nil
 	}
@@ -475,60 +480,71 @@ func (w *Worker) RecoverS3Orphans(ctx context.Context, perOrgLimit int) (int, er
 		log.Println("[GC Worker] DRY RUN: skipping S3 orphan recovery")
 		return 0, nil
 	}
-	orgs, err := w.store.ListS3OrphanOrgs()
-	if err != nil {
-		return 0, fmt.Errorf("failed to list S3 orphan orgs: %w", err)
+	if perBucketLimit <= 0 {
+		perBucketLimit = 100
 	}
+
+	cutoffDay := db.GCProjectionUTCDate(w.clock())
+	startDay := cutoffDay.AddDate(0, 0, -gcS3OrphanRecoveryLookbackDays)
+
 	recovered := 0
-	for _, orgID := range orgs {
-		select {
-		case <-ctx.Done():
-			return recovered, ctx.Err()
-		default:
-		}
-		orphans, err := w.store.ListS3Orphans(orgID, perOrgLimit)
-		if err != nil {
-			log.Printf("[GC Worker] Failed to list S3 orphans for org %s: %v", orgID, err)
-			continue
-		}
-		for _, orph := range orphans {
+	for day := startDay; !day.After(cutoffDay); day = day.AddDate(0, 0, 1) {
+		for bucket := 0; bucket < db.GCDiscoveryBucketCount; bucket++ {
 			select {
 			case <-ctx.Done():
 				return recovered, ctx.Err()
 			default:
 			}
-			if _, err := w.store.GetBlockRefCount(orph.OrgID, orph.BlockID); err == nil {
-				// The canonical block row still exists (likely claimed but not yet finalized).
-				// Skip recovery for now; a later worker retry or startup scan will finish it.
-				continue
-			}
 
-			storageClass := orph.StorageClass
-			if storageClass == "" {
-				storageClass = "hot"
-			}
-			blockStore, err := w.storage.GetBlockStore(storageClass)
+			orphans, err := w.store.ListS3OrphansByDay(day, bucket, perBucketLimit)
 			if err != nil {
-				log.Printf("[GC Worker] S3 orphan recovery: get block store for class %s failed: %v", storageClass, err)
+				log.Printf("[GC Worker] S3 orphan recovery: list failed for day=%s bucket=%d: %v", db.GCProjectionDateString(day), bucket, err)
 				continue
 			}
-			if err := blockStore.DeleteBlock(ctx, orph.BlockID); err != nil {
-				if updErr := w.store.UpdateS3OrphanAttempt(orph.OrgID, orph.BlockID, err.Error(), w.clock()); updErr != nil {
-					log.Printf("[GC Worker] S3 orphan recovery: update attempt for %s failed: %v", orph.BlockID, updErr)
+			for _, orph := range orphans {
+				select {
+				case <-ctx.Done():
+					return recovered, ctx.Err()
+				default:
 				}
-				continue
+				if _, err := w.store.GetBlockRefCount(orph.OrgID, orph.BlockID); err == nil {
+					// The canonical block row still exists (likely claimed but not yet finalized).
+					// Skip recovery for now; a later worker retry or startup scan will finish it.
+					continue
+				}
+
+				storageClass := orph.StorageClass
+				if storageClass == "" {
+					storageClass = "hot"
+				}
+				blockStore, err := w.storage.GetBlockStore(storageClass)
+				if err != nil {
+					log.Printf("[GC Worker] S3 orphan recovery: get block store for class %s failed: %v", storageClass, err)
+					continue
+				}
+				if err := blockStore.DeleteBlock(ctx, orph.BlockID); err != nil {
+					if updErr := w.store.UpdateS3OrphanAttempt(orph.OrgID, orph.BlockID, err.Error(), w.clock()); updErr != nil {
+						log.Printf("[GC Worker] S3 orphan recovery: update attempt for %s failed: %v", orph.BlockID, updErr)
+					}
+					continue
+				}
+				if err := w.store.DeleteS3Orphan(orph.OrgID, orph.BlockID); err != nil {
+					log.Printf("[GC Worker] S3 orphan recovery: failed to clear orphan row %s: %v", orph.BlockID, err)
+					continue
+				}
+				recovered++
+				metrics.GCAuditEventsTotal.WithLabelValues("gc_s3_orphan_recovered").Inc()
+				log.Printf("[GC Worker] Recovered S3 orphan %s (org=%s, retries=%d)", orph.BlockID, orph.OrgID, orph.RetryCount)
 			}
-			if err := w.store.DeleteS3Orphan(orph.OrgID, orph.BlockID); err != nil {
-				log.Printf("[GC Worker] S3 orphan recovery: failed to clear orphan row %s: %v", orph.BlockID, err)
-				continue
-			}
-			recovered++
-			metrics.GCAuditEventsTotal.WithLabelValues("gc_s3_orphan_recovered").Inc()
-			log.Printf("[GC Worker] Recovered S3 orphan %s (org=%s, retries=%d)", orph.BlockID, orph.OrgID, orph.RetryCount)
 		}
 	}
 	return recovered, nil
 }
+
+// gcS3OrphanRecoveryLookbackDays bounds how many past days the worker walks
+// when retrying S3 deletes. The schema TTLs gc_s3_orphans at 90 days; a 14-day
+// window matches the GC retry budget while keeping per-pass work bounded.
+const gcS3OrphanRecoveryLookbackDays = 14
 
 func (w *Worker) processCommit(item QueueItem) error {
 	// Get the commit to find its root_fs_id for cascading deletion

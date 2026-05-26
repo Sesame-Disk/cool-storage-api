@@ -45,7 +45,7 @@ This document tracks all known bugs, limitations, and issues in SesameFS.
 | **Concurrent Hard-Quota Reservation Hardening** | 🟡 Deferred to separate branch | The existing split pre-check → publish → counter-adjust window is still open. A canonical-row reservation prototype was audited and is not merge-ready for PR61 because it leaks reservations on finalize failure, regresses soft-policy evaluation, races with admin resync, and only hardens `seafhttp`. A smaller safe fix now caches repeated chunk prechecks per upload tracker, but that is not reservation hardening. See ISSUE-QUOTA-RESERVATION-01 below. |
 | **Chunked Upload Traffic Accounting Semantics** | 🟡 Accepted debt | Web chunked uploads now pre-check traffic against the declared `Content-Range` total, and repeated storage prechecks no longer walk HEAD on every chunk, but traffic is still recorded only after successful finalize. Abandoned chunk sessions can consume bandwidth without advancing counters. See ISSUE-CHUNKED-UPLOAD-TRAFFIC-01 below. |
 | **Block Refcount Idempotence After Ambiguous CAS** | 🟡 Accepted hotfix debt | Upload/sync block registration now fails closed when Cassandra cannot attribute an LWT outcome, but client retries can still inflate `blocks.ref_count` because block registration has no durable idempotency key yet. See ISSUE-BLOCK-REFCOUNT-IDEMPOTENCE-01 below. |
-| **`blocks` Hot Partition by `org_id`** | 🟡 Accepted schema debt | `PRIMARY KEY ((org_id), block_id)` concentrates all block refcount LWTs for one tenant into one Cassandra partition. In multiregion, that turns Paxos contention into a schema bottleneck, not just a retry-policy problem. See ISSUE-BLOCKS-HOT-PARTITION-01 below. |
+| **`blocks` Hot Partition by `org_id`** | ✅ Fixed (2026-05-26) | `blocks`, `gc_block_candidates`, `gc_s3_orphans`, and the block-id mapping tables now use per-block partitioning so no single org concentrates LWT traffic into one Cassandra partition. The GC scan and S3 orphan recovery paths walk per-day discovery projections instead of partition-scanning by org. See ISSUE-BLOCKS-HOT-PARTITION-01 below. |
 
 ### 🟡 SeaDrive 3.x Missing Endpoints (Non-fatal, but degrade UX)
 | Issue | Status | Notes |
@@ -501,47 +501,50 @@ Until then, treat this as accepted hotfix debt: safer than false-success/data lo
 
 ### ISSUE-BLOCKS-HOT-PARTITION-01: `blocks` Uses `org_id` As the Sole Partition Key
 
-**Status**: 🟡 Accepted schema debt / future schema branch (2026-05-26)
-**Severity**: High operational risk under load — this amplifies Paxos contention, slow queries, and tail latency well before the logical refcount algorithm itself becomes the only problem
-**Affected**: `blocks`, block-refcount LWTs, upload finalize, sync `PutBlock`, GC delete guard, multiregion deployments
+**Status**: ✅ Fixed (2026-05-26)
+**Severity (when active)**: High operational risk under load — amplified Paxos contention, slow LWTs, and tail latency well before the logical refcount algorithm itself became the bottleneck
+**Affected**: `blocks`, `gc_block_candidates`, `gc_s3_orphans`, block-id mapping tables, upload finalize, sync `PutBlock`, GC delete guard, multiregion deployments
 
-#### Current Schema
+#### What The Schema Used To Look Like
 
-The current `blocks` table is keyed as `PRIMARY KEY ((org_id), block_id)` in `internal/db/migrations/001_initial_schema.cql`.
+The original `blocks` table was keyed as `PRIMARY KEY ((org_id), block_id)` in `internal/db/migrations/001_initial_schema.cql`. That meant every block refcount LWT for one organization landed in the same Cassandra partition. In a multiregion deployment, every upload/copy/delete/GC refcount mutation for that org contended on the same partition-local Paxos hotspot.
 
-That means all block-refcount LWT activity for one organization lands in the same Cassandra partition. In a multiregion deployment, every upload/copy/delete/GC refcount mutation for that org is contending on the same partition-local Paxos hotspot.
+This was especially bad for the reserved platform org (`00000000-0000-0000-0000-000000000000`): the problem stopped being a rare tenant-specific outlier and became a central hot partition for shared/system traffic. Each LWT cost ~1s under cross-DC SERIAL Paxos, and a 2 GB upload (≈263 blocks at 8 MB) accumulated minutes of strictly serialized Paxos before the cluster gave up with `received 0 of 2 required responses`.
 
-This is especially important for the reserved platform org (`00000000-0000-0000-0000-000000000000`): it turns the problem from a rare tenant-specific outlier into a central hot partition for shared/system traffic.
+#### What Changed
 
-#### Why This Matters
+The schema for block-related tables now uses per-block partitioning:
 
-- the current CAS/LWT logic can be locally correct and still suffer operationally because the shared row family is partition-hot;
-- retry tuning and per-process throttling can reduce symptoms, but they do not change the fact that the partition key has low cardinality for this workload;
-- cross-region Paxos cost becomes more visible when many unrelated blocks for the same org are forced through one partition boundary.
+- `blocks` → `PRIMARY KEY ((org_id, block_id))`
+- `gc_block_candidates` → `PRIMARY KEY ((org_id, block_id))`
+- `gc_s3_orphans` → `PRIMARY KEY ((org_id, block_id))`
+- `block_id_mappings` → `PRIMARY KEY ((org_id, external_id))`
+- `block_id_mappings_by_internal` → `PRIMARY KEY ((org_id, internal_id), external_id)`
 
-#### Direction For A Future Schema Branch
+Each block now lives in its own Cassandra partition, so concurrent LWTs from one upload cannot contend at the Paxos layer.
 
-The long-term fix is to choose a higher-cardinality partition key that matches bounded query shapes instead of partitioning all block traffic by org.
+#### Discovery Projections Replace Per-Org Partition Scans
 
-Examples worth evaluating against the real access patterns:
+Two paths previously relied on `WHERE org_id = ?` partition scans over `blocks`, `gc_block_candidates`, and `gc_s3_orphans`. Per-block partitioning makes those scans inefficient, so they are replaced by per-day discovery projections:
 
-- partition by `file_id` if the common read shape is "load the blocks for one file";
-- use a composite key such as `(org_id, file_id)` so the org remains part of the logical key while the physical data fans out across many partitions;
-- use `(org_id, bucket)` or another sharded key if block lookup patterns need org scoping but require more even write distribution.
+- `gc_block_candidates_by_day (PRIMARY KEY ((candidate_day, bucket), candidate_at, org_id, block_id))` — the GC scanner walks this by `(day, bucket)` from a persisted cursor (`gc.scan.block_candidates.last_candidate_day`) so it never needs to enumerate all candidate orgs.
+- `gc_s3_orphans_by_day (PRIMARY KEY ((first_seen_day, bucket), first_seen_at, org_id, block_id))` — the worker's `RecoverS3Orphans` walks this over a 14-day window across all discovery buckets.
 
-The rule of thumb is simple: the partition key should have thousands or millions of distinct values and each query should touch one bounded slice at a time. `org_id` alone fails that rule for `blocks`.
+Both projections inherit the same TTL as their canonical table. The bucket count (`db.GCDiscoveryBucketCount = 32`) mirrors the pattern used by `gc_share_links_by_expiry`.
 
-#### Connection To Refcount Redesign
+#### Loss Of The Backfill Safety Net
 
-This schema debt and the refcount-model debt reinforce each other.
+The old scanner could iterate `blocks WHERE org_id = ?` to find zero-ref rows whose `gc_block_candidates` entry never got written. That partition scan was removed because the new schema makes it expensive, and because the only legitimate path for a block to reach `ref_count=0` already runs through `DecrementBlockRefCountsOnce → enqueueZeroRefBlocks → gcBlockEnqueuer.EnqueueBlocks → EnsureBlockGCCandidate`.
 
-- If the system keeps a mutable per-block counter on a row keyed by org, multiregion Paxos remains concentrated on a hot shared partition.
-- If a future branch moves to row-per-reference modeling, it should also revisit the partitioning strategy so those reference rows distribute naturally instead of recreating the same hotspot with a different payload.
+To make the loss observable instead of silent, every failure in that chain increments `gc_zero_ref_enqueue_failures_total{stage=...}`. Alert on sustained non-zero values: that metric is now the only signal that a block hit zero refcount without being registered in `gc_block_candidates`.
 
-Treat this as part of a broader Cassandra schema-shaping backlog. There are likely other hot partitions and query-path bottlenecks to audit, but this one is already tied directly to the current production upload incident class.
+#### Block-Size Lookups On The Read Path
+
+`streaming.QueryBlockSizes` used to batch up to 100 block IDs into a single `WHERE org_id = ? AND block_id IN ?` query, which made sense when those IDs shared a partition. Under per-block partitioning each IN element resolves to its own partition, so the function now issues parallel single-row reads (`blockSizesConcurrency = 32`) and falls back to S3 HEAD for any block still missing.
 
 #### Related Docs
 
+- `docs/SCHEMA-BOTTLENECK-AUDIT.md` (other partition/LWT candidates not addressed here)
 - `docs/TECHNICAL-DEBT.md`
 - `docs/DATABASE-GUIDE.md`
 - `docs/ARCHITECTURE.md`

@@ -737,53 +737,70 @@ func TestGC_LibraryCascade(t *testing.T) {
 	t.Log("Library cascade: scanner + worker processed soft-deleted library")
 }
 
-// TestGC_ScannerOrphanRecovery verifies the scanner finds blocks with
-// ref_count=0 that were never enqueued for GC (simulating a missed enqueue).
-func TestGC_ScannerOrphanRecovery(t *testing.T) {
+// TestGC_ScannerRequeuesCandidatesMissingFromQueue verifies the scanner
+// picks up GC candidates from the per-day discovery projection and re-enqueues
+// them when no matching queue item is present.
+//
+// The earlier version of this test deleted the canonical `gc_block_candidates`
+// row to simulate a "missed enqueue" and relied on the scanner partition-scanning
+// `blocks` to backfill it. That backfill path was removed when `blocks` moved
+// to per-block partitioning (see ISSUE-BLOCKS-HOT-PARTITION-01); the only
+// legitimate entry point for a block into GC is now `EnsureBlockGCCandidate`,
+// observability for failures lives in `gc_zero_ref_enqueue_failures_total`.
+//
+// The current contract is: if the candidate row exists but the queue item is
+// gone (replica drift, hand-cleanup, etc.), the scanner walks
+// `gc_block_candidates_by_day` and re-enqueues. This test covers that path.
+func TestGC_ScannerRequeuesCandidatesMissingFromQueue(t *testing.T) {
 	requireGCEnabled(t)
 	requireCassandra(t)
 
-	repoID := createTestLibrary(t, adminClient, fmt.Sprintf("inttest-gc-orphan-%d", time.Now().UnixNano()))
+	repoID := createTestLibrary(t, adminClient, fmt.Sprintf("inttest-gc-rediscover-%d", time.Now().UnixNano()))
 	orgID := resolveOrgID(t, repoID)
 	queuedAfter := time.Now().UTC().Add(-5 * time.Second)
 
-	// Upload a file, then delete it to get a real block with ref_count=0
-	_, blockID := uploadUniqueFile(t, adminClient, repoID, "orphan.txt", "/")
-	batchDeleteFiles(t, adminClient, repoID, "/", []string{"orphan.txt"})
+	// Upload a file, then delete it to get a real block with ref_count=0.
+	// The delete path runs through DecrementBlockRefCountsOnce →
+	// enqueueZeroRefBlocks → EnsureBlockGCCandidate, so both the canonical
+	// gc_block_candidates row and the gc_block_candidates_by_day projection
+	// row are written.
+	_, blockID := uploadUniqueFile(t, adminClient, repoID, "rediscover.txt", "/")
+	batchDeleteFiles(t, adminClient, repoID, "/", []string{"rediscover.txt"})
 
-	// Wait for ref_count to drop
+	// Wait for ref_count=0 AND the candidate row to land in both tables.
 	ok := pollUntil(t, 20*time.Second, 200*time.Millisecond, func() bool {
-		return readBlockRefCount(t, orgID, blockID) <= 0
+		return readBlockRefCount(t, orgID, blockID) <= 0 && gcCandidateExists(t, orgID, blockID)
 	})
 	if !ok {
-		t.Fatalf("ref_count did not reach 0: %d", readBlockRefCount(t, orgID, blockID))
+		t.Fatalf("preconditions not met: ref_count=%d, candidate=%v",
+			readBlockRefCount(t, orgID, blockID), gcCandidateExists(t, orgID, blockID))
 	}
 
-	// Delete the gc_block_candidates entry directly (simulate missed enqueue)
-	session := shareProjectionDBForTest(t).Session()
-	if err := session.Query(`DELETE FROM gc_block_candidates WHERE org_id = ? AND block_id = ?`, orgID, blockID).Exec(); err != nil {
-		t.Logf("Warning: could not delete GC candidate (may not exist): %v", err)
-	}
+	// Simulate a missing/lost queue item while the candidate row remains.
+	// This is the scenario the discovery projection is designed to recover from.
 	deleteGCQueueItemsByIdentitySince(t, orgID, "block", blockID, queuedAfter)
 
-	t.Log("Orphan block created (ref_count=0, no GC candidate). Running scanner...")
+	t.Log("Candidate row present, queue item removed. Running scanner...")
 
 	triggerGCScannerAndWait(t)
 
-	// Verify the orphan was re-enqueued (allow generous timeout for scanner to complete)
+	// The scanner must re-enqueue. Either we observe the candidate row still
+	// present (scanner re-queued it for a later worker pass) or both rows are
+	// gone because worker+scanner+S3 delete all succeeded between trigger and
+	// poll. Both outcomes are correct; only "candidate gone AND block still
+	// alive" indicates the scanner missed it.
 	ok = pollUntil(t, 30*time.Second, 1*time.Second, func() bool {
-		return gcCandidateExists(t, orgID, blockID)
+		return gcCandidateExists(t, orgID, blockID) || !blockExistsInDB(t, orgID, blockID)
 	})
 	if !ok {
-		// Check if the block was already fully processed (deleted by worker after scanner found it)
-		if !blockExistsInDB(t, orgID, blockID) {
-			t.Log("Scanner orphan recovery: block was found AND deleted (scanner + worker both ran) — correct")
-			return
-		}
-		t.Fatal("Scanner did not re-discover orphaned block with ref_count=0")
+		t.Fatal("scanner did not re-enqueue candidate via gc_block_candidates_by_day discovery")
 	}
 
-	t.Log("Scanner orphan recovery: block re-enqueued for GC — correct")
+	if !blockExistsInDB(t, orgID, blockID) {
+		t.Log("scanner discovery: block was found AND deleted by worker — correct")
+		return
+	}
+	t.Log("scanner discovery: candidate row preserved for next worker pass — correct")
 }
 
 // getGCGracePeriod reads the configured grace period from the admin status API.

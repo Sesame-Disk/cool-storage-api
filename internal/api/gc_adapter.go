@@ -6,6 +6,7 @@ import (
 	v2 "github.com/Sesame-Disk/sesamefs/internal/api/v2"
 	"github.com/Sesame-Disk/sesamefs/internal/db"
 	"github.com/Sesame-Disk/sesamefs/internal/gc"
+	"github.com/Sesame-Disk/sesamefs/internal/metrics"
 	"github.com/google/uuid"
 )
 
@@ -15,15 +16,22 @@ type gcBlockEnqueuer struct {
 }
 
 // EnqueueBlocks enqueues blocks with ref_count=0 for garbage collection.
+//
+// Each failure increments gc_zero_ref_enqueue_failures_total. After the
+// blocks schema refactor removed the per-org partition scan backfill, this
+// metric is the only signal that a block hit ref_count=0 without being
+// registered in gc_block_candidates. Alert on sustained non-zero rate.
 func (e *gcBlockEnqueuer) EnqueueBlocks(orgID string, blockIDs []string, storageClass string) {
 	orgUUID, err := uuid.Parse(orgID)
 	if err != nil {
 		log.Printf("[GC Adapter] Invalid org_id %q: %v", orgID, err)
+		metrics.GCZeroRefEnqueueFailuresTotal.WithLabelValues("invalid_org").Add(float64(len(blockIDs)))
 		return
 	}
 	for _, blockID := range blockIDs {
 		if err := e.service.EnqueueBlock(orgUUID, blockID, uuid.Nil, storageClass); err != nil {
-			log.Printf("[GC Adapter] Failed to enqueue block %s: %v", blockID, err)
+			log.Printf("[GC Adapter] WARNING: failed to enqueue zero-ref block %s for org %s: %v", blockID, orgID, err)
+			metrics.GCZeroRefEnqueueFailuresTotal.WithLabelValues("service_error").Inc()
 		}
 	}
 }

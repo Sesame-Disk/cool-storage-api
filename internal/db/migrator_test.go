@@ -144,7 +144,12 @@ func TestInitialSchemaContainsLookupNameAndStarredIndex(t *testing.T) {
 	assert.Contains(t, content, "CREATE TABLE IF NOT EXISTS gc_org_stats")
 	assert.Contains(t, content, "CREATE TABLE IF NOT EXISTS gc_failed_items")
 	assert.Contains(t, content, "CREATE TABLE IF NOT EXISTS gc_s3_orphans")
+	assert.Contains(t, content, "CREATE TABLE IF NOT EXISTS gc_block_candidates_by_day")
+	assert.Contains(t, content, "CREATE TABLE IF NOT EXISTS gc_s3_orphans_by_day")
 	assert.Contains(t, content, "CREATE TABLE IF NOT EXISTS gc_leases")
+	// `blocks` and related tables must use per-block partitioning to avoid
+	// the org_id hot partition that previously serialized all upload LWTs.
+	assert.Contains(t, content, "PRIMARY KEY ((org_id, block_id))")
 	assert.Contains(t, content, "WITH default_time_to_live = 0")
 	assert.Contains(t, content, "INSERT INTO gc_stats (stat_key, stat_value, updated_at)")
 	assert.NotContains(t, content, "CREATE TABLE IF NOT EXISTS gc_queue_stats")

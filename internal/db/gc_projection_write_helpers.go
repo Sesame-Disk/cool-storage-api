@@ -114,3 +114,31 @@ func AddDeleteLibraryPolicyQuery(batch *gocql.Batch, policyType, orgID, libraryI
 		WHERE policy_type = ? AND bucket = ? AND org_id = ? AND library_id = ?
 	`, policyType, GCDiscoveryBucket(libraryID), orgID, libraryID)
 }
+
+func AddUpsertBlockGCCandidateDiscoveryQuery(batch *gocql.Batch, orgID, blockID, storageClass string, candidateAt time.Time) {
+	batch.Query(`
+		INSERT INTO gc_block_candidates_by_day (candidate_day, bucket, candidate_at, org_id, block_id, storage_class)
+		VALUES (?, ?, ?, ?, ?, ?)
+	`, GCProjectionUTCDate(candidateAt), GCDiscoveryBucket(orgID, blockID), candidateAt.UTC(), orgID, blockID, storageClass)
+}
+
+func AddDeleteBlockGCCandidateDiscoveryQuery(batch *gocql.Batch, orgID, blockID string, candidateAt time.Time) {
+	batch.Query(`
+		DELETE FROM gc_block_candidates_by_day
+		WHERE candidate_day = ? AND bucket = ? AND candidate_at = ? AND org_id = ? AND block_id = ?
+	`, GCProjectionUTCDate(candidateAt), GCDiscoveryBucket(orgID, blockID), candidateAt.UTC(), orgID, blockID)
+}
+
+func AddUpsertS3OrphanDiscoveryQuery(batch *gocql.Batch, orgID, blockID, storageClass string, firstSeenAt time.Time) {
+	batch.Query(`
+		INSERT INTO gc_s3_orphans_by_day (first_seen_day, bucket, first_seen_at, org_id, block_id, storage_class)
+		VALUES (?, ?, ?, ?, ?, ?)
+	`, GCProjectionUTCDate(firstSeenAt), GCDiscoveryBucket(orgID, blockID), firstSeenAt.UTC(), orgID, blockID, storageClass)
+}
+
+func AddDeleteS3OrphanDiscoveryQuery(batch *gocql.Batch, orgID, blockID string, firstSeenAt time.Time) {
+	batch.Query(`
+		DELETE FROM gc_s3_orphans_by_day
+		WHERE first_seen_day = ? AND bucket = ? AND first_seen_at = ? AND org_id = ? AND block_id = ?
+	`, GCProjectionUTCDate(firstSeenAt), GCDiscoveryBucket(orgID, blockID), firstSeenAt.UTC(), orgID, blockID)
+}

@@ -230,7 +230,14 @@ func TestScanner_ScanOrphanedBlocks_SkipsRetriedQueuedCandidate(t *testing.T) {
 	}
 }
 
-func TestScanner_ScanOrphanedBlocks_BackfillsMissingCandidateFromBlocksTable(t *testing.T) {
+// TestScanner_ScanOrphanedBlocks_EnqueuesFromCandidatesByDay validates the new
+// discovery flow: when EnsureBlockGCCandidate has registered a candidate for a
+// zero-ref block, the scanner finds it through the by-day projection and
+// enqueues exactly one queue item per candidate. Earlier versions of this test
+// relied on a per-org partition scan of the `blocks` table to backfill missing
+// candidate rows; that scan was removed when `blocks` moved to per-block
+// partitioning, so the only entry point now is EnsureBlockGCCandidate.
+func TestScanner_ScanOrphanedBlocks_EnqueuesFromCandidatesByDay(t *testing.T) {
 	store := NewMockStore()
 	stats := &Stats{}
 	q := NewQueue(store)
@@ -240,6 +247,12 @@ func TestScanner_ScanOrphanedBlocks_BackfillsMissingCandidateFromBlocksTable(t *
 	store.AddOrganization(orgID)
 	store.AddBlock(orgID, "block-zero-ref", "hot", 0)
 	store.AddBlock(orgID, "block-still-live", "hot", 2)
+
+	// Refcount-decrement paths invoke EnsureBlockGCCandidate when they reach
+	// zero; here we register the candidate row directly to simulate that.
+	if _, err := store.EnsureBlockGCCandidate(orgID, "block-zero-ref", "hot", time.Now()); err != nil {
+		t.Fatalf("EnsureBlockGCCandidate failed: %v", err)
+	}
 
 	if err := s.ScanOnce(context.Background()); err != nil {
 		t.Fatalf("ScanOnce failed: %v", err)
@@ -253,12 +266,100 @@ func TestScanner_ScanOrphanedBlocks_BackfillsMissingCandidateFromBlocksTable(t *
 		t.Fatalf("unexpected queued item: %+v", items[0])
 	}
 
-	candidates, err := store.ListBlockGCCandidates(orgID)
-	if err != nil {
-		t.Fatalf("ListBlockGCCandidates failed: %v", err)
-	}
+	candidates := store.AllBlockGCCandidates()
 	if len(candidates) != 1 || candidates[0].BlockID != "block-zero-ref" {
-		t.Fatalf("expected reconciled GC candidate for block-zero-ref, got %+v", candidates)
+		t.Fatalf("expected one persisted GC candidate for block-zero-ref, got %+v", candidates)
+	}
+}
+
+// TestScanner_ScanOrphanedBlocks_DiscoversAcrossDistinctBuckets confirms that
+// the scanner walks every bucket in the day partition, not just the bucket of
+// the first candidate it sees. Many candidates with different (org, block)
+// pairs land in different buckets via GCDiscoveryBucket().
+func TestScanner_ScanOrphanedBlocks_DiscoversAcrossDistinctBuckets(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	s := NewScanner(store, q, stats, config.GCConfig{})
+
+	orgID := uuid.New()
+	store.AddOrganization(orgID)
+
+	// Seed enough distinct block_ids that every discovery bucket is
+	// touched at least once; 1000 produces full coverage at N=32 buckets.
+	blockCount := 1000
+	for i := 0; i < blockCount; i++ {
+		blockID := fmt.Sprintf("block-%04d", i)
+		if _, err := store.EnsureBlockGCCandidate(orgID, blockID, "hot", time.Now()); err != nil {
+			t.Fatalf("EnsureBlockGCCandidate failed for %s: %v", blockID, err)
+		}
+	}
+
+	if err := s.ScanOnce(context.Background()); err != nil {
+		t.Fatalf("ScanOnce failed: %v", err)
+	}
+
+	items := store.QueueItems(orgID)
+	if len(items) != blockCount {
+		t.Fatalf("expected scanner to enqueue all %d candidates across all buckets, got %d", blockCount, len(items))
+	}
+}
+
+// TestScanner_ScanOrphanedBlocks_AdvancesCursorAndSkipsOldDays validates that
+// the per-day cursor (gc.scan.block_candidates.last_candidate_day) is
+// persisted after a successful scan so the next pass starts later. The
+// scanner uses a small overlap window (gcScanOverlapDays) for late arrivals,
+// so a candidate enqueued before the cursor minus the overlap must NOT be
+// re-discovered.
+func TestScanner_ScanOrphanedBlocks_AdvancesCursorAndSkipsOldDays(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	s := NewScanner(store, q, stats, config.GCConfig{})
+
+	orgID := uuid.New()
+	store.AddOrganization(orgID)
+
+	// Seed a recent candidate the scanner must pick up on the first pass.
+	if _, err := store.EnsureBlockGCCandidate(orgID, "block-recent", "hot", time.Now()); err != nil {
+		t.Fatalf("EnsureBlockGCCandidate failed: %v", err)
+	}
+
+	if err := s.ScanOnce(context.Background()); err != nil {
+		t.Fatalf("first ScanOnce failed: %v", err)
+	}
+	if got := len(store.QueueItems(orgID)); got != 1 {
+		t.Fatalf("expected 1 queued item on first pass, got %d", got)
+	}
+
+	// Cursor should now be persisted; default is today-1 (per scanner code).
+	cursorValue, err := store.LoadGCStats("gc.scan.block_candidates.last_candidate_day")
+	if err != nil || cursorValue == "" {
+		t.Fatalf("expected scan cursor to be persisted, got value=%q err=%v", cursorValue, err)
+	}
+
+	// Drain the existing item so we can detect any duplicate re-enqueue.
+	if _, err := store.DequeueBatch(orgID, 10, time.Now().Add(time.Hour)); err != nil {
+		t.Fatalf("DequeueBatch failed: %v", err)
+	}
+	if err := store.CompleteItem(orgID, store.AllBlockGCCandidates()[0].CandidateAt, ItemBlock, "block-recent"); err != nil {
+		t.Fatalf("CompleteItem failed: %v", err)
+	}
+
+	// Manually back-date the cursor 30 days into the future of the
+	// candidate's day, simulating "we already scanned past this candidate."
+	// The scanner only walks `cursor - gcScanOverlapDays`..today, so a
+	// 30-day gap leaves the candidate's day before the overlap window.
+	farFuture := time.Now().AddDate(0, 0, 30)
+	if err := store.SaveGCStats("gc.scan.block_candidates.last_candidate_day", db.GCProjectionDateString(farFuture)); err != nil {
+		t.Fatalf("SaveGCStats failed: %v", err)
+	}
+
+	if err := s.ScanOnce(context.Background()); err != nil {
+		t.Fatalf("second ScanOnce failed: %v", err)
+	}
+	if got := len(store.QueueItems(orgID)); got != 0 {
+		t.Fatalf("expected scanner to skip candidate outside cursor window, got %d new items", got)
 	}
 }
 

@@ -2,6 +2,7 @@ package streaming
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -9,7 +10,14 @@ import (
 
 	"github.com/Sesame-Disk/sesamefs/internal/crypto"
 	"github.com/Sesame-Disk/sesamefs/internal/db"
+	gocql "github.com/apache/cassandra-gocql-driver/v2"
 )
+
+// blockSizesConcurrency caps in-flight single-row Cassandra reads when fetching
+// block sizes for a file. After the blocks schema move to per-block partitions,
+// each lookup is independent and parallelizes cleanly. 32 keeps wall-clock low
+// on large files without pressuring the driver pool.
+const blockSizesConcurrency = 32
 
 // BlockReadSeeker implements io.ReadSeeker over block storage.
 // It loads only the current block into memory, enabling http.ServeContent
@@ -208,8 +216,14 @@ func (r *BlockReadSeeker) ensureBlock(idx int) error {
 }
 
 // QueryBlockSizes fetches block sizes for a list of resolved block IDs.
-// Uses Cassandra first (fast, single batch query), then falls back to S3 HEAD
-// for any blocks missing from the DB (legacy uploads that didn't populate the blocks table).
+//
+// The blocks table is partitioned by `((org_id, block_id))` so each lookup
+// is a single-partition single-row read with no Paxos cost. We issue up to
+// `blockSizesConcurrency` parallel reads against Cassandra and fall back to
+// S3 HEAD only for blocks still missing (legacy uploads that didn't populate
+// the blocks table). Prior to the per-block partition refactor this used a
+// single `IN (?)` batch of 100, which became inefficient once each element
+// of `IN` resolved to its own partition.
 func QueryBlockSizes(ctx context.Context, database *db.DB, orgID string, blockStore BlockReader, blockIDs []string) ([]int64, error) {
 	sizes := make([]int64, len(blockIDs))
 
@@ -217,41 +231,46 @@ func QueryBlockSizes(ctx context.Context, database *db.DB, orgID string, blockSt
 		return sizes, nil
 	}
 
-	// Step 1: batch query from Cassandra (fast, 1 round trip per 100 blocks)
-	var missing []int // indices of blocks not found in DB
-	const batchSize = 100
-	for start := 0; start < len(blockIDs); start += batchSize {
-		end := start + batchSize
-		if end > len(blockIDs) {
-			end = len(blockIDs)
-		}
+	// Step 1: parallel single-row reads from Cassandra.
+	type lookupResult struct {
+		idx  int
+		size int64
+		ok   bool
+	}
 
-		batchIDs := blockIDs[start:end]
-		iter := database.Session().Query(`
-			SELECT block_id, size_bytes FROM blocks WHERE org_id = ? AND block_id IN ?
-		`, orgID, batchIDs).Iter()
+	concurrency := blockSizesConcurrency
+	if concurrency > len(blockIDs) {
+		concurrency = len(blockIDs)
+	}
+	sem := make(chan struct{}, concurrency)
+	results := make(chan lookupResult, len(blockIDs))
 
-		sizeMap := make(map[string]int64, len(batchIDs))
-		var blockID string
-		var sizeBytes int
-		for iter.Scan(&blockID, &sizeBytes) {
-			sizeMap[blockID] = int64(sizeBytes)
-		}
-		if err := iter.Close(); err != nil {
-			log.Printf("[QueryBlockSizes] WARNING: DB query failed, falling back to S3: %v", err)
-			// Mark all in this batch as missing
-			for i := start; i < end; i++ {
-				missing = append(missing, i)
+	for i, blockID := range blockIDs {
+		sem <- struct{}{}
+		go func(idx int, bid string) {
+			defer func() { <-sem }()
+			var sizeBytes int
+			err := database.Session().Query(`
+				SELECT size_bytes FROM blocks WHERE org_id = ? AND block_id = ?
+			`, orgID, bid).WithContext(ctx).Scan(&sizeBytes)
+			if err != nil {
+				if !errors.Is(err, gocql.ErrNotFound) {
+					log.Printf("[QueryBlockSizes] WARNING: DB read failed for block %s: %v", bid, err)
+				}
+				results <- lookupResult{idx: idx, ok: false}
+				return
 			}
-			continue
-		}
+			results <- lookupResult{idx: idx, size: int64(sizeBytes), ok: sizeBytes > 0}
+		}(i, blockID)
+	}
 
-		for i := start; i < end; i++ {
-			if sz, ok := sizeMap[blockIDs[i]]; ok && sz > 0 {
-				sizes[i] = sz
-			} else {
-				missing = append(missing, i)
-			}
+	var missing []int
+	for i := 0; i < len(blockIDs); i++ {
+		r := <-results
+		if r.ok {
+			sizes[r.idx] = r.size
+		} else {
+			missing = append(missing, r.idx)
 		}
 	}
 
@@ -270,12 +289,12 @@ func QueryBlockSizes(ctx context.Context, database *db.DB, orgID string, blockSt
 
 	ch := make(chan result, len(missing))
 	const maxConcurrency = 20
-	sem := make(chan struct{}, maxConcurrency)
+	s3Sem := make(chan struct{}, maxConcurrency)
 
 	for _, idx := range missing {
-		sem <- struct{}{}
+		s3Sem <- struct{}{}
 		go func(i int, blockID string) {
-			defer func() { <-sem }()
+			defer func() { <-s3Sem }()
 			size, err := blockStore.GetBlockSize(ctx, blockID)
 			ch <- result{idx: i, size: size, err: err}
 		}(idx, blockIDs[idx])

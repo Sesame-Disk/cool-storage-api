@@ -85,7 +85,7 @@ func TestWorker_ProcessBlock_S3RetryExhausted(t *testing.T) {
 	if store.S3OrphanCount() != 1 {
 		t.Fatalf("expected 1 orphan recorded, got %d", store.S3OrphanCount())
 	}
-	orphans, _ := store.ListS3Orphans(orgID, 10)
+	orphans := store.AllS3Orphans()
 	if len(orphans) != 1 {
 		t.Fatalf("expected 1 orphan for org, got %d", len(orphans))
 	}
@@ -169,7 +169,7 @@ func TestWorker_RecoverS3Orphans_PartialFailure(t *testing.T) {
 	if got := store.S3OrphanCount(); got != 1 {
 		t.Errorf("expected 1 orphan remaining, got %d", got)
 	}
-	remaining, _ := store.ListS3Orphans(orgID, 10)
+	remaining := store.AllS3Orphans()
 	if len(remaining) != 1 {
 		t.Fatalf("expected 1 remaining, got %d", len(remaining))
 	}

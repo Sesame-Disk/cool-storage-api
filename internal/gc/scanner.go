@@ -10,6 +10,7 @@ import (
 	"github.com/Sesame-Disk/sesamefs/internal/config"
 	"github.com/Sesame-Disk/sesamefs/internal/db"
 	"github.com/Sesame-Disk/sesamefs/internal/metrics"
+	gocql "github.com/apache/cassandra-gocql-driver/v2"
 	"github.com/google/uuid"
 )
 
@@ -173,112 +174,77 @@ func (s *Scanner) scanPendingStorageCounterReconciliation(ctx context.Context) (
 	return 0, nil
 }
 
-// scanOrphanedBlocks re-enqueues zero-ref block candidates that should still be in GC.
+// scanOrphanedBlocks re-enqueues zero-ref block candidates that should still
+// be in GC. Walks the `gc_block_candidates_by_day` discovery projection from a
+// persisted day cursor up to today, across all discovery buckets, instead of
+// scanning the canonical `gc_block_candidates` partition by org. The
+// per-org partition scan disappeared with the schema move to per-block
+// partitioning; the only entry point for a block into GC is now
+// EnsureBlockGCCandidate from the refcount decrement path.
 func (s *Scanner) scanOrphanedBlocks(ctx context.Context) (int, error) {
 	log.Println("[GC Scanner] Phase 1: Scanning for orphaned blocks...")
 
-	candidateOrgs, err := s.store.ListBlockGCCandidateOrgs()
+	cutoffDay := db.GCProjectionUTCDate(time.Now())
+	startDay, err := s.loadBlockCandidatesStartDay(cutoffDay)
 	if err != nil {
 		return 0, err
 	}
-	allOrgs, err := s.store.ListOrganizations()
-	if err != nil {
-		return 0, err
-	}
-
-	orgSeen := make(map[uuid.UUID]struct{}, len(candidateOrgs)+len(allOrgs))
-	orgs := make([]uuid.UUID, 0, len(candidateOrgs)+len(allOrgs))
-	for _, orgID := range candidateOrgs {
-		if _, ok := orgSeen[orgID]; ok {
-			continue
-		}
-		orgSeen[orgID] = struct{}{}
-		orgs = append(orgs, orgID)
-	}
-	for _, orgID := range allOrgs {
-		if _, ok := orgSeen[orgID]; ok {
-			continue
-		}
-		orgSeen[orgID] = struct{}{}
-		orgs = append(orgs, orgID)
+	if startDay.After(cutoffDay) {
+		log.Printf("[GC Scanner] Phase 1 complete: cursor ahead of cutoff, nothing to scan")
+		metrics.GCScannerLastPhaseRun.WithLabelValues("orphaned_blocks").SetToCurrentTime()
+		return 0, nil
 	}
 
 	enqueued := 0
-	for _, orgID := range orgs {
-		select {
-		case <-ctx.Done():
-			return enqueued, ctx.Err()
-		default:
-		}
+	for day := startDay; !day.After(cutoffDay); day = day.AddDate(0, 0, 1) {
+		for bucket := 0; bucket < db.GCDiscoveryBucketCount; bucket++ {
+			select {
+			case <-ctx.Done():
+				return enqueued, ctx.Err()
+			default:
+			}
 
-		candidates, err := s.store.ListBlockGCCandidates(orgID)
-		if err != nil {
-			continue
-		}
-		blocks, err := s.store.ListBlocksForOrg(orgID)
-		if err != nil {
-			continue
-		}
+			candidates, err := s.store.ListBlockGCCandidatesByDay(day, bucket)
+			if err != nil {
+				log.Printf("[GC Scanner] Phase 1: failed to list candidates for day=%s bucket=%d: %v", db.GCProjectionDateString(day), bucket, err)
+				continue
+			}
 
-		var batch []QueueItem
-		queuedBlocks := make(map[string]struct{}, len(candidates))
-		for _, candidate := range candidates {
-			exists, err := s.store.PendingItemExists(orgID, uuid.Nil, candidate.CandidateAt, ItemBlock, candidate.BlockID)
-			if err != nil {
-				log.Printf("[GC Scanner] Phase 1: failed to inspect queue for block %s in org %s: %v", candidate.BlockID, orgID, err)
-				continue
+			var batch []QueueItem
+			for _, candidate := range candidates {
+				exists, err := s.store.PendingItemExists(candidate.OrgID, uuid.Nil, candidate.CandidateAt, ItemBlock, candidate.BlockID)
+				if err != nil {
+					log.Printf("[GC Scanner] Phase 1: failed to inspect queue for block %s in org %s: %v", candidate.BlockID, candidate.OrgID, err)
+					continue
+				}
+				if exists {
+					continue
+				}
+				batch = append(batch, QueueItem{
+					OrgID:        candidate.OrgID,
+					QueuedAt:     candidate.CandidateAt,
+					ItemType:     ItemBlock,
+					ItemID:       candidate.BlockID,
+					LibraryID:    uuid.Nil,
+					StorageClass: candidate.StorageClass,
+				})
 			}
-			if exists {
-				queuedBlocks[candidate.BlockID] = struct{}{}
-				continue
+			if len(batch) > 0 {
+				if err := s.queue.EnqueueBatch(batch); err != nil {
+					log.Printf("[GC Scanner] Phase 1: failed to batch enqueue blocks for day=%s bucket=%d: %v", db.GCProjectionDateString(day), bucket, err)
+				} else {
+					enqueued += len(batch)
+				}
 			}
-			queuedBlocks[candidate.BlockID] = struct{}{}
-			batch = append(batch, QueueItem{
-				OrgID:        orgID,
-				QueuedAt:     candidate.CandidateAt,
-				ItemType:     ItemBlock,
-				ItemID:       candidate.BlockID,
-				LibraryID:    uuid.Nil,
-				StorageClass: candidate.StorageClass,
-			})
 		}
-		for _, block := range blocks {
-			if block.RefCount > 0 {
-				continue
-			}
-			if _, ok := queuedBlocks[block.BlockID]; ok {
-				continue
-			}
-			candidateAt, err := s.store.EnsureBlockGCCandidate(orgID, block.BlockID, block.StorageClass, time.Now())
-			if err != nil {
-				log.Printf("[GC Scanner] Phase 1: failed to backfill GC candidate for block %s in org %s: %v", block.BlockID, orgID, err)
-				continue
-			}
-			exists, err := s.store.PendingItemExists(orgID, uuid.Nil, candidateAt, ItemBlock, block.BlockID)
-			if err != nil {
-				log.Printf("[GC Scanner] Phase 1: failed to inspect queue for reconciled block %s in org %s: %v", block.BlockID, orgID, err)
-				continue
-			}
-			if exists {
-				queuedBlocks[block.BlockID] = struct{}{}
-				continue
-			}
-			queuedBlocks[block.BlockID] = struct{}{}
-			batch = append(batch, QueueItem{
-				OrgID:        orgID,
-				QueuedAt:     candidateAt,
-				ItemType:     ItemBlock,
-				ItemID:       block.BlockID,
-				LibraryID:    uuid.Nil,
-				StorageClass: block.StorageClass,
-			})
-		}
-		if len(batch) > 0 {
-			if err := s.queue.EnqueueBatch(batch); err != nil {
-				log.Printf("[GC Scanner] Phase 1: failed to batch enqueue blocks for org %s: %v", orgID, err)
-			} else {
-				enqueued += len(batch)
-			}
+	}
+
+	// Advance cursor to today-1 so a same-day late-arriving candidate still
+	// gets picked up on the next pass (gcScanOverlapDays-style overlap).
+	newCursor := cutoffDay.AddDate(0, 0, -1)
+	if !newCursor.Before(startDay) {
+		if err := s.store.SaveGCStats(gcBlockCandidatesCursorKey, db.GCProjectionDateString(newCursor)); err != nil {
+			log.Printf("[GC Scanner] Phase 1: failed to persist block candidates cursor: %v", err)
 		}
 	}
 
@@ -286,6 +252,25 @@ func (s *Scanner) scanOrphanedBlocks(ctx context.Context) (int, error) {
 	metrics.GCItemsEnqueuedTotal.WithLabelValues("orphaned_blocks").Add(float64(enqueued))
 	metrics.GCScannerLastPhaseRun.WithLabelValues("orphaned_blocks").SetToCurrentTime()
 	return enqueued, nil
+}
+
+// loadBlockCandidatesStartDay reads the persisted cursor day and returns the
+// next day to start scanning from. On cold start (no cursor) it falls back to
+// `cutoffDay - gcInitialScanLookbackDays` so we still catch recently created
+// candidates after a fresh deploy.
+func (s *Scanner) loadBlockCandidatesStartDay(cutoffDay time.Time) (time.Time, error) {
+	value, err := s.store.LoadGCStats(gcBlockCandidatesCursorKey)
+	if err != nil {
+		if errors.Is(err, gocql.ErrNotFound) {
+			return cutoffDay.AddDate(0, 0, -gcInitialScanLookbackDays), nil
+		}
+		return time.Time{}, err
+	}
+	lastDay, err := db.ParseGCProjectionDate(value)
+	if err != nil {
+		return time.Time{}, err
+	}
+	return lastDay.AddDate(0, 0, -gcScanOverlapDays), nil
 }
 
 // scanExpiredShareLinks finds share links past their expiration date.
