@@ -766,8 +766,9 @@ Before pulling, on each existing node:
 
 1. Confirm the cluster's actual DC name (`docker compose -f docker-compose.prod.yml exec cassandra nodetool status`) and make sure `CASSANDRA_DC` in `.env` matches it. The bootstrap will refuse to apply a policy that does not include the local DC.
 2. Set `CASSANDRA_REPLICATION_CLASS=NetworkTopologyStrategy` and `CASSANDRA_REPLICATION_DCS` to the full topology you want (single-region: `dc-name:1`; multi-region: `dc-na:1,dc-eu:1,...`).
-3. Pull and `docker compose up -d` as usual. The bootstrap container reapplies the policy idempotently.
-4. Single-region single-DC `SimpleStrategy{rf=1} → NetworkTopologyStrategy{dc:1}` places replicas identically; repair is a no-op but harmless. Multi-DC migrations or RF changes still require `nodetool repair sesamefs` and `nodetool repair system_auth` after the ALTER.
+3. Keep `CASSANDRA_CONSISTENCY=LOCAL_QUORUM` and `CASSANDRA_SERIAL_CONSISTENCY=SERIAL` unless you are deliberately changing the Cassandra consistency contract. In multi-region, `SERIAL` is the safe default for LWT/CAS on shared rows such as library HEAD and block refcounts.
+4. Pull and `docker compose up -d` as usual. The bootstrap container reapplies the policy idempotently.
+5. Single-region single-DC `SimpleStrategy{rf=1} → NetworkTopologyStrategy{dc:1}` places replicas identically; repair is a no-op but harmless. Multi-DC migrations or RF changes still require `nodetool repair sesamefs` and `nodetool repair system_auth` after the ALTER.
 
 ### Restart a service
 
@@ -840,6 +841,8 @@ Settings that **cannot** be set via env vars and must be in this file:
 | `SERVER_TRUSTED_PROXIES` | `server.trusted_proxies` | Comma-separated exact proxy IPs/CIDRs that are allowed to define client IP headers. |
 | `CASSANDRA_HOSTS` | `database.hosts` | Default: `cassandra:9042`. Multi-region: private IPs |
 | `CASSANDRA_KEYSPACE` | `database.keyspace` | |
+| `CASSANDRA_CONSISTENCY` | `database.consistency` | Non-serial query consistency. Recommended default: `LOCAL_QUORUM`. |
+| `CASSANDRA_SERIAL_CONSISTENCY` | `database.serial_consistency` | LWT/CAS serial-phase consistency. Recommended multiregion default: `SERIAL`. |
 | `CASSANDRA_LOCAL_DC` | `database.local_dc` | |
 | `CASSANDRA_USERNAME` | `database.username` | Required by the prod compose bootstrap. Use a dedicated non-superuser role. |
 | `CASSANDRA_PASSWORD` | `database.password` | Required by the prod compose bootstrap. |
@@ -1002,6 +1005,8 @@ CASSANDRA_HEAP_NEWSIZE=400M
 # --- Multi-Region ---
 SERVER_REGION=na
 # CASSANDRA_HOSTS not needed — SesameFS talks to local Cassandra via Docker (cassandra:9042)
+CASSANDRA_CONSISTENCY=LOCAL_QUORUM
+CASSANDRA_SERIAL_CONSISTENCY=SERIAL
 CASSANDRA_DC=dc-na
 CASSANDRA_LOCAL_DC=dc-na
 CASSANDRA_RACK=rack1
@@ -1029,6 +1034,8 @@ CASSANDRA_HEAP_NEWSIZE=400M
 # --- Multi-Region ---
 SERVER_REGION=eu
 # CASSANDRA_HOSTS not needed — SesameFS talks to local Cassandra via Docker (cassandra:9042)
+CASSANDRA_CONSISTENCY=LOCAL_QUORUM
+CASSANDRA_SERIAL_CONSISTENCY=SERIAL
 CASSANDRA_DC=dc-eu
 CASSANDRA_LOCAL_DC=dc-eu
 CASSANDRA_RACK=rack1
@@ -1270,20 +1277,30 @@ If every line is `[OK]`, proceed to Step M4.
   # Single-region remains compatible as a one-DC topology:
   CASSANDRA_REPLICATION_CLASS=NetworkTopologyStrategy
   CASSANDRA_REPLICATION_DCS=dc-na:1
+  CASSANDRA_CONSISTENCY=LOCAL_QUORUM
+  CASSANDRA_SERIAL_CONSISTENCY=SERIAL
 
   # On every multi-region node, expand that topology before `docker compose up`:
   CASSANDRA_REPLICATION_CLASS=NetworkTopologyStrategy
   CASSANDRA_REPLICATION_DCS=dc-na:1,dc-eu:1
+  CASSANDRA_CONSISTENCY=LOCAL_QUORUM
+  CASSANDRA_SERIAL_CONSISTENCY=SERIAL
 
   # Or for 3 regions:
   CASSANDRA_REPLICATION_CLASS=NetworkTopologyStrategy
   CASSANDRA_REPLICATION_DCS=dc-na:1,dc-eu:1,dc-asia:1
+  CASSANDRA_CONSISTENCY=LOCAL_QUORUM
+  CASSANDRA_SERIAL_CONSISTENCY=SERIAL
   ```
 
   > **This is required in multi-region mode.** The bootstrap service applies
   > the declared replication policy to both the SesameFS keyspace and
   > `system_auth`, and it reapplies that policy on each explicit bootstrap run.
   > Treat `.env` as the source of truth for Cassandra replication.
+  >
+  > The recommended app-level consistency pair is `LOCAL_QUORUM` + `SERIAL`.
+  > `LOCAL_SERIAL` lowers the serial phase to the local DC only, which is not
+  > the safe default for SesameFS multiregion LWT on shared rows.
   >
   > `CASSANDRA_REPLICATION_FACTOR` is only used if you deliberately opt back
   > into `CASSANDRA_REPLICATION_CLASS=SimpleStrategy` for legacy compatibility.

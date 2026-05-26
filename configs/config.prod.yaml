@@ -49,6 +49,7 @@ database:
     - cassandra:9042             # Docker service name, fixed
   keyspace: sesamefs
   consistency: LOCAL_QUORUM
+  serial_consistency: SERIAL
   timeout: 25s                  # Safe initial prod value for multi-DC LWT/upload testing; override via CASSANDRA_TIMEOUT if needed
   local_dc: datacenter1
   replication_class: NetworkTopologyStrategy
