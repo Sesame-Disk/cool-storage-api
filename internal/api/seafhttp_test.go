@@ -1748,39 +1748,25 @@ func TestAcquireFinalizeUploadBlockMetadataPermitSerializesCallers(t *testing.T)
 		}
 	}()
 
-	acquired := make(chan struct{})
-	released := make(chan struct{})
-	errCh := make(chan error, 1)
-
-	go func() {
-		releaseSecond, err := acquireFinalizeUploadBlockMetadataPermit(context.Background())
-		if err != nil {
-			errCh <- err
-			return
-		}
-		close(acquired)
+	blockedCtx, cancelBlocked := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancelBlocked()
+	releaseSecond, err := acquireFinalizeUploadBlockMetadataPermit(blockedCtx)
+	if releaseSecond != nil {
 		releaseSecond()
-		close(released)
-	}()
-
-	select {
-	case err := <-errCh:
-		t.Fatalf("second acquire failed: %v", err)
-	case <-acquired:
-		t.Fatal("second acquire should block while first permit is held")
-	case <-time.After(25 * time.Millisecond):
+		t.Fatal("second acquire should not succeed while first permit is held")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("second acquire error = %v, want context deadline exceeded while blocked", err)
 	}
 
 	releaseFirst()
 	releasedFirst = true
 
-	select {
-	case err := <-errCh:
+	releaseSecond, err = acquireFinalizeUploadBlockMetadataPermit(context.Background())
+	if err != nil {
 		t.Fatalf("second acquire failed after release: %v", err)
-	case <-released:
-	case <-time.After(time.Second):
-		t.Fatal("second acquire did not proceed after releasing first permit")
 	}
+	releaseSecond()
 }
 
 func TestChunkUploadQuotaPrecheckCacheMatchesMetadata(t *testing.T) {

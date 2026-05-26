@@ -1,6 +1,6 @@
 # Known Issues - SesameFS
 
-**Last Updated**: 2026-05-22
+**Last Updated**: 2026-05-26
 
 This document tracks all known bugs, limitations, and issues in SesameFS.
 
@@ -44,6 +44,7 @@ This document tracks all known bugs, limitations, and issues in SesameFS.
 | **Quota Enforcement Coverage Gaps in V2 Mutations** | ✅ Fixed (2026-05-14) | The affected non-upload mutation handlers now have visible-delta quota wiring. Deleted file/folder restore remains bounded by configured history retention, deleted-library restore remains bounded by trash retention, and cross-repo move still relies on split-phase destination publish plus source removal. Split-phase publish/counter atomicity remains documented as technical debt (§12d/§12e). See ISSUE-QUOTA-COVERAGE-01 below. |
 | **Concurrent Hard-Quota Reservation Hardening** | 🟡 Deferred to separate branch | The existing split pre-check → publish → counter-adjust window is still open. A canonical-row reservation prototype was audited and is not merge-ready for PR61 because it leaks reservations on finalize failure, regresses soft-policy evaluation, races with admin resync, and only hardens `seafhttp`. A smaller safe fix now caches repeated chunk prechecks per upload tracker, but that is not reservation hardening. See ISSUE-QUOTA-RESERVATION-01 below. |
 | **Chunked Upload Traffic Accounting Semantics** | 🟡 Accepted debt | Web chunked uploads now pre-check traffic against the declared `Content-Range` total, and repeated storage prechecks no longer walk HEAD on every chunk, but traffic is still recorded only after successful finalize. Abandoned chunk sessions can consume bandwidth without advancing counters. See ISSUE-CHUNKED-UPLOAD-TRAFFIC-01 below. |
+| **Block Refcount Idempotence After Ambiguous CAS** | 🟡 Accepted hotfix debt | Upload/sync block registration now fails closed when Cassandra cannot attribute an LWT outcome, but client retries can still inflate `blocks.ref_count` because block registration has no durable idempotency key yet. See ISSUE-BLOCK-REFCOUNT-IDEMPOTENCE-01 below. |
 
 ### 🟡 SeaDrive 3.x Missing Endpoints (Non-fatal, but degrade UX)
 | Issue | Status | Notes |
@@ -437,6 +438,56 @@ What is still missing is traffic-accounting coverage for abandoned or failed chu
 
 - `docs/TECHNICAL-DEBT.md`
 - `docs/QUOTAS-AND-TRAFFIC-PLAN.md`
+
+---
+
+### ISSUE-BLOCK-REFCOUNT-IDEMPOTENCE-01: Ambiguous `blocks` LWT Outcomes Can Still Leak Refcounts Across Retries
+
+**Status**: 🟡 Accepted hotfix debt / pending hardening (2026-05-26)
+**Severity**: Medium-High operational risk — current behavior prefers fail-closed and no unsafe rollback, but some retry paths can still inflate `blocks.ref_count`
+**Affected**: `IncrementOrCreateBlock`, sync `PUT /seafhttp/repo/:repo_id/block/:block_id`, seafhttp upload finalize paths, future block-ref accounting callers
+
+#### Current Behavior
+
+`resolveIncrementBlockMutationError()` and `resolveInsertBlockMutationError()` now treat a confirmation read that sees the "expected" post-LWT state as **unknown outcome**, not success, unless the mutation can be attributed unambiguously.
+
+This is deliberate. It avoids two unsafe behaviors:
+
+- returning false-success after Cassandra may have rejected the write and another writer happened to produce the same visible state;
+- rolling back a block refcount mutation that may already be visible and legitimately referenced.
+
+The hotfix also reduces the main production trigger by serializing chunked `blocks`-table metadata LWTs per process (`finalizeUploadBlockMetadataConcurrency = 1`) and by documenting the required multiregion runtime contract (`SERIAL`, higher Cassandra timeout, slow-query monitoring).
+
+#### Remaining Risk
+
+The flow is still not fully idempotent across client retries.
+
+- **Sync `PutBlock`** now returns `500` when `IncrementOrCreateBlock` cannot prove the outcome. If the first LWT actually applied but the client lost the ACK, a client retry can re-run the same block registration and increment the refcount again.
+- **Chunked upload finalize** now cleans up the tracker on `ErrBlockMutationOutcomeUnknown` and only rolls back the blocks that were already accounted before the ambiguous block. That is the safe choice against data loss, but a full re-upload can still increment the ambiguous block again.
+- **Single-shot/direct upload paths** also fail closed on ambiguous block registration, so they share the same leak-vs-false-success tradeoff.
+
+The current branch therefore fixes the production outage class better than `main`, but it does **not** yet provide a fully idempotent block-registration contract under ambiguous Paxos outcomes.
+
+#### What Is Already Narrowed
+
+- Copy/move code paths that need rollback already use `IncrementBlockRefCountsTracked()` so they receive the exact list of confirmed increments to unwind on publish failure.
+- The older `IncrementBlockRefCounts()` helper was a future footgun because it could expose partial progress without rollback. It now rolls back its own previously confirmed increments before returning an error.
+- The new chunked-upload permit is intentionally only a **process-local** pressure valve. It lowers the chance of `blocks`-table Paxos storms from one finalize wave, but it is not cluster-wide serialization.
+
+#### What Would Fully Close It
+
+A complete fix needs durable idempotency or reconciliation around block registration itself, for example:
+
+- a per-operation idempotency key stored with the block mutation so client retries can be deduplicated;
+- a durable pending-upload/block-promotion row that can reconcile ambiguous mutations after the fact;
+- or a reconciler that recomputes/refines `blocks.ref_count` from published commit reachability rather than trusting every upload-time increment as final truth.
+
+Until then, treat this as accepted hotfix debt: safer than false-success/data loss, but still capable of temporary or permanent refcount inflation under lost-ACK retry scenarios.
+
+#### Related Docs
+
+- `docs/TECHNICAL-DEBT.md`
+- `docs/DEPLOY.md`
 
 ---
 

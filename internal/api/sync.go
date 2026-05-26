@@ -899,7 +899,7 @@ func (h *SyncHandler) PutBlock(c *gin.Context) {
 
 		// Store block metadata using internal ID
 		if err := v2.NewFSHelper(h.db).IncrementOrCreateBlock(orgID, internalID, len(data), storageClass, ""); err != nil {
-			log.Printf("PutBlock: failed to store block metadata org=%s block=%s: %v\n", orgID, internalID, err)
+			log.Printf("PutBlock: failed to store block metadata org=%s block=%s: %v", orgID, internalID, err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to store block metadata"})
 			return
 		}

@@ -375,6 +375,35 @@ func TestResolveInsertBlockMutationErrorReturnsUnknownWhenExistingStateIsUnexpec
 	}
 }
 
+func TestIncrementBlockRefCountsResolvedRollsBackPartialProgress(t *testing.T) {
+	var rolledBack []string
+	seen := []string{}
+	wantErr := errors.New("boom")
+
+	err := incrementBlockRefCountsResolved(
+		[]string{"block-a", "block-b", "block-c"},
+		func(blockID string) error {
+			seen = append(seen, blockID)
+			if blockID == "block-c" {
+				return wantErr
+			}
+			return nil
+		},
+		func(blockIDs []string) {
+			rolledBack = append([]string(nil), blockIDs...)
+		},
+	)
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("incrementBlockRefCountsResolved() error = %v, want %v", err, wantErr)
+	}
+	if got := fmt.Sprint(seen); got != "[block-a block-b block-c]" {
+		t.Fatalf("incrementBlockRefCountsResolved() seen = %s, want all attempted blocks", got)
+	}
+	if got := fmt.Sprint(rolledBack); got != "[block-a block-b]" {
+		t.Fatalf("incrementBlockRefCountsResolved() rollback = %s, want prior successful increments only", got)
+	}
+}
+
 // Test RemoveEntryFromList function
 func TestRemoveEntryFromList(t *testing.T) {
 	entries := []FSEntry{

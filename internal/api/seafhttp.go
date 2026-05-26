@@ -1705,8 +1705,9 @@ readLoop:
 				return fmt.Errorf("failed to create block mapping: %w", mapErr)
 			}
 
-			// Reverse mapping and block metadata are best-effort (matches the
-			// previous serial behaviour: log on failure, don't abort).
+			// Reverse mapping remains best-effort. Block metadata registration is
+			// now required so finalize cannot publish a tree that references a
+			// block row we failed to confirm in Cassandra.
 			if revErr := h.db.Session().Query(`
 				INSERT INTO block_id_mappings_by_internal (org_id, internal_id, external_id, created_at) VALUES (?, ?, ?, toTimestamp(now()))
 			`, token.OrgID, sha256ID, blockSHA1IDLocal).Exec(); revErr != nil {

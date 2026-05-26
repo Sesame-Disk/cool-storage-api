@@ -971,13 +971,10 @@ func (h *FSHelper) IncrementOrCreateBlock(orgID, blockID string, sizeBytes int, 
 				retry, resolveErr := resolveIncrementBlockMutationError(blockID, currentRefCount+1, err, func() (blockMutationState, error) {
 					return h.confirmBlockMutationState(orgID, blockID)
 				})
-				if resolveErr != nil {
-					return resolveErr
-				}
 				if retry {
 					continue
 				}
-				return nil
+				return resolveErr
 			}
 			if applied {
 				return nil
@@ -999,13 +996,10 @@ func (h *FSHelper) IncrementOrCreateBlock(orgID, blockID string, sizeBytes int, 
 			retry, resolveErr := resolveInsertBlockMutationError(blockID, sizeBytes, storageClass, storageKey, err, func() (blockMutationState, error) {
 				return h.confirmBlockMutationState(orgID, blockID)
 			})
-			if resolveErr != nil {
-				return resolveErr
-			}
 			if retry {
 				continue
 			}
-			return nil
+			return resolveErr
 		}
 		if applied {
 			return nil
@@ -1186,14 +1180,33 @@ func (h *FSHelper) CopyFSObjectToLibrary(srcRepoID, dstRepoID, fsID string) (str
 	return newDirFSID, nil
 }
 
-// IncrementBlockRefCounts increments ref_count for blocks (for copy)
-func (h *FSHelper) IncrementBlockRefCounts(orgID string, blockIDs []string) error {
-	for _, blockID := range h.resolveStoredBlockIDs(orgID, blockIDs) {
-		if err := h.IncrementOrCreateBlock(orgID, blockID, 0, "", ""); err != nil {
+func incrementBlockRefCountsResolved(resolvedBlockIDs []string, increment func(string) error, rollback func([]string)) error {
+	incrementedBlockIDs := make([]string, 0, len(resolvedBlockIDs))
+	for _, blockID := range resolvedBlockIDs {
+		if err := increment(blockID); err != nil {
+			if len(incrementedBlockIDs) > 0 && rollback != nil {
+				rollback(incrementedBlockIDs)
+			}
 			return fmt.Errorf("increment block %s: %w", blockID, err)
 		}
+		incrementedBlockIDs = append(incrementedBlockIDs, blockID)
 	}
 	return nil
+}
+
+// IncrementBlockRefCounts increments ref_count for blocks (for copy)
+func (h *FSHelper) IncrementBlockRefCounts(orgID string, blockIDs []string) error {
+	resolvedBlockIDs := h.resolveStoredBlockIDs(orgID, blockIDs)
+	return incrementBlockRefCountsResolved(
+		resolvedBlockIDs,
+		func(blockID string) error {
+			return h.IncrementOrCreateBlock(orgID, blockID, 0, "", "")
+		},
+		func(incrementedBlockIDs []string) {
+			operationKey := fmt.Sprintf("increment_block_refs_rollback:%s:%d", orgID, time.Now().UnixNano())
+			h.DecrementBlockRefCountsOnce(orgID, operationKey, incrementedBlockIDs)
+		},
+	)
 }
 
 // IncrementBlockRefCountsTracked increments ref_count for blocks (for copy)
