@@ -18,6 +18,7 @@ database:
     - cassandra:9042
   keyspace: sesamefs
   consistency: LOCAL_QUORUM
+  timeout: 10s                  # Keep local/dev at the code default; prod should use a higher explicit value
   local_dc: datacenter1
   replication_class: NetworkTopologyStrategy
   replication_dcs:

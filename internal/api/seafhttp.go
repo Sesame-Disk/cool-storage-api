@@ -1019,6 +1019,23 @@ const uploadBlockSize = 8 * 1024 * 1024 // 8 MB
 // typical S3 latency.
 const finalizeUploadConcurrency = 8
 
+// finalizeUploadBlockMetadataConcurrency caps concurrent blocks-table LWTs
+// across chunked upload finalizations in this process. Keep block PUTs
+// parallel, but serialize IncrementOrCreateBlock so a burst of large-file
+// finalizations does not fan out Paxos pressure on the blocks table.
+const finalizeUploadBlockMetadataConcurrency = 1
+
+var finalizeUploadBlockMetadataPermits = make(chan struct{}, finalizeUploadBlockMetadataConcurrency)
+
+func acquireFinalizeUploadBlockMetadataPermit(ctx context.Context) (func(), error) {
+	select {
+	case finalizeUploadBlockMetadataPermits <- struct{}{}:
+		return func() { <-finalizeUploadBlockMetadataPermits }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
 // HandleUpload handles file uploads via the upload token.
 // Supports both single-shot uploads and chunked/resumable uploads (via Content-Range header).
 // Large files are split into blocks and streamed to S3 — never fully loaded into RAM.
@@ -1373,16 +1390,21 @@ func (h *SeafHTTPHandler) handleChunkedFinalizeError(token *AccessToken, tokenSt
 	// HeadConflict and quota_exceeded are both unrecoverable on the same
 	// tracker: the client cannot finalize this session again (head moved past
 	// the retry budget, or quota check will keep rejecting). Drop the tracker
-	// and roll back the block refs we promoted. Other errors (transient DB /
-	// block-store failures) leave the tracker alive so a retried finalize on
-	// the same temp file can reuse the per-tracker accounting and avoid a
-	// double increment.
+	// and roll back the block refs we promoted. A block-mutation outcome that
+	// stayed unknown must also stop same-tracker retries. Previously accounted
+	// block refs are safe to roll back because they were recorded only after a
+	// confirmed success; the ambiguous current block is not in that set yet.
+	// Other errors (transient DB / block-store failures) leave the tracker alive
+	// so a retried finalize on the same temp file can reuse the per-tracker
+	// accounting and avoid a double increment.
 	scope := ""
 	switch {
 	case errors.Is(err, v2.ErrLibraryHeadConflict):
 		scope = "seafhttp_chunk_conflict"
 	case errors.Is(err, errStorageQuotaExceeded):
 		scope = "seafhttp_chunk_quota"
+	case errors.Is(err, v2.ErrBlockMutationOutcomeUnknown):
+		scope = "seafhttp_chunk_block_unknown"
 	}
 	if scope != "" {
 		accountedBlockIDs := upload.AccountedBlockIDs()
@@ -1690,6 +1712,12 @@ readLoop:
 			`, token.OrgID, sha256ID, blockSHA1IDLocal).Exec(); revErr != nil {
 				log.Printf("[finalizeUploadStreaming] WARNING: Failed to write reverse block_id_mapping org=%s int=%s ext=%s: %v", token.OrgID, sha256ID[:16], blockSHA1IDLocal[:16], revErr)
 			}
+
+			releaseMetadataPermit, permitErr := acquireFinalizeUploadBlockMetadataPermit(egCtx)
+			if permitErr != nil {
+				return permitErr
+			}
+			defer releaseMetadataPermit()
 
 			if blkErr := upload.AccountBlockOnce(blockIndexLocal, sha256ID, func() error {
 				return fsHelper.IncrementOrCreateBlock(token.OrgID, sha256ID, len(storedBlock), actualStorageClass, "")

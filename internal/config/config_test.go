@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // clearLoadEnvOverrides blanks out the env vars that Load()/applyEnvOverrides
@@ -19,7 +20,7 @@ func clearLoadEnvOverrides(t *testing.T) {
 		"SERVER_URL", "DESKTOP_CUSTOM_BRAND", "DESKTOP_CUSTOM_LOGO",
 		"CORS_ALLOWED_ORIGINS",
 		"CASSANDRA_HOSTS", "CASSANDRA_KEYSPACE", "CASSANDRA_USERNAME",
-		"CASSANDRA_PASSWORD", "CASSANDRA_LOCAL_DC",
+		"CASSANDRA_PASSWORD", "CASSANDRA_LOCAL_DC", "CASSANDRA_TIMEOUT",
 		"CASSANDRA_REPLICATION_CLASS", "CASSANDRA_REPLICATION_FACTOR", "CASSANDRA_REPLICATION_DCS",
 		"STORAGE_MODE", "S3_BUCKET", "S3_REGION", "S3_ENDPOINT",
 		"S3_SERVER_SIDE_ENCRYPTION", "S3_SSE_KMS_KEY_ID",
@@ -59,35 +60,30 @@ func TestLoad(t *testing.T) {
 	tempDir := t.TempDir()
 	configPath := filepath.Join(tempDir, "config.yaml")
 
-	configContent := `
-server:
-  port: ":9090"
-
-database:
-  hosts:
-    - "localhost"
-  keyspace: "test_keyspace"
-  consistency: "ONE"
-
-storage:
-  default_class: "hot"
-  backends:
-    hot:
-      type: "s3"
-      bucket: "test-bucket"
-      region: "us-east-1"
-
-auth:
-  dev_mode: true
-  dev_tokens:
-    - token: "test-token"
-      user_id: "00000000-0000-0000-0000-000000000001"
-      org_id: "00000000-0000-0000-0000-000000000001"
-
-versioning:
-  default_ttl_days: 30
-  min_ttl_days: 7
-`
+	configContent := "server:\n" +
+		"  port: \":9090\"\n\n" +
+		"database:\n" +
+		"  hosts:\n" +
+		"    - \"localhost\"\n" +
+		"  keyspace: \"test_keyspace\"\n" +
+		"  consistency: \"ONE\"\n" +
+		"  timeout: \"25s\"\n\n" +
+		"storage:\n" +
+		"  default_class: \"hot\"\n" +
+		"  backends:\n" +
+		"    hot:\n" +
+		"      type: \"s3\"\n" +
+		"      bucket: \"test-bucket\"\n" +
+		"      region: \"us-east-1\"\n\n" +
+		"auth:\n" +
+		"  dev_mode: true\n" +
+		"  dev_tokens:\n" +
+		"    - token: \"test-token\"\n" +
+		"      user_id: \"00000000-0000-0000-0000-000000000001\"\n" +
+		"      org_id: \"00000000-0000-0000-0000-000000000001\"\n\n" +
+		"versioning:\n" +
+		"  default_ttl_days: 30\n" +
+		"  min_ttl_days: 7\n"
 
 	if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
 		t.Fatalf("Failed to write test config: %v", err)
@@ -111,6 +107,9 @@ versioning:
 	}
 	if cfg.Database.Keyspace != "test_keyspace" {
 		t.Errorf("Database.Keyspace = %s, want test_keyspace", cfg.Database.Keyspace)
+	}
+	if cfg.Database.Timeout != 25*time.Second {
+		t.Errorf("Database.Timeout = %s, want 25s", cfg.Database.Timeout)
 	}
 
 	// Verify storage config
@@ -180,6 +179,7 @@ versioning:
 	t.Setenv("CONFIG_PATH", configPath)
 	t.Setenv("SERVER_PORT", ":9999")
 	t.Setenv("AUTH_DEV_MODE", "true")
+	t.Setenv("CASSANDRA_TIMEOUT", "42s")
 
 	cfg, err := Load()
 	if err != nil {
@@ -193,6 +193,9 @@ versioning:
 	if !cfg.Auth.DevMode {
 		t.Error("Auth.DevMode should be true (from env)")
 	}
+	if cfg.Database.Timeout != 42*time.Second {
+		t.Errorf("Database.Timeout = %s, want 42s (from env)", cfg.Database.Timeout)
+	}
 }
 
 func TestDefaultConfig(t *testing.T) {
@@ -203,6 +206,9 @@ func TestDefaultConfig(t *testing.T) {
 	}
 	if cfg.Database.Keyspace != "sesamefs" {
 		t.Errorf("Database.Keyspace = %s, want sesamefs", cfg.Database.Keyspace)
+	}
+	if cfg.Database.Timeout != 10*time.Second {
+		t.Errorf("Database.Timeout = %s, want 10s", cfg.Database.Timeout)
 	}
 	if cfg.Database.ReplicationClass != "NetworkTopologyStrategy" {
 		t.Errorf("Database.ReplicationClass = %s, want NetworkTopologyStrategy", cfg.Database.ReplicationClass)

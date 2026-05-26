@@ -450,6 +450,7 @@ type DatabaseConfig struct {
 	Hosts             []string       `yaml:"hosts"`
 	Keyspace          string         `yaml:"keyspace"`
 	Consistency       string         `yaml:"consistency"`
+	Timeout           time.Duration  `yaml:"timeout"`
 	LocalDC           string         `yaml:"local_dc"`
 	Username          string         `yaml:"username"`
 	Password          string         `yaml:"password"`
@@ -678,6 +679,7 @@ func DefaultConfig() *Config {
 			Hosts:             []string{"localhost:9042"},
 			Keyspace:          "sesamefs",
 			Consistency:       "LOCAL_QUORUM",
+			Timeout:           10 * time.Second,
 			LocalDC:           "datacenter1",
 			ReplicationClass:  "NetworkTopologyStrategy",
 			ReplicationFactor: 1,
@@ -848,6 +850,14 @@ func (c *Config) applyEnvOverrides() {
 	}
 	if v := os.Getenv("CASSANDRA_KEYSPACE"); v != "" {
 		c.Database.Keyspace = v
+	}
+	if v := os.Getenv("CASSANDRA_TIMEOUT"); v != "" {
+		parsed, err := time.ParseDuration(strings.TrimSpace(v))
+		if err != nil {
+			c.addEnvOverrideError("CASSANDRA_TIMEOUT must be a duration, got %q", v)
+		} else {
+			c.Database.Timeout = parsed
+		}
 	}
 	if v := os.Getenv("CASSANDRA_USERNAME"); v != "" {
 		c.Database.Username = v
@@ -1290,6 +1300,9 @@ func (c *Config) Validate() error {
 	}
 	if c.Database.Keyspace == "" {
 		return fmt.Errorf("database keyspace is required")
+	}
+	if c.Database.Timeout <= 0 {
+		return fmt.Errorf("database timeout must be greater than zero")
 	}
 	switch normalizedClass := normalizeCassandraReplicationClass(c.Database.ReplicationClass); normalizedClass {
 	case "SimpleStrategy":

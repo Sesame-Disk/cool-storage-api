@@ -11,6 +11,8 @@ import (
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
 )
 
+const defaultCassandraTimeout = 10 * time.Second
+
 // DB wraps the Cassandra session.
 type DB struct {
 	session *gocql.Session
@@ -73,8 +75,12 @@ func missingKeyspaceError(keyspace string) error {
 func newCluster(cfg config.DatabaseConfig) *gocql.ClusterConfig {
 	cluster := gocql.NewCluster(cfg.Hosts...)
 	cluster.Consistency = parseConsistency(cfg.Consistency)
-	cluster.Timeout = 10 * time.Second
-	cluster.ConnectTimeout = 10 * time.Second
+	queryTimeout := cfg.Timeout
+	if queryTimeout <= 0 {
+		queryTimeout = defaultCassandraTimeout
+	}
+	cluster.Timeout = queryTimeout
+	cluster.ConnectTimeout = defaultCassandraTimeout
 
 	if cfg.LocalDC != "" {
 		cluster.PoolConfig.HostSelectionPolicy = gocql.DCAwareRoundRobinPolicy(cfg.LocalDC)
