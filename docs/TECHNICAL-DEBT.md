@@ -1384,15 +1384,33 @@ The copy/move surface is narrower than the generic upload surface:
 
 - active publish paths already use `IncrementBlockRefCountsTracked()` and roll
   back the exact confirmed subset on failure;
-- the older `IncrementBlockRefCounts()` wrapper now self-rolls back previously
-  confirmed increments before returning an error, so it no longer leaves silent
-  partial progress behind for future callers.
+- the older `IncrementBlockRefCounts()` wrapper still does a naive loop and can
+  expose partial increments if a future caller uses it without explicit
+  tracking/rollback. That is not the active copy/move path today, but it
+  remains a footgun until a later hardening branch removes or tightens it.
 
 What would fully close this debt is durable idempotency or reconciliation at
 the block-registration layer itself: an operation key persisted with the block
 mutation, a pending-upload/block-promotion table that can reconcile ambiguous
 outcomes, or a later refcount repair pass derived from published commit
 reachability.
+
+This should stay framed against the two viable design directions:
+
+- **Option B: mutable refcount with CAS/LWT**. Read the current `ref_count`,
+  compute the new value, and `UPDATE ... IF ref_count = <value_read>`. This is
+  the classic optimistic-concurrency approach. It is correct and safe, and it
+  is acceptable when the business cost of a mistake is data loss. The downside
+  is that in multiregion it pays full cross-DC Paxos on every contended write.
+- **Option C: references as rows rather than a mutable integer**. Store one row
+  per `(block_id, referrer)` and make add/remove be `INSERT`/`DELETE` of those
+  rows. That removes most writer collisions at the modeling layer instead of
+  trying to resolve them later on one hot counter row.
+
+The strongest future direction is likely a hybrid: use row-per-reference where
+the steady-state workload can tolerate it, and keep expensive LWT only at the
+irreversible GC moment when the system is about to delete from S3 and must prove
+that no live references remain.
 
 ### 19.q. Chunked Block-Metadata LWT Throttling Is Process-Local, Not Cluster-Wide
 
@@ -1413,6 +1431,40 @@ That gate is intentionally narrow:
 This is still worth shipping because it reduces the hottest self-inflicted
 pressure source without changing protocol semantics. It should just stay
 documented as an operational mitigation, not as a full correctness guarantee.
+
+### 19.r. `blocks` Is Hot-Partitioned By `org_id`
+
+`internal/db/migrations/001_initial_schema.cql` defines `blocks` as
+`PRIMARY KEY ((org_id), block_id)`. That means all block refcount writes for one
+organization land in the same Cassandra partition.
+
+For this workload, that is a classic schema anti-pattern:
+
+- the partition key has low cardinality relative to traffic volume;
+- each org can accumulate a very large block working set;
+- multiregion CAS/LWT then concentrates cross-DC Paxos on one partition rather
+  than distributing it across many independent keys.
+
+The platform/system org makes this more serious than a theoretical tenant edge
+case. Shared/system flows can end up hammering one central partition
+(`00000000-0000-0000-0000-000000000000`) even before the per-row refcount logic
+itself is the limiting factor.
+
+The future schema branch should evaluate higher-cardinality partitioning that
+matches the real bounded query shape, for example:
+
+- `file_id` if the natural read pattern is one file at a time;
+- `(org_id, file_id)` if org scoping matters but physical fan-out is needed;
+- `(org_id, bucket)` or another sharded key if org-local lookup must remain but
+  write distribution is the first concern.
+
+The rule is to partition by something with many distinct values where each query
+touches one bounded slice. `org_id` alone does not satisfy that rule for
+block-heavy traffic.
+
+This should be treated as part of a broader DB-schema bottleneck audit in future
+branches, not as an isolated tuning ticket. The current upload incident just
+made this particular hotspot visible first.
 
 ---
 
