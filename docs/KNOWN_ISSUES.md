@@ -472,8 +472,9 @@ The current branch therefore fixes the production outage class better than `main
 #### What Is Already Narrowed
 
 - Copy/move code paths that need rollback already use `IncrementBlockRefCountsTracked()` so they receive the exact list of confirmed increments to unwind on publish failure.
-- The older `IncrementBlockRefCounts()` helper is still a future footgun because it can expose partial progress without rollback if a new caller uses it naively. That is not the current copy/move hot path, but it remains design debt until it is either removed or hardened in a separate branch.
+- The older `IncrementBlockRefCounts()` helper now attempts rollback of previously confirmed increments before returning an error. That narrows the partial-progress footgun, but rollback is still best-effort because `DecrementBlockRefCountsOnce()` does not surface a rollback error back to the caller.
 - The new chunked-upload permit is intentionally only a **process-local** pressure valve. It lowers the chance of `blocks`-table Paxos storms from one finalize wave, but it is not cluster-wide serialization.
+- The current audit did **not** confirm a same-finalize self-deadlock from that permit: each block acquires/releases it inside its own block goroutine. The remaining gap is coverage, not a confirmed blocker — the suite still lacks a chunked upload test that forces `finalizeUploadStreaming()` through a file larger than `uploadBlockSize` while `finalizeUploadBlockMetadataConcurrency = 1`.
 
 #### What Would Fully Close It
 

@@ -1384,10 +1384,12 @@ The copy/move surface is narrower than the generic upload surface:
 
 - active publish paths already use `IncrementBlockRefCountsTracked()` and roll
   back the exact confirmed subset on failure;
-- the older `IncrementBlockRefCounts()` wrapper still does a naive loop and can
-  expose partial increments if a future caller uses it without explicit
-  tracking/rollback. That is not the active copy/move path today, but it
-  remains a footgun until a later hardening branch removes or tightens it.
+- the older `IncrementBlockRefCounts()` wrapper now attempts rollback of the
+  previously confirmed subset before returning an error. That narrows the old
+  partial-progress footgun, but rollback is still best-effort because the
+  `DecrementBlockRefCountsOnce()` path does not propagate a rollback failure
+  back to the caller. A later hardening branch should either remove this
+  generic wrapper or make rollback failures visible/retryable.
 
 What would fully close this debt is durable idempotency or reconciliation at
 the block-registration layer itself: an operation key persisted with the block
@@ -1431,6 +1433,25 @@ That gate is intentionally narrow:
 This is still worth shipping because it reduces the hottest self-inflicted
 pressure source without changing protocol semantics. It should just stay
 documented as an operational mitigation, not as a full correctness guarantee.
+
+The current audit did **not** confirm the feared same-finalize self-deadlock.
+`finalizeUploadStreaming()` spawns one goroutine per block, and each block
+goroutine acquires the metadata permit once, runs `AccountBlockOnce(...)`, and
+releases the permit when that goroutine returns. There is no current code path
+where one block goroutine acquires a second permit before releasing the first.
+
+The remaining debt here is coverage rather than a confirmed correctness bug.
+Current tests prove:
+
+- the permit primitive blocks a second caller while the first holds it;
+- chunked HTTP upload flows still round-trip and recover from known finalize
+  conflicts.
+
+What is still missing is the integration test that forces
+`finalizeUploadStreaming()` down the true multi-block path with a file larger
+than `uploadBlockSize` while `finalizeUploadBlockMetadataConcurrency = 1`.
+That test should exist before future refactors rely on the throttle as a stable
+invariant.
 
 ### 19.r. `blocks` Is Hot-Partitioned By `org_id`
 
