@@ -532,6 +532,9 @@ func (w *Worker) RecoverS3Orphans(ctx context.Context, perBucketLimit int) (int,
 				if _, err := w.store.GetBlockRefCount(orph.OrgID, orph.BlockID); err == nil {
 					// The canonical block row still exists (likely claimed but not yet finalized).
 					// Skip recovery for now; a later worker retry or startup scan will finish it.
+					if phaseErr == nil {
+						phaseErr = fmt.Errorf("S3 orphan recovery deferred for org=%s block=%s because canonical block row still exists", orph.OrgID, orph.BlockID)
+					}
 					continue
 				} else if !errors.Is(err, gocql.ErrNotFound) {
 					log.Printf("[GC Worker] S3 orphan recovery: block ref-count lookup failed for org=%s block=%s: %v", orph.OrgID, orph.BlockID, err)
@@ -1399,21 +1402,23 @@ func (w *Worker) collectLiveFSObjectBlockReferenceCounts(orgID uuid.UUID) (map[s
 
 func (w *Worker) enqueueZeroRefBlocks(orgID, libraryID uuid.UUID, blockIDs []string, storageClass string) error {
 	var blockBatch []QueueItem
+	var candidateProjectionErr error
 	for _, blockID := range blockIDs {
 		candidateAt, candidateErr := w.store.EnsureBlockGCCandidate(orgID, blockID, storageClass, time.Now())
 		if candidateErr != nil && candidateAt.IsZero() {
 			return candidateErr
 		}
-		if candidateErr != nil {
-			metrics.GCBlockCandidateDiscoveryDegradedTotal.WithLabelValues("worker").Inc()
-			log.Printf("[GC Worker] WARNING: block candidate discovery degraded for org=%s block=%s: %v", orgID, blockID, candidateErr)
-		}
 		exists, err := w.store.PendingItemExists(orgID, uuid.Nil, candidateAt, ItemBlock, blockID)
 		if err != nil {
-			return errors.Join(candidateErr, err)
+			return errors.Join(candidateErr, candidateProjectionErr, err)
 		}
 		if exists {
 			continue
+		}
+		if candidateErr != nil {
+			metrics.GCBlockCandidateDiscoveryDegradedTotal.WithLabelValues("worker").Inc()
+			log.Printf("[GC Worker] WARNING: block candidate discovery degraded for org=%s block=%s: %v", orgID, blockID, candidateErr)
+			candidateProjectionErr = errors.Join(candidateProjectionErr, fmt.Errorf("ensure block GC candidate projection for block %s: %w", blockID, candidateErr))
 		}
 		blockBatch = append(blockBatch, QueueItem{
 			OrgID:        orgID,
@@ -1428,7 +1433,10 @@ func (w *Worker) enqueueZeroRefBlocks(orgID, libraryID uuid.UUID, blockIDs []str
 	if len(blockBatch) == 0 {
 		return nil
 	}
-	return w.queue.EnqueueBatch(blockBatch)
+	if err := w.queue.EnqueueBatch(blockBatch); err != nil {
+		return errors.Join(candidateProjectionErr, err)
+	}
+	return nil
 }
 
 // EnqueueLibraryContents enqueues all contents of a deleted library for GC.

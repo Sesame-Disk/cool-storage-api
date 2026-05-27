@@ -273,8 +273,8 @@ func TestWorker_RecoverS3Orphans_SkipsClaimedRows(t *testing.T) {
 	}
 
 	recovered, err := w.RecoverS3Orphans(context.Background(), 100)
-	if err != nil {
-		t.Fatalf("RecoverS3Orphans: %v", err)
+	if err == nil {
+		t.Fatal("RecoverS3Orphans() error = nil, want non-nil while canonical block row still exists")
 	}
 	if recovered != 0 {
 		t.Errorf("recovered=%d, want 0 while block row still exists", recovered)
@@ -284,6 +284,9 @@ func TestWorker_RecoverS3Orphans_SkipsClaimedRows(t *testing.T) {
 	}
 	if got := sp.DeletedBlocks(); len(got) != 0 {
 		t.Errorf("S3 should not be touched while claimed block row still exists, got %v", got)
+	}
+	if _, err := store.LoadGCStats(gcS3OrphansCursorKey); !errors.Is(err, gocql.ErrNotFound) {
+		t.Fatalf("expected cursor to remain unset while claimed row is deferred, got err=%v", err)
 	}
 }
 

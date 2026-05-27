@@ -2,12 +2,14 @@ package streaming
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log"
 	"sync"
 
 	"github.com/Sesame-Disk/sesamefs/internal/crypto"
 	"github.com/Sesame-Disk/sesamefs/internal/db"
+	gocql "github.com/apache/cassandra-gocql-driver/v2"
 	"github.com/gin-gonic/gin"
 )
 
@@ -38,9 +40,10 @@ func PutCopyBuf(buf []byte) {
 	copyBufPool.Put(&buf)
 }
 
-// BatchResolveBlockIDs resolves all SHA-1 block IDs (40 chars) to SHA-256 in batch.
+// BatchResolveBlockIDs resolves all SHA-1 block IDs (40 chars) to SHA-256.
 // IDs that are already SHA-256 (64 chars) are returned as-is.
-// Uses Cassandra IN queries in batches of 100 for efficiency.
+// block_id_mappings is partitioned by ((org_id, external_id)), so each lookup
+// is a single-row read. Keep concurrency bounded to avoid pressuring the driver.
 func BatchResolveBlockIDs(database *db.DB, orgID string, blockIDs []string) []string {
 	resolved := make([]string, len(blockIDs))
 	copy(resolved, blockIDs)
@@ -56,46 +59,61 @@ func BatchResolveBlockIDs(database *db.DB, orgID string, blockIDs []string) []st
 		return resolved
 	}
 
-	// Batch resolve using IN clause (up to 100 at a time)
-	const batchSize = 100
-	for start := 0; start < len(toResolve); start += batchSize {
-		end := start + batchSize
-		if end > len(toResolve) {
-			end = len(toResolve)
-		}
-		batch := toResolve[start:end]
+	type lookupResult struct {
+		idx        int
+		internalID string
+		err        error
+	}
 
-		externalIDs := make([]string, len(batch))
-		for j, idx := range batch {
-			externalIDs[j] = blockIDs[idx]
-		}
+	const mappingResolveConcurrency = 32
+	concurrency := mappingResolveConcurrency
+	if concurrency > len(toResolve) {
+		concurrency = len(toResolve)
+	}
+	sem := make(chan struct{}, concurrency)
+	results := make(chan lookupResult, len(toResolve))
 
-		iter := database.Session().Query(`
-			SELECT external_id, internal_id FROM block_id_mappings
-			WHERE org_id = ? AND external_id IN ?
-		`, orgID, externalIDs).Iter()
+	for _, idx := range toResolve {
+		sem <- struct{}{}
+		go func(idx int) {
+			defer func() { <-sem }()
+			var internalID string
+			err := database.Session().Query(`
+				SELECT internal_id FROM block_id_mappings
+				WHERE org_id = ? AND external_id = ?
+			`, orgID, blockIDs[idx]).Scan(&internalID)
+			results <- lookupResult{idx: idx, internalID: internalID, err: err}
+		}(idx)
+	}
 
-		var extID, intID string
-		mapping := make(map[string]string, len(batch))
-		for iter.Scan(&extID, &intID) {
-			mapping[extID] = intID
-		}
-		if err := iter.Close(); err != nil {
-			log.Printf("[BatchResolveBlockIDs] WARNING: query error org=%s blocks=%d: %v", orgID, len(batch), err)
-		}
-
-		var unresolved int
-		for _, idx := range batch {
-			if mapped, ok := mapping[blockIDs[idx]]; ok && mapped != "" {
-				resolved[idx] = mapped
-			} else {
-				unresolved++
+	unresolved := 0
+	queryFailures := 0
+	firstUnresolved := ""
+	for range toResolve {
+		result := <-results
+		if result.err != nil {
+			if !errors.Is(result.err, gocql.ErrNotFound) {
+				queryFailures++
+				log.Printf("[BatchResolveBlockIDs] WARNING: query error org=%s block=%s: %v", orgID, blockIDs[result.idx], result.err)
 			}
+			unresolved++
+			if firstUnresolved == "" {
+				firstUnresolved = blockIDs[result.idx]
+			}
+			continue
 		}
-		if unresolved > 0 {
-			log.Printf("[BatchResolveBlockIDs] WARNING: %d/%d blocks UNRESOLVED for org=%s (first unresolved: %s)",
-				unresolved, len(batch), orgID, externalIDs[0])
+		if result.internalID != "" {
+			resolved[result.idx] = result.internalID
+			continue
 		}
+		unresolved++
+		if firstUnresolved == "" {
+			firstUnresolved = blockIDs[result.idx]
+		}
+	}
+	if unresolved > 0 {
+		log.Printf("[BatchResolveBlockIDs] WARNING: %d/%d blocks UNRESOLVED for org=%s (first unresolved: %s, query_failures=%d)",
+			unresolved, len(toResolve), orgID, firstUnresolved, queryFailures)
 	}
 
 	return resolved

@@ -192,7 +192,7 @@ func TestWorker_EnqueueZeroRefBlocks_RecordsProjectionDegradationMetric(t *testi
 	beforeDegraded := testutil.ToFloat64(metrics.GCBlockCandidateDiscoveryDegradedTotal.WithLabelValues("worker"))
 
 	if err := w.enqueueZeroRefBlocks(orgID, uuid.Nil, []string{"block-worker-degraded"}, "hot"); err != nil {
-		t.Fatalf("enqueueZeroRefBlocks returned error despite usable candidate identity: %v", err)
+		t.Fatalf("enqueueZeroRefBlocks returned error despite usable queue protection: %v", err)
 	}
 	afterDegraded := testutil.ToFloat64(metrics.GCBlockCandidateDiscoveryDegradedTotal.WithLabelValues("worker"))
 	if afterDegraded-beforeDegraded != 1 {

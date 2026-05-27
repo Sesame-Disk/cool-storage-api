@@ -1230,37 +1230,48 @@ func (s *CassandraStore) ResolveBlockIDs(orgID uuid.UUID, blockIDs []string) ([]
 		return resolved, nil
 	}
 
-	const batchSize = 100
-	for start := 0; start < len(toResolve); start += batchSize {
-		end := start + batchSize
-		if end > len(toResolve) {
-			end = len(toResolve)
-		}
-		batch := toResolve[start:end]
-		externalIDs := make([]string, len(batch))
-		for i, idx := range batch {
-			externalIDs[i] = blockIDs[idx]
-		}
+	type lookupResult struct {
+		idx        int
+		internalID string
+		err        error
+	}
 
-		iter := s.db.Session().Query(`
-			SELECT external_id, internal_id FROM block_id_mappings
-			WHERE org_id = ? AND external_id IN ?
-		`, orgID.String(), externalIDs).Iter()
+	const mappingResolveConcurrency = 32
+	concurrency := mappingResolveConcurrency
+	if concurrency > len(toResolve) {
+		concurrency = len(toResolve)
+	}
+	sem := make(chan struct{}, concurrency)
+	results := make(chan lookupResult, len(toResolve))
 
-		mapping := make(map[string]string, len(batch))
-		var externalID, internalID string
-		for iter.Scan(&externalID, &internalID) {
-			mapping[externalID] = internalID
-		}
-		if err := iter.Close(); err != nil {
-			return nil, err
-		}
+	for _, idx := range toResolve {
+		sem <- struct{}{}
+		go func(idx int) {
+			defer func() { <-sem }()
+			var internalID string
+			err := s.db.Session().Query(`
+				SELECT internal_id FROM block_id_mappings
+				WHERE org_id = ? AND external_id = ?
+			`, orgID.String(), blockIDs[idx]).Scan(&internalID)
+			results <- lookupResult{idx: idx, internalID: internalID, err: err}
+		}(idx)
+	}
 
-		for _, idx := range batch {
-			if mapped, ok := mapping[blockIDs[idx]]; ok && mapped != "" {
-				resolved[idx] = mapped
+	var resolveErr error
+	for range toResolve {
+		result := <-results
+		if result.err != nil {
+			if !errors.Is(result.err, gocql.ErrNotFound) {
+				resolveErr = errors.Join(resolveErr, fmt.Errorf("resolve block mapping org=%s external=%s: %w", orgID, blockIDs[result.idx], result.err))
 			}
+			continue
 		}
+		if result.internalID != "" {
+			resolved[result.idx] = result.internalID
+		}
+	}
+	if resolveErr != nil {
+		return nil, resolveErr
 	}
 
 	return resolved, nil

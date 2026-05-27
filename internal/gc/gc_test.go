@@ -1334,7 +1334,7 @@ func TestService_EnqueueBlock_ContinuesWhenCandidateRepairDegraded(t *testing.T)
 	beforeDegraded := testutil.ToFloat64(metrics.GCBlockCandidateDiscoveryDegradedTotal.WithLabelValues("service"))
 
 	if err := svc.EnqueueBlock(orgID, "block-repair-warning", uuid.Nil, "hot"); err != nil {
-		t.Fatalf("EnqueueBlock returned error despite successful protection+enqueue: %v", err)
+		t.Fatalf("EnqueueBlock returned error despite usable queue protection: %v", err)
 	}
 	afterDegraded := testutil.ToFloat64(metrics.GCBlockCandidateDiscoveryDegradedTotal.WithLabelValues("service"))
 	if afterDegraded-beforeDegraded != 1 {
