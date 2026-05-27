@@ -11,7 +11,9 @@ import (
 	"time"
 
 	"github.com/Sesame-Disk/sesamefs/internal/config"
+	"github.com/Sesame-Disk/sesamefs/internal/metrics"
 	"github.com/google/uuid"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
 type fakeLeaderLease struct {
@@ -1321,6 +1323,56 @@ func TestService_Queue(t *testing.T) {
 
 	if svc.Queue() != svc.queue {
 		t.Error("Queue() should return the internal queue")
+	}
+}
+
+func TestService_EnqueueBlock_ContinuesWhenCandidateRepairDegraded(t *testing.T) {
+	store := NewMockStore()
+	store.ensureBlockGCCandidateErrAfterMutate = errors.New("repair projection failed")
+	svc := NewService(store, nil, config.GCConfig{Enabled: true}, nil)
+	orgID := uuid.New()
+	beforeDegraded := testutil.ToFloat64(metrics.GCBlockCandidateDiscoveryDegradedTotal.WithLabelValues("service"))
+
+	if err := svc.EnqueueBlock(orgID, "block-repair-warning", uuid.Nil, "hot"); err != nil {
+		t.Fatalf("EnqueueBlock returned error despite usable queue protection: %v", err)
+	}
+	afterDegraded := testutil.ToFloat64(metrics.GCBlockCandidateDiscoveryDegradedTotal.WithLabelValues("service"))
+	if afterDegraded-beforeDegraded != 1 {
+		t.Fatalf("service degraded metric delta = %v, want 1", afterDegraded-beforeDegraded)
+	}
+
+	items := store.QueueItems(orgID)
+	if len(items) != 1 {
+		t.Fatalf("expected 1 queued block item, got %d", len(items))
+	}
+	if items[0].ItemType != ItemBlock || items[0].ItemID != "block-repair-warning" {
+		t.Fatalf("unexpected queued item: %+v", items[0])
+	}
+	if got := len(store.AllBlockGCCandidates()); got != 1 {
+		t.Fatalf("expected canonical GC candidate to remain recorded, got %d rows", got)
+	}
+}
+
+func TestService_EnqueueBlock_ExistingPendingItemSuppressesRepairWarning(t *testing.T) {
+	store := NewMockStore()
+	svc := NewService(store, nil, config.GCConfig{Enabled: true}, nil)
+	orgID := uuid.New()
+	candidateAt := time.Now().UTC().Truncate(time.Millisecond)
+
+	if _, err := store.EnsureBlockGCCandidate(orgID, "block-already-pending", "hot", candidateAt); err != nil {
+		t.Fatalf("EnsureBlockGCCandidate seed failed: %v", err)
+	}
+	if err := store.EnqueueItem(orgID, candidateAt, ItemBlock, "block-already-pending", uuid.Nil, "hot", 0); err != nil {
+		t.Fatalf("EnqueueItem seed failed: %v", err)
+	}
+	store.ensureBlockGCCandidateErrAfterMutate = errors.New("repair projection failed")
+
+	if err := svc.EnqueueBlock(orgID, "block-already-pending", uuid.Nil, "hot"); err != nil {
+		t.Fatalf("EnqueueBlock returned error for already-pending block: %v", err)
+	}
+
+	if got := len(store.QueueItems(orgID)); got != 1 {
+		t.Fatalf("expected existing pending item to remain unique, got %d items", got)
 	}
 }
 

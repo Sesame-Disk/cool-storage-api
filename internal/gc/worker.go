@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Sesame-Disk/sesamefs/internal/db"
 	"github.com/Sesame-Disk/sesamefs/internal/metrics"
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
 	"github.com/google/uuid"
@@ -355,6 +356,8 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem, blockRefs *bl
 		return nil
 	}
 
+	candidateAt := effectiveIdentityAt(item.QueuedAt, item.IdentityAt)
+
 	referenced, err := w.blockReferencedByFSObject(item.OrgID, item.ItemID, blockRefs)
 	if err != nil {
 		return fmt.Errorf("failed to verify live fs_object references for block %s: %w", item.ItemID, err)
@@ -375,7 +378,7 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem, blockRefs *bl
 	// 2. If it didn't apply, it means ref_count > 0 or it was already deleted.
 	// We skip deleting from S3 to avoid data loss.
 	if !applied {
-		if err := w.store.DeleteBlockGCCandidate(item.OrgID, item.ItemID); err != nil {
+		if err := w.store.DeleteBlockGCCandidate(item.OrgID, item.ItemID, candidateAt); err != nil {
 			return fmt.Errorf("failed to clear stale block GC candidate: %w", err)
 		}
 		log.Printf("[GC Worker] Block %s LWT delete not applied (ref_count > 0 or already deleted), skipping S3 deletion", item.ItemID)
@@ -390,7 +393,8 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem, blockRefs *bl
 	if storageClass == "" {
 		storageClass = "hot"
 	}
-	if err := w.store.RecordS3Orphan(item.OrgID, item.ItemID, storageClass, "", w.clock()); err != nil {
+	orphanFirstSeenAt, err := w.store.RecordS3Orphan(item.OrgID, item.ItemID, storageClass, "", w.clock().UTC())
+	if err != nil {
 		return fmt.Errorf("failed to record pending S3 delete for block %s: %w", item.ItemID, err)
 	}
 
@@ -414,7 +418,7 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem, blockRefs *bl
 			metrics.GCAuditEventsTotal.WithLabelValues("gc_block_s3_orphaned").Inc()
 			// Do NOT return error — the block is recorded for recovery.
 			// Continue to mapping/candidate cleanup so the queue item completes.
-		} else if err := w.store.DeleteS3Orphan(item.OrgID, item.ItemID); err != nil {
+		} else if err := w.store.DeleteS3Orphan(item.OrgID, item.ItemID, orphanFirstSeenAt); err != nil {
 			log.Printf("[GC Worker] WARNING: S3 delete for block %s succeeded but failed to clear recovery row: %v", item.ItemID, err)
 		}
 	}
@@ -427,7 +431,7 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem, blockRefs *bl
 		}
 	}
 
-	if err := w.store.DeleteBlockGCCandidate(item.OrgID, item.ItemID); err != nil {
+	if err := w.store.DeleteBlockGCCandidate(item.OrgID, item.ItemID, candidateAt); err != nil {
 		return fmt.Errorf("failed to clear block GC candidate: %w", err)
 	}
 
@@ -467,7 +471,13 @@ func (w *Worker) deleteS3WithRetry(ctx context.Context, blockStore BlockStoreDel
 // RecoverS3Orphans retries S3 deletes for orphan rows in gc_s3_orphans.
 // Called by the scanner; exposed on the worker because it needs access to
 // w.storage. Returns the number of orphans successfully recovered.
-func (w *Worker) RecoverS3Orphans(ctx context.Context, perOrgLimit int) (int, error) {
+//
+// Walks the gc_s3_orphans_by_day discovery projection from a persisted UTC-day
+// cursor up to today. On cold start (no cursor) it scans the full 90-day TTL
+// horizon so old orphan rows cannot get stranded forever. `perBucketLimit`
+// caps the rows pulled per (day, bucket) so a single misbehaving bucket cannot
+// starve the worker.
+func (w *Worker) RecoverS3Orphans(ctx context.Context, perBucketLimit int) (int, error) {
 	if w.storage == nil {
 		return 0, nil
 	}
@@ -475,60 +485,145 @@ func (w *Worker) RecoverS3Orphans(ctx context.Context, perOrgLimit int) (int, er
 		log.Println("[GC Worker] DRY RUN: skipping S3 orphan recovery")
 		return 0, nil
 	}
-	orgs, err := w.store.ListS3OrphanOrgs()
-	if err != nil {
-		return 0, fmt.Errorf("failed to list S3 orphan orgs: %w", err)
+	if perBucketLimit <= 0 {
+		perBucketLimit = 100
 	}
+
+	cutoffDay := db.GCProjectionUTCDate(w.clock())
+	startDay, err := w.loadS3OrphansStartDay(cutoffDay)
+	if err != nil {
+		return 0, err
+	}
+	if startDay.After(cutoffDay) {
+		return 0, nil
+	}
+
 	recovered := 0
-	for _, orgID := range orgs {
-		select {
-		case <-ctx.Done():
-			return recovered, ctx.Err()
-		default:
-		}
-		orphans, err := w.store.ListS3Orphans(orgID, perOrgLimit)
-		if err != nil {
-			log.Printf("[GC Worker] Failed to list S3 orphans for org %s: %v", orgID, err)
-			continue
-		}
-		for _, orph := range orphans {
+	var phaseErr error
+	for day := startDay; !day.After(cutoffDay); day = day.AddDate(0, 0, 1) {
+		for bucket := 0; bucket < db.GCDiscoveryBucketCount; bucket++ {
 			select {
 			case <-ctx.Done():
 				return recovered, ctx.Err()
 			default:
 			}
-			if _, err := w.store.GetBlockRefCount(orph.OrgID, orph.BlockID); err == nil {
-				// The canonical block row still exists (likely claimed but not yet finalized).
-				// Skip recovery for now; a later worker retry or startup scan will finish it.
-				continue
-			}
 
-			storageClass := orph.StorageClass
-			if storageClass == "" {
-				storageClass = "hot"
-			}
-			blockStore, err := w.storage.GetBlockStore(storageClass)
+			orphans, err := w.store.ListS3OrphansByDay(day, bucket, perBucketLimit+1)
 			if err != nil {
-				log.Printf("[GC Worker] S3 orphan recovery: get block store for class %s failed: %v", storageClass, err)
-				continue
-			}
-			if err := blockStore.DeleteBlock(ctx, orph.BlockID); err != nil {
-				if updErr := w.store.UpdateS3OrphanAttempt(orph.OrgID, orph.BlockID, err.Error(), w.clock()); updErr != nil {
-					log.Printf("[GC Worker] S3 orphan recovery: update attempt for %s failed: %v", orph.BlockID, updErr)
+				log.Printf("[GC Worker] S3 orphan recovery: list failed for day=%s bucket=%d: %v", db.GCProjectionDateString(day), bucket, err)
+				if phaseErr == nil {
+					phaseErr = fmt.Errorf("list S3 orphan recovery partition day=%s bucket=%d: %w", db.GCProjectionDateString(day), bucket, err)
 				}
 				continue
 			}
-			if err := w.store.DeleteS3Orphan(orph.OrgID, orph.BlockID); err != nil {
-				log.Printf("[GC Worker] S3 orphan recovery: failed to clear orphan row %s: %v", orph.BlockID, err)
-				continue
+			if len(orphans) > perBucketLimit {
+				log.Printf("[GC Worker] S3 orphan recovery: partition day=%s bucket=%d hit limit=%d; deferring cursor advance", db.GCProjectionDateString(day), bucket, perBucketLimit)
+				if phaseErr == nil {
+					phaseErr = fmt.Errorf("S3 orphan recovery partition day=%s bucket=%d incomplete after reaching limit=%d", db.GCProjectionDateString(day), bucket, perBucketLimit)
+				}
+				orphans = orphans[:perBucketLimit]
 			}
-			recovered++
-			metrics.GCAuditEventsTotal.WithLabelValues("gc_s3_orphan_recovered").Inc()
-			log.Printf("[GC Worker] Recovered S3 orphan %s (org=%s, retries=%d)", orph.BlockID, orph.OrgID, orph.RetryCount)
+			for _, orph := range orphans {
+				select {
+				case <-ctx.Done():
+					return recovered, ctx.Err()
+				default:
+				}
+				if _, err := w.store.GetBlockRefCount(orph.OrgID, orph.BlockID); err == nil {
+					// The canonical block row still exists (likely claimed but not yet finalized).
+					// Skip recovery for now; a later worker retry or startup scan will finish it.
+					if phaseErr == nil {
+						phaseErr = fmt.Errorf("S3 orphan recovery deferred for org=%s block=%s because canonical block row still exists", orph.OrgID, orph.BlockID)
+					}
+					continue
+				} else if !errors.Is(err, gocql.ErrNotFound) {
+					log.Printf("[GC Worker] S3 orphan recovery: block ref-count lookup failed for org=%s block=%s: %v", orph.OrgID, orph.BlockID, err)
+					if phaseErr == nil {
+						phaseErr = fmt.Errorf("check block ref-count for S3 orphan org=%s block=%s: %w", orph.OrgID, orph.BlockID, err)
+					}
+					continue
+				}
+
+				storageClass := orph.StorageClass
+				if storageClass == "" {
+					storageClass = "hot"
+				}
+				blockStore, err := w.storage.GetBlockStore(storageClass)
+				if err != nil {
+					log.Printf("[GC Worker] S3 orphan recovery: get block store for class %s failed: %v", storageClass, err)
+					if phaseErr == nil {
+						phaseErr = fmt.Errorf("get block store for S3 orphan class=%s: %w", storageClass, err)
+					}
+					continue
+				}
+				if err := blockStore.DeleteBlock(ctx, orph.BlockID); err != nil {
+					if updErr := w.store.UpdateS3OrphanAttempt(orph.OrgID, orph.BlockID, err.Error(), w.clock()); updErr != nil {
+						log.Printf("[GC Worker] S3 orphan recovery: update attempt for %s failed: %v", orph.BlockID, updErr)
+						if phaseErr == nil {
+							phaseErr = fmt.Errorf("update S3 orphan attempt for block %s: %w", orph.BlockID, updErr)
+						}
+					}
+					if phaseErr == nil {
+						phaseErr = fmt.Errorf("delete S3 orphan block %s from backing store: %w", orph.BlockID, err)
+					}
+					continue
+				}
+				if err := w.store.DeleteS3Orphan(orph.OrgID, orph.BlockID, orph.FirstSeenAt); err != nil {
+					log.Printf("[GC Worker] S3 orphan recovery: failed to clear orphan row %s: %v", orph.BlockID, err)
+					if phaseErr == nil {
+						phaseErr = fmt.Errorf("clear S3 orphan row for block %s: %w", orph.BlockID, err)
+					}
+					continue
+				}
+				recovered++
+				metrics.GCAuditEventsTotal.WithLabelValues("gc_s3_orphan_recovered").Inc()
+				log.Printf("[GC Worker] Recovered S3 orphan %s (org=%s, retries=%d)", orph.BlockID, orph.OrgID, orph.RetryCount)
+			}
 		}
 	}
-	return recovered, nil
+
+	if phaseErr == nil {
+		newCursor := cutoffDay.AddDate(0, 0, -1)
+		if !newCursor.Before(startDay) {
+			if err := w.store.SaveGCStats(gcS3OrphansCursorKey, db.GCProjectionDateString(newCursor)); err != nil {
+				phaseErr = fmt.Errorf("persist S3 orphan recovery cursor: %w", err)
+			}
+		}
+	}
+
+	return recovered, phaseErr
 }
+
+func (w *Worker) loadS3OrphansStartDay(cutoffDay time.Time) (time.Time, error) {
+	value, err := w.store.LoadGCStats(gcS3OrphansCursorKey)
+	return s3OrphansRecoveryStartDayFromCursor(value, err, cutoffDay)
+}
+
+func s3OrphansRecoveryStartDayFromCursor(value string, loadErr error, cutoffDay time.Time) (time.Time, error) {
+	if loadErr != nil {
+		if errors.Is(loadErr, gocql.ErrNotFound) {
+			return s3OrphansRecoveryScanStartDay(time.Time{}, cutoffDay), nil
+		}
+		return time.Time{}, loadErr
+	}
+	lastDay, err := db.ParseGCProjectionDate(value)
+	if err != nil {
+		return time.Time{}, err
+	}
+	return s3OrphansRecoveryScanStartDay(lastDay, cutoffDay), nil
+}
+
+func s3OrphansRecoveryScanStartDay(lastProcessedDay, cutoffDay time.Time) time.Time {
+	if lastProcessedDay.IsZero() {
+		return cutoffDay.AddDate(0, 0, -gcS3OrphanInitialScanLookbackDays)
+	}
+	return lastProcessedDay.AddDate(0, 0, -gcScanOverlapDays)
+}
+
+// gcS3OrphanInitialScanLookbackDays bounds the cold-start recovery sweep when
+// no cursor exists yet. Match the gc_s3_orphans / gc_s3_orphans_by_day TTL so
+// the first pass can still see every live orphan row.
+const gcS3OrphanInitialScanLookbackDays = 90
 
 func (w *Worker) processCommit(item QueueItem) error {
 	// Get the commit to find its root_fs_id for cascading deletion
@@ -1307,17 +1402,23 @@ func (w *Worker) collectLiveFSObjectBlockReferenceCounts(orgID uuid.UUID) (map[s
 
 func (w *Worker) enqueueZeroRefBlocks(orgID, libraryID uuid.UUID, blockIDs []string, storageClass string) error {
 	var blockBatch []QueueItem
+	var candidateProjectionErr error
 	for _, blockID := range blockIDs {
-		candidateAt, err := w.store.EnsureBlockGCCandidate(orgID, blockID, storageClass, time.Now())
-		if err != nil {
-			return err
+		candidateAt, candidateErr := w.store.EnsureBlockGCCandidate(orgID, blockID, storageClass, time.Now())
+		if candidateErr != nil && candidateAt.IsZero() {
+			return candidateErr
 		}
 		exists, err := w.store.PendingItemExists(orgID, uuid.Nil, candidateAt, ItemBlock, blockID)
 		if err != nil {
-			return err
+			return errors.Join(candidateErr, candidateProjectionErr, err)
 		}
 		if exists {
 			continue
+		}
+		if candidateErr != nil {
+			metrics.GCBlockCandidateDiscoveryDegradedTotal.WithLabelValues("worker").Inc()
+			log.Printf("[GC Worker] WARNING: block candidate discovery degraded for org=%s block=%s: %v", orgID, blockID, candidateErr)
+			candidateProjectionErr = errors.Join(candidateProjectionErr, fmt.Errorf("ensure block GC candidate projection for block %s: %w", blockID, candidateErr))
 		}
 		blockBatch = append(blockBatch, QueueItem{
 			OrgID:        orgID,
@@ -1332,7 +1433,10 @@ func (w *Worker) enqueueZeroRefBlocks(orgID, libraryID uuid.UUID, blockIDs []str
 	if len(blockBatch) == 0 {
 		return nil
 	}
-	return w.queue.EnqueueBatch(blockBatch)
+	if err := w.queue.EnqueueBatch(blockBatch); err != nil {
+		return errors.Join(candidateProjectionErr, err)
+	}
+	return nil
 }
 
 // EnqueueLibraryContents enqueues all contents of a deleted library for GC.

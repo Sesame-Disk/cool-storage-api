@@ -125,6 +125,8 @@ type CassandraStore struct {
 const gcDeletedUsersCursorKey = "gc.scan.expired_deleted_users.last_deleted_day"
 const gcExpiredShareLinksCursorKey = "gc.scan.expired_share_links.last_expiry_day"
 const gcExpiredSharesCursorKey = "gc.scan.expired_shares.last_expiry_day"
+const gcBlockCandidatesCursorKey = "gc.scan.block_candidates.last_candidate_day"
+const gcS3OrphansCursorKey = "gc.scan.s3_orphans.last_first_seen_day"
 
 const (
 	gcInitialScanLookbackDays = 7
@@ -927,91 +929,202 @@ func (s *CassandraStore) GetOrgDeletedAt(orgID uuid.UUID) (*time.Time, error) {
 	return &deletedAtCopy, nil
 }
 
+func (s *CassandraStore) upsertBlockGCCandidateProjection(orgID uuid.UUID, blockID, storageClass string, candidateAt time.Time) error {
+	return s.db.Session().Query(`
+		INSERT INTO gc_block_candidates_by_day (candidate_day, bucket, candidate_at, org_id, block_id, storage_class)
+		VALUES (?, ?, ?, ?, ?, ?)
+	`, db.GCProjectionUTCDate(candidateAt), db.GCDiscoveryBucket(orgID.String(), blockID), candidateAt.UTC(), orgID.String(), blockID, storageClass).Exec()
+}
+
+func casStringValue(row map[string]interface{}, key string) (string, error) {
+	value, ok := row[key]
+	if !ok || value == nil {
+		return "", nil
+	}
+	switch typed := value.(type) {
+	case string:
+		return typed, nil
+	case []byte:
+		return string(typed), nil
+	default:
+		return "", fmt.Errorf("unexpected CAS %s type %T", key, value)
+	}
+}
+
+func casTimeValue(row map[string]interface{}, key string) (time.Time, error) {
+	value, ok := row[key]
+	if !ok || value == nil {
+		return time.Time{}, nil
+	}
+	switch typed := value.(type) {
+	case time.Time:
+		return typed, nil
+	case *time.Time:
+		if typed == nil {
+			return time.Time{}, nil
+		}
+		return *typed, nil
+	default:
+		return time.Time{}, fmt.Errorf("unexpected CAS %s type %T", key, value)
+	}
+}
+
+// EnsureBlockGCCandidate inserts a (org_id, block_id) row into the canonical
+// gc_block_candidates table if one does not already exist, and guarantees the
+// matching gc_block_candidates_by_day discovery row exists for the effective
+// candidate_at timestamp.
 func (s *CassandraStore) EnsureBlockGCCandidate(orgID uuid.UUID, blockID, storageClass string, candidateAt time.Time) (time.Time, error) {
-	var existingOrgID string
-	var existingBlockID string
-	var existingStorageClass string
-	var existingCandidateAt time.Time
+	existing := map[string]interface{}{}
 	applied, err := s.db.Session().Query(`
 		INSERT INTO gc_block_candidates (org_id, block_id, storage_class, candidate_at)
 		VALUES (?, ?, ?, ?) IF NOT EXISTS
-	`, orgID.String(), blockID, storageClass, candidateAt).ScanCAS(&existingOrgID, &existingBlockID, &existingStorageClass, &existingCandidateAt)
+	`, orgID.String(), blockID, storageClass, candidateAt).MapScanCAS(existing)
 	if err != nil {
 		return time.Time{}, err
 	}
-	if applied {
-		return candidateAt, nil
+	effectiveCandidateAt := candidateAt.UTC()
+	effectiveStorageClass := storageClass
+	if !applied {
+		effectiveCandidateAt, err = casTimeValue(existing, "candidate_at")
+		if err != nil {
+			return time.Time{}, err
+		}
+		if effectiveCandidateAt.IsZero() {
+			return time.Time{}, fmt.Errorf("gc_block_candidates row for org=%s block=%s is missing candidate_at", orgID, blockID)
+		}
+		effectiveStorageClass, err = casStringValue(existing, "storage_class")
+		if err != nil {
+			return time.Time{}, err
+		}
+		if effectiveStorageClass == "" {
+			effectiveStorageClass = storageClass
+		}
 	}
-	return existingCandidateAt, nil
+	if err := s.upsertBlockGCCandidateProjection(orgID, blockID, effectiveStorageClass, effectiveCandidateAt); err != nil {
+		return effectiveCandidateAt, fmt.Errorf("ensure gc_block_candidates_by_day discovery row for org=%s block=%s: %w", orgID, blockID, err)
+	}
+	return effectiveCandidateAt, nil
 }
 
-func (s *CassandraStore) DeleteBlockGCCandidate(orgID uuid.UUID, blockID string) error {
-	return s.db.Session().Query(`
+// DeleteBlockGCCandidate removes both the canonical row and the matching
+// discovery row. Callers should pass candidateAt when they already know it
+// (for example from QueueItem.QueuedAt or BlockGCCandidateInfo.CandidateAt) so
+// the discovery row can still be removed even if the canonical row is already
+// gone. A zero candidateAt falls back to reading the canonical row first. If
+// that row is already gone too, the discovery-row primary key is unknown and
+// the cleanup degrades to a best-effort canonical delete plus a warning.
+func (s *CassandraStore) DeleteBlockGCCandidate(orgID uuid.UUID, blockID string, candidateAt time.Time) error {
+	if candidateAt.IsZero() {
+		err := s.db.Session().Query(`
+			SELECT candidate_at FROM gc_block_candidates WHERE org_id = ? AND block_id = ?
+		`, orgID.String(), blockID).Scan(&candidateAt)
+		if err != nil && !errors.Is(err, gocql.ErrNotFound) {
+			return fmt.Errorf("failed to read gc_block_candidates row for delete: %w", err)
+		}
+	}
+
+	if err := s.db.Session().Query(`
 		DELETE FROM gc_block_candidates WHERE org_id = ? AND block_id = ?
-	`, orgID.String(), blockID).Exec()
+	`, orgID.String(), blockID).Exec(); err != nil {
+		return err
+	}
+
+	if candidateAt.IsZero() {
+		log.Printf("[GC] WARNING: DeleteBlockGCCandidate called without candidate_at for org=%s block=%s and canonical row is already gone; gc_block_candidates_by_day cleanup skipped because the discovery key is unknown", orgID, blockID)
+		return nil
+	}
+	if err := s.db.Session().Query(`
+		DELETE FROM gc_block_candidates_by_day
+		WHERE candidate_day = ? AND bucket = ? AND candidate_at = ? AND org_id = ? AND block_id = ?
+	`, db.GCProjectionUTCDate(candidateAt), db.GCDiscoveryBucket(orgID.String(), blockID), candidateAt.UTC(), orgID.String(), blockID).Exec(); err != nil {
+		log.Printf("[GC] WARNING: failed to delete gc_block_candidates_by_day discovery row for org=%s block=%s: %v", orgID, blockID, err)
+	}
+	return nil
 }
 
-func (s *CassandraStore) ListBlockGCCandidateOrgs() ([]uuid.UUID, error) {
-	iter := s.db.Session().Query(`SELECT DISTINCT org_id FROM gc_block_candidates`).Iter()
-	var orgs []uuid.UUID
-	var orgIDStr string
-	for iter.Scan(&orgIDStr) {
-		orgs = append(orgs, parseUUID(orgIDStr))
-	}
-	if err := iter.Close(); err != nil {
-		return nil, fmt.Errorf("failed to list block GC candidate orgs: %w", err)
-	}
-	return orgs, nil
-}
-
-func (s *CassandraStore) ListBlockGCCandidates(orgID uuid.UUID) ([]BlockGCCandidateInfo, error) {
+// ListBlockGCCandidatesByDay enumerates candidates for one (UTC day, discovery
+// bucket) partition. The scanner walks buckets [0, GCDiscoveryBucketCount)
+// for each day from its persisted cursor up to today.
+func (s *CassandraStore) ListBlockGCCandidatesByDay(day time.Time, bucket int) ([]BlockGCCandidateInfo, error) {
 	iter := s.db.Session().Query(`
-		SELECT block_id, storage_class, candidate_at
-		FROM gc_block_candidates WHERE org_id = ?
-	`, orgID.String()).Iter()
+		SELECT candidate_at, org_id, block_id, storage_class
+		FROM gc_block_candidates_by_day
+		WHERE candidate_day = ? AND bucket = ?
+	`, db.GCProjectionUTCDate(day), bucket).Iter()
 	var candidates []BlockGCCandidateInfo
-	var blockID, storageClass string
 	var candidateAt time.Time
-	for iter.Scan(&blockID, &storageClass, &candidateAt) {
+	var orgIDStr, blockID, storageClass string
+	for iter.Scan(&candidateAt, &orgIDStr, &blockID, &storageClass) {
 		candidates = append(candidates, BlockGCCandidateInfo{
+			OrgID:        parseUUID(orgIDStr),
 			BlockID:      blockID,
 			StorageClass: storageClass,
 			CandidateAt:  candidateAt,
 		})
 	}
 	if err := iter.Close(); err != nil {
-		return nil, fmt.Errorf("failed to list block GC candidates for org %s: %w", orgID, err)
+		return nil, fmt.Errorf("failed to list block GC candidates for day=%s bucket=%d: %w", db.GCProjectionDateString(day), bucket, err)
 	}
 	return candidates, nil
 }
 
 // --- S3 orphan recovery ---
 
-// RecordS3Orphan upserts a gc_s3_orphans row preserving first_seen_at when the
-// row already exists. Called both for the initial "S3 pending" record and for
-// actual S3 delete failures.
-func (s *CassandraStore) RecordS3Orphan(orgID uuid.UUID, blockID, storageClass, errMsg string, now time.Time) error {
+func (s *CassandraStore) upsertS3OrphanProjection(orgID uuid.UUID, blockID, storageClass string, firstSeenAt time.Time) error {
+	return s.db.Session().Query(`
+		INSERT INTO gc_s3_orphans_by_day (first_seen_day, bucket, first_seen_at, org_id, block_id, storage_class)
+		VALUES (?, ?, ?, ?, ?, ?)
+	`, db.GCProjectionUTCDate(firstSeenAt), db.GCDiscoveryBucket(orgID.String(), blockID), firstSeenAt.UTC(), orgID.String(), blockID, storageClass).Exec()
+}
+
+// RecordS3Orphan upserts a gc_s3_orphans row preserving and returning the
+// effective first_seen_at when the row already exists. Called both for the
+// initial "S3 pending" record and for actual S3 delete failures.
+//
+// It also guarantees the matching gc_s3_orphans_by_day discovery row exists so
+// recovery can enumerate every orphan without scanning canonical partitions.
+func (s *CassandraStore) RecordS3Orphan(orgID uuid.UUID, blockID, storageClass, errMsg string, now time.Time) (time.Time, error) {
 	initialRetryCount := 0
 	if errMsg != "" {
 		initialRetryCount = 1
 	}
+	existing := map[string]interface{}{}
 	// INSERT IF NOT EXISTS preserves the original first_seen_at on conflict;
 	// if the row exists we fall through to UpdateS3OrphanAttempt-style update.
 	applied, err := s.db.Session().Query(`
 		INSERT INTO gc_s3_orphans (org_id, block_id, storage_class, first_seen_at, last_attempt_at, retry_count, last_error)
 		VALUES (?, ?, ?, ?, ?, ?, ?) IF NOT EXISTS
-	`, orgID.String(), blockID, storageClass, now, now, initialRetryCount, errMsg).ScanCAS(nil, nil, nil, nil, nil, nil, nil)
+	`, orgID.String(), blockID, storageClass, now, now, initialRetryCount, errMsg).MapScanCAS(existing)
 	if err != nil {
-		return fmt.Errorf("failed to record S3 orphan: %w", err)
+		return time.Time{}, fmt.Errorf("failed to record S3 orphan: %w", err)
 	}
-	if applied {
-		return nil
+	effectiveFirstSeenAt := now.UTC()
+	effectiveStorageClass := storageClass
+	if !applied {
+		effectiveFirstSeenAt, err = casTimeValue(existing, "first_seen_at")
+		if err != nil {
+			return time.Time{}, err
+		}
+		if effectiveFirstSeenAt.IsZero() {
+			return time.Time{}, fmt.Errorf("gc_s3_orphans row for org=%s block=%s is missing first_seen_at", orgID, blockID)
+		}
+		effectiveStorageClass, err = casStringValue(existing, "storage_class")
+		if err != nil {
+			return time.Time{}, err
+		}
+		if effectiveStorageClass == "" {
+			effectiveStorageClass = storageClass
+		}
 	}
-	if errMsg == "" {
-		return nil
+	if err := s.upsertS3OrphanProjection(orgID, blockID, effectiveStorageClass, effectiveFirstSeenAt); err != nil {
+		return effectiveFirstSeenAt, fmt.Errorf("ensure gc_s3_orphans_by_day discovery row for org=%s block=%s: %w", orgID, blockID, err)
 	}
-	// Already exists — bump retry_count and last_attempt_at.
-	return s.UpdateS3OrphanAttempt(orgID, blockID, errMsg, now)
+	if !applied && errMsg != "" {
+		if err := s.UpdateS3OrphanAttempt(orgID, blockID, errMsg, now); err != nil {
+			return effectiveFirstSeenAt, err
+		}
+	}
+	return effectiveFirstSeenAt, nil
 }
 
 func (s *CassandraStore) UpdateS3OrphanAttempt(orgID uuid.UUID, blockID, errMsg string, now time.Time) error {
@@ -1033,50 +1146,65 @@ func (s *CassandraStore) UpdateS3OrphanAttempt(orgID uuid.UUID, blockID, errMsg 
 	`, now, prev+1, errMsg, orgID.String(), blockID).Exec()
 }
 
-func (s *CassandraStore) DeleteS3Orphan(orgID uuid.UUID, blockID string) error {
-	return s.db.Session().Query(`
+// DeleteS3Orphan removes both the canonical row and the matching discovery
+// projection row. Callers should pass firstSeenAt when they already know it so
+// the discovery row can still be removed if the canonical row has already been
+// deleted. A zero firstSeenAt falls back to reading the canonical row first.
+func (s *CassandraStore) DeleteS3Orphan(orgID uuid.UUID, blockID string, firstSeenAt time.Time) error {
+	if firstSeenAt.IsZero() {
+		err := s.db.Session().Query(`
+			SELECT first_seen_at FROM gc_s3_orphans WHERE org_id = ? AND block_id = ?
+		`, orgID.String(), blockID).Scan(&firstSeenAt)
+		if err != nil && !errors.Is(err, gocql.ErrNotFound) {
+			return fmt.Errorf("failed to read gc_s3_orphans row for delete: %w", err)
+		}
+	}
+
+	if err := s.db.Session().Query(`
 		DELETE FROM gc_s3_orphans WHERE org_id = ? AND block_id = ?
-	`, orgID.String(), blockID).Exec()
+	`, orgID.String(), blockID).Exec(); err != nil {
+		return err
+	}
+
+	if firstSeenAt.IsZero() {
+		return nil
+	}
+	if err := s.db.Session().Query(`
+		DELETE FROM gc_s3_orphans_by_day
+		WHERE first_seen_day = ? AND bucket = ? AND first_seen_at = ? AND org_id = ? AND block_id = ?
+	`, db.GCProjectionUTCDate(firstSeenAt), db.GCDiscoveryBucket(orgID.String(), blockID), firstSeenAt.UTC(), orgID.String(), blockID).Exec(); err != nil {
+		log.Printf("[GC] WARNING: failed to delete gc_s3_orphans_by_day discovery row for org=%s block=%s: %v", orgID, blockID, err)
+	}
+	return nil
 }
 
-func (s *CassandraStore) ListS3OrphanOrgs() ([]uuid.UUID, error) {
-	iter := s.db.Session().Query(`SELECT DISTINCT org_id FROM gc_s3_orphans`).Iter()
-	var orgs []uuid.UUID
-	var orgIDStr string
-	for iter.Scan(&orgIDStr) {
-		orgs = append(orgs, parseUUID(orgIDStr))
-	}
-	if err := iter.Close(); err != nil {
-		return nil, fmt.Errorf("failed to list S3 orphan orgs: %w", err)
-	}
-	return orgs, nil
-}
-
-func (s *CassandraStore) ListS3Orphans(orgID uuid.UUID, limit int) ([]S3OrphanInfo, error) {
+// ListS3OrphansByDay enumerates orphans for one (UTC day, discovery bucket)
+// partition. `limit` caps the rows returned for one (day, bucket); the worker
+// walks buckets [0, GCDiscoveryBucketCount) for each day from the persisted
+// recovery cursor.
+func (s *CassandraStore) ListS3OrphansByDay(day time.Time, bucket int, limit int) ([]S3OrphanInfo, error) {
 	if limit <= 0 {
 		limit = 100
 	}
 	iter := s.db.Session().Query(`
-		SELECT block_id, storage_class, first_seen_at, last_attempt_at, retry_count, last_error
-		FROM gc_s3_orphans WHERE org_id = ? LIMIT ?
-	`, orgID.String(), limit).Iter()
+		SELECT first_seen_at, org_id, block_id, storage_class
+		FROM gc_s3_orphans_by_day
+		WHERE first_seen_day = ? AND bucket = ?
+		LIMIT ?
+	`, db.GCProjectionUTCDate(day), bucket, limit).Iter()
 	var out []S3OrphanInfo
-	var blockID, storageClass, lastErr string
-	var firstSeen, lastAttempt time.Time
-	var retryCount int
-	for iter.Scan(&blockID, &storageClass, &firstSeen, &lastAttempt, &retryCount, &lastErr) {
+	var firstSeen time.Time
+	var orgIDStr, blockID, storageClass string
+	for iter.Scan(&firstSeen, &orgIDStr, &blockID, &storageClass) {
 		out = append(out, S3OrphanInfo{
-			OrgID:         orgID,
-			BlockID:       blockID,
-			StorageClass:  storageClass,
-			FirstSeenAt:   firstSeen,
-			LastAttemptAt: lastAttempt,
-			RetryCount:    retryCount,
-			LastError:     lastErr,
+			OrgID:        parseUUID(orgIDStr),
+			BlockID:      blockID,
+			StorageClass: storageClass,
+			FirstSeenAt:  firstSeen,
 		})
 	}
 	if err := iter.Close(); err != nil {
-		return nil, fmt.Errorf("failed to list S3 orphans for org %s: %w", orgID, err)
+		return nil, fmt.Errorf("failed to list S3 orphans for day=%s bucket=%d: %w", db.GCProjectionDateString(day), bucket, err)
 	}
 	return out, nil
 }
@@ -1091,7 +1219,35 @@ func (s *CassandraStore) GetBlockRefCount(orgID uuid.UUID, blockID string) (int,
 	return refCount, err
 }
 
+// mappingResolveConcurrency bounds the number of in-flight single-row lookups
+// against block_id_mappings so a large fs_object's block list cannot flood the
+// driver. block_id_mappings is partitioned by ((org_id, external_id)), so each
+// lookup is a single-partition point read.
+const mappingResolveConcurrency = 32
+
 func (s *CassandraStore) ResolveBlockIDs(orgID uuid.UUID, blockIDs []string) ([]string, error) {
+	return resolveBlockIDsConcurrent(orgID, blockIDs, mappingResolveConcurrency, func(idx int) (string, error) {
+		var internalID string
+		err := s.db.Session().Query(`
+			SELECT internal_id FROM block_id_mappings
+			WHERE org_id = ? AND external_id = ?
+		`, orgID.String(), blockIDs[idx]).Scan(&internalID)
+		return internalID, err
+	})
+}
+
+// resolveBlockIDsConcurrent maps every 40-char SHA-1 entry of blockIDs to its
+// internal SHA-256 by calling lookup with bounded concurrency, preserving slice
+// order. 64-char SHA-256 IDs are left untouched and lookup is never called for
+// them. lookup must return gocql.ErrNotFound when no mapping row exists; that
+// (and an empty internal_id) leaves the original ID in place. Any other lookup
+// error is fatal: the function still drains every in-flight lookup, then returns
+// (nil, joinedErr) so callers never act on a partially-resolved slice.
+//
+// orgID is used only for error context. The DB-backed lookup is injected so the
+// concurrency/ordering/error semantics stay unit-testable without a live
+// Cassandra (block_id_mappings has no in-process fake).
+func resolveBlockIDsConcurrent(orgID uuid.UUID, blockIDs []string, maxConcurrency int, lookup func(idx int) (string, error)) ([]string, error) {
 	resolved := make([]string, len(blockIDs))
 	copy(resolved, blockIDs)
 
@@ -1105,37 +1261,46 @@ func (s *CassandraStore) ResolveBlockIDs(orgID uuid.UUID, blockIDs []string) ([]
 		return resolved, nil
 	}
 
-	const batchSize = 100
-	for start := 0; start < len(toResolve); start += batchSize {
-		end := start + batchSize
-		if end > len(toResolve) {
-			end = len(toResolve)
-		}
-		batch := toResolve[start:end]
-		externalIDs := make([]string, len(batch))
-		for i, idx := range batch {
-			externalIDs[i] = blockIDs[idx]
-		}
+	type lookupResult struct {
+		idx        int
+		internalID string
+		err        error
+	}
 
-		iter := s.db.Session().Query(`
-			SELECT external_id, internal_id FROM block_id_mappings
-			WHERE org_id = ? AND external_id IN ?
-		`, orgID.String(), externalIDs).Iter()
+	concurrency := maxConcurrency
+	if concurrency > len(toResolve) {
+		concurrency = len(toResolve)
+	}
+	if concurrency < 1 {
+		concurrency = 1
+	}
+	sem := make(chan struct{}, concurrency)
+	results := make(chan lookupResult, len(toResolve))
 
-		mapping := make(map[string]string, len(batch))
-		var externalID, internalID string
-		for iter.Scan(&externalID, &internalID) {
-			mapping[externalID] = internalID
-		}
-		if err := iter.Close(); err != nil {
-			return nil, err
-		}
+	for _, idx := range toResolve {
+		sem <- struct{}{}
+		go func(idx int) {
+			defer func() { <-sem }()
+			internalID, err := lookup(idx)
+			results <- lookupResult{idx: idx, internalID: internalID, err: err}
+		}(idx)
+	}
 
-		for _, idx := range batch {
-			if mapped, ok := mapping[blockIDs[idx]]; ok && mapped != "" {
-				resolved[idx] = mapped
+	var resolveErr error
+	for range toResolve {
+		result := <-results
+		if result.err != nil {
+			if !errors.Is(result.err, gocql.ErrNotFound) {
+				resolveErr = errors.Join(resolveErr, fmt.Errorf("resolve block mapping org=%s external=%s: %w", orgID, blockIDs[result.idx], result.err))
 			}
+			continue
 		}
+		if result.internalID != "" {
+			resolved[result.idx] = result.internalID
+		}
+	}
+	if resolveErr != nil {
+		return nil, resolveErr
 	}
 
 	return resolved, nil
@@ -1343,23 +1508,6 @@ func (s *CassandraStore) ListOrganizations() ([]uuid.UUID, error) {
 		return nil, err
 	}
 	return orgs, nil
-}
-
-func (s *CassandraStore) ListBlocksForOrg(orgID uuid.UUID) ([]BlockInfo, error) {
-	iter := s.db.Session().Query(`
-		SELECT block_id, storage_class, ref_count FROM blocks WHERE org_id = ?
-	`, orgID.String()).Iter()
-
-	var blocks []BlockInfo
-	var blockID, storageClass string
-	var refCount int
-	for iter.Scan(&blockID, &storageClass, &refCount) {
-		blocks = append(blocks, BlockInfo{BlockID: blockID, StorageClass: storageClass, RefCount: refCount})
-	}
-	if err := iter.Close(); err != nil {
-		return nil, err
-	}
-	return blocks, nil
 }
 
 func (s *CassandraStore) ListExpiredShareLinks() ([]ExpiredShareLinkInfo, error) {

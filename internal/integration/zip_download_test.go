@@ -5,6 +5,7 @@ package integration
 import (
 	"archive/zip"
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
 	"mime/multipart"
@@ -114,4 +115,107 @@ func TestRegionPinnedZipDownload(t *testing.T) {
 	if string(content) != fileContent {
 		t.Fatalf("zipped file content = %q, want %q", string(content), fileContent)
 	}
+}
+
+func TestZipDownloadFailsBeforeHeadersWhenMappingIsMissing(t *testing.T) {
+	requireCassandra(t)
+
+	const requestHost = "eu.sesamefs.local"
+	name := fmt.Sprintf("inttest-zip-mapping-%d", time.Now().UnixNano())
+	createResp := adminClient.PostJSONWithHost(t, "/api2/repos/", map[string]string{
+		"name":       name,
+		"storage_id": "hot-s3-usa",
+	}, requestHost)
+	expectStatus(t, createResp, http.StatusOK)
+
+	result := responseJSON(t, createResp)
+	repoID, _ := result["repo_id"].(string)
+	if repoID == "" {
+		t.Fatalf("expected repo_id in create response: %v", result)
+	}
+
+	t.Cleanup(func() {
+		cleanup := adminClient.Delete(t, fmt.Sprintf("/api/v2.1/repos/%s/", repoID))
+		cleanup.Body.Close()
+	})
+
+	fileName := "zip-missing-mapping.txt"
+	fileContent := fmt.Sprintf("zip missing mapping %d\n", time.Now().UnixNano())
+
+	resp := adminClient.Get(t, fmt.Sprintf("/api2/repos/%s/upload-link/?p=/", repoID))
+	expectStatus(t, resp, http.StatusOK)
+	uploadURL := strings.Trim(responseBody(t, resp), "\" \n\r")
+	uploadFileThroughLink(t, adminClient, uploadURL, fileName, "/", fileContent)
+
+	orgID := resolveOrgID(t, repoID)
+	session := shareProjectionDBForTest(t).Session()
+
+	var headCommit string
+	if err := session.Query(`SELECT head_commit_id FROM libraries WHERE org_id = ? AND library_id = ?`, orgID, repoID).Scan(&headCommit); err != nil {
+		t.Fatalf("failed to read head commit for %s: %v", repoID, err)
+	}
+
+	var rootFSID string
+	if err := session.Query(`SELECT root_fs_id FROM commits WHERE library_id = ? AND commit_id = ?`, repoID, headCommit).Scan(&rootFSID); err != nil {
+		t.Fatalf("failed to read root fs for %s: %v", repoID, err)
+	}
+
+	var dirEntriesJSON string
+	if err := session.Query(`SELECT dir_entries FROM fs_objects WHERE library_id = ? AND fs_id = ?`, repoID, rootFSID).Scan(&dirEntriesJSON); err != nil {
+		t.Fatalf("failed to read root dir entries for %s: %v", repoID, err)
+	}
+
+	var dirEntries []map[string]interface{}
+	if err := json.Unmarshal([]byte(dirEntriesJSON), &dirEntries); err != nil {
+		t.Fatalf("failed to decode root dir entries: %v", err)
+	}
+
+	var fileFSID string
+	for _, entry := range dirEntries {
+		name, _ := entry["name"].(string)
+		if name != fileName {
+			continue
+		}
+		fileFSID, _ = entry["id"].(string)
+		break
+	}
+	if fileFSID == "" {
+		t.Fatalf("uploaded file %q not found in root dir entries: %s", fileName, dirEntriesJSON)
+	}
+
+	var blockIDs []string
+	if err := session.Query(`SELECT block_ids FROM fs_objects WHERE library_id = ? AND fs_id = ?`, repoID, fileFSID).Scan(&blockIDs); err != nil {
+		t.Fatalf("failed to read block ids for %s: %v", fileFSID, err)
+	}
+	if len(blockIDs) == 0 {
+		t.Fatalf("expected block ids for uploaded file %q", fileName)
+	}
+
+	brokenMapping := blockIDs[0]
+	if err := session.Query(`DELETE FROM block_id_mappings WHERE org_id = ? AND external_id = ?`, orgID, brokenMapping).Exec(); err != nil {
+		t.Fatalf("failed to delete block mapping %s: %v", brokenMapping, err)
+	}
+
+	zipTaskResp := adminClient.PostJSON(t, fmt.Sprintf("/api/v2.1/repos/%s/zip-task/?p=/", repoID), map[string]string{})
+	expectStatus(t, zipTaskResp, http.StatusOK)
+	zipTaskPayload := responseJSON(t, zipTaskResp)
+	zipToken, _ := zipTaskPayload["zip_token"].(string)
+	if zipToken == "" {
+		t.Fatalf("expected zip_token in zip task response: %v", zipTaskPayload)
+	}
+
+	zipResp := adminClient.GetWithHost(t, fmt.Sprintf("/seafhttp/zip/%s", zipToken), requestHost)
+	expectStatus(t, zipResp, http.StatusInternalServerError)
+	if got := zipResp.Header.Get("Content-Type"); strings.Contains(got, "application/zip") {
+		zipResp.Body.Close()
+		t.Fatalf("expected JSON error response before zip headers, got Content-Type %q", got)
+	}
+	zipBody := responseBody(t, zipResp)
+	if !strings.Contains(zipBody, "failed to prepare zip download") {
+		t.Fatalf("zip error body = %q, want prepare failure", zipBody)
+	}
+	if strings.Contains(zipBody, brokenMapping) {
+		t.Fatalf("zip error body leaked internal block mapping details: %q", zipBody)
+	}
+	zipResp.Body.Close()
 }

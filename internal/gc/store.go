@@ -68,16 +68,24 @@ type GCStore interface {
 	DecrementBlockRefCount(orgID uuid.UUID, blockID string) (bool, error)
 	DeleteBlockMapping(orgID uuid.UUID, externalID string) error
 	EnsureBlockGCCandidate(orgID uuid.UUID, blockID, storageClass string, candidateAt time.Time) (time.Time, error)
-	DeleteBlockGCCandidate(orgID uuid.UUID, blockID string) error
-	ListBlockGCCandidateOrgs() ([]uuid.UUID, error)
-	ListBlockGCCandidates(orgID uuid.UUID) ([]BlockGCCandidateInfo, error)
+	DeleteBlockGCCandidate(orgID uuid.UUID, blockID string, candidateAt time.Time) error
+	// ListBlockGCCandidatesByDay enumerates candidates whose `candidate_at`
+	// falls on the given UTC day for one discovery bucket. Bucket indices
+	// range over [0, db.GCDiscoveryBucketCount). Replaces the old per-org
+	// partition scan that depended on `blocks` partitioning by org.
+	ListBlockGCCandidatesByDay(day time.Time, bucket int) ([]BlockGCCandidateInfo, error)
 
 	// S3 orphan recovery / pending delete tracking for blocks claimed by GC.
-	RecordS3Orphan(orgID uuid.UUID, blockID, storageClass, errMsg string, now time.Time) error
-	ListS3OrphanOrgs() ([]uuid.UUID, error)
-	ListS3Orphans(orgID uuid.UUID, limit int) ([]S3OrphanInfo, error)
+	// RecordS3Orphan preserves and returns the effective first_seen_at identity
+	// for the orphan row so callers can reliably clean up the discovery
+	// projection even after retries or partial crashes.
+	RecordS3Orphan(orgID uuid.UUID, blockID, storageClass, errMsg string, now time.Time) (time.Time, error)
+	// ListS3OrphansByDay enumerates S3-orphan rows whose `first_seen_at`
+	// falls on the given UTC day for one discovery bucket. `limit` caps the
+	// number of rows returned for a single (day, bucket) pair.
+	ListS3OrphansByDay(day time.Time, bucket int, limit int) ([]S3OrphanInfo, error)
 	UpdateS3OrphanAttempt(orgID uuid.UUID, blockID, errMsg string, now time.Time) error
-	DeleteS3Orphan(orgID uuid.UUID, blockID string) error
+	DeleteS3Orphan(orgID uuid.UUID, blockID string, firstSeenAt time.Time) error
 
 	// Reverse lookup: find block mappings by internal_id (avoids full scan)
 	ListBlockMappingsByInternalID(orgID uuid.UUID, internalID string) ([]BlockMapping, error)
@@ -97,7 +105,6 @@ type GCStore interface {
 
 	// Scanner operations
 	ListOrganizations() ([]uuid.UUID, error)
-	ListBlocksForOrg(orgID uuid.UUID) ([]BlockInfo, error)
 	ListExpiredShareLinks() ([]ExpiredShareLinkInfo, error)
 	ListDistinctCommitLibraries() ([]uuid.UUID, error)
 	ListDistinctFSObjectLibraries() ([]uuid.UUID, error)
@@ -262,6 +269,7 @@ type BlockInfo struct {
 }
 
 type BlockGCCandidateInfo struct {
+	OrgID        uuid.UUID
 	BlockID      string
 	StorageClass string
 	CandidateAt  time.Time

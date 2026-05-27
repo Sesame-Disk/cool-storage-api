@@ -179,29 +179,24 @@ These are deliberate safety mechanisms that are correctly implemented and tested
 
 ## Potential bugs and risks
 
-### HIGH: S3 orphan on delete failure (worker.go:164-169)
+### RESOLVED: S3 orphan on delete failure
 
-**Scenario:** LWT succeeds → DB record deleted → S3 delete fails (network error, timeout).
+The old leak window after `FinalizeBlockDelete` is now closed by an explicit
+recovery path:
 
-**Result:** Block is gone from the database but remains in S3. The scanner cannot find
-it because there's no DB record with `ref_count <= 0` to scan. The orphan persists
-forever, costing storage.
+1. `processBlock` records `gc_s3_orphans` plus the `gc_s3_orphans_by_day`
+   discovery row before it removes the claimed canonical block row.
+2. If the later S3 delete fails, the worker updates the orphan attempt metadata
+   and leaves the recovery row behind instead of depending on the original block
+   row to rediscover the leak.
+3. Scanner phase `s3_orphan_recovery` walks `gc_s3_orphans_by_day` from a
+   persisted UTC-day cursor across all discovery buckets; on cold start it scans
+   the full 90-day TTL horizon so old orphan rows are still recoverable.
 
-**Current handling:** Logs a WARNING, returns error (triggers retry). But the retry
-will also fail because the DB record is already gone — the LWT step will return
-"not applied" (row doesn't exist), and the block skips S3 deletion.
-
-**Impact:** Storage leak. Not data loss (the data is still in S3, just unreachable).
-Over time this could accumulate meaningful cost.
-
-**Recommendation:**
-1. Add a pre-delete S3 check: verify block exists in S3 before deleting from DB
-2. Or: reverse the order — delete from S3 first, then DB (if S3 fails, DB record
-   remains and scanner re-discovers it). This is safer but loses the LWT atomicity.
-3. Or: add a separate "S3 orphan recovery" scan that lists S3 keys and cross-references
-   with the blocks table. This is the most robust but most expensive.
-4. Simplest: add retry with exponential backoff on S3 delete failure BEFORE returning
-   the error (3 attempts, 1s/2s/4s).
+This turns the old permanent storage leak into an operational retry path. The
+remaining tradeoff is intentionally conservative cursor advancement: if the
+canonical block row still exists (for example claimed but not yet finalized),
+recovery defers that row to a later pass instead of touching S3 early.
 
 ### MEDIUM: Decrement-then-read race (worker.go:672-685)
 

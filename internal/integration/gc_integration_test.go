@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Sesame-Disk/sesamefs/internal/db"
 	gcpkg "github.com/Sesame-Disk/sesamefs/internal/gc"
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
 	"github.com/google/uuid"
@@ -149,6 +150,28 @@ func gcCandidateExists(t *testing.T, orgID, blockID string) bool {
 	var ts time.Time
 	err := session.Query(`SELECT candidate_at FROM gc_block_candidates WHERE org_id = ? AND block_id = ?`, orgID, blockID).Scan(&ts)
 	return err == nil
+}
+
+func gcCandidateProjectionExists(t *testing.T, orgID, blockID string, candidateAt time.Time) bool {
+	t.Helper()
+	session := shareProjectionDBForTest(t).Session()
+	var storedBlockID string
+	err := session.Query(`
+		SELECT block_id FROM gc_block_candidates_by_day
+		WHERE candidate_day = ? AND bucket = ? AND candidate_at = ? AND org_id = ? AND block_id = ?
+	`, db.GCProjectionUTCDate(candidateAt), db.GCDiscoveryBucket(orgID, blockID), candidateAt.UTC(), orgID, blockID).Scan(&storedBlockID)
+	return err == nil && storedBlockID == blockID
+}
+
+func gcS3OrphanProjectionExists(t *testing.T, orgID, blockID string, firstSeenAt time.Time) bool {
+	t.Helper()
+	session := shareProjectionDBForTest(t).Session()
+	var storedBlockID string
+	err := session.Query(`
+		SELECT block_id FROM gc_s3_orphans_by_day
+		WHERE first_seen_day = ? AND bucket = ? AND first_seen_at = ? AND org_id = ? AND block_id = ?
+	`, db.GCProjectionUTCDate(firstSeenAt), db.GCDiscoveryBucket(orgID, blockID), firstSeenAt.UTC(), orgID, blockID).Scan(&storedBlockID)
+	return err == nil && storedBlockID == blockID
 }
 
 // uploadUniqueFile uploads a file with unique content and returns the block ID (SHA-256 of content).
@@ -477,7 +500,7 @@ func cleanupGCBlockFixturesForTest(t *testing.T, orgID uuid.UUID, blockID string
 	deleteGCFailedItemsByIdentity(t, orgID.String(), "block", blockID)
 	deleteGCPendingBlockItems(t, orgID, blockID)
 	store := gcpkg.NewCassandraStore(shareProjectionDBForTest(t))
-	if err := store.DeleteBlockGCCandidate(orgID, blockID); err != nil {
+	if err := store.DeleteBlockGCCandidate(orgID, blockID, time.Time{}); err != nil {
 		t.Fatalf("failed to delete gc_block_candidate for %s/%s: %v", orgID, blockID, err)
 	}
 	repairGCSnapshotsForTest(t, orgID)
@@ -737,53 +760,213 @@ func TestGC_LibraryCascade(t *testing.T) {
 	t.Log("Library cascade: scanner + worker processed soft-deleted library")
 }
 
-// TestGC_ScannerOrphanRecovery verifies the scanner finds blocks with
-// ref_count=0 that were never enqueued for GC (simulating a missed enqueue).
-func TestGC_ScannerOrphanRecovery(t *testing.T) {
+// TestGC_ScannerRequeuesCandidatesMissingFromQueue verifies the scanner
+// picks up GC candidates from the per-day discovery projection and re-enqueues
+// them when no matching queue item is present.
+//
+// The earlier version of this test deleted the canonical `gc_block_candidates`
+// row to simulate a "missed enqueue" and relied on the scanner partition-scanning
+// `blocks` to backfill it. That backfill path was removed when `blocks` moved
+// to per-block partitioning (see ISSUE-BLOCKS-HOT-PARTITION-01); the only
+// legitimate entry point for a block into GC is now `EnsureBlockGCCandidate`,
+// observability for failures lives in `gc_zero_ref_enqueue_failures_total`.
+//
+// The current contract is: if the candidate row exists but the queue item is
+// gone (replica drift, hand-cleanup, etc.), the scanner walks
+// `gc_block_candidates_by_day` and re-enqueues. This test covers that path.
+func TestGC_ScannerRequeuesCandidatesMissingFromQueue(t *testing.T) {
 	requireGCEnabled(t)
 	requireCassandra(t)
 
-	repoID := createTestLibrary(t, adminClient, fmt.Sprintf("inttest-gc-orphan-%d", time.Now().UnixNano()))
+	repoID := createTestLibrary(t, adminClient, fmt.Sprintf("inttest-gc-rediscover-%d", time.Now().UnixNano()))
 	orgID := resolveOrgID(t, repoID)
 	queuedAfter := time.Now().UTC().Add(-5 * time.Second)
 
-	// Upload a file, then delete it to get a real block with ref_count=0
-	_, blockID := uploadUniqueFile(t, adminClient, repoID, "orphan.txt", "/")
-	batchDeleteFiles(t, adminClient, repoID, "/", []string{"orphan.txt"})
+	// Upload a file, then delete it to get a real block with ref_count=0.
+	// The delete path runs through DecrementBlockRefCountsOnce →
+	// enqueueZeroRefBlocks → EnsureBlockGCCandidate, so both the canonical
+	// gc_block_candidates row and the gc_block_candidates_by_day projection
+	// row are written.
+	_, blockID := uploadUniqueFile(t, adminClient, repoID, "rediscover.txt", "/")
+	batchDeleteFiles(t, adminClient, repoID, "/", []string{"rediscover.txt"})
 
-	// Wait for ref_count to drop
+	// Wait for ref_count=0 AND the candidate row to land in both tables.
 	ok := pollUntil(t, 20*time.Second, 200*time.Millisecond, func() bool {
-		return readBlockRefCount(t, orgID, blockID) <= 0
+		return readBlockRefCount(t, orgID, blockID) <= 0 && gcCandidateExists(t, orgID, blockID)
 	})
 	if !ok {
-		t.Fatalf("ref_count did not reach 0: %d", readBlockRefCount(t, orgID, blockID))
+		t.Fatalf("preconditions not met: ref_count=%d, candidate=%v",
+			readBlockRefCount(t, orgID, blockID), gcCandidateExists(t, orgID, blockID))
 	}
 
-	// Delete the gc_block_candidates entry directly (simulate missed enqueue)
-	session := shareProjectionDBForTest(t).Session()
-	if err := session.Query(`DELETE FROM gc_block_candidates WHERE org_id = ? AND block_id = ?`, orgID, blockID).Exec(); err != nil {
-		t.Logf("Warning: could not delete GC candidate (may not exist): %v", err)
-	}
+	// Simulate a missing/lost queue item while the candidate row remains.
+	// This is the scenario the discovery projection is designed to recover from.
 	deleteGCQueueItemsByIdentitySince(t, orgID, "block", blockID, queuedAfter)
 
-	t.Log("Orphan block created (ref_count=0, no GC candidate). Running scanner...")
+	t.Log("Candidate row present, queue item removed. Running scanner...")
 
 	triggerGCScannerAndWait(t)
 
-	// Verify the orphan was re-enqueued (allow generous timeout for scanner to complete)
+	// The scanner must re-enqueue. Either we observe the candidate row still
+	// present (scanner re-queued it for a later worker pass) or both rows are
+	// gone because worker+scanner+S3 delete all succeeded between trigger and
+	// poll. Both outcomes are correct; only "candidate gone AND block still
+	// alive" indicates the scanner missed it.
 	ok = pollUntil(t, 30*time.Second, 1*time.Second, func() bool {
-		return gcCandidateExists(t, orgID, blockID)
+		return gcCandidateExists(t, orgID, blockID) || !blockExistsInDB(t, orgID, blockID)
 	})
 	if !ok {
-		// Check if the block was already fully processed (deleted by worker after scanner found it)
-		if !blockExistsInDB(t, orgID, blockID) {
-			t.Log("Scanner orphan recovery: block was found AND deleted (scanner + worker both ran) — correct")
-			return
-		}
-		t.Fatal("Scanner did not re-discover orphaned block with ref_count=0")
+		t.Fatal("scanner did not re-enqueue candidate via gc_block_candidates_by_day discovery")
 	}
 
-	t.Log("Scanner orphan recovery: block re-enqueued for GC — correct")
+	if !blockExistsInDB(t, orgID, blockID) {
+		t.Log("scanner discovery: block was found AND deleted by worker — correct")
+		return
+	}
+	t.Log("scanner discovery: candidate row preserved for next worker pass — correct")
+}
+
+// TestGC_DeleteBlockGCCandidate_RemovesDiscoveryRowWithoutCanonical verifies
+// the store can still clear gc_block_candidates_by_day when the canonical
+// gc_block_candidates row is already gone, as long as the caller provides the
+// original candidate_at from the queue item / scanner row.
+func TestGC_DeleteBlockGCCandidate_RemovesDiscoveryRowWithoutCanonical(t *testing.T) {
+	requireCassandra(t)
+
+	database := shareProjectionDBForTest(t)
+	store := gcpkg.NewCassandraStore(database)
+	orgID := uuid.New()
+	blockID := fmt.Sprintf("cand-cleanup-%d", time.Now().UnixNano())
+	candidateAt := time.Now().UTC().Truncate(time.Millisecond)
+
+	if _, err := store.EnsureBlockGCCandidate(orgID, blockID, "hot", candidateAt); err != nil {
+		t.Fatalf("EnsureBlockGCCandidate: %v", err)
+	}
+	if !gcCandidateExists(t, orgID.String(), blockID) {
+		t.Fatal("expected canonical gc_block_candidates row to exist")
+	}
+	if !gcCandidateProjectionExists(t, orgID.String(), blockID, candidateAt) {
+		t.Fatal("expected gc_block_candidates_by_day projection row to exist")
+	}
+
+	if err := database.Session().Query(fmt.Sprintf(
+		"DELETE FROM gc_block_candidates WHERE org_id = %s AND block_id = '%s'",
+		orgID.String(),
+		blockID,
+	)).Exec(); err != nil {
+		t.Fatalf("delete canonical gc_block_candidates row: %v", err)
+	}
+
+	if err := store.DeleteBlockGCCandidate(orgID, blockID, candidateAt); err != nil {
+		t.Fatalf("DeleteBlockGCCandidate: %v", err)
+	}
+	if gcCandidateProjectionExists(t, orgID.String(), blockID, candidateAt) {
+		t.Fatal("expected gc_block_candidates_by_day projection row to be removed")
+	}
+}
+
+func TestGC_EnsureBlockGCCandidate_RepairsDiscoveryRowWhenCanonicalExists(t *testing.T) {
+	requireCassandra(t)
+
+	database := shareProjectionDBForTest(t)
+	store := gcpkg.NewCassandraStore(database)
+	orgID := uuid.New()
+	blockID := fmt.Sprintf("cand-repair-%d", time.Now().UnixNano())
+	candidateAt := time.Now().UTC().Truncate(time.Millisecond)
+
+	effectiveCandidateAt, err := store.EnsureBlockGCCandidate(orgID, blockID, "hot", candidateAt)
+	if err != nil {
+		t.Fatalf("initial EnsureBlockGCCandidate: %v", err)
+	}
+	if !effectiveCandidateAt.Equal(candidateAt) {
+		t.Fatalf("effective candidate_at = %v, want %v", effectiveCandidateAt, candidateAt)
+	}
+	if err := database.Session().Query(`
+		DELETE FROM gc_block_candidates_by_day
+		WHERE candidate_day = ? AND bucket = ? AND candidate_at = ? AND org_id = ? AND block_id = ?
+	`, db.GCProjectionUTCDate(candidateAt), db.GCDiscoveryBucket(orgID.String(), blockID), candidateAt.UTC(), orgID.String(), blockID).Exec(); err != nil {
+		t.Fatalf("delete block candidate projection row: %v", err)
+	}
+	if gcCandidateProjectionExists(t, orgID.String(), blockID, candidateAt) {
+		t.Fatal("expected block candidate projection row to be deleted before repair")
+	}
+
+	repairedCandidateAt, err := store.EnsureBlockGCCandidate(orgID, blockID, "cold", time.Now().UTC())
+	if err != nil {
+		t.Fatalf("repair EnsureBlockGCCandidate: %v", err)
+	}
+	if !repairedCandidateAt.Equal(candidateAt) {
+		t.Fatalf("repaired candidate_at = %v, want original %v", repairedCandidateAt, candidateAt)
+	}
+	if !gcCandidateProjectionExists(t, orgID.String(), blockID, candidateAt) {
+		t.Fatal("expected gc_block_candidates_by_day projection row to be repaired")
+	}
+}
+
+func TestGC_RecordS3Orphan_RepairsDiscoveryRowWhenCanonicalExists(t *testing.T) {
+	requireCassandra(t)
+
+	database := shareProjectionDBForTest(t)
+	store := gcpkg.NewCassandraStore(database)
+	orgID := uuid.New()
+	blockID := fmt.Sprintf("orph-repair-%d", time.Now().UnixNano())
+	firstSeenAt := time.Now().UTC().Truncate(time.Millisecond)
+
+	effectiveFirstSeenAt, err := store.RecordS3Orphan(orgID, blockID, "hot", "seed", firstSeenAt)
+	if err != nil {
+		t.Fatalf("initial RecordS3Orphan: %v", err)
+	}
+	if !effectiveFirstSeenAt.Equal(firstSeenAt) {
+		t.Fatalf("effective first_seen_at = %v, want %v", effectiveFirstSeenAt, firstSeenAt)
+	}
+	if err := database.Session().Query(`
+		DELETE FROM gc_s3_orphans_by_day
+		WHERE first_seen_day = ? AND bucket = ? AND first_seen_at = ? AND org_id = ? AND block_id = ?
+	`, db.GCProjectionUTCDate(firstSeenAt), db.GCDiscoveryBucket(orgID.String(), blockID), firstSeenAt.UTC(), orgID.String(), blockID).Exec(); err != nil {
+		t.Fatalf("delete S3 orphan projection row: %v", err)
+	}
+	if gcS3OrphanProjectionExists(t, orgID.String(), blockID, firstSeenAt) {
+		t.Fatal("expected S3 orphan projection row to be deleted before repair")
+	}
+
+	repairedFirstSeenAt, err := store.RecordS3Orphan(orgID, blockID, "cold", "", time.Now().UTC())
+	if err != nil {
+		t.Fatalf("repair RecordS3Orphan: %v", err)
+	}
+	if !repairedFirstSeenAt.Equal(firstSeenAt) {
+		t.Fatalf("repaired first_seen_at = %v, want original %v", repairedFirstSeenAt, firstSeenAt)
+	}
+	if !gcS3OrphanProjectionExists(t, orgID.String(), blockID, firstSeenAt) {
+		t.Fatal("expected gc_s3_orphans_by_day projection row to be repaired")
+	}
+}
+
+func TestGC_DeleteS3Orphan_RemovesDiscoveryRowWithoutCanonical(t *testing.T) {
+	requireCassandra(t)
+
+	database := shareProjectionDBForTest(t)
+	store := gcpkg.NewCassandraStore(database)
+	orgID := uuid.New()
+	blockID := fmt.Sprintf("orph-cleanup-%d", time.Now().UnixNano())
+	firstSeenAt := time.Now().UTC().Truncate(time.Millisecond)
+
+	effectiveFirstSeenAt, err := store.RecordS3Orphan(orgID, blockID, "hot", "seed", firstSeenAt)
+	if err != nil {
+		t.Fatalf("RecordS3Orphan: %v", err)
+	}
+	if !gcS3OrphanProjectionExists(t, orgID.String(), blockID, firstSeenAt) {
+		t.Fatal("expected gc_s3_orphans_by_day projection row to exist")
+	}
+	if err := database.Session().Query(`DELETE FROM gc_s3_orphans WHERE org_id = ? AND block_id = ?`, orgID.String(), blockID).Exec(); err != nil {
+		t.Fatalf("delete canonical gc_s3_orphans row: %v", err)
+	}
+
+	if err := store.DeleteS3Orphan(orgID, blockID, effectiveFirstSeenAt); err != nil {
+		t.Fatalf("DeleteS3Orphan: %v", err)
+	}
+	if gcS3OrphanProjectionExists(t, orgID.String(), blockID, firstSeenAt) {
+		t.Fatal("expected gc_s3_orphans_by_day projection row to be removed")
+	}
 }
 
 // getGCGracePeriod reads the configured grace period from the admin status API.

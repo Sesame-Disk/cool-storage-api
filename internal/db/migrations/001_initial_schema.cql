@@ -252,6 +252,9 @@ CREATE TABLE IF NOT EXISTS fs_objects (
     PRIMARY KEY ((library_id), fs_id)
 );
 
+-- Per-block partition: each (org_id, block_id) is its own Paxos partition.
+-- Avoids the prior hot partition where all block-refcount LWTs for an org
+-- (especially the platform org `00000000-...`) serialized through one row group.
 CREATE TABLE IF NOT EXISTS blocks (
     org_id        UUID,
     block_id      TEXT,
@@ -261,34 +264,53 @@ CREATE TABLE IF NOT EXISTS blocks (
     ref_count     INT,
     created_at    TIMESTAMP,
     last_accessed TIMESTAMP,
-    PRIMARY KEY ((org_id), block_id)
+    PRIMARY KEY ((org_id, block_id))
 );
 
+-- Canonical GC candidates table. Per-block partition like `blocks` so reference
+-- decrement to zero never contends with another org's GC traffic.
 CREATE TABLE IF NOT EXISTS gc_block_candidates (
     org_id        UUID,
     block_id      TEXT,
     storage_class TEXT,
     candidate_at  TIMESTAMP,
-    PRIMARY KEY ((org_id), block_id)
+    PRIMARY KEY ((org_id, block_id))
 );
 
+-- Discovery projection for `gc_block_candidates`: partition by (candidate_day,
+-- bucket) so the GC scanner can enumerate today's candidates across many
+-- partitions in parallel. `bucket = GCDiscoveryBucket(org_id, block_id)`.
+-- Pattern mirrors `gc_share_links_by_expiry`.
+CREATE TABLE IF NOT EXISTS gc_block_candidates_by_day (
+    candidate_day DATE,
+    bucket        INT,
+    candidate_at  TIMESTAMP,
+    org_id        UUID,
+    block_id      TEXT,
+    storage_class TEXT,
+    PRIMARY KEY ((candidate_day, bucket), candidate_at, org_id, block_id)
+) WITH CLUSTERING ORDER BY (candidate_at ASC, org_id ASC, block_id ASC);
+
 -- SHA-1 (external/Seafile client) → SHA-256 (internal) content-address mapping.
+-- Per-(org, external) partition so concurrent uploads of different content
+-- never share a Paxos partition.
 CREATE TABLE IF NOT EXISTS block_id_mappings (
     org_id      UUID,
     external_id TEXT,
     internal_id TEXT,
     created_at  TIMESTAMP,
-    PRIMARY KEY ((org_id), external_id)
+    PRIMARY KEY ((org_id, external_id))
 );
 
--- Reverse lookup: internal SHA-256 → external SHA-1.
--- Avoids full org scan when deleting a block and cleaning up its mappings.
+-- Reverse lookup: internal SHA-256 → external SHA-1. `external_id` is kept as
+-- a clustering column because multiple external aliases can point to the same
+-- internal hash and we need to iterate them together.
 CREATE TABLE IF NOT EXISTS block_id_mappings_by_internal (
     org_id      UUID,
     internal_id TEXT,
     external_id TEXT,
     created_at  TIMESTAMP,
-    PRIMARY KEY ((org_id), internal_id, external_id)
+    PRIMARY KEY ((org_id, internal_id), external_id)
 );
 
 -- ─── Share Links ─────────────────────────────────────────────────────────────
@@ -1024,6 +1046,8 @@ CREATE TABLE IF NOT EXISTS gc_processed_items (
 -- When the GC worker deletes the canonical `blocks` row before the backing S3
 -- object, any S3 failure would otherwise leak storage forever. This recovery
 -- table lets the scanner retry deletes later. The 90-day TTL bounds growth.
+-- Per-block partition like `blocks` itself: a hot platform org no longer
+-- concentrates all S3-orphan rows in one Cassandra partition.
 CREATE TABLE IF NOT EXISTS gc_s3_orphans (
     org_id          UUID,
     block_id        TEXT,
@@ -1032,8 +1056,23 @@ CREATE TABLE IF NOT EXISTS gc_s3_orphans (
     last_attempt_at TIMESTAMP,
     retry_count     INT,
     last_error      TEXT,
-    PRIMARY KEY ((org_id), block_id)
+    PRIMARY KEY ((org_id, block_id))
 ) WITH default_time_to_live = 7776000;
+
+-- Discovery projection for `gc_s3_orphans`: partition by (first_seen_day, bucket)
+-- so the scanner can walk recent orphans in parallel without enumerating
+-- partitions by org. Same TTL as the canonical row so the projection cannot
+-- outlive the source. Pattern mirrors `gc_block_candidates_by_day`.
+CREATE TABLE IF NOT EXISTS gc_s3_orphans_by_day (
+    first_seen_day DATE,
+    bucket         INT,
+    first_seen_at  TIMESTAMP,
+    org_id         UUID,
+    block_id       TEXT,
+    storage_class  TEXT,
+    PRIMARY KEY ((first_seen_day, bucket), first_seen_at, org_id, block_id)
+) WITH CLUSTERING ORDER BY (first_seen_at ASC, org_id ASC, block_id ASC)
+  AND default_time_to_live = 7776000;
 
 -- Leadership lease so only one enabled replica runs worker/scanner/rollover
 -- work at a time.

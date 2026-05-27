@@ -514,8 +514,16 @@ GET /api2/repos/{repo_id}/dir/?p=/
 
 **Schema:**
 ```sql
-PRIMARY KEY ((org_id), block_id)  -- Partition by org for dedup
+PRIMARY KEY ((org_id, block_id))  -- Per-block partition: each block is its
+                                  -- own Paxos partition so concurrent uploads
+                                  -- never serialize. Replaces the earlier
+                                  -- ((org_id), block_id) form, which made the
+                                  -- platform org a single hot partition.
 ```
+
+Discovery for the GC scanner is provided by `gc_block_candidates_by_day`
+(see below), so we no longer rely on a `WHERE org_id = ?` partition scan to
+enumerate orphaned blocks.
 
 **Fields:**
 | Field | Type | Description |

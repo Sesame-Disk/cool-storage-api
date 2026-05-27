@@ -1453,39 +1453,41 @@ than `uploadBlockSize` while `finalizeUploadBlockMetadataConcurrency = 1`.
 That test should exist before future refactors rely on the throttle as a stable
 invariant.
 
-### 19.r. `blocks` Is Hot-Partitioned By `org_id`
+### 19.r. `blocks` Is Hot-Partitioned By `org_id` — RESOLVED (2026-05-26)
 
-`internal/db/migrations/001_initial_schema.cql` defines `blocks` as
-`PRIMARY KEY ((org_id), block_id)`. That means all block refcount writes for one
-organization land in the same Cassandra partition.
+The schema branch landed: `blocks`, `gc_block_candidates`, `gc_s3_orphans`,
+`block_id_mappings`, and `block_id_mappings_by_internal` now all use per-block
+(or per-(org, key)) compound partition keys. No single org concentrates LWT
+traffic into one Cassandra partition any more. The platform org
+(`00000000-0000-0000-0000-000000000000`) no longer behaves as a central
+hotspot for shared traffic.
 
-For this workload, that is a classic schema anti-pattern:
+The two paths that relied on partition-scanning by org were rewritten:
 
-- the partition key has low cardinality relative to traffic volume;
-- each org can accumulate a very large block working set;
-- multiregion CAS/LWT then concentrates cross-DC Paxos on one partition rather
-  than distributing it across many independent keys.
+- `gc.Scanner.scanOrphanedBlocks` walks `gc_block_candidates_by_day` by
+  `(day, bucket)` from a persisted cursor instead of enumerating candidate orgs
+  and partition-scanning the canonical table.
+- `gc.Worker.RecoverS3Orphans` walks `gc_s3_orphans_by_day` from a persisted cursor
+  across all discovery buckets, and cold start now scans the full 90-day TTL
+  horizon instead of a fixed 14-day recovery window.
 
-The platform/system org makes this more serious than a theoretical tenant edge
-case. Shared/system flows can end up hammering one central partition
-(`00000000-0000-0000-0000-000000000000`) even before the per-row refcount logic
-itself is the limiting factor.
+The old `ListBlocksForOrg` partition scan that served as a backfill safety net
+is gone; the new contract is that `DecrementBlockRefCountsOnce` →
+`enqueueZeroRefBlocks` → `gcBlockEnqueuer.EnqueueBlocks` →
+`EnsureBlockGCCandidate` is the only path a block ever takes into GC.
+`gc_zero_ref_enqueue_failures_total` remains the alertable hard-failure signal
+that this contract was violated, while
+`gc_block_candidate_discovery_degraded_total{source=...}` captures the softer
+case where the canonical candidate row succeeded but the
+`gc_block_candidates_by_day` repair/write degraded.
 
-The future schema branch should evaluate higher-cardinality partitioning that
-matches the real bounded query shape, for example:
+`streaming.QueryBlockSizes` was updated to use parallel single-row reads
+(`blockSizesConcurrency = 32`) instead of a 100-element `IN` query, because
+each block_id now resolves to its own partition.
 
-- `file_id` if the natural read pattern is one file at a time;
-- `(org_id, file_id)` if org scoping matters but physical fan-out is needed;
-- `(org_id, bucket)` or another sharded key if org-local lookup must remain but
-  write distribution is the first concern.
-
-The rule is to partition by something with many distinct values where each query
-touches one bounded slice. `org_id` alone does not satisfy that rule for
-block-heavy traffic.
-
-This should be treated as part of a broader DB-schema bottleneck audit in future
-branches, not as an isolated tuning ticket. The current upload incident just
-made this particular hotspot visible first.
+Closes `docs/KNOWN_ISSUES.md → ISSUE-BLOCKS-HOT-PARTITION-01`. The wider DB
+bottleneck audit lives in `docs/SCHEMA-BOTTLENECK-AUDIT.md` — those items are
+NOT addressed in this branch.
 
 ---
 

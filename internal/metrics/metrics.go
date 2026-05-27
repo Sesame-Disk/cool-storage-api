@@ -83,6 +83,31 @@ var (
 		},
 	)
 
+	// GCZeroRefEnqueueFailuresTotal counts decrement-to-zero events whose
+	// canonical candidate registration or follow-up queue insert failed. The blocks
+	// schema refactor removed the per-org partition scan backfill, so a
+	// non-zero value here is the only signal that a block hit ref_count=0
+	// without being enqueued. Alert on sustained increase.
+	GCZeroRefEnqueueFailuresTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "gc_zero_ref_enqueue_failures_total",
+			Help: "Number of zero-refcount blocks that failed to reach pending GC state. Sustained values indicate lost-to-GC blocks.",
+		},
+		[]string{"stage"},
+	)
+
+	// GCBlockCandidateDiscoveryDegradedTotal counts events where the canonical
+	// gc_block_candidates row was usable but ensuring or repairing the
+	// gc_block_candidates_by_day discovery row failed. These events do not imply
+	// lost GC work; they indicate degraded scanner backfill/recovery safety.
+	GCBlockCandidateDiscoveryDegradedTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "gc_block_candidate_discovery_degraded_total",
+			Help: "Number of block candidate events where the canonical row succeeded but the discovery projection could not be ensured.",
+		},
+		[]string{"source"},
+	)
+
 	// GCLastWorkerRun records the Unix timestamp of the last worker pass.
 	GCLastWorkerRun = prometheus.NewGauge(
 		prometheus.GaugeOpts{
@@ -308,6 +333,8 @@ func Register() {
 		GCScannerActionsTotal,
 		GCErrorsTotal,
 		GCItemsSkippedTotal,
+		GCZeroRefEnqueueFailuresTotal,
+		GCBlockCandidateDiscoveryDegradedTotal,
 		GCLastWorkerRun,
 		GCLastScannerRun,
 		GCScannerLastPhaseRun,

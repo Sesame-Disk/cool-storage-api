@@ -45,6 +45,22 @@ func NewFSHelper(database *db.DB) *FSHelper {
 	return &FSHelper{db: database}
 }
 
+var resolveStoredBlockIDsFn = func(h *FSHelper, orgID string, blockIDs []string) ([]string, error) {
+	return h.resolveStoredBlockIDs(orgID, blockIDs)
+}
+
+var markBlockMutationProcessedFn = func(h *FSHelper, operationKey string) (bool, error) {
+	return h.markBlockMutationProcessed(operationKey)
+}
+
+var decrementBlockRefCountFn = func(h *FSHelper, orgID, blockID string) bool {
+	return h.decrementBlockRefCount(orgID, blockID)
+}
+
+var incrementOrCreateBlockFn = func(h *FSHelper, orgID, blockID string, sizeBytes int, storageClass, storageKey string) error {
+	return h.IncrementOrCreateBlock(orgID, blockID, sizeBytes, storageClass, storageKey)
+}
+
 // PathTraverseResult contains the result of traversing to a path
 type PathTraverseResult struct {
 	TargetFSID   string    // FS ID of the target (file or dir)
@@ -829,9 +845,17 @@ func (h *FSHelper) CollectBlockIDsRecursive(repoID, fsID string) ([]string, erro
 	return blockIDs, err
 }
 
-func (h *FSHelper) resolveStoredBlockIDs(orgID string, blockIDs []string) []string {
+// resolveStoredBlockIDs maps external SHA-1 block IDs to the internal SHA-256 IDs
+// stored in the blocks table. Resolution is strict (see BatchResolveBlockIDs):
+// ref-count mutations MUST run on resolved IDs. Incrementing an unresolved SHA-1
+// would INSERT a phantom SHA-1 row and leave the real SHA-256 block
+// un-incremented; decrementing one is skipped harmlessly but leaks the real
+// block. Interim fail-closed handling only — see
+// ISSUE-REFCOUNT-RESOLVE-FAILCLOSED-01; the root fix lands with the ref_count
+// counter→per-block redesign, not here.
+func (h *FSHelper) resolveStoredBlockIDs(orgID string, blockIDs []string) ([]string, error) {
 	if len(blockIDs) == 0 {
-		return nil
+		return nil, nil
 	}
 	return streaming.BatchResolveBlockIDs(h.db, orgID, blockIDs)
 }
@@ -1054,7 +1078,19 @@ func (h *FSHelper) collectDirStats(repoID, fsID string) (blockIDs []string, tota
 // The operation is idempotent per operationKey and resolves SHA-1 block IDs to
 // the internal SHA-256 IDs stored in the blocks table.
 func (h *FSHelper) DecrementBlockRefCountsOnce(orgID, operationKey string, blockIDs []string) []string {
-	applied, err := h.markBlockMutationProcessed(operationKey)
+	// Resolve BEFORE consuming the idempotency marker so a failure doesn't burn
+	// the marker. On resolution failure we abort the WHOLE decrement (fail-closed)
+	// rather than acting on a partial/stale list. Known interim behavior: the abort
+	// is total (not per-block) and the resulting leak is permanent (no backfill
+	// scan). See ISSUE-REFCOUNT-RESOLVE-FAILCLOSED-01 — the root fix lands with the
+	// ref_count counter→per-block redesign.
+	resolvedBlockIDs, err := resolveStoredBlockIDsFn(h, orgID, blockIDs)
+	if err != nil {
+		log.Printf("[DecrementBlockRefCountsOnce] ERROR: aborting decrement for operation %q org=%s: block ID resolution failed: %v", operationKey, orgID, err)
+		return nil
+	}
+
+	applied, err := markBlockMutationProcessedFn(h, operationKey)
 	if err != nil {
 		log.Printf("[DecrementBlockRefCountsOnce] WARNING: failed to mark operation %q processed: %v", operationKey, err)
 		return nil
@@ -1064,10 +1100,9 @@ func (h *FSHelper) DecrementBlockRefCountsOnce(orgID, operationKey string, block
 		return nil
 	}
 
-	resolvedBlockIDs := h.resolveStoredBlockIDs(orgID, blockIDs)
 	var zeroRefBlocks []string
 	for _, blockID := range resolvedBlockIDs {
-		hitZero := h.decrementBlockRefCount(orgID, blockID)
+		hitZero := decrementBlockRefCountFn(h, orgID, blockID)
 		if hitZero {
 			zeroRefBlocks = append(zeroRefBlocks, blockID)
 		}
@@ -1196,11 +1231,14 @@ func incrementBlockRefCountsResolved(resolvedBlockIDs []string, increment func(s
 
 // IncrementBlockRefCounts increments ref_count for blocks (for copy)
 func (h *FSHelper) IncrementBlockRefCounts(orgID string, blockIDs []string) error {
-	resolvedBlockIDs := h.resolveStoredBlockIDs(orgID, blockIDs)
+	resolvedBlockIDs, err := resolveStoredBlockIDsFn(h, orgID, blockIDs)
+	if err != nil {
+		return fmt.Errorf("resolve block IDs before increment: %w", err)
+	}
 	return incrementBlockRefCountsResolved(
 		resolvedBlockIDs,
 		func(blockID string) error {
-			return h.IncrementOrCreateBlock(orgID, blockID, 0, "", "")
+			return incrementOrCreateBlockFn(h, orgID, blockID, 0, "", "")
 		},
 		func(incrementedBlockIDs []string) {
 			operationKey := fmt.Sprintf("increment_block_refs_rollback:%s:%d", orgID, time.Now().UnixNano())
@@ -1213,10 +1251,13 @@ func (h *FSHelper) IncrementBlockRefCounts(orgID string, blockIDs []string) erro
 // and returns the exact resolved block IDs that were incremented before any
 // error occurred so callers can roll the mutation back safely.
 func (h *FSHelper) IncrementBlockRefCountsTracked(orgID string, blockIDs []string) ([]string, error) {
-	resolvedBlockIDs := h.resolveStoredBlockIDs(orgID, blockIDs)
+	resolvedBlockIDs, err := resolveStoredBlockIDsFn(h, orgID, blockIDs)
+	if err != nil {
+		return nil, fmt.Errorf("resolve block IDs before increment: %w", err)
+	}
 	incrementedBlockIDs := make([]string, 0, len(resolvedBlockIDs))
 	for _, blockID := range resolvedBlockIDs {
-		if err := h.IncrementOrCreateBlock(orgID, blockID, 0, "", ""); err != nil {
+		if err := incrementOrCreateBlockFn(h, orgID, blockID, 0, "", ""); err != nil {
 			return incrementedBlockIDs, fmt.Errorf("increment block %s: %w", blockID, err)
 		}
 		incrementedBlockIDs = append(incrementedBlockIDs, blockID)

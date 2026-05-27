@@ -223,7 +223,7 @@ func (tm *TokenManager) CreateOneTimeLoginToken(userID, orgID, authToken string)
 		UserID:    userID,
 		OrgID:     orgID,
 		AuthToken: authToken,
-		ExpiresAt: time.Now().Add(60 * time.Second), // One-time tokens expire in 60 seconds
+		ExpiresAt: time.Now().Add(60 * time.Second),
 		CreatedAt: time.Now(),
 	}
 
@@ -289,7 +289,7 @@ type ChunkUpload struct {
 	TotalSize   int64
 	TempFile    *os.File
 	TempPath    string
-	ReceivedEnd int64 // Highest byte received; informational only.
+	ReceivedEnd int64
 	Ranges      []byteRange
 	Finalizing  bool
 
@@ -323,7 +323,7 @@ const (
 
 // ChunkManager manages chunked uploads
 type ChunkManager struct {
-	uploads map[string]*ChunkUpload // keyed by "token:filename"
+	uploads map[string]*ChunkUpload
 	mu      sync.RWMutex
 	tempDir string
 
@@ -870,6 +870,13 @@ type zipTraversalBudget struct {
 	totalBytes int64
 }
 
+type zipPreparedFile struct {
+	path        string
+	blockIDs    []string
+	resolvedIDs []string
+	sizeBytes   int64
+}
+
 func (b *zipTraversalBudget) noteDirectory(depth int) error {
 	if depth > b.maxDepth {
 		return &zipLimitError{message: fmt.Sprintf("zip download exceeds maximum directory depth of %d", b.maxDepth)}
@@ -1377,6 +1384,8 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 var errStorageQuotaExceeded = errors.New("storage quota exceeded")
 
 var rollbackUploadedBlockRefsFn = v2.RollbackUploadedBlockRefs
+
+var zipBatchResolveBlockIDsFn = streaming.BatchResolveBlockIDs
 
 var cleanupChunkUploadFn = func(token, filename string) {
 	chunkManager.CleanupUpload(token, filename)
@@ -2469,6 +2478,15 @@ func (h *SeafHTTPHandler) streamFileFromBlocks(c *gin.Context, token *AccessToke
 
 	log.Printf("[streamFileFromBlocks] Streaming %d blocks, size=%d, encrypted=%v", len(blockIDs), fileSize, fileKey != nil)
 
+	// Batch resolve all block IDs upfront (avoids per-block Cassandra queries).
+	// Strict: a stale SHA-1 sent to SHA-256 storage would truncate the stream
+	// mid-download, so we resolve BEFORE committing any headers and fail clean.
+	resolvedIDs, err := streaming.BatchResolveBlockIDs(h.db, token.OrgID, blockIDs)
+	if err != nil {
+		log.Printf("[streamFileFromBlocks] block ID resolution failed for org=%s: %v", token.OrgID, err)
+		return fmt.Errorf("resolve block IDs: %w", err)
+	}
+
 	// Set headers before streaming — Content-Length lets clients show progress
 	c.Header("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, filename))
 	c.Header("Content-Type", "application/octet-stream")
@@ -2479,9 +2497,6 @@ func (h *SeafHTTPHandler) streamFileFromBlocks(c *gin.Context, token *AccessToke
 		c.Header("Content-Length", strconv.FormatInt(fileSize, 10))
 	}
 	c.Status(http.StatusOK)
-
-	// Batch resolve all block IDs upfront (avoids per-block Cassandra queries)
-	resolvedIDs := streaming.BatchResolveBlockIDs(h.db, token.OrgID, blockIDs)
 
 	// Stream with prefetching pipeline
 	streaming.StreamBlocks(c, c.Request.Context(), blockStore, resolvedIDs, fileKey, fileIV, "streamFileFromBlocks")
@@ -2752,8 +2767,17 @@ func (h *SeafHTTPHandler) HandleZipDownload(c *gin.Context) {
 		}
 	}
 
+	hostname := httputil.GetRoutingHostname(c, h.configuredServerURL())
+	blockStore, _, err := h.resolveLibraryBlockStore(hostname, token.OrgID, token.RepoID)
+	if err != nil {
+		log.Printf("[HandleZipDownload] Failed to resolve block store: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to prepare zip download"})
+		return
+	}
+
 	preflightBudget := h.newZipTraversalBudget()
-	if err := h.validateZipDirectory(token.RepoID, targetFSID, 0, preflightBudget); err != nil {
+	preparedFiles, err := h.prepareZipDirectory(token.RepoID, token.OrgID, targetFSID, "", 0, preflightBudget)
+	if err != nil {
 		if isZipLimitError(err) {
 			c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": err.Error()})
 			return
@@ -2775,9 +2799,7 @@ func (h *SeafHTTPHandler) HandleZipDownload(c *gin.Context) {
 	// Snapshot writer size before streaming so we can calculate the delta afterward.
 	bytesBefore := int64(c.Writer.Size())
 
-	// Recursively add directory contents to the ZIP
-	runtimeBudget := h.newZipTraversalBudget()
-	if err := h.addDirToZip(c.Request.Context(), httputil.GetRoutingHostname(c, h.configuredServerURL()), zipWriter, token.RepoID, token.OrgID, targetFSID, "", fileKey, fileIV, 0, runtimeBudget); err != nil {
+	if err := h.addDirToZip(c.Request.Context(), zipWriter, blockStore, preparedFiles, fileKey, fileIV); err != nil {
 		log.Printf("[HandleZipDownload] ZIP stream aborted: %v", err)
 		return
 	}
@@ -2802,60 +2824,10 @@ func (h *SeafHTTPHandler) HandleZipDownload(c *gin.Context) {
 	}
 }
 
-func (h *SeafHTTPHandler) validateZipDirectory(repoID, dirFSID string, depth int, budget *zipTraversalBudget) error {
-	if budget == nil {
-		return nil
-	}
-	if err := budget.noteDirectory(depth); err != nil {
-		return err
-	}
-
-	var dirEntriesJSON string
-	err := h.db.Session().Query(`
-		SELECT dir_entries FROM fs_objects WHERE library_id = ? AND fs_id = ?
-	`, repoID, dirFSID).Scan(&dirEntriesJSON)
-	if err != nil || dirEntriesJSON == "" || dirEntriesJSON == "[]" {
-		return err
-	}
-
-	var entries []map[string]interface{}
-	if err := json.Unmarshal([]byte(dirEntriesJSON), &entries); err != nil {
-		return fmt.Errorf("parse dir entries: %w", err)
-	}
-
-	for _, entry := range entries {
-		id, _ := entry["id"].(string)
-		if id == "" {
-			continue
-		}
-		modeFloat, _ := entry["mode"].(float64)
-		mode := int(modeFloat)
-		if mode == 16384 || mode&0170000 == 040000 {
-			if err := h.validateZipDirectory(repoID, id, depth+1, budget); err != nil {
-				return err
-			}
-			continue
-		}
-
-		var fileSize int64
-		if err := h.db.Session().Query(`
-			SELECT size_bytes FROM fs_objects WHERE library_id = ? AND fs_id = ?
-		`, repoID, id).Scan(&fileSize); err != nil {
-			return fmt.Errorf("load zip file metadata: %w", err)
-		}
-		if err := budget.noteFile(fileSize); err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
-// addDirToZip recursively adds directory contents to a ZIP archive
-func (h *SeafHTTPHandler) addDirToZip(ctx context.Context, hostname string, zw *zip.Writer, repoID, orgID, dirFSID, prefix string, fileKey []byte, fileIV []byte, depth int, budget *zipTraversalBudget) error {
+func (h *SeafHTTPHandler) prepareZipDirectory(repoID, orgID, dirFSID, prefix string, depth int, budget *zipTraversalBudget) ([]zipPreparedFile, error) {
 	if budget != nil {
 		if err := budget.noteDirectory(depth); err != nil {
-			return err
+			return nil, err
 		}
 	}
 
@@ -2864,14 +2836,15 @@ func (h *SeafHTTPHandler) addDirToZip(ctx context.Context, hostname string, zw *
 		SELECT dir_entries FROM fs_objects WHERE library_id = ? AND fs_id = ?
 	`, repoID, dirFSID).Scan(&dirEntriesJSON)
 	if err != nil || dirEntriesJSON == "" || dirEntriesJSON == "[]" {
-		return err
+		return nil, err
 	}
 
 	var entries []map[string]interface{}
 	if err := json.Unmarshal([]byte(dirEntriesJSON), &entries); err != nil {
-		return fmt.Errorf("parse dir entries: %w", err)
+		return nil, fmt.Errorf("parse dir entries: %w", err)
 	}
 
+	prepared := make([]zipPreparedFile, 0, len(entries))
 	for _, entry := range entries {
 		name, _ := entry["name"].(string)
 		id, _ := entry["id"].(string)
@@ -2886,94 +2859,101 @@ func (h *SeafHTTPHandler) addDirToZip(ctx context.Context, hostname string, zw *
 
 		modeFloat, _ := entry["mode"].(float64)
 		mode := int(modeFloat)
-
-		if mode == 16384 || mode&0170000 == 040000 { // Directory
-			if err := h.addDirToZip(ctx, hostname, zw, repoID, orgID, id, entryPath, fileKey, fileIV, depth+1, budget); err != nil {
-				return err
+		if mode == 16384 || mode&0170000 == 040000 {
+			childFiles, err := h.prepareZipDirectory(repoID, orgID, id, entryPath, depth+1, budget)
+			if err != nil {
+				return nil, err
 			}
-		} else { // File
-			if err := h.addFileToZip(ctx, hostname, zw, repoID, orgID, id, entryPath, fileKey, fileIV, budget); err != nil {
-				return err
+			prepared = append(prepared, childFiles...)
+			continue
+		}
+
+		var blockIDs []string
+		var fileSize int64
+		err := h.db.Session().Query(`
+			SELECT block_ids, size_bytes FROM fs_objects WHERE library_id = ? AND fs_id = ?
+		`, repoID, id).Scan(&blockIDs, &fileSize)
+		if err != nil {
+			return nil, fmt.Errorf("load blocks for %s: %w", entryPath, err)
+		}
+		if budget != nil {
+			if err := budget.noteFile(fileSize); err != nil {
+				return nil, err
 			}
 		}
+
+		resolvedIDs, err := zipBatchResolveBlockIDsFn(h.db, orgID, blockIDs)
+		if err != nil {
+			return nil, fmt.Errorf("resolve block IDs for %s: %w", entryPath, err)
+		}
+
+		prepared = append(prepared, zipPreparedFile{
+			path:        entryPath,
+			blockIDs:    append([]string(nil), blockIDs...),
+			resolvedIDs: append([]string(nil), resolvedIDs...),
+			sizeBytes:   fileSize,
+		})
 	}
 
-	return nil
+	return prepared, nil
 }
 
-// addFileToZip streams a file's blocks into a ZIP archive entry.
-// Uses zip.Store (no compression) for maximum throughput — the data is already
-// compressed by S3/MinIO or is binary data where deflate adds CPU cost for minimal gain.
-// For encrypted files, one block at a time is loaded, decrypted, and written.
-func (h *SeafHTTPHandler) addFileToZip(ctx context.Context, hostname string, zw *zip.Writer, repoID, orgID, fileFSID, zipPath string, fileKey []byte, fileIV []byte, budget *zipTraversalBudget) error {
-	var blockIDs []string
-	var fileSize int64
-	err := h.db.Session().Query(`
-		SELECT block_ids, size_bytes FROM fs_objects WHERE library_id = ? AND fs_id = ?
-	`, repoID, fileFSID).Scan(&blockIDs, &fileSize)
-	if err != nil {
-		return fmt.Errorf("load blocks for %s: %w", zipPath, err)
-	}
-	if budget != nil {
-		if err := budget.noteFile(fileSize); err != nil {
+func (h *SeafHTTPHandler) addDirToZip(ctx context.Context, zw *zip.Writer, blockStore *storage.BlockStore, files []zipPreparedFile, fileKey []byte, fileIV []byte) error {
+	for _, file := range files {
+		if err := h.addFileToZip(ctx, zw, blockStore, file, fileKey, fileIV); err != nil {
 			return err
 		}
 	}
+	return nil
+}
 
-	// Use Store (no compression) for maximum throughput.
-	// Deflate on a 28GB archive caps at ~50-100 MB/s on a single core.
+// addFileToZip streams a preflighted file's blocks into a ZIP archive entry.
+// Uses zip.Store (no compression) for maximum throughput — the data is already
+// compressed by S3/MinIO or is binary data where deflate adds CPU cost for minimal gain.
+// For encrypted files, one block at a time is loaded, decrypted, and written.
+func (h *SeafHTTPHandler) addFileToZip(ctx context.Context, zw *zip.Writer, blockStore *storage.BlockStore, file zipPreparedFile, fileKey []byte, fileIV []byte) error {
 	header := &zip.FileHeader{
-		Name:   zipPath,
-		Method: zip.Store, // No compression — raw speed
+		Name:   file.path,
+		Method: zip.Store,
 	}
-	if fileSize > 0 {
-		header.UncompressedSize64 = uint64(fileSize)
+	if file.sizeBytes > 0 {
+		header.UncompressedSize64 = uint64(file.sizeBytes)
 	}
 	w, err := zw.CreateHeader(header)
 	if err != nil {
-		return fmt.Errorf("create zip entry %s: %w", zipPath, err)
+		return fmt.Errorf("create zip entry %s: %w", file.path, err)
 	}
 
-	blockStore, _, err := h.resolveLibraryBlockStore(hostname, orgID, repoID)
-	if err != nil {
-		return fmt.Errorf("block store not available: %w", err)
-	}
-
-	// Batch resolve all block IDs upfront
-	resolvedIDs := streaming.BatchResolveBlockIDs(h.db, orgID, blockIDs)
-
-	// Get a reusable 4MB buffer for streaming
 	buf := streaming.GetCopyBuf()
 	defer streaming.PutCopyBuf(buf)
 
-	for i, blockID := range blockIDs {
-		internalID := resolvedIDs[i]
-		_ = blockID // original ID used only for logging
+	for i, blockID := range file.blockIDs {
+		internalID := file.resolvedIDs[i]
+		_ = blockID
 
 		if fileKey != nil {
-			// Encrypted: load block, decrypt, write
 			blockData, err := blockStore.GetBlock(ctx, internalID)
 			if err != nil {
-				return fmt.Errorf("get block %s for %s: %w", blockIDs[i], zipPath, err)
+				return fmt.Errorf("get block %s for %s: %w", file.blockIDs[i], file.path, err)
 			}
 			decrypted, err := crypto.DecryptLibraryBlock(blockData, fileKey, fileIV)
 			if err != nil {
-				return fmt.Errorf("decrypt block for %s: %w", zipPath, err)
+				return fmt.Errorf("decrypt block for %s: %w", file.path, err)
 			}
 			if _, err := w.Write(decrypted); err != nil {
-				return fmt.Errorf("write decrypted block for %s: %w", zipPath, err)
+				return fmt.Errorf("write decrypted block for %s: %w", file.path, err)
 			}
-		} else {
-			// Unencrypted: stream directly from S3 → ZIP writer with 4MB buffer
-			reader, err := blockStore.GetBlockReader(ctx, internalID)
-			if err != nil {
-				return fmt.Errorf("get block reader %s for %s: %w", blockIDs[i], zipPath, err)
-			}
-			_, err = io.CopyBuffer(w, reader, buf)
-			reader.Close()
-			if err != nil {
-				return fmt.Errorf("stream block %s for %s: %w", blockIDs[i], zipPath, err)
-			}
+			continue
+		}
+
+		reader, err := blockStore.GetBlockReader(ctx, internalID)
+		if err != nil {
+			return fmt.Errorf("get block reader %s for %s: %w", file.blockIDs[i], file.path, err)
+		}
+		_, err = io.CopyBuffer(w, reader, buf)
+		reader.Close()
+		if err != nil {
+			return fmt.Errorf("stream block %s for %s: %w", file.blockIDs[i], file.path, err)
 		}
 	}
 

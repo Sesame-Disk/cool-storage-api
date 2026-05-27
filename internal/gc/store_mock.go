@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Sesame-Disk/sesamefs/internal/db"
 	"github.com/Sesame-Disk/sesamefs/internal/traffic"
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
 	"github.com/google/uuid"
@@ -37,6 +38,8 @@ type MockStore struct {
 
 	// block GC candidates keyed by "orgID:blockID"
 	blockGCCandidates map[string]*mockBlockGCCandidate
+	// block GC candidate discovery rows keyed by the full projection PK.
+	blockGCCandidateProjections map[mockBlockGCCandidateProjectionKey]BlockGCCandidateInfo
 
 	// block_id_mappings keyed by "orgID:externalID"
 	mappings map[string]string // externalID -> internalID
@@ -145,6 +148,7 @@ type MockStore struct {
 	deleteGroupFullErr             error
 	acquireOrgHardDeleteLockHook   func(orgID uuid.UUID)
 	beginOrgPurgeHook              func(orgID uuid.UUID)
+	getBlockRefCountErr            error
 
 	// optional test hooks for reproducing concurrency windows deterministically.
 	getQueueSizeHook      func(orgID uuid.UUID, size int)
@@ -159,6 +163,11 @@ type MockStore struct {
 	// LoggedBatch case (Cassandra timeout / unavailable) where the batch
 	// committed at the cluster but the client observed a failure.
 	requeueItemErrAfterMutate error
+	// ensureBlockGCCandidateErrAfterMutate, when non-nil, forces
+	// EnsureBlockGCCandidate to preserve the canonical/discovery rows and then
+	// return this error. Models degraded projection-repair outcomes where the
+	// candidate identity is still known to the caller.
+	ensureBlockGCCandidateErrAfterMutate error
 	// dlqOpHook is invoked at the very top of RequeueFailedItem and
 	// DeleteFailedItem on the mock — before the internal mutex is taken —
 	// so concurrency tests can observe whether two admin DLQ ops are
@@ -171,6 +180,8 @@ type MockStore struct {
 
 	// S3 orphans keyed by "orgID:blockID"
 	s3Orphans map[string]*S3OrphanInfo
+	// S3 orphan discovery rows keyed by the full projection PK.
+	s3OrphanProjections map[mockS3OrphanProjectionKey]S3OrphanInfo
 }
 
 type mockBlock struct {
@@ -193,6 +204,22 @@ type mockBlockGCCandidate struct {
 	BlockID      string
 	StorageClass string
 	CandidateAt  time.Time
+}
+
+type mockBlockGCCandidateProjectionKey struct {
+	CandidateDay time.Time
+	Bucket       int
+	CandidateAt  time.Time
+	OrgID        uuid.UUID
+	BlockID      string
+}
+
+type mockS3OrphanProjectionKey struct {
+	FirstSeenDay time.Time
+	Bucket       int
+	FirstSeenAt  time.Time
+	OrgID        uuid.UUID
+	BlockID      string
 }
 
 type mockCommit struct {
@@ -320,6 +347,7 @@ func NewMockStore() *MockStore {
 		failedItems:                   make(map[uuid.UUID][]GCFailedItemInfo),
 		blocks:                        make(map[string]*mockBlock),
 		blockGCCandidates:             make(map[string]*mockBlockGCCandidate),
+		blockGCCandidateProjections:   make(map[mockBlockGCCandidateProjectionKey]BlockGCCandidateInfo),
 		mappings:                      make(map[string]string),
 		commits:                       make(map[string]*mockCommit),
 		fsObjects:                     make(map[string]*mockFSObject),
@@ -350,6 +378,7 @@ func NewMockStore() *MockStore {
 		gcStats:                       make(map[string]string),
 		organizations:                 nil,
 		s3Orphans:                     make(map[string]*S3OrphanInfo),
+		s3OrphanProjections:           make(map[mockS3OrphanProjectionKey]S3OrphanInfo),
 	}
 }
 
@@ -361,6 +390,43 @@ func newMockPendingItemKey(orgID, libraryID uuid.UUID, itemType ItemType, itemID
 		ItemID:     itemID,
 		IdentityAt: identityAt,
 	}
+}
+
+func newMockBlockGCCandidateProjectionKey(orgID uuid.UUID, blockID string, candidateAt time.Time) mockBlockGCCandidateProjectionKey {
+	candidateAt = candidateAt.UTC()
+	return mockBlockGCCandidateProjectionKey{
+		CandidateDay: db.GCProjectionUTCDate(candidateAt),
+		Bucket:       db.GCDiscoveryBucket(orgID.String(), blockID),
+		CandidateAt:  candidateAt,
+		OrgID:        orgID,
+		BlockID:      blockID,
+	}
+}
+
+func newMockS3OrphanProjectionKey(orgID uuid.UUID, blockID string, firstSeenAt time.Time) mockS3OrphanProjectionKey {
+	firstSeenAt = firstSeenAt.UTC()
+	return mockS3OrphanProjectionKey{
+		FirstSeenDay: db.GCProjectionUTCDate(firstSeenAt),
+		Bucket:       db.GCDiscoveryBucket(orgID.String(), blockID),
+		FirstSeenAt:  firstSeenAt,
+		OrgID:        orgID,
+		BlockID:      blockID,
+	}
+}
+
+func (m *MockStore) upsertBlockGCCandidateProjection(candidate *mockBlockGCCandidate) {
+	key := newMockBlockGCCandidateProjectionKey(candidate.OrgID, candidate.BlockID, candidate.CandidateAt)
+	m.blockGCCandidateProjections[key] = BlockGCCandidateInfo{
+		OrgID:        candidate.OrgID,
+		BlockID:      candidate.BlockID,
+		StorageClass: candidate.StorageClass,
+		CandidateAt:  candidate.CandidateAt.UTC(),
+	}
+}
+
+func (m *MockStore) upsertS3OrphanProjection(orphan *S3OrphanInfo) {
+	key := newMockS3OrphanProjectionKey(orphan.OrgID, orphan.BlockID, orphan.FirstSeenAt)
+	m.s3OrphanProjections[key] = *orphan
 }
 
 func (m *MockStore) upsertPendingItem(orgID, libraryID uuid.UUID, itemType ItemType, itemID string, identityAt time.Time, expiresAt *time.Time) {
@@ -402,12 +468,26 @@ func (m *MockStore) AddBlockGCCandidate(orgID uuid.UUID, blockID, storageClass s
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	key := fmt.Sprintf("%s:%s", orgID, blockID)
-	m.blockGCCandidates[key] = &mockBlockGCCandidate{
+	candidate := &mockBlockGCCandidate{
 		OrgID:        orgID,
 		BlockID:      blockID,
 		StorageClass: storageClass,
-		CandidateAt:  candidateAt,
+		CandidateAt:  candidateAt.UTC(),
 	}
+	m.blockGCCandidates[key] = candidate
+	m.upsertBlockGCCandidateProjection(candidate)
+}
+
+func (m *MockStore) DeleteBlockGCCandidateProjectionForTest(orgID uuid.UUID, blockID string, candidateAt time.Time) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.blockGCCandidateProjections, newMockBlockGCCandidateProjectionKey(orgID, blockID, candidateAt))
+}
+
+func (m *MockStore) DeleteS3OrphanProjectionForTest(orgID uuid.UUID, blockID string, firstSeenAt time.Time) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.s3OrphanProjections, newMockS3OrphanProjectionKey(orgID, blockID, firstSeenAt))
 }
 
 func (m *MockStore) AddBlockMapping(orgID uuid.UUID, externalID, internalID string) {
@@ -1371,6 +1451,9 @@ func (m *MockStore) GetOrgDeletedAt(orgID uuid.UUID) (*time.Time, error) {
 func (m *MockStore) GetBlockRefCount(orgID uuid.UUID, blockID string) (int, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
+	if m.getBlockRefCountErr != nil {
+		return 0, m.getBlockRefCountErr
+	}
 
 	key := fmt.Sprintf("%s:%s", orgID, blockID)
 	b, ok := m.blocks[key]
@@ -1402,59 +1485,58 @@ func (m *MockStore) EnsureBlockGCCandidate(orgID uuid.UUID, blockID, storageClas
 	defer m.mu.Unlock()
 	key := fmt.Sprintf("%s:%s", orgID, blockID)
 	if existing, ok := m.blockGCCandidates[key]; ok {
-		return existing.CandidateAt, nil
+		m.upsertBlockGCCandidateProjection(existing)
+		return existing.CandidateAt, m.ensureBlockGCCandidateErrAfterMutate
 	}
-	m.blockGCCandidates[key] = &mockBlockGCCandidate{
+	candidate := &mockBlockGCCandidate{
 		OrgID:        orgID,
 		BlockID:      blockID,
 		StorageClass: storageClass,
-		CandidateAt:  candidateAt,
+		CandidateAt:  candidateAt.UTC(),
 	}
-	return candidateAt, nil
+	m.blockGCCandidates[key] = candidate
+	m.upsertBlockGCCandidateProjection(candidate)
+	return candidate.CandidateAt, m.ensureBlockGCCandidateErrAfterMutate
 }
 
-func (m *MockStore) DeleteBlockGCCandidate(orgID uuid.UUID, blockID string) error {
+func (m *MockStore) DeleteBlockGCCandidate(orgID uuid.UUID, blockID string, candidateAt time.Time) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	delete(m.blockGCCandidates, fmt.Sprintf("%s:%s", orgID, blockID))
+	key := fmt.Sprintf("%s:%s", orgID, blockID)
+	if candidateAt.IsZero() {
+		if existing, ok := m.blockGCCandidates[key]; ok {
+			candidateAt = existing.CandidateAt
+		}
+	}
+	delete(m.blockGCCandidates, key)
+	if !candidateAt.IsZero() {
+		delete(m.blockGCCandidateProjections, newMockBlockGCCandidateProjectionKey(orgID, blockID, candidateAt))
+	}
 	return nil
 }
 
-func (m *MockStore) ListBlockGCCandidateOrgs() ([]uuid.UUID, error) {
+func (m *MockStore) ListBlockGCCandidatesByDay(day time.Time, bucket int) ([]BlockGCCandidateInfo, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	seen := make(map[uuid.UUID]bool)
-	var orgs []uuid.UUID
-	for _, candidate := range m.blockGCCandidates {
-		if seen[candidate.OrgID] {
-			continue
-		}
-		seen[candidate.OrgID] = true
-		orgs = append(orgs, candidate.OrgID)
-	}
-	sort.Slice(orgs, func(i, j int) bool {
-		return orgs[i].String() < orgs[j].String()
-	})
-	return orgs, nil
-}
-
-func (m *MockStore) ListBlockGCCandidates(orgID uuid.UUID) ([]BlockGCCandidateInfo, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	prefix := fmt.Sprintf("%s:", orgID)
+	targetDay := db.GCProjectionUTCDate(day)
 	var candidates []BlockGCCandidateInfo
-	for key, candidate := range m.blockGCCandidates {
-		if len(key) <= len(prefix) || key[:len(prefix)] != prefix {
+	for key, candidate := range m.blockGCCandidateProjections {
+		if !key.CandidateDay.Equal(targetDay) {
 			continue
 		}
-		candidates = append(candidates, BlockGCCandidateInfo{
-			BlockID:      candidate.BlockID,
-			StorageClass: candidate.StorageClass,
-			CandidateAt:  candidate.CandidateAt,
-		})
+		if key.Bucket != bucket {
+			continue
+		}
+		candidates = append(candidates, candidate)
 	}
 	sort.Slice(candidates, func(i, j int) bool {
-		return candidates[i].CandidateAt.Before(candidates[j].CandidateAt)
+		if !candidates[i].CandidateAt.Equal(candidates[j].CandidateAt) {
+			return candidates[i].CandidateAt.Before(candidates[j].CandidateAt)
+		}
+		if candidates[i].OrgID != candidates[j].OrgID {
+			return candidates[i].OrgID.String() < candidates[j].OrgID.String()
+		}
+		return candidates[i].BlockID < candidates[j].BlockID
 	})
 	return candidates, nil
 }
@@ -1633,24 +1715,6 @@ func (m *MockStore) ListOrganizations() ([]uuid.UUID, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return append([]uuid.UUID{}, m.organizations...), nil
-}
-
-func (m *MockStore) ListBlocksForOrg(orgID uuid.UUID) ([]BlockInfo, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	prefix := fmt.Sprintf("%s:", orgID)
-	var blocks []BlockInfo
-	for key, b := range m.blocks {
-		if len(key) > len(prefix) && key[:len(prefix)] == prefix {
-			blocks = append(blocks, BlockInfo{
-				BlockID:      b.BlockID,
-				StorageClass: b.StorageClass,
-				RefCount:     b.RefCount,
-			})
-		}
-	}
-	return blocks, nil
 }
 
 func (m *MockStore) ListExpiredShareLinks() ([]ExpiredShareLinkInfo, error) {
@@ -2677,7 +2741,9 @@ func (m *MockStore) LoadGCStats(key string) (string, error) {
 	defer m.mu.RUnlock()
 	val, ok := m.gcStats[key]
 	if !ok {
-		return "", fmt.Errorf("stat not found: %s", key)
+		// Mirror the Cassandra store contract so callers can use
+		// `errors.Is(err, gocql.ErrNotFound)` regardless of backend.
+		return "", gocql.ErrNotFound
 	}
 	return val, nil
 }
@@ -2755,7 +2821,7 @@ func (d *mockBlockDeleter) DeleteBlock(ctx context.Context, blockID string) erro
 
 // --- S3 orphan recovery (mock) ---
 
-func (m *MockStore) RecordS3Orphan(orgID uuid.UUID, blockID, storageClass, errMsg string, now time.Time) error {
+func (m *MockStore) RecordS3Orphan(orgID uuid.UUID, blockID, storageClass, errMsg string, now time.Time) (time.Time, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	key := fmt.Sprintf("%s:%s", orgID, blockID)
@@ -2764,23 +2830,26 @@ func (m *MockStore) RecordS3Orphan(orgID uuid.UUID, blockID, storageClass, errMs
 		initialRetryCount = 1
 	}
 	if existing, ok := m.s3Orphans[key]; ok {
+		m.upsertS3OrphanProjection(existing)
 		if errMsg != "" {
 			existing.LastAttemptAt = now
 			existing.RetryCount++
 			existing.LastError = errMsg
 		}
-		return nil
+		return existing.FirstSeenAt, nil
 	}
-	m.s3Orphans[key] = &S3OrphanInfo{
+	orphan := &S3OrphanInfo{
 		OrgID:         orgID,
 		BlockID:       blockID,
 		StorageClass:  storageClass,
-		FirstSeenAt:   now,
+		FirstSeenAt:   now.UTC(),
 		LastAttemptAt: now,
 		RetryCount:    initialRetryCount,
 		LastError:     errMsg,
 	}
-	return nil
+	m.s3Orphans[key] = orphan
+	m.upsertS3OrphanProjection(orphan)
+	return orphan.FirstSeenAt, nil
 }
 
 func (m *MockStore) UpdateS3OrphanAttempt(orgID uuid.UUID, blockID, errMsg string, now time.Time) error {
@@ -2795,42 +2864,50 @@ func (m *MockStore) UpdateS3OrphanAttempt(orgID uuid.UUID, blockID, errMsg strin
 	return nil
 }
 
-func (m *MockStore) DeleteS3Orphan(orgID uuid.UUID, blockID string) error {
+func (m *MockStore) DeleteS3Orphan(orgID uuid.UUID, blockID string, firstSeenAt time.Time) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	delete(m.s3Orphans, fmt.Sprintf("%s:%s", orgID, blockID))
+	key := fmt.Sprintf("%s:%s", orgID, blockID)
+	if firstSeenAt.IsZero() {
+		if existing, ok := m.s3Orphans[key]; ok {
+			firstSeenAt = existing.FirstSeenAt
+		}
+	}
+	delete(m.s3Orphans, key)
+	if !firstSeenAt.IsZero() {
+		delete(m.s3OrphanProjections, newMockS3OrphanProjectionKey(orgID, blockID, firstSeenAt))
+	}
 	return nil
 }
 
-func (m *MockStore) ListS3OrphanOrgs() ([]uuid.UUID, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	seen := make(map[uuid.UUID]bool)
-	for _, o := range m.s3Orphans {
-		seen[o.OrgID] = true
-	}
-	orgs := make([]uuid.UUID, 0, len(seen))
-	for o := range seen {
-		orgs = append(orgs, o)
-	}
-	return orgs, nil
-}
-
-func (m *MockStore) ListS3Orphans(orgID uuid.UUID, limit int) ([]S3OrphanInfo, error) {
+func (m *MockStore) ListS3OrphansByDay(day time.Time, bucket int, limit int) ([]S3OrphanInfo, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	if limit <= 0 {
 		limit = 100
 	}
+	targetDay := db.GCProjectionUTCDate(day)
 	var out []S3OrphanInfo
-	for _, o := range m.s3Orphans {
-		if o.OrgID != orgID {
+	for key, orphan := range m.s3OrphanProjections {
+		if !key.FirstSeenDay.Equal(targetDay) {
 			continue
 		}
-		out = append(out, *o)
-		if len(out) >= limit {
-			break
+		if key.Bucket != bucket {
+			continue
 		}
+		out = append(out, orphan)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if !out[i].FirstSeenAt.Equal(out[j].FirstSeenAt) {
+			return out[i].FirstSeenAt.Before(out[j].FirstSeenAt)
+		}
+		if out[i].OrgID != out[j].OrgID {
+			return out[i].OrgID.String() < out[j].OrgID.String()
+		}
+		return out[i].BlockID < out[j].BlockID
+	})
+	if len(out) > limit {
+		out = out[:limit]
 	}
 	return out, nil
 }
@@ -2840,4 +2917,46 @@ func (m *MockStore) S3OrphanCount() int {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return len(m.s3Orphans)
+}
+
+// AllS3Orphans is a test helper returning every orphan row across all
+// (day, bucket) partitions. Replaces the old per-org ListS3Orphans path used
+// by tests that just need to assert "what orphans exist right now".
+func (m *MockStore) AllS3Orphans() []S3OrphanInfo {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := make([]S3OrphanInfo, 0, len(m.s3Orphans))
+	for _, o := range m.s3Orphans {
+		out = append(out, *o)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].OrgID != out[j].OrgID {
+			return out[i].OrgID.String() < out[j].OrgID.String()
+		}
+		return out[i].BlockID < out[j].BlockID
+	})
+	return out
+}
+
+// AllBlockGCCandidates is a test helper returning every candidate row across
+// all (day, bucket) partitions.
+func (m *MockStore) AllBlockGCCandidates() []BlockGCCandidateInfo {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := make([]BlockGCCandidateInfo, 0, len(m.blockGCCandidates))
+	for _, c := range m.blockGCCandidates {
+		out = append(out, BlockGCCandidateInfo{
+			OrgID:        c.OrgID,
+			BlockID:      c.BlockID,
+			StorageClass: c.StorageClass,
+			CandidateAt:  c.CandidateAt,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].OrgID != out[j].OrgID {
+			return out[i].OrgID.String() < out[j].OrgID.String()
+		}
+		return out[i].BlockID < out[j].BlockID
+	})
+	return out
 }
