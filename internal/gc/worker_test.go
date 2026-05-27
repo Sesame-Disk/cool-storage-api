@@ -8,7 +8,9 @@ import (
 	"time"
 
 	"github.com/Sesame-Disk/sesamefs/internal/db"
+	"github.com/Sesame-Disk/sesamefs/internal/metrics"
 	"github.com/google/uuid"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
 func TestNewWorker(t *testing.T) {
@@ -177,6 +179,31 @@ func TestWorker_ProcessBlock_RetryUsesIdentityAtForCandidateCleanup(t *testing.T
 	}
 	if len(candidates) != 0 {
 		t.Fatalf("expected discovery row cleanup via identity_at, got %d rows", len(candidates))
+	}
+}
+
+func TestWorker_EnqueueZeroRefBlocks_RecordsProjectionDegradationMetric(t *testing.T) {
+	store := NewMockStore()
+	store.ensureBlockGCCandidateErrAfterMutate = errors.New("repair projection failed")
+	stats := &Stats{}
+	q := NewQueue(store)
+	w := NewWorker(store, nil, q, 100, 0, false, stats)
+	orgID := uuid.New()
+	beforeDegraded := testutil.ToFloat64(metrics.GCBlockCandidateDiscoveryDegradedTotal.WithLabelValues("worker"))
+
+	if err := w.enqueueZeroRefBlocks(orgID, uuid.Nil, []string{"block-worker-degraded"}, "hot"); err != nil {
+		t.Fatalf("enqueueZeroRefBlocks returned error despite usable candidate identity: %v", err)
+	}
+	afterDegraded := testutil.ToFloat64(metrics.GCBlockCandidateDiscoveryDegradedTotal.WithLabelValues("worker"))
+	if afterDegraded-beforeDegraded != 1 {
+		t.Fatalf("worker degraded metric delta = %v, want 1", afterDegraded-beforeDegraded)
+	}
+	items := store.QueueItems(orgID)
+	if len(items) != 1 {
+		t.Fatalf("expected 1 queued block item, got %d", len(items))
+	}
+	if items[0].ItemID != "block-worker-degraded" || items[0].ItemType != ItemBlock {
+		t.Fatalf("unexpected queued item: %+v", items[0])
 	}
 }
 

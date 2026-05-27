@@ -408,17 +408,21 @@ func (s *Service) EnqueueBlock(orgID uuid.UUID, blockID string, libraryID uuid.U
 	if candidateErr != nil && candidateAt.IsZero() {
 		return candidateErr
 	}
+	if candidateErr != nil {
+		metrics.GCBlockCandidateDiscoveryDegradedTotal.WithLabelValues("service").Inc()
+		log.Printf("[GC] WARNING: block candidate discovery degraded for org=%s block=%s: %v", orgID, blockID, candidateErr)
+	}
 	exists, err := s.store.PendingItemExists(orgID, uuid.Nil, candidateAt, ItemBlock, blockID)
 	if err != nil {
 		return errors.Join(candidateErr, err)
 	}
 	if exists {
-		return candidateErr
+		return nil
 	}
 	if err := s.store.EnqueueItem(orgID, candidateAt, ItemBlock, blockID, libraryID, storageClass, 0); err != nil {
 		return errors.Join(candidateErr, err)
 	}
-	return candidateErr
+	return nil
 }
 
 // EnqueueLibraryDeletion enqueues all contents of a library for GC.

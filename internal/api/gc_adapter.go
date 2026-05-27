@@ -17,10 +17,10 @@ type gcBlockEnqueuer struct {
 
 // EnqueueBlocks enqueues blocks with ref_count=0 for garbage collection.
 //
-// Each failure increments gc_zero_ref_enqueue_failures_total. After the
-// blocks schema refactor removed the per-org partition scan backfill, this
-// metric is the only signal that a block hit ref_count=0 without being
-// registered in gc_block_candidates. Alert on sustained non-zero rate.
+// Hard failures increment gc_zero_ref_enqueue_failures_total. Soft discovery
+// degradation (canonical candidate row ok, by-day projection repair failed) is
+// tracked separately inside the GC service via
+// gc_block_candidate_discovery_degraded_total.
 func (e *gcBlockEnqueuer) EnqueueBlocks(orgID string, blockIDs []string, storageClass string) {
 	orgUUID, err := uuid.Parse(orgID)
 	if err != nil {

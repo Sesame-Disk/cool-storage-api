@@ -163,6 +163,11 @@ type MockStore struct {
 	// LoggedBatch case (Cassandra timeout / unavailable) where the batch
 	// committed at the cluster but the client observed a failure.
 	requeueItemErrAfterMutate error
+	// ensureBlockGCCandidateErrAfterMutate, when non-nil, forces
+	// EnsureBlockGCCandidate to preserve the canonical/discovery rows and then
+	// return this error. Models degraded projection-repair outcomes where the
+	// candidate identity is still known to the caller.
+	ensureBlockGCCandidateErrAfterMutate error
 	// dlqOpHook is invoked at the very top of RequeueFailedItem and
 	// DeleteFailedItem on the mock — before the internal mutex is taken —
 	// so concurrency tests can observe whether two admin DLQ ops are
@@ -1481,7 +1486,7 @@ func (m *MockStore) EnsureBlockGCCandidate(orgID uuid.UUID, blockID, storageClas
 	key := fmt.Sprintf("%s:%s", orgID, blockID)
 	if existing, ok := m.blockGCCandidates[key]; ok {
 		m.upsertBlockGCCandidateProjection(existing)
-		return existing.CandidateAt, nil
+		return existing.CandidateAt, m.ensureBlockGCCandidateErrAfterMutate
 	}
 	candidate := &mockBlockGCCandidate{
 		OrgID:        orgID,
@@ -1491,7 +1496,7 @@ func (m *MockStore) EnsureBlockGCCandidate(orgID uuid.UUID, blockID, storageClas
 	}
 	m.blockGCCandidates[key] = candidate
 	m.upsertBlockGCCandidateProjection(candidate)
-	return candidate.CandidateAt, nil
+	return candidate.CandidateAt, m.ensureBlockGCCandidateErrAfterMutate
 }
 
 func (m *MockStore) DeleteBlockGCCandidate(orgID uuid.UUID, blockID string, candidateAt time.Time) error {

@@ -1405,6 +1405,7 @@ func (w *Worker) enqueueZeroRefBlocks(orgID, libraryID uuid.UUID, blockIDs []str
 			return candidateErr
 		}
 		if candidateErr != nil {
+			metrics.GCBlockCandidateDiscoveryDegradedTotal.WithLabelValues("worker").Inc()
 			log.Printf("[GC Worker] WARNING: block candidate discovery degraded for org=%s block=%s: %v", orgID, blockID, candidateErr)
 		}
 		exists, err := w.store.PendingItemExists(orgID, uuid.Nil, candidateAt, ItemBlock, blockID)
