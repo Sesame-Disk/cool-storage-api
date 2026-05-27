@@ -600,6 +600,84 @@ Some of those scenarios are already handler-covered, but they are not yet exerci
 
 ---
 
+### ISSUE-ZIP-RESOLVE-POSTHEADER-01: ZIP Directory Download Can Truncate After `200 OK`
+
+**Status**: 🟡 Known limitation, intrinsic to streamed archives (2026-05-27)
+**Severity**: Medium — failed/truncated download, not data corruption; recoverable by retry
+**Affected**: `HandleZipDownload` → `addDirToZip` → `addFileToZip` (`internal/api/seafhttp.go`)
+
+#### What Is True Today
+
+The strict block-ID resolution fix (2026-05-27) made **single-file** download handlers resolve all block IDs *before* writing any response headers, so a resolution failure fails clean with `500`. ZIP directory downloads cannot do this with the current design:
+
+- [`seafhttp.go:2774-2778`](internal/api/seafhttp.go#L2774-L2778) commits `Content-Type`, `Content-Disposition`, `200 OK`, and opens the `zip.Writer` **before** walking the tree.
+- [`addFileToZip`](internal/api/seafhttp.go#L2914) resolves each file's blocks *per file*. The earlier fix moved that resolution ahead of `zw.CreateHeader`, so a failure never leaves a half-written entry — but it happens **after** the response was already committed.
+
+So if a file *later* in the archive has a missing mapping or hits a Cassandra timeout, `addDirToZip` returns an error, the handler logs and `return`s, and the client gets a **truncated ZIP after `200 OK`**.
+
+This is intrinsic to streaming a multi-file archive: any per-file storage error (not just resolution) has the same shape. The doc claim "all download handlers resolve before headers" is therefore **only true for single-file handlers** (corrected in `docs/ARCHITECTURE.md`).
+
+#### Options (not yet done)
+
+- **Safe**: preflight — walk the tree, load all file metadata, resolve *all* block IDs for *all* files, then send headers and stream. Costs memory + a full resolution pass before first byte.
+- **Minimal** (current): documented as best-effort post-headers; the abort is logged (`[HandleZipDownload] ZIP stream aborted`). Consider adding a dedicated metric.
+
+#### Related
+
+- ISSUE-STREAMBLOCKS-VOID-01 (same "already committed the response" class).
+
+---
+
+### ISSUE-STREAMBLOCKS-VOID-01: `StreamBlocks` Returns Void → False-Success Log + Over-Counted Traffic
+
+**Status**: 🟡 Observability/billing accuracy gap (2026-05-27)
+**Severity**: Low–Medium — no client-visible corruption, but traffic can be over-recorded
+**Affected**: `streaming.StreamBlocks` and `streamFileFromBlocks` (`internal/api/seafhttp.go`)
+
+#### What Is True Today
+
+`StreamBlocks` ([`streaming.go`](internal/streaming/streaming.go#L176)) returns `void`. If `GetBlock`/`GetBlockReader`/`Write`/`io.CopyBuffer` fails mid-stream it logs and returns — by then headers are sent, so it genuinely cannot signal the client. That part is unavoidable.
+
+The real gap is on the **caller** side. In `streamFileFromBlocks` the code after `StreamBlocks` runs unconditionally:
+
+- logs `Streaming complete: N blocks` even if the stream aborted early;
+- calls `traffic.RecordCheckedTransfer(..., fileSize)` with the **full** `fileSize`, over-counting traffic on a partial transfer.
+
+Not every caller has this: `DownloadHistoricFile` and `HandleZipDownload` already record the **actual** bytes written (`bytesAfter - bytesBefore`), so they are accurate. The defect is specific to the `fileSize`-based recording in `streamFileFromBlocks`.
+
+#### Fix (recommended, not yet done)
+
+Make `StreamBlocks` return `error` (or the bytes streamed), and in `streamFileFromBlocks` skip the success log + record only actual bytes on partial transfer. The client still can't get a new status once the body started, but observability and billing stop lying. Low blast radius (≈6 callers), worth doing soon because it touches billing.
+
+---
+
+### ISSUE-REFCOUNT-RESOLVE-FAILCLOSED-01: Block-Ref Mutations Are Fail-Closed Pending the Counter→Per-Block Redesign
+
+**Status**: 🟡 Accepted interim behavior; root fix deferred to the ref_count redesign (2026-05-27)
+**Severity**: Medium — worst case is a *permanent* block leak in a rare path; no data loss, no corruption
+**Affected**: `resolveStoredBlockIDs`, `DecrementBlockRefCountsOnce`, `IncrementBlockRefCounts*` (`internal/api/v2/fs_helpers.go`)
+
+#### Context
+
+`BatchResolveBlockIDs` became strict (`([]string, error)`) so download paths fail clean. Because ref-count mutations share that helper, they had to handle the error. The interim handling is deliberately **fail-closed**, NOT a full repair, because `blocks.ref_count` is slated to be redesigned from a Cassandra counter to per-block file rows in the next branch — that redesign is where this gets fixed at the root, so we are not patching the leak here.
+
+#### Current Behavior
+
+- **Increment** (`IncrementBlockRefCounts`, `IncrementBlockRefCountsTracked`): propagate the resolution error and abort the copy/publish. This is correct and *safer* than before — `IncrementOrCreateBlock` does `INSERT ... IF NOT EXISTS` ([`fs_helpers.go:996`](internal/api/v2/fs_helpers.go#L996)), so incrementing an unresolved SHA-1 would create a **phantom SHA-1 row** while leaving the real SHA-256 block un-incremented → potential data loss on a later delete. Failing closed prevents that. Callers here are pre-commit and can abort.
+- **Decrement** (`DecrementBlockRefCountsOnce`): resolves **before** consuming the idempotency marker (so a failure doesn't burn the marker), and on resolution failure logs `ERROR` and returns `nil` (decrements nothing). `decrementBlockRefCount` already skips rows that don't exist ([`fs_helpers.go:1107`](internal/api/v2/fs_helpers.go#L1107)), so there is **no corruption** — but two limitations remain:
+  1. **Abort is total, not partial.** If one block of N fails to resolve, the whole decrement is skipped (the old best-effort path decremented the resolvable ones). So the *magnitude* of a leak is larger, though it is now logged.
+  2. **The leak is permanent.** The `blocks WHERE org_id` backfill scan was removed (see ISSUE-BLOCKS-HOT-PARTITION-01), so an inflated `ref_count` is never re-discovered as zero-ref. The ~10 post-commit callers also can't distinguish "0 zero-ref blocks" from "aborted" because the signature stays `[]string`.
+
+#### When It Triggers
+
+Only for **SHA-1 blocks** (Seafile desktop client uploads, which need mapping resolution) **and** a Cassandra timeout / missing mapping during resolution. SHA-256 blocks (64 chars) never hit `block_id_mappings`, so the normal path is unaffected.
+
+#### Resolution
+
+Deferred to the `ref_count` counter→per-block-row redesign. That change replaces the LWT-counter model entirely, at which point resolution and decrement semantics are reworked end-to-end rather than patched here.
+
+---
+
 ## ✅ Fixed Issues
 
 ---

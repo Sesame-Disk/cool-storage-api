@@ -1119,7 +1119,11 @@ WHERE org_id = ? AND external_id = ?
 
 For a 28 GB file with ~1,763 blocks, the path still resolves upfront before streaming, but it does so as up to 32 concurrent point reads instead of serial per-block lookups or partition-crossing `IN` batches.
 
-Resolution is **strict and fail-closed**: `BatchResolveBlockIDs` returns `([]string, error)` and, if any 40-char ID cannot be resolved (lookup error, missing mapping row, or empty `internal_id`), returns `(nil, err)` — it never yields a partially-resolved list. All download handlers resolve **before writing any response headers/body** and abort with HTTP 500 on error. This closes a fail-open hole where a stale SHA-1 sent to SHA-256 storage truncated the download mid-stream after `Content-Length`/status were already committed (see `StreamBlocks`: "headers already sent, can't return error to client"). SHA-256 IDs (64 chars) never hit `block_id_mappings`, so the common path issues zero lookups.
+Resolution is **strict and fail-closed**: `BatchResolveBlockIDs` returns `([]string, error)` and, if any 40-char ID cannot be resolved (lookup error, missing mapping row, or empty `internal_id`), returns `(nil, err)` — it never yields a partially-resolved list. SHA-256 IDs (64 chars) never hit `block_id_mappings`, so the common path issues zero lookups.
+
+**Single-file** download handlers (`streamFileFromBlocks`, `ServeRawFile`, `DownloadHistoricFile`, `ServeHistoricFileRaw`, share-link views) resolve **before writing any response headers/body** and abort with HTTP 500 on error. This closes a fail-open hole where a stale SHA-1 sent to SHA-256 storage truncated the download mid-stream after `Content-Length`/status were already committed (see `StreamBlocks`: "headers already sent, can't return error to client").
+
+**Exception — ZIP directory downloads** commit `200 OK` and open the `zip.Writer` before walking the tree, then resolve each file's blocks inside `addFileToZip`. Per-file resolution still fails *before* writing that file's ZIP entry (no half-written entry), but a resolution failure on a *later* file truncates the archive after headers are already sent — it cannot fail clean. This is intrinsic to streaming a multi-file archive (any per-file storage error has the same shape). Tracked as ISSUE-ZIP-RESOLVE-POSTHEADER-01.
 
 #### ZIP Directory Downloads
 

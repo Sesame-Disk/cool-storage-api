@@ -10,6 +10,149 @@ import (
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
 )
 
+func TestDecrementBlockRefCountsOnce_ResolutionFailureSkipsMarkerAndDecrement(t *testing.T) {
+	helper := &FSHelper{}
+	prevResolve := resolveStoredBlockIDsFn
+	prevMark := markBlockMutationProcessedFn
+	prevDecrement := decrementBlockRefCountFn
+	defer func() {
+		resolveStoredBlockIDsFn = prevResolve
+		markBlockMutationProcessedFn = prevMark
+		decrementBlockRefCountFn = prevDecrement
+	}()
+
+	resolveErr := errors.New("resolve failed")
+	markCalls := 0
+	decrementCalls := 0
+	resolveStoredBlockIDsFn = func(h *FSHelper, orgID string, blockIDs []string) ([]string, error) {
+		if orgID != "org-1" {
+			t.Fatalf("resolve orgID = %q, want %q", orgID, "org-1")
+		}
+		if len(blockIDs) != 1 || blockIDs[0] != "sha1-block" {
+			t.Fatalf("resolve blockIDs = %v, want [sha1-block]", blockIDs)
+		}
+		return nil, resolveErr
+	}
+	markBlockMutationProcessedFn = func(h *FSHelper, operationKey string) (bool, error) {
+		markCalls++
+		return true, nil
+	}
+	decrementBlockRefCountFn = func(h *FSHelper, orgID, blockID string) bool {
+		decrementCalls++
+		return false
+	}
+
+	got := helper.DecrementBlockRefCountsOnce("org-1", "op-1", []string{"sha1-block"})
+	if got != nil {
+		t.Fatalf("DecrementBlockRefCountsOnce() = %v, want nil on resolution failure", got)
+	}
+	if markCalls != 0 {
+		t.Fatalf("markBlockMutationProcessed called %d times, want 0", markCalls)
+	}
+	if decrementCalls != 0 {
+		t.Fatalf("decrementBlockRefCount called %d times, want 0", decrementCalls)
+	}
+}
+
+func TestDecrementBlockRefCountsOnce_UsesResolvedIDsAfterMarker(t *testing.T) {
+	helper := &FSHelper{}
+	prevResolve := resolveStoredBlockIDsFn
+	prevMark := markBlockMutationProcessedFn
+	prevDecrement := decrementBlockRefCountFn
+	defer func() {
+		resolveStoredBlockIDsFn = prevResolve
+		markBlockMutationProcessedFn = prevMark
+		decrementBlockRefCountFn = prevDecrement
+	}()
+
+	markCalls := 0
+	var decremented []string
+	resolveStoredBlockIDsFn = func(h *FSHelper, orgID string, blockIDs []string) ([]string, error) {
+		return []string{"sha256-a", "sha256-b"}, nil
+	}
+	markBlockMutationProcessedFn = func(h *FSHelper, operationKey string) (bool, error) {
+		markCalls++
+		if operationKey != "op-2" {
+			t.Fatalf("operationKey = %q, want %q", operationKey, "op-2")
+		}
+		return true, nil
+	}
+	decrementBlockRefCountFn = func(h *FSHelper, orgID, blockID string) bool {
+		decremented = append(decremented, blockID)
+		return blockID == "sha256-b"
+	}
+
+	got := helper.DecrementBlockRefCountsOnce("org-2", "op-2", []string{"sha1-a", "sha1-b"})
+	if markCalls != 1 {
+		t.Fatalf("markBlockMutationProcessed called %d times, want 1", markCalls)
+	}
+	if len(decremented) != 2 || decremented[0] != "sha256-a" || decremented[1] != "sha256-b" {
+		t.Fatalf("decremented block IDs = %v, want resolved IDs [sha256-a sha256-b]", decremented)
+	}
+	if len(got) != 1 || got[0] != "sha256-b" {
+		t.Fatalf("zero-ref blocks = %v, want [sha256-b]", got)
+	}
+}
+
+func TestIncrementBlockRefCounts_ResolutionFailureSkipsMutation(t *testing.T) {
+	helper := &FSHelper{}
+	prevResolve := resolveStoredBlockIDsFn
+	prevIncrement := incrementOrCreateBlockFn
+	defer func() {
+		resolveStoredBlockIDsFn = prevResolve
+		incrementOrCreateBlockFn = prevIncrement
+	}()
+
+	resolveErr := errors.New("resolve failed")
+	incrementCalls := 0
+	resolveStoredBlockIDsFn = func(h *FSHelper, orgID string, blockIDs []string) ([]string, error) {
+		return nil, resolveErr
+	}
+	incrementOrCreateBlockFn = func(h *FSHelper, orgID, blockID string, sizeBytes int, storageClass, storageKey string) error {
+		incrementCalls++
+		return nil
+	}
+
+	err := helper.IncrementBlockRefCounts("org-3", []string{"sha1-block"})
+	if !errors.Is(err, resolveErr) {
+		t.Fatalf("IncrementBlockRefCounts() error = %v, want wrapped %v", err, resolveErr)
+	}
+	if incrementCalls != 0 {
+		t.Fatalf("IncrementOrCreateBlock called %d times, want 0", incrementCalls)
+	}
+}
+
+func TestIncrementBlockRefCountsTracked_ResolutionFailureSkipsMutation(t *testing.T) {
+	helper := &FSHelper{}
+	prevResolve := resolveStoredBlockIDsFn
+	prevIncrement := incrementOrCreateBlockFn
+	defer func() {
+		resolveStoredBlockIDsFn = prevResolve
+		incrementOrCreateBlockFn = prevIncrement
+	}()
+
+	resolveErr := errors.New("resolve failed")
+	incrementCalls := 0
+	resolveStoredBlockIDsFn = func(h *FSHelper, orgID string, blockIDs []string) ([]string, error) {
+		return nil, resolveErr
+	}
+	incrementOrCreateBlockFn = func(h *FSHelper, orgID, blockID string, sizeBytes int, storageClass, storageKey string) error {
+		incrementCalls++
+		return nil
+	}
+
+	got, err := helper.IncrementBlockRefCountsTracked("org-4", []string{"sha1-block"})
+	if !errors.Is(err, resolveErr) {
+		t.Fatalf("IncrementBlockRefCountsTracked() error = %v, want wrapped %v", err, resolveErr)
+	}
+	if got != nil {
+		t.Fatalf("IncrementBlockRefCountsTracked() incremented = %v, want nil on resolution failure", got)
+	}
+	if incrementCalls != 0 {
+		t.Fatalf("IncrementOrCreateBlock called %d times, want 0", incrementCalls)
+	}
+}
+
 func TestLibraryHeadSnapshotValidateExpectedHeadRejectsMismatch(t *testing.T) {
 	snapshot := &LibraryHeadSnapshot{HeadCommitID: "head-a"}
 
