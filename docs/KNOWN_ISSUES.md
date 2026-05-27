@@ -600,27 +600,30 @@ Some of those scenarios are already handler-covered, but they are not yet exerci
 
 ---
 
-### ISSUE-ZIP-RESOLVE-POSTHEADER-01: ZIP Directory Download Can Truncate After `200 OK`
+### ISSUE-ZIP-STREAM-LATEFAIL-01: ZIP Directory Download Can Still Truncate After `200 OK`
 
-**Status**: 🟡 Known limitation, intrinsic to streamed archives (2026-05-27)
+**Status**: 🟡 Known limitation, narrowed after ZIP preflight fix (2026-05-27)
 **Severity**: Medium — failed/truncated download, not data corruption; recoverable by retry
 **Affected**: `HandleZipDownload` → `addDirToZip` → `addFileToZip` (`internal/api/seafhttp.go`)
 
 #### What Is True Today
 
-The strict block-ID resolution fix (2026-05-27) made **single-file** download handlers resolve all block IDs *before* writing any response headers, so a resolution failure fails clean with `500`. ZIP directory downloads cannot do this with the current design:
+ZIP directory downloads now do a real preflight *before* sending response headers:
 
-- [`seafhttp.go:2774-2778`](internal/api/seafhttp.go#L2774-L2778) commits `Content-Type`, `Content-Disposition`, `200 OK`, and opens the `zip.Writer` **before** walking the tree.
-- [`addFileToZip`](internal/api/seafhttp.go#L2914) resolves each file's blocks *per file*. The earlier fix moved that resolution ahead of `zw.CreateHeader`, so a failure never leaves a half-written entry — but it happens **after** the response was already committed.
+- `HandleZipDownload` resolves the library block store up front.
+- `prepareZipDirectory` walks the tree, checks ZIP traversal limits, loads each file's metadata, and resolves every file's block IDs *before* `application/zip` / `200 OK` are committed.
+- `addFileToZip` then streams the already-prepared entries and no longer performs Cassandra block-ID resolution during response streaming.
 
-So if a file *later* in the archive has a missing mapping or hits a Cassandra timeout, `addDirToZip` returns an error, the handler logs and `return`s, and the client gets a **truncated ZIP after `200 OK`**.
+This closes the specific fail-open hole where a missing `block_id_mappings` row or Cassandra timeout on block-ID resolution used to surface only after the ZIP response had already started.
 
-This is intrinsic to streaming a multi-file archive: any per-file storage error (not just resolution) has the same shape. The doc claim "all download handlers resolve before headers" is therefore **only true for single-file handlers** (corrected in `docs/ARCHITECTURE.md`).
+The remaining limitation is narrower but still real: once the handler starts streaming ZIP bytes, any **late** per-file error while fetching a block from storage, decrypting it, writing it into the ZIP stream, or while the client disconnects has the same shape. The handler can only log and abort, so the client still sees a **truncated ZIP after `200 OK`** in those cases.
+
+The architecture claim "download handlers resolve before headers" is now true for single-file handlers **and** ZIP mapping-resolution preflight, but not for all possible late storage failures in a streamed archive.
 
 #### Options (not yet done)
 
-- **Safe**: preflight — walk the tree, load all file metadata, resolve *all* block IDs for *all* files, then send headers and stream. Costs memory + a full resolution pass before first byte.
-- **Minimal** (current): documented as best-effort post-headers; the abort is logged (`[HandleZipDownload] ZIP stream aborted`). Consider adding a dedicated metric.
+- **Full isolation**: build the archive to temp storage/object storage first, then return it as a normal single-file download. This removes the streamed-archive truncation class at the cost of latency, temp-space, and cleanup complexity.
+- **Current**: streamed ZIP with preflighted mapping resolution. Late storage/decrypt/write failures are still logged as `[HandleZipDownload] ZIP stream aborted`. A dedicated metric would make those incidents observable.
 
 #### Related
 
