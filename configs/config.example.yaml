@@ -24,6 +24,9 @@ database:
   keyspace: sesamefs
   consistency: LOCAL_QUORUM
   serial_consistency: SERIAL
+  # CQL native protocol version (3, 4, or 5). Pinned to 4 to avoid the v5 per-request
+  # keyspace flag, which makes Cassandra log "Keyspace is set via query options".
+  proto_version: 4
   timeout: 10s
   local_dc: datacenter1
   replication_class: NetworkTopologyStrategy

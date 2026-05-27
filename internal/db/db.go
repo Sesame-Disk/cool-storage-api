@@ -93,6 +93,12 @@ func newCluster(cfg config.DatabaseConfig) *gocql.ClusterConfig {
 	cluster := gocql.NewCluster(cfg.Hosts...)
 	cluster.Consistency = parseConsistency(cfg.Consistency)
 	cluster.SerialConsistency = parseSerialConsistency(cfg.SerialConsistency)
+	if cfg.ProtoVersion > 0 {
+		// Pin the CQL native protocol version. Defaults to 4 so gocql does not
+		// negotiate v5, whose per-request keyspace flag makes Cassandra log
+		// "Keyspace is set via query options. This is considered dangerous".
+		cluster.ProtoVersion = cfg.ProtoVersion
+	}
 	queryTimeout := cfg.Timeout
 	if queryTimeout <= 0 {
 		queryTimeout = defaultCassandraTimeout
@@ -128,11 +134,12 @@ func logCassandraRuntimeConfig(cfg config.DatabaseConfig, cluster *gocql.Cluster
 	}
 
 	log.Printf(
-		"[db] Cassandra runtime config: hosts=%s keyspace=%s consistency=%s serial_consistency=%s timeout=%s connect_timeout=%s local_dc=%q configured_replication_class=%s configured_replication=%s actual_replication_source=%s actual_replication_class=%s actual_replication=%s host_selection=%s",
+		"[db] Cassandra runtime config: hosts=%s keyspace=%s consistency=%s serial_consistency=%s proto_version=%d timeout=%s connect_timeout=%s local_dc=%q configured_replication_class=%s configured_replication=%s actual_replication_source=%s actual_replication_class=%s actual_replication=%s host_selection=%s",
 		strings.Join(cfg.Hosts, ","),
 		cfg.Keyspace,
 		cluster.Consistency.String(),
 		cluster.SerialConsistency.String(),
+		cluster.ProtoVersion,
 		cluster.Timeout,
 		cluster.ConnectTimeout,
 		cfg.LocalDC,

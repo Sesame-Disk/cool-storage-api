@@ -21,6 +21,7 @@ func clearLoadEnvOverrides(t *testing.T) {
 		"CORS_ALLOWED_ORIGINS",
 		"CASSANDRA_HOSTS", "CASSANDRA_KEYSPACE", "CASSANDRA_CONSISTENCY", "CASSANDRA_USERNAME",
 		"CASSANDRA_PASSWORD", "CASSANDRA_LOCAL_DC", "CASSANDRA_SERIAL_CONSISTENCY", "CASSANDRA_TIMEOUT",
+		"CASSANDRA_PROTO_VERSION",
 		"CASSANDRA_REPLICATION_CLASS", "CASSANDRA_REPLICATION_FACTOR", "CASSANDRA_REPLICATION_DCS",
 		"STORAGE_MODE", "S3_BUCKET", "S3_REGION", "S3_ENDPOINT",
 		"S3_SERVER_SIDE_ENCRYPTION", "S3_SSE_KMS_KEY_ID",
@@ -186,6 +187,7 @@ versioning:
 	t.Setenv("CASSANDRA_CONSISTENCY", "QUORUM")
 	t.Setenv("CASSANDRA_SERIAL_CONSISTENCY", "LOCAL_SERIAL")
 	t.Setenv("CASSANDRA_TIMEOUT", "42s")
+	t.Setenv("CASSANDRA_PROTO_VERSION", "5")
 
 	cfg, err := Load()
 	if err != nil {
@@ -208,6 +210,9 @@ versioning:
 	if cfg.Database.SerialConsistency != "LOCAL_SERIAL" {
 		t.Errorf("Database.SerialConsistency = %s, want LOCAL_SERIAL (from env)", cfg.Database.SerialConsistency)
 	}
+	if cfg.Database.ProtoVersion != 5 {
+		t.Errorf("Database.ProtoVersion = %d, want 5 (from env)", cfg.Database.ProtoVersion)
+	}
 }
 
 func TestDefaultConfig(t *testing.T) {
@@ -224,6 +229,9 @@ func TestDefaultConfig(t *testing.T) {
 	}
 	if cfg.Database.SerialConsistency != "SERIAL" {
 		t.Errorf("Database.SerialConsistency = %s, want SERIAL", cfg.Database.SerialConsistency)
+	}
+	if cfg.Database.ProtoVersion != 4 {
+		t.Errorf("Database.ProtoVersion = %d, want 4", cfg.Database.ProtoVersion)
 	}
 	if cfg.Database.ReplicationClass != "NetworkTopologyStrategy" {
 		t.Errorf("Database.ReplicationClass = %s, want NetworkTopologyStrategy", cfg.Database.ReplicationClass)
@@ -308,6 +316,14 @@ func TestConfigValidate(t *testing.T) {
 			},
 			wantErr:        true,
 			wantErrContain: "database consistency",
+		},
+		{
+			name: "invalid database proto_version",
+			modify: func(c *Config) {
+				c.Database.ProtoVersion = 2
+			},
+			wantErr:        true,
+			wantErrContain: "database proto_version",
 		},
 		{
 			name: "production requires cors allowlist",

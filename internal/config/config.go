@@ -451,6 +451,7 @@ type DatabaseConfig struct {
 	Keyspace          string         `yaml:"keyspace"`
 	Consistency       string         `yaml:"consistency"`
 	SerialConsistency string         `yaml:"serial_consistency"`
+	ProtoVersion      int            `yaml:"proto_version"` // CQL native protocol version (3, 4, or 5). Pinned to 4 by default to avoid the per-request keyspace flag introduced in v5.
 	Timeout           time.Duration  `yaml:"timeout"`
 	LocalDC           string         `yaml:"local_dc"`
 	Username          string         `yaml:"username"`
@@ -681,6 +682,7 @@ func DefaultConfig() *Config {
 			Keyspace:          "sesamefs",
 			Consistency:       "LOCAL_QUORUM",
 			SerialConsistency: "SERIAL",
+			ProtoVersion:      4,
 			Timeout:           10 * time.Second,
 			LocalDC:           "datacenter1",
 			ReplicationClass:  "NetworkTopologyStrategy",
@@ -858,6 +860,14 @@ func (c *Config) applyEnvOverrides() {
 	}
 	if v := os.Getenv("CASSANDRA_SERIAL_CONSISTENCY"); v != "" {
 		c.Database.SerialConsistency = strings.TrimSpace(v)
+	}
+	if v := os.Getenv("CASSANDRA_PROTO_VERSION"); v != "" {
+		parsed, err := strconv.Atoi(strings.TrimSpace(v))
+		if err != nil {
+			c.addEnvOverrideError("CASSANDRA_PROTO_VERSION must be an integer, got %q", v)
+		} else {
+			c.Database.ProtoVersion = parsed
+		}
 	}
 	if v := os.Getenv("CASSANDRA_TIMEOUT"); v != "" {
 		parsed, err := time.ParseDuration(strings.TrimSpace(v))
@@ -1323,6 +1333,12 @@ func (c *Config) Validate() error {
 	}
 	if c.Database.Timeout <= 0 {
 		return fmt.Errorf("database timeout must be greater than zero")
+	}
+	switch c.Database.ProtoVersion {
+	case 3, 4, 5:
+		// supported CQL native protocol versions
+	default:
+		return fmt.Errorf("database proto_version must be 3, 4, or 5")
 	}
 	switch normalizedClass := normalizeCassandraReplicationClass(c.Database.ReplicationClass); normalizedClass {
 	case "SimpleStrategy":
