@@ -829,9 +829,14 @@ func (h *FSHelper) CollectBlockIDsRecursive(repoID, fsID string) ([]string, erro
 	return blockIDs, err
 }
 
-func (h *FSHelper) resolveStoredBlockIDs(orgID string, blockIDs []string) []string {
+// resolveStoredBlockIDs maps external SHA-1 block IDs to the internal SHA-256 IDs
+// stored in the blocks table. Resolution is strict (see BatchResolveBlockIDs):
+// ref-count mutations MUST run on resolved IDs, because decrementing/incrementing
+// an unresolved SHA-1 would touch the wrong (or a nonexistent) blocks row and
+// leak or prematurely delete the real SHA-256 block.
+func (h *FSHelper) resolveStoredBlockIDs(orgID string, blockIDs []string) ([]string, error) {
 	if len(blockIDs) == 0 {
-		return nil
+		return nil, nil
 	}
 	return streaming.BatchResolveBlockIDs(h.db, orgID, blockIDs)
 }
@@ -1054,6 +1059,17 @@ func (h *FSHelper) collectDirStats(repoID, fsID string) (blockIDs []string, tota
 // The operation is idempotent per operationKey and resolves SHA-1 block IDs to
 // the internal SHA-256 IDs stored in the blocks table.
 func (h *FSHelper) DecrementBlockRefCountsOnce(orgID, operationKey string, blockIDs []string) []string {
+	// Resolve BEFORE consuming the idempotency marker. If resolution fails we
+	// must NOT mark the operation processed — otherwise the decrement is lost
+	// permanently. Decrementing an unresolved SHA-1 would hit the wrong (or a
+	// nonexistent) blocks row and leak the real SHA-256 block, so abort the whole
+	// decrement instead of acting on a partial/stale list.
+	resolvedBlockIDs, err := h.resolveStoredBlockIDs(orgID, blockIDs)
+	if err != nil {
+		log.Printf("[DecrementBlockRefCountsOnce] ERROR: aborting decrement for operation %q org=%s: block ID resolution failed: %v", operationKey, orgID, err)
+		return nil
+	}
+
 	applied, err := h.markBlockMutationProcessed(operationKey)
 	if err != nil {
 		log.Printf("[DecrementBlockRefCountsOnce] WARNING: failed to mark operation %q processed: %v", operationKey, err)
@@ -1064,7 +1080,6 @@ func (h *FSHelper) DecrementBlockRefCountsOnce(orgID, operationKey string, block
 		return nil
 	}
 
-	resolvedBlockIDs := h.resolveStoredBlockIDs(orgID, blockIDs)
 	var zeroRefBlocks []string
 	for _, blockID := range resolvedBlockIDs {
 		hitZero := h.decrementBlockRefCount(orgID, blockID)
@@ -1196,7 +1211,10 @@ func incrementBlockRefCountsResolved(resolvedBlockIDs []string, increment func(s
 
 // IncrementBlockRefCounts increments ref_count for blocks (for copy)
 func (h *FSHelper) IncrementBlockRefCounts(orgID string, blockIDs []string) error {
-	resolvedBlockIDs := h.resolveStoredBlockIDs(orgID, blockIDs)
+	resolvedBlockIDs, err := h.resolveStoredBlockIDs(orgID, blockIDs)
+	if err != nil {
+		return fmt.Errorf("resolve block IDs before increment: %w", err)
+	}
 	return incrementBlockRefCountsResolved(
 		resolvedBlockIDs,
 		func(blockID string) error {
@@ -1213,7 +1231,10 @@ func (h *FSHelper) IncrementBlockRefCounts(orgID string, blockIDs []string) erro
 // and returns the exact resolved block IDs that were incremented before any
 // error occurred so callers can roll the mutation back safely.
 func (h *FSHelper) IncrementBlockRefCountsTracked(orgID string, blockIDs []string) ([]string, error) {
-	resolvedBlockIDs := h.resolveStoredBlockIDs(orgID, blockIDs)
+	resolvedBlockIDs, err := h.resolveStoredBlockIDs(orgID, blockIDs)
+	if err != nil {
+		return nil, fmt.Errorf("resolve block IDs before increment: %w", err)
+	}
 	incrementedBlockIDs := make([]string, 0, len(resolvedBlockIDs))
 	for _, blockID := range resolvedBlockIDs {
 		if err := h.IncrementOrCreateBlock(orgID, blockID, 0, "", ""); err != nil {

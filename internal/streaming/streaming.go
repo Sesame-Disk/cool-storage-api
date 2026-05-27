@@ -3,6 +3,7 @@ package streaming
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"sync"
@@ -44,11 +45,18 @@ func PutCopyBuf(buf []byte) {
 // against block_id_mappings so a large file's block list cannot flood the driver.
 const mappingResolveConcurrency = 32
 
-// BatchResolveBlockIDs resolves all SHA-1 block IDs (40 chars) to SHA-256.
-// IDs that are already SHA-256 (64 chars) are returned as-is.
-// block_id_mappings is partitioned by ((org_id, external_id)), so each lookup
-// is a single-row read. Keep concurrency bounded to avoid pressuring the driver.
-func BatchResolveBlockIDs(database *db.DB, orgID string, blockIDs []string) []string {
+// BatchResolveBlockIDs resolves all SHA-1 block IDs (40 chars) to their internal
+// SHA-256 content address. IDs that are already SHA-256 (64 chars) pass through
+// untouched. block_id_mappings is partitioned by ((org_id, external_id)), so each
+// lookup is a single-partition point read, run with bounded concurrency.
+//
+// Resolution is STRICT: if any 40-char ID cannot be resolved — whether the lookup
+// errored (e.g. Cassandra timeout) or no mapping row exists — the call returns a
+// nil slice and a non-nil error. Callers MUST treat this as fatal and abort BEFORE
+// writing any response headers/body. Streaming a partially-resolved list would
+// send a stale SHA-1 to SHA-256 storage, truncating the download mid-stream after
+// the headers are already committed (see StreamBlocks: "headers already sent").
+func BatchResolveBlockIDs(database *db.DB, orgID string, blockIDs []string) ([]string, error) {
 	return resolveBlockIDs(orgID, blockIDs, mappingResolveConcurrency, func(idx int) (string, error) {
 		var internalID string
 		err := database.Session().Query(`
@@ -62,15 +70,15 @@ func BatchResolveBlockIDs(database *db.DB, orgID string, blockIDs []string) []st
 // resolveBlockIDs maps every 40-char SHA-1 entry of blockIDs to its internal
 // SHA-256 by calling lookup with bounded concurrency, preserving slice order.
 // 64-char SHA-256 IDs are left untouched and lookup is never called for them.
-// lookup must return gocql.ErrNotFound when no mapping row exists; that (and an
-// empty internal_id) leaves the original ID in place rather than being treated
-// as a hard failure. Other lookup errors are logged but likewise non-fatal, so
-// a single failed block never corrupts the resolution of its siblings.
+// lookup must return gocql.ErrNotFound when no mapping row exists.
 //
-// orgID is used only for log context. The DB-backed lookup is injected so the
-// concurrency/ordering/error-isolation logic stays unit-testable without a live
-// Cassandra (block_id_mappings has no in-process fake).
-func resolveBlockIDs(orgID string, blockIDs []string, maxConcurrency int, lookup func(idx int) (string, error)) []string {
+// Resolution is strict: a lookup error, a missing mapping row, or an empty
+// internal_id all mark the block as unresolved. If any block is unresolved the
+// function returns (nil, err) with every cause joined, so callers never act on a
+// partially-resolved slice. orgID is used only for error/log context. The
+// DB-backed lookup is injected so the concurrency/ordering/error semantics stay
+// unit-testable without a live Cassandra (block_id_mappings has no in-process fake).
+func resolveBlockIDs(orgID string, blockIDs []string, maxConcurrency int, lookup func(idx int) (string, error)) ([]string, error) {
 	resolved := make([]string, len(blockIDs))
 	copy(resolved, blockIDs)
 
@@ -82,7 +90,7 @@ func resolveBlockIDs(orgID string, blockIDs []string, maxConcurrency int, lookup
 		}
 	}
 	if len(toResolve) == 0 {
-		return resolved
+		return resolved, nil
 	}
 
 	type lookupResult struct {
@@ -110,37 +118,35 @@ func resolveBlockIDs(orgID string, blockIDs []string, maxConcurrency int, lookup
 		}(idx)
 	}
 
-	unresolved := 0
+	var resolveErr error
 	queryFailures := 0
-	firstUnresolved := ""
+	missingMappings := 0
 	for range toResolve {
 		result := <-results
 		if result.err != nil {
-			if !errors.Is(result.err, gocql.ErrNotFound) {
+			if errors.Is(result.err, gocql.ErrNotFound) {
+				missingMappings++
+				resolveErr = errors.Join(resolveErr, fmt.Errorf("block %s has no SHA-1→SHA-256 mapping row: %w", blockIDs[result.idx], result.err))
+			} else {
 				queryFailures++
-				log.Printf("[BatchResolveBlockIDs] WARNING: query error org=%s block=%s: %v", orgID, blockIDs[result.idx], result.err)
-			}
-			unresolved++
-			if firstUnresolved == "" {
-				firstUnresolved = blockIDs[result.idx]
+				resolveErr = errors.Join(resolveErr, fmt.Errorf("resolve block mapping org=%s block=%s: %w", orgID, blockIDs[result.idx], result.err))
 			}
 			continue
 		}
-		if result.internalID != "" {
-			resolved[result.idx] = result.internalID
+		if result.internalID == "" {
+			missingMappings++
+			resolveErr = errors.Join(resolveErr, fmt.Errorf("block %s mapping row has empty internal_id", blockIDs[result.idx]))
 			continue
 		}
-		unresolved++
-		if firstUnresolved == "" {
-			firstUnresolved = blockIDs[result.idx]
-		}
+		resolved[result.idx] = result.internalID
 	}
-	if unresolved > 0 {
-		log.Printf("[BatchResolveBlockIDs] WARNING: %d/%d blocks UNRESOLVED for org=%s (first unresolved: %s, query_failures=%d)",
-			unresolved, len(toResolve), orgID, firstUnresolved, queryFailures)
+	if resolveErr != nil {
+		log.Printf("[BatchResolveBlockIDs] ERROR: aborting resolution for org=%s: %d/%d blocks unresolved (query_failures=%d, missing_mappings=%d)",
+			orgID, queryFailures+missingMappings, len(toResolve), queryFailures, missingMappings)
+		return nil, resolveErr
 	}
 
-	return resolved
+	return resolved, nil
 }
 
 // PrefetchResult holds the result of a prefetched block.

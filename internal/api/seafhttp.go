@@ -2469,6 +2469,15 @@ func (h *SeafHTTPHandler) streamFileFromBlocks(c *gin.Context, token *AccessToke
 
 	log.Printf("[streamFileFromBlocks] Streaming %d blocks, size=%d, encrypted=%v", len(blockIDs), fileSize, fileKey != nil)
 
+	// Batch resolve all block IDs upfront (avoids per-block Cassandra queries).
+	// Strict: a stale SHA-1 sent to SHA-256 storage would truncate the stream
+	// mid-download, so we resolve BEFORE committing any headers and fail clean.
+	resolvedIDs, err := streaming.BatchResolveBlockIDs(h.db, token.OrgID, blockIDs)
+	if err != nil {
+		log.Printf("[streamFileFromBlocks] block ID resolution failed for org=%s: %v", token.OrgID, err)
+		return fmt.Errorf("resolve block IDs: %w", err)
+	}
+
 	// Set headers before streaming — Content-Length lets clients show progress
 	c.Header("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, filename))
 	c.Header("Content-Type", "application/octet-stream")
@@ -2479,9 +2488,6 @@ func (h *SeafHTTPHandler) streamFileFromBlocks(c *gin.Context, token *AccessToke
 		c.Header("Content-Length", strconv.FormatInt(fileSize, 10))
 	}
 	c.Status(http.StatusOK)
-
-	// Batch resolve all block IDs upfront (avoids per-block Cassandra queries)
-	resolvedIDs := streaming.BatchResolveBlockIDs(h.db, token.OrgID, blockIDs)
 
 	// Stream with prefetching pipeline
 	streaming.StreamBlocks(c, c.Request.Context(), blockStore, resolvedIDs, fileKey, fileIV, "streamFileFromBlocks")
@@ -2920,6 +2926,18 @@ func (h *SeafHTTPHandler) addFileToZip(ctx context.Context, hostname string, zw 
 		}
 	}
 
+	blockStore, _, err := h.resolveLibraryBlockStore(hostname, orgID, repoID)
+	if err != nil {
+		return fmt.Errorf("block store not available: %w", err)
+	}
+
+	// Resolve block IDs upfront and fail BEFORE creating the zip entry, so a
+	// resolution error never leaves a half-written entry in the archive.
+	resolvedIDs, err := streaming.BatchResolveBlockIDs(h.db, orgID, blockIDs)
+	if err != nil {
+		return fmt.Errorf("resolve block IDs for %s: %w", zipPath, err)
+	}
+
 	// Use Store (no compression) for maximum throughput.
 	// Deflate on a 28GB archive caps at ~50-100 MB/s on a single core.
 	header := &zip.FileHeader{
@@ -2933,14 +2951,6 @@ func (h *SeafHTTPHandler) addFileToZip(ctx context.Context, hostname string, zw 
 	if err != nil {
 		return fmt.Errorf("create zip entry %s: %w", zipPath, err)
 	}
-
-	blockStore, _, err := h.resolveLibraryBlockStore(hostname, orgID, repoID)
-	if err != nil {
-		return fmt.Errorf("block store not available: %w", err)
-	}
-
-	// Batch resolve all block IDs upfront
-	resolvedIDs := streaming.BatchResolveBlockIDs(h.db, orgID, blockIDs)
 
 	// Get a reusable 4MB buffer for streaming
 	buf := streaming.GetCopyBuf()

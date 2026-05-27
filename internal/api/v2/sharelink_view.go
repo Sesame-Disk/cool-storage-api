@@ -901,8 +901,15 @@ func (h *ShareLinkViewHandler) handleShareLinkRaw(c *gin.Context, sl *shareLinkD
 	// Determine MIME type from extension
 	mimeType := resolveInlineContentType(ext)
 
-	// Batch resolve all block IDs upfront to avoid per-block Cassandra queries
-	resolvedIDs := streaming.BatchResolveBlockIDs(h.db, sl.orgID, blockIDs)
+	// Batch resolve all block IDs upfront to avoid per-block Cassandra queries.
+	// Strict: fail before any header is written (see BatchResolveBlockIDs) so a
+	// stale SHA-1 can never truncate the response mid-stream.
+	resolvedIDs, err := streaming.BatchResolveBlockIDs(h.db, sl.orgID, blockIDs)
+	if err != nil {
+		slog.Error("block ID resolution failed for share link", "org", sl.orgID, "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read file"})
+		return
+	}
 
 	var fileKeyParam []byte
 	var fileIVParam []byte
@@ -1000,7 +1007,11 @@ func (h *ShareLinkViewHandler) readFileContentAsText(sl *shareLinkData) string {
 	}
 
 	ctx := context.Background()
-	resolvedIDs := streaming.BatchResolveBlockIDs(h.db, sl.orgID, blockIDs)
+	resolvedIDs, err := streaming.BatchResolveBlockIDs(h.db, sl.orgID, blockIDs)
+	if err != nil {
+		slog.Error("block ID resolution failed for inline text content", "org", sl.orgID, "error", err)
+		return ""
+	}
 	var buf strings.Builder
 	for idx := range blockIDs {
 		internalID := resolvedIDs[idx]

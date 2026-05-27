@@ -1119,6 +1119,8 @@ WHERE org_id = ? AND external_id = ?
 
 For a 28 GB file with ~1,763 blocks, the path still resolves upfront before streaming, but it does so as up to 32 concurrent point reads instead of serial per-block lookups or partition-crossing `IN` batches.
 
+Resolution is **strict and fail-closed**: `BatchResolveBlockIDs` returns `([]string, error)` and, if any 40-char ID cannot be resolved (lookup error, missing mapping row, or empty `internal_id`), returns `(nil, err)` — it never yields a partially-resolved list. All download handlers resolve **before writing any response headers/body** and abort with HTTP 500 on error. This closes a fail-open hole where a stale SHA-1 sent to SHA-256 storage truncated the download mid-stream after `Content-Length`/status were already committed (see `StreamBlocks`: "headers already sent, can't return error to client"). SHA-256 IDs (64 chars) never hit `block_id_mappings`, so the common path issues zero lookups.
+
 #### ZIP Directory Downloads
 
 ZIP archives use `zip.Store` (no compression) for maximum throughput. Deflate compression on-the-fly caps at ~50-100 MB/s on a single CPU core, which is the bottleneck for archive downloads. Since stored data is already compressed (images, videos, office docs) or incompressible (encrypted blocks), Deflate provides negligible size reduction at massive CPU cost.

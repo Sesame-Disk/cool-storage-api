@@ -580,7 +580,12 @@ func (h *FileViewHandler) ServeRawFile(c *gin.Context) {
 	if needsBuffer {
 		// iWork preview: must buffer for ZIP extraction
 		var content bytes.Buffer
-		iworkResolvedIDs := streaming.BatchResolveBlockIDs(h.db, orgID, blockIDs)
+		iworkResolvedIDs, err := streaming.BatchResolveBlockIDs(h.db, orgID, blockIDs)
+		if err != nil {
+			log.Printf("[ServeRawFile] block ID resolution failed for org=%s: %v", orgID, err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read file"})
+			return
+		}
 		for idx, _ := range blockIDs {
 			internalID := iworkResolvedIDs[idx]
 			reader, err := blockStore.GetBlockReader(ctx, internalID)
@@ -635,8 +640,15 @@ func (h *FileViewHandler) ServeRawFile(c *gin.Context) {
 	// Normal file serving
 	mimeType := resolveInlineContentType(ext)
 
-	// Batch resolve all block IDs upfront to avoid per-block Cassandra queries
-	resolvedIDs := streaming.BatchResolveBlockIDs(h.db, orgID, blockIDs)
+	// Batch resolve all block IDs upfront to avoid per-block Cassandra queries.
+	// Strict: fail before any header is written (see BatchResolveBlockIDs) so a
+	// stale SHA-1 can never truncate the response mid-stream.
+	resolvedIDs, err := streaming.BatchResolveBlockIDs(h.db, orgID, blockIDs)
+	if err != nil {
+		log.Printf("[ServeRawFile] block ID resolution failed for org=%s: %v", orgID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read file"})
+		return
+	}
 
 	var fileKeyParam []byte
 	var fileIVParam []byte
@@ -954,12 +966,20 @@ func (h *FileViewHandler) DownloadHistoricFile(c *gin.Context) {
 		return
 	}
 
+	// Resolve block IDs before writing headers so a resolution failure fails
+	// clean instead of truncating the stream mid-download.
+	resolvedIDs, err := streaming.BatchResolveBlockIDs(h.db, orgID, blockIDs)
+	if err != nil {
+		log.Printf("[DownloadHistoricFile] block ID resolution failed for org=%s: %v", orgID, err)
+		redirectToFrontendErrorPage(c, http.StatusInternalServerError, "Internal Error", "Could not read the requested file revision.")
+		return
+	}
+
 	// Stream blocks directly to HTTP response
 	c.Header("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, sanitizeFilename(filename)))
 	c.Header("Content-Type", "application/octet-stream")
 	c.Status(http.StatusOK)
 
-	resolvedIDs := streaming.BatchResolveBlockIDs(h.db, orgID, blockIDs)
 	bytesBefore := int64(c.Writer.Size())
 	streaming.StreamBlocks(c, c.Request.Context(), blockStore, resolvedIDs, fileKey, fileIV, "DownloadHistoricFile")
 
@@ -1117,6 +1137,15 @@ func (h *FileViewHandler) ServeHistoricFileRaw(c *gin.Context) {
 		return
 	}
 
+	// Resolve block IDs before writing headers so a resolution failure fails
+	// clean instead of truncating the stream mid-download.
+	resolvedIDs, err := streaming.BatchResolveBlockIDs(h.db, orgID, blockIDs)
+	if err != nil {
+		log.Printf("[ServeHistoricFileRaw] block ID resolution failed for org=%s: %v", orgID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read file"})
+		return
+	}
+
 	// Determine MIME type
 	mimeType := resolveInlineContentType(ext)
 
@@ -1127,6 +1156,5 @@ func (h *FileViewHandler) ServeHistoricFileRaw(c *gin.Context) {
 	}
 	c.Status(http.StatusOK)
 
-	resolvedIDs := streaming.BatchResolveBlockIDs(h.db, orgID, blockIDs)
 	streaming.StreamBlocks(c, c.Request.Context(), blockStore, resolvedIDs, fileKey, fileIV, "ServeHistoricFileRaw")
 }
