@@ -196,6 +196,7 @@ func (s *Scanner) scanOrphanedBlocks(ctx context.Context) (int, error) {
 	}
 
 	enqueued := 0
+	var phaseErr error
 	for day := startDay; !day.After(cutoffDay); day = day.AddDate(0, 0, 1) {
 		for bucket := 0; bucket < db.GCDiscoveryBucketCount; bucket++ {
 			select {
@@ -207,6 +208,9 @@ func (s *Scanner) scanOrphanedBlocks(ctx context.Context) (int, error) {
 			candidates, err := s.store.ListBlockGCCandidatesByDay(day, bucket)
 			if err != nil {
 				log.Printf("[GC Scanner] Phase 1: failed to list candidates for day=%s bucket=%d: %v", db.GCProjectionDateString(day), bucket, err)
+				if phaseErr == nil {
+					phaseErr = fmt.Errorf("list block candidates for day=%s bucket=%d: %w", db.GCProjectionDateString(day), bucket, err)
+				}
 				continue
 			}
 
@@ -215,6 +219,9 @@ func (s *Scanner) scanOrphanedBlocks(ctx context.Context) (int, error) {
 				exists, err := s.store.PendingItemExists(candidate.OrgID, uuid.Nil, candidate.CandidateAt, ItemBlock, candidate.BlockID)
 				if err != nil {
 					log.Printf("[GC Scanner] Phase 1: failed to inspect queue for block %s in org %s: %v", candidate.BlockID, candidate.OrgID, err)
+					if phaseErr == nil {
+						phaseErr = fmt.Errorf("inspect queue for block %s in org %s: %w", candidate.BlockID, candidate.OrgID, err)
+					}
 					continue
 				}
 				if exists {
@@ -232,6 +239,9 @@ func (s *Scanner) scanOrphanedBlocks(ctx context.Context) (int, error) {
 			if len(batch) > 0 {
 				if err := s.queue.EnqueueBatch(batch); err != nil {
 					log.Printf("[GC Scanner] Phase 1: failed to batch enqueue blocks for day=%s bucket=%d: %v", db.GCProjectionDateString(day), bucket, err)
+					if phaseErr == nil {
+						phaseErr = fmt.Errorf("enqueue blocks for day=%s bucket=%d: %w", db.GCProjectionDateString(day), bucket, err)
+					}
 				} else {
 					enqueued += len(batch)
 				}
@@ -239,19 +249,22 @@ func (s *Scanner) scanOrphanedBlocks(ctx context.Context) (int, error) {
 		}
 	}
 
-	// Advance cursor to today-1 so a same-day late-arriving candidate still
-	// gets picked up on the next pass (gcScanOverlapDays-style overlap).
-	newCursor := cutoffDay.AddDate(0, 0, -1)
-	if !newCursor.Before(startDay) {
-		if err := s.store.SaveGCStats(gcBlockCandidatesCursorKey, db.GCProjectionDateString(newCursor)); err != nil {
-			log.Printf("[GC Scanner] Phase 1: failed to persist block candidates cursor: %v", err)
+	if phaseErr == nil {
+		// Advance cursor to today-1 so a same-day late-arriving candidate still
+		// gets picked up on the next pass (gcScanOverlapDays-style overlap).
+		newCursor := cutoffDay.AddDate(0, 0, -1)
+		if !newCursor.Before(startDay) {
+			if err := s.store.SaveGCStats(gcBlockCandidatesCursorKey, db.GCProjectionDateString(newCursor)); err != nil {
+				log.Printf("[GC Scanner] Phase 1: failed to persist block candidates cursor: %v", err)
+				phaseErr = fmt.Errorf("persist block candidates cursor: %w", err)
+			}
 		}
 	}
 
 	log.Printf("[GC Scanner] Phase 1 complete: enqueued %d orphaned blocks", enqueued)
 	metrics.GCItemsEnqueuedTotal.WithLabelValues("orphaned_blocks").Add(float64(enqueued))
 	metrics.GCScannerLastPhaseRun.WithLabelValues("orphaned_blocks").SetToCurrentTime()
-	return enqueued, nil
+	return enqueued, phaseErr
 }
 
 // loadBlockCandidatesStartDay reads the persisted cursor day and returns the

@@ -76,7 +76,10 @@ type GCStore interface {
 	ListBlockGCCandidatesByDay(day time.Time, bucket int) ([]BlockGCCandidateInfo, error)
 
 	// S3 orphan recovery / pending delete tracking for blocks claimed by GC.
-	RecordS3Orphan(orgID uuid.UUID, blockID, storageClass, errMsg string, now time.Time) error
+	// RecordS3Orphan preserves and returns the effective first_seen_at identity
+	// for the orphan row so callers can reliably clean up the discovery
+	// projection even after retries or partial crashes.
+	RecordS3Orphan(orgID uuid.UUID, blockID, storageClass, errMsg string, now time.Time) (time.Time, error)
 	// ListS3OrphansByDay enumerates S3-orphan rows whose `first_seen_at`
 	// falls on the given UTC day for one discovery bucket. `limit` caps the
 	// number of rows returned for a single (day, bucket) pair.

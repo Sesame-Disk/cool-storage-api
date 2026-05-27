@@ -38,6 +38,8 @@ type MockStore struct {
 
 	// block GC candidates keyed by "orgID:blockID"
 	blockGCCandidates map[string]*mockBlockGCCandidate
+	// block GC candidate discovery rows keyed by the full projection PK.
+	blockGCCandidateProjections map[mockBlockGCCandidateProjectionKey]BlockGCCandidateInfo
 
 	// block_id_mappings keyed by "orgID:externalID"
 	mappings map[string]string // externalID -> internalID
@@ -146,6 +148,7 @@ type MockStore struct {
 	deleteGroupFullErr             error
 	acquireOrgHardDeleteLockHook   func(orgID uuid.UUID)
 	beginOrgPurgeHook              func(orgID uuid.UUID)
+	getBlockRefCountErr            error
 
 	// optional test hooks for reproducing concurrency windows deterministically.
 	getQueueSizeHook      func(orgID uuid.UUID, size int)
@@ -172,6 +175,8 @@ type MockStore struct {
 
 	// S3 orphans keyed by "orgID:blockID"
 	s3Orphans map[string]*S3OrphanInfo
+	// S3 orphan discovery rows keyed by the full projection PK.
+	s3OrphanProjections map[mockS3OrphanProjectionKey]S3OrphanInfo
 }
 
 type mockBlock struct {
@@ -194,6 +199,22 @@ type mockBlockGCCandidate struct {
 	BlockID      string
 	StorageClass string
 	CandidateAt  time.Time
+}
+
+type mockBlockGCCandidateProjectionKey struct {
+	CandidateDay time.Time
+	Bucket       int
+	CandidateAt  time.Time
+	OrgID        uuid.UUID
+	BlockID      string
+}
+
+type mockS3OrphanProjectionKey struct {
+	FirstSeenDay time.Time
+	Bucket       int
+	FirstSeenAt  time.Time
+	OrgID        uuid.UUID
+	BlockID      string
 }
 
 type mockCommit struct {
@@ -321,6 +342,7 @@ func NewMockStore() *MockStore {
 		failedItems:                   make(map[uuid.UUID][]GCFailedItemInfo),
 		blocks:                        make(map[string]*mockBlock),
 		blockGCCandidates:             make(map[string]*mockBlockGCCandidate),
+		blockGCCandidateProjections:   make(map[mockBlockGCCandidateProjectionKey]BlockGCCandidateInfo),
 		mappings:                      make(map[string]string),
 		commits:                       make(map[string]*mockCommit),
 		fsObjects:                     make(map[string]*mockFSObject),
@@ -351,6 +373,7 @@ func NewMockStore() *MockStore {
 		gcStats:                       make(map[string]string),
 		organizations:                 nil,
 		s3Orphans:                     make(map[string]*S3OrphanInfo),
+		s3OrphanProjections:           make(map[mockS3OrphanProjectionKey]S3OrphanInfo),
 	}
 }
 
@@ -362,6 +385,43 @@ func newMockPendingItemKey(orgID, libraryID uuid.UUID, itemType ItemType, itemID
 		ItemID:     itemID,
 		IdentityAt: identityAt,
 	}
+}
+
+func newMockBlockGCCandidateProjectionKey(orgID uuid.UUID, blockID string, candidateAt time.Time) mockBlockGCCandidateProjectionKey {
+	candidateAt = candidateAt.UTC()
+	return mockBlockGCCandidateProjectionKey{
+		CandidateDay: db.GCProjectionUTCDate(candidateAt),
+		Bucket:       db.GCDiscoveryBucket(orgID.String(), blockID),
+		CandidateAt:  candidateAt,
+		OrgID:        orgID,
+		BlockID:      blockID,
+	}
+}
+
+func newMockS3OrphanProjectionKey(orgID uuid.UUID, blockID string, firstSeenAt time.Time) mockS3OrphanProjectionKey {
+	firstSeenAt = firstSeenAt.UTC()
+	return mockS3OrphanProjectionKey{
+		FirstSeenDay: db.GCProjectionUTCDate(firstSeenAt),
+		Bucket:       db.GCDiscoveryBucket(orgID.String(), blockID),
+		FirstSeenAt:  firstSeenAt,
+		OrgID:        orgID,
+		BlockID:      blockID,
+	}
+}
+
+func (m *MockStore) upsertBlockGCCandidateProjection(candidate *mockBlockGCCandidate) {
+	key := newMockBlockGCCandidateProjectionKey(candidate.OrgID, candidate.BlockID, candidate.CandidateAt)
+	m.blockGCCandidateProjections[key] = BlockGCCandidateInfo{
+		OrgID:        candidate.OrgID,
+		BlockID:      candidate.BlockID,
+		StorageClass: candidate.StorageClass,
+		CandidateAt:  candidate.CandidateAt.UTC(),
+	}
+}
+
+func (m *MockStore) upsertS3OrphanProjection(orphan *S3OrphanInfo) {
+	key := newMockS3OrphanProjectionKey(orphan.OrgID, orphan.BlockID, orphan.FirstSeenAt)
+	m.s3OrphanProjections[key] = *orphan
 }
 
 func (m *MockStore) upsertPendingItem(orgID, libraryID uuid.UUID, itemType ItemType, itemID string, identityAt time.Time, expiresAt *time.Time) {
@@ -403,12 +463,26 @@ func (m *MockStore) AddBlockGCCandidate(orgID uuid.UUID, blockID, storageClass s
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	key := fmt.Sprintf("%s:%s", orgID, blockID)
-	m.blockGCCandidates[key] = &mockBlockGCCandidate{
+	candidate := &mockBlockGCCandidate{
 		OrgID:        orgID,
 		BlockID:      blockID,
 		StorageClass: storageClass,
-		CandidateAt:  candidateAt,
+		CandidateAt:  candidateAt.UTC(),
 	}
+	m.blockGCCandidates[key] = candidate
+	m.upsertBlockGCCandidateProjection(candidate)
+}
+
+func (m *MockStore) DeleteBlockGCCandidateProjectionForTest(orgID uuid.UUID, blockID string, candidateAt time.Time) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.blockGCCandidateProjections, newMockBlockGCCandidateProjectionKey(orgID, blockID, candidateAt))
+}
+
+func (m *MockStore) DeleteS3OrphanProjectionForTest(orgID uuid.UUID, blockID string, firstSeenAt time.Time) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.s3OrphanProjections, newMockS3OrphanProjectionKey(orgID, blockID, firstSeenAt))
 }
 
 func (m *MockStore) AddBlockMapping(orgID uuid.UUID, externalID, internalID string) {
@@ -1372,6 +1446,9 @@ func (m *MockStore) GetOrgDeletedAt(orgID uuid.UUID) (*time.Time, error) {
 func (m *MockStore) GetBlockRefCount(orgID uuid.UUID, blockID string) (int, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
+	if m.getBlockRefCountErr != nil {
+		return 0, m.getBlockRefCountErr
+	}
 
 	key := fmt.Sprintf("%s:%s", orgID, blockID)
 	b, ok := m.blocks[key]
@@ -1403,21 +1480,33 @@ func (m *MockStore) EnsureBlockGCCandidate(orgID uuid.UUID, blockID, storageClas
 	defer m.mu.Unlock()
 	key := fmt.Sprintf("%s:%s", orgID, blockID)
 	if existing, ok := m.blockGCCandidates[key]; ok {
+		m.upsertBlockGCCandidateProjection(existing)
 		return existing.CandidateAt, nil
 	}
-	m.blockGCCandidates[key] = &mockBlockGCCandidate{
+	candidate := &mockBlockGCCandidate{
 		OrgID:        orgID,
 		BlockID:      blockID,
 		StorageClass: storageClass,
-		CandidateAt:  candidateAt,
+		CandidateAt:  candidateAt.UTC(),
 	}
-	return candidateAt, nil
+	m.blockGCCandidates[key] = candidate
+	m.upsertBlockGCCandidateProjection(candidate)
+	return candidate.CandidateAt, nil
 }
 
 func (m *MockStore) DeleteBlockGCCandidate(orgID uuid.UUID, blockID string, candidateAt time.Time) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	delete(m.blockGCCandidates, fmt.Sprintf("%s:%s", orgID, blockID))
+	key := fmt.Sprintf("%s:%s", orgID, blockID)
+	if candidateAt.IsZero() {
+		if existing, ok := m.blockGCCandidates[key]; ok {
+			candidateAt = existing.CandidateAt
+		}
+	}
+	delete(m.blockGCCandidates, key)
+	if !candidateAt.IsZero() {
+		delete(m.blockGCCandidateProjections, newMockBlockGCCandidateProjectionKey(orgID, blockID, candidateAt))
+	}
 	return nil
 }
 
@@ -1426,19 +1515,14 @@ func (m *MockStore) ListBlockGCCandidatesByDay(day time.Time, bucket int) ([]Blo
 	defer m.mu.RUnlock()
 	targetDay := db.GCProjectionUTCDate(day)
 	var candidates []BlockGCCandidateInfo
-	for _, candidate := range m.blockGCCandidates {
-		if !db.GCProjectionUTCDate(candidate.CandidateAt).Equal(targetDay) {
+	for key, candidate := range m.blockGCCandidateProjections {
+		if !key.CandidateDay.Equal(targetDay) {
 			continue
 		}
-		if db.GCDiscoveryBucket(candidate.OrgID.String(), candidate.BlockID) != bucket {
+		if key.Bucket != bucket {
 			continue
 		}
-		candidates = append(candidates, BlockGCCandidateInfo{
-			OrgID:        candidate.OrgID,
-			BlockID:      candidate.BlockID,
-			StorageClass: candidate.StorageClass,
-			CandidateAt:  candidate.CandidateAt,
-		})
+		candidates = append(candidates, candidate)
 	}
 	sort.Slice(candidates, func(i, j int) bool {
 		if !candidates[i].CandidateAt.Equal(candidates[j].CandidateAt) {
@@ -2732,7 +2816,7 @@ func (d *mockBlockDeleter) DeleteBlock(ctx context.Context, blockID string) erro
 
 // --- S3 orphan recovery (mock) ---
 
-func (m *MockStore) RecordS3Orphan(orgID uuid.UUID, blockID, storageClass, errMsg string, now time.Time) error {
+func (m *MockStore) RecordS3Orphan(orgID uuid.UUID, blockID, storageClass, errMsg string, now time.Time) (time.Time, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	key := fmt.Sprintf("%s:%s", orgID, blockID)
@@ -2741,23 +2825,26 @@ func (m *MockStore) RecordS3Orphan(orgID uuid.UUID, blockID, storageClass, errMs
 		initialRetryCount = 1
 	}
 	if existing, ok := m.s3Orphans[key]; ok {
+		m.upsertS3OrphanProjection(existing)
 		if errMsg != "" {
 			existing.LastAttemptAt = now
 			existing.RetryCount++
 			existing.LastError = errMsg
 		}
-		return nil
+		return existing.FirstSeenAt, nil
 	}
-	m.s3Orphans[key] = &S3OrphanInfo{
+	orphan := &S3OrphanInfo{
 		OrgID:         orgID,
 		BlockID:       blockID,
 		StorageClass:  storageClass,
-		FirstSeenAt:   now,
+		FirstSeenAt:   now.UTC(),
 		LastAttemptAt: now,
 		RetryCount:    initialRetryCount,
 		LastError:     errMsg,
 	}
-	return nil
+	m.s3Orphans[key] = orphan
+	m.upsertS3OrphanProjection(orphan)
+	return orphan.FirstSeenAt, nil
 }
 
 func (m *MockStore) UpdateS3OrphanAttempt(orgID uuid.UUID, blockID, errMsg string, now time.Time) error {
@@ -2775,7 +2862,16 @@ func (m *MockStore) UpdateS3OrphanAttempt(orgID uuid.UUID, blockID, errMsg strin
 func (m *MockStore) DeleteS3Orphan(orgID uuid.UUID, blockID string, firstSeenAt time.Time) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	delete(m.s3Orphans, fmt.Sprintf("%s:%s", orgID, blockID))
+	key := fmt.Sprintf("%s:%s", orgID, blockID)
+	if firstSeenAt.IsZero() {
+		if existing, ok := m.s3Orphans[key]; ok {
+			firstSeenAt = existing.FirstSeenAt
+		}
+	}
+	delete(m.s3Orphans, key)
+	if !firstSeenAt.IsZero() {
+		delete(m.s3OrphanProjections, newMockS3OrphanProjectionKey(orgID, blockID, firstSeenAt))
+	}
 	return nil
 }
 
@@ -2787,14 +2883,14 @@ func (m *MockStore) ListS3OrphansByDay(day time.Time, bucket int, limit int) ([]
 	}
 	targetDay := db.GCProjectionUTCDate(day)
 	var out []S3OrphanInfo
-	for _, o := range m.s3Orphans {
-		if !db.GCProjectionUTCDate(o.FirstSeenAt).Equal(targetDay) {
+	for key, orphan := range m.s3OrphanProjections {
+		if !key.FirstSeenDay.Equal(targetDay) {
 			continue
 		}
-		if db.GCDiscoveryBucket(o.OrgID.String(), o.BlockID) != bucket {
+		if key.Bucket != bucket {
 			continue
 		}
-		out = append(out, *o)
+		out = append(out, orphan)
 	}
 	sort.Slice(out, func(i, j int) bool {
 		if !out[i].FirstSeenAt.Equal(out[j].FirstSeenAt) {

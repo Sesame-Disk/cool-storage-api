@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Sesame-Disk/sesamefs/internal/db"
 	"github.com/google/uuid"
 )
 
@@ -121,6 +122,61 @@ func TestWorker_ProcessBlock_RefCountPositive(t *testing.T) {
 	// No S3 deletions
 	if len(sp.DeletedBlocks()) != 0 {
 		t.Errorf("expected no S3 deletions, got %d", len(sp.DeletedBlocks()))
+	}
+}
+
+func TestWorker_ProcessBlock_RetryUsesIdentityAtForCandidateCleanup(t *testing.T) {
+	store := NewMockStore()
+	sp := &MockStorageProvider{}
+	stats := &Stats{}
+	q := NewQueue(store)
+	w := NewWorker(store, sp, q, 100, 0, false, stats)
+
+	orgID := uuid.New()
+	candidateAt := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
+	store.AddBlock(orgID, "block-retry-cleanup", "hot", 0)
+	if _, err := store.EnsureBlockGCCandidate(orgID, "block-retry-cleanup", "hot", candidateAt); err != nil {
+		t.Fatalf("EnsureBlockGCCandidate failed: %v", err)
+	}
+	if err := store.EnqueueItem(orgID, candidateAt, ItemBlock, "block-retry-cleanup", uuid.Nil, "hot", 0); err != nil {
+		t.Fatalf("EnqueueItem failed: %v", err)
+	}
+
+	items, err := store.DequeueBatch(orgID, 1, time.Now())
+	if err != nil || len(items) != 1 {
+		t.Fatalf("DequeueBatch failed: %v / items=%d", err, len(items))
+	}
+	if err := q.IncrementRetry(items[0]); err != nil {
+		t.Fatalf("IncrementRetry failed: %v", err)
+	}
+
+	retriedItems := store.QueueItems(orgID)
+	if len(retriedItems) != 1 {
+		t.Fatalf("expected exactly 1 retried queue item, got %d", len(retriedItems))
+	}
+	if !effectiveIdentityAt(retriedItems[0].QueuedAt, retriedItems[0].IdentityAt).Equal(candidateAt) {
+		t.Fatalf("effective identity_at = %v, want %v", effectiveIdentityAt(retriedItems[0].QueuedAt, retriedItems[0].IdentityAt), candidateAt)
+	}
+	if retriedItems[0].QueuedAt.Equal(candidateAt) {
+		t.Fatal("expected retry queued_at to differ from original candidate_at")
+	}
+
+	n, err := w.ProcessOnce(context.Background())
+	if err != nil {
+		t.Fatalf("ProcessOnce failed: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("expected 1 processed, got %d", n)
+	}
+	if got := len(store.AllBlockGCCandidates()); got != 0 {
+		t.Fatalf("expected canonical block GC candidate cleanup, got %d rows", got)
+	}
+	candidates, err := store.ListBlockGCCandidatesByDay(candidateAt, db.GCDiscoveryBucket(orgID.String(), "block-retry-cleanup"))
+	if err != nil {
+		t.Fatalf("ListBlockGCCandidatesByDay failed: %v", err)
+	}
+	if len(candidates) != 0 {
+		t.Fatalf("expected discovery row cleanup via identity_at, got %d rows", len(candidates))
 	}
 }
 

@@ -356,6 +356,8 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem, blockRefs *bl
 		return nil
 	}
 
+	candidateAt := effectiveIdentityAt(item.QueuedAt, item.IdentityAt)
+
 	referenced, err := w.blockReferencedByFSObject(item.OrgID, item.ItemID, blockRefs)
 	if err != nil {
 		return fmt.Errorf("failed to verify live fs_object references for block %s: %w", item.ItemID, err)
@@ -376,7 +378,7 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem, blockRefs *bl
 	// 2. If it didn't apply, it means ref_count > 0 or it was already deleted.
 	// We skip deleting from S3 to avoid data loss.
 	if !applied {
-		if err := w.store.DeleteBlockGCCandidate(item.OrgID, item.ItemID, item.QueuedAt); err != nil {
+		if err := w.store.DeleteBlockGCCandidate(item.OrgID, item.ItemID, candidateAt); err != nil {
 			return fmt.Errorf("failed to clear stale block GC candidate: %w", err)
 		}
 		log.Printf("[GC Worker] Block %s LWT delete not applied (ref_count > 0 or already deleted), skipping S3 deletion", item.ItemID)
@@ -391,8 +393,8 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem, blockRefs *bl
 	if storageClass == "" {
 		storageClass = "hot"
 	}
-	orphanFirstSeenAt := w.clock().UTC()
-	if err := w.store.RecordS3Orphan(item.OrgID, item.ItemID, storageClass, "", orphanFirstSeenAt); err != nil {
+	orphanFirstSeenAt, err := w.store.RecordS3Orphan(item.OrgID, item.ItemID, storageClass, "", w.clock().UTC())
+	if err != nil {
 		return fmt.Errorf("failed to record pending S3 delete for block %s: %w", item.ItemID, err)
 	}
 
@@ -429,7 +431,7 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem, blockRefs *bl
 		}
 	}
 
-	if err := w.store.DeleteBlockGCCandidate(item.OrgID, item.ItemID, item.QueuedAt); err != nil {
+	if err := w.store.DeleteBlockGCCandidate(item.OrgID, item.ItemID, candidateAt); err != nil {
 		return fmt.Errorf("failed to clear block GC candidate: %w", err)
 	}
 
@@ -506,13 +508,20 @@ func (w *Worker) RecoverS3Orphans(ctx context.Context, perBucketLimit int) (int,
 			default:
 			}
 
-			orphans, err := w.store.ListS3OrphansByDay(day, bucket, perBucketLimit)
+			orphans, err := w.store.ListS3OrphansByDay(day, bucket, perBucketLimit+1)
 			if err != nil {
 				log.Printf("[GC Worker] S3 orphan recovery: list failed for day=%s bucket=%d: %v", db.GCProjectionDateString(day), bucket, err)
 				if phaseErr == nil {
 					phaseErr = fmt.Errorf("list S3 orphan recovery partition day=%s bucket=%d: %w", db.GCProjectionDateString(day), bucket, err)
 				}
 				continue
+			}
+			if len(orphans) > perBucketLimit {
+				log.Printf("[GC Worker] S3 orphan recovery: partition day=%s bucket=%d hit limit=%d; deferring cursor advance", db.GCProjectionDateString(day), bucket, perBucketLimit)
+				if phaseErr == nil {
+					phaseErr = fmt.Errorf("S3 orphan recovery partition day=%s bucket=%d incomplete after reaching limit=%d", db.GCProjectionDateString(day), bucket, perBucketLimit)
+				}
+				orphans = orphans[:perBucketLimit]
 			}
 			for _, orph := range orphans {
 				select {
@@ -524,6 +533,12 @@ func (w *Worker) RecoverS3Orphans(ctx context.Context, perBucketLimit int) (int,
 					// The canonical block row still exists (likely claimed but not yet finalized).
 					// Skip recovery for now; a later worker retry or startup scan will finish it.
 					continue
+				} else if !errors.Is(err, gocql.ErrNotFound) {
+					log.Printf("[GC Worker] S3 orphan recovery: block ref-count lookup failed for org=%s block=%s: %v", orph.OrgID, orph.BlockID, err)
+					if phaseErr == nil {
+						phaseErr = fmt.Errorf("check block ref-count for S3 orphan org=%s block=%s: %w", orph.OrgID, orph.BlockID, err)
+					}
+					continue
 				}
 
 				storageClass := orph.StorageClass
@@ -533,16 +548,28 @@ func (w *Worker) RecoverS3Orphans(ctx context.Context, perBucketLimit int) (int,
 				blockStore, err := w.storage.GetBlockStore(storageClass)
 				if err != nil {
 					log.Printf("[GC Worker] S3 orphan recovery: get block store for class %s failed: %v", storageClass, err)
+					if phaseErr == nil {
+						phaseErr = fmt.Errorf("get block store for S3 orphan class=%s: %w", storageClass, err)
+					}
 					continue
 				}
 				if err := blockStore.DeleteBlock(ctx, orph.BlockID); err != nil {
 					if updErr := w.store.UpdateS3OrphanAttempt(orph.OrgID, orph.BlockID, err.Error(), w.clock()); updErr != nil {
 						log.Printf("[GC Worker] S3 orphan recovery: update attempt for %s failed: %v", orph.BlockID, updErr)
+						if phaseErr == nil {
+							phaseErr = fmt.Errorf("update S3 orphan attempt for block %s: %w", orph.BlockID, updErr)
+						}
+					}
+					if phaseErr == nil {
+						phaseErr = fmt.Errorf("delete S3 orphan block %s from backing store: %w", orph.BlockID, err)
 					}
 					continue
 				}
 				if err := w.store.DeleteS3Orphan(orph.OrgID, orph.BlockID, orph.FirstSeenAt); err != nil {
 					log.Printf("[GC Worker] S3 orphan recovery: failed to clear orphan row %s: %v", orph.BlockID, err)
+					if phaseErr == nil {
+						phaseErr = fmt.Errorf("clear S3 orphan row for block %s: %w", orph.BlockID, err)
+					}
 					continue
 				}
 				recovered++
@@ -1373,13 +1400,16 @@ func (w *Worker) collectLiveFSObjectBlockReferenceCounts(orgID uuid.UUID) (map[s
 func (w *Worker) enqueueZeroRefBlocks(orgID, libraryID uuid.UUID, blockIDs []string, storageClass string) error {
 	var blockBatch []QueueItem
 	for _, blockID := range blockIDs {
-		candidateAt, err := w.store.EnsureBlockGCCandidate(orgID, blockID, storageClass, time.Now())
-		if err != nil {
-			return err
+		candidateAt, candidateErr := w.store.EnsureBlockGCCandidate(orgID, blockID, storageClass, time.Now())
+		if candidateErr != nil && candidateAt.IsZero() {
+			return candidateErr
+		}
+		if candidateErr != nil {
+			log.Printf("[GC Worker] WARNING: block candidate discovery degraded for org=%s block=%s: %v", orgID, blockID, candidateErr)
 		}
 		exists, err := w.store.PendingItemExists(orgID, uuid.Nil, candidateAt, ItemBlock, blockID)
 		if err != nil {
-			return err
+			return errors.Join(candidateErr, err)
 		}
 		if exists {
 			continue

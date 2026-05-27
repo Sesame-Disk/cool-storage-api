@@ -331,7 +331,6 @@ func TestScanner_ScanOrphanedBlocks_AdvancesCursorAndSkipsOldDays(t *testing.T) 
 	if got := len(store.QueueItems(orgID)); got != 1 {
 		t.Fatalf("expected 1 queued item on first pass, got %d", got)
 	}
-
 	// Cursor should now be persisted; default is today-1 (per scanner code).
 	cursorValue, err := store.LoadGCStats("gc.scan.block_candidates.last_candidate_day")
 	if err != nil || cursorValue == "" {
@@ -644,6 +643,44 @@ func TestScanner_ScanOrphanedCommits_SkipsRetriedQueuedCommit(t *testing.T) {
 	}
 	if got := len(store.QueueItems(orgID)); got != 1 {
 		t.Fatalf("expected 1 queued orphaned commit after dedupe, got %d", got)
+	}
+}
+
+func TestScanner_ScanOrphanedBlocks_EnqueueFailureKeepsCursorUnchanged(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	s := NewScanner(store, q, stats, config.GCConfig{})
+
+	orgID := uuid.New()
+	store.AddOrganization(orgID)
+
+	previousCursor := db.GCProjectionDateString(db.GCProjectionUTCDate(time.Now().AddDate(0, 0, -1)))
+	if err := store.SaveGCStats(gcBlockCandidatesCursorKey, previousCursor); err != nil {
+		t.Fatalf("SaveGCStats() failed: %v", err)
+	}
+
+	if _, err := store.EnsureBlockGCCandidate(orgID, "block-enqueue-fail", "hot", time.Now()); err != nil {
+		t.Fatalf("EnsureBlockGCCandidate failed: %v", err)
+	}
+	store.enqueueBatchErr = fmt.Errorf("enqueue failed")
+
+	enqueued, err := s.scanOrphanedBlocks(context.Background())
+	if err == nil {
+		t.Fatal("scanOrphanedBlocks() error = nil, want non-nil")
+	}
+	if enqueued != 0 {
+		t.Fatalf("scanOrphanedBlocks() enqueued = %d, want 0", enqueued)
+	}
+	gotCursor, err := store.LoadGCStats(gcBlockCandidatesCursorKey)
+	if err != nil {
+		t.Fatalf("LoadGCStats() failed: %v", err)
+	}
+	if gotCursor != previousCursor {
+		t.Fatalf("block candidates cursor = %q, want unchanged %q", gotCursor, previousCursor)
+	}
+	if got := len(store.QueueItems(orgID)); got != 0 {
+		t.Fatalf("enqueue failure should leave queue empty, got %d items", got)
 	}
 }
 

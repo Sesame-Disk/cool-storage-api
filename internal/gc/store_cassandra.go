@@ -929,41 +929,81 @@ func (s *CassandraStore) GetOrgDeletedAt(orgID uuid.UUID) (*time.Time, error) {
 	return &deletedAtCopy, nil
 }
 
+func (s *CassandraStore) upsertBlockGCCandidateProjection(orgID uuid.UUID, blockID, storageClass string, candidateAt time.Time) error {
+	return s.db.Session().Query(`
+		INSERT INTO gc_block_candidates_by_day (candidate_day, bucket, candidate_at, org_id, block_id, storage_class)
+		VALUES (?, ?, ?, ?, ?, ?)
+	`, db.GCProjectionUTCDate(candidateAt), db.GCDiscoveryBucket(orgID.String(), blockID), candidateAt.UTC(), orgID.String(), blockID, storageClass).Exec()
+}
+
+func casStringValue(row map[string]interface{}, key string) (string, error) {
+	value, ok := row[key]
+	if !ok || value == nil {
+		return "", nil
+	}
+	switch typed := value.(type) {
+	case string:
+		return typed, nil
+	case []byte:
+		return string(typed), nil
+	default:
+		return "", fmt.Errorf("unexpected CAS %s type %T", key, value)
+	}
+}
+
+func casTimeValue(row map[string]interface{}, key string) (time.Time, error) {
+	value, ok := row[key]
+	if !ok || value == nil {
+		return time.Time{}, nil
+	}
+	switch typed := value.(type) {
+	case time.Time:
+		return typed, nil
+	case *time.Time:
+		if typed == nil {
+			return time.Time{}, nil
+		}
+		return *typed, nil
+	default:
+		return time.Time{}, fmt.Errorf("unexpected CAS %s type %T", key, value)
+	}
+}
+
 // EnsureBlockGCCandidate inserts a (org_id, block_id) row into the canonical
-// gc_block_candidates table if one does not already exist, and mirrors the
-// fresh insert into the gc_block_candidates_by_day discovery projection.
-//
-// The discovery row is only written on `applied == true` (i.e. when we actually
-// created the canonical row). If the canonical row already exists, the
-// discovery row for the previous candidate_at also already exists; we must not
-// re-write a second discovery row under a different (day, bucket) clustering
-// or we would orphan the original.
+// gc_block_candidates table if one does not already exist, and guarantees the
+// matching gc_block_candidates_by_day discovery row exists for the effective
+// candidate_at timestamp.
 func (s *CassandraStore) EnsureBlockGCCandidate(orgID uuid.UUID, blockID, storageClass string, candidateAt time.Time) (time.Time, error) {
-	var existingOrgID string
-	var existingBlockID string
-	var existingStorageClass string
-	var existingCandidateAt time.Time
+	existing := map[string]interface{}{}
 	applied, err := s.db.Session().Query(`
 		INSERT INTO gc_block_candidates (org_id, block_id, storage_class, candidate_at)
 		VALUES (?, ?, ?, ?) IF NOT EXISTS
-	`, orgID.String(), blockID, storageClass, candidateAt).ScanCAS(&existingOrgID, &existingBlockID, &existingStorageClass, &existingCandidateAt)
+	`, orgID.String(), blockID, storageClass, candidateAt).MapScanCAS(existing)
 	if err != nil {
 		return time.Time{}, err
 	}
+	effectiveCandidateAt := candidateAt.UTC()
+	effectiveStorageClass := storageClass
 	if !applied {
-		return existingCandidateAt, nil
+		effectiveCandidateAt, err = casTimeValue(existing, "candidate_at")
+		if err != nil {
+			return time.Time{}, err
+		}
+		if effectiveCandidateAt.IsZero() {
+			return time.Time{}, fmt.Errorf("gc_block_candidates row for org=%s block=%s is missing candidate_at", orgID, blockID)
+		}
+		effectiveStorageClass, err = casStringValue(existing, "storage_class")
+		if err != nil {
+			return time.Time{}, err
+		}
+		if effectiveStorageClass == "" {
+			effectiveStorageClass = storageClass
+		}
 	}
-
-	// Best-effort: scanner can backfill discovery rows from canonical on
-	// startup if a crash happens between the canonical insert and this write.
-	// We log so the failure is visible, but do not fail the GC enqueue path.
-	if err := s.db.Session().Query(`
-		INSERT INTO gc_block_candidates_by_day (candidate_day, bucket, candidate_at, org_id, block_id, storage_class)
-		VALUES (?, ?, ?, ?, ?, ?)
-	`, db.GCProjectionUTCDate(candidateAt), db.GCDiscoveryBucket(orgID.String(), blockID), candidateAt.UTC(), orgID.String(), blockID, storageClass).Exec(); err != nil {
-		log.Printf("[GC] WARNING: failed to write gc_block_candidates_by_day discovery row for org=%s block=%s: %v", orgID, blockID, err)
+	if err := s.upsertBlockGCCandidateProjection(orgID, blockID, effectiveStorageClass, effectiveCandidateAt); err != nil {
+		return effectiveCandidateAt, fmt.Errorf("ensure gc_block_candidates_by_day discovery row for org=%s block=%s: %w", orgID, blockID, err)
 	}
-	return candidateAt, nil
+	return effectiveCandidateAt, nil
 }
 
 // DeleteBlockGCCandidate removes both the canonical row and the matching
@@ -1027,43 +1067,61 @@ func (s *CassandraStore) ListBlockGCCandidatesByDay(day time.Time, bucket int) (
 
 // --- S3 orphan recovery ---
 
-// RecordS3Orphan upserts a gc_s3_orphans row preserving first_seen_at when the
-// row already exists. Called both for the initial "S3 pending" record and for
-// actual S3 delete failures.
+func (s *CassandraStore) upsertS3OrphanProjection(orgID uuid.UUID, blockID, storageClass string, firstSeenAt time.Time) error {
+	return s.db.Session().Query(`
+		INSERT INTO gc_s3_orphans_by_day (first_seen_day, bucket, first_seen_at, org_id, block_id, storage_class)
+		VALUES (?, ?, ?, ?, ?, ?)
+	`, db.GCProjectionUTCDate(firstSeenAt), db.GCDiscoveryBucket(orgID.String(), blockID), firstSeenAt.UTC(), orgID.String(), blockID, storageClass).Exec()
+}
+
+// RecordS3Orphan upserts a gc_s3_orphans row preserving and returning the
+// effective first_seen_at when the row already exists. Called both for the
+// initial "S3 pending" record and for actual S3 delete failures.
 //
-// On a fresh insert we also write a row into the gc_s3_orphans_by_day discovery
-// projection so the scanner can enumerate orphans without partition scanning
-// by org. The discovery row inherits the same TTL via schema.
-func (s *CassandraStore) RecordS3Orphan(orgID uuid.UUID, blockID, storageClass, errMsg string, now time.Time) error {
+// It also guarantees the matching gc_s3_orphans_by_day discovery row exists so
+// recovery can enumerate every orphan without scanning canonical partitions.
+func (s *CassandraStore) RecordS3Orphan(orgID uuid.UUID, blockID, storageClass, errMsg string, now time.Time) (time.Time, error) {
 	initialRetryCount := 0
 	if errMsg != "" {
 		initialRetryCount = 1
 	}
+	existing := map[string]interface{}{}
 	// INSERT IF NOT EXISTS preserves the original first_seen_at on conflict;
 	// if the row exists we fall through to UpdateS3OrphanAttempt-style update.
 	applied, err := s.db.Session().Query(`
 		INSERT INTO gc_s3_orphans (org_id, block_id, storage_class, first_seen_at, last_attempt_at, retry_count, last_error)
 		VALUES (?, ?, ?, ?, ?, ?, ?) IF NOT EXISTS
-	`, orgID.String(), blockID, storageClass, now, now, initialRetryCount, errMsg).ScanCAS(nil, nil, nil, nil, nil, nil, nil)
+	`, orgID.String(), blockID, storageClass, now, now, initialRetryCount, errMsg).MapScanCAS(existing)
 	if err != nil {
-		return fmt.Errorf("failed to record S3 orphan: %w", err)
+		return time.Time{}, fmt.Errorf("failed to record S3 orphan: %w", err)
 	}
-	if applied {
-		// Best-effort discovery projection write. Same rationale as
-		// EnsureBlockGCCandidate: log on failure, do not abort GC.
-		if err := s.db.Session().Query(`
-			INSERT INTO gc_s3_orphans_by_day (first_seen_day, bucket, first_seen_at, org_id, block_id, storage_class)
-			VALUES (?, ?, ?, ?, ?, ?)
-		`, db.GCProjectionUTCDate(now), db.GCDiscoveryBucket(orgID.String(), blockID), now.UTC(), orgID.String(), blockID, storageClass).Exec(); err != nil {
-			log.Printf("[GC] WARNING: failed to write gc_s3_orphans_by_day discovery row for org=%s block=%s: %v", orgID, blockID, err)
+	effectiveFirstSeenAt := now.UTC()
+	effectiveStorageClass := storageClass
+	if !applied {
+		effectiveFirstSeenAt, err = casTimeValue(existing, "first_seen_at")
+		if err != nil {
+			return time.Time{}, err
 		}
-		return nil
+		if effectiveFirstSeenAt.IsZero() {
+			return time.Time{}, fmt.Errorf("gc_s3_orphans row for org=%s block=%s is missing first_seen_at", orgID, blockID)
+		}
+		effectiveStorageClass, err = casStringValue(existing, "storage_class")
+		if err != nil {
+			return time.Time{}, err
+		}
+		if effectiveStorageClass == "" {
+			effectiveStorageClass = storageClass
+		}
 	}
-	if errMsg == "" {
-		return nil
+	if err := s.upsertS3OrphanProjection(orgID, blockID, effectiveStorageClass, effectiveFirstSeenAt); err != nil {
+		return effectiveFirstSeenAt, fmt.Errorf("ensure gc_s3_orphans_by_day discovery row for org=%s block=%s: %w", orgID, blockID, err)
 	}
-	// Already exists — bump retry_count and last_attempt_at.
-	return s.UpdateS3OrphanAttempt(orgID, blockID, errMsg, now)
+	if !applied && errMsg != "" {
+		if err := s.UpdateS3OrphanAttempt(orgID, blockID, errMsg, now); err != nil {
+			return effectiveFirstSeenAt, err
+		}
+	}
+	return effectiveFirstSeenAt, nil
 }
 
 func (s *CassandraStore) UpdateS3OrphanAttempt(orgID uuid.UUID, blockID, errMsg string, now time.Time) error {
