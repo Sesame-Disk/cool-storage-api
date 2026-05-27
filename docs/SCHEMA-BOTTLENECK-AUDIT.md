@@ -175,6 +175,55 @@ ever measure single-day partitions approaching the soft limit.
 
 ---
 
+## H. Org-scoped `libraries` scans still walk tombstone-heavy partitions
+
+**Status**: open, medium-priority (introduced 2026-05-27)
+
+**Tables**: `libraries`, `libraries_by_owner`, `libraries_deleted_by_org`
+
+**Shape**: several code paths still read the canonical `libraries` partition by
+`org_id` and then filter in application code on `owner_id` or `deleted_at`.
+This is not `ALLOW FILTERING` in the CQL text, but on Cassandra 5 the resulting
+read path can still surface warnings that look like:
+
+```sql
+SELECT deleted_at, owner_id, storage_class
+FROM sesamefs.libraries
+WHERE org_id = <org>
+LIMIT 5000 ALLOW FILTERING
+```
+
+Representative callers:
+
+- `internal/gc/store_cassandra.go` — `ListLibrariesByOwner`, `ListLibrariesForOrg`
+- `internal/api/v2/enforcement.go` — `CountActiveLibraries`
+- `internal/middleware/permissions.go` — `GetUserLibraries`
+- `internal/api/v2/libraries.go` — `ownerHasActiveLibraryNamed`
+- `internal/api/v2/search.go` — org-scoped library search prefilter scans
+
+As of 2026-05-27, the deleted-library trash list/clean flows were moved to the
+`libraries_deleted_by_org` projection, so those routes no longer contribute to
+this canonical-partition scan pattern.
+
+**Risk**: orgs with heavy library churn (soft delete, restore, hard delete)
+accumulate `deleted_at` tombstones and row tombstones in the canonical
+partition. Repeated org-wide reads then produce noisy Cassandra warnings and
+more expensive partition walks in GC and quota/permission-adjacent paths.
+
+**Direction**:
+
+1. Keep deleted-library flows on `libraries_deleted_by_org` and do not regress
+	them back to canonical `libraries` scans.
+2. Move owner-centric enumeration to `libraries_by_owner` where the caller only
+	needs owned libraries.
+3. Introduce an explicit active-library count / projection for enforcement
+	instead of counting `deleted_at IS NULL` via org-wide scans.
+4. Audit any remaining org-wide canonical library scan and either replace it
+	with a read model that matches the access pattern or document why the scan is
+	still acceptable.
+
+---
+
 ## Closing The Loop
 
 When working any of the items above, add the associated `ISSUE-...-01` ID to

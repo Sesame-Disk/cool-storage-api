@@ -1,6 +1,6 @@
 # Known Issues - SesameFS
 
-**Last Updated**: 2026-05-26
+**Last Updated**: 2026-05-27
 
 This document tracks all known bugs, limitations, and issues in SesameFS.
 
@@ -2698,6 +2698,18 @@ That change addresses a different problem: stale active-org entries causing repe
 - Treat this as pending technical debt / operability work
 - Do not revert the current worker short-batch active-set removal
 - Do not add new hot-path exact recounts over `gc_queue`
+
+**Related Cassandra warning shape:**
+There is a separate but similar backlog item for org-scoped `libraries` reads that
+still scan tombstone-heavy partitions and can emit warning text such as:
+
+- `SELECT deleted_at, owner_id, storage_class FROM sesamefs.libraries WHERE org_id = ... LIMIT ... ALLOW FILTERING`
+
+That issue is tracked in [SCHEMA-BOTTLENECK-AUDIT.md](SCHEMA-BOTTLENECK-AUDIT.md).
+As of 2026-05-27, deleted-library trash list/clean paths were moved off the
+canonical `libraries` table onto `libraries_deleted_by_org`, but GC,
+enforcement, and ownership/enumeration paths still have remaining org-scoped
+partition scans to retire.
 
 **Files likely involved in the eventual fix:**
 - `internal/gc/gc.go`

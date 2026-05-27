@@ -1001,6 +1001,12 @@ This audit does **not** apply to the following tables, which do have live runtim
 
 That means the remaining split is intentional by access pattern, not a leftover `ALLOW FILTERING` gap in `GetUserLibraries` anymore.
 
+What still remains as separate debt is the org-scoped owned-library scan inside
+`GetUserLibraries`: it no longer uses `ALLOW FILTERING`, but it still walks the
+canonical `libraries` partition by `org_id` and filters by `owner_id` in Go.
+That is now tracked as a tombstone/partition-scan concern in
+`docs/SCHEMA-BOTTLENECK-AUDIT.md`, not as an `ALLOW FILTERING` regression.
+
 ---
 
 ## 17. Org Storage Policy: Migration And Operational Follow-ups — 🟡 Sys-admin and org-admin UI landed (2026-04-09)
