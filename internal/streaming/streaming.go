@@ -40,11 +40,37 @@ func PutCopyBuf(buf []byte) {
 	copyBufPool.Put(&buf)
 }
 
+// mappingResolveConcurrency bounds the number of in-flight single-row lookups
+// against block_id_mappings so a large file's block list cannot flood the driver.
+const mappingResolveConcurrency = 32
+
 // BatchResolveBlockIDs resolves all SHA-1 block IDs (40 chars) to SHA-256.
 // IDs that are already SHA-256 (64 chars) are returned as-is.
 // block_id_mappings is partitioned by ((org_id, external_id)), so each lookup
 // is a single-row read. Keep concurrency bounded to avoid pressuring the driver.
 func BatchResolveBlockIDs(database *db.DB, orgID string, blockIDs []string) []string {
+	return resolveBlockIDs(orgID, blockIDs, mappingResolveConcurrency, func(idx int) (string, error) {
+		var internalID string
+		err := database.Session().Query(`
+			SELECT internal_id FROM block_id_mappings
+			WHERE org_id = ? AND external_id = ?
+		`, orgID, blockIDs[idx]).Scan(&internalID)
+		return internalID, err
+	})
+}
+
+// resolveBlockIDs maps every 40-char SHA-1 entry of blockIDs to its internal
+// SHA-256 by calling lookup with bounded concurrency, preserving slice order.
+// 64-char SHA-256 IDs are left untouched and lookup is never called for them.
+// lookup must return gocql.ErrNotFound when no mapping row exists; that (and an
+// empty internal_id) leaves the original ID in place rather than being treated
+// as a hard failure. Other lookup errors are logged but likewise non-fatal, so
+// a single failed block never corrupts the resolution of its siblings.
+//
+// orgID is used only for log context. The DB-backed lookup is injected so the
+// concurrency/ordering/error-isolation logic stays unit-testable without a live
+// Cassandra (block_id_mappings has no in-process fake).
+func resolveBlockIDs(orgID string, blockIDs []string, maxConcurrency int, lookup func(idx int) (string, error)) []string {
 	resolved := make([]string, len(blockIDs))
 	copy(resolved, blockIDs)
 
@@ -65,10 +91,12 @@ func BatchResolveBlockIDs(database *db.DB, orgID string, blockIDs []string) []st
 		err        error
 	}
 
-	const mappingResolveConcurrency = 32
-	concurrency := mappingResolveConcurrency
+	concurrency := maxConcurrency
 	if concurrency > len(toResolve) {
 		concurrency = len(toResolve)
+	}
+	if concurrency < 1 {
+		concurrency = 1
 	}
 	sem := make(chan struct{}, concurrency)
 	results := make(chan lookupResult, len(toResolve))
@@ -77,11 +105,7 @@ func BatchResolveBlockIDs(database *db.DB, orgID string, blockIDs []string) []st
 		sem <- struct{}{}
 		go func(idx int) {
 			defer func() { <-sem }()
-			var internalID string
-			err := database.Session().Query(`
-				SELECT internal_id FROM block_id_mappings
-				WHERE org_id = ? AND external_id = ?
-			`, orgID, blockIDs[idx]).Scan(&internalID)
+			internalID, err := lookup(idx)
 			results <- lookupResult{idx: idx, internalID: internalID, err: err}
 		}(idx)
 	}

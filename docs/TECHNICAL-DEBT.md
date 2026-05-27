@@ -1474,9 +1474,12 @@ The two paths that relied on partition-scanning by org were rewritten:
 The old `ListBlocksForOrg` partition scan that served as a backfill safety net
 is gone; the new contract is that `DecrementBlockRefCountsOnce` →
 `enqueueZeroRefBlocks` → `gcBlockEnqueuer.EnqueueBlocks` →
-`EnsureBlockGCCandidate` is the only path a block ever takes into GC. The
-metric `gc_zero_ref_enqueue_failures_total` is the alertable signal that this
-contract was violated.
+`EnsureBlockGCCandidate` is the only path a block ever takes into GC.
+`gc_zero_ref_enqueue_failures_total` remains the alertable hard-failure signal
+that this contract was violated, while
+`gc_block_candidate_discovery_degraded_total{source=...}` captures the softer
+case where the canonical candidate row succeeded but the
+`gc_block_candidates_by_day` repair/write degraded.
 
 `streaming.QueryBlockSizes` was updated to use parallel single-row reads
 (`blockSizesConcurrency = 32`) instead of a 100-element `IN` query, because

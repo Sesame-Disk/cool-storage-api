@@ -530,13 +530,13 @@ Two paths previously relied on `WHERE org_id = ?` partition scans over `blocks`,
 - `gc_block_candidates_by_day (PRIMARY KEY ((candidate_day, bucket), candidate_at, org_id, block_id))` — the GC scanner walks this by `(day, bucket)` from a persisted cursor (`gc.scan.block_candidates.last_candidate_day`) so it never needs to enumerate all candidate orgs.
 - `gc_s3_orphans_by_day (PRIMARY KEY ((first_seen_day, bucket), first_seen_at, org_id, block_id))` — the worker's `RecoverS3Orphans` walks this from a persisted UTC-day cursor across all discovery buckets; on cold start it scans the full 90-day TTL horizon so old orphan rows are still recoverable.
 
-Both projections inherit the same TTL as their canonical table. The bucket count (`db.GCDiscoveryBucketCount = 32`) mirrors the pattern used by `gc_share_links_by_expiry`.
+`gc_s3_orphans_by_day` inherits the same 90-day TTL as `gc_s3_orphans`. `gc_block_candidates_by_day` has no TTL safety net, so delete paths carry `candidate_at` forward and remove that discovery row explicitly even if the canonical row disappeared first. The bucket count (`db.GCDiscoveryBucketCount = 32`) mirrors the pattern used by `gc_share_links_by_expiry`.
 
 #### Loss Of The Backfill Safety Net
 
 The old scanner could iterate `blocks WHERE org_id = ?` to find zero-ref rows whose `gc_block_candidates` entry never got written. That partition scan was removed because the new schema makes it expensive, and because the only legitimate path for a block to reach `ref_count=0` already runs through `DecrementBlockRefCountsOnce → enqueueZeroRefBlocks → gcBlockEnqueuer.EnqueueBlocks → EnsureBlockGCCandidate`.
 
-To make the loss observable instead of silent, every failure in that chain increments `gc_zero_ref_enqueue_failures_total{stage=...}`. Alert on sustained non-zero values: that metric is now the only signal that a block hit zero refcount without being registered in `gc_block_candidates`.
+To make the loss observable instead of silent, hard failures in that chain increment `gc_zero_ref_enqueue_failures_total{stage=...}`. Alert on sustained non-zero values there: those are the lost-to-GC cases where a zero-ref block did not reach pending GC state. Soft failures where the canonical candidate row succeeded but repairing `gc_block_candidates_by_day` degraded now increment `gc_block_candidate_discovery_degraded_total{source=...}` instead; treat that as a scanner safety-net degradation signal, not proof of lost GC work.
 
 #### Block-Size Lookups On The Read Path
 

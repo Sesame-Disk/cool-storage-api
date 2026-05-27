@@ -1010,7 +1010,9 @@ func (s *CassandraStore) EnsureBlockGCCandidate(orgID uuid.UUID, blockID, storag
 // discovery row. Callers should pass candidateAt when they already know it
 // (for example from QueueItem.QueuedAt or BlockGCCandidateInfo.CandidateAt) so
 // the discovery row can still be removed even if the canonical row is already
-// gone. A zero candidateAt falls back to reading the canonical row first.
+// gone. A zero candidateAt falls back to reading the canonical row first. If
+// that row is already gone too, the discovery-row primary key is unknown and
+// the cleanup degrades to a best-effort canonical delete plus a warning.
 func (s *CassandraStore) DeleteBlockGCCandidate(orgID uuid.UUID, blockID string, candidateAt time.Time) error {
 	if candidateAt.IsZero() {
 		err := s.db.Session().Query(`
@@ -1028,6 +1030,7 @@ func (s *CassandraStore) DeleteBlockGCCandidate(orgID uuid.UUID, blockID string,
 	}
 
 	if candidateAt.IsZero() {
+		log.Printf("[GC] WARNING: DeleteBlockGCCandidate called without candidate_at for org=%s block=%s and canonical row is already gone; gc_block_candidates_by_day cleanup skipped because the discovery key is unknown", orgID, blockID)
 		return nil
 	}
 	if err := s.db.Session().Query(`
@@ -1216,7 +1219,35 @@ func (s *CassandraStore) GetBlockRefCount(orgID uuid.UUID, blockID string) (int,
 	return refCount, err
 }
 
+// mappingResolveConcurrency bounds the number of in-flight single-row lookups
+// against block_id_mappings so a large fs_object's block list cannot flood the
+// driver. block_id_mappings is partitioned by ((org_id, external_id)), so each
+// lookup is a single-partition point read.
+const mappingResolveConcurrency = 32
+
 func (s *CassandraStore) ResolveBlockIDs(orgID uuid.UUID, blockIDs []string) ([]string, error) {
+	return resolveBlockIDsConcurrent(orgID, blockIDs, mappingResolveConcurrency, func(idx int) (string, error) {
+		var internalID string
+		err := s.db.Session().Query(`
+			SELECT internal_id FROM block_id_mappings
+			WHERE org_id = ? AND external_id = ?
+		`, orgID.String(), blockIDs[idx]).Scan(&internalID)
+		return internalID, err
+	})
+}
+
+// resolveBlockIDsConcurrent maps every 40-char SHA-1 entry of blockIDs to its
+// internal SHA-256 by calling lookup with bounded concurrency, preserving slice
+// order. 64-char SHA-256 IDs are left untouched and lookup is never called for
+// them. lookup must return gocql.ErrNotFound when no mapping row exists; that
+// (and an empty internal_id) leaves the original ID in place. Any other lookup
+// error is fatal: the function still drains every in-flight lookup, then returns
+// (nil, joinedErr) so callers never act on a partially-resolved slice.
+//
+// orgID is used only for error context. The DB-backed lookup is injected so the
+// concurrency/ordering/error semantics stay unit-testable without a live
+// Cassandra (block_id_mappings has no in-process fake).
+func resolveBlockIDsConcurrent(orgID uuid.UUID, blockIDs []string, maxConcurrency int, lookup func(idx int) (string, error)) ([]string, error) {
 	resolved := make([]string, len(blockIDs))
 	copy(resolved, blockIDs)
 
@@ -1236,10 +1267,12 @@ func (s *CassandraStore) ResolveBlockIDs(orgID uuid.UUID, blockIDs []string) ([]
 		err        error
 	}
 
-	const mappingResolveConcurrency = 32
-	concurrency := mappingResolveConcurrency
+	concurrency := maxConcurrency
 	if concurrency > len(toResolve) {
 		concurrency = len(toResolve)
+	}
+	if concurrency < 1 {
+		concurrency = 1
 	}
 	sem := make(chan struct{}, concurrency)
 	results := make(chan lookupResult, len(toResolve))
@@ -1248,11 +1281,7 @@ func (s *CassandraStore) ResolveBlockIDs(orgID uuid.UUID, blockIDs []string) ([]
 		sem <- struct{}{}
 		go func(idx int) {
 			defer func() { <-sem }()
-			var internalID string
-			err := s.db.Session().Query(`
-				SELECT internal_id FROM block_id_mappings
-				WHERE org_id = ? AND external_id = ?
-			`, orgID.String(), blockIDs[idx]).Scan(&internalID)
+			internalID, err := lookup(idx)
 			results <- lookupResult{idx: idx, internalID: internalID, err: err}
 		}(idx)
 	}

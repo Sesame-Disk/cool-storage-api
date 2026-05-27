@@ -1084,7 +1084,7 @@ Client ←── HTTP Response ←── [Block N streamed via 4MB io.CopyBuffer
 All download routes use the same streaming code:
 
 - `streaming.StreamBlocks(c, ctx, blockStore, resolvedIDs, fileKey, logPrefix)` — prefetch pipeline with 4MB buffers
-- `streaming.BatchResolveBlockIDs(db, orgID, blockIDs)` — batch Cassandra resolution
+- `streaming.BatchResolveBlockIDs(db, orgID, blockIDs)` — bounded concurrent Cassandra point-read resolution
 - `streaming.GetCopyBuf()` / `PutCopyBuf()` — 4MB `sync.Pool` buffers
 - `streaming.PrefetchBlock()` — goroutine-based block prefetch
 - `streaming.BlockReader` interface — satisfied by `*storage.BlockStore`
@@ -1110,14 +1110,14 @@ For encrypted libraries, the goroutine fetches AND decrypts the block.
 
 #### Batch Block ID Resolution
 
-SHA-1 block IDs (from Seafile clients) are translated to SHA-256 via `block_id_mappings` table. Instead of per-block queries, all IDs are resolved upfront using Cassandra `IN` queries in batches of 100:
+SHA-1 block IDs (from Seafile clients) are translated to SHA-256 via `block_id_mappings` table. Because that table is now partitioned by `((org_id, external_id))`, resolution uses bounded concurrent single-row reads (`mappingResolveConcurrency = 32`) instead of cross-partition `IN` queries:
 
 ```sql
-SELECT external_id, internal_id FROM block_id_mappings
-WHERE org_id = ? AND external_id IN ?
+SELECT internal_id FROM block_id_mappings
+WHERE org_id = ? AND external_id = ?
 ```
 
-For a 28 GB file with ~1,763 blocks: 18 queries instead of 1,763.
+For a 28 GB file with ~1,763 blocks, the path still resolves upfront before streaming, but it does so as up to 32 concurrent point reads instead of serial per-block lookups or partition-crossing `IN` batches.
 
 #### ZIP Directory Downloads
 
