@@ -1256,17 +1256,16 @@ func TestSyncHeadStaleAsyncStatsDoNotOverwriteCurrentHead(t *testing.T) {
 				t.Errorf("cleanup synthetic commit %s failed: %v", commitID, err)
 			}
 		}
-		// Delete synthetic fs_objects: heavy root + 256 child dirs + empty root.
-		fsIDs := make([]string, 0, 258)
+		// Delete synthetic fs_objects: heavy root + 256 child dirs + 256*256 file rows + empty root.
+		fsIDs := make([]string, 0, 258+256*256)
 		fsIDs = append(fsIDs, heavyRootFSID, emptyRootFSID)
 		for i := 0; i < 256; i++ {
 			fsIDs = append(fsIDs, fmt.Sprintf("%s-dir-%03d", heavyRootFSID, i))
-		}
-		for _, fsID := range fsIDs {
-			if err := session.Query(`DELETE FROM fs_objects WHERE library_id = ? AND fs_id = ?`, repoID, fsID).Exec(); err != nil {
-				t.Errorf("cleanup synthetic fs_object %s failed: %v", fsID, err)
+			for j := 0; j < 256; j++ {
+				fsIDs = append(fsIDs, fmt.Sprintf("%s-file-%03d-%03d", heavyRootFSID, i, j))
 			}
 		}
+		deleteSyntheticFSObjectsForTest(t, session, repoID, fsIDs)
 	})
 
 	resp := adminClient.Do(t, http.MethodPut, fmt.Sprintf("/seafhttp/repo/%s/commit/HEAD?head=%s", repoID, url.QueryEscape(heavyHead)), nil)
@@ -1354,12 +1353,11 @@ func TestSyncHeadUpdateAppliesStorageCountersBeforeReturning(t *testing.T) {
 		fsIDs := []string{nextRootFSID}
 		for dirIndex := 0; dirIndex < childDirCount; dirIndex++ {
 			fsIDs = append(fsIDs, fmt.Sprintf("%s-dir-%03d", nextRootFSID, dirIndex))
-		}
-		for _, fsID := range fsIDs {
-			if err := session.Query(`DELETE FROM fs_objects WHERE library_id = ? AND fs_id = ?`, repoID, fsID).Exec(); err != nil {
-				t.Errorf("cleanup synthetic fs_object %s failed: %v", fsID, err)
+			for fileIndex := 0; fileIndex < filesPerChild; fileIndex++ {
+				fsIDs = append(fsIDs, fmt.Sprintf("%s-file-%03d-%03d", nextRootFSID, dirIndex, fileIndex))
 			}
 		}
+		deleteSyntheticFSObjectsForTest(t, session, repoID, fsIDs)
 	})
 
 	resp := adminClient.Do(t, http.MethodPut, fmt.Sprintf("/seafhttp/repo/%s/commit/HEAD?head=%s", repoID, url.QueryEscape(nextHead)), nil)
@@ -1809,9 +1807,7 @@ type syntheticDirEntry struct {
 	Size int64  `json:"size,omitempty"`
 }
 
-func insertSyntheticDirectoryTreeForTest(t *testing.T, session interface {
-	Query(stmt string, values ...interface{}) *gocql.Query
-}, repoID, rootFSID string, childDirCount, filesPerChild int, fileSize int64) {
+func insertSyntheticDirectoryTreeForTest(t *testing.T, session *gocql.Session, repoID, rootFSID string, childDirCount, filesPerChild int, fileSize int64) {
 	t.Helper()
 
 	rootEntries := make([]syntheticDirEntry, 0, childDirCount)
@@ -1824,23 +1820,76 @@ func insertSyntheticDirectoryTreeForTest(t *testing.T, session interface {
 		})
 
 		childEntries := make([]syntheticDirEntry, 0, filesPerChild)
+		childFileFSIDs := make([]string, 0, filesPerChild)
 		for fileIndex := 0; fileIndex < filesPerChild; fileIndex++ {
+			fileFSID := fmt.Sprintf("%s-file-%03d-%03d", rootFSID, dirIndex, fileIndex)
+			childFileFSIDs = append(childFileFSIDs, fileFSID)
 			childEntries = append(childEntries, syntheticDirEntry{
-				ID:   fmt.Sprintf("%s-file-%03d-%03d", rootFSID, dirIndex, fileIndex),
+				ID:   fileFSID,
 				Name: fmt.Sprintf("file-%03d.dat", fileIndex),
 				Mode: 33188,
 				Size: fileSize,
 			})
 		}
+		insertSyntheticFileObjectsForTest(t, session, repoID, childFileFSIDs, fileSize)
 		insertSyntheticDirObjectForTest(t, session, repoID, childFSID, childEntries)
 	}
 
 	insertSyntheticDirObjectForTest(t, session, repoID, rootFSID, rootEntries)
 }
 
-func insertSyntheticDirObjectForTest(t *testing.T, session interface {
-	Query(stmt string, values ...interface{}) *gocql.Query
-}, repoID, fsID string, entries []syntheticDirEntry) {
+const syntheticFSObjectBatchSize = 128
+
+func insertSyntheticFileObjectsForTest(t *testing.T, session *gocql.Session, repoID string, fsIDs []string, size int64) {
+	t.Helper()
+	if len(fsIDs) == 0 {
+		return
+	}
+
+	for start := 0; start < len(fsIDs); start += syntheticFSObjectBatchSize {
+		end := start + syntheticFSObjectBatchSize
+		if end > len(fsIDs) {
+			end = len(fsIDs)
+		}
+
+		mtime := time.Now().Unix()
+		batch := session.Batch(gocql.UnloggedBatch)
+		for _, fsID := range fsIDs[start:end] {
+			batch.Query(`
+				INSERT INTO fs_objects (library_id, fs_id, obj_type, obj_name, full_path, size_bytes, mtime, block_ids)
+				VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+			`, repoID, fsID, "file", fsID, "/", size, mtime, []string{})
+		}
+		if err := session.ExecuteBatch(batch); err != nil {
+			t.Fatalf("failed to batch insert synthetic file fs_objects for %s: %v", repoID, err)
+		}
+	}
+}
+
+func deleteSyntheticFSObjectsForTest(t *testing.T, session *gocql.Session, repoID string, fsIDs []string) {
+	t.Helper()
+	if len(fsIDs) == 0 {
+		return
+	}
+
+	for start := 0; start < len(fsIDs); start += syntheticFSObjectBatchSize {
+		end := start + syntheticFSObjectBatchSize
+		if end > len(fsIDs) {
+			end = len(fsIDs)
+		}
+
+		batch := session.Batch(gocql.UnloggedBatch)
+		for _, fsID := range fsIDs[start:end] {
+			batch.Query(`DELETE FROM fs_objects WHERE library_id = ? AND fs_id = ?`, repoID, fsID)
+		}
+		if err := session.ExecuteBatch(batch); err != nil {
+			t.Errorf("cleanup synthetic fs_objects batch for %s failed: %v", repoID, err)
+			return
+		}
+	}
+}
+
+func insertSyntheticDirObjectForTest(t *testing.T, session *gocql.Session, repoID, fsID string, entries []syntheticDirEntry) {
 	t.Helper()
 
 	entriesJSON, err := json.Marshal(entries)
@@ -1855,9 +1904,7 @@ func insertSyntheticDirObjectForTest(t *testing.T, session interface {
 	}
 }
 
-func insertSyntheticFileObjectForTest(t *testing.T, session interface {
-	Query(stmt string, values ...interface{}) *gocql.Query
-}, repoID, fsID string, size int64) {
+func insertSyntheticFileObjectForTest(t *testing.T, session *gocql.Session, repoID, fsID string, size int64) {
 	t.Helper()
 	if err := session.Query(`
 		INSERT INTO fs_objects (library_id, fs_id, obj_type, obj_name, full_path, size_bytes, mtime, block_ids)
