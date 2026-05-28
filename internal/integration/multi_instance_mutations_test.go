@@ -681,10 +681,10 @@ func TestMultiInstanceSameRepoCopyReplaceCleansUpReplacedBlocks(t *testing.T) {
 
 	if !pollUntil(t, 15*time.Second, 250*time.Millisecond, func() bool {
 		for _, name := range fileNames {
-			if readBlockRefCount(t, orgID, sourceBlockIDs[name]) != 2 {
+			if readBlockRefCount(t, orgID, sourceBlockIDs[name]) != 1 {
 				return false
 			}
-			if readBlockRefCount(t, orgID, replacedBlockIDs[name]) > 0 {
+			if readBlockRefCount(t, orgID, replacedBlockIDs[name]) != 1 {
 				return false
 			}
 		}
@@ -693,7 +693,7 @@ func TestMultiInstanceSameRepoCopyReplaceCleansUpReplacedBlocks(t *testing.T) {
 		for _, name := range fileNames {
 			t.Logf("copy replace cleanup state for %s: source=%d replaced=%d", name, readBlockRefCount(t, orgID, sourceBlockIDs[name]), readBlockRefCount(t, orgID, replacedBlockIDs[name]))
 		}
-		t.Fatal("same-repo copy replace did not converge to expected ref_count state")
+		t.Fatal("same-repo copy replace did not converge to expected retained-version state")
 	}
 
 	expectEntriesPresent(t, repoID, "/dst", fileNames)

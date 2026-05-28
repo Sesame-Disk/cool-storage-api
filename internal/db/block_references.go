@@ -17,6 +17,7 @@ import (
 
 const (
 	blockReferrerFSObjectPrefix = "fs:"
+	blockReferrerPublishPrefix  = "pub:"
 	blockReferrerUploadPrefix   = "up:"
 
 	// ProvisionalBlockReferenceTTLSeconds bounds how long an in-flight upload's
@@ -37,6 +38,14 @@ const (
 // reference is naturally idempotent under client retries (no counter inflation).
 func BlockReferrerForFSObject(libraryID, fsID string) string {
 	return blockReferrerFSObjectPrefix + libraryID + ":" + fsID
+}
+
+// BlockReferrerForPublishAttempt builds a temporary referrer for an in-flight
+// metadata publish attempt: "pub:<attempt_id>". Writers use it while preparing
+// a new commit so a failed head-CAS cleanup can remove only the attempt-local
+// referrer instead of touching shared fs:<library>:<fs_id> rows.
+func BlockReferrerForPublishAttempt(attemptID string) string {
+	return blockReferrerPublishPrefix + attemptID
 }
 
 // BlockReferrerForUpload builds the provisional referrer for an in-flight upload:

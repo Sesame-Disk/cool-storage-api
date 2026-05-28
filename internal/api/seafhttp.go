@@ -1431,6 +1431,76 @@ func (h *SeafHTTPHandler) handleChunkedFinalizeError(token *AccessToken, tokenSt
 	upload.ResetFinalization()
 }
 
+func addPublishAttemptReferences(database *db.DB, orgID, repoID, attemptID string, blockIDs []string) error {
+	if database == nil || len(blockIDs) == 0 {
+		return nil
+	}
+	referrer := db.BlockReferrerForPublishAttempt(attemptID)
+	seen := make(map[string]struct{}, len(blockIDs))
+	for _, blockID := range blockIDs {
+		blockID = strings.TrimSpace(blockID)
+		if blockID == "" {
+			continue
+		}
+		if _, dup := seen[blockID]; dup {
+			continue
+		}
+		seen[blockID] = struct{}{}
+		if err := database.AddBlockReference(orgID, blockID, referrer, repoID, 0); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func removePublishAttemptReferences(database *db.DB, orgID, attemptID string, blockIDs []string) error {
+	if database == nil || len(blockIDs) == 0 {
+		return nil
+	}
+	referrer := db.BlockReferrerForPublishAttempt(attemptID)
+	seen := make(map[string]struct{}, len(blockIDs))
+	var removeErr error
+	for _, blockID := range blockIDs {
+		blockID = strings.TrimSpace(blockID)
+		if blockID == "" {
+			continue
+		}
+		if _, dup := seen[blockID]; dup {
+			continue
+		}
+		seen[blockID] = struct{}{}
+		if err := database.RemoveBlockReference(orgID, blockID, referrer); err != nil {
+			removeErr = errors.Join(removeErr, err)
+		}
+	}
+	return removeErr
+}
+
+func cleanupFailedPublishAttempt(database *db.DB, orgID, repoID, attemptID, commitID string, blockIDs []string) error {
+	if database == nil {
+		return nil
+	}
+	var cleanupErr error
+	if strings.TrimSpace(commitID) != "" {
+		if err := database.Session().Query(`
+			DELETE FROM commits WHERE library_id = ? AND commit_id = ?
+		`, repoID, commitID).Exec(); err != nil {
+			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("delete failed publish commit %s: %w", commitID, err))
+		}
+	}
+	if err := removePublishAttemptReferences(database, orgID, attemptID, blockIDs); err != nil {
+		cleanupErr = errors.Join(cleanupErr, fmt.Errorf("remove publish-attempt refs for %s: %w", attemptID, err))
+	}
+	return cleanupErr
+}
+
+func promotePublishedFSObjectReferences(fsHelper *v2.FSHelper, database *db.DB, orgID, repoID, fsID, attemptID string, blockIDs []string) error {
+	if err := fsHelper.RegisterFSObjectBlockReferences(orgID, repoID, fsID, blockIDs); err != nil {
+		return err
+	}
+	return removePublishAttemptReferences(database, orgID, attemptID, blockIDs)
+}
+
 func (h *SeafHTTPHandler) handleSingleShotMetadataError(token *AccessToken, internalBlockID string, err error) {
 	if err == nil || strings.TrimSpace(internalBlockID) == "" {
 		return
@@ -1856,34 +1926,45 @@ func (h *SeafHTTPHandler) commitUploadedFileMultiBlockOnce(orgID, repoID, userID
 		fullPath = parentDir + "/" + actualFilename
 	}
 
-	// Register permanent block references before the fs_object row (row-per-reference
-	// liveness). Fail-closed: if any block ID cannot be resolved, no fs_object is created.
-	if err := v2.NewFSHelper(h.db).RegisterFSObjectBlockReferences(orgID, repoID, fileFSID, blockIDs); err != nil {
-		return "", "", 0, 0, fmt.Errorf("failed to register block references: %w", err)
+	description := fmt.Sprintf("Added or modified \"%s\".\n", actualFilename)
+	commitData := fmt.Sprintf("%s:%s:%s:%d", repoID, newRootFSID, description, time.Now().UnixNano())
+	commitHash := sha1.Sum([]byte(commitData))
+	newCommitID := hex.EncodeToString(commitHash[:])
+
+	// Hold an attempt-local referrer while this commit races for the library HEAD.
+	// If the CAS loses, cleanup removes only this publish attempt instead of
+	// touching the shared fs:<library>:<fs_id> referrer that another winner may use.
+	if err := addPublishAttemptReferences(h.db, orgID, repoID, newCommitID, blockIDs); err != nil {
+		return "", "", 0, 0, fmt.Errorf("failed to stage publish-attempt block references: %w", err)
 	}
 	err = h.db.Session().Query(`
 		INSERT INTO fs_objects (library_id, fs_id, obj_type, obj_name, full_path, size_bytes, mtime, block_ids)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 	`, repoID, fileFSID, "file", actualFilename, fullPath, fileSize, time.Now().Unix(), blockIDs).Exec()
 	if err != nil {
+		_ = removePublishAttemptReferences(h.db, orgID, newCommitID, blockIDs)
 		return "", "", 0, 0, fmt.Errorf("failed to create file fs_object: %w", err)
 	}
-
-	description := fmt.Sprintf("Added or modified \"%s\".\n", actualFilename)
-	commitData := fmt.Sprintf("%s:%s:%s:%d", repoID, newRootFSID, description, time.Now().UnixNano())
-	commitHash := sha1.Sum([]byte(commitData))
-	newCommitID := hex.EncodeToString(commitHash[:])
 
 	err = h.db.Session().Query(`
 		INSERT INTO commits (library_id, commit_id, parent_id, root_fs_id, creator_id, description, created_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?)
 	`, repoID, newCommitID, snapshot.HeadCommitID, newRootFSID, userID, description, time.Now()).Exec()
 	if err != nil {
+		_ = removePublishAttemptReferences(h.db, orgID, newCommitID, blockIDs)
 		return "", "", 0, 0, fmt.Errorf("failed to create commit: %w", err)
 	}
 
 	if err := fsHelper.UpdateLibraryHeadFromSnapshot(snapshot, repoID, newCommitID, snapshot.HeadCommitID); err != nil {
+		if errors.Is(err, v2.ErrLibraryHeadConflict) {
+			if cleanupErr := cleanupFailedPublishAttempt(h.db, orgID, repoID, newCommitID, newCommitID, blockIDs); cleanupErr != nil {
+				return "", "", 0, 0, fmt.Errorf("failed to clean up conflict publish attempt %s: %w", newCommitID, cleanupErr)
+			}
+		}
 		return "", "", 0, 0, fmt.Errorf("failed to update library head: %w", err)
+	}
+	if err := promotePublishedFSObjectReferences(fsHelper, h.db, orgID, repoID, fileFSID, newCommitID, blockIDs); err != nil {
+		log.Printf("[commitUploadedFileMultiBlock] WARNING: head updated for repo=%s commit=%s but failed to promote block references for fs_object %s: %v", repoID, newCommitID, fileFSID, err)
 	}
 
 	log.Printf("[commitUploadedFileMultiBlock] Created commit %s with root %s", newCommitID, newRootFSID)
@@ -1985,35 +2066,43 @@ func (h *SeafHTTPHandler) commitUploadedFileOnce(orgID, repoID, userID, parentDi
 		fullPath = parentDir + "/" + actualFilename
 	}
 
-	// Register permanent block references before the fs_object row (row-per-reference
-	// liveness). Fail-closed: if the block ID cannot be resolved, no fs_object is created.
-	if err := v2.NewFSHelper(h.db).RegisterFSObjectBlockReferences(orgID, repoID, fileFSID, []string{blockID}); err != nil {
-		return "", "", 0, 0, fmt.Errorf("failed to register block references: %w", err)
+	description := fmt.Sprintf("Added or modified \"%s\".\n", actualFilename)
+	commitData := fmt.Sprintf("%s:%s:%s:%d", repoID, newRootFSID, description, time.Now().UnixNano())
+	commitHash := sha1.Sum([]byte(commitData))
+	newCommitID := hex.EncodeToString(commitHash[:])
+
+	if err := addPublishAttemptReferences(h.db, orgID, repoID, newCommitID, []string{blockID}); err != nil {
+		return "", "", 0, 0, fmt.Errorf("failed to stage publish-attempt block references: %w", err)
 	}
 	err = h.db.Session().Query(`
 		INSERT INTO fs_objects (library_id, fs_id, obj_type, obj_name, full_path, size_bytes, mtime, block_ids)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 	`, repoID, fileFSID, "file", actualFilename, fullPath, fileSize, time.Now().Unix(), []string{blockID}).Exec()
 	if err != nil {
+		_ = removePublishAttemptReferences(h.db, orgID, newCommitID, []string{blockID})
 		return "", "", 0, 0, fmt.Errorf("failed to create file fs_object: %w", err)
 	}
 	log.Printf("[commitUploadedFile] Created file fs_object: %s at %s", fileFSID, fullPath)
-
-	description := fmt.Sprintf("Added or modified \"%s\".\n", actualFilename)
-	commitData := fmt.Sprintf("%s:%s:%s:%d", repoID, newRootFSID, description, time.Now().UnixNano())
-	commitHash := sha1.Sum([]byte(commitData))
-	newCommitID := hex.EncodeToString(commitHash[:])
 
 	err = h.db.Session().Query(`
 		INSERT INTO commits (library_id, commit_id, parent_id, root_fs_id, creator_id, description, created_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?)
 	`, repoID, newCommitID, snapshot.HeadCommitID, newRootFSID, userID, description, time.Now()).Exec()
 	if err != nil {
+		_ = removePublishAttemptReferences(h.db, orgID, newCommitID, []string{blockID})
 		return "", "", 0, 0, fmt.Errorf("failed to create commit: %w", err)
 	}
 
 	if err := fsHelper.UpdateLibraryHeadFromSnapshot(snapshot, repoID, newCommitID, snapshot.HeadCommitID); err != nil {
+		if errors.Is(err, v2.ErrLibraryHeadConflict) {
+			if cleanupErr := cleanupFailedPublishAttempt(h.db, orgID, repoID, newCommitID, newCommitID, []string{blockID}); cleanupErr != nil {
+				return "", "", 0, 0, fmt.Errorf("failed to clean up conflict publish attempt %s: %w", newCommitID, cleanupErr)
+			}
+		}
 		return "", "", 0, 0, fmt.Errorf("failed to update library head: %w", err)
+	}
+	if err := promotePublishedFSObjectReferences(fsHelper, h.db, orgID, repoID, fileFSID, newCommitID, []string{blockID}); err != nil {
+		log.Printf("[commitUploadedFile] WARNING: head updated for repo=%s commit=%s but failed to promote block references for fs_object %s: %v", repoID, newCommitID, fileFSID, err)
 	}
 
 	log.Printf("[commitUploadedFile] Created commit %s with root %s", newCommitID, newRootFSID)
