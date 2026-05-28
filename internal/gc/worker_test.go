@@ -579,6 +579,51 @@ func TestWorker_ProcessFSObject_CascadeBlocks(t *testing.T) {
 	}
 }
 
+func TestWorker_ProcessBlock_ReReferencedClaimReleaseIsOwnedByCandidate(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	w := NewWorker(store, nil, q, 100, 0, false, stats)
+
+	orgID := uuid.New()
+	libID := uuid.New()
+	candidateAt := time.Now().Add(-2 * time.Hour).UTC()
+	blockHasRefsCalls := 0
+	store.blockHasReferencesHook = func(hookOrgID uuid.UUID, hookBlockID string, current bool) (bool, error) {
+		blockHasRefsCalls++
+		if blockHasRefsCalls == 1 {
+			return false, nil
+		}
+		store.AddFSObjectReferenceForTest(hookOrgID, hookBlockID, libID, "fs-live")
+		return true, nil
+	}
+
+	store.AddBlock(orgID, "blk-rereferenced", "hot", 0)
+	store.AddBlockGCCandidate(orgID, "blk-rereferenced", "hot", candidateAt)
+	store.EnqueueItem(orgID, candidateAt, ItemBlock, "blk-rereferenced", libID, "hot", 0)
+
+	n, err := w.ProcessOnce(context.Background())
+	if err != nil {
+		t.Fatalf("ProcessOnce failed: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("expected 1 processed item, got %d", n)
+	}
+	block := store.GetBlock(orgID, "blk-rereferenced")
+	if block == nil {
+		t.Fatal("block should remain after re-reference")
+	}
+	if block.GCState != "" || block.GCClaimID != "" {
+		t.Fatalf("claim should be released after re-reference, got state=%q claim=%q", block.GCState, block.GCClaimID)
+	}
+	if got := len(store.AllBlockGCCandidates()); got != 0 {
+		t.Fatalf("expected candidate cleanup after re-reference, got %d", got)
+	}
+	if blockHasRefsCalls != 2 {
+		t.Fatalf("expected 2 block reference checks, got %d", blockHasRefsCalls)
+	}
+}
+
 func TestWorker_ProcessFSObject_CascadesDirEntries(t *testing.T) {
 	store := NewMockStore()
 	stats := &Stats{}

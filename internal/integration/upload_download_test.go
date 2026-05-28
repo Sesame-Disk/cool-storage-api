@@ -348,7 +348,7 @@ func TestDownloadLinkURL(t *testing.T) {
 	}
 }
 
-func TestDuplicateSeafhttpUploadIncrementsBlockRefCount(t *testing.T) {
+func TestDuplicateSeafhttpUploadDeduplicatesBlockReference(t *testing.T) {
 	name := fmt.Sprintf("inttest-dedup-refcount-%d", time.Now().UnixNano())
 	repoID := createTestLibrary(t, adminClient, name)
 
@@ -360,20 +360,14 @@ func TestDuplicateSeafhttpUploadIncrementsBlockRefCount(t *testing.T) {
 	uploadFileThroughLink(t, adminClient, uploadURL, "dup-a.txt", "/", fileContent)
 	uploadFileThroughLink(t, adminClient, uploadURL, "dup-b.txt", "/", fileContent)
 
-	session := shareProjectionDBForTest(t).Session()
-	var orgID string
-	if err := session.Query(`SELECT org_id FROM libraries_by_id WHERE library_id = ?`, repoID).Scan(&orgID); err != nil {
-		t.Fatalf("failed to resolve org_id for repo %s: %v", repoID, err)
-	}
-
+	orgID := resolveOrgID(t, repoID)
 	hash := sha256.Sum256([]byte(fileContent))
 	blockID := hex.EncodeToString(hash[:])
-	var refCount int
-	if err := session.Query(`SELECT ref_count FROM blocks WHERE org_id = ? AND block_id = ?`, orgID, blockID).Scan(&refCount); err != nil {
-		t.Fatalf("failed to read block ref_count for %s: %v", blockID, err)
-	}
-	if refCount != 2 {
-		t.Fatalf("ref_count after duplicate uploads = %d, want 2", refCount)
+	// Both files have identical content → identical fs_id → they SHARE the single
+	// permanent fs:<lib>:<fs_id> reference (dedup). The block stays alive with one
+	// reference, not two — there is no per-file counter to increment.
+	if refCount := readBlockRefCount(t, orgID, blockID); refCount != 1 {
+		t.Fatalf("references after duplicate uploads = %d, want 1 (shared fs_id)", refCount)
 	}
 }
 
@@ -775,19 +769,11 @@ func TestV2DirectUploadRoundTrip(t *testing.T) {
 		t.Fatalf("file %q not found in directory listing after v2 upload", fileName)
 	}
 
-	// Block ref_count must be 1 (one unique write).
-	session := shareProjectionDBForTest(t).Session()
-	var orgID string
-	if err := session.Query(`SELECT org_id FROM libraries_by_id WHERE library_id = ?`, repoID).Scan(&orgID); err != nil {
-		t.Fatalf("failed to resolve org_id for repo %s: %v", repoID, err)
-	}
+	// The single file's block has exactly one permanent fs_object reference.
+	orgID := resolveOrgID(t, repoID)
 	hash := sha256.Sum256([]byte(fileContent))
 	blockID := hex.EncodeToString(hash[:])
-	var refCount int
-	if err := session.Query(`SELECT ref_count FROM blocks WHERE org_id = ? AND block_id = ?`, orgID, blockID).Scan(&refCount); err != nil {
-		t.Fatalf("failed to read block ref_count for block %s: %v", blockID, err)
-	}
-	if refCount != 1 {
-		t.Fatalf("ref_count after v2 upload = %d, want 1", refCount)
+	if refCount := readBlockRefCount(t, orgID, blockID); refCount != 1 {
+		t.Fatalf("references after v2 upload = %d, want 1", refCount)
 	}
 }

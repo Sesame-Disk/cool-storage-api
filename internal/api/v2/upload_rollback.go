@@ -13,11 +13,11 @@ var rollbackUploadedBlockRefsFn = RollbackUploadedBlockRefs
 // aborted upload's blocks and enqueues any that became unreferenced for GC.
 // It is idempotent (removing a missing reference is a no-op), so a retried
 // rollback is always safe.
-func RollbackUploadedBlockRefs(database *db.DB, orgID, repoID string, blockIDs []string) {
+func RollbackUploadedBlockRefs(database *db.DB, orgID, repoID, operationID string, blockIDs []string) {
 	if database == nil || len(blockIDs) == 0 {
 		return
 	}
-	zeroRefBlocks := NewFSHelper(database).ReleaseUploadReferences(orgID, repoID, blockIDs)
+	zeroRefBlocks := NewFSHelper(database).ReleaseUploadReferences(orgID, repoID, operationID, blockIDs)
 	if len(zeroRefBlocks) == 0 {
 		return
 	}
@@ -25,12 +25,12 @@ func RollbackUploadedBlockRefs(database *db.DB, orgID, repoID string, blockIDs [
 	enqueueZeroRefBlocks(database, orgID, repoID, zeroRefBlocks)
 }
 
-func handleStoredUploadMetadataError(database *db.DB, orgID, repoID, fileID string, internalBlockIDs []string, err error) {
+func handleStoredUploadMetadataError(database *db.DB, orgID, repoID, operationID string, internalBlockIDs []string, err error) {
 	if err == nil || len(internalBlockIDs) == 0 {
 		return
 	}
 	if errors.Is(err, ErrLibraryHeadPublicationUnknown) {
 		return
 	}
-	rollbackUploadedBlockRefsFn(database, orgID, repoID, internalBlockIDs)
+	rollbackUploadedBlockRefsFn(database, orgID, repoID, operationID, internalBlockIDs)
 }

@@ -264,7 +264,7 @@ func TestWorker_RecoverS3Orphans_SkipsClaimedRows(t *testing.T) {
 
 	orgID := uuid.New()
 	store.AddBlock(orgID, "orph-claimed", "hot", 0)
-	applied, err := store.ClaimBlockDelete(orgID, "orph-claimed")
+	applied, err := store.ClaimBlockDelete(orgID, "orph-claimed", "claim-1")
 	if err != nil || !applied {
 		t.Fatalf("claim block delete: applied=%v err=%v", applied, err)
 	}

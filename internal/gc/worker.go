@@ -349,6 +349,7 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 	}
 
 	candidateAt := effectiveIdentityAt(item.QueuedAt, item.IdentityAt)
+	claimID := blockDeleteClaimID(candidateAt)
 
 	// Pre-check: a block is alive iff it still has reference rows. This single-
 	// partition point read replaces the old per-org full scan of live fs_objects.
@@ -365,9 +366,10 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 		return nil
 	}
 
-	// 1. Claim the block (gc_state='deleting') via LWT. We defer the physical
-	// DELETE until after we've persisted S3-recovery state.
-	applied, err := w.store.ClaimBlockDelete(item.OrgID, item.ItemID)
+	// 1. Claim the block (gc_state='deleting') via LWT. claimID is stable for one
+	// logical candidate so retries of the same item remain the owner, but a
+	// different attempt cannot release or finalize another attempt's claim.
+	applied, err := w.store.ClaimBlockDelete(item.OrgID, item.ItemID, claimID)
 	if err != nil {
 		return fmt.Errorf("failed to claim block record for deletion: %w", err)
 	}
@@ -388,8 +390,8 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 		return fmt.Errorf("failed to re-check block references for %s: %w", item.ItemID, err)
 	}
 	if hasRefs {
-		if relErr := w.store.ReleaseBlockClaim(item.OrgID, item.ItemID); relErr != nil {
-			log.Printf("[GC Worker] WARNING: failed to release claim on re-referenced block %s: %v", item.ItemID, relErr)
+		if relErr := w.store.ReleaseBlockClaim(item.OrgID, item.ItemID, claimID); relErr != nil {
+			return fmt.Errorf("failed to release claim on re-referenced block %s: %w", item.ItemID, relErr)
 		}
 		if err := w.store.DeleteBlockGCCandidate(item.OrgID, item.ItemID, candidateAt); err != nil {
 			return fmt.Errorf("failed to clear block GC candidate after re-reference: %w", err)
@@ -413,7 +415,7 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 
 	// 4. Now remove the claimed DB row. If this fails, the row stays at -999 and
 	// the queue item will retry; the pending S3 row already preserves recovery state.
-	if err := w.store.FinalizeBlockDelete(item.OrgID, item.ItemID); err != nil {
+	if err := w.store.FinalizeBlockDelete(item.OrgID, item.ItemID, claimID); err != nil {
 		return fmt.Errorf("failed to finalize claimed block delete for %s: %w", item.ItemID, err)
 	}
 
@@ -452,6 +454,10 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 	metrics.GCAuditEventsTotal.WithLabelValues("gc_block_deleted").Inc()
 	log.Printf("[GC Worker] Deleted block %s", item.ItemID)
 	return nil
+}
+
+func blockDeleteClaimID(candidateAt time.Time) string {
+	return candidateAt.UTC().Format(time.RFC3339Nano)
 }
 
 // deleteS3WithRetry attempts to delete a block from S3 with exponential backoff.

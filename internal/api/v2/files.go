@@ -29,6 +29,7 @@ import (
 	"github.com/Sesame-Disk/sesamefs/internal/traffic"
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 )
 
 // TokenCreator is an interface for creating access tokens
@@ -2681,6 +2682,7 @@ func (h *FileHandler) UploadFile(c *gin.Context) {
 	filename := header.Filename
 
 	fsHelper := NewFSHelper(h.db)
+	uploadOperationID := uuid.NewString()
 
 	// Get the current visible storage delta before storing the block so quota is
 	// enforced against the live directory state (replace vs autorename).
@@ -2763,15 +2765,19 @@ func (h *FileHandler) UploadFile(c *gin.Context) {
 
 	// Register block metadata + a provisional reference (kept alive by TTL until
 	// the fs_object commit below creates the permanent reference).
-	if err := fsHelper.RegisterUploadedBlock(orgID, repoID, sha256ID, len(storedContent), storageClass, ""); err != nil {
+	if err := fsHelper.RegisterUploadedBlock(orgID, repoID, sha256ID, uploadOperationID, len(storedContent), storageClass, ""); err != nil {
 		log.Printf("[UploadFile] CRITICAL: failed to register block org=%s block=%s: %v", orgID, sha256ID[:16], err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to store block metadata"})
+		if errors.Is(err, ErrBlockDeleteInProgress) {
+			writeUploadFileError(c, err)
+		} else {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to store block metadata"})
+		}
 		return
 	}
 
 	actualFilename, storageDeltaBytes, storageDeltaFiles, err := h.finalizeStoredUploadMetadata(orgID, userID, repoID, parentDir, filename, fileID, fileSize, replace)
 	if err != nil {
-		handleStoredUploadMetadataError(h.db, orgID, repoID, fileID, []string{sha256ID}, err)
+		handleStoredUploadMetadataError(h.db, orgID, repoID, uploadOperationID, []string{sha256ID}, err)
 		writeUploadFileError(c, err)
 		return
 	}
@@ -2799,6 +2805,8 @@ func writeUploadFileError(c *gin.Context, err error) {
 		// in frontend/src/utils/upload-finalization.js). Keep the wording in
 		// sync across both places.
 		c.JSON(http.StatusConflict, gin.H{"error": "library was modified concurrently; retry the upload"})
+	case errors.Is(err, ErrBlockDeleteInProgress):
+		c.JSON(http.StatusConflict, gin.H{"error": "block is being deleted; retry the upload"})
 	case errors.Is(err, errUploadStorageQuotaExceeded):
 		c.JSON(http.StatusForbidden, gin.H{"error": "storage quota exceeded"})
 	default:

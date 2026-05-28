@@ -39,6 +39,11 @@ var ErrStorageQuotaExceeded = errors.New("storage quota exceeded")
 // attribute the visible state to this operation.
 var ErrBlockMutationOutcomeUnknown = errors.New("block ref-count mutation outcome is unknown")
 
+// ErrBlockDeleteInProgress indicates the GC worker has claimed the block for
+// deletion. Callers should retry from the full upload/store path so S3 PUT and
+// provisional-reference registration happen after the claim clears.
+var ErrBlockDeleteInProgress = errors.New("block delete is in progress")
+
 // NewFSHelper creates a new FSHelper instance
 func NewFSHelper(database *db.DB) *FSHelper {
 	return &FSHelper{db: database}
@@ -853,38 +858,35 @@ func (h *FSHelper) resolveStoredBlockIDs(orgID string, blockIDs []string) ([]str
 // cannot leak the block forever. Liveness is row-based (no mutable counter), so
 // a client retry that re-uploads the same block is naturally idempotent.
 //
-// blockID must already be the internal (SHA-256) ID. The reference is written
-// BEFORE the metadata read so that a concurrent GC claim-then-verify observes it.
-// If the GC worker has claimed the block for deletion (gc_state='deleting'), this
-// backs off and retries so the new reference is not lost to an in-flight delete —
-// the row-per-reference analogue of the old sentinel (-999) backoff.
-func (h *FSHelper) RegisterUploadedBlock(orgID, libraryID, blockID string, sizeBytes int, storageClass, storageKey string) error {
-	const maxRetries = 10
-	referrer := db.BlockReferrerForUpload(libraryID + ":" + blockID)
+// blockID must already be the internal (SHA-256) ID. operationID must identify
+// the specific upload/session/rollback flow that owns the provisional ref so a
+// rollback only removes its own pin. The reference is written BEFORE the
+// metadata read so that a concurrent GC claim-then-verify observes it. If the
+// GC worker has already claimed the block for deletion (gc_state='deleting'),
+// the provisional reference is removed again and the caller gets a retryable
+// error so it can restart from the full upload/store path.
+func (h *FSHelper) RegisterUploadedBlock(orgID, libraryID, blockID, operationID string, sizeBytes int, storageClass, storageKey string) error {
+	referrer := db.BlockReferrerForUpload(operationID)
 
-	for attempt := 0; attempt < maxRetries; attempt++ {
-		if err := h.db.AddBlockReference(orgID, blockID, referrer, libraryID, db.ProvisionalBlockReferenceTTLSeconds); err != nil {
-			return fmt.Errorf("add provisional block reference for %s: %w", blockID, err)
-		}
-
-		gcState, err := h.db.BlockGCState(orgID, blockID)
-		if err != nil {
-			return fmt.Errorf("read block gc_state for %s: %w", blockID, err)
-		}
-		if gcState == db.BlockGCStateDeleting {
-			// GC is mid-delete; wait for it to finish (row deleted or claim
-			// released), then retry so we re-create fresh metadata under our
-			// reference instead of racing the unconditional DELETE.
-			time.Sleep(time.Duration(50<<uint(attempt)) * time.Millisecond) // 50ms, 100ms, 200ms, ...
-			continue
-		}
-
-		if err := h.db.UpsertBlockMetadata(orgID, blockID, sizeBytes, storageClass, storageKey); err != nil {
-			return fmt.Errorf("upsert block metadata for %s: %w", blockID, err)
-		}
-		return nil
+	if err := h.db.AddBlockReference(orgID, blockID, referrer, libraryID, db.ProvisionalBlockReferenceTTLSeconds); err != nil {
+		return fmt.Errorf("add provisional block reference for %s: %w", blockID, err)
 	}
-	return fmt.Errorf("register uploaded block %s: gc_state stuck in %q after %d retries", blockID, db.BlockGCStateDeleting, maxRetries)
+
+	gcState, err := h.db.BlockGCState(orgID, blockID)
+	if err != nil {
+		return fmt.Errorf("read block gc_state for %s: %w", blockID, err)
+	}
+	if gcState == db.BlockGCStateDeleting {
+		if err := h.db.RemoveBlockReference(orgID, blockID, referrer); err != nil {
+			log.Printf("[RegisterUploadedBlock] WARNING: failed to remove provisional reference for block %s after observing gc_state=%q: %v", blockID, gcState, err)
+		}
+		return fmt.Errorf("%w: block %s is currently claimed by GC", ErrBlockDeleteInProgress, blockID)
+	}
+
+	if err := h.db.UpsertBlockMetadata(orgID, blockID, sizeBytes, storageClass, storageKey); err != nil {
+		return fmt.Errorf("upsert block metadata for %s: %w", blockID, err)
+	}
+	return nil
 }
 
 // RegisterFSObjectBlockReferences creates the permanent reference rows for every
@@ -918,12 +920,13 @@ func (h *FSHelper) RegisterFSObjectBlockReferences(orgID, libraryID, fsID string
 // ReleaseUploadReferences removes the provisional upload references for blocks of
 // an aborted upload and returns the block IDs that are now unreferenced, so the
 // caller can enqueue them for GC. blockIDs must be internal (SHA-256) IDs (the
-// same IDs used when the provisional reference was created). Idempotent: removing
-// a missing reference is a no-op, so a retried rollback is safe.
-func (h *FSHelper) ReleaseUploadReferences(orgID, libraryID string, blockIDs []string) []string {
+// same IDs used when the provisional reference was created). operationID must be
+// the same upload/session identity used at registration time. Idempotent:
+// removing a missing reference is a no-op, so a retried rollback is safe.
+func (h *FSHelper) ReleaseUploadReferences(orgID, libraryID, operationID string, blockIDs []string) []string {
+	referrer := db.BlockReferrerForUpload(operationID)
 	var zeroRefBlocks []string
 	for _, blockID := range blockIDs {
-		referrer := db.BlockReferrerForUpload(libraryID + ":" + blockID)
 		if err := h.db.RemoveBlockReference(orgID, blockID, referrer); err != nil {
 			log.Printf("[ReleaseUploadReferences] WARNING: failed to remove provisional reference for block %s: %v", blockID, err)
 			continue

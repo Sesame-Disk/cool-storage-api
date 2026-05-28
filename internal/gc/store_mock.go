@@ -150,6 +150,7 @@ type MockStore struct {
 	acquireOrgHardDeleteLockHook   func(orgID uuid.UUID)
 	beginOrgPurgeHook              func(orgID uuid.UUID)
 	getBlockRefCountErr            error
+	blockHasReferencesHook         func(orgID uuid.UUID, blockID string, current bool) (bool, error)
 
 	// optional test hooks for reproducing concurrency windows deterministically.
 	getQueueSizeHook      func(orgID uuid.UUID, size int)
@@ -190,6 +191,7 @@ type mockBlock struct {
 	BlockID      string
 	StorageClass string
 	GCState      string
+	GCClaimID    string
 }
 
 type mockPendingItemKey struct {
@@ -1478,8 +1480,13 @@ func (m *MockStore) BlockExists(orgID uuid.UUID, blockID string) (bool, error) {
 
 func (m *MockStore) BlockHasReferences(orgID uuid.UUID, blockID string) (bool, error) {
 	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return len(m.blockReferences[fmt.Sprintf("%s:%s", orgID, blockID)]) > 0, nil
+	current := len(m.blockReferences[fmt.Sprintf("%s:%s", orgID, blockID)]) > 0
+	hook := m.blockHasReferencesHook
+	m.mu.RUnlock()
+	if hook != nil {
+		return hook(orgID, blockID, current)
+	}
+	return current, nil
 }
 
 func (m *MockStore) RemoveBlockReference(orgID uuid.UUID, blockID, referrer string) error {
@@ -1592,7 +1599,7 @@ func (m *MockStore) ListBlockGCCandidatesByDay(day time.Time, bucket int) ([]Blo
 	return candidates, nil
 }
 
-func (m *MockStore) ClaimBlockDelete(orgID uuid.UUID, blockID string) (bool, error) {
+func (m *MockStore) ClaimBlockDelete(orgID uuid.UUID, blockID, claimID string) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -1601,26 +1608,37 @@ func (m *MockStore) ClaimBlockDelete(orgID uuid.UUID, blockID string) (bool, err
 	if !ok {
 		return false, nil
 	}
-	// Idempotent claim on gc_state: succeed whether unset or already 'deleting'.
+	if b.GCState == db.BlockGCStateDeleting {
+		return b.GCClaimID == claimID, nil
+	}
 	b.GCState = db.BlockGCStateDeleting
+	b.GCClaimID = claimID
 	return true, nil
 }
 
-func (m *MockStore) ReleaseBlockClaim(orgID uuid.UUID, blockID string) error {
+func (m *MockStore) ReleaseBlockClaim(orgID uuid.UUID, blockID, claimID string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	if b, ok := m.blocks[fmt.Sprintf("%s:%s", orgID, blockID)]; ok {
+		if b.GCState != db.BlockGCStateDeleting || b.GCClaimID != claimID {
+			return fmt.Errorf("block delete claim release not applied for %s", blockID)
+		}
 		b.GCState = ""
+		b.GCClaimID = ""
+		return nil
 	}
-	return nil
+	return fmt.Errorf("block delete claim release not applied for %s", blockID)
 }
 
-func (m *MockStore) FinalizeBlockDelete(orgID uuid.UUID, blockID string) error {
+func (m *MockStore) FinalizeBlockDelete(orgID uuid.UUID, blockID, claimID string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	key := fmt.Sprintf("%s:%s", orgID, blockID)
+	if b, ok := m.blocks[key]; !ok || b.GCState != db.BlockGCStateDeleting || b.GCClaimID != claimID {
+		return fmt.Errorf("block delete finalize not applied for %s", blockID)
+	}
 	delete(m.blocks, key)
 	return nil
 }

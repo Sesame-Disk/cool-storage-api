@@ -18,6 +18,7 @@ import (
 	"time"
 
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
+	"github.com/google/uuid"
 
 	v2 "github.com/Sesame-Disk/sesamefs/internal/api/v2"
 	"github.com/Sesame-Disk/sesamefs/internal/apikeys"
@@ -899,9 +900,14 @@ func (h *SyncHandler) PutBlock(c *gin.Context) {
 
 		// Store block metadata + a provisional reference (kept alive by TTL until
 		// the fs_object commit creates the permanent reference).
-		if err := v2.NewFSHelper(h.db).RegisterUploadedBlock(orgID, repoID, internalID, len(data), storageClass, ""); err != nil {
+		operationID := uuid.NewString()
+		if err := v2.NewFSHelper(h.db).RegisterUploadedBlock(orgID, repoID, internalID, operationID, len(data), storageClass, ""); err != nil {
 			log.Printf("PutBlock: failed to store block metadata org=%s block=%s: %v", orgID, internalID, err)
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to store block metadata"})
+			if errors.Is(err, v2.ErrBlockDeleteInProgress) {
+				c.JSON(http.StatusConflict, gin.H{"error": "block is being deleted; retry the upload"})
+			} else {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to store block metadata"})
+			}
 			return
 		}
 

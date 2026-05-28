@@ -67,13 +67,16 @@ type GCStore interface {
 	RemoveBlockReference(orgID uuid.UUID, blockID, referrer string) error
 	ResolveBlockIDs(orgID uuid.UUID, blockIDs []string) ([]string, error)
 	// ClaimBlockDelete atomically marks the block row gc_state='deleting' via LWT
-	// when it is not already claimed. Callers MUST re-check BlockHasReferences
-	// after a successful claim before deleting from S3 (claim-then-verify).
-	ClaimBlockDelete(orgID uuid.UUID, blockID string) (bool, error)
-	// ReleaseBlockClaim clears gc_state when a claim must be abandoned because a
-	// concurrent reference appeared between the claim and the verify step.
-	ReleaseBlockClaim(orgID uuid.UUID, blockID string) error
-	FinalizeBlockDelete(orgID uuid.UUID, blockID string) error
+	// and records the deterministic claimID for the logical delete attempt.
+	// Callers MUST re-check BlockHasReferences after a successful claim before
+	// deleting from S3 (claim-then-verify).
+	ClaimBlockDelete(orgID uuid.UUID, blockID, claimID string) (bool, error)
+	// ReleaseBlockClaim clears gc_state only when the same claimID still owns the
+	// row. This prevents another attempt from releasing a claim it did not win.
+	ReleaseBlockClaim(orgID uuid.UUID, blockID, claimID string) error
+	// FinalizeBlockDelete removes the block row only when the same claimID still
+	// owns the row.
+	FinalizeBlockDelete(orgID uuid.UUID, blockID, claimID string) error
 	DeleteBlockMapping(orgID uuid.UUID, externalID string) error
 	EnsureBlockGCCandidate(orgID uuid.UUID, blockID, storageClass string, candidateAt time.Time) (time.Time, error)
 	DeleteBlockGCCandidate(orgID uuid.UUID, blockID string, candidateAt time.Time) error

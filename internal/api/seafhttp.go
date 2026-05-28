@@ -1341,16 +1341,16 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 
 	// Register block metadata + a provisional reference (kept alive by TTL until
 	// the fs_object commit creates the permanent reference).
-	if err := v2.NewFSHelper(h.db).RegisterUploadedBlock(token.OrgID, token.RepoID, sha256ID, len(storedContent), actualStorageClass, ""); err != nil {
+	if err := v2.NewFSHelper(h.db).RegisterUploadedBlock(token.OrgID, token.RepoID, sha256ID, token.Token, len(storedContent), actualStorageClass, ""); err != nil {
 		log.Printf("[HandleUpload] CRITICAL: Failed to write block metadata org=%s block=%s: %v", token.OrgID, sha256ID[:16], err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to store block metadata"})
+		writeSeafHTTPUploadError(c, err, "failed to store block metadata")
 		return
 	}
 
 	// Update filesystem metadata
 	commitID, actualFilename, storageDeltaBytes, storageDeltaFiles, err := h.commitUploadedFile(token.OrgID, token.RepoID, token.UserID, parentDir, filename, fileID, chunkData, finalSize, replaceFile)
 	if err != nil {
-		h.handleSingleShotMetadataError(token, fileID, sha256ID, err)
+		h.handleSingleShotMetadataError(token, sha256ID, err)
 		log.Printf("[HandleUpload] Failed to update filesystem: %v", err)
 		writeSeafHTTPUploadError(c, err, "file stored but metadata update failed")
 		return
@@ -1411,6 +1411,8 @@ func (h *SeafHTTPHandler) handleChunkedFinalizeError(token *AccessToken, tokenSt
 		scope = "seafhttp_chunk_quota"
 	case errors.Is(err, v2.ErrBlockMutationOutcomeUnknown):
 		scope = "seafhttp_chunk_block_unknown"
+	case errors.Is(err, v2.ErrBlockDeleteInProgress):
+		scope = ""
 	}
 	if scope != "" {
 		accountedBlockIDs := upload.AccountedBlockIDs()
@@ -1419,6 +1421,7 @@ func (h *SeafHTTPHandler) handleChunkedFinalizeError(token *AccessToken, tokenSt
 				h.db,
 				token.OrgID,
 				token.RepoID,
+				tokenStr,
 				accountedBlockIDs,
 			)
 		}
@@ -1428,7 +1431,7 @@ func (h *SeafHTTPHandler) handleChunkedFinalizeError(token *AccessToken, tokenSt
 	upload.ResetFinalization()
 }
 
-func (h *SeafHTTPHandler) handleSingleShotMetadataError(token *AccessToken, fileID, internalBlockID string, err error) {
+func (h *SeafHTTPHandler) handleSingleShotMetadataError(token *AccessToken, internalBlockID string, err error) {
 	if err == nil || strings.TrimSpace(internalBlockID) == "" {
 		return
 	}
@@ -1439,6 +1442,7 @@ func (h *SeafHTTPHandler) handleSingleShotMetadataError(token *AccessToken, file
 		h.db,
 		token.OrgID,
 		token.RepoID,
+		token.Token,
 		[]string{internalBlockID},
 	)
 }
@@ -1452,6 +1456,8 @@ func writeSeafHTTPUploadError(c *gin.Context, err error, genericMsg string) {
 		// in frontend/src/utils/upload-finalization.js). Keep the wording in
 		// sync across both places.
 		c.JSON(http.StatusConflict, gin.H{"error": "library was modified concurrently; retry the upload"})
+	case errors.Is(err, v2.ErrBlockDeleteInProgress):
+		c.JSON(http.StatusConflict, gin.H{"error": "block is being deleted; retry the upload"})
 	case errors.Is(err, errStorageQuotaExceeded):
 		c.JSON(http.StatusForbidden, gin.H{"error": "storage quota exceeded"})
 	default:
@@ -1725,7 +1731,7 @@ readLoop:
 			defer releaseMetadataPermit()
 
 			if blkErr := upload.AccountBlockOnce(blockIndexLocal, sha256ID, func() error {
-				return fsHelper.RegisterUploadedBlock(token.OrgID, token.RepoID, sha256ID, len(storedBlock), actualStorageClass, "")
+				return fsHelper.RegisterUploadedBlock(token.OrgID, token.RepoID, sha256ID, token.Token, len(storedBlock), actualStorageClass, "")
 			}); blkErr != nil {
 				log.Printf("[finalizeUploadStreaming] CRITICAL: Failed to write block metadata org=%s block=%s: %v", token.OrgID, sha256ID[:16], blkErr)
 				return fmt.Errorf("failed to store block metadata: %w", blkErr)

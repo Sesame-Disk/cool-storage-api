@@ -62,6 +62,21 @@ func parseCASTime(value interface{}) time.Time {
 	return time.Time{}
 }
 
+func parseCASString(value interface{}) string {
+	switch v := value.(type) {
+	case string:
+		return v
+	case []byte:
+		return string(v)
+	case fmt.Stringer:
+		return v.String()
+	case nil:
+		return ""
+	default:
+		return fmt.Sprint(v)
+	}
+}
+
 func (s *CassandraStore) acquireHardDeleteLock(tableName, keyColumn string, keyValue, leaseToken uuid.UUID) (bool, error) {
 	now := time.Now().UTC()
 	existing := map[string]interface{}{}
@@ -1325,45 +1340,55 @@ func resolveBlockIDsConcurrent(orgID uuid.UUID, blockIDs []string, maxConcurrenc
 
 // ClaimBlockDelete marks the block row gc_state='deleting' via LWT so writers
 // back off, deferring the physical DELETE until S3-recovery state is persisted.
-// This is the single expensive Paxos operation in the block lifecycle. It is
-// idempotent: re-claiming a row already in 'deleting' succeeds. The caller MUST
-// re-verify BlockHasReferences after a successful claim (claim-then-verify).
-func (s *CassandraStore) ClaimBlockDelete(orgID uuid.UUID, blockID string) (bool, error) {
-	var prevState string
+// This is the single expensive Paxos operation in the block lifecycle. claimID
+// is stable for one logical candidate so retries of the same item remain the
+// owner, but a different attempt cannot steal or release the claim.
+func (s *CassandraStore) ClaimBlockDelete(orgID uuid.UUID, blockID, claimID string) (bool, error) {
+	existing := map[string]interface{}{}
 	applied, err := s.db.Session().Query(`
-		UPDATE blocks SET gc_state = ?, gc_claimed_at = ?
+		UPDATE blocks SET gc_state = ?, gc_claim_id = ?, gc_claimed_at = ?
 		WHERE org_id = ? AND block_id = ?
 		IF gc_state != ?
-	`, db.BlockGCStateDeleting, time.Now().UTC(), orgID.String(), blockID, db.BlockGCStateDeleting).ScanCAS(&prevState)
+	`, db.BlockGCStateDeleting, claimID, time.Now().UTC(), orgID.String(), blockID, db.BlockGCStateDeleting).MapScanCAS(existing)
 	if err != nil {
 		return false, err
 	}
 	if applied {
 		return true, nil
 	}
-	// Not applied: already 'deleting' (idempotent re-claim) is still a success;
-	// any other prior state (or a missing row) means we did not claim it.
-	return prevState == db.BlockGCStateDeleting, nil
+	return parseCASString(existing["gc_state"]) == db.BlockGCStateDeleting &&
+		parseCASString(existing["gc_claim_id"]) == claimID, nil
 }
 
 // ReleaseBlockClaim clears the gc_state claim when a concurrent reference appeared
 // between the claim and the verify step, so writers stop backing off.
-func (s *CassandraStore) ReleaseBlockClaim(orgID uuid.UUID, blockID string) error {
-	return s.db.Session().Query(`
-		UPDATE blocks SET gc_state = null, gc_claimed_at = null
+func (s *CassandraStore) ReleaseBlockClaim(orgID uuid.UUID, blockID, claimID string) error {
+	applied, err := s.db.Session().Query(`
+		UPDATE blocks SET gc_state = null, gc_claim_id = null, gc_claimed_at = null
 		WHERE org_id = ? AND block_id = ?
-	`, orgID.String(), blockID).Exec()
+		IF gc_state = ? AND gc_claim_id = ?
+	`, orgID.String(), blockID, db.BlockGCStateDeleting, claimID).MapScanCAS(map[string]interface{}{})
+	if err != nil {
+		return err
+	}
+	if !applied {
+		return fmt.Errorf("block delete claim release not applied for %s", blockID)
+	}
+	return nil
 }
 
 // FinalizeBlockDelete removes a block row that was previously claimed by GC.
-func (s *CassandraStore) FinalizeBlockDelete(orgID uuid.UUID, blockID string) error {
-	if err := s.db.Session().Query(`
+func (s *CassandraStore) FinalizeBlockDelete(orgID uuid.UUID, blockID, claimID string) error {
+	applied, err := s.db.Session().Query(`
 		DELETE FROM blocks WHERE org_id = ? AND block_id = ?
-	`, orgID.String(), blockID).Exec(); err != nil {
-		// If the DELETE fails, the row is left with gc_state='deleting'. The
-		// scanner/queue retry re-processes it for cleanup.
-		log.Printf("[GC Store] Warning: claim succeeded but DELETE failed for block %s: %v", blockID, err)
+		IF gc_state = ? AND gc_claim_id = ?
+	`, orgID.String(), blockID, db.BlockGCStateDeleting, claimID).MapScanCAS(map[string]interface{}{})
+	if err != nil {
+		log.Printf("[GC Store] Warning: claim succeeded but conditional DELETE failed for block %s: %v", blockID, err)
 		return err
+	}
+	if !applied {
+		return fmt.Errorf("block delete finalize not applied for %s", blockID)
 	}
 	return nil
 }

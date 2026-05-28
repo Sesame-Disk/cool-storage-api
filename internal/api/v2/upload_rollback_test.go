@@ -15,21 +15,26 @@ func TestHandleStoredUploadMetadataError_RollsBackPromotedBlocks(t *testing.T) {
 
 	var rollbackCalled bool
 	var gotOrgID, gotRepoID string
+	var gotOperationID string
 	var gotBlockIDs []string
-	rollbackUploadedBlockRefsFn = func(database *db.DB, orgID, repoID string, blockIDs []string) {
+	rollbackUploadedBlockRefsFn = func(database *db.DB, orgID, repoID, operationID string, blockIDs []string) {
 		rollbackCalled = true
 		gotOrgID = orgID
 		gotRepoID = repoID
+		gotOperationID = operationID
 		gotBlockIDs = append([]string(nil), blockIDs...)
 	}
 
-	handleStoredUploadMetadataError(nil, "org-1", "repo-1", "file-1", []string{"block-1"}, errors.New("boom"))
+	handleStoredUploadMetadataError(nil, "org-1", "repo-1", "upload-op-1", []string{"block-1"}, errors.New("boom"))
 
 	if !rollbackCalled {
 		t.Fatal("expected failed metadata finalize to roll back promoted blocks")
 	}
 	if gotOrgID != "org-1" || gotRepoID != "repo-1" {
 		t.Fatalf("rollback org/repo = %s/%s, want org-1/repo-1", gotOrgID, gotRepoID)
+	}
+	if gotOperationID != "upload-op-1" {
+		t.Fatalf("rollback operation ID = %s, want upload-op-1", gotOperationID)
 	}
 	if len(gotBlockIDs) != 1 || gotBlockIDs[0] != "block-1" {
 		t.Fatalf("rollback block IDs = %#v, want []string{\"block-1\"}", gotBlockIDs)
@@ -43,11 +48,11 @@ func TestHandleStoredUploadMetadataError_SkipsSuccessfulFinalize(t *testing.T) {
 	}()
 
 	rollbackCalled := false
-	rollbackUploadedBlockRefsFn = func(database *db.DB, orgID, repoID string, blockIDs []string) {
+	rollbackUploadedBlockRefsFn = func(database *db.DB, orgID, repoID, operationID string, blockIDs []string) {
 		rollbackCalled = true
 	}
 
-	handleStoredUploadMetadataError(nil, "org-1", "repo-1", "file-1", []string{"block-1"}, nil)
+	handleStoredUploadMetadataError(nil, "org-1", "repo-1", "upload-op-1", []string{"block-1"}, nil)
 
 	if rollbackCalled {
 		t.Fatal("successful metadata finalize should not roll back promoted blocks")
@@ -61,11 +66,11 @@ func TestHandleStoredUploadMetadataError_SkipsUnknownPublicationOutcome(t *testi
 	}()
 
 	rollbackCalled := false
-	rollbackUploadedBlockRefsFn = func(database *db.DB, orgID, repoID string, blockIDs []string) {
+	rollbackUploadedBlockRefsFn = func(database *db.DB, orgID, repoID, operationID string, blockIDs []string) {
 		rollbackCalled = true
 	}
 
-	handleStoredUploadMetadataError(nil, "org-1", "repo-1", "file-1", []string{"block-1"}, ErrLibraryHeadPublicationUnknown)
+	handleStoredUploadMetadataError(nil, "org-1", "repo-1", "upload-op-1", []string{"block-1"}, ErrLibraryHeadPublicationUnknown)
 
 	if rollbackCalled {
 		t.Fatal("unknown publication outcome should not roll back promoted blocks")

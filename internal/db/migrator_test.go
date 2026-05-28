@@ -147,34 +147,16 @@ func TestInitialSchemaContainsLookupNameAndStarredIndex(t *testing.T) {
 	assert.Contains(t, content, "CREATE TABLE IF NOT EXISTS gc_block_candidates_by_day")
 	assert.Contains(t, content, "CREATE TABLE IF NOT EXISTS gc_s3_orphans_by_day")
 	assert.Contains(t, content, "CREATE TABLE IF NOT EXISTS gc_leases")
+	assert.Contains(t, content, "gc_claim_id   TEXT")
 	// `blocks` and related tables must use per-block partitioning to avoid
 	// the org_id hot partition that previously serialized all upload LWTs.
 	assert.Contains(t, content, "PRIMARY KEY ((org_id, block_id))")
 	assert.Contains(t, content, "WITH default_time_to_live = 0")
 	assert.Contains(t, content, "INSERT INTO gc_stats (stat_key, stat_value, updated_at)")
 	assert.NotContains(t, content, "CREATE TABLE IF NOT EXISTS gc_queue_stats")
-	assert.NotContains(t, content, "WITH default_time_to_live = 604800")
 	assert.Contains(t, content, "storage_class TEXT")
-	assert.NotContains(t, content, "CREATE TABLE IF NOT EXISTS share_links_by_org")
-}
-
-func TestOnlyOfficePendingBlocksMigrationExists(t *testing.T) {
-	raw, err := migrationsFS.ReadFile("migrations/003_onlyoffice_pending_blocks.cql")
-	require.NoError(t, err)
-	content := string(raw)
-
+	assert.Contains(t, content, "replace_existing BOOLEAN")
 	assert.Contains(t, content, "CREATE TABLE IF NOT EXISTS onlyoffice_pending_blocks")
-	assert.Contains(t, content, "org_id            UUID")
-	assert.Contains(t, content, "repo_id           UUID")
-	assert.Contains(t, content, "publish_commit_id TEXT")
-	assert.Contains(t, content, "PRIMARY KEY ((org_id), operation_id)")
 	assert.Contains(t, content, "WITH default_time_to_live = 604800")
-}
-
-func TestAccessTokensReplaceExistingMigrationExists(t *testing.T) {
-	raw, err := migrationsFS.ReadFile("migrations/004_access_tokens_replace_existing.cql")
-	require.NoError(t, err)
-	content := string(raw)
-
-	assert.Contains(t, content, "ALTER TABLE access_tokens ADD replace_existing BOOLEAN")
+	assert.NotContains(t, content, "CREATE TABLE IF NOT EXISTS share_links_by_org")
 }
