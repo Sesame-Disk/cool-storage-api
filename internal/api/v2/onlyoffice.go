@@ -1286,16 +1286,20 @@ func (h *OnlyOfficeHandler) publishEditedDocumentMetadata(fsHelper *FSHelper, or
 		}
 
 		now := time.Now()
-		newFileFSID, err := fsHelper.CreateFileFSObject(orgID, repoID, filename, originalFileSize, []string{externalBlockID})
+		publishAttemptID := uuid.NewString()
+		pendingFile, err := fsHelper.stageFileFSObjectForPublishAttempt(orgID, repoID, publishAttemptID, filename, originalFileSize, []string{externalBlockID})
 		if err != nil {
 			return fmt.Errorf("failed to create file fs_object: %w", err)
+		}
+		cleanupPendingFilePublish := func() {
+			_ = db.RemovePublishAttemptReferences(h.db, orgID, publishAttemptID, pendingFile.internalBlockIDs)
 		}
 
 		updatedEntries := make([]FSEntry, 0, len(result.Entries))
 		fileUpdated := false
 		for _, entry := range result.Entries {
 			if entry.Name == filename {
-				entry.ID = newFileFSID
+				entry.ID = pendingFile.fsID
 				entry.Size = originalFileSize
 				entry.MTime = now.Unix()
 				entry.Modifier = userID + "@sesamefs.local"
@@ -1306,7 +1310,7 @@ func (h *OnlyOfficeHandler) publishEditedDocumentMetadata(fsHelper *FSHelper, or
 
 		if !fileUpdated {
 			updatedEntries = append(updatedEntries, FSEntry{
-				ID:       newFileFSID,
+				ID:       pendingFile.fsID,
 				Name:     filename,
 				Mode:     ModeFile,
 				MTime:    now.Unix(),
@@ -1317,26 +1321,43 @@ func (h *OnlyOfficeHandler) publishEditedDocumentMetadata(fsHelper *FSHelper, or
 
 		newParentFSID, err := fsHelper.CreateDirectoryFSObject(repoID, updatedEntries)
 		if err != nil {
+			cleanupPendingFilePublish()
 			return fmt.Errorf("failed to create parent fs_object: %w", err)
 		}
 
 		newRootFSID, err := fsHelper.RebuildPathToRoot(repoID, result, newParentFSID)
 		if err != nil {
+			cleanupPendingFilePublish()
 			return fmt.Errorf("failed to rebuild path: %w", err)
 		}
 
 		commitDesc := fmt.Sprintf("Modified \"%s\" via OnlyOffice", filename)
 		commitID, err := fsHelper.CreateCommit(repoID, userID, newRootFSID, snapshot.HeadCommitID, commitDesc)
 		if err != nil {
+			cleanupPendingFilePublish()
 			return fmt.Errorf("failed to create commit: %w", err)
 		}
 
 		if err := h.updateOnlyOfficePendingBlockCommitID(orgID, pendingOperationID, commitID); err != nil {
+			if cleanupErr := db.CleanupFailedPublishAttempt(h.db, orgID, repoID, publishAttemptID, commitID, pendingFile.internalBlockIDs); cleanupErr != nil {
+				return errors.Join(
+					fmt.Errorf("failed to persist OnlyOffice pending commit id: %w", err),
+					fmt.Errorf("clean up publish attempt %s: %w", publishAttemptID, cleanupErr),
+				)
+			}
 			return fmt.Errorf("failed to persist OnlyOffice pending commit id: %w", err)
 		}
 
 		if err := fsHelper.UpdateLibraryHeadFromSnapshot(snapshot, repoID, commitID, snapshot.HeadCommitID); err != nil {
+			if errors.Is(err, ErrLibraryHeadConflict) {
+				if cleanupErr := db.CleanupFailedPublishAttempt(h.db, orgID, repoID, publishAttemptID, commitID, pendingFile.internalBlockIDs); cleanupErr != nil {
+					return fmt.Errorf("failed to clean up conflict publish attempt %s: %w", publishAttemptID, cleanupErr)
+				}
+			}
 			return fmt.Errorf("failed to update library head: %w", err)
+		}
+		if err := fsHelper.promotePendingPublishedFiles(orgID, repoID, publishAttemptID, []*pendingPublishedFile{pendingFile}); err != nil {
+			log.Printf("OnlyOffice: WARNING: head updated for repo=%s commit=%s but failed to promote block references for fs_object %s: %v", repoID, commitID, pendingFile.fsID, err)
 		}
 
 		storageDeltaBytes = currentDeltaBytes

@@ -27,6 +27,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime/multipart"
@@ -38,6 +39,7 @@ import (
 	"testing"
 	"time"
 
+	gocql "github.com/apache/cassandra-gocql-driver/v2"
 	"github.com/google/uuid"
 )
 
@@ -158,7 +160,11 @@ func uploadedFileBlockReferrers(t *testing.T, repoID, dirPath, fileName string) 
 
 	var internalBlockID string
 	if err := session.Query(`SELECT internal_id FROM block_id_mappings WHERE org_id = ? AND external_id = ?`, orgID, blockIDs[0]).Scan(&internalBlockID); err != nil {
-		t.Fatalf("failed to resolve block mapping for %s/%s: %v", orgID, blockIDs[0], err)
+		if errors.Is(err, gocql.ErrNotFound) {
+			internalBlockID = blockIDs[0]
+		} else {
+			t.Fatalf("failed to resolve block mapping for %s/%s: %v", orgID, blockIDs[0], err)
+		}
 	}
 
 	iter := session.Query(`SELECT referrer FROM block_references WHERE org_id = ? AND block_id = ?`, orgID, internalBlockID).Iter()

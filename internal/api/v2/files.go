@@ -1141,7 +1141,8 @@ func (h *FileHandler) CreateFile(c *gin.Context) {
 				return fmt.Errorf("failed to store file content: %w", err)
 			}
 			// Register block metadata so GC can manage the template block. The
-			// permanent reference is created below by CreateFileFSObject.
+			// permanent reference is created below via the publish-attempt stage
+			// and promotion (stageFileFSObjectForPublishAttempt + promote on success).
 			if err := h.db.UpsertBlockMetadata(orgID, templateBlockData.Hash, int(fileSize), templateStorageClass, ""); err != nil {
 				return fmt.Errorf("failed to register block metadata: %w", err)
 			}
@@ -1149,14 +1150,18 @@ func (h *FileHandler) CreateFile(c *gin.Context) {
 			log.Printf("[CreateFile] Created Office file %s with template size %d bytes", fileName, fileSize)
 		}
 
-		fileFSID, err := fsHelper.CreateFileFSObject(orgID, repoID, fileName, fileSize, blockIDs)
+		publishAttemptID := uuid.NewString()
+		pendingFile, err := fsHelper.stageFileFSObjectForPublishAttempt(orgID, repoID, publishAttemptID, fileName, fileSize, blockIDs)
 		if err != nil {
 			return fmt.Errorf("failed to create file: %w", err)
+		}
+		cleanupPendingFilePublish := func() {
+			_ = db.RemovePublishAttemptReferences(h.db, orgID, publishAttemptID, pendingFile.internalBlockIDs)
 		}
 
 		newEntry := FSEntry{
 			Name:  fileName,
-			ID:    fileFSID,
+			ID:    pendingFile.fsID,
 			Mode:  ModeFile,
 			MTime: time.Now().Unix(),
 			Size:  fileSize,
@@ -1165,6 +1170,7 @@ func (h *FileHandler) CreateFile(c *gin.Context) {
 
 		newParentFSID, err := fsHelper.CreateDirectoryFSObject(repoID, newEntries)
 		if err != nil {
+			cleanupPendingFilePublish()
 			return fmt.Errorf("failed to update parent directory: %w", err)
 		}
 
@@ -1183,11 +1189,13 @@ func (h *FileHandler) CreateFile(c *gin.Context) {
 
 			newGrandparentFSID, err := fsHelper.CreateDirectoryFSObject(repoID, updatedGrandparentEntries)
 			if err != nil {
+				cleanupPendingFilePublish()
 				return fmt.Errorf("failed to update grandparent directory: %w", err)
 			}
 
 			newRootFSID, err = fsHelper.RebuildPathToRoot(repoID, result, newGrandparentFSID)
 			if err != nil {
+				cleanupPendingFilePublish()
 				return fmt.Errorf("failed to rebuild path: %w", err)
 			}
 		}
@@ -1195,14 +1203,23 @@ func (h *FileHandler) CreateFile(c *gin.Context) {
 		description := fmt.Sprintf("Added \"%s\"", fileName)
 		commitID, err := fsHelper.CreateCommit(repoID, userID, newRootFSID, snapshot.HeadCommitID, description)
 		if err != nil {
+			cleanupPendingFilePublish()
 			return fmt.Errorf("failed to create commit: %w", err)
 		}
 
 		if err := fsHelper.UpdateLibraryHeadFromSnapshot(snapshot, repoID, commitID, snapshot.HeadCommitID); err != nil {
+			if errors.Is(err, ErrLibraryHeadConflict) {
+				if cleanupErr := db.CleanupFailedPublishAttempt(h.db, orgID, repoID, publishAttemptID, commitID, pendingFile.internalBlockIDs); cleanupErr != nil {
+					return fmt.Errorf("failed to clean up conflict publish attempt %s: %w", publishAttemptID, cleanupErr)
+				}
+			}
 			return err
 		}
+		if err := fsHelper.promotePendingPublishedFiles(orgID, repoID, publishAttemptID, []*pendingPublishedFile{pendingFile}); err != nil {
+			log.Printf("[CreateFile] WARNING: head updated for repo=%s commit=%s but failed to promote block references for fs_object %s: %v", repoID, commitID, pendingFile.fsID, err)
+		}
 
-		newFileFSID = fileFSID
+		newFileFSID = pendingFile.fsID
 		newCommitID = commitID
 		return nil
 	})

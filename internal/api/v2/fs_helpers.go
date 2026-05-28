@@ -982,70 +982,6 @@ func (h *FSHelper) collectDirStats(repoID, fsID string) (blockIDs []string, tota
 	return blockIDs, totalSize, fileCount, nil
 }
 
-// CopyFSObjectToLibrary recursively copies an fs_object (file or directory) from
-// one library to another. Returns the new fs_id in the destination library.
-// This is needed because fs_objects are keyed by (library_id, fs_id), so a cross-library
-// copy must create new fs_object rows in the destination library.
-func (h *FSHelper) CopyFSObjectToLibrary(orgID, srcRepoID, dstRepoID, fsID string) (string, error) {
-	// Read the source fs_object
-	var objType, objName, dirEntries string
-	var blockIDs []string
-	var sizeBytes int64
-	var mtime int64
-
-	err := h.db.Session().Query(`
-		SELECT obj_type, obj_name, dir_entries, block_ids, size_bytes, mtime
-		FROM fs_objects WHERE library_id = ? AND fs_id = ?
-	`, srcRepoID, fsID).Scan(&objType, &objName, &dirEntries, &blockIDs, &sizeBytes, &mtime)
-	if err != nil {
-		return "", fmt.Errorf("source fs_object not found (library=%s, fs_id=%s): %w", srcRepoID, fsID, err)
-	}
-
-	if objType == "file" || objType == "" {
-		// File: create a new fs_object in the destination library with the same
-		// block_ids. CreateFileFSObject registers the permanent block references
-		// for the new fs_object, so the copy keeps the blocks alive — no separate
-		// ref-count increment is needed.
-		newFSID, err := h.CreateFileFSObject(orgID, dstRepoID, objName, sizeBytes, blockIDs)
-		if err != nil {
-			return "", fmt.Errorf("failed to copy file fs_object: %w", err)
-		}
-		return newFSID, nil
-	}
-
-	// Directory: recursively copy all children, then create the directory in destination
-	var entries []FSEntry
-	if dirEntries != "" && dirEntries != "[]" {
-		if err := json.Unmarshal([]byte(dirEntries), &entries); err != nil {
-			return "", fmt.Errorf("invalid directory data: %w", err)
-		}
-	}
-
-	// Copy each child entry, updating the fs_id to the new one in the destination library
-	newEntries := make([]FSEntry, len(entries))
-	for i, entry := range entries {
-		newChildFSID, err := h.CopyFSObjectToLibrary(orgID, srcRepoID, dstRepoID, entry.ID)
-		if err != nil {
-			return "", fmt.Errorf("failed to copy child %q: %w", entry.Name, err)
-		}
-		newEntries[i] = FSEntry{
-			Name:  entry.Name,
-			ID:    newChildFSID,
-			Mode:  entry.Mode,
-			MTime: entry.MTime,
-			Size:  entry.Size,
-		}
-	}
-
-	// Create the directory fs_object in the destination library
-	newDirFSID, err := h.CreateDirectoryFSObject(dstRepoID, newEntries)
-	if err != nil {
-		return "", fmt.Errorf("failed to copy directory fs_object: %w", err)
-	}
-
-	return newDirFSID, nil
-}
-
 func buildFileFSObjectID(blockIDs []string, size int64) (string, error) {
 	// Calculate fs_id as SHA-1 of the EXACT JSON that will be returned by pack-fs
 	// Seafile format: {"block_ids":[...],"size":N,"type":1,"version":1} (alphabetical key order)
@@ -1066,6 +1002,118 @@ func buildFileFSObjectID(blockIDs []string, size int64) (string, error) {
 	return hex.EncodeToString(hash[:]), nil
 }
 
+type pendingPublishedFile struct {
+	fsID             string
+	externalBlockIDs []string
+	internalBlockIDs []string
+}
+
+func pendingPublishedFileInternalBlockIDs(pendingFiles []*pendingPublishedFile) []string {
+	blockIDs := make([]string, 0, len(pendingFiles))
+	for _, pending := range pendingFiles {
+		if pending == nil {
+			continue
+		}
+		blockIDs = append(blockIDs, pending.internalBlockIDs...)
+	}
+	return blockIDs
+}
+
+func (h *FSHelper) stageFileFSObjectForPublishAttempt(orgID, repoID, attemptID, name string, size int64, blockIDs []string) (*pendingPublishedFile, error) {
+	fsID, err := buildFileFSObjectID(blockIDs, size)
+	if err != nil {
+		return nil, err
+	}
+
+	resolved, err := db.StagePublishAttemptReferences(h.db, orgID, repoID, attemptID, blockIDs, func(blockIDs []string) ([]string, error) {
+		return resolveStoredBlockIDsFn(h, orgID, blockIDs)
+	})
+	if err != nil {
+		return nil, fmt.Errorf("stage publish-attempt block references for fs_object %s: %w", fsID, err)
+	}
+
+	if err := h.createFileFSObjectRow(repoID, fsID, name, size, blockIDs); err != nil {
+		_ = db.RemovePublishAttemptReferences(h.db, orgID, attemptID, resolved)
+		return nil, err
+	}
+
+	return &pendingPublishedFile{
+		fsID:             fsID,
+		externalBlockIDs: append([]string(nil), blockIDs...),
+		internalBlockIDs: append([]string(nil), resolved...),
+	}, nil
+}
+
+func (h *FSHelper) promotePendingPublishedFiles(orgID, repoID, attemptID string, pendingFiles []*pendingPublishedFile) error {
+	var promoteErr error
+	for _, pending := range pendingFiles {
+		if pending == nil {
+			continue
+		}
+		if err := db.PromotePublishAttemptReferences(h.db, orgID, attemptID, pending.internalBlockIDs, func() error {
+			return h.RegisterFSObjectBlockReferences(orgID, repoID, pending.fsID, pending.externalBlockIDs)
+		}); err != nil {
+			promoteErr = errors.Join(promoteErr, fmt.Errorf("promote file fs_object %s: %w", pending.fsID, err))
+		}
+	}
+	return promoteErr
+}
+
+func (h *FSHelper) copyFSObjectToLibraryForPublishAttempt(orgID, srcRepoID, dstRepoID, fsID, attemptID string) (string, []*pendingPublishedFile, error) {
+	// Read the source fs_object
+	var objType, objName, dirEntries string
+	var blockIDs []string
+	var sizeBytes int64
+	var mtime int64
+
+	err := h.db.Session().Query(`
+		SELECT obj_type, obj_name, dir_entries, block_ids, size_bytes, mtime
+		FROM fs_objects WHERE library_id = ? AND fs_id = ?
+	`, srcRepoID, fsID).Scan(&objType, &objName, &dirEntries, &blockIDs, &sizeBytes, &mtime)
+	if err != nil {
+		return "", nil, fmt.Errorf("source fs_object not found (library=%s, fs_id=%s): %w", srcRepoID, fsID, err)
+	}
+
+	if objType == "file" || objType == "" {
+		pendingFile, err := h.stageFileFSObjectForPublishAttempt(orgID, dstRepoID, attemptID, objName, sizeBytes, blockIDs)
+		if err != nil {
+			return "", nil, fmt.Errorf("failed to stage copied file fs_object: %w", err)
+		}
+		return pendingFile.fsID, []*pendingPublishedFile{pendingFile}, nil
+	}
+
+	var entries []FSEntry
+	if dirEntries != "" && dirEntries != "[]" {
+		if err := json.Unmarshal([]byte(dirEntries), &entries); err != nil {
+			return "", nil, fmt.Errorf("invalid directory data: %w", err)
+		}
+	}
+
+	newEntries := make([]FSEntry, len(entries))
+	pendingFiles := make([]*pendingPublishedFile, 0)
+	for i, entry := range entries {
+		newChildFSID, childPendingFiles, err := h.copyFSObjectToLibraryForPublishAttempt(orgID, srcRepoID, dstRepoID, entry.ID, attemptID)
+		pendingFiles = append(pendingFiles, childPendingFiles...)
+		if err != nil {
+			return "", pendingFiles, fmt.Errorf("failed to copy child %q: %w", entry.Name, err)
+		}
+		newEntries[i] = FSEntry{
+			Name:  entry.Name,
+			ID:    newChildFSID,
+			Mode:  entry.Mode,
+			MTime: entry.MTime,
+			Size:  entry.Size,
+		}
+	}
+
+	newDirFSID, err := h.CreateDirectoryFSObject(dstRepoID, newEntries)
+	if err != nil {
+		return "", pendingFiles, fmt.Errorf("failed to copy directory fs_object: %w", err)
+	}
+
+	return newDirFSID, pendingFiles, nil
+}
+
 func (h *FSHelper) createFileFSObjectRow(repoID, fsID, name string, size int64, blockIDs []string) error {
 	err := h.db.Session().Query(`
 		INSERT INTO fs_objects (library_id, fs_id, obj_type, obj_name, block_ids, size_bytes, mtime)
@@ -1075,28 +1123,4 @@ func (h *FSHelper) createFileFSObjectRow(repoID, fsID, name string, size int64, 
 		return fmt.Errorf("failed to create fs_object: %w", err)
 	}
 	return nil
-}
-
-// CreateFileFSObject creates a new fs_object for a file and registers a permanent
-// block reference for each of its blocks (row-per-reference liveness). References
-// are written BEFORE the fs_object row so a partial failure leaves harmless orphan
-// references rather than an fs_object whose blocks are unreferenced. orgID is
-// required to key the block reference rows (blocks are partitioned per org).
-func (h *FSHelper) CreateFileFSObject(orgID, repoID, name string, size int64, blockIDs []string) (string, error) {
-	fsID, err := buildFileFSObjectID(blockIDs, size)
-	if err != nil {
-		return "", err
-	}
-
-	// Register permanent block references before inserting the fs_object row.
-	// Fail-closed: if any block ID cannot be resolved, no fs_object is created.
-	if err := h.RegisterFSObjectBlockReferences(orgID, repoID, fsID, blockIDs); err != nil {
-		return "", fmt.Errorf("failed to register block references for fs_object %s: %w", fsID, err)
-	}
-
-	if err := h.createFileFSObjectRow(repoID, fsID, name, size, blockIDs); err != nil {
-		return "", err
-	}
-
-	return fsID, nil
 }

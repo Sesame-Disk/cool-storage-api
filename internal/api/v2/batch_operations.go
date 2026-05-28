@@ -560,9 +560,20 @@ func (h *BatchOperationHandler) processSingleItem(orgID, userID, srcRepoID, dstR
 		}
 
 		entryFSID := srcResult.TargetEntry.ID
+		publishAttemptID := ""
+		var pendingCopiedFiles []*pendingPublishedFile
+		cleanupPendingCopyPublish := func() {
+			if len(pendingCopiedFiles) == 0 {
+				return
+			}
+			_ = db.RemovePublishAttemptReferences(h.db, orgID, publishAttemptID, pendingPublishedFileInternalBlockIDs(pendingCopiedFiles))
+		}
 		if srcRepoID != dstRepoID {
-			newFSID, err := fsHelper.CopyFSObjectToLibrary(orgID, srcRepoID, dstRepoID, srcResult.TargetEntry.ID)
+			publishAttemptID = uuid.NewString()
+			newFSID, copiedFiles, err := fsHelper.copyFSObjectToLibraryForPublishAttempt(orgID, srcRepoID, dstRepoID, srcResult.TargetEntry.ID, publishAttemptID)
+			pendingCopiedFiles = copiedFiles
 			if err != nil {
+				cleanupPendingCopyPublish()
 				return fmt.Errorf("failed to copy fs_objects to destination library: %w", err)
 			}
 			entryFSID = newFSID
@@ -579,6 +590,7 @@ func (h *BatchOperationHandler) processSingleItem(orgID, userID, srcRepoID, dstR
 
 		newDstDirFSID, err := fsHelper.CreateDirectoryFSObject(dstRepoID, newDstEntries)
 		if err != nil {
+			cleanupPendingCopyPublish()
 			return fmt.Errorf("failed to update destination directory: %w", err)
 		}
 
@@ -597,11 +609,13 @@ func (h *BatchOperationHandler) processSingleItem(orgID, userID, srcRepoID, dstR
 
 			newParentFSID, err := fsHelper.CreateDirectoryFSObject(dstRepoID, updatedParentEntries)
 			if err != nil {
+				cleanupPendingCopyPublish()
 				return fmt.Errorf("failed to update destination parent: %w", err)
 			}
 
 			newDstRootFSID, err = fsHelper.RebuildPathToRoot(dstRepoID, dstResult, newParentFSID)
 			if err != nil {
+				cleanupPendingCopyPublish()
 				return fmt.Errorf("failed to rebuild destination path: %w", err)
 			}
 		}
@@ -615,14 +629,22 @@ func (h *BatchOperationHandler) processSingleItem(orgID, userID, srcRepoID, dstR
 
 		newDstCommitID, err := fsHelper.CreateCommit(dstRepoID, userID, newDstRootFSID, dstSnapshot.HeadCommitID, dstDescription)
 		if err != nil {
+			cleanupPendingCopyPublish()
 			return fmt.Errorf("failed to create destination commit: %w", err)
 		}
 
-		// Cross-library copy/move already created the destination fs_objects (via
-		// CopyFSObjectToLibrary → CreateFileFSObject), which registered their block
-		// references. No separate ref-count increment is needed here.
 		if err := fsHelper.UpdateLibraryHeadFromSnapshot(dstSnapshot, dstRepoID, newDstCommitID, dstSnapshot.HeadCommitID); err != nil {
+			if len(pendingCopiedFiles) > 0 && errors.Is(err, ErrLibraryHeadConflict) {
+				if cleanupErr := db.CleanupFailedPublishAttempt(h.db, orgID, dstRepoID, publishAttemptID, newDstCommitID, pendingPublishedFileInternalBlockIDs(pendingCopiedFiles)); cleanupErr != nil {
+					return fmt.Errorf("failed to clean up conflict copy publish attempt %s: %w", publishAttemptID, cleanupErr)
+				}
+			}
 			return fmt.Errorf("failed to update destination library: %w", err)
+		}
+		if len(pendingCopiedFiles) > 0 {
+			if err := fsHelper.promotePendingPublishedFiles(orgID, dstRepoID, publishAttemptID, pendingCopiedFiles); err != nil {
+				log.Printf("[processSingleItem] WARNING: head updated for repo=%s commit=%s but failed to promote copied block references: %v", dstRepoID, newDstCommitID, err)
+			}
 		}
 
 		replacedTagCleanupPath, replacedTagCleanupByPrefix = replacedDestinationTagCleanup(dstDir, currentItemName, replacedEntry)

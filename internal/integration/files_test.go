@@ -39,6 +39,35 @@ func TestCreateDirectory(t *testing.T) {
 	}
 }
 
+func TestCreateOfficeFileLeavesNoPublishAttemptRefs(t *testing.T) {
+	requireCassandra(t)
+
+	name := fmt.Sprintf("inttest-create-office-publish-%d", time.Now().UnixNano())
+	repoID := createTestLibrary(t, adminClient, name)
+	fileName := "publish-check.docx"
+
+	resp := adminClient.PostForm(t, fmt.Sprintf("/api2/repos/%s/file/?p=/%s&operation=create", repoID, url.QueryEscape(fileName)), url.Values{})
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+		body := responseBody(t, resp)
+		t.Fatalf("create office file status = %d, want 200/201; body=%s", resp.StatusCode, body)
+	}
+	resp.Body.Close()
+
+	referrers := uploadedFileBlockReferrers(t, repoID, "/", fileName)
+	fsRefs := 0
+	for _, referrer := range referrers {
+		if strings.HasPrefix(referrer, "pub:") {
+			t.Fatalf("created office file leaked publish-attempt ref %q", referrer)
+		}
+		if strings.HasPrefix(referrer, "fs:") {
+			fsRefs++
+		}
+	}
+	if fsRefs != 1 {
+		t.Fatalf("created office file fs ref count = %d, want 1; referrers=%v", fsRefs, referrers)
+	}
+}
+
 func TestFileUpload(t *testing.T) {
 	name := fmt.Sprintf("inttest-upload-%d", time.Now().UnixNano())
 	repoID := createTestLibrary(t, adminClient, name)
@@ -403,6 +432,20 @@ func TestCrossLibraryBatchCopyIncrementsBlockRefCount(t *testing.T) {
 	blockID := hex.EncodeToString(hash[:])
 	if refCount := readBlockRefCount(t, orgID, blockID); refCount != 2 {
 		t.Fatalf("references after cross-library batch copy = %d, want 2", refCount)
+	}
+
+	referrers := uploadedFileBlockReferrers(t, dstRepoID, "/", fileName)
+	fsRefs := 0
+	for _, referrer := range referrers {
+		if strings.HasPrefix(referrer, "pub:") {
+			t.Fatalf("cross-library batch copy leaked publish-attempt ref %q", referrer)
+		}
+		if strings.HasPrefix(referrer, "fs:") {
+			fsRefs++
+		}
+	}
+	if fsRefs != 2 {
+		t.Fatalf("cross-library batch copy fs ref count = %d, want 2; referrers=%v", fsRefs, referrers)
 	}
 }
 
