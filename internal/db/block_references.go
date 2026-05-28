@@ -236,3 +236,29 @@ func (db *DB) BlockGCState(orgID, blockID string) (string, error) {
 	}
 	return gcState, nil
 }
+
+// BlockDeleteFenceActive reports whether GC still owns the physical object for
+// this block. Writers must treat both an in-row gc_state='deleting' claim and a
+// pending gc_s3_orphans row as an active fence; otherwise a re-upload can race
+// with orphan recovery and lose the object after the canonical block row was
+// already deleted.
+func (db *DB) BlockDeleteFenceActive(orgID, blockID string) (bool, error) {
+	gcState, err := db.BlockGCState(orgID, blockID)
+	if err != nil {
+		return false, err
+	}
+	if gcState == BlockGCStateDeleting {
+		return true, nil
+	}
+	var existingBlockID string
+	err = db.Session().Query(`
+		SELECT block_id FROM gc_s3_orphans WHERE org_id = ? AND block_id = ? LIMIT 1
+	`, orgID, blockID).Scan(&existingBlockID)
+	if err != nil {
+		if errors.Is(err, gocql.ErrNotFound) {
+			return false, nil
+		}
+		return false, err
+	}
+	return existingBlockID != "", nil
+}

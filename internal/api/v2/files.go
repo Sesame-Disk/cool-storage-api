@@ -1072,6 +1072,7 @@ func (h *FileHandler) CreateFile(c *gin.Context) {
 	// by SHA-256, so reusing the first successful upload avoids rewriting the
 	// same bytes on later CAS retries.
 	var templateBlockStore *storage.BlockStore
+	var templateStorageClass string
 	var templateBlockStored bool
 
 	if len(templateContent) > 0 {
@@ -1095,6 +1096,22 @@ func (h *FileHandler) CreateFile(c *gin.Context) {
 	var newCommitID string
 
 	err = retryLibraryHeadMutation("CreateFile", func() error {
+		publishAttemptID := uuid.NewString()
+		templateBlockPinned := false
+		releaseTemplateBlockPin := func(enqueueIfZero bool) {
+			if !templateBlockPinned || templateBlockData == nil {
+				return
+			}
+			templateBlockPinned = false
+			zeroRefBlocks := fsHelper.ReleaseUploadReferences(orgID, repoID, publishAttemptID, []string{templateBlockData.Hash})
+			if enqueueIfZero && len(zeroRefBlocks) > 0 {
+				enqueueZeroRefBlocks(h.db, orgID, repoID, zeroRefBlocks)
+			}
+		}
+		defer func() {
+			releaseTemplateBlockPin(true)
+		}()
+
 		snapshot, err := fsHelper.GetLibraryHeadSnapshot(repoID)
 		if err != nil {
 			return fmt.Errorf("%w: %v", errLibraryNotFound, err)
@@ -1125,7 +1142,6 @@ func (h *FileHandler) CreateFile(c *gin.Context) {
 		}
 
 		if templateBlockData != nil && !templateBlockStored {
-			var templateStorageClass string
 			if templateBlockStore == nil {
 				blockStore, storageClass, err := h.resolveLibraryBlockStore(c, orgID, repoID)
 				if err != nil {
@@ -1140,21 +1156,23 @@ func (h *FileHandler) CreateFile(c *gin.Context) {
 			if _, err := templateBlockStore.PutBlockData(c.Request.Context(), templateBlockData); err != nil {
 				return fmt.Errorf("failed to store file content: %w", err)
 			}
-			// Register block metadata so GC can manage the template block. The
-			// permanent reference is created below via the publish-attempt stage
-			// and promotion (stageFileFSObjectForPublishAttempt + promote on success).
-			if err := h.db.UpsertBlockMetadata(orgID, templateBlockData.Hash, int(fileSize), templateStorageClass, ""); err != nil {
-				return fmt.Errorf("failed to register block metadata: %w", err)
-			}
 			templateBlockStored = true
 			log.Printf("[CreateFile] Created Office file %s with template size %d bytes", fileName, fileSize)
 		}
+		if templateBlockData != nil {
+			// Keep the freshly stored template block alive and respect the GC
+			// delete fence until publish-attempt refs take over below.
+			if err := fsHelper.RegisterUploadedBlock(orgID, repoID, templateBlockData.Hash, publishAttemptID, int(fileSize), templateStorageClass, ""); err != nil {
+				return fmt.Errorf("failed to register template block metadata: %w", err)
+			}
+			templateBlockPinned = true
+		}
 
-		publishAttemptID := uuid.NewString()
 		pendingFile, err := fsHelper.stageFileFSObjectForPublishAttempt(orgID, repoID, publishAttemptID, fileName, fileSize, blockIDs)
 		if err != nil {
 			return fmt.Errorf("failed to create file: %w", err)
 		}
+		releaseTemplateBlockPin(false)
 		cleanupPendingFilePublish := func() {
 			_ = db.RemovePublishAttemptReferences(h.db, orgID, publishAttemptID, pendingFile.internalBlockIDs)
 		}

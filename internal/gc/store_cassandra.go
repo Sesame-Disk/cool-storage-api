@@ -1343,6 +1343,21 @@ func resolveBlockIDsConcurrent(orgID uuid.UUID, blockIDs []string, maxConcurrenc
 // This is the single expensive Paxos operation in the block lifecycle. claimID
 // is stable for one logical candidate so retries of the same item remain the
 // owner, but a different attempt cannot steal or release the claim.
+func (s *CassandraStore) readBlockDeleteClaimState(orgID uuid.UUID, blockID string) (string, string, error) {
+	var gcState string
+	var gcClaimID string
+	err := s.db.Session().Query(`
+		SELECT gc_state, gc_claim_id FROM blocks WHERE org_id = ? AND block_id = ?
+	`, orgID.String(), blockID).Scan(&gcState, &gcClaimID)
+	if err != nil {
+		if errors.Is(err, gocql.ErrNotFound) {
+			return "", "", nil
+		}
+		return "", "", err
+	}
+	return gcState, gcClaimID, nil
+}
+
 func (s *CassandraStore) ClaimBlockDelete(orgID uuid.UUID, blockID, claimID string) (bool, error) {
 	existing := map[string]interface{}{}
 	applied, err := s.db.Session().Query(`
@@ -1356,8 +1371,14 @@ func (s *CassandraStore) ClaimBlockDelete(orgID uuid.UUID, blockID, claimID stri
 	if applied {
 		return true, nil
 	}
-	return parseCASString(existing["gc_state"]) == db.BlockGCStateDeleting &&
-		parseCASString(existing["gc_claim_id"]) == claimID, nil
+	gcState, gcClaimID, err := s.readBlockDeleteClaimState(orgID, blockID)
+	if err != nil {
+		return false, err
+	}
+	if gcState == "" && gcClaimID == "" {
+		return false, nil
+	}
+	return gcState == db.BlockGCStateDeleting && gcClaimID == claimID, nil
 }
 
 // ReleaseBlockClaim clears the gc_state claim when a concurrent reference appeared

@@ -872,15 +872,15 @@ func (h *FSHelper) RegisterUploadedBlock(orgID, libraryID, blockID, operationID 
 		return fmt.Errorf("add provisional block reference for %s: %w", blockID, err)
 	}
 
-	gcState, err := h.db.BlockGCState(orgID, blockID)
+	deleteFenceActive, err := h.db.BlockDeleteFenceActive(orgID, blockID)
 	if err != nil {
-		return fmt.Errorf("read block gc_state for %s: %w", blockID, err)
+		return fmt.Errorf("read block delete fence for %s: %w", blockID, err)
 	}
-	if gcState == db.BlockGCStateDeleting {
+	if deleteFenceActive {
 		if err := h.db.RemoveBlockReference(orgID, blockID, referrer); err != nil {
-			log.Printf("[RegisterUploadedBlock] WARNING: failed to remove provisional reference for block %s after observing gc_state=%q: %v", blockID, gcState, err)
+			log.Printf("[RegisterUploadedBlock] WARNING: failed to remove provisional reference for block %s after observing an active block-delete fence: %v", blockID, err)
 		}
-		return fmt.Errorf("%w: block %s is currently claimed by GC", ErrBlockDeleteInProgress, blockID)
+		return fmt.Errorf("%w: block %s is currently fenced by GC delete", ErrBlockDeleteInProgress, blockID)
 	}
 
 	if err := h.db.UpsertBlockMetadata(orgID, blockID, sizeBytes, storageClass, storageKey); err != nil {
