@@ -1046,12 +1046,7 @@ func (h *FSHelper) CopyFSObjectToLibrary(orgID, srcRepoID, dstRepoID, fsID strin
 	return newDirFSID, nil
 }
 
-// CreateFileFSObject creates a new fs_object for a file and registers a permanent
-// block reference for each of its blocks (row-per-reference liveness). References
-// are written BEFORE the fs_object row so a partial failure leaves harmless orphan
-// references rather than an fs_object whose blocks are unreferenced. orgID is
-// required to key the block reference rows (blocks are partitioned per org).
-func (h *FSHelper) CreateFileFSObject(orgID, repoID, name string, size int64, blockIDs []string) (string, error) {
+func buildFileFSObjectID(blockIDs []string, size int64) (string, error) {
 	// Calculate fs_id as SHA-1 of the EXACT JSON that will be returned by pack-fs
 	// Seafile format: {"block_ids":[...],"size":N,"type":1,"version":1} (alphabetical key order)
 	// CRITICAL: The hash MUST match what the client receives, or it can't store the object
@@ -1068,7 +1063,30 @@ func (h *FSHelper) CreateFileFSObject(orgID, repoID, name string, size int64, bl
 		return "", fmt.Errorf("failed to marshal fs content: %w", err)
 	}
 	hash := sha1.Sum(fsContentJSON)
-	fsID := hex.EncodeToString(hash[:])
+	return hex.EncodeToString(hash[:]), nil
+}
+
+func (h *FSHelper) createFileFSObjectRow(repoID, fsID, name string, size int64, blockIDs []string) error {
+	err := h.db.Session().Query(`
+		INSERT INTO fs_objects (library_id, fs_id, obj_type, obj_name, block_ids, size_bytes, mtime)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+	`, repoID, fsID, "file", name, blockIDs, size, time.Now().Unix()).Exec()
+	if err != nil {
+		return fmt.Errorf("failed to create fs_object: %w", err)
+	}
+	return nil
+}
+
+// CreateFileFSObject creates a new fs_object for a file and registers a permanent
+// block reference for each of its blocks (row-per-reference liveness). References
+// are written BEFORE the fs_object row so a partial failure leaves harmless orphan
+// references rather than an fs_object whose blocks are unreferenced. orgID is
+// required to key the block reference rows (blocks are partitioned per org).
+func (h *FSHelper) CreateFileFSObject(orgID, repoID, name string, size int64, blockIDs []string) (string, error) {
+	fsID, err := buildFileFSObjectID(blockIDs, size)
+	if err != nil {
+		return "", err
+	}
 
 	// Register permanent block references before inserting the fs_object row.
 	// Fail-closed: if any block ID cannot be resolved, no fs_object is created.
@@ -1076,13 +1094,8 @@ func (h *FSHelper) CreateFileFSObject(orgID, repoID, name string, size int64, bl
 		return "", fmt.Errorf("failed to register block references for fs_object %s: %w", fsID, err)
 	}
 
-	// Store in database
-	err = h.db.Session().Query(`
-		INSERT INTO fs_objects (library_id, fs_id, obj_type, obj_name, block_ids, size_bytes, mtime)
-		VALUES (?, ?, ?, ?, ?, ?, ?)
-	`, repoID, fsID, "file", name, blockIDs, size, time.Now().Unix()).Exec()
-	if err != nil {
-		return "", fmt.Errorf("failed to create fs_object: %w", err)
+	if err := h.createFileFSObjectRow(repoID, fsID, name, size, blockIDs); err != nil {
+		return "", err
 	}
 
 	return fsID, nil

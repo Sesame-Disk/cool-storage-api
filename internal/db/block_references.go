@@ -2,6 +2,8 @@ package db
 
 import (
 	"errors"
+	"fmt"
+	"strings"
 	"time"
 
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
@@ -53,6 +55,112 @@ func BlockReferrerForPublishAttempt(attemptID string) string {
 // reference once the upload is committed.
 func BlockReferrerForUpload(uploadToken string) string {
 	return blockReferrerUploadPrefix + uploadToken
+}
+
+// BlockIDResolver optionally resolves caller-facing block IDs into the block ID
+// partition key used in block_references before staging a publish attempt.
+type BlockIDResolver func(blockIDs []string) ([]string, error)
+
+func normalizeBlockIDs(blockIDs []string) []string {
+	if len(blockIDs) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(blockIDs))
+	normalized := make([]string, 0, len(blockIDs))
+	for _, blockID := range blockIDs {
+		blockID = strings.TrimSpace(blockID)
+		if blockID == "" {
+			continue
+		}
+		if _, dup := seen[blockID]; dup {
+			continue
+		}
+		seen[blockID] = struct{}{}
+		normalized = append(normalized, blockID)
+	}
+	if len(normalized) == 0 {
+		return nil
+	}
+	return normalized
+}
+
+// AddPublishAttemptReferences stages temporary pub:<attempt> references for an
+// in-flight metadata publish. Input IDs are normalized with TrimSpace + dedup so
+// retrying callers can safely pass repeated or padded block IDs.
+func AddPublishAttemptReferences(database *DB, orgID, repoID, attemptID string, blockIDs []string) error {
+	if database == nil {
+		return nil
+	}
+	referrer := BlockReferrerForPublishAttempt(attemptID)
+	for _, blockID := range normalizeBlockIDs(blockIDs) {
+		if err := database.AddBlockReference(orgID, blockID, referrer, repoID, 0); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// RemovePublishAttemptReferences removes temporary pub:<attempt> references. It
+// is safe to call repeatedly and collapses repeated delete errors with errors.Join.
+func RemovePublishAttemptReferences(database *DB, orgID, attemptID string, blockIDs []string) error {
+	if database == nil {
+		return nil
+	}
+	referrer := BlockReferrerForPublishAttempt(attemptID)
+	var removeErr error
+	for _, blockID := range normalizeBlockIDs(blockIDs) {
+		if err := database.RemoveBlockReference(orgID, blockID, referrer); err != nil {
+			removeErr = errors.Join(removeErr, err)
+		}
+	}
+	return removeErr
+}
+
+// StagePublishAttemptReferences resolves block IDs when needed, then records the
+// attempt-local pub:<attempt> rows that keep blocks alive until HEAD publish wins.
+func StagePublishAttemptReferences(database *DB, orgID, repoID, attemptID string, blockIDs []string, resolve BlockIDResolver) ([]string, error) {
+	resolved := blockIDs
+	if resolve != nil {
+		var err error
+		resolved, err = resolve(blockIDs)
+		if err != nil {
+			return nil, err
+		}
+	}
+	resolved = normalizeBlockIDs(resolved)
+	if err := AddPublishAttemptReferences(database, orgID, repoID, attemptID, resolved); err != nil {
+		return nil, err
+	}
+	return resolved, nil
+}
+
+// CleanupFailedPublishAttempt removes the losing commit row and its attempt-local
+// publish refs after a confirmed HEAD conflict.
+func CleanupFailedPublishAttempt(database *DB, orgID, repoID, attemptID, commitID string, blockIDs []string) error {
+	if database == nil {
+		return nil
+	}
+	var cleanupErr error
+	if strings.TrimSpace(commitID) != "" {
+		if err := database.Session().Query(`
+			DELETE FROM commits WHERE library_id = ? AND commit_id = ?
+		`, repoID, commitID).Exec(); err != nil {
+			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("delete failed publish commit %s: %w", commitID, err))
+		}
+	}
+	if err := RemovePublishAttemptReferences(database, orgID, attemptID, blockIDs); err != nil {
+		cleanupErr = errors.Join(cleanupErr, fmt.Errorf("remove publish-attempt refs for %s: %w", attemptID, err))
+	}
+	return cleanupErr
+}
+
+// PromotePublishAttemptReferences promotes an already-published fs_object to its
+// permanent refs and then removes the temporary attempt-local pub:<attempt> rows.
+func PromotePublishAttemptReferences(database *DB, orgID, attemptID string, blockIDs []string, registerPermanent func() error) error {
+	if err := registerPermanent(); err != nil {
+		return err
+	}
+	return RemovePublishAttemptReferences(database, orgID, attemptID, blockIDs)
 }
 
 // UpsertBlockMetadata stores immutable block metadata (size, storage class/key)

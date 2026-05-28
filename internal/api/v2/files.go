@@ -2930,7 +2930,8 @@ func (h *FileHandler) finalizeStoredUploadMetadataOnce(fsHelper *FSHelper, orgID
 		}
 	}
 
-	fileFSID, err := fsHelper.CreateFileFSObject(orgID, repoID, actualFilename, fileSize, []string{fileID})
+	blockIDs := []string{fileID}
+	fileFSID, err := buildFileFSObjectID(blockIDs, fileSize)
 	if err != nil {
 		return "", 0, 0, fmt.Errorf("failed to create file metadata: %w", err)
 	}
@@ -2972,13 +2973,35 @@ func (h *FileHandler) finalizeStoredUploadMetadataOnce(fsHelper *FSHelper, orgID
 	}
 
 	description := fmt.Sprintf("Added or modified \"%s\".\n", actualFilename)
+	publishAttemptID := uuid.NewString()
+	resolvedBlockIDs, err := db.StagePublishAttemptReferences(fsHelper.db, orgID, repoID, publishAttemptID, blockIDs, func(blockIDs []string) ([]string, error) {
+		return resolveStoredBlockIDsFn(fsHelper, orgID, blockIDs)
+	})
+	if err != nil {
+		return "", 0, 0, fmt.Errorf("failed to stage publish-attempt block references: %w", err)
+	}
+	if err := fsHelper.createFileFSObjectRow(repoID, fileFSID, actualFilename, fileSize, blockIDs); err != nil {
+		_ = db.RemovePublishAttemptReferences(h.db, orgID, publishAttemptID, resolvedBlockIDs)
+		return "", 0, 0, fmt.Errorf("failed to create file metadata: %w", err)
+	}
 	newCommitID, err := fsHelper.CreateCommit(repoID, userID, newRootFSID, snapshot.HeadCommitID, description)
 	if err != nil {
+		_ = db.RemovePublishAttemptReferences(h.db, orgID, publishAttemptID, resolvedBlockIDs)
 		return "", 0, 0, fmt.Errorf("failed to create commit: %w", err)
 	}
 
 	if err := fsHelper.UpdateLibraryHeadFromSnapshot(snapshot, repoID, newCommitID, snapshot.HeadCommitID); err != nil {
+		if errors.Is(err, ErrLibraryHeadConflict) {
+			if cleanupErr := db.CleanupFailedPublishAttempt(h.db, orgID, repoID, publishAttemptID, newCommitID, resolvedBlockIDs); cleanupErr != nil {
+				return "", 0, 0, fmt.Errorf("failed to clean up conflict publish attempt %s: %w", publishAttemptID, cleanupErr)
+			}
+		}
 		return "", 0, 0, fmt.Errorf("failed to update library: %w", err)
+	}
+	if err := db.PromotePublishAttemptReferences(fsHelper.db, orgID, publishAttemptID, resolvedBlockIDs, func() error {
+		return fsHelper.RegisterFSObjectBlockReferences(orgID, repoID, fileFSID, blockIDs)
+	}); err != nil {
+		log.Printf("[UploadFile] WARNING: head updated for repo=%s commit=%s but failed to promote block references for fs_object %s: %v", repoID, newCommitID, fileFSID, err)
 	}
 
 	return actualFilename, storageDeltaBytes, storageDeltaFiles, nil

@@ -125,6 +125,54 @@ func uploadTokenFromURL(uploadURL string) string {
 	return uploadURL[idx+1:]
 }
 
+func uploadedFileBlockReferrers(t *testing.T, repoID, dirPath, fileName string) []string {
+	t.Helper()
+	session := shareProjectionDBForTest(t).Session()
+	orgID := resolveOrgID(t, repoID)
+
+	listResp := adminClient.Get(t, fmt.Sprintf("/api/v2.1/repos/%s/dir/?p=%s", repoID, url.QueryEscape(dirPath)))
+	expectStatus(t, listResp, http.StatusOK)
+	var dirList map[string]interface{}
+	decodeJSON(t, listResp, &dirList)
+	entries, _ := dirList["dirent_list"].([]interface{})
+
+	var fileFSID string
+	for _, rawEntry := range entries {
+		entry, _ := rawEntry.(map[string]interface{})
+		if name, _ := entry["name"].(string); name == fileName {
+			fileFSID, _ = entry["id"].(string)
+			break
+		}
+	}
+	if fileFSID == "" {
+		t.Fatalf("uploaded file %q not found in %s", fileName, dirPath)
+	}
+
+	var blockIDs []string
+	if err := session.Query(`SELECT block_ids FROM fs_objects WHERE library_id = ? AND fs_id = ?`, repoID, fileFSID).Scan(&blockIDs); err != nil {
+		t.Fatalf("failed to read block ids for %s/%s: %v", repoID, fileFSID, err)
+	}
+	if len(blockIDs) != 1 {
+		t.Fatalf("block ids for %q = %v, want exactly one block", fileName, blockIDs)
+	}
+
+	var internalBlockID string
+	if err := session.Query(`SELECT internal_id FROM block_id_mappings WHERE org_id = ? AND external_id = ?`, orgID, blockIDs[0]).Scan(&internalBlockID); err != nil {
+		t.Fatalf("failed to resolve block mapping for %s/%s: %v", orgID, blockIDs[0], err)
+	}
+
+	iter := session.Query(`SELECT referrer FROM block_references WHERE org_id = ? AND block_id = ?`, orgID, internalBlockID).Iter()
+	referrers := make([]string, 0, 4)
+	var referrer string
+	for iter.Scan(&referrer) {
+		referrers = append(referrers, referrer)
+	}
+	if err := iter.Close(); err != nil {
+		t.Fatalf("failed to read block references for %s/%s: %v", orgID, internalBlockID, err)
+	}
+	return referrers
+}
+
 // ── 1. High-concurrency seafhttp upload (commitUploadedFile path) ─────────────
 //
 // 16 goroutines race to finalise their upload metadata against the same library
@@ -302,6 +350,7 @@ func TestConcurrentSeafhttpUploadWhileDeletingNoLostFiles(t *testing.T) {
 
 func TestConcurrentV2UploadsNoLostCommits(t *testing.T) {
 	const concurrency = 10
+	requireCassandra(t)
 
 	repoID := createTestLibrary(t, adminClient, fmt.Sprintf("inttest-v2upload-race-%d", time.Now().UnixNano()))
 
@@ -318,6 +367,22 @@ func TestConcurrentV2UploadsNoLostCommits(t *testing.T) {
 	})
 	expectConcurrentStatuses(t, results, http.StatusOK, http.StatusCreated)
 	expectEntriesPresent(t, repoID, "/", names)
+
+	for _, name := range names {
+		referrers := uploadedFileBlockReferrers(t, repoID, "/", name)
+		fsRefs := 0
+		for _, referrer := range referrers {
+			if strings.HasPrefix(referrer, "pub:") {
+				t.Fatalf("uploaded file %q leaked publish-attempt ref %q after concurrent finalize", name, referrer)
+			}
+			if strings.HasPrefix(referrer, "fs:") {
+				fsRefs++
+			}
+		}
+		if fsRefs != 1 {
+			t.Fatalf("uploaded file %q fs ref count = %d, want 1; referrers=%v", name, fsRefs, referrers)
+		}
+	}
 }
 
 // ── 5. Subdirectory upload concurrency ────────────────────────────────────────
