@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -1836,9 +1837,11 @@ func TestSyncDerivedStateCanaryAlignedWith(t *testing.T) {
 // function via repairSyncHeadDerivedStateIfDriftedFn, which the test injects
 // directly so this contract can be exercised without a real DB session.
 func TestHandleSyncHeadIdempotentSuccess(t *testing.T) {
-	makeHandler := func(repair func(orgID, repoID, targetHead string) error) *SyncHandler {
+	makeHandler := func(blockRepair, derivedRepair func(orgID, repoID, targetHead string) error) *SyncHandler {
 		return &SyncHandler{
-			repairSyncHeadDerivedStateIfDriftedFn: repair,
+			repairPublishedSyncCommitBlockDeltaFn: blockRepair,
+			repairSyncHeadDerivedStateIfDriftedFn: derivedRepair,
+			finalizedBlockDeltas:                  newSyncFinalizedDeltaSet(),
 		}
 	}
 
@@ -1855,7 +1858,7 @@ func TestHandleSyncHeadIdempotentSuccess(t *testing.T) {
 		var capturedArgs struct {
 			orgID, repoID, targetHead string
 		}
-		h := makeHandler(func(orgID, repoID, targetHead string) error {
+		h := makeHandler(nil, func(orgID, repoID, targetHead string) error {
 			calls++
 			capturedArgs.orgID = orgID
 			capturedArgs.repoID = repoID
@@ -1882,8 +1885,101 @@ func TestHandleSyncHeadIdempotentSuccess(t *testing.T) {
 		}
 	})
 
-	t.Run("returns 503 with Retry-After when canary repair fails", func(t *testing.T) {
+	t.Run("returns 503 with Retry-After when block-reference repair fails", func(t *testing.T) {
+		blockRepairCalls := 0
+		derivedRepairCalls := 0
 		h := makeHandler(func(string, string, string) error {
+			blockRepairCalls++
+			return errors.New("block repair failed")
+		}, func(string, string, string) error {
+			derivedRepairCalls++
+			return nil
+		})
+		r := mountTestRoute(h)
+
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/test/lib-1/idempotent/target-head", nil)
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusServiceUnavailable {
+			t.Fatalf("status = %d, want 503; body=%s", w.Code, w.Body.String())
+		}
+		if got := w.Header().Get("Retry-After"); got != "1" {
+			t.Fatalf("Retry-After = %q, want 1", got)
+		}
+		if !strings.Contains(w.Body.String(), "sync head publish block-reference reconciliation pending") {
+			t.Fatalf("body = %q, want block-reference-repair-pending error", w.Body.String())
+		}
+		if blockRepairCalls != 1 {
+			t.Fatalf("block repair calls = %d, want 1", blockRepairCalls)
+		}
+		if derivedRepairCalls != 0 {
+			t.Fatalf("derived repair calls = %d, want 0 when block repair fails first", derivedRepairCalls)
+		}
+	})
+
+	t.Run("skips block-reference repair when finalized delta memo hits", func(t *testing.T) {
+		blockRepairCalls := 0
+		derivedRepairCalls := 0
+		h := makeHandler(func(string, string, string) error {
+			blockRepairCalls++
+			return nil
+		}, func(string, string, string) error {
+			derivedRepairCalls++
+			return nil
+		})
+		h.finalizedBlockDeltas.mark("lib-1", "target-head")
+		r := mountTestRoute(h)
+
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/test/lib-1/idempotent/target-head", nil)
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200; body=%s", w.Code, w.Body.String())
+		}
+		if blockRepairCalls != 0 {
+			t.Fatalf("block repair calls = %d, want 0 on finalized-delta memo hit", blockRepairCalls)
+		}
+		if derivedRepairCalls != 1 {
+			t.Fatalf("derived repair calls = %d, want 1", derivedRepairCalls)
+		}
+	})
+
+	t.Run("runs block-reference repair on finalized delta memo miss before derived-state repair", func(t *testing.T) {
+		calls := make([]string, 0, 2)
+		h := makeHandler(func(orgID, repoID, targetHead string) error {
+			calls = append(calls, fmt.Sprintf("block:%s:%s:%s", orgID, repoID, targetHead))
+			return nil
+		}, func(orgID, repoID, targetHead string) error {
+			calls = append(calls, fmt.Sprintf("derived:%s:%s:%s", orgID, repoID, targetHead))
+			return nil
+		})
+		r := mountTestRoute(h)
+
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/test/lib-1/idempotent/target-head", nil)
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200; body=%s", w.Code, w.Body.String())
+		}
+		want := []string{
+			"block:00000000-0000-0000-0000-000000000001:lib-1:target-head",
+			"derived:00000000-0000-0000-0000-000000000001:lib-1:target-head",
+		}
+		if len(calls) != len(want) {
+			t.Fatalf("call count = %d, want %d (%v)", len(calls), len(want), calls)
+		}
+		for i := range want {
+			if calls[i] != want[i] {
+				t.Fatalf("calls[%d] = %q, want %q (full=%v)", i, calls[i], want[i], calls)
+			}
+		}
+	})
+
+	t.Run("returns 503 with Retry-After when canary repair fails", func(t *testing.T) {
+		h := makeHandler(nil, func(string, string, string) error {
 			return errors.New("repair failed")
 		})
 		r := mountTestRoute(h)
@@ -2285,4 +2381,60 @@ func TestBlockHashValidation(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestSyncFinalizedDeltaSet(t *testing.T) {
+	t.Run("miss before mark, hit after", func(t *testing.T) {
+		set := newSyncFinalizedDeltaSet()
+		if set.contains("repo-1", "head-1") {
+			t.Fatal("expected miss before mark")
+		}
+		set.mark("repo-1", "head-1")
+		if !set.contains("repo-1", "head-1") {
+			t.Fatal("expected hit after mark")
+		}
+		// A different head on the same repo must not be considered finalized.
+		if set.contains("repo-1", "head-2") {
+			t.Fatal("a distinct head must not be a hit")
+		}
+		if set.contains("repo-2", "head-1") {
+			t.Fatal("a distinct repo must not be a hit")
+		}
+	})
+
+	t.Run("entries survive one generation rotation, evict after two", func(t *testing.T) {
+		set := newSyncFinalizedDeltaSet()
+		set.mark("repo", "survivor")
+
+		// Fill the current generation to force a rotation; survivor moves to prev.
+		for i := 0; i < syncFinalizedDeltaShardCap; i++ {
+			set.mark("repo", fmt.Sprintf("gen1-%d", i))
+		}
+		if !set.contains("repo", "survivor") {
+			t.Fatal("entry should still be visible in the previous generation after one rotation")
+		}
+
+		// Fill again to force a second rotation; survivor is now dropped.
+		for i := 0; i < syncFinalizedDeltaShardCap; i++ {
+			set.mark("repo", fmt.Sprintf("gen2-%d", i))
+		}
+		if set.contains("repo", "survivor") {
+			t.Fatal("entry should be evicted after two rotations")
+		}
+	})
+
+	t.Run("nil set and empty keys are safe no-ops", func(t *testing.T) {
+		var set *syncFinalizedDeltaSet
+		set.mark("repo", "head") // must not panic
+		if set.contains("repo", "head") {
+			t.Fatal("nil set must always miss")
+		}
+
+		set = newSyncFinalizedDeltaSet()
+		set.mark("", "head")
+		set.mark("repo", "")
+		if set.contains("", "head") || set.contains("repo", "") {
+			t.Fatal("empty repo/commit keys must never be a hit")
+		}
+	})
 }

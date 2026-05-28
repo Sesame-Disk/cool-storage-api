@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
@@ -58,18 +59,83 @@ type SyncHandler struct {
 	// real DB. Production code leaves it nil; the idempotent fast-path then
 	// falls back to repairSyncHeadDerivedStateIfDrifted.
 	repairSyncHeadDerivedStateIfDriftedFn func(orgID, repoID, targetHead string) error
+
+	// repairPublishedSyncCommitBlockDeltaFn is an optional test seam used by
+	// unit tests to observe or fail the idempotent block-reference repair path
+	// without a real DB session. Production code leaves it nil; the helper then
+	// runs the real block-delta reconciliation.
+	repairPublishedSyncCommitBlockDeltaFn func(orgID, repoID, targetHead string) error
+
+	// finalizedBlockDeltas memoizes (repo, head) pairs whose sync block-reference
+	// delta this process has fully finalized, so the idempotent retry path can skip
+	// the costly full-tree repair. Nil-safe: a handler built without it just always
+	// runs the full (idempotent) repair.
+	finalizedBlockDeltas *syncFinalizedDeltaSet
 }
 
 // NewSyncHandler creates a new sync protocol handler
 func NewSyncHandler(database *db.DB, s3Store *storage.S3Store, blockStore *storage.BlockStore, storageManager *storage.Manager, cfg *config.Config, permMiddleware *middleware.PermissionMiddleware) *SyncHandler {
 	return &SyncHandler{
-		db:             database,
-		storage:        s3Store,
-		blockStore:     blockStore,
-		storageManager: storageManager,
-		config:         cfg,
-		permMiddleware: permMiddleware,
+		db:                   database,
+		storage:              s3Store,
+		blockStore:           blockStore,
+		storageManager:       storageManager,
+		config:               cfg,
+		permMiddleware:       permMiddleware,
+		finalizedBlockDeltas: newSyncFinalizedDeltaSet(),
 	}
+}
+
+// syncFinalizedDeltaShardCap bounds each generation of the finalized-delta memo.
+// At most 2x this many entries are retained (current + previous generation), so
+// memory stays capped without per-entry timestamps or a background sweeper.
+const syncFinalizedDeltaShardCap = 4096
+
+// syncFinalizedDeltaSet is a bounded, thread-safe set of "(repo, head) finalized"
+// markers. It exists purely to let handleSyncHeadIdempotentSuccess skip the
+// full-tree block-reference repair when this process already finalized the exact
+// head. It is intentionally conservative: a missing entry just means the caller
+// runs the full (idempotent) reconciliation, so eviction, restarts, and
+// multi-instance deployments can never cause incorrect behavior — only an extra
+// repair. Entries stay valid for as long as the commit remains the head, because
+// finalized fs: references are permanent until a later head transition removes
+// them (which also changes the head, so the idempotent path no longer matches).
+type syncFinalizedDeltaSet struct {
+	mu   sync.Mutex
+	cur  map[string]struct{}
+	prev map[string]struct{}
+}
+
+func newSyncFinalizedDeltaSet() *syncFinalizedDeltaSet {
+	return &syncFinalizedDeltaSet{cur: make(map[string]struct{}, syncFinalizedDeltaShardCap)}
+}
+
+func (s *syncFinalizedDeltaSet) mark(repoID, commitID string) {
+	if s == nil || repoID == "" || commitID == "" {
+		return
+	}
+	key := repoID + ":" + commitID
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.cur) >= syncFinalizedDeltaShardCap {
+		s.prev = s.cur
+		s.cur = make(map[string]struct{}, syncFinalizedDeltaShardCap)
+	}
+	s.cur[key] = struct{}{}
+}
+
+func (s *syncFinalizedDeltaSet) contains(repoID, commitID string) bool {
+	if s == nil || repoID == "" || commitID == "" {
+		return false
+	}
+	key := repoID + ":" + commitID
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.cur[key]; ok {
+		return true
+	}
+	_, ok := s.prev[key]
+	return ok
 }
 
 // checkSyncPermission verifies the user has the required permission level on the library.
@@ -2413,26 +2479,6 @@ func (d syncCommitBlockDelta) addedBlockIDs() []string {
 	return blockIDs
 }
 
-func normalizeSyncBlockIDs(blockIDs []string) []string {
-	if len(blockIDs) == 0 {
-		return nil
-	}
-	seen := make(map[string]struct{}, len(blockIDs))
-	normalized := make([]string, 0, len(blockIDs))
-	for _, blockID := range blockIDs {
-		blockID = strings.TrimSpace(blockID)
-		if blockID == "" {
-			continue
-		}
-		if _, dup := seen[blockID]; dup {
-			continue
-		}
-		seen[blockID] = struct{}{}
-		normalized = append(normalized, blockID)
-	}
-	return normalized
-}
-
 func syncBlockUploadOperationID(repoID, blockID string) string {
 	return "sync:" + repoID + ":" + blockID
 }
@@ -2475,7 +2521,7 @@ func (h *SyncHandler) loadSyncFileBlockIDs(repoID string, fileIDs []string) (map
 				_ = iter.Close()
 				return nil, fmt.Errorf("unsupported fs_object type %q for %s", objType, fsID)
 			}
-			normalized := normalizeSyncBlockIDs(blockIDs)
+			normalized := db.NormalizeBlockIDs(blockIDs)
 			if len(normalized) == 0 {
 				resolved[fsID] = nil
 				continue
@@ -2525,7 +2571,7 @@ func (h *SyncHandler) collectSyncReachableFiles(repoID, rootFSID string) (map[st
 
 		switch objType {
 		case "file":
-			normalized := normalizeSyncBlockIDs(blockIDs)
+			normalized := db.NormalizeBlockIDs(blockIDs)
 			if len(normalized) != 0 {
 				files[fsID] = normalized
 			}
@@ -2598,6 +2644,17 @@ func (h *SyncHandler) collectSyncCommitFiles(repoID, commitID string) (map[strin
 	return h.collectSyncReachableFiles(repoID, rootFSID)
 }
 
+// buildSyncCommitBlockDelta computes the file-level block reference delta between
+// targetCommitID and its immediate parent.
+//
+// INVARIANT (load-bearing): the head only ever advances by exactly one generation
+// — either a direct fast-forward where the target's parent IS the current head
+// (enforced in handleSyncHeadPromotion) or an auto-merge commit whose parent IS
+// the current head (createSyncAutoMergeCommit). A single-generation diff therefore
+// captures every newly-reachable file, so registering fs: references for the added
+// files covers the whole transition. If a future change ever allows the head to
+// jump multiple generations at once, files added by skipped intermediate commits
+// would never get their permanent references and this delta must be revisited.
 func (h *SyncHandler) buildSyncCommitBlockDelta(repoID, targetCommitID string) (syncCommitBlockDelta, error) {
 	parentCommitID, _, err := h.readSyncTargetCommit(repoID, targetCommitID)
 	if err != nil {
@@ -2632,7 +2689,7 @@ func (h *SyncHandler) buildSyncCommitBlockDelta(repoID, targetCommitID string) (
 }
 
 func (h *SyncHandler) resolveSyncBlockIDs(orgID string, blockIDs []string) ([]string, error) {
-	blockIDs = normalizeSyncBlockIDs(blockIDs)
+	blockIDs = db.NormalizeBlockIDs(blockIDs)
 	if len(blockIDs) == 0 {
 		return nil, nil
 	}
@@ -2640,7 +2697,7 @@ func (h *SyncHandler) resolveSyncBlockIDs(orgID string, blockIDs []string) ([]st
 	if err != nil {
 		return nil, err
 	}
-	return normalizeSyncBlockIDs(resolved), nil
+	return db.NormalizeBlockIDs(resolved), nil
 }
 
 func (h *SyncHandler) stageSyncCommitBlockDelta(orgID, repoID, targetCommitID string) (syncCommitBlockDelta, error) {
@@ -2661,7 +2718,7 @@ func (h *SyncHandler) stageSyncCommitBlockDelta(orgID, repoID, targetCommitID st
 func (h *SyncHandler) releaseSyncUploadReferences(orgID, repoID string, blockIDs []string) {
 	fsHelper := v2.NewFSHelper(h.db)
 	var zeroRefBlocks []string
-	for _, blockID := range normalizeSyncBlockIDs(blockIDs) {
+	for _, blockID := range db.NormalizeBlockIDs(blockIDs) {
 		zeroRefBlocks = append(zeroRefBlocks, fsHelper.ReleaseUploadReferences(orgID, repoID, syncBlockUploadOperationID(repoID, blockID), []string{blockID})...)
 	}
 	h.enqueueSyncZeroRefBlocks(orgID, repoID, zeroRefBlocks)
@@ -2693,7 +2750,7 @@ func (h *SyncHandler) removeSyncCommitFileReferences(orgID, repoID string, remov
 }
 
 func (h *SyncHandler) enqueueSyncZeroRefBlocks(orgID, repoID string, blockIDs []string) {
-	blockIDs = normalizeSyncBlockIDs(blockIDs)
+	blockIDs = db.NormalizeBlockIDs(blockIDs)
 	if h.db == nil || len(blockIDs) == 0 {
 		return
 	}
@@ -2736,11 +2793,28 @@ func (h *SyncHandler) finalizeSyncCommitBlockDelta(orgID, repoID, targetCommitID
 		return err
 	}
 	h.releaseSyncUploadReferences(orgID, repoID, delta.resolvedAddedBlockIDs)
+	h.finalizedBlockDeltas.mark(repoID, targetCommitID)
 	return nil
 }
 
+// repairPublishedSyncCommitBlockDelta re-runs the block-reference reconciliation
+// for an already-published head on the idempotent retry path, healing a prior
+// publish whose finalize did not complete. It is a no-op when this process already
+// finalized the exact (repo, head): the full-tree reachability walk is the costly
+// part, so skipping it spares every idempotent retry once finalize has succeeded
+// here. A miss (cold process, another instance, evicted entry) safely falls back
+// to the full reconciliation, which is idempotent.
 func (h *SyncHandler) repairPublishedSyncCommitBlockDelta(orgID, repoID, targetCommitID string) error {
-	if h == nil || h.db == nil {
+	if h == nil {
+		return nil
+	}
+	if h.finalizedBlockDeltas.contains(repoID, targetCommitID) {
+		return nil
+	}
+	if h.repairPublishedSyncCommitBlockDeltaFn != nil {
+		return h.repairPublishedSyncCommitBlockDeltaFn(orgID, repoID, targetCommitID)
+	}
+	if h.db == nil {
 		return nil
 	}
 	delta, err := h.buildSyncCommitBlockDelta(repoID, targetCommitID)

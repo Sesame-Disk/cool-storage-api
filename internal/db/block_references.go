@@ -61,7 +61,11 @@ func BlockReferrerForUpload(uploadToken string) string {
 // partition key used in block_references before staging a publish attempt.
 type BlockIDResolver func(blockIDs []string) ([]string, error)
 
-func normalizeBlockIDs(blockIDs []string) []string {
+// NormalizeBlockIDs trims, drops empties, and de-duplicates block IDs while
+// preserving first-seen order. Returns nil when nothing usable remains. Callers
+// that stage/remove references share this so the same key set is produced on both
+// sides of an add/remove pair.
+func NormalizeBlockIDs(blockIDs []string) []string {
 	if len(blockIDs) == 0 {
 		return nil
 	}
@@ -92,7 +96,7 @@ func AddPublishAttemptReferences(database *DB, orgID, repoID, attemptID string, 
 		return nil
 	}
 	referrer := BlockReferrerForPublishAttempt(attemptID)
-	for _, blockID := range normalizeBlockIDs(blockIDs) {
+	for _, blockID := range NormalizeBlockIDs(blockIDs) {
 		if err := database.AddBlockReference(orgID, blockID, referrer, repoID, 0); err != nil {
 			return err
 		}
@@ -108,7 +112,7 @@ func RemovePublishAttemptReferences(database *DB, orgID, attemptID string, block
 	}
 	referrer := BlockReferrerForPublishAttempt(attemptID)
 	var removeErr error
-	for _, blockID := range normalizeBlockIDs(blockIDs) {
+	for _, blockID := range NormalizeBlockIDs(blockIDs) {
 		if err := database.RemoveBlockReference(orgID, blockID, referrer); err != nil {
 			removeErr = errors.Join(removeErr, err)
 		}
@@ -127,7 +131,7 @@ func StagePublishAttemptReferences(database *DB, orgID, repoID, attemptID string
 			return nil, err
 		}
 	}
-	resolved = normalizeBlockIDs(resolved)
+	resolved = NormalizeBlockIDs(resolved)
 	if err := AddPublishAttemptReferences(database, orgID, repoID, attemptID, resolved); err != nil {
 		return nil, err
 	}
