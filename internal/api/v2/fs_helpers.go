@@ -15,7 +15,6 @@ import (
 	"github.com/Sesame-Disk/sesamefs/internal/db"
 	"github.com/Sesame-Disk/sesamefs/internal/streaming"
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
-	"github.com/google/uuid"
 )
 
 // FSHelper provides helper functions for file system operations
@@ -47,18 +46,6 @@ func NewFSHelper(database *db.DB) *FSHelper {
 
 var resolveStoredBlockIDsFn = func(h *FSHelper, orgID string, blockIDs []string) ([]string, error) {
 	return h.resolveStoredBlockIDs(orgID, blockIDs)
-}
-
-var markBlockMutationProcessedFn = func(h *FSHelper, operationKey string) (bool, error) {
-	return h.markBlockMutationProcessed(operationKey)
-}
-
-var decrementBlockRefCountFn = func(h *FSHelper, orgID, blockID string) bool {
-	return h.decrementBlockRefCount(orgID, blockID)
-}
-
-var incrementOrCreateBlockFn = func(h *FSHelper, orgID, blockID string, sizeBytes int, storageClass, storageKey string) error {
-	return h.IncrementOrCreateBlock(orgID, blockID, sizeBytes, storageClass, storageKey)
 }
 
 // PathTraverseResult contains the result of traversing to a path
@@ -860,179 +847,97 @@ func (h *FSHelper) resolveStoredBlockIDs(orgID string, blockIDs []string) ([]str
 	return streaming.BatchResolveBlockIDs(h.db, orgID, blockIDs)
 }
 
-func (h *FSHelper) markBlockMutationProcessed(operationKey string) (bool, error) {
-	if strings.TrimSpace(operationKey) == "" {
-		return false, fmt.Errorf("operation key is required")
-	}
-	taskID := uuid.NewMD5(uuid.NameSpaceOID, []byte("block_ref_mutation:"+operationKey))
-	var existingTaskID string
-	return h.db.Session().Query(`
-		INSERT INTO gc_processed_items (task_id) VALUES (?) IF NOT EXISTS
-	`, taskID.String()).ScanCAS(&existingTaskID)
-}
-
-type blockMutationState struct {
-	exists       bool
-	refCount     int
-	sizeBytes    int
-	storageClass string
-	storageKey   string
-}
-
-func isAmbiguousBlockMutationError(err error) bool {
-	var casUnknown gocql.RequestErrCASWriteUnknown
-	var writeTimeout gocql.RequestErrWriteTimeout
-	return errors.As(err, &casUnknown) ||
-		(errors.As(err, &writeTimeout) && strings.EqualFold(strings.TrimSpace(writeTimeout.WriteType), "CAS")) ||
-		errors.Is(err, gocql.ErrTimeoutNoResponse) ||
-		errors.Is(err, gocql.ErrConnectionClosed)
-}
-
-func (h *FSHelper) confirmBlockMutationState(orgID, blockID string) (blockMutationState, error) {
-	state := blockMutationState{}
-	err := h.db.Session().Query(`
-		SELECT ref_count, size_bytes, storage_class, storage_key FROM blocks WHERE org_id = ? AND block_id = ?
-	`, orgID, blockID).Consistency(gocql.Serial).Scan(&state.refCount, &state.sizeBytes, &state.storageClass, &state.storageKey)
-	if err == nil {
-		state.exists = true
-		return state, nil
-	}
-	if errors.Is(err, gocql.ErrNotFound) {
-		return state, nil
-	}
-	return state, err
-}
-
-func resolveIncrementBlockMutationError(blockID string, expectedRefCount int, updateErr error, confirmVisible func() (blockMutationState, error)) (bool, error) {
-	wrapped := fmt.Errorf("conditional block ref-count increment failed for %s: %w", blockID, updateErr)
-	if !isAmbiguousBlockMutationError(updateErr) {
-		return false, wrapped
-	}
-
-	state, confirmErr := confirmVisible()
-	if confirmErr == nil {
-		switch {
-		case !state.exists:
-			log.Printf("[IncrementOrCreateBlock] INFO: ambiguous CAS error for block %s confirmed the row is still missing; retrying", blockID)
-			return true, nil
-		case state.refCount == expectedRefCount-1:
-			log.Printf("[IncrementOrCreateBlock] INFO: ambiguous CAS error for block %s confirmed ref_count remains at %d; retrying", blockID, state.refCount)
-			return true, nil
-		default:
-			log.Printf("[IncrementOrCreateBlock] WARNING: ambiguous CAS error for block %s confirmed ref_count=%d, which cannot be attributed to this operation", blockID, state.refCount)
-			return false, errors.Join(
-				ErrBlockMutationOutcomeUnknown,
-				wrapped,
-				fmt.Errorf("confirmation read found ref_count=%d; cannot attribute the ambiguous increment", state.refCount),
-			)
-		}
-	}
-
-	log.Printf("[IncrementOrCreateBlock] WARNING: ambiguous CAS error for block %s could not be confirmed: %v", blockID, confirmErr)
-	return false, errors.Join(
-		ErrBlockMutationOutcomeUnknown,
-		wrapped,
-		fmt.Errorf("confirmation read failed: %w", confirmErr),
-	)
-}
-
-func resolveInsertBlockMutationError(blockID string, sizeBytes int, storageClass, storageKey string, insertErr error, confirmVisible func() (blockMutationState, error)) (bool, error) {
-	wrapped := fmt.Errorf("conditional block insert failed for %s: %w", blockID, insertErr)
-	if !isAmbiguousBlockMutationError(insertErr) {
-		return false, wrapped
-	}
-
-	state, confirmErr := confirmVisible()
-	if confirmErr == nil {
-		if !state.exists {
-			log.Printf("[IncrementOrCreateBlock] INFO: ambiguous CAS error while inserting block %s confirmed the row is still missing; retrying", blockID)
-			return true, nil
-		}
-		log.Printf("[IncrementOrCreateBlock] WARNING: ambiguous CAS error while inserting block %s confirmed an existing row ref_count=%d size=%d storage_class=%q storage_key=%q, which cannot be attributed to this operation", blockID, state.refCount, state.sizeBytes, state.storageClass, state.storageKey)
-		return false, errors.Join(
-			ErrBlockMutationOutcomeUnknown,
-			wrapped,
-			fmt.Errorf("confirmation read found existing row ref_count=%d size=%d storage_class=%q storage_key=%q; cannot attribute the ambiguous insert", state.refCount, state.sizeBytes, state.storageClass, state.storageKey),
-		)
-	}
-
-	log.Printf("[IncrementOrCreateBlock] WARNING: ambiguous CAS error while inserting block %s could not be confirmed: %v", blockID, confirmErr)
-	return false, errors.Join(
-		ErrBlockMutationOutcomeUnknown,
-		wrapped,
-		fmt.Errorf("confirmation read failed: %w", confirmErr),
-	)
-}
-
-func (h *FSHelper) IncrementOrCreateBlock(orgID, blockID string, sizeBytes int, storageClass, storageKey string) error {
+// RegisterUploadedBlock records freshly-uploaded block metadata plus a
+// provisional reference that keeps the block alive until its fs_object is
+// committed. The provisional reference carries a TTL, so an abandoned upload
+// cannot leak the block forever. Liveness is row-based (no mutable counter), so
+// a client retry that re-uploads the same block is naturally idempotent.
+//
+// blockID must already be the internal (SHA-256) ID. The reference is written
+// BEFORE the metadata read so that a concurrent GC claim-then-verify observes it.
+// If the GC worker has claimed the block for deletion (gc_state='deleting'), this
+// backs off and retries so the new reference is not lost to an in-flight delete —
+// the row-per-reference analogue of the old sentinel (-999) backoff.
+func (h *FSHelper) RegisterUploadedBlock(orgID, libraryID, blockID string, sizeBytes int, storageClass, storageKey string) error {
 	const maxRetries = 10
+	referrer := db.BlockReferrerForUpload(libraryID + ":" + blockID)
 
 	for attempt := 0; attempt < maxRetries; attempt++ {
-		now := time.Now()
+		if err := h.db.AddBlockReference(orgID, blockID, referrer, libraryID, db.ProvisionalBlockReferenceTTLSeconds); err != nil {
+			return fmt.Errorf("add provisional block reference for %s: %w", blockID, err)
+		}
 
-		// 1. Try to read existing block
-		var currentRefCount int
-		err := h.db.Session().Query(`
-			SELECT ref_count FROM blocks WHERE org_id = ? AND block_id = ?
-		`, orgID, blockID).Scan(&currentRefCount)
-
-		if err == nil {
-			if currentRefCount < 0 {
-				// GC sentinel (-999): the GC worker has claimed this row and will
-				// DELETE it momentarily (Phase 2). We must NOT touch it — any
-				// UPDATE would be clobbered by the unconditional DELETE.
-				// Back off with exponential delay to let GC finish Phase 2.
-				time.Sleep(time.Duration(50<<uint(attempt)) * time.Millisecond) // 50ms, 100ms, 200ms, ...
-				continue
-			}
-
-			// Block exists with ref_count >= 0 — increment it via LWT
-			applied, err := h.db.Session().Query(`
-				UPDATE blocks SET ref_count = ?, last_accessed = ?
-				WHERE org_id = ? AND block_id = ? IF ref_count = ?
-			`, currentRefCount+1, now, orgID, blockID, currentRefCount).MapScanCAS(map[string]interface{}{})
-			if err != nil {
-				retry, resolveErr := resolveIncrementBlockMutationError(blockID, currentRefCount+1, err, func() (blockMutationState, error) {
-					return h.confirmBlockMutationState(orgID, blockID)
-				})
-				if retry {
-					continue
-				}
-				return resolveErr
-			}
-			if applied {
-				return nil
-			}
-			// Race: ref_count changed between SELECT and UPDATE, retry
+		gcState, err := h.db.BlockGCState(orgID, blockID)
+		if err != nil {
+			return fmt.Errorf("read block gc_state for %s: %w", blockID, err)
+		}
+		if gcState == db.BlockGCStateDeleting {
+			// GC is mid-delete; wait for it to finish (row deleted or claim
+			// released), then retry so we re-create fresh metadata under our
+			// reference instead of racing the unconditional DELETE.
+			time.Sleep(time.Duration(50<<uint(attempt)) * time.Millisecond) // 50ms, 100ms, 200ms, ...
 			continue
 		}
 
-		if !errors.Is(err, gocql.ErrNotFound) {
-			return fmt.Errorf("failed to read block metadata for %s: %w", blockID, err)
+		if err := h.db.UpsertBlockMetadata(orgID, blockID, sizeBytes, storageClass, storageKey); err != nil {
+			return fmt.Errorf("upsert block metadata for %s: %w", blockID, err)
 		}
-
-		// 2. Block doesn't exist — insert fresh
-		applied, err := h.db.Session().Query(`
-			INSERT INTO blocks (org_id, block_id, size_bytes, storage_class, storage_key, ref_count, created_at, last_accessed)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?) IF NOT EXISTS
-		`, orgID, blockID, sizeBytes, storageClass, storageKey, 1, now, now).MapScanCAS(map[string]interface{}{})
-		if err != nil {
-			retry, resolveErr := resolveInsertBlockMutationError(blockID, sizeBytes, storageClass, storageKey, err, func() (blockMutationState, error) {
-				return h.confirmBlockMutationState(orgID, blockID)
-			})
-			if retry {
-				continue
-			}
-			return resolveErr
-		}
-		if applied {
-			return nil
-		}
-
-		// Race: someone inserted concurrently, retry to increment
+		return nil
 	}
+	return fmt.Errorf("register uploaded block %s: gc_state stuck in %q after %d retries", blockID, db.BlockGCStateDeleting, maxRetries)
+}
 
-	return fmt.Errorf("failed to increment/create block %s after %d retries (persistent contention or GC stall)", blockID, maxRetries)
+// RegisterFSObjectBlockReferences creates the permanent reference rows for every
+// block held by an fs_object. A reference row exists iff the fs_object exists in
+// fs_objects, so block liveness == "some live fs_object contains this block".
+//
+// Block IDs are resolved to internal SHA-256 IDs first and the resolution is
+// strict (fail-closed): if any ID cannot be resolved, no reference is written and
+// the caller must abort the commit. References are written here, BEFORE the
+// fs_object row is inserted, so a partial failure leaves orphan reference rows
+// (a harmless leak self-healed by retrying the same content-addressed upload)
+// rather than an fs_object whose blocks have no reference (potential data loss).
+// Re-registering the same (block, fs_object) is idempotent.
+func (h *FSHelper) RegisterFSObjectBlockReferences(orgID, libraryID, fsID string, blockIDs []string) error {
+	if len(blockIDs) == 0 {
+		return nil
+	}
+	resolved, err := resolveStoredBlockIDsFn(h, orgID, blockIDs)
+	if err != nil {
+		return fmt.Errorf("resolve block IDs before referencing fs_object %s/%s: %w", libraryID, fsID, err)
+	}
+	referrer := db.BlockReferrerForFSObject(libraryID, fsID)
+	for _, blockID := range resolved {
+		if err := h.db.AddBlockReference(orgID, blockID, referrer, libraryID, 0); err != nil {
+			return fmt.Errorf("add fs_object block reference (block %s, fs_object %s/%s): %w", blockID, libraryID, fsID, err)
+		}
+	}
+	return nil
+}
+
+// ReleaseUploadReferences removes the provisional upload references for blocks of
+// an aborted upload and returns the block IDs that are now unreferenced, so the
+// caller can enqueue them for GC. blockIDs must be internal (SHA-256) IDs (the
+// same IDs used when the provisional reference was created). Idempotent: removing
+// a missing reference is a no-op, so a retried rollback is safe.
+func (h *FSHelper) ReleaseUploadReferences(orgID, libraryID string, blockIDs []string) []string {
+	var zeroRefBlocks []string
+	for _, blockID := range blockIDs {
+		referrer := db.BlockReferrerForUpload(libraryID + ":" + blockID)
+		if err := h.db.RemoveBlockReference(orgID, blockID, referrer); err != nil {
+			log.Printf("[ReleaseUploadReferences] WARNING: failed to remove provisional reference for block %s: %v", blockID, err)
+			continue
+		}
+		hasRefs, err := h.db.BlockHasReferences(orgID, blockID)
+		if err != nil {
+			log.Printf("[ReleaseUploadReferences] WARNING: failed to check references for block %s: %v", blockID, err)
+			continue
+		}
+		if !hasRefs {
+			zeroRefBlocks = append(zeroRefBlocks, blockID)
+		}
+	}
+	return zeroRefBlocks
 }
 
 // collectDirStats recursively collects block IDs, total size in bytes, and file count
@@ -1074,91 +979,11 @@ func (h *FSHelper) collectDirStats(repoID, fsID string) (blockIDs []string, tota
 	return blockIDs, totalSize, fileCount, nil
 }
 
-// DecrementBlockRefCountsOnce decrements ref_count for blocks (for deletion).
-// The operation is idempotent per operationKey and resolves SHA-1 block IDs to
-// the internal SHA-256 IDs stored in the blocks table.
-func (h *FSHelper) DecrementBlockRefCountsOnce(orgID, operationKey string, blockIDs []string) []string {
-	// Resolve BEFORE consuming the idempotency marker so a failure doesn't burn
-	// the marker. On resolution failure we abort the WHOLE decrement (fail-closed)
-	// rather than acting on a partial/stale list. Known interim behavior: the abort
-	// is total (not per-block) and the resulting leak is permanent (no backfill
-	// scan). See ISSUE-REFCOUNT-RESOLVE-FAILCLOSED-01 — the root fix lands with the
-	// ref_count counter→per-block redesign.
-	resolvedBlockIDs, err := resolveStoredBlockIDsFn(h, orgID, blockIDs)
-	if err != nil {
-		log.Printf("[DecrementBlockRefCountsOnce] ERROR: aborting decrement for operation %q org=%s: block ID resolution failed: %v", operationKey, orgID, err)
-		return nil
-	}
-
-	applied, err := markBlockMutationProcessedFn(h, operationKey)
-	if err != nil {
-		log.Printf("[DecrementBlockRefCountsOnce] WARNING: failed to mark operation %q processed: %v", operationKey, err)
-		return nil
-	}
-	if !applied {
-		log.Printf("[DecrementBlockRefCountsOnce] INFO: skipping already processed operation %q", operationKey)
-		return nil
-	}
-
-	var zeroRefBlocks []string
-	for _, blockID := range resolvedBlockIDs {
-		hitZero := decrementBlockRefCountFn(h, orgID, blockID)
-		if hitZero {
-			zeroRefBlocks = append(zeroRefBlocks, blockID)
-		}
-	}
-	return zeroRefBlocks
-}
-
-// decrementBlockRefCount performs a single block's ref_count decrement with LWT
-// and retries on CAS failure to guarantee the decrement is never silently lost.
-// Returns true if the block reached zero refs (eligible for GC).
-func (h *FSHelper) decrementBlockRefCount(orgID, blockID string) bool {
-	const maxRetries = 5
-
-	for attempt := 0; attempt < maxRetries; attempt++ {
-		now := time.Now()
-
-		var currentRefCount int
-		err := h.db.Session().Query(`
-			SELECT ref_count FROM blocks WHERE org_id = ? AND block_id = ?
-		`, orgID, blockID).Scan(&currentRefCount)
-		if err != nil {
-			log.Printf("[decrementBlockRefCount] block %s (org=%s) not found, skipping", blockID, orgID)
-			return false
-		}
-
-		if currentRefCount <= 0 {
-			// Already at zero or below — no decrement needed from us.
-			// Return false: this call did NOT cause the transition to zero,
-			// so we must not re-enqueue the block for GC.
-			return false
-		}
-
-		newRefCount := currentRefCount - 1
-		applied, err := h.db.Session().Query(`
-			UPDATE blocks SET ref_count = ?, last_accessed = ?
-			WHERE org_id = ? AND block_id = ? IF ref_count = ?
-		`, newRefCount, now, orgID, blockID, currentRefCount).MapScanCAS(map[string]interface{}{})
-		if err != nil {
-			log.Printf("[decrementBlockRefCount] ERROR: block %s (org=%s): %v", blockID, orgID, err)
-			return false
-		}
-		if applied {
-			return newRefCount == 0
-		}
-		// CAS failed — ref_count changed concurrently, retry
-	}
-
-	log.Printf("[decrementBlockRefCount] ERROR: block %s (org=%s) failed after %d retries (persistent contention)", blockID, orgID, maxRetries)
-	return false
-}
-
 // CopyFSObjectToLibrary recursively copies an fs_object (file or directory) from
 // one library to another. Returns the new fs_id in the destination library.
 // This is needed because fs_objects are keyed by (library_id, fs_id), so a cross-library
 // copy must create new fs_object rows in the destination library.
-func (h *FSHelper) CopyFSObjectToLibrary(srcRepoID, dstRepoID, fsID string) (string, error) {
+func (h *FSHelper) CopyFSObjectToLibrary(orgID, srcRepoID, dstRepoID, fsID string) (string, error) {
 	// Read the source fs_object
 	var objType, objName, dirEntries string
 	var blockIDs []string
@@ -1174,8 +999,11 @@ func (h *FSHelper) CopyFSObjectToLibrary(srcRepoID, dstRepoID, fsID string) (str
 	}
 
 	if objType == "file" || objType == "" {
-		// File: create a new fs_object in the destination library with the same block_ids
-		newFSID, err := h.CreateFileFSObject(dstRepoID, objName, sizeBytes, blockIDs)
+		// File: create a new fs_object in the destination library with the same
+		// block_ids. CreateFileFSObject registers the permanent block references
+		// for the new fs_object, so the copy keeps the blocks alive — no separate
+		// ref-count increment is needed.
+		newFSID, err := h.CreateFileFSObject(orgID, dstRepoID, objName, sizeBytes, blockIDs)
 		if err != nil {
 			return "", fmt.Errorf("failed to copy file fs_object: %w", err)
 		}
@@ -1193,7 +1021,7 @@ func (h *FSHelper) CopyFSObjectToLibrary(srcRepoID, dstRepoID, fsID string) (str
 	// Copy each child entry, updating the fs_id to the new one in the destination library
 	newEntries := make([]FSEntry, len(entries))
 	for i, entry := range entries {
-		newChildFSID, err := h.CopyFSObjectToLibrary(srcRepoID, dstRepoID, entry.ID)
+		newChildFSID, err := h.CopyFSObjectToLibrary(orgID, srcRepoID, dstRepoID, entry.ID)
 		if err != nil {
 			return "", fmt.Errorf("failed to copy child %q: %w", entry.Name, err)
 		}
@@ -1215,58 +1043,12 @@ func (h *FSHelper) CopyFSObjectToLibrary(srcRepoID, dstRepoID, fsID string) (str
 	return newDirFSID, nil
 }
 
-func incrementBlockRefCountsResolved(resolvedBlockIDs []string, increment func(string) error, rollback func([]string)) error {
-	incrementedBlockIDs := make([]string, 0, len(resolvedBlockIDs))
-	for _, blockID := range resolvedBlockIDs {
-		if err := increment(blockID); err != nil {
-			if len(incrementedBlockIDs) > 0 && rollback != nil {
-				rollback(incrementedBlockIDs)
-			}
-			return fmt.Errorf("increment block %s: %w", blockID, err)
-		}
-		incrementedBlockIDs = append(incrementedBlockIDs, blockID)
-	}
-	return nil
-}
-
-// IncrementBlockRefCounts increments ref_count for blocks (for copy)
-func (h *FSHelper) IncrementBlockRefCounts(orgID string, blockIDs []string) error {
-	resolvedBlockIDs, err := resolveStoredBlockIDsFn(h, orgID, blockIDs)
-	if err != nil {
-		return fmt.Errorf("resolve block IDs before increment: %w", err)
-	}
-	return incrementBlockRefCountsResolved(
-		resolvedBlockIDs,
-		func(blockID string) error {
-			return incrementOrCreateBlockFn(h, orgID, blockID, 0, "", "")
-		},
-		func(incrementedBlockIDs []string) {
-			operationKey := fmt.Sprintf("increment_block_refs_rollback:%s:%d", orgID, time.Now().UnixNano())
-			h.DecrementBlockRefCountsOnce(orgID, operationKey, incrementedBlockIDs)
-		},
-	)
-}
-
-// IncrementBlockRefCountsTracked increments ref_count for blocks (for copy)
-// and returns the exact resolved block IDs that were incremented before any
-// error occurred so callers can roll the mutation back safely.
-func (h *FSHelper) IncrementBlockRefCountsTracked(orgID string, blockIDs []string) ([]string, error) {
-	resolvedBlockIDs, err := resolveStoredBlockIDsFn(h, orgID, blockIDs)
-	if err != nil {
-		return nil, fmt.Errorf("resolve block IDs before increment: %w", err)
-	}
-	incrementedBlockIDs := make([]string, 0, len(resolvedBlockIDs))
-	for _, blockID := range resolvedBlockIDs {
-		if err := incrementOrCreateBlockFn(h, orgID, blockID, 0, "", ""); err != nil {
-			return incrementedBlockIDs, fmt.Errorf("increment block %s: %w", blockID, err)
-		}
-		incrementedBlockIDs = append(incrementedBlockIDs, blockID)
-	}
-	return incrementedBlockIDs, nil
-}
-
-// CreateFileFSObject creates a new fs_object for a file
-func (h *FSHelper) CreateFileFSObject(repoID, name string, size int64, blockIDs []string) (string, error) {
+// CreateFileFSObject creates a new fs_object for a file and registers a permanent
+// block reference for each of its blocks (row-per-reference liveness). References
+// are written BEFORE the fs_object row so a partial failure leaves harmless orphan
+// references rather than an fs_object whose blocks are unreferenced. orgID is
+// required to key the block reference rows (blocks are partitioned per org).
+func (h *FSHelper) CreateFileFSObject(orgID, repoID, name string, size int64, blockIDs []string) (string, error) {
 	// Calculate fs_id as SHA-1 of the EXACT JSON that will be returned by pack-fs
 	// Seafile format: {"block_ids":[...],"size":N,"type":1,"version":1} (alphabetical key order)
 	// CRITICAL: The hash MUST match what the client receives, or it can't store the object
@@ -1284,6 +1066,12 @@ func (h *FSHelper) CreateFileFSObject(repoID, name string, size int64, blockIDs 
 	}
 	hash := sha1.Sum(fsContentJSON)
 	fsID := hex.EncodeToString(hash[:])
+
+	// Register permanent block references before inserting the fs_object row.
+	// Fail-closed: if any block ID cannot be resolved, no fs_object is created.
+	if err := h.RegisterFSObjectBlockReferences(orgID, repoID, fsID, blockIDs); err != nil {
+		return "", fmt.Errorf("failed to register block references for fs_object %s: %w", fsID, err)
+	}
 
 	// Store in database
 	err = h.db.Session().Query(`

@@ -1211,12 +1211,29 @@ func (s *CassandraStore) ListS3OrphansByDay(day time.Time, bucket int, limit int
 
 // --- Block operations ---
 
-func (s *CassandraStore) GetBlockRefCount(orgID uuid.UUID, blockID string) (int, error) {
-	var refCount int
+// BlockExists reports whether the canonical blocks row still exists.
+func (s *CassandraStore) BlockExists(orgID uuid.UUID, blockID string) (bool, error) {
+	var existing string
 	err := s.db.Session().Query(`
-		SELECT ref_count FROM blocks WHERE org_id = ? AND block_id = ?
-	`, orgID.String(), blockID).Scan(&refCount)
-	return refCount, err
+		SELECT block_id FROM blocks WHERE org_id = ? AND block_id = ?
+	`, orgID.String(), blockID).Scan(&existing)
+	if err != nil {
+		if errors.Is(err, gocql.ErrNotFound) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
+// BlockHasReferences reports whether any block_references row still exists.
+func (s *CassandraStore) BlockHasReferences(orgID uuid.UUID, blockID string) (bool, error) {
+	return s.db.BlockHasReferences(orgID.String(), blockID)
+}
+
+// RemoveBlockReference deletes one (block, referrer) reference row (idempotent).
+func (s *CassandraStore) RemoveBlockReference(orgID uuid.UUID, blockID, referrer string) error {
+	return s.db.RemoveBlockReference(orgID.String(), blockID, referrer)
 }
 
 // mappingResolveConcurrency bounds the number of in-flight single-row lookups
@@ -1306,26 +1323,36 @@ func resolveBlockIDsConcurrent(orgID uuid.UUID, blockIDs []string, maxConcurrenc
 	return resolved, nil
 }
 
-// ClaimBlockDelete atomically checks ref_count <= 0 and, if so, marks the row
-// with the GC sentinel (-999). The physical DELETE is deferred so the worker can
-// persist S3-recovery state before removing the canonical DB row.
+// ClaimBlockDelete marks the block row gc_state='deleting' via LWT so writers
+// back off, deferring the physical DELETE until S3-recovery state is persisted.
+// This is the single expensive Paxos operation in the block lifecycle. It is
+// idempotent: re-claiming a row already in 'deleting' succeeds. The caller MUST
+// re-verify BlockHasReferences after a successful claim (claim-then-verify).
 func (s *CassandraStore) ClaimBlockDelete(orgID uuid.UUID, blockID string) (bool, error) {
-	// Phase 1: Atomically claim the block for deletion via LWT.
-	// Setting ref_count to a sentinel value (-999) ensures that even if another
-	// process reads the row between phase 1 and 2, it won't treat it as valid.
-	var prevRefCount int
+	var prevState string
 	applied, err := s.db.Session().Query(`
-		UPDATE blocks SET ref_count = -999
+		UPDATE blocks SET gc_state = ?, gc_claimed_at = ?
 		WHERE org_id = ? AND block_id = ?
-		IF ref_count <= 0
-	`, orgID.String(), blockID).ScanCAS(&prevRefCount)
+		IF gc_state != ?
+	`, db.BlockGCStateDeleting, time.Now().UTC(), orgID.String(), blockID, db.BlockGCStateDeleting).ScanCAS(&prevState)
 	if err != nil {
 		return false, err
 	}
-	if !applied {
-		return false, nil
+	if applied {
+		return true, nil
 	}
-	return true, nil
+	// Not applied: already 'deleting' (idempotent re-claim) is still a success;
+	// any other prior state (or a missing row) means we did not claim it.
+	return prevState == db.BlockGCStateDeleting, nil
+}
+
+// ReleaseBlockClaim clears the gc_state claim when a concurrent reference appeared
+// between the claim and the verify step, so writers stop backing off.
+func (s *CassandraStore) ReleaseBlockClaim(orgID uuid.UUID, blockID string) error {
+	return s.db.Session().Query(`
+		UPDATE blocks SET gc_state = null, gc_claimed_at = null
+		WHERE org_id = ? AND block_id = ?
+	`, orgID.String(), blockID).Exec()
 }
 
 // FinalizeBlockDelete removes a block row that was previously claimed by GC.
@@ -1333,44 +1360,12 @@ func (s *CassandraStore) FinalizeBlockDelete(orgID uuid.UUID, blockID string) er
 	if err := s.db.Session().Query(`
 		DELETE FROM blocks WHERE org_id = ? AND block_id = ?
 	`, orgID.String(), blockID).Exec(); err != nil {
-		// If the DELETE fails, the row is left with ref_count = -999.
-		// The scanner will find it (ref_count <= 0) and re-enqueue for cleanup.
-		log.Printf("[GC Store] Warning: LWT succeeded but DELETE failed for block %s: %v", blockID, err)
+		// If the DELETE fails, the row is left with gc_state='deleting'. The
+		// scanner/queue retry re-processes it for cleanup.
+		log.Printf("[GC Store] Warning: claim succeeded but DELETE failed for block %s: %v", blockID, err)
 		return err
 	}
 	return nil
-}
-
-func (s *CassandraStore) DecrementBlockRefCount(orgID uuid.UUID, blockID string) (bool, error) {
-	const maxRetries = 5
-
-	for attempt := 0; attempt < maxRetries; attempt++ {
-		var currentRefCount int
-		err := s.db.Session().Query(`
-			SELECT ref_count FROM blocks WHERE org_id = ? AND block_id = ?
-		`, orgID.String(), blockID).Scan(&currentRefCount)
-		if err != nil {
-			return false, err
-		}
-
-		if currentRefCount <= 0 {
-			return false, nil
-		}
-
-		newRefCount := currentRefCount - 1
-		applied, err := s.db.Session().Query(`
-			UPDATE blocks SET ref_count = ?, last_accessed = ?
-			WHERE org_id = ? AND block_id = ? IF ref_count = ?
-		`, newRefCount, time.Now().UTC(), orgID.String(), blockID, currentRefCount).MapScanCAS(map[string]interface{}{})
-		if err != nil {
-			return false, err
-		}
-		if applied {
-			return newRefCount == 0, nil
-		}
-	}
-
-	return false, fmt.Errorf("decrement block ref_count for %s/%s: CAS retry limit reached", orgID, blockID)
 }
 
 func (s *CassandraStore) ListBlockMappingsByInternalID(orgID uuid.UUID, internalID string) ([]BlockMapping, error) {

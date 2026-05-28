@@ -1339,8 +1339,9 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 		log.Printf("[HandleUpload] WARNING: Failed to write reverse block_id_mapping org=%s int=%s ext=%s: %v", token.OrgID, sha256ID[:16], fileID[:16], err)
 	}
 
-	// Register block metadata for size lookups (used by video/audio Range requests)
-	if err := v2.NewFSHelper(h.db).IncrementOrCreateBlock(token.OrgID, sha256ID, len(storedContent), actualStorageClass, ""); err != nil {
+	// Register block metadata + a provisional reference (kept alive by TTL until
+	// the fs_object commit creates the permanent reference).
+	if err := v2.NewFSHelper(h.db).RegisterUploadedBlock(token.OrgID, token.RepoID, sha256ID, len(storedContent), actualStorageClass, ""); err != nil {
 		log.Printf("[HandleUpload] CRITICAL: Failed to write block metadata org=%s block=%s: %v", token.OrgID, sha256ID[:16], err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to store block metadata"})
 		return
@@ -1391,10 +1392,6 @@ var cleanupChunkUploadFn = func(token, filename string) {
 	chunkManager.CleanupUpload(token, filename)
 }
 
-func uploadRollbackOperationKey(scope, repoID, identifier string) string {
-	return fmt.Sprintf("%s:%s:%s:%d", scope, repoID, identifier, time.Now().UnixNano())
-}
-
 func (h *SeafHTTPHandler) handleChunkedFinalizeError(token *AccessToken, tokenStr, filename string, upload *ChunkUpload, err error) {
 	// HeadConflict and quota_exceeded are both unrecoverable on the same
 	// tracker: the client cannot finalize this session again (head moved past
@@ -1422,7 +1419,6 @@ func (h *SeafHTTPHandler) handleChunkedFinalizeError(token *AccessToken, tokenSt
 				h.db,
 				token.OrgID,
 				token.RepoID,
-				uploadRollbackOperationKey(scope, token.RepoID, tokenStr+":"+filename),
 				accountedBlockIDs,
 			)
 		}
@@ -1443,7 +1439,6 @@ func (h *SeafHTTPHandler) handleSingleShotMetadataError(token *AccessToken, file
 		h.db,
 		token.OrgID,
 		token.RepoID,
-		uploadRollbackOperationKey("seafhttp_single_metadata", token.RepoID, fileID),
 		[]string{internalBlockID},
 	)
 }
@@ -1730,7 +1725,7 @@ readLoop:
 			defer releaseMetadataPermit()
 
 			if blkErr := upload.AccountBlockOnce(blockIndexLocal, sha256ID, func() error {
-				return fsHelper.IncrementOrCreateBlock(token.OrgID, sha256ID, len(storedBlock), actualStorageClass, "")
+				return fsHelper.RegisterUploadedBlock(token.OrgID, token.RepoID, sha256ID, len(storedBlock), actualStorageClass, "")
 			}); blkErr != nil {
 				log.Printf("[finalizeUploadStreaming] CRITICAL: Failed to write block metadata org=%s block=%s: %v", token.OrgID, sha256ID[:16], blkErr)
 				return fmt.Errorf("failed to store block metadata: %w", blkErr)
@@ -1855,6 +1850,11 @@ func (h *SeafHTTPHandler) commitUploadedFileMultiBlockOnce(orgID, repoID, userID
 		fullPath = parentDir + "/" + actualFilename
 	}
 
+	// Register permanent block references before the fs_object row (row-per-reference
+	// liveness). Fail-closed: if any block ID cannot be resolved, no fs_object is created.
+	if err := v2.NewFSHelper(h.db).RegisterFSObjectBlockReferences(orgID, repoID, fileFSID, blockIDs); err != nil {
+		return "", "", 0, 0, fmt.Errorf("failed to register block references: %w", err)
+	}
 	err = h.db.Session().Query(`
 		INSERT INTO fs_objects (library_id, fs_id, obj_type, obj_name, full_path, size_bytes, mtime, block_ids)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -1979,6 +1979,11 @@ func (h *SeafHTTPHandler) commitUploadedFileOnce(orgID, repoID, userID, parentDi
 		fullPath = parentDir + "/" + actualFilename
 	}
 
+	// Register permanent block references before the fs_object row (row-per-reference
+	// liveness). Fail-closed: if the block ID cannot be resolved, no fs_object is created.
+	if err := v2.NewFSHelper(h.db).RegisterFSObjectBlockReferences(orgID, repoID, fileFSID, []string{blockID}); err != nil {
+		return "", "", 0, 0, fmt.Errorf("failed to register block references: %w", err)
+	}
 	err = h.db.Session().Query(`
 		INSERT INTO fs_objects (library_id, fs_id, obj_type, obj_name, full_path, size_bytes, mtime, block_ids)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?)

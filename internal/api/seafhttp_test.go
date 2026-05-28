@@ -12,7 +12,6 @@ import (
 	"net/http/httptest"
 	"os"
 	"reflect"
-	"strings"
 	"testing"
 	"time"
 
@@ -226,14 +225,13 @@ func TestHandleChunkedFinalizeError_RollsBackConflictAndCleansUp(t *testing.T) {
 	}()
 
 	var rollbackCalled bool
-	var gotOrgID, gotRepoID, gotOperationKey string
+	var gotOrgID, gotRepoID string
 	var gotBlockIDs []string
 	var cleanedToken, cleanedFilename string
-	rollbackUploadedBlockRefsFn = func(database *db.DB, orgID, repoID, operationKey string, blockIDs []string) {
+	rollbackUploadedBlockRefsFn = func(database *db.DB, orgID, repoID string, blockIDs []string) {
 		rollbackCalled = true
 		gotOrgID = orgID
 		gotRepoID = repoID
-		gotOperationKey = operationKey
 		gotBlockIDs = append([]string(nil), blockIDs...)
 	}
 	cleanupChunkUploadFn = func(token, filename string) {
@@ -260,9 +258,6 @@ func TestHandleChunkedFinalizeError_RollsBackConflictAndCleansUp(t *testing.T) {
 	if gotOrgID != "org-1" || gotRepoID != "repo-1" {
 		t.Fatalf("rollback org/repo = %s/%s, want org-1/repo-1", gotOrgID, gotRepoID)
 	}
-	if gotOperationKey == "" {
-		t.Fatal("expected rollback operation key to be set")
-	}
 	if !reflect.DeepEqual(gotBlockIDs, []string{"block-a", "block-b", "block-a"}) {
 		t.Fatalf("rollback block IDs = %#v, want %#v", gotBlockIDs, []string{"block-a", "block-b", "block-a"})
 	}
@@ -283,14 +278,13 @@ func TestHandleChunkedFinalizeError_RollsBackQuotaExceededAndCleansUp(t *testing
 	}()
 
 	var rollbackCalled bool
-	var gotOrgID, gotRepoID, gotOperationKey string
+	var gotOrgID, gotRepoID string
 	var gotBlockIDs []string
 	var cleanupCalled bool
-	rollbackUploadedBlockRefsFn = func(database *db.DB, orgID, repoID, operationKey string, blockIDs []string) {
+	rollbackUploadedBlockRefsFn = func(database *db.DB, orgID, repoID string, blockIDs []string) {
 		rollbackCalled = true
 		gotOrgID = orgID
 		gotRepoID = repoID
-		gotOperationKey = operationKey
 		gotBlockIDs = append([]string(nil), blockIDs...)
 	}
 	cleanupChunkUploadFn = func(token, filename string) {
@@ -318,9 +312,6 @@ func TestHandleChunkedFinalizeError_RollsBackQuotaExceededAndCleansUp(t *testing
 	if gotOrgID != "org-2" || gotRepoID != "repo-2" {
 		t.Fatalf("rollback org/repo = %s/%s, want org-2/repo-2", gotOrgID, gotRepoID)
 	}
-	if !strings.HasPrefix(gotOperationKey, "seafhttp_chunk_quota:") {
-		t.Fatalf("operation key = %q, want seafhttp_chunk_quota:* scope", gotOperationKey)
-	}
 	if !reflect.DeepEqual(gotBlockIDs, []string{"block-x", "block-y"}) {
 		t.Fatalf("rollback block IDs = %#v, want %#v", gotBlockIDs, []string{"block-x", "block-y"})
 	}
@@ -336,7 +327,7 @@ func TestHandleChunkedFinalizeError_ResetsNonConflictState(t *testing.T) {
 
 	rollbackCalled := false
 	cleanupCalled := false
-	rollbackUploadedBlockRefsFn = func(database *db.DB, orgID, repoID, operationKey string, blockIDs []string) {
+	rollbackUploadedBlockRefsFn = func(database *db.DB, orgID, repoID string, blockIDs []string) {
 		rollbackCalled = true
 	}
 	cleanupChunkUploadFn = func(token, filename string) {
@@ -371,7 +362,7 @@ func TestHandleChunkedFinalizeError_CleansUpUnknownBlockMutationOutcome(t *testi
 	rollbackCalled := false
 	var gotBlockIDs []string
 	cleanupCalled := false
-	rollbackUploadedBlockRefsFn = func(database *db.DB, orgID, repoID, operationKey string, blockIDs []string) {
+	rollbackUploadedBlockRefsFn = func(database *db.DB, orgID, repoID string, blockIDs []string) {
 		rollbackCalled = true
 		gotBlockIDs = append([]string(nil), blockIDs...)
 	}
@@ -406,13 +397,12 @@ func TestHandleSingleShotMetadataError_RollsBackOnError(t *testing.T) {
 	}()
 
 	var rollbackCalled bool
-	var gotOrgID, gotRepoID, gotOperationKey string
+	var gotOrgID, gotRepoID string
 	var gotBlockIDs []string
-	rollbackUploadedBlockRefsFn = func(database *db.DB, orgID, repoID, operationKey string, blockIDs []string) {
+	rollbackUploadedBlockRefsFn = func(database *db.DB, orgID, repoID string, blockIDs []string) {
 		rollbackCalled = true
 		gotOrgID = orgID
 		gotRepoID = repoID
-		gotOperationKey = operationKey
 		gotBlockIDs = append([]string(nil), blockIDs...)
 	}
 
@@ -427,9 +417,6 @@ func TestHandleSingleShotMetadataError_RollsBackOnError(t *testing.T) {
 	if gotOrgID != "org-1" || gotRepoID != "repo-1" {
 		t.Fatalf("rollback org/repo = %s/%s, want org-1/repo-1", gotOrgID, gotRepoID)
 	}
-	if !strings.HasPrefix(gotOperationKey, "seafhttp_single_metadata:") {
-		t.Fatalf("operation key = %q, want seafhttp_single_metadata:* scope", gotOperationKey)
-	}
 	if !reflect.DeepEqual(gotBlockIDs, []string{"block-internal"}) {
 		t.Fatalf("rollback block IDs = %#v, want %#v", gotBlockIDs, []string{"block-internal"})
 	}
@@ -442,7 +429,7 @@ func TestHandleSingleShotMetadataError_SkipsSuccessAndEmptyBlockID(t *testing.T)
 	}()
 
 	rollbackCalled := false
-	rollbackUploadedBlockRefsFn = func(database *db.DB, orgID, repoID, operationKey string, blockIDs []string) {
+	rollbackUploadedBlockRefsFn = func(database *db.DB, orgID, repoID string, blockIDs []string) {
 		rollbackCalled = true
 	}
 
@@ -467,7 +454,7 @@ func TestHandleSingleShotMetadataError_SkipsUnknownPublicationOutcome(t *testing
 	}()
 
 	rollbackCalled := false
-	rollbackUploadedBlockRefsFn = func(database *db.DB, orgID, repoID, operationKey string, blockIDs []string) {
+	rollbackUploadedBlockRefsFn = func(database *db.DB, orgID, repoID string, blockIDs []string) {
 		rollbackCalled = true
 	}
 

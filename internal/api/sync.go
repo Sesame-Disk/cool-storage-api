@@ -897,8 +897,9 @@ func (h *SyncHandler) PutBlock(c *gin.Context) {
 	if h.db != nil {
 		now := time.Now()
 
-		// Store block metadata using internal ID
-		if err := v2.NewFSHelper(h.db).IncrementOrCreateBlock(orgID, internalID, len(data), storageClass, ""); err != nil {
+		// Store block metadata + a provisional reference (kept alive by TTL until
+		// the fs_object commit creates the permanent reference).
+		if err := v2.NewFSHelper(h.db).RegisterUploadedBlock(orgID, repoID, internalID, len(data), storageClass, ""); err != nil {
 			log.Printf("PutBlock: failed to store block metadata org=%s block=%s: %v", orgID, internalID, err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to store block metadata"})
 			return
@@ -1406,6 +1407,7 @@ func (h *SyncHandler) PackFS(c *gin.Context) {
 // For each object: 40-byte hex ID + 4-byte size (BE) + zlib-compressed JSON
 func (h *SyncHandler) RecvFS(c *gin.Context) {
 	repoID := c.Param("repo_id")
+	orgID := c.GetString("org_id")
 
 	if !h.checkSyncPermission(c, repoID, middleware.PermissionRW) {
 		return
@@ -1493,6 +1495,16 @@ func (h *SyncHandler) RecvFS(c *gin.Context) {
 		}
 
 		now := time.Now().Unix()
+
+		// Register permanent block references before the fs_object row (row-per-reference
+		// liveness). Skip this object on failure so we never persist an fs_object whose
+		// blocks have no reference.
+		if fsType == "file" && len(blockIDs) > 0 {
+			if refErr := v2.NewFSHelper(h.db).RegisterFSObjectBlockReferences(orgID, repoID, fsID, blockIDs); refErr != nil {
+				log.Printf("recv-fs: failed to register block references for %s: %v", fsID, refErr)
+				continue
+			}
+		}
 
 		err = h.db.Session().Query(`
 			INSERT INTO fs_objects (library_id, fs_id, obj_type, obj_name, size_bytes, mtime, dir_entries, block_ids)

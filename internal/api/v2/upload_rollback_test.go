@@ -14,13 +14,12 @@ func TestHandleStoredUploadMetadataError_RollsBackPromotedBlocks(t *testing.T) {
 	}()
 
 	var rollbackCalled bool
-	var gotOrgID, gotRepoID, gotOperationKey string
+	var gotOrgID, gotRepoID string
 	var gotBlockIDs []string
-	rollbackUploadedBlockRefsFn = func(database *db.DB, orgID, repoID, operationKey string, blockIDs []string) {
+	rollbackUploadedBlockRefsFn = func(database *db.DB, orgID, repoID string, blockIDs []string) {
 		rollbackCalled = true
 		gotOrgID = orgID
 		gotRepoID = repoID
-		gotOperationKey = operationKey
 		gotBlockIDs = append([]string(nil), blockIDs...)
 	}
 
@@ -31,9 +30,6 @@ func TestHandleStoredUploadMetadataError_RollsBackPromotedBlocks(t *testing.T) {
 	}
 	if gotOrgID != "org-1" || gotRepoID != "repo-1" {
 		t.Fatalf("rollback org/repo = %s/%s, want org-1/repo-1", gotOrgID, gotRepoID)
-	}
-	if gotOperationKey == "" {
-		t.Fatal("expected rollback operation key to be set")
 	}
 	if len(gotBlockIDs) != 1 || gotBlockIDs[0] != "block-1" {
 		t.Fatalf("rollback block IDs = %#v, want []string{\"block-1\"}", gotBlockIDs)
@@ -47,7 +43,7 @@ func TestHandleStoredUploadMetadataError_SkipsSuccessfulFinalize(t *testing.T) {
 	}()
 
 	rollbackCalled := false
-	rollbackUploadedBlockRefsFn = func(database *db.DB, orgID, repoID, operationKey string, blockIDs []string) {
+	rollbackUploadedBlockRefsFn = func(database *db.DB, orgID, repoID string, blockIDs []string) {
 		rollbackCalled = true
 	}
 
@@ -65,7 +61,7 @@ func TestHandleStoredUploadMetadataError_SkipsUnknownPublicationOutcome(t *testi
 	}()
 
 	rollbackCalled := false
-	rollbackUploadedBlockRefsFn = func(database *db.DB, orgID, repoID, operationKey string, blockIDs []string) {
+	rollbackUploadedBlockRefsFn = func(database *db.DB, orgID, repoID string, blockIDs []string) {
 		rollbackCalled = true
 	}
 

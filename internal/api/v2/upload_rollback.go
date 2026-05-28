@@ -2,29 +2,26 @@ package v2
 
 import (
 	"errors"
-	"fmt"
 	"log"
-	"strings"
-	"time"
 
 	"github.com/Sesame-Disk/sesamefs/internal/db"
 )
 
 var rollbackUploadedBlockRefsFn = RollbackUploadedBlockRefs
 
-func uploadRollbackOperationKey(scope, repoID, identifier string) string {
-	return fmt.Sprintf("%s:%s:%s:%d", scope, repoID, identifier, time.Now().UnixNano())
-}
-
-func RollbackUploadedBlockRefs(database *db.DB, orgID, repoID, operationKey string, blockIDs []string) {
-	if database == nil || len(blockIDs) == 0 || strings.TrimSpace(operationKey) == "" {
+// RollbackUploadedBlockRefs releases the provisional upload references for an
+// aborted upload's blocks and enqueues any that became unreferenced for GC.
+// It is idempotent (removing a missing reference is a no-op), so a retried
+// rollback is always safe.
+func RollbackUploadedBlockRefs(database *db.DB, orgID, repoID string, blockIDs []string) {
+	if database == nil || len(blockIDs) == 0 {
 		return
 	}
-	zeroRefBlocks := NewFSHelper(database).DecrementBlockRefCountsOnce(orgID, operationKey, blockIDs)
+	zeroRefBlocks := NewFSHelper(database).ReleaseUploadReferences(orgID, repoID, blockIDs)
 	if len(zeroRefBlocks) == 0 {
 		return
 	}
-	log.Printf("[uploadRollback] INFO: rollback %q drove %d blocks to zero refs", operationKey, len(zeroRefBlocks))
+	log.Printf("[uploadRollback] INFO: rollback released %d blocks to zero refs", len(zeroRefBlocks))
 	enqueueZeroRefBlocks(database, orgID, repoID, zeroRefBlocks)
 }
 
@@ -35,11 +32,5 @@ func handleStoredUploadMetadataError(database *db.DB, orgID, repoID, fileID stri
 	if errors.Is(err, ErrLibraryHeadPublicationUnknown) {
 		return
 	}
-	rollbackUploadedBlockRefsFn(
-		database,
-		orgID,
-		repoID,
-		uploadRollbackOperationKey("v2_direct_metadata", repoID, fileID),
-		internalBlockIDs,
-	)
+	rollbackUploadedBlockRefsFn(database, orgID, repoID, internalBlockIDs)
 }

@@ -522,10 +522,10 @@ Drains the `gc_queue` table. Each item has a type; the worker dispatches accordi
   original queue row still exists: it escalates only when the old row is still
   present, treats the requeue as successful when the old row is already gone,
   and otherwise leaves the item untouched when the verification itself fails.
-- **Two-phase LWT block deletion**: Phase 1: `UPDATE SET ref_count = -999 IF ref_count <= 0` (atomic claim via Paxos). Phase 2: unconditional `DELETE`. If Phase 1 fails (ref_count > 0, i.e., a concurrent upload incremented it), the block is skipped — no S3 deletion occurs.
-- **Live fs_object guard for block deletion**: before claiming a zero-ref block, the worker checks live `fs_object` references in the org and skips deletion if any still reference the block, including references through block-id mappings. The org reference set is cached for the worker batch, so multiple block items avoid repeated full fs_object scans.
-- **Sentinel protection for uploads**: `IncrementOrCreateBlock` detects sentinel `-999` (`ref_count < 0`) and backs off with exponential delay, waiting for GC Phase 2 to complete the DELETE. Then it creates a fresh row via `INSERT IF NOT EXISTS`. This prevents the race where an upload's UPDATE would be clobbered by GC's unconditional DELETE.
-- **Idempotent per-block decrements**: `gc_processed_items` table (35d TTL) with `INSERT IF NOT EXISTS` prevents double-decrements across worker retries and DLQ requeues within the supported replay window. Task IDs are deterministic from `library_id`, `fs_object_id`, block position, resolved block ID, and the stable GC `identity_at`. A retry continues unrecorded block decrements and verifies recorded ones against live references, repairing markers that were written before their decrement was reflected.
+- **Claim-then-verify block deletion**: before deleting, the worker (1) point-reads `BlockHasReferences` and skips if any reference row exists; (2) `ClaimBlockDelete` marks `gc_state='deleting'` via LWT (the single expensive Paxos op); (3) re-checks `BlockHasReferences` and, if a concurrent upload re-referenced the block, releases the claim (`gc_state=null`) and skips; only then deletes from DB and S3.
+- **Liveness via reference rows**: liveness is a single-partition point query on `block_references` (replacing the old per-org full scan of live fs_objects). SHA-1→SHA-256 resolution happens at write time, so the GC read needs no resolution.
+- **Sentinel protection for uploads**: `RegisterUploadedBlock` registers its reference first, then reads `gc_state`; if it sees `'deleting'` it backs off with exponential delay, waiting for GC to finish, then re-creates the metadata under its reference. This is the row-model analogue of the old `-999` backoff.
+- **Idempotent reference removal**: `RemoveBlockReference` is an idempotent `DELETE` of a single `(block, referrer)` row, so a retried fs_object GC pass or upload rollback cannot double-decrement. The entire class of decrement-idempotency bookkeeping (`gc_processed_items` markers, repair passes) is gone with the counter.
 - **Renewable hard-delete leases**: user, library, and org cascades use `lease_token` + heartbeat rows. Live cascades renew the lease, crashed workers can be taken over after stale heartbeat detection, and active lock contention is postponed without consuming retry budget.
 - **DLQ requeue identity preservation**: Failed items are requeued with their original `queued_at` and stable `identity_at` so cascade stale checks and semantic dedupe keep the same deletion identity when an operator retries a failed item.
 - **Cascade error propagation**: If enqueueing child items fails, the parent item is NOT deleted — the worker returns an error and the item stays in queue for retry.
@@ -534,24 +534,39 @@ Drains the `gc_queue` table. Each item has a type; the worker dispatches accordi
 - Scanner runs immediately on startup to catch anything missed during downtime
 - Health alerting: `gc_worker_consecutive_errors` tracks sequential failures (alert if > 5), `gc_queue_growth_rate` tracks net queue growth (positive = queue growing faster than worker can drain)
 
-#### Reference Counting
+#### Block Liveness — Row-Per-Reference Model
 
-**Operations** (all use Cassandra LWT for atomicity):
-- **File upload**: `IncrementOrCreateBlock` — SELECT → UPDATE IF ref_count = X (increment) or INSERT IF NOT EXISTS (new block). Retries on CAS failure, backs off on sentinel.
-- **File copy**: `IncrementOrCreateBlock` — same flow, deduplicated by block hash.
-- **File/commit deletion**: `decrementBlockRefCount` — SELECT → UPDATE IF ref_count = X (decrement) with retry loop. Returns true only if **this** call caused the transition to 0.
-- **GC block deletion**: Two-phase LWT — `UPDATE SET ref_count = -999 IF ref_count <= 0` then `DELETE`.
+`blocks.ref_count` was removed (2026-05-27). Block liveness is now modeled as rows
+in `block_references`: **a block is alive iff at least one reference row exists**.
+A reference row is `((org_id, block_id), referrer)` where:
+- `referrer = fs:<library_id>:<fs_id>` — a **permanent** reference: this fs_object
+  contains the block. A row exists iff the fs_object exists in `fs_objects`.
+- `referrer = up:<library_id>:<block_id>` — a **provisional** reference written with
+  a TTL while an upload is in flight (before its fs_object is committed). An
+  abandoned upload's row expires on its own — no permanent leak.
 
-**ref_count lifecycle**:
+**Operations** (steady state needs NO LWT — `INSERT`/`DELETE` are idempotent):
+- **File upload**: `RegisterUploadedBlock` — `UpsertBlockMetadata` (INSERT IF NOT EXISTS) + `AddBlockReference(up:…, TTL)`. Backs off if the row is mid-GC (`gc_state='deleting'`).
+- **fs_object creation (upload commit / copy)**: `RegisterFSObjectBlockReferences` — resolves SHA-1→SHA-256 (fail-closed) and `AddBlockReference(fs:<lib>:<fs_id>)` per block, written before the fs_object row. A same-library copy shares the content-addressed fs_id, so it adds no new reference; a cross-library copy creates a new fs_object and therefore a new reference.
+- **fs_object deletion (GC only)**: `removeFSObjectBlockReferences` — `DELETE` the `fs:<lib>:<fs_id>` reference per block; any block left with no references becomes a GC candidate. Explicit file/dir deletes do **not** decrement — the fs_object survives in `fs_objects` (reachable from older commits) until GC sweeps it.
+- **GC block deletion (the only expensive Paxos)**: claim-then-verify — pre-check `BlockHasReferences`; `ClaimBlockDelete` marks `gc_state='deleting'` via LWT; **re-check** `BlockHasReferences` and, if a concurrent upload re-referenced it, release the claim and skip; otherwise `RecordS3Orphan` → `DELETE blocks` → delete from S3.
+
+**Lifecycle**:
 ```
-Upload/Copy:  0 → 1 → 2 → ... (increment via LWT)
-Delete:       ... → 2 → 1 → 0  (decrement via LWT, enqueue when hits 0)
-GC claim:     0 → -999          (LWT sentinel, Phase 1)
-GC delete:    -999 → [row deleted] (unconditional DELETE, Phase 2)
-Upload race:  -999 → [wait] → [row deleted] → INSERT fresh ref_count=1
+Upload:        block_references += up:<lib>:<block>  (TTL)  + blocks row (metadata)
+Commit:        block_references += fs:<lib>:<fs_id>          (permanent)
+fs_object GC:  block_references -= fs:<lib>:<fs_id>  → if none left, enqueue block
+Block GC:      pre-check none → claim gc_state='deleting' (LWT) → re-verify none → DELETE + S3
+Upload race:   writer sees gc_state='deleting' → backs off → re-creates after GC finishes
 ```
 
-**Multi-region considerations**: All LWT operations on the `blocks` table use Cassandra's default `SERIAL` consistency (global Paxos). This ensures uploads in DC-A and GC in DC-B are serialized correctly. GC must be enabled in only one DC (see `configs/config.prod.yaml` comments and KNOWN_ISSUES.md `ISSUE-GC-MULTIINSTANCE-01`). The 1h grace period (>>200ms cross-DC replication lag) ensures non-LWT reads are also consistent before processing.
+**Multi-region considerations**: reference `INSERT`/`DELETE` use `LOCAL_QUORUM` (no
+cross-DC Paxos), so concurrent uploads/deletes no longer collide on a shared
+mutable counter. The single expensive `SERIAL` (global Paxos) operation is the GC
+worker's `gc_state` claim at the irreversible S3-delete gate. GC must be enabled in
+only one DC (see `configs/config.prod.yaml` comments and KNOWN_ISSUES.md
+`ISSUE-GC-MULTIINSTANCE-01`). The 1h grace period (>>200ms cross-DC replication lag)
+ensures a block's references are fully replicated before the gate runs.
 
 #### Reverse Lookup Table
 

@@ -55,17 +55,25 @@ type GCStore interface {
 
 	// Block operations (worker)
 	//
-	// GetBlockRefCount returns the current reference count for a block.
-	// It MUST return a non-nil error when the block row does not exist
-	// (e.g. gocql.ErrNotFound). RecoverS3Orphans relies on this to
-	// distinguish blocks that were claimed-but-not-finalized (row still
-	// present → skip) from blocks whose DB row was already removed
-	// (error → proceed with S3 cleanup).
-	GetBlockRefCount(orgID uuid.UUID, blockID string) (int, error)
+	// BlockExists reports whether the canonical `blocks` row still exists.
+	// RecoverS3Orphans relies on this to distinguish a block still being
+	// claimed/finalized by GC (row present → skip) from one whose DB row was
+	// already removed (absent → proceed with S3 cleanup).
+	BlockExists(orgID uuid.UUID, blockID string) (bool, error)
+	// BlockHasReferences reports whether any block_references row still exists for
+	// the block. This is the liveness check that replaces reading ref_count.
+	BlockHasReferences(orgID uuid.UUID, blockID string) (bool, error)
+	// RemoveBlockReference deletes one (block, referrer) reference row. Idempotent.
+	RemoveBlockReference(orgID uuid.UUID, blockID, referrer string) error
 	ResolveBlockIDs(orgID uuid.UUID, blockIDs []string) ([]string, error)
+	// ClaimBlockDelete atomically marks the block row gc_state='deleting' via LWT
+	// when it is not already claimed. Callers MUST re-check BlockHasReferences
+	// after a successful claim before deleting from S3 (claim-then-verify).
 	ClaimBlockDelete(orgID uuid.UUID, blockID string) (bool, error)
+	// ReleaseBlockClaim clears gc_state when a claim must be abandoned because a
+	// concurrent reference appeared between the claim and the verify step.
+	ReleaseBlockClaim(orgID uuid.UUID, blockID string) error
 	FinalizeBlockDelete(orgID uuid.UUID, blockID string) error
-	DecrementBlockRefCount(orgID uuid.UUID, blockID string) (bool, error)
 	DeleteBlockMapping(orgID uuid.UUID, externalID string) error
 	EnsureBlockGCCandidate(orgID uuid.UUID, blockID, storageClass string, candidateAt time.Time) (time.Time, error)
 	DeleteBlockGCCandidate(orgID uuid.UUID, blockID string, candidateAt time.Time) error
@@ -265,7 +273,6 @@ type CommitInfo struct {
 type BlockInfo struct {
 	BlockID      string
 	StorageClass string
-	RefCount     int
 }
 
 type BlockGCCandidateInfo struct {

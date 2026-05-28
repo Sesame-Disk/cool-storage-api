@@ -470,15 +470,11 @@ func (h *BatchOperationHandler) processSingleItem(orgID, userID, srcRepoID, dstR
 	sourceRemovalPublished := false
 	replacedTagCleanupPath := ""
 	replacedTagCleanupByPrefix := false
-	replacedBlockIDs := []string(nil)
-	destinationCommitID := ""
 
 	err := retryLibraryHeadMutation("BatchOperationDestination", func() error {
 		currentItemName := path.Base(srcPath)
 		replacedTagCleanupPath = ""
 		replacedTagCleanupByPrefix = false
-		replacedBlockIDs = nil
-		destinationCommitID = ""
 
 		srcSnapshot, err := fsHelper.GetLibraryHeadSnapshot(srcRepoID)
 		if err != nil {
@@ -544,10 +540,9 @@ func (h *BatchOperationHandler) processSingleItem(orgID, userID, srcRepoID, dstR
 			if err != nil {
 				return fmt.Errorf("failed to compute replaced entry size: %w", err)
 			}
-			replacedBlockIDs, err = fsHelper.CollectBlockIDsRecursive(dstRepoID, replacedEntry.ID)
-			if err != nil {
-				return fmt.Errorf("failed to collect replaced entry blocks: %w", err)
-			}
+			// The replaced entry's old fs_object stays in fs_objects (reachable from
+			// older commits) and its block references are released when GC sweeps it.
+			// No explicit block-reference removal here.
 		}
 
 		dstDeltaBytes := currentSrcSize - oldDstSize
@@ -566,7 +561,7 @@ func (h *BatchOperationHandler) processSingleItem(orgID, userID, srcRepoID, dstR
 
 		entryFSID := srcResult.TargetEntry.ID
 		if srcRepoID != dstRepoID {
-			newFSID, err := fsHelper.CopyFSObjectToLibrary(srcRepoID, dstRepoID, srcResult.TargetEntry.ID)
+			newFSID, err := fsHelper.CopyFSObjectToLibrary(orgID, srcRepoID, dstRepoID, srcResult.TargetEntry.ID)
 			if err != nil {
 				return fmt.Errorf("failed to copy fs_objects to destination library: %w", err)
 			}
@@ -623,13 +618,10 @@ func (h *BatchOperationHandler) processSingleItem(orgID, userID, srcRepoID, dstR
 			return fmt.Errorf("failed to create destination commit: %w", err)
 		}
 
-		pinnedBlockIDs, err := pinCopiedTreeBlockRefs(fsHelper, orgID, dstRepoID, entryFSID)
-		if err != nil {
-			return fmt.Errorf("failed to increment block ref counts for cross-library %s: %w", opType, err)
-		}
-
+		// Cross-library copy/move already created the destination fs_objects (via
+		// CopyFSObjectToLibrary → CreateFileFSObject), which registered their block
+		// references. No separate ref-count increment is needed here.
 		if err := fsHelper.UpdateLibraryHeadFromSnapshot(dstSnapshot, dstRepoID, newDstCommitID, dstSnapshot.HeadCommitID); err != nil {
-			rollbackCopiedTreeBlockRefs(fsHelper, orgID, opType+"-rollback:"+newDstCommitID, pinnedBlockIDs)
 			return fmt.Errorf("failed to update destination library: %w", err)
 		}
 
@@ -642,7 +634,6 @@ func (h *BatchOperationHandler) processSingleItem(orgID, userID, srcRepoID, dstR
 		itemName = currentItemName
 		srcSize = currentSrcSize
 		srcFiles = currentSrcFiles
-		destinationCommitID = newDstCommitID
 		return nil
 	})
 	if err != nil {
@@ -657,12 +648,6 @@ func (h *BatchOperationHandler) processSingleItem(orgID, userID, srcRepoID, dstR
 		} else {
 			go CleanupFileTagsByPath(h.db, dstRepoID, replacedTagCleanupPath)
 		}
-	}
-	if len(replacedBlockIDs) > 0 && destinationCommitID != "" {
-		go func(operationKey string, blockIDs []string) {
-			zeroRefBlocks := fsHelper.DecrementBlockRefCountsOnce(orgID, operationKey, blockIDs)
-			enqueueZeroRefBlocks(h.db, orgID, dstRepoID, zeroRefBlocks)
-		}(opType+"-replace:"+destinationCommitID, append([]string(nil), replacedBlockIDs...))
 	}
 
 	// For move operation, remove from source
@@ -769,26 +754,22 @@ func (h *BatchOperationHandler) processSameRepoMove(orgID, userID, repoID, srcPa
 	}
 
 	var itemName string
-	var moveCommitID string
 	var replacedTagCleanupPath string
 	var replacedTagCleanupByPrefix bool
 	var movedTagOldPath string
 	var movedTagNewPath string
 	var movedTagByPrefix bool
-	var replacedBlockIDs []string
 	var replacedSize int64
 	var replacedFiles int64
 	skipped := false
 
 	err := retryLibraryHeadMutation("BatchOperationSameRepoMove", func() error {
 		currentItemName := originalItemName
-		moveCommitID = ""
 		replacedTagCleanupPath = ""
 		replacedTagCleanupByPrefix = false
 		movedTagOldPath = ""
 		movedTagNewPath = ""
 		movedTagByPrefix = false
-		replacedBlockIDs = nil
 		replacedSize = 0
 		replacedFiles = 0
 		skipped = false
@@ -848,10 +829,8 @@ func (h *BatchOperationHandler) processSameRepoMove(orgID, userID, repoID, srcPa
 				if err != nil {
 					return nil, fmt.Errorf("failed to compute replaced entry size: %w", err)
 				}
-				replacedBlockIDs, err = fsHelper.CollectBlockIDsRecursive(repoID, replacedEntry.ID)
-				if err != nil {
-					return nil, fmt.Errorf("failed to collect replaced entry blocks: %w", err)
-				}
+				// The replaced entry's old fs_object stays referenced from older
+				// commits until GC sweeps it; no block-reference removal here.
 				replacedTagCleanupPath, replacedTagCleanupByPrefix = replacedDestinationTagCleanup(dstDir, currentItemName, replacedEntry)
 			}
 
@@ -877,7 +856,6 @@ func (h *BatchOperationHandler) processSameRepoMove(orgID, userID, repoID, srcPa
 		}
 
 		itemName = currentItemName
-		moveCommitID = newCommitID
 		return nil
 	})
 	if err != nil {
@@ -891,12 +869,6 @@ func (h *BatchOperationHandler) processSameRepoMove(orgID, userID, repoID, srcPa
 		if err := traffic.AdjustStorageCountersByDeltaSync(h.db, orgID, userID, repoID, -replacedSize, -replacedFiles); err != nil {
 			log.Printf("[processSameRepoMove] failed to apply replaced destination storage counter delta for %s -> %s/%s: %v", srcPath, repoID, dstDir, err)
 		}
-	}
-	if len(replacedBlockIDs) > 0 && moveCommitID != "" {
-		go func(operationKey string, blockIDs []string) {
-			zeroRefBlocks := fsHelper.DecrementBlockRefCountsOnce(orgID, operationKey, blockIDs)
-			enqueueZeroRefBlocks(h.db, orgID, repoID, zeroRefBlocks)
-		}("same-repo-move-replace:"+moveCommitID, append([]string(nil), replacedBlockIDs...))
 	}
 	log.Printf("[processSameRepoMove] moved %s to %s as %s", srcPath, dstDir, itemName)
 	return nil

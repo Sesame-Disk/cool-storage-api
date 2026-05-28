@@ -122,19 +122,36 @@ func resolveOrgID(t *testing.T, repoID string) string {
 	return orgID
 }
 
-// readBlockRefCount returns the ref_count for a block, or -999 if not found.
+// readBlockRefCount returns the number of PERMANENT (fs_object) references a block
+// has under the row-per-reference model, or -999 if the canonical blocks row was
+// deleted. Provisional "up:" upload references (which carry a TTL) are ignored so
+// the count reflects how many live fs_objects reference the block — the closest
+// analogue of the old mutable ref_count.
 func readBlockRefCount(t *testing.T, orgID, blockID string) int {
 	t.Helper()
 	session := shareProjectionDBForTest(t).Session()
-	var rc int
-	err := session.Query(`SELECT ref_count FROM blocks WHERE org_id = ? AND block_id = ?`, orgID, blockID).Scan(&rc)
+
+	var existing string
+	err := session.Query(`SELECT block_id FROM blocks WHERE org_id = ? AND block_id = ?`, orgID, blockID).Scan(&existing)
 	if errors.Is(err, gocql.ErrNotFound) {
 		return -999 // block row deleted
 	}
 	if err != nil {
 		t.Fatalf("readBlockRefCount: %v", err)
 	}
-	return rc
+
+	iter := session.Query(`SELECT referrer FROM block_references WHERE org_id = ? AND block_id = ?`, orgID, blockID).Iter()
+	var referrer string
+	count := 0
+	for iter.Scan(&referrer) {
+		if strings.HasPrefix(referrer, "fs:") {
+			count++
+		}
+	}
+	if err := iter.Close(); err != nil {
+		t.Fatalf("readBlockRefCount references: %v", err)
+	}
+	return count
 }
 
 // blockExistsInDB returns true if the block row exists in the blocks table.

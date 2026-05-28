@@ -10,20 +10,17 @@ import (
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
 )
 
-func TestDecrementBlockRefCountsOnce_ResolutionFailureSkipsMarkerAndDecrement(t *testing.T) {
+// TestRegisterFSObjectBlockReferences_ResolutionFailureAborts verifies the
+// row-per-reference registration is fail-closed: if block ID resolution fails, no
+// reference row is written and the caller's commit is aborted. The resolution
+// error is returned before any DB write, so a zero-value FSHelper (nil db) is
+// enough to exercise the guard.
+func TestRegisterFSObjectBlockReferences_ResolutionFailureAborts(t *testing.T) {
 	helper := &FSHelper{}
 	prevResolve := resolveStoredBlockIDsFn
-	prevMark := markBlockMutationProcessedFn
-	prevDecrement := decrementBlockRefCountFn
-	defer func() {
-		resolveStoredBlockIDsFn = prevResolve
-		markBlockMutationProcessedFn = prevMark
-		decrementBlockRefCountFn = prevDecrement
-	}()
+	defer func() { resolveStoredBlockIDsFn = prevResolve }()
 
 	resolveErr := errors.New("resolve failed")
-	markCalls := 0
-	decrementCalls := 0
 	resolveStoredBlockIDsFn = func(h *FSHelper, orgID string, blockIDs []string) ([]string, error) {
 		if orgID != "org-1" {
 			t.Fatalf("resolve orgID = %q, want %q", orgID, "org-1")
@@ -33,123 +30,10 @@ func TestDecrementBlockRefCountsOnce_ResolutionFailureSkipsMarkerAndDecrement(t 
 		}
 		return nil, resolveErr
 	}
-	markBlockMutationProcessedFn = func(h *FSHelper, operationKey string) (bool, error) {
-		markCalls++
-		return true, nil
-	}
-	decrementBlockRefCountFn = func(h *FSHelper, orgID, blockID string) bool {
-		decrementCalls++
-		return false
-	}
 
-	got := helper.DecrementBlockRefCountsOnce("org-1", "op-1", []string{"sha1-block"})
-	if got != nil {
-		t.Fatalf("DecrementBlockRefCountsOnce() = %v, want nil on resolution failure", got)
-	}
-	if markCalls != 0 {
-		t.Fatalf("markBlockMutationProcessed called %d times, want 0", markCalls)
-	}
-	if decrementCalls != 0 {
-		t.Fatalf("decrementBlockRefCount called %d times, want 0", decrementCalls)
-	}
-}
-
-func TestDecrementBlockRefCountsOnce_UsesResolvedIDsAfterMarker(t *testing.T) {
-	helper := &FSHelper{}
-	prevResolve := resolveStoredBlockIDsFn
-	prevMark := markBlockMutationProcessedFn
-	prevDecrement := decrementBlockRefCountFn
-	defer func() {
-		resolveStoredBlockIDsFn = prevResolve
-		markBlockMutationProcessedFn = prevMark
-		decrementBlockRefCountFn = prevDecrement
-	}()
-
-	markCalls := 0
-	var decremented []string
-	resolveStoredBlockIDsFn = func(h *FSHelper, orgID string, blockIDs []string) ([]string, error) {
-		return []string{"sha256-a", "sha256-b"}, nil
-	}
-	markBlockMutationProcessedFn = func(h *FSHelper, operationKey string) (bool, error) {
-		markCalls++
-		if operationKey != "op-2" {
-			t.Fatalf("operationKey = %q, want %q", operationKey, "op-2")
-		}
-		return true, nil
-	}
-	decrementBlockRefCountFn = func(h *FSHelper, orgID, blockID string) bool {
-		decremented = append(decremented, blockID)
-		return blockID == "sha256-b"
-	}
-
-	got := helper.DecrementBlockRefCountsOnce("org-2", "op-2", []string{"sha1-a", "sha1-b"})
-	if markCalls != 1 {
-		t.Fatalf("markBlockMutationProcessed called %d times, want 1", markCalls)
-	}
-	if len(decremented) != 2 || decremented[0] != "sha256-a" || decremented[1] != "sha256-b" {
-		t.Fatalf("decremented block IDs = %v, want resolved IDs [sha256-a sha256-b]", decremented)
-	}
-	if len(got) != 1 || got[0] != "sha256-b" {
-		t.Fatalf("zero-ref blocks = %v, want [sha256-b]", got)
-	}
-}
-
-func TestIncrementBlockRefCounts_ResolutionFailureSkipsMutation(t *testing.T) {
-	helper := &FSHelper{}
-	prevResolve := resolveStoredBlockIDsFn
-	prevIncrement := incrementOrCreateBlockFn
-	defer func() {
-		resolveStoredBlockIDsFn = prevResolve
-		incrementOrCreateBlockFn = prevIncrement
-	}()
-
-	resolveErr := errors.New("resolve failed")
-	incrementCalls := 0
-	resolveStoredBlockIDsFn = func(h *FSHelper, orgID string, blockIDs []string) ([]string, error) {
-		return nil, resolveErr
-	}
-	incrementOrCreateBlockFn = func(h *FSHelper, orgID, blockID string, sizeBytes int, storageClass, storageKey string) error {
-		incrementCalls++
-		return nil
-	}
-
-	err := helper.IncrementBlockRefCounts("org-3", []string{"sha1-block"})
+	err := helper.RegisterFSObjectBlockReferences("org-1", "lib-1", "fs-1", []string{"sha1-block"})
 	if !errors.Is(err, resolveErr) {
-		t.Fatalf("IncrementBlockRefCounts() error = %v, want wrapped %v", err, resolveErr)
-	}
-	if incrementCalls != 0 {
-		t.Fatalf("IncrementOrCreateBlock called %d times, want 0", incrementCalls)
-	}
-}
-
-func TestIncrementBlockRefCountsTracked_ResolutionFailureSkipsMutation(t *testing.T) {
-	helper := &FSHelper{}
-	prevResolve := resolveStoredBlockIDsFn
-	prevIncrement := incrementOrCreateBlockFn
-	defer func() {
-		resolveStoredBlockIDsFn = prevResolve
-		incrementOrCreateBlockFn = prevIncrement
-	}()
-
-	resolveErr := errors.New("resolve failed")
-	incrementCalls := 0
-	resolveStoredBlockIDsFn = func(h *FSHelper, orgID string, blockIDs []string) ([]string, error) {
-		return nil, resolveErr
-	}
-	incrementOrCreateBlockFn = func(h *FSHelper, orgID, blockID string, sizeBytes int, storageClass, storageKey string) error {
-		incrementCalls++
-		return nil
-	}
-
-	got, err := helper.IncrementBlockRefCountsTracked("org-4", []string{"sha1-block"})
-	if !errors.Is(err, resolveErr) {
-		t.Fatalf("IncrementBlockRefCountsTracked() error = %v, want wrapped %v", err, resolveErr)
-	}
-	if got != nil {
-		t.Fatalf("IncrementBlockRefCountsTracked() incremented = %v, want nil on resolution failure", got)
-	}
-	if incrementCalls != 0 {
-		t.Fatalf("IncrementOrCreateBlock called %d times, want 0", incrementCalls)
+		t.Fatalf("RegisterFSObjectBlockReferences() error = %v, want wrapped %v", err, resolveErr)
 	}
 }
 
@@ -369,181 +253,6 @@ func TestNormalizePath_Additional(t *testing.T) {
 				t.Errorf("normalizePath(%q) = %q, want %q", tt.input, result, tt.expected)
 			}
 		})
-	}
-}
-
-func TestIsAmbiguousBlockMutationError(t *testing.T) {
-	tests := []struct {
-		name string
-		err  error
-		want bool
-	}{
-		{name: "cas write unknown", err: gocql.RequestErrCASWriteUnknown{}, want: true},
-		{name: "cas write timeout", err: gocql.RequestErrWriteTimeout{WriteType: "CAS"}, want: true},
-		{name: "wrapped cas write timeout", err: fmt.Errorf("wrapped: %w", gocql.RequestErrWriteTimeout{WriteType: "CAS"}), want: true},
-		{name: "non cas write timeout", err: gocql.RequestErrWriteTimeout{WriteType: "BATCH"}, want: false},
-		{name: "no response timeout", err: gocql.ErrTimeoutNoResponse, want: true},
-		{name: "connection closed", err: gocql.ErrConnectionClosed, want: true},
-		{name: "generic", err: errors.New("boom"), want: false},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := isAmbiguousBlockMutationError(tt.err); got != tt.want {
-				t.Fatalf("isAmbiguousBlockMutationError(%v) = %v, want %v", tt.err, got, tt.want)
-			}
-		})
-	}
-}
-
-func TestResolveIncrementBlockMutationErrorReturnsUnknownWhenExpectedRefCountIsVisible(t *testing.T) {
-	retry, err := resolveIncrementBlockMutationError("block-1", 3, gocql.RequestErrWriteTimeout{WriteType: "CAS"}, func() (blockMutationState, error) {
-		return blockMutationState{exists: true, refCount: 3}, nil
-	})
-	if retry {
-		t.Fatal("resolveIncrementBlockMutationError() retry = true, want false")
-	}
-	if err == nil {
-		t.Fatal("resolveIncrementBlockMutationError() error = nil, want unknown outcome error")
-	}
-	if !errors.Is(err, ErrBlockMutationOutcomeUnknown) {
-		t.Fatalf("resolveIncrementBlockMutationError() error = %v, want ErrBlockMutationOutcomeUnknown", err)
-	}
-	var writeTimeout gocql.RequestErrWriteTimeout
-	if !errors.As(err, &writeTimeout) {
-		t.Fatalf("resolveIncrementBlockMutationError() error = %v, want wrapped write timeout", err)
-	}
-}
-
-func TestResolveIncrementBlockMutationErrorRetriesWhenRefCountUnchanged(t *testing.T) {
-	retry, err := resolveIncrementBlockMutationError("block-1", 3, gocql.RequestErrCASWriteUnknown{}, func() (blockMutationState, error) {
-		return blockMutationState{exists: true, refCount: 2}, nil
-	})
-	if err != nil {
-		t.Fatalf("resolveIncrementBlockMutationError() error = %v, want nil", err)
-	}
-	if !retry {
-		t.Fatal("resolveIncrementBlockMutationError() retry = false, want true")
-	}
-}
-
-func TestResolveIncrementBlockMutationErrorReturnsUnknownWhenConfirmationFails(t *testing.T) {
-	confirmErr := errors.New("confirm boom")
-	retry, err := resolveIncrementBlockMutationError("block-1", 3, gocql.ErrTimeoutNoResponse, func() (blockMutationState, error) {
-		return blockMutationState{}, confirmErr
-	})
-	if retry {
-		t.Fatal("resolveIncrementBlockMutationError() retry = true, want false")
-	}
-	if err == nil {
-		t.Fatal("resolveIncrementBlockMutationError() error = nil, want unknown outcome error")
-	}
-	if !errors.Is(err, ErrBlockMutationOutcomeUnknown) {
-		t.Fatalf("resolveIncrementBlockMutationError() error = %v, want ErrBlockMutationOutcomeUnknown", err)
-	}
-	if !errors.Is(err, confirmErr) {
-		t.Fatalf("resolveIncrementBlockMutationError() error = %v, want wrapped confirmation error", err)
-	}
-	if !errors.Is(err, gocql.ErrTimeoutNoResponse) {
-		t.Fatalf("resolveIncrementBlockMutationError() error = %v, want wrapped timeout error", err)
-	}
-}
-
-func TestResolveIncrementBlockMutationErrorReturnsUnknownWhenStateIsUnexpected(t *testing.T) {
-	retry, err := resolveIncrementBlockMutationError("block-1", 3, gocql.RequestErrCASWriteUnknown{}, func() (blockMutationState, error) {
-		return blockMutationState{exists: true, refCount: 4}, nil
-	})
-	if retry {
-		t.Fatal("resolveIncrementBlockMutationError() retry = true, want false")
-	}
-	if err == nil {
-		t.Fatal("resolveIncrementBlockMutationError() error = nil, want unknown outcome error")
-	}
-	if !errors.Is(err, ErrBlockMutationOutcomeUnknown) {
-		t.Fatalf("resolveIncrementBlockMutationError() error = %v, want ErrBlockMutationOutcomeUnknown", err)
-	}
-	var casUnknown gocql.RequestErrCASWriteUnknown
-	if !errors.As(err, &casUnknown) {
-		t.Fatalf("resolveIncrementBlockMutationError() error = %v, want wrapped CAS error", err)
-	}
-}
-
-func TestResolveInsertBlockMutationErrorRetriesWhenRowStillMissing(t *testing.T) {
-	retry, err := resolveInsertBlockMutationError("block-1", 42, "hot", "", gocql.RequestErrWriteTimeout{WriteType: "CAS"}, func() (blockMutationState, error) {
-		return blockMutationState{}, nil
-	})
-	if err != nil {
-		t.Fatalf("resolveInsertBlockMutationError() error = %v, want nil", err)
-	}
-	if !retry {
-		t.Fatal("resolveInsertBlockMutationError() retry = false, want true")
-	}
-}
-
-func TestResolveInsertBlockMutationErrorReturnsUnknownWhenExpectedRowExists(t *testing.T) {
-	retry, err := resolveInsertBlockMutationError("block-1", 42, "hot", "", gocql.RequestErrCASWriteUnknown{}, func() (blockMutationState, error) {
-		return blockMutationState{exists: true, refCount: 1, sizeBytes: 42, storageClass: "hot", storageKey: ""}, nil
-	})
-	if retry {
-		t.Fatal("resolveInsertBlockMutationError() retry = true, want false")
-	}
-	if err == nil {
-		t.Fatal("resolveInsertBlockMutationError() error = nil, want unknown outcome error")
-	}
-	if !errors.Is(err, ErrBlockMutationOutcomeUnknown) {
-		t.Fatalf("resolveInsertBlockMutationError() error = %v, want ErrBlockMutationOutcomeUnknown", err)
-	}
-	var casUnknown gocql.RequestErrCASWriteUnknown
-	if !errors.As(err, &casUnknown) {
-		t.Fatalf("resolveInsertBlockMutationError() error = %v, want wrapped CAS error", err)
-	}
-}
-
-func TestResolveInsertBlockMutationErrorReturnsUnknownWhenExistingStateIsUnexpected(t *testing.T) {
-	retry, err := resolveInsertBlockMutationError("block-1", 42, "hot", "", gocql.RequestErrCASWriteUnknown{}, func() (blockMutationState, error) {
-		return blockMutationState{exists: true, refCount: 2, sizeBytes: 42, storageClass: "hot", storageKey: ""}, nil
-	})
-	if retry {
-		t.Fatal("resolveInsertBlockMutationError() retry = true, want false")
-	}
-	if err == nil {
-		t.Fatal("resolveInsertBlockMutationError() error = nil, want unknown outcome error")
-	}
-	if !errors.Is(err, ErrBlockMutationOutcomeUnknown) {
-		t.Fatalf("resolveInsertBlockMutationError() error = %v, want ErrBlockMutationOutcomeUnknown", err)
-	}
-	var casUnknown gocql.RequestErrCASWriteUnknown
-	if !errors.As(err, &casUnknown) {
-		t.Fatalf("resolveInsertBlockMutationError() error = %v, want wrapped CAS error", err)
-	}
-}
-
-func TestIncrementBlockRefCountsResolvedRollsBackPartialProgress(t *testing.T) {
-	var rolledBack []string
-	seen := []string{}
-	wantErr := errors.New("boom")
-
-	err := incrementBlockRefCountsResolved(
-		[]string{"block-a", "block-b", "block-c"},
-		func(blockID string) error {
-			seen = append(seen, blockID)
-			if blockID == "block-c" {
-				return wantErr
-			}
-			return nil
-		},
-		func(blockIDs []string) {
-			rolledBack = append([]string(nil), blockIDs...)
-		},
-	)
-	if !errors.Is(err, wantErr) {
-		t.Fatalf("incrementBlockRefCountsResolved() error = %v, want %v", err, wantErr)
-	}
-	if got := fmt.Sprint(seen); got != "[block-a block-b block-c]" {
-		t.Fatalf("incrementBlockRefCountsResolved() seen = %s, want all attempted blocks", got)
-	}
-	if got := fmt.Sprint(rolledBack); got != "[block-a block-b]" {
-		t.Fatalf("incrementBlockRefCountsResolved() rollback = %s, want prior successful increments only", got)
 	}
 }
 

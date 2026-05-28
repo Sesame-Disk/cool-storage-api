@@ -396,7 +396,7 @@ func (h *OnlyOfficeHandler) ReconcileOnlyOfficePendingBlocks(orgID string) error
 		}
 
 		if strings.TrimSpace(pending.InternalBlockID) != "" {
-			zeroRefBlocks := fsHelper.DecrementBlockRefCountsOnce(orgID, onlyOfficeRollbackOperationKey(pending.OperationID), []string{pending.InternalBlockID})
+			zeroRefBlocks := fsHelper.ReleaseUploadReferences(orgID, pending.RepoID, []string{pending.InternalBlockID})
 			enqueueZeroRefBlocks(h.db, orgID, pending.RepoID, zeroRefBlocks)
 		}
 		if err := h.deleteOnlyOfficePendingBlock(orgID, pending.OperationID); err != nil {
@@ -1222,10 +1222,10 @@ func (h *OnlyOfficeHandler) saveEditedDocument(ctx context.Context, repoID, file
 		log.Printf("OnlyOffice: Warning - failed to create reverse block mapping: %v", err)
 	}
 
-	// Store block metadata using internal (SHA-256) ID. The pending-cleanup
-	// row above is what guarantees this refcount increment can be reversed
-	// even if the process dies before publish.
-	if err := NewFSHelper(h.db).IncrementOrCreateBlock(orgID, internalBlockID, len(content), storageClass, storageKey); err != nil {
+	// Store block metadata and a provisional reference using the internal (SHA-256)
+	// ID. The pending-cleanup row above plus the provisional reference's TTL both
+	// guarantee the block is reclaimed if the process dies before publish.
+	if err := NewFSHelper(h.db).RegisterUploadedBlock(orgID, repoID, internalBlockID, len(content), storageClass, storageKey); err != nil {
 		if deleteErr := h.deleteOnlyOfficePendingBlock(orgID, rollbackID); deleteErr != nil {
 			log.Printf("OnlyOffice: failed to clear pending block cleanup %s after block-metadata failure: %v", rollbackID, deleteErr)
 		}
@@ -1236,8 +1236,7 @@ func (h *OnlyOfficeHandler) saveEditedDocument(ctx context.Context, repoID, file
 	storageDeltaBytes, storageDeltaFiles, newCommitID, err := h.publishEditedDocumentMetadata(fsHelper, orgID, repoID, filePath, filename, userID, originalFileSize, externalBlockID, rollbackID)
 	if err != nil {
 		if shouldRollbackOnlyOfficeMaterializedBlock(blockMetadataRegistered, err) {
-			operationKey := onlyOfficeRollbackOperationKey(rollbackID)
-			zeroRefBlocks := fsHelper.DecrementBlockRefCountsOnce(orgID, operationKey, []string{internalBlockID})
+			zeroRefBlocks := fsHelper.ReleaseUploadReferences(orgID, repoID, []string{internalBlockID})
 			enqueueZeroRefBlocks(h.db, orgID, repoID, zeroRefBlocks)
 			if deleteErr := h.deleteOnlyOfficePendingBlock(orgID, rollbackID); deleteErr != nil {
 				log.Printf("OnlyOffice: failed to clear pending block cleanup %s after rollback: %v", rollbackID, deleteErr)
@@ -1286,7 +1285,7 @@ func (h *OnlyOfficeHandler) publishEditedDocumentMetadata(fsHelper *FSHelper, or
 		}
 
 		now := time.Now()
-		newFileFSID, err := fsHelper.CreateFileFSObject(repoID, filename, originalFileSize, []string{externalBlockID})
+		newFileFSID, err := fsHelper.CreateFileFSObject(orgID, repoID, filename, originalFileSize, []string{externalBlockID})
 		if err != nil {
 			return fmt.Errorf("failed to create file fs_object: %w", err)
 		}

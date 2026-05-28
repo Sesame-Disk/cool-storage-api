@@ -115,7 +115,6 @@ type Block struct {
 	SizeBytes    int       `json:"size"`
 	StorageClass string    `json:"storage_class"`
 	StorageKey   string    `json:"storage_key"` // S3 key or Glacier archive ID
-	RefCount     int       `json:"ref_count"`
 	CreatedAt    time.Time `json:"created_at"`
 	LastAccessed time.Time `json:"last_accessed"`
 }

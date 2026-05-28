@@ -34,7 +34,8 @@ type MockStore struct {
 	failedItems map[uuid.UUID][]GCFailedItemInfo
 
 	// blocks keyed by "orgID:blockID"
-	blocks map[string]*mockBlock
+	blocks          map[string]*mockBlock
+	blockReferences map[string]map[string]struct{}
 
 	// block GC candidates keyed by "orgID:blockID"
 	blockGCCandidates map[string]*mockBlockGCCandidate
@@ -188,7 +189,7 @@ type mockBlock struct {
 	OrgID        uuid.UUID
 	BlockID      string
 	StorageClass string
-	RefCount     int
+	GCState      string
 }
 
 type mockPendingItemKey struct {
@@ -346,6 +347,7 @@ func NewMockStore() *MockStore {
 		orgQueueStats:                 make(map[uuid.UUID]GCOrgStats),
 		failedItems:                   make(map[uuid.UUID][]GCFailedItemInfo),
 		blocks:                        make(map[string]*mockBlock),
+		blockReferences:               make(map[string]map[string]struct{}),
 		blockGCCandidates:             make(map[string]*mockBlockGCCandidate),
 		blockGCCandidateProjections:   make(map[mockBlockGCCandidateProjectionKey]BlockGCCandidateInfo),
 		mappings:                      make(map[string]string),
@@ -460,7 +462,15 @@ func (m *MockStore) AddBlock(orgID uuid.UUID, blockID, storageClass string, refC
 		OrgID:        orgID,
 		BlockID:      blockID,
 		StorageClass: storageClass,
-		RefCount:     refCount,
+	}
+	// Model the legacy refCount as that many distinct reference rows so existing
+	// tests keep their "block is alive with N refs" intent under the row model.
+	if refCount > 0 {
+		refs := make(map[string]struct{}, refCount)
+		for i := 0; i < refCount; i++ {
+			refs[fmt.Sprintf("synthetic:%d", i)] = struct{}{}
+		}
+		m.blockReferences[key] = refs
 	}
 }
 
@@ -862,6 +872,14 @@ func (m *MockStore) GetBlock(orgID uuid.UUID, blockID string) *mockBlock {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.blocks[fmt.Sprintf("%s:%s", orgID, blockID)]
+}
+
+// BlockReferenceCount returns how many reference rows a block currently has.
+// Test helper that replaces the old mutable ref_count assertions.
+func (m *MockStore) BlockReferenceCount(orgID uuid.UUID, blockID string) int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return len(m.blockReferences[fmt.Sprintf("%s:%s", orgID, blockID)])
 }
 
 // GetCommitRecord returns a commit for test assertions.
@@ -1448,19 +1466,52 @@ func (m *MockStore) GetOrgDeletedAt(orgID uuid.UUID) (*time.Time, error) {
 	return &deletedAtCopy, nil
 }
 
-func (m *MockStore) GetBlockRefCount(orgID uuid.UUID, blockID string) (int, error) {
+func (m *MockStore) BlockExists(orgID uuid.UUID, blockID string) (bool, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	if m.getBlockRefCountErr != nil {
-		return 0, m.getBlockRefCountErr
+		return false, m.getBlockRefCountErr
 	}
+	_, ok := m.blocks[fmt.Sprintf("%s:%s", orgID, blockID)]
+	return ok, nil
+}
 
+func (m *MockStore) BlockHasReferences(orgID uuid.UUID, blockID string) (bool, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return len(m.blockReferences[fmt.Sprintf("%s:%s", orgID, blockID)]) > 0, nil
+}
+
+func (m *MockStore) RemoveBlockReference(orgID uuid.UUID, blockID, referrer string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	key := fmt.Sprintf("%s:%s", orgID, blockID)
-	b, ok := m.blocks[key]
-	if !ok {
-		return 0, fmt.Errorf("%w: block %s", gocql.ErrNotFound, blockID)
+	if refs, ok := m.blockReferences[key]; ok {
+		delete(refs, referrer)
+		if len(refs) == 0 {
+			delete(m.blockReferences, key)
+		}
 	}
-	return b.RefCount, nil
+	return nil
+}
+
+// AddBlockReferenceForTest registers a reference row for tests exercising the
+// row-per-reference model directly.
+func (m *MockStore) AddBlockReferenceForTest(orgID uuid.UUID, blockID, referrer string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	key := fmt.Sprintf("%s:%s", orgID, blockID)
+	if m.blockReferences[key] == nil {
+		m.blockReferences[key] = make(map[string]struct{})
+	}
+	m.blockReferences[key][referrer] = struct{}{}
+}
+
+// AddFSObjectReferenceForTest registers the permanent reference an fs_object holds
+// on a block, using the same referrer the GC worker removes when it sweeps that
+// fs_object. Use it to seed "block referenced by fs_object" relationships.
+func (m *MockStore) AddFSObjectReferenceForTest(orgID uuid.UUID, blockID string, libID uuid.UUID, fsID string) {
+	m.AddBlockReferenceForTest(orgID, blockID, db.BlockReferrerForFSObject(libID.String(), fsID))
 }
 
 func (m *MockStore) ResolveBlockIDs(orgID uuid.UUID, blockIDs []string) ([]string, error) {
@@ -1550,11 +1601,19 @@ func (m *MockStore) ClaimBlockDelete(orgID uuid.UUID, blockID string) (bool, err
 	if !ok {
 		return false, nil
 	}
-	if b.RefCount > 0 {
-		return false, nil
-	}
-	b.RefCount = -999
+	// Idempotent claim on gc_state: succeed whether unset or already 'deleting'.
+	b.GCState = db.BlockGCStateDeleting
 	return true, nil
+}
+
+func (m *MockStore) ReleaseBlockClaim(orgID uuid.UUID, blockID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if b, ok := m.blocks[fmt.Sprintf("%s:%s", orgID, blockID)]; ok {
+		b.GCState = ""
+	}
+	return nil
 }
 
 func (m *MockStore) FinalizeBlockDelete(orgID uuid.UUID, blockID string) error {
@@ -1564,22 +1623,6 @@ func (m *MockStore) FinalizeBlockDelete(orgID uuid.UUID, blockID string) error {
 	key := fmt.Sprintf("%s:%s", orgID, blockID)
 	delete(m.blocks, key)
 	return nil
-}
-
-func (m *MockStore) DecrementBlockRefCount(orgID uuid.UUID, blockID string) (bool, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	key := fmt.Sprintf("%s:%s", orgID, blockID)
-	b, ok := m.blocks[key]
-	if !ok {
-		return false, fmt.Errorf("block not found: %s", blockID)
-	}
-	if b.RefCount <= 0 {
-		return false, nil
-	}
-	b.RefCount--
-	return b.RefCount == 0, nil
 }
 
 func (m *MockStore) ListBlockMappingsByInternalID(orgID uuid.UUID, internalID string) ([]BlockMapping, error) {

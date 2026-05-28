@@ -532,15 +532,21 @@ enumerate orphaned blocks.
 | `size_bytes` | INT | Block size |
 | `storage_class` | TEXT | Where stored (`hot-s3-usa`) |
 | `storage_key` | TEXT | S3 object key |
-| `ref_count` | INT | Number of files using this block |
+| `gc_state` | TEXT | `'deleting'` while the GC worker holds a delete claim (else null) |
+| `gc_claimed_at` | TIMESTAMP | When the GC claim was taken |
 | `last_accessed` | TIMESTAMP | For cold storage tiering |
+
+> `blocks` no longer carries a mutable `ref_count`. Block liveness lives in
+> `block_references` (one row per `(block, referrer)`); a block is alive iff a
+> reference row exists. See ARCHITECTURE.md "Block Liveness — Row-Per-Reference Model".
 
 **Deduplication Example:**
 ```
 User A uploads file.pdf (blocks: [abc, def, ghi])
 User B uploads same-file.pdf (blocks: [abc, def, ghi])
-→ blocks table: ref_count for abc, def, ghi = 2
-→ S3: Only one copy of each block stored
+→ S3: only one copy of each block stored
+→ block_references: each block gets one fs:<lib>:<fs_id> row per distinct fs_object
+  that contains it (identical content in the same library shares one fs_id → one row)
 ```
 
 **API Usage (internal):**
@@ -548,8 +554,8 @@ User B uploads same-file.pdf (blocks: [abc, def, ghi])
 POST /api/v2/blocks/upload
 # 1. Hash block content → block_id
 # 2. Check if block exists (dedup)
-# 3. If new: upload to S3, create blocks record
-# 4. If exists: increment ref_count
+# 3. If new: upload to S3, create blocks record (metadata only)
+# 4. Register a reference row (provisional up:… on upload, permanent fs:… on commit)
 ```
 
 ---
@@ -1172,7 +1178,12 @@ Covers both user and group recipients. Complement to `shares_by_user_org` (which
 - Both write `ref_count = 6`
 - Actual should be `7`
 
-**Status: ✅ RESOLVED (2026-04-10).** `IncrementOrCreateBlock` and `decrementBlockRefCount` now use LWT (CAS) with retry loops: `SELECT ref_count` → `UPDATE IF ref_count = X`. Concurrent writers retry on CAS failure. GC uses a two-phase LWT with sentinel value (-999) to prevent upload-vs-GC races. See `ARCHITECTURE.md` for the full ref_count lifecycle.
+**Status: ✅ RESOLVED — SUPERSEDED (2026-05-27).** The shared mutable counter was
+removed entirely. References are modeled as rows in `block_references`
+(`INSERT`/`DELETE` per `(block, referrer)`), so this whole "two writers race on one
+integer" scenario no longer exists — there is nothing to read-modify-write. See
+`ARCHITECTURE.md` "Block Liveness — Row-Per-Reference Model". (Historical: from
+2026-04-10 to 2026-05-27 this was mitigated with LWT/CAS retry loops on `ref_count`.)
 
 #### 3. Commit Chain Integrity
 **Scenario:** Creating a commit requires:
@@ -1271,8 +1282,9 @@ Set appropriate consistency levels per operation:
 | User login | `LOCAL_QUORUM` | Must be consistent |
 | File listing | `LOCAL_ONE` | Can be slightly stale |
 | Commit creation | `QUORUM` | Must be durable |
-| Block ref_count mutation (LWT) | `SERIAL` (default) | Global Paxos for multi-DC safety — do NOT change to `LOCAL_SERIAL` |
-| Block upload (non-LWT reads) | `LOCAL_QUORUM` | Reads before LWT must see latest state |
+| Block reference add/remove (`block_references`) | `LOCAL_QUORUM` | Idempotent INSERT/DELETE — no cross-DC Paxos in steady state |
+| GC block-delete claim (`gc_state` LWT) | `SERIAL` (default) | The ONLY block-path global Paxos — guards the irreversible S3 delete; do NOT change to `LOCAL_SERIAL` |
+| Block upload (non-LWT reads) | `LOCAL_QUORUM` | Reads must see latest state |
 | Share link validation | `LOCAL_QUORUM` | Security-critical |
 
 **Implementation in config.yaml:**

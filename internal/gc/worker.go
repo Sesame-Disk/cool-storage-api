@@ -84,10 +84,6 @@ type hardDeleteLease struct {
 	closedChan chan struct{}
 }
 
-type blockReferenceCache struct {
-	countsByOrg map[uuid.UUID]map[string]int
-}
-
 func newHardDeleteLease(ctx context.Context, kind, target string, renew func() (bool, error), release func() error) *hardDeleteLease {
 	lease := &hardDeleteLease{
 		stopCh:     make(chan struct{}),
@@ -205,7 +201,6 @@ func (w *Worker) processOrg(ctx context.Context, orgID uuid.UUID) (int, error) {
 	}
 
 	processed := 0
-	blockRefs := &blockReferenceCache{countsByOrg: make(map[uuid.UUID]map[string]int)}
 	for _, item := range items {
 		select {
 		case <-ctx.Done():
@@ -213,7 +208,7 @@ func (w *Worker) processOrg(ctx context.Context, orgID uuid.UUID) (int, error) {
 		default:
 		}
 
-		if err := w.processItem(ctx, item, blockRefs); err != nil {
+		if err := w.processItem(ctx, item); err != nil {
 			log.Printf("[GC Worker] Failed to process item %s/%s (type=%s): %v",
 				item.OrgID, item.ItemID, item.ItemType, err)
 			metrics.GCErrorsTotal.WithLabelValues(string(item.ItemType)).Inc()
@@ -278,9 +273,6 @@ func (w *Worker) processOrg(ctx context.Context, orgID uuid.UUID) (int, error) {
 
 		metrics.GCItemsProcessedTotal.WithLabelValues(string(item.ItemType)).Inc()
 		processed++
-		if item.ItemType == ItemFSObject {
-			delete(blockRefs.countsByOrg, item.OrgID)
-		}
 	}
 
 	if len(items) < w.batchSize {
@@ -323,10 +315,10 @@ func (w *Worker) postponeItem(item QueueItem) error {
 	)
 }
 
-func (w *Worker) processItem(ctx context.Context, item QueueItem, blockRefs *blockReferenceCache) error {
+func (w *Worker) processItem(ctx context.Context, item QueueItem) error {
 	switch item.ItemType {
 	case ItemBlock:
-		return w.processBlock(ctx, item, blockRefs)
+		return w.processBlock(ctx, item)
 	case ItemCommit:
 		return w.processCommit(item)
 	case ItemFSObject:
@@ -350,7 +342,7 @@ func (w *Worker) processItem(ctx context.Context, item QueueItem, blockRefs *blo
 	}
 }
 
-func (w *Worker) processBlock(ctx context.Context, item QueueItem, blockRefs *blockReferenceCache) error {
+func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 	if w.dryRun {
 		log.Printf("[GC Worker] DRY RUN: Would conditionally delete block %s from DB and S3", item.ItemID)
 		return nil
@@ -358,30 +350,51 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem, blockRefs *bl
 
 	candidateAt := effectiveIdentityAt(item.QueuedAt, item.IdentityAt)
 
-	referenced, err := w.blockReferencedByFSObject(item.OrgID, item.ItemID, blockRefs)
+	// Pre-check: a block is alive iff it still has reference rows. This single-
+	// partition point read replaces the old per-org full scan of live fs_objects.
+	hasRefs, err := w.store.BlockHasReferences(item.OrgID, item.ItemID)
 	if err != nil {
-		return fmt.Errorf("failed to verify live fs_object references for block %s: %w", item.ItemID, err)
+		return fmt.Errorf("failed to check block references for %s: %w", item.ItemID, err)
 	}
-	if referenced {
-		log.Printf("[GC Worker] Block %s still has a live fs_object reference, skipping deletion", item.ItemID)
+	if hasRefs {
+		log.Printf("[GC Worker] Block %s still referenced, skipping deletion", item.ItemID)
+		if err := w.store.DeleteBlockGCCandidate(item.OrgID, item.ItemID, candidateAt); err != nil {
+			return fmt.Errorf("failed to clear stale block GC candidate: %w", err)
+		}
 		metrics.GCItemsSkippedTotal.Inc()
 		return nil
 	}
 
-	// 1. Claim the block row using LWT (IF ref_count <= 0). We defer the
-	// physical DELETE until after we've persisted S3-recovery state.
+	// 1. Claim the block (gc_state='deleting') via LWT. We defer the physical
+	// DELETE until after we've persisted S3-recovery state.
 	applied, err := w.store.ClaimBlockDelete(item.OrgID, item.ItemID)
 	if err != nil {
 		return fmt.Errorf("failed to claim block record for deletion: %w", err)
 	}
-
-	// 2. If it didn't apply, it means ref_count > 0 or it was already deleted.
-	// We skip deleting from S3 to avoid data loss.
 	if !applied {
+		// Row missing or could not be claimed; nothing to delete from S3.
 		if err := w.store.DeleteBlockGCCandidate(item.OrgID, item.ItemID, candidateAt); err != nil {
 			return fmt.Errorf("failed to clear stale block GC candidate: %w", err)
 		}
-		log.Printf("[GC Worker] Block %s LWT delete not applied (ref_count > 0 or already deleted), skipping S3 deletion", item.ItemID)
+		log.Printf("[GC Worker] Block %s claim not applied (row gone), skipping S3 deletion", item.ItemID)
+		metrics.GCItemsSkippedTotal.Inc()
+		return nil
+	}
+
+	// 2. Claim-then-verify: re-check references AFTER claiming. If a concurrent
+	// upload registered a reference, abandon the claim so the block stays alive.
+	hasRefs, err = w.store.BlockHasReferences(item.OrgID, item.ItemID)
+	if err != nil {
+		return fmt.Errorf("failed to re-check block references for %s: %w", item.ItemID, err)
+	}
+	if hasRefs {
+		if relErr := w.store.ReleaseBlockClaim(item.OrgID, item.ItemID); relErr != nil {
+			log.Printf("[GC Worker] WARNING: failed to release claim on re-referenced block %s: %v", item.ItemID, relErr)
+		}
+		if err := w.store.DeleteBlockGCCandidate(item.OrgID, item.ItemID, candidateAt); err != nil {
+			return fmt.Errorf("failed to clear block GC candidate after re-reference: %w", err)
+		}
+		log.Printf("[GC Worker] Block %s re-referenced after claim, skipping deletion", item.ItemID)
 		metrics.GCItemsSkippedTotal.Inc()
 		return nil
 	}
@@ -529,17 +542,17 @@ func (w *Worker) RecoverS3Orphans(ctx context.Context, perBucketLimit int) (int,
 					return recovered, ctx.Err()
 				default:
 				}
-				if _, err := w.store.GetBlockRefCount(orph.OrgID, orph.BlockID); err == nil {
+				if exists, err := w.store.BlockExists(orph.OrgID, orph.BlockID); err != nil {
+					log.Printf("[GC Worker] S3 orphan recovery: block existence lookup failed for org=%s block=%s: %v", orph.OrgID, orph.BlockID, err)
+					if phaseErr == nil {
+						phaseErr = fmt.Errorf("check block existence for S3 orphan org=%s block=%s: %w", orph.OrgID, orph.BlockID, err)
+					}
+					continue
+				} else if exists {
 					// The canonical block row still exists (likely claimed but not yet finalized).
 					// Skip recovery for now; a later worker retry or startup scan will finish it.
 					if phaseErr == nil {
 						phaseErr = fmt.Errorf("S3 orphan recovery deferred for org=%s block=%s because canonical block row still exists", orph.OrgID, orph.BlockID)
-					}
-					continue
-				} else if !errors.Is(err, gocql.ErrNotFound) {
-					log.Printf("[GC Worker] S3 orphan recovery: block ref-count lookup failed for org=%s block=%s: %v", orph.OrgID, orph.BlockID, err)
-					if phaseErr == nil {
-						phaseErr = fmt.Errorf("check block ref-count for S3 orphan org=%s block=%s: %w", orph.OrgID, orph.BlockID, err)
 					}
 					continue
 				}
@@ -737,9 +750,10 @@ func (w *Worker) processFSObject(ctx context.Context, item QueueItem) error {
 		}
 	}
 
-	// If it's a file with blocks, decrement ref counts
+	// If it's a file with blocks, remove its permanent block references. Any block
+	// left with no references becomes a GC candidate.
 	if len(fsObj.BlockIDs) > 0 {
-		zeroRefBlocks, err := w.decrementFSObjectBlocks(item.OrgID, item.LibraryID, item.ItemID, identityAt, fsObj.BlockIDs)
+		zeroRefBlocks, err := w.removeFSObjectBlockReferences(item.OrgID, item.LibraryID, item.ItemID, fsObj.BlockIDs)
 		if err != nil {
 			return err
 		}
@@ -1257,147 +1271,39 @@ func fsObjectBlockDecrementTaskID(libraryID uuid.UUID, fsID string, identityAt t
 	return uuid.NewMD5(uuid.NameSpaceOID, []byte(taskIDStr))
 }
 
-func (w *Worker) decrementFSObjectBlocks(orgID, libraryID uuid.UUID, fsID string, identityAt time.Time, blockIDs []string) ([]string, error) {
+// removeFSObjectBlockReferences deletes the permanent reference rows held by an
+// fs_object (one "fs:<library>:<fs_id>" referrer per block) and returns the blocks
+// that are now unreferenced, so the caller can enqueue them for GC. Block IDs are
+// resolved to internal SHA-256 IDs first. Idempotent: deleting a missing reference
+// is a no-op, so a retried fs_object GC pass is safe (no double-decrement risk —
+// the whole class of decrement idempotency bugs disappears with the counter).
+func (w *Worker) removeFSObjectBlockReferences(orgID, libraryID uuid.UUID, fsID string, blockIDs []string) ([]string, error) {
 	resolvedBlockIDs, err := w.store.ResolveBlockIDs(orgID, blockIDs)
 	if err != nil {
 		return nil, fmt.Errorf("failed to resolve block IDs for fs_object %s/%s: %w", libraryID, fsID, err)
 	}
 
+	referrer := db.BlockReferrerForFSObject(libraryID.String(), fsID)
+	seen := make(map[string]struct{}, len(resolvedBlockIDs))
 	var zeroRef []string
-	currentOccurrences := make(map[string]int, len(resolvedBlockIDs))
-	skippedMarkers := make(map[string]int)
-	for blockIndex, blockID := range resolvedBlockIDs {
-		currentOccurrences[blockID]++
-		taskID := fsObjectBlockDecrementTaskID(libraryID, fsID, identityAt, blockIndex, blockID)
-		applied, err := w.store.MarkItemProcessed(taskID)
-		if err != nil {
-			return nil, fmt.Errorf("failed to mark block decrement progress for fs_object %s/%s block %s: %w", libraryID, fsID, blockID, err)
-		}
-		if !applied {
-			skippedMarkers[blockID]++
+	for _, blockID := range resolvedBlockIDs {
+		if _, dup := seen[blockID]; dup {
 			continue
 		}
+		seen[blockID] = struct{}{}
 
-		hitZero, err := w.store.DecrementBlockRefCount(orgID, blockID)
-		if err != nil {
-			return nil, fmt.Errorf("failed to decrement block ref_count for fs_object %s/%s block %s: %w", libraryID, fsID, blockID, err)
+		if err := w.store.RemoveBlockReference(orgID, blockID, referrer); err != nil {
+			return nil, fmt.Errorf("failed to remove block reference for fs_object %s/%s block %s: %w", libraryID, fsID, blockID, err)
 		}
-		if hitZero {
+		hasRefs, err := w.store.BlockHasReferences(orgID, blockID)
+		if err != nil {
+			return nil, fmt.Errorf("failed to check references for fs_object %s/%s block %s: %w", libraryID, fsID, blockID, err)
+		}
+		if !hasRefs {
 			zeroRef = append(zeroRef, blockID)
 		}
 	}
-
-	if len(skippedMarkers) > 0 {
-		repairedZeroRef, err := w.repairSkippedFSObjectBlockDecrements(orgID, libraryID, fsID, currentOccurrences, skippedMarkers)
-		if err != nil {
-			return nil, err
-		}
-		zeroRef = append(zeroRef, repairedZeroRef...)
-	}
 	return zeroRef, nil
-}
-
-func (w *Worker) blockReferencedByFSObject(orgID uuid.UUID, blockID string, cache *blockReferenceCache) (bool, error) {
-	if cache != nil {
-		refs, err := w.liveFSObjectBlockReferenceCounts(orgID, cache)
-		if err != nil {
-			return false, err
-		}
-		return refs[blockID] > 0, nil
-	}
-
-	refs, err := w.collectLiveFSObjectBlockReferenceCounts(orgID)
-	if err != nil {
-		return false, err
-	}
-	return refs[blockID] > 0, nil
-}
-
-func (w *Worker) repairSkippedFSObjectBlockDecrements(orgID, libraryID uuid.UUID, fsID string, currentOccurrences, skippedMarkers map[string]int) ([]string, error) {
-	liveCounts, err := w.collectLiveFSObjectBlockReferenceCounts(orgID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to inspect live block references for fs_object %s/%s retry: %w", libraryID, fsID, err)
-	}
-
-	var zeroRef []string
-	for blockID, skipped := range skippedMarkers {
-		expectedMaxRefCount := liveCounts[blockID] - currentOccurrences[blockID]
-		if expectedMaxRefCount < 0 {
-			expectedMaxRefCount = 0
-		}
-
-		refCount, err := w.store.GetBlockRefCount(orgID, blockID)
-		if err != nil {
-			if isBlockNotFound(err) {
-				// The original decrement already happened and the block row
-				// was later finalized by block GC. There is nothing left to
-				// repair for this fs_object retry.
-				continue
-			}
-			return nil, fmt.Errorf("failed to read block ref_count while repairing fs_object %s/%s block %s: %w", libraryID, fsID, blockID, err)
-		}
-
-		missing := refCount - expectedMaxRefCount
-		if missing <= 0 {
-			continue
-		}
-		if missing > skipped {
-			missing = skipped
-		}
-
-		for i := 0; i < missing; i++ {
-			hitZero, err := w.store.DecrementBlockRefCount(orgID, blockID)
-			if err != nil {
-				return nil, fmt.Errorf("failed to repair missing block decrement for fs_object %s/%s block %s: %w", libraryID, fsID, blockID, err)
-			}
-			if hitZero {
-				zeroRef = append(zeroRef, blockID)
-			}
-		}
-	}
-
-	return zeroRef, nil
-}
-
-func (w *Worker) liveFSObjectBlockReferenceCounts(orgID uuid.UUID, cache *blockReferenceCache) (map[string]int, error) {
-	if refs, ok := cache.countsByOrg[orgID]; ok {
-		return refs, nil
-	}
-	refs, err := w.collectLiveFSObjectBlockReferenceCounts(orgID)
-	if err != nil {
-		return nil, err
-	}
-	cache.countsByOrg[orgID] = refs
-	return refs, nil
-}
-
-func (w *Worker) collectLiveFSObjectBlockReferenceCounts(orgID uuid.UUID) (map[string]int, error) {
-	libraries, err := w.store.ListLibrariesForOrg(orgID)
-	if err != nil {
-		return nil, err
-	}
-
-	refs := make(map[string]int)
-	for _, library := range libraries {
-		objects, err := w.store.ListFSObjectsForLibrary(library.LibraryID)
-		if err != nil {
-			return nil, fmt.Errorf("list fs_objects for library %s: %w", library.LibraryID, err)
-		}
-		for _, obj := range objects {
-			if len(obj.BlockIDs) == 0 {
-				continue
-			}
-			resolvedBlockIDs, err := w.store.ResolveBlockIDs(orgID, obj.BlockIDs)
-			if err != nil {
-				return nil, fmt.Errorf("resolve block IDs for fs_object %s/%s: %w", library.LibraryID, obj.FSID, err)
-			}
-			for _, resolvedBlockID := range resolvedBlockIDs {
-				refs[resolvedBlockID]++
-			}
-		}
-	}
-
-	return refs, nil
 }
 
 func (w *Worker) enqueueZeroRefBlocks(orgID, libraryID uuid.UUID, blockIDs []string, storageClass string) error {

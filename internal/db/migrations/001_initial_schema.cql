@@ -253,18 +253,41 @@ CREATE TABLE IF NOT EXISTS fs_objects (
 );
 
 -- Per-block partition: each (org_id, block_id) is its own Paxos partition.
--- Avoids the prior hot partition where all block-refcount LWTs for an org
--- (especially the platform org `00000000-...`) serialized through one row group.
+-- `blocks` holds immutable block metadata (size, storage class/key) plus GC
+-- state. Liveness is NOT a mutable counter anymore — it lives in
+-- `block_references` (a block is alive iff it has ≥1 reference row). `gc_state`
+-- is set to 'deleting' by the GC worker's claim LWT just before the irreversible
+-- S3 delete; writers back off when they observe it. See block_references below.
 CREATE TABLE IF NOT EXISTS blocks (
     org_id        UUID,
     block_id      TEXT,
     size_bytes    INT,
     storage_class TEXT,
     storage_key   TEXT,
-    ref_count     INT,
+    gc_state      TEXT,
+    gc_claimed_at TIMESTAMP,
     created_at    TIMESTAMP,
     last_accessed TIMESTAMP,
     PRIMARY KEY ((org_id, block_id))
+);
+
+-- Row-per-reference liveness model (replaces blocks.ref_count). One row per
+-- (block, referrer). A block is alive iff at least one reference row exists.
+-- INSERT/DELETE are idempotent and need no LWT in steady state — expensive Paxos
+-- is reserved for the GC worker's final claim before deleting from S3.
+--   referrer = "fs:<library_id>:<fs_id>"   permanent: an fs_object containing the block
+--   referrer = "up:<upload_token>"         provisional: an in-flight upload (written
+--                                          with USING TTL so an abandoned upload cannot
+--                                          leak the block forever)
+-- Per-(org, block) partition mirrors `blocks`, so a block's reference rows and its
+-- metadata never contend with another block's traffic.
+CREATE TABLE IF NOT EXISTS block_references (
+    org_id     UUID,
+    block_id   TEXT,
+    referrer   TEXT,
+    library_id UUID,
+    created_at TIMESTAMP,
+    PRIMARY KEY ((org_id, block_id), referrer)
 );
 
 -- Canonical GC candidates table. Per-block partition like `blocks` so reference

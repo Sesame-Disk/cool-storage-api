@@ -1124,8 +1124,9 @@ func (h *FileHandler) CreateFile(c *gin.Context) {
 		}
 
 		if templateBlockData != nil && !templateBlockStored {
+			var templateStorageClass string
 			if templateBlockStore == nil {
-				blockStore, _, err := h.resolveLibraryBlockStore(c, orgID, repoID)
+				blockStore, storageClass, err := h.resolveLibraryBlockStore(c, orgID, repoID)
 				if err != nil {
 					return fmt.Errorf("%w: %v", errBlockStorageUnavailable, err)
 				}
@@ -1133,15 +1134,21 @@ func (h *FileHandler) CreateFile(c *gin.Context) {
 					return errBlockStorageUnavailable
 				}
 				templateBlockStore = blockStore
+				templateStorageClass = storageClass
 			}
 			if _, err := templateBlockStore.PutBlockData(c.Request.Context(), templateBlockData); err != nil {
 				return fmt.Errorf("failed to store file content: %w", err)
+			}
+			// Register block metadata so GC can manage the template block. The
+			// permanent reference is created below by CreateFileFSObject.
+			if err := h.db.UpsertBlockMetadata(orgID, templateBlockData.Hash, int(fileSize), templateStorageClass, ""); err != nil {
+				return fmt.Errorf("failed to register block metadata: %w", err)
 			}
 			templateBlockStored = true
 			log.Printf("[CreateFile] Created Office file %s with template size %d bytes", fileName, fileSize)
 		}
 
-		fileFSID, err := fsHelper.CreateFileFSObject(repoID, fileName, fileSize, blockIDs)
+		fileFSID, err := fsHelper.CreateFileFSObject(orgID, repoID, fileName, fileSize, blockIDs)
 		if err != nil {
 			return fmt.Errorf("failed to create file: %w", err)
 		}
@@ -1262,7 +1269,6 @@ func (h *FileHandler) DeleteDirectory(c *gin.Context) {
 	dirName := path.Base(dirPath)
 	errDirectoryNotFound := errors.New("directory not found")
 	errPathNotDirectory := errors.New("path is not a directory")
-	var blockIDs []string
 	var totalSize int64
 	var fileCount int64
 	var newCommitID string
@@ -1279,7 +1285,7 @@ func (h *FileHandler) DeleteDirectory(c *gin.Context) {
 			return errPathNotDirectory
 		}
 
-		currentBlockIDs, currentTotalSize, currentFileCount, _ := fsHelper.collectDirStats(repoID, result.TargetFSID)
+		_, currentTotalSize, currentFileCount, _ := fsHelper.collectDirStats(repoID, result.TargetFSID)
 		newEntries := RemoveEntryFromList(result.Entries, dirName)
 		newParentFSID, err := fsHelper.CreateDirectoryFSObject(repoID, newEntries)
 		if err != nil {
@@ -1301,7 +1307,6 @@ func (h *FileHandler) DeleteDirectory(c *gin.Context) {
 			return err
 		}
 
-		blockIDs = currentBlockIDs
 		totalSize = currentTotalSize
 		fileCount = currentFileCount
 		newCommitID = commitID
@@ -1321,23 +1326,13 @@ func (h *FileHandler) DeleteDirectory(c *gin.Context) {
 		return
 	}
 
-	// Decrement block ref counts and enqueue zero-ref blocks for GC
-	go func() {
-		if len(blockIDs) > 0 {
-			zeroRefBlocks := fsHelper.DecrementBlockRefCountsOnce(orgID, newCommitID, blockIDs)
-			if len(zeroRefBlocks) > 0 && h.gcEnqueuer != nil {
-				// Get storage class for the library
-				var storageClass string
-				h.db.Session().Query(`
-					SELECT storage_class FROM libraries WHERE org_id = ? AND library_id = ?
-				`, orgID, repoID).Scan(&storageClass)
-				h.gcEnqueuer.EnqueueBlocks(orgID, zeroRefBlocks, storageClass)
-			}
-		}
-		if totalSize > 0 {
-			traffic.DecrementStorageCounters(h.db, orgID, userID, repoID, totalSize, fileCount)
-		}
-	}()
+	// Block references are released when GC sweeps the now-unreachable fs_objects
+	// (the deleted tree stays in fs_objects until version retention expires), so
+	// there is no inline ref decrement here. Storage-quota counters still update
+	// immediately to reflect the user-visible deletion.
+	if totalSize > 0 {
+		go traffic.DecrementStorageCounters(h.db, orgID, userID, repoID, totalSize, fileCount)
+	}
 
 	// Clean up file tags for the deleted directory and its contents (async, non-blocking)
 	go h.cleanupFileTagsForPrefix(repoID, dirPath)
@@ -1945,22 +1940,9 @@ func (h *FileHandler) DeleteFile(c *gin.Context) {
 		return
 	}
 
-	// Decrement block ref counts and enqueue zero-ref blocks for GC
-	go func() {
-		if result.TargetEntry != nil {
-			blockIDs, _ := fsHelper.CollectBlockIDsRecursive(repoID, result.TargetFSID)
-			if len(blockIDs) > 0 {
-				zeroRefBlocks := fsHelper.DecrementBlockRefCountsOnce(orgID, newCommitID, blockIDs)
-				if len(zeroRefBlocks) > 0 && h.gcEnqueuer != nil {
-					var storageClass string
-					h.db.Session().Query(`
-						SELECT storage_class FROM libraries WHERE org_id = ? AND library_id = ?
-					`, orgID, repoID).Scan(&storageClass)
-					h.gcEnqueuer.EnqueueBlocks(orgID, zeroRefBlocks, storageClass)
-				}
-			}
-		}
-	}()
+	// Block references are released when GC sweeps the now-unreachable fs_object
+	// (the deleted file stays in fs_objects until version retention expires), so
+	// there is no inline ref decrement here.
 
 	// Clean up file tags for the deleted file (async, non-blocking)
 	go h.cleanupFileTagsForPath(repoID, filePath)
@@ -2224,33 +2206,12 @@ type CopyFileRequest struct {
 	Filename interface{} `json:"filename" form:"filename"` // Can be string or []string for batch operations
 }
 
-func pinCopiedTreeBlockRefs(fsHelper *FSHelper, orgID, repoID, srcFSID string) ([]string, error) {
-	blockIDs, err := fsHelper.CollectBlockIDsRecursive(repoID, srcFSID)
-	if err != nil {
-		return nil, err
-	}
-	if len(blockIDs) == 0 {
-		return nil, nil
-	}
-	return fsHelper.IncrementBlockRefCountsTracked(orgID, blockIDs)
-}
-
-func rollbackCopiedTreeBlockRefs(fsHelper *FSHelper, orgID, operationKey string, blockIDs []string) {
-	if len(blockIDs) == 0 {
-		return
-	}
-	if zeroRefBlocks := fsHelper.DecrementBlockRefCountsOnce(orgID, operationKey, blockIDs); len(zeroRefBlocks) > 0 {
-		log.Printf("[copyRefRollback] WARNING: rollback %q drove %d blocks to zero refs", operationKey, len(zeroRefBlocks))
-	}
-}
-
 type copyItemResult struct {
-	itemName         string
-	commitID         string
-	deltaBytes       int64
-	deltaFiles       int64
-	replacedBlockIDs []string
-	skipped          bool
+	itemName   string
+	commitID   string
+	deltaBytes int64
+	deltaFiles int64
+	skipped    bool
 }
 
 func copyItemWithinRepoWithRetry(label string, fsHelper *FSHelper, orgID, userID, repoID, srcPath, dstDir, conflictPolicy string) (*copyItemResult, error) {
@@ -2323,14 +2284,6 @@ func copyItemWithinRepoWithRetry(label string, fsHelper *FSHelper, orgID, userID
 			}
 		}
 
-		var replacedBlockIDs []string
-		if replacedEntry != nil {
-			replacedBlockIDs, err = fsHelper.CollectBlockIDsRecursive(repoID, replacedEntry.ID)
-			if err != nil {
-				return fmt.Errorf("failed to collect replaced block IDs: %w", err)
-			}
-		}
-
 		dstNewEntries := AddEntryToList(dstDirEntries, copiedEntry)
 		newDstFSID, err := fsHelper.CreateDirectoryFSObject(repoID, dstNewEntries)
 		if err != nil {
@@ -2366,13 +2319,11 @@ func copyItemWithinRepoWithRetry(label string, fsHelper *FSHelper, orgID, userID
 			return fmt.Errorf("failed to create commit: %w", err)
 		}
 
-		pinnedBlockIDs, err := pinCopiedTreeBlockRefs(fsHelper, orgID, repoID, srcResult.TargetFSID)
-		if err != nil {
-			return fmt.Errorf("failed to increment block ref counts for copy: %w", err)
-		}
-
+		// Block references need no adjustment on copy: a same-repo copy shares the
+		// source's content-addressed fs_id (its reference already exists), and the
+		// replaced entry's old fs_object stays referenced from older commits until
+		// GC sweeps it. The new directory fs_objects carry no blocks.
 		if err := fsHelper.UpdateLibraryHeadFromSnapshot(snapshot, repoID, newCommitID, snapshot.HeadCommitID); err != nil {
-			rollbackCopiedTreeBlockRefs(fsHelper, orgID, "copy-rollback:"+newCommitID, pinnedBlockIDs)
 			return err
 		}
 
@@ -2380,7 +2331,6 @@ func copyItemWithinRepoWithRetry(label string, fsHelper *FSHelper, orgID, userID
 		result.commitID = newCommitID
 		result.deltaBytes = deltaBytes
 		result.deltaFiles = deltaFiles
-		result.replacedBlockIDs = replacedBlockIDs
 		result.skipped = false
 		return nil
 	})
@@ -2388,19 +2338,6 @@ func copyItemWithinRepoWithRetry(label string, fsHelper *FSHelper, orgID, userID
 		return nil, err
 	}
 	return result, nil
-}
-
-func scheduleCopyReplaceBlockCleanup(database *db.DB, fsHelper *FSHelper, orgID, repoID string, result *copyItemResult) {
-	if result == nil || result.skipped || len(result.replacedBlockIDs) == 0 {
-		return
-	}
-
-	commitID := result.commitID
-	blockIDs := append([]string(nil), result.replacedBlockIDs...)
-	go func() {
-		zeroRefBlocks := fsHelper.DecrementBlockRefCountsOnce(orgID, "copy-replace:"+commitID, blockIDs)
-		enqueueZeroRefBlocks(database, orgID, repoID, zeroRefBlocks)
-	}()
 }
 
 // CopyFile copies a file to a new location
@@ -2558,7 +2495,6 @@ func (h *FileHandler) CopyFile(c *gin.Context) {
 	}
 
 	if !copyResult.skipped {
-		scheduleCopyReplaceBlockCleanup(h.db, fsHelper, orgID, repoID, copyResult)
 		if !applyStorageCounterDelta(c, h.db, orgID, userID, repoID, copyResult.deltaBytes, copyResult.deltaFiles) {
 			return
 		}
@@ -2825,9 +2761,10 @@ func (h *FileHandler) UploadFile(c *gin.Context) {
 		log.Printf("[UploadFile] WARNING: failed to write reverse block_id_mapping: %v", err)
 	}
 
-	// Increment/create block ref_count in blocks table
-	if err := fsHelper.IncrementOrCreateBlock(orgID, sha256ID, len(storedContent), storageClass, ""); err != nil {
-		log.Printf("[UploadFile] CRITICAL: failed to register block metadata org=%s block=%s: %v", orgID, sha256ID[:16], err)
+	// Register block metadata + a provisional reference (kept alive by TTL until
+	// the fs_object commit below creates the permanent reference).
+	if err := fsHelper.RegisterUploadedBlock(orgID, repoID, sha256ID, len(storedContent), storageClass, ""); err != nil {
+		log.Printf("[UploadFile] CRITICAL: failed to register block org=%s block=%s: %v", orgID, sha256ID[:16], err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to store block metadata"})
 		return
 	}
@@ -2985,7 +2922,7 @@ func (h *FileHandler) finalizeStoredUploadMetadataOnce(fsHelper *FSHelper, orgID
 		}
 	}
 
-	fileFSID, err := fsHelper.CreateFileFSObject(repoID, actualFilename, fileSize, []string{fileID})
+	fileFSID, err := fsHelper.CreateFileFSObject(orgID, repoID, actualFilename, fileSize, []string{fileID})
 	if err != nil {
 		return "", 0, 0, fmt.Errorf("failed to create file metadata: %w", err)
 	}
@@ -3096,7 +3033,6 @@ func (h *FileHandler) copyBatchFiles(c *gin.Context, srcPaths []string, srcRepoI
 		}
 
 		if !copyOutcome.skipped {
-			scheduleCopyReplaceBlockCleanup(h.db, fsHelper, orgID, repoID, copyOutcome)
 			if !applyStorageCounterDelta(c, h.db, orgID, userID, repoID, copyOutcome.deltaBytes, copyOutcome.deltaFiles) {
 				return
 			}
@@ -4595,10 +4531,7 @@ func (h *FileHandler) BatchDeleteItems(c *gin.Context) {
 
 	fsHelper := NewFSHelper(h.db)
 
-	// Lookup library storage class before the async operation
-	libraryClass := h.lookupLibraryStorageClass(orgID, req.RepoID)
 	var deletedEntries []FSEntry
-	var newCommitID string
 	var responseCommitID string
 
 	err := retryLibraryHeadMutation("BatchDeleteItems", func() error {
@@ -4643,7 +4576,6 @@ func (h *FileHandler) BatchDeleteItems(c *gin.Context) {
 		if len(currentDeletedNames) == 0 {
 			responseCommitID = snapshot.HeadCommitID
 			deletedEntries = nil
-			newCommitID = ""
 			return nil
 		}
 
@@ -4674,7 +4606,6 @@ func (h *FileHandler) BatchDeleteItems(c *gin.Context) {
 		}
 
 		deletedEntries = append([]FSEntry(nil), currentDeletedEntries...)
-		newCommitID = commitID
 		responseCommitID = commitID
 		return nil
 	})
@@ -4700,10 +4631,11 @@ func (h *FileHandler) BatchDeleteItems(c *gin.Context) {
 		return
 	}
 
-	// Clean up file tags and decrement storage counters for all deleted items (async, non-blocking)
+	// Clean up file tags and decrement storage counters for all deleted items (async, non-blocking).
+	// Block references are released when GC sweeps the now-unreachable fs_objects
+	// (they stay in fs_objects until version retention expires), so there is no
+	// inline ref decrement here.
 	go func() {
-		var allDeletedBlockIDs []string
-
 		for _, entry := range deletedEntries {
 			deletedPath := path.Join(parentDir, entry.Name)
 
@@ -4714,23 +4646,10 @@ func (h *FileHandler) BatchDeleteItems(c *gin.Context) {
 				h.cleanupFileTagsForPath(req.RepoID, deletedPath)
 			}
 
-			// Collect stats and block IDs
-			blocks, totalSize, fileCount, err := fsHelper.collectDirStats(req.RepoID, entry.ID)
-			if err == nil {
-				if len(blocks) > 0 {
-					allDeletedBlockIDs = append(allDeletedBlockIDs, blocks...)
-				}
-				if totalSize > 0 || fileCount > 0 {
-					traffic.DecrementStorageCounters(h.db, orgID, userID, req.RepoID, totalSize, fileCount)
-				}
-			}
-		}
-
-		// Enqueue blocks to Garbage Collector
-		if len(allDeletedBlockIDs) > 0 {
-			zeroRefBlocks := fsHelper.DecrementBlockRefCountsOnce(orgID, newCommitID, allDeletedBlockIDs)
-			if len(zeroRefBlocks) > 0 && h.gcEnqueuer != nil {
-				h.gcEnqueuer.EnqueueBlocks(orgID, zeroRefBlocks, libraryClass)
+			// Update storage-quota counters for the deletion.
+			_, totalSize, fileCount, err := fsHelper.collectDirStats(req.RepoID, entry.ID)
+			if err == nil && (totalSize > 0 || fileCount > 0) {
+				traffic.DecrementStorageCounters(h.db, orgID, userID, req.RepoID, totalSize, fileCount)
 			}
 		}
 	}()
