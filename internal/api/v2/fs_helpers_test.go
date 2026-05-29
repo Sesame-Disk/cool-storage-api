@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Sesame-Disk/sesamefs/internal/db"
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
 )
 
@@ -34,6 +35,157 @@ func TestRegisterFSObjectBlockReferences_ResolutionFailureAborts(t *testing.T) {
 	err := helper.RegisterFSObjectBlockReferences("org-1", "lib-1", "fs-1", []string{"sha1-block"})
 	if !errors.Is(err, resolveErr) {
 		t.Fatalf("RegisterFSObjectBlockReferences() error = %v, want wrapped %v", err, resolveErr)
+	}
+}
+
+func TestRegisterUploadedBlock_RetriesFenceWithoutDroppingProvisionalRef(t *testing.T) {
+	helper := &FSHelper{}
+	oldAdd := registerUploadedBlockAddReferenceFn
+	oldFence := registerUploadedBlockFenceActiveFn
+	oldUpsert := registerUploadedBlockUpsertMetadataFn
+	oldRelease := registerUploadedBlockReleaseRefsFn
+	oldAttempts := registerUploadedBlockRetryAttemptsFn
+	oldBackoff := registerUploadedBlockRetryBackoffFn
+	oldSleep := registerUploadedBlockSleepFn
+	t.Cleanup(func() {
+		registerUploadedBlockAddReferenceFn = oldAdd
+		registerUploadedBlockFenceActiveFn = oldFence
+		registerUploadedBlockUpsertMetadataFn = oldUpsert
+		registerUploadedBlockReleaseRefsFn = oldRelease
+		registerUploadedBlockRetryAttemptsFn = oldAttempts
+		registerUploadedBlockRetryBackoffFn = oldBackoff
+		registerUploadedBlockSleepFn = oldSleep
+	})
+
+	var calls []string
+	registerUploadedBlockAddReferenceFn = func(h *FSHelper, orgID, blockID, referrer, libraryID string, ttlSeconds int) error {
+		calls = append(calls, "add")
+		if orgID != "org-1" || blockID != "block-1" || libraryID != "lib-1" {
+			t.Fatalf("add args = %s/%s/%s, want org-1/block-1/lib-1", orgID, blockID, libraryID)
+		}
+		if referrer != db.BlockReferrerForUpload("op-1") {
+			t.Fatalf("referrer = %q, want upload referrer", referrer)
+		}
+		if ttlSeconds != db.ProvisionalBlockReferenceTTLSeconds {
+			t.Fatalf("ttlSeconds = %d, want %d", ttlSeconds, db.ProvisionalBlockReferenceTTLSeconds)
+		}
+		return nil
+	}
+	fenceChecks := 0
+	registerUploadedBlockFenceActiveFn = func(h *FSHelper, orgID, blockID string) (bool, error) {
+		fenceChecks++
+		calls = append(calls, fmt.Sprintf("fence-%d", fenceChecks))
+		return fenceChecks == 1, nil
+	}
+	registerUploadedBlockUpsertMetadataFn = func(h *FSHelper, orgID, blockID string, sizeBytes int, storageClass, storageKey string) error {
+		calls = append(calls, "upsert")
+		if sizeBytes != 123 || storageClass != "hot" || storageKey != "key-1" {
+			t.Fatalf("upsert args = %d/%s/%s, want 123/hot/key-1", sizeBytes, storageClass, storageKey)
+		}
+		return nil
+	}
+	registerUploadedBlockReleaseRefsFn = func(h *FSHelper, orgID, libraryID, operationID string, blockIDs []string) []string {
+		t.Fatal("release should not run when the fence clears during retry")
+		return nil
+	}
+	registerUploadedBlockRetryAttemptsFn = func() int { return 2 }
+	registerUploadedBlockRetryBackoffFn = func(attempt int) time.Duration {
+		calls = append(calls, fmt.Sprintf("backoff-%d", attempt))
+		return time.Millisecond
+	}
+	registerUploadedBlockSleepFn = func(delay time.Duration) {
+		calls = append(calls, fmt.Sprintf("sleep-%s", delay))
+	}
+
+	err := helper.RegisterUploadedBlock("org-1", "lib-1", "block-1", "op-1", 123, "hot", "key-1")
+	if err != nil {
+		t.Fatalf("RegisterUploadedBlock() error = %v, want nil", err)
+	}
+	want := []string{"add", "fence-1", "backoff-1", "sleep-1ms", "fence-2", "upsert"}
+	if len(calls) != len(want) {
+		t.Fatalf("calls = %#v, want %#v", calls, want)
+	}
+	for i := range want {
+		if calls[i] != want[i] {
+			t.Fatalf("calls[%d] = %q, want %q (full=%#v)", i, calls[i], want[i], calls)
+		}
+	}
+}
+
+func TestRegisterUploadedBlock_ReenqueuesZeroRefWhenFenceNeverClears(t *testing.T) {
+	helper := &FSHelper{}
+	oldAdd := registerUploadedBlockAddReferenceFn
+	oldFence := registerUploadedBlockFenceActiveFn
+	oldUpsert := registerUploadedBlockUpsertMetadataFn
+	oldRelease := registerUploadedBlockReleaseRefsFn
+	oldAttempts := registerUploadedBlockRetryAttemptsFn
+	oldBackoff := registerUploadedBlockRetryBackoffFn
+	oldSleep := registerUploadedBlockSleepFn
+	oldEnqueue := registerUploadedBlockEnqueueZeroRefFn
+	t.Cleanup(func() {
+		registerUploadedBlockAddReferenceFn = oldAdd
+		registerUploadedBlockFenceActiveFn = oldFence
+		registerUploadedBlockUpsertMetadataFn = oldUpsert
+		registerUploadedBlockReleaseRefsFn = oldRelease
+		registerUploadedBlockRetryAttemptsFn = oldAttempts
+		registerUploadedBlockRetryBackoffFn = oldBackoff
+		registerUploadedBlockSleepFn = oldSleep
+		registerUploadedBlockEnqueueZeroRefFn = oldEnqueue
+	})
+
+	var calls []string
+	registerUploadedBlockAddReferenceFn = func(h *FSHelper, orgID, blockID, referrer, libraryID string, ttlSeconds int) error {
+		calls = append(calls, "add")
+		return nil
+	}
+	registerUploadedBlockFenceActiveFn = func(h *FSHelper, orgID, blockID string) (bool, error) {
+		calls = append(calls, "fence")
+		return true, nil
+	}
+	registerUploadedBlockUpsertMetadataFn = func(h *FSHelper, orgID, blockID string, sizeBytes int, storageClass, storageKey string) error {
+		t.Fatal("upsert should not run while the delete fence remains active")
+		return nil
+	}
+	registerUploadedBlockReleaseRefsFn = func(h *FSHelper, orgID, libraryID, operationID string, blockIDs []string) []string {
+		calls = append(calls, "release")
+		if orgID != "org-1" || libraryID != "lib-1" || operationID != "op-1" {
+			t.Fatalf("release args = %s/%s/%s, want org-1/lib-1/op-1", orgID, libraryID, operationID)
+		}
+		if len(blockIDs) != 1 || blockIDs[0] != "block-1" {
+			t.Fatalf("release blockIDs = %#v, want []string{\"block-1\"}", blockIDs)
+		}
+		return []string{"block-1"}
+	}
+	registerUploadedBlockRetryAttemptsFn = func() int { return 2 }
+	registerUploadedBlockRetryBackoffFn = func(attempt int) time.Duration {
+		calls = append(calls, fmt.Sprintf("backoff-%d", attempt))
+		return 0
+	}
+	registerUploadedBlockSleepFn = func(delay time.Duration) {
+		t.Fatalf("sleep should not run when backoff is zero, got %s", delay)
+	}
+	registerUploadedBlockEnqueueZeroRefFn = func(orgID string, blockIDs []string, storageClass string) {
+		calls = append(calls, "enqueue")
+		if orgID != "org-1" || storageClass != "hot" {
+			t.Fatalf("enqueue args = %s/%s, want org-1/hot", orgID, storageClass)
+		}
+		if len(blockIDs) != 1 || blockIDs[0] != "block-1" {
+			t.Fatalf("enqueue blockIDs = %#v, want []string{\"block-1\"}", blockIDs)
+		}
+	}
+
+	err := helper.RegisterUploadedBlock("org-1", "lib-1", "block-1", "op-1", 123, "hot", "")
+	if !errors.Is(err, ErrBlockDeleteInProgress) {
+		t.Fatalf("RegisterUploadedBlock() error = %v, want ErrBlockDeleteInProgress", err)
+	}
+	want := []string{"add", "fence", "backoff-1", "fence", "release", "enqueue"}
+	if len(calls) != len(want) {
+		t.Fatalf("calls = %#v, want %#v", calls, want)
+	}
+	for i := range want {
+		if calls[i] != want[i] {
+			t.Fatalf("calls[%d] = %q, want %q (full=%#v)", i, calls[i], want[i], calls)
+		}
 	}
 }
 

@@ -58,6 +58,37 @@ var resolveStoredBlockIDsFn = func(h *FSHelper, orgID string, blockIDs []string)
 	return h.resolveStoredBlockIDs(orgID, blockIDs)
 }
 
+var registerUploadedBlockAddReferenceFn = func(h *FSHelper, orgID, blockID, referrer, libraryID string, ttlSeconds int) error {
+	return h.db.AddBlockReference(orgID, blockID, referrer, libraryID, ttlSeconds)
+}
+
+var registerUploadedBlockFenceActiveFn = func(h *FSHelper, orgID, blockID string) (bool, error) {
+	return h.db.BlockDeleteFenceActive(orgID, blockID)
+}
+
+var registerUploadedBlockUpsertMetadataFn = func(h *FSHelper, orgID, blockID string, sizeBytes int, storageClass, storageKey string) error {
+	return h.db.UpsertBlockMetadata(orgID, blockID, sizeBytes, storageClass, storageKey)
+}
+
+var registerUploadedBlockReleaseRefsFn = func(h *FSHelper, orgID, libraryID, operationID string, blockIDs []string) []string {
+	return h.ReleaseUploadReferences(orgID, libraryID, operationID, blockIDs)
+}
+
+var registerUploadedBlockRetryAttemptsFn = RetryAttempts
+
+var registerUploadedBlockRetryBackoffFn = RetryBackoff
+
+var registerUploadedBlockSleepFn = time.Sleep
+
+var registerUploadedBlockEnqueueZeroRefFn = func(orgID string, blockIDs []string, storageClass string) {
+	if len(blockIDs) == 0 {
+		return
+	}
+	if blockEnqueuer := GetBlockEnqueuerFunc(); blockEnqueuer != nil {
+		blockEnqueuer.EnqueueBlocks(orgID, blockIDs, storageClass)
+	}
+}
+
 // PathTraverseResult contains the result of traversing to a path
 type PathTraverseResult struct {
 	TargetFSID   string    // FS ID of the target (file or dir)
@@ -867,31 +898,50 @@ func (h *FSHelper) resolveStoredBlockIDs(orgID string, blockIDs []string) ([]str
 // the specific upload/session/rollback flow that owns the provisional ref so a
 // rollback only removes its own pin. The reference is written BEFORE the
 // metadata read so that a concurrent GC claim-then-verify observes it. If the
-// GC worker has already claimed the block for deletion (gc_state='deleting'),
-// the provisional reference is removed again and the caller gets a retryable
-// error so it can restart from the full upload/store path.
+// GC worker has already claimed the block for deletion, the same provisional
+// ref is kept in place while the helper retries the fence. This lets the GC
+// worker observe the ref and abandon the delete without dropping liveness for
+// the current operation. Only if the fence never clears inside the bounded
+// retry budget do we roll back our own provisional ref and re-enqueue any
+// newly-zero-ref block for GC before returning a retryable error.
 func (h *FSHelper) RegisterUploadedBlock(orgID, libraryID, blockID, operationID string, sizeBytes int, storageClass, storageKey string) error {
 	referrer := db.BlockReferrerForUpload(operationID)
 
-	if err := h.db.AddBlockReference(orgID, blockID, referrer, libraryID, db.ProvisionalBlockReferenceTTLSeconds); err != nil {
+	if err := registerUploadedBlockAddReferenceFn(h, orgID, blockID, referrer, libraryID, db.ProvisionalBlockReferenceTTLSeconds); err != nil {
 		return fmt.Errorf("add provisional block reference for %s: %w", blockID, err)
 	}
 
-	deleteFenceActive, err := h.db.BlockDeleteFenceActive(orgID, blockID)
-	if err != nil {
-		return fmt.Errorf("read block delete fence for %s: %w", blockID, err)
-	}
-	if deleteFenceActive {
-		if err := h.db.RemoveBlockReference(orgID, blockID, referrer); err != nil {
-			log.Printf("[RegisterUploadedBlock] WARNING: failed to remove provisional reference for block %s after observing an active block-delete fence: %v", blockID, err)
-		}
-		return fmt.Errorf("%w: block %s is currently fenced by GC delete", ErrBlockDeleteInProgress, blockID)
+	attempts := registerUploadedBlockRetryAttemptsFn()
+	if attempts < 1 {
+		attempts = 1
 	}
 
-	if err := h.db.UpsertBlockMetadata(orgID, blockID, sizeBytes, storageClass, storageKey); err != nil {
-		return fmt.Errorf("upsert block metadata for %s: %w", blockID, err)
+	for attempt := 1; attempt <= attempts; attempt++ {
+		deleteFenceActive, err := registerUploadedBlockFenceActiveFn(h, orgID, blockID)
+		if err != nil {
+			return fmt.Errorf("read block delete fence for %s: %w", blockID, err)
+		}
+		if !deleteFenceActive {
+			if err := registerUploadedBlockUpsertMetadataFn(h, orgID, blockID, sizeBytes, storageClass, storageKey); err != nil {
+				return fmt.Errorf("upsert block metadata for %s: %w", blockID, err)
+			}
+			return nil
+		}
+
+		if attempt == attempts {
+			zeroRefBlocks := registerUploadedBlockReleaseRefsFn(h, orgID, libraryID, operationID, []string{blockID})
+			registerUploadedBlockEnqueueZeroRefFn(orgID, zeroRefBlocks, storageClass)
+			return fmt.Errorf("%w: block %s is currently fenced by GC delete", ErrBlockDeleteInProgress, blockID)
+		}
+
+		sleepFor := registerUploadedBlockRetryBackoffFn(attempt)
+		log.Printf("[RegisterUploadedBlock] block %s is fenced by GC delete; retrying (%d/%d) after %s", blockID, attempt, attempts, sleepFor)
+		if sleepFor > 0 {
+			registerUploadedBlockSleepFn(sleepFor)
+		}
 	}
-	return nil
+
+	return fmt.Errorf("%w: exhausted upload block registration retry budget for block %s", ErrBlockDeleteInProgress, blockID)
 }
 
 // RegisterFSObjectBlockReferences creates the permanent reference rows for every

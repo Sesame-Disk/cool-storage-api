@@ -255,11 +255,17 @@ CREATE TABLE IF NOT EXISTS fs_objects (
 -- Per-block partition: each (org_id, block_id) is its own Paxos partition.
 -- `blocks` holds immutable block metadata (size, storage class/key) plus GC
 -- state. Liveness is NOT a mutable counter anymore — it lives in
--- `block_references` (a block is alive iff it has ≥1 reference row). `gc_state`
--- is set to 'deleting' by the GC worker's claim LWT just before the irreversible
--- S3 delete; `gc_claim_id` fences release/finalize so only the owning delete
--- attempt can complete that claim. Writers back off when they observe
--- `gc_state='deleting'`. See block_references below.
+-- `block_references` (a block is alive iff it has ≥1 reference row).
+-- Metadata is written with INSERT ... IF NOT EXISTS (a per-block LWT): the
+-- physical location (storage_class/storage_key) is chosen per library and per
+-- routing region, so first-writer-wins pins ONE canonical location and reads/GC
+-- resolve the backend where the block actually landed. Because the partition is
+-- per (org, block), these LWTs never contend across different blocks — they are
+-- NOT globally serialized. `gc_state` is set to 'deleting' by the GC worker's
+-- claim LWT just before the irreversible S3 delete; `gc_claim_id` fences
+-- release/finalize so only the owning delete attempt can complete that claim.
+-- Writers back off when they observe `gc_state='deleting'`. See block_references
+-- below.
 CREATE TABLE IF NOT EXISTS blocks (
     org_id        UUID,
     block_id      TEXT,

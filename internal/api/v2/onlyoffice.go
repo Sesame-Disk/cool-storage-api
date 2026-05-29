@@ -1348,6 +1348,9 @@ func (h *OnlyOfficeHandler) publishEditedDocumentMetadata(fsHelper *FSHelper, or
 		}
 		if err := fsHelper.promotePendingPublishedFiles(orgID, repoID, publishAttemptID, []*pendingPublishedFile{pendingFile}); err != nil {
 			log.Printf("OnlyOffice: WARNING: head updated for repo=%s commit=%s but failed to promote block references for fs_object %s: %v", repoID, commitID, pendingFile.fsID, err)
+			SchedulePublishedBlockReferenceRepair("onlyoffice:"+publishAttemptID, "OnlyOffice", func() error {
+				return fsHelper.promotePendingPublishedFiles(orgID, repoID, publishAttemptID, []*pendingPublishedFile{pendingFile})
+			})
 		}
 
 		storageDeltaBytes = currentDeltaBytes

@@ -644,6 +644,9 @@ func (h *BatchOperationHandler) processSingleItem(orgID, userID, srcRepoID, dstR
 		if len(pendingCopiedFiles) > 0 {
 			if err := fsHelper.promotePendingPublishedFiles(orgID, dstRepoID, publishAttemptID, pendingCopiedFiles); err != nil {
 				log.Printf("[processSingleItem] WARNING: head updated for repo=%s commit=%s but failed to promote copied block references: %v", dstRepoID, newDstCommitID, err)
+				SchedulePublishedBlockReferenceRepair("batch-dst:"+publishAttemptID, "BatchOperationDestination", func() error {
+					return fsHelper.promotePendingPublishedFiles(orgID, dstRepoID, publishAttemptID, pendingCopiedFiles)
+				})
 			}
 		}
 

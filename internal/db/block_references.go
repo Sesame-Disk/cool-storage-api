@@ -3,6 +3,7 @@ package db
 import (
 	"errors"
 	"fmt"
+	"math/rand"
 	"strings"
 	"time"
 
@@ -55,6 +56,43 @@ func BlockReferrerForPublishAttempt(attemptID string) string {
 // reference once the upload is committed.
 func BlockReferrerForUpload(uploadToken string) string {
 	return blockReferrerUploadPrefix + uploadToken
+}
+
+var publishAttemptPromotionRetryAttempts = 8
+
+var publishAttemptPromotionRetryDelay = 50 * time.Millisecond
+
+var publishAttemptPromotionRetryMaxDelay = 400 * time.Millisecond
+
+var publishAttemptPromotionRetryJitter = 25 * time.Millisecond
+
+var publishAttemptPromotionRetryJitterInt63n = rand.Int63n
+
+var publishAttemptPromotionSleepFn = time.Sleep
+
+var removePublishAttemptReferencesForPromotionFn = RemovePublishAttemptReferences
+
+func publishAttemptPromotionRetryBackoff(attempt int) time.Duration {
+	if attempt < 1 || publishAttemptPromotionRetryDelay <= 0 {
+		return 0
+	}
+
+	delay := publishAttemptPromotionRetryDelay
+	for step := 1; step < attempt; step++ {
+		delay *= 2
+		if publishAttemptPromotionRetryMaxDelay > 0 && delay >= publishAttemptPromotionRetryMaxDelay {
+			delay = publishAttemptPromotionRetryMaxDelay
+			break
+		}
+	}
+
+	if publishAttemptPromotionRetryMaxDelay > 0 && delay > publishAttemptPromotionRetryMaxDelay {
+		delay = publishAttemptPromotionRetryMaxDelay
+	}
+	if publishAttemptPromotionRetryJitter > 0 && publishAttemptPromotionRetryJitterInt63n != nil {
+		delay += time.Duration(publishAttemptPromotionRetryJitterInt63n(int64(publishAttemptPromotionRetryJitter)))
+	}
+	return delay
 }
 
 // BlockIDResolver optionally resolves caller-facing block IDs into the block ID
@@ -208,17 +246,50 @@ func CleanupFailedPublishAttempt(database *DB, orgID, repoID, attemptID, commitI
 
 // PromotePublishAttemptReferences promotes an already-published fs_object to its
 // permanent refs and then removes the temporary attempt-local pub:<attempt> rows.
+// Both steps are idempotent, so bounded retries safely heal transient failures
+// after HEAD is already visible without leaking attempt-local refs forever.
 func PromotePublishAttemptReferences(database *DB, orgID, attemptID string, blockIDs []string, registerPermanent func() error) error {
-	if err := registerPermanent(); err != nil {
-		return err
+	attempts := publishAttemptPromotionRetryAttempts
+	if attempts < 1 {
+		attempts = 1
 	}
-	return RemovePublishAttemptReferences(database, orgID, attemptID, blockIDs)
+
+	var lastErr error
+	for attempt := 1; attempt <= attempts; attempt++ {
+		if err := registerPermanent(); err != nil {
+			lastErr = err
+		} else if err := removePublishAttemptReferencesForPromotionFn(database, orgID, attemptID, blockIDs); err != nil {
+			lastErr = err
+		} else {
+			return nil
+		}
+
+		if attempt == attempts {
+			break
+		}
+		sleepFor := publishAttemptPromotionRetryBackoff(attempt)
+		if sleepFor > 0 {
+			publishAttemptPromotionSleepFn(sleepFor)
+		}
+	}
+	return lastErr
 }
 
 // UpsertBlockMetadata stores immutable block metadata (size, storage class/key)
 // if the row does not already exist. It never sets liveness — that lives in
 // block_references — so it is safe to call on every (deduplicated) upload of the
-// same content. Uses INSERT ... IF NOT EXISTS so a concurrent creator wins cleanly.
+// same content.
+//
+// Uses INSERT ... IF NOT EXISTS (a per-block LWT) deliberately. storage_class and
+// storage_key are NOT globally fixed per block: uploads pick the class per library
+// and per routing region (see resolveLibraryBlockStore), so two writers of the
+// same content can carry different classes. First-writer-wins pins ONE canonical
+// physical location so reads and GC resolve the backend where the block actually
+// landed; a plain last-writer-wins INSERT could repoint metadata at a class that
+// holds no copy, breaking downloads and making GC act on the wrong physical copy.
+// This LWT is scoped to the (org, block) partition, so writers for different
+// blocks never contend — it is NOT globally serialized (the old process-wide
+// concurrency permit that did serialize it has been removed).
 func (db *DB) UpsertBlockMetadata(orgID, blockID string, sizeBytes int, storageClass, storageKey string) error {
 	now := time.Now().UTC()
 	return db.Session().Query(`

@@ -1235,6 +1235,9 @@ func (h *FileHandler) CreateFile(c *gin.Context) {
 		}
 		if err := fsHelper.promotePendingPublishedFiles(orgID, repoID, publishAttemptID, []*pendingPublishedFile{pendingFile}); err != nil {
 			log.Printf("[CreateFile] WARNING: head updated for repo=%s commit=%s but failed to promote block references for fs_object %s: %v", repoID, commitID, pendingFile.fsID, err)
+			SchedulePublishedBlockReferenceRepair("create-file:"+publishAttemptID, "CreateFile", func() error {
+				return fsHelper.promotePendingPublishedFiles(orgID, repoID, publishAttemptID, []*pendingPublishedFile{pendingFile})
+			})
 		}
 
 		newFileFSID = pendingFile.fsID
@@ -3024,6 +3027,11 @@ func (h *FileHandler) finalizeStoredUploadMetadataOnce(fsHelper *FSHelper, orgID
 		return fsHelper.RegisterFSObjectBlockReferences(orgID, repoID, fileFSID, blockIDs)
 	}); err != nil {
 		log.Printf("[UploadFile] WARNING: head updated for repo=%s commit=%s but failed to promote block references for fs_object %s: %v", repoID, newCommitID, fileFSID, err)
+		SchedulePublishedBlockReferenceRepair("upload-file:"+publishAttemptID, "UploadFile", func() error {
+			return db.PromotePublishAttemptReferences(fsHelper.db, orgID, publishAttemptID, resolvedBlockIDs, func() error {
+				return fsHelper.RegisterFSObjectBlockReferences(orgID, repoID, fileFSID, blockIDs)
+			})
+		})
 	}
 
 	return actualFilename, storageDeltaBytes, storageDeltaFiles, nil
