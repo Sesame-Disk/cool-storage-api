@@ -19,7 +19,22 @@ import (
 func TestRegisterFSObjectBlockReferences_ResolutionFailureAborts(t *testing.T) {
 	helper := &FSHelper{}
 	prevResolve := resolveStoredBlockIDsFn
+	prevExists := registerFSObjectBlockReferencesFSObjectExistsFn
+	prevAdd := registerFSObjectBlockReferencesAddReferenceFn
 	defer func() { resolveStoredBlockIDsFn = prevResolve }()
+	defer func() { registerFSObjectBlockReferencesFSObjectExistsFn = prevExists }()
+	defer func() { registerFSObjectBlockReferencesAddReferenceFn = prevAdd }()
+
+	registerFSObjectBlockReferencesFSObjectExistsFn = func(h *FSHelper, libraryID, fsID string) (bool, error) {
+		if libraryID != "lib-1" || fsID != "fs-1" {
+			t.Fatalf("exists args = %s/%s, want lib-1/fs-1", libraryID, fsID)
+		}
+		return true, nil
+	}
+	registerFSObjectBlockReferencesAddReferenceFn = func(h *FSHelper, orgID, blockID, referrer, libraryID string) error {
+		t.Fatal("add reference should not run when block ID resolution fails")
+		return nil
+	}
 
 	resolveErr := errors.New("resolve failed")
 	resolveStoredBlockIDsFn = func(h *FSHelper, orgID string, blockIDs []string) ([]string, error) {
@@ -35,6 +50,85 @@ func TestRegisterFSObjectBlockReferences_ResolutionFailureAborts(t *testing.T) {
 	err := helper.RegisterFSObjectBlockReferences("org-1", "lib-1", "fs-1", []string{"sha1-block"})
 	if !errors.Is(err, resolveErr) {
 		t.Fatalf("RegisterFSObjectBlockReferences() error = %v, want wrapped %v", err, resolveErr)
+	}
+}
+
+func TestRegisterFSObjectBlockReferences_RequiresPersistedFSObject(t *testing.T) {
+	helper := &FSHelper{}
+	prevResolve := resolveStoredBlockIDsFn
+	prevExists := registerFSObjectBlockReferencesFSObjectExistsFn
+	prevAdd := registerFSObjectBlockReferencesAddReferenceFn
+	t.Cleanup(func() {
+		resolveStoredBlockIDsFn = prevResolve
+		registerFSObjectBlockReferencesFSObjectExistsFn = prevExists
+		registerFSObjectBlockReferencesAddReferenceFn = prevAdd
+	})
+
+	resolveStoredBlockIDsFn = func(h *FSHelper, orgID string, blockIDs []string) ([]string, error) {
+		t.Fatal("resolve should not run when the fs_object row is missing")
+		return nil, nil
+	}
+	registerFSObjectBlockReferencesFSObjectExistsFn = func(h *FSHelper, libraryID, fsID string) (bool, error) {
+		if libraryID != "lib-1" || fsID != "fs-1" {
+			t.Fatalf("exists args = %s/%s, want lib-1/fs-1", libraryID, fsID)
+		}
+		return false, nil
+	}
+	registerFSObjectBlockReferencesAddReferenceFn = func(h *FSHelper, orgID, blockID, referrer, libraryID string) error {
+		t.Fatal("add reference should not run when the fs_object row is missing")
+		return nil
+	}
+
+	err := helper.RegisterFSObjectBlockReferences("org-1", "lib-1", "fs-1", []string{"sha1-block"})
+	if !errors.Is(err, errFSObjectNotPersistedForBlockReferences) {
+		t.Fatalf("RegisterFSObjectBlockReferences() error = %v, want wrapped %v", err, errFSObjectNotPersistedForBlockReferences)
+	}
+}
+
+func TestRegisterFSObjectBlockReferences_AddsReferencesForPersistedFSObject(t *testing.T) {
+	helper := &FSHelper{}
+	prevResolve := resolveStoredBlockIDsFn
+	prevExists := registerFSObjectBlockReferencesFSObjectExistsFn
+	prevAdd := registerFSObjectBlockReferencesAddReferenceFn
+	t.Cleanup(func() {
+		resolveStoredBlockIDsFn = prevResolve
+		registerFSObjectBlockReferencesFSObjectExistsFn = prevExists
+		registerFSObjectBlockReferencesAddReferenceFn = prevAdd
+	})
+
+	registerFSObjectBlockReferencesFSObjectExistsFn = func(h *FSHelper, libraryID, fsID string) (bool, error) {
+		return true, nil
+	}
+	resolveStoredBlockIDsFn = func(h *FSHelper, orgID string, blockIDs []string) ([]string, error) {
+		if orgID != "org-1" {
+			t.Fatalf("resolve orgID = %q, want org-1", orgID)
+		}
+		if len(blockIDs) != 2 || blockIDs[0] != "sha1-a" || blockIDs[1] != "sha1-b" {
+			t.Fatalf("resolve blockIDs = %v, want [sha1-a sha1-b]", blockIDs)
+		}
+		return []string{"sha256-a", "sha256-b"}, nil
+	}
+	var calls []string
+	registerFSObjectBlockReferencesAddReferenceFn = func(h *FSHelper, orgID, blockID, referrer, libraryID string) error {
+		calls = append(calls, fmt.Sprintf("%s|%s|%s|%s", orgID, blockID, referrer, libraryID))
+		return nil
+	}
+
+	err := helper.RegisterFSObjectBlockReferences("org-1", "lib-1", "fs-1", []string{"sha1-a", "sha1-b"})
+	if err != nil {
+		t.Fatalf("RegisterFSObjectBlockReferences() error = %v, want nil", err)
+	}
+	want := []string{
+		"org-1|sha256-a|" + db.BlockReferrerForFSObject("lib-1", "fs-1") + "|lib-1",
+		"org-1|sha256-b|" + db.BlockReferrerForFSObject("lib-1", "fs-1") + "|lib-1",
+	}
+	if len(calls) != len(want) {
+		t.Fatalf("calls = %v, want %v", calls, want)
+	}
+	for i := range want {
+		if calls[i] != want[i] {
+			t.Fatalf("calls[%d] = %q, want %q (full=%v)", i, calls[i], want[i], calls)
+		}
 	}
 }
 

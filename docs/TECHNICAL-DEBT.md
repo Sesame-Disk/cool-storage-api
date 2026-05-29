@@ -141,6 +141,43 @@ Add to `.github/workflows/test.yml`:
 
 ---
 
+## 20. Block Metadata Hot-Path LWT (DEFERRED)
+
+### Current State
+The row-per-reference migration removed Paxos from `block_references`, but block materialization still uses `INSERT ... IF NOT EXISTS` in `UpsertBlockMetadata` for the canonical `blocks` row.
+
+### Why It Was Deferred
+This branch keeps the LWT because it still pins one canonical `(storage_class, storage_key)` for a content-addressed block. A blind last-writer-wins rewrite could repoint reads and GC to a backend that does not actually hold the canonical copy.
+
+### Follow-Up Plan
+1. Split block materialization into a hot re-upload path and a cold-create path.
+2. Use a cheap read/confirmation path for already-known blocks.
+3. Keep LWT only for true first-writer creation, or replace it with an equivalent ownership scheme that preserves the canonical physical copy invariant.
+4. Re-run the Docker `go-all-test` path plus focused upload/concurrency integration tests before changing this.
+
+### Regression Tests To Keep
+- `TestConcurrentV2UploadsNoLostCommits`
+- `TestChunkedUploadConflictRollbackCleansStateBeforeFreshReupload`
+- `TestSyncRecvFSBeforePutBlockPublishesDownloadableFile`
+
+---
+
+## 21. Cassandra-Real Coverage For GC Claim Retry (DEFERRED)
+
+### Current State
+`ClaimBlockDelete` now does an explicit `SELECT gc_state, gc_claim_id` after a failed CAS, instead of trusting the partial row returned by Cassandra for `UPDATE ... IF`.
+
+### Why It Was Deferred
+The code path is corrected, but the current tree still lacks a real Cassandra regression that proves a retry of the same logical candidate recognizes its prior claim under Cassandra's actual CAS return semantics.
+
+### Follow-Up Plan
+1. Add a Cassandra-backed store test that seeds a claimed block row.
+2. Retry `ClaimBlockDelete` with the same `claimID` and assert ownership is recognized.
+3. Retry with a different `claimID` and assert it is rejected.
+4. Keep the existing S3-orphan recovery tests green alongside the new coverage.
+
+---
+
 ## 5. Web Upload Pipeline Follow-Ups (PENDING)
 
 ### Current State

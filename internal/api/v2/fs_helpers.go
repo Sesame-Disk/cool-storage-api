@@ -49,6 +49,12 @@ var ErrBlockDeleteInProgress = errors.New("block delete is in progress")
 // Callers should treat this as a failed upload and rely on rollback cleanup.
 var ErrBlockMappingWriteFailed = errors.New("block mapping write failed")
 
+// errFSObjectNotPersistedForBlockReferences means a caller tried to attach
+// permanent fs: block references before the owning fs_object row existed.
+// Current publish paths persist the fs_object first; this guard keeps future
+// call sites from silently creating orphan permanent references.
+var errFSObjectNotPersistedForBlockReferences = errors.New("fs_object is not persisted")
+
 // NewFSHelper creates a new FSHelper instance
 func NewFSHelper(database *db.DB) *FSHelper {
 	return &FSHelper{db: database}
@@ -95,6 +101,14 @@ var registerUploadedBlockEnqueueZeroRefFn = func(orgID string, blockIDs []string
 	if blockEnqueuer := GetBlockEnqueuerFunc(); blockEnqueuer != nil {
 		blockEnqueuer.EnqueueBlocks(orgID, blockIDs, storageClass)
 	}
+}
+
+var registerFSObjectBlockReferencesFSObjectExistsFn = func(h *FSHelper, libraryID, fsID string) (bool, error) {
+	return h.fsObjectExists(libraryID, fsID)
+}
+
+var registerFSObjectBlockReferencesAddReferenceFn = func(h *FSHelper, orgID, blockID, referrer, libraryID string) error {
+	return h.db.AddBlockReference(orgID, blockID, referrer, libraryID, 0)
 }
 
 // PathTraverseResult contains the result of traversing to a path
@@ -956,16 +970,27 @@ func (h *FSHelper) RegisterUploadedBlock(orgID, libraryID, blockID, operationID 
 // block held by an fs_object. A reference row exists iff the fs_object exists in
 // fs_objects, so block liveness == "some live fs_object contains this block".
 //
+// These are the PERMANENT references, promoted only after the owning fs_object
+// row has been persisted. During the publish race liveness is held by the
+// provisional publish-attempt refs (StagePublishAttemptReferences); this call
+// runs in the promote step once the fs_object exists, so it fails closed if the
+// row is missing (errFSObjectNotPersistedForBlockReferences) rather than
+// silently creating orphan permanent references.
+//
 // Block IDs are resolved to internal SHA-256 IDs first and the resolution is
 // strict (fail-closed): if any ID cannot be resolved, no reference is written and
-// the caller must abort the commit. References are written here, BEFORE the
-// fs_object row is inserted, so a partial failure leaves orphan reference rows
-// (a harmless leak self-healed by retrying the same content-addressed upload)
-// rather than an fs_object whose blocks have no reference (potential data loss).
-// Re-registering the same (block, fs_object) is idempotent.
+// the caller must abort the commit. Re-registering the same (block, fs_object)
+// is idempotent.
 func (h *FSHelper) RegisterFSObjectBlockReferences(orgID, libraryID, fsID string, blockIDs []string) error {
 	if len(blockIDs) == 0 {
 		return nil
+	}
+	exists, err := registerFSObjectBlockReferencesFSObjectExistsFn(h, libraryID, fsID)
+	if err != nil {
+		return fmt.Errorf("verify fs_object %s/%s exists before adding block references: %w", libraryID, fsID, err)
+	}
+	if !exists {
+		return fmt.Errorf("attach block references to fs_object %s/%s: %w", libraryID, fsID, errFSObjectNotPersistedForBlockReferences)
 	}
 	resolved, err := resolveStoredBlockIDsFn(h, orgID, blockIDs)
 	if err != nil {
@@ -973,11 +998,25 @@ func (h *FSHelper) RegisterFSObjectBlockReferences(orgID, libraryID, fsID string
 	}
 	referrer := db.BlockReferrerForFSObject(libraryID, fsID)
 	for _, blockID := range resolved {
-		if err := h.db.AddBlockReference(orgID, blockID, referrer, libraryID, 0); err != nil {
+		if err := registerFSObjectBlockReferencesAddReferenceFn(h, orgID, blockID, referrer, libraryID); err != nil {
 			return fmt.Errorf("add fs_object block reference (block %s, fs_object %s/%s): %w", blockID, libraryID, fsID, err)
 		}
 	}
 	return nil
+}
+
+func (h *FSHelper) fsObjectExists(repoID, fsID string) (bool, error) {
+	var existingFSID string
+	err := h.db.Session().Query(`
+		SELECT fs_id FROM fs_objects WHERE library_id = ? AND fs_id = ? LIMIT 1
+	`, repoID, fsID).Scan(&existingFSID)
+	if err != nil {
+		if errors.Is(err, gocql.ErrNotFound) {
+			return false, nil
+		}
+		return false, err
+	}
+	return existingFSID != "", nil
 }
 
 // ReleaseUploadReferences removes the provisional upload references for blocks of
