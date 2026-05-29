@@ -44,6 +44,11 @@ var ErrBlockMutationOutcomeUnknown = errors.New("block ref-count mutation outcom
 // provisional-reference registration happen after the claim clears.
 var ErrBlockDeleteInProgress = errors.New("block delete is in progress")
 
+// ErrBlockMappingWriteFailed indicates the block metadata/provisional ref was
+// materialized but the external<->internal block mapping could not be written.
+// Callers should treat this as a failed upload and rely on rollback cleanup.
+var ErrBlockMappingWriteFailed = errors.New("block mapping write failed")
+
 // NewFSHelper creates a new FSHelper instance
 func NewFSHelper(database *db.DB) *FSHelper {
 	return &FSHelper{db: database}

@@ -1325,18 +1325,16 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 		log.Printf("[HandleUpload] Stored block %s (SHA-256: %s)", fileID[:16], sha256ID[:16])
 	}
 
-	// Create SHA-1 → SHA-256 mapping (dual-write: forward + reverse lookup)
-	if err := h.db.WriteBlockIDMapping(token.OrgID, fileID, sha256ID, time.Time{}); err != nil {
-		log.Printf("[HandleUpload] CRITICAL: Failed to write block_id_mapping org=%s ext=%s int=%s: %v", token.OrgID, fileID[:16], sha256ID[:16], err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create block mapping"})
-		return
-	}
-
 	// Register block metadata + a provisional reference (kept alive by TTL until
-	// the fs_object commit creates the permanent reference).
-	if err := v2.NewFSHelper(h.db).RegisterUploadedBlock(token.OrgID, token.RepoID, sha256ID, token.Token, len(storedContent), actualStorageClass, ""); err != nil {
-		log.Printf("[HandleUpload] CRITICAL: Failed to write block metadata org=%s block=%s: %v", token.OrgID, sha256ID[:16], err)
-		writeSeafHTTPUploadError(c, err, "failed to store block metadata")
+	// the fs_object commit creates the permanent reference), then write the
+	// external SHA-1 mapping only after the block is durable in Cassandra.
+	if err := v2.RegisterUploadedBlockAndMapping(h.db, token.OrgID, token.RepoID, sha256ID, token.Token, len(storedContent), actualStorageClass, "", fileID); err != nil {
+		log.Printf("[HandleUpload] CRITICAL: Failed to materialize block org=%s block=%s ext=%s: %v", token.OrgID, sha256ID[:16], fileID[:16], err)
+		if errors.Is(err, v2.ErrBlockMappingWriteFailed) {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create block mapping"})
+		} else {
+			writeSeafHTTPUploadError(c, err, "failed to store block metadata")
+		}
 		return
 	}
 
@@ -1624,7 +1622,6 @@ func (h *SeafHTTPHandler) finalizeUploadStreaming(c *gin.Context, token *AccessT
 	// stays single-threaded so we don't need to seek; what we parallelise is the
 	// network/IO-bound part that dominates wall-clock time.
 	sha1Hasher := sha1.New()
-	fsHelper := v2.NewFSHelper(h.db)
 
 	eg, egCtx := errgroup.WithContext(ctx)
 	sem := make(chan struct{}, finalizeUploadConcurrency)
@@ -1700,11 +1697,6 @@ readLoop:
 				return fmt.Errorf("failed to store block: %w", putErr)
 			}
 
-			if mapErr := h.db.WriteBlockIDMapping(token.OrgID, blockSHA1IDLocal, sha256ID, time.Time{}); mapErr != nil {
-				log.Printf("[finalizeUploadStreaming] CRITICAL: Failed to write block_id_mapping org=%s ext=%s int=%s: %v", token.OrgID, blockSHA1IDLocal[:16], sha256ID[:16], mapErr)
-				return fmt.Errorf("failed to create block mapping: %w", mapErr)
-			}
-
 			releaseMetadataPermit, permitErr := acquireFinalizeUploadBlockMetadataPermit(egCtx)
 			if permitErr != nil {
 				return permitErr
@@ -1712,8 +1704,12 @@ readLoop:
 			defer releaseMetadataPermit()
 
 			if blkErr := upload.AccountBlockOnce(blockIndexLocal, sha256ID, func() error {
-				return fsHelper.RegisterUploadedBlock(token.OrgID, token.RepoID, sha256ID, token.Token, len(storedBlock), actualStorageClass, "")
+				return v2.RegisterUploadedBlockAndMapping(h.db, token.OrgID, token.RepoID, sha256ID, token.Token, len(storedBlock), actualStorageClass, "", blockSHA1IDLocal)
 			}); blkErr != nil {
+				if errors.Is(blkErr, v2.ErrBlockMappingWriteFailed) {
+					log.Printf("[finalizeUploadStreaming] CRITICAL: Failed to write block_id_mapping org=%s ext=%s int=%s: %v", token.OrgID, blockSHA1IDLocal[:16], sha256ID[:16], blkErr)
+					return fmt.Errorf("failed to create block mapping: %w", blkErr)
+				}
 				log.Printf("[finalizeUploadStreaming] CRITICAL: Failed to write block metadata org=%s block=%s: %v", token.OrgID, sha256ID[:16], blkErr)
 				return fmt.Errorf("failed to store block metadata: %w", blkErr)
 			}

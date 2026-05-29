@@ -2782,19 +2782,15 @@ func (h *FileHandler) UploadFile(c *gin.Context) {
 		return
 	}
 
-	// Create SHA-1 → SHA-256 mapping (dual-write: forward + reverse)
-	if err := h.db.WriteBlockIDMapping(orgID, fileID, sha256ID, time.Time{}); err != nil {
-		log.Printf("[UploadFile] CRITICAL: failed to write block_id_mapping org=%s: %v", orgID, err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create block mapping"})
-		return
-	}
-
 	// Register block metadata + a provisional reference (kept alive by TTL until
-	// the fs_object commit below creates the permanent reference).
-	if err := fsHelper.RegisterUploadedBlock(orgID, repoID, sha256ID, uploadOperationID, len(storedContent), storageClass, ""); err != nil {
-		log.Printf("[UploadFile] CRITICAL: failed to register block org=%s block=%s: %v", orgID, sha256ID[:16], err)
+	// the fs_object commit below creates the permanent reference), then write the
+	// external SHA-1 mapping only after the block is durable in Cassandra.
+	if err := RegisterUploadedBlockAndMapping(h.db, orgID, repoID, sha256ID, uploadOperationID, len(storedContent), storageClass, "", fileID); err != nil {
+		log.Printf("[UploadFile] CRITICAL: failed to materialize block org=%s block=%s ext=%s: %v", orgID, sha256ID[:16], fileID[:16], err)
 		if errors.Is(err, ErrBlockDeleteInProgress) {
 			writeUploadFileError(c, err)
+		} else if errors.Is(err, ErrBlockMappingWriteFailed) {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create block mapping"})
 		} else {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to store block metadata"})
 		}
