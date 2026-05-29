@@ -743,6 +743,7 @@ CREATE TABLE IF NOT EXISTS published_block_reference_repairs (
     fs_id            TEXT,
     staged_block_ids LIST<TEXT>,
     created_at       TIMESTAMP,
+    lease_expires_at TIMESTAMP,
     PRIMARY KEY ((bucket), org_id, repo_id, commit_id, fs_id)
 ) WITH default_time_to_live = 0;
 

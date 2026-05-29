@@ -121,6 +121,51 @@ func TestOnlyOfficeResolveLibraryBlockStoreUsesLocalRegion(t *testing.T) {
 	}
 }
 
+func TestCleanupOnlyOfficeFailedPublishAttempt_JoinsRepairCleanupAndQueueClear(t *testing.T) {
+	oldCleanup := onlyOfficeCleanupFailedPublishAttemptFn
+	oldClear := onlyOfficeClearPendingPublishedFileRepairsFn
+	t.Cleanup(func() {
+		onlyOfficeCleanupFailedPublishAttemptFn = oldCleanup
+		onlyOfficeClearPendingPublishedFileRepairsFn = oldClear
+	})
+
+	cleanupErr := errors.New("cleanup failed")
+	clearErr := errors.New("clear failed")
+	cleanupCalls := 0
+	onlyOfficeCleanupFailedPublishAttemptFn = func(database *db.DB, orgID, repoID, commitID string, blockIDs []string) error {
+		cleanupCalls++
+		if orgID != "org-1" || repoID != "repo-1" || commitID != "commit-1" {
+			t.Fatalf("cleanup args = %s/%s/%s, want org-1/repo-1/commit-1", orgID, repoID, commitID)
+		}
+		if len(blockIDs) != 1 || blockIDs[0] != "queued-block-1" {
+			t.Fatalf("cleanup blockIDs = %#v, want []string{\"queued-block-1\"}", blockIDs)
+		}
+		return cleanupErr
+	}
+	clearCalls := 0
+	onlyOfficeClearPendingPublishedFileRepairsFn = func(database *db.DB, orgID, repoID, commitID string, pendingFiles []*pendingPublishedFile) error {
+		clearCalls++
+		if len(pendingFiles) != 1 || pendingFiles[0] == nil || pendingFiles[0].fsID != "fs-1" {
+			t.Fatalf("pendingFiles = %#v, want one fs-1 pending file", pendingFiles)
+		}
+		return clearErr
+	}
+
+	err := cleanupOnlyOfficeFailedPublishAttempt(nil, "org-1", "repo-1", "commit-1", []*pendingPublishedFile{{fsID: "fs-1", internalBlockIDs: []string{"queued-block-1"}}})
+	if !errors.Is(err, cleanupErr) {
+		t.Fatalf("cleanupOnlyOfficeFailedPublishAttempt() error = %v, want cleanupErr %v", err, cleanupErr)
+	}
+	if !errors.Is(err, clearErr) {
+		t.Fatalf("cleanupOnlyOfficeFailedPublishAttempt() error = %v, want clearErr %v", err, clearErr)
+	}
+	if cleanupCalls != 1 {
+		t.Fatalf("cleanupCalls = %d, want 1", cleanupCalls)
+	}
+	if clearCalls != 1 {
+		t.Fatalf("clearCalls = %d, want 1", clearCalls)
+	}
+}
+
 func TestResolveOnlyOfficeServerURL(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 

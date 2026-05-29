@@ -44,6 +44,19 @@ type OnlyOfficeHandler struct {
 	permMiddleware *middleware.PermissionMiddleware
 }
 
+var onlyOfficeCleanupFailedPublishAttemptFn = func(database *db.DB, orgID, repoID, commitID string, blockIDs []string) error {
+	return db.CleanupFailedPublishAttempt(database, orgID, repoID, commitID, commitID, blockIDs)
+}
+
+var onlyOfficeClearPendingPublishedFileRepairsFn = clearPendingPublishedFileRepairs
+
+func cleanupOnlyOfficeFailedPublishAttempt(database *db.DB, orgID, repoID, commitID string, pendingFiles []*pendingPublishedFile) error {
+	blockIDs := pendingPublishedFileInternalBlockIDs(pendingFiles)
+	cleanupErr := onlyOfficeCleanupFailedPublishAttemptFn(database, orgID, repoID, commitID, blockIDs)
+	clearErr := onlyOfficeClearPendingPublishedFileRepairsFn(database, orgID, repoID, commitID, pendingFiles)
+	return errors.Join(cleanupErr, clearErr)
+}
+
 // RegisterOnlyOfficeRoutes registers OnlyOffice routes
 func RegisterOnlyOfficeRoutes(rg *gin.RouterGroup, database *db.DB, cfg *config.Config, s3Store *storage.S3Store, blockStore *storage.BlockStore, storageManager *storage.Manager, tokenCreator TokenCreator, serverURL string) {
 	permMiddleware := middleware.NewPermissionMiddleware(database)
@@ -1344,7 +1357,7 @@ func (h *OnlyOfficeHandler) publishEditedDocumentMetadata(fsHelper *FSHelper, or
 		}
 
 		if err := h.updateOnlyOfficePendingBlockCommitID(orgID, pendingOperationID, commitID); err != nil {
-			if cleanupErr := db.CleanupFailedPublishAttempt(h.db, orgID, repoID, commitID, commitID, pendingFile.internalBlockIDs); cleanupErr != nil {
+			if cleanupErr := cleanupOnlyOfficeFailedPublishAttempt(h.db, orgID, repoID, commitID, []*pendingPublishedFile{pendingFile}); cleanupErr != nil {
 				return errors.Join(
 					fmt.Errorf("failed to persist OnlyOffice pending commit id: %w", err),
 					fmt.Errorf("clean up publish attempt %s: %w", commitID, cleanupErr),

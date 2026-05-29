@@ -17,16 +17,18 @@ const (
 	publishedBlockReferenceRepairBuckets       = 32
 	publishedBlockReferenceRepairSweepInterval = time.Minute
 	publishedBlockReferenceRepairStaleAfter    = 30 * time.Second
+	publishedBlockReferenceRepairPreCASLease   = 5 * time.Minute
 )
 
 type publishedBlockReferenceRepair struct {
-	Bucket    int
-	OrgID     string
-	RepoID    string
-	CommitID  string
-	FSID      string
+	Bucket         int
+	OrgID          string
+	RepoID         string
+	CommitID       string
+	FSID           string
 	StagedBlockIDs []string
-	CreatedAt time.Time
+	CreatedAt      time.Time
+	LeaseExpiresAt time.Time
 }
 
 var scheduledPublishedBlockReferenceRepairs sync.Map
@@ -50,9 +52,9 @@ var insertPublishedBlockReferenceRepairFn = func(database *db.DB, repair publish
 		return fmt.Errorf("database not available")
 	}
 	return database.Session().Query(`
-		INSERT INTO published_block_reference_repairs (bucket, org_id, repo_id, commit_id, fs_id, staged_block_ids, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?)
-	`, repair.Bucket, repair.OrgID, repair.RepoID, repair.CommitID, repair.FSID, repair.StagedBlockIDs, repair.CreatedAt).Exec()
+		INSERT INTO published_block_reference_repairs (bucket, org_id, repo_id, commit_id, fs_id, staged_block_ids, created_at, lease_expires_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+	`, repair.Bucket, repair.OrgID, repair.RepoID, repair.CommitID, repair.FSID, repair.StagedBlockIDs, repair.CreatedAt, repair.LeaseExpiresAt).Exec()
 }
 
 var deletePublishedBlockReferenceRepairFn = func(database *db.DB, repair publishedBlockReferenceRepair) error {
@@ -70,13 +72,13 @@ var listPublishedBlockReferenceRepairsForBucketFn = func(database *db.DB, bucket
 		return nil, fmt.Errorf("database not available")
 	}
 	iter := database.Session().Query(`
-		SELECT org_id, repo_id, commit_id, fs_id, staged_block_ids, created_at
+		SELECT org_id, repo_id, commit_id, fs_id, staged_block_ids, created_at, lease_expires_at
 		FROM published_block_reference_repairs WHERE bucket = ?
 	`, bucket).Iter()
 
 	var repairs []publishedBlockReferenceRepair
 	var repair publishedBlockReferenceRepair
-	for iter.Scan(&repair.OrgID, &repair.RepoID, &repair.CommitID, &repair.FSID, &repair.StagedBlockIDs, &repair.CreatedAt) {
+	for iter.Scan(&repair.OrgID, &repair.RepoID, &repair.CommitID, &repair.FSID, &repair.StagedBlockIDs, &repair.CreatedAt, &repair.LeaseExpiresAt) {
 		repair.Bucket = bucket
 		repairs = append(repairs, repair)
 		repair = publishedBlockReferenceRepair{}
@@ -87,12 +89,30 @@ var listPublishedBlockReferenceRepairsForBucketFn = func(database *db.DB, bucket
 	return repairs, nil
 }
 
-var publishedBlockReferenceRepairCommitReachableFn = func(database *db.DB, repoID, commitID string) (bool, error) {
+var publishedBlockReferenceRepairHeadCommitFn = func(database *db.DB, repoID string) (string, error) {
 	if database == nil {
-		return false, fmt.Errorf("database not available")
+		return "", fmt.Errorf("database not available")
 	}
 	fsHelper := NewFSHelper(database)
-	headCommitID, err := fsHelper.GetHeadCommitID(repoID)
+	return fsHelper.GetHeadCommitID(repoID)
+}
+
+var publishedBlockReferenceRepairCommitParentFn = func(database *db.DB, repoID, commitID string) (string, error) {
+	if database == nil {
+		return "", fmt.Errorf("database not available")
+	}
+	var parentCommitID string
+	err := database.Session().Query(`
+		SELECT parent_id FROM commits WHERE library_id = ? AND commit_id = ?
+	`, repoID, commitID).Scan(&parentCommitID)
+	if err != nil {
+		return "", err
+	}
+	return parentCommitID, nil
+}
+
+var publishedBlockReferenceRepairCommitReachableFn = func(database *db.DB, repoID, commitID string) (bool, error) {
+	headCommitID, err := publishedBlockReferenceRepairHeadCommitFn(database, repoID)
 	if err != nil {
 		if errors.Is(err, gocql.ErrNotFound) {
 			return false, nil
@@ -100,10 +120,7 @@ var publishedBlockReferenceRepairCommitReachableFn = func(database *db.DB, repoI
 		return false, fmt.Errorf("lookup current head for repo %s: %w", repoID, err)
 	}
 	return onlyOfficeCommitReachable(commitID, headCommitID, func(currentCommitID string) (string, error) {
-		var parentCommitID string
-		err := database.Session().Query(`
-			SELECT parent_id FROM commits WHERE library_id = ? AND commit_id = ?
-		`, repoID, currentCommitID).Scan(&parentCommitID)
+		parentCommitID, err := publishedBlockReferenceRepairCommitParentFn(database, repoID, currentCommitID)
 		if err != nil {
 			if errors.Is(err, gocql.ErrNotFound) {
 				return "", nil
@@ -139,6 +156,41 @@ var publishedBlockReferenceRepairCleanupFn = func(database *db.DB, orgID, repoID
 	return db.CleanupFailedPublishAttempt(database, orgID, repoID, commitID, commitID, blockIDs)
 }
 
+func publishedBlockReferenceRepairShouldDeferCleanup(database *db.DB, repair publishedBlockReferenceRepair) (bool, error) {
+	headCommitID, err := publishedBlockReferenceRepairHeadCommitFn(database, repair.RepoID)
+	if err != nil {
+		if errors.Is(err, gocql.ErrNotFound) {
+			return false, nil
+		}
+		return false, fmt.Errorf("lookup current head for queued publish repair repo %s: %w", repair.RepoID, err)
+	}
+	parentCommitID, err := publishedBlockReferenceRepairCommitParentFn(database, repair.RepoID, repair.CommitID)
+	if err != nil {
+		if errors.Is(err, gocql.ErrNotFound) {
+			return false, nil
+		}
+		return false, fmt.Errorf("lookup parent for queued publish repair commit %s: %w", repair.CommitID, err)
+	}
+	if parentCommitID != headCommitID {
+		return false, nil
+	}
+	leaseDeadline := publishedBlockReferenceRepairLeaseDeadline(repair)
+	if leaseDeadline.IsZero() {
+		return false, nil
+	}
+	return publishedBlockReferenceRepairNowFn().Before(leaseDeadline), nil
+}
+
+func publishedBlockReferenceRepairLeaseDeadline(repair publishedBlockReferenceRepair) time.Time {
+	if !repair.LeaseExpiresAt.IsZero() {
+		return repair.LeaseExpiresAt
+	}
+	if repair.CreatedAt.IsZero() {
+		return time.Time{}
+	}
+	return repair.CreatedAt.Add(publishedBlockReferenceRepairPreCASLease)
+}
+
 func publishedBlockReferenceRepairBucket(orgID, repoID, commitID, fsID string) int {
 	if publishedBlockReferenceRepairBuckets <= 1 {
 		return 0
@@ -156,14 +208,16 @@ func newPublishedBlockReferenceRepair(orgID, repoID, commitID, fsID string, stag
 	repoID = strings.TrimSpace(repoID)
 	commitID = strings.TrimSpace(commitID)
 	fsID = strings.TrimSpace(fsID)
+	now := publishedBlockReferenceRepairNowFn().UTC()
 	return publishedBlockReferenceRepair{
-		Bucket:    publishedBlockReferenceRepairBucket(orgID, repoID, commitID, fsID),
-		OrgID:     orgID,
-		RepoID:    repoID,
-		CommitID:  commitID,
-		FSID:      fsID,
+		Bucket:         publishedBlockReferenceRepairBucket(orgID, repoID, commitID, fsID),
+		OrgID:          orgID,
+		RepoID:         repoID,
+		CommitID:       commitID,
+		FSID:           fsID,
 		StagedBlockIDs: append([]string(nil), db.NormalizeBlockIDs(stagedBlockIDs)...),
-		CreatedAt: publishedBlockReferenceRepairNowFn().UTC(),
+		CreatedAt:      now,
+		LeaseExpiresAt: now.Add(publishedBlockReferenceRepairPreCASLease),
 	}
 }
 
@@ -269,8 +323,7 @@ func schedulePendingPublishedFileRepairs(database *db.DB, orgID, repoID, commitI
 	})
 }
 
-func RepairPublishedFSObjectBlockReferenceRepair(database *db.DB, orgID, repoID, commitID, fsID string, stagedBlockIDs []string) error {
-	repair := newPublishedBlockReferenceRepair(orgID, repoID, commitID, fsID, stagedBlockIDs)
+func repairPublishedBlockReferenceRepair(database *db.DB, repair publishedBlockReferenceRepair) error {
 	if !shouldQueuePublishedBlockReferenceRepair(repair.FSID, repair.StagedBlockIDs) || strings.TrimSpace(repair.CommitID) == "" {
 		return nil
 	}
@@ -292,6 +345,13 @@ func RepairPublishedFSObjectBlockReferenceRepair(database *db.DB, orgID, repoID,
 			return fmt.Errorf("promote published fs_object %s for commit %s: %w", repair.FSID, repair.CommitID, err)
 		}
 	} else {
+		deferCleanup, err := publishedBlockReferenceRepairShouldDeferCleanup(database, repair)
+		if err != nil {
+			return err
+		}
+		if deferCleanup {
+			return nil
+		}
 		if err := publishedBlockReferenceRepairCleanupFn(database, repair.OrgID, repair.RepoID, repair.CommitID, repair.StagedBlockIDs); err != nil {
 			return fmt.Errorf("cleanup unreachable published fs_object %s for commit %s: %w", repair.FSID, repair.CommitID, err)
 		}
@@ -300,6 +360,10 @@ func RepairPublishedFSObjectBlockReferenceRepair(database *db.DB, orgID, repoID,
 		return fmt.Errorf("delete queued publish repair for fs_object %s: %w", repair.FSID, err)
 	}
 	return nil
+}
+
+func RepairPublishedFSObjectBlockReferenceRepair(database *db.DB, orgID, repoID, commitID, fsID string, stagedBlockIDs []string) error {
+	return repairPublishedBlockReferenceRepair(database, newPublishedBlockReferenceRepair(orgID, repoID, commitID, fsID, stagedBlockIDs))
 }
 
 func runPublishedBlockReferenceRepairSweep(database *db.DB) error {
@@ -320,7 +384,7 @@ func runPublishedBlockReferenceRepairSweep(database *db.DB) error {
 			if !repair.CreatedAt.IsZero() && repair.CreatedAt.After(cutoff) {
 				continue
 			}
-			if err := RepairPublishedFSObjectBlockReferenceRepair(database, repair.OrgID, repair.RepoID, repair.CommitID, repair.FSID, repair.StagedBlockIDs); err != nil {
+			if err := repairPublishedBlockReferenceRepair(database, repair); err != nil {
 				log.Printf("[publish_repair] queued repair failed for repo=%s commit=%s fs_object=%s: %v", repair.RepoID, repair.CommitID, repair.FSID, err)
 				if firstErr == nil {
 					firstErr = err
