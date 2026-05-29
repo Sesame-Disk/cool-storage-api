@@ -1,8 +1,11 @@
 package v2
 
 import (
+	"errors"
 	"testing"
 	"time"
+
+	"github.com/Sesame-Disk/sesamefs/internal/db"
 )
 
 func TestSchedulePublishedBlockReferenceRepairDeduplicatesInFlightRepair(t *testing.T) {
@@ -58,5 +61,161 @@ func TestSchedulePublishedBlockReferenceRepairDeduplicatesInFlightRepair(t *test
 	})
 	if len(pending) != 2 {
 		t.Fatalf("scheduled repairs after completion = %d, want 2", len(pending))
+	}
+}
+
+func TestQueuePendingPublishedFileRepairs_RollsBackPartialInsertFailure(t *testing.T) {
+	oldInsert := insertPublishedBlockReferenceRepairFn
+	oldDelete := deletePublishedBlockReferenceRepairFn
+	t.Cleanup(func() {
+		insertPublishedBlockReferenceRepairFn = oldInsert
+		deletePublishedBlockReferenceRepairFn = oldDelete
+	})
+
+	stageErr := errors.New("insert boom")
+	cleanupErr := errors.New("cleanup boom")
+	insertCalls := 0
+	insertPublishedBlockReferenceRepairFn = func(database *db.DB, repair publishedBlockReferenceRepair) error {
+		insertCalls++
+		if insertCalls == 2 {
+			return stageErr
+		}
+		return nil
+	}
+	deleteCalls := 0
+	deletePublishedBlockReferenceRepairFn = func(database *db.DB, repair publishedBlockReferenceRepair) error {
+		deleteCalls++
+		if deleteCalls == 2 {
+			return cleanupErr
+		}
+		return nil
+	}
+
+	pending := []*pendingPublishedFile{
+		{fsID: "fs-1", externalBlockIDs: []string{"block-1"}, internalBlockIDs: []string{"staged-1"}},
+		{fsID: "fs-2", externalBlockIDs: []string{"block-2"}, internalBlockIDs: []string{"staged-2"}},
+	}
+	err := queuePendingPublishedFileRepairs(nil, "org-1", "repo-1", "commit-1", pending)
+	if !errors.Is(err, stageErr) {
+		t.Fatalf("queuePendingPublishedFileRepairs() error = %v, want stage error %v", err, stageErr)
+	}
+	if !errors.Is(err, cleanupErr) {
+		t.Fatalf("queuePendingPublishedFileRepairs() error = %v, want cleanup error %v", err, cleanupErr)
+	}
+	if insertCalls != 2 {
+		t.Fatalf("insertCalls = %d, want 2", insertCalls)
+	}
+	if deleteCalls != 2 {
+		t.Fatalf("deleteCalls = %d, want 2", deleteCalls)
+	}
+}
+
+func TestRepairPublishedFSObjectBlockReferenceRepair_PromotesReachableCommit(t *testing.T) {
+	oldReachable := publishedBlockReferenceRepairCommitReachableFn
+	oldLoad := loadPublishedBlockReferenceRepairPendingFileFn
+	oldPromote := publishedBlockReferenceRepairPromoteFn
+	oldCleanup := publishedBlockReferenceRepairCleanupFn
+	oldDelete := deletePublishedBlockReferenceRepairFn
+	t.Cleanup(func() {
+		publishedBlockReferenceRepairCommitReachableFn = oldReachable
+		loadPublishedBlockReferenceRepairPendingFileFn = oldLoad
+		publishedBlockReferenceRepairPromoteFn = oldPromote
+		publishedBlockReferenceRepairCleanupFn = oldCleanup
+		deletePublishedBlockReferenceRepairFn = oldDelete
+	})
+
+	publishedBlockReferenceRepairCommitReachableFn = func(database *db.DB, repoID, commitID string) (bool, error) {
+		return true, nil
+	}
+	loadPublishedBlockReferenceRepairPendingFileFn = func(database *db.DB, repoID, fsID string) (*pendingPublishedFile, error) {
+		return &pendingPublishedFile{fsID: fsID, externalBlockIDs: []string{"fs-block-1"}}, nil
+	}
+	promoteCalls := 0
+	publishedBlockReferenceRepairPromoteFn = func(helper *FSHelper, orgID, repoID, commitID string, pending *pendingPublishedFile) error {
+		promoteCalls++
+		if orgID != "org-1" || repoID != "repo-1" || commitID != "commit-1" {
+			t.Fatalf("promote args = %s/%s/%s, want org-1/repo-1/commit-1", orgID, repoID, commitID)
+		}
+		if len(pending.internalBlockIDs) != 1 || pending.internalBlockIDs[0] != "queued-block-1" {
+			t.Fatalf("pending.internalBlockIDs = %#v, want []string{\"queued-block-1\"}", pending.internalBlockIDs)
+		}
+		if len(pending.externalBlockIDs) != 1 || pending.externalBlockIDs[0] != "fs-block-1" {
+			t.Fatalf("pending.externalBlockIDs = %#v, want []string{\"fs-block-1\"}", pending.externalBlockIDs)
+		}
+		return nil
+	}
+	publishedBlockReferenceRepairCleanupFn = func(database *db.DB, orgID, repoID, commitID string, blockIDs []string) error {
+		t.Fatal("cleanup should not run for reachable commit")
+		return nil
+	}
+	deleteCalls := 0
+	deletePublishedBlockReferenceRepairFn = func(database *db.DB, repair publishedBlockReferenceRepair) error {
+		deleteCalls++
+		if repair.RepoID != "repo-1" || repair.CommitID != "commit-1" || repair.FSID != "fs-1" {
+			t.Fatalf("delete repair = %#v, want repo-1/commit-1/fs-1", repair)
+		}
+		return nil
+	}
+
+	err := RepairPublishedFSObjectBlockReferenceRepair(nil, "org-1", "repo-1", "commit-1", "fs-1", []string{"queued-block-1"})
+	if err != nil {
+		t.Fatalf("RepairPublishedFSObjectBlockReferenceRepair() error = %v, want nil", err)
+	}
+	if promoteCalls != 1 {
+		t.Fatalf("promoteCalls = %d, want 1", promoteCalls)
+	}
+	if deleteCalls != 1 {
+		t.Fatalf("deleteCalls = %d, want 1", deleteCalls)
+	}
+}
+
+func TestRepairPublishedFSObjectBlockReferenceRepair_CleansUnreachableCommit(t *testing.T) {
+	oldReachable := publishedBlockReferenceRepairCommitReachableFn
+	oldLoad := loadPublishedBlockReferenceRepairPendingFileFn
+	oldPromote := publishedBlockReferenceRepairPromoteFn
+	oldCleanup := publishedBlockReferenceRepairCleanupFn
+	oldDelete := deletePublishedBlockReferenceRepairFn
+	t.Cleanup(func() {
+		publishedBlockReferenceRepairCommitReachableFn = oldReachable
+		loadPublishedBlockReferenceRepairPendingFileFn = oldLoad
+		publishedBlockReferenceRepairPromoteFn = oldPromote
+		publishedBlockReferenceRepairCleanupFn = oldCleanup
+		deletePublishedBlockReferenceRepairFn = oldDelete
+	})
+
+	publishedBlockReferenceRepairCommitReachableFn = func(database *db.DB, repoID, commitID string) (bool, error) {
+		return false, nil
+	}
+	loadPublishedBlockReferenceRepairPendingFileFn = func(database *db.DB, repoID, fsID string) (*pendingPublishedFile, error) {
+		t.Fatal("fs_object lookup should not run for unreachable commits")
+		return nil, nil
+	}
+	publishedBlockReferenceRepairPromoteFn = func(helper *FSHelper, orgID, repoID, commitID string, pending *pendingPublishedFile) error {
+		t.Fatal("promote should not run for unreachable commit")
+		return nil
+	}
+	cleanupCalls := 0
+	publishedBlockReferenceRepairCleanupFn = func(database *db.DB, orgID, repoID, commitID string, blockIDs []string) error {
+		cleanupCalls++
+		if len(blockIDs) != 1 || blockIDs[0] != "queued-block-1" {
+			t.Fatalf("cleanup blockIDs = %#v, want []string{\"queued-block-1\"}", blockIDs)
+		}
+		return nil
+	}
+	deleteCalls := 0
+	deletePublishedBlockReferenceRepairFn = func(database *db.DB, repair publishedBlockReferenceRepair) error {
+		deleteCalls++
+		return nil
+	}
+
+	err := RepairPublishedFSObjectBlockReferenceRepair(nil, "org-1", "repo-1", "commit-1", "fs-1", []string{"queued-block-1"})
+	if err != nil {
+		t.Fatalf("RepairPublishedFSObjectBlockReferenceRepair() error = %v, want nil", err)
+	}
+	if cleanupCalls != 1 {
+		t.Fatalf("cleanupCalls = %d, want 1", cleanupCalls)
+	}
+	if deleteCalls != 1 {
+		t.Fatalf("deleteCalls = %d, want 1", deleteCalls)
 	}
 }

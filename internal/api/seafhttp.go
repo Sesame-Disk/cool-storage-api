@@ -1872,11 +1872,23 @@ func (h *SeafHTTPHandler) commitUploadedFileMultiBlockOnce(orgID, repoID, userID
 		_ = db.RemovePublishAttemptReferences(h.db, orgID, newCommitID, blockIDs)
 		return "", "", 0, 0, fmt.Errorf("failed to create commit: %w", err)
 	}
+	if err := v2.QueuePublishedFSObjectBlockReferenceRepair(h.db, orgID, repoID, newCommitID, fileFSID, blockIDs); err != nil {
+		cleanupErr := db.CleanupFailedPublishAttempt(h.db, orgID, repoID, newCommitID, newCommitID, blockIDs)
+		clearErr := v2.ClearPublishedFSObjectBlockReferenceRepair(h.db, orgID, repoID, newCommitID, fileFSID)
+		return "", "", 0, 0, errors.Join(
+			fmt.Errorf("failed to queue durable publish repair for commit %s: %w", newCommitID, err),
+			cleanupErr,
+			clearErr,
+		)
+	}
 
 	if err := fsHelper.UpdateLibraryHeadFromSnapshot(snapshot, repoID, newCommitID, snapshot.HeadCommitID); err != nil {
 		if errors.Is(err, v2.ErrLibraryHeadConflict) {
 			if cleanupErr := db.CleanupFailedPublishAttempt(h.db, orgID, repoID, newCommitID, newCommitID, blockIDs); cleanupErr != nil {
 				return "", "", 0, 0, fmt.Errorf("failed to clean up conflict publish attempt %s: %w", newCommitID, cleanupErr)
+			}
+			if clearErr := v2.ClearPublishedFSObjectBlockReferenceRepair(h.db, orgID, repoID, newCommitID, fileFSID); clearErr != nil {
+				log.Printf("[commitUploadedFileMultiBlock] WARNING: failed to clear queued publish repair for repo=%s commit=%s fs_object=%s after head conflict: %v", repoID, newCommitID, fileFSID, clearErr)
 			}
 		}
 		return "", "", 0, 0, fmt.Errorf("failed to update library head: %w", err)
@@ -1885,11 +1897,9 @@ func (h *SeafHTTPHandler) commitUploadedFileMultiBlockOnce(orgID, repoID, userID
 		return fsHelper.RegisterFSObjectBlockReferences(orgID, repoID, fileFSID, blockIDs)
 	}); err != nil {
 		log.Printf("[commitUploadedFileMultiBlock] WARNING: head updated for repo=%s commit=%s but failed to promote block references for fs_object %s: %v", repoID, newCommitID, fileFSID, err)
-		v2.SchedulePublishedBlockReferenceRepair("seafhttp-multiblock:"+newCommitID, "commitUploadedFileMultiBlock", func() error {
-			return db.PromotePublishAttemptReferences(h.db, orgID, newCommitID, blockIDs, func() error {
-				return fsHelper.RegisterFSObjectBlockReferences(orgID, repoID, fileFSID, blockIDs)
-			})
-		})
+		v2.SchedulePublishedFSObjectBlockReferenceRepair(h.db, orgID, repoID, newCommitID, fileFSID, "commitUploadedFileMultiBlock", blockIDs)
+	} else if clearErr := v2.ClearPublishedFSObjectBlockReferenceRepair(h.db, orgID, repoID, newCommitID, fileFSID); clearErr != nil {
+		log.Printf("[commitUploadedFileMultiBlock] WARNING: published repo=%s commit=%s but failed to clear queued publish repair for fs_object %s: %v", repoID, newCommitID, fileFSID, clearErr)
 	}
 
 	log.Printf("[commitUploadedFileMultiBlock] Created commit %s with root %s", newCommitID, newRootFSID)
@@ -2017,11 +2027,23 @@ func (h *SeafHTTPHandler) commitUploadedFileOnce(orgID, repoID, userID, parentDi
 		_ = db.RemovePublishAttemptReferences(h.db, orgID, newCommitID, []string{blockID})
 		return "", "", 0, 0, fmt.Errorf("failed to create commit: %w", err)
 	}
+	if err := v2.QueuePublishedFSObjectBlockReferenceRepair(h.db, orgID, repoID, newCommitID, fileFSID, []string{blockID}); err != nil {
+		cleanupErr := db.CleanupFailedPublishAttempt(h.db, orgID, repoID, newCommitID, newCommitID, []string{blockID})
+		clearErr := v2.ClearPublishedFSObjectBlockReferenceRepair(h.db, orgID, repoID, newCommitID, fileFSID)
+		return "", "", 0, 0, errors.Join(
+			fmt.Errorf("failed to queue durable publish repair for commit %s: %w", newCommitID, err),
+			cleanupErr,
+			clearErr,
+		)
+	}
 
 	if err := fsHelper.UpdateLibraryHeadFromSnapshot(snapshot, repoID, newCommitID, snapshot.HeadCommitID); err != nil {
 		if errors.Is(err, v2.ErrLibraryHeadConflict) {
 			if cleanupErr := db.CleanupFailedPublishAttempt(h.db, orgID, repoID, newCommitID, newCommitID, []string{blockID}); cleanupErr != nil {
 				return "", "", 0, 0, fmt.Errorf("failed to clean up conflict publish attempt %s: %w", newCommitID, cleanupErr)
+			}
+			if clearErr := v2.ClearPublishedFSObjectBlockReferenceRepair(h.db, orgID, repoID, newCommitID, fileFSID); clearErr != nil {
+				log.Printf("[commitUploadedFile] WARNING: failed to clear queued publish repair for repo=%s commit=%s fs_object=%s after head conflict: %v", repoID, newCommitID, fileFSID, clearErr)
 			}
 		}
 		return "", "", 0, 0, fmt.Errorf("failed to update library head: %w", err)
@@ -2030,11 +2052,9 @@ func (h *SeafHTTPHandler) commitUploadedFileOnce(orgID, repoID, userID, parentDi
 		return fsHelper.RegisterFSObjectBlockReferences(orgID, repoID, fileFSID, []string{blockID})
 	}); err != nil {
 		log.Printf("[commitUploadedFile] WARNING: head updated for repo=%s commit=%s but failed to promote block references for fs_object %s: %v", repoID, newCommitID, fileFSID, err)
-		v2.SchedulePublishedBlockReferenceRepair("seafhttp-single:"+newCommitID, "commitUploadedFile", func() error {
-			return db.PromotePublishAttemptReferences(h.db, orgID, newCommitID, []string{blockID}, func() error {
-				return fsHelper.RegisterFSObjectBlockReferences(orgID, repoID, fileFSID, []string{blockID})
-			})
-		})
+		v2.SchedulePublishedFSObjectBlockReferenceRepair(h.db, orgID, repoID, newCommitID, fileFSID, "commitUploadedFile", []string{blockID})
+	} else if clearErr := v2.ClearPublishedFSObjectBlockReferenceRepair(h.db, orgID, repoID, newCommitID, fileFSID); clearErr != nil {
+		log.Printf("[commitUploadedFile] WARNING: published repo=%s commit=%s but failed to clear queued publish repair for fs_object %s: %v", repoID, newCommitID, fileFSID, clearErr)
 	}
 
 	log.Printf("[commitUploadedFile] Created commit %s with root %s", newCommitID, newRootFSID)

@@ -158,5 +158,8 @@ func TestInitialSchemaContainsLookupNameAndStarredIndex(t *testing.T) {
 	assert.Contains(t, content, "replace_existing BOOLEAN")
 	assert.Contains(t, content, "CREATE TABLE IF NOT EXISTS onlyoffice_pending_blocks")
 	assert.Contains(t, content, "WITH default_time_to_live = 604800")
+	assert.Contains(t, content, "CREATE TABLE IF NOT EXISTS published_block_reference_repairs")
+	assert.Contains(t, content, "staged_block_ids LIST<TEXT>")
+	assert.Contains(t, content, "PRIMARY KEY ((bucket), org_id, repo_id, commit_id, fs_id)")
 	assert.NotContains(t, content, "CREATE TABLE IF NOT EXISTS share_links_by_org")
 }

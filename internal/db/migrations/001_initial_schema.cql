@@ -729,6 +729,23 @@ CREATE TABLE IF NOT EXISTS onlyoffice_pending_blocks (
     PRIMARY KEY ((org_id), operation_id)
 ) WITH default_time_to_live = 604800;
 
+-- Durable queue for post-HEAD block-reference promotion/cleanup repairs.
+-- Rows are inserted before the library HEAD CAS so later processes can resume
+-- recovery after crashes, restarts, or redeploys. `staged_block_ids` stores
+-- the exact IDs originally used in the pub:<commit> rows; this must not be
+-- reconstructed from fs_objects because different publish surfaces do not all
+-- stage the same identifier shape.
+CREATE TABLE IF NOT EXISTS published_block_reference_repairs (
+    bucket           INT,
+    org_id           UUID,
+    repo_id          UUID,
+    commit_id        TEXT,
+    fs_id            TEXT,
+    staged_block_ids LIST<TEXT>,
+    created_at       TIMESTAMP,
+    PRIMARY KEY ((bucket), org_id, repo_id, commit_id, fs_id)
+) WITH default_time_to_live = 0;
+
 -- ─── Groups ──────────────────────────────────────────────────────────────────
 
 CREATE TABLE IF NOT EXISTS groups (

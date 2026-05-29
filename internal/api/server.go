@@ -238,6 +238,7 @@ func NewServer(cfg *config.Config, database *db.DB, version string) *Server {
 	if database != nil {
 		apiKeyManager = apikeys.NewManager(database)
 	}
+	v2.StartPublishedBlockReferenceRepairer(database)
 
 	s := &Server{
 		config:               cfg,

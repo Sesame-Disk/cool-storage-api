@@ -635,6 +635,15 @@ func (h *BatchOperationHandler) processSingleItem(orgID, userID, srcRepoID, dstR
 				}
 				return fmt.Errorf("failed to stage destination publish-attempt refs for commit %s: %w", newDstCommitID, err)
 			}
+			if err := queuePendingPublishedFileRepairs(h.db, orgID, dstRepoID, newDstCommitID, pendingCopiedFiles); err != nil {
+				cleanupErr := db.CleanupFailedPublishAttempt(h.db, orgID, dstRepoID, newDstCommitID, newDstCommitID, pendingPublishedFileInternalBlockIDs(pendingCopiedFiles))
+				clearErr := clearPendingPublishedFileRepairs(h.db, orgID, dstRepoID, newDstCommitID, pendingCopiedFiles)
+				return errors.Join(
+					fmt.Errorf("failed to queue durable publish repair for destination commit %s: %w", newDstCommitID, err),
+					cleanupErr,
+					clearErr,
+				)
+			}
 		}
 
 		if err := fsHelper.UpdateLibraryHeadFromSnapshot(dstSnapshot, dstRepoID, newDstCommitID, dstSnapshot.HeadCommitID); err != nil {
@@ -642,15 +651,18 @@ func (h *BatchOperationHandler) processSingleItem(orgID, userID, srcRepoID, dstR
 				if cleanupErr := db.CleanupFailedPublishAttempt(h.db, orgID, dstRepoID, newDstCommitID, newDstCommitID, pendingPublishedFileInternalBlockIDs(pendingCopiedFiles)); cleanupErr != nil {
 					return fmt.Errorf("failed to clean up conflict copy publish attempt %s: %w", newDstCommitID, cleanupErr)
 				}
+				if clearErr := clearPendingPublishedFileRepairs(h.db, orgID, dstRepoID, newDstCommitID, pendingCopiedFiles); clearErr != nil {
+					log.Printf("[processSingleItem] WARNING: failed to clear queued publish repairs for repo=%s commit=%s after head conflict: %v", dstRepoID, newDstCommitID, clearErr)
+				}
 			}
 			return fmt.Errorf("failed to update destination library: %w", err)
 		}
 		if len(pendingCopiedFiles) > 0 {
 			if err := fsHelper.promotePendingPublishedFiles(orgID, dstRepoID, newDstCommitID, pendingCopiedFiles); err != nil {
 				log.Printf("[processSingleItem] WARNING: head updated for repo=%s commit=%s but failed to promote copied block references: %v", dstRepoID, newDstCommitID, err)
-				SchedulePublishedBlockReferenceRepair("batch-dst:"+newDstCommitID, "BatchOperationDestination", func() error {
-					return fsHelper.promotePendingPublishedFiles(orgID, dstRepoID, newDstCommitID, pendingCopiedFiles)
-				})
+				schedulePendingPublishedFileRepairs(h.db, orgID, dstRepoID, newDstCommitID, pendingCopiedFiles, "BatchOperationDestination")
+			} else if clearErr := clearPendingPublishedFileRepairs(h.db, orgID, dstRepoID, newDstCommitID, pendingCopiedFiles); clearErr != nil {
+				log.Printf("[processSingleItem] WARNING: published repo=%s commit=%s but failed to clear queued publish repairs: %v", dstRepoID, newDstCommitID, clearErr)
 			}
 		}
 
