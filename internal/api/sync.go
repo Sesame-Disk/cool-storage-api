@@ -3,6 +3,7 @@ package api
 import (
 	"bytes"
 	"compress/zlib"
+	"context"
 	"crypto/sha1"
 	"crypto/sha256"
 	"encoding/binary"
@@ -191,8 +192,12 @@ func (h *SyncHandler) lookupLibraryStorageClass(orgID, repoID string) string {
 	return storageClass
 }
 
+var lookupLibraryStorageClassForSyncFn = func(h *SyncHandler, orgID, repoID string) string {
+	return h.lookupLibraryStorageClass(orgID, repoID)
+}
+
 func (h *SyncHandler) resolvePreferredLibraryStorageClass(c *gin.Context, orgID, repoID string) string {
-	libraryClass := h.lookupLibraryStorageClass(orgID, repoID)
+	libraryClass := lookupLibraryStorageClassForSyncFn(h, orgID, repoID)
 	if h.storageManager != nil {
 		configuredURL := ""
 		if h.config != nil {
@@ -257,6 +262,13 @@ func (h *SyncHandler) resolvePreferredBlockStore(c *gin.Context, orgID, repoID s
 
 // formatSizeSeafile delegates to httputil.FormatSizeSeafile.
 var formatSizeSeafile = httputil.FormatSizeSeafile
+var syncBlockExistsFn = func(ctx context.Context, blockStore *storage.BlockStore, hash string) (bool, error) {
+	return blockStore.BlockExists(ctx, hash)
+}
+var syncPutBlockDataFn = func(ctx context.Context, blockStore *storage.BlockStore, block *storage.BlockData) (string, error) {
+	return blockStore.PutBlockData(ctx, block)
+}
+var registerUploadedBlockAndMappingForSyncFn = v2.RegisterUploadedBlockAndMapping
 
 // formatRelativeTimeHTML delegates to httputil.FormatRelativeTimeHTML.
 var formatRelativeTimeHTML = httputil.FormatRelativeTimeHTML
@@ -930,7 +942,7 @@ func (h *SyncHandler) PutBlock(c *gin.Context) {
 	log.Printf("PutBlock: storing block external=%s internal=%s in storage class %s\n",
 		externalID, internalID, storageClass)
 
-	exists, err := blockStore.BlockExists(c.Request.Context(), internalID)
+	exists, err := syncBlockExistsFn(c.Request.Context(), blockStore, internalID)
 	if err != nil {
 		log.Printf("PutBlock: failed to check block existence: %v\n", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to check block existence"})
@@ -952,7 +964,7 @@ func (h *SyncHandler) PutBlock(c *gin.Context) {
 	}
 
 	if !exists {
-		_, err = blockStore.PutBlockData(c.Request.Context(), blockData)
+		_, err = syncPutBlockDataFn(c.Request.Context(), blockStore, blockData)
 		if err != nil {
 			log.Printf("PutBlock: failed to store in backend: %v\n", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to store block"})
@@ -962,12 +974,20 @@ func (h *SyncHandler) PutBlock(c *gin.Context) {
 
 	// Store block metadata and mapping (if DB available)
 	if h.db != nil {
-		now := time.Now()
-
 		// Store block metadata + a deterministic provisional reference so the
-		// later sync head publish can promote or release exactly this upload pin.
+		// later sync head publish can promote or release exactly this upload pin,
+		// then write the legacy SHA-1 mapping only if the client needs it.
 		operationID := syncBlockUploadOperationID(repoID, internalID)
-		if err := v2.NewFSHelper(h.db).RegisterUploadedBlock(orgID, repoID, internalID, operationID, len(data), storageClass, ""); err != nil {
+		externalMappingID := ""
+		if isLegacySHA1 {
+			externalMappingID = externalID
+		}
+		if err := registerUploadedBlockAndMappingForSyncFn(h.db, orgID, repoID, internalID, operationID, len(data), storageClass, "", externalMappingID); err != nil {
+			if errors.Is(err, v2.ErrBlockMappingWriteFailed) {
+				log.Printf("PutBlock: failed to store block mapping org=%s ext=%s int=%s: %v", orgID, externalID, internalID, err)
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create block mapping"})
+				return
+			}
 			log.Printf("PutBlock: failed to store block metadata org=%s block=%s: %v", orgID, internalID, err)
 			if errors.Is(err, v2.ErrBlockDeleteInProgress) {
 				c.JSON(http.StatusConflict, gin.H{"error": "block is being deleted; retry the upload"})
@@ -979,12 +999,6 @@ func (h *SyncHandler) PutBlock(c *gin.Context) {
 
 		// If legacy SHA-1 client, store mapping external→internal (dual-write: forward + reverse)
 		if isLegacySHA1 {
-			if err := h.db.WriteBlockIDMapping(orgID, externalID, internalID, now); err != nil {
-				log.Printf("PutBlock: failed to store block mapping org=%s ext=%s int=%s: %v", orgID, externalID, internalID, err)
-				v2.RollbackUploadedBlockRefs(h.db, orgID, repoID, operationID, []string{internalID})
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create block mapping"})
-				return
-			}
 			log.Printf("PutBlock: stored mapping %s → %s\n", externalID, internalID)
 		}
 	}

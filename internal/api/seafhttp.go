@@ -1033,6 +1033,20 @@ const finalizeUploadConcurrency = 8
 const finalizeUploadBlockMetadataConcurrency = 1
 
 var finalizeUploadBlockMetadataPermits = make(chan struct{}, finalizeUploadBlockMetadataConcurrency)
+var putUploadedBlockAutoFn = func(ctx context.Context, blockStore *storage.BlockStore, hash string, data []byte) (string, error) {
+	return blockStore.PutBlockAuto(ctx, hash, data)
+}
+var registerUploadedBlockAndMappingForUploadFn = v2.RegisterUploadedBlockAndMapping
+var checkUploadStorageQuotaForCurrentHeadFn = func(h *SeafHTTPHandler, orgID, repoID, userID, parentDir, filename string, fileSize int64, replace bool) (int64, int64, error) {
+	return h.checkUploadStorageQuotaForCurrentHead(orgID, repoID, userID, parentDir, filename, fileSize, replace)
+}
+var lookupLibraryEncryptedForUploadFn = func(h *SeafHTTPHandler, orgID, repoID string) (bool, error) {
+	var encrypted bool
+	err := h.db.Session().Query(`
+		SELECT encrypted FROM libraries WHERE org_id = ? AND library_id = ?
+	`, orgID, repoID).Scan(&encrypted)
+	return encrypted, err
+}
 
 func acquireFinalizeUploadBlockMetadataPermit(ctx context.Context) (func(), error) {
 	select {
@@ -1259,7 +1273,7 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 	}
 	finalSize := int64(len(chunkData))
 
-	storageDeltaBytes, storageDeltaFiles, err := h.checkUploadStorageQuotaForCurrentHead(token.OrgID, token.RepoID, token.UserID, parentDir, filename, finalSize, replaceFile)
+	storageDeltaBytes, storageDeltaFiles, err := checkUploadStorageQuotaForCurrentHeadFn(h, token.OrgID, token.RepoID, token.UserID, parentDir, filename, finalSize, replaceFile)
 	if err != nil {
 		log.Printf("[HandleUpload] Storage quota check failed: %v", err)
 		if errors.Is(err, errStorageQuotaExceeded) {
@@ -1275,11 +1289,8 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 	fileID := hex.EncodeToString(sha1Hash[:])
 
 	// Check encryption
-	var encrypted bool
+	encrypted, err := lookupLibraryEncryptedForUploadFn(h, token.OrgID, token.RepoID)
 	var storedContent = chunkData
-	err = h.db.Session().Query(`
-		SELECT encrypted FROM libraries WHERE org_id = ? AND library_id = ?
-	`, token.OrgID, token.RepoID).Scan(&encrypted)
 	if err != nil {
 		log.Printf("[HandleUpload] Failed to check encryption status: %v", err)
 	}
@@ -1317,7 +1328,7 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 			return
 		}
 	} else {
-		_, err = blockStore.PutBlockAuto(ctx, sha256ID, storedContent)
+		_, err = putUploadedBlockAutoFn(ctx, blockStore, sha256ID, storedContent)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to store block"})
 			return
@@ -1328,7 +1339,7 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 	// Register block metadata + a provisional reference (kept alive by TTL until
 	// the fs_object commit creates the permanent reference), then write the
 	// external SHA-1 mapping only after the block is durable in Cassandra.
-	if err := v2.RegisterUploadedBlockAndMapping(h.db, token.OrgID, token.RepoID, sha256ID, token.Token, len(storedContent), actualStorageClass, "", fileID); err != nil {
+	if err := registerUploadedBlockAndMappingForUploadFn(h.db, token.OrgID, token.RepoID, sha256ID, token.Token, len(storedContent), actualStorageClass, "", fileID); err != nil {
 		log.Printf("[HandleUpload] CRITICAL: Failed to materialize block org=%s block=%s ext=%s: %v", token.OrgID, sha256ID[:16], fileID[:16], err)
 		if errors.Is(err, v2.ErrBlockMappingWriteFailed) {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create block mapping"})
@@ -1693,7 +1704,7 @@ readLoop:
 				return nil
 			}
 
-			if _, putErr := blockStore.PutBlockAuto(egCtx, sha256ID, storedBlock); putErr != nil {
+			if _, putErr := putUploadedBlockAutoFn(egCtx, blockStore, sha256ID, storedBlock); putErr != nil {
 				return fmt.Errorf("failed to store block: %w", putErr)
 			}
 
@@ -1704,7 +1715,7 @@ readLoop:
 			defer releaseMetadataPermit()
 
 			if blkErr := upload.AccountBlockOnce(blockIndexLocal, sha256ID, func() error {
-				return v2.RegisterUploadedBlockAndMapping(h.db, token.OrgID, token.RepoID, sha256ID, token.Token, len(storedBlock), actualStorageClass, "", blockSHA1IDLocal)
+				return registerUploadedBlockAndMappingForUploadFn(h.db, token.OrgID, token.RepoID, sha256ID, token.Token, len(storedBlock), actualStorageClass, "", blockSHA1IDLocal)
 			}); blkErr != nil {
 				if errors.Is(blkErr, v2.ErrBlockMappingWriteFailed) {
 					log.Printf("[finalizeUploadStreaming] CRITICAL: Failed to write block_id_mapping org=%s ext=%s int=%s: %v", token.OrgID, blockSHA1IDLocal[:16], sha256ID[:16], blkErr)

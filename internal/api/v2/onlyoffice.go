@@ -1208,24 +1208,20 @@ func (h *OnlyOfficeHandler) saveEditedDocument(ctx context.Context, repoID, file
 		return fmt.Errorf("failed to store block: %w", err)
 	}
 
-	// Create SHA-1 → SHA-256 mapping for sync protocol compatibility (dual-write: forward + reverse).
-	// Fail closed on either write so reverse-lookup consumers (GC cleanup/orphan recovery) never observe
-	// a half-written mapping while the block continues through metadata publish.
-	if err := h.db.WriteBlockIDMapping(orgID, externalBlockID, internalBlockID, time.Time{}); err != nil {
-		log.Printf("OnlyOffice: CRITICAL - failed to create block mapping org=%s ext=%s int=%s: %v", orgID, externalBlockID[:16], internalBlockID[:16], err)
-		return fmt.Errorf("failed to create block mapping: %w", err)
-	}
-	log.Printf("OnlyOffice: Created block mapping: %s → %s", externalBlockID[:16], internalBlockID[:16])
-
-	// Store block metadata and a provisional reference using the internal (SHA-256)
-	// ID. The pending-cleanup row above plus the provisional reference's TTL both
-	// guarantee the block is reclaimed if the process dies before publish.
-	if err := NewFSHelper(h.db).RegisterUploadedBlock(orgID, repoID, internalBlockID, rollbackID, len(content), storageClass, storageKey); err != nil {
+	// Materialize block metadata/provisional ref first and then the sync mapping.
+	// Keep the pending-cleanup row on mapping failure so the reconciler can finish
+	// cleanup even if the immediate rollback path was only partially successful.
+	if err := RegisterUploadedBlockAndMapping(h.db, orgID, repoID, internalBlockID, rollbackID, len(content), storageClass, storageKey, externalBlockID); err != nil {
+		if errors.Is(err, ErrBlockMappingWriteFailed) {
+			log.Printf("OnlyOffice: CRITICAL - failed to create block mapping org=%s ext=%s int=%s: %v", orgID, externalBlockID[:16], internalBlockID[:16], err)
+			return fmt.Errorf("failed to create block mapping: %w", err)
+		}
 		if deleteErr := h.deleteOnlyOfficePendingBlock(orgID, rollbackID); deleteErr != nil {
 			log.Printf("OnlyOffice: failed to clear pending block cleanup %s after block-metadata failure: %v", rollbackID, deleteErr)
 		}
 		return fmt.Errorf("failed to store block metadata: %w", err)
 	}
+	log.Printf("OnlyOffice: Created block mapping: %s → %s", externalBlockID[:16], internalBlockID[:16])
 	blockMetadataRegistered = true
 
 	storageDeltaBytes, storageDeltaFiles, newCommitID, err := h.publishEditedDocumentMetadata(fsHelper, orgID, repoID, filePath, filename, userID, originalFileSize, externalBlockID, rollbackID)
