@@ -12,6 +12,7 @@ import (
 
 	"github.com/Sesame-Disk/sesamefs/internal/config"
 	"github.com/Sesame-Disk/sesamefs/internal/crypto"
+	"github.com/Sesame-Disk/sesamefs/internal/db"
 	"github.com/Sesame-Disk/sesamefs/internal/storage"
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
 	"github.com/gin-gonic/gin"
@@ -191,7 +192,7 @@ func TestResolveOnlyOfficeInternalURL(t *testing.T) {
 func TestWriteBlockIDMappingDualWrite(t *testing.T) {
 	t.Run("writes forward then reverse", func(t *testing.T) {
 		calls := make([]string, 0, 2)
-		err := writeBlockIDMappingDualWrite(
+		err := db.WriteBlockIDMappingDualWrite(
 			func() error {
 				calls = append(calls, "forward")
 				return nil
@@ -223,7 +224,7 @@ func TestWriteBlockIDMappingDualWrite(t *testing.T) {
 		reverseCalls := 0
 		rollbackCalls := 0
 		wantErr := errors.New("forward failed")
-		err := writeBlockIDMappingDualWrite(
+		err := db.WriteBlockIDMappingDualWrite(
 			func() error { return wantErr },
 			func() error {
 				rollbackCalls++
@@ -248,7 +249,7 @@ func TestWriteBlockIDMappingDualWrite(t *testing.T) {
 	t.Run("fails closed on reverse failure", func(t *testing.T) {
 		calls := make([]string, 0, 2)
 		wantErr := errors.New("reverse failed")
-		err := writeBlockIDMappingDualWrite(
+		err := db.WriteBlockIDMappingDualWrite(
 			func() error {
 				calls = append(calls, "forward")
 				return nil
@@ -279,7 +280,7 @@ func TestWriteBlockIDMappingDualWrite(t *testing.T) {
 	t.Run("joins rollback failure after reverse failure", func(t *testing.T) {
 		wantReverseErr := errors.New("reverse failed")
 		wantRollbackErr := errors.New("rollback failed")
-		err := writeBlockIDMappingDualWrite(
+		err := db.WriteBlockIDMappingDualWrite(
 			func() error { return nil },
 			func() error { return wantRollbackErr },
 			func() error { return wantReverseErr },

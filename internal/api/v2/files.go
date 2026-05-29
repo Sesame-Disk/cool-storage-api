@@ -2783,19 +2783,10 @@ func (h *FileHandler) UploadFile(c *gin.Context) {
 	}
 
 	// Create SHA-1 → SHA-256 mapping (dual-write: forward + reverse)
-	if err := h.db.Session().Query(
-		`INSERT INTO block_id_mappings (org_id, external_id, internal_id) VALUES (?, ?, ?)`,
-		orgID, fileID, sha256ID,
-	).Exec(); err != nil {
+	if err := h.db.WriteBlockIDMapping(orgID, fileID, sha256ID, time.Time{}); err != nil {
 		log.Printf("[UploadFile] CRITICAL: failed to write block_id_mapping org=%s: %v", orgID, err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create block mapping"})
 		return
-	}
-	if err := h.db.Session().Query(
-		`INSERT INTO block_id_mappings_by_internal (org_id, internal_id, external_id, created_at) VALUES (?, ?, ?, toTimestamp(now()))`,
-		orgID, sha256ID, fileID,
-	).Exec(); err != nil {
-		log.Printf("[UploadFile] WARNING: failed to write reverse block_id_mapping: %v", err)
 	}
 
 	// Register block metadata + a provisional reference (kept alive by TTL until

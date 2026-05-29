@@ -1326,17 +1326,10 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 	}
 
 	// Create SHA-1 → SHA-256 mapping (dual-write: forward + reverse lookup)
-	if err := h.db.Session().Query(`
-		INSERT INTO block_id_mappings (org_id, external_id, internal_id) VALUES (?, ?, ?)
-	`, token.OrgID, fileID, sha256ID).Exec(); err != nil {
+	if err := h.db.WriteBlockIDMapping(token.OrgID, fileID, sha256ID, time.Time{}); err != nil {
 		log.Printf("[HandleUpload] CRITICAL: Failed to write block_id_mapping org=%s ext=%s int=%s: %v", token.OrgID, fileID[:16], sha256ID[:16], err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create block mapping"})
 		return
-	}
-	if err := h.db.Session().Query(`
-		INSERT INTO block_id_mappings_by_internal (org_id, internal_id, external_id, created_at) VALUES (?, ?, ?, toTimestamp(now()))
-	`, token.OrgID, sha256ID, fileID).Exec(); err != nil {
-		log.Printf("[HandleUpload] WARNING: Failed to write reverse block_id_mapping org=%s int=%s ext=%s: %v", token.OrgID, sha256ID[:16], fileID[:16], err)
 	}
 
 	// Register block metadata + a provisional reference (kept alive by TTL until
@@ -1707,21 +1700,9 @@ readLoop:
 				return fmt.Errorf("failed to store block: %w", putErr)
 			}
 
-			// Forward mapping is on the critical read path — its failure aborts.
-			if mapErr := h.db.Session().Query(`
-				INSERT INTO block_id_mappings (org_id, external_id, internal_id) VALUES (?, ?, ?)
-			`, token.OrgID, blockSHA1IDLocal, sha256ID).Exec(); mapErr != nil {
+			if mapErr := h.db.WriteBlockIDMapping(token.OrgID, blockSHA1IDLocal, sha256ID, time.Time{}); mapErr != nil {
 				log.Printf("[finalizeUploadStreaming] CRITICAL: Failed to write block_id_mapping org=%s ext=%s int=%s: %v", token.OrgID, blockSHA1IDLocal[:16], sha256ID[:16], mapErr)
 				return fmt.Errorf("failed to create block mapping: %w", mapErr)
-			}
-
-			// Reverse mapping remains best-effort. Block metadata registration is
-			// now required so finalize cannot publish a tree that references a
-			// block row we failed to confirm in Cassandra.
-			if revErr := h.db.Session().Query(`
-				INSERT INTO block_id_mappings_by_internal (org_id, internal_id, external_id, created_at) VALUES (?, ?, ?, toTimestamp(now()))
-			`, token.OrgID, sha256ID, blockSHA1IDLocal).Exec(); revErr != nil {
-				log.Printf("[finalizeUploadStreaming] WARNING: Failed to write reverse block_id_mapping org=%s int=%s ext=%s: %v", token.OrgID, sha256ID[:16], blockSHA1IDLocal[:16], revErr)
 			}
 
 			releaseMetadataPermit, permitErr := acquireFinalizeUploadBlockMetadataPermit(egCtx)

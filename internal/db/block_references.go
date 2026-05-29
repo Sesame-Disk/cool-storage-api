@@ -88,6 +88,54 @@ func NormalizeBlockIDs(blockIDs []string) []string {
 	return normalized
 }
 
+// WriteBlockIDMappingDualWrite executes the forward mapping write, the reverse
+// write, and a compensating rollback of the forward write if the reverse side
+// fails. This keeps the two mapping tables logically in sync even when callers
+// cannot wrap both writes in a single logged batch with the same key shape.
+func WriteBlockIDMappingDualWrite(writeForward func() error, rollbackForward func() error, writeReverse func() error) error {
+	if err := writeForward(); err != nil {
+		return err
+	}
+	if err := writeReverse(); err != nil {
+		if rollbackErr := rollbackForward(); rollbackErr != nil {
+			return errors.Join(err, fmt.Errorf("rollback forward block mapping: %w", rollbackErr))
+		}
+		return err
+	}
+	return nil
+}
+
+// WriteBlockIDMapping dual-writes the external SHA-1 -> internal SHA-256 mapping
+// plus the reverse lookup row used by GC cleanup. Reverse-write failures roll
+// back the forward row so callers never leave a half-written mapping behind.
+func (db *DB) WriteBlockIDMapping(orgID, externalID, internalID string, createdAt time.Time) error {
+	if db == nil {
+		return nil
+	}
+	ts := createdAt.UTC()
+	if ts.IsZero() {
+		ts = time.Now().UTC()
+	}
+	return WriteBlockIDMappingDualWrite(
+		func() error {
+			return db.Session().Query(`
+				INSERT INTO block_id_mappings (org_id, external_id, internal_id, created_at) VALUES (?, ?, ?, ?)
+			`, orgID, externalID, internalID, ts).Exec()
+		},
+		func() error {
+			batch := db.Session().Batch(gocql.LoggedBatch)
+			batch.Query(`DELETE FROM block_id_mappings WHERE org_id = ? AND external_id = ?`, orgID, externalID)
+			batch.Query(`DELETE FROM block_id_mappings_by_internal WHERE org_id = ? AND internal_id = ? AND external_id = ?`, orgID, internalID, externalID)
+			return batch.Exec()
+		},
+		func() error {
+			return db.Session().Query(`
+				INSERT INTO block_id_mappings_by_internal (org_id, internal_id, external_id, created_at) VALUES (?, ?, ?, ?)
+			`, orgID, internalID, externalID, ts).Exec()
+		},
+	)
+}
+
 // AddPublishAttemptReferences stages temporary pub:<attempt> references for an
 // in-flight metadata publish. Input IDs are normalized with TrimSpace + dedup so
 // retrying callers can safely pass repeated or padded block IDs.

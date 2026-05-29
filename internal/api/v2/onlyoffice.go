@@ -1211,24 +1211,7 @@ func (h *OnlyOfficeHandler) saveEditedDocument(ctx context.Context, repoID, file
 	// Create SHA-1 → SHA-256 mapping for sync protocol compatibility (dual-write: forward + reverse).
 	// Fail closed on either write so reverse-lookup consumers (GC cleanup/orphan recovery) never observe
 	// a half-written mapping while the block continues through metadata publish.
-	if err := writeBlockIDMappingDualWrite(
-		func() error {
-			return h.db.Session().Query(`
-				INSERT INTO block_id_mappings (org_id, external_id, internal_id) VALUES (?, ?, ?)
-			`, orgID, externalBlockID, internalBlockID).Exec()
-		},
-		func() error {
-			batch := h.db.Session().Batch(gocql.LoggedBatch)
-			batch.Query(`DELETE FROM block_id_mappings WHERE org_id = ? AND external_id = ?`, orgID, externalBlockID)
-			batch.Query(`DELETE FROM block_id_mappings_by_internal WHERE org_id = ? AND internal_id = ? AND external_id = ?`, orgID, internalBlockID, externalBlockID)
-			return batch.Exec()
-		},
-		func() error {
-			return h.db.Session().Query(`
-				INSERT INTO block_id_mappings_by_internal (org_id, internal_id, external_id, created_at) VALUES (?, ?, ?, toTimestamp(now()))
-			`, orgID, internalBlockID, externalBlockID).Exec()
-		},
-	); err != nil {
+	if err := h.db.WriteBlockIDMapping(orgID, externalBlockID, internalBlockID, time.Time{}); err != nil {
 		log.Printf("OnlyOffice: CRITICAL - failed to create block mapping org=%s ext=%s int=%s: %v", orgID, externalBlockID[:16], internalBlockID[:16], err)
 		return fmt.Errorf("failed to create block mapping: %w", err)
 	}
@@ -1267,19 +1250,6 @@ func (h *OnlyOfficeHandler) saveEditedDocument(ctx context.Context, repoID, file
 	}
 
 	log.Printf("OnlyOffice: saved document %s with block %s (internal: %s), new commit %s", filePath, externalBlockID[:16], internalBlockID[:16], newCommitID)
-	return nil
-}
-
-func writeBlockIDMappingDualWrite(writeForward func() error, rollbackForward func() error, writeReverse func() error) error {
-	if err := writeForward(); err != nil {
-		return err
-	}
-	if err := writeReverse(); err != nil {
-		if rollbackErr := rollbackForward(); rollbackErr != nil {
-			return errors.Join(err, fmt.Errorf("rollback forward block mapping: %w", rollbackErr))
-		}
-		return err
-	}
 	return nil
 }
 
