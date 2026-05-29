@@ -54,17 +54,18 @@ func TestCreateOfficeFileLeavesNoPublishAttemptRefs(t *testing.T) {
 	resp.Body.Close()
 
 	referrers := uploadedFileBlockReferrers(t, repoID, "/", fileName)
-	fsRefs := 0
+	repoFSRefs := 0
+	repoRefPrefix := "fs:" + repoID + ":"
 	for _, referrer := range referrers {
 		if strings.HasPrefix(referrer, "pub:") {
 			t.Fatalf("created office file leaked publish-attempt ref %q", referrer)
 		}
-		if strings.HasPrefix(referrer, "fs:") {
-			fsRefs++
+		if strings.HasPrefix(referrer, repoRefPrefix) {
+			repoFSRefs++
 		}
 	}
-	if fsRefs != 1 {
-		t.Fatalf("created office file fs ref count = %d, want 1; referrers=%v", fsRefs, referrers)
+	if repoFSRefs != 1 {
+		t.Fatalf("created office file repo-local fs ref count = %d, want 1; referrers=%v", repoFSRefs, referrers)
 	}
 }
 

@@ -2,11 +2,14 @@ package v2
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Sesame-Disk/sesamefs/internal/config"
 	"github.com/Sesame-Disk/sesamefs/internal/storage"
@@ -332,6 +335,70 @@ func TestCreateFile_MissingPath(t *testing.T) {
 
 	if w.Code != http.StatusBadRequest {
 		t.Errorf("status = %d, want %d", w.Code, http.StatusBadRequest)
+	}
+}
+
+func TestRetryCreateFileTemplateBlockMaterializationRetriesFencedBlock(t *testing.T) {
+	oldBackoff := createFileTemplateBlockRetryBackoffFn
+	oldSleep := createFileTemplateBlockSleepFn
+	t.Cleanup(func() {
+		createFileTemplateBlockRetryBackoffFn = oldBackoff
+		createFileTemplateBlockSleepFn = oldSleep
+	})
+
+	createFileTemplateBlockRetryBackoffFn = func(attempt int) time.Duration { return 0 }
+	createFileTemplateBlockSleepFn = func(time.Duration) {}
+
+	storeCalls := 0
+	registerCalls := 0
+	resetCalls := 0
+	err := retryCreateFileTemplateBlockMaterialization(func() error {
+		storeCalls++
+		return nil
+	}, func() error {
+		registerCalls++
+		if registerCalls == 1 {
+			return fmt.Errorf("register template block: %w", ErrBlockDeleteInProgress)
+		}
+		return nil
+	}, func() {
+		resetCalls++
+	})
+	if err != nil {
+		t.Fatalf("retryCreateFileTemplateBlockMaterialization() error = %v, want nil", err)
+	}
+	if storeCalls != 2 {
+		t.Fatalf("storeCalls = %d, want 2", storeCalls)
+	}
+	if registerCalls != 2 {
+		t.Fatalf("registerCalls = %d, want 2", registerCalls)
+	}
+	if resetCalls != 1 {
+		t.Fatalf("resetCalls = %d, want 1", resetCalls)
+	}
+}
+
+func TestRetryCreateFileTemplateBlockMaterializationStopsOnNonRetryableError(t *testing.T) {
+	storeCalls := 0
+	registerCalls := 0
+	wantErr := errors.New("boom")
+	err := retryCreateFileTemplateBlockMaterialization(func() error {
+		storeCalls++
+		return nil
+	}, func() error {
+		registerCalls++
+		return wantErr
+	}, func() {
+		t.Fatal("resetStored should not run for non-retryable errors")
+	})
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("retryCreateFileTemplateBlockMaterialization() error = %v, want %v", err, wantErr)
+	}
+	if storeCalls != 1 {
+		t.Fatalf("storeCalls = %d, want 1", storeCalls)
+	}
+	if registerCalls != 1 {
+		t.Fatalf("registerCalls = %d, want 1", registerCalls)
 	}
 }
 

@@ -94,6 +94,45 @@ func rebuildTraversedDirectoryToRoot(fsHelper *FSHelper, repoID string, result *
 // delay (exponential with jitter, capped). Only the attempt count is local.
 const uploadMetadataRetryAttempts = 20
 
+// Office template creates can race with GC over the shared content-addressed
+// template block. When that happens, re-store the template and retry the block
+// registration instead of surfacing a transient 500 to the caller.
+const createFileTemplateBlockRetryAttempts = 3
+
+var createFileTemplateBlockRetryBackoffFn = RetryBackoff
+
+var createFileTemplateBlockSleepFn = time.Sleep
+
+func retryCreateFileTemplateBlockMaterialization(store func() error, register func() error, resetStored func()) error {
+	attempts := createFileTemplateBlockRetryAttempts
+	if attempts < 1 {
+		attempts = 1
+	}
+
+	for attempt := 1; attempt <= attempts; attempt++ {
+		if err := store(); err != nil {
+			return err
+		}
+		if err := register(); err != nil {
+			if !errors.Is(err, ErrBlockDeleteInProgress) || attempt == attempts {
+				return err
+			}
+			if resetStored != nil {
+				resetStored()
+			}
+			sleepFor := createFileTemplateBlockRetryBackoffFn(attempt)
+			log.Printf("[CreateFile] template block registration fenced by GC; retrying (%d/%d) after %s", attempt, attempts, sleepFor)
+			if sleepFor > 0 {
+				createFileTemplateBlockSleepFn(sleepFor)
+			}
+			continue
+		}
+		return nil
+	}
+
+	return fmt.Errorf("unreachable template block materialization state")
+}
+
 // Dirent represents a directory entry in Seafile API format
 // This matches the exact format expected by Seafile clients
 type Dirent struct {
@@ -1141,7 +1180,7 @@ func (h *FileHandler) CreateFile(c *gin.Context) {
 			}
 		}
 
-		if templateBlockData != nil && !templateBlockStored {
+		if templateBlockData != nil {
 			if templateBlockStore == nil {
 				blockStore, storageClass, err := h.resolveLibraryBlockStore(c, orgID, repoID)
 				if err != nil {
@@ -1153,19 +1192,29 @@ func (h *FileHandler) CreateFile(c *gin.Context) {
 				templateBlockStore = blockStore
 				templateStorageClass = storageClass
 			}
-			if _, err := templateBlockStore.PutBlockData(c.Request.Context(), templateBlockData); err != nil {
-				return fmt.Errorf("failed to store file content: %w", err)
+			if err := retryCreateFileTemplateBlockMaterialization(func() error {
+				if templateBlockStored {
+					return nil
+				}
+				if _, err := templateBlockStore.PutBlockData(c.Request.Context(), templateBlockData); err != nil {
+					return fmt.Errorf("failed to store file content: %w", err)
+				}
+				templateBlockStored = true
+				log.Printf("[CreateFile] Created Office file %s with template size %d bytes", fileName, fileSize)
+				return nil
+			}, func() error {
+				// Keep the freshly stored template block alive and respect the GC
+				// delete fence until publish-attempt refs take over below.
+				if err := fsHelper.RegisterUploadedBlock(orgID, repoID, templateBlockData.Hash, uploadOperationID, int(fileSize), templateStorageClass, ""); err != nil {
+					return fmt.Errorf("failed to register template block metadata: %w", err)
+				}
+				templateBlockPinned = true
+				return nil
+			}, func() {
+				templateBlockStored = false
+			}); err != nil {
+				return err
 			}
-			templateBlockStored = true
-			log.Printf("[CreateFile] Created Office file %s with template size %d bytes", fileName, fileSize)
-		}
-		if templateBlockData != nil {
-			// Keep the freshly stored template block alive and respect the GC
-			// delete fence until publish-attempt refs take over below.
-			if err := fsHelper.RegisterUploadedBlock(orgID, repoID, templateBlockData.Hash, uploadOperationID, int(fileSize), templateStorageClass, ""); err != nil {
-				return fmt.Errorf("failed to register template block metadata: %w", err)
-			}
-			templateBlockPinned = true
 		}
 
 		pendingFile, err := fsHelper.prepareFileFSObjectForPublish(repoID, fileName, fileSize, blockIDs)
@@ -1273,6 +1322,8 @@ func (h *FileHandler) CreateFile(c *gin.Context) {
 			c.JSON(http.StatusConflict, gin.H{"error": "file already exists"})
 		case errors.Is(err, errBlockStorageUnavailable):
 			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "block storage not available"})
+		case errors.Is(err, ErrBlockDeleteInProgress):
+			c.JSON(http.StatusConflict, gin.H{"error": "block is being deleted; retry the create"})
 		case errors.Is(err, ErrLibraryHeadConflict):
 			c.JSON(http.StatusConflict, gin.H{"error": "library was modified concurrently; retry the create"})
 		default:
