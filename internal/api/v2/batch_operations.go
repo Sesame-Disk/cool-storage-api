@@ -560,17 +560,10 @@ func (h *BatchOperationHandler) processSingleItem(orgID, userID, srcRepoID, dstR
 		}
 
 		entryFSID := srcResult.TargetEntry.ID
-		publishAttemptID := ""
 		var pendingCopiedFiles []*pendingPublishedFile
-		cleanupPendingCopyPublish := func() {
-			if len(pendingCopiedFiles) == 0 {
-				return
-			}
-			_ = db.RemovePublishAttemptReferences(h.db, orgID, publishAttemptID, pendingPublishedFileInternalBlockIDs(pendingCopiedFiles))
-		}
+		cleanupPendingCopyPublish := func() {}
 		if srcRepoID != dstRepoID {
-			publishAttemptID = uuid.NewString()
-			newFSID, copiedFiles, err := fsHelper.copyFSObjectToLibraryForPublishAttempt(orgID, srcRepoID, dstRepoID, srcResult.TargetEntry.ID, publishAttemptID)
+			newFSID, copiedFiles, err := fsHelper.copyFSObjectToLibraryForPublish(srcRepoID, dstRepoID, srcResult.TargetEntry.ID)
 			pendingCopiedFiles = copiedFiles
 			if err != nil {
 				cleanupPendingCopyPublish()
@@ -632,20 +625,31 @@ func (h *BatchOperationHandler) processSingleItem(orgID, userID, srcRepoID, dstR
 			cleanupPendingCopyPublish()
 			return fmt.Errorf("failed to create destination commit: %w", err)
 		}
+		if len(pendingCopiedFiles) > 0 {
+			if err := fsHelper.stagePendingPublishedFiles(orgID, dstRepoID, newDstCommitID, pendingCopiedFiles); err != nil {
+				if cleanupErr := db.CleanupFailedPublishAttempt(h.db, orgID, dstRepoID, newDstCommitID, newDstCommitID, pendingPublishedFileInternalBlockIDs(pendingCopiedFiles)); cleanupErr != nil {
+					return errors.Join(
+						fmt.Errorf("failed to stage destination publish-attempt refs for commit %s: %w", newDstCommitID, err),
+						fmt.Errorf("cleanup failed publish commit %s: %w", newDstCommitID, cleanupErr),
+					)
+				}
+				return fmt.Errorf("failed to stage destination publish-attempt refs for commit %s: %w", newDstCommitID, err)
+			}
+		}
 
 		if err := fsHelper.UpdateLibraryHeadFromSnapshot(dstSnapshot, dstRepoID, newDstCommitID, dstSnapshot.HeadCommitID); err != nil {
 			if len(pendingCopiedFiles) > 0 && errors.Is(err, ErrLibraryHeadConflict) {
-				if cleanupErr := db.CleanupFailedPublishAttempt(h.db, orgID, dstRepoID, publishAttemptID, newDstCommitID, pendingPublishedFileInternalBlockIDs(pendingCopiedFiles)); cleanupErr != nil {
-					return fmt.Errorf("failed to clean up conflict copy publish attempt %s: %w", publishAttemptID, cleanupErr)
+				if cleanupErr := db.CleanupFailedPublishAttempt(h.db, orgID, dstRepoID, newDstCommitID, newDstCommitID, pendingPublishedFileInternalBlockIDs(pendingCopiedFiles)); cleanupErr != nil {
+					return fmt.Errorf("failed to clean up conflict copy publish attempt %s: %w", newDstCommitID, cleanupErr)
 				}
 			}
 			return fmt.Errorf("failed to update destination library: %w", err)
 		}
 		if len(pendingCopiedFiles) > 0 {
-			if err := fsHelper.promotePendingPublishedFiles(orgID, dstRepoID, publishAttemptID, pendingCopiedFiles); err != nil {
+			if err := fsHelper.promotePendingPublishedFiles(orgID, dstRepoID, newDstCommitID, pendingCopiedFiles); err != nil {
 				log.Printf("[processSingleItem] WARNING: head updated for repo=%s commit=%s but failed to promote copied block references: %v", dstRepoID, newDstCommitID, err)
-				SchedulePublishedBlockReferenceRepair("batch-dst:"+publishAttemptID, "BatchOperationDestination", func() error {
-					return fsHelper.promotePendingPublishedFiles(orgID, dstRepoID, publishAttemptID, pendingCopiedFiles)
+				SchedulePublishedBlockReferenceRepair("batch-dst:"+newDstCommitID, "BatchOperationDestination", func() error {
+					return fsHelper.promotePendingPublishedFiles(orgID, dstRepoID, newDstCommitID, pendingCopiedFiles)
 				})
 			}
 		}

@@ -1276,14 +1276,11 @@ func (h *OnlyOfficeHandler) publishEditedDocumentMetadata(fsHelper *FSHelper, or
 		}
 
 		now := time.Now()
-		publishAttemptID := uuid.NewString()
-		pendingFile, err := fsHelper.stageFileFSObjectForPublishAttempt(orgID, repoID, publishAttemptID, filename, originalFileSize, []string{externalBlockID})
+		pendingFile, err := fsHelper.prepareFileFSObjectForPublish(repoID, filename, originalFileSize, []string{externalBlockID})
 		if err != nil {
 			return fmt.Errorf("failed to create file fs_object: %w", err)
 		}
-		cleanupPendingFilePublish := func() {
-			_ = db.RemovePublishAttemptReferences(h.db, orgID, publishAttemptID, pendingFile.internalBlockIDs)
-		}
+		cleanupPendingFilePublish := func() {}
 
 		updatedEntries := make([]FSEntry, 0, len(result.Entries))
 		fileUpdated := false
@@ -1327,12 +1324,21 @@ func (h *OnlyOfficeHandler) publishEditedDocumentMetadata(fsHelper *FSHelper, or
 			cleanupPendingFilePublish()
 			return fmt.Errorf("failed to create commit: %w", err)
 		}
+		if err := fsHelper.stagePendingPublishedFiles(orgID, repoID, commitID, []*pendingPublishedFile{pendingFile}); err != nil {
+			if cleanupErr := db.CleanupFailedPublishAttempt(h.db, orgID, repoID, commitID, commitID, pendingPublishedFileInternalBlockIDs([]*pendingPublishedFile{pendingFile})); cleanupErr != nil {
+				return errors.Join(
+					fmt.Errorf("failed to stage publish-attempt block references for commit %s: %w", commitID, err),
+					fmt.Errorf("cleanup failed publish commit %s: %w", commitID, cleanupErr),
+				)
+			}
+			return fmt.Errorf("failed to stage publish-attempt block references for commit %s: %w", commitID, err)
+		}
 
 		if err := h.updateOnlyOfficePendingBlockCommitID(orgID, pendingOperationID, commitID); err != nil {
-			if cleanupErr := db.CleanupFailedPublishAttempt(h.db, orgID, repoID, publishAttemptID, commitID, pendingFile.internalBlockIDs); cleanupErr != nil {
+			if cleanupErr := db.CleanupFailedPublishAttempt(h.db, orgID, repoID, commitID, commitID, pendingFile.internalBlockIDs); cleanupErr != nil {
 				return errors.Join(
 					fmt.Errorf("failed to persist OnlyOffice pending commit id: %w", err),
-					fmt.Errorf("clean up publish attempt %s: %w", publishAttemptID, cleanupErr),
+					fmt.Errorf("clean up publish attempt %s: %w", commitID, cleanupErr),
 				)
 			}
 			return fmt.Errorf("failed to persist OnlyOffice pending commit id: %w", err)
@@ -1340,16 +1346,16 @@ func (h *OnlyOfficeHandler) publishEditedDocumentMetadata(fsHelper *FSHelper, or
 
 		if err := fsHelper.UpdateLibraryHeadFromSnapshot(snapshot, repoID, commitID, snapshot.HeadCommitID); err != nil {
 			if errors.Is(err, ErrLibraryHeadConflict) {
-				if cleanupErr := db.CleanupFailedPublishAttempt(h.db, orgID, repoID, publishAttemptID, commitID, pendingFile.internalBlockIDs); cleanupErr != nil {
-					return fmt.Errorf("failed to clean up conflict publish attempt %s: %w", publishAttemptID, cleanupErr)
+				if cleanupErr := db.CleanupFailedPublishAttempt(h.db, orgID, repoID, commitID, commitID, pendingFile.internalBlockIDs); cleanupErr != nil {
+					return fmt.Errorf("failed to clean up conflict publish attempt %s: %w", commitID, cleanupErr)
 				}
 			}
 			return fmt.Errorf("failed to update library head: %w", err)
 		}
-		if err := fsHelper.promotePendingPublishedFiles(orgID, repoID, publishAttemptID, []*pendingPublishedFile{pendingFile}); err != nil {
+		if err := fsHelper.promotePendingPublishedFiles(orgID, repoID, commitID, []*pendingPublishedFile{pendingFile}); err != nil {
 			log.Printf("OnlyOffice: WARNING: head updated for repo=%s commit=%s but failed to promote block references for fs_object %s: %v", repoID, commitID, pendingFile.fsID, err)
-			SchedulePublishedBlockReferenceRepair("onlyoffice:"+publishAttemptID, "OnlyOffice", func() error {
-				return fsHelper.promotePendingPublishedFiles(orgID, repoID, publishAttemptID, []*pendingPublishedFile{pendingFile})
+			SchedulePublishedBlockReferenceRepair("onlyoffice:"+commitID, "OnlyOffice", func() error {
+				return fsHelper.promotePendingPublishedFiles(orgID, repoID, commitID, []*pendingPublishedFile{pendingFile})
 			})
 		}
 

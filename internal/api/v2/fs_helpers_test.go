@@ -189,6 +189,124 @@ func TestRegisterUploadedBlock_ReenqueuesZeroRefWhenFenceNeverClears(t *testing.
 	}
 }
 
+func TestStagePendingPublishedFiles_AssignsResolvedInternalBlockIDs(t *testing.T) {
+	helper := &FSHelper{}
+	oldResolve := stagePendingPublishedFilesResolveFn
+	oldAdd := stagePendingPublishedFilesAddReferencesFn
+	oldRemove := stagePendingPublishedFilesRemoveReferencesFn
+	t.Cleanup(func() {
+		stagePendingPublishedFilesResolveFn = oldResolve
+		stagePendingPublishedFilesAddReferencesFn = oldAdd
+		stagePendingPublishedFilesRemoveReferencesFn = oldRemove
+	})
+
+	resolveCalls := 0
+	stagePendingPublishedFilesResolveFn = func(h *FSHelper, orgID string, blockIDs []string) ([]string, error) {
+		resolveCalls++
+		if orgID != "org-1" {
+			t.Fatalf("resolve orgID = %q, want org-1", orgID)
+		}
+		if len(blockIDs) != 1 || blockIDs[0] != "sha1-1" {
+			t.Fatalf("resolve blockIDs = %#v, want []string{\"sha1-1\"}", blockIDs)
+		}
+		return []string{"sha256-1"}, nil
+	}
+	addCalls := 0
+	stagePendingPublishedFilesAddReferencesFn = func(database *db.DB, orgID, repoID, attemptID string, blockIDs []string) error {
+		addCalls++
+		if orgID != "org-1" || repoID != "repo-1" || attemptID != "commit-1" {
+			t.Fatalf("add args = %s/%s/%s, want org-1/repo-1/commit-1", orgID, repoID, attemptID)
+		}
+		if len(blockIDs) != 1 || blockIDs[0] != "sha256-1" {
+			t.Fatalf("add blockIDs = %#v, want []string{\"sha256-1\"}", blockIDs)
+		}
+		return nil
+	}
+	stagePendingPublishedFilesRemoveReferencesFn = func(database *db.DB, orgID, attemptID string, blockIDs []string) error {
+		t.Fatalf("remove should not run on successful stage, got %s/%s %#v", orgID, attemptID, blockIDs)
+		return nil
+	}
+
+	pending := &pendingPublishedFile{fsID: "fs-1", externalBlockIDs: []string{"sha1-1"}}
+	err := helper.stagePendingPublishedFiles("org-1", "repo-1", "commit-1", []*pendingPublishedFile{pending})
+	if err != nil {
+		t.Fatalf("stagePendingPublishedFiles() error = %v, want nil", err)
+	}
+	if resolveCalls != 1 {
+		t.Fatalf("resolveCalls = %d, want 1", resolveCalls)
+	}
+	if addCalls != 1 {
+		t.Fatalf("addCalls = %d, want 1", addCalls)
+	}
+	if len(pending.internalBlockIDs) != 1 || pending.internalBlockIDs[0] != "sha256-1" {
+		t.Fatalf("pending.internalBlockIDs = %#v, want []string{\"sha256-1\"}", pending.internalBlockIDs)
+	}
+}
+
+func TestStagePendingPublishedFiles_ReturnsRollbackFailureAndKeepsResolvedIDs(t *testing.T) {
+	helper := &FSHelper{}
+	oldResolve := stagePendingPublishedFilesResolveFn
+	oldAdd := stagePendingPublishedFilesAddReferencesFn
+	oldRemove := stagePendingPublishedFilesRemoveReferencesFn
+	t.Cleanup(func() {
+		stagePendingPublishedFilesResolveFn = oldResolve
+		stagePendingPublishedFilesAddReferencesFn = oldAdd
+		stagePendingPublishedFilesRemoveReferencesFn = oldRemove
+	})
+
+	stagePendingPublishedFilesResolveFn = func(h *FSHelper, orgID string, blockIDs []string) ([]string, error) {
+		if len(blockIDs) != 1 {
+			t.Fatalf("resolve blockIDs len = %d, want 1", len(blockIDs))
+		}
+		return []string{"resolved-" + blockIDs[0]}, nil
+	}
+	addCalls := 0
+	stageErr := errors.New("stage boom")
+	stagePendingPublishedFilesAddReferencesFn = func(database *db.DB, orgID, repoID, attemptID string, blockIDs []string) error {
+		addCalls++
+		if addCalls == 2 {
+			return stageErr
+		}
+		return nil
+	}
+	removeCalls := 0
+	cleanupErr := errors.New("cleanup boom")
+	stagePendingPublishedFilesRemoveReferencesFn = func(database *db.DB, orgID, attemptID string, blockIDs []string) error {
+		removeCalls++
+		if orgID != "org-1" || attemptID != "commit-1" {
+			t.Fatalf("remove args = %s/%s, want org-1/commit-1", orgID, attemptID)
+		}
+		if len(blockIDs) != 2 || blockIDs[0] != "resolved-sha1-1" || blockIDs[1] != "resolved-sha1-2" {
+			t.Fatalf("remove blockIDs = %#v, want both staged block IDs", blockIDs)
+		}
+		return cleanupErr
+	}
+
+	pending := []*pendingPublishedFile{
+		{fsID: "fs-1", externalBlockIDs: []string{"sha1-1"}},
+		{fsID: "fs-2", externalBlockIDs: []string{"sha1-2"}},
+	}
+	err := helper.stagePendingPublishedFiles("org-1", "repo-1", "commit-1", pending)
+	if !errors.Is(err, stageErr) {
+		t.Fatalf("stagePendingPublishedFiles() error = %v, want stage error %v", err, stageErr)
+	}
+	if !errors.Is(err, cleanupErr) {
+		t.Fatalf("stagePendingPublishedFiles() error = %v, want cleanup error %v", err, cleanupErr)
+	}
+	if addCalls != 2 {
+		t.Fatalf("addCalls = %d, want 2", addCalls)
+	}
+	if removeCalls != 1 {
+		t.Fatalf("removeCalls = %d, want 1", removeCalls)
+	}
+	if len(pending[0].internalBlockIDs) != 1 || pending[0].internalBlockIDs[0] != "resolved-sha1-1" {
+		t.Fatalf("pending[0].internalBlockIDs = %#v, want []string{\"resolved-sha1-1\"}", pending[0].internalBlockIDs)
+	}
+	if len(pending[1].internalBlockIDs) != 1 || pending[1].internalBlockIDs[0] != "resolved-sha1-2" {
+		t.Fatalf("pending[1].internalBlockIDs = %#v, want []string{\"resolved-sha1-2\"}", pending[1].internalBlockIDs)
+	}
+}
+
 func TestLibraryHeadSnapshotValidateExpectedHeadRejectsMismatch(t *testing.T) {
 	snapshot := &LibraryHeadSnapshot{HeadCommitID: "head-a"}
 

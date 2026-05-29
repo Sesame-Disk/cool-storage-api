@@ -58,6 +58,14 @@ var resolveStoredBlockIDsFn = func(h *FSHelper, orgID string, blockIDs []string)
 	return h.resolveStoredBlockIDs(orgID, blockIDs)
 }
 
+var stagePendingPublishedFilesResolveFn = func(h *FSHelper, orgID string, blockIDs []string) ([]string, error) {
+	return resolveStoredBlockIDsFn(h, orgID, blockIDs)
+}
+
+var stagePendingPublishedFilesAddReferencesFn = db.AddPublishAttemptReferences
+
+var stagePendingPublishedFilesRemoveReferencesFn = db.RemovePublishAttemptReferences
+
 var registerUploadedBlockAddReferenceFn = func(h *FSHelper, orgID, blockID, referrer, libraryID string, ttlSeconds int) error {
 	return h.db.AddBlockReference(orgID, blockID, referrer, libraryID, ttlSeconds)
 }
@@ -1074,29 +1082,54 @@ func pendingPublishedFileInternalBlockIDs(pendingFiles []*pendingPublishedFile) 
 	return blockIDs
 }
 
-func (h *FSHelper) stageFileFSObjectForPublishAttempt(orgID, repoID, attemptID, name string, size int64, blockIDs []string) (*pendingPublishedFile, error) {
+func (h *FSHelper) prepareFileFSObjectForPublish(repoID, name string, size int64, blockIDs []string) (*pendingPublishedFile, error) {
 	fsID, err := buildFileFSObjectID(blockIDs, size)
 	if err != nil {
 		return nil, err
 	}
 
-	resolved, err := db.StagePublishAttemptReferences(h.db, orgID, repoID, attemptID, blockIDs, func(blockIDs []string) ([]string, error) {
-		return resolveStoredBlockIDsFn(h, orgID, blockIDs)
-	})
-	if err != nil {
-		return nil, fmt.Errorf("stage publish-attempt block references for fs_object %s: %w", fsID, err)
-	}
-
 	if err := h.createFileFSObjectRow(repoID, fsID, name, size, blockIDs); err != nil {
-		_ = db.RemovePublishAttemptReferences(h.db, orgID, attemptID, resolved)
 		return nil, err
 	}
 
 	return &pendingPublishedFile{
 		fsID:             fsID,
 		externalBlockIDs: append([]string(nil), blockIDs...),
-		internalBlockIDs: append([]string(nil), resolved...),
 	}, nil
+}
+
+func (h *FSHelper) stagePendingPublishedFiles(orgID, repoID, attemptID string, pendingFiles []*pendingPublishedFile) error {
+	stagedBlockIDs := make([]string, 0)
+	rollbackStagedRefs := func(blockIDs []string, stageErr error) error {
+		if len(blockIDs) == 0 {
+			return stageErr
+		}
+		if cleanupErr := stagePendingPublishedFilesRemoveReferencesFn(h.db, orgID, attemptID, blockIDs); cleanupErr != nil {
+			return errors.Join(stageErr, fmt.Errorf("rollback staged publish-attempt refs for %s: %w", attemptID, cleanupErr))
+		}
+		return stageErr
+	}
+	for _, pending := range pendingFiles {
+		if pending == nil {
+			continue
+		}
+
+		pending.internalBlockIDs = nil
+		resolved, err := stagePendingPublishedFilesResolveFn(h, orgID, pending.externalBlockIDs)
+		if err != nil {
+			return rollbackStagedRefs(stagedBlockIDs, fmt.Errorf("stage publish-attempt block references for fs_object %s: resolve block IDs: %w", pending.fsID, err))
+		}
+		resolved = db.NormalizeBlockIDs(resolved)
+		pending.internalBlockIDs = append([]string(nil), resolved...)
+		if err := stagePendingPublishedFilesAddReferencesFn(h.db, orgID, repoID, attemptID, resolved); err != nil {
+			rollbackIDs := append(append([]string(nil), stagedBlockIDs...), pending.internalBlockIDs...)
+			return rollbackStagedRefs(rollbackIDs, fmt.Errorf("stage publish-attempt block references for fs_object %s: %w", pending.fsID, err))
+		}
+
+		stagedBlockIDs = append(stagedBlockIDs, pending.internalBlockIDs...)
+	}
+
+	return nil
 }
 
 func (h *FSHelper) promotePendingPublishedFiles(orgID, repoID, attemptID string, pendingFiles []*pendingPublishedFile) error {
@@ -1114,7 +1147,7 @@ func (h *FSHelper) promotePendingPublishedFiles(orgID, repoID, attemptID string,
 	return promoteErr
 }
 
-func (h *FSHelper) copyFSObjectToLibraryForPublishAttempt(orgID, srcRepoID, dstRepoID, fsID, attemptID string) (string, []*pendingPublishedFile, error) {
+func (h *FSHelper) copyFSObjectToLibraryForPublish(srcRepoID, dstRepoID, fsID string) (string, []*pendingPublishedFile, error) {
 	// Read the source fs_object
 	var objType, objName, dirEntries string
 	var blockIDs []string
@@ -1130,9 +1163,9 @@ func (h *FSHelper) copyFSObjectToLibraryForPublishAttempt(orgID, srcRepoID, dstR
 	}
 
 	if objType == "file" || objType == "" {
-		pendingFile, err := h.stageFileFSObjectForPublishAttempt(orgID, dstRepoID, attemptID, objName, sizeBytes, blockIDs)
+		pendingFile, err := h.prepareFileFSObjectForPublish(dstRepoID, objName, sizeBytes, blockIDs)
 		if err != nil {
-			return "", nil, fmt.Errorf("failed to stage copied file fs_object: %w", err)
+			return "", nil, fmt.Errorf("failed to prepare copied file fs_object: %w", err)
 		}
 		return pendingFile.fsID, []*pendingPublishedFile{pendingFile}, nil
 	}
@@ -1147,7 +1180,7 @@ func (h *FSHelper) copyFSObjectToLibraryForPublishAttempt(orgID, srcRepoID, dstR
 	newEntries := make([]FSEntry, len(entries))
 	pendingFiles := make([]*pendingPublishedFile, 0)
 	for i, entry := range entries {
-		newChildFSID, childPendingFiles, err := h.copyFSObjectToLibraryForPublishAttempt(orgID, srcRepoID, dstRepoID, entry.ID, attemptID)
+		newChildFSID, childPendingFiles, err := h.copyFSObjectToLibraryForPublish(srcRepoID, dstRepoID, entry.ID)
 		pendingFiles = append(pendingFiles, childPendingFiles...)
 		if err != nil {
 			return "", pendingFiles, fmt.Errorf("failed to copy child %q: %w", entry.Name, err)
