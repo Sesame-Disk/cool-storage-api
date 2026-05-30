@@ -110,18 +110,12 @@ func TestQueuePendingPublishedFileRepairs_RollsBackPartialInsertFailure(t *testi
 	}
 }
 
-func TestCleanupFailedPublishArtifacts_DeletesOnlyUnreachableFSObjects(t *testing.T) {
+func TestCleanupFailedPublishArtifacts_DeletesCommitAndDedupesAttemptRefs(t *testing.T) {
 	oldDeleteCommit := cleanupFailedPublishDeleteCommitFn
 	oldRemoveRefs := cleanupFailedPublishRemoveAttemptReferencesFn
-	oldListRoots := cleanupFailedPublishListCommitRootsFn
-	oldLoadFSObject := cleanupFailedPublishLoadFSObjectFn
-	oldDeleteFSObject := cleanupFailedPublishDeleteFSObjectFn
 	t.Cleanup(func() {
 		cleanupFailedPublishDeleteCommitFn = oldDeleteCommit
 		cleanupFailedPublishRemoveAttemptReferencesFn = oldRemoveRefs
-		cleanupFailedPublishListCommitRootsFn = oldListRoots
-		cleanupFailedPublishLoadFSObjectFn = oldLoadFSObject
-		cleanupFailedPublishDeleteFSObjectFn = oldDeleteFSObject
 	})
 
 	commitDeletes := 0
@@ -143,31 +137,6 @@ func TestCleanupFailedPublishArtifacts_DeletesOnlyUnreachableFSObjects(t *testin
 		}
 		return nil
 	}
-	cleanupFailedPublishListCommitRootsFn = func(database *db.DB, repoID string) ([]failedPublishCommitRoot, error) {
-		if repoID != "repo-1" {
-			t.Fatalf("repoID = %s, want repo-1", repoID)
-		}
-		return []failedPublishCommitRoot{{CommitID: "commit-live", RootFSID: "root-live"}}, nil
-	}
-	cleanupFailedPublishLoadFSObjectFn = func(database *db.DB, repoID, fsID string) (string, string, error) {
-		if repoID != "repo-1" {
-			t.Fatalf("repoID = %s, want repo-1", repoID)
-		}
-		switch fsID {
-		case "root-live":
-			return "dir", `[{"id":"fs-live"}]`, nil
-		case "fs-live":
-			return "file", "", nil
-		default:
-			t.Fatalf("unexpected fsID lookup %q", fsID)
-			return "", "", nil
-		}
-	}
-	var deletedFSIDs []string
-	cleanupFailedPublishDeleteFSObjectFn = func(database *db.DB, repoID, fsID string) error {
-		deletedFSIDs = append(deletedFSIDs, fsID)
-		return nil
-	}
 
 	err := CleanupFailedPublishArtifacts(&db.DB{}, "org-1", "repo-1", "attempt-1", "commit-losing", []string{"fs-live", "fs-zombie"}, []string{"queued-block-1", "queued-block-1"})
 	if err != nil {
@@ -179,21 +148,14 @@ func TestCleanupFailedPublishArtifacts_DeletesOnlyUnreachableFSObjects(t *testin
 	if removeRefsCalls != 1 {
 		t.Fatalf("removeRefsCalls = %d, want 1", removeRefsCalls)
 	}
-	if len(deletedFSIDs) != 1 || deletedFSIDs[0] != "fs-zombie" {
-		t.Fatalf("deletedFSIDs = %#v, want []string{\"fs-zombie\"}", deletedFSIDs)
-	}
 }
 
-func TestCleanupFailedPublishArtifacts_SkipsFSObjectDeleteWhenCommitDeleteFails(t *testing.T) {
+func TestCleanupFailedPublishArtifacts_ReturnsCommitDeleteErrorAfterRemovingRefs(t *testing.T) {
 	oldDeleteCommit := cleanupFailedPublishDeleteCommitFn
 	oldRemoveRefs := cleanupFailedPublishRemoveAttemptReferencesFn
-	oldListRoots := cleanupFailedPublishListCommitRootsFn
-	oldDeleteFSObject := cleanupFailedPublishDeleteFSObjectFn
 	t.Cleanup(func() {
 		cleanupFailedPublishDeleteCommitFn = oldDeleteCommit
 		cleanupFailedPublishRemoveAttemptReferencesFn = oldRemoveRefs
-		cleanupFailedPublishListCommitRootsFn = oldListRoots
-		cleanupFailedPublishDeleteFSObjectFn = oldDeleteFSObject
 	})
 
 	commitErr := errors.New("commit delete failed")
@@ -203,14 +165,6 @@ func TestCleanupFailedPublishArtifacts_SkipsFSObjectDeleteWhenCommitDeleteFails(
 	removeRefsCalls := 0
 	cleanupFailedPublishRemoveAttemptReferencesFn = func(database *db.DB, orgID, attemptID string, blockIDs []string) error {
 		removeRefsCalls++
-		return nil
-	}
-	cleanupFailedPublishListCommitRootsFn = func(database *db.DB, repoID string) ([]failedPublishCommitRoot, error) {
-		t.Fatal("should not walk surviving commits when commit delete fails")
-		return nil, nil
-	}
-	cleanupFailedPublishDeleteFSObjectFn = func(database *db.DB, repoID, fsID string) error {
-		t.Fatal("should not delete fs_objects when commit delete fails")
 		return nil
 	}
 

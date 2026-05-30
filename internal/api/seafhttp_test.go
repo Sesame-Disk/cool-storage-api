@@ -217,6 +217,137 @@ func TestWriteSeafHTTPUploadError_MapsSentinelErrors(t *testing.T) {
 	}
 }
 
+func TestRetrySeafHTTPBlockMaterialization_RetriesFencedBlock(t *testing.T) {
+	oldBackoff := seafHTTPBlockMaterializationRetryBackoffFn
+	oldSleep := seafHTTPBlockMaterializationSleepFn
+	t.Cleanup(func() {
+		seafHTTPBlockMaterializationRetryBackoffFn = oldBackoff
+		seafHTTPBlockMaterializationSleepFn = oldSleep
+	})
+
+	var slept []time.Duration
+	seafHTTPBlockMaterializationRetryBackoffFn = func(attempt int) time.Duration {
+		return time.Duration(attempt) * time.Millisecond
+	}
+	seafHTTPBlockMaterializationSleepFn = func(delay time.Duration) {
+		slept = append(slept, delay)
+	}
+
+	storeCalls := 0
+	materializeCalls := 0
+	err := retrySeafHTTPBlockMaterialization("HandleUpload", "block-1", func() error {
+		storeCalls++
+		return nil
+	}, func() error {
+		materializeCalls++
+		if materializeCalls < 3 {
+			return v2.ErrBlockDeleteInProgress
+		}
+		return nil
+	}, nil)
+	if err != nil {
+		t.Fatalf("retrySeafHTTPBlockMaterialization() error = %v, want nil", err)
+	}
+	if storeCalls != 3 {
+		t.Fatalf("storeCalls = %d, want 3", storeCalls)
+	}
+	if materializeCalls != 3 {
+		t.Fatalf("materializeCalls = %d, want 3", materializeCalls)
+	}
+	if !reflect.DeepEqual(slept, []time.Duration{time.Millisecond, 2 * time.Millisecond}) {
+		t.Fatalf("slept = %#v, want [1ms 2ms]", slept)
+	}
+}
+
+func TestRetrySeafHTTPBlockMaterialization_ClearsFenceWithoutSleeping(t *testing.T) {
+	oldBackoff := seafHTTPBlockMaterializationRetryBackoffFn
+	oldSleep := seafHTTPBlockMaterializationSleepFn
+	t.Cleanup(func() {
+		seafHTTPBlockMaterializationRetryBackoffFn = oldBackoff
+		seafHTTPBlockMaterializationSleepFn = oldSleep
+	})
+
+	seafHTTPBlockMaterializationRetryBackoffFn = func(attempt int) time.Duration {
+		return time.Millisecond
+	}
+	sleepCalls := 0
+	seafHTTPBlockMaterializationSleepFn = func(delay time.Duration) {
+		sleepCalls++
+	}
+
+	storeCalls := 0
+	materializeCalls := 0
+	resolveCalls := 0
+	err := retrySeafHTTPBlockMaterialization("HandleUpload", "block-1", func() error {
+		storeCalls++
+		return nil
+	}, func() error {
+		materializeCalls++
+		if materializeCalls == 1 {
+			return v2.ErrBlockDeleteInProgress
+		}
+		return nil
+	}, func() (bool, error) {
+		resolveCalls++
+		return true, nil
+	})
+	if err != nil {
+		t.Fatalf("retrySeafHTTPBlockMaterialization() error = %v, want nil", err)
+	}
+	if storeCalls != 2 {
+		t.Fatalf("storeCalls = %d, want 2", storeCalls)
+	}
+	if materializeCalls != 2 {
+		t.Fatalf("materializeCalls = %d, want 2", materializeCalls)
+	}
+	if resolveCalls != 1 {
+		t.Fatalf("resolveCalls = %d, want 1", resolveCalls)
+	}
+	if sleepCalls != 0 {
+		t.Fatalf("sleepCalls = %d, want 0", sleepCalls)
+	}
+}
+
+func TestRetrySeafHTTPBlockMaterialization_StopsOnNonRetryableError(t *testing.T) {
+	oldBackoff := seafHTTPBlockMaterializationRetryBackoffFn
+	oldSleep := seafHTTPBlockMaterializationSleepFn
+	t.Cleanup(func() {
+		seafHTTPBlockMaterializationRetryBackoffFn = oldBackoff
+		seafHTTPBlockMaterializationSleepFn = oldSleep
+	})
+
+	seafHTTPBlockMaterializationRetryBackoffFn = func(attempt int) time.Duration {
+		return time.Millisecond
+	}
+	sleepCalls := 0
+	seafHTTPBlockMaterializationSleepFn = func(delay time.Duration) {
+		sleepCalls++
+	}
+
+	storeCalls := 0
+	materializeCalls := 0
+	wantErr := errors.New("boom")
+	err := retrySeafHTTPBlockMaterialization("HandleUpload", "block-1", func() error {
+		storeCalls++
+		return nil
+	}, func() error {
+		materializeCalls++
+		return wantErr
+	}, nil)
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("retrySeafHTTPBlockMaterialization() error = %v, want %v", err, wantErr)
+	}
+	if storeCalls != 1 {
+		t.Fatalf("storeCalls = %d, want 1", storeCalls)
+	}
+	if materializeCalls != 1 {
+		t.Fatalf("materializeCalls = %d, want 1", materializeCalls)
+	}
+	if sleepCalls != 0 {
+		t.Fatalf("sleepCalls = %d, want 0", sleepCalls)
+	}
+}
+
 func TestStageSeafHTTPPublishAttemptReferences_UsesResolvedInternalBlockIDs(t *testing.T) {
 	oldResolve := resolveSeafHTTPStoredBlockIDsFn
 	oldStage := stageSeafHTTPPublishAttemptReferencesFn

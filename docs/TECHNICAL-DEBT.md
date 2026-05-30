@@ -1251,6 +1251,8 @@ The same retry-amplification pattern applies to copy block reference accounting:
 
 Retried metadata mutations can also leave unpublished rows behind. Each failed attempt may have created new `fs_objects` and a `commits` row whose commit never becomes a library HEAD. This is not a functional regression, but CAS retries multiply the amount of unreachable metadata compared with a single failed publish. A future maintenance pass should add observability or cleanup for unpublished commit/fs-object rows.
 
+Failed-publish cleanup intentionally does not delete unreachable-looking `fs_objects` today. `fs_id` is content-addressed, so concurrent in-flight publish attempts for the same content can legitimately share the same `fs_object` row before any winning commit becomes visible. A cleanup pass that only scans currently reachable commits can therefore misclassify a shared in-flight `fs_object` as dead and delete content another still-running attempt needs. Any future cleanup for unpublished `fs_objects` must track per-attempt ownership or another explicit in-flight lease; visible-commit reachability alone is not a safe predicate.
+
 The same pattern now applies to sync auto-merge snapshotting: `internal/api/sync.go` reads base/current/target `root_fs_id` in separate queries before attempting the merge. The final HEAD CAS still rejects stale work correctly, but concurrent head movement can waste merge computation and temporary fs-object materialization before the publish loses.
 
 ### 19.d. `UpdateLibraryHeadFromSnapshot` Validates an Argument Every Caller Passes Mechanically

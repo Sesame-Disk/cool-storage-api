@@ -1046,6 +1046,9 @@ var promoteSeafHTTPPublishAttemptReferencesFn = db.PromotePublishAttemptReferenc
 var queuePublishedFSObjectBlockReferenceRepairFn = v2.QueuePublishedFSObjectBlockReferenceRepair
 var clearPublishedFSObjectBlockReferenceRepairFn = v2.ClearPublishedFSObjectBlockReferenceRepair
 var schedulePublishedFSObjectBlockReferenceRepairFn = v2.SchedulePublishedFSObjectBlockReferenceRepair
+var clearSeafHTTPS3OrphanFenceFn = clearSeafHTTPS3OrphanFence
+var seafHTTPBlockMaterializationRetryBackoffFn = v2.RetryBackoff
+var seafHTTPBlockMaterializationSleepFn = time.Sleep
 var checkUploadStorageQuotaForCurrentHeadFn = func(h *SeafHTTPHandler, orgID, repoID, userID, parentDir, filename string, fileSize int64, replace bool) (int64, int64, error) {
 	return h.checkUploadStorageQuotaForCurrentHead(orgID, repoID, userID, parentDir, filename, fileSize, replace)
 }
@@ -1324,6 +1327,7 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 	// Store using PutAuto (automatically uses multipart for large files)
 	ctx := context.Background()
 	blockStore, actualStorageClass, err := h.resolveLibraryBlockStore(httputil.GetRoutingHostname(c, h.configuredServerURL()), token.OrgID, token.RepoID)
+	var storeUploadedBlock func() error
 	if err != nil {
 		log.Printf("[HandleUpload] Failed to get block store: %v, falling back to S3", err)
 		objectStore, _, resolveErr := h.resolveLibraryObjectStore(httputil.GetRoutingHostname(c, h.configuredServerURL()), token.OrgID, token.RepoID)
@@ -1331,24 +1335,33 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "block storage not available"})
 			return
 		}
-		_, err = objectStore.Put(c.Request.Context(), storageKey, newBytesReader(storedContent), int64(len(storedContent)))
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to upload file"})
-			return
+		storeUploadedBlock = func() error {
+			_, putErr := objectStore.Put(c.Request.Context(), storageKey, newBytesReader(storedContent), int64(len(storedContent)))
+			return putErr
 		}
 	} else {
-		_, err = putUploadedBlockAutoFn(ctx, blockStore, sha256ID, storedContent)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to store block"})
-			return
+		storeUploadedBlock = func() error {
+			_, putErr := putUploadedBlockAutoFn(ctx, blockStore, sha256ID, storedContent)
+			if putErr == nil {
+				log.Printf("[HandleUpload] Stored block %s (SHA-256: %s)", fileID[:16], sha256ID[:16])
+			}
+			return putErr
 		}
-		log.Printf("[HandleUpload] Stored block %s (SHA-256: %s)", fileID[:16], sha256ID[:16])
 	}
 
 	// Register block metadata + a provisional reference (kept alive by TTL until
 	// the fs_object commit creates the permanent reference), then write the
 	// external SHA-1 mapping only after the block is durable in Cassandra.
-	if err := registerUploadedBlockAndMappingForUploadFn(h.db, token.OrgID, token.RepoID, sha256ID, token.Token, len(storedContent), actualStorageClass, "", fileID); err != nil {
+	if err := retrySeafHTTPBlockMaterialization("HandleUpload", sha256ID, func() error {
+		if putErr := storeUploadedBlock(); putErr != nil {
+			return fmt.Errorf("failed to store block: %w", putErr)
+		}
+		return nil
+	}, func() error {
+		return registerUploadedBlockAndMappingForUploadFn(h.db, token.OrgID, token.RepoID, sha256ID, token.Token, len(storedContent), actualStorageClass, "", fileID)
+	}, func() (bool, error) {
+		return clearSeafHTTPS3OrphanFenceFn(c.Request.Context(), h.db, h.storageManager, "HandleUpload", token.OrgID, sha256ID)
+	}); err != nil {
 		log.Printf("[HandleUpload] CRITICAL: Failed to materialize block org=%s block=%s ext=%s: %v", token.OrgID, sha256ID[:16], fileID[:16], err)
 		if errors.Is(err, v2.ErrBlockMappingWriteFailed) {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create block mapping"})
@@ -1477,6 +1490,81 @@ func writeSeafHTTPUploadError(c *gin.Context, err error, genericMsg string) {
 	default:
 		c.JSON(http.StatusInternalServerError, gin.H{"error": genericMsg})
 	}
+}
+
+func clearSeafHTTPS3OrphanFence(ctx context.Context, database *db.DB, storageManager *storage.Manager, label, orgID, blockID string) (bool, error) {
+	if database == nil || storageManager == nil {
+		return false, nil
+	}
+
+	gcState, err := database.BlockGCState(orgID, blockID)
+	if err != nil {
+		return false, fmt.Errorf("read block gc_state for %s: %w", blockID, err)
+	}
+	if gcState == db.BlockGCStateDeleting {
+		return false, nil
+	}
+
+	orphanInfo, found, err := database.GetBlockS3OrphanInfo(orgID, blockID)
+	if err != nil {
+		return false, fmt.Errorf("read S3 orphan row for %s: %w", blockID, err)
+	}
+	if !found {
+		return false, nil
+	}
+
+	storageClass := strings.TrimSpace(orphanInfo.StorageClass)
+	if storageClass == "" {
+		storageClass = "hot"
+	}
+	blockStore, err := storageManager.GetBlockStore(storageClass)
+	if err != nil {
+		return false, fmt.Errorf("get block store for stale orphan fence %s: %w", storageClass, err)
+	}
+	if err := blockStore.DeleteBlock(ctx, blockID); err != nil {
+		return false, fmt.Errorf("delete stale orphaned block %s before re-upload: %w", blockID, err)
+	}
+	if err := database.DeleteBlockS3Orphan(orgID, blockID, orphanInfo.FirstSeenAt); err != nil {
+		return false, fmt.Errorf("clear S3 orphan row for block %s: %w", blockID, err)
+	}
+
+	log.Printf("[%s] Cleared stale S3 orphan fence for block %s before re-upload", label, blockID)
+	return true, nil
+}
+
+func retrySeafHTTPBlockMaterialization(label, blockID string, store func() error, materialize func() error, resolveFence func() (bool, error)) error {
+	attempts := v2.RetryAttempts()
+	if attempts < 1 {
+		attempts = 1
+	}
+
+	for attempt := 1; attempt <= attempts; attempt++ {
+		if err := store(); err != nil {
+			return err
+		}
+		if err := materialize(); err != nil {
+			if !errors.Is(err, v2.ErrBlockDeleteInProgress) || attempt == attempts {
+				return err
+			}
+			if resolveFence != nil {
+				resolved, resolveErr := resolveFence()
+				if resolveErr != nil {
+					log.Printf("[%s] failed to clear stale S3 orphan fence for block %s: %v", label, blockID, resolveErr)
+				} else if resolved {
+					continue
+				}
+			}
+			sleepFor := seafHTTPBlockMaterializationRetryBackoffFn(attempt)
+			log.Printf("[%s] block %s is fenced by GC delete during materialization; retrying (%d/%d) after %s", label, blockID, attempt, attempts, sleepFor)
+			if sleepFor > 0 {
+				seafHTTPBlockMaterializationSleepFn(sleepFor)
+			}
+			continue
+		}
+		return nil
+	}
+
+	return fmt.Errorf("%w: exhausted SeafHTTP block materialization retry budget for block %s", v2.ErrBlockDeleteInProgress, blockID)
 }
 
 // Upload-finalize retries share v2.RetryBackoff for the per-attempt delay
@@ -1716,10 +1804,6 @@ readLoop:
 				return nil
 			}
 
-			if _, putErr := putUploadedBlockAutoFn(egCtx, blockStore, sha256ID, storedBlock); putErr != nil {
-				return fmt.Errorf("failed to store block: %w", putErr)
-			}
-
 			releaseMetadataPermit, permitErr := acquireFinalizeUploadBlockMetadataPermit(egCtx)
 			if permitErr != nil {
 				return permitErr
@@ -1727,7 +1811,17 @@ readLoop:
 			defer releaseMetadataPermit()
 
 			if blkErr := upload.AccountBlockOnce(blockIndexLocal, sha256ID, func() error {
-				return registerUploadedBlockAndMappingForUploadFn(h.db, token.OrgID, token.RepoID, sha256ID, token.Token, len(storedBlock), actualStorageClass, "", blockSHA1IDLocal)
+				return retrySeafHTTPBlockMaterialization("finalizeUploadStreaming", sha256ID, func() error {
+					_, putErr := putUploadedBlockAutoFn(egCtx, blockStore, sha256ID, storedBlock)
+					if putErr != nil {
+						return fmt.Errorf("failed to store block: %w", putErr)
+					}
+					return nil
+				}, func() error {
+					return registerUploadedBlockAndMappingForUploadFn(h.db, token.OrgID, token.RepoID, sha256ID, token.Token, len(storedBlock), actualStorageClass, "", blockSHA1IDLocal)
+				}, func() (bool, error) {
+					return clearSeafHTTPS3OrphanFenceFn(egCtx, h.db, h.storageManager, "finalizeUploadStreaming", token.OrgID, sha256ID)
+				})
 			}); blkErr != nil {
 				if errors.Is(blkErr, v2.ErrBlockMappingWriteFailed) {
 					log.Printf("[finalizeUploadStreaming] CRITICAL: Failed to write block_id_mapping org=%s ext=%s int=%s: %v", token.OrgID, blockSHA1IDLocal[:16], sha256ID[:16], blkErr)
