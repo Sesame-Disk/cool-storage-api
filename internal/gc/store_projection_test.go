@@ -39,6 +39,45 @@ func TestStore_EnsureBlockGCCandidate_RepairsMissingProjection(t *testing.T) {
 	}
 }
 
+func TestStore_EnsureBlockGCCandidate_PrefersEarlierCandidateAt(t *testing.T) {
+	store := NewMockStore()
+	orgID := uuid.New()
+	later := time.Now().Add(48 * time.Hour).UTC().Truncate(time.Millisecond)
+	earlier := later.Add(-24 * time.Hour).UTC().Truncate(time.Millisecond)
+
+	store.AddBlockGCCandidate(orgID, "block-earlier", "hot", later)
+
+	effectiveCandidateAt, err := store.EnsureBlockGCCandidate(orgID, "block-earlier", "cold", earlier)
+	if err != nil {
+		t.Fatalf("EnsureBlockGCCandidate failed: %v", err)
+	}
+	if !effectiveCandidateAt.Equal(earlier) {
+		t.Fatalf("effective candidate_at = %v, want %v", effectiveCandidateAt, earlier)
+	}
+
+	olderDayCandidates, err := store.ListBlockGCCandidatesByDay(earlier, db.GCDiscoveryBucket(orgID.String(), "block-earlier"))
+	if err != nil {
+		t.Fatalf("ListBlockGCCandidatesByDay(earlier) failed: %v", err)
+	}
+	if len(olderDayCandidates) != 1 {
+		t.Fatalf("expected 1 earlier candidate row, got %d", len(olderDayCandidates))
+	}
+	if !olderDayCandidates[0].CandidateAt.Equal(earlier) {
+		t.Fatalf("earlier projection candidate_at = %v, want %v", olderDayCandidates[0].CandidateAt, earlier)
+	}
+	if olderDayCandidates[0].StorageClass != "hot" {
+		t.Fatalf("earlier projection storage_class = %q, want %q", olderDayCandidates[0].StorageClass, "hot")
+	}
+
+	laterDayCandidates, err := store.ListBlockGCCandidatesByDay(later, db.GCDiscoveryBucket(orgID.String(), "block-earlier"))
+	if err != nil {
+		t.Fatalf("ListBlockGCCandidatesByDay(later) failed: %v", err)
+	}
+	if len(laterDayCandidates) != 0 {
+		t.Fatalf("expected stale later projection to be removed, got %d rows", len(laterDayCandidates))
+	}
+}
+
 func TestStore_RecordS3Orphan_RepairsMissingProjectionAndPreservesFirstSeenAt(t *testing.T) {
 	store := NewMockStore()
 	orgID := uuid.New()

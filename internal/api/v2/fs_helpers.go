@@ -84,8 +84,16 @@ var registerUploadedBlockUpsertMetadataFn = func(h *FSHelper, orgID, blockID str
 	return h.db.UpsertBlockMetadata(orgID, blockID, sizeBytes, storageClass, storageKey)
 }
 
+var registerUploadedBlockUpsertProvisionalExpiryFn = func(h *FSHelper, orgID, blockID, referrer, storageClass string, expiresAt time.Time) error {
+	return h.db.UpsertProvisionalBlockReferenceExpiry(orgID, blockID, referrer, storageClass, expiresAt)
+}
+
 var registerUploadedBlockReleaseRefsFn = func(h *FSHelper, orgID, libraryID, operationID string, blockIDs []string) []string {
 	return h.ReleaseUploadReferences(orgID, libraryID, operationID, blockIDs)
+}
+
+var releaseUploadReferenceDeleteExpiryFn = func(h *FSHelper, orgID, blockID, referrer string) error {
+	return h.db.DeleteProvisionalBlockReferenceExpiry(orgID, blockID, referrer, time.Time{})
 }
 
 var registerUploadedBlockRetryAttemptsFn = RetryAttempts
@@ -928,9 +936,15 @@ func (h *FSHelper) resolveStoredBlockIDs(orgID string, blockIDs []string) ([]str
 // newly-zero-ref block for GC before returning a retryable error.
 func (h *FSHelper) RegisterUploadedBlock(orgID, libraryID, blockID, operationID string, sizeBytes int, storageClass, storageKey string) error {
 	referrer := db.BlockReferrerForUpload(operationID)
+	expiresAt := time.Now().UTC().Add(time.Duration(db.ProvisionalBlockReferenceTTLSeconds) * time.Second)
 
 	if err := registerUploadedBlockAddReferenceFn(h, orgID, blockID, referrer, libraryID, db.ProvisionalBlockReferenceTTLSeconds); err != nil {
 		return fmt.Errorf("add provisional block reference for %s: %w", blockID, err)
+	}
+	if err := registerUploadedBlockUpsertProvisionalExpiryFn(h, orgID, blockID, referrer, storageClass, expiresAt); err != nil {
+		zeroRefBlocks := registerUploadedBlockReleaseRefsFn(h, orgID, libraryID, operationID, []string{blockID})
+		registerUploadedBlockEnqueueZeroRefFn(orgID, zeroRefBlocks, storageClass)
+		return fmt.Errorf("record provisional block expiry for %s: %w", blockID, err)
 	}
 
 	attempts := registerUploadedBlockRetryAttemptsFn()
@@ -1032,6 +1046,9 @@ func (h *FSHelper) ReleaseUploadReferences(orgID, libraryID, operationID string,
 		if err := h.db.RemoveBlockReference(orgID, blockID, referrer); err != nil {
 			log.Printf("[ReleaseUploadReferences] WARNING: failed to remove provisional reference for block %s: %v", blockID, err)
 			continue
+		}
+		if err := releaseUploadReferenceDeleteExpiryFn(h, orgID, blockID, referrer); err != nil {
+			log.Printf("[ReleaseUploadReferences] WARNING: failed to delete provisional expiry tracker for block %s: %v", blockID, err)
 		}
 		hasRefs, err := h.db.BlockHasReferences(orgID, blockID)
 		if err != nil {

@@ -63,6 +63,16 @@ func uploadFileThroughLinkWithReplaceField(t *testing.T, c *testClient, uploadUR
 	}
 }
 
+func assertNoUploadReferrers(t *testing.T, repoID, dirPath, fileName string) {
+	t.Helper()
+	referrers := uploadedFileBlockReferrers(t, repoID, dirPath, fileName)
+	for _, referrer := range referrers {
+		if strings.HasPrefix(referrer, "up:") {
+			t.Fatalf("block referrers leaked provisional upload ref: %v", referrers)
+		}
+	}
+}
+
 // TestUploadAndDownloadRoundTrip simulates the full frontend upload/download flow:
 //
 //  1. Create library
@@ -76,7 +86,7 @@ func TestUploadAndDownloadRoundTrip(t *testing.T) {
 	name := fmt.Sprintf("inttest-updown-%d", time.Now().UnixNano())
 	repoID := createTestLibrary(t, adminClient, name)
 
-	fileContent := "Hello from integration test! This is test content for upload/download verification.\n"
+	fileContent := fmt.Sprintf("Hello from integration test! This is test content for upload/download verification. repo=%s\n", repoID)
 	fileName := "roundtrip-test.txt"
 
 	// Step 1: Get upload link
@@ -196,6 +206,8 @@ func TestUploadAndDownloadRoundTrip(t *testing.T) {
 			t.Log("content matches — full round-trip verified")
 		}
 	})
+
+	assertNoUploadReferrers(t, repoID, "/", fileName)
 }
 
 func TestChunkedUploadAndDownloadRoundTrip(t *testing.T) {
@@ -204,7 +216,7 @@ func TestChunkedUploadAndDownloadRoundTrip(t *testing.T) {
 	uploadURL := getUploadURL(t, adminClient, repoID)
 
 	fileName := "chunked-roundtrip.txt"
-	fileContent := []byte(strings.Repeat("chunked roundtrip content ", 32) + "done\n")
+	fileContent := []byte(strings.Repeat("chunked roundtrip content "+repoID+" ", 32) + "done\n")
 	chunkStarts := []int{0, 173, 347, 521}
 
 	for index, start := range chunkStarts {
@@ -262,6 +274,8 @@ func TestChunkedUploadAndDownloadRoundTrip(t *testing.T) {
 	if !bytes.Equal(downloadedContent, fileContent) {
 		t.Fatalf("chunked downloaded content mismatch: got %d bytes, want %d", len(downloadedContent), len(fileContent))
 	}
+
+	assertNoUploadReferrers(t, repoID, "/", fileName)
 }
 
 func TestEncryptedUploadAndDownloadRoundTrip(t *testing.T) {
@@ -709,7 +723,8 @@ func TestGuestCannotUpload(t *testing.T) {
 }
 
 // TestV2DirectUploadRoundTrip verifies the POST /api/v2.1/repos/:id/upload endpoint:
-// the file must appear in the directory listing and the block ref_count must be 1 after upload.
+// the file must appear in the directory listing and the uploaded block must end
+// with exactly one permanent fs: ref and no lingering provisional up: refs.
 func TestV2DirectUploadRoundTrip(t *testing.T) {
 	name := fmt.Sprintf("inttest-v2upload-%d", time.Now().UnixNano())
 	repoID := createTestLibrary(t, adminClient, name)
@@ -776,4 +791,5 @@ func TestV2DirectUploadRoundTrip(t *testing.T) {
 	if refCount := readBlockRefCount(t, orgID, blockID); refCount != 1 {
 		t.Fatalf("references after v2 upload = %d, want 1", refCount)
 	}
+	assertNoUploadReferrers(t, repoID, "/", fileName)
 }

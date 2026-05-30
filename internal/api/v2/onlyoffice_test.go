@@ -14,6 +14,7 @@ import (
 	"github.com/Sesame-Disk/sesamefs/internal/crypto"
 	"github.com/Sesame-Disk/sesamefs/internal/db"
 	"github.com/Sesame-Disk/sesamefs/internal/storage"
+	"github.com/Sesame-Disk/sesamefs/internal/traffic"
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
@@ -166,6 +167,72 @@ func TestCleanupOnlyOfficeFailedPublishAttempt_JoinsRepairCleanupAndQueueClear(t
 	}
 }
 
+func TestFinalizeSuccessfulOnlyOfficeEdit_ReleasesProvisionalRefBeforeCleanup(t *testing.T) {
+	oldRelease := onlyOfficeReleaseUploadedBlockRefsFn
+	oldDelete := onlyOfficeDeletePendingBlockFn
+	oldAdjust := onlyOfficeAdjustStorageCountersFn
+	t.Cleanup(func() {
+		onlyOfficeReleaseUploadedBlockRefsFn = oldRelease
+		onlyOfficeDeletePendingBlockFn = oldDelete
+		onlyOfficeAdjustStorageCountersFn = oldAdjust
+	})
+
+	h := &OnlyOfficeHandler{}
+	var calls []string
+	onlyOfficeReleaseUploadedBlockRefsFn = func(database *db.DB, orgID, repoID, operationID string, blockIDs []string) {
+		calls = append(calls, "release")
+		if orgID != "org-1" || repoID != "repo-1" || operationID != "rollback-1" {
+			t.Fatalf("release args = %s/%s/%s, want org-1/repo-1/rollback-1", orgID, repoID, operationID)
+		}
+		if len(blockIDs) != 1 || blockIDs[0] != "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" {
+			t.Fatalf("release blockIDs = %#v, want the internal block id", blockIDs)
+		}
+	}
+	onlyOfficeDeletePendingBlockFn = func(handler *OnlyOfficeHandler, orgID, operationID string) error {
+		calls = append(calls, "delete")
+		if handler != h {
+			t.Fatal("delete should receive the same handler")
+		}
+		if orgID != "org-1" || operationID != "rollback-1" {
+			t.Fatalf("delete args = %s/%s, want org-1/rollback-1", orgID, operationID)
+		}
+		return nil
+	}
+	onlyOfficeAdjustStorageCountersFn = func(database traffic.DBSession, orgID, userID, repoID string, deltaBytes, deltaFiles int64) error {
+		calls = append(calls, "traffic")
+		if orgID != "org-1" || userID != "user-1" || repoID != "repo-1" {
+			t.Fatalf("traffic args = %s/%s/%s, want org-1/user-1/repo-1", orgID, userID, repoID)
+		}
+		if deltaBytes != 123 || deltaFiles != 1 {
+			t.Fatalf("traffic deltas = %d/%d, want 123/1", deltaBytes, deltaFiles)
+		}
+		return nil
+	}
+
+	h.finalizeSuccessfulOnlyOfficeEdit(
+		"org-1",
+		"repo-1",
+		"user-1",
+		"rollback-1",
+		"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+		"/docs/test.docx",
+		"0123456789abcdef0123456789abcdef01234567",
+		"0123456789abcdef0123456789abcdef01234567",
+		123,
+		1,
+	)
+
+	want := []string{"release", "delete", "traffic"}
+	if len(calls) != len(want) {
+		t.Fatalf("calls = %#v, want %#v", calls, want)
+	}
+	for i := range want {
+		if calls[i] != want[i] {
+			t.Fatalf("calls[%d] = %q, want %q (full=%#v)", i, calls[i], want[i], calls)
+		}
+	}
+}
+
 func TestResolveOnlyOfficeServerURL(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
@@ -312,6 +379,34 @@ func TestWriteBlockIDMappingDualWrite(t *testing.T) {
 			t.Fatalf("error = %v, want %v", err, wantErr)
 		}
 		want := []string{"forward", "reverse", "rollback"}
+		if len(calls) != len(want) {
+			t.Fatalf("call count = %d, want %d (%v)", len(calls), len(want), calls)
+		}
+		for i := range want {
+			if calls[i] != want[i] {
+				t.Fatalf("calls[%d] = %q, want %q (full=%v)", i, calls[i], want[i], calls)
+			}
+		}
+	})
+
+	t.Run("preserves forward mapping when rollback is nil", func(t *testing.T) {
+		calls := make([]string, 0, 2)
+		wantErr := errors.New("reverse failed")
+		err := db.WriteBlockIDMappingDualWrite(
+			func() error {
+				calls = append(calls, "forward")
+				return nil
+			},
+			nil,
+			func() error {
+				calls = append(calls, "reverse")
+				return wantErr
+			},
+		)
+		if !errors.Is(err, wantErr) {
+			t.Fatalf("error = %v, want %v", err, wantErr)
+		}
+		want := []string{"forward", "reverse"}
 		if len(calls) != len(want) {
 			t.Fatalf("call count = %d, want %d (%v)", len(calls), len(want), calls)
 		}

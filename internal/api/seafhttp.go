@@ -1357,6 +1357,7 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 		writeSeafHTTPUploadError(c, err, "file stored but metadata update failed")
 		return
 	}
+	releaseUploadedBlockRefsFn(h.db, token.OrgID, token.RepoID, token.Token, []string{sha256ID})
 	log.Printf("[HandleUpload] Filesystem updated, commit=%s", commitID)
 
 	log.Printf("[HandleUpload] Upload complete: file=%s, size=%d, id=%s", actualFilename, finalSize, fileID[:16])
@@ -1387,6 +1388,8 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 var errStorageQuotaExceeded = errors.New("storage quota exceeded")
 
 var rollbackUploadedBlockRefsFn = v2.RollbackUploadedBlockRefs
+
+var releaseUploadedBlockRefsFn = v2.ReleaseUploadedBlockRefs
 
 var zipBatchResolveBlockIDsFn = streaming.BatchResolveBlockIDs
 
@@ -1747,6 +1750,7 @@ readLoop:
 	if err != nil {
 		return "", "", 0, 0, fmt.Errorf("failed to update filesystem metadata: %w", err)
 	}
+	releaseUploadedBlockRefsFn(h.db, token.OrgID, token.RepoID, token.Token, upload.AccountedBlockIDs())
 	log.Printf("[finalizeUploadStreaming] Filesystem updated, commit=%s", commitID)
 
 	return fileID, actualFilename, storageDeltaBytes, storageDeltaFiles, nil

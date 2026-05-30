@@ -50,6 +50,14 @@ var onlyOfficeCleanupFailedPublishAttemptFn = func(database *db.DB, orgID, repoI
 
 var onlyOfficeClearPendingPublishedFileRepairsFn = clearPendingPublishedFileRepairs
 
+var onlyOfficeReleaseUploadedBlockRefsFn = ReleaseUploadedBlockRefs
+
+var onlyOfficeDeletePendingBlockFn = func(h *OnlyOfficeHandler, orgID, operationID string) error {
+	return h.deleteOnlyOfficePendingBlock(orgID, operationID)
+}
+
+var onlyOfficeAdjustStorageCountersFn = traffic.AdjustStorageCountersByDeltaSync
+
 func cleanupOnlyOfficeFailedPublishAttempt(database *db.DB, orgID, repoID, commitID string, pendingFiles []*pendingPublishedFile) error {
 	blockIDs := pendingPublishedFileInternalBlockIDs(pendingFiles)
 	cleanupErr := onlyOfficeCleanupFailedPublishAttemptFn(database, orgID, repoID, commitID, blockIDs)
@@ -1250,16 +1258,22 @@ func (h *OnlyOfficeHandler) saveEditedDocument(ctx context.Context, repoID, file
 		return err
 	}
 
-	if err := h.deleteOnlyOfficePendingBlock(orgID, rollbackID); err != nil {
+	h.finalizeSuccessfulOnlyOfficeEdit(orgID, repoID, userID, rollbackID, internalBlockID, filePath, externalBlockID, newCommitID, storageDeltaBytes, storageDeltaFiles)
+	return nil
+}
+
+func (h *OnlyOfficeHandler) finalizeSuccessfulOnlyOfficeEdit(orgID, repoID, userID, rollbackID, internalBlockID, filePath, externalBlockID, newCommitID string, storageDeltaBytes, storageDeltaFiles int64) {
+	onlyOfficeReleaseUploadedBlockRefsFn(h.db, orgID, repoID, rollbackID, []string{internalBlockID})
+
+	if err := onlyOfficeDeletePendingBlockFn(h, orgID, rollbackID); err != nil {
 		log.Printf("OnlyOffice: failed to clear pending block cleanup %s after publish success: %v", rollbackID, err)
 	}
 
-	if err := traffic.AdjustStorageCountersByDeltaSync(h.db, orgID, userID, repoID, storageDeltaBytes, storageDeltaFiles); err != nil {
+	if err := onlyOfficeAdjustStorageCountersFn(h.db, orgID, userID, repoID, storageDeltaBytes, storageDeltaFiles); err != nil {
 		log.Printf("OnlyOffice: failed to apply storage counter delta for %s: %v", filePath, err)
 	}
 
 	log.Printf("OnlyOffice: saved document %s with block %s (internal: %s), new commit %s", filePath, externalBlockID[:16], internalBlockID[:16], newCommitID)
-	return nil
 }
 
 func (h *OnlyOfficeHandler) publishEditedDocumentMetadata(fsHelper *FSHelper, orgID, repoID, filePath, filename, userID string, originalFileSize int64, externalBlockID, pendingOperationID string) (int64, int64, string, error) {

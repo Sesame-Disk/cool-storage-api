@@ -178,6 +178,50 @@ The code path is corrected, but the current tree still lacks a real Cassandra re
 
 ---
 
+## 22. SeafHTTP Publish-Attempt ID Resolution Mismatch (DEFERRED)
+
+### Current State
+The direct SeafHTTP finalize paths still call `db.StagePublishAttemptReferences(..., nil)` and queue durable publish-repair rows with external SHA-1 block IDs. Block liveness itself lives on internal SHA-256 IDs.
+
+The current code is not in the highest-risk state anymore because:
+- successful provisional-ref writers (direct uploads, SeafHTTP, sync, and OnlyOffice edits) keep the `up:` ref alive until publish finishes, then release it on success while the GC scanner recovers abandoned refs by per-referrer expiry;
+- permanent `fs:` refs are still added through `RegisterFSObjectBlockReferences`, which resolves external IDs before writing liveness rows.
+
+### Why It Was Deferred
+This mismatch is now a contract / cleanup gap, not the top merge blocker. The main correctness blockers in this branch were the destructive mapping rollback, partial `pub:` stage leak, and abandoned-upload recovery gap. Those are now addressed via forward-mapping preservation, partial-stage rollback cleanup, and per-referrer provisional-expiry tracking plus success-path `up:` ref release.
+
+### Follow-Up Plan
+1. Resolve SeafHTTP single-shot and multiblock finalize inputs to internal SHA-256 IDs before calling `StagePublishAttemptReferences`.
+2. Queue durable publish-repair rows with those resolved internal IDs, matching the v2/sync contract.
+3. Keep the permanent `fs:` registration path unchanged so external block IDs in `fs_objects` remain backward-compatible.
+4. Re-run focused SeafHTTP finalize tests plus publish-repair integration coverage.
+
+### Regression Tests To Keep
+- `TestCreateOfficeFileLeavesNoPublishAttemptRefs`
+- `TestSyncRecvFSBeforePutBlockPublishesDownloadableFile`
+- `TestConcurrentV2UploadsNoLostCommits`
+
+---
+
+## 23. Row-Per-Reference Schema / Docs Cleanup (DEFERRED)
+
+### Current State
+The live code now uses row-per-reference block liveness, but some bootstrap/schema and documentation surfaces still describe the old `ref_count` / `gc_processed_items` world:
+- `internal/db/migrations/001_initial_schema.cql` still defines `gc_processed_items`;
+- `docs/GC-SERVICE-ANALYSIS.md` still documents the old ref-count/LWT delete flow;
+- parts of `docs/DATABASE-GUIDE.md` still mention `gc_processed_items` as the active idempotency mechanism.
+
+### Why It Was Deferred
+This branch prioritized correctness fixes in active code paths. Schema/bootstrap cleanup must also respect the migration checksum rule: already-applied migration files cannot be rewritten in place for existing environments.
+
+### Follow-Up Plan
+1. Remove dead bootstrap tables with a new numbered migration instead of editing `001_initial_schema.cql` in place.
+2. Rewrite stale GC / block-liveness documentation to describe `block_references`, delete fences, and S3 orphan recovery as the canonical model.
+3. Audit diagrams and any remaining `ref_count` references so docs match the running code.
+4. Re-run the focused GC / upload / publish tests after the cleanup branch to catch accidental drift.
+
+---
+
 ## 5. Web Upload Pipeline Follow-Ups (PENDING)
 
 ### Current State

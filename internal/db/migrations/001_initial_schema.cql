@@ -285,9 +285,10 @@ CREATE TABLE IF NOT EXISTS blocks (
 -- INSERT/DELETE are idempotent and need no LWT in steady state — expensive Paxos
 -- is reserved for the GC worker's final claim before deleting from S3.
 --   referrer = "fs:<library_id>:<fs_id>"   permanent: an fs_object containing the block
---   referrer = "up:<upload_token>"         provisional: an in-flight upload (written
---                                          with USING TTL so an abandoned upload cannot
---                                          leak the block forever)
+--   referrer = "up:<upload_token>"         provisional: an in-flight upload. The
+--                                          live ref is released explicitly on success;
+--                                          abandoned uploads are recovered via
+--                                          gc_provisional_block_refs* expiry tables.
 -- Per-(org, block) partition mirrors `blocks`, so a block's reference rows and its
 -- metadata never contend with another block's traffic.
 CREATE TABLE IF NOT EXISTS block_references (
@@ -322,6 +323,32 @@ CREATE TABLE IF NOT EXISTS gc_block_candidates_by_day (
     storage_class TEXT,
     PRIMARY KEY ((candidate_day, bucket), candidate_at, org_id, block_id)
 ) WITH CLUSTERING ORDER BY (candidate_at ASC, org_id ASC, block_id ASC);
+
+-- Tracks one cleanup deadline per provisional upload referrer so abandoned
+-- uploads can be recovered one `up:` row at a time without injecting still-live
+-- blocks into `gc_block_candidates`.
+CREATE TABLE IF NOT EXISTS gc_provisional_block_refs (
+    org_id        TEXT,
+    block_id      TEXT,
+    referrer      TEXT,
+    storage_class TEXT,
+    expires_at    TIMESTAMP,
+    PRIMARY KEY ((org_id, block_id), referrer)
+);
+
+-- Discovery projection for `gc_provisional_block_refs`: partition by
+-- (expiry_day, bucket) so the GC scanner can enumerate expired provisional
+-- refs without scanning canonical block partitions.
+CREATE TABLE IF NOT EXISTS gc_provisional_block_refs_by_day (
+    expiry_day    DATE,
+    bucket        INT,
+    expires_at    TIMESTAMP,
+    org_id        TEXT,
+    block_id      TEXT,
+    referrer      TEXT,
+    storage_class TEXT,
+    PRIMARY KEY ((expiry_day, bucket), expires_at, org_id, block_id, referrer)
+) WITH CLUSTERING ORDER BY (expires_at ASC, org_id ASC, block_id ASC, referrer ASC);
 
 -- SHA-1 (external/Seafile client) → SHA-256 (internal) content-address mapping.
 -- Per-(org, external) partition so concurrent uploads of different content

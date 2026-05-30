@@ -129,6 +129,20 @@ func AddDeleteBlockGCCandidateDiscoveryQuery(batch *gocql.Batch, orgID, blockID 
 	`, GCProjectionUTCDate(candidateAt), GCDiscoveryBucket(orgID, blockID), candidateAt.UTC(), orgID, blockID)
 }
 
+func AddUpsertProvisionalBlockRefExpiryDiscoveryQuery(batch *gocql.Batch, orgID, blockID, referrer, storageClass string, expiresAt time.Time) {
+	batch.Query(`
+		INSERT INTO gc_provisional_block_refs_by_day (expiry_day, bucket, expires_at, org_id, block_id, referrer, storage_class)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+	`, GCProjectionUTCDate(expiresAt), GCDiscoveryBucket(orgID, blockID, referrer), expiresAt.UTC(), orgID, blockID, referrer, storageClass)
+}
+
+func AddDeleteProvisionalBlockRefExpiryDiscoveryQuery(batch *gocql.Batch, orgID, blockID, referrer string, expiresAt time.Time) {
+	batch.Query(`
+		DELETE FROM gc_provisional_block_refs_by_day
+		WHERE expiry_day = ? AND bucket = ? AND expires_at = ? AND org_id = ? AND block_id = ? AND referrer = ?
+	`, GCProjectionUTCDate(expiresAt), GCDiscoveryBucket(orgID, blockID, referrer), expiresAt.UTC(), orgID, blockID, referrer)
+}
+
 func AddUpsertS3OrphanDiscoveryQuery(batch *gocql.Batch, orgID, blockID, storageClass string, firstSeenAt time.Time) {
 	batch.Query(`
 		INSERT INTO gc_s3_orphans_by_day (first_seen_day, bucket, first_seen_at, org_id, block_id, storage_class)

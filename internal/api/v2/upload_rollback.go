@@ -21,11 +21,7 @@ var writeBlockMappingForMaterializationFn = func(database *db.DB, orgID, externa
 	return database.WriteBlockIDMapping(orgID, externalBlockID, internalBlockID, time.Time{})
 }
 
-// RollbackUploadedBlockRefs releases the provisional upload references for an
-// aborted upload's blocks and enqueues any that became unreferenced for GC.
-// It is idempotent (removing a missing reference is a no-op), so a retried
-// rollback is always safe.
-func RollbackUploadedBlockRefs(database *db.DB, orgID, repoID, operationID string, blockIDs []string) {
+func releaseUploadedBlockRefs(database *db.DB, orgID, repoID, operationID string, blockIDs []string, logPrefix string) {
 	if database == nil || len(blockIDs) == 0 {
 		return
 	}
@@ -33,8 +29,22 @@ func RollbackUploadedBlockRefs(database *db.DB, orgID, repoID, operationID strin
 	if len(zeroRefBlocks) == 0 {
 		return
 	}
-	log.Printf("[uploadRollback] INFO: rollback released %d blocks to zero refs", len(zeroRefBlocks))
+	log.Printf("[%s] INFO: released %d blocks to zero refs", logPrefix, len(zeroRefBlocks))
 	enqueueZeroRefBlocks(database, orgID, repoID, zeroRefBlocks)
+}
+
+// ReleaseUploadedBlockRefs releases provisional upload refs after a successful
+// publish path has created the permanent fs: refs.
+func ReleaseUploadedBlockRefs(database *db.DB, orgID, repoID, operationID string, blockIDs []string) {
+	releaseUploadedBlockRefs(database, orgID, repoID, operationID, blockIDs, "uploadRelease")
+}
+
+// RollbackUploadedBlockRefs releases the provisional upload references for an
+// aborted upload's blocks and enqueues any that became unreferenced for GC.
+// It is idempotent (removing a missing reference is a no-op), so a retried
+// rollback is always safe.
+func RollbackUploadedBlockRefs(database *db.DB, orgID, repoID, operationID string, blockIDs []string) {
+	releaseUploadedBlockRefs(database, orgID, repoID, operationID, blockIDs, "uploadRollback")
 }
 
 // RegisterUploadedBlockAndMapping materializes an uploaded block in Cassandra by

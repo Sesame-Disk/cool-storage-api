@@ -72,6 +72,14 @@ var publishAttemptPromotionSleepFn = time.Sleep
 
 var removePublishAttemptReferencesForPromotionFn = RemovePublishAttemptReferences
 
+var addPublishAttemptReferenceFn = func(database *DB, orgID, blockID, referrer, repoID string) error {
+	return database.AddBlockReference(orgID, blockID, referrer, repoID, 0)
+}
+
+var removePublishAttemptReferenceFn = func(database *DB, orgID, blockID, referrer string) error {
+	return database.RemoveBlockReference(orgID, blockID, referrer)
+}
+
 func publishAttemptPromotionRetryBackoff(attempt int) time.Duration {
 	if attempt < 1 || publishAttemptPromotionRetryDelay <= 0 {
 		return 0
@@ -127,14 +135,18 @@ func NormalizeBlockIDs(blockIDs []string) []string {
 }
 
 // WriteBlockIDMappingDualWrite executes the forward mapping write, the reverse
-// write, and a compensating rollback of the forward write if the reverse side
-// fails. This keeps the two mapping tables logically in sync even when callers
-// cannot wrap both writes in a single logged batch with the same key shape.
+// write, and optionally a compensating rollback of the forward write if the
+// reverse side fails. Passing a nil rollback keeps the forward row in place,
+// which is safer for caller-visible SHA-1 resolution than deleting a mapping
+// that another concurrent writer may already rely on.
 func WriteBlockIDMappingDualWrite(writeForward func() error, rollbackForward func() error, writeReverse func() error) error {
 	if err := writeForward(); err != nil {
 		return err
 	}
 	if err := writeReverse(); err != nil {
+		if rollbackForward == nil {
+			return err
+		}
 		if rollbackErr := rollbackForward(); rollbackErr != nil {
 			return errors.Join(err, fmt.Errorf("rollback forward block mapping: %w", rollbackErr))
 		}
@@ -144,8 +156,11 @@ func WriteBlockIDMappingDualWrite(writeForward func() error, rollbackForward fun
 }
 
 // WriteBlockIDMapping dual-writes the external SHA-1 -> internal SHA-256 mapping
-// plus the reverse lookup row used by GC cleanup. Reverse-write failures roll
-// back the forward row so callers never leave a half-written mapping behind.
+// plus the reverse lookup row used by GC cleanup. Reverse-write failures do NOT
+// delete the forward row: client-visible SHA-1 resolution depends on that row,
+// and deleting it after a partial failure can clobber a mapping that another
+// concurrent writer has already made valid. Callers still fail closed so a
+// later retry can heal the reverse lookup.
 func (db *DB) WriteBlockIDMapping(orgID, externalID, internalID string, createdAt time.Time) error {
 	if db == nil {
 		return nil
@@ -160,12 +175,7 @@ func (db *DB) WriteBlockIDMapping(orgID, externalID, internalID string, createdA
 				INSERT INTO block_id_mappings (org_id, external_id, internal_id, created_at) VALUES (?, ?, ?, ?)
 			`, orgID, externalID, internalID, ts).Exec()
 		},
-		func() error {
-			batch := db.Session().Batch(gocql.LoggedBatch)
-			batch.Query(`DELETE FROM block_id_mappings WHERE org_id = ? AND external_id = ?`, orgID, externalID)
-			batch.Query(`DELETE FROM block_id_mappings_by_internal WHERE org_id = ? AND internal_id = ? AND external_id = ?`, orgID, internalID, externalID)
-			return batch.Exec()
-		},
+		nil,
 		func() error {
 			return db.Session().Query(`
 				INSERT INTO block_id_mappings_by_internal (org_id, internal_id, external_id, created_at) VALUES (?, ?, ?, ?)
@@ -178,16 +188,23 @@ func (db *DB) WriteBlockIDMapping(orgID, externalID, internalID string, createdA
 // in-flight metadata publish. Input IDs are normalized with TrimSpace + dedup so
 // retrying callers can safely pass repeated or padded block IDs.
 func AddPublishAttemptReferences(database *DB, orgID, repoID, attemptID string, blockIDs []string) error {
+	_, err := addPublishAttemptReferencesRows(database, orgID, repoID, attemptID, blockIDs)
+	return err
+}
+
+func addPublishAttemptReferencesRows(database *DB, orgID, repoID, attemptID string, blockIDs []string) ([]string, error) {
 	if database == nil {
-		return nil
+		return nil, nil
 	}
 	referrer := BlockReferrerForPublishAttempt(attemptID)
+	staged := make([]string, 0, len(blockIDs))
 	for _, blockID := range NormalizeBlockIDs(blockIDs) {
-		if err := database.AddBlockReference(orgID, blockID, referrer, repoID, 0); err != nil {
-			return err
+		if err := addPublishAttemptReferenceFn(database, orgID, blockID, referrer, repoID); err != nil {
+			return staged, err
 		}
+		staged = append(staged, blockID)
 	}
-	return nil
+	return staged, nil
 }
 
 // RemovePublishAttemptReferences removes temporary pub:<attempt> references. It
@@ -199,7 +216,7 @@ func RemovePublishAttemptReferences(database *DB, orgID, attemptID string, block
 	referrer := BlockReferrerForPublishAttempt(attemptID)
 	var removeErr error
 	for _, blockID := range NormalizeBlockIDs(blockIDs) {
-		if err := database.RemoveBlockReference(orgID, blockID, referrer); err != nil {
+		if err := removePublishAttemptReferenceFn(database, orgID, blockID, referrer); err != nil {
 			removeErr = errors.Join(removeErr, err)
 		}
 	}
@@ -208,6 +225,8 @@ func RemovePublishAttemptReferences(database *DB, orgID, attemptID string, block
 
 // StagePublishAttemptReferences resolves block IDs when needed, then records the
 // attempt-local pub:<attempt> rows that keep blocks alive until HEAD publish wins.
+// If a partial stage fails, this helper cleans up the rows written by this call
+// before returning so direct callers do not leak stuck publish-attempt refs.
 func StagePublishAttemptReferences(database *DB, orgID, repoID, attemptID string, blockIDs []string, resolve BlockIDResolver) ([]string, error) {
 	resolved := blockIDs
 	if resolve != nil {
@@ -218,10 +237,14 @@ func StagePublishAttemptReferences(database *DB, orgID, repoID, attemptID string
 		}
 	}
 	resolved = NormalizeBlockIDs(resolved)
-	if err := AddPublishAttemptReferences(database, orgID, repoID, attemptID, resolved); err != nil {
+	staged, err := addPublishAttemptReferencesRows(database, orgID, repoID, attemptID, resolved)
+	if err != nil {
+		if cleanupErr := RemovePublishAttemptReferences(database, orgID, attemptID, staged); cleanupErr != nil {
+			return nil, errors.Join(err, fmt.Errorf("rollback staged publish-attempt refs for %s: %w", attemptID, cleanupErr))
+		}
 		return nil, err
 	}
-	return resolved, nil
+	return staged, nil
 }
 
 // CleanupFailedPublishAttempt removes the losing commit row and its attempt-local

@@ -104,6 +104,7 @@ func (s *Scanner) ScanOnce(ctx context.Context) error {
 		name string
 		fn   func(context.Context) (int, error)
 	}{
+		{"expired_provisional_block_refs", s.scanExpiredProvisionalBlockRefs},
 		{"orphaned_blocks", s.scanOrphanedBlocks},
 		{"expired_links", s.scanExpiredShareLinks},
 		{"orphaned_commits", s.scanOrphanedCommits},
@@ -174,13 +175,107 @@ func (s *Scanner) scanPendingStorageCounterReconciliation(ctx context.Context) (
 	return 0, nil
 }
 
+// scanExpiredProvisionalBlockRefs expires abandoned provisional upload refs by
+// specific referrer. If removing the expired ref drops the block to zero refs,
+// the block is promoted into gc_block_candidates; otherwise only the expiry
+// tracker is removed.
+func (s *Scanner) scanExpiredProvisionalBlockRefs(ctx context.Context) (int, error) {
+	log.Println("[GC Scanner] Phase 0: Scanning for expired provisional upload refs...")
+
+	now := time.Now().UTC()
+	cutoffDay := db.GCProjectionUTCDate(now)
+	startDay, err := s.loadProvisionalBlockRefsStartDay(cutoffDay)
+	if err != nil {
+		return 0, err
+	}
+	if startDay.After(cutoffDay) {
+		log.Printf("[GC Scanner] Phase 0 complete: cursor ahead of cutoff, nothing to scan")
+		metrics.GCScannerLastPhaseRun.WithLabelValues("expired_provisional_block_refs").SetToCurrentTime()
+		return 0, nil
+	}
+
+	cleaned := 0
+	var phaseErr error
+	for day := startDay; !day.After(cutoffDay); day = day.AddDate(0, 0, 1) {
+		for bucket := 0; bucket < db.GCDiscoveryBucketCount; bucket++ {
+			select {
+			case <-ctx.Done():
+				return cleaned, ctx.Err()
+			default:
+			}
+
+			expiries, err := s.store.ListProvisionalBlockRefExpiriesByDay(day, bucket)
+			if err != nil {
+				log.Printf("[GC Scanner] Phase 0: failed to list provisional expiries for day=%s bucket=%d: %v", db.GCProjectionDateString(day), bucket, err)
+				if phaseErr == nil {
+					phaseErr = fmt.Errorf("list provisional expiries for day=%s bucket=%d: %w", db.GCProjectionDateString(day), bucket, err)
+				}
+				continue
+			}
+
+			for _, expiry := range expiries {
+				if expiry.ExpiresAt.After(now) {
+					continue
+				}
+				if err := s.store.RemoveBlockReference(expiry.OrgID, expiry.BlockID, expiry.Referrer); err != nil {
+					log.Printf("[GC Scanner] Phase 0: failed to remove expired provisional ref org=%s block=%s referrer=%s: %v", expiry.OrgID, expiry.BlockID, expiry.Referrer, err)
+					if phaseErr == nil {
+						phaseErr = fmt.Errorf("remove expired provisional ref org=%s block=%s referrer=%s: %w", expiry.OrgID, expiry.BlockID, expiry.Referrer, err)
+					}
+					continue
+				}
+				hasRefs, err := s.store.BlockHasReferences(expiry.OrgID, expiry.BlockID)
+				if err != nil {
+					log.Printf("[GC Scanner] Phase 0: failed to check block refs after provisional expiry org=%s block=%s referrer=%s: %v", expiry.OrgID, expiry.BlockID, expiry.Referrer, err)
+					if phaseErr == nil {
+						phaseErr = fmt.Errorf("check refs after provisional expiry org=%s block=%s referrer=%s: %w", expiry.OrgID, expiry.BlockID, expiry.Referrer, err)
+					}
+					continue
+				}
+				if !hasRefs {
+					if _, err := s.store.EnsureBlockGCCandidate(expiry.OrgID, expiry.BlockID, expiry.StorageClass, expiry.ExpiresAt); err != nil {
+						log.Printf("[GC Scanner] Phase 0: failed to promote expired provisional ref org=%s block=%s into gc candidate: %v", expiry.OrgID, expiry.BlockID, err)
+						if phaseErr == nil {
+							phaseErr = fmt.Errorf("promote expired provisional ref org=%s block=%s into gc candidate: %w", expiry.OrgID, expiry.BlockID, err)
+						}
+						continue
+					}
+				}
+				if err := s.store.DeleteProvisionalBlockRefExpiry(expiry.OrgID, expiry.BlockID, expiry.Referrer, expiry.ExpiresAt); err != nil {
+					log.Printf("[GC Scanner] Phase 0: failed to delete provisional expiry tracker org=%s block=%s referrer=%s: %v", expiry.OrgID, expiry.BlockID, expiry.Referrer, err)
+					if phaseErr == nil {
+						phaseErr = fmt.Errorf("delete provisional expiry tracker org=%s block=%s referrer=%s: %w", expiry.OrgID, expiry.BlockID, expiry.Referrer, err)
+					}
+					continue
+				}
+				cleaned++
+			}
+		}
+	}
+
+	if phaseErr == nil {
+		newCursor := cutoffDay.AddDate(0, 0, -1)
+		if !newCursor.Before(startDay) {
+			if err := s.store.SaveGCStats(gcProvisionalBlockRefsCursorKey, db.GCProjectionDateString(newCursor)); err != nil {
+				log.Printf("[GC Scanner] Phase 0: failed to persist provisional block ref cursor: %v", err)
+				phaseErr = fmt.Errorf("persist provisional block ref cursor: %w", err)
+			}
+		}
+	}
+
+	log.Printf("[GC Scanner] Phase 0 complete: cleaned %d provisional upload refs", cleaned)
+	recordScannerAction("expired_provisional_block_refs", "cleaned", cleaned)
+	metrics.GCScannerLastPhaseRun.WithLabelValues("expired_provisional_block_refs").SetToCurrentTime()
+	return cleaned, phaseErr
+}
+
 // scanOrphanedBlocks re-enqueues zero-ref block candidates that should still
 // be in GC. Walks the `gc_block_candidates_by_day` discovery projection from a
 // persisted day cursor up to today, across all discovery buckets, instead of
 // scanning the canonical `gc_block_candidates` partition by org. The
 // per-org partition scan disappeared with the schema move to per-block
-// partitioning; the only entry point for a block into GC is now
-// EnsureBlockGCCandidate from the refcount decrement path.
+// partitioning; blocks now enter GC either from explicit zero-ref enqueue paths
+// or from the provisional-upload expiry scan above.
 func (s *Scanner) scanOrphanedBlocks(ctx context.Context) (int, error) {
 	log.Println("[GC Scanner] Phase 1: Scanning for orphaned blocks...")
 
@@ -273,6 +368,21 @@ func (s *Scanner) scanOrphanedBlocks(ctx context.Context) (int, error) {
 // candidates after a fresh deploy.
 func (s *Scanner) loadBlockCandidatesStartDay(cutoffDay time.Time) (time.Time, error) {
 	value, err := s.store.LoadGCStats(gcBlockCandidatesCursorKey)
+	if err != nil {
+		if errors.Is(err, gocql.ErrNotFound) {
+			return cutoffDay.AddDate(0, 0, -gcInitialScanLookbackDays), nil
+		}
+		return time.Time{}, err
+	}
+	lastDay, err := db.ParseGCProjectionDate(value)
+	if err != nil {
+		return time.Time{}, err
+	}
+	return lastDay.AddDate(0, 0, -gcScanOverlapDays), nil
+}
+
+func (s *Scanner) loadProvisionalBlockRefsStartDay(cutoffDay time.Time) (time.Time, error) {
+	value, err := s.store.LoadGCStats(gcProvisionalBlockRefsCursorKey)
 	if err != nil {
 		if errors.Is(err, gocql.ErrNotFound) {
 			return cutoffDay.AddDate(0, 0, -gcInitialScanLookbackDays), nil

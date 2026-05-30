@@ -141,6 +141,7 @@ const gcDeletedUsersCursorKey = "gc.scan.expired_deleted_users.last_deleted_day"
 const gcExpiredShareLinksCursorKey = "gc.scan.expired_share_links.last_expiry_day"
 const gcExpiredSharesCursorKey = "gc.scan.expired_shares.last_expiry_day"
 const gcBlockCandidatesCursorKey = "gc.scan.block_candidates.last_candidate_day"
+const gcProvisionalBlockRefsCursorKey = "gc.scan.provisional_block_refs.last_expiry_day"
 const gcS3OrphansCursorKey = "gc.scan.s3_orphans.last_first_seen_day"
 
 const (
@@ -951,6 +952,22 @@ func (s *CassandraStore) upsertBlockGCCandidateProjection(orgID uuid.UUID, block
 	`, db.GCProjectionUTCDate(candidateAt), db.GCDiscoveryBucket(orgID.String(), blockID), candidateAt.UTC(), orgID.String(), blockID, storageClass).Exec()
 }
 
+func (s *CassandraStore) moveBlockGCCandidateProjection(orgID uuid.UUID, blockID, storageClass string, fromCandidateAt, toCandidateAt time.Time) error {
+	if fromCandidateAt.Equal(toCandidateAt) {
+		return s.upsertBlockGCCandidateProjection(orgID, blockID, storageClass, toCandidateAt)
+	}
+	batch := s.db.Session().Batch(gocql.LoggedBatch)
+	batch.Query(`
+		DELETE FROM gc_block_candidates_by_day
+		WHERE candidate_day = ? AND bucket = ? AND candidate_at = ? AND org_id = ? AND block_id = ?
+	`, db.GCProjectionUTCDate(fromCandidateAt), db.GCDiscoveryBucket(orgID.String(), blockID), fromCandidateAt.UTC(), orgID.String(), blockID)
+	batch.Query(`
+		INSERT INTO gc_block_candidates_by_day (candidate_day, bucket, candidate_at, org_id, block_id, storage_class)
+		VALUES (?, ?, ?, ?, ?, ?)
+	`, db.GCProjectionUTCDate(toCandidateAt), db.GCDiscoveryBucket(orgID.String(), blockID), toCandidateAt.UTC(), orgID.String(), blockID, storageClass)
+	return batch.Exec()
+}
+
 func casStringValue(row map[string]interface{}, key string) (string, error) {
 	value, ok := row[key]
 	if !ok || value == nil {
@@ -987,38 +1004,68 @@ func casTimeValue(row map[string]interface{}, key string) (time.Time, error) {
 // EnsureBlockGCCandidate inserts a (org_id, block_id) row into the canonical
 // gc_block_candidates table if one does not already exist, and guarantees the
 // matching gc_block_candidates_by_day discovery row exists for the effective
-// candidate_at timestamp.
+// candidate_at timestamp. If a row already exists with a later candidate_at,
+// the earlier requested timestamp wins so explicit zero-ref enqueue paths are
+// not delayed behind a provisional upload's future TTL-based candidate.
 func (s *CassandraStore) EnsureBlockGCCandidate(orgID uuid.UUID, blockID, storageClass string, candidateAt time.Time) (time.Time, error) {
-	existing := map[string]interface{}{}
-	applied, err := s.db.Session().Query(`
-		INSERT INTO gc_block_candidates (org_id, block_id, storage_class, candidate_at)
-		VALUES (?, ?, ?, ?) IF NOT EXISTS
-	`, orgID.String(), blockID, storageClass, candidateAt).MapScanCAS(existing)
-	if err != nil {
-		return time.Time{}, err
-	}
 	effectiveCandidateAt := candidateAt.UTC()
-	effectiveStorageClass := storageClass
-	if !applied {
-		effectiveCandidateAt, err = casTimeValue(existing, "candidate_at")
+	if effectiveCandidateAt.IsZero() {
+		effectiveCandidateAt = time.Now().UTC()
+	}
+	for {
+		existing := map[string]interface{}{}
+		applied, err := s.db.Session().Query(`
+			INSERT INTO gc_block_candidates (org_id, block_id, storage_class, candidate_at)
+			VALUES (?, ?, ?, ?) IF NOT EXISTS
+		`, orgID.String(), blockID, storageClass, effectiveCandidateAt).MapScanCAS(existing)
 		if err != nil {
 			return time.Time{}, err
 		}
-		if effectiveCandidateAt.IsZero() {
+		if applied {
+			if err := s.upsertBlockGCCandidateProjection(orgID, blockID, storageClass, effectiveCandidateAt); err != nil {
+				return effectiveCandidateAt, fmt.Errorf("ensure gc_block_candidates_by_day discovery row for org=%s block=%s: %w", orgID, blockID, err)
+			}
+			return effectiveCandidateAt, nil
+		}
+
+		existingCandidateAt, err := casTimeValue(existing, "candidate_at")
+		if err != nil {
+			return time.Time{}, err
+		}
+		if existingCandidateAt.IsZero() {
 			return time.Time{}, fmt.Errorf("gc_block_candidates row for org=%s block=%s is missing candidate_at", orgID, blockID)
 		}
-		effectiveStorageClass, err = casStringValue(existing, "storage_class")
+		existingStorageClass, err := casStringValue(existing, "storage_class")
 		if err != nil {
 			return time.Time{}, err
 		}
-		if effectiveStorageClass == "" {
-			effectiveStorageClass = storageClass
+		if existingStorageClass == "" {
+			existingStorageClass = storageClass
 		}
+		if !effectiveCandidateAt.Before(existingCandidateAt) {
+			if err := s.upsertBlockGCCandidateProjection(orgID, blockID, existingStorageClass, existingCandidateAt); err != nil {
+				return existingCandidateAt, fmt.Errorf("ensure gc_block_candidates_by_day discovery row for org=%s block=%s: %w", orgID, blockID, err)
+			}
+			return existingCandidateAt, nil
+		}
+
+		updateState := map[string]interface{}{}
+		updated, err := s.db.Session().Query(`
+			UPDATE gc_block_candidates SET candidate_at = ?
+			WHERE org_id = ? AND block_id = ?
+			IF candidate_at = ?
+		`, effectiveCandidateAt, orgID.String(), blockID, existingCandidateAt).MapScanCAS(updateState)
+		if err != nil {
+			return time.Time{}, err
+		}
+		if !updated {
+			continue
+		}
+		if err := s.moveBlockGCCandidateProjection(orgID, blockID, existingStorageClass, existingCandidateAt, effectiveCandidateAt); err != nil {
+			return effectiveCandidateAt, fmt.Errorf("move gc_block_candidates_by_day discovery row for org=%s block=%s: %w", orgID, blockID, err)
+		}
+		return effectiveCandidateAt, nil
 	}
-	if err := s.upsertBlockGCCandidateProjection(orgID, blockID, effectiveStorageClass, effectiveCandidateAt); err != nil {
-		return effectiveCandidateAt, fmt.Errorf("ensure gc_block_candidates_by_day discovery row for org=%s block=%s: %w", orgID, blockID, err)
-	}
-	return effectiveCandidateAt, nil
 }
 
 // DeleteBlockGCCandidate removes both the canonical row and the matching
@@ -1081,6 +1128,34 @@ func (s *CassandraStore) ListBlockGCCandidatesByDay(day time.Time, bucket int) (
 		return nil, fmt.Errorf("failed to list block GC candidates for day=%s bucket=%d: %w", db.GCProjectionDateString(day), bucket, err)
 	}
 	return candidates, nil
+}
+
+func (s *CassandraStore) ListProvisionalBlockRefExpiriesByDay(day time.Time, bucket int) ([]ProvisionalBlockRefExpiryInfo, error) {
+	iter := s.db.Session().Query(`
+		SELECT expires_at, org_id, block_id, referrer, storage_class
+		FROM gc_provisional_block_refs_by_day
+		WHERE expiry_day = ? AND bucket = ?
+	`, db.GCProjectionUTCDate(day), bucket).Iter()
+	var out []ProvisionalBlockRefExpiryInfo
+	var expiresAt time.Time
+	var orgIDStr, blockID, referrer, storageClass string
+	for iter.Scan(&expiresAt, &orgIDStr, &blockID, &referrer, &storageClass) {
+		out = append(out, ProvisionalBlockRefExpiryInfo{
+			OrgID:        parseUUID(orgIDStr),
+			BlockID:      blockID,
+			Referrer:     referrer,
+			StorageClass: storageClass,
+			ExpiresAt:    expiresAt,
+		})
+	}
+	if err := iter.Close(); err != nil {
+		return nil, fmt.Errorf("failed to list provisional block ref expiries for day=%s bucket=%d: %w", db.GCProjectionDateString(day), bucket, err)
+	}
+	return out, nil
+}
+
+func (s *CassandraStore) DeleteProvisionalBlockRefExpiry(orgID uuid.UUID, blockID, referrer string, expiresAt time.Time) error {
+	return s.db.DeleteProvisionalBlockReferenceExpiry(orgID.String(), blockID, referrer, expiresAt)
 }
 
 // --- S3 orphan recovery ---

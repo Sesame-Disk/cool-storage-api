@@ -159,3 +159,76 @@ func TestPromotePublishAttemptReferences_ReturnsLastErrorAfterExhaustingRetries(
 		t.Fatalf("removeCalls = %d, want 0", removeCalls)
 	}
 }
+
+func TestStagePublishAttemptReferences_RollsBackPartialStage(t *testing.T) {
+	oldAdd := addPublishAttemptReferenceFn
+	oldRemove := removePublishAttemptReferenceFn
+	t.Cleanup(func() {
+		addPublishAttemptReferenceFn = oldAdd
+		removePublishAttemptReferenceFn = oldRemove
+	})
+
+	var added []string
+	var removed []string
+	wantErr := errors.New("add boom")
+	addPublishAttemptReferenceFn = func(database *DB, orgID, blockID, referrer, repoID string) error {
+		if orgID != "org-1" || repoID != "repo-1" || referrer != BlockReferrerForPublishAttempt("attempt-1") {
+			t.Fatalf("add args = %s/%s/%s, want org-1/repo-1/%s", orgID, repoID, referrer, BlockReferrerForPublishAttempt("attempt-1"))
+		}
+		if blockID == "block-2" {
+			return wantErr
+		}
+		added = append(added, blockID)
+		return nil
+	}
+	removePublishAttemptReferenceFn = func(database *DB, orgID, blockID, referrer string) error {
+		if orgID != "org-1" || referrer != BlockReferrerForPublishAttempt("attempt-1") {
+			t.Fatalf("remove args = %s/%s, want org-1/%s", orgID, referrer, BlockReferrerForPublishAttempt("attempt-1"))
+		}
+		removed = append(removed, blockID)
+		return nil
+	}
+
+	resolved, err := StagePublishAttemptReferences(&DB{}, "org-1", "repo-1", "attempt-1", []string{"block-1", "block-2"}, nil)
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("StagePublishAttemptReferences() error = %v, want %v", err, wantErr)
+	}
+	if resolved != nil {
+		t.Fatalf("resolved = %#v, want nil on stage failure", resolved)
+	}
+	if len(added) != 1 || added[0] != "block-1" {
+		t.Fatalf("added = %#v, want []string{\"block-1\"}", added)
+	}
+	if len(removed) != 1 || removed[0] != "block-1" {
+		t.Fatalf("removed = %#v, want []string{\"block-1\"}", removed)
+	}
+}
+
+func TestStagePublishAttemptReferences_JoinsRollbackFailure(t *testing.T) {
+	oldAdd := addPublishAttemptReferenceFn
+	oldRemove := removePublishAttemptReferenceFn
+	t.Cleanup(func() {
+		addPublishAttemptReferenceFn = oldAdd
+		removePublishAttemptReferenceFn = oldRemove
+	})
+
+	wantStageErr := errors.New("add boom")
+	wantRollbackErr := errors.New("remove boom")
+	addPublishAttemptReferenceFn = func(database *DB, orgID, blockID, referrer, repoID string) error {
+		if blockID == "block-2" {
+			return wantStageErr
+		}
+		return nil
+	}
+	removePublishAttemptReferenceFn = func(database *DB, orgID, blockID, referrer string) error {
+		return wantRollbackErr
+	}
+
+	_, err := StagePublishAttemptReferences(&DB{}, "org-1", "repo-1", "attempt-1", []string{"block-1", "block-2"}, nil)
+	if !errors.Is(err, wantStageErr) {
+		t.Fatalf("error = %v, want stage error %v", err, wantStageErr)
+	}
+	if !errors.Is(err, wantRollbackErr) {
+		t.Fatalf("error = %v, want rollback error %v", err, wantRollbackErr)
+	}
+}

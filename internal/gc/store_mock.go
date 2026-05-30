@@ -41,6 +41,10 @@ type MockStore struct {
 	blockGCCandidates map[string]*mockBlockGCCandidate
 	// block GC candidate discovery rows keyed by the full projection PK.
 	blockGCCandidateProjections map[mockBlockGCCandidateProjectionKey]BlockGCCandidateInfo
+	// provisional upload-ref expiry rows keyed by "orgID:blockID:referrer".
+	provisionalBlockRefExpiries map[string]*mockProvisionalBlockRefExpiry
+	// provisional upload-ref expiry discovery rows keyed by the full projection PK.
+	provisionalBlockRefExpiryProjections map[mockProvisionalBlockRefExpiryProjectionKey]ProvisionalBlockRefExpiryInfo
 
 	// block_id_mappings keyed by "orgID:externalID"
 	mappings map[string]string // externalID -> internalID
@@ -225,6 +229,23 @@ type mockS3OrphanProjectionKey struct {
 	BlockID      string
 }
 
+type mockProvisionalBlockRefExpiry struct {
+	OrgID        uuid.UUID
+	BlockID      string
+	Referrer     string
+	StorageClass string
+	ExpiresAt    time.Time
+}
+
+type mockProvisionalBlockRefExpiryProjectionKey struct {
+	ExpiryDay time.Time
+	Bucket    int
+	ExpiresAt time.Time
+	OrgID     uuid.UUID
+	BlockID   string
+	Referrer  string
+}
+
 type mockCommit struct {
 	LibraryID uuid.UUID
 	CommitID  string
@@ -342,47 +363,49 @@ func mockAcquireHardDeleteLock(locks map[uuid.UUID]mockHardDeleteLock, targetID,
 // NewMockStore creates a new in-memory mock store.
 func NewMockStore() *MockStore {
 	return &MockStore{
-		queue:                         make(map[uuid.UUID][]QueueItem),
-		pendingItems:                  make(map[mockPendingItemKey]*time.Time),
-		activeQueueOrgs:               make(map[uuid.UUID]time.Time),
-		dirtyQueueOrgs:                make(map[uuid.UUID]time.Time),
-		orgQueueStats:                 make(map[uuid.UUID]GCOrgStats),
-		failedItems:                   make(map[uuid.UUID][]GCFailedItemInfo),
-		blocks:                        make(map[string]*mockBlock),
-		blockReferences:               make(map[string]map[string]struct{}),
-		blockGCCandidates:             make(map[string]*mockBlockGCCandidate),
-		blockGCCandidateProjections:   make(map[mockBlockGCCandidateProjectionKey]BlockGCCandidateInfo),
-		mappings:                      make(map[string]string),
-		commits:                       make(map[string]*mockCommit),
-		fsObjects:                     make(map[string]*mockFSObject),
-		getFSObjectErrors:             make(map[string]error),
-		libraries:                     make(map[uuid.UUID]*mockLibrary),
-		orgNames:                      make(map[uuid.UUID]string),
-		orgStatus:                     make(map[uuid.UUID]string),
-		orgDeletedAt:                  make(map[uuid.UUID]time.Time),
-		users:                         make(map[string]*mockUser),
-		groups:                        make(map[string]bool),
-		groupMembers:                  make(map[string]bool),
-		groupsByMember:                make(map[string]bool),
-		deletedLibraries:              make(map[uuid.UUID]*mockDeletedLibrary),
-		storageSnapshots:              make(map[string]traffic.StorageSnapshot),
-		storageCounterReconciliations: make(map[string]*mockStorageCounterReconciliation),
-		orgHardDeleteLocks:            make(map[uuid.UUID]mockHardDeleteLock),
-		userHardDeleteLocks:           make(map[uuid.UUID]mockHardDeleteLock),
-		libraryHardDeleteLocks:        make(map[uuid.UUID]mockHardDeleteLock),
-		shareLinks:                    make(map[string]*mockShareLink),
-		shares:                        make(map[string]*mockShare),
-		restoreJobs:                   make(map[string]*mockRestoreJob),
-		repoTags:                      make(map[string]bool),
-		fileTags:                      make(map[string]*mockFileTag),
-		apiTokens:                     make(map[string]*mockAPIToken),
-		lockedFiles:                   make(map[string]bool),
-		starredFiles:                  make(map[uuid.UUID]bool),
-		monitoredRepos:                make(map[uuid.UUID]bool),
-		gcStats:                       make(map[string]string),
-		organizations:                 nil,
-		s3Orphans:                     make(map[string]*S3OrphanInfo),
-		s3OrphanProjections:           make(map[mockS3OrphanProjectionKey]S3OrphanInfo),
+		queue:                                make(map[uuid.UUID][]QueueItem),
+		pendingItems:                         make(map[mockPendingItemKey]*time.Time),
+		activeQueueOrgs:                      make(map[uuid.UUID]time.Time),
+		dirtyQueueOrgs:                       make(map[uuid.UUID]time.Time),
+		orgQueueStats:                        make(map[uuid.UUID]GCOrgStats),
+		failedItems:                          make(map[uuid.UUID][]GCFailedItemInfo),
+		blocks:                               make(map[string]*mockBlock),
+		blockReferences:                      make(map[string]map[string]struct{}),
+		blockGCCandidates:                    make(map[string]*mockBlockGCCandidate),
+		blockGCCandidateProjections:          make(map[mockBlockGCCandidateProjectionKey]BlockGCCandidateInfo),
+		provisionalBlockRefExpiries:          make(map[string]*mockProvisionalBlockRefExpiry),
+		provisionalBlockRefExpiryProjections: make(map[mockProvisionalBlockRefExpiryProjectionKey]ProvisionalBlockRefExpiryInfo),
+		mappings:                             make(map[string]string),
+		commits:                              make(map[string]*mockCommit),
+		fsObjects:                            make(map[string]*mockFSObject),
+		getFSObjectErrors:                    make(map[string]error),
+		libraries:                            make(map[uuid.UUID]*mockLibrary),
+		orgNames:                             make(map[uuid.UUID]string),
+		orgStatus:                            make(map[uuid.UUID]string),
+		orgDeletedAt:                         make(map[uuid.UUID]time.Time),
+		users:                                make(map[string]*mockUser),
+		groups:                               make(map[string]bool),
+		groupMembers:                         make(map[string]bool),
+		groupsByMember:                       make(map[string]bool),
+		deletedLibraries:                     make(map[uuid.UUID]*mockDeletedLibrary),
+		storageSnapshots:                     make(map[string]traffic.StorageSnapshot),
+		storageCounterReconciliations:        make(map[string]*mockStorageCounterReconciliation),
+		orgHardDeleteLocks:                   make(map[uuid.UUID]mockHardDeleteLock),
+		userHardDeleteLocks:                  make(map[uuid.UUID]mockHardDeleteLock),
+		libraryHardDeleteLocks:               make(map[uuid.UUID]mockHardDeleteLock),
+		shareLinks:                           make(map[string]*mockShareLink),
+		shares:                               make(map[string]*mockShare),
+		restoreJobs:                          make(map[string]*mockRestoreJob),
+		repoTags:                             make(map[string]bool),
+		fileTags:                             make(map[string]*mockFileTag),
+		apiTokens:                            make(map[string]*mockAPIToken),
+		lockedFiles:                          make(map[string]bool),
+		starredFiles:                         make(map[uuid.UUID]bool),
+		monitoredRepos:                       make(map[uuid.UUID]bool),
+		gcStats:                              make(map[string]string),
+		organizations:                        nil,
+		s3Orphans:                            make(map[string]*S3OrphanInfo),
+		s3OrphanProjections:                  make(map[mockS3OrphanProjectionKey]S3OrphanInfo),
 	}
 }
 
@@ -418,6 +441,18 @@ func newMockS3OrphanProjectionKey(orgID uuid.UUID, blockID string, firstSeenAt t
 	}
 }
 
+func newMockProvisionalBlockRefExpiryProjectionKey(orgID uuid.UUID, blockID, referrer string, expiresAt time.Time) mockProvisionalBlockRefExpiryProjectionKey {
+	expiresAt = expiresAt.UTC()
+	return mockProvisionalBlockRefExpiryProjectionKey{
+		ExpiryDay: db.GCProjectionUTCDate(expiresAt),
+		Bucket:    db.GCDiscoveryBucket(orgID.String(), blockID, referrer),
+		ExpiresAt: expiresAt,
+		OrgID:     orgID,
+		BlockID:   blockID,
+		Referrer:  referrer,
+	}
+}
+
 func (m *MockStore) upsertBlockGCCandidateProjection(candidate *mockBlockGCCandidate) {
 	key := newMockBlockGCCandidateProjectionKey(candidate.OrgID, candidate.BlockID, candidate.CandidateAt)
 	m.blockGCCandidateProjections[key] = BlockGCCandidateInfo{
@@ -431,6 +466,17 @@ func (m *MockStore) upsertBlockGCCandidateProjection(candidate *mockBlockGCCandi
 func (m *MockStore) upsertS3OrphanProjection(orphan *S3OrphanInfo) {
 	key := newMockS3OrphanProjectionKey(orphan.OrgID, orphan.BlockID, orphan.FirstSeenAt)
 	m.s3OrphanProjections[key] = *orphan
+}
+
+func (m *MockStore) upsertProvisionalBlockRefExpiryProjection(expiry *mockProvisionalBlockRefExpiry) {
+	key := newMockProvisionalBlockRefExpiryProjectionKey(expiry.OrgID, expiry.BlockID, expiry.Referrer, expiry.ExpiresAt)
+	m.provisionalBlockRefExpiryProjections[key] = ProvisionalBlockRefExpiryInfo{
+		OrgID:        expiry.OrgID,
+		BlockID:      expiry.BlockID,
+		Referrer:     expiry.Referrer,
+		StorageClass: expiry.StorageClass,
+		ExpiresAt:    expiry.ExpiresAt.UTC(),
+	}
 }
 
 func (m *MockStore) upsertPendingItem(orgID, libraryID uuid.UUID, itemType ItemType, itemID string, identityAt time.Time, expiresAt *time.Time) {
@@ -490,10 +536,31 @@ func (m *MockStore) AddBlockGCCandidate(orgID uuid.UUID, blockID, storageClass s
 	m.upsertBlockGCCandidateProjection(candidate)
 }
 
+func (m *MockStore) AddProvisionalBlockRefExpiry(orgID uuid.UUID, blockID, referrer, storageClass string, expiresAt time.Time) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	key := fmt.Sprintf("%s:%s:%s", orgID, blockID, referrer)
+	expiry := &mockProvisionalBlockRefExpiry{
+		OrgID:        orgID,
+		BlockID:      blockID,
+		Referrer:     referrer,
+		StorageClass: storageClass,
+		ExpiresAt:    expiresAt.UTC(),
+	}
+	m.provisionalBlockRefExpiries[key] = expiry
+	m.upsertProvisionalBlockRefExpiryProjection(expiry)
+}
+
 func (m *MockStore) DeleteBlockGCCandidateProjectionForTest(orgID uuid.UUID, blockID string, candidateAt time.Time) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	delete(m.blockGCCandidateProjections, newMockBlockGCCandidateProjectionKey(orgID, blockID, candidateAt))
+}
+
+func (m *MockStore) DeleteProvisionalBlockRefExpiryProjectionForTest(orgID uuid.UUID, blockID, referrer string, expiresAt time.Time) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.provisionalBlockRefExpiryProjections, newMockProvisionalBlockRefExpiryProjectionKey(orgID, blockID, referrer, expiresAt))
 }
 
 func (m *MockStore) DeleteS3OrphanProjectionForTest(orgID uuid.UUID, blockID string, firstSeenAt time.Time) {
@@ -1543,6 +1610,10 @@ func (m *MockStore) EnsureBlockGCCandidate(orgID uuid.UUID, blockID, storageClas
 	defer m.mu.Unlock()
 	key := fmt.Sprintf("%s:%s", orgID, blockID)
 	if existing, ok := m.blockGCCandidates[key]; ok {
+		if candidateAt = candidateAt.UTC(); !candidateAt.IsZero() && candidateAt.Before(existing.CandidateAt) {
+			delete(m.blockGCCandidateProjections, newMockBlockGCCandidateProjectionKey(existing.OrgID, existing.BlockID, existing.CandidateAt))
+			existing.CandidateAt = candidateAt
+		}
 		m.upsertBlockGCCandidateProjection(existing)
 		return existing.CandidateAt, m.ensureBlockGCCandidateErrAfterMutate
 	}
@@ -1597,6 +1668,51 @@ func (m *MockStore) ListBlockGCCandidatesByDay(day time.Time, bucket int) ([]Blo
 		return candidates[i].BlockID < candidates[j].BlockID
 	})
 	return candidates, nil
+}
+
+func (m *MockStore) ListProvisionalBlockRefExpiriesByDay(day time.Time, bucket int) ([]ProvisionalBlockRefExpiryInfo, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	targetDay := db.GCProjectionUTCDate(day)
+	var expiries []ProvisionalBlockRefExpiryInfo
+	for key, expiry := range m.provisionalBlockRefExpiryProjections {
+		if !key.ExpiryDay.Equal(targetDay) {
+			continue
+		}
+		if key.Bucket != bucket {
+			continue
+		}
+		expiries = append(expiries, expiry)
+	}
+	sort.Slice(expiries, func(i, j int) bool {
+		if !expiries[i].ExpiresAt.Equal(expiries[j].ExpiresAt) {
+			return expiries[i].ExpiresAt.Before(expiries[j].ExpiresAt)
+		}
+		if expiries[i].OrgID != expiries[j].OrgID {
+			return expiries[i].OrgID.String() < expiries[j].OrgID.String()
+		}
+		if expiries[i].BlockID != expiries[j].BlockID {
+			return expiries[i].BlockID < expiries[j].BlockID
+		}
+		return expiries[i].Referrer < expiries[j].Referrer
+	})
+	return expiries, nil
+}
+
+func (m *MockStore) DeleteProvisionalBlockRefExpiry(orgID uuid.UUID, blockID, referrer string, expiresAt time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	key := fmt.Sprintf("%s:%s:%s", orgID, blockID, referrer)
+	if expiresAt.IsZero() {
+		if existing, ok := m.provisionalBlockRefExpiries[key]; ok {
+			expiresAt = existing.ExpiresAt
+		}
+	}
+	delete(m.provisionalBlockRefExpiries, key)
+	if !expiresAt.IsZero() {
+		delete(m.provisionalBlockRefExpiryProjections, newMockProvisionalBlockRefExpiryProjectionKey(orgID, blockID, referrer, expiresAt))
+	}
+	return nil
 }
 
 func (m *MockStore) ClaimBlockDelete(orgID uuid.UUID, blockID, claimID string) (bool, error) {

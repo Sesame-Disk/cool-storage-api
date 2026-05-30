@@ -85,6 +85,12 @@ type GCStore interface {
 	// range over [0, db.GCDiscoveryBucketCount). Replaces the old per-org
 	// partition scan that depended on `blocks` partitioning by org.
 	ListBlockGCCandidatesByDay(day time.Time, bucket int) ([]BlockGCCandidateInfo, error)
+	// ListProvisionalBlockRefExpiriesByDay enumerates provisional upload-ref
+	// expiry records whose `expires_at` falls on the given UTC day for one
+	// discovery bucket. Each row is keyed by the specific provisional referrer,
+	// so concurrent uploads of the same block are expired independently.
+	ListProvisionalBlockRefExpiriesByDay(day time.Time, bucket int) ([]ProvisionalBlockRefExpiryInfo, error)
+	DeleteProvisionalBlockRefExpiry(orgID uuid.UUID, blockID, referrer string, expiresAt time.Time) error
 
 	// S3 orphan recovery / pending delete tracking for blocks claimed by GC.
 	// RecordS3Orphan preserves and returns the effective first_seen_at identity
@@ -283,6 +289,14 @@ type BlockGCCandidateInfo struct {
 	BlockID      string
 	StorageClass string
 	CandidateAt  time.Time
+}
+
+type ProvisionalBlockRefExpiryInfo struct {
+	OrgID        uuid.UUID
+	BlockID      string
+	Referrer     string
+	StorageClass string
+	ExpiresAt    time.Time
 }
 
 // GCOrgStats stores reconciled queue state for a single org.

@@ -137,6 +137,7 @@ func TestRegisterUploadedBlock_RetriesFenceWithoutDroppingProvisionalRef(t *test
 	oldAdd := registerUploadedBlockAddReferenceFn
 	oldFence := registerUploadedBlockFenceActiveFn
 	oldUpsert := registerUploadedBlockUpsertMetadataFn
+	oldUpsertExpiry := registerUploadedBlockUpsertProvisionalExpiryFn
 	oldRelease := registerUploadedBlockReleaseRefsFn
 	oldAttempts := registerUploadedBlockRetryAttemptsFn
 	oldBackoff := registerUploadedBlockRetryBackoffFn
@@ -145,6 +146,7 @@ func TestRegisterUploadedBlock_RetriesFenceWithoutDroppingProvisionalRef(t *test
 		registerUploadedBlockAddReferenceFn = oldAdd
 		registerUploadedBlockFenceActiveFn = oldFence
 		registerUploadedBlockUpsertMetadataFn = oldUpsert
+		registerUploadedBlockUpsertProvisionalExpiryFn = oldUpsertExpiry
 		registerUploadedBlockReleaseRefsFn = oldRelease
 		registerUploadedBlockRetryAttemptsFn = oldAttempts
 		registerUploadedBlockRetryBackoffFn = oldBackoff
@@ -178,6 +180,16 @@ func TestRegisterUploadedBlock_RetriesFenceWithoutDroppingProvisionalRef(t *test
 		}
 		return nil
 	}
+	registerUploadedBlockUpsertProvisionalExpiryFn = func(h *FSHelper, orgID, blockID, referrer, storageClass string, expiresAt time.Time) error {
+		calls = append(calls, "expiry")
+		if orgID != "org-1" || blockID != "block-1" || referrer != db.BlockReferrerForUpload("op-1") || storageClass != "hot" {
+			t.Fatalf("expiry args = %s/%s/%s/%s", orgID, blockID, referrer, storageClass)
+		}
+		if expiresAt.IsZero() {
+			t.Fatal("expiresAt should be set")
+		}
+		return nil
+	}
 	registerUploadedBlockReleaseRefsFn = func(h *FSHelper, orgID, libraryID, operationID string, blockIDs []string) []string {
 		t.Fatal("release should not run when the fence clears during retry")
 		return nil
@@ -195,7 +207,113 @@ func TestRegisterUploadedBlock_RetriesFenceWithoutDroppingProvisionalRef(t *test
 	if err != nil {
 		t.Fatalf("RegisterUploadedBlock() error = %v, want nil", err)
 	}
-	want := []string{"add", "fence-1", "backoff-1", "sleep-1ms", "fence-2", "upsert"}
+	want := []string{"add", "expiry", "fence-1", "backoff-1", "sleep-1ms", "fence-2", "upsert"}
+	if len(calls) != len(want) {
+		t.Fatalf("calls = %#v, want %#v", calls, want)
+	}
+	for i := range want {
+		if calls[i] != want[i] {
+			t.Fatalf("calls[%d] = %q, want %q (full=%#v)", i, calls[i], want[i], calls)
+		}
+	}
+}
+
+func TestRegisterUploadedBlock_RecordsProvisionalExpiryAtTTL(t *testing.T) {
+	helper := &FSHelper{}
+	oldAdd := registerUploadedBlockAddReferenceFn
+	oldFence := registerUploadedBlockFenceActiveFn
+	oldUpsert := registerUploadedBlockUpsertMetadataFn
+	oldUpsertExpiry := registerUploadedBlockUpsertProvisionalExpiryFn
+	t.Cleanup(func() {
+		registerUploadedBlockAddReferenceFn = oldAdd
+		registerUploadedBlockFenceActiveFn = oldFence
+		registerUploadedBlockUpsertMetadataFn = oldUpsert
+		registerUploadedBlockUpsertProvisionalExpiryFn = oldUpsertExpiry
+	})
+
+	registerUploadedBlockAddReferenceFn = func(h *FSHelper, orgID, blockID, referrer, libraryID string, ttlSeconds int) error {
+		return nil
+	}
+	registerUploadedBlockFenceActiveFn = func(h *FSHelper, orgID, blockID string) (bool, error) {
+		return false, nil
+	}
+	registerUploadedBlockUpsertMetadataFn = func(h *FSHelper, orgID, blockID string, sizeBytes int, storageClass, storageKey string) error {
+		return nil
+	}
+
+	var expiresAt time.Time
+	registerUploadedBlockUpsertProvisionalExpiryFn = func(h *FSHelper, orgID, blockID, referrer, storageClass string, value time.Time) error {
+		if orgID != "org-1" || blockID != "block-1" || referrer != db.BlockReferrerForUpload("op-1") || storageClass != "hot" {
+			t.Fatalf("expiry args = %s/%s/%s/%s", orgID, blockID, referrer, storageClass)
+		}
+		expiresAt = value
+		return nil
+	}
+
+	before := time.Now().UTC()
+	err := helper.RegisterUploadedBlock("org-1", "lib-1", "block-1", "op-1", 123, "hot", "key-1")
+	after := time.Now().UTC()
+	if err != nil {
+		t.Fatalf("RegisterUploadedBlock() error = %v, want nil", err)
+	}
+	if expiresAt.IsZero() {
+		t.Fatal("expected provisional expiry tracker to be recorded")
+	}
+	wantMin := before.Add(time.Duration(db.ProvisionalBlockReferenceTTLSeconds) * time.Second)
+	wantMax := after.Add(time.Duration(db.ProvisionalBlockReferenceTTLSeconds) * time.Second)
+	if expiresAt.Before(wantMin) || expiresAt.After(wantMax) {
+		t.Fatalf("expiresAt = %v, want between %v and %v", expiresAt, wantMin, wantMax)
+	}
+}
+
+func TestRegisterUploadedBlock_RollsBackWhenExpiryTrackingFails(t *testing.T) {
+	helper := &FSHelper{}
+	oldAdd := registerUploadedBlockAddReferenceFn
+	oldFence := registerUploadedBlockFenceActiveFn
+	oldUpsert := registerUploadedBlockUpsertMetadataFn
+	oldUpsertExpiry := registerUploadedBlockUpsertProvisionalExpiryFn
+	oldRelease := registerUploadedBlockReleaseRefsFn
+	oldEnqueue := registerUploadedBlockEnqueueZeroRefFn
+	t.Cleanup(func() {
+		registerUploadedBlockAddReferenceFn = oldAdd
+		registerUploadedBlockFenceActiveFn = oldFence
+		registerUploadedBlockUpsertMetadataFn = oldUpsert
+		registerUploadedBlockUpsertProvisionalExpiryFn = oldUpsertExpiry
+		registerUploadedBlockReleaseRefsFn = oldRelease
+		registerUploadedBlockEnqueueZeroRefFn = oldEnqueue
+	})
+
+	var calls []string
+	registerUploadedBlockAddReferenceFn = func(h *FSHelper, orgID, blockID, referrer, libraryID string, ttlSeconds int) error {
+		calls = append(calls, "add")
+		return nil
+	}
+	registerUploadedBlockFenceActiveFn = func(h *FSHelper, orgID, blockID string) (bool, error) {
+		t.Fatal("fence check should not run when expiry tracking fails")
+		return false, nil
+	}
+	registerUploadedBlockUpsertMetadataFn = func(h *FSHelper, orgID, blockID string, sizeBytes int, storageClass, storageKey string) error {
+		t.Fatal("metadata upsert should not run when expiry tracking fails")
+		return nil
+	}
+	expiryErr := errors.New("expiry write failed")
+	registerUploadedBlockUpsertProvisionalExpiryFn = func(h *FSHelper, orgID, blockID, referrer, storageClass string, expiresAt time.Time) error {
+		calls = append(calls, "expiry")
+		return expiryErr
+	}
+	registerUploadedBlockReleaseRefsFn = func(h *FSHelper, orgID, libraryID, operationID string, blockIDs []string) []string {
+		calls = append(calls, "release")
+		return []string{"block-1"}
+	}
+	registerUploadedBlockEnqueueZeroRefFn = func(orgID string, blockIDs []string, storageClass string) {
+		calls = append(calls, "enqueue")
+	}
+
+	err := helper.RegisterUploadedBlock("org-1", "lib-1", "block-1", "op-1", 123, "hot", "key-1")
+	if !errors.Is(err, expiryErr) {
+		t.Fatalf("RegisterUploadedBlock() error = %v, want wrapped %v", err, expiryErr)
+	}
+	want := []string{"add", "expiry", "release", "enqueue"}
 	if len(calls) != len(want) {
 		t.Fatalf("calls = %#v, want %#v", calls, want)
 	}

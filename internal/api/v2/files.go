@@ -2876,6 +2876,7 @@ func (h *FileHandler) UploadFile(c *gin.Context) {
 		writeUploadFileError(c, err)
 		return
 	}
+	ReleaseUploadedBlockRefs(h.db, orgID, repoID, uploadOperationID, []string{sha256ID})
 
 	// Record traffic (fire-and-forget)
 	if rec := traffic.Get(); rec != nil {
