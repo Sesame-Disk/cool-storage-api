@@ -48,7 +48,6 @@ type GCStore interface {
 	RecountOrgFailedDepth(orgID uuid.UUID) (int, error)
 	GetOldestQueuedAt(orgID uuid.UUID) (*time.Time, error)
 	SumOrgQueueStats() (int, int, error)
-	MarkItemProcessed(taskID uuid.UUID) (bool, error)
 	GetUserDeletedAt(orgID, userID uuid.UUID) (*time.Time, error)
 	GetLibraryDeletedAt(libraryID uuid.UUID) (*time.Time, error)
 	GetOrgDeletedAt(orgID uuid.UUID) (*time.Time, error)
@@ -63,6 +62,7 @@ type GCStore interface {
 	// BlockHasReferences reports whether any block_references row still exists for
 	// the block. This is the liveness check that replaces reading ref_count.
 	BlockHasReferences(orgID uuid.UUID, blockID string) (bool, error)
+	GetBlockInfo(orgID uuid.UUID, blockID string) (BlockInfo, error)
 	// RemoveBlockReference deletes one (block, referrer) reference row. Idempotent.
 	RemoveBlockReference(orgID uuid.UUID, blockID, referrer string) error
 	ResolveBlockIDs(orgID uuid.UUID, blockIDs []string) ([]string, error)

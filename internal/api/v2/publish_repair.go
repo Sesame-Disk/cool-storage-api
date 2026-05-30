@@ -1,6 +1,7 @@
 package v2
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"hash/fnv"
@@ -29,6 +30,11 @@ type publishedBlockReferenceRepair struct {
 	StagedBlockIDs []string
 	CreatedAt      time.Time
 	LeaseExpiresAt time.Time
+}
+
+type failedPublishCommitRoot struct {
+	CommitID string
+	RootFSID string
 }
 
 var scheduledPublishedBlockReferenceRepairs sync.Map
@@ -148,12 +154,197 @@ var loadPublishedBlockReferenceRepairPendingFileFn = func(database *db.DB, repoI
 	}, nil
 }
 
+var cleanupFailedPublishDeleteCommitFn = func(database *db.DB, repoID, commitID string) error {
+	if database == nil {
+		return fmt.Errorf("database not available")
+	}
+	return database.Session().Query(`
+		DELETE FROM commits WHERE library_id = ? AND commit_id = ?
+	`, repoID, commitID).Exec()
+}
+
+var cleanupFailedPublishRemoveAttemptReferencesFn = db.RemovePublishAttemptReferences
+
+var cleanupFailedPublishListCommitRootsFn = func(database *db.DB, repoID string) ([]failedPublishCommitRoot, error) {
+	if database == nil {
+		return nil, fmt.Errorf("database not available")
+	}
+	iter := database.Session().Query(`
+		SELECT commit_id, root_fs_id FROM commits WHERE library_id = ?
+	`, repoID).Iter()
+
+	var roots []failedPublishCommitRoot
+	var commitID, rootFSID string
+	for iter.Scan(&commitID, &rootFSID) {
+		roots = append(roots, failedPublishCommitRoot{CommitID: commitID, RootFSID: rootFSID})
+	}
+	if err := iter.Close(); err != nil {
+		return nil, err
+	}
+	return roots, nil
+}
+
+var cleanupFailedPublishLoadFSObjectFn = func(database *db.DB, repoID, fsID string) (string, string, error) {
+	if database == nil {
+		return "", "", fmt.Errorf("database not available")
+	}
+	var objType, dirEntries string
+	err := database.Session().Query(`
+		SELECT obj_type, dir_entries FROM fs_objects WHERE library_id = ? AND fs_id = ?
+	`, repoID, fsID).Scan(&objType, &dirEntries)
+	if err != nil {
+		return "", "", err
+	}
+	return objType, dirEntries, nil
+}
+
+var cleanupFailedPublishDeleteFSObjectFn = func(database *db.DB, repoID, fsID string) error {
+	if database == nil {
+		return fmt.Errorf("database not available")
+	}
+	return database.Session().Query(`
+		DELETE FROM fs_objects WHERE library_id = ? AND fs_id = ?
+	`, repoID, fsID).Exec()
+}
+
 var publishedBlockReferenceRepairPromoteFn = func(helper *FSHelper, orgID, repoID, commitID string, pending *pendingPublishedFile) error {
 	return helper.promotePendingPublishedFiles(orgID, repoID, commitID, []*pendingPublishedFile{pending})
 }
 
-var publishedBlockReferenceRepairCleanupFn = func(database *db.DB, orgID, repoID, commitID string, blockIDs []string) error {
-	return db.CleanupFailedPublishAttempt(database, orgID, repoID, commitID, commitID, blockIDs)
+var publishedBlockReferenceRepairCleanupFn = func(database *db.DB, orgID, repoID, commitID, fsID string, blockIDs []string) error {
+	return CleanupFailedPublishArtifacts(database, orgID, repoID, commitID, commitID, []string{fsID}, blockIDs)
+}
+
+func normalizeFailedPublishFSIDs(fsIDs []string) []string {
+	normalized := make([]string, 0, len(fsIDs))
+	seen := make(map[string]struct{}, len(fsIDs))
+	for _, fsID := range fsIDs {
+		fsID = strings.TrimSpace(fsID)
+		if fsID == "" {
+			continue
+		}
+		if _, exists := seen[fsID]; exists {
+			continue
+		}
+		seen[fsID] = struct{}{}
+		normalized = append(normalized, fsID)
+	}
+	return normalized
+}
+
+func findLiveFailedPublishFSObjects(database *db.DB, repoID, excludedCommitID string, targetFSIDs []string) (map[string]struct{}, error) {
+	targets := make(map[string]struct{}, len(targetFSIDs))
+	for _, fsID := range normalizeFailedPublishFSIDs(targetFSIDs) {
+		targets[fsID] = struct{}{}
+	}
+	if len(targets) == 0 {
+		return map[string]struct{}{}, nil
+	}
+
+	roots, err := cleanupFailedPublishListCommitRootsFn(database, repoID)
+	if err != nil {
+		return nil, fmt.Errorf("list surviving commits for repo %s: %w", repoID, err)
+	}
+
+	visited := make(map[string]struct{})
+	live := make(map[string]struct{})
+	queue := make([]string, 0, len(roots))
+	excludedCommitID = strings.TrimSpace(excludedCommitID)
+	for _, root := range roots {
+		if strings.TrimSpace(root.CommitID) == excludedCommitID {
+			continue
+		}
+		rootFSID := strings.TrimSpace(root.RootFSID)
+		if rootFSID != "" {
+			queue = append(queue, rootFSID)
+		}
+	}
+
+	for len(queue) > 0 && len(live) < len(targets) {
+		currentFSID := queue[0]
+		queue = queue[1:]
+		if _, seen := visited[currentFSID]; seen {
+			continue
+		}
+		visited[currentFSID] = struct{}{}
+
+		if _, wanted := targets[currentFSID]; wanted {
+			live[currentFSID] = struct{}{}
+			if len(live) == len(targets) {
+				break
+			}
+		}
+
+		objType, dirEntriesJSON, err := cleanupFailedPublishLoadFSObjectFn(database, repoID, currentFSID)
+		if err != nil {
+			return nil, fmt.Errorf("load fs_object %s while checking failed publish cleanup: %w", currentFSID, err)
+		}
+		if objType == "file" || objType == "" || dirEntriesJSON == "" || dirEntriesJSON == "[]" {
+			continue
+		}
+
+		var entries []FSEntry
+		if err := json.Unmarshal([]byte(dirEntriesJSON), &entries); err != nil {
+			return nil, fmt.Errorf("parse fs_object %s dir_entries while checking failed publish cleanup: %w", currentFSID, err)
+		}
+		for _, entry := range entries {
+			childFSID := strings.TrimSpace(entry.ID)
+			if childFSID != "" {
+				queue = append(queue, childFSID)
+			}
+		}
+	}
+
+	return live, nil
+}
+
+func deleteFailedPublishFSObjects(database *db.DB, repoID, excludedCommitID string, fsIDs []string) error {
+	normalized := normalizeFailedPublishFSIDs(fsIDs)
+	if len(normalized) == 0 {
+		return nil
+	}
+	live, err := findLiveFailedPublishFSObjects(database, repoID, excludedCommitID, normalized)
+	if err != nil {
+		return err
+	}
+	var deleteErr error
+	for _, fsID := range normalized {
+		if _, referenced := live[fsID]; referenced {
+			continue
+		}
+		if err := cleanupFailedPublishDeleteFSObjectFn(database, repoID, fsID); err != nil {
+			deleteErr = errors.Join(deleteErr, fmt.Errorf("delete failed publish fs_object %s: %w", fsID, err))
+		}
+	}
+	return deleteErr
+}
+
+func CleanupFailedPublishArtifacts(database *db.DB, orgID, repoID, attemptID, commitID string, fsIDs, blockIDs []string) error {
+	if database == nil {
+		return nil
+	}
+	var cleanupErr error
+	commitDeleted := true
+	commitID = strings.TrimSpace(commitID)
+	if commitID != "" {
+		if err := cleanupFailedPublishDeleteCommitFn(database, repoID, commitID); err != nil {
+			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("delete failed publish commit %s: %w", commitID, err))
+			commitDeleted = false
+		}
+	}
+	if commitDeleted {
+		if err := deleteFailedPublishFSObjects(database, repoID, commitID, fsIDs); err != nil {
+			cleanupErr = errors.Join(cleanupErr, err)
+		}
+	}
+	attemptID = strings.TrimSpace(attemptID)
+	blockIDs = db.NormalizeBlockIDs(blockIDs)
+	if attemptID != "" && len(blockIDs) > 0 {
+		if err := cleanupFailedPublishRemoveAttemptReferencesFn(database, orgID, attemptID, blockIDs); err != nil {
+			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("remove publish-attempt refs for %s: %w", attemptID, err))
+		}
+	}
+	return cleanupErr
 }
 
 func publishedBlockReferenceRepairShouldDeferCleanup(database *db.DB, repair publishedBlockReferenceRepair) (bool, error) {
@@ -352,7 +543,7 @@ func repairPublishedBlockReferenceRepair(database *db.DB, repair publishedBlockR
 		if deferCleanup {
 			return nil
 		}
-		if err := publishedBlockReferenceRepairCleanupFn(database, repair.OrgID, repair.RepoID, repair.CommitID, repair.StagedBlockIDs); err != nil {
+		if err := publishedBlockReferenceRepairCleanupFn(database, repair.OrgID, repair.RepoID, repair.CommitID, repair.FSID, repair.StagedBlockIDs); err != nil {
 			return fmt.Errorf("cleanup unreachable published fs_object %s for commit %s: %w", repair.FSID, repair.CommitID, err)
 		}
 	}

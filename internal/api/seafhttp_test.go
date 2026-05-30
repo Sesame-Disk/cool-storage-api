@@ -217,6 +217,181 @@ func TestWriteSeafHTTPUploadError_MapsSentinelErrors(t *testing.T) {
 	}
 }
 
+func TestStageSeafHTTPPublishAttemptReferences_UsesResolvedInternalBlockIDs(t *testing.T) {
+	oldResolve := resolveSeafHTTPStoredBlockIDsFn
+	oldStage := stageSeafHTTPPublishAttemptReferencesFn
+	t.Cleanup(func() {
+		resolveSeafHTTPStoredBlockIDsFn = oldResolve
+		stageSeafHTTPPublishAttemptReferencesFn = oldStage
+	})
+
+	resolveCalls := 0
+	resolveSeafHTTPStoredBlockIDsFn = func(fsHelper *v2.FSHelper, orgID string, blockIDs []string) ([]string, error) {
+		resolveCalls++
+		if orgID != "org-1" {
+			t.Fatalf("resolve orgID = %q, want org-1", orgID)
+		}
+		if !reflect.DeepEqual(blockIDs, []string{"sha1-a", "sha1-b"}) {
+			t.Fatalf("resolve blockIDs = %#v, want external ids", blockIDs)
+		}
+		return []string{"sha256-a", "sha256-a", "sha256-b"}, nil
+	}
+	stageSeafHTTPPublishAttemptReferencesFn = func(database *db.DB, orgID, repoID, attemptID string, blockIDs []string, resolve db.BlockIDResolver) ([]string, error) {
+		if resolve != nil {
+			t.Fatal("stage helper should pass resolved internal IDs directly")
+		}
+		if orgID != "org-1" || repoID != "repo-1" || attemptID != "commit-1" {
+			t.Fatalf("stage args = %s/%s/%s, want org-1/repo-1/commit-1", orgID, repoID, attemptID)
+		}
+		want := []string{"sha256-a", "sha256-b"}
+		if !reflect.DeepEqual(blockIDs, want) {
+			t.Fatalf("stage blockIDs = %#v, want %#v", blockIDs, want)
+		}
+		return append([]string(nil), blockIDs...), nil
+	}
+
+	staged, err := stageSeafHTTPPublishAttemptReferences(&v2.FSHelper{}, nil, "org-1", "repo-1", "commit-1", []string{"sha1-a", "sha1-b"})
+	if err != nil {
+		t.Fatalf("stageSeafHTTPPublishAttemptReferences() error = %v", err)
+	}
+	if resolveCalls != 1 {
+		t.Fatalf("resolveCalls = %d, want 1", resolveCalls)
+	}
+	if !reflect.DeepEqual(staged, []string{"sha256-a", "sha256-b"}) {
+		t.Fatalf("staged = %#v, want internal IDs", staged)
+	}
+}
+
+func TestFinalizeSeafHTTPPublishedBlockReferences_UsesStagedInternalIDsForPromotionAndRepair(t *testing.T) {
+	oldPromote := promoteSeafHTTPPublishAttemptReferencesFn
+	oldSchedule := schedulePublishedFSObjectBlockReferenceRepairFn
+	oldClear := clearPublishedFSObjectBlockReferenceRepairFn
+	t.Cleanup(func() {
+		promoteSeafHTTPPublishAttemptReferencesFn = oldPromote
+		schedulePublishedFSObjectBlockReferenceRepairFn = oldSchedule
+		clearPublishedFSObjectBlockReferenceRepairFn = oldClear
+	})
+
+	t.Run("success clears durable repair after internal promotion", func(t *testing.T) {
+		promoteCalls := 0
+		clearCalls := 0
+		scheduleCalls := 0
+		promoteSeafHTTPPublishAttemptReferencesFn = func(database *db.DB, orgID, attemptID string, blockIDs []string, registerPermanent func() error) error {
+			promoteCalls++
+			if orgID != "org-1" || attemptID != "commit-1" {
+				t.Fatalf("promote args = %s/%s, want org-1/commit-1", orgID, attemptID)
+			}
+			if !reflect.DeepEqual(blockIDs, []string{"sha256-a"}) {
+				t.Fatalf("promote blockIDs = %#v, want staged internal IDs", blockIDs)
+			}
+			return nil
+		}
+		clearPublishedFSObjectBlockReferenceRepairFn = func(database *db.DB, orgID, repoID, commitID, fsID string) error {
+			clearCalls++
+			if orgID != "org-1" || repoID != "repo-1" || commitID != "commit-1" || fsID != "fs-1" {
+				t.Fatalf("clear args = %s/%s/%s/%s", orgID, repoID, commitID, fsID)
+			}
+			return nil
+		}
+		schedulePublishedFSObjectBlockReferenceRepairFn = func(database *db.DB, orgID, repoID, commitID, fsID, label string, stagedBlockIDs []string) {
+			scheduleCalls++
+		}
+
+		finalizeSeafHTTPPublishedBlockReferences(&v2.FSHelper{}, nil, "org-1", "repo-1", "commit-1", "fs-1", "commitUploadedFile", []string{"sha1-a"}, []string{"sha256-a"})
+
+		if promoteCalls != 1 {
+			t.Fatalf("promoteCalls = %d, want 1", promoteCalls)
+		}
+		if clearCalls != 1 {
+			t.Fatalf("clearCalls = %d, want 1", clearCalls)
+		}
+		if scheduleCalls != 0 {
+			t.Fatalf("scheduleCalls = %d, want 0", scheduleCalls)
+		}
+	})
+
+	t.Run("failure schedules durable repair with internal staged IDs", func(t *testing.T) {
+		promoteSeafHTTPPublishAttemptReferencesFn = func(database *db.DB, orgID, attemptID string, blockIDs []string, registerPermanent func() error) error {
+			if !reflect.DeepEqual(blockIDs, []string{"sha256-a", "sha256-b"}) {
+				t.Fatalf("promote blockIDs = %#v, want staged internal IDs", blockIDs)
+			}
+			return errors.New("boom")
+		}
+		clearCalls := 0
+		clearPublishedFSObjectBlockReferenceRepairFn = func(database *db.DB, orgID, repoID, commitID, fsID string) error {
+			clearCalls++
+			return nil
+		}
+		scheduleCalls := 0
+		schedulePublishedFSObjectBlockReferenceRepairFn = func(database *db.DB, orgID, repoID, commitID, fsID, label string, stagedBlockIDs []string) {
+			scheduleCalls++
+			if orgID != "org-1" || repoID != "repo-1" || commitID != "commit-1" || fsID != "fs-1" || label != "commitUploadedFileMultiBlock" {
+				t.Fatalf("schedule args = %s/%s/%s/%s/%s", orgID, repoID, commitID, fsID, label)
+			}
+			if !reflect.DeepEqual(stagedBlockIDs, []string{"sha256-a", "sha256-b"}) {
+				t.Fatalf("scheduled stagedBlockIDs = %#v, want internal IDs", stagedBlockIDs)
+			}
+		}
+
+		finalizeSeafHTTPPublishedBlockReferences(&v2.FSHelper{}, nil, "org-1", "repo-1", "commit-1", "fs-1", "commitUploadedFileMultiBlock", []string{"sha1-a", "sha1-b"}, []string{"sha256-a", "sha256-b"})
+
+		if scheduleCalls != 1 {
+			t.Fatalf("scheduleCalls = %d, want 1", scheduleCalls)
+		}
+		if clearCalls != 0 {
+			t.Fatalf("clearCalls = %d, want 0", clearCalls)
+		}
+	})
+}
+
+func TestCleanupSeafHTTPFailedPublishAttempt_JoinsArtifactCleanupAndQueueClear(t *testing.T) {
+	oldCleanup := cleanupSeafHTTPFailedPublishAttemptFn
+	oldClear := clearPublishedFSObjectBlockReferenceRepairFn
+	t.Cleanup(func() {
+		cleanupSeafHTTPFailedPublishAttemptFn = oldCleanup
+		clearPublishedFSObjectBlockReferenceRepairFn = oldClear
+	})
+
+	cleanupErr := errors.New("cleanup failed")
+	clearErr := errors.New("clear failed")
+	cleanupCalls := 0
+	cleanupSeafHTTPFailedPublishAttemptFn = func(database *db.DB, orgID, repoID, attemptID, commitID string, fsIDs, blockIDs []string) error {
+		cleanupCalls++
+		if orgID != "org-1" || repoID != "repo-1" || attemptID != "commit-1" || commitID != "commit-1" {
+			t.Fatalf("cleanup args = %s/%s/%s/%s, want org-1/repo-1/commit-1/commit-1", orgID, repoID, attemptID, commitID)
+		}
+		if !reflect.DeepEqual(fsIDs, []string{"fs-1"}) {
+			t.Fatalf("cleanup fsIDs = %#v, want []string{\"fs-1\"}", fsIDs)
+		}
+		if !reflect.DeepEqual(blockIDs, []string{"sha256-a"}) {
+			t.Fatalf("cleanup blockIDs = %#v, want []string{\"sha256-a\"}", blockIDs)
+		}
+		return cleanupErr
+	}
+	clearCalls := 0
+	clearPublishedFSObjectBlockReferenceRepairFn = func(database *db.DB, orgID, repoID, commitID, fsID string) error {
+		clearCalls++
+		if orgID != "org-1" || repoID != "repo-1" || commitID != "commit-1" || fsID != "fs-1" {
+			t.Fatalf("clear args = %s/%s/%s/%s, want org-1/repo-1/commit-1/fs-1", orgID, repoID, commitID, fsID)
+		}
+		return clearErr
+	}
+
+	err := cleanupSeafHTTPFailedPublishAttempt(nil, "org-1", "repo-1", "commit-1", "fs-1", []string{"sha256-a"})
+	if !errors.Is(err, cleanupErr) {
+		t.Fatalf("cleanupSeafHTTPFailedPublishAttempt() error = %v, want cleanupErr %v", err, cleanupErr)
+	}
+	if !errors.Is(err, clearErr) {
+		t.Fatalf("cleanupSeafHTTPFailedPublishAttempt() error = %v, want clearErr %v", err, clearErr)
+	}
+	if cleanupCalls != 1 {
+		t.Fatalf("cleanupCalls = %d, want 1", cleanupCalls)
+	}
+	if clearCalls != 1 {
+		t.Fatalf("clearCalls = %d, want 1", clearCalls)
+	}
+}
+
 func TestHandleChunkedFinalizeError_RollsBackConflictAndCleansUp(t *testing.T) {
 	oldRollback := rollbackUploadedBlockRefsFn
 	oldCleanup := cleanupChunkUploadFn

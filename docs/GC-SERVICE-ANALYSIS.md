@@ -273,6 +273,10 @@ This section answers: **"When X happens, what gets cleaned up, when, and how do 
 
 ### How deduplication works
 
+> Note
+> The live implementation no longer uses `blocks.ref_count` or `gc_processed_items`.
+> Block liveness is now row-per-reference in `block_references`, zero-ref discovery is recorded in `gc_block_candidates`, and the worker uses claim-then-verify delete fences before touching S3. The historical counter-based examples below have not been fully rewritten yet.
+
 Blocks are identified by SHA-256 hash and scoped to an **org** (partition key = `org_id`).
 When two users in the same org upload identical files, only one copy of each block is
 stored in S3. The `blocks` table tracks a `ref_count` — how many fs_objects reference
@@ -290,7 +294,7 @@ race conditions:
 
 - **Increment** (`IncrementBlockRefCounts`): on upload and copy. Uses `UPDATE ... IF ref_count = ? SET ref_count = ?` with CAS retry.
 - **Decrement** (`DecrementBlockRefCountsOnce`): on file delete. Same CAS pattern. Returns `true` if the decrement caused ref_count to hit 0.
-- **Idempotency**: Each block decrement operation has a stable key derived from `library_id`, `fs_object_id`, block position, resolved block ID, and GC `identity_at`. Processed operations are recorded in `gc_processed_items` (35d TTL) to prevent double-decrement on retry and delayed DLQ replay while allowing partially completed fs_objects to resume. If a marker exists but the current refcount still includes that fs_object occurrence, retry repair applies the missing decrement before deleting the fs_object.
+- **Current idempotency model**: The retired `gc_processed_items` marker table is no longer part of the active design. Upload and publish retries are idempotent because block liveness lives in keyed `block_references` rows, and GC delete retries are guarded by claim IDs plus a re-check of live references before block-finalization.
 
 Blocks are **never shared across orgs** — the `blocks` primary key is `(org_id, block_id)`.
 
@@ -428,7 +432,7 @@ removes the public access link.
 | Guarantee | Mechanism | Integration-tested? |
 |-----------|-----------|-------------------|
 | Block never deleted while ref_count > 0 | LWT: `IF ref_count <= 0` | **Yes** (`TestGC_ConcurrentUploadDuringGC`) |
-| Ref count never double-decremented within the supported replay window | Stable idempotent operation key + `gc_processed_items` | **Yes** (unit + `TestBatchDeleteItems_DeduplicatedFilesDecrementSharedBlockTwice`) |
+| Live block references are never removed twice by retry bookkeeping | Idempotent per-referrer row deletes plus delete-fence revalidation | **Yes** (unit + `TestBatchDeleteItems_DeduplicatedFilesDecrementSharedBlockTwice`) |
 | Re-uploaded content survives pending GC | Grace period + LWT re-check at deletion time | **Yes** (`TestGC_ConcurrentUploadDuringGC`) |
 | Shared block survives partial file delete | Ref count tracks all references | **Yes** (`TestGC_DeduplicationSafety`) |
 | Cascade respects restore from trash | Stale-check + hard-delete lock | Unit tests only (**pending integration**) |

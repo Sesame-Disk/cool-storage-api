@@ -203,21 +203,9 @@ This mismatch is now a contract / cleanup gap, not the top merge blocker. The ma
 
 ---
 
-## 23. Row-Per-Reference Schema / Docs Cleanup (DEFERRED)
+## 23. Row-Per-Reference Schema / Docs Cleanup
 
-### Current State
-The live code now uses row-per-reference block liveness, but some bootstrap/schema and documentation surfaces still describe the old `ref_count` / `gc_processed_items` world:
-- `internal/db/migrations/001_initial_schema.cql` still defines `gc_processed_items`;
-- `docs/GC-SERVICE-ANALYSIS.md` still documents the old ref-count/LWT delete flow;
-- parts of `docs/DATABASE-GUIDE.md` still mention `gc_processed_items` as the active idempotency mechanism.
-
-### Why It Was Deferred
-This branch prioritized correctness fixes in active code paths. Schema/bootstrap cleanup must also respect the migration checksum rule: already-applied migration files cannot be rewritten in place for existing environments.
-
-### Follow-Up Plan
-1. Remove dead bootstrap tables with a new numbered migration instead of editing `001_initial_schema.cql` in place.
-2. Rewrite stale GC / block-liveness documentation to describe `block_references`, delete fences, and S3 orphan recovery as the canonical model.
-3. Audit diagrams and any remaining `ref_count` references so docs match the running code.
+Closed in the current branch: the dead `gc_processed_items` bootstrap table is gone from `001_initial_schema.cql`, the GC store no longer exposes a marker API that nothing calls, and the remaining docs now point at `block_references` / delete-fence GC as the active model instead of the retired counter-marker design.
 4. Re-run the focused GC / upload / publish tests after the cleanup branch to catch accidental drift.
 
 ---

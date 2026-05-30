@@ -44,8 +44,8 @@ type OnlyOfficeHandler struct {
 	permMiddleware *middleware.PermissionMiddleware
 }
 
-var onlyOfficeCleanupFailedPublishAttemptFn = func(database *db.DB, orgID, repoID, commitID string, blockIDs []string) error {
-	return db.CleanupFailedPublishAttempt(database, orgID, repoID, commitID, commitID, blockIDs)
+var onlyOfficeCleanupFailedPublishAttemptFn = func(database *db.DB, orgID, repoID, attemptID, commitID string, fsIDs, blockIDs []string) error {
+	return CleanupFailedPublishArtifacts(database, orgID, repoID, attemptID, commitID, fsIDs, blockIDs)
 }
 
 var onlyOfficeClearPendingPublishedFileRepairsFn = clearPendingPublishedFileRepairs
@@ -59,8 +59,9 @@ var onlyOfficeDeletePendingBlockFn = func(h *OnlyOfficeHandler, orgID, operation
 var onlyOfficeAdjustStorageCountersFn = traffic.AdjustStorageCountersByDeltaSync
 
 func cleanupOnlyOfficeFailedPublishAttempt(database *db.DB, orgID, repoID, commitID string, pendingFiles []*pendingPublishedFile) error {
+	fsIDs := pendingPublishedFileFSIDs(pendingFiles)
 	blockIDs := pendingPublishedFileInternalBlockIDs(pendingFiles)
-	cleanupErr := onlyOfficeCleanupFailedPublishAttemptFn(database, orgID, repoID, commitID, blockIDs)
+	cleanupErr := onlyOfficeCleanupFailedPublishAttemptFn(database, orgID, repoID, commitID, commitID, fsIDs, blockIDs)
 	clearErr := onlyOfficeClearPendingPublishedFileRepairsFn(database, orgID, repoID, commitID, pendingFiles)
 	return errors.Join(cleanupErr, clearErr)
 }
@@ -1307,7 +1308,11 @@ func (h *OnlyOfficeHandler) publishEditedDocumentMetadata(fsHelper *FSHelper, or
 		if err != nil {
 			return fmt.Errorf("failed to create file fs_object: %w", err)
 		}
-		cleanupPendingFilePublish := func() {}
+		cleanupPendingFilePublish := func() {
+			if cleanupErr := CleanupFailedPublishArtifacts(h.db, orgID, repoID, "", "", []string{pendingFile.fsID}, nil); cleanupErr != nil {
+				log.Printf("OnlyOffice: failed to clean up pending fs_object %s before commit publish: %v", pendingFile.fsID, cleanupErr)
+			}
+		}
 
 		updatedEntries := make([]FSEntry, 0, len(result.Entries))
 		fileUpdated := false
@@ -1352,7 +1357,7 @@ func (h *OnlyOfficeHandler) publishEditedDocumentMetadata(fsHelper *FSHelper, or
 			return fmt.Errorf("failed to create commit: %w", err)
 		}
 		if err := fsHelper.stagePendingPublishedFiles(orgID, repoID, commitID, []*pendingPublishedFile{pendingFile}); err != nil {
-			if cleanupErr := db.CleanupFailedPublishAttempt(h.db, orgID, repoID, commitID, commitID, pendingPublishedFileInternalBlockIDs([]*pendingPublishedFile{pendingFile})); cleanupErr != nil {
+			if cleanupErr := cleanupOnlyOfficeFailedPublishAttempt(h.db, orgID, repoID, commitID, []*pendingPublishedFile{pendingFile}); cleanupErr != nil {
 				return errors.Join(
 					fmt.Errorf("failed to stage publish-attempt block references for commit %s: %w", commitID, err),
 					fmt.Errorf("cleanup failed publish commit %s: %w", commitID, cleanupErr),
@@ -1361,12 +1366,10 @@ func (h *OnlyOfficeHandler) publishEditedDocumentMetadata(fsHelper *FSHelper, or
 			return fmt.Errorf("failed to stage publish-attempt block references for commit %s: %w", commitID, err)
 		}
 		if err := queuePendingPublishedFileRepairs(h.db, orgID, repoID, commitID, []*pendingPublishedFile{pendingFile}); err != nil {
-			cleanupErr := db.CleanupFailedPublishAttempt(h.db, orgID, repoID, commitID, commitID, pendingPublishedFileInternalBlockIDs([]*pendingPublishedFile{pendingFile}))
-			clearErr := clearPendingPublishedFileRepairs(h.db, orgID, repoID, commitID, []*pendingPublishedFile{pendingFile})
+			cleanupErr := cleanupOnlyOfficeFailedPublishAttempt(h.db, orgID, repoID, commitID, []*pendingPublishedFile{pendingFile})
 			return errors.Join(
 				fmt.Errorf("failed to queue durable publish repair for commit %s: %w", commitID, err),
 				cleanupErr,
-				clearErr,
 			)
 		}
 
@@ -1382,11 +1385,8 @@ func (h *OnlyOfficeHandler) publishEditedDocumentMetadata(fsHelper *FSHelper, or
 
 		if err := fsHelper.UpdateLibraryHeadFromSnapshot(snapshot, repoID, commitID, snapshot.HeadCommitID); err != nil {
 			if errors.Is(err, ErrLibraryHeadConflict) {
-				if cleanupErr := db.CleanupFailedPublishAttempt(h.db, orgID, repoID, commitID, commitID, pendingFile.internalBlockIDs); cleanupErr != nil {
+				if cleanupErr := cleanupOnlyOfficeFailedPublishAttempt(h.db, orgID, repoID, commitID, []*pendingPublishedFile{pendingFile}); cleanupErr != nil {
 					return fmt.Errorf("failed to clean up conflict publish attempt %s: %w", commitID, cleanupErr)
-				}
-				if clearErr := clearPendingPublishedFileRepairs(h.db, orgID, repoID, commitID, []*pendingPublishedFile{pendingFile}); clearErr != nil {
-					log.Printf("OnlyOffice: failed to clear queued publish repair for repo=%s commit=%s fs_object=%s after head conflict: %v", repoID, commitID, pendingFile.fsID, clearErr)
 				}
 			}
 			return fmt.Errorf("failed to update library head: %w", err)

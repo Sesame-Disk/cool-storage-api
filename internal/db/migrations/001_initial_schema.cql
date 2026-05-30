@@ -1139,12 +1139,6 @@ INSERT INTO gc_stats (stat_key, stat_value, updated_at)
 VALUES ('last_reconcile_run', '', toTimestamp(now()))
 IF NOT EXISTS;
 
--- Keep this longer than gc_failed_items retention so delayed DLQ requeues
--- cannot repeat the same decrement after the idempotency marker expires.
-CREATE TABLE IF NOT EXISTS gc_processed_items (
-    task_id UUID PRIMARY KEY
-) WITH default_time_to_live = 3024000;
-
 -- When the GC worker deletes the canonical `blocks` row before the backing S3
 -- object, any S3 failure would otherwise leak storage forever. This recovery
 -- table lets the scanner retry deletes later. The 90-day TTL bounds growth.

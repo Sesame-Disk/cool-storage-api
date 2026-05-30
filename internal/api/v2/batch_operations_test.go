@@ -7,8 +7,10 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"testing"
 
+	"github.com/Sesame-Disk/sesamefs/internal/db"
 	"github.com/gin-gonic/gin"
 )
 
@@ -165,6 +167,42 @@ func TestMovedItemTagMutation(t *testing.T) {
 				t.Fatalf("movedItemTagMutation() byPrefix = %v, want %v", gotByPrefix, tt.wantByPrefix)
 			}
 		})
+	}
+}
+
+func TestEnqueueZeroRefBlocks_GroupsByCanonicalBlockStorageClass(t *testing.T) {
+	oldLoad := loadZeroRefBlockStorageClassesFn
+	defer func() {
+		loadZeroRefBlockStorageClassesFn = oldLoad
+		SetGCHooks(nil, nil, nil)
+	}()
+
+	enqueuer := &mockGCEnqueuer{}
+	SetGCHooks(enqueuer, nil, nil)
+	loadZeroRefBlockStorageClassesFn = func(database *db.DB, orgID string, blockIDs []string) (map[string][]string, error) {
+		if database == nil {
+			t.Fatal("expected non-nil database placeholder")
+		}
+		if orgID != "org-1" {
+			t.Fatalf("orgID = %q, want org-1", orgID)
+		}
+		if !reflect.DeepEqual(blockIDs, []string{"block-hot-1", "block-cold-1", "block-hot-2"}) {
+			t.Fatalf("blockIDs = %#v, want original order", blockIDs)
+		}
+		return map[string][]string{
+			"hot-a":  {"block-hot-1", "block-hot-2"},
+			"cold-b": {"block-cold-1"},
+		}, nil
+	}
+
+	enqueueZeroRefBlocks(&db.DB{}, "org-1", "repo-1", []string{"block-hot-1", "block-cold-1", "block-hot-2"})
+
+	want := []gcEnqueueCall{
+		{orgID: "org-1", blockIDs: []string{"block-cold-1"}, storageClass: "cold-b"},
+		{orgID: "org-1", blockIDs: []string{"block-hot-1", "block-hot-2"}, storageClass: "hot-a"},
+	}
+	if !reflect.DeepEqual(enqueuer.calls, want) {
+		t.Fatalf("enqueue calls = %#v, want %#v", enqueuer.calls, want)
 	}
 }
 

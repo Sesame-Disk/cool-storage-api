@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"strings"
 	"sync"
 	"time"
 
@@ -404,9 +405,16 @@ func (w *Worker) processBlock(ctx context.Context, item QueueItem) error {
 	// 3. Persist the S3-pending record BEFORE removing the DB row. This closes the
 	// crash window where the process dies after deleting the canonical row but
 	// before recording recovery metadata for the later S3 delete.
-	storageClass := item.StorageClass
+	blockInfo, err := w.store.GetBlockInfo(item.OrgID, item.ItemID)
+	if err != nil {
+		return fmt.Errorf("failed to load canonical block info for %s: %w", item.ItemID, err)
+	}
+	storageClass := strings.TrimSpace(blockInfo.StorageClass)
 	if storageClass == "" {
-		storageClass = "hot"
+		return fmt.Errorf("block %s has empty canonical storage class", item.ItemID)
+	}
+	if item.StorageClass != "" && item.StorageClass != storageClass {
+		log.Printf("[GC Worker] WARNING: block %s queued with storage_class=%s but canonical storage_class=%s; using canonical value", item.ItemID, item.StorageClass, storageClass)
 	}
 	orphanFirstSeenAt, err := w.store.RecordS3Orphan(item.OrgID, item.ItemID, storageClass, "", w.clock().UTC())
 	if err != nil {

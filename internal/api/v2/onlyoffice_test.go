@@ -133,10 +133,13 @@ func TestCleanupOnlyOfficeFailedPublishAttempt_JoinsRepairCleanupAndQueueClear(t
 	cleanupErr := errors.New("cleanup failed")
 	clearErr := errors.New("clear failed")
 	cleanupCalls := 0
-	onlyOfficeCleanupFailedPublishAttemptFn = func(database *db.DB, orgID, repoID, commitID string, blockIDs []string) error {
+	onlyOfficeCleanupFailedPublishAttemptFn = func(database *db.DB, orgID, repoID, attemptID, commitID string, fsIDs, blockIDs []string) error {
 		cleanupCalls++
-		if orgID != "org-1" || repoID != "repo-1" || commitID != "commit-1" {
-			t.Fatalf("cleanup args = %s/%s/%s, want org-1/repo-1/commit-1", orgID, repoID, commitID)
+		if orgID != "org-1" || repoID != "repo-1" || attemptID != "commit-1" || commitID != "commit-1" {
+			t.Fatalf("cleanup args = %s/%s/%s/%s, want org-1/repo-1/commit-1/commit-1", orgID, repoID, attemptID, commitID)
+		}
+		if len(fsIDs) != 1 || fsIDs[0] != "fs-1" {
+			t.Fatalf("cleanup fsIDs = %#v, want []string{\"fs-1\"}", fsIDs)
 		}
 		if len(blockIDs) != 1 || blockIDs[0] != "queued-block-1" {
 			t.Fatalf("cleanup blockIDs = %#v, want []string{\"queued-block-1\"}", blockIDs)

@@ -943,6 +943,16 @@ func (m *MockStore) GetBlock(orgID uuid.UUID, blockID string) *mockBlock {
 	return m.blocks[fmt.Sprintf("%s:%s", orgID, blockID)]
 }
 
+func (m *MockStore) GetBlockInfo(orgID uuid.UUID, blockID string) (BlockInfo, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	block := m.blocks[fmt.Sprintf("%s:%s", orgID, blockID)]
+	if block == nil {
+		return BlockInfo{}, gocql.ErrNotFound
+	}
+	return BlockInfo{BlockID: block.BlockID, StorageClass: block.StorageClass}, nil
+}
+
 // BlockReferenceCount returns how many reference rows a block currently has.
 // Test helper that replaces the old mutable ref_count assertions.
 func (m *MockStore) BlockReferenceCount(orgID uuid.UUID, blockID string) int {
@@ -1482,20 +1492,6 @@ func (m *MockStore) SumOrgQueueStats() (int, int, error) {
 		totalFailed += stats.FailedDepth
 	}
 	return totalQueue, totalFailed, nil
-}
-
-func (m *MockStore) MarkItemProcessed(taskID uuid.UUID) (bool, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	key := taskID.String()
-	if _, exists := m.gcStats[key]; exists {
-		return false, nil
-	}
-
-	// Mock TTL by just setting it in gcStats for now
-	m.gcStats[key] = "processed"
-	return true, nil
 }
 
 func (m *MockStore) GetUserDeletedAt(orgID, userID uuid.UUID) (*time.Time, error) {

@@ -233,7 +233,7 @@ func (s *Scanner) scanExpiredProvisionalBlockRefs(ctx context.Context) (int, err
 					continue
 				}
 				if !hasRefs {
-					if _, err := s.store.EnsureBlockGCCandidate(expiry.OrgID, expiry.BlockID, expiry.StorageClass, expiry.ExpiresAt); err != nil {
+					if _, err := s.store.EnsureBlockGCCandidate(expiry.OrgID, expiry.BlockID, expiry.StorageClass, now); err != nil {
 						log.Printf("[GC Scanner] Phase 0: failed to promote expired provisional ref org=%s block=%s into gc candidate: %v", expiry.OrgID, expiry.BlockID, err)
 						if phaseErr == nil {
 							phaseErr = fmt.Errorf("promote expired provisional ref org=%s block=%s into gc candidate: %w", expiry.OrgID, expiry.BlockID, err)

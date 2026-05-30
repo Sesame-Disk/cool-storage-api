@@ -6,6 +6,7 @@ import (
 	"log"
 	"net/http"
 	"path"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -95,6 +96,39 @@ func movedItemTagMutation(srcPath, dstDir, itemName string, movedEntry *FSEntry)
 	return normalizePath(srcPath), normalizePath(path.Join(dstDir, itemName)), isDirectoryEntry(movedEntry)
 }
 
+var loadZeroRefBlockStorageClassesFn = loadZeroRefBlockStorageClasses
+
+func loadZeroRefBlockStorageClasses(database *db.DB, orgID string, blockIDs []string) (map[string][]string, error) {
+	grouped := make(map[string][]string)
+	seen := make(map[string]struct{}, len(blockIDs))
+	var loadErr error
+	for _, blockID := range blockIDs {
+		blockID = strings.TrimSpace(blockID)
+		if blockID == "" {
+			continue
+		}
+		if _, dup := seen[blockID]; dup {
+			continue
+		}
+		seen[blockID] = struct{}{}
+
+		var storageClass string
+		if err := database.Session().Query(`
+			SELECT storage_class FROM blocks WHERE org_id = ? AND block_id = ?
+		`, orgID, blockID).Scan(&storageClass); err != nil {
+			loadErr = errors.Join(loadErr, fmt.Errorf("load storage class for block %s: %w", blockID, err))
+			continue
+		}
+		storageClass = strings.TrimSpace(storageClass)
+		if storageClass == "" {
+			loadErr = errors.Join(loadErr, fmt.Errorf("load storage class for block %s: empty canonical storage class", blockID))
+			continue
+		}
+		grouped[storageClass] = append(grouped[storageClass], blockID)
+	}
+	return grouped, loadErr
+}
+
 func runSameRepoMoveTagMutation(database *db.DB, repoID, oldPath, newPath string, moveByPrefix bool, replacedCleanupPath string, replacedCleanupByPrefix bool) {
 	if replacedCleanupPath != "" {
 		if replacedCleanupByPrefix {
@@ -122,14 +156,21 @@ func enqueueZeroRefBlocks(database *db.DB, orgID, repoID string, blockIDs []stri
 		return
 	}
 
-	var storageClass string
-	if err := database.Session().Query(`
-		SELECT storage_class FROM libraries WHERE org_id = ? AND library_id = ?
-	`, orgID, repoID).Scan(&storageClass); err != nil {
-		log.Printf("[enqueueZeroRefBlocks] failed to load storage class for repo %s: %v", repoID, err)
+	grouped, err := loadZeroRefBlockStorageClassesFn(database, orgID, blockIDs)
+	if err != nil {
+		log.Printf("[enqueueZeroRefBlocks] failed to load canonical block storage classes for repo %s: %v", repoID, err)
+	}
+	if len(grouped) == 0 {
 		return
 	}
-	blockEnqueuer.EnqueueBlocks(orgID, blockIDs, storageClass)
+	classes := make([]string, 0, len(grouped))
+	for storageClass := range grouped {
+		classes = append(classes, storageClass)
+	}
+	sort.Strings(classes)
+	for _, storageClass := range classes {
+		blockEnqueuer.EnqueueBlocks(orgID, grouped[storageClass], storageClass)
+	}
 }
 
 func batchOperationErrorResponse(err error, opType, itemName string) (int, gin.H, string) {
@@ -561,7 +602,11 @@ func (h *BatchOperationHandler) processSingleItem(orgID, userID, srcRepoID, dstR
 
 		entryFSID := srcResult.TargetEntry.ID
 		var pendingCopiedFiles []*pendingPublishedFile
-		cleanupPendingCopyPublish := func() {}
+		cleanupPendingCopyPublish := func() {
+			if cleanupErr := CleanupFailedPublishArtifacts(h.db, orgID, dstRepoID, "", "", pendingPublishedFileFSIDs(pendingCopiedFiles), nil); cleanupErr != nil {
+				log.Printf("[processSingleItem] WARNING: failed to clean up pending copied fs_objects before commit publish: %v", cleanupErr)
+			}
+		}
 		if srcRepoID != dstRepoID {
 			newFSID, copiedFiles, err := fsHelper.copyFSObjectToLibraryForPublish(srcRepoID, dstRepoID, srcResult.TargetEntry.ID)
 			pendingCopiedFiles = copiedFiles
@@ -627,7 +672,7 @@ func (h *BatchOperationHandler) processSingleItem(orgID, userID, srcRepoID, dstR
 		}
 		if len(pendingCopiedFiles) > 0 {
 			if err := fsHelper.stagePendingPublishedFiles(orgID, dstRepoID, newDstCommitID, pendingCopiedFiles); err != nil {
-				if cleanupErr := db.CleanupFailedPublishAttempt(h.db, orgID, dstRepoID, newDstCommitID, newDstCommitID, pendingPublishedFileInternalBlockIDs(pendingCopiedFiles)); cleanupErr != nil {
+				if cleanupErr := CleanupFailedPublishArtifacts(h.db, orgID, dstRepoID, newDstCommitID, newDstCommitID, pendingPublishedFileFSIDs(pendingCopiedFiles), pendingPublishedFileInternalBlockIDs(pendingCopiedFiles)); cleanupErr != nil {
 					return errors.Join(
 						fmt.Errorf("failed to stage destination publish-attempt refs for commit %s: %w", newDstCommitID, err),
 						fmt.Errorf("cleanup failed publish commit %s: %w", newDstCommitID, cleanupErr),
@@ -636,7 +681,7 @@ func (h *BatchOperationHandler) processSingleItem(orgID, userID, srcRepoID, dstR
 				return fmt.Errorf("failed to stage destination publish-attempt refs for commit %s: %w", newDstCommitID, err)
 			}
 			if err := queuePendingPublishedFileRepairs(h.db, orgID, dstRepoID, newDstCommitID, pendingCopiedFiles); err != nil {
-				cleanupErr := db.CleanupFailedPublishAttempt(h.db, orgID, dstRepoID, newDstCommitID, newDstCommitID, pendingPublishedFileInternalBlockIDs(pendingCopiedFiles))
+				cleanupErr := CleanupFailedPublishArtifacts(h.db, orgID, dstRepoID, newDstCommitID, newDstCommitID, pendingPublishedFileFSIDs(pendingCopiedFiles), pendingPublishedFileInternalBlockIDs(pendingCopiedFiles))
 				clearErr := clearPendingPublishedFileRepairs(h.db, orgID, dstRepoID, newDstCommitID, pendingCopiedFiles)
 				return errors.Join(
 					fmt.Errorf("failed to queue durable publish repair for destination commit %s: %w", newDstCommitID, err),
@@ -648,7 +693,7 @@ func (h *BatchOperationHandler) processSingleItem(orgID, userID, srcRepoID, dstR
 
 		if err := fsHelper.UpdateLibraryHeadFromSnapshot(dstSnapshot, dstRepoID, newDstCommitID, dstSnapshot.HeadCommitID); err != nil {
 			if len(pendingCopiedFiles) > 0 && errors.Is(err, ErrLibraryHeadConflict) {
-				if cleanupErr := db.CleanupFailedPublishAttempt(h.db, orgID, dstRepoID, newDstCommitID, newDstCommitID, pendingPublishedFileInternalBlockIDs(pendingCopiedFiles)); cleanupErr != nil {
+				if cleanupErr := CleanupFailedPublishArtifacts(h.db, orgID, dstRepoID, newDstCommitID, newDstCommitID, pendingPublishedFileFSIDs(pendingCopiedFiles), pendingPublishedFileInternalBlockIDs(pendingCopiedFiles)); cleanupErr != nil {
 					return fmt.Errorf("failed to clean up conflict copy publish attempt %s: %w", newDstCommitID, cleanupErr)
 				}
 				if clearErr := clearPendingPublishedFileRepairs(h.db, orgID, dstRepoID, newDstCommitID, pendingCopiedFiles); clearErr != nil {

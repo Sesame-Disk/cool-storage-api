@@ -239,6 +239,42 @@ func TestWorker_ProcessBlock_RefCountZeroButLiveFSObjectReferenceSkipsDelete(t *
 	}
 }
 
+func TestWorker_ProcessBlock_UsesCanonicalStorageClassForDeleteTracking(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	w := NewWorker(store, nil, q, 100, 0, false, stats)
+
+	orgID := uuid.New()
+	store.AddOrganization(orgID)
+	store.AddBlock(orgID, "block-canonical-cold", "cold-tier", 0)
+	queuedAt := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
+	if err := store.EnqueueItem(orgID, queuedAt, ItemBlock, "block-canonical-cold", uuid.Nil, "hot-tier", 0); err != nil {
+		t.Fatalf("EnqueueItem() error = %v", err)
+	}
+
+	n, err := w.ProcessOnce(context.Background())
+	if err != nil {
+		t.Fatalf("ProcessOnce() error = %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("ProcessOnce() processed = %d, want 1", n)
+	}
+	if store.GetBlock(orgID, "block-canonical-cold") != nil {
+		t.Fatal("expected block row to be finalized from DB")
+	}
+	orphans := store.AllS3Orphans()
+	if len(orphans) != 1 {
+		t.Fatalf("AllS3Orphans() len = %d, want 1", len(orphans))
+	}
+	if orphans[0].BlockID != "block-canonical-cold" {
+		t.Fatalf("orphan block = %q, want block-canonical-cold", orphans[0].BlockID)
+	}
+	if orphans[0].StorageClass != "cold-tier" {
+		t.Fatalf("orphan storage_class = %q, want cold-tier", orphans[0].StorageClass)
+	}
+}
+
 func TestWorker_ProcessBlock_LiveFSObjectReferenceViaMappedIDSkipsDelete(t *testing.T) {
 	store := NewMockStore()
 	sp := &MockStorageProvider{}

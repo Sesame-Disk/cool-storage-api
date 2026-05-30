@@ -878,20 +878,6 @@ func (s *CassandraStore) SumOrgQueueStats() (int, int, error) {
 	}
 	return totalQueue, totalFailed, nil
 }
-
-// MarkItemProcessed attempts to insert the taskID into the gc_processed_items table.
-// The table has a default TTL of 35 days so entries outlive failed-item retention.
-// Returns applied=true if this is the first time (safe to proceed), false if already processed.
-func (s *CassandraStore) MarkItemProcessed(taskID uuid.UUID) (bool, error) {
-	// USING TTL must come before IF NOT EXISTS in CQL syntax.
-	// We omit USING TTL here because the table already has default_time_to_live = 3024000.
-	var existingTaskID string
-	applied, err := s.db.Session().Query(`
-		INSERT INTO gc_processed_items (task_id) VALUES (?) IF NOT EXISTS
-	`, taskID.String()).ScanCAS(&existingTaskID)
-	return applied, err
-}
-
 func (s *CassandraStore) GetUserDeletedAt(orgID, userID uuid.UUID) (*time.Time, error) {
 	var status string
 	var deletedAt *time.Time
@@ -1319,6 +1305,17 @@ func (s *CassandraStore) BlockExists(orgID uuid.UUID, blockID string) (bool, err
 // BlockHasReferences reports whether any block_references row still exists.
 func (s *CassandraStore) BlockHasReferences(orgID uuid.UUID, blockID string) (bool, error) {
 	return s.db.BlockHasReferences(orgID.String(), blockID)
+}
+
+func (s *CassandraStore) GetBlockInfo(orgID uuid.UUID, blockID string) (BlockInfo, error) {
+	info := BlockInfo{BlockID: blockID}
+	err := s.db.Session().Query(`
+		SELECT storage_class FROM blocks WHERE org_id = ? AND block_id = ?
+	`, orgID.String(), blockID).Scan(&info.StorageClass)
+	if err != nil {
+		return BlockInfo{}, err
+	}
+	return info, nil
 }
 
 // RemoveBlockReference deletes one (block, referrer) reference row (idempotent).

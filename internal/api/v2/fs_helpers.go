@@ -918,6 +918,14 @@ func (h *FSHelper) resolveStoredBlockIDs(orgID string, blockIDs []string) ([]str
 	return streaming.BatchResolveBlockIDs(h.db, orgID, blockIDs)
 }
 
+// ResolveStoredBlockIDs maps external SHA-1 block IDs to the internal SHA-256
+// block IDs stored in Cassandra. Callers that need block-liveness operations
+// outside package v2 should resolve first and then stage/promote on the
+// resulting internal IDs.
+func (h *FSHelper) ResolveStoredBlockIDs(orgID string, blockIDs []string) ([]string, error) {
+	return resolveStoredBlockIDsFn(h, orgID, blockIDs)
+}
+
 // RegisterUploadedBlock records freshly-uploaded block metadata plus a
 // provisional reference that keeps the block alive until its fs_object is
 // committed. The provisional reference carries a TTL, so an abandoned upload
@@ -1125,6 +1133,17 @@ type pendingPublishedFile struct {
 	fsID             string
 	externalBlockIDs []string
 	internalBlockIDs []string
+}
+
+func pendingPublishedFileFSIDs(pendingFiles []*pendingPublishedFile) []string {
+	fsIDs := make([]string, 0, len(pendingFiles))
+	for _, pending := range pendingFiles {
+		if pending == nil {
+			continue
+		}
+		fsIDs = append(fsIDs, pending.fsID)
+	}
+	return fsIDs
 }
 
 func pendingPublishedFileInternalBlockIDs(pendingFiles []*pendingPublishedFile) []string {

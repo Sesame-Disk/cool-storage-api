@@ -1314,7 +1314,7 @@ database:
 - [ ] Implement LWT for user creation
 - [ ] Implement LWT for `head_commit_id` updates (optimistic locking)
 - [x] ~~Convert `blocks.ref_count` to counter table~~ — SUPERSEDED: LWT (IF clauses) incompatible with counter columns. Solved with SELECT→CAS retry loops instead (2026-04-10)
-- [x] Add idempotency keys for retryable operations — DONE: `gc_processed_items` table with `INSERT IF NOT EXISTS` prevents double-decrements (2026-04-10)
+- [x] Retire decrement idempotency markers in favor of row-per-reference liveness — DONE: active GC no longer uses `gc_processed_items`; block liveness is derived from `block_references` plus delete-fence verification (2026-05-30)
 
 ---
 

@@ -130,6 +130,54 @@ func TestScanner_ScanExpiredProvisionalBlockRefs_PreservesLiveBlocks(t *testing.
 	}
 }
 
+func TestScanner_ScanExpiredProvisionalBlockRefs_UsesScanTimeForCandidatePartition(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	s := NewScanner(store, q, stats, config.GCConfig{})
+
+	orgID := uuid.New()
+	blockID := "block-old-expiry"
+	referrer := db.BlockReferrerForUpload("stale-upload")
+	expiresAt := time.Now().Add(-72 * time.Hour).UTC().Truncate(time.Millisecond)
+	beforeScan := time.Now().UTC().Add(-time.Second)
+
+	store.AddOrganization(orgID)
+	store.AddBlock(orgID, blockID, "hot", 0)
+	store.mu.Lock()
+	store.blockReferences[fmt.Sprintf("%s:%s", orgID, blockID)] = map[string]struct{}{referrer: {}}
+	store.mu.Unlock()
+	store.AddProvisionalBlockRefExpiry(orgID, blockID, referrer, "hot", expiresAt)
+
+	cleaned, err := s.scanExpiredProvisionalBlockRefs(context.Background())
+	if err != nil {
+		t.Fatalf("scanExpiredProvisionalBlockRefs() error = %v", err)
+	}
+	if cleaned != 1 {
+		t.Fatalf("scanExpiredProvisionalBlockRefs() cleaned = %d, want 1", cleaned)
+	}
+	afterScan := time.Now().UTC().Add(time.Second)
+
+	oldCandidates, err := store.ListBlockGCCandidatesByDay(expiresAt, db.GCDiscoveryBucket(orgID.String(), blockID))
+	if err != nil {
+		t.Fatalf("ListBlockGCCandidatesByDay(old expiry day) error = %v", err)
+	}
+	if len(oldCandidates) != 0 {
+		t.Fatalf("expected no candidate in old expiry partition, got %#v", oldCandidates)
+	}
+
+	newCandidates, err := store.ListBlockGCCandidatesByDay(beforeScan, db.GCDiscoveryBucket(orgID.String(), blockID))
+	if err != nil {
+		t.Fatalf("ListBlockGCCandidatesByDay(scan day) error = %v", err)
+	}
+	if len(newCandidates) != 1 {
+		t.Fatalf("expected 1 candidate in current partition, got %#v", newCandidates)
+	}
+	if newCandidates[0].CandidateAt.Before(beforeScan) || newCandidates[0].CandidateAt.After(afterScan) {
+		t.Fatalf("candidate_at = %v, want between %v and %v", newCandidates[0].CandidateAt, beforeScan, afterScan)
+	}
+}
+
 func TestScanner_ScanOnce_ReturnsPhaseErrorsButContinues(t *testing.T) {
 	store := NewMockStore()
 	stats := &Stats{}
