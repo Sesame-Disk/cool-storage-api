@@ -177,6 +177,74 @@ func TestCleanupFailedPublishArtifacts_ReturnsCommitDeleteErrorAfterRemovingRefs
 	}
 }
 
+func TestCleanupFailedPublishAttempt_PreservesPendingOwnersWhenArtifactCleanupFails(t *testing.T) {
+	oldDeleteCommit := cleanupFailedPublishDeleteCommitFn
+	oldRelease := releasePendingPublishedFileOwnersFn
+	t.Cleanup(func() {
+		cleanupFailedPublishDeleteCommitFn = oldDeleteCommit
+		releasePendingPublishedFileOwnersFn = oldRelease
+	})
+
+	commitErr := errors.New("commit delete failed")
+	cleanupFailedPublishDeleteCommitFn = func(database *db.DB, repoID, commitID string) error {
+		return commitErr
+	}
+	releaseCalls := 0
+	releasePendingPublishedFileOwnersFn = func(database *db.DB, repoID string, pendingFiles []*pendingPublishedFile) error {
+		releaseCalls++
+		return nil
+	}
+
+	err := CleanupFailedPublishAttempt(&db.DB{}, "org-1", "repo-1", "commit-1", "commit-1", []*pendingPublishedFile{{
+		fsID:             "fs-1",
+		cleanupOwnerID:   "owner-1",
+		cleanupCreatedAt: time.Now().UTC(),
+	}})
+	if !errors.Is(err, commitErr) {
+		t.Fatalf("CleanupFailedPublishAttempt() error = %v, want commitErr %v", err, commitErr)
+	}
+	if releaseCalls != 0 {
+		t.Fatalf("releaseCalls = %d, want 0", releaseCalls)
+	}
+}
+
+func TestClearPendingPublishedFileOwners_DeletesOwnerWithoutReachabilityChecks(t *testing.T) {
+	oldDeletePendingOwner := cleanupFailedPublishDeletePendingOwnerFn
+	oldOwnerExists := cleanupFailedPublishPendingOwnerExistsFn
+	oldReachable := cleanupFailedPublishFSObjectReachableFn
+	t.Cleanup(func() {
+		cleanupFailedPublishDeletePendingOwnerFn = oldDeletePendingOwner
+		cleanupFailedPublishPendingOwnerExistsFn = oldOwnerExists
+		cleanupFailedPublishFSObjectReachableFn = oldReachable
+	})
+
+	deleteCalls := 0
+	cleanupFailedPublishDeletePendingOwnerFn = func(database *db.DB, repoID, fsID, ownerID string, createdAt time.Time) error {
+		deleteCalls++
+		return nil
+	}
+	cleanupFailedPublishPendingOwnerExistsFn = func(database *db.DB, repoID, fsID string) (bool, error) {
+		t.Fatal("clearPendingPublishedFileOwners should not check remaining owners")
+		return false, nil
+	}
+	cleanupFailedPublishFSObjectReachableFn = func(database *db.DB, repoID, fsID string) (bool, error) {
+		t.Fatal("clearPendingPublishedFileOwners should not check reachability")
+		return false, nil
+	}
+
+	err := clearPendingPublishedFileOwners(&db.DB{}, "repo-1", []*pendingPublishedFile{{
+		fsID:             "fs-1",
+		cleanupOwnerID:   "owner-1",
+		cleanupCreatedAt: time.Now().UTC(),
+	}})
+	if err != nil {
+		t.Fatalf("clearPendingPublishedFileOwners() error = %v, want nil", err)
+	}
+	if deleteCalls != 1 {
+		t.Fatalf("deleteCalls = %d, want 1", deleteCalls)
+	}
+}
+
 func TestCleanupFailedPublishAttempt_DeletesPendingFSObjectWhenUnownedAndUnreachable(t *testing.T) {
 	oldDeletePendingOwner := cleanupFailedPublishDeletePendingOwnerFn
 	oldOwnerExists := cleanupFailedPublishPendingOwnerExistsFn
@@ -288,11 +356,11 @@ func TestCleanupFailedPublishAttempt_KeepsPendingFSObjectWhenStillOwnedOrReachab
 func TestRunPendingPublishedFSObjectOwnerSweep_ReleasesOnlyStaleOwners(t *testing.T) {
 	oldNow := pendingPublishedFSObjectOwnerNowFn
 	oldList := listPendingPublishedFSObjectOwnersByDayFn
-	oldRelease := releasePendingPublishedFileOwnerFn
+	oldCleanup := cleanupPendingPublishedFileOwnerAttemptFn
 	t.Cleanup(func() {
 		pendingPublishedFSObjectOwnerNowFn = oldNow
 		listPendingPublishedFSObjectOwnersByDayFn = oldList
-		releasePendingPublishedFileOwnerFn = oldRelease
+		cleanupPendingPublishedFileOwnerAttemptFn = oldCleanup
 	})
 
 	now := time.Date(2026, time.June, 1, 12, 0, 0, 0, time.UTC)
@@ -302,12 +370,18 @@ func TestRunPendingPublishedFSObjectOwnerSweep_ReleasesOnlyStaleOwners(t *testin
 			return nil, nil
 		}
 		return []db.PendingPublishedFSObjectOwner{
-			{RepoID: "repo-1", FSID: "fs-stale", OwnerID: "owner-stale", CreatedAt: now.Add(-pendingPublishedFSObjectOwnerStaleAfter - time.Minute)},
+			{RepoID: "repo-1", FSID: "fs-stale", OwnerID: "owner-stale", CreatedAt: now.Add(-pendingPublishedFSObjectOwnerStaleAfter - time.Minute), OrgID: "org-1", AttemptID: "commit-stale", BlockIDs: []string{"queued-block-1"}},
 			{RepoID: "repo-1", FSID: "fs-fresh", OwnerID: "owner-fresh", CreatedAt: now.Add(-time.Hour)},
 		}, nil
 	}
 	var released []string
-	releasePendingPublishedFileOwnerFn = func(database *db.DB, repoID string, pending *pendingPublishedFile) error {
+	cleanupPendingPublishedFileOwnerAttemptFn = func(database *db.DB, repoID string, pending *pendingPublishedFile) error {
+		if pending.cleanupOrgID != "org-1" || pending.cleanupAttemptID != "commit-stale" {
+			t.Fatalf("pending cleanup metadata = %s/%s, want org-1/commit-stale", pending.cleanupOrgID, pending.cleanupAttemptID)
+		}
+		if len(pending.internalBlockIDs) != 1 || pending.internalBlockIDs[0] != "queued-block-1" {
+			t.Fatalf("pending.internalBlockIDs = %#v, want []string{\"queued-block-1\"}", pending.internalBlockIDs)
+		}
 		released = append(released, repoID+":"+pending.fsID+":"+pending.cleanupOwnerID)
 		return nil
 	}

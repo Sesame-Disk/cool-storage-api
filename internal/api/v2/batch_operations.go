@@ -703,7 +703,7 @@ func (h *BatchOperationHandler) processSingleItem(orgID, userID, srcRepoID, dstR
 			return fmt.Errorf("failed to update destination library: %w", err)
 		}
 		if len(pendingCopiedFiles) > 0 {
-			if ownerErr := releasePendingPublishedFileOwners(h.db, dstRepoID, pendingCopiedFiles); ownerErr != nil {
+			if ownerErr := clearPendingPublishedFileOwnersFn(h.db, dstRepoID, pendingCopiedFiles); ownerErr != nil {
 				log.Printf("[processSingleItem] WARNING: published repo=%s commit=%s but failed to clear pending copied fs_object owners: %v", dstRepoID, newDstCommitID, ownerErr)
 			}
 			if err := fsHelper.promotePendingPublishedFiles(orgID, dstRepoID, newDstCommitID, pendingCopiedFiles); err != nil {

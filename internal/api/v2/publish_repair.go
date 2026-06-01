@@ -196,9 +196,15 @@ var cleanupFailedPublishFSObjectReachableFn = func(database *db.DB, repoID, fsID
 	return failedPublishFSObjectReachable(database, repoID, fsID)
 }
 
+var clearPendingPublishedFileOwnersFn = clearPendingPublishedFileOwners
+
+var clearPendingPublishedFileOwnerFn = clearPendingPublishedFileOwner
+
 var releasePendingPublishedFileOwnersFn = releasePendingPublishedFileOwners
 
 var releasePendingPublishedFileOwnerFn = releasePendingPublishedFileOwner
+
+var cleanupPendingPublishedFileOwnerAttemptFn = cleanupPendingPublishedFileOwnerAttempt
 
 var pendingPublishedFSObjectOwnerNowFn = time.Now
 
@@ -232,14 +238,38 @@ func CleanupFailedPublishArtifacts(database *db.DB, orgID, repoID, attemptID, co
 }
 
 func CleanupFailedPublishAttempt(database *db.DB, orgID, repoID, attemptID, commitID string, pendingFiles []*pendingPublishedFile) error {
-	var cleanupErr error
 	if err := CleanupFailedPublishArtifacts(database, orgID, repoID, attemptID, commitID, pendingPublishedFileFSIDs(pendingFiles), pendingPublishedFileInternalBlockIDs(pendingFiles)); err != nil {
-		cleanupErr = errors.Join(cleanupErr, err)
+		return err
 	}
-	if err := releasePendingPublishedFileOwnersFn(database, repoID, pendingFiles); err != nil {
-		cleanupErr = errors.Join(cleanupErr, err)
+	return releasePendingPublishedFileOwnersFn(database, repoID, pendingFiles)
+}
+
+func clearPendingPublishedFileOwners(database *db.DB, repoID string, pendingFiles []*pendingPublishedFile) error {
+	if database == nil || strings.TrimSpace(repoID) == "" {
+		return nil
 	}
-	return cleanupErr
+	var clearErr error
+	for _, pending := range pendingFiles {
+		if err := clearPendingPublishedFileOwnerFn(database, repoID, pending); err != nil {
+			clearErr = errors.Join(clearErr, err)
+		}
+	}
+	return clearErr
+}
+
+func clearPendingPublishedFileOwner(database *db.DB, repoID string, pending *pendingPublishedFile) error {
+	if database == nil || pending == nil {
+		return nil
+	}
+	fsID := strings.TrimSpace(pending.fsID)
+	ownerID := strings.TrimSpace(pending.cleanupOwnerID)
+	if fsID == "" || ownerID == "" {
+		return nil
+	}
+	if err := cleanupFailedPublishDeletePendingOwnerFn(database, repoID, fsID, ownerID, pending.cleanupCreatedAt); err != nil {
+		return fmt.Errorf("clear pending publish owner for fs_object %s: %w", fsID, err)
+	}
+	return nil
 }
 
 func releasePendingPublishedFileOwners(database *db.DB, repoID string, pendingFiles []*pendingPublishedFile) error {
@@ -293,6 +323,41 @@ func ReleasePendingPublishedFSObjectOwner(database *db.DB, repoID, fsID, ownerID
 		cleanupOwnerID:   ownerID,
 		cleanupCreatedAt: createdAt,
 	})
+}
+
+func ClearPendingPublishedFSObjectOwner(database *db.DB, repoID, fsID, ownerID string, createdAt time.Time) error {
+	return clearPendingPublishedFileOwner(database, repoID, &pendingPublishedFile{
+		fsID:             fsID,
+		cleanupOwnerID:   ownerID,
+		cleanupCreatedAt: createdAt,
+	})
+}
+
+func cleanupPendingPublishedFileOwnerAttempt(database *db.DB, repoID string, pending *pendingPublishedFile) error {
+	if err := cleanupPendingPublishedFileAttemptArtifacts(database, repoID, pending); err != nil {
+		return err
+	}
+	return releasePendingPublishedFileOwner(database, repoID, pending)
+}
+
+func cleanupPendingPublishedFileAttemptArtifacts(database *db.DB, repoID string, pending *pendingPublishedFile) error {
+	if database == nil || pending == nil {
+		return nil
+	}
+	fsID := strings.TrimSpace(pending.fsID)
+	attemptID := strings.TrimSpace(pending.cleanupAttemptID)
+	if fsID == "" || attemptID == "" {
+		return nil
+	}
+	blockIDs := db.NormalizeBlockIDs(pending.internalBlockIDs)
+	orgID := strings.TrimSpace(pending.cleanupOrgID)
+	if len(blockIDs) > 0 && orgID == "" {
+		return fmt.Errorf("cleanup metadata for fs_object %s is missing org_id", fsID)
+	}
+	if err := CleanupFailedPublishArtifacts(database, orgID, repoID, attemptID, attemptID, []string{fsID}, blockIDs); err != nil {
+		return fmt.Errorf("cleanup failed publish artifacts for fs_object %s attempt %s: %w", fsID, attemptID, err)
+	}
+	return nil
 }
 
 func failedPublishFSObjectReachable(database *db.DB, repoID, targetFSID string) (bool, error) {
@@ -594,10 +659,13 @@ func runPendingPublishedFSObjectOwnerSweep(database *db.DB) error {
 				}
 				pending := &pendingPublishedFile{
 					fsID:             owner.FSID,
+					internalBlockIDs: append([]string(nil), owner.BlockIDs...),
 					cleanupOwnerID:   owner.OwnerID,
 					cleanupCreatedAt: owner.CreatedAt,
+					cleanupOrgID:     owner.OrgID,
+					cleanupAttemptID: owner.AttemptID,
 				}
-				if err := releasePendingPublishedFileOwnerFn(database, owner.RepoID, pending); err != nil {
+				if err := cleanupPendingPublishedFileOwnerAttemptFn(database, owner.RepoID, pending); err != nil {
 					log.Printf("[publish_repair] stale pending fs_object owner cleanup failed for repo=%s fs_object=%s owner=%s: %v", owner.RepoID, owner.FSID, owner.OwnerID, err)
 					if firstErr == nil {
 						firstErr = err

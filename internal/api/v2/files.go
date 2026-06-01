@@ -1306,7 +1306,7 @@ func (h *FileHandler) CreateFile(c *gin.Context) {
 			}
 			return err
 		}
-		if ownerErr := releasePendingPublishedFileOwners(h.db, repoID, pendingFiles); ownerErr != nil {
+		if ownerErr := clearPendingPublishedFileOwnersFn(h.db, repoID, pendingFiles); ownerErr != nil {
 			log.Printf("[CreateFile] WARNING: published repo=%s commit=%s but failed to clear pending fs_object owners: %v", repoID, commitID, ownerErr)
 		}
 		if err := fsHelper.promotePendingPublishedFiles(orgID, repoID, commitID, pendingFiles); err != nil {
@@ -3122,7 +3122,7 @@ func (h *FileHandler) finalizeStoredUploadMetadataOnce(fsHelper *FSHelper, orgID
 		}
 		return "", 0, 0, fmt.Errorf("failed to update library: %w", err)
 	}
-	if ownerErr := releasePendingPublishedFileOwners(h.db, repoID, pendingFiles); ownerErr != nil {
+	if ownerErr := clearPendingPublishedFileOwnersFn(h.db, repoID, pendingFiles); ownerErr != nil {
 		log.Printf("[UploadFile] WARNING: published repo=%s commit=%s but failed to clear pending fs_object owners: %v", repoID, newCommitID, ownerErr)
 	}
 	if err := fsHelper.promotePendingPublishedFiles(orgID, repoID, newCommitID, pendingFiles); err != nil {

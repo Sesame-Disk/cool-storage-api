@@ -13,21 +13,36 @@ type PendingPublishedFSObjectOwner struct {
 	FSID      string
 	OwnerID   string
 	CreatedAt time.Time
+	OrgID     string
+	AttemptID string
+	BlockIDs  []string
 }
 
-func AddUpsertPendingPublishedFSObjectOwnerQueries(batch *gocql.Batch, repoID, fsID, ownerID string, createdAt time.Time) {
+func AddUpsertPendingPublishedFSObjectOwnerQueries(batch *gocql.Batch, repoID, fsID, ownerID string, createdAt time.Time, orgID, attemptID string, blockIDs []string) {
 	if batch == nil || repoID == "" || fsID == "" || ownerID == "" || createdAt.IsZero() {
 		return
 	}
 	createdAt = createdAt.UTC()
+	blockIDs = NormalizeBlockIDs(blockIDs)
+	if orgID == "" && attemptID == "" && len(blockIDs) == 0 {
+		batch.Query(`
+			INSERT INTO pending_published_fs_objects (repo_id, fs_id, owner_id, created_at)
+			VALUES (?, ?, ?, ?)
+		`, repoID, fsID, ownerID, createdAt)
+		batch.Query(`
+			INSERT INTO pending_published_fs_objects_by_day (created_day, bucket, created_at, repo_id, fs_id, owner_id)
+			VALUES (?, ?, ?, ?, ?, ?)
+		`, GCProjectionUTCDate(createdAt), GCDiscoveryBucket(repoID, fsID, ownerID), createdAt, repoID, fsID, ownerID)
+		return
+	}
 	batch.Query(`
-		INSERT INTO pending_published_fs_objects (repo_id, fs_id, owner_id, created_at)
-		VALUES (?, ?, ?, ?)
-	`, repoID, fsID, ownerID, createdAt)
+		INSERT INTO pending_published_fs_objects (repo_id, fs_id, owner_id, created_at, org_id, attempt_id, block_ids)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+	`, repoID, fsID, ownerID, createdAt, orgID, attemptID, blockIDs)
 	batch.Query(`
-		INSERT INTO pending_published_fs_objects_by_day (created_day, bucket, created_at, repo_id, fs_id, owner_id)
-		VALUES (?, ?, ?, ?, ?, ?)
-	`, GCProjectionUTCDate(createdAt), GCDiscoveryBucket(repoID, fsID, ownerID), createdAt, repoID, fsID, ownerID)
+		INSERT INTO pending_published_fs_objects_by_day (created_day, bucket, created_at, repo_id, fs_id, owner_id, org_id, attempt_id, block_ids)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, GCProjectionUTCDate(createdAt), GCDiscoveryBucket(repoID, fsID, ownerID), createdAt, repoID, fsID, ownerID, orgID, attemptID, blockIDs)
 }
 
 func AddDeletePendingPublishedFSObjectOwnerQueries(batch *gocql.Batch, repoID, fsID, ownerID string, createdAt time.Time) {
@@ -45,7 +60,7 @@ func AddDeletePendingPublishedFSObjectOwnerQueries(batch *gocql.Batch, repoID, f
 	`, GCProjectionUTCDate(createdAt), GCDiscoveryBucket(repoID, fsID, ownerID), createdAt, repoID, fsID, ownerID)
 }
 
-func (db *DB) UpsertPendingPublishedFSObjectOwner(repoID, fsID, ownerID string, createdAt time.Time) error {
+func (db *DB) UpsertPendingPublishedFSObjectOwner(repoID, fsID, ownerID string, createdAt time.Time, orgID, attemptID string, blockIDs []string) error {
 	if db == nil || repoID == "" || fsID == "" || ownerID == "" {
 		return nil
 	}
@@ -53,7 +68,7 @@ func (db *DB) UpsertPendingPublishedFSObjectOwner(repoID, fsID, ownerID string, 
 		createdAt = time.Now().UTC()
 	}
 	batch := db.Session().Batch(gocql.LoggedBatch)
-	AddUpsertPendingPublishedFSObjectOwnerQueries(batch, repoID, fsID, ownerID, createdAt)
+	AddUpsertPendingPublishedFSObjectOwnerQueries(batch, repoID, fsID, ownerID, createdAt, orgID, attemptID, blockIDs)
 	if err := db.Session().ExecuteBatch(batch); err != nil {
 		return fmt.Errorf("upsert pending published fs_object owner repo=%s fs=%s owner=%s: %w", repoID, fsID, ownerID, err)
 	}
@@ -108,14 +123,14 @@ func (db *DB) ListPendingPublishedFSObjectOwnersByDay(day time.Time, bucket int)
 		return nil, nil
 	}
 	iter := db.Session().Query(`
-		SELECT created_at, repo_id, fs_id, owner_id
+		SELECT created_at, repo_id, fs_id, owner_id, org_id, attempt_id, block_ids
 		FROM pending_published_fs_objects_by_day
 		WHERE created_day = ? AND bucket = ?
 	`, GCProjectionUTCDate(day), bucket).Iter()
 
 	owners := make([]PendingPublishedFSObjectOwner, 0)
 	var owner PendingPublishedFSObjectOwner
-	for iter.Scan(&owner.CreatedAt, &owner.RepoID, &owner.FSID, &owner.OwnerID) {
+	for iter.Scan(&owner.CreatedAt, &owner.RepoID, &owner.FSID, &owner.OwnerID, &owner.OrgID, &owner.AttemptID, &owner.BlockIDs) {
 		owners = append(owners, owner)
 		owner = PendingPublishedFSObjectOwner{}
 	}

@@ -782,6 +782,9 @@ CREATE TABLE IF NOT EXISTS pending_published_fs_objects (
     fs_id      TEXT,
     owner_id   TEXT,
     created_at TIMESTAMP,
+    org_id     UUID,
+    attempt_id TEXT,
+    block_ids  LIST<TEXT>,
     PRIMARY KEY ((repo_id, fs_id), owner_id)
 ) WITH default_time_to_live = 604800;
 
@@ -795,6 +798,9 @@ CREATE TABLE IF NOT EXISTS pending_published_fs_objects_by_day (
     repo_id     UUID,
     fs_id       TEXT,
     owner_id    TEXT,
+    org_id      UUID,
+    attempt_id  TEXT,
+    block_ids   LIST<TEXT>,
     PRIMARY KEY ((created_day, bucket), created_at, repo_id, fs_id, owner_id)
 ) WITH CLUSTERING ORDER BY (created_at ASC, repo_id ASC, fs_id ASC, owner_id ASC)
   AND default_time_to_live = 604800;

@@ -1174,6 +1174,8 @@ type pendingPublishedFile struct {
 	internalBlockIDs []string
 	cleanupOwnerID   string
 	cleanupCreatedAt time.Time
+	cleanupOrgID     string
+	cleanupAttemptID string
 }
 
 func pendingPublishedFileFSIDs(pendingFiles []*pendingPublishedFile) []string {
@@ -1253,6 +1255,16 @@ func (h *FSHelper) stagePendingPublishedFiles(orgID, repoID, attemptID string, p
 		}
 
 		stagedBlockIDs = append(stagedBlockIDs, pending.internalBlockIDs...)
+	}
+	for _, pending := range pendingFiles {
+		if pending == nil {
+			continue
+		}
+		pending.cleanupOrgID = orgID
+		pending.cleanupAttemptID = attemptID
+	}
+	if err := h.bindPendingPublishedFileAttempts(repoID, pendingFiles); err != nil {
+		return rollbackStagedRefs(stagedBlockIDs, fmt.Errorf("persist pending publish-attempt metadata: %w", err))
 	}
 
 	return nil
@@ -1340,9 +1352,31 @@ func (h *FSHelper) createPendingPublishedFileRow(repoID, name string, size int64
 		INSERT INTO fs_objects (library_id, fs_id, obj_type, obj_name, block_ids, size_bytes, mtime)
 		VALUES (?, ?, ?, ?, ?, ?, ?)
 	`, repoID, pending.fsID, "file", name, pending.externalBlockIDs, size, time.Now().Unix())
-	db.AddUpsertPendingPublishedFSObjectOwnerQueries(batch, repoID, pending.fsID, pending.cleanupOwnerID, pending.cleanupCreatedAt)
+	db.AddUpsertPendingPublishedFSObjectOwnerQueries(batch, repoID, pending.fsID, pending.cleanupOwnerID, pending.cleanupCreatedAt, "", "", nil)
 	if err := h.db.Session().ExecuteBatch(batch); err != nil {
 		return fmt.Errorf("failed to create tracked fs_object: %w", err)
+	}
+	return nil
+}
+
+func (h *FSHelper) bindPendingPublishedFileAttempts(repoID string, pendingFiles []*pendingPublishedFile) error {
+	if h == nil || h.db == nil {
+		return nil
+	}
+	batch := h.db.Session().Batch(gocql.LoggedBatch)
+	updates := 0
+	for _, pending := range pendingFiles {
+		if pending == nil || pending.fsID == "" || pending.cleanupOwnerID == "" || pending.cleanupCreatedAt.IsZero() {
+			continue
+		}
+		db.AddUpsertPendingPublishedFSObjectOwnerQueries(batch, repoID, pending.fsID, pending.cleanupOwnerID, pending.cleanupCreatedAt, pending.cleanupOrgID, pending.cleanupAttemptID, pending.internalBlockIDs)
+		updates++
+	}
+	if updates == 0 {
+		return nil
+	}
+	if err := h.db.Session().ExecuteBatch(batch); err != nil {
+		return fmt.Errorf("failed to bind tracked fs_object publish attempts: %w", err)
 	}
 	return nil
 }

@@ -478,9 +478,11 @@ func TestFinalizeSeafHTTPPublishedBlockReferences_UsesStagedInternalIDsForPromot
 func TestCleanupSeafHTTPFailedPublishAttempt_JoinsArtifactCleanupAndQueueClear(t *testing.T) {
 	oldCleanup := cleanupSeafHTTPFailedPublishAttemptFn
 	oldClear := clearPublishedFSObjectBlockReferenceRepairFn
+	oldRelease := releaseSeafHTTPPendingFSObjectOwnerFn
 	t.Cleanup(func() {
 		cleanupSeafHTTPFailedPublishAttemptFn = oldCleanup
 		clearPublishedFSObjectBlockReferenceRepairFn = oldClear
+		releaseSeafHTTPPendingFSObjectOwnerFn = oldRelease
 	})
 
 	cleanupErr := errors.New("cleanup failed")
@@ -499,6 +501,11 @@ func TestCleanupSeafHTTPFailedPublishAttempt_JoinsArtifactCleanupAndQueueClear(t
 		}
 		return cleanupErr
 	}
+	releaseCalls := 0
+	releaseSeafHTTPPendingFSObjectOwnerFn = func(database *db.DB, repoID, fsID, ownerID string, createdAt time.Time) error {
+		releaseCalls++
+		return nil
+	}
 	clearCalls := 0
 	clearPublishedFSObjectBlockReferenceRepairFn = func(database *db.DB, orgID, repoID, commitID, fsID string) error {
 		clearCalls++
@@ -512,14 +519,17 @@ func TestCleanupSeafHTTPFailedPublishAttempt_JoinsArtifactCleanupAndQueueClear(t
 	if !errors.Is(err, cleanupErr) {
 		t.Fatalf("cleanupSeafHTTPFailedPublishAttempt() error = %v, want cleanupErr %v", err, cleanupErr)
 	}
-	if !errors.Is(err, clearErr) {
-		t.Fatalf("cleanupSeafHTTPFailedPublishAttempt() error = %v, want clearErr %v", err, clearErr)
+	if errors.Is(err, clearErr) {
+		t.Fatalf("cleanupSeafHTTPFailedPublishAttempt() error = %v, do not want clearErr %v", err, clearErr)
 	}
 	if cleanupCalls != 1 {
 		t.Fatalf("cleanupCalls = %d, want 1", cleanupCalls)
 	}
-	if clearCalls != 1 {
-		t.Fatalf("clearCalls = %d, want 1", clearCalls)
+	if releaseCalls != 0 {
+		t.Fatalf("releaseCalls = %d, want 0", releaseCalls)
+	}
+	if clearCalls != 0 {
+		t.Fatalf("clearCalls = %d, want 0", clearCalls)
 	}
 }
 

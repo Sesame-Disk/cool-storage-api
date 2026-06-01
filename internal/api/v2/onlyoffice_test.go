@@ -125,9 +125,11 @@ func TestOnlyOfficeResolveLibraryBlockStoreUsesLocalRegion(t *testing.T) {
 func TestCleanupOnlyOfficeFailedPublishAttempt_JoinsRepairCleanupAndQueueClear(t *testing.T) {
 	oldCleanup := onlyOfficeCleanupFailedPublishAttemptFn
 	oldClear := onlyOfficeClearPendingPublishedFileRepairsFn
+	oldRelease := releasePendingPublishedFileOwnersFn
 	t.Cleanup(func() {
 		onlyOfficeCleanupFailedPublishAttemptFn = oldCleanup
 		onlyOfficeClearPendingPublishedFileRepairsFn = oldClear
+		releasePendingPublishedFileOwnersFn = oldRelease
 	})
 
 	cleanupErr := errors.New("cleanup failed")
@@ -146,6 +148,11 @@ func TestCleanupOnlyOfficeFailedPublishAttempt_JoinsRepairCleanupAndQueueClear(t
 		}
 		return cleanupErr
 	}
+	releaseCalls := 0
+	releasePendingPublishedFileOwnersFn = func(database *db.DB, repoID string, pendingFiles []*pendingPublishedFile) error {
+		releaseCalls++
+		return nil
+	}
 	clearCalls := 0
 	onlyOfficeClearPendingPublishedFileRepairsFn = func(database *db.DB, orgID, repoID, commitID string, pendingFiles []*pendingPublishedFile) error {
 		clearCalls++
@@ -159,14 +166,17 @@ func TestCleanupOnlyOfficeFailedPublishAttempt_JoinsRepairCleanupAndQueueClear(t
 	if !errors.Is(err, cleanupErr) {
 		t.Fatalf("cleanupOnlyOfficeFailedPublishAttempt() error = %v, want cleanupErr %v", err, cleanupErr)
 	}
-	if !errors.Is(err, clearErr) {
-		t.Fatalf("cleanupOnlyOfficeFailedPublishAttempt() error = %v, want clearErr %v", err, clearErr)
+	if errors.Is(err, clearErr) {
+		t.Fatalf("cleanupOnlyOfficeFailedPublishAttempt() error = %v, do not want clearErr %v", err, clearErr)
 	}
 	if cleanupCalls != 1 {
 		t.Fatalf("cleanupCalls = %d, want 1", cleanupCalls)
 	}
-	if clearCalls != 1 {
-		t.Fatalf("clearCalls = %d, want 1", clearCalls)
+	if releaseCalls != 0 {
+		t.Fatalf("releaseCalls = %d, want 0", releaseCalls)
+	}
+	if clearCalls != 0 {
+		t.Fatalf("clearCalls = %d, want 0", clearCalls)
 	}
 }
 

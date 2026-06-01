@@ -62,9 +62,12 @@ func cleanupOnlyOfficeFailedPublishAttempt(database *db.DB, orgID, repoID, commi
 	fsIDs := pendingPublishedFileFSIDs(pendingFiles)
 	blockIDs := pendingPublishedFileInternalBlockIDs(pendingFiles)
 	cleanupErr := onlyOfficeCleanupFailedPublishAttemptFn(database, orgID, repoID, commitID, commitID, fsIDs, blockIDs)
-	ownerErr := releasePendingPublishedFileOwners(database, repoID, pendingFiles)
+	if cleanupErr != nil {
+		return cleanupErr
+	}
+	ownerErr := releasePendingPublishedFileOwnersFn(database, repoID, pendingFiles)
 	clearErr := onlyOfficeClearPendingPublishedFileRepairsFn(database, orgID, repoID, commitID, pendingFiles)
-	return errors.Join(cleanupErr, ownerErr, clearErr)
+	return errors.Join(ownerErr, clearErr)
 }
 
 // RegisterOnlyOfficeRoutes registers OnlyOffice routes
@@ -1392,7 +1395,7 @@ func (h *OnlyOfficeHandler) publishEditedDocumentMetadata(fsHelper *FSHelper, or
 			}
 			return fmt.Errorf("failed to update library head: %w", err)
 		}
-		if ownerErr := releasePendingPublishedFileOwners(h.db, repoID, []*pendingPublishedFile{pendingFile}); ownerErr != nil {
+		if ownerErr := clearPendingPublishedFileOwnersFn(h.db, repoID, []*pendingPublishedFile{pendingFile}); ownerErr != nil {
 			log.Printf("OnlyOffice: published repo=%s commit=%s but failed to clear pending fs_object owners: %v", repoID, commitID, ownerErr)
 		}
 		if err := fsHelper.promotePendingPublishedFiles(orgID, repoID, commitID, []*pendingPublishedFile{pendingFile}); err != nil {
