@@ -1,6 +1,7 @@
 package v2
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"hash/fnv"
@@ -18,6 +19,8 @@ const (
 	publishedBlockReferenceRepairSweepInterval = time.Minute
 	publishedBlockReferenceRepairStaleAfter    = 30 * time.Second
 	publishedBlockReferenceRepairPreCASLease   = 5 * time.Minute
+	pendingPublishedFSObjectOwnerStaleAfter    = 24 * time.Hour
+	pendingPublishedFSObjectOwnerLookbackDays  = 7
 )
 
 type publishedBlockReferenceRepair struct {
@@ -87,6 +90,13 @@ var listPublishedBlockReferenceRepairsForBucketFn = func(database *db.DB, bucket
 		return nil, err
 	}
 	return repairs, nil
+}
+
+var listPendingPublishedFSObjectOwnersByDayFn = func(database *db.DB, day time.Time, bucket int) ([]db.PendingPublishedFSObjectOwner, error) {
+	if database == nil {
+		return nil, fmt.Errorf("database not available")
+	}
+	return database.ListPendingPublishedFSObjectOwnersByDay(day, bucket)
 }
 
 var publishedBlockReferenceRepairHeadCommitFn = func(database *db.DB, repoID string) (string, error) {
@@ -159,6 +169,39 @@ var cleanupFailedPublishDeleteCommitFn = func(database *db.DB, repoID, commitID 
 
 var cleanupFailedPublishRemoveAttemptReferencesFn = db.RemovePublishAttemptReferences
 
+var cleanupFailedPublishDeleteFSObjectFn = func(database *db.DB, repoID, fsID string) error {
+	if database == nil {
+		return fmt.Errorf("database not available")
+	}
+	return database.Session().Query(`
+		DELETE FROM fs_objects WHERE library_id = ? AND fs_id = ?
+	`, repoID, fsID).Exec()
+}
+
+var cleanupFailedPublishDeletePendingOwnerFn = func(database *db.DB, repoID, fsID, ownerID string, createdAt time.Time) error {
+	if database == nil {
+		return fmt.Errorf("database not available")
+	}
+	return database.DeletePendingPublishedFSObjectOwner(repoID, fsID, ownerID, createdAt)
+}
+
+var cleanupFailedPublishPendingOwnerExistsFn = func(database *db.DB, repoID, fsID string) (bool, error) {
+	if database == nil {
+		return false, fmt.Errorf("database not available")
+	}
+	return database.PendingPublishedFSObjectOwnerExists(repoID, fsID)
+}
+
+var cleanupFailedPublishFSObjectReachableFn = func(database *db.DB, repoID, fsID string) (bool, error) {
+	return failedPublishFSObjectReachable(database, repoID, fsID)
+}
+
+var releasePendingPublishedFileOwnersFn = releasePendingPublishedFileOwners
+
+var releasePendingPublishedFileOwnerFn = releasePendingPublishedFileOwner
+
+var pendingPublishedFSObjectOwnerNowFn = time.Now
+
 var publishedBlockReferenceRepairPromoteFn = func(helper *FSHelper, orgID, repoID, commitID string, pending *pendingPublishedFile) error {
 	return helper.promotePendingPublishedFiles(orgID, repoID, commitID, []*pendingPublishedFile{pending})
 }
@@ -186,6 +229,139 @@ func CleanupFailedPublishArtifacts(database *db.DB, orgID, repoID, attemptID, co
 		}
 	}
 	return cleanupErr
+}
+
+func CleanupFailedPublishAttempt(database *db.DB, orgID, repoID, attemptID, commitID string, pendingFiles []*pendingPublishedFile) error {
+	var cleanupErr error
+	if err := CleanupFailedPublishArtifacts(database, orgID, repoID, attemptID, commitID, pendingPublishedFileFSIDs(pendingFiles), pendingPublishedFileInternalBlockIDs(pendingFiles)); err != nil {
+		cleanupErr = errors.Join(cleanupErr, err)
+	}
+	if err := releasePendingPublishedFileOwnersFn(database, repoID, pendingFiles); err != nil {
+		cleanupErr = errors.Join(cleanupErr, err)
+	}
+	return cleanupErr
+}
+
+func releasePendingPublishedFileOwners(database *db.DB, repoID string, pendingFiles []*pendingPublishedFile) error {
+	if database == nil || strings.TrimSpace(repoID) == "" {
+		return nil
+	}
+	var releaseErr error
+	for _, pending := range pendingFiles {
+		if err := releasePendingPublishedFileOwnerFn(database, repoID, pending); err != nil {
+			releaseErr = errors.Join(releaseErr, err)
+		}
+	}
+	return releaseErr
+}
+
+func releasePendingPublishedFileOwner(database *db.DB, repoID string, pending *pendingPublishedFile) error {
+	if database == nil || pending == nil {
+		return nil
+	}
+	fsID := strings.TrimSpace(pending.fsID)
+	ownerID := strings.TrimSpace(pending.cleanupOwnerID)
+	if fsID == "" || ownerID == "" {
+		return nil
+	}
+	if err := cleanupFailedPublishDeletePendingOwnerFn(database, repoID, fsID, ownerID, pending.cleanupCreatedAt); err != nil {
+		return fmt.Errorf("release pending publish owner for fs_object %s: %w", fsID, err)
+	}
+	ownersRemain, err := cleanupFailedPublishPendingOwnerExistsFn(database, repoID, fsID)
+	if err != nil {
+		return fmt.Errorf("check remaining pending owners for fs_object %s: %w", fsID, err)
+	}
+	if ownersRemain {
+		return nil
+	}
+	reachable, err := cleanupFailedPublishFSObjectReachableFn(database, repoID, fsID)
+	if err != nil {
+		return fmt.Errorf("check fs_object %s reachability: %w", fsID, err)
+	}
+	if reachable {
+		return nil
+	}
+	if err := cleanupFailedPublishDeleteFSObjectFn(database, repoID, fsID); err != nil {
+		return fmt.Errorf("delete unreached pending fs_object %s: %w", fsID, err)
+	}
+	return nil
+}
+
+func ReleasePendingPublishedFSObjectOwner(database *db.DB, repoID, fsID, ownerID string, createdAt time.Time) error {
+	return releasePendingPublishedFileOwner(database, repoID, &pendingPublishedFile{
+		fsID:             fsID,
+		cleanupOwnerID:   ownerID,
+		cleanupCreatedAt: createdAt,
+	})
+}
+
+func failedPublishFSObjectReachable(database *db.DB, repoID, targetFSID string) (bool, error) {
+	if database == nil || strings.TrimSpace(repoID) == "" || strings.TrimSpace(targetFSID) == "" {
+		return false, nil
+	}
+	iter := database.Session().Query(`
+		SELECT root_fs_id FROM commits WHERE library_id = ?
+	`, repoID).Iter()
+	visited := make(map[string]bool)
+	var rootFSID string
+	for iter.Scan(&rootFSID) {
+		reachable, err := failedPublishFSObjectReachableFromRoot(database, repoID, targetFSID, rootFSID, visited)
+		if err != nil {
+			_ = iter.Close()
+			return false, err
+		}
+		if reachable {
+			if err := iter.Close(); err != nil {
+				return false, fmt.Errorf("close commit iterator for repo %s: %w", repoID, err)
+			}
+			return true, nil
+		}
+	}
+	if err := iter.Close(); err != nil {
+		return false, fmt.Errorf("list commits for repo %s: %w", repoID, err)
+	}
+	return false, nil
+}
+
+func failedPublishFSObjectReachableFromRoot(database *db.DB, repoID, targetFSID, rootFSID string, visited map[string]bool) (bool, error) {
+	if rootFSID == "" {
+		return false, nil
+	}
+	stack := []string{rootFSID}
+	for len(stack) > 0 {
+		current := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		if current == "" || visited[current] {
+			continue
+		}
+		if current == targetFSID {
+			return true, nil
+		}
+		visited[current] = true
+
+		var objType, dirEntriesJSON string
+		err := database.Session().Query(`
+			SELECT obj_type, dir_entries FROM fs_objects WHERE library_id = ? AND fs_id = ?
+		`, repoID, current).Scan(&objType, &dirEntriesJSON)
+		if err != nil {
+			return false, fmt.Errorf("load fs_object %s in repo %s: %w", current, repoID, err)
+		}
+		if objType != "dir" {
+			continue
+		}
+		var entries []FSEntry
+		if dirEntriesJSON != "" && dirEntriesJSON != "[]" {
+			if err := json.Unmarshal([]byte(dirEntriesJSON), &entries); err != nil {
+				return false, fmt.Errorf("decode dir_entries for fs_object %s in repo %s: %w", current, repoID, err)
+			}
+		}
+		for i := len(entries) - 1; i >= 0; i-- {
+			if childID := strings.TrimSpace(entries[i].ID); childID != "" && !visited[childID] {
+				stack = append(stack, childID)
+			}
+		}
+	}
+	return false, nil
 }
 
 func publishedBlockReferenceRepairShouldDeferCleanup(database *db.DB, repair publishedBlockReferenceRepair) (bool, error) {
@@ -394,6 +570,45 @@ func repairPublishedBlockReferenceRepair(database *db.DB, repair publishedBlockR
 	return nil
 }
 
+func runPendingPublishedFSObjectOwnerSweep(database *db.DB) error {
+	if database == nil {
+		return nil
+	}
+	now := pendingPublishedFSObjectOwnerNowFn().UTC()
+	cutoff := now.Add(-pendingPublishedFSObjectOwnerStaleAfter)
+	startDay := db.GCProjectionUTCDate(now.AddDate(0, 0, -pendingPublishedFSObjectOwnerLookbackDays))
+	endDay := db.GCProjectionUTCDate(now)
+	var firstErr error
+	for day := startDay; !day.After(endDay); day = day.AddDate(0, 0, 1) {
+		for bucket := 0; bucket < db.GCDiscoveryBucketCount; bucket++ {
+			owners, err := listPendingPublishedFSObjectOwnersByDayFn(database, day, bucket)
+			if err != nil {
+				if firstErr == nil {
+					firstErr = fmt.Errorf("list pending published fs_object owners for day=%s bucket=%d: %w", db.GCProjectionDateString(day), bucket, err)
+				}
+				continue
+			}
+			for _, owner := range owners {
+				if owner.CreatedAt.IsZero() || owner.CreatedAt.After(cutoff) {
+					continue
+				}
+				pending := &pendingPublishedFile{
+					fsID:             owner.FSID,
+					cleanupOwnerID:   owner.OwnerID,
+					cleanupCreatedAt: owner.CreatedAt,
+				}
+				if err := releasePendingPublishedFileOwnerFn(database, owner.RepoID, pending); err != nil {
+					log.Printf("[publish_repair] stale pending fs_object owner cleanup failed for repo=%s fs_object=%s owner=%s: %v", owner.RepoID, owner.FSID, owner.OwnerID, err)
+					if firstErr == nil {
+						firstErr = err
+					}
+				}
+			}
+		}
+	}
+	return firstErr
+}
+
 func RepairPublishedFSObjectBlockReferenceRepair(database *db.DB, orgID, repoID, commitID, fsID string, stagedBlockIDs []string) error {
 	return repairPublishedBlockReferenceRepair(database, newPublishedBlockReferenceRepair(orgID, repoID, commitID, fsID, stagedBlockIDs))
 }
@@ -436,11 +651,17 @@ func StartPublishedBlockReferenceRepairer(database *db.DB) {
 			if err := runPublishedBlockReferenceRepairSweep(database); err != nil {
 				log.Printf("[publish_repair] initial sweep failed: %v", err)
 			}
+			if err := runPendingPublishedFSObjectOwnerSweep(database); err != nil {
+				log.Printf("[publish_repair] initial pending fs_object owner sweep failed: %v", err)
+			}
 			ticker := publishedBlockReferenceRepairTickerFn(publishedBlockReferenceRepairSweepInterval)
 			defer ticker.Stop()
 			for range ticker.C {
 				if err := runPublishedBlockReferenceRepairSweep(database); err != nil {
 					log.Printf("[publish_repair] periodic sweep failed: %v", err)
+				}
+				if err := runPendingPublishedFSObjectOwnerSweep(database); err != nil {
+					log.Printf("[publish_repair] periodic pending fs_object owner sweep failed: %v", err)
 				}
 			}
 		})

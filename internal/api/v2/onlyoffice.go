@@ -62,8 +62,9 @@ func cleanupOnlyOfficeFailedPublishAttempt(database *db.DB, orgID, repoID, commi
 	fsIDs := pendingPublishedFileFSIDs(pendingFiles)
 	blockIDs := pendingPublishedFileInternalBlockIDs(pendingFiles)
 	cleanupErr := onlyOfficeCleanupFailedPublishAttemptFn(database, orgID, repoID, commitID, commitID, fsIDs, blockIDs)
+	ownerErr := releasePendingPublishedFileOwners(database, repoID, pendingFiles)
 	clearErr := onlyOfficeClearPendingPublishedFileRepairsFn(database, orgID, repoID, commitID, pendingFiles)
-	return errors.Join(cleanupErr, clearErr)
+	return errors.Join(cleanupErr, ownerErr, clearErr)
 }
 
 // RegisterOnlyOfficeRoutes registers OnlyOffice routes
@@ -1309,7 +1310,7 @@ func (h *OnlyOfficeHandler) publishEditedDocumentMetadata(fsHelper *FSHelper, or
 			return fmt.Errorf("failed to create file fs_object: %w", err)
 		}
 		cleanupPendingFilePublish := func() {
-			if cleanupErr := CleanupFailedPublishArtifacts(h.db, orgID, repoID, "", "", []string{pendingFile.fsID}, nil); cleanupErr != nil {
+			if cleanupErr := CleanupFailedPublishAttempt(h.db, orgID, repoID, "", "", []*pendingPublishedFile{pendingFile}); cleanupErr != nil {
 				log.Printf("OnlyOffice: failed to clean up pending fs_object %s before commit publish: %v", pendingFile.fsID, cleanupErr)
 			}
 		}
@@ -1390,6 +1391,9 @@ func (h *OnlyOfficeHandler) publishEditedDocumentMetadata(fsHelper *FSHelper, or
 				}
 			}
 			return fmt.Errorf("failed to update library head: %w", err)
+		}
+		if ownerErr := releasePendingPublishedFileOwners(h.db, repoID, []*pendingPublishedFile{pendingFile}); ownerErr != nil {
+			log.Printf("OnlyOffice: published repo=%s commit=%s but failed to clear pending fs_object owners: %v", repoID, commitID, ownerErr)
 		}
 		if err := fsHelper.promotePendingPublishedFiles(orgID, repoID, commitID, []*pendingPublishedFile{pendingFile}); err != nil {
 			log.Printf("OnlyOffice: WARNING: head updated for repo=%s commit=%s but failed to promote block references for fs_object %s: %v", repoID, commitID, pendingFile.fsID, err)

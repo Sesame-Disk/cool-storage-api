@@ -163,5 +163,8 @@ func TestInitialSchemaContainsLookupNameAndStarredIndex(t *testing.T) {
 	assert.Contains(t, content, "CREATE TABLE IF NOT EXISTS published_block_reference_repairs")
 	assert.Contains(t, content, "staged_block_ids LIST<TEXT>")
 	assert.Contains(t, content, "PRIMARY KEY ((bucket), org_id, repo_id, commit_id, fs_id)")
+	assert.Contains(t, content, "CREATE TABLE IF NOT EXISTS pending_published_fs_objects")
+	assert.Contains(t, content, "CREATE TABLE IF NOT EXISTS pending_published_fs_objects_by_day")
+	assert.Contains(t, content, "PRIMARY KEY ((repo_id, fs_id), owner_id)")
 	assert.NotContains(t, content, "CREATE TABLE IF NOT EXISTS share_links_by_org")
 }

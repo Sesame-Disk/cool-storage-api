@@ -33,6 +33,7 @@ import (
 	"github.com/Sesame-Disk/sesamefs/internal/storage"
 	"github.com/Sesame-Disk/sesamefs/internal/streaming"
 	"github.com/Sesame-Disk/sesamefs/internal/traffic"
+	gocql "github.com/apache/cassandra-gocql-driver/v2"
 	"github.com/gin-gonic/gin"
 	"golang.org/x/sync/errgroup"
 )
@@ -1046,6 +1047,7 @@ var promoteSeafHTTPPublishAttemptReferencesFn = db.PromotePublishAttemptReferenc
 var queuePublishedFSObjectBlockReferenceRepairFn = v2.QueuePublishedFSObjectBlockReferenceRepair
 var clearPublishedFSObjectBlockReferenceRepairFn = v2.ClearPublishedFSObjectBlockReferenceRepair
 var schedulePublishedFSObjectBlockReferenceRepairFn = v2.SchedulePublishedFSObjectBlockReferenceRepair
+var releaseSeafHTTPPendingFSObjectOwnerFn = v2.ReleasePendingPublishedFSObjectOwner
 var clearSeafHTTPS3OrphanFenceFn = clearSeafHTTPS3OrphanFence
 var seafHTTPBlockMaterializationRetryBackoffFn = v2.RetryBackoff
 var seafHTTPBlockMaterializationSleepFn = time.Sleep
@@ -1918,7 +1920,8 @@ func stageSeafHTTPPublishAttemptReferences(fsHelper *v2.FSHelper, database *db.D
 func cleanupSeafHTTPFailedPublishAttempt(database *db.DB, orgID, repoID, commitID, fsID string, blockIDs []string) error {
 	cleanupErr := cleanupSeafHTTPFailedPublishAttemptFn(database, orgID, repoID, commitID, commitID, []string{fsID}, blockIDs)
 	clearErr := clearPublishedFSObjectBlockReferenceRepairFn(database, orgID, repoID, commitID, fsID)
-	return errors.Join(cleanupErr, clearErr)
+	ownerErr := releaseSeafHTTPPendingFSObjectOwnerFn(database, repoID, fsID, commitID, time.Time{})
+	return errors.Join(cleanupErr, clearErr, ownerErr)
 }
 
 func finalizeSeafHTTPPublishedBlockReferences(fsHelper *v2.FSHelper, database *db.DB, orgID, repoID, commitID, fsID, label string, externalBlockIDs, stagedBlockIDs []string) {
@@ -1993,10 +1996,14 @@ func (h *SeafHTTPHandler) commitUploadedFileMultiBlockOnce(orgID, repoID, userID
 	if err != nil {
 		return "", "", 0, 0, fmt.Errorf("failed to stage publish-attempt block references: %w", err)
 	}
-	err = h.db.Session().Query(`
+	createdAt := time.Now().UTC()
+	batch := h.db.Session().Batch(gocql.LoggedBatch)
+	batch.Query(`
 		INSERT INTO fs_objects (library_id, fs_id, obj_type, obj_name, full_path, size_bytes, mtime, block_ids)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-	`, repoID, fileFSID, "file", actualFilename, fullPath, fileSize, time.Now().Unix(), blockIDs).Exec()
+	`, repoID, fileFSID, "file", actualFilename, fullPath, fileSize, createdAt.Unix(), blockIDs)
+	db.AddUpsertPendingPublishedFSObjectOwnerQueries(batch, repoID, fileFSID, newCommitID, createdAt)
+	err = h.db.Session().ExecuteBatch(batch)
 	if err != nil {
 		_ = db.RemovePublishAttemptReferences(h.db, orgID, newCommitID, stagedBlockIDs)
 		return "", "", 0, 0, fmt.Errorf("failed to create file fs_object: %w", err)
@@ -2025,6 +2032,9 @@ func (h *SeafHTTPHandler) commitUploadedFileMultiBlockOnce(orgID, repoID, userID
 			}
 		}
 		return "", "", 0, 0, fmt.Errorf("failed to update library head: %w", err)
+	}
+	if ownerErr := releaseSeafHTTPPendingFSObjectOwnerFn(h.db, repoID, fileFSID, newCommitID, createdAt); ownerErr != nil {
+		log.Printf("[commitUploadedFileMultiBlock] WARNING: published repo=%s commit=%s but failed to clear pending fs_object owner for %s: %v", repoID, newCommitID, fileFSID, ownerErr)
 	}
 	finalizeSeafHTTPPublishedBlockReferences(fsHelper, h.db, orgID, repoID, newCommitID, fileFSID, "commitUploadedFileMultiBlock", blockIDs, stagedBlockIDs)
 
@@ -2136,10 +2146,14 @@ func (h *SeafHTTPHandler) commitUploadedFileOnce(orgID, repoID, userID, parentDi
 	if err != nil {
 		return "", "", 0, 0, fmt.Errorf("failed to stage publish-attempt block references: %w", err)
 	}
-	err = h.db.Session().Query(`
+	createdAt := time.Now().UTC()
+	batch := h.db.Session().Batch(gocql.LoggedBatch)
+	batch.Query(`
 		INSERT INTO fs_objects (library_id, fs_id, obj_type, obj_name, full_path, size_bytes, mtime, block_ids)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-	`, repoID, fileFSID, "file", actualFilename, fullPath, fileSize, time.Now().Unix(), []string{blockID}).Exec()
+	`, repoID, fileFSID, "file", actualFilename, fullPath, fileSize, createdAt.Unix(), []string{blockID})
+	db.AddUpsertPendingPublishedFSObjectOwnerQueries(batch, repoID, fileFSID, newCommitID, createdAt)
+	err = h.db.Session().ExecuteBatch(batch)
 	if err != nil {
 		_ = db.RemovePublishAttemptReferences(h.db, orgID, newCommitID, stagedBlockIDs)
 		return "", "", 0, 0, fmt.Errorf("failed to create file fs_object: %w", err)
@@ -2169,6 +2183,9 @@ func (h *SeafHTTPHandler) commitUploadedFileOnce(orgID, repoID, userID, parentDi
 			}
 		}
 		return "", "", 0, 0, fmt.Errorf("failed to update library head: %w", err)
+	}
+	if ownerErr := releaseSeafHTTPPendingFSObjectOwnerFn(h.db, repoID, fileFSID, newCommitID, createdAt); ownerErr != nil {
+		log.Printf("[commitUploadedFile] WARNING: published repo=%s commit=%s but failed to clear pending fs_object owner for %s: %v", repoID, newCommitID, fileFSID, ownerErr)
 	}
 	finalizeSeafHTTPPublishedBlockReferences(fsHelper, h.db, orgID, repoID, newCommitID, fileFSID, "commitUploadedFile", []string{blockID}, stagedBlockIDs)
 

@@ -603,7 +603,7 @@ func (h *BatchOperationHandler) processSingleItem(orgID, userID, srcRepoID, dstR
 		entryFSID := srcResult.TargetEntry.ID
 		var pendingCopiedFiles []*pendingPublishedFile
 		cleanupPendingCopyPublish := func() {
-			if cleanupErr := CleanupFailedPublishArtifacts(h.db, orgID, dstRepoID, "", "", pendingPublishedFileFSIDs(pendingCopiedFiles), nil); cleanupErr != nil {
+			if cleanupErr := CleanupFailedPublishAttempt(h.db, orgID, dstRepoID, "", "", pendingCopiedFiles); cleanupErr != nil {
 				log.Printf("[processSingleItem] WARNING: failed to clean up pending copied fs_objects before commit publish: %v", cleanupErr)
 			}
 		}
@@ -672,7 +672,7 @@ func (h *BatchOperationHandler) processSingleItem(orgID, userID, srcRepoID, dstR
 		}
 		if len(pendingCopiedFiles) > 0 {
 			if err := fsHelper.stagePendingPublishedFiles(orgID, dstRepoID, newDstCommitID, pendingCopiedFiles); err != nil {
-				if cleanupErr := CleanupFailedPublishArtifacts(h.db, orgID, dstRepoID, newDstCommitID, newDstCommitID, pendingPublishedFileFSIDs(pendingCopiedFiles), pendingPublishedFileInternalBlockIDs(pendingCopiedFiles)); cleanupErr != nil {
+				if cleanupErr := CleanupFailedPublishAttempt(h.db, orgID, dstRepoID, newDstCommitID, newDstCommitID, pendingCopiedFiles); cleanupErr != nil {
 					return errors.Join(
 						fmt.Errorf("failed to stage destination publish-attempt refs for commit %s: %w", newDstCommitID, err),
 						fmt.Errorf("cleanup failed publish commit %s: %w", newDstCommitID, cleanupErr),
@@ -681,7 +681,7 @@ func (h *BatchOperationHandler) processSingleItem(orgID, userID, srcRepoID, dstR
 				return fmt.Errorf("failed to stage destination publish-attempt refs for commit %s: %w", newDstCommitID, err)
 			}
 			if err := queuePendingPublishedFileRepairs(h.db, orgID, dstRepoID, newDstCommitID, pendingCopiedFiles); err != nil {
-				cleanupErr := CleanupFailedPublishArtifacts(h.db, orgID, dstRepoID, newDstCommitID, newDstCommitID, pendingPublishedFileFSIDs(pendingCopiedFiles), pendingPublishedFileInternalBlockIDs(pendingCopiedFiles))
+				cleanupErr := CleanupFailedPublishAttempt(h.db, orgID, dstRepoID, newDstCommitID, newDstCommitID, pendingCopiedFiles)
 				clearErr := clearPendingPublishedFileRepairs(h.db, orgID, dstRepoID, newDstCommitID, pendingCopiedFiles)
 				return errors.Join(
 					fmt.Errorf("failed to queue durable publish repair for destination commit %s: %w", newDstCommitID, err),
@@ -693,7 +693,7 @@ func (h *BatchOperationHandler) processSingleItem(orgID, userID, srcRepoID, dstR
 
 		if err := fsHelper.UpdateLibraryHeadFromSnapshot(dstSnapshot, dstRepoID, newDstCommitID, dstSnapshot.HeadCommitID); err != nil {
 			if len(pendingCopiedFiles) > 0 && errors.Is(err, ErrLibraryHeadConflict) {
-				if cleanupErr := CleanupFailedPublishArtifacts(h.db, orgID, dstRepoID, newDstCommitID, newDstCommitID, pendingPublishedFileFSIDs(pendingCopiedFiles), pendingPublishedFileInternalBlockIDs(pendingCopiedFiles)); cleanupErr != nil {
+				if cleanupErr := CleanupFailedPublishAttempt(h.db, orgID, dstRepoID, newDstCommitID, newDstCommitID, pendingCopiedFiles); cleanupErr != nil {
 					return fmt.Errorf("failed to clean up conflict copy publish attempt %s: %w", newDstCommitID, cleanupErr)
 				}
 				if clearErr := clearPendingPublishedFileRepairs(h.db, orgID, dstRepoID, newDstCommitID, pendingCopiedFiles); clearErr != nil {
@@ -703,6 +703,9 @@ func (h *BatchOperationHandler) processSingleItem(orgID, userID, srcRepoID, dstR
 			return fmt.Errorf("failed to update destination library: %w", err)
 		}
 		if len(pendingCopiedFiles) > 0 {
+			if ownerErr := releasePendingPublishedFileOwners(h.db, dstRepoID, pendingCopiedFiles); ownerErr != nil {
+				log.Printf("[processSingleItem] WARNING: published repo=%s commit=%s but failed to clear pending copied fs_object owners: %v", dstRepoID, newDstCommitID, ownerErr)
+			}
 			if err := fsHelper.promotePendingPublishedFiles(orgID, dstRepoID, newDstCommitID, pendingCopiedFiles); err != nil {
 				log.Printf("[processSingleItem] WARNING: head updated for repo=%s commit=%s but failed to promote copied block references: %v", dstRepoID, newDstCommitID, err)
 				schedulePendingPublishedFileRepairs(h.db, orgID, dstRepoID, newDstCommitID, pendingCopiedFiles, "BatchOperationDestination")

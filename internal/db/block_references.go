@@ -247,9 +247,6 @@ func StagePublishAttemptReferences(database *DB, orgID, repoID, attemptID string
 	return staged, nil
 }
 
-// CleanupFailedPublishAttempt removes the losing commit row and its attempt-local
-// publish refs after a confirmed HEAD conflict.
-
 // PromotePublishAttemptReferences promotes an already-published fs_object to its
 // permanent refs and then removes the temporary attempt-local pub:<attempt> rows.
 // Both steps are idempotent, so bounded retries safely heal transient failures

@@ -1222,7 +1222,7 @@ func (h *FileHandler) CreateFile(c *gin.Context) {
 			return fmt.Errorf("failed to create file: %w", err)
 		}
 		cleanupPendingFilePublish := func() {
-			if cleanupErr := CleanupFailedPublishArtifacts(h.db, orgID, repoID, "", "", []string{pendingFile.fsID}, nil); cleanupErr != nil {
+			if cleanupErr := CleanupFailedPublishAttempt(h.db, orgID, repoID, "", "", []*pendingPublishedFile{pendingFile}); cleanupErr != nil {
 				log.Printf("[CreateFile] WARNING: failed to clean up pending fs_object %s before commit publish: %v", pendingFile.fsID, cleanupErr)
 			}
 		}
@@ -1276,7 +1276,7 @@ func (h *FileHandler) CreateFile(c *gin.Context) {
 			return fmt.Errorf("failed to create commit: %w", err)
 		}
 		if err := fsHelper.stagePendingPublishedFiles(orgID, repoID, commitID, pendingFiles); err != nil {
-			if cleanupErr := CleanupFailedPublishArtifacts(h.db, orgID, repoID, commitID, commitID, pendingPublishedFileFSIDs(pendingFiles), pendingPublishedFileInternalBlockIDs(pendingFiles)); cleanupErr != nil {
+			if cleanupErr := CleanupFailedPublishAttempt(h.db, orgID, repoID, commitID, commitID, pendingFiles); cleanupErr != nil {
 				return errors.Join(
 					fmt.Errorf("failed to stage publish-attempt block references for commit %s: %w", commitID, err),
 					fmt.Errorf("cleanup failed publish commit %s: %w", commitID, cleanupErr),
@@ -1285,7 +1285,7 @@ func (h *FileHandler) CreateFile(c *gin.Context) {
 			return fmt.Errorf("failed to stage publish-attempt block references for commit %s: %w", commitID, err)
 		}
 		if err := queuePendingPublishedFileRepairs(h.db, orgID, repoID, commitID, pendingFiles); err != nil {
-			cleanupErr := CleanupFailedPublishArtifacts(h.db, orgID, repoID, commitID, commitID, pendingPublishedFileFSIDs(pendingFiles), pendingPublishedFileInternalBlockIDs(pendingFiles))
+			cleanupErr := CleanupFailedPublishAttempt(h.db, orgID, repoID, commitID, commitID, pendingFiles)
 			clearErr := clearPendingPublishedFileRepairs(h.db, orgID, repoID, commitID, pendingFiles)
 			return errors.Join(
 				fmt.Errorf("failed to queue durable publish repair for commit %s: %w", commitID, err),
@@ -1297,7 +1297,7 @@ func (h *FileHandler) CreateFile(c *gin.Context) {
 
 		if err := fsHelper.UpdateLibraryHeadFromSnapshot(snapshot, repoID, commitID, snapshot.HeadCommitID); err != nil {
 			if errors.Is(err, ErrLibraryHeadConflict) {
-				if cleanupErr := CleanupFailedPublishArtifacts(h.db, orgID, repoID, commitID, commitID, pendingPublishedFileFSIDs(pendingFiles), pendingPublishedFileInternalBlockIDs(pendingFiles)); cleanupErr != nil {
+				if cleanupErr := CleanupFailedPublishAttempt(h.db, orgID, repoID, commitID, commitID, pendingFiles); cleanupErr != nil {
 					return fmt.Errorf("failed to clean up conflict publish attempt %s: %w", commitID, cleanupErr)
 				}
 				if clearErr := clearPendingPublishedFileRepairs(h.db, orgID, repoID, commitID, pendingFiles); clearErr != nil {
@@ -1305,6 +1305,9 @@ func (h *FileHandler) CreateFile(c *gin.Context) {
 				}
 			}
 			return err
+		}
+		if ownerErr := releasePendingPublishedFileOwners(h.db, repoID, pendingFiles); ownerErr != nil {
+			log.Printf("[CreateFile] WARNING: published repo=%s commit=%s but failed to clear pending fs_object owners: %v", repoID, commitID, ownerErr)
 		}
 		if err := fsHelper.promotePendingPublishedFiles(orgID, repoID, commitID, pendingFiles); err != nil {
 			log.Printf("[CreateFile] WARNING: head updated for repo=%s commit=%s but failed to promote block references for fs_object %s: %v", repoID, commitID, pendingFile.fsID, err)
@@ -3032,14 +3035,11 @@ func (h *FileHandler) finalizeStoredUploadMetadataOnce(fsHelper *FSHelper, orgID
 	}
 
 	blockIDs := []string{fileID}
-	fileFSID, err := buildFileFSObjectID(blockIDs, fileSize)
+	pendingFile, err := newPendingPublishedFile(blockIDs, fileSize)
 	if err != nil {
 		return "", 0, 0, fmt.Errorf("failed to create file metadata: %w", err)
 	}
-	pendingFile := &pendingPublishedFile{
-		fsID:             fileFSID,
-		externalBlockIDs: append([]string(nil), blockIDs...),
-	}
+	fileFSID := pendingFile.fsID
 
 	newEntry := FSEntry{
 		ID:    fileFSID,
@@ -3078,12 +3078,12 @@ func (h *FileHandler) finalizeStoredUploadMetadataOnce(fsHelper *FSHelper, orgID
 	}
 
 	description := fmt.Sprintf("Added or modified \"%s\".\n", actualFilename)
-	if err := fsHelper.createFileFSObjectRow(repoID, fileFSID, actualFilename, fileSize, blockIDs); err != nil {
+	if err := fsHelper.createPendingPublishedFileRow(repoID, actualFilename, fileSize, pendingFile); err != nil {
 		return "", 0, 0, fmt.Errorf("failed to create file metadata: %w", err)
 	}
 	pendingFiles := []*pendingPublishedFile{pendingFile}
 	cleanupPendingFilePublish := func() {
-		if cleanupErr := CleanupFailedPublishArtifacts(h.db, orgID, repoID, "", "", pendingPublishedFileFSIDs(pendingFiles), nil); cleanupErr != nil {
+		if cleanupErr := CleanupFailedPublishAttempt(h.db, orgID, repoID, "", "", pendingFiles); cleanupErr != nil {
 			log.Printf("[UploadFile] WARNING: failed to clean up pending fs_object %s before commit publish: %v", pendingFile.fsID, cleanupErr)
 		}
 	}
@@ -3093,7 +3093,7 @@ func (h *FileHandler) finalizeStoredUploadMetadataOnce(fsHelper *FSHelper, orgID
 		return "", 0, 0, fmt.Errorf("failed to create commit: %w", err)
 	}
 	if err := fsHelper.stagePendingPublishedFiles(orgID, repoID, newCommitID, pendingFiles); err != nil {
-		if cleanupErr := CleanupFailedPublishArtifacts(h.db, orgID, repoID, newCommitID, newCommitID, pendingPublishedFileFSIDs(pendingFiles), pendingPublishedFileInternalBlockIDs(pendingFiles)); cleanupErr != nil {
+		if cleanupErr := CleanupFailedPublishAttempt(h.db, orgID, repoID, newCommitID, newCommitID, pendingFiles); cleanupErr != nil {
 			return "", 0, 0, errors.Join(
 				fmt.Errorf("failed to stage publish-attempt block references for commit %s: %w", newCommitID, err),
 				fmt.Errorf("cleanup failed publish commit %s: %w", newCommitID, cleanupErr),
@@ -3102,7 +3102,7 @@ func (h *FileHandler) finalizeStoredUploadMetadataOnce(fsHelper *FSHelper, orgID
 		return "", 0, 0, fmt.Errorf("failed to stage publish-attempt block references for commit %s: %w", newCommitID, err)
 	}
 	if err := queuePendingPublishedFileRepairs(h.db, orgID, repoID, newCommitID, pendingFiles); err != nil {
-		cleanupErr := CleanupFailedPublishArtifacts(h.db, orgID, repoID, newCommitID, newCommitID, pendingPublishedFileFSIDs(pendingFiles), pendingPublishedFileInternalBlockIDs(pendingFiles))
+		cleanupErr := CleanupFailedPublishAttempt(h.db, orgID, repoID, newCommitID, newCommitID, pendingFiles)
 		clearErr := clearPendingPublishedFileRepairs(h.db, orgID, repoID, newCommitID, pendingFiles)
 		return "", 0, 0, errors.Join(
 			fmt.Errorf("failed to queue durable publish repair for commit %s: %w", newCommitID, err),
@@ -3113,7 +3113,7 @@ func (h *FileHandler) finalizeStoredUploadMetadataOnce(fsHelper *FSHelper, orgID
 
 	if err := fsHelper.UpdateLibraryHeadFromSnapshot(snapshot, repoID, newCommitID, snapshot.HeadCommitID); err != nil {
 		if errors.Is(err, ErrLibraryHeadConflict) {
-			if cleanupErr := CleanupFailedPublishArtifacts(h.db, orgID, repoID, newCommitID, newCommitID, pendingPublishedFileFSIDs(pendingFiles), pendingPublishedFileInternalBlockIDs(pendingFiles)); cleanupErr != nil {
+			if cleanupErr := CleanupFailedPublishAttempt(h.db, orgID, repoID, newCommitID, newCommitID, pendingFiles); cleanupErr != nil {
 				return "", 0, 0, fmt.Errorf("failed to clean up conflict publish attempt %s: %w", newCommitID, cleanupErr)
 			}
 			if clearErr := clearPendingPublishedFileRepairs(h.db, orgID, repoID, newCommitID, pendingFiles); clearErr != nil {
@@ -3121,6 +3121,9 @@ func (h *FileHandler) finalizeStoredUploadMetadataOnce(fsHelper *FSHelper, orgID
 			}
 		}
 		return "", 0, 0, fmt.Errorf("failed to update library: %w", err)
+	}
+	if ownerErr := releasePendingPublishedFileOwners(h.db, repoID, pendingFiles); ownerErr != nil {
+		log.Printf("[UploadFile] WARNING: published repo=%s commit=%s but failed to clear pending fs_object owners: %v", repoID, newCommitID, ownerErr)
 	}
 	if err := fsHelper.promotePendingPublishedFiles(orgID, repoID, newCommitID, pendingFiles); err != nil {
 		log.Printf("[UploadFile] WARNING: head updated for repo=%s commit=%s but failed to promote block references for fs_object %s: %v", repoID, newCommitID, fileFSID, err)

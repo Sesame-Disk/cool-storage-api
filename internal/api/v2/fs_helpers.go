@@ -15,6 +15,7 @@ import (
 	"github.com/Sesame-Disk/sesamefs/internal/db"
 	"github.com/Sesame-Disk/sesamefs/internal/streaming"
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
+	"github.com/google/uuid"
 )
 
 // FSHelper provides helper functions for file system operations
@@ -1171,6 +1172,8 @@ type pendingPublishedFile struct {
 	fsID             string
 	externalBlockIDs []string
 	internalBlockIDs []string
+	cleanupOwnerID   string
+	cleanupCreatedAt time.Time
 }
 
 func pendingPublishedFileFSIDs(pendingFiles []*pendingPublishedFile) []string {
@@ -1195,20 +1198,30 @@ func pendingPublishedFileInternalBlockIDs(pendingFiles []*pendingPublishedFile) 
 	return blockIDs
 }
 
-func (h *FSHelper) prepareFileFSObjectForPublish(repoID, name string, size int64, blockIDs []string) (*pendingPublishedFile, error) {
+func newPendingPublishedFile(blockIDs []string, size int64) (*pendingPublishedFile, error) {
 	fsID, err := buildFileFSObjectID(blockIDs, size)
 	if err != nil {
 		return nil, err
 	}
-
-	if err := h.createFileFSObjectRow(repoID, fsID, name, size, blockIDs); err != nil {
-		return nil, err
-	}
-
 	return &pendingPublishedFile{
 		fsID:             fsID,
 		externalBlockIDs: append([]string(nil), blockIDs...),
+		cleanupOwnerID:   uuid.NewString(),
+		cleanupCreatedAt: time.Now().UTC(),
 	}, nil
+}
+
+func (h *FSHelper) prepareFileFSObjectForPublish(repoID, name string, size int64, blockIDs []string) (*pendingPublishedFile, error) {
+	pending, err := newPendingPublishedFile(blockIDs, size)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := h.createPendingPublishedFileRow(repoID, name, size, pending); err != nil {
+		return nil, err
+	}
+
+	return pending, nil
 }
 
 func (h *FSHelper) stagePendingPublishedFiles(orgID, repoID, attemptID string, pendingFiles []*pendingPublishedFile) error {
@@ -1313,6 +1326,25 @@ func (h *FSHelper) copyFSObjectToLibraryForPublish(srcRepoID, dstRepoID, fsID st
 	}
 
 	return newDirFSID, pendingFiles, nil
+}
+
+func (h *FSHelper) createPendingPublishedFileRow(repoID, name string, size int64, pending *pendingPublishedFile) error {
+	if h == nil || h.db == nil {
+		return fmt.Errorf("failed to create tracked fs_object: database not available")
+	}
+	if pending == nil || pending.fsID == "" {
+		return fmt.Errorf("failed to create tracked fs_object: pending file missing fs_id")
+	}
+	batch := h.db.Session().Batch(gocql.LoggedBatch)
+	batch.Query(`
+		INSERT INTO fs_objects (library_id, fs_id, obj_type, obj_name, block_ids, size_bytes, mtime)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+	`, repoID, pending.fsID, "file", name, pending.externalBlockIDs, size, time.Now().Unix())
+	db.AddUpsertPendingPublishedFSObjectOwnerQueries(batch, repoID, pending.fsID, pending.cleanupOwnerID, pending.cleanupCreatedAt)
+	if err := h.db.Session().ExecuteBatch(batch); err != nil {
+		return fmt.Errorf("failed to create tracked fs_object: %w", err)
+	}
+	return nil
 }
 
 func (h *FSHelper) createFileFSObjectRow(repoID, fsID, name string, size int64, blockIDs []string) error {
