@@ -35,6 +35,7 @@ import (
 	"github.com/Sesame-Disk/sesamefs/internal/traffic"
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -1033,7 +1034,13 @@ const finalizeUploadConcurrency = 8
 // finalizations does not fan out Paxos pressure on the blocks table.
 const finalizeUploadBlockMetadataConcurrency = 1
 
+const (
+	seafHTTPUploadFinalizeLeaseTTL          = 30 * time.Second
+	seafHTTPUploadFinalizeLeasePollInterval = 25 * time.Millisecond
+)
+
 var finalizeUploadBlockMetadataPermits = make(chan struct{}, finalizeUploadBlockMetadataConcurrency)
+var chunkedUploadLibraryFinalizePermits sync.Map
 var putUploadedBlockAutoFn = func(ctx context.Context, blockStore *storage.BlockStore, hash string, data []byte) (string, error) {
 	return blockStore.PutBlockAuto(ctx, hash, data)
 }
@@ -1052,6 +1059,7 @@ var clearSeafHTTPPendingFSObjectOwnerFn = v2.ClearPendingPublishedFSObjectOwner
 var clearSeafHTTPS3OrphanFenceFn = clearSeafHTTPS3OrphanFence
 var seafHTTPBlockMaterializationRetryBackoffFn = v2.RetryBackoff
 var seafHTTPBlockMaterializationSleepFn = time.Sleep
+var seafHTTPUploadFinalizeLeaseSleepFn = time.Sleep
 var checkUploadStorageQuotaForCurrentHeadFn = func(h *SeafHTTPHandler, orgID, repoID, userID, parentDir, filename string, fileSize int64, replace bool) (int64, int64, error) {
 	return h.checkUploadStorageQuotaForCurrentHead(orgID, repoID, userID, parentDir, filename, fileSize, replace)
 }
@@ -1070,6 +1078,73 @@ func acquireFinalizeUploadBlockMetadataPermit(ctx context.Context) (func(), erro
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
+}
+
+func acquireChunkedUploadLibraryFinalizePermit(ctx context.Context, repoID string) (func(), error) {
+	repoID = strings.TrimSpace(repoID)
+	if repoID == "" {
+		return func() {}, nil
+	}
+	permitAny, _ := chunkedUploadLibraryFinalizePermits.LoadOrStore(repoID, make(chan struct{}, 1))
+	permit := permitAny.(chan struct{})
+	select {
+	case permit <- struct{}{}:
+		return func() { <-permit }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func acquireSeafHTTPDistributedUploadFinalizeLease(ctx context.Context, database *db.DB, repoID string) (func(), error) {
+	repoID = strings.TrimSpace(repoID)
+	if database == nil || repoID == "" {
+		return func() {}, nil
+	}
+	leaseRole := "upload-finalize:" + repoID
+	leaseToken := uuid.NewString()
+	ttlSeconds := int(seafHTTPUploadFinalizeLeaseTTL / time.Second)
+	for {
+		applied, err := database.Session().Query(`
+			INSERT INTO gc_leases (role, instance_id, heartbeat)
+			VALUES (?, ?, ?) IF NOT EXISTS USING TTL ?
+		`, leaseRole, leaseToken, time.Now().UTC(), ttlSeconds).WithContext(ctx).MapScanCAS(map[string]interface{}{})
+		if err != nil {
+			return nil, fmt.Errorf("acquire upload finalize lease for repo %s: %w", repoID, err)
+		}
+		if applied {
+			return func() {
+				releaseCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				if err := database.Session().Query(`
+					DELETE FROM gc_leases WHERE role = ? IF instance_id = ?
+				`, leaseRole, leaseToken).WithContext(releaseCtx).Exec(); err != nil {
+					log.Printf("[uploadFinalizeLease] Best-effort lease release failed for repo=%s token=%s: %v", repoID, leaseToken, err)
+				}
+			}, nil
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
+		seafHTTPUploadFinalizeLeaseSleepFn(seafHTTPUploadFinalizeLeasePollInterval)
+	}
+}
+
+func acquireSeafHTTPUploadFinalizePermit(ctx context.Context, database *db.DB, repoID string) (func(), error) {
+	releaseLocalPermit, err := acquireChunkedUploadLibraryFinalizePermit(ctx, repoID)
+	if err != nil {
+		return nil, err
+	}
+	releaseDistributedLease, err := acquireSeafHTTPDistributedUploadFinalizeLease(ctx, database, repoID)
+	if err != nil {
+		releaseLocalPermit()
+		return nil, err
+	}
+	return func() {
+		releaseDistributedLease()
+		releaseLocalPermit()
+	}, nil
 }
 
 // HandleUpload handles file uploads via the upload token.
@@ -1333,11 +1408,12 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 	var storeUploadedBlock func() error
 	if err != nil {
 		log.Printf("[HandleUpload] Failed to get block store: %v, falling back to S3", err)
-		objectStore, _, resolveErr := h.resolveLibraryObjectStore(httputil.GetRoutingHostname(c, h.configuredServerURL()), token.OrgID, token.RepoID)
+		objectStore, objectStorageClass, resolveErr := h.resolveLibraryObjectStore(httputil.GetRoutingHostname(c, h.configuredServerURL()), token.OrgID, token.RepoID)
 		if resolveErr != nil {
 			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "block storage not available"})
 			return
 		}
+		actualStorageClass = objectStorageClass
 		storeUploadedBlock = func() error {
 			_, putErr := objectStore.Put(c.Request.Context(), storageKey, newBytesReader(storedContent), int64(len(storedContent)))
 			return putErr
@@ -1375,6 +1451,13 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 	}
 
 	// Update filesystem metadata
+	releaseFinalizePermit, err := acquireSeafHTTPUploadFinalizePermit(c.Request.Context(), h.db, token.RepoID)
+	if err != nil {
+		writeSeafHTTPUploadError(c, err, "file stored but metadata update failed")
+		return
+	}
+	defer releaseFinalizePermit()
+
 	commitID, actualFilename, storageDeltaBytes, storageDeltaFiles, err := h.commitUploadedFile(token.OrgID, token.RepoID, token.UserID, parentDir, filename, fileID, chunkData, finalSize, replaceFile)
 	if err != nil {
 		h.handleSingleShotMetadataError(token, sha256ID, err)
@@ -1851,6 +1934,11 @@ readLoop:
 	fileID := hex.EncodeToString(sha1Hasher.Sum(nil))
 
 	log.Printf("[finalizeUploadStreaming] Stored %d blocks for file %s (size=%d, parallelism=%d)", len(blockSHA1IDs), fileID[:16], totalSize, finalizeUploadConcurrency)
+	releaseFinalizePermit, err := acquireSeafHTTPUploadFinalizePermit(c.Request.Context(), h.db, token.RepoID)
+	if err != nil {
+		return "", "", 0, 0, err
+	}
+	defer releaseFinalizePermit()
 
 	commitID, actualFilename, storageDeltaBytes, storageDeltaFiles, err := h.commitUploadedFileMultiBlock(token.OrgID, token.RepoID, token.UserID, parentDir, filename, fileID, blockSHA1IDs, totalSize, replace)
 	if err != nil {

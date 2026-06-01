@@ -20,7 +20,7 @@ const (
 	publishedBlockReferenceRepairStaleAfter    = 30 * time.Second
 	publishedBlockReferenceRepairPreCASLease   = 5 * time.Minute
 	pendingPublishedFSObjectOwnerStaleAfter    = 24 * time.Hour
-	pendingPublishedFSObjectOwnerLookbackDays  = 7
+	pendingPublishedFSObjectOwnerLookbackDays  = 30
 )
 
 type publishedBlockReferenceRepair struct {
@@ -196,6 +196,17 @@ var cleanupFailedPublishFSObjectReachableFn = func(database *db.DB, repoID, fsID
 	return failedPublishFSObjectReachable(database, repoID, fsID)
 }
 
+var failedPublishReachabilityLoadFSObjectFn = func(database *db.DB, repoID, fsID string) (string, string, error) {
+	if database == nil {
+		return "", "", fmt.Errorf("database not available")
+	}
+	var objType, dirEntriesJSON string
+	err := database.Session().Query(`
+			SELECT obj_type, dir_entries FROM fs_objects WHERE library_id = ? AND fs_id = ?
+		`, repoID, fsID).Scan(&objType, &dirEntriesJSON)
+	return objType, dirEntriesJSON, err
+}
+
 var clearPendingPublishedFileOwnersFn = clearPendingPublishedFileOwners
 
 var clearPendingPublishedFileOwnerFn = clearPendingPublishedFileOwner
@@ -205,6 +216,8 @@ var releasePendingPublishedFileOwnersFn = releasePendingPublishedFileOwners
 var releasePendingPublishedFileOwnerFn = releasePendingPublishedFileOwner
 
 var cleanupPendingPublishedFileOwnerAttemptFn = cleanupPendingPublishedFileOwnerAttempt
+
+var cleanupPendingPublishedFileAttemptCommitReachableFn = publishedBlockReferenceRepairCommitReachableFn
 
 var pendingPublishedFSObjectOwnerNowFn = time.Now
 
@@ -334,6 +347,20 @@ func ClearPendingPublishedFSObjectOwner(database *db.DB, repoID, fsID, ownerID s
 }
 
 func cleanupPendingPublishedFileOwnerAttempt(database *db.DB, repoID string, pending *pendingPublishedFile) error {
+	if database == nil || pending == nil {
+		return nil
+	}
+	attemptID := strings.TrimSpace(pending.cleanupAttemptID)
+	if attemptID == "" {
+		return fmt.Errorf("pending publish owner for fs_object %s is missing cleanup attempt metadata", strings.TrimSpace(pending.fsID))
+	}
+	reachable, err := cleanupPendingPublishedFileAttemptCommitReachableFn(database, repoID, attemptID)
+	if err != nil {
+		return fmt.Errorf("check publish attempt commit %s reachability for fs_object %s: %w", attemptID, strings.TrimSpace(pending.fsID), err)
+	}
+	if reachable {
+		return clearPendingPublishedFileOwner(database, repoID, pending)
+	}
 	if err := cleanupPendingPublishedFileAttemptArtifacts(database, repoID, pending); err != nil {
 		return err
 	}
@@ -404,11 +431,11 @@ func failedPublishFSObjectReachableFromRoot(database *db.DB, repoID, targetFSID,
 		}
 		visited[current] = true
 
-		var objType, dirEntriesJSON string
-		err := database.Session().Query(`
-			SELECT obj_type, dir_entries FROM fs_objects WHERE library_id = ? AND fs_id = ?
-		`, repoID, current).Scan(&objType, &dirEntriesJSON)
+		objType, dirEntriesJSON, err := failedPublishReachabilityLoadFSObjectFn(database, repoID, current)
 		if err != nil {
+			if errors.Is(err, gocql.ErrNotFound) {
+				continue
+			}
 			return false, fmt.Errorf("load fs_object %s in repo %s: %w", current, repoID, err)
 		}
 		if objType != "dir" {

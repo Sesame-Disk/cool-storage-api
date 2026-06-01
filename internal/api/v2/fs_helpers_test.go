@@ -497,11 +497,31 @@ func TestStagePendingPublishedFiles_AssignsResolvedInternalBlockIDs(t *testing.T
 	oldResolve := stagePendingPublishedFilesResolveFn
 	oldAdd := stagePendingPublishedFilesAddReferencesFn
 	oldRemove := stagePendingPublishedFilesRemoveReferencesFn
+	oldPersist := stagePendingPublishedFilesPersistFn
 	t.Cleanup(func() {
 		stagePendingPublishedFilesResolveFn = oldResolve
 		stagePendingPublishedFilesAddReferencesFn = oldAdd
 		stagePendingPublishedFilesRemoveReferencesFn = oldRemove
+		stagePendingPublishedFilesPersistFn = oldPersist
 	})
+
+	persistCalls := 0
+	stagePendingPublishedFilesPersistFn = func(h *FSHelper, repoID string, pending *pendingPublishedFile) error {
+		persistCalls++
+		if repoID != "repo-1" {
+			t.Fatalf("persist repoID = %q, want repo-1", repoID)
+		}
+		if pending.fsID != "fs-1" {
+			t.Fatalf("persist fsID = %q, want fs-1", pending.fsID)
+		}
+		if pending.cleanupOrgID != "org-1" || pending.cleanupAttemptID != "commit-1" {
+			t.Fatalf("persist metadata = %q/%q, want org-1/commit-1", pending.cleanupOrgID, pending.cleanupAttemptID)
+		}
+		if len(pending.internalBlockIDs) != 1 || pending.internalBlockIDs[0] != "sha256-1" {
+			t.Fatalf("persist internalBlockIDs = %#v, want []string{\"sha256-1\"}", pending.internalBlockIDs)
+		}
+		return nil
+	}
 
 	resolveCalls := 0
 	stagePendingPublishedFilesResolveFn = func(h *FSHelper, orgID string, blockIDs []string) ([]string, error) {
@@ -541,6 +561,9 @@ func TestStagePendingPublishedFiles_AssignsResolvedInternalBlockIDs(t *testing.T
 	if addCalls != 1 {
 		t.Fatalf("addCalls = %d, want 1", addCalls)
 	}
+	if persistCalls != 1 {
+		t.Fatalf("persistCalls = %d, want 1", persistCalls)
+	}
 	if len(pending.internalBlockIDs) != 1 || pending.internalBlockIDs[0] != "sha256-1" {
 		t.Fatalf("pending.internalBlockIDs = %#v, want []string{\"sha256-1\"}", pending.internalBlockIDs)
 	}
@@ -551,10 +574,12 @@ func TestStagePendingPublishedFiles_ReturnsRollbackFailureAndKeepsResolvedIDs(t 
 	oldResolve := stagePendingPublishedFilesResolveFn
 	oldAdd := stagePendingPublishedFilesAddReferencesFn
 	oldRemove := stagePendingPublishedFilesRemoveReferencesFn
+	oldPersist := stagePendingPublishedFilesPersistFn
 	t.Cleanup(func() {
 		stagePendingPublishedFilesResolveFn = oldResolve
 		stagePendingPublishedFilesAddReferencesFn = oldAdd
 		stagePendingPublishedFilesRemoveReferencesFn = oldRemove
+		stagePendingPublishedFilesPersistFn = oldPersist
 	})
 
 	stagePendingPublishedFilesResolveFn = func(h *FSHelper, orgID string, blockIDs []string) ([]string, error) {
@@ -562,6 +587,9 @@ func TestStagePendingPublishedFiles_ReturnsRollbackFailureAndKeepsResolvedIDs(t 
 			t.Fatalf("resolve blockIDs len = %d, want 1", len(blockIDs))
 		}
 		return []string{"resolved-" + blockIDs[0]}, nil
+	}
+	stagePendingPublishedFilesPersistFn = func(h *FSHelper, repoID string, pending *pendingPublishedFile) error {
+		return nil
 	}
 	addCalls := 0
 	stageErr := errors.New("stage boom")
@@ -607,6 +635,26 @@ func TestStagePendingPublishedFiles_ReturnsRollbackFailureAndKeepsResolvedIDs(t 
 	}
 	if len(pending[1].internalBlockIDs) != 1 || pending[1].internalBlockIDs[0] != "resolved-sha1-2" {
 		t.Fatalf("pending[1].internalBlockIDs = %#v, want []string{\"resolved-sha1-2\"}", pending[1].internalBlockIDs)
+	}
+}
+
+func TestPrepareFileFSObjectForPublish_DefersPersistenceUntilStage(t *testing.T) {
+	helper := &FSHelper{}
+	pending, err := helper.prepareFileFSObjectForPublish("repo-1", "report.pdf", 123, []string{"sha1-1"})
+	if err != nil {
+		t.Fatalf("prepareFileFSObjectForPublish() error = %v, want nil", err)
+	}
+	if pending == nil {
+		t.Fatal("prepareFileFSObjectForPublish() returned nil pending file")
+	}
+	if pending.name != "report.pdf" {
+		t.Fatalf("pending.name = %q, want report.pdf", pending.name)
+	}
+	if pending.size != 123 {
+		t.Fatalf("pending.size = %d, want 123", pending.size)
+	}
+	if pending.cleanupOrgID != "" || pending.cleanupAttemptID != "" {
+		t.Fatalf("pending cleanup metadata = %q/%q, want empty before stage", pending.cleanupOrgID, pending.cleanupAttemptID)
 	}
 }
 

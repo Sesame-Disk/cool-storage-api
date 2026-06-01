@@ -33,6 +33,53 @@ type mockObjectStore struct {
 	data []byte
 }
 
+func TestAcquireChunkedUploadLibraryFinalizePermitSerializesSameRepo(t *testing.T) {
+	releaseFirst, err := acquireChunkedUploadLibraryFinalizePermit(context.Background(), "repo-1")
+	if err != nil {
+		t.Fatalf("first acquire failed: %v", err)
+	}
+	releasedFirst := false
+	defer func() {
+		if !releasedFirst {
+			releaseFirst()
+		}
+	}()
+
+	blockedCtx, cancelBlocked := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancelBlocked()
+	releaseSecond, err := acquireChunkedUploadLibraryFinalizePermit(blockedCtx, "repo-1")
+	if releaseSecond != nil {
+		releaseSecond()
+		t.Fatal("second acquire should not succeed while first permit is held for the same repo")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("second acquire error = %v, want context deadline exceeded while blocked", err)
+	}
+
+	releaseFirst()
+	releasedFirst = true
+
+	releaseSecond, err = acquireChunkedUploadLibraryFinalizePermit(context.Background(), "repo-1")
+	if err != nil {
+		t.Fatalf("second acquire failed after release: %v", err)
+	}
+	releaseSecond()
+}
+
+func TestAcquireChunkedUploadLibraryFinalizePermitDoesNotBlockDifferentRepos(t *testing.T) {
+	releaseFirst, err := acquireChunkedUploadLibraryFinalizePermit(context.Background(), "repo-1")
+	if err != nil {
+		t.Fatalf("first acquire failed: %v", err)
+	}
+	defer releaseFirst()
+
+	releaseSecond, err := acquireChunkedUploadLibraryFinalizePermit(context.Background(), "repo-2")
+	if err != nil {
+		t.Fatalf("second acquire for different repo failed: %v", err)
+	}
+	releaseSecond()
+}
+
 func (m *mockObjectStore) Put(ctx context.Context, blockID string, data io.Reader, size int64) (string, error) {
 	_, _ = io.Copy(io.Discard, data)
 	return blockID, nil

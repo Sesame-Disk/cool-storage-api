@@ -73,6 +73,10 @@ var stagePendingPublishedFilesAddReferencesFn = db.AddPublishAttemptReferences
 
 var stagePendingPublishedFilesRemoveReferencesFn = db.RemovePublishAttemptReferences
 
+var stagePendingPublishedFilesPersistFn = func(h *FSHelper, repoID string, pending *pendingPublishedFile) error {
+	return h.createPendingPublishedFileRow(repoID, pending)
+}
+
 var registerUploadedBlockAddReferenceFn = func(h *FSHelper, orgID, blockID, referrer, libraryID string, ttlSeconds int) error {
 	return h.db.AddBlockReference(orgID, blockID, referrer, libraryID, ttlSeconds)
 }
@@ -1170,6 +1174,8 @@ func buildFileFSObjectID(blockIDs []string, size int64) (string, error) {
 
 type pendingPublishedFile struct {
 	fsID             string
+	name             string
+	size             int64
 	externalBlockIDs []string
 	internalBlockIDs []string
 	cleanupOwnerID   string
@@ -1200,13 +1206,15 @@ func pendingPublishedFileInternalBlockIDs(pendingFiles []*pendingPublishedFile) 
 	return blockIDs
 }
 
-func newPendingPublishedFile(blockIDs []string, size int64) (*pendingPublishedFile, error) {
+func newPendingPublishedFile(name string, blockIDs []string, size int64) (*pendingPublishedFile, error) {
 	fsID, err := buildFileFSObjectID(blockIDs, size)
 	if err != nil {
 		return nil, err
 	}
 	return &pendingPublishedFile{
 		fsID:             fsID,
+		name:             name,
+		size:             size,
 		externalBlockIDs: append([]string(nil), blockIDs...),
 		cleanupOwnerID:   uuid.NewString(),
 		cleanupCreatedAt: time.Now().UTC(),
@@ -1214,15 +1222,10 @@ func newPendingPublishedFile(blockIDs []string, size int64) (*pendingPublishedFi
 }
 
 func (h *FSHelper) prepareFileFSObjectForPublish(repoID, name string, size int64, blockIDs []string) (*pendingPublishedFile, error) {
-	pending, err := newPendingPublishedFile(blockIDs, size)
+	pending, err := newPendingPublishedFile(name, blockIDs, size)
 	if err != nil {
 		return nil, err
 	}
-
-	if err := h.createPendingPublishedFileRow(repoID, name, size, pending); err != nil {
-		return nil, err
-	}
-
 	return pending, nil
 }
 
@@ -1249,22 +1252,17 @@ func (h *FSHelper) stagePendingPublishedFiles(orgID, repoID, attemptID string, p
 		}
 		resolved = db.NormalizeBlockIDs(resolved)
 		pending.internalBlockIDs = append([]string(nil), resolved...)
+		pending.cleanupOrgID = orgID
+		pending.cleanupAttemptID = attemptID
+		if err := stagePendingPublishedFilesPersistFn(h, repoID, pending); err != nil {
+			return rollbackStagedRefs(stagedBlockIDs, fmt.Errorf("persist pending fs_object %s: %w", pending.fsID, err))
+		}
 		if err := stagePendingPublishedFilesAddReferencesFn(h.db, orgID, repoID, attemptID, resolved); err != nil {
 			rollbackIDs := append(append([]string(nil), stagedBlockIDs...), pending.internalBlockIDs...)
 			return rollbackStagedRefs(rollbackIDs, fmt.Errorf("stage publish-attempt block references for fs_object %s: %w", pending.fsID, err))
 		}
 
 		stagedBlockIDs = append(stagedBlockIDs, pending.internalBlockIDs...)
-	}
-	for _, pending := range pendingFiles {
-		if pending == nil {
-			continue
-		}
-		pending.cleanupOrgID = orgID
-		pending.cleanupAttemptID = attemptID
-	}
-	if err := h.bindPendingPublishedFileAttempts(repoID, pendingFiles); err != nil {
-		return rollbackStagedRefs(stagedBlockIDs, fmt.Errorf("persist pending publish-attempt metadata: %w", err))
 	}
 
 	return nil
@@ -1340,43 +1338,24 @@ func (h *FSHelper) copyFSObjectToLibraryForPublish(srcRepoID, dstRepoID, fsID st
 	return newDirFSID, pendingFiles, nil
 }
 
-func (h *FSHelper) createPendingPublishedFileRow(repoID, name string, size int64, pending *pendingPublishedFile) error {
+func (h *FSHelper) createPendingPublishedFileRow(repoID string, pending *pendingPublishedFile) error {
 	if h == nil || h.db == nil {
 		return fmt.Errorf("failed to create tracked fs_object: database not available")
 	}
 	if pending == nil || pending.fsID == "" {
 		return fmt.Errorf("failed to create tracked fs_object: pending file missing fs_id")
 	}
+	if pending.cleanupOwnerID == "" || pending.cleanupCreatedAt.IsZero() || pending.cleanupOrgID == "" || pending.cleanupAttemptID == "" {
+		return fmt.Errorf("failed to create tracked fs_object: pending file metadata is incomplete")
+	}
 	batch := h.db.Session().Batch(gocql.LoggedBatch)
 	batch.Query(`
 		INSERT INTO fs_objects (library_id, fs_id, obj_type, obj_name, block_ids, size_bytes, mtime)
 		VALUES (?, ?, ?, ?, ?, ?, ?)
-	`, repoID, pending.fsID, "file", name, pending.externalBlockIDs, size, time.Now().Unix())
-	db.AddUpsertPendingPublishedFSObjectOwnerQueries(batch, repoID, pending.fsID, pending.cleanupOwnerID, pending.cleanupCreatedAt, "", "", nil)
+	`, repoID, pending.fsID, "file", pending.name, pending.externalBlockIDs, pending.size, time.Now().Unix())
+	db.AddUpsertPendingPublishedFSObjectOwnerQueries(batch, repoID, pending.fsID, pending.cleanupOwnerID, pending.cleanupCreatedAt, pending.cleanupOrgID, pending.cleanupAttemptID, pending.internalBlockIDs)
 	if err := h.db.Session().ExecuteBatch(batch); err != nil {
 		return fmt.Errorf("failed to create tracked fs_object: %w", err)
-	}
-	return nil
-}
-
-func (h *FSHelper) bindPendingPublishedFileAttempts(repoID string, pendingFiles []*pendingPublishedFile) error {
-	if h == nil || h.db == nil {
-		return nil
-	}
-	batch := h.db.Session().Batch(gocql.LoggedBatch)
-	updates := 0
-	for _, pending := range pendingFiles {
-		if pending == nil || pending.fsID == "" || pending.cleanupOwnerID == "" || pending.cleanupCreatedAt.IsZero() {
-			continue
-		}
-		db.AddUpsertPendingPublishedFSObjectOwnerQueries(batch, repoID, pending.fsID, pending.cleanupOwnerID, pending.cleanupCreatedAt, pending.cleanupOrgID, pending.cleanupAttemptID, pending.internalBlockIDs)
-		updates++
-	}
-	if updates == 0 {
-		return nil
-	}
-	if err := h.db.Session().ExecuteBatch(batch); err != nil {
-		return fmt.Errorf("failed to bind tracked fs_object publish attempts: %w", err)
 	}
 	return nil
 }

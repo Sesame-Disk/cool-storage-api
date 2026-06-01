@@ -2,10 +2,12 @@ package v2
 
 import (
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/Sesame-Disk/sesamefs/internal/db"
+	gocql "github.com/apache/cassandra-gocql-driver/v2"
 )
 
 func TestSchedulePublishedBlockReferenceRepairDeduplicatesInFlightRepair(t *testing.T) {
@@ -353,6 +355,36 @@ func TestCleanupFailedPublishAttempt_KeepsPendingFSObjectWhenStillOwnedOrReachab
 	}
 }
 
+func TestFailedPublishFSObjectReachableFromRoot_IgnoresMissingUnrelatedNodes(t *testing.T) {
+	oldLoad := failedPublishReachabilityLoadFSObjectFn
+	t.Cleanup(func() {
+		failedPublishReachabilityLoadFSObjectFn = oldLoad
+	})
+
+	failedPublishReachabilityLoadFSObjectFn = func(database *db.DB, repoID, fsID string) (string, string, error) {
+		if repoID != "repo-1" {
+			t.Fatalf("repoID = %q, want repo-1", repoID)
+		}
+		switch fsID {
+		case "root-fs":
+			return "dir", `[{"name":"target","id":"target-fs"},{"name":"missing","id":"missing-fs"}]`, nil
+		case "missing-fs":
+			return "", "", gocql.ErrNotFound
+		default:
+			t.Fatalf("unexpected fsID lookup %q", fsID)
+			return "", "", nil
+		}
+	}
+
+	reachable, err := failedPublishFSObjectReachableFromRoot(&db.DB{}, "repo-1", "target-fs", "root-fs", map[string]bool{})
+	if err != nil {
+		t.Fatalf("failedPublishFSObjectReachableFromRoot() error = %v, want nil", err)
+	}
+	if !reachable {
+		t.Fatal("failedPublishFSObjectReachableFromRoot() = false, want true when target remains reachable past a missing sibling")
+	}
+}
+
 func TestRunPendingPublishedFSObjectOwnerSweep_ReleasesOnlyStaleOwners(t *testing.T) {
 	oldNow := pendingPublishedFSObjectOwnerNowFn
 	oldList := listPendingPublishedFSObjectOwnersByDayFn
@@ -392,6 +424,106 @@ func TestRunPendingPublishedFSObjectOwnerSweep_ReleasesOnlyStaleOwners(t *testin
 	}
 	if len(released) != 1 || released[0] != "repo-1:fs-stale:owner-stale" {
 		t.Fatalf("released = %#v, want []string{\"repo-1:fs-stale:owner-stale\"}", released)
+	}
+}
+
+func TestCleanupPendingPublishedFileOwnerAttempt_ClearsOwnerForReachableCommit(t *testing.T) {
+	oldReachable := cleanupPendingPublishedFileAttemptCommitReachableFn
+	oldDeletePendingOwner := cleanupFailedPublishDeletePendingOwnerFn
+	oldDeleteCommit := cleanupFailedPublishDeleteCommitFn
+	oldRemoveAttemptRefs := cleanupFailedPublishRemoveAttemptReferencesFn
+	t.Cleanup(func() {
+		cleanupPendingPublishedFileAttemptCommitReachableFn = oldReachable
+		cleanupFailedPublishDeletePendingOwnerFn = oldDeletePendingOwner
+		cleanupFailedPublishDeleteCommitFn = oldDeleteCommit
+		cleanupFailedPublishRemoveAttemptReferencesFn = oldRemoveAttemptRefs
+	})
+
+	reachabilityChecks := 0
+	cleanupPendingPublishedFileAttemptCommitReachableFn = func(database *db.DB, repoID, commitID string) (bool, error) {
+		reachabilityChecks++
+		if repoID != "repo-1" || commitID != "commit-1" {
+			t.Fatalf("reachability args = %s/%s, want repo-1/commit-1", repoID, commitID)
+		}
+		return true, nil
+	}
+	clearedOwners := 0
+	cleanupFailedPublishDeletePendingOwnerFn = func(database *db.DB, repoID, fsID, ownerID string, createdAt time.Time) error {
+		clearedOwners++
+		if repoID != "repo-1" || fsID != "fs-1" || ownerID != "owner-1" {
+			t.Fatalf("clear owner args = %s/%s/%s, want repo-1/fs-1/owner-1", repoID, fsID, ownerID)
+		}
+		return nil
+	}
+	cleanupFailedPublishDeleteCommitFn = func(database *db.DB, repoID, commitID string) error {
+		t.Fatal("published commit cleanup must not run for reachable commits")
+		return nil
+	}
+	cleanupFailedPublishRemoveAttemptReferencesFn = func(database *db.DB, orgID, attemptID string, blockIDs []string) error {
+		t.Fatal("publish-attempt ref cleanup must not run for reachable commits")
+		return nil
+	}
+
+	err := cleanupPendingPublishedFileOwnerAttempt(&db.DB{}, "repo-1", &pendingPublishedFile{
+		fsID:             "fs-1",
+		cleanupOwnerID:   "owner-1",
+		cleanupCreatedAt: time.Date(2026, time.June, 1, 12, 0, 0, 0, time.UTC),
+		cleanupAttemptID: "commit-1",
+	})
+	if err != nil {
+		t.Fatalf("cleanupPendingPublishedFileOwnerAttempt() error = %v, want nil", err)
+	}
+	if reachabilityChecks != 1 {
+		t.Fatalf("reachabilityChecks = %d, want 1", reachabilityChecks)
+	}
+	if clearedOwners != 1 {
+		t.Fatalf("clearedOwners = %d, want 1", clearedOwners)
+	}
+}
+
+func TestCleanupPendingPublishedFileOwnerAttempt_FailsClosedWithoutAttemptMetadata(t *testing.T) {
+	oldReachable := cleanupPendingPublishedFileAttemptCommitReachableFn
+	oldDeletePendingOwner := cleanupFailedPublishDeletePendingOwnerFn
+	oldDeleteCommit := cleanupFailedPublishDeleteCommitFn
+	t.Cleanup(func() {
+		cleanupPendingPublishedFileAttemptCommitReachableFn = oldReachable
+		cleanupFailedPublishDeletePendingOwnerFn = oldDeletePendingOwner
+		cleanupFailedPublishDeleteCommitFn = oldDeleteCommit
+	})
+
+	reachabilityChecks := 0
+	cleanupPendingPublishedFileAttemptCommitReachableFn = func(database *db.DB, repoID, commitID string) (bool, error) {
+		reachabilityChecks++
+		return false, nil
+	}
+	clearedOwners := 0
+	cleanupFailedPublishDeletePendingOwnerFn = func(database *db.DB, repoID, fsID, ownerID string, createdAt time.Time) error {
+		clearedOwners++
+		return nil
+	}
+	deleteCommitCalls := 0
+	cleanupFailedPublishDeleteCommitFn = func(database *db.DB, repoID, commitID string) error {
+		deleteCommitCalls++
+		return nil
+	}
+
+	err := cleanupPendingPublishedFileOwnerAttempt(&db.DB{}, "repo-1", &pendingPublishedFile{
+		fsID:             "fs-1",
+		cleanupOwnerID:   "owner-1",
+		cleanupCreatedAt: time.Date(2026, time.June, 1, 12, 0, 0, 0, time.UTC),
+		cleanupAttemptID: "   ",
+	})
+	if err == nil || !strings.Contains(err.Error(), "missing cleanup attempt metadata") {
+		t.Fatalf("cleanupPendingPublishedFileOwnerAttempt() error = %v, want missing cleanup attempt metadata", err)
+	}
+	if reachabilityChecks != 0 {
+		t.Fatalf("reachabilityChecks = %d, want 0", reachabilityChecks)
+	}
+	if clearedOwners != 0 {
+		t.Fatalf("clearedOwners = %d, want 0", clearedOwners)
+	}
+	if deleteCommitCalls != 0 {
+		t.Fatalf("deleteCommitCalls = %d, want 0", deleteCommitCalls)
 	}
 }
 

@@ -101,3 +101,53 @@ func TestSyncPutBlockMappingFailureReturns500(t *testing.T) {
 		t.Fatalf("error = %v, want failed to create block mapping", got)
 	}
 }
+
+func TestSeafHTTPHandleUploadFallbackPreservesObjectStoreStorageClass(t *testing.T) {
+	oldRegister := registerUploadedBlockAndMappingForUploadFn
+	oldQuota := checkUploadStorageQuotaForCurrentHeadFn
+	oldEncrypted := lookupLibraryEncryptedForUploadFn
+	t.Cleanup(func() {
+		registerUploadedBlockAndMappingForUploadFn = oldRegister
+		checkUploadStorageQuotaForCurrentHeadFn = oldQuota
+		lookupLibraryEncryptedForUploadFn = oldEncrypted
+	})
+
+	checkUploadStorageQuotaForCurrentHeadFn = func(h *SeafHTTPHandler, orgID, repoID, userID, parentDir, filename string, fileSize int64, replace bool) (int64, int64, error) {
+		return fileSize, 1, nil
+	}
+	lookupLibraryEncryptedForUploadFn = func(h *SeafHTTPHandler, orgID, repoID string) (bool, error) {
+		return false, nil
+	}
+	var gotStorageClass string
+	registerUploadedBlockAndMappingForUploadFn = func(database *db.DB, orgID, repoID, internalBlockID, operationID string, sizeBytes int, storageClass, storageKey, externalBlockID string) error {
+		gotStorageClass = storageClass
+		return fmt.Errorf("stop after register")
+	}
+
+	manager := storage.NewManager()
+	manager.RegisterBackend("hot-fallback", &mockObjectStore{}, "")
+	manager.SetDefaultClass("hot-fallback")
+
+	tokenStore := NewMockTokenStore()
+	if _, err := tokenStore.CreateUploadToken("org1", "repo1", "/", "user1"); err != nil {
+		t.Fatalf("CreateUploadToken() error = %v", err)
+	}
+
+	handler := NewSeafHTTPHandler(nil, manager, nil, tokenStore, nil, nil)
+	r := gin.New()
+	r.POST("/seafhttp/upload-api/:token", handler.HandleUpload)
+
+	req := newMultipartUploadRequest(t, "/seafhttp/upload-api/mock-upload-token", "test.txt", []byte("hello"))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if gotStorageClass != "hot-fallback" {
+		t.Fatalf("register storage_class = %q, want %q", gotStorageClass, "hot-fallback")
+	}
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusInternalServerError)
+	}
+	if got := decodeJSONObject(t, w.Body)["error"]; got != "failed to store block metadata" {
+		t.Fatalf("error = %v, want failed to store block metadata", got)
+	}
+}

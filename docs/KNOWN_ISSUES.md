@@ -1343,8 +1343,8 @@ The GC (worker + scanner) has no coordination mechanism between instances. If mu
 3. **Snapshot drift** (resolved 2026-04-28): the original `gc_queue_stats` counter table was retired from the baseline schema. Queue/DLQ totals now live in `gc_stats` and are reconciled per dirty org by a serialized reconciler (with a periodic full-sum drift check). See ARCHITECTURE.md / GC-SERVICE-ANALYSIS.md.
 
 **Is there data loss?** No. Destructive operations are protected:
-- `DeleteBlock` uses LWT two-phase (only one instance wins the `IF ref_count <= 0`)
-- `MarkItemProcessed` uses `INSERT ... IF NOT EXISTS` to prevent double-decrement of ref_count
+- `DeleteBlock` uses a claim-then-verify delete fence: only one instance can win the claim, and the winner re-checks live `block_references` before touching S3
+- `block_references` rows make fs_object cleanup idempotent; retrying the same delete removes the same keyed refs again instead of replaying a counter decrement
 - Cassandra DELETEs are idempotent
 
 **Actual impact**: Wasted work (CPU/network overhead) and slightly incorrect admin counters. No risk of data loss.

@@ -776,7 +776,9 @@ CREATE TABLE IF NOT EXISTS published_block_reference_repairs (
 
 -- Tracks one or more in-flight publish owners per materialized fs_object row.
 -- Rows exist from pre-commit fs_object persistence until the attempt is cleaned
--- up or the published commit is visible and the owner is cleared.
+-- up or the published commit is visible and the owner is cleared. Retain these
+-- rows for 30 days so recovery still works after extended repair/sweeper
+-- downtime.
 CREATE TABLE IF NOT EXISTS pending_published_fs_objects (
     repo_id    UUID,
     fs_id      TEXT,
@@ -786,7 +788,7 @@ CREATE TABLE IF NOT EXISTS pending_published_fs_objects (
     attempt_id TEXT,
     block_ids  LIST<TEXT>,
     PRIMARY KEY ((repo_id, fs_id), owner_id)
-) WITH default_time_to_live = 604800;
+) WITH default_time_to_live = 2592000;
 
 -- Discovery projection for stale pending fs_object owners. Successful publishes
 -- delete these rows immediately; the remaining rows are abandoned/in-flight
@@ -803,7 +805,7 @@ CREATE TABLE IF NOT EXISTS pending_published_fs_objects_by_day (
     block_ids   LIST<TEXT>,
     PRIMARY KEY ((created_day, bucket), created_at, repo_id, fs_id, owner_id)
 ) WITH CLUSTERING ORDER BY (created_at ASC, repo_id ASC, fs_id ASC, owner_id ASC)
-  AND default_time_to_live = 604800;
+    AND default_time_to_live = 2592000;
 
 -- ─── Groups ──────────────────────────────────────────────────────────────────
 

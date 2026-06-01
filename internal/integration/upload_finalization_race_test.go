@@ -85,6 +85,68 @@ func uploadViaLinkConcurrent(c *testClient, uploadURL, filename, parentDir, cont
 	return concurrentMutationResult{status: resp.StatusCode, body: string(body)}
 }
 
+func uploadChunkThroughLinkStatusConcurrent(c *testClient, uploadURL, fileName, parentDir string, content []byte, contentRange string) (int, string, error) {
+	var buf bytes.Buffer
+	writer := multipart.NewWriter(&buf)
+	part, err := writer.CreateFormFile("file", fileName)
+	if err != nil {
+		return 0, "", err
+	}
+	if _, err := part.Write(content); err != nil {
+		return 0, "", err
+	}
+	if err := writer.WriteField("parent_dir", parentDir); err != nil {
+		return 0, "", err
+	}
+	if err := writer.Close(); err != nil {
+		return 0, "", err
+	}
+
+	req, err := http.NewRequest(http.MethodPost, uploadURL, &buf)
+	if err != nil {
+		return 0, "", err
+	}
+	req.Header.Set("Authorization", "Token "+c.token)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	req.Header.Set("Content-Range", contentRange)
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return 0, "", err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return 0, "", err
+	}
+	return resp.StatusCode, string(body), nil
+}
+
+func uploadChunkedViaLinkConcurrent(c *testClient, uploadURL, filename, parentDir, content string) concurrentMutationResult {
+	data := []byte(content)
+	if len(data) < 2 {
+		data = append(data, 'x')
+	}
+	split := len(data) / 2
+	if split == 0 {
+		split = 1
+	}
+
+	status, body, err := uploadChunkThroughLinkStatusConcurrent(c, uploadURL, filename, parentDir, data[:split], fmt.Sprintf("bytes %d-%d/%d", 0, split-1, len(data)))
+	if err != nil {
+		return concurrentMutationResult{err: err}
+	}
+	if status != http.StatusOK && status != http.StatusCreated {
+		return concurrentMutationResult{status: status, body: body}
+	}
+
+	status, body, err = uploadChunkThroughLinkStatusConcurrent(c, uploadURL, filename, parentDir, data[split:], fmt.Sprintf("bytes %d-%d/%d", split, len(data)-1, len(data)))
+	if err != nil {
+		return concurrentMutationResult{err: err}
+	}
+	return concurrentMutationResult{status: status, body: body}
+}
+
 // uploadViaV2DirectConcurrent posts a multipart file to the direct v2 upload
 // endpoint so the request exercises files.go UploadFile and
 // finalizeStoredUploadMetadataOnce instead of seafhttp.
@@ -423,6 +485,27 @@ func TestConcurrentSeafhttpUploadsToSubdirNoLostCommits(t *testing.T) {
 	})
 	expectConcurrentStatuses(t, results, http.StatusOK, http.StatusCreated)
 	expectEntriesPresent(t, repoID, "/subdir", names)
+}
+
+func TestConcurrentChunkedSeafhttpUploadsNoFinalizeFailures(t *testing.T) {
+	const concurrency = 8
+
+	repoID := createTestLibrary(t, adminClient, fmt.Sprintf("inttest-chunked-finalize-race-%d", time.Now().UnixNano()))
+	uploadURL := getUploadLink(t, adminClient, repoID, "/")
+
+	names := make([]string, concurrency)
+	for i := range names {
+		names[i] = fmt.Sprintf("chunked-race-%02d.txt", i)
+	}
+
+	results := runConcurrentMutations(t, names, func(name string) concurrentMutationResult {
+		content := strings.Repeat(name+"-", 32) + fmt.Sprintf("%d", time.Now().UnixNano())
+		r := uploadChunkedViaLinkConcurrent(adminClient, uploadURL, name, "/", content)
+		r.name = name
+		return r
+	})
+	expectConcurrentStatuses(t, results, http.StatusOK, http.StatusCreated)
+	expectEntriesPresent(t, repoID, "/", names)
 }
 
 // When a resumable upload starts first but another writer creates the original

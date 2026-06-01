@@ -3035,7 +3035,7 @@ func (h *FileHandler) finalizeStoredUploadMetadataOnce(fsHelper *FSHelper, orgID
 	}
 
 	blockIDs := []string{fileID}
-	pendingFile, err := newPendingPublishedFile(blockIDs, fileSize)
+	pendingFile, err := newPendingPublishedFile(actualFilename, blockIDs, fileSize)
 	if err != nil {
 		return "", 0, 0, fmt.Errorf("failed to create file metadata: %w", err)
 	}
@@ -3078,9 +3078,6 @@ func (h *FileHandler) finalizeStoredUploadMetadataOnce(fsHelper *FSHelper, orgID
 	}
 
 	description := fmt.Sprintf("Added or modified \"%s\".\n", actualFilename)
-	if err := fsHelper.createPendingPublishedFileRow(repoID, actualFilename, fileSize, pendingFile); err != nil {
-		return "", 0, 0, fmt.Errorf("failed to create file metadata: %w", err)
-	}
 	pendingFiles := []*pendingPublishedFile{pendingFile}
 	cleanupPendingFilePublish := func() {
 		if cleanupErr := CleanupFailedPublishAttempt(h.db, orgID, repoID, "", "", pendingFiles); cleanupErr != nil {
