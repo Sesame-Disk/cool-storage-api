@@ -1355,11 +1355,8 @@ func (h *OnlyOfficeHandler) publishEditedDocumentMetadata(fsHelper *FSHelper, or
 		}
 
 		commitDesc := fmt.Sprintf("Modified \"%s\" via OnlyOffice", filename)
-		commitID, err := fsHelper.CreateCommit(repoID, userID, newRootFSID, snapshot.HeadCommitID, commitDesc)
-		if err != nil {
-			cleanupPendingFilePublish()
-			return fmt.Errorf("failed to create commit: %w", err)
-		}
+		commitCreatedAt := time.Now().UTC()
+		commitID := buildCommitID(repoID, newRootFSID, commitDesc, commitCreatedAt)
 		if err := fsHelper.stagePendingPublishedFiles(orgID, repoID, commitID, []*pendingPublishedFile{pendingFile}); err != nil {
 			if cleanupErr := cleanupOnlyOfficeFailedPublishAttempt(h.db, orgID, repoID, commitID, []*pendingPublishedFile{pendingFile}); cleanupErr != nil {
 				return errors.Join(
@@ -1374,6 +1371,15 @@ func (h *OnlyOfficeHandler) publishEditedDocumentMetadata(fsHelper *FSHelper, or
 			return errors.Join(
 				fmt.Errorf("failed to queue durable publish repair for commit %s: %w", commitID, err),
 				cleanupErr,
+			)
+		}
+		if err := fsHelper.insertCommit(repoID, commitID, userID, newRootFSID, snapshot.HeadCommitID, commitDesc, commitCreatedAt); err != nil {
+			cleanupErr := cleanupOnlyOfficeFailedPublishAttempt(h.db, orgID, repoID, commitID, []*pendingPublishedFile{pendingFile})
+			clearErr := clearPendingPublishedFileRepairs(h.db, orgID, repoID, commitID, []*pendingPublishedFile{pendingFile})
+			return errors.Join(
+				fmt.Errorf("failed to create commit: %w", err),
+				cleanupErr,
+				clearErr,
 			)
 		}
 

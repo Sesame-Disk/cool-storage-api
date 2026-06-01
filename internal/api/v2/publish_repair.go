@@ -99,6 +99,13 @@ var listPendingPublishedFSObjectOwnersByDayFn = func(database *db.DB, day time.T
 	return database.ListPendingPublishedFSObjectOwnersByDay(day, bucket)
 }
 
+var loadPendingPublishedFSObjectOwnerFn = func(database *db.DB, repoID, fsID, ownerID string) (db.PendingPublishedFSObjectOwner, error) {
+	if database == nil {
+		return db.PendingPublishedFSObjectOwner{}, fmt.Errorf("database not available")
+	}
+	return database.LoadPendingPublishedFSObjectOwner(repoID, fsID, ownerID)
+}
+
 var publishedBlockReferenceRepairHeadCommitFn = func(database *db.DB, repoID string) (string, error) {
 	if database == nil {
 		return "", fmt.Errorf("database not available")
@@ -350,16 +357,34 @@ func cleanupPendingPublishedFileOwnerAttempt(database *db.DB, repoID string, pen
 	if database == nil || pending == nil {
 		return nil
 	}
+	fsID := strings.TrimSpace(pending.fsID)
 	attemptID := strings.TrimSpace(pending.cleanupAttemptID)
 	if attemptID == "" {
-		return fmt.Errorf("pending publish owner for fs_object %s is missing cleanup attempt metadata", strings.TrimSpace(pending.fsID))
+		return fmt.Errorf("pending publish owner for fs_object %s is missing cleanup attempt metadata", fsID)
 	}
 	reachable, err := cleanupPendingPublishedFileAttemptCommitReachableFn(database, repoID, attemptID)
 	if err != nil {
-		return fmt.Errorf("check publish attempt commit %s reachability for fs_object %s: %w", attemptID, strings.TrimSpace(pending.fsID), err)
+		return fmt.Errorf("check publish attempt commit %s reachability for fs_object %s: %w", attemptID, fsID, err)
 	}
 	if reachable {
-		return clearPendingPublishedFileOwner(database, repoID, pending)
+		orgID := strings.TrimSpace(pending.cleanupOrgID)
+		if orgID == "" {
+			return fmt.Errorf("reachable pending publish owner for fs_object %s is missing cleanup org_id", fsID)
+		}
+		promotePending, err := loadPublishedBlockReferenceRepairPendingFileFn(database, repoID, fsID)
+		if err != nil {
+			return fmt.Errorf("load reachable published fs_object %s for commit %s: %w", fsID, attemptID, err)
+		}
+		promotePending.cleanupOwnerID = pending.cleanupOwnerID
+		promotePending.cleanupCreatedAt = pending.cleanupCreatedAt
+		promotePending.cleanupOrgID = orgID
+		promotePending.cleanupAttemptID = attemptID
+		promotePending.internalBlockIDs = append([]string(nil), db.NormalizeBlockIDs(pending.internalBlockIDs)...)
+		helper := NewFSHelper(database)
+		if err := publishedBlockReferenceRepairPromoteFn(helper, orgID, repoID, attemptID, promotePending); err != nil {
+			return fmt.Errorf("promote reachable published fs_object %s for commit %s: %w", fsID, attemptID, err)
+		}
+		return clearPendingPublishedFileOwnerFn(database, repoID, pending)
 	}
 	if err := cleanupPendingPublishedFileAttemptArtifacts(database, repoID, pending); err != nil {
 		return err
@@ -683,6 +708,31 @@ func runPendingPublishedFSObjectOwnerSweep(database *db.DB) error {
 			for _, owner := range owners {
 				if owner.CreatedAt.IsZero() || owner.CreatedAt.After(cutoff) {
 					continue
+				}
+				if strings.TrimSpace(owner.AttemptID) == "" {
+					loadedOwner, err := loadPendingPublishedFSObjectOwnerFn(database, owner.RepoID, owner.FSID, owner.OwnerID)
+					if err != nil {
+						if errors.Is(err, gocql.ErrNotFound) {
+							if deleteErr := cleanupFailedPublishDeletePendingOwnerFn(database, owner.RepoID, owner.FSID, owner.OwnerID, owner.CreatedAt); deleteErr != nil {
+								log.Printf("[publish_repair] failed to delete dangling pending fs_object owner projection repo=%s fs_object=%s owner=%s: %v", owner.RepoID, owner.FSID, owner.OwnerID, deleteErr)
+								if firstErr == nil {
+									firstErr = deleteErr
+								}
+							}
+							continue
+						}
+						log.Printf("[publish_repair] failed to hydrate pending fs_object owner repo=%s fs_object=%s owner=%s: %v", owner.RepoID, owner.FSID, owner.OwnerID, err)
+						if firstErr == nil {
+							firstErr = err
+						}
+						continue
+					}
+					if !loadedOwner.CreatedAt.IsZero() {
+						owner.CreatedAt = loadedOwner.CreatedAt
+					}
+					owner.OrgID = loadedOwner.OrgID
+					owner.AttemptID = loadedOwner.AttemptID
+					owner.BlockIDs = append([]string(nil), loadedOwner.BlockIDs...)
 				}
 				pending := &pendingPublishedFile{
 					fsID:             owner.FSID,

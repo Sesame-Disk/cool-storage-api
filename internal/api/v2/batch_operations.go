@@ -665,11 +665,8 @@ func (h *BatchOperationHandler) processSingleItem(orgID, userID, srcRepoID, dstR
 			dstDescription = fmt.Sprintf("Moved \"%s\"", currentItemName)
 		}
 
-		newDstCommitID, err := fsHelper.CreateCommit(dstRepoID, userID, newDstRootFSID, dstSnapshot.HeadCommitID, dstDescription)
-		if err != nil {
-			cleanupPendingCopyPublish()
-			return fmt.Errorf("failed to create destination commit: %w", err)
-		}
+		commitCreatedAt := time.Now().UTC()
+		newDstCommitID := buildCommitID(dstRepoID, newDstRootFSID, dstDescription, commitCreatedAt)
 		if len(pendingCopiedFiles) > 0 {
 			if err := fsHelper.stagePendingPublishedFiles(orgID, dstRepoID, newDstCommitID, pendingCopiedFiles); err != nil {
 				if cleanupErr := CleanupFailedPublishAttempt(h.db, orgID, dstRepoID, newDstCommitID, newDstCommitID, pendingCopiedFiles); cleanupErr != nil {
@@ -689,6 +686,15 @@ func (h *BatchOperationHandler) processSingleItem(orgID, userID, srcRepoID, dstR
 					clearErr,
 				)
 			}
+		}
+		if err := fsHelper.insertCommit(dstRepoID, newDstCommitID, userID, newDstRootFSID, dstSnapshot.HeadCommitID, dstDescription, commitCreatedAt); err != nil {
+			cleanupErr := CleanupFailedPublishAttempt(h.db, orgID, dstRepoID, newDstCommitID, newDstCommitID, pendingCopiedFiles)
+			clearErr := clearPendingPublishedFileRepairs(h.db, orgID, dstRepoID, newDstCommitID, pendingCopiedFiles)
+			return errors.Join(
+				fmt.Errorf("failed to create destination commit: %w", err),
+				cleanupErr,
+				clearErr,
+			)
 		}
 
 		if err := fsHelper.UpdateLibraryHeadFromSnapshot(dstSnapshot, dstRepoID, newDstCommitID, dstSnapshot.HeadCommitID); err != nil {

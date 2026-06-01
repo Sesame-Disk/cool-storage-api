@@ -33,7 +33,6 @@ import (
 	"github.com/Sesame-Disk/sesamefs/internal/storage"
 	"github.com/Sesame-Disk/sesamefs/internal/streaming"
 	"github.com/Sesame-Disk/sesamefs/internal/traffic"
-	gocql "github.com/apache/cassandra-gocql-driver/v2"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"golang.org/x/sync/errgroup"
@@ -1035,8 +1034,10 @@ const finalizeUploadConcurrency = 8
 const finalizeUploadBlockMetadataConcurrency = 1
 
 const (
-	seafHTTPUploadFinalizeLeaseTTL          = 30 * time.Second
-	seafHTTPUploadFinalizeLeasePollInterval = 25 * time.Millisecond
+	seafHTTPUploadFinalizeLeaseTTL           = 30 * time.Second
+	seafHTTPUploadFinalizeLeasePollInterval  = 25 * time.Millisecond
+	seafHTTPUploadFinalizeLeaseRenewInterval = seafHTTPUploadFinalizeLeaseTTL / 3
+	seafHTTPUploadMetadataFinalizeTimeout    = 2 * time.Minute
 )
 
 var finalizeUploadBlockMetadataPermits = make(chan struct{}, finalizeUploadBlockMetadataConcurrency)
@@ -1060,6 +1061,7 @@ var clearSeafHTTPS3OrphanFenceFn = clearSeafHTTPS3OrphanFence
 var seafHTTPBlockMaterializationRetryBackoffFn = v2.RetryBackoff
 var seafHTTPBlockMaterializationSleepFn = time.Sleep
 var seafHTTPUploadFinalizeLeaseSleepFn = time.Sleep
+var newSeafHTTPUploadFinalizeLeaseTickerFn = func(d time.Duration) *time.Ticker { return time.NewTicker(d) }
 var checkUploadStorageQuotaForCurrentHeadFn = func(h *SeafHTTPHandler, orgID, repoID, userID, parentDir, filename string, fileSize int64, replace bool) (int64, int64, error) {
 	return h.checkUploadStorageQuotaForCurrentHead(orgID, repoID, userID, parentDir, filename, fileSize, replace)
 }
@@ -1080,6 +1082,31 @@ func acquireFinalizeUploadBlockMetadataPermit(ctx context.Context) (func(), erro
 	}
 }
 
+func newSeafHTTPUploadMetadataFinalizeContext() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), seafHTTPUploadMetadataFinalizeTimeout)
+}
+
+var tryAcquireSeafHTTPUploadFinalizeLeaseFn = func(ctx context.Context, database *db.DB, leaseRole, leaseToken string, ttlSeconds int) (bool, error) {
+	return database.Session().Query(`
+		INSERT INTO gc_leases (role, instance_id, heartbeat)
+		VALUES (?, ?, ?) IF NOT EXISTS USING TTL ?
+	`, leaseRole, leaseToken, time.Now().UTC(), ttlSeconds).WithContext(ctx).MapScanCAS(map[string]interface{}{})
+}
+
+var renewSeafHTTPUploadFinalizeLeaseFn = func(ctx context.Context, database *db.DB, leaseRole, leaseToken string, ttlSeconds int) (bool, error) {
+	return database.Session().Query(`
+		UPDATE gc_leases USING TTL ?
+		SET instance_id = ?, heartbeat = ?
+		WHERE role = ? IF instance_id = ?
+	`, ttlSeconds, leaseToken, time.Now().UTC(), leaseRole, leaseToken).WithContext(ctx).MapScanCAS(map[string]interface{}{})
+}
+
+var releaseSeafHTTPUploadFinalizeLeaseFn = func(ctx context.Context, database *db.DB, leaseRole, leaseToken string) error {
+	return database.Session().Query(`
+		DELETE FROM gc_leases WHERE role = ? IF instance_id = ?
+	`, leaseRole, leaseToken).WithContext(ctx).Exec()
+}
+
 func acquireChunkedUploadLibraryFinalizePermit(ctx context.Context, repoID string) (func(), error) {
 	repoID = strings.TrimSpace(repoID)
 	if repoID == "" {
@@ -1095,56 +1122,128 @@ func acquireChunkedUploadLibraryFinalizePermit(ctx context.Context, repoID strin
 	}
 }
 
-func acquireSeafHTTPDistributedUploadFinalizeLease(ctx context.Context, database *db.DB, repoID string) (func(), error) {
+func startSeafHTTPUploadFinalizeLeaseRenewer(parentCtx context.Context, database *db.DB, leaseRole, leaseToken string, ttlSeconds int, renewInterval time.Duration) (context.Context, func()) {
+	if parentCtx == nil {
+		parentCtx = context.Background()
+	}
+	leaseCtx, cancelLease := context.WithCancel(parentCtx)
+	if database == nil || strings.TrimSpace(leaseRole) == "" || strings.TrimSpace(leaseToken) == "" || ttlSeconds <= 0 || renewInterval <= 0 {
+		return leaseCtx, func() { cancelLease() }
+	}
+	ticker := newSeafHTTPUploadFinalizeLeaseTickerFn(renewInterval)
+	stopCh := make(chan struct{})
+	doneCh := make(chan struct{})
+	leaseTTL := time.Duration(ttlSeconds) * time.Second
+	go func() {
+		defer close(doneCh)
+		defer ticker.Stop()
+		lastConfirmedAt := time.Now()
+		for {
+			select {
+			case <-stopCh:
+				return
+			case <-ticker.C:
+				renewCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				applied, err := renewSeafHTTPUploadFinalizeLeaseFn(renewCtx, database, leaseRole, leaseToken, ttlSeconds)
+				cancel()
+				if err != nil {
+					log.Printf("[uploadFinalizeLease] WARNING: renew failed for role=%s token=%s: %v", leaseRole, leaseToken, err)
+					if leaseTTL > 0 && time.Since(lastConfirmedAt) >= leaseTTL {
+						log.Printf("[uploadFinalizeLease] WARNING: giving up lease for role=%s token=%s after %s without successful renewal", leaseRole, leaseToken, time.Since(lastConfirmedAt))
+						cancelLease()
+						return
+					}
+					continue
+				}
+				if !applied {
+					log.Printf("[uploadFinalizeLease] WARNING: lease lost before release for role=%s token=%s", leaseRole, leaseToken)
+					cancelLease()
+					return
+				}
+				lastConfirmedAt = time.Now()
+			}
+		}
+	}()
+	return leaseCtx, func() {
+		close(stopCh)
+		<-doneCh
+		cancelLease()
+	}
+}
+
+func acquireSeafHTTPDistributedUploadFinalizeLeaseWithIntervals(ctx context.Context, database *db.DB, repoID string, ttl, pollInterval, renewInterval time.Duration) (context.Context, func(), error) {
 	repoID = strings.TrimSpace(repoID)
 	if database == nil || repoID == "" {
-		return func() {}, nil
+		return ctx, func() {}, nil
+	}
+	if ttl <= 0 {
+		ttl = seafHTTPUploadFinalizeLeaseTTL
+	}
+	if pollInterval <= 0 {
+		pollInterval = seafHTTPUploadFinalizeLeasePollInterval
+	}
+	if renewInterval <= 0 || renewInterval >= ttl {
+		renewInterval = ttl / 3
+		if renewInterval <= 0 {
+			renewInterval = time.Second
+		}
 	}
 	leaseRole := "upload-finalize:" + repoID
 	leaseToken := uuid.NewString()
-	ttlSeconds := int(seafHTTPUploadFinalizeLeaseTTL / time.Second)
+	ttlSeconds := int((ttl + time.Second - time.Nanosecond) / time.Second)
 	for {
-		applied, err := database.Session().Query(`
-			INSERT INTO gc_leases (role, instance_id, heartbeat)
-			VALUES (?, ?, ?) IF NOT EXISTS USING TTL ?
-		`, leaseRole, leaseToken, time.Now().UTC(), ttlSeconds).WithContext(ctx).MapScanCAS(map[string]interface{}{})
+		applied, err := tryAcquireSeafHTTPUploadFinalizeLeaseFn(ctx, database, leaseRole, leaseToken, ttlSeconds)
 		if err != nil {
-			return nil, fmt.Errorf("acquire upload finalize lease for repo %s: %w", repoID, err)
+			return nil, nil, fmt.Errorf("acquire upload finalize lease for repo %s: %w", repoID, err)
 		}
 		if applied {
-			return func() {
+			leaseCtx, stopRenewal := startSeafHTTPUploadFinalizeLeaseRenewer(ctx, database, leaseRole, leaseToken, ttlSeconds, renewInterval)
+			return leaseCtx, func() {
+				stopRenewal()
 				releaseCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 				defer cancel()
-				if err := database.Session().Query(`
-					DELETE FROM gc_leases WHERE role = ? IF instance_id = ?
-				`, leaseRole, leaseToken).WithContext(releaseCtx).Exec(); err != nil {
+				if err := releaseSeafHTTPUploadFinalizeLeaseFn(releaseCtx, database, leaseRole, leaseToken); err != nil {
 					log.Printf("[uploadFinalizeLease] Best-effort lease release failed for repo=%s token=%s: %v", repoID, leaseToken, err)
 				}
 			}, nil
 		}
 		select {
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			return nil, nil, ctx.Err()
 		default:
 		}
-		seafHTTPUploadFinalizeLeaseSleepFn(seafHTTPUploadFinalizeLeasePollInterval)
+		seafHTTPUploadFinalizeLeaseSleepFn(pollInterval)
 	}
 }
 
-func acquireSeafHTTPUploadFinalizePermit(ctx context.Context, database *db.DB, repoID string) (func(), error) {
+func acquireSeafHTTPDistributedUploadFinalizeLease(ctx context.Context, database *db.DB, repoID string) (context.Context, func(), error) {
+	return acquireSeafHTTPDistributedUploadFinalizeLeaseWithIntervals(ctx, database, repoID, seafHTTPUploadFinalizeLeaseTTL, seafHTTPUploadFinalizeLeasePollInterval, seafHTTPUploadFinalizeLeaseRenewInterval)
+}
+
+func acquireSeafHTTPUploadFinalizePermit(ctx context.Context, database *db.DB, repoID string) (context.Context, func(), error) {
 	releaseLocalPermit, err := acquireChunkedUploadLibraryFinalizePermit(ctx, repoID)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	releaseDistributedLease, err := acquireSeafHTTPDistributedUploadFinalizeLease(ctx, database, repoID)
+	leaseCtx, releaseDistributedLease, err := acquireSeafHTTPDistributedUploadFinalizeLease(ctx, database, repoID)
 	if err != nil {
 		releaseLocalPermit()
-		return nil, err
+		return nil, nil, err
 	}
-	return func() {
+	return leaseCtx, func() {
 		releaseDistributedLease()
 		releaseLocalPermit()
 	}, nil
+}
+
+func checkSeafHTTPUploadFinalizeContext(ctx context.Context, repoID, phase string) error {
+	if ctx == nil || ctx.Err() == nil {
+		return nil
+	}
+	if strings.TrimSpace(phase) == "" {
+		phase = "metadata finalize"
+	}
+	return fmt.Errorf("upload finalize lost exclusivity for repo %s during %s: %w", repoID, phase, ctx.Err())
 }
 
 // HandleUpload handles file uploads via the upload token.
@@ -1451,14 +1550,16 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 	}
 
 	// Update filesystem metadata
-	releaseFinalizePermit, err := acquireSeafHTTPUploadFinalizePermit(c.Request.Context(), h.db, token.RepoID)
+	finalizeCtx, cancelFinalize := newSeafHTTPUploadMetadataFinalizeContext()
+	defer cancelFinalize()
+	leaseCtx, releaseFinalizePermit, err := acquireSeafHTTPUploadFinalizePermit(finalizeCtx, h.db, token.RepoID)
 	if err != nil {
 		writeSeafHTTPUploadError(c, err, "file stored but metadata update failed")
 		return
 	}
 	defer releaseFinalizePermit()
 
-	commitID, actualFilename, storageDeltaBytes, storageDeltaFiles, err := h.commitUploadedFile(token.OrgID, token.RepoID, token.UserID, parentDir, filename, fileID, chunkData, finalSize, replaceFile)
+	commitID, actualFilename, storageDeltaBytes, storageDeltaFiles, err := h.commitUploadedFile(leaseCtx, token.OrgID, token.RepoID, token.UserID, parentDir, filename, fileID, chunkData, finalSize, replaceFile)
 	if err != nil {
 		h.handleSingleShotMetadataError(token, sha256ID, err)
 		log.Printf("[HandleUpload] Failed to update filesystem: %v", err)
@@ -1934,13 +2035,15 @@ readLoop:
 	fileID := hex.EncodeToString(sha1Hasher.Sum(nil))
 
 	log.Printf("[finalizeUploadStreaming] Stored %d blocks for file %s (size=%d, parallelism=%d)", len(blockSHA1IDs), fileID[:16], totalSize, finalizeUploadConcurrency)
-	releaseFinalizePermit, err := acquireSeafHTTPUploadFinalizePermit(c.Request.Context(), h.db, token.RepoID)
+	finalizeCtx, cancelFinalize := newSeafHTTPUploadMetadataFinalizeContext()
+	defer cancelFinalize()
+	leaseCtx, releaseFinalizePermit, err := acquireSeafHTTPUploadFinalizePermit(finalizeCtx, h.db, token.RepoID)
 	if err != nil {
 		return "", "", 0, 0, err
 	}
 	defer releaseFinalizePermit()
 
-	commitID, actualFilename, storageDeltaBytes, storageDeltaFiles, err := h.commitUploadedFileMultiBlock(token.OrgID, token.RepoID, token.UserID, parentDir, filename, fileID, blockSHA1IDs, totalSize, replace)
+	commitID, actualFilename, storageDeltaBytes, storageDeltaFiles, err := h.commitUploadedFileMultiBlock(leaseCtx, token.OrgID, token.RepoID, token.UserID, parentDir, filename, fileID, blockSHA1IDs, totalSize, replace)
 	if err != nil {
 		return "", "", 0, 0, fmt.Errorf("failed to update filesystem metadata: %w", err)
 	}
@@ -1954,7 +2057,7 @@ readLoop:
 // Used for large files that are split into multiple blocks during upload.
 // Returns the commit ID, the actual filename used (may differ if auto-renamed),
 // and the storage delta from the winning publish attempt.
-func (h *SeafHTTPHandler) commitUploadedFileMultiBlock(orgID, repoID, userID, parentDir, filename, fileID string, blockIDs []string, fileSize int64, replace bool) (string, string, int64, int64, error) {
+func (h *SeafHTTPHandler) commitUploadedFileMultiBlock(ctx context.Context, orgID, repoID, userID, parentDir, filename, fileID string, blockIDs []string, fileSize int64, replace bool) (string, string, int64, int64, error) {
 	startedAt := time.Now()
 	attemptsUsed := 0
 	result := "error"
@@ -1965,8 +2068,11 @@ func (h *SeafHTTPHandler) commitUploadedFileMultiBlock(orgID, repoID, userID, pa
 
 	var lastConflict error
 	for attempt := 1; attempt <= uploadMetadataRetryAttempts; attempt++ {
+		if err := checkSeafHTTPUploadFinalizeContext(ctx, repoID, "metadata finalize retry loop"); err != nil {
+			return "", "", 0, 0, err
+		}
 		attemptsUsed = attempt
-		commitID, actualFilename, storageDeltaBytes, storageDeltaFiles, err := h.commitUploadedFileMultiBlockOnce(orgID, repoID, userID, parentDir, filename, fileID, blockIDs, fileSize, replace)
+		commitID, actualFilename, storageDeltaBytes, storageDeltaFiles, err := h.commitUploadedFileMultiBlockOnce(ctx, orgID, repoID, userID, parentDir, filename, fileID, blockIDs, fileSize, replace)
 		if err == nil {
 			result = "success"
 			return commitID, actualFilename, storageDeltaBytes, storageDeltaFiles, nil
@@ -2027,7 +2133,28 @@ func finalizeSeafHTTPPublishedBlockReferences(fsHelper *v2.FSHelper, database *d
 	}
 }
 
-func (h *SeafHTTPHandler) commitUploadedFileMultiBlockOnce(orgID, repoID, userID, parentDir, filename, fileID string, blockIDs []string, fileSize int64, replace bool) (string, string, int64, int64, error) {
+func (h *SeafHTTPHandler) createPendingSeafHTTPFileFSObject(orgID, repoID, attemptID, fsID, filename, fullPath string, fileSize int64, createdAt time.Time, externalBlockIDs, stagedBlockIDs []string) error {
+	if err := h.db.UpsertPendingPublishedFSObjectOwner(repoID, fsID, attemptID, createdAt, orgID, attemptID, stagedBlockIDs); err != nil {
+		_ = db.RemovePublishAttemptReferences(h.db, orgID, attemptID, stagedBlockIDs)
+		return fmt.Errorf("failed to create pending fs_object owner: %w", err)
+	}
+	if err := h.db.Session().Query(`
+		INSERT INTO fs_objects (library_id, fs_id, obj_type, obj_name, full_path, size_bytes, mtime, block_ids)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+	`, repoID, fsID, "file", filename, fullPath, fileSize, createdAt.Unix(), externalBlockIDs).Exec(); err != nil {
+		cleanupErr := cleanupSeafHTTPFailedPublishAttempt(h.db, orgID, repoID, attemptID, fsID, stagedBlockIDs)
+		if cleanupErr != nil {
+			return errors.Join(fmt.Errorf("failed to create file fs_object: %w", err), cleanupErr)
+		}
+		return fmt.Errorf("failed to create file fs_object: %w", err)
+	}
+	return nil
+}
+
+func (h *SeafHTTPHandler) commitUploadedFileMultiBlockOnce(ctx context.Context, orgID, repoID, userID, parentDir, filename, fileID string, blockIDs []string, fileSize int64, replace bool) (string, string, int64, int64, error) {
+	if err := checkSeafHTTPUploadFinalizeContext(ctx, repoID, "metadata finalize attempt"); err != nil {
+		return "", "", 0, 0, err
+	}
 	// Single consistent snapshot: head_commit_id + root_fs_id read together so
 	// the quota delta, tree traversal, and CAS compare all use the same HEAD.
 	fsHelper := v2.NewFSHelper(h.db)
@@ -2088,17 +2215,23 @@ func (h *SeafHTTPHandler) commitUploadedFileMultiBlockOnce(orgID, repoID, userID
 	if err != nil {
 		return "", "", 0, 0, fmt.Errorf("failed to stage publish-attempt block references: %w", err)
 	}
+	if err := checkSeafHTTPUploadFinalizeContext(ctx, repoID, "persist pending publish state"); err != nil {
+		cleanupErr := db.RemovePublishAttemptReferences(h.db, orgID, newCommitID, stagedBlockIDs)
+		if cleanupErr != nil {
+			return "", "", 0, 0, errors.Join(err, cleanupErr)
+		}
+		return "", "", 0, 0, err
+	}
 	createdAt := time.Now().UTC()
-	batch := h.db.Session().Batch(gocql.LoggedBatch)
-	batch.Query(`
-		INSERT INTO fs_objects (library_id, fs_id, obj_type, obj_name, full_path, size_bytes, mtime, block_ids)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-	`, repoID, fileFSID, "file", actualFilename, fullPath, fileSize, createdAt.Unix(), blockIDs)
-	db.AddUpsertPendingPublishedFSObjectOwnerQueries(batch, repoID, fileFSID, newCommitID, createdAt, orgID, newCommitID, stagedBlockIDs)
-	err = h.db.Session().ExecuteBatch(batch)
-	if err != nil {
-		_ = db.RemovePublishAttemptReferences(h.db, orgID, newCommitID, stagedBlockIDs)
-		return "", "", 0, 0, fmt.Errorf("failed to create file fs_object: %w", err)
+	if err := h.createPendingSeafHTTPFileFSObject(orgID, repoID, newCommitID, fileFSID, actualFilename, fullPath, fileSize, createdAt, blockIDs, stagedBlockIDs); err != nil {
+		return "", "", 0, 0, err
+	}
+	if err := checkSeafHTTPUploadFinalizeContext(ctx, repoID, "commit creation"); err != nil {
+		cleanupErr := cleanupSeafHTTPFailedPublishAttempt(h.db, orgID, repoID, newCommitID, fileFSID, stagedBlockIDs)
+		if cleanupErr != nil {
+			return "", "", 0, 0, errors.Join(err, cleanupErr)
+		}
+		return "", "", 0, 0, err
 	}
 
 	err = h.db.Session().Query(`
@@ -2115,6 +2248,13 @@ func (h *SeafHTTPHandler) commitUploadedFileMultiBlockOnce(orgID, repoID, userID
 			fmt.Errorf("failed to queue durable publish repair for commit %s: %w", newCommitID, err),
 			cleanupErr,
 		)
+	}
+	if err := checkSeafHTTPUploadFinalizeContext(ctx, repoID, "library head publish"); err != nil {
+		cleanupErr := cleanupSeafHTTPFailedPublishAttempt(h.db, orgID, repoID, newCommitID, fileFSID, stagedBlockIDs)
+		if cleanupErr != nil {
+			return "", "", 0, 0, errors.Join(err, cleanupErr)
+		}
+		return "", "", 0, 0, err
 	}
 
 	if err := fsHelper.UpdateLibraryHeadFromSnapshot(snapshot, repoID, newCommitID, snapshot.HeadCommitID); err != nil {
@@ -2138,7 +2278,7 @@ func (h *SeafHTTPHandler) commitUploadedFileMultiBlockOnce(orgID, repoID, userID
 // When replace is false and a file with the same name exists, it auto-renames to "name (1).ext".
 // Returns the commit ID, the actual filename used (may differ if auto-renamed),
 // and the storage delta from the winning publish attempt.
-func (h *SeafHTTPHandler) commitUploadedFile(orgID, repoID, userID, parentDir, filename, fileID string, content []byte, fileSize int64, replace bool) (string, string, int64, int64, error) {
+func (h *SeafHTTPHandler) commitUploadedFile(ctx context.Context, orgID, repoID, userID, parentDir, filename, fileID string, content []byte, fileSize int64, replace bool) (string, string, int64, int64, error) {
 	startedAt := time.Now()
 	attemptsUsed := 0
 	result := "error"
@@ -2149,8 +2289,11 @@ func (h *SeafHTTPHandler) commitUploadedFile(orgID, repoID, userID, parentDir, f
 
 	var lastConflict error
 	for attempt := 1; attempt <= uploadMetadataRetryAttempts; attempt++ {
+		if err := checkSeafHTTPUploadFinalizeContext(ctx, repoID, "metadata finalize retry loop"); err != nil {
+			return "", "", 0, 0, err
+		}
 		attemptsUsed = attempt
-		commitID, actualFilename, storageDeltaBytes, storageDeltaFiles, err := h.commitUploadedFileOnce(orgID, repoID, userID, parentDir, filename, fileID, content, fileSize, replace)
+		commitID, actualFilename, storageDeltaBytes, storageDeltaFiles, err := h.commitUploadedFileOnce(ctx, orgID, repoID, userID, parentDir, filename, fileID, content, fileSize, replace)
 		if err == nil {
 			result = "success"
 			return commitID, actualFilename, storageDeltaBytes, storageDeltaFiles, nil
@@ -2177,7 +2320,10 @@ func (h *SeafHTTPHandler) commitUploadedFile(orgID, repoID, userID, parentDir, f
 	return "", "", 0, 0, fmt.Errorf("%w: failed to finalize upload metadata after %d attempts", v2.ErrLibraryHeadConflict, uploadMetadataRetryAttempts)
 }
 
-func (h *SeafHTTPHandler) commitUploadedFileOnce(orgID, repoID, userID, parentDir, filename, fileID string, content []byte, fileSize int64, replace bool) (string, string, int64, int64, error) {
+func (h *SeafHTTPHandler) commitUploadedFileOnce(ctx context.Context, orgID, repoID, userID, parentDir, filename, fileID string, content []byte, fileSize int64, replace bool) (string, string, int64, int64, error) {
+	if err := checkSeafHTTPUploadFinalizeContext(ctx, repoID, "metadata finalize attempt"); err != nil {
+		return "", "", 0, 0, err
+	}
 	// Single consistent snapshot: head_commit_id + root_fs_id read together so
 	// the quota delta, tree traversal, and CAS compare all use the same HEAD.
 	fsHelper := v2.NewFSHelper(h.db)
@@ -2238,17 +2384,23 @@ func (h *SeafHTTPHandler) commitUploadedFileOnce(orgID, repoID, userID, parentDi
 	if err != nil {
 		return "", "", 0, 0, fmt.Errorf("failed to stage publish-attempt block references: %w", err)
 	}
+	if err := checkSeafHTTPUploadFinalizeContext(ctx, repoID, "persist pending publish state"); err != nil {
+		cleanupErr := db.RemovePublishAttemptReferences(h.db, orgID, newCommitID, stagedBlockIDs)
+		if cleanupErr != nil {
+			return "", "", 0, 0, errors.Join(err, cleanupErr)
+		}
+		return "", "", 0, 0, err
+	}
 	createdAt := time.Now().UTC()
-	batch := h.db.Session().Batch(gocql.LoggedBatch)
-	batch.Query(`
-		INSERT INTO fs_objects (library_id, fs_id, obj_type, obj_name, full_path, size_bytes, mtime, block_ids)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-	`, repoID, fileFSID, "file", actualFilename, fullPath, fileSize, createdAt.Unix(), []string{blockID})
-	db.AddUpsertPendingPublishedFSObjectOwnerQueries(batch, repoID, fileFSID, newCommitID, createdAt, orgID, newCommitID, stagedBlockIDs)
-	err = h.db.Session().ExecuteBatch(batch)
-	if err != nil {
-		_ = db.RemovePublishAttemptReferences(h.db, orgID, newCommitID, stagedBlockIDs)
-		return "", "", 0, 0, fmt.Errorf("failed to create file fs_object: %w", err)
+	if err := h.createPendingSeafHTTPFileFSObject(orgID, repoID, newCommitID, fileFSID, actualFilename, fullPath, fileSize, createdAt, []string{blockID}, stagedBlockIDs); err != nil {
+		return "", "", 0, 0, err
+	}
+	if err := checkSeafHTTPUploadFinalizeContext(ctx, repoID, "commit creation"); err != nil {
+		cleanupErr := cleanupSeafHTTPFailedPublishAttempt(h.db, orgID, repoID, newCommitID, fileFSID, stagedBlockIDs)
+		if cleanupErr != nil {
+			return "", "", 0, 0, errors.Join(err, cleanupErr)
+		}
+		return "", "", 0, 0, err
 	}
 	log.Printf("[commitUploadedFile] Created file fs_object: %s at %s", fileFSID, fullPath)
 
@@ -2266,6 +2418,13 @@ func (h *SeafHTTPHandler) commitUploadedFileOnce(orgID, repoID, userID, parentDi
 			fmt.Errorf("failed to queue durable publish repair for commit %s: %w", newCommitID, err),
 			cleanupErr,
 		)
+	}
+	if err := checkSeafHTTPUploadFinalizeContext(ctx, repoID, "library head publish"); err != nil {
+		cleanupErr := cleanupSeafHTTPFailedPublishAttempt(h.db, orgID, repoID, newCommitID, fileFSID, stagedBlockIDs)
+		if cleanupErr != nil {
+			return "", "", 0, 0, errors.Join(err, cleanupErr)
+		}
+		return "", "", 0, 0, err
 	}
 
 	if err := fsHelper.UpdateLibraryHeadFromSnapshot(snapshot, repoID, newCommitID, snapshot.HeadCommitID); err != nil {

@@ -30,6 +30,13 @@ const (
 	// uploads). An abandoned upload's rows expire on their own — no permanent leak.
 	ProvisionalBlockReferenceTTLSeconds = 48 * 60 * 60 // 48h
 
+	// PublishAttemptReferenceTTLSeconds bounds how long a pub:<attempt> crash
+	// backstop can keep blocks alive after a winner commit becomes visible but
+	// permanent fs_object refs have not been promoted yet. It must comfortably
+	// exceed the stale-owner sweep window, repair lag, and prolonged restart
+	// windows so reachable commits still have time to self-heal on recovery.
+	PublishAttemptReferenceTTLSeconds = 35 * 24 * 60 * 60 // 35d
+
 	// BlockGCStateDeleting marks a block row claimed by the GC worker for an
 	// imminent S3 delete. Writers that observe it must back off and retry.
 	BlockGCStateDeleting = "deleting"
@@ -73,7 +80,7 @@ var publishAttemptPromotionSleepFn = time.Sleep
 var removePublishAttemptReferencesForPromotionFn = RemovePublishAttemptReferences
 
 var addPublishAttemptReferenceFn = func(database *DB, orgID, blockID, referrer, repoID string) error {
-	return database.AddBlockReference(orgID, blockID, referrer, repoID, 0)
+	return database.AddBlockReference(orgID, blockID, referrer, repoID, PublishAttemptReferenceTTLSeconds)
 }
 
 var removePublishAttemptReferenceFn = func(database *DB, orgID, blockID, referrer string) error {

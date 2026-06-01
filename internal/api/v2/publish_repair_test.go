@@ -2,6 +2,7 @@ package v2
 
 import (
 	"errors"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -388,10 +389,12 @@ func TestFailedPublishFSObjectReachableFromRoot_IgnoresMissingUnrelatedNodes(t *
 func TestRunPendingPublishedFSObjectOwnerSweep_ReleasesOnlyStaleOwners(t *testing.T) {
 	oldNow := pendingPublishedFSObjectOwnerNowFn
 	oldList := listPendingPublishedFSObjectOwnersByDayFn
+	oldLoad := loadPendingPublishedFSObjectOwnerFn
 	oldCleanup := cleanupPendingPublishedFileOwnerAttemptFn
 	t.Cleanup(func() {
 		pendingPublishedFSObjectOwnerNowFn = oldNow
 		listPendingPublishedFSObjectOwnersByDayFn = oldList
+		loadPendingPublishedFSObjectOwnerFn = oldLoad
 		cleanupPendingPublishedFileOwnerAttemptFn = oldCleanup
 	})
 
@@ -405,6 +408,9 @@ func TestRunPendingPublishedFSObjectOwnerSweep_ReleasesOnlyStaleOwners(t *testin
 			{RepoID: "repo-1", FSID: "fs-stale", OwnerID: "owner-stale", CreatedAt: now.Add(-pendingPublishedFSObjectOwnerStaleAfter - time.Minute), OrgID: "org-1", AttemptID: "commit-stale", BlockIDs: []string{"queued-block-1"}},
 			{RepoID: "repo-1", FSID: "fs-fresh", OwnerID: "owner-fresh", CreatedAt: now.Add(-time.Hour)},
 		}, nil
+	}
+	loadPendingPublishedFSObjectOwnerFn = func(database *db.DB, repoID, fsID, ownerID string) (db.PendingPublishedFSObjectOwner, error) {
+		return db.PendingPublishedFSObjectOwner{}, nil
 	}
 	var released []string
 	cleanupPendingPublishedFileOwnerAttemptFn = func(database *db.DB, repoID string, pending *pendingPublishedFile) error {
@@ -427,14 +433,134 @@ func TestRunPendingPublishedFSObjectOwnerSweep_ReleasesOnlyStaleOwners(t *testin
 	}
 }
 
-func TestCleanupPendingPublishedFileOwnerAttempt_ClearsOwnerForReachableCommit(t *testing.T) {
-	oldReachable := cleanupPendingPublishedFileAttemptCommitReachableFn
+func TestRunPendingPublishedFSObjectOwnerSweep_HydratesMissingMetadataFromPrimaryRow(t *testing.T) {
+	oldNow := pendingPublishedFSObjectOwnerNowFn
+	oldList := listPendingPublishedFSObjectOwnersByDayFn
+	oldLoad := loadPendingPublishedFSObjectOwnerFn
+	oldCleanup := cleanupPendingPublishedFileOwnerAttemptFn
+	t.Cleanup(func() {
+		pendingPublishedFSObjectOwnerNowFn = oldNow
+		listPendingPublishedFSObjectOwnersByDayFn = oldList
+		loadPendingPublishedFSObjectOwnerFn = oldLoad
+		cleanupPendingPublishedFileOwnerAttemptFn = oldCleanup
+	})
+
+	now := time.Date(2026, time.June, 1, 12, 0, 0, 0, time.UTC)
+	pendingPublishedFSObjectOwnerNowFn = func() time.Time { return now }
+	listPendingPublishedFSObjectOwnersByDayFn = func(database *db.DB, day time.Time, bucket int) ([]db.PendingPublishedFSObjectOwner, error) {
+		if !day.Equal(db.GCProjectionUTCDate(now)) || bucket != 0 {
+			return nil, nil
+		}
+		return []db.PendingPublishedFSObjectOwner{{
+			RepoID:    "repo-1",
+			FSID:      "fs-stale",
+			OwnerID:   "owner-stale",
+			CreatedAt: now.Add(-pendingPublishedFSObjectOwnerStaleAfter - time.Minute),
+		}}, nil
+	}
+	hydrated := 0
+	loadPendingPublishedFSObjectOwnerFn = func(database *db.DB, repoID, fsID, ownerID string) (db.PendingPublishedFSObjectOwner, error) {
+		hydrated++
+		if repoID != "repo-1" || fsID != "fs-stale" || ownerID != "owner-stale" {
+			t.Fatalf("hydrate args = %s/%s/%s, want repo-1/fs-stale/owner-stale", repoID, fsID, ownerID)
+		}
+		return db.PendingPublishedFSObjectOwner{
+			RepoID:    repoID,
+			FSID:      fsID,
+			OwnerID:   ownerID,
+			CreatedAt: now.Add(-pendingPublishedFSObjectOwnerStaleAfter - time.Minute),
+			OrgID:     "org-1",
+			AttemptID: "commit-stale",
+			BlockIDs:  []string{"queued-block-1", "queued-block-2"},
+		}, nil
+	}
+	cleanupPendingPublishedFileOwnerAttemptFn = func(database *db.DB, repoID string, pending *pendingPublishedFile) error {
+		if repoID != "repo-1" {
+			t.Fatalf("cleanup repoID = %s, want repo-1", repoID)
+		}
+		if pending.cleanupOrgID != "org-1" || pending.cleanupAttemptID != "commit-stale" {
+			t.Fatalf("pending cleanup metadata = %s/%s, want org-1/commit-stale", pending.cleanupOrgID, pending.cleanupAttemptID)
+		}
+		if !reflect.DeepEqual(pending.internalBlockIDs, []string{"queued-block-1", "queued-block-2"}) {
+			t.Fatalf("pending.internalBlockIDs = %#v, want hydrated block ids", pending.internalBlockIDs)
+		}
+		return nil
+	}
+
+	if err := runPendingPublishedFSObjectOwnerSweep(&db.DB{}); err != nil {
+		t.Fatalf("runPendingPublishedFSObjectOwnerSweep() error = %v, want nil", err)
+	}
+	if hydrated != 1 {
+		t.Fatalf("hydrated = %d, want 1", hydrated)
+	}
+}
+
+func TestRunPendingPublishedFSObjectOwnerSweep_DeletesDanglingProjectionWhenPrimaryRowMissing(t *testing.T) {
+	oldNow := pendingPublishedFSObjectOwnerNowFn
+	oldList := listPendingPublishedFSObjectOwnersByDayFn
+	oldLoad := loadPendingPublishedFSObjectOwnerFn
 	oldDeletePendingOwner := cleanupFailedPublishDeletePendingOwnerFn
+	oldCleanup := cleanupPendingPublishedFileOwnerAttemptFn
+	t.Cleanup(func() {
+		pendingPublishedFSObjectOwnerNowFn = oldNow
+		listPendingPublishedFSObjectOwnersByDayFn = oldList
+		loadPendingPublishedFSObjectOwnerFn = oldLoad
+		cleanupFailedPublishDeletePendingOwnerFn = oldDeletePendingOwner
+		cleanupPendingPublishedFileOwnerAttemptFn = oldCleanup
+	})
+
+	now := time.Date(2026, time.June, 1, 12, 0, 0, 0, time.UTC)
+	pendingPublishedFSObjectOwnerNowFn = func() time.Time { return now }
+	listPendingPublishedFSObjectOwnersByDayFn = func(database *db.DB, day time.Time, bucket int) ([]db.PendingPublishedFSObjectOwner, error) {
+		if !day.Equal(db.GCProjectionUTCDate(now)) || bucket != 0 {
+			return nil, nil
+		}
+		return []db.PendingPublishedFSObjectOwner{{
+			RepoID:    "repo-1",
+			FSID:      "fs-stale",
+			OwnerID:   "owner-stale",
+			CreatedAt: now.Add(-pendingPublishedFSObjectOwnerStaleAfter - time.Minute),
+		}}, nil
+	}
+	loadPendingPublishedFSObjectOwnerFn = func(database *db.DB, repoID, fsID, ownerID string) (db.PendingPublishedFSObjectOwner, error) {
+		return db.PendingPublishedFSObjectOwner{}, gocql.ErrNotFound
+	}
+	deleted := 0
+	cleanupFailedPublishDeletePendingOwnerFn = func(database *db.DB, repoID, fsID, ownerID string, createdAt time.Time) error {
+		deleted++
+		if repoID != "repo-1" || fsID != "fs-stale" || ownerID != "owner-stale" {
+			t.Fatalf("delete args = %s/%s/%s, want repo-1/fs-stale/owner-stale", repoID, fsID, ownerID)
+		}
+		if !createdAt.Equal(now.Add(-pendingPublishedFSObjectOwnerStaleAfter - time.Minute)) {
+			t.Fatalf("delete createdAt = %v, want projection timestamp", createdAt)
+		}
+		return nil
+	}
+	cleanupPendingPublishedFileOwnerAttemptFn = func(database *db.DB, repoID string, pending *pendingPublishedFile) error {
+		t.Fatal("cleanupPendingPublishedFileOwnerAttemptFn must not run for dangling projections")
+		return nil
+	}
+
+	if err := runPendingPublishedFSObjectOwnerSweep(&db.DB{}); err != nil {
+		t.Fatalf("runPendingPublishedFSObjectOwnerSweep() error = %v, want nil", err)
+	}
+	if deleted != 1 {
+		t.Fatalf("deleted = %d, want 1", deleted)
+	}
+}
+
+func TestCleanupPendingPublishedFileOwnerAttempt_PromotesReachableCommitBeforeClearingOwner(t *testing.T) {
+	oldReachable := cleanupPendingPublishedFileAttemptCommitReachableFn
+	oldLoad := loadPublishedBlockReferenceRepairPendingFileFn
+	oldPromote := publishedBlockReferenceRepairPromoteFn
+	oldClear := clearPendingPublishedFileOwnerFn
 	oldDeleteCommit := cleanupFailedPublishDeleteCommitFn
 	oldRemoveAttemptRefs := cleanupFailedPublishRemoveAttemptReferencesFn
 	t.Cleanup(func() {
 		cleanupPendingPublishedFileAttemptCommitReachableFn = oldReachable
-		cleanupFailedPublishDeletePendingOwnerFn = oldDeletePendingOwner
+		loadPublishedBlockReferenceRepairPendingFileFn = oldLoad
+		publishedBlockReferenceRepairPromoteFn = oldPromote
+		clearPendingPublishedFileOwnerFn = oldClear
 		cleanupFailedPublishDeleteCommitFn = oldDeleteCommit
 		cleanupFailedPublishRemoveAttemptReferencesFn = oldRemoveAttemptRefs
 	})
@@ -447,11 +573,39 @@ func TestCleanupPendingPublishedFileOwnerAttempt_ClearsOwnerForReachableCommit(t
 		}
 		return true, nil
 	}
+	loaded := 0
+	loadPublishedBlockReferenceRepairPendingFileFn = func(database *db.DB, repoID, fsID string) (*pendingPublishedFile, error) {
+		loaded++
+		if repoID != "repo-1" || fsID != "fs-1" {
+			t.Fatalf("load args = %s/%s, want repo-1/fs-1", repoID, fsID)
+		}
+		return &pendingPublishedFile{fsID: fsID, externalBlockIDs: []string{"block-ext-1"}}, nil
+	}
+	promoted := 0
+	publishedBlockReferenceRepairPromoteFn = func(helper *FSHelper, orgID, repoID, commitID string, pending *pendingPublishedFile) error {
+		promoted++
+		if helper == nil {
+			t.Fatal("promote helper must be initialized")
+		}
+		if orgID != "org-1" || repoID != "repo-1" || commitID != "commit-1" {
+			t.Fatalf("promote args = %s/%s/%s, want org-1/repo-1/commit-1", orgID, repoID, commitID)
+		}
+		if pending == nil || pending.fsID != "fs-1" {
+			t.Fatalf("promote pending fsID = %#v, want fs-1", pending)
+		}
+		if !reflect.DeepEqual(pending.externalBlockIDs, []string{"block-ext-1"}) {
+			t.Fatalf("promote externalBlockIDs = %#v, want []string{\"block-ext-1\"}", pending.externalBlockIDs)
+		}
+		if !reflect.DeepEqual(pending.internalBlockIDs, []string{"block-int-1"}) {
+			t.Fatalf("promote internalBlockIDs = %#v, want []string{\"block-int-1\"}", pending.internalBlockIDs)
+		}
+		return nil
+	}
 	clearedOwners := 0
-	cleanupFailedPublishDeletePendingOwnerFn = func(database *db.DB, repoID, fsID, ownerID string, createdAt time.Time) error {
+	clearPendingPublishedFileOwnerFn = func(database *db.DB, repoID string, pending *pendingPublishedFile) error {
 		clearedOwners++
-		if repoID != "repo-1" || fsID != "fs-1" || ownerID != "owner-1" {
-			t.Fatalf("clear owner args = %s/%s/%s, want repo-1/fs-1/owner-1", repoID, fsID, ownerID)
+		if repoID != "repo-1" || pending == nil || pending.fsID != "fs-1" || pending.cleanupOwnerID != "owner-1" {
+			t.Fatalf("clear owner args = %s/%#v, want repo-1 owner fs-1/owner-1", repoID, pending)
 		}
 		return nil
 	}
@@ -468,13 +622,21 @@ func TestCleanupPendingPublishedFileOwnerAttempt_ClearsOwnerForReachableCommit(t
 		fsID:             "fs-1",
 		cleanupOwnerID:   "owner-1",
 		cleanupCreatedAt: time.Date(2026, time.June, 1, 12, 0, 0, 0, time.UTC),
+		cleanupOrgID:     "org-1",
 		cleanupAttemptID: "commit-1",
+		internalBlockIDs: []string{"block-int-1"},
 	})
 	if err != nil {
 		t.Fatalf("cleanupPendingPublishedFileOwnerAttempt() error = %v, want nil", err)
 	}
 	if reachabilityChecks != 1 {
 		t.Fatalf("reachabilityChecks = %d, want 1", reachabilityChecks)
+	}
+	if loaded != 1 {
+		t.Fatalf("loaded = %d, want 1", loaded)
+	}
+	if promoted != 1 {
+		t.Fatalf("promoted = %d, want 1", promoted)
 	}
 	if clearedOwners != 1 {
 		t.Fatalf("clearedOwners = %d, want 1", clearedOwners)

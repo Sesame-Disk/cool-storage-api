@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"reflect"
+	"sync"
 	"testing"
 	"time"
 
@@ -76,6 +77,222 @@ func TestAcquireChunkedUploadLibraryFinalizePermitDoesNotBlockDifferentRepos(t *
 	releaseSecond, err := acquireChunkedUploadLibraryFinalizePermit(context.Background(), "repo-2")
 	if err != nil {
 		t.Fatalf("second acquire for different repo failed: %v", err)
+	}
+	releaseSecond()
+}
+
+func TestNewSeafHTTPUploadMetadataFinalizeContext_IgnoresCanceledRequest(t *testing.T) {
+	requestCtx, cancelRequest := context.WithCancel(context.Background())
+	cancelRequest()
+
+	finalizeCtx, cancelFinalize := newSeafHTTPUploadMetadataFinalizeContext()
+	defer cancelFinalize()
+
+	if err := requestCtx.Err(); !errors.Is(err, context.Canceled) {
+		t.Fatalf("requestCtx.Err() = %v, want context canceled", err)
+	}
+	if err := finalizeCtx.Err(); err != nil {
+		t.Fatalf("finalizeCtx.Err() = %v, want nil for server-side finalize context", err)
+	}
+
+	select {
+	case <-finalizeCtx.Done():
+		t.Fatal("server-side finalize context should stay alive independent of the request context")
+	default:
+	}
+}
+
+func TestAcquireSeafHTTPDistributedUploadFinalizeLeaseRenewsWhileHeld(t *testing.T) {
+	origTryAcquire := tryAcquireSeafHTTPUploadFinalizeLeaseFn
+	origRenew := renewSeafHTTPUploadFinalizeLeaseFn
+	origRelease := releaseSeafHTTPUploadFinalizeLeaseFn
+	defer func() {
+		tryAcquireSeafHTTPUploadFinalizeLeaseFn = origTryAcquire
+		renewSeafHTTPUploadFinalizeLeaseFn = origRenew
+		releaseSeafHTTPUploadFinalizeLeaseFn = origRelease
+	}()
+
+	leaseTTL := 40 * time.Millisecond
+	renewInterval := 10 * time.Millisecond
+
+	type leaseState struct {
+		token     string
+		expiresAt time.Time
+	}
+
+	var (
+		mu         sync.Mutex
+		state      = map[string]leaseState{}
+		renewCount int
+	)
+
+	tryAcquireSeafHTTPUploadFinalizeLeaseFn = func(ctx context.Context, database *db.DB, leaseRole, leaseToken string, ttlSeconds int) (bool, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		now := time.Now()
+		current := state[leaseRole]
+		if current.token == "" || !now.Before(current.expiresAt) {
+			state[leaseRole] = leaseState{token: leaseToken, expiresAt: now.Add(leaseTTL)}
+			return true, nil
+		}
+		return false, nil
+	}
+
+	renewSeafHTTPUploadFinalizeLeaseFn = func(ctx context.Context, database *db.DB, leaseRole, leaseToken string, ttlSeconds int) (bool, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		now := time.Now()
+		current := state[leaseRole]
+		if current.token != leaseToken || !now.Before(current.expiresAt) {
+			return false, nil
+		}
+		renewCount++
+		current.expiresAt = now.Add(leaseTTL)
+		state[leaseRole] = current
+		return true, nil
+	}
+
+	releaseSeafHTTPUploadFinalizeLeaseFn = func(ctx context.Context, database *db.DB, leaseRole, leaseToken string) error {
+		mu.Lock()
+		defer mu.Unlock()
+		current := state[leaseRole]
+		if current.token == leaseToken {
+			delete(state, leaseRole)
+		}
+		return nil
+	}
+
+	leaseCtxFirst, releaseFirst, err := acquireSeafHTTPDistributedUploadFinalizeLeaseWithIntervals(context.Background(), &db.DB{}, "repo-1", leaseTTL, time.Millisecond, renewInterval)
+	if err != nil {
+		t.Fatalf("first acquire failed: %v", err)
+	}
+	if leaseCtxFirst == nil {
+		t.Fatal("first lease context must not be nil")
+	}
+	releasedFirst := false
+	defer func() {
+		if !releasedFirst {
+			releaseFirst()
+		}
+	}()
+
+	time.Sleep(leaseTTL + 20*time.Millisecond)
+
+	blockedCtx, cancelBlocked := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancelBlocked()
+	leaseCtxSecond, releaseSecond, err := acquireSeafHTTPDistributedUploadFinalizeLeaseWithIntervals(blockedCtx, &db.DB{}, "repo-1", leaseTTL, time.Millisecond, renewInterval)
+	_ = leaseCtxSecond
+	if releaseSecond != nil {
+		releaseSecond()
+		t.Fatal("second distributed acquire should not succeed while the first lease is still being renewed")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("second acquire error = %v, want context deadline exceeded while the renewed lease is held", err)
+	}
+	if renewCount == 0 {
+		t.Fatal("expected distributed upload finalize lease to renew before TTL expiry")
+	}
+
+	releaseFirst()
+	releasedFirst = true
+	leaseCtxSecond, releaseSecond, err = acquireSeafHTTPDistributedUploadFinalizeLeaseWithIntervals(context.Background(), &db.DB{}, "repo-1", leaseTTL, time.Millisecond, renewInterval)
+	if err != nil {
+		t.Fatalf("second acquire after release failed: %v", err)
+	}
+	if leaseCtxSecond == nil {
+		t.Fatal("second lease context must not be nil")
+	}
+	releaseSecond()
+}
+
+func TestAcquireSeafHTTPDistributedUploadFinalizeLeaseCancelsContextWhenLost(t *testing.T) {
+	origTryAcquire := tryAcquireSeafHTTPUploadFinalizeLeaseFn
+	origRenew := renewSeafHTTPUploadFinalizeLeaseFn
+	origRelease := releaseSeafHTTPUploadFinalizeLeaseFn
+	defer func() {
+		tryAcquireSeafHTTPUploadFinalizeLeaseFn = origTryAcquire
+		renewSeafHTTPUploadFinalizeLeaseFn = origRenew
+		releaseSeafHTTPUploadFinalizeLeaseFn = origRelease
+	}()
+
+	leaseTTL := 40 * time.Millisecond
+	renewInterval := 10 * time.Millisecond
+
+	type leaseState struct {
+		token     string
+		expiresAt time.Time
+	}
+
+	var (
+		mu    sync.Mutex
+		state = map[string]leaseState{}
+	)
+
+	tryAcquireSeafHTTPUploadFinalizeLeaseFn = func(ctx context.Context, database *db.DB, leaseRole, leaseToken string, ttlSeconds int) (bool, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		now := time.Now()
+		current := state[leaseRole]
+		if current.token == "" || !now.Before(current.expiresAt) {
+			state[leaseRole] = leaseState{token: leaseToken, expiresAt: now.Add(leaseTTL)}
+			return true, nil
+		}
+		return false, nil
+	}
+
+	renewCalls := 0
+	renewSeafHTTPUploadFinalizeLeaseFn = func(ctx context.Context, database *db.DB, leaseRole, leaseToken string, ttlSeconds int) (bool, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		renewCalls++
+		if renewCalls == 1 {
+			state[leaseRole] = leaseState{token: "other-holder", expiresAt: time.Now().Add(leaseTTL)}
+			return false, nil
+		}
+		current := state[leaseRole]
+		if current.token != leaseToken {
+			return false, nil
+		}
+		current.expiresAt = time.Now().Add(leaseTTL)
+		state[leaseRole] = current
+		return true, nil
+	}
+
+	releaseSeafHTTPUploadFinalizeLeaseFn = func(ctx context.Context, database *db.DB, leaseRole, leaseToken string) error {
+		mu.Lock()
+		defer mu.Unlock()
+		current := state[leaseRole]
+		if current.token == leaseToken {
+			delete(state, leaseRole)
+		}
+		return nil
+	}
+
+	leaseCtx, releaseFirst, err := acquireSeafHTTPDistributedUploadFinalizeLeaseWithIntervals(context.Background(), &db.DB{}, "repo-1", leaseTTL, time.Millisecond, renewInterval)
+	if err != nil {
+		t.Fatalf("first acquire failed: %v", err)
+	}
+	defer releaseFirst()
+
+	select {
+	case <-leaseCtx.Done():
+		t.Fatal("lease context canceled before loss was observed")
+	default:
+	}
+
+	select {
+	case <-leaseCtx.Done():
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("lease context was not canceled after renewal reported lease loss")
+	}
+
+	time.Sleep(leaseTTL + 20*time.Millisecond)
+	leaseCtxSecond, releaseSecond, err := acquireSeafHTTPDistributedUploadFinalizeLeaseWithIntervals(context.Background(), &db.DB{}, "repo-1", leaseTTL, time.Millisecond, renewInterval)
+	if err != nil {
+		t.Fatalf("second acquire after lost lease failed: %v", err)
+	}
+	if leaseCtxSecond == nil {
+		t.Fatal("second lease context must not be nil")
 	}
 	releaseSecond()
 }

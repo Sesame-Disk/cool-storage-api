@@ -1270,11 +1270,8 @@ func (h *FileHandler) CreateFile(c *gin.Context) {
 		}
 
 		description := fmt.Sprintf("Added \"%s\"", fileName)
-		commitID, err := fsHelper.CreateCommit(repoID, userID, newRootFSID, snapshot.HeadCommitID, description)
-		if err != nil {
-			cleanupPendingFilePublish()
-			return fmt.Errorf("failed to create commit: %w", err)
-		}
+		commitCreatedAt := time.Now().UTC()
+		commitID := buildCommitID(repoID, newRootFSID, description, commitCreatedAt)
 		if err := fsHelper.stagePendingPublishedFiles(orgID, repoID, commitID, pendingFiles); err != nil {
 			if cleanupErr := CleanupFailedPublishAttempt(h.db, orgID, repoID, commitID, commitID, pendingFiles); cleanupErr != nil {
 				return errors.Join(
@@ -1294,6 +1291,15 @@ func (h *FileHandler) CreateFile(c *gin.Context) {
 			)
 		}
 		releaseTemplateBlockPin(false)
+		if err := fsHelper.insertCommit(repoID, commitID, userID, newRootFSID, snapshot.HeadCommitID, description, commitCreatedAt); err != nil {
+			cleanupErr := CleanupFailedPublishAttempt(h.db, orgID, repoID, commitID, commitID, pendingFiles)
+			clearErr := clearPendingPublishedFileRepairs(h.db, orgID, repoID, commitID, pendingFiles)
+			return errors.Join(
+				fmt.Errorf("failed to create commit: %w", err),
+				cleanupErr,
+				clearErr,
+			)
+		}
 
 		if err := fsHelper.UpdateLibraryHeadFromSnapshot(snapshot, repoID, commitID, snapshot.HeadCommitID); err != nil {
 			if errors.Is(err, ErrLibraryHeadConflict) {
@@ -3079,16 +3085,8 @@ func (h *FileHandler) finalizeStoredUploadMetadataOnce(fsHelper *FSHelper, orgID
 
 	description := fmt.Sprintf("Added or modified \"%s\".\n", actualFilename)
 	pendingFiles := []*pendingPublishedFile{pendingFile}
-	cleanupPendingFilePublish := func() {
-		if cleanupErr := CleanupFailedPublishAttempt(h.db, orgID, repoID, "", "", pendingFiles); cleanupErr != nil {
-			log.Printf("[UploadFile] WARNING: failed to clean up pending fs_object %s before commit publish: %v", pendingFile.fsID, cleanupErr)
-		}
-	}
-	newCommitID, err := fsHelper.CreateCommit(repoID, userID, newRootFSID, snapshot.HeadCommitID, description)
-	if err != nil {
-		cleanupPendingFilePublish()
-		return "", 0, 0, fmt.Errorf("failed to create commit: %w", err)
-	}
+	commitCreatedAt := time.Now().UTC()
+	newCommitID := buildCommitID(repoID, newRootFSID, description, commitCreatedAt)
 	if err := fsHelper.stagePendingPublishedFiles(orgID, repoID, newCommitID, pendingFiles); err != nil {
 		if cleanupErr := CleanupFailedPublishAttempt(h.db, orgID, repoID, newCommitID, newCommitID, pendingFiles); cleanupErr != nil {
 			return "", 0, 0, errors.Join(
@@ -3103,6 +3101,15 @@ func (h *FileHandler) finalizeStoredUploadMetadataOnce(fsHelper *FSHelper, orgID
 		clearErr := clearPendingPublishedFileRepairs(h.db, orgID, repoID, newCommitID, pendingFiles)
 		return "", 0, 0, errors.Join(
 			fmt.Errorf("failed to queue durable publish repair for commit %s: %w", newCommitID, err),
+			cleanupErr,
+			clearErr,
+		)
+	}
+	if err := fsHelper.insertCommit(repoID, newCommitID, userID, newRootFSID, snapshot.HeadCommitID, description, commitCreatedAt); err != nil {
+		cleanupErr := CleanupFailedPublishAttempt(h.db, orgID, repoID, newCommitID, newCommitID, pendingFiles)
+		clearErr := clearPendingPublishedFileRepairs(h.db, orgID, repoID, newCommitID, pendingFiles)
+		return "", 0, 0, errors.Join(
+			fmt.Errorf("failed to create commit: %w", err),
 			cleanupErr,
 			clearErr,
 		)

@@ -515,21 +515,35 @@ func rebuildPathToRootWithHooks(repoID string, result *PathTraverseResult, newPa
 
 // CreateCommit creates a new commit with the given root fs_id
 func (h *FSHelper) CreateCommit(repoID, userID, rootFSID, parentCommitID, description string) (string, error) {
-	// Generate commit ID as SHA-1 hash
-	commitData := fmt.Sprintf("%s:%s:%s:%d", repoID, rootFSID, description, time.Now().UnixNano())
-	hash := sha1.Sum([]byte(commitData))
-	commitID := hex.EncodeToString(hash[:])
+	createdAt := time.Now().UTC()
+	commitID := buildCommitID(repoID, rootFSID, description, createdAt)
+	if err := h.insertCommit(repoID, commitID, userID, rootFSID, parentCommitID, description, createdAt); err != nil {
+		return "", err
+	}
+	return commitID, nil
+}
 
-	// Insert commit
+func buildCommitID(repoID, rootFSID, description string, createdAt time.Time) string {
+	if createdAt.IsZero() {
+		createdAt = time.Now().UTC()
+	}
+	commitData := fmt.Sprintf("%s:%s:%s:%d", repoID, rootFSID, description, createdAt.UnixNano())
+	hash := sha1.Sum([]byte(commitData))
+	return hex.EncodeToString(hash[:])
+}
+
+func (h *FSHelper) insertCommit(repoID, commitID, userID, rootFSID, parentCommitID, description string, createdAt time.Time) error {
+	if createdAt.IsZero() {
+		createdAt = time.Now().UTC()
+	}
 	err := h.db.Session().Query(`
 		INSERT INTO commits (library_id, commit_id, parent_id, root_fs_id, creator_id, description, created_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?)
-	`, repoID, commitID, parentCommitID, rootFSID, userID, description, time.Now()).Exec()
+	`, repoID, commitID, parentCommitID, rootFSID, userID, description, createdAt).Exec()
 	if err != nil {
-		return "", fmt.Errorf("failed to create commit: %w", err)
+		return fmt.Errorf("failed to create commit: %w", err)
 	}
-
-	return commitID, nil
+	return nil
 }
 
 // CalculateLibraryStats recursively calculates total size and file count for a library
@@ -1348,13 +1362,14 @@ func (h *FSHelper) createPendingPublishedFileRow(repoID string, pending *pending
 	if pending.cleanupOwnerID == "" || pending.cleanupCreatedAt.IsZero() || pending.cleanupOrgID == "" || pending.cleanupAttemptID == "" {
 		return fmt.Errorf("failed to create tracked fs_object: pending file metadata is incomplete")
 	}
-	batch := h.db.Session().Batch(gocql.LoggedBatch)
-	batch.Query(`
-		INSERT INTO fs_objects (library_id, fs_id, obj_type, obj_name, block_ids, size_bytes, mtime)
-		VALUES (?, ?, ?, ?, ?, ?, ?)
-	`, repoID, pending.fsID, "file", pending.name, pending.externalBlockIDs, pending.size, time.Now().Unix())
-	db.AddUpsertPendingPublishedFSObjectOwnerQueries(batch, repoID, pending.fsID, pending.cleanupOwnerID, pending.cleanupCreatedAt, pending.cleanupOrgID, pending.cleanupAttemptID, pending.internalBlockIDs)
-	if err := h.db.Session().ExecuteBatch(batch); err != nil {
+	if err := h.db.UpsertPendingPublishedFSObjectOwner(repoID, pending.fsID, pending.cleanupOwnerID, pending.cleanupCreatedAt, pending.cleanupOrgID, pending.cleanupAttemptID, pending.internalBlockIDs); err != nil {
+		return fmt.Errorf("failed to create tracked fs_object: %w", err)
+	}
+	if err := h.createFileFSObjectRow(repoID, pending.fsID, pending.name, pending.size, pending.externalBlockIDs); err != nil {
+		cleanupErr := cleanupPendingPublishedFileOwnerAttempt(h.db, repoID, pending)
+		if cleanupErr != nil {
+			return errors.Join(fmt.Errorf("failed to create tracked fs_object: %w", err), cleanupErr)
+		}
 		return fmt.Errorf("failed to create tracked fs_object: %w", err)
 	}
 	return nil
