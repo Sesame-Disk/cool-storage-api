@@ -285,7 +285,7 @@ CREATE TABLE IF NOT EXISTS blocks (
 -- INSERT/DELETE are idempotent and need no LWT in steady state — expensive Paxos
 -- is reserved for the GC worker's final claim before deleting from S3.
 --   referrer = "fs:<library_id>:<fs_id>"   permanent: an fs_object containing the block
---   referrer = "up:<upload_token>"         provisional: an in-flight upload. The
+--   referrer = "up:<operation_id>"         provisional: an in-flight upload. The
 --                                          live ref is released explicitly on success;
 --                                          abandoned uploads are recovered via
 --                                          gc_provisional_block_refs* expiry tables.

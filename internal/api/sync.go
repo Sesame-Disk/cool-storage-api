@@ -2737,27 +2737,9 @@ func (h *SyncHandler) releaseSyncUploadReferences(orgID, repoID string, blockIDs
 }
 
 func (h *SyncHandler) removeSyncCommitFileReferences(orgID, repoID string, removedFiles []syncCommitFileReference) error {
-	var zeroRefBlocks []string
-	for _, file := range removedFiles {
-		resolved, err := h.resolveSyncBlockIDs(orgID, file.blockIDs)
-		if err != nil {
-			return fmt.Errorf("resolve removed fs_object %s/%s block IDs: %w", repoID, file.fsID, err)
-		}
-		referrer := db.BlockReferrerForFSObject(repoID, file.fsID)
-		for _, blockID := range resolved {
-			if err := h.db.RemoveBlockReference(orgID, blockID, referrer); err != nil {
-				return fmt.Errorf("remove fs_object block reference (block %s, fs_object %s/%s): %w", blockID, repoID, file.fsID, err)
-			}
-			hasRefs, err := h.db.BlockHasReferences(orgID, blockID)
-			if err != nil {
-				return fmt.Errorf("check remaining block references for %s after removing %s/%s: %w", blockID, repoID, file.fsID, err)
-			}
-			if !hasRefs {
-				zeroRefBlocks = append(zeroRefBlocks, blockID)
-			}
-		}
-	}
-	h.enqueueSyncZeroRefBlocks(orgID, repoID, zeroRefBlocks)
+	// fs:* references track persisted fs_objects, not membership in the current
+	// HEAD. The retention/reachability GC owns removing these rows after the
+	// fs_object itself is no longer retained.
 	return nil
 }
 

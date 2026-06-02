@@ -90,6 +90,14 @@ type GCStore interface {
 	// discovery bucket. Each row is keyed by the specific provisional referrer,
 	// so concurrent uploads of the same block are expired independently.
 	ListProvisionalBlockRefExpiriesByDay(day time.Time, bucket int) ([]ProvisionalBlockRefExpiryInfo, error)
+	// GetProvisionalBlockRefExpiry loads the canonical expiry row. The scanner
+	// must revalidate this before removing any up:* block reference because the
+	// by-day table is only a discovery projection and can be stale.
+	GetProvisionalBlockRefExpiry(orgID uuid.UUID, blockID, referrer string) (ProvisionalBlockRefExpiryInfo, bool, error)
+	// DeleteProvisionalBlockRefExpiryProjection removes only the discovery row.
+	// It intentionally leaves the canonical row untouched for stale projection
+	// cleanup when an upload ref was renewed or already finalized elsewhere.
+	DeleteProvisionalBlockRefExpiryProjection(orgID uuid.UUID, blockID, referrer string, expiresAt time.Time) error
 	DeleteProvisionalBlockRefExpiry(orgID uuid.UUID, blockID, referrer string, expiresAt time.Time) error
 
 	// S3 orphan recovery / pending delete tracking for blocks claimed by GC.

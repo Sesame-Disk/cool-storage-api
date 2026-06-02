@@ -288,6 +288,7 @@ type ChunkUpload struct {
 	Filename    string
 	ParentDir   string
 	TotalSize   int64
+	OperationID string
 	TempFile    *os.File
 	TempPath    string
 	ReceivedEnd int64
@@ -404,6 +405,7 @@ func (cm *ChunkManager) GetOrCreateUpload(token, filename, parentDir string, tot
 		Filename:    filename,
 		ParentDir:   parentDir,
 		TotalSize:   totalSize,
+		OperationID: newSeafHTTPUploadOperationID(token),
 		TempFile:    tempFile,
 		TempPath:    tempPath,
 		ReceivedEnd: -1,
@@ -729,6 +731,15 @@ func (cu *ChunkUpload) AccountedBlockIDs() []string {
 		blockIDs = append(blockIDs, cu.accountedBlockPosition[position])
 	}
 	return blockIDs
+}
+
+func (cu *ChunkUpload) UploadOperationID() string {
+	cu.mu.Lock()
+	defer cu.mu.Unlock()
+	if strings.TrimSpace(cu.OperationID) == "" {
+		cu.OperationID = newSeafHTTPUploadOperationID(cu.Token)
+	}
+	return cu.OperationID
 }
 
 func (cu *ChunkUpload) HasQuotaPrecheck(parentDir string, totalSize int64, replace bool) bool {
@@ -1071,6 +1082,14 @@ var lookupLibraryEncryptedForUploadFn = func(h *SeafHTTPHandler, orgID, repoID s
 		SELECT encrypted FROM libraries WHERE org_id = ? AND library_id = ?
 	`, orgID, repoID).Scan(&encrypted)
 	return encrypted, err
+}
+
+func newSeafHTTPUploadOperationID(token string) string {
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return "seafhttp:" + uuid.NewString()
+	}
+	return "seafhttp:" + token + ":" + uuid.NewString()
 }
 
 func acquireFinalizeUploadBlockMetadataPermit(ctx context.Context) (func(), error) {
@@ -1465,6 +1484,7 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 		return
 	}
 	finalSize := int64(len(chunkData))
+	uploadOperationID := newSeafHTTPUploadOperationID(token.Token)
 
 	storageDeltaBytes, storageDeltaFiles, err := checkUploadStorageQuotaForCurrentHeadFn(h, token.OrgID, token.RepoID, token.UserID, parentDir, filename, finalSize, replaceFile)
 	if err != nil {
@@ -1540,7 +1560,7 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 		}
 		return nil
 	}, func() error {
-		return registerUploadedBlockAndMappingForUploadFn(h.db, token.OrgID, token.RepoID, sha256ID, token.Token, len(storedContent), actualStorageClass, "", fileID)
+		return registerUploadedBlockAndMappingForUploadFn(h.db, token.OrgID, token.RepoID, sha256ID, uploadOperationID, len(storedContent), actualStorageClass, "", fileID)
 	}, func() (bool, error) {
 		return clearSeafHTTPS3OrphanFenceFn(c.Request.Context(), h.db, h.storageManager, "HandleUpload", token.OrgID, sha256ID)
 	}); err != nil {
@@ -1565,12 +1585,12 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 
 	commitID, actualFilename, storageDeltaBytes, storageDeltaFiles, err := h.commitUploadedFile(leaseCtx, token.OrgID, token.RepoID, token.UserID, parentDir, filename, fileID, chunkData, finalSize, replaceFile)
 	if err != nil {
-		h.handleSingleShotMetadataError(token, sha256ID, err)
+		h.handleSingleShotMetadataError(token, uploadOperationID, sha256ID, err)
 		log.Printf("[HandleUpload] Failed to update filesystem: %v", err)
 		writeSeafHTTPUploadError(c, err, "file stored but metadata update failed")
 		return
 	}
-	releaseUploadedBlockRefsFn(h.db, token.OrgID, token.RepoID, token.Token, []string{sha256ID})
+	releaseUploadedBlockRefsFn(h.db, token.OrgID, token.RepoID, uploadOperationID, []string{sha256ID})
 	log.Printf("[HandleUpload] Filesystem updated, commit=%s", commitID)
 
 	log.Printf("[HandleUpload] Upload complete: file=%s, size=%d, id=%s", actualFilename, finalSize, fileID[:16])
@@ -1639,7 +1659,7 @@ func (h *SeafHTTPHandler) handleChunkedFinalizeError(token *AccessToken, tokenSt
 				h.db,
 				token.OrgID,
 				token.RepoID,
-				tokenStr,
+				upload.UploadOperationID(),
 				accountedBlockIDs,
 			)
 		}
@@ -1649,7 +1669,7 @@ func (h *SeafHTTPHandler) handleChunkedFinalizeError(token *AccessToken, tokenSt
 	upload.ResetFinalization()
 }
 
-func (h *SeafHTTPHandler) handleSingleShotMetadataError(token *AccessToken, internalBlockID string, err error) {
+func (h *SeafHTTPHandler) handleSingleShotMetadataError(token *AccessToken, operationID, internalBlockID string, err error) {
 	if err == nil || strings.TrimSpace(internalBlockID) == "" {
 		return
 	}
@@ -1660,7 +1680,7 @@ func (h *SeafHTTPHandler) handleSingleShotMetadataError(token *AccessToken, inte
 		h.db,
 		token.OrgID,
 		token.RepoID,
-		token.Token,
+		operationID,
 		[]string{internalBlockID},
 	)
 }
@@ -1684,15 +1704,9 @@ func writeSeafHTTPUploadError(c *gin.Context, err error, genericMsg string) {
 }
 
 func clearSeafHTTPS3OrphanFence(ctx context.Context, database *db.DB, storageManager *storage.Manager, label, orgID, blockID string) (bool, error) {
-	if database == nil || storageManager == nil {
-		return false, nil
-	}
-
-	gcState, err := database.BlockGCState(orgID, blockID)
-	if err != nil {
-		return false, fmt.Errorf("read block gc_state for %s: %w", blockID, err)
-	}
-	if gcState == db.BlockGCStateDeleting {
+	_ = ctx
+	_ = storageManager
+	if database == nil {
 		return false, nil
 	}
 
@@ -1704,23 +1718,8 @@ func clearSeafHTTPS3OrphanFence(ctx context.Context, database *db.DB, storageMan
 		return false, nil
 	}
 
-	storageClass := strings.TrimSpace(orphanInfo.StorageClass)
-	if storageClass == "" {
-		storageClass = "hot"
-	}
-	blockStore, err := storageManager.GetBlockStore(storageClass)
-	if err != nil {
-		return false, fmt.Errorf("get block store for stale orphan fence %s: %w", storageClass, err)
-	}
-	if err := blockStore.DeleteBlock(ctx, blockID); err != nil {
-		return false, fmt.Errorf("delete stale orphaned block %s before re-upload: %w", blockID, err)
-	}
-	if err := database.DeleteBlockS3Orphan(orgID, blockID, orphanInfo.FirstSeenAt); err != nil {
-		return false, fmt.Errorf("clear S3 orphan row for block %s: %w", blockID, err)
-	}
-
-	log.Printf("[%s] Cleared stale S3 orphan fence for block %s before re-upload", label, blockID)
-	return true, nil
+	log.Printf("[%s] S3 orphan fence for block %s remains active since %s; writer will back off and leave S3 cleanup to GC recovery", label, blockID, orphanInfo.FirstSeenAt.UTC().Format(time.RFC3339))
+	return false, nil
 }
 
 func retrySeafHTTPBlockMaterialization(label, blockID string, store func() error, materialize func() error, resolveFence func() (bool, error)) error {
@@ -1740,7 +1739,7 @@ func retrySeafHTTPBlockMaterialization(label, blockID string, store func() error
 			if resolveFence != nil {
 				resolved, resolveErr := resolveFence()
 				if resolveErr != nil {
-					log.Printf("[%s] failed to clear stale S3 orphan fence for block %s: %v", label, blockID, resolveErr)
+					log.Printf("[%s] failed to inspect S3 orphan fence for block %s: %v", label, blockID, resolveErr)
 				} else if resolved {
 					continue
 				}
@@ -2001,6 +2000,7 @@ readLoop:
 			}
 			defer releaseMetadataPermit()
 
+			uploadOperationID := upload.UploadOperationID()
 			if blkErr := upload.AccountBlockOnce(blockIndexLocal, sha256ID, func() error {
 				return retrySeafHTTPBlockMaterialization("finalizeUploadStreaming", sha256ID, func() error {
 					_, putErr := putUploadedBlockAutoFn(egCtx, blockStore, sha256ID, storedBlock)
@@ -2009,7 +2009,7 @@ readLoop:
 					}
 					return nil
 				}, func() error {
-					return registerUploadedBlockAndMappingForUploadFn(h.db, token.OrgID, token.RepoID, sha256ID, token.Token, len(storedBlock), actualStorageClass, "", blockSHA1IDLocal)
+					return registerUploadedBlockAndMappingForUploadFn(h.db, token.OrgID, token.RepoID, sha256ID, uploadOperationID, len(storedBlock), actualStorageClass, "", blockSHA1IDLocal)
 				}, func() (bool, error) {
 					return clearSeafHTTPS3OrphanFenceFn(egCtx, h.db, h.storageManager, "finalizeUploadStreaming", token.OrgID, sha256ID)
 				})
@@ -2051,7 +2051,7 @@ readLoop:
 	if err != nil {
 		return "", "", 0, 0, fmt.Errorf("failed to update filesystem metadata: %w", err)
 	}
-	releaseUploadedBlockRefsFn(h.db, token.OrgID, token.RepoID, token.Token, upload.AccountedBlockIDs())
+	releaseUploadedBlockRefsFn(h.db, token.OrgID, token.RepoID, upload.UploadOperationID(), upload.AccountedBlockIDs())
 	log.Printf("[finalizeUploadStreaming] Filesystem updated, commit=%s", commitID)
 
 	return fileID, actualFilename, storageDeltaBytes, storageDeltaFiles, nil

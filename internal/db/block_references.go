@@ -59,10 +59,10 @@ func BlockReferrerForPublishAttempt(attemptID string) string {
 }
 
 // BlockReferrerForUpload builds the provisional referrer for an in-flight upload:
-// "up:<upload_token>". Written with a TTL; superseded by the permanent fs_object
+// "up:<operation_id>". Written with a TTL; superseded by the permanent fs_object
 // reference once the upload is committed.
-func BlockReferrerForUpload(uploadToken string) string {
-	return blockReferrerUploadPrefix + uploadToken
+func BlockReferrerForUpload(operationID string) string {
+	return blockReferrerUploadPrefix + operationID
 }
 
 var publishAttemptPromotionRetryAttempts = 8

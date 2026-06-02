@@ -1140,6 +1140,36 @@ func (s *CassandraStore) ListProvisionalBlockRefExpiriesByDay(day time.Time, buc
 	return out, nil
 }
 
+func (s *CassandraStore) GetProvisionalBlockRefExpiry(orgID uuid.UUID, blockID, referrer string) (ProvisionalBlockRefExpiryInfo, bool, error) {
+	var storageClass string
+	var expiresAt time.Time
+	if err := s.db.Session().Query(`
+		SELECT storage_class, expires_at
+		FROM gc_provisional_block_refs
+		WHERE org_id = ? AND block_id = ? AND referrer = ?
+	`, orgID.String(), blockID, referrer).Scan(&storageClass, &expiresAt); err != nil {
+		if errors.Is(err, gocql.ErrNotFound) {
+			return ProvisionalBlockRefExpiryInfo{}, false, nil
+		}
+		return ProvisionalBlockRefExpiryInfo{}, false, fmt.Errorf("failed to load provisional block ref expiry org=%s block=%s referrer=%s: %w", orgID, blockID, referrer, err)
+	}
+	return ProvisionalBlockRefExpiryInfo{
+		OrgID:        orgID,
+		BlockID:      blockID,
+		Referrer:     referrer,
+		StorageClass: storageClass,
+		ExpiresAt:    expiresAt.UTC(),
+	}, true, nil
+}
+
+func (s *CassandraStore) DeleteProvisionalBlockRefExpiryProjection(orgID uuid.UUID, blockID, referrer string, expiresAt time.Time) error {
+	expiresAt = expiresAt.UTC()
+	return s.db.Session().Query(`
+		DELETE FROM gc_provisional_block_refs_by_day
+		WHERE expiry_day = ? AND bucket = ? AND expires_at = ? AND org_id = ? AND block_id = ? AND referrer = ?
+	`, db.GCProjectionUTCDate(expiresAt), db.GCDiscoveryBucket(orgID.String(), blockID, referrer), expiresAt, orgID.String(), blockID, referrer).Exec()
+}
+
 func (s *CassandraStore) DeleteProvisionalBlockRefExpiry(orgID uuid.UUID, blockID, referrer string, expiresAt time.Time) error {
 	return s.db.DeleteProvisionalBlockReferenceExpiry(orgID.String(), blockID, referrer, expiresAt)
 }

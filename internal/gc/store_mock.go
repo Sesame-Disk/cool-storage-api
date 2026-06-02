@@ -551,6 +551,19 @@ func (m *MockStore) AddProvisionalBlockRefExpiry(orgID uuid.UUID, blockID, refer
 	m.upsertProvisionalBlockRefExpiryProjection(expiry)
 }
 
+func (m *MockStore) AddProvisionalBlockRefExpiryProjectionForTest(orgID uuid.UUID, blockID, referrer, storageClass string, expiresAt time.Time) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	expiresAt = expiresAt.UTC()
+	m.provisionalBlockRefExpiryProjections[newMockProvisionalBlockRefExpiryProjectionKey(orgID, blockID, referrer, expiresAt)] = ProvisionalBlockRefExpiryInfo{
+		OrgID:        orgID,
+		BlockID:      blockID,
+		Referrer:     referrer,
+		StorageClass: storageClass,
+		ExpiresAt:    expiresAt,
+	}
+}
+
 func (m *MockStore) DeleteBlockGCCandidateProjectionForTest(orgID uuid.UUID, blockID string, candidateAt time.Time) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -1693,6 +1706,30 @@ func (m *MockStore) ListProvisionalBlockRefExpiriesByDay(day time.Time, bucket i
 		return expiries[i].Referrer < expiries[j].Referrer
 	})
 	return expiries, nil
+}
+
+func (m *MockStore) GetProvisionalBlockRefExpiry(orgID uuid.UUID, blockID, referrer string) (ProvisionalBlockRefExpiryInfo, bool, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	key := fmt.Sprintf("%s:%s:%s", orgID, blockID, referrer)
+	expiry, ok := m.provisionalBlockRefExpiries[key]
+	if !ok {
+		return ProvisionalBlockRefExpiryInfo{}, false, nil
+	}
+	return ProvisionalBlockRefExpiryInfo{
+		OrgID:        expiry.OrgID,
+		BlockID:      expiry.BlockID,
+		Referrer:     expiry.Referrer,
+		StorageClass: expiry.StorageClass,
+		ExpiresAt:    expiry.ExpiresAt.UTC(),
+	}, true, nil
+}
+
+func (m *MockStore) DeleteProvisionalBlockRefExpiryProjection(orgID uuid.UUID, blockID, referrer string, expiresAt time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.provisionalBlockRefExpiryProjections, newMockProvisionalBlockRefExpiryProjectionKey(orgID, blockID, referrer, expiresAt))
+	return nil
 }
 
 func (m *MockStore) DeleteProvisionalBlockRefExpiry(orgID uuid.UUID, blockID, referrer string, expiresAt time.Time) error {

@@ -825,7 +825,8 @@ func TestHandleChunkedFinalizeError_RollsBackConflictAndCleansUp(t *testing.T) {
 	h := &SeafHTTPHandler{}
 	token := &AccessToken{OrgID: "org-1", RepoID: "repo-1", Token: "upload-token"}
 	upload := &ChunkUpload{
-		Finalizing: true,
+		Finalizing:  true,
+		OperationID: "chunk-op-conflict",
 		accountedBlockPosition: map[int]string{
 			2: "block-a",
 			0: "block-a",
@@ -841,8 +842,8 @@ func TestHandleChunkedFinalizeError_RollsBackConflictAndCleansUp(t *testing.T) {
 	if gotOrgID != "org-1" || gotRepoID != "repo-1" {
 		t.Fatalf("rollback org/repo = %s/%s, want org-1/repo-1", gotOrgID, gotRepoID)
 	}
-	if gotOperationID != "upload-token" {
-		t.Fatalf("rollback operation ID = %s, want upload-token", gotOperationID)
+	if gotOperationID != "chunk-op-conflict" {
+		t.Fatalf("rollback operation ID = %s, want chunk-op-conflict", gotOperationID)
 	}
 	if !reflect.DeepEqual(gotBlockIDs, []string{"block-a", "block-b", "block-a"}) {
 		t.Fatalf("rollback block IDs = %#v, want %#v", gotBlockIDs, []string{"block-a", "block-b", "block-a"})
@@ -882,7 +883,8 @@ func TestHandleChunkedFinalizeError_RollsBackQuotaExceededAndCleansUp(t *testing
 	h := &SeafHTTPHandler{}
 	token := &AccessToken{OrgID: "org-2", RepoID: "repo-2"}
 	upload := &ChunkUpload{
-		Finalizing: true,
+		Finalizing:  true,
+		OperationID: "chunk-op-quota",
 		accountedBlockPosition: map[int]string{
 			0: "block-x",
 			1: "block-y",
@@ -900,8 +902,8 @@ func TestHandleChunkedFinalizeError_RollsBackQuotaExceededAndCleansUp(t *testing
 	if gotOrgID != "org-2" || gotRepoID != "repo-2" {
 		t.Fatalf("rollback org/repo = %s/%s, want org-2/repo-2", gotOrgID, gotRepoID)
 	}
-	if gotOperationID != "upload-token" {
-		t.Fatalf("rollback operation ID = %s, want upload-token", gotOperationID)
+	if gotOperationID != "chunk-op-quota" {
+		t.Fatalf("rollback operation ID = %s, want chunk-op-quota", gotOperationID)
 	}
 	if !reflect.DeepEqual(gotBlockIDs, []string{"block-x", "block-y"}) {
 		t.Fatalf("rollback block IDs = %#v, want %#v", gotBlockIDs, []string{"block-x", "block-y"})
@@ -965,7 +967,7 @@ func TestHandleChunkedFinalizeError_CleansUpUnknownBlockMutationOutcome(t *testi
 
 	h := &SeafHTTPHandler{}
 	token := &AccessToken{OrgID: "org-1", RepoID: "repo-1"}
-	upload := &ChunkUpload{Finalizing: true, accountedBlockPosition: map[int]string{0: "block-a", 1: "block-b"}}
+	upload := &ChunkUpload{Finalizing: true, OperationID: "chunk-op-unknown", accountedBlockPosition: map[int]string{0: "block-a", 1: "block-b"}}
 
 	h.handleChunkedFinalizeError(token, "upload-token", "file.bin", upload, fmt.Errorf("block mutation ambiguous: %w", v2.ErrBlockMutationOutcomeUnknown))
 
@@ -975,8 +977,8 @@ func TestHandleChunkedFinalizeError_CleansUpUnknownBlockMutationOutcome(t *testi
 	if !reflect.DeepEqual(gotBlockIDs, []string{"block-a", "block-b"}) {
 		t.Fatalf("rollback block IDs = %#v, want %#v", gotBlockIDs, []string{"block-a", "block-b"})
 	}
-	if gotOperationID != "upload-token" {
-		t.Fatalf("rollback operation ID = %s, want upload-token", gotOperationID)
+	if gotOperationID != "chunk-op-unknown" {
+		t.Fatalf("rollback operation ID = %s, want chunk-op-unknown", gotOperationID)
 	}
 	if !cleanupCalled {
 		t.Fatal("unknown block mutation outcome should clean up the tracker")
@@ -1007,7 +1009,7 @@ func TestHandleSingleShotMetadataError_RollsBackOnError(t *testing.T) {
 	h := &SeafHTTPHandler{}
 	token := &AccessToken{OrgID: "org-1", RepoID: "repo-1", Token: "upload-token"}
 
-	h.handleSingleShotMetadataError(token, "block-internal", errors.New("boom"))
+	h.handleSingleShotMetadataError(token, "single-op", "block-internal", errors.New("boom"))
 
 	if !rollbackCalled {
 		t.Fatal("expected single-shot metadata error to roll back the promoted block")
@@ -1015,8 +1017,8 @@ func TestHandleSingleShotMetadataError_RollsBackOnError(t *testing.T) {
 	if gotOrgID != "org-1" || gotRepoID != "repo-1" {
 		t.Fatalf("rollback org/repo = %s/%s, want org-1/repo-1", gotOrgID, gotRepoID)
 	}
-	if gotOperationID != "upload-token" {
-		t.Fatalf("rollback operation ID = %s, want upload-token", gotOperationID)
+	if gotOperationID != "single-op" {
+		t.Fatalf("rollback operation ID = %s, want single-op", gotOperationID)
 	}
 	if !reflect.DeepEqual(gotBlockIDs, []string{"block-internal"}) {
 		t.Fatalf("rollback block IDs = %#v, want %#v", gotBlockIDs, []string{"block-internal"})
@@ -1037,12 +1039,12 @@ func TestHandleSingleShotMetadataError_SkipsSuccessAndEmptyBlockID(t *testing.T)
 	h := &SeafHTTPHandler{}
 	token := &AccessToken{OrgID: "org-1", RepoID: "repo-1", Token: "upload-token"}
 
-	h.handleSingleShotMetadataError(token, "block-internal", nil)
+	h.handleSingleShotMetadataError(token, "single-op", "block-internal", nil)
 	if rollbackCalled {
 		t.Fatal("successful finalize should not roll back the promoted block")
 	}
 
-	h.handleSingleShotMetadataError(token, "   ", errors.New("boom"))
+	h.handleSingleShotMetadataError(token, "single-op", "   ", errors.New("boom"))
 	if rollbackCalled {
 		t.Fatal("missing internal block ID should not roll back anything")
 	}
@@ -1062,7 +1064,7 @@ func TestHandleSingleShotMetadataError_SkipsUnknownPublicationOutcome(t *testing
 	h := &SeafHTTPHandler{}
 	token := &AccessToken{OrgID: "org-1", RepoID: "repo-1", Token: "upload-token"}
 
-	h.handleSingleShotMetadataError(token, "block-internal", v2.ErrLibraryHeadPublicationUnknown)
+	h.handleSingleShotMetadataError(token, "single-op", "block-internal", v2.ErrLibraryHeadPublicationUnknown)
 	if rollbackCalled {
 		t.Fatal("unknown publication outcome should not roll back the promoted block")
 	}

@@ -541,9 +541,10 @@ in `block_references`: **a block is alive iff at least one reference row exists*
 A reference row is `((org_id, block_id), referrer)` where:
 - `referrer = fs:<library_id>:<fs_id>` — a **permanent** reference: this fs_object
   contains the block. A row exists iff the fs_object exists in `fs_objects`.
-- `referrer = up:<library_id>:<block_id>` — a **provisional** reference written with
-  a TTL while an upload is in flight (before its fs_object is committed). An
-  abandoned upload's row expires on its own — no permanent leak.
+- `referrer = up:<operation_id>` — a **provisional** reference written with
+  a TTL while one upload attempt/session is in flight (before its fs_object is
+  committed). Abandoned rows are recovered through the canonical
+  `gc_provisional_block_refs` expiry table plus its by-day discovery projection.
 
 **Operations** (steady state needs NO LWT — `INSERT`/`DELETE` are idempotent):
 - **File upload**: `RegisterUploadedBlock` — `UpsertBlockMetadata` (INSERT IF NOT EXISTS) + `AddBlockReference(up:…, TTL)`. Backs off if the row is mid-GC (`gc_state='deleting'`).
@@ -553,7 +554,7 @@ A reference row is `((org_id, block_id), referrer)` where:
 
 **Lifecycle**:
 ```
-Upload:        block_references += up:<lib>:<block>  (TTL)  + blocks row (metadata)
+Upload:        block_references += up:<operation>    (TTL)  + blocks row (metadata)
 Commit:        block_references += fs:<lib>:<fs_id>          (permanent)
 fs_object GC:  block_references -= fs:<lib>:<fs_id>  → if none left, enqueue block
 Block GC:      pre-check none → claim gc_state='deleting' (LWT) → re-verify none → DELETE + S3

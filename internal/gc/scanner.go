@@ -217,36 +217,84 @@ func (s *Scanner) scanExpiredProvisionalBlockRefs(ctx context.Context) (int, err
 				if expiry.ExpiresAt.After(now) {
 					continue
 				}
-				if err := s.store.RemoveBlockReference(expiry.OrgID, expiry.BlockID, expiry.Referrer); err != nil {
-					log.Printf("[GC Scanner] Phase 0: failed to remove expired provisional ref org=%s block=%s referrer=%s: %v", expiry.OrgID, expiry.BlockID, expiry.Referrer, err)
+
+				canonical, found, err := s.store.GetProvisionalBlockRefExpiry(expiry.OrgID, expiry.BlockID, expiry.Referrer)
+				if err != nil {
+					log.Printf("[GC Scanner] Phase 0: failed to load canonical provisional expiry org=%s block=%s referrer=%s: %v", expiry.OrgID, expiry.BlockID, expiry.Referrer, err)
 					if phaseErr == nil {
-						phaseErr = fmt.Errorf("remove expired provisional ref org=%s block=%s referrer=%s: %w", expiry.OrgID, expiry.BlockID, expiry.Referrer, err)
+						phaseErr = fmt.Errorf("load canonical provisional expiry org=%s block=%s referrer=%s: %w", expiry.OrgID, expiry.BlockID, expiry.Referrer, err)
 					}
 					continue
 				}
-				hasRefs, err := s.store.BlockHasReferences(expiry.OrgID, expiry.BlockID)
-				if err != nil {
-					log.Printf("[GC Scanner] Phase 0: failed to check block refs after provisional expiry org=%s block=%s referrer=%s: %v", expiry.OrgID, expiry.BlockID, expiry.Referrer, err)
+
+				if !found {
+					if err := s.store.DeleteProvisionalBlockRefExpiryProjection(expiry.OrgID, expiry.BlockID, expiry.Referrer, expiry.ExpiresAt); err != nil {
+						log.Printf("[GC Scanner] Phase 0: failed to delete orphaned provisional expiry projection org=%s block=%s referrer=%s: %v", expiry.OrgID, expiry.BlockID, expiry.Referrer, err)
+						if phaseErr == nil {
+							phaseErr = fmt.Errorf("delete orphaned provisional expiry projection org=%s block=%s referrer=%s: %w", expiry.OrgID, expiry.BlockID, expiry.Referrer, err)
+						}
+						continue
+					}
+					cleaned++
+					continue
+				}
+
+				canonical.ExpiresAt = canonical.ExpiresAt.UTC()
+				if canonical.ExpiresAt.After(now) {
+					if err := s.store.DeleteProvisionalBlockRefExpiryProjection(expiry.OrgID, expiry.BlockID, expiry.Referrer, expiry.ExpiresAt); err != nil {
+						log.Printf("[GC Scanner] Phase 0: failed to delete stale provisional expiry projection org=%s block=%s referrer=%s: %v", expiry.OrgID, expiry.BlockID, expiry.Referrer, err)
+						if phaseErr == nil {
+							phaseErr = fmt.Errorf("delete stale provisional expiry projection org=%s block=%s referrer=%s: %w", expiry.OrgID, expiry.BlockID, expiry.Referrer, err)
+						}
+						continue
+					}
+					cleaned++
+					continue
+				}
+
+				storageClass := canonical.StorageClass
+				if storageClass == "" {
+					storageClass = expiry.StorageClass
+				}
+				if err := s.store.RemoveBlockReference(canonical.OrgID, canonical.BlockID, canonical.Referrer); err != nil {
+					log.Printf("[GC Scanner] Phase 0: failed to remove expired provisional ref org=%s block=%s referrer=%s: %v", canonical.OrgID, canonical.BlockID, canonical.Referrer, err)
 					if phaseErr == nil {
-						phaseErr = fmt.Errorf("check refs after provisional expiry org=%s block=%s referrer=%s: %w", expiry.OrgID, expiry.BlockID, expiry.Referrer, err)
+						phaseErr = fmt.Errorf("remove expired provisional ref org=%s block=%s referrer=%s: %w", canonical.OrgID, canonical.BlockID, canonical.Referrer, err)
+					}
+					continue
+				}
+				hasRefs, err := s.store.BlockHasReferences(canonical.OrgID, canonical.BlockID)
+				if err != nil {
+					log.Printf("[GC Scanner] Phase 0: failed to check block refs after provisional expiry org=%s block=%s referrer=%s: %v", canonical.OrgID, canonical.BlockID, canonical.Referrer, err)
+					if phaseErr == nil {
+						phaseErr = fmt.Errorf("check refs after provisional expiry org=%s block=%s referrer=%s: %w", canonical.OrgID, canonical.BlockID, canonical.Referrer, err)
 					}
 					continue
 				}
 				if !hasRefs {
-					if _, err := s.store.EnsureBlockGCCandidate(expiry.OrgID, expiry.BlockID, expiry.StorageClass, now); err != nil {
-						log.Printf("[GC Scanner] Phase 0: failed to promote expired provisional ref org=%s block=%s into gc candidate: %v", expiry.OrgID, expiry.BlockID, err)
+					if _, err := s.store.EnsureBlockGCCandidate(canonical.OrgID, canonical.BlockID, storageClass, now); err != nil {
+						log.Printf("[GC Scanner] Phase 0: failed to promote expired provisional ref org=%s block=%s into gc candidate: %v", canonical.OrgID, canonical.BlockID, err)
 						if phaseErr == nil {
-							phaseErr = fmt.Errorf("promote expired provisional ref org=%s block=%s into gc candidate: %w", expiry.OrgID, expiry.BlockID, err)
+							phaseErr = fmt.Errorf("promote expired provisional ref org=%s block=%s into gc candidate: %w", canonical.OrgID, canonical.BlockID, err)
 						}
 						continue
 					}
 				}
-				if err := s.store.DeleteProvisionalBlockRefExpiry(expiry.OrgID, expiry.BlockID, expiry.Referrer, expiry.ExpiresAt); err != nil {
-					log.Printf("[GC Scanner] Phase 0: failed to delete provisional expiry tracker org=%s block=%s referrer=%s: %v", expiry.OrgID, expiry.BlockID, expiry.Referrer, err)
+				if err := s.store.DeleteProvisionalBlockRefExpiry(canonical.OrgID, canonical.BlockID, canonical.Referrer, canonical.ExpiresAt); err != nil {
+					log.Printf("[GC Scanner] Phase 0: failed to delete provisional expiry tracker org=%s block=%s referrer=%s: %v", canonical.OrgID, canonical.BlockID, canonical.Referrer, err)
 					if phaseErr == nil {
-						phaseErr = fmt.Errorf("delete provisional expiry tracker org=%s block=%s referrer=%s: %w", expiry.OrgID, expiry.BlockID, expiry.Referrer, err)
+						phaseErr = fmt.Errorf("delete provisional expiry tracker org=%s block=%s referrer=%s: %w", canonical.OrgID, canonical.BlockID, canonical.Referrer, err)
 					}
 					continue
+				}
+				if !canonical.ExpiresAt.Equal(expiry.ExpiresAt.UTC()) {
+					if err := s.store.DeleteProvisionalBlockRefExpiryProjection(expiry.OrgID, expiry.BlockID, expiry.Referrer, expiry.ExpiresAt); err != nil {
+						log.Printf("[GC Scanner] Phase 0: failed to delete stale provisional expiry projection after canonical expiry org=%s block=%s referrer=%s: %v", expiry.OrgID, expiry.BlockID, expiry.Referrer, err)
+						if phaseErr == nil {
+							phaseErr = fmt.Errorf("delete stale provisional expiry projection after canonical expiry org=%s block=%s referrer=%s: %w", expiry.OrgID, expiry.BlockID, expiry.Referrer, err)
+						}
+						continue
+					}
 				}
 				cleaned++
 			}

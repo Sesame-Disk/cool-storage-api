@@ -210,6 +210,56 @@ Closed in the current branch: the dead `gc_processed_items` bootstrap table is g
 
 ---
 
+## 24. Sync fs_object Reference Retention (DEFERRED)
+
+### Current State
+`fs:*` block references mean "this persisted fs_object contains the block", not
+"this block is present in the current HEAD". Sync finalization therefore preserves
+`fs:<library_id>:<fs_id>` rows when a file leaves HEAD; the permanent reference is
+removed only when the retained fs_object itself is swept by reachability/retention
+GC.
+
+### Why It Was Deferred
+This is the safe merge behavior for the row-per-reference branch because old
+commits, history downloads, and retention windows can still reference fs_objects
+that are no longer in HEAD. Removing `fs:*` from the sync writer path can make a
+block look dead while retained metadata still points at it.
+
+### Follow-Up Plan
+1. Formalize the fs_object retention horizon and gc_grace contract.
+2. Make the fs_object GC the only permanent-reference remover.
+3. Add Cassandra-backed coverage for sync delete/replace followed by history
+   download across the retention window.
+4. Add metrics for retained-unreachable fs_objects and delayed block reclamation.
+
+---
+
+## 25. SeafHTTP Finalize Operational Hardening (DEFERRED)
+
+### Current State
+Correctness blockers for merge have been handled in the writer path:
+- SeafHTTP upload refs use a per-attempt/session operation ID instead of a reusable
+  access token.
+- S3 orphan fences are no longer cleared by writers; recovery/GC owns S3 deletes.
+- Large pending-published owner rows keep `block_ids` out of the logged owner +
+  discovery batch, avoiding Cassandra "Batch too large" failures during large
+  finalization.
+
+### Remaining Debt
+- `finalizeUploadStreaming()` still uses local concurrency permits in addition to
+  the distributed finalize lease; tune this under production load.
+- Pending-owner and publish-repair sweepers need explicit per-run limits and
+  metrics for skipped, repaired, released, and failed rows.
+- The upload-finalize `gc_leases` role should include `orgID` for extra isolation.
+- Lease acquisition can poll LWT every 25ms under contention; add backoff/jitter or
+  a lower-pressure queueing path if hot libraries contend frequently.
+- If a crash happens after the owner+discovery batch but before the separate
+  `block_ids` update, `pub:<attempt>` refs can survive until TTL. This is a known
+  leak window, not data loss; close it later with chunked block-id metadata or a
+  repair source that can reconstruct staged IDs.
+
+---
+
 ## 5. Web Upload Pipeline Follow-Ups (PENDING)
 
 ### Current State
@@ -281,8 +331,15 @@ Future fix options:
 
 **4. Finish the remaining `ReadAll` limits audit**
 
-The two single-shot multipart upload paths now fail closed at 1 GiB before
-calling `io.ReadAll`: `SeafHTTPHandler.HandleUpload` and `FileHandler.UploadFile`.
+`httputil.ReadAllWithLimit` fails closed at 1 GiB (`1 << 30`) before calling
+`io.ReadAll` when the declared size is too large, and also rejects bodies that
+stream past the limit.
+
+Current production callers:
+- `SeafHTTPHandler.HandleUpload` in [internal/api/seafhttp.go](internal/api/seafhttp.go)
+- `FileHandler.UploadFile` in [internal/api/v2/files.go](internal/api/v2/files.go)
+
+Test-only callers live in [internal/httputil/read_limit_test.go](internal/httputil/read_limit_test.go).
 Chunked web uploads already avoid whole-file reads on the request path.
 
 Still pending outside this branch's upload-finalization scope:
