@@ -1580,4 +1580,43 @@ NOT addressed in this branch.
 
 ---
 
-*Last updated: 2026-05-26*
+## Pending-published fs_object cleanup (row-per-owner model)
+
+The publish flow tracks each in-flight fs_object with a row-per-owner in
+`pending_published_fs_objects` (+ the `_by_day` discovery projection). Two known
+gaps remain after closing the shared-delete data-loss race:
+
+**Medium — orphaned fs_object metadata leaks in live libraries.**
+`releasePendingPublishedFileOwner` now only deletes the owner row and returns; it
+deliberately does NOT delete the `fs_objects` row, because `fs_id` is
+content-addressed and a concurrent publish attempt may have just begun reusing
+the same row (deleting it there caused real corruption). The failed-attempt sweep
+path (`cleanupPendingPublishedFileOwnerAttempt` →
+`cleanupPendingPublishedFileAttemptArtifacts` → `CleanupFailedPublishArtifacts`)
+removes the commit and the `pub:<attempt>` refs but likewise leaves the
+`fs_objects` row. The GC scanner only collects fs_objects for libraries that no
+longer exist (`Scanner.scanOrphanedFSObjects` skips any library where
+`LibraryExists` is true), so a failed publish inside an ACTIVE library leaks an
+fs_object metadata row.
+
+Impact: the data-loss risk is resolved; what remains is a bounded metadata leak —
+the row is content-addressed (re-adopted by a later identical publish) and the
+backing blocks are still reclaimed once their `pub:` refs hit the 35d TTL.
+Pending fix option: a GC pass that sweeps fs_objects unreachable from any commit
+in a live library after a grace period, re-verifying reachability AND
+owner-absence at delete time to stay race-safe.
+
+**Low — `pub:<attempt>` refs can leak until TTL on a crash between the owner
+batch and the block_ids write.** `UpsertPendingPublishedFSObjectOwner` writes the
+owner primary row + `_by_day` projection in one `LoggedBatch` (block_ids kept OUT
+to avoid `batch too large` on multi-GB uploads), then writes `block_ids` in a
+separate `UPDATE`. If the process dies between the two, the owner is already
+discoverable by the sweep but carries no `block_ids`; the sweep's artifact
+cleanup (`CleanupFailedPublishArtifacts`) only removes `pub:` refs when it has
+block IDs, so those refs leak until their 35d TTL expires. This is an operational
+leak only — not a visibility or correctness problem — and self-heals via TTL. The
+same future GC pass over abandoned owners could reconcile these earlier.
+
+---
+
+*Last updated: 2026-06-01*

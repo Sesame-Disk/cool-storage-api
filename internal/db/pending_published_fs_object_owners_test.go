@@ -10,9 +10,8 @@ import (
 func TestAddUpsertPendingPublishedFSObjectOwnerQueries_KeepsBlockIDsOutOfLoggedBatch(t *testing.T) {
 	batch := &gocql.Batch{}
 	createdAt := time.Date(2026, time.June, 1, 12, 0, 0, 0, time.UTC)
-	blockIDs := []string{"block-a", "block-b"}
 
-	AddUpsertPendingPublishedFSObjectOwnerQueries(batch, "repo-1", "fs-1", "owner-1", createdAt, "org-1", "attempt-1", blockIDs)
+	AddUpsertPendingPublishedFSObjectOwnerQueries(batch, "repo-1", "fs-1", "owner-1", createdAt, "org-1", "attempt-1")
 
 	if len(batch.Entries) != 2 {
 		t.Fatalf("len(batch.Entries) = %d, want 2", len(batch.Entries))

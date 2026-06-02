@@ -20,7 +20,7 @@ type PendingPublishedFSObjectOwner struct {
 
 const PendingPublishedFSObjectOwnerTTLSeconds = 35 * 24 * 60 * 60 // 35d
 
-func AddUpsertPendingPublishedFSObjectOwnerQueries(batch *gocql.Batch, repoID, fsID, ownerID string, createdAt time.Time, orgID, attemptID string, blockIDs []string) {
+func AddUpsertPendingPublishedFSObjectOwnerQueries(batch *gocql.Batch, repoID, fsID, ownerID string, createdAt time.Time, orgID, attemptID string) {
 	if batch == nil || repoID == "" || fsID == "" || ownerID == "" || createdAt.IsZero() {
 		return
 	}
@@ -69,7 +69,7 @@ func (db *DB) UpsertPendingPublishedFSObjectOwner(repoID, fsID, ownerID string, 
 	createdAt = createdAt.UTC()
 	blockIDs = NormalizeBlockIDs(blockIDs)
 	batch := db.Session().Batch(gocql.LoggedBatch)
-	AddUpsertPendingPublishedFSObjectOwnerQueries(batch, repoID, fsID, ownerID, createdAt, orgID, attemptID, blockIDs)
+	AddUpsertPendingPublishedFSObjectOwnerQueries(batch, repoID, fsID, ownerID, createdAt, orgID, attemptID)
 	if err := batch.Exec(); err != nil {
 		return fmt.Errorf("upsert pending published fs_object owner repo=%s fs=%s owner=%s: %w", repoID, fsID, ownerID, err)
 	}

@@ -466,29 +466,14 @@ func failedPublishFSObjectReachableFromRoot(database *db.DB, repoID, targetFSID,
 	return false, nil
 }
 
-func publishedBlockReferenceRepairShouldDeferCleanup(database *db.DB, repair publishedBlockReferenceRepair) (bool, error) {
+// publishedBlockReferenceRepairShouldDeferCleanup defers cleanup while the repair
+// is still inside its lease window, so a commit that has not yet become durable
+// (slow insert, clock skew across instances) is not torn down prematurely. Once
+// the lease expires, an unreachable commit is treated as an abandoned attempt and
+// cleaned up. Reachability itself is decided by the caller via commitReachable.
+func publishedBlockReferenceRepairShouldDeferCleanup(repair publishedBlockReferenceRepair) bool {
 	leaseDeadline := publishedBlockReferenceRepairLeaseDeadline(repair)
-	if !leaseDeadline.IsZero() && publishedBlockReferenceRepairNowFn().Before(leaseDeadline) {
-		return true, nil
-	}
-	headCommitID, err := publishedBlockReferenceRepairHeadCommitFn(database, repair.RepoID)
-	if err != nil {
-		if errors.Is(err, gocql.ErrNotFound) {
-			return false, nil
-		}
-		return false, fmt.Errorf("lookup current head for queued publish repair repo %s: %w", repair.RepoID, err)
-	}
-	parentCommitID, err := publishedBlockReferenceRepairCommitParentFn(database, repair.RepoID, repair.CommitID)
-	if err != nil {
-		if errors.Is(err, gocql.ErrNotFound) {
-			return false, nil
-		}
-		return false, fmt.Errorf("lookup parent for queued publish repair commit %s: %w", repair.CommitID, err)
-	}
-	if parentCommitID != headCommitID {
-		return false, nil
-	}
-	return false, nil
+	return !leaseDeadline.IsZero() && publishedBlockReferenceRepairNowFn().Before(leaseDeadline)
 }
 
 func publishedBlockReferenceRepairLeaseDeadline(repair publishedBlockReferenceRepair) time.Time {
@@ -655,11 +640,7 @@ func repairPublishedBlockReferenceRepair(database *db.DB, repair publishedBlockR
 			return fmt.Errorf("promote published fs_object %s for commit %s: %w", repair.FSID, repair.CommitID, err)
 		}
 	} else {
-		deferCleanup, err := publishedBlockReferenceRepairShouldDeferCleanup(database, repair)
-		if err != nil {
-			return err
-		}
-		if deferCleanup {
+		if publishedBlockReferenceRepairShouldDeferCleanup(repair) {
 			return nil
 		}
 		if err := publishedBlockReferenceRepairCleanupFn(database, repair.OrgID, repair.RepoID, repair.CommitID, repair.FSID, repair.StagedBlockIDs); err != nil {
