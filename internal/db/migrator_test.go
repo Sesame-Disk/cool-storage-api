@@ -169,7 +169,7 @@ func TestInitialSchemaContainsLookupNameAndStarredIndex(t *testing.T) {
 	assert.Contains(t, content, "PRIMARY KEY ((repo_id, fs_id), owner_id)")
 	assert.Contains(t, content, "attempt_id TEXT")
 	assert.Contains(t, content, "block_ids  LIST<TEXT>")
-	assert.Contains(t, normalizedContent, "PRIMARY KEY ((repo_id, fs_id), owner_id)\n) WITH default_time_to_live = 2592000;")
-	assert.Contains(t, normalizedContent, ") WITH CLUSTERING ORDER BY (created_at ASC, repo_id ASC, fs_id ASC, owner_id ASC)\n    AND default_time_to_live = 2592000;")
+	assert.Contains(t, normalizedContent, "PRIMARY KEY ((repo_id, fs_id), owner_id)\n) WITH default_time_to_live = 3024000;")
+	assert.Contains(t, normalizedContent, ") WITH CLUSTERING ORDER BY (created_at ASC, repo_id ASC, fs_id ASC, owner_id ASC)\n    AND default_time_to_live = 3024000;")
 	assert.NotContains(t, content, "CREATE TABLE IF NOT EXISTS share_links_by_org")
 }
