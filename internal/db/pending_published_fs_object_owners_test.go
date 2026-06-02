@@ -1,14 +1,13 @@
 package db
 
 import (
-	"reflect"
 	"testing"
 	"time"
 
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
 )
 
-func TestAddUpsertPendingPublishedFSObjectOwnerQueries_UsesLeanByDayProjection(t *testing.T) {
+func TestAddUpsertPendingPublishedFSObjectOwnerQueries_KeepsBlockIDsOutOfLoggedBatch(t *testing.T) {
 	batch := &gocql.Batch{}
 	createdAt := time.Date(2026, time.June, 1, 12, 0, 0, 0, time.UTC)
 	blockIDs := []string{"block-a", "block-b"}
@@ -19,13 +18,16 @@ func TestAddUpsertPendingPublishedFSObjectOwnerQueries_UsesLeanByDayProjection(t
 		t.Fatalf("len(batch.Entries) = %d, want 2", len(batch.Entries))
 	}
 	primaryArgs := batch.Entries[0].Args
-	if len(primaryArgs) != 8 {
-		t.Fatalf("len(primaryArgs) = %d, want 8", len(primaryArgs))
+	if len(primaryArgs) != 7 {
+		t.Fatalf("len(primaryArgs) = %d, want 7 for lean owner metadata + ttl", len(primaryArgs))
 	}
-	if !reflect.DeepEqual(primaryArgs[6], blockIDs) {
-		t.Fatalf("primary block_ids = %#v, want %#v", primaryArgs[6], blockIDs)
+	if got := primaryArgs[4]; got != "org-1" {
+		t.Fatalf("primary org_id = %v, want org-1", got)
 	}
-	if got := primaryArgs[7]; got != PendingPublishedFSObjectOwnerTTLSeconds {
+	if got := primaryArgs[5]; got != "attempt-1" {
+		t.Fatalf("primary attempt_id = %v, want attempt-1", got)
+	}
+	if got := primaryArgs[6]; got != PendingPublishedFSObjectOwnerTTLSeconds {
 		t.Fatalf("primary ttl = %v, want %d", got, PendingPublishedFSObjectOwnerTTLSeconds)
 	}
 	byDayArgs := batch.Entries[1].Args

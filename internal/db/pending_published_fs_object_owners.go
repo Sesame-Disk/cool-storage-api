@@ -25,17 +25,18 @@ func AddUpsertPendingPublishedFSObjectOwnerQueries(batch *gocql.Batch, repoID, f
 		return
 	}
 	createdAt = createdAt.UTC()
-	blockIDs = NormalizeBlockIDs(blockIDs)
-	if orgID == "" && attemptID == "" && len(blockIDs) == 0 {
+	// Keep block_ids out of this logged batch. Large uploads can have hundreds
+	// of staged IDs and exceed Cassandra's batch fail threshold.
+	if orgID == "" && attemptID == "" {
 		batch.Query(`
 			INSERT INTO pending_published_fs_objects (repo_id, fs_id, owner_id, created_at)
 			VALUES (?, ?, ?, ?) USING TTL ?
 		`, repoID, fsID, ownerID, createdAt, PendingPublishedFSObjectOwnerTTLSeconds)
 	} else {
 		batch.Query(`
-			INSERT INTO pending_published_fs_objects (repo_id, fs_id, owner_id, created_at, org_id, attempt_id, block_ids)
-			VALUES (?, ?, ?, ?, ?, ?, ?) USING TTL ?
-		`, repoID, fsID, ownerID, createdAt, orgID, attemptID, blockIDs, PendingPublishedFSObjectOwnerTTLSeconds)
+			INSERT INTO pending_published_fs_objects (repo_id, fs_id, owner_id, created_at, org_id, attempt_id)
+			VALUES (?, ?, ?, ?, ?, ?) USING TTL ?
+		`, repoID, fsID, ownerID, createdAt, orgID, attemptID, PendingPublishedFSObjectOwnerTTLSeconds)
 	}
 	batch.Query(`
 		INSERT INTO pending_published_fs_objects_by_day (created_day, bucket, created_at, repo_id, fs_id, owner_id)
@@ -67,36 +68,27 @@ func (db *DB) UpsertPendingPublishedFSObjectOwner(repoID, fsID, ownerID string, 
 	}
 	createdAt = createdAt.UTC()
 	blockIDs = NormalizeBlockIDs(blockIDs)
-	if orgID == "" && attemptID == "" && len(blockIDs) == 0 {
-		if err := db.Session().Query(`
-			INSERT INTO pending_published_fs_objects (repo_id, fs_id, owner_id, created_at)
-			VALUES (?, ?, ?, ?) USING TTL ?
-		`, repoID, fsID, ownerID, createdAt, PendingPublishedFSObjectOwnerTTLSeconds).Exec(); err != nil {
-			return fmt.Errorf("upsert pending published fs_object owner repo=%s fs=%s owner=%s primary row: %w", repoID, fsID, ownerID, err)
-		}
-	} else {
-		if err := db.Session().Query(`
-			INSERT INTO pending_published_fs_objects (repo_id, fs_id, owner_id, created_at, org_id, attempt_id, block_ids)
-			VALUES (?, ?, ?, ?, ?, ?, ?) USING TTL ?
-		`, repoID, fsID, ownerID, createdAt, orgID, attemptID, blockIDs, PendingPublishedFSObjectOwnerTTLSeconds).Exec(); err != nil {
-			return fmt.Errorf("upsert pending published fs_object owner repo=%s fs=%s owner=%s primary row: %w", repoID, fsID, ownerID, err)
-		}
+	batch := db.Session().Batch(gocql.LoggedBatch)
+	AddUpsertPendingPublishedFSObjectOwnerQueries(batch, repoID, fsID, ownerID, createdAt, orgID, attemptID, blockIDs)
+	if err := batch.Exec(); err != nil {
+		return fmt.Errorf("upsert pending published fs_object owner repo=%s fs=%s owner=%s: %w", repoID, fsID, ownerID, err)
+	}
+	if len(blockIDs) == 0 {
+		return nil
 	}
 	if err := db.Session().Query(`
-		INSERT INTO pending_published_fs_objects_by_day (created_day, bucket, created_at, repo_id, fs_id, owner_id)
-		VALUES (?, ?, ?, ?, ?, ?) USING TTL ?
-	`, GCProjectionUTCDate(createdAt), GCDiscoveryBucket(repoID, fsID, ownerID), createdAt, repoID, fsID, ownerID, PendingPublishedFSObjectOwnerTTLSeconds).Exec(); err != nil {
-		rollbackErr := db.Session().Query(`
-			DELETE FROM pending_published_fs_objects
-			WHERE repo_id = ? AND fs_id = ? AND owner_id = ?
-		`, repoID, fsID, ownerID).Exec()
+		UPDATE pending_published_fs_objects USING TTL ?
+		SET block_ids = ?
+		WHERE repo_id = ? AND fs_id = ? AND owner_id = ?
+	`, PendingPublishedFSObjectOwnerTTLSeconds, blockIDs, repoID, fsID, ownerID).Exec(); err != nil {
+		rollbackErr := db.DeletePendingPublishedFSObjectOwner(repoID, fsID, ownerID, createdAt)
 		if rollbackErr != nil {
 			return errors.Join(
-				fmt.Errorf("upsert pending published fs_object owner repo=%s fs=%s owner=%s discovery row: %w", repoID, fsID, ownerID, err),
-				fmt.Errorf("rollback pending published fs_object owner repo=%s fs=%s owner=%s primary row: %w", repoID, fsID, ownerID, rollbackErr),
+				fmt.Errorf("upsert pending published fs_object owner repo=%s fs=%s owner=%s block ids: %w", repoID, fsID, ownerID, err),
+				fmt.Errorf("rollback pending published fs_object owner repo=%s fs=%s owner=%s: %w", repoID, fsID, ownerID, rollbackErr),
 			)
 		}
-		return fmt.Errorf("upsert pending published fs_object owner repo=%s fs=%s owner=%s discovery row: %w", repoID, fsID, ownerID, err)
+		return fmt.Errorf("upsert pending published fs_object owner repo=%s fs=%s owner=%s block ids: %w", repoID, fsID, ownerID, err)
 	}
 	return nil
 }
@@ -119,7 +111,7 @@ func (db *DB) DeletePendingPublishedFSObjectOwner(repoID, fsID, ownerID string, 
 	}
 	batch := db.Session().Batch(gocql.LoggedBatch)
 	AddDeletePendingPublishedFSObjectOwnerQueries(batch, repoID, fsID, ownerID, createdAt)
-	if err := db.Session().ExecuteBatch(batch); err != nil {
+	if err := batch.Exec(); err != nil {
 		return fmt.Errorf("delete pending published fs_object owner repo=%s fs=%s owner=%s: %w", repoID, fsID, ownerID, err)
 	}
 	return nil

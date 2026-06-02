@@ -2139,7 +2139,10 @@ func finalizeSeafHTTPPublishedBlockReferences(fsHelper *v2.FSHelper, database *d
 
 func (h *SeafHTTPHandler) createPendingSeafHTTPFileFSObject(orgID, repoID, attemptID, fsID, filename, fullPath string, fileSize int64, createdAt time.Time, externalBlockIDs, stagedBlockIDs []string) error {
 	if err := h.db.UpsertPendingPublishedFSObjectOwner(repoID, fsID, attemptID, createdAt, orgID, attemptID, stagedBlockIDs); err != nil {
-		_ = db.RemovePublishAttemptReferences(h.db, orgID, attemptID, stagedBlockIDs)
+		cleanupErr := cleanupSeafHTTPFailedPublishAttempt(h.db, orgID, repoID, attemptID, fsID, stagedBlockIDs)
+		if cleanupErr != nil {
+			return errors.Join(fmt.Errorf("failed to create pending fs_object owner: %w", err), cleanupErr)
+		}
 		return fmt.Errorf("failed to create pending fs_object owner: %w", err)
 	}
 	if err := h.db.Session().Query(`

@@ -20,7 +20,7 @@ const (
 	publishedBlockReferenceRepairStaleAfter    = 30 * time.Second
 	publishedBlockReferenceRepairPreCASLease   = 5 * time.Minute
 	pendingPublishedFSObjectOwnerStaleAfter    = 24 * time.Hour
-	pendingPublishedFSObjectOwnerLookbackDays  = 30
+	pendingPublishedFSObjectOwnerLookbackDays  = db.PendingPublishedFSObjectOwnerTTLSeconds / (24 * 60 * 60)
 )
 
 type publishedBlockReferenceRepair struct {
@@ -317,23 +317,8 @@ func releasePendingPublishedFileOwner(database *db.DB, repoID string, pending *p
 	if err := cleanupFailedPublishDeletePendingOwnerFn(database, repoID, fsID, ownerID, pending.cleanupCreatedAt); err != nil {
 		return fmt.Errorf("release pending publish owner for fs_object %s: %w", fsID, err)
 	}
-	ownersRemain, err := cleanupFailedPublishPendingOwnerExistsFn(database, repoID, fsID)
-	if err != nil {
-		return fmt.Errorf("check remaining pending owners for fs_object %s: %w", fsID, err)
-	}
-	if ownersRemain {
-		return nil
-	}
-	reachable, err := cleanupFailedPublishFSObjectReachableFn(database, repoID, fsID)
-	if err != nil {
-		return fmt.Errorf("check fs_object %s reachability: %w", fsID, err)
-	}
-	if reachable {
-		return nil
-	}
-	if err := cleanupFailedPublishDeleteFSObjectFn(database, repoID, fsID); err != nil {
-		return fmt.Errorf("delete unreached pending fs_object %s: %w", fsID, err)
-	}
+	// fs_id is content-addressed and can be shared by concurrent publish attempts.
+	// Removing fs_objects here can delete the metadata row another owner just began using.
 	return nil
 }
 
@@ -482,6 +467,10 @@ func failedPublishFSObjectReachableFromRoot(database *db.DB, repoID, targetFSID,
 }
 
 func publishedBlockReferenceRepairShouldDeferCleanup(database *db.DB, repair publishedBlockReferenceRepair) (bool, error) {
+	leaseDeadline := publishedBlockReferenceRepairLeaseDeadline(repair)
+	if !leaseDeadline.IsZero() && publishedBlockReferenceRepairNowFn().Before(leaseDeadline) {
+		return true, nil
+	}
 	headCommitID, err := publishedBlockReferenceRepairHeadCommitFn(database, repair.RepoID)
 	if err != nil {
 		if errors.Is(err, gocql.ErrNotFound) {
@@ -499,11 +488,7 @@ func publishedBlockReferenceRepairShouldDeferCleanup(database *db.DB, repair pub
 	if parentCommitID != headCommitID {
 		return false, nil
 	}
-	leaseDeadline := publishedBlockReferenceRepairLeaseDeadline(repair)
-	if leaseDeadline.IsZero() {
-		return false, nil
-	}
-	return publishedBlockReferenceRepairNowFn().Before(leaseDeadline), nil
+	return false, nil
 }
 
 func publishedBlockReferenceRepairLeaseDeadline(repair publishedBlockReferenceRepair) time.Time {

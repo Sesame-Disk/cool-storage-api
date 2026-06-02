@@ -248,7 +248,7 @@ func TestClearPendingPublishedFileOwners_DeletesOwnerWithoutReachabilityChecks(t
 	}
 }
 
-func TestCleanupFailedPublishAttempt_DeletesPendingFSObjectWhenUnownedAndUnreachable(t *testing.T) {
+func TestCleanupFailedPublishAttempt_ReleasesOwnerWithoutDeletingSharedFSObject(t *testing.T) {
 	oldDeletePendingOwner := cleanupFailedPublishDeletePendingOwnerFn
 	oldOwnerExists := cleanupFailedPublishPendingOwnerExistsFn
 	oldReachable := cleanupFailedPublishFSObjectReachableFn
@@ -269,17 +269,15 @@ func TestCleanupFailedPublishAttempt_DeletesPendingFSObjectWhenUnownedAndUnreach
 		return nil
 	}
 	cleanupFailedPublishPendingOwnerExistsFn = func(database *db.DB, repoID, fsID string) (bool, error) {
+		t.Fatal("release should not check owner existence before deciding whether to delete a shared fs_object")
 		return false, nil
 	}
 	cleanupFailedPublishFSObjectReachableFn = func(database *db.DB, repoID, fsID string) (bool, error) {
+		t.Fatal("release should not check reachability before deciding whether to delete a shared fs_object")
 		return false, nil
 	}
-	deletedFSObjects := 0
 	cleanupFailedPublishDeleteFSObjectFn = func(database *db.DB, repoID, fsID string) error {
-		deletedFSObjects++
-		if repoID != "repo-1" || fsID != "fs-1" {
-			t.Fatalf("delete fs_object args = %s/%s, want repo-1/fs-1", repoID, fsID)
-		}
+		t.Fatal("release should not delete content-addressed fs_object rows")
 		return nil
 	}
 
@@ -293,66 +291,6 @@ func TestCleanupFailedPublishAttempt_DeletesPendingFSObjectWhenUnownedAndUnreach
 	}
 	if deletedOwners != 1 {
 		t.Fatalf("deletedOwners = %d, want 1", deletedOwners)
-	}
-	if deletedFSObjects != 1 {
-		t.Fatalf("deletedFSObjects = %d, want 1", deletedFSObjects)
-	}
-}
-
-func TestCleanupFailedPublishAttempt_KeepsPendingFSObjectWhenStillOwnedOrReachable(t *testing.T) {
-	tests := []struct {
-		name         string
-		ownersRemain bool
-		reachable    bool
-	}{
-		{name: "another owner remains", ownersRemain: true},
-		{name: "commit already reachable", reachable: true},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			oldDeletePendingOwner := cleanupFailedPublishDeletePendingOwnerFn
-			oldOwnerExists := cleanupFailedPublishPendingOwnerExistsFn
-			oldReachable := cleanupFailedPublishFSObjectReachableFn
-			oldDeleteFSObject := cleanupFailedPublishDeleteFSObjectFn
-			t.Cleanup(func() {
-				cleanupFailedPublishDeletePendingOwnerFn = oldDeletePendingOwner
-				cleanupFailedPublishPendingOwnerExistsFn = oldOwnerExists
-				cleanupFailedPublishFSObjectReachableFn = oldReachable
-				cleanupFailedPublishDeleteFSObjectFn = oldDeleteFSObject
-			})
-
-			cleanupFailedPublishDeletePendingOwnerFn = func(database *db.DB, repoID, fsID, ownerID string, createdAt time.Time) error {
-				return nil
-			}
-			cleanupFailedPublishPendingOwnerExistsFn = func(database *db.DB, repoID, fsID string) (bool, error) {
-				return tt.ownersRemain, nil
-			}
-			reachabilityChecks := 0
-			cleanupFailedPublishFSObjectReachableFn = func(database *db.DB, repoID, fsID string) (bool, error) {
-				reachabilityChecks++
-				return tt.reachable, nil
-			}
-			deleteCalls := 0
-			cleanupFailedPublishDeleteFSObjectFn = func(database *db.DB, repoID, fsID string) error {
-				deleteCalls++
-				return nil
-			}
-
-			err := CleanupFailedPublishAttempt(&db.DB{}, "", "repo-1", "", "", []*pendingPublishedFile{{fsID: "fs-1", cleanupOwnerID: "owner-1", cleanupCreatedAt: time.Now().UTC()}})
-			if err != nil {
-				t.Fatalf("CleanupFailedPublishAttempt() error = %v, want nil", err)
-			}
-			if deleteCalls != 0 {
-				t.Fatalf("deleteCalls = %d, want 0", deleteCalls)
-			}
-			if tt.ownersRemain && reachabilityChecks != 0 {
-				t.Fatalf("reachabilityChecks = %d, want 0 when another owner remains", reachabilityChecks)
-			}
-			if !tt.ownersRemain && reachabilityChecks != 1 {
-				t.Fatalf("reachabilityChecks = %d, want 1", reachabilityChecks)
-			}
-		})
 	}
 }
 
@@ -756,6 +694,7 @@ func TestRepairPublishedFSObjectBlockReferenceRepair_CleansUnreachableCommit(t *
 	oldPromote := publishedBlockReferenceRepairPromoteFn
 	oldCleanup := publishedBlockReferenceRepairCleanupFn
 	oldDelete := deletePublishedBlockReferenceRepairFn
+	oldNow := publishedBlockReferenceRepairNowFn
 	t.Cleanup(func() {
 		publishedBlockReferenceRepairCommitReachableFn = oldReachable
 		publishedBlockReferenceRepairHeadCommitFn = oldHead
@@ -764,8 +703,13 @@ func TestRepairPublishedFSObjectBlockReferenceRepair_CleansUnreachableCommit(t *
 		publishedBlockReferenceRepairPromoteFn = oldPromote
 		publishedBlockReferenceRepairCleanupFn = oldCleanup
 		deletePublishedBlockReferenceRepairFn = oldDelete
+		publishedBlockReferenceRepairNowFn = oldNow
 	})
 
+	now := time.Date(2026, time.May, 29, 12, 5, 0, 0, time.UTC)
+	publishedBlockReferenceRepairNowFn = func() time.Time {
+		return now
+	}
 	publishedBlockReferenceRepairCommitReachableFn = func(database *db.DB, repoID, commitID string) (bool, error) {
 		return false, nil
 	}
@@ -800,9 +744,19 @@ func TestRepairPublishedFSObjectBlockReferenceRepair_CleansUnreachableCommit(t *
 		return nil
 	}
 
-	err := RepairPublishedFSObjectBlockReferenceRepair(nil, "org-1", "repo-1", "commit-1", "fs-1", []string{"queued-block-1"})
+	repair := publishedBlockReferenceRepair{
+		Bucket:         publishedBlockReferenceRepairBucket("org-1", "repo-1", "commit-1", "fs-1"),
+		OrgID:          "org-1",
+		RepoID:         "repo-1",
+		CommitID:       "commit-1",
+		FSID:           "fs-1",
+		StagedBlockIDs: []string{"queued-block-1"},
+		CreatedAt:      now.Add(-10 * time.Minute),
+		LeaseExpiresAt: now.Add(-time.Minute),
+	}
+	err := repairPublishedBlockReferenceRepair(nil, repair)
 	if err != nil {
-		t.Fatalf("RepairPublishedFSObjectBlockReferenceRepair() error = %v, want nil", err)
+		t.Fatalf("repairPublishedBlockReferenceRepair() error = %v, want nil", err)
 	}
 	if cleanupCalls != 1 {
 		t.Fatalf("cleanupCalls = %d, want 1", cleanupCalls)
@@ -840,10 +794,12 @@ func TestRepairPublishedFSObjectBlockReferenceRepair_DefersUnreachableCommitWhil
 		return now
 	}
 	publishedBlockReferenceRepairHeadCommitFn = func(database *db.DB, repoID string) (string, error) {
-		return "parent-1", nil
+		t.Fatal("head lookup should not run while pre-CAS lease is active")
+		return "", nil
 	}
 	publishedBlockReferenceRepairCommitParentFn = func(database *db.DB, repoID, commitID string) (string, error) {
-		return "parent-1", nil
+		t.Fatal("parent lookup should not run while pre-CAS lease is active")
+		return "", nil
 	}
 	loadPublishedBlockReferenceRepairPendingFileFn = func(database *db.DB, repoID, fsID string) (*pendingPublishedFile, error) {
 		t.Fatal("fs_object lookup should not run for deferred unreachable commit")

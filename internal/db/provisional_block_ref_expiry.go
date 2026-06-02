@@ -38,7 +38,7 @@ func (db *DB) UpsertProvisionalBlockReferenceExpiry(orgID, blockID, referrer, st
 	if !existingExpiresAt.IsZero() && !existingExpiresAt.Equal(expiresAt) {
 		AddDeleteProvisionalBlockRefExpiryDiscoveryQuery(batch, orgID, blockID, referrer, existingExpiresAt)
 	}
-	if err := db.Session().ExecuteBatch(batch); err != nil {
+	if err := batch.Exec(); err != nil {
 		return fmt.Errorf("upsert provisional block ref expiry for org=%s block=%s referrer=%s: %w", orgID, blockID, referrer, err)
 	}
 	return nil
@@ -71,7 +71,7 @@ func (db *DB) DeleteProvisionalBlockReferenceExpiry(orgID, blockID, referrer str
 	if !expiresAt.IsZero() {
 		AddDeleteProvisionalBlockRefExpiryDiscoveryQuery(batch, orgID, blockID, referrer, expiresAt.UTC())
 	}
-	if err := db.Session().ExecuteBatch(batch); err != nil {
+	if err := batch.Exec(); err != nil {
 		return fmt.Errorf("delete provisional block ref expiry for org=%s block=%s referrer=%s: %w", orgID, blockID, referrer, err)
 	}
 	return nil

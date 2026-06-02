@@ -278,6 +278,18 @@ Future fix options:
 - or move to per-chunk traffic recording / reservation with reconciliation on completion, retry, or abandonment
 - if per-chunk recording lands, replace the current `declared total on every request` pre-check with chunk-bytes or session-reservation logic to avoid false rejections after partial accounting
 - add tests for aborted uploads, finalize failures, duplicate chunk retries, and malformed `Content-Range`
+
+**4. Finish the remaining `ReadAll` limits audit**
+
+The two single-shot multipart upload paths now fail closed at 1 GiB before
+calling `io.ReadAll`: `SeafHTTPHandler.HandleUpload` and `FileHandler.UploadFile`.
+Chunked web uploads already avoid whole-file reads on the request path.
+
+Still pending outside this branch's upload-finalization scope:
+- audit direct sync-protocol request-body reads and decompressed zlib reads in [internal/api/sync.go](internal/api/sync.go) and give each endpoint an explicit protocol-sized cap or streaming parser
+- cap diagnostic/body reads from external OIDC HTTP responses in [internal/auth/oidc.go](internal/auth/oidc.go)
+- audit storage/buffer/streaming `ReadAll` helpers that are safe only when the caller already controls object size
+- keep tests/HTTP response reads as test-only exceptions unless they become production helpers
   run: |
     go test ./... -coverprofile=coverage.out
     COVERAGE=$(go tool cover -func=coverage.out | grep total | awk '{print $3}' | sed 's/%//')
