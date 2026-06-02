@@ -27,6 +27,263 @@ func TestNewScanner(t *testing.T) {
 	}
 }
 
+func TestScanner_ScanOnce_ExpiredProvisionalRefEnqueuesZeroRefBlock(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	s := NewScanner(store, q, stats, config.GCConfig{})
+
+	orgID := uuid.New()
+	blockID := "block-expired"
+	referrer := db.BlockReferrerForUpload("upload-op")
+	expiresAt := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
+
+	store.AddOrganization(orgID)
+	store.AddBlock(orgID, blockID, "hot", 0)
+	store.mu.Lock()
+	store.blockReferences[fmt.Sprintf("%s:%s", orgID, blockID)] = map[string]struct{}{referrer: {}}
+	store.mu.Unlock()
+	store.AddProvisionalBlockRefExpiry(orgID, blockID, referrer, "hot", expiresAt)
+
+	if err := s.ScanOnce(context.Background()); err != nil {
+		t.Fatalf("ScanOnce() error = %v, want nil", err)
+	}
+	hasRefs, err := store.BlockHasReferences(orgID, blockID)
+	if err != nil {
+		t.Fatalf("BlockHasReferences() error = %v", err)
+	}
+	if hasRefs {
+		t.Fatal("expected expired provisional ref to be removed")
+	}
+	items := store.QueueItems(orgID)
+	if len(items) != 1 {
+		t.Fatalf("expected 1 queued block after scan, got %d", len(items))
+	}
+	if items[0].ItemType != ItemBlock || items[0].ItemID != blockID {
+		t.Fatalf("queued item = %#v, want block %s", items[0], blockID)
+	}
+	expiries, err := store.ListProvisionalBlockRefExpiriesByDay(expiresAt, db.GCDiscoveryBucket(orgID.String(), blockID, referrer))
+	if err != nil {
+		t.Fatalf("ListProvisionalBlockRefExpiriesByDay() error = %v", err)
+	}
+	if len(expiries) != 0 {
+		t.Fatalf("expected expiry tracker to be removed, got %#v", expiries)
+	}
+	gotCursor, err := store.LoadGCStats(gcProvisionalBlockRefsCursorKey)
+	if err != nil {
+		t.Fatalf("LoadGCStats() error = %v", err)
+	}
+	if gotCursor == "" {
+		t.Fatal("expected provisional ref cursor to be persisted")
+	}
+}
+
+func TestScanner_ScanExpiredProvisionalBlockRefs_PreservesLiveBlocks(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	s := NewScanner(store, q, stats, config.GCConfig{})
+
+	orgID := uuid.New()
+	blockID := "block-live"
+	expiredRef := db.BlockReferrerForUpload("expired-op")
+	fsRef := db.BlockReferrerForFSObject("lib-1", "fs-1")
+	expiresAt := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
+
+	store.AddOrganization(orgID)
+	store.AddBlock(orgID, blockID, "hot", 0)
+	store.mu.Lock()
+	store.blockReferences[fmt.Sprintf("%s:%s", orgID, blockID)] = map[string]struct{}{
+		expiredRef: {},
+		fsRef:      {},
+	}
+	store.mu.Unlock()
+	store.AddProvisionalBlockRefExpiry(orgID, blockID, expiredRef, "hot", expiresAt)
+
+	cleaned, err := s.scanExpiredProvisionalBlockRefs(context.Background())
+	if err != nil {
+		t.Fatalf("scanExpiredProvisionalBlockRefs() error = %v, want nil", err)
+	}
+	if cleaned != 1 {
+		t.Fatalf("scanExpiredProvisionalBlockRefs() cleaned = %d, want 1", cleaned)
+	}
+	hasRefs, err := store.BlockHasReferences(orgID, blockID)
+	if err != nil {
+		t.Fatalf("BlockHasReferences() error = %v", err)
+	}
+	if !hasRefs {
+		t.Fatal("expected live fs: ref to keep block alive")
+	}
+	candidates, err := store.ListBlockGCCandidatesByDay(expiresAt, db.GCDiscoveryBucket(orgID.String(), blockID))
+	if err != nil {
+		t.Fatalf("ListBlockGCCandidatesByDay() error = %v", err)
+	}
+	if len(candidates) != 0 {
+		t.Fatalf("expected no GC candidate for still-live block, got %#v", candidates)
+	}
+	expiries, err := store.ListProvisionalBlockRefExpiriesByDay(expiresAt, db.GCDiscoveryBucket(orgID.String(), blockID, expiredRef))
+	if err != nil {
+		t.Fatalf("ListProvisionalBlockRefExpiriesByDay() error = %v", err)
+	}
+	if len(expiries) != 0 {
+		t.Fatalf("expected expiry tracker to be removed, got %#v", expiries)
+	}
+}
+
+func TestScanner_ScanExpiredProvisionalBlockRefs_IgnoresStaleProjectionWhenCanonicalRenewed(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	s := NewScanner(store, q, stats, config.GCConfig{})
+
+	orgID := uuid.New()
+	blockID := "block-renewed-upload"
+	referrer := db.BlockReferrerForUpload("renewed-op")
+	oldExpiresAt := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
+	renewedExpiresAt := time.Now().Add(2 * time.Hour).UTC().Truncate(time.Millisecond)
+
+	store.AddOrganization(orgID)
+	store.AddBlock(orgID, blockID, "hot", 0)
+	store.AddBlockReferenceForTest(orgID, blockID, referrer)
+	store.AddProvisionalBlockRefExpiry(orgID, blockID, referrer, "hot", renewedExpiresAt)
+	store.AddProvisionalBlockRefExpiryProjectionForTest(orgID, blockID, referrer, "hot", oldExpiresAt)
+
+	cleaned, err := s.scanExpiredProvisionalBlockRefs(context.Background())
+	if err != nil {
+		t.Fatalf("scanExpiredProvisionalBlockRefs() error = %v", err)
+	}
+	if cleaned != 1 {
+		t.Fatalf("scanExpiredProvisionalBlockRefs() cleaned = %d, want 1 stale projection", cleaned)
+	}
+	hasRefs, err := store.BlockHasReferences(orgID, blockID)
+	if err != nil {
+		t.Fatalf("BlockHasReferences() error = %v", err)
+	}
+	if !hasRefs {
+		t.Fatal("expected renewed provisional ref to remain alive")
+	}
+	canonical, found, err := store.GetProvisionalBlockRefExpiry(orgID, blockID, referrer)
+	if err != nil {
+		t.Fatalf("GetProvisionalBlockRefExpiry() error = %v", err)
+	}
+	if !found {
+		t.Fatal("expected renewed canonical expiry to remain")
+	}
+	if !canonical.ExpiresAt.Equal(renewedExpiresAt) {
+		t.Fatalf("canonical expires_at = %v, want %v", canonical.ExpiresAt, renewedExpiresAt)
+	}
+	oldExpiries, err := store.ListProvisionalBlockRefExpiriesByDay(oldExpiresAt, db.GCDiscoveryBucket(orgID.String(), blockID, referrer))
+	if err != nil {
+		t.Fatalf("ListProvisionalBlockRefExpiriesByDay(old) error = %v", err)
+	}
+	for _, expiry := range oldExpiries {
+		if expiry.ExpiresAt.Equal(oldExpiresAt) {
+			t.Fatalf("expected stale projection at %v to be removed, got %#v", oldExpiresAt, oldExpiries)
+		}
+	}
+	candidates, err := store.ListBlockGCCandidatesByDay(time.Now().UTC(), db.GCDiscoveryBucket(orgID.String(), blockID))
+	if err != nil {
+		t.Fatalf("ListBlockGCCandidatesByDay() error = %v", err)
+	}
+	if len(candidates) != 0 {
+		t.Fatalf("expected no GC candidate for renewed upload ref, got %#v", candidates)
+	}
+}
+
+func TestScanner_ScanExpiredProvisionalBlockRefs_DropsProjectionWhenCanonicalMissing(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	s := NewScanner(store, q, stats, config.GCConfig{})
+
+	orgID := uuid.New()
+	blockID := "block-missing-canonical"
+	referrer := db.BlockReferrerForUpload("finalized-op")
+	expiresAt := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
+
+	store.AddOrganization(orgID)
+	store.AddBlock(orgID, blockID, "hot", 0)
+	store.AddBlockReferenceForTest(orgID, blockID, referrer)
+	store.AddProvisionalBlockRefExpiryProjectionForTest(orgID, blockID, referrer, "hot", expiresAt)
+
+	cleaned, err := s.scanExpiredProvisionalBlockRefs(context.Background())
+	if err != nil {
+		t.Fatalf("scanExpiredProvisionalBlockRefs() error = %v", err)
+	}
+	if cleaned != 1 {
+		t.Fatalf("scanExpiredProvisionalBlockRefs() cleaned = %d, want 1 orphaned projection", cleaned)
+	}
+	hasRefs, err := store.BlockHasReferences(orgID, blockID)
+	if err != nil {
+		t.Fatalf("BlockHasReferences() error = %v", err)
+	}
+	if !hasRefs {
+		t.Fatal("expected scanner to leave block refs untouched when canonical expiry is missing")
+	}
+	expiries, err := store.ListProvisionalBlockRefExpiriesByDay(expiresAt, db.GCDiscoveryBucket(orgID.String(), blockID, referrer))
+	if err != nil {
+		t.Fatalf("ListProvisionalBlockRefExpiriesByDay() error = %v", err)
+	}
+	if len(expiries) != 0 {
+		t.Fatalf("expected orphaned projection to be removed, got %#v", expiries)
+	}
+	candidates, err := store.ListBlockGCCandidatesByDay(time.Now().UTC(), db.GCDiscoveryBucket(orgID.String(), blockID))
+	if err != nil {
+		t.Fatalf("ListBlockGCCandidatesByDay() error = %v", err)
+	}
+	if len(candidates) != 0 {
+		t.Fatalf("expected no GC candidate when canonical expiry is missing, got %#v", candidates)
+	}
+}
+
+func TestScanner_ScanExpiredProvisionalBlockRefs_UsesScanTimeForCandidatePartition(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	s := NewScanner(store, q, stats, config.GCConfig{})
+
+	orgID := uuid.New()
+	blockID := "block-old-expiry"
+	referrer := db.BlockReferrerForUpload("stale-upload")
+	expiresAt := time.Now().Add(-72 * time.Hour).UTC().Truncate(time.Millisecond)
+	beforeScan := time.Now().UTC().Add(-time.Second)
+
+	store.AddOrganization(orgID)
+	store.AddBlock(orgID, blockID, "hot", 0)
+	store.mu.Lock()
+	store.blockReferences[fmt.Sprintf("%s:%s", orgID, blockID)] = map[string]struct{}{referrer: {}}
+	store.mu.Unlock()
+	store.AddProvisionalBlockRefExpiry(orgID, blockID, referrer, "hot", expiresAt)
+
+	cleaned, err := s.scanExpiredProvisionalBlockRefs(context.Background())
+	if err != nil {
+		t.Fatalf("scanExpiredProvisionalBlockRefs() error = %v", err)
+	}
+	if cleaned != 1 {
+		t.Fatalf("scanExpiredProvisionalBlockRefs() cleaned = %d, want 1", cleaned)
+	}
+	afterScan := time.Now().UTC().Add(time.Second)
+
+	oldCandidates, err := store.ListBlockGCCandidatesByDay(expiresAt, db.GCDiscoveryBucket(orgID.String(), blockID))
+	if err != nil {
+		t.Fatalf("ListBlockGCCandidatesByDay(old expiry day) error = %v", err)
+	}
+	if len(oldCandidates) != 0 {
+		t.Fatalf("expected no candidate in old expiry partition, got %#v", oldCandidates)
+	}
+
+	newCandidates, err := store.ListBlockGCCandidatesByDay(beforeScan, db.GCDiscoveryBucket(orgID.String(), blockID))
+	if err != nil {
+		t.Fatalf("ListBlockGCCandidatesByDay(scan day) error = %v", err)
+	}
+	if len(newCandidates) != 1 {
+		t.Fatalf("expected 1 candidate in current partition, got %#v", newCandidates)
+	}
+	if newCandidates[0].CandidateAt.Before(beforeScan) || newCandidates[0].CandidateAt.After(afterScan) {
+		t.Fatalf("candidate_at = %v, want between %v and %v", newCandidates[0].CandidateAt, beforeScan, afterScan)
+	}
+}
+
 func TestScanner_ScanOnce_ReturnsPhaseErrorsButContinues(t *testing.T) {
 	store := NewMockStore()
 	stats := &Stats{}

@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"net/url"
@@ -29,6 +28,7 @@ import (
 	"github.com/Sesame-Disk/sesamefs/internal/traffic"
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 )
 
 // TokenCreator is an interface for creating access tokens
@@ -92,6 +92,45 @@ func rebuildTraversedDirectoryToRoot(fsHelper *FSHelper, repoID string, result *
 // Upload-finalize retry shares libraryHeadMutationRetryBackoff for per-attempt
 // delay (exponential with jitter, capped). Only the attempt count is local.
 const uploadMetadataRetryAttempts = 20
+
+// Office template creates can race with GC over the shared content-addressed
+// template block. When that happens, re-store the template and retry the block
+// registration instead of surfacing a transient 500 to the caller.
+const createFileTemplateBlockRetryAttempts = 3
+
+var createFileTemplateBlockRetryBackoffFn = RetryBackoff
+
+var createFileTemplateBlockSleepFn = time.Sleep
+
+func retryCreateFileTemplateBlockMaterialization(store func() error, register func() error, resetStored func()) error {
+	attempts := createFileTemplateBlockRetryAttempts
+	if attempts < 1 {
+		attempts = 1
+	}
+
+	for attempt := 1; attempt <= attempts; attempt++ {
+		if err := store(); err != nil {
+			return err
+		}
+		if err := register(); err != nil {
+			if !errors.Is(err, ErrBlockDeleteInProgress) || attempt == attempts {
+				return err
+			}
+			if resetStored != nil {
+				resetStored()
+			}
+			sleepFor := createFileTemplateBlockRetryBackoffFn(attempt)
+			log.Printf("[CreateFile] template block registration fenced by GC; retrying (%d/%d) after %s", attempt, attempts, sleepFor)
+			if sleepFor > 0 {
+				createFileTemplateBlockSleepFn(sleepFor)
+			}
+			continue
+		}
+		return nil
+	}
+
+	return fmt.Errorf("unreachable template block materialization state")
+}
 
 // Dirent represents a directory entry in Seafile API format
 // This matches the exact format expected by Seafile clients
@@ -1071,6 +1110,7 @@ func (h *FileHandler) CreateFile(c *gin.Context) {
 	// by SHA-256, so reusing the first successful upload avoids rewriting the
 	// same bytes on later CAS retries.
 	var templateBlockStore *storage.BlockStore
+	var templateStorageClass string
 	var templateBlockStored bool
 
 	if len(templateContent) > 0 {
@@ -1094,6 +1134,22 @@ func (h *FileHandler) CreateFile(c *gin.Context) {
 	var newCommitID string
 
 	err = retryLibraryHeadMutation("CreateFile", func() error {
+		uploadOperationID := uuid.NewString()
+		templateBlockPinned := false
+		releaseTemplateBlockPin := func(enqueueIfZero bool) {
+			if !templateBlockPinned || templateBlockData == nil {
+				return
+			}
+			templateBlockPinned = false
+			zeroRefBlocks := fsHelper.ReleaseUploadReferences(orgID, repoID, uploadOperationID, []string{templateBlockData.Hash})
+			if enqueueIfZero && len(zeroRefBlocks) > 0 {
+				enqueueZeroRefBlocks(h.db, orgID, repoID, zeroRefBlocks)
+			}
+		}
+		defer func() {
+			releaseTemplateBlockPin(true)
+		}()
+
 		snapshot, err := fsHelper.GetLibraryHeadSnapshot(repoID)
 		if err != nil {
 			return fmt.Errorf("%w: %v", errLibraryNotFound, err)
@@ -1123,9 +1179,9 @@ func (h *FileHandler) CreateFile(c *gin.Context) {
 			}
 		}
 
-		if templateBlockData != nil && !templateBlockStored {
+		if templateBlockData != nil {
 			if templateBlockStore == nil {
-				blockStore, _, err := h.resolveLibraryBlockStore(c, orgID, repoID)
+				blockStore, storageClass, err := h.resolveLibraryBlockStore(c, orgID, repoID)
 				if err != nil {
 					return fmt.Errorf("%w: %v", errBlockStorageUnavailable, err)
 				}
@@ -1133,22 +1189,47 @@ func (h *FileHandler) CreateFile(c *gin.Context) {
 					return errBlockStorageUnavailable
 				}
 				templateBlockStore = blockStore
+				templateStorageClass = storageClass
 			}
-			if _, err := templateBlockStore.PutBlockData(c.Request.Context(), templateBlockData); err != nil {
-				return fmt.Errorf("failed to store file content: %w", err)
+			if err := retryCreateFileTemplateBlockMaterialization(func() error {
+				if templateBlockStored {
+					return nil
+				}
+				if _, err := templateBlockStore.PutBlockData(c.Request.Context(), templateBlockData); err != nil {
+					return fmt.Errorf("failed to store file content: %w", err)
+				}
+				templateBlockStored = true
+				log.Printf("[CreateFile] Created Office file %s with template size %d bytes", fileName, fileSize)
+				return nil
+			}, func() error {
+				// Keep the freshly stored template block alive and respect the GC
+				// delete fence until publish-attempt refs take over below.
+				if err := fsHelper.RegisterUploadedBlock(orgID, repoID, templateBlockData.Hash, uploadOperationID, int(fileSize), templateStorageClass, ""); err != nil {
+					return fmt.Errorf("failed to register template block metadata: %w", err)
+				}
+				templateBlockPinned = true
+				return nil
+			}, func() {
+				templateBlockStored = false
+			}); err != nil {
+				return err
 			}
-			templateBlockStored = true
-			log.Printf("[CreateFile] Created Office file %s with template size %d bytes", fileName, fileSize)
 		}
 
-		fileFSID, err := fsHelper.CreateFileFSObject(repoID, fileName, fileSize, blockIDs)
+		pendingFile, err := fsHelper.prepareFileFSObjectForPublish(repoID, fileName, fileSize, blockIDs)
 		if err != nil {
 			return fmt.Errorf("failed to create file: %w", err)
 		}
+		cleanupPendingFilePublish := func() {
+			if cleanupErr := CleanupFailedPublishAttempt(h.db, orgID, repoID, "", "", []*pendingPublishedFile{pendingFile}); cleanupErr != nil {
+				log.Printf("[CreateFile] WARNING: failed to clean up pending fs_object %s before commit publish: %v", pendingFile.fsID, cleanupErr)
+			}
+		}
+		pendingFiles := []*pendingPublishedFile{pendingFile}
 
 		newEntry := FSEntry{
 			Name:  fileName,
-			ID:    fileFSID,
+			ID:    pendingFile.fsID,
 			Mode:  ModeFile,
 			MTime: time.Now().Unix(),
 			Size:  fileSize,
@@ -1157,6 +1238,7 @@ func (h *FileHandler) CreateFile(c *gin.Context) {
 
 		newParentFSID, err := fsHelper.CreateDirectoryFSObject(repoID, newEntries)
 		if err != nil {
+			cleanupPendingFilePublish()
 			return fmt.Errorf("failed to update parent directory: %w", err)
 		}
 
@@ -1175,26 +1257,71 @@ func (h *FileHandler) CreateFile(c *gin.Context) {
 
 			newGrandparentFSID, err := fsHelper.CreateDirectoryFSObject(repoID, updatedGrandparentEntries)
 			if err != nil {
+				cleanupPendingFilePublish()
 				return fmt.Errorf("failed to update grandparent directory: %w", err)
 			}
 
 			newRootFSID, err = fsHelper.RebuildPathToRoot(repoID, result, newGrandparentFSID)
 			if err != nil {
+				cleanupPendingFilePublish()
 				return fmt.Errorf("failed to rebuild path: %w", err)
 			}
 		}
 
 		description := fmt.Sprintf("Added \"%s\"", fileName)
-		commitID, err := fsHelper.CreateCommit(repoID, userID, newRootFSID, snapshot.HeadCommitID, description)
-		if err != nil {
-			return fmt.Errorf("failed to create commit: %w", err)
+		commitCreatedAt := time.Now().UTC()
+		commitID := buildCommitID(repoID, newRootFSID, description, commitCreatedAt)
+		if err := fsHelper.stagePendingPublishedFiles(orgID, repoID, commitID, pendingFiles); err != nil {
+			if cleanupErr := CleanupFailedPublishAttempt(h.db, orgID, repoID, commitID, commitID, pendingFiles); cleanupErr != nil {
+				return errors.Join(
+					fmt.Errorf("failed to stage publish-attempt block references for commit %s: %w", commitID, err),
+					fmt.Errorf("cleanup failed publish commit %s: %w", commitID, cleanupErr),
+				)
+			}
+			return fmt.Errorf("failed to stage publish-attempt block references for commit %s: %w", commitID, err)
+		}
+		if err := queuePendingPublishedFileRepairs(h.db, orgID, repoID, commitID, pendingFiles); err != nil {
+			cleanupErr := CleanupFailedPublishAttempt(h.db, orgID, repoID, commitID, commitID, pendingFiles)
+			clearErr := clearPendingPublishedFileRepairs(h.db, orgID, repoID, commitID, pendingFiles)
+			return errors.Join(
+				fmt.Errorf("failed to queue durable publish repair for commit %s: %w", commitID, err),
+				cleanupErr,
+				clearErr,
+			)
+		}
+		releaseTemplateBlockPin(false)
+		if err := fsHelper.insertCommit(repoID, commitID, userID, newRootFSID, snapshot.HeadCommitID, description, commitCreatedAt); err != nil {
+			cleanupErr := CleanupFailedPublishAttempt(h.db, orgID, repoID, commitID, commitID, pendingFiles)
+			clearErr := clearPendingPublishedFileRepairs(h.db, orgID, repoID, commitID, pendingFiles)
+			return errors.Join(
+				fmt.Errorf("failed to create commit: %w", err),
+				cleanupErr,
+				clearErr,
+			)
 		}
 
 		if err := fsHelper.UpdateLibraryHeadFromSnapshot(snapshot, repoID, commitID, snapshot.HeadCommitID); err != nil {
+			if errors.Is(err, ErrLibraryHeadConflict) {
+				if cleanupErr := CleanupFailedPublishAttempt(h.db, orgID, repoID, commitID, commitID, pendingFiles); cleanupErr != nil {
+					return fmt.Errorf("failed to clean up conflict publish attempt %s: %w", commitID, cleanupErr)
+				}
+				if clearErr := clearPendingPublishedFileRepairs(h.db, orgID, repoID, commitID, pendingFiles); clearErr != nil {
+					log.Printf("[CreateFile] WARNING: failed to clear queued publish repair for repo=%s commit=%s fs_object=%s after head conflict: %v", repoID, commitID, pendingFile.fsID, clearErr)
+				}
+			}
 			return err
 		}
+		if ownerErr := clearPendingPublishedFileOwnersFn(h.db, repoID, pendingFiles); ownerErr != nil {
+			log.Printf("[CreateFile] WARNING: published repo=%s commit=%s but failed to clear pending fs_object owners: %v", repoID, commitID, ownerErr)
+		}
+		if err := fsHelper.promotePendingPublishedFiles(orgID, repoID, commitID, pendingFiles); err != nil {
+			log.Printf("[CreateFile] WARNING: head updated for repo=%s commit=%s but failed to promote block references for fs_object %s: %v", repoID, commitID, pendingFile.fsID, err)
+			schedulePendingPublishedFileRepairs(h.db, orgID, repoID, commitID, pendingFiles, "CreateFile")
+		} else if clearErr := clearPendingPublishedFileRepairs(h.db, orgID, repoID, commitID, pendingFiles); clearErr != nil {
+			log.Printf("[CreateFile] WARNING: published repo=%s commit=%s but failed to clear queued publish repair for fs_object %s: %v", repoID, commitID, pendingFile.fsID, clearErr)
+		}
 
-		newFileFSID = fileFSID
+		newFileFSID = pendingFile.fsID
 		newCommitID = commitID
 		return nil
 	})
@@ -1208,6 +1335,8 @@ func (h *FileHandler) CreateFile(c *gin.Context) {
 			c.JSON(http.StatusConflict, gin.H{"error": "file already exists"})
 		case errors.Is(err, errBlockStorageUnavailable):
 			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "block storage not available"})
+		case errors.Is(err, ErrBlockDeleteInProgress):
+			c.JSON(http.StatusConflict, gin.H{"error": "block is being deleted; retry the create"})
 		case errors.Is(err, ErrLibraryHeadConflict):
 			c.JSON(http.StatusConflict, gin.H{"error": "library was modified concurrently; retry the create"})
 		default:
@@ -1262,7 +1391,6 @@ func (h *FileHandler) DeleteDirectory(c *gin.Context) {
 	dirName := path.Base(dirPath)
 	errDirectoryNotFound := errors.New("directory not found")
 	errPathNotDirectory := errors.New("path is not a directory")
-	var blockIDs []string
 	var totalSize int64
 	var fileCount int64
 	var newCommitID string
@@ -1279,7 +1407,7 @@ func (h *FileHandler) DeleteDirectory(c *gin.Context) {
 			return errPathNotDirectory
 		}
 
-		currentBlockIDs, currentTotalSize, currentFileCount, _ := fsHelper.collectDirStats(repoID, result.TargetFSID)
+		_, currentTotalSize, currentFileCount, _ := fsHelper.collectDirStats(repoID, result.TargetFSID)
 		newEntries := RemoveEntryFromList(result.Entries, dirName)
 		newParentFSID, err := fsHelper.CreateDirectoryFSObject(repoID, newEntries)
 		if err != nil {
@@ -1301,7 +1429,6 @@ func (h *FileHandler) DeleteDirectory(c *gin.Context) {
 			return err
 		}
 
-		blockIDs = currentBlockIDs
 		totalSize = currentTotalSize
 		fileCount = currentFileCount
 		newCommitID = commitID
@@ -1321,23 +1448,13 @@ func (h *FileHandler) DeleteDirectory(c *gin.Context) {
 		return
 	}
 
-	// Decrement block ref counts and enqueue zero-ref blocks for GC
-	go func() {
-		if len(blockIDs) > 0 {
-			zeroRefBlocks := fsHelper.DecrementBlockRefCountsOnce(orgID, newCommitID, blockIDs)
-			if len(zeroRefBlocks) > 0 && h.gcEnqueuer != nil {
-				// Get storage class for the library
-				var storageClass string
-				h.db.Session().Query(`
-					SELECT storage_class FROM libraries WHERE org_id = ? AND library_id = ?
-				`, orgID, repoID).Scan(&storageClass)
-				h.gcEnqueuer.EnqueueBlocks(orgID, zeroRefBlocks, storageClass)
-			}
-		}
-		if totalSize > 0 {
-			traffic.DecrementStorageCounters(h.db, orgID, userID, repoID, totalSize, fileCount)
-		}
-	}()
+	// Block references are released when GC sweeps the now-unreachable fs_objects
+	// (the deleted tree stays in fs_objects until version retention expires), so
+	// there is no inline ref decrement here. Storage-quota counters still update
+	// immediately to reflect the user-visible deletion.
+	if totalSize > 0 {
+		go traffic.DecrementStorageCounters(h.db, orgID, userID, repoID, totalSize, fileCount)
+	}
 
 	// Clean up file tags for the deleted directory and its contents (async, non-blocking)
 	go h.cleanupFileTagsForPrefix(repoID, dirPath)
@@ -1945,22 +2062,9 @@ func (h *FileHandler) DeleteFile(c *gin.Context) {
 		return
 	}
 
-	// Decrement block ref counts and enqueue zero-ref blocks for GC
-	go func() {
-		if result.TargetEntry != nil {
-			blockIDs, _ := fsHelper.CollectBlockIDsRecursive(repoID, result.TargetFSID)
-			if len(blockIDs) > 0 {
-				zeroRefBlocks := fsHelper.DecrementBlockRefCountsOnce(orgID, newCommitID, blockIDs)
-				if len(zeroRefBlocks) > 0 && h.gcEnqueuer != nil {
-					var storageClass string
-					h.db.Session().Query(`
-						SELECT storage_class FROM libraries WHERE org_id = ? AND library_id = ?
-					`, orgID, repoID).Scan(&storageClass)
-					h.gcEnqueuer.EnqueueBlocks(orgID, zeroRefBlocks, storageClass)
-				}
-			}
-		}
-	}()
+	// Block references are released when GC sweeps the now-unreachable fs_object
+	// (the deleted file stays in fs_objects until version retention expires), so
+	// there is no inline ref decrement here.
 
 	// Clean up file tags for the deleted file (async, non-blocking)
 	go h.cleanupFileTagsForPath(repoID, filePath)
@@ -2224,33 +2328,12 @@ type CopyFileRequest struct {
 	Filename interface{} `json:"filename" form:"filename"` // Can be string or []string for batch operations
 }
 
-func pinCopiedTreeBlockRefs(fsHelper *FSHelper, orgID, repoID, srcFSID string) ([]string, error) {
-	blockIDs, err := fsHelper.CollectBlockIDsRecursive(repoID, srcFSID)
-	if err != nil {
-		return nil, err
-	}
-	if len(blockIDs) == 0 {
-		return nil, nil
-	}
-	return fsHelper.IncrementBlockRefCountsTracked(orgID, blockIDs)
-}
-
-func rollbackCopiedTreeBlockRefs(fsHelper *FSHelper, orgID, operationKey string, blockIDs []string) {
-	if len(blockIDs) == 0 {
-		return
-	}
-	if zeroRefBlocks := fsHelper.DecrementBlockRefCountsOnce(orgID, operationKey, blockIDs); len(zeroRefBlocks) > 0 {
-		log.Printf("[copyRefRollback] WARNING: rollback %q drove %d blocks to zero refs", operationKey, len(zeroRefBlocks))
-	}
-}
-
 type copyItemResult struct {
-	itemName         string
-	commitID         string
-	deltaBytes       int64
-	deltaFiles       int64
-	replacedBlockIDs []string
-	skipped          bool
+	itemName   string
+	commitID   string
+	deltaBytes int64
+	deltaFiles int64
+	skipped    bool
 }
 
 func copyItemWithinRepoWithRetry(label string, fsHelper *FSHelper, orgID, userID, repoID, srcPath, dstDir, conflictPolicy string) (*copyItemResult, error) {
@@ -2323,14 +2406,6 @@ func copyItemWithinRepoWithRetry(label string, fsHelper *FSHelper, orgID, userID
 			}
 		}
 
-		var replacedBlockIDs []string
-		if replacedEntry != nil {
-			replacedBlockIDs, err = fsHelper.CollectBlockIDsRecursive(repoID, replacedEntry.ID)
-			if err != nil {
-				return fmt.Errorf("failed to collect replaced block IDs: %w", err)
-			}
-		}
-
 		dstNewEntries := AddEntryToList(dstDirEntries, copiedEntry)
 		newDstFSID, err := fsHelper.CreateDirectoryFSObject(repoID, dstNewEntries)
 		if err != nil {
@@ -2366,13 +2441,11 @@ func copyItemWithinRepoWithRetry(label string, fsHelper *FSHelper, orgID, userID
 			return fmt.Errorf("failed to create commit: %w", err)
 		}
 
-		pinnedBlockIDs, err := pinCopiedTreeBlockRefs(fsHelper, orgID, repoID, srcResult.TargetFSID)
-		if err != nil {
-			return fmt.Errorf("failed to increment block ref counts for copy: %w", err)
-		}
-
+		// Block references need no adjustment on copy: a same-repo copy shares the
+		// source's content-addressed fs_id (its reference already exists), and the
+		// replaced entry's old fs_object stays referenced from older commits until
+		// GC sweeps it. The new directory fs_objects carry no blocks.
 		if err := fsHelper.UpdateLibraryHeadFromSnapshot(snapshot, repoID, newCommitID, snapshot.HeadCommitID); err != nil {
-			rollbackCopiedTreeBlockRefs(fsHelper, orgID, "copy-rollback:"+newCommitID, pinnedBlockIDs)
 			return err
 		}
 
@@ -2380,7 +2453,6 @@ func copyItemWithinRepoWithRetry(label string, fsHelper *FSHelper, orgID, userID
 		result.commitID = newCommitID
 		result.deltaBytes = deltaBytes
 		result.deltaFiles = deltaFiles
-		result.replacedBlockIDs = replacedBlockIDs
 		result.skipped = false
 		return nil
 	})
@@ -2388,19 +2460,6 @@ func copyItemWithinRepoWithRetry(label string, fsHelper *FSHelper, orgID, userID
 		return nil, err
 	}
 	return result, nil
-}
-
-func scheduleCopyReplaceBlockCleanup(database *db.DB, fsHelper *FSHelper, orgID, repoID string, result *copyItemResult) {
-	if result == nil || result.skipped || len(result.replacedBlockIDs) == 0 {
-		return
-	}
-
-	commitID := result.commitID
-	blockIDs := append([]string(nil), result.replacedBlockIDs...)
-	go func() {
-		zeroRefBlocks := fsHelper.DecrementBlockRefCountsOnce(orgID, "copy-replace:"+commitID, blockIDs)
-		enqueueZeroRefBlocks(database, orgID, repoID, zeroRefBlocks)
-	}()
 }
 
 // CopyFile copies a file to a new location
@@ -2558,7 +2617,6 @@ func (h *FileHandler) CopyFile(c *gin.Context) {
 	}
 
 	if !copyResult.skipped {
-		scheduleCopyReplaceBlockCleanup(h.db, fsHelper, orgID, repoID, copyResult)
 		if !applyStorageCounterDelta(c, h.db, orgID, userID, repoID, copyResult.deltaBytes, copyResult.deltaFiles) {
 			return
 		}
@@ -2736,8 +2794,12 @@ func (h *FileHandler) UploadFile(c *gin.Context) {
 	}
 	defer file.Close()
 
-	content, err := io.ReadAll(file)
+	content, err := httputil.ReadAllWithLimit(file, header.Size, httputil.SingleShotUploadReadLimitBytes)
 	if err != nil {
+		if errors.Is(err, httputil.ErrReadLimitExceeded) {
+			c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "single-shot upload exceeds 1 GiB limit; use chunked upload"})
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read file"})
 		return
 	}
@@ -2745,6 +2807,7 @@ func (h *FileHandler) UploadFile(c *gin.Context) {
 	filename := header.Filename
 
 	fsHelper := NewFSHelper(h.db)
+	uploadOperationID := uuid.NewString()
 
 	// Get the current visible storage delta before storing the block so quota is
 	// enforced against the live directory state (replace vs autorename).
@@ -2809,35 +2872,28 @@ func (h *FileHandler) UploadFile(c *gin.Context) {
 		return
 	}
 
-	// Create SHA-1 → SHA-256 mapping (dual-write: forward + reverse)
-	if err := h.db.Session().Query(
-		`INSERT INTO block_id_mappings (org_id, external_id, internal_id) VALUES (?, ?, ?)`,
-		orgID, fileID, sha256ID,
-	).Exec(); err != nil {
-		log.Printf("[UploadFile] CRITICAL: failed to write block_id_mapping org=%s: %v", orgID, err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create block mapping"})
-		return
-	}
-	if err := h.db.Session().Query(
-		`INSERT INTO block_id_mappings_by_internal (org_id, internal_id, external_id, created_at) VALUES (?, ?, ?, toTimestamp(now()))`,
-		orgID, sha256ID, fileID,
-	).Exec(); err != nil {
-		log.Printf("[UploadFile] WARNING: failed to write reverse block_id_mapping: %v", err)
-	}
-
-	// Increment/create block ref_count in blocks table
-	if err := fsHelper.IncrementOrCreateBlock(orgID, sha256ID, len(storedContent), storageClass, ""); err != nil {
-		log.Printf("[UploadFile] CRITICAL: failed to register block metadata org=%s block=%s: %v", orgID, sha256ID[:16], err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to store block metadata"})
+	// Register block metadata + a provisional reference (kept alive by TTL until
+	// the fs_object commit below creates the permanent reference), then write the
+	// external SHA-1 mapping only after the block is durable in Cassandra.
+	if err := RegisterUploadedBlockAndMapping(h.db, orgID, repoID, sha256ID, uploadOperationID, len(storedContent), storageClass, "", fileID); err != nil {
+		log.Printf("[UploadFile] CRITICAL: failed to materialize block org=%s block=%s ext=%s: %v", orgID, sha256ID[:16], fileID[:16], err)
+		if errors.Is(err, ErrBlockDeleteInProgress) {
+			writeUploadFileError(c, err)
+		} else if errors.Is(err, ErrBlockMappingWriteFailed) {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create block mapping"})
+		} else {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to store block metadata"})
+		}
 		return
 	}
 
 	actualFilename, storageDeltaBytes, storageDeltaFiles, err := h.finalizeStoredUploadMetadata(orgID, userID, repoID, parentDir, filename, fileID, fileSize, replace)
 	if err != nil {
-		handleStoredUploadMetadataError(h.db, orgID, repoID, fileID, []string{sha256ID}, err)
+		handleStoredUploadMetadataError(h.db, orgID, repoID, uploadOperationID, []string{sha256ID}, err)
 		writeUploadFileError(c, err)
 		return
 	}
+	ReleaseUploadedBlockRefs(h.db, orgID, repoID, uploadOperationID, []string{sha256ID})
 
 	// Record traffic (fire-and-forget)
 	if rec := traffic.Get(); rec != nil {
@@ -2862,6 +2918,8 @@ func writeUploadFileError(c *gin.Context, err error) {
 		// in frontend/src/utils/upload-finalization.js). Keep the wording in
 		// sync across both places.
 		c.JSON(http.StatusConflict, gin.H{"error": "library was modified concurrently; retry the upload"})
+	case errors.Is(err, ErrBlockDeleteInProgress):
+		c.JSON(http.StatusConflict, gin.H{"error": "block is being deleted; retry the upload"})
 	case errors.Is(err, errUploadStorageQuotaExceeded):
 		c.JSON(http.StatusForbidden, gin.H{"error": "storage quota exceeded"})
 	default:
@@ -2985,10 +3043,12 @@ func (h *FileHandler) finalizeStoredUploadMetadataOnce(fsHelper *FSHelper, orgID
 		}
 	}
 
-	fileFSID, err := fsHelper.CreateFileFSObject(repoID, actualFilename, fileSize, []string{fileID})
+	blockIDs := []string{fileID}
+	pendingFile, err := newPendingPublishedFile(actualFilename, blockIDs, fileSize)
 	if err != nil {
 		return "", 0, 0, fmt.Errorf("failed to create file metadata: %w", err)
 	}
+	fileFSID := pendingFile.fsID
 
 	newEntry := FSEntry{
 		ID:    fileFSID,
@@ -3027,13 +3087,56 @@ func (h *FileHandler) finalizeStoredUploadMetadataOnce(fsHelper *FSHelper, orgID
 	}
 
 	description := fmt.Sprintf("Added or modified \"%s\".\n", actualFilename)
-	newCommitID, err := fsHelper.CreateCommit(repoID, userID, newRootFSID, snapshot.HeadCommitID, description)
-	if err != nil {
-		return "", 0, 0, fmt.Errorf("failed to create commit: %w", err)
+	pendingFiles := []*pendingPublishedFile{pendingFile}
+	commitCreatedAt := time.Now().UTC()
+	newCommitID := buildCommitID(repoID, newRootFSID, description, commitCreatedAt)
+	if err := fsHelper.stagePendingPublishedFiles(orgID, repoID, newCommitID, pendingFiles); err != nil {
+		if cleanupErr := CleanupFailedPublishAttempt(h.db, orgID, repoID, newCommitID, newCommitID, pendingFiles); cleanupErr != nil {
+			return "", 0, 0, errors.Join(
+				fmt.Errorf("failed to stage publish-attempt block references for commit %s: %w", newCommitID, err),
+				fmt.Errorf("cleanup failed publish commit %s: %w", newCommitID, cleanupErr),
+			)
+		}
+		return "", 0, 0, fmt.Errorf("failed to stage publish-attempt block references for commit %s: %w", newCommitID, err)
+	}
+	if err := queuePendingPublishedFileRepairs(h.db, orgID, repoID, newCommitID, pendingFiles); err != nil {
+		cleanupErr := CleanupFailedPublishAttempt(h.db, orgID, repoID, newCommitID, newCommitID, pendingFiles)
+		clearErr := clearPendingPublishedFileRepairs(h.db, orgID, repoID, newCommitID, pendingFiles)
+		return "", 0, 0, errors.Join(
+			fmt.Errorf("failed to queue durable publish repair for commit %s: %w", newCommitID, err),
+			cleanupErr,
+			clearErr,
+		)
+	}
+	if err := fsHelper.insertCommit(repoID, newCommitID, userID, newRootFSID, snapshot.HeadCommitID, description, commitCreatedAt); err != nil {
+		cleanupErr := CleanupFailedPublishAttempt(h.db, orgID, repoID, newCommitID, newCommitID, pendingFiles)
+		clearErr := clearPendingPublishedFileRepairs(h.db, orgID, repoID, newCommitID, pendingFiles)
+		return "", 0, 0, errors.Join(
+			fmt.Errorf("failed to create commit: %w", err),
+			cleanupErr,
+			clearErr,
+		)
 	}
 
 	if err := fsHelper.UpdateLibraryHeadFromSnapshot(snapshot, repoID, newCommitID, snapshot.HeadCommitID); err != nil {
+		if errors.Is(err, ErrLibraryHeadConflict) {
+			if cleanupErr := CleanupFailedPublishAttempt(h.db, orgID, repoID, newCommitID, newCommitID, pendingFiles); cleanupErr != nil {
+				return "", 0, 0, fmt.Errorf("failed to clean up conflict publish attempt %s: %w", newCommitID, cleanupErr)
+			}
+			if clearErr := clearPendingPublishedFileRepairs(h.db, orgID, repoID, newCommitID, pendingFiles); clearErr != nil {
+				log.Printf("[UploadFile] WARNING: failed to clear queued publish repair for repo=%s commit=%s fs_object=%s after head conflict: %v", repoID, newCommitID, pendingFile.fsID, clearErr)
+			}
+		}
 		return "", 0, 0, fmt.Errorf("failed to update library: %w", err)
+	}
+	if ownerErr := clearPendingPublishedFileOwnersFn(h.db, repoID, pendingFiles); ownerErr != nil {
+		log.Printf("[UploadFile] WARNING: published repo=%s commit=%s but failed to clear pending fs_object owners: %v", repoID, newCommitID, ownerErr)
+	}
+	if err := fsHelper.promotePendingPublishedFiles(orgID, repoID, newCommitID, pendingFiles); err != nil {
+		log.Printf("[UploadFile] WARNING: head updated for repo=%s commit=%s but failed to promote block references for fs_object %s: %v", repoID, newCommitID, fileFSID, err)
+		schedulePendingPublishedFileRepairs(h.db, orgID, repoID, newCommitID, pendingFiles, "UploadFile")
+	} else if clearErr := clearPendingPublishedFileRepairs(h.db, orgID, repoID, newCommitID, pendingFiles); clearErr != nil {
+		log.Printf("[UploadFile] WARNING: published repo=%s commit=%s but failed to clear queued publish repair for fs_object %s: %v", repoID, newCommitID, pendingFile.fsID, clearErr)
 	}
 
 	return actualFilename, storageDeltaBytes, storageDeltaFiles, nil
@@ -3096,7 +3199,6 @@ func (h *FileHandler) copyBatchFiles(c *gin.Context, srcPaths []string, srcRepoI
 		}
 
 		if !copyOutcome.skipped {
-			scheduleCopyReplaceBlockCleanup(h.db, fsHelper, orgID, repoID, copyOutcome)
 			if !applyStorageCounterDelta(c, h.db, orgID, userID, repoID, copyOutcome.deltaBytes, copyOutcome.deltaFiles) {
 				return
 			}
@@ -4595,10 +4697,7 @@ func (h *FileHandler) BatchDeleteItems(c *gin.Context) {
 
 	fsHelper := NewFSHelper(h.db)
 
-	// Lookup library storage class before the async operation
-	libraryClass := h.lookupLibraryStorageClass(orgID, req.RepoID)
 	var deletedEntries []FSEntry
-	var newCommitID string
 	var responseCommitID string
 
 	err := retryLibraryHeadMutation("BatchDeleteItems", func() error {
@@ -4643,7 +4742,6 @@ func (h *FileHandler) BatchDeleteItems(c *gin.Context) {
 		if len(currentDeletedNames) == 0 {
 			responseCommitID = snapshot.HeadCommitID
 			deletedEntries = nil
-			newCommitID = ""
 			return nil
 		}
 
@@ -4674,7 +4772,6 @@ func (h *FileHandler) BatchDeleteItems(c *gin.Context) {
 		}
 
 		deletedEntries = append([]FSEntry(nil), currentDeletedEntries...)
-		newCommitID = commitID
 		responseCommitID = commitID
 		return nil
 	})
@@ -4700,10 +4797,11 @@ func (h *FileHandler) BatchDeleteItems(c *gin.Context) {
 		return
 	}
 
-	// Clean up file tags and decrement storage counters for all deleted items (async, non-blocking)
+	// Clean up file tags and decrement storage counters for all deleted items (async, non-blocking).
+	// Block references are released when GC sweeps the now-unreachable fs_objects
+	// (they stay in fs_objects until version retention expires), so there is no
+	// inline ref decrement here.
 	go func() {
-		var allDeletedBlockIDs []string
-
 		for _, entry := range deletedEntries {
 			deletedPath := path.Join(parentDir, entry.Name)
 
@@ -4714,23 +4812,10 @@ func (h *FileHandler) BatchDeleteItems(c *gin.Context) {
 				h.cleanupFileTagsForPath(req.RepoID, deletedPath)
 			}
 
-			// Collect stats and block IDs
-			blocks, totalSize, fileCount, err := fsHelper.collectDirStats(req.RepoID, entry.ID)
-			if err == nil {
-				if len(blocks) > 0 {
-					allDeletedBlockIDs = append(allDeletedBlockIDs, blocks...)
-				}
-				if totalSize > 0 || fileCount > 0 {
-					traffic.DecrementStorageCounters(h.db, orgID, userID, req.RepoID, totalSize, fileCount)
-				}
-			}
-		}
-
-		// Enqueue blocks to Garbage Collector
-		if len(allDeletedBlockIDs) > 0 {
-			zeroRefBlocks := fsHelper.DecrementBlockRefCountsOnce(orgID, newCommitID, allDeletedBlockIDs)
-			if len(zeroRefBlocks) > 0 && h.gcEnqueuer != nil {
-				h.gcEnqueuer.EnqueueBlocks(orgID, zeroRefBlocks, libraryClass)
+			// Update storage-quota counters for the deletion.
+			_, totalSize, fileCount, err := fsHelper.collectDirStats(req.RepoID, entry.ID)
+			if err == nil && (totalSize > 0 || fileCount > 0) {
+				traffic.DecrementStorageCounters(h.db, orgID, userID, req.RepoID, totalSize, fileCount)
 			}
 		}
 	}()

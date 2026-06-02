@@ -6,6 +6,7 @@ import (
 	"log"
 	"net/http"
 	"path"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -95,6 +96,39 @@ func movedItemTagMutation(srcPath, dstDir, itemName string, movedEntry *FSEntry)
 	return normalizePath(srcPath), normalizePath(path.Join(dstDir, itemName)), isDirectoryEntry(movedEntry)
 }
 
+var loadZeroRefBlockStorageClassesFn = loadZeroRefBlockStorageClasses
+
+func loadZeroRefBlockStorageClasses(database *db.DB, orgID string, blockIDs []string) (map[string][]string, error) {
+	grouped := make(map[string][]string)
+	seen := make(map[string]struct{}, len(blockIDs))
+	var loadErr error
+	for _, blockID := range blockIDs {
+		blockID = strings.TrimSpace(blockID)
+		if blockID == "" {
+			continue
+		}
+		if _, dup := seen[blockID]; dup {
+			continue
+		}
+		seen[blockID] = struct{}{}
+
+		var storageClass string
+		if err := database.Session().Query(`
+			SELECT storage_class FROM blocks WHERE org_id = ? AND block_id = ?
+		`, orgID, blockID).Scan(&storageClass); err != nil {
+			loadErr = errors.Join(loadErr, fmt.Errorf("load storage class for block %s: %w", blockID, err))
+			continue
+		}
+		storageClass = strings.TrimSpace(storageClass)
+		if storageClass == "" {
+			loadErr = errors.Join(loadErr, fmt.Errorf("load storage class for block %s: empty canonical storage class", blockID))
+			continue
+		}
+		grouped[storageClass] = append(grouped[storageClass], blockID)
+	}
+	return grouped, loadErr
+}
+
 func runSameRepoMoveTagMutation(database *db.DB, repoID, oldPath, newPath string, moveByPrefix bool, replacedCleanupPath string, replacedCleanupByPrefix bool) {
 	if replacedCleanupPath != "" {
 		if replacedCleanupByPrefix {
@@ -122,14 +156,21 @@ func enqueueZeroRefBlocks(database *db.DB, orgID, repoID string, blockIDs []stri
 		return
 	}
 
-	var storageClass string
-	if err := database.Session().Query(`
-		SELECT storage_class FROM libraries WHERE org_id = ? AND library_id = ?
-	`, orgID, repoID).Scan(&storageClass); err != nil {
-		log.Printf("[enqueueZeroRefBlocks] failed to load storage class for repo %s: %v", repoID, err)
+	grouped, err := loadZeroRefBlockStorageClassesFn(database, orgID, blockIDs)
+	if err != nil {
+		log.Printf("[enqueueZeroRefBlocks] failed to load canonical block storage classes for repo %s: %v", repoID, err)
+	}
+	if len(grouped) == 0 {
 		return
 	}
-	blockEnqueuer.EnqueueBlocks(orgID, blockIDs, storageClass)
+	classes := make([]string, 0, len(grouped))
+	for storageClass := range grouped {
+		classes = append(classes, storageClass)
+	}
+	sort.Strings(classes)
+	for _, storageClass := range classes {
+		blockEnqueuer.EnqueueBlocks(orgID, grouped[storageClass], storageClass)
+	}
 }
 
 func batchOperationErrorResponse(err error, opType, itemName string) (int, gin.H, string) {
@@ -470,15 +511,11 @@ func (h *BatchOperationHandler) processSingleItem(orgID, userID, srcRepoID, dstR
 	sourceRemovalPublished := false
 	replacedTagCleanupPath := ""
 	replacedTagCleanupByPrefix := false
-	replacedBlockIDs := []string(nil)
-	destinationCommitID := ""
 
 	err := retryLibraryHeadMutation("BatchOperationDestination", func() error {
 		currentItemName := path.Base(srcPath)
 		replacedTagCleanupPath = ""
 		replacedTagCleanupByPrefix = false
-		replacedBlockIDs = nil
-		destinationCommitID = ""
 
 		srcSnapshot, err := fsHelper.GetLibraryHeadSnapshot(srcRepoID)
 		if err != nil {
@@ -544,10 +581,9 @@ func (h *BatchOperationHandler) processSingleItem(orgID, userID, srcRepoID, dstR
 			if err != nil {
 				return fmt.Errorf("failed to compute replaced entry size: %w", err)
 			}
-			replacedBlockIDs, err = fsHelper.CollectBlockIDsRecursive(dstRepoID, replacedEntry.ID)
-			if err != nil {
-				return fmt.Errorf("failed to collect replaced entry blocks: %w", err)
-			}
+			// The replaced entry's old fs_object stays in fs_objects (reachable from
+			// older commits) and its block references are released when GC sweeps it.
+			// No explicit block-reference removal here.
 		}
 
 		dstDeltaBytes := currentSrcSize - oldDstSize
@@ -565,9 +601,17 @@ func (h *BatchOperationHandler) processSingleItem(orgID, userID, srcRepoID, dstR
 		}
 
 		entryFSID := srcResult.TargetEntry.ID
+		var pendingCopiedFiles []*pendingPublishedFile
+		cleanupPendingCopyPublish := func() {
+			if cleanupErr := CleanupFailedPublishAttempt(h.db, orgID, dstRepoID, "", "", pendingCopiedFiles); cleanupErr != nil {
+				log.Printf("[processSingleItem] WARNING: failed to clean up pending copied fs_objects before commit publish: %v", cleanupErr)
+			}
+		}
 		if srcRepoID != dstRepoID {
-			newFSID, err := fsHelper.CopyFSObjectToLibrary(srcRepoID, dstRepoID, srcResult.TargetEntry.ID)
+			newFSID, copiedFiles, err := fsHelper.copyFSObjectToLibraryForPublish(srcRepoID, dstRepoID, srcResult.TargetEntry.ID)
+			pendingCopiedFiles = copiedFiles
 			if err != nil {
+				cleanupPendingCopyPublish()
 				return fmt.Errorf("failed to copy fs_objects to destination library: %w", err)
 			}
 			entryFSID = newFSID
@@ -584,6 +628,7 @@ func (h *BatchOperationHandler) processSingleItem(orgID, userID, srcRepoID, dstR
 
 		newDstDirFSID, err := fsHelper.CreateDirectoryFSObject(dstRepoID, newDstEntries)
 		if err != nil {
+			cleanupPendingCopyPublish()
 			return fmt.Errorf("failed to update destination directory: %w", err)
 		}
 
@@ -602,11 +647,13 @@ func (h *BatchOperationHandler) processSingleItem(orgID, userID, srcRepoID, dstR
 
 			newParentFSID, err := fsHelper.CreateDirectoryFSObject(dstRepoID, updatedParentEntries)
 			if err != nil {
+				cleanupPendingCopyPublish()
 				return fmt.Errorf("failed to update destination parent: %w", err)
 			}
 
 			newDstRootFSID, err = fsHelper.RebuildPathToRoot(dstRepoID, dstResult, newParentFSID)
 			if err != nil {
+				cleanupPendingCopyPublish()
 				return fmt.Errorf("failed to rebuild destination path: %w", err)
 			}
 		}
@@ -618,19 +665,59 @@ func (h *BatchOperationHandler) processSingleItem(orgID, userID, srcRepoID, dstR
 			dstDescription = fmt.Sprintf("Moved \"%s\"", currentItemName)
 		}
 
-		newDstCommitID, err := fsHelper.CreateCommit(dstRepoID, userID, newDstRootFSID, dstSnapshot.HeadCommitID, dstDescription)
-		if err != nil {
-			return fmt.Errorf("failed to create destination commit: %w", err)
+		commitCreatedAt := time.Now().UTC()
+		newDstCommitID := buildCommitID(dstRepoID, newDstRootFSID, dstDescription, commitCreatedAt)
+		if len(pendingCopiedFiles) > 0 {
+			if err := fsHelper.stagePendingPublishedFiles(orgID, dstRepoID, newDstCommitID, pendingCopiedFiles); err != nil {
+				if cleanupErr := CleanupFailedPublishAttempt(h.db, orgID, dstRepoID, newDstCommitID, newDstCommitID, pendingCopiedFiles); cleanupErr != nil {
+					return errors.Join(
+						fmt.Errorf("failed to stage destination publish-attempt refs for commit %s: %w", newDstCommitID, err),
+						fmt.Errorf("cleanup failed publish commit %s: %w", newDstCommitID, cleanupErr),
+					)
+				}
+				return fmt.Errorf("failed to stage destination publish-attempt refs for commit %s: %w", newDstCommitID, err)
+			}
+			if err := queuePendingPublishedFileRepairs(h.db, orgID, dstRepoID, newDstCommitID, pendingCopiedFiles); err != nil {
+				cleanupErr := CleanupFailedPublishAttempt(h.db, orgID, dstRepoID, newDstCommitID, newDstCommitID, pendingCopiedFiles)
+				clearErr := clearPendingPublishedFileRepairs(h.db, orgID, dstRepoID, newDstCommitID, pendingCopiedFiles)
+				return errors.Join(
+					fmt.Errorf("failed to queue durable publish repair for destination commit %s: %w", newDstCommitID, err),
+					cleanupErr,
+					clearErr,
+				)
+			}
 		}
-
-		pinnedBlockIDs, err := pinCopiedTreeBlockRefs(fsHelper, orgID, dstRepoID, entryFSID)
-		if err != nil {
-			return fmt.Errorf("failed to increment block ref counts for cross-library %s: %w", opType, err)
+		if err := fsHelper.insertCommit(dstRepoID, newDstCommitID, userID, newDstRootFSID, dstSnapshot.HeadCommitID, dstDescription, commitCreatedAt); err != nil {
+			cleanupErr := CleanupFailedPublishAttempt(h.db, orgID, dstRepoID, newDstCommitID, newDstCommitID, pendingCopiedFiles)
+			clearErr := clearPendingPublishedFileRepairs(h.db, orgID, dstRepoID, newDstCommitID, pendingCopiedFiles)
+			return errors.Join(
+				fmt.Errorf("failed to create destination commit: %w", err),
+				cleanupErr,
+				clearErr,
+			)
 		}
 
 		if err := fsHelper.UpdateLibraryHeadFromSnapshot(dstSnapshot, dstRepoID, newDstCommitID, dstSnapshot.HeadCommitID); err != nil {
-			rollbackCopiedTreeBlockRefs(fsHelper, orgID, opType+"-rollback:"+newDstCommitID, pinnedBlockIDs)
+			if len(pendingCopiedFiles) > 0 && errors.Is(err, ErrLibraryHeadConflict) {
+				if cleanupErr := CleanupFailedPublishAttempt(h.db, orgID, dstRepoID, newDstCommitID, newDstCommitID, pendingCopiedFiles); cleanupErr != nil {
+					return fmt.Errorf("failed to clean up conflict copy publish attempt %s: %w", newDstCommitID, cleanupErr)
+				}
+				if clearErr := clearPendingPublishedFileRepairs(h.db, orgID, dstRepoID, newDstCommitID, pendingCopiedFiles); clearErr != nil {
+					log.Printf("[processSingleItem] WARNING: failed to clear queued publish repairs for repo=%s commit=%s after head conflict: %v", dstRepoID, newDstCommitID, clearErr)
+				}
+			}
 			return fmt.Errorf("failed to update destination library: %w", err)
+		}
+		if len(pendingCopiedFiles) > 0 {
+			if ownerErr := clearPendingPublishedFileOwnersFn(h.db, dstRepoID, pendingCopiedFiles); ownerErr != nil {
+				log.Printf("[processSingleItem] WARNING: published repo=%s commit=%s but failed to clear pending copied fs_object owners: %v", dstRepoID, newDstCommitID, ownerErr)
+			}
+			if err := fsHelper.promotePendingPublishedFiles(orgID, dstRepoID, newDstCommitID, pendingCopiedFiles); err != nil {
+				log.Printf("[processSingleItem] WARNING: head updated for repo=%s commit=%s but failed to promote copied block references: %v", dstRepoID, newDstCommitID, err)
+				schedulePendingPublishedFileRepairs(h.db, orgID, dstRepoID, newDstCommitID, pendingCopiedFiles, "BatchOperationDestination")
+			} else if clearErr := clearPendingPublishedFileRepairs(h.db, orgID, dstRepoID, newDstCommitID, pendingCopiedFiles); clearErr != nil {
+				log.Printf("[processSingleItem] WARNING: published repo=%s commit=%s but failed to clear queued publish repairs: %v", dstRepoID, newDstCommitID, clearErr)
+			}
 		}
 
 		replacedTagCleanupPath, replacedTagCleanupByPrefix = replacedDestinationTagCleanup(dstDir, currentItemName, replacedEntry)
@@ -642,7 +729,6 @@ func (h *BatchOperationHandler) processSingleItem(orgID, userID, srcRepoID, dstR
 		itemName = currentItemName
 		srcSize = currentSrcSize
 		srcFiles = currentSrcFiles
-		destinationCommitID = newDstCommitID
 		return nil
 	})
 	if err != nil {
@@ -657,12 +743,6 @@ func (h *BatchOperationHandler) processSingleItem(orgID, userID, srcRepoID, dstR
 		} else {
 			go CleanupFileTagsByPath(h.db, dstRepoID, replacedTagCleanupPath)
 		}
-	}
-	if len(replacedBlockIDs) > 0 && destinationCommitID != "" {
-		go func(operationKey string, blockIDs []string) {
-			zeroRefBlocks := fsHelper.DecrementBlockRefCountsOnce(orgID, operationKey, blockIDs)
-			enqueueZeroRefBlocks(h.db, orgID, dstRepoID, zeroRefBlocks)
-		}(opType+"-replace:"+destinationCommitID, append([]string(nil), replacedBlockIDs...))
 	}
 
 	// For move operation, remove from source
@@ -769,26 +849,22 @@ func (h *BatchOperationHandler) processSameRepoMove(orgID, userID, repoID, srcPa
 	}
 
 	var itemName string
-	var moveCommitID string
 	var replacedTagCleanupPath string
 	var replacedTagCleanupByPrefix bool
 	var movedTagOldPath string
 	var movedTagNewPath string
 	var movedTagByPrefix bool
-	var replacedBlockIDs []string
 	var replacedSize int64
 	var replacedFiles int64
 	skipped := false
 
 	err := retryLibraryHeadMutation("BatchOperationSameRepoMove", func() error {
 		currentItemName := originalItemName
-		moveCommitID = ""
 		replacedTagCleanupPath = ""
 		replacedTagCleanupByPrefix = false
 		movedTagOldPath = ""
 		movedTagNewPath = ""
 		movedTagByPrefix = false
-		replacedBlockIDs = nil
 		replacedSize = 0
 		replacedFiles = 0
 		skipped = false
@@ -848,10 +924,8 @@ func (h *BatchOperationHandler) processSameRepoMove(orgID, userID, repoID, srcPa
 				if err != nil {
 					return nil, fmt.Errorf("failed to compute replaced entry size: %w", err)
 				}
-				replacedBlockIDs, err = fsHelper.CollectBlockIDsRecursive(repoID, replacedEntry.ID)
-				if err != nil {
-					return nil, fmt.Errorf("failed to collect replaced entry blocks: %w", err)
-				}
+				// The replaced entry's old fs_object stays referenced from older
+				// commits until GC sweeps it; no block-reference removal here.
 				replacedTagCleanupPath, replacedTagCleanupByPrefix = replacedDestinationTagCleanup(dstDir, currentItemName, replacedEntry)
 			}
 
@@ -877,7 +951,6 @@ func (h *BatchOperationHandler) processSameRepoMove(orgID, userID, repoID, srcPa
 		}
 
 		itemName = currentItemName
-		moveCommitID = newCommitID
 		return nil
 	})
 	if err != nil {
@@ -891,12 +964,6 @@ func (h *BatchOperationHandler) processSameRepoMove(orgID, userID, repoID, srcPa
 		if err := traffic.AdjustStorageCountersByDeltaSync(h.db, orgID, userID, repoID, -replacedSize, -replacedFiles); err != nil {
 			log.Printf("[processSameRepoMove] failed to apply replaced destination storage counter delta for %s -> %s/%s: %v", srcPath, repoID, dstDir, err)
 		}
-	}
-	if len(replacedBlockIDs) > 0 && moveCommitID != "" {
-		go func(operationKey string, blockIDs []string) {
-			zeroRefBlocks := fsHelper.DecrementBlockRefCountsOnce(orgID, operationKey, blockIDs)
-			enqueueZeroRefBlocks(h.db, orgID, repoID, zeroRefBlocks)
-		}("same-repo-move-replace:"+moveCommitID, append([]string(nil), replacedBlockIDs...))
 	}
 	log.Printf("[processSameRepoMove] moved %s to %s as %s", srcPath, dstDir, itemName)
 	return nil

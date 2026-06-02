@@ -62,6 +62,21 @@ func parseCASTime(value interface{}) time.Time {
 	return time.Time{}
 }
 
+func parseCASString(value interface{}) string {
+	switch v := value.(type) {
+	case string:
+		return v
+	case []byte:
+		return string(v)
+	case fmt.Stringer:
+		return v.String()
+	case nil:
+		return ""
+	default:
+		return fmt.Sprint(v)
+	}
+}
+
 func (s *CassandraStore) acquireHardDeleteLock(tableName, keyColumn string, keyValue, leaseToken uuid.UUID) (bool, error) {
 	now := time.Now().UTC()
 	existing := map[string]interface{}{}
@@ -126,6 +141,7 @@ const gcDeletedUsersCursorKey = "gc.scan.expired_deleted_users.last_deleted_day"
 const gcExpiredShareLinksCursorKey = "gc.scan.expired_share_links.last_expiry_day"
 const gcExpiredSharesCursorKey = "gc.scan.expired_shares.last_expiry_day"
 const gcBlockCandidatesCursorKey = "gc.scan.block_candidates.last_candidate_day"
+const gcProvisionalBlockRefsCursorKey = "gc.scan.provisional_block_refs.last_expiry_day"
 const gcS3OrphansCursorKey = "gc.scan.s3_orphans.last_first_seen_day"
 
 const (
@@ -862,20 +878,6 @@ func (s *CassandraStore) SumOrgQueueStats() (int, int, error) {
 	}
 	return totalQueue, totalFailed, nil
 }
-
-// MarkItemProcessed attempts to insert the taskID into the gc_processed_items table.
-// The table has a default TTL of 35 days so entries outlive failed-item retention.
-// Returns applied=true if this is the first time (safe to proceed), false if already processed.
-func (s *CassandraStore) MarkItemProcessed(taskID uuid.UUID) (bool, error) {
-	// USING TTL must come before IF NOT EXISTS in CQL syntax.
-	// We omit USING TTL here because the table already has default_time_to_live = 3024000.
-	var existingTaskID string
-	applied, err := s.db.Session().Query(`
-		INSERT INTO gc_processed_items (task_id) VALUES (?) IF NOT EXISTS
-	`, taskID.String()).ScanCAS(&existingTaskID)
-	return applied, err
-}
-
 func (s *CassandraStore) GetUserDeletedAt(orgID, userID uuid.UUID) (*time.Time, error) {
 	var status string
 	var deletedAt *time.Time
@@ -936,6 +938,22 @@ func (s *CassandraStore) upsertBlockGCCandidateProjection(orgID uuid.UUID, block
 	`, db.GCProjectionUTCDate(candidateAt), db.GCDiscoveryBucket(orgID.String(), blockID), candidateAt.UTC(), orgID.String(), blockID, storageClass).Exec()
 }
 
+func (s *CassandraStore) moveBlockGCCandidateProjection(orgID uuid.UUID, blockID, storageClass string, fromCandidateAt, toCandidateAt time.Time) error {
+	if fromCandidateAt.Equal(toCandidateAt) {
+		return s.upsertBlockGCCandidateProjection(orgID, blockID, storageClass, toCandidateAt)
+	}
+	batch := s.db.Session().Batch(gocql.LoggedBatch)
+	batch.Query(`
+		DELETE FROM gc_block_candidates_by_day
+		WHERE candidate_day = ? AND bucket = ? AND candidate_at = ? AND org_id = ? AND block_id = ?
+	`, db.GCProjectionUTCDate(fromCandidateAt), db.GCDiscoveryBucket(orgID.String(), blockID), fromCandidateAt.UTC(), orgID.String(), blockID)
+	batch.Query(`
+		INSERT INTO gc_block_candidates_by_day (candidate_day, bucket, candidate_at, org_id, block_id, storage_class)
+		VALUES (?, ?, ?, ?, ?, ?)
+	`, db.GCProjectionUTCDate(toCandidateAt), db.GCDiscoveryBucket(orgID.String(), blockID), toCandidateAt.UTC(), orgID.String(), blockID, storageClass)
+	return batch.Exec()
+}
+
 func casStringValue(row map[string]interface{}, key string) (string, error) {
 	value, ok := row[key]
 	if !ok || value == nil {
@@ -972,38 +990,68 @@ func casTimeValue(row map[string]interface{}, key string) (time.Time, error) {
 // EnsureBlockGCCandidate inserts a (org_id, block_id) row into the canonical
 // gc_block_candidates table if one does not already exist, and guarantees the
 // matching gc_block_candidates_by_day discovery row exists for the effective
-// candidate_at timestamp.
+// candidate_at timestamp. If a row already exists with a later candidate_at,
+// the earlier requested timestamp wins so explicit zero-ref enqueue paths are
+// not delayed behind a provisional upload's future TTL-based candidate.
 func (s *CassandraStore) EnsureBlockGCCandidate(orgID uuid.UUID, blockID, storageClass string, candidateAt time.Time) (time.Time, error) {
-	existing := map[string]interface{}{}
-	applied, err := s.db.Session().Query(`
-		INSERT INTO gc_block_candidates (org_id, block_id, storage_class, candidate_at)
-		VALUES (?, ?, ?, ?) IF NOT EXISTS
-	`, orgID.String(), blockID, storageClass, candidateAt).MapScanCAS(existing)
-	if err != nil {
-		return time.Time{}, err
-	}
 	effectiveCandidateAt := candidateAt.UTC()
-	effectiveStorageClass := storageClass
-	if !applied {
-		effectiveCandidateAt, err = casTimeValue(existing, "candidate_at")
+	if effectiveCandidateAt.IsZero() {
+		effectiveCandidateAt = time.Now().UTC()
+	}
+	for {
+		existing := map[string]interface{}{}
+		applied, err := s.db.Session().Query(`
+			INSERT INTO gc_block_candidates (org_id, block_id, storage_class, candidate_at)
+			VALUES (?, ?, ?, ?) IF NOT EXISTS
+		`, orgID.String(), blockID, storageClass, effectiveCandidateAt).MapScanCAS(existing)
 		if err != nil {
 			return time.Time{}, err
 		}
-		if effectiveCandidateAt.IsZero() {
+		if applied {
+			if err := s.upsertBlockGCCandidateProjection(orgID, blockID, storageClass, effectiveCandidateAt); err != nil {
+				return effectiveCandidateAt, fmt.Errorf("ensure gc_block_candidates_by_day discovery row for org=%s block=%s: %w", orgID, blockID, err)
+			}
+			return effectiveCandidateAt, nil
+		}
+
+		existingCandidateAt, err := casTimeValue(existing, "candidate_at")
+		if err != nil {
+			return time.Time{}, err
+		}
+		if existingCandidateAt.IsZero() {
 			return time.Time{}, fmt.Errorf("gc_block_candidates row for org=%s block=%s is missing candidate_at", orgID, blockID)
 		}
-		effectiveStorageClass, err = casStringValue(existing, "storage_class")
+		existingStorageClass, err := casStringValue(existing, "storage_class")
 		if err != nil {
 			return time.Time{}, err
 		}
-		if effectiveStorageClass == "" {
-			effectiveStorageClass = storageClass
+		if existingStorageClass == "" {
+			existingStorageClass = storageClass
 		}
+		if !effectiveCandidateAt.Before(existingCandidateAt) {
+			if err := s.upsertBlockGCCandidateProjection(orgID, blockID, existingStorageClass, existingCandidateAt); err != nil {
+				return existingCandidateAt, fmt.Errorf("ensure gc_block_candidates_by_day discovery row for org=%s block=%s: %w", orgID, blockID, err)
+			}
+			return existingCandidateAt, nil
+		}
+
+		updateState := map[string]interface{}{}
+		updated, err := s.db.Session().Query(`
+			UPDATE gc_block_candidates SET candidate_at = ?
+			WHERE org_id = ? AND block_id = ?
+			IF candidate_at = ?
+		`, effectiveCandidateAt, orgID.String(), blockID, existingCandidateAt).MapScanCAS(updateState)
+		if err != nil {
+			return time.Time{}, err
+		}
+		if !updated {
+			continue
+		}
+		if err := s.moveBlockGCCandidateProjection(orgID, blockID, existingStorageClass, existingCandidateAt, effectiveCandidateAt); err != nil {
+			return effectiveCandidateAt, fmt.Errorf("move gc_block_candidates_by_day discovery row for org=%s block=%s: %w", orgID, blockID, err)
+		}
+		return effectiveCandidateAt, nil
 	}
-	if err := s.upsertBlockGCCandidateProjection(orgID, blockID, effectiveStorageClass, effectiveCandidateAt); err != nil {
-		return effectiveCandidateAt, fmt.Errorf("ensure gc_block_candidates_by_day discovery row for org=%s block=%s: %w", orgID, blockID, err)
-	}
-	return effectiveCandidateAt, nil
 }
 
 // DeleteBlockGCCandidate removes both the canonical row and the matching
@@ -1066,6 +1114,64 @@ func (s *CassandraStore) ListBlockGCCandidatesByDay(day time.Time, bucket int) (
 		return nil, fmt.Errorf("failed to list block GC candidates for day=%s bucket=%d: %w", db.GCProjectionDateString(day), bucket, err)
 	}
 	return candidates, nil
+}
+
+func (s *CassandraStore) ListProvisionalBlockRefExpiriesByDay(day time.Time, bucket int) ([]ProvisionalBlockRefExpiryInfo, error) {
+	iter := s.db.Session().Query(`
+		SELECT expires_at, org_id, block_id, referrer, storage_class
+		FROM gc_provisional_block_refs_by_day
+		WHERE expiry_day = ? AND bucket = ?
+	`, db.GCProjectionUTCDate(day), bucket).Iter()
+	var out []ProvisionalBlockRefExpiryInfo
+	var expiresAt time.Time
+	var orgIDStr, blockID, referrer, storageClass string
+	for iter.Scan(&expiresAt, &orgIDStr, &blockID, &referrer, &storageClass) {
+		out = append(out, ProvisionalBlockRefExpiryInfo{
+			OrgID:        parseUUID(orgIDStr),
+			BlockID:      blockID,
+			Referrer:     referrer,
+			StorageClass: storageClass,
+			ExpiresAt:    expiresAt,
+		})
+	}
+	if err := iter.Close(); err != nil {
+		return nil, fmt.Errorf("failed to list provisional block ref expiries for day=%s bucket=%d: %w", db.GCProjectionDateString(day), bucket, err)
+	}
+	return out, nil
+}
+
+func (s *CassandraStore) GetProvisionalBlockRefExpiry(orgID uuid.UUID, blockID, referrer string) (ProvisionalBlockRefExpiryInfo, bool, error) {
+	var storageClass string
+	var expiresAt time.Time
+	if err := s.db.Session().Query(`
+		SELECT storage_class, expires_at
+		FROM gc_provisional_block_refs
+		WHERE org_id = ? AND block_id = ? AND referrer = ?
+	`, orgID.String(), blockID, referrer).Scan(&storageClass, &expiresAt); err != nil {
+		if errors.Is(err, gocql.ErrNotFound) {
+			return ProvisionalBlockRefExpiryInfo{}, false, nil
+		}
+		return ProvisionalBlockRefExpiryInfo{}, false, fmt.Errorf("failed to load provisional block ref expiry org=%s block=%s referrer=%s: %w", orgID, blockID, referrer, err)
+	}
+	return ProvisionalBlockRefExpiryInfo{
+		OrgID:        orgID,
+		BlockID:      blockID,
+		Referrer:     referrer,
+		StorageClass: storageClass,
+		ExpiresAt:    expiresAt.UTC(),
+	}, true, nil
+}
+
+func (s *CassandraStore) DeleteProvisionalBlockRefExpiryProjection(orgID uuid.UUID, blockID, referrer string, expiresAt time.Time) error {
+	expiresAt = expiresAt.UTC()
+	return s.db.Session().Query(`
+		DELETE FROM gc_provisional_block_refs_by_day
+		WHERE expiry_day = ? AND bucket = ? AND expires_at = ? AND org_id = ? AND block_id = ? AND referrer = ?
+	`, db.GCProjectionUTCDate(expiresAt), db.GCDiscoveryBucket(orgID.String(), blockID, referrer), expiresAt, orgID.String(), blockID, referrer).Exec()
+}
+
+func (s *CassandraStore) DeleteProvisionalBlockRefExpiry(orgID uuid.UUID, blockID, referrer string, expiresAt time.Time) error {
+	return s.db.DeleteProvisionalBlockReferenceExpiry(orgID.String(), blockID, referrer, expiresAt)
 }
 
 // --- S3 orphan recovery ---
@@ -1211,12 +1317,40 @@ func (s *CassandraStore) ListS3OrphansByDay(day time.Time, bucket int, limit int
 
 // --- Block operations ---
 
-func (s *CassandraStore) GetBlockRefCount(orgID uuid.UUID, blockID string) (int, error) {
-	var refCount int
+// BlockExists reports whether the canonical blocks row still exists.
+func (s *CassandraStore) BlockExists(orgID uuid.UUID, blockID string) (bool, error) {
+	var existing string
 	err := s.db.Session().Query(`
-		SELECT ref_count FROM blocks WHERE org_id = ? AND block_id = ?
-	`, orgID.String(), blockID).Scan(&refCount)
-	return refCount, err
+		SELECT block_id FROM blocks WHERE org_id = ? AND block_id = ?
+	`, orgID.String(), blockID).Scan(&existing)
+	if err != nil {
+		if errors.Is(err, gocql.ErrNotFound) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
+// BlockHasReferences reports whether any block_references row still exists.
+func (s *CassandraStore) BlockHasReferences(orgID uuid.UUID, blockID string) (bool, error) {
+	return s.db.BlockHasReferences(orgID.String(), blockID)
+}
+
+func (s *CassandraStore) GetBlockInfo(orgID uuid.UUID, blockID string) (BlockInfo, error) {
+	info := BlockInfo{BlockID: blockID}
+	err := s.db.Session().Query(`
+		SELECT storage_class FROM blocks WHERE org_id = ? AND block_id = ?
+	`, orgID.String(), blockID).Scan(&info.StorageClass)
+	if err != nil {
+		return BlockInfo{}, err
+	}
+	return info, nil
+}
+
+// RemoveBlockReference deletes one (block, referrer) reference row (idempotent).
+func (s *CassandraStore) RemoveBlockReference(orgID uuid.UUID, blockID, referrer string) error {
+	return s.db.RemoveBlockReference(orgID.String(), blockID, referrer)
 }
 
 // mappingResolveConcurrency bounds the number of in-flight single-row lookups
@@ -1306,71 +1440,80 @@ func resolveBlockIDsConcurrent(orgID uuid.UUID, blockIDs []string, maxConcurrenc
 	return resolved, nil
 }
 
-// ClaimBlockDelete atomically checks ref_count <= 0 and, if so, marks the row
-// with the GC sentinel (-999). The physical DELETE is deferred so the worker can
-// persist S3-recovery state before removing the canonical DB row.
-func (s *CassandraStore) ClaimBlockDelete(orgID uuid.UUID, blockID string) (bool, error) {
-	// Phase 1: Atomically claim the block for deletion via LWT.
-	// Setting ref_count to a sentinel value (-999) ensures that even if another
-	// process reads the row between phase 1 and 2, it won't treat it as valid.
-	var prevRefCount int
+// ClaimBlockDelete marks the block row gc_state='deleting' via LWT so writers
+// back off, deferring the physical DELETE until S3-recovery state is persisted.
+// This is the single expensive Paxos operation in the block lifecycle. claimID
+// is stable for one logical candidate so retries of the same item remain the
+// owner, but a different attempt cannot steal or release the claim.
+func (s *CassandraStore) readBlockDeleteClaimState(orgID uuid.UUID, blockID string) (string, string, error) {
+	var gcState string
+	var gcClaimID string
+	err := s.db.Session().Query(`
+		SELECT gc_state, gc_claim_id FROM blocks WHERE org_id = ? AND block_id = ?
+	`, orgID.String(), blockID).Scan(&gcState, &gcClaimID)
+	if err != nil {
+		if errors.Is(err, gocql.ErrNotFound) {
+			return "", "", nil
+		}
+		return "", "", err
+	}
+	return gcState, gcClaimID, nil
+}
+
+func (s *CassandraStore) ClaimBlockDelete(orgID uuid.UUID, blockID, claimID string) (bool, error) {
+	existing := map[string]interface{}{}
 	applied, err := s.db.Session().Query(`
-		UPDATE blocks SET ref_count = -999
+		UPDATE blocks SET gc_state = ?, gc_claim_id = ?, gc_claimed_at = ?
 		WHERE org_id = ? AND block_id = ?
-		IF ref_count <= 0
-	`, orgID.String(), blockID).ScanCAS(&prevRefCount)
+		IF gc_state != ?
+	`, db.BlockGCStateDeleting, claimID, time.Now().UTC(), orgID.String(), blockID, db.BlockGCStateDeleting).MapScanCAS(existing)
 	if err != nil {
 		return false, err
 	}
-	if !applied {
+	if applied {
+		return true, nil
+	}
+	gcState, gcClaimID, err := s.readBlockDeleteClaimState(orgID, blockID)
+	if err != nil {
+		return false, err
+	}
+	if gcState == "" && gcClaimID == "" {
 		return false, nil
 	}
-	return true, nil
+	return gcState == db.BlockGCStateDeleting && gcClaimID == claimID, nil
 }
 
-// FinalizeBlockDelete removes a block row that was previously claimed by GC.
-func (s *CassandraStore) FinalizeBlockDelete(orgID uuid.UUID, blockID string) error {
-	if err := s.db.Session().Query(`
-		DELETE FROM blocks WHERE org_id = ? AND block_id = ?
-	`, orgID.String(), blockID).Exec(); err != nil {
-		// If the DELETE fails, the row is left with ref_count = -999.
-		// The scanner will find it (ref_count <= 0) and re-enqueue for cleanup.
-		log.Printf("[GC Store] Warning: LWT succeeded but DELETE failed for block %s: %v", blockID, err)
+// ReleaseBlockClaim clears the gc_state claim when a concurrent reference appeared
+// between the claim and the verify step, so writers stop backing off.
+func (s *CassandraStore) ReleaseBlockClaim(orgID uuid.UUID, blockID, claimID string) error {
+	applied, err := s.db.Session().Query(`
+		UPDATE blocks SET gc_state = null, gc_claim_id = null, gc_claimed_at = null
+		WHERE org_id = ? AND block_id = ?
+		IF gc_state = ? AND gc_claim_id = ?
+	`, orgID.String(), blockID, db.BlockGCStateDeleting, claimID).MapScanCAS(map[string]interface{}{})
+	if err != nil {
 		return err
+	}
+	if !applied {
+		return fmt.Errorf("block delete claim release not applied for %s", blockID)
 	}
 	return nil
 }
 
-func (s *CassandraStore) DecrementBlockRefCount(orgID uuid.UUID, blockID string) (bool, error) {
-	const maxRetries = 5
-
-	for attempt := 0; attempt < maxRetries; attempt++ {
-		var currentRefCount int
-		err := s.db.Session().Query(`
-			SELECT ref_count FROM blocks WHERE org_id = ? AND block_id = ?
-		`, orgID.String(), blockID).Scan(&currentRefCount)
-		if err != nil {
-			return false, err
-		}
-
-		if currentRefCount <= 0 {
-			return false, nil
-		}
-
-		newRefCount := currentRefCount - 1
-		applied, err := s.db.Session().Query(`
-			UPDATE blocks SET ref_count = ?, last_accessed = ?
-			WHERE org_id = ? AND block_id = ? IF ref_count = ?
-		`, newRefCount, time.Now().UTC(), orgID.String(), blockID, currentRefCount).MapScanCAS(map[string]interface{}{})
-		if err != nil {
-			return false, err
-		}
-		if applied {
-			return newRefCount == 0, nil
-		}
+// FinalizeBlockDelete removes a block row that was previously claimed by GC.
+func (s *CassandraStore) FinalizeBlockDelete(orgID uuid.UUID, blockID, claimID string) error {
+	applied, err := s.db.Session().Query(`
+		DELETE FROM blocks WHERE org_id = ? AND block_id = ?
+		IF gc_state = ? AND gc_claim_id = ?
+	`, orgID.String(), blockID, db.BlockGCStateDeleting, claimID).MapScanCAS(map[string]interface{}{})
+	if err != nil {
+		log.Printf("[GC Store] Warning: claim succeeded but conditional DELETE failed for block %s: %v", blockID, err)
+		return err
 	}
-
-	return false, fmt.Errorf("decrement block ref_count for %s/%s: CAS retry limit reached", orgID, blockID)
+	if !applied {
+		return fmt.Errorf("block delete finalize not applied for %s", blockID)
+	}
+	return nil
 }
 
 func (s *CassandraStore) ListBlockMappingsByInternalID(orgID uuid.UUID, internalID string) ([]BlockMapping, error) {

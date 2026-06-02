@@ -218,7 +218,9 @@ func TestWorker_ProcessBlock_RefCountZeroButLiveFSObjectReferenceSkipsDelete(t *
 	libraryID := uuid.New()
 	store.AddLibrary(orgID, libraryID, "hot")
 	store.AddBlock(orgID, "partial-zero", "hot", 0)
-	store.AddBlock(orgID, "not-yet-decremented", "hot", 1)
+	store.AddFSObjectReferenceForTest(orgID, "partial-zero", libraryID, "fs-partial")
+	store.AddBlock(orgID, "not-yet-decremented", "hot", 0)
+	store.AddFSObjectReferenceForTest(orgID, "not-yet-decremented", libraryID, "fs-partial")
 	store.AddFSObject(libraryID, "fs-partial", "file", []string{"partial-zero", "not-yet-decremented"})
 	store.EnqueueItem(orgID, time.Now().Add(-2*time.Hour), ItemBlock, "partial-zero", uuid.Nil, "hot", 0)
 
@@ -237,6 +239,42 @@ func TestWorker_ProcessBlock_RefCountZeroButLiveFSObjectReferenceSkipsDelete(t *
 	}
 }
 
+func TestWorker_ProcessBlock_UsesCanonicalStorageClassForDeleteTracking(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	w := NewWorker(store, nil, q, 100, 0, false, stats)
+
+	orgID := uuid.New()
+	store.AddOrganization(orgID)
+	store.AddBlock(orgID, "block-canonical-cold", "cold-tier", 0)
+	queuedAt := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
+	if err := store.EnqueueItem(orgID, queuedAt, ItemBlock, "block-canonical-cold", uuid.Nil, "hot-tier", 0); err != nil {
+		t.Fatalf("EnqueueItem() error = %v", err)
+	}
+
+	n, err := w.ProcessOnce(context.Background())
+	if err != nil {
+		t.Fatalf("ProcessOnce() error = %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("ProcessOnce() processed = %d, want 1", n)
+	}
+	if store.GetBlock(orgID, "block-canonical-cold") != nil {
+		t.Fatal("expected block row to be finalized from DB")
+	}
+	orphans := store.AllS3Orphans()
+	if len(orphans) != 1 {
+		t.Fatalf("AllS3Orphans() len = %d, want 1", len(orphans))
+	}
+	if orphans[0].BlockID != "block-canonical-cold" {
+		t.Fatalf("orphan block = %q, want block-canonical-cold", orphans[0].BlockID)
+	}
+	if orphans[0].StorageClass != "cold-tier" {
+		t.Fatalf("orphan storage_class = %q, want cold-tier", orphans[0].StorageClass)
+	}
+}
+
 func TestWorker_ProcessBlock_LiveFSObjectReferenceViaMappedIDSkipsDelete(t *testing.T) {
 	store := NewMockStore()
 	sp := &MockStorageProvider{}
@@ -250,6 +288,9 @@ func TestWorker_ProcessBlock_LiveFSObjectReferenceViaMappedIDSkipsDelete(t *test
 	store.AddBlock(orgID, "internal-block", "hot", 0)
 	externalBlockID := "0123456789abcdef0123456789abcdef01234567"
 	store.AddBlockMapping(orgID, externalBlockID, "internal-block")
+	// The fs_object's reference is stored against the resolved internal ID (the
+	// SHA-1→SHA-256 resolution happens at registration time, not at GC time).
+	store.AddFSObjectReferenceForTest(orgID, "internal-block", libraryID, "fs-mapped")
 	store.AddFSObject(libraryID, "fs-mapped", "file", []string{externalBlockID})
 	store.EnqueueItem(orgID, time.Now().Add(-2*time.Hour), ItemBlock, "internal-block", uuid.Nil, "hot", 0)
 
@@ -327,8 +368,8 @@ func TestWorker_ProcessFSObject_DryRunLeavesQueueAndRefsUntouched(t *testing.T) 
 	if items := store.QueueItems(orgID); items[0].ItemID != "fs-root" || items[0].ItemType != ItemFSObject {
 		t.Fatalf("dry run should not enqueue children, got %#v", items)
 	}
-	if block := store.GetBlock(orgID, "blk-live"); block == nil || block.RefCount != 2 {
-		t.Fatalf("dry run should not decrement block ref_count, got %#v", block)
+	if block := store.GetBlock(orgID, "blk-live"); block == nil || store.BlockReferenceCount(orgID, "blk-live") != 2 {
+		t.Fatalf("dry run should not remove block references, got %#v refs=%d", block, store.BlockReferenceCount(orgID, "blk-live"))
 	}
 	taskID := uuid.NewMD5(uuid.NameSpaceOID, []byte(fmt.Sprintf("%s-%s-%d", libID, "fs-root", queuedAt.UnixNano())))
 	if _, exists := store.gcStats[taskID.String()]; exists {
@@ -516,10 +557,15 @@ func TestWorker_ProcessFSObject_CascadeBlocks(t *testing.T) {
 	orgID := uuid.New()
 	libID := uuid.New()
 
-	// Create blocks with ref_count=1 (will go to 0 when fs_object is processed)
-	store.AddBlock(orgID, "blk-a", "hot", 1)
-	store.AddBlock(orgID, "blk-b", "hot", 1)
-	store.AddBlock(orgID, "blk-c", "hot", 2) // This one won't hit 0
+	// blk-a, blk-b are referenced only by fs-obj-1 (will hit 0 refs when it is swept).
+	store.AddBlock(orgID, "blk-a", "hot", 0)
+	store.AddFSObjectReferenceForTest(orgID, "blk-a", libID, "fs-obj-1")
+	store.AddBlock(orgID, "blk-b", "hot", 0)
+	store.AddFSObjectReferenceForTest(orgID, "blk-b", libID, "fs-obj-1")
+	// blk-c is also referenced by another fs_object, so it stays alive (1 ref left).
+	store.AddBlock(orgID, "blk-c", "hot", 0)
+	store.AddFSObjectReferenceForTest(orgID, "blk-c", libID, "fs-obj-1")
+	store.AddFSObjectReferenceForTest(orgID, "blk-c", libID, "fs-obj-other")
 
 	// Create an fs_object referencing these blocks
 	store.AddFSObject(libID, "fs-obj-1", "file", []string{"blk-a", "blk-b", "blk-c"})
@@ -544,18 +590,16 @@ func TestWorker_ProcessFSObject_CascadeBlocks(t *testing.T) {
 		t.Error("fs_object should be deleted")
 	}
 
-	// Blocks blk-a and blk-b should have ref_count decremented to 0
-	blkA := store.GetBlock(orgID, "blk-a")
-	if blkA == nil || blkA.RefCount != 0 {
-		t.Errorf("blk-a ref_count should be 0, got %v", blkA)
+	// Blocks blk-a and blk-b should have their fs-obj-1 reference removed → 0 refs.
+	if got := store.BlockReferenceCount(orgID, "blk-a"); got != 0 {
+		t.Errorf("blk-a references should be 0, got %d", got)
 	}
-	blkB := store.GetBlock(orgID, "blk-b")
-	if blkB == nil || blkB.RefCount != 0 {
-		t.Errorf("blk-b ref_count should be 0, got %v", blkB)
+	if got := store.BlockReferenceCount(orgID, "blk-b"); got != 0 {
+		t.Errorf("blk-b references should be 0, got %d", got)
 	}
-	blkC := store.GetBlock(orgID, "blk-c")
-	if blkC == nil || blkC.RefCount != 1 {
-		t.Errorf("blk-c ref_count should be 1, got %v", blkC)
+	// blk-c keeps its fs-obj-other reference.
+	if got := store.BlockReferenceCount(orgID, "blk-c"); got != 1 {
+		t.Errorf("blk-c references should be 1, got %d", got)
 	}
 
 	// Two new block items should be enqueued (blk-a and blk-b hit 0)
@@ -568,6 +612,51 @@ func TestWorker_ProcessFSObject_CascadeBlocks(t *testing.T) {
 	}
 	if blockItemCount != 2 {
 		t.Errorf("expected 2 block items enqueued, got %d", blockItemCount)
+	}
+}
+
+func TestWorker_ProcessBlock_ReReferencedClaimReleaseIsOwnedByCandidate(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	w := NewWorker(store, nil, q, 100, 0, false, stats)
+
+	orgID := uuid.New()
+	libID := uuid.New()
+	candidateAt := time.Now().Add(-2 * time.Hour).UTC()
+	blockHasRefsCalls := 0
+	store.blockHasReferencesHook = func(hookOrgID uuid.UUID, hookBlockID string, current bool) (bool, error) {
+		blockHasRefsCalls++
+		if blockHasRefsCalls == 1 {
+			return false, nil
+		}
+		store.AddFSObjectReferenceForTest(hookOrgID, hookBlockID, libID, "fs-live")
+		return true, nil
+	}
+
+	store.AddBlock(orgID, "blk-rereferenced", "hot", 0)
+	store.AddBlockGCCandidate(orgID, "blk-rereferenced", "hot", candidateAt)
+	store.EnqueueItem(orgID, candidateAt, ItemBlock, "blk-rereferenced", libID, "hot", 0)
+
+	n, err := w.ProcessOnce(context.Background())
+	if err != nil {
+		t.Fatalf("ProcessOnce failed: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("expected 1 processed item, got %d", n)
+	}
+	block := store.GetBlock(orgID, "blk-rereferenced")
+	if block == nil {
+		t.Fatal("block should remain after re-reference")
+	}
+	if block.GCState != "" || block.GCClaimID != "" {
+		t.Fatalf("claim should be released after re-reference, got state=%q claim=%q", block.GCState, block.GCClaimID)
+	}
+	if got := len(store.AllBlockGCCandidates()); got != 0 {
+		t.Fatalf("expected candidate cleanup after re-reference, got %d", got)
+	}
+	if blockHasRefsCalls != 2 {
+		t.Fatalf("expected 2 block reference checks, got %d", blockHasRefsCalls)
 	}
 }
 
@@ -693,7 +782,7 @@ func TestWorker_ProcessFSObject_DoesNotCrossSuppressChildAcrossLibraries(t *test
 	}
 }
 
-func TestWorker_ProcessFSObject_RetryKeepsSingleBlockDecrement(t *testing.T) {
+func TestWorker_ProcessFSObject_RetryIsIdempotent(t *testing.T) {
 	store := NewMockStore()
 	stats := &Stats{}
 	q := NewQueue(store)
@@ -703,7 +792,10 @@ func TestWorker_ProcessFSObject_RetryKeepsSingleBlockDecrement(t *testing.T) {
 	libID := uuid.New()
 	identityAt := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
 
-	store.AddBlock(orgID, "blk-a", "hot", 2)
+	// blk-a is referenced by both fs-obj-1 and fs-other.
+	store.AddBlock(orgID, "blk-a", "hot", 0)
+	store.AddFSObjectReferenceForTest(orgID, "blk-a", libID, "fs-obj-1")
+	store.AddFSObjectReferenceForTest(orgID, "blk-a", libID, "fs-other")
 	store.AddFSObject(libID, "fs-obj-1", "file", []string{"blk-a"})
 	store.AddFSObject(libID, "fs-other", "file", []string{"blk-a"})
 	store.AddLibrary(orgID, libID, "hot")
@@ -712,133 +804,23 @@ func TestWorker_ProcessFSObject_RetryKeepsSingleBlockDecrement(t *testing.T) {
 	if err := w.processFSObject(context.Background(), first); err != nil {
 		t.Fatalf("first processFSObject failed: %v", err)
 	}
-	if got := store.GetBlock(orgID, "blk-a").RefCount; got != 1 {
-		t.Fatalf("block ref_count after first pass = %d, want 1", got)
+	if got := store.BlockReferenceCount(orgID, "blk-a"); got != 1 {
+		t.Fatalf("block references after first pass = %d, want 1 (fs-other still references it)", got)
 	}
 
+	// Re-processing the same fs_object is naturally idempotent: removing the
+	// already-gone fs-obj-1 reference is a no-op (no marker bookkeeping needed),
+	// so blk-a keeps its fs-other reference and is not double-removed.
 	store.AddFSObject(libID, "fs-obj-1", "file", []string{"blk-a"})
 	second := QueueItem{OrgID: orgID, QueuedAt: time.Now().UTC(), IdentityAt: identityAt, ItemType: ItemFSObject, ItemID: "fs-obj-1", LibraryID: libID}
 	if err := w.processFSObject(context.Background(), second); err != nil {
 		t.Fatalf("retry processFSObject failed: %v", err)
 	}
-	if got := store.GetBlock(orgID, "blk-a").RefCount; got != 1 {
-		t.Fatalf("block ref_count after retry = %d, want 1", got)
+	if got := store.BlockReferenceCount(orgID, "blk-a"); got != 1 {
+		t.Fatalf("block references after retry = %d, want 1", got)
 	}
 	if store.GetFSObj(libID, "fs-obj-1") != nil {
-		t.Fatal("fs_object should be deleted after per-block progress is replayed")
-	}
-}
-
-func TestWorker_ProcessFSObject_RetryCompletesPartialBlockProgress(t *testing.T) {
-	store := NewMockStore()
-	stats := &Stats{}
-	q := NewQueue(store)
-	w := NewWorker(store, nil, q, 100, 0, false, stats)
-
-	orgID := uuid.New()
-	libID := uuid.New()
-	identityAt := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
-
-	store.AddBlock(orgID, "blk-shared", "hot", 1)
-	store.AddBlock(orgID, "blk-last", "hot", 1)
-	store.AddFSObject(libID, "fs-obj-partial", "file", []string{"blk-shared", "blk-last"})
-	store.AddLibrary(orgID, libID, "hot")
-
-	firstBlockTaskID := fsObjectBlockDecrementTaskID(libID, "fs-obj-partial", identityAt, 0, "blk-shared")
-	if applied, err := store.MarkItemProcessed(firstBlockTaskID); err != nil || !applied {
-		t.Fatalf("seed block progress applied=%v err=%v", applied, err)
-	}
-
-	item := QueueItem{OrgID: orgID, QueuedAt: identityAt, IdentityAt: identityAt, ItemType: ItemFSObject, ItemID: "fs-obj-partial", LibraryID: libID}
-	if err := w.processFSObject(context.Background(), item); err != nil {
-		t.Fatalf("processFSObject retry failed: %v", err)
-	}
-
-	if got := store.GetBlock(orgID, "blk-shared").RefCount; got != 0 {
-		t.Fatalf("repaired block ref_count = %d, want 0", got)
-	}
-	if got := store.GetBlock(orgID, "blk-last").RefCount; got != 0 {
-		t.Fatalf("remaining block ref_count = %d, want 0", got)
-	}
-	if store.GetFSObj(libID, "fs-obj-partial") != nil {
-		t.Fatal("fs_object should be deleted after remaining block progress completes")
-	}
-
-	blockItemCount := 0
-	for _, item := range store.QueueItems(orgID) {
-		if item.ItemType == ItemBlock && (item.ItemID == "blk-shared" || item.ItemID == "blk-last") {
-			blockItemCount++
-		}
-	}
-	if blockItemCount != 2 {
-		t.Fatalf("expected zero-ref block items for repaired and remaining blocks, got %d", blockItemCount)
-	}
-}
-
-func TestWorker_ProcessFSObject_RetryRepairsMarkedButMissingSharedDecrement(t *testing.T) {
-	store := NewMockStore()
-	stats := &Stats{}
-	q := NewQueue(store)
-	w := NewWorker(store, nil, q, 100, 0, false, stats)
-
-	orgID := uuid.New()
-	libID := uuid.New()
-	identityAt := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
-
-	store.AddBlock(orgID, "blk-shared", "hot", 2)
-	store.AddFSObject(libID, "fs-obj-retry", "file", []string{"blk-shared"})
-	store.AddFSObject(libID, "fs-other", "file", []string{"blk-shared"})
-	store.AddLibrary(orgID, libID, "hot")
-
-	taskID := fsObjectBlockDecrementTaskID(libID, "fs-obj-retry", identityAt, 0, "blk-shared")
-	if applied, err := store.MarkItemProcessed(taskID); err != nil || !applied {
-		t.Fatalf("seed block progress applied=%v err=%v", applied, err)
-	}
-
-	item := QueueItem{OrgID: orgID, QueuedAt: identityAt, IdentityAt: identityAt, ItemType: ItemFSObject, ItemID: "fs-obj-retry", LibraryID: libID}
-	if err := w.processFSObject(context.Background(), item); err != nil {
-		t.Fatalf("processFSObject retry failed: %v", err)
-	}
-
-	if got := store.GetBlock(orgID, "blk-shared").RefCount; got != 1 {
-		t.Fatalf("shared block ref_count after repair = %d, want 1", got)
-	}
-	if store.GetFSObj(libID, "fs-obj-retry") != nil {
-		t.Fatal("fs_object should be deleted after repairing the missing decrement")
-	}
-	if store.GetFSObj(libID, "fs-other") == nil {
-		t.Fatal("other fs_object sharing the block should remain")
-	}
-}
-
-func TestWorker_ProcessFSObject_RetrySkipsAlreadyDeletedBlockDuringRepair(t *testing.T) {
-	store := NewMockStore()
-	stats := &Stats{}
-	q := NewQueue(store)
-	w := NewWorker(store, nil, q, 100, 0, false, stats)
-
-	orgID := uuid.New()
-	libID := uuid.New()
-	identityAt := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
-
-	store.AddFSObject(libID, "fs-obj-retry", "file", []string{"blk-already-deleted"})
-	store.AddLibrary(orgID, libID, "hot")
-
-	taskID := fsObjectBlockDecrementTaskID(libID, "fs-obj-retry", identityAt, 0, "blk-already-deleted")
-	if applied, err := store.MarkItemProcessed(taskID); err != nil || !applied {
-		t.Fatalf("seed block progress applied=%v err=%v", applied, err)
-	}
-
-	item := QueueItem{OrgID: orgID, QueuedAt: identityAt, IdentityAt: identityAt, ItemType: ItemFSObject, ItemID: "fs-obj-retry", LibraryID: libID}
-	if err := w.processFSObject(context.Background(), item); err != nil {
-		t.Fatalf("processFSObject retry failed: %v", err)
-	}
-
-	if store.GetFSObj(libID, "fs-obj-retry") != nil {
-		t.Fatal("fs_object should be deleted when its already-processed block row is gone")
-	}
-	if got := len(store.QueueItems(orgID)); got != 0 {
-		t.Fatalf("already-deleted block should not be enqueued again, got %d queue items", got)
+		t.Fatal("fs_object should be deleted after the idempotent retry")
 	}
 }
 
@@ -930,8 +912,12 @@ func TestWorker_ProcessFSObject_IdempotencyScopedByLibrary(t *testing.T) {
 	libB := uuid.New()
 	identityAt := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
 
-	store.AddBlock(orgID, "blk-a", "hot", 1)
-	store.AddBlock(orgID, "blk-b", "hot", 1)
+	// The same fs_id "shared-fs" lives in two libraries; each holds a distinct,
+	// library-scoped reference (fs:<lib>:<fs_id>) on its own block.
+	store.AddBlock(orgID, "blk-a", "hot", 0)
+	store.AddFSObjectReferenceForTest(orgID, "blk-a", libA, "shared-fs")
+	store.AddBlock(orgID, "blk-b", "hot", 0)
+	store.AddFSObjectReferenceForTest(orgID, "blk-b", libB, "shared-fs")
 	store.AddFSObject(libA, "shared-fs", "file", []string{"blk-a"})
 	store.AddFSObject(libB, "shared-fs", "file", []string{"blk-b"})
 	store.AddLibrary(orgID, libA, "hot")
@@ -944,11 +930,11 @@ func TestWorker_ProcessFSObject_IdempotencyScopedByLibrary(t *testing.T) {
 		t.Fatalf("processFSObject libB failed: %v", err)
 	}
 
-	if got := store.GetBlock(orgID, "blk-a").RefCount; got != 0 {
-		t.Fatalf("block ref_count for libA = %d, want 0", got)
+	if got := store.BlockReferenceCount(orgID, "blk-a"); got != 0 {
+		t.Fatalf("block references for libA = %d, want 0", got)
 	}
-	if got := store.GetBlock(orgID, "blk-b").RefCount; got != 0 {
-		t.Fatalf("block ref_count for libB = %d, want 0", got)
+	if got := store.BlockReferenceCount(orgID, "blk-b"); got != 0 {
+		t.Fatalf("block references for libB = %d, want 0", got)
 	}
 }
 
@@ -1148,7 +1134,8 @@ func TestWorker_ProcessCommit_RootFSObjectChildSkipsAfterRestore(t *testing.T) {
 
 	store.AddDeletedLibrary(orgID, libID, "hot", deletedAt)
 	store.AddCommit(libID, "commit-1", "fs-root")
-	store.AddBlock(orgID, "blk-a", "hot", 1)
+	store.AddBlock(orgID, "blk-a", "hot", 0)
+	store.AddFSObjectReferenceForTest(orgID, "blk-a", libID, "fs-root")
 	store.AddFSObject(libID, "fs-root", "file", []string{"blk-a"})
 
 	guardedCommit := QueueItem{
@@ -1191,8 +1178,8 @@ func TestWorker_ProcessCommit_RootFSObjectChildSkipsAfterRestore(t *testing.T) {
 	if store.GetFSObj(libID, "fs-root") == nil {
 		t.Fatal("root fs_object child should be stale after restore and must not be deleted")
 	}
-	if got := store.GetBlock(orgID, "blk-a").RefCount; got != 1 {
-		t.Fatalf("block ref_count after restored root child = %d, want 1", got)
+	if got := store.BlockReferenceCount(orgID, "blk-a"); got != 1 {
+		t.Fatalf("block references after restored root child = %d, want 1", got)
 	}
 }
 
@@ -1208,7 +1195,8 @@ func TestWorker_ProcessFSObject_LibraryCascadeChildSkipsAfterRestore(t *testing.
 
 	store.AddOrganization(orgID)
 	store.AddDeletedLibrary(orgID, libID, "hot", deletedAt)
-	store.AddBlock(orgID, "blk-a", "hot", 1)
+	store.AddBlock(orgID, "blk-a", "hot", 0)
+	store.AddFSObjectReferenceForTest(orgID, "blk-a", libID, "fs-file")
 	store.AddFSObject(libID, "fs-file", "file", []string{"blk-a"})
 	store.deleteRestoreJobsByLibraryErr = errors.New("restore jobs unavailable")
 
@@ -1241,8 +1229,8 @@ func TestWorker_ProcessFSObject_LibraryCascadeChildSkipsAfterRestore(t *testing.
 	if store.GetFSObj(libID, "fs-file") == nil {
 		t.Fatal("fs_object child should be stale after restore and must not be deleted")
 	}
-	if got := store.GetBlock(orgID, "blk-a").RefCount; got != 1 {
-		t.Fatalf("block ref_count after stale fs_object child = %d, want 1", got)
+	if got := store.BlockReferenceCount(orgID, "blk-a"); got != 1 {
+		t.Fatalf("block references after stale fs_object child = %d, want 1", got)
 	}
 }
 
@@ -1676,7 +1664,8 @@ func TestWorker_ProcessLibraryCascade_ChildrenContinueAfterHardDelete(t *testing
 	store.AddOrganization(orgID)
 	store.AddDeletedLibrary(orgID, libID, "hot", deletedAt)
 	store.AddCommit(libID, "commit-1", "fs-root")
-	store.AddBlock(orgID, "blk-a", "hot", 1)
+	store.AddBlock(orgID, "blk-a", "hot", 0)
+	store.AddFSObjectReferenceForTest(orgID, "blk-a", libID, "fs-root")
 	store.AddFSObject(libID, "fs-root", "file", []string{"blk-a"})
 
 	item := QueueItem{OrgID: orgID, QueuedAt: deletedAt, IdentityAt: deletedAt, ItemType: ItemLibraryCascade, ItemID: libID.String(), StorageClass: "hot"}
@@ -1719,8 +1708,8 @@ func TestWorker_ProcessLibraryCascade_ChildrenContinueAfterHardDelete(t *testing
 	if store.GetFSObj(libID, "fs-root") != nil {
 		t.Fatal("fs_object should be deleted after successful hard delete")
 	}
-	if got := store.GetBlock(orgID, "blk-a").RefCount; got != 0 {
-		t.Fatalf("block ref_count after hard-delete child processing = %d, want 0", got)
+	if got := store.BlockReferenceCount(orgID, "blk-a"); got != 0 {
+		t.Fatalf("block references after hard-delete child processing = %d, want 0", got)
 	}
 }
 
@@ -1737,7 +1726,8 @@ func TestWorker_ProcessLibraryCascade_ChildrenContinueAfterHardDeleteWithStaleLo
 	store.AddOrganization(orgID)
 	store.AddDeletedLibrary(orgID, libID, "hot", deletedAt)
 	store.AddCommit(libID, "commit-1", "fs-root")
-	store.AddBlock(orgID, "blk-a", "hot", 1)
+	store.AddBlock(orgID, "blk-a", "hot", 0)
+	store.AddFSObjectReferenceForTest(orgID, "blk-a", libID, "fs-root")
 	store.AddFSObject(libID, "fs-root", "file", []string{"blk-a"})
 
 	item := QueueItem{OrgID: orgID, QueuedAt: deletedAt, IdentityAt: deletedAt, ItemType: ItemLibraryCascade, ItemID: libID.String(), StorageClass: "hot"}
@@ -1786,8 +1776,8 @@ func TestWorker_ProcessLibraryCascade_ChildrenContinueAfterHardDeleteWithStaleLo
 	if store.GetFSObj(libID, "fs-root") != nil {
 		t.Fatal("fs_object should be deleted after hard delete even if lock row lingers")
 	}
-	if got := store.GetBlock(orgID, "blk-a").RefCount; got != 0 {
-		t.Fatalf("block ref_count after stale-lock hard-delete child processing = %d, want 0", got)
+	if got := store.BlockReferenceCount(orgID, "blk-a"); got != 0 {
+		t.Fatalf("block references after stale-lock hard-delete child processing = %d, want 0", got)
 	}
 }
 
@@ -2255,7 +2245,7 @@ func TestWorker_ProcessOrgCascade_SkipsRestoredOrg(t *testing.T) {
 	}
 }
 
-func TestWorker_DecrementFSObjectBlocks_ReturnsOnlyZeroTransitions(t *testing.T) {
+func TestWorker_RemoveFSObjectBlockReferences_ReturnsOnlyZeroTransitions(t *testing.T) {
 	store := NewMockStore()
 	stats := &Stats{}
 	q := NewQueue(store)
@@ -2263,21 +2253,26 @@ func TestWorker_DecrementFSObjectBlocks_ReturnsOnlyZeroTransitions(t *testing.T)
 
 	orgID := uuid.New()
 	libID := uuid.New()
-	store.AddBlock(orgID, "hits-zero", "hot", 1)
-	store.AddBlock(orgID, "stays-positive", "hot", 2)
+	// hits-zero is referenced only by fs-obj; stays-positive is also referenced by
+	// another fs_object, so removing fs-obj's reference leaves it alive.
+	store.AddBlock(orgID, "hits-zero", "hot", 0)
+	store.AddFSObjectReferenceForTest(orgID, "hits-zero", libID, "fs-obj")
+	store.AddBlock(orgID, "stays-positive", "hot", 0)
+	store.AddFSObjectReferenceForTest(orgID, "stays-positive", libID, "fs-obj")
+	store.AddFSObjectReferenceForTest(orgID, "stays-positive", libID, "fs-other")
 
-	zeroRef, err := w.decrementFSObjectBlocks(orgID, libID, "fs-obj", time.Now().UTC(), []string{"hits-zero", "stays-positive"})
+	zeroRef, err := w.removeFSObjectBlockReferences(orgID, libID, "fs-obj", []string{"hits-zero", "stays-positive"})
 	if err != nil {
-		t.Fatalf("decrementFSObjectBlocks failed: %v", err)
+		t.Fatalf("removeFSObjectBlockReferences failed: %v", err)
 	}
 	if len(zeroRef) != 1 || zeroRef[0] != "hits-zero" {
 		t.Fatalf("zeroRef = %#v, want only hits-zero", zeroRef)
 	}
 
-	if got, err := store.GetBlockRefCount(orgID, "hits-zero"); err != nil || got != 0 {
-		t.Fatalf("hits-zero refcount = %d, err=%v; want 0,nil", got, err)
+	if got := store.BlockReferenceCount(orgID, "hits-zero"); got != 0 {
+		t.Fatalf("hits-zero references = %d, want 0", got)
 	}
-	if got, err := store.GetBlockRefCount(orgID, "stays-positive"); err != nil || got != 1 {
-		t.Fatalf("stays-positive refcount = %d, err=%v; want 1,nil", got, err)
+	if got := store.BlockReferenceCount(orgID, "stays-positive"); got != 1 {
+		t.Fatalf("stays-positive references = %d, want 1", got)
 	}
 }

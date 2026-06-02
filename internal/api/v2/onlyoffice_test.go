@@ -12,7 +12,9 @@ import (
 
 	"github.com/Sesame-Disk/sesamefs/internal/config"
 	"github.com/Sesame-Disk/sesamefs/internal/crypto"
+	"github.com/Sesame-Disk/sesamefs/internal/db"
 	"github.com/Sesame-Disk/sesamefs/internal/storage"
+	"github.com/Sesame-Disk/sesamefs/internal/traffic"
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
@@ -120,6 +122,130 @@ func TestOnlyOfficeResolveLibraryBlockStoreUsesLocalRegion(t *testing.T) {
 	}
 }
 
+func TestCleanupOnlyOfficeFailedPublishAttempt_JoinsRepairCleanupAndQueueClear(t *testing.T) {
+	oldCleanup := onlyOfficeCleanupFailedPublishAttemptFn
+	oldClear := onlyOfficeClearPendingPublishedFileRepairsFn
+	oldRelease := releasePendingPublishedFileOwnersFn
+	t.Cleanup(func() {
+		onlyOfficeCleanupFailedPublishAttemptFn = oldCleanup
+		onlyOfficeClearPendingPublishedFileRepairsFn = oldClear
+		releasePendingPublishedFileOwnersFn = oldRelease
+	})
+
+	cleanupErr := errors.New("cleanup failed")
+	clearErr := errors.New("clear failed")
+	cleanupCalls := 0
+	onlyOfficeCleanupFailedPublishAttemptFn = func(database *db.DB, orgID, repoID, attemptID, commitID string, fsIDs, blockIDs []string) error {
+		cleanupCalls++
+		if orgID != "org-1" || repoID != "repo-1" || attemptID != "commit-1" || commitID != "commit-1" {
+			t.Fatalf("cleanup args = %s/%s/%s/%s, want org-1/repo-1/commit-1/commit-1", orgID, repoID, attemptID, commitID)
+		}
+		if len(fsIDs) != 1 || fsIDs[0] != "fs-1" {
+			t.Fatalf("cleanup fsIDs = %#v, want []string{\"fs-1\"}", fsIDs)
+		}
+		if len(blockIDs) != 1 || blockIDs[0] != "queued-block-1" {
+			t.Fatalf("cleanup blockIDs = %#v, want []string{\"queued-block-1\"}", blockIDs)
+		}
+		return cleanupErr
+	}
+	releaseCalls := 0
+	releasePendingPublishedFileOwnersFn = func(database *db.DB, repoID string, pendingFiles []*pendingPublishedFile) error {
+		releaseCalls++
+		return nil
+	}
+	clearCalls := 0
+	onlyOfficeClearPendingPublishedFileRepairsFn = func(database *db.DB, orgID, repoID, commitID string, pendingFiles []*pendingPublishedFile) error {
+		clearCalls++
+		if len(pendingFiles) != 1 || pendingFiles[0] == nil || pendingFiles[0].fsID != "fs-1" {
+			t.Fatalf("pendingFiles = %#v, want one fs-1 pending file", pendingFiles)
+		}
+		return clearErr
+	}
+
+	err := cleanupOnlyOfficeFailedPublishAttempt(nil, "org-1", "repo-1", "commit-1", []*pendingPublishedFile{{fsID: "fs-1", internalBlockIDs: []string{"queued-block-1"}}})
+	if !errors.Is(err, cleanupErr) {
+		t.Fatalf("cleanupOnlyOfficeFailedPublishAttempt() error = %v, want cleanupErr %v", err, cleanupErr)
+	}
+	if errors.Is(err, clearErr) {
+		t.Fatalf("cleanupOnlyOfficeFailedPublishAttempt() error = %v, do not want clearErr %v", err, clearErr)
+	}
+	if cleanupCalls != 1 {
+		t.Fatalf("cleanupCalls = %d, want 1", cleanupCalls)
+	}
+	if releaseCalls != 0 {
+		t.Fatalf("releaseCalls = %d, want 0", releaseCalls)
+	}
+	if clearCalls != 0 {
+		t.Fatalf("clearCalls = %d, want 0", clearCalls)
+	}
+}
+
+func TestFinalizeSuccessfulOnlyOfficeEdit_ReleasesProvisionalRefBeforeCleanup(t *testing.T) {
+	oldRelease := onlyOfficeReleaseUploadedBlockRefsFn
+	oldDelete := onlyOfficeDeletePendingBlockFn
+	oldAdjust := onlyOfficeAdjustStorageCountersFn
+	t.Cleanup(func() {
+		onlyOfficeReleaseUploadedBlockRefsFn = oldRelease
+		onlyOfficeDeletePendingBlockFn = oldDelete
+		onlyOfficeAdjustStorageCountersFn = oldAdjust
+	})
+
+	h := &OnlyOfficeHandler{}
+	var calls []string
+	onlyOfficeReleaseUploadedBlockRefsFn = func(database *db.DB, orgID, repoID, operationID string, blockIDs []string) {
+		calls = append(calls, "release")
+		if orgID != "org-1" || repoID != "repo-1" || operationID != "rollback-1" {
+			t.Fatalf("release args = %s/%s/%s, want org-1/repo-1/rollback-1", orgID, repoID, operationID)
+		}
+		if len(blockIDs) != 1 || blockIDs[0] != "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" {
+			t.Fatalf("release blockIDs = %#v, want the internal block id", blockIDs)
+		}
+	}
+	onlyOfficeDeletePendingBlockFn = func(handler *OnlyOfficeHandler, orgID, operationID string) error {
+		calls = append(calls, "delete")
+		if handler != h {
+			t.Fatal("delete should receive the same handler")
+		}
+		if orgID != "org-1" || operationID != "rollback-1" {
+			t.Fatalf("delete args = %s/%s, want org-1/rollback-1", orgID, operationID)
+		}
+		return nil
+	}
+	onlyOfficeAdjustStorageCountersFn = func(database traffic.DBSession, orgID, userID, repoID string, deltaBytes, deltaFiles int64) error {
+		calls = append(calls, "traffic")
+		if orgID != "org-1" || userID != "user-1" || repoID != "repo-1" {
+			t.Fatalf("traffic args = %s/%s/%s, want org-1/user-1/repo-1", orgID, userID, repoID)
+		}
+		if deltaBytes != 123 || deltaFiles != 1 {
+			t.Fatalf("traffic deltas = %d/%d, want 123/1", deltaBytes, deltaFiles)
+		}
+		return nil
+	}
+
+	h.finalizeSuccessfulOnlyOfficeEdit(
+		"org-1",
+		"repo-1",
+		"user-1",
+		"rollback-1",
+		"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+		"/docs/test.docx",
+		"0123456789abcdef0123456789abcdef01234567",
+		"0123456789abcdef0123456789abcdef01234567",
+		123,
+		1,
+	)
+
+	want := []string{"release", "delete", "traffic"}
+	if len(calls) != len(want) {
+		t.Fatalf("calls = %#v, want %#v", calls, want)
+	}
+	for i := range want {
+		if calls[i] != want[i] {
+			t.Fatalf("calls[%d] = %q, want %q (full=%#v)", i, calls[i], want[i], calls)
+		}
+	}
+}
+
 func TestResolveOnlyOfficeServerURL(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
@@ -184,6 +310,139 @@ func TestResolveOnlyOfficeInternalURL(t *testing.T) {
 		got := resolveOnlyOfficeInternalURL("http://localhost:8088/web-apps/apps/api/documents/api.js", "")
 		if got != dockerComposeOnlyOfficeURL {
 			t.Fatalf("resolveOnlyOfficeInternalURL() = %q, want %q", got, dockerComposeOnlyOfficeURL)
+		}
+	})
+}
+
+func TestWriteBlockIDMappingDualWrite(t *testing.T) {
+	t.Run("writes forward then reverse", func(t *testing.T) {
+		calls := make([]string, 0, 2)
+		err := db.WriteBlockIDMappingDualWrite(
+			func() error {
+				calls = append(calls, "forward")
+				return nil
+			},
+			func() error {
+				calls = append(calls, "rollback")
+				return nil
+			},
+			func() error {
+				calls = append(calls, "reverse")
+				return nil
+			},
+		)
+		if err != nil {
+			t.Fatalf("writeBlockIDMappingDualWrite returned error: %v", err)
+		}
+		want := []string{"forward", "reverse"}
+		if len(calls) != len(want) {
+			t.Fatalf("call count = %d, want %d (%v)", len(calls), len(want), calls)
+		}
+		for i := range want {
+			if calls[i] != want[i] {
+				t.Fatalf("calls[%d] = %q, want %q (full=%v)", i, calls[i], want[i], calls)
+			}
+		}
+	})
+
+	t.Run("stops on forward failure", func(t *testing.T) {
+		reverseCalls := 0
+		rollbackCalls := 0
+		wantErr := errors.New("forward failed")
+		err := db.WriteBlockIDMappingDualWrite(
+			func() error { return wantErr },
+			func() error {
+				rollbackCalls++
+				return nil
+			},
+			func() error {
+				reverseCalls++
+				return nil
+			},
+		)
+		if !errors.Is(err, wantErr) {
+			t.Fatalf("error = %v, want %v", err, wantErr)
+		}
+		if reverseCalls != 0 {
+			t.Fatalf("reverse calls = %d, want 0 after forward failure", reverseCalls)
+		}
+		if rollbackCalls != 0 {
+			t.Fatalf("rollback calls = %d, want 0 after forward failure", rollbackCalls)
+		}
+	})
+
+	t.Run("fails closed on reverse failure", func(t *testing.T) {
+		calls := make([]string, 0, 2)
+		wantErr := errors.New("reverse failed")
+		err := db.WriteBlockIDMappingDualWrite(
+			func() error {
+				calls = append(calls, "forward")
+				return nil
+			},
+			func() error {
+				calls = append(calls, "rollback")
+				return nil
+			},
+			func() error {
+				calls = append(calls, "reverse")
+				return wantErr
+			},
+		)
+		if !errors.Is(err, wantErr) {
+			t.Fatalf("error = %v, want %v", err, wantErr)
+		}
+		want := []string{"forward", "reverse", "rollback"}
+		if len(calls) != len(want) {
+			t.Fatalf("call count = %d, want %d (%v)", len(calls), len(want), calls)
+		}
+		for i := range want {
+			if calls[i] != want[i] {
+				t.Fatalf("calls[%d] = %q, want %q (full=%v)", i, calls[i], want[i], calls)
+			}
+		}
+	})
+
+	t.Run("preserves forward mapping when rollback is nil", func(t *testing.T) {
+		calls := make([]string, 0, 2)
+		wantErr := errors.New("reverse failed")
+		err := db.WriteBlockIDMappingDualWrite(
+			func() error {
+				calls = append(calls, "forward")
+				return nil
+			},
+			nil,
+			func() error {
+				calls = append(calls, "reverse")
+				return wantErr
+			},
+		)
+		if !errors.Is(err, wantErr) {
+			t.Fatalf("error = %v, want %v", err, wantErr)
+		}
+		want := []string{"forward", "reverse"}
+		if len(calls) != len(want) {
+			t.Fatalf("call count = %d, want %d (%v)", len(calls), len(want), calls)
+		}
+		for i := range want {
+			if calls[i] != want[i] {
+				t.Fatalf("calls[%d] = %q, want %q (full=%v)", i, calls[i], want[i], calls)
+			}
+		}
+	})
+
+	t.Run("joins rollback failure after reverse failure", func(t *testing.T) {
+		wantReverseErr := errors.New("reverse failed")
+		wantRollbackErr := errors.New("rollback failed")
+		err := db.WriteBlockIDMappingDualWrite(
+			func() error { return nil },
+			func() error { return wantRollbackErr },
+			func() error { return wantReverseErr },
+		)
+		if !errors.Is(err, wantReverseErr) {
+			t.Fatalf("error = %v, want joined reverse error %v", err, wantReverseErr)
+		}
+		if !errors.Is(err, wantRollbackErr) {
+			t.Fatalf("error = %v, want joined rollback error %v", err, wantRollbackErr)
 		}
 	})
 }

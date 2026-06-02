@@ -253,18 +253,51 @@ CREATE TABLE IF NOT EXISTS fs_objects (
 );
 
 -- Per-block partition: each (org_id, block_id) is its own Paxos partition.
--- Avoids the prior hot partition where all block-refcount LWTs for an org
--- (especially the platform org `00000000-...`) serialized through one row group.
+-- `blocks` holds immutable block metadata (size, storage class/key) plus GC
+-- state. Liveness is NOT a mutable counter anymore — it lives in
+-- `block_references` (a block is alive iff it has ≥1 reference row).
+-- Metadata is written with INSERT ... IF NOT EXISTS (a per-block LWT): the
+-- physical location (storage_class/storage_key) is chosen per library and per
+-- routing region, so first-writer-wins pins ONE canonical location and reads/GC
+-- resolve the backend where the block actually landed. Because the partition is
+-- per (org, block), these LWTs never contend across different blocks — they are
+-- NOT globally serialized. `gc_state` is set to 'deleting' by the GC worker's
+-- claim LWT just before the irreversible S3 delete; `gc_claim_id` fences
+-- release/finalize so only the owning delete attempt can complete that claim.
+-- Writers back off when they observe `gc_state='deleting'`. See block_references
+-- below.
 CREATE TABLE IF NOT EXISTS blocks (
     org_id        UUID,
     block_id      TEXT,
     size_bytes    INT,
     storage_class TEXT,
     storage_key   TEXT,
-    ref_count     INT,
+    gc_state      TEXT,
+    gc_claim_id   TEXT,
+    gc_claimed_at TIMESTAMP,
     created_at    TIMESTAMP,
     last_accessed TIMESTAMP,
     PRIMARY KEY ((org_id, block_id))
+);
+
+-- Row-per-reference liveness model (replaces blocks.ref_count). One row per
+-- (block, referrer). A block is alive iff at least one reference row exists.
+-- INSERT/DELETE are idempotent and need no LWT in steady state — expensive Paxos
+-- is reserved for the GC worker's final claim before deleting from S3.
+--   referrer = "fs:<library_id>:<fs_id>"   permanent: an fs_object containing the block
+--   referrer = "up:<operation_id>"         provisional: an in-flight upload. The
+--                                          live ref is released explicitly on success;
+--                                          abandoned uploads are recovered via
+--                                          gc_provisional_block_refs* expiry tables.
+-- Per-(org, block) partition mirrors `blocks`, so a block's reference rows and its
+-- metadata never contend with another block's traffic.
+CREATE TABLE IF NOT EXISTS block_references (
+    org_id     UUID,
+    block_id   TEXT,
+    referrer   TEXT,
+    library_id UUID,
+    created_at TIMESTAMP,
+    PRIMARY KEY ((org_id, block_id), referrer)
 );
 
 -- Canonical GC candidates table. Per-block partition like `blocks` so reference
@@ -290,6 +323,32 @@ CREATE TABLE IF NOT EXISTS gc_block_candidates_by_day (
     storage_class TEXT,
     PRIMARY KEY ((candidate_day, bucket), candidate_at, org_id, block_id)
 ) WITH CLUSTERING ORDER BY (candidate_at ASC, org_id ASC, block_id ASC);
+
+-- Tracks one cleanup deadline per provisional upload referrer so abandoned
+-- uploads can be recovered one `up:` row at a time without injecting still-live
+-- blocks into `gc_block_candidates`.
+CREATE TABLE IF NOT EXISTS gc_provisional_block_refs (
+    org_id        TEXT,
+    block_id      TEXT,
+    referrer      TEXT,
+    storage_class TEXT,
+    expires_at    TIMESTAMP,
+    PRIMARY KEY ((org_id, block_id), referrer)
+);
+
+-- Discovery projection for `gc_provisional_block_refs`: partition by
+-- (expiry_day, bucket) so the GC scanner can enumerate expired provisional
+-- refs without scanning canonical block partitions.
+CREATE TABLE IF NOT EXISTS gc_provisional_block_refs_by_day (
+    expiry_day    DATE,
+    bucket        INT,
+    expires_at    TIMESTAMP,
+    org_id        TEXT,
+    block_id      TEXT,
+    referrer      TEXT,
+    storage_class TEXT,
+    PRIMARY KEY ((expiry_day, bucket), expires_at, org_id, block_id, referrer)
+) WITH CLUSTERING ORDER BY (expires_at ASC, org_id ASC, block_id ASC, referrer ASC);
 
 -- SHA-1 (external/Seafile client) → SHA-256 (internal) content-address mapping.
 -- Per-(org, external) partition so concurrent uploads of different content
@@ -669,8 +728,83 @@ CREATE TABLE IF NOT EXISTS access_tokens (
     file_path  TEXT,
     user_id    UUID,
     created_at TIMESTAMP,
-    source     TEXT
+    source     TEXT,
+    replace_existing BOOLEAN
 );
+
+-- Durable pending-cleanup rows for OnlyOffice save callbacks.
+-- This tracks materialized blocks between block ref registration and
+-- successful library-head publication so later processes can reconcile stale
+-- pending saves conservatively.
+--
+-- The 7-day default_time_to_live is a safety net only. Normal cleanup happens
+-- on the order of minutes via reconcileStaleOnlyOfficePendingBlocks
+-- (onlyOfficePendingBlockStaleAfter = 5 minutes). The TTL exists so that if
+-- both the inline save trigger and the GC scanner phase fail for an extended
+-- period, rows do not accumulate without bound.
+CREATE TABLE IF NOT EXISTS onlyoffice_pending_blocks (
+    org_id            UUID,
+    operation_id      TEXT,
+    repo_id           UUID,
+    file_path         TEXT,
+    internal_block_id TEXT,
+    external_block_id TEXT,
+    storage_class     TEXT,
+    publish_commit_id TEXT,
+    created_at        TIMESTAMP,
+    updated_at        TIMESTAMP,
+    PRIMARY KEY ((org_id), operation_id)
+) WITH default_time_to_live = 604800;
+
+-- Durable queue for post-HEAD block-reference promotion/cleanup repairs.
+-- Rows are inserted before the library HEAD CAS so later processes can resume
+-- recovery after crashes, restarts, or redeploys. `staged_block_ids` stores
+-- the exact IDs originally used in the pub:<commit> rows; this must not be
+-- reconstructed from fs_objects because different publish surfaces do not all
+-- stage the same identifier shape.
+CREATE TABLE IF NOT EXISTS published_block_reference_repairs (
+    bucket           INT,
+    org_id           UUID,
+    repo_id          UUID,
+    commit_id        TEXT,
+    fs_id            TEXT,
+    staged_block_ids LIST<TEXT>,
+    created_at       TIMESTAMP,
+    lease_expires_at TIMESTAMP,
+    PRIMARY KEY ((bucket), org_id, repo_id, commit_id, fs_id)
+) WITH default_time_to_live = 0;
+
+-- Tracks one or more in-flight publish owners per materialized fs_object row.
+-- Rows exist from pre-commit fs_object persistence until the attempt is cleaned
+-- up or the published commit is visible and the owner is cleared. Retain these
+-- rows for 35 days so recovery still works after extended repair/sweeper
+-- downtime.
+CREATE TABLE IF NOT EXISTS pending_published_fs_objects (
+    repo_id    UUID,
+    fs_id      TEXT,
+    owner_id   TEXT,
+    created_at TIMESTAMP,
+    org_id     UUID,
+    attempt_id TEXT,
+    block_ids  LIST<TEXT>,
+    PRIMARY KEY ((repo_id, fs_id), owner_id)
+) WITH default_time_to_live = 3024000;
+
+-- Discovery projection for stale pending fs_object owners. Successful publishes
+-- delete these rows immediately; the remaining rows are abandoned/in-flight
+-- attempts that need conservative cleanup. Lean key-only projection: owner
+-- metadata (org_id/attempt_id/block_ids) lives on the canonical
+-- pending_published_fs_objects row and is hydrated from there during cleanup.
+CREATE TABLE IF NOT EXISTS pending_published_fs_objects_by_day (
+    created_day DATE,
+    bucket      INT,
+    created_at  TIMESTAMP,
+    repo_id     UUID,
+    fs_id       TEXT,
+    owner_id    TEXT,
+    PRIMARY KEY ((created_day, bucket), created_at, repo_id, fs_id, owner_id)
+) WITH CLUSTERING ORDER BY (created_at ASC, repo_id ASC, fs_id ASC, owner_id ASC)
+    AND default_time_to_live = 3024000;
 
 -- ─── Groups ──────────────────────────────────────────────────────────────────
 
@@ -1036,12 +1170,6 @@ IF NOT EXISTS;
 INSERT INTO gc_stats (stat_key, stat_value, updated_at)
 VALUES ('last_reconcile_run', '', toTimestamp(now()))
 IF NOT EXISTS;
-
--- Keep this longer than gc_failed_items retention so delayed DLQ requeues
--- cannot repeat the same decrement after the idempotency marker expires.
-CREATE TABLE IF NOT EXISTS gc_processed_items (
-    task_id UUID PRIMARY KEY
-) WITH default_time_to_live = 3024000;
 
 -- When the GC worker deletes the canonical `blocks` row before the backing S3
 -- object, any S3 failure would otherwise leak storage forever. This recovery

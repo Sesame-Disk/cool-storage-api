@@ -48,24 +48,35 @@ type GCStore interface {
 	RecountOrgFailedDepth(orgID uuid.UUID) (int, error)
 	GetOldestQueuedAt(orgID uuid.UUID) (*time.Time, error)
 	SumOrgQueueStats() (int, int, error)
-	MarkItemProcessed(taskID uuid.UUID) (bool, error)
 	GetUserDeletedAt(orgID, userID uuid.UUID) (*time.Time, error)
 	GetLibraryDeletedAt(libraryID uuid.UUID) (*time.Time, error)
 	GetOrgDeletedAt(orgID uuid.UUID) (*time.Time, error)
 
 	// Block operations (worker)
 	//
-	// GetBlockRefCount returns the current reference count for a block.
-	// It MUST return a non-nil error when the block row does not exist
-	// (e.g. gocql.ErrNotFound). RecoverS3Orphans relies on this to
-	// distinguish blocks that were claimed-but-not-finalized (row still
-	// present → skip) from blocks whose DB row was already removed
-	// (error → proceed with S3 cleanup).
-	GetBlockRefCount(orgID uuid.UUID, blockID string) (int, error)
+	// BlockExists reports whether the canonical `blocks` row still exists.
+	// RecoverS3Orphans relies on this to distinguish a block still being
+	// claimed/finalized by GC (row present → skip) from one whose DB row was
+	// already removed (absent → proceed with S3 cleanup).
+	BlockExists(orgID uuid.UUID, blockID string) (bool, error)
+	// BlockHasReferences reports whether any block_references row still exists for
+	// the block. This is the liveness check that replaces reading ref_count.
+	BlockHasReferences(orgID uuid.UUID, blockID string) (bool, error)
+	GetBlockInfo(orgID uuid.UUID, blockID string) (BlockInfo, error)
+	// RemoveBlockReference deletes one (block, referrer) reference row. Idempotent.
+	RemoveBlockReference(orgID uuid.UUID, blockID, referrer string) error
 	ResolveBlockIDs(orgID uuid.UUID, blockIDs []string) ([]string, error)
-	ClaimBlockDelete(orgID uuid.UUID, blockID string) (bool, error)
-	FinalizeBlockDelete(orgID uuid.UUID, blockID string) error
-	DecrementBlockRefCount(orgID uuid.UUID, blockID string) (bool, error)
+	// ClaimBlockDelete atomically marks the block row gc_state='deleting' via LWT
+	// and records the deterministic claimID for the logical delete attempt.
+	// Callers MUST re-check BlockHasReferences after a successful claim before
+	// deleting from S3 (claim-then-verify).
+	ClaimBlockDelete(orgID uuid.UUID, blockID, claimID string) (bool, error)
+	// ReleaseBlockClaim clears gc_state only when the same claimID still owns the
+	// row. This prevents another attempt from releasing a claim it did not win.
+	ReleaseBlockClaim(orgID uuid.UUID, blockID, claimID string) error
+	// FinalizeBlockDelete removes the block row only when the same claimID still
+	// owns the row.
+	FinalizeBlockDelete(orgID uuid.UUID, blockID, claimID string) error
 	DeleteBlockMapping(orgID uuid.UUID, externalID string) error
 	EnsureBlockGCCandidate(orgID uuid.UUID, blockID, storageClass string, candidateAt time.Time) (time.Time, error)
 	DeleteBlockGCCandidate(orgID uuid.UUID, blockID string, candidateAt time.Time) error
@@ -74,6 +85,20 @@ type GCStore interface {
 	// range over [0, db.GCDiscoveryBucketCount). Replaces the old per-org
 	// partition scan that depended on `blocks` partitioning by org.
 	ListBlockGCCandidatesByDay(day time.Time, bucket int) ([]BlockGCCandidateInfo, error)
+	// ListProvisionalBlockRefExpiriesByDay enumerates provisional upload-ref
+	// expiry records whose `expires_at` falls on the given UTC day for one
+	// discovery bucket. Each row is keyed by the specific provisional referrer,
+	// so concurrent uploads of the same block are expired independently.
+	ListProvisionalBlockRefExpiriesByDay(day time.Time, bucket int) ([]ProvisionalBlockRefExpiryInfo, error)
+	// GetProvisionalBlockRefExpiry loads the canonical expiry row. The scanner
+	// must revalidate this before removing any up:* block reference because the
+	// by-day table is only a discovery projection and can be stale.
+	GetProvisionalBlockRefExpiry(orgID uuid.UUID, blockID, referrer string) (ProvisionalBlockRefExpiryInfo, bool, error)
+	// DeleteProvisionalBlockRefExpiryProjection removes only the discovery row.
+	// It intentionally leaves the canonical row untouched for stale projection
+	// cleanup when an upload ref was renewed or already finalized elsewhere.
+	DeleteProvisionalBlockRefExpiryProjection(orgID uuid.UUID, blockID, referrer string, expiresAt time.Time) error
+	DeleteProvisionalBlockRefExpiry(orgID uuid.UUID, blockID, referrer string, expiresAt time.Time) error
 
 	// S3 orphan recovery / pending delete tracking for blocks claimed by GC.
 	// RecordS3Orphan preserves and returns the effective first_seen_at identity
@@ -265,7 +290,6 @@ type CommitInfo struct {
 type BlockInfo struct {
 	BlockID      string
 	StorageClass string
-	RefCount     int
 }
 
 type BlockGCCandidateInfo struct {
@@ -273,6 +297,14 @@ type BlockGCCandidateInfo struct {
 	BlockID      string
 	StorageClass string
 	CandidateAt  time.Time
+}
+
+type ProvisionalBlockRefExpiryInfo struct {
+	OrgID        uuid.UUID
+	BlockID      string
+	Referrer     string
+	StorageClass string
+	ExpiresAt    time.Time
 }
 
 // GCOrgStats stores reconciled queue state for a single org.

@@ -3,6 +3,7 @@ package api
 import (
 	"bytes"
 	"compress/zlib"
+	"context"
 	"crypto/sha1"
 	"crypto/sha256"
 	"encoding/binary"
@@ -15,6 +16,7 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
@@ -26,6 +28,7 @@ import (
 	"github.com/Sesame-Disk/sesamefs/internal/httputil"
 	"github.com/Sesame-Disk/sesamefs/internal/middleware"
 	"github.com/Sesame-Disk/sesamefs/internal/storage"
+	"github.com/Sesame-Disk/sesamefs/internal/streaming"
 	"github.com/Sesame-Disk/sesamefs/internal/traffic"
 	"github.com/gin-gonic/gin"
 )
@@ -57,18 +60,83 @@ type SyncHandler struct {
 	// real DB. Production code leaves it nil; the idempotent fast-path then
 	// falls back to repairSyncHeadDerivedStateIfDrifted.
 	repairSyncHeadDerivedStateIfDriftedFn func(orgID, repoID, targetHead string) error
+
+	// repairPublishedSyncCommitBlockDeltaFn is an optional test seam used by
+	// unit tests to observe or fail the idempotent block-reference repair path
+	// without a real DB session. Production code leaves it nil; the helper then
+	// runs the real block-delta reconciliation.
+	repairPublishedSyncCommitBlockDeltaFn func(orgID, repoID, targetHead string) error
+
+	// finalizedBlockDeltas memoizes (repo, head) pairs whose sync block-reference
+	// delta this process has fully finalized, so the idempotent retry path can skip
+	// the costly full-tree repair. Nil-safe: a handler built without it just always
+	// runs the full (idempotent) repair.
+	finalizedBlockDeltas *syncFinalizedDeltaSet
 }
 
 // NewSyncHandler creates a new sync protocol handler
 func NewSyncHandler(database *db.DB, s3Store *storage.S3Store, blockStore *storage.BlockStore, storageManager *storage.Manager, cfg *config.Config, permMiddleware *middleware.PermissionMiddleware) *SyncHandler {
 	return &SyncHandler{
-		db:             database,
-		storage:        s3Store,
-		blockStore:     blockStore,
-		storageManager: storageManager,
-		config:         cfg,
-		permMiddleware: permMiddleware,
+		db:                   database,
+		storage:              s3Store,
+		blockStore:           blockStore,
+		storageManager:       storageManager,
+		config:               cfg,
+		permMiddleware:       permMiddleware,
+		finalizedBlockDeltas: newSyncFinalizedDeltaSet(),
 	}
+}
+
+// syncFinalizedDeltaShardCap bounds each generation of the finalized-delta memo.
+// At most 2x this many entries are retained (current + previous generation), so
+// memory stays capped without per-entry timestamps or a background sweeper.
+const syncFinalizedDeltaShardCap = 4096
+
+// syncFinalizedDeltaSet is a bounded, thread-safe set of "(repo, head) finalized"
+// markers. It exists purely to let handleSyncHeadIdempotentSuccess skip the
+// full-tree block-reference repair when this process already finalized the exact
+// head. It is intentionally conservative: a missing entry just means the caller
+// runs the full (idempotent) reconciliation, so eviction, restarts, and
+// multi-instance deployments can never cause incorrect behavior — only an extra
+// repair. Entries stay valid for as long as the commit remains the head, because
+// finalized fs: references are permanent until a later head transition removes
+// them (which also changes the head, so the idempotent path no longer matches).
+type syncFinalizedDeltaSet struct {
+	mu   sync.Mutex
+	cur  map[string]struct{}
+	prev map[string]struct{}
+}
+
+func newSyncFinalizedDeltaSet() *syncFinalizedDeltaSet {
+	return &syncFinalizedDeltaSet{cur: make(map[string]struct{}, syncFinalizedDeltaShardCap)}
+}
+
+func (s *syncFinalizedDeltaSet) mark(repoID, commitID string) {
+	if s == nil || repoID == "" || commitID == "" {
+		return
+	}
+	key := repoID + ":" + commitID
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.cur) >= syncFinalizedDeltaShardCap {
+		s.prev = s.cur
+		s.cur = make(map[string]struct{}, syncFinalizedDeltaShardCap)
+	}
+	s.cur[key] = struct{}{}
+}
+
+func (s *syncFinalizedDeltaSet) contains(repoID, commitID string) bool {
+	if s == nil || repoID == "" || commitID == "" {
+		return false
+	}
+	key := repoID + ":" + commitID
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.cur[key]; ok {
+		return true
+	}
+	_, ok := s.prev[key]
+	return ok
 }
 
 // checkSyncPermission verifies the user has the required permission level on the library.
@@ -124,8 +192,12 @@ func (h *SyncHandler) lookupLibraryStorageClass(orgID, repoID string) string {
 	return storageClass
 }
 
+var lookupLibraryStorageClassForSyncFn = func(h *SyncHandler, orgID, repoID string) string {
+	return h.lookupLibraryStorageClass(orgID, repoID)
+}
+
 func (h *SyncHandler) resolvePreferredLibraryStorageClass(c *gin.Context, orgID, repoID string) string {
-	libraryClass := h.lookupLibraryStorageClass(orgID, repoID)
+	libraryClass := lookupLibraryStorageClassForSyncFn(h, orgID, repoID)
 	if h.storageManager != nil {
 		configuredURL := ""
 		if h.config != nil {
@@ -190,6 +262,13 @@ func (h *SyncHandler) resolvePreferredBlockStore(c *gin.Context, orgID, repoID s
 
 // formatSizeSeafile delegates to httputil.FormatSizeSeafile.
 var formatSizeSeafile = httputil.FormatSizeSeafile
+var syncBlockExistsFn = func(ctx context.Context, blockStore *storage.BlockStore, hash string) (bool, error) {
+	return blockStore.BlockExists(ctx, hash)
+}
+var syncPutBlockDataFn = func(ctx context.Context, blockStore *storage.BlockStore, block *storage.BlockData) (string, error) {
+	return blockStore.PutBlockData(ctx, block)
+}
+var registerUploadedBlockAndMappingForSyncFn = v2.RegisterUploadedBlockAndMapping
 
 // formatRelativeTimeHTML delegates to httputil.FormatRelativeTimeHTML.
 var formatRelativeTimeHTML = httputil.FormatRelativeTimeHTML
@@ -863,7 +942,7 @@ func (h *SyncHandler) PutBlock(c *gin.Context) {
 	log.Printf("PutBlock: storing block external=%s internal=%s in storage class %s\n",
 		externalID, internalID, storageClass)
 
-	exists, err := blockStore.BlockExists(c.Request.Context(), internalID)
+	exists, err := syncBlockExistsFn(c.Request.Context(), blockStore, internalID)
 	if err != nil {
 		log.Printf("PutBlock: failed to check block existence: %v\n", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to check block existence"})
@@ -885,7 +964,7 @@ func (h *SyncHandler) PutBlock(c *gin.Context) {
 	}
 
 	if !exists {
-		_, err = blockStore.PutBlockData(c.Request.Context(), blockData)
+		_, err = syncPutBlockDataFn(c.Request.Context(), blockStore, blockData)
 		if err != nil {
 			log.Printf("PutBlock: failed to store in backend: %v\n", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to store block"})
@@ -895,25 +974,31 @@ func (h *SyncHandler) PutBlock(c *gin.Context) {
 
 	// Store block metadata and mapping (if DB available)
 	if h.db != nil {
-		now := time.Now()
-
-		// Store block metadata using internal ID
-		if err := v2.NewFSHelper(h.db).IncrementOrCreateBlock(orgID, internalID, len(data), storageClass, ""); err != nil {
+		// Store block metadata + a deterministic provisional reference so the
+		// later sync head publish can promote or release exactly this upload pin,
+		// then write the legacy SHA-1 mapping only if the client needs it.
+		operationID := syncBlockUploadOperationID(repoID, internalID)
+		externalMappingID := ""
+		if isLegacySHA1 {
+			externalMappingID = externalID
+		}
+		if err := registerUploadedBlockAndMappingForSyncFn(h.db, orgID, repoID, internalID, operationID, len(data), storageClass, "", externalMappingID); err != nil {
+			if errors.Is(err, v2.ErrBlockMappingWriteFailed) {
+				log.Printf("PutBlock: failed to store block mapping org=%s ext=%s int=%s: %v", orgID, externalID, internalID, err)
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create block mapping"})
+				return
+			}
 			log.Printf("PutBlock: failed to store block metadata org=%s block=%s: %v", orgID, internalID, err)
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to store block metadata"})
+			if errors.Is(err, v2.ErrBlockDeleteInProgress) {
+				c.JSON(http.StatusConflict, gin.H{"error": "block is being deleted; retry the upload"})
+			} else {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to store block metadata"})
+			}
 			return
 		}
 
 		// If legacy SHA-1 client, store mapping external→internal (dual-write: forward + reverse)
 		if isLegacySHA1 {
-			_ = h.db.Session().Query(`
-				INSERT INTO block_id_mappings (org_id, external_id, internal_id, created_at)
-				VALUES (?, ?, ?, ?)
-			`, orgID, externalID, internalID, now).Exec()
-			_ = h.db.Session().Query(`
-				INSERT INTO block_id_mappings_by_internal (org_id, internal_id, external_id, created_at)
-				VALUES (?, ?, ?, ?)
-			`, orgID, internalID, externalID, now).Exec()
 			log.Printf("PutBlock: stored mapping %s → %s\n", externalID, internalID)
 		}
 	}
@@ -2382,6 +2467,357 @@ func shortSyncCommitID(commitID string) string {
 	return commitID[:8]
 }
 
+type syncCommitFileReference struct {
+	fsID     string
+	blockIDs []string
+}
+
+const syncReachableFileBatchSize = 128
+
+type syncCommitBlockDelta struct {
+	addedFiles            []syncCommitFileReference
+	removedFiles          []syncCommitFileReference
+	resolvedAddedBlockIDs []string
+}
+
+func (d syncCommitBlockDelta) addedBlockIDs() []string {
+	if len(d.addedFiles) == 0 {
+		return nil
+	}
+	blockIDs := make([]string, 0)
+	for _, file := range d.addedFiles {
+		blockIDs = append(blockIDs, file.blockIDs...)
+	}
+	return blockIDs
+}
+
+func syncBlockUploadOperationID(repoID, blockID string) string {
+	return "sync:" + repoID + ":" + blockID
+}
+
+func (h *SyncHandler) loadSyncFileBlockIDs(repoID string, fileIDs []string) (map[string][]string, error) {
+	resolved := make(map[string][]string, len(fileIDs))
+	if len(fileIDs) == 0 {
+		return resolved, nil
+	}
+
+	want := make(map[string]struct{}, len(fileIDs))
+	ordered := make([]string, 0, len(fileIDs))
+	for _, fileID := range fileIDs {
+		fileID = strings.TrimSpace(fileID)
+		if fileID == "" {
+			continue
+		}
+		if _, seen := want[fileID]; seen {
+			continue
+		}
+		want[fileID] = struct{}{}
+		ordered = append(ordered, fileID)
+	}
+
+	for start := 0; start < len(ordered); start += syncReachableFileBatchSize {
+		end := start + syncReachableFileBatchSize
+		if end > len(ordered) {
+			end = len(ordered)
+		}
+
+		iter := h.db.Session().Query(`
+			SELECT fs_id, obj_type, block_ids FROM fs_objects WHERE library_id = ? AND fs_id IN ?
+		`, repoID, ordered[start:end]).Iter()
+
+		var fsID string
+		var objType string
+		var blockIDs []string
+		for iter.Scan(&fsID, &objType, &blockIDs) {
+			if objType != "file" {
+				_ = iter.Close()
+				return nil, fmt.Errorf("unsupported fs_object type %q for %s", objType, fsID)
+			}
+			normalized := db.NormalizeBlockIDs(blockIDs)
+			if len(normalized) == 0 {
+				resolved[fsID] = nil
+				continue
+			}
+			resolved[fsID] = normalized
+		}
+		if err := iter.Close(); err != nil {
+			return nil, fmt.Errorf("load file fs_objects %v: %w", ordered[start:end], err)
+		}
+	}
+
+	for _, fileID := range ordered {
+		if _, ok := resolved[fileID]; !ok {
+			return nil, fmt.Errorf("load fs_object %s: not found", fileID)
+		}
+	}
+
+	return resolved, nil
+}
+
+func (h *SyncHandler) collectSyncReachableFiles(repoID, rootFSID string) (map[string][]string, error) {
+	files := make(map[string][]string)
+	rootFSID = strings.TrimSpace(rootFSID)
+	if rootFSID == "" || rootFSID == strings.Repeat("0", 40) {
+		return files, nil
+	}
+	visited := make(map[string]struct{})
+	var walk func(string) error
+	walk = func(fsID string) error {
+		fsID = strings.TrimSpace(fsID)
+		if fsID == "" {
+			return nil
+		}
+		if _, seen := visited[fsID]; seen {
+			return nil
+		}
+		visited[fsID] = struct{}{}
+
+		var objType string
+		var dirEntries string
+		var blockIDs []string
+		if err := h.db.Session().Query(`
+			SELECT obj_type, dir_entries, block_ids FROM fs_objects WHERE library_id = ? AND fs_id = ?
+		`, repoID, fsID).Scan(&objType, &dirEntries, &blockIDs); err != nil {
+			return fmt.Errorf("load fs_object %s: %w", fsID, err)
+		}
+
+		switch objType {
+		case "file":
+			normalized := db.NormalizeBlockIDs(blockIDs)
+			if len(normalized) != 0 {
+				files[fsID] = normalized
+			}
+			return nil
+		case "dir":
+			if dirEntries == "" || dirEntries == "[]" {
+				return nil
+			}
+			var entries []FSEntry
+			if err := json.Unmarshal([]byte(dirEntries), &entries); err != nil {
+				return fmt.Errorf("parse dir_entries for %s: %w", fsID, err)
+			}
+			fileIDs := make([]string, 0, len(entries))
+			dirIDs := make([]string, 0, len(entries))
+			fallbackIDs := make([]string, 0)
+			for _, entry := range entries {
+				if entry.ID == "" {
+					continue
+				}
+				switch entry.Mode {
+				case 33188:
+					fileIDs = append(fileIDs, entry.ID)
+				case 16384:
+					dirIDs = append(dirIDs, entry.ID)
+				default:
+					fallbackIDs = append(fallbackIDs, entry.ID)
+				}
+			}
+			fileBlockIDs, err := h.loadSyncFileBlockIDs(repoID, fileIDs)
+			if err != nil {
+				return err
+			}
+			for fileID, resolvedBlockIDs := range fileBlockIDs {
+				if len(resolvedBlockIDs) == 0 {
+					continue
+				}
+				files[fileID] = append([]string(nil), resolvedBlockIDs...)
+			}
+			for _, childID := range dirIDs {
+				if err := walk(childID); err != nil {
+					return err
+				}
+			}
+			for _, childID := range fallbackIDs {
+				if err := walk(childID); err != nil {
+					return err
+				}
+			}
+			return nil
+		default:
+			return fmt.Errorf("unsupported fs_object type %q for %s", objType, fsID)
+		}
+	}
+
+	if err := walk(rootFSID); err != nil {
+		return nil, err
+	}
+	return files, nil
+}
+
+func (h *SyncHandler) collectSyncCommitFiles(repoID, commitID string) (map[string][]string, error) {
+	commitID = strings.TrimSpace(commitID)
+	if commitID == "" {
+		return map[string][]string{}, nil
+	}
+	rootFSID, err := h.readCommitRootFSID(repoID, commitID)
+	if err != nil {
+		return nil, fmt.Errorf("read root fs_id for commit %s: %w", commitID, err)
+	}
+	return h.collectSyncReachableFiles(repoID, rootFSID)
+}
+
+// buildSyncCommitBlockDelta computes the file-level block reference delta between
+// targetCommitID and its immediate parent.
+//
+// INVARIANT (load-bearing): the head only ever advances by exactly one generation
+// — either a direct fast-forward where the target's parent IS the current head
+// (enforced in handleSyncHeadPromotion) or an auto-merge commit whose parent IS
+// the current head (createSyncAutoMergeCommit). A single-generation diff therefore
+// captures every newly-reachable file, so registering fs: references for the added
+// files covers the whole transition. If a future change ever allows the head to
+// jump multiple generations at once, files added by skipped intermediate commits
+// would never get their permanent references and this delta must be revisited.
+func (h *SyncHandler) buildSyncCommitBlockDelta(repoID, targetCommitID string) (syncCommitBlockDelta, error) {
+	parentCommitID, _, err := h.readSyncTargetCommit(repoID, targetCommitID)
+	if err != nil {
+		return syncCommitBlockDelta{}, fmt.Errorf("read target commit %s: %w", targetCommitID, err)
+	}
+
+	parentFiles, err := h.collectSyncCommitFiles(repoID, parentCommitID)
+	if err != nil {
+		return syncCommitBlockDelta{}, fmt.Errorf("collect parent commit %s files: %w", parentCommitID, err)
+	}
+	targetFiles, err := h.collectSyncCommitFiles(repoID, targetCommitID)
+	if err != nil {
+		return syncCommitBlockDelta{}, fmt.Errorf("collect target commit %s files: %w", targetCommitID, err)
+	}
+
+	delta := syncCommitBlockDelta{}
+	for fsID, blockIDs := range targetFiles {
+		if _, existed := parentFiles[fsID]; existed {
+			continue
+		}
+		delta.addedFiles = append(delta.addedFiles, syncCommitFileReference{fsID: fsID, blockIDs: append([]string(nil), blockIDs...)})
+	}
+	for fsID, blockIDs := range parentFiles {
+		if _, stillPresent := targetFiles[fsID]; stillPresent {
+			continue
+		}
+		delta.removedFiles = append(delta.removedFiles, syncCommitFileReference{fsID: fsID, blockIDs: append([]string(nil), blockIDs...)})
+	}
+	sort.Slice(delta.addedFiles, func(i, j int) bool { return delta.addedFiles[i].fsID < delta.addedFiles[j].fsID })
+	sort.Slice(delta.removedFiles, func(i, j int) bool { return delta.removedFiles[i].fsID < delta.removedFiles[j].fsID })
+	return delta, nil
+}
+
+func (h *SyncHandler) resolveSyncBlockIDs(orgID string, blockIDs []string) ([]string, error) {
+	blockIDs = db.NormalizeBlockIDs(blockIDs)
+	if len(blockIDs) == 0 {
+		return nil, nil
+	}
+	resolved, err := streaming.BatchResolveBlockIDs(h.db, orgID, blockIDs)
+	if err != nil {
+		return nil, err
+	}
+	return db.NormalizeBlockIDs(resolved), nil
+}
+
+func (h *SyncHandler) stageSyncCommitBlockDelta(orgID, repoID, targetCommitID string) (syncCommitBlockDelta, error) {
+	delta, err := h.buildSyncCommitBlockDelta(repoID, targetCommitID)
+	if err != nil {
+		return syncCommitBlockDelta{}, err
+	}
+	resolved, err := db.StagePublishAttemptReferences(h.db, orgID, repoID, targetCommitID, delta.addedBlockIDs(), func(blockIDs []string) ([]string, error) {
+		return h.resolveSyncBlockIDs(orgID, blockIDs)
+	})
+	if err != nil {
+		return syncCommitBlockDelta{}, fmt.Errorf("stage publish-attempt refs for sync commit %s: %w", targetCommitID, err)
+	}
+	delta.resolvedAddedBlockIDs = resolved
+	return delta, nil
+}
+
+func (h *SyncHandler) releaseSyncUploadReferences(orgID, repoID string, blockIDs []string) {
+	fsHelper := v2.NewFSHelper(h.db)
+	var zeroRefBlocks []string
+	for _, blockID := range db.NormalizeBlockIDs(blockIDs) {
+		zeroRefBlocks = append(zeroRefBlocks, fsHelper.ReleaseUploadReferences(orgID, repoID, syncBlockUploadOperationID(repoID, blockID), []string{blockID})...)
+	}
+	h.enqueueSyncZeroRefBlocks(orgID, repoID, zeroRefBlocks)
+}
+
+func (h *SyncHandler) removeSyncCommitFileReferences(orgID, repoID string, removedFiles []syncCommitFileReference) error {
+	// fs:* references track persisted fs_objects, not membership in the current
+	// HEAD. The retention/reachability GC owns removing these rows after the
+	// fs_object itself is no longer retained.
+	return nil
+}
+
+func (h *SyncHandler) enqueueSyncZeroRefBlocks(orgID, repoID string, blockIDs []string) {
+	blockIDs = db.NormalizeBlockIDs(blockIDs)
+	if h.db == nil || len(blockIDs) == 0 {
+		return
+	}
+	blockEnqueuer := v2.GetBlockEnqueuerFunc()
+	if blockEnqueuer == nil {
+		return
+	}
+
+	var storageClass string
+	if err := h.db.Session().Query(`
+		SELECT storage_class FROM libraries WHERE org_id = ? AND library_id = ?
+	`, orgID, repoID).Scan(&storageClass); err != nil {
+		log.Printf("[enqueueSyncZeroRefBlocks] failed to load storage class for repo %s: %v", repoID, err)
+		return
+	}
+	blockEnqueuer.EnqueueBlocks(orgID, blockIDs, storageClass)
+}
+
+func (h *SyncHandler) finalizeSyncCommitBlockDelta(orgID, repoID, targetCommitID string, delta syncCommitBlockDelta) error {
+	if len(delta.resolvedAddedBlockIDs) == 0 && len(delta.addedFiles) > 0 {
+		resolved, err := h.resolveSyncBlockIDs(orgID, delta.addedBlockIDs())
+		if err != nil {
+			return fmt.Errorf("resolve added block IDs for sync commit %s: %w", targetCommitID, err)
+		}
+		delta.resolvedAddedBlockIDs = resolved
+	}
+
+	fsHelper := v2.NewFSHelper(h.db)
+	if err := db.PromotePublishAttemptReferences(h.db, orgID, targetCommitID, delta.resolvedAddedBlockIDs, func() error {
+		for _, file := range delta.addedFiles {
+			if err := fsHelper.RegisterFSObjectBlockReferences(orgID, repoID, file.fsID, file.blockIDs); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		return fmt.Errorf("promote publish-attempt refs for sync commit %s: %w", targetCommitID, err)
+	}
+	if err := h.removeSyncCommitFileReferences(orgID, repoID, delta.removedFiles); err != nil {
+		return err
+	}
+	h.releaseSyncUploadReferences(orgID, repoID, delta.resolvedAddedBlockIDs)
+	h.finalizedBlockDeltas.mark(repoID, targetCommitID)
+	return nil
+}
+
+// repairPublishedSyncCommitBlockDelta re-runs the block-reference reconciliation
+// for an already-published head on the idempotent retry path, healing a prior
+// publish whose finalize did not complete. It is a no-op when this process already
+// finalized the exact (repo, head): the full-tree reachability walk is the costly
+// part, so skipping it spares every idempotent retry once finalize has succeeded
+// here. A miss (cold process, another instance, evicted entry) safely falls back
+// to the full reconciliation, which is idempotent.
+func (h *SyncHandler) repairPublishedSyncCommitBlockDelta(orgID, repoID, targetCommitID string) error {
+	if h == nil {
+		return nil
+	}
+	if h.finalizedBlockDeltas.contains(repoID, targetCommitID) {
+		return nil
+	}
+	if h.repairPublishedSyncCommitBlockDeltaFn != nil {
+		return h.repairPublishedSyncCommitBlockDeltaFn(orgID, repoID, targetCommitID)
+	}
+	if h.db == nil {
+		return nil
+	}
+	delta, err := h.buildSyncCommitBlockDelta(repoID, targetCommitID)
+	if err != nil {
+		return err
+	}
+	return h.finalizeSyncCommitBlockDelta(orgID, repoID, targetCommitID, delta)
+}
+
 func (h *SyncHandler) tryAutoMergeSyncHeadPromotion(c *gin.Context, orgID, userID, repoID, currentHead, targetHead, baseHead, operation string) (bool, error) {
 	baseRootFSID, err := h.readCommitRootFSID(repoID, baseHead)
 	if err != nil {
@@ -2422,8 +2858,39 @@ func (h *SyncHandler) tryAutoMergeSyncHeadPromotion(c *gin.Context, orgID, userI
 		return false, err
 	}
 
-	if err := h.updateLibraryHeadWithStats(orgID, repoID, mergedCommitID, userID, currentHead); err != nil {
+	delta, err := h.stageSyncCommitBlockDelta(orgID, repoID, mergedCommitID)
+	if err != nil {
 		return false, err
+	}
+	cleanupStaged := true
+	defer func() {
+		if !cleanupStaged {
+			return
+		}
+		if cleanupErr := db.RemovePublishAttemptReferences(h.db, orgID, mergedCommitID, delta.resolvedAddedBlockIDs); cleanupErr != nil {
+			log.Printf("%s: failed to cleanup staged refs for auto-merged commit %s in repo %s: %v", operation, mergedCommitID, repoID, cleanupErr)
+		}
+	}()
+
+	if err := h.updateLibraryHeadWithStats(orgID, repoID, mergedCommitID, userID, currentHead); err != nil {
+		if errors.Is(err, errSyncHeadRepairPending) {
+			cleanupStaged = false
+			if finalizeErr := h.finalizeSyncCommitBlockDelta(orgID, repoID, mergedCommitID, delta); finalizeErr != nil {
+				return false, fmt.Errorf("finalize auto-merged sync commit %s after publish: %w", mergedCommitID, finalizeErr)
+			}
+			go h.updateFullPaths(repoID, mergedRootFSID)
+			c.Header("Retry-After", "1")
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "sync head publish pending storage reconciliation; retry"})
+			return true, nil
+		}
+		return false, err
+	}
+	cleanupStaged = false
+	if err := h.finalizeSyncCommitBlockDelta(orgID, repoID, mergedCommitID, delta); err != nil {
+		go h.updateFullPaths(repoID, mergedRootFSID)
+		c.Header("Retry-After", "1")
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "sync head publish block-reference reconciliation pending; retry"})
+		return true, nil
 	}
 
 	go h.updateFullPaths(repoID, mergedRootFSID)
@@ -2514,19 +2981,52 @@ func (h *SyncHandler) handleSyncHeadPromotion(c *gin.Context, orgID, userID, rep
 			return
 		}
 
+		delta, err := h.stageSyncCommitBlockDelta(orgID, repoID, targetHead)
+		if err != nil {
+			log.Printf("%s: failed to stage block refs for repo %s head %s: %v", operation, repoID, targetHead, err)
+			c.Header("Retry-After", "1")
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "sync head publish block references pending; retry"})
+			return
+		}
+		cleanupStaged := true
+
+		cleanupAttempt := func() {
+			if !cleanupStaged {
+				return
+			}
+			if cleanupErr := db.RemovePublishAttemptReferences(h.db, orgID, targetHead, delta.resolvedAddedBlockIDs); cleanupErr != nil {
+				log.Printf("%s: failed to cleanup staged refs for repo %s head %s: %v", operation, repoID, targetHead, cleanupErr)
+			}
+		}
+
 		if err := h.updateLibraryHeadWithStats(orgID, repoID, targetHead, userID, currentHead); err != nil {
 			if !errors.Is(err, ErrHeadConflict) {
 				if errors.Is(err, errSyncHeadRepairPending) {
+					cleanupStaged = false
+					if finalizeErr := h.finalizeSyncCommitBlockDelta(orgID, repoID, targetHead, delta); finalizeErr != nil {
+						log.Printf("%s: published repo %s head to %s but block-reference reconciliation failed: %v", operation, repoID, targetHead, finalizeErr)
+						if rootFSID != "" {
+							go h.updateFullPaths(repoID, rootFSID)
+						}
+						c.Header("Retry-After", "1")
+						c.JSON(http.StatusServiceUnavailable, gin.H{"error": "sync head publish block-reference reconciliation pending; retry"})
+						return
+					}
 					log.Printf("%s: published repo %s head to %s but aggregate storage reconciliation is still pending: %v", operation, repoID, targetHead, err)
+					if rootFSID != "" {
+						go h.updateFullPaths(repoID, rootFSID)
+					}
 					c.Header("Retry-After", "1")
 					c.JSON(http.StatusServiceUnavailable, gin.H{"error": "sync head publish pending storage reconciliation; retry"})
 					return
 				}
+				cleanupAttempt()
 				log.Printf("%s: failed to update head for repo %s: %v", operation, repoID, err)
 				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update head"})
 				return
 			}
 
+			cleanupAttempt()
 			log.Printf("%s: CAS conflict for repo %s on attempt %d/%d", operation, repoID, attempt+1, maxAttempts)
 			if attempt == maxAttempts-1 {
 				log.Printf("%s: CAS conflict budget exhausted for repo %s targeting %s after %d attempts; returning 503 so clients preserve local state and retry",
@@ -2537,6 +3037,16 @@ func (h *SyncHandler) handleSyncHeadPromotion(c *gin.Context, orgID, userID, rep
 			}
 			time.Sleep(v2.RetryBackoff(attempt + 1))
 			continue
+		}
+		cleanupStaged = false
+		if err := h.finalizeSyncCommitBlockDelta(orgID, repoID, targetHead, delta); err != nil {
+			log.Printf("%s: published repo %s head to %s but block-reference reconciliation failed: %v", operation, repoID, targetHead, err)
+			if rootFSID != "" {
+				go h.updateFullPaths(repoID, rootFSID)
+			}
+			c.Header("Retry-After", "1")
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "sync head publish block-reference reconciliation pending; retry"})
+			return
 		}
 
 		if rootFSID != "" {
@@ -2861,6 +3371,12 @@ func (h *SyncHandler) repairPublishedSyncHeadAfterCounterFailure(orgID, repoID, 
 // repairSyncHeadDerivedStateIfDriftedFn when set so unit tests can inject a
 // failing canary without needing a real DB session.
 func (h *SyncHandler) handleSyncHeadIdempotentSuccess(c *gin.Context, orgID, repoID, targetHead, operation string) {
+	if err := h.repairPublishedSyncCommitBlockDelta(orgID, repoID, targetHead); err != nil {
+		log.Printf("%s: idempotent path detected block-reference drift for repo %s but repair failed: %v", operation, repoID, err)
+		c.Header("Retry-After", "1")
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "sync head publish block-reference reconciliation pending; retry"})
+		return
+	}
 	repair := h.repairSyncHeadDerivedStateIfDriftedFn
 	if repair == nil {
 		repair = h.repairSyncHeadDerivedStateIfDrifted

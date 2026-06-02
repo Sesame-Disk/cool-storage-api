@@ -27,6 +27,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime/multipart"
@@ -38,6 +39,7 @@ import (
 	"testing"
 	"time"
 
+	gocql "github.com/apache/cassandra-gocql-driver/v2"
 	"github.com/google/uuid"
 )
 
@@ -83,6 +85,68 @@ func uploadViaLinkConcurrent(c *testClient, uploadURL, filename, parentDir, cont
 	return concurrentMutationResult{status: resp.StatusCode, body: string(body)}
 }
 
+func uploadChunkThroughLinkStatusConcurrent(c *testClient, uploadURL, fileName, parentDir string, content []byte, contentRange string) (int, string, error) {
+	var buf bytes.Buffer
+	writer := multipart.NewWriter(&buf)
+	part, err := writer.CreateFormFile("file", fileName)
+	if err != nil {
+		return 0, "", err
+	}
+	if _, err := part.Write(content); err != nil {
+		return 0, "", err
+	}
+	if err := writer.WriteField("parent_dir", parentDir); err != nil {
+		return 0, "", err
+	}
+	if err := writer.Close(); err != nil {
+		return 0, "", err
+	}
+
+	req, err := http.NewRequest(http.MethodPost, uploadURL, &buf)
+	if err != nil {
+		return 0, "", err
+	}
+	req.Header.Set("Authorization", "Token "+c.token)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	req.Header.Set("Content-Range", contentRange)
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return 0, "", err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return 0, "", err
+	}
+	return resp.StatusCode, string(body), nil
+}
+
+func uploadChunkedViaLinkConcurrent(c *testClient, uploadURL, filename, parentDir, content string) concurrentMutationResult {
+	data := []byte(content)
+	if len(data) < 2 {
+		data = append(data, 'x')
+	}
+	split := len(data) / 2
+	if split == 0 {
+		split = 1
+	}
+
+	status, body, err := uploadChunkThroughLinkStatusConcurrent(c, uploadURL, filename, parentDir, data[:split], fmt.Sprintf("bytes %d-%d/%d", 0, split-1, len(data)))
+	if err != nil {
+		return concurrentMutationResult{err: err}
+	}
+	if status != http.StatusOK && status != http.StatusCreated {
+		return concurrentMutationResult{status: status, body: body}
+	}
+
+	status, body, err = uploadChunkThroughLinkStatusConcurrent(c, uploadURL, filename, parentDir, data[split:], fmt.Sprintf("bytes %d-%d/%d", split, len(data)-1, len(data)))
+	if err != nil {
+		return concurrentMutationResult{err: err}
+	}
+	return concurrentMutationResult{status: status, body: body}
+}
+
 // uploadViaV2DirectConcurrent posts a multipart file to the direct v2 upload
 // endpoint so the request exercises files.go UploadFile and
 // finalizeStoredUploadMetadataOnce instead of seafhttp.
@@ -123,6 +187,58 @@ func uploadTokenFromURL(uploadURL string) string {
 		return ""
 	}
 	return uploadURL[idx+1:]
+}
+
+func uploadedFileBlockReferrers(t *testing.T, repoID, dirPath, fileName string) []string {
+	t.Helper()
+	session := shareProjectionDBForTest(t).Session()
+	orgID := resolveOrgID(t, repoID)
+
+	listResp := adminClient.Get(t, fmt.Sprintf("/api/v2.1/repos/%s/dir/?p=%s", repoID, url.QueryEscape(dirPath)))
+	expectStatus(t, listResp, http.StatusOK)
+	var dirList map[string]interface{}
+	decodeJSON(t, listResp, &dirList)
+	entries, _ := dirList["dirent_list"].([]interface{})
+
+	var fileFSID string
+	for _, rawEntry := range entries {
+		entry, _ := rawEntry.(map[string]interface{})
+		if name, _ := entry["name"].(string); name == fileName {
+			fileFSID, _ = entry["id"].(string)
+			break
+		}
+	}
+	if fileFSID == "" {
+		t.Fatalf("uploaded file %q not found in %s", fileName, dirPath)
+	}
+
+	var blockIDs []string
+	if err := session.Query(`SELECT block_ids FROM fs_objects WHERE library_id = ? AND fs_id = ?`, repoID, fileFSID).Scan(&blockIDs); err != nil {
+		t.Fatalf("failed to read block ids for %s/%s: %v", repoID, fileFSID, err)
+	}
+	if len(blockIDs) != 1 {
+		t.Fatalf("block ids for %q = %v, want exactly one block", fileName, blockIDs)
+	}
+
+	var internalBlockID string
+	if err := session.Query(`SELECT internal_id FROM block_id_mappings WHERE org_id = ? AND external_id = ?`, orgID, blockIDs[0]).Scan(&internalBlockID); err != nil {
+		if errors.Is(err, gocql.ErrNotFound) {
+			internalBlockID = blockIDs[0]
+		} else {
+			t.Fatalf("failed to resolve block mapping for %s/%s: %v", orgID, blockIDs[0], err)
+		}
+	}
+
+	iter := session.Query(`SELECT referrer FROM block_references WHERE org_id = ? AND block_id = ?`, orgID, internalBlockID).Iter()
+	referrers := make([]string, 0, 4)
+	var referrer string
+	for iter.Scan(&referrer) {
+		referrers = append(referrers, referrer)
+	}
+	if err := iter.Close(); err != nil {
+		t.Fatalf("failed to read block references for %s/%s: %v", orgID, internalBlockID, err)
+	}
+	return referrers
 }
 
 // ── 1. High-concurrency seafhttp upload (commitUploadedFile path) ─────────────
@@ -302,6 +418,7 @@ func TestConcurrentSeafhttpUploadWhileDeletingNoLostFiles(t *testing.T) {
 
 func TestConcurrentV2UploadsNoLostCommits(t *testing.T) {
 	const concurrency = 10
+	requireCassandra(t)
 
 	repoID := createTestLibrary(t, adminClient, fmt.Sprintf("inttest-v2upload-race-%d", time.Now().UnixNano()))
 
@@ -318,6 +435,22 @@ func TestConcurrentV2UploadsNoLostCommits(t *testing.T) {
 	})
 	expectConcurrentStatuses(t, results, http.StatusOK, http.StatusCreated)
 	expectEntriesPresent(t, repoID, "/", names)
+
+	for _, name := range names {
+		referrers := uploadedFileBlockReferrers(t, repoID, "/", name)
+		fsRefs := 0
+		for _, referrer := range referrers {
+			if strings.HasPrefix(referrer, "pub:") {
+				t.Fatalf("uploaded file %q leaked publish-attempt ref %q after concurrent finalize", name, referrer)
+			}
+			if strings.HasPrefix(referrer, "fs:") {
+				fsRefs++
+			}
+		}
+		if fsRefs != 1 {
+			t.Fatalf("uploaded file %q fs ref count = %d, want 1; referrers=%v", name, fsRefs, referrers)
+		}
+	}
 }
 
 // ── 5. Subdirectory upload concurrency ────────────────────────────────────────
@@ -352,6 +485,27 @@ func TestConcurrentSeafhttpUploadsToSubdirNoLostCommits(t *testing.T) {
 	})
 	expectConcurrentStatuses(t, results, http.StatusOK, http.StatusCreated)
 	expectEntriesPresent(t, repoID, "/subdir", names)
+}
+
+func TestConcurrentChunkedSeafhttpUploadsNoFinalizeFailures(t *testing.T) {
+	const concurrency = 8
+
+	repoID := createTestLibrary(t, adminClient, fmt.Sprintf("inttest-chunked-finalize-race-%d", time.Now().UnixNano()))
+	uploadURL := getUploadLink(t, adminClient, repoID, "/")
+
+	names := make([]string, concurrency)
+	for i := range names {
+		names[i] = fmt.Sprintf("chunked-race-%02d.txt", i)
+	}
+
+	results := runConcurrentMutations(t, names, func(name string) concurrentMutationResult {
+		content := strings.Repeat(name+"-", 32) + fmt.Sprintf("%d", time.Now().UnixNano())
+		r := uploadChunkedViaLinkConcurrent(adminClient, uploadURL, name, "/", content)
+		r.name = name
+		return r
+	})
+	expectConcurrentStatuses(t, results, http.StatusOK, http.StatusCreated)
+	expectEntriesPresent(t, repoID, "/", names)
 }
 
 // When a resumable upload starts first but another writer creates the original

@@ -12,7 +12,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"reflect"
-	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -32,6 +32,269 @@ func init() {
 
 type mockObjectStore struct {
 	data []byte
+}
+
+func TestAcquireChunkedUploadLibraryFinalizePermitSerializesSameRepo(t *testing.T) {
+	releaseFirst, err := acquireChunkedUploadLibraryFinalizePermit(context.Background(), "repo-1")
+	if err != nil {
+		t.Fatalf("first acquire failed: %v", err)
+	}
+	releasedFirst := false
+	defer func() {
+		if !releasedFirst {
+			releaseFirst()
+		}
+	}()
+
+	blockedCtx, cancelBlocked := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancelBlocked()
+	releaseSecond, err := acquireChunkedUploadLibraryFinalizePermit(blockedCtx, "repo-1")
+	if releaseSecond != nil {
+		releaseSecond()
+		t.Fatal("second acquire should not succeed while first permit is held for the same repo")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("second acquire error = %v, want context deadline exceeded while blocked", err)
+	}
+
+	releaseFirst()
+	releasedFirst = true
+
+	releaseSecond, err = acquireChunkedUploadLibraryFinalizePermit(context.Background(), "repo-1")
+	if err != nil {
+		t.Fatalf("second acquire failed after release: %v", err)
+	}
+	releaseSecond()
+}
+
+func TestAcquireChunkedUploadLibraryFinalizePermitDoesNotBlockDifferentRepos(t *testing.T) {
+	releaseFirst, err := acquireChunkedUploadLibraryFinalizePermit(context.Background(), "repo-1")
+	if err != nil {
+		t.Fatalf("first acquire failed: %v", err)
+	}
+	defer releaseFirst()
+
+	releaseSecond, err := acquireChunkedUploadLibraryFinalizePermit(context.Background(), "repo-2")
+	if err != nil {
+		t.Fatalf("second acquire for different repo failed: %v", err)
+	}
+	releaseSecond()
+}
+
+func TestNewSeafHTTPUploadMetadataFinalizeContext_IgnoresCanceledRequest(t *testing.T) {
+	requestCtx, cancelRequest := context.WithCancel(context.Background())
+	cancelRequest()
+
+	finalizeCtx, cancelFinalize := newSeafHTTPUploadMetadataFinalizeContext()
+	defer cancelFinalize()
+
+	if err := requestCtx.Err(); !errors.Is(err, context.Canceled) {
+		t.Fatalf("requestCtx.Err() = %v, want context canceled", err)
+	}
+	if err := finalizeCtx.Err(); err != nil {
+		t.Fatalf("finalizeCtx.Err() = %v, want nil for server-side finalize context", err)
+	}
+
+	select {
+	case <-finalizeCtx.Done():
+		t.Fatal("server-side finalize context should stay alive independent of the request context")
+	default:
+	}
+}
+
+func TestAcquireSeafHTTPDistributedUploadFinalizeLeaseRenewsWhileHeld(t *testing.T) {
+	origTryAcquire := tryAcquireSeafHTTPUploadFinalizeLeaseFn
+	origRenew := renewSeafHTTPUploadFinalizeLeaseFn
+	origRelease := releaseSeafHTTPUploadFinalizeLeaseFn
+	defer func() {
+		tryAcquireSeafHTTPUploadFinalizeLeaseFn = origTryAcquire
+		renewSeafHTTPUploadFinalizeLeaseFn = origRenew
+		releaseSeafHTTPUploadFinalizeLeaseFn = origRelease
+	}()
+
+	leaseTTL := 40 * time.Millisecond
+	renewInterval := 10 * time.Millisecond
+
+	type leaseState struct {
+		token     string
+		expiresAt time.Time
+	}
+
+	var (
+		mu         sync.Mutex
+		state      = map[string]leaseState{}
+		renewCount int
+	)
+
+	tryAcquireSeafHTTPUploadFinalizeLeaseFn = func(ctx context.Context, database *db.DB, leaseRole, leaseToken string, ttlSeconds int) (bool, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		now := time.Now()
+		current := state[leaseRole]
+		if current.token == "" || !now.Before(current.expiresAt) {
+			state[leaseRole] = leaseState{token: leaseToken, expiresAt: now.Add(leaseTTL)}
+			return true, nil
+		}
+		return false, nil
+	}
+
+	renewSeafHTTPUploadFinalizeLeaseFn = func(ctx context.Context, database *db.DB, leaseRole, leaseToken string, ttlSeconds int) (bool, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		now := time.Now()
+		current := state[leaseRole]
+		if current.token != leaseToken || !now.Before(current.expiresAt) {
+			return false, nil
+		}
+		renewCount++
+		current.expiresAt = now.Add(leaseTTL)
+		state[leaseRole] = current
+		return true, nil
+	}
+
+	releaseSeafHTTPUploadFinalizeLeaseFn = func(ctx context.Context, database *db.DB, leaseRole, leaseToken string) error {
+		mu.Lock()
+		defer mu.Unlock()
+		current := state[leaseRole]
+		if current.token == leaseToken {
+			delete(state, leaseRole)
+		}
+		return nil
+	}
+
+	leaseCtxFirst, releaseFirst, err := acquireSeafHTTPDistributedUploadFinalizeLeaseWithIntervals(context.Background(), &db.DB{}, "repo-1", leaseTTL, time.Millisecond, renewInterval)
+	if err != nil {
+		t.Fatalf("first acquire failed: %v", err)
+	}
+	if leaseCtxFirst == nil {
+		t.Fatal("first lease context must not be nil")
+	}
+	releasedFirst := false
+	defer func() {
+		if !releasedFirst {
+			releaseFirst()
+		}
+	}()
+
+	time.Sleep(leaseTTL + 20*time.Millisecond)
+
+	blockedCtx, cancelBlocked := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancelBlocked()
+	leaseCtxSecond, releaseSecond, err := acquireSeafHTTPDistributedUploadFinalizeLeaseWithIntervals(blockedCtx, &db.DB{}, "repo-1", leaseTTL, time.Millisecond, renewInterval)
+	_ = leaseCtxSecond
+	if releaseSecond != nil {
+		releaseSecond()
+		t.Fatal("second distributed acquire should not succeed while the first lease is still being renewed")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("second acquire error = %v, want context deadline exceeded while the renewed lease is held", err)
+	}
+	if renewCount == 0 {
+		t.Fatal("expected distributed upload finalize lease to renew before TTL expiry")
+	}
+
+	releaseFirst()
+	releasedFirst = true
+	leaseCtxSecond, releaseSecond, err = acquireSeafHTTPDistributedUploadFinalizeLeaseWithIntervals(context.Background(), &db.DB{}, "repo-1", leaseTTL, time.Millisecond, renewInterval)
+	if err != nil {
+		t.Fatalf("second acquire after release failed: %v", err)
+	}
+	if leaseCtxSecond == nil {
+		t.Fatal("second lease context must not be nil")
+	}
+	releaseSecond()
+}
+
+func TestAcquireSeafHTTPDistributedUploadFinalizeLeaseCancelsContextWhenLost(t *testing.T) {
+	origTryAcquire := tryAcquireSeafHTTPUploadFinalizeLeaseFn
+	origRenew := renewSeafHTTPUploadFinalizeLeaseFn
+	origRelease := releaseSeafHTTPUploadFinalizeLeaseFn
+	defer func() {
+		tryAcquireSeafHTTPUploadFinalizeLeaseFn = origTryAcquire
+		renewSeafHTTPUploadFinalizeLeaseFn = origRenew
+		releaseSeafHTTPUploadFinalizeLeaseFn = origRelease
+	}()
+
+	leaseTTL := 40 * time.Millisecond
+	renewInterval := 10 * time.Millisecond
+
+	type leaseState struct {
+		token     string
+		expiresAt time.Time
+	}
+
+	var (
+		mu    sync.Mutex
+		state = map[string]leaseState{}
+	)
+
+	tryAcquireSeafHTTPUploadFinalizeLeaseFn = func(ctx context.Context, database *db.DB, leaseRole, leaseToken string, ttlSeconds int) (bool, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		now := time.Now()
+		current := state[leaseRole]
+		if current.token == "" || !now.Before(current.expiresAt) {
+			state[leaseRole] = leaseState{token: leaseToken, expiresAt: now.Add(leaseTTL)}
+			return true, nil
+		}
+		return false, nil
+	}
+
+	renewCalls := 0
+	renewSeafHTTPUploadFinalizeLeaseFn = func(ctx context.Context, database *db.DB, leaseRole, leaseToken string, ttlSeconds int) (bool, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		renewCalls++
+		if renewCalls == 1 {
+			state[leaseRole] = leaseState{token: "other-holder", expiresAt: time.Now().Add(leaseTTL)}
+			return false, nil
+		}
+		current := state[leaseRole]
+		if current.token != leaseToken {
+			return false, nil
+		}
+		current.expiresAt = time.Now().Add(leaseTTL)
+		state[leaseRole] = current
+		return true, nil
+	}
+
+	releaseSeafHTTPUploadFinalizeLeaseFn = func(ctx context.Context, database *db.DB, leaseRole, leaseToken string) error {
+		mu.Lock()
+		defer mu.Unlock()
+		current := state[leaseRole]
+		if current.token == leaseToken {
+			delete(state, leaseRole)
+		}
+		return nil
+	}
+
+	leaseCtx, releaseFirst, err := acquireSeafHTTPDistributedUploadFinalizeLeaseWithIntervals(context.Background(), &db.DB{}, "repo-1", leaseTTL, time.Millisecond, renewInterval)
+	if err != nil {
+		t.Fatalf("first acquire failed: %v", err)
+	}
+	defer releaseFirst()
+
+	select {
+	case <-leaseCtx.Done():
+		t.Fatal("lease context canceled before loss was observed")
+	default:
+	}
+
+	select {
+	case <-leaseCtx.Done():
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("lease context was not canceled after renewal reported lease loss")
+	}
+
+	time.Sleep(leaseTTL + 20*time.Millisecond)
+	leaseCtxSecond, releaseSecond, err := acquireSeafHTTPDistributedUploadFinalizeLeaseWithIntervals(context.Background(), &db.DB{}, "repo-1", leaseTTL, time.Millisecond, renewInterval)
+	if err != nil {
+		t.Fatalf("second acquire after lost lease failed: %v", err)
+	}
+	if leaseCtxSecond == nil {
+		t.Fatal("second lease context must not be nil")
+	}
+	releaseSecond()
 }
 
 func (m *mockObjectStore) Put(ctx context.Context, blockID string, data io.Reader, size int64) (string, error) {
@@ -191,6 +454,7 @@ func TestWriteSeafHTTPUploadError_MapsSentinelErrors(t *testing.T) {
 	}{
 		{name: "head conflict", err: v2.ErrLibraryHeadConflict, genericMsg: "failed to finalize upload", wantStatus: http.StatusConflict, wantError: "library was modified concurrently; retry the upload"},
 		{name: "wrapped head conflict (mirrors retry_exhausted production path)", err: fmt.Errorf("%w: failed to finalize upload metadata after 20 attempts", v2.ErrLibraryHeadConflict), genericMsg: "failed to finalize upload", wantStatus: http.StatusConflict, wantError: "library was modified concurrently; retry the upload"},
+		{name: "block delete in progress", err: v2.ErrBlockDeleteInProgress, genericMsg: "failed to finalize upload", wantStatus: http.StatusConflict, wantError: "block is being deleted; retry the upload"},
 		{name: "quota exceeded", err: errStorageQuotaExceeded, genericMsg: "failed to finalize upload", wantStatus: http.StatusForbidden, wantError: "storage quota exceeded"},
 		{name: "generic", err: errors.New("boom"), genericMsg: "failed to finalize upload", wantStatus: http.StatusInternalServerError, wantError: "failed to finalize upload"},
 	}
@@ -217,6 +481,322 @@ func TestWriteSeafHTTPUploadError_MapsSentinelErrors(t *testing.T) {
 	}
 }
 
+func TestRetrySeafHTTPBlockMaterialization_RetriesFencedBlock(t *testing.T) {
+	oldBackoff := seafHTTPBlockMaterializationRetryBackoffFn
+	oldSleep := seafHTTPBlockMaterializationSleepFn
+	t.Cleanup(func() {
+		seafHTTPBlockMaterializationRetryBackoffFn = oldBackoff
+		seafHTTPBlockMaterializationSleepFn = oldSleep
+	})
+
+	var slept []time.Duration
+	seafHTTPBlockMaterializationRetryBackoffFn = func(attempt int) time.Duration {
+		return time.Duration(attempt) * time.Millisecond
+	}
+	seafHTTPBlockMaterializationSleepFn = func(delay time.Duration) {
+		slept = append(slept, delay)
+	}
+
+	storeCalls := 0
+	materializeCalls := 0
+	err := retrySeafHTTPBlockMaterialization("HandleUpload", "block-1", func() error {
+		storeCalls++
+		return nil
+	}, func() error {
+		materializeCalls++
+		if materializeCalls < 3 {
+			return v2.ErrBlockDeleteInProgress
+		}
+		return nil
+	}, nil)
+	if err != nil {
+		t.Fatalf("retrySeafHTTPBlockMaterialization() error = %v, want nil", err)
+	}
+	if storeCalls != 3 {
+		t.Fatalf("storeCalls = %d, want 3", storeCalls)
+	}
+	if materializeCalls != 3 {
+		t.Fatalf("materializeCalls = %d, want 3", materializeCalls)
+	}
+	if !reflect.DeepEqual(slept, []time.Duration{time.Millisecond, 2 * time.Millisecond}) {
+		t.Fatalf("slept = %#v, want [1ms 2ms]", slept)
+	}
+}
+
+func TestRetrySeafHTTPBlockMaterialization_ClearsFenceWithoutSleeping(t *testing.T) {
+	oldBackoff := seafHTTPBlockMaterializationRetryBackoffFn
+	oldSleep := seafHTTPBlockMaterializationSleepFn
+	t.Cleanup(func() {
+		seafHTTPBlockMaterializationRetryBackoffFn = oldBackoff
+		seafHTTPBlockMaterializationSleepFn = oldSleep
+	})
+
+	seafHTTPBlockMaterializationRetryBackoffFn = func(attempt int) time.Duration {
+		return time.Millisecond
+	}
+	sleepCalls := 0
+	seafHTTPBlockMaterializationSleepFn = func(delay time.Duration) {
+		sleepCalls++
+	}
+
+	storeCalls := 0
+	materializeCalls := 0
+	resolveCalls := 0
+	err := retrySeafHTTPBlockMaterialization("HandleUpload", "block-1", func() error {
+		storeCalls++
+		return nil
+	}, func() error {
+		materializeCalls++
+		if materializeCalls == 1 {
+			return v2.ErrBlockDeleteInProgress
+		}
+		return nil
+	}, func() (bool, error) {
+		resolveCalls++
+		return true, nil
+	})
+	if err != nil {
+		t.Fatalf("retrySeafHTTPBlockMaterialization() error = %v, want nil", err)
+	}
+	if storeCalls != 2 {
+		t.Fatalf("storeCalls = %d, want 2", storeCalls)
+	}
+	if materializeCalls != 2 {
+		t.Fatalf("materializeCalls = %d, want 2", materializeCalls)
+	}
+	if resolveCalls != 1 {
+		t.Fatalf("resolveCalls = %d, want 1", resolveCalls)
+	}
+	if sleepCalls != 0 {
+		t.Fatalf("sleepCalls = %d, want 0", sleepCalls)
+	}
+}
+
+func TestRetrySeafHTTPBlockMaterialization_StopsOnNonRetryableError(t *testing.T) {
+	oldBackoff := seafHTTPBlockMaterializationRetryBackoffFn
+	oldSleep := seafHTTPBlockMaterializationSleepFn
+	t.Cleanup(func() {
+		seafHTTPBlockMaterializationRetryBackoffFn = oldBackoff
+		seafHTTPBlockMaterializationSleepFn = oldSleep
+	})
+
+	seafHTTPBlockMaterializationRetryBackoffFn = func(attempt int) time.Duration {
+		return time.Millisecond
+	}
+	sleepCalls := 0
+	seafHTTPBlockMaterializationSleepFn = func(delay time.Duration) {
+		sleepCalls++
+	}
+
+	storeCalls := 0
+	materializeCalls := 0
+	wantErr := errors.New("boom")
+	err := retrySeafHTTPBlockMaterialization("HandleUpload", "block-1", func() error {
+		storeCalls++
+		return nil
+	}, func() error {
+		materializeCalls++
+		return wantErr
+	}, nil)
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("retrySeafHTTPBlockMaterialization() error = %v, want %v", err, wantErr)
+	}
+	if storeCalls != 1 {
+		t.Fatalf("storeCalls = %d, want 1", storeCalls)
+	}
+	if materializeCalls != 1 {
+		t.Fatalf("materializeCalls = %d, want 1", materializeCalls)
+	}
+	if sleepCalls != 0 {
+		t.Fatalf("sleepCalls = %d, want 0", sleepCalls)
+	}
+}
+
+func TestStageSeafHTTPPublishAttemptReferences_UsesResolvedInternalBlockIDs(t *testing.T) {
+	oldResolve := resolveSeafHTTPStoredBlockIDsFn
+	oldStage := stageSeafHTTPPublishAttemptReferencesFn
+	t.Cleanup(func() {
+		resolveSeafHTTPStoredBlockIDsFn = oldResolve
+		stageSeafHTTPPublishAttemptReferencesFn = oldStage
+	})
+
+	resolveCalls := 0
+	resolveSeafHTTPStoredBlockIDsFn = func(fsHelper *v2.FSHelper, orgID string, blockIDs []string) ([]string, error) {
+		resolveCalls++
+		if orgID != "org-1" {
+			t.Fatalf("resolve orgID = %q, want org-1", orgID)
+		}
+		if !reflect.DeepEqual(blockIDs, []string{"sha1-a", "sha1-b"}) {
+			t.Fatalf("resolve blockIDs = %#v, want external ids", blockIDs)
+		}
+		return []string{"sha256-a", "sha256-a", "sha256-b"}, nil
+	}
+	stageSeafHTTPPublishAttemptReferencesFn = func(database *db.DB, orgID, repoID, attemptID string, blockIDs []string, resolve db.BlockIDResolver) ([]string, error) {
+		if resolve != nil {
+			t.Fatal("stage helper should pass resolved internal IDs directly")
+		}
+		if orgID != "org-1" || repoID != "repo-1" || attemptID != "commit-1" {
+			t.Fatalf("stage args = %s/%s/%s, want org-1/repo-1/commit-1", orgID, repoID, attemptID)
+		}
+		want := []string{"sha256-a", "sha256-b"}
+		if !reflect.DeepEqual(blockIDs, want) {
+			t.Fatalf("stage blockIDs = %#v, want %#v", blockIDs, want)
+		}
+		return append([]string(nil), blockIDs...), nil
+	}
+
+	staged, err := stageSeafHTTPPublishAttemptReferences(&v2.FSHelper{}, nil, "org-1", "repo-1", "commit-1", []string{"sha1-a", "sha1-b"})
+	if err != nil {
+		t.Fatalf("stageSeafHTTPPublishAttemptReferences() error = %v", err)
+	}
+	if resolveCalls != 1 {
+		t.Fatalf("resolveCalls = %d, want 1", resolveCalls)
+	}
+	if !reflect.DeepEqual(staged, []string{"sha256-a", "sha256-b"}) {
+		t.Fatalf("staged = %#v, want internal IDs", staged)
+	}
+}
+
+func TestFinalizeSeafHTTPPublishedBlockReferences_UsesStagedInternalIDsForPromotionAndRepair(t *testing.T) {
+	oldPromote := promoteSeafHTTPPublishAttemptReferencesFn
+	oldSchedule := schedulePublishedFSObjectBlockReferenceRepairFn
+	oldClear := clearPublishedFSObjectBlockReferenceRepairFn
+	t.Cleanup(func() {
+		promoteSeafHTTPPublishAttemptReferencesFn = oldPromote
+		schedulePublishedFSObjectBlockReferenceRepairFn = oldSchedule
+		clearPublishedFSObjectBlockReferenceRepairFn = oldClear
+	})
+
+	t.Run("success clears durable repair after internal promotion", func(t *testing.T) {
+		promoteCalls := 0
+		clearCalls := 0
+		scheduleCalls := 0
+		promoteSeafHTTPPublishAttemptReferencesFn = func(database *db.DB, orgID, attemptID string, blockIDs []string, registerPermanent func() error) error {
+			promoteCalls++
+			if orgID != "org-1" || attemptID != "commit-1" {
+				t.Fatalf("promote args = %s/%s, want org-1/commit-1", orgID, attemptID)
+			}
+			if !reflect.DeepEqual(blockIDs, []string{"sha256-a"}) {
+				t.Fatalf("promote blockIDs = %#v, want staged internal IDs", blockIDs)
+			}
+			return nil
+		}
+		clearPublishedFSObjectBlockReferenceRepairFn = func(database *db.DB, orgID, repoID, commitID, fsID string) error {
+			clearCalls++
+			if orgID != "org-1" || repoID != "repo-1" || commitID != "commit-1" || fsID != "fs-1" {
+				t.Fatalf("clear args = %s/%s/%s/%s", orgID, repoID, commitID, fsID)
+			}
+			return nil
+		}
+		schedulePublishedFSObjectBlockReferenceRepairFn = func(database *db.DB, orgID, repoID, commitID, fsID, label string, stagedBlockIDs []string) {
+			scheduleCalls++
+		}
+
+		finalizeSeafHTTPPublishedBlockReferences(&v2.FSHelper{}, nil, "org-1", "repo-1", "commit-1", "fs-1", "commitUploadedFile", []string{"sha1-a"}, []string{"sha256-a"})
+
+		if promoteCalls != 1 {
+			t.Fatalf("promoteCalls = %d, want 1", promoteCalls)
+		}
+		if clearCalls != 1 {
+			t.Fatalf("clearCalls = %d, want 1", clearCalls)
+		}
+		if scheduleCalls != 0 {
+			t.Fatalf("scheduleCalls = %d, want 0", scheduleCalls)
+		}
+	})
+
+	t.Run("failure schedules durable repair with internal staged IDs", func(t *testing.T) {
+		promoteSeafHTTPPublishAttemptReferencesFn = func(database *db.DB, orgID, attemptID string, blockIDs []string, registerPermanent func() error) error {
+			if !reflect.DeepEqual(blockIDs, []string{"sha256-a", "sha256-b"}) {
+				t.Fatalf("promote blockIDs = %#v, want staged internal IDs", blockIDs)
+			}
+			return errors.New("boom")
+		}
+		clearCalls := 0
+		clearPublishedFSObjectBlockReferenceRepairFn = func(database *db.DB, orgID, repoID, commitID, fsID string) error {
+			clearCalls++
+			return nil
+		}
+		scheduleCalls := 0
+		schedulePublishedFSObjectBlockReferenceRepairFn = func(database *db.DB, orgID, repoID, commitID, fsID, label string, stagedBlockIDs []string) {
+			scheduleCalls++
+			if orgID != "org-1" || repoID != "repo-1" || commitID != "commit-1" || fsID != "fs-1" || label != "commitUploadedFileMultiBlock" {
+				t.Fatalf("schedule args = %s/%s/%s/%s/%s", orgID, repoID, commitID, fsID, label)
+			}
+			if !reflect.DeepEqual(stagedBlockIDs, []string{"sha256-a", "sha256-b"}) {
+				t.Fatalf("scheduled stagedBlockIDs = %#v, want internal IDs", stagedBlockIDs)
+			}
+		}
+
+		finalizeSeafHTTPPublishedBlockReferences(&v2.FSHelper{}, nil, "org-1", "repo-1", "commit-1", "fs-1", "commitUploadedFileMultiBlock", []string{"sha1-a", "sha1-b"}, []string{"sha256-a", "sha256-b"})
+
+		if scheduleCalls != 1 {
+			t.Fatalf("scheduleCalls = %d, want 1", scheduleCalls)
+		}
+		if clearCalls != 0 {
+			t.Fatalf("clearCalls = %d, want 0", clearCalls)
+		}
+	})
+}
+
+func TestCleanupSeafHTTPFailedPublishAttempt_JoinsArtifactCleanupAndQueueClear(t *testing.T) {
+	oldCleanup := cleanupSeafHTTPFailedPublishAttemptFn
+	oldClear := clearPublishedFSObjectBlockReferenceRepairFn
+	oldRelease := releaseSeafHTTPPendingFSObjectOwnerFn
+	t.Cleanup(func() {
+		cleanupSeafHTTPFailedPublishAttemptFn = oldCleanup
+		clearPublishedFSObjectBlockReferenceRepairFn = oldClear
+		releaseSeafHTTPPendingFSObjectOwnerFn = oldRelease
+	})
+
+	cleanupErr := errors.New("cleanup failed")
+	clearErr := errors.New("clear failed")
+	cleanupCalls := 0
+	cleanupSeafHTTPFailedPublishAttemptFn = func(database *db.DB, orgID, repoID, attemptID, commitID string, fsIDs, blockIDs []string) error {
+		cleanupCalls++
+		if orgID != "org-1" || repoID != "repo-1" || attemptID != "commit-1" || commitID != "commit-1" {
+			t.Fatalf("cleanup args = %s/%s/%s/%s, want org-1/repo-1/commit-1/commit-1", orgID, repoID, attemptID, commitID)
+		}
+		if !reflect.DeepEqual(fsIDs, []string{"fs-1"}) {
+			t.Fatalf("cleanup fsIDs = %#v, want []string{\"fs-1\"}", fsIDs)
+		}
+		if !reflect.DeepEqual(blockIDs, []string{"sha256-a"}) {
+			t.Fatalf("cleanup blockIDs = %#v, want []string{\"sha256-a\"}", blockIDs)
+		}
+		return cleanupErr
+	}
+	releaseCalls := 0
+	releaseSeafHTTPPendingFSObjectOwnerFn = func(database *db.DB, repoID, fsID, ownerID string, createdAt time.Time) error {
+		releaseCalls++
+		return nil
+	}
+	clearCalls := 0
+	clearPublishedFSObjectBlockReferenceRepairFn = func(database *db.DB, orgID, repoID, commitID, fsID string) error {
+		clearCalls++
+		if orgID != "org-1" || repoID != "repo-1" || commitID != "commit-1" || fsID != "fs-1" {
+			t.Fatalf("clear args = %s/%s/%s/%s, want org-1/repo-1/commit-1/fs-1", orgID, repoID, commitID, fsID)
+		}
+		return clearErr
+	}
+
+	err := cleanupSeafHTTPFailedPublishAttempt(nil, "org-1", "repo-1", "commit-1", "fs-1", []string{"sha256-a"})
+	if !errors.Is(err, cleanupErr) {
+		t.Fatalf("cleanupSeafHTTPFailedPublishAttempt() error = %v, want cleanupErr %v", err, cleanupErr)
+	}
+	if errors.Is(err, clearErr) {
+		t.Fatalf("cleanupSeafHTTPFailedPublishAttempt() error = %v, do not want clearErr %v", err, clearErr)
+	}
+	if cleanupCalls != 1 {
+		t.Fatalf("cleanupCalls = %d, want 1", cleanupCalls)
+	}
+	if releaseCalls != 0 {
+		t.Fatalf("releaseCalls = %d, want 0", releaseCalls)
+	}
+	if clearCalls != 0 {
+		t.Fatalf("clearCalls = %d, want 0", clearCalls)
+	}
+}
+
 func TestHandleChunkedFinalizeError_RollsBackConflictAndCleansUp(t *testing.T) {
 	oldRollback := rollbackUploadedBlockRefsFn
 	oldCleanup := cleanupChunkUploadFn
@@ -226,14 +806,15 @@ func TestHandleChunkedFinalizeError_RollsBackConflictAndCleansUp(t *testing.T) {
 	}()
 
 	var rollbackCalled bool
-	var gotOrgID, gotRepoID, gotOperationKey string
+	var gotOrgID, gotRepoID string
 	var gotBlockIDs []string
 	var cleanedToken, cleanedFilename string
-	rollbackUploadedBlockRefsFn = func(database *db.DB, orgID, repoID, operationKey string, blockIDs []string) {
+	var gotOperationID string
+	rollbackUploadedBlockRefsFn = func(database *db.DB, orgID, repoID, operationID string, blockIDs []string) {
 		rollbackCalled = true
 		gotOrgID = orgID
 		gotRepoID = repoID
-		gotOperationKey = operationKey
+		gotOperationID = operationID
 		gotBlockIDs = append([]string(nil), blockIDs...)
 	}
 	cleanupChunkUploadFn = func(token, filename string) {
@@ -242,9 +823,10 @@ func TestHandleChunkedFinalizeError_RollsBackConflictAndCleansUp(t *testing.T) {
 	}
 
 	h := &SeafHTTPHandler{}
-	token := &AccessToken{OrgID: "org-1", RepoID: "repo-1"}
+	token := &AccessToken{OrgID: "org-1", RepoID: "repo-1", Token: "upload-token"}
 	upload := &ChunkUpload{
-		Finalizing: true,
+		Finalizing:  true,
+		OperationID: "chunk-op-conflict",
 		accountedBlockPosition: map[int]string{
 			2: "block-a",
 			0: "block-a",
@@ -260,8 +842,8 @@ func TestHandleChunkedFinalizeError_RollsBackConflictAndCleansUp(t *testing.T) {
 	if gotOrgID != "org-1" || gotRepoID != "repo-1" {
 		t.Fatalf("rollback org/repo = %s/%s, want org-1/repo-1", gotOrgID, gotRepoID)
 	}
-	if gotOperationKey == "" {
-		t.Fatal("expected rollback operation key to be set")
+	if gotOperationID != "chunk-op-conflict" {
+		t.Fatalf("rollback operation ID = %s, want chunk-op-conflict", gotOperationID)
 	}
 	if !reflect.DeepEqual(gotBlockIDs, []string{"block-a", "block-b", "block-a"}) {
 		t.Fatalf("rollback block IDs = %#v, want %#v", gotBlockIDs, []string{"block-a", "block-b", "block-a"})
@@ -283,14 +865,15 @@ func TestHandleChunkedFinalizeError_RollsBackQuotaExceededAndCleansUp(t *testing
 	}()
 
 	var rollbackCalled bool
-	var gotOrgID, gotRepoID, gotOperationKey string
+	var gotOrgID, gotRepoID string
 	var gotBlockIDs []string
 	var cleanupCalled bool
-	rollbackUploadedBlockRefsFn = func(database *db.DB, orgID, repoID, operationKey string, blockIDs []string) {
+	var gotOperationID string
+	rollbackUploadedBlockRefsFn = func(database *db.DB, orgID, repoID, operationID string, blockIDs []string) {
 		rollbackCalled = true
 		gotOrgID = orgID
 		gotRepoID = repoID
-		gotOperationKey = operationKey
+		gotOperationID = operationID
 		gotBlockIDs = append([]string(nil), blockIDs...)
 	}
 	cleanupChunkUploadFn = func(token, filename string) {
@@ -300,7 +883,8 @@ func TestHandleChunkedFinalizeError_RollsBackQuotaExceededAndCleansUp(t *testing
 	h := &SeafHTTPHandler{}
 	token := &AccessToken{OrgID: "org-2", RepoID: "repo-2"}
 	upload := &ChunkUpload{
-		Finalizing: true,
+		Finalizing:  true,
+		OperationID: "chunk-op-quota",
 		accountedBlockPosition: map[int]string{
 			0: "block-x",
 			1: "block-y",
@@ -318,8 +902,8 @@ func TestHandleChunkedFinalizeError_RollsBackQuotaExceededAndCleansUp(t *testing
 	if gotOrgID != "org-2" || gotRepoID != "repo-2" {
 		t.Fatalf("rollback org/repo = %s/%s, want org-2/repo-2", gotOrgID, gotRepoID)
 	}
-	if !strings.HasPrefix(gotOperationKey, "seafhttp_chunk_quota:") {
-		t.Fatalf("operation key = %q, want seafhttp_chunk_quota:* scope", gotOperationKey)
+	if gotOperationID != "chunk-op-quota" {
+		t.Fatalf("rollback operation ID = %s, want chunk-op-quota", gotOperationID)
 	}
 	if !reflect.DeepEqual(gotBlockIDs, []string{"block-x", "block-y"}) {
 		t.Fatalf("rollback block IDs = %#v, want %#v", gotBlockIDs, []string{"block-x", "block-y"})
@@ -336,7 +920,7 @@ func TestHandleChunkedFinalizeError_ResetsNonConflictState(t *testing.T) {
 
 	rollbackCalled := false
 	cleanupCalled := false
-	rollbackUploadedBlockRefsFn = func(database *db.DB, orgID, repoID, operationKey string, blockIDs []string) {
+	rollbackUploadedBlockRefsFn = func(database *db.DB, orgID, repoID, operationID string, blockIDs []string) {
 		rollbackCalled = true
 	}
 	cleanupChunkUploadFn = func(token, filename string) {
@@ -344,7 +928,7 @@ func TestHandleChunkedFinalizeError_ResetsNonConflictState(t *testing.T) {
 	}
 
 	h := &SeafHTTPHandler{}
-	token := &AccessToken{OrgID: "org-1", RepoID: "repo-1"}
+	token := &AccessToken{OrgID: "org-1", RepoID: "repo-1", Token: "upload-token"}
 	upload := &ChunkUpload{Finalizing: true}
 
 	h.handleChunkedFinalizeError(token, "upload-token", "file.bin", upload, errors.New("boom"))
@@ -371,8 +955,10 @@ func TestHandleChunkedFinalizeError_CleansUpUnknownBlockMutationOutcome(t *testi
 	rollbackCalled := false
 	var gotBlockIDs []string
 	cleanupCalled := false
-	rollbackUploadedBlockRefsFn = func(database *db.DB, orgID, repoID, operationKey string, blockIDs []string) {
+	var gotOperationID string
+	rollbackUploadedBlockRefsFn = func(database *db.DB, orgID, repoID, operationID string, blockIDs []string) {
 		rollbackCalled = true
+		gotOperationID = operationID
 		gotBlockIDs = append([]string(nil), blockIDs...)
 	}
 	cleanupChunkUploadFn = func(token, filename string) {
@@ -381,7 +967,7 @@ func TestHandleChunkedFinalizeError_CleansUpUnknownBlockMutationOutcome(t *testi
 
 	h := &SeafHTTPHandler{}
 	token := &AccessToken{OrgID: "org-1", RepoID: "repo-1"}
-	upload := &ChunkUpload{Finalizing: true, accountedBlockPosition: map[int]string{0: "block-a", 1: "block-b"}}
+	upload := &ChunkUpload{Finalizing: true, OperationID: "chunk-op-unknown", accountedBlockPosition: map[int]string{0: "block-a", 1: "block-b"}}
 
 	h.handleChunkedFinalizeError(token, "upload-token", "file.bin", upload, fmt.Errorf("block mutation ambiguous: %w", v2.ErrBlockMutationOutcomeUnknown))
 
@@ -390,6 +976,9 @@ func TestHandleChunkedFinalizeError_CleansUpUnknownBlockMutationOutcome(t *testi
 	}
 	if !reflect.DeepEqual(gotBlockIDs, []string{"block-a", "block-b"}) {
 		t.Fatalf("rollback block IDs = %#v, want %#v", gotBlockIDs, []string{"block-a", "block-b"})
+	}
+	if gotOperationID != "chunk-op-unknown" {
+		t.Fatalf("rollback operation ID = %s, want chunk-op-unknown", gotOperationID)
 	}
 	if !cleanupCalled {
 		t.Fatal("unknown block mutation outcome should clean up the tracker")
@@ -406,20 +995,21 @@ func TestHandleSingleShotMetadataError_RollsBackOnError(t *testing.T) {
 	}()
 
 	var rollbackCalled bool
-	var gotOrgID, gotRepoID, gotOperationKey string
+	var gotOrgID, gotRepoID string
 	var gotBlockIDs []string
-	rollbackUploadedBlockRefsFn = func(database *db.DB, orgID, repoID, operationKey string, blockIDs []string) {
+	var gotOperationID string
+	rollbackUploadedBlockRefsFn = func(database *db.DB, orgID, repoID, operationID string, blockIDs []string) {
 		rollbackCalled = true
 		gotOrgID = orgID
 		gotRepoID = repoID
-		gotOperationKey = operationKey
+		gotOperationID = operationID
 		gotBlockIDs = append([]string(nil), blockIDs...)
 	}
 
 	h := &SeafHTTPHandler{}
-	token := &AccessToken{OrgID: "org-1", RepoID: "repo-1"}
+	token := &AccessToken{OrgID: "org-1", RepoID: "repo-1", Token: "upload-token"}
 
-	h.handleSingleShotMetadataError(token, "file-1", "block-internal", errors.New("boom"))
+	h.handleSingleShotMetadataError(token, "single-op", "block-internal", errors.New("boom"))
 
 	if !rollbackCalled {
 		t.Fatal("expected single-shot metadata error to roll back the promoted block")
@@ -427,8 +1017,8 @@ func TestHandleSingleShotMetadataError_RollsBackOnError(t *testing.T) {
 	if gotOrgID != "org-1" || gotRepoID != "repo-1" {
 		t.Fatalf("rollback org/repo = %s/%s, want org-1/repo-1", gotOrgID, gotRepoID)
 	}
-	if !strings.HasPrefix(gotOperationKey, "seafhttp_single_metadata:") {
-		t.Fatalf("operation key = %q, want seafhttp_single_metadata:* scope", gotOperationKey)
+	if gotOperationID != "single-op" {
+		t.Fatalf("rollback operation ID = %s, want single-op", gotOperationID)
 	}
 	if !reflect.DeepEqual(gotBlockIDs, []string{"block-internal"}) {
 		t.Fatalf("rollback block IDs = %#v, want %#v", gotBlockIDs, []string{"block-internal"})
@@ -442,19 +1032,19 @@ func TestHandleSingleShotMetadataError_SkipsSuccessAndEmptyBlockID(t *testing.T)
 	}()
 
 	rollbackCalled := false
-	rollbackUploadedBlockRefsFn = func(database *db.DB, orgID, repoID, operationKey string, blockIDs []string) {
+	rollbackUploadedBlockRefsFn = func(database *db.DB, orgID, repoID, operationID string, blockIDs []string) {
 		rollbackCalled = true
 	}
 
 	h := &SeafHTTPHandler{}
-	token := &AccessToken{OrgID: "org-1", RepoID: "repo-1"}
+	token := &AccessToken{OrgID: "org-1", RepoID: "repo-1", Token: "upload-token"}
 
-	h.handleSingleShotMetadataError(token, "file-1", "block-internal", nil)
+	h.handleSingleShotMetadataError(token, "single-op", "block-internal", nil)
 	if rollbackCalled {
 		t.Fatal("successful finalize should not roll back the promoted block")
 	}
 
-	h.handleSingleShotMetadataError(token, "file-1", "   ", errors.New("boom"))
+	h.handleSingleShotMetadataError(token, "single-op", "   ", errors.New("boom"))
 	if rollbackCalled {
 		t.Fatal("missing internal block ID should not roll back anything")
 	}
@@ -467,14 +1057,14 @@ func TestHandleSingleShotMetadataError_SkipsUnknownPublicationOutcome(t *testing
 	}()
 
 	rollbackCalled := false
-	rollbackUploadedBlockRefsFn = func(database *db.DB, orgID, repoID, operationKey string, blockIDs []string) {
+	rollbackUploadedBlockRefsFn = func(database *db.DB, orgID, repoID, operationID string, blockIDs []string) {
 		rollbackCalled = true
 	}
 
 	h := &SeafHTTPHandler{}
-	token := &AccessToken{OrgID: "org-1", RepoID: "repo-1"}
+	token := &AccessToken{OrgID: "org-1", RepoID: "repo-1", Token: "upload-token"}
 
-	h.handleSingleShotMetadataError(token, "file-1", "block-internal", v2.ErrLibraryHeadPublicationUnknown)
+	h.handleSingleShotMetadataError(token, "single-op", "block-internal", v2.ErrLibraryHeadPublicationUnknown)
 	if rollbackCalled {
 		t.Fatal("unknown publication outcome should not roll back the promoted block")
 	}

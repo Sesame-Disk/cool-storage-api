@@ -7,23 +7,36 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Sesame-Disk/sesamefs/internal/db"
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
 )
 
-func TestDecrementBlockRefCountsOnce_ResolutionFailureSkipsMarkerAndDecrement(t *testing.T) {
+// TestRegisterFSObjectBlockReferences_ResolutionFailureAborts verifies the
+// row-per-reference registration is fail-closed: if block ID resolution fails, no
+// reference row is written and the caller's commit is aborted. The resolution
+// error is returned before any DB write, so a zero-value FSHelper (nil db) is
+// enough to exercise the guard.
+func TestRegisterFSObjectBlockReferences_ResolutionFailureAborts(t *testing.T) {
 	helper := &FSHelper{}
 	prevResolve := resolveStoredBlockIDsFn
-	prevMark := markBlockMutationProcessedFn
-	prevDecrement := decrementBlockRefCountFn
-	defer func() {
-		resolveStoredBlockIDsFn = prevResolve
-		markBlockMutationProcessedFn = prevMark
-		decrementBlockRefCountFn = prevDecrement
-	}()
+	prevExists := registerFSObjectBlockReferencesFSObjectExistsFn
+	prevAdd := registerFSObjectBlockReferencesAddReferenceFn
+	defer func() { resolveStoredBlockIDsFn = prevResolve }()
+	defer func() { registerFSObjectBlockReferencesFSObjectExistsFn = prevExists }()
+	defer func() { registerFSObjectBlockReferencesAddReferenceFn = prevAdd }()
+
+	registerFSObjectBlockReferencesFSObjectExistsFn = func(h *FSHelper, libraryID, fsID string) (bool, error) {
+		if libraryID != "lib-1" || fsID != "fs-1" {
+			t.Fatalf("exists args = %s/%s, want lib-1/fs-1", libraryID, fsID)
+		}
+		return true, nil
+	}
+	registerFSObjectBlockReferencesAddReferenceFn = func(h *FSHelper, orgID, blockID, referrer, libraryID string) error {
+		t.Fatal("add reference should not run when block ID resolution fails")
+		return nil
+	}
 
 	resolveErr := errors.New("resolve failed")
-	markCalls := 0
-	decrementCalls := 0
 	resolveStoredBlockIDsFn = func(h *FSHelper, orgID string, blockIDs []string) ([]string, error) {
 		if orgID != "org-1" {
 			t.Fatalf("resolve orgID = %q, want %q", orgID, "org-1")
@@ -33,123 +46,615 @@ func TestDecrementBlockRefCountsOnce_ResolutionFailureSkipsMarkerAndDecrement(t 
 		}
 		return nil, resolveErr
 	}
-	markBlockMutationProcessedFn = func(h *FSHelper, operationKey string) (bool, error) {
-		markCalls++
-		return true, nil
-	}
-	decrementBlockRefCountFn = func(h *FSHelper, orgID, blockID string) bool {
-		decrementCalls++
-		return false
-	}
 
-	got := helper.DecrementBlockRefCountsOnce("org-1", "op-1", []string{"sha1-block"})
-	if got != nil {
-		t.Fatalf("DecrementBlockRefCountsOnce() = %v, want nil on resolution failure", got)
-	}
-	if markCalls != 0 {
-		t.Fatalf("markBlockMutationProcessed called %d times, want 0", markCalls)
-	}
-	if decrementCalls != 0 {
-		t.Fatalf("decrementBlockRefCount called %d times, want 0", decrementCalls)
+	err := helper.RegisterFSObjectBlockReferences("org-1", "lib-1", "fs-1", []string{"sha1-block"})
+	if !errors.Is(err, resolveErr) {
+		t.Fatalf("RegisterFSObjectBlockReferences() error = %v, want wrapped %v", err, resolveErr)
 	}
 }
 
-func TestDecrementBlockRefCountsOnce_UsesResolvedIDsAfterMarker(t *testing.T) {
+func TestRegisterFSObjectBlockReferences_RequiresPersistedFSObject(t *testing.T) {
 	helper := &FSHelper{}
 	prevResolve := resolveStoredBlockIDsFn
-	prevMark := markBlockMutationProcessedFn
-	prevDecrement := decrementBlockRefCountFn
-	defer func() {
+	prevExists := registerFSObjectBlockReferencesFSObjectExistsFn
+	prevAdd := registerFSObjectBlockReferencesAddReferenceFn
+	t.Cleanup(func() {
 		resolveStoredBlockIDsFn = prevResolve
-		markBlockMutationProcessedFn = prevMark
-		decrementBlockRefCountFn = prevDecrement
-	}()
+		registerFSObjectBlockReferencesFSObjectExistsFn = prevExists
+		registerFSObjectBlockReferencesAddReferenceFn = prevAdd
+	})
 
-	markCalls := 0
-	var decremented []string
 	resolveStoredBlockIDsFn = func(h *FSHelper, orgID string, blockIDs []string) ([]string, error) {
+		t.Fatal("resolve should not run when the fs_object row is missing")
+		return nil, nil
+	}
+	registerFSObjectBlockReferencesFSObjectExistsFn = func(h *FSHelper, libraryID, fsID string) (bool, error) {
+		if libraryID != "lib-1" || fsID != "fs-1" {
+			t.Fatalf("exists args = %s/%s, want lib-1/fs-1", libraryID, fsID)
+		}
+		return false, nil
+	}
+	registerFSObjectBlockReferencesAddReferenceFn = func(h *FSHelper, orgID, blockID, referrer, libraryID string) error {
+		t.Fatal("add reference should not run when the fs_object row is missing")
+		return nil
+	}
+
+	err := helper.RegisterFSObjectBlockReferences("org-1", "lib-1", "fs-1", []string{"sha1-block"})
+	if !errors.Is(err, errFSObjectNotPersistedForBlockReferences) {
+		t.Fatalf("RegisterFSObjectBlockReferences() error = %v, want wrapped %v", err, errFSObjectNotPersistedForBlockReferences)
+	}
+}
+
+func TestRegisterFSObjectBlockReferences_AddsReferencesForPersistedFSObject(t *testing.T) {
+	helper := &FSHelper{}
+	prevResolve := resolveStoredBlockIDsFn
+	prevExists := registerFSObjectBlockReferencesFSObjectExistsFn
+	prevAdd := registerFSObjectBlockReferencesAddReferenceFn
+	t.Cleanup(func() {
+		resolveStoredBlockIDsFn = prevResolve
+		registerFSObjectBlockReferencesFSObjectExistsFn = prevExists
+		registerFSObjectBlockReferencesAddReferenceFn = prevAdd
+	})
+
+	registerFSObjectBlockReferencesFSObjectExistsFn = func(h *FSHelper, libraryID, fsID string) (bool, error) {
+		return true, nil
+	}
+	resolveStoredBlockIDsFn = func(h *FSHelper, orgID string, blockIDs []string) ([]string, error) {
+		if orgID != "org-1" {
+			t.Fatalf("resolve orgID = %q, want org-1", orgID)
+		}
+		if len(blockIDs) != 2 || blockIDs[0] != "sha1-a" || blockIDs[1] != "sha1-b" {
+			t.Fatalf("resolve blockIDs = %v, want [sha1-a sha1-b]", blockIDs)
+		}
 		return []string{"sha256-a", "sha256-b"}, nil
 	}
-	markBlockMutationProcessedFn = func(h *FSHelper, operationKey string) (bool, error) {
-		markCalls++
-		if operationKey != "op-2" {
-			t.Fatalf("operationKey = %q, want %q", operationKey, "op-2")
+	var calls []string
+	registerFSObjectBlockReferencesAddReferenceFn = func(h *FSHelper, orgID, blockID, referrer, libraryID string) error {
+		calls = append(calls, fmt.Sprintf("%s|%s|%s|%s", orgID, blockID, referrer, libraryID))
+		return nil
+	}
+
+	err := helper.RegisterFSObjectBlockReferences("org-1", "lib-1", "fs-1", []string{"sha1-a", "sha1-b"})
+	if err != nil {
+		t.Fatalf("RegisterFSObjectBlockReferences() error = %v, want nil", err)
+	}
+	want := []string{
+		"org-1|sha256-a|" + db.BlockReferrerForFSObject("lib-1", "fs-1") + "|lib-1",
+		"org-1|sha256-b|" + db.BlockReferrerForFSObject("lib-1", "fs-1") + "|lib-1",
+	}
+	if len(calls) != len(want) {
+		t.Fatalf("calls = %v, want %v", calls, want)
+	}
+	for i := range want {
+		if calls[i] != want[i] {
+			t.Fatalf("calls[%d] = %q, want %q (full=%v)", i, calls[i], want[i], calls)
+		}
+	}
+}
+
+func TestRegisterUploadedBlock_RetriesFenceWithoutDroppingProvisionalRef(t *testing.T) {
+	helper := &FSHelper{}
+	oldAdd := registerUploadedBlockAddReferenceFn
+	oldFence := registerUploadedBlockFenceActiveFn
+	oldClaimInfo := registerUploadedBlockClaimInfoFn
+	oldReleaseClaim := registerUploadedBlockReleaseClaimFn
+	oldUpsert := registerUploadedBlockUpsertMetadataFn
+	oldUpsertExpiry := registerUploadedBlockUpsertProvisionalExpiryFn
+	oldRelease := registerUploadedBlockReleaseRefsFn
+	oldAttempts := registerUploadedBlockRetryAttemptsFn
+	oldBackoff := registerUploadedBlockRetryBackoffFn
+	oldSleep := registerUploadedBlockSleepFn
+	t.Cleanup(func() {
+		registerUploadedBlockAddReferenceFn = oldAdd
+		registerUploadedBlockFenceActiveFn = oldFence
+		registerUploadedBlockClaimInfoFn = oldClaimInfo
+		registerUploadedBlockReleaseClaimFn = oldReleaseClaim
+		registerUploadedBlockUpsertMetadataFn = oldUpsert
+		registerUploadedBlockUpsertProvisionalExpiryFn = oldUpsertExpiry
+		registerUploadedBlockReleaseRefsFn = oldRelease
+		registerUploadedBlockRetryAttemptsFn = oldAttempts
+		registerUploadedBlockRetryBackoffFn = oldBackoff
+		registerUploadedBlockSleepFn = oldSleep
+	})
+
+	var calls []string
+	registerUploadedBlockAddReferenceFn = func(h *FSHelper, orgID, blockID, referrer, libraryID string, ttlSeconds int) error {
+		calls = append(calls, "add")
+		if orgID != "org-1" || blockID != "block-1" || libraryID != "lib-1" {
+			t.Fatalf("add args = %s/%s/%s, want org-1/block-1/lib-1", orgID, blockID, libraryID)
+		}
+		if referrer != db.BlockReferrerForUpload("op-1") {
+			t.Fatalf("referrer = %q, want upload referrer", referrer)
+		}
+		if ttlSeconds != db.ProvisionalBlockReferenceTTLSeconds {
+			t.Fatalf("ttlSeconds = %d, want %d", ttlSeconds, db.ProvisionalBlockReferenceTTLSeconds)
+		}
+		return nil
+	}
+	fenceChecks := 0
+	registerUploadedBlockFenceActiveFn = func(h *FSHelper, orgID, blockID string) (bool, error) {
+		fenceChecks++
+		calls = append(calls, fmt.Sprintf("fence-%d", fenceChecks))
+		return fenceChecks == 1, nil
+	}
+	registerUploadedBlockClaimInfoFn = func(h *FSHelper, orgID, blockID string) (db.BlockDeleteClaimInfo, bool, error) {
+		t.Fatal("stale claim lookup should not run for a normal retrying fence")
+		return db.BlockDeleteClaimInfo{}, false, nil
+	}
+	registerUploadedBlockReleaseClaimFn = func(h *FSHelper, orgID, blockID, claimID string) (bool, error) {
+		t.Fatal("stale claim release should not run for a normal retrying fence")
+		return false, nil
+	}
+	registerUploadedBlockUpsertMetadataFn = func(h *FSHelper, orgID, blockID string, sizeBytes int, storageClass, storageKey string) error {
+		calls = append(calls, "upsert")
+		if sizeBytes != 123 || storageClass != "hot" || storageKey != "key-1" {
+			t.Fatalf("upsert args = %d/%s/%s, want 123/hot/key-1", sizeBytes, storageClass, storageKey)
+		}
+		return nil
+	}
+	registerUploadedBlockUpsertProvisionalExpiryFn = func(h *FSHelper, orgID, blockID, referrer, storageClass string, expiresAt time.Time) error {
+		calls = append(calls, "expiry")
+		if orgID != "org-1" || blockID != "block-1" || referrer != db.BlockReferrerForUpload("op-1") || storageClass != "hot" {
+			t.Fatalf("expiry args = %s/%s/%s/%s", orgID, blockID, referrer, storageClass)
+		}
+		if expiresAt.IsZero() {
+			t.Fatal("expiresAt should be set")
+		}
+		return nil
+	}
+	registerUploadedBlockReleaseRefsFn = func(h *FSHelper, orgID, libraryID, operationID string, blockIDs []string) []string {
+		t.Fatal("release should not run when the fence clears during retry")
+		return nil
+	}
+	registerUploadedBlockRetryAttemptsFn = func() int { return 2 }
+	registerUploadedBlockRetryBackoffFn = func(attempt int) time.Duration {
+		calls = append(calls, fmt.Sprintf("backoff-%d", attempt))
+		return time.Millisecond
+	}
+	registerUploadedBlockSleepFn = func(delay time.Duration) {
+		calls = append(calls, fmt.Sprintf("sleep-%s", delay))
+	}
+
+	err := helper.RegisterUploadedBlock("org-1", "lib-1", "block-1", "op-1", 123, "hot", "key-1")
+	if err != nil {
+		t.Fatalf("RegisterUploadedBlock() error = %v, want nil", err)
+	}
+	want := []string{"add", "expiry", "fence-1", "backoff-1", "sleep-1ms", "fence-2", "upsert"}
+	if len(calls) != len(want) {
+		t.Fatalf("calls = %#v, want %#v", calls, want)
+	}
+	for i := range want {
+		if calls[i] != want[i] {
+			t.Fatalf("calls[%d] = %q, want %q (full=%#v)", i, calls[i], want[i], calls)
+		}
+	}
+}
+
+func TestRegisterUploadedBlock_ReleasesStaleDeleteClaimWithEmptyStorageClass(t *testing.T) {
+	helper := &FSHelper{db: &db.DB{}}
+	oldAdd := registerUploadedBlockAddReferenceFn
+	oldFence := registerUploadedBlockFenceActiveFn
+	oldClaimInfo := registerUploadedBlockClaimInfoFn
+	oldReleaseClaim := registerUploadedBlockReleaseClaimFn
+	oldUpsert := registerUploadedBlockUpsertMetadataFn
+	oldUpsertExpiry := registerUploadedBlockUpsertProvisionalExpiryFn
+	oldRelease := registerUploadedBlockReleaseRefsFn
+	oldBackoff := registerUploadedBlockRetryBackoffFn
+	oldSleep := registerUploadedBlockSleepFn
+	t.Cleanup(func() {
+		registerUploadedBlockAddReferenceFn = oldAdd
+		registerUploadedBlockFenceActiveFn = oldFence
+		registerUploadedBlockClaimInfoFn = oldClaimInfo
+		registerUploadedBlockReleaseClaimFn = oldReleaseClaim
+		registerUploadedBlockUpsertMetadataFn = oldUpsert
+		registerUploadedBlockUpsertProvisionalExpiryFn = oldUpsertExpiry
+		registerUploadedBlockReleaseRefsFn = oldRelease
+		registerUploadedBlockRetryBackoffFn = oldBackoff
+		registerUploadedBlockSleepFn = oldSleep
+	})
+
+	var calls []string
+	registerUploadedBlockAddReferenceFn = func(h *FSHelper, orgID, blockID, referrer, libraryID string, ttlSeconds int) error {
+		calls = append(calls, "add")
+		return nil
+	}
+	fenceChecks := 0
+	registerUploadedBlockFenceActiveFn = func(h *FSHelper, orgID, blockID string) (bool, error) {
+		fenceChecks++
+		calls = append(calls, fmt.Sprintf("fence-%d", fenceChecks))
+		return fenceChecks == 1, nil
+	}
+	registerUploadedBlockClaimInfoFn = func(h *FSHelper, orgID, blockID string) (db.BlockDeleteClaimInfo, bool, error) {
+		calls = append(calls, "claim-info")
+		return db.BlockDeleteClaimInfo{GCState: db.BlockGCStateDeleting, GCClaimID: "claim-1"}, true, nil
+	}
+	registerUploadedBlockReleaseClaimFn = func(h *FSHelper, orgID, blockID, claimID string) (bool, error) {
+		calls = append(calls, "release-claim")
+		if claimID != "claim-1" {
+			t.Fatalf("claimID = %q, want claim-1", claimID)
 		}
 		return true, nil
 	}
-	decrementBlockRefCountFn = func(h *FSHelper, orgID, blockID string) bool {
-		decremented = append(decremented, blockID)
-		return blockID == "sha256-b"
+	registerUploadedBlockUpsertMetadataFn = func(h *FSHelper, orgID, blockID string, sizeBytes int, storageClass, storageKey string) error {
+		calls = append(calls, "upsert")
+		return nil
+	}
+	registerUploadedBlockUpsertProvisionalExpiryFn = func(h *FSHelper, orgID, blockID, referrer, storageClass string, expiresAt time.Time) error {
+		calls = append(calls, "expiry")
+		return nil
+	}
+	registerUploadedBlockReleaseRefsFn = func(h *FSHelper, orgID, libraryID, operationID string, blockIDs []string) []string {
+		t.Fatal("release refs should not run when stale claim release succeeds")
+		return nil
+	}
+	registerUploadedBlockRetryBackoffFn = func(attempt int) time.Duration {
+		t.Fatal("backoff should not run when stale claim release succeeds")
+		return 0
+	}
+	registerUploadedBlockSleepFn = func(delay time.Duration) {
+		t.Fatalf("sleep should not run when stale claim release succeeds, got %s", delay)
 	}
 
-	got := helper.DecrementBlockRefCountsOnce("org-2", "op-2", []string{"sha1-a", "sha1-b"})
-	if markCalls != 1 {
-		t.Fatalf("markBlockMutationProcessed called %d times, want 1", markCalls)
+	if err := helper.RegisterUploadedBlock("org-1", "lib-1", "block-1", "op-1", 123, "hot", "key-1"); err != nil {
+		t.Fatalf("RegisterUploadedBlock() error = %v, want nil", err)
 	}
-	if len(decremented) != 2 || decremented[0] != "sha256-a" || decremented[1] != "sha256-b" {
-		t.Fatalf("decremented block IDs = %v, want resolved IDs [sha256-a sha256-b]", decremented)
+	want := []string{"add", "expiry", "fence-1", "claim-info", "release-claim", "fence-2", "upsert"}
+	if len(calls) != len(want) {
+		t.Fatalf("calls = %#v, want %#v", calls, want)
 	}
-	if len(got) != 1 || got[0] != "sha256-b" {
-		t.Fatalf("zero-ref blocks = %v, want [sha256-b]", got)
+	for i := range want {
+		if calls[i] != want[i] {
+			t.Fatalf("calls[%d] = %q, want %q (full=%#v)", i, calls[i], want[i], calls)
+		}
 	}
 }
 
-func TestIncrementBlockRefCounts_ResolutionFailureSkipsMutation(t *testing.T) {
+func TestRegisterUploadedBlock_RecordsProvisionalExpiryAtTTL(t *testing.T) {
 	helper := &FSHelper{}
-	prevResolve := resolveStoredBlockIDsFn
-	prevIncrement := incrementOrCreateBlockFn
-	defer func() {
-		resolveStoredBlockIDsFn = prevResolve
-		incrementOrCreateBlockFn = prevIncrement
-	}()
+	oldAdd := registerUploadedBlockAddReferenceFn
+	oldFence := registerUploadedBlockFenceActiveFn
+	oldUpsert := registerUploadedBlockUpsertMetadataFn
+	oldUpsertExpiry := registerUploadedBlockUpsertProvisionalExpiryFn
+	t.Cleanup(func() {
+		registerUploadedBlockAddReferenceFn = oldAdd
+		registerUploadedBlockFenceActiveFn = oldFence
+		registerUploadedBlockUpsertMetadataFn = oldUpsert
+		registerUploadedBlockUpsertProvisionalExpiryFn = oldUpsertExpiry
+	})
 
-	resolveErr := errors.New("resolve failed")
-	incrementCalls := 0
-	resolveStoredBlockIDsFn = func(h *FSHelper, orgID string, blockIDs []string) ([]string, error) {
-		return nil, resolveErr
+	registerUploadedBlockAddReferenceFn = func(h *FSHelper, orgID, blockID, referrer, libraryID string, ttlSeconds int) error {
+		return nil
 	}
-	incrementOrCreateBlockFn = func(h *FSHelper, orgID, blockID string, sizeBytes int, storageClass, storageKey string) error {
-		incrementCalls++
+	registerUploadedBlockFenceActiveFn = func(h *FSHelper, orgID, blockID string) (bool, error) {
+		return false, nil
+	}
+	registerUploadedBlockUpsertMetadataFn = func(h *FSHelper, orgID, blockID string, sizeBytes int, storageClass, storageKey string) error {
 		return nil
 	}
 
-	err := helper.IncrementBlockRefCounts("org-3", []string{"sha1-block"})
-	if !errors.Is(err, resolveErr) {
-		t.Fatalf("IncrementBlockRefCounts() error = %v, want wrapped %v", err, resolveErr)
+	var expiresAt time.Time
+	registerUploadedBlockUpsertProvisionalExpiryFn = func(h *FSHelper, orgID, blockID, referrer, storageClass string, value time.Time) error {
+		if orgID != "org-1" || blockID != "block-1" || referrer != db.BlockReferrerForUpload("op-1") || storageClass != "hot" {
+			t.Fatalf("expiry args = %s/%s/%s/%s", orgID, blockID, referrer, storageClass)
+		}
+		expiresAt = value
+		return nil
 	}
-	if incrementCalls != 0 {
-		t.Fatalf("IncrementOrCreateBlock called %d times, want 0", incrementCalls)
+
+	before := time.Now().UTC()
+	err := helper.RegisterUploadedBlock("org-1", "lib-1", "block-1", "op-1", 123, "hot", "key-1")
+	after := time.Now().UTC()
+	if err != nil {
+		t.Fatalf("RegisterUploadedBlock() error = %v, want nil", err)
+	}
+	if expiresAt.IsZero() {
+		t.Fatal("expected provisional expiry tracker to be recorded")
+	}
+	wantMin := before.Add(time.Duration(db.ProvisionalBlockReferenceTTLSeconds) * time.Second)
+	wantMax := after.Add(time.Duration(db.ProvisionalBlockReferenceTTLSeconds) * time.Second)
+	if expiresAt.Before(wantMin) || expiresAt.After(wantMax) {
+		t.Fatalf("expiresAt = %v, want between %v and %v", expiresAt, wantMin, wantMax)
 	}
 }
 
-func TestIncrementBlockRefCountsTracked_ResolutionFailureSkipsMutation(t *testing.T) {
+func TestRegisterUploadedBlock_RollsBackWhenExpiryTrackingFails(t *testing.T) {
 	helper := &FSHelper{}
-	prevResolve := resolveStoredBlockIDsFn
-	prevIncrement := incrementOrCreateBlockFn
-	defer func() {
-		resolveStoredBlockIDsFn = prevResolve
-		incrementOrCreateBlockFn = prevIncrement
-	}()
+	oldAdd := registerUploadedBlockAddReferenceFn
+	oldFence := registerUploadedBlockFenceActiveFn
+	oldUpsert := registerUploadedBlockUpsertMetadataFn
+	oldUpsertExpiry := registerUploadedBlockUpsertProvisionalExpiryFn
+	oldRelease := registerUploadedBlockReleaseRefsFn
+	oldEnqueue := registerUploadedBlockEnqueueZeroRefFn
+	t.Cleanup(func() {
+		registerUploadedBlockAddReferenceFn = oldAdd
+		registerUploadedBlockFenceActiveFn = oldFence
+		registerUploadedBlockUpsertMetadataFn = oldUpsert
+		registerUploadedBlockUpsertProvisionalExpiryFn = oldUpsertExpiry
+		registerUploadedBlockReleaseRefsFn = oldRelease
+		registerUploadedBlockEnqueueZeroRefFn = oldEnqueue
+	})
 
-	resolveErr := errors.New("resolve failed")
-	incrementCalls := 0
-	resolveStoredBlockIDsFn = func(h *FSHelper, orgID string, blockIDs []string) ([]string, error) {
-		return nil, resolveErr
+	var calls []string
+	registerUploadedBlockAddReferenceFn = func(h *FSHelper, orgID, blockID, referrer, libraryID string, ttlSeconds int) error {
+		calls = append(calls, "add")
+		return nil
 	}
-	incrementOrCreateBlockFn = func(h *FSHelper, orgID, blockID string, sizeBytes int, storageClass, storageKey string) error {
-		incrementCalls++
+	registerUploadedBlockFenceActiveFn = func(h *FSHelper, orgID, blockID string) (bool, error) {
+		t.Fatal("fence check should not run when expiry tracking fails")
+		return false, nil
+	}
+	registerUploadedBlockUpsertMetadataFn = func(h *FSHelper, orgID, blockID string, sizeBytes int, storageClass, storageKey string) error {
+		t.Fatal("metadata upsert should not run when expiry tracking fails")
+		return nil
+	}
+	expiryErr := errors.New("expiry write failed")
+	registerUploadedBlockUpsertProvisionalExpiryFn = func(h *FSHelper, orgID, blockID, referrer, storageClass string, expiresAt time.Time) error {
+		calls = append(calls, "expiry")
+		return expiryErr
+	}
+	registerUploadedBlockReleaseRefsFn = func(h *FSHelper, orgID, libraryID, operationID string, blockIDs []string) []string {
+		calls = append(calls, "release")
+		return []string{"block-1"}
+	}
+	registerUploadedBlockEnqueueZeroRefFn = func(orgID string, blockIDs []string, storageClass string) {
+		calls = append(calls, "enqueue")
+	}
+
+	err := helper.RegisterUploadedBlock("org-1", "lib-1", "block-1", "op-1", 123, "hot", "key-1")
+	if !errors.Is(err, expiryErr) {
+		t.Fatalf("RegisterUploadedBlock() error = %v, want wrapped %v", err, expiryErr)
+	}
+	want := []string{"add", "expiry", "release", "enqueue"}
+	if len(calls) != len(want) {
+		t.Fatalf("calls = %#v, want %#v", calls, want)
+	}
+	for i := range want {
+		if calls[i] != want[i] {
+			t.Fatalf("calls[%d] = %q, want %q (full=%#v)", i, calls[i], want[i], calls)
+		}
+	}
+}
+
+func TestRegisterUploadedBlock_ReenqueuesZeroRefWhenFenceNeverClears(t *testing.T) {
+	helper := &FSHelper{}
+	oldAdd := registerUploadedBlockAddReferenceFn
+	oldFence := registerUploadedBlockFenceActiveFn
+	oldUpsert := registerUploadedBlockUpsertMetadataFn
+	oldRelease := registerUploadedBlockReleaseRefsFn
+	oldAttempts := registerUploadedBlockRetryAttemptsFn
+	oldBackoff := registerUploadedBlockRetryBackoffFn
+	oldSleep := registerUploadedBlockSleepFn
+	oldEnqueue := registerUploadedBlockEnqueueZeroRefFn
+	t.Cleanup(func() {
+		registerUploadedBlockAddReferenceFn = oldAdd
+		registerUploadedBlockFenceActiveFn = oldFence
+		registerUploadedBlockUpsertMetadataFn = oldUpsert
+		registerUploadedBlockReleaseRefsFn = oldRelease
+		registerUploadedBlockRetryAttemptsFn = oldAttempts
+		registerUploadedBlockRetryBackoffFn = oldBackoff
+		registerUploadedBlockSleepFn = oldSleep
+		registerUploadedBlockEnqueueZeroRefFn = oldEnqueue
+	})
+
+	var calls []string
+	registerUploadedBlockAddReferenceFn = func(h *FSHelper, orgID, blockID, referrer, libraryID string, ttlSeconds int) error {
+		calls = append(calls, "add")
+		return nil
+	}
+	registerUploadedBlockFenceActiveFn = func(h *FSHelper, orgID, blockID string) (bool, error) {
+		calls = append(calls, "fence")
+		return true, nil
+	}
+	registerUploadedBlockUpsertMetadataFn = func(h *FSHelper, orgID, blockID string, sizeBytes int, storageClass, storageKey string) error {
+		t.Fatal("upsert should not run while the delete fence remains active")
+		return nil
+	}
+	registerUploadedBlockReleaseRefsFn = func(h *FSHelper, orgID, libraryID, operationID string, blockIDs []string) []string {
+		calls = append(calls, "release")
+		if orgID != "org-1" || libraryID != "lib-1" || operationID != "op-1" {
+			t.Fatalf("release args = %s/%s/%s, want org-1/lib-1/op-1", orgID, libraryID, operationID)
+		}
+		if len(blockIDs) != 1 || blockIDs[0] != "block-1" {
+			t.Fatalf("release blockIDs = %#v, want []string{\"block-1\"}", blockIDs)
+		}
+		return []string{"block-1"}
+	}
+	registerUploadedBlockRetryAttemptsFn = func() int { return 2 }
+	registerUploadedBlockRetryBackoffFn = func(attempt int) time.Duration {
+		calls = append(calls, fmt.Sprintf("backoff-%d", attempt))
+		return 0
+	}
+	registerUploadedBlockSleepFn = func(delay time.Duration) {
+		t.Fatalf("sleep should not run when backoff is zero, got %s", delay)
+	}
+	registerUploadedBlockEnqueueZeroRefFn = func(orgID string, blockIDs []string, storageClass string) {
+		calls = append(calls, "enqueue")
+		if orgID != "org-1" || storageClass != "hot" {
+			t.Fatalf("enqueue args = %s/%s, want org-1/hot", orgID, storageClass)
+		}
+		if len(blockIDs) != 1 || blockIDs[0] != "block-1" {
+			t.Fatalf("enqueue blockIDs = %#v, want []string{\"block-1\"}", blockIDs)
+		}
+	}
+
+	err := helper.RegisterUploadedBlock("org-1", "lib-1", "block-1", "op-1", 123, "hot", "")
+	if !errors.Is(err, ErrBlockDeleteInProgress) {
+		t.Fatalf("RegisterUploadedBlock() error = %v, want ErrBlockDeleteInProgress", err)
+	}
+	want := []string{"add", "fence", "backoff-1", "fence", "release", "enqueue"}
+	if len(calls) != len(want) {
+		t.Fatalf("calls = %#v, want %#v", calls, want)
+	}
+	for i := range want {
+		if calls[i] != want[i] {
+			t.Fatalf("calls[%d] = %q, want %q (full=%#v)", i, calls[i], want[i], calls)
+		}
+	}
+}
+
+func TestStagePendingPublishedFiles_AssignsResolvedInternalBlockIDs(t *testing.T) {
+	helper := &FSHelper{}
+	oldResolve := stagePendingPublishedFilesResolveFn
+	oldAdd := stagePendingPublishedFilesAddReferencesFn
+	oldRemove := stagePendingPublishedFilesRemoveReferencesFn
+	oldPersist := stagePendingPublishedFilesPersistFn
+	t.Cleanup(func() {
+		stagePendingPublishedFilesResolveFn = oldResolve
+		stagePendingPublishedFilesAddReferencesFn = oldAdd
+		stagePendingPublishedFilesRemoveReferencesFn = oldRemove
+		stagePendingPublishedFilesPersistFn = oldPersist
+	})
+
+	persistCalls := 0
+	stagePendingPublishedFilesPersistFn = func(h *FSHelper, repoID string, pending *pendingPublishedFile) error {
+		persistCalls++
+		if repoID != "repo-1" {
+			t.Fatalf("persist repoID = %q, want repo-1", repoID)
+		}
+		if pending.fsID != "fs-1" {
+			t.Fatalf("persist fsID = %q, want fs-1", pending.fsID)
+		}
+		if pending.cleanupOrgID != "org-1" || pending.cleanupAttemptID != "commit-1" {
+			t.Fatalf("persist metadata = %q/%q, want org-1/commit-1", pending.cleanupOrgID, pending.cleanupAttemptID)
+		}
+		if len(pending.internalBlockIDs) != 1 || pending.internalBlockIDs[0] != "sha256-1" {
+			t.Fatalf("persist internalBlockIDs = %#v, want []string{\"sha256-1\"}", pending.internalBlockIDs)
+		}
 		return nil
 	}
 
-	got, err := helper.IncrementBlockRefCountsTracked("org-4", []string{"sha1-block"})
-	if !errors.Is(err, resolveErr) {
-		t.Fatalf("IncrementBlockRefCountsTracked() error = %v, want wrapped %v", err, resolveErr)
+	resolveCalls := 0
+	stagePendingPublishedFilesResolveFn = func(h *FSHelper, orgID string, blockIDs []string) ([]string, error) {
+		resolveCalls++
+		if orgID != "org-1" {
+			t.Fatalf("resolve orgID = %q, want org-1", orgID)
+		}
+		if len(blockIDs) != 1 || blockIDs[0] != "sha1-1" {
+			t.Fatalf("resolve blockIDs = %#v, want []string{\"sha1-1\"}", blockIDs)
+		}
+		return []string{"sha256-1"}, nil
 	}
-	if got != nil {
-		t.Fatalf("IncrementBlockRefCountsTracked() incremented = %v, want nil on resolution failure", got)
+	addCalls := 0
+	stagePendingPublishedFilesAddReferencesFn = func(database *db.DB, orgID, repoID, attemptID string, blockIDs []string) error {
+		addCalls++
+		if orgID != "org-1" || repoID != "repo-1" || attemptID != "commit-1" {
+			t.Fatalf("add args = %s/%s/%s, want org-1/repo-1/commit-1", orgID, repoID, attemptID)
+		}
+		if len(blockIDs) != 1 || blockIDs[0] != "sha256-1" {
+			t.Fatalf("add blockIDs = %#v, want []string{\"sha256-1\"}", blockIDs)
+		}
+		return nil
 	}
-	if incrementCalls != 0 {
-		t.Fatalf("IncrementOrCreateBlock called %d times, want 0", incrementCalls)
+	stagePendingPublishedFilesRemoveReferencesFn = func(database *db.DB, orgID, attemptID string, blockIDs []string) error {
+		t.Fatalf("remove should not run on successful stage, got %s/%s %#v", orgID, attemptID, blockIDs)
+		return nil
+	}
+
+	pending := &pendingPublishedFile{fsID: "fs-1", externalBlockIDs: []string{"sha1-1"}}
+	err := helper.stagePendingPublishedFiles("org-1", "repo-1", "commit-1", []*pendingPublishedFile{pending})
+	if err != nil {
+		t.Fatalf("stagePendingPublishedFiles() error = %v, want nil", err)
+	}
+	if resolveCalls != 1 {
+		t.Fatalf("resolveCalls = %d, want 1", resolveCalls)
+	}
+	if addCalls != 1 {
+		t.Fatalf("addCalls = %d, want 1", addCalls)
+	}
+	if persistCalls != 1 {
+		t.Fatalf("persistCalls = %d, want 1", persistCalls)
+	}
+	if len(pending.internalBlockIDs) != 1 || pending.internalBlockIDs[0] != "sha256-1" {
+		t.Fatalf("pending.internalBlockIDs = %#v, want []string{\"sha256-1\"}", pending.internalBlockIDs)
+	}
+}
+
+func TestStagePendingPublishedFiles_ReturnsRollbackFailureAndKeepsResolvedIDs(t *testing.T) {
+	helper := &FSHelper{}
+	oldResolve := stagePendingPublishedFilesResolveFn
+	oldAdd := stagePendingPublishedFilesAddReferencesFn
+	oldRemove := stagePendingPublishedFilesRemoveReferencesFn
+	oldPersist := stagePendingPublishedFilesPersistFn
+	t.Cleanup(func() {
+		stagePendingPublishedFilesResolveFn = oldResolve
+		stagePendingPublishedFilesAddReferencesFn = oldAdd
+		stagePendingPublishedFilesRemoveReferencesFn = oldRemove
+		stagePendingPublishedFilesPersistFn = oldPersist
+	})
+
+	stagePendingPublishedFilesResolveFn = func(h *FSHelper, orgID string, blockIDs []string) ([]string, error) {
+		if len(blockIDs) != 1 {
+			t.Fatalf("resolve blockIDs len = %d, want 1", len(blockIDs))
+		}
+		return []string{"resolved-" + blockIDs[0]}, nil
+	}
+	stagePendingPublishedFilesPersistFn = func(h *FSHelper, repoID string, pending *pendingPublishedFile) error {
+		return nil
+	}
+	addCalls := 0
+	stageErr := errors.New("stage boom")
+	stagePendingPublishedFilesAddReferencesFn = func(database *db.DB, orgID, repoID, attemptID string, blockIDs []string) error {
+		addCalls++
+		if addCalls == 2 {
+			return stageErr
+		}
+		return nil
+	}
+	removeCalls := 0
+	cleanupErr := errors.New("cleanup boom")
+	stagePendingPublishedFilesRemoveReferencesFn = func(database *db.DB, orgID, attemptID string, blockIDs []string) error {
+		removeCalls++
+		if orgID != "org-1" || attemptID != "commit-1" {
+			t.Fatalf("remove args = %s/%s, want org-1/commit-1", orgID, attemptID)
+		}
+		if len(blockIDs) != 2 || blockIDs[0] != "resolved-sha1-1" || blockIDs[1] != "resolved-sha1-2" {
+			t.Fatalf("remove blockIDs = %#v, want both staged block IDs", blockIDs)
+		}
+		return cleanupErr
+	}
+
+	pending := []*pendingPublishedFile{
+		{fsID: "fs-1", externalBlockIDs: []string{"sha1-1"}},
+		{fsID: "fs-2", externalBlockIDs: []string{"sha1-2"}},
+	}
+	err := helper.stagePendingPublishedFiles("org-1", "repo-1", "commit-1", pending)
+	if !errors.Is(err, stageErr) {
+		t.Fatalf("stagePendingPublishedFiles() error = %v, want stage error %v", err, stageErr)
+	}
+	if !errors.Is(err, cleanupErr) {
+		t.Fatalf("stagePendingPublishedFiles() error = %v, want cleanup error %v", err, cleanupErr)
+	}
+	if addCalls != 2 {
+		t.Fatalf("addCalls = %d, want 2", addCalls)
+	}
+	if removeCalls != 1 {
+		t.Fatalf("removeCalls = %d, want 1", removeCalls)
+	}
+	if len(pending[0].internalBlockIDs) != 1 || pending[0].internalBlockIDs[0] != "resolved-sha1-1" {
+		t.Fatalf("pending[0].internalBlockIDs = %#v, want []string{\"resolved-sha1-1\"}", pending[0].internalBlockIDs)
+	}
+	if len(pending[1].internalBlockIDs) != 1 || pending[1].internalBlockIDs[0] != "resolved-sha1-2" {
+		t.Fatalf("pending[1].internalBlockIDs = %#v, want []string{\"resolved-sha1-2\"}", pending[1].internalBlockIDs)
+	}
+}
+
+func TestPrepareFileFSObjectForPublish_DefersPersistenceUntilStage(t *testing.T) {
+	helper := &FSHelper{}
+	pending, err := helper.prepareFileFSObjectForPublish("repo-1", "report.pdf", 123, []string{"sha1-1"})
+	if err != nil {
+		t.Fatalf("prepareFileFSObjectForPublish() error = %v, want nil", err)
+	}
+	if pending == nil {
+		t.Fatal("prepareFileFSObjectForPublish() returned nil pending file")
+	}
+	if pending.name != "report.pdf" {
+		t.Fatalf("pending.name = %q, want report.pdf", pending.name)
+	}
+	if pending.size != 123 {
+		t.Fatalf("pending.size = %d, want 123", pending.size)
+	}
+	if pending.cleanupOrgID != "" || pending.cleanupAttemptID != "" {
+		t.Fatalf("pending cleanup metadata = %q/%q, want empty before stage", pending.cleanupOrgID, pending.cleanupAttemptID)
 	}
 }
 
@@ -369,181 +874,6 @@ func TestNormalizePath_Additional(t *testing.T) {
 				t.Errorf("normalizePath(%q) = %q, want %q", tt.input, result, tt.expected)
 			}
 		})
-	}
-}
-
-func TestIsAmbiguousBlockMutationError(t *testing.T) {
-	tests := []struct {
-		name string
-		err  error
-		want bool
-	}{
-		{name: "cas write unknown", err: gocql.RequestErrCASWriteUnknown{}, want: true},
-		{name: "cas write timeout", err: gocql.RequestErrWriteTimeout{WriteType: "CAS"}, want: true},
-		{name: "wrapped cas write timeout", err: fmt.Errorf("wrapped: %w", gocql.RequestErrWriteTimeout{WriteType: "CAS"}), want: true},
-		{name: "non cas write timeout", err: gocql.RequestErrWriteTimeout{WriteType: "BATCH"}, want: false},
-		{name: "no response timeout", err: gocql.ErrTimeoutNoResponse, want: true},
-		{name: "connection closed", err: gocql.ErrConnectionClosed, want: true},
-		{name: "generic", err: errors.New("boom"), want: false},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := isAmbiguousBlockMutationError(tt.err); got != tt.want {
-				t.Fatalf("isAmbiguousBlockMutationError(%v) = %v, want %v", tt.err, got, tt.want)
-			}
-		})
-	}
-}
-
-func TestResolveIncrementBlockMutationErrorReturnsUnknownWhenExpectedRefCountIsVisible(t *testing.T) {
-	retry, err := resolveIncrementBlockMutationError("block-1", 3, gocql.RequestErrWriteTimeout{WriteType: "CAS"}, func() (blockMutationState, error) {
-		return blockMutationState{exists: true, refCount: 3}, nil
-	})
-	if retry {
-		t.Fatal("resolveIncrementBlockMutationError() retry = true, want false")
-	}
-	if err == nil {
-		t.Fatal("resolveIncrementBlockMutationError() error = nil, want unknown outcome error")
-	}
-	if !errors.Is(err, ErrBlockMutationOutcomeUnknown) {
-		t.Fatalf("resolveIncrementBlockMutationError() error = %v, want ErrBlockMutationOutcomeUnknown", err)
-	}
-	var writeTimeout gocql.RequestErrWriteTimeout
-	if !errors.As(err, &writeTimeout) {
-		t.Fatalf("resolveIncrementBlockMutationError() error = %v, want wrapped write timeout", err)
-	}
-}
-
-func TestResolveIncrementBlockMutationErrorRetriesWhenRefCountUnchanged(t *testing.T) {
-	retry, err := resolveIncrementBlockMutationError("block-1", 3, gocql.RequestErrCASWriteUnknown{}, func() (blockMutationState, error) {
-		return blockMutationState{exists: true, refCount: 2}, nil
-	})
-	if err != nil {
-		t.Fatalf("resolveIncrementBlockMutationError() error = %v, want nil", err)
-	}
-	if !retry {
-		t.Fatal("resolveIncrementBlockMutationError() retry = false, want true")
-	}
-}
-
-func TestResolveIncrementBlockMutationErrorReturnsUnknownWhenConfirmationFails(t *testing.T) {
-	confirmErr := errors.New("confirm boom")
-	retry, err := resolveIncrementBlockMutationError("block-1", 3, gocql.ErrTimeoutNoResponse, func() (blockMutationState, error) {
-		return blockMutationState{}, confirmErr
-	})
-	if retry {
-		t.Fatal("resolveIncrementBlockMutationError() retry = true, want false")
-	}
-	if err == nil {
-		t.Fatal("resolveIncrementBlockMutationError() error = nil, want unknown outcome error")
-	}
-	if !errors.Is(err, ErrBlockMutationOutcomeUnknown) {
-		t.Fatalf("resolveIncrementBlockMutationError() error = %v, want ErrBlockMutationOutcomeUnknown", err)
-	}
-	if !errors.Is(err, confirmErr) {
-		t.Fatalf("resolveIncrementBlockMutationError() error = %v, want wrapped confirmation error", err)
-	}
-	if !errors.Is(err, gocql.ErrTimeoutNoResponse) {
-		t.Fatalf("resolveIncrementBlockMutationError() error = %v, want wrapped timeout error", err)
-	}
-}
-
-func TestResolveIncrementBlockMutationErrorReturnsUnknownWhenStateIsUnexpected(t *testing.T) {
-	retry, err := resolveIncrementBlockMutationError("block-1", 3, gocql.RequestErrCASWriteUnknown{}, func() (blockMutationState, error) {
-		return blockMutationState{exists: true, refCount: 4}, nil
-	})
-	if retry {
-		t.Fatal("resolveIncrementBlockMutationError() retry = true, want false")
-	}
-	if err == nil {
-		t.Fatal("resolveIncrementBlockMutationError() error = nil, want unknown outcome error")
-	}
-	if !errors.Is(err, ErrBlockMutationOutcomeUnknown) {
-		t.Fatalf("resolveIncrementBlockMutationError() error = %v, want ErrBlockMutationOutcomeUnknown", err)
-	}
-	var casUnknown gocql.RequestErrCASWriteUnknown
-	if !errors.As(err, &casUnknown) {
-		t.Fatalf("resolveIncrementBlockMutationError() error = %v, want wrapped CAS error", err)
-	}
-}
-
-func TestResolveInsertBlockMutationErrorRetriesWhenRowStillMissing(t *testing.T) {
-	retry, err := resolveInsertBlockMutationError("block-1", 42, "hot", "", gocql.RequestErrWriteTimeout{WriteType: "CAS"}, func() (blockMutationState, error) {
-		return blockMutationState{}, nil
-	})
-	if err != nil {
-		t.Fatalf("resolveInsertBlockMutationError() error = %v, want nil", err)
-	}
-	if !retry {
-		t.Fatal("resolveInsertBlockMutationError() retry = false, want true")
-	}
-}
-
-func TestResolveInsertBlockMutationErrorReturnsUnknownWhenExpectedRowExists(t *testing.T) {
-	retry, err := resolveInsertBlockMutationError("block-1", 42, "hot", "", gocql.RequestErrCASWriteUnknown{}, func() (blockMutationState, error) {
-		return blockMutationState{exists: true, refCount: 1, sizeBytes: 42, storageClass: "hot", storageKey: ""}, nil
-	})
-	if retry {
-		t.Fatal("resolveInsertBlockMutationError() retry = true, want false")
-	}
-	if err == nil {
-		t.Fatal("resolveInsertBlockMutationError() error = nil, want unknown outcome error")
-	}
-	if !errors.Is(err, ErrBlockMutationOutcomeUnknown) {
-		t.Fatalf("resolveInsertBlockMutationError() error = %v, want ErrBlockMutationOutcomeUnknown", err)
-	}
-	var casUnknown gocql.RequestErrCASWriteUnknown
-	if !errors.As(err, &casUnknown) {
-		t.Fatalf("resolveInsertBlockMutationError() error = %v, want wrapped CAS error", err)
-	}
-}
-
-func TestResolveInsertBlockMutationErrorReturnsUnknownWhenExistingStateIsUnexpected(t *testing.T) {
-	retry, err := resolveInsertBlockMutationError("block-1", 42, "hot", "", gocql.RequestErrCASWriteUnknown{}, func() (blockMutationState, error) {
-		return blockMutationState{exists: true, refCount: 2, sizeBytes: 42, storageClass: "hot", storageKey: ""}, nil
-	})
-	if retry {
-		t.Fatal("resolveInsertBlockMutationError() retry = true, want false")
-	}
-	if err == nil {
-		t.Fatal("resolveInsertBlockMutationError() error = nil, want unknown outcome error")
-	}
-	if !errors.Is(err, ErrBlockMutationOutcomeUnknown) {
-		t.Fatalf("resolveInsertBlockMutationError() error = %v, want ErrBlockMutationOutcomeUnknown", err)
-	}
-	var casUnknown gocql.RequestErrCASWriteUnknown
-	if !errors.As(err, &casUnknown) {
-		t.Fatalf("resolveInsertBlockMutationError() error = %v, want wrapped CAS error", err)
-	}
-}
-
-func TestIncrementBlockRefCountsResolvedRollsBackPartialProgress(t *testing.T) {
-	var rolledBack []string
-	seen := []string{}
-	wantErr := errors.New("boom")
-
-	err := incrementBlockRefCountsResolved(
-		[]string{"block-a", "block-b", "block-c"},
-		func(blockID string) error {
-			seen = append(seen, blockID)
-			if blockID == "block-c" {
-				return wantErr
-			}
-			return nil
-		},
-		func(blockIDs []string) {
-			rolledBack = append([]string(nil), blockIDs...)
-		},
-	)
-	if !errors.Is(err, wantErr) {
-		t.Fatalf("incrementBlockRefCountsResolved() error = %v, want %v", err, wantErr)
-	}
-	if got := fmt.Sprint(seen); got != "[block-a block-b block-c]" {
-		t.Fatalf("incrementBlockRefCountsResolved() seen = %s, want all attempted blocks", got)
-	}
-	if got := fmt.Sprint(rolledBack); got != "[block-a block-b]" {
-		t.Fatalf("incrementBlockRefCountsResolved() rollback = %s, want prior successful increments only", got)
 	}
 }
 

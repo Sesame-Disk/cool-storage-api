@@ -444,8 +444,19 @@ What is still missing is traffic-accounting coverage for abandoned or failed chu
 
 ### ISSUE-BLOCK-REFCOUNT-IDEMPOTENCE-01: Ambiguous `blocks` LWT Outcomes Can Still Leak Refcounts Across Retries
 
-**Status**: 🟡 Accepted hotfix debt / pending hardening (2026-05-26)
-**Severity**: Medium-High operational risk — current behavior prefers fail-closed and no unsafe rollback, but some retry paths can still inflate `blocks.ref_count`
+**Status**: ✅ Fixed (2026-05-27) by the row-per-reference redesign — `blocks.ref_count`
+is gone. References are modeled as rows in `block_references` (one row per
+`(block, referrer)`: `fs:<library>:<fs_id>` for committed fs_objects, `up:<library>:<block>`
+for in-flight uploads). Adding/removing a reference is an idempotent `INSERT`/`DELETE`
+with no LWT, so a client retry that re-registers the same content-addressed
+`(block, fs_id)` cannot inflate anything — the ambiguous-CAS leak class no longer
+exists. The only expensive Paxos left is the GC worker's `gc_state='deleting'` claim
+at the irreversible S3-delete gate (claim-then-verify). See
+`internal/db/block_references.go`, `FSHelper.RegisterUploadedBlock` /
+`RegisterFSObjectBlockReferences`, and the GC worker's `processBlock` /
+`removeFSObjectBlockReferences`. Original analysis kept below for context.
+
+**Severity (when active)**: Medium-High operational risk — preferred fail-closed and no unsafe rollback, but some retry paths could still inflate `blocks.ref_count`
 **Affected**: `IncrementOrCreateBlock`, sync `PUT /seafhttp/repo/:repo_id/block/:block_id`, seafhttp upload finalize paths, future block-ref accounting callers
 
 #### Current Behavior
@@ -656,8 +667,17 @@ Make `StreamBlocks` return `error` (or the bytes streamed), and in `streamFileFr
 
 ### ISSUE-REFCOUNT-RESOLVE-FAILCLOSED-01: Block-Ref Mutations Are Fail-Closed Pending the Counter→Per-Block Redesign
 
-**Status**: 🟡 Accepted interim behavior; root fix deferred to the ref_count redesign (2026-05-27)
-**Severity**: Medium — worst case is a *permanent* block leak in a rare path; no data loss, no corruption
+**Status**: ✅ Fixed (2026-05-27) by the row-per-reference redesign — the deferred root
+fix has landed. `DecrementBlockRefCountsOnce` / `IncrementBlockRefCounts*` are gone.
+The decrement path is now `RemoveBlockReference` (an idempotent `DELETE` of a single
+`(block, referrer)` row), so a SHA-1 resolution failure during GC is no longer a
+*permanent* leak: deleting a missing reference is a no-op and a retried fs_object GC
+pass simply re-attempts the `DELETE`. Resolution is still strict/fail-closed on the
+*increment* side (`RegisterFSObjectBlockReferences`), which is correct — that path is
+pre-commit and abortable, and the in-flight upload's provisional `up:` reference (with
+TTL) keeps the block alive meanwhile. Original analysis kept below for context.
+
+**Severity (when active)**: Medium — worst case was a *permanent* block leak in a rare path; no data loss, no corruption
 **Affected**: `resolveStoredBlockIDs`, `DecrementBlockRefCountsOnce`, `IncrementBlockRefCounts*` (`internal/api/v2/fs_helpers.go`)
 
 #### Context
@@ -1323,8 +1343,8 @@ The GC (worker + scanner) has no coordination mechanism between instances. If mu
 3. **Snapshot drift** (resolved 2026-04-28): the original `gc_queue_stats` counter table was retired from the baseline schema. Queue/DLQ totals now live in `gc_stats` and are reconciled per dirty org by a serialized reconciler (with a periodic full-sum drift check). See ARCHITECTURE.md / GC-SERVICE-ANALYSIS.md.
 
 **Is there data loss?** No. Destructive operations are protected:
-- `DeleteBlock` uses LWT two-phase (only one instance wins the `IF ref_count <= 0`)
-- `MarkItemProcessed` uses `INSERT ... IF NOT EXISTS` to prevent double-decrement of ref_count
+- `DeleteBlock` uses a claim-then-verify delete fence: only one instance can win the claim, and the winner re-checks live `block_references` before touching S3
+- `block_references` rows make fs_object cleanup idempotent; retrying the same delete removes the same keyed refs again instead of replaying a counter decrement
 - Cassandra DELETEs are idempotent
 
 **Actual impact**: Wasted work (CPU/network overhead) and slightly incorrect admin counters. No risk of data loss.

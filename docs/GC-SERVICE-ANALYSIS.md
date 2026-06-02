@@ -26,8 +26,8 @@ flowchart TD
     end
 
     subgraph Targets["Deletion Targets"]
-        Blocks["Blocks<br/>LWT guard: ref_count <= 0<br/>DB delete then S3 delete"]
-        FSObj["FS Objects<br/>Decrement block refs<br/>Cascade to children"]
+      Blocks["Blocks<br/>Claim+verify delete fence<br/>DB delete then S3 delete"]
+      FSObj["FS Objects<br/>Remove block_references rows<br/>Cascade to children"]
         Commits["Commits<br/>Cascade to root fs_object"]
         Libs["Library Cascade<br/>All commits + fs_objects<br/>Shares, tags, tokens"]
         Users["User Cascade<br/>Libraries + shares<br/>Groups, starred, keys"]
@@ -36,8 +36,8 @@ flowchart TD
 
     subgraph Safety["Safety Mechanisms"]
         Grace["Grace Period<br/>Default: 1 hour"]
-        LWT["LWT Guard<br/>IF ref_count <= 0"]
-            Idempotent["Idempotency<br/>MarkItemProcessed<br/>35d TTL"]
+      LWT["Delete Fence<br/>LWT claim + live-ref recheck"]
+         Idempotent["Idempotency<br/>block_references rows<br/>+ claim IDs"]
         Lock["Hard-Delete Locks<br/>Prevents restore race"]
         Retry["Retry Cap: 5<br/>Then move to DLQ"]
     end
@@ -95,24 +95,23 @@ cascades call `HardDeleteOrgLocked` only after child cleanup has already complet
 
 ```
 processBlock(item):
-  1. LWT: UPDATE blocks SET ref_count = -999
-         WHERE org_id = ? AND block_id = ?
-         IF ref_count <= 0
-     └─ If NOT applied (ref_count > 0): SKIP, delete GC candidate, done.
-     └─ If applied:
-  2. DELETE FROM blocks (unconditional)
-  3. S3 DeleteBlock(blockID)
+  1. Point-read live block_references / provisional refs
+     └─ If any ref exists: skip, delete GC candidate, done.
+  2. ClaimBlockDelete(blockID) via LWT delete fence
+     └─ If claim fails: another worker or a new live ref won; skip.
+  3. Re-check live references after the claim
+     └─ If any ref exists: release claim, skip.
+  4. Record S3 orphan fence + DELETE block metadata/mappings
+  5. S3 DeleteBlock(blockID)
      └─ If S3 fails: LOG WARNING, return error → retry
-     └─ If S3 succeeds:
-  4. Delete block mappings (SHA-1 → SHA-256)
-  5. Delete GC candidate record
-  6. Increment stats
+  6. Delete GC candidate record and clear the fence/claim state
+  7. Increment stats
 ```
 
-**The LWT guard at step 1 is the core safety mechanism.** Even if a block is enqueued
-for deletion while simultaneously being referenced by a new upload, the LWT check
-(`IF ref_count <= 0`) prevents deletion of live data. This was verified in
-`worker_regression_test.go:TestWorker_StorageLeak_LWTSkipsLiveBlock`.
+**The claim+verify fence is the core safety mechanism.** Even if a block is enqueued
+for deletion while simultaneously being referenced by a new upload, the worker
+point-reads live references before and after the LWT claim, and releases the
+claim if a concurrent writer reintroduces liveness before S3 deletion.
 
 ### FS Object deletion (cascade trigger)
 
@@ -123,23 +122,15 @@ processFSObject(item):
   2. If directory: enqueue all children (skip grace period)
   3. If file with blocks:
      a. Resolve block IDs once for the object
-     b. For each block occurrence, create deterministic taskID
-        (fs_id + identity_at + block position + resolved block ID)
-     c. MarkItemProcessed(taskID) — IF NOT EXISTS
-        └─ Already processed: verify whether this block occurrence's
-           decrement is reflected; repair only the missing recorded
-           decrement if the marker was written before the decrement landed
-        └─ First time: DecrementRefCount, check if now 0
-     d. Enqueue zero-ref blocks for deletion
+     b. Delete this fs_object's row-per-reference block_references
+     c. If a block now has no live refs, record/enqueue gc_block_candidates
   4. Delete fs_object from DB
 ```
 
-**The idempotency mechanism at step 3b prevents double-decrement on retry.**
-Each block occurrence in the `fs_object` has its own deterministic marker. After
-a crash, the worker continues unrecorded block decrements and checks recorded
-ones against live references. If a marker was written before its decrement
-landed, the worker repairs that missing decrement instead of deleting the
-`fs_object` with an inflated block refcount.
+**The idempotency mechanism at step 3 is row-per-reference liveness.** Retrying
+the fs_object cleanup deletes the same keyed `block_references` rows again, which
+is safe, and zero-ref discovery is re-derived from current live references rather
+than replaying decrement markers.
 
 Block deletion also re-checks live `fs_object` references before claiming a
 zero-ref block. The worker caches the org's live block-reference set during a
@@ -151,16 +142,15 @@ batch, so deleting N block items does not rescan every `fs_object` N times.
 
 These are deliberate safety mechanisms that are correctly implemented and tested:
 
-1. **LWT-based block deletion** — Cassandra lightweight transactions ensure blocks with
-   `ref_count > 0` are never deleted from S3, even under concurrent upload. The
-   worker also scans live fs_object references before claiming a zero-ref block
-   so partial fs_object decrement recovery cannot remove referenced content.
+1. **Claim-then-verify block deletion** — Cassandra lightweight transactions only guard
+   the delete claim, and the worker re-checks live `block_references` before S3
+   deletion. That prevents live content from being removed even under concurrent upload.
 2. **Grace period** (default 1h) — Recently enqueued items can't be processed. Gives
-   time for concurrent operations to increment ref counts.
-3. **Idempotent decrement** — `MarkItemProcessed` with deterministic per-block task IDs
-   prevents double-decrement across worker retries and delayed DLQ requeues inside the
-   30-day failed-item retention window, while retry repair handles markers that
-   were persisted immediately before a crash. The tracking table now uses a 35-day TTL.
+   time for concurrent operations to finish registering or promoting references.
+3. **Idempotent cleanup by liveness rows** — keyed `block_references` rows replace the
+   retired decrement-marker table. Upload/publish retries are safe because repeated
+   deletes hit the same keys, and block-delete retries are guarded by claim IDs plus
+   a second live-reference check before finalization.
 4. **Cascade ordering** — Commit → root fs_object → children → blocks. If any step fails,
    the parent is not deleted, and the scanner will re-discover it.
 5. **Hard-delete locks** — User, library, and org cascades acquire a tokenized,
@@ -273,6 +263,10 @@ This section answers: **"When X happens, what gets cleaned up, when, and how do 
 
 ### How deduplication works
 
+> Note
+> The live implementation no longer uses `blocks.ref_count` or `gc_processed_items`.
+> Block liveness is now row-per-reference in `block_references`, zero-ref discovery is recorded in `gc_block_candidates`, and the worker uses claim-then-verify delete fences before touching S3. The historical counter-based examples below have not been fully rewritten yet.
+
 Blocks are identified by SHA-256 hash and scoped to an **org** (partition key = `org_id`).
 When two users in the same org upload identical files, only one copy of each block is
 stored in S3. The `blocks` table tracks a `ref_count` — how many fs_objects reference
@@ -290,7 +284,7 @@ race conditions:
 
 - **Increment** (`IncrementBlockRefCounts`): on upload and copy. Uses `UPDATE ... IF ref_count = ? SET ref_count = ?` with CAS retry.
 - **Decrement** (`DecrementBlockRefCountsOnce`): on file delete. Same CAS pattern. Returns `true` if the decrement caused ref_count to hit 0.
-- **Idempotency**: Each block decrement operation has a stable key derived from `library_id`, `fs_object_id`, block position, resolved block ID, and GC `identity_at`. Processed operations are recorded in `gc_processed_items` (35d TTL) to prevent double-decrement on retry and delayed DLQ replay while allowing partially completed fs_objects to resume. If a marker exists but the current refcount still includes that fs_object occurrence, retry repair applies the missing decrement before deleting the fs_object.
+- **Current idempotency model**: The retired `gc_processed_items` marker table is no longer part of the active design. Upload and publish retries are idempotent because block liveness lives in keyed `block_references` rows, and GC delete retries are guarded by claim IDs plus a re-check of live references before block-finalization.
 
 Blocks are **never shared across orgs** — the `blocks` primary key is `(org_id, block_id)`.
 
@@ -428,7 +422,7 @@ removes the public access link.
 | Guarantee | Mechanism | Integration-tested? |
 |-----------|-----------|-------------------|
 | Block never deleted while ref_count > 0 | LWT: `IF ref_count <= 0` | **Yes** (`TestGC_ConcurrentUploadDuringGC`) |
-| Ref count never double-decremented within the supported replay window | Stable idempotent operation key + `gc_processed_items` | **Yes** (unit + `TestBatchDeleteItems_DeduplicatedFilesDecrementSharedBlockTwice`) |
+| Live block references are never removed twice by retry bookkeeping | Idempotent per-referrer row deletes plus delete-fence revalidation | **Yes** (unit + `TestBatchDeleteItems_DeduplicatedFilesDecrementSharedBlockTwice`) |
 | Re-uploaded content survives pending GC | Grace period + LWT re-check at deletion time | **Yes** (`TestGC_ConcurrentUploadDuringGC`) |
 | Shared block survives partial file delete | Ref count tracks all references | **Yes** (`TestGC_DeduplicationSafety`) |
 | Cascade respects restore from trash | Stale-check + hard-delete lock | Unit tests only (**pending integration**) |

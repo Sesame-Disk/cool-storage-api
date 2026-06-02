@@ -141,6 +141,125 @@ Add to `.github/workflows/test.yml`:
 
 ---
 
+## 20. Block Metadata Hot-Path LWT (DEFERRED)
+
+### Current State
+The row-per-reference migration removed Paxos from `block_references`, but block materialization still uses `INSERT ... IF NOT EXISTS` in `UpsertBlockMetadata` for the canonical `blocks` row.
+
+### Why It Was Deferred
+This branch keeps the LWT because it still pins one canonical `(storage_class, storage_key)` for a content-addressed block. A blind last-writer-wins rewrite could repoint reads and GC to a backend that does not actually hold the canonical copy.
+
+### Follow-Up Plan
+1. Split block materialization into a hot re-upload path and a cold-create path.
+2. Use a cheap read/confirmation path for already-known blocks.
+3. Keep LWT only for true first-writer creation, or replace it with an equivalent ownership scheme that preserves the canonical physical copy invariant.
+4. Re-run the Docker `go-all-test` path plus focused upload/concurrency integration tests before changing this.
+
+### Regression Tests To Keep
+- `TestConcurrentV2UploadsNoLostCommits`
+- `TestChunkedUploadConflictRollbackCleansStateBeforeFreshReupload`
+- `TestSyncRecvFSBeforePutBlockPublishesDownloadableFile`
+
+---
+
+## 21. Cassandra-Real Coverage For GC Claim Retry (DEFERRED)
+
+### Current State
+`ClaimBlockDelete` now does an explicit `SELECT gc_state, gc_claim_id` after a failed CAS, instead of trusting the partial row returned by Cassandra for `UPDATE ... IF`.
+
+### Why It Was Deferred
+The code path is corrected, but the current tree still lacks a real Cassandra regression that proves a retry of the same logical candidate recognizes its prior claim under Cassandra's actual CAS return semantics.
+
+### Follow-Up Plan
+1. Add a Cassandra-backed store test that seeds a claimed block row.
+2. Retry `ClaimBlockDelete` with the same `claimID` and assert ownership is recognized.
+3. Retry with a different `claimID` and assert it is rejected.
+4. Keep the existing S3-orphan recovery tests green alongside the new coverage.
+
+---
+
+## 22. SeafHTTP Publish-Attempt ID Resolution Mismatch (DEFERRED)
+
+### Current State
+The direct SeafHTTP finalize paths still call `db.StagePublishAttemptReferences(..., nil)` and queue durable publish-repair rows with external SHA-1 block IDs. Block liveness itself lives on internal SHA-256 IDs.
+
+The current code is not in the highest-risk state anymore because:
+- successful provisional-ref writers (direct uploads, SeafHTTP, sync, and OnlyOffice edits) keep the `up:` ref alive until publish finishes, then release it on success while the GC scanner recovers abandoned refs by per-referrer expiry;
+- permanent `fs:` refs are still added through `RegisterFSObjectBlockReferences`, which resolves external IDs before writing liveness rows.
+
+### Why It Was Deferred
+This mismatch is now a contract / cleanup gap, not the top merge blocker. The main correctness blockers in this branch were the destructive mapping rollback, partial `pub:` stage leak, and abandoned-upload recovery gap. Those are now addressed via forward-mapping preservation, partial-stage rollback cleanup, and per-referrer provisional-expiry tracking plus success-path `up:` ref release.
+
+### Follow-Up Plan
+1. Resolve SeafHTTP single-shot and multiblock finalize inputs to internal SHA-256 IDs before calling `StagePublishAttemptReferences`.
+2. Queue durable publish-repair rows with those resolved internal IDs, matching the v2/sync contract.
+3. Keep the permanent `fs:` registration path unchanged so external block IDs in `fs_objects` remain backward-compatible.
+4. Re-run focused SeafHTTP finalize tests plus publish-repair integration coverage.
+
+### Regression Tests To Keep
+- `TestCreateOfficeFileLeavesNoPublishAttemptRefs`
+- `TestSyncRecvFSBeforePutBlockPublishesDownloadableFile`
+- `TestConcurrentV2UploadsNoLostCommits`
+
+---
+
+## 23. Row-Per-Reference Schema / Docs Cleanup
+
+Closed in the current branch: the dead `gc_processed_items` bootstrap table is gone from `001_initial_schema.cql`, the GC store no longer exposes a marker API that nothing calls, and the remaining docs now point at `block_references` / delete-fence GC as the active model instead of the retired counter-marker design.
+4. Re-run the focused GC / upload / publish tests after the cleanup branch to catch accidental drift.
+
+---
+
+## 24. Sync fs_object Reference Retention (DEFERRED)
+
+### Current State
+`fs:*` block references mean "this persisted fs_object contains the block", not
+"this block is present in the current HEAD". Sync finalization therefore preserves
+`fs:<library_id>:<fs_id>` rows when a file leaves HEAD; the permanent reference is
+removed only when the retained fs_object itself is swept by reachability/retention
+GC.
+
+### Why It Was Deferred
+This is the safe merge behavior for the row-per-reference branch because old
+commits, history downloads, and retention windows can still reference fs_objects
+that are no longer in HEAD. Removing `fs:*` from the sync writer path can make a
+block look dead while retained metadata still points at it.
+
+### Follow-Up Plan
+1. Formalize the fs_object retention horizon and gc_grace contract.
+2. Make the fs_object GC the only permanent-reference remover.
+3. Add Cassandra-backed coverage for sync delete/replace followed by history
+   download across the retention window.
+4. Add metrics for retained-unreachable fs_objects and delayed block reclamation.
+
+---
+
+## 25. SeafHTTP Finalize Operational Hardening (DEFERRED)
+
+### Current State
+Correctness blockers for merge have been handled in the writer path:
+- SeafHTTP upload refs use a per-attempt/session operation ID instead of a reusable
+  access token.
+- S3 orphan fences are no longer cleared by writers; recovery/GC owns S3 deletes.
+- Large pending-published owner rows keep `block_ids` out of the logged owner +
+  discovery batch, avoiding Cassandra "Batch too large" failures during large
+  finalization.
+
+### Remaining Debt
+- `finalizeUploadStreaming()` still uses local concurrency permits in addition to
+  the distributed finalize lease; tune this under production load.
+- Pending-owner and publish-repair sweepers need explicit per-run limits and
+  metrics for skipped, repaired, released, and failed rows.
+- The upload-finalize `gc_leases` role should include `orgID` for extra isolation.
+- Lease acquisition can poll LWT every 25ms under contention; add backoff/jitter or
+  a lower-pressure queueing path if hot libraries contend frequently.
+- If a crash happens after the owner+discovery batch but before the separate
+  `block_ids` update, `pub:<attempt>` refs can survive until TTL. This is a known
+  leak window, not data loss; close it later with chunked block-id metadata or a
+  repair source that can reconstruct staged IDs.
+
+---
+
 ## 5. Web Upload Pipeline Follow-Ups (PENDING)
 
 ### Current State
@@ -209,6 +328,25 @@ Future fix options:
 - or move to per-chunk traffic recording / reservation with reconciliation on completion, retry, or abandonment
 - if per-chunk recording lands, replace the current `declared total on every request` pre-check with chunk-bytes or session-reservation logic to avoid false rejections after partial accounting
 - add tests for aborted uploads, finalize failures, duplicate chunk retries, and malformed `Content-Range`
+
+**4. Finish the remaining `ReadAll` limits audit**
+
+`httputil.ReadAllWithLimit` fails closed at 1 GiB (`1 << 30`) before calling
+`io.ReadAll` when the declared size is too large, and also rejects bodies that
+stream past the limit.
+
+Current production callers:
+- `SeafHTTPHandler.HandleUpload` in [internal/api/seafhttp.go](internal/api/seafhttp.go)
+- `FileHandler.UploadFile` in [internal/api/v2/files.go](internal/api/v2/files.go)
+
+Test-only callers live in [internal/httputil/read_limit_test.go](internal/httputil/read_limit_test.go).
+Chunked web uploads already avoid whole-file reads on the request path.
+
+Still pending outside this branch's upload-finalization scope:
+- audit direct sync-protocol request-body reads and decompressed zlib reads in [internal/api/sync.go](internal/api/sync.go) and give each endpoint an explicit protocol-sized cap or streaming parser
+- cap diagnostic/body reads from external OIDC HTTP responses in [internal/auth/oidc.go](internal/auth/oidc.go)
+- audit storage/buffer/streaming `ReadAll` helpers that are safe only when the caller already controls object size
+- keep tests/HTTP response reads as test-only exceptions unless they become production helpers
   run: |
     go test ./... -coverprofile=coverage.out
     COVERAGE=$(go tool cover -func=coverage.out | grep total | awk '{print $3}' | sed 's/%//')
@@ -1182,6 +1320,8 @@ The same retry-amplification pattern applies to copy block reference accounting:
 
 Retried metadata mutations can also leave unpublished rows behind. Each failed attempt may have created new `fs_objects` and a `commits` row whose commit never becomes a library HEAD. This is not a functional regression, but CAS retries multiply the amount of unreachable metadata compared with a single failed publish. A future maintenance pass should add observability or cleanup for unpublished commit/fs-object rows.
 
+Failed-publish cleanup intentionally does not delete unreachable-looking `fs_objects` today. `fs_id` is content-addressed, so concurrent in-flight publish attempts for the same content can legitimately share the same `fs_object` row before any winning commit becomes visible. A cleanup pass that only scans currently reachable commits can therefore misclassify a shared in-flight `fs_object` as dead and delete content another still-running attempt needs. Any future cleanup for unpublished `fs_objects` must track per-attempt ownership or another explicit in-flight lease; visible-commit reachability alone is not a safe predicate.
+
 The same pattern now applies to sync auto-merge snapshotting: `internal/api/sync.go` reads base/current/target `root_fs_id` in separate queries before attempting the merge. The final HEAD CAS still rejects stale work correctly, but concurrent head movement can waste merge computation and temporary fs-object materialization before the publish loses.
 
 ### 19.d. `UpdateLibraryHeadFromSnapshot` Validates an Argument Every Caller Passes Mechanically
@@ -1497,4 +1637,43 @@ NOT addressed in this branch.
 
 ---
 
-*Last updated: 2026-05-26*
+## Pending-published fs_object cleanup (row-per-owner model)
+
+The publish flow tracks each in-flight fs_object with a row-per-owner in
+`pending_published_fs_objects` (+ the `_by_day` discovery projection). Two known
+gaps remain after closing the shared-delete data-loss race:
+
+**Medium — orphaned fs_object metadata leaks in live libraries.**
+`releasePendingPublishedFileOwner` now only deletes the owner row and returns; it
+deliberately does NOT delete the `fs_objects` row, because `fs_id` is
+content-addressed and a concurrent publish attempt may have just begun reusing
+the same row (deleting it there caused real corruption). The failed-attempt sweep
+path (`cleanupPendingPublishedFileOwnerAttempt` →
+`cleanupPendingPublishedFileAttemptArtifacts` → `CleanupFailedPublishArtifacts`)
+removes the commit and the `pub:<attempt>` refs but likewise leaves the
+`fs_objects` row. The GC scanner only collects fs_objects for libraries that no
+longer exist (`Scanner.scanOrphanedFSObjects` skips any library where
+`LibraryExists` is true), so a failed publish inside an ACTIVE library leaks an
+fs_object metadata row.
+
+Impact: the data-loss risk is resolved; what remains is a bounded metadata leak —
+the row is content-addressed (re-adopted by a later identical publish) and the
+backing blocks are still reclaimed once their `pub:` refs hit the 35d TTL.
+Pending fix option: a GC pass that sweeps fs_objects unreachable from any commit
+in a live library after a grace period, re-verifying reachability AND
+owner-absence at delete time to stay race-safe.
+
+**Low — `pub:<attempt>` refs can leak until TTL on a crash between the owner
+batch and the block_ids write.** `UpsertPendingPublishedFSObjectOwner` writes the
+owner primary row + `_by_day` projection in one `LoggedBatch` (block_ids kept OUT
+to avoid `batch too large` on multi-GB uploads), then writes `block_ids` in a
+separate `UPDATE`. If the process dies between the two, the owner is already
+discoverable by the sweep but carries no `block_ids`; the sweep's artifact
+cleanup (`CleanupFailedPublishArtifacts`) only removes `pub:` refs when it has
+block IDs, so those refs leak until their 35d TTL expires. This is an operational
+leak only — not a visibility or correctness problem — and self-heals via TTL. The
+same future GC pass over abandoned owners could reconcile these earlier.
+
+---
+
+*Last updated: 2026-06-01*

@@ -39,6 +39,36 @@ func TestCreateDirectory(t *testing.T) {
 	}
 }
 
+func TestCreateOfficeFileLeavesNoPublishAttemptRefs(t *testing.T) {
+	requireCassandra(t)
+
+	name := fmt.Sprintf("inttest-create-office-publish-%d", time.Now().UnixNano())
+	repoID := createTestLibrary(t, adminClient, name)
+	fileName := "publish-check.docx"
+
+	resp := adminClient.PostForm(t, fmt.Sprintf("/api2/repos/%s/file/?p=/%s&operation=create", repoID, url.QueryEscape(fileName)), url.Values{})
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+		body := responseBody(t, resp)
+		t.Fatalf("create office file status = %d, want 200/201; body=%s", resp.StatusCode, body)
+	}
+	resp.Body.Close()
+
+	referrers := uploadedFileBlockReferrers(t, repoID, "/", fileName)
+	repoFSRefs := 0
+	repoRefPrefix := "fs:" + repoID + ":"
+	for _, referrer := range referrers {
+		if strings.HasPrefix(referrer, "pub:") {
+			t.Fatalf("created office file leaked publish-attempt ref %q", referrer)
+		}
+		if strings.HasPrefix(referrer, repoRefPrefix) {
+			repoFSRefs++
+		}
+	}
+	if repoFSRefs != 1 {
+		t.Fatalf("created office file repo-local fs ref count = %d, want 1; referrers=%v", repoFSRefs, referrers)
+	}
+}
+
 func TestFileUpload(t *testing.T) {
 	name := fmt.Sprintf("inttest-upload-%d", time.Now().UnixNano())
 	repoID := createTestLibrary(t, adminClient, name)
@@ -199,10 +229,13 @@ func TestFileDelete(t *testing.T) {
 	}
 }
 
-// TestSameLibraryCopyIncrementsBlockRefCountBeforeReturning verifies both the
-// single-file and legacy batch forms of CopyFile increment shared block refs
-// before the handler returns success.
-func TestSameLibraryCopyIncrementsBlockRefCountBeforeReturning(t *testing.T) {
+// TestSameLibraryCopyKeepsBlockAliveViaSharedReference verifies that copying a
+// file within the same library does NOT create a new block reference: the copy
+// shares the source's content-addressed fs_id, so the same permanent
+// fs:<library>:<fs_id> reference covers every copy. The block stays alive (>=1
+// reference) the whole time, which is what matters for the row-per-reference
+// model — there is no per-copy counter to inflate.
+func TestSameLibraryCopyKeepsBlockAliveViaSharedReference(t *testing.T) {
 	name := fmt.Sprintf("inttest-copy-refcount-%d", time.Now().UnixNano())
 	repoID := createTestLibrary(t, adminClient, name)
 
@@ -218,7 +251,7 @@ func TestSameLibraryCopyIncrementsBlockRefCountBeforeReturning(t *testing.T) {
 	hash := sha256.Sum256([]byte(fileContent))
 	blockID := hex.EncodeToString(hash[:])
 	if refCount := readBlockRefCount(t, orgID, blockID); refCount != 1 {
-		t.Fatalf("ref_count after seed upload = %d, want 1", refCount)
+		t.Fatalf("references after seed upload = %d, want 1", refCount)
 	}
 
 	copyResp := adminClient.PostJSON(t, "/api/v2.1/repos/"+repoID+"/file/copy/", map[string]interface{}{
@@ -228,8 +261,10 @@ func TestSameLibraryCopyIncrementsBlockRefCountBeforeReturning(t *testing.T) {
 	})
 	expectStatus(t, copyResp, http.StatusOK)
 	copyResp.Body.Close()
-	if refCount := readBlockRefCount(t, orgID, blockID); refCount != 2 {
-		t.Fatalf("ref_count after single copy = %d, want 2", refCount)
+	// Same content → same fs_id → the existing fs_object reference is shared, not
+	// duplicated. The block stays alive with its single permanent reference.
+	if refCount := readBlockRefCount(t, orgID, blockID); refCount != 1 {
+		t.Fatalf("references after single same-library copy = %d, want 1 (shared fs_id)", refCount)
 	}
 
 	batchCopyResp := adminClient.PostJSON(t, "/api/v2.1/repos/"+repoID+"/file/copy/", map[string]interface{}{
@@ -240,12 +275,12 @@ func TestSameLibraryCopyIncrementsBlockRefCountBeforeReturning(t *testing.T) {
 	})
 	expectStatus(t, batchCopyResp, http.StatusOK)
 	batchCopyResp.Body.Close()
-	if refCount := readBlockRefCount(t, orgID, blockID); refCount != 3 {
-		t.Fatalf("ref_count after batch copy = %d, want 3", refCount)
+	if refCount := readBlockRefCount(t, orgID, blockID); refCount != 1 {
+		t.Fatalf("references after batch same-library copy = %d, want 1 (shared fs_id)", refCount)
 	}
 }
 
-func assertSameLibraryCopyReplaceCleansUpReplacedBlocks(t *testing.T, useBatch bool) {
+func assertSameLibraryCopyReplaceKeepsReplacedBlockUntilGC(t *testing.T, useBatch bool) {
 	t.Helper()
 
 	name := fmt.Sprintf("inttest-copy-replace-refcount-%d", time.Now().UnixNano())
@@ -274,10 +309,10 @@ func assertSameLibraryCopyReplaceCleansUpReplacedBlocks(t *testing.T, useBatch b
 	replacedBlockID := hex.EncodeToString(replacedHash[:])
 
 	if refCount := readBlockRefCount(t, orgID, sourceBlockID); refCount != 1 {
-		t.Fatalf("source ref_count after seed upload = %d, want 1", refCount)
+		t.Fatalf("source references after seed upload = %d, want 1", refCount)
 	}
 	if refCount := readBlockRefCount(t, orgID, replacedBlockID); refCount != 1 {
-		t.Fatalf("replaced ref_count after seed upload = %d, want 1", refCount)
+		t.Fatalf("replaced references after seed upload = %d, want 1", refCount)
 	}
 
 	var copyResp *http.Response
@@ -298,14 +333,16 @@ func assertSameLibraryCopyReplaceCleansUpReplacedBlocks(t *testing.T, useBatch b
 	expectStatus(t, copyResp, http.StatusOK)
 	copyResp.Body.Close()
 
-	if refCount := readBlockRefCount(t, orgID, sourceBlockID); refCount != 2 {
-		t.Fatalf("source ref_count after copy replace = %d, want 2", refCount)
+	// Same content → shared fs_id, so the source block keeps its single reference.
+	if refCount := readBlockRefCount(t, orgID, sourceBlockID); refCount != 1 {
+		t.Fatalf("source references after copy replace = %d, want 1 (shared fs_id)", refCount)
 	}
 
-	if !pollUntil(t, 10*time.Second, 200*time.Millisecond, func() bool {
-		return readBlockRefCount(t, orgID, replacedBlockID) <= 0
-	}) {
-		t.Fatalf("replaced ref_count after copy replace = %d, want <= 0", readBlockRefCount(t, orgID, replacedBlockID))
+	// The replaced file's old fs_object stays in fs_objects (reachable from older
+	// commits) until GC sweeps it, so its block is NOT decremented inline by the
+	// copy-replace — storage is reclaimed later by GC, not synchronously.
+	if refCount := readBlockRefCount(t, orgID, replacedBlockID); refCount != 1 {
+		t.Fatalf("replaced references after copy replace = %d, want 1 (survives until GC)", refCount)
 	}
 
 	dstResp := adminClient.Get(t, fmt.Sprintf("/api/v2.1/repos/%s/dir/?p=/dst", repoID))
@@ -316,23 +353,17 @@ func assertSameLibraryCopyReplaceCleansUpReplacedBlocks(t *testing.T, useBatch b
 	if !containsEntry(entries, "name", fileName) {
 		t.Fatalf("copied file %q not found in /dst after replace", fileName)
 	}
-	if refCount := readBlockRefCount(t, orgID, sourceBlockID); refCount != 2 {
-		t.Fatalf("source ref_count after cleanup = %d, want 2", refCount)
-	}
-	if refCount := readBlockRefCount(t, orgID, replacedBlockID); refCount > 0 {
-		t.Fatalf("replaced ref_count after cleanup = %d, want <= 0", refCount)
-	}
 	if dstResp.Body != nil {
 		dstResp.Body.Close()
 	}
 }
 
-func TestSameLibraryCopyReplaceCleansUpReplacedBlocks(t *testing.T) {
-	assertSameLibraryCopyReplaceCleansUpReplacedBlocks(t, false)
+func TestSameLibraryCopyReplaceKeepsReplacedBlockUntilGC(t *testing.T) {
+	assertSameLibraryCopyReplaceKeepsReplacedBlockUntilGC(t, false)
 }
 
-func TestSameLibraryBatchCopyReplaceCleansUpReplacedBlocks(t *testing.T) {
-	assertSameLibraryCopyReplaceCleansUpReplacedBlocks(t, true)
+func TestSameLibraryBatchCopyReplaceKeepsReplacedBlockUntilGC(t *testing.T) {
+	assertSameLibraryCopyReplaceKeepsReplacedBlockUntilGC(t, true)
 }
 
 // TestCrossLibraryBatchCopyIncrementsBlockRefCount verifies that copying a file
@@ -394,20 +425,28 @@ func TestCrossLibraryBatchCopyIncrementsBlockRefCount(t *testing.T) {
 		t.Fatalf("file %q not found in dstRepo after cross-library batch copy", fileName)
 	}
 
-	// Block ref_count must be 2: once for the original upload, once for the cross-library copy.
-	session := shareProjectionDBForTest(t).Session()
-	var orgID string
-	if err := session.Query(`SELECT org_id FROM libraries_by_id WHERE library_id = ?`, srcRepoID).Scan(&orgID); err != nil {
-		t.Fatalf("failed to resolve org_id: %v", err)
-	}
+	// The block now has 2 permanent fs_object references: one in srcRepo (original
+	// upload) and one in dstRepo — the cross-library copy created a NEW fs_object
+	// there (unlike a same-library copy, which shares the fs_id).
+	orgID := resolveOrgID(t, srcRepoID)
 	hash := sha256.Sum256([]byte(fileContent))
 	blockID := hex.EncodeToString(hash[:])
-	var refCount int
-	if err := session.Query(`SELECT ref_count FROM blocks WHERE org_id = ? AND block_id = ?`, orgID, blockID).Scan(&refCount); err != nil {
-		t.Fatalf("failed to read block ref_count for block %s: %v", blockID, err)
+	if refCount := readBlockRefCount(t, orgID, blockID); refCount != 2 {
+		t.Fatalf("references after cross-library batch copy = %d, want 2", refCount)
 	}
-	if refCount != 2 {
-		t.Fatalf("ref_count after cross-library batch copy = %d, want 2", refCount)
+
+	referrers := uploadedFileBlockReferrers(t, dstRepoID, "/", fileName)
+	fsRefs := 0
+	for _, referrer := range referrers {
+		if strings.HasPrefix(referrer, "pub:") {
+			t.Fatalf("cross-library batch copy leaked publish-attempt ref %q", referrer)
+		}
+		if strings.HasPrefix(referrer, "fs:") {
+			fsRefs++
+		}
+	}
+	if fsRefs != 2 {
+		t.Fatalf("cross-library batch copy fs ref count = %d, want 2; referrers=%v", fsRefs, referrers)
 	}
 }
 
@@ -462,41 +501,24 @@ func TestCrossLibraryBatchCopy_DeleteSourceBlockSurvives(t *testing.T) {
 		t.Fatal("async batch copy task did not complete within 10 s")
 	}
 
-	// 3. Verify ref_count = 2 after copy.
-	session := shareProjectionDBForTest(t).Session()
-	var orgID string
-	if err := session.Query(`SELECT org_id FROM libraries_by_id WHERE library_id = ?`, srcRepoID).Scan(&orgID); err != nil {
-		t.Fatalf("failed to resolve org_id: %v", err)
-	}
+	// 3. Verify the block now has 2 permanent references (srcRepo + dstRepo).
+	orgID := resolveOrgID(t, srcRepoID)
 	hash := sha256.Sum256([]byte(fileContent))
 	blockID := hex.EncodeToString(hash[:])
-
-	var refCount int
-	if err := session.Query(`SELECT ref_count FROM blocks WHERE org_id = ? AND block_id = ?`, orgID, blockID).Scan(&refCount); err != nil {
-		t.Fatalf("failed to read block ref_count: %v", err)
-	}
-	if refCount != 2 {
-		t.Fatalf("ref_count after copy = %d, want 2", refCount)
+	if refCount := readBlockRefCount(t, orgID, blockID); refCount != 2 {
+		t.Fatalf("references after copy = %d, want 2", refCount)
 	}
 
-	// 4. Delete the source file.
+	// 4. Delete the source file. This creates a new commit without it, but the
+	// source's old fs_object stays in fs_objects until GC sweeps it — deletes no
+	// longer decrement inline — so the block stays alive. What matters is that the
+	// dst copy remains readable; storage for the source reference is reclaimed by GC.
 	delResp := adminClient.Delete(t, fmt.Sprintf("/api2/repos/%s/file/?p=/%s", srcRepoID, fileName))
 	expectStatus(t, delResp, http.StatusOK)
 	delResp.Body.Close()
 
-	// 5. Wait for the async decrement goroutine to complete (DecrementBlockRefCountsOnce).
-	deadline = time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		if err := session.Query(`SELECT ref_count FROM blocks WHERE org_id = ? AND block_id = ?`, orgID, blockID).Scan(&refCount); err != nil {
-			t.Fatalf("failed to read block ref_count after delete: %v", err)
-		}
-		if refCount == 1 {
-			break
-		}
-		time.Sleep(200 * time.Millisecond)
-	}
-	if refCount != 1 {
-		t.Fatalf("ref_count after deleting source file = %d, want 1 (block should survive for dst)", refCount)
+	if refCount := readBlockRefCount(t, orgID, blockID); refCount < 1 {
+		t.Fatalf("references after deleting source file = %d, want >= 1 (block must survive for dst)", refCount)
 	}
 
 	// 6. Verify file is still accessible in destination library.
@@ -516,10 +538,11 @@ func TestCrossLibraryBatchCopy_DeleteSourceBlockSurvives(t *testing.T) {
 	dlResp.Body.Close()
 }
 
-// TestBatchDeleteItems_DecrementsBlockRefCount verifies that deleting via the new
-// batch operation properly initiates the Garbage Collector flow by decrementing
-// the block's ref_count to 0. (Preventing storage leaks).
-func TestBatchDeleteItems_DecrementsBlockRefCount(t *testing.T) {
+// TestBatchDeleteItems_BlockSurvivesUntilGC verifies that deleting via the batch
+// operation does NOT decrement block references inline: the deleted file's
+// fs_object stays in fs_objects (reachable from older commits) until GC sweeps it,
+// so the block keeps its reference. Storage is reclaimed by GC, not synchronously.
+func TestBatchDeleteItems_BlockSurvivesUntilGC(t *testing.T) {
 	name := fmt.Sprintf("inttest-batchdel-gc-%d", time.Now().UnixNano())
 	repoID := createTestLibrary(t, adminClient, name)
 
@@ -532,22 +555,12 @@ func TestBatchDeleteItems_DecrementsBlockRefCount(t *testing.T) {
 	uploadURL := strings.Trim(responseBody(t, uploadLinkResp), "\" \n\r")
 	uploadFileThroughLink(t, adminClient, uploadURL, fileName, "/", fileContent)
 
-	session := shareProjectionDBForTest(t).Session()
-	var orgID string
-	if err := session.Query(`SELECT org_id FROM libraries_by_id WHERE library_id = ?`, repoID).Scan(&orgID); err != nil {
-		t.Fatalf("failed to resolve org_id: %v", err)
-	}
-
+	orgID := resolveOrgID(t, repoID)
 	hash := sha256.Sum256([]byte(fileContent))
 	blockID := hex.EncodeToString(hash[:])
 
-	// Verify ref_count is 1
-	var refCount int
-	if err := session.Query(`SELECT ref_count FROM blocks WHERE org_id = ? AND block_id = ?`, orgID, blockID).Scan(&refCount); err != nil {
-		t.Fatalf("failed to read block ref_count: %v", err)
-	}
-	if refCount != 1 {
-		t.Fatalf("ref_count before batch delete = %d, want 1", refCount)
+	if refCount := readBlockRefCount(t, orgID, blockID); refCount != 1 {
+		t.Fatalf("references before batch delete = %d, want 1", refCount)
 	}
 
 	// 2. Batch Delete the file
@@ -560,18 +573,9 @@ func TestBatchDeleteItems_DecrementsBlockRefCount(t *testing.T) {
 	expectStatus(t, delResp, http.StatusOK)
 	delResp.Body.Close()
 
-	// 3. Wait for the async ref_count decrement goroutine
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		if err := session.Query(`SELECT ref_count FROM blocks WHERE org_id = ? AND block_id = ?`, orgID, blockID).Scan(&refCount); err != nil {
-			t.Fatalf("failed to read block ref_count after delete: %v", err)
-		}
-		if refCount <= 0 {
-			break
-		}
-		time.Sleep(200 * time.Millisecond)
-	}
-	if refCount > 0 {
-		t.Fatalf("ref_count after batch deletion = %d, want 0 (so GC can collect it) - possible storage leak", refCount)
+	// 3. The deleted file's fs_object persists until GC, so the block keeps its
+	// reference — no inline decrement.
+	if refCount := readBlockRefCount(t, orgID, blockID); refCount != 1 {
+		t.Fatalf("references after batch delete = %d, want 1 (fs_object survives until GC)", refCount)
 	}
 }

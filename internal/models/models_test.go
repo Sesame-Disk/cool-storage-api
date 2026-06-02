@@ -348,7 +348,6 @@ func TestBlockJSONSerialization(t *testing.T) {
 		SizeBytes:    1024,
 		StorageClass: "hot",
 		StorageKey:   "org123/sha256hash",
-		RefCount:     3,
 		CreatedAt:    now,
 		LastAccessed: now,
 	}

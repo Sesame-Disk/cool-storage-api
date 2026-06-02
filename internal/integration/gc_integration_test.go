@@ -122,19 +122,36 @@ func resolveOrgID(t *testing.T, repoID string) string {
 	return orgID
 }
 
-// readBlockRefCount returns the ref_count for a block, or -999 if not found.
+// readBlockRefCount returns the number of PERMANENT (fs_object) references a block
+// has under the row-per-reference model, or -999 if the canonical blocks row was
+// deleted. Provisional "up:" upload references (which carry a TTL) are ignored so
+// the count reflects how many live fs_objects reference the block — the closest
+// analogue of the old mutable ref_count.
 func readBlockRefCount(t *testing.T, orgID, blockID string) int {
 	t.Helper()
 	session := shareProjectionDBForTest(t).Session()
-	var rc int
-	err := session.Query(`SELECT ref_count FROM blocks WHERE org_id = ? AND block_id = ?`, orgID, blockID).Scan(&rc)
+
+	var existing string
+	err := session.Query(`SELECT block_id FROM blocks WHERE org_id = ? AND block_id = ?`, orgID, blockID).Scan(&existing)
 	if errors.Is(err, gocql.ErrNotFound) {
 		return -999 // block row deleted
 	}
 	if err != nil {
 		t.Fatalf("readBlockRefCount: %v", err)
 	}
-	return rc
+
+	iter := session.Query(`SELECT referrer FROM block_references WHERE org_id = ? AND block_id = ?`, orgID, blockID).Iter()
+	var referrer string
+	count := 0
+	for iter.Scan(&referrer) {
+		if strings.HasPrefix(referrer, "fs:") {
+			count++
+		}
+	}
+	if err := iter.Close(); err != nil {
+		t.Fatalf("readBlockRefCount references: %v", err)
+	}
+	return count
 }
 
 // blockExistsInDB returns true if the block row exists in the blocks table.
@@ -506,6 +523,48 @@ func cleanupGCBlockFixturesForTest(t *testing.T, orgID uuid.UUID, blockID string
 	repairGCSnapshotsForTest(t, orgID)
 }
 
+func seedSyntheticZeroRefBlockForTest(t *testing.T, orgID uuid.UUID, blockID, storageClass string) {
+	t.Helper()
+	database := shareProjectionDBForTest(t)
+	if err := database.UpsertBlockMetadata(orgID.String(), blockID, 1, storageClass, ""); err != nil {
+		t.Fatalf("failed to seed block metadata for %s/%s: %v", orgID, blockID, err)
+	}
+	t.Cleanup(func() {
+		cleanupGCBlockFixturesForTest(t, orgID, blockID)
+		if err := database.Session().Query(`DELETE FROM block_references WHERE org_id = ? AND block_id = ?`, orgID.String(), blockID).Exec(); err != nil {
+			t.Fatalf("failed to delete block_references for %s/%s: %v", orgID, blockID, err)
+		}
+		if err := database.Session().Query(`DELETE FROM blocks WHERE org_id = ? AND block_id = ?`, orgID.String(), blockID).Exec(); err != nil {
+			t.Fatalf("failed to delete blocks row for %s/%s: %v", orgID, blockID, err)
+		}
+	})
+}
+
+func ensureSyntheticBlockCandidateForTest(t *testing.T, orgID uuid.UUID, blockID, storageClass string, candidateAt time.Time) time.Time {
+	t.Helper()
+	store := gcpkg.NewCassandraStore(shareProjectionDBForTest(t))
+	effectiveCandidateAt, err := store.EnsureBlockGCCandidate(orgID, blockID, storageClass, candidateAt.UTC().Truncate(time.Millisecond))
+	if err != nil {
+		t.Fatalf("EnsureBlockGCCandidate(%s/%s): %v", orgID, blockID, err)
+	}
+	return effectiveCandidateAt
+}
+
+func enqueueSyntheticBlockQueueItemForTest(t *testing.T, orgID uuid.UUID, blockID, storageClass string, queuedAt time.Time) {
+	t.Helper()
+	queue := gcpkg.NewQueue(gcpkg.NewCassandraStore(shareProjectionDBForTest(t)))
+	if err := queue.EnqueueBatch([]gcpkg.QueueItem{{
+		OrgID:        orgID,
+		QueuedAt:     queuedAt.UTC().Truncate(time.Millisecond),
+		ItemType:     gcpkg.ItemBlock,
+		ItemID:       blockID,
+		LibraryID:    uuid.Nil,
+		StorageClass: storageClass,
+	}}); err != nil {
+		t.Fatalf("failed to enqueue synthetic block queue item for %s/%s: %v", orgID, blockID, err)
+	}
+}
+
 func failedQueueItemExists(t *testing.T, orgID string, itemType string, itemID string) bool {
 	t.Helper()
 	session := shareProjectionDBForTest(t).Session()
@@ -530,8 +589,10 @@ func failedQueueItemExists(t *testing.T, orgID string, itemType string, itemID s
 // Tests
 // ---------------------------------------------------------------------------
 
-// TestGC_BlockLifecycle verifies the complete happy path:
-// upload file → delete → blocks enqueued → GC processes → blocks gone from DB.
+// TestGC_BlockLifecycle verifies the current file-delete lifecycle: deleting a
+// file removes it from HEAD immediately, but retained historical commits keep
+// the old fs_object alive, so the block stays referenced and must not become a
+// GC candidate until later version GC reclaims that history.
 func TestGC_BlockLifecycle(t *testing.T) {
 	requireGCEnabled(t)
 	requireCassandra(t)
@@ -549,39 +610,29 @@ func TestGC_BlockLifecycle(t *testing.T) {
 		t.Fatalf("expected ref_count=1 after upload, got %d", rc)
 	}
 
-	// Delete the file
+	// Delete the file from HEAD.
 	batchDeleteFiles(t, adminClient, repoID, "/", []string{"lifecycle.txt"})
 
-	// Poll until ref_count drops to 0 (async decrement)
-	ok := pollUntil(t, 20*time.Second, 200*time.Millisecond, func() bool {
-		return readBlockRefCount(t, orgID, blockID) <= 0
+	// The old commit still retains the deleted file's fs_object, so the permanent
+	// block ref stays live and no block GC candidate should be registered yet.
+	ok := pollUntil(t, 5*time.Second, 200*time.Millisecond, func() bool {
+		return readBlockRefCount(t, orgID, blockID) == 1 && !gcCandidateExists(t, orgID, blockID)
 	})
 	if !ok {
-		t.Fatalf("ref_count did not reach 0 within timeout (got %d)", readBlockRefCount(t, orgID, blockID))
+		t.Fatalf("delete unexpectedly changed retained block state: refs=%d candidate=%v", readBlockRefCount(t, orgID, blockID), gcCandidateExists(t, orgID, blockID))
 	}
 
-	// Verify GC candidate was created
-	ok = pollUntil(t, 10*time.Second, 200*time.Millisecond, func() bool {
-		return gcCandidateExists(t, orgID, blockID)
-	})
-	if !ok {
-		t.Fatal("gc_block_candidates entry not created after ref_count hit 0")
-	}
-
-	// Trigger GC worker multiple times (grace period is server-configured;
-	// in dev mode it may be short enough to process immediately)
-	for i := 0; i < 5; i++ {
+	for i := 0; i < 3; i++ {
 		triggerGCWorker(t)
 	}
 
-	// Check if block was deleted from DB (may still be in grace period)
-	t.Logf("Block ref_count after GC triggers: %d, exists=%v",
-		readBlockRefCount(t, orgID, blockID),
-		blockExistsInDB(t, orgID, blockID))
-
-	// The test succeeds if: (a) ref_count reached 0, and (b) GC candidate was created.
-	// Full deletion depends on the server's grace period config which we can't control.
-	t.Log("Block lifecycle: ref_count→0 and GC candidate created — pipeline healthy")
+	if !blockExistsInDB(t, orgID, blockID) {
+		t.Fatal("deleted file block was reclaimed before version GC removed the retained fs_object")
+	}
+	if gcCandidateExists(t, orgID, blockID) {
+		t.Fatal("deleted file block became a GC candidate even though retained history still references it")
+	}
+	t.Log("Block lifecycle: retained history kept the deleted file block alive — correct")
 }
 
 // TestGC_DeduplicationSafety verifies that shared blocks survive when only
@@ -604,24 +655,25 @@ func TestGC_DeduplicationSafety(t *testing.T) {
 	uploadFileThroughLink(t, adminClient, uploadURL, "dedup-a.txt", "/", sharedContent)
 	uploadFileThroughLink(t, adminClient, uploadURL, "dedup-b.txt", "/", sharedContent)
 
-	// Verify ref_count=2
+	// Same-library dedup reuses the same content-addressed fs_id, so there is one
+	// permanent block reference, not one per directory entry.
 	rc := readBlockRefCount(t, orgID, blockID)
-	if rc != 2 {
-		t.Fatalf("expected ref_count=2 after dedup upload, got %d", rc)
+	if rc != 1 {
+		t.Fatalf("expected permanent refs=1 after same-library dedup upload, got %d", rc)
 	}
 
 	// Delete only file A
 	batchDeleteFiles(t, adminClient, repoID, "/", []string{"dedup-a.txt"})
 
-	// Wait for async decrement
+	// Deleting one dirent does not remove the shared fs_object's permanent ref.
 	ok := pollUntil(t, 15*time.Second, 200*time.Millisecond, func() bool {
 		return readBlockRefCount(t, orgID, blockID) == 1
 	})
 	if !ok {
-		t.Fatalf("ref_count should be 1 after deleting one file, got %d", readBlockRefCount(t, orgID, blockID))
+		t.Fatalf("permanent refs should stay 1 after deleting one same-library copy, got %d", readBlockRefCount(t, orgID, blockID))
 	}
 
-	// Trigger GC — block should NOT be deleted (ref_count=1)
+	// Trigger GC — block should NOT be deleted while the shared fs_object stays live.
 	for i := 0; i < 3; i++ {
 		triggerGCWorker(t)
 	}
@@ -633,7 +685,10 @@ func TestGC_DeduplicationSafety(t *testing.T) {
 
 	rc = readBlockRefCount(t, orgID, blockID)
 	if rc < 1 {
-		t.Fatalf("shared block ref_count dropped below 1 (%d) — potential data loss", rc)
+		t.Fatalf("shared block permanent refs dropped below 1 (%d) — potential data loss", rc)
+	}
+	if gcCandidateExists(t, orgID, blockID) {
+		t.Fatal("shared block was queued for GC while another same-library copy still references it")
 	}
 
 	// File B should still be downloadable
@@ -700,6 +755,86 @@ func TestGC_ConcurrentUploadDuringGC(t *testing.T) {
 	dlResp.Body.Close()
 
 	t.Log("Concurrent upload safety: LWT prevented deletion of re-referenced block — correct")
+}
+
+func TestUploadLink_ReuploadBlockedByS3OrphanFence(t *testing.T) {
+	requireCassandra(t)
+
+	repoID := createTestLibrary(t, adminClient, fmt.Sprintf("inttest-upload-orphan-fence-%d", time.Now().UnixNano()))
+	orgID := resolveOrgID(t, repoID)
+	database := shareProjectionDBForTest(t)
+	store := gcpkg.NewCassandraStore(database)
+
+	content := fmt.Sprintf("orphan-fence-content-%d\n", time.Now().UnixNano())
+	hash := sha256.Sum256([]byte(content))
+	blockID := hex.EncodeToString(hash[:])
+
+	uploadLinkResp := adminClient.Get(t, fmt.Sprintf("/api2/repos/%s/upload-link/?p=/", repoID))
+	expectStatus(t, uploadLinkResp, http.StatusOK)
+	uploadURL := strings.Trim(responseBody(t, uploadLinkResp), "\" \n\r")
+	uploadFileThroughLink(t, adminClient, uploadURL, "seed.txt", "/", content)
+
+	if rc := readBlockRefCount(t, orgID, blockID); rc != 1 {
+		t.Fatalf("seed upload permanent refs = %d, want 1", rc)
+	}
+
+	orgUUID, err := uuid.Parse(orgID)
+	if err != nil {
+		t.Fatalf("parse orgID %q: %v", orgID, err)
+	}
+	firstSeenAt := time.Now().UTC().Truncate(time.Millisecond)
+	effectiveFirstSeenAt, err := store.RecordS3Orphan(orgUUID, blockID, "hot", "seed orphan fence", firstSeenAt)
+	if err != nil {
+		t.Fatalf("RecordS3Orphan: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := store.DeleteS3Orphan(orgUUID, blockID, effectiveFirstSeenAt); err != nil {
+			t.Errorf("cleanup DeleteS3Orphan(%s): %v", blockID, err)
+		}
+	})
+	if !gcS3OrphanProjectionExists(t, orgID, blockID, effectiveFirstSeenAt) {
+		t.Fatal("expected gc_s3_orphans_by_day projection row to exist before retry upload")
+	}
+
+	status, body := uploadFileThroughLinkStatus(t, adminClient, uploadURL, "blocked-retry.txt", "/", content)
+	if status != http.StatusConflict {
+		t.Fatalf("reupload status = %d body=%s, want 409 conflict", status, body)
+	}
+	if !strings.Contains(body, "block is being deleted; retry the upload") {
+		t.Fatalf("reupload body = %q, want retryable block-delete message", body)
+	}
+
+	if rc := readBlockRefCount(t, orgID, blockID); rc != 1 {
+		t.Fatalf("permanent refs after blocked reupload = %d, want 1", rc)
+	}
+	assertNoUploadReferrers(t, repoID, "/", "seed.txt")
+
+	orphanInfo, found, err := database.GetBlockS3OrphanInfo(orgID, blockID)
+	if err != nil {
+		t.Fatalf("GetBlockS3OrphanInfo(%s): %v", blockID, err)
+	}
+	if !found {
+		t.Fatal("writer should leave gc_s3_orphans fence active for GC recovery")
+	}
+	if !orphanInfo.FirstSeenAt.UTC().Equal(effectiveFirstSeenAt.UTC()) {
+		t.Fatalf("gc_s3_orphans first_seen_at = %v, want %v", orphanInfo.FirstSeenAt.UTC(), effectiveFirstSeenAt.UTC())
+	}
+	if !gcS3OrphanProjectionExists(t, orgID, blockID, effectiveFirstSeenAt) {
+		t.Fatal("writer should not remove gc_s3_orphans_by_day projection during retryable upload failure")
+	}
+
+	listResp := adminClient.Get(t, fmt.Sprintf("/api/v2.1/repos/%s/dir/?p=/", repoID))
+	expectStatus(t, listResp, http.StatusOK)
+	defer listResp.Body.Close()
+	var dirList map[string]interface{}
+	decodeJSON(t, listResp, &dirList)
+	entries, _ := dirList["dirent_list"].([]interface{})
+	for _, rawEntry := range entries {
+		entry, _ := rawEntry.(map[string]interface{})
+		if name, _ := entry["name"].(string); name == "blocked-retry.txt" {
+			t.Fatal("retry-blocked upload should not create a file entry")
+		}
+	}
 }
 
 // TestGC_LibraryCascade verifies that soft-deleting a library and triggering
@@ -778,52 +913,34 @@ func TestGC_ScannerRequeuesCandidatesMissingFromQueue(t *testing.T) {
 	requireGCEnabled(t)
 	requireCassandra(t)
 
-	repoID := createTestLibrary(t, adminClient, fmt.Sprintf("inttest-gc-rediscover-%d", time.Now().UnixNano()))
-	orgID := resolveOrgID(t, repoID)
-	queuedAfter := time.Now().UTC().Add(-5 * time.Second)
-
-	// Upload a file, then delete it to get a real block with ref_count=0.
-	// The delete path runs through DecrementBlockRefCountsOnce →
-	// enqueueZeroRefBlocks → EnsureBlockGCCandidate, so both the canonical
-	// gc_block_candidates row and the gc_block_candidates_by_day projection
-	// row are written.
-	_, blockID := uploadUniqueFile(t, adminClient, repoID, "rediscover.txt", "/")
-	batchDeleteFiles(t, adminClient, repoID, "/", []string{"rediscover.txt"})
-
-	// Wait for ref_count=0 AND the candidate row to land in both tables.
-	ok := pollUntil(t, 20*time.Second, 200*time.Millisecond, func() bool {
-		return readBlockRefCount(t, orgID, blockID) <= 0 && gcCandidateExists(t, orgID, blockID)
-	})
-	if !ok {
-		t.Fatalf("preconditions not met: ref_count=%d, candidate=%v",
-			readBlockRefCount(t, orgID, blockID), gcCandidateExists(t, orgID, blockID))
+	orgUUID := uuid.New()
+	orgID := orgUUID.String()
+	blockID := fmt.Sprintf("rediscover-%d", time.Now().UnixNano())
+	seedSyntheticZeroRefBlockForTest(t, orgUUID, blockID, "hot")
+	candidateAt := ensureSyntheticBlockCandidateForTest(t, orgUUID, blockID, "hot", time.Now().UTC().Add(-5*time.Second))
+	if !gcCandidateExists(t, orgID, blockID) {
+		t.Fatalf("expected canonical gc_block_candidates row for %s/%s", orgID, blockID)
+	}
+	if !gcCandidateProjectionExists(t, orgID, blockID, candidateAt) {
+		t.Fatalf("expected gc_block_candidates_by_day row for %s/%s", orgID, blockID)
 	}
 
 	// Simulate a missing/lost queue item while the candidate row remains.
 	// This is the scenario the discovery projection is designed to recover from.
-	deleteGCQueueItemsByIdentitySince(t, orgID, "block", blockID, queuedAfter)
+	deleteGCQueueItemsByIdentitySince(t, orgID, "block", blockID, time.Time{})
 
 	t.Log("Candidate row present, queue item removed. Running scanner...")
 
 	triggerGCScannerAndWait(t)
 
-	// The scanner must re-enqueue. Either we observe the candidate row still
-	// present (scanner re-queued it for a later worker pass) or both rows are
-	// gone because worker+scanner+S3 delete all succeeded between trigger and
-	// poll. Both outcomes are correct; only "candidate gone AND block still
-	// alive" indicates the scanner missed it.
-	ok = pollUntil(t, 30*time.Second, 1*time.Second, func() bool {
-		return gcCandidateExists(t, orgID, blockID) || !blockExistsInDB(t, orgID, blockID)
+	// Scanner-only runs should restore the queue row for the surviving candidate.
+	ok := pollUntil(t, 15*time.Second, 200*time.Millisecond, func() bool {
+		return gcQueueItemExistsSince(t, orgID, "block", blockID, candidateAt.Add(-1*time.Second))
 	})
 	if !ok {
 		t.Fatal("scanner did not re-enqueue candidate via gc_block_candidates_by_day discovery")
 	}
-
-	if !blockExistsInDB(t, orgID, blockID) {
-		t.Log("scanner discovery: block was found AND deleted by worker — correct")
-		return
-	}
-	t.Log("scanner discovery: candidate row preserved for next worker pass — correct")
+	t.Log("scanner discovery: candidate row was re-enqueued from the discovery projection — correct")
 }
 
 // TestGC_DeleteBlockGCCandidate_RemovesDiscoveryRowWithoutCanonical verifies
@@ -997,30 +1114,27 @@ func TestGC_GracePeriodEnforcement(t *testing.T) {
 	}
 	t.Logf("Grace period configured: %v", gracePeriod)
 
-	repoID := createTestLibrary(t, adminClient, fmt.Sprintf("inttest-gc-grace-%d", time.Now().UnixNano()))
-	orgID := resolveOrgID(t, repoID)
-
-	_, blockID := uploadUniqueFile(t, adminClient, repoID, "grace.txt", "/")
-	batchDeleteFiles(t, adminClient, repoID, "/", []string{"grace.txt"})
-
-	// Wait for ref_count to drop to 0 and the GC candidate to be created.
-	ok := pollUntil(t, 20*time.Second, 200*time.Millisecond, func() bool {
-		return readBlockRefCount(t, orgID, blockID) <= 0 && gcCandidateExists(t, orgID, blockID)
-	})
-	if !ok {
-		t.Fatalf("block did not reach ref_count=0 + gc_candidate within timeout (rc=%d, candidate=%v)",
-			readBlockRefCount(t, orgID, blockID), gcCandidateExists(t, orgID, blockID))
+	orgUUID := uuid.New()
+	orgID := orgUUID.String()
+	blockID := fmt.Sprintf("grace-%d", time.Now().UnixNano())
+	seedSyntheticZeroRefBlockForTest(t, orgUUID, blockID, "hot")
+	enqueuedAt := time.Now().UTC().Truncate(time.Millisecond)
+	enqueueSyntheticBlockQueueItemForTest(t, orgUUID, blockID, "hot", enqueuedAt)
+	if !gcQueueItemExistsSince(t, orgID, "block", blockID, enqueuedAt.Add(-1*time.Second)) {
+		t.Fatalf("failed to observe seeded queue item for %s/%s", orgID, blockID)
 	}
-	enqueuedAt := time.Now()
 
 	// Trigger GC immediately — the candidate was enqueued mere milliseconds ago,
 	// which is well within any non-zero grace period. The worker must skip it.
-	triggerGCWorker(t)
+	triggerGCWorkerAndWait(t)
 
 	elapsed := time.Since(enqueuedAt)
 	if !blockExistsInDB(t, orgID, blockID) {
 		t.Fatalf("CRITICAL: grace period not enforced — block deleted ~%v after enqueue (grace_period=%v)",
 			elapsed, gracePeriod)
+	}
+	if !gcQueueItemExistsSince(t, orgID, "block", blockID, enqueuedAt.Add(-1*time.Second)) {
+		t.Fatalf("grace period not enforced — queue item for %s/%s was consumed within %v", orgID, blockID, elapsed)
 	}
 	t.Logf("Grace period enforcement: block correctly preserved ~%v after enqueue (grace_period=%v) — correct",
 		elapsed, gracePeriod)
@@ -1034,18 +1148,19 @@ func TestGC_QueueSizeTracking(t *testing.T) {
 
 	statusBefore := getGCQueueSize(t)
 	snapshotBefore := readGCQueueSnapshotTotal(t)
-	queuedAfter := time.Now().UTC().Add(-5 * time.Second)
+	orgUUID := uuid.New()
+	orgID := orgUUID.String()
+	blockID := fmt.Sprintf("qsize-%d", time.Now().UnixNano())
+	seedSyntheticZeroRefBlockForTest(t, orgUUID, blockID, "hot")
+	queuedAt := time.Now().UTC().Truncate(time.Millisecond)
+	enqueueSyntheticBlockQueueItemForTest(t, orgUUID, blockID, "hot", queuedAt)
 
-	// Create a library, upload, delete to generate GC work
-	repoID := createTestLibrary(t, adminClient, fmt.Sprintf("inttest-gc-qsize-%d", time.Now().UnixNano()))
-	orgID := resolveOrgID(t, repoID)
-	_, blockID := uploadUniqueFile(t, adminClient, repoID, "qsize.txt", "/")
-	batchDeleteFiles(t, adminClient, repoID, "/", []string{"qsize.txt"})
-
-	// Poll for the specific block queue item created by this test. Global queue
-	// totals are noisy because other GC work may be draining concurrently.
+	// Poll for the specific block queue item created by this test and for the
+	// persisted/global queue-depth views to observe a non-zero value.
 	ok := pollUntil(t, 15*time.Second, 500*time.Millisecond, func() bool {
-		return gcQueueItemExistsSince(t, orgID, "block", blockID, queuedAfter)
+		return gcQueueItemExistsSince(t, orgID, "block", blockID, queuedAt.Add(-1*time.Second)) &&
+			readGCQueueSnapshotTotal(t) > 0 &&
+			getGCQueueSize(t) > 0
 	})
 	if !ok {
 		t.Fatalf("expected block %s to appear in gc_queue for org %s after enqueue (status_before=%d snapshot_before=%d status_now=%d snapshot_now=%d)",

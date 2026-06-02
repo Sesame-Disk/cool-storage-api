@@ -112,16 +112,10 @@ flowchart TD
     IsDir -->|No| HasBlocks{"Has blocks?"}
     HasBlocks -->|No| Delete
 
-    HasBlocks -->|Yes| TaskID["Create deterministic<br/>taskID = MD5(fsID + timestamp)"]
-    TaskID --> Mark["MarkItemProcessed<br/>INSERT IF NOT EXISTS"]
-    Mark --> First{"First time?"}
-
-    First -->|Yes| Decrement["For each block:<br/>DecrementRefCount"]
-    Decrement --> Check["GetRefCount<br/>for each block"]
-    Check --> Zero["Collect blocks<br/>where ref_count <= 0"]
-    Zero --> Enqueue["Enqueue zero-ref blocks<br/>for deletion"]
-
-    First -->|No| SkipDec["Skip decrement<br/>(already processed)"]
+    HasBlocks -->|Yes| Resolve["Resolve stored block IDs<br/>for this fs_object"]
+    Resolve --> RemoveRefs["Delete row-per-reference<br/>block_references"]
+    RemoveRefs --> Zero["If no live refs remain:<br/>record gc_block_candidates"]
+    Zero --> Enqueue["Enqueue zero-ref blocks<br/>for claim+verify deletion"]
 
     EnqKids --> Delete
     Enqueue --> Delete

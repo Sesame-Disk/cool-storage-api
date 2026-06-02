@@ -108,6 +108,7 @@ func TestInitialSchemaContainsLookupNameAndStarredIndex(t *testing.T) {
 	raw, err := migrationsFS.ReadFile("migrations/001_initial_schema.cql")
 	require.NoError(t, err)
 	content := string(raw)
+	normalizedContent := strings.ReplaceAll(content, "\r\n", "\n")
 
 	assert.Contains(t, content, "name              TEXT,")
 	assert.Contains(t, content, "source_api_key_hash TEXT,")
@@ -135,6 +136,8 @@ func TestInitialSchemaContainsLookupNameAndStarredIndex(t *testing.T) {
 	assert.Contains(t, content, "CREATE TABLE IF NOT EXISTS users_admin_global_by_created")
 	assert.Contains(t, content, "CREATE TABLE IF NOT EXISTS users_admin_global_by_status_created")
 	assert.Contains(t, content, "CREATE TABLE IF NOT EXISTS gc_block_candidates")
+	assert.Contains(t, content, "CREATE TABLE IF NOT EXISTS gc_provisional_block_refs")
+	assert.Contains(t, content, "CREATE TABLE IF NOT EXISTS gc_provisional_block_refs_by_day")
 	assert.Contains(t, content, "CREATE TABLE IF NOT EXISTS gc_deleted_users_by_deleted_day")
 	assert.Contains(t, content, "CREATE TABLE IF NOT EXISTS gc_libraries_by_policy")
 	assert.Contains(t, content, "CREATE TABLE IF NOT EXISTS gc_share_links_by_expiry")
@@ -147,34 +150,26 @@ func TestInitialSchemaContainsLookupNameAndStarredIndex(t *testing.T) {
 	assert.Contains(t, content, "CREATE TABLE IF NOT EXISTS gc_block_candidates_by_day")
 	assert.Contains(t, content, "CREATE TABLE IF NOT EXISTS gc_s3_orphans_by_day")
 	assert.Contains(t, content, "CREATE TABLE IF NOT EXISTS gc_leases")
+	assert.Contains(t, content, "gc_claim_id   TEXT")
 	// `blocks` and related tables must use per-block partitioning to avoid
 	// the org_id hot partition that previously serialized all upload LWTs.
 	assert.Contains(t, content, "PRIMARY KEY ((org_id, block_id))")
 	assert.Contains(t, content, "WITH default_time_to_live = 0")
 	assert.Contains(t, content, "INSERT INTO gc_stats (stat_key, stat_value, updated_at)")
 	assert.NotContains(t, content, "CREATE TABLE IF NOT EXISTS gc_queue_stats")
-	assert.NotContains(t, content, "WITH default_time_to_live = 604800")
 	assert.Contains(t, content, "storage_class TEXT")
-	assert.NotContains(t, content, "CREATE TABLE IF NOT EXISTS share_links_by_org")
-}
-
-func TestOnlyOfficePendingBlocksMigrationExists(t *testing.T) {
-	raw, err := migrationsFS.ReadFile("migrations/003_onlyoffice_pending_blocks.cql")
-	require.NoError(t, err)
-	content := string(raw)
-
+	assert.Contains(t, content, "replace_existing BOOLEAN")
 	assert.Contains(t, content, "CREATE TABLE IF NOT EXISTS onlyoffice_pending_blocks")
-	assert.Contains(t, content, "org_id            UUID")
-	assert.Contains(t, content, "repo_id           UUID")
-	assert.Contains(t, content, "publish_commit_id TEXT")
-	assert.Contains(t, content, "PRIMARY KEY ((org_id), operation_id)")
 	assert.Contains(t, content, "WITH default_time_to_live = 604800")
-}
-
-func TestAccessTokensReplaceExistingMigrationExists(t *testing.T) {
-	raw, err := migrationsFS.ReadFile("migrations/004_access_tokens_replace_existing.cql")
-	require.NoError(t, err)
-	content := string(raw)
-
-	assert.Contains(t, content, "ALTER TABLE access_tokens ADD replace_existing BOOLEAN")
+	assert.Contains(t, content, "CREATE TABLE IF NOT EXISTS published_block_reference_repairs")
+	assert.Contains(t, content, "staged_block_ids LIST<TEXT>")
+	assert.Contains(t, content, "PRIMARY KEY ((bucket), org_id, repo_id, commit_id, fs_id)")
+	assert.Contains(t, content, "CREATE TABLE IF NOT EXISTS pending_published_fs_objects")
+	assert.Contains(t, content, "CREATE TABLE IF NOT EXISTS pending_published_fs_objects_by_day")
+	assert.Contains(t, content, "PRIMARY KEY ((repo_id, fs_id), owner_id)")
+	assert.Contains(t, content, "attempt_id TEXT")
+	assert.Contains(t, content, "block_ids  LIST<TEXT>")
+	assert.Contains(t, normalizedContent, "PRIMARY KEY ((repo_id, fs_id), owner_id)\n) WITH default_time_to_live = 3024000;")
+	assert.Contains(t, normalizedContent, ") WITH CLUSTERING ORDER BY (created_at ASC, repo_id ASC, fs_id ASC, owner_id ASC)\n    AND default_time_to_live = 3024000;")
+	assert.NotContains(t, content, "CREATE TABLE IF NOT EXISTS share_links_by_org")
 }

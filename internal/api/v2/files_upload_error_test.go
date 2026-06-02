@@ -20,6 +20,7 @@ func TestWriteUploadFileError_MapsSentinelErrors(t *testing.T) {
 	}{
 		{name: "head conflict", err: ErrLibraryHeadConflict, wantStatus: http.StatusConflict, wantError: "library was modified concurrently; retry the upload"},
 		{name: "wrapped head conflict (mirrors retry_exhausted production path)", err: fmt.Errorf("%w: failed to finalize upload metadata after 20 attempts", ErrLibraryHeadConflict), wantStatus: http.StatusConflict, wantError: "library was modified concurrently; retry the upload"},
+		{name: "block delete in progress", err: ErrBlockDeleteInProgress, wantStatus: http.StatusConflict, wantError: "block is being deleted; retry the upload"},
 		{name: "quota exceeded", err: errUploadStorageQuotaExceeded, wantStatus: http.StatusForbidden, wantError: "storage quota exceeded"},
 		{name: "generic", err: errors.New("boom"), wantStatus: http.StatusInternalServerError, wantError: "failed to update library"},
 	}

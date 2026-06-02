@@ -7,7 +7,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -15,8 +14,6 @@ import (
 	"sync"
 	"testing"
 	"time"
-
-	gocql "github.com/apache/cassandra-gocql-driver/v2"
 )
 
 // Regression suite for block refcount → zero-ref → GC enqueue pipeline (batch delete,
@@ -89,10 +86,11 @@ func TestBatchDeleteItems_CommitIDMatchesLibraryHead(t *testing.T) {
 	}
 }
 
-// TestBatchDeleteItems_ZeroRefBlockRegistersForGC asserts that after refcount hits zero,
-// the block appears in gc_block_candidates (written before gc_queue enqueue). This catches
-// regressions where DecrementBlockRefCountsOnce runs but EnqueueBlocks / adapter is broken,
-// or where ref never reaches zero.
+// TestBatchDeleteItems_ZeroRefBlockRegistersForGC covers the current delete contract:
+// batch delete advances the library HEAD, but old commits retain the deleted
+// file's fs_object until version GC sweeps it later. The block therefore keeps
+// its existing permanent fs:<library>:<fs_id> reference and must NOT become a GC
+// candidate inline.
 func TestBatchDeleteItems_ZeroRefBlockRegistersForGC(t *testing.T) {
 	name := fmt.Sprintf("inttest-gc-candidate-%d", time.Now().UnixNano())
 	repoID := createTestLibrary(t, adminClient, name)
@@ -105,14 +103,13 @@ func TestBatchDeleteItems_ZeroRefBlockRegistersForGC(t *testing.T) {
 	uploadURL := strings.Trim(responseBody(t, uploadLinkResp), "\" \n\r")
 	uploadFileThroughLink(t, adminClient, uploadURL, fileName, "/", fileContent)
 
-	session := shareProjectionDBForTest(t).Session()
-	var orgID string
-	if err := session.Query(`SELECT org_id FROM libraries_by_id WHERE library_id = ?`, repoID).Scan(&orgID); err != nil {
-		t.Fatalf("failed to resolve org_id: %v", err)
-	}
+	orgID := resolveOrgID(t, repoID)
 
 	hash := sha256.Sum256([]byte(fileContent))
 	blockID := hex.EncodeToString(hash[:])
+	if refCount := readBlockRefCount(t, orgID, blockID); refCount != 1 {
+		t.Fatalf("permanent refs after upload = %d, want 1", refCount)
+	}
 
 	delBody := map[string]interface{}{
 		"repo_id":    repoID,
@@ -123,36 +120,16 @@ func TestBatchDeleteItems_ZeroRefBlockRegistersForGC(t *testing.T) {
 	expectStatus(t, delResp, http.StatusOK)
 	delResp.Body.Close()
 
-	deadline := time.Now().Add(20 * time.Second)
-	var refCount int
-	var candidateAt time.Time
-	for time.Now().Before(deadline) {
-		if err := session.Query(`SELECT ref_count FROM blocks WHERE org_id = ? AND block_id = ?`, orgID, blockID).Scan(&refCount); err != nil {
-			t.Fatalf("failed to read ref_count: %v", err)
-		}
-		if refCount <= 0 {
-			err := session.Query(`
-				SELECT candidate_at FROM gc_block_candidates WHERE org_id = ? AND block_id = ?
-			`, orgID, blockID).Scan(&candidateAt)
-			if err == nil {
-				return
-			}
-			if !errors.Is(err, gocql.ErrNotFound) {
-				t.Fatalf("unexpected gc_block_candidates query error: %v", err)
-			}
-		}
-		time.Sleep(150 * time.Millisecond)
+	if !pollUntil(t, 5*time.Second, 200*time.Millisecond, func() bool {
+		return readBlockRefCount(t, orgID, blockID) == 1 && !gcCandidateExists(t, orgID, blockID)
+	}) {
+		t.Fatalf("batch delete unexpectedly changed block liveness state: refs=%d candidate=%v", readBlockRefCount(t, orgID, blockID), gcCandidateExists(t, orgID, blockID))
 	}
-
-	if refCount > 0 {
-		t.Fatalf("ref_count still %d after batch delete — refcount / async decrement regression", refCount)
-	}
-	t.Fatalf("ref_count reached 0 but block %s never appeared in gc_block_candidates — GC enqueue regression", blockID)
 }
 
-// TestBatchDeleteDirectory_AllNestedBlocksReachZeroRef covers directory deletion:
-// collectDirStats must aggregate all descendant blocks; missing directory handling
-// would leave refs > 0 and leak storage.
+// TestBatchDeleteDirectory_AllNestedBlocksReachZeroRef covers the retained-version
+// behavior for directory deletes: removing a directory from HEAD does not inline
+// drop descendant block refs while older commits still retain those fs_objects.
 func TestBatchDeleteDirectory_AllNestedBlocksReachZeroRef(t *testing.T) {
 	name := fmt.Sprintf("inttest-gc-dir-%d", time.Now().UnixNano())
 	repoID := createTestLibrary(t, adminClient, name)
@@ -170,11 +147,7 @@ func TestBatchDeleteDirectory_AllNestedBlocksReachZeroRef(t *testing.T) {
 	uploadFileThroughLink(t, adminClient, uploadURL, "a.txt", dirPath, contentA)
 	uploadFileThroughLink(t, adminClient, uploadURL, "b.txt", dirPath, contentB)
 
-	session := shareProjectionDBForTest(t).Session()
-	var orgID string
-	if err := session.Query(`SELECT org_id FROM libraries_by_id WHERE library_id = ?`, repoID).Scan(&orgID); err != nil {
-		t.Fatalf("failed to resolve org_id: %v", err)
-	}
+	orgID := resolveOrgID(t, repoID)
 
 	sumA := sha256.Sum256([]byte(contentA))
 	sumB := sha256.Sum256([]byte(contentB))
@@ -190,23 +163,22 @@ func TestBatchDeleteDirectory_AllNestedBlocksReachZeroRef(t *testing.T) {
 	expectStatus(t, delResp, http.StatusOK)
 	delResp.Body.Close()
 
-	deadline := time.Now().Add(25 * time.Second)
-	var refA, refB int
-	for time.Now().Before(deadline) {
-		_ = session.Query(`SELECT ref_count FROM blocks WHERE org_id = ? AND block_id = ?`, orgID, blockA).Scan(&refA)
-		_ = session.Query(`SELECT ref_count FROM blocks WHERE org_id = ? AND block_id = ?`, orgID, blockB).Scan(&refB)
-		if refA <= 0 && refB <= 0 {
-			return
-		}
-		time.Sleep(200 * time.Millisecond)
+	if !pollUntil(t, 5*time.Second, 200*time.Millisecond, func() bool {
+		return readBlockRefCount(t, orgID, blockA) == 1 &&
+			readBlockRefCount(t, orgID, blockB) == 1 &&
+			!gcCandidateExists(t, orgID, blockA) &&
+			!gcCandidateExists(t, orgID, blockB)
+	}) {
+		t.Fatalf("directory delete unexpectedly changed retained block state: blockA refs=%d candidate=%v blockB refs=%d candidate=%v",
+			readBlockRefCount(t, orgID, blockA), gcCandidateExists(t, orgID, blockA),
+			readBlockRefCount(t, orgID, blockB), gcCandidateExists(t, orgID, blockB))
 	}
-	t.Fatalf("directory batch delete refcount regression: blockA=%d blockB=%d (want both <= 0)", refA, refB)
 }
 
-// TestBatchDeleteItems_DeduplicatedFilesDecrementSharedBlockTwice ensures a single
-// batch-delete removes two dirents that share one block (identical content); ref_count
-// must go from 2 to 0 in one operation. Catches failures to pass duplicate block IDs
-// into DecrementBlockRefCountsOnce or broken LWT decrement loops.
+// TestBatchDeleteItems_DeduplicatedFilesDecrementSharedBlockTwice covers the current
+// same-library dedup model: identical content resolves to one shared fs_id, so the
+// block has a single permanent reference before and after the delete until version
+// GC reclaims the old commit's fs_object.
 func TestBatchDeleteItems_DeduplicatedFilesDecrementSharedBlockTwice(t *testing.T) {
 	name := fmt.Sprintf("inttest-gc-dedup-%d", time.Now().UnixNano())
 	repoID := createTestLibrary(t, adminClient, name)
@@ -219,20 +191,12 @@ func TestBatchDeleteItems_DeduplicatedFilesDecrementSharedBlockTwice(t *testing.
 	uploadFileThroughLink(t, adminClient, uploadURL, "dedup-a.txt", "/", shared)
 	uploadFileThroughLink(t, adminClient, uploadURL, "dedup-b.txt", "/", shared)
 
-	session := shareProjectionDBForTest(t).Session()
-	var orgID string
-	if err := session.Query(`SELECT org_id FROM libraries_by_id WHERE library_id = ?`, repoID).Scan(&orgID); err != nil {
-		t.Fatalf("failed to resolve org_id: %v", err)
-	}
+	orgID := resolveOrgID(t, repoID)
 	sumShared := sha256.Sum256([]byte(shared))
 	blockID := hex.EncodeToString(sumShared[:])
 
-	var refCount int
-	if err := session.Query(`SELECT ref_count FROM blocks WHERE org_id = ? AND block_id = ?`, orgID, blockID).Scan(&refCount); err != nil {
-		t.Fatalf("failed to read ref_count: %v", err)
-	}
-	if refCount != 2 {
-		t.Fatalf("ref_count before delete = %d, want 2 (deduplicated block)", refCount)
+	if refCount := readBlockRefCount(t, orgID, blockID); refCount != 1 {
+		t.Fatalf("permanent refs before delete = %d, want 1 (shared fs_id)", refCount)
 	}
 
 	delBody := map[string]interface{}{
@@ -244,24 +208,19 @@ func TestBatchDeleteItems_DeduplicatedFilesDecrementSharedBlockTwice(t *testing.
 	expectStatus(t, delResp, http.StatusOK)
 	delResp.Body.Close()
 
-	deadline := time.Now().Add(25 * time.Second)
-	for time.Now().Before(deadline) {
-		if err := session.Query(`SELECT ref_count FROM blocks WHERE org_id = ? AND block_id = ?`, orgID, blockID).Scan(&refCount); err != nil {
-			t.Fatalf("failed to read ref_count after delete: %v", err)
-		}
-		if refCount <= 0 {
-			return
-		}
-		time.Sleep(200 * time.Millisecond)
+	if !pollUntil(t, 5*time.Second, 200*time.Millisecond, func() bool {
+		return readBlockRefCount(t, orgID, blockID) == 1 && !gcCandidateExists(t, orgID, blockID)
+	}) {
+		t.Fatalf("deduplicated delete unexpectedly changed retained block state: refs=%d candidate=%v", readBlockRefCount(t, orgID, blockID), gcCandidateExists(t, orgID, blockID))
 	}
-	t.Fatalf("ref_count after deleting both deduplicated files = %d, want <= 0", refCount)
 }
 
-// TestBatchDeleteItems_ConcurrentDeletesPreserveLastSharedReference forces two
-// batch-delete requests to remove the same shared block concurrently from separate
-// libraries in the same org. The exact post-condition must be ref_count == 1, the
-// final surviving reference must stay readable, and GC must not register the block
-// as a delete candidate.
+// TestBatchDeleteItems_ConcurrentDeletesPreserveLastSharedReference covers the
+// cross-library retained-version behavior: deleting from repoA and repoB updates
+// each library HEAD, but their old commits still hold their block refs, so the
+// shared block remains at three permanent refs until version GC reclaims those
+// histories. The surviving repoC copy must remain readable and the block must not
+// be queued for GC prematurely.
 func TestBatchDeleteItems_ConcurrentDeletesPreserveLastSharedReference(t *testing.T) {
 	repoA := createTestLibrary(t, adminClient, fmt.Sprintf("inttest-gc-race-a-%d", time.Now().UnixNano()))
 	repoB := createTestLibrary(t, adminClient, fmt.Sprintf("inttest-gc-race-b-%d", time.Now().UnixNano()))
@@ -358,18 +317,17 @@ func TestBatchDeleteItems_ConcurrentDeletesPreserveLastSharedReference(t *testin
 		}
 	}
 
-	if !pollUntil(t, 20*time.Second, 200*time.Millisecond, func() bool {
-		return readBlockRefCount(t, orgA, blockID) == 1
+	if !pollUntil(t, 5*time.Second, 200*time.Millisecond, func() bool {
+		return readBlockRefCount(t, orgA, blockID) == 3
 	}) {
-		t.Fatalf("ref_count after concurrent deletes = %d, want exactly 1", readBlockRefCount(t, orgA, blockID))
+		t.Fatalf("refs after concurrent deletes = %d, want exactly 3 while old commits are retained", readBlockRefCount(t, orgA, blockID))
 	}
 	if !blockExistsInDB(t, orgA, blockID) {
 		t.Fatalf("shared block %s was deleted despite one surviving reference", blockID)
 	}
 
-	time.Sleep(1 * time.Second)
 	if gcCandidateExists(t, orgA, blockID) {
-		t.Fatalf("block %s was registered in gc_block_candidates despite surviving ref_count=1", blockID)
+		t.Fatalf("block %s was registered in gc_block_candidates despite retained cross-library refs", blockID)
 	}
 
 	dlResp := adminClient.Get(t, fmt.Sprintf("/api2/repos/%s/file/?p=/race-c.txt", repoC))

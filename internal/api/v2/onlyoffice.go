@@ -44,6 +44,32 @@ type OnlyOfficeHandler struct {
 	permMiddleware *middleware.PermissionMiddleware
 }
 
+var onlyOfficeCleanupFailedPublishAttemptFn = func(database *db.DB, orgID, repoID, attemptID, commitID string, fsIDs, blockIDs []string) error {
+	return CleanupFailedPublishArtifacts(database, orgID, repoID, attemptID, commitID, fsIDs, blockIDs)
+}
+
+var onlyOfficeClearPendingPublishedFileRepairsFn = clearPendingPublishedFileRepairs
+
+var onlyOfficeReleaseUploadedBlockRefsFn = ReleaseUploadedBlockRefs
+
+var onlyOfficeDeletePendingBlockFn = func(h *OnlyOfficeHandler, orgID, operationID string) error {
+	return h.deleteOnlyOfficePendingBlock(orgID, operationID)
+}
+
+var onlyOfficeAdjustStorageCountersFn = traffic.AdjustStorageCountersByDeltaSync
+
+func cleanupOnlyOfficeFailedPublishAttempt(database *db.DB, orgID, repoID, commitID string, pendingFiles []*pendingPublishedFile) error {
+	fsIDs := pendingPublishedFileFSIDs(pendingFiles)
+	blockIDs := pendingPublishedFileInternalBlockIDs(pendingFiles)
+	cleanupErr := onlyOfficeCleanupFailedPublishAttemptFn(database, orgID, repoID, commitID, commitID, fsIDs, blockIDs)
+	if cleanupErr != nil {
+		return cleanupErr
+	}
+	ownerErr := releasePendingPublishedFileOwnersFn(database, repoID, pendingFiles)
+	clearErr := onlyOfficeClearPendingPublishedFileRepairsFn(database, orgID, repoID, commitID, pendingFiles)
+	return errors.Join(ownerErr, clearErr)
+}
+
 // RegisterOnlyOfficeRoutes registers OnlyOffice routes
 func RegisterOnlyOfficeRoutes(rg *gin.RouterGroup, database *db.DB, cfg *config.Config, s3Store *storage.S3Store, blockStore *storage.BlockStore, storageManager *storage.Manager, tokenCreator TokenCreator, serverURL string) {
 	permMiddleware := middleware.NewPermissionMiddleware(database)
@@ -396,7 +422,7 @@ func (h *OnlyOfficeHandler) ReconcileOnlyOfficePendingBlocks(orgID string) error
 		}
 
 		if strings.TrimSpace(pending.InternalBlockID) != "" {
-			zeroRefBlocks := fsHelper.DecrementBlockRefCountsOnce(orgID, onlyOfficeRollbackOperationKey(pending.OperationID), []string{pending.InternalBlockID})
+			zeroRefBlocks := fsHelper.ReleaseUploadReferences(orgID, pending.RepoID, pending.OperationID, []string{pending.InternalBlockID})
 			enqueueZeroRefBlocks(h.db, orgID, pending.RepoID, zeroRefBlocks)
 		}
 		if err := h.deleteOnlyOfficePendingBlock(orgID, pending.OperationID); err != nil {
@@ -1208,36 +1234,26 @@ func (h *OnlyOfficeHandler) saveEditedDocument(ctx context.Context, repoID, file
 		return fmt.Errorf("failed to store block: %w", err)
 	}
 
-	// Create SHA-1 → SHA-256 mapping for sync protocol compatibility (dual-write: forward + reverse)
-	if err := h.db.Session().Query(`
-		INSERT INTO block_id_mappings (org_id, external_id, internal_id) VALUES (?, ?, ?)
-	`, orgID, externalBlockID, internalBlockID).Exec(); err != nil {
-		log.Printf("OnlyOffice: Warning - failed to create block mapping: %v", err)
-	} else {
-		log.Printf("OnlyOffice: Created block mapping: %s → %s", externalBlockID[:16], internalBlockID[:16])
-	}
-	if err := h.db.Session().Query(`
-		INSERT INTO block_id_mappings_by_internal (org_id, internal_id, external_id, created_at) VALUES (?, ?, ?, toTimestamp(now()))
-	`, orgID, internalBlockID, externalBlockID).Exec(); err != nil {
-		log.Printf("OnlyOffice: Warning - failed to create reverse block mapping: %v", err)
-	}
-
-	// Store block metadata using internal (SHA-256) ID. The pending-cleanup
-	// row above is what guarantees this refcount increment can be reversed
-	// even if the process dies before publish.
-	if err := NewFSHelper(h.db).IncrementOrCreateBlock(orgID, internalBlockID, len(content), storageClass, storageKey); err != nil {
+	// Materialize block metadata/provisional ref first and then the sync mapping.
+	// Keep the pending-cleanup row on mapping failure so the reconciler can finish
+	// cleanup even if the immediate rollback path was only partially successful.
+	if err := RegisterUploadedBlockAndMapping(h.db, orgID, repoID, internalBlockID, rollbackID, len(content), storageClass, storageKey, externalBlockID); err != nil {
+		if errors.Is(err, ErrBlockMappingWriteFailed) {
+			log.Printf("OnlyOffice: CRITICAL - failed to create block mapping org=%s ext=%s int=%s: %v", orgID, externalBlockID[:16], internalBlockID[:16], err)
+			return fmt.Errorf("failed to create block mapping: %w", err)
+		}
 		if deleteErr := h.deleteOnlyOfficePendingBlock(orgID, rollbackID); deleteErr != nil {
 			log.Printf("OnlyOffice: failed to clear pending block cleanup %s after block-metadata failure: %v", rollbackID, deleteErr)
 		}
 		return fmt.Errorf("failed to store block metadata: %w", err)
 	}
+	log.Printf("OnlyOffice: Created block mapping: %s → %s", externalBlockID[:16], internalBlockID[:16])
 	blockMetadataRegistered = true
 
 	storageDeltaBytes, storageDeltaFiles, newCommitID, err := h.publishEditedDocumentMetadata(fsHelper, orgID, repoID, filePath, filename, userID, originalFileSize, externalBlockID, rollbackID)
 	if err != nil {
 		if shouldRollbackOnlyOfficeMaterializedBlock(blockMetadataRegistered, err) {
-			operationKey := onlyOfficeRollbackOperationKey(rollbackID)
-			zeroRefBlocks := fsHelper.DecrementBlockRefCountsOnce(orgID, operationKey, []string{internalBlockID})
+			zeroRefBlocks := fsHelper.ReleaseUploadReferences(orgID, repoID, rollbackID, []string{internalBlockID})
 			enqueueZeroRefBlocks(h.db, orgID, repoID, zeroRefBlocks)
 			if deleteErr := h.deleteOnlyOfficePendingBlock(orgID, rollbackID); deleteErr != nil {
 				log.Printf("OnlyOffice: failed to clear pending block cleanup %s after rollback: %v", rollbackID, deleteErr)
@@ -1247,16 +1263,22 @@ func (h *OnlyOfficeHandler) saveEditedDocument(ctx context.Context, repoID, file
 		return err
 	}
 
-	if err := h.deleteOnlyOfficePendingBlock(orgID, rollbackID); err != nil {
+	h.finalizeSuccessfulOnlyOfficeEdit(orgID, repoID, userID, rollbackID, internalBlockID, filePath, externalBlockID, newCommitID, storageDeltaBytes, storageDeltaFiles)
+	return nil
+}
+
+func (h *OnlyOfficeHandler) finalizeSuccessfulOnlyOfficeEdit(orgID, repoID, userID, rollbackID, internalBlockID, filePath, externalBlockID, newCommitID string, storageDeltaBytes, storageDeltaFiles int64) {
+	onlyOfficeReleaseUploadedBlockRefsFn(h.db, orgID, repoID, rollbackID, []string{internalBlockID})
+
+	if err := onlyOfficeDeletePendingBlockFn(h, orgID, rollbackID); err != nil {
 		log.Printf("OnlyOffice: failed to clear pending block cleanup %s after publish success: %v", rollbackID, err)
 	}
 
-	if err := traffic.AdjustStorageCountersByDeltaSync(h.db, orgID, userID, repoID, storageDeltaBytes, storageDeltaFiles); err != nil {
+	if err := onlyOfficeAdjustStorageCountersFn(h.db, orgID, userID, repoID, storageDeltaBytes, storageDeltaFiles); err != nil {
 		log.Printf("OnlyOffice: failed to apply storage counter delta for %s: %v", filePath, err)
 	}
 
 	log.Printf("OnlyOffice: saved document %s with block %s (internal: %s), new commit %s", filePath, externalBlockID[:16], internalBlockID[:16], newCommitID)
-	return nil
 }
 
 func (h *OnlyOfficeHandler) publishEditedDocumentMetadata(fsHelper *FSHelper, orgID, repoID, filePath, filename, userID string, originalFileSize int64, externalBlockID, pendingOperationID string) (int64, int64, string, error) {
@@ -1286,16 +1308,21 @@ func (h *OnlyOfficeHandler) publishEditedDocumentMetadata(fsHelper *FSHelper, or
 		}
 
 		now := time.Now()
-		newFileFSID, err := fsHelper.CreateFileFSObject(repoID, filename, originalFileSize, []string{externalBlockID})
+		pendingFile, err := fsHelper.prepareFileFSObjectForPublish(repoID, filename, originalFileSize, []string{externalBlockID})
 		if err != nil {
 			return fmt.Errorf("failed to create file fs_object: %w", err)
+		}
+		cleanupPendingFilePublish := func() {
+			if cleanupErr := CleanupFailedPublishAttempt(h.db, orgID, repoID, "", "", []*pendingPublishedFile{pendingFile}); cleanupErr != nil {
+				log.Printf("OnlyOffice: failed to clean up pending fs_object %s before commit publish: %v", pendingFile.fsID, cleanupErr)
+			}
 		}
 
 		updatedEntries := make([]FSEntry, 0, len(result.Entries))
 		fileUpdated := false
 		for _, entry := range result.Entries {
 			if entry.Name == filename {
-				entry.ID = newFileFSID
+				entry.ID = pendingFile.fsID
 				entry.Size = originalFileSize
 				entry.MTime = now.Unix()
 				entry.Modifier = userID + "@sesamefs.local"
@@ -1306,7 +1333,7 @@ func (h *OnlyOfficeHandler) publishEditedDocumentMetadata(fsHelper *FSHelper, or
 
 		if !fileUpdated {
 			updatedEntries = append(updatedEntries, FSEntry{
-				ID:       newFileFSID,
+				ID:       pendingFile.fsID,
 				Name:     filename,
 				Mode:     ModeFile,
 				MTime:    now.Unix(),
@@ -1317,26 +1344,71 @@ func (h *OnlyOfficeHandler) publishEditedDocumentMetadata(fsHelper *FSHelper, or
 
 		newParentFSID, err := fsHelper.CreateDirectoryFSObject(repoID, updatedEntries)
 		if err != nil {
+			cleanupPendingFilePublish()
 			return fmt.Errorf("failed to create parent fs_object: %w", err)
 		}
 
 		newRootFSID, err := fsHelper.RebuildPathToRoot(repoID, result, newParentFSID)
 		if err != nil {
+			cleanupPendingFilePublish()
 			return fmt.Errorf("failed to rebuild path: %w", err)
 		}
 
 		commitDesc := fmt.Sprintf("Modified \"%s\" via OnlyOffice", filename)
-		commitID, err := fsHelper.CreateCommit(repoID, userID, newRootFSID, snapshot.HeadCommitID, commitDesc)
-		if err != nil {
-			return fmt.Errorf("failed to create commit: %w", err)
+		commitCreatedAt := time.Now().UTC()
+		commitID := buildCommitID(repoID, newRootFSID, commitDesc, commitCreatedAt)
+		if err := fsHelper.stagePendingPublishedFiles(orgID, repoID, commitID, []*pendingPublishedFile{pendingFile}); err != nil {
+			if cleanupErr := cleanupOnlyOfficeFailedPublishAttempt(h.db, orgID, repoID, commitID, []*pendingPublishedFile{pendingFile}); cleanupErr != nil {
+				return errors.Join(
+					fmt.Errorf("failed to stage publish-attempt block references for commit %s: %w", commitID, err),
+					fmt.Errorf("cleanup failed publish commit %s: %w", commitID, cleanupErr),
+				)
+			}
+			return fmt.Errorf("failed to stage publish-attempt block references for commit %s: %w", commitID, err)
+		}
+		if err := queuePendingPublishedFileRepairs(h.db, orgID, repoID, commitID, []*pendingPublishedFile{pendingFile}); err != nil {
+			cleanupErr := cleanupOnlyOfficeFailedPublishAttempt(h.db, orgID, repoID, commitID, []*pendingPublishedFile{pendingFile})
+			return errors.Join(
+				fmt.Errorf("failed to queue durable publish repair for commit %s: %w", commitID, err),
+				cleanupErr,
+			)
+		}
+		if err := fsHelper.insertCommit(repoID, commitID, userID, newRootFSID, snapshot.HeadCommitID, commitDesc, commitCreatedAt); err != nil {
+			cleanupErr := cleanupOnlyOfficeFailedPublishAttempt(h.db, orgID, repoID, commitID, []*pendingPublishedFile{pendingFile})
+			clearErr := clearPendingPublishedFileRepairs(h.db, orgID, repoID, commitID, []*pendingPublishedFile{pendingFile})
+			return errors.Join(
+				fmt.Errorf("failed to create commit: %w", err),
+				cleanupErr,
+				clearErr,
+			)
 		}
 
 		if err := h.updateOnlyOfficePendingBlockCommitID(orgID, pendingOperationID, commitID); err != nil {
+			if cleanupErr := cleanupOnlyOfficeFailedPublishAttempt(h.db, orgID, repoID, commitID, []*pendingPublishedFile{pendingFile}); cleanupErr != nil {
+				return errors.Join(
+					fmt.Errorf("failed to persist OnlyOffice pending commit id: %w", err),
+					fmt.Errorf("clean up publish attempt %s: %w", commitID, cleanupErr),
+				)
+			}
 			return fmt.Errorf("failed to persist OnlyOffice pending commit id: %w", err)
 		}
 
 		if err := fsHelper.UpdateLibraryHeadFromSnapshot(snapshot, repoID, commitID, snapshot.HeadCommitID); err != nil {
+			if errors.Is(err, ErrLibraryHeadConflict) {
+				if cleanupErr := cleanupOnlyOfficeFailedPublishAttempt(h.db, orgID, repoID, commitID, []*pendingPublishedFile{pendingFile}); cleanupErr != nil {
+					return fmt.Errorf("failed to clean up conflict publish attempt %s: %w", commitID, cleanupErr)
+				}
+			}
 			return fmt.Errorf("failed to update library head: %w", err)
+		}
+		if ownerErr := clearPendingPublishedFileOwnersFn(h.db, repoID, []*pendingPublishedFile{pendingFile}); ownerErr != nil {
+			log.Printf("OnlyOffice: published repo=%s commit=%s but failed to clear pending fs_object owners: %v", repoID, commitID, ownerErr)
+		}
+		if err := fsHelper.promotePendingPublishedFiles(orgID, repoID, commitID, []*pendingPublishedFile{pendingFile}); err != nil {
+			log.Printf("OnlyOffice: WARNING: head updated for repo=%s commit=%s but failed to promote block references for fs_object %s: %v", repoID, commitID, pendingFile.fsID, err)
+			schedulePendingPublishedFileRepairs(h.db, orgID, repoID, commitID, []*pendingPublishedFile{pendingFile}, "OnlyOffice")
+		} else if clearErr := clearPendingPublishedFileRepairs(h.db, orgID, repoID, commitID, []*pendingPublishedFile{pendingFile}); clearErr != nil {
+			log.Printf("OnlyOffice: published repo=%s commit=%s but failed to clear queued publish repair for fs_object %s: %v", repoID, commitID, pendingFile.fsID, clearErr)
 		}
 
 		storageDeltaBytes = currentDeltaBytes
