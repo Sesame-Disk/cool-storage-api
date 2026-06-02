@@ -757,6 +757,86 @@ func TestGC_ConcurrentUploadDuringGC(t *testing.T) {
 	t.Log("Concurrent upload safety: LWT prevented deletion of re-referenced block — correct")
 }
 
+func TestUploadLink_ReuploadBlockedByS3OrphanFence(t *testing.T) {
+	requireCassandra(t)
+
+	repoID := createTestLibrary(t, adminClient, fmt.Sprintf("inttest-upload-orphan-fence-%d", time.Now().UnixNano()))
+	orgID := resolveOrgID(t, repoID)
+	database := shareProjectionDBForTest(t)
+	store := gcpkg.NewCassandraStore(database)
+
+	content := fmt.Sprintf("orphan-fence-content-%d\n", time.Now().UnixNano())
+	hash := sha256.Sum256([]byte(content))
+	blockID := hex.EncodeToString(hash[:])
+
+	uploadLinkResp := adminClient.Get(t, fmt.Sprintf("/api2/repos/%s/upload-link/?p=/", repoID))
+	expectStatus(t, uploadLinkResp, http.StatusOK)
+	uploadURL := strings.Trim(responseBody(t, uploadLinkResp), "\" \n\r")
+	uploadFileThroughLink(t, adminClient, uploadURL, "seed.txt", "/", content)
+
+	if rc := readBlockRefCount(t, orgID, blockID); rc != 1 {
+		t.Fatalf("seed upload permanent refs = %d, want 1", rc)
+	}
+
+	orgUUID, err := uuid.Parse(orgID)
+	if err != nil {
+		t.Fatalf("parse orgID %q: %v", orgID, err)
+	}
+	firstSeenAt := time.Now().UTC().Truncate(time.Millisecond)
+	effectiveFirstSeenAt, err := store.RecordS3Orphan(orgUUID, blockID, "hot", "seed orphan fence", firstSeenAt)
+	if err != nil {
+		t.Fatalf("RecordS3Orphan: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := store.DeleteS3Orphan(orgUUID, blockID, effectiveFirstSeenAt); err != nil {
+			t.Errorf("cleanup DeleteS3Orphan(%s): %v", blockID, err)
+		}
+	})
+	if !gcS3OrphanProjectionExists(t, orgID, blockID, effectiveFirstSeenAt) {
+		t.Fatal("expected gc_s3_orphans_by_day projection row to exist before retry upload")
+	}
+
+	status, body := uploadFileThroughLinkStatus(t, adminClient, uploadURL, "blocked-retry.txt", "/", content)
+	if status != http.StatusConflict {
+		t.Fatalf("reupload status = %d body=%s, want 409 conflict", status, body)
+	}
+	if !strings.Contains(body, "block is being deleted; retry the upload") {
+		t.Fatalf("reupload body = %q, want retryable block-delete message", body)
+	}
+
+	if rc := readBlockRefCount(t, orgID, blockID); rc != 1 {
+		t.Fatalf("permanent refs after blocked reupload = %d, want 1", rc)
+	}
+	assertNoUploadReferrers(t, repoID, "/", "seed.txt")
+
+	orphanInfo, found, err := database.GetBlockS3OrphanInfo(orgID, blockID)
+	if err != nil {
+		t.Fatalf("GetBlockS3OrphanInfo(%s): %v", blockID, err)
+	}
+	if !found {
+		t.Fatal("writer should leave gc_s3_orphans fence active for GC recovery")
+	}
+	if !orphanInfo.FirstSeenAt.UTC().Equal(effectiveFirstSeenAt.UTC()) {
+		t.Fatalf("gc_s3_orphans first_seen_at = %v, want %v", orphanInfo.FirstSeenAt.UTC(), effectiveFirstSeenAt.UTC())
+	}
+	if !gcS3OrphanProjectionExists(t, orgID, blockID, effectiveFirstSeenAt) {
+		t.Fatal("writer should not remove gc_s3_orphans_by_day projection during retryable upload failure")
+	}
+
+	listResp := adminClient.Get(t, fmt.Sprintf("/api/v2.1/repos/%s/dir/?p=/", repoID))
+	expectStatus(t, listResp, http.StatusOK)
+	defer listResp.Body.Close()
+	var dirList map[string]interface{}
+	decodeJSON(t, listResp, &dirList)
+	entries, _ := dirList["dirent_list"].([]interface{})
+	for _, rawEntry := range entries {
+		entry, _ := rawEntry.(map[string]interface{})
+		if name, _ := entry["name"].(string); name == "blocked-retry.txt" {
+			t.Fatal("retry-blocked upload should not create a file entry")
+		}
+	}
+}
+
 // TestGC_LibraryCascade verifies that soft-deleting a library and triggering
 // the scanner/worker cascades through commits, fs_objects, and blocks.
 func TestGC_LibraryCascade(t *testing.T) {
