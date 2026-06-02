@@ -1455,8 +1455,12 @@ func (h *SeafHTTPHandler) HandleUpload(c *gin.Context) {
 
 	// Single-shot upload: for small files, use the simple path.
 	// For large files (> uploadBlockSize), save to temp file first then stream.
-	chunkData, err := io.ReadAll(file)
+	chunkData, err := httputil.ReadAllWithLimit(file, header.Size, httputil.SingleShotUploadReadLimitBytes)
 	if err != nil {
+		if errors.Is(err, httputil.ErrReadLimitExceeded) {
+			c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "single-shot upload exceeds 1 GiB limit; use chunked upload"})
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read file"})
 		return
 	}
@@ -2222,6 +2226,13 @@ func (h *SeafHTTPHandler) commitUploadedFileMultiBlockOnce(ctx context.Context, 
 		}
 		return "", "", 0, 0, err
 	}
+	if err := queuePublishedFSObjectBlockReferenceRepairFn(h.db, orgID, repoID, newCommitID, fileFSID, stagedBlockIDs); err != nil {
+		cleanupErr := cleanupSeafHTTPFailedPublishAttempt(h.db, orgID, repoID, newCommitID, fileFSID, stagedBlockIDs)
+		return "", "", 0, 0, errors.Join(
+			fmt.Errorf("failed to queue durable publish repair for commit %s: %w", newCommitID, err),
+			cleanupErr,
+		)
+	}
 	createdAt := time.Now().UTC()
 	if err := h.createPendingSeafHTTPFileFSObject(orgID, repoID, newCommitID, fileFSID, actualFilename, fullPath, fileSize, createdAt, blockIDs, stagedBlockIDs); err != nil {
 		return "", "", 0, 0, err
@@ -2241,13 +2252,6 @@ func (h *SeafHTTPHandler) commitUploadedFileMultiBlockOnce(ctx context.Context, 
 	if err != nil {
 		_ = cleanupSeafHTTPFailedPublishAttempt(h.db, orgID, repoID, newCommitID, fileFSID, stagedBlockIDs)
 		return "", "", 0, 0, fmt.Errorf("failed to create commit: %w", err)
-	}
-	if err := queuePublishedFSObjectBlockReferenceRepairFn(h.db, orgID, repoID, newCommitID, fileFSID, stagedBlockIDs); err != nil {
-		cleanupErr := cleanupSeafHTTPFailedPublishAttempt(h.db, orgID, repoID, newCommitID, fileFSID, stagedBlockIDs)
-		return "", "", 0, 0, errors.Join(
-			fmt.Errorf("failed to queue durable publish repair for commit %s: %w", newCommitID, err),
-			cleanupErr,
-		)
 	}
 	if err := checkSeafHTTPUploadFinalizeContext(ctx, repoID, "library head publish"); err != nil {
 		cleanupErr := cleanupSeafHTTPFailedPublishAttempt(h.db, orgID, repoID, newCommitID, fileFSID, stagedBlockIDs)
@@ -2391,6 +2395,13 @@ func (h *SeafHTTPHandler) commitUploadedFileOnce(ctx context.Context, orgID, rep
 		}
 		return "", "", 0, 0, err
 	}
+	if err := queuePublishedFSObjectBlockReferenceRepairFn(h.db, orgID, repoID, newCommitID, fileFSID, stagedBlockIDs); err != nil {
+		cleanupErr := cleanupSeafHTTPFailedPublishAttempt(h.db, orgID, repoID, newCommitID, fileFSID, stagedBlockIDs)
+		return "", "", 0, 0, errors.Join(
+			fmt.Errorf("failed to queue durable publish repair for commit %s: %w", newCommitID, err),
+			cleanupErr,
+		)
+	}
 	createdAt := time.Now().UTC()
 	if err := h.createPendingSeafHTTPFileFSObject(orgID, repoID, newCommitID, fileFSID, actualFilename, fullPath, fileSize, createdAt, []string{blockID}, stagedBlockIDs); err != nil {
 		return "", "", 0, 0, err
@@ -2411,13 +2422,6 @@ func (h *SeafHTTPHandler) commitUploadedFileOnce(ctx context.Context, orgID, rep
 	if err != nil {
 		_ = cleanupSeafHTTPFailedPublishAttempt(h.db, orgID, repoID, newCommitID, fileFSID, stagedBlockIDs)
 		return "", "", 0, 0, fmt.Errorf("failed to create commit: %w", err)
-	}
-	if err := queuePublishedFSObjectBlockReferenceRepairFn(h.db, orgID, repoID, newCommitID, fileFSID, stagedBlockIDs); err != nil {
-		cleanupErr := cleanupSeafHTTPFailedPublishAttempt(h.db, orgID, repoID, newCommitID, fileFSID, stagedBlockIDs)
-		return "", "", 0, 0, errors.Join(
-			fmt.Errorf("failed to queue durable publish repair for commit %s: %w", newCommitID, err),
-			cleanupErr,
-		)
 	}
 	if err := checkSeafHTTPUploadFinalizeContext(ctx, repoID, "library head publish"); err != nil {
 		cleanupErr := cleanupSeafHTTPFailedPublishAttempt(h.db, orgID, repoID, newCommitID, fileFSID, stagedBlockIDs)
