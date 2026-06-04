@@ -746,20 +746,20 @@ func (s *Service) reconcileDirtyQueueStats(limit int) {
 
 	if len(dirtyOrgs) > 0 {
 		for _, dirtyOrg := range dirtyOrgs {
-			recountedAt := time.Now().UTC()
+			snapshotAt := time.Now().UTC()
 			prevStats, err := s.store.GetOrgQueueStats(dirtyOrg.OrgID)
 			if err != nil {
 				log.Printf("[GC] Failed to load org queue stats for %s: %v", dirtyOrg.OrgID, err)
 				continue
 			}
-			queueDepth, err := s.store.RecountOrgQueueDepth(dirtyOrg.OrgID)
+			queueDepth, err := s.store.ReadOrgQueueDepth(dirtyOrg.OrgID)
 			if err != nil {
-				log.Printf("[GC] Failed to recount queue depth for %s: %v", dirtyOrg.OrgID, err)
+				log.Printf("[GC] Failed to read queue depth counters for %s: %v", dirtyOrg.OrgID, err)
 				continue
 			}
-			failedDepth, err := s.store.RecountOrgFailedDepth(dirtyOrg.OrgID)
+			failedDepth, err := s.store.ReadOrgFailedDepth(dirtyOrg.OrgID)
 			if err != nil {
-				log.Printf("[GC] Failed to recount failed depth for %s: %v", dirtyOrg.OrgID, err)
+				log.Printf("[GC] Failed to read failed depth counters for %s: %v", dirtyOrg.OrgID, err)
 				continue
 			}
 			oldestQueuedAt := prevStats.OldestQueuedAt
@@ -772,7 +772,7 @@ func (s *Service) reconcileDirtyQueueStats(limit int) {
 				QueueDepth:     queueDepth,
 				FailedDepth:    failedDepth,
 				OldestQueuedAt: oldestQueuedAt,
-				UpdatedAt:      recountedAt,
+				UpdatedAt:      snapshotAt,
 			}
 			if err := s.store.SaveOrgQueueStats(nextStats); err != nil {
 				log.Printf("[GC] Failed to save org queue stats for %s: %v", dirtyOrg.OrgID, err)
@@ -792,7 +792,7 @@ func (s *Service) reconcileDirtyQueueStats(limit int) {
 				log.Printf("[GC] Failed to clear dirty org %s: %v", dirtyOrg.OrgID, err)
 			}
 			if queueDepth == 0 {
-				if err := s.store.RemoveOrgFromActiveSet(dirtyOrg.OrgID, recountedAt); err != nil {
+				if err := s.store.RemoveOrgFromActiveSet(dirtyOrg.OrgID, snapshotAt); err != nil {
 					log.Printf("[GC] Failed to remove drained org %s from active set: %v", dirtyOrg.OrgID, err)
 				}
 			}
@@ -849,9 +849,9 @@ func (s *Service) refreshFailedItemSnapshotLocked() error {
 	repaired := 0
 	now := time.Now().UTC()
 	for _, org := range snapshotOrgs {
-		failedDepth, err := s.store.RecountOrgFailedDepth(org.OrgID)
+		failedDepth, err := s.store.ReadOrgFailedDepth(org.OrgID)
 		if err != nil {
-			log.Printf("[GC] Failed to recount stale failed depth for %s: %v", org.OrgID, err)
+			log.Printf("[GC] Failed to read stale failed depth counters for %s: %v", org.OrgID, err)
 			continue
 		}
 		if failedDepth == org.FailedItemsTotal {
@@ -930,7 +930,7 @@ func (s *Service) ListFailedItemOrgs(limit int) ([]GCFailedItemOrgInfo, error) {
 
 	orgs := make([]GCFailedItemOrgInfo, 0, len(candidateOrgIDs))
 	for orgID := range candidateOrgIDs {
-		failedDepth, err := s.store.RecountOrgFailedDepth(orgID)
+		failedDepth, err := s.store.ReadOrgFailedDepth(orgID)
 		if err != nil {
 			return nil, err
 		}

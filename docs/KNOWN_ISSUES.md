@@ -1340,7 +1340,7 @@ The GC (worker + scanner) has no coordination mechanism between instances. If mu
 
 1. **DequeueBatch without locking**: `SELECT ... LIMIT ?` returns the same items to all instances. Both process the same items simultaneously.
 2. **Scanner without leader election**: Multiple scanners enqueue the same orphans as duplicates (the PK includes `queued_at = time.Now()`, so each INSERT creates a distinct row).
-3. **Snapshot drift** (resolved 2026-04-28): the original `gc_queue_stats` counter table was retired from the baseline schema. Queue/DLQ totals now live in `gc_stats` and are reconciled per dirty org by a serialized reconciler (with a periodic full-sum drift check). See ARCHITECTURE.md / GC-SERVICE-ANALYSIS.md.
+3. **Snapshot drift** (partially resolved): the original `gc_queue_stats` counter table was retired from the baseline schema. Queue/DLQ totals now live in `gc_stats` and are reconciled per dirty org by a serialized reconciler. Hot `COUNT(*)` reads are gone and DLQ expiry is explicit, but counter-vs-row scrub/repair remains required before treating snapshots as production-authoritative. See ARCHITECTURE.md / GC-SERVICE-ANALYSIS.md.
 
 **Is there data loss?** No. Destructive operations are protected:
 - `DeleteBlock` uses a claim-then-verify delete fence: only one instance can win the claim, and the winner re-checks live `block_references` before touching S3
@@ -2677,16 +2677,16 @@ Tracked in `docs/TECHNICAL-DEBT.md` § 9, Gap B.
 
 ### ISSUE-GC-QUEUE-RECOUNT-01: Exact `gc_queue` Recounts Still Hit Cassandra Tombstone Paths
 
-**Status**: 🟡 Pending
+**Status**: Partially resolved: hot `COUNT(*)` removed, explicit counter scrub still required
 **Discovered**: 2026-04-28
 **Severity**: High operational risk — not a confirmed data-loss bug, but still a real source of Cassandra warnings and expensive partition reads in a GC-critical path
 
 **Affected code paths:**
 - `internal/gc/gc.go` — `reconcileDirtyQueueStats()`
-- `internal/gc/store_cassandra.go` — `RecountOrgQueueDepth()`, `GetQueueSize()`
+- `internal/gc/store_cassandra.go` — counter-backed queue depth reads, `GetQueueSize()`
 
 **Problem**:
-GC still performs exact live recounts of `gc_queue` rows per org using `COUNT(*)`.
+Older GC code performed exact live recounts of `gc_queue` rows per org using `COUNT(*)`.
 
 On Cassandra 5, that path is unsafe operationally on hot or tombstoned `gc_queue` partitions. In practice it produces repeated warnings that surface as internal read shapes like:
 
@@ -2702,12 +2702,13 @@ Even when the application query does not literally contain `ALLOW FILTERING`, Ca
 
 **Why this is not safe to "just fix" with another scan:**
 - Replacing `COUNT(*)` with another full-partition read or row iteration still traverses the same hot/tombstoned partition surface
-- Reintroducing old best-effort queue counters is also unsafe: that design was already removed because drift was structural, not incidental
+- Counter-backed status must stay explicitly approximate unless paired with a scrub/repair path: the retired counter design drifted because drift was structural, not incidental
 
 **Safe direction for a future fix:**
-1. Remove exact `gc_queue` recounts from the hot reconcile/status path
-2. Maintain `queue_depth` snapshots on the write path where queue rows are inserted/deleted/moved
-3. Keep a separate, infrequent scrub/reconciliation path to repair any snapshot drift explicitly
+1. Remove exact `gc_queue` recounts from the hot reconcile/status path - done in the baseline schema by loading `gc_org_queue_counters`.
+2. Maintain `queue_depth`/`failed_depth` counters on the write path where queue rows are inserted/deleted/moved - done for normal Cassandra GC store mutations.
+3. Avoid invisible DLQ expiry - done by replacing Cassandra TTL with `gc_failed_items_by_expiry` and scanner-driven deletes.
+4. Keep a separate, infrequent scrub/reconciliation path to repair any counter drift explicitly - still required for production operations.
 
 **Related worker note:**
 The worker behavior in `internal/gc/worker.go` that removes an org from `gc_active_orgs` when `len(items) < batchSize` should remain in place.
@@ -2715,7 +2716,8 @@ The worker behavior in `internal/gc/worker.go` that removes an org from `gc_acti
 That change addresses a different problem: stale active-org entries causing repeated empty dequeues. It does **not** introduce the `COUNT(*)` issue and remains safe because removal is guarded by the `last_enqueued_at` timestamp semantics.
 
 **Current recommendation:**
-- Treat this as pending technical debt / operability work
+- Treat the hot-path `COUNT(*)` removal and explicit DLQ expiry as implemented, then validate under multi-instance/multinode load
+- Add an explicit scrub/repair command or background job before relying on counters as the only recovery mechanism
 - Do not revert the current worker short-batch active-set removal
 - Do not add new hot-path exact recounts over `gc_queue`
 

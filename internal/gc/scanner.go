@@ -114,12 +114,14 @@ func (s *Scanner) ScanOnce(ctx context.Context) error {
 		{"expired_shares", s.scanExpiredShares},
 		{"expired_restore_jobs", s.scanExpiredRestoreJobs},
 		{"orphaned_group_shares", s.scanOrphanedGroupShares},
+		{"expired_failed_items", s.scanExpiredFailedItems},
 		{"expired_deleted_users", s.scanExpiredDeletedUsers},
 		{"storage_counter_reconciliation", s.scanPendingStorageCounterReconciliation},
 		{"expired_deleted_libraries", s.scanExpiredDeletedLibraries},
 		{"expired_deleted_orgs", s.scanExpiredDeletedOrgs},
 		{"onlyoffice_pending_blocks", s.scanOnlyOfficePendingBlocks},
 		{"s3_orphan_recovery", s.scanS3OrphanRecovery},
+		{"queue_counter_reconciliation", s.scanQueueCounterReconciliation},
 	}
 
 	for _, phase := range phases {
@@ -158,6 +160,25 @@ func (s *Scanner) ScanOnce(ctx context.Context) error {
 	return scanErr
 }
 
+func (s *Scanner) scanQueueCounterReconciliation(ctx context.Context) (int, error) {
+	select {
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	default:
+	}
+
+	const limit = 32
+	log.Println("[GC Scanner] Phase 17: Reconciling GC queue counters...")
+	reconciled, err := s.store.ReconcilePendingQueueCounters(limit)
+	if err != nil {
+		log.Printf("[GC Scanner] Phase 17: queue counter reconciliation error: %v", err)
+	}
+	log.Printf("[GC Scanner] Phase 17 complete: reconciled %d GC queue counter orgs", reconciled)
+	metrics.GCScannerLastPhaseRun.WithLabelValues("queue_counter_reconciliation").SetToCurrentTime()
+	recordScannerAction("queue_counter_reconciliation", "reconciled", reconciled)
+	return 0, err
+}
+
 func (s *Scanner) scanPendingStorageCounterReconciliation(ctx context.Context) (int, error) {
 	select {
 	case <-ctx.Done():
@@ -165,12 +186,12 @@ func (s *Scanner) scanPendingStorageCounterReconciliation(ctx context.Context) (
 	default:
 	}
 
-	log.Println("[GC Scanner] Phase 11: Reconciling pending storage counters...")
+	log.Println("[GC Scanner] Phase 12: Reconciling pending storage counters...")
 	reconciled, err := s.store.ReconcilePendingStorageCounters()
 	if err != nil {
 		return reconciled, err
 	}
-	log.Printf("[GC Scanner] Phase 11 complete: reconciled %d storage counter scopes", reconciled)
+	log.Printf("[GC Scanner] Phase 12 complete: reconciled %d storage counter scopes", reconciled)
 	metrics.GCScannerLastPhaseRun.WithLabelValues("storage_counter_reconciliation").SetToCurrentTime()
 	return 0, nil
 }
@@ -418,7 +439,7 @@ func (s *Scanner) loadBlockCandidatesStartDay(cutoffDay time.Time) (time.Time, e
 	value, err := s.store.LoadGCStats(gcBlockCandidatesCursorKey)
 	if err != nil {
 		if errors.Is(err, gocql.ErrNotFound) {
-			return cutoffDay.AddDate(0, 0, -gcInitialScanLookbackDays), nil
+			return cutoffDay.AddDate(0, 0, -gcFailedItemExpiryInitialLookbackDays), nil
 		}
 		return time.Time{}, err
 	}
@@ -431,6 +452,21 @@ func (s *Scanner) loadBlockCandidatesStartDay(cutoffDay time.Time) (time.Time, e
 
 func (s *Scanner) loadProvisionalBlockRefsStartDay(cutoffDay time.Time) (time.Time, error) {
 	value, err := s.store.LoadGCStats(gcProvisionalBlockRefsCursorKey)
+	if err != nil {
+		if errors.Is(err, gocql.ErrNotFound) {
+			return cutoffDay.AddDate(0, 0, -gcInitialScanLookbackDays), nil
+		}
+		return time.Time{}, err
+	}
+	lastDay, err := db.ParseGCProjectionDate(value)
+	if err != nil {
+		return time.Time{}, err
+	}
+	return lastDay.AddDate(0, 0, -gcScanOverlapDays), nil
+}
+
+func (s *Scanner) loadFailedItemsExpiryStartDay(cutoffDay time.Time) (time.Time, error) {
+	value, err := s.store.LoadGCStats(gcFailedItemsExpiryCursorKey)
 	if err != nil {
 		if errors.Is(err, gocql.ErrNotFound) {
 			return cutoffDay.AddDate(0, 0, -gcInitialScanLookbackDays), nil
@@ -965,10 +1001,89 @@ func (s *Scanner) scanOrphanedGroupShares(ctx context.Context) (int, error) {
 	return cleaned, phaseErr
 }
 
+// scanExpiredFailedItems expires DLQ rows through the store rather than relying
+// on Cassandra TTL. This keeps failed-depth counters and pending markers in sync
+// with the primary gc_failed_items row.
+func (s *Scanner) scanExpiredFailedItems(ctx context.Context) (int, error) {
+	log.Println("[GC Scanner] Phase 10: Expiring GC failed items...")
+
+	now := time.Now().UTC()
+	cutoffDay := db.GCProjectionUTCDate(now)
+	startDay, err := s.loadFailedItemsExpiryStartDay(cutoffDay)
+	if err != nil {
+		return 0, err
+	}
+	if startDay.After(cutoffDay) {
+		log.Printf("[GC Scanner] Phase 10 complete: cursor ahead of cutoff, nothing to expire")
+		metrics.GCScannerLastPhaseRun.WithLabelValues("expired_failed_items").SetToCurrentTime()
+		return 0, nil
+	}
+
+	expired := 0
+	projections := 0
+	failed := 0
+	var phaseErr error
+	for day := startDay; !day.After(cutoffDay); day = day.AddDate(0, 0, 1) {
+		for bucket := 0; bucket < db.GCDiscoveryBucketCount; bucket++ {
+			select {
+			case <-ctx.Done():
+				return expired, ctx.Err()
+			default:
+			}
+
+			expiries, err := s.store.ListFailedItemExpiriesByDay(day, bucket)
+			if err != nil {
+				log.Printf("[GC Scanner] Phase 10: failed to list failed-item expiries for day=%s bucket=%d: %v", db.GCProjectionDateString(day), bucket, err)
+				failed++
+				if phaseErr == nil {
+					phaseErr = fmt.Errorf("list failed-item expiries for day=%s bucket=%d: %w", db.GCProjectionDateString(day), bucket, err)
+				}
+				continue
+			}
+
+			for _, expiry := range expiries {
+				if expiry.ExpiresAt.After(now) {
+					continue
+				}
+				deleted, err := s.store.DeleteExpiredFailedItem(expiry, now)
+				if err != nil {
+					log.Printf("[GC Scanner] Phase 10: failed to expire failed item org=%s item_type=%s item_id=%s failed_at=%s: %v",
+						expiry.OrgID, expiry.ItemType, expiry.ItemID, expiry.FailedAt.Format(time.RFC3339Nano), err)
+					failed++
+					if phaseErr == nil {
+						phaseErr = fmt.Errorf("expire failed item org=%s item=%s: %w", expiry.OrgID, expiry.ItemID, err)
+					}
+					continue
+				}
+				projections++
+				if deleted {
+					expired++
+				}
+			}
+		}
+	}
+
+	if phaseErr == nil {
+		newCursor := cutoffDay.AddDate(0, 0, -1)
+		if !newCursor.Before(startDay) {
+			if err := s.store.SaveGCStats(gcFailedItemsExpiryCursorKey, db.GCProjectionDateString(newCursor)); err != nil {
+				log.Printf("[GC Scanner] Phase 10: failed to persist failed-item expiry cursor: %v", err)
+				phaseErr = fmt.Errorf("persist failed-item expiry cursor: %w", err)
+			}
+		}
+	}
+
+	log.Printf("[GC Scanner] Phase 10 complete: expired %d failed items, touched %d projections", expired, projections)
+	recordScannerAction("expired_failed_items", "expired", expired)
+	recordScannerAction("expired_failed_items", "failed", failed)
+	metrics.GCScannerLastPhaseRun.WithLabelValues("expired_failed_items").SetToCurrentTime()
+	return expired, phaseErr
+}
+
 // scanExpiredDeletedUsers finds soft-deleted users whose grace period has expired
 // and enqueues them for cascade deletion.
 func (s *Scanner) scanExpiredDeletedUsers(ctx context.Context) (int, error) {
-	log.Println("[GC Scanner] Phase 10: Scanning for expired deleted users...")
+	log.Println("[GC Scanner] Phase 11: Scanning for expired deleted users...")
 
 	now := time.Now()
 	users, err := s.store.ListDeletedUsersExpired(s.config.UserGraceDays)
@@ -982,7 +1097,7 @@ func (s *Scanner) scanExpiredDeletedUsers(ctx context.Context) (int, error) {
 	for _, u := range users {
 		exists, err := s.store.PendingItemExists(u.OrgID, uuid.Nil, u.DeletedAt, ItemUserCascade, u.UserID.String())
 		if err != nil {
-			log.Printf("[GC Scanner] Phase 10: failed to dedupe expired deleted user %s: %v", u.UserID, err)
+			log.Printf("[GC Scanner] Phase 11: failed to dedupe expired deleted user %s: %v", u.UserID, err)
 			if phaseErr == nil {
 				phaseErr = err
 			}
@@ -1000,7 +1115,7 @@ func (s *Scanner) scanExpiredDeletedUsers(ctx context.Context) (int, error) {
 	}
 	if len(batch) > 0 {
 		if err := s.queue.EnqueueBatch(batch); err != nil {
-			log.Printf("[GC Scanner] Phase 10: failed to enqueue expired deleted users: %v", err)
+			log.Printf("[GC Scanner] Phase 11: failed to enqueue expired deleted users: %v", err)
 			if phaseErr == nil {
 				phaseErr = err
 			}
@@ -1015,7 +1130,7 @@ func (s *Scanner) scanExpiredDeletedUsers(ctx context.Context) (int, error) {
 		}
 	}
 
-	log.Printf("[GC Scanner] Phase 10 complete: enqueued %d expired deleted users", enqueued)
+	log.Printf("[GC Scanner] Phase 11 complete: enqueued %d expired deleted users", enqueued)
 	metrics.GCItemsEnqueuedTotal.WithLabelValues("expired_deleted_users").Add(float64(enqueued))
 	metrics.GCScannerLastPhaseRun.WithLabelValues("expired_deleted_users").SetToCurrentTime()
 	return enqueued, phaseErr
@@ -1025,7 +1140,7 @@ func (s *Scanner) scanExpiredDeletedUsers(ctx context.Context) (int, error) {
 // period has expired and enqueues them for cascade deletion (commits, fs_objects,
 // blocks, and all library artifacts).
 func (s *Scanner) scanExpiredDeletedLibraries(ctx context.Context) (int, error) {
-	log.Println("[GC Scanner] Phase 11: Scanning for expired deleted libraries...")
+	log.Println("[GC Scanner] Phase 13: Scanning for expired deleted libraries...")
 
 	libs, err := s.store.ListExpiredDeletedLibraries(s.config.TrashRetentionDays)
 	if err != nil {
@@ -1037,7 +1152,7 @@ func (s *Scanner) scanExpiredDeletedLibraries(ctx context.Context) (int, error) 
 	for _, lib := range libs {
 		exists, err := s.store.PendingItemExists(lib.OrgID, uuid.Nil, lib.DeletedAt, ItemLibraryCascade, lib.LibraryID.String())
 		if err != nil {
-			log.Printf("[GC Scanner] Phase 11: failed to dedupe expired deleted library %s: %v", lib.LibraryID, err)
+			log.Printf("[GC Scanner] Phase 13: failed to dedupe expired deleted library %s: %v", lib.LibraryID, err)
 			continue
 		}
 		if exists {
@@ -1053,13 +1168,13 @@ func (s *Scanner) scanExpiredDeletedLibraries(ctx context.Context) (int, error) 
 	}
 	if len(batch) > 0 {
 		if err := s.queue.EnqueueBatch(batch); err != nil {
-			log.Printf("[GC Scanner] Phase 11: failed to enqueue expired deleted libraries: %v", err)
+			log.Printf("[GC Scanner] Phase 13: failed to enqueue expired deleted libraries: %v", err)
 		} else {
 			enqueued = len(batch)
 		}
 	}
 
-	log.Printf("[GC Scanner] Phase 11 complete: enqueued %d expired deleted libraries", enqueued)
+	log.Printf("[GC Scanner] Phase 13 complete: enqueued %d expired deleted libraries", enqueued)
 	metrics.GCItemsEnqueuedTotal.WithLabelValues("expired_deleted_libraries").Add(float64(enqueued))
 	metrics.GCScannerLastPhaseRun.WithLabelValues("expired_deleted_libraries").SetToCurrentTime()
 	return enqueued, nil
@@ -1068,7 +1183,7 @@ func (s *Scanner) scanExpiredDeletedLibraries(ctx context.Context) (int, error) 
 // scanExpiredDeletedOrgs finds soft-deleted organizations whose grace period
 // has expired and enqueues them for cascade deletion (users, libraries, groups).
 func (s *Scanner) scanExpiredDeletedOrgs(ctx context.Context) (int, error) {
-	log.Println("[GC Scanner] Phase 12: Scanning for expired deleted organizations...")
+	log.Println("[GC Scanner] Phase 14: Scanning for expired deleted organizations...")
 
 	orgs, err := s.store.ListExpiredDeletedOrgs(s.config.OrgGraceDays)
 	if err != nil {
@@ -1080,7 +1195,7 @@ func (s *Scanner) scanExpiredDeletedOrgs(ctx context.Context) (int, error) {
 	for _, org := range orgs {
 		exists, err := s.store.PendingItemExists(org.OrgID, uuid.Nil, org.DeletedAt, ItemOrgCascade, org.OrgID.String())
 		if err != nil {
-			log.Printf("[GC Scanner] Phase 12: failed to dedupe expired deleted org %s: %v", org.OrgID, err)
+			log.Printf("[GC Scanner] Phase 14: failed to dedupe expired deleted org %s: %v", org.OrgID, err)
 			continue
 		}
 		if exists {
@@ -1095,13 +1210,13 @@ func (s *Scanner) scanExpiredDeletedOrgs(ctx context.Context) (int, error) {
 	}
 	if len(batch) > 0 {
 		if err := s.queue.EnqueueBatch(batch); err != nil {
-			log.Printf("[GC Scanner] Phase 12: failed to enqueue expired deleted orgs: %v", err)
+			log.Printf("[GC Scanner] Phase 14: failed to enqueue expired deleted orgs: %v", err)
 		} else {
 			enqueued = len(batch)
 		}
 	}
 
-	log.Printf("[GC Scanner] Phase 12 complete: enqueued %d expired deleted organizations", enqueued)
+	log.Printf("[GC Scanner] Phase 14 complete: enqueued %d expired deleted organizations", enqueued)
 	metrics.GCItemsEnqueuedTotal.WithLabelValues("expired_deleted_orgs").Add(float64(enqueued))
 	metrics.GCScannerLastPhaseRun.WithLabelValues("expired_deleted_orgs").SetToCurrentTime()
 	return enqueued, nil
@@ -1115,7 +1230,7 @@ func (s *Scanner) scanExpiredDeletedOrgs(ctx context.Context) (int, error) {
 // idempotent — DecrementBlockRefCountsOnce protects against double-decrement
 // across the inline and scanner trigger paths.
 func (s *Scanner) scanOnlyOfficePendingBlocks(ctx context.Context) (int, error) {
-	log.Println("[GC Scanner] Phase 14: Reconciling OnlyOffice pending blocks...")
+	log.Println("[GC Scanner] Phase 15: Reconciling OnlyOffice pending blocks...")
 	if s.onlyOfficeReconciler == nil {
 		return 0, nil
 	}
@@ -1135,7 +1250,7 @@ func (s *Scanner) scanOnlyOfficePendingBlocks(ctx context.Context) (int, error) 
 		}
 
 		if err := s.onlyOfficeReconciler.ReconcileOnlyOfficePendingBlocks(orgID); err != nil {
-			log.Printf("[GC Scanner] Phase 14: reconcile org %s: %v", orgID, err)
+			log.Printf("[GC Scanner] Phase 15: reconcile org %s: %v", orgID, err)
 			if firstErr == nil {
 				firstErr = err
 			}
@@ -1144,7 +1259,7 @@ func (s *Scanner) scanOnlyOfficePendingBlocks(ctx context.Context) (int, error) 
 		reconciled++
 	}
 
-	log.Printf("[GC Scanner] Phase 14 complete: reconciled %d organizations", reconciled)
+	log.Printf("[GC Scanner] Phase 15 complete: reconciled %d organizations", reconciled)
 	recordScannerAction("onlyoffice_pending_blocks", "reconciled", reconciled)
 	metrics.GCScannerLastPhaseRun.WithLabelValues("onlyoffice_pending_blocks").SetToCurrentTime()
 	return reconciled, firstErr
@@ -1154,15 +1269,15 @@ func (s *Scanner) scanOnlyOfficePendingBlocks(ctx context.Context) (int, error) 
 // removed successfully but whose S3 objects lingered because DeleteBlock
 // failed after the LWT step (see docs/GC-SERVICE-ANALYSIS.md).
 func (s *Scanner) scanS3OrphanRecovery(ctx context.Context) (int, error) {
-	log.Println("[GC Scanner] Phase 13: Recovering S3 orphans...")
+	log.Println("[GC Scanner] Phase 16: Recovering S3 orphans...")
 	if s.orphanRecoverer == nil {
 		return 0, nil
 	}
 	recovered, err := s.orphanRecoverer.RecoverS3Orphans(ctx, 500)
 	if err != nil {
-		log.Printf("[GC Scanner] Phase 13: recovery error: %v", err)
+		log.Printf("[GC Scanner] Phase 16: recovery error: %v", err)
 	}
-	log.Printf("[GC Scanner] Phase 13 complete: recovered %d S3 orphans", recovered)
+	log.Printf("[GC Scanner] Phase 16 complete: recovered %d S3 orphans", recovered)
 	recordScannerAction("s3_orphan_recovery", "recovered", recovered)
 	metrics.GCScannerLastPhaseRun.WithLabelValues("s3_orphan_recovery").SetToCurrentTime()
 	return recovered, err

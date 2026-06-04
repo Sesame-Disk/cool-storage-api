@@ -235,6 +235,32 @@ func TestGCQueueBucket_DeterministicAndDistributedByIdentity(t *testing.T) {
 	}
 }
 
+func TestGCPendingItemBucket_DeterministicAndDistributedByIdentity(t *testing.T) {
+	orgID := uuid.New()
+	libraryID := uuid.New()
+	first := gcPendingItemBucket(orgID, libraryID, ItemFSObject, "fs-1")
+	second := gcPendingItemBucket(orgID, libraryID, ItemFSObject, "fs-1")
+	if first != second {
+		t.Fatalf("pending bucket changed for same identity: %d != %d", first, second)
+	}
+	if first < 0 || first >= gcDefaultQueueBucketCount {
+		t.Fatalf("pending bucket = %d, want [0,%d)", first, gcDefaultQueueBucketCount)
+	}
+
+	otherLibraryBucket := gcPendingItemBucket(orgID, uuid.New(), ItemFSObject, "fs-1")
+	if first == otherLibraryBucket {
+		t.Fatalf("expected library_id to participate in pending bucket identity, both mapped to %d", first)
+	}
+
+	buckets := make(map[int]struct{})
+	for i := 0; i < 128; i++ {
+		buckets[gcPendingItemBucket(orgID, libraryID, ItemFSObject, fmt.Sprintf("fs-%d", i))] = struct{}{}
+	}
+	if len(buckets) < gcDefaultQueueBucketCount/2 {
+		t.Fatalf("expected pending identities to spread across buckets, got %d distinct buckets", len(buckets))
+	}
+}
+
 func TestQueue_ListOrgsWithQueuedItems(t *testing.T) {
 	store := NewMockStore()
 	q := NewQueue(store)

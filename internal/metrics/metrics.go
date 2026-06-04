@@ -218,6 +218,17 @@ var (
 		},
 	)
 
+	// GCQueueCounterUpdateFailuresTotal counts failed writes to approximate GC
+	// queue/DLQ depth counters. Any sustained increase means status snapshots
+	// can drift until an explicit repair pass corrects the counters.
+	GCQueueCounterUpdateFailuresTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "gc_queue_counter_update_failures_total",
+			Help: "Total number of failed GC queue/DLQ depth counter updates.",
+		},
+		[]string{"counter"},
+	)
+
 	// GCActiveOrgRecoveryTriggersTotal counts how often the worker attempts to
 	// rebuild gc_active_orgs from gc_org_stats. Labelled by trigger source.
 	GCActiveOrgRecoveryTriggersTotal = prometheus.NewCounterVec(
@@ -348,6 +359,7 @@ func Register() {
 		GCSnapshotAgeSeconds,
 		GCReconcileDuration,
 		GCSnapshotDriftCorrectedTotal,
+		GCQueueCounterUpdateFailuresTotal,
 		GCActiveOrgRecoveryTriggersTotal,
 		GCActiveOrgRecoveriesTotal,
 		GCWorkerLastSuccessTimestamp,

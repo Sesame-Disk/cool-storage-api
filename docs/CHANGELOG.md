@@ -179,8 +179,9 @@ Schema is now baked into `internal/db/migrations/001_initial_schema.cql`:
   reconciliation.
 - `gc_org_stats (org_id, queue_depth, failed_depth, oldest_queued_at)` —
   per-org snapshot maintained by the reconciler.
-- `gc_failed_items (org_id, failed_at, ...)` — DLQ with a 30-day TTL and a
-  `resolution_status` column for operator workflow.
+- `gc_failed_items (org_id, failed_at, ...)` — durable DLQ with explicit
+  30-day retention via `gc_failed_items_by_expiry` and a `resolution_status`
+  column for operator workflow.
 - Pre-seeds `gc_stats` keys: `total_queue_depth`, `total_failed_items`,
   `dirty_orgs_total`, `last_reconcile_run`.
 

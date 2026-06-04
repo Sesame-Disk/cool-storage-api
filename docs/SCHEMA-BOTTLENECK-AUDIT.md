@@ -99,8 +99,8 @@ visible candidate (see also `docs/TECHNICAL-DEBT.md` §12b).
 forever.
 
 **Risk**: cluster-wide growth if the worker stops draining. Failed items move
-to `gc_failed_items` (30-day TTL), but successful-looking-but-stale items can
-linger.
+to `gc_failed_items` and are expired explicitly through
+`gc_failed_items_by_expiry`, but successful-looking-but-stale items can linger.
 
 **Direction**: introduce a long but bounded TTL (e.g. 90–180 days) so abandoned
 queue items eventually fall off and orphan recovery picks them up via the

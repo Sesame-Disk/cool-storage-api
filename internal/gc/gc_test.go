@@ -555,7 +555,7 @@ func TestService_ReconcileDirtyQueueStats_SerializesRuns(t *testing.T) {
 	var inFlight atomic.Int32
 	var maxInFlight atomic.Int32
 	release := make(chan struct{})
-	store.recountQueueDepthHook = func(orgID uuid.UUID, depth int) {
+	store.readQueueDepthHook = func(orgID uuid.UUID, depth int) {
 		current := inFlight.Add(1)
 		for {
 			max := maxInFlight.Load()
@@ -587,7 +587,7 @@ func TestService_ReconcileDirtyQueueStats_SerializesRuns(t *testing.T) {
 	}
 
 	if got := maxInFlight.Load(); got != 1 {
-		t.Fatalf("expected serialized reconcile passes, max concurrent in-flight recounts = %d", got)
+		t.Fatalf("expected serialized reconcile passes, max concurrent in-flight queue-depth reads = %d", got)
 	}
 }
 

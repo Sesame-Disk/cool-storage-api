@@ -516,8 +516,9 @@ Drains the `gc_queue` table. Each item has a type; the worker dispatches accordi
 - Never delete HEAD commit or its ancestors within TTL
 - Grace period: items wait 1h in queue before processing
 - `gc_queue` is durable in the baseline schema. Stuck items reach the
-  retry cap (5 attempts) and are moved to `gc_failed_items` (DLQ, 30-day TTL)
-  for operator inspection via `GET /api/v2.1/admin/gc/failed-items`. If
+  retry cap (5 attempts) and are moved to `gc_failed_items` (DLQ with explicit
+  30-day retention via `gc_failed_items_by_expiry`) for operator inspection via
+  `GET /api/v2.1/admin/gc/failed-items`. If
   `IncrementRetry` reports an error, the worker first verifies whether the
   original queue row still exists: it escalates only when the old row is still
   present, treats the requeue as successful when the old row is already gone,
@@ -530,7 +531,7 @@ Drains the `gc_queue` table. Each item has a type; the worker dispatches accordi
 - **DLQ requeue identity preservation**: Failed items are requeued with their original `queued_at` and stable `identity_at` so cascade stale checks and semantic dedupe keep the same deletion identity when an operator retries a failed item.
 - **Cascade error propagation**: If enqueueing child items fails, the parent item is NOT deleted — the worker returns an error and the item stays in queue for retry.
 - Dry-run mode for testing (toggle at runtime via admin API); the worker logs simulated actions without consuming queued items.
-- Prometheus metrics: `gc_worker_duration`, `gc_scanner_duration`, `gc_queue_size`, `gc_blocks_deleted_total`, `gc_worker_consecutive_errors`, `gc_queue_growth_rate`, `gc_worker_last_success_timestamp_seconds`, `gc_failed_items_total`, `gc_dirty_orgs_total`, `gc_snapshot_age_seconds`, `gc_reconcile_duration_seconds`, `gc_snapshot_drift_corrected_total`
+- Prometheus metrics: `gc_worker_duration`, `gc_scanner_duration`, `gc_queue_size`, `gc_blocks_deleted_total`, `gc_worker_consecutive_errors`, `gc_queue_growth_rate`, `gc_worker_last_success_timestamp_seconds`, `gc_failed_items_total`, `gc_dirty_orgs_total`, `gc_snapshot_age_seconds`, `gc_reconcile_duration_seconds`, `gc_snapshot_drift_corrected_total`, `gc_queue_counter_update_failures_total`
 - Scanner runs immediately on startup to catch anything missed during downtime
 - Health alerting: `gc_worker_consecutive_errors` tracks sequential failures (alert if > 5), `gc_queue_growth_rate` tracks net queue growth (positive = queue growing faster than worker can drain)
 

@@ -157,9 +157,9 @@ type MockStore struct {
 	blockHasReferencesHook         func(orgID uuid.UUID, blockID string, current bool) (bool, error)
 
 	// optional test hooks for reproducing concurrency windows deterministically.
-	getQueueSizeHook      func(orgID uuid.UUID, size int)
-	removeActiveOrgHook   func(orgID uuid.UUID, activeBefore time.Time)
-	recountQueueDepthHook func(orgID uuid.UUID, depth int)
+	getQueueSizeHook    func(orgID uuid.UUID, size int)
+	removeActiveOrgHook func(orgID uuid.UUID, activeBefore time.Time)
+	readQueueDepthHook  func(orgID uuid.UUID, depth int)
 	// requeueItemErr, when non-nil, forces RequeueItem to return this error
 	// without mutating state. Used to exercise IncrementRetry failure paths
 	// where the LoggedBatch never applied.
@@ -1171,15 +1171,21 @@ func (m *MockStore) FailItem(item QueueItem, failedAt time.Time, lastError, fail
 	defer m.mu.Unlock()
 
 	items := m.queue[item.OrgID]
+	found := false
 	for i, existing := range items {
 		if existing.QueuedAt.Equal(item.QueuedAt) && existing.ItemType == item.ItemType && existing.ItemID == item.ItemID {
 			m.queue[item.OrgID] = append(items[:i], items[i+1:]...)
+			found = true
 			break
 		}
+	}
+	if !found {
+		return nil
 	}
 	m.failedItems[item.OrgID] = append(m.failedItems[item.OrgID], GCFailedItemInfo{
 		OrgID:                       item.OrgID,
 		FailedAt:                    failedAt,
+		ExpiresAt:                   failedAt.Add(gcFailedItemRetention),
 		QueuedAt:                    item.QueuedAt,
 		IdentityAt:                  effectiveIdentityAt(item.QueuedAt, item.IdentityAt),
 		RequiresLibraryDeletedCheck: item.RequiresLibraryDeletedCheck,
@@ -1246,6 +1252,41 @@ func (m *MockStore) ListFailedItems(orgID uuid.UUID, limit int) ([]GCFailedItemI
 	if limit > 0 && len(result) > limit {
 		result = result[:limit]
 	}
+	return result, nil
+}
+
+func (m *MockStore) ListFailedItemExpiriesByDay(day time.Time, bucket int) ([]GCFailedItemExpiryInfo, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	projectionDay := db.GCProjectionUTCDate(day)
+	result := make([]GCFailedItemExpiryInfo, 0)
+	for orgID, items := range m.failedItems {
+		for _, item := range items {
+			expiresAt := item.ExpiresAt
+			if expiresAt.IsZero() {
+				expiresAt = item.FailedAt.Add(gcFailedItemRetention)
+			}
+			if !db.GCProjectionUTCDate(expiresAt).Equal(projectionDay) {
+				continue
+			}
+			if db.GCDiscoveryBucket(orgID.String(), string(item.ItemType), item.ItemID, item.FailedAt.UTC().Format(time.RFC3339Nano)) != bucket {
+				continue
+			}
+			result = append(result, GCFailedItemExpiryInfo{
+				OrgID:     orgID,
+				FailedAt:  item.FailedAt,
+				ExpiresAt: expiresAt,
+				ItemType:  item.ItemType,
+				ItemID:    item.ItemID,
+			})
+		}
+	}
+	sort.Slice(result, func(i, j int) bool {
+		if !result[i].ExpiresAt.Equal(result[j].ExpiresAt) {
+			return result[i].ExpiresAt.Before(result[j].ExpiresAt)
+		}
+		return result[i].ItemID < result[j].ItemID
+	})
 	return result, nil
 }
 
@@ -1317,6 +1358,28 @@ func (m *MockStore) DeleteFailedItem(orgID uuid.UUID, failedAt time.Time, itemTy
 		}
 	}
 	return nil
+}
+
+func (m *MockStore) DeleteExpiredFailedItem(expiry GCFailedItemExpiryInfo, now time.Time) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	items := m.failedItems[expiry.OrgID]
+	for i, item := range items {
+		if item.FailedAt.Equal(expiry.FailedAt) && item.ItemType == expiry.ItemType && item.ItemID == expiry.ItemID {
+			expiresAt := item.ExpiresAt
+			if expiresAt.IsZero() {
+				expiresAt = item.FailedAt.Add(gcFailedItemRetention)
+			}
+			if expiresAt.After(now.UTC()) {
+				return false, nil
+			}
+			m.failedItems[expiry.OrgID] = append(items[:i], items[i+1:]...)
+			m.deletePendingItem(expiry.OrgID, item.LibraryID, item.ItemType, item.ItemID, effectiveIdentityAt(item.QueuedAt, item.IdentityAt))
+			m.dirtyQueueOrgs[expiry.OrgID] = time.Now().UTC()
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func (m *MockStore) RequeueFailedItem(orgID uuid.UUID, failedAt time.Time, itemType ItemType, itemID string, queuedAt time.Time) error {
@@ -1461,10 +1524,10 @@ func (m *MockStore) SaveOrgQueueStats(stats GCOrgStats) error {
 	return nil
 }
 
-func (m *MockStore) RecountOrgQueueDepth(orgID uuid.UUID) (int, error) {
+func (m *MockStore) ReadOrgQueueDepth(orgID uuid.UUID) (int, error) {
 	m.mu.RLock()
 	depth := len(m.queue[orgID])
-	hook := m.recountQueueDepthHook
+	hook := m.readQueueDepthHook
 	m.mu.RUnlock()
 	if hook != nil {
 		hook(orgID, depth)
@@ -1472,7 +1535,7 @@ func (m *MockStore) RecountOrgQueueDepth(orgID uuid.UUID) (int, error) {
 	return depth, nil
 }
 
-func (m *MockStore) RecountOrgFailedDepth(orgID uuid.UUID) (int, error) {
+func (m *MockStore) ReadOrgFailedDepth(orgID uuid.UUID) (int, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return len(m.failedItems[orgID]), nil
@@ -2039,6 +2102,10 @@ func (m *MockStore) ListFSObjectIDsForLibrary(libraryID uuid.UUID) ([]string, er
 		}
 	}
 	return ids, nil
+}
+
+func (m *MockStore) ReconcilePendingQueueCounters(limit int) (int, error) {
+	return 0, nil
 }
 
 func (m *MockStore) ReconcilePendingStorageCounters() (int, error) {
