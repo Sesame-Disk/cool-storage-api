@@ -764,6 +764,24 @@ func (s *Service) reconcileDirtyQueueStats(limit int) {
 			}
 			oldestQueuedAt := prevStats.OldestQueuedAt
 			if queueDepth == 0 {
+				liveOldestQueuedAt, err := s.store.GetOldestQueuedAt(dirtyOrg.OrgID)
+				if err != nil {
+					log.Printf("[GC] Failed to probe live queue rows for %s before drain decision: %v", dirtyOrg.OrgID, err)
+					continue
+				}
+				if liveOldestQueuedAt != nil {
+					log.Printf("[GC] Queue counter false-zero detected for %s; preserving active state and requesting repair", dirtyOrg.OrgID)
+					if err := s.store.RequestQueueCounterReconciliation(dirtyOrg.OrgID, "reconcile_false_zero"); err != nil {
+						log.Printf("[GC] Failed to request queue counter repair for %s after false-zero: %v", dirtyOrg.OrgID, err)
+					}
+					if err := s.store.MarkOrgActive(dirtyOrg.OrgID, snapshotAt); err != nil {
+						log.Printf("[GC] Failed to preserve active org %s after false-zero: %v", dirtyOrg.OrgID, err)
+					}
+					if err := s.store.MarkOrgDirty(dirtyOrg.OrgID, snapshotAt); err != nil {
+						log.Printf("[GC] Failed to keep org %s dirty after false-zero: %v", dirtyOrg.OrgID, err)
+					}
+					continue
+				}
 				oldestQueuedAt = nil
 			}
 

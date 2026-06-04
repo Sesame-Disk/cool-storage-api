@@ -27,6 +27,72 @@ func TestNewScanner(t *testing.T) {
 	}
 }
 
+func TestScanner_LoadBlockCandidatesStartDay_ColdStartUsesInitialLookback(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	s := NewScanner(store, q, stats, config.GCConfig{})
+
+	cutoffDay := time.Date(2026, 6, 4, 0, 0, 0, 0, time.UTC)
+	startDay, err := s.loadBlockCandidatesStartDay(cutoffDay)
+	if err != nil {
+		t.Fatalf("loadBlockCandidatesStartDay failed: %v", err)
+	}
+
+	want := cutoffDay.AddDate(0, 0, -gcInitialScanLookbackDays)
+	if !startDay.Equal(want) {
+		t.Fatalf("loadBlockCandidatesStartDay = %s, want %s", startDay.Format(time.RFC3339), want.Format(time.RFC3339))
+	}
+}
+
+func TestScanner_LoadFailedItemsExpiryStartDay_ColdStartUsesFailedItemLookback(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	s := NewScanner(store, q, stats, config.GCConfig{})
+
+	cutoffDay := time.Date(2026, 6, 4, 0, 0, 0, 0, time.UTC)
+	startDay, err := s.loadFailedItemsExpiryStartDay(cutoffDay)
+	if err != nil {
+		t.Fatalf("loadFailedItemsExpiryStartDay failed: %v", err)
+	}
+
+	want := cutoffDay.AddDate(0, 0, -gcFailedItemExpiryInitialLookbackDays)
+	if !startDay.Equal(want) {
+		t.Fatalf("loadFailedItemsExpiryStartDay = %s, want %s", startDay.Format(time.RFC3339), want.Format(time.RFC3339))
+	}
+}
+
+func TestScanner_ScanQueueCounterReconciliation_ReactivatesOrgWithLiveQueue(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	s := NewScanner(store, q, stats, config.GCConfig{})
+
+	orgID := uuid.New()
+	queuedAt := time.Now().UTC().Add(-2 * time.Hour)
+	if err := store.EnqueueItem(orgID, queuedAt, ItemBlock, "block-repair", uuid.Nil, "hot", 0); err != nil {
+		t.Fatalf("enqueue failed: %v", err)
+	}
+	delete(store.activeQueueOrgs, orgID)
+	if err := store.RequestQueueCounterReconciliation(orgID, "test_repair"); err != nil {
+		t.Fatalf("RequestQueueCounterReconciliation failed: %v", err)
+	}
+
+	if n, err := s.scanQueueCounterReconciliation(context.Background()); err != nil || n != 0 {
+		t.Fatalf("scanQueueCounterReconciliation = (%d, %v), want (0, nil)", n, err)
+	}
+	if _, ok := store.activeQueueOrgs[orgID]; !ok {
+		t.Fatal("expected queue counter repair to reactivate org with live queue")
+	}
+	if _, ok := store.dirtyQueueOrgs[orgID]; !ok {
+		t.Fatal("expected queue counter repair to leave org dirty for snapshot refresh")
+	}
+	if _, ok := store.queueCounterReconciliations[orgID]; ok {
+		t.Fatal("expected queue counter repair request to be cleared")
+	}
+}
+
 func TestScanner_ScanOnce_ExpiredProvisionalRefEnqueuesZeroRefBlock(t *testing.T) {
 	store := NewMockStore()
 	stats := &Stats{}

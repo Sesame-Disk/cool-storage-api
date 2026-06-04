@@ -125,6 +125,8 @@ type MockStore struct {
 
 	// gc_stats keyed by stat_key
 	gcStats map[string]string
+	// pending GC queue counter repairs keyed by orgID.
+	queueCounterReconciliations map[uuid.UUID]mockQueueCounterRepairRequest
 
 	// test hooks for scanner and worker failure paths.
 	enqueueBatchErr                error
@@ -160,6 +162,7 @@ type MockStore struct {
 	getQueueSizeHook    func(orgID uuid.UUID, size int)
 	removeActiveOrgHook func(orgID uuid.UUID, activeBefore time.Time)
 	readQueueDepthHook  func(orgID uuid.UUID, depth int)
+	forcedQueueDepth    map[uuid.UUID]int
 	// requeueItemErr, when non-nil, forces RequeueItem to return this error
 	// without mutating state. Used to exercise IncrementRetry failure paths
 	// where the LoggedBatch never applied.
@@ -344,6 +347,12 @@ type mockStorageCounterReconciliation struct {
 	RequestedAt time.Time
 }
 
+type mockQueueCounterRepairRequest struct {
+	OrgID       uuid.UUID
+	Reason      string
+	RequestedAt time.Time
+}
+
 type mockHardDeleteLock struct {
 	LeaseToken uuid.UUID
 	StartedAt  time.Time
@@ -403,6 +412,8 @@ func NewMockStore() *MockStore {
 		starredFiles:                         make(map[uuid.UUID]bool),
 		monitoredRepos:                       make(map[uuid.UUID]bool),
 		gcStats:                              make(map[string]string),
+		queueCounterReconciliations:          make(map[uuid.UUID]mockQueueCounterRepairRequest),
+		forcedQueueDepth:                     make(map[uuid.UUID]int),
 		organizations:                        nil,
 		s3Orphans:                            make(map[string]*S3OrphanInfo),
 		s3OrphanProjections:                  make(map[mockS3OrphanProjectionKey]S3OrphanInfo),
@@ -1379,6 +1390,12 @@ func (m *MockStore) DeleteExpiredFailedItem(expiry GCFailedItemExpiryInfo, now t
 			return true, nil
 		}
 	}
+	m.queueCounterReconciliations[expiry.OrgID] = mockQueueCounterRepairRequest{
+		OrgID:       expiry.OrgID,
+		Reason:      "failed_expiry_projection_orphaned",
+		RequestedAt: time.Now().UTC(),
+	}
+	m.dirtyQueueOrgs[expiry.OrgID] = time.Now().UTC()
 	return false, nil
 }
 
@@ -1527,6 +1544,9 @@ func (m *MockStore) SaveOrgQueueStats(stats GCOrgStats) error {
 func (m *MockStore) ReadOrgQueueDepth(orgID uuid.UUID) (int, error) {
 	m.mu.RLock()
 	depth := len(m.queue[orgID])
+	if forcedDepth, ok := m.forcedQueueDepth[orgID]; ok {
+		depth = forcedDepth
+	}
 	hook := m.readQueueDepthHook
 	m.mu.RUnlock()
 	if hook != nil {
@@ -1539,6 +1559,17 @@ func (m *MockStore) ReadOrgFailedDepth(orgID uuid.UUID) (int, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return len(m.failedItems[orgID]), nil
+}
+
+func (m *MockStore) RequestQueueCounterReconciliation(orgID uuid.UUID, reason string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.queueCounterReconciliations[orgID] = mockQueueCounterRepairRequest{
+		OrgID:       orgID,
+		Reason:      reason,
+		RequestedAt: time.Now().UTC(),
+	}
+	return nil
 }
 
 func (m *MockStore) GetOldestQueuedAt(orgID uuid.UUID) (*time.Time, error) {
@@ -2105,7 +2136,33 @@ func (m *MockStore) ListFSObjectIDsForLibrary(libraryID uuid.UUID) ([]string, er
 }
 
 func (m *MockStore) ReconcilePendingQueueCounters(limit int) (int, error) {
-	return 0, nil
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if len(m.queueCounterReconciliations) == 0 {
+		return 0, nil
+	}
+
+	orgIDs := make([]uuid.UUID, 0, len(m.queueCounterReconciliations))
+	for orgID := range m.queueCounterReconciliations {
+		orgIDs = append(orgIDs, orgID)
+	}
+	sort.Slice(orgIDs, func(i, j int) bool {
+		return strings.Compare(orgIDs[i].String(), orgIDs[j].String()) < 0
+	})
+	if limit > 0 && len(orgIDs) > limit {
+		orgIDs = orgIDs[:limit]
+	}
+
+	now := time.Now().UTC()
+	for _, orgID := range orgIDs {
+		if len(m.queue[orgID]) > 0 {
+			m.activeQueueOrgs[orgID] = now
+		}
+		m.dirtyQueueOrgs[orgID] = now
+		delete(m.queueCounterReconciliations, orgID)
+	}
+	return len(orgIDs), nil
 }
 
 func (m *MockStore) ReconcilePendingStorageCounters() (int, error) {

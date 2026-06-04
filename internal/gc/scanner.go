@@ -439,7 +439,7 @@ func (s *Scanner) loadBlockCandidatesStartDay(cutoffDay time.Time) (time.Time, e
 	value, err := s.store.LoadGCStats(gcBlockCandidatesCursorKey)
 	if err != nil {
 		if errors.Is(err, gocql.ErrNotFound) {
-			return cutoffDay.AddDate(0, 0, -gcFailedItemExpiryInitialLookbackDays), nil
+			return cutoffDay.AddDate(0, 0, -gcInitialScanLookbackDays), nil
 		}
 		return time.Time{}, err
 	}
@@ -469,7 +469,7 @@ func (s *Scanner) loadFailedItemsExpiryStartDay(cutoffDay time.Time) (time.Time,
 	value, err := s.store.LoadGCStats(gcFailedItemsExpiryCursorKey)
 	if err != nil {
 		if errors.Is(err, gocql.ErrNotFound) {
-			return cutoffDay.AddDate(0, 0, -gcInitialScanLookbackDays), nil
+			return cutoffDay.AddDate(0, 0, -gcFailedItemExpiryInitialLookbackDays), nil
 		}
 		return time.Time{}, err
 	}

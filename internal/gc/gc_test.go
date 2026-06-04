@@ -591,6 +591,47 @@ func TestService_ReconcileDirtyQueueStats_SerializesRuns(t *testing.T) {
 	}
 }
 
+func TestService_ReconcileDirtyQueueStats_FalseZeroDoesNotDrainActiveOrg(t *testing.T) {
+	store := NewMockStore()
+	orgID := uuid.New()
+	queuedAt := time.Now().UTC().Add(-2 * time.Hour)
+	store.activeQueueOrgs[orgID] = queuedAt
+	store.dirtyQueueOrgs[orgID] = queuedAt
+	store.queue[orgID] = []QueueItem{{
+		OrgID:        orgID,
+		QueuedAt:     queuedAt,
+		IdentityAt:   queuedAt,
+		ItemType:     ItemBlock,
+		ItemID:       "block-false-zero",
+		LibraryID:    uuid.Nil,
+		StorageClass: "hot",
+	}}
+	store.orgQueueStats[orgID] = GCOrgStats{
+		OrgID:          orgID,
+		QueueDepth:     1,
+		OldestQueuedAt: &queuedAt,
+		UpdatedAt:      queuedAt,
+	}
+	store.forcedQueueDepth[orgID] = 0
+
+	svc := &Service{store: store, config: config.GCConfig{Enabled: true}}
+	svc.reconcileDirtyQueueStats(1)
+
+	if _, ok := store.activeQueueOrgs[orgID]; !ok {
+		t.Fatal("expected false-zero reconcile to preserve active org")
+	}
+	if _, ok := store.dirtyQueueOrgs[orgID]; !ok {
+		t.Fatal("expected false-zero reconcile to keep org dirty")
+	}
+	if _, ok := store.queueCounterReconciliations[orgID]; !ok {
+		t.Fatal("expected false-zero reconcile to request queue counter repair")
+	}
+	stats := store.orgQueueStats[orgID]
+	if stats.QueueDepth != 1 {
+		t.Fatalf("expected false-zero reconcile to leave prior queue stats intact, got %d", stats.QueueDepth)
+	}
+}
+
 func TestService_RunWorkerOnce_RecoversQueuedOrgsFromSnapshotWhenActiveSetIsMissing(t *testing.T) {
 	store := NewMockStore()
 	store.useActiveQueueOrgsForListing = true

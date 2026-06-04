@@ -246,7 +246,7 @@ func (s *CassandraStore) recordQueueCounterDelta(orgID uuid.UUID, bucket int, qu
 		}
 		metrics.GCQueueCounterUpdateFailuresTotal.WithLabelValues(counter).Inc()
 		log.Printf("[GC] WARNING: failed to update queue-depth counter org=%s bucket=%d queue_delta=%d failed_delta=%d: %v", orgID, bucket, queueDelta, failedDelta, err)
-		if repairErr := s.requestQueueCounterReconciliation(orgID, "counter_update_failed"); repairErr != nil {
+		if repairErr := s.RequestQueueCounterReconciliation(orgID, "counter_update_failed"); repairErr != nil {
 			log.Printf("[GC] WARNING: failed to request queue counter repair org=%s: %v", orgID, repairErr)
 		}
 		if markErr := s.MarkOrgDirty(orgID, time.Now().UTC()); markErr != nil {
@@ -319,6 +319,10 @@ func (s *CassandraStore) requestQueueCounterReconciliation(orgID uuid.UUID, reas
 		INSERT INTO gc_queue_counter_reconciliation (bucket, org_id, requested_at, reason)
 		VALUES (?, ?, ?, ?)
 	`, gcOrgBucket(orgID), orgID.String(), time.Now().UTC(), reason).Exec()
+}
+
+func (s *CassandraStore) RequestQueueCounterReconciliation(orgID uuid.UUID, reason string) error {
+	return s.requestQueueCounterReconciliation(orgID, reason)
 }
 
 // --- Queue operations ---
@@ -836,6 +840,12 @@ func (s *CassandraStore) DeleteExpiredFailedItem(expiry GCFailedItemExpiryInfo, 
 		`, db.GCProjectionUTCDate(expiry.ExpiresAt), db.GCDiscoveryBucket(expiry.OrgID.String(), string(expiry.ItemType), expiry.ItemID, expiry.FailedAt.UTC().Format(time.RFC3339Nano)), expiry.ExpiresAt.UTC(), expiry.OrgID.String(), expiry.FailedAt.UTC(), string(expiry.ItemType), expiry.ItemID).Exec(); err != nil {
 			return false, fmt.Errorf("delete orphaned failed-item expiry projection org=%s item=%s: %w", expiry.OrgID, expiry.ItemID, err)
 		}
+		if repairErr := s.RequestQueueCounterReconciliation(expiry.OrgID, "failed_expiry_projection_orphaned"); repairErr != nil {
+			log.Printf("[GC] WARNING: failed to request queue counter repair for orphaned failed-item expiry org=%s item=%s: %v", expiry.OrgID, expiry.ItemID, repairErr)
+		}
+		if markErr := s.MarkOrgDirty(expiry.OrgID, time.Now().UTC()); markErr != nil {
+			log.Printf("[GC] WARNING: failed to mark org dirty for orphaned failed-item expiry org=%s item=%s: %v", expiry.OrgID, expiry.ItemID, markErr)
+		}
 		return false, nil
 	}
 	if err != nil {
@@ -850,6 +860,12 @@ func (s *CassandraStore) DeleteExpiredFailedItem(expiry GCFailedItemExpiryInfo, 
 			WHERE expiry_day = ? AND bucket = ? AND expires_at = ? AND org_id = ? AND failed_at = ? AND item_type = ? AND item_id = ?
 		`, db.GCProjectionUTCDate(expiry.ExpiresAt), db.GCDiscoveryBucket(expiry.OrgID.String(), string(expiry.ItemType), expiry.ItemID, expiry.FailedAt.UTC().Format(time.RFC3339Nano)), expiry.ExpiresAt.UTC(), expiry.OrgID.String(), expiry.FailedAt.UTC(), string(expiry.ItemType), expiry.ItemID).Exec(); err != nil {
 			return false, fmt.Errorf("delete stale failed-item expiry projection org=%s item=%s: %w", expiry.OrgID, expiry.ItemID, err)
+		}
+		if repairErr := s.RequestQueueCounterReconciliation(expiry.OrgID, "failed_expiry_projection_stale"); repairErr != nil {
+			log.Printf("[GC] WARNING: failed to request queue counter repair for stale failed-item expiry org=%s item=%s: %v", expiry.OrgID, expiry.ItemID, repairErr)
+		}
+		if markErr := s.MarkOrgDirty(expiry.OrgID, time.Now().UTC()); markErr != nil {
+			log.Printf("[GC] WARNING: failed to mark org dirty for stale failed-item expiry org=%s item=%s: %v", expiry.OrgID, expiry.ItemID, markErr)
 		}
 		return false, nil
 	}
@@ -1019,7 +1035,10 @@ func (s *CassandraStore) reconcileQueueCounterRequest(request queueCounterRepair
 		return err
 	}
 
+	var totalQueue int64
+
 	for bucket := 0; bucket < gcDefaultQueueBucketCount; bucket++ {
+		totalQueue += queueDepths[bucket]
 		currentQueue, currentFailed, err := s.loadOrgQueueCounterBucket(request.OrgID, bucket)
 		if err != nil {
 			return fmt.Errorf("load queue counter org=%s bucket=%d: %w", request.OrgID, bucket, err)
@@ -1037,6 +1056,11 @@ func (s *CassandraStore) reconcileQueueCounterRequest(request queueCounterRepair
 
 	if err := s.MarkOrgDirty(request.OrgID, time.Now().UTC()); err != nil {
 		return fmt.Errorf("mark org dirty after queue counter repair org=%s: %w", request.OrgID, err)
+	}
+	if totalQueue > 0 {
+		if err := s.MarkOrgActive(request.OrgID, time.Now().UTC()); err != nil {
+			return fmt.Errorf("mark org active after queue counter repair org=%s: %w", request.OrgID, err)
+		}
 	}
 	if err := s.db.Session().Query(`
 		DELETE FROM gc_queue_counter_reconciliation

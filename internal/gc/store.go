@@ -48,6 +48,7 @@ type GCStore interface {
 	SaveOrgQueueStats(stats GCOrgStats) error
 	ReadOrgQueueDepth(orgID uuid.UUID) (int, error)
 	ReadOrgFailedDepth(orgID uuid.UUID) (int, error)
+	RequestQueueCounterReconciliation(orgID uuid.UUID, reason string) error
 	ReconcilePendingQueueCounters(limit int) (int, error)
 	GetOldestQueuedAt(orgID uuid.UUID) (*time.Time, error)
 	SumOrgQueueStats() (int, int, error)
