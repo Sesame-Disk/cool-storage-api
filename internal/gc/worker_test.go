@@ -283,6 +283,7 @@ func TestWorker_ProcessBlock_MissingCanonicalRowSkipsWithoutClaimOrDLQ(t *testin
 
 	orgID := uuid.New()
 	candidateAt := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
+	store.AddBlockMapping(orgID, "sha1-missing", "block-missing")
 	if _, err := store.EnsureBlockGCCandidate(orgID, "block-missing", "hot", candidateAt); err != nil {
 		t.Fatalf("EnsureBlockGCCandidate failed: %v", err)
 	}
@@ -303,6 +304,9 @@ func TestWorker_ProcessBlock_MissingCanonicalRowSkipsWithoutClaimOrDLQ(t *testin
 	if got := len(store.AllBlockGCCandidates()); got != 0 {
 		t.Fatalf("expected block candidate cleanup, got %d rows", got)
 	}
+	if mappings, _ := store.ListBlockMappingsByInternalID(orgID, "block-missing"); len(mappings) != 0 {
+		t.Fatalf("expected missing-row cleanup to remove mappings, got %d rows", len(mappings))
+	}
 	if got := len(store.FailedItems(orgID)); got != 0 {
 		t.Fatalf("expected no DLQ entries, got %d", got)
 	}
@@ -317,6 +321,7 @@ func TestWorker_ProcessBlock_StubRowAfterClaimIsCleanedWithoutDLQ(t *testing.T) 
 	orgID := uuid.New()
 	candidateAt := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Millisecond)
 	store.AddStubBlockForTest(orgID, "block-stub")
+	store.AddBlockMapping(orgID, "sha1-stub", "block-stub")
 	if _, err := store.EnsureBlockGCCandidate(orgID, "block-stub", "hot", candidateAt); err != nil {
 		t.Fatalf("EnsureBlockGCCandidate failed: %v", err)
 	}
@@ -336,6 +341,9 @@ func TestWorker_ProcessBlock_StubRowAfterClaimIsCleanedWithoutDLQ(t *testing.T) 
 	}
 	if got := len(store.AllBlockGCCandidates()); got != 0 {
 		t.Fatalf("expected block candidate cleanup, got %d rows", got)
+	}
+	if mappings, _ := store.ListBlockMappingsByInternalID(orgID, "block-stub"); len(mappings) != 0 {
+		t.Fatalf("expected stub cleanup to remove mappings, got %d rows", len(mappings))
 	}
 	if got := len(store.FailedItems(orgID)); got != 0 {
 		t.Fatalf("expected no DLQ entries, got %d", got)

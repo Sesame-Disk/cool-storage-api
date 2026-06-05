@@ -1721,8 +1721,7 @@ func (s *CassandraStore) ListBlockMappingsByInternalID(orgID uuid.UUID, internal
 		mappings = append(mappings, BlockMapping{ExternalID: extID, InternalID: intID})
 	}
 	if err := iter.Close(); err != nil {
-		// Log error but do NOT fallback to full org scan. Scanner will eventually clean this up.
-		return nil, nil
+		return nil, fmt.Errorf("list block mappings for org=%s internal_id=%s: %w", orgID, internalID, err)
 	}
 	return mappings, nil
 }
