@@ -209,13 +209,11 @@ the read executes, the count could be back at 1.
 So this is a false-positive enqueue (block enqueued for deletion but LWT skips it),
 not a data loss scenario. The cost is a wasted queue entry that gets cleaned up.
 
-### PARTIAL: Counter drift hot path removed; repair still required
+### RESOLVED: Hot exact recounts removed without Cassandra COUNTER
 
 **Status:** Hot `COUNT(*)` reads are removed from normal status/reconcile paths,
-the baseline now includes `gc_queue_counter_reconciliation`: queue/DLQ mutations
-write a per-org repair marker in the same logged batch, and the scanner
-recomputes queue/failed depths from canonical rows for
-production multi-node operation.
+and the baseline schema no longer depends on Cassandra `COUNTER` tables for
+GC queue/DLQ depth snapshots.
 
 **Original problem:** the `gc_queue_stats` Cassandra counter table was updated
 in a separate batch from queue mutations. Drift accumulated whenever (a) the
@@ -227,21 +225,21 @@ held 0 rows.
 
 **New design:**
 - `gc_queue_stats` is dropped. Snapshots live in `gc_stats` (per-key) and
-  `gc_org_stats` (per-org). The baseline schema also keeps approximate
-  per-org/per-bucket write-path counters in `gc_org_queue_counters` so status
-  reconciliation does not need hot `COUNT(*)` reads over `gc_queue` or
-  `gc_failed_items`.
+  `gc_org_stats` (per-org, with `recalculated_at` for throttling).
 - `gc_failed_items` no longer relies on Cassandra TTL. Failed items carry
   `expires_at` and are discovered through `gc_failed_items_by_expiry`; the
-  scanner deletes expired rows through the GC store so `failed_depth` counters
-  and `gc_pending_items` markers are decremented together.
-- Mutations write to `gc_dirty_orgs`. A serialized reconciler iterates dirty
-  orgs each worker/scanner tick, loads queue/DLQ depth from
-  `gc_org_queue_counters`, saves the per-org row, and applies the delta to the
-  global `gc_stats` totals.
+  scanner deletes expired rows through the GC store so DLQ rows and
+  `gc_pending_items` markers move together.
+- Mutations write only canonical rows plus `gc_active_orgs` / `gc_dirty_orgs`.
+  A serialized refresh pass exact-recalculates a limited dirty-org batch from
+  canonical `gc_queue` / `gc_failed_items` rows, saves the per-org snapshot,
+  and applies the delta to the global `gc_stats` totals.
+- Worker drain decisions do not trust snapshots destructively. The worker uses
+  `GetOldestQueuedAt` as the real confirmation before removing an org from
+  `gc_active_orgs`.
 - Every 10 reconciler passes a full `SUM(queue_depth) FROM gc_org_stats` runs
   as a snapshot safety net; mismatches overwrite the totals and bump
-  `gc_snapshot_drift_corrected_total`. This does not compare counters against
+  `gc_snapshot_drift_corrected_total`. This does not compare snapshots against
   live queue/DLQ rows.
 - Admin DLQ mutations require leadership and serialize through `dlqOpsMu` so
   the non-atomic `RequeueFailedItem` cannot duplicate queue rows under
@@ -249,7 +247,7 @@ held 0 rows.
 
 **New Prometheus metrics:** `gc_failed_items_total`, `gc_dirty_orgs_total`,
 `gc_snapshot_age_seconds`, `gc_snapshot_drift_corrected_total`,
-`gc_queue_counter_update_failures_total`, `gc_reconcile_duration_seconds`.
+`gc_reconcile_duration_seconds`.
 
 `/api/v2.1/admin/gc/status/` now exposes `queue_size`, `failed_items_total`,
 `dirty_orgs_total`, `snapshot_age_seconds` (-1 when no reconcile has run yet),

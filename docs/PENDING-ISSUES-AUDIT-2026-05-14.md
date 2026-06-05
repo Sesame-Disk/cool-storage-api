@@ -120,17 +120,17 @@ Evidence:
 
 Recommendation: either implement real batch move or return 501 for all batch moves until it is real. Returning false success is the dangerous part.
 
-### 5. GC queue exact recounts replaced by write-path counters
+### 5. GC queue exact recounts moved out of the hot path
 
-Resolved in the baseline schema hardening branch for the hot path. GC now has leadership, the hot/status/reconcile paths no longer exact-count every queue bucket, DLQ retention is explicit instead of Cassandra TTL-driven, and `gc_queue_counter_reconciliation` gives the scanner a durable counter-vs-row repair path.
+Resolved in the baseline schema hardening branch without Cassandra counters. GC now has leadership, the hot/status/reconcile paths no longer exact-count every queue bucket, DLQ retention is explicit instead of Cassandra TTL-driven, and exact queue/DLQ snapshot refresh happens from dirty-org markers plus `recalculated_at` throttling.
 
 Evidence:
-- `internal/gc/gc.go` reads queue and failed depths through the explicit counter-snapshot API backed by `gc_org_queue_counters`.
+- `internal/gc/gc.go` serves cheap snapshots from `gc_stats` / `gc_org_stats` and exact-recalculates dirty orgs off the write path.
 - `internal/gc/store_cassandra.go` no longer executes `SELECT COUNT(*) FROM gc_queue` or `SELECT COUNT(*) FROM gc_failed_items` in the GC status/reconcile path.
-- `internal/db/migrations/001_initial_schema.cql` defines `gc_org_queue_counters` with `(org_id, bucket)` partitions and `COUNTER` columns for queue and failed depth.
-- `internal/db/migrations/001_initial_schema.cql` keeps `gc_failed_items` durable and adds `gc_failed_items_by_expiry`; the scanner expires DLQ rows through the store so counters are decremented.
+- `internal/db/migrations/001_initial_schema.cql` keeps `gc_org_stats` as the per-org snapshot row and adds `recalculated_at`; there is no `gc_org_queue_counters` table in the baseline schema.
+- `internal/db/migrations/001_initial_schema.cql` keeps `gc_failed_items` durable and adds `gc_failed_items_by_expiry`; the scanner expires DLQ rows through the store.
 
-Recommendation: validate counter drift behavior and repair backlog drain under multi-instance/multinode load before treating snapshots as authoritative SLO inputs.
+Recommendation: validate dirty-org backlog drain and snapshot staleness under multi-instance/multinode load before treating snapshots as authoritative SLO inputs.
 
 ### 6. Public/upload-link resume semantics remain fragile
 

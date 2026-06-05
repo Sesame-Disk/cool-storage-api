@@ -145,8 +145,6 @@ func TestInitialSchemaContainsLookupNameAndStarredIndex(t *testing.T) {
 	assert.Contains(t, content, "CREATE TABLE IF NOT EXISTS gc_active_orgs")
 	assert.Contains(t, content, "CREATE TABLE IF NOT EXISTS gc_dirty_orgs")
 	assert.Contains(t, content, "CREATE TABLE IF NOT EXISTS gc_org_stats")
-	assert.Contains(t, content, "CREATE TABLE IF NOT EXISTS gc_org_queue_counters")
-	assert.Contains(t, content, "CREATE TABLE IF NOT EXISTS gc_queue_counter_reconciliation")
 	assert.Contains(t, content, "CREATE TABLE IF NOT EXISTS gc_failed_items")
 	assert.Contains(t, content, "CREATE TABLE IF NOT EXISTS gc_failed_items_by_expiry")
 	assert.Contains(t, content, "CREATE TABLE IF NOT EXISTS gc_pending_items")
@@ -155,8 +153,7 @@ func TestInitialSchemaContainsLookupNameAndStarredIndex(t *testing.T) {
 	assert.Contains(t, content, "CREATE TABLE IF NOT EXISTS gc_s3_orphans_by_day")
 	assert.Contains(t, content, "CREATE TABLE IF NOT EXISTS gc_leases")
 	assert.Contains(t, content, "gc_claim_id   TEXT")
-	assert.Contains(t, normalizedContent, "CREATE TABLE IF NOT EXISTS gc_org_queue_counters (\n    org_id       UUID,\n    bucket       INT,\n    queue_depth  COUNTER,\n    failed_depth COUNTER,\n    PRIMARY KEY ((org_id, bucket))\n);")
-	assert.Contains(t, normalizedContent, "CREATE TABLE IF NOT EXISTS gc_queue_counter_reconciliation (\n    bucket       INT,\n    org_id       UUID,\n    requested_at TIMESTAMP,\n    reason       TEXT,\n    PRIMARY KEY ((bucket), org_id)\n);")
+	assert.Contains(t, normalizedContent, "CREATE TABLE IF NOT EXISTS gc_org_stats (\n    org_id           UUID PRIMARY KEY,\n    queue_depth      INT,\n    failed_depth     INT,\n    oldest_queued_at TIMESTAMP,\n    updated_at       TIMESTAMP,\n    recalculated_at TIMESTAMP\n);")
 	assert.Contains(t, normalizedContent, "CREATE TABLE IF NOT EXISTS gc_failed_items_by_expiry (\n    expiry_day DATE,\n    bucket     INT,\n    expires_at TIMESTAMP,\n    org_id     UUID,\n    failed_at  TIMESTAMP,\n    item_type  TEXT,\n    item_id    TEXT,\n    PRIMARY KEY ((expiry_day, bucket), expires_at, org_id, failed_at, item_type, item_id)\n) WITH CLUSTERING ORDER BY (expires_at ASC, org_id ASC, failed_at ASC, item_type ASC, item_id ASC)\n  AND default_time_to_live = 0;")
 	assert.Contains(t, normalizedContent, "CREATE TABLE IF NOT EXISTS gc_pending_items (\n    org_id      UUID,\n    bucket      INT,\n    item_type   TEXT,\n    library_id  UUID,\n    item_id     TEXT,\n    identity_at TIMESTAMP,\n    PRIMARY KEY ((org_id, bucket), item_type, library_id, item_id, identity_at)\n) WITH default_time_to_live = 0;")
 	// `blocks` and related tables must use per-block partitioning to avoid

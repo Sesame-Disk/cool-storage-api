@@ -121,7 +121,6 @@ func (s *Scanner) ScanOnce(ctx context.Context) error {
 		{"expired_deleted_orgs", s.scanExpiredDeletedOrgs},
 		{"onlyoffice_pending_blocks", s.scanOnlyOfficePendingBlocks},
 		{"s3_orphan_recovery", s.scanS3OrphanRecovery},
-		{"queue_counter_reconciliation", s.scanQueueCounterReconciliation},
 	}
 
 	for _, phase := range phases {
@@ -158,25 +157,6 @@ func (s *Scanner) ScanOnce(ctx context.Context) error {
 		s.stats.SetLastScanSuccess(completedAt)
 	}
 	return scanErr
-}
-
-func (s *Scanner) scanQueueCounterReconciliation(ctx context.Context) (int, error) {
-	select {
-	case <-ctx.Done():
-		return 0, ctx.Err()
-	default:
-	}
-
-	const limit = 32
-	log.Println("[GC Scanner] Phase 17: Reconciling GC queue counters...")
-	reconciled, err := s.store.ReconcilePendingQueueCounters(limit)
-	if err != nil {
-		log.Printf("[GC Scanner] Phase 17: queue counter reconciliation error: %v", err)
-	}
-	log.Printf("[GC Scanner] Phase 17 complete: reconciled %d GC queue counter orgs", reconciled)
-	metrics.GCScannerLastPhaseRun.WithLabelValues("queue_counter_reconciliation").SetToCurrentTime()
-	recordScannerAction("queue_counter_reconciliation", "reconciled", reconciled)
-	return 0, err
 }
 
 func (s *Scanner) scanPendingStorageCounterReconciliation(ctx context.Context) (int, error) {

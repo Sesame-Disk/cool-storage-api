@@ -46,10 +46,7 @@ type GCStore interface {
 	ClearDirtyOrg(orgID uuid.UUID, dirtyBefore time.Time) error
 	GetOrgQueueStats(orgID uuid.UUID) (GCOrgStats, error)
 	SaveOrgQueueStats(stats GCOrgStats) error
-	ReadOrgQueueDepth(orgID uuid.UUID) (int, error)
-	ReadOrgFailedDepth(orgID uuid.UUID) (int, error)
-	RequestQueueCounterReconciliation(orgID uuid.UUID, reason string) error
-	ReconcilePendingQueueCounters(limit int) (int, error)
+	RecalculateOrgQueueStats(orgID uuid.UUID) (GCOrgStats, error)
 	GetOldestQueuedAt(orgID uuid.UUID) (*time.Time, error)
 	SumOrgQueueStats() (int, int, error)
 	GetUserDeletedAt(orgID, userID uuid.UUID) (*time.Time, error)
@@ -318,6 +315,7 @@ type GCOrgStats struct {
 	FailedDepth    int
 	OldestQueuedAt *time.Time
 	UpdatedAt      time.Time
+	RecalculatedAt time.Time
 }
 
 // GCFailedItemOrgInfo summarizes one organization with items in the GC DLQ.

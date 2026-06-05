@@ -1340,7 +1340,7 @@ The GC (worker + scanner) has no coordination mechanism between instances. If mu
 
 1. **DequeueBatch without locking**: `SELECT ... LIMIT ?` returns the same items to all instances. Both process the same items simultaneously.
 2. **Scanner without leader election**: Multiple scanners enqueue the same orphans as duplicates (the PK includes `queued_at = time.Now()`, so each INSERT creates a distinct row).
-3. **Snapshot drift** (substantially resolved): the original `gc_queue_stats` counter table was retired from the baseline schema. Queue/DLQ totals now live in `gc_stats` and are reconciled per dirty org by a serialized reconciler. Hot `COUNT(*)` reads are gone, DLQ expiry is explicit, and `gc_queue_counter_reconciliation` gives the scanner a durable counter-vs-row repair path before refreshed snapshots are trusted. See ARCHITECTURE.md / GC-SERVICE-ANALYSIS.md.
+3. **Snapshot drift** (substantially resolved): the original `gc_queue_stats` counter table was retired from the baseline schema. Queue/DLQ totals now live in `gc_stats` and `gc_org_stats`, dirty orgs are exact-recalculated from canonical rows off the write path, hot `COUNT(*)` reads are gone, and DLQ expiry is explicit. Snapshots remain approximate until the background/admin refresh runs. See ARCHITECTURE.md / GC-SERVICE-ANALYSIS.md.
 
 **Is there data loss?** No. Destructive operations are protected:
 - `DeleteBlock` uses a claim-then-verify delete fence: only one instance can win the claim, and the winner re-checks live `block_references` before touching S3
@@ -2705,10 +2705,10 @@ Even when the application query does not literally contain `ALLOW FILTERING`, Ca
 - Counter-backed status must stay explicitly approximate unless paired with a scrub/repair path: the retired counter design drifted because drift was structural, not incidental
 
 **Safe direction for a future fix:**
-1. Remove exact `gc_queue` recounts from the hot reconcile/status path - done in the baseline schema by loading `gc_org_queue_counters`.
-2. Maintain `queue_depth`/`failed_depth` counters on the write path where queue rows are inserted/deleted/moved - done for normal Cassandra GC store mutations.
+1. Remove exact `gc_queue` recounts from the hot reconcile/status path - done.
+2. Keep queue/DLQ writes focused on canonical rows plus dirty/active markers - done.
 3. Avoid invisible DLQ expiry - done by replacing Cassandra TTL with `gc_failed_items_by_expiry` and scanner-driven deletes.
-4. Keep a separate, infrequent scrub/reconciliation path to repair any counter drift explicitly - done in the baseline schema via `gc_queue_counter_reconciliation`.
+4. Keep exact recounts in background/admin refresh, throttled by snapshot recency - done.
 
 **Related worker note:**
 The worker behavior in `internal/gc/worker.go` that removes an org from `gc_active_orgs` when `len(items) < batchSize` should remain in place.
@@ -2716,8 +2716,7 @@ The worker behavior in `internal/gc/worker.go` that removes an org from `gc_acti
 That change addresses a different problem: stale active-org entries causing repeated empty dequeues. It does **not** introduce the `COUNT(*)` issue and remains safe because removal is guarded by the `last_enqueued_at` timestamp semantics.
 
 **Current recommendation:**
-- Treat the hot-path `COUNT(*)` removal and explicit DLQ expiry as implemented, then validate under multi-instance/multinode load
-- Monitor `gc_queue_counter_reconciliation` backlog and `gc_queue_counter_update_failures_total` before relying on counters as the only recovery mechanism
+- Treat the hot-path `COUNT(*)` removal and explicit DLQ expiry as implemented, then validate dirty-org backlog drain and snapshot staleness under multi-instance/multinode load
 - Do not revert the current worker short-batch active-set removal
 - Do not add new hot-path exact recounts over `gc_queue`
 
