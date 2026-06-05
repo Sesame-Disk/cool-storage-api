@@ -380,18 +380,6 @@ func addPendingItemBatchQuery(batch *gocql.Batch, orgID, libraryID uuid.UUID, it
 	`, orgID.String(), gcPendingItemBucket(orgID, libraryID, itemType, itemID), string(itemType), libraryID.String(), itemID, identityAt)
 }
 
-// addPendingItemBatchQueryWithTTL writes a pending marker with a per-row
-// backstop TTL. Used only for DLQ (failed-item) markers: the marker is normally
-// deleted explicitly when the failed item is resolved/expired, and the TTL only
-// guarantees it cannot suppress re-enqueue forever if that explicit delete never
-// runs (e.g. an extended scanner outage). Live queue markers stay TTL-less.
-func addPendingItemBatchQueryWithTTL(batch *gocql.Batch, orgID, libraryID uuid.UUID, itemType ItemType, itemID string, identityAt time.Time, ttlSeconds int) {
-	batch.Query(`
-		INSERT INTO gc_pending_items (org_id, bucket, item_type, library_id, item_id, identity_at)
-		VALUES (?, ?, ?, ?, ?, ?) USING TTL ?
-	`, orgID.String(), gcPendingItemBucket(orgID, libraryID, itemType, itemID), string(itemType), libraryID.String(), itemID, identityAt, ttlSeconds)
-}
-
 func addPendingItemDeleteBatchQuery(batch *gocql.Batch, orgID, libraryID uuid.UUID, itemType ItemType, itemID string, identityAt time.Time) {
 	batch.Query(`
 		DELETE FROM gc_pending_items
@@ -565,7 +553,7 @@ func (s *CassandraStore) FailItem(item QueueItem, failedAt time.Time, lastError,
 		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`, item.OrgID.String(), failedAt, expiresAt, item.QueuedAt, effectiveIdentity, item.RequiresLibraryDeletedCheck, string(item.ItemType), item.ItemID, libraryID.String(), item.StorageClass, item.RetryCount, lastError, failureCode, "open")
 	db.AddUpsertFailedItemExpiryQuery(batch, item.OrgID.String(), failedAt, string(item.ItemType), item.ItemID, expiresAt)
-	addPendingItemBatchQueryWithTTL(batch, item.OrgID, libraryID, item.ItemType, item.ItemID, effectiveIdentity, gcFailedItemBackstopTTLSeconds)
+	addPendingItemBatchQuery(batch, item.OrgID, libraryID, item.ItemType, item.ItemID, effectiveIdentity)
 	batch.Query(`
 		DELETE FROM gc_queue
 		WHERE org_id = ? AND bucket = ? AND queued_at = ? AND item_type = ? AND item_id = ?
@@ -729,18 +717,12 @@ func (s *CassandraStore) ListOrgsWithFailedItems(limit int) ([]GCFailedItemOrgIn
 	if err := iter.Close(); err != nil {
 		return nil, fmt.Errorf("list orgs with failed items: %w", err)
 	}
-	// Page selection uses only the cheap snapshot depth; the per-org name and
-	// last-failure reads below are bounded to the returned page.
-	sort.Slice(candidates, func(i, j int) bool {
-		if candidates[i].depth != candidates[j].depth {
-			return candidates[i].depth > candidates[j].depth
-		}
-		return candidates[i].orgID.String() < candidates[j].orgID.String()
-	})
-	if limit > 0 && len(candidates) > limit {
-		candidates = candidates[:limit]
-	}
-
+	// Hydrate every candidate before ordering: the top-N is by (failed_depth,
+	// most-recent failure), so last-failure must be known for all candidates
+	// before the limit is applied — truncating earlier would bias depth ties by
+	// org_id and could starve a recently-failing org from the auto-retry page.
+	// The per-org reads are bounded by the number of orgs that actually have DLQ
+	// items, which is small in practice.
 	orgs := make([]GCFailedItemOrgInfo, 0, len(candidates))
 	for _, candidate := range candidates {
 		orgName, err := s.GetOrgName(candidate.orgID)
@@ -770,6 +752,9 @@ func (s *CassandraStore) ListOrgsWithFailedItems(limit int) ([]GCFailedItemOrgIn
 		}
 		return orgs[i].OrgID.String() < orgs[j].OrgID.String()
 	})
+	if limit > 0 && len(orgs) > limit {
+		orgs = orgs[:limit]
+	}
 	return orgs, nil
 }
 

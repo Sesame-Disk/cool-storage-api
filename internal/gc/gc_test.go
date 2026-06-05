@@ -741,6 +741,44 @@ func TestService_ListFailedItemOrgs_SortsAndLimits(t *testing.T) {
 	}
 }
 
+// TestService_ListFailedItemOrgs_DepthTieBreaksByRecency locks the contract that
+// when two orgs tie on failed_depth, the more recently-failing org wins the
+// limited page. A naive implementation that truncates by org_id before knowing
+// the real last-failure time would starve a recently-failing org from both the
+// admin list and the auto-retry selection.
+func TestService_ListFailedItemOrgs_DepthTieBreaksByRecency(t *testing.T) {
+	store := NewMockStore()
+	orgOld := uuid.New()
+	orgNew := uuid.New()
+	store.AddOrganizationWithName(orgOld, "older")
+	store.AddOrganizationWithName(orgNew, "newer")
+	base := time.Now().UTC().Add(-3 * time.Hour)
+	if err := store.SaveOrgQueueStats(GCOrgStats{OrgID: orgOld, FailedDepth: 3}); err != nil {
+		t.Fatalf("SaveOrgQueueStats(orgOld): %v", err)
+	}
+	if err := store.SaveOrgQueueStats(GCOrgStats{OrgID: orgNew, FailedDepth: 3}); err != nil {
+		t.Fatalf("SaveOrgQueueStats(orgNew): %v", err)
+	}
+	store.failedItems[orgOld] = []GCFailedItemInfo{
+		{OrgID: orgOld, FailedAt: base.Add(1 * time.Minute), ItemType: ItemBlock, ItemID: "old-1"},
+	}
+	store.failedItems[orgNew] = []GCFailedItemInfo{
+		{OrgID: orgNew, FailedAt: base.Add(90 * time.Minute), ItemType: ItemBlock, ItemID: "new-1"},
+	}
+	svc := NewService(store, nil, config.GCConfig{Enabled: true}, nil)
+
+	orgs, err := svc.ListFailedItemOrgs(1)
+	if err != nil {
+		t.Fatalf("ListFailedItemOrgs(1): %v", err)
+	}
+	if len(orgs) != 1 {
+		t.Fatalf("len(orgs) = %d, want 1", len(orgs))
+	}
+	if orgs[0].OrgID != orgNew {
+		t.Fatalf("depth tie did not break by recency: got %s, want %s (more recent failure)", orgs[0].OrgID, orgNew)
+	}
+}
+
 func TestService_ListFailedItemOrgs_FiltersStaleSnapshotAndIncludesDirtyActualFailures(t *testing.T) {
 	store := NewMockStore()
 	staleOrg := uuid.New()

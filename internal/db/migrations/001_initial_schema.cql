@@ -1135,21 +1135,21 @@ CREATE TABLE IF NOT EXISTS gc_failed_items (
     resolved_at       TIMESTAMP,
     PRIMARY KEY ((org_id), failed_at, item_type, item_id)
 ) WITH CLUSTERING ORDER BY (failed_at DESC, item_type ASC, item_id ASC)
-  AND default_time_to_live = 3888000;
--- ^ 45-day backstop TTL. Primary cleanup is the scanner-driven explicit expiry
--- below (which deletes at failed_at + 30d AND marks the org dirty so the
--- snapshot reconciler refreshes failed_depth). The 45-day table TTL is only a
--- safety net: if the scanner is unavailable for far longer than normal, rows
--- still fall off instead of accumulating forever. It is deliberately longer
--- than the 30-day explicit retention so the dirty-marking path normally wins.
+  AND default_time_to_live = 0;
+-- ^ No table TTL on purpose. DLQ cleanup is the scanner-driven explicit expiry
+-- below: it deletes at failed_at + 30d, removes the projection and pending
+-- marker in the same batch, and marks the org dirty so the snapshot reconciler
+-- refreshes failed_depth. A silent Cassandra TTL would reap rows WITHOUT marking
+-- dirty (leaving failed_depth stale, since the drift check only sums snapshots)
+-- and would destroy diagnostic last_error/failure_code history. Unbounded growth
+-- during a prolonged scanner outage is handled operationally via scanner-health
+-- alerting (gc_scanner_last_phase_run_timestamp), not by an implicit TTL.
 
 -- Explicit expiry projection for DLQ rows. With the per-org snapshot model
 -- (gc_org_stats refreshed from canonical rows, no counters), the scanner walks
 -- this projection, revalidates the primary row, then deletes through the GC
 -- store so failed_depth and pending markers move together with the DLQ row and
--- the org is marked dirty for an exact refresh. The table TTL below is the same
--- 45-day backstop as gc_failed_items so a stalled scanner cannot leak the
--- projection past the canonical row.
+-- the org is marked dirty for an exact refresh.
 CREATE TABLE IF NOT EXISTS gc_failed_items_by_expiry (
     expiry_day DATE,
     bucket     INT,
@@ -1160,7 +1160,7 @@ CREATE TABLE IF NOT EXISTS gc_failed_items_by_expiry (
     item_id    TEXT,
     PRIMARY KEY ((expiry_day, bucket), expires_at, org_id, failed_at, item_type, item_id)
 ) WITH CLUSTERING ORDER BY (expires_at ASC, org_id ASC, failed_at ASC, item_type ASC, item_id ASC)
-  AND default_time_to_live = 3888000;
+  AND default_time_to_live = 0;
 
 -- Live queue and DLQ markers persist until the queue/DLQ row is resolved.
 -- Failed-item retention is enforced explicitly by gc_failed_items_by_expiry so

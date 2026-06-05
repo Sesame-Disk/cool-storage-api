@@ -11,14 +11,6 @@ const gcFailedItemRetentionSeconds = 30 * 24 * 60 * 60
 
 var gcFailedItemRetention = time.Duration(gcFailedItemRetentionSeconds) * time.Second
 
-// gcFailedItemBackstopTTLSeconds is a safety-net Cassandra TTL applied to DLQ
-// rows, their expiry projection, and their pending markers. It is deliberately
-// longer than gcFailedItemRetention so the scanner-driven explicit expiry
-// (which marks the org dirty so failed_depth refreshes) stays the primary
-// cleanup path; the TTL only reaps rows if the scanner is unavailable for far
-// longer than normal, preventing unbounded growth without masking drift.
-const gcFailedItemBackstopTTLSeconds = 45 * 24 * 60 * 60
-
 const (
 	GCFailureCodeNone                        = ""
 	GCFailureCodeLibraryHardDeleteInProgress = "library_hard_delete_in_progress"

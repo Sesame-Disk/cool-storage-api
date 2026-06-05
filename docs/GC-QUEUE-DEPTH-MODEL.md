@@ -69,22 +69,46 @@ known-stale work left). When work was deferred, the gauge is set to the real age
 (`now - last_reconcile_run`). This is stricter than "recalculated > 0": an idle
 pass with nothing dirty correctly counts as fresh.
 
-### DLQ retention TTL restored as a backstop (FIXED)
+### DLQ cleanup stays explicit-only — no Cassandra TTL (decided)
 
-`feat/gc-remove-counters` had dropped the `gc_failed_items` table TTL (the
-original justification — "TTL expiry would not decrement the counter" — died
-with the counters). But the per-reconcile `refreshFailedItemSnapshotLocked` poll
-that used to catch TTL-expired failed items was also removed; the event-driven
-`gc_failed_items_by_expiry` projection replaced it. So pure-TTL would leave
-`failed_depth` stale, and *no* TTL risks unbounded growth if the scanner stalls.
+`feat/gc-remove-counters` dropped the `gc_failed_items` table TTL and the
+per-reconcile `refreshFailedItemSnapshotLocked` poll, replacing both with the
+event-driven `gc_failed_items_by_expiry` projection (scanner deletes at
+`failed_at + 30d`, in one batch with the projection + pending marker, and marks
+the org dirty so `failed_depth` refreshes).
 
-**Decision: keep the event-driven explicit expiry as primary, add a TTL
-backstop.** A **45-day** `default_time_to_live` now sits on `gc_failed_items` and
-`gc_failed_items_by_expiry`, and failed-item pending markers are written with a
-45-day per-row TTL (`addPendingItemBatchQueryWithTTL`). 45d > the 30d explicit
-retention, so the scanner-driven expiry (which marks the org dirty → exact
-refresh) wins normally and the TTL only reaps rows if the scanner is down far
-longer than usual. A TTL reap self-heals in the snapshot on the next recompute.
+A 45-day table-TTL "backstop" was briefly added and then **reverted** after
+review. Reasons it is the wrong tool here:
+
+- A Cassandra TTL reaps rows **without** marking the org dirty. The drift check
+  only *sums* `gc_org_stats` snapshots, so it cannot self-heal a reaped count —
+  `failed_depth` would stay stale until the org is dirtied again or an admin
+  view forces a refresh.
+- It would silently destroy diagnostic `last_error` / `failure_code` history.
+- It reintroduces implicit cleanup into a deliberately explicit-expiry design,
+  and in healthy operation the explicit path always deletes at 30d first, so the
+  45-day TTL never fires anyway (pure dead weight that only "helps" during a
+  multi-week scanner outage — exactly when stale counts are the least concern).
+
+**Backstop against unbounded growth during a prolonged scanner outage is
+operational**, via the existing `gc_scanner_last_phase_run_timestamp` lag alert,
+not an implicit TTL. So `gc_failed_items`, `gc_failed_items_by_expiry`, and the
+failed-item pending markers all stay `TTL = 0`.
+
+### `ListOrgsWithFailedItems` top-N now ordered before truncation (FIXED)
+
+The first cut of the [`updated_at` fix] truncated candidates to `limit` ordered
+by `(failed_depth, org_id)` *before* reading each org's real last-failure time,
+then sorted the page. On `failed_depth` ties at the limit boundary the selection
+was biased by `org_id`, not recency — wrong for the admin list and, more
+importantly, for `retryAutoRecoverableFailedItems` (`gc.go`), which lists with a
+limit, so a recently-failing org could be starved from auto-retry. Fixed by
+hydrating last-failure for all candidates (bounded by the small number of orgs
+with DLQ items), sorting by `(failed_depth desc, last_failure desc, org_id)`,
+then truncating. `MockStore` already ordered-then-limited, so prod now matches
+the mock; a service-level contract test
+(`TestService_ListFailedItemOrgs_DepthTieBreaksByRecency`) locks the tie-break.
+Exact `CassandraStore` parity still needs an integration test (real Cassandra).
 
 ### P2 (contract) — `updated_at` in `/admin/gc/failed-items/orgs/` (FIXED)
 
