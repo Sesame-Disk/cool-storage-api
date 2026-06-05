@@ -1113,12 +1113,14 @@ CREATE TABLE IF NOT EXISTS gc_org_stats (
     queue_depth      INT,
     failed_depth     INT,
     oldest_queued_at TIMESTAMP,
-    updated_at       TIMESTAMP
+    updated_at       TIMESTAMP,
+    recalculated_at TIMESTAMP
 );
 
 CREATE TABLE IF NOT EXISTS gc_failed_items (
     org_id            UUID,
     failed_at         TIMESTAMP,
+    expires_at        TIMESTAMP,
     queued_at         TIMESTAMP,
     identity_at       TIMESTAMP,
     requires_library_deleted_check BOOLEAN,
@@ -1133,17 +1135,44 @@ CREATE TABLE IF NOT EXISTS gc_failed_items (
     resolved_at       TIMESTAMP,
     PRIMARY KEY ((org_id), failed_at, item_type, item_id)
 ) WITH CLUSTERING ORDER BY (failed_at DESC, item_type ASC, item_id ASC)
-  AND default_time_to_live = 2592000;
+  AND default_time_to_live = 0;
+-- ^ No table TTL on purpose. DLQ cleanup is the scanner-driven explicit expiry
+-- below: it deletes at failed_at + 30d, removes the projection and pending
+-- marker in the same batch, and marks the org dirty so the snapshot reconciler
+-- refreshes failed_depth. A silent Cassandra TTL would reap rows WITHOUT marking
+-- dirty (leaving failed_depth stale, since the drift check only sums snapshots)
+-- and would destroy diagnostic last_error/failure_code history. Unbounded growth
+-- during a prolonged scanner outage is handled operationally via scanner-health
+-- alerting (gc_scanner_last_phase_run_timestamp), not by an implicit TTL.
 
--- Live queue markers persist until the queue row is resolved. Pending markers
--- mirrored from gc_failed_items use a per-row TTL in code aligned with DLQ retention.
+-- Explicit expiry projection for DLQ rows. With the per-org snapshot model
+-- (gc_org_stats refreshed from canonical rows, no counters), the scanner walks
+-- this projection, revalidates the primary row, then deletes through the GC
+-- store so failed_depth and pending markers move together with the DLQ row and
+-- the org is marked dirty for an exact refresh.
+CREATE TABLE IF NOT EXISTS gc_failed_items_by_expiry (
+    expiry_day DATE,
+    bucket     INT,
+    expires_at TIMESTAMP,
+    org_id     UUID,
+    failed_at  TIMESTAMP,
+    item_type  TEXT,
+    item_id    TEXT,
+    PRIMARY KEY ((expiry_day, bucket), expires_at, org_id, failed_at, item_type, item_id)
+) WITH CLUSTERING ORDER BY (expires_at ASC, org_id ASC, failed_at ASC, item_type ASC, item_id ASC)
+  AND default_time_to_live = 0;
+
+-- Live queue and DLQ markers persist until the queue/DLQ row is resolved.
+-- Failed-item retention is enforced explicitly by gc_failed_items_by_expiry so
+-- pending markers cannot expire before the failed row that suppresses retries.
 CREATE TABLE IF NOT EXISTS gc_pending_items (
     org_id      UUID,
+    bucket      INT,
     item_type   TEXT,
     library_id  UUID,
     item_id     TEXT,
     identity_at TIMESTAMP,
-    PRIMARY KEY ((org_id), item_type, library_id, item_id, identity_at)
+    PRIMARY KEY ((org_id, bucket), item_type, library_id, item_id, identity_at)
 ) WITH default_time_to_live = 0;
 
 -- Metadata/checkpoint table for GC snapshots, scanner cursors, and projection

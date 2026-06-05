@@ -7,9 +7,9 @@ import (
 	"github.com/google/uuid"
 )
 
-const gcFailedItemRetentionTTLSeconds = 30 * 24 * 60 * 60
+const gcFailedItemRetentionSeconds = 30 * 24 * 60 * 60
 
-var gcFailedItemRetention = time.Duration(gcFailedItemRetentionTTLSeconds) * time.Second
+var gcFailedItemRetention = time.Duration(gcFailedItemRetentionSeconds) * time.Second
 
 const (
 	GCFailureCodeNone                        = ""
@@ -35,7 +35,9 @@ type GCStore interface {
 	ListOrgsWithQueuedSnapshots(limit int) ([]uuid.UUID, error)
 	ListOrgsWithFailedItems(limit int) ([]GCFailedItemOrgInfo, error)
 	ListFailedItems(orgID uuid.UUID, limit int) ([]GCFailedItemInfo, error)
+	ListFailedItemExpiriesByDay(day time.Time, bucket int) ([]GCFailedItemExpiryInfo, error)
 	DeleteFailedItem(orgID uuid.UUID, failedAt time.Time, itemType ItemType, itemID string) error
+	DeleteExpiredFailedItem(expiry GCFailedItemExpiryInfo, now time.Time) (bool, error)
 	RequeueFailedItem(orgID uuid.UUID, failedAt time.Time, itemType ItemType, itemID string, queuedAt time.Time) error
 	MarkOrgActive(orgID uuid.UUID, activeAt time.Time) error
 	RemoveOrgFromActiveSet(orgID uuid.UUID, activeBefore time.Time) error
@@ -44,8 +46,7 @@ type GCStore interface {
 	ClearDirtyOrg(orgID uuid.UUID, dirtyBefore time.Time) error
 	GetOrgQueueStats(orgID uuid.UUID) (GCOrgStats, error)
 	SaveOrgQueueStats(stats GCOrgStats) error
-	RecountOrgQueueDepth(orgID uuid.UUID) (int, error)
-	RecountOrgFailedDepth(orgID uuid.UUID) (int, error)
+	RecalculateOrgQueueStats(orgID uuid.UUID) (GCOrgStats, error)
 	GetOldestQueuedAt(orgID uuid.UUID) (*time.Time, error)
 	SumOrgQueueStats() (int, int, error)
 	GetUserDeletedAt(orgID, userID uuid.UUID) (*time.Time, error)
@@ -314,6 +315,7 @@ type GCOrgStats struct {
 	FailedDepth    int
 	OldestQueuedAt *time.Time
 	UpdatedAt      time.Time
+	RecalculatedAt time.Time
 }
 
 // GCFailedItemOrgInfo summarizes one organization with items in the GC DLQ.
@@ -328,6 +330,7 @@ type GCFailedItemOrgInfo struct {
 type GCFailedItemInfo struct {
 	OrgID                       uuid.UUID  `json:"org_id"`
 	FailedAt                    time.Time  `json:"failed_at"`
+	ExpiresAt                   time.Time  `json:"expires_at"`
 	QueuedAt                    time.Time  `json:"queued_at"`
 	IdentityAt                  time.Time  `json:"identity_at"`
 	RequiresLibraryDeletedCheck bool       `json:"requires_library_deleted_check"`
@@ -340,6 +343,16 @@ type GCFailedItemInfo struct {
 	FailureCode                 string     `json:"failure_code"`
 	ResolvedAt                  *time.Time `json:"resolved_at"`
 	ResolvedState               string     `json:"resolved_state"`
+}
+
+// GCFailedItemExpiryInfo is the lightweight discovery row used by the scanner
+// to expire DLQ rows through the store, preserving failed-depth counters.
+type GCFailedItemExpiryInfo struct {
+	OrgID     uuid.UUID
+	FailedAt  time.Time
+	ExpiresAt time.Time
+	ItemType  ItemType
+	ItemID    string
 }
 
 // GCDirtyOrg identifies an org whose queue snapshot needs reconciliation.

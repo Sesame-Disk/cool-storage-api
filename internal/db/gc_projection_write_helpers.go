@@ -156,3 +156,21 @@ func AddDeleteS3OrphanDiscoveryQuery(batch *gocql.Batch, orgID, blockID string, 
 		WHERE first_seen_day = ? AND bucket = ? AND first_seen_at = ? AND org_id = ? AND block_id = ?
 	`, GCProjectionUTCDate(firstSeenAt), GCDiscoveryBucket(orgID, blockID), firstSeenAt.UTC(), orgID, blockID)
 }
+
+func AddUpsertFailedItemExpiryQuery(batch *gocql.Batch, orgID string, failedAt time.Time, itemType, itemID string, expiresAt time.Time) {
+	batch.Query(`
+		INSERT INTO gc_failed_items_by_expiry (
+			expiry_day, bucket, expires_at, org_id, failed_at, item_type, item_id
+		) VALUES (?, ?, ?, ?, ?, ?, ?)
+	`, GCProjectionUTCDate(expiresAt), GCDiscoveryBucket(orgID, itemType, itemID, failedAt.UTC().Format(time.RFC3339Nano)), expiresAt.UTC(), orgID, failedAt.UTC(), itemType, itemID)
+}
+
+func AddDeleteFailedItemExpiryQuery(batch *gocql.Batch, orgID string, failedAt time.Time, itemType, itemID string, expiresAt time.Time) {
+	if expiresAt.IsZero() {
+		return
+	}
+	batch.Query(`
+		DELETE FROM gc_failed_items_by_expiry
+		WHERE expiry_day = ? AND bucket = ? AND expires_at = ? AND org_id = ? AND failed_at = ? AND item_type = ? AND item_id = ?
+	`, GCProjectionUTCDate(expiresAt), GCDiscoveryBucket(orgID, itemType, itemID, failedAt.UTC().Format(time.RFC3339Nano)), expiresAt.UTC(), orgID, failedAt.UTC(), itemType, itemID)
+}

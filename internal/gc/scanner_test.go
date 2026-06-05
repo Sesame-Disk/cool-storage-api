@@ -27,6 +27,42 @@ func TestNewScanner(t *testing.T) {
 	}
 }
 
+func TestScanner_LoadBlockCandidatesStartDay_ColdStartUsesInitialLookback(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	s := NewScanner(store, q, stats, config.GCConfig{})
+
+	cutoffDay := time.Date(2026, 6, 4, 0, 0, 0, 0, time.UTC)
+	startDay, err := s.loadBlockCandidatesStartDay(cutoffDay)
+	if err != nil {
+		t.Fatalf("loadBlockCandidatesStartDay failed: %v", err)
+	}
+
+	want := cutoffDay.AddDate(0, 0, -gcInitialScanLookbackDays)
+	if !startDay.Equal(want) {
+		t.Fatalf("loadBlockCandidatesStartDay = %s, want %s", startDay.Format(time.RFC3339), want.Format(time.RFC3339))
+	}
+}
+
+func TestScanner_LoadFailedItemsExpiryStartDay_ColdStartUsesFailedItemLookback(t *testing.T) {
+	store := NewMockStore()
+	stats := &Stats{}
+	q := NewQueue(store)
+	s := NewScanner(store, q, stats, config.GCConfig{})
+
+	cutoffDay := time.Date(2026, 6, 4, 0, 0, 0, 0, time.UTC)
+	startDay, err := s.loadFailedItemsExpiryStartDay(cutoffDay)
+	if err != nil {
+		t.Fatalf("loadFailedItemsExpiryStartDay failed: %v", err)
+	}
+
+	want := cutoffDay.AddDate(0, 0, -gcFailedItemExpiryInitialLookbackDays)
+	if !startDay.Equal(want) {
+		t.Fatalf("loadFailedItemsExpiryStartDay = %s, want %s", startDay.Format(time.RFC3339), want.Format(time.RFC3339))
+	}
+}
+
 func TestScanner_ScanOnce_ExpiredProvisionalRefEnqueuesZeroRefBlock(t *testing.T) {
 	store := NewMockStore()
 	stats := &Stats{}
@@ -344,7 +380,7 @@ func TestScanner_ScanOnce_ReturnsAccumulatedPhaseErrorWhenCanceledBetweenPhases(
 	store.deleteExpiredShareLinkErr = fmt.Errorf("delete failed")
 
 	ctx, cancel := context.WithCancel(context.Background())
-	store.recountQueueDepthHook = func(_ uuid.UUID, _ int) {
+	store.reconcileStorageCountersHook = func() {
 		cancel()
 	}
 
@@ -2154,6 +2190,7 @@ func TestScanner_ScanExpiredDeletedLibraries_SkipsOpenFailedCascade(t *testing.T
 	store.failedItems[orgID] = []GCFailedItemInfo{{
 		OrgID:        orgID,
 		FailedAt:     failedAt,
+		ExpiresAt:    failedAt.Add(gcFailedItemRetention),
 		QueuedAt:     deletedAt.Add(2 * time.Minute),
 		IdentityAt:   deletedAt,
 		ItemType:     ItemLibraryCascade,
@@ -2200,9 +2237,12 @@ func TestScanner_ScanExpiredDeletedLibraries_ExpiredFailedMarkerDoesNotSuppressF
 		t.Fatalf("FailItem failed: %v", err)
 	}
 
-	store.mu.Lock()
-	store.failedItems[orgID] = nil
-	store.mu.Unlock()
+	if n, err := s.scanExpiredFailedItems(context.Background()); err != nil || n != 1 {
+		t.Fatalf("scanExpiredFailedItems = (%d, %v), want (1, nil)", n, err)
+	}
+	if got := len(store.FailedItems(orgID)); got != 0 {
+		t.Fatalf("expected expired failed item to be removed, got %d", got)
+	}
 
 	if n, err := s.scanExpiredDeletedLibraries(context.Background()); err != nil || n != 1 {
 		t.Fatalf("scanExpiredDeletedLibraries after failed-row expiry = (%d, %v), want (1, nil)", n, err)

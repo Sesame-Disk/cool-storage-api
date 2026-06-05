@@ -177,18 +177,20 @@ Schema is now baked into `internal/db/migrations/001_initial_schema.cql`:
   (32 hash buckets, no full-table `SELECT DISTINCT`).
 - `gc_dirty_orgs (bucket, org_id, marked_at)` — orgs needing snapshot
   reconciliation.
-- `gc_org_stats (org_id, queue_depth, failed_depth, oldest_queued_at)` —
-  per-org snapshot maintained by the reconciler.
-- `gc_failed_items (org_id, failed_at, ...)` — DLQ with a 30-day TTL and a
-  `resolution_status` column for operator workflow.
+- `gc_org_stats (org_id, queue_depth, failed_depth, oldest_queued_at,
+  recalculated_at)` — per-org snapshot maintained by background exact
+  recalculation from canonical queue / DLQ rows.
+- `gc_failed_items (org_id, failed_at, ...)` — durable DLQ with explicit
+  30-day retention via `gc_failed_items_by_expiry` and a `resolution_status`
+  column for operator workflow.
 - Pre-seeds `gc_stats` keys: `total_queue_depth`, `total_failed_items`,
   `dirty_orgs_total`, `last_reconcile_run`.
 
 ### Fix — reconciler (`internal/gc/gc.go`)
 
 - Snapshot is read by `Status()` from `gc_stats` (single-key reads, no live
-  count). Snapshot is maintained by a `reconcileDirtyQueueStats` pass that
-  runs at the end of every worker tick and every scanner tick.
+  count). Snapshot is maintained by a serialized dirty-org refresh pass; exact
+  recounts happen off the write path and are throttled by `recalculated_at`.
 - The reconciler is serialized via `reconcileMu` so concurrent worker /
   scanner / admin paths cannot corrupt the global totals via interleaved
   read-modify-write cycles.

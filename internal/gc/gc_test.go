@@ -555,7 +555,7 @@ func TestService_ReconcileDirtyQueueStats_SerializesRuns(t *testing.T) {
 	var inFlight atomic.Int32
 	var maxInFlight atomic.Int32
 	release := make(chan struct{})
-	store.recountQueueDepthHook = func(orgID uuid.UUID, depth int) {
+	store.recalculateStatsHook = func(orgID uuid.UUID) {
 		current := inFlight.Add(1)
 		for {
 			max := maxInFlight.Load()
@@ -571,11 +571,11 @@ func TestService_ReconcileDirtyQueueStats_SerializesRuns(t *testing.T) {
 
 	done := make(chan struct{}, 2)
 	go func() {
-		svc.reconcileDirtyQueueStats(1)
+		svc.reconcileDirtyQueueStats(1, 0)
 		done <- struct{}{}
 	}()
 	go func() {
-		svc.reconcileDirtyQueueStats(1)
+		svc.reconcileDirtyQueueStats(1, 0)
 		done <- struct{}{}
 	}()
 
@@ -587,7 +587,32 @@ func TestService_ReconcileDirtyQueueStats_SerializesRuns(t *testing.T) {
 	}
 
 	if got := maxInFlight.Load(); got != 1 {
-		t.Fatalf("expected serialized reconcile passes, max concurrent in-flight recounts = %d", got)
+		t.Fatalf("expected serialized reconcile passes, max concurrent in-flight queue-depth reads = %d", got)
+	}
+}
+
+func TestService_ReconcileDirtyQueueStats_ThrottlesRecentlyRecalculatedOrg(t *testing.T) {
+	store := NewMockStore()
+	orgID := uuid.New()
+	now := time.Now().UTC()
+	store.dirtyQueueOrgs[orgID] = now
+	store.orgQueueStats[orgID] = GCOrgStats{
+		OrgID:          orgID,
+		QueueDepth:     7,
+		FailedDepth:    2,
+		UpdatedAt:      now.Add(-30 * time.Second),
+		RecalculatedAt: now.Add(-30 * time.Second),
+	}
+
+	svc := &Service{store: store, config: config.GCConfig{Enabled: true}}
+	svc.reconcileDirtyQueueStats(1, time.Hour)
+
+	if _, ok := store.dirtyQueueOrgs[orgID]; !ok {
+		t.Fatal("expected recently recalculated org to remain dirty until throttle window elapses")
+	}
+	stats := store.orgQueueStats[orgID]
+	if stats.QueueDepth != 7 || stats.FailedDepth != 2 {
+		t.Fatalf("expected throttled reconcile to leave prior stats intact, got queue=%d failed=%d", stats.QueueDepth, stats.FailedDepth)
 	}
 }
 
@@ -716,6 +741,44 @@ func TestService_ListFailedItemOrgs_SortsAndLimits(t *testing.T) {
 	}
 }
 
+// TestService_ListFailedItemOrgs_DepthTieBreaksByRecency locks the contract that
+// when two orgs tie on failed_depth, the more recently-failing org wins the
+// limited page. A naive implementation that truncates by org_id before knowing
+// the real last-failure time would starve a recently-failing org from both the
+// admin list and the auto-retry selection.
+func TestService_ListFailedItemOrgs_DepthTieBreaksByRecency(t *testing.T) {
+	store := NewMockStore()
+	orgOld := uuid.New()
+	orgNew := uuid.New()
+	store.AddOrganizationWithName(orgOld, "older")
+	store.AddOrganizationWithName(orgNew, "newer")
+	base := time.Now().UTC().Add(-3 * time.Hour)
+	if err := store.SaveOrgQueueStats(GCOrgStats{OrgID: orgOld, FailedDepth: 3}); err != nil {
+		t.Fatalf("SaveOrgQueueStats(orgOld): %v", err)
+	}
+	if err := store.SaveOrgQueueStats(GCOrgStats{OrgID: orgNew, FailedDepth: 3}); err != nil {
+		t.Fatalf("SaveOrgQueueStats(orgNew): %v", err)
+	}
+	store.failedItems[orgOld] = []GCFailedItemInfo{
+		{OrgID: orgOld, FailedAt: base.Add(1 * time.Minute), ItemType: ItemBlock, ItemID: "old-1"},
+	}
+	store.failedItems[orgNew] = []GCFailedItemInfo{
+		{OrgID: orgNew, FailedAt: base.Add(90 * time.Minute), ItemType: ItemBlock, ItemID: "new-1"},
+	}
+	svc := NewService(store, nil, config.GCConfig{Enabled: true}, nil)
+
+	orgs, err := svc.ListFailedItemOrgs(1)
+	if err != nil {
+		t.Fatalf("ListFailedItemOrgs(1): %v", err)
+	}
+	if len(orgs) != 1 {
+		t.Fatalf("len(orgs) = %d, want 1", len(orgs))
+	}
+	if orgs[0].OrgID != orgNew {
+		t.Fatalf("depth tie did not break by recency: got %s, want %s (more recent failure)", orgs[0].OrgID, orgNew)
+	}
+}
+
 func TestService_ListFailedItemOrgs_FiltersStaleSnapshotAndIncludesDirtyActualFailures(t *testing.T) {
 	store := NewMockStore()
 	staleOrg := uuid.New()
@@ -750,6 +813,7 @@ func TestService_ListFailedItemOrgs_FiltersStaleSnapshotAndIncludesDirtyActualFa
 	}}
 
 	svc := NewService(store, nil, config.GCConfig{Enabled: true}, nil)
+	svc.RefreshFailedItemSnapshot()
 
 	orgs, err := svc.ListFailedItemOrgs(10)
 	if err != nil {
@@ -928,6 +992,71 @@ func TestService_RequeueFailedCascade_PreservesIdentityAt(t *testing.T) {
 	}
 }
 
+func TestService_AdminFailedItemOps_RefreshSnapshotImmediately(t *testing.T) {
+	store := NewMockStore()
+	orgID := uuid.New()
+	failedAtA := time.Now().UTC().Truncate(time.Millisecond)
+	failedAtB := failedAtA.Add(time.Second)
+	queuedAtA := failedAtA.Add(-time.Minute)
+	queuedAtB := failedAtB.Add(-time.Minute)
+
+	store.failedItems[orgID] = []GCFailedItemInfo{
+		{
+			OrgID:        orgID,
+			FailedAt:     failedAtA,
+			QueuedAt:     queuedAtA,
+			IdentityAt:   queuedAtA,
+			ItemType:     ItemBlock,
+			ItemID:       "admin-requeue",
+			LibraryID:    uuid.Nil,
+			StorageClass: "hot",
+			RetryCount:   5,
+		},
+		{
+			OrgID:        orgID,
+			FailedAt:     failedAtB,
+			QueuedAt:     queuedAtB,
+			IdentityAt:   queuedAtB,
+			ItemType:     ItemBlock,
+			ItemID:       "admin-delete",
+			LibraryID:    uuid.Nil,
+			StorageClass: "hot",
+			RetryCount:   5,
+		},
+	}
+	store.orgQueueStats[orgID] = GCOrgStats{
+		OrgID:          orgID,
+		QueueDepth:     0,
+		FailedDepth:    2,
+		UpdatedAt:      failedAtB,
+		RecalculatedAt: failedAtB,
+	}
+
+	svc := &Service{
+		store:  store,
+		config: config.GCConfig{Enabled: true},
+		lease:  &fakeLeaderLease{allowed: true},
+	}
+
+	if err := svc.RequeueFailedItem(orgID, failedAtA, ItemBlock, "admin-requeue"); err != nil {
+		t.Fatalf("RequeueFailedItem failed: %v", err)
+	}
+	if err := svc.DeleteFailedItem(orgID, failedAtB, ItemBlock, "admin-delete"); err != nil {
+		t.Fatalf("DeleteFailedItem failed: %v", err)
+	}
+
+	stats := store.orgQueueStats[orgID]
+	if stats.QueueDepth != 1 {
+		t.Fatalf("QueueDepth after admin DLQ ops = %d, want 1", stats.QueueDepth)
+	}
+	if stats.FailedDepth != 0 {
+		t.Fatalf("FailedDepth after admin DLQ ops = %d, want 0", stats.FailedDepth)
+	}
+	if stats.RecalculatedAt.IsZero() {
+		t.Fatal("expected admin DLQ ops to refresh org snapshot immediately")
+	}
+}
+
 func TestService_RetryAutoRecoverableFailedItems_RequeuesMissingLibraryChildren(t *testing.T) {
 	store := NewMockStore()
 	orgID := uuid.New()
@@ -951,6 +1080,12 @@ func TestService_RetryAutoRecoverableFailedItems_RequeuesMissingLibraryChildren(
 		FailureCode:                 GCFailureCodeLibraryHardDeleteInProgress,
 		ResolvedState:               "open",
 	}}
+	store.orgQueueStats[orgID] = GCOrgStats{
+		OrgID:          orgID,
+		FailedDepth:    1,
+		UpdatedAt:      failedAt,
+		RecalculatedAt: failedAt,
+	}
 
 	svc := &Service{
 		store:  store,
@@ -1005,7 +1140,7 @@ func TestService_ReconcileDirtyQueueStats_CorrectsSnapshotDrift(t *testing.T) {
 	store.gcStats[gcStatKeyTotalDirtyOrgs] = "9"
 
 	svc := &Service{store: store, config: config.GCConfig{Enabled: true}, reconcilePasses: gcSnapshotDriftCheckEvery - 1}
-	svc.reconcileDirtyQueueStats(0)
+	svc.reconcileDirtyQueueStats(0, 0)
 
 	queueSnapshot, _ := store.LoadGCStats(gcStatKeyTotalQueue)
 	failedSnapshot, _ := store.LoadGCStats(gcStatKeyTotalFailed)

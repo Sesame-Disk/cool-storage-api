@@ -20,9 +20,9 @@ flowchart TD
     subgraph Service["GC Service"]
         Queue["Queue<br/>gc_queue table<br/>durable (no TTL)"]
         Worker["Worker<br/>Processes batch per org<br/>100 items/tick"]
-        Scanner["Scanner<br/>13 safety phases<br/>Finds orphans"]
+        Scanner["Scanner<br/>Safety phases<br/>Finds orphans + expires DLQ"]
         Reconciler["Reconciler<br/>Walks gc_dirty_orgs<br/>Maintains gc_stats snapshot"]
-        DLQ["Dead-Letter Queue<br/>gc_failed_items<br/>30-day TTL"]
+        DLQ["Dead-Letter Queue<br/>gc_failed_items<br/>explicit 30-day retention"]
     end
 
     subgraph Targets["Deletion Targets"]
@@ -209,10 +209,11 @@ the read executes, the count could be back at 1.
 So this is a false-positive enqueue (block enqueued for deletion but LWT skips it),
 not a data loss scenario. The cost is a wasted queue entry that gets cleaned up.
 
-### RESOLVED: Counter drift (was MEDIUM)
+### RESOLVED: Hot exact recounts removed without Cassandra COUNTER
 
-**Resolved:** 2026-04-28 in the baseline schema (`001_initial_schema.cql`) and the
-accompanying GC service redesign.
+**Status:** Hot `COUNT(*)` reads are removed from normal status/reconcile paths,
+and the baseline schema no longer depends on Cassandra `COUNTER` tables for
+GC queue/DLQ depth snapshots.
 
 **Original problem:** the `gc_queue_stats` Cassandra counter table was updated
 in a separate batch from queue mutations. Drift accumulated whenever (a) the
@@ -224,14 +225,22 @@ held 0 rows.
 
 **New design:**
 - `gc_queue_stats` is dropped. Snapshots live in `gc_stats` (per-key) and
-  `gc_org_stats` (per-org).
-- Mutations write to `gc_dirty_orgs`. A serialized reconciler iterates dirty
-  orgs each worker/scanner tick, recomputes per-org depth via `SELECT COUNT(*)
-  FROM gc_queue WHERE org_id = ?` (partition-bounded), saves the per-org row,
+  `gc_org_stats` (per-org, with `recalculated_at` for throttling).
+- `gc_failed_items` no longer relies on Cassandra TTL. Failed items carry
+  `expires_at` and are discovered through `gc_failed_items_by_expiry`; the
+  scanner deletes expired rows through the GC store so DLQ rows and
+  `gc_pending_items` markers move together.
+- Mutations write only canonical rows plus `gc_active_orgs` / `gc_dirty_orgs`.
+  A serialized refresh pass exact-recalculates a limited dirty-org batch from
+  canonical `gc_queue` / `gc_failed_items` rows, saves the per-org snapshot,
   and applies the delta to the global `gc_stats` totals.
+- Worker drain decisions do not trust snapshots destructively. The worker uses
+  `GetOldestQueuedAt` as the real confirmation before removing an org from
+  `gc_active_orgs`.
 - Every 10 reconciler passes a full `SUM(queue_depth) FROM gc_org_stats` runs
-  as a drift safety net; mismatches overwrite the totals and bump
-  `gc_snapshot_drift_corrected_total`.
+  as a snapshot safety net; mismatches overwrite the totals and bump
+  `gc_snapshot_drift_corrected_total`. This does not compare snapshots against
+  live queue/DLQ rows.
 - Admin DLQ mutations require leadership and serialize through `dlqOpsMu` so
   the non-atomic `RequeueFailedItem` cannot duplicate queue rows under
   concurrent admin requests.

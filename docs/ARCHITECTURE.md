@@ -516,8 +516,9 @@ Drains the `gc_queue` table. Each item has a type; the worker dispatches accordi
 - Never delete HEAD commit or its ancestors within TTL
 - Grace period: items wait 1h in queue before processing
 - `gc_queue` is durable in the baseline schema. Stuck items reach the
-  retry cap (5 attempts) and are moved to `gc_failed_items` (DLQ, 30-day TTL)
-  for operator inspection via `GET /api/v2.1/admin/gc/failed-items`. If
+  retry cap (5 attempts) and are moved to `gc_failed_items` (DLQ with explicit
+  30-day retention via `gc_failed_items_by_expiry`) for operator inspection via
+  `GET /api/v2.1/admin/gc/failed-items`. If
   `IncrementRetry` reports an error, the worker first verifies whether the
   original queue row still exists: it escalates only when the old row is still
   present, treats the requeue as successful when the old row is already gone,

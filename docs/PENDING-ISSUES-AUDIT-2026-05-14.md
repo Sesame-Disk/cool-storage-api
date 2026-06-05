@@ -18,7 +18,7 @@ Legend:
 | 2 | Backup / disaster recovery is not production-ready | P0 | L | Confirmed |
 | 3 | Persistent audit trail / activity feed / Accounts audit provenance is missing | P1 | L | Confirmed |
 | 4 | Batch file move can report success without moving files | P1 | M | Confirmed, broader than docs |
-| 5 | GC queue exact recounts still use Cassandra `COUNT(*)` over queue partitions | P1 | L | Confirmed |
+| 5 | GC queue hot recounts replaced; counter repair path added | P1 | L | Resolved; load validation pending |
 | 6 | Public/upload-link resume semantics remain fragile | P1 | M/L | Confirmed |
 | 7 | Upload "do not replace" is still ambiguous for desktop/client endpoint semantics | P1 | M | Partially confirmed |
 | 8 | File-operation statistics have no real event dataset | P1 | L | Confirmed |
@@ -120,15 +120,17 @@ Evidence:
 
 Recommendation: either implement real batch move or return 501 for all batch moves until it is real. Returning false success is the dangerous part.
 
-### 5. GC queue exact recounts still use Cassandra `COUNT(*)`
+### 5. GC queue exact recounts moved out of the hot path
 
-Confirmed. GC now has leadership, but queue recount debt remains. The code still exact-counts every queue bucket in hot/status/reconcile paths.
+Resolved in the baseline schema hardening branch without Cassandra counters. GC now has leadership, the hot/status/reconcile paths no longer exact-count every queue bucket, DLQ retention is explicit instead of Cassandra TTL-driven, and exact queue/DLQ snapshot refresh happens from dirty-org markers plus `recalculated_at` throttling.
 
 Evidence:
-- `internal/gc/gc.go:739` calls `RecountOrgQueueDepth`.
-- `internal/gc/store_cassandra.go:456-462` and `internal/gc/store_cassandra.go:786-790` execute `SELECT COUNT(*) FROM gc_queue WHERE org_id = ? AND bucket = ?`.
+- `internal/gc/gc.go` serves cheap snapshots from `gc_stats` / `gc_org_stats` and exact-recalculates dirty orgs off the write path.
+- `internal/gc/store_cassandra.go` no longer executes `SELECT COUNT(*) FROM gc_queue` or `SELECT COUNT(*) FROM gc_failed_items` in the GC status/reconcile path.
+- `internal/db/migrations/001_initial_schema.cql` keeps `gc_org_stats` as the per-org snapshot row and adds `recalculated_at`; there is no `gc_org_queue_counters` table in the baseline schema.
+- `internal/db/migrations/001_initial_schema.cql` keeps `gc_failed_items` durable and adds `gc_failed_items_by_expiry`; the scanner expires DLQ rows through the store.
 
-Recommendation: move queue-depth snapshots to queue write paths and keep exact scans only as infrequent repair/scrub tooling.
+Recommendation: validate dirty-org backlog drain and snapshot staleness under multi-instance/multinode load before treating snapshots as authoritative SLO inputs.
 
 ### 6. Public/upload-link resume semantics remain fragile
 
