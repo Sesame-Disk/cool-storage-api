@@ -1713,7 +1713,7 @@ func (s *CassandraStore) ListBlockMappingsByInternalID(orgID uuid.UUID, internal
 	iter := s.db.Session().Query(`
 		SELECT internal_id, external_id FROM block_id_mappings_by_internal
 		WHERE org_id = ? AND internal_id = ?
-	`, orgID, internalID).Iter()
+	`, orgID.String(), internalID).Iter()
 
 	var mappings []BlockMapping
 	var intID, extID string
@@ -1732,14 +1732,27 @@ func (s *CassandraStore) DeleteBlockMapping(orgID uuid.UUID, externalID string) 
 	err := s.db.Session().Query(`
 		SELECT internal_id FROM block_id_mappings WHERE org_id = ? AND external_id = ?
 	`, orgID.String(), externalID).Scan(&internalID)
+	if err != nil && !errors.Is(err, gocql.ErrNotFound) {
+		return fmt.Errorf("read block mapping org=%s external_id=%s: %w", orgID, externalID, err)
+	}
+	if err == nil && internalID != "" {
+		return s.DeleteBlockMappingResolved(orgID, externalID, internalID)
+	}
 
 	batch := s.db.Session().Batch(gocql.LoggedBatch)
 	batch.Query(`DELETE FROM block_id_mappings WHERE org_id = ? AND external_id = ?`, orgID.String(), externalID)
-	if err == nil && internalID != "" {
-		batch.Query(`DELETE FROM block_id_mappings_by_internal WHERE org_id = ? AND internal_id = ? AND external_id = ?`,
-			orgID.String(), internalID, externalID)
-	}
 	return batch.Exec()
+}
+
+func (s *CassandraStore) DeleteBlockMappingResolved(orgID uuid.UUID, externalID, internalID string) error {
+	batch := s.db.Session().Batch(gocql.LoggedBatch)
+	batch.Query(`DELETE FROM block_id_mappings WHERE org_id = ? AND external_id = ?`, orgID.String(), externalID)
+	batch.Query(`DELETE FROM block_id_mappings_by_internal WHERE org_id = ? AND internal_id = ? AND external_id = ?`,
+		orgID.String(), internalID, externalID)
+	if err := batch.Exec(); err != nil {
+		return fmt.Errorf("delete resolved block mapping org=%s external_id=%s internal_id=%s: %w", orgID, externalID, internalID, err)
+	}
+	return nil
 }
 
 // --- Commit operations ---

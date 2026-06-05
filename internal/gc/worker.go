@@ -211,7 +211,7 @@ func (w *Worker) cleanupBlockMappings(orgID uuid.UUID, internalBlockID string) e
 		return fmt.Errorf("failed to list block mappings for %s: %w", internalBlockID, err)
 	}
 	for _, mapping := range mappings {
-		if err := w.store.DeleteBlockMapping(orgID, mapping.ExternalID); err != nil {
+		if err := w.store.DeleteBlockMappingResolved(orgID, mapping.ExternalID, mapping.InternalID); err != nil {
 			return fmt.Errorf("failed to delete block mapping %s for %s: %w", mapping.ExternalID, internalBlockID, err)
 		}
 	}

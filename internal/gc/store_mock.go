@@ -1896,6 +1896,15 @@ func (m *MockStore) DeleteBlockMapping(orgID uuid.UUID, externalID string) error
 	return nil
 }
 
+func (m *MockStore) DeleteBlockMappingResolved(orgID uuid.UUID, externalID, internalID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	key := fmt.Sprintf("%s:%s", orgID, externalID)
+	delete(m.mappings, key)
+	return nil
+}
+
 func (m *MockStore) GetCommit(libraryID uuid.UUID, commitID string) (CommitInfo, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()

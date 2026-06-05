@@ -976,16 +976,24 @@ func TestGC_WorkerSkipsBlockCandidateWithoutCanonicalRow(t *testing.T) {
 	orgID := orgUUID.String()
 	blockID := fmt.Sprintf("cand-missing-%d", time.Now().UnixNano())
 	externalBlockID := fmt.Sprintf("%040x", time.Now().UnixNano())
+	reverseOnlyExternalBlockID := fmt.Sprintf("%040x", time.Now().UnixNano()+1)
 	queuedAt := time.Now().UTC().Add(-2 * time.Hour).Truncate(time.Millisecond)
 	candidateAt := ensureSyntheticBlockCandidateForTest(t, orgUUID, blockID, "hot", queuedAt)
 	enqueueSyntheticBlockQueueItemForTest(t, orgUUID, blockID, "hot", queuedAt)
 	if err := database.WriteBlockIDMapping(orgID, externalBlockID, blockID, time.Now().UTC()); err != nil {
 		t.Fatalf("failed to seed block mapping for %s/%s: %v", orgID, blockID, err)
 	}
+	if err := database.Session().Query(`
+		INSERT INTO block_id_mappings_by_internal (org_id, internal_id, external_id, created_at)
+		VALUES (?, ?, ?, ?)
+	`, orgID, blockID, reverseOnlyExternalBlockID, time.Now().UTC()).Exec(); err != nil {
+		t.Fatalf("failed to seed reverse-only block mapping for %s/%s: %v", orgID, blockID, err)
+	}
 	t.Cleanup(func() {
 		cleanupGCBlockFixturesForTest(t, orgUUID, blockID)
 		_ = database.Session().Query(`DELETE FROM block_id_mappings WHERE org_id = ? AND external_id = ?`, orgID, externalBlockID).Exec()
 		_ = database.Session().Query(`DELETE FROM block_id_mappings_by_internal WHERE org_id = ? AND internal_id = ? AND external_id = ?`, orgID, blockID, externalBlockID).Exec()
+		_ = database.Session().Query(`DELETE FROM block_id_mappings_by_internal WHERE org_id = ? AND internal_id = ? AND external_id = ?`, orgID, blockID, reverseOnlyExternalBlockID).Exec()
 		if err := database.Session().Query(`DELETE FROM blocks WHERE org_id = ? AND block_id = ?`, orgID, blockID).Exec(); err != nil {
 			t.Fatalf("failed to delete blocks row for %s/%s: %v", orgID, blockID, err)
 		}
@@ -1006,6 +1014,9 @@ func TestGC_WorkerSkipsBlockCandidateWithoutCanonicalRow(t *testing.T) {
 	if !blockIDMappingExists(t, orgID, externalBlockID) || !reverseBlockIDMappingExists(t, orgID, blockID, externalBlockID) {
 		t.Fatal("expected block_id_mappings rows before worker")
 	}
+	if !reverseBlockIDMappingExists(t, orgID, blockID, reverseOnlyExternalBlockID) {
+		t.Fatal("expected reverse-only block_id_mappings_by_internal row before worker")
+	}
 
 	for attempt := 0; attempt < 8; attempt++ {
 		if !gcCandidateExists(t, orgID, blockID) &&
@@ -1014,6 +1025,7 @@ func TestGC_WorkerSkipsBlockCandidateWithoutCanonicalRow(t *testing.T) {
 			!failedQueueItemExists(t, orgID, "block", blockID) &&
 			!blockIDMappingExists(t, orgID, externalBlockID) &&
 			!reverseBlockIDMappingExists(t, orgID, blockID, externalBlockID) &&
+			!reverseBlockIDMappingExists(t, orgID, blockID, reverseOnlyExternalBlockID) &&
 			!blockExistsInDB(t, orgID, blockID) {
 			return
 		}
@@ -1036,8 +1048,9 @@ func TestGC_WorkerSkipsBlockCandidateWithoutCanonicalRow(t *testing.T) {
 		failedQueueItemExists(t, orgID, "block", blockID) ||
 		blockIDMappingExists(t, orgID, externalBlockID) ||
 		reverseBlockIDMappingExists(t, orgID, blockID, externalBlockID) ||
+		reverseBlockIDMappingExists(t, orgID, blockID, reverseOnlyExternalBlockID) ||
 		blockExistsInDB(t, orgID, blockID) {
-		t.Fatalf("stale candidate without canonical row was not fully skipped: block_exists=%v candidate=%v projection=%v queue=%v failed=%v mapping=%v reverse_mapping=%v",
+		t.Fatalf("stale candidate without canonical row was not fully skipped: block_exists=%v candidate=%v projection=%v queue=%v failed=%v mapping=%v reverse_mapping=%v reverse_only_mapping=%v",
 			blockExistsInDB(t, orgID, blockID),
 			gcCandidateExists(t, orgID, blockID),
 			gcCandidateProjectionExists(t, orgID, blockID, candidateAt),
@@ -1045,6 +1058,7 @@ func TestGC_WorkerSkipsBlockCandidateWithoutCanonicalRow(t *testing.T) {
 			failedQueueItemExists(t, orgID, "block", blockID),
 			blockIDMappingExists(t, orgID, externalBlockID),
 			reverseBlockIDMappingExists(t, orgID, blockID, externalBlockID),
+			reverseBlockIDMappingExists(t, orgID, blockID, reverseOnlyExternalBlockID),
 		)
 	}
 }
