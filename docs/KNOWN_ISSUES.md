@@ -2677,7 +2677,13 @@ Tracked in `docs/TECHNICAL-DEBT.md` § 9, Gap B.
 
 ### ISSUE-GC-QUEUE-RECOUNT-01: Exact `gc_queue` Recounts Still Hit Cassandra Tombstone Paths
 
-**Status**: Partially resolved: hot `COUNT(*)` removed, explicit counter scrub still required
+**Status**: Substantially resolved (2026-06-05). Hot `COUNT(*)` and the
+counter/repair machinery were both removed in favour of a single-writer dirty
+snapshot + throttled exact recalc (`gc_org_stats.recalculated_at`). See
+[GC-QUEUE-DEPTH-MODEL.md](GC-QUEUE-DEPTH-MODEL.md). Remaining tombstone-warning
+source is the recompute/`DequeueBatch` partition reads themselves — addressed by
+the compaction follow-up in [SCHEMA-BOTTLENECK-AUDIT.md](SCHEMA-BOTTLENECK-AUDIT.md)
+item I (`gc_queue-lcs-compaction`), not by more depth-tracking changes.
 **Discovered**: 2026-04-28
 **Severity**: High operational risk — not a confirmed data-loss bug, but still a real source of Cassandra warnings and expensive partition reads in a GC-critical path
 

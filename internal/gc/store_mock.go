@@ -1299,11 +1299,19 @@ func (m *MockStore) ListOrgsWithFailedItems(limit int) ([]GCFailedItemOrgInfo, e
 		if stats.FailedDepth <= 0 {
 			continue
 		}
+		// Mirror CassandraStore: UpdatedAt reflects the most recent real failure,
+		// not the snapshot refresh time.
+		var lastFailedAt time.Time
+		for _, item := range m.failedItems[orgID] {
+			if item.FailedAt.After(lastFailedAt) {
+				lastFailedAt = item.FailedAt
+			}
+		}
 		results = append(results, GCFailedItemOrgInfo{
 			OrgID:            orgID,
 			OrgName:          m.orgNames[orgID],
 			FailedItemsTotal: stats.FailedDepth,
-			UpdatedAt:        stats.UpdatedAt,
+			UpdatedAt:        lastFailedAt,
 		})
 	}
 	sort.Slice(results, func(i, j int) bool {

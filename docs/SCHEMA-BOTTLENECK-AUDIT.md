@@ -224,6 +224,50 @@ more expensive partition walks in GC and quota/permission-adjacent paths.
 
 ---
 
+## I. `gc_queue` / DLQ tombstone purge needs compaction tuning
+
+**Status**: open, medium-priority (introduced 2026-06-05)
+
+**Tables**: `gc_queue`, `gc_pending_items`, `gc_active_orgs`, `gc_dirty_orgs`,
+`gc_failed_items`, `gc_queue_counter_reconciliation` is gone — but the
+queue/marker tables remain insert+delete churn tables on the default STCS +
+`gc_grace_seconds` (10 days).
+
+**Shape**: these are queue-like tables (rows inserted then deleted on
+completion/clear). The GC moved off `COUNT(*)` recounts to a throttled per-org
+exact recompute (`scanOrgQueueStats`, see
+[GC-QUEUE-DEPTH-MODEL.md](GC-QUEUE-DEPTH-MODEL.md)), but that recompute still
+**reads** the partition, so it walks tombstones. `DequeueBatch` reads
+`queued_at < cutoff` from the front of the queue, exactly where completed-item
+tombstones accumulate.
+
+**Risk**: on a hot org (e.g. the platform org `00000000-…-0001`, bucket 0) the
+recompute and dequeue paths emit `tombstone_warn_threshold` warnings
+(`Read N live rows and M tombstone cells …`). The snapshot throttle
+(`minInterval ≈ 60s`) reduces the recompute frequency but does not eliminate the
+scan; the dequeue scan runs every worker tick regardless.
+
+**Direction**: dedicated branch `gc_queue-lcs-compaction`. Apply
+`LeveledCompactionStrategy` with proactive tombstone purge to the queue/marker
+tables, e.g.:
+
+```cql
+WITH compaction = {
+    'class': 'LeveledCompactionStrategy',
+    'tombstone_threshold': '0.1',
+    'tombstone_compaction_interval': '600'
+}
+```
+
+Leave `gc_grace_seconds` at the default first (LCS + the tombstone knobs do the
+heavy lifting and avoid the multi-node resurrection trade-offs of a low grace).
+Re-measure the warnings before deciding whether a lower `gc_grace_seconds` on
+these idempotent, leader-only-drained queue tables is also warranted. This is
+the load-bearing follow-up that actually silences the tombstone warnings the
+counter-removal work only relocated.
+
+---
+
 ## Closing The Loop
 
 When working any of the items above, add the associated `ISSUE-...-01` ID to

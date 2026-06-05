@@ -1135,13 +1135,21 @@ CREATE TABLE IF NOT EXISTS gc_failed_items (
     resolved_at       TIMESTAMP,
     PRIMARY KEY ((org_id), failed_at, item_type, item_id)
 ) WITH CLUSTERING ORDER BY (failed_at DESC, item_type ASC, item_id ASC)
-  AND default_time_to_live = 0;
+  AND default_time_to_live = 3888000;
+-- ^ 45-day backstop TTL. Primary cleanup is the scanner-driven explicit expiry
+-- below (which deletes at failed_at + 30d AND marks the org dirty so the
+-- snapshot reconciler refreshes failed_depth). The 45-day table TTL is only a
+-- safety net: if the scanner is unavailable for far longer than normal, rows
+-- still fall off instead of accumulating forever. It is deliberately longer
+-- than the 30-day explicit retention so the dirty-marking path normally wins.
 
--- Explicit expiry projection for DLQ rows. gc_failed_items deliberately has no
--- table TTL because Cassandra TTL expiry would not decrement queue-depth
--- counters. The scanner walks this projection, revalidates the primary row,
--- then deletes through the GC store so failed_depth and pending markers move
--- together with the DLQ row.
+-- Explicit expiry projection for DLQ rows. With the per-org snapshot model
+-- (gc_org_stats refreshed from canonical rows, no counters), the scanner walks
+-- this projection, revalidates the primary row, then deletes through the GC
+-- store so failed_depth and pending markers move together with the DLQ row and
+-- the org is marked dirty for an exact refresh. The table TTL below is the same
+-- 45-day backstop as gc_failed_items so a stalled scanner cannot leak the
+-- projection past the canonical row.
 CREATE TABLE IF NOT EXISTS gc_failed_items_by_expiry (
     expiry_day DATE,
     bucket     INT,
@@ -1152,7 +1160,7 @@ CREATE TABLE IF NOT EXISTS gc_failed_items_by_expiry (
     item_id    TEXT,
     PRIMARY KEY ((expiry_day, bucket), expires_at, org_id, failed_at, item_type, item_id)
 ) WITH CLUSTERING ORDER BY (expires_at ASC, org_id ASC, failed_at ASC, item_type ASC, item_id ASC)
-  AND default_time_to_live = 0;
+  AND default_time_to_live = 3888000;
 
 -- Live queue and DLQ markers persist until the queue/DLQ row is resolved.
 -- Failed-item retention is enforced explicitly by gc_failed_items_by_expiry so

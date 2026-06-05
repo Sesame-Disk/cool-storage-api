@@ -781,10 +781,17 @@ func (s *Service) reconcileSnapshotCandidatesLocked(candidates []gcSnapshotCandi
 	totalQueue := s.loadStatInt(gcStatKeyTotalQueue)
 	totalFailed := s.loadStatInt(gcStatKeyTotalFailed)
 
+	// deferred counts candidates that still need an exact refresh but did not
+	// get one this pass (throttled, or errored). While it is > 0 the snapshots
+	// are knowingly stale, so we must not advance last_reconcile_run /
+	// snapshot_age_seconds and claim the snapshot is fresh.
+	deferred := 0
+
 	for _, candidate := range candidates {
 		prevStats, err := s.store.GetOrgQueueStats(candidate.OrgID)
 		if err != nil {
 			log.Printf("[GC] Failed to load org queue stats for %s: %v", candidate.OrgID, err)
+			deferred++
 			continue
 		}
 		if candidate.HasDirtyMarker && !candidate.ForceRefresh && !prevStats.RecalculatedAt.IsZero() && !prevStats.RecalculatedAt.Before(candidate.DirtyBefore) {
@@ -794,12 +801,14 @@ func (s *Service) reconcileSnapshotCandidatesLocked(candidates []gcSnapshotCandi
 			continue
 		}
 		if !candidate.ForceRefresh && minInterval > 0 && !prevStats.RecalculatedAt.IsZero() && time.Since(prevStats.RecalculatedAt) < minInterval {
+			deferred++
 			continue
 		}
 
 		nextStats, err := s.store.RecalculateOrgQueueStats(candidate.OrgID)
 		if err != nil {
 			log.Printf("[GC] Failed to recalculate org queue stats for %s: %v", candidate.OrgID, err)
+			deferred++
 			continue
 		}
 
@@ -843,17 +852,30 @@ func (s *Service) reconcileSnapshotCandidatesLocked(candidates []gcSnapshotCandi
 	} else {
 		log.Printf("[GC] Failed to list dirty orgs after snapshot refresh: %v", err)
 	}
-	lastRun := time.Now().UTC()
 	s.saveStatInt(gcStatKeyTotalQueue, totalQueue)
 	s.saveStatInt(gcStatKeyTotalFailed, totalFailed)
 	s.saveStatInt(gcStatKeyTotalDirtyOrgs, remainingDirtyCount)
-	if err := s.store.SaveGCStats(gcStatKeyLastReconcile, lastRun.Format(time.RFC3339)); err != nil {
-		log.Printf("[GC] Failed to persist last reconcile run: %v", err)
-	}
 	metrics.GCQueueSize.Set(float64(totalQueue))
 	metrics.GCFailedItemsTotal.Set(float64(totalFailed))
 	metrics.GCDirtyOrgsTotal.Set(float64(remainingDirtyCount))
-	metrics.GCSnapshotAgeSeconds.Set(0)
+
+	// last_reconcile_run / snapshot_age_seconds must mean "the snapshots were
+	// confirmed current", not "a pass ran". Only advance them when no candidate
+	// was left needing a refresh; otherwise report the real age so dashboards do
+	// not see a falsely fresh snapshot during a throttle/deferral window.
+	if deferred == 0 {
+		lastRun := time.Now().UTC()
+		if err := s.store.SaveGCStats(gcStatKeyLastReconcile, lastRun.Format(time.RFC3339)); err != nil {
+			log.Printf("[GC] Failed to persist last reconcile run: %v", err)
+		}
+		metrics.GCSnapshotAgeSeconds.Set(0)
+	} else if prev := s.loadStatTime(gcStatKeyLastReconcile); !prev.IsZero() {
+		age := time.Since(prev).Seconds()
+		if age < 0 {
+			age = 0
+		}
+		metrics.GCSnapshotAgeSeconds.Set(age)
+	}
 }
 
 func (s *Service) reconcileDirtyQueueStats(limit int, minInterval time.Duration) {

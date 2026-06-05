@@ -380,6 +380,18 @@ func addPendingItemBatchQuery(batch *gocql.Batch, orgID, libraryID uuid.UUID, it
 	`, orgID.String(), gcPendingItemBucket(orgID, libraryID, itemType, itemID), string(itemType), libraryID.String(), itemID, identityAt)
 }
 
+// addPendingItemBatchQueryWithTTL writes a pending marker with a per-row
+// backstop TTL. Used only for DLQ (failed-item) markers: the marker is normally
+// deleted explicitly when the failed item is resolved/expired, and the TTL only
+// guarantees it cannot suppress re-enqueue forever if that explicit delete never
+// runs (e.g. an extended scanner outage). Live queue markers stay TTL-less.
+func addPendingItemBatchQueryWithTTL(batch *gocql.Batch, orgID, libraryID uuid.UUID, itemType ItemType, itemID string, identityAt time.Time, ttlSeconds int) {
+	batch.Query(`
+		INSERT INTO gc_pending_items (org_id, bucket, item_type, library_id, item_id, identity_at)
+		VALUES (?, ?, ?, ?, ?, ?) USING TTL ?
+	`, orgID.String(), gcPendingItemBucket(orgID, libraryID, itemType, itemID), string(itemType), libraryID.String(), itemID, identityAt, ttlSeconds)
+}
+
 func addPendingItemDeleteBatchQuery(batch *gocql.Batch, orgID, libraryID uuid.UUID, itemType ItemType, itemID string, identityAt time.Time) {
 	batch.Query(`
 		DELETE FROM gc_pending_items
@@ -553,7 +565,7 @@ func (s *CassandraStore) FailItem(item QueueItem, failedAt time.Time, lastError,
 		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`, item.OrgID.String(), failedAt, expiresAt, item.QueuedAt, effectiveIdentity, item.RequiresLibraryDeletedCheck, string(item.ItemType), item.ItemID, libraryID.String(), item.StorageClass, item.RetryCount, lastError, failureCode, "open")
 	db.AddUpsertFailedItemExpiryQuery(batch, item.OrgID.String(), failedAt, string(item.ItemType), item.ItemID, expiresAt)
-	addPendingItemBatchQuery(batch, item.OrgID, libraryID, item.ItemType, item.ItemID, effectiveIdentity)
+	addPendingItemBatchQueryWithTTL(batch, item.OrgID, libraryID, item.ItemType, item.ItemID, effectiveIdentity, gcFailedItemBackstopTTLSeconds)
 	batch.Query(`
 		DELETE FROM gc_queue
 		WHERE org_id = ? AND bucket = ? AND queued_at = ? AND item_type = ? AND item_id = ?
@@ -680,32 +692,74 @@ func (s *CassandraStore) ListFailedItemExpiriesByDay(day time.Time, bucket int) 
 	return expiries, nil
 }
 
+// latestFailedAt returns the most recent failure time for an org. gc_failed_items
+// is clustered by failed_at DESC, so LIMIT 1 is a cheap single-row read of the
+// newest DLQ entry. Returns the zero time when the org has no failed items.
+func (s *CassandraStore) latestFailedAt(orgID uuid.UUID) (time.Time, error) {
+	var failedAt time.Time
+	err := s.db.Session().Query(`
+		SELECT failed_at FROM gc_failed_items WHERE org_id = ? LIMIT 1
+	`, orgID.String()).Scan(&failedAt)
+	if err != nil {
+		if errors.Is(err, gocql.ErrNotFound) {
+			return time.Time{}, nil
+		}
+		return time.Time{}, err
+	}
+	return failedAt, nil
+}
+
 func (s *CassandraStore) ListOrgsWithFailedItems(limit int) ([]GCFailedItemOrgInfo, error) {
-	iter := s.db.Session().Query(`SELECT org_id, failed_depth, updated_at FROM gc_org_stats`).Iter()
+	iter := s.db.Session().Query(`SELECT org_id, failed_depth FROM gc_org_stats`).Iter()
 	var (
 		orgIDStr    string
 		failedDepth int
-		updatedAt   time.Time
 	)
-	orgs := make([]GCFailedItemOrgInfo, 0)
-	for iter.Scan(&orgIDStr, &failedDepth, &updatedAt) {
+	type failedOrgCandidate struct {
+		orgID uuid.UUID
+		depth int
+	}
+	candidates := make([]failedOrgCandidate, 0)
+	for iter.Scan(&orgIDStr, &failedDepth) {
 		if failedDepth <= 0 {
 			continue
 		}
-		orgID := parseUUID(orgIDStr)
-		orgName, err := s.GetOrgName(orgID)
-		if err != nil {
-			orgName = ""
-		}
-		orgs = append(orgs, GCFailedItemOrgInfo{
-			OrgID:            orgID,
-			OrgName:          orgName,
-			FailedItemsTotal: failedDepth,
-			UpdatedAt:        updatedAt,
-		})
+		candidates = append(candidates, failedOrgCandidate{orgID: parseUUID(orgIDStr), depth: failedDepth})
 	}
 	if err := iter.Close(); err != nil {
 		return nil, fmt.Errorf("list orgs with failed items: %w", err)
+	}
+	// Page selection uses only the cheap snapshot depth; the per-org name and
+	// last-failure reads below are bounded to the returned page.
+	sort.Slice(candidates, func(i, j int) bool {
+		if candidates[i].depth != candidates[j].depth {
+			return candidates[i].depth > candidates[j].depth
+		}
+		return candidates[i].orgID.String() < candidates[j].orgID.String()
+	})
+	if limit > 0 && len(candidates) > limit {
+		candidates = candidates[:limit]
+	}
+
+	orgs := make([]GCFailedItemOrgInfo, 0, len(candidates))
+	for _, candidate := range candidates {
+		orgName, err := s.GetOrgName(candidate.orgID)
+		if err != nil {
+			orgName = ""
+		}
+		// UpdatedAt reflects the most recent real failure for this org, not the
+		// snapshot refresh time (which a forced refresh pins to ~now for every
+		// org and so conveys nothing in the admin list).
+		lastFailedAt, err := s.latestFailedAt(candidate.orgID)
+		if err != nil {
+			log.Printf("[GC] Failed to read latest failed_at for %s: %v", candidate.orgID, err)
+		}
+		orgs = append(orgs, GCFailedItemOrgInfo{
+			OrgID:            candidate.orgID,
+			OrgName:          orgName,
+			FailedItemsTotal: candidate.depth,
+			UpdatedAt:        lastFailedAt,
+		})
 	}
 	sort.Slice(orgs, func(i, j int) bool {
 		if orgs[i].FailedItemsTotal != orgs[j].FailedItemsTotal {
@@ -716,9 +770,6 @@ func (s *CassandraStore) ListOrgsWithFailedItems(limit int) ([]GCFailedItemOrgIn
 		}
 		return orgs[i].OrgID.String() < orgs[j].OrgID.String()
 	})
-	if limit > 0 && len(orgs) > limit {
-		orgs = orgs[:limit]
-	}
 	return orgs, nil
 }
 
